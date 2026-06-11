@@ -357,8 +357,12 @@ def _safe_eval_param(expr: str, names: Dict[str, object]) -> object:
         if isinstance(node, ast.Expression):
             return ev(node.body)
         if isinstance(node, ast.Constant):
-            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
-                raise ValueError("non-numeric constant")
+            # numbers AND quoted strings: a string-valued *PARAMETER (e.g.
+            # ``eltype = "CPS4"``) must resolve to its *unquoted* value so that a
+            # ``<eltype>`` token substitutes to ``CPS4``, not ``"CPS4"`` (which ccx
+            # would reject as an unknown element type).
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float, str)):
+                raise ValueError("unsupported constant")
             return node.value
         if isinstance(node, ast.Name):
             if node.id in names:
@@ -1369,6 +1373,8 @@ class Converter:
             "SURFACE": self.handle_surface,
             "CREEP": self.handle_creep,
             "FRICTION": self.handle_friction,
+            "CONTACT PAIR": self.handle_contact_pair,
+            "RIGID BODY": self.handle_rigid_body,
         }
         if kw in handlers:
             return handlers[kw](b)
@@ -1884,14 +1890,62 @@ class Converter:
             return [f"** [abq2ccx] *FRICTION dropped (frictionless / no positive coefficient)"]
         return [emit_keyword("FRICTION", b.params)] + list(b.data)
 
+    def handle_rigid_body(self, b: Block) -> List[str]:
+        """``*RIGID BODY``: Abaqus uses ``PIN NSET``/``TIE NSET`` for the node set that
+        moves with the reference node; ccx calls that simply ``NSET`` and rejects the
+        Abaqus spellings.  Map them, keep ``REF NODE``/``ROT NODE``/``ELSET``."""
+        keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        for k, v in b.params.items():
+            ku = k.upper().replace(" ", "")
+            if ku in ("PINNSET", "TIENSET", "NSET"):
+                keep["NSET"] = v
+            elif ku == "REFNODE":
+                keep["REF NODE"] = v
+            elif ku == "ROTNODE":
+                keep["ROT NODE"] = v
+            elif ku == "ELSET":
+                keep["ELSET"] = v
+            else:
+                self.report.note(f"*RIGID BODY parameter {k} dropped (Abaqus-only).", once=True)
+        if any(k.upper().replace(" ", "") in ("PINNSET", "TIENSET") for k in b.params):
+            self.report.warn("*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
+                             "rigidly with REF NODE); the pin-vs-tie DOF nuance may differ — verify.",
+                             once=True)
+        return [emit_keyword("RIGID BODY", keep)] + list(b.data)
+
+    def handle_contact_pair(self, b: Block) -> List[str]:
+        """``*CONTACT PAIR``: ccx *requires* a ``TYPE`` (Abaqus lets it default to
+        surface-to-surface) and does not understand Abaqus-only parameters such as
+        ``SUPPLEMENTARY CONSTRAINTS``/``TIED``/``GEOMETRIC CORRECTION``."""
+        ccx_ok = {"INTERACTION", "TYPE", "SMALL SLIDING", "ADJUST", "CYCLIC SYMMETRY"}
+        keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        for k, v in b.params.items():
+            if k in ccx_ok:
+                keep[k] = v
+            else:
+                self.report.note(f"*CONTACT PAIR parameter {k} dropped (Abaqus-only; not read by "
+                                 f"ccx).", once=True)
+        if "TYPE" not in keep:
+            keep["TYPE"] = "SURFACE TO SURFACE"
+            self.report.note("*CONTACT PAIR without TYPE -> TYPE=SURFACE TO SURFACE (Abaqus default; "
+                             "ccx requires it explicitly).", once=True)
+        return [emit_keyword("CONTACT PAIR", keep)] + list(b.data)
+
     def handle_surface(self, b: Block) -> List[str]:
         if (b.param("TYPE") or "").upper().startswith("ANALYTICAL"):
             return self._commented(b, "*SURFACE TYPE=ANALYTICAL RIGID is unsupported by ccx; mesh the "
                                       "rigid surface with elements instead.")
+        is_node = (b.param("TYPE") or "").upper() == "NODE"
         out = [emit_keyword("SURFACE", b.params)]
         for rec in merged_data_records(b):
             f = [x for x in rec if x != ""]
             if not f:
+                continue
+            if is_node:
+                # ccx node-based *SURFACE accepts exactly one node/nset per line; Abaqus
+                # may append a weight ("NSET, 1."), which ccx rejects with "only one entry
+                # per line allowed".  Keep just the node/nset.
+                out.append(f[0])
                 continue
             if len(f) >= 2 and f[1].upper() in ("SPOS", "SNEG"):
                 self.report.warn("*SURFACE shell face SPOS/SNEG: ccx handles shell faces differently; "

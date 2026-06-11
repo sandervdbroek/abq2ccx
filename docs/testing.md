@@ -19,7 +19,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (29)
+## 1. Unit tests — `tests/test_convert.py` (33)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -55,6 +55,10 @@ conversion behaviour and referential integrity.
 | `test_instance_space_separated_transform` | an `*Instance` offset written space-separated (`10 0 0`) instead of comma-separated is parsed, not crashed on |
 | `test_meshgen_float_formatted_integers` | mesh-gen count/increment fields written in float form (`*NGEN … 2.0`) are accepted, not crashed on |
 | `test_descending_set_emits_ascending_generate` | a descending set run emits a valid ascending `GENERATE` (not the ccx-invalid `5, 1, -1`) and still resolves to all members |
+| `test_string_parameter_substitution` | a string-valued `*PARAMETER` (`eltype="CPS4"`) substitutes unquoted, so `type=<eltype>` emits `TYPE=CPS4` (not the ccx-rejected `TYPE="CPS4"`) |
+| `test_node_surface_drops_weight` | a node-based `*SURFACE` line (`NS, 1.`) drops the Abaqus weight to one entry per line |
+| `test_contact_pair_default_type` | `*CONTACT PAIR` gets the required `TYPE=SURFACE TO SURFACE` (Abaqus default) and Abaqus-only params are dropped |
+| `test_rigid_body_pin_nset_mapped` | `*RIGID BODY, PIN NSET=…` maps to ccx's `NSET=…` |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -91,8 +95,8 @@ deck and runs it in CalculiX:
 
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
-**Results:** all 1022 convert with zero dangling references; **385 solve** in CalculiX.
-The other 637 convert cleanly but use features ccx cannot run (user elements, UMAT/
+**Results:** all 1022 convert with zero dangling references; **386 solve** in CalculiX.
+The other 636 convert cleanly but use features ccx cannot run (user elements, UMAT/
 VUMAT, explicit dynamics, cohesive/connector elements, piezoelectric/acoustic coupling,
 other user subroutines) or are CAE part fragments / incomplete source decks (e.g.
 externally-supplied `<parameter>` values) — and each was verified to fail *no worse than
@@ -130,6 +134,15 @@ test (plus an adversarial code review) surfaced and fixed real converter bugs:
   pre-publication review surfaced this);
 * **descending set runs** now emit a valid ascending `GENERATE` rather than the
   ccx-invalid `5, 1, -1` (which silently empties the set, dropping a BC/load).
+
+A later pass mining the non-solving decks for *converter-addressable* failures (as
+opposed to fundamental ccx limits — UMAT/UEL/cohesive/explicit, which no converter can
+run) added four more lossless fidelity fixes: **string-valued `*PARAMETER`** (`<eltype>`
+→ `CPS4`, not `"CPS4"`), **node-based `*SURFACE`** one-entry-per-line, **`*CONTACT PAIR`**
+default `TYPE`, and **`*RIGID BODY` `PIN/TIE NSET` → `NSET`**. These correct ~100+ decks'
+emitted cards; most still don't *solve* because they hit a second, fundamental blocker,
+so the net solve gain was small (+1) — the corpus is dominated by genuinely
+ccx-unsupported physics, which is by design (it is a *genuine-Abaqus* corpus).
 
 Earlier rounds also fixed independent-instance meshes, `*PARAMETER` substitution
 (`**`-comments and forward refs), trailing-comma over-merge, Fortran `D` exponents, and

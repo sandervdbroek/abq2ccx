@@ -10,8 +10,8 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 `python corpus/fetch.py` to download into corpus/files/ (gitignored), then
 `python tests/test_corpus.py`.
 
-1022 decks from ~179 public GitHub repositories; 385 expected to solve in
-CalculiX 2.22. Every deck converts cleanly (zero dangling references); the 637
+1022 decks from ~179 public GitHub repositories; 386 expected to solve in
+CalculiX 2.22. Every deck converts cleanly (zero dangling references); the 636
 non-solving decks use features ccx cannot run - UMAT/VUMAT user materials, *USER ELEMENT
 (UEL), cohesive elements, explicit dynamics, piezoelectric/acoustic coupling, connectors,
 other user subroutines - or are CAE part fragments / incomplete source decks. Each was
@@ -618,6 +618,9 @@ CORPUS = [
     dict(name='marcello_gori_beam_bracket', expect_solve=True, license='MIT',
          exercises='C3D8, C3D6',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/4.%20Linear%20Static%20Structural%20Analysis/2.%20Beam%20Bracket/Beam_Bracket.inp'),
+    dict(name='marcello_gori_contact_analysis_n2s', expect_solve=True, license='MIT',
+         exercises='C3D8 — parts/instances/assembly; contact',
+         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/7.%20Non-Linear%20Analysis/5.%20Contact%20Analysis%20Example/Contact_Analysis_N2S.inp'),
     dict(name='marcello_gori_contact_analysis_s2s', expect_solve=True, license='MIT',
          exercises='C3D8 — parts/instances/assembly; contact',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/7.%20Non-Linear%20Analysis/5.%20Contact%20Analysis%20Example/Contact_Analysis_S2S.inp'),
@@ -2049,10 +2052,6 @@ CORPUS = [
          exercises='B31 — parts/instances/assembly; *Buckle',
          note='converts clean; ccx cannot run the analysis',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/6.%20Buckling%20Analysis/4.%20Fixed%20-%20Fixed%20End/C4_Fixed_Fixed_End.inp'),
-    dict(name='marcello_gori_contact_analysis_n2s', expect_solve=False, license='MIT',
-         exercises='C3D8 — parts/instances/assembly; contact',
-         note='converts clean; ccx cannot run the analysis',
-         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/7.%20Non-Linear%20Analysis/5.%20Contact%20Analysis%20Example/Contact_Analysis_N2S.inp'),
     dict(name='marcello_gori_cylinder_impact', expect_solve=False, license='MIT',
          exercises='C3D8R — parts/instances/assembly; explicit',
          note='ccx limitation: explicit dynamics',

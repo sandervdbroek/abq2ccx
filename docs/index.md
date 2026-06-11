@@ -1,4 +1,4 @@
-# AtoC documentation
+# abq2ccx documentation
 
 `abq2ccx.py` converts Abaqus `.inp` decks to CalculiX (`ccx`) `.inp` decks. Start with
 the [project README](../README.md) for the overview; this folder is the detailed

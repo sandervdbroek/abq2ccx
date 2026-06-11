@@ -46,7 +46,7 @@ also solve. This proves the full pipeline — `*NCOPY`/`*ELGEN` expansion, node 
 boundary sets, pressure face, sections — is correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
-demand) is converted and run: all 1022 convert with zero dangling references and 385 solve
+demand) is converted and run: all 1022 convert with zero dangling references and 386 solve
 in CalculiX; the rest convert cleanly but use features ccx cannot run, and each was
 verified to fail no worse than the original unconverted deck. Bulk-running every deck
 through convert → integrity → ccx is also what drove several converter fixes

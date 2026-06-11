@@ -338,6 +338,42 @@ def test_nfill_unequal_bounding_sets():
     assert {51, 52, 53} <= set(conv.geom.nodes)   # interior of the 3 common pairs
 
 
+def test_string_parameter_substitution():
+    # A string-valued *PARAMETER (quoted) must substitute as its *unquoted* value, so
+    # `*Element, type=<eltype>` with eltype="CPS4" emits TYPE=CPS4 (not TYPE="CPS4",
+    # which ccx rejects as an unknown element type).
+    deck = ('*PARAMETER\neltype = "CPS4"\n*NODE\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n'
+            '*ELEMENT, TYPE=<eltype>, ELSET=E\n1,1,2,3,4\n')
+    body, _, _ = convert_str(deck)
+    el = [l for l in body.splitlines() if l.upper().startswith("*ELEMENT")][0]
+    assert "TYPE=CPS4" in el.upper() and '"' not in el
+
+
+def test_node_surface_drops_weight():
+    # ccx node-based *SURFACE accepts one entry per line; an Abaqus weight ("NS, 1.")
+    # must be dropped to just the node/nset.
+    deck = "*NODE\n1,0,0,0\n*NSET,NSET=NS\n1\n*SURFACE, TYPE=NODE, NAME=S\nNS, 1.\n"
+    body, _, _ = convert_str(deck)
+    assert "NS" in [l.strip() for l in body.splitlines()]      # bare 'NS', no ', 1.'
+
+
+def test_contact_pair_default_type():
+    # ccx requires a TYPE on *CONTACT PAIR (Abaqus defaults it); Abaqus-only params drop.
+    deck = "*SURFACE INTERACTION, NAME=SI\n*CONTACT PAIR, INTERACTION=SI, SUPPLEMENTARY CONSTRAINTS=NO\nA, B\n"
+    body, _, _ = convert_str(deck)
+    cp = [l for l in body.splitlines() if l.upper().startswith("*CONTACT PAIR")][0]
+    assert "TYPE=SURFACE TO SURFACE" in cp.upper() and "SUPPLEMENTARY" not in cp.upper()
+
+
+def test_rigid_body_pin_nset_mapped():
+    # Abaqus *RIGID BODY, PIN NSET=... -> ccx NSET=... (ccx rejects the PIN NSET spelling).
+    deck = ("*NODE\n1,0,0,0\n2,1,0,0\n3,2,0,0\n*NSET,NSET=RN\n1,2\n*NSET,NSET=REF\n3\n"
+            "*RIGID BODY, REF NODE=REF, PIN NSET=RN\n")
+    body, _, _ = convert_str(deck)
+    rb = [l for l in body.splitlines() if "RIGID BODY" in l.upper()][0]
+    assert "NSET=RN" in rb.upper() and "PIN NSET" not in rb.upper()
+
+
 def test_meshgen_float_formatted_integers():
     # Exporters sometimes write integer count/increment fields of the mesh-gen cards in
     # float form ("2.0"); the expanders must accept them, not abort the whole deck.
