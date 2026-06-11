@@ -62,6 +62,38 @@ every keyword and either translates it, drops an organisational card, or comment
 with guidance, rather than failing or silently passing it. The exhaustive split is in
 [keyword-reference.md](keyword-reference.md).
 
+## Compatibility limits — what doesn't convert/solve, and why
+
+A converted deck can fail to *solve* in CalculiX for reasons that are mostly **not** the
+converter's to fix. A full audit of the test corpus (every non-solving deck re-run
+through ccx and classified by its failure *and* its source) breaks down as:
+
+| Share | Category | Why no converter can help |
+| --- | --- | --- |
+| ~80% | **Fundamental ccx limits** | The physics isn't in stock ccx: `UMAT`/`VUMAT` user materials (no compiled subroutine), `*USER ELEMENT` (UEL), cohesive elements, explicit dynamics, user MPCs, rigid `R3D` elements, incompressible `ν≥0.5`, per-element distribution orientations — plus genuine non-convergence and degenerate (nonpositive-Jacobian) meshes. |
+| ~4% | **Incomplete source deck** | The deck itself is partial and fails in Abaqus too: no `*MATERIAL` at all, an undefined CAE `_PickedSet`, a material name that doesn't match its section, externally-supplied `<parameter>` values, or a mesh/parser fixture with **no `*STEP`**. |
+| ~15% | **Addressable error, but downstream-blocked** | The *first* error is converter-fixable, but a second, fundamental wall sits behind it. |
+
+The third row is the important subtlety: **fixing the first error rarely makes such a
+deck solve.** For example, Abaqus `*COUPLING`+`*Kinematic` can be translated to ccx
+`*RIGID BODY`, which clears the coupling error on ~30 corpus decks — but *every one* then
+hits a UMAT material, a non-convergence, or a degenerate-mesh error and still doesn't
+run. So the converter is built to **translate or clearly flag** each incompatibility (so
+the deck is faithful and the blocker is visible), not to manufacture ccx capabilities or
+complete a partial deck.
+
+**If your converted deck won't solve,** read the first `*ERROR` ccx prints and place it in
+the table above. A *fundamental* or *incomplete-source* error means the model needs
+remodelling (replace a UMAT with a built-in material, mesh a rigid surface, add the
+missing step, refine an inverted element) — not a different conversion. The conversion
+**report** (the `**`-comment header in the output) flags the cards that were translated
+approximately or commented out, which is the first place to look.
+
+One known translation the converter does *not* yet attempt is `*COUPLING`+`*Kinematic`
+→ `*RIGID BODY` (it is passed through and ccx rejects it): it is a common CAE construct
+worth adding, but every corpus deck that uses it is downstream-blocked, so it could not
+be end-to-end-validated against ccx here.
+
 ## What "verified" means here
 
 Each fact above was taken from a primary source (the CalculiX manual or the Abaqus

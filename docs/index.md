@@ -17,7 +17,8 @@ reference.
 * **[Compatibility & sources](compatibility.md)** — the verified facts the converter
   relies on, version notes, and where they come from. Includes the **end-to-end
   validation** against the NAFEMS LE10 benchmark (run it with
-  `python validate_with_ccx.py`).
+  `python validate_with_ccx.py`) and a **compatibility-limits audit** of what doesn't
+  convert/solve and why (fundamental ccx limits vs. incomplete decks vs. addressable).
 
 ### Generated references (from the code — never out of date)
 
