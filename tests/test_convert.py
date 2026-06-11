@@ -493,6 +493,25 @@ def test_element_load_uses_element_offset():
     assert first == "2", f"*DFLUX element ref took the wrong offset: expected '2', got '{first}'"
 
 
+def test_named_bc_condition_on_instance_set():
+    # *Boundary with a named condition (ENCASTRE) on an instance node set: the set ref must
+    # be flattened (I.fix -> I_FIX) *before* the condition is expanded to DOF ranges, so the
+    # emitted lines name the renamed set.  Guards the flatten-then-expand ordering.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n"
+            "*Element, type=C3D8, elset=e\n1,1,2,3,4,5,6,7,8\n*Nset, nset=fix\n1,2,3,4\n"
+            "*Solid Section, elset=e, material=m\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I, part=P\n*End Instance\n*End Assembly\n"
+            "*Material, name=m\n*Elastic\n1.,0.3\n"
+            "*Step\n*Static\n*Boundary\nI.fix, ENCASTRE\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.upper().startswith("*BOUNDARY"))
+    assert lines[i + 1].upper().startswith("I_FIX,")     # resolved set name, not I.fix
+    assert "1, 3" in lines[i + 1]                          # solid model -> ENCASTRE = DOF 1..3
+    assert "I.FIX" not in body.upper()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
