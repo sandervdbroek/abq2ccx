@@ -2109,11 +2109,10 @@ def make_namer(report: Report):
     return namer
 
 
-def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block]:
-    report.warn("Model uses *PART/*INSTANCE/*ASSEMBLY. Flattened to a single global mesh "
-                "(best-effort) — verify node/element renumbering and instance transforms.", once=True)
-    namer = make_namer(report)
-
+def _partition_assembly(blocks: List[Block]):
+    """Split a *PART/*INSTANCE/*ASSEMBLY deck into its sections via a small state machine:
+    parts (name -> blocks), instances (dicts), assembly-level blocks, and the pre-/post-
+    assembly top-level blocks."""
     parts: "OrderedDict[str, List[Block]]" = OrderedDict()
     instances: List[dict] = []
     assembly_blocks: List[Block] = []
@@ -2157,93 +2156,108 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
             assembly_blocks.append(b)
         elif state[0] == "INST":
             state[1]["extra"].append(b)
+    return parts, instances, assembly_blocks, pre, post
 
-    out: List[Block] = list(pre)
 
-    # Emit each part's "global once" model data (materials etc.).
+def _emit_part_global_data(parts) -> List[Block]:
+    """Each part's 'global once' model data (materials etc.) — not the mesh (consumed
+    per instance) and not the per-instance section cards."""
+    out: List[Block] = []
     for pblocks in parts.values():
         for b in pblocks:
             if b.keyword in GEOM_KW or b.keyword in PART_PER_INSTANCE:
                 continue
             out.append(b)
+    return out
 
-    maps: Dict[str, Tuple[int, int]] = {}      # instance -> (node_off, elem_off)
-    gmax_node = gmax_elem = 0
 
-    for inst in instances:
-        # Build the instance mesh from the part AND the instance's own blocks: CAE
-        # "dependent" instances keep the mesh in the *Part, while "independent"
-        # instances put *Node/*Element inside *Instance...*End Instance.
-        geo_conv = Converter(report, options)
-        geo_conv.build_geometry(parts.get(inst["part"], []) + inst["extra"])
-        geo = geo_conv.geom
-        if not geo.nodes and not geo.elements:
-            report.warn(f"*INSTANCE {inst['name']}: no mesh found in part {inst['part']} or the "
-                        f"instance itself; skipped.")
-            continue
-        node_off, elem_off = gmax_node, gmax_elem
+def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple[Vec, Vec, float]]]:
+    """Parse an *INSTANCE positioning block: a translation line and an optional rotation
+    line (point a, point b, angle).  Returns (translation, rotation-or-None)."""
+    T: Vec = (0.0, 0.0, 0.0)
+    rot = None
+    dl = [ln for ln in inst["data"] if ln.strip()]
+    try:
+        if dl:
+            v = [pf(x) for x in numeric_fields(dl[0])]
+            if len(v) >= 3:
+                T = (v[0], v[1], v[2])
+        if len(dl) > 1:
+            v = [pf(x) for x in numeric_fields(dl[1])]
+            if len(v) >= 7:
+                rot = ((v[0], v[1], v[2]), (v[3], v[4], v[5]), v[6])
+    except ValueError:
+        report.warn(f"*INSTANCE {inst['name']}: could not fully parse the transform "
+                    f"line(s); any unparsed translation/rotation is dropped — verify "
+                    f"positioning.", once=True)
+    if rot:
+        report.warn(f"*INSTANCE {inst['name']} is rotated; node coords are transformed but any "
+                    f"part *ORIENTATION vectors are NOT rotated — verify material directions.", once=True)
+    return T, rot
 
-        # transform: translation line, optional rotation line
-        T: Vec = (0.0, 0.0, 0.0)
-        rot = None
-        dl = [ln for ln in inst["data"] if ln.strip()]
-        try:
-            if dl:
-                v = [pf(x) for x in numeric_fields(dl[0])]
-                if len(v) >= 3:
-                    T = (v[0], v[1], v[2])
-            if len(dl) > 1:
-                v = [pf(x) for x in numeric_fields(dl[1])]
-                if len(v) >= 7:
-                    rot = ((v[0], v[1], v[2]), (v[3], v[4], v[5]), v[6])
-        except ValueError:
-            report.warn(f"*INSTANCE {inst['name']}: could not fully parse the transform "
-                        f"line(s); any unparsed translation/rotation is dropped — verify "
-                        f"positioning.", once=True)
+
+def _emit_instance(inst: dict, parts, namer, report: Report, options,
+                   gmax_node: int, gmax_elem: int):
+    """Emit one *INSTANCE as flat global geometry: build its mesh (from the *Part and/or
+    the instance's own blocks — CAE 'dependent' instances keep the mesh in the *Part,
+    'independent' ones put it inside *Instance...*End Instance), offset node/element ids
+    past the running maxima, apply the instance translation+rotation, and remap its
+    sets/sections/surfaces.  Returns ``(blocks, new_gmax_node, new_gmax_elem,
+    (node_off, elem_off))`` or ``None`` if the instance has no mesh."""
+    geo_conv = Converter(report, options)
+    geo_conv.build_geometry(parts.get(inst["part"], []) + inst["extra"])
+    geo = geo_conv.geom
+    if not geo.nodes and not geo.elements:
+        report.warn(f"*INSTANCE {inst['name']}: no mesh found in part {inst['part']} or the "
+                    f"instance itself; skipped.")
+        return None
+    node_off, elem_off = gmax_node, gmax_elem
+    out: List[Block] = []
+    T, rot = _instance_transform(inst, report)
+
+    ndata = []
+    for nid, (x, y, z) in geo.nodes.items():
+        p = vadd((x, y, z), T)
         if rot:
-            report.warn(f"*INSTANCE {inst['name']} is rotated; node coords are transformed but any "
-                        f"part *ORIENTATION vectors are NOT rotated — verify material directions.", once=True)
+            p = rotate_about_axis(p, rot[0], rot[1], rot[2])
+        gid = nid + node_off
+        ndata.append(f"{gid}, {fmt_coord(p[0])}, {fmt_coord(p[1])}, {fmt_coord(p[2])}")
+        gmax_node = max(gmax_node, gid)
+    out.append(mkblock("NODE", [("NSET", namer(inst["name"]))], ndata))
 
-        ndata = []
-        for nid, (x, y, z) in geo.nodes.items():
-            p = vadd((x, y, z), T)
-            if rot:
-                p = rotate_about_axis(p, rot[0], rot[1], rot[2])
-            gid = nid + node_off
-            ndata.append(f"{gid}, {fmt_coord(p[0])}, {fmt_coord(p[1])}, {fmt_coord(p[2])}")
-            gmax_node = max(gmax_node, gid)
-        out.append(mkblock("NODE", [("NSET", namer(inst["name"]))], ndata))
+    by_type: "OrderedDict[str, List[Tuple[int, List[int]]]]" = OrderedDict()
+    for eid, (typ, conn) in geo.elements.items():
+        by_type.setdefault(typ, []).append((eid, conn))
+    for typ, items in by_type.items():
+        edata = []
+        for eid, conn in items:
+            gid = eid + elem_off
+            edata.extend(reflow([str(gid)] + [str(c + node_off) for c in conn], MAX_ENTRIES_PER_LINE))
+            gmax_elem = max(gmax_elem, gid)
+        out.append(mkblock("ELEMENT", [("TYPE", typ), ("ELSET", namer(inst["name"], "ALL"))], edata))
 
-        by_type: "OrderedDict[str, List[Tuple[int, List[int]]]]" = OrderedDict()
-        for eid, (typ, conn) in geo.elements.items():
-            by_type.setdefault(typ, []).append((eid, conn))
-        for typ, items in by_type.items():
-            edata = []
-            for eid, conn in items:
-                gid = eid + elem_off
-                edata.extend(reflow([str(gid)] + [str(c + node_off) for c in conn], MAX_ENTRIES_PER_LINE))
-                gmax_elem = max(gmax_elem, gid)
-            out.append(mkblock("ELEMENT", [("TYPE", typ), ("ELSET", namer(inst["name"], "ALL"))], edata))
+    for sname, ids in geo.nsets.items():
+        out.append(set_block("NSET", namer(inst["name"], sname), [i + node_off for i in ids]))
+    for sname, ids in geo.elsets.items():
+        out.append(set_block("ELSET", namer(inst["name"], sname), [i + elem_off for i in ids]))
 
-        for sname, ids in geo.nsets.items():
-            out.append(set_block("NSET", namer(inst["name"], sname), [i + node_off for i in ids]))
-        for sname, ids in geo.elsets.items():
-            out.append(set_block("ELSET", namer(inst["name"], sname), [i + elem_off for i in ids]))
+    # per-instance sections / orientations / surfaces (remap names)
+    prefix = inst["name"]
+    for b in parts[inst["part"]] + inst["extra"]:
+        if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION"):
+            out.append(_remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer))
+        elif b.keyword == "ORIENTATION":
+            out.append(_remap_named(b, prefix, ("NAME",), namer))
+        elif b.keyword == "DISTRIBUTION":
+            out.append(_remap_named(b, prefix, ("NAME",), namer))
+        elif b.keyword == "SURFACE":
+            out.append(_remap_surface(b, prefix, namer))
+    return out, gmax_node, gmax_elem, (node_off, elem_off)
 
-        # per-instance sections / orientations / surfaces (remap names)
-        prefix = inst["name"]
-        for b in parts[inst["part"]] + inst["extra"]:
-            if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION"):
-                out.append(_remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer))
-            elif b.keyword == "ORIENTATION":
-                out.append(_remap_named(b, prefix, ("NAME",), namer))
-            elif b.keyword == "DISTRIBUTION":
-                out.append(_remap_named(b, prefix, ("NAME",), namer))
-            elif b.keyword == "SURFACE":
-                out.append(_remap_surface(b, prefix, namer))
-        maps[prefix] = (node_off, elem_off)
 
-    # assembly-level sets / surfaces / constraints
+def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Block]:
+    """Translate assembly-level sets / surfaces / constraints, resolving instance-qualified
+    members (``Instance.id`` / ``Instance.setname``) to the flat global numbering."""
     def resolve(tok: str):
         if "." in tok:
             iname, rest = tok.split(".", 1)
@@ -2254,6 +2268,7 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
                 return ("name", namer(iname, rest))
         return ("raw", tok)
 
+    out: List[Block] = []
     for b in assembly_blocks:
         kw = b.keyword
         if kw in ("NSET", "ELSET"):
@@ -2294,11 +2309,13 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
             out.append(Block("SURFACE", OrderedDict(b.params), data))
         else:
             out.append(b)
+    return out
 
-    out.extend(post)
 
-    # Resolve any remaining instance-qualified references (e.g. *CLOAD on `I2.7`)
-    # that appear in step loads/BCs/constraints, now that all offsets are known.
+def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
+    """Final pass (in place): rewrite any leftover instance-qualified references (e.g. a
+    ``*CLOAD`` on ``I2.7``) in step loads/BCs/constraints to global ids/names, now that
+    all instance offsets are known."""
     for blk in out:
         if blk.keyword in ("NODE", "ELEMENT") or not blk.data:
             continue
@@ -2311,6 +2328,35 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
             rewritten.append(joined)
         if changed:
             blk.data = rewritten
+
+
+def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block]:
+    """``*PART``/``*INSTANCE``/``*ASSEMBLY`` -> one flat, globally-numbered mesh (ccx has
+    no assembly concept).  Orchestrates the five phases, each a helper above: partition
+    the deck -> emit per-part global data -> emit each instance's geometry (id-offset +
+    transform) -> translate assembly-level sets/surfaces/constraints -> resolve leftover
+    instance-qualified references."""
+    report.warn("Model uses *PART/*INSTANCE/*ASSEMBLY. Flattened to a single global mesh "
+                "(best-effort) — verify node/element renumbering and instance transforms.", once=True)
+    namer = make_namer(report)
+    parts, instances, assembly_blocks, pre, post = _partition_assembly(blocks)
+
+    out: List[Block] = list(pre)
+    out.extend(_emit_part_global_data(parts))
+
+    maps: Dict[str, Tuple[int, int]] = {}      # instance -> (node_off, elem_off)
+    gmax_node = gmax_elem = 0
+    for inst in instances:
+        res = _emit_instance(inst, parts, namer, report, options, gmax_node, gmax_elem)
+        if res is None:
+            continue
+        inst_blocks, gmax_node, gmax_elem, offs = res
+        out.extend(inst_blocks)
+        maps[inst["name"]] = offs
+
+    out.extend(_emit_assembly_blocks(assembly_blocks, maps, namer))
+    out.extend(post)
+    _resolve_qualified_refs(out, maps, namer)
     return out
 
 
