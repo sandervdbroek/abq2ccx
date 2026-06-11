@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*_ccx.inp
+*_ccx.log
+.DS_Store
+corpus/files/
