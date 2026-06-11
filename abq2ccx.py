@@ -545,14 +545,6 @@ def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
     return blocks
 
 
-def data_fields(line: str) -> List[str]:
-    """Split a data line into trimmed fields (a trailing comma yields no extra field)."""
-    parts = [p.strip() for p in line.split(",")]
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    return parts
-
-
 def numeric_fields(line: str) -> List[str]:
     """Split a purely-numeric data line on commas *and/or* whitespace.  Some exporters
     emit space-separated values where Abaqus expects commas (e.g. an ``*INSTANCE``
@@ -616,8 +608,13 @@ class Geometry:
 
 
 def expand_generate(fields: List[str]) -> List[int]:
-    """``start, end[, inc]`` -> explicit list of ids."""
-    nums = [int(float(f)) for f in fields if f != ""]
+    """``start, end[, inc]`` -> explicit list of ids.  A malformed (non-integer) field
+    yields an empty list rather than aborting the whole conversion — matching the
+    "one bad line should not kill the file" handling of *NODE/*ELEMENT."""
+    try:
+        nums = [int(float(f)) for f in fields if f != ""]
+    except ValueError:
+        return []
     if len(nums) == 2:
         start, end, inc = nums[0], nums[1], 1
     elif len(nums) >= 3:
@@ -914,8 +911,6 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
             einc = pint(grp[2]) if len(grp) > 2 and grp[2] else 1
             triples.append((n, ninc, einc))
         # nested loops over up to three generation directions
-        counts = [t[0] for t in triples] or [1]
-        idx = [0, 0, 0]
         ranges = [range(t[0]) for t in triples]
         while len(ranges) < 3:
             ranges.append(range(1))
@@ -1094,7 +1089,7 @@ ABQ_MAP_VARS = {"LE": "E", "PE": "PEEQ", "PEMAG": "PEEQ", "CEEQ": "PEEQ", "EE": 
                 "NE11": "E", "NT11": "NT", "UT": "U", "UR": "U", "RT": "RF", "RM": "RF",
                 "CELENT": "EVOL"}
 # ccx identifiers that are valid only on *EL PRINT / *NODE PRINT (.dat), not *EL FILE.
-EL_PRINT_ONLY_VARS = {"ELSE", "ELKE", "EVOL", "COORD", "CELS"}
+EL_PRINT_ONLY_VARS = {"ELSE", "ELKE", "EVOL", "CELS"}
 
 
 # ---------------------------------------------------------------------------
@@ -1353,7 +1348,7 @@ class Converter:
         return out
 
     # -- dispatch -----------------------------------------------------------
-    def translate_one(self, b: Block, in_step: bool = False) -> List[str]:
+    def translate_one(self, b: Block) -> List[str]:
         kw = b.keyword
         handlers = {
             "ELASTIC": self.handle_elastic,
@@ -1622,7 +1617,7 @@ class Converter:
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
-            out.extend(self.translate_one(b, in_step=True))
+            out.extend(self.translate_one(b))
         out.append("*END STEP")
         return out
 
@@ -1887,7 +1882,7 @@ class Converter:
             self.report.note("*FRICTION with no positive coefficient dropped — ccx treats the absence "
                              "of *FRICTION as frictionless, whereas a zero/empty/ROUGH coefficient is "
                              "a hard error there. Re-add it with mu>0 if you need friction.", once=True)
-            return [f"** [abq2ccx] *FRICTION dropped (frictionless / no positive coefficient)"]
+            return ["** [abq2ccx] *FRICTION dropped (frictionless / no positive coefficient)"]
         return [emit_keyword("FRICTION", b.params)] + list(b.data)
 
     def handle_rigid_body(self, b: Block) -> List[str]:
@@ -2166,7 +2161,7 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     out: List[Block] = list(pre)
 
     # Emit each part's "global once" model data (materials etc.).
-    for pname, pblocks in parts.items():
+    for pblocks in parts.values():
         for b in pblocks:
             if b.keyword in GEOM_KW or b.keyword in PART_PER_INSTANCE:
                 continue

@@ -338,6 +338,18 @@ def test_nfill_unequal_bounding_sets():
     assert {51, 52, 53} <= set(conv.geom.nodes)   # interior of the 3 common pairs
 
 
+def test_generate_malformed_token_no_crash():
+    # A malformed (non-integer) field in a GENERATE record skips that record instead of
+    # aborting the whole conversion (matching the *NODE/*ELEMENT one-bad-line handling);
+    # a valid GENERATE in the same deck still works.
+    deck = ("*NODE\n1,0,0,0\n2,1,0,0\n3,2,0,0\n"
+            "*ELEMENT, TYPE=MASS, ELSET=E\n1,1\n2,2\n3,3\n"
+            "*ELSET, ELSET=BAD, GENERATE\n1, oops, 1\n"      # malformed -> skipped, no crash
+            "*ELSET, ELSET=GOOD, GENERATE\n1, 3, 1\n")       # valid
+    _, conv, _ = convert_str(deck)                            # must not raise
+    assert list(conv.geom.elset("GOOD")) == [1, 2, 3]
+
+
 def test_string_parameter_substitution():
     # A string-valued *PARAMETER (quoted) must substitute as its *unquoted* value, so
     # `*Element, type=<eltype>` with eltype="CPS4" emits TYPE=CPS4 (not TYPE="CPS4",

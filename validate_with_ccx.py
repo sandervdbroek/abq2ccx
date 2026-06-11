@@ -14,7 +14,6 @@ a clear message), 1 if a check fails.  Requires CalculiX; install it or FreeCAD.
 
 import glob
 import os
-import re
 import shutil
 import subprocess
 import sys
