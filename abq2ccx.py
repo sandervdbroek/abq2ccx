@@ -2042,20 +2042,44 @@ PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE
                      "ORIENTATION", "DISTRIBUTION", "SURFACE"}
 
 
-# An instance-qualified reference such as ``I2.7`` or ``Plate-1.edge`` (prefix must
-# start with a letter/underscore so numeric data like ``0.5`` never matches).
-INST_REF = re.compile(r"^([A-Za-z_][\w-]*)\.(.+)$")
-ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "SOLID SECTION", "SHELL SECTION", "BEAM SECTION",
-               "MEMBRANE SECTION", "EL PRINT", "EL FILE", "ELEMENT OUTPUT"}
+# Keywords whose members are elements, so a bare instance-qualified id (``I2.7``) takes
+# the element offset, not the node offset.  Covers element/face-based loads (*DLOAD,
+# *DSLOAD, *DFLUX, *DFILM, *FILM, *RADIATE), the element sections, and element output.
+# (Nodal loads/BCs — *CLOAD, *CFLUX, *BOUNDARY — are absent, so they take the node offset.)
+ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "DFLUX", "DFILM", "FILM", "RADIATE",
+               "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
+               "EL PRINT", "EL FILE", "ELEMENT OUTPUT"}
+
+# Parameters whose VALUE names a node set / element set / surface / node (e.g.
+# ``*EL PRINT, ELSET=Part-1.body`` or ``*RIGID BODY, REF NODE=Part-1.ref``).  An
+# instance-qualified value here must be resolved exactly like a data-line member;
+# a plain name is already global.  (REF/ROT NODE point at a node or 1-node set.)
+REF_PARAMS = {"NSET", "ELSET", "SURFACE", "SLAVE", "MASTER",
+              "REF NODE", "REFNODE", "ROT NODE", "ROTNODE", "PIN NSET", "TIE NSET"}
+
+
+def _split_instance_ref(tok: str, maps) -> Optional[Tuple[str, str]]:
+    """Split a (possibly multi-level) instance-qualified token into ``(instance, rest)``.
+
+    Abaqus names a member as ``Instance.set`` / ``Instance.7``; some exporters also write
+    the assembly prefix (``Assembly.Instance.set``).  Return the first dot-separated
+    segment that names a known instance, paired with everything after it, or ``None`` when
+    no segment is a known instance — so plain names and numeric data like ``0.5`` (no
+    segment is an instance) are left untouched."""
+    if "." not in tok:
+        return None
+    segs = tok.split(".")
+    for i, seg in enumerate(segs):
+        if seg.upper() in maps:
+            return seg.upper(), ".".join(segs[i + 1:])
+    return None
 
 
 def _resolve_field(field: str, maps: Dict[str, Tuple[int, int]], entity: str, namer) -> str:
-    m = INST_REF.match(field)
-    if not m:
+    sr = _split_instance_ref(field, maps)
+    if sr is None or not sr[1]:
         return field
-    pre, rest = m.group(1).upper(), m.group(2)
-    if pre not in maps:
-        return field
+    pre, rest = sr
     if re.fullmatch(r"[-+]?\d+", rest):
         off = maps[pre][0 if entity == "node" else 1]
         return str(int(rest) + off)
@@ -2259,13 +2283,12 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
     """Translate assembly-level sets / surfaces / constraints, resolving instance-qualified
     members (``Instance.id`` / ``Instance.setname``) to the flat global numbering."""
     def resolve(tok: str):
-        if "." in tok:
-            iname, rest = tok.split(".", 1)
-            iname = iname.upper()
-            if iname in maps:
-                if re.fullmatch(r"[-+]?\d+", rest):
-                    return ("id", int(rest) + maps[iname][0])
-                return ("name", namer(iname, rest))
+        sr = _split_instance_ref(tok, maps)
+        if sr is not None and sr[1]:
+            iname, rest = sr
+            if re.fullmatch(r"[-+]?\d+", rest):
+                return ("id", int(rest) + maps[iname][0])
+            return ("name", namer(iname, rest))
         return ("raw", tok)
 
     out: List[Block] = []
@@ -2313,13 +2336,25 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
 
 
 def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
-    """Final pass (in place): rewrite any leftover instance-qualified references (e.g. a
-    ``*CLOAD`` on ``I2.7``) in step loads/BCs/constraints to global ids/names, now that
-    all instance offsets are known."""
+    """Final pass (in place): rewrite any leftover instance-qualified references to global
+    ids/names, now that all instance offsets are known.  Covers both data-line members
+    (e.g. a ``*CLOAD`` on ``I2.7``) and the set/surface-naming *parameters* of step/model/
+    output cards (e.g. ``*EL PRINT, ELSET=I2.body`` -> ``ELSET=I2_BODY``)."""
     for blk in out:
-        if blk.keyword in ("NODE", "ELEMENT") or not blk.data:
+        if blk.keyword in ("NODE", "ELEMENT"):
             continue
         entity = "elem" if blk.keyword in ELEM_REF_KW else "node"
+        # (a) parameters that name a set/surface.  Only dotted values whose prefix is a
+        #     known instance are touched, so a definition's own name (LOADED, I2_BODY) and
+        #     unrelated params (MATERIAL=, NAME=) are left untouched.
+        for k, v in list(blk.params.items()):
+            if v and "." in v and k in REF_PARAMS:
+                ent = "elem" if ("ELSET" in k or "ELEMENT" in k) else \
+                      "node" if ("NSET" in k or "NODE" in k) else entity
+                blk.params[k] = _resolve_field(v, maps, ent, namer)
+        # (b) instance-qualified members in data lines.
+        if not blk.data:
+            continue
         rewritten, changed = [], False
         for line in blk.data:
             fields = [_resolve_field(p.strip(), maps, entity, namer) for p in line.split(",")]

@@ -424,6 +424,75 @@ def test_instance_space_separated_transform():
     assert {10.0, 11.0} <= xs           # both part nodes translated by (10,0,0)
 
 
+def test_instance_qualified_set_param_resolved():
+    # Output requests reference sets through a PARAMETER (elset=/nset=), not a data line.
+    # An instance-qualified value (I.body / I.corner) must flatten to the renamed global
+    # set, or ccx reports "elementset I.BODY does not exist" and drops the request.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=body\n1,1,2,3,4\n*Nset, nset=corner\n1\n"
+            "*Solid Section, elset=body, material=m\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I, part=P\n*End Instance\n*End Assembly\n"
+            "*Material, name=m\n*Elastic\n1.,0.3\n"
+            "*Step\n*Static\n*El Print, elset=I.body\nS\n*Node Print, nset=I.corner\nU\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    elp = [l for l in body.splitlines() if l.upper().startswith("*EL PRINT")][0]
+    ndp = [l for l in body.splitlines() if l.upper().startswith("*NODE PRINT")][0]
+    assert "ELSET=I_BODY" in elp.upper() and "I.BODY" not in elp.upper()
+    assert "NSET=I_CORNER" in ndp.upper() and "I.CORNER" not in ndp.upper()
+    # the renamed sets are actually emitted, so the references resolve
+    assert any("ELSET=I_BODY" in l.upper() for l in body.splitlines())
+    assert any("NSET=I_CORNER" in l.upper() for l in body.splitlines())
+
+
+def test_rigid_body_refnode_instance_qualified():
+    # *RIGID BODY names its control node through REF NODE= (a parameter).  An instance-
+    # qualified value must resolve to the renamed node set that flattening emits.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=body\n1,1,2,3,4\n*Nset, nset=ref\n1\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I, part=P\n*End Instance\n"
+            "*Rigid Body, ref node=I.ref, elset=I.body\n*End Assembly\n")
+    body, _, _ = convert_str(deck)
+    rb = [l for l in body.splitlines() if "RIGID BODY" in l.upper()][0]
+    assert "I_REF" in rb.upper() and "I_BODY" in rb.upper()
+    assert "I.REF" not in rb.upper() and "I.BODY" not in rb.upper()
+    assert any("NSET=I_REF" in l.upper() for l in body.splitlines())
+
+
+def test_assembly_instance_set_three_level_ref():
+    # Some exporters qualify a member with the assembly name as well (Assembly.Instance.set).
+    # Flattening must strip the outer assembly level and resolve to the renamed instance set.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=body\n1,1,2,3,4\n*Nset, nset=edge\n1,2\n"
+            "*Solid Section, elset=body, material=m\n*End Part\n"
+            "*Assembly, name=ASM\n*Instance, name=INST, part=P\n*End Instance\n*End Assembly\n"
+            "*Material, name=m\n*Elastic\n1.,0.3\n"
+            "*Step\n*Static\n*Boundary\nASM.INST.edge, 1, 2\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.upper().startswith("*BOUNDARY"))
+    assert lines[i + 1].upper().startswith("INST_EDGE")          # ASM. stripped, INST.edge joined
+    assert "ASM.INST" not in body.upper() and "INST.EDGE" not in body.upper()
+    assert any("NSET=INST_EDGE" in l.upper() for l in lines)     # the set it points at exists
+
+
+def test_element_load_uses_element_offset():
+    # An element/face-based load that names an element by instance-qualified id (I2.1)
+    # must take the ELEMENT offset, not the node offset.  Two single-element instances:
+    # I2's element 1 -> global element 2 (elem_off=1), which must NOT be read as node 5
+    # (node_off=4).  Guards *DFLUX/*DFILM/*FILM/*RADIATE being treated as element-based.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=e\n1,1,2,3,4\n*Solid Section, elset=e, material=m\n1.0\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
+            "*Instance, name=I2, part=P\n2.,0.,0.\n*End Instance\n*End Assembly\n"
+            "*Material, name=m\n*Elastic\n1.,0.3\n"
+            "*Step\n*Heat Transfer\n*Dflux\nI2.1, BF, 10.0\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.upper().startswith("*DFLUX"))
+    first = lines[i + 1].split(",")[0].strip()
+    assert first == "2", f"*DFLUX element ref took the wrong offset: expected '2', got '{first}'"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
