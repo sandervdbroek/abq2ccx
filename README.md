@@ -147,10 +147,11 @@ Every keyword falls into one of five buckets:
 
 ## Keyword reference
 
-Verified against the CalculiX CrunchiX manual (v2.7 HTML / v2.22 PDF), and the
-`calculix/new_keywords` and `calculix/cae` keyword lists (which track the exact
-Abaqus↔CalculiX delta). The converter knows the complete **CalculiX 2.22 keyword
-set (141 cards)**; any Abaqus card in that set is emitted unchanged.
+Verified against the CalculiX CrunchiX manual (v2.7 HTML / v2.22 PDF) plus the 2.23
+release notes, and the `calculix/new_keywords` and `calculix/cae` keyword lists (which
+track the exact Abaqus↔CalculiX delta). The converter knows the complete **CalculiX
+2.22 + 2.23 keyword set (143 cards)**; any Abaqus card in that set is emitted unchanged.
+`*DAMAGE INITIATION` (new in ccx 2.23) is passed through with a version/criterion note.
 
 ### Translated / equivalent (dedicated handlers)
 
@@ -283,9 +284,11 @@ converter warns about the ones it can detect; the rest are here so you know to c
 * Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
 * The converter validates *structure*, not *physics*. Run `ccx` and sanity-check.
-* Targets CalculiX 2.22; the latest release is 2.23 (Nov 2025), which is backward
-  compatible and only adds capability. Solid/shell node ordering is verified
-  identical to Abaqus (so connectivity is passed through unchanged).
+* Targets CalculiX 2.22–2.23. `*DAMAGE INITIATION` (added in 2.23) is emitted; newer
+  Abaqus 2024/2025 cards (`*STEP CYCLING`, `*PIEZORESISTIVITY`, `*ELECTRIC MACHINE …`,
+  `*ALLOWABLE STRESS`, …) have no ccx equivalent and are commented with guidance.
+  Solid/shell node ordering is verified identical to Abaqus (so connectivity is passed
+  through unchanged).
 
 ---
 

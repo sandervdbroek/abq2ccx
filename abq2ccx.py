@@ -986,16 +986,18 @@ PROC_KW = {"STATIC", "FREQUENCY", "BUCKLE", "DYNAMIC", "MODAL DYNAMIC", "HEAT TR
            "UNCOUPLED TEMPERATURE-DISPLACEMENT", "CRACK PROPAGATION", "HCF", "SENSITIVITY",
            "FEASIBLE DIRECTION", "NO ANALYSIS"}
 
-# The COMPLETE set of CalculiX (ccx 2.22) input keywords, verified against the ccx
-# user manual (dhondt.de 2.22 PDF) and the calculix/new_keywords + calculix/cae
-# keyword lists.  Any Abaqus keyword found here is emitted as-is (CalculiX accepts
-# it); anything NOT here and without a dedicated handler has no direct equivalent
+# The COMPLETE set of CalculiX (ccx 2.22 + 2.23) input keywords, verified against the ccx
+# user manual (dhondt.de 2.22 PDF, 2.23 release notes) and the calculix/new_keywords +
+# calculix/cae keyword lists.  Any Abaqus keyword found here is emitted as-is (CalculiX
+# accepts it); anything NOT here and without a dedicated handler has no direct equivalent
 # and is commented out with a warning (see translate_one) rather than silently kept.
+# *DAMAGE INITIATION was introduced in ccx 2.23 (calculix/new_keywords#4).
 CCX_KEYWORDS = {
     # model definition
     "AMPLITUDE", "BASE MOTION", "BEAM SECTION", "CFD", "CHANGE FRICTION", "CLEARANCE",
     "CONDUCTIVITY", "CONSTRAINT", "CONTACT DAMPING", "CONTACT PAIR", "CORRELATION LENGTH",
-    "COUPLING", "CREEP", "CYCLIC HARDENING", "CYCLIC SYMMETRY MODEL", "DAMPING", "DASHPOT",
+    "COUPLING", "CREEP", "CYCLIC HARDENING", "CYCLIC SYMMETRY MODEL", "DAMAGE INITIATION",
+    "DAMPING", "DASHPOT",
     "DEFORMATION PLASTICITY", "DENSITY", "DEPVAR", "DESIGN RESPONSE", "DESIGN VARIABLES",
     "DISTRIBUTING", "DISTRIBUTING COUPLING", "DISTRIBUTION", "ELASTIC",
     "ELECTRICAL CONDUCTIVITY", "ELECTROMAGNETICS", "ELEMENT", "ELSET", "EQUATION",
@@ -1046,6 +1048,10 @@ SEMANTIC_TRAP = {
 }
 # Supported by ccx but worth a heads-up about a behavioural/interface difference.
 PASS_WITH_NOTE = {
+    "DAMAGE INITIATION": "*DAMAGE INITIATION was added in ccx 2.23 and is emitted unchanged; ccx "
+                "implements a subset of Abaqus' damage-initiation criteria and has no *DAMAGE "
+                "EVOLUTION card, so verify your ccx version (>= 2.23), the CRITERION, and that "
+                "progressive damage is not required to soften/fail the material.",
     "COUPLING": "*COUPLING + *KINEMATIC/*DISTRIBUTING is accepted by recent ccx, but ccx "
                 "*KINEMATIC requires an explicit DOF list (Abaqus allows none = all 6) — verify.",
     "USER MATERIAL": "*USER MATERIAL kept, but ccx uses its own umat interface (umat_*.f), not an "
@@ -1066,9 +1072,8 @@ SPECIAL_UNSUPPORTED = {
     "GASKET BEHAVIOR": "gasket behaviour has no ccx equivalent.",
     "COHESIVE SECTION": "ccx has no cohesive element; model debonding with contact (*SURFACE "
                         "BEHAVIOR) or a nonlinear *SPRING.",
-    "DAMAGE INITIATION": "progressive-damage is unsupported by ccx 2.22 (ccx 2.23 adds a "
-                         "*DAMAGE INITIATION card — verify your version and CRITERION).",
-    "DAMAGE EVOLUTION": "progressive-damage evolution is unsupported by ccx; drop.",
+    "DAMAGE EVOLUTION": "ccx 2.23 added *DAMAGE INITIATION but not *DAMAGE EVOLUTION, so "
+                        "progressive damage cannot fully run (the material will not soften/fail); drop.",
     "FIELD": "*FIELD predefined fields are unsupported; use *INITIAL CONDITIONS / *TEMPERATURE / "
              "*DISTRIBUTION instead.",
     "REBAR": "rebar/reinforcement layers have no ccx equivalent; mesh reinforcements explicitly.",
@@ -1077,6 +1082,22 @@ SPECIAL_UNSUPPORTED = {
     "CONCRETE": "concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel.",
     "CONCRETE DAMAGED PLASTICITY": "unsupported by ccx; substitute *PLASTIC or remodel.",
     "CONNECTOR ELASTICITY": "connector behaviour has no ccx equivalent; see *CONNECTOR SECTION.",
+    # Newer Abaqus keywords (2024/2025) with no ccx equivalent (calculix/new_keywords#4).
+    "ALLOWABLE STRESS": "Abaqus 2024 optimisation stress limit; ccx has no equivalent — express a "
+                        "stress constraint via *DESIGN RESPONSE/*CONSTRAINT in a *SENSITIVITY run.",
+    "REDUCED BASIS GENERATE": "Abaqus 2024 reduced-order-basis generation has no ccx equivalent; drop.",
+    "SUBMODEL CUT": "Abaqus 2024 submodel-cut card; ccx drives submodels with *SUBMODEL plus "
+                    "*BOUNDARY/*CLOAD, SUBMODEL — remodel using those.",
+    "WEAR SURFACE PROPERTIES": "Abaqus 2024 surface-wear properties have no ccx equivalent; drop.",
+    "ELECTRICAL RESISTIVITY": "ccx parameterises conduction by *ELECTRICAL CONDUCTIVITY (the "
+                              "inverse); convert resistivity -> conductivity.",
+    "ELECTRIC MACHINE LOAD": "Abaqus 2024 electric-machine load has no ccx equivalent; drop.",
+    "ELECTRIC MACHINE PROPERTY": "Abaqus 2024 electric-machine property has no ccx equivalent; drop.",
+    "ELEMENT USER OUTPUT VARIABLES": "Abaqus UVARM-style user output; ccx has no equivalent (fill "
+                                     "state variables via *DEPVAR + a ccx umat instead).",
+    "PIEZORESISTIVITY": "Abaqus 2024 piezoresistive coupling has no ccx equivalent; drop.",
+    "STEP CYCLING": "Abaqus 2025 step cycling has no ccx equivalent; remodel as repeated steps.",
+    "STEP CYCLING CONTROL": "Abaqus 2025 step-cycling controls have no ccx equivalent; drop.",
 }
 
 # ---- output variable maps (Abaqus identifier -> ccx) --------------------------

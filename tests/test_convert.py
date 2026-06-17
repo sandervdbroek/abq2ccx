@@ -512,6 +512,33 @@ def test_named_bc_condition_on_instance_set():
     assert "I.FIX" not in body.upper()
 
 
+def test_damage_initiation_emitted_for_ccx223():
+    # ccx 2.23 added *DAMAGE INITIATION: it is now emitted (pass-through, with its data),
+    # while *DAMAGE EVOLUTION (still not in ccx) stays commented out.
+    deck = ("*Material, name=m\n*Elastic\n210000., 0.3\n"
+            "*Damage Initiation, criterion=DUCTILE\n0.1, 0.0, 0.0\n"
+            "*Damage Evolution, type=DISPLACEMENT\n0.001,\n")
+    body, _, _ = convert_str(deck)
+    lines = body.splitlines()
+    i = next((k for k, l in enumerate(lines) if l.upper().startswith("*DAMAGE INITIATION")), None)
+    assert i is not None, "expected *DAMAGE INITIATION emitted as a real card"
+    assert lines[i + 1].strip().startswith("0.1")          # its data row survives
+    de = [l for l in lines if "DAMAGE EVOLUTION" in l.upper()]
+    assert de and all(l.lstrip().startswith("**") for l in de)  # evolution commented out
+
+
+def test_new_abaqus_keywords_targeted_guidance():
+    # Newer Abaqus keywords (2024/2025) are recognised and commented with TARGETED guidance,
+    # not the generic "no direct CalculiX equivalent" fallback.
+    deck = ("*Material, name=m\n*Elastic\n1.,0.3\n*Electrical Resistivity\n1.7e-8,\n"
+            "*Step\n*Static\n*Step Cycling\n10,\n*End Step\n")
+    _, _, rep = convert_str(deck)
+    txt = rep.text().upper()
+    assert "ELECTRICAL CONDUCTIVITY" in txt                 # resistivity -> conductivity hint
+    assert "STEP CYCLING" in txt and "REPEATED STEPS" in txt
+    assert "NO DIRECT CALCULIX EQUIVALENT" not in txt       # targeted, not the generic fallback
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
