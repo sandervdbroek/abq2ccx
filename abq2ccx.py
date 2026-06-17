@@ -98,6 +98,7 @@ ELEMENT_NNODES: Dict[str, int] = {
 ELEMENT_TYPE_MAP: Dict[str, str] = {
     "S3R": "S3", "STRI3": "S3", "STRI65": "S6", "S4R5": "S4R", "S8R5": "S8R",
     "B23": "B33", "B22": "B32", "B33": "B31", "B33H": "B31",          # no cubic/2-node-2D beams
+    "T2D3": "T3D3",                                                   # 3-node 2D truss -> 3-node 3D truss
     "B21H": "B21", "B31H": "B31", "B32H": "B32",                      # hybrid beams
     "PIPE21": "B21", "PIPE22": "B32", "PIPE31": "B31", "PIPE32": "B32",  # internal pressure lost
     "CPEG3": "CPE3", "CPEG4": "CPE4", "CPEG4R": "CPE4R", "CPEG6": "CPE6",  # gen. plane strain
@@ -770,7 +771,7 @@ def reflect_point(p: Vec, kind: str, data: Sequence[Vec]) -> Optional[Vec]:
 
 def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NGEN`` -> straight-line node generation between two existing nodes."""
-    if any(k in block.params for k in ("LINE",)) and (block.param("LINE") or "").upper().startswith("C"):
+    if (block.param("LINE") or "").upper().startswith("C"):
         report.warn("*NGEN with circular LINE=C is not supported; nodes not generated.")
         return []
     created: List[int] = []
@@ -785,6 +786,10 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
             continue
         p1, p2 = geom.nodes[n1], geom.nodes[n2]
         ids = list(range(n1, n2 + (1 if inc > 0 else -1), inc))
+        if not ids:
+            report.warn(f"*NGEN endpoints {n1},{n2} with increment {inc} generated no nodes "
+                        f"(check the ordering/sign of the range); skipped.", once=True)
+            continue
         steps = len(ids) - 1
         for k, nid in enumerate(ids):
             t = k / steps if steps else 0.0
@@ -1728,7 +1733,14 @@ class Converter:
                                  f"*DLOAD automatically.", once=True)
                 continue
             for token, face in sd[1]:
-                pl = "P" + face[1] if face and re.fullmatch(r"S[1-6]", face) else "P"
+                if face and re.fullmatch(r"S[1-6]", face):
+                    pl = "P" + face[1]
+                else:
+                    self.report.warn(f"*DSLOAD on '{surf}': face '{face or '?'}' has no ccx Px "
+                                     f"equivalent (ccx needs P1..P6 for element pressure); emitted "
+                                     f"with a bare 'P' which ccx will reject — set the face manually.",
+                                     once=True)
+                    pl = "P"
                 line = f"{token}, {pl}"
                 if mag != "":
                     line += f", {mag}"
@@ -2286,9 +2298,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     for sname, ids in geo.elsets.items():
         out.append(set_block("ELSET", namer(inst["name"], sname), [i + elem_off for i in ids]))
 
-    # per-instance sections / orientations / surfaces (remap names)
+    # per-instance sections / orientations / surfaces (remap names).  Use .get() (as the
+    # build_geometry call above does): an independent instance can carry its own mesh while
+    # referencing a PART= name that was never declared (typo / un-included file) — index it
+    # raw and one bad instance would KeyError out of the whole conversion.
     prefix = inst["name"]
-    for b in parts[inst["part"]] + inst["extra"]:
+    for b in parts.get(inst["part"], []) + inst["extra"]:
         if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION"):
             out.append(_remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer))
         elif b.keyword == "ORIENTATION":

@@ -539,6 +539,39 @@ def test_new_abaqus_keywords_targeted_guidance():
     assert "NO DIRECT CALCULIX EQUIVALENT" not in txt       # targeted, not the generic fallback
 
 
+def test_t2d3_maps_to_t3d3():
+    # 3-node 2D truss has no ccx name; route it to the (node-count-identical) 3-node 3D
+    # truss T3D3 instead of emitting a literal T2D3 that ccx rejects.
+    assert A.ccx_element_type("T2D3", A.Report()) == "T3D3"
+
+
+def test_independent_instance_undefined_part_no_crash():
+    # An independent *Instance can carry its own mesh while naming a PART= that was never
+    # declared (typo / un-included file).  This must not KeyError out of the conversion.
+    deck = ("*Assembly, name=A\n*Instance, name=I, part=GHOST\n"
+            "*Node\n1,0.,0.,0.\n2,1.,0.,0.\n*Element, type=T3D2, elset=e\n1,1,2\n"
+            "*End Instance\n*End Assembly\n")
+    body, _, _ = convert_str(deck)
+    assert any(l.upper().startswith("*ELEMENT") for l in body.splitlines())  # mesh still emitted
+
+
+def test_dsload_unmappable_face_warns():
+    # *DSLOAD on a surface whose face is not S1..S6 (e.g. a shell SPOS) cannot become a ccx
+    # Px label; it must warn rather than silently emit a bare 'P' that ccx rejects.
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n*Element,type=S4,elset=e\n1,1,2,3,4\n"
+            "*Surface,type=element,name=sf\ne, SPOS\n*Step\n*Static\n*Dsload\nsf, P, 5.0\n*End Step\n")
+    _, _, rep = convert_str(deck)
+    assert "px equivalent" in rep.text().lower()
+
+
+def test_ngen_descending_range_warns():
+    # A descending *NGEN range with the default positive increment yields no nodes; that
+    # silent edge-drop must surface as a warning.
+    deck = "*Node\n1,0.,0.,0.\n10,9.,0.,0.\n*Ngen, nset=line\n10,1\n"
+    _, _, rep = convert_str(deck)
+    assert "generated no nodes" in rep.text().lower()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
