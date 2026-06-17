@@ -134,7 +134,7 @@ def test_comprehensive_coverage():
     # element substitutions (node-count preserving)
     assert "*ELEMENT, TYPE=C3D8\n" in body            # C3D8H -> C3D8 (hybrid)
     assert "*ELEMENT, TYPE=C3D8I\n" in body           # SC8R -> C3D8I (continuum shell)
-    assert "*ELEMENT, TYPE=COH3D8\n" in body          # cohesive kept (warned, no equivalent)
+    assert "TYPE=COH3D8" not in body                  # COH3D8 -> C3D8 (ccx has no cohesive; warned)
     # organisational cards dropped
     assert "*PREPRINT" not in body and "*PARAMETER" not in body
     # unsupported -> commented out, not silently kept
@@ -570,6 +570,51 @@ def test_ngen_descending_range_warns():
     deck = "*Node\n1,0.,0.,0.\n10,9.,0.,0.\n*Ngen, nset=line\n10,1\n"
     _, _, rep = convert_str(deck)
     assert "generated no nodes" in rep.text().lower()
+
+
+def test_cohesive_element_substituted_to_continuum():
+    # ccx has no cohesive element; COH* is approximated by the node-count-identical
+    # continuum element so the mesh is at least parseable, with a strong warning.
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n"
+            "*Element, type=COH3D8, elset=c\n1,1,2,3,4,5,6,7,8\n")
+    body, _, rep = convert_str(deck)
+    el = [l for l in body.splitlines() if l.upper().startswith("*ELEMENT")][0]
+    assert "TYPE=C3D8" in el.upper() and "COH" not in el.upper()
+    txt = rep.text().lower()
+    assert "cohesive" in txt and "zero-thickness" in txt        # behaviour-lost + degeneracy warning
+
+
+def test_cohesive_2d_maps_to_plane_strain():
+    deck = "*Node\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n*Element, type=COH2D4, elset=c\n1,1,2,3,4\n"
+    body, _, _ = convert_str(deck)
+    el = [l for l in body.splitlines() if l.upper().startswith("*ELEMENT")][0]
+    assert "TYPE=CPE4" in el.upper()
+
+
+def test_cohesive_section_becomes_solid_section():
+    # The cohesive ELEMENT is substituted by a continuum, so *Cohesive Section must become
+    # a *Solid Section (same elset+material) — otherwise the substituted elements are
+    # section-less and ccx errors "no material assigned".
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n"
+            "*Element, type=COH3D8, elset=c\n1,1,2,3,4,5,6,7,8\n"
+            "*Cohesive Section, elset=c, material=glue, response=TRACTION SEPARATION\n"
+            "*Material, name=glue\n*Elastic\n1000., 0.3\n")
+    body, _, _ = convert_str(deck)
+    sol = [l for l in body.splitlines() if l.upper().startswith("*SOLID SECTION")]
+    assert any("ELSET=C," in l.upper() and "MATERIAL=GLUE" in l.upper() for l in sol)
+    assert "** *COHESIVE SECTION" not in body          # translated, not commented out
+
+
+def test_pore_pressure_element_suffix_dropped():
+    # ccx has no coupled displacement/pore-pressure element; CAX4P -> CAX4 (pore-pressure
+    # DOF dropped) with a warning, analogous to the coupled-temperature T suffix.
+    deck = "*Node\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n*Element, type=CAX4P, elset=e\n1,1,2,3,4\n"
+    body, _, rep = convert_str(deck)
+    el = [l for l in body.splitlines() if l.upper().startswith("*ELEMENT")][0]
+    assert "TYPE=CAX4" in el.upper() and "CAX4P" not in el.upper()
+    assert "pore-pressure" in rep.text().lower()
 
 
 if __name__ == "__main__":

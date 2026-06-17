@@ -85,8 +85,9 @@ ELEMENT_NNODES: Dict[str, int] = {
     # springs / dashpots / gaps / mass / coupling
     "SPRING1": 1, "SPRING2": 2, "SPRINGA": 2, "DASHPOT1": 2, "DASHPOT2": 2, "DASHPOTA": 2,
     "GAPUNI": 2, "GAPCYL": 2, "GAPSPHER": 2, "MASS": 1, "ROTARYI": 1, "DCOUP3D": 1,
-    # cohesive / connector / rigid (no ccx equivalent -- warned, not substituted)
+    # cohesive / gasket (approximated by a thin continuum) / connector / rigid
     "COH2D4": 4, "COH3D6": 6, "COH3D8": 8, "COHAX4": 4, "CONN3D2": 2, "CONN2D2": 2,
+    "GK3D8": 8, "GK3D6": 6, "GK2D4": 4, "GK2D6": 6, "GKPS4": 4, "GKPS6": 6, "GKAX4": 4, "GKAX6": 6,
     "R3D3": 3, "R3D4": 4, "RB2D2": 2, "RB3D2": 2, "RAX2": 2,
     # heat-transfer continuum (Abaqus-compatible names accepted by ccx)
     "DC3D4": 4, "DC3D6": 6, "DC3D8": 8, "DC3D10": 10, "DC3D15": 15, "DC3D20": 20,
@@ -115,6 +116,13 @@ ELEMENT_TYPE_MAP: Dict[str, str] = {
     "C3D4H": "C3D4", "C3D6H": "C3D6", "C3D8H": "C3D8", "C3D8RH": "C3D8R", "C3D8IH": "C3D8I",
     "C3D10H": "C3D10", "C3D15H": "C3D15", "C3D20H": "C3D20", "C3D20RH": "C3D20R",
     "CPE4H": "CPE4", "CPE8H": "CPE8", "CAX4H": "CAX4", "CAX8H": "CAX8",
+    # cohesive / gasket: ccx has no such formulation, so approximate each by the
+    # node-count-identical CONTINUUM element (a thin bonded/compressed layer).  The
+    # special behaviour is lost and a ZERO-thickness layer fails — ccx_element_type
+    # emits a strong, targeted warning for these (COH*/GK* prefixes).
+    "COH3D8": "C3D8", "COH3D6": "C3D6", "COH2D4": "CPE4", "COHAX4": "CAX4",
+    "GK3D8": "C3D8", "GK3D6": "C3D6", "GK2D4": "CPE4", "GK2D6": "CPE6",
+    "GKPS4": "CPS4", "GKPS6": "CPS6", "GKAX4": "CAX4", "GKAX6": "CAX6",
 }
 
 # Element types CalculiX supports directly (verified, ccx 2.22).  Used to tell a
@@ -136,16 +144,16 @@ UNSUPPORTED_ELEM_PREFIXES = ("COH", "GK", "GKPS", "GKAX", "CONN", "ROTARYI")
 
 
 def element_node_count(typ: str) -> Optional[int]:
-    """Node count used to parse connectivity, tolerant of the coupled-temperature
-    ``T`` and hybrid ``H`` suffixes (neither changes the node count, e.g. ``C3D8T``,
-    ``CAX4RT``, ``C3D20HT`` all have the same count as their base)."""
+    """Node count used to parse connectivity, tolerant of the coupled-temperature ``T``,
+    hybrid ``H`` and pore-pressure ``P`` suffixes (none changes the node count, e.g.
+    ``C3D8T``, ``CAX4RT``, ``C3D20HT``, ``CAX4P`` all match their base's count)."""
     typ = typ.upper()
     if typ in ELEMENT_NNODES:
         return ELEMENT_NNODES[typ]
     if typ in ELEMENT_TYPE_MAP:                 # mapped types keep their node count
         return ELEMENT_NNODES.get(ELEMENT_TYPE_MAP[typ])
     base = typ
-    while base and base[-1] in ("T", "H"):
+    while base and base[-1] in ("T", "H", "P"):
         base = base[:-1]
         if base in ELEMENT_NNODES:
             return ELEMENT_NNODES[base]
@@ -160,8 +168,15 @@ def ccx_element_type(typ: str, report: "Report") -> str:
     typ = typ.upper()
     if typ in ELEMENT_TYPE_MAP:
         sub = ELEMENT_TYPE_MAP[typ]
-        report.warn(f"Element {typ} -> {sub} (no native CalculiX type; node-count-preserving "
-                    f"substitution — verify it is acceptable).", once=True)
+        if typ.startswith(("COH", "GK")):
+            report.warn(f"Element {typ} has no ccx formulation; approximated by the continuum "
+                        f"element {sub} (node-count-preserving, runs as a thin elastic layer). The "
+                        f"cohesive/gasket behaviour (separation/closure) is LOST, and a ZERO-thickness "
+                        f"layer fails with a nonpositive-jacobian error — give the layer a small finite "
+                        f"thickness or remodel with contact/*SPRING. Verify the result.", once=True)
+        else:
+            report.warn(f"Element {typ} -> {sub} (no native CalculiX type; node-count-preserving "
+                        f"substitution — verify it is acceptable).", once=True)
         return sub
     if typ in CCX_ELEMENTS:
         return typ
@@ -178,7 +193,15 @@ def ccx_element_type(typ: str, report: "Report") -> str:
     if typ.endswith("H") and len(typ) > 1 and (typ[:-1] in CCX_ELEMENTS or typ[:-1] in ELEMENT_TYPE_MAP):
         report.warn(f"Element {typ} -> {typ[:-1]} (CalculiX has no hybrid formulation).", once=True)
         return ccx_element_type(typ[:-1], report)
-    if typ.startswith(("R3D", "RB2", "RB3", "RAX")):
+    # Pore-pressure (coupled displacement / pore-pressure) elements (the ``P`` suffix):
+    # ccx has no pore-pressure element, so fall back to the mechanical base and drop the
+    # pore-pressure DOF (e.g. CAX4P->CAX4, CPE8P->CPE8, C3D8P->C3D8).
+    if typ.endswith("P") and len(typ) > 1 and (typ[:-1] in CCX_ELEMENTS or typ[:-1] in ELEMENT_TYPE_MAP):
+        report.warn(f"Element {typ} -> {typ[:-1]}: ccx has no pore-pressure (coupled u-p) element; "
+                    f"the pore-pressure DOF is dropped and only the mechanical response is solved — "
+                    f"consolidation/seepage is NOT modelled. Verify.", once=True)
+        return ccx_element_type(typ[:-1], report)
+    if typ.startswith(("R3D", "RB2", "RB3", "RAX", "R2D")):
         report.warn(f"Element {typ} is a rigid (R3D/RB) element; ccx has no rigid element — define "
                     f"the region as a *RIGID BODY (NSET + REF NODE/ROT NODE) instead. Emitted "
                     f"unchanged.", once=True)
@@ -1072,8 +1095,6 @@ SPECIAL_UNSUPPORTED = {
     "CONNECTOR SECTION": "connectors have no ccx element; remodel as *RIGID BODY / *MPC / *SPRING / "
                          "*DASHPOT per the connector behaviour.",
     "CONNECTOR BEHAVIOR": "connector behaviour has no ccx equivalent; see *CONNECTOR SECTION.",
-    "GASKET SECTION": "gaskets have no ccx element/material; approximate with a thin soft solid or "
-                      "*SPRING.",
     "GASKET BEHAVIOR": "gasket behaviour has no ccx equivalent.",
     "COHESIVE SECTION": "ccx has no cohesive element; model debonding with contact (*SURFACE "
                         "BEHAVIOR) or a nonlinear *SPRING.",
@@ -1384,6 +1405,8 @@ class Converter:
             "SHELL SECTION": self.handle_shell_section,
             "SHELL GENERAL SECTION": self.handle_shell_section,
             "BEAM SECTION": self.handle_beam_section,
+            "COHESIVE SECTION": self.handle_cohesive_section,
+            "GASKET SECTION": self.handle_cohesive_section,
             "TIE": self.handle_tie,
             "BOUNDARY": self.handle_boundary,
             "DLOAD": self.handle_dload,
@@ -1504,6 +1527,25 @@ class Converter:
             else:
                 self.report.note(f"*SOLID SECTION parameter {k} dropped (unused by ccx).", once=True)
         return [emit_keyword("SOLID SECTION", keep)] + list(b.data)
+
+    def handle_cohesive_section(self, b: Block) -> List[str]:
+        """``*COHESIVE SECTION`` / ``*GASKET SECTION`` -> ``*SOLID SECTION``.  The cohesive/
+        gasket elements are substituted by a thin continuum (see ccx_element_type), so they
+        need an ordinary solid section.  The traction-separation / closure law is NOT
+        reproduced -- the layer runs as an elastic solid and MATERIAL must be a valid solid
+        material (a traction *ELASTIC, TYPE=... would be rejected by ccx)."""
+        kind = "cohesive" if b.keyword == "COHESIVE SECTION" else "gasket"
+        elset, mat = b.param("ELSET"), b.param("MATERIAL")
+        if not elset or not mat:
+            return self._commented(b, f"*{b.keyword} has no ELSET/MATERIAL to map to *SOLID SECTION.")
+        self.report.warn(f"*{b.keyword} -> *SOLID SECTION: the {kind} elements run as a thin elastic "
+                         f"solid, so the {kind} traction/closure behaviour is NOT modelled; ensure "
+                         f"MATERIAL={mat} is a valid solid material (a traction-separation "
+                         f"*ELASTIC, TYPE=... will be rejected by ccx). Verify.", once=True)
+        keep: "OrderedDict[str, Optional[str]]" = OrderedDict([("ELSET", elset), ("MATERIAL", mat)])
+        if b.param("ORIENTATION"):
+            keep["ORIENTATION"] = b.param("ORIENTATION")
+        return [emit_keyword("SOLID SECTION", keep)]
 
     def handle_beam_section(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()

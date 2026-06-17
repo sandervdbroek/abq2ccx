@@ -139,9 +139,9 @@ Every keyword falls into one of five buckets:
 | --- | --- | --- |
 | **Supported** | emit as-is (it's in the CalculiX keyword set) | `*PLASTIC`, `*HYPERELASTIC`, `*CONTACT PAIR`, `*EQUATION`, `*DENSITY` |
 | **Translated** | dedicated handler adjusts keyword/params/data | `*NCOPY`, `*ELGEN`, `*ELASTIC`, `*SHELL SECTION` composite, `*STEP`, `*DSLOAD`, output cards |
-| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*RIGID BODY`, `*MPC,TIE`→`*EQUATION`, `*DSLOAD`(pressure)→`*DLOAD` |
+| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*RIGID BODY`, `*MPC,TIE`→`*EQUATION`, `*DSLOAD`(pressure)→`*DLOAD`, `*COHESIVE/GASKET SECTION`→`*SOLID SECTION` (thin-continuum approx) |
 | **Dropped** | organisational, no CalculiX meaning | `*PART/*INSTANCE/*ASSEMBLY` (flattened), `*PREPRINT`, `*PARAMETER`, `*SYSTEM` |
-| **Commented** | no equivalent — emitted as `**` comments + warning | `*VISCOELASTIC`, `*CONNECTOR SECTION`, `*GASKET *`, `*COHESIVE *`, `*INERTIA RELIEF`, `*FIELD` |
+| **Commented** | no equivalent — emitted as `**` comments + warning | `*VISCOELASTIC`, `*CONNECTOR SECTION`, `*GASKET BEHAVIOR`, `*INERTIA RELIEF`, `*FIELD`, `*CONCRETE *` |
 
 ---
 
@@ -212,13 +212,20 @@ pressure-face labels (`P1..P6`) carry across unchanged. Element handling:
   `M3D3/4/4R/6/8/8R`, `CPS*`, `CPE*`, `CAX*`, `B21/31/31R/32/32R`, `T2D2/T3D2/T3D3`,
   `SPRING*`, `DASHPOTA`, `GAPUNI`, `MASS`, `DC3D*`, `F3D*`.
 * **Substituted** (node-count preserving, warned): `S3R→S3`, `STRI3→S3`,
-  `STRI65→S6`, `S4R5→S4R`, `S8R5→S8R`, `B22→B32`, `B33→B31`, `PIPE3x→B3x`,
+  `STRI65→S6`, `S4R5→S4R`, `S8R5→S8R`, `B22→B32`, `B33→B31`, `T2D3→T3D3`, `PIPE3x→B3x`,
   `CPEG*→CPE*` (generalized plane strain), `CGAX*→CAX*` (generalized axisym),
   `SC6R→C3D6`/`SC8R→C3D8I` (continuum shell → solid), `C3D10M→C3D10`,
   `DASHPOT1/2→DASHPOTA`, `GAPCYL/GAPSPHER→GAPUNI`, and all hybrid `…H` → non-hybrid
   base (ccx has no mixed u/p formulation).
+* **Best-effort approximation** (node-count preserving, *strong* warning — behaviour lost):
+  cohesive `COH*` and gasket `GK*` → the matching thin continuum (`COH3D8→C3D8`,
+  `COH2D4→CPE4`, `GK3D8→C3D8`, …), with `*COHESIVE/GASKET SECTION → *SOLID SECTION`.
+  The layer runs as a bonded/elastic solid; the traction-separation / closure law is
+  **not** reproduced and a *zero-thickness* layer fails — give it a small finite
+  thickness or remodel with contact. Pore-pressure `…P` → mechanical base
+  (`CAX4P→CAX4`): the pore-pressure DOF is dropped (no consolidation).
 * **No equivalent** (emitted unchanged, strong warning — needs remodelling):
-  cohesive `COH*`, gasket `GK*`, connector `CONN*`, `ROTARYI`.
+  connector `CONN*`, `ROTARYI`, rigid `R2D/R3D/RB*` (use `*RIGID BODY` instead).
 
 ---
 
