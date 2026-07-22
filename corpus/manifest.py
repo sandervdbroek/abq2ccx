@@ -10,7 +10,7 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 `python corpus/fetch.py` to download into corpus/files/ (gitignored), then
 `python tests/test_corpus.py`.
 
-1022 decks from ~179 public GitHub repositories; 386 expected to solve in
+1022 decks from ~179 public GitHub repositories; 385 expected to solve in
 CalculiX 2.22. Every deck converts cleanly (zero dangling references); the 636
 non-solving decks use features ccx cannot run - UMAT/VUMAT user materials, *USER ELEMENT
 (UEL), cohesive elements, explicit dynamics, piezoelectric/acoustic coupling, connectors,
@@ -234,8 +234,13 @@ CORPUS = [
     dict(name='dheller1_hochbauplatte', expect_solve=True, license='none stated',
          exercises='S4R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/dheller1/inp2feap/master/example/hochbauplatte.inp'),
-    dict(name='dithoap_truss_no_umat_disp_cyclic', expect_solve=True, license='MIT',
-         exercises='T3D2 — parts/instances/assembly; *Orientation',
+    # expect_solve history: solved while EQUALLY SPACED amplitudes were mis-emitted as raw
+    # (t,A) pairs (benign garbage loading).  With the amplitude now converted correctly the
+    # deck applies its true cyclic load reversals and ccx 2.22 stops with 'no convergence'
+    # (nonlinear kinematic-hardening truss under full reversal — an analysis limitation,
+    # not a conversion defect).
+    dict(name='dithoap_truss_no_umat_disp_cyclic', expect_solve=False, license='MIT',
+         exercises='T3D2 — parts/instances/assembly; *Orientation; EQUALLY SPACED amplitude',
          url='https://raw.githubusercontent.com/dithoap/RESSForLab/master/testing/Truss-No-UMAT-Disp-Cyclic.inp'),
     dict(name='dlr_amr_test_cube_unstructured_1', expect_solve=True, license='GPL-2.0',
          exercises='T3D2, CPS4, C3D8',

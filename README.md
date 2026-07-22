@@ -105,7 +105,7 @@ python corpus/fetch.py             # download the decks into corpus/files/ (giti
 python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
-Results: **all 1022 convert with zero dangling references, and 386 solve in CalculiX.**
+Results: **all 1022 convert with zero dangling references, and 385 solve in CalculiX.**
 The other 636 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT,
 explicit dynamics, cohesive/connector elements, piezoelectric/acoustic coupling, other
 user subroutines) or are CAE part fragments / incomplete source decks — each verified to

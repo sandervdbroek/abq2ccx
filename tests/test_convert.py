@@ -230,14 +230,23 @@ def test_rigid_element_flagged():
 
 
 def test_name_length_limit():
+    # ccx 2.22's real set-name limit is 80 chars (verified: 80 resolves correctly, >80 stops
+    # with 'set name too long').  Flattened names must stay <= 80 but are NOT needlessly
+    # truncated below that, so CAE names like Instance_SetName keep full fidelity.
     deck = ("*PART, NAME=PART\n" + HEX +
-            "*NSET, NSET=A_VERY_LONG_NODE_SET_NAME_INDEED\n1,2,3,4\n*END PART\n"
+            "*NSET, NSET=A_VERY_LONG_NODE_SET_NAME_INDEED\n1,2,3,4\n"
+            "*NSET, NSET=" + "X" * 78 + "\n1,2\n*END PART\n"
             "*ASSEMBLY, NAME=ASM\n*INSTANCE, NAME=INSTANCE_NUMBER_ONE, PART=PART\n*END INSTANCE\n"
             "*END ASSEMBLY\n*MATERIAL, NAME=ST\n*ELASTIC\n200000.,0.3\n")
     body, _, _ = convert_str(deck)
     import re as _re
-    names = _re.findall(r"\*(?:NSET|ELSET),\s*(?:NSET|ELSET)=([^,\n]+)", body)
-    assert names and all(len(n.strip()) <= 20 for n in names), names
+    names = [n.strip() for n in
+             _re.findall(r"\*(?:NSET|ELSET),\s*(?:NSET|ELSET)=([^,\n]+)", body)]
+    assert names and all(len(n) <= 80 for n in names), names
+    # the moderate CAE-style name survives un-truncated
+    assert "INSTANCE_NUMBER_ONE_A_VERY_LONG_NODE_SET_NAME_INDEED" in names
+    # the pathological 78-char part name got prefixed past 80 -> truncated to exactly 80
+    assert any(len(n) == 80 for n in names), names
 
 
 def test_parameter_with_internal_comment():
@@ -617,6 +626,46 @@ def test_pore_pressure_element_suffix_dropped():
     assert "pore-pressure" in rep.text().lower()
 
 
+def test_empty_dload_op_new_passthrough():
+    # *DLOAD, OP=NEW with no data is valid ccx and MEANS something (remove all previous
+    # distributed loads); it must pass through, not be commented out.
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n*Element,type=CPS4,elset=E\n1,1,2,3,4\n"
+            "*Step\n*Static\n*Dload, OP=NEW\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    live = [l for l in body.splitlines() if not l.lstrip().startswith("**")]
+    assert any(l.upper().startswith("*DLOAD") and "OP=NEW" in l.upper() for l in live)
+
+
+def test_assembly_element_instance_qualified_connectivity():
+    # Assembly-level spring/connector/mass elements often write connectivity as
+    # instance-qualified refs (I1.2, I2.1); these must resolve to global node ids so the
+    # element registers instead of being skipped as non-numeric.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=e\n1,1,2,3,4\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
+            "*Instance, name=I2, part=P\n5.,0.,0.\n*End Instance\n"
+            "*Element, type=SPRINGA, elset=spr\n1, I1.2, I2.1\n*End Assembly\n")
+    _, conv, rep = convert_str(deck)
+    springs = [(typ, conn) for typ, conn in conv.geom.elements.values() if typ == "SPRINGA"]
+    assert springs == [("SPRINGA", [2, 5])]      # I1.2 -> 2 (off 0), I2.1 -> 5 (off 4)
+    assert "skipped" not in rep.text().lower()
+
+
+def test_smooth_step_amplitude_sampled():
+    # ccx has no DEFINITION=SMOOTH STEP (it would silently degrade to a linear ramp);
+    # the quintic is sampled into tabular points: midpoint exact, quarter-point quintic.
+    deck = "*Amplitude, name=SS, definition=SMOOTH STEP\n0., 0., 1., 1.\n"
+    body, _, rep = convert_str(deck)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.upper().startswith("*AMPLITUDE"))
+    assert "DEFINITION" not in lines[i].upper()               # param dropped from the card
+    pts = [tuple(float(x) for x in l.split(",")) for l in lines[i + 1:i + 12]]
+    assert len(pts) == 11 and pts[0] == (0.0, 0.0) and pts[-1] == (1.0, 1.0)
+    assert abs(dict(pts)[0.5] - 0.5) < 1e-12                  # quintic midpoint
+    assert abs(dict(pts)[0.2] - 0.05792) < 1e-9               # x^3(10-15x+6x^2) at 0.2
+    assert "sampled" in rep.text().lower()
+
+
 def test_dload_unsupported_body_load_dropped():
     # ccx supports only GRAV and CENTRIF body loads; ROTA/CORIO/CENT/ROTDYNF are rejected
     # outright by ccx, so they must be dropped (warned) rather than emitted — keeping the
@@ -645,6 +694,113 @@ def test_assembly_node_not_overwritten_by_instance():
     assert conv.geom.nodes.get(999) == (5., 5., 5.)          # assembly ref node survives
     inst_ids = [n for n in conv.geom.nodes if n != 999]
     assert len(inst_ids) == 4 and all(n > 999 for n in inst_ids)  # instances offset above it
+
+
+def test_coupling_refnode_set_resolved_and_empty_kinematic():
+    # CAE writes REF NODE=<set name> (ccx hard error) and an empty *Kinematic (ccx: runs
+    # but silently creates NO constraint).  Both must be repaired.
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n9,0.5,0.5,2.\n"
+            "*Nset, nset=_PickedSet8, internal\n9\n*Element, type=C3D8, elset=E\n1,1,2,3,4,5,6,7,8\n"
+            "*Solid Section, elset=E, material=m\n*Material, name=m\n*Elastic\n1.,.3\n"
+            "*Surface, type=ELEMENT, name=TOP\nE, S2\n"
+            "*Coupling, constraint name=C1, ref node=_PickedSet8, surface=TOP\n*Kinematic\n")
+    body, _, _ = convert_str(deck)
+    lines = body.splitlines()
+    cp = next(l for l in lines if l.upper().startswith("*COUPLING"))
+    assert "REF NODE=9" in cp.upper()
+    ki = next(i for i, l in enumerate(lines) if l.upper().startswith("*KINEMATIC"))
+    assert lines[ki + 1].replace(" ", "") == "1,3"
+
+
+def test_kinematic_rotational_dofs_clamped():
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n9,0.5,0.5,1.\n"
+            "*Nset, nset=R\n9\n*Element, type=CPS4, elset=E\n1,1,2,3,4\n"
+            "*Surface, type=ELEMENT, name=S\nE, S1\n"
+            "*Coupling, constraint name=C, ref node=9, surface=S\n*Kinematic\n1, 6\n")
+    body, _, rep = convert_str(deck)
+    lines = body.splitlines()
+    ki = next(i for i, l in enumerate(lines) if l.upper().startswith("*KINEMATIC"))
+    assert lines[ki + 1].replace(" ", "") == "1,3"
+    assert "clamped" in rep.text().lower()
+
+
+def test_surface_interaction_hard_behavior_synthesized():
+    # An interaction without *SURFACE BEHAVIOR is the Abaqus hard-contact default, but a
+    # ccx *CONTACT PAIR then stops; the HARD behavior card must be synthesized.  One with
+    # an explicit behavior must NOT get a second card.
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=E\n1,1,2,3,4\n"
+            "*Surface Interaction, name=BARE\n"
+            "*Surface Interaction, name=FULL\n*Surface Behavior, pressure-overclosure=LINEAR\n1e5\n")
+    body, _, _ = convert_str(deck)
+    txt = body.upper()
+    i_bare = txt.index("NAME=BARE"); i_full = txt.index("NAME=FULL")
+    assert "PRESSURE-OVERCLOSURE=HARD" in txt[i_bare:i_full]
+    assert "HARD" not in txt[i_full:]                       # FULL keeps only its LINEAR card
+
+
+def test_lamina_to_engineering_constants():
+    deck = "*Material, name=cfrp\n*Elastic, type=LAMINA\n140000., 10000., 0.3, 5000., 5000., 3800.\n"
+    body, _, rep = convert_str(deck)
+    lines = body.splitlines()
+    el = next(i for i, l in enumerate(lines) if l.upper().startswith("*ELASTIC"))
+    assert "ENGINEERING CONSTANTS" in lines[el].upper() and "LAMINA" not in lines[el].upper()
+    row1 = [float(x) for x in lines[el + 1].split(",")]
+    assert row1[:5] == [140000., 10000., 10000., 0.3, 0.3]   # E3=E2, nu13=nu12
+    nu23 = 10000. / (2 * 3800.) - 1                            # from G23
+    assert abs(row1[5] - nu23) < 1e-6
+    assert [float(x) for x in lines[el + 2].split(",")] == [3800.]
+    assert "transverse" in rep.text().lower()
+
+
+def test_beam_section_unsupported_profile_commented():
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=B31,elset=E\n1,1,2\n"
+            "*Beam Section, elset=E, material=m, section=I\n0.1,0.2,0.1,0.1,0.01,0.01,0.01\n")
+    body, _, _ = convert_str(deck)
+    live = [l for l in body.splitlines() if not l.lstrip().startswith("**")]
+    assert not any(l.upper().startswith("*BEAM SECTION") for l in live)
+    assert "SECTION=I" in body.upper()                        # visible in the comment
+
+
+def test_equally_spaced_amplitude_expanded():
+    deck = "*Amplitude, name=EQ, definition=EQUALLY SPACED, fixed interval=0.5\n0., 1., 0.5, 1.\n"
+    body, _, _ = convert_str(deck)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.upper().startswith("*AMPLITUDE"))
+    pts = [tuple(float(x) for x in l.split(",")) for l in lines[i + 1:i + 5]]
+    assert pts == [(0.0, 0.0), (0.5, 1.0), (1.0, 0.5), (1.5, 1.0)]
+
+
+def test_assembly_elset_element_member_uses_elem_offset():
+    # An assembly *Elset member I2.1 is an ELEMENT ref and must take the element offset
+    # (not the node offset) — I2's element 1 is global element 2.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=e\n1,1,2,3,4\n*Solid Section, elset=e, material=m\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
+            "*Instance, name=I2, part=P\n5.,0.,0.\n*End Instance\n"
+            "*Elset, elset=LOADEL\nI2.1\n*End Assembly\n*Material, name=m\n*Elastic\n1.,.3\n")
+    _, conv, _ = convert_str(deck)
+    assert conv.geom.elset("LOADEL") == [2]
+
+
+def test_part_cohesive_section_remapped_per_instance():
+    # A part-level *Cohesive Section must have its elset remapped per instance (I1_COH),
+    # or the substituted continuum elements end up section-less.
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n"
+            "*Element, type=COH3D8, elset=coh\n1,1,2,3,4,5,6,7,8\n"
+            "*Cohesive Section, elset=coh, material=glue, response=TRACTION SEPARATION\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n*End Assembly\n"
+            "*Material, name=glue\n*Elastic\n1000.,.3\n")
+    body, _, _ = convert_str(deck)
+    sol = [l for l in body.splitlines() if l.upper().startswith("*SOLID SECTION")]
+    assert any("ELSET=I1_COH" in l.upper() for l in sol), sol
+
+
+def test_combined_suffix_element_resolves():
+    assert A.ccx_element_type("C3D8PT", A.Report()) == "C3D8"
+    assert A.ccx_element_type("C3D20RHT", A.Report()) == "C3D20R"
 
 
 if __name__ == "__main__":

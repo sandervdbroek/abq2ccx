@@ -120,9 +120,12 @@ ELEMENT_TYPE_MAP: Dict[str, str] = {
     # node-count-identical CONTINUUM element (a thin bonded/compressed layer).  The
     # special behaviour is lost and a ZERO-thickness layer fails — ccx_element_type
     # emits a strong, targeted warning for these (COH*/GK* prefixes).
+    # (6-node 2D gaskets GK2D6/GKPS6/GKAX6 are deliberately NOT mapped: they are
+    # quad-like top/bottom stacks, while CPE6/CPS6/CAX6 are quadratic TRIANGLES —
+    # reinterpreting the connectivity would garble the geometry.)
     "COH3D8": "C3D8", "COH3D6": "C3D6", "COH2D4": "CPE4", "COHAX4": "CAX4",
-    "GK3D8": "C3D8", "GK3D6": "C3D6", "GK2D4": "CPE4", "GK2D6": "CPE6",
-    "GKPS4": "CPS4", "GKPS6": "CPS6", "GKAX4": "CAX4", "GKAX6": "CAX6",
+    "GK3D8": "C3D8", "GK3D6": "C3D6", "GK2D4": "CPE4",
+    "GKPS4": "CPS4", "GKAX4": "CAX4",
 }
 
 # Element types CalculiX supports directly (verified, ccx 2.22).  Used to tell a
@@ -180,27 +183,26 @@ def ccx_element_type(typ: str, report: "Report") -> str:
         return sub
     if typ in CCX_ELEMENTS:
         return typ
-    # Coupled temperature-displacement elements (the ``T`` suffix): CalculiX uses the
-    # *base* element name and gets the temperature DOF from the
-    # ``*COUPLED TEMPERATURE-DISPLACEMENT`` step, so C3D8T->C3D8, CAX4RT->CAX4R,
-    # C3D10MT->C3D10M.  Recurse so a base that itself needs mapping is resolved.
-    if typ.endswith("T") and len(typ) > 1 and (
-            typ[:-1] in CCX_ELEMENTS or typ[:-1] in ELEMENT_TYPE_MAP
-            or (typ[:-1].endswith("H") and typ[:-2] in CCX_ELEMENTS)):
-        report.warn(f"Element {typ} -> {typ[:-1]} (CalculiX uses the base element for coupled "
-                    f"temperature-displacement; the temperature DOF comes from the step).", once=True)
-        return ccx_element_type(typ[:-1], report)
-    if typ.endswith("H") and len(typ) > 1 and (typ[:-1] in CCX_ELEMENTS or typ[:-1] in ELEMENT_TYPE_MAP):
-        report.warn(f"Element {typ} -> {typ[:-1]} (CalculiX has no hybrid formulation).", once=True)
-        return ccx_element_type(typ[:-1], report)
-    # Pore-pressure (coupled displacement / pore-pressure) elements (the ``P`` suffix):
-    # ccx has no pore-pressure element, so fall back to the mechanical base and drop the
-    # pore-pressure DOF (e.g. CAX4P->CAX4, CPE8P->CPE8, C3D8P->C3D8).
-    if typ.endswith("P") and len(typ) > 1 and (typ[:-1] in CCX_ELEMENTS or typ[:-1] in ELEMENT_TYPE_MAP):
-        report.warn(f"Element {typ} -> {typ[:-1]}: ccx has no pore-pressure (coupled u-p) element; "
-                    f"the pore-pressure DOF is dropped and only the mechanical response is solved — "
-                    f"consolidation/seepage is NOT modelled. Verify.", once=True)
-        return ccx_element_type(typ[:-1], report)
+    # Suffix elements — coupled-temperature ``T``, hybrid ``H``, pore-pressure ``P`` — in
+    # any combination (C3D8T, CAX4RP, C3D8PT, C3D20RHT): strip trailing suffix letters
+    # until a known base is reached, warn once per dropped capability, and resolve the
+    # base (which may itself need mapping, e.g. C3D10MT -> C3D10M -> C3D10).
+    base, dropped = typ, ""
+    while len(base) > 1 and base[-1] in "THP" and \
+            base not in CCX_ELEMENTS and base not in ELEMENT_TYPE_MAP:
+        dropped += base[-1]
+        base = base[:-1]
+    if dropped and (base in CCX_ELEMENTS or base in ELEMENT_TYPE_MAP):
+        if "T" in dropped:
+            report.warn(f"Element {typ} -> {base} (CalculiX uses the base element for coupled "
+                        f"temperature-displacement; the temperature DOF comes from the step).", once=True)
+        if "H" in dropped:
+            report.warn(f"Element {typ} -> {base} (CalculiX has no hybrid formulation).", once=True)
+        if "P" in dropped:
+            report.warn(f"Element {typ} -> {base}: ccx has no pore-pressure (coupled u-p) element; "
+                        f"the pore-pressure DOF is dropped and only the mechanical response is solved — "
+                        f"consolidation/seepage is NOT modelled. Verify.", once=True)
+        return ccx_element_type(base, report)
     if typ.startswith(("R3D", "RB2", "RB3", "RAX", "R2D")):
         report.warn(f"Element {typ} is a rigid (R3D/RB) element; ccx has no rigid element — define "
                     f"the region as a *RIGID BODY (NSET + REF NODE/ROT NODE) instead. Emitted "
@@ -1064,8 +1066,6 @@ DROP_WARN_KEYWORDS = {
     "SYSTEM": "*SYSTEM (local coordinate system for following *NODE cards) is unsupported "
               "by ccx and was dropped; node coordinates defined under it may be in a rotated "
               "frame — verify they are global.",
-    "PARAMETER": "*PARAMETER (parametric input) is unsupported by ccx and was dropped; any "
-                 "<parameter> substitutions will not resolve.",
     "UNIT SYSTEM": "*UNIT SYSTEM is unsupported by ccx and was dropped (informational only).",
 }
 # Keywords that exist in BOTH but mean something different in ccx -> warn, then emit.
@@ -1080,8 +1080,6 @@ PASS_WITH_NOTE = {
                 "implements a subset of Abaqus' damage-initiation criteria and has no *DAMAGE "
                 "EVOLUTION card, so verify your ccx version (>= 2.23), the CRITERION, and that "
                 "progressive damage is not required to soften/fail the material.",
-    "COUPLING": "*COUPLING + *KINEMATIC/*DISTRIBUTING is accepted by recent ccx, but ccx "
-                "*KINEMATIC requires an explicit DOF list (Abaqus allows none = all 6) — verify.",
     "USER MATERIAL": "*USER MATERIAL kept, but ccx uses its own umat interface (umat_*.f), not an "
                      "Abaqus UMAT binary — the subroutine must be ported.",
     "USER ELEMENT": "*USER ELEMENT kept; ensure the matching ccx user-element routine is built in.",
@@ -1108,6 +1106,18 @@ SPECIAL_UNSUPPORTED = {
     "CONCRETE": "concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel.",
     "CONCRETE DAMAGED PLASTICITY": "unsupported by ccx; substitute *PLASTIC or remodel.",
     "CONNECTOR ELASTICITY": "connector behaviour has no ccx equivalent; see *CONNECTOR SECTION.",
+    "CONTACT": "Abaqus general contact has no ccx equivalent; define explicit pairs instead: "
+               "*CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element "
+               "surfaces (+ *SURFACE INTERACTION / *SURFACE BEHAVIOR).",
+    "CONTACT INCLUSIONS": "general-contact inclusion list (ALL EXTERIOR is not translatable); "
+                          "create the two surfaces and a *CONTACT PAIR instead.",
+    "CONTACT EXCLUSIONS": "general-contact exclusion list; not applicable to ccx *CONTACT PAIR.",
+    "CONTACT PROPERTY ASSIGNMENT": "assigns a general-contact property; in ccx name the "
+                                   "*SURFACE INTERACTION via *CONTACT PAIR, INTERACTION= instead.",
+    "LATENT HEAT": "ccx has no *LATENT HEAT; approximate with an apparent *SPECIFIC HEAT peak "
+                   "cp + L/(Tliq-Tsol) over the melting interval.",
+    "EMBEDDED ELEMENT": "no ccx equivalent; mesh the reinforcement conformally or tie the "
+                        "embedded nodes with *EQUATION constraints.",
     # Newer Abaqus keywords (2024/2025) with no ccx equivalent (calculix/new_keywords#4).
     "ALLOWABLE STRESS": "Abaqus 2024 optimisation stress limit; ccx has no equivalent — express a "
                         "stress constraint via *DESIGN RESPONSE/*CONSTRAINT in a *SENSITIVITY run.",
@@ -1425,6 +1435,9 @@ class Converter:
             "FRICTION": self.handle_friction,
             "CONTACT PAIR": self.handle_contact_pair,
             "RIGID BODY": self.handle_rigid_body,
+            "COUPLING": self.handle_coupling_card,
+            "KINEMATIC": self.handle_kinematic,
+            "SURFACE INTERACTION": self.handle_surface_interaction,
         }
         if kw in handlers:
             return handlers[kw](b)
@@ -1436,6 +1449,14 @@ class Converter:
             return []
         if kw == "KINEMATIC COUPLING":
             return self.handle_coupling(b)
+        if kw == "PARAMETER":
+            self.report.note("*PARAMETER card dropped; its <name> substitutions were already "
+                             "applied to the deck (ccx has no parametric input).", once=True)
+            return []
+        if kw == "SYSTEM" and not any(x.strip() for x in b.data):
+            # a bare *System resets to the global frame — a no-op, not worth a warning
+            self.report.note("Bare *SYSTEM (reset to global coordinates) dropped — no effect.", once=True)
+            return []
         if kw in DROP_KEYWORDS:
             self.report.note(f"*{kw} dropped (Abaqus-only organisational card; no ccx meaning).", once=True)
             return []
@@ -1469,6 +1490,12 @@ class Converter:
     # -- model-data handlers ------------------------------------------------
     def handle_elastic(self, b: Block) -> List[str]:
         typ = (b.param("TYPE") or "ISO").upper()
+        if typ == "LAMINA":
+            converted = self._lamina_to_engineering_constants(b)
+            if converted is not None:
+                return converted
+            self.report.warn("*ELASTIC TYPE=LAMINA could not be parsed; emitted unchanged — ccx "
+                             "will reject TYPE=LAMINA.", once=True)
         tmap = {"ISOTROPIC": "ISO", "ISO": "ISO", "ORTHOTROPIC": "ORTHO", "ORTHO": "ORTHO",
                 "ENGINEERING CONSTANTS": "ENGINEERING CONSTANTS",
                 "ANISOTROPIC": "ANISO", "ANISO": "ANISO"}
@@ -1484,6 +1511,36 @@ class Converter:
             self.report.note(f"*ELASTIC TYPE={typ} -> {cc} (constant order is identical; "
                              f"data lines passed through).", once=True)
         return [emit_keyword("ELASTIC", params)] + list(b.data)
+
+    def _lamina_to_engineering_constants(self, b: Block) -> Optional[List[str]]:
+        """``*ELASTIC, TYPE=LAMINA`` (E1,E2,nu12,G12,G13,G23[,T]) has no ccx equivalent;
+        expand to ENGINEERING CONSTANTS assuming transverse isotropy: E3=E2, nu13=nu12,
+        nu23 from G23=E2/(2(1+nu23)).  Returns None if the data cannot be parsed."""
+        rows: List[str] = []
+        for rec in merged_data_records(b):
+            f = [x for x in rec if x != ""]
+            if not f:
+                continue
+            try:
+                v = [pf(x) for x in f]
+            except ValueError:
+                return None
+            if len(v) < 6:
+                return None
+            E1, E2, nu12, G12, G13, G23 = v[:6]
+            nu23 = max(0.0, min(0.495, E2 / (2.0 * G23) - 1.0)) if G23 > 0 else nu12
+            rows.append(f"{E1:.6g}, {E2:.6g}, {E2:.6g}, {nu12:.6g}, {nu12:.6g}, "
+                        f"{nu23:.6g}, {G12:.6g}, {G13:.6g}")
+            rows.append(f"{G23:.6g}" + (f", {v[6]:.6g}" if len(v) > 6 else ""))
+        if not rows:
+            return None
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+        params["TYPE"] = "ENGINEERING CONSTANTS"
+        self.report.warn("*ELASTIC TYPE=LAMINA -> ENGINEERING CONSTANTS with assumed transverse "
+                         "isotropy (E3=E2, nu13=nu12, nu23 derived from G23). ccx expands shells "
+                         "to solids, so these through-thickness constants DO enter the stiffness — "
+                         "verify.", once=True)
+        return [emit_keyword("ELASTIC", params)] + rows
 
     def handle_orientation(self, b: Block) -> List[str]:
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -1554,13 +1611,24 @@ class Converter:
         return [emit_keyword("SOLID SECTION", keep)]
 
     def handle_beam_section(self, b: Block) -> List[str]:
+        sec = (b.param("SECTION") or "").upper()
+        # ccx 2.22 beam profiles: RECT, CIRC (ellipse), PIPE, BOX.  Anything else is a
+        # hard "unknown section" error, so comment it out with the escape hatches.
+        if sec not in ("", "RECT", "CIRC", "PIPE", "BOX", "THICK PIPE"):
+            return self._commented(b, f"*BEAM SECTION SECTION={sec} is not a ccx profile (ccx has "
+                                      f"RECT, CIRC, PIPE, BOX; GENERAL only with user element U1). "
+                                      f"Remodel with an equivalent BOX/RECT, or use beam-like solids.")
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("ELSET", "MATERIAL", "SECTION", "ORIENTATION", "OFFSET1", "OFFSET2"):
                 keep[k] = v
             else:
                 self.report.note(f"*BEAM SECTION parameter {k} dropped.", once=True)
-        if (b.param("SECTION") or "").upper() == "CIRC":
+        if sec == "THICK PIPE":
+            keep["SECTION"] = "PIPE"
+            self.report.note("*BEAM SECTION SECTION=THICK PIPE -> PIPE (same radius/thickness data; "
+                             "ccx expands beams to solids, so thick-wall behaviour is captured).", once=True)
+        if sec == "CIRC":
             self.report.warn("*BEAM SECTION SECTION=CIRC: Abaqus uses a radius, ccx uses two elliptical "
                              "axis lengths; verify the dimension line.", once=True)
         return [emit_keyword("BEAM SECTION", keep)] + list(b.data)
@@ -1764,8 +1832,19 @@ class Converter:
                 self.report.warn("*DLOAD label 'P' has no face number; CalculiX needs P1..P6 for element "
                                  "pressure. Verify.", once=True)
             body.append(", ".join(f))
-        if not body:
+        had_data = any(x != "" for rec in merged_data_records(b) for x in rec)
+        if not body and had_data:
+            if (b.param("OP") or "").upper() == "NEW":
+                # keep the bare header: OP=NEW validly removes all previous distributed
+                # loads in ccx, and losing that would leak stale loads across steps
+                self.report.warn("*DLOAD, OP=NEW: every load line was unsupported and dropped, but "
+                                 "the bare OP=NEW card is kept so previous distributed loads are "
+                                 "still removed.", once=True)
+                return [emit_keyword("DLOAD", b.params)]
+            # every load line was unsupported — commenting is louder than emitting a bare card
             return self._commented(b, "*DLOAD has no CalculiX-compatible load lines; dropped.")
+        # a *DLOAD with no data at all is valid ccx (OP=NEW clears previous distributed
+        # loads; plain is a no-op) — pass it through unchanged
         return [emit_keyword("DLOAD", b.params)] + body
 
     def handle_dsload(self, b: Block) -> List[str]:
@@ -1944,14 +2023,84 @@ class Converter:
 
     def handle_amplitude(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        definition = ""
+        fixed = None
+        begin = 0.0
         for k, v in b.params.items():
             if k in ("NAME", "TIME", "SHIFTX", "SHIFTY"):
                 keep[k] = v
-            elif k == "DEFINITION" and v and v.upper() != "TABULAR":
-                self.report.warn(f"*AMPLITUDE DEFINITION={v} unsupported by ccx; treated as TABULAR.", once=True)
+            elif k == "DEFINITION":
+                definition = (v or "").upper()
+            elif k == "FIXED INTERVAL":
+                try:
+                    fixed = pf(v or "")
+                except ValueError:
+                    pass
+            elif k == "BEGIN":
+                try:
+                    begin = pf(v or "")
+                except ValueError:
+                    pass
             else:
                 self.report.note(f"*AMPLITUDE parameter {k} dropped.", once=True)
+        if definition == "SMOOTH STEP":
+            sampled = self._smooth_step_to_tabular(b)
+            if sampled is not None:
+                self.report.note("*AMPLITUDE DEFINITION=SMOOTH STEP sampled into tabular points "
+                                 "(ccx has no smooth-step; the quintic ramp is approximated).", once=True)
+                return [emit_keyword("AMPLITUDE", keep)] + sampled
+            self.report.warn("*AMPLITUDE DEFINITION=SMOOTH STEP could not be parsed; emitted as "
+                             "TABULAR (linear between points) — verify.", once=True)
+        elif definition == "EQUALLY SPACED":
+            # data lines are bare amplitudes; ccx would misread them as (time, amplitude)
+            # pairs, so expand to explicit points at BEGIN + i*FIXED INTERVAL.
+            if fixed:
+                try:
+                    vals = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+                except ValueError:
+                    vals = []
+                if vals:
+                    self.report.note("*AMPLITUDE DEFINITION=EQUALLY SPACED expanded to explicit "
+                                     "time/amplitude pairs.", once=True)
+                    return [emit_keyword("AMPLITUDE", keep)] + \
+                           [f"{begin + i * fixed:.6g}, {a:.6g}" for i, a in enumerate(vals)]
+            return self._commented(b, "*AMPLITUDE DEFINITION=EQUALLY SPACED could not be expanded "
+                                      "(missing/invalid FIXED INTERVAL or data); rebuild as TABULAR.")
+        elif definition in ("PERIODIC", "MODULATED", "DECAY", "SOLUTION DEPENDENT", "ACTUATOR"):
+            # first data line holds series constants, not (t, A) pairs — passing it
+            # through would be silent garbage
+            return self._commented(b, f"*AMPLITUDE DEFINITION={definition} has no ccx equivalent and "
+                                      f"its data is not time/amplitude pairs; sample the curve into a "
+                                      f"TABULAR amplitude manually.")
+        elif definition not in ("", "TABULAR"):
+            self.report.warn(f"*AMPLITUDE DEFINITION={definition} unsupported by ccx; treated as "
+                             f"TABULAR.", once=True)
         return [emit_keyword("AMPLITUDE", keep)] + list(b.data)
+
+    def _smooth_step_to_tabular(self, b: Block) -> Optional[List[str]]:
+        """Sample Abaqus' SMOOTH STEP quintic (a = A0 + (A1-A0)*x^3*(10-15x+6x^2)) into
+        tabular time/amplitude pairs ccx can use.  Returns None if the data is unparsable."""
+        pts: List[Tuple[float, float]] = []
+        try:
+            vals: List[float] = []
+            for rec in merged_data_records(b):
+                vals.extend(pf(x) for x in rec if x != "")
+            for i in range(0, len(vals) - 1, 2):
+                pts.append((vals[i], vals[i + 1]))
+        except ValueError:
+            return None
+        if len(pts) < 2:
+            return None
+        out: List[str] = [f"{pts[0][0]:.6g}, {pts[0][1]:.6g}"]
+        N = 10                                     # samples per interval
+        for (t0, a0), (t1, a1) in zip(pts, pts[1:]):
+            if t1 <= t0:
+                return None
+            for k in range(1, N + 1):
+                x = k / N
+                a = a0 + (a1 - a0) * x**3 * (10.0 - 15.0 * x + 6.0 * x * x)
+                out.append(f"{t0 + (t1 - t0) * x:.6g}, {a:.6g}")
+        return out
 
     def handle_friction(self, b: Block) -> List[str]:
         """``*FRICTION``: CalculiX requires a strictly positive coefficient, and treats
@@ -1996,6 +2145,72 @@ class Converter:
                              "rigidly with REF NODE); the pin-vs-tie DOF nuance may differ — verify.",
                              once=True)
         return [emit_keyword("RIGID BODY", keep)] + list(b.data)
+
+    def handle_coupling_card(self, b: Block) -> List[str]:
+        """``*COUPLING``: ccx accepts the card but requires REF NODE to be a NODE NUMBER —
+        a set name (what Abaqus/CAE always writes, e.g. REF NODE=_PickedSet8) is a hard
+        error.  Resolve single-node sets to their node id."""
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+        ref = (b.param("REF NODE") or "").strip()
+        if ref and not re.fullmatch(r"[-+]?\d+", ref):
+            nodes = self.geom.nset(ref)
+            if len(nodes) == 1:
+                params["REF NODE"] = str(nodes[0])
+                self.report.note(f"*COUPLING REF NODE={ref} resolved to node {nodes[0]} "
+                                 f"(ccx needs a node number, not a set name).", once=True)
+            elif nodes:
+                params["REF NODE"] = str(nodes[0])
+                self.report.warn(f"*COUPLING REF NODE={ref} names a set with {len(nodes)} nodes; "
+                                 f"the first ({nodes[0]}) is used — verify.", once=True)
+            else:
+                self.report.warn(f"*COUPLING REF NODE={ref} could not be resolved to a node id; "
+                                 f"ccx will reject a set name here.", once=True)
+        return [emit_keyword("COUPLING", params)] + list(b.data)
+
+    def handle_kinematic(self, b: Block) -> List[str]:
+        """``*KINEMATIC`` under ``*COUPLING``: ccx allows only DOFs 1..3, and an EMPTY
+        card runs without warnings but creates NO constraint (the ref-node load silently
+        vanishes — verified).  Abaqus' empty default means 'all DOFs', so synthesize
+        1,3; clamp rotational DOFs to the translational range."""
+        lines: List[str] = []
+        for rec in merged_data_records(b):
+            f = [x for x in rec if x != ""]
+            if not f:
+                continue
+            try:
+                d1 = pint(f[0])
+                d2 = pint(f[1]) if len(f) > 1 and f[1] else d1
+            except ValueError:
+                lines.append(", ".join(f))
+                continue
+            if d1 > 3 and d2 > 3:
+                self.report.warn("*KINEMATIC line couples only rotational DOFs (4..6); ccx supports "
+                                 "1..3 only — line dropped, rotations are NOT coupled.", once=True)
+                continue
+            c1, c2 = min(d1, 3), min(d2, 3)
+            if (c1, c2) != (d1, d2):
+                self.report.warn("*KINEMATIC DOFs above 3 clamped (ccx couples translations only; "
+                                 "the surface still follows the ref node rigidly).", once=True)
+            lines.append(f"{c1}, {c2}")
+        if not lines:
+            self.report.warn("*KINEMATIC without DOF lines creates NO constraint in ccx (the "
+                             "coupling silently does nothing); synthesized '1, 3' to match the "
+                             "Abaqus default of coupling all DOFs — verify.", once=True)
+            lines = ["1, 3"]
+        return [emit_keyword("KINEMATIC", b.params)] + lines
+
+    def handle_surface_interaction(self, b: Block) -> List[str]:
+        """``*SURFACE INTERACTION``: Abaqus' default contact is hard pressure-overclosure
+        with NO *SURFACE BEHAVIOR card, but ccx then stops with 'no PRESSURE-OVERCLOSURE'.
+        Synthesize the HARD behavior when the interaction has none."""
+        out = [emit_keyword("SURFACE INTERACTION", b.params)] + list(b.data)
+        name = (b.param("NAME") or "").upper()
+        if name and name in getattr(self, "_si_missing_behavior", set()):
+            self.report.note(f"*SURFACE INTERACTION {name} has no *SURFACE BEHAVIOR; added "
+                             f"PRESSURE-OVERCLOSURE=HARD (the Abaqus default) so *CONTACT PAIR "
+                             f"does not fail.", once=True)
+            out.append("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD")
+        return out
 
     def handle_contact_pair(self, b: Block) -> List[str]:
         """``*CONTACT PAIR``: ccx *requires* a ``TYPE`` (Abaqus lets it default to
@@ -2043,6 +2258,17 @@ class Converter:
             blocks = flatten_assembly(blocks, self.report, self.opt)
         self.build_geometry(blocks)
         self._check_overconstraints(blocks)
+        # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
+        # errors without the card) — handle_surface_interaction synthesizes HARD for these
+        self._si_missing_behavior = set()
+        cur_si = None
+        for blk in blocks:
+            if blk.keyword == "SURFACE INTERACTION":
+                cur_si = (blk.param("NAME") or "").upper()
+                if cur_si:
+                    self._si_missing_behavior.add(cur_si)
+            elif blk.keyword == "SURFACE BEHAVIOR" and cur_si:
+                self._si_missing_behavior.discard(cur_si)
         out: List[str] = []
         for b in blocks:
             if b.keyword == "HEADING":
@@ -2128,6 +2354,7 @@ def dedup_str(seq: Sequence[str]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
+                     "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT", "MASS", "GAP",
                      "ORIENTATION", "DISTRIBUTION", "SURFACE"}
 
 
@@ -2190,9 +2417,13 @@ def set_block(kw: str, name: str, ids: Sequence[int]) -> Block:
     return mkblock(kw, [(kw, name)], lines)
 
 
+CCX_NAME_LIMIT = 80          # verified: ccx 2.22 accepts 80-char set names, errors at >80
+
+
 def make_namer(report: Report):
-    """A consistent name factory that keeps CalculiX's 20-significant-character set/
-    surface-name limit: the same logical name always maps to the same <=20-char
+    """A consistent name factory that keeps CalculiX's 80-character set/surface-name
+    limit (verified against ccx 2.22: names up to 80 chars resolve correctly, longer
+    ones stop with 'set name too long'): the same logical name always maps to the same
     unique string, so a definition and every reference stay in sync."""
     memo: Dict[str, str] = {}
     used: set = set()
@@ -2201,24 +2432,36 @@ def make_namer(report: Report):
         base = "_".join(str(p) for p in parts).upper()
         if base in memo:
             return memo[base]
-        cand = base if len(base) <= 20 else base[:20]
+        cand = base if len(base) <= CCX_NAME_LIMIT else base[:CCX_NAME_LIMIT]
         if cand in used:
             i = 1
             while True:
                 sfx = f"~{i}"
-                cand = base[:20 - len(sfx)] + sfx
+                cand = base[:CCX_NAME_LIMIT - len(sfx)] + sfx
                 if cand not in used:
                     break
                 i += 1
-            report.warn("Flattened set/surface names collide within CalculiX's 20-character "
-                        "significant-name limit and were uniquified; verify set references.", once=True)
-        elif len(base) > 20:
-            report.note("A flattened set/surface name exceeded 20 characters and was truncated "
-                        "(ccx keeps only the first 20).", once=True)
+            report.warn(f"Flattened set/surface names collide within CalculiX's {CCX_NAME_LIMIT}-"
+                        f"character name limit and were uniquified; verify set references.", once=True)
+        elif len(base) > CCX_NAME_LIMIT:
+            report.note(f"A flattened set/surface name exceeded {CCX_NAME_LIMIT} characters and was "
+                        f"truncated (ccx rejects longer names).", once=True)
         used.add(cand)
         memo[base] = cand
         return cand
 
+    def reserve(raw: str) -> None:
+        """Register a name emitted verbatim (assembly-level sets/surfaces keep their
+        original names) so generated names can never collide with it, and flag names
+        over ccx's limit."""
+        n = raw.upper()
+        used.add(n)
+        if len(n) > CCX_NAME_LIMIT:
+            report.warn(f"An assembly-level set/surface name exceeds CalculiX's "
+                        f"{CCX_NAME_LIMIT}-character limit and will be rejected by ccx "
+                        f"('set name too long'); shorten it in the source deck.", once=True)
+
+    namer.reserve = reserve
     return namer
 
 
@@ -2360,26 +2603,27 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     # raw and one bad instance would KeyError out of the whole conversion.
     prefix = inst["name"]
     for b in parts.get(inst["part"], []) + inst["extra"]:
-        if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION"):
+        if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
+                         "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT", "MASS", "GAP"):
             out.append(_remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer))
         elif b.keyword == "ORIENTATION":
             out.append(_remap_named(b, prefix, ("NAME",), namer))
         elif b.keyword == "DISTRIBUTION":
             out.append(_remap_named(b, prefix, ("NAME",), namer))
         elif b.keyword == "SURFACE":
-            out.append(_remap_surface(b, prefix, namer))
+            out.append(_remap_surface(b, prefix, namer, node_off, elem_off))
     return out, gmax_node, gmax_elem, (node_off, elem_off)
 
 
 def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Block]:
     """Translate assembly-level sets / surfaces / constraints, resolving instance-qualified
     members (``Instance.id`` / ``Instance.setname``) to the flat global numbering."""
-    def resolve(tok: str):
+    def resolve(tok: str, entity: str = "node"):
         sr = _split_instance_ref(tok, maps)
         if sr is not None and sr[1]:
             iname, rest = sr
             if re.fullmatch(r"[-+]?\d+", rest):
-                return ("id", int(rest) + maps[iname][0])
+                return ("id", int(rest) + maps[iname][0 if entity == "node" else 1])
             return ("name", namer(iname, rest))
         return ("raw", tok)
 
@@ -2388,6 +2632,7 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
         kw = b.keyword
         if kw in ("NSET", "ELSET"):
             name = (b.param("NSET") if kw == "NSET" else b.param("ELSET")) or ""
+            namer.reserve(name)
             inst = b.param("INSTANCE")
             off = None
             if inst and inst.upper() in maps:
@@ -2407,19 +2652,23 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
                         if re.fullmatch(r"[-+]?\d+", tok) and off is not None:
                             ids.append(int(tok) + off)
                         else:
-                            kind, val = resolve(tok)
+                            kind, val = resolve(tok, "node" if kw == "NSET" else "elem")
                             (ids if kind == "id" else names).append(val)
             if ids:
                 out.append(set_block(kw, name.upper(), ids))
             if names:
                 out.append(mkblock(kw, [(kw, name.upper())], [", ".join(str(n) for n in names)]))
         elif kw == "SURFACE":
+            if b.param("NAME"):
+                namer.reserve(b.param("NAME"))
+            # members of an element surface are element refs, of a node surface node refs
+            surf_ent = "node" if (b.param("TYPE") or "ELEMENT").upper().startswith("NODE") else "elem"
             data = []
             for rec in merged_data_records(b):
                 f = [x for x in rec if x != ""]
                 if not f:
                     continue
-                kind, val = resolve(f[0])
+                kind, val = resolve(f[0], surf_ent)
                 data.append(", ".join([str(val)] + f[1:]))
             out.append(Block("SURFACE", OrderedDict(b.params), data))
         else:
@@ -2433,9 +2682,24 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
     (e.g. a ``*CLOAD`` on ``I2.7``) and the set/surface-naming *parameters* of step/model/
     output cards (e.g. ``*EL PRINT, ELSET=I2.body`` -> ``ELSET=I2_BODY``)."""
     for blk in out:
-        if blk.keyword in ("NODE", "ELEMENT"):
+        if blk.keyword == "NODE":
             continue
-        entity = "elem" if blk.keyword in ELEM_REF_KW else "node"
+        # ELEMENT blocks: assembly-level spring/mass/gap elements may write their
+        # connectivity as instance-qualified node refs ("1, Part-1-1.5, Part-2-1.3");
+        # resolve those to global node ids (the leading element id is plain numeric and
+        # is left untouched) so the element registers instead of being skipped.  Types
+        # with NO ccx equivalent (CONN*, JOINTC, ...) are deliberately left unresolved:
+        # they then drop out via the non-numeric-connectivity skip, which keeps the rest
+        # of the deck solvable instead of feeding ccx a fatal unknown element.
+        if blk.keyword == "ELEMENT":
+            etyp = (blk.param("TYPE") or "").upper()
+            if etyp.startswith(UNSUPPORTED_ELEM_PREFIXES) or etyp in ("JOINTC",):
+                continue
+            entity = "node"                       # connectivity references nodes
+        elif blk.keyword == "SURFACE":            # members follow the surface's TYPE
+            entity = "node" if (blk.param("TYPE") or "ELEMENT").upper().startswith("NODE") else "elem"
+        else:
+            entity = "elem" if blk.keyword in ELEM_REF_KW else "node"
         # (a) parameters that name a set/surface.  Only dotted values whose prefix is a
         #     known instance are touched, so a definition's own name (LOADED, I2_BODY) and
         #     unrelated params (MATERIAL=, NAME=) are left untouched.
@@ -2534,16 +2798,22 @@ def _remap_named(b: Block, prefix: str, keys: Sequence[str], namer) -> Block:
     return Block(b.keyword, p, list(b.data))
 
 
-def _remap_surface(b: Block, prefix: str, namer) -> Block:
+def _remap_surface(b: Block, prefix: str, namer, node_off: int, elem_off: int) -> Block:
     p: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
     if "NAME" in p and p["NAME"]:
         p["NAME"] = namer(prefix, p["NAME"])
+    is_node = (b.param("TYPE") or "ELEMENT").upper().startswith("NODE")
     data = []
     for rec in merged_data_records(b):
         f = [x for x in rec if x != ""]
         if not f:
             continue
-        data.append(", ".join([namer(prefix, f[0])] + f[1:]))
+        # a member may be a bare id (offset it) or a set name (remap it)
+        if re.fullmatch(r"[-+]?\d+", f[0]):
+            first = str(int(f[0]) + (node_off if is_node else elem_off))
+        else:
+            first = namer(prefix, f[0])
+        data.append(", ".join([first] + f[1:]))
     return Block("SURFACE", p, data)
 
 
