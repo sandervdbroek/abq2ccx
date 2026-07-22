@@ -462,7 +462,9 @@ def test_rigid_body_refnode_instance_qualified():
             "*Rigid Body, ref node=I.ref, elset=I.body\n*End Assembly\n")
     body, _, _ = convert_str(deck)
     rb = [l for l in body.splitlines() if "RIGID BODY" in l.upper()][0]
-    assert "I_REF" in rb.upper() and "I_BODY" in rb.upper()
+    # the flattened single-node set I_REF is further resolved to its node NUMBER
+    # (ccx requires REF NODE to be a node id, not a set name)
+    assert "REF NODE=1" in rb.upper() and "I_BODY" in rb.upper()
     assert "I.REF" not in rb.upper() and "I.BODY" not in rb.upper()
     assert any("NSET=I_REF" in l.upper() for l in body.splitlines())
 
@@ -801,6 +803,82 @@ def test_part_cohesive_section_remapped_per_instance():
 def test_combined_suffix_element_resolves():
     assert A.ccx_element_type("C3D8PT", A.Report()) == "C3D8"
     assert A.ccx_element_type("C3D20RHT", A.Report()) == "C3D20R"
+
+
+def test_initial_stress_expanded_to_integration_points():
+    # Abaqus writes *Initial Conditions, TYPE=STRESS as "elset, values" (no int-pt column),
+    # which is a hard ccx error; it must expand to one line per element and integration
+    # point (C3D8 = 8, empirically probed).  Non-expanding TYPEs pass through.
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n"
+            "*Element, type=C3D8, elset=body\n1,1,2,3,4,5,6,7,8\n"
+            "*Solid Section, elset=body, material=m\n*Material, name=m\n*Elastic\n1.,.3\n"
+            "*Initial Conditions, type=STRESS\nbody, 10., 10., 10., 0., 0., 0.\n"
+            "*Initial Conditions, type=VELOCITY\n1, 1, 0.5\n")
+    body, _, rep = convert_str(deck)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if "TYPE=STRESS" in l.upper())
+    ip_lines = [l for l in lines[i + 1:i + 10] if l.startswith("1, ")]
+    assert len(ip_lines) == 8 and ip_lines[0].startswith("1, 1, 10.") and ip_lines[7].startswith("1, 8, 10.")
+    j = next(k for k, l in enumerate(lines) if "TYPE=VELOCITY" in l.upper())
+    assert lines[j + 1].replace(" ", "") == "1,1,0.5"          # untouched
+    assert "per-integration" in rep.text().lower()
+
+
+def test_initial_stress_geostatic_commented():
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=e\n1,1,2,3,4\n"
+            "*Initial Conditions, type=STRESS, GEOSTATIC\ne, -100., 10., 0., 0., 0.5\n")
+    body, _, _ = convert_str(deck)
+    live = [l for l in body.splitlines() if not l.lstrip().startswith("**")]
+    assert not any("INITIAL CONDITIONS" in l.upper() for l in live)
+    assert "GEOSTATIC" in body.upper()                          # visible in the comment
+
+
+def test_approximate_riks_and_default_off():
+    # --approximate reframes *STATIC, RIKS as plain *STATIC; without it the card is kept
+    # (with a pointer to the flag) so nothing changes silently.
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=T3D2,elset=E\n1,1,2\n"
+            "*Step\n*Static, RIKS\n0.01,1.,1e-5,0.1\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert any(l.upper().startswith("*STATIC, RIKS") for l in body.splitlines())
+    assert "--approximate" in rep.text()
+    body, _, rep = convert_str(deck, approximate=True)
+    lines = [l for l in body.splitlines() if l.upper().startswith("*STATIC")]
+    assert lines == ["*STATIC"] and "[APPROX]" in rep.text()
+
+
+def test_approximate_explicit_to_implicit():
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=T3D2,elset=E\n1,1,2\n"
+            "*Step\n*Dynamic, EXPLICIT\n, 0.01\n*End Step\n")
+    body, _, rep = convert_str(deck, approximate=True)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.upper().startswith("*DYNAMIC"))
+    assert "EXPLICIT" not in lines[i].upper()
+    assert lines[i + 1].replace(" ", "") == "1e-05,0.01"     # period/1000, period
+    assert "[APPROX]" in rep.text()
+
+
+def test_approximate_nu_clamp():
+    deck = "*Material,name=m\n*Elastic\n1000., 0.5\n"
+    body, _, _ = convert_str(deck)
+    assert "1000., 0.5" in body                                # untouched by default
+    body, _, rep = convert_str(deck, approximate=True)
+    assert "1000., 0.475" in body and "[APPROX]" in rep.text()
+
+
+def test_approximate_ibeam_to_rect():
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=B31,elset=E\n1,1,2\n"
+            "*Beam Section, elset=E, material=m, section=I\n"
+            "0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008\n0.,0.,1.\n")
+    body, _, rep = convert_str(deck, approximate=True)
+    lines = body.splitlines()
+    i = next(k for k, l in enumerate(lines) if "BEAM SECTION" in l.upper())
+    assert "SECTION=RECT" in lines[i].upper()
+    b_r, h_r = (float(x) for x in lines[i + 1].split(","))
+    assert abs(b_r * h_r - 0.00344) < 1e-6                     # area preserved
+    assert lines[i + 2].replace(" ", "") == "0.,0.,1."         # direction line kept
+    assert "[APPROX]" in rep.text()
 
 
 if __name__ == "__main__":

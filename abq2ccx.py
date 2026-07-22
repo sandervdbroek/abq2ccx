@@ -25,10 +25,12 @@ dependent it is noted in the report and the README.
 
 Usage
 -----
-    python abq2ccx.py model.inp                # -> model_ccx.inp (+ model_ccx.log)
-    python abq2ccx.py model.inp -o out.inp
-    python abq2ccx.py model.inp --quiet
-    python abq2ccx.py model.inp --solid-dof 3  # force translational-only ENCASTRE
+    python3 abq2ccx.py model.inp               # -> model_ccx.inp (+ model_ccx.log)
+    python3 abq2ccx.py decks/*.inp --outdir out   # batch convert
+    python3 abq2ccx.py model.inp --run         # convert + run CalculiX on the result
+    python3 abq2ccx.py model.inp --check --json   # dry-run, machine-readable report
+    python3 abq2ccx.py model.inp --approximate    # opt-in physics approximations
+    python3 abq2ccx.py model.inp --solid-dof   # force translational-only ENCASTRE
 
 This file is intentionally a single self-contained script (no dependencies
 beyond the Python standard library) so it is trivial to drop into a project or
@@ -39,14 +41,20 @@ from __future__ import annotations
 
 import argparse
 import ast
+import glob
+import json
 import math
 import operator
 import os
 import re
+import shutil
+import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
+
+__version__ = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Element reference data
@@ -145,6 +153,19 @@ CCX_ELEMENTS = {
 # Element families with no geometric CalculiX equivalent at all.
 UNSUPPORTED_ELEM_PREFIXES = ("COH", "GK", "GKPS", "GKAX", "CONN", "ROTARYI")
 
+# Integration points per (emitted ccx) element type — empirically probed against ccx 2.22
+# by counting *EL PRINT stress rows on single-element decks.  NOTE the 2D counts are the
+# counts of the internally EXPANDED 3D elements (ccx expands plane/axisym to bricks and
+# wedges: CPS4 -> 8 like C3D8, CPS8 -> 27 like C3D20, CPS3 -> 2 like C3D6), which is what
+# *INITIAL CONDITIONS, TYPE=STRESS/... addresses.
+ELEMENT_IP_COUNT = {
+    "C3D4": 1, "C3D6": 2, "C3D8": 8, "C3D8R": 1, "C3D8I": 8, "C3D10": 4, "C3D10T": 4,
+    "C3D15": 9, "C3D20": 27, "C3D20R": 8, "C3D20RI": 8,
+    "CPS3": 2, "CPS4": 8, "CPS4R": 1, "CPS6": 9, "CPS8": 27, "CPS8R": 8,
+    "CPE3": 2, "CPE4": 8, "CPE4R": 1, "CPE6": 9, "CPE8": 27, "CPE8R": 8,
+    "CAX3": 2, "CAX4": 8, "CAX4R": 1, "CAX6": 9, "CAX8": 27, "CAX8R": 8,
+}
+
 
 def element_node_count(typ: str) -> Optional[int]:
     """Node count used to parse connectivity, tolerant of the coupled-temperature ``T``,
@@ -235,6 +256,7 @@ class Report:
     def __init__(self) -> None:
         self.entries: List[Tuple[str, str]] = []
         self._seen: set = set()
+        self.n_commented = 0          # cards emitted as ** comments (no ccx equivalent)
 
     def warn(self, msg: str, once: bool = False) -> None:
         if once:
@@ -254,10 +276,18 @@ class Report:
     def n_warnings(self) -> int:
         return sum(1 for level, _ in self.entries if level == "WARNING")
 
+    @property
+    def n_notes(self) -> int:
+        return sum(1 for level, _ in self.entries if level == "NOTE")
+
+    def summary(self) -> str:
+        return (f"{self.n_warnings} warning(s), {self.n_notes} note(s), "
+                f"{self.n_commented} commented card(s)")
+
     def header_comment_lines(self) -> List[str]:
         lines = ["** ====================================================================",
-                 "** Converted from Abaqus to CalculiX by abq2ccx.py",
-                 "** Review the notes below and verify against your ccx version.",
+                 f"** Converted from Abaqus to CalculiX by abq2ccx v{__version__}",
+                 f"** {self.summary()} — review below; find commented cards with '** abq2ccx:'.",
                  "** --------------------------------------------------------------------"]
         if not self.entries:
             lines.append("** No conversion issues were flagged.")
@@ -532,7 +562,7 @@ def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
     _seen.add(realpath)
 
     try:
-        with open(path, "r", errors="replace") as fh:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
             raw_lines = fh.read().splitlines()
     except OSError as exc:
         report.warn(f"Could not read {path}: {exc}")
@@ -1165,6 +1195,7 @@ class Converter:
     def __init__(self, report: Report, options) -> None:
         self.report = report
         self.opt = options
+        self._approx = bool(getattr(options, "approximate", False))
         self.geom = Geometry()
         self.orientations: Dict[str, Tuple[Vec, Vec, str]] = {}
         self.surfaces: Dict[str, Tuple[str, List[Tuple[str, Optional[str]]]]] = {}
@@ -1438,6 +1469,10 @@ class Converter:
             "COUPLING": self.handle_coupling_card,
             "KINEMATIC": self.handle_kinematic,
             "SURFACE INTERACTION": self.handle_surface_interaction,
+            "INITIAL CONDITIONS": self.handle_initial_conditions,
+            "EQUATION": self.handle_equation,
+            "STATIC": self.handle_static,
+            "DYNAMIC": self.handle_dynamic,
         }
         if kw in handlers:
             return handlers[kw](b)
@@ -1482,6 +1517,7 @@ class Converter:
         return [emit_keyword(kw, b.params)] + list(b.data)
 
     def _commented(self, b: Block, msg: str) -> List[str]:
+        self.report.n_commented += 1
         self.report.warn(msg, once=True)
         out = ["** abq2ccx: " + msg, "** " + emit_keyword(b.keyword, b.params)]
         out += ["** " + d for d in b.data]
@@ -1510,7 +1546,26 @@ class Converter:
         if typ in ("ORTHOTROPIC", "ANISOTROPIC"):
             self.report.note(f"*ELASTIC TYPE={typ} -> {cc} (constant order is identical; "
                              f"data lines passed through).", once=True)
-        return [emit_keyword("ELASTIC", params)] + list(b.data)
+        data = list(b.data)
+        if self._approx and cc == "ISO":
+            newdata, clamped = [], False
+            for rec in merged_data_records(b):
+                f = [x for x in rec if x != ""]
+                if len(f) >= 2:
+                    try:
+                        if pf(f[1]) >= 0.5:
+                            f[1] = "0.475"
+                            clamped = True
+                    except ValueError:
+                        pass
+                if f:
+                    newdata.append(", ".join(f))
+            if clamped:
+                self.report.warn("[APPROX] *ELASTIC Poisson ratio >= 0.5 clamped to 0.475 (ccx "
+                                 "rejects incompressible nu; slight compressibility introduced — "
+                                 "use *HYPERELASTIC for true incompressibility). Verify.", once=True)
+                data = newdata
+        return [emit_keyword("ELASTIC", params)] + data
 
     def _lamina_to_engineering_constants(self, b: Block) -> Optional[List[str]]:
         """``*ELASTIC, TYPE=LAMINA`` (E1,E2,nu12,G12,G13,G23[,T]) has no ccx equivalent;
@@ -1564,8 +1619,15 @@ class Converter:
         if len(recs) > 1:
             v = [x for x in recs[1] if x != ""]
             if v:
-                out.append(", ".join(v))
-                self.report.note("*ORIENTATION additional-rotation line kept (needs ccx >= ~2.15).", once=True)
+                system = (params.get("SYSTEM") or "RECTANGULAR").upper()
+                if system.startswith("RECT"):
+                    out.append(", ".join(v))
+                    self.report.note("*ORIENTATION additional-rotation line kept (needs ccx >= ~2.15).", once=True)
+                else:
+                    # ccx: "additional rotation ... is only allowed for rectangular systems"
+                    self.report.warn(f"*ORIENTATION SYSTEM={system}: the additional-rotation line is "
+                                     f"not allowed by ccx for non-rectangular systems and was dropped "
+                                     f"— verify material directions.", once=True)
         return out
 
     def handle_distribution(self, b: Block) -> List[str]:
@@ -1615,9 +1677,14 @@ class Converter:
         # ccx 2.22 beam profiles: RECT, CIRC (ellipse), PIPE, BOX.  Anything else is a
         # hard "unknown section" error, so comment it out with the escape hatches.
         if sec not in ("", "RECT", "CIRC", "PIPE", "BOX", "THICK PIPE"):
+            if self._approx and sec == "I":
+                approx = self._ibeam_to_rect(b)
+                if approx is not None:
+                    return approx
             return self._commented(b, f"*BEAM SECTION SECTION={sec} is not a ccx profile (ccx has "
                                       f"RECT, CIRC, PIPE, BOX; GENERAL only with user element U1). "
-                                      f"Remodel with an equivalent BOX/RECT, or use beam-like solids.")
+                                      f"Remodel with an equivalent BOX/RECT, or use beam-like solids"
+                                      f"{'' if self._approx else ', or rerun with --approximate'}.")
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("ELSET", "MATERIAL", "SECTION", "ORIENTATION", "OFFSET1", "OFFSET2"):
@@ -1632,6 +1699,45 @@ class Converter:
             self.report.warn("*BEAM SECTION SECTION=CIRC: Abaqus uses a radius, ccx uses two elliptical "
                              "axis lengths; verify the dimension line.", once=True)
         return [emit_keyword("BEAM SECTION", keep)] + list(b.data)
+
+    def _ibeam_to_rect(self, b: Block) -> Optional[List[str]]:
+        """--approximate: replace an I-profile with the RECT of equal area and equal
+        strong-axis inertia.  Weak-axis bending, torsion and shear areas DIFFER."""
+        recs = merged_data_records(b)
+        if not recs:
+            return None
+        try:
+            v = [pf(x) for x in recs[0] if x != ""]
+        except ValueError:
+            return None
+        if len(v) < 7:
+            return None
+        _l, h, b1, b2, t1, t2, t3 = v[:7]
+        hw = h - t1 - t2
+        if min(h, b1, b2, t1, t2, t3) <= 0 or hw <= 0:
+            return None
+        segs = [(b1 * t1, t1 / 2.0, b1 * t1 ** 3 / 12.0),
+                (b2 * t2, h - t2 / 2.0, b2 * t2 ** 3 / 12.0),
+                (t3 * hw, t1 + hw / 2.0, t3 * hw ** 3 / 12.0)]
+        area = sum(a for a, _, _ in segs)
+        ybar = sum(a * y for a, y, _ in segs) / area
+        inertia = sum(i0 + a * (y - ybar) ** 2 for a, y, i0 in segs)
+        h_r = math.sqrt(12.0 * inertia / area)
+        b_r = area / h_r
+        keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        for k, val in b.params.items():
+            if k in ("ELSET", "MATERIAL", "ORIENTATION", "OFFSET1", "OFFSET2"):
+                keep[k] = val
+        keep["SECTION"] = "RECT"
+        self.report.warn("[APPROX] *BEAM SECTION SECTION=I replaced by the RECT with equal area "
+                         "and equal strong-axis inertia; weak-axis bending, torsion and shear "
+                         "response DIFFER. Verify.", once=True)
+        out = [emit_keyword("BEAM SECTION", keep), f"{b_r:.6g}, {h_r:.6g}"]
+        if len(recs) > 1:                          # keep the direction-cosine line
+            second = [x for x in recs[1] if x != ""]
+            if second:
+                out.append(", ".join(second))
+        return out
 
     def handle_shell_section(self, b: Block) -> List[str]:
         elset = b.param("ELSET")
@@ -1772,8 +1878,10 @@ class Converter:
                                      f"only); TYPE dropped — values now read as displacements.", once=True)
                 continue  # ccx *BOUNDARY has no TYPE parameter
             if k == "LOAD CASE":
-                self.report.note("*BOUNDARY LOAD CASE is only meaningful in ccx steady-state "
-                                 "dynamics.", once=True)
+                # ccx hard-errors on LOAD CASE outside *STEADY STATE DYNAMICS
+                self.report.warn("*BOUNDARY LOAD CASE dropped (ccx allows it only in steady-state "
+                                 "dynamics; elsewhere it is a fatal error).", once=True)
+                continue
             params[k] = v
         out = [emit_keyword("BOUNDARY", params)]
         for rec in merged_data_records(b):
@@ -1922,8 +2030,18 @@ class Converter:
         for rec in merged_data_records(b):
             invars.extend(x for x in rec if x != "")
         outvars: List[str] = []
+        known_bases = set(ABQ_DROP_VARS) | set(ABQ_MAP_VARS) | \
+            {"S", "E", "U", "V", "RF", "NT", "ME", "PEEQ", "THE", "SDV", "HFL", "ENER"}
         for v in invars:
             vu = v.upper()
+            # per-component identifiers (S11, EE12, THE33...) collapse to their base tensor
+            # name — ccx output identifiers are whole quantities, and a long component list
+            # also overflows ccx's 16-entries-per-line reader
+            mcomp = re.fullmatch(r"([A-Z]+?)(\d{1,2})", vu)
+            if vu not in known_bases and mcomp and mcomp.group(1) in known_bases:
+                self.report.note("Per-component output identifiers (e.g. S11, EE12) collapsed to "
+                                 "their base quantity (ccx writes whole tensors).", once=True)
+                vu = mcomp.group(1)
             if vu in ABQ_DROP_VARS:
                 self.report.note(f"Output variable {vu} dropped (no ccx equivalent; derive in "
                                  f"post-processing).", once=True)
@@ -1941,7 +2059,12 @@ class Converter:
             self.report.note(f"*{cc}: no explicit variables -> default '{outvars[0]}'.", once=True)
         out = [emit_keyword(cc, params)]
         if outvars:
-            out.append(", ".join(dedup_str(outvars)))
+            final = dedup_str(outvars)
+            if len(final) > 16:                       # ccx reads at most 16 entries per line
+                self.report.warn(f"*{cc}: more than 16 output identifiers after mapping; keeping "
+                                 f"the first 16 (ccx line limit).", once=True)
+                final = final[:16]
+            out.append(", ".join(final))
         return out
 
     def handle_mpc(self, b: Block) -> List[str]:
@@ -2144,7 +2267,65 @@ class Converter:
             self.report.warn("*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
                              "rigidly with REF NODE); the pin-vs-tie DOF nuance may differ — verify.",
                              once=True)
+        # ccx requires REF NODE / ROT NODE to be node NUMBERS; CAE writes reference-point
+        # set names (_PickedSet47) — resolve single-node sets, exactly as for *COUPLING.
+        for key in ("REF NODE", "ROT NODE"):
+            ref = (keep.get(key) or "").strip()
+            if ref and not re.fullmatch(r"[-+]?\d+", ref):
+                nodes = self.geom.nset(ref)
+                if len(nodes) == 1:
+                    keep[key] = str(nodes[0])
+                    self.report.note(f"*RIGID BODY {key}={ref} resolved to node {nodes[0]} "
+                                     f"(ccx needs a node number).", once=True)
+                elif nodes:
+                    keep[key] = str(nodes[0])
+                    self.report.warn(f"*RIGID BODY {key}={ref} names a set with {len(nodes)} nodes; "
+                                     f"the first ({nodes[0]}) is used — verify.", once=True)
+                else:
+                    self.report.warn(f"*RIGID BODY {key}={ref} could not be resolved to a node id; "
+                                     f"ccx will reject a set name here.", once=True)
         return [emit_keyword("RIGID BODY", keep)] + list(b.data)
+
+    def handle_equation(self, b: Block) -> List[str]:
+        """``*EQUATION``: ccx 2.22 requires node NUMBERS in the terms; Abaqus/CAE decks
+        (esp. periodic-BC lattices) write node SETS.  Resolve single-node sets directly;
+        expand equal-length multi-node sets into one equation per node pairing."""
+        recs = [[x for x in rec if x != ""] for rec in merged_data_records(b)]
+        recs = [r for r in recs if r]
+        if not recs:
+            return [emit_keyword("EQUATION", b.params)] + list(b.data)
+        toks: List[str] = [t for r in recs[1:] for t in r]
+        if len(toks) % 3 != 0 or not any(not re.fullmatch(r"[-+]?[\d.eE+-]+", t) for t in toks[0::3]):
+            return [emit_keyword("EQUATION", b.params)] + list(b.data)   # all-numeric: untouched
+        terms = [(toks[i], toks[i + 1], toks[i + 2]) for i in range(0, len(toks), 3)]
+        resolved: List[Tuple[List[int], str, str]] = []
+        for tok, dof, coef in terms:
+            if re.fullmatch(r"[-+]?\d+", tok):
+                resolved.append(([int(tok)], dof, coef))
+            else:
+                nodes = self.geom.nset(tok)
+                if not nodes:
+                    self.report.warn(f"*EQUATION references set '{tok}' which resolves to no nodes; "
+                                     f"card left unchanged — ccx 2.22 rejects set names here "
+                                     f"(2.23 accepts them).", once=True)
+                    return [emit_keyword("EQUATION", b.params)] + list(b.data)
+                resolved.append((list(nodes), dof, coef))
+        sizes = {len(n) for n, _, _ in resolved if len(n) > 1}
+        if len(sizes) > 1:
+            self.report.warn("*EQUATION mixes node sets of different sizes; card left unchanged — "
+                             "rewrite with explicit nodes.", once=True)
+            return [emit_keyword("EQUATION", b.params)] + list(b.data)
+        n_eq = sizes.pop() if sizes else 1
+        out: List[str] = [emit_keyword("EQUATION", b.params)]
+        for i in range(n_eq):
+            trip = [(nodes[i] if len(nodes) > 1 else nodes[0], dof, coef)
+                    for nodes, dof, coef in resolved]
+            out.append(str(len(trip)))
+            for j in range(0, len(trip), 4):          # ccx: at most 12 entries per line
+                out.append(", ".join(f"{n}, {d}, {c}" for n, d, c in trip[j:j + 4]))
+        self.report.note("*EQUATION set-name terms resolved to node numbers (ccx 2.22 needs "
+                         "explicit nodes; multi-node sets expanded pairwise).", once=True)
+        return out
 
     def handle_coupling_card(self, b: Block) -> List[str]:
         """``*COUPLING``: ccx accepts the card but requires REF NODE to be a NODE NUMBER —
@@ -2199,6 +2380,108 @@ class Converter:
             lines = ["1, 3"]
         return [emit_keyword("KINEMATIC", b.params)] + lines
 
+    def handle_static(self, b: Block) -> List[str]:
+        """``*STATIC, RIKS``: ccx has no arc-length solver.  Under --approximate the step
+        becomes a plain *STATIC (the first two data fields carry over as increments)."""
+        if b.has("RIKS"):
+            if self._approx:
+                params: "OrderedDict[str, Optional[str]]" = OrderedDict(
+                    (k, v) for k, v in b.params.items() if k != "RIKS")
+                self.report.warn("[APPROX] *STATIC, RIKS -> plain *STATIC (ccx has no Riks "
+                                 "arc-length solver; snap-through/post-buckling paths may not "
+                                 "converge or may differ). Verify.", once=True)
+                return [emit_keyword("STATIC", params)] + list(b.data)
+            self.report.warn("*STATIC, RIKS: ccx has no Riks arc-length solver and rejects the "
+                             "parameter; rerun with --approximate to convert to plain *STATIC.",
+                             once=True)
+        return self.passthrough(b)
+
+    def handle_dynamic(self, b: Block) -> List[str]:
+        """``*DYNAMIC, EXPLICIT``: ccx has no explicit solver.  Under --approximate the step
+        becomes implicit *DYNAMIC (initial increment = data dt or period/1000)."""
+        if b.has("EXPLICIT"):
+            if self._approx:
+                drop = ("EXPLICIT", "SCALE FACTOR", "DIRECT USER CONTROL", "ELEMENT BY ELEMENT",
+                        "FIXED TIME INCREMENTATION", "IMPROVED DT METHOD")
+                keep: "OrderedDict[str, Optional[str]]" = OrderedDict(
+                    (k, v) for k, v in b.params.items() if k not in drop)
+                data: List[str] = []
+                recs = merged_data_records(b)
+                if recs:
+                    rec = recs[0]
+                    period = rec[1].strip() if len(rec) > 1 and rec[1].strip() else "1."
+                    init = rec[0].strip() if rec and rec[0].strip() else ""
+                    if not init:
+                        try:
+                            init = f"{pf(period) / 1000.0:.6g}"
+                        except ValueError:
+                            init = "1e-3"
+                    data = [f"{init}, {period}"]
+                self.report.warn("[APPROX] *DYNAMIC, EXPLICIT -> implicit *DYNAMIC (ccx has no "
+                                 "explicit solver; time integration, stability and mass-scaling "
+                                 "semantics differ — expect different increments). Verify.", once=True)
+                return [emit_keyword("DYNAMIC", keep)] + (data or list(b.data))
+            self.report.warn("*DYNAMIC, EXPLICIT: ccx has no explicit solver; rerun with "
+                             "--approximate to convert to an implicit *DYNAMIC step.", once=True)
+        return self.passthrough(b)
+
+    def handle_initial_conditions(self, b: Block) -> List[str]:
+        """``*INITIAL CONDITIONS, TYPE=STRESS/PLASTIC STRAIN/SOLUTION``: Abaqus writes one
+        line per element/elset with NO integration-point column; ccx requires one line per
+        element AND integration point (verified: the Abaqus form is a hard error, the
+        expanded form solves).  Expand each record to every int pt of the emitted ccx
+        element type (uniform value per element).  Other TYPEs pass through unchanged."""
+        typ = (b.param("TYPE") or "").upper()
+        ccx_known = {"DISPLACEMENT", "FLUID VELOCITY", "MASS FLOW", "PLASTIC STRAIN", "PRESSURE",
+                     "SOLUTION", "STRESS", "TEMPERATURE", "TOTAL PRESSURE", "VELOCITY"}
+        if typ and typ not in ccx_known:
+            # e.g. TYPE=ENRICHMENT (XFEM/VCCT), HARDENING, FIELD, RATIO — ccx stops with
+            # "unknown type"; comment the card out with the reason instead
+            return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} is not a ccx initial-"
+                                      f"condition type (ccx knows {', '.join(sorted(ccx_known))}); "
+                                      f"remodel or remove.")
+        if typ not in ("STRESS", "PLASTIC STRAIN", "SOLUTION"):
+            return self.passthrough(b)
+        if b.has("GEOSTATIC"):
+            return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ}, GEOSTATIC (stress varying "
+                                      f"with elevation) has no ccx equivalent; compute per-element "
+                                      f"stresses and list them explicitly.")
+        if b.has("USER"):
+            return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ}, USER needs the "
+                                      f"sigini/sdvini user subroutine — port it to ccx and re-add.")
+        out: List[str] = [emit_keyword("INITIAL CONDITIONS", b.params)]
+        expanded = skipped = 0
+        for rec in merged_data_records(b):
+            f = [x for x in rec if x != ""]
+            if not f:
+                continue
+            tok, vals = f[0], f[1:]
+            eids = [int(tok)] if re.fullmatch(r"[-+]?\d+", tok) else self.geom.elset(tok)
+            if not eids:
+                self.report.warn(f"*INITIAL CONDITIONS TYPE={typ}: '{tok}' matches no element or "
+                                 f"elset; record dropped.", once=True)
+                continue
+            for eid in eids:
+                info = self.geom.elements.get(eid)
+                n = ELEMENT_IP_COUNT.get(ccx_element_type(info[0], self.report)) if info else None
+                if not n:
+                    skipped += 1
+                    continue
+                for k in range(1, n + 1):
+                    out.extend(reflow([str(eid), str(k)] + vals, MAX_ENTRIES_PER_LINE))
+                expanded += 1
+        if expanded:
+            self.report.warn(f"*INITIAL CONDITIONS TYPE={typ} expanded to ccx's per-integration-"
+                             f"point format (uniform value per element; 2D elements use the "
+                             f"internally-expanded 3D point counts).", once=True)
+        if skipped:
+            self.report.warn(f"*INITIAL CONDITIONS TYPE={typ}: {skipped} element(s) have no "
+                             f"integration-point mapping (shells/beams/unknown types); set those "
+                             f"manually.", once=True)
+        if len(out) == 1:
+            return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} had no expandable records.")
+        return out
+
     def handle_surface_interaction(self, b: Block) -> List[str]:
         """``*SURFACE INTERACTION``: Abaqus' default contact is hard pressure-overclosure
         with NO *SURFACE BEHAVIOR card, but ccx then stops with 'no PRESSURE-OVERCLOSURE'.
@@ -2249,6 +2532,12 @@ class Converter:
             if len(f) >= 2 and f[1].upper() in ("SPOS", "SNEG"):
                 self.report.warn("*SURFACE shell face SPOS/SNEG: ccx handles shell faces differently; "
                                  "verify.", once=True)
+            if len(f) >= 2 and re.fullmatch(r"E[1-4]", f[1].upper()):
+                # Abaqus 2D solids name edge faces E1..E4; ccx uses S1..S4 with the same
+                # edge-numbering convention (verified: ccx rejects E1, accepts S1).
+                f = [f[0], "S" + f[1][1:]] + f[2:]
+                self.report.note("*SURFACE 2D edge faces E1..E4 renamed to ccx S1..S4 "
+                                 "(same edge numbering).", once=True)
             out.append(", ".join(f))
         return out
 
@@ -2827,51 +3116,235 @@ def default_output(input_path: str) -> str:
     return stem + "_ccx.inp"
 
 
+class Options:
+    """Conversion options (the CLI argparse namespace also satisfies this contract)."""
+
+    def __init__(self, solid_dof: bool = False, approximate: bool = False) -> None:
+        self.solid_dof = solid_dof
+        self.approximate = approximate
+
+
+class Result:
+    """Outcome of a programmatic conversion (see convert_file / convert_text)."""
+
+    def __init__(self, text: str, body: List[str], report: Report, geometry: Geometry) -> None:
+        self.text = text          # full deck including the header comments
+        self.body = body          # deck lines without the header
+        self.report = report
+        self.geometry = geometry
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.body)
+
+
+def convert_file(path: str, solid_dof: bool = False, approximate: bool = False) -> Result:
+    """One-call module API: convert an Abaqus deck file to CalculiX text."""
+    report = Report()
+    blocks = read_blocks(path, report)
+    conv = Converter(report, Options(solid_dof, approximate))
+    body = conv.convert(blocks) if blocks else []
+    text = ("\n".join(report.header_comment_lines() + body) + "\n") if body else ""
+    return Result(text, body, report, conv.geom)
+
+
+def convert_text(text: str, solid_dof: bool = False, base_dir: str = ".",
+                 approximate: bool = False) -> Result:
+    """Convert Abaqus deck text; ``*INCLUDE`` paths resolve relative to ``base_dir``."""
+    import tempfile
+    fd, p = tempfile.mkstemp(suffix=".inp", dir=base_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return convert_file(p, solid_dof, approximate)
+    finally:
+        os.unlink(p)
+
+
+def find_ccx(override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, str]]:
+    """Locate a CalculiX executable: --ccx/$CCX override, PATH, then known bundle spots
+    (incl. FreeCAD's copy, whose dylibs need the ../lib fallback path)."""
+    for cand in ([override] if override else []) + \
+                ([os.environ["CCX"]] if not override and os.environ.get("CCX") else []):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand, {}
+        return None, {}
+    for name in ("ccx", "ccx_2.23", "ccx_2.22", "ccx_2.21", "CalculiX"):
+        p = shutil.which(name)
+        if p:
+            return p, {}
+    candidates = (glob.glob("/Applications/FreeCAD*.app/Contents/Resources/bin/ccx")
+                  + glob.glob("/usr/local/bin/ccx*") + glob.glob("/opt/homebrew/bin/ccx*")
+                  + glob.glob("/opt/local/bin/ccx*"))
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            env = {}
+            libdir = os.path.join(os.path.dirname(os.path.dirname(c)), "lib")
+            if os.path.isdir(libdir):
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = libdir
+                env["LD_LIBRARY_PATH"] = libdir
+            return c, env
+    return None, {}
+
+
+def run_ccx(out_path: str, override: Optional[str], quiet: bool) -> int:
+    """Run CalculiX on a converted deck; 0 iff the job finishes with no *ERROR."""
+    exe, extra_env = find_ccx(override)
+    if not exe:
+        sys.stderr.write("abq2ccx: no CalculiX executable found (searched --ccx/$CCX, PATH, the "
+                         "FreeCAD bundle, Homebrew/MacPorts); install ccx or pass --ccx PATH.\n")
+        return 1
+    env = dict(os.environ)
+    env.update(extra_env)
+    stem = os.path.splitext(os.path.basename(out_path))[0]
+    cwd = os.path.dirname(os.path.abspath(out_path))
+    if not quiet:
+        sys.stderr.write(f"abq2ccx: running {exe} {stem}\n")
+    try:
+        p = subprocess.run([exe, stem], cwd=cwd, env=env, capture_output=True, text=True)
+    except OSError as exc:
+        sys.stderr.write(f"abq2ccx: could not run ccx: {exc}\n")
+        return 1
+    out = p.stdout + p.stderr
+    if not quiet:
+        sys.stderr.write(out)
+    solved = "Job finished" in out and "*ERROR" not in out
+    if not solved:
+        errs = [ln.strip() for ln in out.splitlines() if "*ERROR" in ln][:3]
+        sys.stderr.write("abq2ccx: ccx did NOT finish cleanly"
+                         + (": " + " | ".join(errs) if errs else "") + "\n")
+    return 0 if solved else 1
+
+
+def _convert_one(path: str, args) -> int:
+    report = Report()
+    blocks = read_blocks(path, report)
+    if not blocks:
+        if not os.path.exists(path):
+            sys.stderr.write(f"abq2ccx: cannot read {path}: no such file\n")
+        else:
+            sys.stderr.write(f"abq2ccx: no Abaqus keywords found in {path} "
+                             f"(is it an Abaqus .inp deck?)\n")
+            msg = report.text().strip()
+            if msg and not msg.startswith("No conversion issues"):
+                sys.stderr.write(msg + "\n")
+        return 1
+    conv = Converter(report, args)
+    try:
+        body = conv.convert(blocks)
+    except Exception as exc:                # surface a clean message, not a bare traceback
+        sys.stderr.write(f"abq2ccx: conversion failed for {path} ({type(exc).__name__}: {exc}).\n"
+                         f"Please report this deck. Run with PYTHONFAULTHANDLER for a traceback.\n")
+        return 4
+
+    if args.output:
+        out_path = args.output
+    else:
+        out_path = default_output(path)
+        if args.outdir:
+            try:
+                os.makedirs(args.outdir, exist_ok=True)
+            except OSError as exc:
+                sys.stderr.write(f"abq2ccx: cannot create --outdir {args.outdir}: {exc}\n")
+                return 1
+            out_path = os.path.join(args.outdir, os.path.basename(out_path))
+    text = "\n".join(report.header_comment_lines() + body) + "\n"
+
+    wrote = False
+    if not args.check:
+        try:
+            with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            wrote = True
+        except OSError as exc:
+            sys.stderr.write(f"abq2ccx: cannot write {out_path}: {exc}\n")
+            return 1
+        if not args.no_log:
+            log_path = os.path.splitext(out_path)[0] + ".log"
+            try:
+                with open(log_path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(report.text())
+            except OSError as exc:
+                sys.stderr.write(f"abq2ccx: cannot write {log_path}: {exc}\n")
+
+    if args.json_out:
+        print(json.dumps({
+            "tool": "abq2ccx", "version": __version__, "input": path,
+            "output": out_path if wrote else None, "check_only": bool(args.check),
+            "nodes": len(conv.geom.nodes), "elements": len(conv.geom.elements),
+            "counts": {"warnings": report.n_warnings, "notes": report.n_notes,
+                       "commented_cards": report.n_commented},
+            "entries": [{"level": lvl, "message": m} for lvl, m in report.entries],
+            "ok": report.n_warnings == 0 and report.n_commented == 0,
+        }))
+    elif not args.quiet:
+        verb = "checked" if args.check else "wrote"
+        sys.stderr.write(f"abq2ccx: {verb} {path if args.check else out_path} "
+                         f"({len(conv.geom.nodes)} nodes, {len(conv.geom.elements)} elements, "
+                         f"{report.summary()})\n")
+        sys.stderr.write(report.text())
+
+    if args.strict and (report.n_warnings > 0 or report.n_commented > 0):
+        return 3
+    if args.run and wrote:
+        return run_ccx(out_path, args.ccx, args.quiet)
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Convert an Abaqus .inp file to a CalculiX (ccx) .inp file.",
-        epilog="The output is a starting point: always review the [WARNING]/[NOTE] lines "
-               "at the top of the file and check it against your ccx version.")
-    ap.add_argument("input", help="Abaqus input deck (.inp)")
-    ap.add_argument("-o", "--output", help="output file (default: <input>_ccx.inp)")
+        prog="abq2ccx",
+        description="Convert Abaqus .inp file(s) to CalculiX (ccx) .inp files.",
+        epilog="Exit codes: 0 converted; 1 cannot read/write; 2 usage error; "
+               "3 --strict findings; 4 internal conversion error. "
+               "The output is a starting point: always review the [WARNING]/[NOTE] lines.")
+    ap.add_argument("input", nargs="+", help="Abaqus input deck(s) (.inp); glob patterns allowed")
+    ap.add_argument("-o", "--output", help="output file (single input only; default: <input>_ccx.inp)")
+    ap.add_argument("--outdir", help="write outputs (default names) into this directory")
     ap.add_argument("--solid-dof", action="store_true",
                     help="force translational-only DOFs when expanding ENCASTRE/PINNED/*SYMM "
                          "(use for solid-only models that have no rotational DOFs)")
     ap.add_argument("--no-log", action="store_true", help="do not write a .log report file")
     ap.add_argument("--quiet", action="store_true", help="suppress the report on stderr")
+    ap.add_argument("--approximate", action="store_true",
+                    help="opt-in: reframe constructs ccx cannot run as approximately equivalent "
+                         "ones it can (Riks->static, explicit->implicit dynamics, nu>=0.5 "
+                         "clamped, I-beam->equivalent RECT), each with a loud [APPROX] warning")
+    ap.add_argument("--check", action="store_true",
+                    help="dry run: parse + convert + report, write nothing")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 3 if the conversion produced warnings or commented-out cards")
+    ap.add_argument("--json", dest="json_out", action="store_true",
+                    help="print a machine-readable JSON report to stdout")
+    ap.add_argument("--run", action="store_true",
+                    help="run CalculiX on the converted output (auto-detected; see --ccx)")
+    ap.add_argument("--ccx", help="CalculiX executable to use with --run ($CCX also honoured)")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
 
-    report = Report()
-    blocks = read_blocks(args.input, report)
-    if not blocks:
-        sys.stderr.write(f"abq2ccx: no keywords parsed from {args.input}\n")
+    inputs: List[str] = []
+    for pat in args.input:
+        if any(ch in pat for ch in "*?[") and not os.path.exists(pat):
+            matches = sorted(glob.glob(pat))         # Windows shells do not expand globs
+            if matches:
+                inputs.extend(matches)
+            else:
+                sys.stderr.write(f"abq2ccx: no files match {pat}\n")
+        else:
+            inputs.append(pat)
+    if not inputs:
+        sys.stderr.write("abq2ccx: nothing to convert\n")
         return 1
+    if args.output and len(inputs) > 1:
+        ap.error("-o/--output is only valid with a single input; use --outdir for batches")
 
-    conv = Converter(report, args)
-    try:
-        body = conv.convert(blocks)
-    except Exception as exc:                # surface a clean message, not a bare traceback
-        sys.stderr.write(f"abq2ccx: conversion failed ({type(exc).__name__}: {exc}).\n"
-                         f"Please report this deck. Run with PYTHONFAULTHANDLER for a traceback.\n")
-        return 2
-
-    out_path = args.output or default_output(args.input)
-    text = "\n".join(report.header_comment_lines() + body) + "\n"
-    with open(out_path, "w") as fh:
-        fh.write(text)
-
-    if not args.no_log:
-        log_path = os.path.splitext(out_path)[0] + ".log"
-        with open(log_path, "w") as fh:
-            fh.write(report.text())
-
-    if not args.quiet:
-        sys.stderr.write(
-            f"abq2ccx: wrote {out_path} "
-            f"({len(conv.geom.nodes)} nodes, {len(conv.geom.elements)} elements, "
-            f"{report.n_warnings} warning(s))\n")
-        sys.stderr.write(report.text())
-    return 0
+    codes = [_convert_one(p, args) for p in inputs]
+    if len(inputs) > 1 and not args.quiet and not args.json_out:
+        ok = sum(1 for c in codes if c == 0)
+        sys.stderr.write(f"abq2ccx: converted {ok}/{len(inputs)} deck(s)"
+                         + (f", {len(inputs) - ok} with findings/failures" if ok != len(inputs) else "")
+                         + "\n")
+    return max(codes)
 
 
 if __name__ == "__main__":

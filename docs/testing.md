@@ -95,7 +95,7 @@ deck and runs it in CalculiX:
 
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
-**Results:** all 1022 convert with zero dangling references; **385 solve** in CalculiX.
+**Results:** all 1022 convert with zero dangling references; **414 solve** in CalculiX.
 The other 636 convert cleanly but use features ccx cannot run (user elements, UMAT/
 VUMAT, explicit dynamics, cohesive/connector elements, piezoelectric/acoustic coupling,
 other user subroutines) or are CAE part fragments / incomplete source decks (e.g.

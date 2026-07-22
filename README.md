@@ -42,11 +42,26 @@ The rest of this README is a self-contained overview.
 ## Quick start
 
 ```bash
-python abq2ccx.py model.inp                 # -> model_ccx.inp  (+ model_ccx.log)
-python abq2ccx.py model.inp -o out.inp      # choose the output name
-python abq2ccx.py model.inp --solid-dof     # solid-only model: ENCASTRE/*SYMM use DOF 1-3
-python abq2ccx.py model.inp --quiet         # don't print the report to stderr
+python3 abq2ccx.py model.inp                 # -> model_ccx.inp  (+ model_ccx.log)
+python3 abq2ccx.py model.inp -o out.inp      # choose the output name
+python3 abq2ccx.py decks/*.inp --outdir out  # batch-convert into a directory
+python3 abq2ccx.py model.inp --run           # convert, then run CalculiX on the result
+python3 abq2ccx.py model.inp --check         # dry run: report only, write nothing
+python3 abq2ccx.py model.inp --json          # machine-readable report on stdout (CI)
+python3 abq2ccx.py model.inp --strict        # exit 3 on any warning/commented card (CI)
+python3 abq2ccx.py model.inp --approximate   # opt-in physics approximations (see below)
+python3 abq2ccx.py model.inp --solid-dof     # solid-only model: ENCASTRE/*SYMM use DOF 1-3
 ```
+
+Exit codes: `0` converted · `1` cannot read/write · `2` usage error · `3` `--strict`
+findings · `4` internal conversion error.  `--run` auto-detects `ccx` (PATH, the
+FreeCAD-bundled copy, Homebrew/MacPorts) — or point at one with `--ccx`/`$CCX`.
+
+**`--approximate` mode** reframes constructs CalculiX cannot run as *approximately
+equivalent* ones it can, each flagged with a loud `[APPROX]` warning: `*STATIC, RIKS` →
+plain `*STATIC`, `*DYNAMIC, EXPLICIT` → implicit `*DYNAMIC`, incompressible `ν ≥ 0.5` →
+`0.475`, `*BEAM SECTION, SECTION=I` → the RECT with equal area + strong-axis inertia.
+Off by default — nothing changes silently.
 
 Then run it in CalculiX (`ccx out`, no extension). The converter validates
 *structure and syntax*, not *physics* — **always read the report** (printed to
@@ -57,10 +72,10 @@ Use as a module:
 
 ```python
 import abq2ccx
-report = abq2ccx.Report()
-blocks = abq2ccx.read_blocks("model.inp", report)
-conv = abq2ccx.Converter(report, type("o", (), {"solid_dof": False})())
-text = "\n".join(conv.convert(blocks))
+result = abq2ccx.convert_file("model.inp")          # or convert_text(deck_string)
+print(result.text)                                  # converted deck incl. header
+print(result.report.summary())                      # "N warning(s), M note(s), ..."
+result.geometry.nodes, result.geometry.elements     # parsed model
 ```
 
 ---
@@ -105,8 +120,8 @@ python corpus/fetch.py             # download the decks into corpus/files/ (giti
 python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
-Results: **all 1022 convert with zero dangling references, and 385 solve in CalculiX.**
-The other 636 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT,
+Results: **all 1022 convert with zero dangling references, and 414 solve in CalculiX.**
+The other 608 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT,
 explicit dynamics, cohesive/connector elements, piezoelectric/acoustic coupling, other
 user subroutines) or are CAE part fragments / incomplete source decks — each verified to
 fail *no worse than the original, unconverted deck*. The converter never makes a deck
