@@ -617,6 +617,36 @@ def test_pore_pressure_element_suffix_dropped():
     assert "pore-pressure" in rep.text().lower()
 
 
+def test_dload_unsupported_body_load_dropped():
+    # ccx supports only GRAV and CENTRIF body loads; ROTA/CORIO/CENT/ROTDYNF are rejected
+    # outright by ccx, so they must be dropped (warned) rather than emitted — keeping the
+    # supported lines so the rest of the *DLOAD survives (forum: "ROTA not supported").
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n"
+            "*Element,type=C3D8,elset=E\n1,1,2,3,4,5,6,7,8\n"
+            "*Material,name=m\n*Elastic\n1.,.3\n*Density\n1e-9\n*Solid Section,elset=E,material=m\n"
+            "*Step\n*Static\n*Dload\nE, GRAV, 9810., 0.,0.,-1.\nE, ROTA, 500., 0.,0.,0., 0.,0.,1.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    live = [l for l in body.splitlines() if not l.lstrip().startswith("**")]
+    assert any("GRAV" in l.upper() for l in live)           # GRAV kept
+    assert not any("ROTA" in l.upper() for l in live)        # ROTA dropped from live output
+    assert "rota" in rep.text().lower()                       # and warned
+
+
+def test_assembly_node_not_overwritten_by_instance():
+    # Assembly-level *Node cards (Abaqus/CAE reference points placed inside *Assembly) must
+    # keep their ids and be emitted BEFORE the instances, which are then numbered above them
+    # so an assembly node id never overwrites a flattened part node id (GitHub issue #2).
+    deck = ("*Part, name=p\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=CPS4, elset=e\n1,1,2,3,4\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=p-1, part=p\n*End Instance\n"
+            "*Node\n999, 5.,5.,5.\n*End Assembly\n")
+    _, conv, _ = convert_str(deck)
+    assert conv.geom.nodes.get(999) == (5., 5., 5.)          # assembly ref node survives
+    inst_ids = [n for n in conv.geom.nodes if n != 999]
+    assert len(inst_ids) == 4 and all(n > 999 for n in inst_ids)  # instances offset above it
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

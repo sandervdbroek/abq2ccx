@@ -1138,6 +1138,12 @@ ABQ_MAP_VARS = {"LE": "E", "PE": "PEEQ", "PEMAG": "PEEQ", "CEEQ": "PEEQ", "EE": 
 # ccx identifiers that are valid only on *EL PRINT / *NODE PRINT (.dat), not *EL FILE.
 EL_PRINT_ONLY_VARS = {"ELSE", "ELKE", "EVOL", "CELS"}
 
+# Abaqus *DLOAD body-force labels CalculiX has no equivalent for (verified: ccx accepts
+# only GRAV and CENTRIF body loads, and rejects the whole *DLOAD on any of these).  CENT
+# is Abaqus' density-scaled centrifugal load; ROTA/CORIO/ROTDYNF are rotary-acceleration /
+# Coriolis / rotor-dynamic loads.
+DLOAD_UNSUPPORTED = {"CENT", "ROTA", "CORIO", "ROTDYNF"}
+
 
 # ---------------------------------------------------------------------------
 # Converter
@@ -1743,16 +1749,24 @@ class Converter:
         return table.get(name)
 
     def handle_dload(self, b: Block) -> List[str]:
-        out = [emit_keyword("DLOAD", b.params)]
+        body: List[str] = []
         for rec in merged_data_records(b):
             f = [x for x in rec if x != ""]
             if not f:
                 continue
-            if len(f) >= 2 and f[1].upper() == "P":
+            label = f[1].upper() if len(f) >= 2 else ""
+            if label in DLOAD_UNSUPPORTED:
+                self.report.warn(f"*DLOAD type {label} has no CalculiX equivalent (ccx body loads are "
+                                 f"GRAV and CENTRIF only — not rotary-acceleration/Coriolis/density-"
+                                 f"scaled centrifugal); this load line was dropped. Verify.", once=True)
+                continue
+            if label == "P":
                 self.report.warn("*DLOAD label 'P' has no face number; CalculiX needs P1..P6 for element "
                                  "pressure. Verify.", once=True)
-            out.append(", ".join(f))
-        return out
+            body.append(", ".join(f))
+        if not body:
+            return self._commented(b, "*DLOAD has no CalculiX-compatible load lines; dropped.")
+        return [emit_keyword("DLOAD", b.params)] + body
 
     def handle_dsload(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -2443,12 +2457,41 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
             blk.data = rewritten
 
 
+def _partition_assembly_geometry(assembly_blocks: List[Block]):
+    """Assembly-level ``*NODE``/``*ELEMENT`` cards (Abaqus/CAE reference points, connector
+    or mass elements) live in their own id space that must NOT be overwritten by the
+    flattened instances.  Split them out so they can be emitted first, keeping their
+    original ids, with the instances numbered above them.  Returns ``(geometry_blocks,
+    max_node_id, max_elem_id, remaining_assembly_blocks)``."""
+    geom: List[Block] = []
+    remaining: List[Block] = []
+    max_node = max_elem = 0
+    for b in assembly_blocks:
+        if b.keyword not in ("NODE", "ELEMENT"):
+            remaining.append(b)
+            continue
+        geom.append(b)
+        for rec in merged_data_records(b):
+            f = [x for x in rec if x != ""]
+            if not f:
+                continue
+            try:
+                first = int(float(f[0]))
+            except ValueError:               # instance-qualified connectivity, blank, etc.
+                continue
+            if b.keyword == "NODE":
+                max_node = max(max_node, first)
+            else:
+                max_elem = max(max_elem, first)
+    return geom, max_node, max_elem, remaining
+
+
 def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block]:
     """``*PART``/``*INSTANCE``/``*ASSEMBLY`` -> one flat, globally-numbered mesh (ccx has
-    no assembly concept).  Orchestrates the five phases, each a helper above: partition
-    the deck -> emit per-part global data -> emit each instance's geometry (id-offset +
-    transform) -> translate assembly-level sets/surfaces/constraints -> resolve leftover
-    instance-qualified references."""
+    no assembly concept).  Orchestrates the phases, each a helper above: partition the
+    deck -> emit per-part global data -> emit assembly-level nodes/elements -> emit each
+    instance's geometry (id-offset + transform) -> translate assembly-level sets/surfaces/
+    constraints -> resolve leftover instance-qualified references."""
     report.warn("Model uses *PART/*INSTANCE/*ASSEMBLY. Flattened to a single global mesh "
                 "(best-effort) — verify node/element renumbering and instance transforms.", once=True)
     namer = make_namer(report)
@@ -2457,8 +2500,18 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     out: List[Block] = list(pre)
     out.extend(_emit_part_global_data(parts))
 
+    # Assembly-level *NODE/*ELEMENT (CAE reference points etc.) keep their original ids and
+    # are emitted BEFORE the instances; the instances are then numbered above them so an
+    # assembly node id can never overwrite a part/instance node id.
+    asm_geom, asm_max_node, asm_max_elem, assembly_blocks = _partition_assembly_geometry(assembly_blocks)
+    if asm_geom:
+        report.warn("Assembly-level *NODE/*ELEMENT (e.g. CAE reference points) kept with their "
+                    "original ids; instance meshes are numbered above them so ids do not collide.",
+                    once=True)
+    out.extend(asm_geom)
+
     maps: Dict[str, Tuple[int, int]] = {}      # instance -> (node_off, elem_off)
-    gmax_node = gmax_elem = 0
+    gmax_node, gmax_elem = asm_max_node, asm_max_elem
     for inst in instances:
         res = _emit_instance(inst, parts, namer, report, options, gmax_node, gmax_elem)
         if res is None:
