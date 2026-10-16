@@ -11,7 +11,7 @@ The converter has three layers of tests:
    loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate across a later
    step's `*BOUNDARY, OP=NEW`, heated models with no initial temperatures, rigidly coupled
    models (a shell plate, and bars whose coupled nodes also carry BCs), the `*MPC`
-   conversions and the loads applied as nodal forces numerically.
+   conversions, connector elements and the loads applied as nodal forces numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -25,7 +25,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (215)
+## 1. Unit tests — `tests/test_convert.py` (223)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -247,6 +247,14 @@ conversion behaviour and referential integrity.
 | `test_transform_of_a_rotated_instance_rotates_the_local_axes` | a part-level `*TRANSFORM` in an instance turned 90° about z: the converted forces use the turned axes |
 | `test_traction_transformed_face_example` | the `C3D20R` example with a rectangular and a cylindrical transform on its loaded face: each node's forces, turned back from its local axes (computed independently in the test), equal those of the same deck without the transforms; no dangling refs |
 | `test_rigid_body_bc_bars_example` | the `rigid_body_bc_bars` validation deck: bar A's far-face `u1 = 0` is taken off in step 1 and moved to its reference point (+ `ROT NODE` 2–3) in step 2's `OP=NEW` card, card for card the BCs bar B has by hand; no warnings, no dangling refs |
+| `test_connector_hinge_between_reference_points` | a `CONN3D2` `HINGE` between two `*MPC BEAM` reference points becomes three translation equations and two rotation equations on their `ROT NODE`s; the element and its connector-only element set are not emitted (and not warned about); an oblique axis gives rows over three rotation components, and an offset joint the `theta_a x d` terms of node a's turning system |
+| `test_connector_in_assembly_resolves_instance_nodes` | an assembly-level connector with instance-qualified nodes (`I1.2`) is resolved to the flat numbering instead of skipped; a connector inside a part is written once per instance; no dangling refs |
+| `test_connector_to_ground_and_held_nodes` | a blank connector node is ground: `JOIN` to ground holds the node by `*BOUNDARY` lines, repeated after a step's `OP=NEW`; a `HINGE` to ground about z on a reference point holds its translations and the `ROT NODE`'s DOFs 1–2, and so does a hinge to a node held by `ENCASTRE` |
+| `test_connector_beam_weld_and_link` | `BEAM` between a beam node and a free node → the same `*RIGID BODY` (and rotation ties) as `*MPC BEAM`; `WELD` between two solid nodes → a `JOIN` when coincident (the rotations are connector-only), the linearised link when offset; `LINK` → the linearised `*EQUATION` of `*MPC LINK` |
+| `test_connector_types_behaviour_and_free_types` | `CARTESIAN`/`CARDAN` without a behaviour are left out (no constraint); `SLOT` and a section with a `*CONNECTOR BEHAVIOR` are commented out with the reason and the element listed; an empty behaviour is ignored; a section on non-connector elements, or a connector on one node twice, is commented out |
+| `test_connector_nlgeom_exact_cases_only` | under `NLGEOM` a hinge between two moving reference points is commented out (`--approximate`: written, `[APPROX]`), a hinge to ground is kept — `*BOUNDARY` lines, or an equation among the `ROT NODE`'s own components for an oblique axis; a `JOIN` from a reference point to a mesh node is kept, eliminated on the mesh node either way round; a hinge between two solid nodes whose rotations live on new rotation nodes is commented out; with explicit dynamics a beam end's rotation cannot be constrained (no knots) and is commented out rather than dropped |
+| `test_connector_rotations_of_nodes_without_rotations` | a `HINGE` between a beam end and a coincident solid node keeps only the `JOIN` (the solid node's rotation is a connector-only unknown); with a moment on that node its rotation lives on a new rotation node, which the moment moves to |
+| `test_connector_examples` | the three connector examples convert with their equations, no `CONN3D2` element, no warnings and no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -337,6 +345,22 @@ deck and runs it in CalculiX:
 * **`mpc_link`** — a node held by a `*MPC LINK` and a spring perpendicular to it: the
   linearised `*EQUATION` gives statics exactly ((P·n)/k n); under `NLGEOM` with a large
   load ccx's `*MPC BEAM` keeps the length to 1e-8 while the link turns 24.5°.
+* **connectors** — the `mpc_pin_tie_joints`, `mpc_beam_lever` and `mpc_link` decks with their
+  `*MPC` lines written as `CONN3D2` connectors (`JOIN` for `PIN`, `WELD` for `TIE`, `BEAM`,
+  `LINK`; the lever and link also under `NLGEOM`) must give the `*MPC` answers: they match to
+  all printed digits.
+* **`connector_hinge_beams`** — the two-span beams joined by `HINGE` connectors about z:
+  loaded in −y the hinge releases the bending (w = −1.2494 vs the hinge solution −1.25),
+  loaded in −z it transmits it (w = −0.4185 vs the propped cantilever −0.4199).
+* **`connector_hinge_bodies`** — the construct of a CAE hinge model: two reference points
+  tied to their members by `*MPC BEAM` (rigid bodies), on ten `SPRING1`s, joined by a
+  `HINGE` about an oblique axis with the joint offset off the axis, loaded by forces and a
+  moment on a reference point. Every printed displacement matches the exact solution (12
+  rigid-body unknowns, 5 hinge constraints, Lagrange multipliers) to 6e-8 of |u|.
+* **`connector_ground_hinge`** — a rigid body hinged to ground (a blank connector node)
+  about an oblique axis and turned by a moment against a spring under `NLGEOM`: 138.48° vs
+  the statics 138.54° (ccx's equilibrium tolerance), every member on the exact rotation about
+  the fixed axis to 6e-6 of |u|.
 * **`equation_overconstraint`** — a deck ccx rejects as written: an `*EQUATION` whose first
   DOF has a BC, its duplicate, and a loop of three ties. Converted, it solves with the tied
   node held and the loop's nodes moving together (ccx, given the whole loop, holds it at
@@ -445,6 +469,10 @@ deck and runs it in CalculiX:
     "Job finished, then abort" case from issue #3 and NaN/Inf results as ccx 2.23 writes
     them (Fortran's `NaN`/`Infinity` in the `.dat`, C's `NAN`/`INF` in the `.frd`; a set
     named `NAN` in a heading is not one).
+  * `test_hood_hinge_keeps_one_mechanism_mode` — the hood-hinge modal deck must have
+    exactly 7 zero-frequency modes (6 rigid-body modes and its `CONN3D2` hinge's mechanism)
+    among its 10, and elastic ones after them; with the connector missing all 10 are zero.
+    Only runs when `ccx` and that deck are available.
 
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
@@ -1090,6 +1118,47 @@ traction and surface-element changes above, for every deck they convert differen
 38 of them gated) and every gated one: nothing new. Net: 202 → 198 gated, 188 → 184 under
 their own loads.
 
+**Connector elements.** `CONN3D2` elements used to be skipped (assembly-level wires with
+instance-qualified nodes) or emitted unchanged (ccx: "unknown element type"), and every
+`*CONNECTOR SECTION` was commented out. Only two corpus decks have connectors (none has
+`CONN2D2`; `oyvindwpetersen_simple_trussjointc` uses `JOINTC`, a different element): the
+hood-hinge modal deck (one `HINGE` between the reference points of its two brackets) and the
+teeter rotor (`BEAM` + `HINGE`, which still stops on its `*BEAM GENERAL SECTION`). Without a
+behaviour a connector is just the constraint of its connection type, now written as ccx
+constraints. Probed on 2.23 (and in ccx's `nonlinmpc.f` / `gen3dmpc.f`):
+
+* a `*RIGID BODY`'s `ROT NODE` and a knot's rotation are total rotation vectors (Rodrigues),
+  so `theta_b = theta_a` is exact and a vector held parallel to a fixed axis is a rotation
+  about it: two rigid bodies on springs hinged about an oblique axis with an offset joint
+  match the exact linear solution to all printed digits, and a body hinged to ground about
+  an oblique axis follows the exact rotation through 138° under `NLGEOM` (a stiff knotted
+  bar through 35°, to 7e-7 — the remaining deviation scales with its compliance);
+* under `NLGEOM`, `*EQUATION`s that link two rigid bodies are solved inaccurately: two
+  bodies on one REF/ROT node are exact (1e-7), but the same bodies tied by `u5 = u1` or
+  `theta4 = theta2`, or chained (a member of one is the other's reference), all converge to
+  the same wrong state — 1 % in displacement, 10 % moment imbalance at 30°, and the members of
+  the untouched body off rigidity by 7e-4 — with no message. One body tied to a held node is
+  exact, and so is a mesh node tied to a body's reference point by `u = u_ref` equations
+  (the same as making it a member, to all digits: no MPC of ccx's own eliminates either
+  side). So under `NLGEOM` the converter keeps a connector only where its rows are boundary
+  conditions, equations among one rotation node's components, or translations of mesh nodes
+  (also tied to a reference point), and comments out the rest (`--approximate`: written
+  linear, `[APPROX]`);
+* a moment on DOF 4–6 of a free node tied to a body by `*EQUATION` moves nothing (ccx has no
+  rotation there), and a `*RIGID BODY` whose `ROT NODE` has no stiffness crashes ccx (exit
+  255, no message): a connector rotation on a solid, plane or free node gets a rotation node
+  of its own only where it shows elsewhere, and is eliminated otherwise;
+* `*BOUNDARY, OP=NEW` removes model-data BCs too: a connector's BCs are repeated after it.
+
+Corpus: the hood-hinge deck now solves with its hinge: 7 zero-frequency modes (6 rigid-body
+modes and the mechanism; without the connector all ten computed modes were zero, the two
+parts floating apart with 12 rigid-body modes), the first elastic mode at 247 Hz, and in all
+ten modes the relative rotation of the brackets lies along the hinge axis to 3e-6 and the
+joint holds to 5e-7. The teeter's `BEAM` connector
+becomes a rigid body on the hub's kinematic coupling (whose `ROT NODE` now follows the
+coupling's rotation); its `HINGE` would hold a rigid-body member at zero and is commented
+out. All other corpus decks convert byte-identically.
+
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
 "Job finished" (the exit code and stderr were ignored); that inflated the earlier
@@ -1121,9 +1190,9 @@ test (plus an adversarial code review) surfaced and fixed real converter bugs:
   sets differ by more than 2×;
 * **space-separated `*INSTANCE` transform** (`10 0 0` instead of `10., 0., 0.`, emitted
   by some lattice generators) is parsed via a comma-or-whitespace splitter;
-* **non-numeric element connectivity** (an assembly-level connector/MPC using
+* **non-numeric element connectivity** (an assembly-level element using
   instance-qualified node names like `PART-1-1.1`) is skipped with a warning rather than
-  crashing;
+  crashing (connector elements are now resolved and written as constraints);
 * **float-formatted mesh-gen integers** (`*NGEN … 2.0`, `*NCOPY, CHANGE NUMBER=100.0`)
   are parsed with `int(float(...))` instead of crashing the whole conversion (a final
   pre-publication review surfaced this);

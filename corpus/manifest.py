@@ -26,7 +26,7 @@ dangling references). Each entry carries one of three expectations:
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
 * neither (605) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
-  *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, connectors, NLGEOM
+  *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
   worse than the original unconverted deck.
@@ -285,7 +285,7 @@ CORPUS = [
          exercises='C3D8 — parts/instances/assembly; *Frequency',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/8.%20Modal%20Analysis/4.%20Mode%20Participation%20Factor%20and%20Effective%20Mass/free_free.inp'),
     dict(name='marcello_gori_hood_hinge_mechanism', expect_solve=True, license='MIT',
-         exercises='S3R, S4, CONN3D2 — parts/instances/assembly; *Orientation; *Frequency; *MPC BEAM (-> *RIGID BODY on knotted shell nodes)',
+         exercises='S3R, S4, CONN3D2 HINGE (-> *EQUATIONs on the ROT NODEs: 6 rigid-body modes + the hinge) — parts/instances/assembly; *Orientation; *Frequency; *MPC BEAM (-> *RIGID BODY on knotted shell nodes)',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/8.%20Modal%20Analysis/2.%20Mechanisms%20Modes/hood_hinge_mechanism.inp'),
     dict(name='marcello_gori_job_1_2', expect_solve=True, license='MIT',
          exercises='S4 — parts/instances/assembly',
@@ -2270,8 +2270,8 @@ CORPUS = [
          note='ccx limitation: *USER ELEMENT (ccx cannot run UEL)',
          url='https://raw.githubusercontent.com/jgomezc1/ABAQUS-US/master/INPUT_FILES/UNIUSER_UEL8.inp'),
     dict(name='jiangk_cn_teeter', expect_solve=False, license='see source repo',
-         exercises='B31, CONN3D2 — parts/instances/assembly; *Orientation; *Frequency',
-         note='ccx limitation: *USER ELEMENT (ccx cannot run UEL)',
+         exercises='B31, CONN3D2 BEAM + HINGE — parts/instances/assembly; *Orientation; *Frequency',
+         note='ccx limitation: *BEAM GENERAL SECTION (no ccx card: the beams have no section) and a beam-end *SURFACE (END1) ccx rejects; the BEAM connector -> *RIGID BODY on the kinematic coupling, the HINGE commented out (it would hold a rigid-body member at zero)',
          url='https://raw.githubusercontent.com/jiangk-cn/Abaqus_MAC/master/Abaqus_teeter_inp/teeter.inp'),
     dict(name='jianyingwu_bending_umat', expect_solve=False, license='see source repo',
          exercises='CPS4T — UMAT; coupled temp-displacement',

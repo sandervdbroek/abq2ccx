@@ -30,6 +30,7 @@ How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.
 | `*SURFACE SECTION` | dropped with its surface elements (`SFM3D*`, `SFMAX*`, `SFMGAX*`), which leave the mesh — no stiffness, no ccx element — while their loads become nodal forces; they stay (and ccx stops on them) if `*REBAR LAYER` or `DENSITY=` in a dynamic/frequency step or under gravity gives them physics, unless `--approximate`. |
 | `*TIE` | Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept. |
 | `*MPC` | line by line: `PIN` → `*EQUATION` on DOFs 1-3; `TIE` → per-DOF `*EQUATION` (shell/beam rotations through knots, DOF 11 in thermal steps); `BEAM` → one `*RIGID BODY` per independent node (chained lines one body); `LINK` → linearised `*EQUATION` without `NLGEOM`, ccx `*MPC BEAM` with it (not on beam/shell/plane nodes); `PLANE`/`STRAIGHT` kept; user MPCs and other types commented, line by line. |
+| `*CONNECTOR SECTION` | its `CONN3D2`/`CONN2D2` elements (never emitted; ccx has no connector element) become the kinematic constraint of the connection type: `JOIN`, `REVOLUTE`, `ALIGN`, `HINGE` → `*EQUATION`s in the translations and rotation vectors (rotations on a `ROT NODE` or a knot), `*BOUNDARY` lines to ground or a held node (repeated after `OP=NEW`); `BEAM`, `WELD` → `*RIGID BODY` (with the `*MPC BEAM` bodies); `LINK` → as `*MPC LINK`; unconstrained types left out. Under `NLGEOM` only the forms that stay exact (`--approximate`: the rest written linear, `[APPROX]`); a behaviour, other types and explicit-dynamics rotations on beam/shell nodes are commented out with the reason. |
 | `*EQUATION` | set-name terms resolved to node numbers, multi-node sets paired in sorted order (as Abaqus does unless `UNSORTED`); terms reordered so the eliminated (first) DOF has no BC and is not eliminated elsewhere; an equation that follows from the others and zero BCs (a duplicate, a loop's closing tie) dropped. |
 | `*KINEMATIC COUPLING` | every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF range (the reference node's DOFs 4-6 then take BCs and moments natively); rotation lines on shell/beam nodes become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`). |
 | `*COUPLING / *KINEMATIC` | `REF NODE` set → node number; empty `*KINEMATIC` → `1, 3` (a rotations-only card couples nothing); DOFs > 3 clamped; on 2-D nodes `1, 2` (ccx holds their DOF 3 itself). Shell/membrane/beam/truss nodes get a force-free knot beam (elset/material `ABQ2CCX_KNOT`), without which ccx 2.23 rejects the rigid MPC, and the coupled rotations are tied to the reference node's DOFs 4-6 by `*EQUATION`; a shell/beam `REF NODE` turns the coupling into a `*RIGID BODY` whose `ROT NODE` follows it. |
@@ -95,8 +96,9 @@ Any keyword not in the CalculiX set and without a translator is emitted as `**` 
 | --- | --- |
 | `*VISCOELASTIC` | time-domain viscoelasticity is unsupported (ccx *VISCO is a creep STEP, not a material); drop, or approximate with *DAMPING. |
 | `*INERTIA RELIEF` | ccx has no inertia relief; constrain with a soft spring-to-ground / 3-2-1 set, or balance with the equilibrating load. |
-| `*CONNECTOR SECTION` | connectors have no ccx element; remodel as *RIGID BODY / *MPC / *SPRING / *DASHPOT per the connector behaviour. |
-| `*CONNECTOR BEHAVIOR` | connector behaviour has no ccx equivalent; see *CONNECTOR SECTION. |
+| `*CONNECTOR BEHAVIOR` | connector behaviour has no ccx equivalent (a section that uses it is commented out); remodel as *SPRING / *DASHPOT / *MPC per the behaviour. |
+| `*CONNECTOR MOTION` | prescribes motion of connector components, which the converted connector (ccx constraints, no connector element) does not have; the prescribed motion is missing. |
+| `*CONNECTOR LOAD` | loads connector components, which the converted connector (ccx constraints, no connector element) does not have; the load is missing. |
 | `*GASKET BEHAVIOR` | gasket behaviour has no ccx equivalent. |
 | `*COHESIVE SECTION` | ccx has no cohesive element; model debonding with contact (*SURFACE BEHAVIOR) or a nonlinear *SPRING. |
 | `*DAMAGE EVOLUTION` | ccx 2.23 added *DAMAGE INITIATION but not *DAMAGE EVOLUTION, so progressive damage cannot fully run (the material will not soften/fail); drop. |
@@ -105,7 +107,20 @@ Any keyword not in the CalculiX set and without a translator is emitted as `**` 
 | `*BEAM GENERAL SECTION` | no direct ccx card; use *USER ELEMENT (U1) + *BEAM SECTION, SECTION=GENERAL with A, I11, I12, I22, shear factor. |
 | `*CONCRETE` | concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel. |
 | `*CONCRETE DAMAGED PLASTICITY` | unsupported by ccx; substitute *PLASTIC or remodel. |
-| `*CONNECTOR ELASTICITY` | connector behaviour has no ccx equivalent; see *CONNECTOR SECTION. |
+| `*CONNECTOR ELASTICITY` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR DAMPING` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR STOP` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR LOCK` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR FRICTION` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR PLASTICITY` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR HARDENING` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR DAMAGE INITIATION` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR DAMAGE EVOLUTION` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR CONSTITUTIVE REFERENCE` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR DERIVED COMPONENT` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR POTENTIAL` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR UNIAXIAL BEHAVIOR` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR FAILURE` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
 | `*CONTACT` | Abaqus general contact has no ccx equivalent; define explicit pairs instead: *CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element surfaces (+ *SURFACE INTERACTION / *SURFACE BEHAVIOR). |
 | `*CONTACT INCLUSIONS` | general-contact inclusion list (ALL EXTERIOR is not translatable); create the two surfaces and a *CONTACT PAIR instead. |
 | `*CONTACT EXCLUSIONS` | general-contact exclusion list; not applicable to ccx *CONTACT PAIR. |

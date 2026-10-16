@@ -128,6 +128,14 @@ TRANSLATED = {
             "`*RIGID BODY` per independent node (chained lines one body); `LINK` → linearised "
             "`*EQUATION` without `NLGEOM`, ccx `*MPC BEAM` with it (not on beam/shell/plane "
             "nodes); `PLANE`/`STRAIGHT` kept; user MPCs and other types commented, line by line.",
+    "*CONNECTOR SECTION": "its `CONN3D2`/`CONN2D2` elements (never emitted; ccx has no connector "
+        "element) become the kinematic constraint of the connection type: `JOIN`, `REVOLUTE`, "
+        "`ALIGN`, `HINGE` → `*EQUATION`s in the translations and rotation vectors (rotations on a "
+        "`ROT NODE` or a knot), `*BOUNDARY` lines to ground or a held node (repeated after "
+        "`OP=NEW`); `BEAM`, `WELD` → `*RIGID BODY` (with the `*MPC BEAM` bodies); `LINK` → as "
+        "`*MPC LINK`; unconstrained types left out. Under `NLGEOM` only the forms that stay exact "
+        "(`--approximate`: the rest written linear, `[APPROX]`); a behaviour, other types and "
+        "explicit-dynamics rotations on beam/shell nodes are commented out with the reason.",
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
         "(as Abaqus does unless `UNSORTED`); terms reordered so the eliminated (first) DOF has no "
         "BC and is not eliminated elsewhere; an equation that follows from the others and zero "
@@ -254,6 +262,8 @@ def element_status(t):
         return f"→ `{t[:-1]}` (hybrid)"
     if t.startswith(("R3D", "RB2", "RB3", "RAX")):
         return "flagged → model as `*RIGID BODY`"
+    if t in A.CONN_TYPES:
+        return "not emitted — its `*CONNECTOR SECTION` becomes ccx constraints"
     if t.startswith(A.UNSUPPORTED_ELEM_PREFIXES):
         return "flagged — no ccx equivalent"
     return "passed through (verify)"
@@ -325,7 +335,8 @@ def gen_keywords():
                "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
-               "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE"}
+               "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
+               "CONNECTOR SECTION"}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",

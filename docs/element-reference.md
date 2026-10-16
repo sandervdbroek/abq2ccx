@@ -103,8 +103,8 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `CONN2D2` | 2 | flagged — no ccx equivalent |
-| `CONN3D2` | 2 | flagged — no ccx equivalent |
+| `CONN2D2` | 2 | not emitted — its `*CONNECTOR SECTION` becomes ccx constraints |
+| `CONN3D2` | 2 | not emitted — its `*CONNECTOR SECTION` becomes ccx constraints |
 
 ## discrete
 

@@ -20,7 +20,9 @@ expansion (including the engineering shear coefficients of an anisotropic one), 
 cube and circular-section beam with no initial temperatures, and the loads ccx has no card
 for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads (cantilevers
 against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
-(local axes), which must match the same models without one.
+(local axes), which must match the same models without one, *MPC joints, levers and links
+against statics, and connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those,
+beam theory and exact statics.
 
     python validate_with_ccx.py
 
@@ -186,6 +188,105 @@ def dat_displacement(dat_path, node):
     """Last displacement (ux, uy, uz) printed for ``node`` by *NODE PRINT in a ccx .dat
     file, or None."""
     return dat_displacements(dat_path).get(node)
+
+
+def _dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _unit(a):
+    n = math.sqrt(_dot(a, a))
+    return tuple(x / n for x in a)
+
+
+def _rotate(v, e, phi):
+    """``v`` turned by ``phi`` about the unit axis ``e`` (Rodrigues)."""
+    c, s, ev = math.cos(phi), math.sin(phi), _dot(e, v)
+    return tuple(x * c + y * s + z * ev * (1 - c) for x, y, z in zip(v, _cross(e, v), e))
+
+
+def _solve(a, b):
+    """Gaussian elimination with partial pivoting (small dense systems)."""
+    n = len(b)
+    m = [row[:] + [b[i]] for i, row in enumerate(a)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r: abs(m[r][c]))
+        m[c], m[p] = m[p], m[c]
+        for r in range(n):
+            if r != c and m[r][c]:
+                f = m[r][c] / m[c][c]
+                m[r] = [x - f * y for x, y in zip(m[r], m[c])]
+    return [m[i][n] / m[i][i] for i in range(n)]
+
+
+def hinge_bodies_reference():
+    """Exact small-displacement solution of examples/connector_hinge_bodies.inp: the
+    displacements of every node, from the 12 rigid-body unknowns (u, theta of reference
+    points 1 and 3), the springs, the loads and the 5 hinge constraints (Lagrange
+    multipliers)."""
+    x = {1: (0., 0., 0.), 3: (0.2, 0.5, -0.1), 11: (1., 0., 0.), 12: (0., 1.5, 0.),
+         13: (0., 0., 2.), 21: (1., 1., 1.), 22: (0.5, -1., 0.7), 23: (-0.4, 0.8, 1.3)}
+    ref = {1: 1, 11: 1, 12: 1, 13: 1, 3: 3, 21: 3, 22: 3, 23: 3}
+    off = {1: 0, 3: 6}                       # unknowns: u1, theta1, u3, theta3
+    axes = [tuple(float(i == k) for i in range(3)) for k in range(3)]
+
+    def row(n, d):                           # u_n,d over the unknowns (rigid-body motion)
+        t = [0.0] * 12
+        o = off[ref[n]]
+        t[o + d] = 1.0
+        r = [a - b for a, b in zip(x[n], x[ref[n]])]
+        for k in range(3):
+            t[o + 3 + k] = _cross(axes[k], r)[d]
+        return t
+    springs = [(11, 0, 50.), (11, 1, 70.), (11, 2, 30.), (12, 0, 40.), (12, 1, 90.),
+               (12, 2, 60.), (13, 0, 80.), (13, 1, 20.), (13, 2, 55.), (21, 1, 25.)]
+    stiff = [[0.0] * 12 for _ in range(12)]
+    for n, d, k in springs:
+        t = row(n, d)
+        stiff = [[s + k * ti * tj for s, tj in zip(srow, t)] for srow, ti in zip(stiff, t)]
+    force = [0.0] * 12
+    for n, d, v in ((22, 0, 1.5), (22, 1, -2.), (22, 2, 0.7), (12, 2, -0.9)):
+        force = [f + v * t for f, t in zip(force, row(n, d))]
+    for k, m in enumerate((0.3, -0.8, 1.1)):            # moment on reference point 3
+        force[9 + k] += m
+    a, b = (1., 2., 0.5), (-1., 0.3, 1.)                # orientation AXES
+    e1 = _unit(a)
+    e3 = _unit(_cross(a, b))
+    e2 = _cross(e3, e1)
+    cons = []
+    for d in range(3):                       # u3 - u1 - theta1 x d = 0
+        c = [0.0] * 12
+        c[6 + d], c[d] = 1.0, -1.0
+        for k in range(3):
+            c[3 + k] = -_cross(axes[k], x[3])[d]
+        cons.append(c)
+    for e in (e2, e3):                       # (theta3 - theta1) . e2 = . e3 = 0
+        cons.append([0.0] * 3 + [-v for v in e] + [0.0] * 3 + list(e))
+    nc = len(cons)
+    q = _solve([stiff[i] + [c[i] for c in cons] for i in range(12)] +
+               [c + [0.0] * nc for c in cons], force + [0.0] * nc)
+    return {n: tuple(_dot(row(n, d), q[:12]) for d in range(3)) for n in x}
+
+
+def ground_hinge_reference():
+    """(axis, turning angle) of examples/connector_ground_hinge.inp: the angle at which
+    the spring's moment about the fixed axis balances M = 6 (bisection)."""
+    e1 = _unit((1., 2., 0.5))
+    r0 = (0.8, 0.5, 1.1)                     # node 21 from node 3
+
+    def residual(phi):
+        r = _rotate(r0, e1, phi)
+        force = (0.0, -25.0 * (r[1] - r0[1]), 0.0)
+        return 6.0 + _dot(_cross(r, force), e1)
+    lo, hi = 0.0, 3.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if residual(mid) > 0 else (lo, mid)
+    return e1, 0.5 * (lo + hi)
 
 
 def main():
@@ -565,6 +666,95 @@ def main():
         ok = rel(length, 5.0) < 1e-6 and turn > 10
         print(f"{'PASS' if ok else 'FAIL'}  mpc_link, NLGEOM (*MPC BEAM): length {length:.7f} (5) "
               f"after turning {turn:.1f} degrees")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    # --- connector elements (CONN3D2): ccx has no connector element; abq2ccx writes each
+    # connector's kinematic constraint as *EQUATION / *BOUNDARY / *RIGID BODY / *MPC -------
+    # the same joints, lever and link as above, written as connectors, must give the same
+    # answers: JOIN = PIN, WELD = TIE (a rigid body on knots), BEAM = *MPC BEAM, LINK = LINK
+    joints = [("*MPC\nPIN, 101, 21\nTIE, 301, 221\n",
+               "*Element, type=CONN3D2, elset=J\n9001, 21, 101\n*Element, type=CONN3D2, elset=W\n"
+               "9002, 221, 301\n*Connector Section, elset=J\nJoin,\n*Connector Section, elset=W\n"
+               "Weld,\n")]
+    lever = [("*MPC\nBEAM, 100, 21\n",
+              "*Element, type=CONN3D2, elset=W\n9001, 21, 100\n*Connector Section, elset=W\nBeam,\n")]
+    link = [("*MPC\nLINK, 2, 1\n",
+             "*Element, type=CONN3D2, elset=W\n9001, 1, 2\n*Connector Section, elset=W\nLink,\n")]
+    nl_lever = [("*Step\n*Static\n", "*Step, nlgeom=YES\n*Static\n0.05, 1., 1e-5, 0.25\n"),
+                ("100, 2, -1.", "100, 2, -10."), ("400, 2, -1.", "400, 2, -10.")]
+    nl_link = [("*Step\n*Static\n", "*Step, nlgeom=YES\n*Static\n0.05, 1., 1e-5, 0.25\n"),
+               ("2, 1, 10.", "2, 1, -2000.")]
+    for name, subs, nodes, label in (
+            ("mpc_pin_tie_joints", [], (21, 101, 111, 221, 301, 311), "JOIN / WELD"),
+            ("mpc_beam_lever", [], (21, 100), "BEAM"),
+            ("mpc_beam_lever", nl_lever, (21, 100), "BEAM, NLGEOM x10"),
+            ("mpc_link", [], (2,), "LINK"),
+            ("mpc_link", nl_link, (2,), "LINK, NLGEOM")):
+        conn = {"mpc_pin_tie_joints": joints, "mpc_beam_lever": lever, "mpc_link": link}[name]
+        ref, got = solve(name, subs, nodes), solve(name, conn + subs, nodes)
+        if ref and got:
+            err = max(abs(a - b) for n in nodes for a, b in zip(ref[n], got[n])) / \
+                max(abs(a) for n in nodes for a in ref[n])
+            ok = err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {name} as connectors ({label}): matches the *MPC "
+                  f"version to {err:.1e} of |u|")
+            failures += 0 if ok else 1
+        else:
+            failures += 1
+    # HINGE (axis z) between beam ends: it releases bending about z and transmits it about y
+    u = solve("connector_hinge_beams", nodes=(21, 101, 111, 221, 301, 311))
+    if u:
+        pin = (0.5e6 / (3 * ei), 0.25e6 / (3 * ei) + 1e6 / (48 * ei))    # w(100), w(150)
+        rb = 150.0 ** 2 * (3 * 200 - 150) / (2 * 200.0 ** 3)
+        tie = tuple((1.0 * x * x * (3 * 150 - x) - rb * x * x * (3 * 200 - x)) / (6 * ei)
+                    for x in (100.0, 150.0))
+        errs = [rel(-u[21][1], pin[0]), rel(-u[111][1], pin[1]),
+                rel(-u[221][2], tie[0]), rel(-u[311][2], tie[1])]
+        same = max(abs(a - b) for x, y in ((21, 101), (221, 301)) for a, b in zip(u[x], u[y]))
+        ok = max(errs) < 0.02 and same < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  connector_hinge_beams (HINGE about z): in-plane w = "
+              f"{u[21][1]:+.4f} (released: {-pin[0]:+.4f}), out-of-plane w = {u[221][2]:+.4f} "
+              f"(transmitted: {-tie[0]:+.4f}); worst {max(errs) * 100:.2f}% diff over both spans")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    # the hood-hinge construct: two *MPC BEAM bodies on springs, an oblique hinge axis and a
+    # joint offset, against the exact small-displacement solution
+    out = (1, 3, 11, 12, 13, 21, 22, 23)
+    u = solve("connector_hinge_bodies", nodes=out)
+    if u:
+        ref = hinge_bodies_reference()
+        err = max(abs(a - b) for n in out for a, b in zip(u[n], ref[n])) / \
+            max(abs(a) for n in out for a in ref[n])
+        ok = err < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  connector_hinge_bodies (HINGE between rigid bodies): "
+              f"member 22 u = ({u[22][0]:+.5f}, {u[22][1]:+.5f}, {u[22][2]:+.5f}), exact "
+              f"({ref[22][0]:+.5f}, {ref[22][1]:+.5f}, {ref[22][2]:+.5f}); {err:.1e} of |u| off")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    # a body hinged to ground under NLGEOM turns ~138 degrees about the fixed oblique axis:
+    # every member must follow that rotation exactly, at the angle that balances the moment
+    u = solve("connector_ground_hinge", nodes=(3, 21, 22, 23))
+    if u:
+        e1, phi_ref = ground_hinge_reference()
+        x3 = (0.2, 0.5, -0.1)
+        pts = {21: (1., 1., 1.), 22: (0.5, -1., 0.7), 23: (-0.4, 0.8, 1.3)}
+        r0 = [p - q for p, q in zip(pts[21], x3)]
+        r1 = [p + d - q for p, d, q in zip(pts[21], u[21], x3)]
+        p0 = [a - _dot(r0, e1) * e for a, e in zip(r0, e1)]
+        p1 = [a - _dot(r1, e1) * e for a, e in zip(r1, e1)]
+        phi = math.atan2(_dot(e1, _cross(p0, p1)), _dot(p0, p1))
+        # (ccx converges the rigid-body MPCs to ~1e-5 of |u|; a linearised hinge would be off
+        # by the order of |u| at this angle)
+        miss = max(abs(q + a - b - c) for n, x in pts.items()
+                   for q, a, b, c in zip(x3, _rotate([p - q for p, q in zip(x, x3)], e1, phi),
+                                         x, u[n])) / max(abs(c) for n in pts for c in u[n])
+        ok = miss < 1e-4 and max(abs(c) for c in u[3]) < 1e-12 and rel(phi, phi_ref) < 0.005
+        print(f"{'PASS' if ok else 'FAIL'}  connector_ground_hinge, NLGEOM (HINGE to ground): body "
+              f"turned {math.degrees(phi):.2f} deg about the axis (statics {math.degrees(phi_ref):.2f}),"
+              f" members {miss:.1e} of |u| off that rigid rotation")
         failures += 0 if ok else 1
     else:
         failures += 1

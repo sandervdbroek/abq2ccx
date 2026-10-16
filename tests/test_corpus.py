@@ -221,6 +221,42 @@ def test_corpus_solves():
                 f"{e['name']}: mesh-only deck was rejected by ccx ({status!r})"
 
 
+def eigenvalues(dat_path):
+    """The eigenvalues a ccx *FREQUENCY step printed to its .dat file."""
+    vals, on = [], False
+    for ln in open(dat_path):
+        f = ln.split()
+        if "E I G E N V A L U E   O U T P U T" in ln:
+            on = True
+        elif on and len(f) >= 2 and f[0].isdigit():
+            vals.append(float(f[1]))
+        elif on and vals and not f:
+            break
+    return vals
+
+
+def test_hood_hinge_keeps_one_mechanism_mode():
+    """marcello_gori_hood_hinge_mechanism, a free-free *FREQUENCY of two hinge brackets
+    joined by a CONN3D2 HINGE: 6 rigid-body modes and the hinge's mechanism mode, then
+    elastic ones (without the connector all 10 are zero: two free parts, 12 rigid-body
+    modes)."""
+    name = "marcello_gori_hood_hinge_mechanism"
+    ccx, env = V.find_ccx()
+    if not ccx or not os.path.exists(os.path.join(FILES, name + ".inp")):
+        print("hood-hinge deck or ccx not found — skipping the mechanism check.")
+        return
+    d = tempfile.mkdtemp()
+    try:
+        open(os.path.join(d, "job.inp"), "w").write(convert(name)[0])
+        fe = dict(os.environ)
+        fe.update(env)
+        subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True, text=True, timeout=300)
+        lam = eigenvalues(os.path.join(d, "job.dat"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert len(lam) == 10 and sum(abs(x) < 1.0 for x in lam) == 7 and lam[7] > 1e6, lam
+
+
 # --- standalone runner with a summary table -----------------------------------
 
 def main():

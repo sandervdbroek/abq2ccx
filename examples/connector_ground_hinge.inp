@@ -1,0 +1,44 @@
+*Heading
+A rigid body hinged to ground (CONN3D2 HINGE with a blank node) turned far under NLGEOM
+** Body B (reference point 3, members 21-23, tied to it by *MPC BEAM -> a *RIGID BODY) is
+** hinged to ground at node 3 about the oblique axis e1 = (1, 2, 0.5)/|.| (orientation AXES)
+** and held by one SPRING1 (k = 25, DOF 2 of node 21).  A moment M = 6 about e1 on node 3
+** turns it by about 138 degrees: the spring's moment about the axis balances M.
+** With ground on one side the hinge axis cannot move, so the linear hinge constraint
+** (theta_3 parallel to e1, u_3 = 0) is exact at any rotation: abq2ccx writes it as
+** *BOUNDARY lines and *EQUATIONs among the components of the body's ROT NODE.
+** validate_with_ccx.py checks that every member turns rigidly about e1 through node 3
+** and that the turning angle balances the moment.
+*Node
+3, 0.2, 0.5, -0.1
+21, 1., 1., 1.
+22, 0.5, -1., 0.7
+23, -0.4, 0.8, 1.3
+*Nset, nset=OUT
+3, 21, 22, 23
+*MPC
+BEAM, 21, 3
+BEAM, 22, 3
+BEAM, 23, 3
+*Element, type=Spring1, elset=K
+101, 21
+*Spring, elset=K
+2
+25.
+*Element, type=CONN3D2, elset=HINGE
+1, , 3
+*Orientation, name=AXES
+1., 2., 0.5, -1., 0.3, 1.
+*Connector Section, elset=HINGE
+Hinge,
+AXES,
+*Step, nlgeom=YES
+*Static
+0.05, 1., 1e-6, 0.1
+*Cload
+3, 4, 2.61861468283
+3, 5, 5.23722936566
+3, 6, 1.30930734142
+*Node Print, nset=OUT
+U
+*End Step

@@ -22,10 +22,11 @@ Converter._drop_surface_elements()   surface elements (SFM*) leave the registry;
                                      loads become nodal forces later
         │
         ▼
-Converter._prescan()   deck-wide facts the handlers need: node kinds, rigid bodies and their
-                       ROT NODEs, the *MPC plan (_plan_mpcs), knot beams
-                       (_plan_rigid_couplings), the BCs on rigid-constraint members their
-                       reference node imposes or, on a *RIGID BODY, takes over
+Converter._prescan()   deck-wide facts the handlers need: node kinds, the connector plan
+                       (_plan_connectors), rigid bodies and their ROT NODEs, the *MPC plan
+                       (_plan_mpcs), knot beams (_plan_rigid_couplings), the connectors'
+                       constraint rows (_plan_connector_rows), the BCs on rigid-constraint
+                       members their reference node imposes or, on a *RIGID BODY, takes over
                        (_plan_coupled_bcs), …; then _plan_distributions(),
                        _plan_planar_constraint() and _plan_circ_rotation_knots()
         │
@@ -155,6 +156,18 @@ so the converter does it in three places, each exact:
   how each type is written (`handle_mpc()` then emits it line by line) and groups the `BEAM`
   lines into rigid bodies by their independent node (union-find over chained lines). The
   bodies get ROT NODEs and, on shell/beam nodes, knot beams like any `*RIGID BODY`.
+* Connector elements (`CONN3D2`/`CONN2D2`) are kept out of the mesh (`Converter._conn`;
+  `_emit_set` drops them from element sets) and planned in two parts. `_plan_connectors()`
+  (before `_plan_mpcs`) reads each `*CONNECTOR SECTION` and routes every element: rigid
+  links (`BEAM`, `WELD`) join the `*MPC BEAM` union-find, `LINK` goes the `*MPC LINK` way,
+  unconstrained types are left out, and the rest become constraint *rows* — `JOIN`,
+  `REVOLUTE`, `ALIGN` in the translations and rotation vectors of nodes a and b — whose
+  shell/beam nodes get knots. `_plan_connector_rows()` (after the knots) maps each rotation
+  to where ccx carries it (a ROT NODE, a knot, a kinematic coupling's reference node, a
+  new rotation node for a solid or free node whose rotation shows elsewhere), drops DOFs
+  held at zero in every step, eliminates connector-only rotations, turns one-DOF rows into
+  `*BOUNDARY` lines (repeated after any `OP=NEW`) and keeps under `NLGEOM` only the rows
+  that stay exact there; `handle_connector_section()` writes them.
 * `_plan_implied_spcs()` finds zero BCs on rigid-body members that the body already holds
   (reference node fixed in that DOF and unable to rotate, in every step the BC is in force,
   `bc_steps()`); `handle_boundary()` leaves them out.

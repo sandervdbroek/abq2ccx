@@ -74,7 +74,7 @@ Common messages and what to do:
 | Message fragment | Meaning / action |
 | --- | --- |
 | `Element X -> Y (… substitution)` | a node-count-preserving swap; verify Y is acceptable for your physics |
-| `… has NO CalculiX equivalent … emitted unchanged` | cohesive/gasket/connector/rigid element — the deck won't run until you remodel it |
+| `… has NO CalculiX equivalent … emitted unchanged` | cohesive/gasket/rigid element — the deck won't run until you remodel it (connector elements are written as constraints instead; see `Connector …` notes) |
 | `*KEYWORD … emitted as a comment` | no equivalent; the original is preserved as `**` comments for you to edit |
 | `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` sits on a DOF an `*EQUATION`, `*MPC` or rigid body eliminates, and the converter could not resolve it exactly (it reorders equation terms, drops redundant equations, leaves out BCs a rigid body already holds and moves identical ones on a `*RIGID BODY` to its reference node) — ccx will stop; remove one (the message says what Abaqus does and when `--approximate` resolves it) |
 | `*BOUNDARY taken off N DOF(s) that a rigid constraint …` | BCs on coupled nodes that the reference node's own BCs impose anyway were removed — exact; ccx cannot have both |
@@ -120,6 +120,7 @@ structural analyses with solids/shells/beams, the common materials, orientation 
 composite layups, sets/surfaces, BCs, loads, ties and equations are well covered, and
 **explicit dynamics** runs natively in ccx. **Contact** is translated card by card (type
 default, tied pairs → `*TIE`, constant friction) but ccx's penalty contact behaves
-differently — verify. **Connectors, gaskets, cohesive elements, inertia relief, user
-subroutines (UMAT/VUMAT/UHARD/USDFLD), Riks and other specialised procedures** have no
-equivalent and are flagged for manual work.
+differently — verify. **Connectors** without a behaviour become their constraint
+(`JOIN`, `HINGE`, `WELD`, `BEAM`, `LINK`, …); **connector behaviours, gaskets, cohesive
+elements, inertia relief, user subroutines (UMAT/VUMAT/UHARD/USDFLD), Riks and other
+specialised procedures** have no equivalent and are flagged for manual work.

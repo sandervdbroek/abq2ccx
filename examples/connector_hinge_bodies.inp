@@ -1,0 +1,103 @@
+*Heading
+Two rigid bodies on springs joined by a HINGE connector, checked against exact statics
+** The construct of a CAE hinge model: each part is tied to a reference point by *MPC BEAM
+** (abq2ccx: a *RIGID BODY with a ROT NODE), and a CONN3D2 HINGE joins the two reference
+** points.  Body A (reference point 1 at the origin, members 11-13) rests on nine SPRING1
+** elements; body B (reference point 3 at d = (0.2, 0.5, -0.1), members 21-23) hangs on the
+** hinge and one spring.  The hinge axis is the local 1-direction of orientation AXES,
+** e1 = (1, 2, 0.5)/|.|, an oblique axis; the joint offset d is not along it, so the JOIN
+** part (node 3 keeps its offset in node 1's turning system) carries rotation terms.
+** Forces on members 12 and 22 and a moment on reference point 3 (DOFs 4-6, which
+** abq2ccx moves to the ROT NODE).
+** Small displacements: 12 unknowns (u, theta of both reference points), 5 hinge
+** constraints u_3 - u_1 - theta_1 x d = 0, (theta_3 - theta_1) parallel to e1;
+** validate_with_ccx.py solves the system exactly (Lagrange multipliers) and compares
+** every printed displacement.
+*Node
+1, 0., 0., 0.
+3, 0.2, 0.5, -0.1
+11, 1., 0., 0.
+12, 0., 1.5, 0.
+13, 0., 0., 2.
+21, 1., 1., 1.
+22, 0.5, -1., 0.7
+23, -0.4, 0.8, 1.3
+*Nset, nset=OUT
+1, 3, 11, 12, 13, 21, 22, 23
+*MPC
+BEAM, 11, 1
+BEAM, 12, 1
+BEAM, 13, 1
+BEAM, 21, 3
+BEAM, 22, 3
+BEAM, 23, 3
+*Element, type=Spring1, elset=K1
+101, 11
+*Element, type=Spring1, elset=K2
+102, 11
+*Element, type=Spring1, elset=K3
+103, 11
+*Element, type=Spring1, elset=K4
+104, 12
+*Element, type=Spring1, elset=K5
+105, 12
+*Element, type=Spring1, elset=K6
+106, 12
+*Element, type=Spring1, elset=K7
+107, 13
+*Element, type=Spring1, elset=K8
+108, 13
+*Element, type=Spring1, elset=K9
+109, 13
+*Element, type=Spring1, elset=K10
+110, 21
+*Spring, elset=K1
+1
+50.
+*Spring, elset=K2
+2
+70.
+*Spring, elset=K3
+3
+30.
+*Spring, elset=K4
+1
+40.
+*Spring, elset=K5
+2
+90.
+*Spring, elset=K6
+3
+60.
+*Spring, elset=K7
+1
+80.
+*Spring, elset=K8
+2
+20.
+*Spring, elset=K9
+3
+55.
+*Spring, elset=K10
+2
+25.
+*Element, type=CONN3D2, elset=HINGE
+1, 1, 3
+*Orientation, name=AXES
+1., 2., 0.5, -1., 0.3, 1.
+*Connector Section, elset=HINGE
+Hinge,
+AXES,
+*Step
+*Static
+*Cload
+22, 1, 1.5
+22, 2, -2.
+22, 3, 0.7
+12, 3, -0.9
+3, 4, 0.3
+3, 5, -0.8
+3, 6, 1.1
+*Node Print, nset=OUT
+U
+*End Step

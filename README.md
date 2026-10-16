@@ -122,6 +122,14 @@ PASS  mpc_beam_lever, NLGEOM x10: lever end -38.410 vs a stiff-beam lever -38.41
 PASS  mpc_pin_tie_joints: PIN hinge w = -1.2494 (beam theory -1.2500), TIE joint w = -0.4185 (propped cantilever -0.4199); worst 0.33% diff over both spans
 PASS  mpc_link (linearised *EQUATION): u = (+0.00640, -0.00480) (statics (+0.00640, -0.00480), 0.0e+00 off)
 PASS  mpc_link, NLGEOM (*MPC BEAM): length 5.0000001 (5) after turning 24.5 degrees
+PASS  mpc_pin_tie_joints as connectors (JOIN / WELD): matches the *MPC version to 0.0e+00 of |u|
+PASS  mpc_beam_lever as connectors (BEAM): matches the *MPC version to 0.0e+00 of |u|
+PASS  mpc_beam_lever as connectors (BEAM, NLGEOM x10): matches the *MPC version to 0.0e+00 of |u|
+PASS  mpc_link as connectors (LINK): matches the *MPC version to 0.0e+00 of |u|
+PASS  mpc_link as connectors (LINK, NLGEOM): matches the *MPC version to 0.0e+00 of |u|
+PASS  connector_hinge_beams (HINGE about z): in-plane w = -1.2494 (released: -1.2500), out-of-plane w = -0.4185 (transmitted: -0.4199); worst 0.33% diff over both spans
+PASS  connector_hinge_bodies (HINGE between rigid bodies): member 22 u = (+0.82909, -0.17256, -0.60309), exact (+0.82909, -0.17256, -0.60309); 6.0e-08 of |u| off
+PASS  connector_ground_hinge, NLGEOM (HINGE to ground): body turned 138.48 deg about the axis (statics 138.54), members 5.7e-06 of |u| off that rigid rotation
 PASS  equation_overconstraint: solves (ccx rejects the deck as written); tied node u_x = -0.0e+00, loop u_x = +0.0420 (+0.0420, +0.0420)
 PASS  op_new_respecify: step 2 beam tip +1.1898 (expected +1.1905, 0.05% diff), plate tip (prescribed) +2.0000 (expected +2.0000, 0.00% diff)
 PASS  op_new_remove: step 2 beam tip +0.5910 (expected +0.5952, 0.71% diff), plate tip (step 1) +4.6380 (expected +4.6380, 0.00% diff)
@@ -185,7 +193,13 @@ statics, with the statically equivalent tip load and with a 10⁴× stiffer beam
 at ten times the load under `NLGEOM`, about 27° of rotation); join two-span beams with a
 `PIN` (a hinge: the second span hands half the load to the cantilever) and a `TIE` (a
 rigid joint: one propped cantilever); and hold a spring-supported node with a `LINK`,
-linearised and under `NLGEOM`. The next runs a deck ccx rejects as written: an `*EQUATION`
+linearised and under `NLGEOM`. The connector checks write the same joints, lever and
+link as `CONN3D2` connectors (`JOIN`, `WELD`, `BEAM`, `LINK`), which must give the same
+answers; join the two-span beams with a `HINGE` about z (it releases in-plane bending and
+transmits out-of-plane bending); hinge two `*MPC BEAM` rigid bodies on springs about an
+oblique axis with an offset joint — the construct of a CAE hinge model — against the exact
+solution; and turn a body hinged to ground through 138° under `NLGEOM`. The next runs a
+deck ccx rejects as written: an `*EQUATION`
 whose first DOF has a BC, a duplicate of it, and a loop of ties that ccx would silently
 hold at zero.
 The next two clamp a beam and a plate and give step 2 a `*BOUNDARY, OP=NEW`, which ccx 2.23
@@ -245,7 +259,7 @@ and every step the Abaqus deck loads still carries a load after conversion), and
 the source deck itself (an empty `*STEP`: the solution is zero, in Abaqus too); they stay
 in the gate as conversion checks, flagged `source_unloaded`. The other 605 convert cleanly
 but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
-Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
+Riks, NLGEOM follower tractions, cohesive and joint elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
 worse than the original. Bulk-running every deck through convert → integrity → ccx (later
 waves gathered by parallel discovery agents across a dozen engineering domains; plus
@@ -276,9 +290,9 @@ Every keyword falls into one of five buckets:
 | --- | --- | --- |
 | **Supported** | emit as-is (it's in the CalculiX keyword set) | `*PLASTIC`, `*HYPERELASTIC`, `*CONTACT PAIR`, `*EQUATION`, `*DENSITY` |
 | **Translated** | dedicated handler adjusts keyword/params/data | `*NCOPY`, `*ELGEN`, `*ELASTIC`, `*SHELL SECTION` composite, `*STEP`, `*DSLOAD`, output cards |
-| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*COUPLING`+`*KINEMATIC`, `*MPC` PIN/TIE→`*EQUATION`, `*MPC` BEAM→`*RIGID BODY`, `*DSLOAD`(pressure)→`*DLOAD`, `*COHESIVE/GASKET SECTION`→`*SOLID SECTION` (thin-continuum approx) |
+| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*COUPLING`+`*KINEMATIC`, `*MPC` PIN/TIE→`*EQUATION`, `*MPC` BEAM→`*RIGID BODY`, `CONN3D2` connectors (`HINGE`, `JOIN`, `WELD`, `BEAM`, …)→`*EQUATION`/`*BOUNDARY`/`*RIGID BODY`, `*DSLOAD`(pressure)→`*DLOAD`, `*COHESIVE/GASKET SECTION`→`*SOLID SECTION` (thin-continuum approx) |
 | **Dropped** | organisational, no CalculiX meaning | `*PART/*INSTANCE/*ASSEMBLY` (flattened), `*PREPRINT`, `*PARAMETER`, `*SYSTEM` |
-| **Commented** | no equivalent — emitted as `**` comments + warning | `*VISCOELASTIC`, `*CONNECTOR SECTION`, `*GASKET BEHAVIOR`, `*INERTIA RELIEF`, `*FIELD`, `*CONCRETE *` |
+| **Commented** | no equivalent — emitted as `**` comments + warning | `*VISCOELASTIC`, `*CONNECTOR BEHAVIOR`, `*GASKET BEHAVIOR`, `*INERTIA RELIEF`, `*FIELD`, `*CONCRETE *` |
 
 ---
 
@@ -316,6 +330,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | converted nodal forces (above) on nodes with a `*TRANSFORM` | given in each node's local axes | ccx, like Abaqus, reads a `*CLOAD` there in the transformed system: rectangular, or cylindrical at the node's undeformed position, fixed in space (probed on 2.23 for solid, shell, membrane, beam, plane and axisymmetric nodes). The load line is commented out with the reason (the load audit flags a step it leaves unloaded) when those axes are unknown: a spherical transform (ccx has none), a node on the cylinder axis, degenerate or unreadable data, two different transforms on one node, or a 2-D node whose local 3-axis is not the global Z axis |
 | `*BOUNDARY, USER`, `*CLOAD, USER`, `...NU` load labels, `*TEMPERATURE, USER`, `*AMPLITUDE, DEFINITION=USER` | commented out | the Abaqus user subroutine cannot run in ccx, which would call its own stock `uboun.f` / `cload.f` / `dload.f` / ... instead — the warning names the one to port |
 | `*MPC` | line by line: `PIN`/`TIE` → per-DOF `*EQUATION`; `BEAM` → `*RIGID BODY` per independent node; `LINK` → linearised `*EQUATION` (no `NLGEOM`) or ccx `*MPC BEAM` | `PLANE`/`STRAIGHT` kept; a line ccx cannot take (user MPCs, other types) is commented out alone. `TIE` ties shell/beam rotations through knots (ccx ignores DOFs 4–6 of a plain shell/beam node in an `*EQUATION`) and the temperature in thermal steps; BEAM lines chained through a node form one body; ccx's `*MPC BEAM` keeps the distance between two nodes but rejects beam/shell/plane nodes |
+| `CONN3D2`/`CONN2D2` + `*CONNECTOR SECTION` | the connection's kinematic constraint: `JOIN`, `REVOLUTE`, `ALIGN`, `HINGE` → `*EQUATION`s (and `*BOUNDARY` lines to ground or a held node); `BEAM`, `WELD` → `*RIGID BODY`; `LINK` → as `*MPC LINK`; `CARTESIAN`, `CARDAN`, … (no constraint) → nothing | ccx has no connector element, and without a behaviour a connector is its constraint. Rotations live where ccx has them (a reference point's `ROT NODE`, knots on shell/beam nodes); exact in linear analyses, and under `NLGEOM` only where the linear form stays exact (a hinge to ground, a rigid link) — the rest commented out (`--approximate`: `[APPROX]`). A `*CONNECTOR BEHAVIOR`, `SLOT`, `UNIVERSAL`, … are commented out |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
 | rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
@@ -361,13 +376,15 @@ Flattened set/surface names are kept within CalculiX's **20-significant-characte
 * **Dropped:** `*PART/*INSTANCE/*ASSEMBLY` (after flattening), `*PREPRINT`,
   `*MANIFEST`, `*PARAMETER` (warns), `*SYSTEM` (warns — nodes may be in a rotated
   frame), `*UNIT SYSTEM`.
-* **Commented out with guidance:** connectors (`*CONNECTOR *`, `*FASTENER`,
-  `*JOINT`), gaskets (`*GASKET *`), cohesive/fracture (`*COHESIVE *`, `*DEBOND`,
-  `*DAMAGE *`, `*ENRICHMENT`), `*INERTIA RELIEF`, `*FIELD`/`*REBAR`, unsupported
-  materials (`*VISCOELASTIC`, `*CONCRETE *`, `*CAP/CLAY PLASTICITY`, `*HYPOELASTIC`,
-  `*POROUS METAL PLASTICITY`), `*BEAM GENERAL SECTION`, and specialized procedures
-  (`*RANDOM RESPONSE`, `*RESPONSE SPECTRUM`, `*GEOSTATIC`, `*MASS DIFFUSION`,
-  explicit-only / co-simulation steps).
+* **Commented out with guidance:** connector behaviours, motions and loads
+  (`*CONNECTOR BEHAVIOR`/`ELASTICITY`/…, `*CONNECTOR MOTION`/`LOAD`), connection types
+  other than the ones above (`SLOT`, `UNIVERSAL`, …), `*FASTENER`, `*JOINT`, gaskets
+  (`*GASKET *`), cohesive/fracture (`*COHESIVE *`, `*DEBOND`, `*DAMAGE *`, `*ENRICHMENT`),
+  `*INERTIA RELIEF`, `*FIELD`/`*REBAR`, unsupported materials (`*VISCOELASTIC`,
+  `*CONCRETE *`, `*CAP/CLAY PLASTICITY`, `*HYPOELASTIC`, `*POROUS METAL PLASTICITY`),
+  `*BEAM GENERAL SECTION`, and specialized procedures (`*RANDOM RESPONSE`,
+  `*RESPONSE SPECTRUM`, `*GEOSTATIC`, `*MASS DIFFUSION`, explicit-only / co-simulation
+  steps).
 * **Semantic trap warned:** `*FILTER` (in ccx = sensitivity smoothing, *not* the
   Abaqus output filter). Note `*VISCO` is a ccx *creep step*, not material
   viscoelasticity.
@@ -414,7 +431,8 @@ pressure-face labels (`P1..P6`) carry across unchanged. Element handling:
   thickness or remodel with contact. Pore-pressure `…P` → mechanical base
   (`CAX4P→CAX4`): the pore-pressure DOF is dropped (no consolidation).
 * **No equivalent** (emitted unchanged, strong warning — needs remodelling):
-  connector `CONN*`, `ROTARYI`, rigid `R2D/R3D/RB*` (use `*RIGID BODY` instead).
+  `ROTARYI`, rigid `R2D/R3D/RB*` (use `*RIGID BODY` instead). Connector elements
+  (`CONN3D2`/`CONN2D2`) are not emitted: their `*CONNECTOR SECTION` becomes constraints.
 
 ---
 
@@ -525,6 +543,15 @@ converter warns about the ones it can detect; the rest are here so you know to c
   nodes), nor in a deck whose first step is linear and a later one `NLGEOM` (only with
   `--approximate`); ccx's distance MPC also struggles to converge once a link turns past 45°
   to the axis of its eliminated DOF.
+* Connectors (`CONN3D2`/`CONN2D2`): only the kinematic constraint of `JOIN`, `REVOLUTE`,
+  `ALIGN`, `HINGE`, `WELD`, `BEAM` and `LINK` is written (and unconstrained types without
+  a behaviour are left out); a `*CONNECTOR BEHAVIOR` (springs, dampers, stops, locks,
+  friction), `*CONNECTOR MOTION`/`LOAD` and the other connection types are commented out.
+  Under `NLGEOM` the linear constraint is exact only to ground or a held node, and for
+  translations between mesh nodes or from a reference point to a mesh node; a hinge between
+  two moving bodies is commented out (with `--approximate`
+  it is written linear, `[APPROX]`: ccx 2.23 also solves `*EQUATION`s that link two rigid
+  bodies inaccurately under `NLGEOM`, about 1 % at 30°).
 * `*DISTRIBUTION` / variable-angle-tow orientations: ccx 2.23 applies them per element
   only under `*SOLID SECTION`, so the converter splits shell and membrane sections into
   one plain `*ORIENTATION` and section per distinct direction (validated against the same
@@ -539,7 +566,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
   coefficients is written as `TYPE=ORTHO`, which runs, where no orientation turns it so
   that it has shear in global axes; for the rest no form of the deck avoids it — the
   CalculiX sources fixed both after 2.23 — so the converter warns, naming the materials.
-* Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
+* Commented/unsupported cards (connector behaviours, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
 * The converter validates *structure*, not *physics*. Run `ccx` and sanity-check.
 * Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written against 2.22–2.23.
@@ -573,6 +600,9 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/mpc_beam_lever.inp`](examples/mpc_beam_lever.inp) | `*MPC BEAM` lever on a `B31` tip → `*RIGID BODY` on a knot, vs the equivalent tip load and a stiff-beam lever |
 | [`examples/mpc_pin_tie_joints.inp`](examples/mpc_pin_tie_joints.inp) | two-span beams joined by `*MPC PIN` (hinge) and `TIE` (rigid joint, knots) |
 | [`examples/mpc_link.inp`](examples/mpc_link.inp) | `*MPC LINK` + `SPRINGA` → linearised `*EQUATION`; ccx `*MPC BEAM` under `NLGEOM` |
+| [`examples/connector_hinge_beams.inp`](examples/connector_hinge_beams.inp) | two-span beams joined by `CONN3D2` `HINGE` connectors about z → `*EQUATION`s on knots; in-plane released, out-of-plane transmitted |
+| [`examples/connector_hinge_bodies.inp`](examples/connector_hinge_bodies.inp) | two `*MPC BEAM` rigid bodies on `SPRING1`s joined by a `HINGE` (oblique axis, offset joint), a moment on a reference point, vs exact statics |
+| [`examples/connector_ground_hinge.inp`](examples/connector_ground_hinge.inp) | a rigid body hinged to ground (blank connector node) turned 138° under `NLGEOM` |
 | [`examples/equation_overconstraint.inp`](examples/equation_overconstraint.inp) | `*EQUATION` on a BC'd DOF (terms reordered), a duplicate and a loop of ties (dropped) |
 | [`examples/cook_membrane_traction.inp`](examples/cook_membrane_traction.inp) | Cook's membrane, `CPS8`, `*DSLOAD TRVEC` → consistent nodal forces, `*NGEN`/`*NFILL`/`*ELGEN` |
 | [`examples/beam_line_load_cantilever.inp`](examples/beam_line_load_cantilever.inp) | beam line loads `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and an upgraded `CIRC` beam → nodal forces |

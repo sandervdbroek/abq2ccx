@@ -3628,6 +3628,204 @@ def test_rigid_body_bc_bars_example():
     assert "*BOUNDARY on 9 DOF(s) of 9 *RIGID BODY node(s) moved" in rep.text() and rep.n_warnings == 0
 
 
+# two reference points (1 and 3, coincident) tied by *MPC BEAM to free nodes, and a HINGE
+# connector between them about z (orientation AX)
+RP2 = ("*Node\n1, 0.,0.,0.\n3, 0.,0.,0.\n11, 1.,0.,0.\n12, 0.,1.,0.\n21, 0.,0.,1.\n22, 1.,1.,1.\n"
+       "*MPC\nBEAM, 11, 1\nBEAM, 12, 1\nBEAM, 21, 3\nBEAM, 22, 3\n"
+       "*Element, type=CONN3D2, elset=H\n7, 1, 3\n*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n"
+       "*Connector Section, elset=H\nHinge,\nAX,\n")
+
+
+def test_connector_hinge_between_reference_points():
+    # ccx has no connector element: a HINGE is its constraint, equal translations and equal
+    # rotations about the two axes normal to the hinge axis, on the reference points' ROT
+    # NODEs (ccx carries a rigid body's rotation there); the element itself is not emitted
+    body, conv, rep = convert_str(RP2)
+    r1, r3 = conv._rb_rot[1], conv._rb_rot[3]
+    assert _equations(body) == [f"3,{k},1,1,{k},-1" for k in (1, 2, 3)] + \
+        [f"{r3},{k},1,{r1},{k},-1" for k in (1, 2)]
+    assert "CONN3D2" not in body and "ELSET=H" not in body and "undefined" not in rep.text()
+    assert "Connector elements -> ccx constraints" in rep.text()
+    # an oblique axis and an offset joint: rows over three rotation components, and node b
+    # keeps its offset d in node a's turning system (u_3 - u_1 - theta_1 x d = 0)
+    oblique = RP2.replace("3, 0.,0.,0.", "3, 0.,0.,2.").replace("0., 0., 1., 1., 0., 0.",
+                                                                 "1., 0., 1., 0., 1., 0.")
+    body, conv, _ = convert_str(oblique)
+    r1, r3 = conv._rb_rot[1], conv._rb_rot[3]
+    lines = _live(body)
+    eqs = [lines[i + 2] for i, l in enumerate(lines) if l == "*EQUATION"]
+    assert eqs[:2] == [f"3, 1, 1, 1, 1, -1, {r1}, 2, -2", f"3, 2, 1, 1, 2, -1, {r1}, 1, 2"]
+    assert eqs[3:] == [f"{r3}, 2, 1, {r1}, 2, -1", f"{r3}, 3, 1, {r3}, 1, -1, {r1}, 3, -1, {r1}, 1, 1"]
+
+
+def test_connector_in_assembly_resolves_instance_nodes():
+    # CAE writes wires at assembly level with instance-qualified nodes: resolved to the flat
+    # numbering (they used to be skipped, the connector lost), set members filtered quietly
+    deck = ("*Part, name=P\n*Node\n1, 0.,0.,0.\n2, 1.,0.,0.\n*Element, type=T3D2, elset=B\n1, 1, 2\n"
+            "*Solid Section, elset=B, material=M\n1.,\n*End Part\n*Assembly, name=A\n"
+            "*Instance, name=I1, part=P\n*End Instance\n*Instance, name=I2, part=P\n1., 0., 0.\n"
+            "*End Instance\n*Element, type=CONN3D2\n1, I1.2, I2.1\n*Elset, elset=W\n1,\n"
+            "*Connector Section, elset=W\nJoin,\n*End Assembly\n*Material, name=M\n*Elastic\n"
+            "1000., 0.3\n")
+    body, conv, rep = convert_str(deck)
+    assert _equations(body) == [f"3,{k},1,2,{k},-1" for k in (1, 2, 3)]
+    assert "non-numeric connectivity" not in rep.text() and "reference undefined" not in rep.text()
+    assert not dangling_refs(reparse(body))
+    # a connector inside a part is one per instance
+    part = deck.replace("*End Part", "*Element, type=CONN3D2, elset=W\n5, 1, 2\n"
+                        "*Connector Section, elset=W\nJoin,\n*End Part")
+    body, _, _ = convert_str(part)
+    assert [f"2,{k},1,1,{k},-1" for k in (1, 2, 3)] + [f"4,{k},1,3,{k},-1" for k in (1, 2, 3)] \
+        == _equations(body)[:6] and not dangling_refs(reparse(body))
+
+
+def test_connector_to_ground_and_held_nodes():
+    # a blank node is ground (at the other node): JOIN to ground holds the node — *BOUNDARY
+    # lines, repeated after OP=NEW (which removes every earlier BC in ccx, model data too)
+    deck = (HEX + "*Node\n9, 2.,0.,0.\n*Element, type=CONN3D2, elset=G\n5, 9,\n"
+            "*Connector Section, elset=G\nJoin,\n*Boundary\n1, 1, 3\n*Step\n*Static\n"
+            "*Boundary, op=NEW\n1, 1, 3\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    lines = _live(body)
+    assert lines.count("9, 1, 1") == 2 and lines.count("9, 3, 3") == 2
+    assert lines[lines.index("*BOUNDARY, OP=NEW") + 2] == "9, 1, 1" and "OP=NEW" in rep.text()
+    # HINGE to ground about z on a reference point: its translations and the rotations about
+    # x and y held; the same constraint written against a node held by its own BCs
+    rp = ("*Node\n1, 0.,0.,0.\n11, 1.,0.,0.\n12, 0.,1.,0.\n*MPC\nBEAM, 11, 1\nBEAM, 12, 1\n"
+          "*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n")
+    body, conv, _ = convert_str(rp + "*Element, type=CONN3D2, elset=H\n7, , 1\n"
+                                "*Connector Section, elset=H\nHinge,\nAX,\n")
+    r1 = conv._rb_rot[1]
+    assert _bc_lines(body) == ["1,1,1", "1,2,2", "1,3,3", f"{r1},1,1", f"{r1},2,2"]
+    assert not _equations(body)
+    body, conv, _ = convert_str(rp + "*Node\n2, 0.,0.,0.\n*Element, type=CONN3D2, elset=H\n7, 2, 1\n"
+                                "*Connector Section, elset=H\nHinge,\nAX,\n*Boundary\n2, ENCASTRE\n")
+    r1 = conv._rb_rot[1]
+    assert _bc_lines(body) == ["1,1,1", "1,2,2", "1,3,3", f"{r1},1,1", f"{r1},2,2",
+                               "2,1,3"] and not _equations(body)
+
+
+def test_connector_beam_weld_and_link():
+    # BEAM (and WELD, the same rigid link) -> a rigid body, exactly like *MPC BEAM
+    deck = B2 + "*Node\n100, 1.5, 0., 0.\n"
+    as_mpc, _, _ = convert_str(deck + "*MPC\nBEAM, 100, 2\n")
+    body, conv, _ = convert_str(deck + "*Element, type=CONN3D2, elset=W\n9, 2, 100\n"
+                                "*Connector Section, elset=W\nBeam,\n")
+    assert "*RIGID BODY, NSET=ABQ2CCX_MPCB1, REF NODE=2" in body and sorted(conv._knots) == [2]
+    assert _equations(body) == _equations(as_mpc)
+    # WELD between two nodes without rotations of their own: the rotations are
+    # connector-only unknowns, so a coincident weld is a JOIN and an offset one a LINK
+    body, conv, _ = convert_str(HEX + "*Node\n9, 1.,0.,0.\n*Element, type=CONN3D2, elset=W\n"
+                                "20, 2, 9\n*Connector Section, elset=W\nWeld,\n")
+    assert _equations(body) == [f"9,{k},1,2,{k},-1" for k in (1, 2, 3)] and not conv._rb_rot
+    body, _, _ = convert_str(HEX + "*Node\n9, 3.,0.,0.\n*Element, type=CONN3D2, elset=W\n"
+                             "20, 2, 9\n*Connector Section, elset=W\nWeld,\n")
+    assert _equations(body) == ["9,1,1,2,1,-1"]
+    # LINK -> as *MPC LINK
+    body, _, rep = convert_str(HEX + "*Node\n9, 1.,3.,4.\n*Element, type=CONN3D2, elset=W\n"
+                               "20, 2, 9\n*Connector Section, elset=W\nLink,\n")
+    lines = _live(body)
+    assert lines[lines.index("*EQUATION") + 2] == "9, 3, 0.8, 9, 2, 0.6, 2, 3, -0.8, 2, 2, -0.6"
+    assert "Connector LINK in a deck without NLGEOM" in rep.text()
+
+
+def test_connector_types_behaviour_and_free_types():
+    base = HEX + "*Node\n9, 1.,0.,0.\n*Element, type=CONN3D2, elset=W\n20, 2, 9\n"
+    # no constraint and no behaviour: transmits nothing — left out (exact)
+    body, _, rep = convert_str(base + "*Connector Section, elset=W\nCartesian, Cardan\n")
+    assert "transmits nothing" in rep.text() and not _equations(body) and "** *CONNECTOR" not in body
+    # a type the converter does not write, and any behaviour: commented out with the reason
+    body, _, rep = convert_str(base + "*Connector Section, elset=W\nSlot,\n")
+    assert "** *CONNECTOR SECTION, ELSET=W" in body and "type SLOT is not converted" in rep.text()
+    assert "** connector element(s) 20 (nodes 2, 9)" in body
+    beh = "*Connector Behavior, name=B\n*Connector Elasticity, component=1\n100.,\n"
+    body, _, rep = convert_str(base + beh + "*Connector Section, elset=W, behavior=B\nJoin,\n")
+    assert "** *CONNECTOR SECTION" in body and "with a *CONNECTOR BEHAVIOR" in rep.text()
+    assert not _equations(body)
+    body, _, rep = convert_str(base + "*Connector Behavior, name=B\n"
+                               "*Connector Section, elset=W, behavior=B\nJoin,\n")
+    assert len(_equations(body)) == 3 and "defines nothing" in rep.text()
+    # a section on an elset without connector elements stays a comment, and so does a
+    # connector on one node twice
+    body, _, rep = convert_str(HEX + "*Connector Section, elset=EALL\nJoin,\n")
+    assert "** *CONNECTOR SECTION" in body and "holds no connector element" in rep.text()
+    body, _, rep = convert_str(base.replace("20, 2, 9", "20, 2, 2") +
+                               "*Connector Section, elset=W\nJoin,\n")
+    assert not _equations(body) and "same node twice" in rep.text()
+
+
+def test_connector_nlgeom_exact_cases_only():
+    # under NLGEOM a hinge between two turning bodies is linear in the rotation vectors only
+    # for small rotations, and ccx solves *EQUATIONs that link two rigid bodies inaccurately
+    # (probed): commented out, or written with [APPROX] under --approximate
+    nl = "*Step, nlgeom=YES\n*Static\n*End Step\n"
+    body, _, rep = convert_str(RP2 + nl)
+    assert not _equations(body) and "--approximate" in rep.text() and "** *CONNECTOR" in body
+    body, _, rep = convert_str(RP2 + nl, approximate=True)
+    assert len(_equations(body)) == 5 and "[APPROX] Connector under NLGEOM" in rep.text()
+    # ... but a hinge to ground keeps its axis, so it is exact at any rotation
+    ground = RP2.replace("7, 1, 3", "7, , 3")
+    body, conv, rep = convert_str(ground + nl)
+    r3 = conv._rb_rot[3]
+    assert _bc_lines(body) == ["3,1,1", "3,2,2", "3,3,3", f"{r3},1,1", f"{r3},2,2"]
+    assert not _equations(body) and "--approximate" not in rep.text()
+    # oblique axis (x + z): an equation among the ROT NODE's own components — still exact
+    body, _, rep = convert_str(ground.replace("0., 0., 1., 1., 0., 0.", "1., 0., 1., 0., 1., 0.") + nl)
+    assert _equations(body) == [f"{r3},3,1,{r3},1,-1"] and f"{r3},2,2" in _bc_lines(body)
+    assert "--approximate" not in rep.text() and "** *CONNECTOR" not in body
+    # a JOIN from a reference point to a mesh node: eliminated on the mesh node (no ccx MPC
+    # touches it), the reference point's translations independent — exact (probed), either
+    # way round; a hinge between two solid nodes whose rotations live on new rotation nodes
+    # (moments on them) links two turning nodes — commented out
+    rp = ("*Node\n1, 0.5,0.5,1.\n100, 0.5,0.5,1.\n*Nset, nset=TOP\n5,6,7,8\n"
+          "*Rigid Body, ref node=1, tie nset=TOP\n*Element, type=CONN3D2, elset=J\n")
+    for conn in ("9, 1, 100", "9, 100, 1"):
+        body, _, _ = convert_str(HEX + rp + conn + "\n*Connector Section, elset=J\nJoin,\n" + nl)
+        assert [e.split(",")[:2] for e in _equations(body)] == [["100", str(k)] for k in (1, 2, 3)]
+    body, conv, rep = convert_str(
+        HEX + "*Node\n9, 1.,0.,0.\n*Orientation, name=AX\n1., 0., 1., 0., 1., 0.\n*Element, "
+        "type=CONN3D2, elset=H\n30, 2, 9\n*Connector Section, elset=H\nHinge,\nAX,\n*Step, "
+        "nlgeom=YES\n*Static\n*Cload\n2, 4, 1.\n9, 5, 1.\n*End Step\n")
+    assert sorted(conv._rb_rot) == [2, 9] and not _equations(body) and "--approximate" in rep.text()
+    # explicit dynamics: no knots (its solver stops on them), so a beam end's rotation
+    # cannot be constrained — commented out rather than silently dropped
+    beams = (B2 + "*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n*Element, type=CONN3D2, "
+             "elset=H\n9, 2, 3\n*Connector Section, elset=H\nHinge,\nAX,\n")
+    body, conv, rep = convert_str(beams + "*Step\n*Dynamic, Explicit\n, 1e-4\n*End Step\n")
+    assert not _equations(body) and not conv._knots and "explicit dynamics" in rep.text()
+    body, conv, _ = convert_str(beams)
+    assert _equations(body) == [f"3,{k},1,2,{k},-1" for k in range(1, 6)] and \
+        sorted(conv._knots) == [2, 3]
+
+
+def test_connector_rotations_of_nodes_without_rotations():
+    # HINGE between a beam end and a coincident solid node: the solid node's rotation is a
+    # connector-only unknown (Abaqus adds it, nothing else touches it), so the revolute part
+    # constrains nothing and only the JOIN remains ...
+    deck = (HEX + "*Node\n20, 1.,0.,0.\n21, 2.,0.,0.\n*Element, type=B31, elset=B\n2, 20, 21\n"
+            "*Beam Section, elset=B, material=M, section=RECT\n1.,1.\n0.,0.,1.\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n"
+            "*Element, type=CONN3D2, elset=H\n30, 20, 2\n*Connector Section, elset=H\nHinge,\nAX,\n")
+    body, conv, _ = convert_str(deck)
+    assert _equations(body) == [f"2,{k},1,20,{k},-1" for k in (1, 2, 3)]
+    # ... unless that rotation shows elsewhere (a moment on it): it then lives on a new
+    # rotation node, which the moment moves to
+    body, conv, _ = convert_str(deck + "*Step\n*Static\n*Cload\n2, 4, 1.\n*End Step\n")
+    rot = conv._rb_rot[2]
+    assert _equations(body)[3:] == [f"{rot},1,1,20,4,-1", f"{rot},2,1,20,5,-1"]
+    assert f"{rot}, 1, 1." in body and "2, 4, 1." not in body
+
+
+def test_connector_examples():
+    for name, eqs in (("connector_hinge_beams", 10), ("connector_hinge_bodies", 5),
+                      ("connector_ground_hinge", 2)):
+        body, conv, rep = convert(os.path.join(EXAMPLES, name + ".inp"))
+        g = reparse(body)
+        assert body.count("*EQUATION") - body.count("** *EQUATION") >= eqs, name
+        assert "TYPE=CONN3D2" not in body and not dangling_refs(g), (name, dangling_refs(g))
+        assert "WARNING" not in rep.text(), (name, rep.text())
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

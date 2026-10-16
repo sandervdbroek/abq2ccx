@@ -395,7 +395,8 @@ def canonical_keyword(keyword: str) -> str:
         known = (set(CCX_KEYWORDS) | GEOM_KW | set(DROP_KEYWORDS) | set(DROP_WARN_KEYWORDS) |
                  set(SPECIAL_UNSUPPORTED) | set(SEMANTIC_TRAP) | set(PASS_WITH_NOTE) |
                  {"KINEMATIC COUPLING", "SHELL GENERAL SECTION", "BEAM GENERAL SECTION",
-                  "COHESIVE SECTION", "GASKET SECTION", "PARAMETER", "SYSTEM", "UNIT SYSTEM",
+                  "COHESIVE SECTION", "GASKET SECTION", "CONNECTOR SECTION", "PARAMETER",
+                  "SYSTEM", "UNIT SYSTEM",
                   "DISTRIBUTING COUPLING", "RATE DEPENDENT", "INITIAL CONDITIONS",
                   "SURFACE INTERACTION", "SURFACE BEHAVIOR", "CONTACT PAIR"})
         for k in known:
@@ -1400,9 +1401,13 @@ SPECIAL_UNSUPPORTED = {
                     "material); drop, or approximate with *DAMPING.",
     "INERTIA RELIEF": "ccx has no inertia relief; constrain with a soft spring-to-ground / 3-2-1 "
                       "set, or balance with the equilibrating load.",
-    "CONNECTOR SECTION": "connectors have no ccx element; remodel as *RIGID BODY / *MPC / *SPRING / "
-                         "*DASHPOT per the connector behaviour.",
-    "CONNECTOR BEHAVIOR": "connector behaviour has no ccx equivalent; see *CONNECTOR SECTION.",
+    "CONNECTOR BEHAVIOR": "connector behaviour has no ccx equivalent (a section that uses it is "
+                          "commented out); remodel as *SPRING / *DASHPOT / *MPC per the behaviour.",
+    "CONNECTOR MOTION": "prescribes motion of connector components, which the converted "
+                        "connector (ccx constraints, no connector element) does not have; the "
+                        "prescribed motion is missing.",
+    "CONNECTOR LOAD": "loads connector components, which the converted connector (ccx "
+                      "constraints, no connector element) does not have; the load is missing.",
     "GASKET BEHAVIOR": "gasket behaviour has no ccx equivalent.",
     "COHESIVE SECTION": "ccx has no cohesive element; model debonding with contact (*SURFACE "
                         "BEHAVIOR) or a nonlinear *SPRING.",
@@ -1415,7 +1420,11 @@ SPECIAL_UNSUPPORTED = {
                             "SECTION=GENERAL with A, I11, I12, I22, shear factor.",
     "CONCRETE": "concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel.",
     "CONCRETE DAMAGED PLASTICITY": "unsupported by ccx; substitute *PLASTIC or remodel.",
-    "CONNECTOR ELASTICITY": "connector behaviour has no ccx equivalent; see *CONNECTOR SECTION.",
+    **{f"CONNECTOR {k}": "connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that "
+                         "uses it is commented out)."
+       for k in ("ELASTICITY", "DAMPING", "STOP", "LOCK", "FRICTION", "PLASTICITY", "HARDENING",
+                 "DAMAGE INITIATION", "DAMAGE EVOLUTION", "CONSTITUTIVE REFERENCE",
+                 "DERIVED COMPONENT", "POTENTIAL", "UNIAXIAL BEHAVIOR", "FAILURE")},
     "CONTACT": "Abaqus general contact has no ccx equivalent; define explicit pairs instead: "
                "*CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element "
                "surfaces (+ *SURFACE INTERACTION / *SURFACE BEHAVIOR).",
@@ -1592,6 +1601,27 @@ def _distribution_axes(vals: Sequence[float], rect: bool,
         a = rotate_about_axis(e1, origin, axis, rot[1])
         b = rotate_about_axis(e2, origin, axis, rot[1])
     return a, b
+
+# Abaqus connector elements and the connection types of *CONNECTOR SECTION (first data
+# line: one assembled type, or a basic translational and/or a basic rotational type).
+# ccx has no connector element; the converter writes the kinematic constraint of the types
+# below as ccx constraints (see Converter._plan_connectors) — without a *CONNECTOR BEHAVIOR,
+# a connector is exactly its constraint.
+CONN_TYPES = ("CONN3D2", "CONN2D2")
+CONN_ASSEMBLED = {"HINGE": ("JOIN", "REVOLUTE"), "WELD": ("JOIN", "ALIGN"),
+                  "CYLINDRICAL": ("SLOT", "REVOLUTE"), "TRANSLATOR": ("SLOT", "ALIGN"),
+                  "PLANAR": ("SLIDE-PLANE", "REVOLUTE"), "UJOINT": ("JOIN", "UNIVERSAL"),
+                  "CVJOINT": ("JOIN", "CONSTANT VELOCITY"),
+                  "BUSHING": ("PROJECTION CARTESIAN", "PROJECTION FLEXION-TORSION")}
+CONN_TRANSLATIONAL = {"JOIN", "LINK", "SLOT", "SLIDE-PLANE", "CARTESIAN", "AXIAL",
+                      "PROJECTION CARTESIAN", "RADIAL-THRUST", "ACCELEROMETER"}
+CONN_ROTATIONAL = {"REVOLUTE", "ALIGN", "UNIVERSAL", "CONSTANT VELOCITY", "CARDAN", "EULER",
+                   "ROTATION", "FLEXION-TORSION", "PROJECTION FLEXION-TORSION",
+                   "ROTATION-ACCELEROMETER"}
+# basic types with no kinematic constraint (every relative motion is available): without
+# a behaviour such a component transmits nothing
+CONN_UNCONSTRAINED = {"CARTESIAN", "AXIAL", "PROJECTION CARTESIAN", "CARDAN", "EULER",
+                      "ROTATION", "FLEXION-TORSION", "PROJECTION FLEXION-TORSION"}
 
 
 # ---------------------------------------------------------------------------
@@ -2014,6 +2044,18 @@ class Converter:
         # (type, nodes), and the full member list of each element set that had some
         self._carriers: "OrderedDict[int, Tuple[str, List[int]]]" = OrderedDict()
         self._carrier_sets: Dict[str, List[int]] = {}
+        # connector elements (see _plan_connectors): element -> (type, node a, node b), None
+        # for a grounded node.  They are constraints in ccx, never emitted as elements.
+        self._conn: "OrderedDict[int, Tuple[str, Optional[int], Optional[int]]]" = OrderedDict()
+        self._conn_plan: Dict[int, dict] = {}      # id(*CONNECTOR SECTION) -> its plan
+        self._conn_beam: List[Tuple[int, int, int]] = []    # rigid links: (a, b, id(section))
+        self._conn_knots: List[int] = []           # shell/beam nodes whose rotations they use
+        self._conn_bcs: List[str] = []             # their *BOUNDARY lines (held in every step)
+        self._conn_held: set = set()               # (node, DOF) held at zero in every step
+        self._conn_bc_dofs: set = set()            # (node, DOF) with a BC in any step
+        self._conn_turned: set = set()             # nodes with moments / prescribed rotations
+        self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_mpcs)
+        self._expanded: set = set()                # nodes of elements ccx expands to 3-D
 
     # -- properties ---------------------------------------------------------
     @property
@@ -2087,6 +2129,9 @@ class Converter:
 
     def _register_elements(self, b: Block) -> None:
         typ = (b.param("TYPE") or "").upper()
+        if typ in CONN_TYPES:
+            self._register_connectors(b, typ)
+            return
         nn = element_node_count(typ)
         toks: List[str] = []
         for line in b.data:
@@ -2112,9 +2157,10 @@ class Converter:
                                  f"verify it is a connector/MPC with no ccx equivalent.", once=True)
                 i += 1 + nn
                 continue
-            if eid in self.geom.elements:
+            if eid in self.geom.elements or eid in self._conn:
                 self.report.warn("Duplicate element id(s) in the input; the last definition is kept "
                                  "(Abaqus behaviour) — check for an upstream renumbering error.", once=True)
+                self._conn.pop(eid, None)
             self.geom.add_element(eid, typ, conn)
             ids.append(eid)
             i += 1 + nn
@@ -2122,6 +2168,33 @@ class Converter:
             self.report.warn(f"*ELEMENT TYPE={typ}: {len(toks) - i} trailing token(s) "
                              f"not parsed; check connectivity.", once=True)
         self._elem_types.add(typ)
+        if b.param("ELSET"):
+            self.geom.add_to_elset(b.param("ELSET"), ids)
+
+    def _register_connectors(self, b: Block, typ: str) -> None:
+        """Connector elements, one per data line ``element, node a, node b``; a blank node
+        is ground (Abaqus).  They stay out of the mesh — ccx has no connector element; the
+        *CONNECTOR SECTION handler writes each connection as constraints."""
+        ids = []
+        for rec in merged_data_records(b):
+            if not rec or not rec[0]:
+                continue
+            try:
+                eid = int(rec[0])
+                ends = [int(x) if x else None for x in (rec[1:3] + ["", ""])[:2]]
+            except ValueError:
+                self.report.warn(f"*ELEMENT TYPE={typ}: a node given by a name ccx cannot "
+                                 f"resolve (instance or set name); that connector is skipped "
+                                 f"— its constraint is missing.", once=True)
+                continue
+            if ends[0] is None and ends[1] is None:
+                continue
+            if eid in self._conn or eid in self.geom.elements:
+                self.report.warn("Duplicate element id(s) in the input; the last definition is kept "
+                                 "(Abaqus behaviour) — check for an upstream renumbering error.", once=True)
+                self.geom.elements.pop(eid, None)
+            self._conn[eid] = (typ, ends[0], ends[1])
+            ids.append(eid)
         if b.param("ELSET"):
             self.geom.add_to_elset(b.param("ELSET"), ids)
 
@@ -2223,6 +2296,8 @@ class Converter:
     def _emit_set(self, out: List[str], kw: str, name: str, ids: Sequence[int]) -> None:
         pool = self.geom.nodes if kw == "NSET" else self.geom.elements
         raw = dedup(ids)
+        if kw == "ELSET" and self._conn:
+            raw = [i for i in raw if i not in self._conn]      # constraints, not elements
         ids = [i for i in raw if i in pool]
         dropped = len(raw) - len(ids)
         if dropped:
@@ -2299,6 +2374,7 @@ class Converter:
             "DLOAD": self.handle_dload,
             "DSLOAD": self.handle_dsload,
             "MPC": self.handle_mpc,
+            "CONNECTOR SECTION": self.handle_connector_section,
             "RESTART": self.handle_restart,
             "AMPLITUDE": self.handle_amplitude,
             "SURFACE": self.handle_surface,
@@ -3997,6 +4073,12 @@ class Converter:
         if self._planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
             # OP=NEW also removes the model-data planar constraint (verified on 2.23)
             out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
+        if self._conn_bcs and (params.get("OP") or "").strip().upper() == "NEW":
+            out += self._conn_bcs
+            self.report.note("*BOUNDARY, OP=NEW: the boundary conditions that hold converted "
+                             "connectors are repeated after it (OP=NEW removes every earlier BC "
+                             "in ccx, model data included; probed), as a connector holds in every "
+                             "step.", once=True)
         return out
 
     def _check_node_target(self, kw: str, spec: str) -> None:
@@ -4837,6 +4919,11 @@ class Converter:
         cc = fmap.get(b.keyword, b.keyword)
         if cc == "CONTACT FILE":
             return self._contact_output(b)
+        members = self.geom.elset((b.param("ELSET") or "").strip()) if b.param("ELSET") else []
+        if members and all(e in self._conn for e in members):
+            self.report.note(f"*{b.keyword} on connector elements dropped: they are constraints in "
+                             f"ccx, which has no connector output (CTF, CU, ...).", once=True)
+            return []
         is_print = cc.endswith("PRINT")
         # parameters ccx's *NODE FILE / *EL FILE reader accepts (noelfiles.f); anything else
         # is "parameter not recognized" there
@@ -5051,6 +5138,69 @@ class Converter:
             out += self._commented(mkblock("MPC", b.params.items(), lines), reason)
         return out
 
+    def handle_connector_section(self, b: Block) -> List[str]:
+        """``*CONNECTOR SECTION``: its connector elements as ccx constraints, from the plan of
+        _plan_connectors / _plan_connector_rows — *BOUNDARY lines and *EQUATIONs (JOIN,
+        REVOLUTE, ALIGN, HINGE; WELD / BEAM to ground), a *RIGID BODY (BEAM, WELD), a
+        linearised *EQUATION or ccx's *MPC BEAM (LINK).  An element that cannot be converted
+        is listed in a commented-out copy of the card, with the reason."""
+        sec = self._conn_plan.get(id(b)) or \
+            {"reason": f"*CONNECTOR SECTION on ELSET={(b.param('ELSET') or '').strip()}, which holds "
+                       f"no connector element (CONN3D2 / CONN2D2); commented out."}
+        if sec["reason"]:
+            return self._commented(b, sec["reason"])
+        out: List[str] = []
+        bcs: List[str] = []
+        skipped: "OrderedDict[str, List[dict]]" = OrderedDict()
+        rows = approx = False
+        for it in sec["items"]:
+            if it["route"] == "skip":
+                skipped.setdefault(it["reason"], []).append(it)
+            elif it["route"] == "link":
+                out += ["*MPC", f"BEAM, {it['b']}, {it['a']}"] if it["link"] == "link-mpc" else \
+                    self._link_equation(it["b"], it["a"])
+            elif it["route"] == "rows":
+                rows, approx = True, approx or bool(it.get("approx"))
+                bcs += [f"{n}, {d}, {d}" for n, d in it["bcs"]]
+                for eq in it["eqs"]:
+                    out += ["*EQUATION", str(len(eq))]
+                    out += [", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in eq[i:i + 4])
+                            for i in range(0, len(eq), 4)]
+        if bcs:
+            bcs = dedup_str(bcs)
+            out = ["*BOUNDARY"] + bcs + out
+            self._conn_bcs += [x for x in bcs if x not in self._conn_bcs]
+        for body in self._mpc_bodies.get(id(b), []):
+            out += self._mpc_rigid_body(body)
+        if any(it["route"] == "beam" for it in sec["items"]):
+            self.report.note("Connector BEAM / WELD (a rigid link) -> *RIGID BODY, like *MPC BEAM: "
+                             "the nodes it links move as one rigid body, exact at any rotation.",
+                             once=True)
+        if rows:
+            self.report.note("Connector elements -> ccx constraints (ccx has no connector element; "
+                             "without a behaviour a connector is its kinematic constraint): JOIN "
+                             "keeps node b at its initial offset in node a's local system, "
+                             "REVOLUTE / HINGE leave only the rotation about node a's local "
+                             "1-direction free, ALIGN locks the relative rotation — as *EQUATIONs "
+                             "on the translations and rotation vectors (a reference point's "
+                             "rotation on its ROT NODE, a shell/beam node's on a knot) and *BOUNDARY "
+                             "lines where a side is grounded or held; exact in a linear analysis.",
+                             once=True)
+        if approx:
+            self.report.warn("[APPROX] Connector under NLGEOM written in its linear form: a "
+                             "REVOLUTE / ALIGN between two moving nodes, or a JOIN offset that "
+                             "turns with node a, holds for small rotations only, and ccx 2.23 "
+                             "solves *EQUATIONs that link rigid bodies' reference / rotation DOFs "
+                             "inaccurately under NLGEOM (probed: about 1 % at 30 degrees).",
+                             once=True)
+        for reason, its in skipped.items():
+            listing = ", ".join(f"{it['eid']} (nodes {'ground' if it['a'] is None else it['a']}, "
+                                f"{'ground' if it['b'] is None else it['b']})" for it in its)
+            out += self._commented(mkblock("CONNECTOR SECTION", b.params.items(),
+                                           list(b.data) + [f"connector element(s) {listing}"]),
+                                   reason)
+        return out
+
     def _warn_transformed_mpc(self, pairs: Sequence[Tuple[int, int]]) -> None:
         if any(n in self._transformed for p in pairs for n in p):
             self.report.warn("*MPC on a node with a *TRANSFORM: ccx reads the DOFs of the "
@@ -5079,7 +5229,7 @@ class Converter:
         name = f"ABQ2CCX_MPCB{self._synth_counter}"
         out = [f"*NSET, NSET={name}"] + reflow([str(n) for n in members])
         out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
-        if ref in self._knots and ref in self._rot_nodes:
+        if (ref in self._knots and ref in self._rot_nodes) or body.get("follow"):
             out += self._rot_node_follows(rot, ref)
         out += self._rotation_ties(members, rot, -3)
         self.report.note("*MPC BEAM -> *RIGID BODY: the lines that share an independent node "
@@ -6415,7 +6565,9 @@ class Converter:
         # of a rigid body or coupling, which carries the body's rotations
         self._plane_only = {n for n, p in plane.items() if p}
         # reference/rotation nodes of rigid bodies and couplings carry real rotations (the
-        # independent node of *MPC BEAM lines too: it becomes a *RIGID BODY's REF NODE)
+        # independent node of *MPC BEAM lines too: it becomes a *RIGID BODY's REF NODE);
+        # rigid connectors join the *MPC BEAM bodies
+        self._plan_connectors(blocks)
         self._plan_mpcs(blocks)
         mpc_refs = [body["ref"] for bodies in self._mpc_bodies.values() for body in bodies]
         self._plane_only.difference_update(mpc_refs)
@@ -6457,6 +6609,7 @@ class Converter:
                     self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
                 body["rot"] = self._rb_rot[ref]
         self._plan_rigid_couplings(blocks)
+        self._plan_connector_rows(blocks)
         self._plan_coupled_bcs(blocks)
         if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks) and any(
                 any(m in self._plane_only for m in members)
@@ -6712,7 +6865,7 @@ class Converter:
             elif b.keyword == "DYNAMIC" and b.has("EXPLICIT") and steps:
                 steps[-1] = True               # the converter runs explicit steps with NLGEOM
         # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
-        nl_any, nl_all = any(steps), bool(steps) and steps[0]
+        self._nl_any, self._nl_all = any(steps), bool(steps) and steps[0]
         # a TIE also ties the temperature (DOF 11) where a step has one; a heat-transfer-only
         # deck has no displacements to tie
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
@@ -6721,13 +6874,13 @@ class Converter:
         self._mpc_mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
         quiet = Report()
         kinds: Dict[str, str] = {}
-        expanded: set = set()                  # nodes of elements ccx expands to 3-D
+        self._expanded = set()                 # nodes of elements ccx expands to 3-D
         for typ, conn in self.geom.elements.values():
             if typ not in kinds:
                 kinds[typ] = ccx_element_type(typ, quiet)
             cc = kinds[typ]
             if cc in SHELL_TYPES or cc in BEAM_TYPES or cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES):
-                expanded.update(conn)
+                self._expanded.update(conn)
         parent: "OrderedDict[int, int]" = OrderedDict()     # BEAM: dependent -> independent
         anchor: Dict[int, int] = {}                          # dependent -> id(its *MPC card)
 
@@ -6766,48 +6919,586 @@ class Converter:
                                  f"commented out.")
                 elif typ != "LINK":
                     self._mpc_plan[key] = (typ.lower(), pairs)
-                elif any(vnorm(vsub(self.geom.nodes[a], self.geom.nodes[c])) == 0.0
-                         for a, c in pairs):
-                    self._mpc_plan[key] = ("skip", "*MPC LINK between coincident nodes has no "
-                                                   "direction to keep a distance along; commented "
-                                                   "out — the constraint is missing.")
-                elif not nl_any:
-                    self._mpc_plan[key] = ("link-eq", pairs)
-                    self.report.note("*MPC LINK in a deck without NLGEOM -> its linearised "
-                                     "*EQUATION (the distance constraint at the initial geometry, "
-                                     "as in an Abaqus small-displacement analysis; exact).",
-                                     once=True)
-                elif any(n in expanded for p in pairs for n in p):
-                    self._mpc_plan[key] = ("skip", "*MPC LINK under NLGEOM on a node of a beam, "
-                                           "truss, shell, membrane or plane element: ccx's "
-                                           "distance MPC (*MPC BEAM) rejects such nodes ('*ERROR "
-                                           "in gen3dmpc: nodes belonging to 1D/2D elements must not "
-                                           "be subject to a BEAM MPC') and a linear *EQUATION is "
-                                           "exact for small rotations only; commented out — the "
-                                           "constraint is missing.")
-                elif not nl_all and not self._approx:
-                    self._mpc_plan[key] = ("skip", "*MPC LINK in a deck whose first step is "
-                                           "linear and a later one NLGEOM: Abaqus linearises the "
-                                           "link in the small-displacement step, while ccx's "
-                                           "distance MPC (*MPC BEAM) runs every step geometrically "
-                                           "nonlinear; commented out — rerun with --approximate to "
-                                           "use *MPC BEAM in all steps.")
                 else:
-                    self._mpc_plan[key] = ("link-mpc", pairs)
-                    if nl_all:
-                        self.report.note("*MPC LINK under NLGEOM -> ccx *MPC BEAM, which keeps the "
-                                         "distance between the two nodes (exact).", once=True)
-                    else:
-                        self.report.warn("[APPROX] *MPC LINK -> ccx *MPC BEAM in a deck whose "
-                                         "first step is linear: ccx runs every step geometrically "
-                                         "nonlinear with it, where Abaqus linearises the link in the "
-                                         "small-displacement steps.", once=True)
+                    self._mpc_plan[key] = self._link_mode(pairs, "*MPC LINK")
+        # rigid connectors (BEAM, WELD; see _plan_connectors) are the same rigid link with no
+        # preferred direction: node b joins node a's body, or a joins b's, or b's chain is
+        # first re-rooted at b (reversing a rigid link changes nothing)
+        for a, c, sec in self._conn_beam:
+            if root(a) == root(c):
+                self.report.note("A rigid connector (BEAM / WELD) joins two nodes that already "
+                                 "move as one rigid body; it adds nothing and is left out.",
+                                 once=True)
+                continue
+            if c in parent and a not in parent:
+                a, c = c, a
+            if c in parent:
+                path = [c]
+                while path[-1] in parent:
+                    path.append(parent[path[-1]])
+                del parent[c], anchor[c]
+                for i in range(len(path) - 1, 0, -1):
+                    parent[path[i]] = path[i - 1]
+                    anchor.setdefault(path[i], sec)
+            parent[c] = a
+            anchor[c] = sec
         groups: "OrderedDict[int, List[int]]" = OrderedDict()
         for dep in parent:                     # deck order, so a body's first member is its
             groups.setdefault(root(dep), []).append(dep)        # first line
         for ref, members in groups.items():
             self._mpc_bodies.setdefault(anchor[members[0]], []).append(
                 {"ref": ref, "members": members, "rot": None})
+
+    def _link_mode(self, pairs: Sequence[Tuple[int, int]], what: str) -> Tuple[str, object]:
+        """How a constant-distance constraint between node pairs (dependent, independent) —
+        Abaqus *MPC LINK or a LINK connector — is written: ("link-eq", pairs), its
+        linearised *EQUATION, when no step runs NLGEOM; ("link-mpc", pairs), ccx's distance
+        MPC (*MPC BEAM), under NLGEOM; or ("skip", why).  Uses the step facts of _plan_mpcs."""
+        if any(vnorm(vsub(self.geom.nodes[a], self.geom.nodes[c])) == 0.0 for a, c in pairs):
+            return ("skip", f"{what} between coincident nodes has no direction to keep a distance "
+                            f"along; commented out — the constraint is missing.")
+        if not self._nl_any:
+            self.report.note(f"{what} in a deck without NLGEOM -> its linearised *EQUATION (the "
+                             f"distance constraint at the initial geometry, as in an Abaqus "
+                             f"small-displacement analysis; exact).", once=True)
+            return ("link-eq", pairs)
+        if any(n in self._expanded for p in pairs for n in p):
+            return ("skip", f"{what} under NLGEOM on a node of a beam, truss, shell, membrane or "
+                            f"plane element: ccx's distance MPC (*MPC BEAM) rejects such nodes "
+                            f"('*ERROR in gen3dmpc: nodes belonging to 1D/2D elements must not be "
+                            f"subject to a BEAM MPC') and a linear *EQUATION is exact for small "
+                            f"rotations only; commented out — the constraint is missing.")
+        if not self._nl_all and not self._approx:
+            return ("skip", f"{what} in a deck whose first step is linear and a later one NLGEOM: "
+                            f"Abaqus linearises the link in the small-displacement step, while "
+                            f"ccx's distance MPC (*MPC BEAM) runs every step geometrically "
+                            f"nonlinear; commented out — rerun with --approximate to use *MPC BEAM "
+                            f"in all steps.")
+        if self._nl_all:
+            self.report.note(f"{what} under NLGEOM -> ccx *MPC BEAM, which keeps the distance "
+                             f"between the two nodes (exact).", once=True)
+        else:
+            self.report.warn(f"[APPROX] {what} -> ccx *MPC BEAM in a deck whose first step is "
+                             f"linear: ccx runs every step geometrically nonlinear with it, where "
+                             f"Abaqus linearises the link in the small-displacement steps.",
+                             once=True)
+        return ("link-mpc", pairs)
+
+    # -- connector elements (CONN3D2 / CONN2D2) ------------------------------------
+    def _conn_axes(self, name: str) -> Optional[Tuple[Vec, Vec, Vec]]:
+        """Unit local directions (e1, e2, e3) of the rectangular *ORIENTATION ``name``, its
+        additional rotation applied, or None."""
+        key = name.strip().strip('"').upper()
+        hit = next((k for k in self.orientations if k.strip('"') == key), None)
+        if hit is None:
+            return None
+        a, bvec, system = self.orientations[hit]
+        e1, e3 = vunit(a), vunit(vcross(a, bvec))
+        if not system.upper().startswith("RECT") or vnorm(e1) < 0.5 or vnorm(e3) < 0.5:
+            return None
+        axes = [e1, vcross(e3, e1), e3]
+        rot = self._orient_rotation.get(hit)
+        if rot and rot[0] in (1, 2, 3) and rot[1]:
+            k = rot[0] - 1
+            axes = [v if i == k else rotate_about_axis(v, (0.0, 0.0, 0.0), axes[k], rot[1])
+                    for i, v in enumerate(axes)]
+        return axes[0], axes[1], axes[2]
+
+    def _plan_connectors(self, blocks: List[Block]) -> None:
+        """Connector elements, part 1 of their plan: before _plan_mpcs, whose rigid bodies the
+        rigid connectors join (part 2 is _plan_connector_rows).  ccx has no connector
+        element, but without a *CONNECTOR BEHAVIOR a connector is just the kinematic
+        constraint of its connection type, which ccx holds exactly:
+
+        * JOIN: node b keeps its initial position in node a's local system, which turns with
+          node a when node a has rotations (else fixed directions; Abaqus): u_b - u_a -
+          theta_a x d = 0 with d = x_b - x_a at the start, linearised;
+        * REVOLUTE: relative rotation about node a's local 1-direction e1 only, i.e.
+          (theta_b - theta_a) parallel to e1: two equations, linear in the rotation vectors
+          ccx solves for — exact for small rotations, and at any rotation when one side
+          cannot turn (the axis then stays put).  HINGE = JOIN + REVOLUTE;
+        * ALIGN: theta_b = theta_a;
+        * BEAM, and WELD (JOIN + ALIGN, the same rigid link): node b moves rigidly with
+          node a — a rigid body through the *MPC BEAM plan, exact at any rotation;
+        * LINK: as *MPC LINK;  CARTESIAN, CARDAN, ...: no constraint, nothing to transmit.
+
+        This part reads each *CONNECTOR SECTION (connection type, node a's local directions,
+        each element's initial offset) and gives every element a route: "rows" (constraint
+        equations, built in part 2), "beam" (rigid body), "link", "free" (no constraint) or
+        "skip" (commented out, with the reason).  Shell/beam nodes whose rotations the rows
+        use become knots (_plan_rigid_couplings): ccx ignores DOFs 4-6 of a plain shell/beam
+        node in an *EQUATION."""
+        self._conn_plan = {}
+        self._conn_beam = []
+        self._conn_knots = []
+        if not self._conn:
+            return
+        quiet = Report()
+        rotn: set = set()                       # shell/beam nodes: rotations of their own
+        for typ, conn in self.geom.elements.values():
+            cc = ccx_element_type(typ, quiet)
+            if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
+                rotn.update(conn)
+        segs = self._bc_segments(blocks)
+        held: Optional[set] = None              # (node, DOF) held at zero in every step
+        for active in bc_steps(segs):
+            now = {k for k, z in active.items() if z}
+            held = now if held is None else held & now
+        self._conn_held = held or set()
+        self._conn_bc_dofs = {k for seg in segs for _, k, _ in seg}
+        # nodes whose rotation is loaded or prescribed (not just held at zero)
+        turned = {n for seg in segs for _, (n, d), _ in seg
+                  if 4 <= d <= 6 and (n, d) not in self._conn_held}
+        for b in blocks:
+            if b.keyword == "CLOAD":
+                for rec in merged_data_records(b):
+                    if len(rec) > 1 and re.fullmatch(r"[456]", rec[1].strip()):
+                        turned.update(self._resolve_nodes(rec[0].strip()))
+        self._conn_turned = turned
+        # rotations that exist apart from the connectors: reference / rotation nodes of
+        # rigid constraints and the nodes of *MPC BEAM lines
+        refs: set = set()
+        for b in blocks:
+            if b.keyword in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
+                for k, v in b.params.items():
+                    if k.replace(" ", "") in ("REFNODE", "ROTNODE") and v:
+                        refs.update(self._resolve_nodes(v.strip())[:1])
+            elif b.keyword == "MPC" and not b.has("USER"):
+                for f in self._mpc_fields(b):
+                    if f[0].upper() == "BEAM":
+                        refs.update(n for tok in f[1:3] for n in self._mpc_nodes(tok))
+        # behaviours that define anything (sub-options follow *CONNECTOR BEHAVIOR)
+        rich: set = set()
+        cur = None
+        for b in blocks:
+            if b.keyword == "CONNECTOR BEHAVIOR":
+                cur = (b.param("NAME") or "").strip().upper()
+            elif cur is not None and b.keyword.startswith("CONNECTOR ") and \
+                    b.keyword != "CONNECTOR SECTION":
+                rich.add(cur)
+            else:
+                cur = None
+        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
+        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        items: List[Tuple[dict, int]] = []
+        planned: set = set()
+        for b in blocks:
+            if b.keyword != "CONNECTOR SECTION":
+                continue
+            elset = (b.param("ELSET") or "").strip()
+            sec: dict = {"items": [], "reason": None}
+            self._conn_plan[id(b)] = sec
+            eids = [e for e in dedup(self.geom.elset(elset)) if e in self._conn]
+            if not eids:
+                sec["reason"] = (f"*CONNECTOR SECTION on ELSET={elset}, which holds no connector "
+                                 f"element (CONN3D2 / CONN2D2); commented out.")
+                continue
+            recs = merged_data_records(b)
+            words = [x.strip().upper() for x in (recs[0] if recs else []) if x.strip()]
+            oris = [x.strip() for x in recs[1]] if len(recs) > 1 else []
+            label = "/".join(words) or "(none)"
+            if len(words) == 1 and words[0] in CONN_ASSEMBLED:
+                trans, rot = CONN_ASSEMBLED[words[0]]
+            elif words == ["BEAM"]:
+                trans = rot = "BEAM"
+            else:
+                trans = next((w for w in words if w in CONN_TRANSLATIONAL), None)
+                rot = next((w for w in words if w in CONN_ROTATIONAL), None)
+                if not words or len(words) != (trans is not None) + (rot is not None):
+                    trans = rot = "?"
+            t = None if trans in CONN_UNCONSTRAINED else trans
+            r = None if rot in CONN_UNCONSTRAINED else rot
+            beh = (b.param("BEHAVIOR") or "").strip().upper()
+            why = None
+            if trans == "?":
+                kind, why = "skip", (f"*CONNECTOR SECTION: connection type {label} is not an Abaqus "
+                                     f"connection type the converter knows; commented out — the "
+                                     f"connector is missing.")
+            elif beh in rich:
+                kind, why = "skip", ("*CONNECTOR SECTION with a *CONNECTOR BEHAVIOR (elasticity, "
+                                     "damping, stops, locks, friction, ...): ccx has no connector "
+                                     "element to carry it; commented out — the connector is "
+                                     "missing.")
+            elif not mechanical:
+                kind = "free"
+                self.report.note("Connector elements left out: a heat-transfer-only deck has no "
+                                 "displacements for them to constrain.", once=True)
+            elif (t, r) in (("BEAM", "BEAM"), ("JOIN", "ALIGN")):
+                kind = "rigid"
+            elif t is None and r is None:
+                kind = "free"
+                self.report.note(f"Connector of type {label}: it constrains no relative motion "
+                                 f"and has no behaviour, so it transmits nothing — left out.",
+                                 once=True)
+            elif t in (None, "JOIN") and r in (None, "REVOLUTE", "ALIGN"):
+                kind = "rows"
+            elif t == "LINK" and r is None:
+                kind = "link"
+            else:
+                kind, why = "skip", (f"*CONNECTOR SECTION: connection type {label} is not converted "
+                                     f"(the converter writes JOIN, REVOLUTE, ALIGN, HINGE, WELD, "
+                                     f"BEAM, LINK and the unconstrained types); commented out — "
+                                     f"the connector is missing.")
+            if beh and beh not in rich:
+                self.report.note(f"*CONNECTOR SECTION, BEHAVIOR={beh}: the behaviour defines nothing "
+                                 f"and is ignored.", once=True)
+            for e in eids:
+                if e in planned:
+                    self.report.warn("A connector element belongs to more than one *CONNECTOR "
+                                     "SECTION; the first one is used.", once=True)
+                    continue
+                planned.add(e)
+                typ, na, nb = self._conn[e]
+                it = {"eid": e, "a": na, "b": nb, "dim": 2 if typ == "CONN2D2" else 3,
+                      "route": kind, "reason": why, "trans": t, "rot": r, "d": (0.0, 0.0, 0.0)}
+                sec["items"].append(it)
+                if kind in ("skip", "free"):
+                    continue
+                if any(n is not None and n not in self.geom.nodes for n in (na, nb)) or na == nb:
+                    it["route"], it["reason"] = "skip", ("Connector element on an undefined node, "
+                                                         "or with the same node twice; commented "
+                                                         "out — the connector is missing.")
+                    continue
+                if na is not None and nb is not None:
+                    it["d"] = vsub(self.geom.nodes[nb], self.geom.nodes[na])
+                if r == "REVOLUTE":
+                    axes = self._conn_axes(oris[0]) if oris and oris[0] else \
+                        ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+                    other = self._conn_axes(oris[1]) if len(oris) > 1 and oris[1] else axes
+                    if it["dim"] == 2:
+                        it["route"], it["reason"] = "skip", (f"*CONNECTOR SECTION: {label} on a "
+                                                             f"CONN2D2 element (REVOLUTE is a 3-D "
+                                                             f"connection type); commented out.")
+                    elif axes is None or other is None:
+                        it["route"], it["reason"] = "skip", (
+                            "*CONNECTOR SECTION: the local directions of a REVOLUTE / HINGE "
+                            "connector (its *ORIENTATION) are missing or not rectangular "
+                            "coordinates the converter reads; commented out — the connector "
+                            "is missing.")
+                    elif abs(vdot(axes[0], other[0])) < 1.0 - 1e-6:
+                        it["route"], it["reason"] = "skip", (
+                            "*CONNECTOR SECTION: a REVOLUTE / HINGE connector whose node b has "
+                            "a local 1-direction other than node a's at the start (Abaqus then "
+                            "holds that misalignment) is not converted; commented out.")
+                    else:
+                        it["e1"] = axes[0]
+                items.append((it, id(b)))
+        if not items:
+            return
+        # nodes whose rotation more than one connector uses
+        uses: Dict[int, int] = {}
+        for it, _ in items:
+            if it["route"] in ("rows", "rigid") and it["rot"] is not None:
+                for n in (it["a"], it["b"]):
+                    if n is not None:
+                        uses[n] = uses.get(n, 0) + 1
+
+        def turns(n: Optional[int]) -> bool:
+            return n is not None and (n in rotn or n in refs or n in turned or uses.get(n, 0) > 1)
+
+        def free_rotation(n: Optional[int], dim: int) -> bool:
+            dofs = (6,) if dim == 2 else (4, 5, 6)
+            return n is not None and not all((n, d) in self._conn_held for d in dofs)
+        for it, sec_id in items:
+            a, b, dim = it["a"], it["b"], it["dim"]
+            if it["route"] == "rigid":
+                if a is None or b is None or not (turns(a) or turns(b)):
+                    # to ground, or between nodes without rotations of their own: JOIN rows
+                    # (the ALIGN part only fixes connector-only rotations), or, offset, a link
+                    if a is not None and b is not None and vnorm(it["d"]) > 0.0:
+                        it["route"] = "link"
+                    else:
+                        it["route"], it["trans"], it["rot"] = "rows", "JOIN", "ALIGN"
+                else:
+                    it["route"] = "beam"
+                    self._conn_beam.append((a, b, sec_id))
+                    continue
+            if it["route"] == "link" and (a is None or b is None):
+                it["route"], it["reason"] = "skip", ("Connector LINK to ground has no length to "
+                                                     "keep (Abaqus puts the ground point at the "
+                                                     "other node); commented out.")
+            if it["route"] != "rows" or explicit:   # (explicit dynamics: no equations on knots)
+                continue
+            ends = [a, b] if it["rot"] is not None else \
+                [a] if vnorm(it["d"]) > 0.0 else []
+            self._conn_knots += [n for n in ends if n in rotn and free_rotation(n, dim)]
+
+    def _kinematic_refs(self, blocks: List[Block]) -> set:
+        """Reference nodes of kinematic couplings that couple translations, where ccx carries
+        the coupling's rotation on the node's own DOFs 4-6 (BCs and moments there act on it,
+        and an *EQUATION can use them as independent terms — ccx eliminates them itself);
+        not a shell/beam reference node, whose coupling becomes a *RIGID BODY."""
+        refs: set = set()
+        for i, b in enumerate(blocks):
+            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            if ref is None or ref in self._rot_nodes:
+                continue
+            if b.keyword == "COUPLING" and i + 1 < len(blocks) and \
+                    blocks[i + 1].keyword == "KINEMATIC" and \
+                    self._kinematic_dofs(blocks[i + 1]) & {1, 2, 3}:
+                refs.add(ref)
+            elif b.keyword == "KINEMATIC COUPLING":
+                for rec in merged_data_records(b):
+                    f = [x for x in rec if x != ""]
+                    try:
+                        if f and (len(f) < 2 or min(pint(x) for x in f[1:3]) <= 3):
+                            refs.add(ref)
+                    except ValueError:
+                        pass
+        return refs
+
+    def _plan_connector_rows(self, blocks: List[Block]) -> None:
+        """Connector elements, part 2 of their plan (after the rigid bodies and knots): the
+        LINK routes, and the constraint equations of the "rows" route, as *BOUNDARY lines
+        and *EQUATIONs on the ccx DOFs:
+
+        * rows in node DOFs: translations 1-3 and the rotation vector 4-6 (DOF 6 alone in
+          2-D) of nodes a and b; a grounded node has none;
+        * a DOF held at zero in every step (its BC) drops out of the rows;
+        * a rotation lives where ccx has it: on the ROT NODE of a reference point (DOFs
+          1-3), on a knotted shell/beam node itself, on DOFs 4-6 of a kinematic coupling's
+          reference node, on the body of a rigid-body member — or, for a node with no
+          rotation of its own (solid, plane or free node), on a new rotation node when the
+          rotation shows elsewhere (another connector, a moment, a prescribed rotation);
+          otherwise it is a connector-only unknown that Abaqus adds and nothing else
+          touches, and it is eliminated from the rows (what is left is what it constrains);
+        * a row left with one DOF holds it at zero (a *BOUNDARY in every step); the others
+          become *EQUATIONs.
+
+        Under NLGEOM (or explicit dynamics) the linear rows are exact only as boundary
+        conditions, as equations among the rotation components of one rotation node (a
+        revolute whose other side cannot turn: the axis stays put), or as equations among
+        the translations of plain nodes (a plain node may also follow a reference point's
+        translations: no MPC of ccx's own eliminates either, probed).  ccx 2.23 also solves *EQUATIONs that link two
+        rigid bodies' reference / rotation DOFs inaccurately under NLGEOM (probed), so the
+        rest is commented out, or written with an [APPROX] warning under --approximate."""
+        items = [it for sec in self._conn_plan.values() for it in sec["items"]]
+        for it in items:
+            if it["route"] == "link":
+                mode, arg = self._link_mode([(it["b"], it["a"])], "Connector LINK")
+                if mode == "skip":
+                    it["route"], it["reason"] = "skip", arg
+                else:
+                    it["link"] = mode
+        rows_items = [it for it in items if it["route"] == "rows"]
+        if not rows_items:
+            return
+        kin = self._kinematic_refs(blocks)
+        # a rigid body's member turns with the body (*RIGID BODY: its TIE members)
+        body_of = {m: body for bodies in self._mpc_bodies.values() for body in bodies
+                   for m in body["members"]}
+        for b in blocks:
+            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "") \
+                if b.keyword == "RIGID BODY" else None
+            if ref is not None:
+                for m in self._rigid_body_members(b)[0]:
+                    if m != ref:
+                        body_of.setdefault(m, {"ref": ref})
+
+        def carrier(n: int) -> Optional[Tuple[int, int]]:
+            """(node, its DOF that carries rotation component 1) of node n's rotation."""
+            for _ in range(len(body_of) + 1):
+                if n in kin:
+                    return (n, 4)
+                if n in self._rb_rot:
+                    return (self._rb_rot[n], 1)
+                if n in self._rot_nodes and n in self._knots:
+                    return (n, 4)
+                if n not in body_of:
+                    return None
+                n = body_of[n]["ref"]
+            return None
+        busy = {(m, d) for _, members, dofs in self._rigid_members(blocks)
+                for m in members for d in dofs}
+        nonplain = {n for n, _ in busy} | self._ref_nodes | set(self._rb_rot.values()) | \
+            set(self._knots) | kin
+        held = self._conn_held
+        skew = lambda d: ((0.0, -d[2], d[1]), (d[2], 0.0, -d[0]), (-d[1], d[0], 0.0))  # noqa: E731
+
+        def rows_of(it: dict, a_turns: bool) -> List[Dict[Tuple[int, int], float]]:
+            a, b, d, dim = it["a"], it["b"], it["d"], it["dim"]
+            rows: List[Dict[Tuple[int, int], float]] = []
+            if it["rot"] == "REVOLUTE" and vnorm(vcross(it["e1"], d)) <= 1e-9 * vnorm(d) and \
+                    (b is None or all((b, g) in held for g in (4, 5, 6))):
+                a_turns = False      # node a then turns about e1 only, which leaves d in place
+            if it["trans"] == "JOIN":                 # u_b - u_a - theta_a x d = 0
+                for k in ((1, 2) if dim == 2 else (1, 2, 3)):
+                    row: Dict[Tuple[int, int], float] = {}
+                    if b is not None:
+                        row[(b, k)] = 1.0
+                    if a is not None:
+                        row[(a, k)] = -1.0
+                        if a_turns and dim == 2:
+                            row[(a, 6)] = d[1] if k == 1 else -d[0]
+                        elif a_turns:
+                            row.update(((a, 3 + m), skew(d)[k - 1][m - 1]) for m in (1, 2, 3))
+                    rows.append(row)
+            if it["rot"] == "ALIGN":                  # theta_b = theta_a
+                for g in ((6,) if dim == 2 else (4, 5, 6)):
+                    rows.append({**({(b, g): 1.0} if b is not None else {}),
+                                 **({(a, g): -1.0} if a is not None else {})})
+            elif it["rot"] == "REVOLUTE":             # (theta_b - theta_a) parallel to e1
+                e1 = it["e1"]
+                p = max(range(3), key=lambda k: abs(e1[k]))
+                for i in (k for k in range(3) if k != p):
+                    c = e1[i] / e1[p]
+                    row = {}
+                    if b is not None:
+                        row.update({(b, 4 + i): 1.0, (b, 4 + p): -c})
+                    if a is not None:
+                        row.update({(a, 4 + i): -1.0, (a, 4 + p): c})
+                    rows.append(row)
+            return [{k: v for k, v in rw.items() if abs(v) > 1e-14 and k not in held}
+                    for rw in rows]
+        # rotations that show beyond one connector get a rotation node of their own
+        uses: Dict[int, int] = {}
+        for it in rows_items:
+            if it["rot"] is None:
+                continue
+            for n in {k[0] for rw in rows_of(it, True) for k in rw if k[1] >= 4}:
+                uses[n] = uses.get(n, 0) + 1
+        for it in rows_items:                 # a JOIN offset turns with rotations node a has
+            a = it["a"]
+            if it["rot"] is None and a in uses and \
+                    any(k[0] == a and k[1] >= 4 for rw in rows_of(it, True) for k in rw):
+                uses[a] += 1
+        synth = sorted(n for n, c in uses.items() if carrier(n) is None and
+                       n not in self._rot_nodes and (c > 1 or n in self._conn_turned))
+        next_id = max(self.geom.nodes, default=0)
+        for n in synth:
+            next_id += 1
+            self.geom.add_node(next_id, self.geom.nodes[n])
+            self._rb_rot[n] = next_id
+            self._ref_nodes.add(n)
+        if synth:
+            self.report.note(f"Connector rotations on {len(synth)} node(s) without rotations of "
+                             f"their own (solid, plane or free nodes) live on new rotation nodes "
+                             f"(DOFs 1-3 = the rotation vector, as a *RIGID BODY's ROT NODE); "
+                             f"BCs and moments on DOFs 4-6 of those nodes are moved there.")
+        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        nl = self._nl_any or explicit
+        carriers = set(self._rb_rot.values())          # rotation nodes (DOFs 1-3 turn)
+        synth_nodes = {self._rb_rot[n] for n in synth}
+
+        def turning(n: int, d: int) -> bool:
+            return d >= 4 or n in carriers
+
+        def plain(n: int, d: int) -> bool:
+            """A translation no ccx MPC of its own touches."""
+            return not turning(n, d) and n not in nonplain
+        for it in rows_items:
+            a = it["a"]
+            a_turns = it["rot"] is not None or (a is not None and (carrier(a) is not None or
+                                                                   a in self._rot_nodes))
+            rows = [rw for rw in rows_of(it, a_turns) if rw]
+            if any(k[1] >= 4 and k[0] in self._rot_nodes and carrier(k[0]) is None
+                   for rw in rows for k in rw):
+                # a shell/beam node's rotation without a knot (explicit dynamics, where the
+                # converter makes none): ccx would ignore it in an *EQUATION
+                it["route"], it["reason"] = "skip", (
+                    "Connector on the rotation of a shell/beam node in a deck with explicit "
+                    "dynamics: ccx ignores DOFs 4-6 of a plain shell/beam node in an *EQUATION, "
+                    "and its explicit solver stops on the knot that would give the node real "
+                    "rotations; commented out — the connector is missing.")
+                continue
+            # eliminate connector-only rotations: the rows that fix them say nothing else
+            for col in sorted({k for rw in rows for k in rw if k[1] >= 4 and carrier(k[0]) is None}):
+                with_col = [rw for rw in rows if col in rw]
+                if not with_col:
+                    continue
+                piv = max(with_col, key=lambda rw: abs(rw[col]))
+                rows.remove(piv)
+                for rw in rows:
+                    if col in rw:
+                        f = rw[col] / piv[col]
+                        for k, v in piv.items():
+                            rw[k] = rw.get(k, 0.0) - f * v
+                for i, rw in enumerate(rows):
+                    big = max([abs(v) for v in rw.values()] or [0.0])
+                    rows[i] = {k: v for k, v in rw.items() if abs(v) > 1e-12 * big}
+                rows = [rw for rw in rows if rw]
+            # a one-DOF row holds that DOF at zero; it drops out of the others
+            zero: List[Tuple[int, int]] = []
+            while True:
+                singles = [next(iter(rw)) for rw in rows if len(rw) == 1]
+                if not singles:
+                    break
+                zero += [k for k in singles if k not in zero]
+                rows = [{k: v for k, v in rw.items() if k not in zero} for rw in rows]
+                rows = [rw for rw in rows if rw]
+
+            def dof(k: Tuple[int, int]) -> Tuple[int, int]:
+                if k[1] <= 3:
+                    return k
+                c = carrier(k[0])
+                return (c[0], c[1] + k[1] - 4)
+            bcs = dedup([dof(k) for k in zero])
+            eqs: List[List[Tuple[int, int, float]]] = []
+            for rw in rows:
+                terms: "OrderedDict[Tuple[int, int], float]" = OrderedDict()
+                for k, v in rw.items():
+                    terms[dof(k)] = terms.get(dof(k), 0.0) + v
+                big = max([abs(v) for v in terms.values()] or [0.0])
+                terms = OrderedDict((k, v) for k, v in terms.items() if abs(v) > 1e-12 * big)
+                if len(terms) == 1:
+                    bcs += [k for k in terms if k not in bcs]
+                elif terms:
+                    # eliminated (first) term: a DOF no other constraint takes, node b's
+                    # (listed first) unless its coefficient is small
+                    free = [k for k in terms if k not in busy and not (k[0] in kin and k[1] >= 4)]
+                    if not free:
+                        it["route"], it["reason"] = "skip", (
+                            "Connector constraint whose DOFs are all eliminated by other "
+                            "constraints (rigid-body members, a kinematic coupling's reference "
+                            "rotation); commented out — the connector is missing.")
+                        break
+                    top = max(abs(terms[k]) for k in free)
+                    big = [k for k in free if abs(terms[k]) >= 0.1 * top]
+                    # a plain node's translation without a BC first (no ccx MPC touches it)
+                    first = next((k for k in big if plain(*k) and k not in self._conn_bc_dofs),
+                                 big[0])
+                    eqs.append([(first[0], first[1], terms[first])] +
+                               [(k[0], k[1], v) for k, v in terms.items() if k != first])
+            if it["route"] != "rows":
+                continue
+            if any(k in busy for k in bcs):
+                it["route"], it["reason"] = "skip", (
+                    "Connector that would hold a translation of a rigid-body member at zero "
+                    "(ccx eliminates those, a boundary condition on one stops ccx); commented "
+                    "out — the connector is missing.")
+                continue
+            if nl:
+                def exact(eq: List[Tuple[int, int, float]]) -> bool:
+                    if all(plain(n, d) for n, d, _ in eq):
+                        return True                   # translations of plain nodes
+                    nodes = {n for n, _, _ in eq}
+                    # the rotation components of one rotation node (the axis of a revolute
+                    # whose other side cannot turn stays put)
+                    one = len(nodes) == 1 and all(turning(n, d) for n, d, _ in eq)
+                    if explicit:                      # (and no MPC of ccx's own: it stops)
+                        return one and nodes <= synth_nodes
+                    # translations only, eliminated on a plain node's DOF that no BC takes,
+                    # the other terms a reference point's own translations (no MPC eliminates
+                    # those): no linear-nonlinear MPC cascade in ccx, exact (probed)
+                    tied = plain(*eq[0][:2]) and eq[0][:2] not in self._conn_bc_dofs and all(
+                        plain(n, d) or (d <= 3 and n in self._ref_nodes and n not in carriers
+                                        and (n, d) not in busy) for n, d, _ in eq[1:])
+                    return one or tied
+                if not all(exact(eq) for eq in eqs):
+                    if self._approx and not explicit:
+                        it["approx"] = True
+                    else:
+                        it["route"], it["reason"] = "skip", (
+                            "Connector under NLGEOM (or explicit dynamics) whose constraint is "
+                            "exact in ccx only for small rotations: its rotation equations link "
+                            "two moving nodes (or a joint offset turns with node a), and ccx "
+                            "2.23 also solves *EQUATIONs that link rigid bodies' reference / "
+                            "rotation DOFs inaccurately under NLGEOM (probed); commented out — "
+                            "rerun with --approximate to write the linear form (not with "
+                            "explicit dynamics, which stops on it).")
+                        continue
+            it["bcs"], it["eqs"] = bcs, eqs
 
     # -- rigid couplings on shell / beam nodes ---------------------------------
     def _plan_rigid_couplings(self, blocks: List[Block]) -> None:
@@ -6890,18 +7581,28 @@ class Converter:
                     self._coupling_plan[id(b)] = {"kind": "unsupported"}
                 else:
                     knots += [n for n in members if n in structural]
-        # the rigid bodies of *MPC BEAM lines, like a *RIGID BODY with TIE members; an *MPC
-        # TIE ties the rotations of two shell/beam nodes, which only works between knots
+        # the rigid bodies of *MPC BEAM lines (and rigid connectors), like a *RIGID BODY with
+        # TIE members; an *MPC TIE ties the rotations of two shell/beam nodes, which only
+        # works between knots.  A body on a kinematic coupling's reference node turns with
+        # the coupling: its ROT NODE follows the node's DOFs 4-6, where ccx carries the
+        # coupling's rotation (and BCs and moments stay there)
+        kin = self._kinematic_refs(blocks)
         for bodies in self._mpc_bodies.values():
             for body in bodies:
                 ref, members = body["ref"], body["members"]
                 knots += [n for n in [ref] + members if n in structural]
                 if ref in self._rot_nodes and any(n in structural for n in [ref] + members):
                     self._rb_rot.pop(ref, None)
+                elif ref in kin:
+                    self._rb_rot.pop(ref, None)
+                    body["follow"] = True
         for mode, arg in self._mpc_plan.values():
             if mode == "tie":
                 knots += [n for p in arg if all(x in self._rot_nodes for x in p) for n in p]
-        knots = [n for n in dedup(knots) if n in self.geom.nodes]
+        rigid = set(knots)
+        # shell/beam nodes whose rotations a connector constrains (see _plan_connectors)
+        conn = [n for n in dedup(self._conn_knots) if n not in rigid and n in self._rot_nodes]
+        knots = [n for n in dedup(knots + conn) if n in self.geom.nodes]
         if not knots:
             return
         # a heat-transfer-only deck makes thermal knots without rotations ('*ERROR in gen3dmpc:
@@ -6914,13 +7615,19 @@ class Converter:
                              "depend on each other', probed on 2.23 with and without the knot "
                              "beams); only the implicit steps can run it.", once=True)
         self._add_knot_beams(knots, blocks)
-        self.report.note(f"Rigid coupling on shell/beam nodes: ccx builds *KINEMATIC / *RIGID BODY "
-                         f"from RIGID MPCs, which ccx 2.23 (FreeCAD 1.1 build) rejects on a shell/"
-                         f"beam node unless ccx made it a knot ('*ERROR in gen3dmpc: ... RIGID "
-                         f"MPC'). Each of the {len(knots)} such node(s) got a force-free knot beam "
-                         f"(a B31 to a new free node, elset/material {KNOT_SET}, no density), "
-                         f"which makes it a knot; the rotations Abaqus couples are tied to the "
-                         f"reference rotation with *EQUATION.")
+        if len(knots) > len(conn):
+            self.report.note(f"Rigid coupling on shell/beam nodes: ccx builds *KINEMATIC / *RIGID "
+                             f"BODY from RIGID MPCs, which ccx 2.23 (FreeCAD 1.1 build) rejects on a "
+                             f"shell/beam node unless ccx made it a knot ('*ERROR in gen3dmpc: ... "
+                             f"RIGID MPC'). Each of the {len(knots) - len(conn)} such node(s) got a "
+                             f"force-free knot beam (a B31 to a new free node, elset/material "
+                             f"{KNOT_SET}, no density), which makes it a knot; the rotations Abaqus "
+                             f"couples are tied to the reference rotation with *EQUATION.")
+        if conn:
+            self.report.note(f"Connectors on shell/beam nodes: ccx ignores DOFs 4-6 of a plain "
+                             f"shell/beam node in an *EQUATION, so the {len(conn)} node(s) whose "
+                             f"rotations a connector constrains got force-free knot beams too "
+                             f"(elset/material {KNOT_SET}), which give them real rotations.")
 
     def _add_knot_beams(self, nodes: Sequence[int], blocks: List[Block]) -> None:
         """Give each of ``nodes`` a force-free *knot beam*: a B31 from the node to a new free
@@ -6964,7 +7671,7 @@ class Converter:
                 self._knot_k = max([k for k in ks if k > 0] or [1.0])
         d = vunit((1.0, 1.0, 1.0))
         nid = max(self.geom.nodes)
-        eid = max(list(self.geom.elements) + list(self._carriers), default=0)
+        eid = max(list(self.geom.elements) + list(self._carriers) + list(self._conn), default=0)
         elems = []
         for n in nodes:
             nid += 1
@@ -7340,6 +8047,22 @@ class Converter:
                     e = st[(members[d][0], d)]
                     end[d] = end[d] or (e[1] == 0.0 and (e[3] == "disp" or z0[d]))
             z0 = end
+
+    def _bc_segments(self, blocks: List[Block]) -> List[List[Tuple[bool, Tuple[int, int], bool]]]:
+        """The source deck's *BOUNDARY entries for bc_steps: (OP=NEW, (node, DOF), zero value)
+        of the model data and of each step.  A named BC counts its rotations too (it fixes
+        them wherever the node has rotations, also ones a connector gives it)."""
+        segs: List[List[Tuple[bool, Tuple[int, int], bool]]] = [[]]
+        for b in blocks:
+            if b.keyword == "STEP":
+                segs.append([])
+            elif b.keyword == "BOUNDARY":
+                new = (b.param("OP") or "").strip().upper() == "NEW"
+                typed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
+                    b.has("FIXED") or b.has("USER")
+                for ns, dofs, mag in self._bc_records(b, True):
+                    segs[-1] += [(new, (n, d), not typed and mag == 0.0) for n in ns for d in dofs]
+        return segs
 
     def _bc_implied(self, c: dict, m: int, d: int, s: int) -> bool:
         """Do the reference node's own BCs in step ``s`` impose the BC member ``m`` has on DOF
@@ -8823,7 +9546,8 @@ def dedup_str(seq: Sequence[str]) -> List[str]:
 
 PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
                      "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION",
-                     "SPRING", "DASHPOT", "MASS", "GAP", "ORIENTATION", "DISTRIBUTION", "SURFACE"}
+                     "SPRING", "DASHPOT", "MASS", "GAP", "ORIENTATION", "DISTRIBUTION", "SURFACE",
+                     "CONNECTOR SECTION"}
 # Part-level constraint cards that reference the part's own nodes/elements/sets: each
 # instance needs its own copy with offset ids and prefixed names (emitted once, raw,
 # they would constrain only one instance — or the wrong nodes after renumbering).
@@ -9153,6 +9877,13 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             edata.extend(reflow([str(gid)] + [str(c + node_off) for c in conn], MAX_ENTRIES_PER_LINE))
             gmax_elem = max(gmax_elem, gid)
         out.append(mkblock("ELEMENT", [("TYPE", typ), ("ELSET", namer(inst["name"], "ALL"))], edata))
+    conns: "OrderedDict[str, List[str]]" = OrderedDict()      # part-level connector elements
+    for eid, (typ, a, c) in geo_conv._conn.items():
+        conns.setdefault(typ, []).append(", ".join(
+            [str(eid + elem_off)] + ["" if n is None else str(n + node_off) for n in (a, c)]))
+        gmax_elem = max(gmax_elem, eid + elem_off)
+    for typ, edata in conns.items():
+        out.append(mkblock("ELEMENT", [("TYPE", typ)], edata))
 
     for sname, ids in geo.nsets.items():
         out.append(set_block("NSET", namer(inst["name"], sname), [i + node_off for i in ids]))
@@ -9233,6 +9964,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             name = (b.param("NAME") or "").strip().upper()
             move = dist_move[name] if name in dist_move else (rotv if rot else None)
             out.append(_remap_distribution(b, prefix, namer, elem_off, move))
+        elif b.keyword == "CONNECTOR SECTION":
+            nb = _remap_named(b, prefix, ("ELSET",), namer)
+            if len(nb.data) > 1:                    # local orientations of nodes a and b
+                nb.data[1] = ", ".join(namer(prefix, x.strip()) if x.strip() else ""
+                                       for x in nb.data[1].split(","))
+            out.append(nb)
         elif b.keyword == "SURFACE":
             out.append(_remap_surface(b, prefix, namer, node_off, elem_off))
         elif b.keyword in PART_CONSTRAINT_KW:
@@ -9313,12 +10050,14 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
         # connectivity as instance-qualified node refs ("1, Part-1-1.5, Part-2-1.3");
         # resolve those to global node ids (the leading element id is plain numeric and
         # is left untouched) so the element registers instead of being skipped.  Types
-        # with NO ccx equivalent (CONN*, JOINTC, ...) are deliberately left unresolved:
+        # with NO ccx equivalent (COH*, JOINTC, ...) are deliberately left unresolved:
         # they then drop out via the non-numeric-connectivity skip, which keeps the rest
-        # of the deck solvable instead of feeding ccx a fatal unknown element.
+        # of the deck solvable instead of feeding ccx a fatal unknown element.  Connector
+        # elements are resolved: the converter writes them as constraints.
         if blk.keyword == "ELEMENT":
             etyp = (blk.param("TYPE") or "").upper()
-            if etyp.startswith(UNSUPPORTED_ELEM_PREFIXES) or etyp in ("JOINTC",):
+            if (etyp.startswith(UNSUPPORTED_ELEM_PREFIXES) and etyp not in CONN_TYPES) or \
+                    etyp in ("JOINTC",):
                 continue
             entity = "node"                       # connectivity references nodes
         elif blk.keyword == "SURFACE":            # members follow the surface's TYPE

@@ -67,7 +67,7 @@ itself is not the cause — it is verified identical to Abaqus.)
 
 * A `*SOLID SECTION`/`*SHELL SECTION` references a material that wasn't emitted —
   check the report for a commented-out material card.
-* The element type has no CalculiX equivalent (cohesive/gasket/connector/rigid). The
+* The element type has no CalculiX equivalent (cohesive/gasket/rigid). The
   report flags these; they must be remodelled (see below).
 * Abaqus surface elements (`SFM3D*`, `SFMAX*`) only get here when the converter kept them:
   normally they leave the mesh (no stiffness) and their loads become nodal forces, but
@@ -255,8 +255,11 @@ These are the silent ones — no error, wrong physics.
 The converter flags these and preserves the original as `**` comments; there is no
 automatic equivalent:
 
-* **Connectors / fasteners / joints** → rebuild with `*RIGID BODY`, `*MPC`, `*SPRING`,
-  `*DASHPOT` per the connector behaviour.
+* **Connectors with a behaviour, fasteners, joints** → rebuild with `*RIGID BODY`,
+  `*MPC`, `*SPRING`, `*DASHPOT` per the connector behaviour. (A connector *without* a
+  behaviour — `JOIN`, `HINGE`, `REVOLUTE`, `ALIGN`, `WELD`, `BEAM`, `LINK` — is converted
+  to its constraint; one under `NLGEOM` whose linear form is not exact there, e.g. a hinge
+  between two moving bodies, is commented out — `--approximate` writes it linear.)
 * **Gaskets** → approximate with a thin soft solid or a `*SPRING`.
 * **Cohesive elements / debonding** → model with contact (`*SURFACE BEHAVIOR`) or a
   nonlinear `*SPRING`.

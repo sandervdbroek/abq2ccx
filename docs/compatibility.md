@@ -39,6 +39,11 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **ccx 2.23 edge cases: a spherical `*TRANSFORM` (`TYPE=S`) and one with `a` = 0 give NaN results without an error. On the cylinder axis (closer than ~1e-11) ccx silently uses the global axes. With `a` parallel to `b` the axes are arbitrary. With two `*TRANSFORM` cards on a node the last one wins. On a `CPS`/`CPE` node whose local 3-axis is not global Z a local load does not reproduce its global counterpart (up to 86 % of |u| off)** (`CAX` nodes do) | a converted load on such a node is commented out with the reason. In 2-D only transforms that keep local 3 on the Z axis are accepted (Abaqus 2-D nodes have DOFs 1 and 2 only). The converter refuses within 1e-6 of the axis | probed on 2.23 (a `C3D8` cube; `CPS4`/`CPE4`/`CPS8`/`CPE8R` and `CAX4`/`CAX8` plates) |
 | **ccx silently ignores a `*CLOAD` on a node that belongs to no element** | surface elements whose nodes no other element uses are warned | probed on 2.23: no error, zero displacement there |
 | **ccx reads `*TEMPERATURE` only after thermal `*INITIAL CONDITIONS`** ("a *TEMPERATURE card is detected but no thermal *INITIAL CONDITIONS are given"), then needs one in every node ("no initial temperature defined in node"), and **refuses it in heat transfer and (un)coupled temperature-displacement steps**, with initial conditions too; Abaqus starts every node at 0 when none is given, and does not allow a predefined temperature field in steps where temperature is a DOF | a deck that applies `*TEMPERATURE` without initial temperatures gets `*INITIAL CONDITIONS, TYPE=TEMPERATURE` with 0 on every node ahead of the first step; with them, the nodes they leave out — knot-beam nodes too — get 0 first. Not for a `FILE=` card (ccx reads it as a CalculiX `.frd`; warned) — a `USER` card is commented out anyway; `*TEMPERATURE` in a heat transfer or coupled step is commented out (warned) | Abaqus Analysis User's Guide 2017, "Initial conditions" ("If initial conditions are not specified, all initial conditions are zero") and "Predefined fields" (restrictions); probed on 2.23 (a free heated `C3D8` cube converted without initial temperatures strains α T exactly) |
+| **ccx has no connector element; a connector without a behaviour is exactly its kinematic constraint.** Abaqus `JOIN` keeps node b's coordinates in node a's local system (fixed directions, or turning with node a when it has rotations); `REVOLUTE` imposes e1a·e2b = e1a·e3b = 0 (rotation about node a's local 1-direction only); `HINGE` = `JOIN` + `REVOLUTE`, `WELD` = `JOIN` + `ALIGN`; a blank node is ground, placed at the other node | `CONN3D2`/`CONN2D2` are not emitted; their `*CONNECTOR SECTION` becomes `*EQUATION`s, `*BOUNDARY` lines, a `*RIGID BODY` (`BEAM`, `WELD`) or the `*MPC LINK` forms | Abaqus connection-type reference (JOIN, REVOLUTE, HINGE, connector elements); the hood-hinge deck has 7 zero modes (6 rigid-body + the hinge) instead of two free parts' 12, and every mode's relative rotation lies along the hinge axis to 3e-6 |
+| **A `*RIGID BODY`'s `ROT NODE` (and a knot's rotation) is a total rotation vector** (Rodrigues: `nonlinmpc.f`; a knot's DOFs 4–6 are replaced by its rotation node's 1–3 in `gen3dmpc.f`) | equal vectors are equal rotations; a vector held parallel to a fixed axis is a rotation about it — so a hinge to ground (or to a held node) is exact at any angle as `*BOUNDARY` lines / equations among one rotation node's components | ccx sources; probed: a body hinged to ground about an oblique axis turned 138° follows the exact rotation to ccx's convergence tolerance (and a knotted beam end to 7e-7) |
+| **Under `NLGEOM`, `*EQUATION`s that link two rigid bodies' reference / rotation DOFs are solved inaccurately** — two `*RIGID BODY` cards on one REF/ROT node are exact, but the same bodies joined by `*EQUATION`s (u5 = u1, θ4 = θ2) or chained (a member of one is the other's reference) all converge to the same wrong state | under `NLGEOM` a connector is written only where it needs no such link (to ground / a held node, between plain nodes or from a reference point to a mesh node, a rigid link); otherwise it is commented out, or written linear under `--approximate` (`[APPROX]`) | probed on 2.23: ~1 % displacement and ~10 % moment imbalance at 30°, members of the untouched body off rigidity by 7e-4; exact to all digits without `NLGEOM` |
+| **DOFs 4–6 of a node without rotational elements do nothing**, and **a `ROT NODE` without stiffness crashes ccx** (exit 255, no message) | a connector rotation on a solid / plane / free node goes to a new rotation node only when it shows elsewhere (another connector, a moment, a prescribed rotation); otherwise it is eliminated (the connector-only rotation Abaqus adds constrains nothing); a `WELD`/`BEAM` between two such nodes is a `JOIN` (coincident) or a `LINK` | probed on 2.23 (a moment on a free node's DOF 6 tied to a body moves nothing) |
+| **`*BOUNDARY, OP=NEW` removes model-data BCs too** | the BCs that hold a connector (to ground, or to a held node) are repeated after every `OP=NEW` card | probed on 2.23 |
 
 ## Version notes
 
@@ -189,7 +194,12 @@ the same models written with one `*ORIENTATION` and section per element (to 3e-1
 exactly), a rigid lever (`*MPC BEAM`) on a cantilever tip matches statics within 0.04 % (and
 a 10⁴× stiffer beam lever within 5e-7 at 27° of rotation), `*MPC PIN` and `TIE` joints
 between beam spans match the hinge and the propped-cantilever solutions within 0.33 %, an
-`*MPC LINK` matches statics exactly and keeps its length under `NLGEOM`, a deck whose
+`*MPC LINK` matches statics exactly and keeps its length under `NLGEOM`, the same
+joints, lever and link written as `CONN3D2` connectors (`JOIN`, `WELD`, `BEAM`, `LINK`)
+give the same answers, a `HINGE` between beam spans releases bending about its axis and
+transmits it about the other, two rigid bodies on springs hinged about an oblique axis
+with an offset joint match the exact solution to 6e-8, a body hinged to ground turns 138°
+under `NLGEOM` exactly about the axis, a deck whose
 `*EQUATION` clashes with a BC (and has a duplicate and a loop of ties) solves with the ties
 held, a clamped beam and plate keep their clamps across a later step's
 `*BOUNDARY, OP=NEW` (beam theory within 0.7 %, a prescribed plate displacement exactly),
@@ -276,6 +286,25 @@ body), `LINK` becomes its linearised `*EQUATION` without `NLGEOM` and ccx's dist
 with it, and `PLANE`/`STRAIGHT` pass through. User MPCs (a numeric type, the Abaqus `MPC`
 subroutine) and the other types (`SLIDER`, `REVOLUTE`, `UNIVERSAL`, `ELBOW`, `LINEAR`, …)
 are commented out one line at a time, with the reason in the report.
+
+Connector elements (`CONN3D2`/`CONN2D2` with `*CONNECTOR SECTION`) have no ccx element, but
+a connector without a `*CONNECTOR BEHAVIOR` is only the kinematic constraint of its
+connection type, which ccx holds exactly: `JOIN`, `REVOLUTE`, `ALIGN` and `HINGE` become
+`*EQUATION`s in the nodes' translations and rotation vectors (node b keeps its initial
+offset in node a's turning system; the hinge leaves only the rotation about node a's local
+1-direction free), with `*BOUNDARY` lines where a side is ground or held; `BEAM` and `WELD`
+(the same rigid link) become a `*RIGID BODY`; `LINK` goes the `*MPC LINK` way; and the
+unconstrained types (`CARTESIAN`, `CARDAN`, `ROTATION`, …) transmit nothing and are left
+out. Rotations are taken where ccx carries them — a reference point's `ROT NODE`, a knot on
+a shell/beam node. The equations are linear in the rotation vectors: exact in a linear or
+perturbation analysis, and under `NLGEOM` exact only where one side cannot turn (the hinge
+axis stays put) or no rotation enters. A hinge between two moving bodies under `NLGEOM` is
+therefore commented out (written linear, with an `[APPROX]` warning, under
+`--approximate`), as are connectors with a behaviour, `*CONNECTOR MOTION`/`LOAD`, and the
+other connection types (`SLOT`, `SLIDE-PLANE`, `UNIVERSAL`, `CONSTANT VELOCITY`, …). In
+the corpus only two decks have connectors: the hood-hinge modal deck (one `HINGE`), whose
+parts now move as a mechanism instead of floating apart, and the teeter deck (`BEAM` and
+`HINGE`), which still stops on its `*BEAM GENERAL SECTION`.
 
 ## What "verified" means here
 
