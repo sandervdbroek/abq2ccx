@@ -77,7 +77,7 @@ def convert(path, out_inp):
 
 def run_ccx(ccx, env, inp_path):
     """Run ccx; return (workdir, status, combined output) with status from
-    abq2ccx.classify_ccx_run ("solved" / "accepted" / "failed")."""
+    abq2ccx.classify_ccx_run ("solved" / "nonfinite" / "accepted" / "failed")."""
     d = tempfile.mkdtemp(prefix="ccxval_")
     shutil.copy(inp_path, os.path.join(d, "job.inp"))
     full_env = dict(os.environ)
@@ -85,7 +85,8 @@ def run_ccx(ccx, env, inp_path):
     try:
         r = subprocess.run([ccx, "job"], cwd=d, env=full_env,
                            capture_output=True, text=True, timeout=600)
-        return d, A.classify_ccx_run(r.returncode, r.stdout, r.stderr), r.stdout + r.stderr
+        status = A.classify_ccx_run(r.returncode, r.stdout, r.stderr, os.path.join(d, "job"))
+        return d, status, r.stdout + r.stderr
     except Exception as exc:  # noqa: BLE001
         return d, "failed", f"failed to launch ccx: {exc}"
 

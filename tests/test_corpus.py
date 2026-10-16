@@ -10,8 +10,9 @@ Two layers of checking:
                  runs.
   3. SOLVE     — optional: if CalculiX (ccx) is found, decks marked ``expect_solve``
                  must solve (ccx exits 0, prints "Job finished" with no *ERROR and no
-                 crash, and runs an analysis STEP), and mesh-only decks marked
-                 ``parse_only`` must be accepted by ccx; the rest are recorded only.
+                 crash, runs an analysis STEP, and writes no NaN/Inf to the .dat or
+                 .frd), and mesh-only decks marked ``parse_only`` must be accepted by
+                 ccx; the rest are recorded only.
 
 Usage:
     python corpus/fetch.py          # first, download the decks (network)
@@ -85,7 +86,8 @@ def dangling(text):
 
 
 # The solve judge lives in abq2ccx.py so the corpus test, validate_with_ccx.py and the
-# CLI's --run all apply the same rules (exit code, crash messages, a STEP must run).
+# CLI's --run all apply the same rules (exit code, crash messages, a STEP must run, the
+# results must be finite).
 classify_ccx_run = A.classify_ccx_run
 
 
@@ -97,11 +99,11 @@ def run_ccx(ccx, env, text):
     try:
         p = subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True,
                            text=True, timeout=300)
+        return classify_ccx_run(p.returncode, p.stdout, p.stderr, os.path.join(d, "job"))
     except subprocess.TimeoutExpired:
         return "failed"
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    return classify_ccx_run(p.returncode, p.stdout, p.stderr)
 
 
 # --- pytest entry points ------------------------------------------------------
@@ -145,6 +147,61 @@ def test_classify_ccx_run():
     # per-iteration non-convergence is normal in nonlinear solves, not a failure
     assert classify_ccx_run(0, " STEP 1\n no convergence\n Job finished\n", "") == "solved"
 
+    # A diverged solution also ends with "Job finished" and exit 0 (an explicit step on a
+    # circular-section beam whose increment ccx misjudged gave NaN for every value): the
+    # judge reads the results, Fortran's NaN/Infinity in the .dat's print blocks and C's
+    # NAN/INF in the .frd, but not set names such as NAN in the headings, nor ccx's own
+    # tables (an undamped steady-state mode at its eigenfrequency has an infinite
+    # participation factor). Lines as ccx 2.23 writes them.
+    head = "\n displacements (vx,vy,vz) for set {} and time  0.1668256E-03\n\n"
+    ssd = ("P A R T I C I P A T I O N   F A C T O R S   F O R   F R E Q U E N C Y    "
+           "0.4147260912592E+02 (CYCLES/TIME)\n\n MODE NO    FREQUENCY               FACTOR\n"
+           "           (CYCLES/TIME)      REAL        IMAGINARY\n\n"
+           "      1   0.1504584E+02   0.5320239E-02   0.0000000E+00\n"
+           "      2   0.4147261E+02        Infinity             NaN\n")
+    frd = ("    1C\n  100CL  101 1.66826E-03           2                     1    1           1\n"
+           " -4  DISP        4    1\n -5  D1          1    2    1    0\n"
+           " -1         1 1.00000E+00-2.00000E+00 0.00000E+00\n -1         2{}\n -3\n")
+    with tempfile.TemporaryDirectory() as d:
+        job = os.path.join(d, "job")
+
+        def results(dat=None, frd_line=None):
+            for ext, text in ((".dat", dat), (".frd", frd.format(frd_line) if frd_line else None)):
+                if os.path.exists(job + ext):
+                    os.unlink(job + ext)
+                if text is not None:
+                    open(job + ext, "w").write(text)
+            return classify_ccx_run(0, ok, "", job)
+
+        finite = " 1.00000E+00-2.00000E+00 0.00000E+00"
+        rows = "         4  1.000000E+00 -2.000000E-01  0.000000E+00\n"
+        nan_row = "         4           NaN           NaN           NaN\n"
+        assert results() == "solved"                                   # no result files
+        assert results(head.format("NAN") + rows, finite) == "solved"
+        assert results(head.format("INF") + rows) == "solved"
+        assert results(ssd + head.format("MID") + rows, finite) == "solved"
+        assert results(head.format("MID") + rows + ssd, finite) == "solved"
+        assert results(" statistics for surface set STOP and time  0.1000000E+01\n\n   total surface "
+                       "force (fx,fy,fz) and moment about the origin(mx,my,mz)\n\n    1.804112E-16"
+                       "  1.110223E-16           NaN  1.549923E+00 -1.549923E+00  0.000000E+00\n",
+                       finite) == "nonfinite"                         # *SECTION PRINT
+        assert results(ssd + head.format("MID") + rows.replace("0.000000E+00", "         NaN"),
+                       finite) == "nonfinite"
+        assert results(head.format("MID") + nan_row, finite) == "nonfinite"
+        assert results(head.format("MID") + "         4      Infinity     -Infinity  0.000000E+00\n",
+                       finite) == "nonfinite"
+        assert results(" total force (fx,fy,fz) for set FIX and time  0.1000000E+01\n\n"
+                       "      -Infinity  0.000000E+00  0.000000E+00\n", finite) == "nonfinite"
+        assert results(head.format("MID") + rows,
+                       " 1.00000E+00         NAN-2.00000E+00") == "nonfinite"
+        assert results(None, "         INF 0.00000E+00        -INF") == "nonfinite"
+        assert A.ccx_nonfinite_result(job) == "job.frd: DISP at 1.66826E-03: 2 INF 0.00000E+00 -INF"
+        results(head.format("MID") + nan_row)
+        assert A.ccx_nonfinite_result(job) == ("job.dat: displacements (vx,vy,vz) for set MID and "
+                                               "time 0.1668256E-03: 4 NaN NaN NaN")
+        assert classify_ccx_run(0, " *ERROR in e_c3d\n" + ok, "", job) == "failed"
+        assert classify_ccx_run(0, " Job finished\n", "", job) == "accepted"   # no STEP ran
+
 
 def test_corpus_solves():
     """expect_solve decks must solve and parse_only decks must be accepted by ccx
@@ -160,7 +217,8 @@ def test_corpus_solves():
             assert status == "solved", f"{e['name']}: expected to solve in ccx, got {status!r}"
         elif e.get("parse_only"):
             status = run_ccx(ccx, env, convert(e["name"])[0])
-            assert status != "failed", f"{e['name']}: mesh-only deck was rejected by ccx"
+            assert status in ("accepted", "solved"), \
+                f"{e['name']}: mesh-only deck was rejected by ccx ({status!r})"
 
 
 # --- standalone runner with a summary table -----------------------------------
@@ -199,16 +257,18 @@ def main():
             if e["expect_solve"]:
                 ccxcol = "SOLVED" if status == "solved" else status.upper()
                 if status != "solved":
-                    result = ("UNEXPECTED: no analysis step ran" if status == "accepted"
-                              else "UNEXPECTED no-solve")
+                    result = {"accepted": "UNEXPECTED: no analysis step ran",
+                              "nonfinite": "UNEXPECTED: NaN/Inf results"}.get(
+                                  status, "UNEXPECTED no-solve")
                     failures += 1
             elif e.get("parse_only"):
-                ccxcol = {"accepted": "ACCEPTED", "solved": "solved+"}.get(status, "FAILED")
-                if status == "failed":
+                ccxcol = {"accepted": "ACCEPTED", "solved": "solved+"}.get(status, status.upper())
+                if status not in ("accepted", "solved"):
                     result = "UNEXPECTED: ccx rejected it"
                     failures += 1
             else:
-                ccxcol = {"solved": "solved+", "accepted": "accepted+"}.get(status, "no-solve(ok)")
+                ccxcol = {"solved": "solved+", "accepted": "accepted+",
+                          "nonfinite": "nonfinite(ok)"}.get(status, "no-solve(ok)")
         print(f"{name:27s} {'ok':>5s} {rep.n_warnings:>3d} {d:>6d} {ccxcol:>13s}  {result}")
     n_solve = sum(1 for e in decks if e["expect_solve"])
     n_unloaded = sum(1 for e in decks if e["expect_solve"] and e.get("source_unloaded"))

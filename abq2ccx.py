@@ -9312,15 +9312,81 @@ def find_ccx(override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, s
 CCX_ABORT_SIGNS = ("free(): ", "double free", "malloc(): ", "corrupted size", "Aborted",
                    "Segmentation fault")
 _CCX_STEP_RE = re.compile(r"^\s*STEP\s+\d+\s*$", re.M)
+# A solution that went to NaN (an unstable explicit increment, say) still ends with "Job
+# finished" and exit 0; only the results show it: Fortran writes NaN/Infinity to the .dat,
+# C writes NAN/INF to the .frd.
+_NONFINITE_RE = re.compile(rb"(?i)(?<![a-z])[+-]?(?:nan|inf(?:inity)?)(?![a-z])")
+_DAT_LINE_RE = re.compile(rb"\s*(?:(?P<row>[+-]?(?:\.?\d|(?i:(?:nan|inf(?:inity)?)(?![a-z]))))|[A-Za-z])")
+_DAT_TABLE_RE = re.compile(rb"\s*(?:[A-Z] ){3}")      # "S T E P", "E I G E N V A L U E ..."
 
 
-def classify_ccx_run(returncode, stdout: str, stderr: str) -> str:
+def _squash(line: bytes, limit: int = 100) -> str:
+    text = " ".join(line.decode("latin-1").split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _dat_nonfinite(fh) -> Optional[str]:
+    # Only the rows of print blocks, whose headings end "... and time t" (*NODE, *EL,
+    # *CONTACT and *SECTION PRINT; a section print's sub-headings stay in its block), up
+    # to the next spaced-out heading of ccx's own: its tables may hold an Inf that is no
+    # divergence, e.g. an undamped *STEADY STATE DYNAMICS mode's participation factor at
+    # its eigenfrequency.
+    header = None
+    for ln in fh:
+        m = _DAT_LINE_RE.match(ln)
+        if not m:                                   # a blank line
+            continue
+        if not m.group("row"):                      # a heading
+            if b" and time " in ln:
+                header = ln
+            elif _DAT_TABLE_RE.match(ln):
+                header = None
+        elif header and (b"n" in ln or b"N" in ln) and _NONFINITE_RE.search(ln):
+            return f"{_squash(header)}: {_squash(ln)}"
+    return None
+
+
+def _frd_nonfinite(fh) -> Optional[str]:
+    block, at = "", ""
+    for ln in fh:
+        if ln.startswith((b" -1", b" -2")):         # one node's values
+            if (b"N" in ln or b"n" in ln) and _NONFINITE_RE.search(ln):
+                return f"{block} at {at}: {_squash(ln[3:])}"
+        elif ln.startswith(b" -4"):                 # " -4  DISP        4    1"
+            block = _squash(ln[3:]).split(" ")[0]
+        elif ln.startswith(b"  100C"):              # "  100CL  101 1.66826E-03 ..."
+            at = _squash(ln[12:24])
+        elif ln.startswith(b"    2C"):
+            block, at = "node coordinates", "the mesh"
+    return None
+
+
+def ccx_nonfinite_result(job: str) -> Optional[str]:
+    """Where ccx's results for ``job`` (its path without the extension) first hold a NaN
+    or Inf: a value row of the .dat (*NODE PRINT, *EL PRINT, ...) or a node's values in
+    a .frd result block, as "<file>: <where>: <values>"; None if all are finite."""
+    for ext, scan in ((".dat", _dat_nonfinite), (".frd", _frd_nonfinite)):
+        try:
+            with open(job + ext, "rb") as fh:
+                hit = scan(fh)
+        except OSError:
+            continue
+        if hit:
+            return f"{os.path.basename(job)}{ext}: {hit}"
+    return None
+
+
+def classify_ccx_run(returncode, stdout: str, stderr: str, job: Optional[str] = None) -> str:
     """Classify a finished ccx run:
 
-    * ``"solved"``   - exit 0, "Job finished", no ``*ERROR``, no crash/abort message, and
-                       at least one analysis STEP executed;
-    * ``"accepted"`` - the same, but no STEP ran (a mesh-only deck ccx only parsed);
-    * ``"failed"``   - anything else, including a crash after "Job finished".
+    * ``"solved"``    - exit 0, "Job finished", no ``*ERROR``, no crash/abort message, at
+                        least one analysis STEP executed, and (given ``job``, the job's
+                        path without the extension) every value its .dat print blocks
+                        and .frd result blocks hold is finite;
+    * ``"nonfinite"`` - the same, but the results hold NaN or Inf: ccx finishes a
+                        diverged solution like any other (see ccx_nonfinite_result);
+    * ``"accepted"``  - no STEP ran (a mesh-only deck ccx only parsed), otherwise clean;
+    * ``"failed"``    - anything else, including a crash after "Job finished".
 
     The per-iteration "no convergence" message is normal in nonlinear solves and is not
     a failure; a run that really gives up prints ``*ERROR``."""
@@ -9330,12 +9396,14 @@ def classify_ccx_run(returncode, stdout: str, stderr: str) -> str:
         return "failed"
     if any(s in stdout or s in stderr for s in CCX_ABORT_SIGNS):
         return "failed"
-    return "solved" if _CCX_STEP_RE.search(stdout) else "accepted"
+    if not _CCX_STEP_RE.search(stdout):
+        return "accepted"
+    return "nonfinite" if job and ccx_nonfinite_result(job) else "solved"
 
 
 def run_ccx(out_path: str, override: Optional[str], quiet: bool) -> int:
-    """Run CalculiX on a converted deck; 0 if the analysis solves (or ccx accepts a
-    mesh-only deck that has nothing to solve), 1 otherwise."""
+    """Run CalculiX on a converted deck; 0 if the analysis solves with finite results (or
+    ccx accepts a mesh-only deck that has nothing to solve), 1 otherwise."""
     exe, extra_env = find_ccx(override)
     if not exe:
         sys.stderr.write("abq2ccx: no CalculiX executable found (searched --ccx/$CCX, PATH, the "
@@ -9355,11 +9423,16 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool) -> int:
     out = p.stdout + p.stderr
     if not quiet:
         sys.stderr.write(out)
-    status = classify_ccx_run(p.returncode, p.stdout, p.stderr)
+    job = os.path.join(cwd, stem)
+    status = classify_ccx_run(p.returncode, p.stdout, p.stderr, job)
     if status == "accepted":
         sys.stderr.write("abq2ccx: ccx accepted the deck, but it has no analysis step — "
                          "nothing was solved.\n")
         return 0
+    if status == "nonfinite":
+        sys.stderr.write(f"abq2ccx: ccx finished, but its results hold NaN/Inf values (the "
+                         f"solution diverged): {ccx_nonfinite_result(job)}\n")
+        return 1
     if status == "failed":
         errs = [ln.strip() for ln in out.splitlines() if "*ERROR" in ln][:3]
         aborts = [s.strip() for s in CCX_ABORT_SIGNS if s in out]

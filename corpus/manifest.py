@@ -13,18 +13,19 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
 dangling references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (202) - an analysis step runs to completion in CalculiX 2.23:
-  ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, and executes
-  at least one STEP - under the deck's own loads: no step the deck loads may lose all
-  its loads in the conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
+* ``expect_solve=True`` (198) - an analysis step runs to completion in CalculiX 2.23:
+  ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
+  least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
+  the deck's own loads: no step the deck loads may lose all its loads in the
+  conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
   14 of them also carry ``source_unloaded=True``: the source deck applies no load,
   prescribed displacement or initial velocity in any step (and has no eigenvalue
   step), so it solves to a zero response. They are kept as conversion checks but left
-  out of the headline count of decks that solve (188).
+  out of the headline count of decks that solve (184).
 * ``parse_only=True`` (219) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (601) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (605) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, connectors, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -211,9 +212,6 @@ CORPUS = [
     dict(name='igrega348_e11128', expect_solve=True, license='MIT',
          exercises='B31 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/E11128.inp'),
-    dict(name='irfancn_input', expect_solve=True, license='MIT',
-         exercises='C3D8T — parts/instances/assembly; UMAT; explicit',
-         url='https://raw.githubusercontent.com/irfancn/Abaqus-VUMAT-Gurson_GTN/master/input.inp'),
     dict(name='jain_shobhit_job_beamhex', expect_solve=True, license='GPL-3.0',
          exercises='C3D20R — parts/instances/assembly; *Frequency',
          url='https://raw.githubusercontent.com/jain-shobhit/SSMTool/master/ext/YetAnotherFEcode/examples/Meshes/Beam3D/Job-BeamHex.inp'),
@@ -599,9 +597,6 @@ CORPUS = [
     dict(name='smrg_uob_cube_pbc_uat', expect_solve=True, license='MIT',
          exercises='C3D8R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/smrg-uob/PeriodicBoundaryCondition/master/examples/Cube_PBC_UAT.inp'),
-    dict(name='tubakabura_plate_user', expect_solve=True, license='see source repo',
-         exercises='C3D8R — parts/instances/assembly; UMAT; explicit',
-         url='https://raw.githubusercontent.com/Tubakabura/ABAQUS-cpp-User-Subroutines/main/linearelastic/plate_user.inp'),
     dict(name='weili101_ex4_job_buckling_ssff_0', expect_solve=True, license='MIT',
          exercises='S4R — parts/instances/assembly; *Buckle',
          url='https://raw.githubusercontent.com/weili101/Deep_Plates/main/FE%20Models%20%28Abaqus%20Input%20Files%29/Ex4-Job-Buckling-SSFF-0.inp'),
@@ -622,9 +617,6 @@ CORPUS = [
     dict(name='davidmorinntnu_example_vuhard_v2', expect_solve=True, license='MIT',
          exercises='C3D8R — parts/instances/assembly; explicit',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_UHARD/example_VUHARD_V2.inp'),
-    dict(name='davidmorinntnu_example_vusdfld_v1', expect_solve=True, license='MIT',
-         exercises='C3D8R — parts/instances/assembly; explicit',
-         url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_USDFLD/example_VUSDFLD_V1.inp'),
     dict(name='dithoap_cube_cyclic_disp', expect_solve=True, license='MIT',
          exercises='C3D8 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/dithoap/RESSForLab/master/testing/Cube_Cyclic_Disp.inp'),
@@ -652,9 +644,6 @@ CORPUS = [
     dict(name='marcello_gori_frf_damping', expect_solve=True, license='MIT',
          exercises='S4 — parts/instances/assembly; *Frequency',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/10.%20Harmonic%20Analysis/1.%20Fixed-Fixed%20Beam/FRF_Damping.inp'),
-    dict(name='marcello_gori_modal_analysis_beam', expect_solve=True, license='MIT',
-         exercises='S4 — parts/instances/assembly; *Frequency',
-         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/10.%20Harmonic%20Analysis/1.%20Fixed-Fixed%20Beam/Modal_Analysis_Beam.inp'),
     dict(name='marcello_gori_with_damping', expect_solve=True, license='MIT',
          exercises='C3D8 — parts/instances/assembly; *Frequency',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/10.%20Harmonic%20Analysis/2.%20L-Shaped%20Bracket/With_Damping.inp'),
@@ -1930,6 +1919,12 @@ CORPUS = [
          exercises='S4R — parts/instances/assembly; UMAT; explicit',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_UMAT/example_VUMAT_SHELL.inp'),
+    dict(name='davidmorinntnu_example_vusdfld_v1', expect_solve=False, license='MIT',
+         exercises='C3D8R — parts/instances/assembly; explicit',
+         note="ccx runs it to 'Job finished', but with *BOUNDARY TYPE=VELOCITY read as a "
+              "displacement (100 mm within 1 ms, not 100 mm/s) the explicit solution "
+              "diverges: the .frd holds +-INF from t = 2e-4 (the judge's 'nonfinite')",
+         url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_USDFLD/example_VUSDFLD_V1.inp'),
     dict(name='davidmorinntnu_example_vusdfld_v2', expect_solve=False, license='MIT',
          exercises='S4R — parts/instances/assembly; explicit',
          note="ccx limitation: explicit dynamics stops on the *RIGID BODY of its *MPC BEAM lines on shell nodes ('linear and nonlinear MPC's depend on each other'); before, the MPC was dropped and the run passed the corpus' 300 s limit",
@@ -2150,6 +2145,14 @@ CORPUS = [
          exercises='C3D8T — parts/instances/assembly; UMAT; thermal',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/InstituteOfMechanics/Thermomechanical_Gradient_Enhanced_Damage_UMAT/main/numerical_examples/reduced_section_plate_test/tensileTest.inp'),
+    dict(name='irfancn_input', expect_solve=False, license='MIT',
+         exercises='C3D8T — parts/instances/assembly; UMAT; explicit',
+         note="ccx limitation: VUMAT (Gurson-GTN; no user material subroutine in ccx). "
+              "ccx runs its *USER MATERIAL stub, which returns zero stress; only the "
+              "explicit step survives that: with no elastic constants its stable "
+              "increment is 6.2e29, so the whole step is one increment (all stresses "
+              "0, total strains up to 7e5)",
+         url='https://raw.githubusercontent.com/irfancn/Abaqus-VUMAT-Gurson_GTN/master/input.inp'),
     dict(name='irfancn_viscoelastic_input', expect_solve=False, license='MIT',
          exercises='C3D8 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
@@ -2386,6 +2389,15 @@ CORPUS = [
          exercises='C3D8, C3D6 — parts/instances/assembly',
          note='source overconstraint: the clamp BC set shares 38 nodes with a kinematic coupling whose reference node is free (loaded), so the BCs are not implied by the coupling and ccx stops (*ERROR in cascade: dependent side of a MPC and a SPC); Abaqus/Standard does not apply BCs on the DOFs a kinematic coupling eliminates, and the deck solves with --approximate, which drops them as Abaqus does',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/4.%20Linear%20Static%20Structural%20Analysis/2.%20Beam%20Bracket/Job-1.inp'),
+    dict(name='marcello_gori_modal_analysis_beam', expect_solve=False, license='MIT',
+         exercises='S4 — parts/instances/assembly; *Frequency; undamped *Steady State Dynamics',
+         note="no damping (its twin marcello_gori_frf_damping adds *MODAL DAMPING): the "
+              "response at the frequency points ccx puts on the eigenfrequencies is "
+              "unbounded, +-INF/NaN at 41.5 and 58.2 Hz in the node values. The judge "
+              "sees 'solved' only because the step's .frd blocks hold no nodes: its "
+              "history *NODE FILE, NSET=<shell node> cards replace the all-node card, and "
+              "ccx 2.23 writes no shell node for them",
+         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/10.%20Harmonic%20Analysis/1.%20Fixed-Fixed%20Beam/Modal_Analysis_Beam.inp'),
     dict(name='marcello_gori_pipe_impact', expect_solve=False, license='MIT',
          exercises='S4R, R3D4 — parts/instances/assembly; explicit',
          note='ccx 2.23: *ERROR reading *ELEMENT:',
@@ -3730,6 +3742,13 @@ CORPUS = [
          exercises='C3D8R — parts/instances/assembly; UMAT; explicit',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/Tubakabura/ABAQUS-cpp-User-Subroutines/main/linearelastic/plate_builtin.inp'),
+    dict(name='tubakabura_plate_user', expect_solve=False, license='see source repo',
+         exercises='C3D8R — parts/instances/assembly; UMAT; explicit',
+         note="ccx limitation: UMAT (no user material subroutine in ccx). ccx runs its "
+              "*USER MATERIAL stub, which returns zero stress; only the explicit step "
+              "survives that: with no elastic constants its stable increment is "
+              "6.2e29, so the whole step is one increment (all stresses 0)",
+         url='https://raw.githubusercontent.com/Tubakabura/ABAQUS-cpp-User-Subroutines/main/linearelastic/plate_user.inp'),
     dict(name='universal_ctags_input', expect_solve=False, license='GPL-2.0',
          exercises='CPE4R — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',

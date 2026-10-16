@@ -199,6 +199,14 @@ These are the silent ones — no error, wrong physics.
   ccx alone would take) and warns about a fixed `DIRECT` increment above that cap — lower
   it or drop `DIRECT`. Editing the deck by hand, keep the maximum increment at or below
   0.12·d/c (d the section diameter, c the material's dilatational wave speed).
+* **NaN or Inf in the results after "Job finished".** ccx 2.23 ends a solution that has
+  diverged with "Job finished" and exit code 0 like any other, so check the results, not
+  just the log: `abq2ccx --run` exits 1 and names the first NaN/Inf value in the `.dat`
+  print blocks or the `.frd` (file, block, time, row), which tells you when it went
+  wrong. In an explicit step it is an increment above the stable limit — set a smaller
+  maximum increment in the 4th field of the `*DYNAMIC` data line — or a load the model
+  cannot follow: check the converter's `[WARNING]`s for a load or BC it had to drop or
+  reinterpret.
 * **`*TEMPERATURE` is not a thermal BC.** In a heat-transfer step, a *prescribed*
   temperature is `*BOUNDARY` on DOF 11; `*TEMPERATURE` only supplies the field that
   drives thermal expansion in a mechanical run. Watch K vs °C too.

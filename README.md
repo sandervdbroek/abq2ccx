@@ -56,7 +56,9 @@ python3 abq2ccx.py model.inp --solid-dof     # solid-only model: ENCASTRE/*SYMM 
 
 Exit codes: `0` converted · `1` cannot read/write · `2` usage error · `3` `--strict`
 findings · `4` internal conversion error.  `--run` auto-detects `ccx` (PATH, the
-FreeCAD-bundled copy, Homebrew/MacPorts) — or point at one with `--ccx`/`$CCX`.
+FreeCAD-bundled copy, Homebrew/MacPorts) — or point at one with `--ccx`/`$CCX` — and
+exits `1` when ccx stops with an `*ERROR`, crashes, or writes NaN/Inf results (it ends a
+diverged solution with "Job finished" all the same).
 
 **`--approximate` mode** reframes constructs CalculiX cannot run as *approximately
 equivalent* ones it can, each flagged with a loud `[APPROX]` warning: `*STATIC, RIKS` →
@@ -233,12 +235,12 @@ python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
 Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
-references; 188 solve in CalculiX under their own loads** (ccx exits 0, prints "Job
-finished" with no `*ERROR` or crash, and runs an analysis step — and every step the
-Abaqus deck loads still carries a load after conversion), and **219 mesh-only decks** — no
+references; 184 solve in CalculiX under their own loads** (ccx exits 0, prints "Job
+finished" with no `*ERROR` or crash, runs an analysis step and writes no NaN/Inf results —
+and every step the Abaqus deck loads still carries a load after conversion), and **219 mesh-only decks** — no
 `*STEP`, so nothing to solve — are **accepted** by ccx. 14 more solve but apply no load in
 the source deck itself (an empty `*STEP`: the solution is zero, in Abaqus too); they stay
-in the gate as conversion checks, flagged `source_unloaded`. The other 601 convert cleanly
+in the gate as conversion checks, flagged `source_unloaded`. The other 605 convert cleanly
 but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
 Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck

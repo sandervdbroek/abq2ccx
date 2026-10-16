@@ -187,7 +187,7 @@ correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
-188 solve in CalculiX under their own loads (14 more solve but load nothing in the source
+184 solve in CalculiX under their own loads (14 more solve but load nothing in the source
 deck) and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
 convert cleanly but use features ccx cannot run, and each was verified to fail no worse
 than the original unconverted deck. Bulk-running every deck

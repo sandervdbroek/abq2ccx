@@ -408,19 +408,29 @@ deck and runs it in CalculiX:
     **Always runs** (no ccx needed).
   * `test_corpus_solves` — decks marked `expect_solve` are run in CalculiX and must
     **solve**: ccx exits 0, prints "Job finished" with no `*ERROR` and no crash/abort
-    message on stdout or stderr, and executes at least one analysis `STEP`. Mesh-only
-    decks marked `parse_only` (no `*STEP`, so nothing to solve) must be **accepted** by
-    ccx under the same clean-exit rules. Only runs when `ccx` is available.
+    message on stdout or stderr, executes at least one analysis `STEP`, and writes only
+    finite results. ccx 2.23 ends a solution that went to NaN (an unstable explicit
+    increment, say) with "Job finished" and exit 0 like any other, so the judge reads the
+    value rows of the `.dat` print blocks (`*NODE PRINT`, `*EL PRINT`, …; not ccx's own
+    eigenvalue and participation-factor tables) and the node values of the `.frd` result
+    blocks; a NaN or Inf there makes the run **`nonfinite`**, not solved.
+    Mesh-only decks marked `parse_only` (no `*STEP`, so nothing to solve) must be
+    **accepted** by ccx under the same clean-exit rules. Only runs when `ccx` is
+    available. The same judge (`classify_ccx_run` in `abq2ccx.py`) decides
+    `validate_with_ccx.py`'s runs and `--run`, which exits 1 on a `nonfinite` run and
+    names the first NaN/Inf value: file, print block or result block, time, row.
   * `test_classify_ccx_run` — unit test of that judge (no ccx needed), including the
-    "Job finished, then abort" case from issue #3.
+    "Job finished, then abort" case from issue #3 and NaN/Inf results as ccx 2.23 writes
+    them (Fortran's `NaN`/`Infinity` in the `.dat`, C's `NAN`/`INF` in the `.frd`; a set
+    named `NAN` in a heading is not one).
 
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **188 solve** in CalculiX under their own loads and **219 mesh-only decks are
+references; **184 solve** in CalculiX under their own loads and **219 mesh-only decks are
 accepted** by it. 14 more decks solve but load nothing in the source deck itself (an empty
 `*STEP`), so their solution is zero in Abaqus as well; they stay in the gate as conversion
-checks (`source_unloaded=True`), outside the headline count. The other 601 convert cleanly
+checks (`source_unloaded=True`), outside the headline count. The other 605 convert cleanly
 but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
 Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
@@ -952,10 +962,51 @@ transforms on one node, or a 2-D node whose local 3-axis leaves the Z axis. Eigh
 decks have `*TRANSFORM` nodes, but none puts a converted load on them, and all 1073 corpus
 files convert byte-identically.
 
+**NaN and Inf results.** A solution that diverges ends like any other in ccx 2.23 ("Job
+finished", exit 0): an explicit step on circular-section beams printed NaN for every
+displacement and the judge counted it as solved. The judge now reads the results as well
+(`test_corpus_solves` above), and every corpus deck was rerun with it while every line of
+its `.dat` and `.frd` was searched for a NaN or Inf. Only two decks have one, both then
+gated, and both left the gate:
+
+* `davidmorinntnu_example_vusdfld_v1` (explicit): its `*BOUNDARY, TYPE=VELOCITY` is read as
+  a displacement — 100 mm within 1 ms instead of 100 mm/s — and the `.frd` holds ±INF from
+  t = 2.0e-4 on.
+* `marcello_gori_modal_analysis_beam`: its `*STEADY STATE DYNAMICS` step has no damping (its
+  twin `marcello_gori_frf_damping` has), and ccx puts frequency points on the
+  eigenfrequencies, where the response is unbounded: a mode's participation factor is
+  Infinity there (−1.1e15 at the first, as the rounding falls), and so are the node values,
+  ±INF and NaN at 41.5 and 58.2 Hz. The judge skips ccx's own tables, so it saw no NaN: the
+  step's `.frd` blocks hold no nodes, because the converter turns the history output on a
+  shell node into a later `*NODE FILE, NSET=` card, which replaces the all-node one in ccx,
+  and ccx 2.23 writes no shell node for it. With the field output alone the run is
+  `nonfinite`.
+
+Looking at what the explicit decks that solve actually compute — 138 decks have a `*DYNAMIC,
+EXPLICIT` step, 8 of them gated — took two more out: `irfancn_input` and
+`tubakabura_plate_user` use a `*USER MATERIAL`, for which ccx runs a stub that returns zero
+stress. Only an explicit step gets through that (under `*STATIC` ccx stops: "matrix found to
+be singular"), and with no elastic constants its stable increment comes out as 6.2e29, so
+the whole step is a single increment with every stress 0. The other 350 `*USER MATERIAL`
+decks were not gated. Three of the remaining explicit decks wrote no results at all: their
+only output request is a bare `*OUTPUT, FIELD, VARIABLE=PRESELECT`, the CAE default, which
+the converter drops. That is not peculiar to explicit decks: 123 of the 198 gated decks have
+a step without `*NODE FILE` or `*EL FILE`, mostly for this reason, and 104 no output request
+at all, so ccx writes only the mesh to their `.frd` and the judge has nothing to read.
+Rerun with `*NODE FILE` (`U`) and `*EL FILE` (`S, E`) added to those 135 steps, all 198 give
+finite results. In `marcello_gori_cylinder_impact` the cylinder passes through the plate it
+should strike, at its initial velocity of 100 (Abaqus general contact has no ccx
+equivalent; the converter comments it out and warns). The census was repeated after the
+traction and surface-element changes above, for every deck they convert differently (123,
+38 of them gated) and every gated one: nothing new. Net: 202 → 198 gated, 188 → 184 under
+their own loads.
+
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
 "Job finished" (the exit code and stderr were ignored); that inflated the earlier
-headline of 414 "solving" decks.
+headline of 414 "solving" decks. Until October 2026 it did not read the results either:
+an explicit step on circular-section beams whose increment ccx misjudged printed NaN for
+every displacement and still counted as solved.
 
 This corpus was assembled in waves: bulk-downloading hundreds of genuine Abaqus decks
 from public GitHub repositories (the second wave via parallel discovery agents fanned
