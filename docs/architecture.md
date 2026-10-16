@@ -32,7 +32,9 @@ Converter._plan_incompatible_slabs()   CPS4I / CPE4I -> C3D8I slabs (top nodes, 
         ▼
 Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANSFORM of each
                        node (_transform_defs), the connector plan (_plan_connectors), rigid
-                       bodies and their ROT NODEs, the *MPC plan (_plan_mpcs), knot beams
+                       bodies and their ROT NODEs (also for kinematic couplings whose
+                       transformed reference node needs one, _plan_kinematic_rot_nodes),
+                       the *MPC plan (_plan_mpcs), knot beams
                        (_plan_rigid_couplings), the ROT NODEs' local axes (_plan_rot_axes),
                        the connectors' constraint rows in the DOFs ccx reads, local on
                        transformed nodes (_plan_connector_rows), the BCs on rigid-constraint
@@ -40,7 +42,11 @@ Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANS
                        (_plan_coupled_bcs), the velocity / acceleration BCs
                        (_plan_velocity_bcs), …; then _plan_load_cases() (a *BUCKLE step's
                        LOAD CASE=2 BCs), _plan_distributions(),
-                       _plan_planar_constraint() and _plan_circ_rotation_knots(); last
+                       _plan_planar_constraint(), _plan_circ_rotation_knots(),
+                       _plan_op_new_rotations() and _plan_transformed_rotations()
+                       (rotational BCs / moments of transformed shell/beam and
+                       kinematic reference nodes: kept, knot + global components, or
+                       refused, per card); last
                        _plan_output(): each step's output requests fitted to ccx's output
                        model (.frd or .dat, one node set per variable, one output control),
                        Abaqus' preselected and default field output added, and explicit
@@ -112,6 +118,15 @@ a `*CLOAD` there in those axes; a node whose axes are unknown makes the line sta
 one per node with its spherical axes (`_transform_axes`), and gives a `*RIGID BODY` ROT NODE
 its reference node's axes; `_check_transforms` (end of `_prescan`) plans those and warns about
 two cards with different data on a node and 2-D nodes whose local 3-axis leaves Z.
+Rotations of transformed nodes: a kinematic coupling whose transformed reference node's
+rotation the deck uses becomes a `*RIGID BODY` with a ROT NODE of its own
+(`_plan_kinematic_rot_nodes`, emitted by `_coupling_as_rigid_body`); `handle_equation` moves
+terms on a rigid-body reference node's DOFs 4–6 to its ROT NODE and comments out equations
+with DOF 4–6 terms on other transformed nodes; `_plan_transformed_rotations` decides per
+transformed shell/beam or kinematic reference node whether its rotational BCs and moments
+stay (ccx reads them locally), go to global components on a knot (`_rot_global_lines`,
+`_rot_bc_global`; `_ccx_knot` reads ccx's knot rule) or are refused, and
+`_active_dof_lines` / `handle_cload` emit those lines at the end of each card.
 At the end of every step `_flush_nodal_loads` writes one `*CLOAD` per amplitude with the
 node DOFs whose total changed (0 where a load went away) — never `OP=NEW`, which in ccx
 would also remove the deck's own concentrated loads. `_nodal_load_inexact` decides whether

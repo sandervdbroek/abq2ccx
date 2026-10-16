@@ -84,7 +84,7 @@ prints one `PASS` line per check, about seventy in all; [testing](docs/testing.m
 | the same plate loaded through `SFM3D8` surface elements | its face-pressure result | 7 digits |
 | circular, pipe, box and planar beams; beam line loads; pinned, tied and hinged spans | beam theory, Euler buckling | ≤ 1.3 % |
 | Cook's membrane under a shear traction; a thick cylinder under a radial traction | published 23.96; Lamé | 0.12 %; 0.02 % |
-| rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads, connectors and `*MPC`s on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
+| rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads, connectors, `*MPC`s and rotations on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
 | per-element `*DISTRIBUTION` orientations (a solid plate, a composite shell) | one `*ORIENTATION` per element | ≤ 3e-11 |
 | thermal expansion (orthotropic, anisotropic, no initial temperatures) | α ΔT; analytic stress | ≤ 5e-6 |
 | velocity / acceleration BCs; displacement BCs without an amplitude | their time integral; wave theory; Abaqus' default amplitudes | 5e-5 of the travel; wave stress ≈ 1 % on average; exact |
@@ -174,6 +174,7 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`thermal_no_initial_temperature`](examples/thermal_no_initial_temperature.inp) | `*Temperature` without initial temperatures |
 | [`cook_membrane_traction`](examples/cook_membrane_traction.inp), [`cylinder_traction_cax`](examples/cylinder_traction_cax.inp) | `*DSLOAD TRVEC` on `CPS8` and `CAX8` edges → nodal forces |
 | [`traction_transformed_face`](examples/traction_transformed_face.inp), [`transform_spherical_rigid`](examples/transform_spherical_rigid.inp) | loads on `*TRANSFORM`ed nodes; a spherical transform; a transformed rigid-body reference point |
+| [`transform_rotations`](examples/transform_rotations.inp) | rotational BCs and moments on a transformed kinematic reference point (→ `*RIGID BODY` with a `ROT NODE` in its axes) and beam tip (→ knot, global components) |
 | [`velocity_bc_column`](examples/velocity_bc_column.inp), [`velocity_bc_bar`](examples/velocity_bc_bar.inp) | `*BOUNDARY, TYPE=VELOCITY` (implicit and explicit) |
 | [`default_amplitude_bars`](examples/default_amplitude_bars.inp) | a displacement `*BOUNDARY` and a `*CLOAD` without an amplitude → ramped / stepped as in Abaqus (run as `*DYNAMIC`, `*VISCO`, coupled and explicit) |
 | [`preselect_output_bar`](examples/preselect_output_bar.inp), [`explicit_default_output_bar`](examples/explicit_default_output_bar.inp), [`preselect_contact_blocks`](examples/preselect_contact_blocks.inp) | Abaqus' preselected and default output |

@@ -129,8 +129,8 @@ TRANSLATED = {
         "a `*RIGID BODY` move to its reference node with zero rotations about the other axes, as "
         "Abaqus/Standard moves them, where the BC'd nodes hold the same DOFs; the rest is warned "
         "(`--approximate` drops it on a kinematic coupling or an `*MPC` and makes the `*RIGID "
-        "BODY` move, as Abaqus/Standard does). `USER` (Abaqus `DISP`) commented, "
-        "naming ccx's `uboun.f`.",
+        "BODY` move, as Abaqus/Standard does). Rotations of a node with a `*TRANSFORM`: see "
+        "`*TRANSFORM`. `USER` (Abaqus `DISP`) commented, naming ccx's `uboun.f`.",
     "*DLOAD": "pressures and body loads passed through (`Px` faces match Abaqus); `P` on shells "
         "kept and on membranes written `P1` (both push along the element normal in Abaqus and ccx; "
         "ccx stops on `P` on a membrane), bare `P` on solids flagged; `P1`..`P4` on `CPS4I`/`CPE4I` "
@@ -183,13 +183,17 @@ TRANSLATED = {
         "(`--approximate`: the rest written linear, `[APPROX]`); a behaviour, other types and "
         "explicit-dynamics rotations on beam/shell nodes are commented out with the reason. On a "
         "node with a `*TRANSFORM` the rows are in its local DOFs, as ccx reads them (a rotation on "
-        "its `ROT NODE`, which gets the node's axes); commented out where those axes are undefined "
-        "or a rotation lives on DOFs 4-6 of a transformed shell/beam or kinematic reference node "
-        "(ccx misreads them).",
+        "its `ROT NODE`, which gets the node's axes; a transformed kinematic reference node's "
+        "coupling becomes a `*RIGID BODY` for it); commented out where those axes are undefined "
+        "or a rotation lives on DOFs 4-6 of a transformed shell/beam node, or of a kinematic "
+        "reference node whose coupling stays a coupling (ccx misreads them).",
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
         "(as Abaqus does unless `UNSORTED`); terms reordered so the eliminated (first) DOF has no "
         "BC and is not eliminated elsewhere; an equation that follows from the others and zero "
-        "BCs (a duplicate, a loop's closing tie) dropped.",
+        "BCs (a duplicate, a loop's closing tie) dropped. A term on DOFs 4-6 of a rigid-body "
+        "reference point → its `ROT NODE`'s DOFs 1-3 (ccx ignores DOFs 4-6 of the REF NODE); an "
+        "equation with a term on DOFs 4-6 of any other node with a `*TRANSFORM` is commented out "
+        "(ccx 2.23 misreads such terms).",
     "*KINEMATIC COUPLING": "every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF "
         "range (the reference node's DOFs 4-6 then take BCs and moments natively); rotation lines "
         "on shell/beam nodes become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`).",
@@ -201,7 +205,10 @@ TRANSLATED = {
         "get a force-free knot beam (elset/material `ABQ2CCX_KNOT`), without which ccx 2.23 "
         "rejects the rigid MPC, and the coupled rotations are tied to the reference node's DOFs "
         "4-6 by `*EQUATION`; a shell/beam `REF NODE` turns the coupling into a `*RIGID BODY` "
-        "whose `ROT NODE` follows it.",
+        "whose `ROT NODE` follows it. A coupling of all translations whose `REF NODE` has a "
+        "`*TRANSFORM` and a rotation the deck uses (rotational BCs other than all three held at "
+        "zero, moments, `*EQUATION` terms, connectors) becomes a `*RIGID BODY` whose `ROT NODE` "
+        "has the node's local axes (ccx's coupling would read them about the global ones).",
     "*RIGID BODY": "`PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node "
         "number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs "
         "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); a reference point with a "
@@ -215,9 +222,15 @@ TRANSLATED = {
         "per node with its spherical axes (1 radial, 3 meridional towards the pole, 2 = 3 × 1, "
         "fixed at the original position — exact); nodes on the polar axis keep the global axes "
         "(warned). Two cards with different data on a node (Abaqus does not allow it; ccx takes "
-        "the last) and a 2-D node whose local 3-axis leaves Z (ccx 2.23 gets it wrong) are warned.",
-    "*CLOAD": "moments on a rigid-body reference point → its `ROT NODE`; `ORIENTATION=` (local "
-        "axes) and `FOLLOWER=YES` dropped with a warning; `USER` commented, naming ccx's `cload.f`.",
+        "the last) and a 2-D node whose local 3-axis leaves Z (ccx 2.23 gets it wrong) are warned. "
+        "BCs and moments on DOFs 4-6 of a transformed shell/beam node: kept where ccx reads them "
+        "in the local axes (one local rotation on a beam node that is no knot, a shell node that is "
+        "no knot), else in global components on a knot (beam nodes get a knot beam) where an exact "
+        "form exists, else commented out.",
+    "*CLOAD": "moments on a rigid-body reference point → its `ROT NODE`; on a knotted shell/beam "
+        "node or kinematic reference node with a `*TRANSFORM` → global components (see "
+        "`*TRANSFORM`); `ORIENTATION=` (local axes) and `FOLLOWER=YES` dropped with a warning; "
+        "`USER` commented, naming ccx's `cload.f`.",
     "*TEMPERATURE": "passed through (upgraded beams' midside nodes get their end nodes' mean); "
         "`USER` (Abaqus `UTEMP`) commented, naming ccx's `utemp.f`.",
     "*FILM / *DFLUX / *CFLUX / *RADIATE": "passed through, except loads from an Abaqus user "

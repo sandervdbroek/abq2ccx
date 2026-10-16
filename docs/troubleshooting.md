@@ -101,6 +101,12 @@ converter comments `*TEMPERATURE` out there.
   reference node that is one of the body's own nodes, although the body is loaded and the
   rest of the model is right. Read the reaction at the supports, or give the body a reference
   node of its own.
+* **Rotational BCs, moments or an `*EQUATION` on a `*TRANSFORM`ed node are commented out.**
+  ccx reads them in the local axes only on a shell/beam node that is no knot; elsewhere the
+  converter writes them in global components where that is exact, and the warning names
+  what is not (rotations held about non-global local axes on a knot, a shell in a
+  `*DYNAMIC` deck, ...). Hold all three rotations, or give the support its own reference
+  point with a kinematic coupling, whose rotation the converter carries in its local axes.
 * **Short extra beams in the model (`ABQ2CCX_KNOT`).** Knot beams carry no load; ignore
   them in the results.
 * **Velocity and acceleration BCs.** ccx prescribes displacements only, so they become

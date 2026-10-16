@@ -84,6 +84,7 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `cylinder_traction_cax` | radial `TRVEC` on a thick `CAX8` cylinder | Lamé | 0.02 % |
 | `traction_transformed_face`, Cook's membrane with a `*TRANSFORM` | tractions on transformed nodes | the same models without the transform | round-off |
 | `transform_spherical_rigid` | a spherical `*TRANSFORM`; a transformed rigid-body reference point | the model in global components | exact |
+| `transform_rotations` | rotational BCs and moments on a transformed kinematic reference point and beam tip, linear and NLGEOM | the model in global components (an untransformed `ROT NODE` held by an `*EQUATION`, a knot beam) | 2e-8 of \|u\| (before: 130 %) |
 | `velocity_bc_column` | `TYPE=VELOCITY` with a `SMOOTH STEP`, kept into a second step | the integral of the velocity | 5e-5 of the travel |
 | `velocity_bc_bar` | a bar driven by a velocity (explicit) and an acceleration (implicit) | wave theory | ≈ 1 % on average |
 | `default_amplitude_bars` | a displacement BC and a `*CLOAD` without an amplitude, in implicit `*DYNAMIC`, `*VISCO`, a transient coupled and an explicit step | Abaqus' defaults: the BC ramped (explicit: held where it is), the load applied at once | the ramp to 7e-18 (ccx alone: 0.02 off); 1.98 × static overshoot; the hold exact |

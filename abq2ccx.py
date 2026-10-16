@@ -2529,6 +2529,15 @@ class Converter:
         self._rot_axes: Dict[int, Tuple[Vec, Vec]] = {}
         self._rot_axes_why: Dict[int, str] = {}
         self._rot_axes_warned = False
+        # kinematic couplings whose transformed reference node carries its rotation on a ROT
+        # NODE of a *RIGID BODY instead (_plan_kinematic_rot_nodes): id(*COUPLING) -> ROT NODE
+        self._kin_rb: Dict[int, int] = {}
+        # deck BCs / moments on DOFs 4-6 of a transformed shell/beam node or kinematic
+        # reference node (_plan_transformed_rotations): node -> "keep" / "global" / "refuse",
+        # and per (id(card), node) the lines that replace them (or why they are left out)
+        self._rot_mode: Dict[int, str] = {}
+        self._rot_lines: Dict[Tuple[int, int], Union[List[str], str]] = {}
+        self._rot_hit: List[int] = []              # the *BOUNDARY's planned nodes met so far
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         self._last_coupling: Optional[dict] = None
         # *DISTRIBUTION orientations (see _plan_distributions)
@@ -4927,6 +4936,7 @@ class Converter:
             [ln.split(",") for ln in self._midside_records(b, "boundary")]
         # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
         recs = self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
+        self._rot_hit = []
         for rec in recs + midside:
             # Interior blanks are positional (e.g. "node, dof1, , value" = blank last
             # DOF), so trim only trailing empties — never filter interior fields.
@@ -4958,6 +4968,10 @@ class Converter:
                 out.extend(kept if kept is not None else [", ".join(g)])
             else:
                 out.append(", ".join(g))
+        for n in self._rot_hit:                 # _plan_transformed_rotations
+            got = self._rot_lines.get((id(b), n))
+            out.extend(got if isinstance(got, list) else self._rot_refused(b, n, got))
+        self._rot_hit = []
         if getattr(self, "_n_inactive_rot", 0):
             self.report.note("Rotational DOFs (4-6) prescribed on nodes that only belong to plane-"
                              "stress/plane-strain/axisymmetric elements were dropped: those nodes "
@@ -5008,6 +5022,19 @@ class Converter:
         if hi < 4 or lo > 6:
             return None
         nodes = self._resolve_nodes(spec)
+        planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse")]
+        if planned:
+            # rotations of a transformed shell/beam / kinematic reference node: the card's
+            # lines for them come at its end (_plan_transformed_rotations)
+            self._rot_hit += [n for n in planned if n not in self._rot_hit]
+            out = [line(spec, lo, 3)] if lo <= 3 else []
+            if hi >= 7:
+                out.append(line(spec, 7, hi))
+            for n in nodes:
+                if n not in planned:
+                    kept = self._active_dof_lines(str(n), max(lo, 4), min(hi, 6), extra)
+                    out.extend(kept if kept is not None else [line(str(n), max(lo, 4), min(hi, 6))])
+            return out
         refs = [n for n in nodes if n in self._rb_rot]
         if refs:
             out = [line(spec, lo, min(hi, 3))] if lo <= 3 and len(refs) == len(nodes) else \
@@ -6223,19 +6250,26 @@ class Converter:
                 self.report.note(f"*CLOAD parameter {k} dropped (not read by ccx).", once=True)
         out = [emit_keyword("CLOAD", keep)]
         moved = False
+        hit: List[int] = []         # transformed nodes whose moments _plan_transformed_rotations rewrites
         for ln in b.data:
             f = [x.strip() for x in ln.split(",")]
             self._check_node_target("CLOAD", f[0] if f else "")
-            refs: List[int] = []
-            if len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and 4 <= int(f[1]) <= 6:
-                nodes = self._resolve_nodes(f[0])
-                refs = [n for n in nodes if n in self._rb_rot]
-            if not refs:
+            if not (len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and 4 <= int(f[1]) <= 6):
                 out.append(ln)
                 continue
-            moved = True
-            if len(refs) != len(nodes):
+            nodes = self._resolve_nodes(f[0])
+            planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse")]
+            refs = [n for n in nodes if n in self._rb_rot]
+            if planned:
+                hit += [n for n in planned if n not in hit]
+                out += [", ".join([str(n)] + f[1:]) for n in nodes
+                        if n not in planned and n not in self._rb_rot]
+            elif not refs:
+                out.append(ln)
+                continue
+            elif len(refs) != len(nodes):
                 out.append(ln)                       # the other nodes keep the moment
+            moved = moved or bool(refs)
             try:                                     # a zero moment: the same in any axes
                 zero = pf(f[2]) == 0.0
             except (IndexError, ValueError):
@@ -6244,6 +6278,9 @@ class Converter:
                 out.append(", ".join([str(self._rb_rot[n]), str(int(f[1]) - 3)] + f[2:]))
                 if not zero:
                     self._warn_rot_frame(n)
+        for n in hit:
+            got = self._rot_lines.get((id(b), n))
+            out.extend(got if isinstance(got, list) else self._rot_refused(b, n, got))
         if moved:
             self.report.note("Moments on a *RIGID BODY reference point moved to DOFs 1-3 of its "
                              "ROT NODE (ccx ignores DOFs 4-6 of the REF NODE).", once=True)
@@ -6991,6 +7028,402 @@ class Converter:
                              f"global axes there; Abaqus reads them in the node's local axes, but "
                              f"{why}. Verify.")
             self._reduces("rigid-body rotational BCs / moments on a *TRANSFORM reference node in global axes")
+
+    # -- deck BCs and moments on DOFs 4-6 of a node with a *TRANSFORM ---------------------
+    def _plan_transformed_rotations(self, blocks: List[Block]) -> None:
+        """Deck BCs and moments on DOFs 4-6 of a node with a *TRANSFORM that carries its
+        rotation itself: a shell/beam node, or a kinematic coupling's reference node that
+        keeps that form (the others' rotations live on a ROT NODE with the node's axes,
+        _plan_kinematic_rot_nodes / _active_dof_lines).  Abaqus reads them in the node's
+        local axes.  ccx 2.23 (probed against the rigidly rotated model, rectangular and
+        cylindrical transforms, linear and NLGEOM):
+
+        * on a shell/beam node that is not a knot each becomes a mean-rotation MPC about the
+          local axis (gen3dboun / gen3dforc use the transformation): exact for one local
+          rotation per node; with several, usermpc can pick a dependent twice ('zero
+          coefficient on the dependent side'; 1.5-156 % off on a beam) — not on a shell,
+          whose rotational BCs make two such MPCs at most;
+        * on a knot (a frame joint, a converter knot beam) and on a kinematic reference node
+          they act on a rotation node ccx makes without the transform, about the GLOBAL axes
+          (34-291 % off): written in global components there — a moment line by line, held
+          rotations as their global values where they are all three or an axis-aligned set,
+          all three held at zero as they are (exact; also in *DYNAMIC steps);
+        * in a deck with a *DYNAMIC step ccx makes a shell/beam node with rotational BCs or
+          moments a knot itself, giving its rotation node the transform evaluated elsewhere
+          (a local BC 0.7-380 % off, shells 28-90 %).
+
+        So a beam node keeps its lines where ccx makes it no knot and one local rotation
+        carries all its BCs and moments (no *DYNAMIC step); otherwise it gets a knot beam
+        (none in a deck with an explicit step, which stops on them) and the global form.  A
+        shell node keeps them where it is no knot (no *DYNAMIC step), takes the global form on
+        a knot, and is refused otherwise (a dangling knot beam leaves a shell's drilling
+        rotation singular under a moment).  What has no exact form is commented out with the
+        reason.  Fills _rot_mode and _rot_lines; runs after the planners that add knot beams."""
+        self._rot_mode, self._rot_lines = {}, {}
+        if not self._transformed or getattr(self.opt, "solid_dof", False):
+            return
+        procs = [b for b in blocks if b.keyword in PROC_KW]
+        if procs and all(b.keyword == "HEAT TRANSFER" for b in procs):
+            return
+        kin = self._kinematic_refs(blocks)
+        own = {n for n in self._transformed if n not in self._rb_rot and
+               (n in self._rot_nodes or n in kin)}
+        if not own:
+            return
+        cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
+        step = 0
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword in ("BOUNDARY", "CLOAD"):
+                cards.append((b, step, self._rot_items(b, own)))
+        used = sorted({n for _, _, items in cards for n in items})
+        if not used:
+            return
+        dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
+        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        quiet = Report()
+        beam_nodes = {n for typ, conn in self.geom.elements.values()
+                      if ccx_element_type(typ, quiet) in BEAM_TYPES and
+                      not ccx_element_type(typ, quiet).startswith(("T2D", "T3D")) for n in conn}
+        sections = self._knot_sections(blocks)
+        at = self._elements_at(set(used))
+        # a circular section's mean-rotation BC locks the node's other rotations too
+        # (_plan_circ_rotation_knots): never kept as it is there
+        circ = {n for e in self._circ_beam_elements(blocks) for c in [self.geom.elements[e][1]]
+                if len(c) == 3 for n in (c[0], c[2])}
+        refused: Dict[int, str] = {}
+        knot_beams: List[int] = []
+        for n in used:
+            axes = self._local_axes(n)
+            trivial = all(self._zero_hold(b, items[n]) for b, _, items in cards if n in items)
+            if isinstance(axes, str):
+                if not trivial:
+                    self.report.warn(f"Rotational BCs / moments on node {n}, which has a *TRANSFORM, "
+                                     f"act about the global axes in ccx; Abaqus reads them in the "
+                                     f"node's local axes, but {axes}. Verify.", once=True)
+                continue
+            if n in kin:
+                mode = "global"
+            elif n in beam_nodes:
+                knot = self._ccx_knot(n, sections, at)
+                many = {d for _, _, items in cards for d, _ in items.get(n, ())}
+                if knot is True:
+                    mode = "global"
+                elif knot is False and not dynamic and len(many) == 1 and n not in circ:
+                    mode = "keep"
+                elif explicit:
+                    mode = "keep" if trivial else "refuse"
+                    refused[n] = ("ccx's explicit solver stops on the knot beam that would carry "
+                                  "them in global components, and without one ccx makes the node a "
+                                  "knot itself, evaluating its *TRANSFORM elsewhere (probed in "
+                                  "*DYNAMIC steps: 0.7-380 % off)")
+                else:
+                    mode = "global"
+                    if n not in self._knots:
+                        knot_beams.append(n)
+            else:
+                knot = self._ccx_knot(n, sections, at)
+                if trivial or (knot is False and not dynamic):
+                    mode = "keep"
+                elif knot is True and not dynamic:
+                    mode = "global"
+                else:
+                    mode = "refuse"
+                    refused[n] = ("in a deck with a *DYNAMIC step ccx makes the shell node a knot "
+                                  "itself, evaluating its *TRANSFORM elsewhere (probed: 28-90 % "
+                                  "off)" if dynamic else
+                                  "ccx reads them in the local axes on a plain shell node but "
+                                  "about the global ones on a knot, and the converter cannot tell "
+                                  "which this node is (its elements' normals differ by 15-25 deg, "
+                                  "or the deck has *NORMAL definitions)")
+            self._rot_mode[n] = mode
+        if knot_beams:
+            self._add_knot_beams(knot_beams, blocks)
+            self.report.note(f"{len(knot_beams)} beam node(s) with a *TRANSFORM and rotational BCs "
+                             f"or moments (e.g. node {knot_beams[0]}) got a force-free knot beam (a "
+                             f"B31 to a new free node, elset/material {KNOT_SET}, no density): on a "
+                             f"plain beam node ccx 2.23 makes them mean-rotation MPCs about the "
+                             f"local axes, several of which can clash ('zero coefficient on the "
+                             f"dependent side', probed: up to 156 % off), and in *DYNAMIC steps it "
+                             f"evaluates the transform elsewhere; on the knot they are written in "
+                             f"global components (exact). A knot holds the beam section rigid at "
+                             f"the node, as beam theory does.", once=True)
+        for n, mode in self._rot_mode.items():
+            if mode == "global":
+                self._rot_global_lines(n, self._local_axes(n), cards)
+            elif mode == "refuse":
+                for b, _, items in cards:
+                    if n in items:
+                        self._rot_lines[(id(b), n)] = refused[n]
+        if any(m == "global" for m in self._rot_mode.values()):
+            self.report.note("Rotational BCs / moments on knotted shell/beam nodes and kinematic "
+                             "reference nodes with a *TRANSFORM written in global components: ccx "
+                             "2.23 applies them to a rotation node it makes without the transform, "
+                             "about the global axes (probed), while Abaqus reads them in the node's "
+                             "local axes — a moment line by line, held rotations as their global "
+                             "values.", once=True)
+
+    def _rot_items(self, b: Block, nodes: set) -> Dict[int, List[Tuple[int, float]]]:
+        """(DOF, value) per node of ``nodes`` that the *BOUNDARY or *CLOAD ``b`` gives on DOFs
+        4-6, as handle_boundary / handle_cload emit the card (a named BC type: zero on its
+        rotations, where it has them; a value that does not read as a number: NaN)."""
+        out: Dict[int, List[Tuple[int, float]]] = {}
+
+        def num(x: str) -> float:
+            try:
+                return pf(x) if x else 0.0
+            except ValueError:
+                return float("nan")
+        if b.keyword == "CLOAD":
+            for ln in b.data:
+                f = [x.strip() for x in ln.split(",")]
+                if len(f) >= 2 and re.fullmatch(r"[456]", f[1]):
+                    for n in self._resolve_nodes(f[0]):
+                        if n in nodes:
+                            out.setdefault(n, []).append((int(f[1]), num(f[2] if len(f) > 2 else "")))
+            return out
+        for rec in self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) < 2 or not g[0]:
+                continue
+            if re.fullmatch(r"[-+]?\d+", g[1]):
+                d1 = int(g[1])
+                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
+                ranges, value = [(min(d1, d2), max(d1, d2))], num(g[3] if len(g) > 3 else "")
+            else:
+                ranges, value = self._named_bc_dofs(g[1], self._named_bc_rot(g[0])) or [], 0.0
+            for n in self._resolve_nodes(g[0]):
+                if n in nodes:
+                    out.setdefault(n, []).extend((d, value) for lo, hi in ranges
+                                                 for d in range(max(lo, 4), min(hi, 6) + 1))
+        return {n: v for n, v in out.items() if v}
+
+    @staticmethod
+    def _zero_hold(b: Block, items: List[Tuple[int, float]]) -> bool:
+        """A displacement *BOUNDARY that holds all of DOFs 4-6 at zero — the same in any axes."""
+        return b.keyword == "BOUNDARY" and Converter._bc_type(b) == "DISPLACEMENT" and \
+            not b.has("FIXED") and not b.has("USER") and \
+            {d for d, _ in items} == {4, 5, 6} and all(v == 0.0 for _, v in items)
+
+    @staticmethod
+    def _fmt_rot(v: float, scale: float) -> str:
+        """A value written in global components: rounding noise (below 1e-12 of the values it
+        came from) as 0, at most 18 characters (ccx reads 20 of a field)."""
+        return "0." if abs(v) <= 1e-12 * scale else "%.12g" % v
+
+    def _rot_global_lines(self, n: int, axes: Tuple[Vec, Vec, Vec],
+                          cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]]) -> None:
+        """_rot_lines for node ``n``, whose rotational BCs and moments ccx applies about the
+        global axes: each card's are rewritten in global components where the step semantics
+        let them (Abaqus: a BC or load given in a later step replaces that DOF's, OP=NEW
+        removes the earlier steps'; ccx: likewise per global DOF, loads given within a step
+        add up).
+
+        * BCs: the state after each card (the local rotations held, their values) as its
+          global values — all three local rotations, or a set whose axes span global ones (a
+          transform about z: local 6 = global 6, local 4-5 = global 4-5), all held at zero as
+          they are; values from an earlier step with an amplitude, or with another amplitude
+          than the card's, have no such form;
+        * moments: each line as its three global components; the first card of a step that
+          loads some of the node's local rotations also gives the components of the ones an
+          earlier step loaded and this one leaves (they carry on in Abaqus, while ccx replaces
+          the global DOFs), if they have no amplitude; a step whose cards have different
+          amplitudes has no such form."""
+        state: Dict[int, Tuple[float, Optional[str], int]] = {}
+        for b, s, items in cards:
+            if b.keyword != "BOUNDARY":
+                continue
+            if (b.param("OP") or "").strip().upper() == "NEW":
+                state = {j: e for j, e in state.items() if e[2] == s}
+            if n not in items:
+                continue
+            if self._bc_type(b) != "DISPLACEMENT" or b.has("FIXED") or b.has("USER"):
+                self._rot_lines[(id(b), n)] = ("a velocity, acceleration, FIXED or USER boundary "
+                                               "condition on the rotations has no form in global "
+                                               "components")
+                continue
+            amp = (b.param("AMPLITUDE") or "").strip().upper() or None
+            for d, v in items[n]:
+                state[d] = (v, amp, s)
+            self._rot_lines[(id(b), n)] = self._rot_bc_global(n, axes, state, amp, s)
+        state = {}
+        groups: Dict[int, List[Tuple[Block, List[Tuple[int, float]]]]] = {}
+        for b, s, items in cards:
+            if b.keyword == "CLOAD" and n in items:
+                groups.setdefault(s, []).append((b, items[n]))
+        verdict: Dict[int, Optional[str]] = {}
+
+        def comps(d: int, v: float) -> List[str]:
+            return [f"{n}, {k + 4}, {self._fmt_rot(v * axes[d - 4][k], abs(v))}" for k in range(3)]
+        for b, s, items in cards:
+            if b.keyword != "CLOAD":
+                continue
+            if (b.param("OP") or "").strip().upper() == "NEW":
+                state = {j: e for j, e in state.items() if e[2] == s}
+            if n not in items:
+                continue
+            amp = (b.param("AMPLITUDE") or "").strip().upper() or None
+            lines: List[str] = []
+            if s not in verdict:
+                group = groups[s]
+                respec = {d for _, its in group for d, _ in its}
+                carried = {j: e for j, e in state.items() if j not in respec and e[0] != 0.0}
+                why = None
+                if len({(c.param("AMPLITUDE") or "").strip().upper() for c, _ in group}) > 1:
+                    why = ("this step loads the rotations with different amplitudes, which share "
+                           "the global DOFs in ccx")
+                elif any(e[1] is not None or amp is not None for e in carried.values()):
+                    why = ("an earlier step's moment on another rotation of the node carries on in "
+                           "Abaqus with an amplitude, which the global components would restart")
+                elif any(math.isnan(v) for _, its in group for _, v in its):
+                    why = "a value does not read as a number (a *PARAMETER?)"
+                verdict[s] = why
+                if why is None:
+                    for j, (v, _, _) in carried.items():
+                        lines += comps(j, v)
+                for d in respec:
+                    state.pop(d, None)
+            for d, v in items[n]:
+                prev = state.get(d)
+                state[d] = ((prev[0] if prev else 0.0) + v, amp, s)
+                lines += comps(d, v)
+            self._rot_lines[(id(b), n)] = verdict[s] or lines
+
+    def _rot_bc_global(self, n: int, axes: Tuple[Vec, Vec, Vec],
+                       state: Dict[int, Tuple[float, Optional[str], int]], amp: Optional[str],
+                       s: int) -> Union[List[str], str]:
+        """The *BOUNDARY lines that hold node ``n``'s local rotations ``state`` (DOF -> value,
+        amplitude, step) in global components, or why there are none (see _rot_global_lines)."""
+        vals = {j: e[0] for j, e in state.items()}
+        if any(math.isnan(v) for v in vals.values()):
+            return "a value does not read as a number (a *PARAMETER?)"
+        if any(v != 0.0 and (a != amp or (a is not None and s0 != s)) for v, a, s0 in state.values()):
+            return ("the rotations held have different amplitudes, or one carries an amplitude on "
+                    "from an earlier step, which the global values would restart")
+        held = sorted(vals)
+        if held == [4, 5, 6] and not any(vals.values()):
+            return [f"{n}, 4, 6"]
+        support = [k for k in range(3) if any(abs(axes[j - 4][k]) > 1e-9 for j in held)]
+        if len(support) != len(held):
+            return ("the local rotation axes held are not a set of global ones (ccx holds a "
+                    "knot's rotations about the global axes only)")
+        scale = max(abs(v) for v in vals.values()) or 1.0
+        return [f"{n}, {k + 4}, {k + 4}" + (", " + self._fmt_rot(g, scale) if g != 0.0 else "")
+                for k in support for g in [sum(vals[j] * axes[j - 4][k] for j in held)]]
+
+    def _knot_sections(self, blocks: List[Block]) -> Dict[int, tuple]:
+        """Element -> what ccx's knot test compares of its section (gen3dnor): a shell's
+        ('S', thickness, offset), a beam's ('B', section type, dimensions); elements of a
+        section card that does not read so are left out."""
+        out: Dict[int, tuple] = {}
+        for b in blocks:
+            if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
+                                 "BEAM GENERAL SECTION"):
+                continue
+            recs = [[x.strip() for x in r if x.strip() != ""] for r in merged_data_records(b)]
+            recs = [r for r in recs if r]
+            try:
+                if b.keyword.startswith("SHELL"):
+                    thick = sum(pf(r[0]) for r in recs) if b.has("COMPOSITE") else pf(recs[0][0])
+                    key: tuple = ("S", thick, (b.param("OFFSET") or "0").strip().upper())
+                else:
+                    key = ("B", (b.param("SECTION") or "").strip().upper(),
+                           tuple(pf(x) for x in recs[0]))
+            except (IndexError, ValueError):
+                continue
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                out[e] = key
+        return out
+
+    def _elements_at(self, nodes: set) -> Dict[int, List[int]]:
+        """Node -> the elements (ids, ascending) that have it, for ``nodes``."""
+        at: Dict[int, List[int]] = {}
+        for e, (_, conn) in self.geom.elements.items():
+            for m in conn:
+                if m in nodes:
+                    at.setdefault(m, []).append(e)
+        return {m: sorted(set(es)) for m, es in at.items()}
+
+    def _ccx_knot(self, n: int, sections: Dict[int, tuple],
+                  at: Optional[Dict[int, List[int]]] = None) -> Optional[bool]:
+        """Whether ccx 2.23 makes shell/beam node ``n`` a knot (True, False, or None where the
+        converter cannot tell).  gen3dnor groups a node's shell and beam elements: an element
+        joins the group of the lowest-numbered one when its section (thickness, offset; a
+        beam's section) is the same and its direction within 20 deg (0.5 deg with *NORMAL
+        definitions) — a shell's normal, a beam's tangent and second section axis; more than
+        one group makes a knot.  Within 15 deg is one group here, more than 25 deg two; a
+        converter knot beam, trusses or other elements at the node decide it too."""
+        if n in self._knots:
+            return True
+        quiet = Report()
+        shells: List[int] = []
+        beams: List[int] = []
+        for e in (at if at is not None else self._elements_at({n})).get(n, []):
+            cc = ccx_element_type(self.geom.elements[e][0], quiet)
+            if cc in SHELL_TYPES or cc.startswith("M3D"):
+                shells.append(e)
+            elif cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D")):
+                beams.append(e)
+            elif not cc.startswith(("MASS", "SPRING", "DASHPOT")):
+                return None
+        if shells and beams:
+            return True
+        if self._has_normal or not (shells or beams):
+            return None
+        pts = self.geom.nodes
+
+        def direction(e: int) -> Optional[Tuple[Vec, ...]]:
+            typ, conn = self.geom.elements[e]
+            if e in shells:
+                nc = 3 if len(conn) in (3, 6) else 4
+                i = conn.index(n)
+                if i < nc:
+                    p = pts[conn[i]]
+                    v = vcross(vsub(pts[conn[(i + 1) % nc]], p), vsub(pts[conn[(i - 1) % nc]], p))
+                elif nc == 4:
+                    v = vcross(vsub(pts[conn[2]], pts[conn[0]]), vsub(pts[conn[3]], pts[conn[1]]))
+                else:
+                    v = vcross(vsub(pts[conn[1]], pts[conn[0]]), vsub(pts[conn[2]], pts[conn[0]]))
+                return (vunit(v),) if vnorm(v) else None
+            t = vsub(pts[conn[-1]], pts[conn[0]])
+            n1 = self._beam_n1.get(e)
+            if not vnorm(t) or n1 is None or not vnorm(vcross(t, n1)):
+                return None
+            return vunit(t), vunit(vcross(t, n1))
+        group = sorted(shells or beams)
+        ref = direction(group[0])
+        if ref is None or group[0] not in sections:
+            return None
+        verdict: Optional[bool] = False
+        for e in group[1:]:
+            d = direction(e)
+            if d is None or e not in sections:
+                return None
+            if sections[e] != sections[group[0]]:
+                return True
+            cos = min(vdot(a, c) for a, c in zip(ref, d))
+            if cos < math.cos(math.radians(25.0)):
+                return True
+            if cos < math.cos(math.radians(15.0)):
+                verdict = None
+        return verdict
+
+    def _rot_refused(self, b: Block, n: int, why: Optional[str]) -> List[str]:
+        """Comment lines (and a warning) for node ``n``'s rotational BCs / moments in card
+        ``b`` that have no exact form (see _plan_transformed_rotations)."""
+        why = why or ("a velocity or acceleration boundary condition, converted into a "
+                      "displacement one with a generated amplitude, has no form in global "
+                      "components")
+        what = "BCs" if b.keyword == "BOUNDARY" else "moments"
+        self.report.n_commented += 1
+        self.report.warn(f"*{b.keyword} on DOFs 4-6 of a node with a *TRANSFORM (e.g. node {n}) "
+                         f"commented out — the rotational {what} are missing: Abaqus reads them in "
+                         f"the node's local axes, and {why}.", once=True)
+        return [f"** abq2ccx: node {n}, DOFs 4-6 of this *{b.keyword} left out: no exact form in "
+                f"ccx 2.23 ({why})"]
 
     def _to_local_axes(self, forces: Dict[Tuple[int, int], float], nodes: Sequence[int],
                        flat: set) -> Tuple[Dict[Tuple[int, int], float], Optional[str]]:
@@ -8911,6 +9344,59 @@ class Converter:
         return pre + [emit_keyword("RIGID BODY", keep)] + list(b.data) + ties
 
     def handle_equation(self, b: Block) -> List[str]:
+        """``*EQUATION``: node sets resolved (_equation_lines), then the terms on DOFs 4-6 of
+        nodes whose rotation ccx carries elsewhere or misreads:
+
+        * a *RIGID BODY reference node (and a node whose rotation a ROT NODE carries: a
+          converted kinematic coupling's reference node, a connector rotation node's): ccx
+          carries the body's rotation on DOFs 1-3 of the ROT NODE and ignores DOFs 4-6 of the
+          REF NODE — a term there acts as a fixed zero, or stops ccx when the node has a
+          *TRANSFORM (probed) — so the term moves to the ROT NODE, which has the node's local
+          axes if it has a *TRANSFORM (exact, probed against the rotated model);
+        * any other node with a *TRANSFORM: ccx 2.23 reads DOF 4 about the global axis and
+          DOFs 5-6 through an out-of-range read of the 3 x 3 transformation matrix (terms on
+          the node's translations with undefined coefficients, or 'SPC in node ... in
+          transformed coordinates cannot be converted in MPC'; probed), with no exact form —
+          the equation is commented out."""
+        out = self._equation_block_lines(b)
+        card = mkblock("EQUATION", data=out[1:])
+        eqs = self._equation_terms(card)
+        moved, bad = False, None
+        for eq in eqs:
+            for i, (tok, dof, coef) in enumerate(eq):
+                if not re.fullmatch(r"[-+]?\d+", dof.strip()) or not 4 <= int(dof) <= 6:
+                    continue
+                nodes = self._resolve_nodes(tok)
+                if len(nodes) == 1 and nodes[0] in self._rb_rot:
+                    eq[i] = (str(self._rb_rot[nodes[0]]), str(int(dof) - 3), coef)
+                    moved = True
+                elif any(n in self._transformed for n in nodes):
+                    bad = bad or next(n for n in nodes if n in self._transformed)
+        if bad is not None:
+            self.report.n_commented += 1
+            self.report.warn(f"*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (e.g. "
+                             f"node {bad}) commented out — the constraint is missing: ccx 2.23 "
+                             f"reads DOF 4 there about the global axis and DOFs 5-6 through an "
+                             f"out-of-range read of the transformation matrix (terms on the node's "
+                             f"translations with undefined coefficients, or it stops; probed), "
+                             f"while Abaqus reads them in the local axes. Write the constraint "
+                             f"without the rotations of transformed nodes.", once=True)
+            return ["** abq2ccx: *EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM "
+                    "(misread by ccx 2.23) commented out"] + ["** " + x for x in out]
+        if not moved:
+            return out
+        self.report.note("*EQUATION terms on DOFs 4-6 of a *RIGID BODY reference node moved to DOFs "
+                         "1-3 of its ROT NODE, which carries the body's rotation (ccx ignores DOFs "
+                         "4-6 of the REF NODE: a term there would act as a fixed zero; probed).",
+                         once=True)
+        lines = [out[0]]
+        for eq in eqs:
+            lines.append(str(len(eq)))
+            for j in range(0, len(eq), 4):            # ccx: at most 12 entries per line
+                lines.append(", ".join(f"{n}, {d}, {c}" for n, d, c in eq[j:j + 4]))
+        return lines
+
+    def _equation_block_lines(self, b: Block) -> List[str]:
         """``*EQUATION``: ccx 2.22 requires node NUMBERS in the terms; Abaqus/CAE decks
         (esp. periodic-BC lattices) write node SETS.  Resolve single-node sets directly;
         expand equal-length multi-node sets into one equation per node pairing."""
@@ -8978,17 +9464,19 @@ class Converter:
                                  f"ccx will reject a set name here.", once=True)
         self._last_coupling = self._coupling_plan.get(id(b))
         self._last_planar = id(b) in self._planar_kin
-        if (self._last_coupling or {}).get("kind") == "rb":
+        if (self._last_coupling or {}).get("kind") in ("rb", "rbk"):
             return self._coupling_as_rigid_body(self._last_coupling)
         if (self._last_coupling or {}).get("kind") == "unsupported":
             self._warn_rigid_unsupported()
         return [emit_keyword("COUPLING", params)] + list(b.data)
 
     def _coupling_as_rigid_body(self, plan: dict) -> List[str]:
-        """A kinematic coupling of all translations whose reference node is a shell/beam
-        node, as the equivalent *RIGID BODY: ccx would otherwise carry the coupling's
-        rotation and the knotted node's own rotation as two unrelated unknowns (see
-        _plan_rigid_couplings), so the ROT NODE is tied to the node's rotations instead."""
+        """A kinematic coupling of all translations as the equivalent *RIGID BODY — the same
+        RIGID MPCs in ccx.  With a shell/beam reference node ("rb") ccx would otherwise carry
+        the coupling's rotation and the knotted node's own rotation as two unrelated unknowns
+        (see _plan_rigid_couplings), so the ROT NODE is tied to the node's rotations instead;
+        with a transformed reference node ("rbk", _plan_kinematic_rot_nodes) the ROT NODE
+        carries the rotation in the node's local axes."""
         ref, rot, members = plan["ref"], plan["rot"], plan["members"]
         if not members:
             self.report.warn("*COUPLING couples only its own reference node; dropped.", once=True)
@@ -8997,12 +9485,13 @@ class Converter:
         name = f"ABQ2CCX_RB{self._synth_counter}"
         out = [f"*NSET, NSET={name}"] + reflow([str(n) for n in members])
         out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
-        out += self._rot_node_follows(rot, ref)
+        if plan["kind"] == "rb":
+            out += self._rot_node_follows(rot, ref)
+            self.report.note("*COUPLING + *KINEMATIC with a shell/beam REF NODE -> *RIGID BODY on "
+                             "the coupled nodes (the reference node itself left out), with a ROT "
+                             "NODE tied to the reference node's rotations: as a ccx kinematic "
+                             "coupling the node would carry two unrelated rotations.", once=True)
         out += self._rotation_ties(members, rot, -3, sorted(plan["dofs"]))
-        self.report.note("*COUPLING + *KINEMATIC with a shell/beam REF NODE -> *RIGID BODY on the "
-                         "coupled nodes (the reference node itself left out), with a ROT NODE tied "
-                         "to the reference node's rotations: as a ccx kinematic coupling the node "
-                         "would carry two unrelated rotations.", once=True)
         return out
 
     def handle_kinematic(self, b: Block) -> List[str]:
@@ -9016,7 +9505,7 @@ class Converter:
         fixed itself, so coupling it stops ccx ('dependent side of a MPC and a SPC')."""
         plan, self._last_coupling = self._last_coupling or {}, None
         planar, self._last_planar = self._last_planar, False
-        if plan.get("kind") == "rb":
+        if plan.get("kind") in ("rb", "rbk"):
             return []                 # folded into the *RIGID BODY of the *COUPLING card
         top = 2 if planar else 3
         lines: List[str] = []
@@ -9519,6 +10008,7 @@ class Converter:
         self._plan_planar_constraint(blocks)
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
+        self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
         self._complete_temperature_ic()         # after every planner that adds knot nodes
         self._plan_output(blocks)               # last: it reads the final mesh (knot beams too)
@@ -9880,6 +10370,7 @@ class Converter:
             next_id += 1
             self.geom.add_node(next_id, self.geom.nodes.get(ref, (0.0, 0.0, 0.0)))
             self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
+        next_id = self._plan_kinematic_rot_nodes(blocks, next_id)
         for bodies in self._mpc_bodies.values():
             for body in bodies:
                 ref = body["ref"]
@@ -10655,7 +11146,7 @@ class Converter:
         refs: set = set()
         for i, b in enumerate(blocks):
             ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
-            if ref is None or ref in self._rot_nodes:
+            if ref is None or ref in self._rot_nodes or id(b) in self._kin_rb:
                 continue
             if b.keyword == "COUPLING" and i + 1 < len(blocks) and \
                     blocks[i + 1].keyword == "KINEMATIC" and \
@@ -10670,6 +11161,134 @@ class Converter:
                     except ValueError:
                         pass
         return refs
+
+    def _plan_kinematic_rot_nodes(self, blocks: List[Block], next_id: int) -> int:
+        """ccx builds a kinematic coupling (couplings.f) as RIGID MPCs on an internal rotation
+        node tied to DOFs 4-6 of the reference node, an internal node without the reference
+        node's *TRANSFORM: rotational BCs and moments there act about the global axes, and
+        *EQUATION terms on DOFs 4-6 of a transformed node are misread (DOF 4 global, 5-6
+        through an out-of-range read of the transformation matrix).  Abaqus reads all of
+        them in the node's local axes.  A coupling of all translations whose transformed
+        reference node's rotation is used — a rotational BC other than all three held at
+        zero, a moment, an *EQUATION term, a connector, rotations of coupled shell/beam
+        nodes, the rigid body of an *MPC BEAM — is therefore written as the *RIGID BODY it
+        is in ccx (the same RIGID MPCs) with a ROT NODE of its own (added here at the
+        reference node's position, ``_kin_rb``): the ROT NODE gets the node's axes
+        (_plan_rot_axes) and carries the rotation on DOFs 1-3, where BCs, moments and
+        equation terms are moved — read in the local axes (probed on 2.23 against the
+        rotated model: exact, linear and NLGEOM; as a kinematic coupling 34-253 % off).
+        Couplings of some translations, 2-D ones and reference nodes whose axes are
+        undefined keep their form (_plan_transformed_rotations).  Returns the last node id."""
+        quiet = Report()
+        structural = set(self._shell_nodes) | set(self._beam_nodes)
+        for typ, conn in self.geom.elements.values():
+            if ccx_element_type(typ, quiet).startswith("M3D"):
+                structural.update(conn)
+        cands: "OrderedDict[int, List[Tuple[int, bool]]]" = OrderedDict()  # ref -> (id, tied)
+        convertible: set = set()             # couplings of all translations, 3-D members
+        for i, b in enumerate(blocks):
+            if b.keyword != "COUPLING" or i + 1 >= len(blocks) or blocks[i + 1].keyword != "KINEMATIC":
+                continue
+            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            if ref is None or ref not in self._transformed or ref in self._rb_rot or \
+                    ref in structural or isinstance(self._local_axes(ref), str):
+                continue
+            dofs = self._kinematic_dofs(blocks[i + 1])
+            members = [n for n in self._surface_member_nodes(b.param("SURFACE") or "") if n != ref]
+            if not {1, 2, 3} <= dofs or not members or all(n in self._plane_only for n in members):
+                cands.setdefault(ref, []).append((id(b), False))
+                continue
+            tied = bool(dofs & {4, 5, 6}) and any(n in structural for n in members)
+            cands.setdefault(ref, []).append((id(b), tied))
+            convertible.add(id(b))
+        for ref, cs in cands.items():
+            # every coupling on the node converts (sharing one ROT NODE), or none does
+            if any(t for _, t in cs) or self._rotation_used(ref, blocks):
+                if any(c not in convertible for c, _ in cs):
+                    continue
+                next_id += 1
+                self.geom.add_node(next_id, self.geom.nodes.get(ref, (0.0, 0.0, 0.0)))
+                self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
+                for c, _ in cs:
+                    self._kin_rb[c] = next_id
+        if self._kin_rb:
+            self.report.note(f"{len(self._kin_rb)} kinematic coupling(s) with a *TRANSFORM on the "
+                             f"reference node written as *RIGID BODY with a ROT NODE in the node's "
+                             f"local axes (the same RIGID MPCs in ccx): ccx's kinematic coupling "
+                             f"carries the rotation on an internal node without the *TRANSFORM, "
+                             f"so rotational BCs and moments there would act about the global "
+                             f"axes and *EQUATION terms on DOFs 4-6 be misread; Abaqus reads them "
+                             f"in the local axes. They are moved to the ROT NODE's DOFs 1-3 "
+                             f"(probed on 2.23: exact, linear and NLGEOM).")
+        return next_id
+
+    def _rotation_used(self, n: int, blocks: List[Block]) -> bool:
+        """Whether the deck uses the rotation of node ``n`` in a way that depends on its axes: a
+        *BOUNDARY on DOFs 4-6 other than all three held at zero (the same in any axes), a
+        *CLOAD or an *EQUATION term there, a connector constraining it, or the rigid body of
+        *MPC BEAM lines on it."""
+        for b in blocks:
+            if b.keyword == "BOUNDARY":
+                fixed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
+                    b.has("FIXED") or b.has("USER")
+                got: Dict[int, float] = {}
+                for nodes, dofs, mag in self._bc_records(b, True):
+                    if n in nodes:
+                        got.update((d, mag) for d in dofs if 4 <= d <= 6)
+                if got and (fixed or set(got) != {4, 5, 6} or any(v != 0.0 for v in got.values())):
+                    return True
+            elif b.keyword == "CLOAD":
+                for rec in merged_data_records(b):
+                    f = [x.strip() for x in rec]
+                    if len(f) > 1 and re.fullmatch(r"[456]", f[1]) and n in self._resolve_nodes(f[0]):
+                        return True
+            elif b.keyword == "EQUATION":
+                if any(4 <= d <= 6 and n in ns for ns, d in self._equation_dofs(b)):
+                    return True
+        for sec in self._conn_plan.values():
+            for it in sec["items"]:
+                if it["route"] in ("rows", "rigid", "beam") and n in (it["a"], it["b"]) and \
+                        (it["rot"] is not None or (it["a"] == n and vnorm(it["d"]) > 0.0)):
+                    return True
+        return any(body["ref"] == n for bodies in self._mpc_bodies.values() for body in bodies)
+
+    def _equation_dofs(self, b: Block) -> List[Tuple[List[int], int]]:
+        """(nodes, DOF) of every term of the *EQUATION card ``b`` (a node set term: its
+        nodes); unreadable fields are skipped."""
+        out: List[Tuple[List[int], int]] = []
+        for eq in self._equation_terms(b):
+            for tok, dof, _ in eq:
+                try:
+                    out.append((self._resolve_nodes(tok), pint(dof)))
+                except ValueError:
+                    pass
+        return out
+
+    @staticmethod
+    def _equation_terms(b: Block) -> List[List[Tuple[str, str, str]]]:
+        """The equations of an *EQUATION card as lists of (node or set, DOF, coefficient)
+        fields: each starts with a line giving its number of terms, then up to four terms a
+        line.  A card that does not parse so gives []."""
+        recs = [[x.strip() for x in rec if x.strip() != ""] for rec in merged_data_records(b)]
+        recs = [r for r in recs if r]
+        out: List[List[Tuple[str, str, str]]] = []
+        i = 0
+        while i < len(recs):
+            try:
+                count = pint(recs[i][0])
+            except ValueError:
+                return []
+            if len(recs[i]) != 1 or count < 1:
+                return []
+            toks: List[str] = []
+            i += 1
+            while len(toks) < 3 * count and i < len(recs):
+                toks += recs[i]
+                i += 1
+            if len(toks) != 3 * count:
+                return []
+            out.append([(toks[k], toks[k + 1], toks[k + 2]) for k in range(0, len(toks), 3)])
+        return out
 
     def _plan_connector_rows(self, blocks: List[Block]) -> None:
         """Connector elements, part 2 of their plan (after the rigid bodies and knots): the
@@ -11171,6 +11790,12 @@ class Converter:
                     continue
                 members = self._surface_member_nodes(b.param("SURFACE") or "")
                 dofs = self._kinematic_dofs(nxt)
+                if id(b) in self._kin_rb:          # a *RIGID BODY (_plan_kinematic_rot_nodes)
+                    knots += [n for n in members if n in structural]
+                    self._coupling_plan[id(b)] = {"kind": "rbk", "ref": ref, "dofs": dofs,
+                                                  "rot": self._kin_rb[id(b)],
+                                                  "members": [n for n in members if n != ref]}
+                    continue
                 if not dofs & {1, 2, 3} or not any(n in structural for n in members + [ref]):
                     continue
                 if ref not in structural:
@@ -11557,7 +12182,7 @@ class Converter:
                 if nxt is None or nxt.keyword != "KINEMATIC":
                     continue
                 plan = (self._coupling_plan.get(id(b)) or {}).get("kind")
-                kind, tied, rb = "kin", plan in ("kin", "rb"), plan == "rb"   # rb: a *RIGID BODY
+                kind, tied, rb = "kin", plan in ("kin", "rb", "rbk"), plan in ("rb", "rbk")
                 lines = [(self._surface_member_nodes(b.param("SURFACE") or ""),
                           self._kinematic_dofs(nxt))]
             else:
@@ -13073,7 +13698,8 @@ class Converter:
                              f"beam(s) is unrestrained — Abaqus' planar beams have no such DOF; ccx "
                              f"shows a 0 Hz twist mode in *FREQUENCY and its *BUCKLE factors (near 1) "
                              f"are meaningless. No BC was added: none of its nodes can take one "
-                             f"(nodes under a *TRANSFORM, where ccx allows no rotational BC, and "
+                             f"(nodes under a *TRANSFORM, where ccx reads a rotational BC in the "
+                             f"local axes, and "
                              f"rigid-body/coupling reference nodes are skipped; on a circular section "
                              f"only an element's middle node holds the twist alone).", once=True)
             self._reduces("2-D beam twist unrestrained")
@@ -13187,8 +13813,9 @@ class Converter:
         _plan_planar_constraint).  Returns those nodes and the number of such beams with no
         safe node.  Beams with constrained nodes are left alone (the constraint may hold
         the twist); a beam that is not straight has no rigid twist once DOF 3 is fixed.
-        Nodes with a *TRANSFORM are never picked: ccx allows no rotational BC there.  On a
-        circular section the node is a 3-node element's middle node."""
+        Nodes with a *TRANSFORM are never picked: ccx reads a rotational BC there in the
+        local axes (or, on a knot, the global ones; probed).  On a circular section the node is
+        a 3-node element's middle node."""
         beams = [e for e, t in planar.items() if t not in PLANAR_TRUSS_TYPES]
         root: Dict[int, int] = {}
 
@@ -13268,7 +13895,7 @@ class Converter:
         (0.3-1.3 % with a knot inside a span of 40-10 elements; nothing at a pinned end); a
         node ccx makes a knot anyway (a frame joint) gets one too, harmlessly.  Left alone:
         full zero clamps (exact as they are), 3-node elements' middle nodes (the tied nodes
-        are unused there), nodes with a *TRANSFORM (ccx allows no rotational BC there) or
+        are unused there), nodes with a *TRANSFORM (_plan_transformed_rotations) or
         that are rigid-body/coupling reference nodes, heat-transfer-only decks; a deck with
         an explicit dynamic step is only warned (the explicit solver stops on the density-
         free knot beams: '*ERROR in calcstabletimeincvol').  Runs after

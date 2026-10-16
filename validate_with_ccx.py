@@ -1338,6 +1338,37 @@ def main():
     failures += same_as("mpc_transform, NLGEOM x5, with a cylindrical *TRANSFORM on the reference "
                         "point", with_transform(nl_mpc_tr, 301, *cyl, rp_xyz),
                         untransformed(nl_mpc_tr))
+    # Rotational BCs and moments on DOFs 4-6 of nodes with a *TRANSFORM, which ccx 2.23 applies
+    # about the global axes on a kinematic reference point and a knot (and as clashing mean-
+    # rotation MPCs on a plain beam node): the reference point's coupling becomes a *RIGID BODY
+    # whose ROT NODE has its axes, the beam tip a knot with its moments in global components.
+    # The twin: no *TRANSFORM, a *RIGID BODY with an untransformed ROT NODE 101 whose rotation
+    # about local 2 an *EQUATION holds, a knot beam at the tip, everything in global components.
+    rot_deck = open(os.path.join(EXAMPLES, "transform_rotations.inp")).read()
+    ea = local_axes("C", (0.3, -0.2, -0.4), (1.1, 0.9, 1.6), (4.0, 0.5, 0.5))
+    eb = local_axes("R", (1., 2., 0.5), (-1., 0.3, 1.), (2.5, 3., 0.))
+
+    def components(node, base, pairs, axes):
+        return [f"{node}, {base + k + 1}, {sum(v * axes[j][k] for j, v in pairs)!r}" for k in range(3)]
+    twin = re.sub(r"(?m)^\*Transform.*\n.*\n", "", rot_deck)
+    order = sorted(range(3), key=lambda k: -abs(ea[1][k]))
+    twin = twin.replace(
+        "*Surface, type=NODE, name=FACES\nFACE\n*Coupling, constraint name=END, ref node=RP, "
+        "surface=FACES\n*Kinematic\n",
+        "*Node\n101, 4.0, 0.5, 0.5\n212, 5.05, 3.05, 0.05\n*Rigid Body, ref node=RP, rot node=101, "
+        "tie nset=FACE\n*Equation\n3\n" + ", ".join(f"101, {k + 1}, {ea[1][k]!r}" for k in order)
+        + "\n*Element, type=B31, elset=KNOT\n30, 211, 212\n*Beam Section, elset=KNOT, material=M, "
+        "section=RECT\n0.05, 0.05\n1., -1., 0.\n")
+    twin = twin.replace("*Boundary\nRP, 5, 5\n", "")
+    loads = "\n".join(components("RP", 0, [(0, 0.5)], ea) + components(101, 0, [(0, 0.3), (2, 2.)], ea)
+                      + components("TIP", 0, [(1, 0.1)], eb)
+                      + components("TIP", 3, [(0, 0.5), (2, -0.3)], eb))
+    twin = re.sub(r"(?s)\*Cload\n.*?\*Node Print", "*Cload\n" + loads + "\n*Node Print", twin)
+    failures += same_as("transform_rotations (a kinematic reference point with a cylindrical "
+                        "*TRANSFORM, its rotation about local 2 held, local moments; a beam tip "
+                        "with local moments)", rot_deck, twin)
+    nl = lambda t: t.replace("*Step\n*Static\n", "*Step, nlgeom=YES, inc=200\n*Static\n0.05, 1., 1e-6, 0.05\n")  # noqa: E731
+    failures += same_as("transform_rotations, NLGEOM", nl(rot_deck), nl(twin))
 
     # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs ----------
     # A column pulled through a rigid reference point: the velocity ramps in by a SMOOTH

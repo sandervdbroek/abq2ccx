@@ -49,6 +49,11 @@ without an error. A full audit and the work that followed:
   terms only where no two share a global DOF, else through an untransformed twin node, as
   ccx 2.23 mis-assembles an equation that holds a DOF twice (this also fixes the connector
   `LINK` to a transformed node).
+* **Rotations of `*TRANSFORM`ed nodes** — rotational BCs, moments and `*EQUATION` terms on
+  DOFs 4–6 written as ccx reads them: a transformed kinematic reference node's coupling as
+  a `*RIGID BODY` with a `ROT NODE` in its axes, knot beams and global components on beam
+  nodes, equation terms moved to rigid bodies' `ROT NODE`s; what has no exact form
+  commented out and warned.
 * **Materials and orientations** — per-element `*DISTRIBUTION` orientations; the elastic
   forms ccx 2.23 needs beside orthotropic and anisotropic expansion; halved ANISO expansion
   shear coefficients; zero-shear ANISO written as ORTHO; default initial temperatures.

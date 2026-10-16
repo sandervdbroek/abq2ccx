@@ -3105,7 +3105,7 @@ def test_planar_straight_beam_twist_held_at_one_node():
     clamped = PLANAR_BEAM.replace("1, ENCASTRE", "1, 1, 2\n4, 1, 2\n4, 6, 6")
     body, _, _ = convert_str(clamped)
     assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body
-    # ... and never at a node with a *TRANSFORM (ccx allows no rotational BC there)
+    # ... and never at a node with a *TRANSFORM (ccx would read the BC in its local axes)
     body, _, _ = convert_str(pinned.replace("*Step", "*Nset, nset=TURN\n1\n*Transform, nset=TURN\n"
                                             "1., 1., 0., -1., 1., 0.\n*Step", 1))
     assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body
@@ -3225,10 +3225,13 @@ def test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes():
         "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 4\n3, 2, 4\n*End Step\n"
     _, conv, _ = convert_str(deck)
     assert list(conv._knots) == [1, 3]
-    # no knot where ccx allows no rotational BC (*TRANSFORM), nor in a heat-transfer-only deck
-    _, conv, _ = convert_str(CIRC_BEAM + "*Nset, nset=TURN\n1\n*Transform, nset=TURN\n"
-                             "0., 1., 0., -1., 0., 0.\n*Boundary\n1, 1, 4\n3, 2, 4\n" + CIRC_STATIC)
-    assert list(conv._knots) == [3]
+    # a node with a *TRANSFORM gets its knot from _plan_transformed_rotations, which writes the
+    # local rotation in global components there (local 1 = y: DOF 5); none in a heat-transfer-
+    # only deck
+    body, conv, _ = convert_str(CIRC_BEAM + "*Nset, nset=TURN\n1\n*Transform, nset=TURN\n"
+                                "0., 1., 0., -1., 0., 0.\n*Boundary\n1, 1, 4\n3, 2, 4\n" + CIRC_STATIC)
+    assert list(conv._knots) == [3, 1] and conv._rot_mode == {1: "global"}
+    assert {"1,1,3", "1,5,5"} <= set(_bc_lines(body))
     _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, 1, 4\n*Step\n*Heat Transfer\n1., 1.\n"
                              "*End Step\n")
     assert not conv._knots
@@ -4926,6 +4929,281 @@ def test_transform_spherical_rigid_example():
     assert sorted(got) == [32, 33, 34, 37, 38, 39, 42, 43, 44, 100, rot] and got[100][0] == "C"
     assert f"\n{rot}, 1, 2\n" in body and f"\n{rot}, 3, 0.05\n" in body
     assert rep.n_warnings == 0 and not conv.unloaded_steps and not dangling_refs(reparse(body))
+
+
+# --- deck BCs, moments and *EQUATION terms on DOFs 4-6 of nodes with a *TRANSFORM -------
+
+# the top face of the cube coupled kinematically (all DOFs) to reference point 9
+KIN9 = HEX + ("*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+              "*Surface, type=NODE, name=TOPS\nTOPN\n*Coupling, constraint name=C1, ref node=RP, "
+              "surface=TOPS\n*Kinematic\n1, 6\n")
+KIN9_STEP = ("*Step\n*Static\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\nRP, 5, 5\n"
+             "RP, 4, 4, 0.01\n*Cload\nRP, 6, 2.\n*End Step\n")
+YX = "0., 2., 0., -1., 1., 0."          # rectangular: local 1 = y, 2 = -x, 3 = z
+
+
+def _axes_rect(a, b):
+    """Local axes e1, e2, e3 of a rectangular *TRANSFORM through a and b (Abaqus, ccx)."""
+    e1, e3 = _unit(a), _unit(_cross(a, b))
+    return e1, _cross(e3, e1), e3
+
+
+def test_kinematic_reference_node_with_a_transform_becomes_a_rigid_body():
+    # ccx's kinematic coupling carries the rotation on an internal node without the reference
+    # node's *TRANSFORM: rotational BCs and moments there would act about the global axes
+    # (probed: 34-253 % off).  As the *RIGID BODY it is in ccx, with a ROT NODE in the node's
+    # axes, they are read locally, as in Abaqus (probed: exact, linear and NLGEOM)
+    body, conv, rep = convert_str(_transformed(KIN9 + KIN9_STEP, "9", YX))
+    rot = conv._rb_rot[9]
+    assert "*COUPLING" not in body and "*KINEMATIC" not in body
+    assert f"*RIGID BODY, NSET=ABQ2CCX_RB1, REF NODE=9, ROT NODE={rot}" in body
+    assert _emitted_transforms(body)[rot] == ("R", [0., 1., 0., -1., 0., 0.])
+    assert {f"{rot},2,2", f"{rot},1,1,0.01"} <= set(_bc_lines(body))
+    assert _cloads(body) == [{(rot, 3): 2.0}]
+    assert "written as *RIGID BODY with a ROT NODE in the node's local axes" in rep.text()
+    assert rep.n_warnings == 0
+    # an *EQUATION term on the reference node's DOF 6 goes to the ROT NODE's DOF 3
+    deck = _transformed(KIN9 + "*Equation\n2\nRP, 6, 1., 1, 1, -1.\n" + STEP, "9", YX)
+    body, conv, rep = convert_str(deck)
+    assert sorted(_equation_terms(body)[0]) == [(1, 1, -1.), (conv._rb_rot[9], 3, 1.)]
+    # two couplings on the reference node: both rigid bodies, one ROT NODE; with one of them
+    # coupling some translations only, neither (that one cannot be a *RIGID BODY)
+    two = KIN9 + ("*Nset, nset=BOTN\n1, 2, 3, 4\n*Surface, type=NODE, name=BOTS\nBOTN\n"
+                  "*Coupling, constraint name=C2, ref node=RP, surface=BOTS\n*Kinematic\n1, 6\n")
+    body, conv, _ = convert_str(_transformed(two + KIN9_STEP.replace("1, 1, 3\n2, 1, 3\n3, 1, 3\n"
+                                                                     "4, 1, 3\n", ""), "9", YX))
+    rot = conv._rb_rot[9]
+    assert body.count(f"REF NODE=9, ROT NODE={rot}") == 2 and "*COUPLING" not in body
+    body, conv, _ = convert_str(_transformed(two.replace("*Kinematic\n1, 6\n*Nset", "*Kinematic\n"
+                                                         "1, 2\n*Nset") + KIN9_STEP, "9", YX))
+    assert body.count("*COUPLING") == 2 and 9 not in conv._rb_rot and conv._rot_mode[9] == "global"
+    # all three rotations held at zero (the same in any axes) uses no axes: still a coupling
+    held = KIN9 + "*Step\n*Static\n*Boundary\nRP, 4, 4\nRP, 5, 5\nRP, 6, 6\n*End Step\n"
+    body, conv, rep = convert_str(_transformed(held, "9", YX))
+    assert "*COUPLING" in body and 9 not in conv._rb_rot and rep.n_warnings == 0
+    # on its cylinder axis the reference node has no local axes: a coupling, warned
+    body, conv, rep = convert_str(_transformed(KIN9 + KIN9_STEP, "9", "0.5, 0.5, 0., 0.5, 0.5, 1.", "C"))
+    assert "*COUPLING" in body and "act about the global axes in ccx" in rep.text()
+    _, _, rep = convert_str(_transformed(held, "9", "0.5, 0.5, 0., 0.5, 0.5, 1.", "C"))
+    assert "act about the global axes" not in rep.text()
+
+
+def test_connector_on_a_transformed_kinematic_reference_node_uses_its_rot_node():
+    # a hinge to ground on the reference point: as a kinematic coupling ccx would carry the
+    # rotation on the point's DOFs 4-6, which it misreads (the connector was commented out);
+    # as the rigid body the rotation is on its ROT NODE, in the point's axes, where the rows
+    # go (probed: exact against the model without the transform)
+    hinge = KIN9 + ("*Orientation, name=AX\n0., 1., 0., 0., 0., 1.\n*Element, type=CONN3D2, "
+                    "elset=H\n20, 9\n*Connector Section, elset=H\nHinge,\nAX,\n" + STEP)
+    body, conv, rep = convert_str(_transformed(hinge, "9", YX))
+    rot = conv._rb_rot[9]
+    assert f"REF NODE=9, ROT NODE={rot}" in body and "** *CONNECTOR SECTION" not in body
+    # the hinge axis y is the point's local 1: its local 2 and 3 are held on the ROT NODE
+    assert {f"{rot},2,2", f"{rot},3,3"} <= set(_bc_lines(body)) and f"{rot},1,1" not in _bc_lines(body)
+    assert "own DOFs 4-6" not in rep.text() and rep.n_warnings == 0
+
+
+def test_kinematic_reference_node_that_stays_a_coupling_gets_global_components():
+    # a coupling of some translations cannot be a *RIGID BODY; ccx reads the moments and
+    # rotational BCs on its reference node about the global axes, so they are written in
+    # global components (local 1 = y, 2 = -x: theta . e1 = 0.01, theta . e2 = 0 is
+    # theta_x = 0, theta_y = 0.01; the moment about local 3 = z stays on DOF 6)
+    some = KIN9.replace("*Kinematic\n1, 6\n", "*Kinematic\n1, 2\n4, 6\n")
+    deck = _transformed(some + KIN9_STEP, "9", YX)
+    body, conv, rep = convert_str(deck)
+    assert "*COUPLING" in body and 9 not in conv._rb_rot and conv._rot_mode[9] == "global"
+    assert {"9,4,4", "9,5,5,0.01"} <= set(_bc_lines(body))
+    assert not any(l.startswith("RP,") and l.split(",")[1] in "456" for l in _bc_lines(body))
+    assert _close(_cloads(body)[0], {(9, 4): 0., (9, 5): 0., (9, 6): 2.})
+    assert "written in global components" in rep.text()
+    # a single oblique local rotation held there has no such form: commented out, warned
+    tilted = _transformed(some + KIN9_STEP.replace("RP, 4, 4, 0.01\n", ""), "9", "1., 1., 0., -1., 1., 1.")
+    body, conv, rep = convert_str(tilted)
+    assert "node 9, DOFs 4-6 of this *BOUNDARY left out" in body
+    assert "the local rotation axes held are not a set of global ones" in rep.text()
+
+
+def test_equation_terms_on_rigid_body_reference_rotations_move_to_the_rot_node():
+    # ccx carries a *RIGID BODY's rotation on DOFs 1-3 of its ROT NODE and ignores DOFs 4-6
+    # of the REF NODE: an *EQUATION term there acted as a fixed zero (probed: 100 % off), or
+    # stopped ccx on a transformed reference node; on the ROT NODE it is exact
+    eq = "*Equation\n2\nRP, 5, 1., 1, 1, -0.5\n"
+    for deck in (RB.replace("*Step", eq + "*Step", 1),
+                 _transformed(RB.replace("*Step", eq + "*Step", 1), "9", YX)):
+        body, conv, rep = convert_str(deck)
+        rot = conv._rb_rot[9]
+        assert sorted(_equation_terms(body)[0]) == [(1, 1, -0.5), (rot, 2, 1.)]
+        assert "moved to DOFs 1-3 of its ROT NODE, which carries the body's rotation" in rep.text()
+    # translations of the reference node stay where they are
+    body, conv, _ = convert_str(RB.replace("*Step", "*Equation\n2\nRP, 2, 1., 1, 1, -0.5\n*Step", 1))
+    assert sorted(_equation_terms(body)[0]) == [(1, 1, -0.5), (9, 2, 1.)]
+
+
+def test_equation_on_rotations_of_a_transformed_node_is_commented_out():
+    # ccx 2.23 reads an *EQUATION term on DOF 4 of a transformed node about the global axis
+    # and DOFs 5-6 through an out-of-range read of the transformation matrix (terms on the
+    # translations with undefined coefficients, or it stops; probed): no exact form
+    beams = _transformed(B2 + "*Equation\n2\n3, 5, 1., 2, 5, -1.\n" + STEP, "3", YX)
+    body, conv, rep = convert_str(beams)
+    assert not _equation_terms(body) and "** *EQUATION" in body
+    assert "*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (e.g. node 3)" in rep.text()
+    # a solid node's (no rotations in Abaqus; ccx misreads DOFs 5-6 just the same)
+    solid = _transformed(HEX + "*Equation\n2\n2, 5, 1., 1, 1, -1.\n" + STEP, "2", YX)
+    body, _, rep = convert_str(solid)
+    assert not _equation_terms(body) and "commented out — the constraint is missing" in rep.text()
+    # translations of transformed nodes, and rotations of other nodes, are untouched
+    body, _, rep = convert_str(_transformed(B2 + "*Equation\n2\n3, 1, 1., 2, 5, -1.\n" + STEP, "3", YX))
+    assert len(_equation_terms(body)) == 1 and "DOFs 4-6 of a node with a *TRANSFORM" not in rep.text()
+
+
+# a B31 cantilever 1-2-3 (section axes oblique), clamped at 1, a *TRANSFORM on the tip 3
+TIP3 = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=B31, elset=B\n"
+        "1, 1, 2\n2, 2, 3\n*Beam Section, elset=B, material=M, section=RECT\n1., 0.5\n0., 0.6, 0.8\n"
+        "*Material, name=M\n*Elastic\n1000., 0.3\n*Nset, nset=TIP\n3\n*Transform, nset=TIP\n{}\n"
+        "*Boundary\n1, 1, 6\n*Step\n*Static\n{}*End Step\n")
+TIP_AB = ((0., 1., 0.), (-1., 0., 0.5))       # local 1 = y, local 3 = (1, 0, 2) / sqrt(5)
+
+
+def _tip(steps, data="0., 1., 0., -1., 0., 0.5"):
+    return TIP3.format(data, steps)
+
+
+def test_transformed_beam_node_keeps_a_single_local_rotation():
+    # on a beam node that is no knot ccx makes a rotational BC / moment a mean-rotation MPC
+    # about the LOCAL axis (gen3dboun / gen3dforc use the transform): exact for one local
+    # rotation per node (probed, linear and NLGEOM) — kept as it is, no knot
+    for steps in ("*Boundary\n3, 5, 5, 0.01\n", "*Cload\n3, 6, 2.\n",
+                  "*Boundary\n3, 5, 5\n*End Step\n*Step\n*Static\n*Cload\n3, 5, 1.\n"):
+        body, conv, rep = convert_str(_tip(steps))
+        assert conv._rot_mode == {3: "keep"} and not conv._knots, steps
+        assert rep.n_warnings == 0
+    assert "3,5,5,0.01" in _bc_lines(convert_str(_tip("*Boundary\n3, 5, 5, 0.01\n"))[0])
+
+
+def test_transformed_beam_node_rotations_in_global_components_on_a_knot():
+    # several local rotations on one beam node: ccx's mean-rotation MPCs can clash (probed:
+    # 'zero coefficient on the dependent side', up to 156 % off), so the node gets a knot
+    # beam, on which ccx reads rotational BCs and moments about the global axes: they are
+    # written in global components (probed: exact, linear, NLGEOM, *DYNAMIC)
+    e = _axes_rect(*TIP_AB)
+    body, conv, rep = convert_str(_tip("*Cload\n3, 4, 1.\n3, 6, 2.\n"))
+    assert 3 in conv._knots and conv._rot_mode[3] == "global"
+    want = {(3, 4 + k): e[0][k] + 2. * e[2][k] for k in range(3)}
+    assert _close(_cloads(body)[0], want, 1e-10)
+    assert "got a force-free knot beam" in rep.text() and rep.n_warnings == 0
+    # three local rotations prescribed: their global values
+    body, _, _ = convert_str(_tip("*Boundary\n3, 4, 4, 0.01\n3, 5, 6, 0.02\n"))
+    rows = {l.split(",")[1]: float(l.split(",")[3]) for l in _bc_lines(body) if l.startswith("3,")}
+    assert _close([rows[str(4 + k)] for k in range(3)],
+                  [0.01 * e[0][k] + 0.02 * e[1][k] + 0.02 * e[2][k] for k in range(3)], 1e-10)
+    # all six held (ENCASTRE): the translations locally, the rotations as they are
+    body, _, _ = convert_str(_tip("*Boundary\n3, ENCASTRE\n*Cload\n2, 2, 1.\n"))
+    assert [l for l in _bc_lines(body) if l.startswith("3,")] == ["3,1,3", "3,4,6"]
+    # two oblique local rotations held: no global form — commented out, warned
+    body, _, rep = convert_str(_tip("*Boundary\n3, 4, 5\n*Cload\n2, 2, 1.\n"))
+    assert not [l for l in _bc_lines(body) if l.startswith("3,")]
+    assert "node 3, DOFs 4-6 of this *BOUNDARY left out" in body
+    assert "*BOUNDARY on DOFs 4-6 of a node with a *TRANSFORM (e.g. node 3) commented out" in rep.text()
+    # ... unless they span global axes: a transform about z (local 3 = z)
+    body, _, rep = convert_str(_tip("*Boundary\n3, 4, 5\n3, 6, 6, 0.01\n", "0.6, 0.8, 0., -0.8, 0.6, 0."))
+    assert [l for l in _bc_lines(body) if l.startswith("3,")] == ["3,4,4", "3,5,5", "3,6,6,0.01"]
+    assert rep.n_warnings == 0
+    # a set line with the transformed node and another: the other keeps its line
+    ends = _tip("*Boundary\nENDS, 1, 6\n*Cload\nENDS, 6, 2.\n").replace("*Nset, nset=TIP",
+                                                                         "*Nset, nset=ENDS\n2, 3\n*Nset, nset=TIP")
+    body, _, rep = convert_str(ends)
+    assert {"ENDS,1,3", "2,4,6", "3,4,6"} <= set(_bc_lines(body))
+    assert _close(_cloads(body)[0], {(2, 6): 2., **{(3, 4 + k): 2. * e[2][k] for k in range(3)}}, 1e-10)
+
+
+def test_transformed_moments_carry_on_over_steps_on_a_knot():
+    # Abaqus keeps an earlier step's moment on a local rotation the next step leaves; ccx
+    # replaces whole global DOFs, so that step gives the carried components again
+    e = _axes_rect(*TIP_AB)
+    body, _, rep = convert_str(_tip("*Cload\n3, 4, 1.\n3, 5, 1.\n*End Step\n*Step\n*Static\n"
+                                    "*Cload\n3, 6, 2.\n"))
+    s1, s2 = _cloads(body)
+    assert _close(s1, {(3, 4 + k): e[0][k] + e[1][k] for k in range(3)}, 1e-10)
+    assert _close(s2, {(3, 4 + k): e[0][k] + e[1][k] + 2. * e[2][k] for k in range(3)}, 1e-10)
+    # with an amplitude the carried moment would restart: commented out, warned
+    body, _, rep = convert_str(_tip("*Cload\n3, 4, 1.\n3, 5, 1.\n*End Step\n*Step\n*Static\n"
+                                    "*Cload, amplitude=A\n3, 6, 2.\n").replace(
+                                        "*Boundary\n1, 1, 6", "*Amplitude, name=A\n0., 0., 1., 1.\n*Boundary\n1, 1, 6"))
+    assert "an earlier step's moment on another rotation of the node carries on" in rep.text()
+    # OP=NEW removes the earlier moments in both
+    body, _, _ = convert_str(_tip("*Cload\n3, 4, 1.\n*End Step\n*Step\n*Static\n*Cload, op=NEW\n3, 6, 2.\n"))
+    assert _close(_cloads(body)[1], {(3, 4 + k): 2. * e[2][k] for k in range(3)}, 1e-10)
+
+
+def test_transformed_rotations_on_a_frame_joint_and_in_dynamic_decks():
+    # a frame joint is a ccx knot (two beam directions): read about the global axes there
+    frame = TIP3.replace("2, 2, 3\n", "2, 2, 3\n3, 3, 4\n").replace(
+        "3, 2., 0., 0.\n", "3, 2., 0., 0.\n4, 2., 0., 1.\n")
+    deck = frame.format("0., 1., 0., -1., 0., 0.5", "*Cload\n3, 5, 1.\n")
+    body, conv, rep = convert_str(deck)
+    e = _axes_rect(*TIP_AB)
+    assert conv._rot_mode[3] == "global" and not conv._knots
+    assert _close(_cloads(body)[0], {(3, 4 + k): e[1][k] for k in range(3)}, 1e-10)
+    # one local rotation held on a knot: about local 1 = y it is global DOF 5; about the
+    # oblique local 2 it has no global form — commented out
+    body, conv, rep = convert_str(frame.format("0., 1., 0., -1., 0., 0.5", "*Boundary\n3, 4, 4, 0.01\n"))
+    assert "3,5,5,0.01" in _bc_lines(body) and rep.n_warnings == 0
+    _, conv, rep = convert_str(frame.format("0., 1., 0., -1., 0., 0.5", "*Boundary\n3, 5, 5, 0.01\n"))
+    assert "DOFs 4-6 of a node with a *TRANSFORM (e.g. node 3) commented out" in rep.text()
+    # a *DYNAMIC step: ccx makes the knot itself and evaluates the transform elsewhere (probed:
+    # 0.7-380 % off), so even one local rotation goes onto a knot beam in global components
+    dyn = _tip("*Cload\n3, 6, 2.\n").replace("*Static", "*Dynamic\n0.1, 1.")
+    body, conv, rep = convert_str(dyn)
+    assert 3 in conv._knots and conv._rot_mode[3] == "global"
+    assert _close(_cloads(body)[0], {(3, 4 + k): 2. * e[2][k] for k in range(3)}, 1e-10)
+    # an explicit step stops on knot beams: refused, unless all three are held at zero
+    exp = _tip("*Cload\n3, 6, 2.\n").replace("*Static", "*Dynamic, explicit\n, 1.")
+    body, conv, rep = convert_str(exp)
+    assert not conv._knots and "ccx's explicit solver stops on the knot beam" in rep.text()
+    body, conv, rep = convert_str(exp.replace("*Cload\n3, 6, 2.\n", "*Boundary\n3, 4, 6\n"))
+    assert conv._rot_mode[3] == "keep" and "3,4,6" in _bc_lines(body)
+
+
+def test_transformed_shell_node_rotations():
+    # a shell node that is no knot: ccx's mean-rotation MPCs in the local axes are exact for
+    # its BCs (two at most) and one or two moment components (probed): kept
+    shell = _transformed(S4 + "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Boundary\n5, 4, 5\n"
+                              "*Cload\n6, 4, 0.1\n*End Step\n", "5, 6", "1., 1., 0.3, -1., 1., 0.")
+    body, conv, rep = convert_str(shell)
+    assert conv._rot_mode == {5: "keep", 6: "keep"} and not conv._knots
+    assert "5,4,5" in _bc_lines(body) and _cloads(body) == [{(6, 4): 0.1}]
+    # in a deck with a *DYNAMIC step ccx makes the node a knot itself (probed: 28-90 % off)
+    body, conv, rep = convert_str(shell.replace("*Static", "*Dynamic\n0.1, 1."))
+    assert conv._rot_mode[5] == "refuse" and "a *DYNAMIC step ccx makes the shell node a knot" in rep.text()
+
+
+def _knot_of(deck, n):
+    """The converter's guess whether ccx makes node ``n`` of ``deck`` a knot."""
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w") as fh:
+            fh.write(deck)
+        blocks = A.read_blocks(path, A.Report())
+    finally:
+        os.unlink(path)
+    conv = A.Converter(A.Report(), Opt())
+    conv.convert(blocks)
+    return conv._ccx_knot(n, conv._knot_sections(blocks))
+
+
+def test_ccx_knot_prediction():
+    # gen3dnor: one expansion group per section and direction (within 20 deg) at a node;
+    # more than one group makes a knot
+    assert _knot_of(_tip(""), 2) is False and _knot_of(_tip(""), 3) is False
+    assert _knot_of(_tip("").replace("3, 2., 0., 0.", "3, 2., 0.3, 0."), 2) is None   # 16.7 deg
+    assert _knot_of(_tip("").replace("3, 2., 0., 0.", "3, 1., 1., 0."), 2) is True    # 90 deg
+    two = _tip("").replace("*Material", "*Elset, elset=B2\n2\n*Beam Section, elset=B2, "
+                                        "material=M, section=RECT\n1., 0.4\n0., 0.6, 0.8\n*Material")
+    assert _knot_of(two, 2) is True                       # another section
+    # shells: a flat plate's shared edge is one group, a fold of 90 deg two
+    assert _knot_of(S4, 2) is False
+    assert _knot_of(S4.replace("5,2,0,0\n6,2,1,0", "5,1,0,1\n6,1,1,1"), 2) is True
 
 
 # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION ------------------------------------------
