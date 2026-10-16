@@ -64,7 +64,9 @@ TRANSLATED = {
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped.",
     "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped; "
         "DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 "
-        "crashes on them).",
+        "crashes on them). An element end node of a circular-section beam whose rotational BCs "
+        "hold only some of DOFs 4-6, or a nonzero one, gets a force-free knot beam (elset/material "
+        "`ABQ2CCX_KNOT`): ccx 2.23 would lock the node's other rotations too.",
     "*DLOAD": "passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / "
         "`CONSTANT RESULTANT` dropped (warned under NLGEOM).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`.",
@@ -212,7 +214,9 @@ def gen_elements():
                          "are free in ccx. In a planar model (no 3-D elements, all their nodes at one "
                          "z) the converter fixes DOF 3 on their nodes, midside nodes included (node set "
                          f"`{A.PLANAR_NODES_SET}`, model data, repeated after `*BOUNDARY, OP=NEW`), and "
-                         "DOFs 4-5 at one node of a straight beam whose twist nothing restrains. The "
+                         "DOFs 4-5 at one node of a straight beam whose twist nothing restrains (on a "
+                         "circular section, an element's middle node: at an end node ccx 2.23 would "
+                         "lock the bending rotation too). The "
                          "rotations are not fixed on every node (that stiffens ccx's expanded beams), so "
                          "`*FREQUENCY` results include twist modes that Abaqus' planar beams do not "
                          "have (warned).\n")

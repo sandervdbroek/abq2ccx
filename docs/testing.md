@@ -6,7 +6,8 @@ The converter has three layers of tests:
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
    CalculiX, checking the NAFEMS LE10 benchmark, circular-, pipe- and box-section
-   cantilevers, and a planar beam's frequencies and buckling load numerically.
+   cantilevers, circular-section beams with rotational BCs, and planar beams'
+   frequencies and buckling loads numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -20,7 +21,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (135)
+## 1. Unit tests — `tests/test_convert.py` (138)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -157,11 +158,14 @@ conversion behaviour and referential integrity.
 | `test_planar_line_types` | `planar_line_type()` maps the Abaqus 2-D beams/trusses and their `H`/`T` variants (`B21H` → `B21`, `T2D2T` → `T2D2`, `PIPE22`, …) and nothing else (`B31`, `T3D2`, `CPS4`, …) |
 | `test_planar_beams_fix_out_of_plane_dof` | a planar `B21` model gets node set `ABQ2CCX_PLANAR` with DOF 3 fixed in model data ahead of the steps (ccx runs `B21` as a 3-D `B31`, so each bending mode would appear twice); `B21H`, `B23`, `PIPE21`, `B22` and `T2D2` trusses alike; `ENCASTRE` already holds the twist; `*FREQUENCY` warns that twist modes remain; 3-D beams are left alone |
 | `test_planar_constraint_reaches_upgraded_midside_nodes` | a `B21` under `SECTION=CIRC` (→ `B32`) has its inserted midside nodes in the planar set |
-| `test_planar_straight_beam_twist_held_at_one_node` | a straight beam on pinned supports gets DOFs 4–5 at one support (its twist is otherwise a 0 Hz mode); with CAE's U1/U2/UR3 clamp, at the clamped node, for a circular section too; a pinned circular-section beam gets none (ccx 2.23 couples a DOF 4/5 BC into its bending rotation) and a warning; a frame that is not straight needs none |
+| `test_planar_straight_beam_twist_held_at_one_node` | a straight beam on pinned supports gets DOFs 4–5 at one support (its twist is otherwise a 0 Hz mode); with CAE's U1/U2/UR3 clamp, at the clamped node, for a circular section too; a pinned circular-section beam gets them at the middle node of an element next to a support (at an end node ccx 2.23 would lock its bending rotation too), no knot beam; a frame that is not straight needs none |
 | `test_planar_constraint_skips_constrained_and_skewed_nodes` | nodes whose DOF 3 is the dependent term of an `*EQUATION` (an SPC there stops ccx), `*MPC` nodes, rigid-body members and nodes under a `*TRANSFORM` whose 3-axis is not z are left out; a transform about z is kept |
 | `test_planar_constraint_repeated_after_op_new` | a `*BOUNDARY, OP=NEW` step repeats the planar constraint (OP=NEW removes model-data BCs too) |
 | `test_planar_constraint_needs_a_planar_model` | `B21` among 3-D elements, or with nodes off one z plane, gets no constraint and a warning |
 | `test_planar_pinned_beam_example` | the bundled planar beam converts to 20 `B21` with DOF 3 on all 21 nodes and DOFs 4–5 at the pinned end, ahead of the steps, no dangling refs |
+| `test_circ_beam_partial_rotation_bc_gets_knot_beam` | an element end node of a `CIRC` beam whose rotational BCs hold only some rotations (DOFs 1–4 at a pinned end, `XSYMM`), or a nonzero one (a prescribed rotation, even with all three given), gets a force-free knot beam (ccx 2.23 would lock its other rotations); the BC lines are kept; none for full zero clamps, `RECT` beams or a BC on a 3-node element's middle node |
+| `test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes` | a later `*BOUNDARY, OP=NEW` step that leaves only some rotations held gets knots; none on a node with a `*TRANSFORM` nor in a heat-transfer-only deck; an explicit dynamic step is warned instead (it stops on the knot beams); knots on most end nodes are warned (their rigid sections stiffen the beam) |
+| `test_circ_rotation_bc_examples` | the bundled `beam_circ_rotation_bcs` deck gets knot beams at the two pinned ends whose twist is held and at the turned tip, none at the clamp; `planar_pinned_circ_beam` holds its twist at the first element's middle node, no knots; no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -189,12 +193,24 @@ deck and runs it in CalculiX:
   one through the thickness, the brick ccx expands an `S8R` into — under `*RIGID BODY`.
   The reference-point displacements must agree within 0.5 % of |u| (they agree to
   0.001 %).
+* **`beam_circ_rotation_bcs`** — two `B31` beams with a circular section, which ccx 2.23
+  runs as `B32`: one pinned at both ends with its twist held there and a mid-span load, one
+  clamped with its tip turned by a prescribed rotation of 0.001 rad. Under a rotational BC
+  ccx ties a circular section to its corners and locks the rotations the BC leaves free
+  (without the converter's knot beams the first deflects 0.31 of beam theory, the second
+  0.76); checks the mid-span deflection, −12.658 vs P L³/(48 E I) = −12.631 (0.2 %), and
+  the tip deflection, +0.5004 vs θ L/2 = +0.5 (0.1 %).
 * **`planar_pinned_beam`** — a simply supported `B21` beam (rectangular section) with a
   `*FREQUENCY` and a `*BUCKLE` step. ccx runs `B21` as a 3-D `B31`, so this
   checks the planar constraint: the first two frequencies against beam theory, 93.67 and
   373.02 Hz vs 93.81 and 375.25 Hz (0.6 %), and the buckling load against Euler's,
   220545 vs 221079 (0.2 %). Without the constraint ccx reports 0 Hz modes (the free twist
   and the unsupported out-of-plane motion) and a buckling factor of 1, and the check fails.
+* **`planar_pinned_circ_beam`** — the same check on a `B21` beam with a circular section
+  (a `B32` in ccx), whose twist is held at the first element's middle node: 40.81 and
+  163.28 Hz vs 40.62 and 162.49 Hz (0.5 %), buckling load 16239 vs 16278 (0.2 %). At an end
+  node the twist BC would lock the bending rotation as well (f1 1.46-fold, buckling load
+  1.88-fold); with none, ccx reports a 0 Hz twist mode and a buckling factor of 0.0001.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -342,10 +358,38 @@ nothing restrains (pinned supports, or CAE's U1/U2/UR3 clamp) has a 0 Hz twist m
 meaningless `*BUCKLE` factors (about 1), and under NLGEOM a pinned `B31` beam stopped
 converging ("increment size smaller than minimum"; with the BC its large deflection matches
 the elastica). So DOFs 4–5 are fixed at one of its nodes — one whose in-plane rotation is
-already fixed, else a support; on a circular section ccx 2.23 couples such a BC into the
-bending rotation (a simply supported beam then deflects half as much), so there it is only
-warned. `validate_with_ccx.py` checks a pinned planar beam's frequencies and buckling load
-against beam theory.
+already fixed, else a support (on a circular section, the middle node of an element next to
+one: see below). `validate_with_ccx.py` checks pinned planar beams' frequencies and buckling
+loads against beam theory.
+
+**Rotational BCs on circular-section beams.** Adding the twist BC above showed that on a
+circular section ccx 2.23 couples a rotational BC into the other rotations; its sources
+explain why. ccx expands a `CIRC` beam node into eight nodes on the circle (`gen3dfrom1d`),
+and for every rotational BC on a `B32`/`B32R` node that is not a knot it ties the
+section's four midside nodes to the mean of their corners (`gen3dboun`) — exact on the
+rectangles `RECT`, `PIPE` and `BOX` expand into, but no rigid rotation of a circle
+satisfies it. So a BC on DOF 4, 5 or 6 at an element end node locks the twist and both
+bending rotations there. Probed with 10 `B32` per span: a simply supported beam with its
+twist held at one end deflects 0.46 of beam theory, with the twist held at both pinned
+ends 0.27; a cantilever whose tip is turned by a prescribed rotation reaches 0.76 of
+θ L/2 (all three rotations given); DOF 4 on every node gives 0.009; `RECT`, `PIPE` and `BOX`
+are unaffected. Moments are not affected (`gen3dforc` adds no such ties), nor is a BC at a
+3-node element's middle node (no element uses the section nodes tied there), nor a knot,
+whose BCs act on its rotation node. The converter therefore gives each element end node of
+a `CIRC` beam whose rotational BCs hold only some rotations, or a nonzero one, in some step
+a force-free knot beam, as for rigid couplings: 0.994 and 1.00 of beam theory. A knot's
+rigid section costs a little where the beam bends (Poisson locking — it vanishes with
+ν = 0): 1.3, 0.6 and 0.3 % with a knot inside a span of 10, 20 and 40 elements, nothing at
+a pinned end. So full zero clamps keep ccx's handling, and knots on more than a quarter of
+the end nodes are warned (DOF 4 on every node: 0.84 with the knots). A planar `CIRC` beam
+on pinned supports gets its twist BC at an element's middle node instead, where nothing
+else changes: bending frequencies and buckling load as with the twist free, to 4 digits.
+Implicit `*DYNAMIC` turns rotational BCs into knots by itself (identical results with and
+without the knot beams); an explicit step stops on the density-free knot beams
+("*ERROR in calcstabletimeincvol"), so there it is only warned — ccx's explicit solver also
+returned NaN displacements for `CIRC` beams with no rotational BC at all. No corpus deck has
+such a BC, and every corpus deck converts byte-identically; `validate_with_ccx.py` checks
+both 3-D cases and the planar beam against beam theory.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

@@ -1,0 +1,48 @@
+*Heading
+Circular-section beams with rotational BCs: a held twist and a prescribed rotation
+** Two separate B31 beams, L = 1000, r = 10, E = 210000 (I = pi r^4 / 4), 20 elements each.
+** A (nodes 1-21): pinned at both ends with the twist held there (DOFs 1-4 / 2-4), mid-span
+**   load P = 1000 in -y.  Beam theory: mid deflection P L^3 / (48 E I) = 12.631.
+** B (nodes 101-121): clamped at 101, its tip turned by 0.001 rad about z (DOFs 4, 5 held,
+**   DOF 6 = 0.001).  Beam theory: tip deflection theta L / 2 = 0.5.
+** ccx 2.23 runs circular sections only on B32 (abq2ccx adds the midside nodes) and, for a
+** rotational BC on a B32 end node, ties the section's midside nodes to its corners, which
+** a circle cannot follow: the node's other rotations lock as well (A then deflects 0.31 of
+** beam theory, B 0.76).  abq2ccx gives such nodes a force-free knot beam, which makes them
+** ccx knots whose BCs hold only the rotations they name (A 1.002, B 1.001).
+*Node
+1, 0., 0., 0.
+21, 1000., 0., 0.
+101, 0., 500., 0.
+121, 1000., 500., 0.
+*Ngen, nset=A
+1, 21, 1
+*Ngen, nset=B
+101, 121, 1
+*Element, type=B31, elset=BEAMS
+1, 1, 2
+101, 101, 102
+*Elgen, elset=BEAMS
+1, 20, 1, 1
+101, 20, 1, 1
+*Nset, nset=OUT
+11, 121
+*Beam Section, elset=BEAMS, material=STEEL, section=CIRC
+10.
+0., 0., -1.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Boundary
+1, 1, 4
+21, 2, 4
+101, ENCASTRE
+121, 4, 5
+121, 6, 6, 0.001
+*Step
+*Static
+*Cload
+11, 2, -1000.
+*Node Print, nset=OUT
+U
+*End Step

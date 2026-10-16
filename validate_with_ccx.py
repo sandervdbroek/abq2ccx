@@ -6,7 +6,9 @@ just structurally-valid text.  It auto-detects a ``ccx`` binary (including the o
 bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
 stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, a shell plate rigidly coupled to a loaded reference point against the same plate
-built from solids, and the natural frequencies and buckling load of a planar (B21) beam.
+built from solids, circular-section beams with a held twist and a prescribed rotation
+against beam theory, and the natural frequencies and buckling loads of planar (B21) beams
+with a rectangular and a circular section.
 
     python validate_with_ccx.py
 
@@ -234,32 +236,61 @@ def main():
               f"({ur[0]:+.4f}, {ur[1]:+.4f}, {ur[2]:+.4f}), {err * 100:.3f}% of |u|")
         failures += 0 if ok else 1
 
-    # --- planar beam on pinned supports: frequencies and buckling vs beam theory ----------
-    # ccx runs B21 as a 3-D B31, so this checks the planar constraint: DOF 3 fixed on every
-    # node (otherwise nothing holds the beam in its plane) and DOFs 4-5 at the pinned end
-    # (otherwise the free twist is a 0 Hz mode and the buckling factor meaningless).
-    inp = os.path.join(tmp, "planar.inp")
-    convert(os.path.join(EXAMPLES, "planar_pinned_beam.inp"), inp)
+    # --- circular-section beams with rotational BCs: deflections vs beam theory --------------
+    # Under any rotational BC ccx 2.23 ties a B32 end node's circular section to its corners,
+    # locking the rotations the BC leaves free (beam A, twist held at its pinned ends, then
+    # deflects 0.31 of beam theory; beam B, tip turned by a prescribed rotation, 0.76): this
+    # checks the knot beams abq2ccx gives such nodes.
+    inp = os.path.join(tmp, "circrot.inp")
+    convert(os.path.join(EXAMPLES, "beam_circ_rotation_bcs.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
-    ei, length = 210000.0 * 20.0 * 40.0 ** 3 / 12, 1000.0                # in-plane E I
-    c = math.sqrt(ei / (7.85e-9 * 20.0 * 40.0)) * math.pi / (2 * length ** 2)
-    refs = [c, 4 * c, math.pi ** 2 * ei / length ** 2]                     # f1, f2, Euler load
-    dat = os.path.join(d, "job.dat")
-    got = (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")[:2]
-           + dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")[:1]) \
-        if status == "solved" else []
-    if len(got) < 3:
-        print(f"FAIL  planar_pinned_beam: no frequencies / buckling factor ({status})")
-        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
-        failures += 1
-    else:
-        diffs = [abs(g - r) / r for g, r in zip(got, refs)]
-        ok = max(diffs) < 0.02
-        print(f"{'PASS' if ok else 'FAIL'}  planar_pinned_beam (B21): f1, f2 = {got[0]:.2f}, "
-              f"{got[1]:.2f} Hz (beam theory {refs[0]:.2f}, {refs[1]:.2f}), buckling load "
-              f"{got[2]:.0f} (Euler {refs[2]:.0f}); max {max(diffs) * 100:.1f}% diff")
+    ei, length = 210000.0 * math.pi * 10.0 ** 4 / 4, 1000.0
+    for label, node, ref in (("A: pinned, twist held", 11, -1000.0 * length ** 3 / (48 * ei)),
+                             ("B: tip turned 0.001 rad", 121, 0.001 * length / 2)):
+        u = dat_displacement(os.path.join(d, "job.dat"), node) if status == "solved" else None
+        if u is None:
+            print(f"FAIL  beam_circ_rotation_bcs ({label}): no displacement ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        ok = abs(u[1] - ref) / abs(ref) < 0.02
+        print(f"{'PASS' if ok else 'FAIL'}  beam_circ_rotation_bcs ({label}): deflection = "
+              f"{u[1]:+.4f} (beam theory {ref:+.4f}, {abs(u[1] - ref) / abs(ref) * 100:.1f}% diff)")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # --- planar beams on pinned supports: frequencies and buckling vs beam theory ---------
+    # ccx runs B21 as a 3-D B31, so this checks the planar constraint: DOF 3 fixed on every
+    # node (otherwise nothing holds the beam in its plane) and DOFs 4-5 at one node
+    # (otherwise the free twist is a 0 Hz mode and the buckling factor meaningless): at the
+    # pinned end, and on the circular section (a B32 in ccx) at the first element's middle
+    # node — at the end node ccx 2.23 would lock the bending rotation as well (f1 1.46x).
+    for name, label, ei, rho_a in (
+            ("planar_pinned_beam", "B21", 210000.0 * 20.0 * 40.0 ** 3 / 12, 7.85e-9 * 20.0 * 40.0),
+            ("planar_pinned_circ_beam", "B21 + CIRC", 210000.0 * math.pi * 10.0 ** 4 / 4,
+             7.85e-9 * math.pi * 10.0 ** 2)):
+        inp = os.path.join(tmp, name + ".inp")
+        convert(os.path.join(EXAMPLES, name + ".inp"), inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        length = 1000.0
+        c = math.sqrt(ei / rho_a) * math.pi / (2 * length ** 2)            # in-plane E I
+        refs = [c, 4 * c, math.pi ** 2 * ei / length ** 2]                 # f1, f2, Euler load
+        dat = os.path.join(d, "job.dat")
+        got = (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")[:2]
+               + dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")[:1]) \
+            if status == "solved" else []
+        if len(got) < 3:
+            print(f"FAIL  {name}: no frequencies / buckling factor ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+        else:
+            diffs = [abs(g - r) / r for g, r in zip(got, refs)]
+            ok = max(diffs) < 0.02
+            print(f"{'PASS' if ok else 'FAIL'}  {name} ({label}): f1, f2 = {got[0]:.2f}, "
+                  f"{got[1]:.2f} Hz (beam theory {refs[0]:.2f}, {refs[1]:.2f}), buckling load "
+                  f"{got[2]:.0f} (Euler {refs[2]:.0f}); max {max(diffs) * 100:.1f}% diff")
+            failures += 0 if ok else 1
+        shutil.rmtree(d, ignore_errors=True)
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

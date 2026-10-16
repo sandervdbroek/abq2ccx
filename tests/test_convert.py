@@ -1652,13 +1652,19 @@ def test_planar_straight_beam_twist_held_at_one_node():
     body, _, _ = convert_str(pinned.replace("*Step", "*Nset, nset=TURN\n1\n*Transform, nset=TURN\n"
                                             "1., 1., 0., -1., 1., 0.\n*Step", 1))
     assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body
-    # on a circular section ccx 2.23 couples a DOF 4/5 BC into the bending rotation: only
-    # at a node whose in-plane rotation is fixed anyway, else a warning
+    # on a circular section a DOF 4/5 BC at an element end node locks the bending rotation
+    # as well (ccx 2.23): at a node whose in-plane rotation is fixed anyway, else at the
+    # middle node of an element next to a support (B21 -> B32 1, 5, 2), where it holds
+    # only the twist — no knot beam needed
     circ = "section=CIRC\n0.05"
-    body, _, _ = convert_str(clamped.replace("section=RECT\n0.1, 0.2", circ))
-    assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body
-    body, _, rep = convert_str(pinned.replace("section=RECT\n0.1, 0.2", circ))
-    assert ", 4, 5\n" not in body and "of 1 straight 2-D beam(s) is unrestrained" in rep.text()
+    body, conv, _ = convert_str(clamped.replace("section=RECT\n0.1, 0.2", circ))
+    assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body and not conv._knots
+    body, conv, rep = convert_str(pinned.replace("section=RECT\n0.1, 0.2", circ))
+    assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n5, 4, 5\n*BEAM SECTION" in body and not conv._knots
+    assert "DOFs 4-5 are fixed at node(s) 5" in rep.text() and "is unrestrained" not in rep.text()
+    body, _, _ = convert_str(pinned.replace("section=RECT\n0.1, 0.2", circ).replace(
+        "1, 1, 2\n4, 2, 2", "3, 2, 2\n4, 1, 2"))          # supports at nodes 3, 4: element 2, 6, 3
+    assert "ABQ2CCX_PLANAR, 3, 3\n6, 4, 5\n" in body
     # a frame that is not straight has no rigid twist once DOF 3 is fixed
     frame = PLANAR_BEAM.replace("3, 2., 0.\n4, 3., 0.", "3, 2., 1.\n4, 2., 2.").replace(
         "1, ENCASTRE", "1, 1, 2\n4, 1, 2")
@@ -1713,6 +1719,79 @@ def test_planar_pinned_beam_example():
     assert g.nset("ABQ2CCX_PLANAR") == list(range(1, 22))
     assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n1, 4, 5\n" in body.split("*STEP")[0]
     assert not dangling_refs(g), dangling_refs(g)
+
+
+CIRC_STATIC = "*Step\n*Static\n*Cload\n2, 2, -1.\n*End Step\n"
+
+
+def test_circ_beam_partial_rotation_bc_gets_knot_beam():
+    # a rotational BC on a B32 end node makes ccx 2.23 tie the section's midside nodes to its
+    # corners, which a circle cannot follow: the node's other rotations lock as well (a
+    # pinned beam with its twist held deflects 0.27 of beam theory).  A knot beam per such
+    # node hands the BCs to the knot's rotation node; the BC lines stay as they are.
+    body, conv, rep = convert_str(CIRC_BEAM + "*Boundary\n1, 1, 4\n3, 2, 4\n" + CIRC_STATIC)
+    g = reparse(body)
+    assert list(conv._knots) == [1, 3] and g.elsets["ABQ2CCX_KNOT"] == [3, 4]
+    assert g.elements[3] == ("B31", [1, 6]) and g.elements[4] == ("B31", [3, 7])
+    assert "*MATERIAL, NAME=ABQ2CCX_KNOT\n*ELASTIC\n210000., 0.\n*DENSITY\n0.\n" in body
+    assert "*BOUNDARY\n1, 1, 4\n3, 2, 4\n*STEP" in body and not dangling_refs(g)
+    assert "would lock the node's other rotations" in rep.text() and "(1, 3) got a force-free" \
+        in rep.text()
+    # a symmetry plane (XSYMM = DOFs 1, 5, 6) holds some rotations too; a prescribed rotation
+    # is locked even when all three are given
+    _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, ENCASTRE\n3, XSYMM\n" + CIRC_STATIC)
+    assert list(conv._knots) == [3]
+    _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, ENCASTRE\n3, 4, 5\n3, 6, 6, 0.001\n"
+                             + CIRC_STATIC)
+    assert list(conv._knots) == [3]
+    # full zero clamps are exact as they are; other sections need no knot
+    body, conv, rep = convert_str(CIRC_BEAM + "*Boundary\n1, ENCASTRE\n3, 1, 6\n" + CIRC_STATIC)
+    assert not conv._knots and "ABQ2CCX_KNOT" not in body and "knot" not in rep.text()
+    _, conv, _ = convert_str(CIRC_BEAM.replace("section=CIRC\n0.05", "section=RECT\n0.1, 0.1")
+                             + "*Boundary\n1, 1, 4\n3, 2, 4\n" + CIRC_STATIC)
+    assert not conv._knots
+    # at a 3-node element's middle node the tied section nodes are unused: exact already
+    b32 = CIRC_BEAM.replace("type=B31", "type=B32").replace("1, 1, 2\n2, 2, 3\n", "1, 1, 2, 3\n")
+    _, conv, _ = convert_str(b32 + "*Boundary\n1, 1, 3\n3, 2, 3\n2, 4, 4\n" + CIRC_STATIC)
+    assert not conv._knots
+
+
+def test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes():
+    # the BCs a step solves with count: OP=NEW may leave only some rotations held
+    deck = CIRC_BEAM + "*Boundary\n1, ENCASTRE\n" + CIRC_STATIC + \
+        "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 4\n3, 2, 4\n*End Step\n"
+    _, conv, _ = convert_str(deck)
+    assert list(conv._knots) == [1, 3]
+    # no knot where ccx allows no rotational BC (*TRANSFORM), nor in a heat-transfer-only deck
+    _, conv, _ = convert_str(CIRC_BEAM + "*Nset, nset=TURN\n1\n*Transform, nset=TURN\n"
+                             "0., 1., 0., -1., 0., 0.\n*Boundary\n1, 1, 4\n3, 2, 4\n" + CIRC_STATIC)
+    assert list(conv._knots) == [3]
+    _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, 1, 4\n*Step\n*Heat Transfer\n1., 1.\n"
+                             "*End Step\n")
+    assert not conv._knots
+    # ccx's explicit solver stops on the density-free knot beams: warned instead
+    _, conv, rep = convert_str(CIRC_BEAM + "*Density\n7.85e-9\n*Boundary\n1, 1, 4\n3, 2, 4\n"
+                               "*Step\n*Dynamic, explicit\n, 0.001\n*Cload\n2, 2, -1.\n*End Step\n")
+    assert not conv._knots and "calcstabletimeincvol" in rep.text()
+    # many knots: each rigid section stiffens the beam where it bends
+    _, conv, rep = convert_str(CIRC_BEAM + "*Nset, nset=ALL\n1, 2, 3\n*Boundary\n1, 1, 3\n"
+                               "3, 2, 3\nALL, 4, 4\n" + CIRC_STATIC)
+    assert list(conv._knots) == [1, 2, 3] and "3 of the 3 element end nodes" in rep.text()
+
+
+def test_circ_rotation_bc_examples():
+    # the decks validate_with_ccx.py checks against beam theory: knot beams at the pinned ends
+    # whose twist is held (1, 21) and at the turned tip (121), none at the clamp (101) ...
+    body, conv, _ = convert(os.path.join(EXAMPLES, "beam_circ_rotation_bcs.inp"))
+    g = reparse(body)
+    assert list(conv._knots) == [1, 21, 121] and len(g.elsets["ABQ2CCX_KNOT"]) == 3
+    assert {t for t, _ in g.elements.values()} == {"B32", "B31"} and not dangling_refs(g)
+    # ... and the planar circular beam's twist held at the first element's middle node
+    body, conv, _ = convert(os.path.join(EXAMPLES, "planar_pinned_circ_beam.inp"))
+    g = reparse(body)
+    assert g.elements[1] == ("B32", [1, 22, 2]) and not conv._knots
+    assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n22, 4, 5\n" in body.split("*STEP")[0]
+    assert g.nset("ABQ2CCX_PLANAR") == list(range(1, 42)) and not dangling_refs(g)
 
 
 if __name__ == "__main__":

@@ -95,7 +95,10 @@ PASS  beam_circ_cantilever (B31 + CIRC): tip deflection = -4.2290 (beam theory -
 PASS  beam_pipe_box_cantilever (PIPE31 + PIPE): tip deflection y = -7.1490 (beam theory -7.1886, 0.6% diff)
 PASS  beam_pipe_box_cantilever (B32 + BOX): tip deflection y = -1.7898 (beam theory -1.7887, 0.1% diff), z = -4.5091 (beam theory -4.5265, 0.4% diff)
 PASS  coupling_shell_plate (rigid coupling on S8R nodes): RP displacement (-0.1025, +0.0191, +1.7152) vs the solid *Rigid Body (-0.1025, +0.0191, +1.7152), 0.001% of |u|
+PASS  beam_circ_rotation_bcs (A: pinned, twist held): deflection = -12.6581 (beam theory -12.6313, 0.2% diff)
+PASS  beam_circ_rotation_bcs (B: tip turned 0.001 rad): deflection = +0.5004 (beam theory +0.5000, 0.1% diff)
 PASS  planar_pinned_beam (B21): f1, f2 = 93.67, 373.02 Hz (beam theory 93.81, 375.25), buckling load 220545 (Euler 221079); max 0.6% diff
+PASS  planar_pinned_circ_beam (B21 + CIRC): f1, f2 = 40.81, 163.28 Hz (beam theory 40.62, 162.49), buckling load 16239 (Euler 16278); max 0.5% diff
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -114,11 +117,15 @@ misread box dimension would miss beam theory by 18 % or more. The fourth couples
 plate's edge rigidly to an offset reference point that carries a force and a moment (a
 coupling ccx 2.23 rejects on shell nodes without the converter's knot beams) and compares
 the reference point's displacement with the same plate built from `C3D20R` bricks under
-`*RIGID BODY`. The fifth runs a planar `B21` beam on pinned supports through a frequency
-and a buckling step and compares the first two frequencies and the buckling load with beam
-theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar constraint:
-without it ccx reports 0 Hz modes (the free twist and the unsupported out-of-plane motion)
-and a buckling factor of 1.
+`*RIGID BODY`. The fifth gives two circular-section beams rotational BCs — a twist held at
+pinned supports, a prescribed tip rotation — and compares their deflections with beam
+theory: under a rotational BC ccx 2.23 locks a circular section's other rotations, so this
+needs the converter's knot beams (without them 0.31 and 0.76 of beam theory). The last two
+run planar `B21` beams (rectangular and circular sections) on pinned supports through a
+frequency and a buckling step and compare the first two frequencies and the buckling load
+with beam theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar
+constraint: without it ccx reports 0 Hz modes (the free twist and the unsupported
+out-of-plane motion) and a buckling factor of 1.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -212,6 +219,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
 | rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
+| rotational BCs on `CIRC` beam nodes | knot beam per node | a BC on some of DOFs 4–6 (or a nonzero one) at a circular-section `B32` end node makes ccx 2.23 lock the node's other rotations too (a pinned beam with its twist held deflects 0.3 of beam theory); as a knot the node's BCs hold only the rotations they name |
 | `*CONTACT PAIR, TIED` | `*TIE` per surface pair | without `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; face-to-face suggested if ccx struggles) |
 | `*FRICTION` | `mu` only | ccx reads Abaqus' 2nd field (slip rate / mu_k) as its stick slope; `ROUGH` warned (no equivalent) |
 | `*PLASTIC, HARDENING=JOHNSON COOK` | native ccx Johnson-Cook + `*RATE DEPENDENT` | ccx switches JC on only with a rate card (C = 0 added if the deck has none); `HARDENING=USER` / Chaboche `PARAMETERS` commented (material runs elastic) |
@@ -282,9 +290,10 @@ pressure-face labels (`P1..P6`) carry across unchanged. Element handling:
   that an `*EQUATION`, `*MPC`, rigid body, coupling or `*TIE` drives. A straight beam whose
   twist nothing restrains (pinned supports, or CAE's U1/U2/UR3 clamp) also gets DOFs 4–5 fixed
   at one node; otherwise its twist is a 0 Hz mode and `*BUCKLE` factors are meaningless — on a
-  circular section, where ccx 2.23 couples that BC into the bending rotation, this is only
-  warned. The rotations are not fixed everywhere (that stiffens ccx's expanded beams), so
-  `*FREQUENCY` results also contain twist modes, which Abaqus' planar beams cannot have (warned).
+  circular section at the middle node of an element, as at an end node ccx 2.23 would lock
+  the bending rotation too. The rotations are not fixed everywhere (that stiffens ccx's
+  expanded beams), so `*FREQUENCY` results also contain twist modes, which Abaqus' planar
+  beams cannot have (warned).
 * **Best-effort approximation** (node-count preserving, *strong* warning — behaviour lost):
   cohesive `COH*` and gasket `GK*` → the matching thin continuum (`COH3D8→C3D8`,
   `COH2D4→CPE4`, `GK3D8→C3D8`, …), with `*COHESIVE/GASKET SECTION → *SOLID SECTION`.
@@ -368,6 +377,14 @@ converter warns about the ones it can detect; the rest are here so you know to c
   nonlinear MPC's depend on each other"), a coupling whose shell/beam reference node
   couples only some translations, and coupled DOFs that also carry a `*BOUNDARY` (ccx
   stops on that overconstraint, which Abaqus resolves).
+* A rotational BC on a **circular-section beam** node also locks the node's other rotations
+  in ccx 2.23 (it ties the section's midside nodes to its corners, which a circle cannot
+  follow). Where a BC holds only some of DOFs 4–6, or a nonzero one, the converter gives the
+  node a knot beam as above, whose BCs then hold only what they name (pinned beam with its
+  twist held: 0.994 of beam theory instead of about 0.3). The knot's rigid section stiffens the
+  beam slightly where it bends (0.3–1.3 % with a knot inside a span), which adds up when
+  most nodes carry such a BC (warned). Not repaired in a deck with an explicit dynamic step
+  (ccx stops on the knot beams; warned).
 * `*DISTRIBUTION` / variable-angle-tow orientation is solid-section-only in ccx.
 * Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
@@ -392,7 +409,9 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/beam_pipe_box_cantilever.inp`](examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` → `B32R` with midside nodes, `B32` + `SECTION=BOX` → `B32R`, biaxial tip load |
 | [`examples/coupling_shell_plate.inp`](examples/coupling_shell_plate.inp) | `S8R` edge `*Coupling`+`*Kinematic` to a loaded reference point → knot beams + rotation ties, `*NGEN`/`*NFILL`/`*ELGEN` |
 | [`examples/coupling_solid_plate.inp`](examples/coupling_solid_plate.inp) | its `C3D20R` + `*Rigid Body, TIE NSET` reference, `*NCOPY` |
+| [`examples/beam_circ_rotation_bcs.inp`](examples/beam_circ_rotation_bcs.inp) | circular-section `B31` beams with a twist held at pinned supports and a prescribed tip rotation → knot beams |
 | [`examples/planar_pinned_beam.inp`](examples/planar_pinned_beam.inp) | planar `B21` beam on pinned supports: DOF 3 fixed on its nodes and the twist at the pin, `*FREQUENCY` + `*BUCKLE` |
+| [`examples/planar_pinned_circ_beam.inp`](examples/planar_pinned_circ_beam.inp) | the same with a circular section (`B32` in ccx): the twist held at the first element's middle node |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

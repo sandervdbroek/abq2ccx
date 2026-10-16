@@ -23,7 +23,7 @@ How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.
 | `*FREQUENCY` | Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked (ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes). |
 | `*BUCKLE` | `EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads accuracy/vectors/iterations. |
 | `*HEAT TRANSFER` | `END=` / `MXDEM` dropped. |
-| `*BOUNDARY` | named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped; DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 crashes on them). |
+| `*BOUNDARY` | named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped; DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 crashes on them). An element end node of a circular-section beam whose rotational BCs hold only some of DOFs 4-6, or a nonzero one, gets a force-free knot beam (elset/material `ABQ2CCX_KNOT`): ccx 2.23 would lock the node's other rotations too. |
 | `*DLOAD` | passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / `CONSTANT RESULTANT` dropped (warned under NLGEOM). |
 | `*DSLOAD` | surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`. |
 | `*TIE` | Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept. |

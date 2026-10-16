@@ -52,7 +52,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 __version__ = "1.1.0"
 
@@ -1486,6 +1486,7 @@ class Converter:
         self._planar_elems: Dict[int, str] = {}
         self._planar_others: List[str] = []
         self._planar_bc: List[str] = []
+        self._planar_twist: List[int] = []         # ... the nodes among them with DOFs 4-5 fixed
         self._jc_with_rate: set = set()
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
@@ -1493,10 +1494,12 @@ class Converter:
         # 2-node beams upgraded to 3-node beams (_upgrade_section_beams): element -> (end node,
         # end node, midside node)
         self._midside: "OrderedDict[int, Tuple[int, int, int]]" = OrderedDict()
-        # rigid couplings on shell/beam nodes (see _plan_rigid_couplings)
+        # knot beams: rigid couplings on shell/beam nodes and rotational BCs on circular-section
+        # beams (see _plan_rigid_couplings, _plan_circ_rotation_knots, _add_knot_beams)
         self._knots: "OrderedDict[int, int]" = OrderedDict()   # node -> free end of its knot beam
-        self._knot_e = 1.0                         # knot-beam modulus / section size
+        self._knot_e = 1.0                         # knot-beam modulus / section size / length
         self._knot_a = 1.0
+        self._knot_ell = 1.0
         self._knot_k: Optional[float] = None       # its conductivity (thermal decks only)
         self._tie_rotations = True                 # False in a heat-transfer-only deck
         self._rot_nodes: set = set()               # nodes with rotations (shell/beam, not truss)
@@ -3974,6 +3977,7 @@ class Converter:
         self._prescan(blocks)
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
+        self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
         # errors without the card) — handle_surface_interaction synthesizes HARD for these
         self._si_missing_behavior = set()
@@ -4425,56 +4429,16 @@ class Converter:
         knots = [n for n in dedup(knots) if n in self.geom.nodes]
         if not knots:
             return
-        # the knot beam carries no load, so its geometry and stiffness only need to be
-        # harmless: short (1 % of the model size), a modulus of the deck's order (keeps the
-        # matrix well scaled), all pointing along one oblique direction (one section card)
-        lo = [min(x[k] for x in self.geom.nodes.values()) for k in range(3)]
-        hi = [max(x[k] for x in self.geom.nodes.values()) for k in range(3)]
-        span = vnorm(vsub((hi[0], hi[1], hi[2]), (lo[0], lo[1], lo[2])))
-        ell = 0.01 * span if span > 0 else 1.0
-        self._knot_a = float(f"{ell / 2:.4g}")
-        moduli = []
-        for b in blocks:
-            if b.keyword == "ELASTIC":
-                recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
-                try:
-                    moduli.append(pf(recs[0][0]))
-                except (IndexError, ValueError):
-                    pass
-        self._knot_e = max([m for m in moduli if m > 0] or [1.0])
-        # a thermal step needs a conductivity on every element (ccx stops without one); a
-        # heat-transfer-only deck makes thermal knots without rotations ('*ERROR in gen3dmpc:
+        # a heat-transfer-only deck makes thermal knots without rotations ('*ERROR in gen3dmpc:
         # ... a rotational DOF is constrained'), so nothing is tied there
         procs = [b for b in blocks if b.keyword in PROC_KW]
-        if any(b.keyword in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
-                             "UNCOUPLED TEMPERATURE-DISPLACEMENT") for b in procs):
-            ks = []
-            for b in blocks:
-                if b.keyword == "CONDUCTIVITY":
-                    recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
-                    try:
-                        ks.append(pf(recs[0][0]))
-                    except (IndexError, ValueError):
-                        pass
-            self._knot_k = max([k for k in ks if k > 0] or [1.0])
         self._tie_rotations = not procs or any(b.keyword != "HEAT TRANSFER" for b in procs)
         if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in procs):
             self.report.warn("Rigid coupling on shell/beam nodes in a deck with an explicit dynamic "
                              "step: ccx's explicit solver stops on it ('linear and nonlinear MPC's "
                              "depend on each other', probed on 2.23 with and without the knot "
                              "beams); only the implicit steps can run it.", once=True)
-        d = vunit((1.0, 1.0, 1.0))
-        nid = max(self.geom.nodes)
-        eid = max(self.geom.elements, default=0)
-        elems = []
-        for n in knots:
-            nid += 1
-            eid += 1
-            self.geom.add_node(nid, vadd(self.geom.nodes[n], vscale(d, ell)))
-            self.geom.add_element(eid, "B31", [n, nid])
-            self._knots[n] = nid
-            elems.append(eid)
-        self.geom.add_to_elset(KNOT_SET, elems)
+        self._add_knot_beams(knots, blocks)
         self.report.note(f"Rigid coupling on shell/beam nodes: ccx builds *KINEMATIC / *RIGID BODY "
                          f"from RIGID MPCs, which ccx 2.23 (FreeCAD 1.1 build) rejects on a shell/"
                          f"beam node unless ccx made it a knot ('*ERROR in gen3dmpc: ... RIGID "
@@ -4482,6 +4446,59 @@ class Converter:
                          f"(a B31 to a new free node, elset/material {KNOT_SET}, no density), "
                          f"which makes it a knot; the rotations Abaqus couples are tied to the "
                          f"reference rotation with *EQUATION.")
+
+    def _add_knot_beams(self, nodes: Sequence[int], blocks: List[Block]) -> None:
+        """Give each of ``nodes`` a force-free *knot beam*: a B31 from the node to a new free
+        end node, in elset/material KNOT_SET without density, so it carries no load in any
+        procedure.  ccx makes a node that two different beam expansions share a knot — a
+        rigid section whose rotations are true DOFs (rotational BCs, moments and MPC terms
+        act on its rotation node).  The first call fixes the beams' length, size, modulus
+        and (thermal decks) conductivity; nodes that already have one are skipped."""
+        nodes = [n for n in dedup(nodes) if n in self.geom.nodes and n not in self._knots]
+        if not nodes:
+            return
+        if not self._knots:
+            # the knot beam carries no load, so its geometry and stiffness only need to be
+            # harmless: short (1 % of the model size), a modulus of the deck's order (keeps
+            # the matrix well scaled), all along one oblique direction (one section card)
+            lo = [min(x[k] for x in self.geom.nodes.values()) for k in range(3)]
+            hi = [max(x[k] for x in self.geom.nodes.values()) for k in range(3)]
+            span = vnorm(vsub((hi[0], hi[1], hi[2]), (lo[0], lo[1], lo[2])))
+            self._knot_ell = 0.01 * span if span > 0 else 1.0
+            self._knot_a = float(f"{self._knot_ell / 2:.4g}")
+            moduli = []
+            for b in blocks:
+                if b.keyword == "ELASTIC":
+                    recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
+                    try:
+                        moduli.append(pf(recs[0][0]))
+                    except (IndexError, ValueError):
+                        pass
+            self._knot_e = max([m for m in moduli if m > 0] or [1.0])
+            # a thermal step needs a conductivity on every element (ccx stops without one)
+            if any(b.keyword in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                                 "UNCOUPLED TEMPERATURE-DISPLACEMENT") for b in blocks):
+                ks = []
+                for b in blocks:
+                    if b.keyword == "CONDUCTIVITY":
+                        recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
+                        try:
+                            ks.append(pf(recs[0][0]))
+                        except (IndexError, ValueError):
+                            pass
+                self._knot_k = max([k for k in ks if k > 0] or [1.0])
+        d = vunit((1.0, 1.0, 1.0))
+        nid = max(self.geom.nodes)
+        eid = max(self.geom.elements, default=0)
+        elems = []
+        for n in nodes:
+            nid += 1
+            eid += 1
+            self.geom.add_node(nid, vadd(self.geom.nodes[n], vscale(d, self._knot_ell)))
+            self.geom.add_element(eid, "B31", [n, nid])
+            self._knots[n] = nid
+            elems.append(eid)
+        self.geom.add_to_elset(KNOT_SET, elems)
 
     def _knot_section(self) -> List[str]:
         if not self._knots:
@@ -4729,12 +4746,16 @@ class Converter:
         U1/U2/UR3 clamp CAE writes) keeps a rigid twist mode — 0 Hz in *FREQUENCY, *BUCKLE
         factors near 1, an NLGEOM step that stops converging (B31) — so DOFs 4-5 are fixed
         at ONE of its nodes: one whose in-plane rotation is already fixed (no effect on any
-        section), else a support (no effect on B31, B32 RECT, B32R PIPE/BOX; on a node of a
-        circular section ccx 2.23 couples a DOF 4/5 BC into the bending rotation, so none
-        is added there).  Nodes whose DOF 3 a constraint drives, or under a *TRANSFORM
-        whose 3-axis is not z, are left out.  Fills ``self._planar_bc`` (model data;
-        handle_boundary repeats it after OP=NEW, which removes it)."""
+        section), else a support (no effect on B31, B32 RECT, B32R PIPE/BOX).  A beam with a
+        circular section gets them at the middle node of an element next to a support
+        instead: at an element end node ccx 2.23 would lock the bending rotation as well
+        (see _plan_circ_rotation_knots), at a middle node the BC holds only the rotations it
+        names (probed: static, NLGEOM, *FREQUENCY and *BUCKLE as with the twist free, to 4
+        digits).  Nodes whose DOF 3 a constraint drives, or under a *TRANSFORM whose 3-axis
+        is not z, are left out.  Fills ``self._planar_bc`` (model data; handle_boundary
+        repeats it after OP=NEW, which removes it) and ``self._planar_twist``."""
         self._planar_bc = []
+        self._planar_twist = []
         planar = {e: t for e, t in self._planar_elems.items() if e in self.geom.elements}
         if not planar:
             return
@@ -4774,6 +4795,7 @@ class Converter:
         self.geom.nsets[PLANAR_NODES_SET] = sorted(fixed)
         self._planar_bc = ["*BOUNDARY"] + ([f"{PLANAR_NODES_SET}, 3, 3"] if fixed else []) + \
             [f"{n}, 4, 5" for n in twist]
+        self._planar_twist = list(twist)
         effects = ([] if set(planar.values()) <= PLANAR_TRUSS_TYPES else
                    ["each bending mode would appear twice in *FREQUENCY and *BUCKLE could find "
                     "out-of-plane buckling"]) + \
@@ -4786,20 +4808,25 @@ class Converter:
                          f"in Abaqus' planar model{'; ' + why if left else ''}.", once=True)
         if twist:
             shown = ", ".join(map(str, twist[:5])) + (", ..." if len(twist) > 5 else "")
+            circ_mids = {c[1] for e in self._circ_beam_elements(blocks)
+                         for c in [self.geom.elements[e][1]] if len(c) == 3}
+            middle = (" (on a circular section: at the middle node of an element next to one, "
+                      "where ccx 2.23 does not lock the bending rotation with it)"
+                      if set(twist) & circ_mids else "")
             self.report.note(f"The twist (rotation about the beam axis) of {len(twist)} straight 2-D "
                              f"beam(s) was unrestrained — Abaqus' planar beams have no such DOF; in "
                              f"ccx it is a 0 Hz *FREQUENCY mode, makes *BUCKLE factors meaningless "
                              f"and can stop an NLGEOM step converging. DOFs 4-5 are fixed at node(s) "
                              f"{shown}: one per beam, at a node whose in-plane rotation is already "
-                             f"fixed, else at a support.", once=True)
+                             f"fixed, else at a support{middle}.", once=True)
         if loose:
             self.report.warn(f"The twist (rotation about the beam axis) of {loose} straight 2-D "
                              f"beam(s) is unrestrained — Abaqus' planar beams have no such DOF; ccx "
                              f"shows a 0 Hz twist mode in *FREQUENCY and its *BUCKLE factors (near 1) "
-                             f"are meaningless. No BC was added: on a beam with a circular section "
-                             f"ccx 2.23 couples a DOF 4/5 BC into the bending rotation (probed: a "
-                             f"simply supported beam then deflects half as much), and ccx allows no "
-                             f"rotational BC on a node with a *TRANSFORM.", once=True)
+                             f"are meaningless. No BC was added: none of its nodes can take one "
+                             f"(nodes under a *TRANSFORM, where ccx allows no rotational BC, and "
+                             f"rigid-body/coupling reference nodes are skipped; on a circular section "
+                             f"only an element's middle node holds the twist alone).", once=True)
         if any(t not in PLANAR_TRUSS_TYPES for t in planar.values()) and \
                 any(b.keyword in ("FREQUENCY", "COMPLEX FREQUENCY") for b in blocks):
             self.report.warn("*FREQUENCY on a planar beam model: ccx's 3-D beams keep their twist "
@@ -4874,27 +4901,49 @@ class Converter:
                 skew.update(self._resolve_nodes((b.param("NSET") or "").strip()))
         return skew
 
+    def _boundary_records(self, b: Block) -> Iterator[Tuple[List[int], set, bool]]:
+        """(nodes, DOFs, moves) per data line of the *BOUNDARY ``b``; ``moves`` is True when
+        the line prescribes a value other than 0 (or the card velocities, accelerations,
+        FIXED or USER values)."""
+        typ = (b.param("TYPE") or "").strip().upper()
+        moving = typ in ("VELOCITY", "ACCELERATION") or b.has("FIXED") or b.has("USER")
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) < 2 or not g[0]:
+                continue
+            value = 0.0
+            if re.fullmatch(r"[-+]?\d+", g[1]):
+                d1 = int(g[1])
+                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
+                ds = set(range(min(d1, d2), max(d1, d2) + 1))
+                try:
+                    value = pf(g[3]) if len(g) > 3 and g[3] else 0.0
+                except ValueError:
+                    value = 1.0                          # a *PARAMETER name: assume it moves
+            else:
+                ds = {d for lo, hi in self._named_bc_dofs(g[1], True) or [] for d in range(lo, hi + 1)}
+            yield self._resolve_nodes(g[0]), ds, moving or value != 0.0
+
     def _bc_dofs_by_node(self, blocks: List[Block]) -> Dict[int, set]:
         """Every DOF some *BOUNDARY (model data or any step) prescribes, per node."""
         dofs: Dict[int, set] = {}
         for b in blocks:
             if b.keyword != "BOUNDARY":
                 continue
-            for rec in merged_data_records(b):
-                g = [x.strip() for x in rec]
-                while g and g[-1] == "":
-                    g.pop()
-                if len(g) < 2 or not g[0]:
-                    continue
-                if re.fullmatch(r"[-+]?\d+", g[1]):
-                    d1 = int(g[1])
-                    d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
-                    ds = set(range(min(d1, d2), max(d1, d2) + 1))
-                else:
-                    ds = {d for lo, hi in self._named_bc_dofs(g[1], True) or [] for d in range(lo, hi + 1)}
-                for n in self._resolve_nodes(g[0]):
+            for nodes, ds, _moves in self._boundary_records(b):
+                for n in nodes:
                     dofs.setdefault(n, set()).update(ds)
         return dofs
+
+    def _circ_beam_elements(self, blocks: List[Block]) -> set:
+        """Elements under a *BEAM SECTION with SECTION=CIRC."""
+        circ: set = set()
+        for b in blocks:
+            if b.keyword == "BEAM SECTION" and (b.param("SECTION") or "").strip().upper() == "CIRC":
+                circ.update(self.geom.elset((b.param("ELSET") or "").strip()))
+        return {e for e in circ if e in self.geom.elements}
 
     def _planar_twist_nodes(self, blocks: List[Block], planar: Dict[int, str],
                             held: set) -> Tuple[List[int], int]:
@@ -4903,7 +4952,8 @@ class Converter:
         _plan_planar_constraint).  Returns those nodes and the number of such beams with no
         safe node.  Beams with constrained nodes are left alone (the constraint may hold
         the twist); a beam that is not straight has no rigid twist once DOF 3 is fixed.
-        Nodes with a *TRANSFORM are never picked: ccx allows no rotational BC there."""
+        Nodes with a *TRANSFORM are never picked: ccx allows no rotational BC there.  On a
+        circular section the node is a 3-node element's middle node."""
         beams = [e for e, t in planar.items() if t not in PLANAR_TRUSS_TYPES]
         root: Dict[int, int] = {}
 
@@ -4921,10 +4971,7 @@ class Converter:
         groups: "OrderedDict[int, List[int]]" = OrderedDict()
         for e in beams:
             groups.setdefault(find(self.geom.elements[e][1][0]), []).append(e)
-        circ: set = set()
-        for b in blocks:
-            if b.keyword == "BEAM SECTION" and (b.param("SECTION") or "").strip().upper() == "CIRC":
-                circ.update(self.geom.elset((b.param("ELSET") or "").strip()))
+        circ = self._circ_beam_elements(blocks)
         bc = self._bc_dofs_by_node(blocks) if groups else {}
         turned = {n for b in blocks if b.keyword == "TRANSFORM"
                   for n in self._resolve_nodes((b.param("NSET") or "").strip())}
@@ -4948,14 +4995,111 @@ class Converter:
                 continue
             cand = [n for n in cn if n not in turned and n not in self._ref_nodes]
             clamped = [n for n in cand if 6 in bc.get(n, set())]
+            supports = [n for n in cand if bc.get(n, set()) & {1, 2, 3}]
             if clamped:
                 picks.append(clamped[0])
-            elif not cand or any(e in circ for e in elems):
+            elif any(e in circ for e in elems):
+                # a circular section: the middle node of a 3-node element, one next to a
+                # support if there is one (at an end node the BC would lock the bending too)
+                mids = [c for c in (self.geom.elements[e][1] for e in elems)
+                        if len(c) == 3 and c[1] in cand]
+                near = [c for c in mids if c[0] in supports or c[2] in supports]
+                if mids:
+                    picks.append((near or mids)[0][1])
+                else:
+                    loose += 1
+            elif not cand:
                 loose += 1
             else:
-                supports = [n for n in cand if bc.get(n, set()) & {1, 2, 3}]
                 picks.append(supports[0] if supports else min(cand))
         return picks, loose
+
+    # ======================================================================
+    # Rotational BCs on circular-section beams
+    # ======================================================================
+    def _plan_circ_rotation_knots(self, blocks: List[Block]) -> None:
+        """ccx expands a circular-section beam node into eight nodes on the circle (corners
+        at 45 degrees, midsides on the section axes) and, for every rotational BC on a
+        B32/B32R node that is not a knot, ties that section's four midside nodes to the mean
+        of their corners (gen3dboun) — exact on a rectangle (RECT, PIPE, BOX), but no rigid
+        rotation of a circle satisfies it, so a BC on DOF 4, 5 or 6 at an element end node
+        locks the twist and both bending rotations there.  Probed on 2.23 (B32, 10
+        elements): a pinned beam whose twist is held at both supports deflects 0.27 of beam
+        theory (DOF 4 at one end: 0.46), a prescribed tip rotation gives 0.76 of its
+        deflection, DOF 4 on every node 0.009.  A knot hands the BCs to its rotation node
+        instead, so every element end node of a CIRC beam whose rotational BCs hold only some
+        of DOFs 4-6, or a nonzero value, in some step gets a knot beam (_add_knot_beams):
+        0.994 and 1.00.  The knot's rigid section costs a little where the beam bends
+        (0.3-1.3 % with a knot inside a span of 40-10 elements; nothing at a pinned end); a
+        node ccx makes a knot anyway (a frame joint) gets one too, harmlessly.  Left alone:
+        full zero clamps (exact as they are), 3-node elements' middle nodes (the tied nodes
+        are unused there), nodes with a *TRANSFORM (ccx allows no rotational BC there) or
+        that are rigid-body/coupling reference nodes, heat-transfer-only decks; a deck with
+        an explicit dynamic step is only warned (the explicit solver stops on the density-
+        free knot beams: '*ERROR in calcstabletimeincvol').  Runs after
+        _plan_planar_constraint, whose DOF 4-5 lines count in every step."""
+        if getattr(self.opt, "solid_dof", False):
+            return
+        ends = {n for e in self._circ_beam_elements(blocks)
+                for c in [self.geom.elements[e][1]] if len(c) == 3 for n in (c[0], c[2])}
+        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        if not ends or all(p == "HEAT TRANSFER" for p in procs):
+            return
+        twist = set(self._planar_twist) & ends
+        active: Dict[int, set] = {}                      # node -> rotations a BC holds now
+        moves: set = set()                               # nodes given a nonzero rotation
+        need: List[int] = []
+
+        def check() -> None:                             # the BCs a step solves with
+            for n in sorted((set(active) | twist) & ends):
+                rot = active.get(n, set()) | ({4, 5} if n in twist else set())
+                if rot and (rot != {4, 5, 6} or n in moves):
+                    need.append(n)
+
+        for b in blocks:
+            if b.keyword == "BOUNDARY":
+                if (b.param("OP") or "").strip().upper() == "NEW":
+                    active = {}
+                for nodes, ds, moving in self._boundary_records(b):
+                    for n in (nodes if ds & {4, 5, 6} else []):
+                        if n in ends:
+                            active.setdefault(n, set()).update(ds & {4, 5, 6})
+                            if moving:
+                                moves.add(n)
+            elif b.keyword == "END STEP":
+                check()
+        check()
+        turned = {n for b in blocks if b.keyword == "TRANSFORM"
+                  for n in self._resolve_nodes((b.param("NSET") or "").strip())}
+        need = [n for n in dedup(need) if n not in turned and n not in self._ref_nodes
+                and n not in self._knots]
+        if not need:
+            return
+        shown = ", ".join(map(str, need[:5])) + (", ..." if len(need) > 5 else "")
+        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks):
+            self.report.warn(f"Rotational BCs on {len(need)} element end node(s) of circular-section "
+                             f"beams ({shown}) hold only some rotations, or a nonzero one: ccx 2.23 "
+                             f"locks the node's other rotations as well (probed: a pinned beam with "
+                             f"its twist held at the supports deflects about 0.3 of beam theory). The "
+                             f"knot beams that repair it were not added: ccx's explicit solver stops "
+                             f"on them ('*ERROR in calcstabletimeincvol', they have no density) — "
+                             f"verify.", once=True)
+            return
+        self._add_knot_beams(need, blocks)
+        self.report.note(f"Rotational BCs on circular-section beams: for a rotational BC on a "
+                         f"B32/B32R node ccx 2.23 ties the section's midside nodes to its corners, "
+                         f"which a circle cannot follow, so a BC on some of DOFs 4-6 (or a nonzero "
+                         f"one) would lock the node's other rotations as well (probed: a pinned beam "
+                         f"with its twist held at the supports deflects about 0.3 of beam theory). "
+                         f"The {len(need)} such node(s) ({shown}) got a force-free knot beam (a B31 "
+                         f"to a new free node, elset/material {KNOT_SET}, no density): a knot's BCs "
+                         f"hold only the rotations they name.", once=True)
+        if len(need) > max(2, len(ends) // 4):
+            self.report.warn(f"{len(need)} of the {len(ends)} element end nodes of circular-section "
+                             f"beams got a knot beam for their rotational BCs: each knot is a rigid "
+                             f"section, which stiffens the beam where it bends (probed: DOF 4 held on "
+                             f"every node of a 10-element beam deflects 0.84 of beam theory with the "
+                             f"knots, 0.009 without) — verify.", once=True)
 
 
 def dedup_str(seq: Sequence[str]) -> List[str]:

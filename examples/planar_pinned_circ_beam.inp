@@ -1,0 +1,43 @@
+*Heading
+Simply supported planar beam (B21) with a circular section: frequencies and buckling
+** L = 1000, r = 10 (I = pi r^4 / 4 = 7854, A = pi r^2), E = 210000, rho = 7.85e-9.
+** Euler-Bernoulli: f_n = n^2 pi / (2 L^2) sqrt(E I / (rho A)) = 40.62 and 162.49 Hz,
+** buckling load P = pi^2 E I / L^2 = 16278.
+** ccx runs B21 as a 3-D beam, circular sections only as B32: abq2ccx adds the midside
+** nodes, fixes DOF 3 on every node and holds the free twist (else a 0 Hz mode and a
+** meaningless buckling factor) with DOFs 4-5 at the middle node of the first element: at
+** an element end node ccx 2.23 would lock the bending rotation of a circular section too
+** (f1 1.46x, buckling load 1.88x); at the middle node both are as with the twist free.
+*Node
+1, 0., 0.
+21, 1000., 0.
+*Ngen, nset=AXIS
+1, 21, 1
+*Element, type=B21, elset=BEAM
+1, 1, 2
+*Elgen, elset=BEAM
+1, 20, 1, 1
+*Nset, nset=PIN
+1
+*Nset, nset=ROLLER
+21
+*Beam Section, elset=BEAM, material=STEEL, section=CIRC
+10.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Density
+7.85e-9
+*Boundary
+PIN, 1, 2
+ROLLER, 2, 2
+*Step
+*Frequency
+4
+*End Step
+*Step
+*Buckle
+2
+*Cload
+ROLLER, 1, -1.
+*End Step

@@ -20,7 +20,8 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **A keyword line ending in a comma continues its *parameters* on the next line** | splice them back; never merge a genuine data row | Abaqus input syntax: "continue a long keyword line by ending it with a comma" |
 | **`NSET=` on `*NODE`, `ELSET=` on `*ELEMENT`, `GENERATE` on `*NSET`/`*ELSET`** are accepted | relied upon when emitting geometry | ccx `*NODE`/`*ELEMENT`/`*NSET`/`*ELSET` sections |
 | **`*EQUATION`/`*MPC` dependent DOF can't also be an SPC** | pre-flight overconstraint warning | ccx `*EQUATION` section; the `cascade` error on the forums |
-| **ccx has no planar beam or truss**: `B21` "is internally replaced by a B31 element", `T2D2` by a `T3D2`, so their out-of-plane DOFs are free; a rotational BC on every node of an expanded beam stiffens it | in a planar model, fix DOF 3 on the nodes of 2-D beams/trusses, and DOFs 4–5 at one node of a straight beam whose twist is free (twist modes stay in `*FREQUENCY`, warned) | ccx manual 6.2.31, 6.2.34; probed on 2.23 (`B21` frequency deck: every bending mode twice) |
+| **ccx has no planar beam or truss**: `B21` "is internally replaced by a B31 element", `T2D2` by a `T3D2`, so their out-of-plane DOFs are free; a rotational BC on every node of an expanded beam stiffens it | in a planar model, fix DOF 3 on the nodes of 2-D beams/trusses, and DOFs 4–5 at one node of a straight beam whose twist is free — on a circular section an element's middle node (twist modes stay in `*FREQUENCY`, warned) | ccx manual 6.2.31, 6.2.34; probed on 2.23 (`B21` frequency deck: every bending mode twice) |
+| **A rotational BC on a circular-section beam node locks its other rotations**: for every rotational BC on a non-knot `B32`/`B32R` node ccx ties the section's midside nodes to the mean of its corners, and a `CIRC` section's eight nodes lie on the circle, where no rigid rotation satisfies that; at a 3-node element's middle node the tied nodes are unused | an element end node whose rotational BCs hold only some of DOFs 4–6, or a nonzero one, gets a force-free knot beam: a knot's BCs act on its rotation node (warned when most nodes need one, or not repaired under an explicit step) | ccx sources `gen3dfrom1d.f`, `gen3dboun.f`; probed on 2.23 (twist held at pinned ends: 0.27 of beam theory, 0.994 with knots) |
 
 ## Version notes
 
@@ -57,8 +58,10 @@ line with the element type and mesh density). A cantilever on linear beams with 
 circular section matches beam theory's tip deflection within 0.4 %, pipe- and
 box-section cantilevers match it within 0.6 %, a shell plate whose edge is rigidly coupled
 to a loaded reference point matches the same plate built from solids under `*RIGID BODY`
-within 0.001 %, a planar `B21` beam's frequencies and buckling load match beam theory
-within 0.6 %, and the composite-shell and assembly decks also solve. This proves the full
+within 0.001 %, circular-section beams with a held twist and a prescribed rotation match
+beam theory within 0.2 %, planar `B21` beams' frequencies and buckling loads (rectangular
+and circular sections) match it within 0.6 %, and the composite-shell and assembly decks
+also solve. This proves the full
 pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face,
 sections — is correct, not merely well-formed.
 
