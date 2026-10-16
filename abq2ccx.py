@@ -2112,12 +2112,17 @@ class AmplitudeCurve:
     times where it is not smooth; ``panel``: the length of one integration panel for a
     non-polynomial curve (PERIODIC / MODULATED / DECAY; 0 = polynomial pieces);
     ``total``: TIME=TOTAL TIME; ``absolute``: VALUE=ABSOLUTE (its values replace the
-    magnitude on the card)."""
+    magnitude on the card); ``corners``: the inner points of a piecewise-linear curve
+    where its slope changes, which Abaqus smooths where it needs the curve's time
+    derivative, by ``smooth`` (its SMOOTH parameter; None: the default, 0.25 in
+    Abaqus/Standard and 0 in Abaqus/Explicit)."""
     value: Callable[[float], float]
     breaks: List[float]
     panel: float = 0.0
     total: bool = False
     absolute: bool = False
+    corners: List[float] = field(default_factory=list)
+    smooth: Optional[float] = None
 
 
 def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
@@ -2140,6 +2145,10 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
         fixed, begin = num("FIXED INTERVAL", 0.0), num("BEGIN", 0.0)
     except ValueError:
         return None
+    try:
+        smooth = num("SMOOTH", -1.0)                 # -1: not given
+    except ValueError:
+        smooth = -1.0
     if b.has("INPUT") or not vals:
         return None
     if definition in ("TABULAR", "SMOOTH STEP", "EQUALLY SPACED"):
@@ -2153,7 +2162,7 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
         amps = [a * sy + dy for _, a in pts]
         if not ts or any(t1 < t0 for t0, t1 in zip(ts, ts[1:])):
             return None
-        smooth = definition == "SMOOTH STEP"
+        step = definition == "SMOOTH STEP"
 
         def tabular(t: float) -> float:
             if t <= ts[0]:
@@ -2162,10 +2171,15 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
                 return amps[-1]
             i = bisect.bisect_right(ts, t) - 1          # ts[i] <= t < ts[i + 1]
             x = (t - ts[i]) / (ts[i + 1] - ts[i])
-            if smooth:
+            if step:
                 x = x ** 3 * (10.0 - 15.0 * x + 6.0 * x * x)
             return amps[i] + (amps[i + 1] - amps[i]) * x
-        return AmplitudeCurve(tabular, ts, 0.0, total, absolute)
+        slopes = [(a1 - a0) / (t1 - t0) if t1 > t0 else math.inf
+                  for t0, t1, a0, a1 in zip(ts, ts[1:], amps, amps[1:])]
+        corners = [] if step else [ts[i + 1] for i, (s0, s1) in enumerate(zip(slopes, slopes[1:]))
+                                   if s0 != s1]
+        return AmplitudeCurve(tabular, ts, 0.0, total, absolute, corners,
+                              None if smooth < 0.0 else smooth)
     if (sx, sy, dx, dy) != (1.0, 1.0, 0.0, 0.0):
         return None                 # scaling/shifting of the analytic forms: not modelled
     if definition == "PERIODIC" and len(vals) >= 4:
@@ -4622,7 +4636,8 @@ class Converter:
         """What the velocity-BC plan needs to know of a step: the time period over which its
         nodes move (None for Riks, heat transfer, a linear perturbation, ...), the time it
         adds to the total time (0 for a perturbation step, None when unknown), the default
-        amplitude of its loads and BCs, and whether it is dynamic / under NLGEOM."""
+        amplitude of its velocity and acceleration BCs, and whether it is dynamic /
+        explicit / under NLGEOM."""
         step_b = group[0]
         proc_b = next((x for x in group[1:] if x.keyword in PROC_KW or
                        x.keyword in self._MOTION_PROCS), None)
@@ -4642,17 +4657,33 @@ class Converter:
                 advance = None
             if proc != "HEAT TRANSFER":
                 period = advance
+        # the default amplitude of loads and BCs (Abaqus manual, "Defining an analysis",
+        # Table 1): STEP in Abaqus/Explicit and in transient procedures, RAMP in static and
+        # steady-state ones; *STEP AMPLITUDE overrides it in Abaqus/Standard
+        quasi = proc == "DYNAMIC" and \
+            (proc_b.param("APPLICATION") or "").strip().upper().startswith("QUASI")
         default = (step_b.param("AMPLITUDE") or "").strip().upper()
         if explicit:
-            default = "STEP"         # Abaqus/Explicit applies loads and BCs at once
+            default = "STEP"
         elif default not in ("RAMP", "STEP"):
-            # Abaqus: loads and BCs step in dynamics (except quasi-static), ramp elsewhere
-            quasi = proc_b is not None and (proc_b.param("APPLICATION") or "").upper().startswith("QUASI")
-            default = "STEP" if proc == "DYNAMIC" and not quasi else "RAMP"
+            if proc == "DYNAMIC":
+                transient = not quasi
+            elif proc.endswith("TEMPERATURE-DISPLACEMENT"):
+                transient = not proc_b.has("STEADY STATE")
+            elif proc == "SOILS":
+                transient = proc_b.has("CONSOLIDATION")
+            else:
+                transient = proc == "VISCO"            # the table's "quasi-static": STEP too
+            default = "STEP" if transient else "RAMP"
+        # *BOUNDARY, AMPLITUDE: "when displacement or rotation components in a static step or
+        # in a dynamic step with APPLICATION=QUASI-STATIC are given with TYPE=VELOCITY, ...
+        # the default is always a STEP function"
+        static = proc in ("STATIC", "GEOSTATIC")
+        defaults = {"VELOCITY": "STEP" if static or quasi else default, "ACCELERATION": default}
         if step_b.has("NLGEOM"):
             nlgeom = nlgeom or (step_b.param("NLGEOM") or "YES").strip().upper() != "NO"
-        return dict(period=period, advance=advance, default=default, dynamic=proc == "DYNAMIC",
-                    perturbation=perturbation, nlgeom=nlgeom or explicit,
+        return dict(period=period, advance=advance, defaults=defaults, dynamic=proc == "DYNAMIC",
+                    explicit=explicit, perturbation=perturbation, nlgeom=nlgeom or explicit,
                     proc=(proc + (", RIKS" if proc_b.has("RIKS") else "")) if proc else "(no procedure)")
 
     @staticmethod
@@ -4689,12 +4720,14 @@ class Converter:
         amplitude (integrate_history keeps that within 1e-4 of the step's travel; a
         constant or piecewise-constant rate is exact).  The rate is the magnitude times the
         amplitude (VALUE=ABSOLUTE: the amplitude alone; TIME=TOTAL TIME on total time) or,
-        without AMPLITUDE, the step default: STEP holds the magnitude over the step, RAMP
-        ramps the rate from its previous value.  A rate BC a later step keeps (no OP=NEW,
-        not re-specified) keeps moving the DOF in Abaqus - at the rate it ended with, or
-        along a TOTAL TIME amplitude - while a ccx BC with a step-time amplitude stays at
-        its last value (manual, *AMPLITUDE), so that step gets the continued motion before
-        its *END STEP (_vel_tail).  The start displacement and velocity of each DOF are
+        without AMPLITUDE, the Abaqus default (_step_motion): a velocity is held over a
+        static or quasi-static step (STEP); anything else follows the step's default
+        amplitude, where a RAMP starts from the value at the end of the previous step (a
+        velocity in a dynamic step: from the DOF's velocity).  A rate BC a later step keeps
+        (no OP=NEW, not re-specified) keeps moving the DOF in Abaqus - at the rate it ended
+        with, or along a TOTAL TIME amplitude - while a ccx BC with a step-time amplitude
+        stays at its last value (manual, *AMPLITUDE), so that step gets the continued motion
+        before its *END STEP (_vel_tail).  The start displacement and velocity of each DOF are
         followed through the steps; where the displacement is unknown (the DOF was free, or
         held by a USER / SUBMODEL BC) a zero rate becomes *BOUNDARY, FIXED (probed: holds
         the value the previous step ended with) and any other rate cannot be converted.
@@ -4905,9 +4938,26 @@ class Converter:
                 return h[2] > 0.0 and T / h[2] > 8 * max_points
 
             def prev_rate(k: Tuple[int, int], bc: dict) -> float:
-                """Where a RAMP of bc on DOF k starts (0 without an earlier BC of its type)."""
+                """Where a RAMP of bc on DOF k starts: in a dynamic step a velocity starts from
+                the DOF's velocity at the step start (Abaqus Verification Guide, boundary
+                condition types: "linear from the previous value at the end of the first
+                step"), anything else from the value the DOF's earlier BC of its type ended
+                with (0 without one)."""
+                if bc["mode"] != "RAMP":
+                    return 0.0
+                u_s, v_s = start.get(k, (None, None))
+                if info["dynamic"] and bc["q"] == "VELOCITY":
+                    if v_s is not None:
+                        return v_s
+                    if u_s is not None:          # (else the BC cannot be converted anyway)
+                        self.report.warn("*BOUNDARY, TYPE=VELOCITY ramped (no AMPLITUDE, *STEP "
+                                         "AMPLITUDE=RAMP) in a dynamic step on a DOF whose velocity "
+                                         "at the step start the converter does not know (a "
+                                         "displacement BC or a static step moved it): Abaqus ramps "
+                                         "from that velocity; taken as the DOF's earlier velocity "
+                                         "BC value (0 without one).", once=True)
                 pe = prev_end.get(k)
-                return (pe[1] or 0.0) if bc["mode"] == "RAMP" and pe and pe[0] == bc["q"] else 0.0
+                return (pe[1] or 0.0) if pe and pe[0] == bc["q"] else 0.0
 
             def convert(bc: dict, keys: List[Tuple[int, int]], shapes: Dict[tuple, str],
                         amp_lines: List[str], entries: list, driven: dict) -> None:
@@ -4930,6 +4980,21 @@ class Converter:
                                                  f"over a thousand times in the step: too fast for "
                                                  f"a sampled displacement amplitude."))
                     return
+                c = bc.get("curve")
+                if bc["mode"] == "AMP" and q == "VELOCITY" and info["dynamic"]:
+                    # *BOUNDARY: "In an Abaqus/Standard dynamic ... procedure, amplitude curves
+                    # specified for ... TYPE=VELOCITY will be smoothed automatically"
+                    off = t0 if c.total else 0.0
+                    frac = c.smooth if c.smooth is not None else 0.0 if info["explicit"] else 0.25
+                    if frac > 0.0 and any(off < x < off + T for x in c.corners):
+                        self.report.warn(f"*BOUNDARY, TYPE=VELOCITY with a TABULAR amplitude in a "
+                                         f"dynamic step: Abaqus replaces the curve around each of "
+                                         f"its points by a quadratic (SMOOTH={frac:g}) so that the "
+                                         f"acceleration stays finite, while the converter integrates "
+                                         f"the piecewise-linear curve: the displacement can differ by "
+                                         f"up to the change of slope x (SMOOTH x the time interval)^2 "
+                                         f"/ 6 per point. Give the amplitude SMOOTH=0 in the Abaqus "
+                                         f"deck to compare like with like.", once=True)
                 groups_: "OrderedDict[tuple, List[Tuple[int, int]]]" = OrderedDict()
                 for k in keys:
                     u_s, v_s = start.get(k, (0.0, 0.0))
@@ -5075,17 +5140,25 @@ class Converter:
                         elif named:
                             mode, mag = "STEP", 0.0
                         else:
-                            mode = ("AMP" if curve else "UNKNOWN") if amp else info["default"]
+                            mode = ("AMP" if curve else "UNKNOWN") if amp else info["defaults"][q]
                         bc = dict(q=q, mode=mode, mag=mag or 0.0, curve=curve, amp=amp or None,
                                   spec=spec, dofs=dofs, named=named, text=text)
                         if mode == "RAMP" and (mag or any(prev_rate(k, bc) for k in keys)):
-                            self.report.warn(f"*BOUNDARY, TYPE={q} without AMPLITUDE in a step whose "
-                                             f"default amplitude is RAMP: taken, like any Abaqus BC, "
-                                             f"as the {q.lower()} ramping from its previous value (0 "
-                                             f"at first) to the given one over the step, so the "
-                                             f"displacement grows quadratically. If the deck means "
-                                             f"a constant {q.lower()}, give it an amplitude (or *STEP, "
-                                             f"AMPLITUDE=STEP).", once=True)
+                            self.report.note(f"*BOUNDARY, TYPE={q} without AMPLITUDE in a "
+                                             f"{info['proc']} step whose default amplitude is RAMP "
+                                             f"(*STEP AMPLITUDE, or the procedure's default): the "
+                                             f"{q.lower()} ramps over the step to the given one from "
+                                             f"its value at the end of the previous step (0 at "
+                                             f"first; a velocity in a dynamic step: from the DOF's "
+                                             f"velocity), as in Abaqus.", once=True)
+                        if q == "ACCELERATION" and not info["dynamic"] and not bad and \
+                                (mag or curve is not None):
+                            self.report.warn(f"*BOUNDARY, TYPE=ACCELERATION in a {info['proc']} step: "
+                                             f"the Abaqus manual says acceleration histories should "
+                                             f"not be used in static steps. Converted to the motion "
+                                             f"the acceleration integrates to from the velocity at "
+                                             f"the step start, which Abaqus need not reproduce.",
+                                             once=True)
                         if not bad:
                             convert(bc, keys, shapes, amp_lines, entries, driven)
                     for k in keys:
@@ -5124,20 +5197,26 @@ class Converter:
                 self._vel_tail[s] = pieces(None, tail_amps, tail,
                                            ["** [abq2ccx] *BOUNDARY, TYPE=VELOCITY/ACCELERATION of "
                                             "an earlier step, still in force: its motion continues"])
-            # warn where finite rotations about several axes are integrated component-wise
+            # warn where finite rotations about several axes are integrated component-wise:
+            # a node turned about more than one axis in this step, or about another axis
+            # than the one it turned about before (the manual's own example of velocity BCs)
             if nlgeom:
-                axes: Dict[int, int] = {}
+                axes: Dict[int, set] = {}
                 for k, st in state.items():
                     bc = st[2]
                     if bc is not None and bc["q"] in self._RATE_TYPES and k[1] >= 4:
                         res = motion(bc, 0.0, 0.0, prev_rate(k, bc))
                         if res is not None and any(x != 0.0 for _, x in res[0]):
-                            axes[k[0]] = axes.get(k[0], 0) + 1
-                if any(c > 1 for c in axes.values()):
-                    self.report.warn("*BOUNDARY, TYPE=VELOCITY/ACCELERATION on more than one "
-                                     "rotational DOF of a node under NLGEOM: each rotation is "
-                                     "integrated on its own, which is exact only for a rotation "
-                                     "about a fixed axis (finite rotations do not add up).", once=True)
+                            axes.setdefault(k[0], set()).add(k[1])
+                for (n, d), (u_s, _) in start.items():
+                    if d >= 4 and u_s and n in axes:
+                        axes[n].add(d)
+                if any(len(ds) > 1 for ds in axes.values()):
+                    self.report.warn("*BOUNDARY, TYPE=VELOCITY/ACCELERATION turning a node under "
+                                     "NLGEOM about more than one axis (in one step, or one after "
+                                     "the other): each rotation component is integrated on its "
+                                     "own, which is exact only for a rotation about a fixed axis "
+                                     "(finite rotations do not add up).", once=True)
             # where each DOF ends the step, and the form its BC carries into the next one
             for k, st in state.items():
                 bc, (u_s, v_s) = st[2], start[k]

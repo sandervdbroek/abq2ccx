@@ -324,14 +324,21 @@ parts now move as a mechanism instead of floating apart, and the teeter deck (`B
 displacements only), so the converter integrates it: a DOF moves by the integral of the
 prescribed velocity (an acceleration twice, from the velocity at the step start) from where
 the step finds it. The velocity is the magnitude times its amplitude (`VALUE=ABSOLUTE`: the
-amplitude itself; `TIME=TOTAL TIME` on total time), or without an amplitude the step's
-default — held from the start of the step in explicit and transient dynamics (and under
-`*STEP, AMPLITUDE=STEP`), ramped from its previous value under the `RAMP` default of static
-steps. That last case is taken from Abaqus' general rule for BCs without an amplitude and is
-**warned**: it has not been checked against an Abaqus run, and a constant velocity is easily
-made explicit with an amplitude. The integral is exact at the amplitude's points and within
-1e-4 of the step's travel between them (a constant or piecewise-constant velocity exact), so
-it is a sampled history, not a physics approximation, and is not gated behind
+amplitude itself; `TIME=TOTAL TIME` on total time), or without an amplitude the default
+the Abaqus manual gives: a velocity is held from the start of a static step or a
+quasi-static dynamic one whatever `*STEP, AMPLITUDE` says ("always a STEP function",
+`*BOUNDARY`), and of any Abaqus/Explicit step; anything else follows the step's default
+amplitude — `*STEP, AMPLITUDE`, else the procedure's ("Defining an analysis": `STEP` in
+dynamics, `*VISCO` and transient coupled or consolidation steps, `RAMP` in steady-state
+ones) — a `RAMP` going from the value at the end of the previous step (a velocity in a
+dynamic step: from the DOF's velocity). **Warned**: an acceleration in a static step (the
+manual says not to use one there), and a tabular velocity amplitude in a dynamic step,
+which Abaqus/Standard smooths around its points (`SMOOTH`, default 0.25; Abaqus/Explicit
+only on request) where the converter integrates the straight-line curve — the
+displacement can differ by up to the change of slope × (`SMOOTH` × interval)² / 6 per
+point. The integral is exact at the amplitude's points and within 1e-4 of the step's
+travel between them (a constant or piecewise-constant velocity exact), so it is a sampled
+history, not a physics approximation, and is not gated behind
 `--approximate` (the converter samples `SMOOTH STEP` displacement amplitudes the same way,
 far more coarsely). The displacement at each step start is followed through the steps;
 where it is unknown — the DOF was free in an earlier step — a zero velocity becomes
@@ -340,7 +347,8 @@ rotations in ccx, so a shell or beam rotation there is commented out too; a rigi
 rotations are held on its `ROT NODE`). The midside node the converter adds to a 2-node beam
 moves with the mean of its end nodes' motions, as the Abaqus element's interior does. In a
 linear perturbation step only the constraint is kept, and under `NLGEOM` angular velocities
-about more than one axis of a node are warned (each rotation is integrated on its own, exact
+that turn a node about more than one axis — in one step, or one after the other, as in the
+manual's own example — are warned (each rotation component is integrated on its own, exact
 only about a fixed axis). Not converted (warned): an amplitude with more than a thousand
 oscillations in the step, and a `TIME=TOTAL TIME` amplitude after a step of unknown length
 (Riks).

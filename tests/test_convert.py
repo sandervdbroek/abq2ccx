@@ -4471,7 +4471,9 @@ def test_velocity_bc_carried_into_later_steps_and_ramped():
     deck = VEL_HEX + ("*Amplitude, name=A1\n0., 0., 0.5, 1., 1., 1.\n"
                       "*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY, amplitude=A1\n"
                       "TOP, 3, 3, 0.1\n*End Step\n*Step\n*Static\n0.1, 2.\n*End Step\n"
-                      "*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\nTOP, 3, 3, -0.2\n*End Step\n")
+                      "*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\nTOP, 3, 3, -0.2\n*End Step\n"
+                      "*Step, amplitude=RAMP\n*Visco\n0.1, 1.\n*Boundary, type=VELOCITY\n"
+                      "TOP, 3, 3, 0.4\n*End Step\n")
     body, _, rep = convert_str(deck)
     steps = body.split("*STEP")
     assert _amplitude(body, "ABQ2CCX_VEL1")[-1] == (1.0, 0.75)          # 0.1 x 0.75 = 0.075
@@ -4479,11 +4481,15 @@ def test_velocity_bc_carried_into_later_steps_and_ramped():
     # where a ccx BC would freeze at its last value
     assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nTOP, 3, 3, 1.\n*END STEP" in _without_output(steps[2])
     assert _amplitude(body, "ABQ2CCX_VEL2") == [(0.0, 0.075), (2.0, 0.275)]
-    # step 3, no amplitude in a static step: the velocity ramps from 0.1 to -0.2
-    pts = _amplitude(body, "ABQ2CCX_VEL3")
-    assert pts[0] == (0.0, 0.275) and pts[-1] == (1.0, 0.225)
-    assert max(abs(v - (0.275 + 0.1 * t - 0.15 * t * t)) for t, v in pts) < 1e-12
-    assert "default amplitude is RAMP" in rep.text()
+    # step 3, no amplitude in a static step: the velocity is constant (Abaqus manual,
+    # *BOUNDARY AMPLITUDE: "always a STEP function"), so the displacement is linear
+    assert _amplitude(body, "ABQ2CCX_VEL3") == [(0.0, 0.275), (1.0, 0.075)]
+    # step 4, *STEP AMPLITUDE=RAMP in a quasi-static (*VISCO) step: the velocity ramps from
+    # the -0.2 step 3 ended with to 0.4
+    pts = _amplitude(body, "ABQ2CCX_VEL4")
+    assert pts[0] == (0.0, 0.075) and pts[-1] == (1.0, 0.175)
+    assert max(abs(v - (0.075 - 0.2 * t + 0.3 * t * t)) for t, v in pts) < 1e-12
+    assert "VISCO step whose default amplitude is RAMP" in rep.text()
 
 
 def test_velocity_bc_after_a_free_step():
@@ -4524,6 +4530,22 @@ def test_velocity_bc_on_rigid_body_reference_point():
     body, conv, _ = convert_str(deck)
     assert {(n, 1) for n in (5, 6, 7, 8)} <= set().union(*conv._bc_drop.values())
     assert "TOP, 1, 1" not in body
+
+
+def test_velocity_bc_finite_rotations_about_several_axes_warned():
+    # the manual's example: three turns about z in one static step, a quarter turn about x
+    # in the next; integrated per component, the second is wrong under NLGEOM
+    rigid = (VEL_HEX + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=RP\n100\n"
+             "*Rigid Body, ref node=100, tie nset=TOP\n")
+    turn_z = ("*Step, nlgeom\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\nRP, 1, 5\n"
+              "RP, 6, 6, 18.84955592\n*End Step\n")
+    turn_x = ("*Step, nlgeom\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\n"
+              "RP, 4, 4, 1.570796327\nRP, 5, 6\n*End Step\n")
+    warning = "about more than one axis (in one step, or one after the other)"
+    assert warning not in convert_str(rigid + turn_z)[2].text()
+    assert warning in convert_str(rigid + turn_z + turn_x)[2].text()
+    both = turn_z.replace("RP, 1, 5\n", "RP, 1, 3\nRP, 5, 5\nRP, 4, 4, 1.\n")
+    assert warning in convert_str(rigid + both)[2].text()
 
 
 def test_velocity_bc_examples():
@@ -4600,12 +4622,50 @@ def test_velocity_bc_ramp_start_does_not_depend_on_node_order():
         body, _, _ = convert_str(VEL_HEX + f"*Nset, nset=PAIR\n{pair}\n*Amplitude, name=A, time=TOTAL TIME"
                                            f"\n0., 0., 10., 10.\n*Step\n*Static\n0.1, 1.\n*Boundary, "
                                            f"type=VELOCITY, amplitude=A\nPAIR, 3, 3, 1.\n*End Step\n"
-                                           f"*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\n6, 3, 3, 5."
-                                           f"\n*End Step\n*Step\n*Static\n0.1, 1.\n*End Step\n")
+                                           f"*Step, amplitude=RAMP\n*Visco\n0.1, 1.\n*Boundary, type=VELOCITY"
+                                           f"\n6, 3, 3, 5.\n*End Step\n*Step\n*Static\n0.1, 1.\n*End Step\n")
         ends.append([_amplitude(body, f"ABQ2CCX_VEL{i}")[-1] for i in (2, 3, 4, 5)])
     # step 2: node 6 ramps 1 -> 5 (0.5 -> 3.5), node 5 follows A (0.5 -> 2); step 3: node 5
     # follows A (-> 4.5), node 6 holds 5 (3.5 -> 8.5)
     assert ends[0] == ends[1] == [(1.0, 3.5), (1.0, 2.0), (1.0, 4.5), (1.0, 8.5)]
+
+
+def test_velocity_bc_default_amplitude_follows_the_abaqus_manual():
+    def end(step, proc, extra="", card="*Boundary, type=VELOCITY\nTOP, 3, 3, 1.\n"):
+        body, _, rep = convert_str(VEL_HEX + extra + f"{step}\n{proc}\n0.1, 1.\n{card}*End Step\n")
+        return _amplitude(body, "ABQ2CCX_VEL1" if "VELOCITY" in card else "ABQ2CCX_ACC1")[-1], rep.text()
+    # a velocity without AMPLITUDE is held over a static or quasi-static step whatever
+    # *STEP AMPLITUDE says; elsewhere it follows the procedure's default amplitude
+    # ("Defining an analysis", Table 1) unless *STEP AMPLITUDE overrides it
+    held, ramped = (1.0, 1.0), (1.0, 0.5)
+    for step, proc, want in (("*Step", "*Static", held), ("*Step, amplitude=RAMP", "*Static", held),
+                             ("*Step", "*Dynamic, application=QUASI-STATIC", held),
+                             ("*Step", "*Dynamic", held), ("*Step, amplitude=RAMP", "*Dynamic", ramped),
+                             ("*Step", "*Visco", held), ("*Step, amplitude=RAMP", "*Visco", ramped),
+                             ("*Step", "*Coupled temperature-displacement", held),
+                             ("*Step", "*Coupled temperature-displacement, steady state", ramped),
+                             ("*Step", "*Soils, consolidation", held), ("*Step", "*Soils", ramped)):
+        assert end(step, proc)[0] == want, (step, proc)
+    # an acceleration follows the step's default: ramped in a quasi-static dynamic step
+    acc = "*Boundary, type=ACCELERATION\nTOP, 3, 3, 1.\n"
+    pt, text = end("*Step", "*Dynamic, application=QUASI-STATIC", card=acc)
+    assert abs(pt[1] - 1.0 / 6.0) < 1e-9 and "should not be used" not in text   # t^3 / 6
+    # Abaqus says acceleration histories should not be used in static steps
+    pt, text = end("*Step", "*Static", card=acc)
+    assert abs(pt[1] - 1.0 / 6.0) < 1e-9 and "should not be used in static steps" in text
+    # a ramped velocity in a dynamic step starts from the DOF's velocity
+    pt, text = end("*Step, amplitude=RAMP", "*Dynamic", "*Initial Conditions, type=VELOCITY\nTOP, 3, 2.\n")
+    assert pt == (1.0, 1.5) and "default amplitude is RAMP" in text      # 2 t - t^2 / 2
+    # Abaqus/Standard smooths a TABULAR velocity curve in a dynamic step (SMOOTH=0.25 by
+    # default), Abaqus/Explicit only on request
+    tab = "*Amplitude, name=T{}\n0., 0., 0.5, 1., 1., 1.\n"
+    card = "*Boundary, type=VELOCITY, amplitude=T\nTOP, 3, 3, 1.\n"
+    smoothed = "replaces the curve around each of its points by a quadratic"
+    assert smoothed in end("*Step", "*Dynamic", tab.format(""), card)[1]
+    assert smoothed not in end("*Step", "*Dynamic", tab.format(", smooth=0."), card)[1]
+    assert smoothed not in end("*Step", "*Dynamic, explicit", tab.format(""), card)[1]
+    assert smoothed in end("*Step", "*Dynamic, explicit", tab.format(", smooth=0.1"), card)[1]
+    assert smoothed not in end("*Step", "*Static", tab.format(""), card)[1]
 
 
 def test_velocity_bc_unreadable_lines_and_amplitudes():
