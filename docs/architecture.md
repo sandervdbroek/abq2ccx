@@ -91,6 +91,10 @@ Abaqus semantics (a later step replaces a load, `OP=NEW` drops the card's earlie
 Forces on a node with a `*TRANSFORM` are first given in its local axes (`_to_local_axes`,
 `_local_axes`; `_transform_defs` reads the cards into `_transformed`), since ccx and Abaqus read
 a `*CLOAD` there in those axes; a node whose axes are unknown makes the line stay commented.
+`handle_transform` writes a spherical `*TRANSFORM`, which ccx does not have, as a rectangular
+one per node with its spherical axes (`_transform_axes`), and gives a `*RIGID BODY` ROT NODE
+its reference node's axes; `_check_transforms` (end of `_prescan`) plans those and warns about
+two cards with different data on a node and 2-D nodes whose local 3-axis leaves Z.
 At the end of every step `_flush_nodal_loads` writes one `*CLOAD` per amplitude with the
 node DOFs whose total changed (0 where a load went away) — never `OP=NEW`, which in ccx
 would also remove the deck's own concentrated loads. `_nodal_load_inexact` decides whether

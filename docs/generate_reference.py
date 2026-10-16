@@ -116,7 +116,7 @@ TRANSLATED = {
         "the mesh) → nodal forces too, positive against the surface normal (`SPOS`: the element "
         "normal); under NLGEOM only with `--approximate`. On a node with a `*TRANSFORM` the "
         "converted forces (also `*DLOAD`'s) are given in its local axes, as ccx and Abaqus read a "
-        "`*CLOAD` there; a node whose axes are unknown (spherical, on the cylinder axis, "
+        "`*CLOAD` there; a node whose axes are unknown (on the cylinder or polar axis, "
         "degenerate, two transforms, a 2-D node turned out of plane) leaves the line commented.",
     "*SURFACE SECTION": "dropped with its surface elements (`SFM3D*`, `SFMAX*`, `SFMGAX*`), "
         "which leave the mesh — no stiffness, no ccx element — while their loads become nodal "
@@ -152,9 +152,17 @@ TRANSLATED = {
         "whose `ROT NODE` follows it.",
     "*RIGID BODY": "`PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node "
         "number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs "
-        "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE). Shell/membrane/beam/truss "
+        "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); a reference point with a "
+        "`*TRANSFORM` gives the `ROT NODE` its local axes (warned where they are undefined). "
+        "Shell/membrane/beam/truss "
         "members get knot beams; the rotations of `TIE NSET`/`ELSET` shell/beam members are tied "
         "to the `ROT NODE`, `PIN NSET` ones stay free.",
+    "*TRANSFORM": "rectangular and cylindrical cards passed through; `TYPE=S` (spherical — ccx "
+        "has none and reads it as rectangular) commented out and replaced by a rectangular card "
+        "per node with its spherical axes (1 radial, 3 meridional towards the pole, 2 = 3 × 1, "
+        "fixed at the original position — exact); nodes on the polar axis keep the global axes "
+        "(warned). Two cards with different data on a node (Abaqus does not allow it; ccx takes "
+        "the last) and a 2-D node whose local 3-axis leaves Z (ccx 2.23 gets it wrong) are warned.",
     "*CLOAD": "moments on a rigid-body reference point → its `ROT NODE`; `ORIENTATION=` (local "
         "axes) and `FOLLOWER=YES` dropped with a warning; `USER` commented, naming ccx's `cload.f`.",
     "*TEMPERATURE": "passed through (upgraded beams' midside nodes get their end nodes' mean); "
@@ -336,7 +344,7 @@ def gen_keywords():
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
                "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
-               "CONNECTOR SECTION"}
+               "CONNECTOR SECTION", "TRANSFORM"}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",

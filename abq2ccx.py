@@ -1983,6 +1983,14 @@ class Converter:
         # nodes with a *TRANSFORM (local DOFs) -> its (TYPE letter, a, b), or why its local axes
         # are unknown (see _transform_defs / _local_axes)
         self._transformed: Dict[int, Union[Tuple[str, Vec, Vec], str]] = {}
+        self._transform_last: Dict[int, int] = {}  # node -> id() of the last *TRANSFORM naming it
+        self._transform_twice: set = set()         # nodes named by several cards with equal data
+        self._n_transform_sets = 0                 # ABQ2CCX_TRn sets written so far
+        # *RIGID BODY ROT NODE -> (local 1, local 2) of its REF NODE's *TRANSFORM, which it gets
+        # too; REF NODE -> why its ROT NODE cannot (see _check_transforms)
+        self._rot_axes: Dict[int, Tuple[Vec, Vec]] = {}
+        self._rot_axes_why: Dict[int, str] = {}
+        self._rot_axes_warned = False
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         self._last_coupling: Optional[dict] = None
         # *DISTRIBUTION orientations (see _plan_distributions)
@@ -2368,6 +2376,7 @@ class Converter:
             "COHESIVE SECTION": self.handle_cohesive_section,
             "GASKET SECTION": self.handle_cohesive_section,
             "SURFACE SECTION": self.handle_surface_section,
+            "TRANSFORM": self.handle_transform,
             "TIE": self.handle_tie,
             "BOUNDARY": self.handle_boundary,
             "CLOAD": self.handle_cload,
@@ -4099,7 +4108,8 @@ class Converter:
         removed where ccx needs it, or None when the line can stay as it is:
 
         * rotations of a rigid-body reference node go to DOFs 1-3 of its ROT NODE (ccx
-          ignores DOFs 4-6 of the REF NODE);
+          ignores DOFs 4-6 of the REF NODE), which has the reference node's local axes if it
+          has a *TRANSFORM (_check_transforms);
         * nodes that only belong to plane/axisymmetric continuum elements have no
           rotations — those DOFs are dropped (a set mixing them with shell/beam nodes keeps
           its rotations on the latter, one line per node)."""
@@ -4115,8 +4125,14 @@ class Converter:
                   ([] if len(refs) == len(nodes) else [line(spec, d1, d2)])
             if hi >= 7 and len(refs) == len(nodes):
                 out.append(line(spec, 7, hi))
+            try:                                  # zero on all of 4-6: the same in any axes
+                held = lo <= 4 and hi >= 6 and (not extra or not extra[0] or pf(extra[0]) == 0.0)
+            except ValueError:
+                held = False
             for n in refs:
                 out.append(line(str(self._rb_rot[n]), max(lo, 4) - 3, min(hi, 6) - 3))
+                if not held:
+                    self._warn_rot_frame(n)
             self.report.note("Rotational BCs on a *RIGID BODY reference point moved to DOFs 1-3 "
                              "of its ROT NODE (ccx ignores DOFs 4-6 of the REF NODE).", once=True)
             return out
@@ -4181,7 +4197,8 @@ class Converter:
 
     def handle_cload(self, b: Block) -> List[str]:
         """``*CLOAD``: moments (DOFs 4-6) on a *RIGID BODY reference point go to DOFs 1-3 of
-        its ROT NODE — ccx silently ignores them on the REF NODE (verified: no rotation).
+        its ROT NODE — ccx silently ignores them on the REF NODE (verified: no rotation); the
+        ROT NODE has the reference node's local axes if it has a *TRANSFORM.
         Abaqus ORIENTATION= (local load axes) and FOLLOWER=YES have no ccx counterpart."""
         if b.has("USER"):
             return self._user_load_card(b)
@@ -4217,8 +4234,14 @@ class Converter:
             moved = True
             if len(refs) != len(nodes):
                 out.append(ln)                       # the other nodes keep the moment
+            try:                                     # a zero moment: the same in any axes
+                zero = pf(f[2]) == 0.0
+            except (IndexError, ValueError):
+                zero = False
             for n in refs:
                 out.append(", ".join([str(self._rb_rot[n]), str(int(f[1]) - 3)] + f[2:]))
+                if not zero:
+                    self._warn_rot_frame(n)
         if moved:
             self.report.note("Moments on a *RIGID BODY reference point moved to DOFs 1-3 of its "
                              "ROT NODE (ccx ignores DOFs 4-6 of the REF NODE).", once=True)
@@ -4681,38 +4704,65 @@ class Converter:
                 f" in the *CLOAD at the end of this step"
                 + (f"; in the local axes of the {len(local)} with a *TRANSFORM" if local else "")]
 
+    _SEVERAL_TRANSFORMS = ("is in several *TRANSFORM cards with different data (Abaqus allows "
+                           "one per node; ccx takes the last)")
+
+    @staticmethod
+    def _transform_card(b: Block) -> Union[Tuple[str, Vec, Vec], str]:
+        """A *TRANSFORM card's (TYPE letter, a, b), or why its data line cannot be read.  Like
+        ccx, only the first letter of TYPE counts."""
+        typ = ((b.param("TYPE") or "").strip().upper() or "R")[0]
+        try:
+            v = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+            return typ, (v[0], v[1], v[2]), (v[3], v[4], v[5])
+        except (IndexError, ValueError):
+            return "has a *TRANSFORM whose data line cannot be read"
+
     def _transform_defs(self, blocks: List[Block]) -> Dict[int, Union[Tuple[str, Vec, Vec], str]]:
         """Each node with a *TRANSFORM -> its card's (TYPE letter, a, b), or why the local axes
-        of the node are unknown: an unreadable data line, or several cards (Abaqus allows one
-        per node; ccx takes the last).  Like ccx, only the first letter of TYPE counts."""
+        of the node are unknown: an unreadable data line, or several cards with different data
+        (Abaqus allows one per node; ccx 2.23 silently takes the last, probed).  Also fills
+        _transform_last (node -> id of the last card naming it) and _transform_twice (nodes
+        that several cards with the same data name)."""
         out: Dict[int, Union[Tuple[str, Vec, Vec], str]] = {}
+        self._transform_last, twice = {}, set()
         for b in blocks:
             if b.keyword != "TRANSFORM":
                 continue
-            typ = ((b.param("TYPE") or "").strip().upper() or "R")[0]
-            d: Union[Tuple[str, Vec, Vec], str]
-            try:
-                v = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
-                d = (typ, (v[0], v[1], v[2]), (v[3], v[4], v[5]))
-            except (IndexError, ValueError):
-                d = "has a *TRANSFORM whose data line cannot be read"
+            d = self._transform_card(b)
             for n in self._resolve_nodes((b.param("NSET") or "").strip()):
-                out[n] = d if out.get(n, d) == d else \
-                    "is in several *TRANSFORM cards (Abaqus allows one per node)"
+                if n not in out:
+                    out[n] = d
+                elif out[n] == d and not isinstance(d, str):
+                    twice.add(n)
+                else:
+                    out[n] = self._SEVERAL_TRANSFORMS
+                self._transform_last[n] = id(b)
+        self._transform_twice = {n for n in twice if out[n] != self._SEVERAL_TRANSFORMS}
         return out
 
     def _local_axes(self, n: int) -> Union[Tuple[Vec, Vec, Vec], str]:
-        """The local axes 1, 2, 3 in which ccx — like Abaqus — reads a *CLOAD on node ``n``,
-        which has a *TRANSFORM, or why they are unknown.  Probed on 2.23 (solid, shell,
-        membrane, beam, plane and axisymmetric nodes): rectangular — 1 along a, 2 towards b
-        in the plane of a and b, 3 = 1 x 2; cylindrical — 3 along the axis from a to b, 1
-        radial from the axis to the node, 2 = 3 x 1, at the node's undeformed position and
-        fixed in space under NLGEOM, as in Abaqus.  ccx has no spherical system (TYPE=S gives
-        NaN results) and uses the global axes for a node on the cylinder axis."""
+        """The local axes 1, 2, 3 in which ccx — like Abaqus — reads a *CLOAD, a *BOUNDARY and
+        *EQUATION terms on node ``n``, which has a *TRANSFORM (a spherical one as converted by
+        handle_transform), or why they are unknown (see _transform_axes)."""
         d = self._transformed[n]
         if isinstance(d, str):
             return f"node {n} {d}"
-        typ, a, b = d
+        return self._transform_axes(n, *d)
+
+    def _transform_axes(self, n: int, typ: str, a: Vec, b: Vec) -> Union[Tuple[Vec, Vec, Vec], str]:
+        """The local axes 1, 2, 3 of node ``n`` under a *TRANSFORM of type ``typ`` with points
+        ``a`` and ``b``, or why they are undefined.  Probed on 2.23 (solid, shell, membrane,
+        beam, plane and axisymmetric nodes): rectangular — 1 along a, 2 towards b in the plane
+        of a and b, 3 = 1 x 2; cylindrical — 3 along the axis from a to b, 1 radial from the
+        axis to the node, 2 = 3 x 1, at the node's undeformed position and fixed in space
+        under NLGEOM, as in Abaqus; ccx uses the global axes for a node on the cylinder axis,
+        and reads any other TYPE as rectangular.  Spherical, which ccx does not have
+        (handle_transform writes these axes as a rectangular card per node) — Abaqus manual,
+        "Transformed coordinate systems": 1 radial from the centre a through the node, 3
+        meridional (in the plane of the polar axis a-b and the node, towards b), 2 = 3 x 1
+        circumferential, at the node's original position.  Abaqus cannot define a cylindrical
+        or spherical system for a node on the line through a and b."""
         if typ == "R":
             e3 = vcross(a, b)
             if vnorm(e3) <= 1e-9 * vnorm(a) * vnorm(b):
@@ -4720,21 +4770,168 @@ class Converter:
                         f"origin, or in line with b)")
             e1, e3 = vunit(a), vunit(e3)
             return e1, vcross(e3, e1), e3
+        if typ not in ("C", "S"):
+            return (f"the *TRANSFORM of node {n} has an unknown TYPE (Abaqus knows R, C and S; "
+                    f"ccx reads it as rectangular)")
+        kind = "cylindrical" if typ == "C" else "spherical"
+        if n not in self.geom.nodes:
+            return f"node {n} of a {kind} *TRANSFORM is not defined"
+        axis, p = vsub(b, a), vsub(self.geom.nodes[n], a)
+        if not vnorm(axis):
+            return f"the {kind} *TRANSFORM of node {n} is degenerate (a and b coincide)"
+        e3 = vunit(axis)
+        r = vsub(p, vscale(e3, vdot(p, e3)))
+        # cylindrical: within 1e-6 of the model's scale; spherical: within 1e-6 rad of the axis
+        if vnorm(r) <= 1e-6 * (max(vnorm(axis), vnorm(p)) if typ == "C" else vnorm(p)):
+            return (f"node {n} lies on the {'axis' if typ == 'C' else 'polar axis'} of its {kind} "
+                    f"*TRANSFORM, where the local directions are undefined (Abaqus cannot "
+                    f"define the system there; ccx uses the global axes)")
         if typ == "C":
-            axis, p = vsub(b, a), vsub(self.geom.nodes[n], a)
-            if not vnorm(axis):
-                return f"the cylindrical *TRANSFORM of node {n} is degenerate (a and b coincide)"
-            e3 = vunit(axis)
-            r = vsub(p, vscale(e3, vdot(p, e3)))
-            if vnorm(r) <= 1e-6 * max(vnorm(axis), vnorm(p)):
-                return (f"node {n} lies on the axis of its cylindrical *TRANSFORM, where the local "
-                        f"directions are undefined (Abaqus rejects such a node; ccx uses the "
-                        f"global axes there)")
             e1 = vunit(r)
             return e1, vcross(e3, e1), e3
-        if typ == "S":
-            return f"node {n} has a spherical *TRANSFORM (TYPE=S), which ccx does not have"
-        return f"the *TRANSFORM of node {n} has an unknown TYPE"
+        e1 = vunit(p)
+        e2 = vunit(vcross(e3, e1))
+        return e1, e2, vcross(e1, e2)
+
+    def _rect_transform(self, nodes: Sequence[int], data: str) -> List[str]:
+        """A rectangular *TRANSFORM, data line ``data`` (points a, b), on a new node set
+        ABQ2CCX_TRn of ``nodes``."""
+        self._n_transform_sets += 1
+        name = f"ABQ2CCX_TR{self._n_transform_sets}"
+        return [f"*NSET, NSET={name}"] + reflow(list(nodes)) + \
+            [f"*TRANSFORM, NSET={name}, TYPE=R", data]
+
+    def handle_transform(self, b: Block) -> List[str]:
+        """``*TRANSFORM``: rectangular and cylindrical cards pass through.  ccx 2.23 has no
+        spherical system: it silently reads TYPE=S as a rectangular system through points a and
+        b (probed: the same results as TYPE=R), degenerate when the centre a is the origin (NaN
+        results with a *CLOAD there, a singular matrix with a BC).  So a TYPE=S card becomes
+        a rectangular card per node (nodes with equal axes share one) with that node's
+        spherical axes (_transform_axes), fixed at its original position as in Abaqus: BCs,
+        loads and *EQUATION terms there keep their meaning.  After the card that last names a
+        *RIGID BODY reference node, its ROT NODE gets the same local axes (_check_transforms)."""
+        d = self._transform_card(b)
+        nset = (b.param("NSET") or "").strip()
+        if isinstance(d, str) or d[0] != "S":
+            out = [emit_keyword("TRANSFORM", b.params)] + list(b.data)
+        else:
+            out = ["** abq2ccx: spherical *TRANSFORM (ccx has none) -> a rectangular *TRANSFORM per "
+                   "node with the same local axes", "** " + emit_keyword("TRANSFORM", b.params)] + \
+                  ["** " + x for x in b.data]
+            groups: "OrderedDict[str, List[int]]" = OrderedDict()
+            off: List[int] = []
+            why = ""
+            for n in dedup(self._resolve_nodes(nset)):
+                axes = self._transform_axes(n, *d)
+                if isinstance(axes, str):
+                    off.append(n)
+                    why = why or axes
+                else:
+                    groups.setdefault(", ".join(_fmt_unit(x) for x in axes[0] + axes[1]), []).append(n)
+            for data, nodes in groups.items():
+                out += self._rect_transform(nodes, data)
+            self.report.note("*TRANSFORM, TYPE=S (spherical): ccx has none and silently reads the "
+                             "card as a rectangular system through points a and b (probed on 2.23; "
+                             "with the centre a at the origin that system is degenerate: NaN results "
+                             "with a *CLOAD there, a singular matrix with a BC). Each node gets a "
+                             "rectangular *TRANSFORM with its spherical axes instead — 1 radial from "
+                             "the centre a, 3 meridional towards the pole b, 2 = 3 x 1 — at its "
+                             "original position, fixed in space as in Abaqus, so BCs, loads and "
+                             "equations there act as in Abaqus.", once=True)
+            if off:
+                self.report.warn(f"*TRANSFORM, TYPE=S on {nset}: no local axes for {len(off)} "
+                                 f"node(s), since {why}. Their BCs and loads act along the global "
+                                 f"axes in ccx — verify.", once=True)
+        for ref, rot in self._rb_rot.items():
+            if rot in self._rot_axes and self._transform_last.get(ref) == id(b):
+                e1, e2 = self._rot_axes[rot]
+                out += self._rect_transform([rot], ", ".join(_fmt_unit(x) for x in e1 + e2))
+        return out
+
+    def _check_transforms(self) -> None:
+        """Deck-wide *TRANSFORM checks, once _transform_defs and _plan_rigid_couplings have
+        filled _transformed and _rb_rot:
+
+        * several cards with different data on a node: Abaqus does not allow it ("Multiple
+          transformation definitions are not allowed at a node"), ccx 2.23 silently takes the
+          last card (probed) -> warning (the same data twice: a note);
+        * a node of 2-D elements whose local 3-axis leaves the global Z axis: the Abaqus manual
+          requires a transformation consistent with the degrees of freedom at the node, and
+          ccx 2.23 gets such a node wrong without an error (probed) -> warning;
+        * a *RIGID BODY reference node whose rotational BCs and moments go to DOFs 1-3 of its
+          ROT NODE (_active_dof_lines, handle_cload): Abaqus reads them in the reference
+          node's local axes, so the ROT NODE gets the same axes as a rectangular *TRANSFORM
+          (probed on 2.23: exact, also under NLGEOM).  Where they are undefined, or the ROT
+          NODE also carries connector constraints (written in global components), the reason
+          is kept for a warning when such a BC or moment is moved (_warn_rot_frame)."""
+        if not self._transformed:
+            return
+        several = sorted(n for n, d in self._transformed.items() if d == self._SEVERAL_TRANSFORMS)
+        if several:
+            self.report.warn(f"{len(several)} node(s) (e.g. node {several[0]}) are named by several "
+                             f"*TRANSFORM cards with different data. Abaqus does not allow that "
+                             f"('Multiple transformation definitions are not allowed at a node'); "
+                             f"ccx 2.23 silently uses the last card (probed), so BCs, loads and "
+                             f"equations on these nodes act in its axes. Keep one *TRANSFORM per "
+                             f"node.")
+        if self._transform_twice:
+            twice = sorted(self._transform_twice)
+            self.report.note(f"{len(twice)} node(s) (e.g. node {twice[0]}) are named by several "
+                             f"*TRANSFORM cards with the same data: Abaqus does not allow multiple "
+                             f"transformation definitions at a node; ccx uses the last card, which "
+                             f"defines the same axes here.")
+        flat = set(self._plane_only)                  # nodes of 2-D elements
+        for typ, conn in self.geom.elements.values():
+            if typ.upper().startswith(("B21", "B22", "B23", "PIPE21", "PIPE22", "T2D")):
+                flat.update(conn)
+        tilted = []
+        for n in sorted(flat & set(self._transformed)):
+            axes = self._local_axes(n)
+            if not isinstance(axes, str) and math.hypot(axes[2][0], axes[2][1]) > 1e-6:
+                tilted.append(n)
+        if tilted:
+            self.report.warn(f"*TRANSFORM turns the local 3-axis of {len(tilted)} node(s) of 2-D "
+                             f"elements (e.g. node {tilted[0]}) out of the global Z axis, the normal "
+                             f"of the model plane. The Abaqus manual requires a transformation "
+                             f"consistent with the degrees of freedom at the node (local 1 and 2 in "
+                             f"the plane), and ccx 2.23 gets such nodes wrong without an error "
+                             f"(probed: the *TRANSFORM alone changes plane-strain and quadratic "
+                             f"plane-stress models by up to 91 % of |u|; BCs and loads there act "
+                             f"partly out of the plane, on axisymmetric, truss and beam nodes too). "
+                             f"Give these nodes a transformation about the Z axis.")
+        # connector constraints (_plan_connector_rows) are written in global components, also
+        # on the rotation node that carries a node's rotation: such a node stays global
+        conn = {k[0] for sec in self._conn_plan.values() for it in sec["items"]
+                if it.get("route") == "rows"
+                for k in list(it.get("bcs", ())) + [t for eq in it.get("eqs", ()) for t in eq]}
+        for ref, rot in self._rb_rot.items():
+            if ref not in self._transformed or rot in self._transformed:
+                continue
+            axes = self._local_axes(ref)
+            if isinstance(axes, str):
+                self._rot_axes_why[ref] = axes
+            elif rot in conn:
+                self._rot_axes_why[ref] = (f"its rotation node {rot} also carries connector "
+                                           f"constraints, which are written in global components")
+            else:
+                self._rot_axes[rot] = (axes[0], axes[1])
+        if self._rot_axes:
+            self.report.note("*RIGID BODY reference node(s) with a *TRANSFORM: Abaqus reads their "
+                             "rotational BCs and moments in the local axes, so each ROT NODE, which "
+                             "carries them as its DOFs 1-3, gets the same axes as a rectangular "
+                             "*TRANSFORM (probed on 2.23: exact, also under NLGEOM).")
+
+    def _warn_rot_frame(self, ref: int) -> None:
+        """Warn (once) when a rotational BC or moment moves from *RIGID BODY reference node
+        ``ref``, whose *TRANSFORM leaves its local axes undefined, to its untransformed ROT
+        NODE: there it acts about the global axes."""
+        why = self._rot_axes_why.get(ref)
+        if why and not self._rot_axes_warned:
+            self._rot_axes_warned = True
+            self.report.warn(f"Rotational BCs / moments on *RIGID BODY reference node {ref}, which "
+                             f"has a *TRANSFORM, moved to DOFs 1-3 of its ROT NODE act about the "
+                             f"global axes there; Abaqus reads them in the node's local axes, but "
+                             f"{why}. Verify.")
 
     def _to_local_axes(self, forces: Dict[Tuple[int, int], float], nodes: Sequence[int],
                        flat: set) -> Tuple[Dict[Tuple[int, int], float], Optional[str]]:
@@ -6619,6 +6816,7 @@ class Converter:
                              "dynamic step: ccx's explicit solver stops on it ('linear and nonlinear "
                              "MPC's depend on each other' — its 2-D expansion is built from linear "
                              "MPCs; probed on 2.23); only implicit steps can run it.", once=True)
+        self._check_transforms()
         self._n_inactive_rot = 0
         self._depvar_counts = set()
         for b in blocks:
@@ -7696,10 +7894,13 @@ class Converter:
     def _rotation_ties(self, members: Sequence[int], target: int, offset: int,
                        dofs: Sequence[int] = (4, 5, 6)) -> List[str]:
         """*EQUATION ties rotation(member) = DOF ``k + offset`` of ``target`` for the knotted
-        members that have rotations.  A member DOF under a *BOUNDARY cannot be the tie's
-        dependent term (ccx stops on a DOF that is both SPC'd and dependent in an MPC):
-        _settle_dependents then makes the body's DOF dependent instead, or drops the tie
-        when that one is taken too (self._gen_ties marks the ties it may drop)."""
+        members that have rotations — on a ROT NODE that has its reference node's local axes
+        (_rot_axes), the member's global rotation written in them (probed on 2.23: a shell
+        edge tied to such a body matches the transform-free model exactly, also under
+        NLGEOM; plain ties miss by 0.5 % of max |u|).  A member DOF under a *BOUNDARY cannot
+        be the tie's dependent term (ccx stops on a DOF that is both SPC'd and dependent in
+        an MPC): _settle_dependents then makes the body's DOF dependent instead, or drops the
+        tie when that one is taken too (self._gen_ties marks the ties it may drop)."""
         out: List[str] = []
         if not self._tie_rotations:
             return out
@@ -7719,6 +7920,17 @@ class Converter:
                                      "rotation is tied to the first one only — verify.", once=True)
                     continue
                 self._rot_tied.add((n, k))
+                axes = self._rot_axes.get(target) if offset == -3 else None
+                if axes:
+                    # a ROT NODE with its reference node's local axes (_check_transforms):
+                    # ccx reads its *EQUATION terms in them, so the member's global rotation k
+                    # is the sum over j of e_j[k] times its local rotation j (exact, linear)
+                    terms = [(j + 1, -e[k - 4]) for j, e in enumerate(axes + (vcross(*axes),))
+                             if abs(e[k - 4]) > 1e-12]
+                    self._gen_ties.add(frozenset([(n, k)] + [(target, j) for j, _ in terms]))
+                    out += ["*EQUATION", str(1 + len(terms)), ", ".join(
+                        [f"{n}, {k}, 1."] + [f"{target}, {j}, {_fmt_unit(c)}" for j, c in terms])]
+                    continue
                 self._gen_ties.add(frozenset(((n, k), (target, k + offset))))
                 out += ["*EQUATION", "2", f"{n}, {k}, 1., {target}, {k + offset}, -1."]
         return out
@@ -9730,6 +9942,15 @@ def _fmt_component(x: float) -> str:
     """A derived coordinate/direction component, with rounding noise (|x| < 1e-12 of a
     unit-ish vector, e.g. cos 90 deg) printed as an exact 0."""
     return "0" if abs(x) < 1e-12 else f"{x:.9g}"
+
+
+def _fmt_unit(x: float) -> str:
+    """A unit-vector component to 15 decimals, trailing zeros dropped: at most 18 characters,
+    since ccx 2.23 reads only the first 20 of a data field (probed on *TRANSFORM: a longer
+    number is cut — 6.000000000000000E-01 is read as 6 — or stops ccx when the cut is no
+    number)."""
+    s = f"{x:.15f}".rstrip("0")
+    return "0." if s in ("0.", "-0.") else s
 
 
 def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off: int,

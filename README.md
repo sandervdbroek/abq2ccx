@@ -144,6 +144,7 @@ PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(20) = 0.013331 (Lame 0.013333, 
 PASS  traction_transformed_face with *TRANSFORM (C3D20R face, rectangular + cylindrical): u at 225 nodes differs from the model without it by 0.0e+00 of max |u| (0.01981)
 PASS  cook_membrane_traction with *TRANSFORM (CPS8 edge, in-plane rectangular + cylindrical): u at 33 nodes differs from the model without it by 6.4e-17 of max |u| (25.06)
 PASS  thermal_no_initial_temperature (*Temperature, no initial temperatures): cube strain 1.200000e-03 / 1.200000e-03 / 1.200000e-03 (alpha T = 1.200000e-03, 8.6e-16 off); CIRC beam end u_x = +0.120001 (alpha T L = +0.120000, 0.0005% diff)
+PASS  transform_spherical_rigid (spherical *TRANSFORM, rigid body with a cylindrical one on its reference point): u at 46 nodes differs from the model in global components by 0.0e+00 of max |u| (0.003692)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -223,12 +224,21 @@ as consistent nodal forces: a shear traction (`*DSLOAD TRVEC`) on Cook's membran
 the published displacement of its loaded edge (23.96, Bergan & Felippa 1985); uniform line
 loads (`*DLOAD PY`, local `P2`, `PZ`) on three cantilevers — `B31`, `B32` and a circular
 `B31` run as `B32` — against q L⁴/(8 E I), with the applied resultants checked against q L;
-and a radial traction on an axisymmetric thick cylinder against Lamé's solution. The last
+and a radial traction on an axisymmetric thick cylinder against Lamé's solution. The next
 two put a traction on nodes with local axes: ccx, like Abaqus, reads a `*CLOAD` on a node with a
 `*TRANSFORM` in its local axes, so the converted forces are given in them. A `C3D20R` block
 whose loaded face carries a rectangular and a cylindrical transform, and Cook's membrane
 with in-plane ones on its loaded edge, must match the same models without the transforms
 at every printed node (forces left in global components miss by 149 % and 88 % of |u|).
+The next one puts local axes on a block that ccx lacks or does not carry over: a spherical
+`*TRANSFORM` on part of its top face, which ccx does not have (each node gets a rectangular
+one with its spherical axes), under local loads, a radial roller and a circumferential
+support; and a cylindrical one on the reference point of a rigid end face, held against
+rotation about its local 1 and 2 and loaded by a local force and moment (ccx carries the
+body's rotations on its ROT NODE, which gets the same axes). It must match the same model
+written in global components — global loads, `*EQUATION` supports, an explicit ROT NODE —
+at every node (the conversion before ran without a message and missed by 784 % of |u|; the
+ROT NODE without its axes alone misses by 91 %).
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -327,12 +337,13 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*DSLOAD`/`*DLOAD` `TRVEC`, `TRSHR` (surface tractions) | consistent nodal forces (`*CLOAD`) | ccx has no traction load: the face/edge shape functions are integrated over the undeformed geometry (× plane thickness, × 2πr axisymmetric; `TRSHR` projected onto the face). Exact in small-strain steps and for NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT RESULTANT=YES`; other NLGEOM tractions only with `--approximate` |
 | `*DLOAD` `PX`/`PY`/`PZ`/`P1`/`P2` on beams | consistent nodal forces (`*CLOAD`) | on the converted element's nodes (incl. inserted midside nodes); ccx's own beam `P1`/`P2` is a section-face pressure |
 | surface elements `SFM3D3/4/4R/6/8/8R`, `SFMAX1/2`, `SFMGAX1/2` | left out of the mesh; their `TRVEC`, `TRSHR`, `P` (`*DLOAD`, or `*DSLOAD` on their `SPOS`/`SNEG` side) → consistent nodal forces | ccx has no surface element; they have no stiffness, so only their loads matter. Element sets keep their other members; `*SURFACE SECTION` and surfaces / `*EL PRINT` on them only are dropped. Abaqus signs: an element-based `P` acts along the element normal, a surface `P` against the surface normal. Kept (ccx then stops on them) if they carry rebar, or mass in a dynamic / frequency step or under gravity — unless `--approximate` |
-| converted nodal forces (above) on nodes with a `*TRANSFORM` | given in each node's local axes | ccx, like Abaqus, reads a `*CLOAD` there in the transformed system: rectangular, or cylindrical at the node's undeformed position, fixed in space (probed on 2.23 for solid, shell, membrane, beam, plane and axisymmetric nodes). The load line is commented out with the reason (the load audit flags a step it leaves unloaded) when those axes are unknown: a spherical transform (ccx has none), a node on the cylinder axis, degenerate or unreadable data, two different transforms on one node, or a 2-D node whose local 3-axis is not the global Z axis |
+| converted nodal forces (above) on nodes with a `*TRANSFORM` | given in each node's local axes | ccx, like Abaqus, reads a `*CLOAD` there in the transformed system: rectangular, or cylindrical / spherical at the node's undeformed position, fixed in space (probed on 2.23 for solid, shell, membrane, beam, plane and axisymmetric nodes). The load line is commented out with the reason (the load audit flags a step it leaves unloaded) when those axes are unknown: a node on the cylinder or polar axis, degenerate or unreadable data, two different transforms on one node, or a 2-D node whose local 3-axis is not the global Z axis |
+| `*TRANSFORM, TYPE=S` (spherical) | commented out; a rectangular `*TRANSFORM` per node with that node's spherical axes | ccx has no spherical system and silently reads `TYPE=S` as a rectangular one through `a` and `b` (NaN results or a singular matrix when the centre is the origin, wrong axes otherwise). The Abaqus axes — 1 radial from the centre, 3 meridional towards the pole, 2 = 3 × 1 — at each node's original position are fixed in space, so BCs, loads and `*EQUATION` terms keep their meaning. Nodes on the polar axis, where Abaqus cannot define the system, keep the global axes (warned) |
 | `*BOUNDARY, USER`, `*CLOAD, USER`, `...NU` load labels, `*TEMPERATURE, USER`, `*AMPLITUDE, DEFINITION=USER` | commented out | the Abaqus user subroutine cannot run in ccx, which would call its own stock `uboun.f` / `cload.f` / `dload.f` / ... instead — the warning names the one to port |
 | `*MPC` | line by line: `PIN`/`TIE` → per-DOF `*EQUATION`; `BEAM` → `*RIGID BODY` per independent node; `LINK` → linearised `*EQUATION` (no `NLGEOM`) or ccx `*MPC BEAM` | `PLANE`/`STRAIGHT` kept; a line ccx cannot take (user MPCs, other types) is commented out alone. `TIE` ties shell/beam rotations through knots (ccx ignores DOFs 4–6 of a plain shell/beam node in an `*EQUATION`) and the temperature in thermal steps; BEAM lines chained through a node form one body; ccx's `*MPC BEAM` keeps the distance between two nodes but rejects beam/shell/plane nodes |
 | `CONN3D2`/`CONN2D2` + `*CONNECTOR SECTION` | the connection's kinematic constraint: `JOIN`, `REVOLUTE`, `ALIGN`, `HINGE` → `*EQUATION`s (and `*BOUNDARY` lines to ground or a held node); `BEAM`, `WELD` → `*RIGID BODY`; `LINK` → as `*MPC LINK`; `CARTESIAN`, `CARDAN`, … (no constraint) → nothing | ccx has no connector element, and without a behaviour a connector is its constraint. Rotations live where ccx has them (a reference point's `ROT NODE`, knots on shell/beam nodes); exact in linear analyses, and under `NLGEOM` only where the linear form stays exact (a hinge to ground, a rigid link) — the rest commented out (`--approximate`: `[APPROX]`). A `*CONNECTOR BEHAVIOR`, `SLOT`, `UNIVERSAL`, … are commented out |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
-| `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
+| `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3. If the `REF NODE` has a `*TRANSFORM`, the `ROT NODE` gets its local axes (a rectangular `*TRANSFORM`), since Abaqus reads those BCs and moments in them, and the rotation ties of shell/beam members to it are written in those axes; where they are undefined (`REF NODE` on the cylinder axis, ...) the move is warned |
 | rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
 | `*DYNAMIC, EXPLICIT` with `CIRC` beams | maximum time increment set (4th data field) | ccx 2.23 sizes a circular-section beam's stable increment as if its section were the box around the circle and runs it at about 1.3× the limit (NaN displacements); the cap is ccx's own estimate with the square through the section's corner nodes, side d/√2; a fixed (`DIRECT`) increment above it is warned |
 | rotational BCs on `CIRC` beam nodes | knot beam per node | a BC on some of DOFs 4–6 (or a nonzero one) at a circular-section `B32` end node makes ccx 2.23 lock the node's other rotations too (a pinned beam with its twist held deflects 0.3 of beam theory); as a knot the node's BCs hold only the rotations they name |
@@ -566,6 +577,10 @@ converter warns about the ones it can detect; the rest are here so you know to c
   coefficients is written as `TYPE=ORTHO`, which runs, where no orientation turns it so
   that it has shear in global axes; for the rest no form of the deck avoids it — the
   CalculiX sources fixed both after 2.23 — so the converter warns, naming the materials.
+* `*TRANSFORM` decks Abaqus would not accept are warned, not repaired: a node named by two
+  cards with different data (ccx silently takes the last), and a node of 2-D elements whose
+  local 3-axis is not the Z axis (ccx 2.23 then gets the model wrong — even with no load or
+  BC on the node for plane-strain and quadratic plane-stress elements).
 * Commented/unsupported cards (connector behaviours, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
 * The converter validates *structure*, not *physics*. Run `ccx` and sanity-check.
@@ -609,6 +624,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/cylinder_traction_cax.inp`](examples/cylinder_traction_cax.inp) | axisymmetric `CAX8` thick cylinder, radial `*DSLOAD TRVEC` (2πr) |
 | [`examples/traction_transformed_face.inp`](examples/traction_transformed_face.inp) | `C3D20R` block, oblique `*DSLOAD TRVEC` on a face whose nodes have a rectangular and a cylindrical `*TRANSFORM` → nodal forces in their local axes |
 | [`examples/thermal_no_initial_temperature.inp`](examples/thermal_no_initial_temperature.inp) | `*Temperature` without initial temperatures (a `C3D8` cube, a `CIRC` beam with a knot beam) → `*INITIAL CONDITIONS, TYPE=TEMPERATURE` at Abaqus' default 0 on every node |
+| [`examples/transform_spherical_rigid.inp`](examples/transform_spherical_rigid.inp) | `C3D8` block: `*TRANSFORM, TYPE=S` nodes with local loads and supports → a rectangular transform per node; a `*RIGID BODY` whose reference point has a cylindrical transform, partial rotational BCs and a moment → the ROT NODE gets its axes |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

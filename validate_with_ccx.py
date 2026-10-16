@@ -289,6 +289,62 @@ def ground_hinge_reference():
     return e1, 0.5 * (lo + hi)
 
 
+def global_twin(deck):
+    """examples/transform_spherical_rigid.inp written without *TRANSFORM: its local loads in
+    global components, its partial supports as *EQUATION (e . u = 0) and its rigid body with an
+    explicit ROT NODE 101 whose rotation is held about the reference point's local 1 and 2.
+    The local axes follow the Abaqus manual ("Transformed coordinate systems"), computed here
+    independently of the converter: spherical — 1 radial from the centre a through the node, 2
+    = (b - a) x 1 (circumferential), 3 = 1 x 2 (meridional, towards the pole b); cylindrical —
+    3 along the axis from a to b, 1 radial from it through the node, 2 = 3 x 1."""
+    def unit(v):
+        s = math.sqrt(sum(x * x for x in v))
+        return [x / s for x in v]
+
+    def cross(p, q):
+        return [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]]
+
+    def spherical(a, b, p):
+        e1 = unit([x - y for x, y in zip(p, a)])
+        e2 = unit(cross([x - y for x, y in zip(b, a)], e1))
+        return e1, e2, cross(e1, e2)
+
+    def cylindrical(a, b, p):
+        e3 = unit([x - y for x, y in zip(b, a)])
+        q = [x - y for x, y in zip(p, a)]
+        e1 = unit([x - sum(s * t for s, t in zip(q, e3)) * z for x, z in zip(q, e3)])
+        return e1, cross(e3, e1), e3
+
+    def equation(node, e, taken=()):
+        """e . (DOFs 1-3 of node) = 0; the dependent (first) DOF is the one with the largest
+        coefficient that another equation on the node has not taken."""
+        order = sorted(range(3), key=lambda k: (k + 1 in taken, -abs(e[k])))
+        return ["*Equation", "3", ", ".join(f"{node}, {k + 1}, {e[k]!r}" for k in order)]
+
+    xyz = {}
+    for ln in deck.split("*Node, nset=ALLN\n")[1].split("*")[0].splitlines():
+        f = [float(x) for x in ln.split(",")]
+        xyz[int(f[0])] = f[1:]
+    sph = lambda n: spherical((2., .5, -1.), (2.3, .7, 2.), xyz[n])        # noqa: E731
+    rp = cylindrical((0., -1., -1.), (.4, 1., 0.), xyz[100])
+    held = equation(101, rp[0])
+    eqs = equation(37, sph(37)[0]) + equation(43, sph(43)[1]) + held + \
+        equation(101, rp[1], taken=(int(held[2].split(",")[1]),))
+    loads = {33: [-0.5, 0.3, 0.], 39: [0., 0., 0.4], 44: [0.2, -0.1, 0.25]}
+    cload = []
+    for n, f in loads.items():
+        e = sph(n)
+        cload += [f"{n}, {k + 1}, {sum(f[i] * e[i][k] for i in range(3))!r}" for k in range(3)]
+    cload += [f"RP, {k + 1}, {0.2 * rp[0][k] - 0.15 * rp[2][k]!r}" for k in range(3)]
+    cload += [f"RP, {k + 4}, {0.05 * rp[2][k]!r}" for k in range(3)]
+    out = re.sub(r"(?m)^\*Transform.*\n.*\n", "", deck)
+    out = out.replace("*Rigid Body, ref node=RP, tie nset=FAR\n",
+                      "*Node\n101, 3.5, 0.5, 0.5\n*Rigid Body, ref node=RP, rot node=101, tie nset=FAR\n"
+                      + "\n".join(eqs) + "\n")
+    step = out[out.index("*Boundary\n"):out.index("*Node Print")]
+    return out.replace(step, "*Boundary\nCLAMP, 1, 3\n*Cload\n" + "\n".join(cload) + "\n")
+
+
 def main():
     ccx, env = find_ccx()
     if not ccx:
@@ -1021,6 +1077,36 @@ def main():
               f"temperatures): cube strain {eps[0]:.6e} / {eps[1]:.6e} / {eps[2]:.6e} (alpha T = "
               f"{alpha_t:.6e}, {err_cube:.1e} off); CIRC beam end u_x = {u[13][0]:+.6f} (alpha T L "
               f"= {alpha_t * 100.0:+.6f}, {err_beam * 100:.4f}% diff)")
+        failures += 0 if ok else 1
+
+    # Local axes ccx lacks or does not carry over: a spherical *TRANSFORM (ccx has none; each
+    # node gets a rectangular one with its spherical axes) and a rigid body whose reference
+    # point has a cylindrical one (ccx carries the body's rotations on its ROT NODE, which gets
+    # the same axes).  The example's local loads, radial roller, circumferential support and
+    # held rotations must act as in the same model written in global components.
+    deck = open(os.path.join(EXAMPLES, "transform_spherical_rigid.inp")).read()
+    u, bad = [], ""
+    for text in (deck, global_twin(deck)):
+        src, inp = os.path.join(tmp, "local_src.inp"), os.path.join(tmp, "local.inp")
+        with open(src, "w") as fh:
+            fh.write(text)
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+        if status != "solved" and not bad:
+            bad = " / ".join([status] + [l.strip() for l in out.splitlines() if "ERROR" in l])
+        shutil.rmtree(d, ignore_errors=True)
+    if not u[0] or u[0].keys() != u[1].keys():
+        print(f"FAIL  transform_spherical_rigid: no displacements to compare "
+              f"({bad or 'different nodes printed'})")
+        failures += 1
+    else:
+        scale = max(abs(x) for v in u[1].values() for x in v)
+        err = max(abs(a - b) for n in u[1] for a, b in zip(u[0][n], u[1][n])) / scale
+        ok = err <= 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  transform_spherical_rigid (spherical *TRANSFORM, rigid body "
+              f"with a cylindrical one on its reference point): u at {len(u[1])} nodes differs from "
+              f"the model in global components by {err:.1e} of max |u| ({scale:.4g})")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

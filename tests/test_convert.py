@@ -3515,7 +3515,8 @@ def test_nodal_forces_on_unusable_transforms_are_refused():
             ("R", "1., 1., 0., 2., 2., 0.", "the rectangular *TRANSFORM of node 5 is degenerate"),
             ("C", "1., 1., 1., 1., 1., 1.", "the cylindrical *TRANSFORM of node 5 is degenerate"),
             ("C", "0., 0., 0., 0., 0., 3.", "node 5 lies on the axis of its cylindrical *TRANSFORM"),
-            ("S", "0., 0., 0., 0., 0., 3.", "node 5 has a spherical *TRANSFORM (TYPE=S), which ccx"),
+            ("S", "0., 0., 0., 0., 0., 3.", "node 5 lies on the polar axis of its spherical *TRANSFORM"),
+            ("S", "1., 1., 1., 1., 1., 1.", "the spherical *TRANSFORM of node 5 is degenerate"),
             ("R", "0., 1., 0.", "node 5 has a *TRANSFORM whose data line cannot be read")):
         body, conv, rep = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", data, typ))
         assert _cloads(body) == [{}] and conv.unloaded_steps == [1], (typ, data)
@@ -3824,6 +3825,185 @@ def test_connector_examples():
         assert body.count("*EQUATION") - body.count("** *EQUATION") >= eqs, name
         assert "TYPE=CONN3D2" not in body and not dangling_refs(g), (name, dangling_refs(g))
         assert "WARNING" not in rep.text(), (name, rep.text())
+
+
+def _emitted_transforms(body):
+    """{node: (TYPE letter, [a, b])} of a converted deck's *TRANSFORM cards (the last wins)."""
+    geom, out, lines = reparse(body), {}, body.splitlines()
+    for i, ln in enumerate(lines):
+        m = re.match(r"\*TRANSFORM, NSET=([^,]+)(?:, TYPE=(\w))?$", ln)
+        if m:
+            for n in geom.nset(m.group(1)):
+                out[n] = (m.group(2) or "R", [float(x) for x in lines[i + 1].split(",")])
+    return out
+
+
+def _unit(v):
+    return [x / math.sqrt(sum(y * y for y in v)) for x in v]
+
+
+def _cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
+HEX_XYZ = {1: (0., 0., 0.), 2: (1., 0., 0.), 3: (1., 1., 0.), 4: (0., 1., 0.), 5: (0., 0., 1.),
+           6: (1., 0., 1.), 7: (1., 1., 1.), 8: (0., 1., 1.)}
+STEP = "*Step\n*Static\n*End Step\n"
+
+
+def test_spherical_transform_becomes_a_rectangular_one_per_node():
+    # ccx has no spherical system (NaN results, or a singular matrix with a BC): each node gets
+    # a rectangular *TRANSFORM with its Abaqus spherical axes — 1 radial from the centre a,
+    # 2 = (b - a) x 1 circumferential, 3 = 1 x 2 meridional (towards the pole b)
+    a, pole = (-1., -1., -1.), (0., 0., 1.)
+    deck = _transformed(HEX + STEP, "1, 2, 3, 4, 5, 6, 7, 8", "-1., -1., -1., -1., -1., 3.", "S")
+    body, _, rep = convert_str(deck)
+    assert "** *TRANSFORM, NSET=TR, TYPE=S\n** -1., -1., -1., -1., -1., 3.\n" in body
+    got = _emitted_transforms(body)
+    for n, p in HEX_XYZ.items():
+        e1 = _unit([x - y for x, y in zip(p, a)])
+        assert got[n][0] == "R" and _close(got[n][1], e1 + _unit(_cross(pole, e1)), 1e-14), n
+    assert len(re.findall(r"(?m)^\*TRANSFORM, NSET=ABQ2CCX_TR\d+, TYPE=R$", body)) == 7  # 1, 7: one ray
+    assert "Each node gets a rectangular *TRANSFORM with its spherical axes" in rep.text()
+    assert "*TRANSFORM" not in "".join(m for lvl, m in rep.entries if lvl == "WARNING")
+    # nodes on the polar axis (here the z axis through the centre) have no spherical axes
+    body, _, rep = convert_str(_transformed(HEX + STEP, "1, 2, 3, 4, 5, 6, 7, 8",
+                                            "0., 0., 0., 0., 0., 3.", "S"))
+    assert sorted(_emitted_transforms(body)) == [2, 3, 4, 6, 7, 8]
+    assert ("*TRANSFORM, TYPE=S on TR: no local axes for 2 node(s), since node 1 lies on the polar "
+            "axis of its spherical *TRANSFORM") in rep.text()
+    # a set member the deck never defines has no position, hence no axes (and no crash)
+    body, _, rep = convert_str(_transformed(HEX + STEP, "5, 6, 99", "-1., -1., -1., -1., -1., 3.", "S"))
+    assert sorted(_emitted_transforms(body)) == [5, 6] and "node 99 of a spherical *TRANSFORM is " \
+        "not defined" in rep.text()
+    # converted loads on such nodes go into the same axes: turned back, they are the global ones
+    body, conv, _ = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", "-1., -1., -1., -1., -1., 3.", "S"))
+    (local,), got = _cloads(body), _emitted_transforms(body)
+    for n in TOP4:
+        e1, e2 = got[n][1][:3], got[n][1][3:]
+        axes = (e1, e2, _cross(e1, e2))
+        back = [sum(local.get((n, d + 1), 0.0) * axes[d][k] for d in range(3)) for k in range(3)]
+        assert _close(back, [0.6, 0.0, -0.8], 1e-12), n
+    assert not conv.unloaded_steps
+
+
+def test_several_transforms_on_a_node_warn():
+    # Abaqus: "Multiple transformation definitions are not allowed at a node"; ccx silently
+    # takes the last card
+    once = _transformed(HEX + STEP, "5", "0., 2., 0., -1., 1., 0.")
+    body, _, rep = convert_str(_transformed(once, "5, 6", "1., 0., 0., 0., 1., 0.", nset="TR2"))
+    assert ("1 node(s) (e.g. node 5) are named by several *TRANSFORM cards with different data"
+            in rep.text()) and _emitted_transforms(body)[5] == ("R", [1., 0., 0., 0., 1., 0.])
+    _, _, rep = convert_str(_transformed(once, "5", "0., 2., 0., -1., 1., 0.", nset="TR2"))
+    assert "with the same data" in rep.text() and "different data" not in rep.text()
+    _, _, rep = convert_str(once)
+    assert "several *TRANSFORM cards" not in rep.text()
+
+
+def test_transform_turning_2d_nodes_out_of_the_plane_warns():
+    # a 2-D node has DOFs 1 and 2 in the model plane: the Abaqus manual wants a consistent
+    # transformation (local 3 along Z); ccx 2.23 gets any other one wrong without an error
+    plate = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n*Element, type={}, elset=E\n"
+             "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1., 0.3\n*Solid Section, elset=E, "
+             "material=M\n{}" + STEP)
+    warning = "out of the global Z axis, the normal of the model plane"
+    for typ, data, tilted in (("R", "1., 1., 0., -1., 1., 0.", False),     # local 3 = +z
+                              ("R", "1., 1., 0., 1., -1., 0.", False),     # local 3 = -z
+                              ("C", "0., 0., 0., 0., 0., 1.", False),      # about z
+                              ("R", "1., 0., 1., 0., 1., 0.", True),       # tilted
+                              ("C", "0., 0., 0., 0., 1., 0.", True)):      # about y, in the plane
+        for elem, thick in (("CPS4", "0.5\n"), ("CPE4", "0.5\n"), ("CAX4", "")):
+            _, _, rep = convert_str(_transformed(plate.format(elem, thick), "2, 3", data, typ))
+            assert (warning in rep.text()) == tilted, (elem, typ, data)
+            if tilted:
+                assert "2 node(s) of 2-D elements (e.g. node 2)" in rep.text()
+    truss = ("*Node\n1, 0., 0.\n2, 1., 0.\n3, 0.5, 0.8\n*Element, type=T2D2, elset=E\n1, 1, 2\n"
+             "2, 2, 3\n3, 3, 1\n*Material, name=M\n*Elastic\n1., 0.3\n*Solid Section, elset=E, "
+             "material=M\n0.01\n" + STEP)
+    _, _, rep = convert_str(_transformed(truss, "3", "1., 0., 1., 0., 1., 0."))
+    assert warning in rep.text()
+    _, _, rep = convert_str(_transformed(HEX + STEP, "6, 7", "1., 0., 1., 0., 1., 0."))   # 3-D
+    assert warning not in rep.text()
+
+
+# a rigid top face whose reference point 9 carries rotational BCs and a moment
+RB = HEX + ("*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+            "*Rigid Body, ref node=RP, tie nset=TOPN\n*Step\n*Static\n*Boundary\nRP, 4, 5\n"
+            "RP, 6, 6, 0.01\n*Cload\nRP, 6, 2.\n*End Step\n")
+
+
+def test_rigid_body_rot_node_gets_the_reference_node_axes():
+    # rotational BCs / moments on the reference node move to DOFs 1-3 of its ROT NODE; Abaqus
+    # reads them in the reference node's local axes, so the ROT NODE gets the same ones
+    rect = _transformed(RB, "9", "0., 2., 0., -1., 1., 0.")         # 1 = y, 2 = -x, 3 = z
+    body, conv, rep = convert_str(rect)
+    rot = conv._rb_rot[9]
+    got = _emitted_transforms(body)
+    assert got[rot] == ("R", [0., 1., 0., -1., 0., 0.]) and got[9] == ("R", [0., 2., 0., -1., 1., 0.])
+    assert f"\n{rot}, 1, 2\n{rot}, 3, 3, 0.01\n" in body and _cloads(body) == [{(rot, 3): 2.0}]
+    assert "each ROT NODE, which carries them as its DOFs 1-3, gets the same axes" in rep.text()
+    # cylindrical about the x axis: the axes at the reference node's position (0.5, 0.5, 2)
+    body, conv, _ = convert_str(_transformed(RB, "9", "0., 0., 0., 1., 0., 0.", "C"))
+    e1 = _unit([0., 0.5, 2.])
+    assert _close(_emitted_transforms(body)[conv._rb_rot[9]][1], e1 + _cross([1., 0., 0.], e1), 1e-14)
+    # spherical (centre 0, pole z): the ROT NODE takes the reference node's spherical axes
+    body, conv, _ = convert_str(_transformed(RB, "9", "0., 0., 0., 0., 0., 1.", "S"))
+    e1 = _unit([0.5, 0.5, 2.])
+    got = _emitted_transforms(body)
+    assert _close(got[conv._rb_rot[9]][1], got[9][1], 0.) and \
+        _close(got[9][1], e1 + _unit(_cross([0., 0., 1.], e1)), 1e-14)
+    # on the cylinder axis the local axes are undefined: no transform for the ROT NODE, and the
+    # moved BCs and moments act about the global axes there — warned
+    axis = _transformed(RB, "9", "0.5, 0.5, 0., 0.5, 0.5, 1.", "C")
+    body, conv, rep = convert_str(axis)
+    assert conv._rb_rot[9] not in _emitted_transforms(body)
+    assert ("Rotational BCs / moments on *RIGID BODY reference node 9, which has a *TRANSFORM, "
+            "moved to DOFs 1-3 of its ROT NODE act about the global axes") in rep.text()
+    held = axis.replace("RP, 4, 5\nRP, 6, 6, 0.01\n*Cload\nRP, 6, 2.\n", "RP, 4, 6\n")
+    _, _, rep = convert_str(held)                       # all rotations held at 0: any axes
+    assert "act about the global axes" not in rep.text()
+
+
+def test_rotation_ties_to_a_transformed_rot_node_use_its_axes():
+    # knotted shell members of the body tie their (global) rotations to the ROT NODE, whose
+    # DOFs are local once it has the reference node's axes (1 = y, 2 = -x, 3 = z here):
+    # rotation x = -local 2, y = local 1, z = local 3
+    plate = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n9, 1.5, 0.5, 0.\n"
+             "*Element, type=S4, elset=P\n1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1., 0.3\n"
+             "*Shell Section, elset=P, material=M\n0.1\n*Nset, nset=RP\n9\n*Nset, nset=EDGE\n2, 3\n"
+             "*Rigid Body, ref node=RP, tie nset=EDGE\n*Step\n*Static\n*Boundary\n1, 1, 6\n4, 1, 6\n"
+             "RP, 4, 5\n*Cload\nRP, 6, 1.\n*End Step\n")
+    body, conv, rep = convert_str(_transformed(plate, "9", "0., 2., 0., -1., 1., 0."))
+    rot = conv._rb_rot[9]
+    for n in (2, 3):
+        for line in (f"{n}, 4, 1., {rot}, 2, 1.", f"{n}, 5, 1., {rot}, 1, -1.", f"{n}, 6, 1., {rot}, 3, -1."):
+            assert f"*EQUATION\n2\n{line}\n" in body, line
+    assert "Coupled rotation not tied" not in rep.text()
+    body, conv, _ = convert_str(plate)                                  # no transform: as before
+    assert f"*EQUATION\n2\n2, 4, 1., {conv._rb_rot[9]}, 1, -1.\n" in body
+
+
+def test_rot_node_with_connector_rows_keeps_the_global_axes():
+    # connector constraints on a reference point's rotation are written in global components on
+    # its ROT NODE (RP2: a hinge between two *MPC BEAM reference points), so a ROT NODE that
+    # carries them gets no transform; a rotational BC moved there is warned
+    deck = RP2 + "*Nset, nset=R1\n1\n*Transform, nset=R1\n0., 1., 0., -1., 0., 0.\n*Step\n*Static\n" \
+                 "*Boundary\n1, 5, 5\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert conv._rb_rot[1] not in _emitted_transforms(body) and 1 in _emitted_transforms(body)
+    assert f"its rotation node {conv._rb_rot[1]} also carries connector constraints" in rep.text()
+
+
+def test_transform_spherical_rigid_example():
+    # the deck validate_with_ccx.py runs against its global twin: nine spherical nodes on
+    # nine rays (nine cards), the cylindrical reference point's ROT NODE (one more)
+    body, conv, rep = convert(os.path.join(EXAMPLES, "transform_spherical_rigid.inp"))
+    rot = conv._rb_rot[100]
+    got = _emitted_transforms(body)
+    assert len(re.findall(r"(?m)^\*TRANSFORM, NSET=ABQ2CCX_TR\d+, TYPE=R$", body)) == 10
+    assert sorted(got) == [32, 33, 34, 37, 38, 39, 42, 43, 44, 100, rot] and got[100][0] == "C"
+    assert f"\n{rot}, 1, 2\n" in body and f"\n{rot}, 3, 0.05\n" in body
+    assert rep.n_warnings == 0 and not conv.unloaded_steps and not dangling_refs(reparse(body))
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (223)
+## 1. Unit tests — `tests/test_convert.py` (230)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -240,7 +240,7 @@ conversion behaviour and referential integrity.
 | `test_surface_elements_in_an_assembly_instance` | the corpus deck's shape: surface elements and their `*SURFACE SECTION` inside an `*INSTANCE`, a `TRVEC` on `ASSEMBLY.INSTANCE.SET` → nodal forces, nothing commented |
 | `test_nle10_surface_elements_example` | the LE10 example with an `SFM3D8` skin: the converted forces add up to the pressure × the top face's area, along z |
 | `test_nodal_forces_on_transformed_nodes_go_into_their_local_axes` | a `TRVEC` on a C3D8 face whose nodes have a `*TRANSFORM`: the forces are given in each node's local axes — rectangular (1 along a, 3 = a × b), cylindrical (1 radial at the node, 2 = 3 × 1, 3 along the axis) — and untransformed nodes keep global components; the comment's resultant stays global |
-| `test_nodal_forces_on_unusable_transforms_are_refused` | the load line is commented, with the reason, and the step flagged, when a loaded node's axes are unknown: a degenerate rectangular (a = 0, a ∥ b) or cylindrical (a = b) transform, a node on the cylinder axis, `TYPE=S`, an unreadable data line, two different transforms on one node (the same one twice is fine) |
+| `test_nodal_forces_on_unusable_transforms_are_refused` | the load line is commented, with the reason, and the step flagged, when a loaded node's axes are unknown: a degenerate rectangular (a = 0, a ∥ b), cylindrical or spherical (a = b) transform, a node on the cylinder axis or on a spherical transform's polar axis, an unreadable data line, two different transforms on one node (the same one twice is fine) |
 | `test_nodal_forces_on_transformed_2d_nodes` | a `CPS4` edge traction on transformed nodes: an in-plane rectangular transform (local 3 along +z or −z) and a cylinder about z give DOFs 1-2 only; a transform that turns local 3 out of the Z axis is refused |
 | `test_beam_and_surface_element_loads_on_transformed_nodes` | a beam line load `PY` and an `SFM3D4` pressure on transformed nodes are given in their local axes too |
 | `test_transformed_nodal_forces_meet_the_decks_cload_on_local_dofs` | the clash check against the deck's own `*CLOAD` uses the local DOFs: a force rotated onto local DOF 1, which the deck's `*CLOAD` also loads, is refused in a two-step deck (globally the DOFs looked disjoint) |
@@ -255,6 +255,13 @@ conversion behaviour and referential integrity.
 | `test_connector_nlgeom_exact_cases_only` | under `NLGEOM` a hinge between two moving reference points is commented out (`--approximate`: written, `[APPROX]`), a hinge to ground is kept — `*BOUNDARY` lines, or an equation among the `ROT NODE`'s own components for an oblique axis; a `JOIN` from a reference point to a mesh node is kept, eliminated on the mesh node either way round; a hinge between two solid nodes whose rotations live on new rotation nodes is commented out; with explicit dynamics a beam end's rotation cannot be constrained (no knots) and is commented out rather than dropped |
 | `test_connector_rotations_of_nodes_without_rotations` | a `HINGE` between a beam end and a coincident solid node keeps only the `JOIN` (the solid node's rotation is a connector-only unknown); with a moment on that node its rotation lives on a new rotation node, which the moment moves to |
 | `test_connector_examples` | the three connector examples convert with their equations, no `CONN3D2` element, no warnings and no dangling refs |
+| `test_spherical_transform_becomes_a_rectangular_one_per_node` | a `TYPE=S` card is commented out and every node gets a rectangular `*TRANSFORM` whose `a`, `b` are its Abaqus spherical axes 1 and 2 (computed independently in the test: 1 radial from the centre, 2 = (b − a) × 1), nodes on one ray from the centre sharing a card; nodes on the polar axis get none, warned; a traction's forces on spherical nodes, turned back from those axes, are the global ones |
+| `test_several_transforms_on_a_node_warn` | a node in two `*TRANSFORM` cards with different data is warned (Abaqus does not allow it) and keeps the last card in ccx; the same data twice is a note |
+| `test_transform_turning_2d_nodes_out_of_the_plane_warns` | on `CPS4`, `CPE4`, `CAX4` and `T2D2` nodes a transform whose local 3-axis leaves the Z axis (tilted rectangular; a cylinder about an in-plane axis) is warned; local 3 along +z or −z, a cylinder about z, or any transform on 3-D nodes is not |
+| `test_rigid_body_rot_node_gets_the_reference_node_axes` | a `*RIGID BODY` reference node with a rectangular, cylindrical or spherical transform: its ROT NODE gets a rectangular `*TRANSFORM` with the reference node's local axes, the moved BC and moment lines are unchanged; on the cylinder axis the ROT NODE gets none and the move is warned, unless the BC holds all three rotations at zero |
+| `test_rotation_ties_to_a_transformed_rot_node_use_its_axes` | a `*RIGID BODY` on an `S4` edge whose reference node has a rectangular transform: the knotted members' rotation ties to the ROT NODE are written in its local axes (rotation x = −local 2, y = local 1, z = local 3); without the transform, the plain ties as before |
+| `test_rot_node_with_connector_rows_keeps_the_global_axes` | a hinge connector between two `*MPC BEAM` reference points, one with a `*TRANSFORM`: connector constraints are written in global components on its ROT NODE, so that ROT NODE gets no transform and a rotational BC moved onto it is warned |
+| `test_transform_spherical_rigid_example` | the example `validate_with_ccx.py` runs: nine spherical nodes on nine rays get nine rectangular cards, the reference point's ROT NODE a tenth; the moved rotational BC and moment; no warning, no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -426,6 +433,20 @@ deck and runs it in CalculiX:
   without thermal initial conditions, and on a knot beam's free node without one. The cube
   must strain α T = 1.2e-3 (it does to 9e-16) and the beam's far end move α T L = 0.12
   (0.1200006). Converted without the default, ccx stops before the step.
+* **`transform_spherical_rigid`** — local axes ccx lacks or does not carry over, on a
+  2 × 1 × 1 `C3D8` block clamped at one end: a spherical `*TRANSFORM` (centre below the
+  block, oblique polar axis) on part of its top face, whose nodes carry local loads, a radial
+  roller and a circumferential support — ccx has no spherical system, so each node gets a
+  rectangular transform with its spherical axes —, and a cylindrical one (oblique axis) on
+  the reference point of its rigid far face, held against rotation about local 1 and 2 and
+  loaded by a local force and a moment about local 3 — ccx carries the body's rotations on
+  the ROT NODE, which gets the same axes. It runs against the same model written in global
+  components (`global_twin`: global loads, `*EQUATION` e · u = 0 for the partial supports, an
+  explicit ROT NODE with two rotation equations; the axes computed there independently from
+  the Abaqus manual). Every node's displacement must agree within 1e-6 of max |u|; it agrees
+  exactly (0). The conversion before — `TYPE=S` passed through, which ccx reads as a
+  rectangular system, and the ROT NODE without axes — runs without a message and misses by
+  784 % of max |u|; the ROT NODE without its axes alone misses by 91 %.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -1158,6 +1179,30 @@ joint holds to 5e-7. The teeter's `BEAM` connector
 becomes a rigid body on the hub's kinematic coupling (whose `ROT NODE` now follows the
 coupling's rotation); its `HINGE` would hold a rigid-body member at zero and is commented
 out. All other corpus decks convert byte-identically.
+
+**`*TRANSFORM` cases ccx 2.23 gets wrong without a message.** (1) ccx has no spherical
+system: it reads `*TRANSFORM, TYPE=S` as a rectangular one through `a` and `b` — with the
+centre at the origin a degenerate one (NaN results with a load there, a singular matrix
+with a BC), otherwise one with the wrong axes. Each node now gets a rectangular transform
+with its spherical axes (Abaqus manual: 1 radial, 3 meridional towards the pole, 2 = 3 × 1,
+fixed at the original position) — exact; nodes on the polar axis, where Abaqus cannot define
+the system, keep the global axes with a warning. (2) Two cards with different data on a node:
+Abaqus does not allow it, ccx takes the last — warned. (3) A node of 2-D elements whose local
+3-axis leaves the Z axis: the Abaqus manual requires a transformation consistent with the
+node's DOFs, and ccx breaks such a model — even with no load or BC on the node for
+plane-strain and quadratic plane-stress elements (12–91 % of max |u|) — so it is warned.
+(4) Rotational BCs and moments on a `*RIGID BODY` reference node, which the converter moves
+to DOFs 1-3 of its ROT NODE, are local in Abaqus when the reference node has a transform;
+ccx honours a `*TRANSFORM` on the ROT NODE (probed: exact, also under NLGEOM), so the ROT
+NODE now gets the reference node's axes; where those are undefined, the move is warned. All
+probes are listed in [compatibility.md](compatibility.md). No corpus deck has a spherical
+transform, two cards on a node or a tilted 2-D one (the three `hqdinh` truss decks turn
+their `T2D2` node about z only). Five reference nodes with a transform — four of
+`idaholab_ringshear_mdpc`, one of `lcharleux_deformablecone3d` — lie on their cylinder's
+axis, where the local axes are undefined, so no ROT NODE gets a transform; only
+`idaholab_ringshear_mdpc` moves rotational BCs there (its containers' rotations about the
+axis), which is now warned. That warning is the only change: the other 1072 corpus files
+convert byte-identically.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
