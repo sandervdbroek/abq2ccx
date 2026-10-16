@@ -100,6 +100,16 @@ TRANSLATED = {
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
         "accuracy/vectors/iterations.",
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped.",
+    "*COUPLED TEMPERATURE-DISPLACEMENT": "passed through. ccx 2.23 solves the transient form as a "
+        "dynamic step (HHT) with the mass of every `*DENSITY` and `*MASS`, where Abaqus/Standard "
+        "neglects inertia: in such a deck the densities and `*MASS` values are divided by 10³⁰ and "
+        "the specific heats and GRAV / CENTRIF magnitudes multiplied by it, which leaves the heat "
+        "capacity (density × specific heat) and the body forces as they were — unless a dynamic or "
+        "eigenvalue step needs the mass (then warned). A mechanical load that jumps at the start of "
+        "such a step (no `AMPLITUDE`), or a BC that `*BOUNDARY, OP=NEW` releases there, is warned: "
+        "ccx's HHT integration overshoots the jump by 5 % at the first increment.",
+    "*MASS": "passed through; in a deck with a transient `*COUPLED TEMPERATURE-DISPLACEMENT` step "
+        "divided by 10³⁰ with the densities (see there).",
     "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=VELOCITY`/"
         "`ACCELERATION` → a displacement BC whose generated amplitude integrates the history from "
         "the DOF's state at the step start (continued in later steps that keep it). Without "
@@ -142,7 +152,8 @@ TRANSLATED = {
         "`P` is positive along the element normal); gravity on them adds nothing (no mass), "
         "other loads on them are commented; user-subroutine labels (`...NU`) commented, naming "
         "ccx's `dload.f`. `OP=NEW` keeps the `*DSLOAD` pressures Abaqus keeps (ccx's `OP=NEW` "
-        "would remove them).",
+        "would remove them). GRAV and CENTRIF magnitudes are multiplied by 10³⁰ where the masses "
+        "are divided by it (see `*COUPLED TEMPERATURE-DISPLACEMENT`).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; on a shell's / membrane's "
         "`SNEG` side → `P` / `P1`, on its `SPOS` side the same with the sign flipped (Abaqus "
         "pushes a surface pressure against the surface normal, ccx's `P` / `P1` pushes along the "
@@ -264,7 +275,8 @@ TRANSLATED = {
         "expansion once the deck has temperatures — unless an orientation or ply angle turns it so "
         "that it has shear in global axes. One with shear coefficients gets α12, α13, α23 halved on "
         "every row: Abaqus' are engineering (γ12 = α12 ΔT), ccx reads tensor components "
-        "(ε12 = α12 ΔT).",
+        "(ε12 = α12 ΔT). In a deck with a transient `*COUPLED TEMPERATURE-DISPLACEMENT` step the "
+        "densities are divided and the specific heats multiplied by 10³⁰ (see there).",
     "*HYPERELASTIC": "no model keyword → `POLYNOMIAL` (Abaqus default); `TEST DATA INPUT` commented.",
     "*DEPVAR": "SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx; "
         "reduced physics).",
@@ -466,7 +478,8 @@ def gen_keywords():
                "BEAM SECTION", "STEP", "END STEP", "BOUNDARY", "DLOAD", "DSLOAD", "TIE", "MPC",
                "CREEP", "AMPLITUDE", "RESTART", "SURFACE", "OUTPUT", "NODE OUTPUT", "ELEMENT OUTPUT",
                "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "STATIC", "DYNAMIC", "FREQUENCY",
-               "BUCKLE", "HEAT TRANSFER", "EQUATION", "COUPLING", "KINEMATIC", "RIGID BODY",
+               "BUCKLE", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT", "MASS", "EQUATION",
+               "COUPLING", "KINEMATIC", "RIGID BODY",
                "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",

@@ -1844,6 +1844,12 @@ def ccx_label_ok(label: str, allowed: set) -> bool:
 # Coriolis / rotor-dynamic loads.
 DLOAD_UNSUPPORTED = {"CENT", "ROTA", "CORIO", "ROTDYNF"}
 
+# What the masses of a deck with a transient *COUPLED TEMPERATURE-DISPLACEMENT step are
+# divided by — and specific heats, GRAV and CENTRIF magnitudes multiplied by — so that ccx
+# 2.23, which solves that step as a dynamic one, runs it without inertia as Abaqus does
+# (see Converter._plan_coupled_inertia).
+COUPLED_MASS_SCALE = 1e30
+
 # In a deck with temperatures, ccx 2.23 runs a linear-elastic material correctly in linear
 # steps only when its *ELASTIC form is at least as anisotropic as its *EXPANSION (probed).
 # With an isotropic *ELASTIC and a TYPE=ORTHO or ANISO expansion, its stress routine stores
@@ -2499,6 +2505,9 @@ class Converter:
         self._expansion_as_ortho: Dict[int, str] = {}
         # id(*ELASTIC) -> (TYPE of its material's ORTHO/ANISO *EXPANSION, material name)
         self._elastic_expansion: Dict[int, Tuple[str, str]] = {}
+        # masses go out divided by it, specific heats and GRAV / CENTRIF magnitudes
+        # multiplied by it (_plan_coupled_inertia); None: as in the deck
+        self._mass_scale: Optional[float] = None
         self._expansion_material: Dict[int, str] = {}   # id(*EXPANSION) -> its material's name
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
@@ -3070,6 +3079,7 @@ class Converter:
             "HYPERELASTIC": self.handle_hyperelastic,
             "DENSITY": self.handle_dependent_material,
             "SPECIFIC HEAT": self.handle_dependent_material,
+            "MASS": self.handle_mass,
             "CONDUCTIVITY": self.handle_dependent_material,
             "EXPANSION": self.handle_expansion,
             "MOHR COULOMB": self.handle_dependent_material,
@@ -3273,8 +3283,9 @@ class Converter:
 
     def handle_dependent_material(self, b: Block) -> List[str]:
         """Material cards whose only conversion need is DEPENDENCIES= collapsing (*DENSITY,
-        *SPECIFIC HEAT, *CONDUCTIVITY, *EXPANSION, *MOHR COULOMB[ HARDENING]), and the shear
-        coefficients of an anisotropic *EXPANSION (_tensor_expansion_shear)."""
+        *SPECIFIC HEAT, *CONDUCTIVITY, *EXPANSION, *MOHR COULOMB[ HARDENING]), the shear
+        coefficients of an anisotropic *EXPANSION (_tensor_expansion_shear), and the scaled
+        densities and specific heats of a transient coupled deck (_mass_scaled)."""
         typ = (b.param("TYPE") or "ISO").upper()
         n = {"ORTHO": 3, "ORTHOTROPIC": 3, "ANISO": 6, "ANISOTROPIC": 6}.get(typ, 1)
         nvals = {"MOHR COULOMB": 2, "MOHR COULOMB HARDENING": 2}.get(b.keyword, n)
@@ -3292,11 +3303,18 @@ class Converter:
                                     "halved to the tensor components ccx reads." if aniso else ""),
                                  once=True)
                 self._reduces(f"*{b.keyword} field-variable dependence")
-                return [emit_keyword(b.keyword, params)] + list(b.data)
+                return self._mass_scaled(b, [emit_keyword(b.keyword, params)] + list(b.data),
+                                         raw=True)
             out = [emit_keyword(b.keyword, params)] + data
         else:
             out = self.passthrough(b)
+        out = self._mass_scaled(b, out)
         return self._tensor_expansion_shear(b, out) if aniso else out
+
+    def handle_mass(self, b: Block) -> List[str]:
+        """``*MASS``: passed through, its values scaled with the deck's other masses where
+        _plan_coupled_inertia scales them (ccx stores a MASS element's mass as its density)."""
+        return self._mass_scaled(b, self.passthrough(b))
 
     def _tensor_expansion_shear(self, b: Block, out: List[str]) -> List[str]:
         """The emitted *EXPANSION, TYPE=ANISO card ``out`` (one row per data line: alpha11,
@@ -3833,6 +3851,206 @@ class Converter:
                              f"ccx 2.23 computes right, except where an *ORIENTATION or a composite "
                              f"ply angle turns it so that it has shear in global axes: TYPE=ORTHO "
                              f"would lose that shear there without an error.", once=True)
+
+    def _plan_coupled_inertia(self, blocks: List[Block]) -> None:
+        """Abaqus/Standard's transient *COUPLED TEMPERATURE-DISPLACEMENT neglects inertia
+        ("Fully coupled thermal-stress analysis"); ccx 2.23 solves it as a dynamic step: the
+        card gives it nmethod 4 and an HHT alpha (couptempdisps.f), and nonlingeo.c builds the
+        mass matrix for nmethod 4 unless the step is pure heat transfer, from every *DENSITY
+        and *MASS (it stops without a density).  Probed: a bar under a load applied at once
+        swings between 0.33 and 1.6 times its static extension; heated at one end, it misses
+        its thermal expansion by up to 13 %.  (ccx's own *UNCOUPLED TEMPERATURE-DISPLACEMENT,
+        not an Abaqus keyword, runs the same way; the STEADY STATE forms are static.)
+
+        Where no step needs the mass (no dynamic or eigenvalue step), the masses go out divided
+        by COUPLED_MASS_SCALE and what multiplies them multiplied by it: *SPECIFIC HEAT (ccx's
+        heat capacity is density x specific heat, each interpolated in its own temperature
+        table) and the GRAV and CENTRIF magnitudes (body forces density x g and density x w^2
+        r, on *MASS elements too).  The inertia falls 30 orders of magnitude below the
+        stiffness and nothing else changes.  Probed: the bar sits at its static extension from
+        the second increment; under gravity, a centrifugal load or a point mass under gravity
+        it is at the static value at every increment; its temperatures equal those of *HEAT
+        TRANSFER and its thermal expansion follows them exactly (under NLGEOM with plasticity
+        to the solver tolerance).
+
+        ccx's HHT integration (ALPHA -0.05) stays.  Without mass it gives (1 + alpha) R(n+1) =
+        alpha R(n) for the mechanical residual R: an increment is in equilibrium when the one
+        before was, and a mechanical load that jumps at a step start (STEP, Abaqus' default
+        amplitude in this procedure) is overshot by alpha / (1 + alpha) = 5 % of the jump at
+        the first increment, 0.3 % at the second.  ALPHA=0 would be exact there, but the
+        massless velocities and accelerations that ccx's predictor extrapolates with then never
+        decay (probed: a plastic NLGEOM bar stops after 25 of 200 increments; with ALPHA -0.05
+        it matches *STATIC).  A jump also gives the step a huge initial acceleration (the mass
+        matrix of that solve is doped with (dt/10)^2 beta (1 + alpha) K), so the next
+        predictor is far off: probed, a bar loaded past yield at once stops at the second
+        increment — as it does with its real density when it is stiff, like most thermal-
+        stress models, whose increments are much longer than their natural periods.  Hence
+        the warning on such loads.  Even without a jump that predictor overshoots the first
+        increments (2.8 times the increment at the second): with plasticity and growing
+        increments Newton can fail where *STATIC converges — so it does for a stiff bar with
+        its real density.  ALPHA -1/3 damps it fastest (the plastic bar then converges like
+        *STATIC) but overshoots a step start out of balance by 50 %, not 5 % (probed: a
+        released BC that carried a load), and not every such start shows in the deck (an
+        amplitude that jumps, a *MODEL CHANGE, unbalanced initial stresses); ccx's alpha is
+        kept.  (An initial contact overclosure is no such start: ccx closes it at the first
+        increment exactly, with either alpha.)"""
+        groups: List[List[Block]] = []
+        for b in blocks:
+            if b.keyword == "STEP":
+                groups.append([b])
+            elif groups and groups[-1][-1].keyword != "END STEP":
+                groups[-1].append(b)
+        coupled: List[Tuple[int, List[Block]]] = []    # (step number, its cards)
+        for i, g in enumerate(groups, 1):
+            proc = next((x for x in g[1:] if x.keyword in PROC_KW), None)
+            if proc is not None and proc.keyword == "COUPLED TEMPERATURE-DISPLACEMENT" and \
+                    not (proc.has("STEADY STATE") or proc.has("STEADYSTATE")):
+                coupled.append((i, g))
+        if not coupled:
+            return
+        heavy, unread = False, []
+        for b in blocks:
+            if b.keyword in ("DENSITY", "SPECIFIC HEAT", "MASS"):
+                rows = [[x.strip() for x in rec] for rec in merged_data_records(b)] \
+                    if b.keyword == "MASS" else material_rows(b, 1)
+                if rows is None:
+                    unread.append(f"the rows of a *{b.keyword}, DEPENDENCIES= card")
+                    continue
+                # every field must read: the temperatures and field values too, or a
+                # DEPENDENCIES= card is not collapsed and ccx reads its lines as rows
+                for row in rows:
+                    for j, x in enumerate(row):
+                        try:
+                            v = pf(x) if x else 0.0
+                        except ValueError:
+                            unread.append(f"*{b.keyword} value '{x}'")
+                            continue
+                        if j == 0 or b.keyword == "MASS":
+                            heavy = heavy or (v != 0.0 and b.keyword != "SPECIFIC HEAT")
+            elif b.keyword == "DLOAD":
+                for rec in merged_data_records(b):
+                    g = [x.strip() for x in rec]
+                    if len(g) > 2 and g[1].upper() in ("GRAV", "CENTRIF") and g[2]:
+                        try:
+                            pf(g[2])
+                        except ValueError:
+                            unread.append(f"the {g[1].upper()} magnitude '{g[2]}'")
+        if not heavy:
+            return                      # nothing to move (ccx stops without a density there)
+        steps = ", ".join(str(n) for n, _ in coupled)
+        needs = sorted({b.keyword for b in blocks if b.keyword in self._INERTIA_PROCEDURES or
+                        b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT"})
+        if needs or unread:
+            why = (f"the deck's {', '.join('*' + k for k in needs)} step(s) need them (ccx has one "
+                   f"density per material for all steps)" if needs else
+                   f"the converter cannot read {unread[0]}")
+            self.report.warn(f"Transient *COUPLED TEMPERATURE-DISPLACEMENT (step {steps}): Abaqus/"
+                             f"Standard neglects inertia in this procedure, but ccx 2.23 solves it as "
+                             f"a dynamic step with the mass of every *DENSITY and *MASS, so a load "
+                             f"applied at once makes the structure swing about its static position "
+                             f"and a quick temperature change sets it vibrating (probed: a bar under "
+                             f"a sudden load swings between 0.33 and 1.6 times its static "
+                             f"extension). The masses were not scaled away because {why}; the "
+                             f"coupled steps match Abaqus only where their increments are much "
+                             f"longer than the structure's natural periods.", once=True)
+            return
+        self._mass_scale = COUPLED_MASS_SCALE
+        k = f"{COUPLED_MASS_SCALE:g}"
+        self.report.note(f"Transient *COUPLED TEMPERATURE-DISPLACEMENT (step {steps}): Abaqus/"
+                         f"Standard neglects inertia in this procedure, ccx 2.23 solves it as a "
+                         f"dynamic step with the mass of every *DENSITY and *MASS. Densities and "
+                         f"*MASS values divided by {k}, *SPECIFIC HEAT multiplied by {k} (the heat "
+                         f"capacity, density x specific heat, is unchanged) and GRAV / CENTRIF "
+                         f"magnitudes multiplied by {k} (the body forces are unchanged): the inertia "
+                         f"falls 30 orders of magnitude below the stiffness and the step runs "
+                         f"quasi-statically, as in Abaqus. As for any stiff model in this ccx step, "
+                         f"its predictor then extrapolates with velocities that mean nothing without "
+                         f"mass: a strongly nonlinear step may need smaller increments than *STATIC "
+                         f"would.", once=True)
+        jumps = {n for n, g in coupled
+                 if (g[0].param("AMPLITUDE") or "").strip().upper() != "RAMP" and any(
+                     b.keyword in ("CLOAD", "DLOAD", "DSLOAD") and
+                     (not b.param("AMPLITUDE") or (b.param("OP") or "").strip().upper() == "NEW")
+                     for b in g)}
+        # so does a mechanical BC that a *BOUNDARY, OP=NEW releases: its reaction drops at the
+        # step start (probed: a bar whose top BC carried its load overshoots the same way when
+        # a coupled step releases it).  OP=NEW keeps what the step's own earlier cards gave.
+        transient = {n for n, _ in coupled}
+        # a 2-D model: plane and axisymmetric elements, 2-D beams, rigid elements and
+        # connectors, and dimensionless springs and masses only
+        flat = PLANAR_COMPANION_PREFIXES + ("CAX", "CGAX", "DCAX", "RAX", "SAX", "MAX", "MGAX")
+        two_d = bool(self.geom.elements) and all(
+            typ.upper().startswith(flat) or planar_line_type(typ) is not None
+            for typ in {t for t, _conn in self.geom.elements.values()})
+        rotating = self._shell_nodes | self._beam_nodes | self._ref_nodes | set(self._rb_rot.values())
+
+        def carries(n, d: int) -> bool:
+            """Whether node ``n`` has DOF ``d`` in Abaqus, so that a BC there can bear a load:
+            the in-plane translations always, DOF 3 off 2-D models and their nodes, rotations
+            on shell, beam and reference nodes (in a 2-D model only the in-plane one, 6)."""
+            if d <= 2 or not isinstance(n, int):        # an unresolved set name: assume so
+                return True
+            if two_d:
+                return d == 6 and n in rotating
+            return n not in self._plane_only if d == 3 else n in rotating
+
+        active: set = set()
+        before: set = set()
+        step, fresh = 0, set()
+        for b in blocks + [Block("STEP", OrderedDict())]:
+            if b.keyword == "STEP":
+                if step in transient and before - active:
+                    jumps.add(step)
+                step, before, fresh = step + 1, set(active), set()
+            elif b.keyword == "BOUNDARY":
+                keys = {(n, d) for spec, dofs, *_ in self._rate_lines(b)
+                        for n in (self._resolve_nodes(spec) or [spec.upper()]) for d in dofs
+                        if d <= 6 and carries(n, d)}
+                if step and (b.param("OP") or "").strip().upper() == "NEW":
+                    active = {k for k in active if k in fresh}
+                active |= keys
+                fresh |= keys
+        if jumps:
+            self.report.warn(f"Transient *COUPLED TEMPERATURE-DISPLACEMENT (step "
+                             f"{', '.join(str(n) for n in sorted(jumps))}): a mechanical load without "
+                             f"AMPLITUDE or removed by OP=NEW (Abaqus applies or removes it at once in "
+                             f"this procedure and has the step in equilibrium from the first "
+                             f"increment), or a BC that *BOUNDARY, OP=NEW releases, jumps at the start "
+                             f"of the step. ccx 2.23 integrates the step with the HHT method (ALPHA "
+                             f"-0.05), which overshoots such a jump by 5 % at the step's first "
+                             f"increment (0.3 % at the second); a plastic material keeps that "
+                             f"overshoot, and Newton may fail at the next increment (probed: a bar "
+                             f"loaded past yield at once stops there, with or without its real "
+                             f"density). Check the first increments of the step.", once=True)
+
+    def _mass_scaled(self, b: Block, out: List[str], raw: bool = False) -> List[str]:
+        """The emitted *DENSITY / *SPECIFIC HEAT / *MASS card ``out`` with its masses divided by
+        self._mass_scale and its specific heats multiplied by it (_plan_coupled_inertia): the
+        first value of each row, every value of a *MASS line.  A row is one line, or with
+        ``raw`` (the deck's DEPENDENCIES= rows, uncollapsed) as many as material_rows reads.
+        Temperatures and field values stay as they are."""
+        if not self._mass_scale or b.keyword not in ("DENSITY", "SPECIFIC HEAT", "MASS"):
+            return out
+        per_rec = 1
+        if raw:
+            try:
+                per_rec = -(-(2 + max(0, int(float(b.param("DEPENDENCIES") or "0")))) // 8)
+            except ValueError:
+                pass
+        factor = self._mass_scale if b.keyword == "SPECIFIC HEAT" else 1.0 / self._mass_scale
+        lines, row = list(out), 0
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith("*") or not ln.strip():
+                continue
+            if row % per_rec == 0:
+                f = [x.strip() for x in ln.split(",")]
+                for j in range(len(f) if b.keyword == "MASS" else 1):
+                    if f[j]:
+                        # 12 significant digits: ccx reads only the first 20 characters of a field
+                        f[j] = "%.12g" % (pf(f[j]) * factor)
+                lines[i] = ", ".join(f).rstrip()
+            row += 1
+        return lines
 
     def _material_uses(self, blocks: List[Block]) -> List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]:
         """``(MATERIAL, axes)`` for every section and composite ply (shell or solid) that uses
@@ -6371,6 +6589,10 @@ class Converter:
             elif label == "P":
                 self.report.warn("*DLOAD label 'P' has no face number; CalculiX needs P1..P6 for element "
                                  "pressure. Verify.", once=True)
+            if self._mass_scale and label in ("GRAV", "CENTRIF") and len(g) > 2 and g[2]:
+                # the masses it acts on are divided by the scale (_plan_coupled_inertia)
+                g = g[:2] + ["%.12g" % (pf(g[2]) * self._mass_scale)] + g[3:]
+                f = [x for x in g if x != ""]
             body.append(", ".join(f))
             lines.append(((f[0].upper(), label), body[-1], f[2] if len(f) > 2 else ""))
         had_data = any(x != "" for rec in merged_data_records(b) for x in rec)
@@ -10524,6 +10746,7 @@ class Converter:
         self._plan_expansion_as_ortho(blocks)
         self._plan_elastic_expansion(blocks)
         self._check_nlgeom_expansion(blocks)
+        self._plan_coupled_inertia(blocks)
         # distributed loads that become nodal forces need the plane-section thickness, the
         # beams' n1 directions and the DOFs the deck's own *CLOADs act on
         self._section_thick, self._beam_n1, self._deck_cloads = {}, {}, {}

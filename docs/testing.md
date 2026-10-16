@@ -36,8 +36,8 @@ They cover:
   settling, connectors, `*TRANSFORM`s.
 * **Loads, BCs and steps** — consistent nodal forces, the load audit, surface-element
   loads, shell and membrane pressure on `SPOS`/`SNEG` sides, velocity and acceleration BCs,
-  the default amplitude of displacement BCs, `OP=NEW`, `*BUCKLE` load cases, temperatures,
-  explicit defaults, Riks.
+  the default amplitude of displacement BCs, `OP=NEW`, `*BUCKLE` load cases, temperatures, the masses of
+  transient coupled steps, explicit defaults, Riks.
 * **Reduced physics** — the record of what a conversion drops or replaces
   (`Converter.reduced_physics`), and what does not count (exact substitutions, output
   requests, numerical controls); `*NODE, SYSTEM=` coordinates and `*NODE` normals.
@@ -88,6 +88,7 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `velocity_bc_column` | `TYPE=VELOCITY` with a `SMOOTH STEP`, kept into a second step | the integral of the velocity | 5e-5 of the travel |
 | `velocity_bc_bar` | a bar driven by a velocity (explicit) and an acceleration (implicit) | wave theory | ≈ 1 % on average |
 | `default_amplitude_bars` | a displacement BC and a `*CLOAD` without an amplitude, in implicit `*DYNAMIC`, `*VISCO`, a transient coupled and an explicit step | Abaqus' defaults: the BC ramped (explicit: held where it is), the load applied at once | the ramp to 7e-18 (ccx alone: 0.02 off); 1.98 × static overshoot; the hold exact |
+| `coupled_quasistatic_bars` | transient coupled steps without inertia: two bars under ramped gravity (one with point masses), then one heated at its top, the other loaded at once | statics, with the temperatures the run prints; the same model in `*HEAT TRANSFER` steps; ccx's HHT overshoot of a jump, α / (1 + α) | 6e-9 at every increment (with the masses as given: 6e-3, 30 % of the expansion); temperatures equal; 5.26 %, −0.28 %, 0.015 % |
 | `preselect_output_bar`, `preselect_contact_blocks` | Abaqus/CAE's `PRESELECT` requests: U, RF, S, contact pressure | statics | ≤ 0.005 % |
 | `explicit_default_output_bar` | an explicit step with no output request: 20 intervals | wave theory | exact before the wave arrives |
 | `cps4i_slab_bending` (also as `CPE4I`) | `CPS4I`/`CPE4I` as `C3D8I` slabs under an end couple: tip deflection, σ_xx, σ_zz | beam theory (exact for Abaqus' four-mode element on rectangles) | 4e-8 (a plain `CPS4`: 39 % of the deflection) |

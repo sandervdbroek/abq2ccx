@@ -28,7 +28,10 @@ it (linear and NLGEOM) — velocity / acceleration boundary conditions against t
 time integral and the wave they send through a bar, displacement boundary conditions without
 an amplitude ramped as Abaqus/Standard ramps them (implicit dynamics, *VISCO, a transient
 coupled step) and held as Abaqus/Explicit holds them, while loads keep their procedure's
-default (a stepped load overshoots), field and history output requested at
+default (a stepped load overshoots), transient coupled temperature-displacement steps run
+without inertia as in Abaqus/Standard (bars under gravity and point masses, then heated or
+loaded at once, against statics and the same model's heat transfer), field and history
+output requested at
 beam nodes (the .frd and .dat values against beam theory), and the field output Abaqus
 preselects: a bar in tension with only Abaqus/CAE's *Output, variable=PRESELECT requests,
 and a bar impact in an explicit step without any output request (20 output frames, the
@@ -1444,8 +1447,9 @@ def main():
     # (0.01, then 0.03 in a second step), the other loaded at its top by a *CLOAD without an
     # amplitude: the driven top must follow the ramps at every increment, the loaded one
     # take its load at once - in *DYNAMIC overshooting to about twice its static extension
-    # 0.004, in *VISCO sitting there from the first increment, in the coupled step (which
-    # ccx 2.23 solves with inertia) well above the 0.0004 a ramp would give at t = 0.1.
+    # 0.004, in *VISCO sitting there from the first increment, in the coupled step (without
+    # inertia: abq2ccx scales the masses away) well above the 0.0004 a ramp would give at
+    # t = 0.1.
     # Abaqus/Explicit ignores the value of such a BC and holds the DOF (zero velocity): the
     # driven top stays at 0, and the loaded top, held by one in the second step, stays where
     # the first step left it.
@@ -1502,6 +1506,78 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  default_amplitude_bars ({label}): driven top within "
               f"{dev:.1e} of {'0' if label.endswith('EXPLICIT') else 'the ramps 0 -> 0.01 -> 0.03'} "
               f"at {len(driven)} increments; {what}")
+        failures += 0 if ok else 1
+
+    # --- transient coupled temperature-displacement steps without inertia -----------------
+    # ccx 2.23 solves a transient *COUPLED TEMPERATURE-DISPLACEMENT step as a dynamic one with
+    # the mass of every *DENSITY and *MASS, where Abaqus/Standard neglects inertia; abq2ccx
+    # divides the masses by 1e30 and multiplies the specific heats and the GRAV magnitudes by
+    # it.  Two bars take their weight, ramped up in step 1 (one also point masses at its top);
+    # in step 2 one is heated at its top, the other loaded there by a *CLOAD without an
+    # amplitude.  The heated top must be at its static position at every increment: the sag
+    # under the weight plus the thermal expansion of the temperatures printed along the bar,
+    # which must equal the same model's in *HEAT TRANSFER steps (the heat capacity, density
+    # x specific heat, is unchanged).  The loaded top must sink with the ramped weight and be
+    # at its static extension from the third increment of step 2 on, having overshot the
+    # load's jump by ccx's HHT alpha / (1 + alpha) = 5.26 % at the first and -0.28 % at the
+    # second (abq2ccx warns about this).  With the masses as given, the heated top misses its
+    # static position by up to 30 % of the expansion and the loaded top swings between -66 %
+    # and +63 % of its extension about its static position.
+    src = open(os.path.join(EXAMPLES, "coupled_quasistatic_bars.inp")).read()
+    heat = src.replace("type=C3D8T", "type=DC3D8").replace("*Coupled Temperature-displacement",
+                                                           "*Heat Transfer")
+    for cut in ("*Element, type=MASS, elset=WEIGHTS\n201, 17\n202, 18\n203, 19\n204, 20\n",
+                "*Mass, elset=WEIGHTS\n 0.25\n", "*Boundary\n BOTTOMS, ENCASTRE\n",
+                "*Dload\n BARS, GRAV, 1., 0., 0., -1.\n WEIGHTS, GRAV, 1., 0., 0., -1.\n",
+                "*Cload\n LOADED_TOP, 3, 0.25\n", "*Node Print, nset=HEATED_TOP\n U\n",
+                "*Node Print, nset=LOADED_TOP\n U\n"):
+        heat = heat.replace(cut, "")
+    found = {}
+    for label, text in (("coupled", src), ("heat", heat)):
+        tmp_src = os.path.join(tmp, "coupled_quasistatic_bars_src.inp")
+        with open(tmp_src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, "coupled_quasistatic_bars.inp")
+        convert(tmp_src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        found[label] = (status, out, {t: {int(r[0]): r[1] for r in rows}
+                                      for t, rows in dat_history(dat, "temperatures", "HEATED_AXIS")},
+                        dat_history(dat, "displacements", "HEATED_TOP"),
+                        dat_history(dat, "displacements", "LOADED_TOP"))
+        shutil.rmtree(d, ignore_errors=True)
+    status, out, temps, heated, loaded = found["coupled"]
+    status_h, out_h, temps_h = found["heat"][:3]
+    if status != "solved" or status_h != "solved" or len(heated) != 20 or len(loaded) != 20 or \
+            len(temps) != 10 or sorted(temps) != sorted(temps_h):
+        print(f"FAIL  coupled_quasistatic_bars: did not solve ({status}; *HEAT TRANSFER twin {status_h})")
+        print("\n".join(l for l in (out + out_h).splitlines() if "ERROR" in l)[:400])
+        failures += 1
+    else:
+        rho, g, e, length, mass = 0.15625, 1.0, 1000.0, 4.0, 1.0
+        sag = rho * g * length ** 2 / (2 * e)               # under its own weight (both bars)
+        dev_t = max(abs(temps[t][n] - temps_h[t][n]) for t in temps for n in temps_h[t])
+        dev_h = 0.0
+        for t, rows in heated:
+            # the heated bar also carries the point masses; in step 2 it grows by alpha times
+            # the integral of its (linear-element) temperature along it
+            grow = 1e-4 * sum((temps[t][n] + temps[t][n + 4]) / 2 for n in (1, 5, 9, 13)) \
+                if t > 1.0 + 1e-9 else 0.0
+            ref = -(sag + mass * g * length / e) * min(t, 1.0) + grow
+            dev_h = max([dev_h] + [abs(r[2] - ref) for r in rows])
+        dev_w = max(abs(r[2] + sag * t) for t, rows in loaded if t <= 1.0 + 1e-9 for r in rows)
+        # the loaded top in step 2, as a fraction of the load's static extension 0.004 past its
+        # static position: without mass ccx's HHT step gives (1 + alpha) R(n+1) = alpha R(n)
+        jump = [(rows[0][2] + sag - 0.004) / 0.004 for t, rows in loaded if t > 1.0 + 1e-9]
+        hht = -0.05 / (1.0 - 0.05)
+        dev_j = max(abs(x + hht ** (k + 1)) for k, x in enumerate(jump))
+        ok = dev_t < 1e-6 and dev_h < 1e-7 and dev_w < 1e-9 and dev_j < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  coupled_quasistatic_bars: heated top within {dev_h:.1e} "
+              f"of its static position (weight + expansion) at 20 increments, temperatures within "
+              f"{dev_t:.1e} of *HEAT TRANSFER; loaded top within {dev_w:.1e} of its ramped sag, "
+              f"then past its static extension by {jump[0] * 100:+.2f} %, {jump[1] * 100:+.2f} %, "
+              f"{jump[2] * 100:+.3f} % of the jump (HHT alpha / (1 + alpha) = {-hht * 100:.2f} %: "
+              f"within {dev_j:.1e})")
         failures += 0 if ok else 1
 
     # --- output requests at beam nodes: field output for a node set, history at a node ----

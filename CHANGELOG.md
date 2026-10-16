@@ -32,6 +32,11 @@ without an error. A full audit and the work that followed:
   default departs from ccx's: ramped from the previous value where ccx would step them
   (implicit dynamics, `*VISCO`, transient coupled steps), held where they are in explicit
   steps; `*STEP, AMPLITUDE` dropped on explicit steps.
+* **Coupled temperature–displacement** — transient steps run without inertia, as in
+  Abaqus/Standard (ccx 2.23 solves them as dynamic steps): masses divided by 10³⁰, specific
+  heats and GRAV/CENTRIF magnitudes multiplied by it, which leaves heat capacity and body
+  forces as they were; load jumps and BCs released at the start of such a step, which ccx's
+  HHT scheme overshoots, are warned.
 * **Beams** — circular, pipe and box sections upgraded to the quadratic beams ccx 2.23 runs;
   planar beams and trusses held in their plane; knot beams for rotational BCs on
   circular-section nodes and across `*BOUNDARY, OP=NEW`; a capped explicit increment for

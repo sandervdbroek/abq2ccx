@@ -5958,6 +5958,178 @@ def test_approximate_reframings_are_reduced_physics():
                                 "*Solid Section, elset=EALL, material=M\n", approximate=True)
     assert conv.reduced_physics == ["--approximate: *ELASTIC Poisson ratio >= 0.5 clamped to 0.475"]
 
+COUPLED_HEX = HEX.replace("TYPE=C3D8", "TYPE=C3D8T") + """*ELEMENT, TYPE=MASS, ELSET=PM
+9, 8
+*NSET, NSET=TOP
+5, 6, 7, 8
+*NSET, NSET=BOT
+1, 2, 3, 4
+*NSET, NSET=ALLN, GENERATE
+1, 8, 1
+*MATERIAL, NAME=M
+*ELASTIC
+1000., 0.
+*DENSITY
+7.8e-9, 20.
+7.7e-9, 520.
+*CONDUCTIVITY
+45.
+*SPECIFIC HEAT
+4.6e8, 20.
+5.2e8, 520.
+*EXPANSION
+1.2e-5
+*SOLID SECTION, ELSET=EALL, MATERIAL=M
+*MASS, ELSET=PM
+0.002
+*AMPLITUDE, NAME=A
+0., 0., 1., 1.
+*INITIAL CONDITIONS, TYPE=TEMPERATURE
+ALLN, 20.
+*BOUNDARY
+BOT, 1, 3
+"""
+COUPLED_STEP = "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n*BOUNDARY\nTOP, 11, 11, 100.\n*END STEP\n"
+
+
+def test_coupled_inertia_masses_scaled_away():
+    # ccx 2.23 solves a transient *COUPLED TEMPERATURE-DISPLACEMENT step as a dynamic one with
+    # the mass of every *DENSITY and *MASS, where Abaqus/Standard neglects inertia: the masses
+    # go out divided by 1e30, the specific heats (temperature by temperature) and the GRAV /
+    # CENTRIF magnitudes multiplied by it, so that density x specific heat and the body
+    # forces stay as they were; the step card (ccx's HHT alpha) and the rest stay as given
+    body, conv, rep = convert_str(COUPLED_HEX + "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT, DELTMX=5.\n"
+                                                "0.1, 1.\n*DLOAD, AMPLITUDE=A\n"
+                                                "EALL, GRAV, 9810., 0., 0., -1.\n"
+                                                "PM, GRAV, 9810., 0., 0., -1.\n"
+                                                "EALL, CENTRIF, 100., 0., 0., 0., 0., 0., 1.\n*END STEP\n")
+    assert conv._mass_scale == 1e30
+    assert _card(body, "*DENSITY") == ["7.8e-39, 20.", "7.7e-39, 520."]
+    assert _card(body, "*SPECIFIC HEAT") == ["4.6e+38, 20.", "5.2e+38, 520."]
+    assert _card(body, "*MASS, ELSET=PM") == ["2e-33"]
+    assert _card(body, "*CONDUCTIVITY") == ["45."] and _card(body, "*EXPANSION") == ["1.2e-5"]
+    for (rho, c), want in zip(zip(_card(body, "*DENSITY"), _card(body, "*SPECIFIC HEAT")),
+                              (7.8e-9 * 4.6e8, 7.7e-9 * 5.2e8)):
+        assert abs(float(rho.split(",")[0]) * float(c.split(",")[0]) / want - 1.0) < 1e-12
+    st = _step(body, 1)
+    assert "*COUPLED TEMPERATURE-DISPLACEMENT, DELTMX=5.\n0.1, 1.\n" in st and "ALPHA" not in body
+    assert "*DLOAD, AMPLITUDE=A\nEALL, GRAV, 9.81e+33, 0., 0., -1.\nPM, GRAV, 9.81e+33, 0., 0., -1.\n" \
+           "EALL, CENTRIF, 1e+32, 0., 0., 0., 0., 0., 1.\n" in st
+    assert "Densities and *MASS values divided by 1e+30" in rep.text()
+    assert "jumps at the start" not in rep.text() and "not scaled away" not in rep.text()
+    assert not dangling_refs(reparse(body))
+
+
+def test_coupled_inertia_only_in_transient_coupled_steps():
+    # no mass acts in a steady-state coupled step (static in ccx too), a heat transfer or a
+    # static step; ccx's own *UNCOUPLED TEMPERATURE-DISPLACEMENT, not an Abaqus keyword, means
+    # what ccx makes of it; without a mass nothing moves: the cards stay as given, unflagged
+    for deck, proc in ((COUPLED_HEX, "*COUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE"),
+                       (COUPLED_HEX, "*HEAT TRANSFER"), (COUPLED_HEX, "*STATIC"),
+                       (COUPLED_HEX, "*UNCOUPLED TEMPERATURE-DISPLACEMENT"),
+                       (COUPLED_HEX.replace("7.8e-9, 20.\n7.7e-9, 520.", "0.").replace(
+                           "*MASS, ELSET=PM\n0.002", "*MASS, ELSET=PM\n0."),
+                        "*COUPLED TEMPERATURE-DISPLACEMENT")):
+        body, conv, rep = convert_str(deck + f"*STEP\n{proc}\n0.1, 1.\n*DLOAD\nEALL, GRAV, 9810., 0., "
+                                             f"0., -1.\n*END STEP\n")
+        assert conv._mass_scale is None, proc
+        assert "EALL, GRAV, 9810., 0., 0., -1.\n" in body and "e+30" not in body, proc
+        assert "inertia" not in rep.text() and "jumps at the start" not in rep.text(), proc
+
+
+def test_coupled_inertia_kept_where_a_step_needs_the_mass():
+    # ccx has one density per material for all steps: with a dynamic or eigenvalue step in the
+    # deck the masses stay as they are and the coupled steps' inertia is warned about, as it is
+    # when a value cannot be read
+    for other in ("*STEP\n*FREQUENCY\n5\n*END STEP\n", "*STEP\n*DYNAMIC\n0.1, 1.\n*END STEP\n"):
+        body, conv, rep = convert_str(COUPLED_HEX + COUPLED_STEP + other)
+        assert conv._mass_scale is None
+        assert _card(body, "*DENSITY") == ["7.8e-9, 20.", "7.7e-9, 520."]
+        assert "(step 1): Abaqus/Standard neglects inertia" in rep.text()
+        assert "need them (ccx has one density per material for all steps)" in rep.text()
+    for old, new, what in (("*MASS, ELSET=PM\n0.002", "*MASS, ELSET=PM\nM0", "*MASS value 'M0'"),
+                           ("*DENSITY\n7.8e-9, 20.\n7.7e-9, 520.", "*DENSITY, DEPENDENCIES=7\n7.8e-9",
+                            "the rows of a *DENSITY, DEPENDENCIES= card"),
+                           ("*DENSITY\n7.8e-9, 20.\n7.7e-9, 520.", "*DENSITY, DEPENDENCIES=1\n7.8e-9, 20., F1",
+                            "*DENSITY value 'F1'")):
+        body, conv, rep = convert_str(COUPLED_HEX.replace(old, new) + COUPLED_STEP)
+        assert conv._mass_scale is None and "e+30" not in body
+        assert f"not scaled away because the converter cannot read {what}" in rep.text(), what
+
+
+def test_coupled_inertia_load_jump_warned():
+    # without mass ccx's HHT step puts an increment in equilibrium when the one before was: a
+    # mechanical load that jumps at the step start (no AMPLITUDE, Abaqus' STEP default in this
+    # procedure, or removed by OP=NEW) is overshot at the first increments - warned; an
+    # amplitude, *STEP, AMPLITUDE=RAMP or thermal loads alone do not jump
+    for step, loads, warned in (("*STEP", "*CLOAD\n8, 3, 1.\n", True),
+                                ("*STEP", "*DLOAD\nEALL, P2, 1.\n", True),
+                                ("*STEP", "*CLOAD, AMPLITUDE=A\n8, 3, 1.\n", False),
+                                ("*STEP, AMPLITUDE=RAMP", "*CLOAD\n8, 3, 1.\n", False),
+                                ("*STEP", "*CLOAD, OP=NEW, AMPLITUDE=A\n", True),
+                                ("*STEP", "*BOUNDARY\nTOP, 11, 11, 100.\n*DFLUX\nEALL, BF, 1.\n", False)):
+        body, conv, rep = convert_str(COUPLED_HEX + f"{step}\n*COUPLED TEMPERATURE-DISPLACEMENT\n"
+                                                    f"0.1, 1.\n{loads}*END STEP\n")
+        assert conv._mass_scale == 1e30, (step, loads)
+        assert ("(step 1): a mechanical load without AMPLITUDE" in rep.text() and
+                "jumps at the start of the step" in rep.text()) == warned, (step, loads)
+    # only the steps where it jumps are named
+    body, _, rep = convert_str(COUPLED_HEX + "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n"
+                                             "*CLOAD, AMPLITUDE=A\n8, 3, 1.\n*END STEP\n" + COUPLED_STEP +
+                               "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n*CLOAD\n8, 3, 2.\n"
+                               "*END STEP\n")
+    assert "(step 1, 2, 3): Abaqus/Standard neglects inertia" in rep.text()
+    assert "(step 3): a mechanical load without AMPLITUDE" in rep.text()
+    # a BC that a later *BOUNDARY, OP=NEW releases drops its reaction at the step start: a jump
+    # too; not where OP=NEW gives every mechanical BC again, nor for a temperature BC
+    held = COUPLED_HEX + "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n*BOUNDARY\nTOP, 3, 3\n" \
+                         "TOP, 11, 11, 100.\n*END STEP\n"
+    for again, warned in (("BOT, 1, 3\n", True), ("BOT, 1, 3\nTOP, 3, 3\n", False),
+                          ("BOT, 1, 3\nTOP, 3, 3\n8, 11, 11, 50.\n", False)):
+        body, _, rep = convert_str(held + "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n"
+                                          f"*BOUNDARY, OP=NEW\n{again}*END STEP\n")
+        assert ("(step 2): a mechanical load without AMPLITUDE" in rep.text()) == warned, again
+        assert "(step 1): a mechanical load" not in rep.text(), again
+    # a DOF the node does not have bears no load: DOF 3 of a plane-strain node
+    plane = ("*NODE\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*ELEMENT, TYPE=CPE4T, ELSET=EALL\n"
+             "1, 1, 2, 3, 4\n*NSET, NSET=BOT\n1, 2\n*NSET, NSET=ALLN\n1, 2, 3, 4\n*MATERIAL, NAME=M\n"
+             "*ELASTIC\n1000., 0.\n*DENSITY\n1.\n*CONDUCTIVITY\n1.\n*SPECIFIC HEAT\n1.\n"
+             "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n1.\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\n"
+             "ALLN, 0.\n*BOUNDARY\nBOT, 1, 3\n")
+    for again, warned in (("BOT, 1, 2\n", False), ("BOT, 1, 1\n", True)):
+        body, conv, rep = convert_str(plane + "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n"
+                                              f"*BOUNDARY, OP=NEW\n{again}*END STEP\n")
+        assert conv._mass_scale == 1e30, again
+        assert ("(step 1): a mechanical load without AMPLITUDE" in rep.text()) == warned, again
+    # ... and a point mass leaves the model 2-D: DOF 3 of its node bears nothing either
+    body, conv, rep = convert_str(plane.replace("*NSET, NSET=BOT", "*ELEMENT, TYPE=MASS, ELSET=PM\n9, 4\n"
+                                                                   "*NSET, NSET=BOT") +
+                                  "*MASS, ELSET=PM\n1.\n*BOUNDARY\n4, 3, 3\n*STEP\n"
+                                  "*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n*BOUNDARY, OP=NEW\n"
+                                  "BOT, 1, 3\n*END STEP\n")
+    assert conv._mass_scale == 1e30 and "a mechanical load without AMPLITUDE" not in rep.text()
+
+
+def test_coupled_inertia_dependencies_rows():
+    # a *DENSITY / *SPECIFIC HEAT with DEPENDENCIES= is collapsed to the no-field state first,
+    # then scaled: the property value only, not the temperature
+    deck = COUPLED_HEX.replace("*DENSITY\n7.8e-9, 20.\n7.7e-9, 520.\n",
+                               "*DENSITY, DEPENDENCIES=1\n7.8e-9, 20., 0.\n7.0e-9, 20., 1.\n")
+    body, conv, _ = convert_str(deck + COUPLED_STEP)
+    assert conv._mass_scale == 1e30 and _card(body, "*DENSITY") == ["7.8e-39, 20."]
+
+
+def test_coupled_inertia_example():
+    # the deck validate_with_ccx.py runs: masses, specific heat and gravity scaled; the load
+    # that jumps in step 2 is warned about
+    body, _, rep = convert(os.path.join(EXAMPLES, "coupled_quasistatic_bars.inp"))
+    assert _card(body, "*DENSITY") == ["1.5625e-31"] and _card(body, "*SPECIFIC HEAT") == ["1e+30"]
+    assert _card(body, "*MASS, ELSET=WEIGHTS") == ["2.5e-31"]
+    assert "BARS, GRAV, 1e+30, 0., 0., -1.\nWEIGHTS, GRAV, 1e+30, 0., 0., -1.\n" in _step(body, 1)
+    assert "(step 2): a mechanical load without AMPLITUDE" in rep.text()
+    assert not dangling_refs(reparse(body))
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
