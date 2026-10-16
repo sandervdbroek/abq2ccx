@@ -90,9 +90,8 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
     `ENGINEERING CONSTANTS` (or `ORTHO`) beside an ORTHO expansion;
   * `NLGEOM` steps and materials with `*PLASTIC` or `*CREEP` (ccx's nonlinear path) get
     these combinations right, but there ccx accepts only an isotropic or orthotropic
-    `*ELASTIC`. Under `NLGEOM`, though, a non-isotropic expansion turned by an
-    `*ORIENTATION` is wrong with *every* elastic type: an ORTHO one loses the shear part
-    of the turned strain, an ANISO one does not converge;
+    `*ELASTIC`. `NLGEOM` has a limitation of its own with these expansions, whatever the
+    elastic type (next item);
   * temperature rows are interpolated linearly in the given constants for `TYPE=ISO`
     (E, ν, as Abaqus does), but in the stiffness matrix for every other type (ccx turns
     engineering constants into one per row as it reads them);
@@ -106,6 +105,38 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
   rows between the given temperatures until ccx's interpolation of the stiffness is
   within 1e-4 of the stiffness from Abaqus' interpolated constants. Materials on the
   nonlinear path are left as they are. The `NLGEOM` limitation cannot be fixed this way.
+* **Under `NLGEOM`, an orthotropic thermal expansion in turned material axes, and any
+  anisotropic one, are computed wrongly** (probed with free heated unit cubes and plates,
+  E = 1000, ν = 0.2, α = 1e-3, 2e-3, 4e-3, ΔT = 1, strains from the displacements; read off
+  ccx's `calcmechstrain` and `modifystressstiff`). With `NLGEOM`, ccx splits the
+  deformation gradient into a mechanical and a thermal part, and in 2.23:
+  * it treats every `TYPE=ORTHO` expansion as diagonal in global axes. Where an
+    `*ORIENTATION` or a composite ply angle turns the material axes so that the thermal
+    strain has shear in global axes, that shear is dropped, without an error: a cube
+    turned 30° about z gets its normal strains (1.25e-3, 1.75e-3) but no shear strain
+    instead of −4.33e-4, and a [30/−30]s fibre laminate's in-plane thermal strains come
+    out 41 % and 8 % off. This holds with every `*ELASTIC` form (isotropic as given,
+    engineering constants, orthotropic, anisotropic), on C3D8/C3D8R/C3D8I/C3D20R, S4, S8R
+    (plain, and composite by ply angle or section orientation) and M3D4, in `*STATIC`,
+    implicit and explicit `*DYNAMIC` and `*COUPLED TEMPERATURE-DISPLACEMENT` (steady state
+    and transient) steps, and with `*PLASTIC`. Axes that the orientation only permutes
+    (0°, 90°, a [0/90] layup) and coefficients equal across the turn are right: there is
+    no shear to lose;
+  * it builds the thermal deformation gradient of a `TYPE=ANISO` expansion from the wrong
+    array, so the step stops with "too many cutbacks" — with or without an `*ORIENTATION`,
+    as soon as the deck has temperatures, even for a pulled cube whose temperature never
+    changes;
+  * linear steps (also coupled and `*PLASTIC` ones) and `NLGEOM=NO` are right, and a deck
+    without temperatures has no thermal strain to get wrong.
+
+  The CalculiX sources changed both routines on 9–10 October 2026 (Dhondtguido/CalculiX
+  commits 67faf64 and 2c609be), after 2.23 was posted on 2 November 2025; a build with
+  the change was not tried here. No form of the deck avoids it in 2.23, so the converter
+  only warns, once per kind and naming the materials, when a step has `NLGEOM` (an
+  explicit step counts unless it says `NLGEOM=NO`: the converter switches it on) and a
+  section or composite ply uses a material with an ORTHO expansion in axes turned so that
+  its thermal strain has shear in global axes, in a deck where the temperature changes,
+  or one with an ANISO expansion, in a deck with temperatures.
 * No 2.24 exists as of October 2026.
 * A few cards are version-gated in older ccx (e.g. `*MEMBRANE SECTION` from 2.14, the
   `*ORIENTATION` rotation line from ~2.15, `C3D8R` hourglass control from 2.3). Check

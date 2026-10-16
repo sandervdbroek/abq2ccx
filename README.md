@@ -483,6 +483,11 @@ converter warns about the ones it can detect; the rest are here so you know to c
   thickness or material-property distributions) has no ccx equivalent and is commented
   out; when a distribution's `INPUT=` file is missing, its `*ORIENTATION` is commented out
   too, so ccx stops at the sections that use it rather than run them in global axes.
+* Thermal expansion under `NLGEOM`: ccx 2.23 silently loses the shear part of an
+  orthotropic `*EXPANSION` whose axes an `*ORIENTATION` or a composite ply angle turns off
+  the global axes, and stops with "too many cutbacks" on any `TYPE=ANISO` expansion once the
+  deck has temperatures (linear steps are right). No form of the deck avoids it — the
+  CalculiX sources fixed both after 2.23 — so the converter warns, naming the materials.
 * Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
 * The converter validates *structure*, not *physics*. Run `ccx` and sanity-check.

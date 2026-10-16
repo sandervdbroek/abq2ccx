@@ -24,7 +24,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (173)
+## 1. Unit tests — `tests/test_convert.py` (176)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -93,6 +93,9 @@ conversion behaviour and referential integrity.
 | `test_iso_elastic_temperature_rows_for_ortho_expansion` | temperature columns kept; E alone varying needs no extra rows; E and ν varying get rows (E, ν linear in T) until the linearly interpolated stiffness is within 1e-4 between them |
 | `test_elastic_for_aniso_expansion_becomes_aniso` | isotropic, engineering-constants and `LAMINA` `*ELASTIC` beside `TYPE=ANISO` → `TYPE=ANISO` (8/8/5 + T lines); the engineering constants' normal block inverts back to their compliance, the G's sit at D1212/D1313/D2323 |
 | `test_elastic_left_alone_beside_expansion` | a kept `*PLASTIC` (ccx's nonlinear path) leaves the material alone, a commented-out one does not; an expansion affects only its own material; ν ≥ 0.5 is not rewritten and warned |
+| `test_nlgeom_turned_ortho_expansion_warned` | an `*EXPANSION, TYPE=ORTHO` whose axes an `*ORIENTATION` turns (by its points or its rotation line) is warned in a deck with an `NLGEOM` step (also `NLGEOM=YES`, an explicit step, a coupled step before an `NLGEOM` one) and a temperature change; not for a linear step, `NLGEOM=NO`, no orientation, axes only permuted, an isotropic expansion, coefficients equal across the turn, no temperature change or no temperatures; a temperature row with unequal coefficients and a cylindrical system are warned |
+| `test_nlgeom_aniso_expansion_warned` | an `*EXPANSION, TYPE=ANISO` is warned in a deck with an `NLGEOM` step and temperatures, turned or not and without a temperature change; not in linear steps, without temperatures, or on a material no section uses |
+| `test_nlgeom_expansion_composite_plies` | composite plies: a 45° ply, a ply naming a turned orientation and a turned section orientation are warned; 0/90/−90° plies and a −30° ply on a section orientation turned +30° are not |
 | `test_beam_section_unsupported_profile_commented` | `*BEAM SECTION, SECTION=I` (no ccx profile) is commented out with guidance |
 | `test_equally_spaced_amplitude_expanded` | `DEFINITION=EQUALLY SPACED` expands to explicit time/amplitude pairs |
 | `test_assembly_elset_element_member_uses_elem_offset` | an assembly `*Elset` member `I2.1` takes the element offset |
@@ -754,13 +757,55 @@ the rest of the matrix showed that engineering constants do not help with `TYPE=
 (wrong shear strains without an `*ORIENTATION`), that `TYPE=ANISO` elasticity is right
 with every expansion, that `*PLASTIC` / `*CREEP` materials and `NLGEOM` steps were never
 affected (and ccx rejects `ANISO` elasticity with `*PLASTIC`), but also that under
-`NLGEOM` a turned non-isotropic expansion is wrong with any elastic type. ccx interpolates the converted stiffness, not E and ν, between temperature rows: up
+`NLGEOM` a turned non-isotropic expansion is wrong with any elastic type (next
+paragraph). ccx interpolates the converted stiffness, not E and ν, between temperature rows: up
 to 8 % off mid-interval for a table whose E triples while ν goes 0.2 → 0.3, so rows are
 added until the two agree to 1e-4 (a steel-like table, E 210 → 180 GPa and ν 0.30 → 0.32,
 needs 3). A prescribed general strain gives the same stresses with the original and the
 rewritten `*ELASTIC` (isotropic, orthotropic, engineering constants with three different
 G's, `LAMINA`). No corpus deck has the combination (four have an ORTHO expansion, beside
 engineering constants or a user material); all 1073 corpus files convert byte-identically.
+
+**Thermal expansion under `NLGEOM`.** The probes above left one case no rewrite of the
+deck fixes. Free heated unit elements (E = 1000, ν = 0.2, α = 1e-3, 2e-3, 4e-3, ΔT = 1,
+material axes turned 30° about z, held 3-2-1; the Green-Lagrange strain from the corner
+displacements against ((I + R diag(α ΔT) Rᵀ)² − I) / 2, runs judged with
+`classify_ccx_run`), 64 runs in all: with `*EXPANSION, TYPE=ORTHO` every `NLGEOM` run
+keeps the turned normal strains (1.2508e-3, 1.7515e-3) and loses the shear (0 instead of
+−4.3366e-4; 45°: 0 instead of −5.0e-4) — isotropic (as given and as the converter's
+engineering constants), orthotropic and anisotropic `*ELASTIC`; the orientation by its
+points or a rotation line; C3D8, C3D8R, C3D8I, C3D20R, S4, S8R, M3D4 and composite S8R
+(two 30° plies, or 0° plies on a turned section orientation); `*STATIC`, quasi-static
+`*DYNAMIC`, `*DYNAMIC, EXPLICIT` (the converter's `NLGEOM`), `*COUPLED
+TEMPERATURE-DISPLACEMENT` steady state and transient; and with `*PLASTIC` (a yield stress
+never reached). The same decks without `NLGEOM` (or with `NLGEOM=NO`, also on an explicit
+step) are exact, as are `NLGEOM` runs without an orientation, with 0° or 90° axes, an
+isotropic expansion, α1 = α2 turned about z, or a [0/90] layup. A symmetric [30/−30]s
+fibre laminate (E1/E2 = 10) shows it in its normal strains: 1.2508e-3 and 1.7515e-3
+against 0.889e-3 and 1.620e-3 in the linear run; a [0/90]s one agrees to 0.5 %. With
+`TYPE=ANISO` every `NLGEOM` run stops with "too many cutbacks" — turned or not, with or
+without shear coefficients, whatever the `*ELASTIC`, also for a cube that is only pulled
+while its temperature stays at the initial value; only a deck without temperatures runs
+(a turned ORTHO material is right there, and where the temperature does not change). The
+ccx sources show why: `calcmechstrain`, as it stood from January 2025 until the fix,
+divides the stretches by the diagonal of the thermal stretch whenever the expansion has
+at most three coefficients (the turned shear in `eth(4..6)` never enters), and for six it
+builds the deformation gradient from the mechanical gradient's array before computing it,
+instead of from the displacement gradient (and symmetrises it). The CalculiX sources
+changed both on 9–10 October 2026 (commits 67faf64, 2c609be), after 2.23 was posted (2
+November 2025; the FreeCAD 1.1.4 binary reports 2.23, built 7 November 2025). Single
+C3D20R and S8R elements were meshed 2 × 2 (× 2): alone, their zero-energy modes spoil the
+corner displacements even in linear runs (the integration point strains stay right).
+Transient coupled runs were repeated with density 1e-12: ccx solves their mechanics
+dynamically, and with density 1 the cube still rings at t = 1. The converter now warns
+(`_check_nlgeom_expansion`, called from `_prescan`) when a step has `NLGEOM` (or is
+explicit without `NLGEOM=NO`) and a section or composite ply uses a material with an
+ANISO expansion, in a deck with temperatures, or an ORTHO one in axes turned so that its
+thermal strain has shear in global axes, in a deck where the temperature changes; on the
+probe decks it fires on every run ccx got wrong and on no other. Of the four corpus decks
+with an ORTHO expansion only `alexasafonov_pultrusion` has `NLGEOM` steps (coupled, with
+temperatures), and its orientation is the global axes (`1,0,0, 0,1,0` with a 0°
+rotation): not warned.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

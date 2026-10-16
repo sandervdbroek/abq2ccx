@@ -1048,6 +1048,96 @@ def test_elastic_left_alone_beside_expansion():
     assert "could not be read" in rep.text()
 
 
+TURNED_30 = "*Orientation, name=T\n0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0.\n"
+NLGEOM_STEP = "*Step, nlgeom\n*Static\n"
+HEATED = "*Temperature\nALL, 100.\n"
+TEMPS_IC = "*Initial Conditions, type=TEMPERATURE\nALL, 0.\n"
+
+
+def nlgeom_expansion_warnings(expansion, orientation="", section="", step=NLGEOM_STEP,
+                              load=HEATED, ic=TEMPS_IC):
+    """The NLGEOM thermal-expansion WARNINGs for a heated C3D8 of material M."""
+    deck = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n" + orientation +
+            f"*Solid Section, elset=EALL, material=M{section}\n,\n*Material, name=M\n"
+            "*Elastic\n1000., 0.2\n" + expansion + ic + step + load + "*End Step\n")
+    _, _, rep = convert_str(deck)
+    return [m for m in rep.text().splitlines() if "in a deck with NLGEOM steps" in m]
+
+
+def test_nlgeom_turned_ortho_expansion_warned():
+    # ccx 2.23 drops the shear of a turned orthotropic thermal strain in NLGEOM steps
+    # (probed: a free cube turned 30 deg gets no shear strain), whatever the deck's form
+    w = nlgeom_expansion_warnings(ORTHO_EXPANSION, TURNED_30, ", orientation=T")
+    assert len(w) == 1 and w[0].startswith("[WARNING] Material M: *EXPANSION, TYPE=ORTHO in material "
+                                           "axes that an *ORIENTATION")
+    for ori, step in (("*Orientation, name=T\n1., 0., 0., 0., 1., 0.\n3, 30.\n", NLGEOM_STEP),
+                      (TURNED_30, "*Step, nlgeom=YES\n*Static\n"),
+                      (TURNED_30, "*Step\n*Dynamic, Explicit\n, 1.\n"),   # NLGEOM added there
+                      (TURNED_30, "*Step\n*Coupled Temperature-displacement, steady state\n1., 1.\n"
+                                  "*Step, nlgeom\n*Static\n")):
+        assert len(nlgeom_expansion_warnings(ORTHO_EXPANSION, ori, ", orientation=T", step)) == 1
+    # ... and not where ccx is right: linear steps, NLGEOM=NO, no orientation, axes the
+    # orientation only permutes (also through its rotation line), an isotropic expansion,
+    # equal coefficients across the turn, no temperature change, no temperatures
+    quiet = [(ORTHO_EXPANSION, TURNED_30, "*Step\n*Static\n", HEATED, TEMPS_IC),
+             (ORTHO_EXPANSION, TURNED_30, "*Step, nlgeom=NO\n*Static\n", HEATED, TEMPS_IC),
+             (ORTHO_EXPANSION, TURNED_30, "*Step, nlgeom=NO\n*Dynamic, Explicit\n, 1.\n", HEATED,
+              TEMPS_IC),
+             (ORTHO_EXPANSION, "", NLGEOM_STEP, HEATED, TEMPS_IC),
+             (ORTHO_EXPANSION, "*Orientation, name=T\n1., 0., 0., 0., 1., 0.\n3, 0.\n", NLGEOM_STEP,
+              HEATED, TEMPS_IC),
+             (ORTHO_EXPANSION, "*Orientation, name=T\n0., 1., 0., -1., 0., 0.\n", NLGEOM_STEP,
+              HEATED, TEMPS_IC),
+             (ORTHO_EXPANSION, "*Orientation, name=T\n1., 0., 0., 0., 1., 0.\n1, 90.\n", NLGEOM_STEP,
+              HEATED, TEMPS_IC),
+             ("*Expansion\n1e-3\n", TURNED_30, NLGEOM_STEP, HEATED, TEMPS_IC),
+             ("*Expansion, type=ORTHO\n2e-3, 2e-3, 4e-3\n", TURNED_30, NLGEOM_STEP, HEATED, TEMPS_IC),
+             (ORTHO_EXPANSION, TURNED_30, NLGEOM_STEP, "", TEMPS_IC),
+             (ORTHO_EXPANSION, TURNED_30, NLGEOM_STEP, "", "")]
+    for exp, ori, step, load, ic in quiet:
+        assert not nlgeom_expansion_warnings(exp, ori, ", orientation=T" if ori else "", step, load, ic)
+    # a temperature row with unequal coefficients is enough; a cylindrical system turns
+    assert nlgeom_expansion_warnings("*Expansion, type=ORTHO\n2e-3, 2e-3, 4e-3, 0.\n1e-3, 2e-3, 4e-3, "
+                                     "100.\n", TURNED_30, ", orientation=T")
+    assert nlgeom_expansion_warnings(ORTHO_EXPANSION, "*Orientation, name=T, system=CYLINDRICAL\n"
+                                     "0., 0., 0., 0., 0., 1.\n", ", orientation=T")
+
+
+def test_nlgeom_aniso_expansion_warned():
+    # an anisotropic expansion stops ccx 2.23's NLGEOM steps ('too many cutbacks', probed)
+    # once the deck has temperatures, turned or not, even where the temperature stays
+    w = nlgeom_expansion_warnings(ANISO_EXPANSION, load="")
+    assert len(w) == 1 and w[0].startswith("[WARNING] Material M: *EXPANSION, TYPE=ANISO in a deck")
+    assert nlgeom_expansion_warnings(ANISO_EXPANSION, TURNED_30, ", orientation=T")
+    assert not nlgeom_expansion_warnings(ANISO_EXPANSION, step="*Step\n*Static\n")
+    assert not nlgeom_expansion_warnings(ANISO_EXPANSION, load="", ic="")
+    # a material no section uses is not computed at all
+    _, _, rep = convert_str(HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Solid Section, elset=EALL, "
+                            "material=M\n,\n*Material, name=M\n*Elastic\n1000., 0.2\n*Material, "
+                            "name=SPARE\n*Elastic\n1000., 0.2\n" + ANISO_EXPANSION + TEMPS_IC +
+                            NLGEOM_STEP + HEATED + "*End Step\n")
+    assert "NLGEOM" not in rep.text()
+
+
+def test_nlgeom_expansion_composite_plies():
+    # composite plies: the ply angle turns the section's orientation about its local 3
+    def warned(plies, orientation=""):
+        deck = ("*Node, nset=ALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+                "5, .5, 0., 0.\n6, 1., .5, 0.\n7, .5, 1., 0.\n8, 0., .5, 0.\n"
+                "*Element, type=S8R, elset=P\n1, 1, 2, 3, 4, 5, 6, 7, 8\n" + TURNED_30 +
+                f"*Shell Section, elset=P, composite{orientation}\n" + plies +
+                "*Material, name=PLY\n*Elastic, type=LAMINA\n10000., 1000., 0.3, 500., 500., 400.\n"
+                + ORTHO_EXPANSION + TEMPS_IC + NLGEOM_STEP + HEATED + "*End Step\n")
+        _, _, rep = convert_str(deck)
+        return "Material PLY: *EXPANSION, TYPE=ORTHO" in rep.text()
+
+    assert warned("0.1, 3, PLY, 0.\n0.1, 3, PLY, 45.\n")
+    assert warned("0.1, 3, PLY, T\n")                                 # the ply names T
+    assert warned("0.1, 3, PLY, 0.\n0.1, 3, PLY,\n", ", orientation=T")
+    assert not warned("0.1, 3, PLY, 0.\n0.1, 3, PLY, 90.\n0.1, 3, PLY, -90.\n")
+    assert not warned("0.1, 3, PLY, -30.\n", ", orientation=T")       # back to the global axes
+
+
 def test_beam_section_unsupported_profile_commented():
     deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=B31,elset=E\n1,1,2\n"
             "*Beam Section, elset=E, material=m, section=I\n0.1,0.2,0.1,0.1,0.01,0.01,0.01\n")

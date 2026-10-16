@@ -132,10 +132,21 @@ These are the silent ones — no error, wrong physics.
   `TYPE=ANISO` without an `*ORIENTATION`. The converter writes such an `*ELASTIC` as
   `ENGINEERING CONSTANTS` or `ANISO` with the same stiffness, adding temperature rows when
   E and ν both vary with temperature (the report has a NOTE per material); keep that form
-  if you edit the converted deck. Under `NLGEOM`, an orthotropic or anisotropic expansion
-  turned by an `*ORIENTATION` is wrong in ccx 2.23 with any elastic type (the turned shear
-  part is lost, or the step does not converge), which no rewrite fixes — check one
-  element's thermal strain against a hand calculation there.
+  if you edit the converted deck.
+* **Under `NLGEOM`, turned orthotropic thermal strains lose their shear, and an
+  anisotropic expansion stops the step.** In `NLGEOM` steps ccx 2.23 treats an `*EXPANSION,
+  TYPE=ORTHO` as diagonal in global axes: where an `*ORIENTATION` or a composite ply angle
+  turns the material axes, the shear part of the thermal strain is silently lost (a cube
+  turned 30° keeps its normal thermal strains but gets no shear strain; a [30/−30]s
+  laminate's in-plane thermal strains come out 8 and 41 % off) — with any elastic type,
+  element and procedure, `*PLASTIC` and explicit dynamics included. An `*EXPANSION,
+  TYPE=ANISO` makes `NLGEOM` steps stop with "too many cutbacks" as soon as the deck has
+  temperatures, turned or not, even where the temperature never changes. Linear steps are
+  right, and no form of the deck avoids either in 2.23 (the CalculiX sources fixed both
+  in October 2026), so the converter only warns, naming the materials: check one
+  element's thermal strain against a hand calculation, or keep the thermal load out of
+  `NLGEOM` steps where that is acceptable. An ANISO expansion without shear coefficients
+  can be given as `TYPE=ORTHO` if no `*ORIENTATION` turns it.
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=` and would use the
   first table row; the converter keeps the Abaqus no-field state (field = 0) and warns.
 * **Per-element (`*DISTRIBUTION`) orientations quietly collapse to one.** ccx 2.23 gives
