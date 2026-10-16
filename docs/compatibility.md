@@ -42,6 +42,30 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
     made the node a *knot*, which a beam element attached to it does. The converter gives
     each such node a force-free *knot beam*, and uses the knot's rotations to tie the
     node's rotations to the coupling as Abaqus does (see [testing](testing.md)).
+* **Per-element orientations (`*DISTRIBUTION` + an `*ORIENTATION` that names it) are
+  supported by ccx 2.23, but only partly as Abaqus defines them** (probed with small decks
+  and read off its distribution, orientation and section readers):
+  * `*DISTRIBUTION` takes `NAME`, `LOCATION` and `TABLE`; each data line is
+    `element or element set, ax, ay, az, bx, by, bz` in global coordinates, and becomes an
+    orientation of its own. `*DISTRIBUTION TABLE` is ignored (with a warning), and values
+    after the sixth — an Abaqus origin `c` — are silently dropped.
+  * The `*ORIENTATION` that names the distribution takes all its lines over, so a second
+    one naming the same distribution stops ccx; a name ccx can read as a number (`D1`,
+    `E5`, `12`) silently makes the orientation all-zero.
+  * Only `*SOLID SECTION` gives each listed element its own line; the elements it does not
+    list get the first line, so the Abaqus default line (blank element field) works only
+    as the first line. `*SHELL SECTION`, plain or `COMPOSITE`, and `*MEMBRANE SECTION` give
+    every element the first line — the results equal a single orientation.
+  * An additional-rotation line turns only the first line correctly; the others are left
+    practically unrotated (the angle is converted to radians again for each line).
+
+  The converter gives each orientation its own distribution, resolved to one line per
+  element of its solid sections (default first, the origin subtracted and the rotation
+  applied to the axes, no rotation line), and splits shell and membrane sections into one
+  plain `*ORIENTATION` and section per distinct direction. Composite plies get their
+  orientations from their group's own axes, and assembly flattening renames the
+  distribution per instance, offsets its element labels and turns its axes with a rotated
+  instance.
 * No 2.24 exists as of October 2026.
 * A few cards are version-gated in older ccx (e.g. `*MEMBRANE SECTION` from 2.14, the
   `*ORIENTATION` rotation line from ~2.15, `C3D8R` hourglass control from 2.3). Check
@@ -60,8 +84,10 @@ box-section cantilevers match it within 0.6 %, a shell plate whose edge is rigid
 to a loaded reference point matches the same plate built from solids under `*RIGID BODY`
 within 0.001 %, circular-section beams with a held twist and a prescribed rotation match
 beam theory within 0.2 %, planar `B21` beams' frequencies and buckling loads (rectangular
-and circular sections) match it within 0.6 %, and the composite-shell and assembly decks
-also solve. This proves the full
+and circular sections) match it within 0.6 %, a C3D8 plate and a composite S8R
+variable-angle-tow panel whose fibre angles come from a `*DISTRIBUTION` move exactly like
+the same models written with one `*ORIENTATION` and section per element (to 3e-11 and
+exactly), and the composite-shell and assembly decks also solve. This proves the full
 pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face,
 sections — is correct, not merely well-formed.
 
@@ -91,7 +117,7 @@ through ccx and classified by its failure *and* its source) breaks down as:
 
 | Share | Category | Why no converter can help |
 | --- | --- | --- |
-| ~80% | **Fundamental ccx limits** | The physics isn't in stock ccx: `UMAT`/`VUMAT` user materials (no compiled subroutine), `*USER ELEMENT` (UEL), cohesive elements, user MPCs, rigid `R3D` elements, Riks arc-length steps, incompressible `ν≥0.5`, per-element distribution orientations — plus genuine non-convergence and degenerate (nonpositive-Jacobian) meshes. |
+| ~80% | **Fundamental ccx limits** | The physics isn't in stock ccx: `UMAT`/`VUMAT` user materials (no compiled subroutine), `*USER ELEMENT` (UEL), cohesive elements, user MPCs, rigid `R3D` elements, Riks arc-length steps, incompressible `ν≥0.5`, layered (composite) solid sections — plus genuine non-convergence and degenerate (nonpositive-Jacobian) meshes. |
 | ~4% | **Incomplete source deck** | The deck itself is partial and fails in Abaqus too: no `*MATERIAL` at all, an undefined CAE `_PickedSet`, a material name that doesn't match its section, externally-supplied `<parameter>` values, or a mesh/parser fixture with **no `*STEP`**. |
 | ~15% | **Addressable error, but downstream-blocked** | The *first* error is converter-fixable, but a second, fundamental wall sits behind it. |
 

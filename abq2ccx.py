@@ -1448,6 +1448,43 @@ def ccx_label_ok(label: str, allowed: set) -> bool:
 DLOAD_UNSUPPORTED = {"CENT", "ROTA", "CORIO", "ROTDYNF"}
 
 
+def _fortran_real_like(text: str) -> bool:
+    """Whether ccx 2.23 reads ``text`` as a number on an ``*ORIENTATION`` data line.  It
+    tries ``(f20.0)`` on the first 20 characters before taking the line as a distribution
+    name, and gfortran accepts names such as ``D1``, ``E-3``, ``Q1``, ``1+2``, ``12``,
+    ``.``, ``+``, ``INF`` and ``NAN`` there (verified): the orientation then silently
+    becomes a plain one with zero axes and the stiffness matrix is singular."""
+    s = text.strip().upper()[:20]
+    return bool(re.fullmatch(r"[+-]?\d*\.?\d*(?:[EDQ][+-]?\d+|[+-]\d+)?", s)
+                or re.fullmatch(r"[+-]?(?:INF|INFINITY|NAN(?:\(.*\))?)", s))
+
+
+def _distribution_axes(vals: Sequence[float], rect: bool,
+                       rot: Optional[Tuple[int, float]]) -> Tuple[Vec, Vec]:
+    """The ccx points ``a``, ``b`` of one orientation-distribution line ``a, b[, c]``.
+
+    For a rectangular system the origin ``c`` is subtracted (ccx ignores fields past the
+    sixth; Abaqus measures a and b from c) and an additional rotation ``(local axis,
+    degrees)`` is applied to the axes themselves: ccx 2.23 turns only a distribution's
+    first line by the *ORIENTATION's rotation line and leaves the others practically
+    unrotated (verified).  Cylindrical a, b are points on the axis and are kept."""
+    a, b = tuple(vals[0:3]), tuple(vals[3:6])
+    if not rect:
+        return a, b
+    if len(vals) >= 9 and any(vals[6:9]):
+        c = tuple(vals[6:9])
+        a, b = vsub(a, c), vsub(b, c)
+    if rot and rot[1]:
+        e1 = vunit(a)
+        e3 = vunit(vcross(a, b))
+        e2 = vcross(e3, e1)
+        axis = (e1, e2, e3)[rot[0] - 1]
+        origin = (0.0, 0.0, 0.0)
+        a = rotate_about_axis(e1, origin, axis, rot[1])
+        b = rotate_about_axis(e2, origin, axis, rot[1])
+    return a, b
+
+
 # ---------------------------------------------------------------------------
 # Converter
 # ---------------------------------------------------------------------------
@@ -1508,6 +1545,14 @@ class Converter:
         self._transformed: set = set()             # nodes with a *TRANSFORM (local DOFs)
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         self._last_coupling: Optional[dict] = None
+        # *DISTRIBUTION orientations (see _plan_distributions)
+        self._dists: "OrderedDict[str, Block]" = OrderedDict()  # NAME -> *DISTRIBUTION
+        self._dist_ori: "OrderedDict[str, dict]" = OrderedDict()  # *ORIENTATION NAME -> plan
+        self._dist_refs: set = set()               # every *ORIENTATION that names a distribution
+        self._dist_split: Dict[int, List[Tuple[str, dict]]] = {}  # id(section) -> groups
+        self._dist_tables: set = set()             # *DISTRIBUTION TABLE names they use
+        self._dist_plain: Dict[tuple, str] = {}    # (axes, angle, system) -> orientation name
+        self._used_names: set = set()              # names the converter may not reuse
 
     # -- properties ---------------------------------------------------------
     @property
@@ -1776,9 +1821,11 @@ class Converter:
             "ELASTIC": self.handle_elastic,
             "ORIENTATION": self.handle_orientation,
             "DISTRIBUTION": self.handle_distribution,
+            "DISTRIBUTION TABLE": self.handle_distribution_table,
             "SOLID SECTION": self.handle_solid_section,
             "SHELL SECTION": self.handle_shell_section,
             "SHELL GENERAL SECTION": self.handle_shell_section,
+            "MEMBRANE SECTION": self.handle_membrane_section,
             "BEAM SECTION": self.handle_beam_section,
             "COHESIVE SECTION": self.handle_cohesive_section,
             "GASKET SECTION": self.handle_cohesive_section,
@@ -2218,6 +2265,8 @@ class Converter:
             return self._commented(b, "*ORIENTATION, DEFINITION=OFFSET TO NODES (axes from each "
                                       "element's own local nodes) has no ccx equivalent; define "
                                       "the system by coordinates or a *DISTRIBUTION.")
+        if self._orientation_distribution(b) is not None:
+            return self._distribution_orientation(b)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "DEFINITION":
@@ -2273,16 +2322,329 @@ class Converter:
                                      f"— verify material directions.", once=True)
         return out
 
+    # -- *DISTRIBUTION orientations -----------------------------------------
     def handle_distribution(self, b: Block) -> List[str]:
+        """An orientation distribution is re-emitted right before each *ORIENTATION that
+        names it (see _plan_distributions), so the card itself emits nothing.  ccx has no
+        other kind of distribution."""
+        name = (b.param("NAME") or "").strip().upper()
+        if not (b.param("LOCATION") or "ELEMENT").strip().upper().startswith("ELEM"):
+            return self._commented(b, f"*DISTRIBUTION {name}, LOCATION={b.param('LOCATION')}: ccx "
+                                      f"takes per-element orientations from element distributions "
+                                      f"only, and has no other kind.")
+        plans = [p for p in self._dist_ori.values() if p["dist"] == name]
+        if any(p["has_data"] for p in plans):
+            self.report.note("*DISTRIBUTION orientations re-emitted for ccx 2.23 right before "
+                             "each *ORIENTATION that names them: one line per element of its "
+                             "solid sections (default line first, origin subtracted, the "
+                             "additional rotation applied to the axes); its shell and membrane "
+                             "sections get one plain *ORIENTATION per distinct direction.",
+                             once=True)
+            return []
+        if plans:
+            return self._commented(b, f"*DISTRIBUTION {name} has no data lines, so the "
+                                      f"*ORIENTATION that names it cannot be formed.")
+        return self._commented(b, f"*DISTRIBUTION {name} is not named by any *ORIENTATION: ccx "
+                                  f"supports distributions only as per-element orientations "
+                                  f"(Abaqus also distributes shell thicknesses and material "
+                                  f"properties) — model the variation with element sets and one "
+                                  f"section or material each.")
+
+    def handle_distribution_table(self, b: Block) -> List[str]:
+        if (b.param("NAME") or "").strip().upper() in self._dist_tables:
+            self.report.note("*DISTRIBUTION TABLE of an orientation distribution dropped (ccx "
+                             "needs no table: its distribution lines are always a, b).", once=True)
+            return []
+        return self.passthrough(b)
+
+    def _orientation_distribution(self, b: Block) -> Optional[str]:
+        """The distribution an *ORIENTATION names on its data line in place of the point
+        coordinates (Abaqus per-element orientations), or None."""
+        if not (b.param("DEFINITION") or "COORDINATES").strip().upper().startswith("COORD"):
+            return None
+        recs = merged_data_records(b)
+        tok = recs[0][0] if recs and recs[0] else ""
+        if not tok:
+            return None
+        if tok.upper() in self._dists:            # even a name such as INF or NAN
+            return tok.upper()
+        try:
+            pf(tok)
+        except ValueError:
+            return tok.upper()
+        return None
+
+    def _distribution_orientation(self, b: Block) -> List[str]:
+        """An *ORIENTATION that names a *DISTRIBUTION, preceded by the distribution in the
+        form ccx 2.23 runs correctly (see _plan_distributions)."""
+        name = (b.param("NAME") or "").strip().upper()
+        ref = self._orientation_distribution(b)
+        plan = self._dist_ori.get(name)
+        if plan is None and ref in self._dists:
+            return self._commented(b, f"*ORIENTATION {name} names *DISTRIBUTION {ref}, which is not "
+                                      f"element-based: per-element orientations need an element "
+                                      f"distribution (LOCATION=ELEMENT).")
+        if plan is None:
+            return self._commented(b, f"*ORIENTATION {name} names *DISTRIBUTION {ref}, which the "
+                                      f"deck does not define; define the distribution or give "
+                                      f"the axes by coordinates.")
+        if not plan["has_data"]:
+            return self._commented(b, f"*ORIENTATION {name}: its *DISTRIBUTION {ref} has no data "
+                                      f"lines (INPUT= file missing?), so the per-element material "
+                                      f"directions are unknown and the sections that use it "
+                                      f"cannot run until the data is supplied.")
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
-            if k in ("LOCATION", "TABLE"):
+            if k == "DEFINITION":
                 continue
-            params[k] = v
-        self.report.warn("*DISTRIBUTION passed through: CalculiX supports it only via *ORIENTATION on a "
-                         "*SOLID SECTION (never on shells), and the table layout may need manual "
-                         "adjustment to 'elset, ax,ay,az, bx,by,bz'. Verify.", once=True)
-        return [emit_keyword("DISTRIBUTION", params)] + list(b.data)
+            if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
+                self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
+                                 "RECTANGULAR — verify the local system.", once=True)
+                params["SYSTEM"] = "RECTANGULAR"
+            else:
+                params[k] = v
+        if plan["dropped_rot"]:
+            self.report.warn(f"*ORIENTATION {name}: an additional rotation is not allowed by ccx "
+                             f"for a non-rectangular system and was dropped — verify material "
+                             f"directions.", once=True)
+        if plan["split"] and not plan["solid"]:
+            return []                              # its shell sections carry their own axes
+        first = plan["default"]
+        head = [", " + ", ".join(first)] if first else []
+        body: List[str] = []
+        if plan["solid"]:
+            elems = sorted(plan["solid"])
+            body = [f"{e}, " + ", ".join(plan["vec"][e]) for e in elems if e in plan["vec"]]
+            uncovered = sum(1 for e in elems if e not in plan["vec"])
+            if uncovered and first is None:
+                self.report.warn(f"*ORIENTATION {name}: {uncovered} element(s) of its solid "
+                                 f"sections are not listed in *DISTRIBUTION {ref}, which has no "
+                                 f"default line (Abaqus requires one); ccx gives them the first "
+                                 f"line's axes — verify.", once=True)
+        if not head and not body:                  # unused: one untagged line keeps it valid
+            head = [", " + ", ".join(next(iter(plan["vec"].values())))]
+        return ([f"*DISTRIBUTION, NAME={plan['copy']}"] + head + body
+                + [emit_keyword("ORIENTATION", params), plan["copy"]])
+
+    def _plan_distributions(self, blocks: List[Block]) -> None:
+        """Per-element orientations given by a *DISTRIBUTION (Abaqus discrete orientations,
+        variable-angle-tow layups), planned for what ccx 2.23 does with them (probed, and
+        read off its distribution, orientation and section readers):
+
+        * every distribution line becomes an orientation of its own, and the *ORIENTATION
+          that names the distribution takes all of them over, so a second *ORIENTATION
+          naming the same distribution stops ccx ('distribution ... has not been defined');
+        * only *SOLID SECTION gives each listed element its own line; the elements it does
+          not list get the first line, so the Abaqus default line must come first;
+        * *SHELL SECTION, plain or COMPOSITE, and *MEMBRANE SECTION ignore the lines and give
+          every element the first one;
+        * the *ORIENTATION's additional-rotation line turns only the first line correctly;
+        * origin values (fields 8-10) are ignored, and a distribution name ccx can read as a
+          number (D1, E5, 12) silently zeroes the orientation (see _fortran_real_like).
+
+        So each such orientation gets its own copy of the distribution, resolved to one line
+        per element of its solid sections (default line first, origin subtracted, the
+        additional rotation applied to the axes, no rotation line), which handle_orientation
+        emits right before it; and every shell or membrane section that uses one is split
+        into an element set, a plain *ORIENTATION and a section per distinct direction."""
+        self._dists = OrderedDict()
+        for b in blocks:
+            if b.keyword == "DISTRIBUTION" and (b.param("NAME") or "").strip():
+                self._dists[b.param("NAME").strip().upper()] = b
+        refs: List[Tuple[str, str, Block]] = []
+        plain: set = set()
+        for b in blocks:
+            if b.keyword != "ORIENTATION":
+                continue
+            name = (b.param("NAME") or "").strip().upper()
+            ref = self._orientation_distribution(b)
+            if ref is None:
+                plain.add(name)
+            else:
+                self._dist_refs.add(name)
+                if ref in self._dists:
+                    refs.append((name, ref, b))
+        if not self._dists:
+            return
+        self._used_names = set(self.geom.elsets) | plain | set(self._dists) | {r[0] for r in refs}
+        given: set = set()
+        for name, ref, b in refs:
+            dist = self._dists[ref]
+            if not (dist.param("LOCATION") or "ELEMENT").strip().upper().startswith("ELEM"):
+                continue                           # node labels: handle_orientation reports it
+            rect = not (b.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("CYL")
+            rot = self._orient_rotation.get(name)
+            dropped = bool(rot and rot[1] and not rect)
+            if rot and (not rect or rot[0] not in (1, 2, 3)):
+                rot = None
+            default, vec = self._distribution_lines(dist, ref, rect, rot)
+            # ccx hands a distribution to the first *ORIENTATION that names it, and reads a
+            # name that looks like a number as coordinates: give those a copy of their own
+            if ref in given or ref in plain or _fortran_real_like(ref):
+                copy = self._fresh_name(f"{ref}_{name}")
+            else:
+                copy = ref
+            given.add(ref)
+            if dist.param("TABLE"):
+                self._dist_tables.add(dist.param("TABLE").strip().upper())
+            self._dist_ori[name] = dict(dist=ref, copy=copy, rect=rect, rot=rot,
+                                        dropped_rot=dropped, default=default, vec=vec,
+                                        has_data=default is not None or bool(vec),
+                                        solid=set(), split=False)
+        for b in blocks:
+            kw = b.keyword
+            ori = (b.param("ORIENTATION") or "").strip().upper()
+            elset = (b.param("ELSET") or "").strip()
+            shell = kw in ("SHELL SECTION", "SHELL GENERAL SECTION")
+            if shell and self._continuum_shell_elset(elset):
+                if ori in self._dist_ori and not b.has("COMPOSITE"):    # runs as a solid
+                    self._dist_ori[ori]["solid"].update(self._existing(elset))
+            elif shell or kw == "MEMBRANE SECTION":
+                if not (kw == "SHELL GENERAL SECTION"
+                        and not (b.has("MATERIAL") or b.has("COMPOSITE"))):
+                    self._plan_split(b, ori)
+            elif kw in ("SOLID SECTION", "COHESIVE SECTION", "GASKET SECTION"):
+                if ori in self._dist_ori:
+                    self._dist_ori[ori]["solid"].update(self._existing(elset))
+            elif ori in self._dist_ori:
+                self.report.warn(f"*{kw}, ORIENTATION={ori}: a *DISTRIBUTION orientation gives "
+                                 f"per-element axes to sections only; ccx gives this card the "
+                                 f"distribution's first (default) axes — verify.", once=True)
+
+    def _existing(self, elset: str) -> List[int]:
+        return [e for e in self.geom.elset(elset) if e in self.geom.elements]
+
+    def _continuum_shell_elset(self, elset: Optional[str]) -> bool:
+        """Whether every element of ``elset`` is a continuum shell (SC6R/SC8R): those run as
+        C3D6/C3D8I solids in ccx, so their *SHELL SECTION becomes a *SOLID SECTION."""
+        types = {self.geom.elements[e][0].upper() for e in self.geom.elset(elset or "")
+                 if e in self.geom.elements}
+        return bool(types) and all(t.startswith("SC") for t in types)
+
+    def _distribution_lines(self, dist: Block, ref: str, rect: bool,
+                            rot: Optional[Tuple[int, float]]):
+        """``(default, {element: axes})`` of an orientation distribution, each axes entry the
+        six ccx tokens of a, b (see _distribution_axes); a later line wins, as in ccx, and an
+        element-set label covers every member."""
+        default = None
+        vec: "OrderedDict[int, Tuple[str, ...]]" = OrderedDict()
+        bad = undefined = 0
+        for rec in merged_data_records(dist):
+            if not any(rec):
+                continue
+            label, toks = rec[0], [x for x in rec[1:] if x != ""]
+            try:
+                vals = [pf(x) for x in toks]
+            except ValueError:
+                vals = []
+            if len(vals) < 6:
+                bad += 1
+                continue
+            # ccx reads each value as (f20.0): a longer token would be cut off
+            if (rect and ((len(vals) >= 9 and any(vals[6:9])) or (rot and rot[1]))) or \
+                    any(len(t) > 20 for t in toks[:6]):
+                a, bv = _distribution_axes(vals, rect, rot)
+                axes = tuple(_fmt_component(x) for x in (*a, *bv))
+            else:
+                axes = tuple(toks[:6])
+            if label == "":
+                default = axes
+            elif re.fullmatch(r"[-+]?\d+", label):
+                if int(label) in self.geom.elements:
+                    vec[int(label)] = axes
+                else:
+                    undefined += 1
+            else:
+                members = self._existing(label)
+                undefined += 0 if members else 1
+                for e in members:
+                    vec[e] = axes
+        if bad:
+            self.report.warn(f"*DISTRIBUTION {ref}: {bad} line(s) without six numeric values "
+                             f"(a, b) were skipped.", once=True)
+        if undefined:
+            self.report.warn(f"*DISTRIBUTION {ref}: {undefined} line(s) name an undefined element "
+                             f"or element set and were skipped.", once=True)
+        return default, vec
+
+    def _plan_split(self, b: Block, ori: str) -> None:
+        """Split a shell/membrane section that uses *DISTRIBUTION orientations (its own or a
+        composite ply's) into element groups that share the same axes."""
+        involved = [ori] if ori in self._dist_ori else []
+        if b.has("COMPOSITE"):
+            for rec in merged_data_records(b):
+                o = rec[3].strip().upper() if len(rec) > 3 else ""
+                if o in self._dist_ori and o not in involved:
+                    involved.append(o)
+        involved = [o for o in involved if self._dist_ori[o]["has_data"]]
+        elset = (b.param("ELSET") or "").strip().upper()
+        if not involved or not elset:
+            return
+        groups: "OrderedDict[tuple, List[int]]" = OrderedDict()
+        uncovered = 0
+        for e in dedup(self._existing(elset)):
+            key = []
+            for o in involved:
+                p = self._dist_ori[o]
+                axes = p["vec"].get(e, p["default"])
+                if axes is None:
+                    uncovered += 1
+                    axes = next(iter(p["vec"].values()))
+                key.append(axes)
+            groups.setdefault(tuple(key), []).append(e)
+        if uncovered:
+            self.report.warn(f"*{b.keyword} {elset}: {uncovered} element(s) are not listed in its "
+                             f"*DISTRIBUTION orientation, which has no default line (Abaqus "
+                             f"requires one); they get the first line's axes — verify.", once=True)
+        split = []
+        for k, (key, members) in enumerate(groups.items(), 1):
+            gname = elset if len(groups) == 1 else self._fresh_name(f"{elset}_G{k}")
+            if gname != elset:
+                self.geom.elsets[gname] = members
+            split.append((gname, dict(zip(involved, key))))
+        self._dist_split[id(b)] = split
+        for o in involved:
+            self._dist_ori[o]["split"] = True
+        self.report.note(f"*{b.keyword} with a *DISTRIBUTION orientation split into one element "
+                         f"set, plain *ORIENTATION and section per distinct direction (ccx 2.23 "
+                         f"gives every element of a shell or membrane section the "
+                         f"distribution's first line).", once=True)
+
+    def _plain_dist_orientation(self, name: str, axes: Tuple[str, ...], angle: float,
+                                pre: List[str]) -> str:
+        """A plain *ORIENTATION with the axes of one distribution group, turned by ``angle``
+        about the shell normal for a composite ply, written into ``pre`` the first time a
+        section needs it."""
+        plan = self._dist_ori[name]
+        key = (axes, round(angle, 6), plan["rect"])
+        if key in self._dist_plain:
+            return self._dist_plain[key]
+        oname = self._fresh_name(f"{name}_A{len(self._dist_plain) + 1}")
+        self._dist_plain[key] = oname
+        pre.append(f"*ORIENTATION, NAME={oname}" + ("" if plan["rect"] else ", SYSTEM=CYLINDRICAL"))
+        pre.append(", ".join(axes))
+        if angle and plan["rect"]:
+            pre.append(f"3, {fmt_num(angle)}")
+        elif angle:
+            self.report.warn(f"Composite ply angle on the cylindrical *DISTRIBUTION orientation "
+                             f"'{name}': ccx allows no additional rotation for a non-rectangular "
+                             f"system, so the ply angle was dropped — verify ply directions.",
+                             once=True)
+        return oname
+
+    def _fresh_name(self, base: str) -> str:
+        """A set / orientation / distribution name used nowhere else in the deck, within
+        ccx's 80-character limit, and one ccx cannot read as a number."""
+        base = base.upper()
+        if _fortran_real_like(base):
+            base = "ABQ2CCX_" + base
+        cand, i = base[:CCX_NAME_LIMIT], 1
+        while cand in self._used_names:
+            sfx = f"~{i}"
+            cand = base[:CCX_NAME_LIMIT - len(sfx)] + sfx
+            i += 1
+        self._used_names.add(cand)
+        return cand
 
     def handle_solid_section(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -2424,23 +2786,34 @@ class Converter:
                                           "thickness + material, or a composite layup.")
             self.report.note("*SHELL GENERAL SECTION -> *SHELL SECTION (membrane/bending stiffness "
                              "semantics are not identical; verify).", once=True)
-        if elset:
-            src_types = {self.geom.elements[e][0].upper() for e in self.geom.elset(elset)
-                         if e in self.geom.elements}
-            if src_types and all(t.startswith("SC") for t in src_types):
-                # continuum shells run as C3D6/C3D8I solids in ccx, which stops on a shell
-                # section there; the thickness comes from the mesh
-                if b.has("COMPOSITE"):
-                    return self._commented(b, "*SHELL SECTION, COMPOSITE on continuum shells "
-                                              "(SC6R/SC8R): they run as solids in ccx, which has no "
-                                              "layered solid section — mesh the plies as separate "
-                                              "solid layers or use S8R composite shells.")
-                keep_s: "OrderedDict[str, Optional[str]]" = OrderedDict(
-                    (k, v) for k, v in b.params.items() if k in ("ELSET", "MATERIAL", "ORIENTATION"))
-                self.report.note("*SHELL SECTION on continuum shells (SC6R/SC8R) -> *SOLID SECTION "
-                                 "(they run as C3D6/C3D8I solids; thickness comes from the mesh).",
-                                 once=True)
-                return [emit_keyword("SOLID SECTION", keep_s)]
+        if elset and self._continuum_shell_elset(elset):
+            # continuum shells run as C3D6/C3D8I solids in ccx, which stops on a shell
+            # section there; the thickness comes from the mesh
+            if b.has("COMPOSITE"):
+                return self._commented(b, "*SHELL SECTION, COMPOSITE on continuum shells "
+                                          "(SC6R/SC8R): they run as solids in ccx, which has no "
+                                          "layered solid section — mesh the plies as separate "
+                                          "solid layers or use S8R composite shells.")
+            keep_s: "OrderedDict[str, Optional[str]]" = OrderedDict(
+                (k, v) for k, v in b.params.items() if k in ("ELSET", "MATERIAL", "ORIENTATION"))
+            self.report.note("*SHELL SECTION on continuum shells (SC6R/SC8R) -> *SOLID SECTION "
+                             "(they run as C3D6/C3D8I solids; thickness comes from the mesh).",
+                             once=True)
+            return [emit_keyword("SOLID SECTION", keep_s)]
+        split = self._dist_split.get(id(b))
+        if split is None:
+            return self._shell_section_cards(b, elset, base_ori, {})
+        out: List[str] = []
+        for gname, axes in split:
+            out += self._shell_section_cards(b, gname, base_ori, axes)
+        return out
+
+    def _shell_section_cards(self, b: Block, elset: Optional[str], base_ori: str,
+                             axes: Dict[str, Tuple[str, ...]]) -> List[str]:
+        """The ccx cards of a *SHELL SECTION for the elements of ``elset``.  ``axes`` holds,
+        for a group of elements that share them, the a, b tokens of each *DISTRIBUTION
+        orientation the section uses (see _plan_split); it is empty when it uses none."""
+        base = base_ori.upper()
         if b.has("COMPOSITE"):
             if elset:
                 types = {self.geom.elements[e][0] for e in self.geom.elset(elset)
@@ -2451,7 +2824,9 @@ class Converter:
                                      f"S6 or S8R.", once=True)
             keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
             for k, v in b.params.items():
-                if k in ("ELSET", "OFFSET"):
+                if k == "ELSET":
+                    keep[k] = elset
+                elif k == "OFFSET":
                     keep[k] = v
                 elif k == "COMPOSITE":
                     keep[k] = None
@@ -2472,13 +2847,19 @@ class Converter:
                 thick, mat = g[0], g[2]
                 ply_ori = g[3] if len(g) > 3 else ""
                 if ply_ori == "":
-                    oriname = base_ori.upper() if base_ori else None
+                    oriname = self._plain_dist_orientation(base, axes[base], 0.0, pre) \
+                        if base in axes else (base or None)
                 else:
                     try:                                  # Abaqus: numeric ply angle
-                        float(ply_ori)
-                        oriname = self._synth_orientation(base_ori, ply_ori, pre)
+                        angle = float(ply_ori)
                     except ValueError:                    # already an *ORIENTATION name
                         oriname = ply_ori.upper()
+                        if oriname in axes:
+                            oriname = self._plain_dist_orientation(oriname, axes[oriname], 0.0, pre)
+                    else:
+                        # a distribution orientation's own rotation is already in its axes
+                        oriname = self._plain_dist_orientation(base, axes[base], angle, pre) \
+                            if base in axes else self._synth_orientation(base_ori, ply_ori, pre)
                 if oriname:
                     ply_lines.append(f"{thick}, , {mat}, {oriname}")
                 else:
@@ -2500,7 +2881,12 @@ class Converter:
                 keep[k] = v
             else:
                 self.report.note(f"*SHELL SECTION parameter {k} dropped.", once=True)
-        out = [emit_keyword("SHELL SECTION", keep)]
+        if "ELSET" in keep:
+            keep["ELSET"] = elset
+        pre = []
+        if base in axes:
+            keep["ORIENTATION"] = self._plain_dist_orientation(base, axes[base], 0.0, pre)
+        out = pre + [emit_keyword("SHELL SECTION", keep)]
         recs = merged_data_records(b)
         if recs:
             f = [x for x in recs[0] if x != ""]
@@ -2511,7 +2897,25 @@ class Converter:
                 out.append(f[0])
         return out
 
+    def handle_membrane_section(self, b: Block) -> List[str]:
+        split = self._dist_split.get(id(b))
+        if split is None:
+            return self.passthrough(b)
+        base = (b.param("ORIENTATION") or "").strip().upper()
+        out: List[str] = []
+        for gname, axes in split:
+            params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+            params["ELSET"] = gname
+            pre: List[str] = []
+            params["ORIENTATION"] = self._plain_dist_orientation(base, axes[base], 0.0, pre)
+            out += pre + [emit_keyword("MEMBRANE SECTION", params)] + list(b.data)
+        return out
+
     def _synth_orientation(self, base_name: str, angle: str, pre: List[str]) -> Optional[str]:
+        if base_name and base_name.upper() in self._dist_refs:
+            # an orientation that names a *DISTRIBUTION reaches here only when its axes could
+            # not be resolved (it is commented out): there are no axes to turn
+            return base_name.upper()
         try:
             ang = float(angle)
         except ValueError:
@@ -3975,6 +4379,7 @@ class Converter:
         self._check_nonpositive_ids()
         self._check_overconstraints(blocks)
         self._prescan(blocks)
+        self._plan_distributions(blocks)
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
@@ -5127,11 +5532,12 @@ PART_CONSTRAINT_KW = {"EQUATION", "MPC", "RIGID BODY", "NODAL THICKNESS", "TRANS
 
 # Keywords whose members are elements, so a bare instance-qualified id (``I2.7``) takes
 # the element offset, not the node offset.  Covers element/face-based loads (*DLOAD,
-# *DSLOAD, *DFLUX, *DFILM, *FILM, *RADIATE), the element sections, and element output.
+# *DSLOAD, *DFLUX, *DFILM, *FILM, *RADIATE), the element sections, element output and the
+# element labels of a *DISTRIBUTION.
 # (Nodal loads/BCs — *CLOAD, *CFLUX, *BOUNDARY — are absent, so they take the node offset.)
 ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "DFLUX", "DFILM", "FILM", "RADIATE",
                "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
-               "EL PRINT", "EL FILE", "ELEMENT OUTPUT"}
+               "EL PRINT", "EL FILE", "ELEMENT OUTPUT", "DISTRIBUTION"}
 
 # Parameters whose VALUE names a node set / element set / surface / node (e.g.
 # ``*EL PRINT, ELSET=Part-1.body`` or ``*RIGID BODY, REF NODE=Part-1.ref``).  An
@@ -5400,9 +5806,9 @@ def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple
                     f"line(s); any unparsed translation/rotation is dropped — verify "
                     f"positioning.", once=True)
     if rot:
-        report.warn(f"*INSTANCE {inst['name']} is rotated; node coordinates, *ORIENTATION axes, "
-                    f"beam n1 directions and part-level *NORMAL/*TRANSFORM data are transformed "
-                    f"with it — *DISTRIBUTION orientation tables are not; verify material "
+        report.warn(f"*INSTANCE {inst['name']} is rotated; node coordinates, *ORIENTATION axes "
+                    f"(also per-element *DISTRIBUTION axes), beam n1 directions and part-level "
+                    f"*NORMAL/*TRANSFORM data are transformed with it — verify material "
                     f"directions.", once=True)
     return T, rot
 
@@ -5466,10 +5872,30 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     def rotp(p: Vec) -> Vec:                    # a point moves exactly like a node
         q = vadd(p, T)
         return rotate_about_axis(q, rot[0], rot[1], rot[2]) if rot else q
-    for b in parts.get(inst["part"], []) + inst["extra"]:
+
+    # the part's orientation distributions move like the axes of the *ORIENTATION that
+    # names them (None: unchanged by this instance's transform)
+    inst_blocks = parts.get(inst["part"], []) + inst["extra"]
+    dists = {(b.param("NAME") or "").strip().upper() for b in inst_blocks if b.keyword == "DISTRIBUTION"}
+    dist_move = {}
+    for b in inst_blocks:
+        ref = b.data[0].split(",")[0].strip().upper() if b.keyword == "ORIENTATION" and b.data else ""
+        if ref in dists:
+            rect = (b.param("SYSTEM") or "RECTANGULAR").upper().startswith("RECT")
+            dist_move[ref] = (rotv if rot else None) if rect else (rotp if rot or any(T) else None)
+    for b in inst_blocks:
         if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
                          "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT", "MASS", "GAP"):
             nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer)
+            if b.has("COMPOSITE"):
+                # a ply line (thickness, points, material, angle or orientation, ply name)
+                # can name one of the part's orientations: this instance's copy
+                for i, ln in enumerate(nb.data):
+                    f = ln.split(",")
+                    o = f[3].strip() if len(f) > 3 else ""
+                    if o and not re.fullmatch(r"[-+]?(\d+\.?\d*|\.\d+)([EeDd][-+]?\d+)?", o):
+                        f[3] = " " + namer(prefix, o)
+                        nb.data[i] = ",".join(f)
             if rot and b.keyword == "BEAM SECTION" and len(nb.data) > 1:
                 # the second data line is the beam's n1 direction: it turns with the part
                 try:
@@ -5482,7 +5908,11 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         elif b.keyword == "ORIENTATION":
             nb = _remap_named(b, prefix, ("NAME",), namer)
             system = (b.param("SYSTEM") or "RECTANGULAR").upper()
-            if (rot or any(T)) and nb.data and \
+            ref = nb.data[0].split(",")[0].strip() if nb.data else ""
+            if ref.upper() in dists:
+                # the axes come from the part's *DISTRIBUTION: name this instance's copy
+                nb.data[0] = ", ".join([namer(prefix, ref)] + nb.data[0].split(",")[1:])
+            elif (rot or any(T)) and nb.data and \
                     (b.param("DEFINITION") or "COORDINATES").upper().startswith("COORD"):
                 # rectangular axes are direction points measured from the origin (or from
                 # c on a 9-value line): they only rotate.  Cylindrical a, b are points on
@@ -5497,7 +5927,9 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                     pass
             out.append(nb)
         elif b.keyword == "DISTRIBUTION":
-            out.append(_remap_named(b, prefix, ("NAME",), namer))
+            name = (b.param("NAME") or "").strip().upper()
+            move = dist_move[name] if name in dist_move else (rotv if rot else None)
+            out.append(_remap_distribution(b, prefix, namer, elem_off, move))
         elif b.keyword == "SURFACE":
             out.append(_remap_surface(b, prefix, namer, node_off, elem_off))
         elif b.keyword in PART_CONSTRAINT_KW:
@@ -5678,6 +6110,33 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     out.extend(post)
     _resolve_qualified_refs(out, maps, namer)
     return out
+
+
+def _remap_distribution(b: Block, prefix: str, namer, elem_off: int, move) -> Block:
+    """One instance's copy of a part-level *DISTRIBUTION: its name prefixed like the
+    instance's other names, element labels offset, element-set labels prefixed, and the
+    a, b[, c] points of every line moved with the instance by ``move`` (None: unchanged)."""
+    p: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+    if p.get("NAME"):
+        p["NAME"] = namer(prefix, p["NAME"].strip())
+    data = []
+    for rec in merged_data_records(b):
+        if not any(rec):
+            continue
+        label, vals = rec[0], rec[1:]
+        if re.fullmatch(r"[-+]?\d+", label):
+            label = str(int(label) + elem_off) if int(label) > 0 else label
+        elif label:
+            label = namer(prefix, label)
+        if move is not None:
+            try:
+                v = [pf(x) for x in vals if x != ""]
+            except ValueError:
+                v = []
+            if len(v) in (6, 9):
+                vals = [_fmt_component(x) for i in range(0, len(v), 3) for x in move(tuple(v[i:i + 3]))]
+        data.append(", ".join([label] + vals))
+    return Block(b.keyword, p, data)
 
 
 def _remap_named(b: Block, prefix: str, keys: Sequence[str], namer) -> Block:

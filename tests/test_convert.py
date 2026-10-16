@@ -1794,6 +1794,253 @@ def test_circ_rotation_bc_examples():
     assert g.nset("ABQ2CCX_PLANAR") == list(range(1, 42)) and not dangling_refs(g)
 
 
+# --- *DISTRIBUTION orientations (what ccx 2.23 does: see Converter._plan_distributions) ---
+HEX3 = """*Node
+1, 0.,0.,0.
+2, 1.,0.,0.
+3, 1.,1.,0.
+4, 0.,1.,0.
+5, 0.,0.,1.
+6, 1.,0.,1.
+7, 1.,1.,1.
+8, 0.,1.,1.
+9, 2.,0.,0.
+10, 2.,1.,0.
+11, 2.,0.,1.
+12, 2.,1.,1.
+13, 3.,0.,0.
+14, 3.,1.,0.
+15, 3.,0.,1.
+16, 3.,1.,1.
+*Element, type=C3D8, elset=ALL
+1, 1,2,3,4,5,6,7,8
+2, 2,9,10,3,6,11,12,7
+3, 9,13,14,10,11,15,16,12
+*Elset, elset=PAIR
+2, 3
+*Elset, elset=E1
+1
+*Material, name=M
+*Elastic, type=ENGINEERING CONSTANTS
+100000., 8000., 8000., 0.3, 0.3, 0.45, 4000., 4000.
+3000.
+"""
+
+
+def _card(body, head):
+    """The data lines after the live card line ``head`` up to the next keyword line."""
+    lines = body.splitlines()
+    i = lines.index(head)
+    out = []
+    for ln in lines[i + 1:]:
+        if ln.startswith("*"):
+            break
+        out.append(ln)
+    return out
+
+
+def test_distribution_solid_lines_resolved_for_ccx():
+    # ccx turns only a distribution's first line by the rotation line and ignores an origin:
+    # both are applied to the axes instead; the default line comes first; the set label
+    # covers its members and the later line for element 3 wins; the table is dropped
+    body, _, rep = convert_str(HEX3 + "*Distribution Table, name=T1\ncoord3D, coord3D\n"
+                               "*Distribution, name=Disc, location=ELEMENT, Table=T1\n"
+                               ", 1., 0., 0., 0., 1., 0.\n1, 0., 1., 0., -1., 0., 0.\n"
+                               "PAIR, 0., 1., 0., -1., 0., 0.\n"
+                               "3, 11., 10., 0., 10., 11., 0., 10., 10., 0.\n"
+                               "*Orientation, name=Ori-1\nDisc\n3, 90.\n"
+                               "*Solid Section, elset=ALL, material=M, orientation=Ori-1\n,\n")
+    assert _card(body, "*DISTRIBUTION, NAME=DISC") == [
+        ", 0, 1, 0, -1, 0, 0", "1, -1, 0, 0, 0, -1, 0", "2, -1, 0, 0, 0, -1, 0", "3, 0, 1, 0, -1, 0, 0"]
+    assert _card(body, "*ORIENTATION, NAME=Ori-1") == ["DISC"]                # no rotation line
+    assert not any(l.startswith("*DISTRIBUTION TABLE") for l in _live(body))
+    assert "TABLE of an orientation distribution dropped" in rep.text() and rep.n_warnings == 0
+    # lines that need no change keep their tokens exactly
+    body, _, _ = convert_str(HEX3 + "*Distribution, name=Disc\n, 1., 0., 0., 0., 1., 0.\n"
+                             "2, 0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0.\n"
+                             "*Orientation, name=Ori-1\nDisc\n3, 0.\n"
+                             "*Solid Section, elset=PAIR, material=M, orientation=Ori-1\n,\n")
+    assert _card(body, "*DISTRIBUTION, NAME=DISC") == [
+        ", 1., 0., 0., 0., 1., 0.", "2, 0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0."]
+
+
+def test_distribution_name_ccx_reads_as_number():
+    # ccx tries (f20.0) on the orientation's data line first: these names parse as reals
+    for name in ("D1", "E-3", "Q1", "1+2", "12", "1.5", ".", "+", "INF", "nan",
+                 "12345678901234567890X"):
+        assert A._fortran_real_like(name), name
+    for name in ("E", "D", "1E", "D+", "INFX", "DISC", "ORI-1-DISCORIENT", "D_1"):
+        assert not A._fortran_real_like(name), name
+    body, _, _ = convert_str(HEX3 + "*Distribution, name=D1\n, 1., 0., 0., 0., 1., 0.\n"
+                             "*Orientation, name=Ori-1\nD1\n"
+                             "*Solid Section, elset=ALL, material=M, orientation=Ori-1\n,\n")
+    name = _card(body, "*ORIENTATION, NAME=Ori-1")[0]
+    assert name != "D1" and not A._fortran_real_like(name) and f"*DISTRIBUTION, NAME={name}" in body
+
+
+def test_distribution_named_by_two_orientations_gets_two_copies():
+    # ccx hands a distribution to the first *ORIENTATION naming it; each copy lists only the
+    # elements of its own solid sections, so the copies never re-tag each other's elements
+    body, _, _ = convert_str(HEX3 + "*Distribution, name=Disc\n, 1., 0., 0., 0., 1., 0.\n"
+                             "1, 0., 1., 0., -1., 0., 0.\n2, 0., 1., 0., -1., 0., 0.\n"
+                             "3, 0., 1., 0., -1., 0., 0.\n"
+                             "*Orientation, name=O1\nDisc\n*Orientation, name=O2\nDisc\n3, 90.\n"
+                             "*Solid Section, elset=E1, material=M, orientation=O1\n,\n"
+                             "*Solid Section, elset=PAIR, material=M, orientation=O2\n,\n")
+    assert _card(body, "*DISTRIBUTION, NAME=DISC") == [", 1., 0., 0., 0., 1., 0.",
+                                                        "1, 0., 1., 0., -1., 0., 0."]
+    assert _card(body, "*DISTRIBUTION, NAME=DISC_O2") == [
+        ", 0, 1, 0, -1, 0, 0", "2, -1, 0, 0, 0, -1, 0", "3, -1, 0, 0, 0, -1, 0"]
+    assert _card(body, "*ORIENTATION, NAME=O1") == ["DISC"]
+    assert _card(body, "*ORIENTATION, NAME=O2") == ["DISC_O2"]
+
+
+DIST_PART = """*Part, name=P
+*Node
+1, 0.,0.,0.
+2, 1.,0.,0.
+3, 1.,1.,0.
+4, 0.,1.,0.
+5, 0.,0.,1.
+6, 1.,0.,1.
+7, 1.,1.,1.
+8, 0.,1.,1.
+*Element, type=C3D8, elset=ALL
+1, 1,2,3,4,5,6,7,8
+*Distribution, name=Disc, location=ELEMENT, Table=Disc_Table
+, 1., 0., 0., 0., 1., 0.
+1, 1., 0., 0., 0., 1., 0.
+*Orientation, name=Ori-1, system=RECTANGULAR
+Disc
+3, 0.
+*Solid Section, elset=ALL, orientation=Ori-1, material=M
+,
+*End Part
+*Assembly, name=Assembly
+*Instance, name=I1, part=P
+*End Instance
+*Instance, name=I2, part=P
+0., 0., 0.
+0., 0., 0., 0., 0., 1., 90.
+*End Instance
+*End Assembly
+*Distribution Table, name=Disc_Table
+coord3D, coord3D
+*Material, name=M
+*Elastic, type=ENGINEERING CONSTANTS
+100000., 8000., 8000., 0.3, 0.3, 0.45, 4000., 4000.
+3000.
+"""
+
+
+def test_distribution_flattened_per_instance():
+    # each instance: its own distribution name (and the orientation's reference to it),
+    # element labels offset, and the axes turned with a rotated instance
+    body, _, _ = convert_str(DIST_PART)
+    assert _card(body, "*DISTRIBUTION, NAME=I1_DISC") == [", 1., 0., 0., 0., 1., 0.",
+                                                           "1, 1., 0., 0., 0., 1., 0."]
+    assert _card(body, "*ORIENTATION, NAME=I1_ORI-1, SYSTEM=RECTANGULAR") == ["I1_DISC"]
+    assert _card(body, "*DISTRIBUTION, NAME=I2_DISC") == [", 0, 1, 0, -1, 0, 0",
+                                                           "2, 0, 1, 0, -1, 0, 0"]
+    assert _card(body, "*ORIENTATION, NAME=I2_ORI-1, SYSTEM=RECTANGULAR") == ["I2_DISC"]
+    assert "*SOLID SECTION, ELSET=I2_ALL, ORIENTATION=I2_ORI-1, MATERIAL=M" in body
+    assert not dangling_refs(reparse(body))
+
+
+def test_composite_ply_orientation_named_per_instance():
+    deck = DIST_PART.replace("*Solid Section, elset=ALL, orientation=Ori-1, material=M\n,\n",
+                             "*Orientation, name=Ori-2\n1., 0., 0., 0., 1., 0.\n"
+                             "*Solid Section, elset=ALL, composite\n1., 1, M, Ori-2, Ply-1\n"
+                             "1., 1, M, 45., Ply-2\n")
+    body, _, _ = convert_str(deck)
+    assert "1., 1, M, I1_ORI-2, Ply-1" in body and "1., 1, M, I2_ORI-2, Ply-1" in body
+    assert "1., 1, M, 45., Ply-2" in body                                       # angle kept
+
+
+def test_distribution_shell_section_split_per_direction():
+    # ccx gives every element of a shell section the distribution's first line, so the
+    # section is split into one set + plain orientation + section per distinct direction
+    deck = S4.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                      "*Distribution, name=DP\n, 1., 0., 0., 0., 1., 0.\n2, 0., 1., 0., -1., 0., 0.\n"
+                      "*Orientation, name=OP\nDP\n3, 0.\n"
+                      "*Shell Section, elset=E, material=M, orientation=OP\n0.1, 5\n")
+    body, _, rep = convert_str(deck)
+    g = reparse(body)
+    assert g.elsets["E_G1"] == [1] and g.elsets["E_G2"] == [2]
+    assert _card(body, "*ORIENTATION, NAME=OP_A1") == ["1., 0., 0., 0., 1., 0."]
+    assert _card(body, "*ORIENTATION, NAME=OP_A2") == ["0., 1., 0., -1., 0., 0."]
+    assert _card(body, "*SHELL SECTION, ELSET=E_G1, MATERIAL=M, ORIENTATION=OP_A1") == ["0.1"]
+    assert _card(body, "*SHELL SECTION, ELSET=E_G2, MATERIAL=M, ORIENTATION=OP_A2") == ["0.1"]
+    assert not any(l.startswith(("*DISTRIBUTION", "*ORIENTATION, NAME=OP\n")) for l in _live(body))
+    assert "split into one element set" in rep.text()
+    # composite: a ply angle turns the group's own axes; a ply may name a distribution
+    # orientation of its own
+    deck = S4.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                      "*Distribution, name=DP\n, 1., 0., 0., 0., 1., 0.\n2, 0., 1., 0., -1., 0., 0.\n"
+                      "*Distribution, name=DM\n, 1., 0., 0., 0., 1., 0.\n2, 0., -1., 0., 1., 0., 0.\n"
+                      "*Orientation, name=OP\nDP\n*Orientation, name=OM\nDM\n"
+                      "*Shell Section, elset=E, composite, orientation=OP\n0.1, 3, M, 30.\n"
+                      "0.1, 3, M, OM\n")
+    body, _, _ = convert_str(deck)
+    sec = _card(body, "*SHELL SECTION, ELSET=E_G2, COMPOSITE")
+    assert len(sec) == 2
+    turned = _card(body, "*ORIENTATION, NAME=" + sec[0].split(", ")[-1])
+    assert turned == ["0., 1., 0., -1., 0., 0.", "3, 30."]
+    assert _card(body, "*ORIENTATION, NAME=" + sec[1].split(", ")[-1]) == ["0., -1., 0., 1., 0., 0."]
+    assert not dangling_refs(reparse(body))
+
+
+def test_distribution_without_data_comments_out_its_orientation():
+    body, _, rep = convert_str(HEX3 + "*Distribution, name=Disc, input=missing.ori\n"
+                               "*Orientation, name=O1\nDisc\n"
+                               "*Solid Section, elset=ALL, material=M, orientation=O1\n,\n")
+    assert not any(l.startswith(("*DISTRIBUTION", "*ORIENTATION")) for l in _live(body))
+    assert "per-element material" in rep.text() and "INPUT=missing.ori" in rep.text()
+    # a composite ply angle on it is not turned off a made-up frame; ccx then stops on the
+    # missing orientation instead of running global axes
+    deck = S4.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                      "*Distribution, name=DP, input=missing.ori\n*Orientation, name=OP\nDP\n"
+                      "*Shell Section, elset=E, composite, orientation=OP\n0.1, 3, M, 30.\n")
+    body, _, _ = convert_str(deck)
+    assert "0.1, , M, OP" in body and "ABQ2CCX_OR" not in body
+    # node-based distributions cannot orient elements
+    body, _, rep = convert_str(HEX3 + "*Distribution, name=Disc, location=NODE\n"
+                               ", 1., 0., 0., 0., 1., 0.\n1, 0., 1., 0., -1., 0., 0.\n"
+                               "*Orientation, name=O1\nDisc\n"
+                               "*Solid Section, elset=ALL, material=M, orientation=O1\n,\n")
+    assert not any(l.startswith(("*DISTRIBUTION", "*ORIENTATION")) for l in _live(body))
+    assert "not element-based" in rep.text()
+
+
+def test_distribution_not_named_by_an_orientation_commented():
+    # ccx distributes orientations only (Abaqus also shell thicknesses, material properties)
+    body, _, rep = convert_str(HEX3 + "*Distribution, name=Thick, location=ELEMENT, table=TT\n"
+                               ", 0.1\n1, 0.2\n*Solid Section, elset=ALL, material=M\n,\n")
+    assert not any(l.startswith("*DISTRIBUTION") for l in _live(body))
+    assert "not named by any *ORIENTATION" in rep.text()
+
+
+def test_distribution_plate_examples():
+    # the pairs validate_with_ccx.py compares: distribution form vs one orientation and
+    # section per element
+    body, _, _ = convert(os.path.join(EXAMPLES, "distribution_solid_plate.inp"))
+    for inst in ("PLATE-1", "PLATE-2"):
+        lines = _card(body, f"*DISTRIBUTION, NAME={inst}_ORI-1-DISCORIENT")
+        assert len(lines) == 11 and lines[0].startswith(", ")    # default + elements 1-10
+        assert _card(body, f"*ORIENTATION, NAME={inst}_ORI-1, SYSTEM=RECTANGULAR") == \
+            [f"{inst}_ORI-1-DISCORIENT"]
+    assert not dangling_refs(reparse(body))
+    body, _, _ = convert(os.path.join(EXAMPLES, "distribution_shell_plate.inp"))
+    g = reparse(body)
+    assert [len(g.elsets[f"PANEL-1_PANEL_G{k}"]) for k in range(1, 17)] == [1] * 16
+    assert body.count("*SHELL SECTION, ELSET=PANEL-1_PANEL_G") == 16
+    assert not any(l.startswith("*DISTRIBUTION") for l in _live(body))
+    assert not dangling_refs(g), dangling_refs(g)
+    for name in ("distribution_solid_plate_explicit", "distribution_shell_plate_explicit"):
+        body, _, _ = convert(os.path.join(EXAMPLES, name + ".inp"))
+        assert "*DISTRIBUTION" not in body and not dangling_refs(reparse(body))
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

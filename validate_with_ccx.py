@@ -7,8 +7,9 @@ bundled with FreeCAD) and checks results against reference values: the NAFEMS LE
 stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, a shell plate rigidly coupled to a loaded reference point against the same plate
 built from solids, circular-section beams with a held twist and a prescribed rotation
-against beam theory, and the natural frequencies and buckling loads of planar (B21) beams
-with a rectangular and a circular section.
+against beam theory, the natural frequencies and buckling loads of planar (B21) beams with a
+rectangular and a circular section, and per-element *DISTRIBUTION orientations (a C3D8 plate
+and a composite S8R panel) against the same models written with one orientation per element.
 
     python validate_with_ccx.py
 
@@ -130,6 +131,24 @@ def dat_eigen_table(dat_path, title):
         elif rows:
             break
     return rows
+
+
+def dat_displacements(dat_path):
+    """{node: (ux, uy, uz)} of every node *NODE PRINT wrote to a ccx .dat file (the last
+    value printed for each), or None if there is no .dat file."""
+    if not os.path.exists(dat_path):
+        return None
+    found, inblock = {}, False
+    for ln in open(dat_path):
+        if ln.strip().startswith("displacements"):
+            inblock = True
+            continue
+        f = ln.split()
+        if inblock and len(f) == 4 and f[0].isdigit():
+            found[int(f[0])] = [float(x) for x in f[1:]]
+        elif inblock and f and not f[0].isdigit():
+            inblock = False
+    return found
 
 
 def main():
@@ -291,6 +310,40 @@ def main():
                   f"{got[2]:.0f} (Euler {refs[2]:.0f}); max {max(diffs) * 100:.1f}% diff")
             failures += 0 if ok else 1
         shutil.rmtree(d, ignore_errors=True)
+
+    # --- per-element *DISTRIBUTION orientations vs one *ORIENTATION per element ---------
+    # ccx 2.23 gives each element its own distribution line only under a *SOLID SECTION
+    # (and there turns only the first line by the rotation line), and gives every element
+    # of a *SHELL SECTION the first line.  So abq2ccx resolves a solid distribution per
+    # element and splits a shell section per direction: the C3D8 plate (two instances, one
+    # rotated) and the composite S8R variable-angle-tow panel (a rotated instance) must move
+    # exactly like the same models written with one orientation and section per element.
+    for name, label in (("distribution_solid_plate", "C3D8 *SOLID SECTION"),
+                        ("distribution_shell_plate", "composite S8R *SHELL SECTION")):
+        res = {}
+        for deck in (name, name + "_explicit"):
+            inp = os.path.join(tmp, deck + ".inp")
+            convert(os.path.join(EXAMPLES, deck + ".inp"), inp)
+            d, status, out = run_ccx(ccx, env, inp)
+            res[deck] = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+            shutil.rmtree(d, ignore_errors=True)
+            if not res[deck]:
+                print(f"FAIL  {deck}: no displacements ({status})")
+                print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+                failures += 1
+        if all(res.values()):
+            ud, ue = res[name], res[name + "_explicit"]
+            if set(ud) != set(ue):
+                print(f"FAIL  {name}: the two models printed different nodes")
+                failures += 1
+                continue
+            scale = max(abs(x) for v in ue.values() for x in v)
+            err = max(abs(a - b) for n in ue for a, b in zip(ud[n], ue[n])) / scale
+            ok = err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {name} ({label}, per-element *DISTRIBUTION "
+                  f"orientation): {len(ue)} node displacements vs one *ORIENTATION per element, "
+                  f"max difference {err:.1e} of max |u|")
+            failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

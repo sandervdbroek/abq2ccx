@@ -99,6 +99,8 @@ PASS  beam_circ_rotation_bcs (A: pinned, twist held): deflection = -12.6581 (bea
 PASS  beam_circ_rotation_bcs (B: tip turned 0.001 rad): deflection = +0.5004 (beam theory +0.5000, 0.1% diff)
 PASS  planar_pinned_beam (B21): f1, f2 = 93.67, 373.02 Hz (beam theory 93.81, 375.25), buckling load 220545 (Euler 221079); max 0.6% diff
 PASS  planar_pinned_circ_beam (B21 + CIRC): f1, f2 = 40.81, 163.28 Hz (beam theory 40.62, 162.49), buckling load 16239 (Euler 16278); max 0.5% diff
+PASS  distribution_solid_plate (C3D8 *SOLID SECTION, per-element *DISTRIBUTION orientation): 84 node displacements vs one *ORIENTATION per element, max difference 2.8e-11 of max |u|
+PASS  distribution_shell_plate (composite S8R *SHELL SECTION, per-element *DISTRIBUTION orientation): 69 node displacements vs one *ORIENTATION per element, max difference 0.0e+00 of max |u|
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -120,12 +122,16 @@ the reference point's displacement with the same plate built from `C3D20R` brick
 `*RIGID BODY`. The fifth gives two circular-section beams rotational BCs — a twist held at
 pinned supports, a prescribed tip rotation — and compares their deflections with beam
 theory: under a rotational BC ccx 2.23 locks a circular section's other rotations, so this
-needs the converter's knot beams (without them 0.31 and 0.76 of beam theory). The last two
-run planar `B21` beams (rectangular and circular sections) on pinned supports through a
-frequency and a buckling step and compare the first two frequencies and the buckling load
+needs the converter's knot beams (without them 0.31 and 0.76 of beam theory). The sixth and
+seventh run planar `B21` beams (rectangular and circular sections) on pinned supports through
+a frequency and a buckling step and compare the first two frequencies and the buckling load
 with beam theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar
 constraint: without it ccx reports 0 Hz modes (the free twist and the unsupported
-out-of-plane motion) and a buckling factor of 1.
+out-of-plane motion) and a buckling factor of 1. The last two give every element its own
+fibre angle through a `*DISTRIBUTION`, as a variable-angle-tow layup does: a `C3D8` plate
+(two instances, one rotated; a default line, an element-set line and an additional
+rotation) and a composite `S8R` panel whose plies follow +θ and −θ paths. Every node must
+move exactly as in the same model written with one `*ORIENTATION` and section per element.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -206,7 +212,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*PART/*INSTANCE/*ASSEMBLY` | flattened, one global numbering | instance transform applied; `inst.node`/`inst.set` resolved |
 | `*ELASTIC, ORTHOTROPIC/ANISOTROPIC` | `ORTHO`/`ANISO` | same constant order |
 | `*ORIENTATION` | `*ORIENTATION` | origin `c` subtracted (axes `a−c`, `b−c`); `DEFINITION=NODES` resolved; `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
-| `*DISTRIBUTION` | passed (solid-section only) | shells not supported by ccx |
+| `*DISTRIBUTION` (per-element orientation) | solids: resolved per element; shells/membranes: one `*ORIENTATION` + section per direction | ccx 2.23 honours a distribution only under `*SOLID SECTION` (default line first, rotation line on the first line only, origin ignored) and gives a shell section its first line; one distribution per orientation; other distributions commented |
 | `*BEAM SECTION, SECTION=CIRC` | radius `r` → diameters `2r, 2r`; 2-node beams → `B32`/`B32R` | ccx reads an ellipse's axis lengths; ccx 2.23 rejects linear beams with a circular section, so each gets a midside node (BCs, temperatures and initial conditions on both end nodes reach it) |
 | `*BEAM SECTION, SECTION=PIPE/BOX/THICK PIPE` | data unchanged, `THICK PIPE` → `PIPE`; beams → `B32R` | both codes read the data alike (outer radius, wall; `a, b, t1..t4`); ccx 2.23 runs these sections only on `B32R`, so 2-node beams get a midside node as for `CIRC` and `B32` only changes type |
 | `*SHELL SECTION, COMPOSITE` | S6/S8R; synth `*ORIENTATION` per ply angle | no inline ply angle in ccx; `SYMMETRIC` layups mirrored; on continuum shells (SC8R) → `*SOLID SECTION` |
@@ -367,7 +373,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
   node-to-surface; some decks converge in ccx only with `TYPE=SURFACE TO SURFACE` instead.
 * Assembly flattening is best-effort. Part-level constraints (`*EQUATION`, `*MPC`,
   `*RIGID BODY`, `*COUPLING`, …) are copied per instance; rotated instances rotate
-  `*ORIENTATION` axes, beam `n1` and `*NORMAL`, but not `*DISTRIBUTION` tables.
+  `*ORIENTATION` axes (also per-element `*DISTRIBUTION` axes), beam `n1` and `*NORMAL`.
 * Rigid couplings (`*KINEMATIC`, `*RIGID BODY`) on **shell/beam nodes** are rejected by
   ccx 2.23 (FreeCAD 1.1 build: `*ERROR in gen3dmpc … RIGID MPC`) unless the node is a
   ccx *knot*. The converter attaches a short force-free beam (elset `ABQ2CCX_KNOT`, no
@@ -385,7 +391,13 @@ converter warns about the ones it can detect; the rest are here so you know to c
   beam slightly where it bends (0.3–1.3 % with a knot inside a span), which adds up when
   most nodes carry such a BC (warned). Not repaired in a deck with an explicit dynamic step
   (ccx stops on the knot beams; warned).
-* `*DISTRIBUTION` / variable-angle-tow orientation is solid-section-only in ccx.
+* `*DISTRIBUTION` / variable-angle-tow orientations: ccx 2.23 applies them per element
+  only under `*SOLID SECTION`, so the converter splits shell and membrane sections into
+  one plain `*ORIENTATION` and section per distinct direction (validated against the same
+  models written per element). A distribution that is not an orientation (Abaqus shell
+  thickness or material-property distributions) has no ccx equivalent and is commented
+  out; when a distribution's `INPUT=` file is missing, its `*ORIENTATION` is commented out
+  too, so ccx stops at the sections that use it rather than run them in global axes.
 * Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
 * The converter validates *structure*, not *physics*. Run `ccx` and sanity-check.

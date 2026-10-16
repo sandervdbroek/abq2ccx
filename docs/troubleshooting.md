@@ -47,6 +47,25 @@ itself is not the cause — it is verified identical to Abaqus.)
 rejected, and `S8` (full integration) is not `S8R`. A linear-shell composite mesh
 can't be relabelled (node counts differ); it must be re-meshed with quadratic shells.
 
+### `*ERROR reading *ORIENTATION: distribution … has not been defined`, or spooles reports `matrix found to be singular`
+
+Both come from per-element orientations given by a `*DISTRIBUTION` (Abaqus discrete
+orientations, variable-angle-tow layups) when the ccx deck is written by hand. The
+converter's output avoids both:
+
+* ccx gives a distribution to the **first** `*ORIENTATION` that names it, so a second
+  `*ORIENTATION` naming the same distribution stops with "has not been defined". Give
+  each orientation its own copy of the distribution (the converter does).
+* ccx first tries to read the orientation's data line as a number, so a distribution
+  named like one — `D1`, `E5`, `Q1`, `12`, `1.5` — silently turns the orientation into an
+  all-zero one, and the solver then finds the stiffness matrix singular. Rename the
+  distribution (the converter does).
+* When the converter comments an `*ORIENTATION` out because its distribution has **no
+  data lines** — typically an `INPUT=` file (a TexGen `.ori` file, say) that is not next
+  to the deck — ccx then stops at the section with "nonexistent orientation". Copy the
+  file alongside the deck and convert again; without it the per-element directions are
+  simply unknown.
+
 ### "Job killed without any error"
 
 Usually out of memory. Big models need a lot of RAM (rule of thumb from the forum:
@@ -78,6 +97,16 @@ These are the silent ones — no error, wrong physics.
   material now runs elastic.
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=` and would use the
   first table row; the converter keeps the Abaqus no-field state (field = 0) and warns.
+* **Per-element (`*DISTRIBUTION`) orientations quietly collapse to one.** ccx 2.23 gives
+  each element its own distribution line only under `*SOLID SECTION`; there the elements
+  it does not list get the *first* line, the `*ORIENTATION`'s additional-rotation line
+  turns only the first line, and an origin given after `a, b` is ignored. Under a
+  `*SHELL SECTION` — plain or `COMPOSITE` — or a `*MEMBRANE SECTION`, every element gets
+  the first line. The
+  converter therefore writes, for solids, one resolved line per element (default line
+  first, the rotation and the origin already applied to the axes, no rotation line) and,
+  for shells and membranes, one plain `*ORIENTATION` and section per distinct direction.
+  If you edit the converted deck, keep that form.
 * **A rigid body's reference point ignores rotations.** ccx carries a `*RIGID BODY`'s
   rotations on DOFs 1–3 of a separate `ROT NODE` and silently ignores BCs and moments on
   DOFs 4–6 of the `REF NODE` (a moment there does nothing). The converter adds an explicit

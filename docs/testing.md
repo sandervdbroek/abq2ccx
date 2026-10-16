@@ -21,7 +21,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (138)
+## 1. Unit tests — `tests/test_convert.py` (147)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -166,6 +166,15 @@ conversion behaviour and referential integrity.
 | `test_circ_beam_partial_rotation_bc_gets_knot_beam` | an element end node of a `CIRC` beam whose rotational BCs hold only some rotations (DOFs 1–4 at a pinned end, `XSYMM`), or a nonzero one (a prescribed rotation, even with all three given), gets a force-free knot beam (ccx 2.23 would lock its other rotations); the BC lines are kept; none for full zero clamps, `RECT` beams or a BC on a 3-node element's middle node |
 | `test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes` | a later `*BOUNDARY, OP=NEW` step that leaves only some rotations held gets knots; none on a node with a `*TRANSFORM` nor in a heat-transfer-only deck; an explicit dynamic step is warned instead (it stops on the knot beams); knots on most end nodes are warned (their rigid sections stiffen the beam) |
 | `test_circ_rotation_bc_examples` | the bundled `beam_circ_rotation_bcs` deck gets knot beams at the two pinned ends whose twist is held and at the turned tip, none at the clamp; `planar_pinned_circ_beam` holds its twist at the first element's middle node, no knots; no dangling refs |
+| `test_distribution_solid_lines_resolved_for_ccx` | a `*DISTRIBUTION` orientation on a `*SOLID SECTION`: default line first, an element-set label expanded, a later line winning, the origin subtracted and the `*ORIENTATION`'s rotation applied to the axes (no rotation line left), `*DISTRIBUTION TABLE` dropped; untouched lines keep their tokens |
+| `test_distribution_name_ccx_reads_as_number` | names ccx 2.23 reads as numbers on an `*ORIENTATION` data line (`D1`, `E-3`, `Q1`, `1+2`, `12`, `.`, `INF`, 20 leading digits) are detected and the emitted distribution renamed; `E`, `D`, `1E`, `D_1` are left alone |
+| `test_distribution_named_by_two_orientations_gets_two_copies` | two `*ORIENTATION`s naming one distribution get a copy each, listing only their own sections' elements |
+| `test_distribution_flattened_per_instance` | a part's distribution per instance: its name and the orientation's reference to it prefixed, element labels offset, axes turned with a rotated instance |
+| `test_composite_ply_orientation_named_per_instance` | a composite ply line naming one of the part's orientations names the instance's copy; a ply angle is kept |
+| `test_distribution_shell_section_split_per_direction` | a shell section on a distribution orientation → one element set, plain `*ORIENTATION` and section per direction; composite plies: an angle turns the group's axes, a ply may name a distribution orientation of its own |
+| `test_distribution_without_data_comments_out_its_orientation` | a distribution with no data (missing `INPUT=` file): its orientation is commented out with the reason |
+| `test_distribution_not_named_by_an_orientation_commented` | a distribution no `*ORIENTATION` names (a shell-thickness/material distribution in Abaqus) is commented out |
+| `test_distribution_plate_examples` | the `distribution_*_plate` validation pairs: one resolved distribution per instance (default + 10 elements), the S8R panel split into 16 sections, the explicit decks free of distributions; no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -211,6 +220,17 @@ deck and runs it in CalculiX:
   163.28 Hz vs 40.62 and 162.49 Hz (0.5 %), buckling load 16239 vs 16278 (0.2 %). At an end
   node the twist BC would lock the bending rotation as well (f1 1.46-fold, buckling load
   1.88-fold); with none, ccx reports a 0 Hz twist mode and a buckling factor of 0.0001.
+* **`distribution_solid_plate`** vs **`distribution_solid_plate_explicit`**, and
+  **`distribution_shell_plate`** vs **`distribution_shell_plate_explicit`** — per-element
+  fibre angles from a `*DISTRIBUTION`, as in a variable-angle-tow layup, against the same
+  model written with one `*ORIENTATION` and one section per element (a form ccx runs
+  unchanged). The `C3D8` plate has two instances (one translated and rotated about an
+  inclined axis), a default line, an element-set line and a 10° additional rotation; the
+  composite `S8R` panel is a rotated instance whose plies follow +θ and −θ paths from two
+  distributions, one ply at 90° to the section orientation. Every node's displacement must
+  agree within 1e-6 of max |u| (they agree to 3e-11 and exactly). Converted without the
+  rotation built into the axes, the plate misses by 21 %; with the shell section left to
+  ccx's own distribution handling, the panel misses by 62 %.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -390,6 +410,34 @@ without the knot beams); an explicit step stops on the density-free knot beams
 returned NaN displacements for `CIRC` beams with no rotational BC at all. No corpus deck has
 such a BC, and every corpus deck converts byte-identically; `validate_with_ccx.py` checks
 both 3-D cases and the planar beam against beam theory.
+
+**Per-element (`*DISTRIBUTION`) orientations.** Abaqus gives each element its own material
+axes through a `*DISTRIBUTION` that an `*ORIENTATION` names (CAE discrete orientations,
+TexGen yarn directions, variable-angle-tow layups). ccx 2.23 has the feature, but probing
+it with small decks — a free cube with orthotropic thermal expansion strains along its
+material axes, so each element's axes can be read off its displacements — and reading its
+distribution, orientation and section readers showed that it implements only part of it:
+each distribution line becomes an orientation of its own, which `*SOLID SECTION` hands to
+its element (the elements a distribution does not list get its first line); the
+`*ORIENTATION` naming the distribution takes all its lines, so a second one naming it stops
+ccx; a name ccx can read as a number (`D1`, `E5`, `12`) silently gives an all-zero
+orientation and a singular stiffness matrix; an origin after `a, b` is ignored; an
+additional-rotation line turns only the first line (each later one gets the angle converted
+to radians again); and `*SHELL SECTION`, plain or composite, gives every element the first
+line, so its results equal those of one uniform orientation. The converter used to pass the
+distribution through, renamed per instance while the `*ORIENTATION` kept the old name (and
+ccx stopped: "distribution … has not been defined"), with element labels not offset and axes
+not turned with a rotated instance; composite plies synthesized from a distribution
+orientation used a fixed x-y frame. Each orientation now gets its own distribution, resolved
+to one line per element of its solid sections, and each shell or membrane section using one
+is split per direction; `validate_with_ccx.py` checks both against the per-element form. The
+same work fixed composite ply lines that name an orientation inside a part: they kept the
+part-level name after flattening. Of the seven corpus decks with a distribution
+orientation, none starts solving — they now get past the distribution and stop on what
+remains: the five TexGen decks' distribution data lives in `.ori` files not in the corpus,
+`shridharbailkeri_solid_plate_cfrp` has a composite section on continuum shells (no layered
+solid section in ccx) and a HASHIN damage criterion ccx rejects, and
+`vineethravi2310_tensile` has a UMAT and a composite solid section.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

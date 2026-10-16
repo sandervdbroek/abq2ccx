@@ -1,0 +1,203 @@
+*Heading
+Per-element fibre angles written as one *Orientation per element, C3D8 plate
+** Reference for distribution_solid_plate.inp: the same model with one *Orientation and
+** one *Solid Section per element (ccx runs this form unchanged).
+**
+** PARTS
+**
+*Part, name=PLATE
+*Node
+   1,  0.0,  0.0,  0.0
+   2,  1.0,  0.0,  0.0
+   3,  2.0,  0.0,  0.0
+   4,  3.0,  0.0,  0.0
+   5,  4.0,  0.0,  0.0
+   6,  5.0,  0.0,  0.0
+   7,  6.0,  0.0,  0.0
+   8,  0.0,  1.0,  0.0
+   9,  1.0,  1.0,  0.0
+  10,  2.0,  1.0,  0.0
+  11,  3.0,  1.0,  0.0
+  12,  4.0,  1.0,  0.0
+  13,  5.0,  1.0,  0.0
+  14,  6.0,  1.0,  0.0
+  15,  0.0,  2.0,  0.0
+  16,  1.0,  2.0,  0.0
+  17,  2.0,  2.0,  0.0
+  18,  3.0,  2.0,  0.0
+  19,  4.0,  2.0,  0.0
+  20,  5.0,  2.0,  0.0
+  21,  6.0,  2.0,  0.0
+  22,  0.0,  0.0,  0.5
+  23,  1.0,  0.0,  0.5
+  24,  2.0,  0.0,  0.5
+  25,  3.0,  0.0,  0.5
+  26,  4.0,  0.0,  0.5
+  27,  5.0,  0.0,  0.5
+  28,  6.0,  0.0,  0.5
+  29,  0.0,  1.0,  0.5
+  30,  1.0,  1.0,  0.5
+  31,  2.0,  1.0,  0.5
+  32,  3.0,  1.0,  0.5
+  33,  4.0,  1.0,  0.5
+  34,  5.0,  1.0,  0.5
+  35,  6.0,  1.0,  0.5
+  36,  0.0,  2.0,  0.5
+  37,  1.0,  2.0,  0.5
+  38,  2.0,  2.0,  0.5
+  39,  3.0,  2.0,  0.5
+  40,  4.0,  2.0,  0.5
+  41,  5.0,  2.0,  0.5
+  42,  6.0,  2.0,  0.5
+*Element, type=C3D8
+  1,   1,   2,   9,   8,  22,  23,  30,  29
+  2,   2,   3,  10,   9,  23,  24,  31,  30
+  3,   3,   4,  11,  10,  24,  25,  32,  31
+  4,   4,   5,  12,  11,  25,  26,  33,  32
+  5,   5,   6,  13,  12,  26,  27,  34,  33
+  6,   6,   7,  14,  13,  27,  28,  35,  34
+  7,   8,   9,  16,  15,  29,  30,  37,  36
+  8,   9,  10,  17,  16,  30,  31,  38,  37
+  9,  10,  11,  18,  17,  31,  32,  39,  38
+ 10,  11,  12,  19,  18,  32,  33,  40,  39
+ 11,  12,  13,  20,  19,  33,  34,  41,  40
+ 12,  13,  14,  21,  20,  34,  35,  42,  41
+*Nset, nset=FIX
+1, 8, 15, 22, 29, 36
+*Nset, nset=TIP
+7, 14, 21, 28, 35, 42
+*Elset, elset=ALL, generate
+1, 12, 1
+*Elset, elset=MIDSET
+9, 10
+*Elset, elset=E1
+1
+*Orientation, name=ORI-E1
+1, 0, 0, -0, 1, 0
+3, 10.
+*Solid Section, elset=E1, orientation=ORI-E1, material=CFRP
+,
+*Elset, elset=E2
+2
+*Orientation, name=ORI-E2
+0.965925826289, 0.258819045103, 0, -0.258819045103, 0.965925826289, 0
+3, 10.
+*Solid Section, elset=E2, orientation=ORI-E2, material=CFRP
+,
+*Elset, elset=E3
+3
+*Orientation, name=ORI-E3
+0.866025403784, 0.5, 0, -0.5, 0.866025403784, 0
+3, 10.
+*Solid Section, elset=E3, orientation=ORI-E3, material=CFRP
+,
+*Elset, elset=E4
+4
+*Orientation, name=ORI-E4
+0.707106781187, 0.707106781187, 0, -0.707106781187, 0.707106781187, 0
+3, 10.
+*Solid Section, elset=E4, orientation=ORI-E4, material=CFRP
+,
+*Elset, elset=E5
+5
+*Orientation, name=ORI-E5
+0.5, 0.866025403784, 0, -0.866025403784, 0.5, 0
+3, 10.
+*Solid Section, elset=E5, orientation=ORI-E5, material=CFRP
+,
+*Elset, elset=E6
+6
+*Orientation, name=ORI-E6
+0.258819045103, 0.965925826289, 0, -0.965925826289, 0.258819045103, 0
+3, 10.
+*Solid Section, elset=E6, orientation=ORI-E6, material=CFRP
+,
+*Elset, elset=E7
+7
+*Orientation, name=ORI-E7
+0.996194698092, 0.0871557427477, 0, -0.0871557427477, 0.996194698092, 0
+3, 10.
+*Solid Section, elset=E7, orientation=ORI-E7, material=CFRP
+,
+*Elset, elset=E8
+8
+*Orientation, name=ORI-E8
+0.939692620786, 0.342020143326, 0, -0.342020143326, 0.939692620786, 0
+3, 10.
+*Solid Section, elset=E8, orientation=ORI-E8, material=CFRP
+,
+*Elset, elset=E9
+9
+*Orientation, name=ORI-E9
+0.819152044289, 0.573576436351, 0, -0.573576436351, 0.819152044289, 0
+3, 10.
+*Solid Section, elset=E9, orientation=ORI-E9, material=CFRP
+,
+*Elset, elset=E10
+10
+*Orientation, name=ORI-E10
+0.819152044289, 0.573576436351, 0, -0.573576436351, 0.819152044289, 0
+3, 10.
+*Solid Section, elset=E10, orientation=ORI-E10, material=CFRP
+,
+*Elset, elset=E11
+11
+*Orientation, name=ORI-E11
+0.642787609687, 0.766044443119, 0, -0.766044443119, 0.642787609687, 0
+3, 10.
+*Solid Section, elset=E11, orientation=ORI-E11, material=CFRP
+,
+*Elset, elset=E12
+12
+*Orientation, name=ORI-E12
+0.642787609687, 0.766044443119, 0, -0.766044443119, 0.642787609687, 0
+3, 10.
+*Solid Section, elset=E12, orientation=ORI-E12, material=CFRP
+,
+*End Part
+**
+** ASSEMBLY
+**
+*Assembly, name=Assembly
+**
+*Instance, name=PLATE-1, part=PLATE
+*End Instance
+**
+*Instance, name=PLATE-2, part=PLATE
+0., 4., 1.
+0., 4., 1., 1., 5., 2., 30.
+*End Instance
+**
+*Nset, nset=N1, instance=PLATE-1, generate
+1, 42, 1
+*Nset, nset=N2, instance=PLATE-2, generate
+1, 42, 1
+*End Assembly
+**
+** MATERIALS
+**
+*Material, name=CFRP
+*Elastic, type=ENGINEERING CONSTANTS
+140000., 9000., 9000., 0.3, 0.3, 0.45, 4600., 4600.
+3100.
+**
+** STEP: Load
+**
+*Step, name=Load, nlgeom=NO
+*Static
+1., 1., 1e-05, 1.
+*Boundary
+PLATE-1.FIX, ENCASTRE
+PLATE-2.FIX, ENCASTRE
+*Cload
+PLATE-1.TIP, 1, 20.
+PLATE-1.TIP, 2, 4.
+PLATE-1.TIP, 3, 1.
+PLATE-2.TIP, 1, 20.
+PLATE-2.TIP, 2, -3.
+PLATE-2.TIP, 3, 2.
+*Node Print, nset=N1
+U
+*Node Print, nset=N2
+U
+*End Step
