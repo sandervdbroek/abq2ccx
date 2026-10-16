@@ -22,7 +22,7 @@ How Abaqus field/history output identifiers map to CalculiX `*NODE FILE` / `*EL 
 
 ## Dropped — no CalculiX equivalent (derive in post-processing)
 
-`A`, `AENER`, `AREA`, `AT`, `CDISP`, `CELENT`, `CF`, `CFORCE`, `COORD`, `CSTRESS`, `CTF`, `DAMAGEC`, `DAMAGEFC`, `DAMAGEFT`, `DAMAGEMC`, `DAMAGEMT`, `DAMAGESHR`, `DAMAGET`, `DMICRT`, `ELEDEN`, `ELEN`, `EPDDEN`, `ESEDEN`, `EVF`, `EVOLAVG`, `IE`, `LODE`, `MISES`, `MMIXDME`, `NE`, `NFLUX`, `NFORC`, `PEEQVAVG`, `PEVAVG`, `PHILSM`, `PRESS`, `PSILSM`, `RBFOR`, `SDEG`, `SE`, `SF`, `SM`, `STATUS`, `STATUSXFEM`, `STH`, `SVAVG`, `TEMP`, `TRESC`, `TRIAX`, `VENER`
+`A`, `AENER`, `AREA`, `AT`, `CDISP`, `CELENT`, `CF`, `CFORCE`, `COORD`, `CSTRESS`, `CTF`, `DAMAGEC`, `DAMAGEFC`, `DAMAGEFT`, `DAMAGEMC`, `DAMAGEMT`, `DAMAGESHR`, `DAMAGET`, `DMICRT`, `DUCTCRT`, `ELEDEN`, `ELEN`, `EPDDEN`, `ESEDEN`, `EVF`, `EVOLAVG`, `IE`, `LODE`, `MISES`, `MMIXDME`, `NE`, `NFLUX`, `NFORC`, `PEEQVAVG`, `PEVAVG`, `PHILSM`, `PRESS`, `PSILSM`, `RBFOR`, `SDEG`, `SE`, `SF`, `SM`, `STATUS`, `STATUSXFEM`, `STH`, `SVAVG`, `TEMP`, `TRESC`, `TRIAX`, `VENER`
 
 ## Valid only on `*EL PRINT` / `*NODE PRINT` (.dat)
 

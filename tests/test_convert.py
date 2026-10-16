@@ -720,19 +720,144 @@ def test_named_bc_condition_on_instance_set():
     assert "I.FIX" not in body.upper()
 
 
-def test_damage_initiation_emitted_for_ccx223():
-    # ccx 2.23 added *DAMAGE INITIATION: it is now emitted (pass-through, with its data),
-    # while *DAMAGE EVOLUTION (still not in ccx) stays commented out.
-    deck = ("*Material, name=m\n*Elastic\n210000., 0.3\n"
-            "*Damage Initiation, criterion=DUCTILE\n0.1, 0.0, 0.0\n"
-            "*Damage Evolution, type=DISPLACEMENT\n0.001,\n")
-    body, _, _ = convert_str(deck)
+JC_MATERIAL = ("*Material, name=TI\n*Elastic\n110000., 0.3\n*Plastic\n900., 0.\n1100., 1.\n"
+               "*Damage Initiation, criterion=JOHNSON COOK\n"
+               "-0.09, 0.25, 0.5, 0.014, 3.87, 1878., 293., 1.\n")
+JC_STEP = "*Solid Section, elset=EALL, material=TI\n*Step, nlgeom\n*Static\n0.1, 1.\n*End Step\n"
+
+
+def test_damage_initiation_criteria_ccx_cannot_run_are_commented():
+    # ccx 2.23 knows RICE TRACEY and JOHNSON COOK only and stops on any other criterion.
+    # Without *DAMAGE EVOLUTION Abaqus only evaluates the criterion (output), so commenting
+    # it out is exact (a note); with one, the evolution is lost anyway (a warning).
+    # (a section uses the material: the cards of a material nothing uses change nothing)
+    plain = HEX + ("*Material, name=m\n*Elastic\n210000., 0.3\n"
+                   "*Damage Initiation, criterion=DUCTILE\n0.1, 0.0, 0.0\n")
+    section = "*Solid Section, elset=EALL, material=m\n"
+    body, _, rep = convert_str(plain + section)
+    di = [l for l in body.splitlines() if "DAMAGE INITIATION" in l.upper()]
+    assert di and all(l.lstrip().startswith("**") for l in di)
+    assert any(lvl == "NOTE" and "CRITERION=DUCTILE (material m)" in m and "only that output"
+               in m for lvl, m in rep.entries)
+    body, _, rep = convert_str(plain + "*Damage Evolution, type=DISPLACEMENT\n0.001,\n" + section)
+    assert all(l.lstrip().startswith("**") for l in body.splitlines() if "DAMAGE" in l.upper())
+    assert any(lvl == "WARNING" and "CRITERION=DUCTILE" in m and "*DAMAGE EVOLUTION" in m
+               for lvl, m in rep.entries)
+
+
+def test_damage_initiation_johnson_cook_kept_with_ccx_second_line():
+    # Abaqus' Johnson-Cook data (d1-d5, melting and transition temperature, reference strain
+    # rate) are ccx's first line; ccx wants a second, the damage at which it deletes the
+    # element (which crashes 2.23): 1E30 keeps the criterion an output, as in Abaqus.
+    body, _, rep = convert_str(HEX + JC_MATERIAL + JC_STEP)
     lines = body.splitlines()
-    i = next((k for k, l in enumerate(lines) if l.upper().startswith("*DAMAGE INITIATION")), None)
-    assert i is not None, "expected *DAMAGE INITIATION emitted as a real card"
-    assert lines[i + 1].strip().startswith("0.1")          # its data row survives
-    de = [l for l in lines if "DAMAGE EVOLUTION" in l.upper()]
-    assert de and all(l.lstrip().startswith("**") for l in de)  # evolution commented out
+    i = lines.index("*DAMAGE INITIATION, CRITERION=JOHNSON COOK")
+    assert lines[i + 1] == "-0.09, 0.25, 0.5, 0.014, 3.87, 1878., 293., 1."
+    assert lines[i + 2] == "1.E30"
+    assert any("1E30 there keeps every element" in m for _, m in rep.entries)
+    # without temperature dependence (d5 = 0, temperatures blank) ccx still wants the melting
+    # temperature above the transition one
+    body, _, _ = convert_str(HEX + JC_MATERIAL.replace("3.87, 1878., 293., 1.", "0., , , 1.")
+                             + JC_STEP)
+    assert "-0.09, 0.25, 0.5, 0.014, 0., 1., 0., 1." in body.splitlines()
+    # an output request for Abaqus' Johnson-Cook criterion reads ccx's indicator
+    body, _, _ = convert_str(HEX + JC_MATERIAL + JC_STEP.replace(
+        "*End Step", "*El Print, elset=EALL\nPEEQ, JCCRT\n*End Step"))
+    assert "PEEQ, DUCT" in body.splitlines()
+
+
+def test_damage_initiation_johnson_cook_commented_where_ccx_misreads_it():
+    def kept(deck):
+        return "*DAMAGE INITIATION, CRITERION=JOHNSON COOK" in convert_str(deck)[0].splitlines()
+    assert kept(HEX + JC_MATERIAL + JC_STEP)
+    # ccx 2.23 gives every *DAMAGE INITIATION card to the deck's last *MATERIAL (probed)
+    other = "*Material, name=STEEL\n*Elastic\n210000., 0.3\n"
+    assert kept(HEX + other + JC_MATERIAL + JC_STEP)
+    assert not kept(HEX + JC_MATERIAL + other + JC_STEP)
+    _, _, rep = convert_str(HEX + JC_MATERIAL + other + JC_STEP)
+    assert any("deck's last *MATERIAL (STEEL)" in m for _, m in rep.entries)
+    # ... evaluates it only for a plastic material, in nonlinear *STATIC / *DYNAMIC steps
+    assert not kept(HEX + JC_MATERIAL.replace("*Plastic\n900., 0.\n1100., 1.\n", "") + JC_STEP)
+    assert not kept(HEX + JC_MATERIAL + JC_STEP + "*Step\n*Frequency\n5\n*End Step\n")
+    assert not kept(HEX + JC_MATERIAL + JC_STEP.replace("*Step, nlgeom", "*Step, perturbation"))
+    assert not kept(HEX + JC_MATERIAL)                                   # no step at all
+    # ... and reads one card: of two Johnson-Cook cards the later one is kept
+    body, _, _ = convert_str(HEX + JC_MATERIAL + "*Damage Initiation, criterion=JOHNSON COOK\n"
+                                                 "0.2, 0., 0., 0., 0., 1000., 20., 1.\n" + JC_STEP)
+    live = [l for l in body.splitlines() if not l.startswith("**")]
+    assert live.count("*DAMAGE INITIATION, CRITERION=JOHNSON COOK") == 1
+    assert "0.2, 0., 0., 0., 0., 1000., 20., 1." in live
+
+
+def test_elastic_young_modulus_only_gets_zero_poisson():
+    # Abaqus reads an omitted Poisson's ratio as 0; ccx stops: 'not enough constants'
+    body, _, _ = convert_str("*Material, name=m\n*Elastic\n 3e+07, \n")
+    assert "*ELASTIC\n3e+07, 0." in body
+    body, _, _ = convert_str("*Material, name=m\n*Elastic\n3e+07, , 20.\n4e+07\n")
+    assert "*ELASTIC\n3e+07, , 20.\n4e+07, 0." in body
+
+
+def test_traction_elastic_of_unused_material_commented():
+    # a cohesive traction-separation stiffness: ccx reads it as isotropic E, nu and stops
+    deck = (HEX + "*Material, name=STEEL\n*Elastic\n210000., 0.3\n*Material, name=GLUE\n"
+            "*Elastic, type=TRACTION\n8.5e+11, 8.5e+11, 8.5e+11\n"
+            "*Solid Section, elset=EALL, material=STEEL\n")
+    body, _, rep = convert_str(deck)
+    assert "** *ELASTIC, TYPE=TRACTION" in body and "\n*ELASTIC, TYPE=TRACTION" not in body
+    assert any(lvl == "NOTE" and "No section uses material GLUE" in m for lvl, m in rep.entries)
+    body, _, _ = convert_str(deck.replace("material=STEEL\n", "material=GLUE\n"))
+    assert "\n*ELASTIC, TYPE=TRACTION" in body          # used: left for the cohesive warning
+
+
+def test_boundary_on_inactive_unknown_dof_dropped():
+    # DOF 9 (electric potential) exists only on piezoelectric / electrical elements (and user
+    # elements); elsewhere Abaqus ignores the BC, while ccx stops: 'unknown DOF'
+    deck = HEX + ("*Nset, nset=TOP\n5,6,7,8\n*Step\n*Static\n*Boundary\nTOP, 9, 9, 500.\n"
+                  "TOP, 1, 9\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "TOP, 9, 9" not in body and "TOP, 1, 6\nTOP, 8, 8" in body
+    assert any("DOF 9 (electric potential) dropped" in m for _, m in rep.entries)
+    body, _, _ = convert_str(deck.replace("TYPE=C3D8", "TYPE=C3D8E"))
+    assert "TOP, 9, 9, 500." in body
+
+
+def test_inactive_dof_lines_leave_no_empty_or_split_card():
+    # the default-amplitude planner sees a card's lines as handle_boundary keeps them: a line
+    # on a DOF no element has neither splits the ramped card nor leaves an empty one behind
+    mat = ("*Material, name=m\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, elset=EALL, "
+           "material=m\n*Nset, nset=TOP\n5,6,7,8\n*Nset, nset=BOT\n1,2,3,4\n*Boundary\nBOT, 1, 3\n")
+    body, _, _ = convert_str(HEX + mat + "*Step\n*Dynamic\n0.1, 1.\n*Boundary\nTOP, 3, 3, 0.1\n"
+                                         "TOP, 9, 9, 5.\nTOP, 1, 1, 0.01\n*End Step\n")
+    step = body[body.index("*DYNAMIC"):]
+    assert "*BOUNDARY, AMPLITUDE=RAMP12357111317\nTOP, 3, 3, 0.1\nTOP, 1, 1, 0.01\n*NODE FILE" in step
+    body, _, _ = convert_str(HEX + mat + "*Step\n*Dynamic, Explicit\n, 1.\n*Boundary\nTOP, 3, 3, 0.1\n"
+                                         "TOP, 9, 9, 5.\n*End Step\n")
+    assert "*BOUNDARY\nTOP, 3, 3\n*NODE FILE" in body
+    body, _, _ = convert_str(HEX + mat + "*Step\n*Static\n*Boundary\nTOP, 9, 9, 5.\n*Cload\nTOP, 3, 1.\n"
+                                         "*End Step\n")
+    step = body[body.index("*STATIC"):]
+    assert "*BOUNDARY" not in step                        # the card had nothing else
+    body, _, _ = convert_str(HEX + mat + "*Step\n*Static\n*Boundary, op=NEW\nTOP, 9, 9, 5.\n*End Step\n")
+    assert "*BOUNDARY, OP=NEW\n" in body                  # but OP=NEW still removes BOT's BC
+
+
+def test_rotation_bc_on_truss_nodes_dropped():
+    # truss nodes have no rotations: Abaqus ignores XASYMM's DOF 4 there, ccx stops in gen3dboun
+    deck = ("*Node\n1, 0., 0.\n2, 1., 1.\n3, 2., 0.\n*Element, type=T2D2, elset=T\n1, 1, 2\n2, 2, 3\n"
+            "*Material, name=m\n*Elastic\n1., 0.3\n*Solid Section, elset=T, material=m\n1.\n"
+            "*Boundary\n3, XASYMM\n1, PINNED\n*Step\n*Static\n*Cload\n2, 2, -1.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "3, 2, 3" in body and "3, 4, 4" not in body
+    assert any("only belong to truss elements" in m for _, m in rep.entries)
+
+
+def test_shell_offset_labels_become_numbers():
+    # ccx takes OFFSET only as a number; Abaqus' SPOS / SNEG are 0.5 / -0.5 in both codes
+    shell = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n*Element, type=S4R, elset=P\n1,1,2,3,4\n"
+             "*Material, name=m\n*Elastic\n1., 0.3\n")
+    for label, value in (("SNEG", "-0.5"), ("spos", "0.5")):
+        body, _, _ = convert_str(shell + f"*Shell Section, elset=P, material=m, offset={label}\n1.\n")
+        assert f"*SHELL SECTION, ELSET=P, MATERIAL=m, OFFSET={value}" in body
 
 
 def test_new_abaqus_keywords_targeted_guidance():
@@ -5809,6 +5934,20 @@ def test_reduced_physics_record():
                                                                     "hourglass=ENHANCED"))
     assert conv.reduced_physics == ["*SECTION CONTROLS (HOURGLASS=ENHANCED on C3D8R)"]
 
+
+
+def test_commented_card_of_an_unused_material_is_no_reduced_physics():
+    # a material no section uses changes nothing: its commented cards are notes, not reduced
+    # physics; the same cards in the material a section uses are
+    used = HEX + ("*Material, name=M\n*Elastic\n1000., 0.3\n*Damage Evolution, type=ENERGY\n1.\n"
+                  "*Solid Section, elset=EALL, material=M\n")
+    unused = HEX + ("*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
+                    "*Material, name=COH\n*Elastic\n1000., 0.3\n*Damage Evolution, type=ENERGY\n1.\n")
+    step = "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n"
+    _, conv, _ = convert_str(used + step)
+    assert conv.reduced_physics == ["*DAMAGE EVOLUTION"]
+    _, conv, rep = convert_str(unused + step)
+    assert conv.reduced_physics == [] and "No section uses material COH" in rep.text()
 
 def test_node_system_cylindrical_and_spherical():
     # Abaqus *NODE, SYSTEM=C gives R, theta (degrees), Z; SYSTEM=S gives R, theta, phi with phi

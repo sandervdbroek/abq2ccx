@@ -67,10 +67,16 @@ without an error. A full audit and the work that followed:
   contact output.
 * **Crash guards** — step data outside a step, undefined materials, rotational DOFs on plane
   nodes and other inputs that crash ccx 2.23 are commented, warned or dropped.
+* **First ccx errors of non-solving decks** — `*DAMAGE INITIATION` in the form ccx 2.23
+  reads (Johnson-Cook kept as an output-only criterion, other criteria commented);
+  Poisson's ratio 0 on E-only `*ELASTIC` lines; unused cohesive `TYPE=TRACTION`
+  elasticity commented; BCs on DOFs a node does not have (truss rotations, DOFs 7
+  and 9) dropped; `OFFSET=SPOS`/`SNEG` as numbers; the source-deck faults among the
+  rest named in the corpus notes.
 
-Corpus: 160 decks solve their own problem; 28 more solve with reduced physics, 14 load
+Corpus: 165 decks solve their own problem; 28 more solve with reduced physics, 14 load
 nothing (3 both) and one drifts to a solution that is not the deck's; 219 mesh-only decks are
-accepted, 603 need what ccx cannot run.
+accepted, 598 need what ccx cannot run.
 
 ## 1.1.0 (July 2026)
 

@@ -30,13 +30,14 @@ They cover:
   count) and which of them are exact, `CPS4I`/`CPE4I` as `C3D8I` slabs and when they fall
   back, beam upgrades for circular, pipe and box sections, the planar constraint, surface
   elements, composite and continuum shells, `*SECTION CONTROLS`.
-* **Materials** — elastic types, the expansion rewrites, plasticity forms, field
-  dependencies, creep, `*DEPVAR`.
+* **Materials** — elastic types (an E-only line, cohesive traction elasticity), the
+  expansion rewrites, plasticity forms, `*DAMAGE INITIATION` (the Johnson-Cook form ccx
+  reads, other criteria commented), field dependencies, creep, `*DEPVAR`.
 * **Constraints** — `*MPC`, couplings and rigid bodies, knot beams, overconstraint
   settling, connectors, `*TRANSFORM`s.
 * **Loads, BCs and steps** — consistent nodal forces, the load audit, surface-element
   loads, shell and membrane pressure on `SPOS`/`SNEG` sides, velocity and acceleration BCs,
-  the default amplitude of displacement BCs, `OP=NEW`, `*BUCKLE` load cases, temperatures, the masses of
+  the default amplitude of displacement BCs, BCs on DOFs a node does not have, `OP=NEW`, `*BUCKLE` load cases, temperatures, the masses of
   transient coupled steps, explicit defaults, Riks.
 * **Reduced physics** — the record of what a conversion drops or replaces
   (`Converter.reduced_physics`), and what does not count (exact substitutions, output
@@ -95,6 +96,7 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `shell_pressure_sides` | pressure on an `S8R` plate's `SPOS` side, its `SNEG` side, and element-based `P` | Navier, with the sign Abaqus gives each | 1.0 % |
 | `kinematic_all_dofs` | a bare `*KINEMATIC` (all DOFs) on a solid face under a force and two moments | the face under `*RIGID BODY` | exact |
 | `assembly_rotated_instances` | a turned instance with an oriented orthotropic material, instance-qualified loads, a surface pressure | the same model written flat by hand | exact (coordinates and displacements) |
+| `damage_johnson_cook_cubes` | a Johnson-Cook `*DAMAGE INITIATION`: ccx's indicator `DUCT` (from `JCCRT`) in uniaxial tension; the run with the card against the run without | PEEQ / (d1 + d2 e^(−d3/3)); identical results | 5e-7; exact |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`
@@ -142,26 +144,26 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1022 decks convert with no dangling
-reference. 200 are gated `expect_solve`: **160 solve the deck's own physics**; 14 are
+reference. 205 are gated `expect_solve`: **165 solve the deck's own physics**; 14 are
 `source_unloaded`, one is `solver_differs` (a snap-fit insert that only contact holds drifts
 out of its buckle) and 28 (3 of them also unloaded) are `reduced_physics` — concrete damaged
 plasticity (2), UHARD / VUHARD hardening (4), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
 `B32` (3), general contact (1), a dropped `*IMPERFECTION` (1). 219 mesh-only decks are
-accepted. The other 603 stop first on:
+accepted. The other 598 stop first on, or (the last row) run without, what they need:
 
 | Decks | First blocker |
 | ---: | --- |
 | 353 | a user material (UMAT/VUMAT) |
 | 66 | a user element (UEL) |
-| 46 | an incomplete or invalid source deck (undefined sets or materials, external parameters, CAE fragments) |
+| 50 | an incomplete or invalid source deck (undefined sets or materials, external parameters, CAE fragments) |
 | 34 | an explicit coupled temperature–displacement step (28), or `*MATRIX GENERATE` (6) |
-| 19 | a `*DAMAGE INITIATION` criterion ccx 2.23 rejects |
-| 24 | no convergence or divergence (17), or more than the gate's 300 s (7) |
+| 26 | no convergence or divergence (18), or more than the gate's 300 s (8) |
 | 16 | NLGEOM follower tractions (they convert with `--approximate`) |
-| 16 | other ccx errors, one or a few decks each |
-| 29 | an element type, beam section, user subroutine or physics ccx lacks (rigid, piezoelectric, infinite elements; I and general beam sections; cohesive, acoustic, pore-pressure models) |
+| 15 | other ccx errors, one or a few decks each |
+| 30 | an element type, beam section, user subroutine or physics ccx lacks (rigid, piezoelectric, infinite elements; I and general beam sections; cohesive, acoustic, pore-pressure models; composites on `S4R`) |
+| 8 | Abaqus general contact (7) or an XFEM crack (1): ccx has neither, and the converted deck runs without it — not the deck's physics, so not gated |
 
 Every one of them was checked to fail no worse than the original, unconverted deck. Fixing
 a first error often only exposes a second, fundamental one behind it, so the converter aims

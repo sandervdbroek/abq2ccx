@@ -43,9 +43,9 @@ print(result.report.summary())               # "N warning(s), M note(s), K comme
   nodal forces; connector elements become their kinematic constraints. A substitution that
   changes the element formulation (hybrid, modified or thin-shell elements run as ccx's
   plain ones) is flagged as reduced physics.
-* **Materials and orientations** — elastic types, plasticity (including Johnson-Cook),
-  thermal expansion, composite layups and per-element `*DISTRIBUTION` orientations
-  (variable-angle-tow layups).
+* **Materials and orientations** — elastic types, plasticity (including Johnson-Cook), the
+  Johnson-Cook damage initiation criterion ccx shares with Abaqus, thermal expansion,
+  composite layups and per-element `*DISTRIBUTION` orientations (variable-angle-tow layups).
 * **Constraints** — `*MPC`, kinematic couplings and rigid bodies (with *knot beams* where
   ccx 2.23 rejects rigid constraints on shell and beam nodes), and the overconstraints ccx
   rejects but Abaqus resolves.
@@ -96,10 +96,10 @@ prints one `PASS` line per check, about seventy in all; [testing](docs/testing.m
 A **corpus of 1022 genuine Abaqus decks** from about 180 public repositories (CAE exports,
 UMAT and UEL decks, explicit and coupled models, …) is fetched on demand and run through
 convert → integrity check → ccx. On ccx 2.23 all 1022 convert with no dangling reference;
-**160 solve the deck's own physics**; 40 more solve but stay out of that count — 14 load
+**165 solve the deck's own physics**; 40 more solve but stay out of that count — 14 load
 nothing in the source deck, 28 (3 of them also unloaded) solve a model with reduced physics,
 and one converges to a solution that is not the deck's (a part that only contact holds drifts
-away in ccx) — and 219 mesh-only decks are accepted. The other 603 need what ccx cannot run — mostly user
+away in ccx) — and 219 mesh-only decks are accepted. The other 598 need what ccx cannot run — mostly user
 materials (353) and user elements (66). See [testing](docs/testing.md).
 
 ## How it works
@@ -182,6 +182,7 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`shell_pressure_sides`](examples/shell_pressure_sides.inp) | `*DSLOAD P` on a shell's `SPOS` / `SNEG` side and an element-based `P` |
 | [`kinematic_all_dofs`](examples/kinematic_all_dofs.inp) | a bare `*Coupling` + `*Kinematic` (all DOFs) on a solid face, against `*RIGID BODY` |
 | [`assembly_rotated_instances`](examples/assembly_rotated_instances.inp), [`…_flat`](examples/assembly_rotated_instances_flat.inp) | a turned instance with an oriented orthotropic material, against the same model written flat |
+| [`damage_johnson_cook_cubes`](examples/damage_johnson_cook_cubes.inp) | a Johnson-Cook `*DAMAGE INITIATION` → ccx's form, reporting `DUCT` |
 | [`coverage_kitchen_sink`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped and commented cards, output-variable mapping |
 
 ## Tests

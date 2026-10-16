@@ -1485,10 +1485,6 @@ SEMANTIC_TRAP = {
 }
 # Supported by ccx but worth a heads-up about a behavioural/interface difference.
 PASS_WITH_NOTE = {
-    "DAMAGE INITIATION": "*DAMAGE INITIATION was added in ccx 2.23 and is emitted unchanged; ccx "
-                "implements a subset of Abaqus' damage-initiation criteria and has no *DAMAGE "
-                "EVOLUTION card, so verify your ccx version (>= 2.23), the CRITERION, and that "
-                "progressive damage is not required to soften/fail the material.",
     "USER MATERIAL": "*USER MATERIAL kept, but ccx uses its own umat interface (umat_*.f), not an "
                      "Abaqus UMAT binary — the subroutine must be ported.",
     "USER ELEMENT": "*USER ELEMENT kept; ensure the matching ccx user-element routine is built in.",
@@ -1583,7 +1579,8 @@ ABQ_DROP_VARS = {"MISES", "PRESS", "TRESC", "A", "NE", "IE", "CF", "NFORC", "COO
                  "AT", "SE", "SM", "SF", "ELEN", "NFLUX", "RBFOR", "CELENT", "EVF", "PEEQVAVG",
                  "PEVAVG", "SVAVG", "EVOLAVG", "TEMP", "STATUSXFEM", "PHILSM", "PSILSM", "DMICRT",
                  "SDEG", "DAMAGEC", "DAMAGET", "DAMAGEFT", "DAMAGEFC", "DAMAGEMT", "DAMAGEMC",
-                 "DAMAGESHR", "TRIAX", "LODE", "ESEDEN", "EPDDEN", "MMIXDME", "ELEDEN"}
+                 "DAMAGESHR", "TRIAX", "LODE", "ESEDEN", "EPDDEN", "MMIXDME", "ELEDEN",
+                 "DUCTCRT"}
 # Renamed / folded onto a ccx identifier.
 ABQ_MAP_VARS = {"LE": "E", "PE": "PEEQ", "PEMAG": "PEEQ", "CEEQ": "PEEQ", "EE": "ME",
                 "NE11": "E", "NT11": "NT", "UT": "U", "UR": "U", "RT": "RF", "RM": "RF"}
@@ -1604,7 +1601,7 @@ EL_PRINT_ONLY_VARS = {"ELSE", "ELKE", "EVOL", "CELS"}
 # *EL PRINT ('label not applicable or unknown') and a skipped token with a warning on the
 # other cards — so labels outside these sets are dropped.
 CCX_EL_PRINT_LABELS = {"S", "E", "ME", "EVOL", "EMAS", "COOR", "CENT", "ENER", "ELSE", "ELKE",
-                       "PEEQ", "SDV", "HFL", "SVF", "SF", "HFLF", "EBHE"}
+                       "PEEQ", "SDV", "HFL", "SVF", "SF", "HFLF", "EBHE", "DUCT"}
 CCX_NODE_PRINT_LABELS = {"U", "NT", "TS", "RF", "RFL", "PS", "PN", "MF", "V", "A", "VF", "PSF",
                          "TSF", "MACH", "DEPF", "TTF", "PTF", "CP", "TURB", "RECU"}
 CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", "MAXU", "V", "PS",
@@ -1612,7 +1609,7 @@ CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", 
                    "DEPT", "HCRI", "PRF", "POT", "SEN", "A", "S", "E", "PEEQ", "SDV", "ENER",
                    "HFL", "HER", "ZZS", "ERR", "NOE", "PHS", "MAXS", "MAXE", "ME", "SF", "HFLF",
                    "SVF", "DEPF", "DTF", "ECD", "EMFE", "EMFB", "PCON", "SNEG", "SMID", "SPOS",
-                   "KEQ", "THE"}
+                   "KEQ", "THE", "DUCT"}
 # *CONTACT OUTPUT / *CONTACT FILE: ccx writes CDIS (opening/slip), CSTR (pressure/shear)
 # and CELS (contact energy); CDIS and CSTR switch on the same CONTACT block, all of COPEN,
 # CSLIP1/2, CPRESS and CSHEAR1/2 (probed on 2.23).  Only Abaqus names ccx itself recognises
@@ -1868,6 +1865,20 @@ ELASTIC_FOR_EXPANSION = {("ISO", "ORTHO"): "ENGINEERING CONSTANTS", ("ISO", "ANI
 # left as they are.
 INELASTIC_MATERIAL_CARDS = {"CREEP", "DEFORMATION PLASTICITY", "HYPERELASTIC", "HYPERFOAM",
                             "MOHR COULOMB", "USER MATERIAL"}
+
+# Abaqus material options: cards that belong to the *MATERIAL above them.  Commented out in a
+# material that no section or composite ply uses, such a card changes nothing in the analysis,
+# so it is no reduced physics (Converter._commented).
+MATERIAL_OPTION_CARDS = {
+    "BRITTLE CRACKING", "BRITTLE FAILURE", "BRITTLE SHEAR", "CAP PLASTICITY", "CLAY PLASTICITY",
+    "CONCRETE", "CONCRETE COMPRESSION DAMAGE", "CONCRETE COMPRESSION HARDENING",
+    "CONCRETE DAMAGED PLASTICITY", "CONCRETE TENSION DAMAGE", "CONCRETE TENSION STIFFENING",
+    "CONDUCTIVITY", "CREEP", "CRUSHABLE FOAM", "CYCLIC HARDENING", "DAMAGE EVOLUTION",
+    "DAMAGE INITIATION", "DAMAGE STABILIZATION", "DAMPING", "DENSITY", "DEPVAR",
+    "DRUCKER PRAGER", "ELASTIC", "EXPANSION", "HYPERELASTIC", "HYPERFOAM", "HYPOELASTIC",
+    "INELASTIC HEAT FRACTION", "MOHR COULOMB", "MULLINS EFFECT", "PLASTIC",
+    "POROUS METAL PLASTICITY", "POTENTIAL", "RATE DEPENDENT", "SPECIFIC HEAT", "SWELLING",
+    "USER DEFINED FIELD", "USER MATERIAL", "USER OUTPUT VARIABLES", "VISCOELASTIC"}
 
 
 def ortho_from_iso(e: float, nu: float) -> List[float]:
@@ -2473,9 +2484,11 @@ class Converter:
         self._synth_cache: Dict[Tuple[str, float], str] = {}
         # deck-wide facts filled in by _prescan (defaults keep handlers usable standalone)
         self._plane_only: set = set()
+        self._no_rot: set = set()                      # ... and of trusses: no rotations at all
         self._shell_nodes: set = set()
         self._beam_nodes: set = set()
         self._n_inactive_rot = 0
+        self._n_inactive_rot_truss = 0
         self._depvar_counts: set = set()
         self._fields_set = False
         self._n_steps = 0
@@ -2501,6 +2514,12 @@ class Converter:
         # its step (_plan_op_new_rotations)
         self._op_new_drop: Dict[int, bool] = {}
         self._jc_with_rate: set = set()
+        # id(material card) -> its material; the materials sections use; id(*DAMAGE
+        # INITIATION) -> (material, evolution follows, why commented or None) (_plan_material_cards)
+        self._card_material: Dict[int, str] = {}
+        self._used_materials: set = set()
+        self._damage_plan: Dict[int, Tuple[Optional[str], bool, Optional[str]]] = {}
+        self._jc_damage_kept = False
         # id(*EXPANSION, TYPE=ANISO) written as TYPE=ORTHO -> its material's name
         self._expansion_as_ortho: Dict[int, str] = {}
         # id(*ELASTIC) -> (TYPE of its material's ORTHO/ANISO *EXPANSION, material name)
@@ -3074,6 +3093,7 @@ class Converter:
             "BUCKLE": self.handle_buckle,
             "HEAT TRANSFER": self.handle_heat_transfer,
             "PLASTIC": self.handle_plastic,
+            "DAMAGE INITIATION": self.handle_damage_initiation,
             "DEPVAR": self.handle_depvar,
             "CYCLIC HARDENING": self.handle_cyclic_hardening,
             "HYPERELASTIC": self.handle_hyperelastic,
@@ -3168,8 +3188,14 @@ class Converter:
         """``b`` as comment lines, with ``msg`` reported.  A commented-out card is physics the
         Abaqus deck has and the ccx model lacks (reduced physics, named by the card or by
         ``reduces``) unless ``reduces`` is False: an output request, a numerical control, or a
-        card Abaqus itself would not apply (reported as a NOTE)."""
+        card Abaqus itself would not apply (reported as a NOTE).  So is a material option of a
+        material that no section or composite ply uses: it changes nothing in the analysis."""
         self.report.n_commented += 1
+        if reduces is not False and b.keyword in MATERIAL_OPTION_CARDS:
+            mat = self._card_material.get(id(b))
+            if mat and mat.upper() not in self._used_materials:
+                reduces = False
+                msg += f" No section uses material {mat}, so this changes nothing."
         if reduces is False:
             self.report.note(msg, once=True)
         else:
@@ -3428,6 +3454,151 @@ class Converter:
         data = self._collapse_dependencies(b, 2) if b.has("DEPENDENCIES") else None
         return [emit_keyword("PLASTIC", params)] + (data if data is not None else list(b.data))
 
+    def _plan_material_cards(self, blocks: List[Block]) -> None:
+        """Which material each material card belongs to (``_card_material``), the materials
+        a section or composite ply uses (``_used_materials``), and what handle_damage_
+        initiation does with each *DAMAGE INITIATION card: ``_damage_plan[id(card)] =
+        (material, evolution, why)`` — its material (None outside one), whether a *DAMAGE
+        EVOLUTION follows it, and why it is commented out (None: kept).
+
+        ccx 2.23 evaluates two criteria, RICE TRACEY (not an Abaqus one) and JOHNSON COOK,
+        and stops on any other ('criterion is not known').  Its Johnson-Cook criterion is
+        Abaqus' (calcdamage.f: d1-d5, melting and transition temperatures, reference strain
+        rate; the indicator sums the plastic strain increments over the strain at
+        initiation), but (probed on 2.23):
+        * the data take a second line, the indicator at which ccx deletes the element
+          (without it: 'damage definition is not complete'), and deleting one crashes 2.23;
+        * every *DAMAGE INITIATION card goes to the deck's last *MATERIAL, whichever
+          material it follows, and a later card overwrites an earlier one;
+        * ccx stops unless that material is plastic and every step is a nonlinear *STATIC
+          or *DYNAMIC step.
+        Without a *DAMAGE EVOLUTION Abaqus too only evaluates the criterion (output such as
+        JCCRT or DUCTCRT) and leaves the material as it is, so a criterion commented out
+        loses only that output; a *DAMAGE EVOLUTION is dropped anyway (SPECIAL_UNSUPPORTED)."""
+        self._card_material = {}
+        self._used_materials = {m for m, _ in self._material_uses(blocks)}
+        self._damage_plan = {}
+        materials: List[str] = []
+        plastic: set = set()
+        cards: List[Tuple[Block, Optional[str], bool]] = []
+        steps: List[str] = []               # each step's procedure ("" for none)
+        mat: Optional[str] = None
+        for i, b in enumerate(blocks):
+            kw = b.keyword
+            if kw == "MATERIAL":
+                mat = (b.param("NAME") or "").strip()
+                materials.append(mat.upper())
+                continue
+            if kw in ("STEP", "NODE", "ELEMENT", "SURFACE INTERACTION", "CONNECTOR BEHAVIOR",
+                      "GASKET BEHAVIOR") or kw.endswith("SECTION"):
+                mat = None
+            if mat is not None:
+                self._card_material[id(b)] = mat
+            if kw == "STEP":
+                steps.append("PERTURBATION" if b.has("PERTURBATION") else "")
+            elif kw in PROC_KW and steps and not steps[-1]:
+                steps[-1] = f"{kw}, RIKS" if b.has("RIKS") else kw
+            elif kw == "PLASTIC" and mat is not None and self._plastic_kept(b):
+                plastic.add(mat.upper())
+            elif kw == "DAMAGE INITIATION":
+                evolution = False
+                for nb in blocks[i + 1:]:          # its sub-options follow it
+                    if nb.keyword == "DAMAGE EVOLUTION":
+                        evolution = True
+                    elif nb.keyword != "DAMAGE STABILIZATION":
+                        break
+                cards.append((b, mat, evolution))
+        bad = next(((n, p) for n, p in enumerate(steps, 1) if p not in ("STATIC", "DYNAMIC")), None)
+        last = materials[-1] if materials else None
+        kept = False
+        for b, m, evolution in reversed(cards):    # ccx reads the last card it is given
+            crit = (b.param("CRITERION") or "").upper().replace(" ", "").replace("-", "")
+            if crit != "JOHNSONCOOK":
+                why = ("ccx 2.23 evaluates only the RICE TRACEY and JOHNSON COOK criteria and "
+                       "stops on any other ('criterion is not known')")
+            elif m is None:
+                why = "it belongs to no *MATERIAL, and ccx evaluates damage only in a material"
+            elif m.upper() != last:
+                why = (f"ccx 2.23 gives every *DAMAGE INITIATION card to the deck's last "
+                       f"*MATERIAL ({last}), not to the one it follows (probed), so it cannot "
+                       f"evaluate this one")
+            elif kept:
+                why = ("ccx 2.23 keeps one *DAMAGE INITIATION card (a later one overwrites it), "
+                       "and a later Johnson-Cook card of this material is kept")
+            elif m.upper() not in plastic:
+                why = ("ccx evaluates it only for a plastic material ('no equivalent strain is "
+                       "calculated'), and this one has no *PLASTIC card ccx runs")
+            elif not steps:
+                why = ("ccx evaluates it only in nonlinear *STATIC and *DYNAMIC steps, and the "
+                       "deck has no step")
+            elif bad:
+                why = (f"ccx evaluates it only in nonlinear *STATIC and *DYNAMIC steps and stops "
+                       f"on a deck with any other ('neither nonlinear static nor nonlinear "
+                       f"dynamic'): step {bad[0]} is "
+                       f"{'a perturbation step' if bad[1] == 'PERTURBATION' else '*' + bad[1] if bad[1] else 'without a procedure'}")
+            elif self._jc_damage_data(b) is None:
+                why = ("its data are not one line of d1-d5, melting temperature, transition "
+                       "temperature and a positive reference strain rate")
+            else:
+                why, kept = None, True
+            self._damage_plan[id(b)] = (m, evolution, why)
+        self._jc_damage_kept = kept
+
+    @staticmethod
+    def _jc_damage_data(b: Block) -> Optional[List[str]]:
+        """The 8 values of an Abaqus Johnson-Cook damage initiation card — d1, d2, d3, d4,
+        d5, melting temperature, transition temperature, reference strain rate — as ccx
+        2.23 reads them, or None when the card's data are not that (one line of numbers, a
+        positive reference rate).  ccx stops unless the melting temperature exceeds the
+        transition temperature, which matters only through the d5 term: with d5 = 0 (no
+        temperature dependence) a melting temperature one above the transition one is
+        written instead."""
+        recs = [r for r in merged_data_records(b) if any(r)]
+        if b.has("DEPENDENCIES") or len(recs) != 1 or len(recs[0]) > 8:
+            return None
+        toks = (recs[0] + [""] * 8)[:8]
+        try:
+            v = [pf(x) if x else 0.0 for x in toks]
+        except ValueError:
+            return None
+        if not all(math.isfinite(x) for x in v) or v[7] <= 0.0 or (v[5] <= v[6] and v[4] != 0.0):
+            return None
+        toks = [x or "0." for x in toks]
+        if v[5] <= v[6]:
+            toks[5] = fmt_num(v[6] + 1.0)
+        return toks
+
+    def handle_damage_initiation(self, b: Block) -> List[str]:
+        """``*DAMAGE INITIATION`` (see _plan_material_cards): a Johnson-Cook criterion ccx
+        2.23 can evaluate is kept, with 1E30 as the damage at which ccx would delete the
+        element, so it only reports the damage indicator, as Abaqus does without a *DAMAGE
+        EVOLUTION; any other card is commented out."""
+        mat, evolution, why = self._damage_plan.get(
+            id(b), (None, False, "it belongs to no *MATERIAL, and ccx evaluates damage only in a "
+                                 "material"))
+        crit = " ".join((b.param("CRITERION") or "?").split()).upper()
+        head = f"*DAMAGE INITIATION, CRITERION={crit}" + (f" (material {mat})" if mat else "")
+        if why is not None:
+            lost = (" It has a *DAMAGE EVOLUTION, which ccx cannot run either (dropped, see its "
+                    "warning): past initiation Abaqus degrades the material, ccx keeps its "
+                    "undamaged response." if evolution else
+                    " Without a *DAMAGE EVOLUTION Abaqus only evaluates a damage initiation "
+                    "criterion (for output) and leaves the material as it is, so only that output "
+                    "is lost.")
+            return self._commented(b, f"{head}: {why}. Commented out.{lost}", reduces=evolution)
+        self.report.note(f"{head}: ccx 2.23 evaluates Abaqus' Johnson-Cook criterion (below the "
+                         f"reference strain rate its rate term is linear, 1 + d4 (rate/ref - 1), "
+                         f"not 1 + d4 ln(rate/ref)), but it wants a second data line with the "
+                         f"damage at which it deletes the element, and deleting one crashes "
+                         f"2.23: 1E30 there keeps every element, so the criterion only reports "
+                         f"the damage indicator (*EL FILE / *EL PRINT label DUCT; Abaqus' JCCRT)"
+                         + ("; its *DAMAGE EVOLUTION is dropped (see that warning), so past "
+                            "initiation the material keeps its undamaged response, unlike in "
+                            "Abaqus." if evolution else
+                            ", as Abaqus does without a *DAMAGE EVOLUTION."), once=True)
+        return [emit_keyword("DAMAGE INITIATION", OrderedDict([("CRITERION", "JOHNSON COOK")])),
+                ", ".join(self._jc_damage_data(b) or []), "1.E30"]
+
     def handle_cyclic_hardening(self, b: Block) -> List[str]:
         """``*CYCLIC HARDENING``: ccx reads it only after a *PLASTIC, HARDENING=COMBINED of
         the same material (an error otherwise), and only in tabular form — Abaqus'
@@ -3479,13 +3650,23 @@ class Converter:
         return [emit_keyword("HYPERELASTIC", params)] + list(b.data)
 
     def handle_elastic(self, b: Block) -> List[str]:
-        typ = (b.param("TYPE") or "ISO").upper()
+        typ = " ".join((b.param("TYPE") or "ISO").split()).upper()
         if typ == "LAMINA":
             converted = self._lamina_to_engineering_constants(b)
             if converted is not None:
                 return self._fit_elastic_to_expansion(b, "ENGINEERING CONSTANTS", converted)
             self.report.warn("*ELASTIC TYPE=LAMINA could not be parsed; emitted unchanged — ccx "
                              "will reject TYPE=LAMINA.", once=True)
+        mat = self._card_material.get(id(b))
+        if typ in ("TRACTION", "COUPLED TRACTION") and mat is not None and \
+                mat.upper() not in self._used_materials:
+            # a cohesive traction-separation stiffness: ccx has no such type and reads the
+            # values as isotropic constants ('Poisson coefficient should be less than 0.5')
+            return self._commented(b, f"*ELASTIC, TYPE={typ} (material {mat}): a cohesive "
+                                      f"traction-separation stiffness, which ccx has no form of "
+                                      f"(it reads the values as isotropic E and nu and stops). No "
+                                      f"section uses material {mat}, so this changes nothing.",
+                                   reduces=False)
         tmap = {"ISOTROPIC": "ISO", "ISO": "ISO", "ORTHOTROPIC": "ORTHO", "ORTHO": "ORTHO",
                 "ENGINEERING CONSTANTS": "ENGINEERING CONSTANTS",
                 "ANISOTROPIC": "ANISO", "ANISO": "ANISO"}
@@ -3513,6 +3694,18 @@ class Converter:
                 self._reduces("*ELASTIC field-variable dependence")
             else:
                 data = collapsed
+        if cc == "ISO":
+            # Abaqus reads an omitted Poisson's ratio as 0 (a blank field is zero); ccx stops
+            # on a line with E alone ('not enough constants on the input line')
+            for k, ln in enumerate(data):
+                f = [x.strip() for x in ln.split(",")]
+                while len(f) > 1 and f[-1] == "":
+                    f.pop()
+                if len(f) == 1 and f[0]:
+                    data[k] = f"{f[0]}, 0."
+                    self.report.note("*ELASTIC data line with Young's modulus only: Poisson's "
+                                     "ratio 0 written, the value Abaqus reads for an omitted one "
+                                     "(ccx stops on the line: 'not enough constants').", once=True)
         if self._approx and cc == "ISO":
             newdata, clamped = [], False
             for rec in ([p.strip() for p in ln.split(",")] for ln in data):
@@ -4826,6 +5019,18 @@ class Converter:
             out += self._shell_section_cards(b, gname, base_ori, axes)
         return out
 
+    def _shell_offset(self, value: Optional[str]) -> Optional[str]:
+        """A *SHELL SECTION OFFSET for ccx, which takes only the number: Abaqus' SPOS / SNEG
+        (the shell's top / bottom face on the nodes) are its offsets 0.5 / -0.5, which ccx
+        reads the same way (probed on 2.23: OFFSET=0.5 puts the expanded shell below its
+        nodes, on the negative side of the normal); it stops on the labels."""
+        label = (value or "").strip().upper()
+        if label not in ("SPOS", "SNEG"):
+            return value
+        self.report.note("*SHELL SECTION, OFFSET=SPOS / SNEG -> OFFSET=0.5 / -0.5, the same "
+                         "offset as a number (ccx stops on the label).", once=True)
+        return "0.5" if label == "SPOS" else "-0.5"
+
     def _shell_section_cards(self, b: Block, elset: Optional[str], base_ori: str,
                              axes: Dict[str, Tuple[str, ...]]) -> List[str]:
         """The ccx cards of a *SHELL SECTION for the elements of ``elset``.  ``axes`` holds,
@@ -4845,7 +5050,7 @@ class Converter:
                 if k == "ELSET":
                     keep[k] = elset
                 elif k == "OFFSET":
-                    keep[k] = v
+                    keep[k] = self._shell_offset(v)
                 elif k == "COMPOSITE":
                     keep[k] = None
                 elif k in ("ORIENTATION", "SYMMETRIC"):
@@ -4896,7 +5101,7 @@ class Converter:
         keep = OrderedDict()
         for k, v in b.params.items():
             if k in ("ELSET", "MATERIAL", "ORIENTATION", "OFFSET", "NODAL THICKNESS"):
-                keep[k] = v
+                keep[k] = self._shell_offset(v) if k == "OFFSET" else v
             else:
                 self.report.note(f"*SHELL SECTION parameter {k} dropped.", once=True)
         if "ELSET" in keep:
@@ -5155,6 +5360,7 @@ class Converter:
         # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
         recs = self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
         self._rot_hit = []
+        head, inactive = len(out), False          # inactive: a line left out (no such DOF)
         for rec in recs + midside:
             # Interior blanks are positional (e.g. "node, dof1, , value" = blank last
             # DOF), so trim only trailing empties — never filter interior fields.
@@ -5173,16 +5379,19 @@ class Converter:
                 else:
                     for d1, d2 in dofs:
                         kept = self._active_dof_lines(spec, d1, d2, [])
+                        inactive |= kept == []
                         out.extend(kept if kept is not None else [f"{spec}, {d1}, {d2}"])
             elif len(rest) >= 2:
                 # node, first-dof, last-dof[, magnitude]; blank last-dof means = first
                 dof2 = rest[1] if rest[1] != "" else rest[0]
                 kept = None
                 if re.fullmatch(r"[-+]?\d+", rest[0]) and re.fullmatch(r"[-+]?\d+", dof2):
-                    kept = self._active_dof_lines(spec, int(rest[0]), int(dof2), rest[2:])
+                    kept = self._known_dof_lines(spec, int(rest[0]), int(dof2), rest[2:])
+                inactive |= kept == []
                 out.extend(kept if kept is not None else [", ".join([spec, rest[0], dof2] + rest[2:])])
             elif len(rest) == 1 and re.fullmatch(r"[-+]?\d+", rest[0]):
-                kept = self._active_dof_lines(spec, int(rest[0]), int(rest[0]), [])
+                kept = self._known_dof_lines(spec, int(rest[0]), int(rest[0]), [])
+                inactive |= kept == []
                 out.extend(kept if kept is not None else [", ".join(g)])
             else:
                 out.append(", ".join(g))
@@ -5190,6 +5399,8 @@ class Converter:
             got = self._rot_lines.get((id(b), n))
             out.extend(got if isinstance(got, list) else self._rot_refused(b, n, got))
         self._rot_hit = []
+        if inactive and len(out) == head and (params.get("OP") or "").strip().upper() != "NEW":
+            out = []          # all its lines were on DOFs the nodes do not have: no card left
         if getattr(self, "_n_inactive_rot", 0):
             self.report.note("Rotational DOFs (4-6) prescribed on nodes that only belong to plane-"
                              "stress/plane-strain/axisymmetric elements were dropped: those nodes "
@@ -5197,6 +5408,12 @@ class Converter:
                              "two-dimensional solid element library), so such a BC constrains "
                              "nothing there, while ccx treats it as a rotational constraint and 2.23 "
                              "crashes (bus error) or stops in usermpc. Exact.", once=True)
+        if self._n_inactive_rot_truss:
+            self.report.warn("Rotational DOFs (4-6) prescribed on nodes that only belong to truss "
+                             "elements (or trusses and plane elements) were dropped: those nodes have "
+                             "no rotations (Abaqus ignores such BCs with a warning), but ccx stops "
+                             "('gen3dboun: ... the elements to which this node belongs do not have "
+                             "rotational DOFs').", once=True)
         if self._planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
             # OP=NEW also removes the model-data planar constraint (verified on 2.23)
             out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
@@ -5224,6 +5441,47 @@ class Converter:
                              f"(incomplete export?); ccx stops with 'node set {spec.upper()} has not "
                              f"yet been defined'.", once=True)
 
+    # Abaqus DOFs ccx has no form of ('*ERROR in bounadd: unknown DOF'; it knows 1-6, 8 and
+    # 11), with the element types that have them (a user element may have any DOF): a BC on
+    # such a DOF where no element of the model has it is inactive, and Abaqus ignores it
+    # (with a warning)
+    _UNKNOWN_DOF_ELEMENTS = {7: ("warping", lambda t: re.match(r"B3\dOS|V?U\d+$", t) is not None),
+                             9: ("electric potential",
+                                 lambda t: t.endswith("E") or t.startswith("Q3D") or
+                                 re.match(r"V?U\d+$", t) is not None)}
+
+    def _inactive_dof(self, nodes: Sequence[int], d: int) -> bool:
+        """Whether handle_boundary leaves DOF ``d`` out on all of ``nodes``: a DOF ccx does
+        not have that no element of the model has (_UNKNOWN_DOF_ELEMENTS), or a rotation at
+        nodes without rotations (_no_rot: plane, axisymmetric and truss nodes)."""
+        if d in self._UNKNOWN_DOF_ELEMENTS:
+            has = self._UNKNOWN_DOF_ELEMENTS[d][1]
+            return not any(has(t.upper()) for t in self._elem_types)
+        return 4 <= d <= 6 and bool(nodes) and all(n in self._no_rot for n in nodes)
+
+    def _known_dof_lines(self, spec: str, d1: int, d2: int, extra: List[str]) -> Optional[List[str]]:
+        """_active_dof_lines for DOFs d1..d2 less those of _UNKNOWN_DOF_ELEMENTS that no
+        element of the model has; None when the line can stay as it is."""
+        lo, hi = min(d1, d2), max(d1, d2)
+        drop = [d for d, (_, has) in self._UNKNOWN_DOF_ELEMENTS.items()
+                if lo <= d <= hi and not any(has(t.upper()) for t in self._elem_types)]
+        if not drop:
+            return self._active_dof_lines(spec, d1, d2, extra)
+        out: List[str] = []
+        start = lo
+        for d in drop + [hi + 1]:
+            if start <= d - 1:
+                kept = self._active_dof_lines(spec, start, d - 1, extra)
+                out.extend(kept if kept is not None else
+                           [", ".join([spec, str(start), str(d - 1)] + extra)])
+            start = d + 1
+        for d in drop:
+            self.report.note(f"*BOUNDARY on DOF {d} ({self._UNKNOWN_DOF_ELEMENTS[d][0]}) dropped: "
+                             f"no element of the model has that DOF, so Abaqus ignores the BC (with "
+                             f"a warning), and ccx, which has no such DOF, would stop ('unknown "
+                             f"DOF').", once=True)
+        return out
+
     def _active_dof_lines(self, spec: str, d1: int, d2: int, extra: List[str]) -> Optional[List[str]]:
         """BC data lines for DOFs d1..d2 on ``spec`` with the rotational DOFs (4-6) moved or
         removed where ccx needs it, or None when the line can stay as it is:
@@ -5231,9 +5489,9 @@ class Converter:
         * rotations of a rigid-body reference node go to DOFs 1-3 of its ROT NODE (ccx
           ignores DOFs 4-6 of the REF NODE), which has the reference node's local axes if it
           has a *TRANSFORM (_plan_rot_axes);
-        * nodes that only belong to plane/axisymmetric continuum elements have no
-          rotations — those DOFs are dropped (a set mixing them with shell/beam nodes keeps
-          its rotations on the latter, one line per node)."""
+        * nodes that only belong to plane/axisymmetric continuum or truss elements have no
+          rotations — those DOFs are dropped, as Abaqus ignores them (a set mixing them with
+          shell/beam nodes keeps its rotations on the latter, one line per node)."""
         def line(target: str, a: int, b: int) -> str:
             return ", ".join([target, str(a), str(b)] + extra)
         lo, hi = min(d1, d2), max(d1, d2)
@@ -5270,19 +5528,21 @@ class Converter:
             self.report.note("Rotational BCs on a *RIGID BODY reference point moved to DOFs 1-3 "
                              "of its ROT NODE (ccx ignores DOFs 4-6 of the REF NODE).", once=True)
             return out
-        if not self._plane_only:
+        if not self._no_rot:
             return None
-        flat = [n for n in nodes if n in self._plane_only]
+        flat = [n for n in nodes if n in self._no_rot]
         if not nodes or not flat:
             return None
-        self._n_inactive_rot += len(flat)
+        truss = sum(1 for n in flat if n not in self._plane_only)
+        self._n_inactive_rot += len(flat) - truss
+        self._n_inactive_rot_truss += truss
         out: List[str] = []
         if lo <= 3:
             out.append(line(spec, lo, 3))
         if hi >= 7:
             out.append(line(spec, 7, hi))
         for n in nodes:
-            if n not in self._plane_only:
+            if n not in self._no_rot:
                 out.append(line(str(n), max(lo, 4), min(hi, 6)))
         return out
 
@@ -6199,6 +6459,10 @@ class Converter:
                         ln["num"] = None
             ln["nodes"] = self._resolve_nodes(g[0])
             ln["ends"] = [e for n in ln["nodes"] for e in mid_ends.get(n, (n,))]
+            if ln["dofs"]:                           # as handle_boundary keeps them
+                ln["dofs"] = [d for d in ln["dofs"] if not self._inactive_dof(ln["nodes"], d)]
+                if not ln["dofs"]:
+                    continue
             out.append(ln)
         return out
 
@@ -7951,6 +8215,14 @@ class Converter:
                 report.note(f"Output variable {vu} dropped (no ccx equivalent; derive in "
                             f"post-processing).", once=True)
                 continue
+            if vu == "JCCRT":
+                if not self._jc_damage_kept:
+                    report.note("Output variable JCCRT dropped: no Johnson-Cook *DAMAGE "
+                                "INITIATION is kept in ccx.", once=True)
+                    continue
+                report.note("Output variable JCCRT -> DUCT (ccx's damage indicator of the "
+                            "kept Johnson-Cook *DAMAGE INITIATION).", once=True)
+                vu = "DUCT"
             mapped = ABQ_MAP_VARS.get(vu, vu)
             if mapped != vu:
                 why = ABQ_MAP_CAVEATS.get(vu, "CalculiX naming")
@@ -10536,6 +10808,7 @@ class Converter:
         quiet = Report()
         emitted: Dict[str, str] = {}
         plane: Dict[int, bool] = {}
+        no_rot: Dict[int, bool] = {}
         self._shell_nodes = set()
         self._beam_nodes = set()
         for typ, conn in self.geom.elements.values():
@@ -10543,8 +10816,10 @@ class Converter:
                 emitted[typ] = ccx_element_type(typ, quiet)
             cc = emitted[typ]
             is_plane = cc.startswith(PLANE_ELEM_PREFIXES)
+            translational = is_plane or cc.startswith(("T2D", "T3D"))
             for n in conn:
                 plane[n] = plane.get(n, True) and is_plane
+                no_rot[n] = no_rot.get(n, True) and translational
             if cc in SHELL_TYPES:
                 self._shell_nodes.update(conn)
             elif cc in BEAM_TYPES:
@@ -10571,6 +10846,9 @@ class Converter:
                         refs = self._resolve_nodes(v.strip())[:1]
                         self._plane_only.difference_update(refs)
                         self._ref_nodes.update(refs)
+        # ... and with truss nodes: the nodes without rotational DOFs, where Abaqus ignores a
+        # rotational BC (_active_dof_lines)
+        self._no_rot = {n for n, p in no_rot.items() if p} - self._ref_nodes
         # ccx carries a *RIGID BODY's rotations on DOFs 1-3 of its ROT NODE and silently
         # ignores BCs/moments on DOFs 4-6 of the REF NODE (verified on 2.23: a moment there
         # does nothing).  Give every rigid body an explicit rotation node so the
@@ -10616,7 +10894,7 @@ class Converter:
                              "MPCs; probed on 2.23); only implicit steps can run it.", once=True)
         self._check_transforms()
         self._plan_default_amplitudes(blocks)  # reads the ROT NODE axes (_plan_rot_axes)
-        self._n_inactive_rot = 0
+        self._n_inactive_rot = self._n_inactive_rot_truss = 0
         self._depvar_counts = set()
         for b in blocks:
             if b.keyword == "DEPVAR":
@@ -10743,6 +11021,7 @@ class Converter:
             elif b.keyword in ("STEP", "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "NODE",
                                "ELEMENT"):
                 jc_block = None
+        self._plan_material_cards(blocks)
         self._plan_expansion_as_ortho(blocks)
         self._plan_elastic_expansion(blocks)
         self._check_nlgeom_expansion(blocks)

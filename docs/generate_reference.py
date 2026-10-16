@@ -71,7 +71,8 @@ TRANSLATED = {
         "about the normal; `SYMMETRIC` layups mirrored; on continuum shells (SC6R/SC8R, which "
         "run as solids) → `*SOLID SECTION` (composite: commented); with a `*DISTRIBUTION` "
         "orientation (its own or a ply's) split into one element set, plain `*ORIENTATION` and "
-        "section per distinct direction.",
+        "section per distinct direction. `OFFSET=SPOS`/`SNEG` → `0.5`/`-0.5` (ccx takes only "
+        "the number and reads it the same way).",
     "*SHELL GENERAL SECTION": "→ `*SHELL SECTION` (thickness+material form); ABD/stiffness form "
         "flagged as unsupported.",
     "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's "
@@ -122,8 +123,10 @@ TRANSLATED = {
         "Abaqus/Explicit ignores the value and holds the DOF where it is (a zero BC, or `FIXED` "
         "where the DOF may have moved; a rotation or a node with a `*TRANSFORM` it cannot hold is "
         "kept, warned). Zero lines on DOFs still at zero stay as they are. DOFs 4-6 "
-        "dropped on nodes of plane/axisymmetric elements (Abaqus: no rotations there, so the BC "
-        "holds nothing; ccx 2.23 crashes on them). `LOAD CASE` dropped (Abaqus reads it only in "
+        "dropped on nodes of plane/axisymmetric or truss elements (no rotations there, Abaqus "
+        "ignores them; ccx 2.23 crashes or stops on them), and DOFs 7 (warping) and 9 (electric "
+        "potential), which ccx does not have, where no element of the model has them. "
+        "`LOAD CASE` dropped (Abaqus reads it only in "
         "`*BUCKLE`); in steady-state dynamics `IMAGINARY` (the out-of-phase part, also on `*CLOAD` "
         "and `*DLOAD`) → ccx's `LOAD CASE=2`; in a `*BUCKLE` step the "
         "`LOAD CASE=2` cards that repeat `LOAD CASE=1` cards (the Abaqus/CAE default) are left "
@@ -259,8 +262,20 @@ TRANSLATED = {
         "none); `HARDENING=USER` and `DATATYPE=PARAMETERS` commented (ccx would silently skip "
         "them; reduced physics: ccx 2.23 has no user hardening, and its tabulated hardening cannot "
         "reproduce Chaboche back-stresses); `DEPENDENCIES` collapsed.",
+    "*DAMAGE INITIATION": "ccx 2.23 evaluates `RICE TRACEY` and `JOHNSON COOK` only. `JOHNSON "
+        "COOK` (d1-d5, melting and transition temperature, reference strain rate, as in Abaqus) "
+        "is kept with the second data line ccx wants, the damage at which it deletes the element, "
+        "set to `1E30` (a deletion crashes 2.23): it then only reports the damage indicator "
+        "(`DUCT`, to which Abaqus' `JCCRT` maps), as Abaqus does without a `*DAMAGE EVOLUTION` — "
+        "where ccx reads it as meant: the deck's last `*MATERIAL` (ccx gives every card to it), "
+        "plastic, all steps nonlinear `*STATIC`/`*DYNAMIC`, one card. Any other card is "
+        "commented: exact without a `*DAMAGE EVOLUTION` (only the criterion output is lost), "
+        "warned with one (the evolution is dropped anyway).",
     "*ELASTIC / *DENSITY / *SPECIFIC HEAT / *CONDUCTIVITY / *EXPANSION / *MOHR COULOMB": "`TYPE` "
-        "token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`, same constant order); `DEPENDENCIES=n` (field variables, which ccx ignores) collapsed to the "
+        "token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`, same constant order); an "
+        "isotropic `*ELASTIC` line with E alone gets ν = 0 (Abaqus' value for the blank field; ccx "
+        "stops on the line); a cohesive `TYPE=TRACTION` in a material no section uses is "
+        "commented (ccx would read it as E, ν); `DEPENDENCIES=n` (field variables, which ccx ignores) collapsed to the "
         "Abaqus no-field state, field = 0: the rows of that state, of the end of the table nearest "
         "0 (which Abaqus holds beyond it), or interpolated between the two states around 0 when "
         "they share their temperatures — exact when the deck sets no field variable; otherwise "
@@ -484,7 +499,7 @@ def gen_keywords():
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
                "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
-               "CONNECTOR SECTION", "TRANSFORM"}
+               "CONNECTOR SECTION", "TRANSFORM", "DAMAGE INITIATION"}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",

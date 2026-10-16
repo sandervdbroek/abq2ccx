@@ -222,6 +222,24 @@ def dat_el_stress(dat_path, elem):
     return [sum(r[k] for r in rows) / len(rows) for k in range(6)] if rows else None
 
 
+def dat_el_scalar(dat_path, title):
+    """{element: value at its first integration point} from the last *EL PRINT table of a
+    scalar (PEEQ, DUCT) whose heading starts with ``title`` in a ccx .dat file."""
+    found, inblock = {}, False
+    if not os.path.exists(dat_path):
+        return found
+    for ln in open(dat_path):
+        if ln.strip().startswith(title):
+            found, inblock = {}, True
+            continue
+        f = ln.split()
+        if inblock and len(f) == 3 and f[0].isdigit():
+            found.setdefault(int(f[0]), float(f[2]))
+        elif inblock and f and not f[0].isdigit():
+            inblock = False
+    return found
+
+
 def dat_eigen_table(dat_path, title):
     """The rows of the first eigenvalue table titled ``title`` in a ccx .dat file: the
     frequencies (cycles/time) under "E I G E N V A L U E   O U T P U T", or the factors
@@ -1823,6 +1841,40 @@ def main():
         print(f"FAIL  assembly_rotated_instances: the two models printed different nodes "
               f"({len(ua)} / {len(uf)})")
         failures += 1
+    # --- Johnson-Cook damage initiation: ccx's indicator, the model unchanged -------
+    # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which
+    # it deletes an element, out of reach so that it only reports): in uniaxial tension the
+    # indicator is PEEQ / (d1 + d2 exp(-d3 / 3)), and the run is the same as without the card.
+    src = open(os.path.join(EXAMPLES, "damage_johnson_cook_cubes.inp")).read()
+    card = "*DAMAGE INITIATION, CRITERION=JOHNSON COOK\n0.2, 0.3, 1.5, 0., 0., 1878., 293., 1.\n"
+    runs = {}
+    for label, text in (("with", src), ("without", src.replace(card, ""))):
+        path = os.path.join(tmp, f"jc_{label}_src.inp")
+        with open(path, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"jc_{label}.inp")
+        convert(path, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        runs[label] = (status, dat_el_scalar(dat, "equivalent plastic strain"),
+                       dat_el_scalar(dat, "ductile damage initiation"), dat_displacements(dat))
+        shutil.rmtree(d, ignore_errors=True)
+    (s1, peeq, duct, u1), (s0, peeq0, duct0, u0) = runs["with"], runs["without"]
+    eps_f = 0.2 + 0.3 * math.exp(-0.5)
+    if s1 != "solved" or s0 != "solved" or not peeq or set(duct) != {1, 2}:
+        print(f"FAIL  damage_johnson_cook_cubes: {s1} / {s0} (with / without the card), DUCT "
+              f"for elements {sorted(duct)}")
+        failures += 1
+    else:
+        ratio = duct[2] / peeq[2]
+        same = peeq == peeq0 and u1 == u0
+        ok = abs(ratio * eps_f - 1) < 1e-5 and duct[1] == 0.0 and peeq[1] > 0.0 and same
+        print(f"{'PASS' if ok else 'FAIL'}  damage_johnson_cook_cubes (*DAMAGE INITIATION, "
+              f"CRITERION=JOHNSON COOK): DUCT / PEEQ = {ratio:.6f} (1 / {eps_f:.6f} = "
+              f"{1 / eps_f:.6f}) at PEEQ {peeq[2]:.5f}, DUCT {duct[1]:g} in the cube without the "
+              f"criterion, results {'identical to' if same else 'DIFFERENT from'} the run "
+              f"without the card")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
