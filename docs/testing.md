@@ -7,8 +7,9 @@ The converter has three layers of tests:
 2. **End-to-end solver validation** — converts the example decks and runs them in
    CalculiX, checking the NAFEMS LE10 benchmark, circular-, pipe- and box-section
    cantilevers, circular-section beams with rotational BCs, planar beams' frequencies and
-   buckling loads, per-element `*DISTRIBUTION` orientations, and a clamped beam and plate
-   across a later step's `*BOUNDARY, OP=NEW` numerically.
+   buckling loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate
+   across a later step's `*BOUNDARY, OP=NEW`, a rigidly coupled shell plate and the `*MPC`
+   conversions numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -22,7 +23,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (156)
+## 1. Unit tests — `tests/test_convert.py` (163)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -36,7 +37,7 @@ conversion behaviour and referential integrity.
 | `test_comprehensive_coverage` | element substitutions, dropped/commented cards, and output-variable mapping in a single kitchen-sink deck |
 | `test_element_substitutions` | `ccx_element_type()` mappings (e.g. `CPEG8→CPE8`, `STRI65→S6`) **and** the invariant that every substitution preserves node count |
 | `test_nset_from_elset` | `*Nset, ELSET=…` expanded to the element set's nodes (ccx has no NSET-from-ELSET) |
-| `test_overconstraint_warning` | a `*BOUNDARY` on an `*EQUATION` dependent DOF raises the pre-flight overconstraint warning |
+| `test_overconstraint_equation_reordered` | an `*EQUATION` whose first DOF has a BC, or is the first DOF of another equation, gets a free term first; a duplicate and a loop's closing equation are dropped; a rigid-body member's translation is never made dependent; an equation whose every DOF is held (one of them nonzero) keeps the overconstraint warning, as does a BC on a rigid member's eliminated DOF |
 | `test_tie_param_handling` | `*TIE` strips Abaqus-only `TYPE=`, keeps ccx-supported `ADJUST` |
 | `test_instance_rotation_order` | `*INSTANCE` applies translation **then** rotation (`R(p+T)`), per the Abaqus manual |
 | `test_shell_general_section` | `*SHELL GENERAL SECTION` → `*SHELL SECTION` |
@@ -185,6 +186,13 @@ conversion behaviour and referential integrity.
 | `test_op_new_that_removes_bcs_makes_knots` | an OP=NEW that removes a BC stays and the beam clamp it re-specifies gets a knot beam (`ABQ2CCX_KNOT`); a beam node whose rotations it releases gets none unless a later step fixes them again; shell nodes with rotational BCs before it always get one |
 | `test_op_new_knots_skipped_with_explicit_steps` | with an explicit step in the deck no knot beams are added (they stop ccx's explicit solver), and the removal is warned |
 | `test_op_new_examples` | the two OP=NEW validation decks: no OP=NEW left where step 2 removes nothing; where it removes the prop, OP=NEW stays and the beam root and the five plate root nodes are knots; no dangling refs |
+| `test_mpc_lines_converted_one_by_one` | an `*MPC` card keeps its convertible lines (`PIN` → `*EQUATION` on DOFs 1–3) and comments out only the `SLIDER` and user (`99`) lines; node sets pair node by node in ascending order or with a single second node, and mismatched sets comment that line out; an MPC on a node with a `*TRANSFORM` is warned |
+| `test_mpc_tie_ties_rotations_between_knots` | `TIE` between two beam nodes knots both and ties all six DOFs; with a solid or free node only DOFs 1–3; a coupled temperature-displacement step adds DOF 11 |
+| `test_mpc_link_linearised_or_ccx_beam` | `LINK` without `NLGEOM` → the linearised `*EQUATION` (direction cosines, largest component first); under `NLGEOM` → ccx `*MPC BEAM`; on beam nodes under `NLGEOM`, or in a linear-then-`NLGEOM` deck, commented out (the latter converted with `--approximate`, `[APPROX]`) |
+| `test_mpc_beam_lines_become_rigid_bodies` | `BEAM` lines sharing an independent node, or chained through one another, become one `*RIGID BODY` with a `ROT NODE`; shell members get knots and rotation ties; rotational BCs on the independent node move to the `ROT NODE`; a shell independent node's own rotation drives the `ROT NODE`; a node dependent twice is warned and its later line commented |
+| `test_rigid_member_bcs_the_body_implies_are_left_out` | zero BCs on rigid-body members are left out where the reference node is held in that DOF and cannot rotate (a `SYM` set is split around them); not when the body may turn, a value is nonzero or `OP=NEW` releases the reference BCs; a body of plane-strain nodes needs only DOF 6 held, and is warned in a deck with an explicit step |
+| `test_bc_steps_follow_op_new` | the BCs in force per step: kept from earlier steps, a later value replaces an earlier one, `OP=NEW` starts from none |
+| `test_rotation_tie_on_a_member_bc_makes_the_body_dependent` | a shell member's rotation under a BC makes the `ROT NODE` DOF the tie's dependent term; on a `*KINEMATIC` reference node (whose DOFs 4–6 ccx eliminates itself) the tie is dropped instead |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -241,6 +249,25 @@ deck and runs it in CalculiX:
   agree within 1e-6 of max |u| (they agree to 3e-11 and exactly). Converted without the
   rotation built into the axes, the plate misses by 21 %; with the shell section left to
   ccx's own distribution handling, the panel misses by 62 %.
+* **`mpc_beam_lever`** — three B31 cantilevers: one carries a rigid lever (`*MPC BEAM`,
+  converted to a `*RIGID BODY` on the knotted tip node) loaded at its end, one the
+  statically equivalent tip force and moment, one a 10⁴× stiffer beam as the lever. The tip
+  and lever-end deflections match statics within 0.04 % (−3.2488 / −4.2982 vs −3.25 /
+  −4.30) and the two references within 4e-5. A variant at ten times the load under
+  `NLGEOM` (about 27° at the tip) matches the stiff-beam lever within 5e-7 and keeps the
+  lever's length to 5e-8.
+* **`mpc_pin_tie_joints`** — two-span beams joined at coincident nodes by `*MPC PIN` (a
+  hinge: w = −1.2494 vs (P/2) L³/(3EI) = −1.25) and by `*MPC TIE` (a rigid joint: one
+  propped cantilever, −0.4185 vs −0.4199); worst 0.33 % over both spans. Without the knots
+  the `TIE` gives the `PIN` result: ccx ignores DOFs 4–6 of a plain beam node in an
+  `*EQUATION`.
+* **`mpc_link`** — a node held by a `*MPC LINK` and a spring perpendicular to it: the
+  linearised `*EQUATION` gives statics exactly ((P·n)/k n); under `NLGEOM` with a large
+  load ccx's `*MPC BEAM` keeps the length to 1e-8 while the link turns 24.5°.
+* **`equation_overconstraint`** — a deck ccx rejects as written: an `*EQUATION` whose first
+  DOF has a BC, its duplicate, and a loop of three ties. Converted, it solves with the tied
+  node held and the loop's nodes moving together (ccx, given the whole loop, holds it at
+  zero).
 * **`op_new_respecify`**, **`op_new_remove`** — a clamped `B31` cantilever and a clamped `S4`
   plate whose step 2 has `*BOUNDARY, OP=NEW`. In the first, step 2 re-specifies every BC
   (OP=NEW is dropped), doubles the beam's tip load and prescribes the plate tip z = 2: the
@@ -290,8 +317,8 @@ deck and runs it in CalculiX:
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **220 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
-other 583 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
+references; **219 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
+other 584 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
 other user subroutines, Riks, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
 externally-supplied `<parameter>` values, or nodes numbered from 0) — and each was
@@ -377,9 +404,59 @@ coupling whose reference node is itself a shell/beam node becomes a `*RIGID BODY
 `ROT NODE` follows that node: kept as a ccx coupling, the node carries two unrelated
 rotations (probed: the beam acts hinged at the coupled face). Not covered: explicit
 dynamics ("linear and nonlinear MPC's depend on each other", with or without the knot
-beams), and coupled DOFs that also carry a `*BOUNDARY` — `dheller1_uprofile` now passes
-the gen3dmpc check but stops on that overconstraint, which Abaqus resolves and ccx does
-not.
+beams), and coupled DOFs that also carry a `*BOUNDARY` the body does not already hold
+(below).
+
+**Abaqus `*MPC` and overconstraints.** `*MPC` used to keep only `PLANE`/`STRAIGHT` and
+`TIE`; any other line commented out the whole card, so four gated decks ran with their
+`BEAM` MPCs missing. Each line is now converted on its own. Probed on 2.23:
+
+* ccx's `*MPC BEAM` is a **distance** constraint — Abaqus `LINK`, not Abaqus `BEAM`: a node
+  swung by a prescribed motion keeps its distance to the other to 1e-6. ccx rejects it on
+  any node of a beam, truss, shell, membrane or plane element, knot or not ("nodes belonging
+  to 1D/2D elements must not be subject to a BEAM MPC"), and switching its dependent DOF
+  when a link passes 45° to the axis of that DOF stalls the increment. A coincident free
+  node tied to a beam node by `PIN` equations does not get around it: the linear equations
+  depend on the nonlinear MPC's dependent DOF and ccx's result breaks the tie. So `LINK`
+  becomes its linearised `*EQUATION` in a deck without `NLGEOM` (what Abaqus solves there),
+  ccx's `*MPC BEAM` under `NLGEOM`, and is commented out on beam/shell/plane nodes under
+  `NLGEOM` (or, without `--approximate`, in a linear-then-`NLGEOM` deck: ccx's distance MPC
+  runs every step geometrically nonlinear).
+* Abaqus `BEAM` (displacements *and* rotations) → one `*RIGID BODY` per independent node;
+  lines chained through a node are one body, since rigid links compose. Exact at any
+  rotation, and on shell/beam nodes through the knot beams. The barrel-vault deck's four
+  coincident shell node pairs then match an exact linear-equation tie of the same model to
+  all printed digits.
+* A `TIE` on two plain beam nodes ties nothing beyond the translations: two spans tied by
+  six equations deflect exactly like the pinned hinge. Knots make the rotations tie (the
+  `TIE` spans then match one continuous beam within 0.3 %).
+* ccx eliminates an `*EQUATION`'s first term. Where that DOF has a BC or is another
+  equation's, a free term now goes first (a bipartite matching, deck-wide, including the
+  converter's own equations); an equation that reduces to 0 = 0 given the earlier ones and
+  zero BCs is dropped. A **closed loop** of ties (u1 = u2, u2 = u3, u3 = u1) is not rejected
+  by ccx: it warns "zero coefficient on the dependent side" and returns zero displacements —
+  a silent wrong result the converter now prevents.
+* A zero BC on a rigid-body member's eliminated DOF is left out when the body already holds
+  that DOF (reference node fixed in it and unable to rotate, in every step the BC is in
+  force — `OP=NEW` included); otherwise it stays and is warned. `dheller1_uprofile` (a
+  coupled U-profile end section that also carries the BCs) now solves; an equivalent model
+  with plain equations and the same knot beams matches it to all printed digits.
+
+Corpus: `dheller1_uprofile` now solves (it stopped on the cascade). Of the four gated
+`BEAM` decks, the hood-hinge modal deck and the barrel vault still solve and now carry the
+constraint (in all ten hood modes every BEAM group moves rigidly with its reference node
+to 7e-7). The two `davidmorin` patches (`uexternaldb`, `usdfld_v2`) lost their gate: their
+earlier "solve" left the loaded reference point unconnected (a zero-load run); with the
+constraint carried, the `*BOUNDARY, TYPE=VELOCITY` the converter reads as a displacement
+(100 instead of the ~0.95 the velocity integrates to) stretches the patch until ccx stops.
+With that displacement corrected by hand, `uexternaldb` solves with the edge following its
+reference point exactly and `usdfld_v2` necks at 15 % stretch. Six NASA CompDam decks get
+past `*ERROR in cascade` / "two different MPC's" and stop on their VUMAT (one on an
+unsupported `*DLOAD TRVEC5`); `marcello_gori_job_1_3` (a coupling whose reference node is
+free while 38 coupled nodes are clamped) and `sahmotaman_coldforging` (die nodes on the
+axis keep their BC in steps where the die is released) are real overconstraints and still
+stop there. The explicit `davidmorin` decks now stop on ccx's explicit-MPC limit instead of
+running past the time limit without their constraint. Net: 220 → 219 solving (+1, −2).
 
 **Planar beams and trusses.** ccx has no planar beam or truss: it runs `B21` "as a B31" and
 `T2D2` as a `T3D2` (manual 6.2.31, 6.2.34), and the converter maps the other 2-D types onto

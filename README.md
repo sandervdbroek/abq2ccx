@@ -101,6 +101,12 @@ PASS  planar_pinned_beam (B21): f1, f2 = 93.67, 373.02 Hz (beam theory 93.81, 37
 PASS  planar_pinned_circ_beam (B21 + CIRC): f1, f2 = 40.81, 163.28 Hz (beam theory 40.62, 162.49), buckling load 16239 (Euler 16278); max 0.5% diff
 PASS  distribution_solid_plate (C3D8 *SOLID SECTION, per-element *DISTRIBUTION orientation): 84 node displacements vs one *ORIENTATION per element, max difference 2.8e-11 of max |u|
 PASS  distribution_shell_plate (composite S8R *SHELL SECTION, per-element *DISTRIBUTION orientation): 69 node displacements vs one *ORIENTATION per element, max difference 0.0e+00 of max |u|
+PASS  mpc_beam_lever (*MPC BEAM -> *RIGID BODY): tip -3.2488 / lever end -4.2982 (statics -3.2500 / -4.3000, 0.04% diff); vs the equivalent tip load and a stiff-beam lever 3.8e-05
+PASS  mpc_beam_lever, NLGEOM x10: lever end -38.410 vs a stiff-beam lever -38.410 (5.2e-07); lever length 20.0000010 (20)
+PASS  mpc_pin_tie_joints: PIN hinge w = -1.2494 (beam theory -1.2500), TIE joint w = -0.4185 (propped cantilever -0.4199); worst 0.33% diff over both spans
+PASS  mpc_link (linearised *EQUATION): u = (+0.00640, -0.00480) (statics (+0.00640, -0.00480), 0.0e+00 off)
+PASS  mpc_link, NLGEOM (*MPC BEAM): length 5.0000001 (5) after turning 24.5 degrees
+PASS  equation_overconstraint: solves (ccx rejects the deck as written); tied node u_x = -0.0e+00, loop u_x = +0.0420 (+0.0420, +0.0420)
 PASS  op_new_respecify: step 2 beam tip +1.1898 (expected +1.1905, 0.05% diff), plate tip (prescribed) +2.0000 (expected +2.0000, 0.00% diff)
 PASS  op_new_remove: step 2 beam tip +0.5910 (expected +0.5952, 0.71% diff), plate tip (step 1) +4.6380 (expected +4.6380, 0.00% diff)
 PASS  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO *Expansion): free strains 0.0000% / 0.0000% off alpha dT; held cube at T = 90: strains 0.0001% off, sigma_xx = -1.71000 (analytic -1.71000)
@@ -135,6 +141,14 @@ fibre angle through a `*DISTRIBUTION`, as a variable-angle-tow layup does: a `C3
 (two instances, one rotated; a default line, an element-set line and an additional
 rotation) and a composite `S8R` panel whose plies follow +θ and −θ paths. Every node must
 move exactly as in the same model written with one `*ORIENTATION` and section per element.
+The `*MPC` checks hang a rigid lever (`BEAM`) on a cantilever tip and compare it with
+statics, with the statically equivalent tip load and with a 10⁴× stiffer beam lever (also
+at ten times the load under `NLGEOM`, about 27° of rotation); join two-span beams with a
+`PIN` (a hinge: the second span hands half the load to the cantilever) and a `TIE` (a
+rigid joint: one propped cantilever); and hold a spring-supported node with a `LINK`,
+linearised and under `NLGEOM`. The next runs a deck ccx rejects as written: an `*EQUATION`
+whose first DOF has a BC, a duplicate of it, and a loop of ties that ccx would silently
+hold at zero.
 The next two clamp a beam and a plate and give step 2 a `*BOUNDARY, OP=NEW`, which ccx 2.23
 lets drop the clamps' rotations: one step re-specifies every BC (the converter drops its
 OP=NEW), the other removes the beam's prop (the clamped nodes become knots). Converted
@@ -167,9 +181,9 @@ python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
 Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
-references; 220 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
+references; 219 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
 crash, and runs an analysis step), and **219 mesh-only decks** — no `*STEP`, so nothing to
-solve — are **accepted** by ccx. The other 583 convert cleanly but use features ccx cannot
+solve — are **accepted** by ccx. The other 584 convert cleanly but use features ccx cannot
 run (user elements, UMAT/VUMAT and other user subroutines, Riks, cohesive/connector
 elements, piezoelectric/acoustic coupling) or are CAE part fragments / incomplete or
 invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
@@ -202,7 +216,7 @@ Every keyword falls into one of five buckets:
 | --- | --- | --- |
 | **Supported** | emit as-is (it's in the CalculiX keyword set) | `*PLASTIC`, `*HYPERELASTIC`, `*CONTACT PAIR`, `*EQUATION`, `*DENSITY` |
 | **Translated** | dedicated handler adjusts keyword/params/data | `*NCOPY`, `*ELGEN`, `*ELASTIC`, `*SHELL SECTION` composite, `*STEP`, `*DSLOAD`, output cards |
-| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*COUPLING`+`*KINEMATIC`, `*MPC,TIE`→`*EQUATION`, `*DSLOAD`(pressure)→`*DLOAD`, `*COHESIVE/GASKET SECTION`→`*SOLID SECTION` (thin-continuum approx) |
+| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*COUPLING`+`*KINEMATIC`, `*MPC` PIN/TIE→`*EQUATION`, `*MPC` BEAM→`*RIGID BODY`, `*DSLOAD`(pressure)→`*DLOAD`, `*COHESIVE/GASKET SECTION`→`*SOLID SECTION` (thin-continuum approx) |
 | **Dropped** | organisational, no CalculiX meaning | `*PART/*INSTANCE/*ASSEMBLY` (flattened), `*PREPRINT`, `*PARAMETER`, `*SYSTEM` |
 | **Commented** | no equivalent — emitted as `**` comments + warning | `*VISCOELASTIC`, `*CONNECTOR SECTION`, `*GASKET BEHAVIOR`, `*INERTIA RELIEF`, `*FIELD`, `*CONCRETE *` |
 
@@ -234,7 +248,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*BOUNDARY, TYPE=VELOCITY/ACCEL` | `TYPE` dropped | ccx is displacement-only |
 | `*DLOAD, Px` | unchanged | solid face numbering matches Abaqus |
 | `*DSLOAD` (pressure) | `*DLOAD` with `Px` | ccx `*DSLOAD` is submodel-only; shells use `P` |
-| `*MPC, TIE` | per-DOF `*EQUATION` | `PLANE`/`STRAIGHT` kept |
+| `*MPC` | line by line: `PIN`/`TIE` → per-DOF `*EQUATION`; `BEAM` → `*RIGID BODY` per independent node; `LINK` → linearised `*EQUATION` (no `NLGEOM`) or ccx `*MPC BEAM` | `PLANE`/`STRAIGHT` kept; a line ccx cannot take (user MPCs, other types) is commented out alone. `TIE` ties shell/beam rotations through knots (ccx ignores DOFs 4–6 of a plain shell/beam node in an `*EQUATION`) and the temperature in thermal steps; BEAM lines chained through a node form one body; ccx's `*MPC BEAM` keeps the distance between two nodes but rejects beam/shell/plane nodes |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
 | rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
@@ -257,10 +271,16 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*AMP` | `*AMPLITUDE` | keyword abbreviation expanded |
 | `R3D3`/`R3D4` rigid elements | flagged | model as `*RIGID BODY` (NSET + ref/rot node) |
 
-The converter also runs a **pre-flight overconstraint check**: if a DOF is both the
-dependent term of an `*EQUATION`/`*MPC` and the target of a `*BOUNDARY`, it warns —
-that combination is the single most common crash on converted decks (`*ERROR in
-cascade … dependent side of a MPC and a SPC`). Flattened set/surface names are kept
+The converter also **resolves overconstraints** that ccx rejects and Abaqus resolves itself
+— the single most common crash on converted decks (`*ERROR in cascade … dependent side of
+a MPC and a SPC` / `… two different MPC's`). ccx eliminates the *first* term of every
+`*EQUATION` (also the ones the converter writes), so where that DOF has a `*BOUNDARY` or is
+eliminated by another constraint, another term of the same equation goes first (a bipartite
+matching assigns them); an equation that follows from the others and zero BCs (a duplicate,
+or one closing a loop of ties — ccx would silently hold such a loop at zero) is dropped, and
+a zero BC on a rigid-body member's DOF that the body already holds (reference node fixed
+there, rotations fixed) is left out. What cannot be resolved exactly keeps the
+`Possible overconstraint` warning. Flattened set/surface names are kept
 within CalculiX's **20-significant-character** limit (and uniquified) so instance
 prefixing can't silently collide two sets.
 
@@ -352,7 +372,9 @@ converter warns about the ones it can detect; the rest are here so you know to c
 
 * **Overconstraint** — a `*BOUNDARY` on a DOF that's also an `*EQUATION`/`*MPC`/tie
   dependent → `*ERROR in cascade … dependent side of a MPC and a SPC`. The converter
-  pre-flight-warns; fix by removing the BC or the constraint on that DOF.
+  reorders equation terms, drops redundant equations and leaves out BCs a rigid body
+  already implies; what is left is warned — fix by removing the BC or the constraint on
+  that DOF.
 * **Set used before defined** — ccx is order-dependent (Abaqus isn't). The converter
   emits nodes/elements, then sets, then steps, which avoids this.
 * **Set/surface name > 20 significant chars** → silent collision. Handled for the
@@ -394,9 +416,10 @@ converter warns about the ones it can detect; the rest are here so you know to c
   density) to each such node, which makes it one, and ties the node's rotations to the
   coupling as Abaqus does — exact in linear and `NLGEOM` steps (validated against the same
   plate built from solids). Not covered: explicit dynamics (ccx stops: "linear and
-  nonlinear MPC's depend on each other"), a coupling whose shell/beam reference node
-  couples only some translations, and coupled DOFs that also carry a `*BOUNDARY` (ccx
-  stops on that overconstraint, which Abaqus resolves).
+  nonlinear MPC's depend on each other" — also for rigid bodies on plane/axisymmetric
+  nodes), a coupling whose shell/beam reference node couples only some translations, and
+  a `*BOUNDARY` on a coupled DOF that the body does not already hold (ccx stops on that
+  overconstraint, which Abaqus resolves).
 * A rotational BC on a **circular-section beam** node also locks the node's other rotations
   in ccx 2.23 (it ties the section's midside nodes to its corners, which a circle cannot
   follow). Where a BC holds only some of DOFs 4–6, or a nonzero one, the converter gives the
@@ -410,6 +433,12 @@ converter warns about the ones it can detect; the rest are here so you know to c
   converter drops an OP=NEW that removes nothing, and gives the affected nodes knot beams
   where it does remove BCs (a beam clamp then is 0.1–0.7 % stiffer, as a rigid section);
   with an explicit step in the deck it can only warn.
+* `*MPC`: user MPCs (a numeric type) and types other than `PIN`, `TIE`, `LINK`, `BEAM`,
+  `PLANE`, `STRAIGHT` are commented out. `LINK` under `NLGEOM` on a beam, shell, truss,
+  membrane or plane-element node has no exact ccx form (ccx's distance MPC rejects such
+  nodes), nor in a deck whose first step is linear and a later one `NLGEOM` (only with
+  `--approximate`); ccx's distance MPC also struggles to converge once a link turns past 45°
+  to the axis of its eliminated DOF.
 * `*DISTRIBUTION` / variable-angle-tow orientations: ccx 2.23 applies them per element
   only under `*SOLID SECTION`, so the converter splits shell and membrane sections into
   one plain `*ORIENTATION` and section per distinct direction (validated against the same
@@ -445,6 +474,10 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/planar_pinned_circ_beam.inp`](examples/planar_pinned_circ_beam.inp) | the same with a circular section (`B32` in ccx): the twist held at the first element's middle node |
 | [`examples/op_new_respecify.inp`](examples/op_new_respecify.inp) | clamped `B31` beam + `S4` plate, step 2 re-specifies every BC with `*BOUNDARY, OP=NEW` → OP=NEW dropped |
 | [`examples/op_new_remove.inp`](examples/op_new_remove.inp) | the same, step 2's `*BOUNDARY, OP=NEW` removes the beam's prop → knot beams on the clamped nodes |
+| [`examples/mpc_beam_lever.inp`](examples/mpc_beam_lever.inp) | `*MPC BEAM` lever on a `B31` tip → `*RIGID BODY` on a knot, vs the equivalent tip load and a stiff-beam lever |
+| [`examples/mpc_pin_tie_joints.inp`](examples/mpc_pin_tie_joints.inp) | two-span beams joined by `*MPC PIN` (hinge) and `TIE` (rigid joint, knots) |
+| [`examples/mpc_link.inp`](examples/mpc_link.inp) | `*MPC LINK` + `SPRINGA` → linearised `*EQUATION`; ccx `*MPC BEAM` under `NLGEOM` |
+| [`examples/equation_overconstraint.inp`](examples/equation_overconstraint.inp) | `*EQUATION` on a BC'd DOF (terms reordered), a duplicate and a loop of ties (dropped) |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

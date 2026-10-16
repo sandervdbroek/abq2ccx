@@ -88,9 +88,15 @@ TRANSLATED = {
         "`CONSTANT RESULTANT` dropped (warned under NLGEOM).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`.",
     "*TIE": "Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept.",
-    "*MPC": "`TIE` → per-DOF `*EQUATION`; `PLANE`/`STRAIGHT` kept; others commented.",
+    "*MPC": "line by line: `PIN` → `*EQUATION` on DOFs 1-3; `TIE` → per-DOF `*EQUATION` "
+            "(shell/beam rotations through knots, DOF 11 in thermal steps); `BEAM` → one "
+            "`*RIGID BODY` per independent node (chained lines one body); `LINK` → linearised "
+            "`*EQUATION` without `NLGEOM`, ccx `*MPC BEAM` with it (not on beam/shell/plane "
+            "nodes); `PLANE`/`STRAIGHT` kept; user MPCs and other types commented, line by line.",
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
-        "(as Abaqus does unless `UNSORTED`).",
+        "(as Abaqus does unless `UNSORTED`); terms reordered so the eliminated (first) DOF has no "
+        "BC and is not eliminated elsewhere; an equation that follows from the others and zero "
+        "BCs (a duplicate, a loop's closing tie) dropped.",
     "*KINEMATIC COUPLING": "every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF "
         "range (the reference node's DOFs 4-6 then take BCs and moments natively); rotation lines "
         "on shell/beam nodes become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`).",

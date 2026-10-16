@@ -1,0 +1,70 @@
+*Heading
+Two-span beams joined by *MPC PIN (a hinge) and *MPC TIE (a rigid joint)
+** Each structure: a B31 span x = 0..100 clamped at x = 0 and a second span x = 100..200 on
+** a roller at x = 200 (u_y = u_z = 0, no twist); the spans meet at coincident nodes joined
+** by an MPC, and P = 1 acts in -y at x = 150.  L = 100, 2 x 2 section, E = 1e5.
+**   PIN (nodes 21 / 101): a hinge — the second span is simply supported and hands P/2 to
+**       the cantilever: w(100) = (P/2) L^3/(3EI) = 1.25, w(150) = w(100)/2 + P L^3/(48EI).
+**   TIE (nodes 221 / 301): a rigid joint — one propped cantilever of length 2L; abq2ccx
+**       makes the joint nodes ccx knots, since ccx ignores the rotations of a plain beam
+**       node in an *EQUATION (the joint would stay a hinge).
+** validate_with_ccx.py checks both against beam theory.
+*Node
+1, 0., 0., 0.
+21, 100., 0., 0.
+101, 100., 0., 0.
+121, 200., 0., 0.
+201, 0., 0., 50.
+221, 100., 0., 50.
+301, 100., 0., 50.
+321, 200., 0., 50.
+*Ngen
+1, 21, 1
+*Ngen
+101, 121, 1
+*Ngen
+201, 221, 1
+*Ngen
+301, 321, 1
+*Element, type=B31, elset=BEAMS
+1, 1, 2
+*Elgen, elset=BEAMS
+1, 20, 1, 1
+*Element, type=B31, elset=BEAMS
+101, 101, 102
+*Elgen, elset=BEAMS
+101, 20, 1, 1
+*Element, type=B31, elset=BEAMS
+201, 201, 202
+*Elgen, elset=BEAMS
+201, 20, 1, 1
+*Element, type=B31, elset=BEAMS
+301, 301, 302
+*Elgen, elset=BEAMS
+301, 20, 1, 1
+*Nset, nset=CLAMPS
+1, 201
+*Nset, nset=ROLLERS
+121, 321
+*Nset, nset=OUT
+21, 101, 111, 221, 301, 311
+*Beam Section, elset=BEAMS, material=STEEL, section=RECT
+2., 2.
+0., 0., 1.
+*Material, name=STEEL
+*Elastic
+1.e5, 0.3
+*MPC
+PIN, 101, 21
+TIE, 301, 221
+*Boundary
+CLAMPS, ENCASTRE
+ROLLERS, 2, 4
+*Step
+*Static
+*Cload
+111, 2, -1.
+311, 2, -1.
+*Node Print, nset=OUT
+U
+*End Step

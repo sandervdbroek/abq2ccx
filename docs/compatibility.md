@@ -19,10 +19,13 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **Coupled temperature-displacement elements share the base element name** (`C3D8T`≡`C3D8`, `CAX4RT`≡`CAX4R`); the temperature DOF comes from the step | strip the trailing `T` | ccx `*COUPLED TEMPERATURE-DISPLACEMENT` / element sections (no separate `…T` element names) |
 | **A keyword line ending in a comma continues its *parameters* on the next line** | splice them back; never merge a genuine data row | Abaqus input syntax: "continue a long keyword line by ending it with a comma" |
 | **`NSET=` on `*NODE`, `ELSET=` on `*ELEMENT`, `GENERATE` on `*NSET`/`*ELSET`** are accepted | relied upon when emitting geometry | ccx `*NODE`/`*ELEMENT`/`*NSET`/`*ELSET` sections |
-| **`*EQUATION`/`*MPC` dependent DOF can't also be an SPC** | pre-flight overconstraint warning | ccx `*EQUATION` section; the `cascade` error on the forums |
+| **`*EQUATION`/`*MPC` dependent DOF can't also be an SPC** — ccx eliminates an equation's *first* term | equation terms reordered so a free DOF goes first, redundant equations dropped, BCs a rigid body implies left out; the rest warned | ccx `*EQUATION` section; the `cascade` error on the forums; probed on 2.23 |
 | **ccx has no planar beam or truss**: `B21` "is internally replaced by a B31 element", `T2D2` by a `T3D2`, so their out-of-plane DOFs are free; a rotational BC on every node of an expanded beam stiffens it | in a planar model, fix DOF 3 on the nodes of 2-D beams/trusses, and DOFs 4–5 at one node of a straight beam whose twist is free — on a circular section an element's middle node (twist modes stay in `*FREQUENCY`, warned) | ccx manual 6.2.31, 6.2.34; probed on 2.23 (`B21` frequency deck: every bending mode twice) |
 | **A rotational BC on a circular-section beam node locks its other rotations**: for every rotational BC on a non-knot `B32`/`B32R` node ccx ties the section's midside nodes to the mean of its corners, and a `CIRC` section's eight nodes lie on the circle, where no rigid rotation satisfies that; at a 3-node element's middle node the tied nodes are unused | an element end node whose rotational BCs hold only some of DOFs 4–6, or a nonzero one, gets a force-free knot beam: a knot's BCs act on its rotation node (warned when most nodes need one, or not repaired under an explicit step) | ccx sources `gen3dfrom1d.f`, `gen3dboun.f`; probed on 2.23 (twist held at pinned ends: 0.27 of beam theory, 0.994 with knots) |
 | **A later step's `*BOUNDARY, OP=NEW` loses the rotational BCs it re-specifies on shell/beam nodes**: ccx applies them through mean-rotation MPCs whose angle SPC OP=NEW deletes, and the rebuilt MPC finds no free dependent DOF; on shells stale SPC indices also zero unrelated BCs | from step 2 on, after rotational BCs on shell/beam nodes, an OP=NEW that removes nothing is dropped; where it removes BCs, the shell/beam nodes it would break get knot beams (a deck with an explicit step: warned) | ccx sources `boundarys.f`, `gen3dboun.f`, `usermpc.f` ("no MPC is generated for the mean rotation"); probed on 2.23 (clamped cantilever re-clamped with OP=NEW: tip deflection 1.87e5 instead of 0.595; a prescribed shell displacement of 2 came out 0) |
+| **ccx's `*MPC BEAM` keeps the distance between two nodes** (Abaqus `LINK`, not Abaqus `BEAM`) and rejects nodes of beam, truss, shell, membrane and plane elements | Abaqus `LINK` → ccx `*MPC BEAM` under `NLGEOM` (a linearised `*EQUATION` without it); Abaqus `BEAM` → `*RIGID BODY` | probed on 2.23 (a link turned through 8° and 25° keeps its length to 1e-8; `*ERROR in gen3dmpc: nodes belonging to 1D/2D elements must not be subject to a BEAM MPC`) |
+| **A rotational DOF of a non-knot shell/beam node does nothing in an `*EQUATION`** | `*MPC TIE` rotations are tied between knots only | probed on 2.23: two beam spans `TIE`d by six equations deflect exactly like a `PIN`ned hinge, as knots like one continuous beam |
+| **A closed loop of `*EQUATION` ties** (u1 = u2, u2 = u3, u3 = u1) is accepted, but ccx then warns "zero coefficient on the dependent side" and **holds the whole loop at zero** | the loop's closing equation is dropped (it follows from the others) | probed on 2.23 |
 
 ## Version notes
 
@@ -122,7 +125,12 @@ beam theory within 0.2 %, planar `B21` beams' frequencies and buckling loads (re
 and circular sections) match it within 0.6 %, a C3D8 plate and a composite S8R
 variable-angle-tow panel whose fibre angles come from a `*DISTRIBUTION` move exactly like
 the same models written with one `*ORIENTATION` and section per element (to 3e-11 and
-exactly), a clamped beam and plate keep their clamps across a later step's
+exactly), a rigid lever (`*MPC BEAM`) on a cantilever tip matches statics within 0.04 % (and
+a 10⁴× stiffer beam lever within 5e-7 at 27° of rotation), `*MPC PIN` and `TIE` joints
+between beam spans match the hinge and the propped-cantilever solutions within 0.33 %, an
+`*MPC LINK` matches statics exactly and keeps its length under `NLGEOM`, a deck whose
+`*EQUATION` clashes with a BC (and has a duplicate and a loop of ties) solves with the ties
+held, a clamped beam and plate keep their clamps across a later step's
 `*BOUNDARY, OP=NEW` (beam theory within 0.7 %, a prescribed plate displacement exactly),
 and the composite-shell and assembly decks also solve. This proves the full pipeline —
 `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face, sections — is
@@ -130,7 +138,7 @@ correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
-220 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
+219 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
 convert cleanly but use features ccx cannot run, and each was verified to fail no worse
 than the original unconverted deck. Bulk-running every deck
 through convert → integrity → ccx is also what drove several converter fixes
@@ -177,9 +185,18 @@ approximately or commented out, which is the first place to look.
 `*COUPLING`+`*Kinematic` passes to ccx natively (ccx has both keywords; the converter
 resolves the `REF NODE` set and fills an empty `*Kinematic`). Where it couples shell,
 membrane, beam or truss nodes, ccx 2.23 accepts it only through the knot beams above;
-explicit-dynamics steps cannot run it at all, and a coupled DOF that also carries a
-`*BOUNDARY` stops ccx ("dependent side of a MPC and a SPC") where Abaqus resolves the
-overconstraint.
+explicit-dynamics steps cannot run it at all (nor any rigid body on plane or axisymmetric
+nodes: "linear and nonlinear MPC's depend on each other"). A coupled DOF that also carries
+a `*BOUNDARY` stops ccx ("dependent side of a MPC and a SPC") where Abaqus resolves the
+overconstraint; the converter leaves such a BC out where the body already holds that DOF
+(its reference node fixed there and unable to rotate), which is exact, and warns otherwise.
+
+Abaqus `*MPC` is converted line by line: `PIN` and `TIE` become `*EQUATION`s, `BEAM`
+lines become one `*RIGID BODY` per independent node (lines chained through a node form one
+body), `LINK` becomes its linearised `*EQUATION` without `NLGEOM` and ccx's distance MPC
+with it, and `PLANE`/`STRAIGHT` pass through. User MPCs (a numeric type, the Abaqus `MPC`
+subroutine) and the other types (`SLIDER`, `REVOLUTE`, `UNIVERSAL`, `ELBOW`, `LINEAR`, …)
+are commented out one line at a time, with the reason in the report.
 
 ## What "verified" means here
 

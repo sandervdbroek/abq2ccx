@@ -382,6 +382,120 @@ def main():
                   f"orientation): {len(ue)} node displacements vs one *ORIENTATION per element, "
                   f"max difference {err:.1e} of max |u|")
             failures += 0 if ok else 1
+    # --- *MPC: a rigid lever (BEAM), joints (PIN / TIE) and a rigid link (LINK) -------
+    # BEAM -> *RIGID BODY on the beam's tip node (a knot whose ROT NODE follows its
+    # rotation); PIN / TIE -> *EQUATION (a TIE between knots, so the rotations take part);
+    # LINK -> its linearised *EQUATION, or ccx's *MPC BEAM under NLGEOM.
+    def solve(name, subs=(), nodes=()):
+        """Convert an example (optionally with text substitutions), run it and return the
+        last printed displacement of each node, or None."""
+        src = os.path.join(EXAMPLES, name + ".inp")
+        text = open(src).read()
+        for a, b in subs:
+            text = text.replace(a, b)
+        tmp_src = os.path.join(tmp, f"{name}_{len(subs)}_src.inp")
+        with open(tmp_src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"{name}_{len(subs)}.inp")
+        convert(tmp_src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = {n: dat_displacement(os.path.join(d, "job.dat"), n) for n in nodes} \
+            if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+        if status != "solved" or any(v is None for v in u.values()):
+            print(f"FAIL  {name}{' (variant)' if subs else ''}: did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return u
+
+    def rel(a, b):
+        return abs(a - b) / abs(b)
+
+    ei = 1.0e5 * 4.0 / 3.0                                      # E I of the 2 x 2 section
+    u = solve("mpc_beam_lever", nodes=(21, 100, 221, 400))
+    if u:
+        tip = 1e6 / (3 * ei) + 20 * 1e4 / (2 * ei)              # P = 1, M = P e, L = 100
+        lever = tip + (1e4 / (2 * ei) + 20 * 100 / ei) * 20
+        errs = [rel(-u[21][1], tip), rel(-u[100][1], lever), rel(u[21][1], u[221][1]),
+                rel(u[100][1], u[400][1])]
+        ok = max(errs[:2]) < 0.01 and max(errs[2:]) < 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  mpc_beam_lever (*MPC BEAM -> *RIGID BODY): tip "
+              f"{u[21][1]:+.4f} / lever end {u[100][1]:+.4f} (statics {-tip:+.4f} / {-lever:+.4f}, "
+              f"{max(errs[:2]) * 100:.2f}% diff); vs the equivalent tip load and a stiff-beam "
+              f"lever {max(errs[2:]):.1e}")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    # the same lever at 10x the load under NLGEOM (about 27 degrees at the tip)
+    u = solve("mpc_beam_lever", subs=[("*Step\n*Static\n",
+                                       "*Step, nlgeom=YES\n*Static\n0.05, 1., 1e-5, 0.25\n"),
+                                      ("100, 2, -1.", "100, 2, -10."),
+                                      ("400, 2, -1.", "400, 2, -10.")],
+              nodes=(21, 100, 400))
+    if u:
+        length = math.dist((100 + u[21][0], u[21][1], u[21][2]),
+                           (120 + u[100][0], u[100][1], u[100][2]))
+        err = rel(u[100][1], u[400][1])
+        ok = err < 1e-4 and rel(length, 20.0) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  mpc_beam_lever, NLGEOM x10: lever end {u[100][1]:+.3f} "
+              f"vs a stiff-beam lever {u[400][1]:+.3f} ({err:.1e}); lever length {length:.7f} "
+              f"(20)")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    u = solve("mpc_pin_tie_joints", nodes=(21, 101, 111, 221, 301, 311))
+    if u:
+        pin = (0.5e6 / (3 * ei), 0.25e6 / (3 * ei) + 1e6 / (48 * ei))    # w(100), w(150)
+        rb = 150.0 ** 2 * (3 * 200 - 150) / (2 * 200.0 ** 3)           # roller reaction
+        tie = tuple((1.0 * x * x * (3 * 150 - x) - rb * x * x * (3 * 200 - x)) / (6 * ei)
+                    for x in (100.0, 150.0))
+        errs = [rel(-u[21][1], pin[0]), rel(-u[111][1], pin[1]),
+                rel(-u[221][1], tie[0]), rel(-u[311][1], tie[1])]
+        same = max(abs(a - b) for x, y in ((21, 101), (221, 301)) for a, b in zip(u[x], u[y]))
+        ok = max(errs) < 0.02 and same < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  mpc_pin_tie_joints: PIN hinge w = {u[21][1]:+.4f} "
+              f"(beam theory {-pin[0]:+.4f}), TIE joint w = {u[221][1]:+.4f} (propped cantilever "
+              f"{-tie[0]:+.4f}); worst {max(errs) * 100:.2f}% diff over both spans")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    u = solve("mpc_link", nodes=(2,))
+    if u:
+        ref = (0.0064, -0.0048, 0.0)                             # (P.n / k) n
+        err = max(abs(a - b) for a, b in zip(u[2], ref))
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  mpc_link (linearised *EQUATION): u = ({u[2][0]:+.5f}, "
+              f"{u[2][1]:+.5f}) (statics (+0.00640, -0.00480), {err:.1e} off)")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    # NLGEOM and a large load: ccx's *MPC BEAM keeps the length while the link turns ~25 deg
+    # (it turns away from the 45-degree diagonal, where ccx would have to switch the MPC's
+    # dependent DOF)
+    u = solve("mpc_link", subs=[("*Step\n*Static\n",
+                                 "*Step, nlgeom=YES\n*Static\n0.05, 1., 1e-5, 0.25\n"),
+                                ("2, 1, 10.", "2, 1, -2000.")], nodes=(2,))
+    if u:
+        length = math.dist((3 + u[2][0], 4 + u[2][1], u[2][2]), (0.0, 0.0, 0.0))
+        turn = math.degrees(math.atan2(4 + u[2][1], 3 + u[2][0]) - math.atan2(4, 3))
+        ok = rel(length, 5.0) < 1e-6 and turn > 10
+        print(f"{'PASS' if ok else 'FAIL'}  mpc_link, NLGEOM (*MPC BEAM): length {length:.7f} (5) "
+              f"after turning {turn:.1f} degrees")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    # an *EQUATION whose first DOF has a BC: the terms are swapped, the duplicate dropped;
+    # a loop of ties loses its closing equation (ccx would hold the loop at zero)
+    u = solve("equation_overconstraint", nodes=(2, 3, 6, 7))
+    if u:
+        loop = [u[n][0] for n in (3, 6, 7)]
+        ok = abs(u[2][0]) < 1e-12 and min(loop) > 0.01 and max(loop) - min(loop) < 1e-12
+        print(f"{'PASS' if ok else 'FAIL'}  equation_overconstraint: solves (ccx rejects the deck "
+              f"as written); tied node u_x = {u[2][0]:+.1e}, loop u_x = {loop[0]:+.4f} "
+              f"({loop[1]:+.4f}, {loop[2]:+.4f})")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
 
     # --- *BOUNDARY, OP=NEW in a later step on a clamped beam and plate --------------------
     # ccx 2.23 does not rebuild re-specified rotational BCs on shell/beam nodes after OP=NEW:

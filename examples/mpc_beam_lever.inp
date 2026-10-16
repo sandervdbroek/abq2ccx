@@ -1,0 +1,71 @@
+*Heading
+Rigid lever on a cantilever tip (*MPC BEAM), checked against statics
+** Three B31 cantilevers, L = 100, 2 x 2 section, E = 1e5, clamped at x = 0:
+**   A  the tip node 21 carries a rigid lever (*MPC BEAM) to node 100 at x = 120, loaded
+**      by P = 1 in -y;
+**   B  the same beam loaded at its tip by the statically equivalent P = 1 in -y and
+**      M = -P e = -20 about z (e = 20);
+**   C  the same beam with the lever modelled as a 1e4 times stiffer B31 to node 400.
+** Statics: w_tip = P L^3/(3EI) + M L^2/(2EI), theta_tip = P L^2/(2EI) + M L/(EI) and the
+** lever end w_tip + theta_tip e — 3.25 and 4.30 with EI = 1e5 * 4/3.  abq2ccx turns the
+** BEAM MPC into a *RIGID BODY on the beam node (a knot whose ROT NODE follows the node's
+** rotation); validate_with_ccx.py checks A against B and C and the statics.
+*Node
+1, 0., 0., 0.
+21, 100., 0., 0.
+100, 120., 0., 0.
+201, 0., 0., 50.
+221, 100., 0., 50.
+301, 0., 0., 100.
+321, 100., 0., 100.
+400, 120., 0., 100.
+*Ngen, nset=BEAM_A
+1, 21, 1
+*Ngen, nset=BEAM_B
+201, 221, 1
+*Ngen, nset=BEAM_C
+301, 321, 1
+*Element, type=B31, elset=BEAMS
+1, 1, 2
+*Elgen, elset=BEAMS
+1, 20, 1, 1
+*Element, type=B31, elset=BEAMS
+201, 201, 202
+*Elgen, elset=BEAMS
+201, 20, 1, 1
+*Element, type=B31, elset=BEAMS
+301, 301, 302
+*Elgen, elset=BEAMS
+301, 20, 1, 1
+*Element, type=B31, elset=LEVER
+400, 321, 400
+*Nset, nset=ROOTS
+1, 201, 301
+*Nset, nset=TIPS
+21, 100, 221, 321, 400
+*Beam Section, elset=BEAMS, material=STEEL, section=RECT
+2., 2.
+0., 0., 1.
+*Beam Section, elset=LEVER, material=STIFF, section=RECT
+2., 2.
+0., 0., 1.
+*Material, name=STEEL
+*Elastic
+1.e5, 0.3
+*Material, name=STIFF
+*Elastic
+1.e9, 0.3
+*MPC
+BEAM, 100, 21
+*Boundary
+ROOTS, ENCASTRE
+*Step
+*Static
+*Cload
+100, 2, -1.
+221, 2, -1.
+221, 6, -20.
+400, 2, -1.
+*Node Print, nset=TIPS
+U
+*End Step

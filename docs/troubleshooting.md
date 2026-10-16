@@ -14,8 +14,19 @@ The single most common crash on converted decks. A degree of freedom is **both**
 dependent term of an `*EQUATION`/`*MPC`/tie/coupling **and** the target of a
 `*BOUNDARY`. CalculiX eliminates the dependent DOF, so it can't also be constrained.
 
-* The converter **pre-flight-warns** about this ("Possible overconstraint: node N
-  DOF d …"). Fix by removing either the BC or the constraint on that DOF.
+* The converter resolves what it can exactly, as Abaqus would: it lists the terms of an
+  `*EQUATION` (also the ones it writes) so that a DOF without a BC is eliminated, drops an
+  equation that follows from the others and zero BCs, and leaves out a zero BC on a
+  rigid-body member's DOF when the body already holds it. What remains is warned
+  ("Possible overconstraint: node N DOF d …"). Fix those by removing either the BC or the
+  constraint on that DOF.
+* The sibling message `*ERROR reading *EQUATION: the DOF corresponding to node N in
+  direction d is detected on the dependent side of two different MPC's` has the same
+  cause (two equations eliminating one DOF) and the same handling.
+* A closed loop of `*EQUATION` ties (u1 = u2, u2 = u3, u3 = u1) does **not** stop ccx: it
+  warns `zero coefficient on the dependent side of an equation` and holds the loop at zero.
+  The converter drops the loop's closing equation; if you see that warning on a deck you
+  wrote by hand, look for one.
 * For 2-D/plane models, keep DOF 3 out of couplings.
 * It often appears after assembly flattening or `*SYMM` expansion drops a BC onto a
   coupled node.

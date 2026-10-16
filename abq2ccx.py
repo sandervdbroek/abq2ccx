@@ -1537,6 +1537,25 @@ def _distribution_axes(vals: Sequence[float], rect: bool,
 # ---------------------------------------------------------------------------
 
 
+def bc_steps(segments: List[List[Tuple[bool, Tuple[int, int], bool]]]):
+    """Yield the *BOUNDARY DOFs in force in each step, as {(node, dof): held at zero}, from
+    the BC entries (OP=NEW, (node, dof), zero value) of the model data (segments[0]) and of
+    each step.  Abaqus and ccx semantics: a step keeps the BCs in force before it, a later
+    value on a DOF replaces the earlier one, and a step with a *BOUNDARY, OP=NEW starts from
+    none.  A deck without steps yields the model data's BCs.  (One dict, updated in place.)"""
+    active: Dict[Tuple[int, int], bool] = {}
+    for _, k, z in segments[0]:
+        active[k] = z
+    if len(segments) == 1:
+        yield active
+    for seg in segments[1:]:
+        if any(new for new, _, _ in seg):
+            active = {}
+        for _, k, z in seg:
+            active[k] = z
+        yield active
+
+
 class Converter:
 
     def __init__(self, report: Report, options) -> None:
@@ -1593,7 +1612,6 @@ class Converter:
         self._knot_k: Optional[float] = None       # its conductivity (thermal decks only)
         self._tie_rotations = True                 # False in a heat-transfer-only deck
         self._rot_nodes: set = set()               # nodes with rotations (shell/beam, not truss)
-        self._spc: set = set()                     # (node, dof) under a *BOUNDARY in any step
         self._rot_tied: set = set()                # (node, dof) already tied to a body rotation
         self._transformed: set = set()             # nodes with a *TRANSFORM (local DOFs)
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
@@ -1606,6 +1624,14 @@ class Converter:
         self._dist_tables: set = set()             # *DISTRIBUTION TABLE names they use
         self._dist_plain: Dict[tuple, str] = {}    # (axes, angle, system) -> orientation name
         self._used_names: set = set()              # names the converter may not reuse
+        # Abaqus *MPC lines (see _plan_mpcs): (id(card), line) -> (mode, node pairs or reason),
+        # and the rigid bodies of the BEAM lines by the card they are emitted with
+        self._mpc_plan: Dict[Tuple[int, int], Tuple[str, object]] = {}
+        self._mpc_bodies: Dict[int, List[dict]] = {}
+        self._mpc_thermal = False                  # a step solves for temperatures
+        self._mpc_mechanical = True                # ... for displacements
+        self._implied_spc: set = set()             # (node, dof) BCs a rigid constraint fixes
+        self._gen_ties: set = set()                # the rotation ties the converter writes
 
     # -- properties ---------------------------------------------------------
     @property
@@ -3288,6 +3314,8 @@ class Converter:
                 out.extend(kept if kept is not None else [", ".join(g)])
             else:
                 out.append(", ".join(g))
+        if self._implied_spc:
+            out = out[:1] + [x for ln in out[1:] for x in self._without_implied(ln)]
         if getattr(self, "_n_inactive_rot", 0):
             self.report.warn("Rotational DOFs (4-6) prescribed on nodes that only belong to plane-"
                              "stress/plane-strain/axisymmetric elements were dropped: those nodes "
@@ -3644,28 +3672,117 @@ class Converter:
         return [emit_keyword("CONTACT FILE", keep), ", ".join(dedup_str(labels))]
 
     def handle_mpc(self, b: Block) -> List[str]:
-        rot = self.has_rotational_dof
-        plane_lines: List[str] = []
-        eq_lines: List[str] = []
-        for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
-            if not f:
-                continue
+        """Abaqus ``*MPC``, converted line by line (a line ccx cannot take is commented out
+        on its own, the rest of the card is kept), from the deck-wide plan of _plan_mpcs:
+
+        * PLANE / STRAIGHT: native ccx MPCs, kept;
+        * PIN (equal displacements) and TIE (all common DOFs equal) -> per-DOF *EQUATION,
+          exact; TIE ties rotations only between shell/beam nodes, which get knot beams —
+          ccx ignores DOFs 4-6 of a non-knot shell/beam node in an *EQUATION (probed: a
+          tied beam joint stays a hinge);
+        * LINK (constant distance, rotations free) -> its linearised *EQUATION when no step
+          runs NLGEOM, else ccx's *MPC BEAM, which keeps the distance between two nodes
+          (probed) but rejects nodes of beam/truss/shell/membrane/plane elements;
+        * BEAM (rigid beam: displacements AND rotations) -> one *RIGID BODY per independent
+          node, emitted at the card where its first line appears;
+        * user MPCs (a numeric type) and the other Abaqus types are commented out."""
+        native: List[str] = []
+        eqs: List[str] = []
+        skipped: "OrderedDict[str, List[str]]" = OrderedDict()     # reason -> lines
+        for i, f in enumerate(self._mpc_fields(b)):
             typ = f[0].upper()
-            if typ in ("PLANE", "STRAIGHT"):
-                plane_lines.append(", ".join(f))
-            elif typ == "TIE" and len(f) >= 3:
-                dep, indep = f[1], f[2]
-                for d in range(1, (6 if rot else 3) + 1):
-                    eq_lines += ["*EQUATION", "2", f"{dep}, {d}, 1.0, {indep}, {d}, -1.0"]
-                self.report.note("*MPC TIE converted to per-DOF *EQUATION.", once=True)
-            else:
-                return self._commented(b, f"*MPC TYPE={typ} not convertible automatically; edit manually.")
+            line = ", ".join(f)
+            mode, arg = self._mpc_plan.get((id(b), i), (None, None))
+            if typ in ("PLANE", "STRAIGHT") and not b.has("USER"):
+                native.append(line)
+            elif re.fullmatch(r"[-+]?\d+", typ) or b.has("USER"):
+                skipped.setdefault(f"*MPC user type {typ}: ccx runs user MPCs only from its own "
+                                   f"compiled umpc routine, and the Abaqus MPC subroutine cannot "
+                                   f"be used; commented out — the constraint is missing.",
+                                   []).append(line)
+            elif mode == "skip" or mode is None:
+                skipped.setdefault(arg or f"*MPC {typ} has no ccx equivalent the converter can "
+                                          f"write (supported: PIN, TIE, LINK, BEAM, PLANE, "
+                                          f"STRAIGHT); commented out — the constraint is missing.",
+                                   []).append(line)
+            elif mode == "beam":
+                continue                    # part of a *RIGID BODY (self._mpc_bodies)
+            elif mode == "link-mpc":
+                native += [f"BEAM, {dep}, {ind}" for dep, ind in arg]
+            elif mode == "link-eq":
+                self._warn_transformed_mpc(arg)
+                for dep, ind in arg:
+                    eqs += self._link_equation(dep, ind)
+            else:                           # PIN / TIE
+                self._warn_transformed_mpc(arg)
+                for dep, ind in arg:
+                    both = all(n in self._knots and n in self._rot_nodes for n in (dep, ind))
+                    dofs = ((1, 2, 3, 4, 5, 6) if typ == "TIE" and both and self._tie_rotations
+                            else (1, 2, 3)) if self._mpc_mechanical else ()
+                    if typ == "TIE" and self._mpc_thermal:
+                        dofs += (11,)
+                    for d in dofs:
+                        eqs += ["*EQUATION", "2", f"{dep}, {d}, 1., {ind}, {d}, -1."]
+                    if typ == "TIE" and not both and any(n in self._rot_nodes for n in (dep, ind)):
+                        self.report.warn("*MPC TIE between a shell/beam node and a node without "
+                                         "rotations (solid or free node): only the displacements "
+                                         "are tied — ccx has no rotations on the other node.",
+                                         once=True)
+                if typ == "PIN" and not self._mpc_mechanical:
+                    self.report.note("*MPC PIN ties displacements only; a heat-transfer-only deck "
+                                     "has none, so it was left out.", once=True)
+                else:
+                    self.report.note("*MPC PIN -> *EQUATION on DOFs 1-3 (equal displacements, "
+                                     "rotations free; exact)." if typ == "PIN" else
+                                     "*MPC TIE -> per-DOF *EQUATION (exact): displacements, the "
+                                     "rotations of two shell/beam nodes (made ccx knots for it) "
+                                     "and the temperature in thermal steps.", once=True)
         out: List[str] = []
-        if plane_lines:
-            out.append("*MPC")
-            out.extend(plane_lines)
-        out.extend(eq_lines)
+        if native:
+            out += ["*MPC"] + native
+        out += eqs
+        for body in self._mpc_bodies.get(id(b), []):
+            out += self._mpc_rigid_body(body)
+        for reason, lines in skipped.items():
+            out += self._commented(mkblock("MPC", b.params.items(), lines), reason)
+        return out
+
+    def _warn_transformed_mpc(self, pairs: Sequence[Tuple[int, int]]) -> None:
+        if any(n in self._transformed for p in pairs for n in p):
+            self.report.warn("*MPC on a node with a *TRANSFORM: ccx reads the DOFs of the "
+                             "*EQUATION it becomes in the node's local axes — verify that the "
+                             "constraint acts in the directions intended.", once=True)
+
+    def _link_equation(self, dep: int, ind: int) -> List[str]:
+        """Abaqus *MPC LINK in a deck without NLGEOM: the distance constraint linearised at
+        the initial geometry, e . (u_dep - u_ind) = 0 with e the unit vector between the
+        nodes — what Abaqus solves in a small-displacement analysis.  The dependent term is
+        the first node's largest component."""
+        e = vunit(vsub(self.geom.nodes[dep], self.geom.nodes[ind]))
+        ks = sorted((k for k in range(3) if abs(e[k]) > 1e-12), key=lambda k: -abs(e[k]))
+        terms = [(dep, k + 1, e[k]) for k in ks] + [(ind, k + 1, -e[k]) for k in ks]
+        lines = ["*EQUATION", str(len(terms))]
+        for j in range(0, len(terms), 4):
+            lines.append(", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in terms[j:j + 4]))
+        return lines
+
+    def _mpc_rigid_body(self, body: dict) -> List[str]:
+        """The *RIGID BODY of a group of Abaqus *MPC BEAM lines (see _plan_mpcs): the
+        dependent nodes follow the root node rigidly; the rotations of knotted shell/beam
+        members are tied to the ROT NODE, which follows a shell/beam root's own rotation."""
+        ref, rot, members = body["ref"], body["rot"], body["members"]
+        self._synth_counter += 1
+        name = f"ABQ2CCX_MPCB{self._synth_counter}"
+        out = [f"*NSET, NSET={name}"] + reflow([str(n) for n in members])
+        out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
+        if ref in self._knots and ref in self._rot_nodes:
+            out += self._rot_node_follows(rot, ref)
+        out += self._rotation_ties(members, rot, -3)
+        self.report.note("*MPC BEAM -> *RIGID BODY: the lines that share an independent node "
+                         "(or chain through one another) form one rigid body about it; the "
+                         "dependent nodes follow it in displacement and rotation, exact at any "
+                         "rotation (BCs and moments on the independent node's DOFs 4-6 act on "
+                         "the body's rotation).", once=True)
         return out
 
     def handle_coupling(self, b: Block) -> List[str]:
@@ -4572,7 +4689,6 @@ class Converter:
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._upgrade_section_beams(blocks)
         self._check_nonpositive_ids()
-        self._check_overconstraints(blocks)
         self._prescan(blocks)
         self._plan_distributions(blocks)
         self._check_undefined_materials(blocks)
@@ -4602,7 +4718,7 @@ class Converter:
             out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "
                     "runs them as 3-D elements)"] + self._planar_bc
         out.extend(self.emit_other(blocks))
-        return out
+        return self._settle_dependents(out)
 
     # Cards that read a node set as per-node state or as an output selection: a midside node
     # between two members belongs to the set too (a *BOUNDARY on every node of a beam must
@@ -4801,8 +4917,12 @@ class Converter:
         # they have no rotational DOFs at all — unless they are the reference/rotation node
         # of a rigid body or coupling, which carries the body's rotations
         self._plane_only = {n for n, p in plane.items() if p}
-        # reference/rotation nodes of rigid bodies and couplings carry real rotations
-        self._ref_nodes = set()
+        # reference/rotation nodes of rigid bodies and couplings carry real rotations (the
+        # independent node of *MPC BEAM lines too: it becomes a *RIGID BODY's REF NODE)
+        self._plan_mpcs(blocks)
+        mpc_refs = [body["ref"] for bodies in self._mpc_bodies.values() for body in bodies]
+        self._plane_only.difference_update(mpc_refs)
+        self._ref_nodes = set(mpc_refs)
         for b in blocks:
             if b.keyword in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
                 for k, v in b.params.items():
@@ -4831,7 +4951,24 @@ class Converter:
             next_id += 1
             self.geom.add_node(next_id, self.geom.nodes.get(ref, (0.0, 0.0, 0.0)))
             self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
+        for bodies in self._mpc_bodies.values():
+            for body in bodies:
+                ref = body["ref"]
+                if ref not in self._rb_rot:
+                    next_id += 1
+                    self.geom.add_node(next_id, self.geom.nodes[ref])
+                    self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
+                body["rot"] = self._rb_rot[ref]
         self._plan_rigid_couplings(blocks)
+        self._plan_implied_spcs(blocks)
+        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks) and any(
+                any(m in self._plane_only for m in members)
+                for _, members, _ in self._rigid_members(blocks)):
+            self.report.warn("Rigid constraint (*RIGID BODY, kinematic coupling or *MPC BEAM) on "
+                             "nodes of plane / axisymmetric elements in a deck with an explicit "
+                             "dynamic step: ccx's explicit solver stops on it ('linear and nonlinear "
+                             "MPC's depend on each other' — its 2-D expansion is built from linear "
+                             "MPCs; probed on 2.23); only implicit steps can run it.", once=True)
         self._n_inactive_rot = 0
         self._depvar_counts = set()
         for b in blocks:
@@ -4945,6 +5082,149 @@ class Converter:
                          f"can crash after 'Job finished', patched builds reject the deck). "
                          f"Renumber the mesh.", once=True)
 
+    # -- Abaqus *MPC lines -------------------------------------------------------
+    @staticmethod
+    def _mpc_fields(b: Block) -> List[List[str]]:
+        """The data lines of an *MPC card as field lists (MPC type first)."""
+        recs = [[x for x in rec if x != ""] for rec in merged_data_records(b)]
+        return [r for r in recs if r]
+
+    def _mpc_nodes(self, token: str) -> List[int]:
+        """The nodes of one *MPC node field: a node number, or a node set in the order Abaqus
+        pairs it (ascending ids unless the set is UNSORTED, as for *EQUATION)."""
+        if re.fullmatch(r"[-+]?\d+", token):
+            return [int(token)]
+        nodes = self.geom.nset(token)
+        return dedup(nodes) if token.upper() in self.geom.unsorted else sorted(set(nodes))
+
+    def _mpc_pairs(self, f: List[str]) -> Optional[List[Tuple[int, int]]]:
+        """(first node, second node) pairs of a two-node *MPC line ``TYPE, first, second``:
+        node sets pair node by node, or every node of the first field with a single second
+        node; None if a field names no defined node or the sets do not pair up."""
+        if len(f) < 3:
+            return None
+        a, c = self._mpc_nodes(f[1]), self._mpc_nodes(f[2])
+        if not a or not c or (len(c) != 1 and len(a) != len(c)) or \
+                any(n not in self.geom.nodes for n in a + c):
+            return None
+        return [(n, c[0] if len(c) == 1 else c[i]) for i, n in enumerate(a)]
+
+    def _plan_mpcs(self, blocks: List[Block]) -> None:
+        """Deck-wide plan of the Abaqus *MPC lines (see handle_mpc): the node pairs of each
+        PIN / TIE / LINK / BEAM line, or why the line cannot be converted.
+
+        A BEAM MPC moves its first node with a rigid beam from the second (displacements
+        and rotations), so all BEAM lines that share a second node — and lines chained
+        through a node that is first in one line and second in another — move as ONE rigid
+        body about the root of the chain.  Each such group becomes a ccx *RIGID BODY on the
+        root: exact at any rotation, where linear *EQUATION ties hold for small ones only."""
+        self._mpc_plan = {}
+        self._mpc_bodies = {}
+        steps: List[bool] = []
+        for b in blocks:
+            if b.keyword == "STEP":
+                nl = b.param("NLGEOM")
+                steps.append("NLGEOM" in b.params and (nl or "YES").strip().upper() != "NO")
+            elif b.keyword == "DYNAMIC" and b.has("EXPLICIT") and steps:
+                steps[-1] = True               # the converter runs explicit steps with NLGEOM
+        # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
+        nl_any, nl_all = any(steps), bool(steps) and steps[0]
+        # a TIE also ties the temperature (DOF 11) where a step has one; a heat-transfer-only
+        # deck has no displacements to tie
+        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        self._mpc_thermal = any(k in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                                      "UNCOUPLED TEMPERATURE-DISPLACEMENT") for k in procs)
+        self._mpc_mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
+        quiet = Report()
+        kinds: Dict[str, str] = {}
+        expanded: set = set()                  # nodes of elements ccx expands to 3-D
+        for typ, conn in self.geom.elements.values():
+            if typ not in kinds:
+                kinds[typ] = ccx_element_type(typ, quiet)
+            cc = kinds[typ]
+            if cc in SHELL_TYPES or cc in BEAM_TYPES or cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES):
+                expanded.update(conn)
+        parent: "OrderedDict[int, int]" = OrderedDict()     # BEAM: dependent -> independent
+        anchor: Dict[int, int] = {}                          # dependent -> id(its *MPC card)
+
+        def root(n: int) -> int:
+            while n in parent:
+                n = parent[n]
+            return n
+        for b in blocks:
+            if b.keyword != "MPC" or b.has("USER"):
+                continue
+            for i, f in enumerate(self._mpc_fields(b)):
+                typ = f[0].upper()
+                if typ not in ("PIN", "TIE", "LINK", "BEAM"):
+                    continue
+                key = (id(b), i)
+                pairs = self._mpc_pairs(f)
+                if pairs is None:
+                    self._mpc_plan[key] = ("skip", f"*MPC {typ} line '{', '.join(f)}': a node "
+                                           f"field names no defined node, or two node sets of "
+                                           f"different sizes are paired; commented out — the "
+                                           f"constraint is missing.")
+                elif typ == "BEAM":
+                    kept = []
+                    for dep, ind in pairs:
+                        if dep == ind or dep in parent or root(ind) == dep:
+                            self.report.warn(f"*MPC BEAM: node {dep} is the dependent node of "
+                                             f"more than one BEAM line, or the lines form a loop "
+                                             f"(Abaqus rejects both); only its first line is "
+                                             f"used.", once=True)
+                            continue
+                        parent[dep] = ind
+                        anchor[dep] = id(b)
+                        kept.append((dep, ind))
+                    self._mpc_plan[key] = ("beam", kept) if kept else \
+                        ("skip", f"*MPC BEAM line '{', '.join(f)}' adds no new dependent node; "
+                                 f"commented out.")
+                elif typ != "LINK":
+                    self._mpc_plan[key] = (typ.lower(), pairs)
+                elif any(vnorm(vsub(self.geom.nodes[a], self.geom.nodes[c])) == 0.0
+                         for a, c in pairs):
+                    self._mpc_plan[key] = ("skip", "*MPC LINK between coincident nodes has no "
+                                                   "direction to keep a distance along; commented "
+                                                   "out — the constraint is missing.")
+                elif not nl_any:
+                    self._mpc_plan[key] = ("link-eq", pairs)
+                    self.report.note("*MPC LINK in a deck without NLGEOM -> its linearised "
+                                     "*EQUATION (the distance constraint at the initial geometry, "
+                                     "as in an Abaqus small-displacement analysis; exact).",
+                                     once=True)
+                elif any(n in expanded for p in pairs for n in p):
+                    self._mpc_plan[key] = ("skip", "*MPC LINK under NLGEOM on a node of a beam, "
+                                           "truss, shell, membrane or plane element: ccx's "
+                                           "distance MPC (*MPC BEAM) rejects such nodes ('*ERROR "
+                                           "in gen3dmpc: nodes belonging to 1D/2D elements must not "
+                                           "be subject to a BEAM MPC') and a linear *EQUATION is "
+                                           "exact for small rotations only; commented out — the "
+                                           "constraint is missing.")
+                elif not nl_all and not self._approx:
+                    self._mpc_plan[key] = ("skip", "*MPC LINK in a deck whose first step is "
+                                           "linear and a later one NLGEOM: Abaqus linearises the "
+                                           "link in the small-displacement step, while ccx's "
+                                           "distance MPC (*MPC BEAM) runs every step geometrically "
+                                           "nonlinear; commented out — rerun with --approximate to "
+                                           "use *MPC BEAM in all steps.")
+                else:
+                    self._mpc_plan[key] = ("link-mpc", pairs)
+                    if nl_all:
+                        self.report.note("*MPC LINK under NLGEOM -> ccx *MPC BEAM, which keeps the "
+                                         "distance between the two nodes (exact).", once=True)
+                    else:
+                        self.report.warn("[APPROX] *MPC LINK -> ccx *MPC BEAM in a deck whose "
+                                         "first step is linear: ccx runs every step geometrically "
+                                         "nonlinear with it, where Abaqus linearises the link in the "
+                                         "small-displacement steps.", once=True)
+        groups: "OrderedDict[int, List[int]]" = OrderedDict()
+        for dep in parent:                     # deck order, so a body's first member is its
+            groups.setdefault(root(dep), []).append(dep)        # first line
+        for ref, members in groups.items():
+            self._mpc_bodies.setdefault(anchor[members[0]], []).append(
+                {"ref": ref, "members": members, "rot": None})
+
     # -- rigid couplings on shell / beam nodes ---------------------------------
     def _plan_rigid_couplings(self, blocks: List[Block]) -> None:
         """ccx builds *RIGID BODY and *KINEMATIC couplings from RIGID MPCs, which ccx 2.23
@@ -4973,7 +5253,6 @@ class Converter:
                 self._rot_nodes.update(conn)
             elif cc.startswith("M3D"):
                 structural.update(conn)
-        self._spc = self._boundary_dofs(blocks)
         self._transformed = {n for b in blocks if b.keyword == "TRANSFORM"
                              for n in self._resolve_nodes((b.param("NSET") or "").strip())}
         self._coupling_plan = {}
@@ -5028,6 +5307,17 @@ class Converter:
                     self._coupling_plan[id(b)] = {"kind": "unsupported"}
                 else:
                     knots += [n for n in members if n in structural]
+        # the rigid bodies of *MPC BEAM lines, like a *RIGID BODY with TIE members; an *MPC
+        # TIE ties the rotations of two shell/beam nodes, which only works between knots
+        for bodies in self._mpc_bodies.values():
+            for body in bodies:
+                ref, members = body["ref"], body["members"]
+                knots += [n for n in [ref] + members if n in structural]
+                if ref in self._rot_nodes and any(n in structural for n in [ref] + members):
+                    self._rb_rot.pop(ref, None)
+        for mode, arg in self._mpc_plan.values():
+            if mode == "tie":
+                knots += [n for p in arg if all(x in self._rot_nodes for x in p) for n in p]
         knots = [n for n in dedup(knots) if n in self.geom.nodes]
         if not knots:
             return
@@ -5116,8 +5406,10 @@ class Converter:
     def _rotation_ties(self, members: Sequence[int], target: int, offset: int,
                        dofs: Sequence[int] = (4, 5, 6)) -> List[str]:
         """*EQUATION ties rotation(member) = DOF ``k + offset`` of ``target`` for the knotted
-        members that have rotations; a member DOF under a *BOUNDARY keeps the BC (ccx stops
-        on a DOF that is both SPC'd and the dependent term of an MPC)."""
+        members that have rotations.  A member DOF under a *BOUNDARY cannot be the tie's
+        dependent term (ccx stops on a DOF that is both SPC'd and dependent in an MPC):
+        _settle_dependents then makes the body's DOF dependent instead, or drops the tie
+        when that one is taken too (self._gen_ties marks the ties it may drop)."""
         out: List[str] = []
         if not self._tie_rotations:
             return out
@@ -5132,16 +5424,12 @@ class Converter:
             for k in dofs:
                 if k < 4 or k > 6:
                     continue
-                if (n, k) in self._spc:
-                    self.report.note("Coupled rotation not tied where the node's DOF has a "
-                                     "*BOUNDARY (ccx stops on a DOF that is SPC'd and dependent "
-                                     "in an MPC) — the BC governs it.", once=True)
-                    continue
                 if (n, k) in self._rot_tied:
                     self.report.warn("A shell/beam node belongs to two rigid constraints; its "
                                      "rotation is tied to the first one only — verify.", once=True)
                     continue
                 self._rot_tied.add((n, k))
+                self._gen_ties.add(frozenset(((n, k), (target, k + offset))))
                 out += ["*EQUATION", "2", f"{n}, {k}, 1., {target}, {k + offset}, -1."]
         return out
 
@@ -5177,6 +5465,121 @@ class Converter:
                     dofs = [d for a, c in (self._named_bc_dofs(g[1], True) or [])
                             for d in range(a, c + 1)]
                 out.update((n, d) for n in self._resolve_nodes(g[0]) for d in dofs)
+        return out
+
+    def _rigid_members(self, blocks: List[Block]):
+        """(reference node, members, coupled translations) of every rigid constraint ccx
+        builds from RIGID MPCs: *RIGID BODY, kinematic couplings and the rigid bodies of
+        *MPC BEAM lines.  ccx eliminates the members' coupled translations."""
+        for i, b in enumerate(blocks):
+            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            if ref is None:
+                continue
+            if b.keyword == "RIGID BODY":
+                tie, pin = self._rigid_body_members(b)
+                yield ref, [n for n in tie + pin if n != ref], {1, 2, 3}
+            elif b.keyword == "COUPLING" and i + 1 < len(blocks) and \
+                    blocks[i + 1].keyword == "KINEMATIC":
+                members = self._surface_member_nodes(b.param("SURFACE") or "")
+                yield ref, [n for n in members if n != ref], \
+                    self._kinematic_dofs(blocks[i + 1]) & {1, 2, 3}
+            elif b.keyword == "KINEMATIC COUPLING":
+                for r in merged_data_records(b):
+                    f = [x for x in r if x != ""]
+                    try:
+                        d1 = pint(f[1]) if len(f) > 1 else 1
+                        d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 3)
+                    except (IndexError, ValueError):
+                        continue
+                    yield ref, [n for n in self._resolve_nodes(f[0]) if n != ref], \
+                        set(range(min(d1, d2), max(d1, d2) + 1)) & {1, 2, 3}
+        for bodies in self._mpc_bodies.values():
+            for body in bodies:
+                yield body["ref"], body["members"], {1, 2, 3}
+
+    def _plan_implied_spcs(self, blocks: List[Block]) -> None:
+        """Zero *BOUNDARY values that a rigid constraint already implies, to be left out.
+
+        ccx eliminates the coupled translations of a rigid constraint's members and stops
+        when one also carries a *BOUNDARY ('*ERROR in cascade: ... dependent side of a MPC
+        and a SPC'); Abaqus resolves such an overconstraint itself.  In a step, a member's
+        zero BC on translation k is implied when the body cannot rotate (zero BCs on the
+        rotations of its reference node: DOF 6 alone for a body of plane / axisymmetric
+        nodes) and the reference node is held at zero in k: the member stays at zero in k
+        anyway.  Where that holds in every step the member's BC is in force (bc_steps),
+        leaving the BC out changes nothing."""
+        self._implied_spc = set()
+        segs: List[List[Tuple[bool, Tuple[int, int], bool]]] = [[]]
+        for b in blocks:
+            if b.keyword == "STEP":
+                segs.append([])
+            if b.keyword != "BOUNDARY":
+                continue
+            new = (b.param("OP") or "").strip().upper() == "NEW"
+            typed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
+                b.has("FIXED")
+            for rec in merged_data_records(b):
+                g = [x.strip() for x in rec]
+                while g and g[-1] == "":
+                    g.pop()
+                if len(g) < 2:
+                    continue
+                val = ""
+                if re.fullmatch(r"[-+]?\d+", g[1]):
+                    d1 = int(g[1])
+                    d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
+                    dofs = list(range(min(d1, d2), max(d1, d2) + 1))
+                    val = g[3] if len(g) > 3 else ""
+                else:
+                    dofs = [d for a, c in (self._named_bc_dofs(g[1], True) or [])
+                            for d in range(a, c + 1)]
+                try:
+                    zero = not typed and (val == "" or pf(val) == 0.0)
+                except ValueError:
+                    zero = False
+                segs[-1] += [(new, (n, d), zero) for n in self._resolve_nodes(g[0]) for d in dofs]
+        if not any(segs):
+            return
+        cands = []
+        for ref, members, dofs in self._rigid_members(blocks):
+            # a body of plane / axisymmetric nodes only turns about z (Abaqus' 2-D models have
+            # no DOFs 4-5; ccx's 2-D expansion holds them, probed)
+            turns = (6,) if members and all(m in self._plane_only for m in members) else (4, 5, 6)
+            cands += [(m, k, ref, turns) for m in members for k in dofs]
+        seen: set = set()
+        bad: set = set()
+        for active in bc_steps(segs):
+            for m, k, ref, turns in cands:
+                if (m, k) in active:
+                    seen.add((m, k))
+                    if not (active[(m, k)] and active.get((ref, k)) and
+                            all(active.get((ref, r)) for r in turns)):
+                        bad.add((m, k))
+        self._implied_spc = seen - bad
+        if self._implied_spc:
+            self.report.note(f"{len(self._implied_spc)} zero *BOUNDARY DOF(s) on members of a rigid "
+                             f"constraint left out: the reference node is held at zero there and "
+                             f"cannot rotate, so the member stays at zero anyway. ccx stops on a BC "
+                             f"on a DOF it eliminates ('*ERROR in cascade: ... dependent side of a "
+                             f"MPC and a SPC'); Abaqus resolves this overconstraint itself.")
+
+    def _without_implied(self, line: str) -> List[str]:
+        """A *BOUNDARY data line without the (node, DOF) pairs in self._implied_spc: the
+        affected DOFs get one line per remaining node."""
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 2 or not all(re.fullmatch(r"[-+]?\d+", x) for x in f[1:3] if x):
+            return [line]
+        lo = int(f[1])
+        hi = int(f[2]) if len(f) > 2 and f[2] else lo
+        lo, hi = min(lo, hi), max(lo, hi)
+        nodes = self._resolve_nodes(f[0])
+        if not any((n, d) in self._implied_spc for n in nodes for d in range(lo, hi + 1)):
+            return [line]
+        out: List[str] = []
+        for d in range(lo, hi + 1):
+            keep = [n for n in nodes if (n, d) not in self._implied_spc]
+            spec = [f[0]] if len(keep) == len(nodes) else [str(n) for n in keep]
+            out += [", ".join([s, str(d), str(d)] + f[3:]) for s in spec]
         return out
 
     def _first_node(self, token: str) -> Optional[int]:
@@ -5263,60 +5666,354 @@ class Converter:
             return [int(token)]
         return self.geom.nset(token)
 
-    def _check_overconstraints(self, blocks: List[Block]) -> None:
-        """Flag the #1 runtime crash on converted decks: a DOF that is both the
-        dependent term of an *EQUATION/*MPC and the target of a *BOUNDARY (ccx stops
-        with '*ERROR in cascade ... dependent side of a MPC and a SPC')."""
-        dep: Dict[Tuple[int, int], str] = {}
-        ndof = 6 if self.has_rotational_dof else 3
-        for b in blocks:
-            if b.keyword == "EQUATION":
-                nums: List[str] = []
-                for rec in merged_data_records(b):
-                    nums.extend(x for x in rec if x != "")
-                if len(nums) >= 3:                       # count, then node, dof, coef, ...
-                    try:
-                        dep[(int(float(nums[1])), int(float(nums[2])))] = "EQUATION"
-                    except ValueError:
-                        pass
-            elif b.keyword == "MPC":
-                for rec in merged_data_records(b):
-                    f = [x for x in rec if x != ""]
-                    if len(f) >= 2 and f[0].upper() == "TIE":
-                        try:
-                            n = int(float(f[1]))
-                            for d in range(1, ndof + 1):
-                                dep[(n, d)] = "MPC TIE"
-                        except ValueError:
-                            pass
-        if not dep:
-            return
-        clashes: List[Tuple[int, int, str]] = []
-        for b in blocks:
-            if b.keyword != "BOUNDARY":
+    # -- dependent DOFs of the converted deck ------------------------------------
+    def _settle_dependents(self, out: List[str]) -> List[str]:
+        """Choose the eliminated (first) term of every *EQUATION of the converted deck.
+
+        ccx eliminates an equation's first DOF and stops when that DOF also has a *BOUNDARY
+        ('*ERROR in cascade: the DOF ... is detected on the dependent side of a MPC and a
+        SPC') or is eliminated by another constraint ('... on the dependent side of two
+        different MPC's'); Abaqus resolves such overconstraints itself.  The terms of an
+        equation can be listed in any order, so a clashing first term is swapped for one
+        whose DOF is free: the same equation, which ccx then accepts.  The DOFs ccx
+        eliminates itself are taken first — the coupled translations of *RIGID BODY and
+        *KINEMATIC members, a *KINEMATIC reference node's DOFs 4-6 (they carry the coupling
+        rotation; probed: an equation on one is 'on the dependent side of two different
+        MPC's'), *TIE slaves and the nodes of native *MPCs — and a bipartite matching
+        (augmenting paths) assigns the equations, so one can hand its DOF to another that has
+        no other choice.  The equations are then accepted in order, each reduced by the ones
+        before it: one that reduces to 0 = 0 is redundant and dropped (a duplicate, or a loop
+        of ties, which ccx would hold at zero).  An equation left without a free DOF stays
+        as it is, with a warning, except the converter's own rotation ties, which are
+        dropped (the *BOUNDARY then governs that rotation)."""
+        cards: List[Tuple[str, "OrderedDict[str, Optional[str]]", int, List[int]]] = []
+        for j, line in enumerate(out):
+            if line.startswith("**"):
                 continue
-            for rec in merged_data_records(b):
-                f = [x for x in rec if x != ""]
-                if not f:
-                    continue
-                if len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]):
-                    d1 = int(f[1])
-                    d2 = int(f[2]) if len(f) > 2 and re.fullmatch(r"[-+]?\d+", f[2]) else d1
-                    dofs = list(range(min(d1, d2), max(d1, d2) + 1))
-                elif len(f) >= 2:
-                    nb = self._named_bc_dofs(f[1]) or []
-                    dofs = [d for a, c in nb for d in range(a, c + 1)]
+            if line.startswith("*"):
+                kw, params = parse_keyword_line(line)
+                cards.append((kw, params, j, []))
+            elif cards and line.strip():
+                cards[-1][3].append(j)
+        isint = re.compile(r"[-+]?\d+").fullmatch
+
+        def fields(j: int) -> List[str]:
+            f = [x.strip() for x in out[j].split(",")]
+            while f and f[-1] == "":
+                f.pop()
+            return f
+        inline: Dict[str, List[int]] = {}        # node sets / node surfaces the handlers wrote
+        nsurf: Dict[str, List[int]] = {}
+
+        def nodes_of(tok: str) -> List[int]:
+            if isint(tok):
+                return [int(tok)]
+            return inline.get(tok.upper()) or self.geom.nset(tok)
+        for kw, params, _, data in cards:
+            if kw == "NSET" and (params.get("NSET") or "").upper() not in self.geom.nsets:
+                toks = [t for j in data for t in fields(j) if t]
+                ids: List[int] = []
+                if "GENERATE" in params:
+                    for a, c, inc in zip(toks[0::3], toks[1::3], toks[2::3]):
+                        ids += list(range(pint(a), pint(c) + 1, max(pint(inc), 1)))
                 else:
-                    dofs = list(range(1, ndof + 1))
-                for n in self._resolve_nodes(f[0]):
-                    for d in dofs:
-                        if (n, d) in dep:
-                            clashes.append((n, d, dep[(n, d)]))
-        for n, d, src in clashes[:5]:
+                    for t in toks:
+                        ids += nodes_of(t)
+                inline[(params.get("NSET") or "").upper()] = ids
+            elif kw == "SURFACE" and (params.get("TYPE") or "").upper() == "NODE":
+                nsurf[(params.get("NAME") or "").upper()] = \
+                    [n for j in data for n in nodes_of(fields(j)[0])]
+
+        def surface_nodes(name: str) -> List[int]:
+            return nsurf.get(name.upper()) or self._surface_member_nodes(name)
+        spc: set = set()
+        segs: List[List[Tuple[bool, Tuple[int, int], bool]]] = [[]]   # BCs: model, each step
+        transformed: set = set()
+        # DOFs ccx eliminates itself: rigid-body / kinematic members' translations (a BC on
+        # one stops ccx) and the DOFs its other constraints may eliminate (those accept a BC
+        # — ccx picks around it or carries it over — but no *EQUATION can eliminate them)
+        busy: Dict[Tuple[int, int], str] = {}
+        taken_too: set = set()
+        for ci, (kw, params, _, data) in enumerate(cards):
+            if kw == "STEP":
+                segs.append([])
+            elif kw == "BOUNDARY":
+                new = (params.get("OP") or "").strip().upper() == "NEW"
+                for j in data:
+                    f = fields(j)
+                    if len(f) < 2 or not isint(f[1]):
+                        continue
+                    d1 = int(f[1])
+                    d2 = int(f[2]) if len(f) > 2 and isint(f[2]) else d1
+                    try:
+                        z = "FIXED" not in params and (len(f) < 4 or pf(f[3]) == 0.0)
+                    except ValueError:
+                        z = False
+                    for n in nodes_of(f[0]):
+                        for d in range(min(d1, d2), max(d1, d2) + 1):
+                            spc.add((n, d))
+                            segs[-1].append((new, (n, d), z))
+            elif kw == "TRANSFORM":
+                transformed.update(nodes_of((params.get("NSET") or "").strip()))
+            elif kw == "RIGID BODY":
+                ref = (params.get("REF NODE") or "").strip()
+                rot = (params.get("ROT NODE") or "").strip()
+                members = nodes_of((params.get("NSET") or "").strip()) if params.get("NSET") else \
+                    [n for e in self.geom.elset((params.get("ELSET") or "").strip())
+                     if e in self.geom.elements for n in self.geom.elements[e][1]]
+                for m in members:
+                    if str(m) not in (ref, rot):
+                        busy.update({(m, d): "*RIGID BODY" for d in (1, 2, 3)})
+            elif kw == "COUPLING" and ci + 1 < len(cards) and \
+                    cards[ci + 1][0] in ("KINEMATIC", "DISTRIBUTING"):
+                ref = (params.get("REF NODE") or "").strip()
+                nxt = cards[ci + 1]
+                dofs: set = set()
+                for j in nxt[3]:
+                    f = fields(j)
+                    if f and isint(f[0]):
+                        d2 = int(f[1]) if len(f) > 1 and isint(f[1]) else int(f[0])
+                        dofs.update(range(int(f[0]), d2 + 1))
+                if not isint(ref) or not dofs:
+                    continue
+                if nxt[0] == "DISTRIBUTING":
+                    taken_too.update((int(ref), d) for d in dofs)
+                    continue
+                taken_too.update((int(ref), d) for d in (4, 5, 6))    # the coupling rotation
+                for m in surface_nodes((params.get("SURFACE") or "").strip()):
+                    if m != int(ref):
+                        busy.update({(m, d): "*KINEMATIC coupling" for d in dofs if d <= 3})
+            elif kw == "MPC":
+                for j in data:
+                    f = fields(j)
+                    nodes = [int(t) for t in f[1:] if isint(t)]
+                    typ = f[0].upper() if f else ""
+                    nodes = nodes[3:] if typ == "PLANE" else nodes[2:] if typ == "STRAIGHT" \
+                        else nodes[:1] if typ == "BEAM" else nodes
+                    taken_too.update((n, d) for n in nodes for d in (1, 2, 3))
+            elif kw == "TIE":
+                for j in data:
+                    f = fields(j)
+                    if f:
+                        taken_too.update((n, d) for n in surface_nodes(f[0]) or nodes_of(f[0])
+                                         for d in (1, 2, 3))
+        # ccx turns a BC on a node with a *TRANSFORM into an MPC on its global DOFs
+        spc.update((n, d) for n, k in list(spc) if n in transformed and k <= 3 for d in (1, 2, 3))
+        clash = sorted(k for k in busy if k in spc)
+        for n, d in clash[:3]:
+            self.report.warn(f"Possible overconstraint: node {n} DOF {d} is eliminated by a "
+                             f"{busy[(n, d)]} (ccx builds it from MPCs) AND has a *BOUNDARY. "
+                             f"CalculiX will stop with '*ERROR in cascade ... dependent side of a "
+                             f"MPC and a SPC'. Remove the BC or the constraint on that DOF.",
+                             once=True)
+        # the equations: (card, [(node, dof, coefficient text), ...])
+        eqs: List[Tuple[int, List[Tuple[int, int, str]]]] = []
+        for ci, (kw, params, _, data) in enumerate(cards):
+            if kw != "EQUATION" or params:
+                continue
+            toks = [t for j in data for t in fields(j) if t]
+            parsed: List[List[Tuple[int, int, str]]] = []
+            pos = 0
+            try:
+                while pos < len(toks):
+                    cnt = pint(toks[pos])
+                    trip = toks[pos + 1:pos + 1 + 3 * cnt]
+                    pos += 1 + 3 * cnt
+                    if cnt < 1 or len(trip) < 3 * cnt or \
+                            not all(isint(trip[q]) and isint(trip[q + 1]) for q in range(0, len(trip), 3)):
+                        raise ValueError
+                    parsed.append([(int(trip[q]), int(trip[q + 1]), trip[q + 2])
+                                   for q in range(0, len(trip), 3)])
+            except (ValueError, IndexError):
+                continue                       # set names / unreadable: left as written
+            eqs += [(ci, terms) for terms in parsed]
+        if not eqs:
+            return out
+        taken = spc | set(busy) | taken_too
+        cands: List[List[Tuple[int, int]]] = []
+        for _, terms in eqs:
+            dofs = [(n, d) for n, d, _ in terms]
+            try:
+                big = max(abs(pf(c)) for _, _, c in terms)
+                cands.append([(n, d) for n, d, c in terms if (n, d) not in taken and
+                              dofs.count((n, d)) == 1 and abs(pf(c)) > 1e-9 * big])
+            except ValueError:
+                cands.append([])
+        assign: Dict[int, Tuple[int, int]] = {}
+        owner: Dict[Tuple[int, int], int] = {}
+        for e, (_, terms) in enumerate(eqs):
+            t0 = terms[0][:2]
+            if cands[e] and cands[e][0] == t0 and t0 not in owner:
+                assign[e], owner[t0] = t0, e
+
+        def augment(start: int) -> bool:
+            via: Dict[Tuple[int, int], int] = {}
+
+            def options(e: int):                # free DOFs first, then the ones to displace
+                return iter(sorted(cands[e], key=lambda c: c in owner))
+            stack = [(start, options(start))]
+            budget = 20000
+            while stack and budget > 0:
+                e, it = stack[-1]
+                nxt = None
+                for c in it:
+                    if c in via:
+                        continue
+                    via[c] = e
+                    budget -= 1
+                    if c not in owner:         # free DOF: shift the assignments along the path
+                        while True:
+                            w = via[c]
+                            prev = assign.get(w)
+                            assign[w], owner[c] = c, w
+                            if w == start:
+                                return True
+                            c = prev
+                    nxt = owner[c]
+                    break
+                if nxt is None:
+                    stack.pop()
+                else:
+                    stack.append((nxt, options(nxt)))
+            return False
+        for e in range(len(eqs)):
+            if e not in assign:
+                augment(e)
+        # held at zero by a BC in every step
+        held: Optional[set] = None
+        for active in bc_steps(segs):
+            now = {k for k, z in active.items() if z}
+            held = now if held is None else held & now
+        held = held or set()
+        # Accept the equations in deck order, each reduced by the ones accepted before it
+        # (their eliminated DOFs substituted): one that reduces to 0 = 0 — a duplicate, or
+        # one closing a loop of ties — holds whenever the others do and is dropped; ccx
+        # cannot take it (no DOF of it is free, or the loop gives a zero coefficient on the
+        # dependent side and ccx then silently holds the loop at zero, probed).  The
+        # eliminated DOF must keep a nonzero coefficient in the reduced equation, so no
+        # loop reaches ccx; the matching's choice is tried first.
+        accepted: Dict[Tuple[int, int], Dict[Tuple[int, int], float]] = {}
+
+        def reduce(coef: Dict[Tuple[int, int], float], tol: float):
+            res = dict(coef)
+            for _ in range(500):
+                k = next((q for q in res if q in accepted), None)
+                if k is None:
+                    return res
+                c = res.pop(k)
+                for q, a in accepted[k].items():
+                    res[q] = res.get(q, 0.0) + c * a
+                res = {q: v for q, v in res.items() if abs(v) > tol}
+                if len(res) > 500:
+                    break
+            return None                        # too large to tell: taken as independent
+        final: List[Optional[List[Tuple[int, int, str]]]] = []
+        moved = dropped = redundant = rewritten = 0
+        stuck: List[Tuple[int, int]] = []
+        for e, (_, terms) in enumerate(eqs):
+            dofs = [(n, d) for n, d, _ in terms]
+            try:
+                coef: Dict[Tuple[int, int], float] = {}
+                for n, d, c in terms:
+                    coef[(n, d)] = coef.get((n, d), 0.0) + pf(c)
+            except ValueError:
+                final.append(terms)
+                continue
+            tol = 1e-9 * max(abs(c) for c in coef.values())
+            res = reduce(coef, tol)
+            if res is not None and all(q in held for q in res):
+                final.append(None)                 # 0 = 0 in every step
+                redundant += 1
+                continue
+            order = ([assign[e]] if e in assign else []) + dofs
+            dep = next((k for k in order if k not in taken and k not in accepted and
+                        dofs.count(k) == 1 and abs(coef[k]) > tol and
+                        (res is None or abs(res.get(k, 0.0)) > tol)), None)
+            if dep is not None:
+                accepted[dep] = {q: -c / coef[dep] for q, c in coef.items() if q != dep}
+                if dep != dofs[0]:
+                    k = dofs.index(dep)
+                    terms = [terms[k]] + terms[:k] + terms[k + 1:]
+                    moved += 1
+                final.append(terms)
+                continue
+            alt = next((k for k in (res or {}) if k not in taken and k not in accepted), None)
+            if alt is not None:
+                # no DOF of the equation itself is free, but the equation reduced by the
+                # accepted ones (the same constraint, given those) has one
+                accepted[alt] = {q: -c / res[alt] for q, c in res.items() if q != alt}
+                final.append([(alt[0], alt[1], f"{res[alt]:.12g}")] +
+                             [(q[0], q[1], f"{c:.12g}") for q, c in res.items() if q != alt])
+                rewritten += 1
+            elif frozenset(dofs) in self._gen_ties and len(terms) == 2:
+                final.append(None)
+                dropped += 1
+            else:
+                final.append(terms)
+                stuck.append(dofs[0])
+        new_cards: Dict[int, List[str]] = {}
+        by_card: "OrderedDict[int, List[int]]" = OrderedDict()
+        for e, (ci, _) in enumerate(eqs):
+            by_card.setdefault(ci, []).append(e)
+        for ci, es in by_card.items():
+            if all(final[e] is eqs[e][1] for e in es):
+                continue                           # this card stays as written
+            lines: List[str] = []
+            for e in es:
+                terms = final[e]
+                if terms is None:
+                    continue
+                lines.append(str(len(terms)))
+                for q in range(0, len(terms), 4):
+                    lines.append(", ".join(f"{n}, {d}, {c}" for n, d, c in terms[q:q + 4]))
+            new_cards[ci] = lines
+        if moved or rewritten:
+            self.report.note(f"*EQUATION: {moved + rewritten} equation(s) reordered so that the "
+                             f"eliminated (first) term is a DOF without a *BOUNDARY that no other "
+                             f"constraint eliminates — ccx stops otherwise ('*ERROR in cascade ... "
+                             f"dependent side of a MPC and a SPC' / '... two different MPC's'); "
+                             f"each equation is unchanged"
+                             + (f" ({rewritten} written reduced by the equations before it: the "
+                                f"same constraint, given those)" if rewritten else "")
+                             + " — Abaqus resolves this overconstraint itself.")
+        if redundant:
+            self.report.note(f"*EQUATION: {redundant} redundant equation(s) dropped — each follows "
+                             f"from the equations before it and zero *BOUNDARY values that hold in "
+                             f"every step (a duplicate, or one closing a loop of ties), so it holds "
+                             f"anyway. ccx cannot take it: no DOF of it is free ('*ERROR in cascade "
+                             f"... dependent side of a MPC and a SPC' / '... two different MPC's'), "
+                             f"or a loop leaves a zero coefficient on the dependent side and ccx "
+                             f"silently holds the loop at zero. Abaqus removes such a redundant "
+                             f"constraint itself.")
+        if dropped:
+            self.report.note("Coupled rotation not tied where the node's DOF has a *BOUNDARY and "
+                             "the body's rotation DOF is already fixed or eliminated (ccx stops on a "
+                             "DOF that is SPC'd and dependent in an MPC) — the BC governs it.",
+                             once=True)
+        for n, d in stuck[:5]:
             self.report.warn(f"Possible overconstraint: node {n} DOF {d} is on the dependent side of "
-                             f"a {src} AND has a *BOUNDARY. CalculiX will stop with '*ERROR in cascade "
-                             f"... dependent side of a MPC and a SPC'. Remove the BC or the constraint "
-                             f"on that DOF.", once=True)
+                             f"an *EQUATION whose every DOF has a *BOUNDARY or is eliminated by "
+                             f"another constraint. CalculiX will stop with '*ERROR in cascade ... "
+                             f"dependent side of a MPC and a SPC' (or '... two different MPC's'). "
+                             f"Remove the BC or the constraint on that DOF.", once=True)
+        if not new_cards:
+            return out
+        drop_lines: set = set()
+        insert: Dict[int, List[str]] = {}
+        for ci, lines in new_cards.items():
+            _, _, j, data = cards[ci]
+            drop_lines.update(data)
+            if lines:
+                insert[data[0]] = lines
+            else:
+                drop_lines.add(j)              # every equation of the card dropped
+        res: List[str] = []
+        for j, line in enumerate(out):
+            if j in insert:
+                res += insert[j]
+            if j not in drop_lines:
+                res.append(line)
+        return res
 
     # ======================================================================
     # Planar models: ccx runs 2-D beams and trusses as 3-D elements

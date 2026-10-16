@@ -18,11 +18,19 @@ Converter.build_geometry()   Pass A: walk blocks in order, fill the geometry reg
                                      expand *NGEN/*NCOPY/*ELGEN/… to explicit nodes/elements
         │
         ▼
-Converter._check_overconstraints()   pre-flight warning for BC-on-dependent-DOF
+Converter._prescan()   deck-wide facts the handlers need: node kinds, rigid bodies and their
+                       ROT NODEs, the *MPC plan (_plan_mpcs), knot beams
+                       (_plan_rigid_couplings), the BCs a rigid body already implies
+                       (_plan_implied_spcs), …; then _plan_distributions(),
+                       _plan_planar_constraint() and _plan_circ_rotation_knots()
         │
         ▼
 emit_geometry()  +  emit_other()     Pass B: write nodes/elements/sets from the registry,
                                              then translate the remaining blocks in order
+        │
+        ▼
+Converter._settle_dependents()   choose each *EQUATION's eliminated (first) term against the
+                                 BCs and ccx's own dependents; drop redundant equations
 ```
 
 `Converter.convert(blocks)` runs the whole thing and returns the output as a
@@ -92,6 +100,28 @@ regenerate the docs (below).
   `DROP_WARN_KEYWORDS` with a message if it can change the model).
 * **Normalise an abbreviation** → `PARAM_ALIASES` (parameter) or `KEYWORD_ALIASES`
   (keyword).
+
+## Constraints: `*MPC`, rigid bodies and overconstraints
+
+ccx eliminates one DOF per constraint equation — the *first* term of an `*EQUATION`, the
+members' translations of a `*RIGID BODY` or `*KINEMATIC` coupling — and stops when that DOF
+also has a `*BOUNDARY` or is eliminated twice. Abaqus resolves such overconstraints itself,
+so the converter does it in three places, each exact:
+
+* `_plan_mpcs()` (in `_prescan`) resolves every Abaqus `*MPC` line to node pairs, decides
+  how each type is written (`handle_mpc()` then emits it line by line) and groups the `BEAM`
+  lines into rigid bodies by their independent node (union-find over chained lines). The
+  bodies get ROT NODEs and, on shell/beam nodes, knot beams like any `*RIGID BODY`.
+* `_plan_implied_spcs()` finds zero BCs on rigid-body members that the body already holds
+  (reference node fixed in that DOF and unable to rotate, in every step the BC is in force,
+  `bc_steps()`); `handle_boundary()` leaves them out.
+* `_settle_dependents()` runs on the finished output: it collects the BCs per step and the
+  DOFs ccx eliminates itself, assigns each `*EQUATION` a free DOF by bipartite matching
+  (original first term preferred), then accepts the equations in deck order reducing each
+  by the ones before it — an equation that reduces to 0 = 0 is dropped, and the eliminated
+  DOF must keep a nonzero reduced coefficient, so no loop of ties reaches ccx (which would
+  hold it at zero). Converter rotation ties that find no free DOF are dropped; anything else
+  left over is kept and warned.
 
 ## Mesh-generation expanders
 

@@ -172,12 +172,174 @@ def test_nset_from_elset():
     assert sorted(conv.geom.nsets["CLAMP"]) == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
-def test_overconstraint_warning():
-    deck = ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n"
-            "*EQUATION\n2\n1, 1, 1.0, 2, 1, -1.0\n"
-            "*BOUNDARY\n1, 1, 1\n")
-    _, _, rep = convert_str(deck)
-    assert any("overconstraint" in m.lower() for _, m in rep.entries)
+def test_overconstraint_equation_reordered():
+    # ccx eliminates an equation's FIRST term and stops when that DOF also has a BC, or is
+    # the first term of another equation; listing the same equation with a free DOF first
+    # is accepted.  A duplicate holds whenever the original does, so it is dropped.
+    deck = ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 2.,0.,0.\n"
+            "*EQUATION\n2\n1, 1, 1.0, 2, 1, -1.0\n")
+    body, _, rep = convert_str(deck + "*BOUNDARY\n1, 1, 1\n")
+    assert _equations(body) == ["2,1,-1.0,1,1,1.0"] and "reordered" in rep.text()
+    assert "Possible overconstraint" not in rep.text()
+    body, _, _ = convert_str(deck + "*EQUATION\n2\n1, 1, 1.0, 3, 1, -1.0\n")
+    assert _equations(body) == ["1,1,1.0,2,1,-1.0", "3,1,-1.0,1,1,1.0"]
+    body, _, rep = convert_str(deck + "*EQUATION\n2\n1, 1, 1.0, 2, 1, -1.0\n*BOUNDARY\n1, 1, 1\n")
+    assert _equations(body) == ["2,1,-1.0,1,1,1.0"] and body.count("*EQUATION") == 1
+    assert "redundant" in rep.text()
+    # a loop of ties: the closing equation follows from the others — ccx would take it, but
+    # finds a zero coefficient on its dependent side and silently holds the loop at zero
+    loop = "".join(f"*EQUATION\n2\n{a},1,1.,{b},1,-1.\n" for a, b in ((1, 2), (2, 3), (3, 1)))
+    body, _, rep = convert_str("*NODE\n1,0,0,0\n2,1,0,0\n3,2,0,0\n" + loop)
+    assert _equations(body) == ["1,1,1.,2,1,-1.", "2,1,1.,3,1,-1."] and "redundant" in rep.text()
+    # every DOF under a BC, one of them nonzero: a real overconstraint, kept and flagged
+    body, _, rep = convert_str(deck + "*BOUNDARY\n1, 1, 1\n2, 1, 1, 0.5\n")
+    assert _equations(body) == ["1,1,1.0,2,1,-1.0"] and "Possible overconstraint" in rep.text()
+    # a rigid-body member's translation is eliminated by ccx itself: never made dependent
+    rb = (HEX + "*Node\n100, 0.5, 0.5, 2.\n9, 3., 0., 0.\n*Nset, nset=TOP\n5,6,7,8\n"
+          "*Rigid Body, ref node=100, tie nset=TOP\n*Equation\n2\n5, 1, 1., 9, 1, -1.\n")
+    body, _, _ = convert_str(rb)
+    assert _equations(body) == ["9,1,-1.,5,1,1."]
+    _, _, rep = convert_str(rb + "*Boundary\n6, 1, 1\n100, 2, 2\n")
+    assert "node 6 DOF 1 is eliminated by a *RIGID BODY" in rep.text()
+
+
+def test_mpc_lines_converted_one_by_one():
+    # one line ccx cannot take no longer drops the whole card: PIN -> *EQUATION on DOFs
+    # 1-3 (exact), the SLIDER and user (numeric) lines alone are commented out
+    deck = B2 + "*MPC\nPIN, 3, 2\nSLIDER, 3, 1, 4\n99, 3, 2\n"
+    body, _, rep = convert_str(deck)
+    assert _equations(body) == [f"3,{d},1.,2,{d},-1." for d in (1, 2, 3)]
+    assert "** SLIDER, 3, 1, 4" in body and "** 99, 3, 2" in body
+    assert "user type 99" in rep.text() and "*MPC SLIDER has no ccx equivalent" in rep.text()
+    # node sets pair node by node (ascending ids), or every node with a single second
+    # node; sets of different sizes cannot pair: that line is commented out
+    sets = (HEX + "*Node\n11,0,0,2\n12,1,0,2\n13,1,1,2\n14,0,1,2\n*Nset,nset=A\n12, 11\n"
+            "*Nset,nset=B\n2, 1\n*Nset,nset=D\n13, 14\n*Nset,nset=E\n5, 6, 7\n"
+            "*MPC\nPIN, A, B\nPIN, D, 8\nPIN, D, E\n")
+    body, _, rep = convert_str(sets)
+    assert _equations(body) == [f"{a},{d},1.,{b},{d},-1." for a, b in ((11, 1), (12, 2), (13, 8),
+                                                                      (14, 8)) for d in (1, 2, 3)]
+    assert "** PIN, D, E" in body and "different sizes" in rep.text()
+    # ccx reads an *EQUATION's DOFs in a node's *TRANSFORM axes: warned
+    _, _, rep = convert_str(HEX + "*Node\n9,2,0,0\n*Nset,nset=T9\n9\n*Transform, nset=T9\n"
+                            "0.,1.,0.,-1.,0.,0.\n*MPC\nPIN, 9, 2\n")
+    assert "*MPC on a node with a *TRANSFORM" in rep.text()
+
+
+def test_mpc_tie_ties_rotations_between_knots():
+    # ccx ignores DOFs 4-6 of a plain beam node in an *EQUATION (probed: a TIE'd joint
+    # stays a hinge), so both nodes become knots and all six DOFs are tied
+    body, conv, rep = convert_str(B2 + "*MPC\nTIE, 3, 2\n")
+    assert sorted(conv._knots) == [2, 3] and "ABQ2CCX_KNOT" in body
+    assert _equations(body) == [f"3,{d},1.,2,{d},-1." for d in range(1, 7)]
+    # a solid and a free node have no rotations; a thermal step ties the temperature too
+    solid = HEX + "*Node\n9, 2., 0., 0.\n*MPC\nTIE, 9, 2\n"
+    body, conv, _ = convert_str(solid)
+    assert _equations(body) == [f"9,{d},1.,2,{d},-1." for d in (1, 2, 3)] and not conv._knots
+    body, _, _ = convert_str(solid + "*Step\n*Coupled Temperature-Displacement\n1., 1.\n*End Step\n")
+    assert _equations(body) == [f"9,{d},1.,2,{d},-1." for d in (1, 2, 3, 11)]
+
+
+def test_mpc_link_linearised_or_ccx_beam():
+    # LINK keeps the distance between two nodes: linearised at the initial geometry when no
+    # step runs NLGEOM (as Abaqus' small-displacement analysis does) ...
+    link = ("*Node\n1,0,0,0\n2,3,4,0\n3,7,1,0\n*Element,type=SpringA,elset=S\n1,3,2\n*Spring,"
+            "elset=S\n\n1000.\n*MPC\nLINK, 2, 1\n")
+    body, _, rep = convert_str(link + "*Step\n*Static\n*End Step\n")
+    lines = body.splitlines()
+    i = lines.index("*EQUATION")
+    assert lines[i + 1:i + 3] == ["4", "2, 2, 0.8, 2, 1, 0.6, 1, 2, -0.8, 1, 1, -0.6"]
+    assert "linearised" in rep.text()
+    # ... and ccx's *MPC BEAM (a distance MPC, probed) under NLGEOM
+    nl = link + "*Step, nlgeom=YES\n*Static\n*End Step\n"
+    body, _, rep = convert_str(nl)
+    assert "*MPC\nBEAM, 2, 1" in body and "*EQUATION" not in "\n".join(_live(body))
+    # ccx rejects a BEAM MPC on nodes of beams, shells or plane elements
+    body, _, rep = convert_str(B2 + "*MPC\nLINK, 4, 1\n*Step, nlgeom=YES\n*Static\n*End Step\n")
+    assert "** LINK, 4, 1" in body and "gen3dmpc" in rep.text()
+    # a linear first step and a later NLGEOM one: only with --approximate
+    mixed = link + "*Step\n*Static\n*End Step\n*Step, nlgeom=YES\n*Static\n*End Step\n"
+    body, _, rep = convert_str(mixed)
+    assert "** LINK, 2, 1" in body and "--approximate" in rep.text()
+    body, _, rep = convert_str(mixed, approximate=True)
+    assert "*MPC\nBEAM, 2, 1" in body and "[APPROX] *MPC LINK" in rep.text()
+
+
+def test_mpc_beam_lines_become_rigid_bodies():
+    # BEAM ties displacements AND rotations of the first node to a rigid beam from the
+    # second: lines sharing a second node — or chained through one another — form one
+    # *RIGID BODY on the chain's root, exact at any rotation
+    deck = (S4 + "*Node\n200, 3., 0.5, 0.\n*MPC\nBEAM, R, REF\nBEAM, REF, 200\n"
+            "*Boundary\n200, 4, 6\n")
+    body, conv, rep = convert_str(deck)
+    rot = conv._rb_rot[200]
+    assert f"*RIGID BODY, NSET=ABQ2CCX_MPCB1, REF NODE=200, ROT NODE={rot}" in body
+    assert "*NSET, NSET=ABQ2CCX_MPCB1\n5, 6, 100\n" in body
+    assert sorted(conv._knots) == [5, 6]                               # shell members
+    assert _equations(body) == [f"{n},{k},1.,{rot},{k - 3},-1." for n in (5, 6) for k in (4, 5, 6)]
+    assert f"{rot}, 1, 3" in body and "200, 4, 6" not in body          # rotations -> ROT NODE
+    assert "BEAM -> *RIGID BODY" in rep.text()
+    # a shell node as the independent node: the ROT NODE follows its own rotation
+    body, conv, _ = convert_str(S4 + "*MPC\nBEAM, 5, 2\nBEAM, 6, 2\n")
+    rot = conv._rb_rot_synth[2]
+    assert f"REF NODE=2, ROT NODE={rot}" in body and sorted(conv._knots) == [2, 5, 6]
+    eqs = _equations(body)
+    assert eqs[:3] == [f"{rot},{k},1.,2,{k + 3},-1." for k in (1, 2, 3)]
+    # a node that is dependent twice is invalid in Abaqus too: its first line is used
+    body, _, rep = convert_str(S4 + "*MPC\nBEAM, 5, 2\nBEAM, 5, 1\n")
+    assert "dependent node of more than one BEAM line" in rep.text()
+    assert body.count("*RIGID BODY") == 1 and "** BEAM, 5, 1" in body
+
+
+def test_rigid_member_bcs_the_body_implies_are_left_out():
+    # a member's zero BC on a DOF the rigid body eliminates stops ccx; it is implied (and
+    # left out) when the reference node is held there and cannot rotate
+    deck = (HEX + "*Node\n100, 0.5, 0.5, 2.\n*Nset,nset=TOP\n5,6,7,8\n*Nset,nset=SYM\n1,4,5,8\n"
+            "*Rigid Body, ref node=100, tie nset=TOP\n*Boundary\nSYM, 1, 1\n100, 1, 1\n"
+            "100, 3, 6\n*Step\n*Static\n*Boundary\n100, 2, 2, 0.1\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert conv._implied_spc == {(5, 1), (8, 1)}
+    lines = _live(body)
+    i = lines.index("*BOUNDARY")
+    assert lines[i + 1:i + 6] == ["1, 1, 1", "4, 1, 1", "100, 1, 1", "100, 3, 3",
+                                  f"{conv._rb_rot[100]}, 1, 3"]      # SYM without 5 and 8
+    assert "left out" in rep.text()
+    # not implied: the body may turn about y, or a BC is nonzero, or one is released (OP=NEW)
+    for edit in (("100, 3, 6", "100, 3, 3\n100, 6, 6"), ("SYM, 1, 1", "SYM, 1, 1, 0.01"),
+                 ("*Boundary\n100, 2", "*Boundary, op=NEW\n100, 2")):
+        _, conv, _ = convert_str(deck.replace(*edit))
+        assert not conv._implied_spc, edit
+    # a body of plane-strain nodes only turns about z; ccx's explicit solver cannot run it
+    q = (Q4 + "*Node\n10, 0.5, 2.\n*Nset,nset=TOP\n3,4\n*Rigid Body, ref node=10, tie nset=TOP\n"
+         "*Boundary\nL, 1, 1\n10, 1, 1\n10, 6, 6\n")
+    _, conv, rep = convert_str(q)
+    assert conv._implied_spc == {(4, 1)} and "explicit dynamic" not in rep.text()
+    _, _, rep = convert_str(q + "*Step\n*Dynamic, Explicit\n, 1e-4\n*End Step\n")
+    assert "plane / axisymmetric elements in a deck with an explicit" in rep.text()
+
+
+def test_bc_steps_follow_op_new():
+    # a step keeps the BCs before it and a later value replaces an earlier one; OP=NEW
+    # in a step starts from none
+    k1, k2 = (1, 1), (2, 1)
+    steps = [dict(a) for a in A.bc_steps([[(False, k1, True)], [(False, k2, False)],
+                                          [(True, k2, True)], []])]
+    assert steps == [{k1: True, k2: False}, {k2: True}, {k2: True}]
+    assert [dict(a) for a in A.bc_steps([[(False, k1, True)]])] == [{k1: True}]
+
+
+def test_rotation_tie_on_a_member_bc_makes_the_body_dependent():
+    # a member rotation under a BC cannot be the tie's dependent term: the ROT NODE's DOF
+    # is (the BC then holds the body's rotation, exact); a *KINEMATIC reference node's
+    # DOFs 4-6 are eliminated by ccx itself, so that tie is dropped (the BC governs it)
+    body, conv, _ = convert_str(S4 + "*Rigid Body, ref node=REF, tie nset=R\n*Boundary\n5, 4, 4\n")
+    rot = conv._rb_rot[100]
+    assert f"{rot},1,-1.,5,4,1." in _equations(body)
+    deck = (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
+            "surface=RS\n*Kinematic\n*Boundary\n5, 4, 4\n")
+    body, _, rep = convert_str(deck)
+    assert not any(e.startswith("5,4,") or e.endswith(",5,4,1.") for e in _equations(body))
+    assert "the BC governs it" in rep.text()
 
 
 def test_tie_param_handling():
@@ -1007,6 +1169,10 @@ def test_nonpositive_node_number_warns():
 
 Q4 = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n*Element,type=CPS4,elset=E\n1,1,2,3,4\n"
       "*Nset,nset=L\n1,4\n*Solid Section,elset=E,material=M\n1.,\n*Material,name=M\n"
+      "*Elastic\n1000.,0.3\n")
+# two B31 beams whose ends 2 and 3 meet at x = 1
+B2 = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,0,0\n4,2,0,0\n*Element,type=B31,elset=B\n1,1,2\n2,3,4\n"
+      "*Beam Section,elset=B,material=M,section=RECT\n1.,1.\n0.,0.,1.\n*Material,name=M\n"
       "*Elastic\n1000.,0.3\n")
 S4 = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n100,2.5,0.5,0\n"
       "*Element,type=S4,elset=E\n1,1,2,3,4\n2,2,5,6,3\n*Nset,nset=R\n5,6\n*Nset,nset=REF\n100\n"
