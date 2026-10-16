@@ -13,7 +13,7 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
 dangling references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (205) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (206) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
@@ -22,7 +22,7 @@ dangling references). Each entry carries one of three expectations:
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
-  - ``reduced_physics='<what>'`` (28, 3 of them also source_unloaded): the conversion
+  - ``reduced_physics='<what>'`` (29, 3 of them also source_unloaded): the conversion
     drops or replaces part of the Abaqus model - a constitutive behaviour (concrete
     damaged plasticity, user hardening, Chaboche back-stresses, field-dependent
     elasticity), an element formulation (hybrid, modified or thin-shell elements run as
@@ -34,10 +34,10 @@ dangling references). Each entry carries one of three expectations:
     that only contact holds, which drifts away before the contact closes: ccx has no
     contact stabilization). Found in the results, not in the conversion.
   All three kinds are kept as conversion checks.
-* ``parse_only=True`` (219) - mesh-only decks with no *STEP (FE-library test meshes,
+* ``parse_only=True`` (221) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (598) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (595) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -240,6 +240,14 @@ CORPUS = [
     dict(name='jain_shobhit_job_beamhex', expect_solve=True, license='GPL-3.0',
          exercises='C3D20R — parts/instances/assembly; *Frequency',
          url='https://raw.githubusercontent.com/jain-shobhit/SSMTool/master/ext/YetAnotherFEcode/examples/Meshes/Beam3D/Job-BeamHex.inp'),
+    dict(name='jasiuk_research_group_boundarycond', expect_solve=True,
+         reduced_physics='its general contact (*CONTACT) has no ccx counterpart (the dropped plate never reaches the other in this step, so the run is unaffected, but the model differs)',
+         license='MIT',
+         exercises='R3D4, MASS — parts/instances/assembly; explicit',
+         note='two rigid R3D4 plates (skins of their rigid bodies), one dropped at 5 m/s: it '
+              'never reaches the other in the step (400 mm apart, 50 mm travel), so the '
+              'general contact ccx lacks (*CONTACT, commented) changes nothing',
+         url='https://raw.githubusercontent.com/Jasiuk-Research-Group/LatticeOPT/main/Examples/Example%201/BoundaryCond.inp'),
     dict(name='jgomezc1_uniuser_cla_cae', expect_solve=True, license='MIT',
          exercises='CPE8',
          url='https://raw.githubusercontent.com/jgomezc1/ABAQUS-US/master/INPUT_FILES/UNIUSER_CLA_CAE.inp'),
@@ -773,6 +781,11 @@ CORPUS = [
          exercises='B31H',
          note='mesh-only deck (no *STEP): nothing to solve; ccx is only checked to accept it',
          url='https://raw.githubusercontent.com/Bleemsys/Artisan-Core/main/Test_json/FEAMesh/MeshTrim/TrimMesh.inp'),
+    dict(name='bleemsys_trimmesh_wskin', expect_solve=False, parse_only=True, license='see source repo',
+         exercises='R3D3',
+         note='mesh-only deck (no *STEP): nothing to solve; ccx is only checked to accept it '
+              '(its R3D3 rigid elements, in no *RIGID BODY, become skins)',
+         url='https://raw.githubusercontent.com/Bleemsys/Artisan-Core/main/Test_json/MeshLattice/GenSkin/TrimMesh_wSkin.inp'),
     dict(name='burakbayramli_ellipticalmodel', expect_solve=False, parse_only=True, license='see source repo',
          exercises='CPS3 — parts/instances/assembly',
          note='mesh-only deck (no *STEP): nothing to solve; ccx is only checked to accept it',
@@ -1181,6 +1194,10 @@ CORPUS = [
          exercises='C3D20 — parts/instances/assembly',
          note='mesh-only deck (no *STEP): nothing to solve; ccx is only checked to accept it',
          url='https://raw.githubusercontent.com/Krande/adapy/main/files/fem_files/abaqus/box.inp'),
+    dict(name='krande_box_rigid', expect_solve=False, parse_only=True, license='GPL-3.0',
+         exercises='R3D4, MASS, ROTARYI — parts/instances/assembly',
+         note='mesh-only deck (no *STEP): nothing to solve; ccx is only checked to accept it',
+         url='https://raw.githubusercontent.com/Krande/adapy/main/files/fem_files/abaqus/box_rigid.inp'),
     dict(name='krande_element_elset', expect_solve=False, parse_only=True, license='GPL-3.0',
          exercises='S3',
          note='mesh-only deck (no *STEP): nothing to solve; ccx is only checked to accept it',
@@ -1885,10 +1902,6 @@ CORPUS = [
          exercises='U6, CPE4, CPE4T — *Parameter; *User Element; coupled temp-displacement',
          note='ccx limitation: *USER ELEMENT (ccx cannot run UEL)',
          url='https://raw.githubusercontent.com/bibekanandadatta/Abaqus-UEL-Hydrogel/main/test/U6_hydrogel_1x1_square_elem_64.inp'),
-    dict(name='bleemsys_trimmesh_wskin', expect_solve=False, license='see source repo',
-         exercises='R3D3',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
-         url='https://raw.githubusercontent.com/Bleemsys/Artisan-Core/main/Test_json/MeshLattice/GenSkin/TrimMesh_wSkin.inp'),
     dict(name='bristolcompositesinstitute_single_element', expect_solve=False, license='MIT',
          exercises='CPE4R — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
@@ -2185,7 +2198,10 @@ CORPUS = [
          url='https://raw.githubusercontent.com/idaholab/GranularFlowModels/main/examples/hopper-hypoplastic.inp'),
     dict(name='idaholab_ringshear_mdpc', expect_solve=False, license='GPL-2.0',
          exercises='C3D8R, MASS, ROTARYI — parts/instances/assembly; explicit; contact; *Tie',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
+         note='*CAP PLASTICITY has no ccx equivalent; its REVOLUTION analytical surfaces convert '
+              'only with --approximate (the ROTARYI elements of their bodies stop ccx without '
+              'it), and then ccx explicit stops on the cylindrical *TRANSFORM of the rigid bodies\' '
+              'reference points (linear and nonlinear MPCs depend on each other)',
          url='https://raw.githubusercontent.com/idaholab/GranularFlowModels/main/examples/ringShear-MDPC.inp'),
     dict(name='ijwolden_2x2', expect_solve=False, license='see source repo',
          exercises='CPS4R — parts/instances/assembly',
@@ -2223,10 +2239,6 @@ CORPUS = [
          exercises='U1, CPS3 — UMAT; *User Element',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/irfancn/Abaqus-UEL-elastic/master/wedge_elast.inp'),
-    dict(name='jasiuk_research_group_boundarycond', expect_solve=False, license='MIT',
-         exercises='R3D4, MASS — parts/instances/assembly; explicit',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
-         url='https://raw.githubusercontent.com/Jasiuk-Research-Group/LatticeOPT/main/Examples/Example%201/BoundaryCond.inp'),
     dict(name='jasiuk_research_group_boundarycond_2', expect_solve=False, license='MIT',
          exercises='S4R — parts/instances/assembly; explicit',
          note="incomplete source: the instance PART-1-1 (the Ti-6Al-4V target, the only user of its Johnson-Cook material) is missing — the deck's *Assembly opens with a bare *End Instance — so its sets BOT/LEFT/RIGHT are empty and ccx stops on them; it also uses Abaqus general contact (*CONTACT), which has no ccx equivalent",
@@ -2367,10 +2379,6 @@ CORPUS = [
          exercises='DC3D8 — heat transfer',
          note='source/ccx: *ERROR in e_c3d_th: nonpositive jacobian',
          url='https://raw.githubusercontent.com/JuliaFEM/AbaqusReader.jl/master/test/test_real_world/thermal_conduction.inp'),
-    dict(name='krande_box_rigid', expect_solve=False, license='GPL-3.0',
-         exercises='R3D4, MASS, ROTARYI — parts/instances/assembly',
-         note='source/ccx: *ERROR reading *ELEMENT:',
-         url='https://raw.githubusercontent.com/Krande/adapy/main/files/fem_files/abaqus/box_rigid.inp'),
     dict(name='krande_uuea', expect_solve=False, license='GPL-3.0',
          exercises='CAX4P — parts/instances/assembly',
          note='source/ccx: *ERROR reading *ELEMENT:',
@@ -2462,11 +2470,15 @@ CORPUS = [
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/10.%20Harmonic%20Analysis/1.%20Fixed-Fixed%20Beam/Modal_Analysis_Beam.inp'),
     dict(name='marcello_gori_pipe_impact', expect_solve=False, license='MIT',
          exercises='S4R, R3D4 — parts/instances/assembly; explicit',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
+         note='Abaqus general contact (*CONTACT, *CONTACT INCLUSIONS ALL EXTERIOR) has no ccx '
+              'equivalent: the rigid target converts, but without the contact the pipe passes '
+              'through it, so the run that completes is not the impact',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/11.%20Explicit%20Analysis/2.%20Pipe%20Impact/Pipe_Impact.inp'),
     dict(name='marcello_gori_spring_mass_damper', expect_solve=False, license='MIT',
          exercises='R3D4, MASS, SPRINGA, DASHPOTA — parts/instances/assembly; *Frequency',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
+         note='step 2 is a damped *COMPLEX FREQUENCY, which ccx does not have (its *COMPLEX '
+              'FREQUENCY needs CORIOLIS or FLUTTER); step 1 runs, but ARPACK cannot return the '
+              'spring mode of this 3-DOF system beside its two zero modes',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/9.%20Damping/1.%20Spring%20Dashpot%20Damping/Spring_Mass_Damper.inp'),
     dict(name='marcello_gori_static_all_modal_nlgeom', expect_solve=False, license='MIT',
          exercises='S4, B31 — parts/instances/assembly; *Frequency',

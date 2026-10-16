@@ -38,8 +38,12 @@ and a bar impact in an explicit step without any output request (20 output frame
 free end against 1-D wave theory), CPS4I / CPE4I cantilevers written as C3D8I slabs under
 an end couple against beam theory (deflection and stresses), shell pressure on the SPOS and
 SNEG faces and element-based against the Navier plate solution (the sign of each), a bare
-*KINEMATIC (all DOFs) against *RIGID BODY, and an assembly with a turned instance against
-the same model written flat.
+*KINEMATIC (all DOFs) against *RIGID BODY, an assembly with a turned instance against
+the same model written flat, and rigid tools: a rigid flat punch (rigid elements, and
+the same face as an analytical surface) against the penalty contact law and a punch given
+the motion node by node, also turned under NLGEOM, a block tied to a turning rigid plate, a
+rigid plate's MASS and ROTARYI on springs against its frequencies, and (--approximate) a
+faceted analytical sphere against Hertz.
 
     python validate_with_ccx.py
 
@@ -85,10 +89,10 @@ def find_ccx():
     return None, {}
 
 
-def convert(path, out_inp):
+def convert(path, out_inp, approximate=False):
     rep = A.Report()
     blocks = A.read_blocks(path, rep)
-    conv = A.Converter(rep, type("O", (), {"solid_dof": False})())
+    conv = A.Converter(rep, type("O", (), {"solid_dof": False, "approximate": approximate})())
     body = conv.convert(blocks)                     # convert first: the header lists warnings
     text = "\n".join(rep.header_comment_lines() + body) + "\n"
     with open(out_inp, "w") as fh:
@@ -440,6 +444,242 @@ def dat_history(dat_path, what, nset):
                 continue
             rows.append(vals[1:] if len(vals) == 4 and what != "total force" else vals)
     return out
+
+
+# --- rigid tools: Abaqus decks built here, so that each variant differs only in the tool ----
+# A rigid flat punch pressed into an elastic block (3-D C3D8, plane-strain CPE4, axisymmetric
+# CAX4) under frictionless HARD contact; the tool is rigid elements (R3D4 / R2D2 / RAX2), an
+# analytical surface (CYLINDER / SEGMENTS), or a solid punch every node of which is given the
+# motion (tool="prescribed") — the reference a rigid body must reproduce.  Reference node 9001.
+
+def _ids(ids, k=16):
+    ids = [str(i) for i in ids]
+    return [", ".join(ids[i:i + k]) for i in range(0, len(ids), k)]
+
+
+def rigid_punch_deck(dim="3d", tool="elements", nlgeom=False, d=0.01, theta=0.0,
+                     ctype="SURFACE TO SURFACE", n=4, m=3):
+    lines = ["*HEADING", f"Rigid flat punch on an elastic block ({dim}, tool: {tool})"]
+    ref = (0.5, 0.5, 2.0) if dim == "3d" else (0.5, 2.0)
+    tool_nodes = {}
+    if dim == "3d":
+        nid = lambda i, j, k: 1 + i + (n + 1) * (j + (n + 1) * k)      # noqa: E731
+        lines.append("*NODE")
+        lines += [f"{nid(i, j, k)}, {i / n:.12g}, {j / n:.12g}, {k / n:.12g}"
+                  for k in range(n + 1) for j in range(n + 1) for i in range(n + 1)]
+        lines.append("*ELEMENT, TYPE=C3D8, ELSET=BLOCK")
+        lines += [f"{1 + i + n * j + n * n * k}, {nid(i, j, k)}, {nid(i + 1, j, k)}, {nid(i + 1, j + 1, k)}, "
+                  f"{nid(i, j + 1, k)}, {nid(i, j, k + 1)}, {nid(i + 1, j, k + 1)}, {nid(i + 1, j + 1, k + 1)}, "
+                  f"{nid(i, j + 1, k + 1)}" for k in range(n) for j in range(n) for i in range(n)]
+        lines += ["*NSET, NSET=BOT"] + _ids(nid(i, j, 0) for j in range(n + 1) for i in range(n + 1))
+        lines += ["*NSET, NSET=TOPB"] + _ids(nid(i, j, n) for j in range(n + 1) for i in range(n + 1))
+        lines += ["*ELSET, ELSET=TOPE"] + _ids(1 + i + n * j + n * n * (n - 1) for j in range(n) for i in range(n))
+        lines += ["*SURFACE, NAME=TOP", "TOPE, S2"]
+        fixes = ["BOT, 3, 3", f"{nid(0, 0, 0)}, 1, 2", f"{nid(n, 0, 0)}, 2, 2"]
+        pn = lambda i, j: 1000 + i + (m + 1) * j                         # noqa: E731
+        if tool == "analytic":
+            # point c on the NEGATIVE local z-axis: local y = -Z, so the line's normal
+            # (e3 x s, s = +x) points down at the block
+            lines += ["*SURFACE, TYPE=CYLINDER, NAME=TOOL", "0., 0., 1., 1., 0., 1.", "0., -1., 1.",
+                      "START, -0.25, 0.", "LINE, 1.25, 0."]
+        else:
+            lines.append("*NODE")
+            for lay, z in ((0, 1.0),) + (((1, 1.1),) if tool == "prescribed" else ()):
+                for j in range(m + 1):
+                    for i in range(m + 1):
+                        tool_nodes[500 * lay + pn(i, j)] = (-0.25 + 1.5 * i / m, -0.25 + 1.5 * j / m, z)
+            lines += [f"{k}, {p[0]:.12g}, {p[1]:.12g}, {p[2]:.12g}" for k, p in sorted(tool_nodes.items())]
+            lines.append(f"*ELEMENT, TYPE={'R3D4' if tool == 'elements' else 'C3D8'}, ELSET=PUNCH")
+            for j in range(m):
+                for i in range(m):
+                    face = [pn(i, j), pn(i, j + 1), pn(i + 1, j + 1), pn(i + 1, j)]   # normal -z
+                    conn = face if tool == "elements" else [500 + x for x in face] + face
+                    lines.append(f"{2000 + i + m * j}, " + ", ".join(map(str, conn)))
+            lines += ["*SURFACE, NAME=TOOL", "PUNCH, SPOS" if tool == "elements" else "PUNCH, S2"]
+    else:
+        ax = dim == "axisym"
+        nid = lambda i, j: 1 + i + (n + 1) * j                            # noqa: E731
+        lines.append("*NODE")
+        lines += [f"{nid(i, j)}, {i / n:.12g}, {j / n:.12g}" for j in range(n + 1) for i in range(n + 1)]
+        lines.append(f"*ELEMENT, TYPE={'CAX4' if ax else 'CPE4'}, ELSET=BLOCK")
+        lines += [f"{1 + i + n * j}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+                  for j in range(n) for i in range(n)]
+        lines += ["*NSET, NSET=BOT"] + _ids(nid(i, 0) for i in range(n + 1))
+        lines += ["*NSET, NSET=TOPB"] + _ids(nid(i, n) for i in range(n + 1))
+        lines += ["*NSET, NSET=AXIS"] + _ids(nid(0, j) for j in range(n + 1))
+        lines += ["*ELSET, ELSET=TOPE"] + _ids(1 + i + n * (n - 1) for i in range(n))
+        lines += ["*SURFACE, NAME=TOP", "TOPE, S3"]
+        fixes = ["BOT, 2, 2", "AXIS, 1, 1" if ax else f"{nid(0, 0)}, 1, 1"]
+        x0, x1 = (0.0, 1.25) if ax else (-0.25, 1.25)
+        if tool == "analytic":
+            # running from x1 to x0 (-x), the profile's normal e3 x s points down (-y)
+            lines += ["*SURFACE, TYPE=SEGMENTS, NAME=TOOL", f"START, {x1:g}, 1.", f"LINE, {x0:g}, 1."]
+        else:
+            lines.append("*NODE")
+            xs = [x1 + (x0 - x1) * i / m for i in range(m + 1)]
+            for lay, y in ((0, 1.0),) + (((1, 1.1),) if tool == "prescribed" else ()):
+                for i, x in enumerate(xs):
+                    tool_nodes[1000 + 500 * lay + i] = (x, y)
+            lines += [f"{k}, {p[0]:.12g}, {p[1]:.12g}" for k, p in sorted(tool_nodes.items())]
+            typ = ("RAX2" if ax else "R2D2") if tool == "elements" else ("CAX4" if ax else "CPE4")
+            lines.append(f"*ELEMENT, TYPE={typ}, ELSET=PUNCH")
+            for i in range(m):
+                conn = [1000 + i, 1001 + i] if tool == "elements" else [1500 + i, 1501 + i, 1001 + i, 1000 + i]
+                lines.append(f"{2000 + i}, " + ", ".join(map(str, conn)))
+            lines += ["*SURFACE, NAME=TOOL", "PUNCH, SPOS" if tool == "elements" else "PUNCH, S3"]
+    lines += ["*NODE, NSET=REF", "9001, " + ", ".join(f"{x:g}" for x in ref)]
+    lines += ["*SOLID SECTION, ELSET=BLOCK, MATERIAL=STEEL"] + ([] if dim == "3d" else ["1."])
+    lines += ["*MATERIAL, NAME=STEEL", "*ELASTIC", "1000., 0.3"]
+    if tool == "prescribed":
+        lines += ["*SOLID SECTION, ELSET=PUNCH, MATERIAL=STEEL"] + ([] if dim == "3d" else ["1."])
+        lines += ["*NSET, NSET=TOOLN"] + _ids(sorted(tool_nodes))
+    else:
+        lines += [f"*RIGID BODY, REF NODE=9001, {'ELSET=PUNCH' if tool == 'elements' else 'ANALYTICAL SURFACE=TOOL'}"]
+    lines += ["*SURFACE INTERACTION, NAME=SMOOTH", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD",
+              f"*CONTACT PAIR, INTERACTION=SMOOTH, TYPE={ctype}", "TOP, TOOL", "*BOUNDARY"] + fixes
+    lines += [f"*STEP{', NLGEOM' if nlgeom else ''}, INC=1000", "*STATIC",
+              "0.1, 1., 1e-6, 0.1" if nlgeom else "1., 1.", "*BOUNDARY"]
+    if tool == "prescribed":                  # the rigid motion of every punch node
+        c, sn = math.cos(theta), math.sin(theta)
+        for k, p in sorted(tool_nodes.items()):
+            if dim == "3d":                    # turned about x through the reference node
+                ry, rz = p[1] - ref[1], p[2] - ref[2]
+                u = (0.0, c * ry - sn * rz - ry, sn * ry + c * rz - rz - d)
+            else:                              # turned about z
+                rx, ry = p[0] - ref[0], p[1] - ref[1]
+                u = (c * rx - sn * ry - rx, sn * rx + c * ry - ry - d)
+            lines += [f"{k}, {i + 1}, {i + 1}, {x:.15g}" for i, x in enumerate(u)]
+    elif dim == "3d":
+        lines += ["9001, 1, 2", f"9001, 3, 3, {-d:g}", f"9001, 4, 4, {theta:g}", "9001, 5, 6"]
+    else:
+        lines += ["9001, 1, 1", f"9001, 2, 2, {-d:g}", f"9001, 6, 6, {theta:g}"]
+    lines += ["*NODE PRINT, NSET=REF", "U, RF", "*NODE PRINT, NSET=TOPB", "U"]
+    lines += (["*NODE PRINT, NSET=TOOLN", "RF"] if tool == "prescribed" else []) + ["*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def rigid_tied_deck(tool="elements", d=0.1, theta=0.05, n=4, m=3):
+    """A block whose top face is tied (*TIE) to a rigid plate (R3D4 elements, or a CYLINDER
+    surface) that reference node 9001 pushes down and turns about x under NLGEOM; or, with
+    tool="prescribed", the block's top nodes given that motion directly."""
+    nid = lambda i, j, k: 1 + i + (n + 1) * (j + (n + 1) * k)          # noqa: E731
+    lines = ["*HEADING", f"Block tied to a rigid plate that turns (tool: {tool})", "*NODE"]
+    lines += [f"{nid(i, j, k)}, {i / n:.12g}, {j / n:.12g}, {k / n:.12g}"
+              for k in range(n + 1) for j in range(n + 1) for i in range(n + 1)]
+    lines.append("*ELEMENT, TYPE=C3D8, ELSET=BLOCK")
+    lines += [f"{1 + i + n * j + n * n * k}, {nid(i, j, k)}, {nid(i + 1, j, k)}, {nid(i + 1, j + 1, k)}, "
+              f"{nid(i, j + 1, k)}, {nid(i, j, k + 1)}, {nid(i + 1, j, k + 1)}, {nid(i + 1, j + 1, k + 1)}, "
+              f"{nid(i, j + 1, k + 1)}" for k in range(n) for j in range(n) for i in range(n)]
+    lines += ["*NSET, NSET=BOT"] + _ids(nid(i, j, 0) for j in range(n + 1) for i in range(n + 1))
+    lines += ["*NSET, NSET=MID"] + _ids(nid(i, j, n // 2) for j in range(n + 1) for i in range(n + 1))
+    lines += ["*ELSET, ELSET=TOPE"] + _ids(1 + i + n * j + n * n * (n - 1) for j in range(n) for i in range(n))
+    lines += ["*SURFACE, NAME=TOP", "TOPE, S2", "*NODE, NSET=REF", "9001, 0.5, 0.5, 2."]
+    if tool == "elements":
+        pn = lambda i, j: 1000 + i + (m + 1) * j                         # noqa: E731
+        lines += ["*NODE"] + [f"{pn(i, j)}, {i / m:.12g}, {j / m:.12g}, 1." for j in range(m + 1) for i in range(m + 1)]
+        lines.append("*ELEMENT, TYPE=R3D4, ELSET=PLATE")
+        lines += [f"{2000 + i + m * j}, {pn(i, j)}, {pn(i, j + 1)}, {pn(i + 1, j + 1)}, {pn(i + 1, j)}"
+                  for j in range(m) for i in range(m)]
+        lines += ["*SURFACE, NAME=TOOL", "PLATE, SPOS", "*RIGID BODY, REF NODE=9001, ELSET=PLATE"]
+    elif tool == "analytic":
+        lines += ["*SURFACE, TYPE=CYLINDER, NAME=TOOL", "0., 0., 1., 1., 0., 1.", "0., -1., 1.",
+                  "START, 0., 0.", "LINE, 1., 0.", "*RIGID BODY, REF NODE=9001, ANALYTICAL SURFACE=TOOL"]
+    lines += ["*SOLID SECTION, ELSET=BLOCK, MATERIAL=STEEL", "*MATERIAL, NAME=STEEL", "*ELASTIC", "1000., 0.3"]
+    lines += ([] if tool == "prescribed" else ["*TIE, NAME=GLUE", "TOP, TOOL"]) + ["*BOUNDARY", "BOT, 1, 3"]
+    lines += ["*STEP, NLGEOM, INC=1000", "*STATIC", "0.1, 1., 1e-6, 0.1", "*BOUNDARY"]
+    if tool == "prescribed":
+        c, sn = math.cos(theta), math.sin(theta)
+        for j in range(n + 1):
+            ry, rz = j / n - 0.5, 1.0 - 2.0
+            u = (0.0, c * ry - sn * rz - ry, sn * ry + c * rz - rz - d)
+            lines += [f"{nid(i, j, n)}, {k + 1}, {k + 1}, {u[k]:.15g}" for i in range(n + 1) for k in range(3)]
+    else:
+        lines += ["9001, 1, 2", f"9001, 3, 3, {-d:g}", f"9001, 4, 4, {theta:g}", "9001, 5, 6"]
+    lines += ["*NODE PRINT, NSET=MID", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def rigid_inertia_deck(mass=6.0, k=96.0, kz=1.0e4, rot=(1.5, 2.0, 1.0)):
+    """A rigid plate (R3D4) whose mass (MASS) and rotary inertia (ROTARYI) sit on its reference
+    node, on springs: free in y (2 springs k at x = +/-0.75) and about z, plus a stiff z spring."""
+    pn = lambda i, j: 1 + i + 3 * j                                      # noqa: E731
+    lines = ["*HEADING", "Rigid plate (R3D4) on springs: MASS and ROTARYI on its reference node",
+             "*NODE"] + [f"{pn(i, j)}, {-0.75 + 0.75 * i:g}, {-0.75 + 0.75 * j:g}, 0." for j in range(3) for i in range(3)]
+    lines += ["100, 0., 0., 0.5", "101, 0.75, 1., 0.", "102, -0.75, 1., 0.", "103, 0., 0., -1.5",
+              "*ELEMENT, TYPE=R3D4, ELSET=PLATE"]
+    lines += [f"{1 + i + 2 * j}, {pn(i, j)}, {pn(i + 1, j)}, {pn(i + 1, j + 1)}, {pn(i, j + 1)}"
+              for j in range(2) for i in range(2)]
+    lines += ["*ELEMENT, TYPE=MASS, ELSET=PM", "10, 100", "*MASS, ELSET=PM", f"{mass:g}",
+              "*ELEMENT, TYPE=ROTARYI, ELSET=PI", "11, 100", "*ROTARY INERTIA, ELSET=PI",
+              f"{rot[0]:g}, {rot[1]:g}, {rot[2]:g}, 0., 0., 0.",
+              "*ELEMENT, TYPE=SPRINGA, ELSET=SY", f"20, {pn(2, 1)}, 101", f"21, {pn(0, 1)}, 102",
+              "*SPRING, ELSET=SY", "", f"{k:.1f}", "*ELEMENT, TYPE=SPRINGA, ELSET=SZ", "22, 100, 103",
+              "*SPRING, ELSET=SZ", "", f"{kz:.1f}", "*RIGID BODY, REF NODE=100, ELSET=PLATE",
+              "*BOUNDARY", "101, 1, 3", "102, 1, 3", "103, 1, 3", "100, 1, 1", "100, 4, 5",
+              "*STEP", "*FREQUENCY", "2", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def rigid_hertz_deck(radius=10.0, d=0.1, n=60, size=40.0):
+    """A rigid sphere (an axisymmetric SEGMENTS surface: a CIRCL arc) pressed into a half-space
+    of CAX4 elements graded towards the contact; reference node 99001 at the centre."""
+    nid = lambda i, j: 1 + i + (n + 1) * j                                # noqa: E731
+    grade = lambda k: size * (k / n) ** 2                                 # noqa: E731
+    lines = ["*HEADING", "Rigid sphere (analytical surface) on an elastic half-space: Hertz", "*NODE"]
+    lines += [f"{nid(i, j)}, {grade(i):.12g}, {-grade(n - j):.12g}" for j in range(n + 1) for i in range(n + 1)]
+    lines.append("*ELEMENT, TYPE=CAX4, ELSET=BLOCK")
+    lines += [f"{1 + i + n * j}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+              for j in range(n) for i in range(n)]
+    lines += ["*NSET, NSET=BOT"] + _ids(nid(i, 0) for i in range(n + 1))
+    lines += ["*NSET, NSET=AXIS"] + _ids(nid(0, j) for j in range(n + 1))
+    lines += ["*ELSET, ELSET=TOPE"] + _ids(1 + i + n * (n - 1) for i in range(n))
+    lines += ["*SURFACE, NAME=TOP", "TOPE, S3", "*NODE, NSET=REF", f"99001, 0., {radius:g}",
+              "*SURFACE, TYPE=SEGMENTS, NAME=BALL", f"START, {radius:g}, {radius:g}",
+              f"CIRCL, 0., 0., 0., {radius:g}", "*RIGID BODY, REF NODE=99001, ANALYTICAL SURFACE=BALL",
+              "*SOLID SECTION, ELSET=BLOCK, MATERIAL=STEEL", "*MATERIAL, NAME=STEEL", "*ELASTIC", "1000., 0.3",
+              "*SURFACE INTERACTION, NAME=SMOOTH", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD",
+              "*CONTACT PAIR, INTERACTION=SMOOTH", "TOP, BALL", "*BOUNDARY", "BOT, 1, 2", "AXIS, 1, 1",
+              "*STEP, INC=1000", "*STATIC", "0.1, 1., 1e-6, 0.1", "*BOUNDARY", "99001, 1, 1",
+              f"99001, 2, 2, {-d:g}", "99001, 6, 6", "*NODE PRINT, NSET=REF", "U, RF", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def rigid_punch_explicit_deck(tool="elements", dtmax=None, period=0.002):
+    """The plane-strain punch of rigid_punch_deck (node-to-surface contact) in explicit
+    dynamics: the block gets a density and the motion is ramped over the step; ``dtmax`` is
+    the step's maximum increment (4th field of the *DYNAMIC data line)."""
+    d = rigid_punch_deck("planar", tool, ctype="NODE TO SURFACE")
+    d = d.replace("*ELASTIC\n1000., 0.3", "*ELASTIC\n1000., 0.3\n*DENSITY\n1e-3")
+    d = d.replace("*STEP, INC=1000\n", f"*AMPLITUDE, NAME=RAMP\n0., 0., {period:g}, 1.\n*STEP, INC=1000000\n")
+    return d.replace("*STATIC\n1., 1.\n*BOUNDARY\n", f"*DYNAMIC, EXPLICIT\n, {period:g}"
+                     + (f", , {dtmax:g}" if dtmax else "") + "\n*BOUNDARY, AMPLITUDE=RAMP\n")
+
+
+def rigid_pressure_deck(kind="R2D2", thick=0.5, p=2.0, k=4.0):
+    """A rigid R2D2 segment of length 1 in a plane-strain model whose section is ``thick``
+    thick, or an R3D4 unit square, pushed by a pressure P on the element (positive along its
+    normal: +y, +z) against a spring k at reference node 9; Abaqus: u = p / k (an R2D2 has no
+    section thickness: P acts per unit depth)."""
+    if kind == "R2D2":
+        lines = ["*HEADING", "Pressure on a rigid R2D2 segment", "*NODE", "1, 0., 0.", "2, 1., 0.",
+                 "3, 1., 1.", "4, 0., 1.", "11, 0., 2.", "12, 1., 2.", "9, 0.5, 3.",
+                 "*ELEMENT, TYPE=CPE4, ELSET=B", "1, 1, 2, 3, 4", "*ELEMENT, TYPE=R2D2, ELSET=R",
+                 "5, 11, 12", f"*SOLID SECTION, ELSET=B, MATERIAL=M", f"{thick:g}"]
+        held, dof = ["9, 1, 1", "9, 6, 6"], 2
+    else:
+        lines = ["*HEADING", "Pressure on a rigid R3D4 facet", "*NODE"]
+        lines += [f"{i + 1}, {x:g}, {y:g}, {z:g}" for i, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)])]
+        lines += ["11, 0., 0., 2.", "12, 1., 0., 2.", "13, 1., 1., 2.", "14, 0., 1., 2.", "9, 0.5, 0.5, 3.",
+                  "*ELEMENT, TYPE=C3D8, ELSET=B", "1, 1, 2, 3, 4, 5, 6, 7, 8",
+                  "*ELEMENT, TYPE=R3D4, ELSET=R", "5, 11, 12, 13, 14", "*SOLID SECTION, ELSET=B, MATERIAL=M"]
+        held, dof = ["9, 1, 2", "9, 4, 6"], 3
+    lines += ["*MATERIAL, NAME=M", "*ELASTIC", "100., 0.3", "*RIGID BODY, REF NODE=9, ELSET=R",
+              "*ELEMENT, TYPE=SPRING1, ELSET=SP", "50, 9", "*SPRING, ELSET=SP", str(dof), f"{k:.6f}",
+              "*NSET, NSET=REF", "9", "*NSET, NSET=BN"] + _ids(range(1, 5 if kind == "R2D2" else 9))
+    lines += ["*BOUNDARY", f"BN, 1, {2 if kind == 'R2D2' else 3}", "*STEP", "*STATIC", "*BOUNDARY"] + held
+    lines += ["*DLOAD", f"R, P, {p:g}", "*NODE PRINT, NSET=REF", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
 
 
 def frd_last(frd_path, name):
@@ -1874,6 +2114,157 @@ def main():
               f"{1 / eps_f:.6f}) at PEEQ {peeq[2]:.5f}, DUCT {duct[1]:g} in the cube without the "
               f"criterion, results {'identical to' if same else 'DIFFERENT from'} the run "
               f"without the card")
+    # --- rigid elements and analytical rigid surfaces ---------------------------------
+    # ccx has neither: the converter gives each facet a force-free skin element that the rigid
+    # body carries.  Against frictionless HARD contact (ccx: a linear law of slope K = 50 x the
+    # first material's modulus) a flat punch on a free block has the series-spring answer
+    # F = A d / (L / E' + 1 / K) — E' = E / (1 - nu^2) in plane strain — exactly, and the same
+    # punch written as an analytical surface, or as a solid punch whose every node is given
+    # the motion, must give the same block.
+    def rigid_run(text, name, approximate=False):
+        src = os.path.join(tmp, name + "_src.inp")
+        with open(src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, name + ".inp")
+        convert(src, inp, approximate)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        res = {"status": status, "out": out,
+               "ref": dat_history(dat, "forces", "REF"), "top": dat_history(dat, "displacements", "TOPB"),
+               "mid": dat_history(dat, "displacements", "MID"),
+               "tool": dat_history(dat, "forces", "TOOLN"), "refu": dat_history(dat, "displacements", "REF")}
+        if os.path.exists(dat):
+            res["eig"] = dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")
+        shutil.rmtree(d, ignore_errors=True)
+        return res
+
+    def rows_diff(a, b):
+        return max(abs(x - y) for ra, rb in zip(a, b) for x, y in zip(ra, rb)), \
+            max(abs(x) for r in b for x in r)
+
+    E, nu, K, dd = 1000.0, 0.3, 50.0 * 1000.0, 0.01
+    for dim, k, eprime in (("3d", 2, E), ("planar", 1, E / (1 - nu * nu))):
+        ref = -1.0 * dd / (1.0 / eprime + 1.0 / K)
+        got = {}
+        for tool in ("elements", "analytic"):
+            r = rigid_run(rigid_punch_deck(dim, tool), f"rigid_punch_{dim}_{tool}")
+            got[tool] = r
+            if r["status"] != "solved" or not r["ref"]:
+                print(f"FAIL  rigid_punch ({dim}, {tool}): {r['status']}")
+                print("\n".join(l for l in r["out"].splitlines() if "ERROR" in l))
+                failures += 1
+        if all(g["status"] == "solved" and g["ref"] for g in got.values()):
+            fa, fb = got["elements"]["ref"][-1][1][0][k], got["analytic"]["ref"][-1][1][0][k]
+            du, scale = rows_diff(got["analytic"]["top"][-1][1], got["elements"]["top"][-1][1])
+            ok = abs(fa / ref - 1) < 1e-5 and abs(fb / ref - 1) < 1e-5 and du <= 1e-6 * scale
+            tools = ("R3D4", "CYLINDER") if dim == "3d" else ("R2D2", "SEGMENTS")
+            print(f"{'PASS' if ok else 'FAIL'}  rigid_punch ({dim}, face-to-face): reaction {fa:+.6f} "
+                  f"({tools[0]} skins), {fb:+.6f} ({tools[1]} analytical surface) vs A d / (L/E' + "
+                  f"1/K) = {ref:+.6f}; block top {du / scale:.1e} apart")
+            failures += 0 if ok else 1
+    # axisymmetric (node-to-surface; ccx's face-to-face one is uneven at a punch edge, with a
+    # prescribed punch too): RAX2 skins and a SEGMENTS surface against a prescribed CAX4 punch
+    got = {tool: rigid_run(rigid_punch_deck("axisym", tool, ctype="NODE TO SURFACE"), f"rigid_punch_ax_{tool}")
+           for tool in ("elements", "analytic", "prescribed")}
+    if not all(g["status"] == "solved" and g["top"] for g in got.values()):
+        print("FAIL  rigid_punch (axisymmetric): " + ", ".join(f"{t} {g['status']}" for t, g in got.items()))
+        failures += 1
+    else:
+        ub = got["prescribed"]["top"][-1][1]
+        fp = sum(r[1] for r in got["prescribed"]["tool"][-1][1])
+        errs = [rows_diff(got[t]["top"][-1][1], ub) for t in ("elements", "analytic")]
+        forces = [got[t]["ref"][-1][1][0][1] for t in ("elements", "analytic")]
+        ok = all(du <= 1e-6 * sc for du, sc in errs) and all(abs(f / fp - 1) < 1e-5 for f in forces)
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_punch (axisymmetric, node-to-surface): RAX2 skins and a "
+              f"SEGMENTS surface move the block as the prescribed punch does ({max(e[0] / e[1] for e in errs):.1e} "
+              f"apart); reactions {forces[0]:+.6f}, {forces[1]:+.6f} vs {fp:+.6f} (per 2-degree sector)")
+        failures += 0 if ok else 1
+    # NLGEOM: the punch pushed in and turned (3-D 0.05 rad about x, plane 0.03 rad about z)
+    for dim, th in (("3d", 0.05), ("planar", 0.03)):
+        got = {tool: rigid_run(rigid_punch_deck(dim, tool, nlgeom=True, d=0.1, theta=th, ctype="NODE TO SURFACE"),
+                               f"rigid_tilt_{dim}_{tool}") for tool in ("elements", "analytic", "prescribed")}
+        if not all(g["status"] == "solved" and g["top"] for g in got.values()):
+            print(f"FAIL  rigid_punch_tilt ({dim}): " + ", ".join(f"{t} {g['status']}" for t, g in got.items()))
+            failures += 1
+            continue
+        errs = [rows_diff(got[t]["top"][-1][1], got["prescribed"]["top"][-1][1]) for t in ("elements", "analytic")]
+        worst = max(du / sc for du, sc in errs)
+        ok = worst < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_punch_tilt ({dim}, NLGEOM, turned {th:g} rad): rigid skins and "
+              f"the analytical surface vs the punch given the exact motion: block top {worst:.1e} of |u| apart")
+        failures += 0 if ok else 1
+    # *TIE to a rigid plate that turns under NLGEOM: the tied nodes join the body
+    got = {tool: rigid_run(rigid_tied_deck(tool), f"rigid_tie_{tool}") for tool in ("elements", "analytic", "prescribed")}
+    if not all(g["status"] == "solved" and g["mid"] for g in got.values()):
+        print("FAIL  rigid_tie: " + ", ".join(f"{t} {g['status']}" for t, g in got.items()))
+        failures += 1
+    else:
+        errs = [rows_diff(got[t]["mid"][-1][1], got["prescribed"]["mid"][-1][1]) for t in ("elements", "analytic")]
+        worst = max(du / sc for du, sc in errs)
+        ok = worst < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_tie (*TIE to a rigid plate turned 0.05 rad, NLGEOM): block "
+              f"mid-height {worst:.1e} of |u| from the top given the exact motion (ccx's own tie: 1.3e-2)")
+        failures += 0 if ok else 1
+    # mass and rotary inertia from the deck's MASS / ROTARYI elements only (zero-density skins)
+    r = rigid_run(rigid_inertia_deck(), "rigid_inertia")
+    want = sorted([math.sqrt(2 * 96.0 / 6.0) / (2 * math.pi), math.sqrt(2 * 96.0 * 0.75 ** 2 / 1.0) / (2 * math.pi)])
+    eig = r.get("eig") or []
+    got_f = sorted(eig)[:2] if len(eig) >= 2 else []
+    if r["status"] != "solved" or len(got_f) < 2:
+        print(f"FAIL  rigid_inertia: {r['status']}, eigenvalues {eig}")
+        failures += 1
+    else:
+        err = max(abs(a / b - 1) for a, b in zip(got_f, want))
+        ok = err < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_inertia (R3D4 plate, MASS + ROTARYI on springs): f = "
+              f"{got_f[0]:.6f}, {got_f[1]:.6f} Hz (theory {want[0]:.6f}, {want[1]:.6f}; {err:.1e} off)")
+        failures += 0 if ok else 1
+    # --approximate: a sphere (SEGMENTS with a CIRCL arc) meshed into facets, on a half-space
+    r = rigid_run(rigid_hertz_deck(), "rigid_hertz", approximate=True)
+    hertz = 4.0 / 3.0 * E / (1 - nu * nu) * math.sqrt(10.0) * 0.1 ** 1.5
+    if r["status"] != "solved" or not r["ref"]:
+        print(f"FAIL  rigid_hertz: {r['status']}")
+        failures += 1
+    else:
+        f = -180.0 * r["ref"][-1][1][0][1]                 # ccx: per 2-degree sector
+        ok = abs(f / hertz - 1) < 0.03
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_hertz (--approximate, faceted analytical sphere on a "
+              f"half-space): F = {f:.2f} vs Hertz {hertz:.2f} ({(f / hertz - 1) * 100:+.1f}%; finite domain "
+              f"and penalty contact)")
+        failures += 0 if ok else 1
+
+    # explicit dynamics: ccx leaves the contact of a plane model's expanded nodes with a rigid
+    # surface out of its stable increment, so the converter caps the step's increment; the
+    # punch given its motion node by node, run at that increment, is the reference
+    r = rigid_run(rigid_punch_explicit_deck("elements"), "rigid_explicit_elements")
+    with open(os.path.join(tmp, "rigid_explicit_elements.inp")) as fh:
+        m = re.search(r"(?m)^\*DYNAMIC, EXPLICIT[^\n]*\n([^\n]*)", fh.read())
+    fields = [x.strip() for x in m.group(1).split(",")] if m else []
+    cap = float(fields[3]) if len(fields) > 3 and fields[3] else None
+    ref_run = rigid_run(rigid_punch_explicit_deck("prescribed", dtmax=cap), "rigid_explicit_prescribed") \
+        if cap else None
+    if not cap or r["status"] != "solved" or not r["top"] or not ref_run or ref_run["status"] != "solved" \
+            or not ref_run["top"]:
+        print(f"FAIL  rigid_punch_explicit (planar): cap {cap}, {r['status']}, "
+              f"{ref_run['status'] if ref_run else 'no reference run'}")
+        failures += 1
+    else:
+        du, sc = rows_diff(r["top"][-1][1], ref_run["top"][-1][1])
+        f_s, f_p = r["ref"][-1][1][0][1], sum(row[1] for row in ref_run["tool"][-1][1])
+        ok = du <= 1e-6 * sc and abs(f_s / f_p - 1) < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_punch_explicit (planar, R2D2 skins): maximum increment "
+              f"{cap:g} set by the converter (ccx's own estimate leaves this contact out); block top "
+              f"{du / sc:.1e} of |u| from the punch given its motion node by node at that increment, "
+              f"reaction {f_s:+.6f} vs {f_p:+.6f}")
+        failures += 0 if ok else 1
+    # pressure on rigid elements: positive along the element normal; an R2D2 per unit depth
+    for kind, axis in (("R2D2", 1), ("R3D4", 2)):
+        r = rigid_run(rigid_pressure_deck(kind), f"rigid_pressure_{kind}")
+        u = r["refu"][-1][1][0][axis] if r["status"] == "solved" and r["refu"] else None
+        ok = u is not None and abs(u / (2.0 / 4.0) - 1) < 1e-9
+        what = "segment of length 1 (section 0.5 thick)" if kind == "R2D2" else "unit facet"
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_pressure ({kind}): P = 2 on a rigid {what} against a "
+              f"spring k = 4: u = {u if u is not None else r['status']} (p / k = 0.5)")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

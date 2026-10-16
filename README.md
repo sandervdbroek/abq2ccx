@@ -49,6 +49,10 @@ print(result.report.summary())               # "N warning(s), M note(s), K comme
 * **Constraints** — `*MPC`, kinematic couplings and rigid bodies (with *knot beams* where
   ccx 2.23 rejects rigid constraints on shell and beam nodes), and the overconstraints ccx
   rejects but Abaqus resolves.
+* **Rigid tools** — rigid elements (`R3D3`, `R3D4`, `R2D2`, `RAX2`, …) become force-free
+  solid skins carried by their rigid body, so contact against them works; analytical rigid
+  surfaces are meshed the same way, curved ones only with `--approximate`; a `*TIE` to a
+  rigid surface makes its nodes part of the body, and `ROTARYI` becomes point masses.
 * **Loads and BCs** — surface tractions and beam line loads become consistent nodal forces;
   velocity and acceleration BCs become integrated displacement BCs; `*TRANSFORM` local axes
   are respected wherever ccx reads them.
@@ -69,8 +73,9 @@ problem.
 **`--approximate`** (off by default) lets the converter reframe what ccx cannot run exactly
 as a close equivalent, each flagged `[APPROX]` — a Riks step as plain static, ν ≥ 0.5 as
 0.475, an I-section as an equivalent rectangle, NLGEOM follower tractions as fixed nodal
-forces, and a few more ([full list](docs/user-guide.md#--approximate)). Without it those
-cards are commented out with the reason, so ccx never silently runs a different model.
+forces, a curved analytical rigid surface as flat facets, and a few more
+([full list](docs/user-guide.md#--approximate)). Without it those cards are commented out
+with the reason, so ccx never silently runs a different model.
 
 ## Validation
 
@@ -92,14 +97,16 @@ prints one `PASS` line per check, about seventy in all; [testing](docs/testing.m
 | `CPS4I` / `CPE4I` cantilevers under an end couple (as `C3D8I` slabs) | beam theory (deflection, σ_xx = −My/I, σ_zz) | 4e-8 |
 | pressure on a shell's `SPOS` / `SNEG` side and element-based `P` | Navier plate solution, each sign | 1.0 % |
 | a bare `*KINEMATIC` (all DOFs); an assembly with a turned instance | `*RIGID BODY`; the same model written flat | exact |
+| a rigid flat punch of `R3D4`, `R2D2` or `RAX2` elements or the same face as an analytical surface, also turned under NLGEOM and in explicit dynamics; a block tied to a turning rigid plate; pressure on rigid elements; `MASS` + `ROTARYI` on a rigid plate | ccx's penalty contact law; the punch given its motion node by node; p / k; spring frequencies | ≤ 8e-7 of \|u\|, mostly round-off |
+| a faceted analytical sphere on a block (`--approximate`) | Hertz | 2.3 % (finite block, penalty contact) |
 
 A **corpus of 1022 genuine Abaqus decks** from about 180 public repositories (CAE exports,
 UMAT and UEL decks, explicit and coupled models, …) is fetched on demand and run through
 convert → integrity check → ccx. On ccx 2.23 all 1022 convert with no dangling reference;
-**165 solve the deck's own physics**; 40 more solve but stay out of that count — 14 load
-nothing in the source deck, 28 (3 of them also unloaded) solve a model with reduced physics,
+**165 solve the deck's own physics**; 41 more solve but stay out of that count — 14 load
+nothing in the source deck, 29 (3 of them also unloaded) solve a model with reduced physics,
 and one converges to a solution that is not the deck's (a part that only contact holds drifts
-away in ccx) — and 219 mesh-only decks are accepted. The other 598 need what ccx cannot run — mostly user
+away in ccx) — and 221 mesh-only decks are accepted. The other 595 need what ccx cannot run — mostly user
 materials (353) and user elements (66). See [testing](docs/testing.md).
 
 ## How it works
@@ -125,16 +132,15 @@ The [architecture guide](docs/architecture.md) describes the pipeline and how to
 * User subroutines (UMAT/VUMAT, UEL, DLOAD, DISP, …) do not run in stock ccx. Such cards are
   commented out, naming the ccx subroutine to port.
 * Cohesive and gasket elements run as thin continua (their traction-separation law is lost;
-  warned). Rigid elements, analytical rigid surfaces, connector behaviours, inertia relief
-  and materials such as viscoelasticity and concrete damaged plasticity have no equivalent
-  and are flagged for remodelling; a deck that runs without them is flagged as reduced
-  physics.
+  warned). Abaqus general contact (`*CONTACT`), connector behaviours, inertia relief and
+  materials such as viscoelasticity and concrete damaged plasticity have no equivalent and
+  are flagged for remodelling; a deck that runs without them is flagged as reduced physics.
 * ccx's own first-order elements are not Abaqus': its `CPE4`/`C3D8`/`CAX4` are plain 2×2(×2)
   integration, without Abaqus' selectively reduced volume terms (on a coarse bending mesh
   Abaqus' `CPE4` deflects 9–19 % more for ν 0–0.3), and its `CPS4` is a 3-D slab with a free
   thickness, not 2-D plane stress ([compatibility](docs/compatibility.md)).
-* Explicit coupled temperature–displacement steps do not run; Riks steps and NLGEOM follower
-  tractions run only with `--approximate`.
+* Explicit coupled temperature–displacement steps do not run; Riks steps, NLGEOM follower
+  tractions and curved analytical rigid surfaces run only with `--approximate`.
 * Contact is translated card by card, but ccx's penalty contact behaves differently from
   Abaqus' — check it.
 * ccx 2.23 gets some valid input wrong without an error. The converter works around what it
@@ -183,6 +189,7 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`kinematic_all_dofs`](examples/kinematic_all_dofs.inp) | a bare `*Coupling` + `*Kinematic` (all DOFs) on a solid face, against `*RIGID BODY` |
 | [`assembly_rotated_instances`](examples/assembly_rotated_instances.inp), [`…_flat`](examples/assembly_rotated_instances_flat.inp) | a turned instance with an oriented orthotropic material, against the same model written flat |
 | [`damage_johnson_cook_cubes`](examples/damage_johnson_cook_cubes.inp) | a Johnson-Cook `*DAMAGE INITIATION` → ccx's form, reporting `DUCT` |
+| [`rigid_punch_block`](examples/rigid_punch_block.inp), [`rigid_punch_cylinder`](examples/rigid_punch_cylinder.inp), [`rigid_body_inertia`](examples/rigid_body_inertia.inp) | a rigid `R3D4` punch and the same face as an analytical `CYLINDER` → skins of their rigid body; `MASS` + `ROTARYI` on a rigid plate → point masses |
 | [`coverage_kitchen_sink`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped and commented cards, output-variable mapping |
 
 ## Tests

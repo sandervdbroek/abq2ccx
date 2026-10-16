@@ -98,7 +98,7 @@ ELEMENT_NNODES: Dict[str, int] = {
     # cohesive / gasket (approximated by a thin continuum) / connector / rigid
     "COH2D4": 4, "COH3D6": 6, "COH3D8": 8, "COHAX4": 4, "CONN3D2": 2, "CONN2D2": 2,
     "GK3D8": 8, "GK3D6": 6, "GK2D4": 4, "GK2D6": 6, "GKPS4": 4, "GKPS6": 6, "GKAX4": 4, "GKAX6": 6,
-    "R3D3": 3, "R3D4": 4, "RB2D2": 2, "RB3D2": 2, "RAX2": 2,
+    "R3D3": 3, "R3D4": 4, "R2D2": 2, "RB2D2": 2, "RB3D2": 2, "RAX2": 2,
     # heat-transfer continuum (Abaqus-compatible names accepted by ccx)
     "DC3D4": 4, "DC3D6": 6, "DC3D8": 8, "DC3D10": 10, "DC3D15": 15, "DC3D20": 20,
     "DC1D2": 2, "DC1D3": 3,
@@ -319,9 +319,9 @@ def ccx_element_type(typ: str, report: "Report") -> str:
                     once=True)
         return typ
     if typ.startswith(("R3D", "RB2", "RB3", "RAX", "R2D")):
-        report.warn(f"Element {typ} is a rigid (R3D/RB) element; ccx has no rigid element — define "
-                    f"the region as a *RIGID BODY (NSET + REF NODE/ROT NODE) instead. Emitted "
-                    f"unchanged.", once=True)
+        report.warn(f"Element {typ} is a rigid element that the conversion left as it is (see the "
+                    f"warning on why); ccx has no rigid element and stops with '*ERROR reading "
+                    f"*ELEMENT'.", once=True)
         return typ
     if typ.startswith(UNSUPPORTED_ELEM_PREFIXES):
         report.warn(f"Element {typ} (cohesive/gasket/connector/rotary-inertia) has NO CalculiX "
@@ -906,6 +906,13 @@ def pint(token) -> int:
     return int(pf(token))
 
 
+def short_real(x: float, digits: int = 9) -> str:
+    """A real for a ccx data field: at most ``digits`` significant digits (ccx 2.23 reads only
+    the first 20 characters of a field) and always with a decimal point or exponent."""
+    s = f"{x:.{digits}g}"
+    return s if any(c in s for c in ".eEnN") else s + "."
+
+
 def fmt_num(value) -> str:
     """Format a float compactly but losslessly enough for FE input."""
     if isinstance(value, str):
@@ -999,6 +1006,224 @@ def rotate_about_axis(p: Vec, a: Vec, b: Vec, angle_deg: float) -> Vec:
     term = vadd(vadd(vscale(d, c), vscale(vcross(u, d), s)),
                 vscale(u, vdot(u, d) * (1.0 - c)))
     return vadd(a, term)
+
+
+def analytic_profile(b: Block) -> Tuple[Optional[dict], str]:
+    """An analytical rigid *SURFACE (TYPE=SEGMENTS / CYLINDER / REVOLUTION) as data: the
+    points of its local frame (CYLINDER a, b, c; REVOLUTION a, b — none when the frame lines
+    are left out, as within a part), the profile's start point and its segments ("LINE",
+    end), ("CIRCL", end, centre) and ("PARAB", middle, end) in the profile plane (Abaqus
+    Keywords Reference, *SURFACE).  (None, why) when the card cannot be read."""
+    typ = (b.param("TYPE") or "").strip().upper()
+    recs = [r for r in merged_data_records(b) if any(x for x in r)]
+    frame: List[Vec] = []
+    i = 0
+    while i < len(recs) and i < {"CYLINDER": 2, "REVOLUTION": 1}.get(typ, 0) and \
+            recs[i][0].strip().upper() != "START":
+        try:
+            v = [pf(x) for x in recs[i] if x != ""]
+        except ValueError:
+            return None, f"its coordinate line '{', '.join(recs[i])}' is not numeric"
+        frame += [(v[k], v[k + 1], v[k + 2]) for k in range(0, len(v) - 2, 3)]
+        i += 1
+    if frame and len(frame) != {"CYLINDER": 3, "REVOLUTION": 2}.get(typ):
+        return None, "its coordinate lines do not give the points of its local system"
+    if i >= len(recs) or recs[i][0].strip().upper() != "START":
+        return None, "it has no START line"
+
+    def nums(rec: List[str], n: int) -> List[float]:
+        v = [pf(x) for x in rec[1:] if x != ""]
+        if len(v) < n:
+            raise ValueError
+        return v[:n]
+
+    segs: List[tuple] = []
+    try:
+        x, y = nums(recs[i], 2)
+        for rec in recs[i + 1:]:
+            word = rec[0].strip().upper()
+            if word == "LINE":
+                v = nums(rec, 2)
+                segs.append(("LINE", (v[0], v[1])))
+            elif word in ("CIRCL", "PARAB"):
+                v = nums(rec, 4)
+                segs.append((word, (v[0], v[1]), (v[2], v[3])))
+            else:
+                return None, f"its segment '{rec[0]}' is not LINE, CIRCL or PARAB"
+    except ValueError:
+        return None, "a segment's coordinates are not numeric"
+    if not segs:
+        return None, "it has no segments"
+    try:
+        fillet = pf(b.param("FILLET RADIUS") or "0")
+    except ValueError:
+        fillet = 0.0
+    return {"type": typ, "frame": frame, "start": (x, y), "segs": segs, "fillet": fillet}, ""
+
+
+def profile_points(start: Tuple[float, float], segs: Sequence[tuple], max_deg: float,
+                   max_len: Optional[float] = None) -> Tuple[List[Tuple[float, float]], int, float]:
+    """An analytical surface's profile as a polyline: LINE segments exactly (cut into pieces
+    of at most ``max_len``), CIRCL / PARAB arcs as chords turning at most ``max_deg`` degrees
+    (and, for a circle, no longer than ``max_len``).  Abaqus uses the shorter arc between a
+    circular segment's ends (less than 179.74 degrees) and a parabola through the start,
+    middle and end points.  Returns the points, the number of curved segments (0: the
+    polyline is the profile) and the largest chord angle used (degrees)."""
+    out = [start]
+    curved = 0
+    worst = 0.0
+    for seg in segs:
+        p = out[-1]
+        if seg[0] == "LINE":
+            e = seg[1]
+            ln = math.hypot(e[0] - p[0], e[1] - p[1])
+            n = max(1, min(2000, math.ceil(ln / max_len - 1e-9))) if max_len and ln > 0 else 1
+            out += [(p[0] + (e[0] - p[0]) * k / n, p[1] + (e[1] - p[1]) * k / n) for k in range(1, n)]
+            out.append(e)
+            continue
+        curved += 1
+        if seg[0] == "CIRCL":
+            end, c = seg[1], seg[2]
+            a0 = math.atan2(p[1] - c[1], p[0] - c[0])
+            d = math.atan2(end[1] - c[1], end[0] - c[0]) - a0
+            d = (d + math.pi) % (2.0 * math.pi) - math.pi     # the shorter arc
+            r0, r1 = math.hypot(p[0] - c[0], p[1] - c[1]), math.hypot(end[0] - c[0], end[1] - c[1])
+            step = max_deg
+            if max_len and max(r0, r1) > 0:
+                step = min(step, max(0.1, math.degrees(max_len / max(r0, r1))))
+            n = max(1, math.ceil(abs(math.degrees(d)) / step - 1e-9))
+            worst = max(worst, abs(math.degrees(d)) / n)
+            out += [(c[0] + (r0 + (r1 - r0) * k / n) * math.cos(a0 + d * k / n),
+                     c[1] + (r0 + (r1 - r0) * k / n) * math.sin(a0 + d * k / n)) for k in range(1, n)]
+            out.append(end)
+            continue
+        m, e = seg[1], seg[2]                   # PARAB: the quadratic through p, m, e
+        t0 = (4 * m[0] - 3 * p[0] - e[0], 4 * m[1] - 3 * p[1] - e[1])
+        t1 = (p[0] - 4 * m[0] + 3 * e[0], p[1] - 4 * m[1] + 3 * e[1])
+        turn = abs(math.degrees(math.atan2(t0[0] * t1[1] - t0[1] * t1[0], t0[0] * t1[0] + t0[1] * t1[1])))
+        ln = math.hypot(m[0] - p[0], m[1] - p[1]) + math.hypot(e[0] - m[0], e[1] - m[1])
+        n = max(2, math.ceil(turn / max_deg - 1e-9), math.ceil(ln / max_len - 1e-9) if max_len else 0)
+        n = min(n, 4000)
+        worst = max(worst, turn / n)
+        for k in range(1, n):
+            s = k / n
+            w = ((1 - s) * (1 - 2 * s), 4 * s * (1 - s), s * (2 * s - 1))
+            out.append((w[0] * p[0] + w[1] * m[0] + w[2] * e[0], w[0] * p[1] + w[1] * m[1] + w[2] * e[1]))
+        out.append(e)
+    return out, curved, worst
+
+
+def analytic_frame(kind: str, frame: Sequence[Vec]) -> Tuple[Vec, Vec, Vec, Vec]:
+    """(origin, e1, e2, e3) of a three-dimensional analytical surface's local system.
+    CYLINDER: point a is the origin, b lies on the local x-axis and c on the generator,
+    which is the NEGATIVE local z-axis (c is moved within the plane a, b, c to make a-c
+    perpendicular to a-b); the profile lies in the local x-y plane.  REVOLUTION: the axis
+    (local z) runs from a to b and the profile lies in the r-z plane; e1 is the radial
+    direction of the seam the facets start from.  Without frame points the part's own
+    axes are meant: CYLINDER a = origin, b on +x, c on -z; REVOLUTION a = origin, b on +y,
+    r along x (Abaqus Analysis User's Guide, "Analytical rigid surface definition")."""
+    if kind == "CYLINDER":
+        a, b, c = frame if frame else ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0))
+        ex = vunit(vsub(b, a))
+        g = vsub(c, a)
+        g = vsub(g, vscale(ex, vdot(g, ex)))
+        ez = vscale(vunit(g), -1.0)
+        return a, ex, vcross(ez, ex), ez
+    a, b = frame if frame else ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    ez = vunit(vsub(b, a))
+    er = (1.0, 0.0, 0.0)
+    if abs(vdot(er, ez)) > 0.9:
+        er = (0.0, 0.0, 1.0)
+    er = vunit(vsub(er, vscale(ez, vdot(er, ez))))
+    return a, er, vcross(ez, er), ez
+
+
+def closest_on_triangle(p: Vec, a: Vec, b: Vec, c: Vec) -> Vec:
+    """The point of triangle a, b, c nearest to p (Ericson, Real-Time Collision Detection)."""
+    ab, ac, ap = vsub(b, a), vsub(c, a), vsub(p, a)
+    d1, d2 = vdot(ab, ap), vdot(ac, ap)
+    if d1 <= 0 and d2 <= 0:
+        return a
+    bp = vsub(p, b)
+    d3, d4 = vdot(ab, bp), vdot(ac, bp)
+    if d3 >= 0 and d4 <= d3:
+        return b
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0 and d1 >= 0 and d3 <= 0:
+        return vadd(a, vscale(ab, d1 / (d1 - d3)))
+    cp = vsub(p, c)
+    d5, d6 = vdot(ab, cp), vdot(ac, cp)
+    if d6 >= 0 and d5 <= d6:
+        return c
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0 and d2 >= 0 and d6 <= 0:
+        return vadd(a, vscale(ac, d2 / (d2 - d6)))
+    va = d3 * d6 - d5 * d4
+    if va <= 0 and (d4 - d3) >= 0 and (d5 - d6) >= 0:
+        return vadd(b, vscale(vsub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))))
+    den = va + vb + vc
+    if den == 0:
+        return a
+    v, w = vb / den, vc / den
+    return vadd(a, vadd(vscale(ab, v), vscale(ac, w)))
+
+
+def skin_lift(p: Sequence[float], level: int, half: float, axisym: bool) -> Vec:
+    """The 3-D node of a plane / axisymmetric rigid skin at point ``p`` of the model's plane:
+    at z = -half (level 0) or +half (level 1) in a plane model; turned by -/+1 degree about
+    the y-axis in an axisymmetric one, where ccx expands every 2-D element by rotation into a
+    2-degree sector ("half clockwise and half counterclockwise", ccx manual 6.2.30) — so the
+    skin's face coincides with the expanded faces it contacts."""
+    sg = -1.0 if level == 0 else 1.0
+    if axisym:
+        a = math.radians(1.0)
+        return (p[0] * math.cos(a), p[1], sg * p[0] * math.sin(a))
+    return (p[0], p[1], sg * half)
+
+
+def sym3_eigen(m: Sequence[Sequence[float]]) -> Tuple[List[float], List[Vec]]:
+    """Eigenvalues and unit eigenvectors of a symmetric 3x3 matrix (cyclic Jacobi)."""
+    a = [[float(m[i][j]) for j in range(3)] for i in range(3)]
+    v = [[1.0 if i == j else 0.0 for j in range(3)] for i in range(3)]
+    for _ in range(50):
+        off = sum(a[i][j] ** 2 for i in range(3) for j in range(3) if i != j)
+        if off <= 1e-30 * max(1e-300, sum(a[i][i] ** 2 for i in range(3))):
+            break
+        for p, q in ((0, 1), (0, 2), (1, 2)):
+            if a[p][q] == 0.0:
+                continue
+            th = 0.5 * math.atan2(2.0 * a[p][q], a[q][q] - a[p][p])
+            c, s = math.cos(th), math.sin(th)
+            for k in range(3):                  # A <- A J (columns p, q)
+                akp, akq = a[k][p], a[k][q]
+                a[k][p], a[k][q] = c * akp - s * akq, s * akp + c * akq
+            for k in range(3):                  # A <- J^T A (rows p, q)
+                apk, aqk = a[p][k], a[q][k]
+                a[p][k], a[q][k] = c * apk - s * aqk, s * apk + c * aqk
+            for k in range(3):
+                vkp, vkq = v[k][p], v[k][q]
+                v[k][p], v[k][q] = c * vkp - s * vkq, s * vkp + c * vkq
+    return [a[i][i] for i in range(3)], [(v[0][i], v[1][i], v[2][i]) for i in range(3)]
+
+
+def inertia_star(inertia: Sequence[Sequence[float]], mass: float
+                 ) -> Optional[List[Tuple[Vec, float]]]:
+    """Six point masses that carry a rotary inertia tensor exactly: pairs at +/- r along its
+    principal axes, of total ``mass`` and centred on the point the tensor refers to, so the
+    first moment is zero and the second moments give the tensor (a pair of mass m_k at
+    distance r adds 2 m_k r^2 about the two other axes).  With principal moments I_k the
+    pair on axis k needs 2 m_k r^2 = (I_j + I_l - I_k) / 2, which a physical inertia never
+    makes negative.  Returns (offset, mass) per point — a zero mass where a pair is not
+    needed — or None when the tensor violates that (or ``mass`` is not positive)."""
+    vals, vecs = sym3_eigen(inertia)
+    top = max(abs(x) for x in vals) if vals else 0.0
+    p = [(vals[1] + vals[2] - vals[0]) / 2.0, (vals[0] + vals[2] - vals[1]) / 2.0,
+         (vals[0] + vals[1] - vals[2]) / 2.0]
+    if mass <= 0.0 or top <= 0.0 or min(p) < -1e-9 * top:
+        return None
+    p = [max(0.0, x) for x in p]
+    r = math.sqrt(sum(p) / mass)
+    return [(vscale(vecs[k], s * r), p[k] / (2.0 * r * r)) for k in range(3) for s in (1.0, -1.0)]
 
 
 def reflect_point(p: Vec, kind: str, data: Sequence[Vec]) -> Optional[Vec]:
@@ -1372,6 +1597,26 @@ ALL_NODES_SET = "ABQ2CCX_ALL_NODES"
 # Element set (and material) of the force-free "knot beams" that make the shell/beam nodes
 # of a rigid coupling ccx knots — see Converter._plan_rigid_couplings.
 KNOT_SET = "ABQ2CCX_KNOT"
+# Abaqus rigid elements; ccx has none.  Each becomes a force-free *skin* that its rigid body
+# carries (see Converter._plan_rigid): a facet (R3D3, R3D4) a thin C3D6 / C3D8 one of whose
+# faces is the facet, a plane segment (R2D2, RB2D2) a C3D8 through the model's thickness, an
+# axisymmetric one (RAX2) a C3D8 over ccx's +/-1 degree sector; an RB3D2 (a rigid link in
+# space) only adds its nodes.
+RIGID_ELEMENTS = {"R3D3", "R3D4", "R2D2", "RB2D2", "RAX2", "RB3D2"}
+# Element set, material and section of those skins and of the analytical surfaces' facets.
+RIGID_SET = "ABQ2CCX_RIGID"
+# Analytical rigid surfaces (*SURFACE, TYPE=...) a *RIGID BODY can carry.
+ANALYTIC_SURFACES = ("SEGMENTS", "CYLINDER", "REVOLUTION")
+# --approximate: a curved analytical-surface segment (CIRCL, PARAB) and the circumference of
+# a surface of revolution become straight facets turning at most this many degrees each
+# (chord sag 1 - cos(a/2) of the radius: 2.4e-4 at 2.5 degrees).
+ANALYTIC_FACET_DEG = 2.5
+# Plane and axisymmetric continuum elements (Abaqus names): their faces S1..S4 are edges.
+PLANAR_SOLID_PREFIXES = ("CPS", "CPE", "CAX", "CGAX", "DC2D", "DCAX", "AC2D", "ACAX", "COH2D",
+                         "COHAX", "GK2D", "GKPS", "GKPE", "GKAX")
+# Element types (Abaqus names) of an axisymmetric model.
+AXISYMMETRIC_PREFIXES = ("CAX", "CGAX", "RAX", "SAX", "MAX", "MGAX", "DCAX", "ACAX", "CCAX",
+                         "SFMAX", "SFMGAX", "COHAX", "GKAX")
 # Why moving *RIGID BODY member BCs to the reference node (as Abaqus does) would hold the
 # body more than the BCs themselves — see Converter._plan_rigid_body_move.
 RB_MOVE_INEXACT = {
@@ -2685,6 +2930,29 @@ class Converter:
         # need ccx's own step ramp
         self._amp_cards: Dict[int, List[object]] = {}
         self._ramp_steps: set = set()
+        # rigid elements and analytical rigid surfaces (see _plan_rigid): each rigid element's
+        # skin per contact side ('P' = SPOS, 'N' = SNEG) -> (skin element, ccx face label);
+        # the *SURFACE lines that replace a rigid entry, by (id(card), record); the meshed
+        # analytical surfaces (name -> (element set, face label)) and the ones left as they
+        # are (name -> why); the skin material (modulus, density, thermal); the planar bodies'
+        # reference nodes and their out-of-plane BCs; the rotary-inertia stars' masses
+        self._skins: Dict[Tuple[int, str], Tuple[int, str]] = {}
+        self._rigid_lines: Dict[Tuple[int, int], List[str]] = {}
+        self._analytic: Dict[str, Tuple[str, str]] = {}
+        self._analytic_skipped: Dict[str, str] = {}
+        self._skin_material: Optional[Tuple[float, float, bool]] = None
+        self._rigid_planar_refs: List[int] = []
+        self._rigid_planar_bc: List[str] = []
+        self._rigid_cards_out = False
+        self._star_masses: List[Tuple[str, float]] = []     # (element set, mass) per *MASS card
+        self._rotary_done: set = set()             # id(*ROTARY INERTIA) carried by a star
+        self._rigid_own_sets: set = set()          # the bodies' node sets the converter made
+        self._node_elem_map: Optional[Dict[int, List[int]]] = None   # node -> elements (lazy)
+        self._tie_to_rigid: set = set()            # (id(*TIE), record) -> slave nodes joined the body
+        self._skin_depth: Dict[int, float] = {}     # plane skin -> its depth (z = -T .. T)
+        self._skin_diag: Dict[int, float] = {}      # skin -> its rigid facet's diagonal (Abaqus)
+        self._rigid_faces: Dict[str, List[Tuple[int, str]]] = {}   # rigid surface -> skin faces
+        self._contact_explicit: Optional[Tuple[float, str]] = None  # see _plan_rigid_contact_increment
 
     # -- properties ---------------------------------------------------------
     @property
@@ -3015,6 +3283,7 @@ class Converter:
                 i += 1
                 continue
             if b.keyword == "STEP":
+                out.extend(self._rigid_model_cards())   # after the deck's materials
                 if self._temp_ic_default and self._step_idx == 0:
                     out.extend(self._default_temperature_ic())
                 out.extend(self._out_tp_cards)          # ccx: *TIME POINTS before any *STEP
@@ -3043,6 +3312,7 @@ class Converter:
                 continue
             out.extend(self.translate_one(b))
             i += 1
+        out.extend(self._rigid_model_cards())          # a deck without *STEP
         return out
 
     # -- dispatch -----------------------------------------------------------
@@ -3076,6 +3346,7 @@ class Converter:
             "FRICTION": self.handle_friction,
             "CONTACT PAIR": self.handle_contact_pair,
             "RIGID BODY": self.handle_rigid_body,
+            "ROTARY INERTIA": self.handle_rotary_inertia,
             "COUPLING": self.handle_coupling_card,
             "KINEMATIC": self.handle_kinematic,
             "SURFACE INTERACTION": self.handle_surface_interaction,
@@ -5419,6 +5690,9 @@ class Converter:
             out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
         if self._slab_bc and (params.get("OP") or "").strip().upper() == "NEW":
             out += ["** [abq2ccx] slab thickness DOF held again (OP=NEW removed it)"] + self._slab_bc
+        if self._rigid_planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
+            out += ["** [abq2ccx] plane rigid bodies held in their plane again (OP=NEW removed "
+                    "it)"] + self._rigid_planar_bc
         if self._conn_bcs and (params.get("OP") or "").strip().upper() == "NEW":
             # bare lines: on a card with FIXED or an amplitude they would take it on too
             out += (["*BOUNDARY"] if any(k != "OP" for k in params) else []) + self._conn_bcs
@@ -6796,6 +7070,13 @@ class Converter:
             if _is_user_load(b, g):
                 side += self._user_load_line(b, g)
                 continue
+            rigid = self._rigid_dload(b, g, label) if self._skins and g[0] else None
+            if rigid is not None:
+                for ln, key, mag in rigid[0]:
+                    body.append(ln)
+                    lines.append((key, ln, mag))
+                side += rigid[1]
+                continue
             m = re.fullmatch(r"(TRVEC|TRSHR)([1-6]?)", label)
             if m:
                 eids = self._load_elements(g[0])
@@ -6932,6 +7213,13 @@ class Converter:
             for token, face in sd[1]:
                 if self._only_carriers(token):
                     continue
+                rigid = self._rigid_pressure(token, face, mag, False, surf) if self._skins else None
+                if rigid is not None:
+                    for ln, key, m2 in rigid[0]:
+                        body.append(ln)
+                        lines.append((key, ln, m2))
+                    side += rigid[1]
+                    continue
                 sign = 1.0
                 family = self._sheet_family(token) if face in ("SPOS", "SNEG") else None
                 if face and re.fullmatch(r"S[1-6]", face):
@@ -6982,6 +7270,71 @@ class Converter:
                 return []                 # nothing to apply and (OP=NEW) nothing left to remove
             return self._commented(b, "Could not convert *DSLOAD automatically; edit manually.", reduces=False)
         return out + side
+
+    # -- distributed loads on rigid elements (their skins, see _plan_rigid) -----------------
+    def _rigid_dload(self, b: Block, g: List[str], label: str):
+        """An element-based *DLOAD line on rigid elements: (ccx lines, commented lines), or None
+        when it names none.  A pressure P acts on the facet's skin face; a mass-proportional
+        load (GRAV, CENTRIF) finds no mass on the skins, as Abaqus/Standard's rigid elements
+        have none; a body force per volume (BX, BY, BZ, BR, ...) is not converted (Abaqus
+        integrates it over the element's thickness, the skins have another)."""
+        eids = self._load_elements(g[0])
+        rid = [e for e in eids if (e, "P") in self._skins or (e, "N") in self._skins]
+        if not rid:
+            return None
+        if label == "P" and len(rid) == len(eids):
+            return self._rigid_pressure(g[0], None, g[2] if len(g) > 2 else "", True, g[0])
+        if label in ("GRAV", "CENTRIF", "CENT") and len(rid) < len(eids):
+            return None                         # the rest of the set carries it; skins: no mass
+        if label in ("GRAV", "CENTRIF", "CENT"):
+            return [], [f"** abq2ccx: {', '.join(x for x in g if x)} -> no load: it acts only on rigid "
+                        f"elements, which carry no mass (Abaqus/Standard)"]
+        return [], self._drop_load_line(b, g, f"a {label} load on rigid elements (here their "
+                                              f"skins) is not converted")
+
+    def _rigid_pressure(self, token: str, face: Optional[str], mag: str, element_based: bool,
+                        name: str):
+        """*DLOAD lines (ccx face pressure Pk on the skins' contact faces) for a pressure on the
+        rigid elements of ``token``: (lines, commented lines), or None when it names none.  Abaqus:
+        an element-based P on a rigid element pushes along its positive normal, a surface P
+        against the surface's normal (into its SPOS / SNEG face); ccx's Pk pushes against face
+        k's outward normal — so a surface P keeps its sign on its side's skin face, an element
+        P is minus a pressure on the SPOS skin's face (plus one on an SNEG-only skin)."""
+        eids = self._load_elements(token)
+        rid = [e for e in eids if (e, "P") in self._skins or (e, "N") in self._skins]
+        if not rid:
+            return None
+        if len(rid) < len(eids):
+            self.report.warn(f"Pressure on '{name}': its element set mixes rigid elements with "
+                             f"others; not converted — split the set.", once=True)
+            return [], [f"** abq2ccx: pressure on {name} not converted (rigid and other elements mixed)"]
+        try:
+            p = pf(mag) if mag != "" else 0.0
+        except ValueError:
+            return [], [f"** abq2ccx: pressure on {name} not converted (magnitude '{mag}')"]
+        side = {"SPOS": "P", "SNEG": "N"}.get((face or "").upper())
+        if not element_based and side is None:
+            self.report.warn(f"*DSLOAD on '{name}': a pressure needs a one-sided surface (SPOS or "
+                             f"SNEG) of the rigid elements; not converted.", once=True)
+            return [], [f"** abq2ccx: pressure on {name} not converted (no SPOS / SNEG side)"]
+        out = []
+        for e in rid:
+            if element_based:
+                s_ = "P" if (e, "P") in self._skins else "N"
+                q = -p if s_ == "P" else p
+            else:
+                if (e, side) not in self._skins:
+                    continue
+                s_, q = side, p
+            sk, f = self._skins[(e, s_)]
+            q /= self._skin_depth.get(sk, 1.0)
+            line = f"{sk}, P{f[1:]}, {short_real(q, 12)}"
+            out.append((line, (str(sk), f"P{f[1:]}"), short_real(q, 12)))
+        self.report.note("Pressure on rigid elements -> ccx face pressure on their skins' contact "
+                         "faces (an element-based P pushes along the element normal, a surface P "
+                         "into the surface, as in Abaqus; on R2D2 / RB2D2, which have no section "
+                         "thickness, per unit depth: divided by the plane skins' depth).", once=True)
+        return out, []
 
     # -- distributed loads as nodal forces, and *DLOAD bookkeeping -------------------
     def _load_elements(self, token: str) -> List[int]:
@@ -9560,7 +9913,52 @@ class Converter:
                 keep[k] = v
         return [emit_keyword("HEAT TRANSFER", keep)] + list(b.data)
 
+    def _pair_lines(self, b: Block, what: str) -> Tuple[Optional[Block], List[str], bool]:
+        """A *TIE / *CONTACT PAIR card without the lines the rigid-tie planner took (their
+        slave nodes joined a rigid body) and without those that name an analytical rigid
+        surface that was not meshed, which come back commented out: (the card — None when
+        the whole card is commented —, comment lines, whether no line is left)."""
+        drop = {k for (i, k) in self._tie_to_rigid if i == id(b)}
+        keep, gone_lines, gone = [], [], None
+        for k, ln in enumerate(b.data):
+            if k in drop:
+                continue
+            hit = next((t.strip().upper() for t in ln.split(",")[:2]
+                        if t.strip().upper() in self._analytic_skipped), None)
+            if hit:
+                gone = gone or hit
+                gone_lines.append(ln)
+            else:
+                keep.append(ln)
+        comments: List[str] = []
+        if gone:
+            msg = (f"{what} on analytical rigid surface {gone}, which is not converted "
+                   f"({self._analytic_skipped[gone]}).")
+            if not drop and not any(x.strip() for x in keep):
+                return None, self._commented(b, msg), True
+            self.report.n_commented += 1
+            self.report.warn(msg + " Its lines are commented out; the card's other lines are kept.",
+                             once=True)
+            comments = ["** abq2ccx: " + msg] + ["** " + ln for ln in gone_lines]
+        empty = not any(x.strip() for x in keep)
+        return Block(b.keyword, b.params, keep, b.part, b.instance), comments, empty
+
     def handle_tie(self, b: Block) -> List[str]:
+        drop = any(i == id(b) for (i, _) in self._tie_to_rigid)
+        nb, comments, empty = self._pair_lines(b, "*TIE")
+        if nb is None:
+            return comments
+        if drop:
+            self.report.note("*TIE to a rigid surface: the slave nodes Abaqus ties (TIED NSET, or "
+                             "within its default or given position tolerance; adjusted to touch the "
+                             "surface unless ADJUST=NO) join that rigid body instead — ccx's tie of "
+                             "them follows the body's NLGEOM rotation only linearly (1.3 % off at "
+                             "0.05 rad, probed on 2.23) and stops explicit dynamics; a tied node "
+                             "moves rigidly with the body, as in Abaqus.", once=True)
+        if empty:
+            return ["** [abq2ccx] *TIE " + (b.param("NAME") or "") + ": its slave nodes are "
+                    "members of the rigid body of its master surface"] + comments
+        b = nb
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("NAME", "POSITION TOLERANCE", "ADJUST", "CYCLIC SYMMETRY", "MULTISTAGE"):
@@ -9578,7 +9976,7 @@ class Converter:
                 self.report.note(f"*TIE parameter {k} dropped (unsupported by ccx).", once=True)
         self.report.note("*TIE: in ccx the MASTER (independent, 2nd) surface must be element-based; "
                          "a node-based master will be rejected — verify surface roles.", once=True)
-        return [emit_keyword("TIE", keep)] + list(b.data)
+        return [emit_keyword("TIE", keep)] + list(b.data) + comments
 
     def handle_restart(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -9767,7 +10165,19 @@ class Converter:
         Abaqus spellings.  Map them, keep ``REF NODE``/``ROT NODE``/``ELSET``.  ccx moves
         only the members' translations, so the rotations of knotted TIE/ELSET shell/beam
         members are tied to the ROT NODE (PIN members keep theirs, as in Abaqus), and a
-        shell/beam reference node drives the ROT NODE (see _plan_rigid_couplings)."""
+        shell/beam reference node drives the ROT NODE (see _plan_rigid_couplings).  Rigid
+        elements and analytical surfaces reach here as a TIE NSET of their skins' nodes
+        (_plan_rigid); one whose analytical surface could not be meshed is commented out."""
+        surf = (b.param("ANALYTICAL SURFACE") or "").strip().upper()
+        if surf:
+            why = self._analytic_skipped.get(surf, "it was not converted")
+            return self._commented(b, f"*RIGID BODY with ANALYTICAL SURFACE={surf}: the surface "
+                                      f"is not converted ({why}).")
+        if b.data and any(x.strip() for x in b.data):
+            self.report.note("*RIGID BODY data line dropped (ccx's *RIGID BODY has none; Abaqus "
+                             "reads it only in Abaqus/Explicit, as the rigid elements' thickness / "
+                             "area, which the skins' contact faces carry).", once=True)
+            b = Block(b.keyword, b.params, [], b.part, b.instance)
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         pre: List[str] = []
         node_sets = [v for k, v in b.params.items()
@@ -9836,6 +10246,19 @@ class Converter:
                 ties += self._rot_node_follows(rot, ref)
             ties += self._rotation_ties([n for n in tie if n != ref], rot, -3)
         return pre + [emit_keyword("RIGID BODY", keep)] + list(b.data) + ties
+
+    def handle_rotary_inertia(self, b: Block) -> List[str]:
+        """``*ROTARY INERTIA``: ccx 2.23 has no ROTARYI element.  On a rigid body the converter
+        carries it as point masses (_plan_rotary_stars), and the card is consumed."""
+        if id(b) in self._rotary_done:
+            self.report.note("*ROTARY INERTIA on a rigid body carried by point masses of the body "
+                             "(see the note on its reference node); the card itself is not "
+                             "written.", once=True)
+            return []
+        return self._commented(b, "*ROTARY INERTIA: ccx has no rotary-inertia element (ROTARYI); "
+                                  "only the rotary inertia of a rigid body with a *MASS is "
+                                  "converted (as point masses) — add it as point masses on the "
+                                  "structure.")
 
     def handle_equation(self, b: Block) -> List[str]:
         """``*EQUATION``: node sets resolved (_equation_lines), then the terms on DOFs 4-6 of
@@ -10343,7 +10766,24 @@ class Converter:
         and does not understand Abaqus-only parameters such as ``SUPPLEMENTARY
         CONSTRAINTS``/``GEOMETRIC CORRECTION``.  ``TIED`` (surfaces bonded for the whole
         analysis) becomes a ccx ``*TIE`` per surface pair — dropping it would let the
-        bodies separate (verified: RF 0 instead of the tied value)."""
+        bodies separate (verified: RF 0 instead of the tied value) — except on a rigid
+        master, whose tied slave nodes join its rigid body (_plan_rigid_ties)."""
+        drop = any(i == id(b) for (i, _) in self._tie_to_rigid)
+        nb, comments, empty = self._pair_lines(b, "*CONTACT PAIR")
+        if nb is None:
+            return comments
+        if drop:
+            self.report.note("*CONTACT PAIR, TIED to a rigid surface: the slave nodes ccx's tie "
+                             "would connect (within ADJUST, or ccx's default tolerance) join that "
+                             "rigid body instead, adjusted onto the surface — ccx's tie of them "
+                             "follows the body's NLGEOM rotation only linearly (1.3 % off at 0.05 "
+                             "rad, probed on 2.23) and stops explicit dynamics.", once=True)
+        if empty:
+            return ["** [abq2ccx] *CONTACT PAIR " + (b.param("INTERACTION") or "") + ": its slave "
+                    "nodes are members of the rigid body of its master surface"] + comments
+        return self._contact_pair_lines(nb) + comments
+
+    def _contact_pair_lines(self, b: Block) -> List[str]:
         if b.has("TIED"):
             out: List[str] = []
             adj = (b.param("ADJUST") or "").strip()
@@ -10393,6 +10833,13 @@ class Converter:
         if (b.param("TYPE") or "").upper().startswith("ANALYTICAL"):
             return self._commented(b, "*SURFACE TYPE=ANALYTICAL RIGID is unsupported by ccx; mesh the "
                                       "rigid surface with elements instead.", reduces=False)
+        name = (b.param("NAME") or "").strip().upper()
+        if (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES:
+            if name in self._analytic:
+                elset, face = self._analytic[name]
+                return [f"*SURFACE, NAME={b.param('NAME')}, TYPE=ELEMENT", f"{elset}, {face}"]
+            return self._commented(b, f"Analytical rigid surface {name} not converted "
+                                      f"({self._analytic_skipped.get(name, 'see the warnings')}).")
         is_node = (b.param("TYPE") or "").upper() == "NODE"
         if b.has("COMBINE"):
             return self._commented(b, "*SURFACE, COMBINE (a surface built from other surfaces) has "
@@ -10406,9 +10853,14 @@ class Converter:
                                  f"and TYPE).", once=True)
         out = [emit_keyword("SURFACE", params)]
         on_carriers = 0
-        for rec in merged_data_records(b):
+        for k, rec in enumerate(merged_data_records(b)):
             f = [x for x in rec if x != ""]
             if not f:
+                continue
+            if (id(b), k) in self._rigid_lines:       # faces of rigid elements -> their skins
+                out.extend(self._rigid_lines[(id(b), k)])
+                self.report.note("*SURFACE faces of rigid elements (SPOS / SNEG; no label: both) -> "
+                                 "the matching faces of their skins.", once=True)
                 continue
             eids = self._load_elements(f[0]) if self._carriers and not is_node else []
             carried = sum(1 for e in eids if e in self._carriers)
@@ -10491,11 +10943,13 @@ class Converter:
         self.build_geometry(blocks)
         self._drop_surface_elements(raw, blocks)
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
+        self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._upgrade_section_beams(blocks)
         self._check_nonpositive_ids()
         self._prescan(blocks)
         self._plan_load_cases(blocks)
+        self._plan_rigid_planar_holds()             # after _prescan: the bodies' ROT NODEs
         self._warn_coupled_clashes()                # BCs on coupled DOFs left (_prescan)
         self._plan_distributions(blocks)
         self._check_undefined_materials(blocks)
@@ -10504,6 +10958,7 @@ class Converter:
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
+        self._plan_rigid_contact_increment(blocks)
         self._complete_temperature_ic()         # after every planner that adds knot nodes
         self._plan_output(blocks)               # last: it reads the final mesh (knot beams too)
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
@@ -10530,6 +10985,9 @@ class Converter:
         if self._planar_bc:
             out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "
                     "runs them as 3-D elements)"] + self._planar_bc
+        if self._rigid_planar_bc:
+            out += ["** [abq2ccx] keep the rigid bodies of plane rigid elements / surfaces in their "
+                    "plane (3-D bodies in ccx)"] + self._rigid_planar_bc
         out.extend(self.emit_other(blocks))
         out = self._settle_dependents(out)
         self._audit_loads(blocks, out)
@@ -10602,6 +11060,1271 @@ class Converter:
                              f"(probed on 2.23), so their share of the converted loads acts only "
                              f"where a constraint (*EQUATION, *MPC, *RIGID BODY, *COUPLING) ties "
                              f"them to the structure. Verify.")
+
+    # -- rigid elements and analytical rigid surfaces ----------------------------
+    def _plan_rigid(self, blocks: List[Block]) -> None:
+        """Abaqus rigid elements (RIGID_ELEMENTS) and analytical rigid surfaces (*SURFACE,
+        TYPE=SEGMENTS / CYLINDER / REVOLUTION under *RIGID BODY, ANALYTICAL SURFACE=) as
+        constructs ccx 2.23 runs.  ccx has neither, and its RIGID MPCs refuse shell/beam
+        nodes but take solid ones (_plan_rigid_couplings), so every facet becomes a *skin*:
+        a force-free solid element that the rigid body carries, one face of which is the
+        facet with its SPOS / SNEG normal pointing out (the side a contact surface uses):
+
+        * R3D3 / R3D4 -> C3D6 / C3D8 behind the facet (its own nodes plus copies offset a
+          tenth of the facet's size), facet face S2 (SNEG: the copies in front, face S1);
+        * R2D2 / RB2D2 (plane strain / stress) -> a C3D8 through the model's thickness
+          (twice the largest plane section thickness), face S5 (SNEG S3): a 3-D rigid body,
+          held out of its plane (reference node DOF 3 and ROT NODE DOFs 1-2, see
+          _plan_rigid_planar_holds), is exact where ccx's 2-D one is not — under NLGEOM a
+          rotating 2-D body is off by ~1e-5 at 0.001 rad (node-to-surface contact) as its
+          expansion follows the rotation linearly, and it reports a zero reaction force
+          with face-to-face contact (probed on 2.23);
+        * RAX2 -> a C3D8 over ccx's +/-1 degree axisymmetric sector (skin_lift), face S5
+          (SNEG S3), under a 3-D body held the same way;
+        * RB3D2 (a rigid link in space, no surface) -> its nodes only.
+
+        A side a *SURFACE names gets a skin (no face label: both sides, Abaqus' double-sided
+        surface); an element no surface names gets the SPOS one, which keeps its id.  The
+        skin's material comes last in the deck — ccx's default HARD contact stiffness is 50
+        times the first material's first elastic constant — and its modulus, thickness and
+        density do not matter: the skin moves rigidly, so it is strain free (probed:
+        modulus 1e-3 to 1e9 and thickness 1e-3 to 1 identical to all printed digits, linear
+        and NLGEOM, and identical to prescribing the same motion on every skin node).  Its
+        density is 0, so the body's mass is what the deck gives it (*MASS, *ROTARY INERTIA,
+        see _plan_rotary_stars); in an explicit deck ccx's stable-increment estimate needs a
+        density, so the skin gets 1e-9 of the deck's largest one with a modulus that keeps
+        its wave speed 1e-3 of the deck's (never the critical element).  In Abaqus/Explicit a
+        thickness on the *RIGID BODY data line offsets the contact surfaces by half of it
+        (OFFSET shifts them): the skins' contact faces are moved there.
+
+        Analytical surfaces are meshed the same way.  A profile of straight lines is exact
+        (SEGMENTS in a plane or axisymmetric model, CYLINDER swept over the model's extent
+        along its generator, which Abaqus takes as infinite); circular / parabolic arcs, a
+        surface of revolution and a FILLET RADIUS make flat facets an approximation, done
+        only under --approximate ([APPROX], ANALYTIC_FACET_DEG per facet).  The *RIGID BODY
+        cards of all of these become TIE NSET bodies of every node involved."""
+        rigid = OrderedDict((e, (t.upper(), list(c))) for e, (t, c) in self.geom.elements.items()
+                            if t.upper() in RIGID_ELEMENTS)
+        analytic = [b for b in blocks if b.keyword == "SURFACE" and
+                    (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES]
+        if not rigid and not analytic:
+            self._plan_rotary_stars(blocks)        # rigid bodies of the deck's own elements
+            self._plan_skin_material(blocks)
+            return
+        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        axisym = any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values())
+        bodies = [b for b in blocks if b.keyword == "RIGID BODY"]
+        deck_nodes = list(self.geom.nodes.values())
+        body_of: Dict[int, Block] = {}
+        for b in bodies:
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                if e in rigid:
+                    body_of.setdefault(e, b)
+        # Abaqus/Explicit: the thickness on the data line and OFFSET move the contact
+        # surfaces of R3D3 / R3D4 / RAX2 elements; DENSITY gives them mass
+        shift: Dict[int, Tuple[float, float]] = {}
+        heavy: set = set()                       # id(*RIGID BODY) whose elements have mass
+        for b in bodies:
+            members = [e for e in self.geom.elset((b.param("ELSET") or "").strip()) if e in rigid]
+            if not members:
+                continue
+            if not explicit:
+                if b.data and any(x.strip() for x in b.data):
+                    self.report.note("*RIGID BODY data line (rigid-element thickness / area) "
+                                     "dropped: Abaqus/Standard ignores it (it is Abaqus/Explicit "
+                                     "data).", once=True)
+                continue
+            try:
+                thick = pf([x for r in merged_data_records(b) for x in r if x != ""][0]) \
+                    if b.data else 0.0
+            except (IndexError, ValueError):
+                thick = 0.0
+            off_s = (b.param("OFFSET") or "0").strip().upper()
+            try:
+                off = {"SPOS": 0.5, "SNEG": -0.5}.get(off_s, None)
+                off = pf(off_s) if off is None else off
+            except ValueError:
+                off = 0.0
+            if b.has("NODAL THICKNESS"):
+                self.report.warn("*RIGID BODY, NODAL THICKNESS: the rigid elements' contact "
+                                 "surfaces are offset by the data-line thickness only (the "
+                                 "nodal thicknesses are not read) — verify.", once=True)
+            try:
+                dens = pf(b.param("DENSITY") or "0")
+            except ValueError:
+                dens = 1.0
+            if dens and thick:
+                heavy.add(id(b))
+            if thick:
+                for e in members:
+                    if rigid[e][0] in ("R3D3", "R3D4", "RAX2"):
+                        shift[e] = ((0.5 - off) * thick, -(0.5 + off) * thick)
+        if heavy and not self._approx:
+            self.report.warn("*RIGID BODY, DENSITY= with a thickness: Abaqus/Explicit gives those "
+                             "rigid elements mass, which the conversion does not carry (it would "
+                             "be the elements' distributed mass and rotary inertia); they are left "
+                             "as they are, so ccx stops with '*ERROR reading *ELEMENT' — rerun with "
+                             "--approximate to convert them without that mass, or give the body "
+                             "its mass as *MASS / *ROTARY INERTIA elements.")
+            skip = {e for e, b in body_of.items() if id(b) in heavy}
+            for e in skip:
+                del rigid[e]
+        elif heavy:
+            self.report.warn("[APPROX] *RIGID BODY, DENSITY= with a thickness: the rigid elements' "
+                             "own mass (Abaqus/Explicit) is not carried — only the body's *MASS / "
+                             "*ROTARY INERTIA elements are. Verify the body's inertia.")
+        # the sides the deck's surfaces use, and the surface records that name rigid elements
+        need: Dict[int, set] = {e: set() for e in rigid}
+        entries: List[Tuple[Block, int, List[int], List[int], str]] = []
+        for b in blocks:
+            if b.keyword != "SURFACE" or (b.param("TYPE") or "ELEMENT").strip().upper() != "ELEMENT":
+                continue
+            for k, rec in enumerate(merged_data_records(b)):
+                f = [x for x in rec if x != ""]
+                if not f:
+                    continue
+                eids = [int(f[0])] if re.fullmatch(r"[-+]?\d+", f[0]) else dedup(self.geom.elset(f[0]))
+                rid = [e for e in eids if e in rigid]
+                if not rid:
+                    continue
+                face = f[1].upper() if len(f) > 1 else ""
+                sides = {"SPOS": "P", "SNEG": "N", "": "PN"}.get(face)
+                if sides is None:
+                    self.report.warn(f"*SURFACE {b.param('NAME') or ''}: face '{face}' of rigid "
+                                     f"elements (an edge) has no ccx counterpart; those faces are "
+                                     f"left out of the surface.", once=True)
+                    sides = ""
+                if any(rigid[e][0] == "RB3D2" for e in rid):
+                    self.report.warn("A *SURFACE names RB3D2 rigid links, which have no face in "
+                                     "ccx (Abaqus gives them no unique normal either); left out "
+                                     "of the surface.", once=True)
+                for e in rid:
+                    if rigid[e][0] != "RB3D2":
+                        need[e].update(sides)
+                entries.append((b, k, rid, [e for e in eids if e not in rigid], sides))
+        refs = {self._first_node(b.param("REF NODE") or "") for b in bodies} - {None}
+        self._plan_skin_elements(blocks, rigid, need, shift, refs)
+        for b, k, rid, rest, sides in entries:
+            lines: List[str] = []
+            for side in sides:
+                by_face: "OrderedDict[str, List[int]]" = OrderedDict()
+                for e in rid:
+                    if (e, side) in self._skins:
+                        sk, face = self._skins[(e, side)]
+                        by_face.setdefault(face, []).append(sk)
+                for face, sks in by_face.items():
+                    name = self._rigid_set_name("ABQ2CCX_RS")
+                    self.geom.elsets[name] = sks
+                    lines.append(f"{name}, {face}")
+            if rest:
+                f = [x for x in merged_data_records(b)[k] if x != ""]
+                name = self._rigid_set_name("ABQ2CCX_RS")
+                self.geom.elsets[name] = rest
+                lines.append(", ".join([name] + f[1:]))
+            self._rigid_lines[(id(b), k)] = lines
+        # the skin faces of the surfaces made of rigid elements only, and each skin's body
+        faces_of: Dict[str, List[Tuple[int, str]]] = {}
+        skin_body: Dict[int, Block] = {}
+        for (e, side), (sk, _) in self._skins.items():
+            if e in body_of:
+                skin_body[sk] = body_of[e]
+        per_card: Dict[int, List[tuple]] = {}
+        for item in entries:
+            per_card.setdefault(id(item[0]), []).append(item)
+        for b in blocks:
+            if b.keyword != "SURFACE" or id(b) not in per_card:
+                continue
+            recs = [r for r in merged_data_records(b) if any(x for x in r)]
+            items = per_card[id(b)]
+            if len(items) != len(recs) or any(rest or not sides for _, _, _, rest, sides in items):
+                continue
+            faces_of[(b.param("NAME") or "").strip().upper()] = [
+                self._skins[(e, side)] for _, _, rid, _, sides in items for side in sides
+                for e in rid if (e, side) in self._skins]
+        members_of: Dict[int, List[int]] = {}   # id(*RIGID BODY) -> nodes its skins / surface add
+        for b in analytic:
+            self._mesh_analytic(b, blocks, axisym, members_of, deck_nodes)
+        for name, (elset, face) in self._analytic.items():
+            body = next((r for r in bodies if (r.param("ANALYTICAL SURFACE") or "").strip().upper()
+                         == name), None)
+            if body is not None:
+                faces_of[name] = [(e, face) for e in self.geom.elsets.get(elset, [])]
+                for e in self.geom.elsets.get(elset, []):
+                    skin_body[e] = body
+        pins_of: Dict[int, List[int]] = {}
+        self._plan_rigid_ties(blocks, faces_of, skin_body, members_of, pins_of)
+        self._rigid_faces = dict(faces_of)
+        self._rewrite_rigid_bodies(bodies, rigid, members_of, pins_of)
+        links = {e for e, (t, _) in rigid.items() if t == "RB3D2"}
+        for name, ids in self.geom.elsets.items():
+            if any(i in links for i in ids):          # RB3D2: no element in ccx
+                self.geom.elsets[name] = [i for i in ids if i not in links]
+        orphans = [e for e in rigid if e not in body_of]
+        if orphans:
+            self.report.warn(f"{len(orphans)} rigid element(s) belong to no *RIGID BODY (Abaqus "
+                             f"requires one): converted to skins without a rigid constraint, "
+                             f"which ccx would treat as soft solids in an analysis.")
+        self._plan_rotary_stars(blocks)
+        self._plan_skin_material(blocks)
+
+    def _plan_skin_material(self, blocks: List[Block]) -> None:
+        """The skins' (and rotary-inertia tetrahedra's) material, if any were made: the deck's
+        largest modulus and no density; in a deck with an explicit step a density 1e-9 of its
+        largest one and a modulus that keeps the wave speed 1e-3 of the deck's (see _plan_rigid)."""
+        if not self.geom.elsets.get(RIGID_SET):
+            return
+        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        moduli = []
+        dens = []
+        for b in blocks:
+            if b.keyword in ("ELASTIC", "DENSITY"):
+                try:
+                    v = pf([x for r in merged_data_records(b) for x in r if x != ""][0])
+                except (IndexError, ValueError):
+                    continue
+                if v > 0:
+                    (moduli if b.keyword == "ELASTIC" else dens).append(v)
+        e_ref, rho_ref = max(moduli or [1.0]), max(dens or [1.0])
+        thermal = any(b.keyword in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                                    "UNCOUPLED TEMPERATURE-DISPLACEMENT") for b in blocks)
+        if explicit:
+            rho = 1e-9 * rho_ref
+            self._skin_material = (rho * (1e-3 * math.sqrt(e_ref / rho_ref)) ** 2, rho, thermal)
+        else:
+            self._skin_material = (e_ref, 0.0, thermal)
+        if thermal:
+            self.report.warn("Rigid elements / analytical surfaces in a deck with a thermal step: "
+                             "their ccx skins conduct no heat and store none (Abaqus' rigid "
+                             "elements carry temperatures only in some cases) — verify.", once=True)
+
+    def _rigid_set_name(self, base: str) -> str:
+        i = 1
+        while f"{base}{i}" in self.geom.elsets or f"{base}{i}" in self.geom.nsets or \
+                f"{base}{i}" in self.surfaces:
+            i += 1
+        return f"{base}{i}"
+
+    def _next_ids(self) -> Tuple[int, int]:
+        return (max(self.geom.nodes, default=0),
+                max(list(self.geom.elements) + list(self._carriers) + list(self._conn), default=0))
+
+    def _plane_thickness(self, blocks: List[Block]) -> float:
+        """The largest section thickness of the plane-stress / plane-strain elements (1 where
+        a section leaves it out, the Abaqus default)."""
+        thick = 0.0
+        for b in blocks:
+            if b.keyword != "SOLID SECTION":
+                continue
+            types = {self.geom.elements[e][0].upper() for e in self.geom.elset((b.param("ELSET") or "").strip())
+                     if e in self.geom.elements}
+            if not any(t.startswith(("CPS", "CPE")) for t in types):
+                continue
+            try:
+                t = pf([x for x in merged_data_records(b)[0] if x != ""][0]) if b.data else 1.0
+            except (IndexError, ValueError):
+                t = 1.0
+            thick = max(thick, t if t > 0 else 1.0)
+        return thick or 1.0
+
+    def _skin_brick(self, facet: Sequence[Vec], normal: Vec, side: str, t: float,
+                    nodes: Sequence[int], nid: int) -> Tuple[List[int], int]:
+        """Connectivity of a 3-D skin (C3D6 / C3D8) on a facet of existing nodes ``nodes`` at
+        ``facet``: new nodes offset ``t`` behind the facet (away from its contact side
+        ``side``), listed first for SPOS so that the facet is face S2, last for SNEG (face
+        S1) — both with a positive volume (the bottom face's normal points to the top)."""
+        d = vscale(normal, -t if side == "P" else t)
+        back = []
+        for p in facet:
+            nid += 1
+            self.geom.add_node(nid, vadd(p, d))
+            back.append(nid)
+        return (back + list(nodes) if side == "P" else list(nodes) + back), nid
+
+    def _plan_skin_elements(self, blocks: List[Block], rigid: "OrderedDict[int, Tuple[str, List[int]]]",
+                            need: Dict[int, set], shift: Dict[int, Tuple[float, float]],
+                            refs: Optional[set] = None) -> None:
+        """Turn every rigid element into its skin(s) (see _plan_rigid); fills self._skins.  A
+        facet node that is a rigid body's reference node gets a copy in the skin: ccx's
+        reaction at a reference node misses the body's share when an element of the body
+        is attached to it (probed: 1.9 instead of 10.2)."""
+        if not rigid:
+            return
+        refs = refs or set()
+        nid, eid = self._next_ids()
+        nodes = self.geom.nodes
+        at_node: Dict[int, List[int]] = {}
+        if shift:                               # for _avg_normal
+            for e, (_, conn) in rigid.items():
+                for n in conn:
+                    at_node.setdefault(n, []).append(e)
+        half = self._plane_thickness(blocks)        # the planar skins span z = -T .. T
+        copies: Dict[Tuple[int, int, str], int] = {}   # (node, z level / side, kind) -> copy
+        skins: List[int] = []
+        links = 0
+        degenerate: List[int] = []
+        kinds: "OrderedDict[str, int]" = OrderedDict()
+        for e, (typ, conn) in rigid.items():
+            if typ == "RB3D2" or not all(n in nodes for n in conn):
+                if typ == "RB3D2":
+                    del self.geom.elements[e]
+                    links += 1
+                continue
+            sides = [s for s in "PN" if s in need.get(e, set())] or ["P"]
+            pts = [nodes[n] for n in conn]
+            for i, side in enumerate(sides):
+                sid = e
+                if i:
+                    eid += 1
+                    sid = eid
+                if typ in ("R3D3", "R3D4"):
+                    if typ == "R3D3":
+                        nrm = vcross(vsub(pts[1], pts[0]), vsub(pts[2], pts[0]))
+                    else:
+                        nrm = vcross(vsub(pts[2], pts[0]), vsub(pts[3], pts[1]))
+                    area = vnorm(nrm) / 2.0
+                    if area <= 0.0:
+                        degenerate.append(e)
+                        break
+                    nrm = vunit(nrm)
+                    face_nodes, face_pts = list(conn), pts
+                    s = shift.get(e, (0.0, 0.0))[0 if side == "P" else 1]
+                    if s:
+                        face_nodes, face_pts = [], []
+                        for n, p in zip(conn, pts):
+                            key = (n, 0, f"shift{side}{s!r}")
+                            if key not in copies:
+                                nid += 1
+                                self.geom.add_node(nid, vadd(p, vscale(self._avg_normal(n, rigid, at_node), s)))
+                                copies[key] = nid
+                            face_nodes.append(copies[key])
+                            face_pts.append(nodes[copies[key]])
+                    elif refs.intersection(conn):
+                        face_nodes = []
+                        for n in conn:
+                            if n in refs:
+                                key = (n, 0, "ref")
+                                if key not in copies:
+                                    nid += 1
+                                    self.geom.add_node(nid, nodes[n])
+                                    copies[key] = nid
+                                n = copies[key]
+                            face_nodes.append(n)
+                    conn2, nid = self._skin_brick(face_pts, nrm, side, 0.1 * math.sqrt(area), face_nodes, nid)
+                    self.geom.elements[sid] = ("C3D6" if typ == "R3D3" else "C3D8", conn2)
+                    self._skins[(e, side)] = (sid, "S2" if side == "P" else "S1")
+                    self._skin_diag[sid] = (max(vnorm(vsub(pts[(i + 1) % 3], pts[i])) for i in range(3))
+                                            if typ == "R3D3" else 0.5 * (vnorm(vsub(pts[2], pts[0]))
+                                                                         + vnorm(vsub(pts[3], pts[1]))))
+                    kind = f"{typ} -> {'C3D6' if typ == 'R3D3' else 'C3D8'}"
+                else:
+                    a, b = pts[0], pts[1]
+                    ln = math.hypot(b[0] - a[0], b[1] - a[1])
+                    if ln <= 0.0:
+                        degenerate.append(e)
+                        break
+                    nrm = (-(b[1] - a[1]) / ln, (b[0] - a[0]) / ln, 0.0)
+                    t = 0.1 * ln
+                    ax = typ == "RAX2"
+                    sh = shift.get(e, (0.0, 0.0))[0 if side == "P" else 1] if ax else 0.0
+                    face2 = [vadd(p, vscale(self._avg_normal(n, rigid, at_node), sh)) if sh else p
+                             for n, p in zip(conn, pts)]
+                    d = -t if side == "P" else t
+                    if ax and nrm[0] * d < 0 and min(face2[0][0], face2[1][0]) > 0:
+                        # keep the offset nodes on this side of the axis
+                        d = math.copysign(min(abs(d), 0.5 * min(face2[0][0], face2[1][0]) / abs(nrm[0])), d)
+                    back2 = [(max(0.0, q[0] + nrm[0] * d) if ax else q[0] + nrm[0] * d, q[1] + nrm[1] * d)
+                             for q in face2]
+                    lay = []
+                    for lev in (0, 1):
+                        row = []
+                        for n, q in zip(conn, face2):
+                            key = (n, lev, f"{'ax' if ax else 'pl'}{side if sh else ''}")
+                            if key not in copies:
+                                nid += 1
+                                self.geom.add_node(nid, skin_lift(q, lev, half, ax))
+                                copies[key] = nid
+                            row.append(copies[key])
+                        back = []
+                        for q in back2:
+                            nid += 1
+                            self.geom.add_node(nid, skin_lift(q, lev, half, ax))
+                            back.append(nid)
+                        # CCW in the plane: SPOS a', b', b, a (the facet is nodes 3-4: face S5),
+                        # SNEG a, b, b', a' (nodes 1-2: face S3)
+                        lay.append([back[0], back[1], row[1], row[0]] if side == "P" else
+                                   [row[0], row[1], back[1], back[0]])
+                    self.geom.elements[sid] = ("C3D8", lay[0] + lay[1])
+                    self._skins[(e, side)] = (sid, "S5" if side == "P" else "S3")
+                    self._skin_diag[sid] = ln
+                    if not ax:
+                        self._skin_depth[sid] = 2.0 * half
+                    kind = f"{typ} -> C3D8"
+                skins.append(sid)
+                kinds[kind] = kinds.get(kind, 0) + 1
+        for e in degenerate:                    # no face: its nodes only, as an RB3D2's
+            self.geom.elements.pop(e, None)
+            rigid[e] = ("RB3D2", rigid[e][1])
+        if degenerate:
+            self.report.warn(f"{len(degenerate)} rigid element(s) without area (coincident nodes, "
+                             f"e.g. {degenerate[0]}): no skin; their nodes still join the rigid body, "
+                             f"and a surface on them is left out.", once=True)
+        self.geom.add_to_elset(RIGID_SET, skins)
+        if kinds:
+            self.report.note(f"Rigid elements -> force-free skin elements of their rigid body "
+                             f"({', '.join(f'{k}: {v}' for k, v in kinds.items())}; element set "
+                             f"{RIGID_SET}): ccx has no rigid element, and the skin's face on the "
+                             f"facet carries its contact side. The skin moves rigidly, so its "
+                             f"material, thickness and density do not change the result (probed "
+                             f"on 2.23); its density is 0 outside explicit dynamics, so the body's "
+                             f"mass is what the deck gives it.", once=True)
+        if any(t in ("R2D2", "RB2D2", "RAX2") for t, _ in rigid.values()):
+            self.report.note(f"Plane / axisymmetric rigid elements (R2D2, RB2D2, RAX2) -> C3D8 "
+                             f"skins across ccx's expansion of the 2-D model (plane: z = "
+                             f"+/-{fmt_num(half)}, twice the thickest section; axisymmetric: the "
+                             f"+/-1 degree sector ccx expands to) under a 3-D rigid body held out "
+                             f"of the plane: exact under NLGEOM rotation, where ccx 2.23's 2-D rigid "
+                             f"body follows its expansion only linearly, and with a correct "
+                             f"reference-point reaction in face-to-face contact, where the 2-D body "
+                             f"reports none (probed).", once=True)
+        if links:
+            self.report.note(f"{links} RB3D2 rigid link(s): their nodes join the rigid body (no "
+                             f"element in ccx).", once=True)
+
+    def _avg_normal(self, n: int, rigid, at_node: Dict[int, List[int]]) -> Vec:
+        """Mean unit normal at node ``n`` of the rigid facets / segments that use it (SPOS
+        direction; an offset of either side moves along it); ``at_node``: node -> rigid
+        elements."""
+        acc = (0.0, 0.0, 0.0)
+        for e in at_node.get(n, []):
+            typ, conn = rigid[e]
+            p = [self.geom.nodes[m] for m in conn if m in self.geom.nodes]
+            if typ == "R3D3" and len(p) == 3:
+                acc = vadd(acc, vunit(vcross(vsub(p[1], p[0]), vsub(p[2], p[0]))))
+            elif typ == "R3D4" and len(p) == 4:
+                acc = vadd(acc, vunit(vcross(vsub(p[2], p[0]), vsub(p[3], p[1]))))
+            elif len(p) == 2:
+                acc = vadd(acc, vunit((-(p[1][1] - p[0][1]), p[1][0] - p[0][0], 0.0)))
+        return vunit(acc)
+
+    def _analytic_size(self, name: str, blocks: List[Block]) -> Optional[float]:
+        """The facet size an analytical surface is meshed to: the slave side's face size (10th
+        percentile of the edge lengths of the surfaces its contact pairs / ties pair it
+        with; else of the deck's non-rigid elements).  ccx's face-to-face search misses a
+        master face several slave faces long (probed: an axisymmetric punch face five slave
+        faces wide made no contact element), and a facet no larger than the slave faces
+        keeps the faceting finer than the deformable mesh resolves."""
+        others: List[str] = []
+        for b in blocks:
+            if b.keyword not in ("CONTACT PAIR", "TIE"):
+                continue
+            for rec in merged_data_records(b):
+                toks = [x.strip().upper() for x in rec[:2]]
+                if name in toks and len(toks) == 2:
+                    others.append(toks[1 - toks.index(name)])
+        lengths: List[float] = []
+
+        def edges(conn: Sequence[int]) -> None:
+            pts = [self.geom.nodes[n] for n in conn if n in self.geom.nodes]
+            for i, q in enumerate(pts):
+                d = vnorm(vsub(pts[(i + 1) % len(pts)], q))
+                if d > 0:
+                    lengths.append(d)
+
+        types: Dict[str, str] = {}
+        for o in others:
+            sd = self.surfaces.get(o)
+            if not sd:
+                continue
+            for token, face in sd[1]:
+                if sd[0].startswith("NODE"):
+                    for n in self._resolve_nodes(token)[:2000]:
+                        for e in self._node_elems().get(n, [])[:1]:
+                            edges(self.geom.elements[e][1])
+                    continue
+                eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token)
+                for e in eids[:5000]:
+                    edges(self._face_nodes(e, face, types))
+        if not lengths:
+            skins = set(self.geom.elsets.get(RIGID_SET, []))
+            for e, (t, conn) in list(self.geom.elements.items())[:20000]:
+                if t.upper() not in RIGID_ELEMENTS and len(conn) > 1 and e not in skins:
+                    edges(conn)
+        if not lengths:
+            return None
+        lengths.sort()
+        return lengths[len(lengths) // 10]
+
+    def _node_elems(self) -> Dict[int, List[int]]:
+        if self._node_elem_map is None:
+            m: Dict[int, List[int]] = {}
+            for e, (_, conn) in self.geom.elements.items():
+                for n in conn:
+                    m.setdefault(n, []).append(e)
+            self._node_elem_map = m
+        return self._node_elem_map
+
+    def _mesh_analytic(self, b: Block, blocks: List[Block], axisym: bool,
+                       members_of: Dict[int, List[int]], deck_nodes: List[Vec]) -> None:
+        """Mesh one analytical rigid surface into skin facets (see _plan_rigid): its *SURFACE
+        then names their contact faces (self._analytic), and its rigid body takes their nodes
+        (``members_of``).  Facets are about the slave faces' size (_analytic_size); straight
+        segments stay exact however they are cut."""
+        name = (b.param("NAME") or "").strip().upper()
+        typ = (b.param("TYPE") or "").strip().upper()
+        body = next((r for r in blocks if r.keyword == "RIGID BODY" and
+                     (r.param("ANALYTICAL SURFACE") or "").strip().upper() == name), None)
+        prof, why = analytic_profile(b)
+        if prof is None:
+            self._analytic_skipped[name] = f"its data cannot be read ({why})"
+        elif body is None:
+            self._analytic_skipped[name] = "no *RIGID BODY carries it (Abaqus requires one)"
+        if name in self._analytic_skipped:
+            self.report.warn(f"Analytical rigid surface {name} (TYPE={typ}) not converted: "
+                             f"{self._analytic_skipped[name]}; it, its rigid body and the "
+                             f"contact pairs / ties that use it are commented out.")
+            return
+        h = self._analytic_size(name, blocks)
+        pts, curved, chord = profile_points(prof["start"], prof["segs"], ANALYTIC_FACET_DEG, h)
+        nc, circ = 0, 0.0
+        if typ == "REVOLUTION":
+            rmax = max(abs(q[0]) for q in pts)
+            circ = ANALYTIC_FACET_DEG
+            if h and rmax > 0:
+                circ = min(circ, max(0.25, math.degrees(h / rmax)))
+            nc = math.ceil(360.0 / circ - 1e-9)
+            nc = max(8, min(nc, max(144, 60000 // max(1, len(pts) - 1))))
+            circ = 360.0 / nc
+        approx = []
+        if curved:
+            approx.append(f"its {curved} circular / parabolic segment(s) become chords turning at "
+                          f"most {chord:.3g} degrees (chord sag at most "
+                          f"{1 - math.cos(math.radians(chord) / 2):.1e} of the radius)")
+        if typ == "REVOLUTION":
+            approx.append(f"its circumference becomes {nc} flat facets of {circ:.3g} degrees "
+                          f"(chord sag {1 - math.cos(math.radians(circ) / 2):.1e} of the radius)")
+        if prof["fillet"] > 0:
+            approx.append(f"its FILLET RADIUS={prof['fillet']:g} corners are left sharp")
+        if approx and not self._approx:
+            self._analytic_skipped[name] = ("meshing it into flat facets approximates its geometry ("
+                                            + "; ".join(approx) + ") — rerun with --approximate")
+            self.report.warn(f"Analytical rigid surface {name} (TYPE={typ}) not converted: "
+                             f"{self._analytic_skipped[name]}. ccx has no analytical surface; it, "
+                             f"its rigid body and the contact pairs / ties that use it are "
+                             f"commented out.")
+            return
+        nid, eid = self._next_ids()
+        new_elems: List[int] = []
+        faces = set()
+        longest = 0.0                           # the largest facet edge (in the plane: segment)
+        if typ == "SEGMENTS":
+            half = self._plane_thickness(blocks)
+            fac: Dict[Tuple[int, int], int] = {}
+            for i, q in enumerate(pts):
+                for lev in (0, 1):
+                    nid += 1
+                    self.geom.add_node(nid, skin_lift(q, lev, half, axisym))
+                    fac[(i, lev)] = nid
+            for i in range(len(pts) - 1):
+                a, c = pts[i], pts[i + 1]
+                ln = math.hypot(c[0] - a[0], c[1] - a[1])
+                if ln <= 0.0:
+                    continue
+                longest = max(longest, ln)
+                nrm = (-(c[1] - a[1]) / ln, (c[0] - a[0]) / ln)       # n = e3 x s
+                t = 0.1 * ln
+                if axisym and nrm[0] > 0 and min(a[0], c[0]) > 0:
+                    t = min(t, 0.5 * min(a[0], c[0]) / nrm[0])       # stay off the axis
+                rows = []
+                for lev in (0, 1):
+                    back = []
+                    for q in (a, c):
+                        nid += 1
+                        x = q[0] - t * nrm[0]
+                        self.geom.add_node(nid, skin_lift((max(0.0, x) if axisym else x, q[1] - t * nrm[1]),
+                                                          lev, half, axisym))
+                        back.append(nid)
+                    rows.append([back[0], back[1], fac[(i + 1, lev)], fac[(i, lev)]])
+                eid += 1
+                self.geom.add_element(eid, "C3D8", rows[0] + rows[1])
+                faces.add("S5")
+                new_elems.append(eid)
+        else:
+            origin, e1, e2, e3 = analytic_frame(typ, prof["frame"])
+            grid: Dict[Tuple[int, int], int] = {}
+
+            def node_at(key: Tuple[int, int], q: Vec) -> int:
+                nonlocal nid
+                if key not in grid:
+                    nid += 1
+                    self.geom.add_node(nid, q)
+                    grid[key] = nid
+                return grid[key]
+
+            quads: List[Tuple[List[int], Vec]] = []
+            if typ == "CYLINDER":
+                ws = [vdot(vsub(q, origin), e3) for q in deck_nodes]
+                lo, hi = (min(ws), max(ws)) if ws else (0.0, 0.0)
+                span = self._model_span()
+                margin = max(0.5 * (hi - lo), 0.05 * span, 1e-6 * max(span, 1.0))
+                lo, hi = lo - margin, hi + margin
+                cap = max(1, 60000 // max(1, len(pts) - 1))
+                nw = max(1, min(cap, 2000, math.ceil((hi - lo) / h - 1e-9) if h else 1))
+                at = lambda i, j: vadd(origin, vadd(vadd(vscale(e1, pts[i][0]), vscale(e2, pts[i][1])),  # noqa: E731
+                                                    vscale(e3, lo + (hi - lo) * j / nw)))
+                for i in range(len(pts) - 1):
+                    sv = (pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+                    if sv == (0.0, 0.0):
+                        continue
+                    want = vadd(vscale(e1, -sv[1]), vscale(e2, sv[0]))      # n = e3 x s
+                    for j in range(nw):
+                        quads.append(([node_at((i, j), at(i, j)), node_at((i + 1, j), at(i + 1, j)),
+                                       node_at((i + 1, j + 1), at(i + 1, j + 1)),
+                                       node_at((i, j + 1), at(i, j + 1))], want))
+            else:
+                tol = 1e-12 * max(1.0, max(abs(x) for q in pts for x in q))
+
+                def rev(i: int, k: int) -> int:
+                    r, z = pts[i]
+                    if abs(r) <= tol:
+                        return node_at((i, -1), vadd(origin, vscale(e3, z)))
+                    ph = 2.0 * math.pi * (k % nc) / nc
+                    return node_at((i, k % nc), vadd(origin, vadd(vscale(e3, z), vadd(
+                        vscale(e1, r * math.cos(ph)), vscale(e2, r * math.sin(ph))))))
+                for i in range(len(pts) - 1):
+                    (r0, z0), (r1, z1) = pts[i], pts[i + 1]
+                    if abs(r0) <= tol and abs(r1) <= tol:
+                        continue
+                    for k in range(nc):
+                        ph = 2.0 * math.pi * (k + 0.5) / nc
+                        er = vadd(vscale(e1, math.cos(ph)), vscale(e2, math.sin(ph)))
+                        want = vsub(vscale(e3, r1 - r0), vscale(er, z1 - z0))   # n = e3' x s
+                        quads.append((dedup([rev(i, k), rev(i + 1, k), rev(i + 1, k + 1), rev(i, k + 1)]),
+                                      want))
+            for quad, want in quads:
+                q = [self.geom.nodes[n] for n in quad]
+                if len(q) == 3:
+                    nrm = vcross(vsub(q[1], q[0]), vsub(q[2], q[0]))
+                    if vdot(nrm, want) < 0:
+                        quad, q, nrm = [quad[0], quad[2], quad[1]], [q[0], q[2], q[1]], vscale(nrm, -1.0)
+                elif len(q) == 4:
+                    nrm = vcross(vsub(q[2], q[0]), vsub(q[3], q[1]))
+                    if vdot(nrm, want) < 0:
+                        quad, q, nrm = [quad[0], quad[3], quad[2], quad[1]], [q[0], q[3], q[2], q[1]], \
+                            vscale(nrm, -1.0)
+                else:
+                    continue
+                area = vnorm(nrm) / 2.0
+                if area <= 0.0:
+                    continue
+                longest = max([longest] + [vnorm(vsub(q[(i + 1) % len(q)], q[i])) for i in range(len(q))])
+                conn, nid = self._skin_brick(q, vunit(nrm), "P", 0.1 * math.sqrt(area), quad, nid)
+                eid += 1
+                self.geom.add_element(eid, "C3D6" if len(q) == 3 else "C3D8", conn)
+                new_elems.append(eid)
+                faces.add("S2")
+        if not new_elems:
+            self._analytic_skipped[name] = "its profile has no extent"
+            self.report.warn(f"Analytical rigid surface {name} (TYPE={typ}) not converted: its "
+                             f"profile has no extent; it, its rigid body and the contact pairs / "
+                             f"ties that use it are commented out.")
+            return
+        self._node_elem_map = None
+        elset = self._rigid_set_name("ABQ2CCX_AS")
+        self.geom.elsets[elset] = new_elems
+        self.geom.add_to_elset(RIGID_SET, new_elems)
+        self._analytic[name] = (elset, faces.pop())
+        members_of.setdefault(id(body), []).extend(
+            n for e in new_elems for n in self.geom.elements[e][1])
+        if typ == "SEGMENTS":
+            ref = self._first_node(body.param("REF NODE") or "")
+            if ref is not None:
+                self._rigid_planar_refs.append(ref)
+        what = ("a plane" if typ == "SEGMENTS" and not axisym else "an axisymmetric"
+                if typ == "SEGMENTS" else "a three-dimensional")
+        extent = " over the model's extent along its generator (Abaqus' is infinite)" \
+            if typ == "CYLINDER" else ""
+        size = ""
+        if h and longest <= 1.5 * h:
+            size = f" of about the slave faces' size ({h:.3g})"
+        elif h:
+            size = (f" of up to {longest:.3g} across (the facet count is capped; the slave faces "
+                    f"are about {h:.3g})")
+        if approx:
+            self.report.warn(f"[APPROX] Analytical rigid surface {name} (TYPE={typ}) meshed into "
+                             f"{len(new_elems)} flat facets{size}{extent}: {'; '.join(approx)}. ccx "
+                             f"has no analytical surface, so contact sees the faceted shape.")
+        else:
+            self.report.note(f"Analytical rigid surface {name} (TYPE={typ}, {what} profile of "
+                             f"straight lines) meshed exactly into {len(new_elems)} facets{size}"
+                             f"{extent}: skin elements (element set {elset}) of its rigid body, "
+                             f"whose outward faces are the surface.")
+
+    def _plan_rigid_ties(self, blocks: List[Block], faces_of: Dict[str, List[Tuple[int, str]]],
+                         skin_body: Dict[int, Block], members_of: Dict[int, List[int]],
+                         pins_of: Dict[int, List[int]]) -> None:
+        """*TIE lines, and *CONTACT PAIR, TIED lines, whose master is a rigid surface (rigid
+        elements' skins or a meshed analytical surface): the slave nodes they tie become
+        members of the master's rigid body (TIE, or PIN with NO ROTATION) and the line is
+        dropped.  A node tied to a rigid surface moves rigidly with it, so that is the tie,
+        exact also where ccx's tie MPCs, chained onto the body's nonlinear MPCs, follow an
+        NLGEOM rotation only linearly (probed on 2.23: 1.3 % off at 0.05 rad; exact in linear
+        steps and NLGEOM translation) or stop explicit dynamics ('linear and nonlinear MPC's
+        depend on each other').
+
+        The slave nodes a *TIE ties are Abaqus' (Analysis User's Guide, "Mesh tie
+        constraints"): the nodes of TIED NSET, else those within the position tolerance of
+        the master — by default 10 % (surface-to-surface, Abaqus/Standard's default
+        formulation) or 5 % (node-to-surface: TYPE=NODE TO SURFACE, Abaqus/Explicit's
+        default, a node-based slave surface) of the typical master facet diagonal, of the
+        typical slave facet diagonal for an analytical master (5 % of the slave node spacing
+        for a node-based slave).  The distance is measured from the side of a slave shell
+        that faces the master (its half thickness and OFFSET) unless NO THICKNESS, and
+        ADJUST (the default) moves a tied node that is farther than that to just touch the
+        master.  Not modelled: the surface-to-surface addendum that also ties the nodes of
+        slave faces lying mostly within the tolerance.  A TIED contact pair ties the nodes
+        ccx's *TIE would, as the converter writes such a pair on deformable surfaces as one:
+        within ADJUST (a distance) or ccx's default 2.5 % of the master faces' edges, moved
+        onto the master."""
+        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        shells = self._shell_thicknesses(blocks)
+        taken = {n for r in blocks if r.keyword == "RIGID BODY"
+                 for part in self._rigid_body_members(r) for n in part}
+        for b in blocks:
+            pair = b.keyword == "CONTACT PAIR" and b.has("TIED")
+            if not (b.keyword == "TIE" or pair) or b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE"):
+                continue
+            label = f"{'*CONTACT PAIR, TIED' if pair else '*TIE'} {b.param('NAME') or ''}".rstrip()
+            if pair:
+                adjust, no_thick, tied_set, form = True, True, None, ""
+                try:
+                    tol = pf((b.param("ADJUST") or "0").strip())
+                except ValueError:
+                    tol = 0.0                   # ADJUST=<node set>: ccx's tie default
+            else:
+                adjust = (b.param("ADJUST") or "YES").strip().upper() != "NO"
+                no_thick = b.has("NO THICKNESS")
+                tied_set = (b.param("TIED NSET") or "").strip() or None
+                form = (b.param("TYPE") or "").replace(" ", "").upper()
+                try:
+                    tol = pf(b.param("POSITION TOLERANCE") or "0")
+                except ValueError:
+                    tol = 0.0
+            for k, rec in enumerate(merged_data_records(b)):
+                toks = [x.strip().upper() for x in rec if x.strip()]
+                if len(toks) < 2:
+                    continue
+                if toks[0] in faces_of:
+                    self.report.warn(f"{label}: its slave surface {toks[0]} is a rigid surface; a "
+                                     f"rigid body cannot follow another surface — left to ccx, "
+                                     f"which may stop on it.", once=True)
+                    continue
+                faces = faces_of.get(toks[1])
+                if not faces:
+                    continue
+                owners = {id(skin_body[sk]) for sk, _ in faces if sk in skin_body}
+                if len(owners) != 1:
+                    continue
+                body = skin_body[faces[0][0]]
+                tris: List[Tuple[Vec, Vec, Vec]] = []
+                edge = []
+                for sk, face in faces:
+                    typ, conn = self.geom.elements[sk]
+                    fam = "WEDGE" if typ == "C3D6" else "HEX"
+                    m = re.fullmatch(r"S(\d)", face)
+                    pos = FACE_NODES[fam][int(m.group(1))] if m else ()
+                    corners = [self.geom.nodes[conn[i - 1]] for i in pos[:(3 if fam == "WEDGE" and
+                                                                          face in ("S1", "S2") else 4)]]
+                    for i in range(len(corners)):
+                        edge.append(vnorm(vsub(corners[(i + 1) % len(corners)], corners[i])))
+                    tris += [(corners[0], corners[i], corners[i + 1]) for i in range(1, len(corners) - 1)]
+                if not tris:
+                    continue
+                stype, sfaces = self.surfaces.get(toks[0], ("ELEMENT", []))
+                node_based = stype.startswith("NODE")
+                slave_faces = [] if node_based else [
+                    (e, f) for tok, f in sfaces
+                    for e in ([int(tok)] if re.fullmatch(r"[-+]?\d+", tok) else self.geom.elset(tok))
+                    if e in self.geom.elements]
+                if node_based:
+                    slaves = dedup([n for tok, _ in sfaces for n in self._resolve_nodes(tok)])
+                else:
+                    slaves = dedup([n for e, f in slave_faces for n in self._face_node_ids(e, f)])
+                slaves = [n for n in slaves if n not in taken and n in self.geom.nodes]
+                if tol <= 1e-10:
+                    if pair:
+                        tol_k = 0.025 * (sum(edge) / len(edge))
+                    else:
+                        n2s = node_based or form == "NODETOSURFACE" or (explicit and form != "SURFACETOSURFACE")
+                        if toks[1] in self._analytic:      # the slave side's size (Abaqus)
+                            base = self._node_spacing(slaves) if node_based else \
+                                self._mean_diagonal([self._face_points(e, f) for e, f in slave_faces])
+                        else:
+                            base = sum(self._skin_diag.get(sk, 0.0) for sk, _ in faces) / len(faces)
+                        tol_k = (0.05 if n2s else 0.10) * (base if base > 0 else sum(edge) / len(edge))
+                else:
+                    tol_k = tol
+                # half thickness of a slave shell node on its side towards the master
+                half: Dict[int, Tuple[float, float, Vec]] = {}
+                if not no_thick:
+                    for e, f in slave_faces:
+                        if e in shells:
+                            t_e, off = shells[e]
+                            nrm = self._shell_normal(e)
+                            for n in self.geom.elements[e][1]:
+                                if n not in half or t_e > half[n][0]:
+                                    half[n] = (t_e, off, nrm)
+                reach = tol_k + max((0.5 + abs(v[1])) * v[0] for v in half.values()) if half else tol_k
+                cell = max(max(edge), reach, 1e-12)
+                grid: Dict[Tuple[int, int, int], List[int]] = {}
+                for i, tri in enumerate(tris):
+                    lo = [int(math.floor((min(q[a] for q in tri) - reach) / cell)) for a in range(3)]
+                    hi = [int(math.floor((max(q[a] for q in tri) + reach) / cell)) for a in range(3)]
+                    for gx in range(lo[0], hi[0] + 1):
+                        for gy in range(lo[1], hi[1] + 1):
+                            for gz in range(lo[2], hi[2] + 1):
+                                grid.setdefault((gx, gy, gz), []).append(i)
+                chosen = set(self.geom.nset(tied_set)) if tied_set else None
+                tied = []
+                for n in slaves:
+                    if chosen is not None and n not in chosen:
+                        continue
+                    p = self.geom.nodes[n]
+                    key = tuple(int(math.floor(p[a] / cell)) for a in range(3))
+                    cand = grid.get(key, []) if chosen is None else range(len(tris))
+                    best = None
+                    for i in cand:
+                        q = closest_on_triangle(p, *tris[i])
+                        dd = vnorm(vsub(p, q))
+                        if best is None or dd < best[0]:
+                            best = (dd, q)
+                    if best is None:
+                        continue
+                    dd, q = best
+                    h = 0.0
+                    if n in half:
+                        t_e, off, nrm = half[n]
+                        up = vdot(vsub(q, p), nrm) >= 0.0          # the shell's top faces the master
+                        h = (0.5 - off) * t_e if up else (0.5 + off) * t_e
+                    if chosen is None and dd - h > tol_k:
+                        continue
+                    tied.append(n)
+                    if adjust and dd > h:
+                        self.geom.nodes[n] = vadd(q, vscale(vsub(p, q), h / dd)) if h > 0 else q
+                if not tied:
+                    continue
+                taken.update(tied)
+                (pins_of if b.has("NO ROTATION") else members_of).setdefault(id(body), []).extend(tied)
+                self._tie_to_rigid.add((id(b), k))
+                if len(tied) < len(slaves):
+                    why = ("not in its TIED NSET" if chosen is not None else
+                           f"farther than the position tolerance ({tol_k:.3g}) from the rigid master")
+                    self.report.note(f"{label}: {len(slaves) - len(tied)} slave node(s) {why} are "
+                                     f"left untied, as {'ccx' if pair else 'Abaqus'} leaves them.",
+                                     once=True)
+
+    def _shell_thicknesses(self, blocks: List[Block]) -> Dict[int, Tuple[float, float]]:
+        """Conventional shell element -> (thickness, OFFSET as a fraction: SPOS 0.5, SNEG
+        -0.5) from its *SHELL SECTION / *SHELL GENERAL SECTION (a layup: its plies' sum)."""
+        out: Dict[int, Tuple[float, float]] = {}
+        for b in blocks:
+            if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION"):
+                continue
+            recs = [r for r in merged_data_records(b) if any(x for x in r)]
+            try:
+                t = sum(pf(r[0]) for r in recs if r and r[0]) if b.has("COMPOSITE") else \
+                    (pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 0.0)
+            except ValueError:
+                continue
+            o = (b.param("OFFSET") or "0").strip().upper()
+            try:
+                off = {"SPOS": 0.5, "SNEG": -0.5}[o] if o in ("SPOS", "SNEG") else pf(o)
+            except ValueError:
+                off = 0.0
+            if t <= 0:
+                continue
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                typ = self.geom.elements.get(e, ("", []))[0].upper()
+                if typ in SHELL_TYPES and not typ.startswith(("SC", "SFM")):
+                    out[e] = (t, off)
+        return out
+
+    def _shell_normal(self, e: int) -> Vec:
+        """Unit normal of a shell element (right-hand rule over its corner nodes)."""
+        conn = self.geom.elements[e][1]
+        p = [self.geom.nodes[n] for n in conn[:3 if len(conn) in (3, 6) else 4]]
+        nrm = vcross(vsub(p[1], p[0]), vsub(p[2], p[0])) if len(p) == 3 else \
+            vcross(vsub(p[2], p[0]), vsub(p[3], p[1]))
+        return vunit(nrm) if vnorm(nrm) > 0 else (0.0, 0.0, 0.0)
+
+    def _face_node_ids(self, e: int, face: Optional[str]) -> List[int]:
+        """The nodes of face ``face`` of element ``e``: an edge Sk of a plane / axisymmetric
+        element (with its midside node), else as _face_nodes."""
+        typ, conn = self.geom.elements[e]
+        m = re.fullmatch(r"S([1-4])", (face or "").upper())
+        if m and typ.upper().startswith(PLANAR_SOLID_PREFIXES) and len(conn) in (3, 4, 6, 8):
+            nc = 3 if len(conn) in (3, 6) else 4
+            k = int(m.group(1))
+            if k > nc:
+                return []
+            ids = [conn[k - 1], conn[k % nc]]
+            return ids + ([conn[nc + k - 1]] if len(conn) == 2 * nc else [])
+        return self._face_nodes(e, face, {})
+
+    def _face_points(self, e: int, face: Optional[str]) -> List[Vec]:
+        """The corner points of face ``face`` of element ``e`` (an edge: its two end nodes)."""
+        typ, conn = self.geom.elements[e]
+        ids = self._face_node_ids(e, face)
+        m = re.fullmatch(r"S([1-4])", (face or "").upper())
+        if m and typ.upper().startswith(PLANAR_SOLID_PREFIXES):
+            ids = ids[:2]
+        elif typ.upper() in SHELL_TYPES or len(ids) in (3, 4, 6, 8):
+            ids = ids[:3 if len(ids) in (3, 6) else 4]
+        return [self.geom.nodes[n] for n in ids if n in self.geom.nodes]
+
+    @staticmethod
+    def _mean_diagonal(facets: List[List[Vec]]) -> float:
+        """The typical facet diagonal: a quadrilateral's mean diagonal, a triangle's longest
+        edge, a segment's length — averaged."""
+        vals = []
+        for q in facets:
+            if len(q) == 2:
+                vals.append(vnorm(vsub(q[1], q[0])))
+            elif len(q) == 3:
+                vals.append(max(vnorm(vsub(q[(i + 1) % 3], q[i])) for i in range(3)))
+            elif len(q) >= 4:
+                vals.append(0.5 * (vnorm(vsub(q[2], q[0])) + vnorm(vsub(q[3], q[1]))))
+        return sum(vals) / len(vals) if vals else 0.0
+
+    def _node_spacing(self, ids: List[int]) -> float:
+        """The mean distance from each of the nodes ``ids`` to its nearest one (a grid of
+        cells about that size across)."""
+        pts = [self.geom.nodes[n] for n in ids if n in self.geom.nodes]
+        if len(pts) < 2:
+            return 0.0
+        lo = [min(p[a] for p in pts) for a in range(3)]
+        hi = [max(p[a] for p in pts) for a in range(3)]
+        span = max(hi[a] - lo[a] for a in range(3)) or 1.0
+        cell = span / max(1.0, len(pts) ** (1.0 / 3.0))
+        grid: Dict[Tuple[int, int, int], List[int]] = {}
+        for i, p in enumerate(pts):
+            grid.setdefault(tuple(int(math.floor(p[a] / cell)) for a in range(3)), []).append(i)
+        total = 0.0
+        for i, p in enumerate(pts):
+            c = tuple(int(math.floor(p[a] / cell)) for a in range(3))
+            best = None
+            for ring in range(1, 4):
+                for dx in range(-ring, ring + 1):
+                    for dy in range(-ring, ring + 1):
+                        for dz in range(-ring, ring + 1):
+                            for j in grid.get((c[0] + dx, c[1] + dy, c[2] + dz), []):
+                                if j != i:
+                                    d = vnorm(vsub(pts[j], p))
+                                    best = d if best is None or d < best else best
+                if best is not None:
+                    break
+            total += best if best is not None else span
+        return total / len(pts)
+
+    def _rewrite_rigid_bodies(self, bodies: List[Block], rigid, members_of: Dict[int, List[int]],
+                              pins_of: Optional[Dict[int, List[int]]] = None) -> None:
+        """Give each *RIGID BODY whose element set holds rigid elements, or that carries a
+        meshed analytical surface, a TIE NSET of all the nodes it moves: its elements' nodes
+        (the skins' included), the rigid elements' own nodes (an RB3D2's, a plane skin's
+        mid-plane nodes) and its earlier TIE NSET — Abaqus ties the nodes of an ELSET in all
+        their DOFs, and ccx takes one node set (NSET) or element set."""
+        planar = {e for e, (t, _) in rigid.items() if t in ("R2D2", "RB2D2", "RAX2")}
+        for b in bodies:
+            es = (b.param("ELSET") or "").strip()
+            elems = self.geom.elset(es) if es else []
+            touched = any(e in rigid for e in elems) or id(b) in members_of or \
+                id(b) in (pins_of or {})
+            if not touched:
+                continue
+            nodes: List[int] = []
+            for e in elems:
+                if e in self.geom.elements:
+                    nodes.extend(self.geom.elements[e][1])
+                if e in rigid:
+                    nodes.extend(rigid[e][1])           # the element's own nodes
+                    for side in "PN":
+                        sk = self._skins.get((e, side))
+                        if sk and sk[0] != e:
+                            nodes.extend(self.geom.elements[sk[0]][1])
+            nodes.extend(members_of.get(id(b), []))
+            for k, v in b.params.items():
+                if k.replace(" ", "") == "TIENSET" and v:
+                    nodes.extend(self.geom.nset(v))
+            name = self._rigid_set_name("ABQ2CCX_RBN")
+            self._rigid_own_sets.add(name)
+            ref = self._first_node(b.param("REF NODE") or "")
+            self.geom.nsets[name] = [n for n in dedup(nodes) if n in self.geom.nodes and n != ref]
+            params: "OrderedDict[str, Optional[str]]" = OrderedDict()
+            for k, v in b.params.items():
+                if k.replace(" ", "") in ("ELSET", "TIENSET", "ANALYTICALSURFACE", "DENSITY",
+                                          "OFFSET", "NODALTHICKNESS"):
+                    continue
+                params[k] = v
+            params["TIE NSET"] = name
+            pins = (pins_of or {}).get(id(b), [])
+            if pins:
+                old = [n for k, v in b.params.items() if k.replace(" ", "") == "PINNSET" and v
+                       for n in self.geom.nset(v)]
+                pname = self._rigid_set_name("ABQ2CCX_RBN")
+                self._rigid_own_sets.add(pname)
+                self.geom.nsets[pname] = dedup(old + pins)
+                params = OrderedDict((k, v) for k, v in params.items() if k.replace(" ", "") != "PINNSET")
+                params["PIN NSET"] = pname
+            b.params = params
+            b.data = []
+            if any(e in planar for e in elems):
+                ref = self._first_node(b.param("REF NODE") or "")
+                if ref is not None:
+                    self._rigid_planar_refs.append(ref)
+
+    def _plan_rotary_stars(self, blocks: List[Block]) -> None:
+        """Rotary inertia (ROTARYI elements, *ROTARY INERTIA) on the nodes of a rigid body,
+        which ccx 2.23 does not have, as point masses the body carries (inertia_star): six
+        new member nodes on the principal axes of the body's summed rotary inertia, centred
+        on the body node with the largest *MASS, and a negative *MASS there that takes back
+        their mass — so the body keeps its mass and centre of mass and gains exactly that
+        inertia (it turns with the body, as Abaqus' does).  The six nodes get four
+        zero-density tetrahedra of the skin material: ccx 2.23's *FREQUENCY stops ('add_bo_st:
+        coefficient should be 0') on a *MASS at a member node that belongs to no other
+        element.  Probed: frequencies, implicit and explicit dynamics of a body on springs
+        match theory with the negative mass as with the deck's mass reduced (identical).
+        In a plane model only I33 acts (a plane body turns about z only; Abaqus' usual 2-D
+        input gives only it), so the star lies in the plane.  An axisymmetric body (u_r, u_z
+        and the in-plane rotation in Abaqus) is not given one — how ccx's 2-degree sector
+        would take a whole-circumference inertia is not established — so its ROTARYI is
+        dropped where inertia does nothing (no dynamic or frequency step), else only under
+        --approximate."""
+        rot_elems = OrderedDict((e, c[0]) for e, (t, c) in self.geom.elements.items()
+                                if t.upper() == "ROTARYI" and c)
+        if not rot_elems:
+            return
+        mass_at: Dict[int, float] = {}
+        for b in blocks:
+            if b.keyword != "MASS":
+                continue
+            try:
+                m = pf([x for r in merged_data_records(b) for x in r if x != ""][0])
+            except (IndexError, ValueError):
+                continue
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                info = self.geom.elements.get(e)
+                if info and info[0].upper() == "MASS" and info[1]:
+                    mass_at[info[1][0]] = mass_at.get(info[1][0], 0.0) + m
+        owner: Dict[int, Block] = {}
+        for b in blocks:
+            if b.keyword != "RIGID BODY" or b.param("ANALYTICAL SURFACE"):
+                continue                # an unmeshed analytical surface: commented out
+            ref = self._first_node(b.param("REF NODE") or "")
+            tie, pin = self._rigid_body_members(b)
+            for n in [ref] + tie + pin:
+                if n is not None:
+                    owner.setdefault(n, b)
+        axisym = any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values())
+        planar = {n for n in self._rigid_planar_refs}
+        skins = set(self.geom.elsets.get(RIGID_SET, []))
+        dims = {t.upper() for e, (t, _) in self.geom.elements.items() if e not in skins and not
+                t.upper().startswith(("SPRING", "DASHPOT", "MASS", "ROTARYI", "GAPUNI", "CONN"))}
+        planar_model = not axisym and bool(dims) and all(
+            planar_line_type(t) or t.startswith(PLANAR_COMPANION_PREFIXES) for t in dims)
+        inertial = any(b.keyword in ("DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
+                                     "COMPLEX FREQUENCY", "SUBSPACE DYNAMIC") for b in blocks)
+        per_body: "OrderedDict[int, List[Tuple[Block, int]]]" = OrderedDict()
+        cards: Dict[int, Block] = {}
+        for b in blocks:
+            if b.keyword == "ROTARY INERTIA":
+                for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                    if e in rot_elems:
+                        cards[e] = b
+        for e, n in rot_elems.items():
+            body = owner.get(n)
+            if body is not None and e in cards:
+                per_body.setdefault(id(body), []).append((body, e))
+        done: set = set()
+        nid, eid = self._next_ids()
+        for items in per_body.values():
+            body = items[0][0]
+            ref = self._first_node(body.param("REF NODE") or "")
+            tensor = [[0.0] * 3 for _ in range(3)]
+            ok = True
+            for _, e in items:
+                card = cards[e]
+                try:
+                    v = [pf(x) if x else 0.0 for r in merged_data_records(card) for x in r][:6]
+                except ValueError:
+                    ok = False
+                    break
+                v += [0.0] * (6 - len(v))
+                loc = [[v[0], v[3], v[4]], [v[3], v[1], v[5]], [v[4], v[5], v[2]]]
+                axes = self._rotary_axes(card)
+                if axes is None:
+                    ok = False
+                    break
+                for i in range(3):
+                    for j in range(3):
+                        tensor[i][j] += sum(axes[k][i] * loc[k][l] * axes[l][j]
+                                            for k in range(3) for l in range(3))
+                if any(abs(x) > 0 for x in v[3:]):
+                    self.report.note("*ROTARY INERTIA products of inertia (I12, I13, I23) read as "
+                                     "the inertia tensor's off-diagonal components.", once=True)
+            if not ok:
+                self.report.warn("*ROTARY INERTIA with an unreadable value or an orientation that "
+                                 "is not rectangular: not converted (ccx has no ROTARYI element).",
+                                 once=True)
+                continue
+            if axisym:
+                if inertial and not self._approx:
+                    self.report.warn(f"ROTARYI on the axisymmetric rigid body of reference node {ref} "
+                                     f"not converted: ccx 2.23 has no ROTARYI element, and the "
+                                     f"converter carries rotary inertia only on 3-D and plane "
+                                     f"bodies. In a dynamic or frequency step it acts on the "
+                                     f"body's in-plane rotation (DOF 6), so ccx stops on it — "
+                                     f"rerun with --approximate to drop it (exact where that "
+                                     f"rotation is held).", once=False)
+                    continue
+                done.update(e for _, e in items)
+                if inertial:
+                    self.report.warn(f"[APPROX] ROTARYI on the axisymmetric rigid body of reference "
+                                     f"node {ref} dropped (ccx 2.23 has no ROTARYI element): its "
+                                     f"rotary inertia about the out-of-plane axis is lost, which "
+                                     f"matters only where the body's rotation (DOF 6) is free in "
+                                     f"a dynamic or frequency step.", once=False)
+                else:
+                    self.report.note("ROTARYI elements on an axisymmetric rigid body dropped: the "
+                                     "deck has no dynamic or frequency step, where rotary inertia "
+                                     "would act.", once=True)
+                continue
+            if ref in planar or planar_model:
+                tensor = [[tensor[2][2] / 2, 0.0, 0.0], [0.0, tensor[2][2] / 2, 0.0], [0.0, 0.0, tensor[2][2]]]
+            nodes = [n for _, e in items for n in [rot_elems[e]]]
+            tie, pin = self._rigid_body_members(body)
+            pool = [n for n in dedup(([ref] if ref is not None else []) + tie + pin) if n in self.geom.nodes]
+            centre = max(pool, key=lambda n: mass_at.get(n, 0.0), default=None)
+            m_c = mass_at.get(centre, 0.0) if centre is not None else 0.0
+            star = inertia_star(tensor, 0.5 * m_c) if m_c > 0 else None
+            if star is None:
+                self.report.warn(f"Rotary inertia on the rigid body of reference node {ref} not "
+                                 f"converted: " + ("the body has no *MASS to centre it on (ccx has "
+                                 "no ROTARYI element; give the body a mass)" if m_c <= 0 else
+                                 "its principal moments break the triangle inequality, which no "
+                                 "mass distribution has") + ".", once=False)
+                continue
+            c = self.geom.nodes[centre]
+            star_nodes = []
+            for off, m in star:
+                nid += 1
+                self.geom.add_node(nid, vadd(c, off))
+                star_nodes.append(nid)
+                if m > 0:
+                    eid += 1
+                    self.geom.add_element(eid, "MASS", [nid])
+                    name = self._rigid_set_name("ABQ2CCX_STAR")
+                    self.geom.elsets[name] = [eid]
+                    self._star_masses.append((name, m))
+            eid += 1
+            self.geom.add_element(eid, "MASS", [centre])
+            name = self._rigid_set_name("ABQ2CCX_STAR")
+            self.geom.elsets[name] = [eid]
+            self._star_masses.append((name, -0.5 * m_c))
+            p1, m1, p2, m2, p3, m3 = star_nodes
+            tets = []
+            for a, b2 in ((p1, p2), (p2, m1), (m1, m2), (m2, p1)):
+                conn = [p3, m3, a, b2]
+                x = [self.geom.nodes[n] for n in conn]
+                if vdot(vcross(vsub(x[1], x[0]), vsub(x[2], x[0])), vsub(x[3], x[0])) < 0:
+                    conn = [p3, m3, b2, a]
+                eid += 1
+                self.geom.add_element(eid, "C3D4", conn)
+                tets.append(eid)
+            self.geom.add_to_elset(RIGID_SET, tets)
+            # the body takes the star's nodes: a new TIE NSET with its tie members and them
+            # (the deck's own sets are left as they are)
+            params = OrderedDict()
+            old: List[int] = []
+            tset = None
+            for k, v in body.params.items():
+                ku = k.replace(" ", "")
+                if ku == "TIENSET" and v and v.strip().upper() in self._rigid_own_sets:
+                    tset = v.strip().upper()           # the converter's own: extend it
+                    params[k] = v
+                elif ku == "TIENSET" and v:
+                    old += self.geom.nset(v)
+                elif ku == "ELSET" and v:
+                    old += [n for e in self.geom.elset(v) if e in self.geom.elements
+                            for n in self.geom.elements[e][1]]
+                else:
+                    params[k] = v
+            if tset is None:
+                tset = self._rigid_set_name("ABQ2CCX_RBN")
+                self._rigid_own_sets.add(tset)
+                params["TIE NSET"] = tset
+            self.geom.nsets[tset] = dedup(self.geom.nsets.get(tset, []) + old + star_nodes)
+            body.params = params
+            done.update(e for _, e in items)
+            self.report.note(f"Rotary inertia of the rigid body of reference node {ref} -> six point "
+                             f"masses on its principal axes around node {centre} (the body node with "
+                             f"the largest *MASS) and a *MASS of {fmt_num(-0.5 * m_c)} there: the "
+                             f"body keeps its mass and centre of mass and gains exactly that inertia "
+                             f"(ccx 2.23 has no ROTARYI element).", once=False)
+        for e in done:
+            del self.geom.elements[e]
+        for b in blocks:
+            if b.keyword == "ROTARY INERTIA" and any(e in done for e in self.geom.elset(
+                    (b.param("ELSET") or "").strip())):
+                self._rotary_done.add(id(b))
+        for name, ids in self.geom.elsets.items():
+            if any(i in done for i in ids):
+                self.geom.elsets[name] = [i for i in ids if i not in done]
+
+    def _rotary_axes(self, card: Block) -> Optional[List[Vec]]:
+        """The axes (rows) a *ROTARY INERTIA's values refer to: global, or a rectangular
+        *ORIENTATION's (x along a, y towards b, z = x cross y); None for any other system."""
+        name = (card.param("ORIENTATION") or "").strip().upper()
+        if not name:
+            return [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+        o = self.orientations.get(name)
+        if not o or not o[2].upper().startswith("RECT") or self._orient_rotation.get(name):
+            return None
+        e1 = vunit(o[0])
+        e2 = vunit(vsub(o[1], vscale(e1, vdot(o[1], e1))))
+        return [e1, e2, vcross(e1, e2)]
+
+    def _plan_rigid_planar_holds(self) -> None:
+        """Model-data BCs that keep the 3-D rigid bodies of plane rigid elements in their
+        plane, as Abaqus' plane bodies are: reference node DOF 3 and ROT NODE DOFs 1-2
+        (rotations about x and y) held — repeated after *BOUNDARY, OP=NEW, which removes
+        them (see handle_boundary)."""
+        lines = []
+        for ref in dedup(self._rigid_planar_refs):
+            rot = self._rb_rot.get(ref)
+            lines.append(f"{ref}, 3, 3")
+            if rot is not None:
+                lines.append(f"{rot}, 1, 2")
+        self._rigid_planar_bc = ["*BOUNDARY"] + lines if lines else []
+
+    def _rigid_model_cards(self) -> List[str]:
+        """The skins' material and section, and the rotary-inertia stars' *MASS cards —
+        written after the deck's own materials (just before the first *STEP), as ccx's
+        default contact stiffness comes from the first material."""
+        if self._rigid_cards_out:
+            return []
+        self._rigid_cards_out = True
+        out: List[str] = []
+        if self.geom.elsets.get(RIGID_SET) and self._skin_material:
+            e, rho, thermal = self._skin_material
+            out += ["** [abq2ccx] force-free skins of the rigid elements / analytical surfaces "
+                    "(their rigid bodies move them; see the header)",
+                    f"*MATERIAL, NAME={RIGID_SET}", "*ELASTIC", f"{short_real(e)}, 0.",
+                    "*DENSITY", short_real(rho)]
+            if thermal:
+                out += ["*CONDUCTIVITY", "1e-30", "*SPECIFIC HEAT", "0."]
+            out += [f"*SOLID SECTION, ELSET={RIGID_SET}, MATERIAL={RIGID_SET}"]
+        for name, m in self._star_masses:          # ccx reads 20 characters of a field
+            out += [f"*MASS, ELSET={name}", short_real(m, 12)]
+        return out
 
     def _audit_loads(self, blocks: List[Block], out: List[str]) -> None:
         """Guard against a hollow solve: a step the Abaqus deck loads but whose every load
@@ -14099,7 +15822,10 @@ class Converter:
         (a B21 with a circular section becomes a B32 with a midside node)."""
         self._planar_elems = {}
         others: set = set()
+        skins = set(self.geom.elsets.get(RIGID_SET, []))   # rigid elements' skins (_plan_rigid)
         for eid, (typ, _conn) in self.geom.elements.items():
+            if eid in skins:
+                continue
             base = planar_line_type(typ)
             if base:
                 self._planar_elems[eid] = base
@@ -14639,6 +16365,124 @@ class Converter:
         self._circ_explicit = best
         self._circ_explicit_issue = ", ".join(dedup_str(missing))
 
+    # ccx's lumped node mass over its contact area share for the expanded faces of plane /
+    # axisymmetric slave edges, times rho A / (K L) (A: element area, L: edge length) — node-
+    # to-surface: the most critical node (masses: e_c3d.f lumping, a 20-node brick's corners
+    # 0.2917 / 1.2917 / 8 of its mass; areas: tiefaccont.f, 1/4 a 4-node face's, 1/100 and
+    # 24/100 an 8-node face's corner and midside); face-to-face: the face's mean node mass
+    # over the face area.
+    CONTACT_MASS_AREA = {"N2F": {3: 2.0 / 3.0, 4: 0.5, 6: 0.381, 8: 0.2688},
+                         "F2F": {3: 1.0 / 6.0, 4: 0.125, 6: 0.0605, 8: 0.0464}}
+
+    def _plan_rigid_contact_increment(self, blocks: List[Block]) -> None:
+        """ccx sizes an explicit step's increment from its elements (Courant) and from its
+        contact springs (calcstabletimeinccont.f: springfac * critom * sqrt(m_m m_s /
+        ((m_m + m_s) K A)) with half the nodes' masses, K the penalty stiffness, A the slave
+        node's area, springfac 1 node-to-surface, 0.1 face-to-face) — but skips a spring
+        whose slave and master nodes both lack active DOFs: the nodes of a plane or
+        axisymmetric model's expansion (ccx ties them to the 2-D nodes) against a rigid
+        surface's (members of its rigid body).  That contact then runs at the elements'
+        increment, which can exceed its stable one: probed on 2.23, a punch of rigid skins
+        on a CPE4 block bounced (the block top 3.3 times the punch travel, no reaction at the
+        reference node); at a smaller increment it equals the punch given its motion node by
+        node to all printed digits.  Records the smallest springfac / 2 * sqrt(m / (K A))
+        over the slave edges of contact pairs between plane / axisymmetric elements and a
+        rigid surface — ccx's formula with the slave nodes' masses on both sides, its rule
+        when one side is constrained; K is HARD contact's 50 times the largest first elastic
+        constant (ccx takes material 1's) or the LINEAR slope — for the maximum increment of
+        explicit *DYNAMIC steps (_circ_explicit_increment)."""
+        self._contact_explicit = None
+        if not self._rigid_faces or not any(b.keyword == "DYNAMIC" and b.has("EXPLICIT")
+                                            for b in blocks):
+            return
+        rho: Dict[str, float] = {}
+        first_e: List[float] = []
+        mat_of: Dict[int, str] = {}
+        k_of: Dict[str, Optional[float]] = {}
+        mat: Optional[str] = None
+        inter: Optional[str] = None
+        for b in blocks:
+            kw = b.keyword
+            vals = [x for r in merged_data_records(b) for x in r if x != ""]
+            if kw == "MATERIAL":
+                mat, inter = (b.param("NAME") or "").strip().upper(), None
+            elif kw == "SURFACE INTERACTION":
+                inter, mat = (b.param("NAME") or "").strip().upper(), None
+                k_of[inter] = None
+            elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
+                mat = inter = None
+                if kw == "SOLID SECTION":
+                    for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                        mat_of[e] = (b.param("MATERIAL") or "").strip().upper()
+            elif mat and kw == "DENSITY":
+                try:
+                    r = min(pf(rec[0]) for rec in merged_data_records(b) if rec and rec[0])
+                except ValueError:
+                    continue
+                if r > 0:
+                    rho[mat] = r
+            elif mat and kw == "ELASTIC" and vals:
+                try:
+                    first_e.append(abs(pf(vals[0])))
+                except ValueError:
+                    pass
+            elif inter and kw == "SURFACE BEHAVIOR":
+                po = (b.param("PRESSURE-OVERCLOSURE") or "HARD").strip().upper()
+                try:
+                    k = pf(vals[0]) if po == "LINEAR" and vals else 0.0
+                except ValueError:
+                    k = 0.0
+                k_of[inter] = k if k > 0 else None
+        if not first_e or max(first_e) <= 0:
+            return
+        k_hard = 50.0 * max(first_e)
+        best: Optional[Tuple[float, int]] = None
+        for b in blocks:
+            if b.keyword != "CONTACT PAIR" or b.has("TIED"):
+                continue
+            f2f = (b.param("TYPE") or "").replace(" ", "").upper() == "SURFACETOSURFACE"
+            coef = self.CONTACT_MASS_AREA["F2F" if f2f else "N2F"]
+            kpen = k_of.get((b.param("INTERACTION") or "").strip().upper()) or k_hard
+            for rec in merged_data_records(b):
+                toks = [x.strip().upper() for x in rec if x.strip()]
+                if len(toks) < 2 or toks[1] not in self._rigid_faces:
+                    continue
+                stype, sfaces = self.surfaces.get(toks[0], ("ELEMENT", []))
+                if stype.startswith("NODE"):
+                    continue
+                for tok, face in sfaces:
+                    m = re.fullmatch(r"S([1-4])", (face or "").upper())
+                    if not m:
+                        continue
+                    for e in ([int(tok)] if re.fullmatch(r"[-+]?\d+", tok) else self.geom.elset(tok)):
+                        typ, conn = self.geom.elements.get(e, ("", []))
+                        n = len(conn)
+                        density = rho.get(mat_of.get(e, ""))
+                        if not typ.upper().startswith(PLANAR_SOLID_PREFIXES) or n not in coef or \
+                                not density or any(c not in self.geom.nodes for c in conn):
+                            continue
+                        nc = 3 if n in (3, 6) else 4
+                        k = int(m.group(1))
+                        if k > nc:
+                            continue
+                        pts = [self.geom.nodes[c] for c in conn[:nc]]
+                        area = 0.5 * abs(sum(pts[i][0] * pts[(i + 1) % nc][1] - pts[(i + 1) % nc][0] * pts[i][1]
+                                             for i in range(nc)))
+                        a, c2 = pts[k - 1], pts[k % nc]
+                        ln = math.hypot(c2[0] - a[0], c2[1] - a[1])
+                        if area <= 0 or ln <= 0:
+                            continue
+                        r = coef[n] * density * area / (kpen * ln)
+                        if typ.upper().startswith(AXISYMMETRIC_PREFIXES):
+                            rx = max(a[0], c2[0])
+                            if rx <= 0:
+                                continue
+                            r *= max(0.0, sum(q[0] for q in pts) / nc) / rx
+                        v = (0.1 if f2f else 1.0) * 0.5 * math.sqrt(r)
+                        if v > 0 and (best is None or v < best[0]):
+                            best = (v, e)
+        self._contact_explicit = best
+
     def _wave_speeds(self, blocks: List[Block]) -> Dict[str, float]:
         """Material (upper-case name) -> the largest dilatational wave speed
         sqrt(E (1 - nu) / ((1 + nu) (1 - 2 nu) rho)) over its *ELASTIC and *DENSITY rows
@@ -14793,23 +16637,40 @@ class Converter:
                 best = (hf / c, e)
         return best
 
+    def _explicit_caps(self, critom: float) -> List[Tuple[float, str, int]]:
+        """The maximum increments the converter sets on explicit steps: (cap, why, element) for
+        circular-section beams (_plan_circ_explicit_increment) and for contact of plane /
+        axisymmetric elements with a rigid surface (_plan_rigid_contact_increment, ccx's
+        contact formula times its safety factor 0.8)."""
+        caps = []
+        if self._circ_explicit is not None:
+            caps.append((float("%.3g" % (critom * 0.3 * (0.8 / 1.3) / 2.0 * self._circ_explicit[0])),
+                         "circ", self._circ_explicit[1]))
+        if self._contact_explicit is not None:
+            caps.append((float("%.3g" % (0.8 * critom * self._contact_explicit[0])), "contact",
+                         self._contact_explicit[1]))
+        return caps
+
     def _circ_capped_max(self, proc: Optional[Block], dtmax: Optional[float]) -> Optional[float]:
         """An explicit step's maximum increment as converted: the deck's, or the smaller cap
-        _circ_explicit_increment sets for circular-section beams."""
-        if self._circ_explicit is None or proc is None or proc.has("DIRECT") or \
-                proc.has("DIRECT USER CONTROL"):
+        _circ_explicit_increment sets (circular-section beams, contact with a rigid surface)."""
+        caps = self._explicit_caps(self._critom(proc))
+        if not caps or proc is None or proc.has("DIRECT") or proc.has("DIRECT USER CONTROL"):
             return dtmax
-        cap = float("%.3g" % (self._critom(proc) * 0.3 * (0.8 / 1.3) / 2.0 * self._circ_explicit[0]))
+        cap = min(c for c, _, _ in caps)
         return min(cap, dtmax) if dtmax else cap
 
     def _circ_explicit_increment(self, params: "OrderedDict[str, Optional[str]]",
                                  data: List[str]) -> List[str]:
         """The data line of an explicit *DYNAMIC in a deck with circular-section beams
-        (_plan_circ_explicit_increment): the maximum increment (4th field, the same in both
-        codes) becomes ccx's Courant estimate with h = min(l, d / sqrt(2)) unless the
-        deck's own maximum or the step period is no larger.  A fixed increment (DIRECT)
-        above it is only warned: ccx's mass scaling for it is sized from the same
-        overestimate (probed: NaN at 1.2x and 2.4x ccx's estimate, where RECT beams run)."""
+        (_plan_circ_explicit_increment) or with contact of plane / axisymmetric elements on a
+        rigid surface (_plan_rigid_contact_increment): the maximum increment (4th field, the
+        same in both codes) becomes the smaller cap unless the deck's own maximum or the step
+        period is no larger.  For the beams it is ccx's Courant estimate with h = min(l, d /
+        sqrt(2)); for the contact, ccx's contact formula, which ccx itself skips there.  A
+        fixed increment (DIRECT) above a cap is only warned: ccx's mass scaling for it is
+        sized from the same estimates (probed for the beams: NaN at 1.2x and 2.4x ccx's
+        estimate, where RECT beams run)."""
         if self._circ_explicit_issue:
             self.report.warn(f"*DYNAMIC, EXPLICIT with circular-section (CIRC) beams: ccx 2.23 "
                              f"runs them at about 1.3x their stable increment (NaN displacements, "
@@ -14817,16 +16678,16 @@ class Converter:
                              f"{self._circ_explicit_issue}. Set the maximum increment (4th field "
                              f"of the *DYNAMIC data line) to at most 0.12 d / c (d: section "
                              f"diameter, c: the material's dilatational wave speed).", once=True)
-        if self._circ_explicit is None:
-            return data
         try:
             alpha = min(max(pf(params.get("ALPHA") or "-0.05"), -1.0 / 3.0), 0.0)
         except ValueError:
             alpha = -0.05
         critom = 1.96 / math.sqrt(1.0 - alpha * (1.0 + alpha * (2.0 + alpha)))
-        h_over_c, elem = self._circ_explicit
-        cap = "%.3g" % (critom * 0.3 * (0.8 / 1.3) / 2.0 * h_over_c)
-        top = float(cap)
+        caps = self._explicit_caps(critom)
+        if not caps:
+            return data
+        top = min(c for c, _, _ in caps)
+        cap = "%.3g" % top
         # no data line: ccx runs the step with a period of 1
         fields = [x.strip() for x in data[0].split(",")] if data else ["", "1."]
         fields += [""] * (4 - len(fields))
@@ -14839,28 +16700,50 @@ class Converter:
 
         if "DIRECT" in params:
             fixed = num(0)
-            if fixed and fixed > top:
-                self.report.warn(f"*DYNAMIC, EXPLICIT, DIRECT: the fixed increment {fields[0]} "
-                                 f"exceeds the stable increment of the circular-section (CIRC) "
-                                 f"beams (about {cap}, element {elem}). ccx 2.23 overestimates "
-                                 f"it by about 1.3x, and its mass scaling for a larger fixed "
-                                 f"increment is sized from the same estimate, so the run "
-                                 f"diverges (NaN displacements, probed). Use a fixed increment "
-                                 f"of at most {cap}, or drop DIRECT so abq2ccx caps the "
-                                 f"automatic increment.", once=True)
+            for c, why, elem in caps:
+                if not fixed or fixed <= c:
+                    continue
+                if why == "circ":
+                    self.report.warn(f"*DYNAMIC, EXPLICIT, DIRECT: the fixed increment {fields[0]} "
+                                     f"exceeds the stable increment of the circular-section (CIRC) "
+                                     f"beams (about {c:.3g}, element {elem}). ccx 2.23 overestimates "
+                                     f"it by about 1.3x, and its mass scaling for a larger fixed "
+                                     f"increment is sized from the same estimate, so the run "
+                                     f"diverges (NaN displacements, probed). Use a fixed increment "
+                                     f"of at most {c:.3g}, or drop DIRECT so abq2ccx caps the "
+                                     f"automatic increment.", once=True)
+                else:
+                    self.report.warn(f"*DYNAMIC, EXPLICIT, DIRECT: the fixed increment {fields[0]} "
+                                     f"exceeds the stable increment of the contact between plane / "
+                                     f"axisymmetric elements and a rigid surface (about {c:.3g}, "
+                                     f"element {elem}), which ccx 2.23 leaves out of its estimate "
+                                     f"(and its mass scaling) there: the contact bounces (probed). "
+                                     f"Use a fixed increment of at most {c:.3g}, or drop DIRECT so "
+                                     f"abq2ccx caps the automatic increment.", once=True)
             return data
         period, limit = num(1), num(3)
         if limit is None or 0 < limit <= top or (period is not None and 0 < period <= top):
             return data
         fields[3] = cap
-        self.report.note(f"*DYNAMIC, EXPLICIT: maximum increment {cap} set for the circular-"
-                         f"section (CIRC) beams (4th data field; ccx still picks a smaller "
-                         f"increment where other elements need one). ccx 2.23 measures their "
-                         f"expanded section by the box around the circle and runs them at about "
-                         f"1.3x their stable increment: NaN displacements (probed). {cap} is "
-                         f"ccx's own Courant estimate with the square through the section's "
-                         f"corner nodes (smallest at element {elem}), at least 1.4x below the "
-                         f"probed limit.", once=True)
+        why, elem = next((w, e) for c, w, e in caps if c == top)
+        if why == "circ":
+            self.report.note(f"*DYNAMIC, EXPLICIT: maximum increment {cap} set for the circular-"
+                             f"section (CIRC) beams (4th data field; ccx still picks a smaller "
+                             f"increment where other elements need one). ccx 2.23 measures their "
+                             f"expanded section by the box around the circle and runs them at about "
+                             f"1.3x their stable increment: NaN displacements (probed). {cap} is "
+                             f"ccx's own Courant estimate with the square through the section's "
+                             f"corner nodes (smallest at element {elem}), at least 1.4x below the "
+                             f"probed limit.", once=True)
+        else:
+            self.report.note(f"*DYNAMIC, EXPLICIT: maximum increment {cap} set for the contact of "
+                             f"plane / axisymmetric elements with a rigid surface (4th data field; "
+                             f"ccx still picks a smaller increment where other elements need one). "
+                             f"ccx 2.23 leaves such contact out of its stable increment (both sides "
+                             f"are constrained nodes there), so it ran at the elements' increment "
+                             f"and bounced (probed). {cap} is ccx's own contact formula with the "
+                             f"slave nodes' masses (smallest at element {elem}) times 0.8.",
+                             once=True)
         return [", ".join(fields)] + data[1:]
 
 
@@ -14879,8 +16762,8 @@ def dedup_str(seq: Sequence[str]) -> List[str]:
 
 PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
                      "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION",
-                     "SPRING", "DASHPOT", "MASS", "GAP", "ORIENTATION", "DISTRIBUTION", "SURFACE",
-                     "CONNECTOR SECTION"}
+                     "SPRING", "DASHPOT", "MASS", "ROTARY INERTIA", "GAP", "ORIENTATION",
+                     "DISTRIBUTION", "SURFACE", "CONNECTOR SECTION"}
 # Part-level constraint cards that reference the part's own nodes/elements/sets: each
 # instance needs its own copy with offset ids and prefixed names (emitted once, raw,
 # they would constrain only one instance — or the wrong nodes after renumbering).
@@ -14902,7 +16785,8 @@ ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "DFLUX", "DFILM", "FILM", "RADIATE",
 # instance-qualified value here must be resolved exactly like a data-line member;
 # a plain name is already global.  (REF/ROT NODE point at a node or 1-node set.)
 REF_PARAMS = {"NSET", "ELSET", "SURFACE", "SLAVE", "MASTER",
-              "REF NODE", "REFNODE", "ROT NODE", "ROTNODE", "PIN NSET", "TIE NSET"}
+              "REF NODE", "REFNODE", "ROT NODE", "ROTNODE", "PIN NSET", "TIE NSET",
+              "ANALYTICAL SURFACE"}
 
 
 def _split_instance_ref(tok: str, maps) -> Optional[Tuple[str, str]]:
@@ -15095,7 +16979,7 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
     for k in ("REF NODE", "REFNODE", "ROT NODE", "ROTNODE"):
         if p.get(k):
             p[k] = node(p[k].strip())
-    for k in ("NSET", "PIN NSET", "TIE NSET", "SURFACE"):
+    for k in ("NSET", "PIN NSET", "TIE NSET", "SURFACE", "ANALYTICAL SURFACE"):
         if p.get(k):
             p[k] = namer(prefix, p[k].strip())
     if p.get("ELSET"):
@@ -15268,7 +17152,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         if b.keyword in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
                          "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION",
                          "SPRING",
-                         "DASHPOT", "MASS", "GAP"):
+                         "DASHPOT", "MASS", "ROTARY INERTIA", "GAP"):
             nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer)
             if b.has("COMPOSITE"):
                 # a ply line (thickness, points, material, angle or orientation, ply name)
@@ -15287,6 +17171,23 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                         nb.data[1] = ", ".join(_fmt_component(x) for x in rotv((v[0], v[1], v[2])))
                 except ValueError:
                     pass
+            if rot and b.keyword == "ROTARY INERTIA" and not b.param("ORIENTATION") and nb.data:
+                # without an orientation the tensor is in the part's axes (Abaqus, "Rotary
+                # inertia"): I' = R I R^T for the instance's rotation R
+                try:
+                    v = [pf(x) if x.strip() else 0.0 for x in nb.data[0].split(",")][:6]
+                except ValueError:
+                    v = []
+                if v:
+                    v += [0.0] * (6 - len(v))
+                    t = [[v[0], v[3], v[4]], [v[3], v[1], v[5]], [v[4], v[5], v[2]]]
+                    cols = [rotv(tuple(1.0 if i == j else 0.0 for i in range(3))) for j in range(3)]
+                    r = [[cols[j][i] for j in range(3)] for i in range(3)]       # R e_j = cols[j]
+                    w = [[sum(r[i][k] * t[k][l] * r[j][l] for k in range(3) for l in range(3))
+                          for j in range(3)] for i in range(3)]
+                    vals = (w[0][0], w[1][1], w[2][2], w[0][1], w[0][2], w[1][2])
+                    top = max(abs(x) for x in vals)
+                    nb.data[0] = ", ".join("0." if abs(x) <= 1e-13 * top else f"{x:.15g}" for x in vals)
             out.append(nb)
         elif b.keyword == "ORIENTATION":
             nb = _remap_named(b, prefix, ("NAME",), namer)
@@ -15319,6 +17220,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                 nb.data[1] = ", ".join(namer(prefix, x.strip()) if x.strip() else ""
                                        for x in nb.data[1].split(","))
             out.append(nb)
+        elif b.keyword == "SURFACE" and (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES:
+            out.append(_place_analytic(b, prefix, namer, rotp))
         elif b.keyword == "SURFACE":
             out.append(_remap_surface(b, prefix, namer, node_off, elem_off))
         elif b.keyword in PART_CONSTRAINT_KW:
@@ -15540,6 +17443,41 @@ def _remap_named(b: Block, prefix: str, keys: Sequence[str], namer) -> Block:
         if k in p and p[k]:
             p[k] = namer(prefix, p[k])
     return Block(b.keyword, p, list(b.data))
+
+
+def _place_analytic(b: Block, prefix: str, namer, rotp) -> Block:
+    """One instance's copy of a part-level analytical rigid surface: its name prefixed like
+    the instance's other names and its geometry moved with the instance.  Within a part the
+    surface's frame is the part's axes (Abaqus leaves its coordinate lines blank there):
+    CYLINDER a at the origin, b on the x-axis, c on the negative z-axis; REVOLUTION a at the
+    origin, b on the y-axis.  Those points move like nodes and are written out; a SEGMENTS
+    profile (global X-Y / r-z coordinates) moves point by point."""
+    p: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+    if p.get("NAME"):
+        p["NAME"] = namer(prefix, p["NAME"].strip())
+    typ = (b.param("TYPE") or "").strip().upper()
+    prof, _ = analytic_profile(b)
+    if prof is None:
+        return Block("SURFACE", p, list(b.data))
+    data: List[str] = []
+    if typ == "SEGMENTS":
+        def mv(q: Tuple[float, float]) -> List[str]:
+            r = rotp((q[0], q[1], 0.0))
+            return [fmt_coord(r[0]), fmt_coord(r[1])]
+        data.append(", ".join(["START"] + mv(prof["start"])))
+        for seg in prof["segs"]:
+            data.append(", ".join([seg[0]] + [x for q in seg[1:] for x in mv(q)]))
+        return Block("SURFACE", p, data)
+    frame = prof["frame"] or ([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)] if typ == "CYLINDER"
+                              else [(0.0, 0.0, 0.0), (0.0, 1.0, 0.0)])
+    pts = [rotp(q) for q in frame]
+    data.append(", ".join(fmt_coord(x) for q in pts[:2] for x in q))
+    if typ == "CYLINDER":
+        data.append(", ".join(fmt_coord(x) for x in pts[2]))
+    data.append(", ".join(["START"] + [fmt_coord(x) for x in prof["start"]]))
+    for seg in prof["segs"]:
+        data.append(", ".join([seg[0]] + [fmt_coord(x) for q in seg[1:] for x in q]))
+    return Block("SURFACE", p, data)
 
 
 def _remap_surface(b: Block, prefix: str, namer, node_off: int, elem_off: int) -> Block:

@@ -34,8 +34,16 @@ use a linear element. (Node ordering is not the cause: it is the same in both co
 
 **`*ERROR … no material defined`, or an element type rejected.** A section names a material
 the converter commented out (see the report), or an element has no ccx counterpart
-(cohesive, gasket, rigid) and needs remodelling. Surface elements reach ccx only when they
-carry rebar or mass that acts; `--approximate` leaves them out anyway.
+(cohesive, gasket, a `ROTARYI` that is not on a rigid body) and needs remodelling. Rigid
+elements become skins of their rigid body, except those of an Abaqus/Explicit `*RIGID BODY`
+with `DENSITY` and a thickness, whose mass the conversion would lose: `--approximate`
+converts them without it. Surface elements reach ccx only when they carry rebar or mass
+that acts; `--approximate` leaves them out anyway.
+
+**`*ERROR reading *COMPLEX FREQUENCY: either parameter CORIOLIS or parameter FLUTTER is
+required`.** ccx's complex eigenvalue step covers only Coriolis forces and flutter; Abaqus'
+damped one (dashpots, damping) has no ccx counterpart. Use `*MODAL DYNAMIC` or `*STEADY
+STATE DYNAMICS` with the damping instead.
 
 **Composite shell errors.** `*SHELL SECTION, COMPOSITE` works only on `S6` and `S8R`; a
 layup on `S4`/`S4R`/`S3` must be re-meshed with quadratic shells.
@@ -109,6 +117,25 @@ converter comments `*TEMPERATURE` out there.
   point with a kinematic coupling, whose rotation the converter carries in its local axes.
 * **Short extra beams in the model (`ABQ2CCX_KNOT`).** Knot beams carry no load; ignore
   them in the results.
+* **Thin extra solids on rigid tools (`ABQ2CCX_RIGID`).** ccx has no rigid element and no
+  analytical surface, so each rigid facet becomes a force-free solid *skin* that its rigid
+  body moves; the skin's face on the facet is the contact face. Skins never strain: ignore
+  them in the results. Their material comes after the deck's on purpose — ccx takes the
+  default `HARD` contact stiffness from the first material.
+* **An analytical rigid surface was "not converted".** Curved profiles, surfaces of
+  revolution and fillets would only be facets, so without `--approximate` the surface, its
+  rigid body and its contact pairs and ties are commented out. With it, the `[APPROX]`
+  warning gives the facets' chord angle and sag.
+* **A `*TIE` to a rigid surface is gone.** Its slave nodes became members of the rigid body:
+  ccx's tie would follow an NLGEOM rotation only linearly and stops explicit dynamics.
+* **Rotary inertia became point masses (`ABQ2CCX_STAR*`).** ccx 2.23 has no `ROTARYI`; a
+  rigid body's inertia comes from six point masses on its principal axes and a negative
+  `*MASS` that keeps the body's mass and centre of mass.
+* **Axisymmetric reactions are 180 times too small.** ccx prints them per 2° sector;
+  multiply by 180 for Abaqus' whole-circumference value.
+* **An explicit run of a plane or axisymmetric model bounces off a rigid tool.** ccx 2.23
+  leaves that contact out of its stable increment; the converter caps the step's maximum
+  increment (a NOTE gives the value). Keep a hand-set maximum or `DIRECT` increment below it.
 * **Velocity and acceleration BCs.** ccx prescribes displacements only, so they become
   displacement BCs with generated amplitudes (`ABQ2CCX_VEL*`/`ACC*`). Edit the Abaqus BC and
   reconvert rather than the amplitudes. After a velocity jump, the driven node's own velocity
@@ -154,8 +181,8 @@ The converter keeps these as `**` comments with guidance:
   `*DASHPOT`. (Connectors without a behaviour are converted.)
 * **Gaskets** → a thin soft solid or a `*SPRING`; **cohesive elements and debonding** →
   contact or a nonlinear `*SPRING` (by default they run as a bonded thin continuum, warned).
-* **Rigid elements** (`R3D*`, `RB*`) and analytical rigid surfaces → meshed bodies under a
-  `*RIGID BODY`.
+* **Abaqus general contact** (`*CONTACT`) → `*CONTACT PAIR`s between the surfaces that can
+  touch (rigid elements and analytical surfaces convert, so they can be part of them).
 * **Inertia relief** → soft springs to ground or a 3-2-1 constraint.
 * **Unsupported materials** (`*VISCOELASTIC`, `*CONCRETE …`, `*DAMAGE EVOLUTION`, …) → the
   nearest supported model.

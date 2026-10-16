@@ -95,7 +95,10 @@ TRANSLATED = {
         "AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped. An "
         "explicit step in a deck with circular-section beams gets a maximum time increment "
         "(4th data field): ccx 2.23 overestimates their stable increment about 1.3-fold "
-        "(NaN displacements); a fixed `DIRECT` increment above it is warned.",
+        "(NaN displacements); so does one with contact of plane / axisymmetric elements on a rigid "
+        "surface, which ccx 2.23 leaves out of its stable increment (the contact bounces): ccx's "
+        "contact formula with the slave nodes' masses, times 0.8. A fixed `DIRECT` increment "
+        "above a cap is warned.",
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes).",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
@@ -154,10 +157,15 @@ TRANSLATED = {
         "tractions, and so do `TRVEC`/`TRSHR`/`P` on surface elements (which leave the mesh; "
         "`P` is positive along the element normal); gravity on them adds nothing (no mass), "
         "other loads on them are commented; user-subroutine labels (`...NU`) commented, naming "
-        "ccx's `dload.f`. `OP=NEW` keeps the `*DSLOAD` pressures Abaqus keeps (ccx's `OP=NEW` "
+        "ccx's `dload.f`. A `P` on rigid elements → a face pressure on their skins (minus p on "
+        "the `SPOS` skin's face: Abaqus' P pushes along the element normal; on R2D2 / RB2D2, "
+        "which have no section thickness, per unit depth); gravity on rigid "
+        "elements alone applies nothing (they carry no mass), a body force per volume on them is "
+        "commented. `OP=NEW` keeps the `*DSLOAD` pressures Abaqus keeps (ccx's `OP=NEW` "
         "would remove them). GRAV and CENTRIF magnitudes are multiplied by 10³⁰ where the masses "
         "are divided by it (see `*COUPLED TEMPERATURE-DISPLACEMENT`).",
-    "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; on a shell's / membrane's "
+    "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels (on the `SPOS` / `SNEG` side of "
+        "rigid elements: their skins' face); on a shell's / membrane's "
         "`SNEG` side → `P` / `P1`, on its `SPOS` side the same with the sign flipped (Abaqus "
         "pushes a surface pressure against the surface normal, ccx's `P` / `P1` pushes along the "
         "element normal; `validate_with_ccx.py shell_pressure_sides`); surface tractions "
@@ -178,7 +186,15 @@ TRANSLATED = {
         "which leave the mesh — no stiffness, no ccx element — while their loads become nodal "
         "forces; they stay (and ccx stops on them) if `*REBAR LAYER` or `DENSITY=` in a "
         "dynamic/frequency step or under gravity gives them physics, unless `--approximate`.",
-    "*TIE": "Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept.",
+    "*TIE": "Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept. A line "
+        "whose master is a rigid surface (rigid elements' skins, a meshed analytical surface) is "
+        "not written: the slave nodes Abaqus ties — `TIED NSET`, or those within the position "
+        "tolerance, by default 10 % (surface-to-surface) or 5 % (node-to-surface: `TYPE=NODE TO "
+        "SURFACE`, Abaqus/Explicit, a node-based slave) of the typical master facet diagonal (an "
+        "analytical master: the slave facets'), measured from a slave shell's side towards the "
+        "master unless `NO THICKNESS` — join that rigid body (`NO ROTATION`: translations only), "
+        "moved to touch the surface unless `ADJUST=NO` — exact, where ccx's tie follows an "
+        "`NLGEOM` rotation of the body only linearly and stops explicit dynamics.",
     "*MPC": "line by line: `PIN` → `*EQUATION` on DOFs 1-3; `TIE` → per-DOF `*EQUATION` "
             "(shell/beam rotations through knots, DOF 11 in thermal steps); `BEAM` → one "
             "`*RIGID BODY` per independent node (chained lines one body); `LINK` → linearised "
@@ -230,7 +246,22 @@ TRANSLATED = {
         "which connector constraints on it are written too. "
         "Shell/membrane/beam/truss "
         "members get knot beams; the rotations of `TIE NSET`/`ELSET` shell/beam members are tied "
-        "to the `ROT NODE`, `PIN NSET` ones stay free.",
+        "to the `ROT NODE`, `PIN NSET` ones stay free. A body of rigid elements or an "
+        "`ANALYTICAL SURFACE` becomes a `TIE NSET` of every node it moves (the skins', the rigid "
+        "elements' own, rotary-inertia point masses, tied nodes); a plane or axisymmetric one is "
+        "held out of its plane (reference node DOF 3, `ROT NODE` 1-2; repeated after `OP=NEW`). "
+        "The data line (Abaqus/Explicit thickness) moves the skins' contact faces by half the "
+        "thickness (`OFFSET` shifts them) and is not written; `DENSITY` with a thickness "
+        "(rigid-element mass) leaves the elements unconverted unless `--approximate`; an "
+        "analytical surface that is not meshed comments the body out.",
+    "*ROTARY INERTIA": "ccx 2.23 has no `ROTARYI` element: on a rigid body with a `*MASS`, the "
+        "body's summed rotary inertia becomes six point masses on its principal axes around the "
+        "body node with the largest mass, a negative `*MASS` there that takes their mass back, "
+        "and four zero-density tetrahedra on those nodes (exact: same mass, centre of mass and "
+        "inertia; in a plane model only I33, so the masses lie in the plane); an axisymmetric "
+        "body's is dropped where the deck has no dynamic or frequency step, else only with "
+        "`--approximate`; otherwise commented. In a part without `ORIENTATION` the tensor turns "
+        "with its instance.",
     "*TRANSFORM": "rectangular and cylindrical cards passed through; `TYPE=S` (spherical — ccx "
         "has none and reads it as rectangular) commented out and replaced by a rectangular card "
         "per node with its spherical axes (1 radial, 3 meridional towards the pole, 2 = 3 × 1, "
@@ -251,8 +282,10 @@ TRANSLATED = {
         "subroutine (`USER`, a `...NU` label): commented, naming ccx's `film.f` / `dflux.f` / "
         "`cflux.f` / `radiate.f` (kept, ccx would run its stock subroutine instead).",
     "*CONTACT PAIR": "missing `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; the note "
-        "suggests `SURFACE TO SURFACE` if ccx struggles to converge); `TIED` → `*TIE`; `SMALL "
-        "SLIDING` dropped for surface-to-surface; Abaqus-only params dropped.",
+        "suggests `SURFACE TO SURFACE` if ccx struggles to converge); `TIED` → `*TIE` (on a rigid "
+        "master: its slave nodes join the rigid body, see `*TIE`); `SMALL SLIDING` dropped for "
+        "surface-to-surface; Abaqus-only params dropped. A line naming an analytical surface "
+        "that is not meshed is commented out, the card's other lines kept.",
     "*SURFACE INTERACTION": "2D out-of-plane thickness line dropped; `*SURFACE BEHAVIOR, "
         "PRESSURE-OVERCLOSURE=HARD` synthesized when missing (the Abaqus default).",
     "*FRICTION": "only `mu` emitted (ccx would read Abaqus' slip-rate / mu_k field as its stick "
@@ -307,8 +340,15 @@ TRANSLATED = {
     "*SURFACE": "only `NAME`/`TYPE` kept; shell edges `E1..E4` → `S3..S6` (plane elements "
         "`S1..S4`); `ANALYTICAL RIGID` / `COMBINE` commented; `SPOS`/`SNEG` kept (ccx reads them as the "
         "expanded shell's top and bottom face, as Abaqus); `CPS4I`/`CPE4I` edges `S1..S4` → "
-        "`S3..S6` of their slabs; faces of "
-        "surface elements (not in the ccx mesh) left out, a surface of them only dropped.",
+        "`S3..S6` of their slabs; faces of rigid elements → the matching faces of their skins "
+        "(no label: both sides); faces of "
+        "surface elements (not in the ccx mesh) left out, a surface of them only dropped. "
+        "`TYPE=SEGMENTS` / `CYLINDER` / `REVOLUTION` (analytical rigid surfaces) → "
+        "skin facets of their rigid body, about the slave faces' size, named by an element-based "
+        "surface of the same name: straight-line `SEGMENTS` and `CYLINDER` (over the model's "
+        "extent along the generator) exactly; arcs (`CIRCL`, `PARAB`), `REVOLUTION` and "
+        "`FILLET RADIUS` only under `--approximate` (`[APPROX]` with the chord angle and sag), "
+        "otherwise commented with their body, pairs and ties.",
     "*OUTPUT / *NODE OUTPUT / *ELEMENT OUTPUT": "field output → `*NODE FILE`/`*EL FILE` (.frd), "
         "history output for a set → `*NODE PRINT`/`*EL PRINT` (.dat); the `*OUTPUT` card is dropped "
         "and its `FREQUENCY`/`NUMBER INTERVAL`/`TIME INTERVAL`/`TIME POINTS` go onto the step's "
@@ -364,7 +404,7 @@ def element_category(t):
         (("SPRING", "DASHPOT", "GAPUNI", "GAPCYL", "GAPSPHER", "MASS", "DCOUP", "ROTARYI"), "discrete"),
         (("COH",), "cohesive"),
         (("CONN",), "connector"),
-        (("R3D", "RB2", "RB3", "RAX"), "rigid"),
+        (("R3D", "RB2", "RB3", "RAX", "R2D"), "rigid"),
         (("SFM",), "surface (load carrier)"),
         (("DC3D", "DC1D"), "heat-transfer continuum"),
         (("C3D",), "3D continuum"),
@@ -400,8 +440,16 @@ def element_status(t):
         return "direct"
     if t.endswith("H") and t[:-1] in A.CCX_ELEMENTS:
         return f"→ `{t[:-1]}` (hybrid dropped: reduced physics)"
-    if t.startswith(("R3D", "RB2", "RB3", "RAX")):
-        return "flagged → model as `*RIGID BODY`"
+    if t in ("R3D3", "R3D4"):
+        return f"→ `{'C3D6' if t == 'R3D3' else 'C3D8'}` skin of its rigid body (exact; face `S2` = `SPOS`, `S1` = `SNEG`)"
+    if t in ("R2D2", "RB2D2"):
+        return "→ `C3D8` skin through the model's thickness, 3-D rigid body held in the plane (exact; `S5` / `S3`)"
+    if t == "RAX2":
+        return "→ `C3D8` skin over ccx's ±1° sector, 3-D rigid body held in the plane (exact; `S5` / `S3`)"
+    if t == "RB3D2":
+        return "not emitted — its nodes join its rigid body"
+    if t == "ROTARYI":
+        return "on a rigid body with a `*MASS`: six point masses (exact); otherwise flagged"
     if t in A.CONN_TYPES:
         return "not emitted — its `*CONNECTOR SECTION` becomes ccx constraints"
     if t.startswith(A.UNSUPPORTED_ELEM_PREFIXES):
@@ -458,6 +506,22 @@ def gen_elements():
                          "couplings, `*FREQUENCY` / `*BUCKLE`, whose mass and geometric stiffness are "
                          "not compared ...) the element runs as `CPS4`/`CPE4`, which locks in "
                          "bending, and counts as reduced physics.\n")
+        if cat == "rigid":
+            parts.append("ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so "
+                         "each rigid element becomes a force-free solid *skin* that its rigid body "
+                         "carries (element set and material `" + A.RIGID_SET + "`): one face is the "
+                         "element itself, pointing along its `SPOS` normal (the right-hand rule over "
+                         "the nodes; 2-D: node 1 → 2 turned 90° counterclockwise); a `SNEG` side gets "
+                         "the skin on the other side, an unlabelled surface both. The skin moves "
+                         "rigidly, so its material, thickness and density (0; tiny in explicit "
+                         "dynamics) change nothing; its material is written after the deck's own "
+                         "(ccx's default contact stiffness comes from the first material). Plane "
+                         "and axisymmetric skins are 3-D bricks across ccx's expansion of the 2-D "
+                         "model under a 3-D body: ccx's 2-D rigid body follows its expansion only "
+                         "linearly under `NLGEOM` rotation and reports no reaction with "
+                         "face-to-face contact. Analytical rigid surfaces (`*SURFACE, TYPE=SEGMENTS / "
+                         "CYLINDER / REVOLUTION`) are meshed into the same skins — see the keyword "
+                         "reference.\n")
         if cat == "beam / truss":
             pairs = ", ".join(f"`{a}` → `{b}`" for a, b in A.CIRC_QUADRATIC.items())
             parts.append("Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is "

@@ -59,6 +59,12 @@ without an error. A full audit and the work that followed:
   a `*RIGID BODY` with a `ROT NODE` in its axes, knot beams and global components on beam
   nodes, equation terms moved to rigid bodies' `ROT NODE`s; what has no exact form
   commented out and warned.
+* **Rigid tools** — rigid elements (`R3D3`, `R3D4`, `R2D2`, `RB2D2`, `RAX2`, `RB3D2`) as
+  force-free solid skins of their rigid body, so contact against them works; analytical
+  rigid surfaces meshed into skins (curved ones with `--approximate`); ties to rigid
+  surfaces as body members; `ROTARYI` on rigid bodies as point masses; explicit increments
+  capped where ccx leaves plane or axisymmetric contact with a rigid surface out of its
+  estimate.
 * **Materials and orientations** — per-element `*DISTRIBUTION` orientations; the elastic
   forms ccx 2.23 needs beside orthotropic and anisotropic expansion; halved ANISO expansion
   shear coefficients; zero-shear ANISO written as ORTHO; default initial temperatures.
@@ -74,9 +80,9 @@ without an error. A full audit and the work that followed:
   and 9) dropped; `OFFSET=SPOS`/`SNEG` as numbers; the source-deck faults among the
   rest named in the corpus notes.
 
-Corpus: 165 decks solve their own problem; 28 more solve with reduced physics, 14 load
-nothing (3 both) and one drifts to a solution that is not the deck's; 219 mesh-only decks are
-accepted, 598 need what ccx cannot run.
+Corpus: 165 decks solve their own problem; 29 more solve with reduced physics, 14 load
+nothing (3 both) and one drifts to a solution that is not the deck's; 221 mesh-only decks are
+accepted, 595 need what ccx cannot run.
 
 ## 1.1.0 (July 2026)
 

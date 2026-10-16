@@ -4,7 +4,7 @@
 
 Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged. A substitution is exact only where noted; any other replaces Abaqus' element formulation, which the converter records as reduced physics (`Converter.reduced_physics`, a header warning): ccx then solves a different discretization than Abaqus.
 
-Direct CalculiX types: **68**. Total recognised: **166**.
+Direct CalculiX types: **68**. Total recognised: **167**.
 
 ## 3D continuum
 
@@ -118,7 +118,7 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 | `GAPSPHER` | 2 | → `GAPUNI` (substituted: reduced physics) |
 | `GAPUNI` | 2 | direct |
 | `MASS` | 1 | direct |
-| `ROTARYI` | 1 | flagged — no ccx equivalent |
+| `ROTARYI` | 1 | on a rigid body with a `*MASS`: six point masses (exact); otherwise flagged |
 | `SPRING1` | 1 | direct |
 | `SPRING2` | 2 | direct |
 | `SPRINGA` | 2 | direct |
@@ -225,11 +225,14 @@ ccx has no incompatible-mode plane element. `CPS4I` and `CPE4I` (the latter on p
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `R3D3` | 3 | flagged → model as `*RIGID BODY` |
-| `R3D4` | 4 | flagged → model as `*RIGID BODY` |
-| `RAX2` | 2 | flagged → model as `*RIGID BODY` |
-| `RB2D2` | 2 | flagged → model as `*RIGID BODY` |
-| `RB3D2` | 2 | flagged → model as `*RIGID BODY` |
+| `R2D2` | 2 | → `C3D8` skin through the model's thickness, 3-D rigid body held in the plane (exact; `S5` / `S3`) |
+| `R3D3` | 3 | → `C3D6` skin of its rigid body (exact; face `S2` = `SPOS`, `S1` = `SNEG`) |
+| `R3D4` | 4 | → `C3D8` skin of its rigid body (exact; face `S2` = `SPOS`, `S1` = `SNEG`) |
+| `RAX2` | 2 | → `C3D8` skin over ccx's ±1° sector, 3-D rigid body held in the plane (exact; `S5` / `S3`) |
+| `RB2D2` | 2 | → `C3D8` skin through the model's thickness, 3-D rigid body held in the plane (exact; `S5` / `S3`) |
+| `RB3D2` | 2 | not emitted — its nodes join its rigid body |
+
+ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so each rigid element becomes a force-free solid *skin* that its rigid body carries (element set and material `ABQ2CCX_RIGID`): one face is the element itself, pointing along its `SPOS` normal (the right-hand rule over the nodes; 2-D: node 1 → 2 turned 90° counterclockwise); a `SNEG` side gets the skin on the other side, an unlabelled surface both. The skin moves rigidly, so its material, thickness and density (0; tiny in explicit dynamics) change nothing; its material is written after the deck's own (ccx's default contact stiffness comes from the first material). Plane and axisymmetric skins are 3-D bricks across ccx's expansion of the 2-D model under a 3-D body: ccx's 2-D rigid body follows its expansion only linearly under `NLGEOM` rotation and reports no reaction with face-to-face contact. Analytical rigid surfaces (`*SURFACE, TYPE=SEGMENTS / CYLINDER / REVOLUTION`) are meshed into the same skins — see the keyword reference.
 
 ## shell
 

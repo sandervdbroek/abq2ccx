@@ -417,11 +417,13 @@ def test_amp_keyword_alias():
     assert "*AMPLITUDE, NAME=A1" in body
 
 
-def test_rigid_element_flagged():
+def test_rigid_element_without_body_becomes_a_skin():
+    # Abaqus requires a *RIGID BODY for rigid elements; a mesh-only deck without one still
+    # converts (to a skin, warned) so that ccx accepts the mesh
     deck = "*NODE\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n*ELEMENT, TYPE=R3D3, ELSET=R\n1,1,2,3\n"
     body, _, rep = convert_str(deck)
-    assert "*ELEMENT, TYPE=R3D3" in body                       # emitted unchanged
-    assert any("rigid" in m.lower() and "R3D3" in m for _, m in rep.entries)
+    assert "*ELEMENT, TYPE=R3D3" not in body and "*ELEMENT, TYPE=C3D6\n1, " in body
+    assert any("belong to no *RIGID BODY" in m for _, m in rep.entries)
 
 
 def test_name_length_limit():
@@ -6268,6 +6270,503 @@ def test_coupled_inertia_example():
     assert "(step 2): a mechanical load without AMPLITUDE" in rep.text()
     assert not dangling_refs(reparse(body))
 
+# --- rigid elements and analytical rigid surfaces ---------------------------------------
+
+RIGID_PLATE = """*NODE
+1, 0.,0.,0.
+2, 1.,0.,0.
+3, 1.,1.,0.
+4, 0.,1.,0.
+5, 2.,0.,0.
+9, 0.5, 0.5, 1.
+*ELEMENT, TYPE=R3D4, ELSET=PLATE
+1, 1, 2, 3, 4
+*ELEMENT, TYPE=R3D3, ELSET=PLATE
+2, 2, 5, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*RIGID BODY, REF NODE=9, ELSET=PLATE
+"""
+
+
+def _emitted(body):
+    g = reparse(body)
+    return g, {e: t for e, (t, _) in g.elements.items()}
+
+
+def _face_points(g, eid, face):
+    typ, conn = g.elements[eid]
+    fam = "WEDGE" if typ == "C3D6" else "HEX"
+    pos = A.FACE_NODES[fam][int(face[1:])]
+    n = 3 if fam == "WEDGE" and face in ("S1", "S2") else 4
+    return [g.nodes[conn[i - 1]] for i in pos[:n]]
+
+
+def _outward(g, eid, face):
+    """Unit outward normal of a skin element's face (the Abaqus / ccx face node order turns
+    clockwise seen from outside)."""
+    p = _face_points(g, eid, face)
+    if len(p) == 3:
+        nrm = A.vcross(A.vsub(p[1], p[0]), A.vsub(p[2], p[0]))
+    else:
+        nrm = A.vcross(A.vsub(p[2], p[0]), A.vsub(p[3], p[1]))
+    return A.vscale(A.vunit(nrm), -1.0)
+
+
+def _surface_lines(body, name):
+    m = re.search(r"\*SURFACE, NAME=" + name + r"[^\n]*\n((?:[^*][^\n]*\n)+)", body)
+    return [l.split(",") for l in m.group(1).strip().splitlines()] if m else []
+
+
+def test_rigid_facets_become_skins_with_their_contact_side():
+    deck = RIGID_PLATE + ("*SURFACE, NAME=UP\nPLATE, SPOS\n*SURFACE, NAME=DOWN\nPLATE, SNEG\n"
+                          "*SURFACE, NAME=BOTH\nPLATE,\n*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    g, types = _emitted(body)
+    assert types[1] == "C3D8" and types[2] == "C3D6"              # same ids, the SPOS skins
+    for name, want in (("UP", 1.0), ("DOWN", -1.0)):
+        lines = _surface_lines(body, name)
+        assert lines and all(f[1].strip() in ("S1", "S2") for f in lines)
+        for f in lines:
+            for e in g.elset(f[0].strip()):
+                n = _outward(g, e, f[1].strip())
+                assert abs(n[2] - want) < 1e-12, (name, e, n)       # +z is the facets' SPOS
+                assert all(abs(p[2]) < 1e-12 for p in _face_points(g, e, f[1].strip()))
+    assert len(_surface_lines(body, "BOTH")) == 2                  # double-sided: both skins
+    # the body moves every node of the skins (facet nodes and the offset copies)
+    m = re.search(r"\*RIGID BODY, REF NODE=9, NSET=([^,\s]+), ROT NODE=\d+", body)
+    members = set(g.nset(m.group(1)))
+    skin_nodes = {n for e in g.elset(A.RIGID_SET) for n in g.elements[e][1]}
+    assert skin_nodes <= members and {1, 2, 3, 4, 5} <= members
+    # the skin material comes after the deck's (ccx's HARD contact stiffness is 50 x the
+    # first material's first constant) with its modulus, and with no density outside
+    # explicit dynamics
+    assert body.index("*MATERIAL, NAME=STEEL") < body.index(f"*MATERIAL, NAME={A.RIGID_SET}") \
+        < body.index("*STEP")
+    blk = body[body.index(f"*MATERIAL, NAME={A.RIGID_SET}"):]
+    assert "*ELASTIC\n210000., 0.\n*DENSITY\n0.\n" in blk
+    assert f"*SOLID SECTION, ELSET={A.RIGID_SET}, MATERIAL={A.RIGID_SET}" in blk
+
+
+def test_rigid_skins_in_explicit_dynamics_get_a_small_density():
+    deck = RIGID_PLATE + "*STEP\n*DYNAMIC, EXPLICIT\n, 1e-3\n*BOUNDARY\n9, 1, 6\n*END STEP\n"
+    body, _, _ = convert_str(deck)
+    m = re.search(r"\*MATERIAL, NAME=" + A.RIGID_SET + r"\n\*ELASTIC\n(\S+), 0\.\n\*DENSITY\n(\S+)\n", body)
+    e, rho = float(m.group(1)), float(m.group(2))
+    assert 0 < rho < 1e-6 and 0 < e < 1e-6                        # wave speed 1e-3 of the deck's
+    assert all(len(x) <= 20 for x in (m.group(1), m.group(2)))     # ccx reads 20 characters
+
+
+def test_rigid_density_with_thickness_needs_approximate():
+    deck = (RIGID_PLATE.replace("*RIGID BODY, REF NODE=9, ELSET=PLATE",
+                                "*RIGID BODY, REF NODE=9, ELSET=PLATE, DENSITY=7.8e-9\n0.5")
+            + "*STEP\n*DYNAMIC, EXPLICIT\n, 1e-3\n*END STEP\n")
+    body, _, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=R3D4" in body and "DENSITY= with a thickness" in rep.text()
+    body, _, rep = convert_str(deck, approximate=True)
+    assert "*ELEMENT, TYPE=R3D4" not in body and "[APPROX] *RIGID BODY, DENSITY=" in rep.text()
+
+
+def test_rigid_explicit_thickness_offsets_the_contact_faces():
+    # Abaqus/Explicit: a thickness t on the *RIGID BODY data line puts the SPOS contact
+    # surface t/2 above the facet (OFFSET=SPOS: on it), SNEG t/2 below
+    for off, up, down in (("", 0.25, -0.25), (", OFFSET=SPOS", 0.0, -0.5)):
+        deck = (RIGID_PLATE.replace("*RIGID BODY, REF NODE=9, ELSET=PLATE",
+                                    f"*RIGID BODY, REF NODE=9, ELSET=PLATE{off}\n0.5")
+                + "*SURFACE, NAME=UP\nPLATE, SPOS\n*SURFACE, NAME=DOWN\nPLATE, SNEG\n"
+                + "*STEP\n*DYNAMIC, EXPLICIT\n, 1e-3\n*END STEP\n")
+        body, _, _ = convert_str(deck)
+        g, _ = _emitted(body)
+        for name, z in (("UP", up), ("DOWN", down)):
+            for f in _surface_lines(body, name):
+                for e in g.elset(f[0].strip()):
+                    assert all(abs(p[2] - z) < 1e-12 for p in _face_points(g, e, f[1].strip())), (off, name)
+        assert "*RIGID BODY, REF NODE=9, NSET=" in body and "\n0.5\n" not in body
+
+
+def test_plane_and_axisymmetric_rigid_segments():
+    # R2D2 in a plane-strain model: a C3D8 through twice the thickest section, face S5 on
+    # the segment (SPOS = 90 degrees counterclockwise from node 1 -> 2), a 3-D body held
+    # out of its plane in model data and again after OP=NEW
+    plane = ("*NODE\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n11,1.5,1.\n12,-0.5,1.\n9,0.5,2.\n"
+             "*ELEMENT, TYPE=CPE4, ELSET=B\n1,1,2,3,4\n*ELEMENT, TYPE=R2D2, ELSET=R\n5,11,12\n"
+             "*SOLID SECTION, ELSET=B, MATERIAL=M\n2.\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+             "*SURFACE, NAME=TOOL\nR, SPOS\n*RIGID BODY, REF NODE=9, ELSET=R\n"
+             "*STEP\n*STATIC\n*BOUNDARY, OP=NEW\n9, 1, 2\n9, 6, 6\n*END STEP\n")
+    body, conv, _ = convert_str(plane)
+    g, types = _emitted(body)
+    assert types[5] == "C3D8"
+    (elset, face), = [(f[0].strip(), f[1].strip()) for f in _surface_lines(body, "TOOL")]
+    assert face == "S5"
+    pts = _face_points(g, 5, "S5")
+    assert sorted({round(p[2], 9) for p in pts}) == [-2.0, 2.0] and all(abs(p[1] - 1) < 1e-12 for p in pts)
+    assert abs(_outward(g, 5, "S5")[1] + 1.0) < 1e-12               # SPOS of 11 -> 12 is -y
+    rot = conv._rb_rot[9]
+    holds = f"*BOUNDARY\n9, 3, 3\n{rot}, 1, 2\n"
+    assert body.count(holds) == 2                                  # model data + after OP=NEW
+    m = re.search(r"\*RIGID BODY, REF NODE=9, NSET=([^,\s]+)", body)
+    assert {11, 12} <= set(g.nset(m.group(1)))                     # the segment's own nodes too
+    # RAX2 in an axisymmetric model: the +/-1 degree sector ccx expands CAX elements to
+    ax = plane.replace("CPE4", "CAX4").replace("R2D2", "RAX2").replace("12,-0.5,1.", "12,0.,1.")
+    body, _, _ = convert_str(ax)
+    g, types = _emitted(body)
+    assert types[5] == "C3D8"
+    for p in _face_points(g, 5, "S5"):
+        r = math.hypot(p[0], p[2])
+        assert r < 1e-12 or abs(abs(math.degrees(math.atan2(p[2], p[0]))) - 1.0) < 1e-9
+
+
+def test_rb3d2_links_join_their_rigid_body():
+    deck = ("*NODE\n1,0.,0.,0.\n2,1.,0.,0.\n3,2.,0.,0.\n*ELEMENT, TYPE=RB3D2, ELSET=L\n1,1,2\n2,2,3\n"
+            "*RIGID BODY, REF NODE=1, ELSET=L\n*STEP\n*STATIC\n*BOUNDARY\n1,1,6\n*END STEP\n")
+    body, _, _ = convert_str(deck)
+    assert "RB3D2" not in body.split("** ===")[-1] and "*ELSET, ELSET=L" not in body
+    m = re.search(r"\*RIGID BODY, REF NODE=1, NSET=([^,\s]+)", body)
+    members = set(reparse(body).nset(m.group(1)))
+    assert members >= {2, 3} and 1 not in members          # the reference node is no member
+
+
+ANALYTIC_2D = ("*NODE\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n9,0.,4.\n"
+               "*ELEMENT, TYPE=CAX4, ELSET=B\n1,1,2,3,4\n*ELSET, ELSET=TOPE\n1\n"
+               "*SURFACE, NAME=TOP\nTOPE, S3\n*SOLID SECTION, ELSET=B, MATERIAL=M\n"
+               "*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n")
+
+
+def test_analytical_segments_exact_or_approximate():
+    straight = ANALYTIC_2D + ("*SURFACE, TYPE=SEGMENTS, NAME=TOOL\nSTART, 1.5, 1.\nLINE, 0., 1.\n"
+                              "*RIGID BODY, REF NODE=9, ANALYTICAL SURFACE=TOOL\n"
+                              "*SURFACE INTERACTION, NAME=I\n*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD\n"
+                              "*CONTACT PAIR, INTERACTION=I\nTOP, TOOL\n")
+    body, _, rep = convert_str(straight)
+    assert "meshed exactly" in rep.text() and "[APPROX]" not in rep.text()
+    g, types = _emitted(body)
+    (elset, face), = [(f[0].strip(), f[1].strip()) for f in _surface_lines(body, "TOOL")]
+    assert face == "S5" and len(g.elset(elset)) >= 2                # cut to the slave's size
+    for e in g.elset(elset):
+        assert abs(_outward(g, e, face)[1] + 1.0) < 1e-9            # n = e3 x s: -z towards TOP
+        assert all(abs(p[1] - 1.0) < 1e-12 for p in _face_points(g, e, face))
+    assert re.search(r"\*RIGID BODY, REF NODE=9, NSET=\S+, ROT NODE=\d+", body)
+    curved = straight.replace("START, 1.5, 1.\nLINE, 0., 1.", "START, 1.5, 2.5\nCIRCL, 0., 1., 0., 2.5")
+    body, _, rep = convert_str(curved)
+    assert "not converted" in rep.text() and "--approximate" in rep.text()
+    for kw in ("*SURFACE, TYPE=SEGMENTS", "*RIGID BODY", "*CONTACT PAIR"):
+        assert f"** {kw}" in body                                   # commented out, all three
+    body, _, rep = convert_str(curved, approximate=True)
+    msg = [m for _, m in rep.entries if m.startswith("[APPROX] Analytical rigid surface TOOL")]
+    assert msg and "degrees" in msg[0] and "chord sag" in msg[0]
+    g, _ = _emitted(body)
+    (elset, face), = [(f[0].strip(), f[1].strip()) for f in _surface_lines(body, "TOOL")]
+    for e in g.elset(elset):                                       # facet ends on the arc
+        for p in _face_points(g, e, face):
+            r = math.hypot(p[0], p[2])
+            assert abs(math.hypot(r, p[1] - 2.5) - 1.5) < 1e-9
+
+
+def test_analytical_cylinder_and_revolution_frames():
+    base = ("*NODE\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n"
+            "8,0.,1.,1.\n9,0.5,0.5,3.\n*ELEMENT, TYPE=C3D8, ELSET=B\n1,1,2,3,4,5,6,7,8\n"
+            "*SOLID SECTION, ELSET=B, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n")
+    # CYLINDER: point c lies on the NEGATIVE local z-axis, so with c = a - Y the local y is
+    # -Z and the profile's normal e3 x s (s = +x) points down
+    cyl = base + ("*SURFACE, TYPE=CYLINDER, NAME=TOOL\n0., 0., 1., 1., 0., 1.\n0., -1., 1.\n"
+                  "START, -0.5, 0.\nLINE, 1.5, 0.\n*RIGID BODY, REF NODE=9, ANALYTICAL SURFACE=TOOL\n")
+    body, _, rep = convert_str(cyl)
+    assert "meshed exactly" in rep.text()
+    g, _ = _emitted(body)
+    (elset, face), = [(f[0].strip(), f[1].strip()) for f in _surface_lines(body, "TOOL")]
+    ys = [p[1] for e in g.elset(elset) for p in _face_points(g, e, face)]
+    assert min(ys) < 0.0 and max(ys) > 1.0                         # spans the model along Y
+    for e in g.elset(elset):
+        assert abs(_outward(g, e, face)[2] + 1.0) < 1e-9
+        assert all(abs(p[2] - 1.0) < 1e-12 for p in _face_points(g, e, face))
+    # REVOLUTION about the axis a -> b: a cylinder r = 2 whose profile runs down (-z) has
+    # its normal outward (e3 x s, e3 = e_r x e_z), only under --approximate
+    rev = base + ("*SURFACE, TYPE=REVOLUTION, NAME=TOOL\n0.5, 0.5, 0., 0.5, 0.5, 1.\n"
+                  "START, 2., 1.\nLINE, 2., 0.\n*RIGID BODY, REF NODE=9, ANALYTICAL SURFACE=TOOL\n")
+    body, _, rep = convert_str(rev)
+    assert "not converted" in rep.text()
+    body, _, rep = convert_str(rev, approximate=True)
+    assert "circumference becomes" in rep.text()
+    g, _ = _emitted(body)
+    (elset, face), = [(f[0].strip(), f[1].strip()) for f in _surface_lines(body, "TOOL")]
+    for e in g.elset(elset):
+        p = _face_points(g, e, face)
+        c = [sum(q[k] for q in p) / len(p) for k in range(3)]
+        radial = A.vunit((c[0] - 0.5, c[1] - 0.5, 0.0))
+        assert A.vdot(_outward(g, e, face), radial) > 0.99
+
+
+def test_rotary_inertia_on_a_rigid_body_becomes_point_masses():
+    deck = RIGID_PLATE + ("*ELEMENT, TYPE=MASS, ELSET=PM\n10, 9\n*MASS, ELSET=PM\n6.\n"
+                          "*ELEMENT, TYPE=ROTARYI, ELSET=PI\n11, 9\n*ROTARY INERTIA, ELSET=PI\n"
+                          "1.5, 2., 1., 0., 0., 0.\n*STEP\n*FREQUENCY\n3\n*END STEP\n")
+    body, _, rep = convert_str(deck)
+    assert "ROTARYI" not in body.split("** ===")[-1] and "*ROTARY INERTIA" not in body
+    g = reparse(body)
+    masses = {}
+    for m in re.finditer(r"\*MASS, ELSET=(\S+)\n(\S+)\n", body):
+        for e in g.elset(m.group(1)):
+            masses[g.elements[e][1][0]] = masses.get(g.elements[e][1][0], 0.0) + float(m.group(2))
+    assert abs(sum(masses.values()) - 6.0) < 1e-9                  # the body's mass unchanged
+    c = g.nodes[9]
+    first = [sum(m * (g.nodes[n][k] - c[k]) for n, m in masses.items()) for k in range(3)]
+    assert max(abs(x) for x in first) < 1e-9                       # centre of mass unchanged
+    inertia = [[sum(m * ((A.vdot(A.vsub(g.nodes[n], c), A.vsub(g.nodes[n], c)) if i == j else 0.0)
+                         - (g.nodes[n][i] - c[i]) * (g.nodes[n][j] - c[j])) for n, m in masses.items())
+                for j in range(3)] for i in range(3)]
+    want = [[1.5, 0, 0], [0, 2.0, 0], [0, 0, 1.0]]
+    assert max(abs(inertia[i][j] - want[i][j]) for i in range(3) for j in range(3)) < 1e-9
+    m = re.search(r"\*RIGID BODY, REF NODE=9, NSET=([^,\s]+)", body)
+    assert set(masses) <= set(g.nset(m.group(1))) | {9}           # the star moves with the body
+    star = [e for e in g.elset(A.RIGID_SET) if g.elements[e][0] == "C3D4"]
+    assert len(star) == 4                                          # its nodes need an element
+    # a body of the deck's own elements (no rigid element) gets the same, and the material
+    body, _, _ = convert_str(HEX + "*NODE\n9, 0.5, 0.5, 2.\n*NSET, NSET=ALLN\n1, 2, 3, 4, 5, 6, 7, 8\n"
+                                   "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n"
+                                   "100., 0.3\n*RIGID BODY, REF NODE=9, TIE NSET=ALLN\n"
+                                   "*ELEMENT, TYPE=MASS, ELSET=PM\n10, 9\n*MASS, ELSET=PM\n2.\n"
+                                   "*ELEMENT, TYPE=ROTARYI, ELSET=PI\n11, 9\n*ROTARY INERTIA, ELSET=PI\n"
+                                   "1., 1., 1.\n*STEP\n*FREQUENCY\n2\n*END STEP\n")
+    assert "ROTARYI" not in body.split("** ===")[-1] and f"*MATERIAL, NAME={A.RIGID_SET}" in body
+    assert "*MASS, ELSET=ABQ2CCX_STAR" in body
+
+
+def test_tie_to_a_rigid_surface_makes_the_slave_nodes_members():
+    deck = (HEX + "*NODE\n11, 0.,0.,1.\n12, 1.,0.,1.\n13, 1.,1.,1.\n14, 0.,1.,1.\n9, 0.5,0.5,2.\n"
+            "*ELEMENT, TYPE=R3D4, ELSET=PLATE\n2, 11, 14, 13, 12\n*ELSET, ELSET=TOPE\n1\n"
+            "*SURFACE, NAME=TOP\nTOPE, S2\n*SURFACE, NAME=TOOL\nPLATE, SPOS\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*RIGID BODY, REF NODE=9, ELSET=PLATE\n*TIE, NAME=GLUE\nTOP, TOOL\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n*END STEP\n")
+    body, _, rep = convert_str(deck)
+    assert "*TIE" not in body.replace("** [abq2ccx] *TIE", "") and "join that rigid body" in rep.text()
+    m = re.search(r"\*RIGID BODY, REF NODE=9, NSET=([^,\s]+)", body)
+    assert {5, 6, 7, 8} <= set(reparse(body).nset(m.group(1)))
+
+
+def test_instanced_analytical_surface_moves_with_its_instance():
+    deck = ("*PART, NAME=TOOLP\n*SURFACE, TYPE=CYLINDER, NAME=FACE\nSTART, -1., 0.\nLINE, 1., 0.\n"
+            "*NODE\n1, 0., 0., 0.\n*NSET, NSET=RP\n1\n*RIGID BODY, REF NODE=RP, ANALYTICAL SURFACE=FACE\n"
+            "*END PART\n*PART, NAME=BLK\n" + HEX + "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*END PART\n"
+            "*ASSEMBLY, NAME=A\n*INSTANCE, NAME=T1, PART=TOOLP\n0., 0., 5.\n0., 0., 5., 1., 0., 5., 90.\n"
+            "*END INSTANCE\n*INSTANCE, NAME=B1, PART=BLK\n*END INSTANCE\n*END ASSEMBLY\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n")
+    blocks = A.flatten_assembly(A.read_blocks_text(deck) if hasattr(A, "read_blocks_text") else
+                                _blocks_of(deck), A.Report(), Opt())
+    surf = [b for b in blocks if b.keyword == "SURFACE" and (b.param("TYPE") or "").upper() == "CYLINDER"]
+    assert len(surf) == 1 and surf[0].param("NAME") != "FACE"
+    frame = A.analytic_profile(surf[0])[0]["frame"]
+    # part axes moved by the instance: a = (0,0,5); x stays x; the part's -z turns to +y
+    assert max(abs(x - y) for x, y in zip(frame[0], (0.0, 0.0, 5.0))) < 1e-9
+    assert max(abs(x - y) for x, y in zip(frame[1], (1.0, 0.0, 5.0))) < 1e-9
+    assert max(abs(x - y) for x, y in zip(frame[2], (0.0, 1.0, 5.0))) < 1e-9
+    rb = [b for b in blocks if b.keyword == "RIGID BODY"]
+    assert rb[0].param("ANALYTICAL SURFACE") == surf[0].param("NAME")
+
+
+def test_loads_on_rigid_elements():
+    deck = RIGID_PLATE.replace("*ELEMENT, TYPE=R3D3, ELSET=PLATE\n2, 2, 5, 3\n", "") + (
+        "*SURFACE, NAME=UP\nPLATE, SPOS\n*SURFACE, NAME=DOWN\nPLATE, SNEG\n*STEP\n*STATIC\n"
+        "*BOUNDARY\n9, 1, 6\n{}*END STEP\n")
+    # an element-based P pushes along the element normal (+z here): minus a pressure on the
+    # SPOS skin's face S2; a surface P pushes into its side's face
+    body, _, _ = convert_str(deck.format("*DLOAD\nPLATE, P, 10.\n"))
+    assert "*DLOAD\n1, P2, -10.\n" in body
+    body, _, _ = convert_str(deck.format("*DSLOAD\nUP, P, 10.\n"))
+    assert "*DLOAD\n1, P2, 10.\n" in body
+    body, _, _ = convert_str(deck.format("*DSLOAD\nDOWN, P, 10.\n"))
+    m = re.search(r"\*DLOAD\n(\d+), P1, 10\.\n", body)
+    assert m and int(m.group(1)) != 1                              # the SNEG skin, face S1
+    # a body force per volume would act on the skin's volume: commented out; gravity on
+    # rigid elements only: nothing (no mass in Abaqus/Standard)
+    body, _, rep = convert_str(deck.format("*DLOAD\nPLATE, BZ, 10.\n"))
+    assert "** PLATE, BZ, 10." in body and "\nPLATE, BZ" not in body
+    body, _, _ = convert_str(deck.format("*DLOAD\nPLATE, GRAV, 9.81, 0., 0., -1.\n"))
+    assert "-> no load: it acts only on rigid elements" in body
+
+
+def test_pressure_on_plane_rigid_segments_is_per_unit_depth():
+    # an R2D2 has no section thickness: Abaqus' P acts per unit depth, while its skin spans
+    # z = -T .. T (T the thickest section, 2 here), so the face pressure is P / (2 T)
+    deck = ("*NODE\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n11,1.5,1.\n12,-0.5,1.\n9,0.5,2.\n"
+            "*ELEMENT, TYPE=CPE4, ELSET=B\n1,1,2,3,4\n*ELEMENT, TYPE=R2D2, ELSET=R\n5,11,12\n"
+            "*SOLID SECTION, ELSET=B, MATERIAL=M\n2.\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*RIGID BODY, REF NODE=9, ELSET=R\n*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n"
+            "*DLOAD\nR, P, 1.\n*END STEP\n")
+    body, _, rep = convert_str(deck)
+    assert "*DLOAD\n5, P5, -0.25\n" in body and "per unit depth" in rep.text()
+    assert "Unknown element type R2D2" not in rep.text()
+
+
+def test_reference_node_on_a_facet_is_no_member():
+    # ccx's reaction at a reference node misses the body's share when a skin is attached to
+    # it: the skin gets a copy of the node, and the reference node is not in the body's set
+    body, _, _ = convert_str(RIGID_PLATE.replace("REF NODE=9", "REF NODE=1"))
+    g = reparse(body)
+    assert 1 not in g.elements[1][1]
+    m = re.search(r"\*RIGID BODY, REF NODE=1, NSET=([^,\s]+)", body)
+    members = set(g.nset(m.group(1)))
+    assert 1 not in members and {2, 3, 4} <= members
+    copy = [n for n in g.elements[1][1] if n not in (2, 3, 4) and g.nodes[n] == g.nodes[1]]
+    assert copy and copy[0] in members
+
+
+def test_instanced_rotary_inertia_turns_with_its_instance():
+    # without an ORIENTATION a part's rotary inertia is in the part's axes (Abaqus): an
+    # instance turned 90 degrees about z gives I' = R I R^T
+    deck = ("*PART, NAME=P\n*NODE\n1, 0., 0., 0.\n*ELEMENT, TYPE=ROTARYI, ELSET=RI\n1, 1\n"
+            "*ROTARY INERTIA, ELSET=RI\n1., 2., 3., 0.5, 0., 0.\n*END PART\n*ASSEMBLY, NAME=A\n"
+            "*INSTANCE, NAME=I1, PART=P\n0., 0., 0.\n0., 0., 0., 0., 0., 1., 90.\n*END INSTANCE\n"
+            "*END ASSEMBLY\n")
+    blocks = A.flatten_assembly(_blocks_of(deck), A.Report(), Opt())
+    card, = [b for b in blocks if b.keyword == "ROTARY INERTIA"]
+    vals = [float(x) for x in card.data[0].split(",")]
+    assert max(abs(x - y) for x, y in zip(vals, (2.0, 1.0, 3.0, -0.5, 0.0, 0.0))) < 1e-12
+
+
+def test_plane_rotary_inertia_uses_only_i33():
+    # Abaqus' 2-D input gives only I33 (", , I33"): the star lies in the plane, without the
+    # triangle-inequality refusal a 3-D tensor diag(0, 0, I33) would get
+    deck = ("*NODE\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n9,0.5,0.5\n*ELEMENT, TYPE=CPE4, ELSET=B\n"
+            "1,1,2,3,4\n*SOLID SECTION, ELSET=B, MATERIAL=M\n1.\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            "1000., 0.3\n*DENSITY\n1e-12\n*RIGID BODY, REF NODE=9, ELSET=B\n"
+            "*ELEMENT, TYPE=MASS, ELSET=MM\n20, 9\n*MASS, ELSET=MM\n2.\n"
+            "*ELEMENT, TYPE=ROTARYI, ELSET=RI\n21, 9\n*ROTARY INERTIA, ELSET=RI\n, , 0.25\n"
+            "*STEP\n*FREQUENCY\n2\n*END STEP\n")
+    body, _, rep = convert_str(deck)
+    assert "triangle inequality" not in rep.text() and "ROTARYI" not in body.split("** ===")[-1]
+    g = reparse(body)
+    masses = {}
+    for m in re.finditer(r"\*MASS, ELSET=(\S+)\n(\S+)\n", body):
+        for e in g.elset(m.group(1)):
+            masses[g.elements[e][1][0]] = masses.get(g.elements[e][1][0], 0.0) + float(m.group(2))
+    c = g.nodes[9]
+    assert all(abs(g.nodes[n][2]) < 1e-12 for n, m in masses.items() if m)       # in the plane
+    i33 = sum(m * ((g.nodes[n][0] - c[0]) ** 2 + (g.nodes[n][1] - c[1]) ** 2) for n, m in masses.items())
+    assert abs(i33 - 0.25) < 1e-12 and abs(sum(masses.values()) - 2.0) < 1e-12
+
+
+def test_axisymmetric_rotary_inertia_is_dropped_only_where_exact():
+    deck = ("*NODE\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n11,1.5,1.\n12,0.,1.\n9,0.5,2.\n"
+            "*ELEMENT, TYPE=CAX4, ELSET=B\n1,1,2,3,4\n*ELEMENT, TYPE=RAX2, ELSET=R\n5,11,12\n"
+            "*SOLID SECTION, ELSET=B, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*DENSITY\n1.\n*RIGID BODY, REF NODE=9, ELSET=R\n*ELEMENT, TYPE=MASS, ELSET=MM\n"
+            "20, 9\n*MASS, ELSET=MM\n2.\n*ELEMENT, TYPE=ROTARYI, ELSET=RI\n21, 9\n"
+            "*ROTARY INERTIA, ELSET=RI\n, , 0.25\n*STEP\n{}\n*END STEP\n")
+    body, _, rep = convert_str(deck.format("*STATIC"))            # no inertia acts: exact
+    assert "ROTARYI" not in body.split("** ===")[-1] and "no dynamic or frequency step" in rep.text()
+    body, _, rep = convert_str(deck.format("*FREQUENCY\n2"))
+    assert "ROTARYI" in body.split("** ===")[-1] and "not converted" in rep.text()
+    body, _, rep = convert_str(deck.format("*FREQUENCY\n2"), approximate=True)
+    assert "ROTARYI" not in body.split("** ===")[-1] and "[APPROX] ROTARYI" in rep.text()
+
+
+TIED_PLATE = (HEX + "*NODE\n11, 0.,0.,1.\n12, 1.,0.,1.\n13, 1.,1.,1.\n14, 0.,1.,1.\n9, 0.5,0.5,2.\n"
+              "*ELEMENT, TYPE=R3D4, ELSET=PLATE\n2, 11, 14, 13, 12\n*ELSET, ELSET=TOPE\n1\n"
+              "*SURFACE, NAME=TOP\nTOPE, S2\n*SURFACE, NAME=TOOL\nPLATE, SPOS\n"
+              "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+              "*RIGID BODY, REF NODE=9, ELSET=PLATE\n{}*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n*END STEP\n")
+
+
+def _body_members(body, ref=9):
+    m = re.search(rf"\*RIGID BODY, REF NODE={ref}, NSET=([^,\s]+)", body)
+    return set(reparse(body).nset(m.group(1)))
+
+
+def test_tied_contact_pair_to_a_rigid_surface_makes_the_slave_nodes_members():
+    body, _, rep = convert_str(TIED_PLATE.format("*SURFACE INTERACTION, NAME=G\n"
+                                                 "*CONTACT PAIR, INTERACTION=G, TIED\nTOP, TOOL\n"))
+    assert "*TIE" not in body and "*CONTACT PAIR" not in body.replace("** [abq2ccx] *CONTACT PAIR", "")
+    assert {5, 6, 7, 8} <= _body_members(body) and "join that rigid body" in rep.text()
+
+
+def test_tie_to_a_rigid_surface_follows_abaqus_tolerances():
+    # Abaqus' default position tolerance: 10 % of the typical master facet diagonal (sqrt 2
+    # here) surface-to-surface, 5 % node-to-surface; a node 0.1 below the plate is tied by
+    # the first and moved onto it, left alone by the second
+    low = TIED_PLATE.replace("7, 1.,1.,1.", "7, 1.,1.,0.9")
+    body, conv, _ = convert_str(low.format("*TIE, NAME=GLUE\nTOP, TOOL\n"))
+    assert 7 in _body_members(body) and abs(conv.geom.nodes[7][2] - 1.0) < 1e-12
+    body, conv, rep = convert_str(low.format("*TIE, NAME=GLUE, TYPE=NODE TO SURFACE\nTOP, TOOL\n"))
+    assert 7 not in _body_members(body) and {5, 6, 8} <= _body_members(body)
+    assert abs(conv.geom.nodes[7][2] - 0.9) < 1e-12 and "left untied, as Abaqus" in rep.text()
+    # TIED NSET: exactly those nodes, whatever their distance
+    body, _, _ = convert_str(low.format("*NSET, NSET=TN\n5, 7\n*TIE, NAME=GLUE, TIED NSET=TN, "
+                                        "TYPE=NODE TO SURFACE\nTOP, TOOL\n"))
+    assert {5, 7} <= _body_members(body) and not {6, 8} & _body_members(body)
+    # a slave shell keeps its half thickness to the master (just touching), unless NO THICKNESS
+    shell = ("*NODE\n1,0.,0.,0.85\n2,1.,0.,0.85\n3,1.,1.,0.85\n4,0.,1.,0.85\n"
+             "*ELEMENT, TYPE=S4, ELSET=SH\n1, 1, 2, 3, 4\n*SURFACE, NAME=TOP\nSH, SPOS\n"
+             "*SHELL SECTION, ELSET=SH, MATERIAL=M\n0.2\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+             "*NODE\n11, 0.,0.,1.\n12, 1.,0.,1.\n13, 1.,1.,1.\n14, 0.,1.,1.\n9, 0.5,0.5,2.\n"
+             "*ELEMENT, TYPE=R3D4, ELSET=PLATE\n2, 11, 14, 13, 12\n*SURFACE, NAME=TOOL\nPLATE, SPOS\n"
+             "*RIGID BODY, REF NODE=9, ELSET=PLATE\n*TIE, NAME=GLUE{}\nTOP, TOOL\n"
+             "*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n*END STEP\n")
+    body, conv, _ = convert_str(shell.format(""))
+    assert {1, 2, 3, 4} <= _body_members(body)
+    assert all(abs(conv.geom.nodes[n][2] - 0.9) < 1e-12 for n in (1, 2, 3, 4))
+    body, conv, _ = convert_str(shell.format(", NO THICKNESS"))      # 0.15 > 0.1 sqrt 2
+    assert not {1, 2, 3, 4} & _body_members(body)
+    body, conv, _ = convert_str(shell.format(", NO THICKNESS, POSITION TOLERANCE=0.2"))
+    assert {1, 2, 3, 4} <= _body_members(body)
+    assert all(abs(conv.geom.nodes[n][2] - 1.0) < 1e-12 for n in (1, 2, 3, 4))
+
+
+def test_unconverted_analytical_surface_comments_only_its_lines():
+    deck = (ANALYTIC_2D + "*NODE\n11, 1.5, 1.\n12, 0., 1.\n8, 0., 5.\n"
+            "*ELEMENT, TYPE=RAX2, ELSET=R\n5, 11, 12\n*SURFACE, NAME=FLAT\nR, SPOS\n"
+            "*RIGID BODY, REF NODE=8, ELSET=R\n"
+            "*SURFACE, TYPE=SEGMENTS, NAME=TOOL\nSTART, 1.5, 2.5\nCIRCL, 0., 1., 0., 2.5\n"
+            "*RIGID BODY, REF NODE=9, ANALYTICAL SURFACE=TOOL\n*SURFACE INTERACTION, NAME=I\n"
+            "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD\n*CONTACT PAIR, INTERACTION=I\n"
+            "TOP, TOOL\nTOP, FLAT\n")
+    body, _, rep = convert_str(deck)
+    assert "\nTOP, FLAT\n" in body and "\n** TOP, TOOL\n" in body and "\nTOP, TOOL\n" not in body
+    assert "other lines are kept" in rep.text()
+
+
+def test_explicit_plane_contact_with_a_rigid_surface_caps_the_increment():
+    # ccx leaves contact between a plane model's expanded nodes and a rigid surface out of
+    # its stable increment; the cap is ccx's contact formula: 0.8 critom / 2 sqrt(m / (K A))
+    import validate_with_ccx as V
+    def explicit(dim):
+        d = V.rigid_punch_deck(dim, "elements", ctype="NODE TO SURFACE")
+        return d.replace("*ELASTIC\n1000., 0.3", "*ELASTIC\n1000., 0.3\n*DENSITY\n1e-3").replace(
+            "*STATIC\n1., 1.", "*DYNAMIC, EXPLICIT\n, 0.002")
+    body, _, rep = convert_str(explicit("planar"))
+    critom = 1.96 / math.sqrt(1.0 + 0.05 * (1.0 - 0.05 * 1.95))
+    want = 0.8 * critom * 0.5 * math.sqrt(0.5 * 1e-3 * 0.0625 / (50 * 1000.0 * 0.25))
+    line = body.split("*DYNAMIC, EXPLICIT")[1].splitlines()[1]
+    assert abs(float(line.split(",")[3]) / want - 1) < 5e-3 and "rigid surface (4th data field" in rep.text()
+    body, _, _ = convert_str(explicit("3d"))                       # ccx sizes 3-D contact itself
+    assert body.split("*DYNAMIC, EXPLICIT")[1].splitlines()[1].strip() == ", 0.002"
+
+
+def test_rigid_examples_match_the_validation_decks():
+    import validate_with_ccx as V
+    for name, text in (("rigid_punch_block", V.rigid_punch_deck("3d", "elements")),
+                       ("rigid_punch_cylinder", V.rigid_punch_deck("3d", "analytic")),
+                       ("rigid_body_inertia", V.rigid_inertia_deck())):
+        path = os.path.join(EXAMPLES, name + ".inp")
+        with open(path) as fh:
+            assert fh.read() == text, f"examples/{name}.inp differs from validate_with_ccx.py's deck"
+        body, _, _ = convert(path)
+        g = reparse(body)
+        assert all(n in g.nodes for _, conn in g.elements.values() for n in conn)
+        assert all(i in g.nodes for ids in g.nsets.values() for i in ids)
+        assert all(i in g.elements for ids in g.elsets.values() for i in ids)
+
+
+def _blocks_of(text):
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w") as fh:
+            fh.write(text)
+        return A.read_blocks(path, A.Report())
+    finally:
+        os.unlink(path)
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

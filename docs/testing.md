@@ -29,12 +29,13 @@ They cover:
 * **Elements and sections** — substitutions (the suite enforces that each keeps the node
   count) and which of them are exact, `CPS4I`/`CPE4I` as `C3D8I` slabs and when they fall
   back, beam upgrades for circular, pipe and box sections, the planar constraint, surface
-  elements, composite and continuum shells, `*SECTION CONTROLS`.
+  elements, composite and continuum shells, `*SECTION CONTROLS`, rigid elements and analytical
+  rigid surfaces (skins, normals, facets), rotary inertia.
 * **Materials** — elastic types (an E-only line, cohesive traction elasticity), the
   expansion rewrites, plasticity forms, `*DAMAGE INITIATION` (the Johnson-Cook form ccx
   reads, other criteria commented), field dependencies, creep, `*DEPVAR`.
 * **Constraints** — `*MPC`, couplings and rigid bodies, knot beams, overconstraint
-  settling, connectors, `*TRANSFORM`s.
+  settling, connectors, `*TRANSFORM`s, ties to rigid surfaces.
 * **Loads, BCs and steps** — consistent nodal forces, the load audit, surface-element
   loads, shell and membrane pressure on `SPOS`/`SNEG` sides, velocity and acceleration BCs,
   the default amplitude of displacement BCs, BCs on DOFs a node does not have, `OP=NEW`, `*BUCKLE` load cases, temperatures, the masses of
@@ -97,6 +98,13 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `kinematic_all_dofs` | a bare `*KINEMATIC` (all DOFs) on a solid face under a force and two moments | the face under `*RIGID BODY` | exact |
 | `assembly_rotated_instances` | a turned instance with an oriented orthotropic material, instance-qualified loads, a surface pressure | the same model written flat by hand | exact (coordinates and displacements) |
 | `damage_johnson_cook_cubes` | a Johnson-Cook `*DAMAGE INITIATION`: ccx's indicator `DUCT` (from `JCCRT`) in uniaxial tension; the run with the card against the run without | PEEQ / (d1 + d2 e^(−d3/3)); identical results | 5e-7; exact |
+| `rigid_punch_block`, `rigid_punch_cylinder`, and generated plane and axisymmetric twins | a rigid flat punch of `R3D4`, `R2D2` or `RAX2` elements, or the same face as a `CYLINDER` / `SEGMENTS` analytical surface | ccx's penalty law A d / (L/E′ + 1/K); the punch given its motion node by node | 2e-7; ≤ 1e-14 |
+| the same punches turned under NLGEOM (0.05 rad; plane 0.03 rad) | rigid skins and analytical surfaces | the punch given the exact motion | ≤ 8e-7 of \|u\| |
+| a block tied to a turning rigid plate (`R3D4`, `CYLINDER`) | a `*TIE` to a rigid surface, NLGEOM | its top given the exact motion | 1.8e-7 (ccx's own tie: 1.3e-2) |
+| `rigid_body_inertia` | `MASS` + `ROTARYI` of an `R3D4` plate on springs | its translation and rotation frequencies | 1.9e-7 |
+| a faceted analytical sphere (`--approximate`) | the indentation force on a block | Hertz | 2.3 % (finite block, penalty contact) |
+| the plane punch in explicit dynamics | `R2D2` skins at the increment the converter caps (ccx leaves this contact out of its estimate) | the punch given its motion node by node at that increment | exact |
+| a rigid `R2D2` segment and an `R3D4` facet on a spring | an element pressure `P` (on the `R2D2`: per unit depth) | p / k | exact |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`
@@ -144,14 +152,14 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1022 decks convert with no dangling
-reference. 205 are gated `expect_solve`: **165 solve the deck's own physics**; 14 are
+reference. 206 are gated `expect_solve`: **165 solve the deck's own physics**; 14 are
 `source_unloaded`, one is `solver_differs` (a snap-fit insert that only contact holds drifts
-out of its buckle) and 28 (3 of them also unloaded) are `reduced_physics` — concrete damaged
+out of its buckle) and 29 (3 of them also unloaded) are `reduced_physics` — concrete damaged
 plasticity (2), UHARD / VUHARD hardening (4), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
-`B32` (3), general contact (1), a dropped `*IMPERFECTION` (1). 219 mesh-only decks are
-accepted. The other 598 stop first on, or (the last row) run without, what they need:
+`B32` (3), general contact (2), a dropped `*IMPERFECTION` (1). 221 mesh-only decks are
+accepted. The other 595 stop first on, or (the last row) run without, what they need:
 
 | Decks | First blocker |
 | ---: | --- |
@@ -162,7 +170,7 @@ accepted. The other 598 stop first on, or (the last row) run without, what they 
 | 26 | no convergence or divergence (18), or more than the gate's 300 s (8) |
 | 16 | NLGEOM follower tractions (they convert with `--approximate`) |
 | 15 | other ccx errors, one or a few decks each |
-| 30 | an element type, beam section, user subroutine or physics ccx lacks (rigid, piezoelectric, infinite elements; I and general beam sections; cohesive, acoustic, pore-pressure models; composites on `S4R`) |
+| 27 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections; cohesive, acoustic, pore-pressure models; composites on `S4R`) |
 | 8 | Abaqus general contact (7) or an XFEM crack (1): ccx has neither, and the converted deck runs without it — not the deck's physics, so not gated |
 
 Every one of them was checked to fail no worse than the original, unconverted deck. Fixing

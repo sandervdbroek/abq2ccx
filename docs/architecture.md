@@ -28,6 +28,9 @@ Converter._drop_surface_elements()   surface elements (SFM*) leave the registry;
 Converter._plan_incompatible_slabs()   CPS4I / CPE4I -> C3D8I slabs (top nodes, *EQUATION
                                        ties, held DOF 3, plane-stress ORTHO material) where
                                        exact; otherwise CPS4 / CPE4 as reduced physics
+Converter._plan_rigid()   rigid elements -> skin solids of their rigid body, analytical
+                          surfaces meshed into skins, *RIGID BODY cards -> TIE NSETs, ties to
+                          rigid surfaces -> body members, ROTARYI -> point masses
         │
         ▼
 Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANSFORM of each
@@ -240,6 +243,35 @@ so the converter does it in three places, each exact:
   DOF must keep a nonzero reduced coefficient, so no loop of ties reaches ccx (which would
   hold it at zero). Converter rotation ties that find no free DOF are dropped; anything else
   left over is kept and warned.
+
+## Rigid elements and analytical rigid surfaces
+
+ccx has no rigid element and no analytical surface, and its `*RIGID BODY` refuses shell and
+beam nodes, so `_plan_rigid()` — right after `_drop_surface_elements`, before the other
+planners, which then see an ordinary mesh and ordinary rigid bodies — turns each rigid
+element into a force-free solid *skin* (`_plan_skin_elements`: `R3D3`/`R3D4` → `C3D6`/`C3D8`
+behind the facet, `R2D2`/`RB2D2`/`RAX2` → `C3D8` across ccx's expansion of the 2-D model via
+`skin_lift`; `RB3D2` → its nodes only), keyed in `_skins` by (element, side) → (skin, face).
+The deck's `*SURFACE` records that name rigid elements get element sets of the skins and
+their faces (`_rigid_lines`, used by `handle_surface`). Analytical surfaces
+(`_mesh_analytic`: `analytic_profile` reads the card, `profile_points` cuts the profile into
+facets about the slave faces' size from `_analytic_size`, `analytic_frame` gives the
+`CYLINDER`/`REVOLUTION` axes) become skins too (`_analytic`), unless they would need
+`--approximate` (`_analytic_skipped`: their `*SURFACE`, `*RIGID BODY`, pairs and ties are
+commented out). `_plan_rigid_ties` makes the slave nodes of a `*TIE` to a rigid surface body
+members (`_tie_to_rigid`), and `_rewrite_rigid_bodies` gives every touched `*RIGID BODY` a
+`TIE NSET` (and `PIN NSET`) of all its nodes, in place, so `_rigid_body_members()` and the
+knot, coupled-BC and output planners read the full body. `_plan_rotary_stars` replaces
+`ROTARYI` elements by `inertia_star()` point masses; `_plan_skin_material` sizes the skin
+material, which `_rigid_model_cards()` writes after the deck's materials, just before the
+first `*STEP`. After `_prescan` (which adds the ROT NODEs) `_plan_rigid_planar_holds()`
+writes the model-data BCs that keep plane and axisymmetric bodies in their plane;
+`handle_boundary` repeats them after `OP=NEW`. In assemblies, `_place_analytic` gives a
+part's analytical surface its instance's frame. `_plan_rigid_contact_increment` (after
+`_plan_circ_explicit_increment`) sizes the explicit-step cap for contact of plane and
+axisymmetric elements with a rigid surface, which ccx leaves out of its stable increment;
+`_explicit_caps` gives both caps to `_circ_explicit_increment` (the `*DYNAMIC` data line) and
+to the output planner (`_circ_capped_max`).
 
 ## Velocity and acceleration boundary conditions
 

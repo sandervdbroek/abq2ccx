@@ -50,6 +50,13 @@ a different model without saying so. With it, these reframings are made, each wi
 * surface tractions under NLGEOM that follow the surface or act per current area, and beam
   line loads under NLGEOM → fixed nodal forces;
 * surface elements that carry mass or rebar → left out of the mesh;
+* curved analytical rigid surfaces (`CIRCL` and `PARAB` profiles, `TYPE=REVOLUTION`,
+  `FILLET RADIUS`) → flat facets about the slave faces' size (the warning gives their chord
+  angle and sag);
+* rigid elements of an Abaqus/Explicit `*RIGID BODY` with `DENSITY` and a thickness → skins
+  without that mass;
+* `ROTARYI` on an axisymmetric rigid body in a deck with a dynamic or frequency step →
+  dropped;
 * a `*BOUNDARY` on DOFs that a kinematic coupling or `*MPC` eliminates → dropped, as
   Abaqus/Standard ignores it; identical BCs on `*RIGID BODY` nodes → moved to the reference
   node even where that holds the body more than the BCs did;
@@ -87,7 +94,8 @@ Messages are de-duplicated. A clean conversion says *"No conversion issues were 
 | `Reduced physics — ccx solves a different model than this Abaqus deck: …` | the last warning, naming what the conversion dropped or replaced (a material behaviour, an element formulation, a constraint, a load, …); ccx runs, but its results are not the deck's own solution — remodel what the warnings above name |
 | `Element X -> Y: the same solution — …` | an exact node-count-preserving swap (a note); nothing to do |
 | `Element X -> Y: ccx has no X, and Y is a different element formulation …` | a stand-in with other physics (reduced physics); check that Y suits your problem |
-| `… has NO CalculiX equivalent … emitted unchanged` | a cohesive, gasket or rigid element; the deck won't run until it is remodelled |
+| `… has NO CalculiX equivalent … emitted unchanged` | a cohesive or gasket element, or a `ROTARYI` that is not on a rigid body; the deck won't run until it is remodelled |
+| `Analytical rigid surface … not converted` | it would only be facets (or has no rigid body): it, its rigid body and its contact pairs and ties are commented out; `--approximate` meshes it |
 | `*KEYWORD … emitted as a comment` | no equivalent; the original is kept as `**` comments for you to edit |
 | `Step N is loaded in the Abaqus deck …, but no load survives the conversion` | every load of that step was commented out; ccx would solve it with no load — see the step's other warnings |
 | `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` on a DOF that an `*EQUATION`, `*MPC` or rigid body eliminates, which the converter could not resolve exactly; ccx will stop. The message says what Abaqus does and whether `--approximate` resolves it |
@@ -111,6 +119,8 @@ Everything the converter creates starts with `ABQ2CCX_`:
 | `ABQ2CCX_KNOT` | the force-free *knot beams* on shell and beam nodes that carry rigid couplings or rotational BCs; ignore them in the results |
 | `ABQ2CCX_PLANAR` | the nodes of a planar model held in its plane |
 | `ABQ2CCX_SLAB` | the nodes of `CPS4I`/`CPE4I` elements written as one-element-thick `C3D8I` slabs, held in DOF 3; a plane-stress slab's material is `<material>_PLANE_STRESS` |
+| `ABQ2CCX_RIGID` | the force-free skin elements, and their material, that stand for rigid elements and meshed analytical surfaces; ignore them in the results |
+| `ABQ2CCX_RS*`, `ABQ2CCX_AS*`, `ABQ2CCX_STAR*` | the skins a surface uses, a meshed analytical surface, and the point masses of a rigid body's rotary inertia |
 | `ABQ2CCX_RB*`, `ABQ2CCX_MPCB*`, `ABQ2CCX_KC*`, `ABQ2CCX_TIED*` | node sets and surfaces of rigid bodies, `*MPC BEAM` bodies, kinematic couplings and tied contact pairs |
 | `ABQ2CCX_BC*` | node subsets of a BC card that the converter partly moved or removed |
 | `ABQ2CCX_TR*`, `ABQ2CCX_OR*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles) |
@@ -148,10 +158,11 @@ share.
 Static, frequency, buckling, implicit and explicit dynamic, steady-state dynamic, heat
 transfer and coupled temperature–displacement analyses of solids, shells and beams are well
 covered, with the common materials, orientations and composite layups, sets, surfaces, BCs,
-loads, ties, equations, couplings, rigid bodies and connectors without a behaviour. Contact
-is translated card by card, but ccx's penalty contact behaves differently — check it. User
-subroutines, connector behaviours, gaskets, inertia relief, Riks and some specialised
-materials and procedures have no equivalent and are flagged for manual work.
+loads, ties, equations, couplings, rigid bodies, rigid elements and analytical rigid
+surfaces, and connectors without a behaviour. Contact is translated card by card, but ccx's
+penalty contact behaves differently — check it. User subroutines, connector behaviours,
+gaskets, inertia relief, Riks and some specialised materials and procedures have no
+equivalent and are flagged for manual work.
 
 The generated references list every case: [keywords](keyword-reference.md),
 [elements](element-reference.md), [output variables](output-reference.md).
