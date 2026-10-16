@@ -23,6 +23,10 @@ Converter._check_overconstraints()   pre-flight warning for BC-on-dependent-DOF
         ▼
 emit_geometry()  +  emit_other()     Pass B: write nodes/elements/sets from the registry,
                                              then translate the remaining blocks in order
+        │
+        ▼
+Converter._audit_loads()     load audit: step_load_audit() on the Abaqus blocks and on the
+                             output; a step loaded there but not here is warned
 ```
 
 `Converter.convert(blocks)` runs the whole thing and returns the output as a
@@ -62,6 +66,29 @@ which keeps the deck faithful to what the author wrote.
    comments plus a warning (with tailored text from `SPECIAL_UNSUPPORTED` if present).
 
 This is the "support as many as possible, convert or flag the rest" policy in code.
+
+## Loads ccx has no card for
+
+Surface tractions (`TRVEC`/`TRSHR` on `*DSLOAD` or element-based `*DLOAD`) and beam line
+loads (`*DLOAD PX/PY/PZ/P1/P2`) become **consistent nodal forces**. `_load_faces` /
+`_beam_lines` resolve the faces, edges or beams (corner nodes first, the plane-section
+thickness or the axisymmetric flag, beam n1); `consistent_nodal_forces()` integrates the
+shape functions by Gauss quadrature over each one in its undeformed geometry; and
+`_to_nodal_forces` records the result per (card, target, label) in `_nodal_loads`, in
+Abaqus semantics (a later step replaces a load, `OP=NEW` drops the card's earlier ones).
+At the end of every step `_flush_nodal_loads` writes one `*CLOAD` per amplitude with the
+node DOFs whose total changed (0 where a load went away) — never `OP=NEW`, which in ccx
+would also remove the deck's own concentrated loads. `_nodal_load_inexact` decides whether
+nodal forces are exact (small strain; NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT
+RESULTANT=YES`); otherwise the line stays commented unless `--approximate`.
+`_dl_state` / `_flush_dloads` do the same bookkeeping for the `*DLOAD` lines that come from
+`*DLOAD` and from `*DSLOAD`, whose `OP=NEW` scopes differ in Abaqus but not in ccx.
+
+The **load audit** (`step_load_audit`) lists the loads active in every step — loads and
+prescribed BC values persist until `OP=NEW`, a perturbation step counts only its own, user
+subroutine magnitudes count in the Abaqus deck but not in ccx's (its stock subroutine would
+run). `_audit_loads` compares the two and fills `unloaded_steps` / `source_unloaded`, which
+`tests/test_corpus.py` gates on.
 
 ## Element handling
 
@@ -137,9 +164,10 @@ python validate_with_ccx.py     # converts + runs the examples in CalculiX
 ```
 
 It auto-detects `ccx` (including FreeCAD's bundled binary), runs the example decks, and
-checks the NAFEMS LE10 benchmark stress against the published reference and the tip
-deflections of circular-, pipe- and box-section cantilevers against beam theory. It skips
-cleanly if no `ccx` is found.
+checks the NAFEMS LE10 benchmark stress against the published reference, the tip
+deflections of circular-, pipe- and box-section cantilevers against beam theory, and the
+loads applied as consistent nodal forces (Cook's membrane, beam line loads, Lamé's
+cylinder). It skips cleanly if no `ccx` is found.
 
 There is also a **corpus** of 1022 genuine Abaqus decks (`corpus/manifest.py`) fetched on
 demand and tested end-to-end:
@@ -149,8 +177,9 @@ python corpus/fetch.py          # download to corpus/files/ (gitignored)
 python tests/test_corpus.py     # convert all + (if ccx) solve the ones expected to
 ```
 
-`tests/test_corpus.py` asserts every deck converts with zero dangling references, and
-that decks marked `expect_solve` actually solve in ccx (clean exit, no crash, an
-analysis step runs) while mesh-only `parse_only` decks are accepted. To add a deck, append an entry
+`tests/test_corpus.py` asserts every deck converts with zero dangling references, that
+decks marked `expect_solve` keep a load in every step their Abaqus deck loads (the load
+audit) and actually solve in ccx (clean exit, no crash, an analysis step runs), while
+mesh-only `parse_only` decks are accepted. To add a deck, append an entry
 to `corpus/manifest.py`. The complete test suite — unit, end-to-end, and corpus, with a
 description of each test — is documented in [testing.md](testing.md).

@@ -1,0 +1,43 @@
+*HEADING
+Cook's membrane: tapered panel clamped on its left edge, a uniform shear traction on
+its right edge (*DSLOAD TRVEC, total load 1). Plane stress, E = 1, nu = 1/3,
+thickness 1, 16 x 16 CPS8. Reference: the vertical displacement of the midpoint
+C = (48, 52) of the loaded edge is 23.96 (Bergan & Felippa, CMAME 50, 1985).
+** node (i, j) = 1 + j + 100 i: i = 0..32 across the panel, j = 0..32 up it
+*NODE
+1, 0., 0.
+33, 0., 44.
+3201, 48., 44.
+3233, 48., 60.
+*NGEN, NSET=LEFT
+1, 33, 1
+*NGEN, NSET=RIGHT
+3201, 3233, 1
+*NFILL
+LEFT, RIGHT, 32, 100
+*NSET, NSET=C
+3217
+*ELEMENT, TYPE=CPS8, ELSET=PANEL
+1, 1, 201, 203, 3, 101, 202, 103, 2
+*ELGEN, ELSET=PANEL
+1, 16, 200, 1, 16, 2, 16
+*ELSET, ELSET=RIGHT_EDGE, GENERATE
+16, 256, 16
+*SURFACE, TYPE=ELEMENT, NAME=LOADED
+RIGHT_EDGE, S2
+*MATERIAL, NAME=UNIT
+*ELASTIC
+1., 0.333333333333
+*SOLID SECTION, ELSET=PANEL, MATERIAL=UNIT
+1.
+*BOUNDARY
+LEFT, 1, 2
+*STEP
+*STATIC
+*DSLOAD
+LOADED, TRVEC, 0.0625, 0., 1., 0.
+*NODE PRINT, NSET=C
+U
+*NODE PRINT, NSET=LEFT, TOTALS=ONLY
+RF
+*END STEP

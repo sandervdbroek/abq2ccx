@@ -20,6 +20,10 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **A keyword line ending in a comma continues its *parameters* on the next line** | splice them back; never merge a genuine data row | Abaqus input syntax: "continue a long keyword line by ending it with a comma" |
 | **`NSET=` on `*NODE`, `ELSET=` on `*ELEMENT`, `GENERATE` on `*NSET`/`*ELSET`** are accepted | relied upon when emitting geometry | ccx `*NODE`/`*ELEMENT`/`*NSET`/`*ELSET` sections |
 | **`*EQUATION`/`*MPC` dependent DOF can't also be an SPC** | pre-flight overconstraint warning | ccx `*EQUATION` section; the `cascade` error on the forums |
+| **ccx has no surface-traction load** (no `TRVEC`/`TRSHR` labels) **and reads `P1`/`P2` on a beam as a pressure on its expanded section face** | tractions and beam line loads become consistent nodal forces (`*CLOAD`) | no traction label in the 2.23 binary; probed: `P1` on a 1 × 2 `RECT` cantilever deflects 2× beam theory (pressure × section width) |
+| **A `*CLOAD` on a `CPS`/`CPE` node is the total for the section thickness; on a `CAX` node the total over 2π**, as in Abaqus | traction forces are scaled by the thickness / integrated over the full circle | probed on 2.23: each matches a pressure-loaded twin |
+| **`*CLOAD`s on one node DOF (and `*DLOAD`s on one face) add within a step and replace across steps; `OP=NEW` removes only earlier steps' loads** | converted forces are re-emitted as totals, never with `OP=NEW`; ccx's `*DLOAD, OP=NEW` removes the `*DSLOAD` pressures Abaqus keeps, so those are given again | probed on 2.23 |
+| **Abaqus tractions: `FOLLOWER=YES` and `CONSTANT RESULTANT=NO` by default; `FOLLOWER` does not apply to `TRSHR`, whose direction is projected onto the surface in the reference configuration** | nodal forces (fixed in ccx) are exact under NLGEOM only for `TRVEC` with `FOLLOWER=NO, CONSTANT RESULTANT=YES` | Abaqus Keywords manual (`*DSLOAD`, `*DLOAD`) and Analysis User's Guide (distributed loads) |
 
 ## Version notes
 
@@ -56,13 +60,17 @@ line with the element type and mesh density). A cantilever on linear beams with 
 circular section matches beam theory's tip deflection within 0.4 %, pipe- and
 box-section cantilevers match it within 0.6 %, a shell plate whose edge is rigidly coupled
 to a loaded reference point matches the same plate built from solids under `*RIGID BODY`
-within 0.001 %, and the composite-shell and assembly decks also solve. This proves the
+within 0.001 %, Cook's membrane under a shear traction matches the published 23.96 within
+0.12 %, cantilevers under beam line loads match q L⁴/(8 E I) within 1.2 %, an axisymmetric
+cylinder under a radial traction matches Lamé within 0.02 %, and the composite-shell and
+assembly decks also solve. This proves the
 full pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face,
 sections — is correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
-220 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
+188 solve in CalculiX under their own loads (14 more solve but load nothing in the source
+deck) and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
 convert cleanly but use features ccx cannot run, and each was verified to fail no worse
 than the original unconverted deck. Bulk-running every deck
 through convert → integrity → ccx is also what drove several converter fixes

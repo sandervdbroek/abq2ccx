@@ -60,7 +60,8 @@ FreeCAD-bundled copy, Homebrew/MacPorts) — or point at one with `--ccx`/`$CCX`
 **`--approximate` mode** reframes constructs CalculiX cannot run as *approximately
 equivalent* ones it can, each flagged with a loud `[APPROX]` warning: `*STATIC, RIKS` →
 plain `*STATIC`, incompressible `ν ≥ 0.5` → `0.475`, `*BEAM SECTION, SECTION=I` → the
-RECT with equal area + strong-axis inertia. Off by default — nothing changes silently: a
+RECT with equal area + strong-axis inertia, an NLGEOM surface traction that follows the
+deforming surface (or acts per current area) → fixed nodal forces. Off by default — nothing changes silently: a
 Riks step is then commented out, because ccx would otherwise run it as an ordinary
 load-controlled static step without saying so. (`*DYNAMIC, EXPLICIT` needs no reframing:
 ccx integrates explicitly itself, and the converter adds the Abaqus/Explicit defaults ccx
@@ -95,6 +96,12 @@ PASS  beam_circ_cantilever (B31 + CIRC): tip deflection = -4.2290 (beam theory -
 PASS  beam_pipe_box_cantilever (PIPE31 + PIPE): tip deflection y = -7.1490 (beam theory -7.1886, 0.6% diff)
 PASS  beam_pipe_box_cantilever (B32 + BOX): tip deflection y = -1.7898 (beam theory -1.7887, 0.1% diff), z = -4.5091 (beam theory -4.5265, 0.4% diff)
 PASS  coupling_shell_plate (rigid coupling on S8R nodes): RP displacement (-0.1025, +0.0191, +1.7152) vs the solid *Rigid Body (-0.1025, +0.0191, +1.7152), 0.001% of |u|
+PASS  cook_membrane_traction (TRVEC on CPS8 edges): v_C = 23.932 (reference 23.96, 0.12% diff)
+PASS  beam_line_load_cantilever (A): applied -1 (q L = -1), tip deflection -0.001173 (beam theory -0.001172, 0.1% diff)
+PASS  beam_line_load_cantilever (B): applied +1 (q L = +1), tip deflection +0.001158 (beam theory +0.001172, 1.2% diff)
+PASS  beam_line_load_cantilever (C): applied -0.1 (q L = -0.1), tip deflection -0.001583 (beam theory -0.001592, 0.6% diff)
+PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(10) = 0.019667 (Lame 0.019667, 0.00% diff)
+PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(20) = 0.013331 (Lame 0.013333, 0.02% diff)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -113,7 +120,12 @@ misread box dimension would miss beam theory by 18 % or more. The fourth couples
 plate's edge rigidly to an offset reference point that carries a force and a moment (a
 coupling ccx 2.23 rejects on shell nodes without the converter's knot beams) and compares
 the reference point's displacement with the same plate built from `C3D20R` bricks under
-`*RIGID BODY`.
+`*RIGID BODY`. The last three check loads ccx has no card for, which the converter applies
+as consistent nodal forces: a shear traction (`*DSLOAD TRVEC`) on Cook's membrane against
+the published displacement of its loaded edge (23.96, Bergan & Felippa 1985); uniform line
+loads (`*DLOAD PY`, local `P2`, `PZ`) on three cantilevers — `B31`, `B32` and a circular
+`B31` run as `B32` — against q L⁴/(8 E I), with the applied resultants checked against q L;
+and a radial traction on an axisymmetric thick cylinder against Lamé's solution.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -137,12 +149,15 @@ python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
 Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
-references; 220 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
-crash, and runs an analysis step), and **219 mesh-only decks** — no `*STEP`, so nothing to
-solve — are **accepted** by ccx. The other 583 convert cleanly but use features ccx cannot
-run (user elements, UMAT/VUMAT and other user subroutines, Riks, cohesive/connector
-elements, piezoelectric/acoustic coupling) or are CAE part fragments / incomplete or
-invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
+references; 188 solve in CalculiX under their own loads** (ccx exits 0, prints "Job
+finished" with no `*ERROR` or crash, and runs an analysis step — and every step the
+Abaqus deck loads still carries a load after conversion), and **219 mesh-only decks** — no
+`*STEP`, so nothing to solve — are **accepted** by ccx. 14 more solve but apply no load in
+the source deck itself (an empty `*STEP`: the solution is zero, in Abaqus too); they stay
+in the gate as conversion checks, flagged `source_unloaded`. The other 601 convert cleanly
+but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
+Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
+coupling) or are CAE part fragments / incomplete or invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
 worse than the original. Bulk-running every deck through convert → integrity → ccx (later
 waves gathered by parallel discovery agents across a dozen engineering domains; plus
 adversarial code reviews) surfaced and fixed real converter bugs — keyword-line
@@ -203,6 +218,9 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*BOUNDARY, TYPE=VELOCITY/ACCEL` | `TYPE` dropped | ccx is displacement-only |
 | `*DLOAD, Px` | unchanged | solid face numbering matches Abaqus |
 | `*DSLOAD` (pressure) | `*DLOAD` with `Px` | ccx `*DSLOAD` is submodel-only; shells use `P` |
+| `*DSLOAD`/`*DLOAD` `TRVEC`, `TRSHR` (surface tractions) | consistent nodal forces (`*CLOAD`) | ccx has no traction load: the face/edge shape functions are integrated over the undeformed geometry (× plane thickness, × 2πr axisymmetric; `TRSHR` projected onto the face). Exact in small-strain steps and for NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT RESULTANT=YES`; other NLGEOM tractions only with `--approximate` |
+| `*DLOAD` `PX`/`PY`/`PZ`/`P1`/`P2` on beams | consistent nodal forces (`*CLOAD`) | on the converted element's nodes (incl. inserted midside nodes); ccx's own beam `P1`/`P2` is a section-face pressure |
+| `*BOUNDARY, USER`, `*CLOAD, USER`, `...NU` load labels, `*TEMPERATURE, USER`, `*AMPLITUDE, DEFINITION=USER` | commented out | the Abaqus user subroutine cannot run in ccx, which would call its own stock `uboun.f` / `cload.f` / `dload.f` / ... instead — the warning names the one to port |
 | `*MPC, TIE` | per-DOF `*EQUATION` | `PLANE`/`STRAIGHT` kept |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
@@ -375,6 +393,9 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/beam_pipe_box_cantilever.inp`](examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` → `B32R` with midside nodes, `B32` + `SECTION=BOX` → `B32R`, biaxial tip load |
 | [`examples/coupling_shell_plate.inp`](examples/coupling_shell_plate.inp) | `S8R` edge `*Coupling`+`*Kinematic` to a loaded reference point → knot beams + rotation ties, `*NGEN`/`*NFILL`/`*ELGEN` |
 | [`examples/coupling_solid_plate.inp`](examples/coupling_solid_plate.inp) | its `C3D20R` + `*Rigid Body, TIE NSET` reference, `*NCOPY` |
+| [`examples/cook_membrane_traction.inp`](examples/cook_membrane_traction.inp) | Cook's membrane, `CPS8`, `*DSLOAD TRVEC` → consistent nodal forces, `*NGEN`/`*NFILL`/`*ELGEN` |
+| [`examples/beam_line_load_cantilever.inp`](examples/beam_line_load_cantilever.inp) | beam line loads `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and an upgraded `CIRC` beam → nodal forces |
+| [`examples/cylinder_traction_cax.inp`](examples/cylinder_traction_cax.inp) | axisymmetric `CAX8` thick cylinder, radial `*DSLOAD TRVEC` (2πr) |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

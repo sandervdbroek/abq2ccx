@@ -1,0 +1,61 @@
+*HEADING
+Three cantilevers (L = 100, E = 1e7) under uniform line loads (*DLOAD), which ccx has no
+card for and the converter applies as consistent nodal forces. Beam theory, tip
+deflection q L^4 / (8 E I):
+  A: B31, RECT 2 x 4, n1 = z, global PY = -0.01 -> u_y = -0.0011719 (I = 2 * 4^3 / 12)
+  B: B32, RECT 2 x 4, n1 = y, local P2 = 0.01 (local 2 = t x n1 = +z) -> u_z = +0.0011719
+  C: B31, CIRC r = 1 (run as B32 with midside nodes), global PZ = -0.001 -> u_z = -0.0015915
+*NODE
+1, 0., 0., 0.
+21, 100., 0., 0.
+101, 0., 10., 0.
+121, 100., 10., 0.
+201, 0., 20., 0.
+221, 100., 20., 0.
+*NGEN, NSET=A_NODES
+1, 21, 1
+*NGEN, NSET=B_NODES
+101, 121, 1
+*NGEN, NSET=C_NODES
+201, 221, 1
+*NSET, NSET=ROOTS
+1, 101, 201
+*NSET, NSET=TIPS
+21, 121, 221
+*ELEMENT, TYPE=B31, ELSET=A
+1, 1, 2
+*ELGEN, ELSET=A
+1, 20, 1, 1
+*ELEMENT, TYPE=B32, ELSET=B
+101, 101, 102, 103
+*ELGEN, ELSET=B
+101, 10, 2, 1
+*ELEMENT, TYPE=B31, ELSET=C
+201, 201, 202
+*ELGEN, ELSET=C
+201, 20, 1, 1
+*MATERIAL, NAME=STEEL
+*ELASTIC
+1.e7, 0.3
+*BEAM SECTION, ELSET=A, MATERIAL=STEEL, SECTION=RECT
+2., 4.
+0., 0., 1.
+*BEAM SECTION, ELSET=B, MATERIAL=STEEL, SECTION=RECT
+2., 4.
+0., 1., 0.
+*BEAM SECTION, ELSET=C, MATERIAL=STEEL, SECTION=CIRC
+1.
+0., 0., 1.
+*BOUNDARY
+ROOTS, ENCASTRE
+*STEP
+*STATIC
+*DLOAD
+A, PY, -0.01
+B, P2, 0.01
+C, PZ, -0.001
+*NODE PRINT, NSET=TIPS
+U
+*NODE PRINT, NSET=ROOTS, TOTALS=ONLY
+RF
+*END STEP

@@ -60,6 +60,12 @@ These are the silent ones — no error, wrong physics.
   the same, so a converted static step keeps its meaning. Abaqus/Explicit defaults to
   `NLGEOM=ON`; the converter therefore adds `NLGEOM` (and a large `INC`) to every
   `*DYNAMIC, EXPLICIT` step.
+* **A step solves to zero displacement.** Check the report for `Step N is loaded in the
+  Abaqus deck (...), but no load survives the conversion`: every load of that step was
+  commented out — a user-subroutine load or BC (port it to the ccx subroutine the warning
+  names), an NLGEOM follower traction (`--approximate` applies it as fixed nodal forces), a
+  load on an undefined surface. ccx then solves the step with no load at all. A deck that
+  loads nothing even in Abaqus gets a note instead.
 * **A Riks step does not run.** ccx has no arc-length solver; passed through, it would
   silently solve a load-controlled static step instead, so the converter comments the
   `*STATIC, RIKS` card out and ccx stops at that step. `--approximate` accepts the

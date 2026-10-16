@@ -1426,6 +1426,274 @@ DLOAD_UNSUPPORTED = {"CENT", "ROTA", "CORIO", "ROTDYNF"}
 
 
 # ---------------------------------------------------------------------------
+# Load audit: which steps still carry a load after conversion
+# ---------------------------------------------------------------------------
+
+# Eigenvalue extractions solve without any load.
+LOAD_FREE_PROCEDURES = {"FREQUENCY", "COMPLEX FREQUENCY"}
+# Linear-perturbation procedures: only the loads given in the step itself act, and they do
+# not carry over to later steps.
+PERTURBATION_PROCEDURES = {"BUCKLE", "MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
+# History cards that load the model -> the field (0-based) whose non-zero value makes a
+# data line a load.  *BOUNDARY loads only through a prescribed non-zero value (field 3), a
+# film / radiation condition through its coefficient / emissivity (field 3).
+LOAD_CARD_FIELD = {"CLOAD": 2, "DLOAD": 2, "DSLOAD": 2, "BOUNDARY": 3, "TEMPERATURE": 1,
+                   "CFLUX": 2, "DFLUX": 2, "DSFLUX": 2, "FILM": 3, "SFILM": 3, "RADIATE": 3,
+                   "SRADIATE": 3, "CONNECTOR MOTION": 2, "CONNECTOR LOAD": 2, "BASE MOTION": -1}
+# ccx user subroutine that supplies the magnitude of a user-defined load / BC card (Abaqus
+# writes USER on the card, or a load label ending in NU).
+CCX_USER_SUBROUTINE = {"BOUNDARY": "uboun.f", "CLOAD": "cload.f", "DLOAD": "dload.f",
+                       "DSLOAD": "dload.f", "FILM": "film.f", "SFILM": "film.f",
+                       "DFLUX": "dflux.f", "DSFLUX": "dflux.f", "CFLUX": "cflux.f",
+                       "RADIATE": "radiate.f", "SRADIATE": "radiate.f",
+                       "TEMPERATURE": "utemp.f", "AMPLITUDE": "uamplitude.f"}
+
+
+def _is_user_load(b: Block, f: Sequence[str]) -> bool:
+    """Whether data line ``f`` of load card ``b`` takes its magnitude from a user
+    subroutine: USER on the card, or a distributed / film / flux label ending in NU."""
+    if b.has("USER"):
+        return True
+    return b.keyword not in ("CLOAD", "BOUNDARY", "TEMPERATURE", "CFLUX") and len(f) > 1 and \
+        f[1].strip().upper().endswith("NU")
+
+
+def _load_entries(b: Block, user_loads: bool) -> List[Tuple[tuple, Optional[str]]]:
+    """(key, description) per data line of load card ``b``; the description is None where
+    the line applies no load (a zero value, a homogeneous BC).  ``user_loads``: whether a
+    user-subroutine magnitude counts as a load (see step_load_audit)."""
+    kw = b.keyword
+    idx = LOAD_CARD_FIELD[kw]
+    out: List[Tuple[tuple, Optional[str]]] = []
+    if idx < 0:                                   # *BASE MOTION: the card is the load
+        return [((kw, tuple(b.params.items())), f"*{kw}")]
+    for rec in merged_data_records(b):
+        f = [x.strip() for x in rec]
+        if not f or not any(f):
+            continue
+        target = f[0] or "the whole model"
+        label = f[1].upper() if len(f) > 1 else ""
+        if kw == "BOUNDARY":
+            try:
+                d1 = int(label)
+                d2 = int(f[2]) if len(f) > 2 and f[2] else d1
+            except ValueError:                    # a named type (ENCASTRE, XSYMM, ...)
+                continue
+            keys = [(kw, f[0].upper(), d) for d in range(min(d1, d2), max(d1, d2) + 1)]
+        else:
+            keys = [(kw, f[0].upper(), label)]
+        desc: Optional[str] = None
+        if _is_user_load(b, f):
+            if user_loads:
+                desc = f"*{kw} on {target} (user subroutine)"
+        elif kw == "TEMPERATURE":
+            desc = f"*TEMPERATURE on {target}" if len(f) > 1 and f[1] else None
+        else:
+            val = f[idx] if len(f) > idx else ""
+            try:
+                nonzero = bool(val) and pf(val) != 0.0
+            except ValueError:                    # unresolved symbol: assume it loads
+                nonzero = True
+            if nonzero:
+                desc = (f"*BOUNDARY: prescribed value on {target}" if kw == "BOUNDARY"
+                        else f"*{kw} {label} on {target}" if kw in ("DLOAD", "DSLOAD")
+                        else f"*{kw} on {target}")
+        out += [(k, desc) for k in keys]
+    return out
+
+
+def step_load_audit(blocks: Sequence[Block], user_loads: bool) -> List[Optional[List[str]]]:
+    """Per *STEP, in order: None for an eigenvalue extraction (it needs no load), else the
+    loads active in the step — an empty list means the step solves with no load at all,
+    i.e. to a zero response.  Loads and prescribed BCs carry over to later steps until an
+    OP=NEW card of the same keyword; a linear-perturbation step counts only its own loads.
+    Initial velocities load a dynamic step, initial stresses any step.
+
+    ``user_loads``: whether a magnitude that comes from a user subroutine (USER, ...NU
+    labels) counts.  It does in an Abaqus deck; in a ccx deck the stock ccx subroutine
+    would run in place of the deck's own, so it does not."""
+    state: Dict[str, Dict[tuple, str]] = {}
+    initial: Dict[str, List[str]] = {"VELOCITY": [], "STRESS": []}
+    fresh: Dict[str, set] = {}             # keys (re)defined in the current step, per card
+
+    def apply(b: Block, into: Dict[str, Dict[tuple, str]]) -> None:
+        card = into.setdefault(b.keyword, {})
+        if (b.param("OP") or "").strip().upper() == "NEW":
+            # OP=NEW removes what earlier steps applied, not the cards before it in this
+            # step (Abaqus; probed on ccx 2.23 for *CLOAD and *BOUNDARY)
+            kept = fresh.get(b.keyword, set())
+            into[b.keyword] = card = {k: v for k, v in card.items() if k in kept}
+        for key, desc in _load_entries(b, user_loads):
+            fresh.setdefault(b.keyword, set()).add(key)
+            if desc:
+                card[key] = desc
+            else:
+                card.pop(key, None)
+
+    out: List[Optional[List[str]]] = []
+    step: Optional[List[Block]] = None
+    for b in list(blocks) + [Block("END STEP", OrderedDict())]:
+        kw = b.keyword
+        if kw == "STEP":
+            step = [b]
+            fresh.clear()
+            continue
+        if kw != "END STEP":
+            if step is not None:
+                step.append(b)
+            elif kw in LOAD_CARD_FIELD:           # model-data *BOUNDARY
+                apply(b, state)
+            elif kw == "INITIAL CONDITIONS":
+                typ = (b.param("TYPE") or "").strip().upper()
+                # the values: node, DOF, velocity | node set, angular velocity, axis ... |
+                # element, stress components
+                lo, hi = {"VELOCITY": (2, 3), "ROTATING VELOCITY": (1, 2)}.get(typ, (1, None))
+                typ = "VELOCITY" if typ == "ROTATING VELOCITY" else typ
+                if typ in initial:
+                    nums = [x for r in merged_data_records(b) for x in r[lo:hi] if x.strip()]
+                    try:
+                        moving = any(pf(x) != 0.0 for x in nums)
+                    except ValueError:
+                        moving = True
+                    if moving:
+                        initial[typ].append(f"*INITIAL CONDITIONS, TYPE={typ}")
+            continue
+        if step is None:
+            continue
+        proc = next((x.keyword for x in step if x.keyword in PROC_KW), None)
+        perturb = proc in PERTURBATION_PROCEDURES or (step[0].has("PERTURBATION") and
+                                                      proc not in LOAD_FREE_PROCEDURES)
+        active = {} if perturb else state
+        for x in step[1:]:
+            if x.keyword in LOAD_CARD_FIELD:
+                apply(x, active)
+        if proc in LOAD_FREE_PROCEDURES:
+            out.append(None)
+        else:
+            loads = [d for card in active.values() for d in card.values()] + initial["STRESS"]
+            if proc in ("DYNAMIC", "MODAL DYNAMIC"):
+                loads += initial["VELOCITY"]
+            out.append(dedup_str(loads))
+        step = None
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Consistent nodal forces of distributed loads ccx has no card for
+# ---------------------------------------------------------------------------
+
+# Gauss rules: 4-point Gauss-Legendre on [-1, 1]; 3 x 3 Gauss on the square; the 7-point
+# degree-5 rule on the triangle 0 <= r, s, r + s <= 1 (weights sum to its area 1/2).
+_GAUSS_LINE = ((-0.8611363115940526, 0.3478548451374538), (-0.3399810435848563, 0.6521451548625461),
+               (0.3399810435848563, 0.6521451548625461), (0.8611363115940526, 0.3478548451374538))
+_GAUSS3 = ((-0.7745966692414834, 5.0 / 9.0), (0.0, 8.0 / 9.0), (0.7745966692414834, 5.0 / 9.0))
+_GAUSS_QUAD = tuple((a, b, wa * wb) for a, wa in _GAUSS3 for b, wb in _GAUSS3)
+_GAUSS_TRI = ((1.0 / 3.0, 1.0 / 3.0, 0.1125),
+              *((r, s, 0.0661970763942531) for r, s in ((0.4701420641051151, 0.4701420641051151),
+                                                        (0.0597158717897698, 0.4701420641051151),
+                                                        (0.4701420641051151, 0.0597158717897698))),
+              *((r, s, 0.0629695902724136) for r, s in ((0.1012865073234563, 0.1012865073234563),
+                                                        (0.7974269853530873, 0.1012865073234563),
+                                                        (0.1012865073234563, 0.7974269853530873))))
+_Q8_MID = ((0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0))
+_Q4_CORNER = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0))
+
+
+def _shape(kind: str, n: int, a: float, b: float = 0.0) -> Tuple[List[float], List[float], List[float]]:
+    """Shape functions N and their derivatives along both face coordinates at (a, b) of an
+    edge (``kind`` "line": 2 or 3 nodes, corners first) or a face ("area": tri 3/6, quad
+    4/8 nodes, corners first, then the midside nodes after each corner)."""
+    if kind == "line":
+        if n == 2:
+            return [(1 - a) / 2, (1 + a) / 2], [-0.5, 0.5], [0.0, 0.0]
+        return [a * (a - 1) / 2, a * (a + 1) / 2, 1 - a * a], [a - 0.5, a + 0.5, -2 * a], [0.0] * 3
+    if n in (3, 6):                                    # triangle, area coordinates
+        l1, l2, l3 = 1 - a - b, a, b
+        if n == 3:
+            return [l1, l2, l3], [-1.0, 1.0, 0.0], [-1.0, 0.0, 1.0]
+        return ([l1 * (2 * l1 - 1), l2 * (2 * l2 - 1), l3 * (2 * l3 - 1), 4 * l1 * l2, 4 * l2 * l3,
+                 4 * l3 * l1],
+                [1 - 4 * l1, 4 * l2 - 1, 0.0, 4 * (l1 - l2), 4 * l3, -4 * l3],
+                [1 - 4 * l1, 0.0, 4 * l3 - 1, -4 * l2, 4 * l2, 4 * (l1 - l3)])
+    N, da, db = [], [], []
+    for ai, bi in _Q4_CORNER:
+        if n == 4:
+            N.append((1 + a * ai) * (1 + b * bi) / 4)
+            da.append(ai * (1 + b * bi) / 4)
+            db.append(bi * (1 + a * ai) / 4)
+        else:
+            N.append((1 + a * ai) * (1 + b * bi) * (a * ai + b * bi - 1) / 4)
+            da.append(ai * (1 + b * bi) * (2 * a * ai + b * bi) / 4)
+            db.append(bi * (1 + a * ai) * (a * ai + 2 * b * bi) / 4)
+    if n == 8:
+        for ai, bi in _Q8_MID:
+            if ai == 0.0:
+                N.append((1 - a * a) * (1 + b * bi) / 2)
+                da.append(-a * (1 + b * bi))
+                db.append(bi * (1 - a * a) / 2)
+            else:
+                N.append((1 + a * ai) * (1 - b * b) / 2)
+                da.append(ai * (1 - b * b) / 2)
+                db.append(-b * (1 + a * ai))
+    return N, da, db
+
+
+def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: bool = False
+                            ) -> List[Vec]:
+    """f_i = integral of N_i t over one edge or face in its undeformed geometry, by Gauss
+    quadrature (exact for the constant tractions and line loads of straight or flat
+    members, and to quadrature accuracy on curved ones).  ``kind`` is "line" (2/3 nodes) or
+    "area" (3/6/4/8 nodes), corner nodes first.  ``load(point, normal, tangent)`` gives
+    the traction / line load vector there: an edge passes its in-plane (x-y) normal, a
+    face its unit normal; the tangent is the unit edge direction (None on a face).  An
+    axisymmetric edge integrates over the full circle (2 pi r ds, r = x), the convention
+    of concentrated loads on axisymmetric elements in Abaqus and ccx alike."""
+    n = len(xyz)
+    rule = (((g, 0.0, w) for g, w in _GAUSS_LINE) if kind == "line" else
+            _GAUSS_TRI if n in (3, 6) else _GAUSS_QUAD)
+    forces = [[0.0, 0.0, 0.0] for _ in range(n)]
+    for a, b, w in rule:
+        N, da, db = _shape(kind, n, a, b)
+        p = tuple(sum(N[i] * xyz[i][k] for i in range(n)) for k in range(3))
+        ga = tuple(sum(da[i] * xyz[i][k] for i in range(n)) for k in range(3))
+        if kind == "line":
+            jac = vnorm(ga)
+            tangent: Optional[Vec] = vunit(ga)
+            normal = vunit((ga[1], -ga[0], 0.0))
+            if axisymmetric:
+                jac *= 2.0 * math.pi * p[0]
+        else:
+            gb = tuple(sum(db[i] * xyz[i][k] for i in range(n)) for k in range(3))
+            cross = vcross(ga, gb)
+            jac = vnorm(cross)
+            normal, tangent = vunit(cross), None
+        t = load(p, normal, tangent)
+        for i in range(n):
+            s = N[i] * jac * w
+            for k in range(3):
+                forces[i][k] += s * t[k]
+    return [(f[0], f[1], f[2]) for f in forces]
+
+
+def blocks_from_lines(lines: Sequence[str]) -> List[Block]:
+    """The keyword cards of flat deck text (no *INCLUDE, *PARAMETER or keyword continuation
+    lines) — the converter's own output.  Mesh data lines are skipped."""
+    blocks: List[Block] = []
+    cur: Optional[Block] = None
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("**"):
+            continue
+        if s.startswith("*"):
+            kw, params = parse_keyword_line(s)
+            cur = Block(kw, params)
+            blocks.append(cur)
+        elif cur is not None and cur.keyword not in GEOM_KW:
+            cur.data.append(s)
+    return blocks
+
+
+# ---------------------------------------------------------------------------
 # Converter
 # ---------------------------------------------------------------------------
 
@@ -1477,6 +1745,27 @@ class Converter:
         self._transformed: set = set()             # nodes with a *TRANSFORM (local DOFs)
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         self._last_coupling: Optional[dict] = None
+        # load audit (see _audit_loads): steps loaded in the deck but not after conversion
+        self.unloaded_steps: List[int] = []
+        self.source_unloaded = False
+        # distributed loads emitted as consistent nodal forces (see _flush_nodal_loads):
+        # (card, target, label) -> ({(node, DOF): force}, amplitude), in Abaqus semantics
+        self._nodal_loads: "OrderedDict[tuple, Tuple[Dict[Tuple[int, int], float], Optional[str]]]" = \
+            OrderedDict()
+        self._nodal_fresh: set = set()              # keys (re)defined in the current step
+        self._nodal_reset: set = set()              # cards with OP=NEW in the current step
+        self._nodal_emitted: Dict[Tuple[int, int], Tuple[str, Optional[str]]] = {}   # in ccx
+        self._cload_new = False                     # the deck's *CLOAD, OP=NEW in this step
+        self._section_thick: Dict[int, float] = {}  # plane element -> section thickness
+        self._beam_n1: Dict[int, Optional[Vec]] = {}    # beam -> approximate n1 of its section
+        self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> amplitudes
+        self._has_normal = False
+        self._planar_beams = False                  # the deck's beams are 2-D (B21, B22, ...)
+        # *DLOAD lines emitted per source card ("DLOAD" / "DSLOAD"): key -> (line, amplitude),
+        # so a ccx *DLOAD, OP=NEW does not remove the other card's loads (see _flush_dloads)
+        self._dl_state: Dict[str, "OrderedDict[tuple, Tuple[str, Optional[str]]]"] = {}
+        self._dl_fresh: set = set()                 # (card, key) given in the current step
+        self._dl_wiped = False                      # a ccx *DLOAD, OP=NEW in the current step
 
     # -- properties ---------------------------------------------------------
     @property
@@ -1769,6 +2058,10 @@ class Converter:
             "SURFACE INTERACTION": self.handle_surface_interaction,
             "INITIAL CONDITIONS": self.handle_initial_conditions,
             "TEMPERATURE": self.handle_temperature,
+            "FILM": self.handle_flux_film,
+            "DFLUX": self.handle_flux_film,
+            "CFLUX": self.handle_flux_film,
+            "RADIATE": self.handle_flux_film,
             "NORMAL": self.handle_normal,
             "EQUATION": self.handle_equation,
             "STATIC": self.handle_static,
@@ -2599,14 +2892,20 @@ class Converter:
         self._step_nlgeom = self._step_nlgeom or \
             ("NLGEOM" in params and (nl or "YES").strip().upper() != "NO")
         out = [emit_keyword("STEP", params)]
+        self._nodal_fresh, self._nodal_reset, self._cload_new = set(), set(), False
+        self._dl_fresh, self._dl_wiped = set(), False
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
             out.extend(self.translate_one(b))
+        out.extend(self._flush_dloads())
+        out.extend(self._flush_nodal_loads())
         out.append("*END STEP")
         return out
 
     def handle_boundary(self, b: Block) -> List[str]:
+        if b.has("USER"):
+            return self._user_load_card(b)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "TYPE":
@@ -2762,10 +3061,13 @@ class Converter:
         """``*CLOAD``: moments (DOFs 4-6) on a *RIGID BODY reference point go to DOFs 1-3 of
         its ROT NODE — ccx silently ignores them on the REF NODE (verified: no rotation).
         Abaqus ORIENTATION= (local load axes) and FOLLOWER=YES have no ccx counterpart."""
+        if b.has("USER"):
+            return self._user_load_card(b)
+        if (b.param("OP") or "").strip().upper() == "NEW":
+            self._cload_new = True        # it also removes the converted nodal forces (ccx)
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
-            if k in ("OP", "AMPLITUDE", "TIME DELAY", "USER", "LOAD CASE", "SECTOR", "SUBMODEL",
-                     "STEP"):
+            if k in ("OP", "AMPLITUDE", "TIME DELAY", "LOAD CASE", "SECTOR", "SUBMODEL", "STEP"):
                 keep[k] = v
             elif k == "ORIENTATION":
                 self.report.warn(f"*CLOAD, ORIENTATION={v} dropped: ccx applies concentrated loads "
@@ -2801,53 +3103,117 @@ class Converter:
         return out
 
     def handle_dload(self, b: Block) -> List[str]:
+        """``*DLOAD``: body loads and face pressures pass through.  Element-based tractions
+        (TRVECn / TRSHRn) and beam line loads (PX, PY, PZ, P1, P2) have no ccx card — ccx reads
+        P1 / P2 on a beam as a pressure on its expanded section face, i.e. scaled by the
+        section width (probed on 2.23) — and become consistent nodal forces
+        (_to_nodal_forces); user-subroutine loads (...NU labels) are commented out."""
+        op_new = (b.param("OP") or "").strip().upper() == "NEW"
+        if op_new:
+            self._reset_nodal_loads("DLOAD")
         body: List[str] = []
+        lines: List[Tuple[tuple, str, str]] = []           # (key, line, magnitude) of the body
+        side: List[str] = []                                # converted / commented-out lines
         for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
+            g = [x.strip() for x in rec]
+            f = [x for x in g if x != ""]
             if not f:
                 continue
-            label = f[1].upper() if len(f) >= 2 else ""
+            label = g[1].upper() if len(g) >= 2 else ""
             if label in DLOAD_UNSUPPORTED:
                 self.report.warn(f"*DLOAD type {label} has no CalculiX equivalent (ccx body loads are "
                                  f"GRAV and CENTRIF only — not rotary-acceleration/Coriolis/density-"
                                  f"scaled centrifugal); this load line was dropped. Verify.", once=True)
                 continue
+            if _is_user_load(b, g):
+                side += self._user_load_line(b, g)
+                continue
+            m = re.fullmatch(r"(TRVEC|TRSHR)([1-6]?)", label)
+            if m:
+                eids = self._load_elements(g[0])
+                faces, why = self._load_faces(eids, m.group(2), shell_reference=not m.group(2)) \
+                    if eids else ([], f"element set '{g[0]}' is empty or undefined")
+                side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
+                continue
+            if re.fullmatch(r"P[XYZ12]", label):
+                eids = self._load_elements(g[0])
+                beams = [e for e in eids if self._is_beam(e)]
+                if beams:
+                    faces, why = self._beam_lines(eids, label) if len(beams) == len(eids) else \
+                        ([], f"element set '{g[0]}' mixes beams with other elements")
+                    side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
+                    continue
+            if not g[0] and ALL_ELEMENTS_SET in self.geom.elsets:
+                # Abaqus applies a body load with no element set to the whole model; ccx
+                # needs a set (without one the line read as 'GRAV, 9.81, ...' is garbage)
+                g = [ALL_ELEMENTS_SET] + g[1:]
+                f = [x for x in g if x != ""]
+                self.report.note(f"*DLOAD line without an element set (Abaqus: the whole model) -> "
+                                 f"ELSET {ALL_ELEMENTS_SET}.", once=True)
             if label == "P":
                 self.report.warn("*DLOAD label 'P' has no face number; CalculiX needs P1..P6 for element "
                                  "pressure. Verify.", once=True)
             body.append(", ".join(f))
+            lines.append(((f[0].upper(), label), body[-1], f[2] if len(f) > 2 else ""))
         had_data = any(x != "" for rec in merged_data_records(b) for x in rec)
-        params = self._load_params(b, ("OP", "AMPLITUDE", "TIME DELAY", "LOAD CASE", "SECTOR", "SUBMODEL", "STEP"))
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        if body or op_new:
+            params = self._load_params(b, ("OP", "AMPLITUDE", "TIME DELAY", "LOAD CASE", "SECTOR",
+                                           "SUBMODEL", "STEP"))
+        if op_new:
+            self._dload_op_new("DLOAD")
+        self._track_dloads("DLOAD", b, lines)
         if not body and had_data:
-            if (b.param("OP") or "").upper() == "NEW":
+            if op_new:
                 # keep the bare header: OP=NEW validly removes all previous distributed
                 # loads in ccx, and losing that would leak stale loads across steps
-                self.report.warn("*DLOAD, OP=NEW: every load line was unsupported and dropped, but "
-                                 "the bare OP=NEW card is kept so previous distributed loads are "
-                                 "still removed.", once=True)
-                return [emit_keyword("DLOAD", params)]
+                if not side:
+                    self.report.warn("*DLOAD, OP=NEW: every load line was unsupported and dropped, "
+                                     "but the bare OP=NEW card is kept so previous distributed loads "
+                                     "are still removed.", once=True)
+                return [emit_keyword("DLOAD", params)] + side
+            if side:
+                return side
             # every load line was unsupported — commenting is louder than emitting a bare card
             return self._commented(b, "*DLOAD has no CalculiX-compatible load lines; dropped.")
         # a *DLOAD with no data at all is valid ccx (OP=NEW clears previous distributed
         # loads; plain is a no-op) — pass it through unchanged
-        return [emit_keyword("DLOAD", params)] + body
+        return [emit_keyword("DLOAD", params)] + body + side
 
     def handle_dsload(self, b: Block) -> List[str]:
-        keep = self._load_params(b, ("OP", "AMPLITUDE", "TIME DELAY", "SUBMODEL", "STEP"))
+        """``*DSLOAD``: a surface pressure becomes a ccx *DLOAD face pressure (ccx's P1..P6 face
+        numbers match Abaqus' continuum faces); a surface traction (TRVEC / TRSHR) becomes
+        consistent nodal forces (_to_nodal_forces); a user-subroutine load (...NU labels) is
+        commented out."""
+        op_new = (b.param("OP") or "").strip().upper() == "NEW"
+        if op_new:
+            self._reset_nodal_loads("DSLOAD")
         body: List[str] = []
+        lines: List[Tuple[tuple, str, str]] = []
+        side: List[str] = []
         for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
+            g = [x.strip() for x in rec]
+            f = [x for x in g if x != ""]
             if len(f) < 2:
                 continue
             surf, label = f[0].upper(), f[1].upper()
             mag = f[2] if len(f) > 2 else ""
+            if _is_user_load(b, g):
+                side += self._user_load_line(b, g)
+                continue
+            if label in ("TRVEC", "TRSHR"):
+                faces, why = self._surface_faces(surf)
+                side += self._to_nodal_forces(b, "DSLOAD", g, faces, why)
+                continue
             if not re.fullmatch(r"P[1-6]?", label):
-                self.report.warn(f"*DSLOAD label {label} is not a simple pressure; convert manually.", once=True)
+                side += self._drop_load_line(b, f, f"the load type {label} has no ccx equivalent (ccx "
+                                                   f"surface loads are pressures)")
                 continue
             sd = self.surfaces.get(surf)
             if not sd or sd[0].startswith("NODE"):
-                self.report.warn(f"*DSLOAD on '{surf}': not an element-based surface; cannot map to "
-                                 f"*DLOAD automatically.", once=True)
+                side += self._drop_load_line(b, f, f"surface '{f[0]}' is not defined in the deck" if
+                                             not sd else f"'{f[0]}' is a node-based surface (a pressure "
+                                                         f"needs element faces)")
                 continue
             for token, face in sd[1]:
                 if face and re.fullmatch(r"S[1-6]", face):
@@ -2862,11 +3228,388 @@ class Converter:
                 if mag != "":
                     line += f", {mag}"
                 body.append(line)
-        if not body:
+                lines.append(((token.upper(), pl), line, mag))
+        if body:
+            self.report.note("*DSLOAD surface pressure converted to *DLOAD with Px face labels "
+                             "(solid faces match Abaqus).", once=True)
+        # OP=NEW: Abaqus removes the earlier *DSLOAD loads only; ccx's *DLOAD, OP=NEW removes
+        # every earlier distributed load, so the deck's own *DLOADs are restored at the end of
+        # the step (_flush_dloads).  Without earlier *DSLOAD pressures nothing needs removing.
+        wipe = op_new and any(("DSLOAD", k) not in self._dl_fresh
+                              for k in self._dl_state.get("DSLOAD", {}))
+        out: List[str] = []
+        if body or wipe:
+            keep = self._load_params(b, ("OP", "AMPLITUDE", "TIME DELAY", "SUBMODEL", "STEP"))
+            if not wipe:
+                keep.pop("OP", None)
+            if op_new:
+                self._dload_op_new("DSLOAD", wipe)
+            out = [emit_keyword("DLOAD", keep)] + body
+        elif op_new:
+            self._dload_op_new("DSLOAD", False)
+        self._track_dloads("DSLOAD", b, lines)
+        if not out and not side:
+            if not any(x.strip() for x in b.data):
+                return []                 # nothing to apply and (OP=NEW) nothing left to remove
             return self._commented(b, "Could not convert *DSLOAD automatically; edit manually.")
-        self.report.note("*DSLOAD surface pressure converted to *DLOAD with Px face labels "
-                         "(solid faces match Abaqus).", once=True)
-        return [emit_keyword("DLOAD", keep)] + body
+        return out + side
+
+    # -- distributed loads as nodal forces, and *DLOAD bookkeeping -------------------
+    def _load_elements(self, token: str) -> List[int]:
+        """The defined elements a load line targets — a set counts each member once (a set
+        built by *ELGEN lists its master element twice), as the emitted set does."""
+        eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else dedup(self.geom.elset(token))
+        return [e for e in eids if e in self.geom.elements]
+
+    def _is_beam(self, eid: int) -> bool:
+        info = self.geom.elements.get(eid)
+        return bool(info) and info[0].upper().startswith(("B2", "B3", "PIPE"))
+
+    def _surface_faces(self, name: str) -> Tuple[list, Optional[str]]:
+        """The element faces / edges of element-based *SURFACE ``name`` (see _load_faces), or
+        why they cannot be resolved."""
+        sd = self.surfaces.get(name.upper())
+        if sd is None:
+            return [], f"surface '{name}' is not defined in the deck"
+        if sd[0].startswith("NODE"):
+            return [], f"'{name}' is a node-based surface (a traction needs element faces)"
+        faces: list = []
+        seen: set = set()
+        for token, face in sd[1]:
+            eids = self._load_elements(token)
+            if not eids:
+                return [], f"surface '{name}' member '{token}' matches no element"
+            label = (face or "").upper()
+            eids = [e for e in eids if (e, label) not in seen]   # each face counts once
+            seen.update((e, label) for e in eids)
+            got, why = self._load_faces(eids, label, shell_reference=False)
+            if why:
+                return [], why
+            faces += got
+        return faces, None
+
+    def _load_faces(self, eids: Sequence[int], face: str, shell_reference: bool
+                    ) -> Tuple[list, Optional[str]]:
+        """Per element, the edge / face a traction acts on as (nodes — corners first, then the
+        midside nodes —, "line" or "area", scale, axisymmetric, planar, n1), or why it cannot
+        be resolved.  ``face``: S1..S6 or 1..6 (continuum faces, plane-element edges), SPOS /
+        SNEG (a shell's reference surface; with ``shell_reference`` also no face at all).
+        A plane-stress / plane-strain edge carries the section thickness as its scale."""
+        out: list = []
+        quiet = Report()
+        m = re.fullmatch(r"S?([1-6])", face)
+        for e in eids:
+            info = self.geom.elements.get(e)
+            if info is None:
+                return [], f"element {e} is not defined"
+            typ, conn = info
+            cc, n = ccx_element_type(typ, quiet), len(conn)
+            if cc.startswith(PLANE_ELEM_PREFIXES):
+                nc = 3 if n in (3, 6) else 4
+                if not m or int(m.group(1)) > nc or n not in (nc, 2 * nc):
+                    return [], f"face '{face}' is not an edge of the {typ} element {e}"
+                k = int(m.group(1))
+                pos = [k, k % nc + 1] + ([nc + k] if n == 2 * nc else [])
+                axi = cc.startswith("CAX")
+                out.append(([conn[p - 1] for p in pos], "line",
+                             1.0 if axi else self._section_thick.get(e, 1.0), axi, True, None))
+            elif cc.startswith("C3D"):
+                fam = {4: "TET", 10: "TET", 6: "WEDGE", 15: "WEDGE", 8: "HEX", 20: "HEX"}.get(n)
+                if not fam or not m or int(m.group(1)) not in FACE_NODES[fam]:
+                    return [], f"face '{face}' is not a face of the {typ} element {e}"
+                out.append(([conn[p - 1] for p in FACE_NODES[fam][int(m.group(1))] if p <= n], "area",
+                            1.0, False, False, None))
+            elif (cc in SHELL_TYPES or cc.startswith("M3D")) and n in (3, 4, 6, 8):
+                if face not in ("SPOS", "SNEG") and not (shell_reference and not face):
+                    return [], (f"face '{face}' of the {typ} element {e} is not its reference "
+                                f"surface (SPOS / SNEG)")
+                out.append((list(conn), "area", 1.0, False, False, None))
+            else:
+                return [], f"element {e} ({typ}) has no face this conversion can load"
+        return out, None
+
+    def _beam_lines(self, eids: Sequence[int], label: str) -> Tuple[list, Optional[str]]:
+        """Per beam element, its nodes — ends first, then the midside node of a 3-node beam (as
+        converted: an upgraded 2-node beam has one) — as a "line" for _to_nodal_forces, with
+        the approximate n1 of its cross section, which P1 / P2 need."""
+        out: list = []
+        for e in eids:
+            typ, conn = self.geom.elements[e]
+            nodes = [conn[0], conn[-1]] + ([conn[1]] if len(conn) == 3 else [])
+            n1 = (0.0, 0.0, -1.0) if self._planar_beams else self._beam_n1.get(e)
+            if label in ("P1", "P2"):
+                if self._has_normal:
+                    return [], "the deck's *NORMAL cards redefine the beams' local axes"
+                if n1 is None:
+                    return [], f"the cross-section axes of beam {e} are unknown"
+            out.append((nodes, "line", 1.0, False, self._planar_beams, n1))
+        return out, None
+
+    def _nodal_load_inexact(self, b: Block, base: str) -> Optional[str]:
+        """Why nodal forces from the undeformed geometry would not reproduce the Abaqus load
+        in this step, or None when they do: always in a small-strain step; under NLGEOM only
+        for a traction that keeps its direction (FOLLOWER=NO) and its resultant (CONSTANT
+        RESULTANT=YES) — ccx keeps a *CLOAD fixed in direction and magnitude."""
+        if not self._step_nlgeom:
+            return None
+        if base in ("PX", "PY", "PZ", "P1", "P2"):
+            return "under NLGEOM a beam line load acts on the deforming beam"
+        if base == "TRSHR":
+            return "under NLGEOM a shear traction (TRSHR) stays tangent to the deforming surface"
+        if (b.param("FOLLOWER") or "YES").strip().upper() != "NO":
+            return ("under NLGEOM the traction rotates with the surface (FOLLOWER=YES, the Abaqus "
+                    "default)")
+        if (b.param("CONSTANT RESULTANT") or "NO").strip().upper() != "YES":
+            return ("under NLGEOM the traction acts per unit current area (CONSTANT RESULTANT=NO, "
+                    "the Abaqus default)")
+        return None
+
+    def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
+                         why: Optional[str]) -> List[str]:
+        """One traction (TRVEC / TRSHR) or beam line-load (PX / PY / PZ / P1 / P2) data line ``g``
+        -> consistent nodal forces (consistent_nodal_forces over ``faces``), registered for
+        the *CLOAD at the end of the step (_flush_nodal_loads).  Returns the comment lines that
+        take the load's place in the deck.  TRVEC: magnitude x the unit direction; TRSHR: the
+        direction projected onto the face (in its undeformed geometry, as in Abaqus) at every
+        integration point; plane-element edges carry the section thickness, axisymmetric edges
+        the full circle; a 2-D model has no third component."""
+        label = g[1].upper()
+        base = label[:5] if label.startswith("TR") else label
+        if why:
+            return self._drop_load_line(b, g, why)
+        try:
+            mag = pf(g[2]) if len(g) > 2 and g[2] else 0.0
+            d = tuple(pf(x) if x else 0.0 for x in (g[3:6] + ["", "", ""])[:3])
+        except ValueError:
+            return self._drop_load_line(b, g, "its magnitude or direction is not a number")
+        if b.param("ORIENTATION") and base in ("TRVEC", "TRSHR"):
+            return self._drop_load_line(b, g, f"its direction is given in the local system "
+                                              f"{b.param('ORIENTATION')}, which this conversion "
+                                              f"does not apply")
+        inexact = self._nodal_load_inexact(b, base)
+        if inexact and not self._approx:
+            return self._drop_load_line(b, g, f"{inexact}, which nodal forces from the undeformed "
+                                              f"geometry cannot follow (they are exact in small-"
+                                              f"strain steps, and under NLGEOM for TRVEC with "
+                                              f"FOLLOWER=NO, CONSTANT RESULTANT=YES); rerun with "
+                                              f"--approximate to apply them anyway")
+        degenerate: List[int] = []
+        if base in ("TRVEC", "TRSHR"):
+            if any(f[4] for f in faces):                      # 2-D: in-plane components only
+                d = (d[0], d[1], 0.0)
+            if mag and vnorm(d) == 0.0:
+                return self._drop_load_line(b, g, "its direction vector is zero")
+            unit = vunit(d)
+
+            def load(p, normal, tangent):
+                if base == "TRVEC":
+                    return vscale(unit, mag)
+                s = vsub(unit, vscale(normal, vdot(unit, normal)))
+                if vnorm(s) < 1e-9:
+                    degenerate.append(1)
+                    return (0.0, 0.0, 0.0)
+                return vscale(vunit(s), mag)
+        elif base in ("PX", "PY", "PZ"):
+            axis = {"PX": (1.0, 0.0, 0.0), "PY": (0.0, 1.0, 0.0), "PZ": (0.0, 0.0, 1.0)}[base]
+
+            def load(p, normal, tangent):
+                return vscale(axis, mag)
+        forces: Dict[Tuple[int, int], float] = {}
+        for nodes, kind, scale, axi, planar, n1 in faces:
+            if base in ("P1", "P2"):
+                def load(p, normal, tangent, n1=n1):
+                    n2 = vcross(tangent, n1)
+                    if vnorm(n2) < 1e-9:
+                        degenerate.append(1)
+                        return (0.0, 0.0, 0.0)
+                    n2 = vunit(n2)
+                    return vscale(vcross(n2, tangent) if base == "P1" else n2, mag)
+            fv = consistent_nodal_forces(kind, [self.geom.nodes[n] for n in nodes], load, axi)
+            for nd, v in zip(nodes, fv):
+                for k in range(2 if planar else 3):
+                    if v[k]:
+                        forces[(nd, k + 1)] = forces.get((nd, k + 1), 0.0) + scale * v[k]
+        if degenerate:
+            return self._drop_load_line(b, g, "its direction is normal to the surface (no shear "
+                                              "component)" if base == "TRSHR" else
+                                              "a beam is parallel to its n1 direction")
+        big = max((abs(v) for v in forces.values()), default=0.0)
+        forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
+        amp = b.param("AMPLITUDE")
+        key = (card, g[0].upper(), label)
+        clash = self._nodal_load_clash(key, forces, amp)
+        if clash:
+            return self._drop_load_line(b, g, clash)
+        if inexact:
+            self.report.warn(f"[APPROX] *{b.keyword} {base}: {inexact}; converted anyway to nodal "
+                             f"forces from the undeformed geometry, which ccx keeps fixed in "
+                             f"direction and magnitude — the response differs from Abaqus as the "
+                             f"mesh deforms. Verify.", once=True)
+        self._set_nodal_load(key, forces, amp)
+        what = "surface tractions (TRVEC / TRSHR)" if base.startswith("TR") else \
+            "beam line loads (PX / PY / PZ / P1 / P2)"
+        self.report.note(f"*{b.keyword} {what} -> consistent nodal forces in a *CLOAD at the end of "
+                         f"the step: ccx has no such load"
+                         + ("" if base.startswith("TR") else " (it reads P1 / P2 on a beam as a "
+                            "pressure on the expanded section face)")
+                         + ". The shape functions are integrated over the undeformed faces / edges "
+                         "(times the section thickness on plane elements, over the full circle on "
+                         "axisymmetric ones).", once=True)
+        res = [sum(v for (_, k), v in forces.items() if k == c) for c in (1, 2, 3)]
+        return [f"** abq2ccx: {', '.join(x for x in g if x)} -> nodal forces on "
+                f"{len({n for n, _ in forces})} node(s), resultant ({', '.join('%.6g' % x for x in res)}),"
+                f" in the *CLOAD at the end of this step"]
+
+    def _nodal_load_clash(self, key: tuple, forces: Dict[Tuple[int, int], float],
+                          amp: Optional[str]) -> Optional[str]:
+        """Why ``forces`` cannot join the generated *CLOAD, or None.  ccx keeps one value and one
+        amplitude per node and DOF: values given in one step add up, a later step replaces
+        them.  A node DOF shared with the deck's own *CLOAD is therefore exact only when the
+        deck has a single step and the same amplitude; one shared with another converted load
+        needs the same amplitude."""
+        for nd in forces:
+            amps = self._deck_cloads.get(nd)
+            if amps is not None and (self._n_steps > 1 or amps != {amp}):
+                return (f"its nodal force on node {nd[0]} DOF {nd[1]} would share the entry of the "
+                        f"deck's own *CLOAD there (ccx keeps one value and amplitude per node and "
+                        f"DOF, and a later step replaces it)")
+        for other, (f2, a2) in self._nodal_loads.items():
+            if other != key and a2 != amp and not f2.keys().isdisjoint(forces):
+                return (f"it shares nodes with another converted load ({other[2]} on {other[1]}) "
+                        f"under a different amplitude, and ccx keeps one amplitude per node and DOF")
+        return None
+
+    def _set_nodal_load(self, key: tuple, forces: Dict[Tuple[int, int], float],
+                        amp: Optional[str]) -> None:
+        """Record the nodal forces of a converted load (Abaqus semantics: a key given again in
+        a later step replaces it, twice in one step adds up; no force removes it)."""
+        if key in self._nodal_fresh and key in self._nodal_loads:
+            old = self._nodal_loads[key][0]
+            for nd, v in forces.items():
+                old[nd] = old.get(nd, 0.0) + v
+        elif forces:
+            self._nodal_loads[key] = (dict(forces), amp)
+        else:
+            self._nodal_loads.pop(key, None)
+        self._nodal_fresh.add(key)
+
+    def _reset_nodal_loads(self, card: str) -> None:
+        """OP=NEW on a *DSLOAD / *DLOAD: the converted loads of that card from earlier steps go
+        (those given earlier in this step stay — Abaqus, and ccx alike)."""
+        if card in self._nodal_reset:
+            return
+        self._nodal_reset.add(card)
+        for k in [k for k in self._nodal_loads if k[0] == card and k not in self._nodal_fresh]:
+            del self._nodal_loads[k]
+
+    def _flush_nodal_loads(self) -> List[str]:
+        """The *CLOAD (one per amplitude) that brings ccx's generated nodal forces to the state
+        the step's converted loads define: every node DOF whose force changed, with 0 where a
+        load went away.  Never OP=NEW, which would also remove the deck's own *CLOADs; after
+        the deck's own *CLOAD, OP=NEW (which removes these too) every force is given again."""
+        target: Dict[Tuple[int, int], Tuple[str, Optional[str]]] = {}
+        sums: Dict[Tuple[int, int], float] = {}
+        amps: Dict[Tuple[int, int], Optional[str]] = {}
+        for forces, amp in self._nodal_loads.values():
+            for nd, v in forces.items():
+                sums[nd] = sums.get(nd, 0.0) + v
+                amps[nd] = amp
+        for nd, v in sums.items():
+            target[nd] = ("%.12g" % v if v else "0", amps[nd])
+        held = {} if self._cload_new else self._nodal_emitted
+        groups: "OrderedDict[Optional[str], List[str]]" = OrderedDict()
+        for nd in sorted(set(target) | set(held)):
+            new = target.get(nd, ("0", None))
+            if held.get(nd) == new or (nd not in held and new[0] == "0"):
+                continue
+            groups.setdefault(new[1], []).append(f"{nd[0]}, {nd[1]}, {new[0]}")
+        self._nodal_emitted = {nd: v for nd, v in target.items() if v[0] != "0"}
+        out: List[str] = []
+        if groups:
+            out.append("** abq2ccx: consistent nodal forces of the surface tractions / beam line "
+                       "loads converted above")
+        for amp, data in groups.items():
+            out.append("*CLOAD" + (f", AMPLITUDE={amp}" if amp else ""))
+            out.extend(data)
+        return out
+
+    def _drop_load_line(self, b: Block, g: Sequence[str], why: str) -> List[str]:
+        """Comment out one load data line, with the reason."""
+        text = ", ".join(x for x in g if x)
+        label = g[1].upper() if len(g) > 1 else ""
+        msg = f"*{b.keyword} {label} on '{g[0]}' not converted: {why}. Commented out."
+        self.report.n_commented += 1
+        self.report.warn(msg, once=True)
+        return ["** abq2ccx: " + msg, "** " + text]
+
+    def _user_load_line(self, b: Block, g: Sequence[str]) -> List[str]:
+        """A load line whose magnitude comes from an Abaqus user subroutine (a ...NU label)."""
+        label = g[1].upper() if len(g) > 1 else ""
+        if label.startswith(("TRVEC", "TRSHR", "EDLD")):
+            return self._drop_load_line(b, g, "its magnitude and direction come from the Abaqus "
+                                              "user subroutine UTRACLOAD, and ccx has no user "
+                                              "traction load")
+        sub = CCX_USER_SUBROUTINE.get(b.keyword, "user subroutine")
+        return self._drop_load_line(b, g, f"its magnitude comes from an Abaqus user subroutine, "
+                                          f"which ccx cannot call (kept, ccx would run its stock "
+                                          f"{sub} in its place); port the subroutine to ccx's "
+                                          f"{sub} and restore the line")
+
+    def _user_load_card(self, b: Block) -> List[str]:
+        """A load / BC card with USER: its magnitudes come from an Abaqus user subroutine."""
+        sub = CCX_USER_SUBROUTINE.get(b.keyword, "user subroutine")
+        what = "prescribed values" if b.keyword == "BOUNDARY" else "magnitudes"
+        return self._commented(b, f"*{b.keyword}, USER: the {what} come from an Abaqus user "
+                                  f"subroutine, which ccx cannot call — kept, ccx would run its "
+                                  f"stock {sub} in place of the deck's own. Commented out: port the "
+                                  f"subroutine to ccx's {sub} and restore the card.")
+
+    def _track_dloads(self, origin: str, b: Block, lines: List[Tuple[tuple, str, str]]) -> None:
+        """Record the *DLOAD lines emitted for a *DLOAD / *DSLOAD card (``origin``), in
+        Abaqus semantics: a zero magnitude removes the load."""
+        state = self._dl_state.setdefault(origin, OrderedDict())
+        amp = b.param("AMPLITUDE")
+        for key, line, mag in lines:
+            self._dl_fresh.add((origin, key))
+            try:
+                zero = bool(mag) and pf(mag) == 0.0
+            except ValueError:
+                zero = False
+            if zero:
+                state.pop(key, None)
+            else:
+                state[key] = (line, amp)
+
+    def _dload_op_new(self, origin: str, wipes: bool = True) -> None:
+        """OP=NEW on a *DLOAD / *DSLOAD: Abaqus removes that card's loads of earlier steps.  An
+        emitted ccx *DLOAD, OP=NEW (``wipes``) removes the other card's too, so they are given
+        again at the end of the step (_flush_dloads)."""
+        state = self._dl_state.setdefault(origin, OrderedDict())
+        for key in [k for k in state if (origin, k) not in self._dl_fresh]:
+            del state[key]
+        self._dl_wiped = self._dl_wiped or wipes
+
+    def _flush_dloads(self) -> List[str]:
+        """After a ccx *DLOAD, OP=NEW in this step: the distributed loads of earlier steps that
+        Abaqus keeps (the other card's, not redefined here), given again."""
+        if not self._dl_wiped:
+            return []
+        groups: "OrderedDict[Optional[str], List[str]]" = OrderedDict()
+        for origin, state in self._dl_state.items():
+            for key, (line, amp) in state.items():
+                if (origin, key) not in self._dl_fresh:
+                    groups.setdefault(amp, []).append(line)
+        out: List[str] = []
+        if groups:
+            out.append("** abq2ccx: distributed loads of earlier steps that Abaqus keeps here (ccx's "
+                       "*DLOAD, OP=NEW above removed them)")
+            self.report.note("*DLOAD / *DSLOAD, OP=NEW: Abaqus removes only the earlier loads of the "
+                             "same card, ccx's *DLOAD, OP=NEW every earlier distributed load — the "
+                             "other card's loads are given again at the end of the step.", once=True)
+        for amp, data in groups.items():
+            out.append("*DLOAD" + (f", AMPLITUDE={amp}" if amp else ""))
+            out.extend(data)
+        return out
 
     def handle_output(self, b: Block) -> List[str]:
         fmap = {"NODE OUTPUT": "NODE FILE", "ELEMENT OUTPUT": "EL FILE",
@@ -3318,6 +4061,11 @@ class Converter:
                            scaled([f"{begin + i * fixed:.6g}, {a:.6g}" for i, a in enumerate(vals)])
             return self._commented(b, "*AMPLITUDE DEFINITION=EQUALLY SPACED could not be expanded "
                                       "(missing/invalid FIXED INTERVAL or data); rebuild as TABULAR.")
+        elif definition == "USER":
+            return self._commented(b, "*AMPLITUDE, DEFINITION=USER: the amplitude comes from the "
+                                      "Abaqus user subroutine UAMP, which ccx cannot call (its own "
+                                      "is uamplitude.f). Commented out: the loads that use it stop "
+                                      "ccx ('nonexistent amplitude') until the subroutine is ported.")
         elif definition in ("PERIODIC", "MODULATED", "DECAY", "SOLUTION DEPENDENT", "ACTUATOR"):
             # first data line holds series constants, not (t, A) pairs — passing it
             # through would be silent garbage
@@ -3758,8 +4506,28 @@ class Converter:
 
     def handle_temperature(self, b: Block) -> List[str]:
         """``*TEMPERATURE`` passes through; the midside nodes of upgraded 2-node beams get the
-        mean of their end nodes' values."""
+        mean of their end nodes' values.  USER (Abaqus UTEMP) is commented out."""
+        if b.has("USER"):
+            return self._user_load_card(b)
         return self.passthrough(b) + self._midside_records(b, "field")
+
+    def handle_flux_film(self, b: Block) -> List[str]:
+        """``*FILM`` / ``*DFLUX`` / ``*CFLUX`` / ``*RADIATE`` pass through, minus the loads whose
+        magnitude comes from an Abaqus user subroutine (USER on the card, a ...NU label):
+        kept, ccx would run its stock film.f / dflux.f / ... in place of the deck's own."""
+        if b.has("USER"):
+            return self._user_load_card(b)
+        kept: List[str] = []
+        side: List[str] = []
+        for ln in b.data:
+            g = [x.strip() for x in ln.split(",")]
+            if _is_user_load(b, g):
+                side += self._user_load_line(b, g)
+            else:
+                kept.append(ln)
+        if not side:
+            return self.passthrough(b)
+        return ([emit_keyword(b.keyword, b.params)] + kept if kept else []) + side
 
     def handle_normal(self, b: Block) -> List[str]:
         """``*NORMAL`` passes through.  ccx builds a beam's expanded cross-section from the
@@ -3961,7 +4729,28 @@ class Converter:
         out.extend(self.emit_geometry())
         out.extend(self._knot_section())
         out.extend(self.emit_other(blocks))
+        self._audit_loads(blocks, out)
         return out
+
+    def _audit_loads(self, blocks: List[Block], out: List[str]) -> None:
+        """Guard against a hollow solve: a step the Abaqus deck loads but whose every load
+        was commented out (or became a stock ccx user subroutine) would still run — to a
+        zero response.  Fills ``unloaded_steps`` (1-based) and ``source_unloaded`` (the deck
+        itself applies no load in any step and has no eigenvalue step)."""
+        src = step_load_audit(blocks, user_loads=True)
+        dst = step_load_audit(blocks_from_lines(out), user_loads=False)
+        self.source_unloaded = bool(src) and all(s == [] for s in src)
+        self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1) if s and d == []]
+        for i in self.unloaded_steps:
+            lost = src[i - 1]
+            self.report.warn(f"Step {i} is loaded in the Abaqus deck ({'; '.join(lost[:3])}"
+                             f"{'; ...' if len(lost) > 3 else ''}), but no load survives the "
+                             f"conversion: ccx would solve it with no load at all, to a zero "
+                             f"response. See the commented-out load cards.")
+        if self.source_unloaded:
+            self.report.note("The Abaqus deck applies no load, prescribed displacement or "
+                             "initial velocity in any step, so its solution is zero — in ccx "
+                             "as in Abaqus.", once=True)
 
     # Cards that read a node set as per-node state or as an output selection: a midside node
     # between two members belongs to the set too (a *BOUNDARY on every node of a beam must
@@ -4253,6 +5042,46 @@ class Converter:
             elif b.keyword in ("STEP", "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "NODE",
                                "ELEMENT"):
                 jc_block = None
+        # distributed loads that become nodal forces need the plane-section thickness, the
+        # beams' n1 directions and the DOFs the deck's own *CLOADs act on
+        self._section_thick, self._beam_n1, self._deck_cloads = {}, {}, {}
+        self._has_normal = any(b.keyword == "NORMAL" for b in blocks)
+        # Abaqus models are 2-D or 3-D throughout: 2-D beams make every beam planar
+        self._planar_beams = any(t.upper().startswith(("B21", "B22", "B23", "PIPE21", "PIPE22"))
+                                 for t in self._elem_types)
+        # a *DLOAD line with no element set loads the whole model (Abaqus); ccx needs a set
+        if self.geom.elements and any(b.keyword == "DLOAD" and any(
+                len(r) > 1 and not r[0].strip() for r in merged_data_records(b)) for b in blocks):
+            self.geom.elsets.setdefault(ALL_ELEMENTS_SET, list(self.geom.elements))
+        for b in blocks:
+            recs = [[x.strip() for x in r] for r in merged_data_records(b)]
+            if b.keyword == "SOLID SECTION":
+                try:
+                    t = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 1.0
+                except ValueError:
+                    t = 1.0
+                for e in self.geom.elset(b.param("ELSET") or ""):
+                    self._section_thick[e] = t
+            elif b.keyword == "BEAM SECTION":
+                # the second data line of a standard profile is the approximate n1 direction
+                n1: Optional[Vec] = None
+                sec = (b.param("SECTION") or "").strip().upper()
+                if sec in ("RECT", "CIRC", "PIPE", "BOX", "THICK PIPE", "I", "L", "HEX", "TRAPEZOID",
+                           "ELLIPSE"):
+                    n1 = (0.0, 0.0, -1.0)
+                    if len(recs) > 1 and len([x for x in recs[1] if x]) >= 3:
+                        try:
+                            n1 = tuple(pf(x) for x in [x for x in recs[1] if x][:3])
+                        except ValueError:
+                            n1 = None
+                for e in self.geom.elset(b.param("ELSET") or ""):
+                    self._beam_n1[e] = n1
+            elif b.keyword == "CLOAD":
+                amp = b.param("AMPLITUDE")
+                for r in recs:
+                    if len(r) > 1 and re.fullmatch(r"[-+]?\d+", r[1]):
+                        for n in self._resolve_nodes(r[0]):
+                            self._deck_cloads.setdefault((n, int(r[1])), set()).add(amp)
         # Abaqus prints the whole model when *EL PRINT / *NODE PRINT has no set; ccx
         # silently prints nothing — give those cards an explicit whole-model set
         if any(b.keyword == "EL PRINT" and not b.param("ELSET") for b in blocks) and self.geom.elements:
@@ -5507,8 +6336,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--quiet", action="store_true", help="suppress the report on stderr")
     ap.add_argument("--approximate", action="store_true",
                     help="opt-in: reframe constructs ccx cannot run as approximately equivalent "
-                         "ones it can (Riks->static, nu>=0.5 clamped, I-beam->equivalent RECT), "
-                         "each with a loud [APPROX] warning")
+                         "ones it can (Riks->static, nu>=0.5 clamped, I-beam->equivalent RECT, "
+                         "NLGEOM follower tractions->fixed nodal forces), each with a loud "
+                         "[APPROX] warning")
     ap.add_argument("--check", action="store_true",
                     help="dry run: parse + convert + report, write nothing")
     ap.add_argument("--strict", action="store_true",

@@ -154,6 +154,19 @@ conversion behaviour and referential integrity.
 | `test_beam_pipe_box_cantilever_example` | the bundled pipe/box cantilevers convert to 40 `B32R` (the `PIPE31` beams with midside nodes, the `B32` beams on their own nodes) with both data lines unchanged, no dangling refs |
 | `test_beam_circ_cantilever_example` | the bundled CIRC cantilever converts to 20 `B32` with midside nodes and diameters, no dangling refs |
 | `test_coupling_plate_examples` | the `coupling_shell_plate`/`coupling_solid_plate` validation pair: 9 knot beams and 27 rotation ties on the `S8R` edge, none for the `C3D20R` reference; no dangling refs |
+| `test_consistent_nodal_forces_integrate_shape_functions` | the face/edge integrator: a unit load gives ¼ per quad4 node, −1/12 and ⅓ on quad8 corners and midsides, ⅙ per tri3 node, 0 and ⅙ on tri6 corners and midsides, ⅙-⅙-⅔ on a 3-node edge, and 2π ∫ N r ds on an axisymmetric edge |
+| `test_dsload_traction_becomes_consistent_nodal_forces` | `*DSLOAD TRVEC` on a C3D8 face → a `*CLOAD` of magnitude × area / 4 per node along the normalised direction; `TRSHR` projected onto the face; a `TRSHR` normal to the face is refused; element-based `TRVEC2` is the same load |
+| `test_traction_on_plane_and_axisymmetric_edges` | a plane-stress edge traction is times the section thickness and in-plane only; an axisymmetric one is over the full circle (2πr) |
+| `test_traction_under_nlgeom_converts_only_when_exact` | under NLGEOM a follower (`FOLLOWER=YES`, the default) or per-current-area (`CONSTANT RESULTANT=NO`) traction is commented and the step flagged; `FOLLOWER=NO, CONSTANT RESULTANT=YES` converts; `--approximate` converts the rest with `[APPROX]` |
+| `test_converted_loads_across_steps_never_use_op_new` | converted forces carry their `AMPLITUDE`; an unchanged load is not re-emitted; `*DSLOAD, OP=NEW` gives the old traction's nodes 0 instead of `OP=NEW`; after the deck's own `*CLOAD, OP=NEW` the converted forces are given again |
+| `test_converted_load_sharing_a_deck_cload_dof` | a converted force on a node DOF the deck's own `*CLOAD` also loads is kept in a one-step deck (ccx adds them) and refused in a multi-step one (ccx would replace one with the other) |
+| `test_beam_line_loads_become_consistent_nodal_forces` | `*DLOAD PY` / `P1` / `P2` / `PZ` on `B31`, `B32`, an upgraded `CIRC` beam (its midside node takes ⅔) and a planar `B21` → nodal forces along the global or local (n1, t × n1) axes |
+| `test_user_subroutine_loads_are_commented_out` | `*BOUNDARY, USER`, `*CLOAD, USER`, a `P1NU` line, `*TEMPERATURE, USER`, a `F1NU` film and `*AMPLITUDE, DEFINITION=USER` are commented, naming `uboun.f` / `cload.f` / `dload.f` / `utemp.f` / `film.f` / `uamplitude.f`; the other lines stay |
+| `test_load_audit_flags_steps_whose_loads_do_not_survive` | a step loaded only by a `*BOUNDARY, USER` is flagged (`unloaded_steps`); an empty step marks the deck `source_unloaded`, a frequency step does not; `step_load_audit` carries loads across steps and resets them only with `OP=NEW` (not the cards before it in the same step) |
+| `test_dload_and_dsload_op_new_keep_each_others_loads` | a `*DLOAD, OP=NEW` keeps the earlier `*DSLOAD` pressure (given again), and a `*DSLOAD, OP=NEW` the earlier gravity — ccx's `OP=NEW` would remove both |
+| `test_dload_without_element_set_loads_the_whole_model` | `, GRAV, ...` (no element set: the whole model in Abaqus) → a whole-model element set |
+| `test_dsload_on_undefined_surface_says_so` | a `*DSLOAD` on a surface the deck never defines says so (it used to say "not element-based") and flags the step |
+| `test_distributed_load_examples` | the Cook, line-load and cylinder examples' converted forces add up to the applied loads (1; q L per beam; 2π a h p) |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -181,6 +194,21 @@ deck and runs it in CalculiX:
   one through the thickness, the brick ccx expands an `S8R` into — under `*RIGID BODY`.
   The reference-point displacements must agree within 0.5 % of |u| (they agree to
   0.001 %).
+* **`cook_membrane_traction`** — Cook's membrane (plane stress, E = 1, ν = 1/3, 16 × 16
+  `CPS8`) under a shear traction on its right edge (`*DSLOAD TRVEC`, total 1), which ccx has
+  no card for: the converter applies consistent nodal forces. Checks the vertical
+  displacement of the loaded edge's midpoint against the published 23.96 (Bergan & Felippa
+  1985): 23.932, 0.12 %. (An independent plane-stress Q8 solution converges to 23.963 there;
+  the top corner converges to 25.19, so the classic reference point is the edge midpoint.)
+* **`beam_line_load_cantilever`** — uniform line loads on three cantilevers: `*DLOAD PY` on
+  `B31`, the local `P2` on `B32` and `PZ` on a circular `B31` run as `B32` with midside nodes.
+  Checks that the converted forces add up to q L exactly and the tip deflections against
+  q L⁴/(8 E I): 0.1 %, 1.2 % and 0.6 % (the 10-element `B32` is stiffest).
+* **`cylinder_traction_cax`** — an open-ended thick cylinder (`CAX8`) under internal pressure
+  applied as a radial traction (`*DSLOAD TRVEC`): u_r at the inner and outer radius against
+  Lamé, within 0.02 % — the full-circle (2πr) convention of axisymmetric nodal forces, which
+  ccx shares with Abaqus (probed: a `*CLOAD` on a `CAX4` edge matches the same edge under
+  pressure only as the 2π total).
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -199,9 +227,14 @@ deck and runs it in CalculiX:
   records its own) into `corpus/files/` (gitignored), and are content-deduplicated so a
   byte-identical fixture shared across repos appears once.
 * **`corpus/fetch.py`** — downloads the manifest's decks.
-* **`tests/test_corpus.py`** — two checks:
+* **`tests/test_corpus.py`** — these checks:
   * `test_corpus_converts` — every present deck converts without crashing and the
     result is referentially consistent (zero dangling references). **Always runs.**
+  * `test_corpus_loads` — an `expect_solve` deck must keep a load in every step the
+    Abaqus deck loads (the converter's load audit, `Converter.unloaded_steps`): a step
+    whose loads were all commented out would still "solve" in ccx, to a zero response.
+    And `source_unloaded=True` must flag exactly the decks that load no step at all.
+    **Always runs** (no ccx needed).
   * `test_corpus_solves` — decks marked `expect_solve` are run in CalculiX and must
     **solve**: ccx exits 0, prints "Job finished" with no `*ERROR` and no crash/abort
     message on stdout or stderr, and executes at least one analysis `STEP`. Mesh-only
@@ -213,9 +246,12 @@ deck and runs it in CalculiX:
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **220 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
-other 583 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
-other user subroutines, Riks, cohesive/connector elements, piezoelectric/acoustic
+references; **188 solve** in CalculiX under their own loads and **219 mesh-only decks are
+accepted** by it. 14 more decks solve but load nothing in the source deck itself (an empty
+`*STEP`), so their solution is zero in Abaqus as well; they stay in the gate as conversion
+checks (`source_unloaded=True`), outside the headline count. The other 601 convert cleanly
+but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
+Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
 externally-supplied `<parameter>` values, or nodes numbered from 0) — and each was
 verified to fail *no worse than the original, unconverted deck*.
@@ -303,6 +339,42 @@ dynamics ("linear and nonlinear MPC's depend on each other", with or without the
 beams), and coupled DOFs that also carry a `*BOUNDARY` — `dheller1_uprofile` now passes
 the gen3dmpc check but stops on that overconstraint, which Abaqus resolves and ccx does
 not.
+
+**Hollow solves: loads that did not survive the conversion.** A solve only counts if the
+model carries the deck's loads. A load audit (`step_load_audit`, run on the Abaqus deck and
+on the converted one) found that 53 of the 220 decks then gated as solving ran with no load
+at all, so ccx "solved" them to zero displacement:
+
+* 36 lost their only load, a surface traction (`*DSLOAD TRVEC` / `TRSHR`), which ccx has no
+  card for and the converter used to comment out;
+* 3 had a user-subroutine BC (`*BOUNDARY, USER`), which went through unchanged, so ccx ran
+  its stock `uboun.f` instead of the deck's `DISP` routine;
+* 14 load nothing in the source deck itself.
+
+Tractions and beam line loads (`*DLOAD PX/PY/PZ/P1/P2`, which ccx reads on a beam as a
+section-face pressure) now become consistent nodal forces: the face/edge shape functions
+integrated by Gauss quadrature over the undeformed geometry, times the plane-section
+thickness (probed: a ccx `*CLOAD` on a `CPS`/`CPE` node is the total for the section
+thickness) or over the full circle on axisymmetric edges (probed: ccx, like Abaqus, takes
+the 2π total there), emitted as a `*CLOAD` at the end of the step. ccx adds `*CLOAD`s on
+one node and DOF within a step and replaces them across steps (probed, as for `*DLOAD`), so
+the converted forces are re-emitted as totals when they change, never with `OP=NEW` (which
+would also remove the deck's own concentrated loads). Nodal forces are exact in small-strain
+steps; under NLGEOM only for a `TRVEC` that keeps its direction and resultant
+(`FOLLOWER=NO, CONSTANT RESULTANT=YES` — the defaults are `YES` / `NO`), since ccx keeps a
+`*CLOAD` fixed. Any other NLGEOM traction stays commented unless `--approximate`.
+User-subroutine loads and BCs are commented out, naming the ccx subroutine to port. The
+audit is now a corpus gate (`test_corpus_loads`).
+
+Of the 36 traction decks, 20 now solve under their real load: their converted forces add up
+to traction × area to 1e-13 per surface, and on `minhnguyenikm_cook_q4_job_2` (`TRSHR`) ccx
+gives the same corner deflection as an independent Q4 solution of the same mesh (1.073028).
+`xzhang66_plainstrain` (element-based `TRSHR2`/`TRSHR4` with end pressures), which ccx
+used to stop on, now solves and joins the gate: ccx matches an independent Q4 solution
+there on all 45 nodes to 2e-7. The other 16 traction decks are NLGEOM follower or
+current-area tractions and leave the gate, as do the 3 user-subroutine decks. Net: 220
+gated decks, of which 167 carried their real loads → 202 gated, of which 188 (all but the
+14 `source_unloaded` ones) do.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

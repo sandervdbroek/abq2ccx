@@ -64,10 +64,22 @@ TRANSLATED = {
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped.",
     "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped; "
         "DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 "
-        "crashes on them).",
-    "*DLOAD": "passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / "
-        "`CONSTANT RESULTANT` dropped (warned under NLGEOM).",
-    "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`.",
+        "crashes on them); `USER` (Abaqus `DISP`) commented, naming ccx's `uboun.f`.",
+    "*DLOAD": "pressures and body loads passed through (`Px` faces match Abaqus); bare `P` on solids "
+        "flagged; a line without an element set (Abaqus: the whole model) gets a whole-model set; "
+        "`FOLLOWER=NO` / `CONSTANT RESULTANT` dropped (warned under NLGEOM). Element tractions "
+        "(`TRVECn`/`TRSHRn`) and beam line loads (`PX`/`PY`/`PZ`/`P1`/`P2` — ccx reads `P1`/`P2` "
+        "on a beam as a section-face pressure) → consistent nodal forces, as for `*DSLOAD` "
+        "tractions; user-subroutine labels (`...NU`) commented, naming ccx's `dload.f`. "
+        "`OP=NEW` keeps the `*DSLOAD` pressures Abaqus keeps (ccx's `OP=NEW` would remove them).",
+    "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; surface tractions "
+        "(`TRVEC`/`TRSHR`, which ccx has no card for) → consistent nodal forces: the face/edge "
+        "shape functions integrated by Gauss quadrature over the undeformed geometry (times the "
+        "plane-section thickness, or 2πr on axisymmetric edges; `TRSHR` projected onto the face), "
+        "emitted as a `*CLOAD` (one per amplitude, never `OP=NEW`) at the end of the step. Exact in "
+        "small-strain steps and, under NLGEOM, for `TRVEC` with `FOLLOWER=NO, CONSTANT "
+        "RESULTANT=YES`; any other NLGEOM traction is commented (`--approximate` converts it with an "
+        "`[APPROX]` warning).",
     "*TIE": "Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept.",
     "*MPC": "`TIE` → per-DOF `*EQUATION`; `PLANE`/`STRAIGHT` kept; others commented.",
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
@@ -87,7 +99,12 @@ TRANSLATED = {
         "members get knot beams; the rotations of `TIE NSET`/`ELSET` shell/beam members are tied "
         "to the `ROT NODE`, `PIN NSET` ones stay free.",
     "*CLOAD": "moments on a rigid-body reference point → its `ROT NODE`; `ORIENTATION=` (local "
-        "axes) and `FOLLOWER=YES` dropped with a warning.",
+        "axes) and `FOLLOWER=YES` dropped with a warning; `USER` commented, naming ccx's `cload.f`.",
+    "*TEMPERATURE": "passed through (upgraded beams' midside nodes get their end nodes' mean); "
+        "`USER` (Abaqus `UTEMP`) commented, naming ccx's `utemp.f`.",
+    "*FILM / *DFLUX / *CFLUX / *RADIATE": "passed through, except loads from an Abaqus user "
+        "subroutine (`USER`, a `...NU` label): commented, naming ccx's `film.f` / `dflux.f` / "
+        "`cflux.f` / `radiate.f` (kept, ccx would run its stock subroutine instead).",
     "*CONTACT PAIR": "missing `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; the note "
         "suggests `SURFACE TO SURFACE` if ccx struggles to converge); `TIED` → `*TIE`; `SMALL "
         "SLIDING` dropped for surface-to-surface; Abaqus-only params dropped.",
@@ -109,7 +126,8 @@ TRANSLATED = {
     "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for "
         "strain hardening with m ≠ 0); other laws → `LAW=USER`.",
     "*AMPLITUDE": "keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; "
-        "`SMOOTH STEP` sampled, `EQUALLY SPACED` expanded, `VALUE=ABSOLUTE` warned. (`*AMP` alias "
+        "`SMOOTH STEP` sampled, `EQUALLY SPACED` expanded, `VALUE=ABSOLUTE` warned, "
+        "`DEFINITION=USER` (Abaqus `UAMP`) commented, naming ccx's `uamplitude.f`. (`*AMP` alias "
         "accepted.)",
     "*RESTART": "keeps `WRITE`/`READ`/`FREQUENCY`/`STEP`; other params dropped.",
     "*SURFACE": "only `NAME`/`TYPE` kept; shell edges `E1..E4` → `S3..S6` (plane elements "
@@ -127,6 +145,11 @@ TRANSLATED = {
         "the deck has no step.",
     "INPUT= on data cards": "the referenced file's data lines are inlined (ccx reads `INPUT=` "
         "only on `*INCLUDE`).",
+    "Load audit": "every step the Abaqus deck loads (loads, prescribed values, initial "
+        "velocities; they persist across steps until `OP=NEW`) must still carry a load after "
+        "conversion: a step whose loads were all commented out is warned (`Step N is loaded in the "
+        "Abaqus deck ... but no load survives the conversion`), since ccx would solve it with no "
+        "load; a deck that loads no step at all is noted.",
 }
 
 
@@ -219,7 +242,7 @@ def gen_keywords():
                "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
-               "CONTACT OUTPUT", "CONTACT FILE"}
+               "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE"}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",
