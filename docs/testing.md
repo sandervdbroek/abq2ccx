@@ -34,7 +34,8 @@ They cover:
 * **Constraints** — `*MPC`, couplings and rigid bodies, knot beams, overconstraint
   settling, connectors, `*TRANSFORM`s.
 * **Loads, BCs and steps** — consistent nodal forces, the load audit, surface-element
-  loads, velocity and acceleration BCs, `OP=NEW`, temperatures, explicit defaults, Riks.
+  loads, velocity and acceleration BCs, the default amplitude of displacement BCs, `OP=NEW`,
+  temperatures, explicit defaults, Riks.
 * **Output** — the `.frd`/`.dat` mapping, output frequencies, preselected field and contact
   output, ccx's label lists.
 
@@ -79,6 +80,7 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `transform_spherical_rigid` | a spherical `*TRANSFORM`; a transformed rigid-body reference point | the model in global components | exact |
 | `velocity_bc_column` | `TYPE=VELOCITY` with a `SMOOTH STEP`, kept into a second step | the integral of the velocity | 5e-5 of the travel |
 | `velocity_bc_bar` | a bar driven by a velocity (explicit) and an acceleration (implicit) | wave theory | ≈ 1 % on average |
+| `default_amplitude_bars` | a displacement BC and a `*CLOAD` without an amplitude, in implicit `*DYNAMIC`, `*VISCO`, a transient coupled and an explicit step | Abaqus' defaults: the BC ramped (explicit: held where it is), the load applied at once | the ramp to 7e-18 (ccx alone: 0.02 off); 1.98 × static overshoot; the hold exact |
 | `preselect_output_bar`, `preselect_contact_blocks` | Abaqus/CAE's `PRESELECT` requests: U, RF, S, contact pressure | statics | ≤ 0.005 % |
 | `explicit_default_output_bar` | an explicit step with no output request: 20 intervals | wave theory | exact before the wave arrives |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |

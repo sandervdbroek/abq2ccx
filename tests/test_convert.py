@@ -4994,6 +4994,175 @@ def test_velocity_bc_in_frequency_step_keeps_the_constraint():
     assert "*BOUNDARY\nTOP, 3, 3\n" in body and "ABQ2CCX_VEL" not in body
 
 
+RAMP = "*BOUNDARY, AMPLITUDE=RAMP12357111317"
+
+
+def test_default_amplitude_ramps_displacement_bcs_where_ccx_steps_them():
+    # ccx gives a BC without AMPLITUDE its procedure's default as Abaqus does (RAMP in static
+    # and steady-state steps, STEP elsewhere), but Abaqus/Standard always ramps a displacement:
+    # where ccx would step it, the line gets ccx's own step ramp, and *STEP, AMPLITUDE=STEP
+    # (ccx's default there anyway) makes ccx define it
+    for step, proc, ramped, head in (
+            ("*Step", "*Static", False, "*STEP\n"),
+            ("*Step, amplitude=STEP", "*Static", True, "*STEP, AMPLITUDE=STEP\n"),
+            ("*Step", "*Dynamic", True, "*STEP, AMPLITUDE=STEP\n"),
+            ("*Step", "*Dynamic, application=QUASI-STATIC", False, "*STEP, AMPLITUDE=RAMP\n"),
+            ("*Step, amplitude=RAMP", "*Dynamic", False, "*STEP, AMPLITUDE=RAMP\n"),
+            ("*Step", "*Visco, cetol=0.001", True, "*STEP, AMPLITUDE=STEP\n"),
+            ("*Step", "*Coupled temperature-displacement", True, "*STEP, AMPLITUDE=STEP\n"),
+            ("*Step", "*Coupled temperature-displacement, steady state", False, "*STEP\n"),
+            ("*Step", "*Uncoupled temperature-displacement", True, "*STEP, AMPLITUDE=STEP\n"),
+            ("*Step", "*Uncoupled temperature-displacement, steady state", False, "*STEP\n"),
+            ("*Step", "*Heat transfer", False, "*STEP\n"), ("*Step", "*Frequency", False, "*STEP\n"),
+            ("*Step, perturbation", "*Static", False, "*STEP\n")):
+        body, _, rep = convert_str(VEL_HEX + f"{step}\n{proc}\n0.1, 1.\n*Boundary\nTOP, 3, 3, 0.1\n"
+                                             f"*Cload\n5, 1, 1.\n*End Step\n")
+        st = _without_output("*STEP" + _step(body, 1))
+        assert st.startswith(head), (step, proc, st)
+        assert (f"{RAMP}\nTOP, 3, 3, 0.1\n" in st) == ramped, (step, proc, st)
+        assert "*CLOAD\n5, 1, 1.\n" in st, (step, proc)                # loads: the step's default
+        assert ("'always a RAMP function'" in rep.text()) == ramped
+    # an amplitude, FIXED, a velocity or the temperature: as given
+    for card in ("*Boundary, amplitude=A\nTOP, 3, 3, 0.1\n", "*Boundary, fixed\nTOP, 3, 3\n",
+                 "*Boundary, type=VELOCITY\nTOP, 3, 3, 0.1\n", "*Boundary\nTOP, 11, 11, 20.\n"):
+        body, _, _ = convert_str(VEL_HEX + "*Amplitude, name=A\n0., 0., 1., 1.\n*Step\n"
+                                           "*Coupled temperature-displacement\n0.1, 1.\n" + card +
+                                 "*End Step\n")
+        assert RAMP not in body and "*STEP\n" in body, card
+
+
+def test_default_amplitude_ramp_only_where_it_changes_something():
+    # a zero line on DOFs still at zero when the step starts is the same ramped or not: kept
+    # as it is; DOFs a step moved (or left free) ramp back from where they are, line by line
+    # and DOF by DOF (node 6's DOFs 1-2 held at zero in step 1, its DOF 3 moved; node 8 moved,
+    # node 1 is held by the model's BC)
+    body, _, _ = convert_str(VEL_HEX + "*Step\n*Dynamic\n0.1, 1.\n*Boundary\nTOP, 3, 3, 0.1\n1, 1, 3\n"
+                                       "6, 1, 2\n*End Step\n*Step\n*Dynamic\n0.1, 1.\n*Boundary\n"
+                                       "TOP, 3, 3\n6, 1, 3\n8, ENCASTRE\n1, ENCASTRE\n*End Step\n"
+                                       "*Step\n*Dynamic\n0.1, 1.\n*Boundary\n6, 1, 2\n*End Step\n")
+    s1, s2, s3 = (_without_output("*STEP" + _step(body, k)) for k in (1, 2, 3))
+    assert s1.startswith("*STEP, AMPLITUDE=STEP\n") and \
+        f"{RAMP}\nTOP, 3, 3, 0.1\n*BOUNDARY\n1, 1, 3\n6, 1, 2\n" in s1
+    assert s2.startswith("*STEP, AMPLITUDE=STEP\n") and \
+        f"{RAMP}\nTOP, 3, 3\n*BOUNDARY\n6, 1, 2\n{RAMP}\n6, 3, 3\n8, 1, 3\n*BOUNDARY\n1, 1, 3\n" in s2
+    assert s3.startswith("*STEP\n") and "*BOUNDARY\n6, 1, 2\n" in s3 and RAMP not in s3
+    # the card's OP=NEW goes with its first piece; a midside node of an upgraded beam ramps
+    # with the end node that moves it (the card's own interpolation, kept in one piece)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=BEAM\n1, 1, 2\n"
+            "*Beam Section, elset=BEAM, material=M, section=CIRC\n0.05\n0., 0., -1.\n*Material, "
+            "name=M\n*Elastic\n2.1e5, 0.3\n*Density\n7.8e-9\n*Boundary\n1, 1, 6\n2, 1, 2\n2, 4, 6\n"
+            "*Step\n*Dynamic\n0.1, 1.\n*Boundary, op=NEW\n1, 1, 6\n2, 1, 2\n2, 3, 3, 0.2\n2, 4, 6\n"
+            "*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert list(conv._midside.values()) == [(1, 2, 3)]
+    st = _without_output("*STEP" + _step(body, 1))
+    assert f"*BOUNDARY, OP=NEW\n1, 1, 6\n2, 1, 2\n{RAMP}\n2, 3, 3, 0.2\n*BOUNDARY\n2, 4, 6\n" \
+           f"3, 1, 2\n{RAMP}\n3, 3, 3, 0.1\n*BOUNDARY\n3, 4, 6\n" in st, st
+    assert st.count("OP=NEW") == 1
+
+
+def test_default_amplitude_explicit_holds_the_dof():
+    # Abaqus/Explicit ignores the value of a displacement BC without AMPLITUDE and enforces a
+    # zero velocity: a DOF still at zero gets a zero BC; one that may have moved is held
+    # where the previous step left it (FIXED), per DOF of a named type too
+    body, _, rep = convert_str(VEL_HEX + "*Step, amplitude=RAMP\n*Dynamic, explicit\n, 1.\n*Boundary\n"
+                                         "TOP, 3, 3, 0.1\n*Cload\nTOP, 1, 1.\n*End Step\n*Step\n"
+                                         "*Dynamic, explicit\n, 1.\n*Boundary\nTOP, 3, 3, 0.2\n"
+                                         "TOP, PINNED\n*End Step\n")
+    s1, s2 = (_without_output("*STEP" + _step(body, k)) for k in (1, 2))
+    assert s1.startswith("*STEP, INC=10000000, NLGEOM\n")              # *STEP AMPLITUDE dropped
+    assert "*BOUNDARY\nTOP, 3, 3\n*CLOAD" in s1
+    assert "*BOUNDARY\nTOP, 3, 3\n*BOUNDARY, FIXED\nTOP, 1, 2\n*BOUNDARY\nTOP, 3, 3\n" in s2
+    text = rep.text()
+    assert "ignores the value ('does not admit jumps in displacement')" in text
+    assert "held where the previous step left them (*BOUNDARY, FIXED)" in text
+    assert "dropped on an explicit step" in text
+    # the load audit follows: a nonzero value without AMPLITUDE moves nothing in Abaqus/Explicit
+    _, conv, _ = convert_str(VEL_HEX + "*Step\n*Dynamic, explicit\n, 1.\n*Boundary\nTOP, 3, 3, 0.1\n"
+                                       "*End Step\n")
+    assert conv.source_unloaded and not conv.unloaded_steps
+    _, conv, _ = convert_str(VEL_HEX + "*Amplitude, name=A\n0., 0., 1., 1.\n*Step\n*Dynamic, explicit\n"
+                                       ", 1.\n*Boundary, amplitude=A\nTOP, 3, 3, 0.1\n*End Step\n")
+    assert not conv.source_unloaded and not conv.unloaded_steps
+
+
+def test_default_amplitude_explicit_hold_limits():
+    # FIXED holds a rigid body's rotations on its ROT NODE's translations; it takes no
+    # shell/beam rotation and misreads a node with a *TRANSFORM in ccx 2.23: kept, warned
+    later = "*Step\n*Dynamic, explicit\n, 1.\n*Cload\n{0}, 3, 1.\n*End Step\n*Step\n*Dynamic, explicit\n" \
+            ", 1.\n*Boundary\n{1}\n*End Step\n"
+    body, conv, rep = convert_str(VEL_HEX + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=RP\n100\n"
+                                            "*Rigid Body, ref node=100, tie nset=TOP\n" +
+                                  later.format("RP", "RP, 4, 6"))
+    assert f"*BOUNDARY, FIXED\n{conv._rb_rot[100]}, 1, 3\n" in body and "Kept as given" not in rep.text()
+    body, _, rep = convert_str(VEL_HEX + "*Transform, nset=TOP\n0., 1., 0., -1., 0., 0.\n" +
+                               later.format("TOP", "TOP, 1, 1, 0.5"))
+    assert "*BOUNDARY\nTOP, 1, 1, 0.5\n" in _without_output(_step(body, 2)) and \
+        "Kept as given" in rep.text()
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, "
+             "elset=P\n1, 1, 2, 3, 4\n*Shell Section, elset=P, material=M\n0.1\n*Material, name=M\n"
+             "*Elastic\n1000., 0.3\n*Density\n1.\n*Boundary\n1, 1, 6\n2, 1, 6\n")
+    body, _, rep = convert_str(shell + later.format("3", "3, 4, 4\n3, 1, 3"))
+    assert "*BOUNDARY\n3, 4, 4\n*BOUNDARY, FIXED\n3, 1, 3\n" in _without_output(_step(body, 2)) and \
+        "Kept as given" in rep.text()
+    # a velocity BC's zero rate from an unknown start, on a transformed node: not FIXED either
+    body, _, _ = convert_str(VEL_HEX + "*Transform, nset=TOP\n0., 1., 0., -1., 0., 0.\n*Step\n*Static\n"
+                                       "*Cload\nTOP, 3, 1.\n*End Step\n*Step\n*Static\n*Boundary, "
+                                       "type=VELOCITY\nTOP, 1, 3\n*End Step\n")
+    assert "\n*BOUNDARY, FIXED\n" not in body and "a node with a *TRANSFORM: ccx 2.23 reads the global" in body
+
+
+def test_default_amplitude_on_transformed_nodes():
+    # ccx allows one amplitude for all DOFs of a node with a *TRANSFORM, and its step ramp
+    # starts a BC new on a DOF there from an auxiliary node's value (probed: from 0), so all
+    # the node's lines of a step ramp - its zero ones too, warned - where every DOF had a BC
+    # before the step (or in the first step), and none where one had not (warned)
+    tr = "*Transform, nset=TOP\n0., 1., 0., -1., 0., 0.\n"
+    body, _, rep = convert_str(VEL_HEX + tr + "*Step\n*Dynamic\n0.1, 1.\n*Boundary\nTOP, 1, 1, 0.01\n"
+                                         "TOP, 2, 2\n*End Step\n*Step\n*Dynamic\n0.1, 1.\n*Boundary\n"
+                                         "TOP, 3, 3, -0.005\nTOP, 1, 1, 0.02\n*End Step\n*Step\n"
+                                         "*Dynamic\n0.1, 1.\n*Boundary\nTOP, 1, 1, 0.03\n*End Step\n")
+    s1, s2, s3 = (_without_output("*STEP" + _step(body, k)) for k in (1, 2, 3))
+    assert f"{RAMP}\nTOP, 1, 1, 0.01\nTOP, 2, 2\n" in s1
+    assert s2.startswith("*STEP\n") and "*BOUNDARY\nTOP, 3, 3, -0.005\nTOP, 1, 1, 0.02\n" in s2
+    assert f"{RAMP}\nTOP, 1, 1, 0.03\n" in s3            # DOF 1 had a BC: ccx ramps from it
+    text = rep.text()
+    assert "so its zero displacement BCs in that step were ramped too" in text
+    assert "ccx's step ramp would start it there from the value of the auxiliary node" in text
+    body, _, rep = convert_str(VEL_HEX + tr + "*Step\n*Dynamic\n0.1, 1.\n*Boundary\nTOP, 1, 1, 0.01\n"
+                                         "*End Step\n")
+    assert f"{RAMP}\nTOP, 1, 1, 0.01\n" in body and "were ramped too" not in rep.text()
+    # the BCs that hold a connector, repeated after OP=NEW, get their own card after a FIXED one
+    deck = (HEX + "*Node\n9, 2.,0.,0.\n*Element, type=CONN3D2, elset=G\n5, 9,\n*Connector Section, "
+            "elset=G\nJoin,\n*Boundary\n1, 1, 3\n*Step\n*Dynamic, explicit\n, 1.\n*Cload\n7, 3, 1.\n"
+            "*End Step\n*Step\n*Dynamic, explicit\n, 1.\n*Boundary, op=NEW\n7, 1, 3\n1, 1, 3\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    assert "*BOUNDARY, OP=NEW, FIXED\n7, 1, 3\n*BOUNDARY\n9, 1, 1\n9, 2, 2\n9, 3, 3\n*BOUNDARY\n" \
+           "1, 1, 3\n" in _step(body, 2)
+
+
+def test_default_amplitude_example():
+    # the deck validate_with_ccx.py runs: the driven top ramps in both steps, the load steps
+    body, _, _ = convert(os.path.join(EXAMPLES, "default_amplitude_bars.inp"))
+    s1, s2 = (_without_output("*STEP" + _step(body, k)) for k in (1, 2))
+    assert s1.startswith("*STEP, INC=1000, AMPLITUDE=STEP\n") and \
+        f"{RAMP}\nDRIVEN_TOP, 3, 3, 0.01\n*CLOAD\nLOADED_TOP, 3, 0.25\n" in s1
+    assert s2.startswith("*STEP, INC=1000, AMPLITUDE=STEP\n") and f"{RAMP}\nDRIVEN_TOP, 3, 3, 0.03\n" in s2
+    assert not dangling_refs(reparse(body))
+
+
+def test_default_amplitude_explicit_hold_feeds_the_velocity_plan():
+    # a velocity BC after an explicit step that held its DOF with a displacement BC without
+    # AMPLITUDE (zero velocity) starts from where the DOF stood, not from the ignored value
+    body, _, _ = convert_str(VEL_HEX + "*Step\n*Dynamic, explicit\n, 1.\n*Boundary, type=VELOCITY\n"
+                                       "TOP, 3, 3, 1.\n*End Step\n*Step\n*Dynamic, explicit\n, 1.\n"
+                                       "*Boundary\nTOP, 3, 3, 5.\n*End Step\n*Step\n*Dynamic, explicit\n"
+                                       ", 1.\n*Boundary, type=VELOCITY\nTOP, 3, 3, 1.\n*End Step\n")
+    assert "*BOUNDARY, FIXED\nTOP, 3, 3\n" in _step(body, 2)
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nTOP, 3, 3, 1.\n" in _step(body, 3)
+    assert _amplitude(body, "ABQ2CCX_VEL2") == [(0.0, 1.0), (1.0, 2.0)]
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

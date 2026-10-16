@@ -77,7 +77,7 @@ prints one `PASS` line per check, about sixty in all; [testing](docs/testing.md)
 | rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads and connectors on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
 | per-element `*DISTRIBUTION` orientations (a solid plate, a composite shell) | one `*ORIENTATION` per element | ≤ 3e-11 |
 | thermal expansion (orthotropic, anisotropic, no initial temperatures) | α ΔT; analytic stress | ≤ 5e-6 |
-| velocity / acceleration BCs | their time integral; wave theory | 5e-5 of the travel; wave stress ≈ 1 % on average |
+| velocity / acceleration BCs; displacement BCs without an amplitude | their time integral; wave theory; Abaqus' default amplitudes | 5e-5 of the travel; wave stress ≈ 1 % on average; exact |
 | preselected and default output, contact output | statics, wave theory | ≤ 0.005 % (static) |
 
 A **corpus of 1022 genuine Abaqus decks** from about 180 public repositories (CAE exports,
@@ -154,6 +154,7 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`cook_membrane_traction`](examples/cook_membrane_traction.inp), [`cylinder_traction_cax`](examples/cylinder_traction_cax.inp) | `*DSLOAD TRVEC` on `CPS8` and `CAX8` edges → nodal forces |
 | [`traction_transformed_face`](examples/traction_transformed_face.inp), [`transform_spherical_rigid`](examples/transform_spherical_rigid.inp) | loads on `*TRANSFORM`ed nodes; a spherical transform; a transformed rigid-body reference point |
 | [`velocity_bc_column`](examples/velocity_bc_column.inp), [`velocity_bc_bar`](examples/velocity_bc_bar.inp) | `*BOUNDARY, TYPE=VELOCITY` (implicit and explicit) |
+| [`default_amplitude_bars`](examples/default_amplitude_bars.inp) | a displacement `*BOUNDARY` and a `*CLOAD` without an amplitude → ramped / stepped as in Abaqus (run as `*DYNAMIC`, `*VISCO`, coupled and explicit) |
 | [`preselect_output_bar`](examples/preselect_output_bar.inp), [`explicit_default_output_bar`](examples/explicit_default_output_bar.inp), [`preselect_contact_blocks`](examples/preselect_contact_blocks.inp) | Abaqus' preselected and default output |
 | [`coverage_kitchen_sink`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped and commented cards, output-variable mapping |
 

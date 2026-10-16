@@ -90,6 +90,8 @@ Messages are de-duplicated. A clean conversion says *"No conversion issues were 
 | `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` on a DOF that an `*EQUATION`, `*MPC` or rigid body eliminates, which the converter could not resolve exactly; ccx will stop. The message says what Abaqus does and whether `--approximate` resolves it |
 | `*BOUNDARY taken off …` / `… moved to the reference node … Exact.` | BCs on rigid-constraint members resolved the way Abaqus does; nothing to do |
 | `*BOUNDARY, TYPE=VELOCITY … start of the step is unknown` | the DOF was free before the step, so its displacement there is unknown: a zero velocity became `*BOUNDARY, FIXED`, anything else was commented out — prescribe a displacement, or constrain the DOF in the earlier step |
+| `*BOUNDARY (displacement) with a nonzero value and no AMPLITUDE in an explicit step` | Abaqus/Explicit ignores that value and holds the DOF, so nothing moves — in Abaqus too; give the BC an amplitude if the DOF should move |
+| `… Kept as given: ccx moves the DOF to that value at once` / `… on a node with a *TRANSFORM, on a DOF that had no BC before the step` | ccx cannot hold or ramp that displacement BC the way Abaqus does, so the DOF jumps to the given value; give the BC an amplitude in the Abaqus deck |
 | `… member(s) reference undefined …` | a set named ids that don't exist; check upstream renumbering if the count surprises you |
 | `Duplicate node/element id(s) …` | the deck defines an id twice; the last one wins, as in Abaqus |
 
@@ -107,6 +109,9 @@ Everything the converter creates starts with `ABQ2CCX_`:
 | `ABQ2CCX_TR*`, `ABQ2CCX_OR*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles) |
 | `ABQ2CCX_VEL*`, `ABQ2CCX_ACC*` | amplitudes that integrate velocity and acceleration BCs |
 | `ABQ2CCX_TP*`, `ABQ2CCX_OUTPUT*` | generated `*TIME POINTS` and output node sets |
+
+One name is ccx's own: `AMPLITUDE=RAMP12357111317` on a `*BOUNDARY` is ccx's step ramp, which
+the converter uses where Abaqus/Standard ramps a displacement BC that ccx would apply at once.
 
 Edit the Abaqus deck and convert again rather than editing these by hand.
 

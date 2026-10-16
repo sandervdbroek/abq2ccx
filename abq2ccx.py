@@ -1867,15 +1867,20 @@ def _is_user_load(b: Block, f: Sequence[str]) -> bool:
         f[1].strip().upper().endswith("NU")
 
 
-def _load_entries(b: Block, user_loads: bool) -> List[Tuple[tuple, Optional[str]]]:
+def _load_entries(b: Block, user_loads: bool, explicit: bool = False
+                  ) -> List[Tuple[tuple, Optional[str]]]:
     """(key, description) per data line of load card ``b``; the description is None where
-    the line applies no load (a zero value, a homogeneous BC).  ``user_loads``: whether a
-    user-subroutine magnitude counts as a load (see step_load_audit)."""
+    the line applies no load (a zero value, a homogeneous BC; in an explicit step
+    (``explicit``) a displacement BC without AMPLITUDE, whose value Abaqus/Explicit
+    ignores: it holds the DOF where it is).  ``user_loads``: whether a user-subroutine
+    magnitude counts as a load (see step_load_audit)."""
     kw = b.keyword
     idx = LOAD_CARD_FIELD[kw]
     out: List[Tuple[tuple, Optional[str]]] = []
     if idx < 0:                                   # *BASE MOTION: the card is the load
         return [((kw, tuple(b.params.items())), f"*{kw}")]
+    held = explicit and kw == "BOUNDARY" and not (b.param("AMPLITUDE") or "").strip() and \
+        (b.param("TYPE") or "DISPLACEMENT").strip().upper() == "DISPLACEMENT"
     for rec in merged_data_records(b):
         f = [x.strip() for x in rec]
         if not f or not any(f):
@@ -1892,7 +1897,9 @@ def _load_entries(b: Block, user_loads: bool) -> List[Tuple[tuple, Optional[str]
         else:
             keys = [(kw, f[0].upper(), label)]
         desc: Optional[str] = None
-        if _is_user_load(b, f):
+        if held:
+            pass
+        elif _is_user_load(b, f):
             if user_loads:
                 desc = f"*{kw} on {target} (user subroutine)"
         elif kw == "TEMPERATURE":
@@ -1925,14 +1932,14 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool) -> List[Optional[
     initial: Dict[str, List[str]] = {"VELOCITY": [], "STRESS": []}
     fresh: Dict[str, set] = {}             # keys (re)defined in the current step, per card
 
-    def apply(b: Block, into: Dict[str, Dict[tuple, str]]) -> None:
+    def apply(b: Block, into: Dict[str, Dict[tuple, str]], explicit: bool = False) -> None:
         card = into.setdefault(b.keyword, {})
         if (b.param("OP") or "").strip().upper() == "NEW":
             # OP=NEW removes what earlier steps applied, not the cards before it in this
             # step (Abaqus; probed on ccx 2.23 for *CLOAD and *BOUNDARY)
             kept = fresh.get(b.keyword, set())
             into[b.keyword] = card = {k: v for k, v in card.items() if k in kept}
-        for key, desc in _load_entries(b, user_loads):
+        for key, desc in _load_entries(b, user_loads, explicit):
             fresh.setdefault(b.keyword, set()).add(key)
             if desc:
                 card[key] = desc
@@ -1973,9 +1980,10 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool) -> List[Optional[
         perturb = proc in PERTURBATION_PROCEDURES or (step[0].has("PERTURBATION") and
                                                       proc not in LOAD_FREE_PROCEDURES)
         active = {} if perturb else state
+        explicit = any(x.keyword == "DYNAMIC" and x.has("EXPLICIT") for x in step)
         for x in step[1:]:
             if x.keyword in LOAD_CARD_FIELD:
-                apply(x, active)
+                apply(x, active, explicit)
         if proc in LOAD_FREE_PROCEDURES:
             out.append(None)
         else:
@@ -2493,6 +2501,11 @@ class Converter:
         self._vel_tail: Dict[int, List[object]] = {}
         self._vel_only_amps: set = set()
         self._vel_amp_count = 0
+        # displacement *BOUNDARY cards without AMPLITUDE that Abaqus applies otherwise than
+        # ccx would (see _plan_default_amplitudes): what replaces each, and the steps that
+        # need ccx's own step ramp
+        self._amp_cards: Dict[int, List[object]] = {}
+        self._ramp_steps: set = set()
 
     # -- properties ---------------------------------------------------------
     @property
@@ -4399,7 +4412,14 @@ class Converter:
                                      "static step).", once=True)
                 continue
             if k == "AMPLITUDE":
-                if (v or "").strip().upper() in ("RAMP", "STEP"):
+                if explicit:
+                    # *STEP: AMPLITUDE "is relevant only for Abaqus/Standard analyses"; ccx
+                    # would apply it to the explicit step's loads too
+                    self.report.note(f"*STEP AMPLITUDE={v} dropped on an explicit step: Abaqus/"
+                                     f"Explicit ignores it and applies loads and boundary "
+                                     f"conditions without an amplitude at once (ccx would not).",
+                                     once=True)
+                elif (v or "").strip().upper() in ("RAMP", "STEP"):
                     params[k] = v.strip().upper()
                 else:
                     self.report.warn(f"*STEP AMPLITUDE={v}: ccx accepts only RAMP or STEP here; "
@@ -4426,11 +4446,15 @@ class Converter:
                 self.report.note("Explicit *STEP: NLGEOM added (Abaqus/Explicit includes geometric "
                                  "nonlinearity by default; ccx does not).", once=True)
         if proc == "DYNAMIC" and proc_block is not None and "AMPLITUDE" not in params and \
-                (proc_block.param("APPLICATION") or "").upper().startswith("QUASI"):
+                not explicit and (proc_block.param("APPLICATION") or "").upper().startswith("QUASI"):
             params["AMPLITUDE"] = "RAMP"
             self.report.note("*DYNAMIC, APPLICATION=QUASI-STATIC: *STEP AMPLITUDE=RAMP added (the "
                              "Abaqus default for quasi-static dynamics; ccx steps loads in dynamic "
                              "steps by default).", once=True)
+        if self._step_idx in self._ramp_steps and "AMPLITUDE" not in params:
+            # ccx's default here anyway; it makes ccx define its step ramp, which the
+            # displacement BCs of this step use (_plan_default_amplitudes)
+            params["AMPLITUDE"] = "STEP"
         if proc in ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO") and not step_block.has("PERTURBATION"):
             self._general_step_seen = True
@@ -4471,6 +4495,13 @@ class Converter:
                     if isinstance(p, Block) and p.has("OP"):
                         self._op_new_drop[id(p)] = self._op_new_drop[id(b)]
             return self._boundary_pieces(pieces)
+        if id(b) in self._amp_cards:                 # _plan_default_amplitudes
+            pieces = self._amp_cards[id(b)]
+            if id(b) in self._op_new_drop:
+                for p in pieces:
+                    if isinstance(p, Block) and p.has("OP"):
+                        self._op_new_drop[id(p)] = self._op_new_drop[id(b)]
+            return self._boundary_pieces(pieces)
         if b.has("USER"):
             return self._user_load_card(b)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -4492,7 +4523,9 @@ class Converter:
                "effect (ccx 2.23 would not rebuild the shell/beam rotations after it)"] \
             if self._op_new_drop.get(id(b)) and (b.param("OP") or "").strip().upper() == "NEW" else []
         out.append(emit_keyword("BOUNDARY", params))
-        midside = [ln.split(",") for ln in self._midside_records(b, "boundary")]
+        # (the pieces of a card _plan_default_amplitudes splits carry their midside lines)
+        midside = [] if getattr(b, "_no_midside", False) else \
+            [ln.split(",") for ln in self._midside_records(b, "boundary")]
         # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
         recs = self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
         for rec in recs + midside:
@@ -4536,7 +4569,8 @@ class Converter:
             # OP=NEW also removes the model-data planar constraint (verified on 2.23)
             out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
         if self._conn_bcs and (params.get("OP") or "").strip().upper() == "NEW":
-            out += self._conn_bcs
+            # bare lines: on a card with FIXED or an amplitude they would take it on too
+            out += (["*BOUNDARY"] if any(k != "OP" for k in params) else []) + self._conn_bcs
             self.report.note("*BOUNDARY, OP=NEW: the boundary conditions that hold converted "
                              "connectors are repeated after it (OP=NEW removes every earlier BC "
                              "in ccx, model data included; probed), as a connector holds in every "
@@ -4669,11 +4703,12 @@ class Converter:
         return out
 
     def _step_motion(self, group: List[Block], nlgeom: bool) -> dict:
-        """What the velocity-BC plan needs to know of a step: the time period over which its
-        nodes move (None for Riks, heat transfer, a linear perturbation, ...), the time it
-        adds to the total time (0 for a perturbation step, None when unknown), the default
-        amplitude of its velocity and acceleration BCs, and whether it is dynamic /
-        explicit / under NLGEOM."""
+        """What the velocity-BC and default-amplitude plans need to know of a step: the time
+        period over which its nodes move (None for Riks, heat transfer, a linear
+        perturbation, ...), the time it adds to the total time (0 for a perturbation step,
+        None when unknown), the Abaqus default amplitude of its displacement, velocity and
+        acceleration BCs, the one ccx gives a load or BC without AMPLITUDE in the converted
+        step (``ccx``), and whether it is dynamic / explicit / under NLGEOM."""
         step_b = group[0]
         proc_b = next((x for x in group[1:] if x.keyword in PROC_KW or
                        x.keyword in self._MOTION_PROCS), None)
@@ -4713,13 +4748,32 @@ class Converter:
             default = "STEP" if transient else "RAMP"
         # *BOUNDARY, AMPLITUDE: "when displacement or rotation components in a static step or
         # in a dynamic step with APPLICATION=QUASI-STATIC are given with TYPE=VELOCITY, ...
-        # the default is always a STEP function"
+        # the default is always a STEP function"; with TYPE=DISPLACEMENT it "is always a RAMP
+        # function" in Abaqus/Standard, while Abaqus/Explicit "does not admit jumps in
+        # displacement": it ignores the value and enforces a zero velocity (FIXED: the DOF
+        # stays where the step finds it)
         static = proc in ("STATIC", "GEOSTATIC")
-        defaults = {"VELOCITY": "STEP" if static or quasi else default, "ACCELERATION": default}
+        defaults = {"VELOCITY": "STEP" if static or quasi else default, "ACCELERATION": default,
+                    "DISPLACEMENT": "FIXED" if explicit else "RAMP"}
+        # ccx 2.23 (tempload.f; probed): RAMP from the value at the end of the previous step
+        # in *STATIC and steady-state heat transfer / (un)coupled steps, STEP in any other
+        # (dynamics, *VISCO, transient), unless the *STEP card handle_step writes has
+        # AMPLITUDE= (explicit steps get none; quasi-static dynamics gets RAMP)
+        written = (step_b.param("AMPLITUDE") or "").strip().upper()
+        if quasi and written not in ("RAMP", "STEP"):
+            written = "RAMP"
+        if explicit:
+            ccx = "STEP"
+        elif written in ("RAMP", "STEP"):
+            ccx = written
+        else:
+            ccx = "RAMP" if proc == "STATIC" or (proc in TEMPERATURE_DOF_PROCS and
+                                                 proc_b.has("STEADY STATE")) else "STEP"
         if step_b.has("NLGEOM"):
             nlgeom = nlgeom or (step_b.param("NLGEOM") or "YES").strip().upper() != "NO"
-        return dict(period=period, advance=advance, defaults=defaults, dynamic=proc == "DYNAMIC",
-                    explicit=explicit, perturbation=perturbation, nlgeom=nlgeom or explicit,
+        return dict(period=period, advance=advance, defaults=defaults, ccx=ccx,
+                    dynamic=proc == "DYNAMIC", explicit=explicit, perturbation=perturbation,
+                    nlgeom=nlgeom or explicit,
                     proc=(proc + (", RIKS" if proc_b.has("RIKS") else "")) if proc else "(no procedure)")
 
     @staticmethod
@@ -5048,20 +5102,19 @@ class Converter:
                                                          f"USER/SUBMODEL BC, before): ccx prescribes "
                                                          f"total displacements only."))
                             continue
-                        # a zero rate holds the DOF where the step finds it: FIXED takes the
-                        # translations (and a rigid body's rotations, which go to its ROT
-                        # NODE's translations); a solid node has no DOFs 4-6 to hold
-                        fix = [(n, d) for n, d in members if d <= 3 or n in self._rb_rot]
-                        rotating = [(n, d) for n, d in members
-                                    if (n, d) not in fix and n in self._rot_nodes]
+                        # a zero rate holds the DOF where the step finds it: FIXED, where ccx
+                        # can (_holdable); a solid node has no DOFs 4-6 to hold
+                        fix = [(n, d) for n, d in members if self._holdable(n, d)]
+                        rotating = [(n, d) for n, d in members if self._holdable(n, d) is False]
                         if fix:
                             entries += [("FIXED", ln) for ln in lines(spec, dofs, fix, "")]
                         if rotating:
                             entries.append(comment(
                                 f"{spec}, DOF {', '.join(map(str, sorted({d for _, d in rotating})))}",
-                                f"*BOUNDARY, TYPE={q}: a zero rate on a shell/beam rotation whose "
-                                f"value at the start of the step is unknown (ccx's *BOUNDARY, "
-                                f"FIXED takes no rotations)."))
+                                f"*BOUNDARY, TYPE={q}: a zero rate on a DOF whose value at the start "
+                                f"of the step is unknown and that ccx's *BOUNDARY, FIXED cannot hold "
+                                f"(a shell/beam rotation: it takes none; a node with a *TRANSFORM: "
+                                f"ccx 2.23 reads the global component as the local value)."))
                         continue
                     pts, _, _, dev = motion(bc, u_s, v_s, prev)
                     travel = max(abs(x - u_s) for _, x in pts)
@@ -5160,9 +5213,12 @@ class Converter:
                     except ValueError:
                         mag = None
                     if not rate:
+                        # without AMPLITUDE: Abaqus/Explicit holds the DOF where it is (as the
+                        # converted card does, _plan_default_amplitudes); Abaqus/Standard ramps
+                        # it, which ends where a STEP does
                         mode = "UNKNOWN" if mag is None or b.has("USER") or b.has("SUBMODEL") else \
                             "FIXED" if b.has("FIXED") else ("AMP" if curve else "UNKNOWN") if amp \
-                            else "STEP"
+                            else "FIXED" if info["explicit"] else "STEP"
                         bc = dict(q="DISPLACEMENT", mode=mode, mag=mag or 0.0, curve=curve)
                     else:
                         bad = mag is None or b.has("USER") or not dofs or \
@@ -5299,6 +5355,374 @@ class Converter:
                              f"sample exactly: the generated displacement amplitude deviates by up "
                              f"to {stats['dev']:.1e} of the step's travel between its points.",
                              once=True)
+
+    # -- displacement BCs without AMPLITUDE: Abaqus' default amplitude ---------------
+    # Abaqus/Standard procedures in which ccx may step a displacement BC that Abaqus ramps
+    _RAMP_PROCS = {"STATIC", "DYNAMIC", "VISCO", "COUPLED TEMPERATURE-DISPLACEMENT",
+                   "UNCOUPLED TEMPERATURE-DISPLACEMENT"}
+    # ccx's own step ramp: what *STEP, AMPLITUDE=RAMP gives a load or BC without AMPLITUDE,
+    # from the value at the end of the previous step to the given one (a BC new on a DOF:
+    # from its displacement there, spcmatch.f).  ccx defines it under this name once any
+    # *STEP card has AMPLITUDE= (allocation.f, steps.f); tempload.f singles it out by name.
+    CCX_RAMP = "RAMP12357111317"
+
+    def _plan_default_amplitudes(self, blocks: List[Block]) -> None:
+        """Displacement *BOUNDARY lines without AMPLITUDE where Abaqus' default amplitude is
+        not ccx's.
+
+        ccx 2.23 gives a load or BC without AMPLITUDE its procedure's default, as Abaqus
+        does: RAMP in static and steady-state steps, STEP in dynamics, *VISCO and transient
+        steps, unless *STEP AMPLITUDE says otherwise (Abaqus "Defining an analysis", Table
+        1; ccx tempload.f, probed on 2.23 for each procedure).  For displacements and
+        rotations (TYPE=DISPLACEMENT, DOFs 1-6) Abaqus departs from it:
+
+        * Abaqus/Standard: "the default is always a RAMP function" (*BOUNDARY), from the
+          value at the end of the previous step.  Where ccx would step the line - an
+          implicit *DYNAMIC, *VISCO or transient (un)coupled step, or *STEP, AMPLITUDE=STEP
+          - it gets ccx's own step ramp (CCX_RAMP); handle_step then makes ccx define it
+          with *STEP, AMPLITUDE=STEP, which is ccx's default for such a step anyway.
+          Probed on 2.23: the same as *STEP, AMPLITUDE=RAMP, also for a BC new on a DOF a
+          load moved (it ramps from there).
+        * Abaqus/Explicit "does not admit jumps in displacement": "the value of a nonzero
+          displacement boundary condition that is specified without an amplitude reference
+          will be ignored, and a zero velocity boundary condition will be enforced" (Analysis
+          User's Guide; the keyword reference's "zero displacement" is that seen from rest).
+          A line on DOFs still at zero becomes a zero BC; one on DOFs that may have moved
+          is held with *BOUNDARY, FIXED (the value the previous step ended with) where ccx
+          can: translations, and a rigid body's rotations (on its ROT NODE's
+          translations), of nodes without a *TRANSFORM - ccx 2.23 reads the global
+          component as the local value there (probed).  Anything else is kept as given and
+          warned.
+
+        A zero line on DOFs still at zero when the step starts (_dofs_at_rest) means the
+        same either way and stays as it is."""
+        self._amp_cards, self._ramp_steps = {}, set()
+        model: List[Block] = []
+        groups: List[List[Block]] = []
+        i = 0
+        while i < len(blocks):                       # the step grouping of emit_other
+            if blocks[i].keyword == "STEP":
+                j, group = i, []
+                while j < len(blocks):
+                    group.append(blocks[j])
+                    if blocks[j].keyword == "END STEP":
+                        break
+                    j += 1
+                groups.append(group)
+                i = j + 1
+                continue
+            if blocks[i].keyword == "BOUNDARY" and not groups:
+                model.append(blocks[i])
+            i += 1
+        mid_ends = {m: (a, c) for a, c, m in self._midside.values()}
+        todo: List[Tuple[int, str, str, Block, List[dict]]] = []   # step, kind, procedure, card, lines
+        query: set = set()
+        nlgeom = False
+        for s, group in enumerate(groups, 1):
+            info = self._step_motion(group, nlgeom)
+            nlgeom = info["nlgeom"]
+            if info["explicit"]:
+                kind = "hold"
+            elif info["proc"] in self._RAMP_PROCS and info["ccx"] == "STEP" and \
+                    info["period"] is not None:
+                kind = "ramp"
+            else:
+                continue
+            for b in group[1:]:
+                if b.keyword != "BOUNDARY" or self._bc_type(b) != "DISPLACEMENT" or \
+                        (b.param("AMPLITUDE") or "").strip() or \
+                        any(b.has(k) for k in ("FIXED", "USER", "SUBMODEL")):
+                    continue
+                lines = self._amp_lines(b, mid_ends)
+                todo.append((s, kind, info["proc"], b, lines))
+                for ln in lines:
+                    query.update((n, d) for n in ln["ends"] for d in ln["dofs"] if 1 <= d <= 6)
+        if not todo:
+            return
+        rest = self._dofs_at_rest(model, groups, query, {t[0] for t in todo})
+        seen: Dict[str, str] = {}                    # what was done (class -> a procedure)
+        for s in sorted({t[0] for t in todo}):
+            items = [t for t in todo if t[0] == s]
+            classes = [[[self._default_amp_class(ln, d, kind, rest[s][0]) for d in ln["dofs"]]
+                        for ln in lines] for _, kind, _, _, lines in items]
+            if items[0][1] == "ramp":
+                self._local_axes_ramps(s, items, classes, rest[s][1], seen)
+            for (_, kind, proc, b, lines), cls in zip(items, classes):
+                done = {c for cs in cls for c in cs}
+                for c in done - {"keep"}:
+                    seen.setdefault(c, proc)
+                if not done & {"zero", "fix", "ramp"}:
+                    continue
+                entries: List[Tuple[Optional[str], str]] = []
+                for ln, cs in zip(lines, cls):
+                    entries += self._default_amp_entries(ln, cs)
+                note = ("** [abq2ccx] displacement BC without AMPLITUDE, ramped from its value at "
+                        "the end of the previous step as in Abaqus/Standard: AMPLITUDE="
+                        f"{self.CCX_RAMP} is ccx's own step ramp" if kind == "ramp" else
+                        "** [abq2ccx] displacement BC without AMPLITUDE in an explicit step: "
+                        "Abaqus/Explicit ignores its value and holds the DOF where it is (zero "
+                        "velocity)")
+                self._amp_cards[id(b)] = [note] + self._bc_runs(b.param("OP"), entries)
+                if "ramp" in done:
+                    self._ramp_steps.add(s)
+        if "ramp" in seen:
+            self.report.note(f"*BOUNDARY (displacement) without AMPLITUDE in a {seen['ramp']} step "
+                             f"whose loads ccx steps: ramped from the value at the end of the "
+                             f"previous step, as Abaqus/Standard applies a displacement BC "
+                             f"('always a RAMP function'), with ccx's own step ramp (AMPLITUDE="
+                             f"{self.CCX_RAMP}, which ccx defines once a *STEP has AMPLITUDE=: "
+                             f"*STEP, AMPLITUDE=STEP, ccx's default for the step, is written "
+                             f"where the step has none).", once=True)
+        if "transform" in seen:
+            self.report.warn("A displacement BC ramped on a node with a *TRANSFORM: ccx allows "
+                             "only one amplitude for all DOFs of such a node, so its zero "
+                             "displacement BCs in that step were ramped too (from zero, so they "
+                             "stay there); check that none of its BCs there has another "
+                             "amplitude.", once=True)
+        if "step!" in seen:
+            self.report.warn(f"*BOUNDARY (displacement) without AMPLITUDE in a {seen['step!']} step "
+                             f"on a node with a *TRANSFORM, on a DOF that had no BC before the "
+                             f"step: Abaqus ramps it from where the DOF is, but ccx's step ramp "
+                             f"would start it there from the value of the auxiliary node ccx "
+                             f"gives such a node (probed on 2.23: from 0). The node's displacement "
+                             f"BCs of that step are applied at once instead (ccx's default for "
+                             f"the step): the DOF jumps to the given value.", once=True)
+        if "zero" in seen:
+            self.report.warn("*BOUNDARY (displacement) with a nonzero value and no AMPLITUDE in an "
+                             "explicit step: Abaqus/Explicit ignores the value ('does not admit "
+                             "jumps in displacement') and enforces a zero velocity, so the DOF, "
+                             "still at zero, stays there: converted to a zero BC. Give the BC an "
+                             "amplitude if the DOF should move.", once=True)
+        if "fix" in seen:
+            self.report.note("*BOUNDARY (displacement) without AMPLITUDE in an explicit step on DOFs "
+                             "that may have moved before it: held where the previous step left "
+                             "them (*BOUNDARY, FIXED), as Abaqus/Explicit ignores the value and "
+                             "enforces a zero velocity.", once=True)
+        if "keep!" in seen:
+            self.report.warn("*BOUNDARY (displacement) without AMPLITUDE in an explicit step on a "
+                             "rotation of a shell/beam or coupling node, or a node with a "
+                             "*TRANSFORM, that may have moved before it: Abaqus/Explicit holds it "
+                             "where it is (zero velocity), which ccx's *BOUNDARY, FIXED cannot do "
+                             "there (it takes no rotations, and ccx 2.23 reads a transformed "
+                             "node's global component as the local value). Kept as given: ccx "
+                             "moves the DOF to that value at once.", once=True)
+
+    def _amp_lines(self, b: Block, mid_ends: Dict[int, Tuple[int, int]]) -> List[dict]:
+        """The data lines of displacement *BOUNDARY ``b`` as handle_boundary reads them (after
+        _plan_coupled_bcs's rewrite, if any; then the midside lines of upgraded beams), each
+        as a dict: its text, node spec, named type, DOFs ([] where the converter cannot read
+        the line, which then stays as it is), magnitude (text; ``num``: its value, None if
+        unreadable), resolved nodes, and ``ends``: the nodes whose state decides the line -
+        its own, a midside node's end nodes for that node."""
+        recs = self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
+        out: List[dict] = []
+        for rec in list(recs) + [ln.split(",") for ln in self._midside_records(b, "boundary")]:
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if not g:
+                continue
+            ln = dict(text=", ".join(g), spec=g[0], named=None, dofs=[], value="", num=0.0)
+            rest = g[1:]
+            if rest and rest[0] and not re.fullmatch(r"[-+]?\d+", rest[0]):
+                runs = self._named_bc_dofs(rest[0], self._named_bc_rot(g[0]))
+                if runs is not None:
+                    ln["named"] = rest[0]
+                    ln["dofs"] = [d for a, c in runs for d in range(a, c + 1)]
+            elif rest and re.fullmatch(r"[-+]?\d+", rest[0]):
+                last = rest[1] if len(rest) > 1 and rest[1] != "" else rest[0]
+                if re.fullmatch(r"[-+]?\d+", last):
+                    d1, d2 = int(rest[0]), int(last)
+                    ln["dofs"] = list(range(min(d1, d2), max(d1, d2) + 1))
+                    ln["value"] = rest[2] if len(rest) > 2 else ""
+                    try:
+                        ln["num"] = pf(ln["value"]) if ln["value"] else 0.0
+                    except ValueError:
+                        ln["num"] = None
+            ln["nodes"] = self._resolve_nodes(g[0])
+            ln["ends"] = [e for n in ln["nodes"] for e in mid_ends.get(n, (n,))]
+            out.append(ln)
+        return out
+
+    def _dofs_at_rest(self, model: List[Block], groups: List[List[Block]], query: set,
+                      need: set) -> Dict[int, Tuple[set, set]]:
+        """For each step in ``need`` (1-based), the (node, DOF) pairs of ``query`` still at
+        zero when it starts, by the deck's BCs as Abaqus applies them: everything starts at
+        zero and stays there through a perturbation or heat-transfer step; any other step
+        leaves a DOF there only under a BC that holds it - a zero displacement or velocity, a
+        FIXED, a BC carried from before (a nonzero one with an amplitude may follow a total-
+        time curve: not), and in Abaqus/Explicit a new displacement without AMPLITUDE (a
+        zero velocity) - or puts it there with a new zero displacement.  And the pairs with
+        a BC in force when it starts (ccx matches a BC re-specified there to the old one)."""
+        at_zero = set(query)
+        held: Dict[Tuple[int, int], Tuple[str, float, bool]] = {}
+
+        def apply(b: Block, new: set) -> None:
+            kind = "fixed" if b.has("FIXED") else "other" if b.has("USER") or b.has("SUBMODEL") \
+                else {"DISPLACEMENT": "disp", "VELOCITY": "vel"}.get(self._bc_type(b), "other")
+            amp = bool((b.param("AMPLITUDE") or "").strip())
+            for nodes, dofs, mag in self._bc_records(b):
+                for k in ((n, d) for n in nodes for d in dofs):
+                    if k in query:
+                        held[k] = (kind, mag, amp)
+                        new.add(k)
+
+        for b in model:
+            apply(b, set())
+        out: Dict[int, Tuple[set, set]] = {}
+        nlgeom = False
+        for s, group in enumerate(groups, 1):
+            info = self._step_motion(group, nlgeom)
+            nlgeom = info["nlgeom"]
+            if s in need:
+                out[s] = (set(at_zero), set(held))
+            cards = [x for x in group[1:] if x.keyword == "BOUNDARY"]
+            if any((x.param("OP") or "").strip().upper() == "NEW" for x in cards):
+                held.clear()
+            new: set = set()
+            for x in cards:
+                apply(x, new)
+            if info["perturbation"] or info["proc"] == "HEAT TRANSFER":
+                continue
+            for k in query:
+                kind, mag, amp = held.get(k, ("free", 0.0, False))
+                if kind == "fixed" or (kind == "vel" and mag == 0.0):
+                    continue
+                if kind == "disp" and k not in new:
+                    if amp and mag != 0.0:
+                        at_zero.discard(k)
+                elif kind == "disp" and info["explicit"] and not amp:
+                    continue
+                elif kind == "disp" and mag == 0.0:
+                    at_zero.add(k)
+                else:
+                    at_zero.discard(k)
+        return out
+
+    def _default_amp_class(self, ln: dict, d: int, kind: str, at_rest: set) -> str:
+        """What _plan_default_amplitudes does with DOF ``d`` of line ``ln`` in a step of
+        ``kind`` ("ramp": Abaqus/Standard ramps it where ccx would step it; "hold":
+        Abaqus/Explicit): "keep" it, make it a "zero" BC, hold it with "fix" (FIXED), give it
+        ccx's step "ramp", or keep it as given although it cannot be held ("keep!")."""
+        if not 1 <= d <= 6:
+            return "keep"                     # temperature, pressure, ...: the step's default
+        known = all((n, d) in at_rest for n in ln["ends"])
+        if kind == "ramp":
+            return "keep" if ln["num"] == 0.0 and known else "ramp"
+        if known:
+            return "keep" if ln["num"] == 0.0 else "zero"
+        holds = [self._holdable(n, d) for n in ln["nodes"]]
+        if all(h is None for h in holds):
+            return "keep"                     # no rotations at these nodes: nothing to hold
+        # all or nothing: a line mixing them keeps its rotations on all its nodes
+        # (_active_dof_lines), and FIXED stops ccx on a rotation
+        return "fix" if all(holds) else "keep!"
+
+    def _holdable(self, n: int, d: int) -> Optional[bool]:
+        """Whether *BOUNDARY, FIXED can hold DOF ``d`` (1-6) of node ``n`` where the previous
+        step left it: a translation, or a rigid body's rotation (on its ROT NODE's
+        translations), of a node without a *TRANSFORM - ccx 2.23 reads the global component
+        as the local value there (probed).  False where the DOF exists but cannot be held
+        (FIXED takes no rotations: a shell/beam or coupling node's), None where the node has
+        no such DOF."""
+        if d <= 3 or n in self._rb_rot:
+            return self._local_node(n, d) is None
+        return False if n in self._rot_nodes or n in self._ref_nodes else None
+
+    def _local_node(self, n: int, d: int) -> Optional[int]:
+        """The node that carries DOF ``d`` (1-6) of node ``n`` in ccx if that one has local
+        axes: ``n`` for a translation of a node with a *TRANSFORM, the ROT NODE for a rigid
+        body's rotation when it has axes (_plan_rot_axes); else None."""
+        if d <= 3:
+            return n if n in self._transformed else None
+        r = self._rb_rot.get(n)
+        return r if r is not None and (r in self._transformed or r in self._rot_axes) else None
+
+    def _local_axes_ramps(self, s: int, items: list, classes: list, in_force: set,
+                          seen: Dict[str, str]) -> None:
+        """Ramp step ``s``'s displacement lines on nodes with local axes (_local_node) all or
+        none.  ccx allows one amplitude for all DOFs of such a node (manual, *AMPLITUDE), and
+        it takes their BCs through an auxiliary node, from whose value its step ramp starts a
+        BC new on a DOF (bounadd.f, spcmatch.f; probed on 2.23: from 0, not from where the
+        DOF is) - which is right in the first step and on a DOF that had a BC before the step
+        (ccx then ramps from that BC's value).  Where a node has a DOF of neither kind, its
+        lines (and the lines sharing a DOF with them) stay at ccx's default, STEP ("step!");
+        else its zero lines ramp too (from zero: no change)."""
+        on: Dict[int, List[Tuple[Tuple[int, int], str]]] = {}
+        shared: List[set] = []                       # the nodes each line DOF ties together
+        for (_, _, _, _, lines), cls in zip(items, classes):
+            for ln, cs in zip(lines, cls):
+                for d, c in zip(ln["dofs"], cs):
+                    if c not in ("keep", "ramp"):
+                        continue
+                    ms = set()
+                    for n in ln["nodes"]:
+                        m = self._local_node(n, d)
+                        if m is not None:
+                            on.setdefault(m, []).append(((n, d), c))
+                            ms.add(m)
+                    if ms:
+                        shared.append(ms)
+        ramped = {m for m, lst in on.items() if any(c == "ramp" for _, c in lst)}
+        bad = {m for m in ramped if s > 1 and any(k not in in_force for k, _ in on[m])}
+        grown = True
+        while grown:                                 # a node sharing a line DOF with one
+            grown = False
+            for ms in shared:
+                if ms & bad and not ms <= bad:
+                    bad |= ms
+                    grown = True
+        for (_, _, proc, _, lines), cls in zip(items, classes):
+            for ln, cs in zip(lines, cls):
+                for i, d in enumerate(ln["dofs"]):
+                    ms = {self._local_node(n, d) for n in ln["nodes"]} - {None}
+                    if ms & bad and cs[i] == "ramp":
+                        cs[i] = "step!"
+                        seen.setdefault("step!", proc)
+                    elif ms & ramped and not ms & bad and cs[i] == "keep" and 1 <= d <= 6:
+                        cs[i] = "ramp"
+                        seen.setdefault("transform", proc)
+
+    def _default_amp_entries(self, ln: dict, cs: List[str]) -> List[Tuple[Optional[str], str]]:
+        """(signature, text) of the lines that replace line ``ln`` whose DOFs got classes
+        ``cs`` (_default_amp_class): a named type stays named where one class covers it,
+        anything else goes out as DOF runs, a zero or FIXED one without its magnitude."""
+        sig = {"fix": "FIXED", "ramp": self.CCX_RAMP}
+        if all(c == "keep" for c in cs):
+            return [(None, ln["text"])]
+        if ln["named"] and len(set(cs)) == 1:
+            return [(sig.get(cs[0]), f"{ln['spec']}, {ln['named']}")]
+        runs: List[list] = []                 # [first DOF, last DOF, class]
+        for d, c in zip(ln["dofs"], cs):
+            if runs and runs[-1][1] == d - 1 and runs[-1][2] == c:
+                runs[-1][1] = d
+            else:
+                runs.append([d, d, c])
+        out = []
+        for a, z, c in runs:
+            value = ln["value"] if c in ("keep", "keep!", "step!", "ramp") else ""
+            out.append((sig.get(c), ", ".join([ln["spec"], str(a), str(z)] + ([value] if value else []))))
+        return out
+
+    @staticmethod
+    def _bc_runs(op: Optional[str], entries: List[Tuple[Optional[str], str]]) -> List[Block]:
+        """One *BOUNDARY per run of lines of one signature (None: plain, "FIXED", else an
+        amplitude), in line order - a later line overrides an earlier one on the same DOF -
+        the first with the card's OP.  They carry their midside lines (_amp_lines)."""
+        out: List[Block] = []
+        for sig, text in entries:
+            if out and out[-1]._sig == sig:
+                out[-1].data.append(text)
+                continue
+            params = [("OP", op)] if op and not out else []
+            if sig == "FIXED":
+                params.append(("FIXED", None))
+            elif sig is not None:
+                params.append(("AMPLITUDE", sig))
+            blk = mkblock("BOUNDARY", params, [text])
+            blk._sig, blk._no_midside = sig, True
+            out.append(blk)
+        return out
 
     def _load_params(self, b: Block, allowed: Sequence[str]) -> "OrderedDict[str, Optional[str]]":
         """Parameters ccx's distributed-load cards read; Abaqus-only ones are dropped —
@@ -8711,6 +9135,7 @@ class Converter:
                              "MPC's depend on each other' — its 2-D expansion is built from linear "
                              "MPCs; probed on 2.23); only implicit steps can run it.", once=True)
         self._check_transforms()
+        self._plan_default_amplitudes(blocks)  # reads the ROT NODE axes (_plan_rot_axes)
         self._n_inactive_rot = 0
         self._depvar_counts = set()
         for b in blocks:

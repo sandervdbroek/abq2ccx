@@ -24,7 +24,10 @@ against beam theory) — applied as consistent nodal forces, also on nodes with 
 against statics, connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
 theory and exact statics — also on nodes with a *TRANSFORM, against the same models without
 it (linear and NLGEOM) — velocity / acceleration boundary conditions against their
-time integral and the wave they send through a bar, field and history output requested at
+time integral and the wave they send through a bar, displacement boundary conditions without
+an amplitude ramped as Abaqus/Standard ramps them (implicit dynamics, *VISCO, a transient
+coupled step) and held as Abaqus/Explicit holds them, while loads keep their procedure's
+default (a stepped load overshoots), field and history output requested at
 beam nodes (the .frd and .dat values against beam theory), and the field output Abaqus
 preselects: a bar in tension with only Abaqus/CAE's *Output, variable=PRESELECT requests,
 and a bar impact in an explicit step without any output request (20 output frames, the
@@ -1346,6 +1349,73 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  velocity_bc_bar ({label}): driven end u = "
               f"{u[1][2]:.6f} (0.005); wave stress behind the front {mean * 100:.1f}% off on "
               f"average ({worst * 100:.1f}% at worst), {ahead * 100:.2f}% ahead of it")
+        failures += 0 if ok else 1
+
+    # --- displacement BCs without AMPLITUDE: Abaqus' default amplitude --------------------
+    # Abaqus/Standard ramps a displacement BC without an amplitude in every procedure, where
+    # ccx steps it in dynamics, *VISCO and transient coupled steps; loads keep the
+    # procedure's default (STEP there) in both.  One bar is driven at its top by such a BC
+    # (0.01, then 0.03 in a second step), the other loaded at its top by a *CLOAD without an
+    # amplitude: the driven top must follow the ramps at every increment, the loaded one
+    # take its load at once - in *DYNAMIC overshooting to about twice its static extension
+    # 0.004, in *VISCO sitting there from the first increment, in the coupled step (which
+    # ccx 2.23 solves with inertia) well above the 0.0004 a ramp would give at t = 0.1.
+    # Abaqus/Explicit ignores the value of such a BC and holds the DOF (zero velocity): the
+    # driven top stays at 0, and the loaded top, held by one in the second step, stays where
+    # the first step left it.
+    src = open(os.path.join(EXAMPLES, "default_amplitude_bars.inp")).read()
+    dyn = "*Dynamic, direct\n 0.005, 1."
+    visco = src.replace(dyn, "*Visco, cetol=0.001\n 0.1, 1.").replace(
+        "*Density\n 0.15625\n", "*Density\n 0.15625\n*Creep, law=TIME\n 1e-30, 1., 0.\n")
+    coupled = src.replace(dyn, "*Coupled Temperature-displacement\n 0.1, 1.") \
+        .replace("type=C3D8,", "type=C3D8T,") \
+        .replace("*Density\n 0.15625\n", "*Density\n 0.15625\n*Conductivity\n 1.\n*Specific Heat\n 1.\n") \
+        .replace("**\n*Step, name=PULL", "*Nset, nset=ALL, generate\n 1, 120, 1\n*Initial Conditions, "
+                 "type=TEMPERATURE\n ALL, 0.\n**\n*Step, name=PULL")
+    explicit = src.replace(dyn, "*Dynamic, explicit\n , 1.").replace(
+        "DRIVEN_TOP, 3, 3, 0.03\n", "DRIVEN_TOP, 3, 3, 0.03\n LOADED_TOP, 3, 3\n")
+    for label, text in (("*DYNAMIC", src), ("*VISCO", visco),
+                        ("*COUPLED TEMPERATURE-DISPLACEMENT", coupled), ("*DYNAMIC, EXPLICIT", explicit)):
+        tmp_src = os.path.join(tmp, "default_amplitude_bars_src.inp")
+        with open(tmp_src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, "default_amplitude_bars.inp")
+        convert(tmp_src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        driven = dat_history(os.path.join(d, "job.dat"), "displacements", "DRIVEN_TOP")
+        loaded = [(t, rows[0][2]) for t, rows in
+                  dat_history(os.path.join(d, "job.dat"), "displacements", "LOADED_TOP")]
+        shutil.rmtree(d, ignore_errors=True)
+        first = [u for t, u in loaded if t <= 1.0 + 1e-9]
+        second = [u for t, u in loaded if t > 1.0 + 1e-9]
+        if status != "solved" or not driven or abs(driven[-1][0] - 2.0) > 1e-6 or not first or \
+                not second:
+            print(f"FAIL  default_amplitude_bars ({label}): did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            failures += 1
+            continue
+        if label.endswith("EXPLICIT"):
+            ref = lambda t: 0.0                                              # noqa: E731
+            spread = max(second) - min(second)
+            load_ok = spread <= 1e-12 * abs(second[0]) and abs(second[0] - first[-1]) <= \
+                1e-12 * abs(first[-1]) and abs(first[-1]) > 1e-5
+            what = (f"loaded top held at {second[0]:.6g} through step 2 (spread {spread:.1e}; step 1 "
+                    f"ended at {first[-1]:.6g})")
+        else:
+            ref = lambda t: 0.01 * t if t <= 1.0 + 1e-9 else 0.01 + 0.02 * (t - 1.0)  # noqa: E731
+            if label == "*DYNAMIC":
+                load_ok, what = max(first) > 1.6 * 0.004, f"loaded top peaks at {max(first) / 0.004:.2f} x static"
+            elif label == "*VISCO":
+                load_ok = abs(first[0] - 0.004) < 1e-3 * 0.004
+                what = f"loaded top {first[0]:.6g} at the first increment (static 0.004)"
+            else:
+                load_ok = first[0] > 0.5 * 0.004
+                what = f"loaded top {first[0]:.6g} at t = 0.1 (a ramp: about 0.0004)"
+        dev = max(abs(r[2] - ref(t)) for t, rows in driven for r in rows)
+        ok = dev < 1e-9 and load_ok
+        print(f"{'PASS' if ok else 'FAIL'}  default_amplitude_bars ({label}): driven top within "
+              f"{dev:.1e} of {'0' if label.endswith('EXPLICIT') else 'the ramps 0 -> 0.01 -> 0.03'} "
+              f"at {len(driven)} increments; {what}")
         failures += 0 if ok else 1
 
     # --- output requests at beam nodes: field output for a node set, history at a node ----

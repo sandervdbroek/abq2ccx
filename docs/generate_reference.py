@@ -63,9 +63,12 @@ TRANSLATED = {
         "as both codes read them alike, and `THICK PIPE` → `PIPE`; ccx 2.23 runs these sections only "
         "on `B32R`, so their beams become `B32R` (2-node ones with an inserted midside node; see the "
         "element reference).",
-    "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept; `PERTURBATION` kept "
-        "only for `*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then "
-        "persist); explicit steps get `INC=10000000` + `NLGEOM`; `*END STEP` ensured.",
+    "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept (dropped on explicit "
+        "steps, which Abaqus/Explicit runs without it); `PERTURBATION` kept only for "
+        "`*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then persist); "
+        "explicit steps get `INC=10000000` + `NLGEOM`; a step whose displacement BCs get ccx's "
+        "step ramp (see `*BOUNDARY`) gets `AMPLITUDE=STEP`, ccx's default there; `*END STEP` "
+        "ensured.",
     "*STATIC": "`RIKS` commented by default (ccx would silently run it as plain static; "
         "`--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
     "*DYNAMIC": "implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; "
@@ -81,7 +84,16 @@ TRANSLATED = {
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped.",
     "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=VELOCITY`/"
         "`ACCELERATION` → a displacement BC whose generated amplitude integrates the history from "
-        "the DOF's state at the step start (continued in later steps that keep it); DOFs 4-6 "
+        "the DOF's state at the step start (continued in later steps that keep it). Without "
+        "`AMPLITUDE` a displacement (DOFs 1-6) follows Abaqus, not the procedure's default: "
+        "Abaqus/Standard always ramps it from its value at the end of the previous step, so where "
+        "ccx would step it (implicit `*DYNAMIC`, `*VISCO`, transient (un)coupled steps, `*STEP, "
+        "AMPLITUDE=STEP`) the line gets ccx's own step ramp (`AMPLITUDE=RAMP12357111317`; on a "
+        "node with a `*TRANSFORM` only where that ramp starts from the DOF's value, else at once, "
+        "warned); "
+        "Abaqus/Explicit ignores the value and holds the DOF where it is (a zero BC, or `FIXED` "
+        "where the DOF may have moved; a rotation or a node with a `*TRANSFORM` it cannot hold is "
+        "kept, warned). Zero lines on DOFs still at zero stay as they are. DOFs 4-6 "
         "dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 "
         "crashes on them). An element end node of a circular-section beam whose rotational BCs "
         "hold only some of DOFs 4-6, or a nonzero one, gets a force-free knot beam (elset/material "

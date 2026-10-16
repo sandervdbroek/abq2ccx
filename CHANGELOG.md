@@ -18,6 +18,10 @@ without an error. A full audit and the work that followed:
   nodal forces, in the local axes of `*TRANSFORM`ed nodes; user-subroutine loads and BCs
   commented out, naming the ccx subroutine; velocity and acceleration BCs integrated into
   displacement BCs, with Abaqus' default amplitudes.
+* **Default amplitudes** — displacement BCs without an amplitude follow Abaqus where its
+  default departs from ccx's: ramped from the previous value where ccx would step them
+  (implicit dynamics, `*VISCO`, transient coupled steps), held where they are in explicit
+  steps; `*STEP, AMPLITUDE` dropped on explicit steps.
 * **Beams** — circular, pipe and box sections upgraded to the quadratic beams ccx 2.23 runs;
   planar beams and trusses held in their plane; knot beams for rotational BCs on
   circular-section nodes and across `*BOUNDARY, OP=NEW`; a capped explicit increment for
