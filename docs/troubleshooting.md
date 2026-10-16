@@ -244,10 +244,24 @@ These are the silent ones — no error, wrong physics.
   (they stop ccx under `DIRECT` and in `*MODAL DYNAMIC`, and explicit dynamics ignores
   them). The converter puts `*OUTPUT`'s `FREQUENCY` / `NUMBER INTERVAL` / `TIME INTERVAL` /
   `TIME POINTS` on the step's first output card, the `.frd` requests' first, so history
-  output may come coarser or finer than Abaqus would write it. In an explicit step without a
-  fixed or maximum increment it cannot turn a time interval into increments, and ccx writes
-  every increment (warned): set `FREQUENCY=N` on the step's first output card, with N the
+  output may come coarser or finer than Abaqus would write it. An explicit step's intervals
+  (Abaqus' default: 20 for field output) become a `FREQUENCY` from the increment ccx will
+  take — the fixed or maximum one, else ccx's own Courant estimate, which the converter
+  repeats from the mesh, the sections and the materials (exact on the corpus decks ccx sizes;
+  contact can make ccx's increment smaller, then output comes more often). Where no element
+  can be sized (no density or elastic constants, as with user materials) ccx writes every
+  increment (warned): set `FREQUENCY=N` on the step's first output card, with N the
   interval over the increment ccx prints as "SELECTED time increment".
+* **Abaqus' preselected output, in ccx labels.** `*Output, field, variable=PRESELECT` — the
+  request Abaqus/CAE writes into every step — and a step without any output request (Abaqus
+  then writes the preselected output by default) become whole-model `*NODE FILE` / `*EL FILE`
+  cards with the procedure's preselected variables ccx has (U, RF and S, E in a static
+  step, see the [output reference](output-reference.md)). A step without requests of its own
+  gets the requests Abaqus carries over written again, with its own frequency: ccx would keep
+  the cards of the step before, at that step's frequency or time points. Not written: Abaqus' contact
+  output (`CSTRESS`, `CDISP`; add a `*CONTACT OUTPUT` request where you need it),
+  accelerations (`A`, which ccx 2.23's `*NODE FILE` rejects), concentrated forces (`CF`) and
+  the whole-model energies of the preselected history output.
 * **NaN displacements in an explicit step with circular-section beams.** ccx 2.23 sizes a
   `CIRC` beam's stable increment as if its section were the box around the circle and runs
   it at about 1.3× the limit. The converter caps every automatic `*DYNAMIC, EXPLICIT`

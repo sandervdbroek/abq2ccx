@@ -149,6 +149,8 @@ PASS  velocity_bc_column (TYPE=VELOCITY, SMOOTH STEP, kept into a 2nd step): top
 PASS  velocity_bc_bar (explicit, TYPE=VELOCITY): driven end u = 0.005000 (0.005); wave stress behind the front 0.6% off on average (6.7% at worst), 0.00% ahead of it
 PASS  velocity_bc_bar (implicit, TYPE=ACCELERATION): driven end u = 0.005000 (0.005); wave stress behind the front 1.1% off on average (1.5% at worst), 0.09% ahead of it
 PASS  beam_output_requests (*NODE OUTPUT at B32 nodes): .frd tip deflection -3.2801 (beam theory -3.3089, 0.9% diff) at t = 0.25, 0.5, 0.75, 1; .dat mid-span -1.0236 (beam theory -1.0373, 1.3% diff); without OUTPUT=2D 4 empty .frd blocks
+PASS  preselect_output_bar (*Output, field, variable=PRESELECT): .frd u_x = 0.0047619 (P L / E A = 0.0047619), S11 = 9.9996...9.9996 (10), sum RF_x = -1000.0 (-1000); worst 0.004% off
+PASS  explicit_default_output_bar (no *Output request, *DYNAMIC, EXPLICIT): FREQUENCY=4, 22 .frd frames for Abaqus' 20 intervals; tip u = v0 t to 0.00% before the wave arrives, peak -0.03729 (v0 L / c = -0.03867, 3.6% off), -0.000054 at 2 L / c (0)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -365,7 +367,8 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*CREEP, LAW=STRAIN/TIME` | ccx Norton (default) | other laws → `LAW=USER` |
 | `*OUTPUT, FIELD` + `*NODE/ELEMENT OUTPUT` | `*NODE FILE`/`*EL FILE` (.frd) | `POSITION=`/`DIRECTIONS=` stripped; one node set per variable and step (ccx keeps the last card's): the whole model before a set, several sets joined; a set the `.frd` cannot show (beam/shell nodes of an expanded model, reference points) is also printed, or gets `OUTPUT=2D` when the `.frd` takes only U/V/RF |
 | `*OUTPUT, HISTORY` + `*NODE/ELEMENT OUTPUT` for a set | `*NODE PRINT`/`*EL PRINT` (.dat) | as a `.frd` set it would replace the step's field output of the same variable |
-| `*OUTPUT` `FREQUENCY`/`NUMBER INTERVAL`/`TIME INTERVAL`/`TIME POINTS` | `FREQUENCY=` or `TIME POINTS=` on the step's first output card | ccx has one per step (the `.frd` requests' first); intervals → generated `*TIME POINTS`, or a frequency from a fixed or maximum increment (explicit dynamics ignores `TIME POINTS`); Abaqus' every-10-increments default in `*DYNAMIC`/`*MODAL DYNAMIC` kept |
+| `*OUTPUT` `FREQUENCY`/`NUMBER INTERVAL`/`TIME INTERVAL`/`TIME POINTS` | `FREQUENCY=` or `TIME POINTS=` on the step's first output card | ccx has one per step (the `.frd` requests' first); intervals → generated `*TIME POINTS`, or a frequency from a fixed or maximum increment, in explicit dynamics (which ignores `TIME POINTS`) from the increment ccx will take, estimated with its own Courant formula; Abaqus' every-10-increments default in `*DYNAMIC`/`*MODAL DYNAMIC` and 20 intervals in explicit dynamics kept |
+| `*OUTPUT, FIELD, VARIABLE=PRESELECT` / `ALL`, and a step without any `*OUTPUT` | whole-model `*NODE FILE`/`*EL FILE` with the ccx labels of Abaqus' preselected field output for the procedure: U, RF / S, E in a static step, V added in dynamics, NT, RFL / HFL in heat transfer ([table](docs/output-reference.md)) | ccx has no preselected output, so the Abaqus/CAE default wrote only the mesh; Abaqus writes this output by default where a step has no output database request and inherits none, and a step without requests of its own gets the carried-over ones again (ccx would keep the earlier step's frequency); `PEEQ` only with plasticity; A, CF and contact output have no ccx label here; preselected history output (energies) has no counterpart |
 | `*EL PRINT`/`*NODE PRINT` without a set | whole-model set added | Abaqus prints everything; ccx prints nothing |
 | output variables | ccx's own label lists per card | an unknown `*EL PRINT` label stops ccx; `*CONTACT OUTPUT` → `*CONTACT FILE` with `CDIS`/`CSTR` |
 | `*SURFACE` shell edges `E1..E4` | `S3..S6` | on ccx shells `S1`/`S2` are the faces |
@@ -470,7 +473,9 @@ PLASTICITY`, `*CYCLIC HARDENING`, `*MOHR COULOMB`, `*CREEP` (Norton). Unsupporte
 **Output variables** — renamed: `LE→E`, `PE→PEEQ`, `CEEQ→PEEQ`, `EE→ME`, `NT11→NT`,
 `RM→RF`. Dropped (no ccx key; derive in post): `MISES`, `PRESS`, `NE`, `IE`, `A`,
 `CF`, `NFORC`, `COORD`, `STH`, `CSTRESS`, `SF/SM/SE`. `ELSE`/`ELKE`/`EVOL`/`COORD`
-are `*EL PRINT`-only and are dropped from `*EL FILE`.
+are `*EL PRINT`-only and are dropped from `*EL FILE`. `VARIABLE=PRESELECT` (and a step
+without output requests) becomes the ccx labels of Abaqus' preselected field output for the
+procedure — see the [output reference](docs/output-reference.md).
 
 ---
 
@@ -644,6 +649,8 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/velocity_bc_column.inp`](examples/velocity_bc_column.inp) | `*Boundary, type=VELOCITY` with a `SMOOTH STEP` amplitude on a `*Rigid Body` reference point, kept into a second step |
 | [`examples/velocity_bc_bar.inp`](examples/velocity_bc_bar.inp) | Abaqus/Explicit bar driven by `*Boundary, type=VELOCITY` (wave stress −ρcv); `validate_with_ccx.py` also runs it implicit with `type=ACCELERATION` |
 | [`examples/beam_output_requests.inp`](examples/beam_output_requests.inp) | field output for a set of `B32` nodes → `OUTPUT=2D`, history output at a node → `*NODE PRINT`, `NUMBER INTERVAL` → `*TIME POINTS` |
+| [`examples/preselect_output_bar.inp`](examples/preselect_output_bar.inp) | a bar in tension with only Abaqus/CAE's `*Output, field/history, variable=PRESELECT` → `*NODE FILE` U, RF and `*EL FILE` S, E |
+| [`examples/explicit_default_output_bar.inp`](examples/explicit_default_output_bar.inp) | a bar impact in `*DYNAMIC, EXPLICIT` without any output request → Abaqus' default output at 20 intervals, `FREQUENCY` from ccx's stable increment |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

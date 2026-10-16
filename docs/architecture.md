@@ -31,7 +31,9 @@ Converter._prescan()   deck-wide facts the handlers need: node kinds, the connec
                        (_plan_velocity_bcs), …; then _plan_distributions(),
                        _plan_planar_constraint() and _plan_circ_rotation_knots(); last
                        _plan_output(): each step's output requests fitted to ccx's output
-                       model (.frd or .dat, one node set per variable, one output control)
+                       model (.frd or .dat, one node set per variable, one output control),
+                       Abaqus' preselected and default field output added, and explicit
+                       output intervals turned into increments with ccx's Courant estimate
         │
         ▼
 emit_geometry()  +  emit_other()     Pass B: write nodes/elements/sets from the registry,
@@ -144,7 +146,7 @@ regenerate the docs (below).
   add it to `CCX_ELEMENTS` (direct) or to `ELEMENT_TYPE_MAP` (substitution — keep the
   node count identical to the target, the test suite enforces this).
 * **Map or drop an output variable** → edit `ABQ_MAP_VARS` / `ABQ_DROP_VARS` /
-  `EL_PRINT_ONLY_VARS`.
+  `EL_PRINT_ONLY_VARS`; Abaqus' preselected field output per procedure is `PRESELECT_FIELD`.
 * **Give an unsupported keyword tailored guidance** → add an entry to
   `SPECIAL_UNSUPPORTED` (otherwise it gets a generic "no equivalent" comment).
 * **Drop an organisational keyword** → add it to `DROP_KEYWORDS` (or
@@ -260,9 +262,11 @@ pressure carried by surface elements against the face-pressure result), the tip
 deflections of circular-, pipe- and box-section cantilevers, circular-section beams with
 rotational BCs and in an explicit dynamic step, planar beams' frequencies and buckling
 loads against beam theory, a clamped beam and plate across a later step's
-`*BOUNDARY, OP=NEW`, and the loads applied as consistent nodal forces (Cook's membrane,
+`*BOUNDARY, OP=NEW`, the loads applied as consistent nodal forces (Cook's membrane,
 beam line loads, Lamé's cylinder, and tractions on nodes with a `*TRANSFORM` against the
-same models without one). It skips cleanly if no `ccx` is found.
+same models without one), and the field output Abaqus preselects (a bar in tension, and an
+explicit bar impact without output requests against wave theory). It skips cleanly if no
+`ccx` is found.
 
 There is also a **corpus** of 1022 genuine Abaqus decks (`corpus/manifest.py`) fetched on
 demand and tested end-to-end:

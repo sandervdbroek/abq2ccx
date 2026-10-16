@@ -1,0 +1,87 @@
+*Heading
+ Abaqus/CAE's default output requests on a bar in tension
+** abq2ccx example: the two output requests Abaqus/CAE writes into every step,
+** *Output, field, variable=PRESELECT and *Output, history, variable=PRESELECT, and nothing
+** else.  ccx has no preselected output; abq2ccx writes the ccx labels of Abaqus'
+** preselected field output for a static step, *NODE FILE U, RF and *EL FILE S, E (without
+** them ccx wrote only the mesh to the .frd).  The energies of the history request have no
+** ccx counterpart.
+** Steel bar 10 x 10 x 100 (10 C3D8), x = 0 held along x (free to contract), 1000 N along
+** x at x = 100: u_x = P L / (E A) = 0.0047619, S11 = 10, E11 = 4.7619e-5, sum RF_x = -1000.
+*Node
+   1, 0, 0, 0
+   2, 0, 0, 10
+   3, 0, 10, 0
+   4, 0, 10, 10
+   5, 10, 0, 0
+   6, 10, 0, 10
+   7, 10, 10, 0
+   8, 10, 10, 10
+   9, 20, 0, 0
+  10, 20, 0, 10
+  11, 20, 10, 0
+  12, 20, 10, 10
+  13, 30, 0, 0
+  14, 30, 0, 10
+  15, 30, 10, 0
+  16, 30, 10, 10
+  17, 40, 0, 0
+  18, 40, 0, 10
+  19, 40, 10, 0
+  20, 40, 10, 10
+  21, 50, 0, 0
+  22, 50, 0, 10
+  23, 50, 10, 0
+  24, 50, 10, 10
+  25, 60, 0, 0
+  26, 60, 0, 10
+  27, 60, 10, 0
+  28, 60, 10, 10
+  29, 70, 0, 0
+  30, 70, 0, 10
+  31, 70, 10, 0
+  32, 70, 10, 10
+  33, 80, 0, 0
+  34, 80, 0, 10
+  35, 80, 10, 0
+  36, 80, 10, 10
+  37, 90, 0, 0
+  38, 90, 0, 10
+  39, 90, 10, 0
+  40, 90, 10, 10
+  41, 100, 0, 0
+  42, 100, 0, 10
+  43, 100, 10, 0
+  44, 100, 10, 10
+*Element, type=C3D8, elset=BAR
+  1, 1, 5, 7, 3, 2, 6, 8, 4
+  2, 5, 9, 11, 7, 6, 10, 12, 8
+  3, 9, 13, 15, 11, 10, 14, 16, 12
+  4, 13, 17, 19, 15, 14, 18, 20, 16
+  5, 17, 21, 23, 19, 18, 22, 24, 20
+  6, 21, 25, 27, 23, 22, 26, 28, 24
+  7, 25, 29, 31, 27, 26, 30, 32, 28
+  8, 29, 33, 35, 31, 30, 34, 36, 32
+  9, 33, 37, 39, 35, 34, 38, 40, 36
+ 10, 37, 41, 43, 39, 38, 42, 44, 40
+*Nset, nset=FIX
+1, 2, 3, 4
+*Nset, nset=TIP
+41, 42, 43, 44
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Solid Section, elset=BAR, material=STEEL
+*Step, name=Pull
+*Static
+*Boundary
+FIX, 1, 1
+1, 2, 3
+3, 3, 3
+2, 2, 2
+*Cload
+TIP, 1, 250.
+** OUTPUT REQUESTS (as Abaqus/CAE writes them)
+*Output, field, variable=PRESELECT
+*Output, history, variable=PRESELECT
+*End Step

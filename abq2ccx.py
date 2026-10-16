@@ -1521,6 +1521,164 @@ OUTPUT_CARDS = {"NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "NODE OUTPUT",
 # Procedures without time increments: an output frequency means nothing there.
 UNTIMED_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY", "GREEN",
                  "SUBSTRUCTURE GENERATE", "SENSITIVITY", "FEASIBLE DIRECTION", "NO ANALYSIS"}
+# Abaqus' preselected field output per procedure (*OUTPUT, FIELD, VARIABLE=PRESELECT, and
+# what Abaqus writes when a deck requests no output database output at all; Analysis
+# User's Guide, "Output to the output database", table 1) as the ccx labels that carry it:
+# (*NODE FILE labels, *EL FILE labels).  PEEQ (Abaqus' PE, PEEQ, PEMAG, CEEQ) only where a
+# material yields or creeps: ccx warns "PEEQ-output requested" on a model without.  Left
+# out (probed on 2.23): A, which *NODE FILE rejects as "label not applicable", and V in
+# steady state dynamics ("V only available ..."); CF, EVF and the volume averages have no
+# ccx label.  ccx's E is Abaqus' LE only without NLGEOM (Green-Lagrange strain with it).
+PRESELECT_FIELD = {
+    "STATIC": (("U", "RF"), ("S", "E", "PEEQ")),
+    "VISCO": (("U", "RF"), ("S", "E", "PEEQ")),
+    "DYNAMIC": (("U", "V", "RF"), ("S", "E", "PEEQ")),
+    "MODAL DYNAMIC": (("U", "V", "RF"), ("S", "E")),
+    "STEADY STATE DYNAMICS": (("U", "RF"), ("S", "E")),
+    "FREQUENCY": (("U",), ()),
+    "BUCKLE": (("U",), ()),
+    "COMPLEX FREQUENCY": (("U",), ()),
+    "HEAT TRANSFER": (("NT", "RFL"), ("HFL",)),
+    "COUPLED TEMPERATURE-DISPLACEMENT": (("U", "RF", "NT", "RFL"), ("S", "E", "PEEQ", "HFL")),
+}
+# What of it has no ccx label (A, CF, contact, the explicit volume averages).
+PRESELECT_NO_CCX = {
+    "STATIC": "CF, CSTRESS, CDISP", "VISCO": "CF, CSTRESS, CDISP",
+    "DYNAMIC": "A, CF, CSTRESS, CDISP", "EXPLICIT": "A, CSTRESS, EVF and the volume averages",
+    "MODAL DYNAMIC": "A, CF", "STEADY STATE DYNAMICS": "V, A, CF",
+    "COUPLED TEMPERATURE-DISPLACEMENT": "CF, CSTRESS, CDISP",
+}
+# Abaqus' linear perturbation procedures: output requests carry over only between
+# consecutive perturbation steps, and those of general steps skip them.
+PERTURBATION_PROCS = {"FREQUENCY", "BUCKLE", "COMPLEX FREQUENCY", "MODAL DYNAMIC",
+                      "STEADY STATE DYNAMICS", "SUBSTRUCTURE GENERATE", "GREEN"}
+
+# ccx sizes an explicit increment per element (calcstabletimeincvol.f) as critom * h * f /
+# (2 c) times a safety factor 0.8 / 1.3: c the material's largest wave speed, h the
+# smallest of volume * k / face area over the element's faces (k = 3 for tetrahedra, 2 for
+# a wedge's quadrilateral faces, else 1; volume and areas from the one-point Jacobians,
+# exact for straight-edged elements) and f the factor of the brick type below.  Beams,
+# shells, membranes and plane elements are sized as the bricks ccx expands them into
+# (gen3delem.f): through their thickness, a truss's square section, or the 2-degree
+# sector of an axisymmetric element.  The factors were probed on one element of each type
+# (ccx 2.23 prints the estimate): C3D8R's is 0.625 there (0.938 in later sources).
+COURANT_FACTOR = (("C3D20", 0.3), ("C3D10", 0.3), ("C3D15", 0.3), ("C3D8I", 0.125),
+                  ("C3D8R", 0.625), ("C3D8", 0.9), ("C3D4", 1.0), ("C3D6", 1.0))
+COURANT_BRICK = (("S3", "C3D6"), ("M3D3", "C3D6"), ("CPS3", "C3D6"), ("CPE3", "C3D6"),
+                 ("CAX3", "C3D6"), ("S4R", "C3D8R"), ("M3D4R", "C3D8R"), ("CPS4R", "C3D8R"),
+                 ("CPE4R", "C3D8R"), ("CAX4R", "C3D8R"), ("S4", "C3D8I"), ("M3D4", "C3D8"),
+                 ("CPS4", "C3D8"), ("CPE4", "C3D8"), ("CAX4", "C3D8"), ("S6", "C3D15"),
+                 ("M3D6", "C3D15"), ("CPS6", "C3D15"), ("CPE6", "C3D15"), ("CAX6", "C3D15"),
+                 ("S8R", "C3D20R"), ("M3D8R", "C3D20R"), ("CPS8R", "C3D20R"), ("CPE8R", "C3D20R"),
+                 ("CAX8R", "C3D20R"), ("S8", "C3D20"), ("M3D8", "C3D20"), ("CPS8", "C3D20"),
+                 ("CPE8", "C3D20"), ("CAX8", "C3D20"), ("B31R", "C3D8R"), ("B31", "C3D8I"),
+                 ("B21", "C3D8I"), ("T3D2", "C3D8I"), ("T2D2", "C3D8I"), ("B32R", "C3D20R"),
+                 ("B32", "C3D20"), ("T3D3", "C3D20"))
+HEX_FACES = ((3, 2, 1, 0), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7))
+TET_FACES = ((0, 2, 1), (0, 1, 3), (1, 2, 3), (0, 3, 2))
+WEDGE_FACES = ((0, 2, 1), (3, 4, 5), (0, 1, 4, 3), (1, 2, 5, 4), (3, 5, 2, 0))
+
+
+def _face_area(p: Sequence[Vec]) -> float:
+    """Area of a straight-edged triangle or (warped: its one-point Jacobian) quadrilateral."""
+    if len(p) == 3:
+        return 0.5 * vnorm(vcross(vsub(p[1], p[0]), vsub(p[2], p[0])))
+    return 0.5 * vnorm(vcross(vsub(p[2], p[0]), vsub(p[3], p[1])))
+
+
+def _tet_volume(a: Vec, b: Vec, c: Vec, d: Vec) -> float:
+    return abs(vdot(vsub(b, a), vcross(vsub(c, a), vsub(d, a)))) / 6.0
+
+
+def max_normal_stiffness(typ: str, v: Sequence[float]) -> Optional[float]:
+    """The largest normal stiffness (C11, C22, C33) of an orthotropic or anisotropic
+    *ELASTIC card of TYPE ``typ`` with values ``v`` (its first temperature)."""
+    try:
+        if typ.startswith("ENGINEERING"):
+            e1, e2, e3, n12, n13, n23 = v[:6]
+            s = [[1 / e1, -n12 / e1, -n13 / e1], [-n12 / e1, 1 / e2, -n23 / e2],
+                 [-n13 / e1, -n23 / e2, 1 / e3]]
+            det = (s[0][0] * (s[1][1] * s[2][2] - s[1][2] * s[2][1])
+                   - s[0][1] * (s[1][0] * s[2][2] - s[1][2] * s[2][0])
+                   + s[0][2] * (s[1][0] * s[2][1] - s[1][1] * s[2][0]))
+            diag = [(s[1][1] * s[2][2] - s[1][2] ** 2) / det, (s[0][0] * s[2][2] - s[0][2] ** 2) / det,
+                    (s[0][0] * s[1][1] - s[0][1] ** 2) / det]
+        elif typ.startswith(("ORTHO", "ANISO")):
+            diag = [v[0], v[2], v[5]]
+        elif typ == "LAMINA":
+            e1, e2, n12 = v[:3]
+            diag = [max(e1, e2) / (1 - n12 * n12 * e2 / e1)]
+        else:
+            return None
+    except (IndexError, ValueError, ZeroDivisionError):
+        return None
+    k = max(diag)
+    return k if math.isfinite(k) and k > 0 else None
+
+
+def courant_length(ctype: str, pts: Sequence[Vec], section: dict) -> Optional[float]:
+    """h * f of ccx's explicit increment estimate (COURANT_FACTOR) for an element of ccx
+    type ``ctype`` with node coordinates ``pts``; ``section``: 't' (shell, membrane or
+    plane thickness), 'area' (truss), 'rect' (a, b), 'circ' (diameter).  None for
+    elements ccx does not size (springs, masses...) or that cannot be measured."""
+    brick = next((b for p, b in COURANT_BRICK if ctype.startswith(p)), ctype)
+    f = next((v for p, v in COURANT_FACTOR if brick.startswith(p)), None)
+    if f is None or not pts:
+        return None
+    if ctype.startswith("C3D"):
+        if brick.startswith(("C3D4", "C3D10")) and len(pts) >= 4:
+            vol = _tet_volume(*pts[:4])
+            areas = [(3.0, _face_area([pts[i] for i in fc])) for fc in TET_FACES]
+        elif brick.startswith(("C3D6", "C3D15")) and len(pts) >= 6:
+            c = pts[:6]
+            vol = _tet_volume(c[0], c[1], c[2], c[3]) + _tet_volume(c[1], c[2], c[3], c[4]) + \
+                _tet_volume(c[2], c[3], c[4], c[5])
+            areas = [(1.0 if len(fc) == 3 else 2.0, _face_area([c[i] for i in fc]))
+                     for fc in WEDGE_FACES]
+        elif len(pts) >= 8:
+            c = pts[:8]
+            sg = ((-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+                  (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1))
+            jac = [tuple(sum(sg[n][d] * c[n][x] for n in range(8)) / 8.0 for x in range(3))
+                   for d in range(3)]
+            vol = 8.0 * abs(vdot(jac[0], vcross(jac[1], jac[2])))
+            areas = [(1.0, _face_area([c[i] for i in fc])) for fc in HEX_FACES]
+        else:
+            return None
+        hs = [k * vol / a for k, a in areas if a > 0]
+        return min(hs) * f if hs and vol > 0 else None
+    if ctype.startswith(("B", "T3D", "T2D")):       # a beam or truss: a box along the axis
+        end = 1 if ctype.startswith(("B31", "B21", "T3D2", "T2D2")) else 2
+        if len(pts) <= end:
+            return None
+        sizes = [vnorm(vsub(pts[end], pts[0]))]
+        if "rect" in section:
+            sizes += list(section["rect"])
+        elif "circ" in section:                 # ccx sees the box around the circle
+            sizes.append(math.sqrt(2.0) * section["circ"])
+        elif "area" in section:
+            sizes.append(math.sqrt(section["area"]))
+        else:
+            return None
+        return min(sizes) * f if min(sizes) > 0 else None
+    # a shell, membrane or plane element: the brick ccx makes of it, its polygon moved by
+    # half the thickness to either side (an axisymmetric one: turned about the y axis by
+    # 1 degree to either side), sized as that brick
+    n = 3 if brick.startswith(("C3D6", "C3D15")) else 4
+    if len(pts) < n:
+        return None
+    poly = list(pts[:n])
+    if ctype.startswith("CAX"):
+        a = math.radians(1.0)
+        sides = [[(x * math.cos(a), y, s * x * math.sin(a)) for x, y, _z in poly] for s in (-1, 1)]
+    else:
+        t = section.get("t")
+        normal = vcross(vsub(poly[2], poly[0]), vsub(poly[-1], poly[1]))
+        if not t or vnorm(normal) == 0:
+            return None
+        normal = vscale(normal, 0.5 * t / vnorm(normal))
+        sides = [[vsub(q, normal) for q in poly], [vadd(q, normal) for q in poly]]
+    return courant_length(brick, sides[0] + sides[1], section)
 
 
 def ccx_label_ok(label: str, allowed: set) -> bool:
@@ -2654,7 +2812,7 @@ class Converter:
                              "request for a set to the .dat (*NODE PRINT / *EL PRINT), and its "
                              "FREQUENCY / NUMBER INTERVAL / TIME INTERVAL / TIME POINTS onto the "
                              "step's first output card.", once=True)
-            return []
+            return self._anchored_output(b)        # a preselected request's cards
         if kw == "KINEMATIC COUPLING":
             return self.handle_coupling(b)
         if kw == "PARAMETER":
@@ -4242,6 +4400,7 @@ class Converter:
         out.extend(self._boundary_pieces(self._vel_tail.get(self._step_idx, [])))
         out.extend(self._flush_dloads())
         out.extend(self._flush_nodal_loads())
+        out.extend(self._anchored_output(step_block))  # Abaqus' default output, if any
         self._step_temp_dof = None
         out.append("*END STEP")
         return out
@@ -5965,9 +6124,16 @@ class Converter:
         parameters and variables are given here, where the card stands)."""
         p = self._out_plan.get(id(b)) or self._lone_output_plan(b)
         if p["cc"] == "CONTACT FILE":
-            self._contact_card(b, self.report)
-        else:
-            self._output_card(b, p["cc"], self.report)
+            self._contact_card(p.get("src", b), self.report)
+        elif p["cc"]:
+            self._output_card(p.get("src", b), p["cc"], self.report)
+        return self._anchored_output(b, p)
+
+    def _anchored_output(self, b: Block, p: Optional[dict] = None) -> List[str]:
+        """The ccx output cards (and their notes) _plan_output placed at block ``b``."""
+        p = p or self._out_plan.get(id(b))
+        if not p:
+            return []
         for msg in p["notes"]:
             self.report.note(msg, once=True)
         for msg in p["warnings"]:
@@ -6210,7 +6376,16 @@ class Converter:
                 solid_nodes.update(conn)
             elif types[typ].startswith(CCX_EXPANDED_PREFIXES):
                 flat_nodes.update(conn)
+        self._out_yields = self._yielding_materials(blocks)
+        self._courant = None                    # (min h f / c, element), see _courant_min
         steps: List[Tuple[int, dict, List[dict]]] = []
+        # The field output requests Abaqus keeps for a later step without requests of its
+        # own, per kind of step (general, linear perturbation): None while there are none
+        # (Abaqus then writes its preselected output), else the cards of the step that made
+        # them, [(card, the *OUTPUT it follows)] — a PRESELECT / ALL *OUTPUT standing for
+        # its preselected variables, "DEFAULT" for the preselected default
+        carried: Dict[bool, Optional[list]] = {False: None, True: None}
+        prev_pert = False
         i, k = 0, 0
         while i < len(blocks):
             if blocks[i].keyword == "STEP":
@@ -6219,18 +6394,63 @@ class Converter:
                     j += 1
                 k += 1
                 inner = blocks[i + 1:j]
-                timing = self._step_timing(next((x for x in inner if x.keyword in PROC_KW), None))
-                ctx, reqs = None, []
+                proc = next((x for x in inner if x.keyword in PROC_KW), None)
+                timing = self._step_timing(proc)
+                if timing["kind"] == "explicit":
+                    timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
+                    timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
+                pert = timing["proc"] in PERTURBATION_PROCS or blocks[i].has("PERTURBATION")
+                ctx, reqs, odb, add, own = None, [], False, False, []
                 for x in inner:
                     if x.keyword == "OUTPUT":
-                        ctx = x
-                        if (x.param("VARIABLE") or "").strip().upper() in ("PRESELECT", "ALL"):
-                            self._out_notes.setdefault(id(x), []).append(
-                                f"*OUTPUT, VARIABLE={x.param('VARIABLE').strip().upper()}: ccx has "
-                                f"no preselected output, so only the variables named on the "
-                                f"*NODE OUTPUT / *ELEMENT OUTPUT cards that follow are requested.")
+                        ctx, odb = x, True
+                        add = add or (x.param("OP") or "").strip().upper() in ("ADD", "REPLACE")
+                        var = (x.param("VARIABLE") or "").strip().upper()
+                        if not x.has("FIELD"):
+                            if var in ("PRESELECT", "ALL"):
+                                self._out_notes.setdefault(id(x), []).append(
+                                    f"*OUTPUT, HISTORY, VARIABLE={var}: Abaqus' preselected history "
+                                    f"output (whole-model energies ALLIE, ALLKE, ...) has no ccx "
+                                    f"counterpart; dropped.")
+                            continue
+                        if var in ("PRESELECT", "ALL"):
+                            own.append((x, None))
+                            reqs += self._preselect_requests(x, x, timing, var, quiet, k)
                     elif x.keyword in OUTPUT_CARDS:
-                        reqs.append(self._output_request(x, ctx, timing, quiet))
+                        sub = x.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
+                        if sub and ctx is not None and ctx.has("FIELD") and \
+                                (ctx.param("VARIABLE") or "").strip().upper() == "ALL":
+                            self._out_notes.setdefault(id(ctx), []).append(
+                                f"*{x.keyword} under *OUTPUT, FIELD, VARIABLE=ALL dropped (Abaqus "
+                                f"ignores the individual requests then).")
+                            self._out_plan[id(x)] = {"cc": None, "cards": [], "notes": [],
+                                                     "warnings": [], "out2d": False}
+                            continue
+                        src = self._preselect_card(x, ctx, timing) if sub else x
+                        if src is None:     # a preselected request with no ccx label here
+                            self._out_plan[id(x)] = {"cc": None, "cards": [], "warnings": [],
+                                                     "out2d": False, "notes": [
+                                f"*{x.keyword}, VARIABLE=PRESELECT in a *{timing['proc']} step: "
+                                f"Abaqus preselects no such variable there; dropped."]}
+                            continue
+                        if sub and ctx is not None and ctx.has("FIELD"):
+                            own.append((x, ctx))
+                        r = self._output_request(src, ctx, timing, quiet)
+                        r["anchor"] = x
+                        reqs.append(r)
+                if odb and not add:
+                    carried[pert] = own
+                else:
+                    # Abaqus: a step without output database requests keeps those in force —
+                    # of the previous general step, or of the previous step when both are
+                    # perturbation steps — and the first such step writes the preselected
+                    # output; OP=ADD / REPLACE keeps them beside the step's own.  ccx keeps
+                    # its cards too, but at the previous step's frequency (or time points)
+                    # and as a step in between left them, so they are written again
+                    held = carried[pert] if (not pert or prev_pert) else None
+                    reqs += self._carried_requests(blocks[i], held, timing, quiet, k)
+                    carried[pert] = (held if held is not None else [("DEFAULT", None)]) + own
+                prev_pert = pert
                 steps.append((k, timing, reqs))
                 i = j
             i += 1
@@ -6301,11 +6521,17 @@ class Converter:
         two_d = stated == "2D" or (stated is None and (not frd3d or out2d))
         visible = solid_nodes | (flat_nodes if two_d else set())
         for k, timing, reqs in steps:
-            for r in reqs:
-                self._out_plan[id(r["b"])] = {"cc": r["cc"], "cards": self._request_cards(r, visible),
-                                             "notes": r["notes"], "warnings": r["warnings"],
-                                             "out2d": r.get("out2d", False)}
             self._out_ctl[k] = self._step_output_control(k, timing, reqs)
+            for r in reqs:
+                # the cards are written where their anchor stands: the output card itself, the
+                # *OUTPUT of a preselected request, or the *STEP of Abaqus' default output
+                p = self._out_plan.setdefault(id(r.get("anchor", r["b"])), {
+                    "cc": r["cc"], "src": r["b"], "cards": [], "notes": [], "warnings": [],
+                    "out2d": False})
+                p["cards"] += self._request_cards(r, visible)
+                p["notes"] += r["notes"]
+                p["warnings"] += r["warnings"]
+                p["out2d"] = p["out2d"] or r.get("out2d", False)
 
     def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
         """One output card of a step: where it goes, its labels and the output control it
@@ -6342,6 +6568,121 @@ class Converter:
                     "would replace the step's field output, and it has no values at beam or "
                     "shell nodes or at reference points.")
         return r
+
+    def _yielding_materials(self, blocks: List[Block]) -> bool:
+        """Whether a material of the deck yields or creeps in ccx (a *PLASTIC card the
+        converter keeps, or *CREEP): ccx writes PEEQ only then, and warns otherwise."""
+        return any((b.keyword == "PLASTIC" and self._plastic_kept(b)) or b.keyword == "CREEP"
+                   for b in blocks)
+
+    def _preselect_labels(self, proc: Optional[str], var: str) -> Tuple[List[str], List[str]]:
+        """(*NODE FILE labels, *EL FILE labels) of Abaqus' preselected field output in a
+        ``proc`` step (PRESELECT_FIELD); VARIABLE=ALL adds the strain energy density (not
+        the state variables: SDV on a model with *DEPVAR but no user material crashes ccx
+        2.23, probed)."""
+        node, elem = PRESELECT_FIELD.get(proc or "", ((), ()))
+        elem = [x for x in elem if x != "PEEQ" or self._out_yields]
+        if var == "ALL" and "S" in elem:
+            elem.append("ENER")
+        return list(node), elem
+
+    def _preselect_requests(self, anchor: Block, ctx: Block, timing: dict, var: str,
+                            quiet: "Report", k: int, why: str = "") -> List[dict]:
+        """The whole-model *NODE FILE / *EL FILE requests of Abaqus' preselected field output
+        (``var`` PRESELECT or ALL) for step ``k``, under *OUTPUT ``ctx`` (its frequency
+        applies), written where ``anchor`` stands: the *OUTPUT card, or the *STEP of a step
+        without output database requests (``why``): 'default', the output Abaqus writes
+        then, or 'carried', an earlier step's preselected request, whose variables change
+        with the procedure."""
+        node, elem = self._preselect_labels(timing["proc"], var)
+        reqs = []
+        for kw, labels in (("NODE OUTPUT", node), ("ELEMENT OUTPUT", elem)):
+            if labels:
+                r = self._output_request(mkblock(kw, None, [", ".join(labels)]), ctx, timing, quiet)
+                r["anchor"] = anchor
+                reqs.append(r)
+        proc = f"*{timing['proc']}" if timing["proc"] else "an unknown"
+        cards = " and ".join(f"*{cc} {', '.join(labels)}" for cc, labels in
+                             (("NODE FILE", node), ("EL FILE", elem)) if labels)
+        if not reqs:
+            if not why:
+                self._out_notes.setdefault(id(anchor), []).append(
+                    f"*OUTPUT, FIELD, VARIABLE={var} in {proc} step: ccx has no counterpart of "
+                    f"Abaqus' preselected field output there; dropped.")
+            return reqs
+        if not any(r["live"] for r in reqs):        # FREQUENCY=0: none of it is written
+            for r in reqs:
+                r["notes"] = []
+            reqs[0]["notes"].append(f"*OUTPUT, FIELD, VARIABLE={var} with {reqs[0]['ctl'][1]}=0: "
+                                    f"Abaqus writes none of it; nothing written.")
+            return reqs
+        lost = PRESELECT_NO_CCX.get("EXPLICIT" if timing["kind"] == "explicit" else
+                                    timing["proc"], "")
+        lost = f" (no ccx label for {lost})" if lost else ""
+        if why == "default":
+            reqs[0]["notes"].append(
+                f"Step {k} ({proc}) requests no output database output and inherits none, so "
+                f"Abaqus writes its preselected field output -> {cards} added{lost}.")
+        elif why:
+            reqs[0]["notes"].append(
+                f"Step {k} ({proc}) carries over an earlier step's preselected field output "
+                f"(Abaqus) -> {cards} written again{lost}: ccx keeps its cards too, but at the "
+                f"earlier step's output frequency and variables.")
+        else:
+            reqs[0]["notes"].append(
+                f"*OUTPUT, FIELD, VARIABLE={var} in {proc} step -> {cards}: Abaqus' "
+                f"{'preselected' if var == 'PRESELECT' else 'applicable'} field output in ccx "
+                f"labels{lost}.")
+        return reqs
+
+    def _preselect_card(self, b: Block, ctx: Optional[Block], timing: dict) -> Optional[Block]:
+        """A field *NODE OUTPUT / *ELEMENT OUTPUT with VARIABLE=PRESELECT (the procedure's
+        preselected variables of that kind, plus the ones it names) or VARIABLE=ALL (the
+        names ignored, as Abaqus does) as the plain card the planner reads; None when
+        nothing is left; any other card unchanged."""
+        var = (b.param("VARIABLE") or "").strip().upper()
+        if var not in ("PRESELECT", "ALL") or b.keyword == "CONTACT OUTPUT" or ctx is None \
+                or not ctx.has("FIELD"):
+            return b
+        node, elem = self._preselect_labels(timing["proc"], var)
+        labels = node if b.keyword == "NODE OUTPUT" else elem
+        own = [] if var == "ALL" else [v for rec in merged_data_records(b) for v in rec if v != ""]
+        if not labels and not own:
+            return None
+        return mkblock(b.keyword, [(p, v) for p, v in b.params.items() if p != "VARIABLE"],
+                       [", ".join(dedup_str(list(labels) + own))])
+
+    def _carried_requests(self, anchor: Block, held: Optional[list], timing: dict,
+                          quiet: "Report", k: int) -> List[dict]:
+        """The field output requests step ``k`` carries over (``held``, see _plan_output) as
+        requests written at its *STEP ``anchor``: the cards of the step that made them, at
+        their *OUTPUT's frequency and with this step's preselected variables; Abaqus'
+        preselected default when ``held`` is None."""
+        if held is None:
+            return self._preselect_requests(anchor, mkblock("OUTPUT", [("FIELD", None)]), timing,
+                                            "PRESELECT", quiet, k, why="default")
+        reqs: List[dict] = []
+        listed: List[dict] = []
+        for x, ctx in held:
+            if x == "DEFAULT":
+                reqs += self._preselect_requests(anchor, mkblock("OUTPUT", [("FIELD", None)]),
+                                                 timing, "PRESELECT", quiet, k, why="carried")
+            elif x.keyword == "OUTPUT":
+                reqs += self._preselect_requests(anchor, x, timing,
+                                                 (x.param("VARIABLE") or "").strip().upper(),
+                                                 quiet, k, why="carried")
+            else:
+                src = self._preselect_card(x, ctx, timing)
+                if src is not None:
+                    r = self._output_request(src, ctx, timing, quiet)
+                    r["anchor"] = anchor
+                    listed.append(r)
+        if listed:
+            listed[0]["notes"].append(
+                f"Step {k} carries over the field output requests of an earlier step (Abaqus) "
+                f"-> their cards written again: ccx keeps them too, but at the earlier step's "
+                f"output frequency and as a step in between left them.")
+        return reqs + listed
 
     def _request_cards(self, r: dict, visible: set) -> List[tuple]:
         """The ccx cards of output request ``r`` (see _plan_output): a .frd node set with
@@ -6530,12 +6871,18 @@ class Converter:
                         f"POINTS only where it picks the increments; DIRECT and *MODAL DYNAMIC "
                         f"stop on them).")
             return ("FREQUENCY", str(n))
-        if timing["dtmax"]:
-            n = max(1, int(spacing / timing["dtmax"] + 1e-9))
+        sizes = [(v, what) for v, what in ((timing["dtmax"], "the maximum increment"),
+                                           (timing.get("dtstable"), "ccx's stable increment"))
+                 if v]
+        if sizes:
+            inc, what = min(sizes)
+            n = max(1, int(spacing / inc + 1e-9))
+            how = ("" if what.startswith("the") else " as abq2ccx estimates it with ccx's "
+                   "Courant formula (calcstabletimeincvol.f)")
             msgs.append(f"Explicit output every {fmt_num(spacing)} of step time -> FREQUENCY={n} "
-                        f"from the maximum increment {fmt_num(timing['dtmax'])} (ccx ignores TIME "
-                        f"POINTS in explicit dynamics; its stable increment can be smaller, so the "
-                        f"output comes at least that often).")
+                        f"from {what} {'%.3g' % inc}{how} (ccx ignores TIME POINTS in explicit "
+                        f"dynamics; where contact makes its increment smaller, the output comes "
+                        f"more often).")
             return ("FREQUENCY", str(n))
         return ("NONE", spacing)
 
@@ -11026,6 +11373,130 @@ class Converter:
                         densities.setdefault(cur, []).append(rho)
         return {m: math.sqrt(max(moduli[m]) / min(densities[m]))
                 for m in moduli if m in densities and m not in other}
+
+    def _all_wave_speeds(self, blocks: List[Block]) -> Dict[str, float]:
+        """_wave_speeds, plus the orthotropic and anisotropic materials: sqrt(largest normal
+        stiffness / rho), which can fall a little short of the speed ccx finds over all
+        directions (anisomaxwavspd.f)."""
+        speeds = dict(self._wave_speeds(blocks))
+        stiff: Dict[str, float] = {}
+        rho: Dict[str, float] = {}
+        cur: Optional[str] = None
+        for b in blocks:
+            kw = b.keyword
+            if kw == "MATERIAL":
+                cur = (b.param("NAME") or "").strip().upper()
+            elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
+                cur = None
+            elif cur is not None and kw == "ELASTIC":
+                typ = (b.param("TYPE") or "ISO").strip().upper()
+                try:
+                    vals = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+                except ValueError:
+                    continue
+                k = max_normal_stiffness(typ, vals)
+                if k:
+                    stiff[cur] = k
+            elif cur is not None and kw == "DENSITY":
+                try:
+                    r = min(pf(rec[0]) for rec in merged_data_records(b) if rec and rec[0])
+                except ValueError:
+                    continue
+                if r > 0:
+                    rho[cur] = r
+        for m, k in stiff.items():
+            if m not in speeds and m in rho:
+                speeds[m] = math.sqrt(k / rho[m])
+        return speeds
+
+    @staticmethod
+    def _critom(proc: Optional[Block]) -> float:
+        """ccx's critical frequency factor of the explicit increment for the *DYNAMIC
+        ALPHA (calcstabletimeincvol.f, no damping)."""
+        try:
+            alpha = min(max(pf((proc.param("ALPHA") if proc else None) or "-0.05"), -1.0 / 3.0), 0.0)
+        except ValueError:
+            alpha = -0.05
+        return 1.96 / math.sqrt(1.0 - alpha * (1.0 + alpha * (2.0 + alpha)))
+
+    def _explicit_stable_increment(self, blocks: List[Block], proc: Optional[Block]) -> Optional[float]:
+        """The increment ccx picks for an explicit step (calcstabletimeincvol.f; COURANT_FACTOR):
+        0.8 / 1.3 * critom * min(h f / c) / 2 over the elements it can size; None when it
+        can size none (no material with a density and elastic constants: ccx then runs the
+        step in a single increment)."""
+        if self._courant is None:
+            self._courant = self._courant_min(blocks) or False
+        if not self._courant:
+            return None
+        return self._critom(proc) * (0.8 / 1.3) / 2.0 * self._courant[0]
+
+    def _courant_min(self, blocks: List[Block]) -> Optional[Tuple[float, int]]:
+        """(smallest h f / c, its element) over the elements under a section whose material
+        has a wave speed (_all_wave_speeds); courant_length gives h f."""
+        speeds = self._all_wave_speeds(blocks)
+        if not speeds:
+            return None
+        sized: Dict[int, Tuple[float, dict]] = {}
+        for b in blocks:
+            if b.keyword not in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION",
+                                 "MEMBRANE SECTION", "BEAM SECTION", "COHESIVE SECTION",
+                                 "GASKET SECTION"):
+                continue
+            recs = [r for r in merged_data_records(b) if any(x for x in r)]
+
+            def num(r: int, i: int) -> Optional[float]:
+                try:
+                    v = pf(recs[r][i])
+                except (IndexError, ValueError):
+                    return None
+                return v if math.isfinite(v) and v > 0 else None
+            mats = [(b.param("MATERIAL") or "").strip().upper()]
+            sec: dict = {}
+            if b.has("COMPOSITE"):                  # plies: thickness, -, material, ...
+                plies = [r for r in range(len(recs)) if num(r, 0)]
+                sec["t"] = sum(num(r, 0) for r in plies)
+                mats = [recs[r][2].strip().upper() for r in plies if len(recs[r]) > 2]
+            elif b.keyword == "BEAM SECTION":
+                shape = (b.param("SECTION") or "").strip().upper()
+                if shape in ("RECT", "BOX") and num(0, 0) and num(0, 1):
+                    sec["rect"] = (num(0, 0), num(0, 1))
+                elif shape in ("CIRC", "PIPE", "THICK PIPE") and num(0, 0):
+                    sec["circ"] = 2.0 * num(0, 0)           # Abaqus gives the radius
+            elif b.keyword == "SOLID SECTION":
+                sec["t"] = sec["area"] = num(0, 0) or 1.0   # plane thickness, truss area
+            elif b.keyword in ("COHESIVE SECTION", "GASKET SECTION"):
+                sec["t"] = 1.0          # a *SOLID SECTION without data in ccx (continuum)
+            else:
+                sec["t"] = num(0, 0)
+            cs = [speeds[m] for m in mats if m in speeds]
+            if not cs:
+                continue
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                sized[e] = (max(cs), sec)
+        quiet = Report()
+        types: Dict[str, str] = {}
+        best: Optional[Tuple[float, int]] = None
+        for e, (c, sec) in sized.items():
+            if e not in self.geom.elements:
+                continue
+            typ, conn = self.geom.elements[e]
+            if typ not in types:
+                types[typ] = ccx_element_type(typ, quiet)
+            if any(n not in self.geom.nodes for n in conn):
+                continue
+            hf = courant_length(types[typ], [self.geom.nodes[n] for n in conn], sec)
+            if hf and (best is None or hf / c < best[0]):
+                best = (hf / c, e)
+        return best
+
+    def _circ_capped_max(self, proc: Optional[Block], dtmax: Optional[float]) -> Optional[float]:
+        """An explicit step's maximum increment as converted: the deck's, or the smaller cap
+        _circ_explicit_increment sets for circular-section beams."""
+        if self._circ_explicit is None or proc is None or proc.has("DIRECT") or \
+                proc.has("DIRECT USER CONTROL"):
+            return dtmax
+        cap = float("%.3g" % (self._critom(proc) * 0.3 * (0.8 / 1.3) / 2.0 * self._circ_explicit[0]))
+        return min(cap, dtmax) if dtmax else cap
 
     def _circ_explicit_increment(self, params: "OrderedDict[str, Optional[str]]",
                                  data: List[str]) -> List[str]:

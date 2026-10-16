@@ -1448,9 +1448,9 @@ def test_circ_beam_explicit_increment_capped():
     body, _, _ = convert_str(CIRC_EXPLICIT + explicit_step(", 0.001, , 1e-6"))
     assert "\n, 0.001, , 2.09e-09\n" in body
     body, _, rep = convert_str(CIRC_EXPLICIT + explicit_step(", 0.001, , 1e-9"))
-    assert "\n, 0.001, , 1e-9\n" in body and "maximum increment" not in rep.text()
+    assert "\n, 0.001, , 1e-9\n" in body and "set for the circular-section" not in rep.text()
     body, _, rep = convert_str(CIRC_EXPLICIT + explicit_step(", 1e-9"))
-    assert "\n, 1e-9\n" in body and "maximum increment" not in rep.text()
+    assert "\n, 1e-9\n" in body and "set for the circular-section" not in rep.text()
     # an element shorter than d / sqrt(2) sets it by its length (ccx's own estimate there)
     short = CIRC_EXPLICIT.replace("3, 2., 0., 0.", "3, 1.05, 0., 0.")
     body, conv, _ = convert_str(short + explicit_step(", 0.001"))
@@ -1463,7 +1463,7 @@ def test_circ_beam_explicit_increment_left_alone_or_warned():
     assert "*DYNAMIC\n1e-4, 0.001\n" in body and conv._circ_explicit is None
     rect = CIRC_EXPLICIT.replace("section=CIRC\n0.05", "section=RECT\n0.1, 0.1")
     body, _, rep = convert_str(rect + explicit_step(", 0.001"))
-    assert "*DYNAMIC, EXPLICIT\n, 0.001\n" in body and "maximum increment" not in rep.text()
+    assert "*DYNAMIC, EXPLICIT\n, 0.001\n" in body and "set for the circular-section" not in rep.text()
     # a fixed increment (DIRECT USER CONTROL -> DIRECT) above the cap is only warned: ccx's
     # mass scaling for it is sized from the same overestimate
     direct = ", direct user control"
@@ -1471,7 +1471,7 @@ def test_circ_beam_explicit_increment_left_alone_or_warned():
     assert "*DYNAMIC, EXPLICIT, DIRECT\n1e-8, 0.001\n" in body
     assert "the fixed increment 1e-8 exceeds" in rep.text()
     _, _, rep = convert_str(CIRC_EXPLICIT + explicit_step("1e-9, 0.001", direct))
-    assert "fixed increment" not in rep.text()
+    assert "the fixed increment" not in rep.text()
     # no density (nor any wave speed): no cap, a warning with the rule of thumb
     body, _, rep = convert_str(CIRC_EXPLICIT.replace("*Density\n7.85e-9\n", "")
                                + explicit_step(", 0.001"))
@@ -2162,6 +2162,12 @@ def _step(body, k):
     return body.split("*STEP")[k].split("*END STEP")[0]
 
 
+def _without_output(text):
+    """``text`` without its *NODE FILE / *EL FILE cards: a step without output requests gets
+    Abaqus' default output at its end."""
+    return re.sub(r"\*(?:NODE FILE|EL FILE)[^\n]*\n[^*\n][^\n]*\n", "", text)
+
+
 def test_history_output_goes_to_print_cards():
     # a ccx .frd keeps one node set per variable: as *NODE FILE, NSET=TOP the history request
     # replaced the field output's whole-model U (probed on 2.23); *OUTPUT, HISTORY for a set
@@ -2281,6 +2287,225 @@ def test_beam_output_requests_example():
     assert ("*NODE FILE, NSET=TIP, OUTPUT=2D, TIME POINTS=ABQ2CCX_TP1\nU, RF\n*NODE PRINT, NSET=MID\n"
             "U\n") in body
     assert not dangling_refs(reparse(body))
+
+
+PRESELECT = "*Output, field, variable=PRESELECT\n"
+STEEL = ("*Material, name=M\n*Elastic\n210000., 0.3\n*Density\n7.85e-9\n"
+         "*Solid Section, elset=EALL, material=M\n")
+
+
+def test_preselect_field_output_per_procedure():
+    # *OUTPUT, FIELD, VARIABLE=PRESELECT (the Abaqus/CAE default) -> the ccx labels of Abaqus'
+    # preselected field output for the step's procedure ("Output to the output database",
+    # table 1); before, ccx wrote the mesh only.  A in no step and V in steady state dynamics
+    # are left out (ccx 2.23 rejects them on *NODE FILE, probed); implicit *DYNAMIC output
+    # comes every 10 increments, the Abaqus default there
+    cases = {"*Static\n": "*NODE FILE\nU, RF\n*EL FILE\nS, E\n",
+             "*Dynamic\n0.01, 1.\n": "*NODE FILE, FREQUENCY=10\nU, V, RF\n*EL FILE\nS, E\n",
+             "*Frequency\n5\n": "*NODE FILE\nU\n",
+             "*Buckle\n2\n": "*NODE FILE\nU\n",
+             "*Heat Transfer, steady state\n1., 1.\n": "*NODE FILE\nNT, RFL\n*EL FILE\nHFL\n",
+             "*Coupled Temperature-displacement\n0.1, 1.\n":
+                 "*NODE FILE\nU, RF, NT, RFL\n*EL FILE\nS, E, HFL\n"}
+    for proc, cards in cases.items():
+        body, _, rep = convert_str(HEX + "*Step\n" + proc + PRESELECT + "*End Step\n")
+        assert cards in _step(body, 1), (proc, _step(body, 1))
+        assert _step(body, 1).count("*EL FILE") == cards.count("*EL FILE"), proc
+        assert "VARIABLE=PRESELECT in *" in rep.text()
+    body, _, _ = convert_str(HEX + "*Step\n*Frequency, storage=yes\n5\n" + PRESELECT + "*End Step\n"
+                             "*Step\n*Steady State Dynamics\n1., 10., 5\n" + PRESELECT + "*End Step\n"
+                             "*Step\n*Modal Dynamic\n0.001, 0.1\n" + PRESELECT + "*End Step\n")
+    assert "*NODE FILE\nU, RF\n*EL FILE\nS, E\n" in _step(body, 2)
+    assert "*NODE FILE, FREQUENCY=10\nU, V, RF\n*EL FILE\nS, E\n" in _step(body, 3)
+    # preselected history output (whole-model energies) has no ccx counterpart
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n*Output, history, variable=PRESELECT\n"
+                               "*End Step\n")
+    assert "*NODE FILE" not in body and "has no ccx counterpart; dropped" in rep.text()
+
+
+def test_preselect_peeq_only_where_a_material_yields():
+    # ccx warns 'PEEQ-output requested' on a model without plasticity (probed): PEEQ only
+    # with a *PLASTIC the converter keeps, or *CREEP
+    plastic = STEEL.replace("*Density", "*Plastic\n200., 0.\n400., 0.1\n*Density")
+    deck = "*Step\n*Static\n" + PRESELECT + "*End Step\n"
+    body, _, _ = convert_str(HEX + plastic + deck)
+    assert "*EL FILE\nS, E, PEEQ\n" in _step(body, 1)
+    body, _, _ = convert_str(HEX + plastic.replace("*Plastic", "*Plastic, hardening=user, properties=2")
+                             + deck)
+    assert "*EL FILE\nS, E\n" in _step(body, 1)
+    body, _, _ = convert_str(HEX + STEEL + deck)
+    assert "*EL FILE\nS, E\n" in _step(body, 1)
+
+
+def test_preselect_with_named_variables_and_all():
+    # PRESELECT plus variables named under it: Abaqus appends them; a field *NODE OUTPUT /
+    # *ELEMENT OUTPUT with VARIABLE=PRESELECT: its kind's preselected variables plus its own;
+    # *OUTPUT, FIELD, VARIABLE=ALL: also ENER, and the cards under it are ignored (Abaqus)
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n" + PRESELECT + "*Element Output\nENER\n"
+                             "*End Step\n")
+    assert "*NODE FILE\nU, RF\n*EL FILE\nS, E\n*EL FILE\nENER\n" in _step(body, 1)
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n*Output, field\n*Node Output, variable=PRESELECT\n"
+                               "NT\n*Element Output, variable=PRESELECT\n*End Step\n")
+    assert "*NODE FILE\nU, RF, NT\n*EL FILE\nS, E\n" in _step(body, 1)
+    assert "VARIABLE dropped" not in rep.text()
+    body, _, rep = convert_str(HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Step\n*Static\n"
+                               "*Output, field, variable=ALL\n*Node Output, nset=TOP\nU\n*End Step\n")
+    assert "*NODE FILE\nU, RF\n*EL FILE\nS, E, ENER\n" in _step(body, 1)
+    assert "NSET=TOP" not in _step(body, 1) and "ignores the individual requests" in rep.text()
+    # a kind with nothing preselected for the procedure is dropped, not defaulted to U / S
+    body, _, _ = convert_str(HEX + "*Step\n*Frequency\n3\n*Output, field\n*Element Output, "
+                             "variable=PRESELECT\n*End Step\n")
+    assert "*EL FILE" not in body
+
+
+def test_default_output_without_output_requests():
+    # Abaqus writes its preselected field output for a step without output database
+    # requests (*OUTPUT) and carries it over; *NODE PRINT / *EL PRINT (.dat) and *NODE FILE /
+    # *EL FILE (.fil) requests do not replace it.  Added at the end of the step
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n*End Step\n")
+    assert _step(body, 1).endswith("*NODE FILE\nU, RF\n*EL FILE\nS, E\n")
+    assert "requests no output database output and inherits none" in rep.text()
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Node Print\nU\n*El Print\nS\n*End Step\n")
+    assert _step(body, 1).endswith("*EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS\nS\n*NODE FILE\nU, RF\n"
+                                   "*EL FILE\nS, E\n")
+    # history requests only: Abaqus writes no field output in that step
+    body, _, _ = convert_str(HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Step\n*Static\n*Output, history\n"
+                             "*Node Output, nset=TOP\nU\n*End Step\n")
+    assert "*NODE FILE" not in body and "*EL FILE" not in body
+    # later steps of the kind keep it and get it again, with their procedure's variables and
+    # default frequency (ccx would keep the earlier step's); a perturbation step after a
+    # general one gets the default
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n*End Step\n*Step\n*Static\n*End Step\n"
+                               "*Step\n*Dynamic\n0.01, 1.\n*End Step\n*Step\n*Frequency\n3\n"
+                               "*End Step\n")
+    assert _step(body, 2).endswith("*NODE FILE\nU, RF\n*EL FILE\nS, E\n")
+    assert _step(body, 3).endswith("*NODE FILE, FREQUENCY=10\nU, V, RF\n*EL FILE\nS, E\n")
+    assert _step(body, 4).endswith("*NODE FILE\nU\n")
+    assert "carries over an earlier step's preselected field output" in rep.text()
+    # the deck's own field requests are what Abaqus writes, also in the steps after them
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Output, field\n*Node Output\nU\n*End Step\n"
+                             "*Step\n*Static\n*End Step\n")
+    assert "*EL FILE" not in body and _step(body, 2).endswith("*NODE FILE\nU\n")
+
+
+def test_carried_output_requests_written_again():
+    # ccx keeps a step's output cards for later steps, but at that step's frequency or time
+    # points and as a step in between left them; Abaqus carries the requests themselves over,
+    # so a step without requests of its own gets them again: here the time points of its own
+    # period, a FREQUENCY where ccx stops on time points (DIRECT), the static default after a
+    # dynamic step, and the variables a perturbation step replaced in ccx
+    body, _, _ = convert_str(HEX + "*Step, nlgeom\n*Static\n0.1, 1.\n*Output, field, "
+                             "variable=PRESELECT, number interval=4\n*End Step\n*Step, nlgeom\n"
+                             "*Static\n0.1, 3.\n*End Step\n*Step, nlgeom\n*Static, direct\n0.5, 1.\n"
+                             "*End Step\n")
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP2, GENERATE\n0.75, 3., 0.75\n" in body
+    assert "*NODE FILE, TIME POINTS=ABQ2CCX_TP2\nU, RF\n" in _step(body, 2)
+    assert "*NODE FILE, FREQUENCY=1\nU, RF\n" in _step(body, 3)
+    body, _, _ = convert_str(HEX + "*Step\n*Dynamic\n0.01, 1.\n*End Step\n*Step\n*Static\n*End Step\n")
+    assert _step(body, 2).endswith("*NODE FILE, FREQUENCY=1\nU, RF\n*EL FILE\nS, E\n")
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Output, field\n*Node Output\nRF, U\n*Element "
+                             "Output\nS\n*End Step\n*Step, perturbation\n*Frequency\n3\n" + PRESELECT +
+                             "*End Step\n*Step\n*Static\n*End Step\n")
+    assert _step(body, 2).endswith("*NODE FILE\nU\n")
+    assert _step(body, 3).endswith("*NODE FILE\nRF, U\n*EL FILE\nS\n")
+    # named variables beside a preselected request stay, at the request's own frequency
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Output, field, variable=PRESELECT, frequency=5\n"
+                             "*Element Output\nENER\n*End Step\n*Step\n*Dynamic\n0.01, 1.\n*End Step\n")
+    assert _step(body, 2).endswith("*NODE FILE\nU, V, RF\n*EL FILE\nS, E\n*EL FILE\nENER\n")
+    # OP=ADD keeps the requests in force (here Abaqus' default) beside the new ones
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Output, field, op=add\n*Element Output\nENER\n"
+                             "*End Step\n")
+    assert _step(body, 1).endswith("*EL FILE\nENER\n*NODE FILE\nU, RF\n*EL FILE\nS, E\n")
+    # an explicit step gets its own FREQUENCY (20 intervals of 1e-2 over ccx's 8.847e-8)
+    body, _, _ = convert_str(HEX + STEEL + "*Step\n*Dynamic, Explicit\n, 1.e-4\n" + PRESELECT +
+                             "*End Step\n*Step\n*Dynamic, Explicit\n, 1.e-2\n*End Step\n")
+    assert "*NODE FILE, FREQUENCY=56\n" in _step(body, 1)
+    assert "*NODE FILE, FREQUENCY=5651\n" in _step(body, 2)
+    # FREQUENCY=0: nothing written, one note
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n*Output, field, variable=PRESELECT, "
+                               "frequency=0\n*End Step\n*Step\n*Static\n*End Step\n")
+    assert "*NODE FILE" not in body and "*EL FILE" not in body
+    assert "Abaqus writes none of it" in rep.text() and "*NODE OUTPUT dropped" not in rep.text()
+
+
+def test_explicit_output_frequency_from_ccx_stable_increment():
+    # ccx ignores TIME POINTS in explicit dynamics and writes every increment unless given a
+    # FREQUENCY; its increment is its Courant estimate (calcstabletimeincvol.f): 8.847e-8 for
+    # a unit C3D8 cube of steel, as ccx 2.23 prints it.  Abaqus' default 20 field intervals of
+    # 1e-4 -> every 5e-6 -> FREQUENCY=56
+    body, conv, rep = convert_str(HEX + STEEL + "*Step\n*Dynamic, Explicit\n, 1.e-4\n*End Step\n")
+    assert "*NODE FILE, FREQUENCY=56\nU, V, RF\n*EL FILE\nS, E\n" in _step(body, 1)
+    assert "from ccx's stable increment 8.85e-08" in rep.text()
+    assert abs(conv._explicit_stable_increment([], None) / 8.847263e-08 - 1) < 1e-6
+    # a smaller maximum increment (4th field) sets it; the *OUTPUT's NUMBER INTERVAL counts
+    body, _, rep = convert_str(HEX + STEEL + "*Step\n*Dynamic, Explicit\n, 1.e-4, , 1.e-8\n" +
+                               PRESELECT.replace("\n", ", number interval=4\n") + "*End Step\n")
+    assert "*NODE FILE, FREQUENCY=2500\nU, V, RF\n" in body and "maximum increment 1e-08" in rep.text()
+
+
+def test_preselect_output_examples():
+    # the validate_with_ccx.py decks: Abaqus/CAE's default requests on a bar in tension, and
+    # an explicit bar impact without output requests (FREQUENCY=4: ccx's increment 8.85e-7
+    # into 20 intervals of 7.7336e-5)
+    body, _, _ = convert(os.path.join(EXAMPLES, "preselect_output_bar.inp"))
+    assert "*CLOAD\nTIP, 1, 250.\n*NODE FILE\nU, RF\n*EL FILE\nS, E\n*END STEP" in body
+    assert not dangling_refs(reparse(body))
+    body, _, _ = convert(os.path.join(EXAMPLES, "explicit_default_output_bar.inp"))
+    assert _step(body, 1).endswith("*NODE FILE, FREQUENCY=4\nU, V, RF\n*EL FILE\nS, E\n")
+    assert not dangling_refs(reparse(body))
+
+
+def test_courant_length_matches_ccx_223():
+    # h * f of ccx's explicit increment estimate against the increments ccx 2.23 printed for
+    # one element of each type (steel: c = 6.0010e6; dt = 0.8/1.3 * 1.91722 * h f / (2 c)).
+    # C3D8R's factor is 0.625 in 2.23 (0.938 in later sources); shells, membranes and plane
+    # elements are sized through their thickness, axisymmetric ones as a 2-degree sector at
+    # their mean radius, beams by their section (a CIRC one as the box around the circle)
+    c = math.sqrt(210000. * 0.7 / (1.3 * 0.4 * 7.85e-9))
+    k = 0.8 / 1.3 * A.Converter._critom(None) / (2 * c)
+
+    def mid(a, b):
+        return tuple((x + y) / 2 for x, y in zip(a, b))
+    box = [(0, 0, 0), (1, 0, 0), (1, 2, 0), (0, 2, 0), (0, 0, 3), (1, 0, 3), (1, 2, 3), (0, 2, 3)]
+    box20 = box + [mid(box[i], box[j]) for i, j in ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6),
+                                                   (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7))]
+    tet = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    tet10 = tet + [mid(tet[i], tet[j]) for i, j in ((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3))]
+    wed = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 2), (1, 0, 2), (0, 1, 2)]
+    quad = [(0, 0, 0), (2, 0, 0), (2, 3, 0), (0, 3, 0)]
+    quad8 = quad + [mid(quad[i], quad[(i + 1) % 4]) for i in range(4)]
+    tri = [(0, 0, 0), (2, 0, 0), (0, 2, 0)]
+    axi = [(10, 0, 0), (12, 0, 0), (12, 2, 0), (10, 2, 0)]
+    line2, line3 = [(0, 0, 0), (1, 0, 0)], [(0, 0, 0), (0.5, 0, 0), (1, 0, 0)]
+    rect = {"rect": (0.2, 0.3)}
+    probes = [("C3D8", box, {}, 8.847263e-08), ("C3D8R", box, {}, 6.143933e-08),
+              ("C3D8I", box, {}, 1.228787e-08), ("C3D20R", box20, {}, 2.949088e-08),
+              ("C3D4", tet, {}, 5.675522e-08), ("C3D10", tet10, {}, 1.702657e-08),
+              ("C3D6", wed, {}, 6.951066e-08), ("S4R", quad, {"t": 0.5}, 3.071966e-08),
+              ("S4", quad, {"t": 0.5}, 6.143933e-09), ("S8R", quad8, {"t": 0.5}, 1.474544e-08),
+              ("S3", tri, {"t": 0.5}, 4.915146e-08), ("M3D4", quad, {"t": 0.5}, 4.423631e-08),
+              ("CPS4R", quad, {"t": 0.5}, 3.071966e-08), ("CAX4R", axi, {}, 2.358622e-08),
+              ("CAX4", axi, {}, 3.396415e-08), ("B31", line2, rect, 2.457573e-09),
+              ("B31R", line2, rect, 1.228787e-08), ("B32R", line3, rect, 5.898175e-09),
+              ("B32", line3, {"circ": 0.1}, 4.170640e-09)]
+    for typ, pts, sec, dt in probes:
+        got = k * A.courant_length(typ, pts, sec)
+        assert abs(got / dt - 1) < 2e-4, (typ, got, dt)
+    assert A.courant_length("SPRINGA", line2, {}) is None and A.courant_length("S4", quad, {}) is None
+    # ccx runs B21 / T2D2 as B31 / T3D2 (sized as C3D8I)
+    assert A.courant_length("B21", line2, rect) == A.courant_length("B31", line2, rect)
+    assert A.courant_length("T2D2", line2, {"area": 0.04}) == A.courant_length("T3D2", line2, {"area": 0.04})
+    # a cohesive layer (a thin continuum in ccx) sizes the increment; short LAMINA data is
+    # skipped, not a crash
+    glue = ("*Node\n9, 0.,0.,1.01\n10, 1.,0.,1.01\n11, 1.,1.,1.01\n12, 0.,1.,1.01\n*Element, "
+            "type=COH3D8, elset=GLUE\n2, 5,6,7,8,9,10,11,12\n*Material, name=G\n*Elastic\n"
+            "1000., 0.3\n*Density\n1e-9\n*Cohesive Section, elset=GLUE, material=G, "
+            "response=continuum\n")
+    _, conv, _ = convert_str(HEX + STEEL + glue + "*Step\n*Dynamic, Explicit\n, 1.e-4\n*End Step\n")
+    assert conv._courant[1] == 2
+    lamina = STEEL.replace("*Elastic\n210000., 0.3", "*Elastic, type=LAMINA\n100000., 8000.")
+    _, conv, _ = convert_str(HEX + lamina + "*Step\n*Dynamic, Explicit\n, 1.e-4\n*End Step\n")
+    assert conv._courant is False
 
 
 def test_cload_orientation_warned():
@@ -4252,7 +4477,7 @@ def test_velocity_bc_carried_into_later_steps_and_ramped():
     assert _amplitude(body, "ABQ2CCX_VEL1")[-1] == (1.0, 0.75)          # 0.1 x 0.75 = 0.075
     # step 2 keeps the BC: in Abaqus the DOF keeps moving at the velocity it ended with,
     # where a ccx BC would freeze at its last value
-    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nTOP, 3, 3, 1.\n*END STEP" in steps[2]
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nTOP, 3, 3, 1.\n*END STEP" in _without_output(steps[2])
     assert _amplitude(body, "ABQ2CCX_VEL2") == [(0.0, 0.075), (2.0, 0.275)]
     # step 3, no amplitude in a static step: the velocity ramps from 0.1 to -0.2
     pts = _amplitude(body, "ABQ2CCX_VEL3")
@@ -4307,7 +4532,7 @@ def test_velocity_bc_examples():
     body, _, _ = convert(os.path.join(EXAMPLES, "velocity_bc_column.inp"))
     assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\nRP, 3, 3, 1\n" in body
     assert _amplitude(body, "ABQ2CCX_VEL1")[-1] == (0.01, 0.0095)
-    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nRP, 3, 3, 1.\n*END STEP" in body
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nRP, 3, 3, 1.\n*END STEP" in _without_output(body)
     assert _amplitude(body, "ABQ2CCX_VEL2") == [(0.0, 0.0095), (0.005, 0.0145)]
     assert not dangling_refs(reparse(body))
     body, _, _ = convert(os.path.join(EXAMPLES, "velocity_bc_bar.inp"))
@@ -4338,14 +4563,14 @@ def test_velocity_bc_zero_rate_from_unknown_start_holds_what_it_can():
     for line in ("TOP, 1, 6", "TOP, ENCASTRE"):
         body, _, _ = convert_str(VEL_HEX + "*Step\n*Static\n*Cload\nTOP, 3, 1.\n*End Step\n*Step\n"
                                            "*Static\n*Boundary, type=VELOCITY\n" + line + "\n*End Step\n")
-        assert "*BOUNDARY, FIXED\nTOP, 1, 3\n*END STEP" in body, line
+        assert "*BOUNDARY, FIXED\nTOP, 1, 3\n*END STEP" in _without_output(body), line
     # XSYMM (DOFs 1, 5, 6) on a rigid body's reference point: x on the point, the turns on
     # its ROT NODE's translations — never a DOF range over 1-6
     body, _, _ = convert_str(VEL_HEX + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=RP\n100\n"
                                        "*Rigid Body, ref node=100, tie nset=TOP\n*Step\n*Static\n*Cload\n"
                                        "RP, 3, 1.\n*End Step\n*Step\n*Static\n*Boundary, type=VELOCITY\n"
                                        "RP, XSYMM\n*End Step\n")
-    assert "*BOUNDARY, FIXED\nRP, 1, 1\n101, 2, 3\n*END STEP" in body
+    assert "*BOUNDARY, FIXED\nRP, 1, 1\n101, 2, 3\n*END STEP" in _without_output(body)
 
 
 def test_velocity_bc_midside_node_follows_its_end_nodes():
@@ -4360,10 +4585,10 @@ def test_velocity_bc_midside_node_follows_its_end_nodes():
     steps = body.split("*STEP")
     assert "1, 3, 3, 1\n2, 3, 3, 1\n3, 3, 3, 1\n" in steps[1]
     # kept into step 2: the continuation moves the midside node with its ends
-    assert "1, 3, 3, 1.\n2, 3, 3, 1.\n3, 3, 3, 1\n*END STEP" in steps[2]
+    assert "1, 3, 3, 1.\n2, 3, 3, 1.\n3, 3, 3, 1\n*END STEP" in _without_output(steps[2])
     # step 3 re-specifies node 2 only: node 1 keeps moving at 1, node 2 at 3, the midside
     # node at their mean (2 -> 4)
-    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL5\n3, 3, 3, 1.\n*END STEP" in steps[3]
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL5\n3, 3, 3, 1.\n*END STEP" in _without_output(steps[3])
     assert _amplitude(body, "ABQ2CCX_VEL5") == [(0.0, 2.0), (1.0, 4.0)]
 
 

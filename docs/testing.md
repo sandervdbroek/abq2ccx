@@ -12,7 +12,8 @@ The converter has three layers of tests:
    step's `*BOUNDARY, OP=NEW`, heated models with no initial temperatures, rigidly coupled
    models (a shell plate, and bars whose coupled nodes also carry BCs), the `*MPC`
    conversions, connector elements, the loads applied as nodal forces, velocity /
-   acceleration BCs and field and history output requested at beam nodes numerically.
+   acceleration BCs, field and history output requested at beam nodes, and the field output
+   Abaqus preselects (also in an explicit step without output requests) numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -26,7 +27,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (253)
+## 1. Unit tests — `tests/test_convert.py` (261)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -172,6 +173,14 @@ conversion behaviour and referential integrity.
 | `test_output_intervals_to_time_points_or_frequency` | `NUMBER INTERVAL` → a generated `*TIME POINTS, GENERATE` before the first `*STEP` (automatic increments), `TIME INTERVAL` under `DIRECT` → `FREQUENCY` from the fixed increment; the deck's own `*TIME POINTS` are used by name |
 | `test_dynamic_output_defaults_and_explicit_intervals` | implicit `*DYNAMIC` output every 10 increments (the Abaqus default); `*MODAL DYNAMIC` and explicit `DIRECT USER CONTROL` intervals → `FREQUENCY` from the fixed increment, explicit intervals with a maximum increment → `FREQUENCY` from it, without either → warned |
 | `test_beam_output_requests_example` | the bundled `beam_output_requests` deck: `*TIME POINTS` at 0.25…1, `*NODE FILE, NSET=TIP, OUTPUT=2D` and `*NODE PRINT, NSET=MID`; no dangling refs |
+| `test_preselect_field_output_per_procedure` | `*OUTPUT, FIELD, VARIABLE=PRESELECT` → the ccx labels of Abaqus' preselected field output per procedure: `*NODE FILE` U, RF / `*EL FILE` S, E (static), U, V, RF every 10 increments (`*DYNAMIC`), U (`*FREQUENCY`, `*BUCKLE`), NT, RFL / HFL (heat transfer), both (coupled temperature-displacement), U, RF / S, E (steady state dynamics: no V), U, V, RF (`*MODAL DYNAMIC`); preselected history output dropped with a note |
+| `test_preselect_peeq_only_where_a_material_yields` | `PEEQ` joins S, E only with a `*PLASTIC` the converter keeps (not `HARDENING=USER`) or `*CREEP`: ccx warns on it otherwise |
+| `test_preselect_with_named_variables_and_all` | variables named under a `PRESELECT` request are added to it; a field `*NODE OUTPUT` / `*ELEMENT OUTPUT, VARIABLE=PRESELECT` gets its kind's preselected variables plus its own (no "VARIABLE dropped"), and is dropped where the procedure preselects none of that kind; `VARIABLE=ALL` adds `ENER` and ignores the cards under it |
+| `test_default_output_without_output_requests` | a step without any `*OUTPUT` request gets Abaqus' default (the preselected field output) at its end, also beside `*NODE PRINT` / `*EL PRINT`; history requests only → no field output; later steps get the carried-over default again with their own variables and frequency (V and every 10 increments in a dynamic step), a perturbation step after a general one the default; a deck's own field requests are carried over as they are |
+| `test_carried_output_requests_written_again` | ccx keeps a step's output cards for later steps, but at that step's frequency / time points and as a step in between left them, so a step without requests gets the carried requests again: `*TIME POINTS` for its own period, `FREQUENCY` instead under `DIRECT` (where ccx stops on time points), the static default after a dynamic step, the variables a perturbation step replaced, named variables at the request's own frequency, `OP=ADD` beside the default, an explicit step's own `FREQUENCY`; `FREQUENCY=0` writes nothing (one note) |
+| `test_explicit_output_frequency_from_ccx_stable_increment` | explicit dynamics ignores `*TIME POINTS`: Abaqus' 20 field intervals become `FREQUENCY=56` from ccx's stable increment of a unit C3D8 steel cube (8.847e-8, as ccx 2.23 prints it); a smaller maximum increment and the `*OUTPUT`'s `NUMBER INTERVAL` take over |
+| `test_preselect_output_examples` | the bundled `preselect_output_bar` (`*NODE FILE` U, RF / `*EL FILE` S, E after the load) and `explicit_default_output_bar` (`FREQUENCY=4` at the step end) decks; no dangling refs |
+| `test_courant_length_matches_ccx_223` | `courant_length` against the explicit increments ccx 2.23 printed for one element of 19 types (solids, shells, membranes, plane and axisymmetric elements as the bricks ccx expands them into, rectangular and circular beams) within 0.02 %; `B21`/`T2D2` as ccx's `B31`/`T3D2`; springs and a shell without thickness are not sized; a cohesive layer (a thin continuum in ccx) sets the deck's increment; short `LAMINA` data is skipped, not a crash |
 | `test_cload_orientation_warned` | `*CLOAD, ORIENTATION=` (local load axes) is warned |
 | `test_blankless_keywords_recognised` | blank-less keywords (`*SOLIDSECTION`, `*ELPRINT`, `*ENDSTEP`) are recognised as ccx does |
 | `test_frequency_storage_for_later_modal_step` | `*FREQUENCY` gets `STORAGE=YES` when a later modal/steady-state step needs its eigenmodes |
@@ -492,6 +501,21 @@ deck and runs it in CalculiX:
   deflection at t = 0.25, 0.5, 0.75 and 1, −3.2801 vs Timoshenko beam theory −3.3089
   (0.9 %), and the `.dat` mid-span history at the same times, −1.0236 vs −1.0373 (1.3 %).
   Without `OUTPUT=2D` the same deck writes four empty `.frd` blocks, and the check fails.
+* **`preselect_output_bar`** — a steel bar 10 × 10 × 100 (10 `C3D8`) pulled with 1000 N, whose
+  only output requests are the two Abaqus/CAE writes into every step, `*Output, field` and
+  `*Output, history, variable=PRESELECT`. ccx has no preselected output and wrote only the
+  mesh to the `.frd`; the converter writes `*NODE FILE` U, RF and `*EL FILE` S, E. Checks the
+  uniform state: u_x at the end 0.0047619 = PL/EA, S11 = 10 (9.9996), E11 = S11/E and the
+  reactions summing to −1000, worst 0.004 % off.
+* **`explicit_default_output_bar`** — a steel bar 10 × 10 × 200 (20 `C3D8`) held at x = 0 and
+  moving towards the support at v0 = −1000 mm/s when a `*DYNAMIC, EXPLICIT` step of 2L/c
+  starts, without any output request: Abaqus writes its preselected output at 20 intervals.
+  ccx ignores `*TIME POINTS` in explicit dynamics and would write every increment; the
+  converter sets `FREQUENCY=4` from ccx's own stable increment (8.85e-7 s, which ccx then
+  prints). Checks 20–23 `.frd` frames (22: every 4 of 88 increments, and the end) with
+  velocities, the free end moving at v0 until the support's wave arrives (exact to 0.00 %),
+  its peak −0.03729 against 1-D wave theory v0 L/c = −0.03867 (3.6 %, the wave front's
+  dispersion), and back to −0.00005 (0) at 2L/c.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -1317,6 +1341,47 @@ a deck's first error is ccx's own — `*DAMAGE INITIATION` with a criterion ccx 
 makes its input sizing swallow the following cards — a later `*NODE PRINT` or `*TIME POINTS`
 adds an "increase nprint_" / "nam_" error; those decks stop as before.
 `validate_with_ccx.py` checks a beam deck's `.frd` and `.dat` values against beam theory.
+
+**Preselected and default output.** Found by the NaN/Inf judge (branch `judge-nan`): the
+request Abaqus/CAE writes into every step, a bare `*Output, field, variable=PRESELECT`,
+converted to no ccx card at all, so ccx wrote only the mesh to the `.frd` — 139 of the then
+219 gated decks had no field output (111 with that request, 15 with no output request at all,
+13 with `*NODE PRINT` / `*EL PRINT` only), and a NaN check of their results was vacuous.
+Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the output
+database*, table 1) now becomes the ccx labels it has
+([output-reference](output-reference.md)). Abaqus writes it by default, too, in a step without
+any output database request where none carries over (`*NODE PRINT` / `*EL PRINT` / `*NODE
+FILE` / `*EL FILE` are `.dat` / `.fil` requests); requests carry over to later steps, those of
+perturbation steps only between consecutive ones, and a step's history requests alone leave it
+without field output. Probed on 2.23: `A` on `*NODE FILE` is "label not applicable" (also in
+dynamics), `V` is not available in steady state dynamics, `PEEQ` on a model without plasticity
+draws a warning, and `SDV` on a `*DEPVAR` model without a user material crashes ccx — so `A`
+(and `V` there) are left out, `PEEQ` comes only with plasticity, and `VARIABLE=ALL` adds only
+`ENER`. Explicit dynamics ignores `TIME POINTS` (ccx does not reach its time-point logic in
+`checkconvergence.c` there), so Abaqus' 20 default intervals, or the `*OUTPUT`'s, need a
+`FREQUENCY`, and the increment ccx takes is its Courant estimate (`calcstabletimeincvol.f`)
+unless a fixed or smaller maximum one is given. The converter repeats that estimate from the
+mesh, the sections and the materials; its element factors were probed on one element of each
+type (`C3D8R`'s is 0.625 in 2.23, 0.938 in later sources), and on the six corpus decks ccx
+sizes before it stops it matches ccx's printed increment exactly in five (the sixth has
+field-dependent elasticity, where the converter takes the stiffest row, so its increment is
+1.35× too small and the output comes 1.35× less often). A step without requests of its own
+gets the requests Abaqus carries over written again: ccx keeps the earlier cards, but at the
+earlier step's frequency or time points (an explicit step after another got its 20 intervals
+at the first step's increment count, a `DIRECT` step stopped on inherited time points) and as
+a perturbation step in between left them. Of the 1073 corpus files 352 convert with different
+cards (241 more only in their notes): 262 get the preselected output of their `PRESELECT`
+requests (17 of them explicit), 69 the default output of a step without requests, 4 the
+requests their later steps carry over, written again, and 35 explicit decks a `FREQUENCY` from
+ccx's stable increment where ccx wrote every increment (warned). All 200 gated decks now write
+`.frd` results, none an empty block set, and the NaN/Inf-aware judge calls every one solved;
+of the decks it ungates, `marcello_gori_modal_analysis_beam` shows Infinity at its undamped
+resonance, now in 1342-node blocks, and `davidmorinntnu_example_vusdfld_v1`, its velocity BC
+integrated since, writes finite results. `davidmorinntnu_example_vuhard_v1`/`_v2` write the
+100 frames their deck asks for, 0.5 MB, instead of every increment (343 MB);
+`marcello_gori_cylinder_impact` gets Abaqus' 20 intervals (21 frames with the end).
+`validate_with_ccx.py` checks a bar's `.frd` under the CAE requests and an explicit bar impact
+without requests against theory.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

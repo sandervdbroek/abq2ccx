@@ -216,7 +216,15 @@ TRANSLATED = {
         "and its `FREQUENCY`/`NUMBER INTERVAL`/`TIME INTERVAL`/`TIME POINTS` go onto the step's "
         "first output card (ccx has one for all output of a step: the .frd requests' first, Abaqus' "
         "defaults kept; intervals → generated `*TIME POINTS`, or a frequency from a fixed or maximum "
-        "increment); `FREQUENCY=0` drops its requests. Per .frd variable one node set (ccx keeps the "
+        "increment, or in explicit dynamics from ccx's own stable increment, estimated with its "
+        "Courant formula); `FREQUENCY=0` drops its requests. `VARIABLE=PRESELECT`/`ALL` → the ccx "
+        "labels of Abaqus' preselected field output for the procedure (see output-reference), "
+        "plus the variables named under it; preselected history output (energies) is dropped. A "
+        "step without `*OUTPUT` requests of its own gets the field requests Abaqus carries over "
+        "written again — at their own frequency, with its procedure's preselected variables, or "
+        "Abaqus' preselected default where none carries over (ccx would keep the earlier step's "
+        "cards and frequency); `OP=ADD`/`REPLACE` keeps them beside the step's own. Per .frd "
+        "variable one node set (ccx keeps the "
         "last card's): the whole model before a set, several sets joined; a set the .frd cannot "
         "show — beam/shell nodes of a model ccx writes expanded, reference points — is also "
         "printed, or gets `OUTPUT=2D` when the deck's .frd output is only U/V/RF.",
@@ -403,7 +411,31 @@ def gen_output():
              ", ".join(f"`{v}`" for v in sorted(A.ABQ_DROP_VARS)) + "\n",
              "## Valid only on `*EL PRINT` / `*NODE PRINT` (.dat)\n",
              "Dropped from `*EL FILE`/`*NODE FILE` (.frd): "
-             + ", ".join(f"`{v}`" for v in sorted(A.EL_PRINT_ONLY_VARS)) + ".\n"]
+             + ", ".join(f"`{v}`" for v in sorted(A.EL_PRINT_ONLY_VARS)) + ".\n",
+             "## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)\n",
+             "Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the "
+             "output database*, table 1) as the whole-model ccx cards it becomes. Abaqus also "
+             "writes it for a step without any output database request (`*OUTPUT`) when none "
+             "carries over from an earlier step (requests carry over to later steps; between "
+             "perturbation steps only from the step before), so the converter adds it there; "
+             "`*NODE PRINT`/`*EL PRINT`/`*NODE FILE`/`*EL FILE` are .dat/.fil requests and do not "
+             "replace it. Carried-over requests are written again in such a step, at their own "
+             "frequency and with its procedure's variables, as ccx would keep the earlier step's "
+             "frequency. "
+             "`PEEQ` only where a material yields or creeps (ccx warns on it otherwise); "
+             "`VARIABLE=ALL` adds `ENER`. The frequency is the `*OUTPUT` card's, else Abaqus' "
+             "default: every increment, every 10 in `*DYNAMIC`/`*MODAL DYNAMIC`, 20 intervals in "
+             "explicit dynamics (there a `FREQUENCY` from ccx's stable increment, as ccx ignores "
+             "`*TIME POINTS`). Abaqus' preselected history output, whole-model energies, has no "
+             "ccx counterpart and is dropped.\n",
+             md_table(["Procedure", "`*NODE FILE`", "`*EL FILE`", "No ccx label for"],
+                      [(f"`*{p}`" + (" (implicit)" if p == "DYNAMIC" else ""),
+                        ", ".join(n) or "—", ", ".join(e) or "—",
+                        A.PRESELECT_NO_CCX.get(p, "—"))
+                       for p, (n, e) in A.PRESELECT_FIELD.items()]
+                      + [("`*DYNAMIC, EXPLICIT`", ", ".join(A.PRESELECT_FIELD["DYNAMIC"][0]),
+                          ", ".join(A.PRESELECT_FIELD["DYNAMIC"][1]), A.PRESELECT_NO_CCX["EXPLICIT"])])
+             + "\n"]
     return "\n".join(parts)
 
 

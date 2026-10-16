@@ -50,8 +50,10 @@ ccx model_ccx                                    # run it (note: no .inp extensi
    reason — see [Reading the report](#reading-the-conversion-report) below.
 3. **Resolve commented cards.** Anything emitted as `** abq2ccx: …` has no CalculiX
    equivalent and needs manual remodelling; the comment says how.
-4. **Run `ccx`** and sanity-check results. Field output (`*OUTPUT, FIELD`) is in
-   `<job>.frd`; history output for a node or element set (`*OUTPUT, HISTORY`) is printed
+4. **Run `ccx`** and sanity-check results. Field output (`*OUTPUT, FIELD`, and Abaqus'
+   preselected output — `VARIABLE=PRESELECT`, or a step without output requests — in the
+   ccx variables it has) is in `<job>.frd`; history output for a node or element set
+   (`*OUTPUT, HISTORY`) is printed
    to `<job>.dat`, as are `.frd` node sets ccx cannot write there — beam and shell nodes
    (ccx writes such models expanded to 3-D) and reference points. If it stops, see
    [troubleshooting.md](troubleshooting.md). To confirm your toolchain end-to-end, run

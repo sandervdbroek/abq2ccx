@@ -23,8 +23,11 @@ against beam theory) — applied as consistent nodal forces, also on nodes with 
 (local axes), which must match the same models without one, *MPC joints, levers and links
 against statics, connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
 theory and exact statics, velocity / acceleration boundary conditions against their
-time integral and the wave they send through a bar, and field and history output
-requested at beam nodes (the .frd and .dat values against beam theory).
+time integral and the wave they send through a bar, field and history output requested at
+beam nodes (the .frd and .dat values against beam theory), and the field output Abaqus
+preselects: a bar in tension with only Abaqus/CAE's *Output, variable=PRESELECT requests,
+and a bar impact in an explicit step without any output request (20 output frames, the
+free end against 1-D wave theory).
 
     python validate_with_ccx.py
 
@@ -130,6 +133,27 @@ def frd_displacement_history(frd_path, node):
             empty += rows == 0
             inblock = False
     return found, empty
+
+
+def frd_blocks(frd_path, name):
+    """[(time, {node: values})] of every .frd result block called ``name`` (DISP, FORC,
+    STRESS, TOSTRAIN, VELO ...)."""
+    found, time, cur = [], None, None
+    if not os.path.exists(frd_path):
+        return found
+    for ln in open(frd_path):
+        if ln.startswith("  100C"):
+            time = float(ln[12:24])
+        elif ln.startswith(" -4"):
+            cur = {} if ln[5:13].strip() == name else None
+            if cur is not None:
+                found.append((time, cur))
+        elif cur is not None and ln.startswith(" -1"):
+            n = (len(ln.rstrip()) - 13) // 12
+            cur[int(ln[3:13])] = [float(ln[13 + i * 12:25 + i * 12]) for i in range(n)]
+        elif ln.startswith(" -3"):
+            cur = None
+    return found
 
 
 def dat_displacements(dat_path):
@@ -1271,6 +1295,67 @@ def main():
               f"at t = {', '.join(f'{t:g}' for t in times)}; .dat mid-span {mid[-1][1]:+.4f} (beam "
               f"theory {ref_mid:+.4f}, {d_mid * 100:.1f}% diff); without OUTPUT=2D {empty3d} empty "
               f".frd blocks")
+        failures += 0 if ok else 1
+
+    # --- Abaqus' preselected and default field output ---------------------------------
+    # A bar in tension with only the two requests Abaqus/CAE writes (*Output, field / history,
+    # variable=PRESELECT): ccx has no preselected output and wrote the mesh only; abq2ccx
+    # writes *NODE FILE U, RF and *EL FILE S, E.  Uniform stress: u_x = P L / (E A), S11 =
+    # P / A, E11 = S11 / E, and the reactions at x = 0 sum to -P.
+    inp = os.path.join(tmp, "preselect_output_bar.inp")
+    convert(os.path.join(EXAMPLES, "preselect_output_bar.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    frd = os.path.join(d, "job.frd")
+    disp, forc = frd_blocks(frd, "DISP"), frd_blocks(frd, "FORC")
+    stress, strain = frd_blocks(frd, "STRESS"), frd_blocks(frd, "TOSTRAIN")
+    shutil.rmtree(d, ignore_errors=True)
+    if status != "solved" or not (len(disp) == len(forc) == len(stress) == len(strain) == 1):
+        print(f"FAIL  preselect_output_bar: {status}; .frd blocks DISP {len(disp)}, FORC "
+              f"{len(forc)}, STRESS {len(stress)}, TOSTRAIN {len(strain)} (expected one each)")
+        failures += 1
+    else:
+        ref_u, ref_s = 1000.0 * 100.0 / (210000.0 * 100.0), 10.0
+        tip_u = [disp[0][1][n][0] for n in (41, 42, 43, 44)]
+        rf = sum(forc[0][1][n][0] for n in (1, 2, 3, 4))
+        s11 = [v[0] for v in stress[0][1].values()]
+        e11 = [v[0] for v in strain[0][1].values()]
+        worst = max([abs(u / ref_u - 1) for u in tip_u] + [abs(x / ref_s - 1) for x in s11] +
+                    [abs(x * 210000.0 / ref_s - 1) for x in e11] + [abs(rf / -1000.0 - 1)])
+        ok = worst < 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  preselect_output_bar (*Output, field, variable=PRESELECT):"
+              f" .frd u_x = {tip_u[0]:.7f} (P L / E A = {ref_u:.7f}), S11 = {min(s11):.4f}..."
+              f"{max(s11):.4f} (10), sum RF_x = {rf:+.1f} (-1000); worst {worst * 100:.3f}% off")
+        failures += 0 if ok else 1
+
+    # An explicit step without any output request: Abaqus writes its preselected output at 20
+    # intervals; ccx ignores *TIME POINTS in explicit dynamics, so abq2ccx sets a FREQUENCY
+    # from ccx's own stable increment.  The bar moves at v0 towards its support when the step
+    # starts: the free end keeps v0 until the support's wave arrives at L / c (c = sqrt(E /
+    # rho)), then moves back to 0 at 2 L / c, the end of the step.
+    inp = os.path.join(tmp, "explicit_default_output_bar.inp")
+    convert(os.path.join(EXAMPLES, "explicit_default_output_bar.inp"), inp)
+    with open(inp) as fh:
+        freq = re.search(r"\*NODE FILE, FREQUENCY=(\d+)", fh.read())
+    d, status, out = run_ccx(ccx, env, inp)
+    disp, velo = frd_blocks(os.path.join(d, "job.frd"), "DISP"), frd_blocks(os.path.join(d, "job.frd"), "VELO")
+    shutil.rmtree(d, ignore_errors=True)
+    v0, length, c = -1000.0, 200.0, math.sqrt(210000.0 / 7.85e-9)
+    if status != "solved" or not freq or not 20 <= len(disp) <= 23 or len(velo) != len(disp):
+        print(f"FAIL  explicit_default_output_bar: {status}, {len(disp)} DISP / {len(velo)} VELO "
+              f"blocks (expected 20-23 each), FREQUENCY {freq.group(1) if freq else 'none'}")
+        failures += 1
+    else:
+        tip = [(t, sum(v[n][0] for n in (81, 82, 83, 84)) / 4) for t, v in disp]
+        early = [abs(u / (v0 * t) - 1) for t, u in tip if t < 0.8 * length / c]
+        peak, last = min(u for _, u in tip), tip[-1][1]
+        ref = v0 * length / c
+        ok = (max(early) < 1e-3 and abs(peak / ref - 1) < 0.05 and abs(last) < 0.02 * abs(ref)
+              and abs(tip[-1][0] - 2 * length / c) < 1e-9)
+        print(f"{'PASS' if ok else 'FAIL'}  explicit_default_output_bar (no *Output request, "
+              f"*DYNAMIC, EXPLICIT): FREQUENCY={freq.group(1)}, {len(disp)} .frd frames for "
+              f"Abaqus' 20 intervals; tip u = v0 t to {max(early) * 100:.2f}% before the wave "
+              f"arrives, peak {peak:+.5f} (v0 L / c = {ref:+.5f}, {abs(peak / ref - 1) * 100:.1f}% "
+              f"off), {last:+.6f} at 2 L / c (0)")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
