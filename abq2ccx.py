@@ -2546,6 +2546,7 @@ class Converter:
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         self.build_geometry(blocks)
+        self._check_nonpositive_ids()
         self._check_overconstraints(blocks)
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
         # errors without the card) — handle_surface_interaction synthesizes HARD for these
@@ -2567,6 +2568,25 @@ class Converter:
         out.extend(self.emit_geometry())
         out.extend(self.emit_other(blocks))
         return out
+
+    def _check_nonpositive_ids(self) -> None:
+        """Abaqus requires positive node numbers; a deck numbered from 0 (some mesh
+        writers do this) is invalid input, and ccx behaves unpredictably on it —
+        unpatched builds can print 'Job finished' and then crash, patched builds reject
+        the deck.  Flag it; renumbering is left to the user."""
+        bad_n = sorted(n for n in self.geom.nodes if n <= 0)
+        bad_e = sorted(e for e in self.geom.elements if e <= 0)
+        if not (bad_n or bad_e):
+            return
+        parts = []
+        if bad_n:
+            parts.append(f"{len(bad_n)} node(s), e.g. {bad_n[0]}")
+        if bad_e:
+            parts.append(f"{len(bad_e)} element(s), e.g. {bad_e[0]}")
+        self.report.warn(f"Non-positive numbering ({'; '.join(parts)}): Abaqus requires positive "
+                         f"node/element numbers and ccx's behaviour is undefined (unpatched builds "
+                         f"can crash after 'Job finished', patched builds reject the deck). "
+                         f"Renumber the mesh.", once=True)
 
     def _resolve_nodes(self, token: str) -> List[int]:
         if re.fullmatch(r"[-+]?\d+", token):

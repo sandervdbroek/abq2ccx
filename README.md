@@ -120,10 +120,12 @@ python corpus/fetch.py             # download the decks into corpus/files/ (giti
 python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
-Results: **all 1022 convert with zero dangling references, and 414 solve in CalculiX.**
-The other 608 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT,
+Results: **all 1022 convert with zero dangling references; 199 solve in CalculiX** (ccx
+exits 0, prints "Job finished" with no `*ERROR` or crash, and runs an analysis step), and
+**214 mesh-only decks** — no `*STEP`, so nothing to solve — are **accepted** by ccx.
+The other 609 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT,
 explicit dynamics, cohesive/connector elements, piezoelectric/acoustic coupling, other
-user subroutines) or are CAE part fragments / incomplete source decks — each verified to
+user subroutines) or are CAE part fragments / incomplete or invalid source decks — each verified to
 fail *no worse than the original, unconverted deck*. The converter never makes a deck
 worse than the original. Bulk-running every deck through convert → integrity → ccx (later
 waves gathered by parallel discovery agents across a dozen engineering domains; plus

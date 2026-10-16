@@ -149,6 +149,7 @@ python tests/test_corpus.py     # convert all + (if ccx) solve the ones expected
 ```
 
 `tests/test_corpus.py` asserts every deck converts with zero dangling references, and
-that decks marked `expect_solve` actually solve in ccx. To add a deck, append an entry
+that decks marked `expect_solve` actually solve in ccx (clean exit, no crash, an
+analysis step runs) while mesh-only `parse_only` decks are accepted. To add a deck, append an entry
 to `corpus/manifest.py`. The complete test suite — unit, end-to-end, and corpus, with a
 description of each test — is documented in [testing.md](testing.md).

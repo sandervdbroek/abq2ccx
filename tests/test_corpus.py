@@ -5,7 +5,9 @@ Two layers of checking:
   1. CONVERT   — every deck converts without crashing and the result is referentially
                  consistent (every element node / set member resolves). Always runs.
   2. SOLVE     — optional: if CalculiX (ccx) is found, decks marked ``expect_solve``
-                 are run and must solve; the rest are recorded but not required.
+                 must solve (ccx exits 0, prints "Job finished" with no *ERROR and no
+                 crash, and runs an analysis STEP), and mesh-only decks marked
+                 ``parse_only`` must be accepted by ccx; the rest are recorded only.
 
 Usage:
     python corpus/fetch.py          # first, download the decks (network)
@@ -17,6 +19,7 @@ run without network. The bundled ``examples/`` are exercised by ``test_convert.p
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,7 +46,8 @@ def present():
 def convert(name):
     rep = A.Report()
     blocks = A.read_blocks(os.path.join(FILES, name + ".inp"), rep)
-    text = "\n".join(rep.header_comment_lines() + A.Converter(rep, _opt()).convert(blocks)) + "\n"
+    body = A.Converter(rep, _opt()).convert(blocks)       # convert first: the header
+    text = "\n".join(rep.header_comment_lines() + body) + "\n"   # lists its warnings
     return text, rep
 
 
@@ -64,21 +68,45 @@ def dangling(text):
         os.unlink(p)
 
 
+# What a crashing ccx prints after (or instead of) a clean finish.  The issue #3 deck
+# made unpatched ccx builds print "Job finished" and then abort in glibc's free().
+ABORT_SIGNS = ("free(): ", "double free", "malloc(): ", "corrupted size", "Aborted",
+               "Segmentation fault")
+STEP_RE = re.compile(r"^\s*STEP\s+\d+\s*$", re.M)
+
+
+def classify_ccx_run(returncode, stdout, stderr):
+    """Classify a finished ccx run:
+
+    * ``"solved"``   - exit 0, "Job finished", no ``*ERROR``, no crash/abort, and at
+                       least one analysis STEP executed;
+    * ``"accepted"`` - the same, but no STEP ran (a mesh-only deck ccx only parsed);
+    * ``"failed"``   - anything else, including a crash after "Job finished".
+
+    The per-iteration "no convergence" message is normal in nonlinear solves and is not
+    treated as failure; a run that really gives up prints ``*ERROR``."""
+    if returncode != 0 or "Job finished" not in stdout:
+        return "failed"
+    if "*ERROR" in stdout or "*ERROR" in stderr:
+        return "failed"
+    if any(s in stdout or s in stderr for s in ABORT_SIGNS):
+        return "failed"
+    return "solved" if STEP_RE.search(stdout) else "accepted"
+
+
 def run_ccx(ccx, env, text):
     d = tempfile.mkdtemp()
     open(os.path.join(d, "job.inp"), "w").write(text)
     fe = dict(os.environ)
     fe.update(env)
     try:
-        out = subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True,
-                             text=True, timeout=300).stdout
+        p = subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True,
+                           text=True, timeout=300)
     except subprocess.TimeoutExpired:
-        out = "TIMEOUT"
+        return "failed"
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    # "Job finished" + no fatal "*ERROR" == success. The per-iteration "no convergence"
-    # message is normal in nonlinear solves and must NOT be treated as failure.
-    return "Job finished" in out and "*ERROR" not in out
+    return classify_ccx_run(p.returncode, p.stdout, p.stderr)
 
 
 # --- pytest entry points ------------------------------------------------------
@@ -94,18 +122,37 @@ def test_corpus_converts():
         assert dangling(text) == 0, f"{e['name']}: dangling references after conversion"
 
 
+def test_classify_ccx_run():
+    """The solve judge itself (no ccx needed)."""
+    ok = " STEP            1\n\n Job finished\n"
+    assert classify_ccx_run(0, ok, "") == "solved"
+    assert classify_ccx_run(0, " Job finished\n", "") == "accepted"     # mesh-only: no STEP ran
+    # issue #3: unpatched ccx printed "Job finished", then aborted in glibc's free()
+    assert classify_ccx_run(-6, ok, "free(): invalid size\n") == "failed"
+    assert classify_ccx_run(134, ok, "") == "failed"
+    assert classify_ccx_run(0, ok, "double free or corruption (out)\n") == "failed"
+    assert classify_ccx_run(0, " *ERROR reading *NODE\n Job finished\n", "") == "failed"
+    assert classify_ccx_run(201, " *ERROR reading *NODE: node number 0 is not positive\n",
+                            "") == "failed"
+    # per-iteration non-convergence is normal in nonlinear solves, not a failure
+    assert classify_ccx_run(0, " STEP 1\n no convergence\n Job finished\n", "") == "solved"
+
+
 def test_corpus_solves():
-    """Decks marked expect_solve must solve in ccx (if ccx is available)."""
+    """expect_solve decks must solve and parse_only decks must be accepted by ccx
+    (if ccx is available)."""
     decks = present()
     ccx, env = V.find_ccx()
     if not decks or not ccx:
         print("no corpus files or no ccx found — skipping solve checks.")
         return
     for e in sorted(decks, key=lambda x: x["name"]):
-        if not e["expect_solve"]:
-            continue
-        text, _ = convert(e["name"])
-        assert run_ccx(ccx, env, text), f"{e['name']}: expected to solve in ccx but did not"
+        if e["expect_solve"]:
+            status = run_ccx(ccx, env, convert(e["name"])[0])
+            assert status == "solved", f"{e['name']}: expected to solve in ccx, got {status!r}"
+        elif e.get("parse_only"):
+            status = run_ccx(ccx, env, convert(e["name"])[0])
+            assert status != "failed", f"{e['name']}: mesh-only deck was rejected by ccx"
 
 
 # --- standalone runner with a summary table -----------------------------------
@@ -136,19 +183,27 @@ def main():
             failures += 1
         ccxcol = "-"
         if ccx:
-            ok = run_ccx(ccx, env, text)
+            status = run_ccx(ccx, env, text)
             if e["expect_solve"]:
-                ccxcol = "SOLVED" if ok else "FAILED"
-                if not ok:
-                    result = "UNEXPECTED no-solve"
+                ccxcol = "SOLVED" if status == "solved" else status.upper()
+                if status != "solved":
+                    result = ("UNEXPECTED: no analysis step ran" if status == "accepted"
+                              else "UNEXPECTED no-solve")
+                    failures += 1
+            elif e.get("parse_only"):
+                ccxcol = {"accepted": "ACCEPTED", "solved": "solved+"}.get(status, "FAILED")
+                if status == "failed":
+                    result = "UNEXPECTED: ccx rejected it"
                     failures += 1
             else:
-                ccxcol = "solved+" if ok else "no-solve(ok)"
+                ccxcol = {"solved": "solved+", "accepted": "accepted+"}.get(status, "no-solve(ok)")
         print(f"{name:27s} {'ok':>5s} {rep.n_warnings:>3d} {d:>6d} {ccxcol:>13s}  {result}")
     n_solve = sum(1 for e in decks if e["expect_solve"])
-    print(f"\n{len(decks)} converted, 0 dangling expected; {n_solve} expected to solve.")
+    n_parse = sum(1 for e in decks if e.get("parse_only"))
+    print(f"\n{len(decks)} converted, 0 dangling expected; {n_solve} expected to solve, "
+          f"{n_parse} mesh-only (no analysis step) expected to be accepted by ccx.")
     print("All corpus checks passed." if not failures else f"{failures} failure(s).")
-    print("\n(expect_solve=False decks are source-deck/analysis limitations — see corpus/manifest.py.)")
+    print("\n(the remaining decks are source-deck/analysis limitations — see corpus/manifest.py.)")
     return 1 if failures else 0
 
 

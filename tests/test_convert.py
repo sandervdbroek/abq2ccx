@@ -881,6 +881,16 @@ def test_approximate_ibeam_to_rect():
     assert "[APPROX]" in rep.text()
 
 
+def test_nonpositive_node_number_warns():
+    # Abaqus requires positive node numbers; a deck numbered from 0 (issue #3) is invalid
+    # input and ccx behaves unpredictably on it, so the converter must flag it.
+    deck = "*Node\n0,0.,0.\n1,1.,0.\n2,1.,1.\n3,0.,1.\n*Element, type=CPS4, elset=E\n1, 0,1,2,3\n"
+    _, _, rep = convert_str(deck)
+    assert "non-positive numbering" in rep.text().lower() and "e.g. 0" in rep.text()
+    _, _, rep = convert_str(deck.replace("0,0.,0.", "4,0.,0.").replace("1, 0,1", "1, 4,1"))
+    assert "non-positive" not in rep.text().lower()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

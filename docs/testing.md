@@ -19,7 +19,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (33)
+## 1. Unit tests — `tests/test_convert.py` (70)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -40,7 +40,7 @@ conversion behaviour and referential integrity.
 | `test_step_nlgeom_and_name` | `*STEP` drops `NAME`, keeps `NLGEOM` |
 | `test_amp_keyword_alias` | the `*AMP` abbreviation → `*AMPLITUDE` |
 | `test_rigid_element_flagged` | `R3D3` rigid element flagged (model as `*RIGID BODY`) and emitted unchanged |
-| `test_name_length_limit` | flattened instance set names kept within ccx's 20-significant-character limit |
+| `test_name_length_limit` | flattened instance set names kept within ccx's 80-character name limit (probed on ccx 2.22), but not truncated below it |
 | `test_parameter_with_internal_comment` | a `**` comment inside a `*PARAMETER` block does **not** terminate it |
 | `test_parameter_forward_reference` | `*PARAMETER` resolves regardless of definition order (`a = b*2; b = 3.`) |
 | `test_no_residual_parameter_tokens` | no `<name>` tokens remain in the output after substitution |
@@ -59,6 +59,43 @@ conversion behaviour and referential integrity.
 | `test_node_surface_drops_weight` | a node-based `*SURFACE` line (`NS, 1.`) drops the Abaqus weight to one entry per line |
 | `test_contact_pair_default_type` | `*CONTACT PAIR` gets the required `TYPE=SURFACE TO SURFACE` (Abaqus default) and Abaqus-only params are dropped |
 | `test_rigid_body_pin_nset_mapped` | `*RIGID BODY, PIN NSET=…` maps to ccx's `NSET=…` |
+| `test_generate_malformed_token_no_crash` | a non-integer field in a `GENERATE` record skips that record instead of aborting the conversion |
+| `test_instance_qualified_set_param_resolved` | instance-qualified set names in keyword **parameters** (`*EL PRINT, ELSET=I.body`) resolve to the flattened global set |
+| `test_rigid_body_refnode_instance_qualified` | `*RIGID BODY, REF NODE=I.ref` resolves through the flattened set to a node number |
+| `test_assembly_instance_set_three_level_ref` | `Assembly.Instance.set` members strip the assembly level and resolve to the instance set |
+| `test_element_load_uses_element_offset` | a numeric instance-qualified element id in an element load (`*DFLUX I2.1`) takes the element offset, not the node offset |
+| `test_named_bc_condition_on_instance_set` | `ENCASTRE` on an instance node set is flattened **before** expansion, so the DOF lines name the renamed set |
+| `test_damage_initiation_emitted_for_ccx223` | `*DAMAGE INITIATION` (ccx 2.23) is emitted with its data; `*DAMAGE EVOLUTION` stays commented |
+| `test_new_abaqus_keywords_targeted_guidance` | Abaqus 2024/2025 keywords get targeted guidance, not the generic "no equivalent" comment |
+| `test_t2d3_maps_to_t3d3` | the 3-node 2D truss maps to the node-count-identical `T3D3` |
+| `test_independent_instance_undefined_part_no_crash` | an instance with its own mesh naming an undeclared `PART=` converts instead of crashing |
+| `test_dsload_unmappable_face_warns` | a `*DSLOAD` on a face with no ccx `P1..P6` label (shell `SPOS`) warns instead of silently emitting a bare `P` |
+| `test_ngen_descending_range_warns` | a descending `*NGEN` range that generates no nodes is reported, not silently dropped |
+| `test_cohesive_element_substituted_to_continuum` | `COH3D8` → `C3D8` with the cohesive-behaviour-lost / zero-thickness warning |
+| `test_cohesive_2d_maps_to_plane_strain` | `COH2D4` → `CPE4` |
+| `test_cohesive_section_becomes_solid_section` | `*COHESIVE SECTION` → `*SOLID SECTION` with the same elset and material |
+| `test_pore_pressure_element_suffix_dropped` | pore-pressure elements drop the `P` suffix (`CAX4P→CAX4`) with a warning |
+| `test_empty_dload_op_new_passthrough` | an empty `*DLOAD, OP=NEW` (clears previous loads) passes through rather than being commented out |
+| `test_assembly_element_instance_qualified_connectivity` | assembly-level spring elements with instance-qualified connectivity (`I1.2, I2.1`) resolve to global nodes and register |
+| `test_smooth_step_amplitude_sampled` | `DEFINITION=SMOOTH STEP` is sampled as the Abaqus quintic into tabular points (midpoint and quarter-point exact) |
+| `test_dload_unsupported_body_load_dropped` | `*DLOAD` `ROTA` lines are dropped with a warning while supported `GRAV` lines are kept |
+| `test_assembly_node_not_overwritten_by_instance` | assembly-level reference nodes keep their ids and instances are numbered above them (issue #2) |
+| `test_coupling_refnode_set_resolved_and_empty_kinematic` | `*COUPLING, REF NODE=<set>` → node number; an empty `*KINEMATIC` gets `1, 3` (ccx otherwise creates no constraint) |
+| `test_kinematic_rotational_dofs_clamped` | `*KINEMATIC` DOFs above 3 are clamped to ccx's translational range |
+| `test_surface_interaction_hard_behavior_synthesized` | an interaction without `*SURFACE BEHAVIOR` gets `PRESSURE-OVERCLOSURE=HARD`; one with a behaviour is left alone |
+| `test_lamina_to_engineering_constants` | `*ELASTIC, TYPE=LAMINA` → `ENGINEERING CONSTANTS` (E3=E2, ν13=ν12, ν23 from G23) |
+| `test_beam_section_unsupported_profile_commented` | `*BEAM SECTION, SECTION=I` (no ccx profile) is commented out with guidance |
+| `test_equally_spaced_amplitude_expanded` | `DEFINITION=EQUALLY SPACED` expands to explicit time/amplitude pairs |
+| `test_assembly_elset_element_member_uses_elem_offset` | an assembly `*Elset` member `I2.1` takes the element offset |
+| `test_part_cohesive_section_remapped_per_instance` | a part-level `*Cohesive Section` elset is remapped per instance (`I1_COH`) |
+| `test_combined_suffix_element_resolves` | combined suffixes resolve (`C3D8PT→C3D8`, `C3D20RHT→C3D20R`) |
+| `test_initial_stress_expanded_to_integration_points` | `*INITIAL CONDITIONS, TYPE=STRESS` on an elset expands to one line per element and integration point |
+| `test_initial_stress_geostatic_commented` | a `GEOSTATIC` initial stress (no ccx equivalent) is commented with guidance |
+| `test_approximate_riks_and_default_off` | `--approximate` turns `*STATIC, RIKS` into plain `*STATIC`; without the flag the card is kept and points at the flag |
+| `test_approximate_explicit_to_implicit` | `--approximate` turns `*DYNAMIC, EXPLICIT` into implicit `*DYNAMIC` with a period/1000 initial increment |
+| `test_approximate_nu_clamp` | `--approximate` clamps ν ≥ 0.5 to 0.475; without the flag ν is untouched |
+| `test_approximate_ibeam_to_rect` | `--approximate` replaces an I-profile with the RECT of equal area and strong-axis inertia |
+| `test_nonpositive_node_number_warns` | a mesh numbered from node 0 (invalid Abaqus input, issue #3) is flagged; a positive-numbered one is not |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -91,16 +128,27 @@ deck and runs it in CalculiX:
   * `test_corpus_converts` — every present deck converts without crashing and the
     result is referentially consistent (zero dangling references). **Always runs.**
   * `test_corpus_solves` — decks marked `expect_solve` are run in CalculiX and must
-    solve (only when `ccx` is available).
+    **solve**: ccx exits 0, prints "Job finished" with no `*ERROR` and no crash/abort
+    message on stdout or stderr, and executes at least one analysis `STEP`. Mesh-only
+    decks marked `parse_only` (no `*STEP`, so nothing to solve) must be **accepted** by
+    ccx under the same clean-exit rules. Only runs when `ccx` is available.
+  * `test_classify_ccx_run` — unit test of that judge (no ccx needed), including the
+    "Job finished, then abort" case from issue #3.
 
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
-**Results:** all 1022 convert with zero dangling references; **414 solve** in CalculiX.
-The other 636 convert cleanly but use features ccx cannot run (user elements, UMAT/
-VUMAT, explicit dynamics, cohesive/connector elements, piezoelectric/acoustic coupling,
-other user subroutines) or are CAE part fragments / incomplete source decks (e.g.
-externally-supplied `<parameter>` values) — and each was verified to fail *no worse than
-the original, unconverted deck*.
+**Results:** all 1022 convert with zero dangling references; **199 solve** in CalculiX
+and **214 mesh-only decks are accepted** by it. The other 609 convert cleanly but use
+features ccx cannot run (user elements, UMAT/VUMAT, explicit dynamics, cohesive/connector
+elements, piezoelectric/acoustic coupling, other user subroutines) or are CAE part
+fragments / incomplete or invalid source decks (e.g. externally-supplied `<parameter>`
+values, or nodes numbered from 0) — and each was verified to fail *no worse than the
+original, unconverted deck*.
+
+Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
+mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
+"Job finished" (the exit code and stderr were ignored); that inflated the earlier
+headline of 414 "solving" decks.
 
 This corpus was assembled in waves: bulk-downloading hundreds of genuine Abaqus decks
 from public GitHub repositories (the second wave via parallel discovery agents fanned
@@ -151,5 +199,5 @@ set-name truncation consistency.
 ## Adding to the corpus
 
 Append one `dict(...)` entry to `corpus/manifest.py` (name, url, license, exercises,
-`expect_solve`, optional note), then `python corpus/fetch.py` and re-run
-`python tests/test_corpus.py`.
+`expect_solve`, `parse_only=True` for a mesh-only deck with no `*STEP`, optional note),
+then `python corpus/fetch.py` and re-run `python tests/test_corpus.py`.
