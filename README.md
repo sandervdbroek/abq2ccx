@@ -92,6 +92,8 @@ through CalculiX (it auto-detects `ccx`, including the copy bundled with FreeCAD
 ```text
 PASS  nle10_thickplate (NAFEMS LE10): SYY at point D = -5.650 MPa (reference -5.38 MPa, 5.0% diff)
 PASS  beam_circ_cantilever (B31 + CIRC): tip deflection = -4.2290 (beam theory -4.2441, 0.4% diff)
+PASS  beam_pipe_box_cantilever (PIPE31 + PIPE): tip deflection y = -7.1490 (beam theory -7.1886, 0.6% diff)
+PASS  beam_pipe_box_cantilever (B32 + BOX): tip deflection y = -1.7898 (beam theory -1.7887, 0.1% diff), z = -4.5091 (beam theory -4.5265, 0.4% diff)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -103,7 +105,10 @@ point D versus the published reference −5.38 MPa — a 5 % difference, in line
 element type and mesh density. That exercises the whole pipeline (mesh expansion,
 node ordering, boundary sets, pressure face, solid section) and confirms it is correct.
 The second check is a cantilever on linear `B31` beams with a circular section: its tip
-deflection is compared with beam theory, P L³/(3 E I).
+deflection is compared with beam theory, P L³/(3 E I). The third does the same for a pipe
+section on `PIPE31` elements and a box section on `B32` elements, which ccx 2.23 runs only
+on `B32R`. The box has unequal sides and wall pairs and is loaded in both directions, so a
+misread box dimension would miss beam theory by 18 % or more.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -355,6 +360,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/composite_shell.inp`](examples/composite_shell.inp) | S8R composite layup, orthotropic, `*ORIENTATION`, `ENCASTRE`, `*DSLOAD` |
 | [`examples/assembly_two_blocks.inp`](examples/assembly_two_blocks.inp) | two-instance assembly, `instance.node` reference in a step |
 | [`examples/beam_circ_cantilever.inp`](examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters, `*NGEN`/`*ELGEN` |
+| [`examples/beam_pipe_box_cantilever.inp`](examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` → `B32R` with midside nodes, `B32` + `SECTION=BOX` → `B32R`, biaxial tip load |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

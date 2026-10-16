@@ -1,0 +1,50 @@
+*Heading
+Two cantilevers: a pipe section on PIPE31 elements and a box section on B32 elements
+** Both L = 100, E = 1e5, clamped at x = 0.  Euler-Bernoulli tip deflection P L^3 / (3 E I):
+** - PIPE, outer radius 1, wall 0.2: I = pi (1 - 0.8^4) / 4 = 0.4637; P = 1 in -y -> 7.189.
+** - BOX, a = 2 along local 1 (-z), b = 3 along local 2 (+y), walls t1 = t3 = 0.1 (at +-1)
+**   and t2 = t4 = 0.2 (at +-2): I11 = 1.8636, I22 = 0.7364; P = 1 in -y -> 1.789, in -z -> 4.527.
+** ccx 2.23 runs PIPE and BOX sections only on B32R, so abq2ccx emits the PIPE31 beams as
+** B32R with a midside node per element and the B32 beams as B32R; both data lines pass
+** through unchanged (the two codes read them alike).
+*Node
+1, 0., 0., 0.
+21, 100., 0., 0.
+101, 0., 10., 0.
+141, 100., 10., 0.
+*Ngen, nset=PIPE_AXIS
+1, 21, 1
+*Ngen, nset=BOX_AXIS
+101, 141, 1
+*Element, type=PIPE31, elset=PIPE
+1, 1, 2
+*Elgen, elset=PIPE
+1, 20, 1, 1
+*Element, type=B32, elset=BOX
+101, 101, 102, 103
+*Elgen, elset=BOX
+101, 20, 2, 1
+*Nset, nset=ROOTS
+1, 101
+*Nset, nset=TIPS
+21, 141
+*Beam Section, elset=PIPE, material=MAT, section=PIPE
+1., 0.2
+0., 0., -1.
+*Beam Section, elset=BOX, material=MAT, section=BOX
+2., 3., 0.1, 0.2, 0.1, 0.2
+0., 0., -1.
+*Material, name=MAT
+*Elastic
+1.e5, 0.3
+*Boundary
+ROOTS, ENCASTRE
+*Step
+*Static
+*Cload
+21, 2, -1.
+141, 2, -1.
+141, 3, -1.
+*Node Print, nset=TIPS
+U
+*End Step

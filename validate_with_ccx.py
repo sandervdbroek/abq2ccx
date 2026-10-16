@@ -3,8 +3,9 @@
 
 This is the proof that the converter produces *runnable, correct* CalculiX input — not
 just structurally-valid text.  It auto-detects a ``ccx`` binary (including the one
-bundled with FreeCAD) and checks two results against reference values: the NAFEMS LE10
-stress, and the tip deflection of a circular-section cantilever against beam theory.
+bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
+stress, and the tip deflections of circular-, pipe- and box-section cantilevers against
+beam theory.
 
     python validate_with_ccx.py
 
@@ -156,6 +157,34 @@ def main():
         ok = abs(u[1] - ref) / abs(ref) < 0.02
         print(f"{'PASS' if ok else 'FAIL'}  beam_circ_cantilever (B31 + CIRC): tip deflection = "
               f"{u[1]:+.4f} (beam theory {ref:+.4f}, {abs(u[1]-ref)/abs(ref)*100:.1f}% diff)")
+        failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
+
+    # --- pipe and box cantilevers: tip deflections vs beam theory ---------------------
+    # ccx 2.23 runs PIPE and BOX sections only on B32R, so this checks the PIPE31 -> B32R
+    # (midside nodes) and B32 -> B32R upgrades, and that both codes read the PIPE (outer
+    # radius, wall) and BOX (a, b, t1..t4) data alike: the box has a != b and unequal wall
+    # pairs and is loaded along y and z, so a swapped a/b or wall pair misses by >= 18 %.
+    inp = os.path.join(tmp, "pipebox.inp")
+    convert(os.path.join(EXAMPLES, "beam_pipe_box_cantilever.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    pl3_3e = 1.0 * 100.0 ** 3 / (3 * 1.0e5)                     # P L^3 / (3 E)
+    i_pipe = math.pi / 4 * (1 - 0.8 ** 4)                        # outer radius 1, wall 0.2
+    i11 = (2 * 3 ** 3 - 1.8 * 2.6 ** 3) / 12                     # box bending along local 2 (y)
+    i22 = (3 * 2 ** 3 - 2.6 * 1.8 ** 3) / 12                     # box bending along local 1 (z)
+    for label, node, cases in (("PIPE31 + PIPE", 21, [("y", 1, i_pipe)]),
+                               ("B32 + BOX", 141, [("y", 1, i11), ("z", 2, i22)])):
+        u = dat_displacement(os.path.join(d, "job.dat"), node) if status == "solved" else None
+        if u is None:
+            print(f"FAIL  beam_pipe_box_cantilever ({label}): no tip displacement ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        res = [(axis, u[k], -pl3_3e / inertia) for axis, k, inertia in cases]
+        ok = all(abs(v - ref) / abs(ref) < 0.02 for _, v, ref in res)
+        print(f"{'PASS' if ok else 'FAIL'}  beam_pipe_box_cantilever ({label}): tip deflection "
+              + ", ".join(f"{axis} = {v:+.4f} (beam theory {ref:+.4f}, "
+                          f"{abs(v - ref) / abs(ref) * 100:.1f}% diff)" for axis, v, ref in res))
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
 

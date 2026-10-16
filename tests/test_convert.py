@@ -1433,6 +1433,17 @@ def test_mixed_section_beams_report_each_case():
     assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
 
 
+def test_beam_pipe_box_cantilever_example():
+    body, _, _ = convert(os.path.join(EXAMPLES, "beam_pipe_box_cantilever.inp"))
+    g = reparse(body)
+    # 20 PIPE31 -> B32R with midside nodes 142-161, 20 B32 -> B32R on their own nodes
+    assert [t for t, _ in g.elements.values()] == ["B32R"] * 40 and len(g.nodes) == 82
+    assert g.elements[1][1] == [1, 142, 2] and g.nodes[142] == (2.5, 0.0, 0.0)
+    assert g.elements[101][1] == [101, 102, 103] and g.elements[120][1] == [139, 140, 141]
+    assert "SECTION=PIPE\n1., 0.2\n" in body and "SECTION=BOX\n2., 3., 0.1, 0.2, 0.1, 0.2\n" in body
+    assert not dangling_refs(g), dangling_refs(g)
+
+
 def test_beam_circ_cantilever_example():
     body, _, _ = convert(os.path.join(EXAMPLES, "beam_circ_cantilever.inp"))
     g = reparse(body)

@@ -50,10 +50,10 @@ CalculiX (auto-detecting `ccx`, including FreeCAD's bundled binary). The headlin
 check is the **NAFEMS LE10 thick-plate benchmark**: the converted deck solves and
 reports σ_yy = −5.65 MPa at point D vs the published reference −5.38 MPa (5 % — in
 line with the element type and mesh density). A cantilever on linear beams with a
-circular section matches beam theory's tip deflection within 0.4 %, and the
-composite-shell and assembly decks also solve. This proves the full pipeline —
-`*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face, sections — is
-correct, not merely well-formed.
+circular section matches beam theory's tip deflection within 0.4 %, pipe- and
+box-section cantilevers match it within 0.6 %, and the composite-shell and assembly
+decks also solve. This proves the full pipeline — `*NCOPY`/`*ELGEN` expansion, node
+ordering, boundary sets, pressure face, sections — is correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,

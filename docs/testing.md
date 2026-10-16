@@ -5,8 +5,8 @@ The converter has three layers of tests:
 1. **Unit tests** — fast, no solver needed, run on small controlled fixtures and the
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
-   CalculiX, checking the NAFEMS LE10 benchmark and a circular-section cantilever
-   numerically.
+   CalculiX, checking the NAFEMS LE10 benchmark and circular-, pipe- and box-section
+   cantilevers numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -20,7 +20,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (121)
+## 1. Unit tests — `tests/test_convert.py` (122)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -147,6 +147,7 @@ conversion behaviour and referential integrity.
 | `test_pipe_box_beams_become_b32r` | ccx 2.23 runs `PIPE`/`BOX` sections only on `B32R`: under `PIPE`, `BOX` and `THICK PIPE` (emitted as `PIPE`), 2-node `B21`/`B31`/`B31R`/`PIPE31` → `B32R` with a midside node, end, middle, end; ids and the elset kept; the `PIPE` (outer radius, wall) and `BOX` (a, b, t1..t4) data lines pass through; the midside node joins a node set only a `*BOUNDARY` uses |
 | `test_pipe_box_b32_only_changes_type` | `B32`/`PIPE32` under `PIPE`/`BOX` → `B32R` with the same nodes and no midside message; `B32` under `CIRC` is left alone |
 | `test_mixed_section_beams_report_each_case` | `CIRC`, `PIPE` and `BOX` beams in one deck: one report line for the midside-node upgrades (naming both sections and both reasons) and one for the retyped `B32`; an element under both a `PIPE` and a `CIRC` section stays `B32R` |
+| `test_beam_pipe_box_cantilever_example` | the bundled pipe/box cantilevers convert to 40 `B32R` (the `PIPE31` beams with midside nodes, the `B32` beams on their own nodes) with both data lines unchanged, no dangling refs |
 | `test_beam_circ_cantilever_example` | the bundled CIRC cantilever converts to 20 `B32` with midside nodes and diameters, no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
@@ -162,6 +163,12 @@ deck and runs it in CalculiX:
   which ccx 2.23 rejects; the converter emits `B32` with inserted midside nodes and turns
   the Abaqus radius into ccx's diameters. Checks the tip deflection against beam theory,
   P L³/(3 E I) = −4.244 (the converted deck gives −4.229, 0.4 %).
+* **`beam_pipe_box_cantilever`** — a pipe section on `PIPE31` elements and a box section on
+  `B32` elements, which ccx 2.23 runs only on `B32R`; the converter emits both as `B32R`
+  (the `PIPE31` beams with midside nodes). Checks the tip deflections against beam theory:
+  pipe −7.149 vs −7.189 (0.6 %); box −1.790 vs −1.789 (0.1 %) along y and −4.509 vs
+  −4.527 (0.4 %) along z. The box has a ≠ b and unequal wall pairs and is loaded along both
+  axes, so a swapped a/b or wall pair would miss by 18 % or more.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -244,9 +251,9 @@ the outer radius and wall thickness; `BOX` is `a` along local 1, `b` along local
 walls at +1, +2, −1, −2 (from the manual; a probe with one thick wall under axial tension
 confirms the wall order). A 40-element cantilever's tip deflection is 0.997 (`PIPE`) and
 1.010 (`BOX`) of P L³/(3 E I); `BOX` converges to 1.012 because ccx integrates the walls
-along their centre lines and ignores each wall's own bending stiffness. No corpus deck
-starts solving: the two `PIPE31H` decks that use `THICK PIPE` also need externally supplied
-`<parameter>` values.
+along their centre lines and ignores each wall's own bending stiffness. `validate_with_ccx.py`
+checks a pipe and a box cantilever against beam theory. No corpus deck starts solving: the
+two `PIPE31H` decks that use `THICK PIPE` also need externally supplied `<parameter>` values.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
