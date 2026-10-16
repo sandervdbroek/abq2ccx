@@ -13,13 +13,13 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
 dangling references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (218) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (220) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, and executes
   at least one STEP.
 * ``parse_only=True`` (219) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (585) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (583) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, connectors,
   other user subroutines - or are CAE part fragments / incomplete or invalid source
   decks (see each entry's ``note``). Each was verified to fail no worse than the
@@ -623,6 +623,12 @@ CORPUS = [
     dict(name='marcello_gori_snap_fit_tr1', expect_solve=True, license='MIT',
          exercises='C3D8 — parts/instances/assembly; contact',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/14.%20Project.%20Snap%20Fit%20Analysis/Snap_Fit_TR1.inp'),
+    dict(name='marcello_gori_spring_plate_nl', expect_solve=True, license='MIT',
+         exercises='S4 — parts/instances/assembly; NLGEOM; rigid coupling on shell nodes (knot beams)',
+         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/7.%20Non-Linear%20Analysis/3.%20Spring%20Plate/Spring_Plate_NL.inp'),
+    dict(name='marcello_gori_u_shaped_bracket', expect_solve=True, license='MIT',
+         exercises='S4R — parts/instances/assembly; rigid coupling on shell nodes (knot beams)',
+         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/4.%20Linear%20Static%20Structural%20Analysis/1.%20U%20Shaped%20Bracket/U_Shaped_Bracket.inp'),
     dict(name='smrg_uob_cube_pbc_uat', expect_solve=True, license='MIT',
          exercises='C3D8R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/smrg-uob/PeriodicBoundaryCondition/master/examples/Cube_PBC_UAT.inp'),
@@ -1589,10 +1595,6 @@ CORPUS = [
          exercises='CPE4I — parts/instances/assembly; *Orientation; contact',
          note='VCCT debonding: the bonded start (*INITIAL CONDITIONS, TYPE=CONTACT) has no ccx equivalent, and the remaining contact pair - node-to-surface, the Abaqus default - does not converge in ccx (it runs as face-to-face contact, without the bond)',
          url='https://raw.githubusercontent.com/asurovi/Composite_Delmination_Undergrad_Thesis/main/mesh_analysis/VCCT2400.inp'),
-    dict(name='marcello_gori_u_shaped_bracket', expect_solve=False, license='MIT',
-         exercises='S4R — parts/instances/assembly',
-         note='solves on ccx 2.22; ccx 2.23 (FreeCAD 1.1 build) rejects *KINEMATIC coupling on shell nodes (*ERROR in gen3dmpc: RIGID MPC on shell nodes)',
-         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/4.%20Linear%20Static%20Structural%20Analysis/1.%20U%20Shaped%20Bracket/U_Shaped_Bracket.inp'),
     dict(name='weili101_ex4_job_buckling_ssff_1', expect_solve=False, license='MIT',
          exercises='S4R — parts/instances/assembly',
          note='ccx limitation: *STATIC, RIKS (no arc-length solver) - the converter comments the Riks step out (ccx would otherwise run it as plain static); --approximate runs it as plain *STATIC',
@@ -1887,7 +1889,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/dheller1/inp2feap/master/example/hex.inp'),
     dict(name='dheller1_uprofile', expect_solve=False, license='none stated',
          exercises='S4R — parts/instances/assembly',
-         note='ccx 2.23 rejects rigid couplings (RIGID MPCs) on shell/beam nodes (*ERROR in gen3dmpc)',
+         note='source overconstraint: the coupled end-section nodes also carry a *BOUNDARY on coupled DOFs, which Abaqus resolves but ccx rejects (*ERROR in cascade: dependent side of a MPC and a SPC); the rigid coupling on its shell nodes itself now passes (knot beams)',
          url='https://raw.githubusercontent.com/dheller1/inp2feap/master/example/uprofile.inp'),
     dict(name='duojiaojiang_compression_11', expect_solve=False, license='LGPL',
          exercises='C3D8R — parts/instances/assembly; *Orientation; UMAT; explicit',
@@ -2345,10 +2347,6 @@ CORPUS = [
          exercises='R3D4, MASS, SPRINGA, DASHPOTA — parts/instances/assembly; *Frequency',
          note='ccx 2.23: *ERROR reading *ELEMENT:',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/9.%20Damping/1.%20Spring%20Dashpot%20Damping/Spring_Mass_Damper.inp'),
-    dict(name='marcello_gori_spring_plate_nl', expect_solve=False, license='MIT',
-         exercises='S4 — parts/instances/assembly',
-         note='ccx 2.23 rejects rigid couplings (RIGID MPCs) on shell/beam nodes (*ERROR in gen3dmpc)',
-         url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/7.%20Non-Linear%20Analysis/3.%20Spring%20Plate/Spring_Plate_NL.inp'),
     dict(name='marcello_gori_static_all_modal_nlgeom', expect_solve=False, license='MIT',
          exercises='S4, B31 — parts/instances/assembly; *Frequency',
          note='invalid source: load cards outside any *STEP',

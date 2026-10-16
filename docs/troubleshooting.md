@@ -83,6 +83,12 @@ These are the silent ones — no error, wrong physics.
   DOFs 4–6 of the `REF NODE` (a moment there does nothing). The converter adds an explicit
   `ROT NODE` and moves those BCs/moments onto it — keep that in mind when editing the
   converted deck or reading reaction moments.
+* **Short beams on coupled shell/beam nodes (`ABQ2CCX_KNOT`).** ccx 2.23 rejects a rigid
+  coupling on a shell, membrane, beam or truss node unless ccx has made the node a
+  "knot", so the converter attaches a short beam with a free end and no density to each
+  such node; the knot also carries the node's rotations, which `*EQUATION`s tie to the
+  coupling's. The beams carry no load — ignore them in the results (whole-model output
+  lists them).
 * **`C3D8R` hourglassing.** CalculiX auto-enables hourglass control only from v2.3.
   For bending-dominated linear bricks prefer `C3D8I` or `C3D20R`. There is no
   artificial-energy output in ccx, so check a scaled deformed shape for hourglass modes.

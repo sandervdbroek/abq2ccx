@@ -1224,6 +1224,22 @@ PLANE_ELEM_PREFIXES = ("CPS", "CPE", "CAX")
 # the whole model; ccx: no output at all).
 ALL_ELEMENTS_SET = "ABQ2CCX_ALL_ELEMENTS"
 ALL_NODES_SET = "ABQ2CCX_ALL_NODES"
+# Element set (and material) of the force-free "knot beams" that make the shell/beam nodes
+# of a rigid coupling ccx knots — see Converter._plan_rigid_couplings.
+KNOT_SET = "ABQ2CCX_KNOT"
+
+# Abaqus face -> 1-based local node positions (corners, then midsides) of the continuum
+# families; a lower-order element simply has fewer nodes.  Shells use every node for a face
+# and the corner/midside pair for an edge (see Converter._face_nodes).
+FACE_NODES = {
+    "HEX": {1: (1, 2, 3, 4, 9, 10, 11, 12), 2: (5, 8, 7, 6, 16, 15, 14, 13),
+            3: (1, 5, 6, 2, 17, 13, 18, 9), 4: (2, 6, 7, 3, 18, 14, 19, 10),
+            5: (3, 7, 8, 4, 19, 15, 20, 11), 6: (4, 8, 5, 1, 20, 16, 17, 12)},
+    "TET": {1: (1, 2, 3, 5, 6, 7), 2: (1, 4, 2, 8, 9, 5), 3: (2, 4, 3, 9, 10, 6),
+            4: (3, 4, 1, 10, 8, 7)},
+    "WEDGE": {1: (1, 2, 3, 7, 8, 9), 2: (4, 6, 5, 12, 11, 10), 3: (1, 4, 5, 2, 13, 10, 14, 7),
+              4: (2, 5, 6, 3, 14, 11, 15, 8), 5: (3, 6, 4, 1, 15, 12, 13, 9)},
+}
 
 # The COMPLETE set of CalculiX (ccx 2.22 + 2.23) input keywords, verified against the ccx
 # user manual (dhondt.de 2.22 PDF, 2.23 release notes) and the calculix/new_keywords +
@@ -1436,7 +1452,6 @@ class Converter:
         self._n_steps = 0
         self._step_idx = 0
         self._step_nlgeom = False
-        self._last_coupling_nodes: List[int] = []
         self._synth_counter = 0
         self._has_sensitivity = False
         self._freq_storage = False
@@ -1450,6 +1465,18 @@ class Converter:
         # 2-node beams upgraded to 3-node beams (_upgrade_section_beams): element -> (end node,
         # end node, midside node)
         self._midside: "OrderedDict[int, Tuple[int, int, int]]" = OrderedDict()
+        # rigid couplings on shell/beam nodes (see _plan_rigid_couplings)
+        self._knots: "OrderedDict[int, int]" = OrderedDict()   # node -> free end of its knot beam
+        self._knot_e = 1.0                         # knot-beam modulus / section size
+        self._knot_a = 1.0
+        self._knot_k: Optional[float] = None       # its conductivity (thermal decks only)
+        self._tie_rotations = True                 # False in a heat-transfer-only deck
+        self._rot_nodes: set = set()               # nodes with rotations (shell/beam, not truss)
+        self._spc: set = set()                     # (node, dof) under a *BOUNDARY in any step
+        self._rot_tied: set = set()                # (node, dof) already tied to a body rotation
+        self._transformed: set = set()             # nodes with a *TRANSFORM (local DOFs)
+        self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
+        self._last_coupling: Optional[dict] = None
 
     # -- properties ---------------------------------------------------------
     @property
@@ -3013,7 +3040,8 @@ class Converter:
         last DOF — one line per member).  Every line is kept, as node surfaces with ccx
         ``*COUPLING`` + ``*KINEMATIC`` per DOF range (ccx couples translations; the reference
         node's rotations still drive them, and unlike *RIGID BODY its DOFs 4-6 take BCs and
-        moments).  (The newer *COUPLING/*KINEMATIC/*DISTRIBUTING are native ccx keywords.)"""
+        moments); rotation ranges on knotted shell/beam members become *EQUATION ties to
+        those DOFs.  (The newer *COUPLING/*KINEMATIC/*DISTRIBUTING are native ccx keywords.)"""
         ref = (b.param("REF NODE") or b.param("REFNODE") or "").strip()
         recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
         recs = [r for r in recs if r]
@@ -3032,42 +3060,48 @@ class Converter:
             return self._commented(b, "*KINEMATIC COUPLING DOF fields could not be parsed; edit "
                                       "manually.")
         members = [m for ms in groups.values() for m in ms]
-        nodes = [n for m in members for n in self._resolve_nodes(m)]
-        self._warn_rigid_on_structural(nodes)
+        if (self._coupling_plan.get(id(b)) or {}).get("kind") == "unsupported":
+            self._warn_rigid_unsupported()
         self._synth_counter += 1
         tag = f"ABQ2CCX_KC{self._synth_counter}"
         out: List[str] = []
+        ties: List[str] = []
+        # ccx carries the coupling's rotation on DOFs 4-6 of the reference node once a
+        # translational group couples it, so knotted shell/beam members can tie theirs
+        coupled = any(lo <= 3 for lo, _ in groups) and re.fullmatch(r"[-+]?\d+", ref) is not None
         for gi, ((lo, hi), ms) in enumerate(groups.items(), 1):
-            if lo > 3:
-                self.report.warn("*KINEMATIC COUPLING line couples only rotational DOFs (4..6); ccx "
-                                 "couples translations only — line dropped, rotations are NOT "
-                                 "coupled.", once=True)
-                continue
-            if hi > 3 and any(n in self._shell_nodes or n in self._beam_nodes
-                              for m in ms for n in self._resolve_nodes(m)):
+            nodes = [n for m in ms for n in self._resolve_nodes(m)]
+            if hi > 3 and coupled:
+                ties += self._rotation_ties(nodes, int(ref), 0, range(max(lo, 4), hi + 1))
+            if hi > 3 and any(n in self._rot_nodes and n not in self._knots for n in nodes):
                 self.report.warn("*KINEMATIC COUPLING DOFs above 3 clamped: ccx *KINEMATIC couples "
                                  "translations only, so the rotations of the coupled shell/beam "
                                  "nodes are free.", once=True)
+            if lo > 3:
+                if not any(n in self._knots for n in nodes) or not coupled:
+                    self.report.warn("*KINEMATIC COUPLING line couples only rotational DOFs "
+                                     "(4..6); ccx couples translations only — line dropped, "
+                                     "rotations are NOT coupled.", once=True)
+                continue
             out += [f"*SURFACE, TYPE=NODE, NAME={tag}_{gi}"] + list(ms)
             out += [f"*COUPLING, CONSTRAINT NAME={tag}_{gi}, REF NODE={ref}, SURFACE={tag}_{gi}",
                     "*KINEMATIC", f"{lo}, {min(hi, 3)}"]
         self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per DOF "
                          "range (every member line kept).", once=True)
-        return out or self._commented(b, "*KINEMATIC COUPLING couples no translational DOF; "
-                                         "dropped.")
+        return (out + ties) or self._commented(b, "*KINEMATIC COUPLING couples no translational "
+                                                  "DOF; dropped.")
 
-    def _warn_rigid_on_structural(self, nodes: Sequence[int]) -> None:
-        """ccx builds *KINEMATIC couplings and *RIGID BODY from RIGID MPCs; on nodes of
-        expanded shells/beams ccx 2.23 (FreeCAD 1.1 build) stops with '*ERROR in gen3dmpc:
-        nodes belonging to shell elements must not be subject to a RIGID MPC' — ccx 2.22
-        accepted it and current sources only warn."""
-        if any(n in self._shell_nodes or n in self._beam_nodes for n in nodes):
-            self.report.warn("Rigid coupling (*KINEMATIC / *RIGID BODY) on shell or beam nodes: ccx "
-                             "implements it with RIGID MPCs, which ccx 2.23 (e.g. the FreeCAD 1.1 "
-                             "build) rejects ('*ERROR in gen3dmpc: nodes belonging to shell elements "
-                             "must not be subject to a RIGID MPC'); ccx 2.22 accepts it. If your ccx "
-                             "stops there, tie the edge to the reference node with *EQUATION.",
-                             once=True)
+    def _warn_rigid_unsupported(self) -> None:
+        """The one rigid-coupling form the knot beams cannot repair (see
+        _plan_rigid_couplings): a shell/beam reference node with only some translations
+        coupled, or in a legacy *KINEMATIC COUPLING card."""
+        self.report.warn("Rigid coupling (*KINEMATIC) whose reference node is a shell/beam node, "
+                         "with only some translations coupled (or in a *KINEMATIC COUPLING card): "
+                         "ccx implements it with RIGID MPCs, which ccx 2.23 (e.g. the FreeCAD 1.1 "
+                         "build) rejects ('*ERROR in gen3dmpc: nodes belonging to shell elements "
+                         "must not be subject to a RIGID MPC'), and the converter can only repair "
+                         "full-translation couplings of such a node. Couple DOFs 1-3, or use a "
+                         "separate reference point tied to the node.", once=True)
 
     def handle_creep(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -3365,7 +3399,10 @@ class Converter:
     def handle_rigid_body(self, b: Block) -> List[str]:
         """``*RIGID BODY``: Abaqus uses ``PIN NSET``/``TIE NSET`` for the node set that
         moves with the reference node; ccx calls that simply ``NSET`` and rejects the
-        Abaqus spellings.  Map them, keep ``REF NODE``/``ROT NODE``/``ELSET``."""
+        Abaqus spellings.  Map them, keep ``REF NODE``/``ROT NODE``/``ELSET``.  ccx moves
+        only the members' translations, so the rotations of knotted TIE/ELSET shell/beam
+        members are tied to the ROT NODE (PIN members keep theirs, as in Abaqus), and a
+        shell/beam reference node drives the ROT NODE (see _plan_rigid_couplings)."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         pre: List[str] = []
         node_sets = [v for k, v in b.params.items()
@@ -3389,10 +3426,12 @@ class Converter:
                 keep["ELSET"] = v
             else:
                 self.report.note(f"*RIGID BODY parameter {k} dropped (Abaqus-only).", once=True)
+        tie, pin = self._rigid_body_members(b)
         if any(k.upper().replace(" ", "") in ("PINNSET", "TIENSET") for k in b.params):
-            self.report.warn("*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
-                             "rigidly with REF NODE); the pin-vs-tie DOF nuance may differ — verify.",
-                             once=True)
+            self.report.note("*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
+                             "rigidly with REF NODE); the rotations of TIE (and ELSET) shell/beam "
+                             "nodes are tied to the body, those of PIN nodes stay free, as in "
+                             "Abaqus.", once=True)
         # ccx requires REF NODE / ROT NODE to be node NUMBERS; CAE writes reference-point
         # set names (_PickedSet47) — resolve single-node sets, exactly as for *COUPLING.
         for key in ("REF NODE", "ROT NODE"):
@@ -3411,21 +3450,22 @@ class Converter:
                     self.report.warn(f"*RIGID BODY {key}={ref} could not be resolved to a node id; "
                                      f"ccx will reject a set name here.", once=True)
         ref_ids = self._resolve_nodes((keep.get("REF NODE") or "").strip())
-        if ref_ids and ref_ids[0] in self._rb_rot_synth and not keep.get("ROT NODE"):
-            keep["ROT NODE"] = str(self._rb_rot_synth[ref_ids[0]])
+        ref = ref_ids[0] if ref_ids else None
+        own = ref in self._knots and ref in self._rot_nodes    # a shell/beam reference node
+        if ref in self._rb_rot_synth and not keep.get("ROT NODE"):
+            keep["ROT NODE"] = str(self._rb_rot_synth[ref])
             self.report.note("*RIGID BODY: explicit ROT NODE added — ccx carries the body's "
                              "rotations on its DOFs 1-3 and ignores DOFs 4-6 of the REF NODE, so "
-                             "rotational BCs and moments on the reference point are moved there.",
-                             once=True)
-        members: List[int] = []
-        for v in node_sets:
-            members.extend(self.geom.nset(v))
-        if keep.get("ELSET"):
-            for e in self.geom.elset(keep["ELSET"] or ""):
-                if e in self.geom.elements:
-                    members.extend(self.geom.elements[e][1])
-        self._warn_rigid_on_structural(members)
-        return pre + [emit_keyword("RIGID BODY", keep)] + list(b.data)
+                             + ("it is tied to the rotations of the shell/beam reference node."
+                                if own else "rotational BCs and moments on the reference point "
+                                            "are moved there."), once=True)
+        rot = self._first_node(keep.get("ROT NODE") or "")
+        ties: List[str] = []
+        if ref is not None and rot is not None:
+            if own:
+                ties += self._rot_node_follows(rot, ref)
+            ties += self._rotation_ties([n for n in tie if n != ref], rot, -3)
+        return pre + [emit_keyword("RIGID BODY", keep)] + list(b.data) + ties
 
     def handle_equation(self, b: Block) -> List[str]:
         """``*EQUATION``: ccx 2.22 requires node NUMBERS in the terms; Abaqus/CAE decks
@@ -3493,37 +3533,52 @@ class Converter:
             else:
                 self.report.warn(f"*COUPLING REF NODE={ref} could not be resolved to a node id; "
                                  f"ccx will reject a set name here.", once=True)
-        self._last_coupling_nodes = self._surface_nodes(b.param("SURFACE") or "")
+        self._last_coupling = self._coupling_plan.get(id(b))
+        if (self._last_coupling or {}).get("kind") == "rb":
+            return self._coupling_as_rigid_body(self._last_coupling)
+        if (self._last_coupling or {}).get("kind") == "unsupported":
+            self._warn_rigid_unsupported()
         return [emit_keyword("COUPLING", params)] + list(b.data)
 
-    def _surface_nodes(self, name: str) -> List[int]:
-        """Nodes of a registered *SURFACE: node surfaces list nodes/node sets, element
-        surfaces contribute every node of their elements (a superset of the face nodes,
-        good enough for 'does it touch shells?' checks)."""
-        sd = self.surfaces.get(name.upper())
-        if not sd:
+    def _coupling_as_rigid_body(self, plan: dict) -> List[str]:
+        """A kinematic coupling of all translations whose reference node is a shell/beam
+        node, as the equivalent *RIGID BODY: ccx would otherwise carry the coupling's
+        rotation and the knotted node's own rotation as two unrelated unknowns (see
+        _plan_rigid_couplings), so the ROT NODE is tied to the node's rotations instead."""
+        ref, rot, members = plan["ref"], plan["rot"], plan["members"]
+        if not members:
+            self.report.warn("*COUPLING couples only its own reference node; dropped.", once=True)
             return []
-        nodes: List[int] = []
-        for token, _face in sd[1]:
-            if sd[0].startswith("NODE"):
-                nodes.extend(self._resolve_nodes(token))
-            else:
-                eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token)
-                for e in eids:
-                    if e in self.geom.elements:
-                        nodes.extend(self.geom.elements[e][1])
-        return nodes
+        self._synth_counter += 1
+        name = f"ABQ2CCX_RB{self._synth_counter}"
+        out = [f"*NSET, NSET={name}"] + reflow([str(n) for n in members])
+        out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
+        out += self._rot_node_follows(rot, ref)
+        out += self._rotation_ties(members, rot, -3, sorted(plan["dofs"]))
+        self.report.note("*COUPLING + *KINEMATIC with a shell/beam REF NODE -> *RIGID BODY on the "
+                         "coupled nodes (the reference node itself left out), with a ROT NODE tied "
+                         "to the reference node's rotations: as a ccx kinematic coupling the node "
+                         "would carry two unrelated rotations.", once=True)
+        return out
 
     def handle_kinematic(self, b: Block) -> List[str]:
         """``*KINEMATIC`` under ``*COUPLING``: ccx allows only DOFs 1..3, and an EMPTY
         card runs without warnings but creates NO constraint (the ref-node load silently
         vanishes — verified).  Abaqus' empty default means 'all DOFs', so synthesize
-        1,3; clamp rotational DOFs to the translational range."""
+        1,3; clamp rotational DOFs to the translational range.  The rotations Abaqus
+        couples on knotted shell/beam members are tied to the reference node's DOFs 4-6,
+        which carry the ccx coupling's rotation (see _plan_rigid_couplings)."""
+        plan, self._last_coupling = self._last_coupling or {}, None
+        if plan.get("kind") == "rb":
+            return []                 # folded into the *RIGID BODY of the *COUPLING card
         lines: List[str] = []
+        had_lines = False
+        clamped = False
         for rec in merged_data_records(b):
             f = [x for x in rec if x != ""]
             if not f:
                 continue
+            had_lines = True
             try:
                 d1 = pint(f[0])
                 d2 = pint(f[1]) if len(f) > 1 and f[1] else d1
@@ -3535,17 +3590,23 @@ class Converter:
                                  "1..3 only — line dropped, rotations are NOT coupled.", once=True)
                 continue
             c1, c2 = min(d1, 3), min(d2, 3)
-            if (c1, c2) != (d1, d2):
-                self.report.warn("*KINEMATIC DOFs above 3 clamped (ccx couples translations only; "
-                                 "the surface still follows the ref node rigidly).", once=True)
+            clamped = clamped or (c1, c2) != (d1, d2)
             lines.append(f"{c1}, {c2}")
-        if not lines:
+        if not had_lines:
             self.report.warn("*KINEMATIC without DOF lines creates NO constraint in ccx (the "
                              "coupling silently does nothing); synthesized '1, 3' to match the "
                              "Abaqus default of coupling all DOFs — verify.", once=True)
             lines = ["1, 3"]
-        self._warn_rigid_on_structural(self._last_coupling_nodes)
-        return [emit_keyword("KINEMATIC", b.params)] + lines
+        ties: List[str] = []
+        if plan.get("kind") == "kin" and lines:
+            # ccx carries the coupling's rotation on DOFs 4-6 of the reference node
+            ties = self._rotation_ties(plan["members"], plan["ref"], 0, sorted(plan["dofs"]))
+        if clamped:
+            self.report.note("*KINEMATIC DOFs above 3 clamped to 1..3 (ccx couples translations; "
+                             "the surface still follows the ref node rigidly"
+                             + ("; the rotations of the coupled shell/beam nodes are tied to the "
+                                "ref node by *EQUATION)." if ties else ")."), once=True)
+        return [emit_keyword("KINEMATIC", b.params)] + lines + ties
 
     def handle_static(self, b: Block) -> List[str]:
         """``*STATIC, RIKS``: ccx has no arc-length solver, and passed through it would
@@ -3898,6 +3959,7 @@ class Converter:
                 out.extend(b.data)
                 break
         out.extend(self.emit_geometry())
+        out.extend(self._knot_section())
         out.extend(self.emit_other(blocks))
         return out
 
@@ -4128,6 +4190,7 @@ class Converter:
             next_id += 1
             self.geom.add_node(next_id, self.geom.nodes.get(ref, (0.0, 0.0, 0.0)))
             self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
+        self._plan_rigid_couplings(blocks)
         self._n_inactive_rot = 0
         self._depvar_counts = set()
         for b in blocks:
@@ -4239,6 +4302,306 @@ class Converter:
                          f"node/element numbers and ccx's behaviour is undefined (unpatched builds "
                          f"can crash after 'Job finished', patched builds reject the deck). "
                          f"Renumber the mesh.", once=True)
+
+    # -- rigid couplings on shell / beam nodes ---------------------------------
+    def _plan_rigid_couplings(self, blocks: List[Block]) -> None:
+        """ccx builds *RIGID BODY and *KINEMATIC couplings from RIGID MPCs, which ccx 2.23
+        (the FreeCAD 1.1 build) rejects on a shell, membrane, beam or truss node unless ccx
+        has made the node a *knot* ('*ERROR in gen3dmpc: nodes belonging to shell elements must not
+        be subject to a RIGID MPC'; 2.22 accepted it, current sources warn).  A beam element
+        attached to a node makes it a knot, so every such node of a rigid constraint gets a
+        *knot beam*: a B31 from the node to a new free end node, in a material without
+        density — it carries no load in any procedure, linear or NLGEOM.  The knot also
+        gives the node real rotations, which the handlers tie to the body's rotation where
+        Abaqus couples them (a rotational DOF of a non-knot shell/beam node does nothing in
+        an MPC, so ccx's own coupling leaves those rotations free).  Probed on 2.23: a
+        knotted S8R plate edge matches a C3D20R solid with *RIGID BODY to 1e-3 (linear and
+        NLGEOM), a knotted beam end the statically equivalent tip load to 1e-4.
+
+        A *KINEMATIC coupling whose reference node is itself a shell/beam node cannot keep
+        that form: ccx then carries two unrelated rotations on the node (probed: the beam
+        acts as if hinged at the coupled face), so it becomes a *RIGID BODY whose ROT NODE
+        follows the reference node's own rotation."""
+        quiet = Report()
+        self._rot_nodes = set()
+        structural = self._shell_nodes | self._beam_nodes      # + membranes (no rotations)
+        for typ, conn in self.geom.elements.values():
+            cc = ccx_element_type(typ, quiet)
+            if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
+                self._rot_nodes.update(conn)
+            elif cc.startswith("M3D"):
+                structural.update(conn)
+        self._spc = self._boundary_dofs(blocks)
+        self._transformed = {n for b in blocks if b.keyword == "TRANSFORM"
+                             for n in self._resolve_nodes((b.param("NSET") or "").strip())}
+        self._coupling_plan = {}
+        knots: List[int] = []
+        for i, b in enumerate(blocks):
+            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            if b.keyword == "RIGID BODY":
+                tie, pin = self._rigid_body_members(b)
+                if ref is None or not any(n in structural for n in tie + pin + [ref]):
+                    continue
+                knots += [n for n in [ref] + tie + pin if n in structural]
+                if ref in self._rot_nodes:
+                    # the reference node's own rotation drives the body (its ROT NODE is tied
+                    # to it), so BCs and moments on DOFs 4-6 stay on the node
+                    self._rb_rot.pop(ref, None)
+            elif b.keyword == "COUPLING":
+                nxt = blocks[i + 1] if i + 1 < len(blocks) else None
+                if ref is None or nxt is None or nxt.keyword != "KINEMATIC":
+                    continue
+                members = self._surface_member_nodes(b.param("SURFACE") or "")
+                dofs = self._kinematic_dofs(nxt)
+                if not dofs & {1, 2, 3} or not any(n in structural for n in members + [ref]):
+                    continue
+                if ref not in structural:
+                    knots += [n for n in members if n in structural]
+                    self._coupling_plan[id(b)] = {"kind": "kin", "ref": ref, "members": members,
+                                                  "dofs": dofs}
+                elif {1, 2, 3} <= dofs and ref in self._rot_nodes:
+                    rot = max(self.geom.nodes) + 1
+                    self.geom.add_node(rot, self.geom.nodes[ref])
+                    knots += [ref] + [n for n in members if n in structural]
+                    self._coupling_plan[id(b)] = {"kind": "rb", "ref": ref, "rot": rot, "dofs": dofs,
+                                                  "members": [n for n in members if n != ref]}
+                else:
+                    self._coupling_plan[id(b)] = {"kind": "unsupported"}
+            elif b.keyword == "KINEMATIC COUPLING":
+                members, translational = [], False
+                for r in merged_data_records(b):
+                    f = [x for x in r if x != ""]
+                    if not f:
+                        continue
+                    members += self._resolve_nodes(f[0])
+                    try:          # member, first DOF, last DOF (no DOFs: all of them)
+                        translational = translational or len(f) < 2 or min(
+                            pint(f[1]), pint(f[2]) if len(f) > 2 else pint(f[1])) <= 3
+                    except ValueError:
+                        pass
+                if ref is None or not translational or \
+                        not any(n in structural for n in members + [ref]):
+                    continue
+                if ref in structural:
+                    self._coupling_plan[id(b)] = {"kind": "unsupported"}
+                else:
+                    knots += [n for n in members if n in structural]
+        knots = [n for n in dedup(knots) if n in self.geom.nodes]
+        if not knots:
+            return
+        # the knot beam carries no load, so its geometry and stiffness only need to be
+        # harmless: short (1 % of the model size), a modulus of the deck's order (keeps the
+        # matrix well scaled), all pointing along one oblique direction (one section card)
+        lo = [min(x[k] for x in self.geom.nodes.values()) for k in range(3)]
+        hi = [max(x[k] for x in self.geom.nodes.values()) for k in range(3)]
+        span = vnorm(vsub((hi[0], hi[1], hi[2]), (lo[0], lo[1], lo[2])))
+        ell = 0.01 * span if span > 0 else 1.0
+        self._knot_a = float(f"{ell / 2:.4g}")
+        moduli = []
+        for b in blocks:
+            if b.keyword == "ELASTIC":
+                recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
+                try:
+                    moduli.append(pf(recs[0][0]))
+                except (IndexError, ValueError):
+                    pass
+        self._knot_e = max([m for m in moduli if m > 0] or [1.0])
+        # a thermal step needs a conductivity on every element (ccx stops without one); a
+        # heat-transfer-only deck makes thermal knots without rotations ('*ERROR in gen3dmpc:
+        # ... a rotational DOF is constrained'), so nothing is tied there
+        procs = [b for b in blocks if b.keyword in PROC_KW]
+        if any(b.keyword in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                             "UNCOUPLED TEMPERATURE-DISPLACEMENT") for b in procs):
+            ks = []
+            for b in blocks:
+                if b.keyword == "CONDUCTIVITY":
+                    recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
+                    try:
+                        ks.append(pf(recs[0][0]))
+                    except (IndexError, ValueError):
+                        pass
+            self._knot_k = max([k for k in ks if k > 0] or [1.0])
+        self._tie_rotations = not procs or any(b.keyword != "HEAT TRANSFER" for b in procs)
+        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in procs):
+            self.report.warn("Rigid coupling on shell/beam nodes in a deck with an explicit dynamic "
+                             "step: ccx's explicit solver stops on it ('linear and nonlinear MPC's "
+                             "depend on each other', probed on 2.23 with and without the knot "
+                             "beams); only the implicit steps can run it.", once=True)
+        d = vunit((1.0, 1.0, 1.0))
+        nid = max(self.geom.nodes)
+        eid = max(self.geom.elements, default=0)
+        elems = []
+        for n in knots:
+            nid += 1
+            eid += 1
+            self.geom.add_node(nid, vadd(self.geom.nodes[n], vscale(d, ell)))
+            self.geom.add_element(eid, "B31", [n, nid])
+            self._knots[n] = nid
+            elems.append(eid)
+        self.geom.add_to_elset(KNOT_SET, elems)
+        self.report.note(f"Rigid coupling on shell/beam nodes: ccx builds *KINEMATIC / *RIGID BODY "
+                         f"from RIGID MPCs, which ccx 2.23 (FreeCAD 1.1 build) rejects on a shell/"
+                         f"beam node unless ccx made it a knot ('*ERROR in gen3dmpc: ... RIGID "
+                         f"MPC'). Each of the {len(knots)} such node(s) got a force-free knot beam "
+                         f"(a B31 to a new free node, elset/material {KNOT_SET}, no density), "
+                         f"which makes it a knot; the rotations Abaqus couples are tied to the "
+                         f"reference rotation with *EQUATION.")
+
+    def _knot_section(self) -> List[str]:
+        if not self._knots:
+            return []
+        a = fmt_num(self._knot_a)
+        thermal = [] if self._knot_k is None else \
+            ["*CONDUCTIVITY", fmt_num(self._knot_k), "*SPECIFIC HEAT", "0."]
+        return [f"*MATERIAL, NAME={KNOT_SET}", "*ELASTIC", f"{fmt_num(self._knot_e)}, 0.",
+                "*DENSITY", "0."] + thermal + [
+                f"*BEAM SECTION, ELSET={KNOT_SET}, MATERIAL={KNOT_SET}, SECTION=RECT",
+                f"{a}, {a}", "1., -1., 0."]
+
+    def _rotation_ties(self, members: Sequence[int], target: int, offset: int,
+                       dofs: Sequence[int] = (4, 5, 6)) -> List[str]:
+        """*EQUATION ties rotation(member) = DOF ``k + offset`` of ``target`` for the knotted
+        members that have rotations; a member DOF under a *BOUNDARY keeps the BC (ccx stops
+        on a DOF that is both SPC'd and the dependent term of an MPC)."""
+        out: List[str] = []
+        if not self._tie_rotations:
+            return out
+        for n in dedup(members):
+            if n not in self._knots or n not in self._rot_nodes or n == target:
+                continue
+            if n in self._transformed or target in self._transformed:
+                self.report.warn("Coupled rotation not tied on a node with a *TRANSFORM (its "
+                                 "*EQUATION DOFs are local, the body rotation global) — the "
+                                 "rotation stays free there.", once=True)
+                continue
+            for k in dofs:
+                if k < 4 or k > 6:
+                    continue
+                if (n, k) in self._spc:
+                    self.report.note("Coupled rotation not tied where the node's DOF has a "
+                                     "*BOUNDARY (ccx stops on a DOF that is SPC'd and dependent "
+                                     "in an MPC) — the BC governs it.", once=True)
+                    continue
+                if (n, k) in self._rot_tied:
+                    self.report.warn("A shell/beam node belongs to two rigid constraints; its "
+                                     "rotation is tied to the first one only — verify.", once=True)
+                    continue
+                self._rot_tied.add((n, k))
+                out += ["*EQUATION", "2", f"{n}, {k}, 1., {target}, {k + offset}, -1."]
+        return out
+
+    def _rot_node_follows(self, rot: int, ref: int) -> List[str]:
+        """*EQUATION ties ROT NODE DOFs 1-3 = rotations of the (knotted) shell/beam reference
+        node, ROT NODE dependent: BCs and moments then act on the node's own rotations."""
+        if not self._tie_rotations:
+            return []
+        if ref in self._transformed:
+            self.report.warn("Coupled rotation not tied on a node with a *TRANSFORM (its "
+                             "*EQUATION DOFs are local, the body rotation global) — the "
+                             "rotation stays free there.", once=True)
+            return []
+        return [x for k in (1, 2, 3) for x in ("*EQUATION", "2", f"{rot}, {k}, 1., {ref}, {k + 3}, -1.")]
+
+    def _boundary_dofs(self, blocks: List[Block]) -> set:
+        """(node, dof) pairs a *BOUNDARY constrains in any step."""
+        out: set = set()
+        for b in blocks:
+            if b.keyword != "BOUNDARY":
+                continue
+            for rec in merged_data_records(b):
+                g = [x.strip() for x in rec]
+                while g and g[-1] == "":
+                    g.pop()
+                if len(g) < 2:
+                    continue
+                if re.fullmatch(r"[-+]?\d+", g[1]):
+                    d1 = int(g[1])
+                    d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
+                    dofs = list(range(min(d1, d2), max(d1, d2) + 1))
+                else:
+                    dofs = [d for a, c in (self._named_bc_dofs(g[1], True) or [])
+                            for d in range(a, c + 1)]
+                out.update((n, d) for n in self._resolve_nodes(g[0]) for d in dofs)
+        return out
+
+    def _first_node(self, token: str) -> Optional[int]:
+        nodes = self._resolve_nodes(token.strip()) if token.strip() else []
+        return nodes[0] if nodes else None
+
+    def _rigid_body_members(self, b: Block) -> Tuple[List[int], List[int]]:
+        """(tie, pin) members of an Abaqus *RIGID BODY: TIE NSET and ELSET nodes move with
+        the body in all DOFs, PIN NSET nodes in their translations only (ccx's NSET, should
+        a deck use it, counts as TIE)."""
+        tie: List[int] = []
+        pin: List[int] = []
+        for k, v in b.params.items():
+            ku = k.upper().replace(" ", "")
+            if not v:
+                continue
+            if ku == "PINNSET":
+                pin.extend(self.geom.nset(v))
+            elif ku in ("TIENSET", "NSET"):
+                tie.extend(self.geom.nset(v))
+            elif ku == "ELSET":
+                for e in self.geom.elset(v):
+                    if e in self.geom.elements:
+                        tie.extend(self.geom.elements[e][1])
+        tie = dedup(tie)
+        tied = set(tie)
+        return tie, [n for n in dedup(pin) if n not in tied]
+
+    def _kinematic_dofs(self, b: Block) -> set:
+        """DOFs a *KINEMATIC card couples (no data line: all of them, as in Abaqus)."""
+        dofs: set = set()
+        for rec in merged_data_records(b):
+            f = [x for x in rec if x != ""]
+            try:
+                d1 = pint(f[0])
+                d2 = pint(f[1]) if len(f) > 1 else d1
+            except (IndexError, ValueError):
+                continue
+            dofs.update(range(min(d1, d2), max(d1, d2) + 1))
+        return dofs or set(range(1, 7))
+
+    def _surface_member_nodes(self, name: str) -> List[int]:
+        """The nodes a *COUPLING on surface ``name`` acts on: a node surface's nodes, or the
+        nodes on the listed element faces/edges."""
+        sd = self.surfaces.get(name.upper())
+        if not sd:
+            return []
+        nodes: List[int] = []
+        types: Dict[str, str] = {}
+        for token, face in sd[1]:
+            if sd[0].startswith("NODE"):
+                nodes.extend(self._resolve_nodes(token))
+                continue
+            eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token)
+            for e in eids:
+                nodes.extend(self._face_nodes(e, face, types))
+        return dedup(nodes)
+
+    def _face_nodes(self, eid: int, face: Optional[str], types: Dict[str, str]) -> List[int]:
+        info = self.geom.elements.get(eid)
+        if not info:
+            return []
+        typ, conn = info
+        if typ not in types:
+            types[typ] = ccx_element_type(typ, Report())
+        cc, f, n = types[typ], (face or "").upper(), len(conn)
+        if cc in SHELL_TYPES or cc.startswith("M3D"):
+            # SPOS/SNEG (ccx S1/S2) cover the whole element; edges are E1..E4 (ccx S3..S6)
+            m = re.fullmatch(r"E([1-4])", f) or re.fullmatch(r"S([3-6])", f)
+            if not m:
+                return list(conn)
+            k = int(m.group(1)) - (2 if f.startswith("S") else 0)
+            nc = 3 if n in (3, 6) else 4
+            pos = [k, k % nc + 1] + ([nc + k] if n >= 2 * nc else [])
+            return [conn[p - 1] for p in pos if p <= n]
+        fam = {4: "TET", 10: "TET", 6: "WEDGE", 15: "WEDGE", 8: "HEX", 20: "HEX"}.get(n)
+        m = re.fullmatch(r"S(\d)", f)
+        if cc.startswith("C3D") and fam and m and int(m.group(1)) in FACE_NODES[fam]:
+            return [conn[p - 1] for p in FACE_NODES[fam][int(m.group(1))] if p <= n]
+        return list(conn)
 
     def _resolve_nodes(self, token: str) -> List[int]:
         if re.fullmatch(r"[-+]?\d+", token):

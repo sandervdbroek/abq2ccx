@@ -942,14 +942,115 @@ def test_plane_node_rotational_bc_dropped():
     assert [l for l in _live(body) if l.startswith("L,")] == ["L, 1, 1"]
 
 
-def test_rigid_coupling_on_shell_nodes_warns():
+def _equations(body):
+    """The two-term *EQUATION data lines of a converted deck, blanks removed."""
+    lines = body.splitlines()
+    return [lines[i + 2].replace(" ", "") for i, l in enumerate(lines)
+            if l == "*EQUATION" and lines[i + 1] == "2"]
+
+
+def test_rigid_coupling_on_shell_nodes_gets_knot_beams():
+    # ccx 2.23 rejects a RIGID MPC (*KINEMATIC / *RIGID BODY) on a shell node that is not a
+    # knot ('*ERROR in gen3dmpc'); a force-free dangling B31 per coupled node makes it one,
+    # and the rotations an empty *Kinematic couples are tied to the ref node's DOFs 4-6
     deck = (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
-            "surface=RS\n*Kinematic\n1, 3\n")
-    _, _, rep = convert_str(deck)
-    assert "gen3dmpc" in rep.text()
-    _, _, rep = convert_str(HEX + "*Nset,nset=TOP\n5,6,7,8\n*Node\n100,0.5,0.5,2.\n"
-                            "*Rigid Body, nset=TOP, ref node=100\n")
-    assert "gen3dmpc" not in rep.text()
+            "surface=RS\n*Kinematic\n")
+    body, conv, rep = convert_str(deck)
+    assert list(conv._knots) == [5, 6] and 100 not in conv._knots     # the free RP needs none
+    g = reparse(body)
+    assert g.elements[3] == ("B31", [5, 101]) and g.elements[4] == ("B31", [6, 102])
+    assert g.elsets["ABQ2CCX_KNOT"] == [3, 4] and not dangling_refs(g), dangling_refs(g)
+    assert ("*MATERIAL, NAME=ABQ2CCX_KNOT\n*ELASTIC\n1000., 0.\n*DENSITY\n0.\n*BEAM SECTION, "
+            "ELSET=ABQ2CCX_KNOT, MATERIAL=ABQ2CCX_KNOT, SECTION=RECT\n") in body
+    assert "*KINEMATIC\n1, 3\n*EQUATION" in body
+    assert _equations(body) == [f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6)]
+    assert "gen3dmpc" in rep.text() and "knot beam" in rep.text()
+    # a DOF list without rotations ties none; a rotation under a *BOUNDARY keeps the BC
+    body, _, _ = convert_str(deck + "2, 2\n")
+    assert "B31" in body and not _equations(body)
+    body, _, rep = convert_str(deck + "*Boundary\n5, 4, 4\n")
+    assert "5,4,1.,100,4,-1." not in _equations(body) and "5,5,1.,100,5,-1." in _equations(body)
+    assert "the BC governs it" in rep.text()
+    # solid members need no knots: no beams, no note
+    body, _, rep = convert_str(HEX + "*Nset,nset=TOP\n5,6,7,8\n*Node\n100,0.5,0.5,2.\n"
+                               "*Rigid Body, nset=TOP, ref node=100\n")
+    assert "gen3dmpc" not in rep.text() and "ABQ2CCX_KNOT" not in body
+
+
+def test_rigid_body_shell_tie_and_pin_members():
+    # TIE NSET (and ELSET) shell nodes follow the body's rotation (its ROT NODE DOFs 1-3);
+    # PIN NSET nodes keep theirs free — the Abaqus distinction, which ccx's NSET lacks
+    body, conv, rep = convert_str(S4 + "*Rigid Body, ref node=REF, tie nset=R\n")
+    rot = conv._rb_rot[100]
+    assert f"ROT NODE={rot}" in body and list(conv._knots) == [5, 6]
+    assert _equations(body) == [f"{n},{k},1.,{rot},{k - 3},-1." for n in (5, 6) for k in (4, 5, 6)]
+    body, conv, rep = convert_str(S4 + "*Rigid Body, ref node=REF, pin nset=R\n")
+    assert list(conv._knots) == [5, 6] and not _equations(body)
+    assert "those of PIN nodes stay free" in rep.text()
+
+
+def test_coupling_with_shell_reference_node_becomes_rigid_body():
+    # a shell/beam REF NODE would carry the ccx coupling's rotation and its own knot rotation
+    # as two unrelated unknowns (probed: a beam acts hinged at the coupled face), so the
+    # coupling becomes a *RIGID BODY whose ROT NODE follows the node's own rotations; BCs and
+    # moments on the node's DOFs 4-6 therefore stay on the node
+    deck = (S4 + "*Nset, nset=EDGE\n2, 3, 5, 6\n*Surface, type=node, name=SE\nEDGE\n"
+            "*Coupling, constraint name=C, ref node=2, surface=SE\n*Kinematic\n"
+            "*Step\n*Static\n*Cload\n2, 5, 7.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    live = "\n".join(_live(body))
+    assert "*COUPLING" not in live and "*KINEMATIC" not in live
+    assert "*NSET, NSET=ABQ2CCX_RB1\n3, 5, 6\n*RIGID BODY, NSET=ABQ2CCX_RB1, REF NODE=2, ROT NODE=101" in body
+    assert list(conv._knots) == [2, 3, 5, 6]
+    eqs = _equations(body)
+    assert eqs[:3] == [f"101,{k},1.,2,{k + 3},-1." for k in (1, 2, 3)]
+    assert eqs[3:] == [f"{n},{k},1.,101,{k - 3},-1." for n in (3, 5, 6) for k in (4, 5, 6)]
+    assert "2, 5, 7." in body                                     # the moment stays on node 2
+    # only some translations coupled: not repairable, warned (no knots)
+    body, conv, rep = convert_str(deck.replace("*Kinematic\n", "*Kinematic\n2, 2\n"))
+    assert not conv._knots and "full-translation couplings" in rep.text()
+
+
+def test_rigid_coupling_knots_on_edges_trusses_and_thermal_decks():
+    # an element-edge surface knots only the edge's nodes (S4 element 2 = 2,5,6,3: E2 = 5,6)
+    deck = (S4 + "*Elset, elset=E2S\n2\n*Surface, type=element, name=SE\nE2S, E2\n"
+            "*Coupling, constraint name=C, ref node=100, surface=SE\n*Kinematic\n")
+    _, conv, _ = convert_str(deck)
+    assert list(conv._knots) == [5, 6]
+    # truss nodes get knots (ccx rejects RIGID MPCs on them too) but no rotation ties
+    truss = ("*Node\n1,0,0,0\n2,1,0,0\n3,2,0,0\n*Element, type=T3D2, elset=T\n1, 1, 2\n"
+             "*Nset, nset=M\n2\n*Rigid Body, ref node=3, tie nset=M\n")
+    body, conv, _ = convert_str(truss)
+    assert list(conv._knots) == [2] and not _equations(body)
+    # a thermal step needs a conductivity on the knot material; a heat-transfer-only deck
+    # gets no rotation ties (its knots have no rotations: '*ERROR in gen3dmpc')
+    td = deck.replace("*Elastic\n1000.,0.3\n", "*Elastic\n1000.,0.3\n*Conductivity\n45.\n")
+    body, _, _ = convert_str(td + "*Step\n*Coupled Temperature-Displacement, steady state\n1., 1.\n"
+                             "*End Step\n")
+    assert "*DENSITY\n0.\n*CONDUCTIVITY\n45.\n*SPECIFIC HEAT\n0.\n" in body and _equations(body)
+    body, _, _ = convert_str(td + "*Step\n*Heat Transfer, steady state\n1., 1.\n*End Step\n")
+    assert "*CONDUCTIVITY\n45." in body and not _equations(body)
+    # explicit dynamics cannot run it at all (ccx: linear and nonlinear MPCs depend on each other)
+    _, _, rep = convert_str(deck + "*Step\n*Dynamic, Explicit\n, 1e-4\n*End Step\n")
+    assert "explicit dynamic step" in rep.text()
+
+
+def test_kinematic_rotation_lines():
+    # a *Kinematic with only rotational lines couples nothing in ccx — it must not get the
+    # '1, 3' synthesized for an EMPTY card (that would couple translations Abaqus leaves free)
+    deck = (HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6,7,8\n*Surface, type=node, name=ST\n"
+            "TOP\n*Coupling, constraint name=C, ref node=100, surface=ST\n*Kinematic\n4, 6\n")
+    body, _, rep = convert_str(deck)
+    lines = body.splitlines()
+    ki = lines.index("*KINEMATIC")
+    assert ki == len(lines) - 1 or lines[ki + 1].startswith("*")
+    assert "rotations are NOT coupled" in rep.text() and "synthesized" not in rep.text()
+    # a *KINEMATIC COUPLING rotation line on shell nodes is tied once a translation line
+    # couples the same reference node
+    body, _, rep = convert_str(S4 + "*Kinematic Coupling, ref node=100\nR, 1, 3\nR, 4, 6\n")
+    assert body.count("*COUPLING") == 1
+    assert _equations(body) == [f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6)]
+    assert "NOT coupled" not in rep.text()
 
 
 def test_plastic_hardening_forms():
@@ -1450,6 +1551,20 @@ def test_beam_circ_cantilever_example():
     assert [t for t, _ in g.elements.values()] == ["B32"] * 20 and len(g.nodes) == 41
     assert g.elements[1][1] == [1, 22, 2] and g.nodes[22] == (2.5, 0.0, 0.0)
     assert "SECTION=CIRC\n2, 2\n" in body                          # radius 1 -> diameters
+    assert not dangling_refs(g), dangling_refs(g)
+
+
+def test_coupling_plate_examples():
+    # the shell/solid pair validate_with_ccx.py compares: the S8R edge gets a knot beam per
+    # coupled node and its rotations tied; the C3D20R reference needs neither
+    body, conv, _ = convert(os.path.join(EXAMPLES, "coupling_shell_plate.inp"))
+    g = reparse(body)
+    assert list(conv._knots) == list(range(21, 822, 100)) and len(g.elsets["ABQ2CCX_KNOT"]) == 9
+    assert len(_equations(body)) == 27 and not dangling_refs(g), dangling_refs(g)
+    body, conv, _ = convert(os.path.join(EXAMPLES, "coupling_solid_plate.inp"))
+    g = reparse(body)
+    assert not conv._knots and "ABQ2CCX_KNOT" not in body and not _equations(body)
+    assert len(g.nodes) == 3 * 189 + 2 and len(g.elements) == 40      # + RP and its ROT NODE
     assert not dangling_refs(g), dangling_refs(g)
 
 

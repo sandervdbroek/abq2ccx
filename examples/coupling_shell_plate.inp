@@ -1,0 +1,54 @@
+*Heading
+Shell plate edge rigidly coupled to a reference point that carries a force and a moment
+** 100 x 40 plate, 2 thick, 10 x 4 S8R elements, clamped at x = 0.  The x = 100 edge is
+** kinematically coupled (all DOFs) to RP = (120, 20, 5), loaded by F = (100, 50, 20) and
+** M = (200, -300, 1000).  ccx 2.23 rejects a rigid coupling on shell nodes; abq2ccx makes
+** the edge nodes knots with force-free beams and ties their rotations to the RP.
+** validate_with_ccx.py checks the RP displacement against coupling_solid_plate.inp: the
+** same plate as C3D20R bricks (one through the thickness, like ccx's shell expansion)
+** under *Rigid Body.
+*Node
+1, 0., 0., 0.
+21, 100., 0., 0.
+801, 0., 40., 0.
+821, 100., 40., 0.
+9001, 120., 20., 5.
+*Ngen, nset=Y0
+1, 21, 1
+*Ngen, nset=Y40
+801, 821, 1
+*Nfill, nset=GRID
+Y0, Y40, 8, 100
+*Element, type=S8R, elset=PLATE
+1, 1, 3, 203, 201, 2, 103, 202, 101
+*Elgen, elset=PLATE
+1, 10, 2, 1, 4, 200, 10
+*Nset, nset=CLAMP, generate
+1, 801, 100
+*Nset, nset=TIP, generate
+21, 821, 100
+*Nset, nset=RP
+9001
+*Shell Section, elset=PLATE, material=STEEL
+2., 5
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Surface, type=NODE, name=TIP_S
+TIP, 1.
+*Coupling, constraint name=TIP_C, ref node=RP, surface=TIP_S
+*Kinematic
+*Step, name=Load, nlgeom=NO
+*Static
+*Boundary
+CLAMP, ENCASTRE
+*Cload
+RP, 1, 100.
+RP, 2, 50.
+RP, 3, 20.
+RP, 4, 200.
+RP, 5, -300.
+RP, 6, 1000.
+*Node Print, nset=RP
+U
+*End Step

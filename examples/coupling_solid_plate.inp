@@ -1,0 +1,61 @@
+*Heading
+Solid reference for coupling_shell_plate.inp: the plate as C3D20R bricks under *Rigid Body
+** The same 100 x 40 x 2 plate, 10 x 4 C3D20R elements with one through the thickness (the
+** brick ccx expands an S8R into), clamped at x = 0.  The x = 100 end face moves rigidly
+** with RP = (120, 20, 5), which carries the same force and moment.  ccx accepts a rigid
+** body on solid nodes, so this deck needs no knots; validate_with_ccx.py compares the RP
+** displacements of the two decks.
+*Node
+1, 0., 0., -1.
+21, 100., 0., -1.
+801, 0., 40., -1.
+821, 100., 40., -1.
+9001, 120., 20., 5.
+*Ngen, nset=Y0
+1, 21, 1
+*Ngen, nset=Y40
+801, 821, 1
+*Nfill, nset=GRID
+Y0, Y40, 8, 100
+*Nset, nset=BOTTOM
+Y0, Y40, GRID
+*Ncopy, shift, old set=BOTTOM, new set=MIDDLE, change number=1000
+0., 0., 1.
+
+*Ncopy, shift, old set=BOTTOM, new set=TOP, change number=2000
+0., 0., 2.
+
+*Element, type=C3D20R, elset=PLATE
+1, 1, 3, 203, 201, 2001, 2003, 2203, 2201, 2, 103, 202, 101, 2002, 2103,
+2202, 2101, 1001, 1003, 1203, 1201
+*Elgen, elset=PLATE
+1, 10, 2, 1, 4, 200, 10
+*Nset, nset=CLAMP, generate
+1, 801, 100
+1001, 1801, 200
+2001, 2801, 100
+*Nset, nset=TIP, generate
+21, 821, 100
+1021, 1821, 200
+2021, 2821, 100
+*Nset, nset=RP
+9001
+*Solid Section, elset=PLATE, material=STEEL
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Rigid Body, ref node=RP, tie nset=TIP
+*Step, name=Load, nlgeom=NO
+*Static
+*Boundary
+CLAMP, ENCASTRE
+*Cload
+RP, 1, 100.
+RP, 2, 50.
+RP, 3, 20.
+RP, 4, 200.
+RP, 5, -300.
+RP, 6, 1000.
+*Node Print, nset=RP
+U
+*End Step

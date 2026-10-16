@@ -20,7 +20,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (122)
+## 1. Unit tests — `tests/test_convert.py` (127)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -100,7 +100,11 @@ conversion behaviour and referential integrity.
 | `test_history_card_outside_step_commented` | step data (`*CLOAD`) before any `*STEP` is commented out with the reason; model-data `*BOUNDARY` stays |
 | `test_undefined_material_warns` | a section naming an undefined material is warned (with the defined names); a valid deck is not |
 | `test_plane_node_rotational_bc_dropped` | DOFs 4–6 on plane-element nodes are dropped (`L,6,6` gone, `L,1,6`→`L,1,3`); shell nodes keep `1,6` |
-| `test_rigid_coupling_on_shell_nodes_warns` | a `*KINEMATIC` coupling on shell nodes warns about ccx 2.23's RIGID-MPC error; a solid-node `*RIGID BODY` does not |
+| `test_rigid_coupling_on_shell_nodes_gets_knot_beams` | each shell node of a `*COUPLING`+`*KINEMATIC` gets a force-free knot beam (`B31` to a new free node, elset/material `ABQ2CCX_KNOT`, no density), without which ccx 2.23 rejects the rigid MPC; the rotations an empty `*KINEMATIC` couples are tied to the reference node's DOFs 4–6 by `*EQUATION` — not for a translations-only card, nor on a DOF with a `*BOUNDARY`; solid members get no knots |
+| `test_rigid_body_shell_tie_and_pin_members` | `*RIGID BODY` `TIE NSET` shell nodes get their rotations tied to the `ROT NODE`; `PIN NSET` nodes get knots but keep their rotations free |
+| `test_coupling_with_shell_reference_node_becomes_rigid_body` | a kinematic coupling whose `REF NODE` is a shell node becomes a `*RIGID BODY` on the other coupled nodes whose `ROT NODE` follows the node's rotations (a moment on the node stays there); one that couples only some translations is warned instead |
+| `test_rigid_coupling_knots_on_edges_trusses_and_thermal_decks` | an element-edge surface knots only its edge nodes; truss members get knots but no rotation ties; a thermal step gives the knot material a conductivity; a heat-transfer-only deck gets no rotation ties; an explicit step is warned |
+| `test_kinematic_rotation_lines` | a rotations-only `*KINEMATIC` is not given the `1, 3` meant for an empty card; `*KINEMATIC COUPLING` rotation lines on shell nodes become rotation ties |
 | `test_plastic_hardening_forms` | Johnson-Cook kept native and given the `*RATE DEPENDENT` card ccx needs (C = 0 unless the deck has one); `HARDENING=USER` and Chaboche `PARAMETERS` commented; tabular hardening untouched |
 | `test_field_dependencies_collapsed` | `DEPENDENCIES=1` collapsed to field = 0: interpolated `*ELASTIC` (E = 115500), the f = 0 `*PLASTIC` curve, the nearest `*DENSITY` row |
 | `test_depvar_delete_and_labels` | `*DEPVAR` keeps the count, drops label lines and warns on `DELETE=` |
@@ -149,6 +153,7 @@ conversion behaviour and referential integrity.
 | `test_mixed_section_beams_report_each_case` | `CIRC`, `PIPE` and `BOX` beams in one deck: one report line for the midside-node upgrades (naming both sections and both reasons) and one for the retyped `B32`; an element under both a `PIPE` and a `CIRC` section stays `B32R` |
 | `test_beam_pipe_box_cantilever_example` | the bundled pipe/box cantilevers convert to 40 `B32R` (the `PIPE31` beams with midside nodes, the `B32` beams on their own nodes) with both data lines unchanged, no dangling refs |
 | `test_beam_circ_cantilever_example` | the bundled CIRC cantilever converts to 20 `B32` with midside nodes and diameters, no dangling refs |
+| `test_coupling_plate_examples` | the `coupling_shell_plate`/`coupling_solid_plate` validation pair: 9 knot beams and 27 rotation ties on the `S8R` edge, none for the `C3D20R` reference; no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -169,6 +174,13 @@ deck and runs it in CalculiX:
   pipe −7.149 vs −7.189 (0.6 %); box −1.790 vs −1.789 (0.1 %) along y and −4.509 vs
   −4.527 (0.4 %) along z. The box has a ≠ b and unequal wall pairs and is loaded along both
   axes, so a swapped a/b or wall pair would miss by 18 % or more.
+* **`coupling_shell_plate`** vs **`coupling_solid_plate`** — a 100 × 40 × 2 plate clamped at
+  one end, its other edge rigidly coupled to an offset reference point that carries a force
+  and a moment: as `S8R` shells under `*COUPLING`+`*KINEMATIC` (rejected by ccx 2.23 on
+  shell nodes; the converter adds knot beams and rotation ties), and as `C3D20R` bricks —
+  one through the thickness, the brick ccx expands an `S8R` into — under `*RIGID BODY`.
+  The reference-point displacements must agree within 0.5 % of |u| (they agree to
+  0.001 %).
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -201,8 +213,8 @@ deck and runs it in CalculiX:
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **218 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
-other 585 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
+references; **220 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
+other 583 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
 other user subroutines, Riks, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
 externally-supplied `<parameter>` values, or nodes numbered from 0) — and each was
@@ -229,10 +241,10 @@ review for silent drops found three kinds of problem, all fixed in the converter
 
 Net on 2.23: 199 → 215 solving and 214 → 219 accepted. Four decks lost their gate on
 purpose — a Riks deck (now commented out instead of silently run as static), a shell model
-whose rigid coupling 2.23 rejects, and two VCCT decks whose remaining contact (Abaqus'
-default node-to-surface) does not converge once the unsupported bonded start is gone. Two
-decks that solve stay ungated: one is nondeterministic (ccx's built-in `utemp` stub segfaults
-about 1 run in 6), one takes ~260 s.
+whose rigid coupling 2.23 rejects (since repaired, below), and two VCCT decks whose
+remaining contact (Abaqus' default node-to-surface) does not converge once the unsupported
+bonded start is gone. Two decks that solve stay ungated: one is nondeterministic (ccx's
+built-in `utemp` stub segfaults about 1 run in 6), one takes ~260 s.
 
 **Circular-section beams.** ccx 2.23 also stops on linear beams with a circular section
 ("Please use quadratic elements for beams with circular cross section"), which blocked a
@@ -254,6 +266,43 @@ confirms the wall order). A 40-element cantilever's tip deflection is 0.997 (`PI
 along their centre lines and ignores each wall's own bending stiffness. `validate_with_ccx.py`
 checks a pipe and a box cantilever against beam theory. No corpus deck starts solving: the
 two `PIPE31H` decks that use `THICK PIPE` also need externally supplied `<parameter>` values.
+
+**Rigid couplings on shell, beam and truss nodes.** ccx builds `*RIGID BODY` and
+`*KINEMATIC` couplings from RIGID MPCs, and 2.23 stops on one that touches a shell,
+membrane, beam or truss node (`*ERROR in gen3dmpc: nodes belonging to shell elements must
+not be subject to a RIGID MPC`; 2.22 ran them, current sources only warn) — unless ccx has
+made the node a *knot*, which a beam element attached to it does. Each such node now gets
+a force-free *knot beam* (a `B31` to a new free node, no density) and ccx's own constraint
+stays. The knot also gives the node real rotations, so the rotations Abaqus couples are
+tied to the body's by `*EQUATION`: ccx's coupling never coupled them (a rotational DOF of a
+non-knot shell node does nothing in an MPC), so a straight coupled edge hinged freely about
+itself. Probed on 2.23:
+
+* an `S8R` plate edge coupled to an offset, loaded reference point vs the same plate as
+  `C3D20R` under `*RIGID BODY`: reference-point displacement within 1.3e-5 of |u|, body
+  rotations within 0.1 %; under `NLGEOM` (about 8° end rotation) within 6e-4; the
+  zero-density knot beams leave the eigenfrequencies unchanged. As `S4` vs `C3D8I` and
+  `S4R` vs `C3D8R` (the bricks ccx expands them into): 5e-5 and 2e-5 of |u|;
+* a `B31`/`B32` cantilever whose tip is coupled to an offset point vs the statically
+  equivalent tip load: within 1e-4;
+* `marcello_gori_u_shaped_bracket`, whose reference points are encastred, vs the same deck
+  with the coupled nodes encastred directly: within 5.7e-7 over all 2092 nodes;
+* `marcello_gori_spring_plate_nl` (`NLGEOM` and plasticity): unchanged to 6 digits when the
+  knot beams' modulus is scaled by 1000 either way or their section by 10 — they carry no
+  load.
+
+Linear `*EQUATION` ties u = u_R + θ × (x − x_R) were the alternative: exact only without
+`NLGEOM` (up to 23 % off at 8° in the same probe), and they still could not tie the shell
+rotations. Both decks above now solve (218 → 220); `marcello_gori_job_1`, a beam tower,
+already did, and its first buckling factor rises 0.4 % now that the column tops'
+rotations follow the reference point, as its empty `*Kinematic` asks. A kinematic
+coupling whose reference node is itself a shell/beam node becomes a `*RIGID BODY` whose
+`ROT NODE` follows that node: kept as a ccx coupling, the node carries two unrelated
+rotations (probed: the beam acts hinged at the coupled face). Not covered: explicit
+dynamics ("linear and nonlinear MPC's depend on each other", with or without the knot
+beams), and coupled DOFs that also carry a `*BOUNDARY` — `dheller1_uprofile` now passes
+the gen3dmpc check but stops on that overconstraint, which Abaqus resolves and ccx does
+not.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

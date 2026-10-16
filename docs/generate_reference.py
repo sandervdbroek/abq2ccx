@@ -73,12 +73,19 @@ TRANSLATED = {
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
         "(as Abaqus does unless `UNSORTED`).",
     "*KINEMATIC COUPLING": "every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF "
-        "range (the reference node's DOFs 4-6 then take BCs and moments natively).",
-    "*COUPLING / *KINEMATIC": "`REF NODE` set → node number; empty `*KINEMATIC` → `1, 3`; DOFs > 3 "
-        "clamped; shell/beam nodes warned (ccx 2.23 rejects rigid MPCs there).",
+        "range (the reference node's DOFs 4-6 then take BCs and moments natively); rotation lines "
+        "on shell/beam nodes become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`).",
+    "*COUPLING / *KINEMATIC": "`REF NODE` set → node number; empty `*KINEMATIC` → `1, 3` (a "
+        "rotations-only card couples nothing); DOFs > 3 clamped. Shell/membrane/beam/truss nodes "
+        "get a force-free knot beam (elset/material `ABQ2CCX_KNOT`), without which ccx 2.23 "
+        "rejects the rigid MPC, and the coupled rotations are tied to the reference node's DOFs "
+        "4-6 by `*EQUATION`; a shell/beam `REF NODE` turns the coupling into a `*RIGID BODY` "
+        "whose `ROT NODE` follows it.",
     "*RIGID BODY": "`PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node "
         "number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs "
-        "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); shell/beam nodes warned.",
+        "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE). Shell/membrane/beam/truss "
+        "members get knot beams; the rotations of `TIE NSET`/`ELSET` shell/beam members are tied "
+        "to the `ROT NODE`, `PIN NSET` ones stay free.",
     "*CLOAD": "moments on a rigid-body reference point → its `ROT NODE`; `ORIENTATION=` (local "
         "axes) and `FOLLOWER=YES` dropped with a warning.",
     "*CONTACT PAIR": "missing `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; the note "

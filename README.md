@@ -94,6 +94,7 @@ PASS  nle10_thickplate (NAFEMS LE10): SYY at point D = -5.650 MPa (reference -5.
 PASS  beam_circ_cantilever (B31 + CIRC): tip deflection = -4.2290 (beam theory -4.2441, 0.4% diff)
 PASS  beam_pipe_box_cantilever (PIPE31 + PIPE): tip deflection y = -7.1490 (beam theory -7.1886, 0.6% diff)
 PASS  beam_pipe_box_cantilever (B32 + BOX): tip deflection y = -1.7898 (beam theory -1.7887, 0.1% diff), z = -4.5091 (beam theory -4.5265, 0.4% diff)
+PASS  coupling_shell_plate (rigid coupling on S8R nodes): RP displacement (-0.1025, +0.0191, +1.7152) vs the solid *Rigid Body (-0.1025, +0.0191, +1.7152), 0.001% of |u|
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -108,7 +109,11 @@ The second check is a cantilever on linear `B31` beams with a circular section: 
 deflection is compared with beam theory, P L³/(3 E I). The third does the same for a pipe
 section on `PIPE31` elements and a box section on `B32` elements, which ccx 2.23 runs only
 on `B32R`. The box has unequal sides and wall pairs and is loaded in both directions, so a
-misread box dimension would miss beam theory by 18 % or more.
+misread box dimension would miss beam theory by 18 % or more. The fourth couples a shell
+plate's edge rigidly to an offset reference point that carries a force and a moment (a
+coupling ccx 2.23 rejects on shell nodes without the converter's knot beams) and compares
+the reference point's displacement with the same plate built from `C3D20R` bricks under
+`*RIGID BODY`.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -132,9 +137,9 @@ python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
 Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
-references; 218 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
+references; 220 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
 crash, and runs an analysis step), and **219 mesh-only decks** — no `*STEP`, so nothing to
-solve — are **accepted** by ccx. The other 585 convert cleanly but use features ccx cannot
+solve — are **accepted** by ccx. The other 583 convert cleanly but use features ccx cannot
 run (user elements, UMAT/VUMAT and other user subroutines, Riks, cohesive/connector
 elements, piezoelectric/acoustic coupling) or are CAE part fragments / incomplete or
 invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
@@ -167,7 +172,7 @@ Every keyword falls into one of five buckets:
 | --- | --- | --- |
 | **Supported** | emit as-is (it's in the CalculiX keyword set) | `*PLASTIC`, `*HYPERELASTIC`, `*CONTACT PAIR`, `*EQUATION`, `*DENSITY` |
 | **Translated** | dedicated handler adjusts keyword/params/data | `*NCOPY`, `*ELGEN`, `*ELASTIC`, `*SHELL SECTION` composite, `*STEP`, `*DSLOAD`, output cards |
-| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*RIGID BODY`, `*MPC,TIE`→`*EQUATION`, `*DSLOAD`(pressure)→`*DLOAD`, `*COHESIVE/GASKET SECTION`→`*SOLID SECTION` (thin-continuum approx) |
+| **Equivalent** | mapped to the nearest CalculiX construct | `*KINEMATIC COUPLING`→`*COUPLING`+`*KINEMATIC`, `*MPC,TIE`→`*EQUATION`, `*DSLOAD`(pressure)→`*DLOAD`, `*COHESIVE/GASKET SECTION`→`*SOLID SECTION` (thin-continuum approx) |
 | **Dropped** | organisational, no CalculiX meaning | `*PART/*INSTANCE/*ASSEMBLY` (flattened), `*PREPRINT`, `*PARAMETER`, `*SYSTEM` |
 | **Commented** | no equivalent — emitted as `**` comments + warning | `*VISCOELASTIC`, `*CONNECTOR SECTION`, `*GASKET BEHAVIOR`, `*INERTIA RELIEF`, `*FIELD`, `*CONCRETE *` |
 
@@ -201,6 +206,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*MPC, TIE` | per-DOF `*EQUATION` | `PLANE`/`STRAIGHT` kept |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
+| rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
 | `*CONTACT PAIR, TIED` | `*TIE` per surface pair | without `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; face-to-face suggested if ccx struggles) |
 | `*FRICTION` | `mu` only | ccx reads Abaqus' 2nd field (slip rate / mu_k) as its stick slope; `ROUGH` warned (no equivalent) |
 | `*PLASTIC, HARDENING=JOHNSON COOK` | native ccx Johnson-Cook + `*RATE DEPENDENT` | ccx switches JC on only with a rate card (C = 0 added if the deck has none); `HARDENING=USER` / Chaboche `PARAMETERS` commented (material runs elastic) |
@@ -337,8 +343,14 @@ converter warns about the ones it can detect; the rest are here so you know to c
   `*RIGID BODY`, `*COUPLING`, …) are copied per instance; rotated instances rotate
   `*ORIENTATION` axes, beam `n1` and `*NORMAL`, but not `*DISTRIBUTION` tables.
 * Rigid couplings (`*KINEMATIC`, `*RIGID BODY`) on **shell/beam nodes** are rejected by
-  ccx 2.23 (FreeCAD 1.1 build: `*ERROR in gen3dmpc … RIGID MPC`); ccx 2.22 accepts them.
-  The converter warns.
+  ccx 2.23 (FreeCAD 1.1 build: `*ERROR in gen3dmpc … RIGID MPC`) unless the node is a
+  ccx *knot*. The converter attaches a short force-free beam (elset `ABQ2CCX_KNOT`, no
+  density) to each such node, which makes it one, and ties the node's rotations to the
+  coupling as Abaqus does — exact in linear and `NLGEOM` steps (validated against the same
+  plate built from solids). Not covered: explicit dynamics (ccx stops: "linear and
+  nonlinear MPC's depend on each other"), a coupling whose shell/beam reference node
+  couples only some translations, and coupled DOFs that also carry a `*BOUNDARY` (ccx
+  stops on that overconstraint, which Abaqus resolves).
 * `*DISTRIBUTION` / variable-angle-tow orientation is solid-section-only in ccx.
 * Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
@@ -361,6 +373,8 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/assembly_two_blocks.inp`](examples/assembly_two_blocks.inp) | two-instance assembly, `instance.node` reference in a step |
 | [`examples/beam_circ_cantilever.inp`](examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters, `*NGEN`/`*ELGEN` |
 | [`examples/beam_pipe_box_cantilever.inp`](examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` → `B32R` with midside nodes, `B32` + `SECTION=BOX` → `B32R`, biaxial tip load |
+| [`examples/coupling_shell_plate.inp`](examples/coupling_shell_plate.inp) | `S8R` edge `*Coupling`+`*Kinematic` to a loaded reference point → knot beams + rotation ties, `*NGEN`/`*NFILL`/`*ELGEN` |
+| [`examples/coupling_solid_plate.inp`](examples/coupling_solid_plate.inp) | its `C3D20R` + `*Rigid Body, TIE NSET` reference, `*NCOPY` |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

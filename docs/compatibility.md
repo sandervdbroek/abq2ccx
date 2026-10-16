@@ -34,9 +34,12 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
   * step data (`*CLOAD`, `*DLOAD`, `*FREQUENCY`, output cards) outside any `*STEP`, a
     section naming an undefined material, and `*BOUNDARY` DOFs 4–6 on plane-element nodes
     now **crash** ccx (segfault / bus error) instead of a clean `*ERROR`;
-  * rigid couplings (`*KINEMATIC`, `*RIGID BODY`) on shell or beam nodes stop with
-    `*ERROR in gen3dmpc: nodes belonging to shell elements must not be subject to a RIGID
-    MPC` (2.22 ran them; the current ccx sources only warn).
+  * rigid couplings (`*KINEMATIC`, `*RIGID BODY`) on shell, membrane, beam or truss nodes
+    stop with `*ERROR in gen3dmpc: nodes belonging to shell elements must not be subject
+    to a RIGID MPC` (2.22 ran them; the current ccx sources only warn) — unless ccx has
+    made the node a *knot*, which a beam element attached to it does. The converter gives
+    each such node a force-free *knot beam*, and uses the knot's rotations to tie the
+    node's rotations to the coupling as Abaqus does (see [testing](testing.md)).
 * No 2.24 exists as of October 2026.
 * A few cards are version-gated in older ccx (e.g. `*MEMBRANE SECTION` from 2.14, the
   `*ORIENTATION` rotation line from ~2.15, `C3D8R` hourglass control from 2.3). Check
@@ -51,13 +54,15 @@ check is the **NAFEMS LE10 thick-plate benchmark**: the converted deck solves an
 reports σ_yy = −5.65 MPa at point D vs the published reference −5.38 MPa (5 % — in
 line with the element type and mesh density). A cantilever on linear beams with a
 circular section matches beam theory's tip deflection within 0.4 %, pipe- and
-box-section cantilevers match it within 0.6 %, and the composite-shell and assembly
-decks also solve. This proves the full pipeline — `*NCOPY`/`*ELGEN` expansion, node
-ordering, boundary sets, pressure face, sections — is correct, not merely well-formed.
+box-section cantilevers match it within 0.6 %, a shell plate whose edge is rigidly coupled
+to a loaded reference point matches the same plate built from solids under `*RIGID BODY`
+within 0.001 %, and the composite-shell and assembly decks also solve. This proves the
+full pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face,
+sections — is correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
-218 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
+220 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
 convert cleanly but use features ccx cannot run, and each was verified to fail no worse
 than the original unconverted deck. Bulk-running every deck
 through convert → integrity → ccx is also what drove several converter fixes
@@ -86,12 +91,13 @@ through ccx and classified by its failure *and* its source) breaks down as:
 | ~15% | **Addressable error, but downstream-blocked** | The *first* error is converter-fixable, but a second, fundamental wall sits behind it. |
 
 The third row is the important subtlety: **fixing the first error rarely makes such a
-deck solve.** For example, Abaqus `*COUPLING`+`*Kinematic` can be translated to ccx
-`*RIGID BODY`, which clears the coupling error on ~30 corpus decks — but *every one* then
-hits a UMAT material, a non-convergence, or a degenerate-mesh error and still doesn't
-run. So the converter is built to **translate or clearly flag** each incompatibility (so
-the deck is faithful and the blocker is visible), not to manufacture ccx capabilities or
-complete a partial deck.
+deck solve.** For example, the rigid couplings on shell nodes that ccx 2.23 rejects are
+now repaired — but of the eight corpus decks that have one, only two newly solve (a
+third already ran); the other five then hit a VUMAT, a user element, an unsupported
+damage criterion, an incomplete source or an overconstraint and still don't run. So the
+converter is built to **translate or clearly flag** each incompatibility (so the deck is
+faithful and the blocker is visible), not to manufacture ccx capabilities or complete a
+partial deck.
 
 **If your converted deck won't solve,** read the first `*ERROR` ccx prints and place it in
 the table above. A *fundamental* or *incomplete-source* error means the model needs
@@ -100,10 +106,12 @@ missing step, refine an inverted element) — not a different conversion. The co
 **report** (the `**`-comment header in the output) flags the cards that were translated
 approximately or commented out, which is the first place to look.
 
-One known translation the converter does *not* yet attempt is `*COUPLING`+`*Kinematic`
-→ `*RIGID BODY` (it is passed through and ccx rejects it): it is a common CAE construct
-worth adding, but every corpus deck that uses it is downstream-blocked, so it could not
-be end-to-end-validated against ccx here.
+`*COUPLING`+`*Kinematic` passes to ccx natively (ccx has both keywords; the converter
+resolves the `REF NODE` set and fills an empty `*Kinematic`). Where it couples shell,
+membrane, beam or truss nodes, ccx 2.23 accepts it only through the knot beams above;
+explicit-dynamics steps cannot run it at all, and a coupled DOF that also carries a
+`*BOUNDARY` stops ccx ("dependent side of a MPC and a SPC") where Abaqus resolves the
+overconstraint.
 
 ## What "verified" means here
 

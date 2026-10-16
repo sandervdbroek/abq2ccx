@@ -4,8 +4,9 @@
 This is the proof that the converter produces *runnable, correct* CalculiX input — not
 just structurally-valid text.  It auto-detects a ``ccx`` binary (including the one
 bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
-stress, and the tip deflections of circular-, pipe- and box-section cantilevers against
-beam theory.
+stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
+theory, and a shell plate rigidly coupled to a loaded reference point against the same
+plate built from solids.
 
     python validate_with_ccx.py
 
@@ -187,6 +188,30 @@ def main():
                           f"{abs(v - ref) / abs(ref) * 100:.1f}% diff)" for axis, v, ref in res))
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # --- rigid coupling on shell nodes vs the same plate as solids under *Rigid Body --
+    # ccx 2.23 rejects a rigid coupling on shell nodes that are not knots, so this checks the
+    # knot beams and the rotation ties together (without the ties a moment about the edge
+    # line finds the edge hinged) against a model ccx accepts unchanged.
+    u = {}
+    for name in ("coupling_shell_plate", "coupling_solid_plate"):
+        inp = os.path.join(tmp, name + ".inp")
+        convert(os.path.join(EXAMPLES, name + ".inp"), inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u[name] = dat_displacement(os.path.join(d, "job.dat"), 9001) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if u[name] is None:
+            print(f"FAIL  {name}: no reference-point displacement ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+    if all(u.values()):
+        us, ur = u["coupling_shell_plate"], u["coupling_solid_plate"]
+        err = max(abs(a - b) for a, b in zip(us, ur)) / max(abs(b) for b in ur)
+        ok = err < 0.005
+        print(f"{'PASS' if ok else 'FAIL'}  coupling_shell_plate (rigid coupling on S8R nodes): RP "
+              f"displacement ({us[0]:+.4f}, {us[1]:+.4f}, {us[2]:+.4f}) vs the solid *Rigid Body "
+              f"({ur[0]:+.4f}, {ur[1]:+.4f}, {ur[2]:+.4f}), {err * 100:.3f}% of |u|")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
