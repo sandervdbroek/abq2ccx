@@ -120,7 +120,12 @@ TRANSLATED = {
         "them); `DEPENDENCIES` collapsed.",
     "*ELASTIC / *DENSITY / *SPECIFIC HEAT / *CONDUCTIVITY / *EXPANSION / *MOHR COULOMB": "`TYPE` "
         "token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`, same constant order); `DEPENDENCIES=n` (field variables, which ccx ignores) collapsed to the "
-        "Abaqus no-field state, field = 0.",
+        "Abaqus no-field state, field = 0. A linear-elastic `*ELASTIC` less anisotropic than its "
+        "material's `*EXPANSION` (isotropic beside `ORTHO`, isotropic / orthotropic / engineering "
+        "constants beside `ANISO`) is written as `ENGINEERING CONSTANTS` / `ANISO` with the same "
+        "stiffness, since ccx 2.23 otherwise uses a wrong stiffness in linear steps once the deck has "
+        "temperatures; temperature rows are "
+        "added so its stiffness interpolation stays within 1e-4 of Abaqus'.",
     "*HYPERELASTIC": "no model keyword → `POLYNOMIAL` (Abaqus default); `TEST DATA INPUT` commented.",
     "*DEPVAR": "SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx).",
     "*INITIAL CONDITIONS": "`TYPE=STRESS/PLASTIC STRAIN/SOLUTION` expanded per integration point "

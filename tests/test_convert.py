@@ -758,6 +758,111 @@ def test_lamina_to_engineering_constants():
     assert "transverse" in rep.text().lower()
 
 
+def elastic_card(body, material):
+    """The emitted *ELASTIC card of ``material``: (keyword line, data lines)."""
+    lines = body.splitlines()
+    i = lines.index(f"*MATERIAL, NAME={material}")
+    j = next(k for k in range(i + 1, len(lines)) if lines[k].startswith("*ELASTIC"))
+    k = next((k for k in range(j + 1, len(lines)) if lines[k].startswith("*")), len(lines))
+    return lines[j], lines[j + 1:k]
+
+
+ORTHO_EXPANSION = "*Expansion, type=ORTHO\n1e-3, 2e-3, 4e-3\n"
+ANISO_EXPANSION = "*Expansion, type=ANISO\n1e-3, 2e-3, 4e-3, 0., 0., 0.\n"
+
+
+def test_iso_elastic_with_ortho_expansion_becomes_engineering_constants():
+    # ccx 2.23 gets the thermal strains wrong for an isotropic *ELASTIC beside an orthotropic
+    # *EXPANSION (linear steps): the same stiffness goes out as engineering constants
+    body, _, rep = convert_str("*Material, name=M\n*Elastic\n1000., 0.2\n" + ORTHO_EXPANSION +
+                               "*Material, name=PLAIN\n*Elastic\n1000., 0.2\n*Expansion\n1e-3\n"
+                               "*Material, name=EC\n*Elastic, type=ENGINEERING CONSTANTS\n"
+                               "1., 2., 3., .1, .2, .3, 4., 5.\n6.\n" + ORTHO_EXPANSION)
+    assert ("*ELASTIC, TYPE=ENGINEERING CONSTANTS\n1000, 1000, 1000, 0.2, 0.2, 0.2, 416.666666667, "
+            "416.666666667\n416.666666667\n*EXPANSION, TYPE=ORTHO") in body
+    assert "*MATERIAL, NAME=PLAIN\n*ELASTIC\n1000., 0.2\n" in body      # isotropic expansion
+    assert elastic_card(body, "EC")[1] == ["1., 2., 3., .1, .2, .3, 4., 5.", "6."]
+    assert "Material M: isotropic *ELASTIC written as TYPE=ENGINEERING CONSTANTS" in rep.text()
+    assert "Material PLAIN" not in rep.text() and "Material EC" not in rep.text()
+
+
+def test_iso_elastic_temperature_rows_for_ortho_expansion():
+    # only E varies: the stiffness is linear in E, so the given rows (and columns) suffice
+    body, _, _ = convert_str("*Material, name=M\n*Elastic\n1000., 0.2, 20.\n2000., 0.2, 120.\n"
+                             + ORTHO_EXPANSION)
+    assert elastic_card(body, "M")[1] == [
+        "1000, 1000, 1000, 0.2, 0.2, 0.2, 416.666666667, 416.666666667", "416.666666667, 20.",
+        "2000, 2000, 2000, 0.2, 0.2, 0.2, 833.333333333, 833.333333333", "833.333333333, 120."]
+    # nu varies too: ccx interpolates the converted stiffness, Abaqus E and nu, so rows are
+    # added (E, nu linear in T) until the stiffness between them is within 1e-4
+    body, _, rep = convert_str("*Material, name=M\n*Elastic\n1000., 0.2, 0.\n3000., 0.3, 200.\n"
+                               + ORTHO_EXPANSION)
+    data = elastic_card(body, "M")[1]
+    rows = [[float(x) for x in data[k].split(",") + data[k + 1].split(",")]
+            for k in range(0, len(data), 2)]
+    temps = [r[9] for r in rows]
+    assert temps[0] == 0. and temps[-1] == 200. and len(temps) > 2 and temps == sorted(temps)
+    for r in rows:
+        e, nu = 1000. + 10. * r[9], 0.2 + 0.0005 * r[9]
+        assert r[0:3] == [r[0]] * 3 and r[3:6] == [r[3]] * 3 and r[6:9] == [r[6]] * 3
+        assert abs(r[0] - e) < 1e-6 and abs(r[3] - nu) < 1e-9 and abs(r[6] - e / (2 + 2 * nu)) < 1e-6
+    for r0, r1 in zip(rows, rows[1:]):
+        t = (r0[9] + r1[9]) / 2
+        exact = A.ortho_from_iso(1000. + 10. * t, 0.2 + 0.0005 * t)
+        lin = [(a + b) / 2 for a, b in zip(A.ortho_from_iso(r0[0], r0[3]), A.ortho_from_iso(r1[0], r1[3]))]
+        assert max(abs(a - b) for a, b in zip(exact, lin)) <= 1e-4 * max(exact)
+    assert f"{len(rows) - 2} temperature row(s) added" in rep.text()
+
+
+def test_elastic_for_aniso_expansion_becomes_aniso():
+    # engineering constants do not help with an ANISO expansion (ccx 2.23 also gets an
+    # orthotropic *ELASTIC wrong beside it without an *ORIENTATION): all go out as ANISO
+    body, _, rep = convert_str("*Material, name=ISO\n*Elastic\n1000., 0.2, 50.\n" + ANISO_EXPANSION +
+                               "*Material, name=EC\n*Elastic, type=ENGINEERING CONSTANTS\n"
+                               "1000., 2000., 3000., 0.2, 0.25, 0.3, 400., 500.\n600.\n" + ANISO_EXPANSION
+                               + "*Material, name=LAM\n*Elastic, type=LAMINA\n"
+                                 "1000., 600., 0.25, 300., 300., 250.\n" + ANISO_EXPANSION)
+    head, data = elastic_card(body, "ISO")
+    assert head == "*ELASTIC, TYPE=ANISO" and [len(ln.split(",")) for ln in data] == [8, 8, 6]
+    lam, mu = 1000. * .2 / (1.2 * .6), 1000. / 2.4
+    iso = A.aniso_from_ortho([lam + 2 * mu, lam, lam + 2 * mu, lam, lam, lam + 2 * mu, mu, mu, mu])
+    assert all(abs(a - b) < 1e-6 for a, b in zip([float(x) for ln in data for x in ln.split(",")],
+                                                 iso + [50.]))
+    # engineering constants: the normal block inverts back to the compliance, G's in place
+    head, data = elastic_card(body, "EC")
+    d = [float(x) for ln in data for x in ln.split(",")]
+    dn = [[d[0], d[1], d[3]], [d[1], d[2], d[4]], [d[3], d[4], d[5]]]
+    sn = [[1 / 1000., -.2 / 1000., -.25 / 1000.], [-.2 / 1000., 1 / 2000., -.3 / 2000.],
+          [-.25 / 1000., -.3 / 2000., 1 / 3000.]]
+    prod = [[sum(dn[i][k] * sn[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    assert head == "*ELASTIC, TYPE=ANISO" and len(d) == 21
+    assert all(abs(prod[i][j] - (i == j)) < 1e-9 for i in range(3) for j in range(3))
+    assert (d[9], d[14], d[20]) == (400., 500., 600.) and not any(d[6:9] + d[10:14] + d[15:20])
+    assert elastic_card(body, "LAM")[0] == "*ELASTIC, TYPE=ANISO"
+    assert "orthotropic *ELASTIC with an anisotropic expansion unless an *ORIENTATION" in rep.text()
+
+
+def test_elastic_left_alone_beside_expansion():
+    # a kept *PLASTIC puts ccx on its nonlinear material path: correct there, and it takes
+    # only an isotropic or orthotropic *ELASTIC
+    body, _, rep = convert_str("*Material, name=P\n*Elastic\n1000., 0.2\n" + ORTHO_EXPANSION +
+                               "*Plastic\n100., 0.\n")
+    assert "*ELASTIC\n1000., 0.2\n" in body and "written as" not in rep.text()
+    # ... but a *PLASTIC the converter comments out leaves the material elastic
+    body, _, _ = convert_str("*Material, name=P\n*Elastic\n1000., 0.2\n" + ORTHO_EXPANSION +
+                             "*Plastic, hardening=USER\n100., 0.\n")
+    assert elastic_card(body, "P")[0] == "*ELASTIC, TYPE=ENGINEERING CONSTANTS"
+    # an expansion belongs to its own material only
+    body, _, _ = convert_str("*Material, name=A\n*Elastic\n1000., 0.2\n*Material, name=B\n"
+                             "*Elastic\n500., 0.3\n" + ORTHO_EXPANSION)
+    assert elastic_card(body, "A") == ("*ELASTIC", ["1000., 0.2"])
+    assert elastic_card(body, "B")[0] == "*ELASTIC, TYPE=ENGINEERING CONSTANTS"
+    # constants ccx rejects anyway (nu >= 0.5) are not rewritten
+    body, _, rep = convert_str("*Material, name=M\n*Elastic\n1000., 0.5\n" + ORTHO_EXPANSION)
+    assert elastic_card(body, "M") == ("*ELASTIC", ["1000., 0.5"])
+    assert "could not be read" in rep.text()
+
+
 def test_beam_section_unsupported_profile_commented():
     deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=B31,elset=E\n1,1,2\n"
             "*Beam Section, elset=E, material=m, section=I\n0.1,0.2,0.1,0.1,0.01,0.01,0.01\n")

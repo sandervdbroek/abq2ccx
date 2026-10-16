@@ -1447,6 +1447,53 @@ def ccx_label_ok(label: str, allowed: set) -> bool:
 # Coriolis / rotor-dynamic loads.
 DLOAD_UNSUPPORTED = {"CENT", "ROTA", "CORIO", "ROTDYNF"}
 
+# In a deck with temperatures, ccx 2.23 runs a linear-elastic material correctly in linear
+# steps only when its *ELASTIC form is at least as anisotropic as its *EXPANSION (probed).
+# With an isotropic *ELASTIC and a TYPE=ORTHO or ANISO expansion, its stress routine stores
+# the stiffness in orthotropic/anisotropic form while the element stiffness still reads it
+# as (E, nu): E becomes lambda + 2 mu and nu becomes lambda, a wrong stiffness for every
+# load, without an error.  A free heated cube (E = 1000, nu = 0.2, alpha = 1e-3, 2e-3, 4e-3)
+# shrinks with strains near -2, with or without an *ORIENTATION; frequencies come out 17x
+# too low.  An orthotropic or engineering-constants *ELASTIC fails the same way with an
+# ANISO expansion unless an *ORIENTATION applies.
+# (emitted *ELASTIC type, expansion type) -> the type that works, with the same stiffness.
+ELASTIC_FOR_EXPANSION = {("ISO", "ORTHO"): "ENGINEERING CONSTANTS", ("ISO", "ANISO"): "ANISO",
+                         ("ENGINEERING CONSTANTS", "ANISO"): "ANISO", ("ORTHO", "ANISO"): "ANISO"}
+# Material cards that put ccx on its nonlinear material path, which combines any *ELASTIC
+# with any *EXPANSION correctly (verified for *PLASTIC and *CREEP) but accepts only an
+# isotropic or orthotropic *ELASTIC: such materials (and those with a kept *PLASTIC) are
+# left as they are.
+INELASTIC_MATERIAL_CARDS = {"CREEP", "DEFORMATION PLASTICITY", "HYPERELASTIC", "HYPERFOAM",
+                            "MOHR COULOMB", "USER MATERIAL"}
+
+
+def ortho_from_iso(e: float, nu: float) -> List[float]:
+    """The 9 ccx TYPE=ORTHO constants (D1111, D1122, D2222, D1133, D2233, D3333, D1212,
+    D1313, D2323) of an isotropic material."""
+    lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+    mu = e / (2.0 * (1.0 + nu))
+    return [lam + 2.0 * mu, lam, lam + 2.0 * mu, lam, lam, lam + 2.0 * mu, mu, mu, mu]
+
+
+def ortho_from_engineering(v: Sequence[float]) -> List[float]:
+    """The 9 ccx TYPE=ORTHO constants of engineering constants (E1, E2, E3, nu12, nu13,
+    nu23, G12, G13, G23), computed the way ccx converts them when it reads them."""
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = v
+    n21, n31, n32 = n12 * e2 / e1, n13 * e3 / e1, n23 * e3 / e2
+    gam = 1.0 / (1.0 - n12 * n21 - n23 * n32 - n31 * n13 - 2.0 * n21 * n32 * n13)
+    return [e1 * (1.0 - n23 * n32) * gam, e1 * (n21 + n31 * n23) * gam,
+            e2 * (1.0 - n13 * n31) * gam, e1 * (n31 + n21 * n32) * gam,
+            e2 * (n32 + n12 * n31) * gam, e3 * (1.0 - n12 * n21) * gam, g12, g13, g23]
+
+
+def aniso_from_ortho(d: Sequence[float]) -> List[float]:
+    """The 21 ccx TYPE=ANISO constants (D1111, D1122, D2222, D1133, D2233, D3333, D1112,
+    D2212, D3312, D1212, D1113, D2213, D3313, D1213, D1313, D1123, D2223, D3323, D1223,
+    D1323, D2323) of the 9 orthotropic ones."""
+    z = 0.0
+    return [d[0], d[1], d[2], d[3], d[4], d[5], z, z, z, d[6], z, z, z, z, d[7],
+            z, z, z, z, z, d[8]]
+
 
 def _fortran_real_like(text: str) -> bool:
     """Whether ccx 2.23 reads ``text`` as a number on an ``*ORIENTATION`` data line.  It
@@ -1528,6 +1575,8 @@ class Converter:
         # its step (_plan_op_new_rotations)
         self._op_new_drop: Dict[int, bool] = {}
         self._jc_with_rate: set = set()
+        # id(*ELASTIC) -> (TYPE of its material's ORTHO/ANISO *EXPANSION, material name)
+        self._elastic_expansion: Dict[int, Tuple[str, str]] = {}
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
         self._rb_rot_synth: Dict[int, int] = {}    # ... where the converter created the ROT NODE
@@ -2156,7 +2205,7 @@ class Converter:
         if typ == "LAMINA":
             converted = self._lamina_to_engineering_constants(b)
             if converted is not None:
-                return converted
+                return self._fit_elastic_to_expansion(b, "ENGINEERING CONSTANTS", converted)
             self.report.warn("*ELASTIC TYPE=LAMINA could not be parsed; emitted unchanged — ccx "
                              "will reject TYPE=LAMINA.", once=True)
         tmap = {"ISOTROPIC": "ISO", "ISO": "ISO", "ORTHOTROPIC": "ORTHO", "ORTHO": "ORTHO",
@@ -2203,7 +2252,7 @@ class Converter:
                                  "rejects incompressible nu; slight compressibility introduced — "
                                  "use *HYPERELASTIC for true incompressibility). Verify.", once=True)
                 data = newdata
-        return [emit_keyword("ELASTIC", params)] + data
+        return self._fit_elastic_to_expansion(b, cc, [emit_keyword("ELASTIC", params)] + data)
 
     def _lamina_to_engineering_constants(self, b: Block) -> Optional[List[str]]:
         """``*ELASTIC, TYPE=LAMINA`` (E1,E2,nu12,G12,G13,G23[,T]) has no ccx equivalent;
@@ -2234,6 +2283,143 @@ class Converter:
                          "to solids, so these through-thickness constants DO enter the stiffness — "
                          "verify.", once=True)
         return [emit_keyword("ELASTIC", params)] + rows
+
+    def _plan_elastic_expansion(self, blocks: List[Block]) -> None:
+        """The *ELASTIC cards whose material has an orthotropic or anisotropic *EXPANSION,
+        which handle_elastic may have to rewrite (ELASTIC_FOR_EXPANSION).  A material's
+        cards run from its *MATERIAL to the next card that cannot belong to it.  Materials on
+        ccx's nonlinear material path (INELASTIC_MATERIAL_CARDS, or a *PLASTIC card that
+        handle_plastic keeps) are left out."""
+        self._elastic_expansion = {}
+        ends = {"MATERIAL", "STEP", "NODE", "ELEMENT", "SURFACE INTERACTION", "CONNECTOR BEHAVIOR",
+                "GASKET BEHAVIOR"}
+
+        def plan(group: List[Block]) -> None:
+            exp = [g for g in group if g.keyword == "EXPANSION"]
+            typ = (exp[-1].param("TYPE") or "ISO").strip().upper() if exp else "ISO"
+            kind = {"ORTHO": "ORTHO", "ORTHOTROPIC": "ORTHO", "ANISO": "ANISO",
+                    "ANISOTROPIC": "ANISO"}.get(typ)
+            if kind is None or any(g.keyword in INELASTIC_MATERIAL_CARDS or
+                                   (g.keyword == "PLASTIC" and self._plastic_kept(g)) for g in group):
+                return
+            for g in group:
+                if g.keyword == "ELASTIC":
+                    self._elastic_expansion[id(g)] = (kind, group[0].param("NAME") or "?")
+
+        group: List[Block] = []
+        for b in blocks:
+            if b.keyword in ends or b.keyword.endswith("SECTION"):
+                if group:
+                    plan(group)
+                group = [b] if b.keyword == "MATERIAL" else []
+            elif group:
+                group.append(b)
+        if group:
+            plan(group)
+
+    @staticmethod
+    def _plastic_kept(b: Block) -> bool:
+        """Whether handle_plastic emits this *PLASTIC card rather than commenting it out
+        (user, parametric or unknown hardening, unreadable Johnson-Cook data)."""
+        hard = (b.param("HARDENING") or "ISOTROPIC").strip().upper().replace(" ", "").replace("-", "")
+        if hard == "JOHNSONCOOK":
+            vals = [x.strip() for x in (b.data[0].split(",") if b.data else [])]
+            while vals and vals[-1] == "":
+                vals.pop()
+            try:
+                return len([pf(x) if x else 0.0 for x in vals]) >= 3
+            except ValueError:
+                return False
+        return hard in ("ISOTROPIC", "KINEMATIC", "COMBINED") and \
+            not (b.param("DATATYPE") or "").strip().upper().startswith("PARAM")
+
+    def _fit_elastic_to_expansion(self, b: Block, cc: str, out: List[str]) -> List[str]:
+        """The emitted *ELASTIC card ``out`` (ccx type ``cc``) in the form ccx 2.23 needs beside
+        its material's orthotropic or anisotropic *EXPANSION (ELASTIC_FOR_EXPANSION), with the
+        same stiffness; ``out`` itself when no change is needed.  ccx interpolates the
+        converted stiffness linearly in temperature where Abaqus interpolates the given
+        constants, so rows are added between the given temperatures until the two agree to
+        1e-4 of the stiffness (they coincide at the given temperatures)."""
+        kind, mat = self._elastic_expansion.get(id(b), ("", ""))
+        target = ELASTIC_FOR_EXPANSION.get((cc, kind))
+        if target is None:
+            return out
+        to_ortho = {"ISO": lambda v: ortho_from_iso(v[0], v[1]),
+                    "ENGINEERING CONSTANTS": ortho_from_engineering, "ORTHO": list}[cc]
+        n_line = 1 if cc == "ISO" else 2               # data lines per temperature row
+        data = [ln for ln in out[1:] if ln.strip()]
+        rows: List[Tuple[List[float], str]] = []       # (constants, temperature token)
+        try:
+            if len(data) % n_line:
+                raise ValueError("incomplete row")
+            for k in range(0, len(data), n_line):
+                recs = [[x.strip() for x in ln.split(",")] for ln in data[k:k + n_line]]
+                if n_line == 1:                        # E, nu[, T]
+                    vals, rest = (recs[0] + ["", ""])[:2], recs[0][2:]
+                else:                                  # 8 constants / 9th[, T]
+                    vals, rest = (recs[0] + [""] * 8)[:8] + recs[1][:1], recs[1][1:]
+                v = [pf(x) if x else 0.0 for x in vals]
+                if cc == "ISO" and not (v[0] > 0.0 and -1.0 < v[1] < 0.5):
+                    raise ValueError("invalid constants")
+                if not all(math.isfinite(x) for x in to_ortho(v)):
+                    raise ValueError("invalid constants")
+                rows.append((v, rest[0] if rest else ""))
+        except (ValueError, ZeroDivisionError):
+            self.report.warn(f"Material {mat}: its *ELASTIC data could not be read or is invalid, "
+                             f"so it was emitted unchanged beside *EXPANSION, TYPE={kind}; ccx 2.23 "
+                             f"uses a wrong stiffness for this combination in linear steps of a "
+                             f"deck with temperatures — give the elastic constants as "
+                             f"TYPE={target}.", once=True)
+            return out
+        added, worst = 0, 0.0
+        try:
+            temps = [pf(t) for _, t in rows] if len(rows) > 1 else []
+        except ValueError:
+            temps = []
+        if temps and all(t0 < t1 for t0, t1 in zip(temps, temps[1:])):
+            fine = rows[:1]
+            for (v0, _), row1, t0, t1 in zip(rows, rows[1:], temps, temps[1:]):
+                def at(s: float, v0=v0, v1=row1[0]) -> List[float]:
+                    return [x + s * (y - x) for x, y in zip(v0, v1)]
+                # n equal sub-intervals; the error of ccx's interpolation at their middles,
+                # relative to the largest stiffness constant there
+                for n in (1, 2, 4, 8, 16, 32, 64):
+                    d = [to_ortho(at(k / (2 * n))) for k in range(2 * n + 1)]
+                    err = max(max(abs(m - (p + q) / 2.0) for p, m, q in zip(d[k], d[k + 1], d[k + 2]))
+                              / (max(abs(x) for x in d[k + 1]) or 1.0) for k in range(0, 2 * n, 2))
+                    if err <= 1e-4:
+                        break
+                worst = max(worst, err)
+                fine += [(at(k / n), "%.12g" % (t0 + k * (t1 - t0) / n)) for k in range(1, n)]
+                fine.append(row1)
+            added = len(fine) - len(rows)
+            rows = fine
+        params = [p.strip() for p in out[0].split(",")[1:] if not p.strip().upper().startswith("TYPE=")]
+        lines = [", ".join(["*ELASTIC", f"TYPE={target}"] + params)]
+        for v, temp in rows:
+            if target == "ANISO":
+                consts = aniso_from_ortho(to_ortho(v))
+            else:                                      # engineering constants of an isotropic material
+                g = v[0] / (2.0 * (1.0 + v[1]))
+                consts = [v[0]] * 3 + [v[1]] * 3 + [g] * 3
+            # 12 significant digits: ccx reads only the first 20 characters of a field
+            toks = ["%.12g" % x for x in consts] + ([temp] if temp else [])
+            lines += [", ".join(toks[i:i + 8]) for i in range(0, len(toks), 8)]
+        what = {"ISO": "isotropic", "ENGINEERING CONSTANTS": "engineering-constants",
+                "ORTHO": "orthotropic"}[cc]
+        why = ("an isotropic *ELASTIC with an orthotropic or anisotropic expansion" if cc == "ISO"
+               else "an orthotropic *ELASTIC with an anisotropic expansion unless an *ORIENTATION "
+                    "applies")
+        self.report.note(f"Material {mat}: {what} *ELASTIC written as TYPE={target} with the same "
+                         f"stiffness because of its *EXPANSION, TYPE={kind}: in linear steps of a "
+                         f"deck with temperatures, ccx 2.23 uses a wrong stiffness (and thermal "
+                         f"strains) for {why}."
+                         + (f" {added} temperature row(s) added between the given ones: ccx "
+                            f"interpolates the converted stiffness linearly in temperature, Abaqus "
+                            f"the given constants, and the extra rows keep the two within "
+                            f"{'1e-4' if worst <= 1e-4 else f'{worst:.1g}'}." if added else ""),
+                         once=True)
+        return lines
 
     def _orientation_points(self, b: Block) -> Optional[List[float]]:
         """The ccx ``a, b`` direction points of an Abaqus *ORIENTATION, or None when they
@@ -4708,6 +4894,7 @@ class Converter:
             elif b.keyword in ("STEP", "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "NODE",
                                "ELEMENT"):
                 jc_block = None
+        self._plan_elastic_expansion(blocks)
         # Abaqus prints the whole model when *EL PRINT / *NODE PRINT has no set; ccx
         # silently prints nothing — give those cards an explicit whole-model set
         if any(b.keyword == "EL PRINT" and not b.param("ELSET") for b in blocks) and self.geom.elements:

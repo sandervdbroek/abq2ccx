@@ -1,0 +1,91 @@
+*Heading
+Isotropic elasticity with orthotropic / anisotropic thermal expansion: three unit cubes
+** Each cube is one C3D8 element, heated uniformly from 0 to 90.  In linear steps of a deck
+** with temperatures, ccx 2.23 uses a wrong stiffness for an isotropic *Elastic beside a
+** TYPE=ORTHO or ANISO *Expansion, so abq2ccx writes those *Elastic cards as ENGINEERING
+** CONSTANTS / ANISO.
+** FREE   (nodes 1-8):   isotropic, alpha = 1e-5, 2e-5, 4e-5 along a material system turned
+**                       30 deg about z, held 3-2-1: strain = R diag(alpha dT) R^T, no stress.
+** ANISO  (nodes 11-18): isotropic, TYPE=ANISO with zero shear terms, held 3-2-1:
+**                       strain = alpha dT, no stress.
+** HOT    (nodes 21-28): E 1000 -> 3000 and nu 0.2 -> 0.3 over T = 0 -> 200, both x faces
+**                       held in x: at T = 90, E = 1900, nu = 0.245, so
+**                       sigma_xx = -E alpha_x dT = -1.71 and eps_yy = (alpha_y + nu alpha_x) dT.
+*Node, nset=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+11, 2., 0., 0.
+12, 3., 0., 0.
+13, 3., 1., 0.
+14, 2., 1., 0.
+15, 2., 0., 1.
+16, 3., 0., 1.
+17, 3., 1., 1.
+18, 2., 1., 1.
+21, 4., 0., 0.
+22, 5., 0., 0.
+23, 5., 1., 0.
+24, 4., 1., 0.
+25, 4., 0., 1.
+26, 5., 0., 1.
+27, 5., 1., 1.
+28, 4., 1., 1.
+*Element, type=C3D8, elset=FREE
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Element, type=C3D8, elset=ANISO
+2, 11, 12, 13, 14, 15, 16, 17, 18
+*Element, type=C3D8, elset=HOT
+3, 21, 22, 23, 24, 25, 26, 27, 28
+*Nset, nset=HOT_X
+21, 22, 23, 24, 25, 26, 27, 28
+*Orientation, name=TURNED
+0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0.
+*Solid Section, elset=FREE, material=ISO_ORTHO, orientation=TURNED
+,
+*Solid Section, elset=ANISO, material=ISO_ANISO
+,
+*Solid Section, elset=HOT, material=ISO_HOT
+,
+*Material, name=ISO_ORTHO
+*Elastic
+200000., 0.3
+*Expansion, type=ORTHO
+1.e-5, 2.e-5, 4.e-5
+*Material, name=ISO_ANISO
+*Elastic
+70000., 0.33
+*Expansion, type=ANISO
+1.e-5, 2.e-5, 4.e-5, 0., 0., 0.
+*Material, name=ISO_HOT
+*Elastic
+1000., 0.2, 0.
+3000., 0.3, 200.
+*Expansion, type=ORTHO
+1.e-5, 2.e-5, 4.e-5
+*Boundary
+1, 1, 3
+2, 2, 3
+4, 3, 3
+11, 1, 3
+12, 2, 3
+14, 3, 3
+HOT_X, 1, 1
+21, 2, 3
+24, 3, 3
+*Initial Conditions, type=TEMPERATURE
+NALL, 0.
+*Step
+*Static
+*Temperature
+NALL, 90.
+*Node Print, nset=NALL
+U
+*El Print, elset=HOT
+S
+*End Step

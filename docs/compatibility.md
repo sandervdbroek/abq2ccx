@@ -67,6 +67,40 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
   orientations from their group's own axes, and assembly flattening renames the
   distribution per instance, offsets its element labels and turns its axes with a rotated
   instance.
+* **An elasticity less anisotropic than the thermal expansion gets a wrong stiffness in
+  linear steps of a deck with temperatures** (probed with unit cubes on
+  C3D8/C3D8I/C3D8R/C3D20R, S4/S4R, M3D4, CPS4/CPE4/CAX4, B31/B32R and T3D2, and read off
+  ccx's `linel`, `materialdata_me` and `elastics`):
+  * an isotropic `*ELASTIC` beside `*EXPANSION, TYPE=ORTHO` or `ANISO`: once the deck has
+    temperatures (an initial temperature field), the stress routine stores the stiffness
+    in orthotropic or anisotropic form, but the linear element stiffness still reads it
+    as (E, ν), so E becomes λ + 2μ and ν becomes λ — for every load, without an error.
+    Heated, a free cube (E = 1000, ν = 0.2, α = 1e-3, 2e-3, 4e-3) *shrinks*, with strains
+    of −2.2, −2.0 and −1.6, with or without an `*ORIENTATION`; pulled at a temperature
+    that does not change, it contracts sideways by 0.25 instead of 2e-4; its frequencies
+    come out 17 times too low. Without temperatures the material is right;
+  * an orthotropic or engineering-constants `*ELASTIC` beside `TYPE=ANISO` goes wrong the
+    same way (spurious shear strains, or values of 1e14) unless an `*ORIENTATION` applies.
+    Only `TYPE=ANISO` elasticity is right beside an ANISO expansion everywhere, and
+    `ENGINEERING CONSTANTS` (or `ORTHO`) beside an ORTHO expansion;
+  * `NLGEOM` steps and materials with `*PLASTIC` or `*CREEP` (ccx's nonlinear path) get
+    these combinations right, but there ccx accepts only an isotropic or orthotropic
+    `*ELASTIC`. Under `NLGEOM`, though, a non-isotropic expansion turned by an
+    `*ORIENTATION` is wrong with *every* elastic type: an ORTHO one loses the shear part
+    of the turned strain, an ANISO one does not converge;
+  * temperature rows are interpolated linearly in the given constants for `TYPE=ISO`
+    (E, ν, as Abaqus does), but in the stiffness matrix for every other type (ccx turns
+    engineering constants into one per row as it reads them);
+  * the shear coefficients α12, α13, α23 of an ANISO expansion are tensor components
+    (thermal ε12 = α12 ΔT). Whether Abaqus means the same is not verified here; the
+    converter passes the coefficients through.
+
+  The converter writes an isotropic `*ELASTIC` as `ENGINEERING CONSTANTS` beside an ORTHO
+  expansion, and an isotropic, orthotropic or engineering-constants one as `ANISO` beside
+  an ANISO expansion — the same stiffness, so a stress analysis is unchanged — and adds
+  rows between the given temperatures until ccx's interpolation of the stiffness is
+  within 1e-4 of the stiffness from Abaqus' interpolated constants. Materials on the
+  nonlinear path are left as they are. The `NLGEOM` limitation cannot be fixed this way.
 * No 2.24 exists as of October 2026.
 * A few cards are version-gated in older ccx (e.g. `*MEMBRANE SECTION` from 2.14, the
   `*ORIENTATION` rotation line from ~2.15, `C3D8R` hourglass control from 2.3). Check

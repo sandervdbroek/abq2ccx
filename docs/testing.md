@@ -22,7 +22,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (152)
+## 1. Unit tests — `tests/test_convert.py` (156)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -87,6 +87,10 @@ conversion behaviour and referential integrity.
 | `test_kinematic_rotational_dofs_clamped` | `*KINEMATIC` DOFs above 3 are clamped to ccx's translational range |
 | `test_surface_interaction_hard_behavior_synthesized` | an interaction without `*SURFACE BEHAVIOR` gets `PRESSURE-OVERCLOSURE=HARD`; one with a behaviour is left alone |
 | `test_lamina_to_engineering_constants` | `*ELASTIC, TYPE=LAMINA` → `ENGINEERING CONSTANTS` (E3=E2, ν13=ν12, ν23 from G23) |
+| `test_iso_elastic_with_ortho_expansion_becomes_engineering_constants` | an isotropic `*ELASTIC` beside `*EXPANSION, TYPE=ORTHO` → `ENGINEERING CONSTANTS` with the same stiffness (G = E/2(1+ν)) and a NOTE; it is left alone beside an isotropic expansion, as are engineering constants beside an ORTHO one |
+| `test_iso_elastic_temperature_rows_for_ortho_expansion` | temperature columns kept; E alone varying needs no extra rows; E and ν varying get rows (E, ν linear in T) until the linearly interpolated stiffness is within 1e-4 between them |
+| `test_elastic_for_aniso_expansion_becomes_aniso` | isotropic, engineering-constants and `LAMINA` `*ELASTIC` beside `TYPE=ANISO` → `TYPE=ANISO` (8/8/5 + T lines); the engineering constants' normal block inverts back to their compliance, the G's sit at D1212/D1313/D2323 |
+| `test_elastic_left_alone_beside_expansion` | a kept `*PLASTIC` (ccx's nonlinear path) leaves the material alone, a commented-out one does not; an expansion affects only its own material; ν ≥ 0.5 is not rewritten and warned |
 | `test_beam_section_unsupported_profile_commented` | `*BEAM SECTION, SECTION=I` (no ccx profile) is commented out with guidance |
 | `test_equally_spaced_amplitude_expanded` | `DEFINITION=EQUALLY SPACED` expands to explicit time/amplitude pairs |
 | `test_assembly_elset_element_member_uses_elem_offset` | an assembly `*Elset` member `I2.1` takes the element offset |
@@ -245,6 +249,15 @@ deck and runs it in CalculiX:
   tip moves 0.5910 (beam theory 0.5952; the knot stiffens the clamp by 0.7 %) and the plate
   tip as in step 1, to 1e-4. Converted as they were, ccx gives 3.7e5 and 0 (the prescribed
   value lost), 1.9e5 and 2.2e9, and the checks fail.
+* **`thermal_expansion_cubes`** — three heated unit cubes whose isotropic `*Elastic` sits beside
+  an orthotropic or anisotropic `*Expansion`, whose stiffness ccx 2.23 gets wrong in linear
+  steps once temperatures are defined (the converter writes the `*Elastic` as
+  `ENGINEERING CONSTANTS` / `ANISO`): a free cube with its material system turned 30° about
+  z and a free one with an ANISO expansion, against the analytic strain R diag(α ΔT) Rᵀ
+  (exact), and a cube held in x whose E and ν vary strongly with temperature, read at
+  T = 90 between the given rows: σ_xx = −1.71000 vs −E α_x ΔT = −1.71 and ε_yy, ε_zz within
+  1e-6. Converted without the rewrite, the free cubes shrink (a displacement of −964 where
+  +0.0011 is right); without the added temperature rows the held cube is 0.6 % / 1.4 % off.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -500,6 +513,29 @@ removes a BC in step 2) has no rotational BCs, so neither is affected, while
 dropped — the only corpus deck that converts differently — but it still stops before that,
 on its `SECTION=RECTANGULAR` (with `RECT`: `*ERROR in cascade` in step 1).
 `validate_with_ccx.py` checks both repairs on a clamped beam and plate.
+
+**Isotropic elasticity with orthotropic thermal expansion.** Found while probing
+distribution orientations: in a linear step ccx 2.23 gives a free cube with an isotropic
+`*ELASTIC` and `*EXPANSION, TYPE=ORTHO` (α = 1e-3, 2e-3, 4e-3) strains of −2.2, −2.0 and
+−1.6, with or without an `*ORIENTATION` and on every element family tried (continuum,
+shell, membrane, plane, axisymmetric, beam, truss). Its stress routine stores the
+stiffness of such a material in orthotropic form, while the element stiffness still
+reads it as (E, ν) — E becomes λ + 2μ and ν becomes λ, a negative bulk modulus; a fully
+clamped cube even shows the right stress. The stiffness is wrong for any load once the
+deck has temperatures: a cube pulled at an unchanged temperature contracts sideways by
+0.25 instead of 2e-4, and its frequencies are 17 times too low (without temperatures it
+is right). The same stiffness as `ENGINEERING CONSTANTS` is exact in every case. Probing
+the rest of the matrix showed that engineering constants do not help with `TYPE=ANISO`
+(wrong shear strains without an `*ORIENTATION`), that `TYPE=ANISO` elasticity is right
+with every expansion, that `*PLASTIC` / `*CREEP` materials and `NLGEOM` steps were never
+affected (and ccx rejects `ANISO` elasticity with `*PLASTIC`), but also that under
+`NLGEOM` a turned non-isotropic expansion is wrong with any elastic type. ccx interpolates the converted stiffness, not E and ν, between temperature rows: up
+to 8 % off mid-interval for a table whose E triples while ν goes 0.2 → 0.3, so rows are
+added until the two agree to 1e-4 (a steel-like table, E 210 → 180 GPa and ν 0.30 → 0.32,
+needs 3). A prescribed general strain gives the same stresses with the original and the
+rewritten `*ELASTIC` (isotropic, orthotropic, engineering constants with three different
+G's, `LAMINA`). No corpus deck has the combination (four have an ORTHO expansion, beside
+engineering constants or a user material); all 1073 corpus files convert byte-identically.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

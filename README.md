@@ -103,6 +103,7 @@ PASS  distribution_solid_plate (C3D8 *SOLID SECTION, per-element *DISTRIBUTION o
 PASS  distribution_shell_plate (composite S8R *SHELL SECTION, per-element *DISTRIBUTION orientation): 69 node displacements vs one *ORIENTATION per element, max difference 0.0e+00 of max |u|
 PASS  op_new_respecify: step 2 beam tip +1.1898 (expected +1.1905, 0.05% diff), plate tip (prescribed) +2.0000 (expected +2.0000, 0.00% diff)
 PASS  op_new_remove: step 2 beam tip +0.5910 (expected +0.5952, 0.71% diff), plate tip (step 1) +4.6380 (expected +4.6380, 0.00% diff)
+PASS  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO *Expansion): free strains 0.0000% / 0.0000% off alpha dT; held cube at T = 90: strains 0.0001% off, sigma_xx = -1.71000 (analytic -1.71000)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -134,11 +135,15 @@ fibre angle through a `*DISTRIBUTION`, as a variable-angle-tow layup does: a `C3
 (two instances, one rotated; a default line, an element-set line and an additional
 rotation) and a composite `S8R` panel whose plies follow +θ and −θ paths. Every node must
 move exactly as in the same model written with one `*ORIENTATION` and section per element.
-The last two clamp a beam and a plate and give step 2 a `*BOUNDARY, OP=NEW`, which ccx 2.23
+The next two clamp a beam and a plate and give step 2 a `*BOUNDARY, OP=NEW`, which ccx 2.23
 lets drop the clamps' rotations: one step re-specifies every BC (the converter drops its
 OP=NEW), the other removes the beam's prop (the clamped nodes become knots). Converted
 without these repairs, the beam tip moves 1e5 times too far and the plate's prescribed tip
-displacement comes out 0.
+displacement comes out 0. The thermal check heats unit cubes whose isotropic `*Elastic` sits
+beside an orthotropic or anisotropic `*Expansion` — whose stiffness ccx 2.23 silently gets
+wrong in linear steps once a deck has temperatures (a free cube shrinks) — and compares their
+strains (one has its material system turned 30°) and the stress of a cube held in x, whose E
+and ν vary with temperature, with the analytic values.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -218,6 +223,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*NGEN/*NFILL/*NCOPY/*ELGEN/*ELCOPY` | explicit `*NODE`/`*ELEMENT` | no mesh-generation in ccx |
 | `*PART/*INSTANCE/*ASSEMBLY` | flattened, one global numbering | instance transform applied; `inst.node`/`inst.set` resolved |
 | `*ELASTIC, ORTHOTROPIC/ANISOTROPIC` | `ORTHO`/`ANISO` | same constant order |
+| `*ELASTIC` less anisotropic than the material's `*EXPANSION` | isotropic beside `ORTHO` → `ENGINEERING CONSTANTS`; isotropic / orthotropic / engineering constants beside `ANISO` → `ANISO` | same stiffness; otherwise ccx 2.23 uses a wrong stiffness in linear steps once the deck has temperatures (thermal strains, displacements and frequencies all off); temperature rows added so the stiffness interpolation matches Abaqus' to 1e-4; materials with `*PLASTIC`/`*CREEP` left alone |
 | `*ORIENTATION` | `*ORIENTATION` | origin `c` subtracted (axes `a−c`, `b−c`); `DEFINITION=NODES` resolved; `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
 | `*DISTRIBUTION` (per-element orientation) | solids: resolved per element; shells/membranes: one `*ORIENTATION` + section per direction | ccx 2.23 honours a distribution only under `*SOLID SECTION` (default line first, rotation line on the first line only, origin ignored) and gives a shell section its first line; one distribution per orientation; other distributions commented |
 | `*BEAM SECTION, SECTION=CIRC` | radius `r` → diameters `2r, 2r`; 2-node beams → `B32`/`B32R` | ccx reads an ellipse's axis lengths; ccx 2.23 rejects linear beams with a circular section, so each gets a midside node (BCs, temperatures and initial conditions on both end nodes reach it) |

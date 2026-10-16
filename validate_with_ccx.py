@@ -10,7 +10,8 @@ built from solids, circular-section beams with a held twist and a prescribed rot
 against beam theory, the natural frequencies and buckling loads of planar (B21) beams with a
 rectangular and a circular section, per-element *DISTRIBUTION orientations (a C3D8 plate
 and a composite S8R panel) against the same models written with one orientation per element,
-and a clamped beam and plate after a later step's *BOUNDARY, OP=NEW.
+a clamped beam and plate after a later step's *BOUNDARY, OP=NEW, and the thermal strains
+of isotropic materials with an orthotropic / anisotropic expansion.
 
     python validate_with_ccx.py
 
@@ -129,6 +130,24 @@ def dat_displacement_history(dat_path, node):
         elif inblock and f and not f[0].isdigit():
             inblock = False
     return found
+
+
+def dat_el_stress(dat_path, elem):
+    """Mean stress (sxx, syy, szz, sxy, sxz, syz) over the integration points of ``elem`` in
+    the last *EL PRINT stress table of a ccx .dat file, or None."""
+    rows, inblock = [], False
+    if not os.path.exists(dat_path):
+        return None
+    for ln in open(dat_path):
+        if ln.strip().startswith("stresses"):
+            rows, inblock = [], True
+            continue
+        f = ln.split()
+        if inblock and len(f) == 8 and f[0] == str(elem):
+            rows.append([float(x) for x in f[2:]])
+        elif inblock and f and not f[0].isdigit():
+            inblock = False
+    return [sum(r[k] for r in rows) / len(rows) for k in range(6)] if rows else None
 
 
 def dat_eigen_table(dat_path, title):
@@ -394,6 +413,51 @@ def main():
             f"{label} {v:+.4f} (expected {ref:+.4f}, {diff * 100:.2f}% diff)"
             for (label, v, ref), diff in zip(refs, diffs)))
         failures += 0 if ok else 1
+
+    # --- isotropic *Elastic beside an orthotropic / anisotropic *Expansion -----------------
+    # ccx 2.23 uses a wrong stiffness for this combination in linear steps once the deck has
+    # temperatures (a free heated cube shrinks), so the converter writes such *Elastic cards
+    # as ENGINEERING CONSTANTS or ANISO.  Three heated unit cubes: two free ones against
+    # alpha dT (one with its material system turned 30 deg about z), and one held in x whose
+    # E and nu depend on temperature, read between the given rows (without the added rows
+    # ccx is 0.6 % / 1.4 % off there).
+    inp = os.path.join(tmp, "thermal.inp")
+    convert(os.path.join(EXAMPLES, "thermal_expansion_cubes.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    dat = os.path.join(d, "job.dat")
+    a1, a2, a3, dt = 1e-5, 2e-5, 4e-5, 90.0
+    c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+    e_hot, nu_hot = 1900.0, 0.245                                    # E, nu at T = 90
+    expect = {1: [(a1 * c * c + a2 * s * s) * dt, (a1 * s * s + a2 * c * c) * dt, a3 * dt,
+                  (a1 - a2) * s * c * dt, 0.0, 0.0],
+              11: [a1 * dt, a2 * dt, a3 * dt, 0.0, 0.0, 0.0],
+              21: [0.0, (a2 + nu_hot * a1) * dt, (a3 + nu_hot * a1) * dt, 0.0, 0.0, 0.0]}
+    errs = []
+    for base, ref in expect.items():
+        # homogeneous strain from the corner displacements (nodes at unit offsets x, y, z)
+        u = [dat_displacement(dat, base + k) if status == "solved" else None for k in (0, 1, 3, 4)]
+        if any(v is None for v in u):
+            errs = None
+            break
+        h = [[u[j + 1][i] - u[0][i] for j in range(3)] for i in range(3)]      # du_i / dx_j
+        eps = [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2,
+               (h[1][2] + h[2][1]) / 2]
+        errs.append(max(abs(x - y) for x, y in zip(eps, ref)) / max(abs(y) for y in ref))
+    sig = dat_el_stress(dat, 3) if status == "solved" else None
+    if errs is None or sig is None:
+        print(f"FAIL  thermal_expansion_cubes: no displacements / stresses ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        sxx_ref = -e_hot * a1 * dt
+        errs.append(abs(sig[0] - sxx_ref) / abs(sxx_ref))
+        ok = max(errs) < 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO "
+              f"*Expansion): free strains {errs[0] * 100:.4f}% / {errs[1] * 100:.4f}% off alpha dT; "
+              f"held cube at T = 90: strains {errs[2] * 100:.4f}% off, sigma_xx = {sig[0]:+.5f} "
+              f"(analytic {sxx_ref:+.5f})")
+        failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

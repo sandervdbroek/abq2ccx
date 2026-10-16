@@ -95,6 +95,18 @@ These are the silent ones — no error, wrong physics.
   adds a rate-independent one (C = 0) when the deck has none. `HARDENING=USER` and
   Chaboche `DATATYPE=PARAMETERS` cards are commented out, so the report tells you when a
   material now runs elastic.
+* **A heated part shrinks, or a model with temperatures is far too soft.** In linear steps
+  of a deck with temperatures (an initial temperature field), ccx 2.23 silently uses a
+  wrong stiffness — for thermal and mechanical loads and for frequencies alike — when a
+  material's `*EXPANSION` is more anisotropic than its `*ELASTIC`: an isotropic `*ELASTIC`
+  beside `TYPE=ORTHO` or `ANISO`, or an orthotropic / engineering-constants one beside
+  `TYPE=ANISO` without an `*ORIENTATION`. The converter writes such an `*ELASTIC` as
+  `ENGINEERING CONSTANTS` or `ANISO` with the same stiffness, adding temperature rows when
+  E and ν both vary with temperature (the report has a NOTE per material); keep that form
+  if you edit the converted deck. Under `NLGEOM`, an orthotropic or anisotropic expansion
+  turned by an `*ORIENTATION` is wrong in ccx 2.23 with any elastic type (the turned shear
+  part is lost, or the step does not converge), which no rewrite fixes — check one
+  element's thermal strain against a hand calculation there.
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=` and would use the
   first table row; the converter keeps the Abaqus no-field state (field = 0) and warns.
 * **Per-element (`*DISTRIBUTION`) orientations quietly collapse to one.** ccx 2.23 gives
