@@ -16,10 +16,10 @@ planar (B21) beams with a rectangular and a circular section, per-element *DISTR
 orientations (a C3D8 plate and a composite S8R panel) against the same models written with
 one orientation per element, a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, the thermal strains of isotropic materials with an orthotropic / anisotropic
-expansion, and the loads ccx has no card for — surface tractions (Cook's membrane, Lame's
-cylinder) and beam line loads (cantilevers against beam theory) — applied as consistent
-nodal forces, also on nodes with a *TRANSFORM (local axes), which must match the same
-models without one.
+expansion (including the engineering shear coefficients of an anisotropic one), and the
+loads ccx has no card for — surface tractions (Cook's membrane, Lame's cylinder) and beam
+line loads (cantilevers against beam theory) — applied as consistent nodal forces, also on
+nodes with a *TRANSFORM (local axes), which must match the same models without one.
 
     python validate_with_ccx.py
 
@@ -614,21 +614,25 @@ def main():
     # --- isotropic *Elastic beside an orthotropic / anisotropic *Expansion -----------------
     # ccx 2.23 uses a wrong stiffness for this combination in linear steps once the deck has
     # temperatures (a free heated cube shrinks), so the converter writes such *Elastic cards
-    # as ENGINEERING CONSTANTS or ANISO.  Three heated unit cubes: two free ones against
-    # alpha dT (one with its material system turned 30 deg about z), and one held in x whose
-    # E and nu depend on temperature, read between the given rows (without the added rows
-    # ccx is 0.6 % / 1.4 % off there).
+    # as ENGINEERING CONSTANTS or ANISO.  Four heated unit cubes: three free ones against
+    # alpha dT (one with its material system turned 30 deg about z, one with an ANISO
+    # expansion whose shear coefficients are Abaqus' engineering ones, gamma_ij = alpha_ij dT,
+    # which ccx reads as tensor components once halved), and one held in x whose E and nu
+    # depend on temperature, read between the given rows (without the added rows ccx is
+    # 0.6 % / 1.4 % off there).
     inp = os.path.join(tmp, "thermal.inp")
     convert(os.path.join(EXAMPLES, "thermal_expansion_cubes.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
     dat = os.path.join(d, "job.dat")
     a1, a2, a3, dt = 1e-5, 2e-5, 4e-5, 90.0
+    a12, a13, a23 = 1.2e-5, -0.8e-5, 0.6e-5                          # engineering, as given
     c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
     e_hot, nu_hot = 1900.0, 0.245                                    # E, nu at T = 90
     expect = {1: [(a1 * c * c + a2 * s * s) * dt, (a1 * s * s + a2 * c * c) * dt, a3 * dt,
                   (a1 - a2) * s * c * dt, 0.0, 0.0],
               11: [a1 * dt, a2 * dt, a3 * dt, 0.0, 0.0, 0.0],
-              21: [0.0, (a2 + nu_hot * a1) * dt, (a3 + nu_hot * a1) * dt, 0.0, 0.0, 0.0]}
+              21: [0.0, (a2 + nu_hot * a1) * dt, (a3 + nu_hot * a1) * dt, 0.0, 0.0, 0.0],
+              31: [a1 * dt, a2 * dt, a3 * dt, a12 * dt / 2, a13 * dt / 2, a23 * dt / 2]}
     errs = []
     for base, ref in expect.items():
         # homogeneous strain from the corner displacements (nodes at unit offsets x, y, z)
@@ -650,7 +654,8 @@ def main():
         errs.append(abs(sig[0] - sxx_ref) / abs(sxx_ref))
         ok = max(errs) < 1e-3
         print(f"{'PASS' if ok else 'FAIL'}  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO "
-              f"*Expansion): free strains {errs[0] * 100:.4f}% / {errs[1] * 100:.4f}% off alpha dT; "
+              f"*Expansion): free strains {errs[0] * 100:.4f}% / {errs[1] * 100:.4f}% off alpha dT, "
+              f"ANISO with shear terms {errs[3] * 100:.4f}% off (alpha_ij dT / 2 for i /= j); "
               f"held cube at T = 90: strains {errs[2] * 100:.4f}% off, sigma_xx = {sig[0]:+.5f} "
               f"(analytic {sxx_ref:+.5f})")
         failures += 0 if ok else 1

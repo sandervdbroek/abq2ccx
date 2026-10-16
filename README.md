@@ -125,7 +125,7 @@ PASS  mpc_link, NLGEOM (*MPC BEAM): length 5.0000001 (5) after turning 24.5 degr
 PASS  equation_overconstraint: solves (ccx rejects the deck as written); tied node u_x = -0.0e+00, loop u_x = +0.0420 (+0.0420, +0.0420)
 PASS  op_new_respecify: step 2 beam tip +1.1898 (expected +1.1905, 0.05% diff), plate tip (prescribed) +2.0000 (expected +2.0000, 0.00% diff)
 PASS  op_new_remove: step 2 beam tip +0.5910 (expected +0.5952, 0.71% diff), plate tip (step 1) +4.6380 (expected +4.6380, 0.00% diff)
-PASS  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO *Expansion): free strains 0.0000% / 0.0000% off alpha dT; held cube at T = 90: strains 0.0001% off, sigma_xx = -1.71000 (analytic -1.71000)
+PASS  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO *Expansion): free strains 0.0000% / 0.0000% off alpha dT, ANISO with shear terms 0.0000% off (alpha_ij dT / 2 for i /= j); held cube at T = 90: strains 0.0001% off, sigma_xx = -1.71000 (analytic -1.71000)
 PASS  rigid_body_bc_bars (BCs on *RIGID BODY nodes moved to the reference node): bar A vs the same BCs on the reference point by hand, max |du| = 9.7e-21 of |u| 0.3421; A's far face |u1| <= 9.0e-21 as it moves 0.512 (NLGEOM)
 PASS  cook_membrane_traction (TRVEC on CPS8 edges): v_C = 23.932 (reference 23.96, 0.12% diff)
 PASS  beam_line_load_cantilever (A): applied -1 (q L = -1), tip deflection -0.001173 (beam theory -0.001172, 0.1% diff)
@@ -194,10 +194,12 @@ without these repairs, the beam tip moves 1e5 times too far and the plate's pres
 displacement comes out 0. The thermal check heats unit cubes whose isotropic `*Elastic` sits
 beside an orthotropic or anisotropic `*Expansion` — whose stiffness ccx 2.23 silently gets
 wrong in linear steps once a deck has temperatures (a free cube shrinks) — and compares their
-strains (one has its material system turned 30°) and the stress of a cube held in x, whose E
-and ν vary with temperature, with the analytic values. The next gives the far face of a
-bar's rigid end cap (a `*RIGID BODY` on its elements) `u1 = 0`, which ccx stops on and the
-converter moves to the reference point with zero rotations about y and z, as Abaqus does —
+strains (one has its material system turned 30°, one an anisotropic expansion with shear
+terms, which Abaqus gives as engineering and ccx reads as tensor components) and the stress
+of a cube held in x, whose E and ν vary with temperature, with the analytic values. The
+next gives the far face of a bar's rigid end cap (a `*RIGID BODY` on its elements) `u1 = 0`,
+which ccx stops on and the converter moves to the reference point with zero rotations about
+y and z, as Abaqus does —
 implied in a first step that holds the reference point, moved in a second that releases
 it — and compares the bar with the same BCs written on the reference point, in `NLGEOM`
 steps where the cap twists 25° about the axis of the moved BC.
@@ -296,6 +298,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*ELASTIC, ORTHOTROPIC/ANISOTROPIC` | `ORTHO`/`ANISO` | same constant order |
 | `*EXPANSION, TYPE=ANISO` without shear coefficients | `TYPE=ORTHO` (α11, α22, α33) | the same thermal strain; ccx 2.23 stops `NLGEOM` steps on any ANISO expansion once the deck has temperatures ("too many cutbacks") but computes ORTHO exactly; kept ANISO where an `*ORIENTATION` or ply angle turns it so that it has shear in global axes (ORTHO would silently lose that shear there) |
 | `*ELASTIC` less anisotropic than the material's `*EXPANSION` | isotropic beside `ORTHO` → `ENGINEERING CONSTANTS`; isotropic / orthotropic / engineering constants beside `ANISO` → `ANISO` | same stiffness; otherwise ccx 2.23 uses a wrong stiffness in linear steps once the deck has temperatures (thermal strains, displacements and frequencies all off); temperature rows added so the stiffness interpolation matches Abaqus' to 1e-4; materials with `*PLASTIC`/`*CREEP` left alone |
+| `*EXPANSION, TYPE=ANISO` | same card, α12, α13, α23 halved | Abaqus' shear coefficients are engineering (γ12 = α12 ΔT), ccx reads tensor components (ε12 = α12 ΔT); every temperature row; see [compatibility](docs/compatibility.md) for the sources |
 | `*ORIENTATION` | `*ORIENTATION` | origin `c` subtracted (axes `a−c`, `b−c`); `DEFINITION=NODES` resolved; `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
 | `*DISTRIBUTION` (per-element orientation) | solids: resolved per element; shells/membranes: one `*ORIENTATION` + section per direction | ccx 2.23 honours a distribution only under `*SOLID SECTION` (default line first, rotation line on the first line only, origin ignored) and gives a shell section its first line; one distribution per orientation; other distributions commented |
 | `*BEAM SECTION, SECTION=CIRC` | radius `r` → diameters `2r, 2r`; 2-node beams → `B32`/`B32R` | ccx reads an ellipse's axis lengths; ccx 2.23 rejects linear beams with a circular section, so each gets a midside node (BCs, temperatures and initial conditions on both end nodes reach it) |

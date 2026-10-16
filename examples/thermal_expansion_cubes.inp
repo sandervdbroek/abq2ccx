@@ -1,5 +1,5 @@
 *Heading
-Isotropic elasticity with orthotropic / anisotropic thermal expansion: three unit cubes
+Isotropic elasticity with orthotropic / anisotropic thermal expansion: four unit cubes
 ** Each cube is one C3D8 element, heated uniformly from 0 to 90.  In linear steps of a deck
 ** with temperatures, ccx 2.23 uses a wrong stiffness for an isotropic *Elastic beside a
 ** TYPE=ORTHO or ANISO *Expansion, so abq2ccx writes those *Elastic cards as ENGINEERING
@@ -11,6 +11,11 @@ Isotropic elasticity with orthotropic / anisotropic thermal expansion: three uni
 ** HOT    (nodes 21-28): E 1000 -> 3000 and nu 0.2 -> 0.3 over T = 0 -> 200, both x faces
 **                       held in x: at T = 90, E = 1900, nu = 0.245, so
 **                       sigma_xx = -E alpha_x dT = -1.71 and eps_yy = (alpha_y + nu alpha_x) dT.
+** SHEAR  (nodes 31-38): isotropic, TYPE=ANISO with shear terms alpha12, alpha13, alpha23 =
+**                       1.2e-5, -0.8e-5, 0.6e-5, held 3-2-1.  Abaqus' shear coefficients are
+**                       engineering (gamma_ij = alpha_ij dT; a ply turned by theta about z has
+**                       the laminate-theory alpha12 = 2 (alpha1 - alpha2) sin cos), so the
+**                       tensor strain is eps_ij = alpha_ij dT / 2 for i /= j, no stress.
 *Node, nset=NALL
 1, 0., 0., 0.
 2, 1., 0., 0.
@@ -36,12 +41,22 @@ Isotropic elasticity with orthotropic / anisotropic thermal expansion: three uni
 26, 5., 0., 1.
 27, 5., 1., 1.
 28, 4., 1., 1.
+31, 6., 0., 0.
+32, 7., 0., 0.
+33, 7., 1., 0.
+34, 6., 1., 0.
+35, 6., 0., 1.
+36, 7., 0., 1.
+37, 7., 1., 1.
+38, 6., 1., 1.
 *Element, type=C3D8, elset=FREE
 1, 1, 2, 3, 4, 5, 6, 7, 8
 *Element, type=C3D8, elset=ANISO
 2, 11, 12, 13, 14, 15, 16, 17, 18
 *Element, type=C3D8, elset=HOT
 3, 21, 22, 23, 24, 25, 26, 27, 28
+*Element, type=C3D8, elset=SHEAR
+4, 31, 32, 33, 34, 35, 36, 37, 38
 *Nset, nset=HOT_X
 21, 22, 23, 24, 25, 26, 27, 28
 *Orientation, name=TURNED
@@ -51,6 +66,8 @@ Isotropic elasticity with orthotropic / anisotropic thermal expansion: three uni
 *Solid Section, elset=ANISO, material=ISO_ANISO
 ,
 *Solid Section, elset=HOT, material=ISO_HOT
+,
+*Solid Section, elset=SHEAR, material=ISO_SHEAR
 ,
 *Material, name=ISO_ORTHO
 *Elastic
@@ -68,6 +85,11 @@ Isotropic elasticity with orthotropic / anisotropic thermal expansion: three uni
 3000., 0.3, 200.
 *Expansion, type=ORTHO
 1.e-5, 2.e-5, 4.e-5
+*Material, name=ISO_SHEAR
+*Elastic
+70000., 0.33
+*Expansion, type=ANISO
+1.e-5, 2.e-5, 4.e-5, 1.2e-5, -0.8e-5, 0.6e-5
 *Boundary
 1, 1, 3
 2, 2, 3
@@ -78,6 +100,9 @@ Isotropic elasticity with orthotropic / anisotropic thermal expansion: three uni
 HOT_X, 1, 1
 21, 2, 3
 24, 3, 3
+31, 1, 3
+32, 2, 3
+34, 3, 3
 *Initial Conditions, type=TEMPERATURE
 NALL, 0.
 *Step

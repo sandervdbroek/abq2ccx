@@ -1921,6 +1921,7 @@ class Converter:
         self._expansion_as_ortho: Dict[int, str] = {}
         # id(*ELASTIC) -> (TYPE of its material's ORTHO/ANISO *EXPANSION, material name)
         self._elastic_expansion: Dict[int, Tuple[str, str]] = {}
+        self._expansion_material: Dict[int, str] = {}   # id(*EXPANSION) -> its material's name
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
         self._rb_rot_synth: Dict[int, int] = {}    # ... where the converter created the ROT NODE
@@ -2463,10 +2464,13 @@ class Converter:
 
     def handle_dependent_material(self, b: Block) -> List[str]:
         """Material cards whose only conversion need is DEPENDENCIES= collapsing (*DENSITY,
-        *SPECIFIC HEAT, *CONDUCTIVITY, *EXPANSION, *MOHR COULOMB[ HARDENING])."""
+        *SPECIFIC HEAT, *CONDUCTIVITY, *EXPANSION, *MOHR COULOMB[ HARDENING]), and the shear
+        coefficients of an anisotropic *EXPANSION (_tensor_expansion_shear)."""
         typ = (b.param("TYPE") or "ISO").upper()
         n = {"ORTHO": 3, "ORTHOTROPIC": 3, "ANISO": 6, "ANISOTROPIC": 6}.get(typ, 1)
         nvals = {"MOHR COULOMB": 2, "MOHR COULOMB HARDENING": 2}.get(b.keyword, n)
+        # with USER the data lines are VUEXPAN's user properties, not coefficients
+        aniso = b.keyword == "EXPANSION" and n == 6 and not b.has("USER")
         if b.has("DEPENDENCIES"):
             data = self._collapse_dependencies(b, nvals)
             params: "OrderedDict[str, Optional[str]]" = OrderedDict(
@@ -2474,10 +2478,53 @@ class Converter:
             if data is None:
                 self.report.warn(f"*{b.keyword}, DEPENDENCIES=...: rows could not be parsed; "
                                  f"passed through — ccx ignores field-variable dependence and in "
-                                 f"effect uses only the first row. Verify.", once=True)
-                data = list(b.data)
-            return [emit_keyword(b.keyword, params)] + data
-        return self.passthrough(b)
+                                 f"effect uses only the first row. Verify."
+                                 + (" Its shear coefficients alpha12, alpha13, alpha23 are NOT "
+                                    "halved to the tensor components ccx reads." if aniso else ""),
+                                 once=True)
+                return [emit_keyword(b.keyword, params)] + list(b.data)
+            out = [emit_keyword(b.keyword, params)] + data
+        else:
+            out = self.passthrough(b)
+        return self._tensor_expansion_shear(b, out) if aniso else out
+
+    def _tensor_expansion_shear(self, b: Block, out: List[str]) -> List[str]:
+        """The emitted *EXPANSION, TYPE=ANISO card ``out`` (one row per data line: alpha11,
+        alpha22, alpha33, alpha12, alpha13, alpha23, temperature) with its shear coefficients
+        halved.  Abaqus gives alpha12, alpha13, alpha23 as engineering coefficients (the shear
+        thermal strain gamma_ij = 2 eps_ij = alpha_ij dT): its material data use the
+        engineering shear strains of its strain vector (Conventions: (eps11, eps22, eps33,
+        gamma12, gamma13, gamma23)), as do the thermal strain increments UEXPAN returns for
+        TYPE=ANISO, and its PZT-5H verification enters the strain coefficient d15 in the
+        d_113 slot unhalved.  ccx 2.23 reads them as tensor components: a free cube strains
+        eps_ij = alpha_ij dT (probed for 12, 13 and 23), a clamped one has sigma12 =
+        -2 mu alpha12 dT.  Temperatures, blank fields and a distribution name stay as they are."""
+        lines = list(out)
+        halved = False
+        for i in range(1, len(lines)):
+            if lines[i].lstrip().startswith("*"):
+                continue
+            f = [x.strip() for x in lines[i].split(",")]
+            try:
+                shear = [pf(x) if x else 0.0 for x in f[3:6]]
+            except ValueError:
+                continue                            # a distribution name, not coefficients
+            if not any(shear):
+                continue
+            for k, v in enumerate(shear, 3):
+                if v != 0.0:
+                    # 12 significant digits: ccx reads only the first 20 characters of a field
+                    f[k] = "%.12g" % (0.5 * v)
+            lines[i] = ", ".join(f).rstrip()
+            halved = True
+        if halved:
+            mat = self._expansion_material.get(id(b), "?")
+            self.report.note(f"Material {mat}: the shear coefficients alpha12, alpha13, alpha23 of "
+                             f"its *EXPANSION, TYPE=ANISO halved — Abaqus gives them as engineering "
+                             f"shear strain per degree (gamma12 = alpha12 dT, the shear measure of "
+                             f"its strains), ccx 2.23 reads tensor components (eps12 = alpha12 dT).",
+                             once=True)
+        return lines
 
     def handle_plastic(self, b: Block) -> List[str]:
         """``*PLASTIC``: ccx implements ISOTROPIC / KINEMATIC / COMBINED tabular hardening
@@ -2737,9 +2784,10 @@ class Converter:
                     self._expansion_as_ortho[id(exp)] = name
 
     def handle_expansion(self, b: Block) -> List[str]:
-        """``*EXPANSION``: DEPENDENCIES= collapsed (handle_dependent_material), and an
-        anisotropic one without shear coefficients written as TYPE=ORTHO (alpha11, alpha22,
-        alpha33[, temperature]) where _plan_expansion_as_ortho chose it."""
+        """``*EXPANSION``: DEPENDENCIES= collapsed and the shear coefficients of an anisotropic
+        one halved (handle_dependent_material), and an anisotropic one without shear
+        coefficients written as TYPE=ORTHO (alpha11, alpha22, alpha33[, temperature]) where
+        _plan_expansion_as_ortho chose it."""
         out = self.handle_dependent_material(b)
         mat = self._expansion_as_ortho.get(id(b))
         if mat is None:
@@ -6400,6 +6448,18 @@ class Converter:
                             not (b.param("DATATYPE") or "").upper().startswith("PARAM"))
             elif b.keyword == "CYCLIC HARDENING" and combined:
                 self._cyclic_ok.add(id(b))
+        # the material each *EXPANSION card belongs to (named in handle_dependent_material's
+        # notes); a gasket or connector behavior's expansion has none
+        self._expansion_material = {}
+        mat = "?"
+        for b in blocks:
+            if b.keyword == "MATERIAL":
+                mat = (b.param("NAME") or "?").strip()
+            elif b.keyword in ("STEP", "GASKET BEHAVIOR", "CONNECTOR BEHAVIOR") or \
+                    b.keyword.endswith("SECTION"):
+                mat = "?"
+            elif b.keyword == "EXPANSION":
+                self._expansion_material[id(b)] = mat
         # Abaqus gives nodes without an initial temperature 0; ccx stops ("no initial
         # temperature defined in node ...") once any are missing
         self._temp_ic_fill = False

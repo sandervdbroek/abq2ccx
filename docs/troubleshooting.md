@@ -137,6 +137,10 @@ These are the silent ones — no error, wrong physics.
   adds a rate-independent one (C = 0) when the deck has none. `HARDENING=USER` and
   Chaboche `DATATYPE=PARAMETERS` cards are commented out, so the report tells you when a
   material now runs elastic.
+* **The converted `*EXPANSION, TYPE=ANISO` has half the shear coefficients.** That is
+  intended: Abaqus gives α12, α13, α23 as engineering shear strain per degree
+  (γ12 = α12 ΔT), ccx reads tensor components (ε12 = α12 ΔT), so the converter halves them
+  (a NOTE per material). Keep them halved if you edit the converted deck.
 * **A heated part shrinks, or a model with temperatures is far too soft.** In linear steps
   of a deck with temperatures (an initial temperature field), ccx 2.23 silently uses a
   wrong stiffness — for thermal and mechanical loads and for frequencies alike — when a

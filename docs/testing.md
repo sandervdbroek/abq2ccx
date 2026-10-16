@@ -25,7 +25,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (209)
+## 1. Unit tests — `tests/test_convert.py` (210)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -93,6 +93,7 @@ conversion behaviour and referential integrity.
 | `test_iso_elastic_with_ortho_expansion_becomes_engineering_constants` | an isotropic `*ELASTIC` beside `*EXPANSION, TYPE=ORTHO` → `ENGINEERING CONSTANTS` with the same stiffness (G = E/2(1+ν)) and a NOTE; it is left alone beside an isotropic expansion, as are engineering constants beside an ORTHO one |
 | `test_iso_elastic_temperature_rows_for_ortho_expansion` | temperature columns kept; E alone varying needs no extra rows; E and ν varying get rows (E, ν linear in T) until the linearly interpolated stiffness is within 1e-4 between them |
 | `test_elastic_for_aniso_expansion_becomes_aniso` | isotropic, engineering-constants and `LAMINA` `*ELASTIC` beside a `TYPE=ANISO` expansion with a shear coefficient → `TYPE=ANISO` (8/8/5 + T lines); the engineering constants' normal block inverts back to their compliance, the G's sit at D1212/D1313/D2323 |
+| `test_aniso_expansion_shear_halved` | `*EXPANSION, TYPE=ANISO` α12, α13, α23 halved on every row (Abaqus engineering → ccx tensor), with a NOTE naming the material; normal coefficients, temperatures, blank fields, `TYPE=ORTHO`, a distribution name and the user properties of `USER` untouched; zero-shear cards go out as `TYPE=ORTHO` instead; `DEPENDENCIES` collapsed first, then halved |
 | `test_elastic_left_alone_beside_expansion` | a kept `*PLASTIC` (ccx's nonlinear path) leaves the material alone, a commented-out one does not; an expansion affects only its own material; ν ≥ 0.5 is not rewritten and warned |
 | `test_nlgeom_turned_ortho_expansion_warned` | an `*EXPANSION, TYPE=ORTHO` whose axes an `*ORIENTATION` turns (by its points or its rotation line) is warned in a deck with an `NLGEOM` step (also `NLGEOM=YES`, an explicit step, a coupled step before an `NLGEOM` one) and a temperature change; not for a linear step, `NLGEOM=NO`, no orientation, axes only permuted, an isotropic expansion, coefficients equal across the turn, no temperature change or no temperatures; a temperature row with unequal coefficients and a cylindrical system are warned |
 | `test_nlgeom_aniso_expansion_warned` | an `*EXPANSION, TYPE=ANISO` is warned in a deck with an `NLGEOM` step and temperatures, turned or not and without a temperature change; not in linear steps, without temperatures, or on a material no section uses; one without shear coefficients only where it is turned |
@@ -343,16 +344,20 @@ deck and runs it in CalculiX:
   tip moves 0.5910 (beam theory 0.5952; the knot stiffens the clamp by 0.7 %) and the plate
   tip as in step 1, to 1e-4. Converted as they were, ccx gives 3.7e5 and 0 (the prescribed
   value lost), 1.9e5 and 2.2e9, and the checks fail.
-* **`thermal_expansion_cubes`** — three heated unit cubes whose isotropic `*Elastic` sits beside
+* **`thermal_expansion_cubes`** — four heated unit cubes whose isotropic `*Elastic` sits beside
   an orthotropic or anisotropic `*Expansion`, whose stiffness ccx 2.23 gets wrong in linear
   steps once temperatures are defined (the converter writes the `*Elastic` as
   `ENGINEERING CONSTANTS` / `ANISO`): a free cube with its material system turned 30° about
   z and a free one with an ANISO expansion (no shear coefficients, unturned: it goes out as
   `TYPE=ORTHO` beside engineering constants), against the analytic strain R diag(α ΔT) Rᵀ
-  (exact), and a cube held in x whose E and ν vary strongly with temperature, read at
-  T = 90 between the given rows: σ_xx = −1.71000 vs −E α_x ΔT = −1.71 and ε_yy, ε_zz within
-  1e-6. Converted without the rewrite, the free cubes shrink (a displacement of −964 where
-  +0.0011 is right); without the added temperature rows the held cube is 0.6 % / 1.4 % off.
+  (exact), a free one whose ANISO expansion has shear terms α12, α13, α23 = 1.2e-5,
+  −0.8e-5, 0.6e-5 (Abaqus' engineering coefficients), against the tensor strain
+  ε_ij = α_ij ΔT / 2 for i ≠ j (exact), and a cube held in x whose E and ν vary strongly
+  with temperature, read at T = 90 between the given rows: σ_xx = −1.71000 vs
+  −E α_x ΔT = −1.71 and ε_yy, ε_zz within 1e-6. Converted without the rewrite, the free
+  cubes shrink (a displacement of −964 where +0.0011 is right); without the added
+  temperature rows the held cube is 0.6 % / 1.4 % off; without halving the shear
+  coefficients the shear strains come out doubled (15 % of the largest strain off).
 * **`rigid_body_bc_bars`** — two `C3D8` bars clamped at x = 0 whose end caps (x = 4..5) are
   `*RIGID BODY`s on their elements, in two `NLGEOM` steps. Bar A's cap has `u1 = 0` on its
   far face (ccx stops on a BC on a rigid-body node): implied in step 1, which holds the
@@ -824,6 +829,21 @@ removes a BC in step 2) has no rotational BCs, so neither is affected, while
 dropped — the only corpus deck that converts differently — but it still stops before that,
 on its `SECTION=RECTANGULAR` (with `RECT`: `*ERROR in cascade` in step 1).
 `validate_with_ccx.py` checks both repairs on a clamped beam and plate.
+
+**Shear coefficients of an anisotropic thermal expansion.** Probes showed ccx 2.23
+reading α12, α13, α23 of `*EXPANSION, TYPE=ANISO` as tensor components (a heated free cube with
+α12, α13, α23 = 6e-5, 8e-5, 1e-4 strains ε12, ε13, ε23 = 6e-5, 8e-5, 1e-4 per degree, without
+stress). Abaqus' documentation never says which measure its α12 is, so it was settled from
+its other pages and its verification decks: material data are given in its strain vector
+(ε11, ε22, ε33, γ12, γ13, γ23), the TYPE=ANISO thermal strain increments of `UEXPAN` sit in
+Abaqus/Standard's engineering-shear strain arrays, and the PZT-5H verification enters the
+piezoelectric strain coefficient d15 unhalved in its d<sub>113</sub> slot and still verifies
+the unconstrained permittivity (2.77e-8 F/m; a tensor reading gives 6.56e-8). An outside
+Abaqus run agrees (`wenbinyugroup/sgio`: a free C3D8 with α12 = 1e-3, ΔT = 1 prints
+E12 = 1e-3). So the converter halves them; before, a converted deck had twice Abaqus'
+shear thermal strain. None of the 1073 corpus files, nor any of the 14,556 verification
+and 5,056 benchmark / example decks of Abaqus 2017, has an ANISO expansion; the corpus
+converts byte-identically.
 
 **Isotropic elasticity with orthotropic thermal expansion.** Found while probing
 distribution orientations: in a linear step ccx 2.23 gives a free cube with an isotropic

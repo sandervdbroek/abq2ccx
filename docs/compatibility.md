@@ -15,6 +15,7 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **No `*PART`/`*INSTANCE`/`*ASSEMBLY`/`*SYSTEM`** | must be flattened to one global numbering | absent from the ccx keyword set; forum guidance to export flat |
 | **Set/surface names: 20 significant characters** (21st is a reserved `N`/`E`/`S`/`T` suffix) | flattened instance-prefixed names are truncated + uniquified | ccx manual "Sets" section |
 | **`*ELASTIC` constant order is identical**; only the `TYPE` token differs (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`) | rename token, pass data through | ccx `*ELASTIC` section |
+| **`*EXPANSION, TYPE=ANISO` has the same order (α11, α22, α33, α12, α13, α23) but not the same shear measure**: Abaqus' α12, α13, α23 are engineering (γ12 = 2ε12 = α12 ΔT), ccx 2.23 reads tensor components (ε12 = α12 ΔT) | halve α12, α13, α23 on every temperature row (NOTE per material) | ccx: probed (a free cube strains ε12, ε13, ε23 = α12, α13, α23 · ΔT; a clamped one has σ12 = −2μ α12 ΔT). Abaqus: no page says it of α12 in words, but four sources agree — its Conventions give material data in the strain vector (ε11, ε22, ε33, γ12, γ13, γ23) and "Abaqus always reports shear strain as engineering shear strain"; the TYPE=ANISO thermal strain increments a `UEXPAN` returns sit in Abaqus/Standard's strain arrays, which carry "NSHR engineering shear components" (`UMAT`; `VUMAT`: tensor components in Abaqus/Explicit, "different from … UMAT in Abaqus/Standard, which uses engineering components"); the Verification Guide's PZT-5H test (`ppzovallin.inp`) enters the strain coefficient d15 = 741e-12 m/V unhalved as d<sub>113</sub> and verifies the unconstrained permittivity D11 = 2.77e-8 F/m, which holds only if that slot multiplies the engineering shear strain (a tensor reading gives 6.56e-8); and an Abaqus run reported in `wenbinyugroup/sgio` (commit 9087061): a free C3D8 with α12 = 1e-3, ΔT = 1 prints E12 = 1e-3. No 2017 verification, benchmark or example deck (19,612) has an ANISO expansion |
 | **`*INSTANCE` applies translation before rotation** (`R(p+T)`) | flatten transforms accordingly | Abaqus keyword manual: "translation is applied before rotation" |
 | **Coupled temperature-displacement elements share the base element name** (`C3D8T`≡`C3D8`, `CAX4RT`≡`CAX4R`); the temperature DOF comes from the step | strip the trailing `T` | ccx `*COUPLED TEMPERATURE-DISPLACEMENT` / element sections (no separate `…T` element names) |
 | **A keyword line ending in a comma continues its *parameters* on the next line** | splice them back; never merge a genuine data row | Abaqus input syntax: "continue a long keyword line by ending it with a comma" |
@@ -105,8 +106,10 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
     (E, ν, as Abaqus does), but in the stiffness matrix for every other type (ccx turns
     engineering constants into one per row as it reads them);
   * the shear coefficients α12, α13, α23 of an ANISO expansion are tensor components
-    (thermal ε12 = α12 ΔT). Whether Abaqus means the same is not verified here; the
-    converter passes the coefficients through.
+    (thermal ε12 = α12 ΔT, probed for all three), where Abaqus' are engineering ones
+    (γ12 = α12 ΔT; sources in the table above): passed through, a converted deck would
+    have twice the Abaqus shear thermal strain, so the converter halves them on every
+    row (after collapsing `DEPENDENCIES`; a distribution name is left as it is).
 
   The converter writes an isotropic `*ELASTIC` as `ENGINEERING CONSTANTS` beside an ORTHO
   expansion, and an isotropic, orthotropic or engineering-constants one as `ANISO` beside
@@ -281,7 +284,10 @@ one item that could not be quoted as text (the exact mid-side *edge* sequence, w
 the manual shows only as figures) is the universal Abaqus/Gmsh convention and is
 corroborated by the no-permutation pass-through in `gmsh2ccx`; if you want
 belt-and-suspenders certainty, run a single quadratic element through `ccx` and check a
-known displacement.
+known displacement. Likewise no Abaqus page states in words that the shear coefficients
+of an anisotropic `*EXPANSION` are engineering ones: that rests on the four sources in
+the table (conventions, subroutine storage, a verification deck, an outside Abaqus run);
+a free unit cube with α12 ≠ 0 in Abaqus settles it (E12 = α12 ΔT).
 
 ## Sources
 
@@ -295,3 +301,11 @@ known displacement.
 * Abaqus Keywords Reference Manual, `*INSTANCE` — <https://www.sharcnet.ca/Software/Abaqus/6.14.2/v6.14/books/key/ch09abk19.html>
 * Abaqus Analysis User's Guide (2016), "Coupling constraints" (kinematic coupling eliminates the coupled DOFs; no BCs on them in Abaqus/Standard) — <https://ceae-server.colorado.edu/v2016/books/usb/pt08ch35s03aus135.html>
 * Abaqus Analysis User's Guide (2016), "Overconstraint checks" (BCs on rigid-body nodes moved to the reference node) — <https://ceae-server.colorado.edu/v2016/books/usb/pt08ch35s06aus140.html>
+* Abaqus 2017 documentation (MIT mirror), for the shear measure of `*EXPANSION, TYPE=ANISO`:
+  Conventions — <https://abaqus-docs.mit.edu/2017/English/SIMACAEMODRefMap/simamod-c-conventions.htm>;
+  Thermal expansion — <https://abaqus-docs.mit.edu/2017/English/SIMACAEMATRefMap/simamat-c-thermalexpan.htm>;
+  UEXPAN — <https://abaqus-docs.mit.edu/2017/English/SIMACAESUBRefMap/simasub-c-uexpan.htm>;
+  UMAT — <https://abaqus-docs.mit.edu/2017/English/SIMACAESUBRefMap/simasub-c-umat.htm>;
+  VUMAT — <https://abaqus-docs.mit.edu/2017/English/SIMACAESUBRefMap/simasub-c-vumat.htm>;
+  piezoelectric verification (`ppzovallin.inp`) — <https://abaqus-docs.mit.edu/2017/English/SIMACAEVERRefMap/simaver-c-piezogeneral.htm>
+* `wenbinyugroup/sgio`, Abaqus `*Expansion, type=ANISO` reader (commit 9087061) — <https://github.com/wenbinyugroup/sgio/commit/9087061aa3>

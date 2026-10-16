@@ -1031,6 +1031,50 @@ def test_elastic_for_aniso_expansion_becomes_aniso():
     assert "orthotropic *ELASTIC with an anisotropic expansion unless an *ORIENTATION" in rep.text()
 
 
+def expansion_card(body, material):
+    """The emitted *EXPANSION card of ``material``: (keyword line, data lines)."""
+    lines = body.splitlines()
+    i = lines.index(f"*MATERIAL, NAME={material}")
+    j = next(k for k in range(i + 1, len(lines)) if lines[k].startswith("*EXPANSION"))
+    k = next((k for k in range(j + 1, len(lines)) if lines[k].startswith("*")), len(lines))
+    return lines[j], lines[j + 1:k]
+
+
+def test_aniso_expansion_shear_halved():
+    # Abaqus gives alpha12, alpha13, alpha23 as engineering shear strain per degree (gamma12 =
+    # alpha12 dT), ccx 2.23 reads them as tensor components (eps12 = alpha12 dT): they are
+    # halved, row by row; the normal coefficients, temperatures and blanks stay
+    elastic = "*Elastic, type=ANISOTROPIC\n" + "1., 0., 1., 0., 0., 1., 0., 0.\n0., 1., 0., 0., " \
+              "0., 0., 1., 0.\n0., 0., 0., 0., 1.\n"
+    body, _, rep = convert_str(
+        "*Material, name=TURNED\n" + elastic + "*Expansion, type=ANISO\n"
+        "1e-5, 2e-5, 4e-5, -8.6602540378e-6, 3.D-6, 1.e-6, 20.\n"
+        "1.1e-5, 2.2e-5, 4.4e-5, -1e-5,, 2e-6, 120.\n"
+        "*Material, name=ZERO\n" + elastic + ANISO_EXPANSION +
+        "*Material, name=ORTHO\n" + elastic + "*Expansion, type=ORTHO\n1e-5, 2e-5, 4e-5, 20.\n"
+        "*Material, name=FIELD\n" + elastic + "*Expansion, type=ANISO, dependencies=1\n"
+        "1e-5, 2e-5, 4e-5, 2e-6, 0., 0., 0., 0.\n9e-5, 9e-5, 9e-5, 8e-6, 0., 0., 0., 1.\n"
+        "*Material, name=DIST\n" + elastic + "*Expansion, type=ANISO\nEXPDIST\n"
+        "*Material, name=USERX\n" + elastic + "*Expansion, type=ANISO, user\n1., 2., 3., 4., 5.\n"
+        "*Material, name=TIGHT\n" + elastic + "*Expansion, type=ANISO\n1e-3,2e-3,4e-3,0.,0.,0.\n")
+    assert expansion_card(body, "TURNED") == ("*EXPANSION, TYPE=ANISO", [
+        "1e-5, 2e-5, 4e-5, -4.3301270189e-06, 1.5e-06, 5e-07, 20.",
+        "1.1e-5, 2.2e-5, 4.4e-5, -5e-06, , 1e-06, 120."])
+    assert expansion_card(body, "ZERO") == ("*EXPANSION, TYPE=ORTHO", ["1e-3, 2e-3, 4e-3"])
+    assert expansion_card(body, "TIGHT") == ("*EXPANSION, TYPE=ORTHO", ["1e-3, 2e-3, 4e-3"])
+    assert expansion_card(body, "ORTHO")[1] == ["1e-5, 2e-5, 4e-5, 20."]
+    # DEPENDENCIES: collapsed to the field-free row first, then halved
+    assert expansion_card(body, "FIELD") == ("*EXPANSION, TYPE=ANISO",
+                                             ["1e-5, 2e-5, 4e-5, 1e-06, 0., 0., 0."])
+    assert expansion_card(body, "DIST")[1] == ["EXPDIST"]          # a distribution name
+    assert expansion_card(body, "USERX")[1] == ["1., 2., 3., 4., 5."]  # VUEXPAN properties
+    text = rep.text()
+    assert "Material TURNED: the shear coefficients alpha12, alpha13, alpha23 of its " \
+           "*EXPANSION, TYPE=ANISO halved" in text and "Material FIELD: the shear" in text
+    assert not any(f"Material {m}: the shear" in text for m in ("ZERO", "ORTHO", "DIST", "USERX",
+                                                                 "TIGHT"))
+
+
 def test_elastic_left_alone_beside_expansion():
     # a kept *PLASTIC puts ccx on its nonlinear material path: correct there, and it takes
     # only an isotropic or orthotropic *ELASTIC
@@ -1143,15 +1187,6 @@ def test_nlgeom_expansion_composite_plies():
     assert warned("0.1, 3, PLY, 0.\n0.1, 3, PLY,\n", ", orientation=T")
     assert not warned("0.1, 3, PLY, 0.\n0.1, 3, PLY, 90.\n0.1, 3, PLY, -90.\n")
     assert not warned("0.1, 3, PLY, -30.\n", ", orientation=T")       # back to the global axes
-
-
-def expansion_card(body, material):
-    """The emitted *EXPANSION card of ``material``: (keyword line, data lines)."""
-    lines = body.splitlines()
-    i = lines.index(f"*MATERIAL, NAME={material}")
-    j = next(k for k in range(i + 1, len(lines)) if lines[k].startswith("*EXPANSION"))
-    k = next((k for k in range(j + 1, len(lines)) if lines[k].startswith("*")), len(lines))
-    return lines[j], lines[j + 1:k]
 
 
 def heated_cube(expansion, orientation="", section=""):
