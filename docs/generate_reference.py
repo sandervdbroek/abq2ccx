@@ -188,7 +188,13 @@ TRANSLATED = {
         "constants beside `ANISO`) is written as `ENGINEERING CONSTANTS` / `ANISO` with the same "
         "stiffness, since ccx 2.23 otherwise uses a wrong stiffness in linear steps once the deck has "
         "temperatures; temperature rows are "
-        "added so its stiffness interpolation stays within 1e-4 of Abaqus'.",
+        "added so its stiffness interpolation stays within 1e-4 of Abaqus'. An `*EXPANSION, "
+        "TYPE=ANISO` whose shear coefficients are zero in every row is written as `TYPE=ORTHO` "
+        "(the elastic rule then follows `ORTHO`), since ccx 2.23 stops `NLGEOM` steps on any ANISO "
+        "expansion once the deck has temperatures — unless an orientation or ply angle turns it so "
+        "that it has shear in global axes. One with shear coefficients gets α12, α13, α23 halved on "
+        "every row: Abaqus' are engineering (γ12 = α12 ΔT), ccx reads tensor components "
+        "(ε12 = α12 ΔT).",
     "*HYPERELASTIC": "no model keyword → `POLYNOMIAL` (Abaqus default); `TEST DATA INPUT` commented.",
     "*DEPVAR": "SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx).",
     "*INITIAL CONDITIONS": "`TYPE=STRESS/PLASTIC STRAIN/SOLUTION` expanded per integration point "
