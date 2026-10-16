@@ -1241,6 +1241,29 @@ FACE_NODES = {
               4: (2, 5, 6, 3, 14, 11, 15, 8), 5: (3, 6, 4, 1, 15, 12, 13, 9)},
 }
 
+# Abaqus planar (2-D) beams and trusses.  ccx has no planar beam: B21 "is internally replaced
+# by a B31 element and is treated as such", T2D2 likewise by a T3D2 (manual 6.2.31, 6.2.34),
+# and ELEMENT_TYPE_MAP sends the others to 3-D beams/trusses, so their out-of-plane DOFs are
+# free.  In a planar model the converter fixes DOF 3 on their nodes (node set PLANAR_NODES_SET,
+# see Converter._plan_planar_constraint).
+PLANAR_LINE_TYPES = {"B21", "B22", "B23", "PIPE21", "PIPE22", "T2D2", "T2D3"}
+PLANAR_TRUSS_TYPES = {"T2D2", "T2D3"}
+# Element families that can share a planar model with them: plane continuum, 2-D rigid,
+# connector, cohesive/gasket and heat-transfer elements, and dimensionless springs/masses.
+PLANAR_COMPANION_PREFIXES = ("CPS", "CPE", "DC2D", "AC2D", "COH2D", "GK2D", "GKPS", "R2D", "RB2D",
+                             "CONN2D", "SPRING", "DASHPOT", "MASS", "ROTARYI", "GAPUNI")
+PLANAR_NODES_SET = "ABQ2CCX_PLANAR"
+
+
+def planar_line_type(typ: str) -> Optional[str]:
+    """The planar beam/truss type an Abaqus element type belongs to (B21H -> B21, T2D2T ->
+    T2D2), or None for any other element."""
+    base = typ.upper()
+    while base not in PLANAR_LINE_TYPES and len(base) > 1 and base[-1] in "HT":
+        base = base[:-1]
+    return base if base in PLANAR_LINE_TYPES else None
+
+
 # The COMPLETE set of CalculiX (ccx 2.22 + 2.23) input keywords, verified against the ccx
 # user manual (dhondt.de 2.22 PDF, 2.23 release notes) and the calculix/new_keywords +
 # calculix/cae keyword lists.  Any Abaqus keyword found here is emitted as-is (CalculiX
@@ -1458,6 +1481,11 @@ class Converter:
         self._general_step_seen = False
         self._cyclic_ok: set = set()
         self._temp_ic_fill = False
+        # planar 2-D beams/trusses: element -> its PLANAR_LINE_TYPES type, and the model-data
+        # *BOUNDARY lines that keep them in their plane (_plan_planar_constraint)
+        self._planar_elems: Dict[int, str] = {}
+        self._planar_others: List[str] = []
+        self._planar_bc: List[str] = []
         self._jc_with_rate: set = set()
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
@@ -2664,6 +2692,9 @@ class Converter:
                              "have no rotations (Abaqus ignores such BCs with a warning), but ccx "
                              "treats them as rotational constraints and 2.23 crashes (bus error) or "
                              "stops in usermpc.", once=True)
+        if self._planar_bc and (b.param("OP") or "").strip().upper() == "NEW":
+            # OP=NEW also removes the model-data planar constraint (verified on 2.23)
+            out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
         return out
 
     def _check_node_target(self, kw: str, spec: str) -> None:
@@ -3936,11 +3967,13 @@ class Converter:
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         self.build_geometry(blocks)
+        self._find_planar_elements()            # before the beam upgrades below retype them
         self._upgrade_section_beams(blocks)
         self._check_nonpositive_ids()
         self._check_overconstraints(blocks)
         self._prescan(blocks)
         self._check_undefined_materials(blocks)
+        self._plan_planar_constraint(blocks)
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
         # errors without the card) — handle_surface_interaction synthesizes HARD for these
         self._si_missing_behavior = set()
@@ -3960,6 +3993,9 @@ class Converter:
                 break
         out.extend(self.emit_geometry())
         out.extend(self._knot_section())
+        if self._planar_bc:
+            out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "
+                    "runs them as 3-D elements)"] + self._planar_bc
         out.extend(self.emit_other(blocks))
         return out
 
@@ -4662,6 +4698,264 @@ class Converter:
                              f"a {src} AND has a *BOUNDARY. CalculiX will stop with '*ERROR in cascade "
                              f"... dependent side of a MPC and a SPC'. Remove the BC or the constraint "
                              f"on that DOF.", once=True)
+
+    # ======================================================================
+    # Planar models: ccx runs 2-D beams and trusses as 3-D elements
+    # ======================================================================
+    def _find_planar_elements(self) -> None:
+        """Record the deck's planar beams/trusses (B21, T2D2, ...) and the element types that
+        keep the model from being planar — before the beam-section upgrades retype elements
+        (a B21 with a circular section becomes a B32 with a midside node)."""
+        self._planar_elems = {}
+        others: set = set()
+        for eid, (typ, _conn) in self.geom.elements.items():
+            base = planar_line_type(typ)
+            if base:
+                self._planar_elems[eid] = base
+            elif not typ.upper().startswith(PLANAR_COMPANION_PREFIXES):
+                others.add(typ.upper())
+        self._planar_others = sorted(others)
+
+    def _plan_planar_constraint(self, blocks: List[Block]) -> None:
+        """Keep a planar model's 2-D beams and trusses in their plane.  ccx runs them as 3-D
+        B31/B32/T3D2 elements whose out-of-plane motion nothing restrains (probed on 2.23):
+        every bending mode appears twice in *FREQUENCY, *BUCKLE finds out-of-plane buckling,
+        and a truss node is a mechanism (0 Hz modes; U3 is solver noise).  Fixing DOF 3 on
+        their nodes (midside nodes of upgraded beams included) leaves the in-plane response
+        unchanged (static, NLGEOM and *DYNAMIC to 6 digits).  The rotations are NOT fixed on
+        every node: that stiffens ccx's expanded beams (a circular-section B32's bending
+        frequencies 16x too high, a RECT B32 ~10 % too stiff) and changes *DYNAMIC results
+        (knots).  A straight beam whose twist nothing restrains (pinned supports, or the
+        U1/U2/UR3 clamp CAE writes) keeps a rigid twist mode — 0 Hz in *FREQUENCY, *BUCKLE
+        factors near 1, an NLGEOM step that stops converging (B31) — so DOFs 4-5 are fixed
+        at ONE of its nodes: one whose in-plane rotation is already fixed (no effect on any
+        section), else a support (no effect on B31, B32 RECT, B32R PIPE/BOX; on a node of a
+        circular section ccx 2.23 couples a DOF 4/5 BC into the bending rotation, so none
+        is added there).  Nodes whose DOF 3 a constraint drives, or under a *TRANSFORM
+        whose 3-axis is not z, are left out.  Fills ``self._planar_bc`` (model data;
+        handle_boundary repeats it after OP=NEW, which removes it)."""
+        self._planar_bc = []
+        planar = {e: t for e, t in self._planar_elems.items() if e in self.geom.elements}
+        if not planar:
+            return
+        kinds = ", ".join(sorted(set(planar.values())))
+        if self._planar_others:
+            more = ", ..." if len(self._planar_others) > 4 else ""
+            self.report.warn(f"2-D beam/truss elements ({kinds}) share the model with "
+                             f"{', '.join(self._planar_others[:4])}{more}: ccx runs them as 3-D "
+                             f"elements, and in a model that is not planar their out-of-plane DOFs "
+                             f"were left free — verify.", once=True)
+            return
+        nodes = dedup([n for e in planar for n in self.geom.elements[e][1] if n in self.geom.nodes])
+        if not nodes:
+            return
+        pts = [self.geom.nodes[n] for n in nodes]
+        extent = max(max(p[i] for p in pts) - min(p[i] for p in pts) for i in range(3))
+        zs = [p[2] for p in pts]
+        if max(zs) - min(zs) > 1e-6 * extent:
+            self.report.warn(f"2-D beam/truss elements ({kinds}) whose nodes are not in one plane "
+                             f"z = const (z from {min(zs):g} to {max(zs):g}): ccx runs them as 3-D "
+                             f"elements at the given z, while Abaqus' planar elements ignore z; "
+                             f"their out-of-plane DOFs were left free — verify.", once=True)
+            return
+        held = self._planar_held_nodes(blocks)
+        skew = self._planar_skew_nodes(blocks)
+        fixed = [n for n in nodes if n not in held and n not in skew]
+        twist, loose = ([], 0) if getattr(self.opt, "solid_dof", False) else \
+            self._planar_twist_nodes(blocks, planar, held)
+        left = len(nodes) - len(fixed)
+        why = (f"{left} node(s) whose DOF 3 an *EQUATION, *MPC, rigid body, coupling or *TIE "
+               f"drives, or under a *TRANSFORM whose 3-axis is not z, were left out")
+        if not fixed and not twist:
+            self.report.warn(f"Planar model: ccx runs the 2-D beams/trusses ({kinds}) as 3-D "
+                             f"elements, but no out-of-plane constraint could be added: {why}.",
+                             once=True)
+            return
+        self.geom.nsets[PLANAR_NODES_SET] = sorted(fixed)
+        self._planar_bc = ["*BOUNDARY"] + ([f"{PLANAR_NODES_SET}, 3, 3"] if fixed else []) + \
+            [f"{n}, 4, 5" for n in twist]
+        effects = ([] if set(planar.values()) <= PLANAR_TRUSS_TYPES else
+                   ["each bending mode would appear twice in *FREQUENCY and *BUCKLE could find "
+                    "out-of-plane buckling"]) + \
+                  (["truss nodes would be mechanisms (U3 solver noise, 0 Hz modes)"]
+                   if set(planar.values()) & PLANAR_TRUSS_TYPES else [])
+        self.report.note(f"Planar model: ccx runs the 2-D beams/trusses ({kinds}) as 3-D elements "
+                         f"(B21 as a B31, T2D2 as a T3D2), whose out-of-plane motion is free — "
+                         f"{'; '.join(effects)}. DOF 3 is fixed on their {len(fixed)} node(s) (node "
+                         f"set {PLANAR_NODES_SET}, model data, repeated after *BOUNDARY, OP=NEW), as "
+                         f"in Abaqus' planar model{'; ' + why if left else ''}.", once=True)
+        if twist:
+            shown = ", ".join(map(str, twist[:5])) + (", ..." if len(twist) > 5 else "")
+            self.report.note(f"The twist (rotation about the beam axis) of {len(twist)} straight 2-D "
+                             f"beam(s) was unrestrained — Abaqus' planar beams have no such DOF; in "
+                             f"ccx it is a 0 Hz *FREQUENCY mode, makes *BUCKLE factors meaningless "
+                             f"and can stop an NLGEOM step converging. DOFs 4-5 are fixed at node(s) "
+                             f"{shown}: one per beam, at a node whose in-plane rotation is already "
+                             f"fixed, else at a support.", once=True)
+        if loose:
+            self.report.warn(f"The twist (rotation about the beam axis) of {loose} straight 2-D "
+                             f"beam(s) is unrestrained — Abaqus' planar beams have no such DOF; ccx "
+                             f"shows a 0 Hz twist mode in *FREQUENCY and its *BUCKLE factors (near 1) "
+                             f"are meaningless. No BC was added: on a beam with a circular section "
+                             f"ccx 2.23 couples a DOF 4/5 BC into the bending rotation (probed: a "
+                             f"simply supported beam then deflects half as much), and ccx allows no "
+                             f"rotational BC on a node with a *TRANSFORM.", once=True)
+        if any(t not in PLANAR_TRUSS_TYPES for t in planar.values()) and \
+                any(b.keyword in ("FREQUENCY", "COMPLEX FREQUENCY") for b in blocks):
+            self.report.warn("*FREQUENCY on a planar beam model: ccx's 3-D beams keep their twist "
+                             "(rotation about the beam axis), so the eigenmodes include twist modes "
+                             "that Abaqus' planar beams cannot have — skip them when comparing "
+                             "frequencies (fixing the rotations on every node would stiffen ccx's "
+                             "expanded beams instead).", once=True)
+
+    def _planar_held_nodes(self, blocks: List[Block]) -> set:
+        """Nodes whose DOF 3 a ccx constraint may drive: the dependent term of an *EQUATION,
+        *MPC nodes, *RIGID BODY members, coupling reference and member nodes, *TIE slaves.
+        A *BOUNDARY on a dependent DOF stops ccx ('dependent side of a MPC and a SPC'), and
+        their out-of-plane motion follows the constraint."""
+        held: set = set()
+        for b in blocks:
+            kw = b.keyword
+            if kw == "EQUATION":
+                toks = [x for rec in merged_data_records(b) for x in rec if x != ""]
+                i = 0
+                while i + 3 < len(toks):                 # count, then node, DOF, coefficient, ...
+                    try:
+                        k, dof = pint(toks[i]), pint(toks[i + 2])
+                    except ValueError:
+                        break
+                    if dof == 3:
+                        held.update(self._resolve_nodes(toks[i + 1]))
+                    i += 1 + 3 * max(k, 1)
+            elif kw == "MPC":
+                for rec in merged_data_records(b):
+                    for tok in [x for x in rec if x != ""][1:]:
+                        held.update(self._resolve_nodes(tok))
+            elif kw == "RIGID BODY":
+                for k, v in b.params.items():
+                    key = k.replace(" ", "")
+                    if v and key in ("NSET", "PINNSET", "TIENSET"):
+                        held.update(self.geom.nset(v.strip()))
+                    elif v and key == "ELSET":
+                        for e in self.geom.elset(v.strip()):
+                            held.update(self.geom.elements[e][1] if e in self.geom.elements else [])
+            elif kw in ("COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
+                ref = (b.param("REF NODE") or b.param("REFNODE") or "").strip()
+                held.update(self._resolve_nodes(ref) if ref else [])
+                if kw == "COUPLING":
+                    held.update(self._surface_nodes((b.param("SURFACE") or "").strip()))
+                else:
+                    for rec in merged_data_records(b):
+                        if rec and rec[0].strip():
+                            held.update(self._resolve_nodes(rec[0].strip()))
+            elif kw == "TIE" or (kw == "CONTACT PAIR" and b.has("TIED")):
+                for rec in merged_data_records(b):
+                    if rec and rec[0].strip():
+                        held.update(self._surface_nodes(rec[0].strip()))
+        return held
+
+    def _planar_skew_nodes(self, blocks: List[Block]) -> set:
+        """Nodes under a *TRANSFORM whose local 3-axis is not the global z: ccx applies their
+        BCs in the local system, so DOF 3 there is not the out-of-plane direction."""
+        skew: set = set()
+        for b in blocks:
+            if b.keyword != "TRANSFORM":
+                continue
+            kind = (b.param("TYPE") or "R").strip().upper()
+            try:
+                v = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+            except ValueError:
+                v = []
+            axis: Optional[Vec] = None
+            if len(v) >= 6 and kind in ("R", "C"):     # R: a x b; C: the axis through a and b
+                a, c = (v[0], v[1], v[2]), (v[3], v[4], v[5])
+                axis = vcross(a, c) if kind == "R" else vsub(c, a)
+            if axis is None or vnorm(axis) == 0 or abs(axis[2]) < (1 - 1e-6) * vnorm(axis):
+                skew.update(self._resolve_nodes((b.param("NSET") or "").strip()))
+        return skew
+
+    def _bc_dofs_by_node(self, blocks: List[Block]) -> Dict[int, set]:
+        """Every DOF some *BOUNDARY (model data or any step) prescribes, per node."""
+        dofs: Dict[int, set] = {}
+        for b in blocks:
+            if b.keyword != "BOUNDARY":
+                continue
+            for rec in merged_data_records(b):
+                g = [x.strip() for x in rec]
+                while g and g[-1] == "":
+                    g.pop()
+                if len(g) < 2 or not g[0]:
+                    continue
+                if re.fullmatch(r"[-+]?\d+", g[1]):
+                    d1 = int(g[1])
+                    d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
+                    ds = set(range(min(d1, d2), max(d1, d2) + 1))
+                else:
+                    ds = {d for lo, hi in self._named_bc_dofs(g[1], True) or [] for d in range(lo, hi + 1)}
+                for n in self._resolve_nodes(g[0]):
+                    dofs.setdefault(n, set()).update(ds)
+        return dofs
+
+    def _planar_twist_nodes(self, blocks: List[Block], planar: Dict[int, str],
+                            held: set) -> Tuple[List[int], int]:
+        """For each straight 2-D beam (a connected set of planar beam elements on one line)
+        whose twist no BC restrains: the node to fix DOFs 4-5 at (see
+        _plan_planar_constraint).  Returns those nodes and the number of such beams with no
+        safe node.  Beams with constrained nodes are left alone (the constraint may hold
+        the twist); a beam that is not straight has no rigid twist once DOF 3 is fixed.
+        Nodes with a *TRANSFORM are never picked: ccx allows no rotational BC there."""
+        beams = [e for e, t in planar.items() if t not in PLANAR_TRUSS_TYPES]
+        root: Dict[int, int] = {}
+
+        def find(n: int) -> int:
+            root.setdefault(n, n)
+            while root[n] != n:
+                root[n] = root[root[n]]
+                n = root[n]
+            return n
+
+        for e in beams:
+            conn = self.geom.elements[e][1]
+            for n in conn[1:]:
+                root[find(n)] = find(conn[0])
+        groups: "OrderedDict[int, List[int]]" = OrderedDict()
+        for e in beams:
+            groups.setdefault(find(self.geom.elements[e][1][0]), []).append(e)
+        circ: set = set()
+        for b in blocks:
+            if b.keyword == "BEAM SECTION" and (b.param("SECTION") or "").strip().upper() == "CIRC":
+                circ.update(self.geom.elset((b.param("ELSET") or "").strip()))
+        bc = self._bc_dofs_by_node(blocks) if groups else {}
+        turned = {n for b in blocks if b.keyword == "TRANSFORM"
+                  for n in self._resolve_nodes((b.param("NSET") or "").strip())}
+        picks: List[int] = []
+        loose = 0
+        for elems in groups.values():
+            cn = dedup([n for e in elems for n in self.geom.elements[e][1] if n in self.geom.nodes])
+            if not cn or any(n in held for n in cn):
+                continue
+            p0 = self.geom.nodes[cn[0]]
+            far = max(cn, key=lambda n: vnorm(vsub(self.geom.nodes[n], p0)))
+            length = vnorm(vsub(self.geom.nodes[far], p0))
+            if length == 0:
+                continue
+            d = vscale(vsub(self.geom.nodes[far], p0), 1.0 / length)
+            if any(vnorm(vcross(vsub(self.geom.nodes[n], p0), d)) > 1e-6 * length for n in cn):
+                continue
+            # the twist is the rotation about d: DOF 4 alone holds it on a beam along x
+            if any({4, 5} <= ds or (4 in ds and abs(d[1]) < 1e-6) or (5 in ds and abs(d[0]) < 1e-6)
+                   for ds in (bc.get(n, set()) for n in cn)):
+                continue
+            cand = [n for n in cn if n not in turned and n not in self._ref_nodes]
+            clamped = [n for n in cand if 6 in bc.get(n, set())]
+            if clamped:
+                picks.append(clamped[0])
+            elif not cand or any(e in circ for e in elems):
+                loose += 1
+            else:
+                supports = [n for n in cand if bc.get(n, set()) & {1, 2, 3}]
+                picks.append(supports[0] if supports else min(cand))
+        return picks, loose
 
 
 def dedup_str(seq: Sequence[str]) -> List[str]:

@@ -206,6 +206,16 @@ def gen_elements():
                          f"2.23 runs only on `B32R`, beams whose emitted type is {b32r} become `B32R`: "
                          "the 2-node ones get a midside node in the same way, and `B32` only changes "
                          "type.\n")
+            planar = ", ".join(f"`{t}`" for t in sorted(A.PLANAR_LINE_TYPES))
+            parts.append("ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as "
+                         f"`T3D2` — so the out-of-plane DOFs of {planar} (and their `H`/`T` variants) "
+                         "are free in ccx. In a planar model (no 3-D elements, all their nodes at one "
+                         "z) the converter fixes DOF 3 on their nodes, midside nodes included (node set "
+                         f"`{A.PLANAR_NODES_SET}`, model data, repeated after `*BOUNDARY, OP=NEW`), and "
+                         "DOFs 4-5 at one node of a straight beam whose twist nothing restrains. The "
+                         "rotations are not fixed on every node (that stiffens ccx's expanded beams), so "
+                         "`*FREQUENCY` results include twist modes that Abaqus' planar beams do not "
+                         "have (warned).\n")
     return "\n".join(parts)
 
 

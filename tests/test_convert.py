@@ -1568,6 +1568,153 @@ def test_coupling_plate_examples():
     assert not dangling_refs(g), dangling_refs(g)
 
 
+PLANAR_BEAM = """*Node
+1, 0., 0.
+2, 1., 0.
+3, 2., 0.
+4, 3., 0.
+*Element, type=B21, elset=BEAM
+1, 1, 2
+2, 2, 3
+3, 3, 4
+*Beam Section, elset=BEAM, material=M, section=RECT
+0.1, 0.2
+*Material, name=M
+*Elastic
+2.1e5, 0.3
+*Density
+7.85e-9
+*Step
+*Frequency
+5
+*Boundary
+1, ENCASTRE
+*End Step
+"""
+
+
+def test_planar_line_types():
+    assert [A.planar_line_type(t) for t in ("B21", "b21h", "B22H", "B23", "PIPE21H", "PIPE22",
+                                            "T2D2", "T2D2T", "T2D3H")] == \
+        ["B21", "B21", "B22", "B23", "PIPE21", "PIPE22", "T2D2", "T2D2", "T2D3"]
+    assert {A.planar_line_type(t) for t in ("B31", "B32", "T3D2", "PIPE31", "CPS4", "S4R")} == {None}
+
+
+def test_planar_beams_fix_out_of_plane_dof():
+    # ccx runs B21 as a 3-D B31 (T2D2 as a T3D2): with DOF 3 free each bending mode of a
+    # planar beam shows up twice in *FREQUENCY, and a truss node is a mechanism
+    body, _, rep = convert_str(PLANAR_BEAM)
+    model = body.split("*STEP")[0]                                 # model data
+    assert "*NSET, NSET=ABQ2CCX_PLANAR, GENERATE\n1, 4, 1\n" in model
+    assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n*BEAM SECTION" in model
+    assert ", 4, 5\n" not in body                       # ENCASTRE (DOFs 1-6) holds the twist
+    assert "DOF 3 is fixed on their 4 node(s)" in rep.text()
+    assert "eigenmodes include twist modes" in rep.text()
+    # the other 2-D beams and trusses (B23 -> B33 -> B31, PIPE21 -> B21, ...) alike
+    for typ in ("B21H", "B23", "PIPE21"):
+        body, _, _ = convert_str(PLANAR_BEAM.replace("type=B21", f"type={typ}"))
+        assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n" in body, typ
+    body, conv, _ = convert_str(PLANAR_BEAM.replace("1, 1, 2\n2, 2, 3\n3, 3, 4\n", "1, 1, 2, 3\n")
+                                .replace("type=B21", "type=B22"))
+    assert "*ELEMENT, TYPE=B32\n1, 1, 2, 3\n" in body and conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2, 3]
+    truss = PLANAR_BEAM.replace("type=B21", "type=T2D2").replace(
+        "*Beam Section, elset=BEAM, material=M, section=RECT\n0.1, 0.2",
+        "*Solid Section, elset=BEAM, material=M\n0.01").replace("1, ENCASTRE", "1, 1, 2\n4, 2, 2")
+    body, _, rep = convert_str(truss)
+    assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n*SOLID SECTION" in body and ", 4, 5\n" not in body
+    assert "twist" not in rep.text()                    # a truss carries no twist
+    # 3-D beams are left as they are
+    body, _, rep = convert_str(CIRC_BEAM)
+    assert "ABQ2CCX_PLANAR" not in body and "lanar" not in rep.text()
+
+
+def test_planar_constraint_reaches_upgraded_midside_nodes():
+    # a B21 under a circular section becomes a B32 with midside nodes 5-7 (ccx 2.23 rejects
+    # linear CIRC beams); they would move out of plane just the same
+    body, conv, _ = convert_str(PLANAR_BEAM.replace("section=RECT\n0.1, 0.2", "section=CIRC\n0.05"))
+    assert "*ELEMENT, TYPE=B32\n1, 1, 5, 2\n" in body
+    assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2, 3, 4, 5, 6, 7]
+    assert "*NSET, NSET=ABQ2CCX_PLANAR, GENERATE\n1, 7, 1\n" in body
+
+
+def test_planar_straight_beam_twist_held_at_one_node():
+    # pinned supports leave the twist of a straight beam free in ccx (a 0 Hz mode, *BUCKLE
+    # factors ~1): DOFs 4-5 are fixed at one support...
+    pinned = PLANAR_BEAM.replace("1, ENCASTRE", "1, 1, 2\n4, 2, 2")
+    body, _, rep = convert_str(pinned)
+    assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n1, 4, 5\n*BEAM SECTION" in body
+    assert "DOFs 4-5 are fixed at node(s) 1" in rep.text()
+    # ... preferably where the in-plane rotation is already fixed (CAE's U1, U2, UR3 clamp)
+    clamped = PLANAR_BEAM.replace("1, ENCASTRE", "1, 1, 2\n4, 1, 2\n4, 6, 6")
+    body, _, _ = convert_str(clamped)
+    assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body
+    # ... and never at a node with a *TRANSFORM (ccx allows no rotational BC there)
+    body, _, _ = convert_str(pinned.replace("*Step", "*Nset, nset=TURN\n1\n*Transform, nset=TURN\n"
+                                            "1., 1., 0., -1., 1., 0.\n*Step", 1))
+    assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body
+    # on a circular section ccx 2.23 couples a DOF 4/5 BC into the bending rotation: only
+    # at a node whose in-plane rotation is fixed anyway, else a warning
+    circ = "section=CIRC\n0.05"
+    body, _, _ = convert_str(clamped.replace("section=RECT\n0.1, 0.2", circ))
+    assert "ABQ2CCX_PLANAR, 3, 3\n4, 4, 5\n" in body
+    body, _, rep = convert_str(pinned.replace("section=RECT\n0.1, 0.2", circ))
+    assert ", 4, 5\n" not in body and "of 1 straight 2-D beam(s) is unrestrained" in rep.text()
+    # a frame that is not straight has no rigid twist once DOF 3 is fixed
+    frame = PLANAR_BEAM.replace("3, 2., 0.\n4, 3., 0.", "3, 2., 1.\n4, 2., 2.").replace(
+        "1, ENCASTRE", "1, 1, 2\n4, 1, 2")
+    body, _, rep = convert_str(frame)
+    assert "ABQ2CCX_PLANAR, 3, 3\n*BEAM SECTION" in body and "DOFs 4-5" not in rep.text()
+
+
+def test_planar_constraint_skips_constrained_and_skewed_nodes():
+    # a DOF-3 BC on the dependent term of an *EQUATION stops ccx ('dependent side of a MPC
+    # and a SPC'); a *TRANSFORM that tilts the local 3-axis out of z makes DOF 3 another
+    # direction; one rotating about z keeps it
+    deck = PLANAR_BEAM.replace("*Step", "*Equation\n2\n4, 3, 1., 3, 3, -1.\n"
+                               "*Nset, nset=TILT\n2\n*Transform, nset=TILT\n1., 0., 0., 0., 1., 1.\n"
+                               "*Nset, nset=TURN\n3\n*Transform, nset=TURN\n1., 1., 0., -1., 1., 0.\n"
+                               "*Step", 1)
+    _, conv, rep = convert_str(deck)
+    assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 3]
+    assert "2 node(s) whose DOF 3 an *EQUATION" in rep.text()
+    # *MPC nodes and rigid-body members likewise
+    _, conv, _ = convert_str(PLANAR_BEAM.replace("*Step", "*MPC\nTIE, 4, 3\n*Step", 1))
+    assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2]
+    _, conv, _ = convert_str(PLANAR_BEAM.replace("*Step", "*Node\n5, 4., 0.\n*Nset, nset=RB\n3, 4\n"
+                                                 "*Rigid Body, ref node=5, tie nset=RB\n*Step", 1))
+    assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2]
+
+
+def test_planar_constraint_repeated_after_op_new():
+    # *BOUNDARY, OP=NEW removes the model-data constraint as well (verified on ccx 2.23)
+    deck = PLANAR_BEAM.replace("*End Step\n", "*End Step\n*Step\n*Static\n*Boundary, op=NEW\n"
+                                              "1, ENCASTRE\n*Cload\n4, 2, -1.\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    first, second = body.split("*STEP")[1:]
+    assert "ABQ2CCX_PLANAR" not in first
+    assert "*BOUNDARY, OP=NEW\n1, 1, 6\n** [abq2ccx] planar constraint re-applied (OP=NEW removed " \
+           "it)\n*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n*CLOAD" in second
+
+
+def test_planar_constraint_needs_a_planar_model():
+    # among 3-D elements, or off a z = const plane, a 2-D beam is left as ccx runs it
+    body, _, rep = convert_str(PLANAR_BEAM.replace("*Beam Section", "*Element, type=C3D8, elset=BLK\n"
+                                                   "9, 1, 2, 3, 4, 1, 2, 3, 4\n*Beam Section"))
+    assert "ABQ2CCX_PLANAR" not in body and "share the model with C3D8" in rep.text()
+    body, _, rep = convert_str(PLANAR_BEAM.replace("4, 3., 0.", "4, 3., 0., 0.5"))
+    assert "ABQ2CCX_PLANAR" not in body and "not in one plane z = const" in rep.text()
+
+
+def test_planar_pinned_beam_example():
+    body, _, _ = convert(os.path.join(EXAMPLES, "planar_pinned_beam.inp"))
+    g = reparse(body)
+    assert [t for t, _ in g.elements.values()] == ["B21"] * 20 and len(g.nodes) == 21
+    # DOF 3 on all 21 nodes, the twist held at the pinned end, ahead of the steps
+    assert g.nset("ABQ2CCX_PLANAR") == list(range(1, 22))
+    assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n1, 4, 5\n" in body.split("*STEP")[0]
+    assert not dangling_refs(g), dangling_refs(g)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

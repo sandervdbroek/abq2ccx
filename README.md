@@ -95,6 +95,7 @@ PASS  beam_circ_cantilever (B31 + CIRC): tip deflection = -4.2290 (beam theory -
 PASS  beam_pipe_box_cantilever (PIPE31 + PIPE): tip deflection y = -7.1490 (beam theory -7.1886, 0.6% diff)
 PASS  beam_pipe_box_cantilever (B32 + BOX): tip deflection y = -1.7898 (beam theory -1.7887, 0.1% diff), z = -4.5091 (beam theory -4.5265, 0.4% diff)
 PASS  coupling_shell_plate (rigid coupling on S8R nodes): RP displacement (-0.1025, +0.0191, +1.7152) vs the solid *Rigid Body (-0.1025, +0.0191, +1.7152), 0.001% of |u|
+PASS  planar_pinned_beam (B21): f1, f2 = 93.67, 373.02 Hz (beam theory 93.81, 375.25), buckling load 220545 (Euler 221079); max 0.6% diff
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -113,7 +114,11 @@ misread box dimension would miss beam theory by 18 % or more. The fourth couples
 plate's edge rigidly to an offset reference point that carries a force and a moment (a
 coupling ccx 2.23 rejects on shell nodes without the converter's knot beams) and compares
 the reference point's displacement with the same plate built from `C3D20R` bricks under
-`*RIGID BODY`.
+`*RIGID BODY`. The fifth runs a planar `B21` beam on pinned supports through a frequency
+and a buckling step and compares the first two frequencies and the buckling load with beam
+theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar constraint:
+without it ccx reports 0 Hz modes (the free twist and the unsupported out-of-plane motion)
+and a buckling factor of 1.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -268,6 +273,18 @@ pressure-face labels (`P1..P6`) carry across unchanged. Element handling:
   midpoint; element ids and sets are kept. Under `SECTION=PIPE`, `BOX` or `THICK PIPE`, which
   ccx 2.23 runs only on `B32R`, `B21`/`B31`/`B31R` become `B32R` the same way and `B32` →
   `B32R` keeps its nodes.
+* **Planar models**: ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as
+  `T3D2`, and the other 2-D types map onto 3-D ones — so their out-of-plane motion is free
+  (each bending mode twice in `*FREQUENCY`, out-of-plane `*BUCKLE` modes, truss nodes that are
+  mechanisms). When the model is planar (2-D beams/trusses, no 3-D elements, all their nodes at
+  one z) the converter fixes DOF 3 on their nodes, midside nodes of upgraded beams included
+  (node set `ABQ2CCX_PLANAR`, model data, repeated after `*BOUNDARY, OP=NEW`), leaving out nodes
+  that an `*EQUATION`, `*MPC`, rigid body, coupling or `*TIE` drives. A straight beam whose
+  twist nothing restrains (pinned supports, or CAE's U1/U2/UR3 clamp) also gets DOFs 4–5 fixed
+  at one node; otherwise its twist is a 0 Hz mode and `*BUCKLE` factors are meaningless — on a
+  circular section, where ccx 2.23 couples that BC into the bending rotation, this is only
+  warned. The rotations are not fixed everywhere (that stiffens ccx's expanded beams), so
+  `*FREQUENCY` results also contain twist modes, which Abaqus' planar beams cannot have (warned).
 * **Best-effort approximation** (node-count preserving, *strong* warning — behaviour lost):
   cohesive `COH*` and gasket `GK*` → the matching thin continuum (`COH3D8→C3D8`,
   `COH2D4→CPE4`, `GK3D8→C3D8`, …), with `*COHESIVE/GASKET SECTION → *SOLID SECTION`.
@@ -375,6 +392,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/beam_pipe_box_cantilever.inp`](examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` → `B32R` with midside nodes, `B32` + `SECTION=BOX` → `B32R`, biaxial tip load |
 | [`examples/coupling_shell_plate.inp`](examples/coupling_shell_plate.inp) | `S8R` edge `*Coupling`+`*Kinematic` to a loaded reference point → knot beams + rotation ties, `*NGEN`/`*NFILL`/`*ELGEN` |
 | [`examples/coupling_solid_plate.inp`](examples/coupling_solid_plate.inp) | its `C3D20R` + `*Rigid Body, TIE NSET` reference, `*NCOPY` |
+| [`examples/planar_pinned_beam.inp`](examples/planar_pinned_beam.inp) | planar `B21` beam on pinned supports: DOF 3 fixed on its nodes and the twist at the pin, `*FREQUENCY` + `*BUCKLE` |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

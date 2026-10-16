@@ -20,6 +20,7 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **A keyword line ending in a comma continues its *parameters* on the next line** | splice them back; never merge a genuine data row | Abaqus input syntax: "continue a long keyword line by ending it with a comma" |
 | **`NSET=` on `*NODE`, `ELSET=` on `*ELEMENT`, `GENERATE` on `*NSET`/`*ELSET`** are accepted | relied upon when emitting geometry | ccx `*NODE`/`*ELEMENT`/`*NSET`/`*ELSET` sections |
 | **`*EQUATION`/`*MPC` dependent DOF can't also be an SPC** | pre-flight overconstraint warning | ccx `*EQUATION` section; the `cascade` error on the forums |
+| **ccx has no planar beam or truss**: `B21` "is internally replaced by a B31 element", `T2D2` by a `T3D2`, so their out-of-plane DOFs are free; a rotational BC on every node of an expanded beam stiffens it | in a planar model, fix DOF 3 on the nodes of 2-D beams/trusses, and DOFs 4–5 at one node of a straight beam whose twist is free (twist modes stay in `*FREQUENCY`, warned) | ccx manual 6.2.31, 6.2.34; probed on 2.23 (`B21` frequency deck: every bending mode twice) |
 
 ## Version notes
 
@@ -56,8 +57,9 @@ line with the element type and mesh density). A cantilever on linear beams with 
 circular section matches beam theory's tip deflection within 0.4 %, pipe- and
 box-section cantilevers match it within 0.6 %, a shell plate whose edge is rigidly coupled
 to a loaded reference point matches the same plate built from solids under `*RIGID BODY`
-within 0.001 %, and the composite-shell and assembly decks also solve. This proves the
-full pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face,
+within 0.001 %, a planar `B21` beam's frequencies and buckling load match beam theory
+within 0.6 %, and the composite-shell and assembly decks also solve. This proves the full
+pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face,
 sections — is correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on

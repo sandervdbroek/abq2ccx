@@ -5,8 +5,8 @@ This is the proof that the converter produces *runnable, correct* CalculiX input
 just structurally-valid text.  It auto-detects a ``ccx`` binary (including the one
 bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
 stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
-theory, and a shell plate rigidly coupled to a loaded reference point against the same
-plate built from solids.
+theory, a shell plate rigidly coupled to a loaded reference point against the same plate
+built from solids, and the natural frequencies and buckling load of a planar (B21) beam.
 
     python validate_with_ccx.py
 
@@ -107,6 +107,27 @@ def dat_displacement(dat_path, node):
         elif inblock and f and not f[0].isdigit():
             inblock = False
     return found
+
+
+def dat_eigen_table(dat_path, title):
+    """The rows of the first eigenvalue table titled ``title`` in a ccx .dat file: the
+    frequencies (cycles/time) under "E I G E N V A L U E   O U T P U T", or the factors
+    under "B U C K L I N G   F A C T O R   O U T P U T"."""
+    if not os.path.exists(dat_path):
+        return []
+    rows, inblock = [], False
+    for ln in open(dat_path):
+        if title in ln:
+            inblock = True
+            continue
+        f = ln.split()
+        if not inblock or not f:
+            continue
+        if f[0].isdigit() and len(f) in (2, 5):
+            rows.append(float(f[3] if len(f) == 5 else f[1]))
+        elif rows:
+            break
+    return rows
 
 
 def main():
@@ -212,6 +233,33 @@ def main():
               f"displacement ({us[0]:+.4f}, {us[1]:+.4f}, {us[2]:+.4f}) vs the solid *Rigid Body "
               f"({ur[0]:+.4f}, {ur[1]:+.4f}, {ur[2]:+.4f}), {err * 100:.3f}% of |u|")
         failures += 0 if ok else 1
+
+    # --- planar beam on pinned supports: frequencies and buckling vs beam theory ----------
+    # ccx runs B21 as a 3-D B31, so this checks the planar constraint: DOF 3 fixed on every
+    # node (otherwise nothing holds the beam in its plane) and DOFs 4-5 at the pinned end
+    # (otherwise the free twist is a 0 Hz mode and the buckling factor meaningless).
+    inp = os.path.join(tmp, "planar.inp")
+    convert(os.path.join(EXAMPLES, "planar_pinned_beam.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    ei, length = 210000.0 * 20.0 * 40.0 ** 3 / 12, 1000.0                # in-plane E I
+    c = math.sqrt(ei / (7.85e-9 * 20.0 * 40.0)) * math.pi / (2 * length ** 2)
+    refs = [c, 4 * c, math.pi ** 2 * ei / length ** 2]                     # f1, f2, Euler load
+    dat = os.path.join(d, "job.dat")
+    got = (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")[:2]
+           + dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")[:1]) \
+        if status == "solved" else []
+    if len(got) < 3:
+        print(f"FAIL  planar_pinned_beam: no frequencies / buckling factor ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        diffs = [abs(g - r) / r for g, r in zip(got, refs)]
+        ok = max(diffs) < 0.02
+        print(f"{'PASS' if ok else 'FAIL'}  planar_pinned_beam (B21): f1, f2 = {got[0]:.2f}, "
+              f"{got[1]:.2f} Hz (beam theory {refs[0]:.2f}, {refs[1]:.2f}), buckling load "
+              f"{got[2]:.0f} (Euler {refs[2]:.0f}); max {max(diffs) * 100:.1f}% diff")
+        failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

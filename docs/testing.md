@@ -5,8 +5,8 @@ The converter has three layers of tests:
 1. **Unit tests** — fast, no solver needed, run on small controlled fixtures and the
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
-   CalculiX, checking the NAFEMS LE10 benchmark and circular-, pipe- and box-section
-   cantilevers numerically.
+   CalculiX, checking the NAFEMS LE10 benchmark, circular-, pipe- and box-section
+   cantilevers, and a planar beam's frequencies and buckling load numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -20,7 +20,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (127)
+## 1. Unit tests — `tests/test_convert.py` (135)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -154,6 +154,14 @@ conversion behaviour and referential integrity.
 | `test_beam_pipe_box_cantilever_example` | the bundled pipe/box cantilevers convert to 40 `B32R` (the `PIPE31` beams with midside nodes, the `B32` beams on their own nodes) with both data lines unchanged, no dangling refs |
 | `test_beam_circ_cantilever_example` | the bundled CIRC cantilever converts to 20 `B32` with midside nodes and diameters, no dangling refs |
 | `test_coupling_plate_examples` | the `coupling_shell_plate`/`coupling_solid_plate` validation pair: 9 knot beams and 27 rotation ties on the `S8R` edge, none for the `C3D20R` reference; no dangling refs |
+| `test_planar_line_types` | `planar_line_type()` maps the Abaqus 2-D beams/trusses and their `H`/`T` variants (`B21H` → `B21`, `T2D2T` → `T2D2`, `PIPE22`, …) and nothing else (`B31`, `T3D2`, `CPS4`, …) |
+| `test_planar_beams_fix_out_of_plane_dof` | a planar `B21` model gets node set `ABQ2CCX_PLANAR` with DOF 3 fixed in model data ahead of the steps (ccx runs `B21` as a 3-D `B31`, so each bending mode would appear twice); `B21H`, `B23`, `PIPE21`, `B22` and `T2D2` trusses alike; `ENCASTRE` already holds the twist; `*FREQUENCY` warns that twist modes remain; 3-D beams are left alone |
+| `test_planar_constraint_reaches_upgraded_midside_nodes` | a `B21` under `SECTION=CIRC` (→ `B32`) has its inserted midside nodes in the planar set |
+| `test_planar_straight_beam_twist_held_at_one_node` | a straight beam on pinned supports gets DOFs 4–5 at one support (its twist is otherwise a 0 Hz mode); with CAE's U1/U2/UR3 clamp, at the clamped node, for a circular section too; a pinned circular-section beam gets none (ccx 2.23 couples a DOF 4/5 BC into its bending rotation) and a warning; a frame that is not straight needs none |
+| `test_planar_constraint_skips_constrained_and_skewed_nodes` | nodes whose DOF 3 is the dependent term of an `*EQUATION` (an SPC there stops ccx), `*MPC` nodes, rigid-body members and nodes under a `*TRANSFORM` whose 3-axis is not z are left out; a transform about z is kept |
+| `test_planar_constraint_repeated_after_op_new` | a `*BOUNDARY, OP=NEW` step repeats the planar constraint (OP=NEW removes model-data BCs too) |
+| `test_planar_constraint_needs_a_planar_model` | `B21` among 3-D elements, or with nodes off one z plane, gets no constraint and a warning |
+| `test_planar_pinned_beam_example` | the bundled planar beam converts to 20 `B21` with DOF 3 on all 21 nodes and DOFs 4–5 at the pinned end, ahead of the steps, no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -181,6 +189,12 @@ deck and runs it in CalculiX:
   one through the thickness, the brick ccx expands an `S8R` into — under `*RIGID BODY`.
   The reference-point displacements must agree within 0.5 % of |u| (they agree to
   0.001 %).
+* **`planar_pinned_beam`** — a simply supported `B21` beam (rectangular section) with a
+  `*FREQUENCY` and a `*BUCKLE` step. ccx runs `B21` as a 3-D `B31`, so this
+  checks the planar constraint: the first two frequencies against beam theory, 93.67 and
+  373.02 Hz vs 93.81 and 375.25 Hz (0.6 %), and the buckling load against Euler's,
+  220545 vs 221079 (0.2 %). Without the constraint ccx reports 0 Hz modes (the free twist
+  and the unsupported out-of-plane motion) and a buckling factor of 1, and the check fails.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -303,6 +317,35 @@ dynamics ("linear and nonlinear MPC's depend on each other", with or without the
 beams), and coupled DOFs that also carry a `*BOUNDARY` — `dheller1_uprofile` now passes
 the gen3dmpc check but stops on that overconstraint, which Abaqus resolves and ccx does
 not.
+
+**Planar beams and trusses.** ccx has no planar beam or truss: it runs `B21` "as a B31" and
+`T2D2` as a `T3D2` (manual 6.2.31, 6.2.34), and the converter maps the other 2-D types onto
+3-D ones, so nothing holds them in their plane. The `B21` frequency deck reported every
+bending mode twice (13.59/13.59, 85.05/85.05, 237.7/237.7 Hz, …), and in the seven `T2D2`
+truss decks the out-of-plane displacement was solver noise of the size of the in-plane one
+(up to 34 times it); given a density, one of them showed a 0 Hz mode per node. The converter
+now fixes DOF 3 on the nodes of 2-D beams and trusses in a planar model (model data,
+repeated after `*BOUNDARY, OP=NEW`, which removes it). The frequency deck then gives each
+bending mode once — 13.59, 85.05, 237.65, 464.3 Hz against Euler–Bernoulli's 13.52, 84.70,
+237.2, 464.8 — plus the 748.9 Hz twist mode, which Abaqus' planar beam cannot have and which
+is warned; the truss decks' in-plane displacements are unchanged to 1e-15 and their U3 is
+zero. All 14 corpus decks with 2-D elements keep their verdict (8 solve, 2 accepted, 4
+failing as before), and every other corpus deck converts byte-identically. A portal frame
+(`B21`, fixed bases, 10 elements per member) matches a 2-D Euler–Bernoulli frame solution:
+sway deflection 1.2343 vs 1.2456, frequencies 14.95, 43.85, 97.28, 103.65 Hz vs 14.89,
+43.62, 97.48, 103.38, buckling factor 107.1 vs 106.3 — where the unconstrained deck put
+out-of-plane modes first (4.7 Hz, factor 9.8). The rotations are not fixed on every node:
+probed on 2.23, that raises the bending frequencies of a `B32` beam with a circular section
+16-fold, makes a rectangular one about 10 % stiffer, and changes a `B31` beam's `*DYNAMIC`
+response by 3.6 % (knots). The twist needs one BC, though: a straight beam whose twist
+nothing restrains (pinned supports, or CAE's U1/U2/UR3 clamp) has a 0 Hz twist mode and
+meaningless `*BUCKLE` factors (about 1), and under NLGEOM a pinned `B31` beam stopped
+converging ("increment size smaller than minimum"; with the BC its large deflection matches
+the elastica). So DOFs 4–5 are fixed at one of its nodes — one whose in-plane rotation is
+already fixed, else a support; on a circular section ccx 2.23 couples such a BC into the
+bending rotation (a simply supported beam then deflects half as much), so there it is only
+warned. `validate_with_ccx.py` checks a pinned planar beam's frequencies and buckling load
+against beam theory.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
