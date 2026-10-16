@@ -2543,8 +2543,15 @@ class Converter:
         # and the rigid bodies of the BEAM lines by the card they are emitted with
         self._mpc_plan: Dict[Tuple[int, int], Tuple[str, object]] = {}
         self._mpc_bodies: Dict[int, List[dict]] = {}
+        # (id(card), line) -> [(why, node pair)] for the line's pairs that are commented out
+        self._mpc_refused: Dict[Tuple[int, int], List[Tuple[str, Tuple[int, int]]]] = {}
         self._mpc_thermal = False                  # a step solves for temperatures
         self._mpc_mechanical = True                # ... for displacements
+        # node with a *TRANSFORM -> its twin: a new node without one that follows it (u_twin =
+        # u_node), through which a constraint uses the node's global displacement (_dir_terms);
+        # the twins whose equations are written
+        self._twins: "OrderedDict[int, int]" = OrderedDict()
+        self._twins_out: set = set()
         self._gen_ties: set = set()                # the rotation ties the converter writes
         # explicit dynamics with circular-section beams (_plan_circ_explicit_increment): the
         # smallest min(element length, d / sqrt(2)) / wave speed and its element, and the
@@ -8073,14 +8080,31 @@ class Converter:
           elements;
         * BEAM (rigid beam: displacements AND rotations) -> one *RIGID BODY per independent
           node, emitted at the card where its first line appears;
-        * user MPCs (a numeric type) and the other Abaqus types are commented out."""
+        * user MPCs (a numeric type) and the other Abaqus types are commented out.
+
+        PIN, TIE and LINK constrain the global displacements in Abaqus, also on a node with a
+        *TRANSFORM, where ccx reads *EQUATION terms in the node's local axes: their equations
+        are written there (_tie_rows, _link_terms), without the node pairs _plan_mpc_transforms
+        refuses (undefined local axes, a TIE's rotations on a transformed shell/beam node);
+        ccx's *MPC BEAM (a LINK under NLGEOM) is not affected by a transform (probed)."""
         native: List[str] = []
         eqs: List[str] = []
         skipped: "OrderedDict[str, List[str]]" = OrderedDict()     # reason -> lines
+        local = False
         for i, f in enumerate(self._mpc_fields(b)):
             typ = f[0].upper()
             line = ", ".join(f)
             mode, arg = self._mpc_plan.get((id(b), i), (None, None))
+            if mode != "skip" and (id(b), i) in self._mpc_refused:
+                # some node pairs of the line cannot be written (_plan_mpc_transforms)
+                groups: "OrderedDict[str, List[Tuple[int, int]]]" = OrderedDict()
+                for why, pair in self._mpc_refused[(id(b), i)]:
+                    groups.setdefault(why, []).append(pair)
+                for why, pairs in groups.items():
+                    listing = ", ".join(f"({p}, {q})" for p, q in pairs)
+                    skipped.setdefault(f"{why}; node pair(s) {listing} of this line commented "
+                                       f"out — their constraint is missing (its other pairs are "
+                                       f"converted).", []).append(line)
             if typ in ("PLANE", "STRAIGHT") and not b.has("USER"):
                 native.append(line)
             elif re.fullmatch(r"[-+]?\d+", typ) or b.has("USER"):
@@ -8095,22 +8119,30 @@ class Converter:
                                    []).append(line)
             elif mode == "beam":
                 continue                    # part of a *RIGID BODY (self._mpc_bodies)
+            elif mode == "link-none":
+                self.report.note("*MPC LINK keeps a distance; a heat-transfer-only deck has no "
+                                 "displacements, so it was left out.", once=True)
             elif mode == "link-mpc":
                 native += [f"BEAM, {dep}, {ind}" for dep, ind in arg]
             elif mode == "link-eq":
-                self._warn_transformed_mpc(arg)
                 for dep, ind in arg:
                     eqs += self._link_equation(dep, ind)
+                    local = local or dep in self._transformed or ind in self._transformed
             else:                           # PIN / TIE
-                self._warn_transformed_mpc(arg)
                 for dep, ind in arg:
                     both = all(n in self._knots and n in self._rot_nodes for n in (dep, ind))
                     dofs = ((1, 2, 3, 4, 5, 6) if typ == "TIE" and both and self._tie_rotations
                             else (1, 2, 3)) if self._mpc_mechanical else ()
                     if typ == "TIE" and self._mpc_thermal:
                         dofs += (11,)
+                    # the displacements in the local DOFs of nodes with a *TRANSFORM
+                    rows = self._tie_rows(dep, ind) if self._mpc_mechanical else None
+                    if rows is not None:
+                        eqs += self._twin_lines(rows) + self._equation_lines(rows)
+                        local = True
                     for d in dofs:
-                        eqs += ["*EQUATION", "2", f"{dep}, {d}, 1., {ind}, {d}, -1."]
+                        if rows is None or d > 3:
+                            eqs += ["*EQUATION", "2", f"{dep}, {d}, 1., {ind}, {d}, -1."]
                     if typ == "TIE" and not both and any(n in self._rot_nodes for n in (dep, ind)):
                         self.report.warn("*MPC TIE between a shell/beam node and a node without "
                                          "rotations (solid or free node): only the displacements "
@@ -8125,6 +8157,8 @@ class Converter:
                                      "*MPC TIE -> per-DOF *EQUATION (exact): displacements, the "
                                      "rotations of two shell/beam nodes (made ccx knots for it) "
                                      "and the temperature in thermal steps.", once=True)
+        if local:
+            self._note_transformed_mpc()
         out: List[str] = []
         for line in native:                 # one card per MPC (see above)
             out += ["*MPC", line]
@@ -8155,7 +8189,7 @@ class Converter:
                 skipped.setdefault(it["reason"], []).append(it)
             elif it["route"] == "link":
                 out += ["*MPC", f"BEAM, {it['b']}, {it['a']}"] if it["link"] == "link-mpc" else \
-                    self._link_equation(it["b"], it["a"], local=True)
+                    self._link_equation(it["b"], it["a"])
                 local = local or (it["link"] == "link-eq" and any(
                     n in self._transformed for n in (it["a"], it["b"])))
             elif it["route"] == "rows":
@@ -8192,6 +8226,7 @@ class Converter:
                              "and *BOUNDARY lines there, and a rotation on its rotation node's DOFs "
                              "in that node's local axes (probed on 2.23: the same results as the "
                              "model without the *TRANSFORM, linear and NLGEOM).", once=True)
+            self._note_twins()
         if approx:
             self.report.warn("[APPROX] Connector under NLGEOM written in its linear form: a "
                              "REVOLUTE / ALIGN between two moving nodes, or a JOIN offset that "
@@ -8207,35 +8242,185 @@ class Converter:
                                    reason, reduces=not (reason.startswith("Connector element on an undefined node") or "is a 3-D connection type" in reason))
         return out
 
-    def _warn_transformed_mpc(self, pairs: Sequence[Tuple[int, int]]) -> None:
-        if any(n in self._transformed for p in pairs for n in p):
-            self.report.warn("*MPC on a node with a *TRANSFORM: ccx reads the DOFs of the "
-                             "*EQUATION it becomes in the node's local axes — verify that the "
-                             "constraint acts in the directions intended.", once=True)
-            self._reduces("*MPC on a *TRANSFORM node")
+    # -- *EQUATION terms on nodes with a *TRANSFORM ---------------------------------
+    # ccx (like Abaqus) reads an *EQUATION term on DOF 1-3 of a node with a *TRANSFORM as a
+    # local DOF j and expands it into the global DOFs g of e_j whose component is 1e-5 or more
+    # (equations.f).  ccx 2.23 mis-assembles an equation that then holds a global DOF twice —
+    # several local terms of one node do that — unless a substitution of another MPC into it
+    # first merges the repeats (cascade.c): the stiffness of its eliminated DOF is spread over
+    # the repeated terms with each cross term counted once (probed: an untransformed equation
+    # with a term split in two halves is 100 % off, the constraint itself still holds).  So an
+    # *MPC equation holds a node's local terms only where no two of them share a global DOF —
+    # one local term, or several whose axes have no global component in common (probed: exact,
+    # also under NLGEOM) — and uses the node's twin otherwise (_dir_terms).  (Connector rows
+    # between two transformed nodes keep several; the three local dependents of node b then
+    # name each other's DOFs, so ccx's cascade merges the repeats: probed exact.)
+    def _mpc_frame(self, n: int) -> Union[None, str, Tuple[Vec, Vec, Vec]]:
+        """The local axes in which ccx reads *EQUATION terms on DOFs 1-3 of node ``n``: None
+        for the global ones, or why they are undefined (_local_axes)."""
+        return self._local_axes(n) if n in self._transformed else None
 
-    def _link_equation(self, dep: int, ind: int, local: bool = False) -> List[str]:
-        """Abaqus *MPC LINK in a deck without NLGEOM: the distance constraint linearised at
-        the initial geometry, e . (u_dep - u_ind) = 0 with e the unit vector between the
-        nodes — what Abaqus solves in a small-displacement analysis.  The dependent term is
-        the first node's largest component.  ``local`` (connectors): the terms on a node with
-        a *TRANSFORM are in its local DOFs, e . e_j for local DOF j — ccx reads them there,
-        as Abaqus does — and a node without one is listed first (its DOF is eliminated)."""
+    def _mpc_twin(self, n: int) -> int:
+        """The twin of node ``n`` (which has a *TRANSFORM): a new node at its place without one,
+        tied to it by u_twin = u_n (_twin_rows), made once."""
+        if n not in self._twins:
+            nid = max(self.geom.nodes) + 1
+            self.geom.add_node(nid, self.geom.nodes[n])
+            self._twins[n] = nid
+        return self._twins[n]
+
+    def _dir_terms(self, n: int, v: Vec, plan: bool = False) -> List[Tuple[int, int, float]]:
+        """The *EQUATION terms of v . u_n (u_n the displacement of node ``n``, v in global
+        components) in the DOFs ccx reads: the global ones on a node without a *TRANSFORM; on a
+        node with one, (v . e_j) times its local DOF j where no two of those share a global
+        DOF in ccx's expansion — else, as one of them would hold a DOF twice, the global
+        terms on its twin (_mpc_twin, made when ``plan``)."""
+        ax = self._mpc_frame(n)
+        tol = 1e-12 * vnorm(v)
+        if not isinstance(ax, tuple):
+            return [(n, k + 1, v[k]) for k in range(3) if abs(v[k]) > tol]
+        c = [vdot(v, e) for e in ax]
+        js = [j for j in range(3) if abs(c[j]) > tol]
+        spans = [{g for g in range(3) if abs(ax[j][g]) >= 1e-5} for j in js]
+        if all(not (p & q) for p, q in itertools.combinations(spans, 2)):
+            return [(n, j + 1, c[j]) for j in js]
+        twin = self._mpc_twin(n) if plan else self._twins[n]
+        return [(twin, k + 1, v[k]) for k in range(3) if abs(v[k]) > tol]
+
+    def _tie_rows(self, a: int, b: int, plan: bool = False) -> \
+            Optional[List[List[Tuple[int, int, float]]]]:
+        """u_a = u_b (*MPC PIN, the displacements of an *MPC TIE) as three *EQUATIONs in the
+        DOFs ccx reads, or None when neither node has a *TRANSFORM (then one per global DOF):
+        the components along node a's local axes — node b's where only b has a *TRANSFORM —
+        so that node has one local term in each (exact under NLGEOM too, probed), and the other
+        node its global terms, its local terms where they share no global DOF (equal or
+        axis-aligned axes), or its twin's terms (_dir_terms; repeated DOFs are mis-assembled,
+        and under NLGEOM drift or stop ccx).  The
+        first term, which ccx eliminates, is node a's: its local DOF, in an order in which ccx
+        finds a global DOF to eliminate for each (_ccx_dependent_order), or a global DOF, a
+        different one in each row (the largest product of coefficients)."""
+        fa, fb = self._mpc_frame(a), self._mpc_frame(b)
+        frame = fa if isinstance(fa, tuple) else fb
+        if not isinstance(frame, tuple):
+            return None
+        rows = [self._dir_terms(a, frame[j], plan) + self._dir_terms(b, vscale(frame[j], -1.0), plan)
+                for j in range(3)]
+        if isinstance(fa, tuple):
+            return self._ccx_dependent_order(rows, fa)
+        p = max(itertools.permutations(range(3)),
+                key=lambda q: abs(frame[0][q[0]] * frame[1][q[1]] * frame[2][q[2]]))
+        out = []
+        for j, rw in enumerate(rows):
+            first = next(t for t in rw if t[0] == a and t[1] == p[j] + 1)
+            out.append([first] + [t for t in rw if t is not first])
+        return out
+
+    def _twin_rows(self, n: int) -> List[List[Tuple[int, int, float]]]:
+        """u_twin = u_n for node ``n`` and its twin: e_j . u_twin = u_n,j for each local DOF j
+        of n — one local term each — with n's local DOF eliminated (listed first, in an order
+        ccx takes), so the twin's DOFs stay free for the constraints that use them."""
+        ax = self._local_axes(n)
+        twin = self._twins[n]
+        rows = [[(n, j + 1, 1.0)] + [(twin, k + 1, -ax[j][k]) for k in range(3)
+                                     if abs(ax[j][k]) > 1e-12] for j in range(3)]
+        return self._ccx_dependent_order(rows, ax)
+
+    @staticmethod
+    def _ccx_finds_dependents(rows: Sequence[Sequence[Tuple[int, int, float]]],
+                              ax: Tuple[Vec, Vec, Vec]) -> bool:
+        """Whether ccx 2.23 finds a global DOF to eliminate for each of ``rows`` in turn, whose
+        first terms are local DOFs j of one node with *TRANSFORM axes ``ax``: the first component
+        g from j on (j -> j+1 -> j+2, cyclically) of size 1e-5 or more in e_j that no earlier row
+        took (equations.f) — ccx stops ('SPC in node ... cannot be converted in MPC: all') when
+        none is left — and the row's global coefficient there must not vanish."""
+        tk: set = set()
+        for rw in rows:
+            n, j = rw[0][0], rw[0][1]
+            g = next((g for g in ((j - 1 + q) % 3 + 1 for q in range(3))
+                      if g not in tk and abs(ax[j - 1][g - 1]) >= 1e-5), None)
+            top = max(abs(c) for _, _, c in rw)
+            if g is None or abs(sum(c * ax[q - 1][g - 1] for m, q, c in rw
+                                    if m == n and q <= 3)) <= 1e-6 * top:
+                return False
+            tk.add(g)
+        return True
+
+    @classmethod
+    def _ccx_dependent_order(cls, rows: List[List[Tuple[int, int, float]]],
+                             ax: Tuple[Vec, Vec, Vec]) -> List[List[Tuple[int, int, float]]]:
+        """``rows`` (first terms: local DOFs of one node with axes ``ax``) in an order in which
+        ccx finds a global DOF for each (_ccx_finds_dependents) — some axes fail in one order
+        and not in another (probed: a cylinder axis along (0.6, 0.8, 0) in the order 1, 2, 3)
+        — or as given when none does."""
+        if len(rows) < 2 or cls._ccx_finds_dependents(rows, ax):
+            return rows
+        return list(next((p for p in itertools.permutations(rows)
+                          if cls._ccx_finds_dependents(p, ax)), rows))
+
+    @staticmethod
+    def _equation_lines(rows: Sequence[Sequence[Tuple[int, int, float]]]) -> List[str]:
+        """*EQUATION cards for ``rows`` of (node, DOF, coefficient), four terms per line."""
+        out: List[str] = []
+        for rw in rows:
+            out += ["*EQUATION", str(len(rw))]
+            out += [", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in rw[i:i + 4])
+                    for i in range(0, len(rw), 4)]
+        return out
+
+    def _twin_lines(self, rows: Sequence[Sequence[Tuple[int, int, float]]]) -> List[str]:
+        """The equations of the twins that ``rows`` use (_twin_rows) not yet written."""
+        used = {t[0] for rw in rows for t in rw}
+        out: List[str] = []
+        for n, twin in self._twins.items():
+            if twin in used and n not in self._twins_out:
+                self._twins_out.add(n)
+                out += self._equation_lines(self._twin_rows(n))
+        return out
+
+    def _note_transformed_mpc(self) -> None:
+        self.report.note("*MPC PIN / TIE / LINK on nodes with a *TRANSFORM: Abaqus makes the "
+                         "global displacements equal (keeps the distance), whatever the nodes' "
+                         "transforms, which set only the directions of their loads, BCs, *EQUATION "
+                         "terms and output; ccx reads *EQUATION terms on such a node in its local "
+                         "axes, so the equations are written there — the components along one "
+                         "node's local axes, a node's local terms only where no two share a global "
+                         "DOF, else through an untransformed twin node (u_twin = u_node): ccx 2.23 "
+                         "mis-assembles an equation that holds a DOF twice; probed: exact, linear, "
+                         "NLGEOM and explicit.", once=True)
+        self._note_twins()
+
+    def _note_twins(self) -> None:
+        if self._twins:
+            self.report.note(f"{len(self._twins)} node(s) with a *TRANSFORM got a twin node: a new "
+                             f"node at the same place without one, tied to it by u_twin = u_node, "
+                             f"through which a constraint uses the node's global displacement "
+                             f"(ccx 2.23 mis-assembles an equation that holds a DOF twice, as "
+                             f"several local terms of one node give).",
+                             once=True)
+
+    def _link_terms(self, dep: int, ind: int, plan: bool = False) -> List[Tuple[int, int, float]]:
+        """The *EQUATION terms of the linearised LINK, e . (u_dep - u_ind) = 0 with e the unit
+        vector from node ind to node dep at the initial geometry, in the DOFs ccx reads
+        (_dir_terms; ``plan`` makes the twins), each node's terms largest first: node dep's
+        first (its largest component is eliminated), or, where only node dep has a *TRANSFORM,
+        node ind's."""
         e = vunit(vsub(self.geom.nodes[dep], self.geom.nodes[ind]))
-        ks = sorted((k for k in range(3) if abs(e[k]) > 1e-12), key=lambda k: -abs(e[k]))
-        terms = [(dep, k + 1, e[k]) for k in ks] + [(ind, k + 1, -e[k]) for k in ks]
-        if local and (dep in self._transformed or ind in self._transformed):
-            terms = []
-            first = ind if dep in self._transformed and ind not in self._transformed else dep
-            for n in (first, dep if first == ind else ind):
-                axes = self._local_axes(n) if n in self._transformed else \
-                    ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-                c = [(j + 1, (1.0 if n == dep else -1.0) * vdot(e, axes[j])) for j in range(3)]
-                terms += [(n, j, v) for j, v in sorted(c, key=lambda t: -abs(t[1])) if abs(v) > 1e-12]
-        lines = ["*EQUATION", str(len(terms))]
-        for j in range(0, len(terms), 4):
-            lines.append(", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in terms[j:j + 4]))
-        return lines
+        if dep not in self._transformed and ind not in self._transformed:
+            ks = sorted((k for k in range(3) if abs(e[k]) > 1e-12), key=lambda k: -abs(e[k]))
+            return [(dep, k + 1, e[k]) for k in ks] + [(ind, k + 1, -e[k]) for k in ks]
+        sides = [sorted(self._dir_terms(n, vscale(e, s), plan), key=lambda t: -abs(t[2]))
+                 for n, s in ((dep, 1.0), (ind, -1.0))]
+        if dep in self._transformed and ind not in self._transformed:
+            sides.reverse()
+        return sides[0] + sides[1]
+
+    def _link_equation(self, dep: int, ind: int) -> List[str]:
+        """Abaqus *MPC LINK (or a LINK connector) in a deck without NLGEOM: the distance
+        constraint linearised at the initial geometry, e . (u_dep - u_ind) = 0 — what Abaqus
+        solves in a small-displacement analysis — as one *EQUATION (_link_terms), after the
+        equations of the twins it uses that are not written yet."""
+        terms = self._link_terms(dep, ind)
+        return self._twin_lines([terms]) + self._equation_lines([terms])
 
     def _mpc_rigid_body(self, body: dict) -> List[str]:
         """The *RIGID BODY of a group of Abaqus *MPC BEAM lines (see _plan_mpcs): the
@@ -10036,12 +10221,16 @@ class Converter:
         quiet = Report()
         kinds: Dict[str, str] = {}
         self._expanded = set()                 # nodes of elements ccx expands to 3-D
+        rotn: set = set()                      # shell/beam nodes: rotations of their own
         for typ, conn in self.geom.elements.values():
             if typ not in kinds:
                 kinds[typ] = ccx_element_type(typ, quiet)
             cc = kinds[typ]
             if cc in SHELL_TYPES or cc in BEAM_TYPES or cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES):
                 self._expanded.update(conn)
+            if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
+                rotn.update(conn)
+        self._mpc_refused = {}
         parent: "OrderedDict[int, int]" = OrderedDict()     # BEAM: dependent -> independent
         anchor: Dict[int, int] = {}                          # dependent -> id(its *MPC card)
 
@@ -10079,9 +10268,13 @@ class Converter:
                         ("skip", f"*MPC BEAM line '{', '.join(f)}' adds no new dependent node; "
                                  f"commented out.")
                 elif typ != "LINK":
-                    self._mpc_plan[key] = (typ.lower(), pairs)
+                    self._mpc_plan[key] = self._plan_mpc_transforms(key, typ, (typ.lower(), pairs),
+                                                                    rotn)
+                elif not self._mpc_mechanical:          # no displacements to keep a distance in
+                    self._mpc_plan[key] = ("link-none", pairs)
                 else:
-                    self._mpc_plan[key] = self._link_mode(pairs, "*MPC LINK")
+                    self._mpc_plan[key] = self._plan_mpc_transforms(
+                        key, typ, self._link_mode(pairs, "*MPC LINK"), rotn)
         # rigid connectors (BEAM, WELD; see _plan_connectors) are the same rigid link with no
         # preferred direction: node b joins node a's body, or a joins b's, or b's chain is
         # first re-rooted at b (reversing a rigid link changes nothing)
@@ -10144,6 +10337,55 @@ class Converter:
                              f"Abaqus linearises the link in the small-displacement steps.",
                              once=True)
         return ("link-mpc", pairs)
+
+    _MPC_OWN_ROTATION = (
+        "*MPC TIE between two shell/beam nodes, one with a *TRANSFORM: TIE makes the rotations "
+        "equal too, and ccx 2.23 misreads *EQUATION terms on DOFs 4-6 of a node with a "
+        "*TRANSFORM (DOF 4 as the global rotation, DOFs 5 and 6 through an out-of-range read of "
+        "the transformation matrix: ccx stops with 'SPC in node ... cannot be converted in MPC', "
+        "or ties other DOFs; probed), so they cannot be tied there, and a TIE without them is a "
+        "different joint (its displacements and temperature are not tied either)")
+
+    def _plan_mpc_transforms(self, key: Tuple[int, int], typ: str, plan: Tuple[str, object],
+                             rotn: set) -> Tuple[str, object]:
+        """The node pairs of a PIN / TIE line, or of a LINK line written as *EQUATION, that can
+        be written on nodes with a *TRANSFORM (_tie_rows, _link_terms; plans their twins), from
+        ``plan`` = (mode, pairs).  Not a pair (in _mpc_refused, commented out with the reason)
+        whose node has no defined local axes, or a TIE that ties the rotations of a transformed
+        shell/beam node (_MPC_OWN_ROTATION) — no knot beams are made for those; ("skip", why)
+        when no pair is left.  Abaqus' PIN makes the global displacements equal, TIE the global
+        displacements, rotations and temperature, LINK keeps the distance ("General multi-point
+        constraints"); a nodal transform sets only the directions of the node's loads, BCs,
+        *EQUATION terms and output.  A heat-transfer-only deck has no displacements: nothing
+        to write there but a TIE's temperature, which no transform affects."""
+        mode, pairs = plan
+        if mode not in ("pin", "tie", "link-eq") or not self._transformed:
+            return plan
+        moves = self._mpc_mechanical                               # translations are tied
+        kept: List[Tuple[int, int]] = []
+        refused: List[Tuple[str, Tuple[int, int]]] = []
+        for a, b in pairs:
+            why = next((x for x in (self._mpc_frame(n) for n in (a, b)) if isinstance(x, str)),
+                       None) if moves else None
+            if why:
+                why = re.sub(r"\bnode \d+", "a node", why)
+                refused.append((f"*MPC {typ} on a node without defined local axes: {why}. "
+                                f"Abaqus does not define that node's local directions, in which "
+                                f"its *EQUATION terms would have to be written", (a, b)))
+            elif mode == "tie" and self._mpc_mechanical and a in rotn and b in rotn and \
+                    (a in self._transformed or b in self._transformed):
+                refused.append((self._MPC_OWN_ROTATION, (a, b)))
+            else:
+                kept.append((a, b))
+                if mode == "link-eq":
+                    self._link_terms(a, b, plan=True)
+                elif moves:
+                    self._tie_rows(a, b, plan=True)
+        if refused:
+            self._mpc_refused[key] = refused
+        if not kept:
+            return ("skip", f"{refused[0][0]}; commented out — the constraint is missing.")
+        return (mode, kept)
 
     # -- connector elements (CONN3D2 / CONN2D2) ------------------------------------
     def _conn_axes(self, name: str) -> Optional[Tuple[Vec, Vec, Vec]]:
@@ -10470,12 +10712,15 @@ class Converter:
                     it["route"], it["reason"] = "skip", arg
                     continue
                 it["link"] = mode
-                # its *EQUATION is written in local DOFs (_link_equation); ccx's distance MPC
-                # under NLGEOM is not affected by a *TRANSFORM (probed)
+                # its *EQUATION is written in local DOFs, through twins where a node would need
+                # several (_link_terms); ccx's distance MPC under NLGEOM is not affected by a
+                # *TRANSFORM (probed)
                 why = next((x for x in (self._local_axes(n) for n in (it["b"], it["a"])
                                         if n in self._transformed) if isinstance(x, str)), None)
                 if mode == "link-eq" and why:
                     it["route"], it["reason"] = "skip", self._conn_axes_reason(why)
+                elif mode == "link-eq":
+                    self._link_terms(it["b"], it["a"], plan=True)
         rows_items = [it for it in items if it["route"] == "rows"]
         if not rows_items:
             return
@@ -10735,18 +10980,8 @@ class Converter:
                 ax = frame(n)
 
                 def found(perm: Sequence[int]) -> bool:
-                    tk: set = set()
-                    for i in perm:
-                        rw = out[i]
-                        j = next(iter(rw))[1]
-                        g = next((g for g in ((j - 1 + q) % 3 + 1 for q in range(3))
-                                  if g not in tk and abs(ax[j - 1][g - 1]) >= 1e-5), None)
-                        top = max(abs(v) for v in rw.values())
-                        if g is None or abs(sum(v * ax[q - 1][g - 1] for (m, q), v in rw.items()
-                                                if m == n and q <= 3)) <= 1e-6 * top:
-                            return False
-                        tk.add(g)
-                    return True
+                    return self._ccx_finds_dependents(
+                        [[(m, q, v) for (m, q), v in out[i].items()] for i in perm], ax)
                 if len(idx) > 1 and not found(idx):
                     perm = next((p for p in itertools.permutations(idx) if found(p)), None)
                     if perm is not None:
@@ -12244,8 +12479,14 @@ class Converter:
                     moved += 1
                 final.append(terms)
                 continue
-            alt = next((k for k in (res or {}) if k not in taken and k not in accepted and
-                        ccx_pick(k, res) is not None), None)
+            # (not where the reduced equation holds several local translations of one node:
+            # ccx's expansion would repeat its global DOFs, which ccx 2.23 mis-assembles)
+            several = res is not None and any(
+                sum(1 for m, d in res if m == n and d <= 3) > 1 for n in {m for m, _ in res}
+                if n in transformed)
+            alt = None if several else \
+                next((k for k in (res or {}) if k not in taken and k not in accepted and
+                      ccx_pick(k, res) is not None), None)
             if alt is not None:
                 g = ccx_pick(alt, res)
                 if g:

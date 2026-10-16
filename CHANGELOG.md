@@ -44,6 +44,11 @@ without an error. A full audit and the work that followed:
   `LINK` node pair under NLGEOM, each get a card of their own, as ccx reads one MPC per card:
   two `LINK` pairs in one card stopped ccx ("increase nk_"), and a second `PLANE` or
   `STRAIGHT` line's nodes were silently put on the first line's plane or line.
+* **`*MPC` on transformed nodes** — `PIN`, `TIE` and `LINK` written in the local DOFs ccx reads
+  on nodes with a `*TRANSFORM` (they constrain the global motion in Abaqus): a node's local
+  terms only where no two share a global DOF, else through an untransformed twin node, as
+  ccx 2.23 mis-assembles an equation that holds a DOF twice (this also fixes the connector
+  `LINK` to a transformed node).
 * **Materials and orientations** — per-element `*DISTRIBUTION` orientations; the elastic
   forms ccx 2.23 needs beside orthotropic and anisotropic expansion; halved ANISO expansion
   shear coefficients; zero-shear ANISO written as ORTHO; default initial temperatures.

@@ -222,10 +222,13 @@ def test_mpc_lines_converted_one_by_one():
     assert _equations(body) == [f"{a},{d},1.,{b},{d},-1." for a, b in ((11, 1), (12, 2), (13, 8),
                                                                       (14, 8)) for d in (1, 2, 3)]
     assert "** PIN, D, E" in body and "different sizes" in rep.text()
-    # ccx reads an *EQUATION's DOFs in a node's *TRANSFORM axes: warned
-    _, _, rep = convert_str(HEX + "*Node\n9,2,0,0\n*Nset,nset=T9\n9\n*Transform, nset=T9\n"
-                            "0.,1.,0.,-1.,0.,0.\n*MPC\nPIN, 9, 2\n")
-    assert "*MPC on a node with a *TRANSFORM" in rep.text()
+    # ccx reads an *EQUATION's DOFs in a node's *TRANSFORM axes (here local 1 = y, 2 = -x,
+    # 3 = z): the global u_9 = u_2 is written along them (test_mpc_pin_on_a_transformed_node...)
+    body, _, rep = convert_str(HEX + "*Node\n9,2,0,0\n*Nset,nset=T9\n9\n*Transform, nset=T9\n"
+                               "0.,1.,0.,-1.,0.,0.\n*MPC\nPIN, 9, 2\n")
+    assert _equation_terms(body) == [[(9, 1, 1.), (2, 2, -1.)], [(9, 2, 1.), (2, 1, 1.)],
+                                     [(9, 3, 1.), (2, 3, -1.)]]
+    assert "Abaqus makes the global displacements equal" in rep.text() and rep.n_warnings == 0
 
 
 def test_mpc_tie_ties_rotations_between_knots():
@@ -4665,16 +4668,234 @@ def test_connector_dependents_on_a_transformed_node_in_an_order_ccx_takes():
 
 
 def test_settle_dependents_follows_ccx_on_a_transformed_node_with_a_bc():
-    # node 1 is fixed, node 2 has a *TRANSFORM (about z) and a BC on its local 3: the LINK's
-    # eliminated DOF goes to a local DOF of node 2 that ccx can take (its BC takes global z)
+    # node 1 is fixed, node 2 has a *TRANSFORM (about z, local 1 along the link) and a BC on its
+    # local 3: the LINK's eliminated DOF goes to a local DOF of node 2 that ccx can take (its BC
+    # takes global z)
     deck = ("*Node\n1, 0., 0., 0.\n2, 3., 4., 0.\n3, 7., 1., 0.\n*Element, type=SpringA, elset=S\n"
             "1, 3, 2\n*Spring, elset=S\n\n1000.\n*Element, type=CONN3D2, elset=L\n9, 1, 2\n"
             "*Connector Section, elset=L\nLink,\n*Nset, nset=T2\n2\n*Transform, nset=T2\n"
-            "0.8775825618903728, 0.479425538604203, 0., -0.479425538604203, 0.8775825618903728, 0.\n"
+            "0.6, 0.8, 0., -0.8, 0.6, 0.\n"
             "*Boundary\n1, 1, 3\n3, 1, 3\n2, 3, 3\n*Step\n*Static\n*Cload\n2, 1, 10.\n*End Step\n")
     body, conv, rep = convert_str(deck)
     eq, = _equation_terms(body)
-    assert eq[0][0] == 2 and eq[0][1] in (1, 2) and "Possible overconstraint" not in rep.text()
+    assert eq[0][:2] == (2, 1) and len(eq) == 3 and "Possible overconstraint" not in rep.text()
+    # turned off the link (0.5 rad about z): e has two local components on node 2, which ccx
+    # would expand into repeated global DOFs, so the link goes through node 2's twin; node 1
+    # is fixed, so a twin DOF is eliminated, and the twin row on node 2's local 3 (its BC
+    # takes global z, ccx's only choice there) eliminates the twin's z instead
+    body, conv, rep = convert_str(deck.replace(
+        "0.6, 0.8, 0., -0.8, 0.6, 0.", "0.8775825618903728, 0.479425538604203, 0., "
+        "-0.479425538604203, 0.8775825618903728, 0."))
+    twin = conv._twins[2]
+    eqs = _equation_terms(body)
+    assert len(eqs) == 4 and not _ccx_expansion_repeats(body)
+    link = next(eq for eq in eqs if any(n == 1 for n, _, _ in eq))
+    assert link[0][0] == twin and {n for n, _, _ in link} == {1, twin}
+    z = next(eq for eq in eqs if (2, 3) in [t[:2] for t in eq])
+    assert z[0][:2] == (twin, 3) and "Possible overconstraint" not in rep.text()
+
+
+def test_settle_dependents_writes_no_equation_with_several_local_translations():
+    # an *EQUATION none of whose DOFs is free is written reduced by the equations before it
+    # where that frees one — not where the reduced equation would hold two local translations
+    # of a node with a *TRANSFORM (the last one here would become u_11,2, u_12,2, u_9,2 and
+    # u_9,3): ccx 2.23 expands them into repeated global DOFs and mis-assembles such an
+    # equation without a message, so it stays as written, with the overconstraint warning
+    eqs = [[(11, 1, 2.), (11, 2, 2.), (12, 2, 0.5)], [(10, 2, 1.), (11, 2, 1.), (9, 2, -1.), (12, 1, 2.)],
+           [(12, 1, -1.), (9, 3, -1.), (12, 2, 1.), (10, 1, 2.)], [(12, 1, -1.), (10, 3, 2.)],
+           [(10, 1, 2.), (11, 1, 1.), (10, 2, 0.5)]]
+    deck = (HEX + "*Node\n9, 2., 0., 0.\n10, 3., 0., 0.\n11, 3., 1., 0.\n12, 4., 0., 0.\n"
+            "*Nset, nset=T9\n9\n*Transform, nset=T9\n1., 2., 0.5, -1., 0.3, 1.\n" +
+            "".join(f"*Equation\n{len(eq)}\n" + ", ".join(f"{n}, {d}, {c}" for n, d, c in eq) + "\n"
+                    for eq in eqs))
+    body, _, rep = convert_str(deck)
+    assert _equation_terms(body)[4] == eqs[4] and not _ccx_expansion_repeats(body)
+    assert "Possible overconstraint" in rep.text()
+
+
+def _transform_axes(typ, a, b, x):
+    """Abaqus' local axes of a rectangular / cylindrical *TRANSFORM at point ``x`` (computed
+    here, apart from abq2ccx)."""
+    if typ == "R":
+        e1, e3 = _unit(a), _unit(_cross(a, b))
+        return e1, _cross(e3, e1), e3
+    e3 = _unit([q - p for p, q in zip(a, b)])
+    r = [xi - ai for xi, ai in zip(x, a)]
+    e1 = _unit([ri - sum(s * t for s, t in zip(r, e3)) * e for ri, e in zip(r, e3)])
+    return e1, _cross(e3, e1), e3
+
+
+def _ccx_expansion_repeats(body):
+    """The *EQUATIONs of a converted deck that hold a global DOF twice once ccx expands each
+    term on DOFs 1-3 of a node with a *TRANSFORM into the global DOFs of its local axis (the
+    components of 1e-5 or more; equations.f) — ccx 2.23 mis-assembles such an equation unless
+    another MPC is substituted into it (probed: 38-144 % of max |u| off, silently)."""
+    geom, tr, bad = reparse(body), _emitted_transforms(body), []
+    for eq in _equation_terms(body):
+        seen = []
+        for n, d, _ in eq:
+            if n in tr and d <= 3:
+                typ, v = tr[n]
+                ax = _transform_axes(typ, v[:3], v[3:], geom.nodes[n])
+                seen += [(n, g + 1) for g in range(3) if abs(ax[d - 1][g]) >= 1e-5]
+            else:
+                seen.append((n, d))
+        if len(seen) != len(set(seen)):
+            bad.append(eq)
+    return bad
+
+
+# node 9 next to the unit cube, with a cylindrical *TRANSFORM whose axis lies along (0.6, 0.8, 0):
+# ccx's own choice of the global DOFs it eliminates for local dependents fails there in the
+# order 1, 2, 3 (probed: 'SPC in node ... cannot be converted in MPC: all')
+CYL9 = (HEX + "*Node\n9, 2., 0.3, 0.2\n*Nset, nset=T9\n9\n*Transform, nset=T9, type=C\n"
+        "0.3, -0.2, 0.5, 0.9, 0.6, 0.5\n")
+CYL9_AXES = _transform_axes("C", (0.3, -0.2, 0.5), (0.9, 0.6, 0.5), (2., 0.3, 0.2))
+
+
+def test_mpc_pin_on_a_transformed_node_uses_its_local_dofs():
+    # Abaqus' PIN makes the GLOBAL displacements equal, also on a node with a *TRANSFORM (the
+    # manual's "General multi-point constraints"; its verification xmpcpinxt.inp gives the
+    # results without transforms), and ccx reads *EQUATION terms there in the local axes: u_9 =
+    # u_2 is written along node 9's axes, u_9,j = e_j . u_2 — one local term per equation, which
+    # ccx needs (several drift or stop under NLGEOM, and a DOF repeated in ccx's expansion is
+    # mis-assembled), node 9's (the dependent node's) local DOF eliminated, the equations in an
+    # order in which ccx finds a global DOF for each
+    body, conv, rep = convert_str(CYL9 + "*MPC\nPIN, 9, 2\n")
+    eqs = _equation_terms(body)
+    assert len(eqs) == 3 and all(eq[0][0] == 9 and [n for n, _, _ in eq].count(9) == 1 for eq in eqs)
+    for eq in eqs:
+        j = eq[0][1]
+        assert _close([c for n, d, c in sorted(eq) if n == 2],
+                      [-x for x in CYL9_AXES[j - 1] if abs(x) > 1e-12], 1e-11), eq
+    assert _ccx_dependents(eqs, 9, CYL9_AXES) is not None
+    assert _ccx_dependents(sorted(eqs, key=lambda eq: eq[0][1]), 9, CYL9_AXES) is None
+    assert not conv._twins and not _ccx_expansion_repeats(body) and rep.n_warnings == 0
+    assert "Abaqus makes the global displacements equal" in rep.text()
+    # node 9 the independent node: e_j . u_2 = u_9,j, a different DOF of node 2 eliminated in each
+    body, conv, rep = convert_str(CYL9 + "*MPC\nPIN, 2, 9\n")
+    eqs = _equation_terms(body)
+    assert sorted(eq[0][:2] for eq in eqs) == [(2, 1), (2, 2), (2, 3)]
+    assert all([(n, c) for n, _, c in eq if n == 9] == [(9, -1.)] for eq in eqs)
+    for eq in eqs:
+        j = next(d for n, d, _ in eq if n == 9)
+        assert _close([c for n, d, c in sorted(eq) if n == 2],
+                      [x for x in CYL9_AXES[j - 1] if abs(x) > 1e-12], 1e-11), eq
+    # a TIE between solid nodes: the same, and its temperature (DOF 11, a scalar) as before
+    body, _, _ = convert_str(CYL9 + "*MPC\nTIE, 9, 2\n*Step\n*Coupled Temperature-Displacement\n"
+                                    "1., 1.\n*End Step\n")
+    eqs = _equation_terms(body)
+    assert len(eqs) == 4 and eqs[-1] == [(9, 11, 1.), (2, 11, -1.)]
+
+
+def test_mpc_pin_between_differently_transformed_nodes_uses_a_twin():
+    # both nodes with a *TRANSFORM, the axes different: along node 9's axes node 10 would have
+    # local terms that share global DOFs, so it gets a twin — a new untransformed node at its
+    # place, tied by e_j . u_twin = u_10,j (node 10's local DOF eliminated, the twin's free) —
+    # and u_9 = u_twin is written along node 9's axes; the twin's equations are written once,
+    # for every line that needs node 10's global displacement (here also node 12's, in another
+    # *MPC card)
+    deck = (CYL9 + "*Node\n10, 2., 0.3, 0.2\n11, 1., 1.5, 0.\n12, 2., 0.3, 0.2\n*Nset, nset=T10\n10\n"
+            "*Transform, nset=T10\n1., 2., 0.5, -1., 0.3, 1.\n*Nset, nset=T12\n12\n"
+            "*Transform, nset=T12\n0.3, -1., 0.2, 0.8, 0.5, -0.4\n*MPC\nPIN, 9, 10\nPIN, 11, 10\n"
+            "*MPC\nPIN, 12, 10\n")
+    body, conv, rep = convert_str(deck)
+    twin = conv._twins[10]
+    assert list(conv._twins) == [10] and conv.geom.nodes[twin] == conv.geom.nodes[10]
+    eqs = _equation_terms(body)
+    assert len(eqs) == 12 and not _ccx_expansion_repeats(body)
+    assert all({n for n, _, _ in eq} == {12, twin} for eq in eqs if eq[0][0] == 12)
+    ax10 = _transform_axes("R", (1., 2., 0.5), (-1., 0.3, 1.), None)
+    rows10 = [eq for eq in eqs if eq[0][0] == 10]
+    assert len(rows10) == 3 and all({n for n, _, _ in eq} == {10, twin} for eq in rows10)
+    for eq in rows10:
+        assert _close([c for n, d, c in sorted(eq) if n == twin],
+                      [-x for x in ax10[eq[0][1] - 1] if abs(x) > 1e-12], 1e-11)
+    assert all({n for n, _, _ in eq} == {9, twin} for eq in eqs if eq[0][0] == 9)
+    # (node 11 has no *TRANSFORM: its line needs no twin, one local term of node 10 per row)
+    assert all({n for n, _, _ in eq} == {11, 10} for eq in eqs if eq[0][0] == 11)
+    assert "got a twin node" in rep.text() and rep.n_warnings == 0
+    # the same axes on both nodes (one card): local DOF j of one equals local DOF j of the other
+    same = (HEX + "*Node\n9, 2., 0.3, 0.2\n10, 2., 0.3, 0.2\n*Nset, nset=T\n9, 10\n"
+            "*Transform, nset=T, type=C\n0.3, -0.2, 0.5, 0.9, 0.6, 0.5\n*MPC\nPIN, 9, 10\n")
+    body, conv, _ = convert_str(same)
+    assert not conv._twins and sorted(_equation_terms(body)) == \
+        [[(9, j, 1.), (10, j, -1.)] for j in (1, 2, 3)]
+    # axes along the global ones (local 1 = y, 2 = -x, 3 = z on node 10): its three local terms
+    # in each equation share no global DOF, so no twin (probed: exact, also under NLGEOM)
+    aligned = deck.replace("1., 2., 0.5, -1., 0.3, 1.", "0., 1., 0., -1., 0., 0.")
+    body, conv, _ = convert_str(aligned.split("*MPC")[0] + "*MPC\nPIN, 9, 10\n")
+    eqs = _equation_terms(body)
+    assert not conv._twins and max(sum(1 for n, _, _ in eq if n == 10) for eq in eqs) == 3
+    assert not _ccx_expansion_repeats(body)
+
+
+def test_mpc_tie_rotations_on_a_transformed_shell_or_beam_node_are_refused():
+    # a TIE between beam ends ties the rotations too, and ccx 2.23 misreads *EQUATION terms on
+    # DOFs 4-6 of a node with a *TRANSFORM (DOF 4 global, DOFs 5-6 out of range: ccx stops or
+    # ties other DOFs; probed): such a pair is commented out, and no knot beams are made for it
+    tr3 = "*Nset, nset=T3\n3\n*Transform, nset=T3\n1., 2., 0.5, -1., 0.3, 1.\n"
+    body, conv, rep = convert_str(B2 + tr3 + "*MPC\nTIE, 3, 2\n")
+    assert not _equation_terms(body) and not conv._knots and "** TIE, 3, 2" in body
+    assert "misreads *EQUATION terms on DOFs 4-6" in rep.text()
+    # a node-set line: the other pair is converted (knots, all six DOFs)
+    b3 = B2 + "*Node\n5,2,0,0\n6,3,0,0\n*Element,type=B31,elset=B\n3,5,6\n" \
+        "*Nset, nset=A\n3, 5\n*Nset, nset=B\n2, 4\n"
+    tr5 = "*Nset, nset=T5\n5\n*Transform, nset=T5\n1., 2., 0.5, -1., 0.3, 1.\n"
+    body, conv, rep = convert_str(b3 + tr5 + "*MPC\nTIE, A, B\n")
+    assert sorted(conv._knots) == [2, 3] and _equations(body) == \
+        [f"3,{d},1.,2,{d},-1." for d in range(1, 7)]
+    assert "node pair(s) (5, 4) of this line commented out" in rep.text() and "** TIE, A, B" in body
+    # a heat-transfer-only deck ties the temperatures only: nothing to refuse
+    body, _, rep = convert_str(B2 + tr3 + "*MPC\nTIE, 3, 2\n*Step\n*Heat Transfer\n1., 1.\n*End Step\n")
+    assert _equations(body) == ["3,11,1.,2,11,-1."] and "misreads" not in rep.text()
+    # a beam end tied to a free node: no rotation in common, so only the displacements are tied,
+    # in node 3's local axes
+    body, _, rep = convert_str(B2 + tr3 + "*Node\n9, 1., 0., 0.\n*MPC\nTIE, 3, 9\n")
+    eqs = _equation_terms(body)
+    assert len(eqs) == 3 and all(eq[0][0] == 3 for eq in eqs) and "misreads" not in rep.text()
+
+
+def test_mpc_on_a_node_without_local_axes_is_refused():
+    # a node on the axis of its cylindrical *TRANSFORM has no local directions (Abaqus rejects
+    # the system there): the PIN / LINK lines on it are commented out
+    deck = (HEX + "*Node\n9, 2., 0., 0.5\n*Nset, nset=T9\n9\n*Transform, nset=T9, type=C\n"
+            "2., 0., 0., 2., 0., 1.\n")
+    for line in ("PIN, 9, 2", "LINK, 9, 2"):
+        body, conv, rep = convert_str(deck + f"*MPC\n{line}\n")
+        assert not _equation_terms(body) and f"** {line}" in body and not conv._twins
+        assert "on a node without defined local axes: a node lies on the axis" in rep.text()
+    # ccx's distance MPC (*MPC BEAM, a LINK under NLGEOM) does not read the axes
+    body, _, rep = convert_str(deck + "*MPC\nLINK, 9, 2\n*Step, nlgeom\n*Static\n*End Step\n")
+    assert "*MPC\nBEAM, 9, 2" in body and "without defined local axes" not in rep.text()
+
+
+def test_mpc_link_on_transformed_nodes_uses_one_local_term_per_node():
+    # the linearised LINK e . (u_9 - u_2) = 0: along a local axis of node 9 it is one local
+    # term; across them (here e = (1, 0.3, 0.2) / |.|, cylindrical axes) node 9 would have
+    # several, which ccx expands into repeated global DOFs and mis-assembles (probed: 74-144 %
+    # of max |u| off) — so the LINK uses node 9's twin
+    body, conv, rep = convert_str(CYL9 + "*MPC\nLINK, 9, 2\n*Step\n*Static\n*End Step\n")
+    twin = conv._twins[9]
+    eqs = _equation_terms(body)
+    assert len(eqs) == 4 and not _ccx_expansion_repeats(body)
+    link, = [eq for eq in eqs if any(n == 2 for n, _, _ in eq)]
+    e = _unit([1., 0.3, 0.2])
+    assert {n for n, _, _ in link} == {2, twin} and _close(
+        [c for n, d, c in sorted(link)], [-x for x in e] + list(e), 1e-11)
+    assert sorted(eq[0][:2] for eq in eqs if eq is not link) == [(9, 1), (9, 2), (9, 3)]
+    # a link along node 9's local 1 (radial from the z axis, e = (1, 0, 0) from node 2): one
+    # local term, no twin
+    radial = (HEX + "*Node\n9, 2., 0., 0.\n*Nset, nset=T9\n9\n*Transform, nset=T9, type=C\n"
+              "0., 0., 0., 0., 0., 1.\n*MPC\nLINK, 9, 2\n*Step\n*Static\n*End Step\n")
+    body, conv, _ = convert_str(radial)
+    assert not conv._twins and _equation_terms(body) == [[(2, 1, -1.), (9, 1, 1.)]]
+    # NLGEOM: ccx's *MPC BEAM keeps the distance whatever the transform (probed)
+    body, conv, _ = convert_str(CYL9 + "*MPC\nLINK, 9, 2\n*Step, nlgeom\n*Static\n*End Step\n")
+    assert "*MPC\nBEAM, 9, 2" in body and not conv._twins and not _equation_terms(body)
+    # a heat-transfer-only deck has no displacements: the LINK is left out, as a PIN is
+    body, conv, rep = convert_str(CYL9 + "*MPC\nLINK, 9, 2\n*Step\n*Heat Transfer\n1., 1.\n*End Step\n")
+    assert not _equation_terms(body) and not conv._twins and "it was left out" in rep.text()
 
 
 def test_connector_rotation_node_of_a_transformed_solid_node_gets_its_axes():

@@ -75,6 +75,7 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `connector_hinge_bodies` | a hinge between two rigid bodies, oblique axis, offset joint | exact solution | 6e-8 |
 | `connector_ground_hinge` | a body hinged to ground turned 138° under NLGEOM | rigid rotation about the axis | 6e-6 |
 | `connector_transform_plate`, `connector_transform_join`, and the hinge examples with a `*TRANSFORM` | connectors on transformed nodes, also NLGEOM | the same models without the transform | exact |
+| `mpc_transform` | `*MPC` `PIN`, `TIE` across faces with different transforms (twin nodes), a face pinned to a transformed reference point, a `LINK` to a transformed node; orthotropic, uneven mesh; also NLGEOM | the same model without the transforms | exact |
 | `op_new_respecify`, `op_new_remove` | clamps across a later step's `*BOUNDARY, OP=NEW` | expected deflections | ≤ 0.7 % |
 | `distribution_solid_plate`, `distribution_shell_plate` | per-element `*DISTRIBUTION` orientations | their `*_explicit` twins (one orientation per element) | ≤ 3e-11 |
 | `thermal_expansion_cubes` | isotropic `*Elastic` beside ORTHO / ANISO `*Expansion` (with shear terms) | α ΔT; analytic stress | ≤ 1e-6 |

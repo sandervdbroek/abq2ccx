@@ -191,6 +191,15 @@ so the converter does it in three places, each exact:
   how each type is written (`handle_mpc()` then emits it line by line) and groups the `BEAM`
   lines into rigid bodies by their independent node (union-find over chained lines). The
   bodies get ROT NODEs and, on shell/beam nodes, knot beams like any `*RIGID BODY`.
+  On nodes with a `*TRANSFORM` (`_plan_mpc_transforms()`) a `PIN`/`TIE` is written along
+  one node's local axes (`_tie_rows()`) and a linear `LINK` with its local terms
+  (`_link_terms()`) — `_dir_terms()` gives v · u_n in the DOFs ccx reads: a node's local
+  terms only where no two share a global DOF, else the global terms of the node's *twin*
+  (`_mpc_twin()`, a new node tied by u_twin = u_n, `_twin_rows()`), because ccx 2.23
+  mis-assembles an equation that holds a DOF twice; `_ccx_dependent_order()` orders the rows whose eliminated terms are
+  local DOFs of one node as ccx needs (shared with the connector rows). Pairs on nodes
+  without local axes, and `TIE` rotations on a transformed shell/beam node, are refused
+  (`_mpc_refused`).
 * Connector elements (`CONN3D2`/`CONN2D2`) are kept out of the mesh (`Converter._conn`;
   `_emit_set` drops them from element sets) and planned in two parts. `_plan_connectors()`
   (before `_plan_mpcs`) reads each `*CONNECTOR SECTION` and routes every element: rigid

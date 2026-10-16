@@ -21,7 +21,8 @@ cube and circular-section beam with no initial temperatures, and the loads ccx h
 for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads (cantilevers
 against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
 (local axes), which must match the same models without one, *MPC joints, levers and links
-against statics, connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
+against statics — PIN, TIE and LINK also on nodes with a *TRANSFORM, against the same model
+without it (linear and NLGEOM) — connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
 theory and exact statics — also on nodes with a *TRANSFORM, against the same models without
 it (linear and NLGEOM) — velocity / acceleration boundary conditions against their
 time integral and the wave they send through a bar, displacement boundary conditions without
@@ -1309,6 +1310,34 @@ def main():
     failures += same_as("connector_ground_hinge, NLGEOM, with a rectangular *TRANSFORM on its "
                         "reference point (moments in the local axes)",
                         with_transform(ground, 3, *rect, (0.2, 0.5, -0.1)), ground)
+
+    # --- *MPC PIN / TIE / LINK on nodes with a *TRANSFORM ----------------------------------
+    # Abaqus' PIN, TIE and LINK constrain the global displacements whatever the nodes'
+    # transforms (its verification decks xmpcpinxt, xmpctiext and xmpclnk3t give the results
+    # without them), and ccx reads *EQUATION terms on a transformed node in its local axes:
+    # abq2ccx writes them there, one local term per node and equation — through an
+    # untransformed twin of the node where it would need several, since ccx 2.23
+    # mis-assembles an equation that holds a DOF twice.  examples/mpc_transform.inp is an
+    # orthotropic model on an uneven mesh, so that no symmetry hides such an error: PIN and
+    # TIE across an interface whose faces have a cylindrical and a rectangular transform, a
+    # face pinned to a reference point, a LINK to a transformed node; then with a rectangular
+    # or cylindrical transform on the loaded reference point (its load in the local axes),
+    # and under NLGEOM (the LINK as ccx's *MPC BEAM).  The equations in global components
+    # (abq2ccx before) miss here by 103-111 % of max |u| (ccx only warns of a zero coefficient
+    # in cascade), in the probes by 44-190 % without a message, or stop ccx.
+    mpc_tr = open(os.path.join(EXAMPLES, "mpc_transform.inp")).read()
+    rp_xyz = (2.6, 0.35, 0.2)
+    failures += same_as("mpc_transform (PIN / TIE across faces with different *TRANSFORMs, a "
+                        "LINK to a transformed node)", mpc_tr, untransformed(mpc_tr))
+    failures += same_as("mpc_transform with a rectangular *TRANSFORM on the loaded reference point",
+                        with_transform(mpc_tr, 301, *rect, rp_xyz), untransformed(mpc_tr))
+    failures += same_as("mpc_transform with a cylindrical *TRANSFORM on the loaded reference point",
+                        with_transform(mpc_tr, 301, *cyl, rp_xyz), untransformed(mpc_tr))
+    nl_mpc_tr = mpc_tr.replace("*Step\n*Static\n", "*Step, nlgeom=YES\n*Static\n0.1, 1., 1e-6, 0.2\n") \
+        .replace("301, 1, 2.\n301, 2, -3.\n301, 3, 1.", "301, 1, 10.\n301, 2, -15.\n301, 3, 5.")
+    failures += same_as("mpc_transform, NLGEOM x5, with a cylindrical *TRANSFORM on the reference "
+                        "point", with_transform(nl_mpc_tr, 301, *cyl, rp_xyz),
+                        untransformed(nl_mpc_tr))
 
     # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs ----------
     # A column pulled through a rigid reference point: the velocity ramps in by a SMOOTH

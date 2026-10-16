@@ -84,7 +84,7 @@ prints one `PASS` line per check, about seventy in all; [testing](docs/testing.m
 | the same plate loaded through `SFM3D8` surface elements | its face-pressure result | 7 digits |
 | circular, pipe, box and planar beams; beam line loads; pinned, tied and hinged spans | beam theory, Euler buckling | ≤ 1.3 % |
 | Cook's membrane under a shear traction; a thick cylinder under a radial traction | published 23.96; Lamé | 0.12 %; 0.02 % |
-| rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads and connectors on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
+| rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads, connectors and `*MPC`s on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
 | per-element `*DISTRIBUTION` orientations (a solid plate, a composite shell) | one `*ORIENTATION` per element | ≤ 3e-11 |
 | thermal expansion (orthotropic, anisotropic, no initial temperatures) | α ΔT; analytic stress | ≤ 5e-6 |
 | velocity / acceleration BCs; displacement BCs without an amplitude | their time integral; wave theory; Abaqus' default amplitudes | 5e-5 of the travel; wave stress ≈ 1 % on average; exact |
@@ -167,6 +167,7 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`mpc_beam_lever`](examples/mpc_beam_lever.inp), [`mpc_pin_tie_joints`](examples/mpc_pin_tie_joints.inp), [`mpc_link`](examples/mpc_link.inp) | `*MPC BEAM`, `PIN`, `TIE`, `LINK` |
 | [`connector_hinge_beams`](examples/connector_hinge_beams.inp), [`connector_hinge_bodies`](examples/connector_hinge_bodies.inp), [`connector_ground_hinge`](examples/connector_ground_hinge.inp) | `CONN3D2` `HINGE` connectors between beams, rigid bodies and to ground |
 | [`connector_transform_plate`](examples/connector_transform_plate.inp), [`connector_transform_join`](examples/connector_transform_join.inp) | `JOIN` / `LINK` connectors on nodes with a `*TRANSFORM` |
+| [`mpc_transform`](examples/mpc_transform.inp) | `*MPC` `PIN`, `TIE` and `LINK` on nodes with a `*TRANSFORM` → local DOFs, twin nodes |
 | [`op_new_respecify`](examples/op_new_respecify.inp), [`op_new_remove`](examples/op_new_remove.inp) | `*BOUNDARY, OP=NEW` after rotational BCs on beams and shells |
 | [`distribution_solid_plate`](examples/distribution_solid_plate.inp), [`distribution_shell_plate`](examples/distribution_shell_plate.inp) | per-element `*DISTRIBUTION` orientations (solid, composite S8R); `*_explicit` are their one-orientation-per-element twins |
 | [`thermal_expansion_cubes`](examples/thermal_expansion_cubes.inp) | isotropic `*Elastic` beside ORTHO / ANISO `*Expansion` |

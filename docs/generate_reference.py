@@ -169,7 +169,11 @@ TRANSLATED = {
             "(shell/beam rotations through knots, DOF 11 in thermal steps); `BEAM` → one "
             "`*RIGID BODY` per independent node (chained lines one body); `LINK` → linearised "
             "`*EQUATION` without `NLGEOM`, ccx `*MPC BEAM` with it (not on beam/shell/plane "
-            "nodes); `PLANE`/`STRAIGHT` kept; user MPCs and other types commented, line by line.",
+            "nodes); `PLANE`/`STRAIGHT` kept; user MPCs and other types commented, line by line. "
+            "On a node with a `*TRANSFORM` the equations are in its local DOFs, one local term "
+            "per node (through an untransformed twin node where it would need several); a node "
+            "without defined local axes, or a `TIE` on a transformed shell/beam node's "
+            "rotations, leaves its node pair commented.",
     "*CONNECTOR SECTION": "its `CONN3D2`/`CONN2D2` elements (never emitted; ccx has no connector "
         "element) become the kinematic constraint of the connection type: `JOIN`, `REVOLUTE`, "
         "`ALIGN`, `HINGE` → `*EQUATION`s in the translations and rotation vectors (rotations on a "
