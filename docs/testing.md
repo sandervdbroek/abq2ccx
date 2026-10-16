@@ -208,7 +208,7 @@ conversion behaviour and referential integrity.
 | `test_rotation_tie_on_a_member_bc_makes_the_body_dependent` | a shell member's rotation under a BC: on a `*RIGID BODY` it moves to the `ROT NODE` (the tie keeps the member dependent); where it stays on the members (BCs that differ, warned) the `ROT NODE` DOF becomes the first tie's dependent term and the second tie is dropped; on a `*KINEMATIC` reference node (whose DOFs 4–6 ccx eliminates itself) the tie is dropped instead |
 | `test_coupling_bc_bars_example` | the `coupling_bc_bars` validation deck: bars A and C lose their 27 redundant end-face BCs, bar B (the same constraints without a coupling) keeps its own; no warnings, no dangling refs |
 | `test_consistent_nodal_forces_integrate_shape_functions` | the face/edge integrator: a unit load gives ¼ per quad4 node, −1/12 and ⅓ on quad8 corners and midsides, ⅙ per tri3 node, 0 and ⅙ on tri6 corners and midsides, ⅙-⅙-⅔ on a 3-node edge, and 2π ∫ N r ds on an axisymmetric edge |
-| `test_dsload_traction_becomes_consistent_nodal_forces` | `*DSLOAD TRVEC` on a C3D8 face → a `*CLOAD` of magnitude × area / 4 per node along the normalised direction; `TRSHR` projected onto the face; a `TRSHR` normal to the face is refused; element-based `TRVEC2` is the same load |
+| `test_dsload_traction_becomes_consistent_nodal_forces` | `*DSLOAD TRVEC` on a C3D8 face → a `*CLOAD` of magnitude × area / 4 per node along the normalised direction; `TRSHR` projected onto the face; a face the `TRSHR` direction is normal to gets no load (as in Abaqus), and a `TRSHR` with no shear part anywhere is refused; element-based `TRVEC2` is the same load |
 | `test_traction_on_plane_and_axisymmetric_edges` | a plane-stress edge traction is times the section thickness and in-plane only; an axisymmetric one is over the full circle (2πr) |
 | `test_traction_under_nlgeom_converts_only_when_exact` | under NLGEOM a follower (`FOLLOWER=YES`, the default) or per-current-area (`CONSTANT RESULTANT=NO`) traction is commented and the step flagged; `FOLLOWER=NO, CONSTANT RESULTANT=YES` converts; `--approximate` converts the rest with `[APPROX]` |
 | `test_converted_loads_across_steps_never_use_op_new` | converted forces carry their `AMPLITUDE`; an unchanged load is not re-emitted; `*DSLOAD, OP=NEW` gives the old traction's nodes 0 instead of `OP=NEW`; after the deck's own `*CLOAD, OP=NEW` the converted forces are given again |
@@ -368,8 +368,8 @@ deck and runs it in CalculiX:
   q L⁴/(8 E I): 0.1 %, 1.2 % and 0.6 % (the 10-element `B32` is stiffest).
 * **`cylinder_traction_cax`** — an open-ended thick cylinder (`CAX8`) under internal pressure
   applied as a radial traction (`*DSLOAD TRVEC`): u_r at the inner and outer radius against
-  Lamé, within 0.02 % — the full-circle (2πr) convention of axisymmetric nodal forces, which
-  ccx shares with Abaqus (probed: a `*CLOAD` on a `CAX4` edge matches the same edge under
+  Lamé, within 0.02 % — the full-circle (2πr) total that ccx expects of a concentrated load
+  on an axisymmetric node (probed: a `*CLOAD` on a `CAX4` edge matches the same edge under
   pressure only as the 2π total).
 * **`traction_transformed_face`** and **`cook_membrane_traction` with `*TRANSFORM`** — ccx, like
   Abaqus, reads a `*CLOAD` on a node with a `*TRANSFORM` in the node's local axes, so the
@@ -900,8 +900,8 @@ Tractions and beam line loads (`*DLOAD PX/PY/PZ/P1/P2`, which ccx reads on a bea
 section-face pressure) now become consistent nodal forces: the face/edge shape functions
 integrated by Gauss quadrature over the undeformed geometry, times the plane-section
 thickness (probed: a ccx `*CLOAD` on a `CPS`/`CPE` node is the total for the section
-thickness) or over the full circle on axisymmetric edges (probed: ccx, like Abaqus, takes
-the 2π total there), emitted as a `*CLOAD` at the end of the step. ccx adds `*CLOAD`s on
+thickness) or over the full circle on axisymmetric edges (probed: ccx takes the 2π total
+there), emitted as a `*CLOAD` at the end of the step. ccx adds `*CLOAD`s on
 one node and DOF within a step and replaces them across steps (probed, as for `*DLOAD`), so
 the converted forces are re-emitted as totals when they change, never with `OP=NEW` (which
 would also remove the deck's own concentrated loads). Nodal forces are exact in small-strain

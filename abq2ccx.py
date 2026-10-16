@@ -1780,8 +1780,9 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
     "area" (3/6/4/8 nodes), corner nodes first.  ``load(point, normal, tangent)`` gives
     the traction / line load vector there: an edge passes its in-plane (x-y) normal, a
     face its unit normal; the tangent is the unit edge direction (None on a face).  An
-    axisymmetric edge integrates over the full circle (2 pi r ds, r = x), the convention
-    of concentrated loads on axisymmetric elements in Abaqus and ccx alike."""
+    axisymmetric edge integrates over the full circle (2 pi r ds, r = x): ccx reads a
+    concentrated load on an axisymmetric node as the total around the circumference
+    (probed on 2.23 against a pressure-loaded twin)."""
     n = len(xyz)
     rule = (((g, 0.0, w) for g, w in _GAUSS_LINE) if kind == "line" else
             _GAUSS_TRI if n in (3, 6) else _GAUSS_QUAD)
@@ -4304,8 +4305,11 @@ class Converter:
         RESULTANT=YES) — ccx keeps a *CLOAD fixed in direction and magnitude."""
         if not self._step_nlgeom:
             return None
-        if base in ("PX", "PY", "PZ", "P1", "P2"):
-            return "under NLGEOM a beam line load acts on the deforming beam"
+        if base in ("P1", "P2"):
+            return "under NLGEOM a beam line load in the local directions rotates with the beam"
+        if base in ("PX", "PY", "PZ"):
+            return ("under NLGEOM Abaqus keeps a global beam line load fixed in direction but does "
+                    "not document whether it acts per unit original or current length")
         if base == "TRSHR":
             return "under NLGEOM a shear traction (TRSHR) stays tangent to the deforming surface"
         if base == "P":
@@ -4324,11 +4328,13 @@ class Converter:
         """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2) or surface-element
         pressure (P) data line ``g`` -> consistent nodal forces (consistent_nodal_forces over
         ``faces``), registered for the *CLOAD at the end of the step (_flush_nodal_loads).
-        Returns the comment lines that take the load's place in the deck.  TRVEC: magnitude x
-        the unit direction; TRSHR: the direction projected onto the face (in its undeformed
-        geometry, as in Abaqus) at every integration point; P: along the face normal, with each
-        face's sense (_load_faces); plane-element edges carry the section thickness,
-        axisymmetric edges the full circle; a 2-D model has no third component."""
+        Returns the comment lines that take the load's place in the deck.  As the Abaqus
+        Analysis User's Guide defines them: TRVEC is the magnitude times the normalized
+        direction; TRSHR projects the direction onto the face in its undeformed geometry, at
+        every integration point, and normalizes it — a point where the direction is normal to
+        the face gets no load.  P acts along the face normal, with each face's sense
+        (_load_faces); plane-element edges carry the section thickness, axisymmetric edges the
+        full circle; a 2-D model has no third component."""
         label = g[1].upper()
         base = label[:5] if label.startswith("TR") else label
         if why:
@@ -4344,11 +4350,11 @@ class Converter:
                                               f"does not apply")
         inexact = self._nodal_load_inexact(b, base)
         if inexact and not self._approx:
-            return self._drop_load_line(b, g, f"{inexact}, which nodal forces from the undeformed "
-                                              f"geometry cannot follow (they are exact in small-"
-                                              f"strain steps, and under NLGEOM for TRVEC with "
-                                              f"FOLLOWER=NO, CONSTANT RESULTANT=YES); rerun with "
-                                              f"--approximate to apply them anyway")
+            return self._drop_load_line(b, g, f"{inexact}; nodal forces from the undeformed "
+                                              f"geometry are known to be exact only in small-strain "
+                                              f"steps, and under NLGEOM for TRVEC with FOLLOWER=NO, "
+                                              f"CONSTANT RESULTANT=YES — rerun with --approximate to "
+                                              f"apply them anyway")
         degenerate: List[int] = []
         if base in ("TRVEC", "TRSHR"):
             if any(f[4] for f in faces):                      # 2-D: in-plane components only
@@ -4391,12 +4397,17 @@ class Converter:
                 for k in range(2 if planar else 3):
                     if v[k]:
                         forces[(nd, k + 1)] = forces.get((nd, k + 1), 0.0) + scale * v[k]
-        if degenerate:
-            return self._drop_load_line(b, g, "its direction is normal to the surface (no shear "
-                                              "component)" if base == "TRSHR" else
-                                              "a beam is parallel to its n1 direction")
+        if degenerate and base != "TRSHR":
+            return self._drop_load_line(b, g, "a beam is parallel to its n1 direction")
         big = max((abs(v) for v in forces.values()), default=0.0)
         forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
+        if degenerate:
+            if not forces:
+                return self._drop_load_line(b, g, "its direction is normal to the surface "
+                                                  "everywhere, so it has no shear component "
+                                                  "(Abaqus applies no load there either)")
+            self.report.note(f"*{b.keyword} TRSHR on '{g[0]}': the direction is normal to part of the "
+                             f"surface, which carries no shear load there (as in Abaqus).", once=True)
         res = [sum(v for (_, k), v in forces.items() if k == c) for c in (1, 2, 3)]   # global
         n_loaded = len({n for n, _ in forces})
         local = sorted({n for n, _ in forces if n in self._transformed})

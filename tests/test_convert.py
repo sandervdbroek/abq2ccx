@@ -2928,6 +2928,12 @@ def test_dsload_traction_becomes_consistent_nodal_forces():
     body, conv, rep = convert_str(deck.format("TRSHR, 2., 0., 0., 1."))
     assert _cloads(body) == [{}] and "no shear component" in rep.text()
     assert conv.unloaded_steps == [1]
+    # where the direction is normal to a face, that face gets no shear load (Abaqus); the
+    # rest of the surface keeps its load
+    body, _, rep = convert_str(HEX + "*Surface, name=TWO\nEALL, S2\nEALL, S4\n*Step\n*Static\n"
+                                     "*Dsload\nTWO, TRSHR, 2., 1., 0., 0.\n*End Step\n")
+    assert _cloads(body) == [{(n, 1): 0.5 for n in (5, 6, 7, 8)}]
+    assert "normal to part of the surface" in rep.text()
     # an element-based traction on face 2 is the same load
     body, _, _ = convert_str(HEX + "*Step\n*Static\n*Dload\nEALL, TRVEC2, 4., 0., 0., -2.\n*End Step\n")
     assert _cloads(body) == [{(n, 3): -1.0 for n in (5, 6, 7, 8)}]
