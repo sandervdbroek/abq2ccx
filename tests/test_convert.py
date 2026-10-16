@@ -742,12 +742,34 @@ def test_independent_instance_undefined_part_no_crash():
 
 
 def test_dsload_unmappable_face_warns():
-    # *DSLOAD on a surface whose face is not S1..S6 (e.g. a shell SPOS) cannot become a ccx
-    # Px label; it must warn rather than silently emit a bare 'P' that ccx rejects.
-    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n*Element,type=S4,elset=e\n1,1,2,3,4\n"
-            "*Surface,type=element,name=sf\ne, SPOS\n*Step\n*Static\n*Dsload\nsf, P, 5.0\n*End Step\n")
+    # *DSLOAD on a surface whose face is neither S1..S6 nor a shell / membrane side (here
+    # SPOS on a solid) cannot become a ccx Px label; it must warn rather than silently emit
+    # a bare 'P' that ccx rejects.
+    deck = HEX + ("*Elset, elset=e\n1\n*Surface,type=element,name=sf\ne, SPOS\n*Step\n*Static\n"
+                  "*Dsload\nsf, P, 5.0\n*End Step\n")
     _, _, rep = convert_str(deck)
     assert "px equivalent" in rep.text().lower()
+
+
+def test_shell_and_membrane_pressure_sides():
+    # Abaqus pushes a surface pressure against the surface normal (SPOS along -n, SNEG along
+    # +n) and an element-based *DLOAD P along +n; ccx's *DLOAD P on a shell and P1 on a
+    # membrane push along +n, and ccx stops on P on a membrane (probed on 2.23).
+    def card(typ, face=None):
+        load = (f"*Surface,type=element,name=sf\ne, {face}\n*Step\n*Static\n*Dsload\nsf, P, 5.0\n"
+                if face else "*Step\n*Static\n*Dload\ne, P, 5.0\n")
+        deck = (f"*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n*Element,type={typ},elset=e\n"
+                f"1,1,2,3,4\n" + load + "*End Step\n")
+        body, _, rep = convert_str(deck)
+        return [ln for ln in body.splitlines() if ln.startswith("e, P")][0], rep
+    assert card("S4", "SPOS")[0] == "e, P, -5."
+    assert card("S4", "SNEG")[0] == "e, P, 5.0"
+    assert card("S4")[0] == "e, P, 5.0"
+    assert card("M3D4", "SPOS")[0] == "e, P1, -5."
+    assert card("M3D4", "SNEG")[0] == "e, P1, 5.0"
+    assert card("M3D4")[0] == "e, P1, 5.0"
+    for typ, face in (("S4", "SPOS"), ("S4", None), ("M3D4", None)):
+        assert card(typ, face)[1].n_warnings == 0, card(typ, face)[1].text()
 
 
 def test_ngen_descending_range_warns():
@@ -836,10 +858,20 @@ def test_smooth_step_amplitude_sampled():
     lines = body.splitlines()
     i = next(k for k, l in enumerate(lines) if l.upper().startswith("*AMPLITUDE"))
     assert "DEFINITION" not in lines[i].upper()               # param dropped from the card
-    pts = [tuple(float(x) for x in l.split(",")) for l in lines[i + 1:i + 12]]
-    assert len(pts) == 11 and pts[0] == (0.0, 0.0) and pts[-1] == (1.0, 1.0)
+    pts = []
+    for l in lines[i + 1:]:
+        if l.startswith("*"):
+            break
+        pts.append(tuple(float(x) for x in l.split(",")))
+    assert len(pts) == 101 and pts[0] == (0.0, 0.0) and pts[-1] == (1.0, 1.0)
     assert abs(dict(pts)[0.5] - 0.5) < 1e-12                  # quintic midpoint
     assert abs(dict(pts)[0.2] - 0.05792) < 1e-9               # x^3(10-15x+6x^2) at 0.2
+    # between the points the table stays within 7.2e-5 of the quintic (h^2/8 max|f''|)
+    quintic = lambda x: x ** 3 * (10 - 15 * x + 6 * x * x)
+    worst = max(abs(a0 + (a1 - a0) * (x - t0) / (t1 - t0) - quintic(x))
+                for (t0, a0), (t1, a1) in zip(pts, pts[1:]) for x in (t0 + (t1 - t0) * k / 8
+                                                                      for k in range(9)))
+    assert worst < 7.3e-5, worst
     assert "sampled" in rep.text().lower()
 
 
@@ -908,7 +940,7 @@ def test_kinematic_rotational_dofs_clamped():
     body, _, rep = convert_str(deck)
     assert kinematic_line(body).replace(" ", "") == "1,2" and "DOFs above 2 left out" in rep.text()
     body, _, rep = convert_str(deck.replace("1, 6\n", ""))          # empty card: Abaqus' all
-    assert kinematic_line(body).replace(" ", "") == "1,2" and "synthesized '1, 2'" in rep.text()
+    assert kinematic_line(body).replace(" ", "") == "1,2" and "'1, 2' is written" in rep.text()
     body, _, _ = convert_str(deck.replace("*Coupling, constraint name=C, ref node=9, surface=S\n"
                                           "*Kinematic\n1, 6\n",
                                           "*Nset, nset=M\n1, 2\n*Kinematic Coupling, ref node=9\n"
@@ -5162,6 +5194,251 @@ def test_default_amplitude_explicit_hold_feeds_the_velocity_plan():
     assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nTOP, 3, 3, 1.\n" in _step(body, 3)
     assert _amplitude(body, "ABQ2CCX_VEL2") == [(0.0, 1.0), (1.0, 2.0)]
 
+# --- solve fidelity: exact conversions and the reduced-physics record -------------------
+PLANE2 = ("*Node\n1,0.,0.\n2,2.,0.\n3,4.,0.\n4,0.,1.\n5,2.,1.\n6,4.,1.\n"
+          "*Element, type=CPS4I, elset=B\n1,1,2,5,4\n2,2,3,6,5\n*Nset, nset=ROOT\n1,4\n"
+          "*Material, name=STEEL\n*Elastic\n1000., 0.3\n*Density\n7.8e-9\n"
+          "*Solid Section, elset=B, material=STEEL\n0.5,\n*Boundary\nROOT, ENCASTRE\n")
+
+
+def test_cps4i_written_as_c3d8i_slab():
+    # ccx has no incompatible-mode plane element; a CPS4I becomes a C3D8I slab one section
+    # thickness deep on its 2-D nodes, with plane stress through an ORTHO material
+    deck = PLANE2 + "*Step\n*Static\n*Dload\n2, P2, 1.\n*Cload\n6, 2, -1.\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=C3D8I" in body and "CPS4" not in body.split("*NSET")[0]
+    assert re.search(r"^1, 1, 2, 5, 4, 7, 8, 9, 10$", body, re.M), body[:600]
+    assert "\n7, 0, 0, 0.5\n" in body                    # top node one thickness above node 1
+    assert "*EQUATION\n2\n7, 1, 1., 1, 1, -1." in body and "ABQ2CCX_SLAB, 3, 3" in body
+    assert "*ELASTIC, TYPE=ORTHO" in body and "STEEL_PLANE_STRESS" in body
+    ortho = body.split("*ELASTIC, TYPE=ORTHO\n")[1].splitlines()
+    vals = [float(x) for x in ortho[0].split(",")] + [float(ortho[1])]
+    d11, g = 1000. / (1 - 0.09), 1000. / 2.6
+    assert all(abs(a - b) <= 1e-6 * d11 for a, b in
+               zip(vals, (d11, 0.3 * d11, d11, 0., 0., 1000., g, g, g))), vals
+    assert "*DENSITY\n7.8e-9" in body or "*DENSITY\n7.8E-09" in body.upper()
+    assert "2, P4, 1." in body                           # edge 2 is the slab's side face 4
+    assert conv.reduced_physics == [] and rep.n_warnings == 0, rep.text()
+    # a plane-strain CPE4I keeps its material; DOF 3 is held again after OP=NEW
+    body, conv, _ = convert_str(deck.replace("CPS4I", "CPE4I").replace(
+        "*Dload", "*Boundary, op=NEW\nROOT, 1, 2\n*Dload"))
+    assert "material=STEEL" in body.replace("MATERIAL", "material") and "ORTHO" not in body
+    assert body.count("ABQ2CCX_SLAB, 3, 3") == 2 and conv.reduced_physics == []
+    # *ELASTIC with E alone has nu = 0 (a blank field, as Abaqus reads it)
+    body, conv, _ = convert_str(deck.replace("1000., 0.3\n", "1000.\n"))
+    ortho = body.split("*ELASTIC, TYPE=ORTHO\n")[1].splitlines()
+    assert [float(x) for x in ortho[0].split(",")] == [1000., 0., 1000., 0., 0., 1000., 500., 500.]
+    assert conv.reduced_physics == []
+    # a Poisson's ratio the plane-stress stiffness cannot take keeps the plain element
+    body, conv, _ = convert_str(deck.replace("1000., 0.3\n", "1000., 1.\n"))
+    assert "C3D8I" not in body and conv.reduced_physics
+
+
+def test_cps4i_outside_the_exact_slab_form_is_reduced_physics():
+    # NLGEOM (and plasticity, contact, couplings ...) keep the old CPS4 stand-in, which locks in
+    # bending: reduced physics
+    deck = PLANE2 + "*Step, nlgeom=YES\n*Static\n*Cload\n6, 2, -1.\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert "TYPE=CPS4\n" in body and "C3D8I" not in body
+    assert conv.reduced_physics == ["element CPS4I -> CPS4 (incompatible modes dropped)"]
+    assert "a step runs NLGEOM" in rep.text() and "Reduced physics" in rep.text()
+    deck = PLANE2.replace("*Density\n7.8e-9\n", "*Plastic\n10., 0.\n") + \
+        "*Step\n*Static\n*Cload\n6, 2, -1.\n*End Step\n"
+    assert "material STEEL has *PLASTIC" in convert_str(deck)[2].text()
+    # CPE4I: Abaqus adds a fifth, volumetric mode, which matters off a parallelogram
+    deck = PLANE2.replace("CPS4I", "CPE4I").replace("6,4.,1.", "6,4.5,1.") + \
+        "*Step\n*Static\n*Cload\n6, 2, -1.\n*End Step\n"
+    _, conv, rep = convert_str(deck)
+    assert conv.reduced_physics and "not a parallelogram" in rep.text()
+
+
+def test_reduced_physics_record():
+    # a dropped constitutive card, a replaced element formulation and a dropped interaction
+    # are reduced physics; exact substitutions, output requests and numerical controls are not
+    plain = HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
+    step = "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n"
+    _, conv, _ = convert_str(plain + step)
+    assert conv.reduced_physics == []
+    _, conv, rep = convert_str(plain.replace("*Solid", "*Plastic, hardening=USER\n3\n*Solid") + step)
+    assert conv.reduced_physics == ["*PLASTIC"] and "Reduced physics" in rep.text()
+    _, conv, _ = convert_str(plain.replace("*Solid", "*Concrete Damaged Plasticity\n30., 0.1\n*Solid")
+                             + step)
+    assert conv.reduced_physics == ["*CONCRETE DAMAGED PLASTICITY"]
+    _, conv, _ = convert_str(plain.replace("C3D8", "C3D8H") + step)
+    assert conv.reduced_physics == ["element C3D8H -> C3D8"]
+    _, conv, _ = convert_str(plain + "*Energy Output\n*Bulk Viscosity\n0.06, 1.2\n"
+                                     "*File Format, ascii\n" + step)
+    assert conv.reduced_physics == [], conv.reduced_physics
+    tri = ("*Node\n1,0.,0.\n2,1.,0.\n3,0.,1.\n*Element, type={}, elset=E\n1,1,2,3\n"
+           "*Material, name=M\n*Elastic\n1000., 0.3\n*{} Section, elset=E, material=M\n0.1\n"
+           "*Boundary\n1, 1, 3\n2, 2, 3\n*Step\n*Static\n*Cload\n3, 2, 1.\n*End Step\n")
+    for typ, sec, reduced in (("CPE3H", "Solid", False), ("S3R", "Shell", False),
+                              ("STRI3", "Shell", True), ("CPS6M", "Solid", True)):
+        deck = tri.format(typ, sec)
+        if typ == "CPS6M":
+            deck = deck.replace("1,1,2,3\n", "1,1,2,3,4,5,6\n").replace(
+                "3,0.,1.\n", "3,0.,1.\n4,0.5,0.\n5,0.5,0.5\n6,0.,0.5\n")
+        _, conv, rep = convert_str(deck)
+        assert bool(conv.reduced_physics) == reduced, (typ, conv.reduced_physics, rep.text())
+    # a *SECTION CONTROLS whose options do not apply (SECOND ORDER ACCURACY in Abaqus/Standard,
+    # hourglass factors 1 on a fully integrated element) changes nothing; ENHANCED hourglass
+    # control on a C3D8R does
+    sc = plain.replace("material=M\n", "material=M, controls=EC\n") + \
+        "*Section Controls, name=EC, second order accuracy=YES\n1., 1., 1.\n" + step
+    _, conv, rep = convert_str(sc)
+    assert conv.reduced_physics == [] and "changes nothing" in rep.text()
+    _, conv, _ = convert_str(sc.replace("C3D8,", "C3D8R,").replace("second order accuracy=YES",
+                                                                    "hourglass=ENHANCED"))
+    assert conv.reduced_physics == ["*SECTION CONTROLS (HOURGLASS=ENHANCED on C3D8R)"]
+
+
+def test_node_system_cylindrical_and_spherical():
+    # Abaqus *NODE, SYSTEM=C gives R, theta (degrees), Z; SYSTEM=S gives R, theta, phi with phi
+    # up from the X-Y plane (Abaqus 'Node definition')
+    body, conv, _ = convert_str("*Node, system=C\n1, 10., 20., 5.\n*Node, system=S\n2, 2., 90., 30.\n")
+    x, y, z = conv.geom.nodes[1]
+    assert abs(x - 10 * math.cos(math.radians(20))) < 1e-12 and abs(y - 10 * math.sin(math.radians(20))) < 1e-12
+    assert z == 5.0
+    x, y, z = conv.geom.nodes[2]
+    assert abs(x) < 1e-12 and abs(y - math.sqrt(3)) < 1e-12 and abs(z - 1.0) < 1e-12
+    assert conv.reduced_physics == []
+    # a normal on such a line is given in the same form (*NODE: its second entry is an angle,
+    # in a spherical system its third too): 1, 20, 0 is the radial direction at theta = 20
+    body, conv, _ = convert_str("*Node, system=C\n1, 10., 20., 5., 1., 20., 0.\n"
+                                "*Node, system=S\n2, 2., 90., 30., 1., 90., 30.\n")
+    nx, ny, nz = conv._node_normals[1]
+    assert abs(nx - math.cos(math.radians(20))) < 1e-12 and abs(ny - math.sin(math.radians(20))) < 1e-12
+    assert abs(nz) < 1e-12
+    nx, ny, nz = conv._node_normals[2]
+    assert abs(nx) < 1e-12 and abs(ny - math.sqrt(3) / 2) < 1e-12 and abs(nz - 0.5) < 1e-12
+
+
+def test_node_normals_become_normal_cards():
+    # Abaqus uses the *NODE normal for every shell element at the node; ccx would average the
+    # element normals, so they are written as *NORMAL lines (a deck's own *NORMAL wins)
+    deck = ("*Node\n1,0.,0.,0.,0.,0.6,0.8\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+            "*Element, type=S4, elset=E\n7,1,2,3,4\n")
+    body, conv, rep = convert_str(deck)
+    assert "*NORMAL\n7, 1, 0, 0.6, 0.8" in body.replace("0.,", "0,").replace("0.0,", "0,") or \
+        re.search(r"\*NORMAL\n7, 1, [-0. ]*, 0\.6, 0\.8", body), body
+    assert conv.reduced_physics == []
+    body, _, _ = convert_str(deck + "*Normal\n7, 1, 0., 0., 1.\n")
+    assert body.count("*NORMAL") == 1
+
+
+def test_buckle_load_case_two_cards():
+    # Abaqus/CAE writes each buckling BC for LOAD CASE=1 and 2; ccx has one set of BCs: the
+    # repeats are left out (exact), differing buckling-mode BCs are reduced physics
+    base = HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
+    step = ("*Step, perturbation\n*Buckle\n2\n*Boundary, op=NEW, load case=1\n1, 1, 3\n"
+            "*Boundary, op=NEW, load case=2\n1, 1, 3\n*Cload\n7, 3, -1.\n*End Step\n")
+    body, conv, rep = convert_str(base + step)
+    cards = [ln for ln in body.splitlines() if ln.startswith("*BOUNDARY")]
+    assert cards == ["*BOUNDARY, OP=NEW"] and conv.reduced_physics == [], body
+    body, conv, rep = convert_str(base + step.replace("load case=2\n1, 1, 3", "load case=2\n1, 1, 2"))
+    assert conv.reduced_physics == ["*BUCKLE buckling-mode BCs (*BOUNDARY, LOAD CASE=2)"]
+
+
+def _normal_rows(body):
+    return [[float(x) for x in ln.split(",")] for ln in _card(body, "*NORMAL")]
+
+
+def test_node_normals_blank_fields_trusses_knots_and_undefined_nodes():
+    # *NODE fields are positional: a blank normal component is 0, as Abaqus reads it
+    shell = ("*Node\n1,0.,0.,0.,0., ,1.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
+             "*Element, type=S4, elset=E\n7,1,2,3,4\n")
+    body, conv, _ = convert_str(shell)
+    assert _normal_rows(body) == [[7., 1., 0., 0., 1.]] and conv.reduced_physics == []
+    # a truss has no cross-section orientation, a beam takes its n2 from the normal
+    body, conv, _ = convert_str(shell + "*Element, type=T3D2, elset=T\n8,1,2\n")
+    assert conv.reduced_physics == [], conv.reduced_physics
+    body, conv, _ = convert_str(shell + "*Element, type=B31, elset=B\n8,1,2\n")
+    assert conv.reduced_physics == ["*NODE normals of beam nodes (cross-section orientation)"]
+    # the converter's own knot beams (a rigid coupling on shell nodes) are no such beams
+    body, conv, _ = convert_str(shell + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=TIPN\n1, 2\n"
+                                "*Kinematic Coupling, ref node=100\nTIPN, 1, 6\n")
+    assert "ABQ2CCX_KNOT" in body and not any("normals" in r for r in conv.reduced_physics)
+    # an element on an undefined node does not stop the conversion
+    body, conv, _ = convert_str(shell.replace("7,1,2,3,4", "7,1,2,3,99"))
+    assert "*ELEMENT, TYPE=S4" in body
+
+
+def test_node_system_empty_record_and_cps4i_slab_guards():
+    body, conv, _ = convert_str("*Node, system=C\n1, 10., 0., 0.\n,\n2, 10., 90., 0.\n")
+    assert abs(conv.geom.nodes[2][1] - 10.) < 1e-12 and abs(conv.geom.nodes[2][0]) < 1e-12
+    # an element on an undefined node, or a step the slab is not probed for, keeps the
+    # plain element (reduced physics) instead of stopping the conversion
+    load = "*Step\n*Static\n*Cload\n6, 2, -1.\n*End Step\n"
+    body, conv, _ = convert_str(PLANE2.replace("2,2,3,6,5", "2,2,3,99,5") + load)
+    assert "C3D8I" not in body and conv.reduced_physics
+    body, conv, _ = convert_str(PLANE2 + "*Step\n*Frequency\n3\n*End Step\n")
+    assert "C3D8I" not in body and conv.reduced_physics == ["element CPS4I -> CPS4 (incompatible modes dropped)"]
+    # a planar beam beside the slabs is still held in its plane
+    beam = ("*Node\n50, 10., 0.\n51, 11., 0.\n*Element, type=B21, elset=BM\n90, 50, 51\n"
+            "*Beam Section, elset=BM, material=STEEL, section=RECT\n0.1, 0.1\n")
+    body, conv, rep = convert_str(PLANE2 + beam + load.replace("6, 2", "51, 2"))
+    assert "C3D8I" in body and "ABQ2CCX_PLANAR" in body and conv.reduced_physics == [], rep.text()
+
+
+def test_steady_state_dynamics_real_and_imaginary_parts():
+    # Abaqus gives the out-of-phase part with IMAGINARY and ignores LOAD CASE outside
+    # *BUCKLE; ccx reads LOAD CASE=2 as the imaginary part
+    base = (HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-9\n"
+            "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n")
+    ssd = "*Steady State Dynamics\n10., 100., 5\n"
+    body, conv, rep = convert_str(
+        base + "*Step\n*Frequency\n4\n*End Step\n*Step\n" + ssd + "*Cload, imaginary\n7, 3, 1.\n"
+        "*Cload, real\n8, 3, 1.\n*Boundary, imaginary\n5, 1, 1, 0.001\n"
+        "*Boundary, load case=2\n6, 1, 1, 0.001\n*End Step\n")
+    live = _live(body)
+    assert "*CLOAD, LOAD CASE=2" in live and "*BOUNDARY, LOAD CASE=2" in live, body
+    assert sum("LOAD CASE" in ln for ln in live) == 2 and conv.reduced_physics == []
+    # a PERTURBATION steady-state dynamics step is no static perturbation step
+    body, conv, rep = convert_str(
+        base + "*Step, perturbation\n*Frequency\n4\n*End Step\n" +
+        2 * ("*Step, perturbation\n" + ssd + "*Cload\n7, 3, 1.\n*End Step\n"))
+    assert conv.reduced_physics == [] and "PERTURBATION on a static step" not in rep.text()
+
+
+def test_field_dependencies_exact_only_where_abaqus_has_that_state():
+    # field 0 a state of the table: its rows, exact (other temperatures elsewhere do not matter)
+    rows = "1000.,0.3,0.,0.\n2000.,0.3,100.,0.\n500.,0.3,0.,1.\n700.,0.3,50.,1.\n900.,0.3,100.,1.\n"
+    body, conv, _ = convert_str("*Material,name=M\n*Elastic,dependencies=1\n" + rows)
+    assert _card(body, "*ELASTIC") == ["1000., 0.3, 0.", "2000., 0.3, 100."] and conv.reduced_physics == []
+    # 0 between two states given at different temperatures: not reproduced exactly
+    body, conv, _ = convert_str("*Material,name=M\n*Elastic,dependencies=1\n" +
+                                rows.replace(",0.\n", ",-1.\n"))
+    assert conv.reduced_physics == ["*ELASTIC field-variable dependence"]
+    # a single state at another field value: Abaqus holds it beyond the table, exact
+    body, conv, _ = convert_str("*Material,name=M\n*Density, dependencies=1\n7.8e-9, , 1.\n")
+    assert _card(body, "*DENSITY") == ["7.8e-9"] and conv.reduced_physics == []
+
+
+def test_distribution_trailing_blank_is_zero():
+    body, conv, rep = convert_str(HEX3 + "*Distribution, name=Disc\n, 1., 0., 0., 0., 1., 0.\n"
+                                  "2, 0.866025403784, 0.5, 0., -0.5, 0.866025403784,\n"
+                                  "*Orientation, name=Ori-1\nDisc\n3, 0.\n"
+                                  "*Solid Section, elset=PAIR, material=M, orientation=Ori-1\n,\n")
+    assert _card(body, "*DISTRIBUTION, NAME=DISC")[1] == "2, 0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0."
+    assert conv.reduced_physics == [], conv.reduced_physics
+
+
+def test_section_controls_defaults_change_nothing():
+    base = (HEX.replace("C3D8,", "C3D8R,") + "*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=EALL, material=M, controls=SC\n")
+    # HOURGLASS=STIFFNESS is Abaqus/Standard's default; data-line value 7 is not used, 8 is an
+    # Abaqus/Explicit drill scale
+    body, conv, _ = convert_str(base + "*Section Controls, name=SC, hourglass=STIFFNESS\n"
+                                "1., 1., 2., 0.5, 0.5, 1., 5., 2.\n")
+    assert conv.reduced_physics == [], conv.reduced_physics
+    body, conv, _ = convert_str(base + "*Section Controls, name=SC\n2.\n")
+    assert conv.reduced_physics == ["*SECTION CONTROLS (data-line value 1 = 2.)"]
+
+
+def test_approximate_reframings_are_reduced_physics():
+    body, conv, _ = convert_str(HEX + "*Material, name=M\n*Elastic\n1000., 0.5\n"
+                                "*Solid Section, elset=EALL, material=M\n", approximate=True)
+    assert conv.reduced_physics == ["--approximate: *ELASTIC Poisson ratio >= 0.5 clamped to 0.475"]
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -2,7 +2,7 @@
 
 # Element reference
 
-Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged.
+Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged. A substitution is exact only where noted; any other replaces Abaqus' element formulation, which the converter records as reduced physics (`Converter.reduced_physics`, a header warning): ccx then solves a different discretization than Abaqus.
 
 Direct CalculiX types: **68**. Total recognised: **166**.
 
@@ -11,28 +11,28 @@ Direct CalculiX types: **68**. Total recognised: **166**.
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `C3D10` | 10 | direct |
-| `C3D10H` | 10 | → `C3D10` (substituted) |
-| `C3D10HS` | 10 | → `C3D10` (substituted) |
-| `C3D10M` | 10 | → `C3D10` (substituted) |
-| `C3D10MH` | 10 | → `C3D10` (substituted) |
+| `C3D10H` | 10 | → `C3D10` (substituted: reduced physics) |
+| `C3D10HS` | 10 | → `C3D10` (substituted: reduced physics) |
+| `C3D10M` | 10 | → `C3D10` (substituted: reduced physics) |
+| `C3D10MH` | 10 | → `C3D10` (substituted: reduced physics) |
 | `C3D10T` | 10 | direct |
 | `C3D15` | 15 | direct |
-| `C3D15H` | 15 | → `C3D15` (substituted) |
+| `C3D15H` | 15 | → `C3D15` (substituted: reduced physics) |
 | `C3D20` | 20 | direct |
-| `C3D20H` | 20 | → `C3D20` (substituted) |
+| `C3D20H` | 20 | → `C3D20` (substituted: reduced physics) |
 | `C3D20R` | 20 | direct |
-| `C3D20RH` | 20 | → `C3D20R` (substituted) |
+| `C3D20RH` | 20 | → `C3D20R` (substituted: reduced physics) |
 | `C3D20RI` | 20 | direct |
 | `C3D4` | 4 | direct |
-| `C3D4H` | 4 | → `C3D4` (substituted) |
+| `C3D4H` | 4 | → `C3D4` (substituted: reduced physics) |
 | `C3D6` | 6 | direct |
-| `C3D6H` | 6 | → `C3D6` (substituted) |
+| `C3D6H` | 6 | → `C3D6` (substituted: reduced physics) |
 | `C3D8` | 8 | direct |
-| `C3D8H` | 8 | → `C3D8` (substituted) |
+| `C3D8H` | 8 | → `C3D8` (substituted: reduced physics) |
 | `C3D8I` | 8 | direct |
-| `C3D8IH` | 8 | → `C3D8I` (substituted) |
+| `C3D8IH` | 8 | → `C3D8I` (substituted: reduced physics) |
 | `C3D8R` | 8 | direct |
-| `C3D8RH` | 8 | → `C3D8R` (substituted) |
+| `C3D8RH` | 8 | → `C3D8R` (substituted: reduced physics) |
 
 ## 3D fluid (CFD)
 
@@ -51,12 +51,12 @@ Direct CalculiX types: **68**. Total recognised: **166**.
 | --- | --- | --- |
 | `CAX3` | 3 | direct |
 | `CAX4` | 4 | direct |
-| `CAX4H` | 4 | → `CAX4` (substituted) |
+| `CAX4H` | 4 | → `CAX4` (substituted: reduced physics) |
 | `CAX4R` | 4 | direct |
 | `CAX6` | 6 | direct |
-| `CAX6M` | 6 | → `CAX6` (substituted) |
+| `CAX6M` | 6 | → `CAX6` (substituted: reduced physics) |
 | `CAX8` | 8 | direct |
-| `CAX8H` | 8 | → `CAX8` (substituted) |
+| `CAX8H` | 8 | → `CAX8` (substituted: reduced physics) |
 | `CAX8R` | 8 | direct |
 
 ## beam / truss
@@ -64,27 +64,27 @@ Direct CalculiX types: **68**. Total recognised: **166**.
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `B21` | 2 | direct |
-| `B21H` | 2 | → `B21` (substituted) |
-| `B22` | 3 | → `B32` (substituted) |
-| `B23` | 2 | → `B31` (substituted) |
+| `B21H` | 2 | → `B21` (substituted: reduced physics) |
+| `B22` | 3 | → `B32` (exact) |
+| `B23` | 2 | → `B31` (substituted: reduced physics) |
 | `B31` | 2 | direct |
-| `B31H` | 2 | → `B31` (substituted) |
+| `B31H` | 2 | → `B31` (substituted: reduced physics) |
 | `B31R` | 2 | direct |
 | `B32` | 3 | direct |
-| `B32H` | 3 | → `B32` (substituted) |
+| `B32H` | 3 | → `B32` (substituted: reduced physics) |
 | `B32R` | 3 | direct |
-| `B33` | 2 | → `B31` (substituted) |
-| `B33H` | 2 | → `B31` (substituted) |
-| `PIPE21` | 2 | → `B21` (substituted) |
-| `PIPE22` | 3 | → `B32` (substituted) |
-| `PIPE31` | 2 | → `B31` (substituted) |
-| `PIPE32` | 3 | → `B32` (substituted) |
+| `B33` | 2 | → `B31` (substituted: reduced physics) |
+| `B33H` | 2 | → `B31` (substituted: reduced physics) |
+| `PIPE21` | 2 | → `B21` (substituted: reduced physics) |
+| `PIPE22` | 3 | → `B32` (substituted: reduced physics) |
+| `PIPE31` | 2 | → `B31` (substituted: reduced physics) |
+| `PIPE32` | 3 | → `B32` (substituted: reduced physics) |
 | `T2D2` | 2 | direct |
-| `T2D3` | 3 | → `T3D3` (substituted) |
+| `T2D3` | 3 | → `T3D3` (exact) |
 | `T3D2` | 2 | direct |
 | `T3D3` | 3 | direct |
 
-Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is `B21` → `B32`, `B31` → `B32`, `B31R` → `B32R` become 3-node beams: ccx 2.23 rejects linear beams with a circular section. Each element gets a new midside node at the midpoint of its end nodes (ccx's order is end, middle, end); element ids and sets are kept, and BCs, temperatures and initial conditions given for both end nodes also reach the midside node.
+Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is `B21` → `B32`, `B31` → `B32`, `B31R` → `B32R` become 3-node beams: ccx 2.23 rejects linear beams with a circular section. Each element gets a new midside node at the midpoint of its end nodes (ccx's order is end, middle, end); element ids and sets are kept, and BCs, temperatures and initial conditions given for both end nodes also reach the midside node. The 3-node beam is a different element than Abaqus' 2-node one, so such a deck counts as reduced physics.
 
 Under `SECTION=PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), which ccx 2.23 runs only on `B32R`, beams whose emitted type is `B21`, `B31`, `B31R`, `B32` become `B32R`: the 2-node ones get a midside node in the same way, and `B32` only changes type.
 
@@ -94,10 +94,10 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `COH2D4` | 4 | → `CPE4` (substituted) |
-| `COH3D6` | 6 | → `C3D6` (substituted) |
-| `COH3D8` | 8 | → `C3D8` (substituted) |
-| `COHAX4` | 4 | → `CAX4` (substituted) |
+| `COH2D4` | 4 | → `CPE4` (substituted: reduced physics) |
+| `COH3D6` | 6 | → `C3D6` (substituted: reduced physics) |
+| `COH3D8` | 8 | → `C3D8` (substituted: reduced physics) |
+| `COHAX4` | 4 | → `CAX4` (substituted: reduced physics) |
 
 ## connector
 
@@ -110,12 +110,12 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `DASHPOT1` | 2 | → `DASHPOTA` (substituted) |
-| `DASHPOT2` | 2 | → `DASHPOTA` (substituted) |
+| `DASHPOT1` | 2 | → `DASHPOTA` (substituted: reduced physics) |
+| `DASHPOT2` | 2 | → `DASHPOTA` (substituted: reduced physics) |
 | `DASHPOTA` | 2 | direct |
 | `DCOUP3D` | 1 | direct |
-| `GAPCYL` | 2 | → `GAPUNI` (substituted) |
-| `GAPSPHER` | 2 | → `GAPUNI` (substituted) |
+| `GAPCYL` | 2 | → `GAPUNI` (substituted: reduced physics) |
+| `GAPSPHER` | 2 | → `GAPUNI` (substituted: reduced physics) |
 | `GAPUNI` | 2 | direct |
 | `MASS` | 1 | direct |
 | `ROTARYI` | 1 | flagged — no ccx equivalent |
@@ -133,24 +133,24 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `CGAX3` | 3 | → `CAX3` (substituted) |
-| `CGAX4` | 4 | → `CAX4` (substituted) |
-| `CGAX4R` | 4 | → `CAX4R` (substituted) |
-| `CGAX6` | 6 | → `CAX6` (substituted) |
-| `CGAX8` | 8 | → `CAX8` (substituted) |
-| `CGAX8R` | 8 | → `CAX8R` (substituted) |
+| `CGAX3` | 3 | → `CAX3` (substituted: reduced physics) |
+| `CGAX4` | 4 | → `CAX4` (substituted: reduced physics) |
+| `CGAX4R` | 4 | → `CAX4R` (substituted: reduced physics) |
+| `CGAX6` | 6 | → `CAX6` (substituted: reduced physics) |
+| `CGAX8` | 8 | → `CAX8` (substituted: reduced physics) |
+| `CGAX8R` | 8 | → `CAX8R` (substituted: reduced physics) |
 
 ## generalized plane strain
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `CPEG3` | 3 | → `CPE3` (substituted) |
-| `CPEG4` | 4 | → `CPE4` (substituted) |
-| `CPEG4R` | 4 | → `CPE4R` (substituted) |
-| `CPEG6` | 6 | → `CPE6` (substituted) |
-| `CPEG6M` | 6 | → `CPE6` (substituted) |
-| `CPEG8` | 8 | → `CPE8` (substituted) |
-| `CPEG8R` | 8 | → `CPE8R` (substituted) |
+| `CPEG3` | 3 | → `CPE3` (substituted: reduced physics) |
+| `CPEG4` | 4 | → `CPE4` (substituted: reduced physics) |
+| `CPEG4R` | 4 | → `CPE4R` (substituted: reduced physics) |
+| `CPEG6` | 6 | → `CPE6` (substituted: reduced physics) |
+| `CPEG6M` | 6 | → `CPE6` (substituted: reduced physics) |
+| `CPEG8` | 8 | → `CPE8` (substituted: reduced physics) |
+| `CPEG8R` | 8 | → `CPE8R` (substituted: reduced physics) |
 
 ## heat-transfer continuum
 
@@ -182,13 +182,13 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `GK2D4` | 4 | → `CPE4` (substituted) |
+| `GK2D4` | 4 | → `CPE4` (substituted: reduced physics) |
 | `GK2D6` | 6 | flagged — no ccx equivalent |
-| `GK3D6` | 6 | → `C3D6` (substituted) |
-| `GK3D8` | 8 | → `C3D8` (substituted) |
-| `GKAX4` | 4 | → `CAX4` (substituted) |
+| `GK3D6` | 6 | → `C3D6` (substituted: reduced physics) |
+| `GK3D8` | 8 | → `C3D8` (substituted: reduced physics) |
+| `GKAX4` | 4 | → `CAX4` (substituted: reduced physics) |
 | `GKAX6` | 6 | flagged — no ccx equivalent |
-| `GKPS4` | 4 | → `CPS4` (substituted) |
+| `GKPS4` | 4 | → `CPS4` (substituted: reduced physics) |
 | `GKPS6` | 6 | flagged — no ccx equivalent |
 
 ## plane strain
@@ -197,13 +197,13 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 | --- | --- | --- |
 | `CPE3` | 3 | direct |
 | `CPE4` | 4 | direct |
-| `CPE4H` | 4 | → `CPE4` (substituted) |
-| `CPE4I` | 4 | → `CPE4` (substituted) |
+| `CPE4H` | 4 | → `CPE4` (substituted: reduced physics) |
+| `CPE4I` | 4 | → `C3D8I` slab (exact for small-strain linear elasticity in static steps); otherwise → `CPE4`, reduced physics |
 | `CPE4R` | 4 | direct |
 | `CPE6` | 6 | direct |
-| `CPE6M` | 6 | → `CPE6` (substituted) |
+| `CPE6M` | 6 | → `CPE6` (substituted: reduced physics) |
 | `CPE8` | 8 | direct |
-| `CPE8H` | 8 | → `CPE8` (substituted) |
+| `CPE8H` | 8 | → `CPE8` (substituted: reduced physics) |
 | `CPE8R` | 8 | direct |
 
 ## plane stress
@@ -212,12 +212,14 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 | --- | --- | --- |
 | `CPS3` | 3 | direct |
 | `CPS4` | 4 | direct |
-| `CPS4I` | 4 | → `CPS4` (substituted) |
+| `CPS4I` | 4 | → `C3D8I` slab (exact for small-strain linear elasticity in static steps); otherwise → `CPS4`, reduced physics |
 | `CPS4R` | 4 | direct |
 | `CPS6` | 6 | direct |
-| `CPS6M` | 6 | → `CPS6` (substituted) |
+| `CPS6M` | 6 | → `CPS6` (substituted: reduced physics) |
 | `CPS8` | 8 | direct |
 | `CPS8R` | 8 | direct |
+
+ccx has no incompatible-mode plane element. `CPS4I` and `CPE4I` (the latter on parallelograms: Abaqus adds a fifth, volumetric mode that acts only on distorted elements) become one-element-thick `C3D8I` slabs: the 2-D nodes are the bottom face (ids, BCs and loads kept), new top nodes one section thickness above follow their in-plane DOFs by `*EQUATION`, and DOF 3 of every slab node is held (node set `ABQ2CCX_SLAB`, repeated after `*BOUNDARY, OP=NEW`), so the slab deforms in plane strain and the C3D8I's modes are those of Abaqus' four-mode element. `CPS4I` gets the plane-stress stiffness as an `ORTHO` material with no coupling to the thickness direction, so S33 = 0. Probed on 2.23 against a 2-D implementation of the incompatible-mode element (rectangular and skewed meshes): equal to 1e-7; `validate_with_ccx.py cps4i_slab` checks pure bending against beam theory. Outside small-strain linear elasticity in static steps (`NLGEOM`, other materials, contact, couplings, `*FREQUENCY` / `*BUCKLE`, whose mass and geometric stiffness are not compared ...) the element runs as `CPS4`/`CPE4`, which locks in bending, and counts as reduced physics.
 
 ## rigid
 
@@ -238,19 +240,19 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 | `DS6` | 6 | passed through (verify) |
 | `DS8` | 8 | passed through (verify) |
 | `S3` | 3 | direct |
-| `S3R` | 3 | → `S3` (substituted) |
+| `S3R` | 3 | → `S3` (exact) |
 | `S4` | 4 | direct |
 | `S4R` | 4 | direct |
-| `S4R5` | 4 | → `S4R` (substituted) |
+| `S4R5` | 4 | → `S4R` (substituted: reduced physics) |
 | `S6` | 6 | direct |
 | `S8` | 8 | direct |
 | `S8R` | 8 | direct |
-| `S8R5` | 8 | → `S8R` (substituted) |
+| `S8R5` | 8 | → `S8R` (substituted: reduced physics) |
 | `S9R5` | 9 | passed through (verify) |
-| `SC6R` | 6 | → `C3D6` (substituted) |
-| `SC8R` | 8 | → `C3D8I` (substituted) |
-| `STRI3` | 3 | → `S3` (substituted) |
-| `STRI65` | 6 | → `S6` (substituted) |
+| `SC6R` | 6 | → `C3D6` (substituted: reduced physics) |
+| `SC8R` | 8 | → `C3D8I` (substituted: reduced physics) |
+| `STRI3` | 3 | → `S3` (substituted: reduced physics) |
+| `STRI65` | 6 | → `S6` (substituted: reduced physics) |
 | `US3` | 3 | direct |
 
 ## surface (load carrier)

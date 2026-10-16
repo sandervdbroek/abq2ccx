@@ -60,6 +60,14 @@ converter comments `*TEMPERATURE` out there.
 
 ## It runs, but the results look wrong
 
+* **The report ends with "Reduced physics — ccx solves a different model than this Abaqus
+  deck: …".** The conversion dropped or replaced something ccx has no counterpart for: a
+  constitutive behaviour (concrete damaged plasticity, user hardening, Chaboche
+  back-stresses, field-dependent properties), an element formulation (hybrid, modified or
+  thin-shell elements run as ccx's plain ones; `CPS4I`/`CPE4I` outside small-strain linear
+  elasticity), a section control, an interaction (general contact), a load or the geometry
+  (an imperfection). ccx runs, but not the deck's own problem; the warnings above say what is
+  missing and how to remodel it. The list is `Converter.reduced_physics` in the API.
 * **A step solves to zero.** The report says "Step N is loaded in the Abaqus deck …, but no
   load survives the conversion": its loads were all commented out — a user-subroutine load,
   an NLGEOM follower traction (`--approximate` applies it as fixed forces), a load on an
@@ -71,7 +79,9 @@ converter comments `*TEMPERATURE` out there.
 * **A material lost its plasticity.** ccx runs tabulated isotropic, kinematic and combined
   hardening and Johnson-Cook, and silently skips other `*PLASTIC` forms. The converter
   comments `HARDENING=USER` and Chaboche `PARAMETERS` out (the report says the material now
-  runs elastic) and adds the `*RATE DEPENDENT` card Johnson-Cook needs.
+  runs elastic, as reduced physics) and adds the `*RATE DEPENDENT` card Johnson-Cook needs.
+  A tabulated curve is no stand-in for Chaboche: ccx's isotropic table has no Bauschinger
+  effect, and its kinematic table does not follow the curve.
 * **A heated part shrinks, or a model with temperatures is far too soft.** ccx 2.23 uses a
   wrong stiffness in linear steps when the `*ELASTIC` is less anisotropic than the
   `*EXPANSION`; the converter rewrites the `*ELASTIC` with the same stiffness (a NOTE per
@@ -82,10 +92,15 @@ converter comments `*TEMPERATURE` out there.
   the materials. Check one element's thermal strain by hand, or keep the thermal load out of
   NLGEOM steps.
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=`; the converter keeps
-  the Abaqus no-field state (field = 0) and warns.
+  the Abaqus no-field state (field = 0): exact (a note) when the deck sets no field variable
+  and the table gives that state, reduced physics (warned) otherwise.
 * **A rigid body ignores rotations at its reference point.** ccx carries a `*RIGID BODY`'s
   rotation on a separate `ROT NODE`; the converter adds one and moves the reference point's
   rotational BCs and moments to it. Read reaction moments there.
+* **A rigid body's reaction force is zero.** ccx 2.23 reports no reaction at a `*RIGID BODY`
+  reference node that is one of the body's own nodes, although the body is loaded and the
+  rest of the model is right. Read the reaction at the supports, or give the body a reference
+  node of its own.
 * **Short extra beams in the model (`ABQ2CCX_KNOT`).** Knot beams carry no load; ignore
   them in the results.
 * **Velocity and acceleration BCs.** ccx prescribes displacements only, so they become
@@ -115,6 +130,10 @@ converter comments `*TEMPERATURE` out there.
 * **Contact behaves differently.** ccx contact is penalty-based (node-to-surface or
   face-to-face), with different default stiffness and no "no separation". A pair without
   `TYPE` gets Abaqus' default, node-to-surface; some decks converge only face-to-face.
+* **A part flies away, or contact never closes, in a static step.** ccx has no contact
+  stabilization: a part that only contact holds (its reference point driven in one direction,
+  say) has no stiffness in its free directions until the contact closes, and ccx's solution
+  drifts there. Hold those directions where the model allows it (a BC on the reference point).
 * **`C3D8R` hourglassing.** Prefer `C3D8I` or `C3D20R` for bending; ccx has no artificial
   energy output, so check a scaled deformed shape.
 * **Units are not enforced.** A mixed unit system silently corrupts results.

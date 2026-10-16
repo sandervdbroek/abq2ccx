@@ -8,6 +8,12 @@ Two layers of checking:
                  deck loads (else ccx "solves" that step with no load at all), and
                  ``source_unloaded`` must flag exactly the decks that load no step. Always
                  runs.
+     FIDELITY  — ``reduced_physics`` must flag exactly the ``expect_solve`` decks whose
+                 conversion drops or replaces part of the Abaqus model (a constitutive
+                 behaviour, an element formulation, a constraint, a load ...:
+                 ``Converter.reduced_physics``), so no deck counts as a faithful solve while
+                 the converter drops its physics; ``solver_differs`` (a ccx solution found
+                 not to be the deck's) sits only on ``expect_solve`` decks. Always runs.
   3. SOLVE     — optional: if CalculiX (ccx) is found, decks marked ``expect_solve``
                  must solve (ccx exits 0, prints "Job finished" with no *ERROR and no
                  crash, runs an analysis STEP, and writes no NaN/Inf to the .dat or
@@ -65,6 +71,18 @@ def load_problem(e, conv):
     if bool(e.get("source_unloaded")) != conv.source_unloaded:
         return ("source_unloaded=True, but the deck loads a step" if e.get("source_unloaded")
                 else "the deck loads no step: flag it source_unloaded=True")
+    return None
+
+
+def fidelity_problem(e, conv):
+    """Why an expect_solve deck's ``reduced_physics`` flag disagrees with its conversion, or
+    None: a conversion that drops or replaces part of the Abaqus model must be flagged (it is
+    then left out of the count of faithful solves), and only such a conversion."""
+    if conv.reduced_physics and not e.get("reduced_physics"):
+        return (f"the conversion drops or replaces {'; '.join(conv.reduced_physics)}: flag it "
+                f"reduced_physics")
+    if e.get("reduced_physics") and not conv.reduced_physics:
+        return "reduced_physics is set, but the conversion keeps the deck's physics"
     return None
 
 
@@ -129,6 +147,22 @@ def test_corpus_loads():
         return
     for e in sorted(decks, key=lambda x: x["name"]):
         problem = load_problem(e, convert(e["name"])[2])
+        assert problem is None, f"{e['name']}: {problem}"
+
+
+def test_corpus_fidelity():
+    """expect_solve decks whose conversion drops or replaces part of the Abaqus model (a
+    constitutive behaviour, an element formulation, a constraint, a load ...) carry
+    ``reduced_physics`` — they still solve, but not the deck's own problem — and no other
+    deck does."""
+    stray = [e["name"] for e in CORPUS if e.get("solver_differs") and not e["expect_solve"]]
+    assert not stray, f"solver_differs on decks that are not expect_solve: {stray}"
+    decks = [e for e in present() if e["expect_solve"]]
+    if not decks:
+        print("corpus/files/ is empty — run 'python corpus/fetch.py' to enable corpus tests.")
+        return
+    for e in sorted(decks, key=lambda x: x["name"]):
+        problem = fidelity_problem(e, convert(e["name"])[2])
         assert problem is None, f"{e['name']}: {problem}"
 
 
@@ -287,6 +321,10 @@ def main():
         if problem:
             result = f"LOADS: {problem}"
             failures += 1
+        problem = fidelity_problem(e, conv) if e["expect_solve"] else None
+        if problem:
+            result = f"FIDELITY: {problem}"
+            failures += 1
         ccxcol = "-"
         if ccx:
             status = run_ccx(ccx, env, text)
@@ -308,9 +346,15 @@ def main():
         print(f"{name:27s} {'ok':>5s} {rep.n_warnings:>3d} {d:>6d} {ccxcol:>13s}  {result}")
     n_solve = sum(1 for e in decks if e["expect_solve"])
     n_unloaded = sum(1 for e in decks if e["expect_solve"] and e.get("source_unloaded"))
+    n_reduced = sum(1 for e in decks if e["expect_solve"] and e.get("reduced_physics"))
+    n_differs = sum(1 for e in decks if e["expect_solve"] and e.get("solver_differs"))
+    n_faithful = sum(1 for e in decks if e["expect_solve"] and not e.get("source_unloaded")
+                     and not e.get("reduced_physics") and not e.get("solver_differs"))
     n_parse = sum(1 for e in decks if e.get("parse_only"))
     print(f"\n{len(decks)} converted, 0 dangling expected; {n_solve} expected to solve under "
-          f"the deck's own loads ({n_unloaded} of them load nothing in the source deck), "
+          f"the deck's own loads ({n_unloaded} of them load nothing in the source deck, "
+          f"{n_reduced} solve a model with reduced physics, {n_differs} solve to a solution "
+          f"that is not the deck's; {n_faithful} faithful solves), "
           f"{n_parse} mesh-only (no analysis step) expected to be accepted by ccx.")
     print("All corpus checks passed." if not failures else f"{failures} failure(s).")
     print("\n(the remaining decks are source-deck/analysis limitations — see corpus/manifest.py.)")

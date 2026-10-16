@@ -36,10 +36,13 @@ print(result.report.summary())               # "N warning(s), M note(s), K comme
   and elements.
 * **Parts, instances and assemblies** → one flat model, with instance transforms applied
   and part-level sections, constraints and orientations copied per instance.
-* **Elements** → CalculiX types, keeping the node count. Beams under circular, pipe and box
-  sections get the midside nodes ccx 2.23 needs; planar beams and trusses are held in their
-  plane; surface elements leave the mesh and their loads become nodal forces; connector
-  elements become their kinematic constraints.
+* **Elements** → CalculiX types, keeping the node count. Incompatible-mode `CPS4I`/`CPE4I`
+  become exact one-element-thick `C3D8I` slabs (ccx has no such plane element); beams under
+  circular, pipe and box sections get the midside nodes ccx 2.23 needs; planar beams and
+  trusses are held in their plane; surface elements leave the mesh and their loads become
+  nodal forces; connector elements become their kinematic constraints. A substitution that
+  changes the element formulation (hybrid, modified or thin-shell elements run as ccx's
+  plain ones) is flagged as reduced physics.
 * **Materials and orientations** — elastic types, plasticity (including Johnson-Cook),
   thermal expansion, composite layups and per-element `*DISTRIBUTION` orientations
   (variable-angle-tow layups).
@@ -56,6 +59,13 @@ The exact handling of every keyword, element type and output variable is in the 
 references: [keywords](docs/keyword-reference.md), [elements](docs/element-reference.md),
 [output variables](docs/output-reference.md).
 
+**Reduced physics.** Whatever the converter has to drop or replace of the Abaqus model — a
+constitutive behaviour ccx lacks (concrete damaged plasticity, user hardening, Chaboche
+back-stresses, field-dependent properties), an element formulation, a section control, a
+constraint or interaction, a load — is named in a "Reduced physics" warning at the end of
+the report (`Converter.reduced_physics` in the API): ccx then runs, but not the deck's own
+problem.
+
 **`--approximate`** (off by default) lets the converter reframe what ccx cannot run exactly
 as a close equivalent, each flagged `[APPROX]` — a Riks step as plain static, ν ≥ 0.5 as
 0.475, an I-section as an equivalent rectangle, NLGEOM follower tractions as fixed nodal
@@ -66,7 +76,7 @@ cards are commented out with the reason, so ccx never silently runs a different 
 
 `python validate_with_ccx.py` converts the bundled examples, runs them in CalculiX (it finds
 `ccx`, including FreeCAD's copy) and compares each result with an independent reference. It
-prints one `PASS` line per check, about sixty in all; [testing](docs/testing.md) lists them.
+prints one `PASS` line per check, about seventy in all; [testing](docs/testing.md) lists them.
 
 | Check | Reference | Agreement |
 | --- | --- | --- |
@@ -79,12 +89,17 @@ prints one `PASS` line per check, about sixty in all; [testing](docs/testing.md)
 | thermal expansion (orthotropic, anisotropic, no initial temperatures) | α ΔT; analytic stress | ≤ 5e-6 |
 | velocity / acceleration BCs; displacement BCs without an amplitude | their time integral; wave theory; Abaqus' default amplitudes | 5e-5 of the travel; wave stress ≈ 1 % on average; exact |
 | preselected and default output, contact output | statics, wave theory | ≤ 0.005 % (static) |
+| `CPS4I` / `CPE4I` cantilevers under an end couple (as `C3D8I` slabs) | beam theory (deflection, σ_xx = −My/I, σ_zz) | 4e-8 |
+| pressure on a shell's `SPOS` / `SNEG` side and element-based `P` | Navier plate solution, each sign | 1.0 % |
+| a bare `*KINEMATIC` (all DOFs); an assembly with a turned instance | `*RIGID BODY`; the same model written flat | exact |
 
 A **corpus of 1022 genuine Abaqus decks** from about 180 public repositories (CAE exports,
 UMAT and UEL decks, explicit and coupled models, …) is fetched on demand and run through
 convert → integrity check → ccx. On ccx 2.23 all 1022 convert with no dangling reference;
-**186 solve under their own loads**, 14 more solve but load nothing in the source deck, and
-219 mesh-only decks are accepted. The other 603 need what ccx cannot run — mostly user
+**160 solve the deck's own physics**; 40 more solve but stay out of that count — 14 load
+nothing in the source deck, 28 (3 of them also unloaded) solve a model with reduced physics,
+and one converges to a solution that is not the deck's (a part that only contact holds drifts
+away in ccx) — and 219 mesh-only decks are accepted. The other 603 need what ccx cannot run — mostly user
 materials (353) and user elements (66). See [testing](docs/testing.md).
 
 ## How it works
@@ -112,7 +127,12 @@ The [architecture guide](docs/architecture.md) describes the pipeline and how to
 * Cohesive and gasket elements run as thin continua (their traction-separation law is lost;
   warned). Rigid elements, analytical rigid surfaces, connector behaviours, inertia relief
   and materials such as viscoelasticity and concrete damaged plasticity have no equivalent
-  and are flagged for remodelling.
+  and are flagged for remodelling; a deck that runs without them is flagged as reduced
+  physics.
+* ccx's own first-order elements are not Abaqus': its `CPE4`/`C3D8`/`CAX4` are plain 2×2(×2)
+  integration, without Abaqus' selectively reduced volume terms (on a coarse bending mesh
+  Abaqus' `CPE4` deflects 9–19 % more for ν 0–0.3), and its `CPS4` is a 3-D slab with a free
+  thickness, not 2-D plane stress ([compatibility](docs/compatibility.md)).
 * Explicit coupled temperature–displacement steps do not run; Riks steps and NLGEOM follower
   tractions run only with `--approximate`.
 * Contact is translated card by card, but ccx's penalty contact behaves differently from
@@ -156,6 +176,10 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`velocity_bc_column`](examples/velocity_bc_column.inp), [`velocity_bc_bar`](examples/velocity_bc_bar.inp) | `*BOUNDARY, TYPE=VELOCITY` (implicit and explicit) |
 | [`default_amplitude_bars`](examples/default_amplitude_bars.inp) | a displacement `*BOUNDARY` and a `*CLOAD` without an amplitude → ramped / stepped as in Abaqus (run as `*DYNAMIC`, `*VISCO`, coupled and explicit) |
 | [`preselect_output_bar`](examples/preselect_output_bar.inp), [`explicit_default_output_bar`](examples/explicit_default_output_bar.inp), [`preselect_contact_blocks`](examples/preselect_contact_blocks.inp) | Abaqus' preselected and default output |
+| [`cps4i_slab_bending`](examples/cps4i_slab_bending.inp) | a `CPS4I` cantilever under an end couple → `C3D8I` slabs (also run as `CPE4I`) |
+| [`shell_pressure_sides`](examples/shell_pressure_sides.inp) | `*DSLOAD P` on a shell's `SPOS` / `SNEG` side and an element-based `P` |
+| [`kinematic_all_dofs`](examples/kinematic_all_dofs.inp) | a bare `*Coupling` + `*Kinematic` (all DOFs) on a solid face, against `*RIGID BODY` |
+| [`assembly_rotated_instances`](examples/assembly_rotated_instances.inp), [`…_flat`](examples/assembly_rotated_instances_flat.inp) | a turned instance with an oriented orthotropic material, against the same model written flat |
 | [`coverage_kitchen_sink`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped and commented cards, output-variable mapping |
 
 ## Tests

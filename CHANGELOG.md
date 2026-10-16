@@ -1,7 +1,8 @@
 # Changelog
 
-Corpus counts are on the CalculiX version current at the time; "solve" counts only decks
-that solve under their own loads from October 2026 on.
+Corpus counts are on the CalculiX version current at the time; from October 2026 on, "solve"
+counts only decks that solve their own problem: under their own loads, without reduced
+physics.
 
 ## Unreleased (October 2026, still `__version__ = "1.1.0"`) — CalculiX 2.23
 
@@ -14,6 +15,15 @@ without an error. A full audit and the work that followed:
   `parse_only` class (issue #3).
 * **Load audit** — a step the Abaqus deck loads must still be loaded after conversion;
   decks that load nothing are flagged `source_unloaded` and kept out of the headline.
+* **Reduced physics** — whatever a conversion drops or replaces of the Abaqus model (a
+  material behaviour, an element formulation, a section control, an interaction, a load, the
+  geometry) is named in a closing "Reduced physics" warning (`Converter.reduced_physics`);
+  such decks are flagged `reduced_physics` and kept out of the headline. Each "verify" hedge
+  was settled with a ccx probe: `CPS4I`/`CPE4I` now run exactly as `C3D8I` slabs (they locked
+  as `CPS4`), a shell pressure on the `SPOS` side pushes the right way, `*NODE, SYSTEM=C/S`
+  coordinates and `*NODE` normals are converted, steady-state `IMAGINARY` loads become ccx's
+  `LOAD CASE=2`, and exact cases (`S3R`, a bare `*KINEMATIC`, duplicated `*BUCKLE` load cases,
+  turned instances) are notes. `--approximate` reframings count as reduced physics too.
 * **Loads** — surface tractions, beam line loads and surface-element loads as consistent
   nodal forces, in the local axes of `*TRANSFORM`ed nodes; user-subroutine loads and BCs
   commented out, naming the ccx subroutine; velocity and acceleration BCs integrated into
@@ -39,8 +49,9 @@ without an error. A full audit and the work that followed:
 * **Crash guards** — step data outside a step, undefined materials, rotational DOFs on plane
   nodes and other inputs that crash ccx 2.23 are commented, warned or dropped.
 
-Corpus: 186 decks solve under their own loads (14 more solve but load nothing), 219
-mesh-only decks are accepted, 603 need what ccx cannot run.
+Corpus: 160 decks solve their own problem; 28 more solve with reduced physics, 14 load
+nothing (3 both) and one drifts to a solution that is not the deck's; 219 mesh-only decks are
+accepted, 603 need what ccx cannot run.
 
 ## 1.1.0 (July 2026)
 

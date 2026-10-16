@@ -1,0 +1,71 @@
+*HEADING
+ Two instances of one part, the second translated and turned 90 degrees about z, with an
+ orthotropic material at 45 degrees, instance-qualified loads and a surface pressure; the
+ same model written flat by hand is assembly_rotated_instances_flat.inp
+*PART, NAME=BAR
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+4, 3., 0., 0.
+5, 4., 0., 0.
+6, 0., 1., 0.
+7, 1., 1., 0.
+8, 2., 1., 0.
+9, 3., 1., 0.
+10, 4., 1., 0.
+11, 0., 0., 1.
+12, 1., 0., 1.
+13, 2., 0., 1.
+14, 3., 0., 1.
+15, 4., 0., 1.
+16, 0., 1., 1.
+17, 1., 1., 1.
+18, 2., 1., 1.
+19, 3., 1., 1.
+20, 4., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=ALL
+1, 1, 2, 7, 6, 11, 12, 17, 16
+2, 2, 3, 8, 7, 12, 13, 18, 17
+3, 3, 4, 9, 8, 13, 14, 19, 18
+4, 4, 5, 10, 9, 14, 15, 20, 19
+*NSET, NSET=ROOT
+1, 6, 11, 16
+*NSET, NSET=TIP
+5, 10, 15, 20
+*SURFACE, TYPE=ELEMENT, NAME=TOPF
+ALL, S2
+*ORIENTATION, NAME=ORI
+1., 1., 0., -1., 1., 0.
+*SOLID SECTION, ELSET=ALL, MATERIAL=ORTHO, ORIENTATION=ORI
+*END PART
+*ASSEMBLY, NAME=ASM
+*INSTANCE, NAME=I1, PART=BAR
+*END INSTANCE
+*INSTANCE, NAME=I2, PART=BAR
+0., 3., 0.
+0., 3., 0., 0., 3., 1., 90.
+*END INSTANCE
+*NSET, NSET=FIX1, INSTANCE=I1
+1, 6, 11, 16
+*NSET, NSET=FIX2, INSTANCE=I2
+1, 6, 11, 16
+*END ASSEMBLY
+*MATERIAL, NAME=ORTHO
+*ELASTIC, TYPE=ENGINEERING CONSTANTS
+200., 50., 50., 0.25, 0.25, 0.3, 20., 20.,
+15.
+*BOUNDARY
+FIX1, ENCASTRE
+FIX2, ENCASTRE
+*STEP
+*STATIC
+*CLOAD
+I1.TIP, 3, -0.25
+I2.TIP, 1, 0.5
+I2.5, 2, -1.
+*DSLOAD
+I2.TOPF, P, 0.3
+*NODE PRINT
+U
+*END STEP

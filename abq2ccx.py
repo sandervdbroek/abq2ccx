@@ -150,6 +150,66 @@ ELEMENT_TYPE_MAP: Dict[str, str] = {
     "GKPS4": "CPS4", "GKAX4": "CAX4",
 }
 
+# Substitutions that keep the Abaqus element's solution exactly, with the reason; every other
+# substitution in ELEMENT_TYPE_MAP (or a dropped H / P suffix) replaces Abaqus' element
+# formulation and counts as reduced physics (Converter._reduces).
+EXACT_SUBSTITUTIONS = {
+    "S3R": "Abaqus documents S3 and S3R as the same element (Abaqus 2017 three-dimensional "
+           "conventional shell element library: 'identical to element S3')",
+    "CPE3H": "a constant-strain triangle's volume change is constant, so Abaqus' constant "
+             "hybrid pressure equals the displacement element's for a compressible material",
+    "B22": "the 3-node beam in the model plane, which the converter keeps planar like B21",
+    "T2D3": "the 3-node truss in the model plane, which the converter keeps planar like T2D2",
+}
+# What the other substitutions drop (Abaqus 2017 element libraries), for the warning.
+SUBSTITUTION_LOSS = {
+    "STRI3": "Abaqus' STRI3 is a thin-shell facet element, S3 a general-purpose shell",
+    "STRI65": "Abaqus' STRI65 is a 5-DOF thin shell",
+    "S4R5": "Abaqus' S4R5 is a 5-DOF thin shell", "S8R5": "Abaqus' S8R5 is a 5-DOF thin shell",
+    "B23": "Abaqus' B23 is a cubic beam", "B33": "Abaqus' B33 is a cubic beam",
+    "B33H": "Abaqus' B33H is a cubic hybrid beam",
+    "B21H": "Abaqus' hybrid beam", "B31H": "Abaqus' hybrid beam", "B32H": "Abaqus' hybrid beam",
+    **{p: "Abaqus' pipe element takes internal/external pressure"
+       for p in ("PIPE21", "PIPE22", "PIPE31", "PIPE32")},
+    **{t: "generalized plane strain lets the model plane stretch and bend"
+       for t in ("CPEG3", "CPEG4", "CPEG4R", "CPEG6", "CPEG8", "CPEG8R", "CPEG6M")},
+    **{t: "Abaqus' generalized axisymmetric element twists"
+       for t in ("CGAX3", "CGAX4", "CGAX4R", "CGAX6", "CGAX8", "CGAX8R")},
+    "SC6R": "Abaqus' continuum shell", "SC8R": "Abaqus' continuum shell",
+    **{t: "Abaqus' modified triangle / tetrahedron (its own interpolation, hourglass control)"
+       for t in ("C3D10M", "C3D10MH", "CPS6M", "CPE6M", "CAX6M")},
+    "C3D10HS": "Abaqus' C3D10HS has an 11-point integration scheme and pressure DOFs that switch on "
+               "near incompressibility",
+    "DASHPOT1": "a grounded dashpot", "DASHPOT2": "Abaqus' DASHPOT2 acts along fixed DOFs",
+    "GAPCYL": "a cylindrical gap", "GAPSPHER": "a spherical gap",
+    "CPS4I": "incompatible modes dropped: the element locks in bending",
+    "CPE4I": "incompatible modes dropped: the element locks in bending",
+    **{t: "Abaqus' hybrid (mixed displacement-pressure) element" for t in
+       ("C3D4H", "C3D6H", "C3D8H", "C3D8RH", "C3D8IH", "C3D10H", "C3D15H", "C3D20H", "C3D20RH",
+        "CPE4H", "CPE8H", "CAX4H", "CAX8H")},
+}
+
+
+def substitution_loss(typ: str) -> Optional[str]:
+    """``"element <Abaqus type> -> <ccx type>"`` when ccx_element_type replaces the element's
+    formulation (reduced physics), or None when ccx runs that element: natively, under its
+    coupled temperature-displacement base name (a T suffix), unchanged (types ccx stops on), or
+    through an exact substitution (EXACT_SUBSTITUTIONS)."""
+    t = typ.upper()
+    if t in CCX_ELEMENTS or t in EXACT_SUBSTITUTIONS:
+        return None
+    sub = ccx_element_type(t, Report())
+    if sub == t:
+        return None
+    base, dropped = t, ""
+    while len(base) > 1 and base[-1] in "THP" and base not in CCX_ELEMENTS and \
+            base not in ELEMENT_TYPE_MAP:
+        dropped += base[-1]
+        base = base[:-1]
+    if dropped and set(dropped) == {"T"} and (base in CCX_ELEMENTS or base in EXACT_SUBSTITUTIONS):
+        return None
+    return f"element {t} -> {sub}"
+
 # Element types CalculiX supports directly (verified, ccx 2.22).  Used to tell a
 # direct passthrough from one needing substitution / a warning.
 CCX_ELEMENTS = {
@@ -216,9 +276,13 @@ def ccx_element_type(typ: str, report: "Report") -> str:
                         f"cohesive/gasket behaviour (separation/closure) is LOST, and a ZERO-thickness "
                         f"layer fails with a nonpositive-jacobian error — give the layer a small finite "
                         f"thickness or remodel with contact/*SPRING. Verify the result.", once=True)
+        elif typ in EXACT_SUBSTITUTIONS:
+            report.note(f"Element {typ} -> {sub}: the same solution — {EXACT_SUBSTITUTIONS[typ]}.",
+                        once=True)
         else:
-            report.warn(f"Element {typ} -> {sub} (no native CalculiX type; node-count-preserving "
-                        f"substitution — verify it is acceptable).", once=True)
+            report.warn(f"Element {typ} -> {sub}: ccx has no {typ}, and {sub} is a different element "
+                        f"formulation ({SUBSTITUTION_LOSS.get(typ, 'node-count-preserving stand-in')}), "
+                        f"so the results differ from Abaqus'.", once=True)
         return sub
     if typ in CCX_ELEMENTS:
         return typ
@@ -235,8 +299,15 @@ def ccx_element_type(typ: str, report: "Report") -> str:
         if "T" in dropped:
             report.warn(f"Element {typ} -> {base} (CalculiX uses the base element for coupled "
                         f"temperature-displacement; the temperature DOF comes from the step).", once=True)
-        if "H" in dropped:
-            report.warn(f"Element {typ} -> {base} (CalculiX has no hybrid formulation).", once=True)
+        if "H" in dropped and typ in EXACT_SUBSTITUTIONS:
+            report.note(f"Element {typ} -> {base}: the same solution — {EXACT_SUBSTITUTIONS[typ]}.",
+                        once=True)
+        elif "H" in dropped:
+            report.warn(f"Element {typ} -> {base}: CalculiX has no hybrid (mixed displacement-"
+                        f"pressure) formulation; the displacement element differs from Abaqus' "
+                        f"hybrid one (its fully integrated linear elements also lack Abaqus' "
+                        f"selectively reduced volume terms), most for nearly incompressible "
+                        f"materials.", once=True)
         if "P" in dropped:
             report.warn(f"Element {typ} -> {base}: ccx has no pore-pressure (coupled u-p) element; "
                         f"the pore-pressure DOF is dropped and only the mechanical response is solved — "
@@ -292,6 +363,15 @@ class Report:
         self.entries: List[Tuple[str, str]] = []
         self._seen: set = set()
         self.n_commented = 0          # cards emitted as ** comments (no ccx equivalent)
+        # what the ccx model drops or replaces of the Abaqus model (Converter._reduces;
+        # kept here so deck reading, mesh generation and assembly flattening record it too)
+        self.reduced: List[str] = []
+
+    def reduce(self, what: str) -> None:
+        """Record reduced physics: ``what`` part of the Abaqus model the ccx model drops or
+        replaces (see Converter.reduced_physics)."""
+        if what not in self.reduced:
+            self.reduced.append(what)
 
     def warn(self, msg: str, once: bool = False) -> None:
         if once:
@@ -299,6 +379,11 @@ class Report:
                 return
             self._seen.add(msg)
         self.entries.append(("WARNING", msg))
+        if msg.startswith("[APPROX]"):
+            # an --approximate reframing makes ccx solve another model than the deck's
+            text = msg[len("[APPROX]"):].strip()
+            cuts = [i for i in (text.find(": "), text.find("; "), text.find(" (")) if i >= 25]
+            self.reduce("--approximate: " + text[:min(cuts + [len(text), 100])].rstrip(" ,;:."))
 
     def note(self, msg: str, once: bool = False) -> None:
         if once:
@@ -634,6 +719,7 @@ def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
             raw_lines = fh.read().splitlines()
     except OSError as exc:
         report.warn(f"Could not read {path}: {exc}")
+        report.reduce("an *INCLUDE file could not be read")
         return []
 
     raw_lines = apply_parameters(raw_lines, report, _params)
@@ -675,6 +761,7 @@ def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
                     report.warn(f"*{keyword}, INPUT={src}: data file not found next to the deck; "
                                 f"the card has no data lines (copy the file alongside and "
                                 f"reconvert).", once=True)
+                    report.reduce(f"*{keyword}, INPUT={src}: data file missing")
                 else:
                     current.data.extend(x.strip() for x in ext
                                         if x.strip() and not x.strip().startswith("*"))
@@ -1042,6 +1129,7 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
         if block.has(opt):
             report.warn(f"*NFILL, {opt} is not supported by the converter; the fill is generated "
                         f"as a plain (biased) linear fill — verify the generated nodes.", once=True)
+            report.reduce(f"*NFILL, {opt} (fill approximated)")
 
     def frac(j: int, nint: int) -> float:
         if abs(bias - 1.0) < 1e-12:
@@ -1067,9 +1155,10 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
                 report.warn("*NFILL bounding node sets differ in length by more than 2x; "
                             "skipped (cannot pair them reliably).", once=True)
                 continue
-            report.warn("*NFILL bounding node sets differ slightly in length; filling the "
-                        "corresponding (leading) node pairs only (a spurious extra edge "
-                        "node is ignored).", once=True)
+            report.note("*NFILL bounding node sets differ in length: the corresponding "
+                        "(leading) node pairs are filled and the longer set's extra nodes "
+                        "ignored, as Abaqus does (Abaqus 'Node definition': 'the extra nodes in "
+                        "the longer set are ignored').", once=True)
         for a, b in zip(s1, s2):
             pa, pb = geom.nodes.get(a), geom.nodes.get(b)
             if pa is None or pb is None:
@@ -1122,6 +1211,7 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     if block.has("POLE"):
         report.warn("*NCOPY, POLE is not supported by the converter; nodes are copied with the "
                     "SHIFT/REFLECT data only — verify the generated nodes.", once=True)
+        report.reduce("*NCOPY, POLE ignored")
     # REFLECT data: the points' coordinates may sit on one line (LINE: x1..z2) or
     # several (MIRROR: a, b on the first, c on the second) — take them as a flat list.
     pts: List[Vec] = []
@@ -1319,6 +1409,12 @@ PLANAR_COMPANION_PREFIXES = ("CPS", "CPE", "DC2D", "AC2D", "COH2D", "GK2D", "GKP
                              "CONN2D", "SPRING", "DASHPOT", "MASS", "ROTARYI", "GAPUNI")
 PLANAR_NODES_SET = "ABQ2CCX_PLANAR"
 
+# Abaqus' incompatible-mode plane elements.  ccx 2.23 has no such plane element, but its C3D8I
+# reproduces them as a one-element-thick slab (see Converter._plan_incompatible_slabs): the
+# element's kind of plane problem, and the node set whose thickness DOF the slab holds.
+SLAB_TYPES = {"CPS4I": "stress", "CPE4I": "strain"}
+SLAB_NODES_SET = "ABQ2CCX_SLAB"
+
 
 def planar_line_type(typ: str) -> Optional[str]:
     """The planar beam/truss type an Abaqus element type belongs to (B21H -> B21, T2D2T ->
@@ -1397,6 +1493,26 @@ PASS_WITH_NOTE = {
                      "Abaqus UMAT binary — the subroutine must be ported.",
     "USER ELEMENT": "*USER ELEMENT kept; ensure the matching ccx user-element routine is built in.",
 }
+# Abaqus output / diagnostics requests ccx has no card for: commented out, the solution is
+# unchanged.
+OUTPUT_ONLY_KEYWORDS = {
+    "ENERGY OUTPUT", "ENERGY PRINT", "ENERGY FILE", "INCREMENTATION OUTPUT", "FILE FORMAT",
+    "FILE OUTPUT", "MONITOR", "PRINT", "DIAGNOSTICS", "CONTOUR INTEGRAL", "RADIATION OUTPUT",
+    "RADIATION PRINT", "RADIATION FILE", "USER OUTPUT VARIABLES", "ELEMENT MATRIX OUTPUT",
+    "MODAL OUTPUT", "MODAL PRINT", "MODAL FILE", "SECTION FILE", "INTEGRATED OUTPUT",
+    "INTEGRATED OUTPUT SECTION", "ELEMENT RESPONSE", "NODE RESPONSE", "SURFACE PRINT"}
+# Abaqus numerical controls with no ccx card (ccx uses its own): they steer the solver, not
+# the model, so ccx still solves the deck's physics.
+NUMERICAL_KEYWORDS = {
+    "BULK VISCOSITY": "Abaqus/Explicit's artificial bulk viscosity (it damps the solution "
+                      "numerically); ccx's explicit solver has none",
+    "FIXED MASS SCALING": "explicit mass scaling (artificial mass); ccx runs the true mass",
+    "VARIABLE MASS SCALING": "explicit mass scaling (artificial mass); ccx runs the true mass",
+    "SOLUTION TECHNIQUE": "the Newton / quasi-Newton choice; ccx uses its own",
+    "SOLVER CONTROLS": "iterative solver settings; ccx uses its own",
+    "CONTACT CONTROLS": "contact algorithm settings; ccx uses its own",
+}
+
 # Abaqus keywords with NO ccx equivalent: commented out with targeted guidance.
 SPECIAL_UNSUPPORTED = {
     "VISCOELASTIC": "time-domain viscoelasticity is unsupported (ccx *VISCO is a creep STEP, not a "
@@ -2363,6 +2479,7 @@ class Converter:
         self._has_sensitivity = False
         self._freq_storage = False
         self._general_step_seen = False
+        self._step_proc: Optional[str] = None      # the procedure of the step being emitted
         self._cyclic_ok: set = set()
         self._temp_ic_fill = False
         self._temp_ic_default = False
@@ -2459,6 +2576,24 @@ class Converter:
         # load audit (see _audit_loads): steps loaded in the deck but not after conversion
         self.unloaded_steps: List[int] = []
         self.source_unloaded = False
+        # CPS4I / CPE4I written as C3D8I slabs (see _plan_incompatible_slabs): element -> its
+        # plane problem ("stress" / "strain"), (2-D node, thickness) -> its top node, the
+        # *SOLID SECTION cards they use -> (kind, material written for them), and the model
+        # data that ties the slabs' top nodes (*EQUATION) and holds their thickness DOF
+        self._slabs: Dict[int, str] = {}
+        self._slab_top: Dict[Tuple[int, float], int] = {}
+        self._slab_sections: Dict[int, Tuple[str, str]] = {}
+        self._slab_materials: Dict[str, List[str]] = {}    # material written for them -> cards
+        self._slab_written: set = set()
+        self._slab_eq: List[str] = []
+        self._slab_bc: List[str] = []
+        self._node_normals: Dict[int, Vec] = {}    # *NODE fields 5-7: the node's shell normal
+        self._lc_drop: set = set()                 # id(*BOUNDARY, LOAD CASE=2) left out
+        self._param_values: set = set()            # parameter values in the deck (_prescan)
+        self._sc_types: Dict[str, set] = {}        # *SECTION CONTROLS name -> its Abaqus types
+        self._sc_explicit = False
+        self._sc_damage = False
+        self._sc_hyper: set = set()
         # distributed loads emitted as consistent nodal forces (see _flush_nodal_loads):
         # (card, target, label) -> ({(node, DOF): force}, amplitude), in Abaqus semantics
         self._nodal_loads: "OrderedDict[tuple, Tuple[Dict[Tuple[int, int], float], Optional[str]]]" = \
@@ -2544,31 +2679,88 @@ class Converter:
                 expand_elcopy(b, self.geom, self.report)
             elif kw == "NMAP":
                 self.report.warn("*NMAP (coordinate mapping) is not supported; skipped.")
+                self._reduces("*NMAP coordinate mapping skipped")
             elif kw == "ORIENTATION":
                 self._register_orientation(b)
             elif kw == "SURFACE":
                 self._register_surface(b)
 
+    def _cartesian_nodes(self, blocks: List[Block]) -> List[Block]:
+        """``blocks`` with every *NODE, SYSTEM=C / S card rewritten in Cartesian coordinates
+        (before an assembly is flattened: instance transforms move Cartesian points).  Abaqus
+        "Node definition" / *NODE: SYSTEM=C gives R, theta, Z; SYSTEM=S gives R, theta, phi,
+        with theta about Z from X and phi up from the X-Y plane, both in degrees; SYSTEM=R
+        (the default) is Cartesian already.  A normal on such a line is given in the same form
+        (Abaqus 2017 Keywords *NODE: its second entry is an angle in degrees, in a spherical
+        system its third too), so it is converted like a point and left to be normalised."""
+        out: List[Block] = []
+        for b in blocks:
+            system = (b.param("SYSTEM") or "R").strip().upper()[:1] if b.keyword == "NODE" else "R"
+            if system == "R":
+                out.append(b)
+                continue
+            if system not in ("C", "S"):
+                self.report.warn(f"*NODE, SYSTEM={b.param('SYSTEM')} is not an Abaqus coordinate "
+                                 f"system (R, C or S); its coordinates are read as Cartesian.",
+                                 once=True)
+                self._reduces(f"*NODE, SYSTEM={b.param('SYSTEM')} coordinates")
+                out.append(b)
+                continue
+            def cartesian(v: List[str]) -> Tuple[float, float, float]:
+                r, th = pf(v[0]) if v[0] else 0.0, math.radians(pf(v[1])) if v[1] else 0.0
+                c = pf(v[2]) if v[2] else 0.0
+                if system == "C":
+                    return r * math.cos(th), r * math.sin(th), c
+                ph = math.radians(c)
+                return (r * math.cos(ph) * math.cos(th), r * math.cos(ph) * math.sin(th),
+                        r * math.sin(ph))
+
+            data = []
+            for rec in merged_data_records(b):
+                f = [x.strip() for x in rec]
+                if not any(f):
+                    continue
+                given = (f[1:4] + ["", "", ""])[:3]
+                nrm = (f[4:7] + ["", "", ""])[:3]
+                try:
+                    xyz = cartesian(given)
+                    nxyz = cartesian(nrm) if any(nrm) else None
+                except ValueError:
+                    data.append(", ".join(f))         # _register_nodes reports the bad record
+                    continue
+                rest = ([repr(x) for x in nxyz] + f[7:]) if nxyz else f[4:]
+                data.append(", ".join([f[0]] + [repr(x) for x in xyz] + rest))
+            params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
+            out.append(Block(b.keyword, params, data, b.part, b.instance))
+            self.report.note("*NODE, SYSTEM=C / S: cylindrical (R, theta, Z) and spherical (R, "
+                             "theta, phi) coordinates converted to Cartesian (Abaqus 'Node "
+                             "definition': angles in degrees, theta about Z from X, phi up from "
+                             "the X-Y plane), and so are normals given on those lines, which "
+                             "Abaqus reads in the same form (*NODE: their second entry is an "
+                             "angle, in a spherical system their third too).", once=True)
+        return out
+
     def _register_nodes(self, b: Block) -> None:
-        if b.has("SYSTEM"):
-            self.report.warn("*NODE with SYSTEM= (cylindrical/spherical input) treated as Cartesian; verify.", once=True)
         ids = []
         for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
+            f = [x.strip() for x in rec]
+            while f and f[-1] == "":
+                f.pop()
             if not f:
                 continue
-            try:
+            try:                            # fields by position; a blank one is 0, as in Abaqus
                 nid = int(float(f[0]))
-                coords = [pf(x) for x in f[1:4]]
+                coords = [pf(x) if x else 0.0 for x in (f[1:4] + ["", "", ""])[:3]]
             except ValueError:              # one malformed line should not abort the file
                 self.report.warn("Skipped a *NODE record with non-numeric data; verify the deck.", once=True)
                 continue
-            while len(coords) < 3:
-                coords.append(0.0)
             if len(f) > 4:
-                self.report.note("*NODE normal directions (fields 5-7) dropped — ccx averages "
-                                 "shell/beam normals from the elements (use *NORMAL to impose "
-                                 "them).", once=True)
+                try:
+                    nrm = tuple(pf(x) if x else 0.0 for x in (f[4:7] + ["", "", ""])[:3])
+                    if vnorm(nrm) > 1e-12:
+                        self._node_normals[nid] = vunit(nrm)
+                except ValueError:
+                    pass
             if nid in self.geom.nodes:
                 self.report.warn("Duplicate node id(s) in the input; the last definition is kept "
                                  "(Abaqus behaviour) — check for an upstream renumbering error.", once=True)
@@ -2605,6 +2797,7 @@ class Converter:
                 self.report.warn(f"*ELEMENT TYPE={typ}: non-numeric connectivity "
                                  f"(instance-qualified or named node); element skipped — "
                                  f"verify it is a connector/MPC with no ccx equivalent.", once=True)
+                self._reduces(f"*ELEMENT, TYPE={typ} elements with named nodes skipped")
                 i += 1 + nn
                 continue
             if eid in self.geom.elements or eid in self._conn:
@@ -2636,6 +2829,7 @@ class Converter:
                 self.report.warn(f"*ELEMENT TYPE={typ}: a node given by a name ccx cannot "
                                  f"resolve (instance or set name); that connector is skipped "
                                  f"— its constraint is missing.", once=True)
+                self._reduces("connector element with an unresolvable node skipped")
                 continue
             if ends[0] is None and ends[1] is None:
                 continue
@@ -2733,6 +2927,9 @@ class Converter:
             by_type.setdefault(typ, []).append((eid, conn))
         for typ, items in by_type.items():
             out_typ = ccx_element_type(typ, self.report)
+            loss = substitution_loss(typ)
+            if loss and typ.upper() not in SLAB_TYPES:    # (_plan_incompatible_slabs says why)
+                self._reduces(loss)
             out.append(f"*ELEMENT, TYPE={out_typ}")
             for eid, conn in items:
                 out.extend(reflow([str(eid)] + [str(c) for c in conn], MAX_ENTRIES_PER_LINE))
@@ -2797,7 +2994,7 @@ class Converter:
                     b, f"*{b.keyword} is step (history) data but appears {where}: Abaqus rejects "
                        f"that, ccx stops with '*{b.keyword} should only be used within a STEP', "
                        f"and ccx 2.23 segfaults when the deck has no *STEP at all. Commented out "
-                       f"— move it into a step if it was meant to apply."))
+                       f"— move it into a step if it was meant to apply.", reduces=False))
                 i += 1
                 continue
             out.extend(self.translate_one(b))
@@ -2861,6 +3058,7 @@ class Converter:
             "EXPANSION": self.handle_expansion,
             "MOHR COULOMB": self.handle_dependent_material,
             "MOHR COULOMB HARDENING": self.handle_dependent_material,
+            "SECTION CONTROLS": self.handle_section_controls,
         }
         if kw in handlers:
             return handlers[kw](b)
@@ -2891,6 +3089,8 @@ class Converter:
             return []
         if kw in DROP_WARN_KEYWORDS:
             self.report.warn(DROP_WARN_KEYWORDS[kw], once=True)
+            if kw == "SYSTEM":
+                self._reduces("*SYSTEM (nodes given in a local frame read as global)")
             return []
         return self.passthrough(b)
 
@@ -2905,27 +3105,50 @@ class Converter:
             return self._commented(b, "*FILTER: the Abaqus output filter (anti-aliasing / halt "
                                       "on limit) has no ccx equivalent, and ccx's *FILTER — a "
                                       "sensitivity-smoothing card — is an error outside a "
-                                      "*SENSITIVITY step. Commented out.")
+                                      "*SENSITIVITY step. Commented out.", reduces=b.has("HALT"))
+        if kw == "SURFACE BEHAVIOR" and b.has("NO SEPARATION"):
+            self.report.warn("*SURFACE BEHAVIOR, NO SEPARATION: ccx has no such option (it ignores "
+                             "the parameter), so surfaces in contact can separate again.", once=True)
+            self._reduces("*SURFACE BEHAVIOR, NO SEPARATION")
         if kw in SEMANTIC_TRAP:
             self.report.warn(SEMANTIC_TRAP[kw], once=True)
         elif kw in PASS_WITH_NOTE:
             self.report.note(PASS_WITH_NOTE[kw], once=True)
+            if kw in ("USER MATERIAL", "USER ELEMENT"):
+                self._reduces(f"*{kw} (the Abaqus subroutine does not run in ccx)")
         elif kw not in CCX_KEYWORDS:
+            if kw in OUTPUT_ONLY_KEYWORDS:
+                return self._commented(b, f"*{kw}: an output / diagnostics request ccx has no "
+                                          f"counterpart for; commented out — the solution is the "
+                                          f"same.", reduces=False)
+            if kw in NUMERICAL_KEYWORDS:
+                return self._commented(b, f"*{kw}: {NUMERICAL_KEYWORDS[kw]}; commented out — it does "
+                                          f"not change the model ccx solves.", reduces=False)
             guidance = SPECIAL_UNSUPPORTED.get(kw)
             msg = (f"*{kw}: {guidance}" if guidance
-                   else f"*{kw} has no direct CalculiX equivalent; emitted as a comment for review.")
+                   else f"*{kw} has no CalculiX equivalent; commented out, so ccx solves the model "
+                        f"without it.")
             return self._commented(b, msg)
         params = b.params
         if b.has("DEPENDENCIES"):
             params = OrderedDict((k, v) for k, v in b.params.items() if k != "DEPENDENCIES")
             self.report.warn(f"*{kw}, DEPENDENCIES=...: ccx has no field-variable dependence and "
-                             f"in effect uses only the first data row; parameter dropped — "
-                             f"verify the property.", once=True)
+                             f"reads the field columns as further rows; parameter dropped — the "
+                             f"property differs from Abaqus'.", once=True)
+            self._reduces(f"*{kw}, DEPENDENCIES (field-variable dependence)")
         return [emit_keyword(kw, params)] + list(b.data)
 
-    def _commented(self, b: Block, msg: str) -> List[str]:
+    def _commented(self, b: Block, msg: str, reduces: Union[bool, str] = True) -> List[str]:
+        """``b`` as comment lines, with ``msg`` reported.  A commented-out card is physics the
+        Abaqus deck has and the ccx model lacks (reduced physics, named by the card or by
+        ``reduces``) unless ``reduces`` is False: an output request, a numerical control, or a
+        card Abaqus itself would not apply (reported as a NOTE)."""
         self.report.n_commented += 1
-        self.report.warn(msg, once=True)
+        if reduces is False:
+            self.report.note(msg, once=True)
+        else:
+            self.report.warn(msg, once=True)
+            self._reduces(reduces if isinstance(reduces, str) else f"*{b.keyword}")
         out = ["** abq2ccx: " + msg, "** " + emit_keyword(b.keyword, b.params)]
         out += ["** " + d for d in b.data]
         return out
@@ -2937,8 +3160,10 @@ class Converter:
 
         ccx has no field variables: it ignores DEPENDENCIES and reads the field columns as
         further temperature rows, so effectively only the first row counts.  Abaqus with no
-        field defined uses field = 0, so that state is kept — interpolated between rows
-        (one field variable, one row per state) or else the rows of the state nearest 0.
+        field defined uses field = 0, so that state is kept: the rows of the state at 0 (or at
+        the end of the table nearest 0, which Abaqus holds beyond the table), or rows
+        interpolated between the two states around 0 (one field variable, the same
+        temperatures); else, inexactly, the rows of the state nearest 0.
         Each row is ``nvals`` property values, the temperature, then the n field values,
         8 entries per physical line."""
         try:
@@ -2965,41 +3190,62 @@ class Converter:
                 states.append(fl)
         out_rows: List[Tuple[List[str], str]] = []
         per_state_unique = len({(t, fl) for t, (_, _, fl) in zip(temps, rows)}) == len(rows)
-        if ndep == 1 and per_state_unique and len(states) > 1:
-            by_t: "OrderedDict[float, List[Tuple[float, List[str], str]]]" = OrderedDict()
-            for t, (vals, traw, fl) in zip(temps, rows):
-                by_t.setdefault(t, []).append((fl[0], vals, traw))
-            for t, grp in by_t.items():
-                grp.sort(key=lambda g: g[0])
-                if any(g[0] == 0.0 for g in grp):
-                    g = next(g for g in grp if g[0] == 0.0)
-                    out_rows.append((g[1], g[2]))
-                elif 0.0 < grp[0][0]:
-                    out_rows.append((grp[0][1], grp[0][2]))
-                elif 0.0 > grp[-1][0]:
-                    out_rows.append((grp[-1][1], grp[-1][2]))
-                else:
-                    lo = max((g for g in grp if g[0] < 0.0), key=lambda g: g[0])
-                    hi = min((g for g in grp if g[0] > 0.0), key=lambda g: g[0])
-                    w = -lo[0] / (hi[0] - lo[0])
-                    try:
-                        vals = [f"{num(a) + w * (num(c) - num(a)):.6g}" if (a or c) else ""
-                                for a, c in zip(lo[1], hi[1])]
-                    except ValueError:
-                        return None
-                    out_rows.append((vals, lo[2]))
-            desc = "field variable 1 = 0 (the Abaqus value when no field is defined; interpolated)"
-        else:
-            keep = min(states, key=lambda s: (sum(abs(x) for x in s), states.index(s)))
+        # Abaqus with no field defined evaluates the table at field 0: it interpolates linearly
+        # inside the tabulated range of each field variable and holds the end value beyond it,
+        # so 0 is clamped into every variable's range
+        target = tuple(min(max(0.0, min(st[j] for st in states)), max(st[j] for st in states))
+                       for j in range(ndep))
+        exact = True
+        lo = hi = None
+        if target in states:
+            out_rows = [(vals, traw) for vals, traw, fl in rows if fl == target]
+            desc = (f"the rows for field variable(s) = {', '.join(f'{x:g}' for x in target)} ("
+                    + ("the Abaqus no-field value 0)" if not any(target) else
+                       "the end of the table nearest 0, which Abaqus holds beyond it)"))
+        elif ndep == 1 and per_state_unique:
+            # 0 lies between two rows of the one field variable
+            lo = max((st for st in states if st[0] < 0.0), key=lambda st: st[0])
+            hi = min((st for st in states if st[0] > 0.0), key=lambda st: st[0])
+            at_hi = {t: vals for t, (vals, _, fl) in zip(temps, rows) if fl == hi}
+            if [t for t, (_, _, fl) in zip(temps, rows) if fl == lo] != \
+                    [t for t, (_, _, fl) in zip(temps, rows) if fl == hi]:
+                lo = hi = None              # different temperatures: not a regular table
+            else:
+                w = -lo[0] / (hi[0] - lo[0])
+                try:
+                    for t, (vals, traw, fl) in zip(temps, rows):
+                        if fl == lo:
+                            out_rows.append(([f"{num(a) + w * (num(c) - num(a)):.6g}" if (a or c)
+                                              else "" for a, c in zip(vals, at_hi[t])], traw))
+                except ValueError:
+                    return None
+                desc = (f"field variable 1 = 0, interpolated between its rows at {lo[0]:g} and "
+                        f"{hi[0]:g} (given at the same temperatures), as Abaqus interpolates")
+        if not out_rows:
+            exact = False
+            keep = min(states, key=lambda st: (sum(abs(x - y) for x, y in zip(st, target)),
+                                               states.index(st)))
             out_rows = [(vals, traw) for vals, traw, fl in rows if fl == keep]
-            desc = (f"the rows for field variable(s) = {', '.join(f'{x:g}' for x in keep)} (the "
-                    f"state nearest the Abaqus no-field value 0)")
-        self.report.warn(f"*{b.keyword}, DEPENDENCIES={ndep}: ccx has no field-variable dependence "
-                         f"(it ignores the parameter and in effect uses only the first row). "
-                         f"Collapsed to {desc}"
-                         + ("; this deck sets field variables (*FIELD / USDFLD / TYPE=FIELD), which "
-                            "ccx cannot replicate" if self._fields_set else "")
-                         + ". Verify.", once=True)
+            desc = (f"the rows for field variable(s) = {', '.join(f'{x:g}' for x in keep)}, the "
+                    f"state nearest the Abaqus no-field value 0")
+        if self._fields_set:
+            self.report.warn(f"*{b.keyword}, DEPENDENCIES={ndep}: ccx has no field-variable "
+                             f"dependence (it ignores the parameter and in effect uses only the first "
+                             f"row). Collapsed to {desc}; this deck sets field variables (*FIELD / "
+                             f"USDFLD / TYPE=FIELD), which ccx cannot replicate, so the property "
+                             f"differs from Abaqus' where they are not 0.", once=True)
+            self._reduces(f"*{b.keyword} field-variable dependence")
+        elif not exact:
+            self.report.warn(f"*{b.keyword}, DEPENDENCIES={ndep}: ccx has no field-variable "
+                             f"dependence; collapsed to {desc}. Abaqus interpolates the property at "
+                             f"field 0 between rows this table gives at different temperatures or "
+                             f"field-variable combinations, which the collapse does not reproduce.",
+                             once=True)
+            self._reduces(f"*{b.keyword} field-variable dependence")
+        else:
+            self.report.note(f"*{b.keyword}, DEPENDENCIES={ndep}: ccx has no field-variable "
+                             f"dependence; collapsed to {desc}. The deck sets no field variable, so "
+                             f"Abaqus uses that state too. Exact.", once=True)
         data: List[str] = []
         for vals, traw in out_rows:
             entries = list(vals) + [traw]
@@ -3029,6 +3275,7 @@ class Converter:
                                  + (" Its shear coefficients alpha12, alpha13, alpha23 are NOT "
                                     "halved to the tensor components ccx reads." if aniso else ""),
                                  once=True)
+                self._reduces(f"*{b.keyword} field-variable dependence")
                 return [emit_keyword(b.keyword, params)] + list(b.data)
             out = [emit_keyword(b.keyword, params)] + data
         else:
@@ -3130,12 +3377,18 @@ class Converter:
                              "(Chaboche) model to these data, while ccx reads the table as its own "
                              "combined law (isotropic part from *CYCLIC HARDENING) — verify the "
                              "response under load reversal.", once=True)
+            self._reduces("*PLASTIC, HARDENING=COMBINED (Abaqus' nonlinear kinematic fit)")
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "HARDENING":
                 params[k] = hard
             elif k == "DEPENDENCIES":
                 continue
+            elif k == "RATE" or (k == "SCALE STRESS" and (v or "").strip() not in ("", "1", "1.",
+                                                                                 "1.0")):
+                self.report.warn(f"*PLASTIC, {k}={v} dropped (not a ccx parameter): the hardening "
+                                 f"curve ccx uses differs from Abaqus'.", once=True)
+                self._reduces(f"*PLASTIC, {k}")
             else:
                 self.report.note(f"*PLASTIC parameter {k} dropped (not a ccx parameter).", once=True)
         data = self._collapse_dependencies(b, 2) if b.has("DEPENDENCIES") else None
@@ -3152,7 +3405,7 @@ class Converter:
         if id(b) not in self._cyclic_ok:
             return self._commented(b, "*CYCLIC HARDENING without a (kept) *PLASTIC, "
                                       "HARDENING=COMBINED in its material is an error in ccx; "
-                                      "commented out.")
+                                      "commented out.", reduces=False)
         return self.passthrough(b)
 
     def handle_depvar(self, b: Block) -> List[str]:
@@ -3161,6 +3414,7 @@ class Converter:
         if b.has("DELETE"):
             self.report.warn(f"*DEPVAR, DELETE={b.param('DELETE')}: element deletion is unsupported "
                              f"by ccx — failed elements are never removed from the model.", once=True)
+            self._reduces("element deletion (*DEPVAR, DELETE)")
         recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
         recs = [r for r in recs if r]
         if len(recs) > 1:
@@ -3179,6 +3433,11 @@ class Converter:
                                       "coefficients from *UNIAXIAL/*BIAXIAL/... TEST DATA; ccx needs "
                                       "the coefficients themselves — fit them and re-add the card.")
         params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+        if b.has("DEPENDENCIES"):
+            self.report.warn("*HYPERELASTIC, DEPENDENCIES: ccx has no field-variable dependence and "
+                             "reads the field columns as data; the coefficients differ from "
+                             "Abaqus'.", once=True)
+            self._reduces("*HYPERELASTIC field-variable dependence")
         if not any(k in models for k in params):
             params = OrderedDict([("POLYNOMIAL", None)] + list(params.items()))
             self.report.note("*HYPERELASTIC without a model keyword -> POLYNOMIAL (the Abaqus "
@@ -3217,6 +3476,7 @@ class Converter:
                 self.report.warn("*ELASTIC, DEPENDENCIES=...: rows could not be parsed; passed "
                                  "through — ccx ignores field-variable dependence and in effect "
                                  "uses only the first row. Verify.", once=True)
+                self._reduces("*ELASTIC field-variable dependence")
             else:
                 data = collapsed
         if self._approx and cc == "ISO":
@@ -3267,6 +3527,7 @@ class Converter:
                          "isotropy (E3=E2, nu13=nu12, nu23 derived from G23). ccx expands shells "
                          "to solids, so these through-thickness constants DO enter the stiffness — "
                          "verify.", once=True)
+        self._reduces("*ELASTIC, TYPE=LAMINA (assumed out-of-plane constants)")
         return [emit_keyword("ELASTIC", params)] + rows
 
     @staticmethod
@@ -3424,6 +3685,7 @@ class Converter:
                              f"uses a wrong stiffness for this combination in linear steps of a "
                              f"deck with temperatures — give the elastic constants as "
                              f"TYPE={target}.", once=True)
+            self._reduces(f"*ELASTIC of material {mat} beside *EXPANSION, TYPE={kind} (ccx 2.23 misreads it)")
             return out
         added, worst = 0, 0.0
         try:
@@ -3544,6 +3806,7 @@ class Converter:
                              f"41 % off). Linear steps are right, and no form of the deck avoids it in "
                              f"ccx 2.23: check the thermal strains against a hand calculation.",
                              once=True)
+            self._reduces("thermal shear of a turned ORTHO *EXPANSION under NLGEOM (ccx 2.23 drops it)")
         if aniso:
             self.report.warn(f"{names(aniso)}: *EXPANSION, TYPE=ANISO in a deck with NLGEOM steps "
                              f"and temperatures. ccx 2.23 builds the thermal deformation gradient of "
@@ -3674,7 +3937,7 @@ class Converter:
         if definition.startswith("OFFSET"):
             return self._commented(b, "*ORIENTATION, DEFINITION=OFFSET TO NODES (axes from each "
                                       "element's own local nodes) has no ccx equivalent; define "
-                                      "the system by coordinates or a *DISTRIBUTION.")
+                                      "the system by coordinates or a *DISTRIBUTION.", reduces=False)
         if self._orientation_distribution(b) is not None:
             return self._distribution_orientation(b)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -3684,6 +3947,7 @@ class Converter:
             if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
                 self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
                                  "RECTANGULAR — verify the local system.", once=True)
+                self._reduces("*ORIENTATION, SYSTEM=SPHERICAL written rectangular")
                 params["SYSTEM"] = "RECTANGULAR"
             else:
                 params[k] = v
@@ -3696,7 +3960,7 @@ class Converter:
                 if pts is None:
                     return self._commented(b, "*ORIENTATION, DEFINITION=NODES: the node numbers "
                                               "could not be resolved to coordinates; define the "
-                                              "system by coordinates.")
+                                              "system by coordinates.", reduces=False)
                 v = [_fmt_component(x) for x in pts]
                 self.report.note("*ORIENTATION, DEFINITION=NODES resolved to coordinates (ccx "
                                  "takes points a, b).", once=True)
@@ -3730,6 +3994,7 @@ class Converter:
                     self.report.warn(f"*ORIENTATION SYSTEM={system}: the additional-rotation line is "
                                      f"not allowed by ccx for non-rectangular systems and was dropped "
                                      f"— verify material directions.", once=True)
+                    self._reduces("*ORIENTATION additional rotation on a non-rectangular system dropped")
         return out
 
     # -- *DISTRIBUTION orientations -----------------------------------------
@@ -3741,7 +4006,7 @@ class Converter:
         if not (b.param("LOCATION") or "ELEMENT").strip().upper().startswith("ELEM"):
             return self._commented(b, f"*DISTRIBUTION {name}, LOCATION={b.param('LOCATION')}: ccx "
                                       f"takes per-element orientations from element distributions "
-                                      f"only, and has no other kind.")
+                                      f"only, and has no other kind.", reduces=name in self._param_values)
         plans = [p for p in self._dist_ori.values() if p["dist"] == name]
         if any(p["has_data"] for p in plans):
             self.report.note("*DISTRIBUTION orientations re-emitted for ccx 2.23 right before "
@@ -3753,12 +4018,12 @@ class Converter:
             return []
         if plans:
             return self._commented(b, f"*DISTRIBUTION {name} has no data lines, so the "
-                                      f"*ORIENTATION that names it cannot be formed.")
+                                      f"*ORIENTATION that names it cannot be formed.", reduces=False)
         return self._commented(b, f"*DISTRIBUTION {name} is not named by any *ORIENTATION: ccx "
                                   f"supports distributions only as per-element orientations "
                                   f"(Abaqus also distributes shell thicknesses and material "
                                   f"properties) — model the variation with element sets and one "
-                                  f"section or material each.")
+                                  f"section or material each.", reduces=name in self._param_values)
 
     def handle_distribution_table(self, b: Block) -> List[str]:
         if (b.param("NAME") or "").strip().upper() in self._dist_tables:
@@ -3793,16 +4058,16 @@ class Converter:
         if plan is None and ref in self._dists:
             return self._commented(b, f"*ORIENTATION {name} names *DISTRIBUTION {ref}, which is not "
                                       f"element-based: per-element orientations need an element "
-                                      f"distribution (LOCATION=ELEMENT).")
+                                      f"distribution (LOCATION=ELEMENT).", reduces=False)
         if plan is None:
             return self._commented(b, f"*ORIENTATION {name} names *DISTRIBUTION {ref}, which the "
                                       f"deck does not define; define the distribution or give "
-                                      f"the axes by coordinates.")
+                                      f"the axes by coordinates.", reduces=False)
         if not plan["has_data"]:
             return self._commented(b, f"*ORIENTATION {name}: its *DISTRIBUTION {ref} has no data "
                                       f"lines (INPUT= file missing?), so the per-element material "
                                       f"directions are unknown and the sections that use it "
-                                      f"cannot run until the data is supplied.")
+                                      f"cannot run until the data is supplied.", reduces=False)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "DEFINITION":
@@ -3810,6 +4075,7 @@ class Converter:
             if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
                 self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
                                  "RECTANGULAR — verify the local system.", once=True)
+                self._reduces("*ORIENTATION, SYSTEM=SPHERICAL written rectangular")
                 params["SYSTEM"] = "RECTANGULAR"
             else:
                 params[k] = v
@@ -3817,6 +4083,7 @@ class Converter:
             self.report.warn(f"*ORIENTATION {name}: an additional rotation is not allowed by ccx "
                              f"for a non-rectangular system and was dropped — verify material "
                              f"directions.", once=True)
+            self._reduces("*ORIENTATION additional rotation on a non-rectangular system dropped")
         if plan["split"] and not plan["solid"]:
             return []                              # its shell sections carry their own axes
         first = plan["default"]
@@ -3920,6 +4187,7 @@ class Converter:
                 self.report.warn(f"*{kw}, ORIENTATION={ori}: a *DISTRIBUTION orientation gives "
                                  f"per-element axes to sections only; ccx gives this card the "
                                  f"distribution's first (default) axes — verify.", once=True)
+                self._reduces(f"*{kw}, ORIENTATION={ori}: per-element distribution axes replaced")
 
     def _existing(self, elset: str) -> List[int]:
         return [e for e in self.geom.elset(elset) if e in self.geom.elements]
@@ -3942,7 +4210,13 @@ class Converter:
         for rec in merged_data_records(dist):
             if not any(rec):
                 continue
-            label, toks = rec[0], [x for x in rec[1:] if x != ""]
+            fields = list(rec[1:])
+            while fields and fields[-1] == "":
+                fields.pop()
+            # Abaqus: a blank or omitted value is 0 (b3 = 0 may be left off the line)
+            label, toks = rec[0], [x if x != "" else "0." for x in fields]
+            if toks:
+                toks += ["0."] * (6 - len(toks))
             try:
                 vals = [pf(x) for x in toks]
             except ValueError:
@@ -3972,6 +4246,7 @@ class Converter:
         if bad:
             self.report.warn(f"*DISTRIBUTION {ref}: {bad} line(s) without six numeric values "
                              f"(a, b) were skipped.", once=True)
+            self._reduces(f"*DISTRIBUTION {ref} lines skipped")
         if undefined:
             self.report.warn(f"*DISTRIBUTION {ref}: {undefined} line(s) name an undefined element "
                              f"or element set and were skipped.", once=True)
@@ -4040,6 +4315,7 @@ class Converter:
                              f"'{name}': ccx allows no additional rotation for a non-rectangular "
                              f"system, so the ply angle was dropped — verify ply directions.",
                              once=True)
+            self._reduces("composite ply angle on a cylindrical distribution orientation dropped")
         return oname
 
     def _fresh_name(self, base: str) -> str:
@@ -4056,7 +4332,95 @@ class Converter:
         self._used_names.add(cand)
         return cand
 
+    # *SECTION CONTROLS options that Abaqus/Standard ignores (Abaqus 2017 Keywords Guide: they
+    # apply only to Abaqus/Explicit, or to element types ccx never runs — S3RS / S4RS, SPH)
+    _SC_EXPLICIT_ONLY = {"CONVERSION CRITERION", "ELEMENT CONVERSION", "IMPROVED DT METHOD", "KERNEL",
+                         "LENGTH RATIO", "PARTICLE THICKNESS", "RAMP INITIAL STRESS",
+                         "SECOND ORDER ACCURACY", "SPH FORMULATION", "SPH SMOOTHING LENGTH",
+                         "SPH TENSILE INSTABILITY CONTROL", "WEIGHT FACTOR", "KINEMATIC SPLIT",
+                         "DRILL STIFFNESS"}
+    # Abaqus elements with hourglass control: first-order reduced integration, and the modified
+    # triangles / tetrahedra (Abaqus/Standard)
+    _HOURGLASS_PREFIXES = ("C3D8R", "CPS4R", "CPE4R", "CAX4R", "CPEG4R", "CGAX4R", "S4R", "M3D4R",
+                           "SC8R", "SC6R", "C3D10M", "CPS6M", "CPE6M", "CAX6M", "CPEG6M")
+
+    def handle_section_controls(self, b: Block) -> List[str]:
+        """*SECTION CONTROLS has no ccx card (ccx's elements have their own, fixed formulation).
+        It changes Abaqus' element formulation only where its options apply (Abaqus 2017
+        Keywords Guide): hourglass control on first-order reduced-integration and modified
+        elements, element deletion / degradation / viscous regularization with progressive
+        damage, distortion control on C3D10HS, and the Abaqus/Explicit-only options in an
+        explicit step.  Elsewhere the card does nothing in Abaqus either."""
+        name = (b.param("NAME") or "").strip().upper()
+        types = self._sc_types.get(name, set())
+        why: List[str] = []
+        hourglass = sorted(t for t in types if t.startswith(self._HOURGLASS_PREFIXES))
+        for k, v in b.params.items():
+            v = (v or "").strip().upper()
+            if k == "NAME":
+                continue
+            if k in self._SC_EXPLICIT_ONLY:
+                if self._sc_explicit:
+                    why.append(f"{k}={v} (explicit step)")
+            elif k == "HOURGLASS":
+                # the default: ENHANCED on hyperelastic / hyperfoam materials and (Standard)
+                # modified triangles / tetrahedra, else STIFFNESS (Standard) / RELAX STIFFNESS
+                # (Explicit) — the same hourglass control as a section without the option
+                changed = [t for t in hourglass if v != (
+                    "ENHANCED" if name in self._sc_hyper or
+                    t.startswith(("C3D10M", "CPS6M", "CPE6M", "CAX6M", "CPEG6M")) else
+                    "RELAX STIFFNESS" if self._sc_explicit else "STIFFNESS")]
+                if changed:
+                    why.append(f"HOURGLASS={v} on {', '.join(changed)}")
+            elif k in ("ELEMENT DELETION", "MAX DEGRADATION", "VISCOSITY"):
+                if self._sc_damage or any(t.startswith(("COH", "CONN")) for t in types):
+                    why.append(f"{k}={v} (progressive damage)")
+            elif k == "DISTORTION CONTROL":
+                if self._sc_explicit or "C3D10HS" in types:
+                    why.append(f"{k}={v}")
+            elif k == "INITIAL GAP OPENING":
+                if any(t.startswith("COH") and "P" in t[3:] for t in types):
+                    why.append(f"{k}={v}")
+            else:
+                why.append(f"{k}={v}")
+        # data line (Abaqus 2017 Keywords *SECTION CONTROLS): 1 hourglass stiffness scale,
+        # 2 its rotational scale (shells), 3-5 Explicit-only scales (out-of-plane hourglass,
+        # bulk viscosity), 6 C3D4H's pressure hourglass scale, 7 not used, 8 the Explicit drill
+        # scale; a second line holds SPH (Explicit) settings.  ENHANCED ignores the data line.
+        enhanced = (b.param("HOURGLASS") or "").strip().upper() == "ENHANCED"
+        rec = [x.strip() for r in merged_data_records(b) for x in r]
+        for i, x in enumerate(rec):
+            try:
+                scale = pf(x) if x else 1.0
+            except ValueError:
+                scale = None
+            if scale == 1.0 or i == 6:
+                continue                         # the default value / not used
+            if (i == 0 and hourglass and not enhanced) or scale is None or \
+                    (i == 1 and not enhanced and any(t.startswith("S4R") for t in hourglass)) or \
+                    (i in (2, 3, 4, 7) and self._sc_explicit) or (i == 5 and "C3D4H" in types) or \
+                    (i > 7 and self._sc_explicit):
+                why.append(f"data-line value {i + 1} = {x}")
+        if not types:
+            return self._commented(b, f"*SECTION CONTROLS {name or ''}: no section uses it; commented "
+                                      f"out.", reduces=False)
+        if not why:
+            return self._commented(b, f"*SECTION CONTROLS {name}: no option it sets applies to its "
+                                      f"elements ({', '.join(sorted(types))}) in this analysis "
+                                      f"(Abaqus 2017 Keywords Guide), so it changes nothing; "
+                                      f"commented out.", reduces=False)
+        return self._commented(b, f"*SECTION CONTROLS {name} changes Abaqus' element formulation "
+                                  f"({'; '.join(why)}), which ccx's elements cannot take; commented "
+                                  f"out, so ccx runs its own formulation.",
+                               reduces=f"*SECTION CONTROLS ({'; '.join(why)})")
+
     def handle_solid_section(self, b: Block) -> List[str]:
+        if id(b) in self._slab_sections:           # CPS4I / CPE4I as C3D8I slabs
+            kind, mat = self._slab_sections[id(b)]
+            out = [] if mat in self._slab_written else self._slab_materials.get(mat, [])
+            self._slab_written.add(mat)
+            return out + [emit_keyword("SOLID SECTION", OrderedDict(
+                [("ELSET", b.param("ELSET")), ("MATERIAL", mat)]))]
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("ELSET", "MATERIAL", "ORIENTATION"):
@@ -4064,6 +4428,7 @@ class Converter:
             elif k == "COMPOSITE":
                 self.report.warn("*SOLID SECTION, COMPOSITE is not supported by ccx; model each layer "
                                  "with its own solid elements/section.", once=True)
+                self._reduces("*SOLID SECTION, COMPOSITE")
             else:
                 self.report.note(f"*SOLID SECTION parameter {k} dropped (unused by ccx).", once=True)
         data = list(b.data)
@@ -4093,6 +4458,7 @@ class Converter:
                          f"solid, so the {kind} traction/closure behaviour is NOT modelled; ensure "
                          f"MATERIAL={mat} is a valid solid material (a traction-separation "
                          f"*ELASTIC, TYPE=... will be rejected by ccx). Verify.", once=True)
+        self._reduces(f"*{b.keyword} (the {kind} law)")
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict([("ELSET", elset), ("MATERIAL", mat)])
         if b.param("ORIENTATION"):
             keep["ORIENTATION"] = b.param("ORIENTATION")
@@ -4344,6 +4710,7 @@ class Converter:
             if system != "RECTANGULAR":
                 self.report.warn(f"Composite ply orientation is based on non-rectangular system "
                                  f"'{system}'; the synthesized orientation may be inaccurate.", once=True)
+                self._reduces("composite ply orientation on a non-rectangular system")
         else:
             a, bvec = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
         if ang == 0.0:
@@ -4364,6 +4731,7 @@ class Converter:
                                  f"rotates about local axis {rot[0]}: ccx allows a single rotation "
                                  f"per orientation, so that base rotation is not combined — verify "
                                  f"the ply directions.", once=True)
+                self._reduces("composite ply angle combined with an orientation rotation")
         name = f"ABQ2CCX_OR{len(self._synth_cache) + 1}"
         self._synth_cache[key] = name
         pre.append(f"*ORIENTATION, NAME={name}")
@@ -4378,6 +4746,7 @@ class Converter:
         self._step_idx += 1
         proc_block = next((b for b in inner if b.keyword in PROC_KW), None)
         proc = proc_block.keyword if proc_block else None
+        self._step_proc = proc
         explicit = proc == "DYNAMIC" and proc_block is not None and proc_block.has("EXPLICIT")
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in step_block.params.items():
@@ -4400,12 +4769,23 @@ class Converter:
                                          "eigenmodes).", once=True)
                 elif proc in ("FREQUENCY", "BUCKLE"):
                     params[k] = v
+                elif proc != "STATIC":
+                    self.report.note(f"*STEP, PERTURBATION dropped on a *{proc} step (ccx reads it only "
+                                     f"on *FREQUENCY / *BUCKLE; it runs *{proc} as a linear "
+                                     f"procedure anyway).", once=True)
                 elif self._step_idx < self._n_steps:
                     self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
                                      "general step, so its loads persist into the following steps "
                                      "(an Abaqus perturbation leaves the base state untouched). Move "
                                      "the perturbation load case after the last general step or remove "
                                      "its loads in the next step (OP=NEW).", once=True)
+                    self._reduces("*STEP, PERTURBATION on a static step that is not the last (its loads persist)")
+                elif self._general_step_seen:
+                    self.report.warn("*STEP, PERTURBATION on the last (static) step dropped: ccx runs "
+                                     "it as a general step that continues from the earlier steps' "
+                                     "state, while Abaqus linearizes about that base state and "
+                                     "reports the perturbation alone.", once=True)
+                    self._reduces("*STEP, PERTURBATION static step after a general step")
                 else:
                     self.report.note("*STEP PERTURBATION dropped (ccx allows it only for *FREQUENCY / "
                                      "*BUCKLE; a final perturbation *STATIC is an ordinary linear "
@@ -4488,6 +4868,9 @@ class Converter:
         return out
 
     def handle_boundary(self, b: Block) -> List[str]:
+        if id(b) in self._lc_drop:                   # _plan_load_cases, before any other plan
+            return ["** [abq2ccx] *BOUNDARY, LOAD CASE=2 (buckling-mode BCs) left out: ccx has one "
+                    "set of BCs per step"]
         if self._bc_type(b) in self._RATE_TYPES and id(b) in self._vel_cards:   # _plan_velocity_bcs
             pieces = self._vel_cards[id(b)]
             if id(b) in self._op_new_drop:       # the card's OP=NEW goes with its first block
@@ -4510,11 +4893,20 @@ class Converter:
                 if v and v.upper() in ("VELOCITY", "ACCELERATION"):
                     self.report.warn(f"*BOUNDARY TYPE={v} is unsupported by ccx (displacement BCs "
                                      f"only); TYPE dropped — values now read as displacements.", once=True)
+                    self._reduces(f"*BOUNDARY, TYPE={v} read as a displacement")
                 continue  # ccx *BOUNDARY has no TYPE parameter
             if k == "LOAD CASE":
-                # ccx hard-errors on LOAD CASE outside *STEADY STATE DYNAMICS
-                self.report.warn("*BOUNDARY LOAD CASE dropped (ccx allows it only in steady-state "
-                                 "dynamics; elsewhere it is a fatal error).", once=True)
+                # Abaqus reads it only in *BUCKLE (see _plan_load_cases) and ignores it in every
+                # other procedure; ccx stops on it outside steady-state dynamics, and there reads
+                # LOAD CASE=2 as the imaginary part — which Abaqus gives with IMAGINARY instead
+                self.report.note("*BOUNDARY parameter LOAD CASE dropped (Abaqus reads it only in "
+                                 "*BUCKLE steps; ccx stops on it outside steady-state dynamics).",
+                                 once=True)
+                continue
+            if k in ("REAL", "IMAGINARY"):
+                part = self._ssd_part(b, k)
+                if part:
+                    params["LOAD CASE"] = part
                 continue
             if k == "OP" and id(b) in self._op_new_drop:
                 continue                # an OP=NEW that removes nothing (_plan_op_new_rotations)
@@ -4560,14 +4952,17 @@ class Converter:
             else:
                 out.append(", ".join(g))
         if getattr(self, "_n_inactive_rot", 0):
-            self.report.warn("Rotational DOFs (4-6) prescribed on nodes that only belong to plane-"
+            self.report.note("Rotational DOFs (4-6) prescribed on nodes that only belong to plane-"
                              "stress/plane-strain/axisymmetric elements were dropped: those nodes "
-                             "have no rotations (Abaqus ignores such BCs with a warning), but ccx "
-                             "treats them as rotational constraints and 2.23 crashes (bus error) or "
-                             "stops in usermpc.", once=True)
+                             "have no rotations in Abaqus (their active DOFs are 1 and 2; Abaqus 2017 "
+                             "two-dimensional solid element library), so such a BC constrains "
+                             "nothing there, while ccx treats it as a rotational constraint and 2.23 "
+                             "crashes (bus error) or stops in usermpc. Exact.", once=True)
         if self._planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
             # OP=NEW also removes the model-data planar constraint (verified on 2.23)
             out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
+        if self._slab_bc and (params.get("OP") or "").strip().upper() == "NEW":
+            out += ["** [abq2ccx] slab thickness DOF held again (OP=NEW removed it)"] + self._slab_bc
         if self._conn_bcs and (params.get("OP") or "").strip().upper() == "NEW":
             # bare lines: on a card with FIXED or an amplitude they would take it on too
             out += (["*BOUNDARY"] if any(k != "OP" for k in params) else []) + self._conn_bcs
@@ -4945,8 +5340,10 @@ class Converter:
                 out.append(mkblock("BOUNDARY", [("OP", op)], []))     # it still removes BCs
             return out
 
-        def comment(what: str, why: str) -> Tuple[str, str]:
+        def comment(what: str, why: str, reduces: bool = True) -> Tuple[str, str]:
             self.report.warn(why, once=True)
+            if reduces:
+                self._reduces("*BOUNDARY, TYPE=VELOCITY/ACCELERATION line not converted")
             return ("#", f"** [abq2ccx] not converted: {what} -- {why}")
 
         def constraint_card(b: Block, why: str) -> List[object]:
@@ -4960,7 +5357,8 @@ class Converter:
                 if not dofs or nonzero:
                     entries.append(comment(text, f"*BOUNDARY, TYPE={self._bc_type(b)} {why}: "
                                                  f"only a zero value on readable DOFs can be "
-                                                 f"converted (to a zero displacement BC)."))
+                                                 f"converted (to a zero displacement BC).",
+                                           why not in ("in model data", "outside a step")))
                 else:
                     entries.append((None, f"{spec}, {named}" if named else
                                     f"{spec}, {dofs[0]}, {dofs[-1]}"))
@@ -5046,6 +5444,7 @@ class Converter:
                                          "displacement BC or a static step moved it): Abaqus ramps "
                                          "from that velocity; taken as the DOF's earlier velocity "
                                          "BC value (0 without one).", once=True)
+                        self._reduces("velocity BC ramped from an assumed start velocity")
                 pe = prev_end.get(k)
                 return (pe[1] or 0.0) if pe and pe[0] == bc["q"] else 0.0
 
@@ -5085,6 +5484,7 @@ class Converter:
                                          f"up to the change of slope x (SMOOTH x the time interval)^2 "
                                          f"/ 6 per point. Give the amplitude SMOOTH=0 in the Abaqus "
                                          f"deck to compare like with like.", once=True)
+                        self._reduces("velocity BC amplitude smoothing (Abaqus) not reproduced")
                 groups_: "OrderedDict[tuple, List[Tuple[int, int]]]" = OrderedDict()
                 for k in keys:
                     u_s, v_s = start.get(k, (0.0, 0.0))
@@ -5154,6 +5554,7 @@ class Converter:
                         self.report.warn("*BOUNDARY, TYPE=VELOCITY/ACCELERATION on a node with a "
                                          "*TRANSFORM: ccx allows only one amplitude for all DOFs of "
                                          "such a node; check its other BCs.", once=True)
+                        self._reduces("velocity / acceleration BC on a *TRANSFORM node")
 
             def mean_entry(ea: tuple, ec: tuple, m: int, d: int, shapes: Dict[tuple, str],
                            amp_lines: List[str]) -> Optional[Tuple[object, str]]:
@@ -5251,6 +5652,7 @@ class Converter:
                                              f"the acceleration integrates to from the velocity at "
                                              f"the step start, which Abaqus need not reproduce.",
                                              once=True)
+                            self._reduces("acceleration BC in a static step")
                         if not bad:
                             convert(bc, keys, shapes, amp_lines, entries, driven)
                     for k in keys:
@@ -5309,6 +5711,7 @@ class Converter:
                                      "the other): each rotation component is integrated on its "
                                      "own, which is exact only for a rotation about a fixed axis "
                                      "(finite rotations do not add up).", once=True)
+                    self._reduces("finite rotations from velocity BCs integrated per component")
             # where each DOF ends the step, and the form its BC carries into the next one
             for k, st in state.items():
                 bc, (u_s, v_s) = st[2], start[k]
@@ -5355,6 +5758,7 @@ class Converter:
                              f"sample exactly: the generated displacement amplitude deviates by up "
                              f"to {stats['dev']:.1e} of the step's travel between its points.",
                              once=True)
+            self._reduces("velocity / acceleration BC history sampled inexactly")
 
     # -- displacement BCs without AMPLITUDE: Abaqus' default amplitude ---------------
     # Abaqus/Standard procedures in which ccx may step a displacement BC that Abaqus ramps
@@ -5487,6 +5891,7 @@ class Converter:
                              f"gives such a node (probed on 2.23: from 0). The node's displacement "
                              f"BCs of that step are applied at once instead (ccx's default for "
                              f"the step): the DOF jumps to the given value.", once=True)
+            self._reduces("displacement BC on a *TRANSFORM node stepped where Abaqus ramps it")
         if "zero" in seen:
             self.report.warn("*BOUNDARY (displacement) with a nonzero value and no AMPLITUDE in an "
                              "explicit step: Abaqus/Explicit ignores the value ('does not admit "
@@ -5506,6 +5911,7 @@ class Converter:
                              "there (it takes no rotations, and ccx 2.23 reads a transformed "
                              "node's global component as the local value). Kept as given: ccx "
                              "moves the DOF to that value at once.", once=True)
+            self._reduces("explicit-step BC moved where Abaqus/Explicit holds it")
 
     def _amp_lines(self, b: Block, mid_ends: Dict[int, Tuple[int, int]]) -> List[dict]:
         """The data lines of displacement *BOUNDARY ``b`` as handle_boundary reads them (after
@@ -5724,6 +6130,27 @@ class Converter:
             out.append(blk)
         return out
 
+    def _ssd_part(self, b: Block, k: str, can: bool = True) -> Optional[str]:
+        """ccx's LOAD CASE for Abaqus' REAL / IMAGINARY parameter on a load or BC card, or None
+        to leave it out.  Abaqus gives the in-phase (REAL, the default) and out-of-phase
+        (IMAGINARY) parts of a steady-state dynamics load that way (Abaqus 2017 Keywords
+        *BOUNDARY, *CLOAD, *DLOAD); ccx reads LOAD CASE=1 / 2 there instead.  ``can``: the
+        ccx card takes LOAD CASE."""
+        if k == "REAL":
+            return None
+        if self._step_proc != "STEADY STATE DYNAMICS":
+            self.report.note(f"*{b.keyword}, IMAGINARY dropped (Abaqus reads it only in steady-state "
+                             f"dynamics and matrix generation).", once=True)
+            return None
+        if not can:
+            self.report.warn(f"*{b.keyword}, IMAGINARY: the ccx card has no imaginary part, so this "
+                             f"out-of-phase load acts in phase.", once=True)
+            self._reduces(f"*{b.keyword}, IMAGINARY (out-of-phase part applied in phase)")
+            return None
+        self.report.note(f"*{b.keyword}, IMAGINARY -> LOAD CASE=2: the imaginary (out-of-phase) "
+                         f"part in ccx's steady-state dynamics.", once=True)
+        return "2"
+
     def _load_params(self, b: Block, allowed: Sequence[str]) -> "OrderedDict[str, Optional[str]]":
         """Parameters ccx's distributed-load cards read; Abaqus-only ones are dropped —
         with a WARNING where they change the load under NLGEOM (ccx pressures always
@@ -5733,13 +6160,24 @@ class Converter:
             if k in allowed:
                 keep[k] = v
                 continue
+            if k in ("REAL", "IMAGINARY"):
+                part = self._ssd_part(b, k, "LOAD CASE" in allowed)
+                if part:
+                    keep["LOAD CASE"] = part
+                continue
             vu = (v or "YES").strip().upper()
             changes = (k == "FOLLOWER" and vu == "NO") or (k == "CONSTANT RESULTANT" and vu == "YES")
-            if changes and self._step_nlgeom:
+            if k == "TOTAL FORCE":
+                self.report.warn(f"*{b.keyword}, TOTAL FORCE dropped: Abaqus spreads the magnitude as "
+                                 f"a total force over the surface, ccx reads it as a pressure.",
+                                 once=True)
+                self._reduces(f"*{b.keyword}, TOTAL FORCE")
+            elif changes and self._step_nlgeom:
                 self.report.warn(f"*{b.keyword} {k}={vu} dropped: under NLGEOM ccx pressure loads "
                                  f"always follow the deformed surface and scale with its current "
                                  f"area, so this load differs from Abaqus as the mesh deforms.",
                                  once=True)
+                self._reduces(f"*{b.keyword} {k}={vu} under NLGEOM")
             else:
                 self.report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx"
                                  f"{'; no effect without NLGEOM' if changes else ''}).", once=True)
@@ -5758,15 +6196,22 @@ class Converter:
         for k, v in b.params.items():
             if k in ("OP", "AMPLITUDE", "TIME DELAY", "LOAD CASE", "SECTOR", "SUBMODEL", "STEP"):
                 keep[k] = v
+            elif k in ("REAL", "IMAGINARY"):
+                part = self._ssd_part(b, k)
+                if part:
+                    keep["LOAD CASE"] = part
             elif k == "ORIENTATION":
                 self.report.warn(f"*CLOAD, ORIENTATION={v} dropped: ccx applies concentrated loads "
                                  f"in the global system (or a node's *TRANSFORM), so these load "
                                  f"components now act along the global axes — verify.", once=True)
+                self._reduces("*CLOAD, ORIENTATION (local load directions)")
             elif k == "FOLLOWER" and (v or "YES").strip().upper() == "YES":
                 (self.report.warn if self._step_nlgeom else self.report.note)(
                     "*CLOAD, FOLLOWER=YES dropped: ccx concentrated loads keep their direction"
                     + (" — under NLGEOM this load no longer rotates with the node." if
                        self._step_nlgeom else " (no effect without NLGEOM)."), once=True)
+                if self._step_nlgeom:
+                    self._reduces("*CLOAD, FOLLOWER=YES under NLGEOM")
             else:
                 self.report.note(f"*CLOAD parameter {k} dropped (not read by ccx).", once=True)
         out = [emit_keyword("CLOAD", keep)]
@@ -5820,6 +6265,7 @@ class Converter:
                 self.report.warn(f"*DLOAD type {label} has no CalculiX equivalent (ccx body loads are "
                                  f"GRAV and CENTRIF only — not rotary-acceleration/Coriolis/density-"
                                  f"scaled centrifugal); this load line was dropped. Verify.", once=True)
+                self._reduces(f"*DLOAD {label} dropped")
                 continue
             if _is_user_load(b, g):
                 side += self._user_load_line(b, g)
@@ -5851,7 +6297,7 @@ class Converter:
                 elif label not in ("GRAV", "CENTRIF"):
                     side += self._drop_load_line(b, g, f"it loads surface elements, which are not "
                                                        f"in the ccx mesh, and a {label} load on "
-                                                       f"them is not converted")
+                                                       f"them is not converted", reduces=label not in ("BX", "BY", "BZ"))
                     continue
                 if not (self.geom.elements if not g[0] else
                         any(e not in self._carriers for e in self._load_elements(g[0]))):
@@ -5866,7 +6312,19 @@ class Converter:
                 f = [x for x in g if x != ""]
                 self.report.note(f"*DLOAD line without an element set (Abaqus: the whole model) -> "
                                  f"ELSET {ALL_ELEMENTS_SET}.", once=True)
-            if label == "P":
+            if self._slabs and re.fullmatch(r"P[1-4]", label) and g[0] and \
+                    set(self._load_elements(g[0])) <= set(self._slabs):
+                label = f"P{int(label[1]) + 2}"    # a 2-D edge is a side face of its C3D8I slab
+                f = [f[0], label] + f[2:]
+            family = self._sheet_family(f[0]) if label == "P" else None
+            if family == "membrane":
+                f = [f[0], "P1"] + f[2:]               # ccx stops on P on a membrane
+                label = "P1"
+            if family:
+                self.report.note(f"*DLOAD P on {family}s -> ccx *DLOAD {f[1]}: both push along the "
+                                 f"positive element normal (probed on 2.23; Abaqus 2017 element "
+                                 f"libraries). Exact.", once=True)
+            elif label == "P":
                 self.report.warn("*DLOAD label 'P' has no face number; CalculiX needs P1..P6 for element "
                                  "pressure. Verify.", once=True)
             body.append(", ".join(f))
@@ -5930,7 +6388,7 @@ class Converter:
             if not sd or sd[0].startswith("NODE"):
                 side += self._drop_load_line(b, f, f"surface '{f[0]}' is not defined in the deck" if
                                              not sd else f"'{f[0]}' is a node-based surface (a pressure "
-                                                         f"needs element faces)")
+                                                         f"needs element faces)", reduces=False)
                 continue
             if self._carriers and any(e in self._carriers for token, _ in sd[1]
                                       for e in self._load_elements(token)):
@@ -5944,8 +6402,21 @@ class Converter:
             for token, face in sd[1]:
                 if self._only_carriers(token):
                     continue
+                sign = 1.0
+                family = self._sheet_family(token) if face in ("SPOS", "SNEG") else None
                 if face and re.fullmatch(r"S[1-6]", face):
                     pl = "P" + face[1]
+                elif family:
+                    pl, sign = self._SHEET_PRESSURE[(family, face)]
+                    self.report.note(f"*DSLOAD pressure on {family} faces SPOS / SNEG -> *DLOAD "
+                                     f"{pl}, with the sign flipped on SPOS: Abaqus pushes a surface "
+                                     f"pressure against the surface normal (SPOS along -n, SNEG along "
+                                     f"+n), ccx's {pl} pushes along +n (probed on 2.23; Abaqus 2017 "
+                                     f"element libraries). Exact.", once=True)
+                    if sign < 0 and mag.strip() and self._signed(mag, sign) == mag:
+                        self.report.warn(f"*DSLOAD on '{surf}' (SPOS): magnitude '{mag}' is not a "
+                                         f"number, so its sign could not be flipped for ccx's {pl} "
+                                         f"(which pushes along +n): negate it.", once=True)
                 else:
                     self.report.warn(f"*DSLOAD on '{surf}': face '{face or '?'}' has no ccx Px "
                                      f"equivalent (ccx needs P1..P6 for element pressure); emitted "
@@ -5954,7 +6425,7 @@ class Converter:
                     pl = "P"
                 line = f"{token}, {pl}"
                 if mag != "":
-                    line += f", {mag}"
+                    line += f", {self._signed(mag, sign)}"
                 body.append(line)
                 lines.append(((token.upper(), pl), line, mag))
         if body:
@@ -5979,7 +6450,7 @@ class Converter:
         if not out and not side:
             if not any(x.strip() for x in b.data):
                 return []                 # nothing to apply and (OP=NEW) nothing left to remove
-            return self._commented(b, "Could not convert *DSLOAD automatically; edit manually.")
+            return self._commented(b, "Could not convert *DSLOAD automatically; edit manually.", reduces=False)
         return out + side
 
     # -- distributed loads as nodal forces, and *DLOAD bookkeeping -------------------
@@ -6000,6 +6471,35 @@ class Converter:
     def _is_beam(self, eid: int) -> bool:
         info = self.geom.elements.get(eid)
         return bool(info) and info[0].upper().startswith(("B2", "B3", "PIPE"))
+
+    def _sheet_family(self, token: str) -> Optional[str]:
+        """"shell" or "membrane" when the elements of ``token`` are all conventional shells,
+        all membranes, or a mix ("membrane": the label that works on both), else None."""
+        quiet = Report()
+        types = {ccx_element_type(self.geom.elements[e][0], quiet) for e in self._load_elements(token)
+                 if e in self.geom.elements}
+        if not types or not all(t in SHELL_TYPES or t.startswith("M3D") for t in types):
+            return None
+        return "membrane" if any(t.startswith("M3D") for t in types) else "shell"
+
+    # Shell and membrane pressure (probed on ccx 2.23: S3, S4, S4R, S8R plates and M3D4 /
+    # M3D8R membranes with the normal along +z, Abaqus 2017 shell and membrane element
+    # libraries): Abaqus' element-based P and ccx's *DLOAD P / P1 push along the positive
+    # element normal (ccx shells read P, P1 and P2 alike; on a membrane ccx stops on P and
+    # pushes P2 along -n); a surface-based Abaqus P pushes against the surface's normal —
+    # SPOS along -n, SNEG along +n.  -> (ccx label, sign) for SNEG / SPOS faces.
+    _SHEET_PRESSURE = {("shell", "SNEG"): ("P", 1.0), ("shell", "SPOS"): ("P", -1.0),
+                       ("membrane", "SNEG"): ("P1", 1.0), ("membrane", "SPOS"): ("P1", -1.0)}
+
+    @staticmethod
+    def _signed(mag: str, sign: float) -> str:
+        """``mag`` times ``sign`` (a blank magnitude stays blank)."""
+        if sign > 0 or not mag.strip():
+            return mag
+        try:
+            return fmt_num(-pf(mag))
+        except ValueError:
+            return mag
 
     def _surface_faces(self, name: str, carriers_only: bool = False) -> Tuple[list, Optional[str]]:
         """The element faces / edges of element-based *SURFACE ``name`` (see _load_faces), or
@@ -6149,7 +6649,7 @@ class Converter:
             mag = pf(g[2]) if len(g) > 2 and g[2] else 0.0
             d = tuple(pf(x) if x else 0.0 for x in (g[3:6] + ["", "", ""])[:3])
         except ValueError:
-            return self._drop_load_line(b, g, "its magnitude or direction is not a number")
+            return self._drop_load_line(b, g, "its magnitude or direction is not a number", reduces=False)
         if b.param("ORIENTATION") and base in ("TRVEC", "TRSHR"):
             return self._drop_load_line(b, g, f"its direction is given in the local system "
                                               f"{b.param('ORIENTATION')}, which this conversion "
@@ -6166,7 +6666,7 @@ class Converter:
             if any(f[4] for f in faces):                      # 2-D: in-plane components only
                 d = (d[0], d[1], 0.0)
             if mag and vnorm(d) == 0.0:
-                return self._drop_load_line(b, g, "its direction vector is zero")
+                return self._drop_load_line(b, g, "its direction vector is zero", reduces=False)
             unit = vunit(d)
 
             def load(p, normal, tangent):
@@ -6204,14 +6704,14 @@ class Converter:
                     if v[k]:
                         forces[(nd, k + 1)] = forces.get((nd, k + 1), 0.0) + scale * v[k]
         if degenerate and base != "TRSHR":
-            return self._drop_load_line(b, g, "a beam is parallel to its n1 direction")
+            return self._drop_load_line(b, g, "a beam is parallel to its n1 direction", reduces=False)
         big = max((abs(v) for v in forces.values()), default=0.0)
         forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
         if degenerate:
             if not forces:
                 return self._drop_load_line(b, g, "its direction is normal to the surface "
                                                   "everywhere, so it has no shear component "
-                                                  "(Abaqus applies no load there either)")
+                                                  "(Abaqus applies no load there either)", reduces=False)
             self.report.note(f"*{b.keyword} TRSHR on '{g[0]}': the direction is normal to part of the "
                              f"surface, which carries no shear load there (as in Abaqus).", once=True)
         res = [sum(v for (_, k), v in forces.items() if k == c) for c in (1, 2, 3)]   # global
@@ -6465,6 +6965,7 @@ class Converter:
                              f"plane-stress models by up to 91 % of |u|; BCs and loads there act "
                              f"partly out of the plane, on axisymmetric, truss and beam nodes too). "
                              f"Give these nodes a transformation about the Z axis.")
+            self._reduces("*TRANSFORM turning the 3-axis of 2-D nodes (ccx 2.23 gets them wrong)")
         if any(rot not in self._conn_rot for rot in self._rot_axes):
             self.report.note("*RIGID BODY reference node(s) with a *TRANSFORM: Abaqus reads their "
                              "rotational BCs and moments in the local axes, so each ROT NODE, which "
@@ -6482,6 +6983,7 @@ class Converter:
                              f"has a *TRANSFORM, moved to DOFs 1-3 of its ROT NODE act about the "
                              f"global axes there; Abaqus reads them in the node's local axes, but "
                              f"{why}. Verify.")
+            self._reduces("rigid-body rotational BCs / moments on a *TRANSFORM reference node in global axes")
 
     def _to_local_axes(self, forces: Dict[Tuple[int, int], float], nodes: Sequence[int],
                        flat: set) -> Tuple[Dict[Tuple[int, int], float], Optional[str]]:
@@ -6580,13 +7082,16 @@ class Converter:
             out.extend(data)
         return out
 
-    def _drop_load_line(self, b: Block, g: Sequence[str], why: str) -> List[str]:
-        """Comment out one load data line, with the reason."""
+    def _drop_load_line(self, b: Block, g: Sequence[str], why: str, reduces: bool = True) -> List[str]:
+        """Comment out one load data line, with the reason — reduced physics unless ``reduces``
+        is False (a line Abaqus would not apply either)."""
         text = ", ".join(x for x in g if x)
         label = g[1].upper() if len(g) > 1 else ""
         msg = f"*{b.keyword} {label} on '{g[0]}' not converted: {why}. Commented out."
         self.report.n_commented += 1
         self.report.warn(msg, once=True)
+        if reduces:
+            self._reduces(f"*{b.keyword} {label} load dropped")
         return ["** abq2ccx: " + msg, "** " + text]
 
     def _user_load_line(self, b: Block, g: Sequence[str]) -> List[str]:
@@ -7634,7 +8139,7 @@ class Converter:
             {"reason": f"*CONNECTOR SECTION on ELSET={(b.param('ELSET') or '').strip()}, which holds "
                        f"no connector element (CONN3D2 / CONN2D2); commented out."}
         if sec["reason"]:
-            return self._commented(b, sec["reason"])
+            return self._commented(b, sec["reason"], reduces=False)
         out: List[str] = []
         bcs: List[str] = []
         skipped: "OrderedDict[str, List[dict]]" = OrderedDict()
@@ -7693,7 +8198,7 @@ class Converter:
                                 f"{'ground' if it['b'] is None else it['b']})" for it in its)
             out += self._commented(mkblock("CONNECTOR SECTION", b.params.items(),
                                            list(b.data) + [f"connector element(s) {listing}"]),
-                                   reason)
+                                   reason, reduces=not (reason.startswith("Connector element on an undefined node") or "is a 3-D connection type" in reason))
         return out
 
     def _warn_transformed_mpc(self, pairs: Sequence[Tuple[int, int]]) -> None:
@@ -7701,6 +8206,7 @@ class Converter:
             self.report.warn("*MPC on a node with a *TRANSFORM: ccx reads the DOFs of the "
                              "*EQUATION it becomes in the node's local axes — verify that the "
                              "constraint acts in the directions intended.", once=True)
+            self._reduces("*MPC on a *TRANSFORM node")
 
     def _link_equation(self, dep: int, ind: int, local: bool = False) -> List[str]:
         """Abaqus *MPC LINK in a deck without NLGEOM: the distance constraint linearised at
@@ -7756,7 +8262,7 @@ class Converter:
         recs = [r for r in recs if r]
         if not ref or not recs:
             return self._commented(b, "*KINEMATIC COUPLING could not be converted (no REF NODE or "
-                                      "no members); edit manually.")
+                                      "no members); edit manually.", reduces=False)
         if not re.fullmatch(r"[-+]?\d+", ref) and self.geom.nset(ref):
             ref = str(self.geom.nset(ref)[0])
         groups: "OrderedDict[Tuple[int, int], List[str]]" = OrderedDict()
@@ -7767,7 +8273,7 @@ class Converter:
                 groups.setdefault((min(d1, d2), max(d1, d2)), []).append(r[0])
         except ValueError:
             return self._commented(b, "*KINEMATIC COUPLING DOF fields could not be parsed; edit "
-                                      "manually.")
+                                      "manually.", reduces=False)
         members = [m for ms in groups.values() for m in ms]
         if (self._coupling_plan.get(id(b)) or {}).get("kind") == "unsupported":
             self._warn_rigid_unsupported()
@@ -7792,6 +8298,7 @@ class Converter:
                     self.report.warn("*KINEMATIC COUPLING line couples only rotational DOFs "
                                      "(4..6); ccx couples translations only — line dropped, "
                                      "rotations are NOT coupled.", once=True)
+                    self._reduces("*KINEMATIC COUPLING rotation-only line dropped")
                 continue
             if top == 2 and hi > 2:
                 self._note_planar_kinematic()
@@ -7829,6 +8336,7 @@ class Converter:
                     continue  # Norton is ccx default
                 self.report.warn(f"*CREEP LAW={v} has no ccx built-in equivalent; set to LAW=USER "
                                  f"(implement creep.f).", once=True)
+                self._reduces(f"*CREEP, LAW={v}")
                 keep["LAW"] = "USER"
             else:
                 keep[k] = v
@@ -7845,6 +8353,7 @@ class Converter:
                     self.report.warn("*CREEP (Abaqus default LAW=STRAIN, strain hardening) -> ccx "
                                      "Norton law, which is TIME hardening: with m != 0 the creep "
                                      "strain differs whenever the stress changes. Verify.", once=True)
+                    self._reduces("*CREEP strain hardening run as time hardening")
                     break
         return [emit_keyword("CREEP", keep)] + list(b.data)
 
@@ -7942,6 +8451,11 @@ class Converter:
                 keep[k] = v
             elif k == "TYPE":
                 self.report.note(f"*TIE TYPE={v} dropped (not a ccx parameter).", once=True)
+            elif k == "NO ROTATION":
+                self.report.warn("*TIE, NO ROTATION dropped: ccx ties the surfaces' expanded faces, "
+                                 "which holds the shell / beam rotations Abaqus leaves free.",
+                                 once=True)
+                self._reduces("*TIE, NO ROTATION")
             else:
                 self.report.note(f"*TIE parameter {k} dropped (unsupported by ccx).", once=True)
         self.report.note("*TIE: in ccx the MASTER (independent, 2nd) surface must be element-based; "
@@ -7995,6 +8509,7 @@ class Converter:
                                      "load magnitudes themselves, ccx always multiplies them by the "
                                      "magnitude on the load/BC card — set those magnitudes to 1.",
                                      once=True)
+                    self._reduces("*AMPLITUDE, VALUE=ABSOLUTE scaled by the load magnitude")
             else:
                 self.report.note(f"*AMPLITUDE parameter {k} dropped.", once=True)
 
@@ -8018,11 +8533,13 @@ class Converter:
         if definition == "SMOOTH STEP":
             sampled = self._smooth_step_to_tabular(b)
             if sampled is not None:
-                self.report.note("*AMPLITUDE DEFINITION=SMOOTH STEP sampled into tabular points "
-                                 "(ccx has no smooth-step; the quintic ramp is approximated).", once=True)
+                self.report.note("*AMPLITUDE DEFINITION=SMOOTH STEP sampled into tabular points, "
+                                 "100 per interval (ccx has no smooth step): the table follows the "
+                                 "quintic ramp to 7.2e-5 of each step's change.", once=True)
                 return [emit_keyword("AMPLITUDE", keep)] + scaled(sampled)
             self.report.warn("*AMPLITUDE DEFINITION=SMOOTH STEP could not be parsed; emitted as "
                              "TABULAR (linear between points) — verify.", once=True)
+            self._reduces("*AMPLITUDE, SMOOTH STEP read as TABULAR")
         elif definition == "EQUALLY SPACED":
             # data lines are bare amplitudes; ccx would misread them as (time, amplitude)
             # pairs, so expand to explicit points at BEGIN + i*FIXED INTERVAL.
@@ -8037,21 +8554,22 @@ class Converter:
                     return [emit_keyword("AMPLITUDE", keep)] + \
                            scaled([f"{begin + i * fixed:.6g}, {a:.6g}" for i, a in enumerate(vals)])
             return self._commented(b, "*AMPLITUDE DEFINITION=EQUALLY SPACED could not be expanded "
-                                      "(missing/invalid FIXED INTERVAL or data); rebuild as TABULAR.")
+                                      "(missing/invalid FIXED INTERVAL or data); rebuild as TABULAR.", reduces=False)
         elif definition == "USER":
             return self._commented(b, "*AMPLITUDE, DEFINITION=USER: the amplitude comes from the "
                                       "Abaqus user subroutine UAMP, which ccx cannot call (its own "
                                       "is uamplitude.f). Commented out: the loads that use it stop "
-                                      "ccx ('nonexistent amplitude') until the subroutine is ported.")
+                                      "ccx ('nonexistent amplitude') until the subroutine is ported.", reduces=False)
         elif definition in ("PERIODIC", "MODULATED", "DECAY", "SOLUTION DEPENDENT", "ACTUATOR"):
             # first data line holds series constants, not (t, A) pairs — passing it
             # through would be silent garbage
             return self._commented(b, f"*AMPLITUDE DEFINITION={definition} has no ccx equivalent and "
                                       f"its data is not time/amplitude pairs; sample the curve into a "
-                                      f"TABULAR amplitude manually.")
+                                      f"TABULAR amplitude manually.", reduces=False)
         elif definition not in ("", "TABULAR"):
             self.report.warn(f"*AMPLITUDE DEFINITION={definition} unsupported by ccx; treated as "
                              f"TABULAR.", once=True)
+            self._reduces(f"*AMPLITUDE, DEFINITION={definition} read as TABULAR")
         return [emit_keyword("AMPLITUDE", keep)] + scaled(list(b.data))
 
     def _smooth_step_to_tabular(self, b: Block) -> Optional[List[str]]:
@@ -8069,7 +8587,7 @@ class Converter:
         if len(pts) < 2:
             return None
         out: List[str] = [f"{pts[0][0]:.6g}, {pts[0][1]:.6g}"]
-        N = 10                                     # samples per interval
+        N = 100                     # samples per interval: within 7.2e-5 of the quintic's step
         for (t0, a0), (t1, a1) in zip(pts, pts[1:]):
             if t1 <= t0:
                 return None
@@ -8089,6 +8607,7 @@ class Converter:
             self.report.warn("*FRICTION, ROUGH (no slip once in contact) has no ccx equivalent; "
                              "dropped, so this interaction becomes FRICTIONLESS. Re-add *FRICTION "
                              "with a large mu (or tie the surfaces) to approximate no-slip.", once=True)
+            self._reduces("*FRICTION, ROUGH (frictionless in ccx)")
             return ["** [abq2ccx] *FRICTION, ROUGH dropped (no ccx equivalent)"]
         for k in b.params:
             if k not in ("DEPENDENCIES",):
@@ -8096,6 +8615,8 @@ class Converter:
                                                   "USER") else self.report.note
                 level(f"*FRICTION parameter {k} dropped (ccx's *FRICTION takes only mu and a "
                       f"stick slope).", once=True)
+                if level == self.report.warn:
+                    self._reduces(f"*FRICTION, {k}")
         if b.has("DEPENDENCIES"):            # rows: mu, slip rate, pressure, T, fields...
             data = self._collapse_dependencies(b, 3) or list(b.data)
         else:
@@ -8119,6 +8640,7 @@ class Converter:
                              f"a constant mu (slip-rate / pressure / temperature tables, exponential "
                              f"decay and anisotropy are not modelled) and Abaqus' later fields would "
                              f"be read as ccx's stick slope.", once=True)
+            self._reduces("*FRICTION table reduced to one coefficient")
         return ["*FRICTION", f"{mu:g},"]
 
     def handle_rigid_body(self, b: Block) -> List[str]:
@@ -8149,6 +8671,11 @@ class Converter:
                 keep["ROT NODE"] = v
             elif ku == "ELSET":
                 keep["ELSET"] = v
+            elif ku in ("POSITION", "DENSITY"):
+                self.report.warn(f"*RIGID BODY parameter {k} dropped (Abaqus-only): the body's "
+                                 f"{'reference point position' if ku == 'POSITION' else 'mass'} "
+                                 f"differs in ccx.", once=True)
+                self._reduces(f"*RIGID BODY, {k}")
             else:
                 self.report.note(f"*RIGID BODY parameter {k} dropped (Abaqus-only).", once=True)
         tie, pin = self._rigid_body_members(b)
@@ -8318,6 +8845,7 @@ class Converter:
             if d1 > 3 and d2 > 3:
                 self.report.warn("*KINEMATIC line couples only rotational DOFs (4..6); ccx supports "
                                  "1..3 only — line dropped, rotations are NOT coupled.", once=True)
+                self._reduces("*KINEMATIC rotation-only coupling")
                 continue
             if planar and max(d1, d2) > 2:
                 self._note_planar_kinematic()
@@ -8327,11 +8855,15 @@ class Converter:
             clamped = clamped or (not planar and (c1, c2) != (d1, d2))
             lines.append(f"{c1}, {c2}")
         if not had_lines:
-            self.report.warn(f"*KINEMATIC without DOF lines creates NO constraint in ccx (the "
-                             f"coupling silently does nothing); synthesized '1, {top}' to match the "
-                             f"Abaqus default of coupling all DOFs"
-                             f"{' (in-plane: the nodes are 2-D)' if planar else ''} — verify.",
-                             once=True)
+            self.report.note(f"*KINEMATIC without DOF lines: Abaqus couples all DOFs (Keywords "
+                             f"Guide: 'If this field is left blank, all degrees of freedom will be "
+                             f"constrained'), ccx would couple none, so '1, {top}' is written"
+                             f"{' (in-plane: the nodes are 2-D)' if planar else ''}: ccx's *KINEMATIC "
+                             f"moves the nodes rigidly with the reference node's translations and "
+                             f"rotations (probed on 2.23: a solid face under a reference-node force "
+                             f"and moments moves exactly as with *RIGID BODY; validate_with_ccx.py "
+                             f"kinematic_all_dofs), and shell / beam nodes get their rotations tied "
+                             f"to it. Exact.", once=True)
             lines = [f"1, {top}"]
         ties: List[str] = []
         if plan.get("kind") == "kin" and lines:
@@ -8383,7 +8915,7 @@ class Converter:
                                       "through, ccx would silently run a load-controlled *STATIC "
                                       "instead, so the procedure is commented out and ccx stops at "
                                       "this step. Rerun with --approximate to accept the plain-"
-                                      "*STATIC reframing.")
+                                      "*STATIC reframing.", reduces=False)
         return [emit_keyword("STATIC", params)] + list(b.data)
 
     def handle_dynamic(self, b: Block) -> List[str]:
@@ -8421,6 +8953,7 @@ class Converter:
             elif k == "ADIABATIC":
                 self.report.warn("*DYNAMIC ADIABATIC dropped: ccx does not convert plastic work "
                                  "into heat in a mechanical step.", once=True)
+                self._reduces("adiabatic heating (*DYNAMIC, ADIABATIC)")
             else:
                 self.report.note(f"*DYNAMIC parameter {k} dropped (Abaqus-only).", once=True)
         data = list(b.data)
@@ -8476,6 +9009,7 @@ class Converter:
                                  "several lines, but the deck has no single *DEPVAR size to tell "
                                  "them apart — each line was taken as its own record. Verify.",
                                  once=True)
+                self._reduces("*INITIAL CONDITIONS, TYPE=SOLUTION records misread")
         for f in records:
             tok, vals = f[0], f[1:]
             eids = [int(tok)] if re.fullmatch(r"[-+]?\d+", tok) else self.geom.elset(tok)
@@ -8500,6 +9034,7 @@ class Converter:
             self.report.warn(f"*INITIAL CONDITIONS TYPE={typ}: {skipped} element(s) have no "
                              f"integration-point mapping (shells/beams/unknown types); set those "
                              f"manually.", once=True)
+            self._reduces(f"*INITIAL CONDITIONS, TYPE={typ} on shells / beams dropped")
         if len(out) == 1:
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} had no expandable records.")
         return out
@@ -8515,9 +9050,14 @@ class Converter:
                                       f"is degree of freedom 11 there, and Abaqus does not allow a "
                                       f"predefined temperature field in such a step (prescribe the "
                                       f"temperature with *BOUNDARY on DOF 11); ccx stops on the "
-                                      f"card. Commented out.")
+                                      f"card. Commented out.", reduces=False)
         if b.has("USER"):
             return self._user_load_card(b)
+        if b.has("FILE"):
+            self.report.warn("*TEMPERATURE, FILE=: ccx reads FILE= as a CalculiX .frd results "
+                             "file, not Abaqus' .odb / .fil, so these temperatures are lost (ccx "
+                             "prints 'ERROR in readfrd' without stopping).", once=True)
+            self._reduces("*TEMPERATURE, FILE= (Abaqus results file)")
         return self.passthrough(b) + self._midside_records(b, "field")
 
     def handle_flux_film(self, b: Block) -> List[str]:
@@ -8599,8 +9139,22 @@ class Converter:
         # surfaces; ccx takes no data line here (it uses the element thickness) and
         # would report the line as a card it cannot interpret.
         if any(x.strip() for x in b.data):
-            self.report.note("*SURFACE INTERACTION data line (2D out-of-plane thickness) dropped — "
-                             "ccx uses the plane-element section thickness for contact.", once=True)
+            plane = {t for e, t in self._section_thick.items() if e in self.geom.elements and
+                     self.geom.elements[e][0].upper().startswith(("CPS", "CPE"))}
+            try:
+                given = pf([x for x in b.data[0].split(",") if x.strip()][0])
+            except (ValueError, IndexError):
+                given = None
+            if plane and (given is None or any(abs(t - given) > 1e-12 * max(abs(t), 1.0)
+                                               for t in plane)):
+                self.report.warn("*SURFACE INTERACTION out-of-plane thickness of 2-D contact "
+                                 "differs from the plane-element section thickness, which ccx uses "
+                                 "for contact instead.", once=True)
+                self._reduces("*SURFACE INTERACTION 2-D contact thickness")
+            else:
+                self.report.note("*SURFACE INTERACTION data line (2D out-of-plane thickness) dropped — "
+                                 "ccx uses the plane-element section thickness for contact (the same "
+                                 "here; Abaqus ignores the line in 3-D).", once=True)
         out = [emit_keyword("SURFACE INTERACTION", b.params)]
         name = (b.param("NAME") or "").upper()
         if name and name in getattr(self, "_si_missing_behavior", set()):
@@ -8664,11 +9218,11 @@ class Converter:
     def handle_surface(self, b: Block) -> List[str]:
         if (b.param("TYPE") or "").upper().startswith("ANALYTICAL"):
             return self._commented(b, "*SURFACE TYPE=ANALYTICAL RIGID is unsupported by ccx; mesh the "
-                                      "rigid surface with elements instead.")
+                                      "rigid surface with elements instead.", reduces=False)
         is_node = (b.param("TYPE") or "").upper() == "NODE"
         if b.has("COMBINE"):
             return self._commented(b, "*SURFACE, COMBINE (a surface built from other surfaces) has "
-                                      "no ccx equivalent; list the element faces / nodes directly.")
+                                      "no ccx equivalent; list the element faces / nodes directly.", reduces=False)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("NAME", "TYPE"):
@@ -8706,13 +9260,17 @@ class Converter:
                                              "(ccx node surfaces carry no weights) — distributed "
                                              "couplings/loads on it will weight nodes equally.",
                                              once=True)
+                            self._reduces("node-based *SURFACE weights")
                     except ValueError:
                         pass
                 out.append(f[0])
                 continue
             if len(f) >= 2 and f[1].upper() in ("SPOS", "SNEG"):
-                self.report.warn("*SURFACE shell face SPOS/SNEG: ccx handles shell faces differently; "
-                                 "verify.", once=True)
+                self.report.note("*SURFACE shell / membrane faces SPOS and SNEG kept: ccx reads them "
+                                 "as the top (S2) and bottom (S1) face of its expanded element, as "
+                                 "Abaqus does (probed on 2.23: a *DSLOAD pressure on SPOS pushes "
+                                 "along -n, on SNEG along +n, on S1 / S2 like SNEG / SPOS).",
+                                 once=True)
             if len(f) >= 2 and re.fullmatch(r"E[1-4]", f[1].upper()):
                 f = [f[0], self._edge_face(f[0], int(f[1][1:]))] + f[2:]
             out.append(", ".join(f))
@@ -8724,6 +9282,7 @@ class Converter:
             self.report.warn(f"*SURFACE {b.param('NAME') or ''}: its faces on surface elements are "
                              f"left out with them (loads on it still reach them as nodal forces); a "
                              f"contact, tie or coupling on it sees only its other faces.", once=True)
+            self._reduces("surface faces on surface elements left out")
         return out
 
     def _edge_face(self, token: str, k: int) -> str:
@@ -8743,6 +9302,7 @@ class Converter:
             self.report.warn(f"*SURFACE edge face E{k} on '{token}': element family unknown or "
                              f"mixed; mapped to S{k + 2} (the ccx shell-edge numbering) — verify.",
                              once=True)
+            self._reduces("*SURFACE edge faces on mixed element families")
         else:
             self.report.note("*SURFACE shell edges E1..E4 -> ccx S3..S6 (S1/S2 are the shell "
                              "faces in ccx).", once=True)
@@ -8750,15 +9310,18 @@ class Converter:
 
     # ======================================================================
     def convert(self, blocks: List[Block]) -> List[str]:
+        blocks = self._cartesian_nodes(blocks)
         raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         self.build_geometry(blocks)
         self._drop_surface_elements(raw, blocks)
+        self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._upgrade_section_beams(blocks)
         self._check_nonpositive_ids()
         self._prescan(blocks)
+        self._plan_load_cases(blocks)
         self._warn_coupled_clashes()                # BCs on coupled DOFs left (_prescan)
         self._plan_distributions(blocks)
         self._check_undefined_materials(blocks)
@@ -8787,12 +9350,18 @@ class Converter:
                 break
         out.extend(self.emit_geometry())
         out.extend(self._knot_section())
+        out.extend(self._slab_cards())
+        out.extend(self._node_normal_cards(blocks))
         if self._planar_bc:
             out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "
                     "runs them as 3-D elements)"] + self._planar_bc
         out.extend(self.emit_other(blocks))
         out = self._settle_dependents(out)
         self._audit_loads(blocks, out)
+        if self.reduced_physics:
+            self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
+                             + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
+                             "own solution (see the warnings above).")
         return out
 
     # procedures and *DLOAD labels in which an element's mass acts
@@ -8874,6 +9443,7 @@ class Converter:
                              f"{'; ...' if len(lost) > 3 else ''}), but no load survives the "
                              f"conversion: ccx would solve it with no load at all, to a zero "
                              f"response. See the commented-out load cards.")
+            self._reduces(f"step {i}: every load lost")
         if self.source_unloaded:
             self.report.note("The Abaqus deck applies no load, prescribed displacement or "
                              "initial velocity in any step, so its solution is zero — in ccx "
@@ -8943,6 +9513,8 @@ class Converter:
                              f"element(s) emitted as B32R instead of B32 ({counts(False)}), with the "
                              f"same nodes; ccx 2.23 accepts PIPE and BOX sections only on B32R.",
                              once=True)
+            self._reduces(f"element {', '.join(kinds[False])} (SECTION={label(False)} needs B32R in "
+                          f"ccx)")
         if not self._midside:
             return
         why = []
@@ -8958,6 +9530,8 @@ class Converter:
                          f"BCs, temperatures and initial conditions on both end nodes also reach the "
                          f"midside node. The quadratic beam is closer to beam theory than the linear "
                          f"one, so results can differ slightly from Abaqus.", once=True)
+        self._reduces(f"element {', '.join(kinds[True])} (SECTION={label(True)} needs a 3-node beam "
+                      f"in ccx)")
         names = set(self.geom.nsets)
         counted: set = set()                    # node sets some other card counts node by node
         for b in blocks:
@@ -9074,8 +9648,10 @@ class Converter:
                 self._beam_nodes.update(conn)
         # nodes that only belong to plane-stress/strain/axisymmetric continuum elements:
         # they have no rotational DOFs at all — unless they are the reference/rotation node
-        # of a rigid body or coupling, which carries the body's rotations
-        self._plane_only = {n for n, p in plane.items() if p}
+        # of a rigid body or coupling, which carries the body's rotations (the C3D8I slabs of
+        # CPS4I / CPE4I elements are plane elements to Abaqus)
+        slab = {n for e in self._slabs for n in self.geom.elements[e][1]}
+        self._plane_only = {n for n, p in plane.items() if p or n in slab}
         # reference/rotation nodes of rigid bodies and couplings carry real rotations (the
         # independent node of *MPC BEAM lines too: it becomes a *RIGID BODY's REF NODE);
         # rigid connectors join the *MPC BEAM bodies
@@ -9150,6 +9726,26 @@ class Converter:
             or (b.keyword == "INITIAL CONDITIONS" and (b.param("TYPE") or "").upper() == "FIELD")
             for b in blocks)
         self._n_steps = sum(1 for b in blocks if b.keyword == "STEP")
+        # every parameter value of the deck but card names: a *DISTRIBUTION that some card
+        # names (a shell thickness, a material property) carries physics ccx cannot take
+        self._param_values = {(v or "").strip().upper() for b in blocks for k, v in b.params.items()
+                              if v and k != "NAME"}
+        # *SECTION CONTROLS: the Abaqus element types of the sections naming each one, and the
+        # analysis features that make its options matter (handle_section_controls)
+        self._sc_types = {}
+        self._sc_hyper = set()          # controls on a hyperelastic / hyperfoam material
+        hyper = {g[0].param("NAME").strip().upper() for g in self._material_groups(blocks)
+                 if g[0].param("NAME") and any(c.keyword in ("HYPERELASTIC", "HYPERFOAM") for c in g)}
+        for b in blocks:
+            if b.keyword.endswith("SECTION") and b.param("CONTROLS"):
+                types = {self.geom.elements[e][0].upper() for e in self.geom.elset(b.param("ELSET") or "")
+                         if e in self.geom.elements}
+                name = b.param("CONTROLS").strip().upper()
+                self._sc_types.setdefault(name, set()).update(types)
+                if (b.param("MATERIAL") or "").strip().upper() in hyper:
+                    self._sc_hyper.add(name)
+        self._sc_explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        self._sc_damage = any(b.keyword in ("DAMAGE EVOLUTION", "DAMAGE INITIATION") for b in blocks)
         self._step_idx = 0
         self._step_nlgeom = False
         self._has_sensitivity = any(b.keyword in ("SENSITIVITY", "FEASIBLE DIRECTION") for b in blocks)
@@ -9292,6 +9888,48 @@ class Converter:
             self.geom.elsets[ALL_ELEMENTS_SET] = list(self.geom.elements)
         if any(b.keyword == "NODE PRINT" and not b.param("NSET") for b in blocks) and self.geom.nodes:
             self.geom.nsets[ALL_NODES_SET] = list(self.geom.nodes)
+
+    def _plan_load_cases(self, blocks: List[Block]) -> None:
+        """*BOUNDARY, LOAD CASE.  Abaqus reads it only in *BUCKLE steps (*BOUNDARY, Keywords
+        Guide: "ignored in all procedures except BUCKLE"): LOAD CASE=1 (the default) holds the
+        base state under the applied loads, LOAD CASE=2 the buckling modes.  ccx has one set of
+        BCs per step (and stops on the parameter outside steady-state dynamics), so the
+        parameter goes.  Abaqus/CAE writes every buckling BC twice, once per load case: a
+        LOAD CASE=2 card that repeats a LOAD CASE=1 card of the step is left out (exact; probed
+        on 2.23: a second *BOUNDARY, OP=NEW in a step keeps the first one's BCs).  Buckling-
+        mode BCs that differ from the base state's cannot be had in ccx: the modes then get the
+        base state's BCs (reduced physics).  Fills ``self._lc_drop``."""
+        self._lc_drop = set()
+        step: List[Block] = []
+        groups: List[List[Block]] = []
+        for b in blocks:
+            if b.keyword == "STEP":
+                step = []
+                groups.append(step)
+            elif b.keyword != "END STEP":
+                step.append(b)
+        for g in groups:
+            bcs = [b for b in g if b.keyword == "BOUNDARY"]
+            two = [b for b in bcs if (b.param("LOAD CASE") or "1").strip() == "2"]
+            if not two:
+                continue
+            if not any(b.keyword == "BUCKLE" for b in g):
+                continue                       # Abaqus ignores LOAD CASE: both cards apply
+            key = lambda b: tuple(", ".join(x.strip().upper() for x in r) for r in
+                                  merged_data_records(b) if any(x.strip() for x in r))
+            ones = [key(b) for b in bcs if (b.param("LOAD CASE") or "1").strip() != "2"]
+            if all(key(b) in ones for b in two):
+                self._lc_drop.update(id(b) for b in two)
+                self.report.note("*BUCKLE: the *BOUNDARY, LOAD CASE=2 cards (buckling-mode BCs) "
+                                 "repeat LOAD CASE=1 cards (the Abaqus/CAE default) and are left "
+                                 "out; ccx's one set of BCs is the same for both. Exact.", once=True)
+            else:
+                self._lc_drop.update(id(b) for b in two)
+                self.report.warn("*BUCKLE with *BOUNDARY, LOAD CASE=2 cards (buckling-mode BCs) "
+                                 "that differ from the LOAD CASE=1 ones: ccx has one set of BCs per "
+                                 "step, so the buckling modes get the LOAD CASE=1 BCs; the LOAD "
+                                 "CASE=2 cards are left out.", once=True)
+                self._reduces("*BUCKLE buckling-mode BCs (*BOUNDARY, LOAD CASE=2)")
 
     def _check_undefined_materials(self, blocks: List[Block]) -> None:
         """A section naming a material the deck never defines is invalid input; ccx stops
@@ -10457,6 +11095,7 @@ class Converter:
                 self.report.warn("Coupled rotation not tied on a node with a *TRANSFORM (its "
                                  "*EQUATION DOFs are local, the body rotation global) — the "
                                  "rotation stays free there.", once=True)
+                self._reduces("coupled rotation not tied on a *TRANSFORM node")
                 continue
             for k in dofs:
                 if k < 4 or k > 6:
@@ -10464,6 +11103,7 @@ class Converter:
                 if (n, k) in self._rot_tied:
                     self.report.warn("A shell/beam node belongs to two rigid constraints; its "
                                      "rotation is tied to the first one only — verify.", once=True)
+                    self._reduces("shell / beam node rotation tied to one of its two rigid constraints only")
                     continue
                 self._rot_tied.add((n, k))
                 axes = self._rot_axes.get(target) if offset == -3 else None
@@ -10490,6 +11130,7 @@ class Converter:
             self.report.warn("Coupled rotation not tied on a node with a *TRANSFORM (its "
                              "*EQUATION DOFs are local, the body rotation global) — the "
                              "rotation stays free there.", once=True)
+            self._reduces("coupled rotation not tied on a *TRANSFORM node")
             return []
         return [x for k in (1, 2, 3) for x in ("*EQUATION", "2", f"{rot}, {k}, 1., {ref}, {k + 3}, -1.")]
 
@@ -11733,6 +12374,351 @@ class Converter:
     # ======================================================================
     # Planar models: ccx runs 2-D beams and trusses as 3-D elements
     # ======================================================================
+    # procedures a C3D8I slab is probed to reproduce (static bending: small strain, no thermal
+    # or dynamic terms); its mass and geometric stiffness are not compared, so a *FREQUENCY or
+    # *BUCKLE step keeps the plain element, as reduced physics
+    _SLAB_PROCEDURES = {"STATIC"}
+    _OTHER_PROCEDURES = {"FREQUENCY", "BUCKLE",
+                         "DYNAMIC", "MODAL DYNAMIC", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY",
+                         "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                         "UNCOUPLED TEMPERATURE-DISPLACEMENT", "DYNAMIC TEMPERATURE-DISPLACEMENT",
+                         "VISCO", "SOILS", "GEOSTATIC", "RANDOM RESPONSE", "RESPONSE SPECTRUM",
+                         "SUBSTRUCTURE GENERATE", "MATRIX GENERATE", "MASS DIFFUSION",
+                         "COUPLED THERMAL-ELECTRICAL", "ELECTROMAGNETIC", "DIRECT CYCLIC",
+                         "LOW CYCLE FATIGUE", "ANNEAL", "GREEN", "SENSITIVITY", "CRACK PROPAGATION"}
+    # cards that would act on the slab's nodes or faces beyond what the exact form covers
+    _SLAB_BLOCKERS = {"EQUATION", "MPC", "RIGID BODY", "COUPLING", "KINEMATIC COUPLING",
+                      "DISTRIBUTING COUPLING", "TIE", "CONTACT PAIR", "CONTACT", "TRANSFORM",
+                      "INITIAL CONDITIONS", "TEMPERATURE", "NORMAL", "CONNECTOR SECTION",
+                      "MODEL CHANGE", "SUBMODEL", "RADIATE", "FILM", "DFLUX", "CFLUX", "DSFLUX",
+                      "MASS", "SPRING", "DASHPOT", "GAP", "ELEMENT OPERATOR", "IMPERFECTION"}
+
+    # model data that never belongs to a *MATERIAL (where a material's options end)
+    _NOT_MATERIAL = {"BOUNDARY", "CLOAD", "DLOAD", "DSLOAD", "AMPLITUDE", "INITIAL CONDITIONS",
+                     "NSET", "ELSET", "SURFACE", "ORIENTATION", "TRANSFORM", "EQUATION", "MPC",
+                     "RIGID BODY", "COUPLING", "KINEMATIC", "DISTRIBUTING", "KINEMATIC COUPLING",
+                     "DISTRIBUTING COUPLING", "TIE", "CONTACT PAIR", "CONTACT", "SURFACE INTERACTION",
+                     "FRICTION", "SURFACE BEHAVIOR", "PHYSICAL CONSTANTS", "PARAMETER", "HEADING",
+                     "PREPRINT", "RESTART", "PART", "END PART", "INSTANCE", "END INSTANCE",
+                     "ASSEMBLY", "END ASSEMBLY", "OUTPUT", "NODE OUTPUT", "ELEMENT OUTPUT",
+                     "NODE PRINT", "EL PRINT", "NODE FILE", "EL FILE", "FILE FORMAT", "ENERGY OUTPUT",
+                     "PRINT", "MONITOR", "SYSTEM", "TIME POINTS", "DISTRIBUTION", "DISTRIBUTION TABLE",
+                     "NORMAL", "MASS", "SPRING", "DASHPOT", "SECTION CONTROLS", "NODAL THICKNESS",
+                     "CONNECTOR SECTION", "CONNECTOR BEHAVIOR", "TEMPERATURE", "FIELD"}
+
+    def _material_options(self, blocks: List[Block]) -> Dict[str, List[Block]]:
+        """Material name (upper case) -> its *MATERIAL card and options, which end at the next
+        card that is never a material option (_NOT_MATERIAL, or what _material_groups ends
+        at).  Unknown cards count as options, so a check that allows only some options errs on
+        the safe side."""
+        out: Dict[str, List[Block]] = {}
+        for g in self._material_groups(blocks):
+            opts = [g[0]]
+            for c in g[1:]:
+                if c.keyword in self._NOT_MATERIAL:
+                    break
+                opts.append(c)
+            out[(g[0].param("NAME") or "").strip().upper()] = opts
+        return out
+
+    @staticmethod
+    def _card_values(c: Block, n: int) -> List[float]:
+        """The first ``n`` fields of ``c``'s first data record as numbers, a blank or missing
+        field 0 as Abaqus reads it (``*ELASTIC`` with E alone: nu = 0); ValueError if a field is
+        not a number."""
+        rec = next((r for r in merged_data_records(c) if any(x.strip() for x in r)), [])
+        f = [x.strip() for x in rec] + [""] * n
+        return [pf(x) if x else 0.0 for x in f[:n]]
+
+    def _slab_obstacle(self, blocks: List[Block], cand: Dict[int, str]) -> Optional[str]:
+        """Why the CPS4I / CPE4I elements ``cand`` cannot become exact C3D8I slabs, or None.
+        The slab form is exact for small-strain linear elasticity (_plan_incompatible_slabs);
+        anything else on the elements (or the deck being out of its scope) keeps the plain
+        CPS4 / CPE4 substitution."""
+        steps = [b for b in blocks if b.keyword == "STEP"]
+        for b in steps:
+            nl = b.param("NLGEOM")
+            if b.has("NLGEOM") and (nl is None or nl.strip().upper() in ("", "YES")):
+                return "a step runs NLGEOM"
+        for b in blocks:
+            if b.keyword in self._OTHER_PROCEDURES:
+                return f"the deck has a *{b.keyword} step"
+            if b.keyword == "STATIC" and b.has("RIKS"):
+                return "the deck has a Riks step"
+            if b.keyword in self._SLAB_BLOCKERS:
+                return f"the deck has *{b.keyword}"
+        slab_nodes = {n for e in cand for n in self.geom.elements[e][1]}
+        if any(n not in self.geom.nodes for n in slab_nodes):
+            return "an element references an undefined node"
+        if any(n in slab_nodes for e, (_t, conn) in self.geom.elements.items()
+               if e not in cand for n in conn):
+            return "their nodes are shared with other elements"
+        for e, kind in cand.items():
+            if kind != "strain":
+                continue
+            p = [self.geom.nodes[n] for n in self.geom.elements[e][1]]
+            size = max(abs(p[0][k] - p[2][k]) + abs(p[1][k] - p[3][k]) for k in range(3))
+            if max(abs(p[0][k] + p[2][k] - p[1][k] - p[3][k]) for k in range(3)) > 1e-9 * size:
+                # Abaqus' CPE4I adds a fifth, volumetric mode that the C3D8I lacks; it does
+                # nothing on a parallelogram (both give the same solution there)
+                return (f"CPE4I element {e} is not a parallelogram (Abaqus adds a fifth, volumetric "
+                        f"incompatible mode, which changes the solution there)")
+        groups = self._material_options(blocks)
+        covered: set = set()
+        for b in blocks:
+            if not b.keyword.endswith("SECTION"):
+                continue
+            es = set(self.geom.elset(b.param("ELSET") or ""))
+            hit = es & set(cand)
+            if not hit:
+                continue
+            if b.keyword != "SOLID SECTION":
+                return f"they have a *{b.keyword}"
+            if hit != es or len({cand[e] for e in hit}) > 1:
+                return f"element set {b.param('ELSET')} mixes them with other element types"
+            extra = [k for k in b.params if k not in ("ELSET", "MATERIAL", "CONTROLS")]
+            if extra:
+                return f"their *SOLID SECTION has {', '.join(extra)}"
+            mat = (b.param("MATERIAL") or "").strip().upper()
+            for c in groups.get(mat, [None])[1:]:
+                if c.keyword not in ("ELASTIC", "DENSITY"):
+                    return f"material {mat} has *{c.keyword}"
+                if c.has("DEPENDENCIES") or (c.keyword == "ELASTIC" and (c.param("TYPE") or "ISO")
+                                             .strip().upper()[:3] != "ISO"):
+                    return f"material {mat} has a {c.keyword.lower()} that is not constant and isotropic"
+                rows = [[x for x in r if x != ""] for r in merged_data_records(c)]
+                if len([r for r in rows if r]) != 1:
+                    return f"material {mat} has a temperature-dependent *{c.keyword}"
+                try:
+                    vals = self._card_values(c, 2)
+                except ValueError:
+                    return f"material {mat} has an unreadable *{c.keyword}"
+                if c.keyword == "ELASTIC" and not (vals[0] > 0.0 and -1.0 < vals[1] < 1.0):
+                    return f"material {mat} has E <= 0 or a Poisson's ratio outside (-1, 1)"
+            if mat not in groups or not any(c.keyword == "ELASTIC" for c in groups[mat]):
+                return f"material {mat} has no *ELASTIC"
+            covered |= hit
+        if covered != set(cand):
+            return "some of them have no *SOLID SECTION"
+        for b in blocks:
+            if b.keyword == "DLOAD":
+                for rec in merged_data_records(b):
+                    g = [x.strip() for x in rec]
+                    if len(g) < 2 or not any(g):
+                        continue
+                    eids = set(self._load_elements(g[0])) if g[0] else set(self.geom.elements)
+                    if eids & set(cand) and (not eids <= set(cand) or not re.fullmatch(
+                            r"P[1-4]|BX|BY|GRAV", g[1].upper())):
+                        return f"a *DLOAD {g[1].upper()} acts on them"
+            elif b.keyword == "DSLOAD":
+                for rec in merged_data_records(b):
+                    g = [x.strip() for x in rec]
+                    if len(g) < 2:
+                        continue
+                    sd = self.surfaces.get(g[0].upper())
+                    if sd and any(set(self._load_elements(tok)) & set(cand) for tok, _ in sd[1]) \
+                            and g[1].upper() != "P":
+                        return f"a *DSLOAD {g[1].upper()} acts on them"
+            elif b.keyword == "SURFACE" and (b.param("TYPE") or "ELEMENT").upper() == "ELEMENT":
+                for rec in merged_data_records(b):
+                    f = [x for x in rec if x != ""]
+                    eids = set(self._load_elements(f[0])) if f else set()
+                    if eids & set(cand) and (not eids <= set(cand) or len(f) < 2 or
+                                             not re.fullmatch(r"S[1-4]", f[1].upper())):
+                        return f"element surface {b.param('NAME')} is not made of their edges S1..S4"
+        return None
+
+    def _plan_incompatible_slabs(self, blocks: List[Block]) -> None:
+        """CPS4I / CPE4I -> C3D8I, exactly.  ccx 2.23 has no incompatible-mode plane element,
+        and its CPS4 / CPE4 lock in bending (a cantilever of 10 x 2 elements deflects 29 % too
+        little).  Abaqus' CPS4I has four incompatible modes (Abaqus Theory Guide, "Continuum
+        elements with incompatible modes": Simo & Rifai's form of Wilson's / Taylor's modes,
+        G~ = (j0/j) alpha_i xi_i . t^-1), and ccx's C3D8I adds the same modes in its plane.
+        Each element becomes a one-element-thick C3D8I slab: its 2-D nodes are the bottom face
+        (ids, coordinates, BCs and loads kept) and new top nodes one section thickness above
+        them follow their in-plane DOFs (*EQUATION); DOF 3 of every slab node is held, so the
+        slab deforms in plane strain (C3D8I's out-of-plane modes then stay zero).  CPE4I keeps
+        its material; CPS4I gets the plane-stress stiffness as an ORTHO material with no
+        coupling to the thickness direction (D1111 = D2222 = E/(1-nu^2), D1122 = nu E/(1-nu^2),
+        D1133 = D2233 = 0, D1212 = D1313 = D2323 = G), whose sigma_33 is zero.  Probed on 2.23
+        against a 2-D implementation of the four-mode element (cantilevers, nu 0 / 0.3 / 0.45,
+        rectangular and skewed meshes): equal to 1e-7, the precision of ccx's printout.
+        Abaqus' CPE4I has a fifth, volumetric mode, which changes nothing on a parallelogram
+        (the only CPE4I elements converted).  ccx's C3D8I with w held but an isotropic
+        material (its own plane stress, w free) is NOT this: 0.06 % off on rectangles, 3 % on
+        skewed meshes.  The exact form needs small-strain linear elasticity; any other use of
+        the elements keeps CPS4 / CPE4 and counts as reduced physics (_slab_obstacle)."""
+        cand = OrderedDict((e, SLAB_TYPES[t.upper()]) for e, (t, _c) in self.geom.elements.items()
+                           if t.upper() in SLAB_TYPES)
+        if not cand:
+            return
+        kinds = ", ".join(sorted({self.geom.elements[e][0].upper() for e in cand}))
+        why = self._slab_obstacle(blocks, cand)
+        if why:
+            subs = ", ".join(f"{t} -> {ELEMENT_TYPE_MAP[t]}" for t in sorted(
+                {self.geom.elements[e][0].upper() for e in cand}))
+            self.report.warn(f"Element {subs}: the incompatible modes are dropped, so the elements "
+                             f"lock in bending (a 10 x 2 cantilever deflects 29 % too little). The "
+                             f"exact C3D8I-slab form does not apply here: {why}.", once=True)
+            self._reduces(f"element {subs} (incompatible modes dropped)")
+            return
+        sections = [b for b in blocks if b.keyword == "SOLID SECTION"
+                    and set(self.geom.elset(b.param("ELSET") or "")) & set(cand)]
+        groups = self._material_options(blocks)
+        thick: Dict[int, float] = {}
+        for b in sections:
+            recs = [[x.strip() for x in r] for r in merged_data_records(b)]
+            try:
+                t = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 1.0
+            except ValueError:
+                t = 1.0
+            for e in self.geom.elset(b.param("ELSET") or ""):
+                thick[e] = t
+            mat = (b.param("MATERIAL") or "").strip()
+            kind = cand[self.geom.elset(b.param("ELSET") or "")[0]]
+            if kind == "strain":
+                self._slab_sections[id(b)] = (kind, mat)
+                continue
+            name, i = f"{mat}_PLANE_STRESS"[:CCX_NAME_LIMIT], 1
+            while name.upper() in groups or name in self._slab_materials:
+                name = f"{mat}_PLANE_STRESS"[:CCX_NAME_LIMIT - 4] + f"~{i}"
+                i += 1
+            vals = {c.keyword: self._card_values(c, 2) for c in groups[mat.upper()][1:]}
+            e_mod, nu = vals["ELASTIC"]
+            d11, gmod = e_mod / (1.0 - nu * nu), e_mod / (2.0 * (1.0 + nu))
+            cards = [f"*MATERIAL, NAME={name}", "*ELASTIC, TYPE=ORTHO",
+                     ", ".join(fmt_num(x) for x in (d11, nu * d11, d11, 0.0, 0.0, e_mod, gmod, gmod)),
+                     fmt_num(gmod)]
+            if "DENSITY" in vals:
+                cards += ["*DENSITY", fmt_num(vals["DENSITY"][0])]
+            self._slab_materials[name] = cards
+            self._slab_sections[id(b)] = (kind, name)
+        next_id = max(self.geom.nodes, default=0)
+        for e, kind in cand.items():
+            typ, conn = self.geom.elements[e]
+            top = []
+            for n in conn:
+                key = (n, thick[e])
+                if key not in self._slab_top:
+                    next_id += 1
+                    x, y, z = self.geom.nodes[n]
+                    self.geom.add_node(next_id, (x, y, z + thick[e]))
+                    self._slab_top[key] = next_id
+                top.append(self._slab_top[key])
+            self.geom.elements[e] = ("C3D8I", list(conn) + top)
+            self._slabs[e] = kind
+        self._elem_types.add("C3D8I")
+        bottom = sorted({n for (n, _t) in self._slab_top})
+        self.geom.nsets[SLAB_NODES_SET] = bottom + sorted(self._slab_top.values())
+        self._slab_eq = ["*EQUATION"]
+        for (n, _t), m in sorted(self._slab_top.items(), key=lambda kv: kv[1]):
+            for d in (1, 2):
+                self._slab_eq += ["2", f"{m}, {d}, 1., {n}, {d}, -1."]
+        self._slab_bc = ["*BOUNDARY", f"{SLAB_NODES_SET}, 3, 3"]
+        # element faces: the 2-D edges S1..S4 are the slab's side faces S3..S6
+        for b in blocks:
+            if b.keyword == "SURFACE" and (b.param("TYPE") or "ELEMENT").upper() == "ELEMENT":
+                data, moved = [], False
+                for line in b.data:
+                    f = [x.strip() for x in line.split(",")]
+                    if len(f) >= 2 and re.fullmatch(r"S[1-4]", f[1].upper()) and f[0] and \
+                            set(self._load_elements(f[0])) <= set(self._slabs):
+                        f[1] = f"S{int(f[1][1:]) + 2}"
+                        moved = True
+                    data.append(", ".join(f))
+                if moved:
+                    b.data = data
+                    self._register_surface(b)
+        n_ps = sum(1 for k in cand.values() if k == "stress")
+        self.report.note(
+            f"{kinds} -> C3D8I (ccx has no incompatible-mode plane element): each of the {len(cand)} "
+            f"element(s) is a slab one section thickness deep on its 2-D nodes (ids, BCs and loads "
+            f"kept); the {len(self._slab_top)} new top nodes follow their in-plane DOFs (*EQUATION) "
+            f"and DOF 3 of every slab node is held (node set {SLAB_NODES_SET}), so the slab "
+            f"deforms in plane strain"
+            + (f"; the {n_ps} plane-stress element(s) get the plane-stress stiffness as an ORTHO "
+               f"material (D1111 = D2222 = E/(1-nu^2), D1122 = nu E/(1-nu^2), D3333 = E, D1133 = "
+               f"D2233 = 0, shear G), so S33 is 0 and E33 is written as 0" if n_ps else "")
+            + ". Exact: equal to Abaqus' four-mode incompatible element to 1e-7 (probed on 2.23; "
+              "validate_with_ccx.py cps4i_slab). Edge pressures P1..P4 and faces S1..S4 are the "
+              "slab's P3..P6 / S3..S6; results are on the slab's 8 integration points.", once=True)
+
+    def _node_normal_cards(self, blocks: List[Block]) -> List[str]:
+        """*NODE fields 5-7 (a shell normal at the node) as ccx *NORMAL lines.  Abaqus uses
+        that normal for every conventional shell element at the node (Abaqus "Defining the
+        initial geometry of conventional shell elements"; a *NORMAL card overrides it for its
+        element, and a normal more than 160 degrees from an element's own is taken reversed).
+        ccx would average the element normals instead, which changes a curved shell's
+        directors (the sphere decks give the exact normals)."""
+        if not self._node_normals:
+            return []
+        given = set()
+        for b in blocks:
+            if b.keyword == "NORMAL":
+                for rec in merged_data_records(b):
+                    f = [x for x in rec if x != ""]
+                    try:
+                        given.add((pint(f[0]), pint(f[1])))
+                    except (ValueError, IndexError):
+                        continue
+        quiet = Report()
+        knots = set(self.geom.elset(KNOT_SET)) if self._knots else set()
+        lines, beams = [], set()
+        for eid, (typ, conn) in self.geom.elements.items():
+            hit = [n for n in conn if n in self._node_normals]
+            if not hit or any(n not in self.geom.nodes for n in conn):
+                continue
+            sub = ccx_element_type(typ, quiet)
+            if sub not in SHELL_TYPES:
+                # a beam's n2 comes from the normal; trusses and the converter's own knot
+                # beams have no cross-section orientation to lose
+                if sub in BEAM_TYPES and not sub.startswith(("T2D", "T3D")) and eid not in knots:
+                    beams.update(hit)
+                continue
+            p = [self.geom.nodes[n] for n in conn[:4 if len(conn) in (4, 8, 9) else 3]]
+            own = vunit(vcross(vsub(p[1], p[0]), vsub(p[-1], p[0])))
+            for n in hit:
+                if (eid, n) in given:
+                    continue
+                nrm = self._node_normals[n]
+                if vdot(nrm, own) < math.cos(math.radians(160.0)):
+                    nrm = vscale(nrm, -1.0)
+                lines.append(f"{eid}, {n}, " + ", ".join(_fmt_component(c) for c in nrm))
+        shells = {n for ln in lines for n in [int(ln.split(",")[1])]}
+        if lines:
+            self.report.note(f"*NODE shell normals (fields 5-7) of {len(shells)} node(s) -> *NORMAL "
+                             f"for each shell element at the node, as Abaqus uses them (ccx would "
+                             f"average the element normals instead).", once=True)
+        if beams:
+            self.report.warn(f"*NODE normals (fields 5-7) on {len(beams)} beam node(s) dropped: "
+                             f"Abaqus takes a beam's n2 direction from them, ccx from the section's "
+                             f"n1 — the cross-sections may be turned.", once=True)
+            self._reduces("*NODE normals of beam nodes (cross-section orientation)")
+        return ["*NORMAL"] + lines if lines else []
+
+    def _slab_cards(self) -> List[str]:
+        """Model data of the C3D8I slabs (_plan_incompatible_slabs): the top nodes' ties and
+        the held thickness DOF."""
+        if not self._slabs:
+            return []
+        return (["** [abq2ccx] CPS4I / CPE4I as C3D8I slabs: top nodes follow the 2-D nodes in "
+                 "plane, thickness DOF held"] + self._slab_eq + self._slab_bc)
+
+    def _reduces(self, what: str) -> None:
+        """Record that the ccx model drops or replaces ``what`` — part of the physics the
+        Abaqus deck solves (a constitutive behaviour, an element formulation, a constraint or
+        interaction, a load, the geometry): ccx then solves a different problem, so the run is
+        not the deck's own solution (``reduced_physics``; the corpus keeps such decks out of
+        its count of faithful solves)."""
+        self.report.reduce(what)
+
+    @property
+    def reduced_physics(self) -> List[str]:
+        """What the ccx model drops or replaces of the physics the Abaqus deck solves — a
+        constitutive behaviour, an element formulation, a constraint or interaction, a load,
+        the geometry (see _reduces); empty when ccx solves the deck's own model."""
+        return self.report.reduced
+
     def _find_planar_elements(self) -> None:
         """Record the deck's planar beams/trusses (B21, T2D2, ...) and the element types that
         keep the model from being planar — before the beam-section upgrades retype elements
@@ -11743,8 +12729,8 @@ class Converter:
             base = planar_line_type(typ)
             if base:
                 self._planar_elems[eid] = base
-            elif not typ.upper().startswith(PLANAR_COMPANION_PREFIXES):
-                others.add(typ.upper())
+            elif not typ.upper().startswith(PLANAR_COMPANION_PREFIXES) and eid not in self._slabs:
+                others.add(typ.upper())             # (a C3D8I slab is a CPS4I / CPE4I)
         self._planar_others = sorted(others)
 
     def _plan_planar_constraint(self, blocks: List[Block]) -> None:
@@ -11792,6 +12778,7 @@ class Converter:
                              f"z = const (z from {min(zs):g} to {max(zs):g}): ccx runs them as 3-D "
                              f"elements at the given z, while Abaqus' planar elements ignore z; "
                              f"their out-of-plane DOFs were left free — verify.", once=True)
+            self._reduces("2-D beams / trusses not in one plane (out-of-plane DOFs free)")
             return
         held = self._planar_held_nodes(blocks)
         skew = self._planar_skew_nodes(blocks)
@@ -11805,6 +12792,7 @@ class Converter:
             self.report.warn(f"Planar model: ccx runs the 2-D beams/trusses ({kinds}) as 3-D "
                              f"elements, but no out-of-plane constraint could be added: {why}.",
                              once=True)
+            self._reduces("2-D beams / trusses with free out-of-plane DOFs")
             return
         self.geom.nsets[PLANAR_NODES_SET] = sorted(fixed)
         self._planar_bc = ["*BOUNDARY"] + ([f"{PLANAR_NODES_SET}, 3, 3"] if fixed else []) + \
@@ -11841,6 +12829,7 @@ class Converter:
                              f"(nodes under a *TRANSFORM, where ccx allows no rotational BC, and "
                              f"rigid-body/coupling reference nodes are skipped; on a circular section "
                              f"only an element's middle node holds the twist alone).", once=True)
+            self._reduces("2-D beam twist unrestrained")
         if any(t not in PLANAR_TRUSS_TYPES for t in planar.values()) and \
                 any(b.keyword in ("FREQUENCY", "COMPLEX FREQUENCY") for b in blocks):
             self.report.warn("*FREQUENCY on a planar beam model: ccx's 3-D beams keep their twist "
@@ -11848,6 +12837,7 @@ class Converter:
                              "that Abaqus' planar beams cannot have — skip them when comparing "
                              "frequencies (fixing the rotations on every node would stiffen ccx's "
                              "expanded beams instead).", once=True)
+            self._reduces("2-D beams' twist modes in *FREQUENCY")
 
     def _planar_held_nodes(self, blocks: List[Block]) -> set:
         """Nodes whose DOF 3 a ccx constraint may drive: the dependent term of an *EQUATION,
@@ -12082,6 +13072,7 @@ class Converter:
                              f"knot beams that repair it were not added: ccx's explicit solver stops "
                              f"on them ('*ERROR in calcstabletimeincvol', they have no density) — "
                              f"verify.", once=True)
+            self._reduces("rotational BCs on circular-section beam end nodes")
             return
         self._add_knot_beams(need, blocks)
         self.report.note(f"Rotational BCs on circular-section beams: for a rotational BC on a "
@@ -12098,6 +13089,7 @@ class Converter:
                              f"section, which stiffens the beam where it bends (probed: DOF 4 held on "
                              f"every node of a 10-element beam deflects 0.84 of beam theory with the "
                              f"knots, 0.009 without) — verify.", once=True)
+            self._reduces("knot beams for rotational BCs on circular-section beams")
 
     # ======================================================================
     # *BOUNDARY, OP=NEW after rotational BCs on shell/beam nodes
@@ -12804,11 +13796,12 @@ def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple
         report.warn(f"*INSTANCE {inst['name']}: could not fully parse the transform "
                     f"line(s); any unparsed translation/rotation is dropped — verify "
                     f"positioning.", once=True)
+        report.reduce(f"*INSTANCE {inst['name']} transform not fully parsed")
     if rot:
-        report.warn(f"*INSTANCE {inst['name']} is rotated; node coordinates, *ORIENTATION axes "
-                    f"(also per-element *DISTRIBUTION axes), beam n1 directions and part-level "
-                    f"*NORMAL/*TRANSFORM data are transformed with it — verify material "
-                    f"directions.", once=True)
+        report.note(f"*INSTANCE {inst['name']} is rotated: node coordinates, *NODE normals, "
+                    f"*ORIENTATION axes (also per-element *DISTRIBUTION axes), beam n1 directions "
+                    f"and part-level *NORMAL/*TRANSFORM data are turned with it (validate_with_ccx.py "
+                    f"assembly_rotated_instances and distribution_solid_plate).", once=True)
     return T, rot
 
 
@@ -12838,6 +13831,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             p = rotate_about_axis(p, rot[0], rot[1], rot[2])
         gid = nid + node_off
         ndata.append(f"{gid}, {fmt_coord(p[0])}, {fmt_coord(p[1])}, {fmt_coord(p[2])}")
+        nrm = geo_conv._node_normals.get(nid)          # a shell normal turns with the instance
+        if nrm:
+            if rot:
+                nrm = vsub(rotate_about_axis(nrm, rot[0], rot[1], rot[2]),
+                           rotate_about_axis((0.0, 0.0, 0.0), rot[0], rot[1], rot[2]))
+            ndata[-1] += ", " + ", ".join(_fmt_component(c) for c in nrm)
         gmax_node = max(gmax_node, gid)
     out.append(mkblock("NODE", [("NSET", namer(inst["name"]))], ndata))
 
@@ -13094,8 +14093,12 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     deck -> emit per-part global data -> emit assembly-level nodes/elements -> emit each
     instance's geometry (id-offset + transform) -> translate assembly-level sets/surfaces/
     constraints -> resolve leftover instance-qualified references."""
-    report.warn("Model uses *PART/*INSTANCE/*ASSEMBLY. Flattened to a single global mesh "
-                "(best-effort) — verify node/element renumbering and instance transforms.", once=True)
+    report.note("Model uses *PART/*INSTANCE/*ASSEMBLY: flattened to a single global mesh — each "
+                "instance's nodes and elements numbered above the previous ones, its translation and "
+                "rotation applied, its sets, surfaces and sections renamed per instance "
+                "(validate_with_ccx.py assembly_rotated_instances: a turned instance with an oriented "
+                "orthotropic material, instance-qualified loads and a surface pressure solves "
+                "exactly like the same model written flat).", once=True)
     namer = make_namer(report)
     parts, instances, assembly_blocks, pre, post = _partition_assembly(blocks)
 
@@ -13107,7 +14110,7 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     # assembly node id can never overwrite a part/instance node id.
     asm_geom, asm_max_node, asm_max_elem, assembly_blocks = _partition_assembly_geometry(assembly_blocks)
     if asm_geom:
-        report.warn("Assembly-level *NODE/*ELEMENT (e.g. CAE reference points) kept with their "
+        report.note("Assembly-level *NODE/*ELEMENT (e.g. CAE reference points) kept with their "
                     "original ids; instance meshes are numbered above them so ids do not collide.",
                     once=True)
     out.extend(asm_geom)

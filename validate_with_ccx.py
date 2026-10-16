@@ -31,7 +31,11 @@ default (a stepped load overshoots), field and history output requested at
 beam nodes (the .frd and .dat values against beam theory), and the field output Abaqus
 preselects: a bar in tension with only Abaqus/CAE's *Output, variable=PRESELECT requests,
 and a bar impact in an explicit step without any output request (20 output frames, the
-free end against 1-D wave theory).
+free end against 1-D wave theory), CPS4I / CPE4I cantilevers written as C3D8I slabs under
+an end couple against beam theory (deflection and stresses), shell pressure on the SPOS and
+SNEG faces and element-based against the Navier plate solution (the sign of each), a bare
+*KINEMATIC (all DOFs) against *RIGID BODY, and an assembly with a turned instance against
+the same model written flat.
 
     python validate_with_ccx.py
 
@@ -1545,6 +1549,122 @@ def main():
               f"nodes {min(cpress[0]):.4f}...{max(cpress[0]):.4f} (10), then {min(cpress[1]):.4f}..."
               f"{max(cpress[1]):.4f} (20) in the carried step; worst {worst * 100:.3f}% off")
         failures += 0 if ok else 1
+
+    # --- CPS4I / CPE4I as C3D8I slabs: pure bending, exactly -----------------------
+    # ccx has no incompatible-mode plane element; abq2ccx writes each as a one-element-thick
+    # C3D8I slab (top nodes tied in plane, thickness DOF held; plane stress through an ORTHO
+    # material with no thickness coupling).  Abaqus' four-mode CPS4I represents pure bending
+    # on rectangles exactly, so the 5 x 2 cantilever under an end couple must give beam
+    # theory: tip u_y = M L^2 / (2 E' I) (E' = E plane stress, E / (1 - nu^2) plane strain),
+    # sigma_xx = -M y / I at every integration point, sigma_zz = 0 / nu sigma_xx.
+    for kind, ep in (("CPS4I", 1000.0), ("CPE4I", 1000.0 / (1 - 0.3 ** 2))):
+        src = os.path.join(tmp, f"slab_{kind}_src.inp")
+        with open(src, "w") as fh:
+            fh.write(open(os.path.join(EXAMPLES, "cps4i_slab_bending.inp")).read().replace("CPS4I", kind))
+        inp = os.path.join(tmp, f"slab_{kind}.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        tip = dat_displacement(os.path.join(d, "job.dat"), 12)
+        s10 = dat_el_stress(os.path.join(d, "job.dat"), 10)        # top layer, y from 0 to 0.5
+        shutil.rmtree(d, ignore_errors=True)
+        if status != "solved" or tip is None or s10 is None:
+            print(f"FAIL  cps4i_slab ({kind}): did not solve ({status})")
+            failures += 1
+            continue
+        eye = 0.5 / 12.0                                       # t h^3 / 12, t = 0.5, h = 1
+        ref_u = 1.0 * 10.0 ** 2 / (2 * ep * eye)
+        ref_s = -1.0 * 0.25 / eye                              # element centroid y = 0.25
+        ref_z = 0.0 if kind == "CPS4I" else 0.3 * ref_s
+        err = max(abs(tip[1] / ref_u - 1), abs(s10[0] / ref_s - 1), abs(s10[2] - ref_z) / abs(ref_s),
+                  abs(s10[1]) / abs(ref_s), abs(s10[3]) / abs(ref_s))
+        ok = err < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  cps4i_slab ({kind} -> C3D8I slab, end couple): tip u_y "
+              f"{tip[1]:.6f} (beam theory {ref_u:.6f}), sigma_xx {s10[0]:.5f} (-M y / I = {ref_s:.5f}), "
+              f"sigma_zz {s10[2]:.5f}; max deviation {err:.1e}"
+              + (" (a plain CPS4 gives 39 % of the deflection)" if kind == "CPS4I" else ""))
+        failures += 0 if ok else 1
+
+    # --- shell pressure on SPOS / SNEG faces and element-based P, against Navier --------
+    # Abaqus pushes a surface pressure against the surface normal (SPOS along -n, SNEG along
+    # +n) and an element-based *DLOAD P along +n (Abaqus 2017 shell element library); ccx's
+    # *DLOAD P on a shell pushes along +n, so abq2ccx flips the sign on SPOS.  Simply
+    # supported square S8R plate, a = 1, t = 0.01, p = 1: centre deflection 0.00406 p a^4 / D.
+    dee = 1.0e7 * 0.01 ** 3 / (12 * (1 - 0.3 ** 2))
+    ref = 0.00406235 / dee
+    for variant, subs, sign in (("*DSLOAD on SPOS", (), -1.0),
+                                ("*DSLOAD on SNEG", (("PLATE, SPOS", "PLATE, SNEG"),), 1.0),
+                                ("*DLOAD P", (("*DSLOAD\nLOADED, P, 1.", "*DLOAD\nPLATE, P, 1."),), 1.0)):
+        u = solve("shell_pressure_sides", subs=subs, nodes=(145,))
+        if not u:
+            failures += 1
+            continue
+        w = u[145][2]
+        ok = abs(w / (sign * ref) - 1) < 0.02
+        print(f"{'PASS' if ok else 'FAIL'}  shell_pressure_sides ({variant}): centre w {w:+.5e} "
+              f"(Navier {sign * ref:+.5e}, {abs(w / (sign * ref) - 1) * 100:.1f}% off)")
+        failures += 0 if ok else 1
+
+    # --- *KINEMATIC without DOF lines: all DOFs, like a rigid body ---------------------------
+    # Abaqus couples every DOF when *KINEMATIC has no data lines; ccx would couple none, so
+    # abq2ccx writes '1, 3', which carries the reference node's rotations too: the coupled end
+    # face of a C3D8 cantilever under a reference-node force and two moments must move exactly
+    # as with *RIGID BODY on the same face.
+    res = {}
+    for kind, subs in (("kinematic", ()), ("rigid", (("*COUPLING, CONSTRAINT NAME=CAP, REF NODE=REF, "
+                                                      "SURFACE=END\n*KINEMATIC\n",
+                                                      "*RIGID BODY, NSET=FACE, REF NODE=REF\n"),))):
+        src = os.path.join(tmp, f"kin_{kind}_src.inp")
+        text = open(os.path.join(EXAMPLES, "kinematic_all_dofs.inp")).read()
+        for a, b in subs:
+            text = text.replace(a, b)
+        with open(src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"kin_{kind}.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        res[kind] = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+    nodes = [n for n in range(1, 100) if n in res["kinematic"] and n in res["rigid"]]
+    if len(nodes) == 99:
+        scale = max(abs(x) for n in nodes for x in res["rigid"][n])
+        err = max(abs(a - b) for n in nodes for a, b in zip(res["kinematic"][n], res["rigid"][n])) / scale
+        ok = err < 1e-6 and scale > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  kinematic_all_dofs (bare *KINEMATIC -> '1, 3'): 99 node "
+              f"displacements vs *RIGID BODY, max difference {err:.1e} of max |u| {scale:.4f}")
+        failures += 0 if ok else 1
+    else:
+        print(f"FAIL  kinematic_all_dofs: did not solve ({len(nodes)} nodes compared)")
+        failures += 1
+
+    # --- assembly flattening: a turned instance against the same model written flat -------
+    # Two instances of one part, the second translated and turned 90 degrees about z, with an
+    # orthotropic material at 45 degrees (turned with the instance: an unturned orientation
+    # moves the nodes by 9 % of max |u|), instance-qualified loads and a surface pressure.
+    # The flat twin numbers the instances 1-20 / 21-40 as the converter does and gives the
+    # second one's coordinates and orientation turned by hand.
+    res, xyz = {}, {}
+    for deck in ("assembly_rotated_instances", "assembly_rotated_instances_flat"):
+        inp = os.path.join(tmp, deck + ".inp")
+        convert(os.path.join(EXAMPLES, deck + ".inp"), inp)
+        xyz[deck] = A.convert_file(os.path.join(EXAMPLES, deck + ".inp")).geometry.nodes
+        d, status, out = run_ccx(ccx, env, inp)
+        res[deck] = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+    ua, uf = res["assembly_rotated_instances"], res["assembly_rotated_instances_flat"]
+    if len(uf) == 40 and set(ua) == set(uf):
+        scale = max(abs(x) for v in uf.values() for x in v)
+        err = max(abs(a - b) for n in uf for a, b in zip(ua[n], uf[n])) / scale
+        cerr = max(abs(a - b) for n in uf for a, b in zip(xyz["assembly_rotated_instances"][n],
+                                                          xyz["assembly_rotated_instances_flat"][n]))
+        ok = err < 1e-6 and cerr < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  assembly_rotated_instances (*PART / *INSTANCE flattening, "
+              f"a turned instance): 40 nodes at the hand-flattened coordinates ({cerr:.0e}), "
+              f"displacements max difference {err:.1e} of max |u|")
+        failures += 0 if ok else 1
+    else:
+        print(f"FAIL  assembly_rotated_instances: the two models printed different nodes "
+              f"({len(ua)} / {len(uf)})")
+        failures += 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

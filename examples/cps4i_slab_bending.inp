@@ -1,0 +1,58 @@
+*HEADING
+ CPS4I cantilever under an end couple (pure bending): abq2ccx writes the incompatible-mode
+ elements as C3D8I slabs; tip deflection M L^2 / (2 E I), sigma_xx = -M y / I exactly
+*NODE, NSET=NALL
+1, 0.0, -0.5
+2, 2.0, -0.5
+3, 4.0, -0.5
+4, 6.0, -0.5
+5, 8.0, -0.5
+6, 10.0, -0.5
+7, 0.0, 0.0
+8, 2.0, 0.0
+9, 4.0, 0.0
+10, 6.0, 0.0
+11, 8.0, 0.0
+12, 10.0, 0.0
+13, 0.0, 0.5
+14, 2.0, 0.5
+15, 4.0, 0.5
+16, 6.0, 0.5
+17, 8.0, 0.5
+18, 10.0, 0.5
+*ELEMENT, TYPE=CPS4I, ELSET=BEAM
+1, 1, 2, 8, 7
+2, 2, 3, 9, 8
+3, 3, 4, 10, 9
+4, 4, 5, 11, 10
+5, 5, 6, 12, 11
+6, 7, 8, 14, 13
+7, 8, 9, 15, 14
+8, 9, 10, 16, 15
+9, 10, 11, 17, 16
+10, 11, 12, 18, 17
+*NSET, NSET=ROOT
+1, 7, 13
+*NSET, NSET=ROOTMID
+7
+*NSET, NSET=TIP
+6, 12, 18
+*MATERIAL, NAME=STEEL
+*ELASTIC
+1000., 0.3
+*SOLID SECTION, ELSET=BEAM, MATERIAL=STEEL
+0.5,
+*BOUNDARY
+ROOT, 1, 1
+ROOTMID, 2, 2
+*STEP
+*STATIC
+** end couple M = 1: the consistent nodal forces of sigma_xx = -M y / I on the tip edge
+*CLOAD
+18, 1, -1.
+6, 1, 1.
+*NODE PRINT, NSET=TIP
+U
+*EL PRINT, ELSET=BEAM
+S
+*END STEP

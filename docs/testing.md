@@ -27,15 +27,20 @@ They cover:
   instance-qualified references, part-level sections and constraints copied per instance,
   set-name limits.
 * **Elements and sections** — substitutions (the suite enforces that each keeps the node
-  count), beam upgrades for circular, pipe and box sections, the planar constraint,
-  surface elements, composite and continuum shells.
+  count) and which of them are exact, `CPS4I`/`CPE4I` as `C3D8I` slabs and when they fall
+  back, beam upgrades for circular, pipe and box sections, the planar constraint, surface
+  elements, composite and continuum shells, `*SECTION CONTROLS`.
 * **Materials** — elastic types, the expansion rewrites, plasticity forms, field
   dependencies, creep, `*DEPVAR`.
 * **Constraints** — `*MPC`, couplings and rigid bodies, knot beams, overconstraint
   settling, connectors, `*TRANSFORM`s.
 * **Loads, BCs and steps** — consistent nodal forces, the load audit, surface-element
-  loads, velocity and acceleration BCs, the default amplitude of displacement BCs, `OP=NEW`,
-  temperatures, explicit defaults, Riks.
+  loads, shell and membrane pressure on `SPOS`/`SNEG` sides, velocity and acceleration BCs,
+  the default amplitude of displacement BCs, `OP=NEW`, `*BUCKLE` load cases, temperatures,
+  explicit defaults, Riks.
+* **Reduced physics** — the record of what a conversion drops or replaces
+  (`Converter.reduced_physics`), and what does not count (exact substitutions, output
+  requests, numerical controls); `*NODE, SYSTEM=` coordinates and `*NODE` normals.
 * **Output** — the `.frd`/`.dat` mapping, output frequencies, preselected field and contact
   output, ccx's label lists.
 
@@ -83,6 +88,10 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `default_amplitude_bars` | a displacement BC and a `*CLOAD` without an amplitude, in implicit `*DYNAMIC`, `*VISCO`, a transient coupled and an explicit step | Abaqus' defaults: the BC ramped (explicit: held where it is), the load applied at once | the ramp to 7e-18 (ccx alone: 0.02 off); 1.98 × static overshoot; the hold exact |
 | `preselect_output_bar`, `preselect_contact_blocks` | Abaqus/CAE's `PRESELECT` requests: U, RF, S, contact pressure | statics | ≤ 0.005 % |
 | `explicit_default_output_bar` | an explicit step with no output request: 20 intervals | wave theory | exact before the wave arrives |
+| `cps4i_slab_bending` (also as `CPE4I`) | `CPS4I`/`CPE4I` as `C3D8I` slabs under an end couple: tip deflection, σ_xx, σ_zz | beam theory (exact for Abaqus' four-mode element on rectangles) | 4e-8 (a plain `CPS4`: 39 % of the deflection) |
+| `shell_pressure_sides` | pressure on an `S8R` plate's `SPOS` side, its `SNEG` side, and element-based `P` | Navier, with the sign Abaqus gives each | 1.0 % |
+| `kinematic_all_dofs` | a bare `*KINEMATIC` (all DOFs) on a solid face under a force and two moments | the face under `*RIGID BODY` | exact |
+| `assembly_rotated_instances` | a turned instance with an oriented orthotropic material, instance-qualified loads, a surface pressure | the same model written flat by hand | exact (coordinates and displacements) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`
@@ -102,6 +111,8 @@ Each entry has its URL, license, what it exercises, and:
 | `expect_solve=True` | the deck must solve in ccx |
 | `parse_only=True` | a mesh-only deck (no `*STEP`); ccx must accept it |
 | `source_unloaded=True` | it solves, but the source deck loads nothing (an empty `*STEP`); kept as a conversion check, out of the headline count |
+| `reduced_physics='<what>'` | it solves, but the conversion drops or replaces part of the Abaqus model (a constitutive behaviour, an element formulation, a section control, an interaction, a load, the geometry), so not its own problem; kept as a conversion check, out of the headline count |
+| `solver_differs='<why>'` | the conversion keeps the deck's physics, but ccx's solution is not the deck's: the deck relies on solver behaviour ccx 2.23 lacks (a part that only contact holds drifts away before the contact closes); found in the results; out of the headline count |
 | `note` | why a deck does not solve, or what a gated one depends on |
 
 The tests:
@@ -111,6 +122,10 @@ The tests:
 * `test_corpus_loads` — every step an `expect_solve` deck loads in Abaqus still carries a
   load after conversion (the converter's load audit), and `source_unloaded` flags exactly
   the decks that load nothing. Always runs.
+* `test_corpus_fidelity` — `reduced_physics` flags exactly the `expect_solve` decks whose
+  conversion records reduced physics (`Converter.reduced_physics`): no deck counts as a
+  faithful solve while the converter drops its material model or replaces its element;
+  `solver_differs` sits only on `expect_solve` decks. Always runs.
 * `test_corpus_solves` — runs every `expect_solve` and `parse_only` deck in ccx (300 s
   each). The judge, `classify_ccx_run` (shared with `--run` and `validate_with_ccx.py`),
   calls a run **solved** when ccx exits 0, prints "Job finished" without an `*ERROR` or a
@@ -124,8 +139,14 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1022 decks convert with no dangling
-reference. 200 are gated `expect_solve`: 186 solve under their own loads and 14 are
-`source_unloaded`. 219 mesh-only decks are accepted. The other 603 stop first on:
+reference. 200 are gated `expect_solve`: **160 solve the deck's own physics**; 14 are
+`source_unloaded`, one is `solver_differs` (a snap-fit insert that only contact holds drifts
+out of its buckle) and 28 (3 of them also unloaded) are `reduced_physics` — concrete damaged
+plasticity (2), UHARD / VUHARD hardening (4), field-dependent elasticity set by USDFLD or a
+user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
+`CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
+`B32` (3), general contact (1), a dropped `*IMPERFECTION` (1). 219 mesh-only decks are
+accepted. The other 603 stop first on:
 
 | Decks | First blocker |
 | ---: | --- |
@@ -148,5 +169,7 @@ cost.
 
 Append an entry to `corpus/manifest.py` (name, raw URL, license, what it exercises), run
 `python corpus/fetch.py`, then `python tests/test_corpus.py`. Gate a deck with
-`expect_solve=True` only when it solves under its own loads, and give a non-solving deck a
-`note` with its first ccx error.
+`expect_solve=True` only when it solves under its own loads (add `reduced_physics` with the
+reason if the conversion report ends with "Reduced physics", and `solver_differs` if ccx's
+results are not the deck's — a part that flies away, contact that never closes), and give a
+non-solving deck a `note` with its first ccx error.

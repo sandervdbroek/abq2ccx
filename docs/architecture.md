@@ -11,6 +11,9 @@ read_blocks()          tokenize text -> list[Block]   (follow *INCLUDE, resolve 
                                                         strip ** comments, normalise GEN/PERT/AMP)
         │
         ▼
+Converter._cartesian_nodes()   *NODE, SYSTEM=C / S coordinates -> Cartesian
+        │
+        ▼
 flatten_assembly()     *PART/*INSTANCE/*ASSEMBLY -> flat list[Block]   (only if present)
         │
         ▼
@@ -22,6 +25,11 @@ Converter._drop_surface_elements()   surface elements (SFM*) leave the registry;
                                      loads become nodal forces later
         │
         ▼
+Converter._plan_incompatible_slabs()   CPS4I / CPE4I -> C3D8I slabs (top nodes, *EQUATION
+                                       ties, held DOF 3, plane-stress ORTHO material) where
+                                       exact; otherwise CPS4 / CPE4 as reduced physics
+        │
+        ▼
 Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANSFORM of each
                        node (_transform_defs), the connector plan (_plan_connectors), rigid
                        bodies and their ROT NODEs, the *MPC plan (_plan_mpcs), knot beams
@@ -30,7 +38,8 @@ Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANS
                        transformed nodes (_plan_connector_rows), the BCs on rigid-constraint
                        members their reference node imposes or, on a *RIGID BODY, takes over
                        (_plan_coupled_bcs), the velocity / acceleration BCs
-                       (_plan_velocity_bcs), …; then _plan_distributions(),
+                       (_plan_velocity_bcs), …; then _plan_load_cases() (a *BUCKLE step's
+                       LOAD CASE=2 BCs), _plan_distributions(),
                        _plan_planar_constraint() and _plan_circ_rotation_knots(); last
                        _plan_output(): each step's output requests fitted to ccx's output
                        model (.frd or .dat, one node set per variable, one output control),
@@ -127,10 +136,22 @@ subroutine magnitudes count in the Abaqus deck but not in ccx's (its stock subro
 run). `_audit_loads` compares the two and fills `unloaded_steps` / `source_unloaded`, which
 `tests/test_corpus.py` gates on.
 
+The **reduced-physics record** (`Converter.reduced_physics`, kept on the `Report` as
+`Report.reduced`, so deck reading, mesh generation and flattening add to it too) names what
+the ccx model drops or replaces of the Abaqus one. Every path that comments out, drops or
+substitutes something Abaqus would solve calls `_reduces` (`report.reduce` outside a
+`Converter`): `_commented` does unless its caller passes `reduces=False` (output requests,
+numerical controls — `OUTPUT_ONLY_KEYWORDS`, `NUMERICAL_KEYWORDS` — and input Abaqus would
+not apply), and so do `_drop_load_line` and `substitution_loss` (an `ELEMENT_TYPE_MAP` entry
+outside `EXACT_SUBSTITUTIONS`); `Report.warn` records every `[APPROX]` reframing. A non-empty
+record ends the report with a "Reduced physics" warning; `tests/test_corpus.py` checks the
+manifest's `reduced_physics` flags against it.
+
 ## Element handling
 
 `ccx_element_type(typ, report)` decides each element's fate using
-`ELEMENT_TYPE_MAP` (node-count-preserving substitutions), `CCX_ELEMENTS` (direct), and
+`ELEMENT_TYPE_MAP` (node-count-preserving substitutions; `EXACT_SUBSTITUTIONS` are the exact
+ones, the rest reduced physics), `CCX_ELEMENTS` (direct), and
 recursive coupled-temperature (`T`) / hybrid (`H`) suffix strips, then the
 rigid/cohesive prefix checks. `element_node_count(typ)` gives the node count used to
 parse connectivity across continuation lines (tolerant of the `T`/`H` suffixes and the

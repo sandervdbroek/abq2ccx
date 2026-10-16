@@ -42,7 +42,7 @@ stderr. Run the deck with `ccx <output>` (no `.inp` extension).
 
 Without it, a construct ccx cannot run exactly is commented out or warned, so ccx never runs
 a different model without saying so. With it, these reframings are made, each with an
-`[APPROX]` warning:
+`[APPROX]` warning and listed in the closing "Reduced physics" warning:
 
 * `*STATIC, RIKS` → a plain, load-controlled `*STATIC` (ccx has no arc-length method);
 * `*ELASTIC` with ν ≥ 0.5 → ν = 0.475 (ccx has no hybrid elements);
@@ -61,7 +61,8 @@ a different model without saying so. With it, these reframings are made, each wi
 ## Recommended workflow
 
 1. **Export a flat deck if you can** (Abaqus/CAE: *Do not use parts and assemblies*). The
-   converter flattens assemblies, but a flat deck is the lower-risk input.
+   converter flattens assemblies (turned instances included: `validate_with_ccx.py`
+   compares one with the same model written flat), but a flat deck has less to convert.
 2. **Convert and read the report.** Every `[WARNING]` and `[NOTE]` is there for a reason.
 3. **Resolve commented cards.** A card emitted as `** abq2ccx: …` has no CalculiX
    equivalent and needs remodelling; the comment says how.
@@ -83,7 +84,9 @@ Messages are de-duplicated. A clean conversion says *"No conversion issues were 
 
 | Message | Meaning and action |
 | --- | --- |
-| `Element X -> Y (… substitution)` | a node-count-preserving swap; check that Y suits your physics |
+| `Reduced physics — ccx solves a different model than this Abaqus deck: …` | the last warning, naming what the conversion dropped or replaced (a material behaviour, an element formulation, a constraint, a load, …); ccx runs, but its results are not the deck's own solution — remodel what the warnings above name |
+| `Element X -> Y: the same solution — …` | an exact node-count-preserving swap (a note); nothing to do |
+| `Element X -> Y: ccx has no X, and Y is a different element formulation …` | a stand-in with other physics (reduced physics); check that Y suits your problem |
 | `… has NO CalculiX equivalent … emitted unchanged` | a cohesive, gasket or rigid element; the deck won't run until it is remodelled |
 | `*KEYWORD … emitted as a comment` | no equivalent; the original is kept as `**` comments for you to edit |
 | `Step N is loaded in the Abaqus deck …, but no load survives the conversion` | every load of that step was commented out; ccx would solve it with no load — see the step's other warnings |
@@ -104,6 +107,7 @@ Everything the converter creates starts with `ABQ2CCX_`:
 | `ABQ2CCX_ALL_NODES`, `ABQ2CCX_ALL_ELEMENTS` | whole-model sets (output requests without a set, default initial temperatures) |
 | `ABQ2CCX_KNOT` | the force-free *knot beams* on shell and beam nodes that carry rigid couplings or rotational BCs; ignore them in the results |
 | `ABQ2CCX_PLANAR` | the nodes of a planar model held in its plane |
+| `ABQ2CCX_SLAB` | the nodes of `CPS4I`/`CPE4I` elements written as one-element-thick `C3D8I` slabs, held in DOF 3; a plane-stress slab's material is `<material>_PLANE_STRESS` |
 | `ABQ2CCX_RB*`, `ABQ2CCX_MPCB*`, `ABQ2CCX_KC*`, `ABQ2CCX_TIED*` | node sets and surfaces of rigid bodies, `*MPC BEAM` bodies, kinematic couplings and tied contact pairs |
 | `ABQ2CCX_BC*` | node subsets of a BC card that the converter partly moved or removed |
 | `ABQ2CCX_TR*`, `ABQ2CCX_OR*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles) |
