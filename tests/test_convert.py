@@ -4176,7 +4176,8 @@ def test_connector_rotations_of_nodes_without_rotations():
 
 def test_connector_examples():
     for name, eqs in (("connector_hinge_beams", 10), ("connector_hinge_bodies", 5),
-                      ("connector_ground_hinge", 2)):
+                      ("connector_ground_hinge", 2), ("connector_transform_plate", 28),
+                      ("connector_transform_join", 27)):
         body, conv, rep = convert(os.path.join(EXAMPLES, name + ".inp"))
         g = reparse(body)
         assert body.count("*EQUATION") - body.count("** *EQUATION") >= eqs, name
@@ -4340,15 +4341,177 @@ def test_rotation_ties_to_a_transformed_rot_node_use_its_axes():
     assert f"*EQUATION\n2\n2, 4, 1., {conv._rb_rot[9]}, 1, -1.\n" in body
 
 
-def test_rot_node_with_connector_rows_keeps_the_global_axes():
-    # connector constraints on a reference point's rotation are written in global components on
-    # its ROT NODE (RP2: a hinge between two *MPC BEAM reference points), so a ROT NODE that
-    # carries them gets no transform; a rotational BC moved there is warned
-    deck = RP2 + "*Nset, nset=R1\n1\n*Transform, nset=R1\n0., 1., 0., -1., 0., 0.\n*Step\n*Static\n" \
-                 "*Boundary\n1, 5, 5\n*End Step\n"
+def _equation_terms(body):
+    """Every *EQUATION of a converted deck as [(node, DOF, coefficient), ...]."""
+    lines, out = _live(body), []
+    for i, l in enumerate(lines):
+        if l == "*EQUATION":
+            n, toks, j = int(lines[i + 1]), [], i + 2
+            while len(toks) < 3 * n:
+                toks += [t.strip() for t in lines[j].split(",") if t.strip()]
+                j += 1
+            out.append([(int(toks[q]), int(toks[q + 1]), float(toks[q + 2])) for q in range(0, 3 * n, 3)])
+    return out
+
+
+def _ccx_dependents(eqs, node, axes):
+    """The global DOFs ccx 2.23 eliminates for equations whose first term is a local DOF of
+    ``node`` (equations.f: from the term's own direction on, 1 -> 2 -> 3 -> 1, the first
+    component of size 1e-5 or more not taken yet), in order; None where it finds none."""
+    taken = []
+    for eq in eqs:
+        n, j, _ = eq[0]
+        if n != node:
+            continue
+        g = next((g for g in ((j - 1 + q) % 3 + 1 for q in range(3))
+                  if g not in taken and abs(axes[j - 1][g - 1]) >= 1e-5), None)
+        if g is None:
+            return None
+        taken.append(g)
+    return taken
+
+
+def test_rot_node_with_connector_rows_gets_the_local_axes():
+    # connector constraints on a reference point's rotation go to its ROT NODE (RP2: a hinge
+    # about z between two *MPC BEAM reference points); with a *TRANSFORM on the reference point
+    # (local 1 = y, 2 = -x, 3 = z) the ROT NODE gets its axes and every row is written in
+    # local DOFs: u_3 = u_1 is u_3x = -u_1,2, u_3y = u_1,1, u_3z = u_1,3, and the rotations
+    # likewise on the ROT NODE (probed on 2.23: exact against the model without the transform)
+    deck = RP2 + "*Nset, nset=R1\n1\n*Transform, nset=R1\n0., 1., 0., -1., 0., 0.\n"
     body, conv, rep = convert_str(deck)
-    assert conv._rb_rot[1] not in _emitted_transforms(body) and 1 in _emitted_transforms(body)
-    assert f"its rotation node {conv._rb_rot[1]} also carries connector constraints" in rep.text()
+    r1, r3 = conv._rb_rot[1], conv._rb_rot[3]
+    got = _emitted_transforms(body)
+    assert got[1] == ("R", [0., 1., 0., -1., 0., 0.]) and got[r1][0] == "R"
+    assert _close(got[r1][1], [0., 1., 0., -1., 0., 0.])
+    assert _equation_terms(body)[:5] == [
+        [(3, 1, 1.), (1, 2, 1.)], [(3, 2, 1.), (1, 1, -1.)], [(3, 3, 1.), (1, 3, -1.)],
+        [(r3, 1, 1.), (r1, 2, 1.)], [(r3, 2, 1.), (r1, 1, -1.)]]
+    assert "written in each node's local DOFs" in rep.text() and rep.n_warnings == 0
+    # a rotational BC on the reference point is moved to the ROT NODE in those axes, and the
+    # hinge row it decides (theta_1x = -theta_1,2 = 0) holds theta_3x: no warning either
+    body, conv, rep = convert_str(deck + "*Step\n*Static\n*Boundary\n1, 5, 5\n*End Step\n")
+    r1, r3 = conv._rb_rot[1], conv._rb_rot[3]
+    assert f"{r1},2,2" in _bc_lines(body) and f"{r3},1,1" in _bc_lines(body)
+    assert [(r3, 2, 1.), (r1, 1, -1.)] in _equation_terms(body) and rep.n_warnings == 0
+
+
+# a JOIN between cube corner 2 and a coincident free node 9, which has a cylindrical
+# *TRANSFORM about z through (0.5, 0.5): local 1 radial (1, -1, 0)/sqrt(2), 2 = (1, 1, 0)/sqrt(2)
+JOIN9 = (HEX + "*Node\n9, 1.,0.,0.\n*Element, type=CONN3D2, elset=J\n20, 2, 9\n"
+         "*Connector Section, elset=J\nJoin,\n*Nset, nset=T9\n9\n*Transform, nset=T9, type=C\n"
+         "0.5, 0.5, 0., 0.5, 0.5, 1.\n")
+
+
+def test_connector_join_on_a_transformed_node_uses_its_local_dofs():
+    # ccx reads *EQUATION terms on a node with a *TRANSFORM in its local axes, as Abaqus does:
+    # u_9 = u_2 becomes one equation per local DOF j of node 9, u_9,j = e_j . u_2 (projected:
+    # several local translations of one node in an equation fail under NLGEOM, probed), each
+    # eliminating a DOF of the untransformed node 2
+    body, conv, rep = convert_str(JOIN9)
+    h = math.sqrt(0.5)
+    eqs = sorted(_equation_terms(body))
+    assert all(len([t for t in eq if t[0] == 9]) == 1 for eq in eqs) and len(eqs) == 3
+    assert all(eq[0][0] == 2 for eq in eqs)
+    want = {1: (h, -h, 0.), 2: (h, h, 0.), 3: (0., 0., 1.)}
+    for eq in eqs:
+        (j, c9), = [(d, c) for n, d, c in eq if n == 9]
+        assert _close([-c / c9 for n, d, c in sorted(eq) if n == 2],
+                      [x for x in want[j] if x], 1e-11), eq
+    # node 2 held: the rows hold node 9's local DOFs (*BOUNDARY), as Abaqus does
+    body, conv, rep = convert_str(JOIN9 + "*Boundary\n2, 1, 3\n")
+    assert not _equation_terms(body) and sorted(l for l in _bc_lines(body) if l.startswith("9,")) \
+        == ["9,1,1", "9,2,2", "9,3,3"]
+
+
+def test_connector_link_on_a_transformed_node_uses_its_local_dofs():
+    # the linearised LINK e . (u_9 - u_2) = 0, e = (0, 0.6, 0.8): node 9's terms are e . e_j
+    # in its local axes (1 = y, 2 = -x, 3 = z), node 2's (no *TRANSFORM) come first
+    deck = (HEX + "*Node\n9, 1.,3.,4.\n*Element, type=CONN3D2, elset=W\n20, 2, 9\n"
+            "*Connector Section, elset=W\nLink,\n*Nset, nset=T9\n9\n*Transform, nset=T9\n"
+            "0., 1., 0., -1., 0., 0.\n")
+    body, _, rep = convert_str(deck)
+    assert _equation_terms(body) == [[(2, 3, -0.8), (2, 2, -0.6), (9, 3, 0.8), (9, 1, 0.6)]]
+    assert "written in each node's local DOFs" in rep.text()
+
+
+def test_connector_refused_where_ccx_cannot_take_the_local_axes():
+    # a node on its cylinder's axis: Abaqus cannot define the local directions there
+    body, conv, rep = convert_str(JOIN9.replace("0.5, 0.5, 0., 0.5, 0.5, 1.", "1., 0., 0., 1., 0., 1."))
+    assert not _equation_terms(body) and "** *CONNECTOR SECTION" in body
+    assert "Connector on a node without defined local axes: a node lies on the axis" in rep.text()
+    # a rotation on DOFs 4-6 of a node with a *TRANSFORM (here a beam end): ccx misreads
+    # *EQUATION terms there (DOF 4 as global, DOFs 5-6 out of range; probed) — no knot either
+    beams = (B2 + "*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n*Element, type=CONN3D2, "
+             "elset=H\n9, 2, 3\n*Connector Section, elset=H\nHinge,\nAX,\n*Nset, nset=T3\n3\n"
+             "*Transform, nset=T3\n1., 2., 0.5, -1., 0.3, 1.\n")
+    body, conv, rep = convert_str(beams)
+    assert not _equation_terms(body) and not conv._knots and "own DOFs 4-6" in rep.text()
+    # ... unless the node's rotation is held: then only the JOIN part is left
+    body, conv, rep = convert_str(beams + "*Boundary\n3, 4, 6\n")
+    assert len(_equation_terms(body)) == 3 and "own DOFs 4-6" not in rep.text()
+
+
+def test_connector_between_differently_transformed_nodes_under_nlgeom():
+    # u_9 = u_2 with both nodes transformed differently keeps several local translations of
+    # node 2 in each equation: exact in a linear step, but ccx 2.23 does not converge on such
+    # an equation under NLGEOM (probed) — commented out there
+    deck = JOIN9 + "*Nset, nset=T2\n2\n*Transform, nset=T2\n1., 2., 0.5, -1., 0.3, 1.\n"
+    body, _, rep = convert_str(deck)
+    assert len(_equation_terms(body)) == 3 and "different *TRANSFORMs" not in rep.text()
+    body, _, rep = convert_str(deck + "*Step, nlgeom=YES\n*Static\n*End Step\n")
+    assert not _equation_terms(body) and "different *TRANSFORMs" in rep.text()
+    # one transformed node under NLGEOM: one local translation per equation, written
+    body, _, rep = convert_str(JOIN9 + "*Step, nlgeom=YES\n*Static\n*End Step\n")
+    assert len(_equation_terms(body)) == 3 and "** *CONNECTOR" not in body
+
+
+def test_connector_dependents_on_a_transformed_node_in_an_order_ccx_takes():
+    # node 2 is a rigid-body member (ccx eliminates its translations), so the JOIN eliminates
+    # node 9's local DOFs; ccx turns each into a global DOF by its own rule, which fails for
+    # these axes (a cylinder axis in the x-y plane) in the order 1, 2, 3 ('SPC in node 9 in
+    # transformed coordinates cannot be converted in MPC: all', probed): another order is used
+    deck = (HEX + "*Node\n9, 1.,0.,0.\n100, 0.5,0.5,0.5\n*Nset, nset=ALL8\n1,2,3,4,5,6,7,8\n"
+            "*Rigid Body, ref node=100, tie nset=ALL8\n*Element, type=CONN3D2, elset=J\n20, 2, 9\n"
+            "*Connector Section, elset=J\nJoin,\n*Nset, nset=T9\n9\n*Transform, nset=T9, type=C\n"
+            "0.3, -0.2, 0.5, 0.9, 0.6, 0.5\n")
+    body, conv, rep = convert_str(deck)
+    eqs = _equation_terms(body)
+    axes = conv._local_axes(9)
+    assert [eq[0][0] for eq in eqs] == [9, 9, 9] and _ccx_dependents(eqs, 9, axes) is not None
+    natural = sorted(eqs, key=lambda eq: eq[0][1])
+    assert _ccx_dependents(natural, 9, axes) is None
+    assert "Possible overconstraint" not in rep.text()
+
+
+def test_settle_dependents_follows_ccx_on_a_transformed_node_with_a_bc():
+    # node 1 is fixed, node 2 has a *TRANSFORM (about z) and a BC on its local 3: the LINK's
+    # eliminated DOF goes to a local DOF of node 2 that ccx can take (its BC takes global z)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 3., 4., 0.\n3, 7., 1., 0.\n*Element, type=SpringA, elset=S\n"
+            "1, 3, 2\n*Spring, elset=S\n\n1000.\n*Element, type=CONN3D2, elset=L\n9, 1, 2\n"
+            "*Connector Section, elset=L\nLink,\n*Nset, nset=T2\n2\n*Transform, nset=T2\n"
+            "0.8775825618903728, 0.479425538604203, 0., -0.479425538604203, 0.8775825618903728, 0.\n"
+            "*Boundary\n1, 1, 3\n3, 1, 3\n2, 3, 3\n*Step\n*Static\n*Cload\n2, 1, 10.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    eq, = _equation_terms(body)
+    assert eq[0][0] == 2 and eq[0][1] in (1, 2) and "Possible overconstraint" not in rep.text()
+
+
+def test_connector_rotation_node_of_a_transformed_solid_node_gets_its_axes():
+    # a hinge between a solid node with a moment (its rotation then lives on a new rotation
+    # node) and a beam end: that node has a *TRANSFORM, so its rotation node gets the same
+    # axes — the moment moved there acts in them, as in Abaqus (probed: exact)
+    deck = (HEX + "*Node\n20, 1.,0.,0.\n21, 2.,0.,0.\n*Element, type=B31, elset=B\n2, 20, 21\n"
+            "*Beam Section, elset=B, material=M, section=RECT\n1.,1.\n0.,0.,1.\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n"
+            "*Element, type=CONN3D2, elset=H\n30, 2, 20\n*Connector Section, elset=H\nHinge,\nAX,\n"
+            "*Nset, nset=T2\n2\n*Transform, nset=T2\n0., 1., 0., -1., 0., 0.\n"
+            "*Step\n*Static\n*Cload\n2, 4, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    rot = conv._rb_rot[2]
+    assert rot in conv._conn_rot and rot in _emitted_transforms(body)
+    assert _close(_emitted_transforms(body)[rot][1], [0., 1., 0., -1., 0., 0.])
+    assert f"{rot}, 1, 1." in body and "local axes (a rectangular *TRANSFORM)" in rep.text()
+    assert rep.n_warnings == 0
 
 
 def test_transform_spherical_rigid_example():

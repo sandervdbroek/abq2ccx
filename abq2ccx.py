@@ -43,6 +43,7 @@ import argparse
 import ast
 import bisect
 import glob
+import itertools
 import json
 import math
 import operator
@@ -2365,8 +2366,9 @@ class Converter:
         self._transform_last: Dict[int, int] = {}  # node -> id() of the last *TRANSFORM naming it
         self._transform_twice: set = set()         # nodes named by several cards with equal data
         self._n_transform_sets = 0                 # ABQ2CCX_TRn sets written so far
-        # *RIGID BODY ROT NODE -> (local 1, local 2) of its REF NODE's *TRANSFORM, which it gets
-        # too; REF NODE -> why its ROT NODE cannot (see _check_transforms)
+        # *RIGID BODY ROT NODE (or a connector's rotation node) -> (local 1, local 2) of its
+        # REF NODE's *TRANSFORM, which it gets too; REF NODE -> why its ROT NODE cannot (see
+        # _plan_rot_axes)
         self._rot_axes: Dict[int, Tuple[Vec, Vec]] = {}
         self._rot_axes_why: Dict[int, str] = {}
         self._rot_axes_warned = False
@@ -2448,6 +2450,7 @@ class Converter:
         self._conn_held: set = set()               # (node, DOF) held at zero in every step
         self._conn_bc_dofs: set = set()            # (node, DOF) with a BC in any step
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
+        self._conn_rot: set = set()                # rotation nodes made for connector rotations
         self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_mpcs)
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
@@ -4526,7 +4529,7 @@ class Converter:
 
         * rotations of a rigid-body reference node go to DOFs 1-3 of its ROT NODE (ccx
           ignores DOFs 4-6 of the REF NODE), which has the reference node's local axes if it
-          has a *TRANSFORM (_check_transforms);
+          has a *TRANSFORM (_plan_rot_axes);
         * nodes that only belong to plane/axisymmetric continuum elements have no
           rotations — those DOFs are dropped (a set mixing them with shell/beam nodes keeps
           its rotations on the latter, one line per node)."""
@@ -5899,7 +5902,7 @@ class Converter:
         a rectangular card per node (nodes with equal axes share one) with that node's
         spherical axes (_transform_axes), fixed at its original position as in Abaqus: BCs,
         loads and *EQUATION terms there keep their meaning.  After the card that last names a
-        *RIGID BODY reference node, its ROT NODE gets the same local axes (_check_transforms)."""
+        *RIGID BODY reference node, its ROT NODE gets the same local axes (_plan_rot_axes)."""
         d = self._transform_card(b)
         nset = (b.param("NSET") or "").strip()
         if isinstance(d, str) or d[0] != "S":
@@ -5938,9 +5941,28 @@ class Converter:
                 out += self._rect_transform([rot], ", ".join(_fmt_unit(x) for x in e1 + e2))
         return out
 
+    def _plan_rot_axes(self, pairs: Dict[int, int]) -> None:
+        """Local axes of the rotation nodes in ``pairs`` (reference node -> its ROT NODE, or
+        a node -> the rotation node _plan_connector_rows made for it).  ccx carries the node's
+        rotation on DOFs 1-3 of that node, where _active_dof_lines / handle_cload move the
+        node's rotational BCs and moments, and Abaqus reads those in the node's local axes
+        when it has a *TRANSFORM: the rotation node gets the same axes as a rectangular
+        *TRANSFORM (handle_transform writes it; probed on 2.23: exact, also under NLGEOM), and
+        the rotation ties and connector constraints on it are written in them.  Where they are
+        undefined the reason is kept for a warning when such a BC or moment is moved
+        (_warn_rot_frame); a rotation node with a *TRANSFORM of its own keeps that one."""
+        for ref, rot in pairs.items():
+            if ref not in self._transformed or rot in self._transformed:
+                continue
+            axes = self._local_axes(ref)
+            if isinstance(axes, str):
+                self._rot_axes_why[ref] = axes
+            else:
+                self._rot_axes[rot] = (axes[0], axes[1])
+
     def _check_transforms(self) -> None:
-        """Deck-wide *TRANSFORM checks, once _transform_defs and _plan_rigid_couplings have
-        filled _transformed and _rb_rot:
+        """Deck-wide *TRANSFORM checks, once _transform_defs, _plan_rigid_couplings and
+        _plan_rot_axes have filled _transformed, _rb_rot and _rot_axes:
 
         * several cards with different data on a node: Abaqus does not allow it ("Multiple
           transformation definitions are not allowed at a node"), ccx 2.23 silently takes the
@@ -5950,10 +5972,7 @@ class Converter:
           ccx 2.23 gets such a node wrong without an error (probed) -> warning;
         * a *RIGID BODY reference node whose rotational BCs and moments go to DOFs 1-3 of its
           ROT NODE (_active_dof_lines, handle_cload): Abaqus reads them in the reference
-          node's local axes, so the ROT NODE gets the same axes as a rectangular *TRANSFORM
-          (probed on 2.23: exact, also under NLGEOM).  Where they are undefined, or the ROT
-          NODE also carries connector constraints (written in global components), the reason
-          is kept for a warning when such a BC or moment is moved (_warn_rot_frame)."""
+          node's local axes, so the ROT NODE has the same axes (_plan_rot_axes) -> note."""
         if not self._transformed:
             return
         several = sorted(n for n, d in self._transformed.items() if d == self._SEVERAL_TRANSFORMS)
@@ -5989,23 +6008,7 @@ class Converter:
                              f"plane-stress models by up to 91 % of |u|; BCs and loads there act "
                              f"partly out of the plane, on axisymmetric, truss and beam nodes too). "
                              f"Give these nodes a transformation about the Z axis.")
-        # connector constraints (_plan_connector_rows) are written in global components, also
-        # on the rotation node that carries a node's rotation: such a node stays global
-        conn = {k[0] for sec in self._conn_plan.values() for it in sec["items"]
-                if it.get("route") == "rows"
-                for k in list(it.get("bcs", ())) + [t for eq in it.get("eqs", ()) for t in eq]}
-        for ref, rot in self._rb_rot.items():
-            if ref not in self._transformed or rot in self._transformed:
-                continue
-            axes = self._local_axes(ref)
-            if isinstance(axes, str):
-                self._rot_axes_why[ref] = axes
-            elif rot in conn:
-                self._rot_axes_why[ref] = (f"its rotation node {rot} also carries connector "
-                                           f"constraints, which are written in global components")
-            else:
-                self._rot_axes[rot] = (axes[0], axes[1])
-        if self._rot_axes:
+        if any(rot not in self._conn_rot for rot in self._rot_axes):
             self.report.note("*RIGID BODY reference node(s) with a *TRANSFORM: Abaqus reads their "
                              "rotational BCs and moments in the local axes, so each ROT NODE, which "
                              "carries them as its DOFs 1-3, gets the same axes as a rectangular "
@@ -7113,15 +7116,18 @@ class Converter:
         out: List[str] = []
         bcs: List[str] = []
         skipped: "OrderedDict[str, List[dict]]" = OrderedDict()
-        rows = approx = False
+        rows = approx = local = False
         for it in sec["items"]:
             if it["route"] == "skip":
                 skipped.setdefault(it["reason"], []).append(it)
             elif it["route"] == "link":
                 out += ["*MPC", f"BEAM, {it['b']}, {it['a']}"] if it["link"] == "link-mpc" else \
-                    self._link_equation(it["b"], it["a"])
+                    self._link_equation(it["b"], it["a"], local=True)
+                local = local or (it["link"] == "link-eq" and any(
+                    n in self._transformed for n in (it["a"], it["b"])))
             elif it["route"] == "rows":
                 rows, approx = True, approx or bool(it.get("approx"))
+                local = local or bool(it.get("local"))
                 bcs += [f"{n}, {d}, {d}" for n, d in it["bcs"]]
                 for eq in it["eqs"]:
                     out += ["*EQUATION", str(len(eq))]
@@ -7147,6 +7153,12 @@ class Converter:
                              "rotation on its ROT NODE, a shell/beam node's on a knot) and *BOUNDARY "
                              "lines where a side is grounded or held; exact in a linear analysis.",
                              once=True)
+        if local:
+            self.report.note("Connector constraints on nodes with a *TRANSFORM are written in each "
+                             "node's local DOFs, in which ccx (like Abaqus) reads *EQUATION terms "
+                             "and *BOUNDARY lines there, and a rotation on its rotation node's DOFs "
+                             "in that node's local axes (probed on 2.23: the same results as the "
+                             "model without the *TRANSFORM, linear and NLGEOM).", once=True)
         if approx:
             self.report.warn("[APPROX] Connector under NLGEOM written in its linear form: a "
                              "REVOLUTE / ALIGN between two moving nodes, or a JOIN offset that "
@@ -7168,14 +7180,24 @@ class Converter:
                              "*EQUATION it becomes in the node's local axes — verify that the "
                              "constraint acts in the directions intended.", once=True)
 
-    def _link_equation(self, dep: int, ind: int) -> List[str]:
+    def _link_equation(self, dep: int, ind: int, local: bool = False) -> List[str]:
         """Abaqus *MPC LINK in a deck without NLGEOM: the distance constraint linearised at
         the initial geometry, e . (u_dep - u_ind) = 0 with e the unit vector between the
         nodes — what Abaqus solves in a small-displacement analysis.  The dependent term is
-        the first node's largest component."""
+        the first node's largest component.  ``local`` (connectors): the terms on a node with
+        a *TRANSFORM are in its local DOFs, e . e_j for local DOF j — ccx reads them there,
+        as Abaqus does — and a node without one is listed first (its DOF is eliminated)."""
         e = vunit(vsub(self.geom.nodes[dep], self.geom.nodes[ind]))
         ks = sorted((k for k in range(3) if abs(e[k]) > 1e-12), key=lambda k: -abs(e[k]))
         terms = [(dep, k + 1, e[k]) for k in ks] + [(ind, k + 1, -e[k]) for k in ks]
+        if local and (dep in self._transformed or ind in self._transformed):
+            terms = []
+            first = ind if dep in self._transformed and ind not in self._transformed else dep
+            for n in (first, dep if first == ind else ind):
+                axes = self._local_axes(n) if n in self._transformed else \
+                    ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+                c = [(j + 1, (1.0 if n == dep else -1.0) * vdot(e, axes[j])) for j in range(3)]
+                terms += [(n, j, v) for j, v in sorted(c, key=lambda t: -abs(t[1])) if abs(v) > 1e-12]
         lines = ["*EQUATION", str(len(terms))]
         for j in range(0, len(terms), 4):
             lines.append(", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in terms[j:j + 4]))
@@ -8535,6 +8557,7 @@ class Converter:
         # reference/rotation nodes of rigid bodies and couplings carry real rotations (the
         # independent node of *MPC BEAM lines too: it becomes a *RIGID BODY's REF NODE);
         # rigid connectors join the *MPC BEAM bodies
+        self._transformed = self._transform_defs(blocks)
         self._plan_connectors(blocks)
         self._plan_mpcs(blocks)
         mpc_refs = [body["ref"] for bodies in self._mpc_bodies.values() for body in bodies]
@@ -8577,6 +8600,7 @@ class Converter:
                     self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
                 body["rot"] = self._rb_rot[ref]
         self._plan_rigid_couplings(blocks)
+        self._plan_rot_axes(self._rb_rot)              # the connector rows use them
         self._plan_connector_rows(blocks)
         self._plan_coupled_bcs(blocks)
         self._plan_velocity_bcs(blocks)       # after _plan_coupled_bcs: reads its card rewrites
@@ -8974,6 +8998,23 @@ class Converter:
                     for i, v in enumerate(axes)]
         return axes[0], axes[1], axes[2]
 
+    _CONN_OWN_ROTATION = (
+        "Connector on the rotation of a node with a *TRANSFORM that carries its rotation on its "
+        "own DOFs 4-6 (a shell/beam node, or a kinematic coupling's reference node): ccx 2.23 "
+        "misreads *EQUATION terms on DOFs 4-6 of a node with a *TRANSFORM (DOF 4 as the global "
+        "rotation, DOFs 5 and 6 through an out-of-range read of the transformation matrix; "
+        "probed), so the constraint cannot be written there; commented out — the connector is "
+        "missing.")
+
+    @staticmethod
+    def _conn_axes_reason(why: str) -> str:
+        """Why a connector on a node whose local axes are undefined is commented out (``why``
+        from _local_axes, without the node: one reason, and warning, for all such nodes)."""
+        why = re.sub(r"\bnode \d+", "a node", why)
+        return (f"Connector on a node without defined local axes: {why}. Abaqus does not define "
+                f"the directions of the constraint's DOFs there; commented out — the connector "
+                f"is missing.")
+
     def _plan_connectors(self, blocks: List[Block]) -> None:
         """Connector elements, part 1 of their plan: before _plan_mpcs, whose rigid bodies the
         rigid connectors join (part 2 is _plan_connector_rows).  ccx has no connector
@@ -9192,6 +9233,9 @@ class Converter:
                 continue
             ends = [a, b] if it["rot"] is not None else \
                 [a] if vnorm(it["d"]) > 0.0 else []
+            if any(n in rotn and free_rotation(n, dim) and n in self._transformed for n in ends):
+                it["route"], it["reason"] = "skip", self._CONN_OWN_ROTATION
+                continue
             self._conn_knots += [n for n in ends if n in rotn and free_rotation(n, dim)]
 
     def _kinematic_refs(self, blocks: List[Block]) -> set:
@@ -9234,7 +9278,15 @@ class Converter:
           otherwise it is a connector-only unknown that Abaqus adds and nothing else
           touches, and it is eliminated from the rows (what is left is what it constrains);
         * a row left with one DOF holds it at zero (a *BOUNDARY in every step); the others
-          become *EQUATIONs.
+          become *EQUATIONs;
+        * ccx — like Abaqus — reads the DOFs of a node with a *TRANSFORM in its local axes (and
+          a rotation node's in its reference node's, _plan_rot_axes): a global component k
+          there becomes sum_j e_j[k] times local DOF j, a BC holds a local DOF, and an
+          equation eliminates a DOF without local axes where it can (ccx turns an eliminated
+          local DOF into a global one by its own rule, which _settle_dependents follows).
+          Where the local axes are undefined (a node on its cylinder axis, several cards), or
+          a rotation lives on DOFs 4-6 of a transformed shell/beam or kinematic reference node
+          (ccx misreads those, probed), the connector is commented out.
 
         Under NLGEOM (or explicit dynamics) the linear rows are exact only as boundary
         conditions, as equations among the rotation components of one rotation node (a
@@ -9249,8 +9301,14 @@ class Converter:
                 mode, arg = self._link_mode([(it["b"], it["a"])], "Connector LINK")
                 if mode == "skip":
                     it["route"], it["reason"] = "skip", arg
-                else:
-                    it["link"] = mode
+                    continue
+                it["link"] = mode
+                # its *EQUATION is written in local DOFs (_link_equation); ccx's distance MPC
+                # under NLGEOM is not affected by a *TRANSFORM (probed)
+                why = next((x for x in (self._local_axes(n) for n in (it["b"], it["a"])
+                                        if n in self._transformed) if isinstance(x, str)), None)
+                if mode == "link-eq" and why:
+                    it["route"], it["reason"] = "skip", self._conn_axes_reason(why)
         rows_items = [it for it in items if it["route"] == "rows"]
         if not rows_items:
             return
@@ -9281,9 +9339,22 @@ class Converter:
             return None
         busy = {(m, d) for _, members, dofs in self._rigid_members(blocks)
                 for m in members for d in dofs}
+        # (a transformed node's local DOFs all mix the global ones ccx eliminates)
+        busy |= {(m, j) for m, d in list(busy) if d <= 3 and m in self._transformed
+                 for j in (1, 2, 3)}
         nonplain = {n for n, _ in busy} | self._ref_nodes | set(self._rb_rot.values()) | \
             set(self._knots) | kin
         held = self._conn_held
+
+        def frame(n: int) -> Union[None, str, Tuple[Vec, Vec, Vec]]:
+            """The local axes in which ccx reads DOFs 1-3 of node ``n``, None for the global
+            ones, or why they are undefined."""
+            if n in self._rot_axes:
+                e1, e2 = self._rot_axes[n]
+                return e1, e2, vcross(e1, e2)
+            return self._local_axes(n) if n in self._transformed else None
+        # rotation-node DOFs held in every step: BCs moved there from DOFs 4-6 of its node
+        rot_held = {(self._rb_rot[n], d - 3) for n, d in held if 4 <= d <= 6 and n in self._rb_rot}
         skew = lambda d: ((0.0, -d[2], d[1]), (d[2], 0.0, -d[0]), (-d[1], d[0], 0.0))  # noqa: E731
 
         def rows_of(it: dict, a_turns: bool) -> List[Dict[Tuple[int, int], float]]:
@@ -9319,19 +9390,87 @@ class Converter:
                     if a is not None:
                         row.update({(a, 4 + i): -1.0, (a, 4 + p): c})
                     rows.append(row)
-            return [{k: v for k, v in rw.items() if abs(v) > 1e-14 and k not in held}
-                    for rw in rows]
+            return [{k: v for k, v in rw.items() if abs(v) > 1e-14} for rw in rows]
+
+        def native(rw: Dict[Tuple[int, int], float]) -> Union[str, Dict[Tuple[int, int], float]]:
+            """Row ``rw`` of rows_of in the DOFs ccx reads, those a BC holds at zero in every
+            step dropped (in the axes ccx holds them) — or why it cannot be written.  A term
+            on a node without local axes stays as it is (dof() moves a rotation to its
+            carrier); on a transformed node global component k becomes sum_j e_j[k] times
+            local DOF j, and a rotation goes to its rotation node's DOFs in that node's axes."""
+            out: "OrderedDict[Tuple[int, int], float]" = OrderedDict()
+            local = False
+
+            def add(k: Tuple[int, int], v: float) -> None:
+                out[k] = out.get(k, 0.0) + v
+
+            def spread(n: int, base: int, k: int, v: float, ax: Tuple[Vec, Vec, Vec],
+                       skip: set) -> None:
+                for j in range(3):
+                    if ax[j][k] and (n, base + j) not in skip:
+                        add((n, base + j), v * ax[j][k])
+            unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+            for (n, d), v in rw.items():
+                own = frame(n)
+                if d <= 3:
+                    if own is None:
+                        if (n, d) not in held:
+                            add((n, d), v)
+                    elif isinstance(own, str):
+                        return own
+                    else:
+                        local = True
+                        spread(n, 1, d - 1, v, own, held)
+                    continue
+                c = carrier(n)
+                zero = all((n, g) in held for g in (4, 5, 6))        # zero in any axes
+                if c is None:                     # a connector-only rotation (eliminated)
+                    if own is None or (isinstance(own, str) and
+                                       not any((n, g) in held for g in (4, 5, 6))):
+                        if (n, d) not in held:
+                            add((n, d), v)
+                    elif isinstance(own, str) and not zero:
+                        return own
+                    elif not zero:
+                        local = True
+                        spread(n, 4, d - 4, v, own, held)
+                elif c[1] == 4:                   # the node's own DOFs 4-6 (ccx misreads them
+                    if c[0] not in self._transformed:          # on a transformed node)
+                        if (n, d) not in held:
+                            add((n, d), v)
+                    elif not zero:
+                        return self._CONN_OWN_ROTATION
+                else:                             # DOFs 1-3 of a rotation node
+                    ax = frame(c[0])
+                    if ax is None and (own is None or isinstance(own, str)):
+                        if (n, d) not in held:
+                            add((n, d), v)        # (dof() moves it there)
+                    elif isinstance(ax, str):
+                        return ax
+                    elif not zero:
+                        local = True
+                        spread(c[0], 1, d - 4, v, ax or unit, rot_held)
+            big = max([abs(v) for v in out.values()] or [0.0])
+            return OrderedDict((k, v) for k, v in out.items()
+                               if abs(v) > 1e-14 and (not local or abs(v) > 1e-12 * big))
+
+        def natives(it: dict, a_turns: bool) -> List[Dict[Tuple[int, int], float]]:
+            rows = [native(rw) for rw in rows_of(it, a_turns)]
+            return [rw for rw in rows if not isinstance(rw, str)]
+
+        def is_local(k: Tuple[int, int]) -> bool:
+            return k[1] <= 3 and isinstance(frame(k[0]), tuple)
         # rotations that show beyond one connector get a rotation node of their own
         uses: Dict[int, int] = {}
         for it in rows_items:
             if it["rot"] is None:
                 continue
-            for n in {k[0] for rw in rows_of(it, True) for k in rw if k[1] >= 4}:
+            for n in {k[0] for rw in natives(it, True) for k in rw if k[1] >= 4}:
                 uses[n] = uses.get(n, 0) + 1
         for it in rows_items:                 # a JOIN offset turns with rotations node a has
             a = it["a"]
             if it["rot"] is None and a in uses and \
-                    any(k[0] == a and k[1] >= 4 for rw in rows_of(it, True) for k in rw):
+                    any(k[0] == a and k[1] >= 4 for rw in natives(it, True) for k in rw):
                 uses[a] += 1
         synth = sorted(n for n, c in uses.items() if carrier(n) is None and
                        n not in self._rot_nodes and (c > 1 or n in self._conn_turned))
@@ -9341,11 +9480,18 @@ class Converter:
             self.geom.add_node(next_id, self.geom.nodes[n])
             self._rb_rot[n] = next_id
             self._ref_nodes.add(n)
+            self._conn_rot.add(next_id)
+        self._plan_rot_axes({n: self._rb_rot[n] for n in synth})
+        rot_held |= {(self._rb_rot[n], d - 3) for n, d in held if 4 <= d <= 6 and n in synth}
         if synth:
             self.report.note(f"Connector rotations on {len(synth)} node(s) without rotations of "
                              f"their own (solid, plane or free nodes) live on new rotation nodes "
                              f"(DOFs 1-3 = the rotation vector, as a *RIGID BODY's ROT NODE); "
-                             f"BCs and moments on DOFs 4-6 of those nodes are moved there.")
+                             f"BCs and moments on DOFs 4-6 of those nodes are moved there."
+                             + (" The rotation node of a node with a *TRANSFORM has the node's "
+                                "local axes (a rectangular *TRANSFORM), in which Abaqus reads "
+                                "those BCs and moments." if any(self._rb_rot[n] in self._rot_axes
+                                                                for n in synth) else ""))
         explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         nl = self._nl_any or explicit
         carriers = set(self._rb_rot.values())          # rotation nodes (DOFs 1-3 turn)
@@ -9357,11 +9503,101 @@ class Converter:
         def plain(n: int, d: int) -> bool:
             """A translation no ccx MPC of its own touches."""
             return not turning(n, d) and n not in nonplain
+
+        def moved(k: Tuple[int, int]) -> bool:
+            """A local translation of a node with a *TRANSFORM of its own (not a rotation node
+            with its reference node's axes)."""
+            return k[1] <= 3 and k[0] in self._transformed and is_local(k)
+
+        def gauss_jordan(rows: List["OrderedDict[Tuple[int, int], float]"]) -> \
+                List["OrderedDict[Tuple[int, int], float]"]:
+            """Rows with local DOFs reduced (Gauss-Jordan) on the local translations of a
+            transformed node first — node b's where it has them — then on the other local DOFs,
+            each pivot in one row only: the rows of a JOIN become one per local DOF of the node
+            (projected on its axes), as ccx 2.23 needs under NLGEOM (probed: an *EQUATION with
+            several local translations of one node fails to converge or drifts there; one per
+            equation is exact), and a row left with one DOF holds it.  The eliminated DOF of a
+            row is then one without local axes where the row has one (chosen as for the other
+            connectors, not twice), else its pivot; it is listed first."""
+            rows = [OrderedDict(rw) for rw in rows]
+            pivots: List[Optional[Tuple[int, int]]] = [None] * len(rows)
+            for i in range(len(rows)):
+                rw = rows[i]
+                free = [k for k in rw if k not in busy and not (k[0] in kin and k[1] >= 4)]
+                if not free:
+                    continue
+                top = max(abs(rw[k]) for k in free)
+                big = [k for k in free if abs(rw[k]) >= 0.1 * top]
+                pick = [k for k in big if moved(k)] or [k for k in big if is_local(k)]
+                if pick:
+                    p = max((k for k in pick if k[0] == pick[0][0]), key=lambda k: abs(rw[k]))
+                else:
+                    p = next((k for k in big if plain(*k) and k not in self._conn_bc_dofs), big[0])
+                pivots[i] = p
+                for j, other in enumerate(rows):
+                    if j != i and p in other:
+                        f = other[p] / rw[p]
+                        for k, v in rw.items():
+                            other[k] = other.get(k, 0.0) - f * v
+                        del other[p]
+                        m = max([abs(v) for v in other.values()] or [0.0])
+                        rows[j] = OrderedDict((k, v) for k, v in other.items() if abs(v) > 1e-12 * m)
+            out: List["OrderedDict[Tuple[int, int], float]"] = []
+            used: set = set()
+            for rw, p in zip(rows, pivots):
+                if not rw:
+                    continue
+                if p is not None and is_local(p) and len(rw) > 1:
+                    top = max(abs(v) for v in rw.values())
+                    glob = sorted((k for k in rw if not is_local(k) and k not in busy and k not in used
+                                   and not (k[0] in kin and k[1] >= 4) and abs(rw[k]) >= 0.1 * top),
+                                  key=lambda k: (not (plain(*k) and k not in self._conn_bc_dofs),
+                                                 -abs(rw[k])))
+                    p = glob[0] if glob else p
+                    used.add(p)
+                out.append(rw if p is None else
+                           OrderedDict([(p, rw[p])] + [(k, v) for k, v in rw.items() if k != p]))
+            # ccx eliminates a global DOF for a local first term: the first component from the
+            # term's own direction on (1 -> 2 -> 3 -> 1) of size 1e-5 or more that no earlier
+            # equation took, and stops when none is left ('cannot be converted in MPC: all') —
+            # which some axes reach in one order and not another (probed): the rows whose first
+            # terms are local DOFs of one node go in an order in which each finds one
+            for n in dedup([next(iter(rw))[0] for rw in out if rw and is_local(next(iter(rw)))]):
+                idx = [i for i, rw in enumerate(out) if rw and next(iter(rw))[0] == n and
+                       is_local(next(iter(rw)))]
+                ax = frame(n)
+
+                def found(perm: Sequence[int]) -> bool:
+                    tk: set = set()
+                    for i in perm:
+                        rw = out[i]
+                        j = next(iter(rw))[1]
+                        g = next((g for g in ((j - 1 + q) % 3 + 1 for q in range(3))
+                                  if g not in tk and abs(ax[j - 1][g - 1]) >= 1e-5), None)
+                        top = max(abs(v) for v in rw.values())
+                        if g is None or abs(sum(v * ax[q - 1][g - 1] for (m, q), v in rw.items()
+                                                if m == n and q <= 3)) <= 1e-6 * top:
+                            return False
+                        tk.add(g)
+                    return True
+                if len(idx) > 1 and not found(idx):
+                    perm = next((p for p in itertools.permutations(idx) if found(p)), None)
+                    if perm is not None:
+                        rows_n = [out[i] for i in perm]
+                        for i, rw in zip(idx, rows_n):
+                            out[i] = rw
+            return out
         for it in rows_items:
             a = it["a"]
             a_turns = it["rot"] is not None or (a is not None and (carrier(a) is not None or
                                                                    a in self._rot_nodes))
-            rows = [rw for rw in rows_of(it, a_turns) if rw]
+            rows = [native(rw) for rw in rows_of(it, a_turns)]
+            why = next((rw for rw in rows if isinstance(rw, str)), None)
+            if why is not None:
+                it["route"], it["reason"] = "skip", why if why == self._CONN_OWN_ROTATION else \
+                    self._conn_axes_reason(why)
+                continue
+            rows = [rw for rw in rows if rw]
             if any(k[1] >= 4 and k[0] in self._rot_nodes and carrier(k[0]) is None
                    for rw in rows for k in rw):
                 # a shell/beam node's rotation without a knot (explicit dynamics, where the
@@ -9404,13 +9640,18 @@ class Converter:
                 c = carrier(k[0])
                 return (c[0], c[1] + k[1] - 4)
             bcs = dedup([dof(k) for k in zero])
-            eqs: List[List[Tuple[int, int, float]]] = []
+            mapped: List["OrderedDict[Tuple[int, int], float]"] = []
             for rw in rows:
                 terms: "OrderedDict[Tuple[int, int], float]" = OrderedDict()
                 for k, v in rw.items():
                     terms[dof(k)] = terms.get(dof(k), 0.0) + v
                 big = max([abs(v) for v in terms.values()] or [0.0])
-                terms = OrderedDict((k, v) for k, v in terms.items() if abs(v) > 1e-12 * big)
+                mapped.append(OrderedDict((k, v) for k, v in terms.items() if abs(v) > 1e-12 * big))
+            reduced = any(is_local(k) for terms in mapped for k in terms)
+            if reduced:
+                mapped = gauss_jordan(mapped)
+            eqs: List[List[Tuple[int, int, float]]] = []
+            for terms in mapped:
                 if len(terms) == 1:
                     bcs += [k for k in terms if k not in bcs]
                 elif terms:
@@ -9426,8 +9667,8 @@ class Converter:
                     top = max(abs(terms[k]) for k in free)
                     big = [k for k in free if abs(terms[k]) >= 0.1 * top]
                     # a plain node's translation without a BC first (no ccx MPC touches it)
-                    first = next((k for k in big if plain(*k) and k not in self._conn_bc_dofs),
-                                 big[0])
+                    first = next(iter(terms)) if reduced else \
+                        next((k for k in big if plain(*k) and k not in self._conn_bc_dofs), big[0])
                     eqs.append([(first[0], first[1], terms[first])] +
                                [(k[0], k[1], v) for k, v in terms.items() if k != first])
             if it["route"] != "rows":
@@ -9437,6 +9678,16 @@ class Converter:
                     "Connector that would hold a translation of a rigid-body member at zero "
                     "(ccx eliminates those, a boundary condition on one stops ccx); commented "
                     "out — the connector is missing.")
+                continue
+            several = [eq for eq in eqs if any(
+                sum(1 for m, d, _ in eq if m == n and moved((m, d))) > 1 for n, _, _ in eq)]
+            if nl and several:
+                it["route"], it["reason"] = "skip", (
+                    "Connector under NLGEOM (or explicit dynamics) between nodes with different "
+                    "*TRANSFORMs whose constraint keeps several local translations of one node in "
+                    "an *EQUATION: ccx 2.23 does not converge on such an equation under NLGEOM, or "
+                    "drifts (probed; one local translation per equation is exact); commented out "
+                    "— the connector is missing.")
                 continue
             if nl:
                 def exact(eq: List[Tuple[int, int, float]]) -> bool:
@@ -9469,6 +9720,7 @@ class Converter:
                             "explicit dynamics, which stops on it).")
                         continue
             it["bcs"], it["eqs"] = bcs, eqs
+            it["local"] = reduced or any(is_local(k) for k in bcs)
 
     # -- rigid couplings on shell / beam nodes ---------------------------------
     def _plan_rigid_couplings(self, blocks: List[Block]) -> None:
@@ -9498,7 +9750,6 @@ class Converter:
                 self._rot_nodes.update(conn)
             elif cc.startswith("M3D"):
                 structural.update(conn)
-        self._transformed = self._transform_defs(blocks)
         self._coupling_plan = {}
         knots: List[int] = []
         for i, b in enumerate(blocks):
@@ -9694,7 +9945,7 @@ class Converter:
                 self._rot_tied.add((n, k))
                 axes = self._rot_axes.get(target) if offset == -3 else None
                 if axes:
-                    # a ROT NODE with its reference node's local axes (_check_transforms):
+                    # a ROT NODE with its reference node's local axes (_plan_rot_axes):
                     # ccx reads its *EQUATION terms in them, so the member's global rotation k
                     # is the sum over j of e_j[k] times its local rotation j (exact, linear)
                     terms = [(j + 1, -e[k - 4]) for j, e in enumerate(axes + (vcross(*axes),))
@@ -10536,6 +10787,8 @@ class Converter:
         spc: set = set()
         segs: List[List[Tuple[bool, Tuple[int, int], bool]]] = [[]]   # BCs: model, each step
         transformed: set = set()
+        tcard: Dict[int, Optional[Tuple[str, Vec, Vec]]] = {}   # node -> its (last) *TRANSFORM
+        bc_first: Dict[Tuple[int, int], int] = {}               # (node, DOF) -> card of 1st BC
         # DOFs ccx eliminates itself: rigid-body / kinematic members' translations (a BC on
         # one stops ccx) and the DOFs its other constraints may eliminate (those accept a BC
         # — ccx picks around it or carries it over — but no *EQUATION can eliminate them)
@@ -10560,8 +10813,18 @@ class Converter:
                         for d in range(min(d1, d2), max(d1, d2) + 1):
                             spc.add((n, d))
                             segs[-1].append((new, (n, d), z))
+                            bc_first.setdefault((n, d), ci)
             elif kw == "TRANSFORM":
-                transformed.update(nodes_of((params.get("NSET") or "").strip()))
+                ns = nodes_of((params.get("NSET") or "").strip())
+                transformed.update(ns)
+                try:
+                    v = [pf(x) for j in data for x in fields(j) if x]
+                    tc: Optional[Tuple[str, Vec, Vec]] = (
+                        "C" if (params.get("TYPE") or "").strip().upper().startswith("C") else "R",
+                        (v[0], v[1], v[2]), (v[3], v[4], v[5]))
+                except (ValueError, IndexError):
+                    tc = None
+                tcard.update((n, tc) for n in ns)
             elif kw == "RIGID BODY":
                 ref = (params.get("REF NODE") or "").strip()
                 rot = (params.get("ROT NODE") or "").strip()
@@ -10605,8 +10868,8 @@ class Converter:
                         taken_too.update((n, d) for n in surface_nodes(f[0]) or nodes_of(f[0])
                                          for d in (1, 2, 3))
         # ccx turns a BC on a node with a *TRANSFORM into an MPC on its global DOFs
-        spc.update((n, d) for n, k in list(spc) if n in transformed and k <= 3 for d in (1, 2, 3))
-        clash = sorted(k for k in busy if k in spc and k not in self._clash_dofs)
+        spc_x = spc | {(n, d) for n, k in spc if n in transformed and k <= 3 for d in (1, 2, 3)}
+        clash = sorted(k for k in busy if k in spc_x and k not in self._clash_dofs)
         for n, d in clash[:3]:
             self.report.warn(f"Possible overconstraint: node {n} DOF {d} is eliminated by a "
                              f"{busy[(n, d)]} (ccx builds it from MPCs) AND has a *BOUNDARY. "
@@ -10636,7 +10899,67 @@ class Converter:
             eqs += [(ci, terms) for terms in parsed]
         if not eqs:
             return out
+        # the local axes of the transformed nodes (ccx reads any TYPE but C as rectangular)
+        taxes: Dict[int, Tuple[Vec, Vec, Vec]] = {}
+        for n, tc in tcard.items():
+            ax = self._transform_axes(n, *tc) if tc and n in self.geom.nodes else "?"
+            if not isinstance(ax, str):
+                taxes[n] = ax
         taken = spc | set(busy) | taken_too
+        # a local DOF of a transformed node mixes its global DOFs: none of them can be
+        # eliminated here where ccx's own constraints eliminate one of those, or the axes are
+        # unknown; where only a BC does, ccx's choice is followed (ccx_pick)
+        taken |= {(n, d) for n, k in list(taken) if n in transformed and k <= 3 and
+                  (n not in taxes or (n, k) in busy or (n, k) in taken_too) for d in (1, 2, 3)}
+        # ccx eliminates a global DOF for each local one: for a BC (bounadd) the largest
+        # component it can, for an *EQUATION's first term (equations.f) the first component from
+        # its own direction on (1 -> 2 -> 3 -> 1) whose size is 1e-5 or more and that no
+        # constraint eliminates yet — in deck order, and stops ('cannot be converted in MPC:
+        # all ...') when none is left
+        bc_ev = sorted((ci, n, d) for (n, d), ci in bc_first.items() if n in taxes and d <= 3)
+        gtaken: Dict[int, set] = {}
+        pos = [0]
+
+        def bc_pick(n: int, i: int, tk: set) -> Optional[int]:
+            e = taxes[n][i - 1]
+            gs = [g for g in (1, 2, 3) if g not in tk and abs(e[g - 1]) > 1e-30]
+            return max(gs, key=lambda g: abs(e[g - 1])) if gs else None
+
+        def flush(upto: int) -> None:
+            while pos[0] < len(bc_ev) and bc_ev[pos[0]][0] < upto:
+                _, n, i = bc_ev[pos[0]]
+                pos[0] += 1
+                g = bc_pick(n, i, gtaken.setdefault(n, set()))
+                if g is not None:
+                    gtaken[n].add(g)
+
+        def later_ok(n: int, tk: set) -> bool:
+            tk = set(tk)
+            for _, m, i in bc_ev[pos[0]:]:
+                if m == n:
+                    g = bc_pick(m, i, tk)
+                    if g is None:
+                        return False
+                    tk.add(g)
+            return True
+
+        def ccx_pick(k: Tuple[int, int], coef: Dict[Tuple[int, int], float]) -> Optional[int]:
+            """The global DOF ccx eliminates for dependent ``k``, a local DOF of a transformed
+            node (0: not one), or None where it finds none, one whose coefficient vanishes in
+            the equation's global form, or one a later BC on the node needs."""
+            n, j = k
+            if j > 3 or n not in taxes:
+                return 0
+            ax, tk = taxes[n], gtaken.setdefault(n, set())
+            for g in ((j - 1 + q) % 3 + 1 for q in range(3)):
+                if g in tk or abs(ax[j - 1][g - 1]) < 1e-5:
+                    continue
+                total = sum(c * ax[i - 1][g - 1] for (m, i), c in coef.items() if m == n and i <= 3)
+                if abs(total) <= 1e-6 * max(abs(c) for c in coef.values()) or \
+                        not later_ok(n, tk | {g}):
+                    return None
+                return g
+            return None
         cands: List[List[Tuple[int, int]]] = []
         for _, terms in eqs:
             dofs = [(n, d) for n, d, _ in terms]
@@ -10657,7 +10980,8 @@ class Converter:
             via: Dict[Tuple[int, int], int] = {}
 
             def options(e: int):                # free DOFs first, then the ones to displace
-                return iter(sorted(cands[e], key=lambda c: c in owner))
+                return iter(sorted(cands[e], key=lambda c: (c in owner, c[1] <= 3 and
+                                                            c[0] in transformed)))
             stack = [(start, options(start))]
             budget = 20000
             while stack and budget > 0:
@@ -10717,7 +11041,8 @@ class Converter:
         final: List[Optional[List[Tuple[int, int, str]]]] = []
         moved = dropped = redundant = rewritten = 0
         stuck: List[Tuple[int, int]] = []
-        for e, (_, terms) in enumerate(eqs):
+        for e, (ci, terms) in enumerate(eqs):
+            flush(ci)
             dofs = [(n, d) for n, d, _ in terms]
             try:
                 coef: Dict[Tuple[int, int], float] = {}
@@ -10732,11 +11057,16 @@ class Converter:
                 final.append(None)                 # 0 = 0 in every step
                 redundant += 1
                 continue
-            order = ([assign[e]] if e in assign else []) + dofs
+            order = ([assign[e]] if e in assign else []) + \
+                sorted(dofs, key=lambda k: k[1] <= 3 and k[0] in transformed)
             dep = next((k for k in order if k not in taken and k not in accepted and
                         dofs.count(k) == 1 and abs(coef[k]) > tol and
-                        (res is None or abs(res.get(k, 0.0)) > tol)), None)
+                        (res is None or abs(res.get(k, 0.0)) > tol) and
+                        ccx_pick(k, coef) is not None), None)
             if dep is not None:
+                g = ccx_pick(dep, coef)
+                if g:
+                    gtaken[dep[0]].add(g)
                 accepted[dep] = {q: -c / coef[dep] for q, c in coef.items() if q != dep}
                 if dep != dofs[0]:
                     k = dofs.index(dep)
@@ -10744,8 +11074,12 @@ class Converter:
                     moved += 1
                 final.append(terms)
                 continue
-            alt = next((k for k in (res or {}) if k not in taken and k not in accepted), None)
+            alt = next((k for k in (res or {}) if k not in taken and k not in accepted and
+                        ccx_pick(k, res) is not None), None)
             if alt is not None:
+                g = ccx_pick(alt, res)
+                if g:
+                    gtaken[alt[0]].add(g)
                 # no DOF of the equation itself is free, but the equation reduced by the
                 # accepted ones (the same constraint, given those) has one
                 accepted[alt] = {q: -c / res[alt] for q, c in res.items() if q != alt}

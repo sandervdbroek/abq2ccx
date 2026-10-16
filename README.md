@@ -145,6 +145,12 @@ PASS  traction_transformed_face with *TRANSFORM (C3D20R face, rectangular + cyli
 PASS  cook_membrane_traction with *TRANSFORM (CPS8 edge, in-plane rectangular + cylindrical): u at 33 nodes differs from the model without it by 6.4e-17 of max |u| (25.06)
 PASS  thermal_no_initial_temperature (*Temperature, no initial temperatures): cube strain 1.200000e-03 / 1.200000e-03 / 1.200000e-03 (alpha T = 1.200000e-03, 8.6e-16 off); CIRC beam end u_x = +0.120001 (alpha T L = +0.120000, 0.0005% diff)
 PASS  transform_spherical_rigid (spherical *TRANSFORM, rigid body with a cylindrical one on its reference point): u at 46 nodes differs from the model in global components by 0.0e+00 of max |u| (0.003692)
+PASS  connector_transform_plate (JOIN to a rigid plate on a cylindrically transformed face, LINK to a transformed node): u at 57 nodes differs from the model without the *TRANSFORM by 0.0e+00 of max |u| (0.3467)
+PASS  connector_transform_join (JOIN to a transformed face): u at 54 nodes differs from the model without the *TRANSFORM by 0.0e+00 of max |u| (0.5752)
+PASS  connector_transform_join, NLGEOM x40 (max |u| 2.8 on a unit block): u at 54 nodes differs from the model without the *TRANSFORM by 0.0e+00 of max |u| (2.826)
+PASS  connector_hinge_bodies with a rectangular *TRANSFORM on reference point 1: u at 8 nodes differs from the model without the *TRANSFORM by 0.0e+00 of max |u| (0.8291)
+PASS  connector_hinge_bodies with a cylindrical *TRANSFORM on reference point 3 (its moment in the local axes): u at 8 nodes differs from the model without the *TRANSFORM by 0.0e+00 of max |u| (0.8291)
+PASS  connector_ground_hinge, NLGEOM, with a rectangular *TRANSFORM on its reference point (moments in the local axes): u at 4 nodes differs from the model without the *TRANSFORM by 0.0e+00 of max |u| (2.39)
 PASS  velocity_bc_column (TYPE=VELOCITY, SMOOTH STEP, kept into a 2nd step): top at 0.009500 / 0.014500 (integral 0.009500 / 0.014500), 34 increments within 5.0e-05 of the travel; reaction 1.0054 x E A u/L
 PASS  velocity_bc_bar (explicit, TYPE=VELOCITY): driven end u = 0.005000 (0.005); wave stress behind the front 0.6% off on average (6.7% at worst), 0.00% ahead of it
 PASS  velocity_bc_bar (implicit, TYPE=ACCELERATION): driven end u = 0.005000 (0.005); wave stress behind the front 1.1% off on average (1.5% at worst), 0.09% ahead of it
@@ -244,7 +250,16 @@ rotation about its local 1 and 2 and loaded by a local force and moment (ccx car
 body's rotations on its ROT NODE, which gets the same axes). It must match the same model
 written in global components — global loads, `*EQUATION` supports, an explicit ROT NODE —
 at every node (the conversion before ran without a message and missed by 784 % of |u|; the
-ROT NODE without its axes alone misses by 91 %).
+ROT NODE without its axes alone misses by 91 %). The next six put connectors on nodes with
+a `*TRANSFORM`, whose DOFs ccx, like Abaqus, reads in their local axes, so the converter
+writes the connector rows there: a rigid plate joined to a face whose cylindrical axis lies
+in the x–y plane (each equation eliminates a local DOF of the face node, which ccx turns into
+a global one by its own rule — in the plain order it stops at six of nine nodes) with a
+`LINK` to a transformed node; a `JOIN` to a transformed face, linear and under `NLGEOM`; the
+hinge between two rigid bodies with a transform on either reference point; and the hinge to
+ground under `NLGEOM` with one on its reference point. Each must match the same model
+without the transform at every node, and does exactly (rows in global components missed by
+7–76 % of |u|, without a warning for the joins, or ccx stopped).
 The velocity checks pull a column through a rigid reference point by a
 `*BOUNDARY, TYPE=VELOCITY` ramped in by a `SMOOTH STEP` (its top must follow the integral of
 the velocity at every increment, also in a second step that keeps the BC) and drive a bar
@@ -352,9 +367,9 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*TRANSFORM, TYPE=S` (spherical) | commented out; a rectangular `*TRANSFORM` per node with that node's spherical axes | ccx has no spherical system and silently reads `TYPE=S` as a rectangular one through `a` and `b` (NaN results or a singular matrix when the centre is the origin, wrong axes otherwise). The Abaqus axes — 1 radial from the centre, 3 meridional towards the pole, 2 = 3 × 1 — at each node's original position are fixed in space, so BCs, loads and `*EQUATION` terms keep their meaning. Nodes on the polar axis, where Abaqus cannot define the system, keep the global axes (warned) |
 | `*BOUNDARY, USER`, `*CLOAD, USER`, `...NU` load labels, `*TEMPERATURE, USER`, `*AMPLITUDE, DEFINITION=USER` | commented out | the Abaqus user subroutine cannot run in ccx, which would call its own stock `uboun.f` / `cload.f` / `dload.f` / ... instead — the warning names the one to port |
 | `*MPC` | line by line: `PIN`/`TIE` → per-DOF `*EQUATION`; `BEAM` → `*RIGID BODY` per independent node; `LINK` → linearised `*EQUATION` (no `NLGEOM`) or ccx `*MPC BEAM` | `PLANE`/`STRAIGHT` kept; a line ccx cannot take (user MPCs, other types) is commented out alone. `TIE` ties shell/beam rotations through knots (ccx ignores DOFs 4–6 of a plain shell/beam node in an `*EQUATION`) and the temperature in thermal steps; BEAM lines chained through a node form one body; ccx's `*MPC BEAM` keeps the distance between two nodes but rejects beam/shell/plane nodes |
-| `CONN3D2`/`CONN2D2` + `*CONNECTOR SECTION` | the connection's kinematic constraint: `JOIN`, `REVOLUTE`, `ALIGN`, `HINGE` → `*EQUATION`s (and `*BOUNDARY` lines to ground or a held node); `BEAM`, `WELD` → `*RIGID BODY`; `LINK` → as `*MPC LINK`; `CARTESIAN`, `CARDAN`, … (no constraint) → nothing | ccx has no connector element, and without a behaviour a connector is its constraint. Rotations live where ccx has them (a reference point's `ROT NODE`, knots on shell/beam nodes); exact in linear analyses, and under `NLGEOM` only where the linear form stays exact (a hinge to ground, a rigid link) — the rest commented out (`--approximate`: `[APPROX]`). A `*CONNECTOR BEHAVIOR`, `SLOT`, `UNIVERSAL`, … are commented out |
+| `CONN3D2`/`CONN2D2` + `*CONNECTOR SECTION` | the connection's kinematic constraint: `JOIN`, `REVOLUTE`, `ALIGN`, `HINGE` → `*EQUATION`s (and `*BOUNDARY` lines to ground or a held node); `BEAM`, `WELD` → `*RIGID BODY`; `LINK` → as `*MPC LINK`; `CARTESIAN`, `CARDAN`, … (no constraint) → nothing | ccx has no connector element, and without a behaviour a connector is its constraint. Rotations live where ccx has them (a reference point's `ROT NODE`, knots on shell/beam nodes); exact in linear analyses, and under `NLGEOM` only where the linear form stays exact (a hinge to ground, a rigid link) — the rest commented out (`--approximate`: `[APPROX]`). On a node with a `*TRANSFORM` the rows are written in its local DOFs, as ccx reads them (a rotation on its `ROT NODE`, which gets the node's axes); commented out where the axes are undefined or the rotation lives on DOFs 4–6 of a transformed shell/beam or kinematic reference node, which ccx misreads. A `*CONNECTOR BEHAVIOR`, `SLOT`, `UNIVERSAL`, … are commented out |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
-| `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3. If the `REF NODE` has a `*TRANSFORM`, the `ROT NODE` gets its local axes (a rectangular `*TRANSFORM`), since Abaqus reads those BCs and moments in them, and the rotation ties of shell/beam members to it are written in those axes; where they are undefined (`REF NODE` on the cylinder axis, ...) the move is warned |
+| `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3. If the `REF NODE` has a `*TRANSFORM`, the `ROT NODE` gets its local axes (a rectangular `*TRANSFORM`), since Abaqus reads those BCs and moments in them, and the rotation ties of shell/beam members and connector constraints on it are written in those axes; where they are undefined (`REF NODE` on the cylinder axis, ...) the move is warned |
 | rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
 | `*DYNAMIC, EXPLICIT` with `CIRC` beams | maximum time increment set (4th data field) | ccx 2.23 sizes a circular-section beam's stable increment as if its section were the box around the circle and runs it at about 1.3× the limit (NaN displacements); the cap is ccx's own estimate with the square through the section's corner nodes, side d/√2; a fixed (`DIRECT`) increment above it is warned |
 | rotational BCs on `CIRC` beam nodes | knot beam per node | a BC on some of DOFs 4–6 (or a nonzero one) at a circular-section `B32` end node makes ccx 2.23 lock the node's other rotations too (a pinned beam with its twist held deflects 0.3 of beam theory); as a knot the node's BCs hold only the rotations they name |
@@ -583,7 +598,12 @@ converter warns about the ones it can detect; the rest are here so you know to c
   translations between mesh nodes or from a reference point to a mesh node; a hinge between
   two moving bodies is commented out (with `--approximate`
   it is written linear, `[APPROX]`: ccx 2.23 also solves `*EQUATION`s that link two rigid
-  bodies inaccurately under `NLGEOM`, about 1 % at 30°).
+  bodies inaccurately under `NLGEOM`, about 1 % at 30°). On nodes with a `*TRANSFORM` a
+  connector is commented out where it constrains a rotation that lives on a transformed
+  shell/beam or kinematic reference node's own DOFs 4–6 (ccx 2.23 misreads `*EQUATION`
+  terms there), where a node's local axes are undefined, and under `NLGEOM` between two
+  nodes with different transforms (ccx does not converge on an equation with several local
+  translations of one node).
 * `*DISTRIBUTION` / variable-angle-tow orientations: ccx 2.23 applies them per element
   only under `*SOLID SECTION`, so the converter splits shell and membrane sections into
   one plain `*ORIENTATION` and section per distinct direction (validated against the same
@@ -639,6 +659,8 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/connector_hinge_beams.inp`](examples/connector_hinge_beams.inp) | two-span beams joined by `CONN3D2` `HINGE` connectors about z → `*EQUATION`s on knots; in-plane released, out-of-plane transmitted |
 | [`examples/connector_hinge_bodies.inp`](examples/connector_hinge_bodies.inp) | two `*MPC BEAM` rigid bodies on `SPRING1`s joined by a `HINGE` (oblique axis, offset joint), a moment on a reference point, vs exact statics |
 | [`examples/connector_ground_hinge.inp`](examples/connector_ground_hinge.inp) | a rigid body hinged to ground (blank connector node) turned 138° under `NLGEOM` |
+| [`examples/connector_transform_plate.inp`](examples/connector_transform_plate.inp) | a rigid plate (`*RIGID BODY`) joined by `JOIN` connectors to a face with a cylindrical `*TRANSFORM` (axis in the x–y plane) and a `LINK` to a transformed node → equations in local DOFs, ordered as ccx needs |
+| [`examples/connector_transform_join.inp`](examples/connector_transform_join.inp) | two `C3D8` blocks joined face to face by `JOIN` connectors, one face with a rectangular `*TRANSFORM` → one equation per local DOF; `validate_with_ccx.py` also runs it under `NLGEOM` |
 | [`examples/equation_overconstraint.inp`](examples/equation_overconstraint.inp) | `*EQUATION` on a BC'd DOF (terms reordered), a duplicate and a loop of ties (dropped) |
 | [`examples/cook_membrane_traction.inp`](examples/cook_membrane_traction.inp) | Cook's membrane, `CPS8`, `*DSLOAD TRVEC` → consistent nodal forces, `*NGEN`/`*NFILL`/`*ELGEN` |
 | [`examples/beam_line_load_cantilever.inp`](examples/beam_line_load_cantilever.inp) | beam line loads `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and an upgraded `CIRC` beam → nodal forces |

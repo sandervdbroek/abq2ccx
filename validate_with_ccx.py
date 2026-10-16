@@ -22,7 +22,8 @@ for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads
 against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
 (local axes), which must match the same models without one, *MPC joints, levers and links
 against statics, connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
-theory and exact statics, velocity / acceleration boundary conditions against their
+theory and exact statics — also on nodes with a *TRANSFORM, against the same models without
+it (linear and NLGEOM) — velocity / acceleration boundary conditions against their
 time integral and the wave they send through a bar, field and history output requested at
 beam nodes (the .frd and .dat values against beam theory), and the field output Abaqus
 preselects: a bar in tension with only Abaqus/CAE's *Output, variable=PRESELECT requests,
@@ -1189,6 +1190,96 @@ def main():
               f"with a cylindrical one on its reference point): u at {len(u[1])} nodes differs from "
               f"the model in global components by {err:.1e} of max |u| ({scale:.4g})")
         failures += 0 if ok else 1
+
+    # --- connector elements on nodes with a *TRANSFORM ------------------------------------
+    # ccx, like Abaqus, reads *EQUATION terms and BCs on a transformed node in its local axes,
+    # so abq2ccx writes the connector rows there — a rotation on its rotation node, which gets
+    # the reference node's axes.  Each model must match the same model without the *TRANSFORM
+    # (its local loads in global components): a rigid plate joined to a face with a cylindrical
+    # transform, where ccx's own choice of eliminated DOFs fails in the plain order, and a LINK
+    # (linear); a JOIN to a transformed face (linear and NLGEOM); the HINGE between rigid bodies
+    # with a transform on either reference point; the hinge to ground under NLGEOM with one on
+    # its reference point.  Rows in global components (abq2ccx before this) miss by 7-76 % of
+    # max |u| — with no warning on the JOINs and on reference point 1 — or ccx stops.
+    def local_axes(typ, a, b, x):
+        """Abaqus' local axes of a rectangular / cylindrical *TRANSFORM at point ``x``,
+        computed independently of abq2ccx."""
+        if typ == "R":
+            e1, e3 = _unit(a), _unit(_cross(a, b))
+            return e1, _cross(e3, e1), e3
+        e3 = _unit([q - p for p, q in zip(a, b)])
+        r = [xi - ai for xi, ai in zip(x, a)]
+        e1 = _unit([ri - _dot(r, e3) * e for ri, e in zip(r, e3)])
+        return e1, _cross(e3, e1), e3
+
+    def with_transform(deck, node, typ, a, b, x):
+        """``deck`` with a *TRANSFORM on ``node`` (at ``x``) and its *CLOAD lines (forces and
+        moments) given in the local axes."""
+        ax = local_axes(typ, a, b, x)
+        head, cload = deck.split("*Cload\n", 1)
+        lines, rest = cload.split("*", 1)
+        keep, own = [], {}
+        for ln in lines.strip().splitlines():
+            n, d, v = (f.strip() for f in ln.split(","))
+            if n == str(node):
+                own[int(d)] = float(v)
+            else:
+                keep.append(ln)
+        for base in (0, 3):
+            g = [own.get(base + k + 1, 0.0) for k in range(3)]
+            if any(g):
+                keep += [f"{node}, {base + j + 1}, {_dot(g, e):.14g}" for j, e in enumerate(ax)]
+        card = (f"*Nset, nset=LOCAL\n{node}\n*Transform, nset=LOCAL, type={typ}\n"
+                + ", ".join(repr(float(v)) for v in list(a) + list(b)) + "\n")
+        return head.replace("*Step", card + "*Step", 1) + "*Cload\n" + "\n".join(keep) + "\n*" + rest
+
+    def same_as(label, text, twin):
+        """Run ``text`` and ``twin`` (the same model in global components) and compare every
+        printed displacement; 1 on failure."""
+        u, bad = [], ""
+        for i, t in enumerate((text, twin)):
+            src, inp = os.path.join(tmp, f"ct{i}_src.inp"), os.path.join(tmp, f"ct{i}.inp")
+            with open(src, "w") as fh:
+                fh.write(t)
+            convert(src, inp)
+            d, status, out = run_ccx(ccx, env, inp)
+            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            if status != "solved" and not bad:
+                bad = " / ".join([status] + [l.strip() for l in out.splitlines() if "ERROR" in l])
+            shutil.rmtree(d, ignore_errors=True)
+        if not u[0] or u[0].keys() != u[1].keys():
+            print(f"FAIL  {label}: no displacements to compare ({bad or 'different nodes printed'})")
+            return 1
+        scale = max(abs(x) for v in u[1].values() for x in v)
+        err = max(abs(p - q) for n in u[1] for p, q in zip(u[0][n], u[1][n])) / scale
+        ok = err <= 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes differs from the model "
+              f"without the *TRANSFORM by {err:.1e} of max |u| ({scale:.4g})")
+        return 0 if ok else 1
+    untransformed = lambda t: re.sub(r"(?mi)^\*Transform.*\n.*\n", "", t)  # noqa: E731
+    plate = open(os.path.join(EXAMPLES, "connector_transform_plate.inp")).read()
+    failures += same_as("connector_transform_plate (JOIN to a rigid plate on a cylindrically "
+                        "transformed face, LINK to a transformed node)", plate, untransformed(plate))
+    join = open(os.path.join(EXAMPLES, "connector_transform_join.inp")).read()
+    failures += same_as("connector_transform_join (JOIN to a transformed face)", join,
+                        untransformed(join))
+    nl_join = join.replace("*Step\n*Static\n", "*Step, nlgeom=YES\n*Static\n0.1, 1., 1e-6, 0.2\n") \
+        .replace("TIP, 1, 1.\nTIP, 2, -2.\nTIP, 3, 0.5", "TIP, 1, 40.\nTIP, 2, -80.\nTIP, 3, 20.")
+    failures += same_as("connector_transform_join, NLGEOM x40 (max |u| 2.8 on a unit block)",
+                        nl_join, untransformed(nl_join))
+    hinge = open(os.path.join(EXAMPLES, "connector_hinge_bodies.inp")).read().replace(
+        "*Node Print, nset=OUT", "*Node Print, nset=OUT, global=YES")
+    rect, cyl = ("R", (1., 2., 0.5), (-1., 0.3, 1.)), ("C", (0.3, -0.2, -0.4), (1.1, 0.9, 1.6))
+    failures += same_as("connector_hinge_bodies with a rectangular *TRANSFORM on reference point 1",
+                        with_transform(hinge, 1, *rect, (0., 0., 0.)), hinge)
+    failures += same_as("connector_hinge_bodies with a cylindrical *TRANSFORM on reference point 3 "
+                        "(its moment in the local axes)",
+                        with_transform(hinge, 3, *cyl, (0.2, 0.5, -0.1)), hinge)
+    ground = open(os.path.join(EXAMPLES, "connector_ground_hinge.inp")).read().replace(
+        "*Node Print, nset=OUT", "*Node Print, nset=OUT, global=YES")
+    failures += same_as("connector_ground_hinge, NLGEOM, with a rectangular *TRANSFORM on its "
+                        "reference point (moments in the local axes)",
+                        with_transform(ground, 3, *rect, (0.2, 0.5, -0.1)), ground)
 
     # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs ----------
     # A column pulled through a rigid reference point: the velocity ramps in by a SMOOTH

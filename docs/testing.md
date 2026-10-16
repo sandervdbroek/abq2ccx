@@ -11,9 +11,10 @@ The converter has three layers of tests:
    loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate across a later
    step's `*BOUNDARY, OP=NEW`, heated models with no initial temperatures, rigidly coupled
    models (a shell plate, and bars whose coupled nodes also carry BCs), the `*MPC`
-   conversions, connector elements, the loads applied as nodal forces, velocity /
-   acceleration BCs, field and history output requested at beam nodes, and the field output
-   Abaqus preselects (also in an explicit step without output requests) numerically.
+   conversions, connector elements (also on nodes with a `*TRANSFORM`), the loads applied
+   as nodal forces, velocity / acceleration BCs, field and history output requested at beam
+   nodes, and the field output Abaqus preselects (also in an explicit step without output
+   requests) numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -27,7 +28,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (261)
+## 1. Unit tests — `tests/test_convert.py` (270)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -272,13 +273,20 @@ conversion behaviour and referential integrity.
 | `test_connector_types_behaviour_and_free_types` | `CARTESIAN`/`CARDAN` without a behaviour are left out (no constraint); `SLOT` and a section with a `*CONNECTOR BEHAVIOR` are commented out with the reason and the element listed; an empty behaviour is ignored; a section on non-connector elements, or a connector on one node twice, is commented out |
 | `test_connector_nlgeom_exact_cases_only` | under `NLGEOM` a hinge between two moving reference points is commented out (`--approximate`: written, `[APPROX]`), a hinge to ground is kept — `*BOUNDARY` lines, or an equation among the `ROT NODE`'s own components for an oblique axis; a `JOIN` from a reference point to a mesh node is kept, eliminated on the mesh node either way round; a hinge between two solid nodes whose rotations live on new rotation nodes is commented out; with explicit dynamics a beam end's rotation cannot be constrained (no knots) and is commented out rather than dropped |
 | `test_connector_rotations_of_nodes_without_rotations` | a `HINGE` between a beam end and a coincident solid node keeps only the `JOIN` (the solid node's rotation is a connector-only unknown); with a moment on that node its rotation lives on a new rotation node, which the moment moves to |
-| `test_connector_examples` | the three connector examples convert with their equations, no `CONN3D2` element, no warnings and no dangling refs |
+| `test_connector_examples` | the five connector examples convert with their equations, no `CONN3D2` element, no warnings and no dangling refs |
 | `test_spherical_transform_becomes_a_rectangular_one_per_node` | a `TYPE=S` card is commented out and every node gets a rectangular `*TRANSFORM` whose `a`, `b` are its Abaqus spherical axes 1 and 2 (computed independently in the test: 1 radial from the centre, 2 = (b − a) × 1), nodes on one ray from the centre sharing a card; nodes on the polar axis get none, warned; a traction's forces on spherical nodes, turned back from those axes, are the global ones |
 | `test_several_transforms_on_a_node_warn` | a node in two `*TRANSFORM` cards with different data is warned (Abaqus does not allow it) and keeps the last card in ccx; the same data twice is a note |
 | `test_transform_turning_2d_nodes_out_of_the_plane_warns` | on `CPS4`, `CPE4`, `CAX4` and `T2D2` nodes a transform whose local 3-axis leaves the Z axis (tilted rectangular; a cylinder about an in-plane axis) is warned; local 3 along +z or −z, a cylinder about z, or any transform on 3-D nodes is not |
 | `test_rigid_body_rot_node_gets_the_reference_node_axes` | a `*RIGID BODY` reference node with a rectangular, cylindrical or spherical transform: its ROT NODE gets a rectangular `*TRANSFORM` with the reference node's local axes, the moved BC and moment lines are unchanged; on the cylinder axis the ROT NODE gets none and the move is warned, unless the BC holds all three rotations at zero |
 | `test_rotation_ties_to_a_transformed_rot_node_use_its_axes` | a `*RIGID BODY` on an `S4` edge whose reference node has a rectangular transform: the knotted members' rotation ties to the ROT NODE are written in its local axes (rotation x = −local 2, y = local 1, z = local 3); without the transform, the plain ties as before |
-| `test_rot_node_with_connector_rows_keeps_the_global_axes` | a hinge connector between two `*MPC BEAM` reference points, one with a `*TRANSFORM`: connector constraints are written in global components on its ROT NODE, so that ROT NODE gets no transform and a rotational BC moved onto it is warned |
+| `test_rot_node_with_connector_rows_gets_the_local_axes` | a hinge connector between two `*MPC BEAM` reference points, one with a `*TRANSFORM` (local 1 = y, 2 = −x): its ROT NODE gets the same axes and every row is in local DOFs (u_3x = −u_1,2, u_3y = u_1,1, …, likewise the rotations on the ROT NODE); a rotational BC moved there decides a hinge row (a `*BOUNDARY` on the other ROT NODE); no warning |
+| `test_connector_join_on_a_transformed_node_uses_its_local_dofs` | a `JOIN` from a cube corner to a node with a cylindrical transform: one equation per local DOF j of the transformed node (u_j = e_j · u_2, the axes computed in the test), each eliminating a DOF of the untransformed node; with that node held, `*BOUNDARY` lines on the transformed node's local DOFs |
+| `test_connector_link_on_a_transformed_node_uses_its_local_dofs` | the linearised `LINK` to a transformed node: its terms e · e_j in the local axes, the untransformed node's listed first |
+| `test_connector_refused_where_ccx_cannot_take_the_local_axes` | a connector on a node on its cylinder's axis is commented out (one reason, one warning); a hinge on a transformed beam end (its rotation on DOFs 4–6, which ccx misreads) is commented out and makes no knot — with the node's rotations held, only the `JOIN` is written |
+| `test_connector_between_differently_transformed_nodes_under_nlgeom` | a `JOIN` between two nodes with different transforms is written in a linear deck and commented out under `NLGEOM` (several local translations of one node per equation); with one transformed node it is written under `NLGEOM` too |
+| `test_connector_dependents_on_a_transformed_node_in_an_order_ccx_takes` | a `JOIN` from a rigid-body member to a node whose cylinder axis lies in the x–y plane eliminates the node's local DOFs, in an order in which ccx's rule (simulated in the test) finds a global DOF for each — the order 1, 2, 3 does not |
+| `test_settle_dependents_follows_ccx_on_a_transformed_node_with_a_bc` | a `LINK` between a fixed node and a transformed node with a BC on its local 3: the equation eliminates a free local DOF of the transformed node (ccx's BC takes another global DOF), without an overconstraint warning |
+| `test_connector_rotation_node_of_a_transformed_solid_node_gets_its_axes` | a hinge between a transformed solid node with a moment and a beam end: the node's rotation node gets the node's axes (a rectangular `*TRANSFORM`), the moment moves there; no warning |
 | `test_transform_spherical_rigid_example` | the example `validate_with_ccx.py` runs: nine spherical nodes on nine rays get nine rectangular cards, the reference point's ROT NODE a tenth; the moved rotational BC and moment; no warning, no dangling refs |
 | `test_amplitude_curve_definitions` | `amplitude_curve()` evaluates `TABULAR` (end values held), `SMOOTH STEP`, `EQUALLY SPACED`, `SCALEX`/`SCALEY` then `SHIFTX`/`SHIFTY`, `PERIODIC` (on `TOTAL TIME`) and `DECAY` (`VALUE=ABSOLUTE`) as Abaqus defines them; `USER` and descending times give None |
 | `test_integrate_history_is_exact_at_its_points` | a constant rate integrates to two exact points; the `SMOOTH STEP` velocity of the davidmorin decks to 0.95, exact at every point and within 1e-4 of the travel between them in under 40 points; an acceleration from a start value and rate exactly |
@@ -482,6 +490,26 @@ deck and runs it in CalculiX:
   exactly (0). The conversion before — `TYPE=S` passed through, which ccx reads as a
   rectangular system, and the ROT NODE without axes — runs without a message and misses by
   784 % of max |u|; the ROT NODE without its axes alone misses by 91 %.
+* **connectors on nodes with a `*TRANSFORM`** — ccx, like Abaqus, reads `*EQUATION` terms
+  and BCs on a transformed node in its local axes, so the converter writes the connector
+  rows there (a rotation on its rotation node, which gets the node's axes). Six models are
+  run against the same models without the transform (the transform cards removed, or local
+  loads turned back into global components with axes computed independently in the
+  script), every printed node within 1e-6 of max |u|: `connector_transform_plate` — a rigid
+  plate on a clamped block joined by nine `JOIN`s to a second block whose joined face has a
+  cylindrical transform with its axis in the x–y plane (the plate's translations are ccx's
+  dependents, so each equation eliminates a local DOF of the face node, and ccx's rule for
+  turning it into a global one stops at six of the nine nodes in the plain order), and a
+  `LINK` to a spring-supported node with a rectangular transform and a BC on its local 3;
+  `connector_transform_join` — two blocks joined face to face, one face with an oblique
+  rectangular transform, linear and under `NLGEOM` at 40 × the load (max |u| 2.8 on unit
+  blocks); `connector_hinge_bodies` with a rectangular transform on reference point 1 and,
+  separately, a cylindrical one on reference point 3 (its moment in the local axes); and
+  `connector_ground_hinge` under `NLGEOM` (138°) with a rectangular transform on its
+  reference point. All six agree exactly (0). Rows in global components — the converter
+  before — miss by 60 % / 50 % (the join, linear / `NLGEOM`), 7 % and 76 % (the hinge, on
+  point 1 without a warning) and 33 % (the ground hinge), and ccx stops on the plate
+  ('SPC in node 101 in transformed coordinates cannot be converted in MPC').
 * **`velocity_bc_column`** — a 1 × 1 × 4 elastic column whose top is tied to a reference
   point pulled by `*BOUNDARY, TYPE=VELOCITY` (velocity 1, ramped in by a `SMOOTH STEP` over
   0.001 of a 0.01 step — the pattern of the corpus' davidmorin decks), and a second step that
@@ -1274,6 +1302,47 @@ axis, where the local axes are undefined, so no ROT NODE gets a transform; only
 `idaholab_ringshear_mdpc` moves rotational BCs there (its containers' rotations about the
 axis), which is now warned. That warning is the only change: the other 1072 corpus files
 convert byte-identically.
+
+**Connectors on nodes with a `*TRANSFORM`.** The connector rows were written in global
+components, but ccx — like Abaqus, whose manual lists linear constraint equations among the
+uses of a nodal transformation — reads `*EQUATION` terms and BCs on a transformed node in its
+local axes, so a connector on such a node (a CAE reference point whose BCs use a datum
+system, a face with a cylindrical system) constrained the wrong directions without a
+message: 33–66 % of max |u| for a `JOIN` between two blocks, 7–98 % for a hinge between rigid
+bodies, 99–352 % for a linear `LINK`; a ROT NODE that carried connector rows was kept in
+global axes (BCs and moments moved onto it acted about those, with a warning). Each term is
+now written in the node's local DOFs (global component k = Σ_j e_j[k] × local DOF j) and a
+rotation in its rotation node's axes, which every ROT NODE — also a connector's rotation
+node of a solid node — gets from its node. Probed on 2.23, and read in the CalculiX sources
+(`equations.f`, `bounadd.f`):
+
+* only DOFs 1–3 of a transformed node are read locally: an `*EQUATION` term on DOF 4 is read
+  about the global axis, on DOFs 5 and 6 through an out-of-range read of the 3 × 3
+  transformation matrix (terms on the node's translations with undefined coefficients), and a
+  BC on DOFs 4–6 acts globally. A rotation on a transformed knot or kinematic reference node
+  cannot be constrained (rigidly tied beams miss by 50–75 % whichever way the terms are
+  written, or ccx stops), so such a connector is commented out — before, it ran 37–62 % off
+  without a message;
+* ccx turns an eliminated local DOF into a global one by its own rule — from the term's local
+  direction on, cyclically, the first component of 1e-5 or more not taken yet (for a BC: the
+  largest) — and stops when none is left ('SPC in node … in transformed coordinates cannot be
+  converted in MPC: all'), which some axes reach in one equation order and not in another. The
+  rows eliminate an untransformed DOF where they can, are ordered so ccx finds one for each
+  local DOF where they cannot, and `_settle_dependents` follows ccx's rule (in deck order,
+  BCs included) for every `*EQUATION`;
+* under `NLGEOM` ccx does not converge on an `*EQUATION` with several local translations of one
+  node, or drifts by 3–6e-5 of max |u|, while one per equation is exact (linear steps: both
+  exact; a ROT NODE's local DOFs: exact either way). The rows are reduced on the transformed
+  node's local translations (a `JOIN` is one equation per local DOF); a connector between two
+  differently transformed nodes is commented out under `NLGEOM`;
+* a `*RIGID BODY` (`BEAM`, `WELD`) and ccx's `*MPC BEAM` (a `LINK` under `NLGEOM`) are not
+  affected by a transform on their nodes.
+
+`validate_with_ccx.py` checks six such models against their transform-free twins (all exact).
+No corpus deck has a connector on a transformed node — the two connector decks have no
+`*TRANSFORM`, and the eight `*TRANSFORM` decks no connector (none of the 36 `*INCLUDE` files is
+in the corpus) — so all 1073 corpus files convert byte-identically and the gated counts do not
+change.
 
 **`*BOUNDARY, TYPE=VELOCITY / ACCELERATION`.** The converter used to drop `TYPE` and pass
 the value on as a displacement (a velocity of 100 over a 0.01 step became a displacement

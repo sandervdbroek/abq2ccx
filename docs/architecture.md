@@ -22,10 +22,12 @@ Converter._drop_surface_elements()   surface elements (SFM*) leave the registry;
                                      loads become nodal forces later
         │
         ▼
-Converter._prescan()   deck-wide facts the handlers need: node kinds, the connector plan
-                       (_plan_connectors), rigid bodies and their ROT NODEs, the *MPC plan
-                       (_plan_mpcs), knot beams (_plan_rigid_couplings), the connectors'
-                       constraint rows (_plan_connector_rows), the BCs on rigid-constraint
+Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANSFORM of each
+                       node (_transform_defs), the connector plan (_plan_connectors), rigid
+                       bodies and their ROT NODEs, the *MPC plan (_plan_mpcs), knot beams
+                       (_plan_rigid_couplings), the ROT NODEs' local axes (_plan_rot_axes),
+                       the connectors' constraint rows in the DOFs ccx reads, local on
+                       transformed nodes (_plan_connector_rows), the BCs on rigid-constraint
                        members their reference node imposes or, on a *RIGID BODY, takes over
                        (_plan_coupled_bcs), the velocity / acceleration BCs
                        (_plan_velocity_bcs), …; then _plan_distributions(),
@@ -41,7 +43,8 @@ emit_geometry()  +  emit_other()     Pass B: write nodes/elements/sets from the 
         │
         ▼
 Converter._settle_dependents()   choose each *EQUATION's eliminated (first) term against the
-                                 BCs and ccx's own dependents; drop redundant equations
+                                 BCs and ccx's own dependents — on a transformed node where ccx
+                                 can turn it into a global DOF; drop redundant equations
 Converter._audit_loads()     load audit: step_load_audit() on the Abaqus blocks and on the
                              output; a step loaded there but not here is warned
 ```

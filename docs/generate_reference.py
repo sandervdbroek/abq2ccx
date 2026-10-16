@@ -137,7 +137,11 @@ TRANSLATED = {
         "`OP=NEW`); `BEAM`, `WELD` → `*RIGID BODY` (with the `*MPC BEAM` bodies); `LINK` → as "
         "`*MPC LINK`; unconstrained types left out. Under `NLGEOM` only the forms that stay exact "
         "(`--approximate`: the rest written linear, `[APPROX]`); a behaviour, other types and "
-        "explicit-dynamics rotations on beam/shell nodes are commented out with the reason.",
+        "explicit-dynamics rotations on beam/shell nodes are commented out with the reason. On a "
+        "node with a `*TRANSFORM` the rows are in its local DOFs, as ccx reads them (a rotation on "
+        "its `ROT NODE`, which gets the node's axes); commented out where those axes are undefined "
+        "or a rotation lives on DOFs 4-6 of a transformed shell/beam or kinematic reference node "
+        "(ccx misreads them).",
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
         "(as Abaqus does unless `UNSORTED`); terms reordered so the eliminated (first) DOF has no "
         "BC and is not eliminated elsewhere; an equation that follows from the others and zero "
@@ -155,7 +159,8 @@ TRANSLATED = {
     "*RIGID BODY": "`PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node "
         "number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs "
         "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); a reference point with a "
-        "`*TRANSFORM` gives the `ROT NODE` its local axes (warned where they are undefined). "
+        "`*TRANSFORM` gives the `ROT NODE` its local axes (warned where they are undefined), in "
+        "which connector constraints on it are written too. "
         "Shell/membrane/beam/truss "
         "members get knot beams; the rotations of `TIE NSET`/`ELSET` shell/beam members are tied "
         "to the `ROT NODE`, `PIN NSET` ones stay free.",
