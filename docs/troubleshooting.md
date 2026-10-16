@@ -258,10 +258,21 @@ These are the silent ones — no error, wrong physics.
   cards with the procedure's preselected variables ccx has (U, RF and S, E in a static
   step, see the [output reference](output-reference.md)). A step without requests of its own
   gets the requests Abaqus carries over written again, with its own frequency: ccx would keep
-  the cards of the step before, at that step's frequency or time points. Not written: Abaqus' contact
-  output (`CSTRESS`, `CDISP`; add a `*CONTACT OUTPUT` request where you need it),
-  accelerations (`A`, which ccx 2.23's `*NODE FILE` rejects), concentrated forces (`CF`) and
-  the whole-model energies of the preselected history output.
+  the cards of the step before, at that step's frequency or time points. Its contact output
+  (`CSTRESS`, `CDISP`) becomes `*CONTACT FILE` where ccx 2.23 can write it: a model with a
+  `*CONTACT PAIR` that is not tied, unless a node-to-surface pair (the Abaqus default) is in
+  a model with axisymmetric elements — ccx 2.23 aborts writing it once `S` goes to the `.frd`
+  too — or with plane or membrane elements and no beam or shell — ccx writes it at nodes that
+  model's 2-D `.frd` lacks; a face-to-face pair (`TYPE=SURFACE TO SURFACE`) has it there too.
+  General contact and tied pairs become no ccx contact pair, so there is no contact output. Not written: accelerations (`A`, which ccx
+  2.23's `*NODE FILE` rejects), concentrated forces (`CF`) and the whole-model energies of
+  the preselected history output.
+* **ccx stops with SIGABRT right after writing contact output** (no message; the `.frd` ends
+  with a CONTACT and an ERROR block). ccx 2.23 does that in a model with axisymmetric
+  elements whose `.frd` gets both contact output (`*CONTACT FILE`) and `S` (which brings ccx's
+  stress error estimate along), unless every contact pair is `TYPE=SURFACE TO SURFACE`. The
+  converter drops such a contact request with a warning; added by hand, drop it again or
+  switch the pairs to face-to-face.
 * **NaN displacements in an explicit step with circular-section beams.** ccx 2.23 sizes a
   `CIRC` beam's stable increment as if its section were the box around the circle and runs
   it at about 1.3× the limit. The converter caps every automatic `*DYNAMIC, EXPLICIT`

@@ -239,7 +239,12 @@ TRANSLATED = {
         "a print card without a set gets a whole-model set (Abaqus prints everything, ccx "
         "nothing).",
     "*CONTACT OUTPUT / *CONTACT FILE": "→ `*CONTACT FILE`; `CDISP`/`CSTRESS` kept as ccx's "
-        "`CDIS`/`CSTR`, other Abaqus contact variables dropped (a card left empty is dropped).",
+        "`CDIS`/`CSTR`, other Abaqus contact variables dropped (a card left empty is dropped); "
+        "`VARIABLE=PRESELECT`/`ALL` → the procedure's preselected contact output (none in linear "
+        "perturbation steps; `PRESELECT` adds the variables named under it). "
+        "Dropped too where the ccx model has no contact pair (general contact, a tied pair → "
+        "`*TIE`), and where ccx 2.23 aborts on it: a model with axisymmetric elements whose "
+        "`.frd` also gets `S`, unless every pair is `SURFACE TO SURFACE`.",
     "Step data outside a *STEP": "`*CLOAD`, `*DLOAD`, output and procedure cards before the first "
         "step (or between steps) are commented — Abaqus rejects them and ccx 2.23 segfaults when "
         "the deck has no step.",
@@ -433,13 +438,28 @@ def gen_output():
              "explicit dynamics (there a `FREQUENCY` from ccx's stable increment, as ccx ignores "
              "`*TIME POINTS`). Abaqus' preselected history output, whole-model energies, has no "
              "ccx counterpart and is dropped.\n",
-             md_table(["Procedure", "`*NODE FILE`", "`*EL FILE`", "No ccx label for"],
+             "Its contact output (`CSTRESS`, `CDISP`), which Abaqus writes where the model has "
+             "contact, becomes `*CONTACT FILE` (CDIS and CSTR switch on the same CONTACT block in "
+             "ccx: opening, slip, pressure and shear at the slave nodes) where ccx 2.23 can write "
+             "it: a model with a `*CONTACT PAIR` that is not `TIED`. Left out, with a note: "
+             "general contact and tied pairs, which become no ccx contact pair (ccx would write an "
+             "empty block), and node-to-surface pairs (the Abaqus default) in a model with "
+             "axisymmetric elements — ccx 2.23 aborts writing their contact output once the `.frd` "
+             "also gets `S` — or with plane or membrane elements and no beam or shell — ccx writes "
+             "it at the nodes of their expanded 3-D form, which the 2-D `.frd` of such a model "
+             "lacks. Face-to-face pairs (`SURFACE TO SURFACE`) have it in every model; none of it "
+             "in linear perturbation steps (Abaqus preselects none there).\n",
+             md_table(["Procedure", "`*NODE FILE`", "`*EL FILE`", "`*CONTACT FILE`",
+                       "No ccx label for"],
                       [(f"`*{p}`" + (" (implicit)" if p == "DYNAMIC" else ""),
                         ", ".join(n) or "—", ", ".join(e) or "—",
+                        ", ".join(A.PRESELECT_CONTACT.get(p, ("", ()))[1]) or "—",
                         A.PRESELECT_NO_CCX.get(p, "—"))
                        for p, (n, e) in A.PRESELECT_FIELD.items()]
                       + [("`*DYNAMIC, EXPLICIT`", ", ".join(A.PRESELECT_FIELD["DYNAMIC"][0]),
-                          ", ".join(A.PRESELECT_FIELD["DYNAMIC"][1]), A.PRESELECT_NO_CCX["EXPLICIT"])])
+                          ", ".join(A.PRESELECT_FIELD["DYNAMIC"][1]),
+                          ", ".join(A.PRESELECT_CONTACT["EXPLICIT"][1]),
+                          A.PRESELECT_NO_CCX["EXPLICIT"])])
              + "\n"]
     return "\n".join(parts)
 

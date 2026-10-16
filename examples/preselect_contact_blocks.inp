@@ -1,0 +1,100 @@
+*Heading
+ Two steel blocks pressed together: Abaqus' preselected contact output
+** abq2ccx example: Abaqus' preselected field output includes the contact stresses and
+** displacements (CSTRESS, CDISP) in a static step of a model with contact; abq2ccx writes
+** them as *CONTACT FILE CDIS, CSTR next to *NODE FILE U, RF and *EL FILE S, E, where ccx
+** 2.23 can write them (here a face-to-face pair of solid elements).  Step 2 has no output
+** request and carries step 1's over (Abaqus), so it gets the same cards again.
+** Two 10 x 10 x 10 steel blocks (2 x 2 x 1 C3D8 each), the upper one resting on the lower
+** one through a frictionless surface-to-surface pair, on symmetry planes x = 0 and y = 0,
+** the lower one held at z = 0; a pressure on the top face presses them together: uniaxial
+** stress, so the contact pressure equals the applied one, 10 in step 1 and 20 in step 2.
+*Node
+  1, 0, 0, 0
+  2, 5, 0, 0
+  3, 10, 0, 0
+  4, 0, 5, 0
+  5, 5, 5, 0
+  6, 10, 5, 0
+  7, 0, 10, 0
+  8, 5, 10, 0
+  9, 10, 10, 0
+  10, 0, 0, 10
+  11, 5, 0, 10
+  12, 10, 0, 10
+  13, 0, 5, 10
+  14, 5, 5, 10
+  15, 10, 5, 10
+  16, 0, 10, 10
+  17, 5, 10, 10
+  18, 10, 10, 10
+  101, 0, 0, 10
+  102, 5, 0, 10
+  103, 10, 0, 10
+  104, 0, 5, 10
+  105, 5, 5, 10
+  106, 10, 5, 10
+  107, 0, 10, 10
+  108, 5, 10, 10
+  109, 10, 10, 10
+  110, 0, 0, 20
+  111, 5, 0, 20
+  112, 10, 0, 20
+  113, 0, 5, 20
+  114, 5, 5, 20
+  115, 10, 5, 20
+  116, 0, 10, 20
+  117, 5, 10, 20
+  118, 10, 10, 20
+*Element, type=C3D8, elset=LOWER
+  1, 1, 2, 5, 4, 10, 11, 14, 13
+  2, 2, 3, 6, 5, 11, 12, 15, 14
+  3, 4, 5, 8, 7, 13, 14, 17, 16
+  4, 5, 6, 9, 8, 14, 15, 18, 17
+*Element, type=C3D8, elset=UPPER
+  101, 101, 102, 105, 104, 110, 111, 114, 113
+  102, 102, 103, 106, 105, 111, 112, 115, 114
+  103, 104, 105, 108, 107, 113, 114, 117, 116
+  104, 105, 106, 109, 108, 114, 115, 118, 117
+*Nset, nset=BOTTOM
+  1, 2, 3, 4, 5, 6, 7, 8
+  9
+*Nset, nset=XSYM
+  1, 4, 7, 10, 13, 16, 101, 104
+  107, 110, 113, 116
+*Nset, nset=YSYM
+  1, 2, 3, 10, 11, 12, 101, 102
+  103, 110, 111, 112
+*Surface, type=ELEMENT, name=LOWER_TOP
+LOWER, S2
+*Surface, type=ELEMENT, name=UPPER_BOTTOM
+UPPER, S1
+*Surface, type=ELEMENT, name=UPPER_TOP
+UPPER, S2
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Solid Section, elset=LOWER, material=STEEL
+*Solid Section, elset=UPPER, material=STEEL
+*Surface Interaction, name=FRICTIONLESS
+1.,
+*Contact Pair, interaction=FRICTIONLESS, type=SURFACE TO SURFACE
+UPPER_BOTTOM, LOWER_TOP
+*Boundary
+BOTTOM, 3, 3
+XSYM, 1, 1
+YSYM, 2, 2
+*Step, name=Press, nlgeom=NO
+*Static
+0.5, 1.
+*Dsload
+UPPER_TOP, P, 10.
+*Output, field, variable=PRESELECT
+*Output, history, variable=PRESELECT
+*End Step
+*Step, name=Press harder, nlgeom=NO
+*Static
+0.5, 1.
+*Dsload
+UPPER_TOP, P, 20.
+*End Step

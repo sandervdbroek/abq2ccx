@@ -32,16 +32,18 @@ Dropped from `*EL FILE`/`*NODE FILE` (.frd): `CELS`, `ELKE`, `ELSE`, `EVOL`.
 
 Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the output database*, table 1) as the whole-model ccx cards it becomes. Abaqus also writes it for a step without any output database request (`*OUTPUT`) when none carries over from an earlier step (requests carry over to later steps; between perturbation steps only from the step before), so the converter adds it there; `*NODE PRINT`/`*EL PRINT`/`*NODE FILE`/`*EL FILE` are .dat/.fil requests and do not replace it. Carried-over requests are written again in such a step, at their own frequency and with its procedure's variables, as ccx would keep the earlier step's frequency. `PEEQ` only where a material yields or creeps (ccx warns on it otherwise); `VARIABLE=ALL` adds `ENER`. The frequency is the `*OUTPUT` card's, else Abaqus' default: every increment, every 10 in `*DYNAMIC`/`*MODAL DYNAMIC`, 20 intervals in explicit dynamics (there a `FREQUENCY` from ccx's stable increment, as ccx ignores `*TIME POINTS`). Abaqus' preselected history output, whole-model energies, has no ccx counterpart and is dropped.
 
-| Procedure | `*NODE FILE` | `*EL FILE` | No ccx label for |
-| --- | --- | --- | --- |
-| `*STATIC` | U, RF | S, E, PEEQ | CF, CSTRESS, CDISP |
-| `*VISCO` | U, RF | S, E, PEEQ | CF, CSTRESS, CDISP |
-| `*DYNAMIC` (implicit) | U, V, RF | S, E, PEEQ | A, CF, CSTRESS, CDISP |
-| `*MODAL DYNAMIC` | U, V, RF | S, E | A, CF |
-| `*STEADY STATE DYNAMICS` | U, RF | S, E | V, A, CF |
-| `*FREQUENCY` | U | — | — |
-| `*BUCKLE` | U | — | — |
-| `*COMPLEX FREQUENCY` | U | — | — |
-| `*HEAT TRANSFER` | NT, RFL | HFL | — |
-| `*COUPLED TEMPERATURE-DISPLACEMENT` | U, RF, NT, RFL | S, E, PEEQ, HFL | CF, CSTRESS, CDISP |
-| `*DYNAMIC, EXPLICIT` | U, V, RF | S, E, PEEQ | A, CSTRESS, EVF and the volume averages |
+Its contact output (`CSTRESS`, `CDISP`), which Abaqus writes where the model has contact, becomes `*CONTACT FILE` (CDIS and CSTR switch on the same CONTACT block in ccx: opening, slip, pressure and shear at the slave nodes) where ccx 2.23 can write it: a model with a `*CONTACT PAIR` that is not `TIED`. Left out, with a note: general contact and tied pairs, which become no ccx contact pair (ccx would write an empty block), and node-to-surface pairs (the Abaqus default) in a model with axisymmetric elements — ccx 2.23 aborts writing their contact output once the `.frd` also gets `S` — or with plane or membrane elements and no beam or shell — ccx writes it at the nodes of their expanded 3-D form, which the 2-D `.frd` of such a model lacks. Face-to-face pairs (`SURFACE TO SURFACE`) have it in every model; none of it in linear perturbation steps (Abaqus preselects none there).
+
+| Procedure | `*NODE FILE` | `*EL FILE` | `*CONTACT FILE` | No ccx label for |
+| --- | --- | --- | --- | --- |
+| `*STATIC` | U, RF | S, E, PEEQ | CDIS, CSTR | CF |
+| `*VISCO` | U, RF | S, E, PEEQ | CDIS, CSTR | CF |
+| `*DYNAMIC` (implicit) | U, V, RF | S, E, PEEQ | CDIS, CSTR | A, CF |
+| `*MODAL DYNAMIC` | U, V, RF | S, E | — | A, CF |
+| `*STEADY STATE DYNAMICS` | U, RF | S, E | — | V, A, CF |
+| `*FREQUENCY` | U | — | — | — |
+| `*BUCKLE` | U | — | — | — |
+| `*COMPLEX FREQUENCY` | U | — | — | — |
+| `*HEAT TRANSFER` | NT, RFL | HFL | — | — |
+| `*COUPLED TEMPERATURE-DISPLACEMENT` | U, RF, NT, RFL | S, E, PEEQ, HFL | CDIS, CSTR | CF |
+| `*DYNAMIC, EXPLICIT` | U, V, RF | S, E, PEEQ | CSTR | A, EVF and the volume averages |

@@ -149,7 +149,9 @@ regenerate the docs (below).
   add it to `CCX_ELEMENTS` (direct) or to `ELEMENT_TYPE_MAP` (substitution — keep the
   node count identical to the target, the test suite enforces this).
 * **Map or drop an output variable** → edit `ABQ_MAP_VARS` / `ABQ_DROP_VARS` /
-  `EL_PRINT_ONLY_VARS`; Abaqus' preselected field output per procedure is `PRESELECT_FIELD`.
+  `EL_PRINT_ONLY_VARS`; Abaqus' preselected field output per procedure is `PRESELECT_FIELD`,
+  its contact output `PRESELECT_CONTACT`, and where ccx cannot write contact output
+  `CONTACT_OUTPUT_ISSUES` (`Converter._contact_output_issues`).
 * **Give an unsupported keyword tailored guidance** → add an entry to
   `SPECIAL_UNSUPPORTED` (otherwise it gets a generic "no equivalent" comment).
 * **Drop an organisational keyword** → add it to `DROP_KEYWORDS` (or
@@ -267,8 +269,9 @@ rotational BCs and in an explicit dynamic step, planar beams' frequencies and bu
 loads against beam theory, a clamped beam and plate across a later step's
 `*BOUNDARY, OP=NEW`, the loads applied as consistent nodal forces (Cook's membrane,
 beam line loads, Lamé's cylinder, and tractions on nodes with a `*TRANSFORM` against the
-same models without one), and the field output Abaqus preselects (a bar in tension, and an
-explicit bar impact without output requests against wave theory). It skips cleanly if no
+same models without one), and the field output Abaqus preselects (a bar in tension, an
+explicit bar impact without output requests against wave theory, and the contact pressure
+of two blocks pressed together). It skips cleanly if no
 `ccx` is found.
 
 There is also a **corpus** of 1022 genuine Abaqus decks (`corpus/manifest.py`) fetched on

@@ -2141,14 +2141,139 @@ def test_el_print_unknown_labels_dropped():
     assert len(prints) == 1 and "*EL PRINT, ELSET=EALL\nS\n" in body + "\n"
 
 
+def _contact(pair="", mesh=None, faces=("S1", "S2")):
+    """A model with a contact pair between two faces of its element(s)."""
+    return ((mesh or HEX) + f"*Surface, name=A\nEALL, {faces[0]}\n*Surface, name=B\nEALL, {faces[1]}\n"
+            f"*Surface interaction, name=SI\n*Contact pair, interaction=SI{pair}\nA, B\n")
+
+
+QUAD = "*NODE\n1, 0.,0.\n2, 1.,0.\n3, 1.,1.\n4, 0.,1.\n*ELEMENT, TYPE={}, ELSET=EALL\n1, 1,2,3,4\n"
+
+
 def test_contact_output_maps_to_ccx_labels():
-    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Contact Output\nCDISP, CSTRESS, CFORCE\n"
-                             "*End Step\n")
+    body, _, _ = convert_str(_contact() + "*Step\n*Static\n*Output, field\n*Contact Output\nCDISP, "
+                             "CSTRESS, CFORCE\n*End Step\n")
     assert "*CONTACT FILE\nCDIS, CSTR" in body
-    # names ccx does not know itself are dropped, not folded onto CSTR: switching contact
-    # output on that way made ccx 2.23 abort on a deck that solves without it
-    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Contact Output\nCPRESS\n*End Step\n")
+    # names ccx does not know itself are dropped, not folded onto CSTR
+    body, _, _ = convert_str(_contact() + "*Step\n*Static\n*Output, field\n*Contact Output\nCPRESS\n"
+                             "*End Step\n")
     assert "*CONTACT FILE" not in body
+
+
+def test_contact_output_requests_ccx_cannot_write():
+    # ccx writes contact output only for *CONTACT PAIR contact (a model without one gets an
+    # empty block), and 2.23 aborts on it in a model with axisymmetric elements once the .frd
+    # gets S too (its stress error estimate comes with S) — unless every pair is face-to-face;
+    # node-to-surface contact of plane / axisymmetric elements lands on the nodes of their
+    # expanded 3-D form, which the 2-D .frd lacks (probed)
+    req = "*Output, field\n*Node Output\nU\n*Element Output\nS\n*Contact Output\nCSTRESS\n"
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n" + req + "*End Step\n")
+    assert "*CONTACT FILE" not in body and "*EL FILE\nS\n" in body
+    assert "*CONTACT OUTPUT dropped: the ccx model has no contact pair" in rep.text()
+    body, _, rep = convert_str(HEX + "*Surface, name=A\nEALL, S1\n*Surface, name=B\nEALL, S2\n"
+                               "*Contact pair, interaction=SI, tied\nA, B\n*Step\n*Static\n" + req +
+                               "*End Step\n")
+    assert "*TIE" in body and "*CONTACT FILE" not in body
+    axi = QUAD.format("CAX4")
+    body, _, rep = convert_str(_contact(mesh=axi, faces=("S1", "S3")) + "*Step\n*Static\n" + req +
+                               "*End Step\n")
+    assert "*CONTACT FILE" not in body
+    assert ("*CONTACT OUTPUT dropped: ccx 2.23 aborts writing contact output in a model with "
+            "axisymmetric elements") in rep.text()
+    body, _, rep = convert_str(_contact(mesh=axi, faces=("S1", "S3")) + "*Step\n*Static\n" +
+                               req.replace("*Element Output\nS\n", "") + "*End Step\n")
+    assert "*CONTACT FILE\nCSTR\n" in body and "expanded 3-D form" in rep.text()
+    body, _, rep = convert_str(_contact(", type=SURFACE TO SURFACE", axi, ("S1", "S3")) +
+                               "*Step\n*Static\n" + req + "*End Step\n")
+    assert "*CONTACT FILE\nCSTR\n" in body and "*CONTACT OUTPUT" not in rep.text()
+    body, _, rep = convert_str(_contact(mesh=QUAD.format("CPE4"), faces=("S1", "S3")) +
+                               "*Step\n*Static\n" + req + "*End Step\n")
+    assert "*CONTACT FILE\nCSTR\n" in body
+    assert "*CONTACT OUTPUT: ccx writes node-to-surface contact output of plane" in rep.text()
+
+
+def test_preselect_contact_output():
+    # Abaqus' preselected field output has the contact stresses and displacements (CSTRESS,
+    # CDISP) in general static, quasi-static, implicit dynamic and coupled temperature-
+    # displacement steps of a model with contact, CSTRESS in explicit dynamics (table 1):
+    # *CONTACT FILE beside the *NODE FILE / *EL FILE cards (CDIS and CSTR switch on the same
+    # CONTACT block in ccx); node-to-surface pairs (Abaqus' default) of solid elements too
+    sts = ", type=SURFACE TO SURFACE"
+    cases = {"*Static\n": "*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n",
+             "*Visco, cetol=1.e-3\n0.1, 1.\n": "*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n",
+             "*Dynamic\n0.01, 1.\n": "*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n",
+             "*Coupled Temperature-displacement\n0.1, 1.\n":
+                 "*EL FILE\nS, E, HFL\n*CONTACT FILE\nCDIS, CSTR\n",
+             "*Dynamic, Explicit\n, 1.e-4\n": "*EL FILE\nS, E\n*CONTACT FILE\nCSTR\n"}
+    for proc, cards in cases.items():
+        for pair in (sts, ""):
+            body, _, rep = convert_str(_contact(pair) + STEEL + "*Step\n" + proc + PRESELECT +
+                                       "*End Step\n")
+            assert cards in _step(body, 1), (proc, pair, _step(body, 1))
+            assert "*CONTACT FILE " in rep.text() and "CSTRESS" not in rep.text(), proc
+    # none in linear perturbation steps; the default output of a step without requests and
+    # the carried one have it
+    body, _, _ = convert_str(_contact(sts) + "*Step\n*Static\n" + PRESELECT + "*End Step\n"
+                             "*Step, perturbation\n*Static\n" + PRESELECT + "*End Step\n"
+                             "*Step, perturbation\n*Frequency\n3\n" + PRESELECT + "*End Step\n")
+    assert "*CONTACT FILE" in _step(body, 1)
+    assert "*CONTACT FILE" not in _step(body, 2) + _step(body, 3)
+    body, _, rep = convert_str(_contact(sts) + "*Step\n*Static\n*End Step\n*Step\n*Static\n"
+                               "*End Step\n")
+    assert _step(body, 1).endswith("*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n")
+    assert _step(body, 2).endswith("*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n")
+    # a model without contact: Abaqus writes no contact output, so the notes do not miss it
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n" + PRESELECT + "*End Step\n")
+    assert "*CONTACT FILE" not in body and "(no ccx label for CF)." in rep.text()
+    assert "CSTRESS" not in rep.text()
+
+
+def test_preselect_contact_output_left_out_where_ccx_cannot_write_it():
+    # Abaqus contact ccx has no contact pair for — a tied pair (a *TIE in ccx), general
+    # contact (not converted) — and node-to-surface pairs of plane and axisymmetric elements
+    # (ccx 2.23 aborts on their contact output in an axisymmetric model; in a plane one it
+    # lands on nodes the 2-D .frd lacks): no *CONTACT FILE, a note why
+    deck = "*Step\n*Static\n" + PRESELECT + "*End Step\n"
+    no_pair = "CSTRESS, CDISP left out: the ccx model has no contact pair"
+    body, _, rep = convert_str(HEX + "*Surface, name=A\nEALL, S1\n*Surface, name=B\nEALL, S2\n"
+                               "*Contact pair, interaction=SI, tied\nA, B\n" + deck)
+    assert "*TIE" in body and "*CONTACT FILE" not in body and no_pair in rep.text()
+    body, _, rep = convert_str(HEX + "*Contact\n*Contact Inclusions, all exterior\n" +
+                               deck.replace("*Static", "*Dynamic, Explicit\n, 1.e-4"))
+    assert "*CONTACT FILE" not in body and "CSTRESS left out: the ccx model has no contact" in rep.text()
+    for elem in ("CAX4", "CPE4", "CPS4", "M3D4"):
+        body, _, rep = convert_str(_contact(mesh=QUAD.format(elem), faces=("S1", "S3")) + deck)
+        assert "*CONTACT FILE" not in body, elem
+        assert ("ccx 2.23 aborts" if elem == "CAX4" else "expanded 3-D form") in rep.text(), elem
+        body, _, rep = convert_str(_contact(", type=SURFACE TO SURFACE", QUAD.format(elem),
+                                            ("S1", "S3")) + deck)
+        assert "*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n" in _step(body, 1), elem
+    # a beam makes ccx write the .frd in 3-D, expanded nodes included: plane elements then
+    # have it, axisymmetric ones still not
+    beam = "*NODE\n9, 5.,0.\n10, 6.,0.\n*ELEMENT, TYPE=B31, ELSET=BEAM\n9, 9, 10\n"
+    for elem, ok in (("CPE4", True), ("CAX4", False)):
+        body, _, rep = convert_str(_contact(mesh=QUAD.format(elem) + beam, faces=("S1", "S3")) + deck)
+        assert ("*CONTACT FILE\nCDIS, CSTR\n" in body) == ok, elem
+
+
+def test_contact_output_variable_preselect():
+    # a field *CONTACT OUTPUT, VARIABLE=PRESELECT / ALL: the contact variables Abaqus
+    # preselects for the procedure (none in a linear perturbation step) plus the ones named
+    req = "*Output, field\n*Contact Output, variable={}\n"
+    for proc, var, card in (("*Static\n", "PRESELECT", "*CONTACT FILE\nCDIS, CSTR\n"),
+                            ("*Dynamic, Explicit\n, 1.e-4\n", "ALL", "*CONTACT FILE, FREQUENCY=56\nCSTR\n")):
+        body, _, rep = convert_str(_contact() + STEEL + "*Step\n" + proc + req.format(var) +
+                                   "*End Step\n")
+        assert card in body and "parameter VARIABLE dropped" not in rep.text(), proc
+    body, _, rep = convert_str(_contact() + "*Step\n*Static\n*End Step\n*Step, perturbation\n"
+                               "*Frequency\n3\n" + req.format("PRESELECT") + "*End Step\n")
+    assert "*CONTACT FILE" not in _step(body, 2)
+    assert "*CONTACT OUTPUT, VARIABLE=PRESELECT in a *FREQUENCY step: Abaqus preselects" in rep.text()
+    # a request carried into a later step that ccx cannot write (no contact pair) is not
+    # announced as written again
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n*Output, field\n*Contact Output\n*End Step\n"
+                               "*Step\n*Static\n*End Step\n")
+    assert "*CONTACT FILE" not in body and "their cards written again" not in rep.text()
 
 
 OUT_BEAM = ("*Node\n1, 0., 0., 0.\n7, 60., 0., 0.\n*Ngen, nset=AXIS\n1, 7, 1\n*Nset, nset=TIP\n7\n"
@@ -2452,6 +2577,11 @@ def test_preselect_output_examples():
     assert not dangling_refs(reparse(body))
     body, _, _ = convert(os.path.join(EXAMPLES, "explicit_default_output_bar.inp"))
     assert _step(body, 1).endswith("*NODE FILE, FREQUENCY=4\nU, V, RF\n*EL FILE\nS, E\n")
+    assert not dangling_refs(reparse(body))
+    # two blocks pressed together: the contact output in step 1 and, carried, in step 2
+    body, _, _ = convert(os.path.join(EXAMPLES, "preselect_contact_blocks.inp"))
+    for k in (1, 2):
+        assert _step(body, k).endswith("*NODE FILE\nU, RF\n*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n")
     assert not dangling_refs(reparse(body))
 
 

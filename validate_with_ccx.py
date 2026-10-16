@@ -1449,6 +1449,33 @@ def main():
               f"off), {last:+.6f} at 2 L / c (0)")
         failures += 0 if ok else 1
 
+    # Abaqus' preselected contact output: two steel blocks pressed together through a
+    # frictionless face-to-face pair, on symmetry planes (uniaxial stress), with the CAE
+    # requests in step 1 and none in step 2, which carries them over.  ccx gets *CONTACT FILE
+    # CDIS, CSTR in both steps; the contact pressure at the upper block's nine bottom nodes
+    # must be the applied pressure, 10 and then 20, and zero everywhere else.
+    inp = os.path.join(tmp, "preselect_contact_blocks.inp")
+    convert(os.path.join(EXAMPLES, "preselect_contact_blocks.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    cont = frd_blocks(os.path.join(d, "job.frd"), "CONTACT")
+    shutil.rmtree(d, ignore_errors=True)
+    ends = [vals for t, vals in cont if min(abs(t - 1.0), abs(t - 2.0)) < 1e-9]
+    pressed = [{n: v for n, v in vals.items() if any(v)} for vals in ends]
+    if status != "solved" or len(cont) != 4 or len(ends) != 2 or not all(pressed):
+        print(f"FAIL  preselect_contact_blocks: {status}, {len(cont)} CONTACT blocks (expected 4, "
+              f"two increments in each step), {[len(p) for p in pressed]} nodes in contact at the "
+              f"ends of the steps (expected 9 each)")
+        failures += 1
+    else:
+        cpress = [[v[3] for v in p.values()] for p in pressed]
+        worst = max(abs(x / ref - 1) for ref, xs in zip((10.0, 20.0), cpress) for x in xs)
+        ok = all(set(p) == set(range(101, 110)) for p in pressed) and worst < 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  preselect_contact_blocks (*Output, field, "
+              f"variable=PRESELECT with *CONTACT PAIR): .frd CPRESS at the {len(pressed[0])} slave "
+              f"nodes {min(cpress[0]):.4f}...{max(cpress[0]):.4f} (10), then {min(cpress[1]):.4f}..."
+              f"{max(cpress[1]):.4f} (20) in the carried step; worst {worst * 100:.3f}% off")
+        failures += 0 if ok else 1
+
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")

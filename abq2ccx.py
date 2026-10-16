@@ -1498,12 +1498,35 @@ CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", 
                    "SVF", "DEPF", "DTF", "ECD", "EMFE", "EMFB", "PCON", "SNEG", "SMID", "SPOS",
                    "KEQ", "THE"}
 # *CONTACT OUTPUT / *CONTACT FILE: ccx writes CDIS (opening/slip), CSTR (pressure/shear)
-# and CELS (contact energy).  Only Abaqus names ccx itself recognises by their first four
-# characters (CDISP, CSTRESS) are kept: folding CPRESS/COPEN/... onto CSTR/CDIS as well
-# would switch contact output on for decks where ccx 2.23 then aborts while writing it
-# (verified on an axisymmetric node-to-surface model that solves without it).
+# and CELS (contact energy); CDIS and CSTR switch on the same CONTACT block, all of COPEN,
+# CSLIP1/2, CPRESS and CSHEAR1/2 (probed on 2.23).  Only Abaqus names ccx itself recognises
+# by their first four characters (CDISP, CSTRESS) are kept; CPRESS, COPEN, ... are dropped,
+# not folded onto them.  Where ccx 2.23 has no contact output to write or aborts on it, see
+# CONTACT_OUTPUT_ISSUES.
 CCX_CONTACT_FILE_LABELS = {"CDIS", "CSTR", "CELS", "PCON"}
 ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
+# Contact output (*CONTACT FILE CDIS/CSTR) ccx 2.23 cannot write, probed on a block pressed
+# onto another (plane strain/stress, axisymmetric and 3-D solid elements of every order and
+# shape, a shell and a membrane plate; static, NLGEOM, *VISCO, implicit and explicit
+# dynamics, coupled temperature-displacement, and the steps after them; ccx's own implicit-
+# dynamics contact decks): ccx writes it only for *CONTACT PAIR contact, an empty block
+# without one; in a model with axisymmetric elements it aborts (SIGABRT, after the CONTACT
+# block) once S output adds its stress error estimate to the .frd, unless every pair is
+# face-to-face — with node-to-surface pairs and without pairs, whatever the procedure,
+# OUTPUT=3D or contact state; and it writes node-to-surface contact of plane, axisymmetric
+# and membrane elements at the slave nodes of their expanded 3-D form, which the .frd of a
+# model without beams or shells (CCX_FRD_3D_TRIGGER) does not hold.  Everywhere else the
+# values land on nodes of the .frd (the deck's own, or expanded ones of a 3-D .frd).
+CONTACT_OUTPUT_ISSUES = {
+    "nopair": "the ccx model has no contact pair (Abaqus general contact is not converted, a "
+              "tied pair becomes a *TIE), so ccx has no contact output to write",
+    "abort": "ccx 2.23 aborts writing contact output in a model with axisymmetric elements "
+             "once the .frd also gets S, unless every contact pair is face-to-face "
+             "(TYPE=SURFACE TO SURFACE)",
+    "expanded": "ccx writes node-to-surface contact output of plane, axisymmetric and membrane "
+                "elements at the slave nodes of their expanded 3-D form, which the .frd of a "
+                "model without beams or shells does not hold",
+}
 # Which nodes a ccx 2.23 .frd holds (probed): a model with a beam (B...) or shell (S3, S4,
 # S6, S8...) element is written in its expanded 3-D form — ccx's default OUTPUT=3D then
 # (elements.f) — and the .frd has the expanded nodes only, none of the original nodes of a
@@ -1542,12 +1565,21 @@ PRESELECT_FIELD = {
     "HEAT TRANSFER": (("NT", "RFL"), ("HFL",)),
     "COUPLED TEMPERATURE-DISPLACEMENT": (("U", "RF", "NT", "RFL"), ("S", "E", "PEEQ", "HFL")),
 }
-# What of it has no ccx label (A, CF, contact, the explicit volume averages).
+# What of it has no ccx label (A, CF, the explicit volume averages).
 PRESELECT_NO_CCX = {
-    "STATIC": "CF, CSTRESS, CDISP", "VISCO": "CF, CSTRESS, CDISP",
-    "DYNAMIC": "A, CF, CSTRESS, CDISP", "EXPLICIT": "A, CSTRESS, EVF and the volume averages",
+    "STATIC": "CF", "VISCO": "CF", "DYNAMIC": "A, CF",
+    "EXPLICIT": "A, EVF and the volume averages",
     "MODAL DYNAMIC": "A, CF", "STEADY STATE DYNAMICS": "V, A, CF",
-    "COUPLED TEMPERATURE-DISPLACEMENT": "CF, CSTRESS, CDISP",
+    "COUPLED TEMPERATURE-DISPLACEMENT": "CF",
+}
+# Its contact output, which Abaqus writes where the model has contact: (Abaqus variables,
+# ccx *CONTACT FILE labels) — CSTRESS and CDISP in general static, quasi-static, implicit
+# dynamic and coupled temperature-displacement steps, CSTRESS alone in explicit dynamics,
+# none in linear perturbation steps.  Written where ccx can (CONTACT_OUTPUT_ISSUES).
+PRESELECT_CONTACT = {
+    "STATIC": ("CSTRESS, CDISP", ("CDIS", "CSTR")), "VISCO": ("CSTRESS, CDISP", ("CDIS", "CSTR")),
+    "DYNAMIC": ("CSTRESS, CDISP", ("CDIS", "CSTR")), "EXPLICIT": ("CSTRESS", ("CSTR",)),
+    "COUPLED TEMPERATURE-DISPLACEMENT": ("CSTRESS, CDISP", ("CDIS", "CSTR")),
 }
 # Abaqus' linear perturbation procedures: output requests carry over only between
 # consecutive perturbation steps, and those of general steps skip them.
@@ -2401,6 +2433,7 @@ class Converter:
         self._out_ctl_now: Tuple[str, str] = ("FREQUENCY", "1")   # the one ccx has in force
         self._out_ctl_step = 0                     # last step whose first output card is out
         self._out_tp_cards: List[str] = []         # *TIME POINTS to emit before the first *STEP
+        self._out_contact = {"abaqus": False, "pairs": 0, "nts": False, "flat": False, "axi": False}
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
@@ -6459,6 +6492,16 @@ class Converter:
             elif types[typ].startswith(CCX_EXPANDED_PREFIXES):
                 flat_nodes.update(conn)
         self._out_yields = self._yielding_materials(blocks)
+        pairs = [b for b in blocks if b.keyword == "CONTACT PAIR" and not b.has("TIED")]
+        self._out_contact = {           # the contact ccx gets (_contact_output_issues)
+            "abaqus": any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks),
+            "pairs": len(pairs),
+            "nts": any((b.param("TYPE") or "").upper().replace(" ", "") != "SURFACETOSURFACE"
+                       for b in pairs),
+            # elements whose expanded nodes only a 3-D .frd (a beam or shell model) holds
+            "flat": not frd3d and any(c.startswith(PLANE_ELEM_PREFIXES + ("M3D",))
+                                      for c in types.values()),
+            "axi": any(c.startswith("CAX") for c in types.values())}
         self._courant = None                    # (min h f / c, element), see _courant_min
         steps: List[Tuple[int, dict, List[dict]]] = []
         # The field output requests Abaqus keeps for a later step without requests of its
@@ -6482,6 +6525,7 @@ class Converter:
                     timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
                     timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
                 pert = timing["proc"] in PERTURBATION_PROCS or blocks[i].has("PERTURBATION")
+                timing["pert"] = pert
                 ctx, reqs, odb, add, own = None, [], False, False, []
                 for x in inner:
                     if x.keyword == "OUTPUT":
@@ -6536,6 +6580,7 @@ class Converter:
                 steps.append((k, timing, reqs))
                 i = j
             i += 1
+        self._contact_requests_checked(steps)
         # one .frd node set per variable and step: the whole model before a set, several
         # sets joined into one
         unions: Dict[Tuple[str, ...], str] = {}
@@ -6634,6 +6679,9 @@ class Converter:
             r["notes"].append(f"*{b.keyword} with {ctl[1]}=0 dropped (output suppressed)." if ctx is None
                               else f"*OUTPUT with {ctl[1]}=0: Abaqus writes none of its requests; "
                                    f"*{b.keyword} dropped.")
+        if r["live"] and cc == "CONTACT FILE" and not self._out_contact["pairs"]:
+            r["live"] = False               # see _contact_requests_checked
+            r["notes"].append(f"*{b.keyword} dropped: {CONTACT_OUTPUT_ISSUES['nopair']}.")
         if r["live"] and cc in ("NODE PRINT", "EL PRINT") and sub:
             kind, key = ("node", "NSET") if cc == "NODE PRINT" else ("element", "ELSET")
             name = params[key].strip().upper()
@@ -6657,6 +6705,35 @@ class Converter:
         return any((b.keyword == "PLASTIC" and self._plastic_kept(b)) or b.keyword == "CREEP"
                    for b in blocks)
 
+    def _contact_output_issues(self) -> List[str]:
+        """Why ccx 2.23 cannot write the model's contact output, as CONTACT_OUTPUT_ISSUES
+        keys, the most telling first: no ccx contact pair; the abort in a model with
+        axisymmetric elements (unless every pair is face-to-face); node-to-surface contact of
+        plane, axisymmetric or membrane elements, written at nodes the .frd does not hold."""
+        c = self._out_contact
+        issues = [] if c["pairs"] else ["nopair"]
+        if c["axi"] and (c["nts"] or not c["pairs"]):
+            issues.append("abort")
+        if c["flat"] and c["nts"]:
+            issues.append("expanded")
+        return issues
+
+    def _contact_requests_checked(self, steps: List[Tuple[int, dict, List[dict]]]) -> None:
+        """The deck's own contact output requests against _contact_output_issues (Abaqus'
+        preselected contact output is planned only where ccx writes it; a request in a model
+        without a ccx contact pair is dropped when it is made, _output_request): dropped where
+        ccx 2.23 would abort — a model with axisymmetric elements that writes S to the .frd
+        as well —, noted where ccx writes them at nodes the .frd does not hold."""
+        issues = self._contact_output_issues()
+        reqs = [r for _k, _t, step in steps for r in step if r["live"]]
+        stress = any(r["cc"] == "EL FILE" and "S" in r["labels"] for r in reqs)
+        for r in (r for r in reqs if r["cc"] == "CONTACT FILE"):
+            if "abort" in issues and stress:
+                r["live"] = False
+                r["warnings"].append(f"*{r['b'].keyword} dropped: {CONTACT_OUTPUT_ISSUES['abort']}.")
+            elif "expanded" in issues:
+                r["notes"].append(f"*{r['b'].keyword}: {CONTACT_OUTPUT_ISSUES['expanded']}.")
+
     def _preselect_labels(self, proc: Optional[str], var: str) -> Tuple[List[str], List[str]]:
         """(*NODE FILE labels, *EL FILE labels) of Abaqus' preselected field output in a
         ``proc`` step (PRESELECT_FIELD); VARIABLE=ALL adds the strain energy density (not
@@ -6670,22 +6747,30 @@ class Converter:
 
     def _preselect_requests(self, anchor: Block, ctx: Block, timing: dict, var: str,
                             quiet: "Report", k: int, why: str = "") -> List[dict]:
-        """The whole-model *NODE FILE / *EL FILE requests of Abaqus' preselected field output
-        (``var`` PRESELECT or ALL) for step ``k``, under *OUTPUT ``ctx`` (its frequency
-        applies), written where ``anchor`` stands: the *OUTPUT card, or the *STEP of a step
-        without output database requests (``why``): 'default', the output Abaqus writes
-        then, or 'carried', an earlier step's preselected request, whose variables change
-        with the procedure."""
+        """The whole-model *NODE FILE / *EL FILE / *CONTACT FILE requests of Abaqus'
+        preselected field output (``var`` PRESELECT or ALL) for step ``k``, under *OUTPUT
+        ``ctx`` (its frequency applies), written where ``anchor`` stands: the *OUTPUT card, or
+        the *STEP of a step without output database requests (``why``): 'default', the
+        output Abaqus writes then, or 'carried', an earlier step's preselected request, whose
+        variables change with the procedure.  Its contact output (PRESELECT_CONTACT) only
+        where ccx writes it for the model (_contact_output_issues)."""
         node, elem = self._preselect_labels(timing["proc"], var)
+        key = "EXPLICIT" if timing["kind"] == "explicit" else timing["proc"]
+        abq_contact, contact = self._preselect_contact(timing)
+        issues = self._contact_output_issues() if contact else []
+        if issues:
+            contact = ()
         reqs = []
-        for kw, labels in (("NODE OUTPUT", node), ("ELEMENT OUTPUT", elem)):
+        for kw, labels in (("NODE OUTPUT", node), ("ELEMENT OUTPUT", elem),
+                           ("CONTACT OUTPUT", contact)):
             if labels:
                 r = self._output_request(mkblock(kw, None, [", ".join(labels)]), ctx, timing, quiet)
                 r["anchor"] = anchor
                 reqs.append(r)
         proc = f"*{timing['proc']}" if timing["proc"] else "an unknown"
         cards = " and ".join(f"*{cc} {', '.join(labels)}" for cc, labels in
-                             (("NODE FILE", node), ("EL FILE", elem)) if labels)
+                             (("NODE FILE", node), ("EL FILE", elem), ("CONTACT FILE", contact))
+                             if labels)
         if not reqs:
             if not why:
                 self._out_notes.setdefault(id(anchor), []).append(
@@ -6698,9 +6783,10 @@ class Converter:
             reqs[0]["notes"].append(f"*OUTPUT, FIELD, VARIABLE={var} with {reqs[0]['ctl'][1]}=0: "
                                     f"Abaqus writes none of it; nothing written.")
             return reqs
-        lost = PRESELECT_NO_CCX.get("EXPLICIT" if timing["kind"] == "explicit" else
-                                    timing["proc"], "")
-        lost = f" (no ccx label for {lost})" if lost else ""
+        lost = [f"no ccx label for {PRESELECT_NO_CCX[key]}"] if PRESELECT_NO_CCX.get(key or "") else []
+        if issues and (issues[0] != "nopair" or self._out_contact["abaqus"]):
+            lost.append(f"{abq_contact} left out: {CONTACT_OUTPUT_ISSUES[issues[0]]}")
+        lost = f" ({'; '.join(lost)})" if lost else ""
         if why == "default":
             reqs[0]["notes"].append(
                 f"Step {k} ({proc}) requests no output database output and inherits none, so "
@@ -6717,17 +6803,28 @@ class Converter:
                 f"labels{lost}.")
         return reqs
 
+    @staticmethod
+    def _preselect_contact(timing: dict) -> Tuple[str, Tuple[str, ...]]:
+        """(Abaqus variables, ccx *CONTACT FILE labels) of the contact output Abaqus
+        preselects in a step (PRESELECT_CONTACT); none in a linear perturbation step."""
+        if timing.get("pert"):
+            return "", ()
+        key = "EXPLICIT" if timing["kind"] == "explicit" else timing["proc"]
+        return PRESELECT_CONTACT.get(key or "", ("", ()))
+
     def _preselect_card(self, b: Block, ctx: Optional[Block], timing: dict) -> Optional[Block]:
-        """A field *NODE OUTPUT / *ELEMENT OUTPUT with VARIABLE=PRESELECT (the procedure's
-        preselected variables of that kind, plus the ones it names) or VARIABLE=ALL (the
-        names ignored, as Abaqus does) as the plain card the planner reads; None when
-        nothing is left; any other card unchanged."""
+        """A field *NODE OUTPUT / *ELEMENT OUTPUT / *CONTACT OUTPUT with VARIABLE=PRESELECT
+        (the procedure's preselected variables of that kind, plus the ones it names) or
+        VARIABLE=ALL (the names ignored, as Abaqus does) as the plain card the planner reads;
+        None when nothing is left; any other card unchanged."""
         var = (b.param("VARIABLE") or "").strip().upper()
-        if var not in ("PRESELECT", "ALL") or b.keyword == "CONTACT OUTPUT" or ctx is None \
-                or not ctx.has("FIELD"):
+        if var not in ("PRESELECT", "ALL") or ctx is None or not ctx.has("FIELD"):
             return b
-        node, elem = self._preselect_labels(timing["proc"], var)
-        labels = node if b.keyword == "NODE OUTPUT" else elem
+        if b.keyword == "CONTACT OUTPUT":
+            labels = self._preselect_contact(timing)[1]
+        else:
+            node, elem = self._preselect_labels(timing["proc"], var)
+            labels = node if b.keyword == "NODE OUTPUT" else elem
         own = [] if var == "ALL" else [v for rec in merged_data_records(b) for v in rec if v != ""]
         if not labels and not own:
             return None
@@ -6759,8 +6856,9 @@ class Converter:
                     r = self._output_request(src, ctx, timing, quiet)
                     r["anchor"] = anchor
                     listed.append(r)
-        if listed:
-            listed[0]["notes"].append(
+        written = [r for r in listed if r["live"]]
+        if written:
+            written[0]["notes"].append(
                 f"Step {k} carries over the field output requests of an earlier step (Abaqus) "
                 f"-> their cards written again: ccx keeps them too, but at the earlier step's "
                 f"output frequency and as a step in between left them.")

@@ -14,7 +14,7 @@ The converter has three layers of tests:
    conversions, connector elements (also on nodes with a `*TRANSFORM`), the loads applied
    as nodal forces, velocity / acceleration BCs, field and history output requested at beam
    nodes, and the field output Abaqus preselects (also in an explicit step without output
-   requests) numerically.
+   requests, and its contact output) numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -28,7 +28,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (270)
+## 1. Unit tests — `tests/test_convert.py` (274)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -166,6 +166,7 @@ conversion behaviour and referential integrity.
 | `test_rigid_body_reference_rotations_go_to_rot_node` | a `*RIGID BODY` gets an explicit `ROT NODE`; `ENCASTRE` and moments on the reference point reach its DOFs 1–3 (ccx ignores DOFs 4–6 of the REF NODE) |
 | `test_el_print_unknown_labels_dropped` | unknown `*EL PRINT` labels (fatal in ccx) are dropped; a card left empty is dropped |
 | `test_contact_output_maps_to_ccx_labels` | `*CONTACT OUTPUT` → `*CONTACT FILE` with `CDIS`/`CSTR`; names ccx doesn't know (`CPRESS`, `CFORCE`) are dropped, and a card left empty is dropped |
+| `test_contact_output_requests_ccx_cannot_write` | a contact output request is dropped (with a note) where the ccx model has no contact pair — none, or a `TIED` pair (a `*TIE` in ccx) — and with a warning where ccx 2.23 aborts on it: axisymmetric elements, a node-to-surface pair and `S` in the `.frd`; kept without `S`, and for a face-to-face pair; a node-to-surface pair of plane or axisymmetric elements is noted (ccx writes it at the expanded 3-D nodes) |
 | `test_history_output_goes_to_print_cards` | `*OUTPUT, HISTORY` + `*NODE OUTPUT, NSET=` → `*NODE PRINT` and `*ELEMENT OUTPUT, ELSET=` → `*EL PRINT` beside the field output's whole-model `*NODE FILE`/`*EL FILE` (no `*NODE FILE, NSET=` left to replace it); a history set the deck never defines is dropped |
 | `test_frd_node_sets_one_per_variable` | per step and `.frd` variable one node set: a whole-model request wins over a set's, U on two sets gets their union (`ABQ2CCX_OUTPUT`, emitted with both sets' nodes), RF on one set stays |
 | `test_frd_set_at_reference_node_printed` | field output at a reference point (a node of no element, in no `.frd`) → `*NODE PRINT`, also when the whole-model request covers the variable |
@@ -180,7 +181,10 @@ conversion behaviour and referential integrity.
 | `test_default_output_without_output_requests` | a step without any `*OUTPUT` request gets Abaqus' default (the preselected field output) at its end, also beside `*NODE PRINT` / `*EL PRINT`; history requests only → no field output; later steps get the carried-over default again with their own variables and frequency (V and every 10 increments in a dynamic step), a perturbation step after a general one the default; a deck's own field requests are carried over as they are |
 | `test_carried_output_requests_written_again` | ccx keeps a step's output cards for later steps, but at that step's frequency / time points and as a step in between left them, so a step without requests gets the carried requests again: `*TIME POINTS` for its own period, `FREQUENCY` instead under `DIRECT` (where ccx stops on time points), the static default after a dynamic step, the variables a perturbation step replaced, named variables at the request's own frequency, `OP=ADD` beside the default, an explicit step's own `FREQUENCY`; `FREQUENCY=0` writes nothing (one note) |
 | `test_explicit_output_frequency_from_ccx_stable_increment` | explicit dynamics ignores `*TIME POINTS`: Abaqus' 20 field intervals become `FREQUENCY=56` from ccx's stable increment of a unit C3D8 steel cube (8.847e-8, as ccx 2.23 prints it); a smaller maximum increment and the `*OUTPUT`'s `NUMBER INTERVAL` take over |
-| `test_preselect_output_examples` | the bundled `preselect_output_bar` (`*NODE FILE` U, RF / `*EL FILE` S, E after the load) and `explicit_default_output_bar` (`FREQUENCY=4` at the step end) decks; no dangling refs |
+| `test_preselect_contact_output` | Abaqus' preselected contact output in a model with a contact pair (face-to-face or node-to-surface, solid elements) → `*CONTACT FILE` CDIS, CSTR after the `*NODE FILE` / `*EL FILE` cards in static, `*VISCO`, implicit `*DYNAMIC` and coupled temperature-displacement steps, CSTR in explicit dynamics; none in linear perturbation steps; also in the default output of a step without requests and in the carried one; a model without contact gets none, and its notes do not count `CSTRESS` as missing |
+| `test_preselect_contact_output_left_out_where_ccx_cannot_write_it` | no `*CONTACT FILE`, and a note why, for a `TIED` pair (→ `*TIE`), general contact, and node-to-surface pairs of `CAX4` (ccx 2.23 aborts), `CPE4`, `CPS4` and `M3D4` (expanded 3-D nodes); face-to-face pairs of all four get it; beside a `B31` beam (a 3-D `.frd`) `CPE4` gets it too, `CAX4` still not |
+| `test_contact_output_variable_preselect` | a field `*CONTACT OUTPUT, VARIABLE=PRESELECT`/`ALL` → the procedure's preselected contact output (CDIS, CSTR static; CSTR explicit), none in a linear perturbation `*FREQUENCY` step (dropped with a note); a carried request ccx cannot write is not announced as written again |
+| `test_preselect_output_examples` | the bundled `preselect_output_bar` (`*NODE FILE` U, RF / `*EL FILE` S, E after the load), `explicit_default_output_bar` (`FREQUENCY=4` at the step end) and `preselect_contact_blocks` (`*CONTACT FILE` CDIS, CSTR in both steps) decks; no dangling refs |
 | `test_courant_length_matches_ccx_223` | `courant_length` against the explicit increments ccx 2.23 printed for one element of 19 types (solids, shells, membranes, plane and axisymmetric elements as the bricks ccx expands them into, rectangular and circular beams) within 0.02 %; `B21`/`T2D2` as ccx's `B31`/`T3D2`; springs and a shell without thickness are not sized; a cohesive layer (a thin continuum in ccx) sets the deck's increment; short `LAMINA` data is skipped, not a crash |
 | `test_cload_orientation_warned` | `*CLOAD, ORIENTATION=` (local load axes) is warned |
 | `test_blankless_keywords_recognised` | blank-less keywords (`*SOLIDSECTION`, `*ELPRINT`, `*ENDSTEP`) are recognised as ccx does |
@@ -546,6 +550,13 @@ deck and runs it in CalculiX:
   velocities, the free end moving at v0 until the support's wave arrives (exact to 0.00 %),
   its peak −0.03729 against 1-D wave theory v0 L/c = −0.03867 (3.6 %, the wave front's
   dispersion), and back to −0.00005 (0) at 2L/c.
+* **`preselect_contact_blocks`** — two steel blocks 10 × 10 × 10 (2 × 2 × 1 `C3D8` each), the
+  upper one resting on the lower one through a frictionless `SURFACE TO SURFACE` pair, on
+  symmetry planes, pressed together by a pressure on the top face: 10 in a step with the
+  CAE requests, 20 in a second step without requests (it carries them over). Abaqus'
+  preselected output there includes the contact output, so the converter adds `*CONTACT FILE`
+  CDIS, CSTR in both steps. Uniaxial stress makes the contact pressure the applied one: CPRESS
+  at the upper block's nine bottom nodes 9.99986 and 19.9991, zero elsewhere (0.005 % off).
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -1453,6 +1464,45 @@ integrated since, writes finite results. `davidmorinntnu_example_vuhard_v1`/`_v2
 `marcello_gori_cylinder_impact` gets Abaqus' 20 intervals (21 frames with the end).
 `validate_with_ccx.py` checks a bar's `.frd` under the CAE requests and an explicit bar impact
 without requests against theory.
+
+**Preselected contact output.** Abaqus' preselected field output also has the contact
+stresses and displacements where the model has contact (`CSTRESS`, `CDISP`; `CSTRESS` alone
+in explicit dynamics); they were left out because contact output switched on for every deck
+had made ccx 2.23 abort on an axisymmetric node-to-surface model that solves without it.
+Probed on hand-written decks of a block pressed onto another — plane strain and stress,
+axisymmetric and 3-D solid elements of every order and shape (23 types), a shell and a
+membrane plate, plane elements beside a beam; node-to-surface and face-to-face pairs; static,
+`NLGEOM`, `*VISCO`, explicit dynamics, coupled temperature-displacement, and static,
+frequency and buckling steps after them — and ccx's own implicit-dynamics contact decks
+(`ball`, `contdamp1`–`3`), ccx 2.23 writes contact output everywhere except: in a model with
+axisymmetric elements it aborts (SIGABRT, right after the CONTACT block) once the `.frd` also
+gets `S`, which brings ccx's stress error estimate along, unless every pair is face-to-face —
+with node-to-surface pairs or none at all, in every procedure, with `OUTPUT=3D`, with the
+contact open or closed, with or without friction; in plane, axisymmetric and membrane models
+without beams or shells it writes node-to-surface contact at the slave nodes of their
+expanded 3-D form, which their 2-D `.frd` does not have; and a model without a contact pair
+(general contact, a tied pair → `*TIE`) gets empty blocks. `CDIS` and `CSTR` switch on the
+same block (opening, slip, pressure, shear), and an empty `*CONTACT FILE` in a later step
+switches carried contact output off. `lcharleux_indentation_axi`, the deck behind the old
+comment, solves, and aborts with `*CONTACT FILE` added by hand. So the preselection now gets
+`*CONTACT FILE` CDIS, CSTR (CSTR in explicit dynamics) where the model has a `*CONTACT PAIR`
+that is not tied, unless a node-to-surface pair is in a model with axisymmetric elements, or
+with plane or membrane elements and no beam or shell (a note says why); a `*CONTACT OUTPUT,
+VARIABLE=PRESELECT` gets the same per procedure; and a deck's own contact request is dropped
+where ccx has no contact pair or would abort. Of the 1073 corpus files 124 convert with
+different cards (289 more only in their notes), and only in their `*CONTACT FILE` cards: 7
+get the preselected contact output, 116 lose a contact request of their own in a model
+without a ccx contact pair, and `juliafem_contact_hertz` (axisymmetric, node-to-surface, with
+`S`) loses one where ccx would abort; ten general-contact decks,
+`marcello_gori_cylinder_impact` among them, get a note that their preselected `CSTRESS` has
+no ccx contact pair (written anyway, it changes none of their verdicts and adds empty CONTACT
+blocks). Run in ccx before and after, all 124 keep their verdict —
+`gut_aachen_cube_pp_subrtest` fails either way, with an `*ERROR` or a crash from run to run.
+Of the two gated decks that gain the output, `marcello_gori_job_1_4` shows the pressure at
+its 44 slave nodes growing with the load to 326, and `marcello_gori_snap_fit_tr1` is zero in
+every frame: ccx never closes that snap fit's contact (displacements reach 96 against the 19
+prescribed), which the new output shows and the solve judge cannot. `validate_with_ccx.py`
+checks the contact pressure of two blocks pressed together.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
