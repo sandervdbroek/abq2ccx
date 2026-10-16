@@ -48,6 +48,8 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **Under `NLGEOM`, `*EQUATION`s that link two rigid bodies' reference / rotation DOFs are solved inaccurately** — two `*RIGID BODY` cards on one REF/ROT node are exact, but the same bodies joined by `*EQUATION`s (u5 = u1, θ4 = θ2) or chained (a member of one is the other's reference) all converge to the same wrong state | under `NLGEOM` a connector is written only where it needs no such link (to ground / a held node, between plain nodes or from a reference point to a mesh node, a rigid link); otherwise it is commented out, or written linear under `--approximate` (`[APPROX]`) | probed on 2.23: ~1 % displacement and ~10 % moment imbalance at 30°, members of the untouched body off rigidity by 7e-4; exact to all digits without `NLGEOM` |
 | **DOFs 4–6 of a node without rotational elements do nothing**, and **a `ROT NODE` without stiffness crashes ccx** (exit 255, no message) | a connector rotation on a solid / plane / free node goes to a new rotation node only when it shows elsewhere (another connector, a moment, a prescribed rotation); otherwise it is eliminated (the connector-only rotation Abaqus adds constrains nothing); a `WELD`/`BEAM` between two such nodes is a `JOIN` (coincident) or a `LINK` | probed on 2.23 (a moment on a free node's DOF 6 tied to a body moves nothing) |
 | **`*BOUNDARY, OP=NEW` removes model-data BCs too** | the BCs that hold a connector (to ground, or to a held node) are repeated after every `OP=NEW` card | probed on 2.23 |
+| **ccx's `*BOUNDARY` prescribes displacements only** (no `TYPE`). With an amplitude a value is magnitude × amplitude (held at the end values outside its points); a value with a step-time amplitude **freezes at its end value** in later steps; `FIXED` holds the value the previous step ended with, also on a DOF that was free, but takes no rotations | `TYPE=VELOCITY / ACCELERATION` → a displacement BC whose generated amplitude is the time integral of the history from the DOF's state at the step start; a velocity BC a later step keeps (it keeps moving the DOF in Abaqus) is continued in that step | ccx manual `*BOUNDARY` / `*AMPLITUDE`, sources `tempload.f`, `bounadd.f`, `spcmatch.f`; probed on 2.23 |
+| **In dynamics ccx derives a prescribed node's velocity and acceleration from its displacement** (Newmark update, implicit and explicit) | a velocity jump at a step start shows as a decaying oscillation of that node's own velocity output; the motion it imposes and the rest of the model are unaffected (a bar driven at 0.01: identical wave with or without the matching initial velocity) | `resultsini.c`; probed on 2.23 |
 
 ## Version notes
 
@@ -214,14 +216,18 @@ under a shear traction matches the published 23.96 within
 cylinder under a radial traction matches Lamé within 0.02 %, tractions on nodes with a
 `*TRANSFORM` (a `C3D20R` face, Cook's loaded edge) match the same models without one to
 round-off, a free cube and a circular-section beam heated without initial temperatures
-expand by α T from Abaqus' default 0 (exactly, and within 5e-6), and the composite-shell
-and assembly decks also solve. This proves the full pipeline —
+expand by α T from Abaqus' default 0 (exactly, and within 5e-6), a column pulled through a
+rigid reference point by a velocity BC with a `SMOOTH STEP` amplitude follows the integral
+of the velocity at every increment (within 5e-5 of its travel, and on into a second step
+that keeps the BC), a bar driven at one end by a velocity (explicit) or an acceleration
+(implicit) carries the wave stress −ρcv (−ρca(t − z/c)) behind its front, and the
+composite-shell and assembly decks also solve. This proves the full pipeline —
 `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face, sections — is
 correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
-184 solve in CalculiX under their own loads (14 more solve but load nothing in the source
+186 solve in CalculiX under their own loads (14 more solve but load nothing in the source
 deck) and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
 convert cleanly but use features ccx cannot run, and each was verified to fail no worse
 than the original unconverted deck. Bulk-running every deck
@@ -309,6 +315,31 @@ other connection types (`SLOT`, `SLIDE-PLANE`, `UNIVERSAL`, `CONSTANT VELOCITY`,
 the corpus only two decks have connectors: the hood-hinge modal deck (one `HINGE`), whose
 parts now move as a mechanism instead of floating apart, and the teeter deck (`BEAM` and
 `HINGE`), which still stops on its `*BEAM GENERAL SECTION`.
+
+`*BOUNDARY, TYPE=VELOCITY / ACCELERATION` has no ccx counterpart (ccx prescribes
+displacements only), so the converter integrates it: a DOF moves by the integral of the
+prescribed velocity (an acceleration twice, from the velocity at the step start) from where
+the step finds it. The velocity is the magnitude times its amplitude (`VALUE=ABSOLUTE`: the
+amplitude itself; `TIME=TOTAL TIME` on total time), or without an amplitude the step's
+default — held from the start of the step in explicit and transient dynamics (and under
+`*STEP, AMPLITUDE=STEP`), ramped from its previous value under the `RAMP` default of static
+steps. That last case is taken from Abaqus' general rule for BCs without an amplitude and is
+**warned**: it has not been checked against an Abaqus run, and a constant velocity is easily
+made explicit with an amplitude. The integral is exact at the amplitude's points and within
+1e-4 of the step's travel between them (a constant or piecewise-constant velocity exact), so
+it is a sampled history, not a physics approximation, and is not gated behind
+`--approximate` (the converter samples `SMOOTH STEP` displacement amplitudes the same way,
+far more coarsely). The displacement at each step start is followed through the steps;
+where it is unknown — the DOF was free in an earlier step — a zero velocity becomes
+`*BOUNDARY, FIXED` and any other line is commented out with a warning (`FIXED` takes no
+rotations in ccx, so a shell or beam rotation there is commented out too; a rigid body's
+rotations are held on its `ROT NODE`). The midside node the converter adds to a 2-node beam
+moves with the mean of its end nodes' motions, as the Abaqus element's interior does. In a
+linear perturbation step only the constraint is kept, and under `NLGEOM` angular velocities
+about more than one axis of a node are warned (each rotation is integrated on its own, exact
+only about a fixed axis). Not converted (warned): an amplitude with more than a thousand
+oscillations in the step, and a `TIME=TOTAL TIME` amplitude after a step of unknown length
+(Riks).
 
 ## What "verified" means here
 

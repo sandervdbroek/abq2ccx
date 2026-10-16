@@ -13,7 +13,7 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
 dangling references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (198) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (200) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
@@ -21,11 +21,11 @@ dangling references). Each entry carries one of three expectations:
   14 of them also carry ``source_unloaded=True``: the source deck applies no load,
   prescribed displacement or initial velocity in any step (and has no eigenvalue
   step), so it solves to a zero response. They are kept as conversion checks but left
-  out of the headline count of decks that solve (184).
+  out of the headline count of decks that solve (186).
 * ``parse_only=True`` (219) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (605) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (603) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -1895,13 +1895,13 @@ CORPUS = [
          exercises='C3D8R — parts/instances/assembly; *Orientation; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_UMAT/example_UMAT.inp'),
-    dict(name='davidmorinntnu_example_uexternaldb', expect_solve=False, license='MIT',
-         exercises='S4 — parts/instances/assembly',
-         note='its *MPC BEAM lines are now carried (as *RIGID BODY): before, they were dropped and the loaded reference point was not connected — a zero-load solve. Now *BOUNDARY, TYPE=VELOCITY, read as a displacement (100 instead of the ~0.95 the velocity integrates to), stretches the patch 20x and ccx stops (increment size smaller than minimum); with 0.95 it solves, the edge following the reference point exactly. Also needs UHARD/USDFLD subroutines',
+    dict(name='davidmorinntnu_example_uexternaldb', expect_solve=True, license='MIT',
+         exercises='S4 — parts/instances/assembly; *Boundary, type=VELOCITY',
+         note='its *MPC BEAM lines are carried (as *RIGID BODY) and its *BOUNDARY, TYPE=VELOCITY (100 along y, SMOOTH STEP over the first 0.001 of the 0.01 step) is integrated into a displacement amplitude: the reference point and the loaded edge reach the 0.95 the velocity integrates to, exactly (checked at 5 times). Its UHARD hardening and USDFLD field are commented out (no such subroutines in ccx), so the shell runs elastic',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_UEXTERNALDB/example_UEXTERNALDB.inp'),
     dict(name='davidmorinntnu_example_usdfld_v2', expect_solve=False, license='MIT',
          exercises='S4R — parts/instances/assembly',
-         note='its *MPC BEAM lines are now carried (as *RIGID BODY): before, they were dropped and the loaded reference point was not connected — a zero-load solve. Now *BOUNDARY, TYPE=VELOCITY, read as a displacement (100 instead of the ~0.95 the velocity integrates to), stops ccx (increment size smaller than minimum); with 0.95 the plastic patch necks at 15 % stretch and stops too. Also needs the USDFLD subroutine (damage)',
+         note='its *MPC BEAM lines are carried (as *RIGID BODY) and its *BOUNDARY, TYPE=VELOCITY is integrated into displacements (0.95 at the end of the step), but the plastic patch necks at 16 % stretch (t = 0.0083 of 0.01) and ccx stops: increment size smaller than minimum. In Abaqus its USDFLD subroutine softens and deletes the failing elements (*Depvar, delete=3); ccx has neither',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_USDFLD/example_USDFLD_V2.inp'),
     dict(name='davidmorinntnu_example_vexternaldb', expect_solve=False, license='MIT',
          exercises='S4 — parts/instances/assembly; explicit',
@@ -1919,11 +1919,13 @@ CORPUS = [
          exercises='S4R — parts/instances/assembly; UMAT; explicit',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_UMAT/example_VUMAT_SHELL.inp'),
-    dict(name='davidmorinntnu_example_vusdfld_v1', expect_solve=False, license='MIT',
-         exercises='C3D8R — parts/instances/assembly; explicit',
-         note="ccx runs it to 'Job finished', but with *BOUNDARY TYPE=VELOCITY read as a "
-              "displacement (100 mm within 1 ms, not 100 mm/s) the explicit solution "
-              "diverges: the .frd holds +-INF from t = 2e-4 (the judge's 'nonfinite')",
+    dict(name='davidmorinntnu_example_vusdfld_v1', expect_solve=True, license='MIT',
+         exercises='C3D8R — parts/instances/assembly; explicit; *Boundary, type=VELOCITY',
+         note="its *BOUNDARY, TYPE=VELOCITY (+-100 with a SMOOTH STEP over 0.001) is "
+              "integrated into displacements and the explicit run stays finite; read as a "
+              "displacement (100 mm within 1 ms, not 100 mm/s) it diverged: the .frd held "
+              "+-INF from t = 2e-4 (the judge's 'nonfinite'). Its USDFLD field is commented "
+              "out (no such subroutine in ccx)",
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_USDFLD/example_VUSDFLD_V1.inp'),
     dict(name='davidmorinntnu_example_vusdfld_v2', expect_solve=False, license='MIT',
          exercises='S4R — parts/instances/assembly; explicit',

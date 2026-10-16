@@ -145,6 +145,9 @@ PASS  traction_transformed_face with *TRANSFORM (C3D20R face, rectangular + cyli
 PASS  cook_membrane_traction with *TRANSFORM (CPS8 edge, in-plane rectangular + cylindrical): u at 33 nodes differs from the model without it by 6.4e-17 of max |u| (25.06)
 PASS  thermal_no_initial_temperature (*Temperature, no initial temperatures): cube strain 1.200000e-03 / 1.200000e-03 / 1.200000e-03 (alpha T = 1.200000e-03, 8.6e-16 off); CIRC beam end u_x = +0.120001 (alpha T L = +0.120000, 0.0005% diff)
 PASS  transform_spherical_rigid (spherical *TRANSFORM, rigid body with a cylindrical one on its reference point): u at 46 nodes differs from the model in global components by 0.0e+00 of max |u| (0.003692)
+PASS  velocity_bc_column (TYPE=VELOCITY, SMOOTH STEP, kept into a 2nd step): top at 0.009500 / 0.014500 (integral 0.009500 / 0.014500), 34 increments within 5.0e-05 of the travel; reaction 1.0054 x E A u/L
+PASS  velocity_bc_bar (explicit, TYPE=VELOCITY): driven end u = 0.005000 (0.005); wave stress behind the front 0.6% off on average (6.7% at worst), 0.00% ahead of it
+PASS  velocity_bc_bar (implicit, TYPE=ACCELERATION): driven end u = 0.005000 (0.005); wave stress behind the front 1.1% off on average (1.5% at worst), 0.09% ahead of it
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -239,6 +242,11 @@ body's rotations on its ROT NODE, which gets the same axes). It must match the s
 written in global components — global loads, `*EQUATION` supports, an explicit ROT NODE —
 at every node (the conversion before ran without a message and missed by 784 % of |u|; the
 ROT NODE without its axes alone misses by 91 %).
+The velocity checks pull a column through a rigid reference point by a
+`*BOUNDARY, TYPE=VELOCITY` ramped in by a `SMOOTH STEP` (its top must follow the integral of
+the velocity at every increment, also in a second step that keeps the BC) and drive a bar
+at one end by a velocity (explicit: the wave behind the front carries −ρcv) and by an
+acceleration (implicit: −ρca(t − z/c)).
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -262,12 +270,12 @@ python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
 Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
-references; 184 solve in CalculiX under their own loads** (ccx exits 0, prints "Job
+references; 186 solve in CalculiX under their own loads** (ccx exits 0, prints "Job
 finished" with no `*ERROR` or crash, runs an analysis step and writes no NaN/Inf results —
 and every step the Abaqus deck loads still carries a load after conversion), and **219 mesh-only decks** — no
 `*STEP`, so nothing to solve — are **accepted** by ccx. 14 more solve but apply no load in
 the source deck itself (an empty `*STEP`: the solution is zero, in Abaqus too); they stay
-in the gate as conversion checks, flagged `source_unloaded`. The other 605 convert cleanly
+in the gate as conversion checks, flagged `source_unloaded`. The other 603 convert cleanly
 but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
 Riks, NLGEOM follower tractions, cohesive and joint elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
@@ -331,7 +339,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*SHELL SECTION, COMPOSITE` | S6/S8R; synth `*ORIENTATION` per ply angle | no inline ply angle in ccx; `SYMMETRIC` layups mirrored; on continuum shells (SC8R) → `*SOLID SECTION` |
 | `*STEP` | `NAME` dropped, `NLGEOM` on step, `AMPLITUDE=RAMP/STEP` kept, `PERTURBATION` only for freq/buckle, `*END STEP` added | explicit steps get `INC=10000000` + `NLGEOM` (Abaqus/Explicit defaults) |
 | `*BOUNDARY ENCASTRE/PINNED/*SYMM` | numeric DOFs | rotational DOFs only if shells/beams (`--solid-dof` to force 1-3) |
-| `*BOUNDARY, TYPE=VELOCITY/ACCEL` | `TYPE` dropped | ccx is displacement-only |
+| `*BOUNDARY, TYPE=VELOCITY/ACCELERATION` | displacement `*BOUNDARY` + a generated `*AMPLITUDE` (`ABQ2CCX_VEL*`/`ACC*`) | ccx prescribes displacements only: the amplitude is the time integral of the velocity (acceleration: twice) from the DOF's state at the step start — exact at its points, within 1e-4 of the step's travel between them, a constant rate exact; a BC a later step keeps is continued in that step (a ccx BC would freeze); a zero rate on a DOF whose start is unknown → `FIXED` |
 | `*DLOAD, Px` | unchanged | solid face numbering matches Abaqus |
 | `*DSLOAD` (pressure) | `*DLOAD` with `Px` | ccx `*DSLOAD` is submodel-only; shells use `P` |
 | `*DSLOAD`/`*DLOAD` `TRVEC`, `TRSHR` (surface tractions) | consistent nodal forces (`*CLOAD`) | ccx has no traction load: the face/edge shape functions are integrated over the undeformed geometry (× plane thickness, × 2πr axisymmetric; `TRSHR` projected onto the face). Exact in small-strain steps and for NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT RESULTANT=YES`; other NLGEOM tractions only with `--approximate` |
@@ -625,6 +633,8 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/traction_transformed_face.inp`](examples/traction_transformed_face.inp) | `C3D20R` block, oblique `*DSLOAD TRVEC` on a face whose nodes have a rectangular and a cylindrical `*TRANSFORM` → nodal forces in their local axes |
 | [`examples/thermal_no_initial_temperature.inp`](examples/thermal_no_initial_temperature.inp) | `*Temperature` without initial temperatures (a `C3D8` cube, a `CIRC` beam with a knot beam) → `*INITIAL CONDITIONS, TYPE=TEMPERATURE` at Abaqus' default 0 on every node |
 | [`examples/transform_spherical_rigid.inp`](examples/transform_spherical_rigid.inp) | `C3D8` block: `*TRANSFORM, TYPE=S` nodes with local loads and supports → a rectangular transform per node; a `*RIGID BODY` whose reference point has a cylindrical transform, partial rotational BCs and a moment → the ROT NODE gets its axes |
+| [`examples/velocity_bc_column.inp`](examples/velocity_bc_column.inp) | `*Boundary, type=VELOCITY` with a `SMOOTH STEP` amplitude on a `*Rigid Body` reference point, kept into a second step |
+| [`examples/velocity_bc_bar.inp`](examples/velocity_bc_bar.inp) | Abaqus/Explicit bar driven by `*Boundary, type=VELOCITY` (wave stress −ρcv); `validate_with_ccx.py` also runs it implicit with `type=ACCELERATION` |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

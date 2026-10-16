@@ -11,7 +11,8 @@ The converter has three layers of tests:
    loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate across a later
    step's `*BOUNDARY, OP=NEW`, heated models with no initial temperatures, rigidly coupled
    models (a shell plate, and bars whose coupled nodes also carry BCs), the `*MPC`
-   conversions, connector elements and the loads applied as nodal forces numerically.
+   conversions, connector elements, the loads applied as nodal forces and velocity /
+   acceleration BCs numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -25,7 +26,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (230)
+## 1. Unit tests — `tests/test_convert.py` (245)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -262,6 +263,21 @@ conversion behaviour and referential integrity.
 | `test_rotation_ties_to_a_transformed_rot_node_use_its_axes` | a `*RIGID BODY` on an `S4` edge whose reference node has a rectangular transform: the knotted members' rotation ties to the ROT NODE are written in its local axes (rotation x = −local 2, y = local 1, z = local 3); without the transform, the plain ties as before |
 | `test_rot_node_with_connector_rows_keeps_the_global_axes` | a hinge connector between two `*MPC BEAM` reference points, one with a `*TRANSFORM`: connector constraints are written in global components on its ROT NODE, so that ROT NODE gets no transform and a rotational BC moved onto it is warned |
 | `test_transform_spherical_rigid_example` | the example `validate_with_ccx.py` runs: nine spherical nodes on nine rays get nine rectangular cards, the reference point's ROT NODE a tenth; the moved rotational BC and moment; no warning, no dangling refs |
+| `test_amplitude_curve_definitions` | `amplitude_curve()` evaluates `TABULAR` (end values held), `SMOOTH STEP`, `EQUALLY SPACED`, `SCALEX`/`SCALEY` then `SHIFTX`/`SHIFTY`, `PERIODIC` (on `TOTAL TIME`) and `DECAY` (`VALUE=ABSOLUTE`) as Abaqus defines them; `USER` and descending times give None |
+| `test_integrate_history_is_exact_at_its_points` | a constant rate integrates to two exact points; the `SMOOTH STEP` velocity of the davidmorin decks to 0.95, exact at every point and within 1e-4 of the travel between them in under 40 points; an acceleration from a start value and rate exactly |
+| `test_velocity_bc_integrated_into_displacement_amplitude` | `*BOUNDARY, TYPE=VELOCITY` with a `SMOOTH STEP` amplitude → a displacement BC with the magnitude on the line and the motion per unit velocity as its generated amplitude (0.0005 at the end of the ramp, 0.0095 at the end of the step); the amplitude only the velocity used is dropped |
+| `test_velocity_bc_explicit_default_is_constant` | in an explicit step a velocity without amplitude is constant from the start (two exact points, the jump noted); a zero velocity from rest is a zero BC |
+| `test_velocity_bc_carried_into_later_steps_and_ramped` | a velocity BC a later step keeps continues there at the velocity it ended with (a continuation card before `*END STEP`); without amplitude in a static step the velocity ramps from its previous value (warned) |
+| `test_velocity_bc_after_a_free_step` | after a step in which the DOF was free, a zero velocity becomes `*BOUNDARY, FIXED` and any other line is commented out with a warning |
+| `test_acceleration_bc_from_initial_velocity` | `TYPE=ACCELERATION` in a dynamic step integrates twice from the `*INITIAL CONDITIONS, TYPE=VELOCITY` value: u = 0.5 t + t² |
+| `test_velocity_bc_on_rigid_body_reference_point` | an angular velocity on a `*RIGID BODY` reference point drives its `ROT NODE` (exact under `*STEP, AMPLITUDE=STEP`); zero velocities from rest count as zero BCs, so a member BC the body implies is left out |
+| `test_velocity_bc_examples` | the two validation decks: the column's reference point follows the `SMOOTH STEP` velocity to 0.0095 and is continued to 0.0145 in the second step; the bar's end moves at v; no dangling refs |
+| `test_velocity_bc_card_follows_op_new_drop` | a velocity card with `OP=NEW` that re-specifies every BC loses `OP=NEW` like a displacement card (`_plan_op_new_rotations`): the converted first card carries the decision |
+| `test_velocity_bc_zero_rate_from_unknown_start_holds_what_it_can` | after a free step a zero velocity on `TOP, 1, 6` or `ENCASTRE` of solid nodes holds their translations (`FIXED`, DOFs 1–3: solids have no 4–6); `XSYMM` on a rigid body's reference point holds x there and its turns on the `ROT NODE` — never a DOF range over a named type's gaps |
+| `test_velocity_bc_midside_node_follows_its_end_nodes` | a `CIRC` beam's midside node moves with its end nodes' velocity in the step that gives it, in a later step that keeps it, and with their mean when one end is re-specified and the other carried |
+| `test_velocity_bc_ramp_start_does_not_depend_on_node_order` | a RAMP after a step whose `TOTAL TIME` velocity another node keeps starts from the value of the step before, whichever node comes first in the set |
+| `test_velocity_bc_unreadable_lines_and_amplitudes` | a blank first DOF or unknown type in a velocity card is commented, not a crash; an amplitude another card names (`FILM AMPLITUDE=`) is kept; explicit steps apply a velocity at once whatever `*STEP AMPLITUDE` says; over a thousand oscillations in a step, or a `TOTAL TIME` amplitude after a Riks step, are not converted (warned) |
+| `test_velocity_bc_in_frequency_step_keeps_the_constraint` | in a `*FREQUENCY` step a velocity BC keeps only its constraint |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -447,6 +463,18 @@ deck and runs it in CalculiX:
   exactly (0). The conversion before — `TYPE=S` passed through, which ccx reads as a
   rectangular system, and the ROT NODE without axes — runs without a message and misses by
   784 % of max |u|; the ROT NODE without its axes alone misses by 91 %.
+* **`velocity_bc_column`** — a 1 × 1 × 4 elastic column whose top is tied to a reference
+  point pulled by `*BOUNDARY, TYPE=VELOCITY` (velocity 1, ramped in by a `SMOOTH STEP` over
+  0.001 of a 0.01 step — the pattern of the corpus' davidmorin decks), and a second step that
+  keeps the BC. The top must sit on the integral of the velocity at every increment: it
+  reaches 0.0095 and 0.0145 exactly and stays within 5e-5 of the travel over all 34
+  increments; the reaction is 1.005 × E A u/L (the NLGEOM second-order term at 0.36 %
+  strain).
+* **`velocity_bc_bar`** — an elastic bar (E = ρ = 1, so c = 1) driven at one end. Explicit,
+  by a velocity 0.01 applied at once: behind the front the stress averages −ρcv within 0.6 %
+  (explicit ringing up to 6.7 % at the front; Abaqus damps it with bulk viscosity), nothing
+  ahead of it, the end at v t = 0.005. Implicit (fixed increments), by an acceleration 0.04:
+  the stress follows −ρca(t − z/c) within 1.5 % and the end reaches a t²/2 = 0.005.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -498,10 +526,10 @@ deck and runs it in CalculiX:
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **184 solve** in CalculiX under their own loads and **219 mesh-only decks are
+references; **186 solve** in CalculiX under their own loads and **219 mesh-only decks are
 accepted** by it. 14 more decks solve but load nothing in the source deck itself (an empty
 `*STEP`), so their solution is zero in Abaqus as well; they stay in the gate as conversion
-checks (`source_unloaded=True`), outside the headline count. The other 605 convert cleanly
+checks (`source_unloaded=True`), outside the headline count. The other 603 convert cleanly
 but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
 Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
@@ -1203,6 +1231,36 @@ axis, where the local axes are undefined, so no ROT NODE gets a transform; only
 `idaholab_ringshear_mdpc` moves rotational BCs there (its containers' rotations about the
 axis), which is now warned. That warning is the only change: the other 1072 corpus files
 convert byte-identically.
+
+**`*BOUNDARY, TYPE=VELOCITY / ACCELERATION`.** The converter used to drop `TYPE` and pass
+the value on as a displacement (a velocity of 100 over a 0.01 step became a displacement
+of 100 instead of the 0.95 it integrates to). It now converts each such line to a
+displacement BC whose generated amplitude is the time integral of the history, following
+the displacement at each step start through the steps (see
+[compatibility](compatibility.md)). Probed on 2.23 for this: ccx evaluates a BC amplitude
+exactly at every increment and freezes a step-time amplitude BC at its end value in later
+steps (so a velocity BC a later step keeps gets an explicit continuation); `*BOUNDARY,
+FIXED` holds the previous step's end value even on a DOF that was free; in implicit and
+explicit dynamics a bar driven by the integrated displacement carries the same wave as the
+velocity drive (−ρcv within 0.8 %), only the driven node's own velocity output rings after
+a jump.
+
+Corpus: the 39 decks with velocity BCs change and no other deck's output does.
+`davidmorinntnu_example_uexternaldb` solves again, now with its loading: the reference
+point and the loaded edge reach the 0.95 the velocity integrates to, exactly (its UHARD
+hardening and USDFLD field are commented out, as in the other gated davidmorin decks, so
+the shell runs elastic). `davidmorinntnu_example_usdfld_v2` gets the same displacement but
+its plastic patch necks at 16 % stretch and ccx stops (in Abaqus its USDFLD deletes the
+failing elements). `davidmorinntnu_example_vuhard_v2` keeps solving, now with the
+integrated displacement instead of the misread one. `davidmorinntnu_example_vusdfld_v1`,
+which the NaN/Inf judge left out (driven 100 within 1 ms, it wrote about a million
+non-finite values to its `.frd`), runs with finite results now and is back in the gate.
+`irfancn_input` stays out: its user-material stub gives zero stress, whatever it is
+driven by. `sahmotaman_upsetting` (a `DECAY` velocity amplitude ccx has no equivalent for,
+so the converter used to comment it out and ccx stopped at the BC) now reaches its UMAT,
+its real limit. `sahmotaman_coldforging` still stops at its die-axis overconstraint; its
+second punch has no BC before the step that drives it, so that velocity is not converted
+(warned). Net: +2 (198 → 200 in the gate, 184 → 186 under their own loads).
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

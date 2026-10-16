@@ -213,6 +213,15 @@ These are the silent ones — no error, wrong physics.
   rotations too. So do the shell/beam nodes whose rotational BCs a later step's
   `*BOUNDARY, OP=NEW` would otherwise break. The beams carry no load — ignore them in the
   results (whole-model output lists them).
+* **Velocity and acceleration BCs are displacement BCs in ccx.** ccx's `*BOUNDARY`
+  prescribes displacements only, so `TYPE=VELOCITY / ACCELERATION` becomes a displacement BC
+  with a generated amplitude (`ABQ2CCX_VEL*`/`ACC*`) that integrates the history from the
+  DOF's displacement (and velocity) at the step start. Edit the original BC and reconvert
+  rather than editing those amplitudes. In a dynamic step ccx derives the driven node's own
+  velocity from that displacement, so after a jump in velocity (a BC without amplitude
+  applies at once) that node's velocity output oscillates for a while; the motion and the
+  rest of the model are unaffected. Where a DOF was free before the step its start is
+  unknown: a zero velocity becomes `*BOUNDARY, FIXED`, any other line is commented out.
 * **`C3D8R` hourglassing.** CalculiX auto-enables hourglass control only from v2.3.
   For bending-dominated linear bricks prefer `C3D8I` or `C3D20R`. There is no
   artificial-energy output in ccx, so check a scaled deformed shape for hourglass modes.

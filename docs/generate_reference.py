@@ -79,8 +79,10 @@ TRANSLATED = {
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
         "accuracy/vectors/iterations.",
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped.",
-    "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped; "
-        "DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 "
+    "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=VELOCITY`/"
+        "`ACCELERATION` → a displacement BC whose generated amplitude integrates the history from "
+        "the DOF's state at the step start (continued in later steps that keep it); DOFs 4-6 "
+        "dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 "
         "crashes on them). An element end node of a circular-section beam whose rotational BCs "
         "hold only some of DOFs 4-6, or a nonzero one, gets a force-free knot beam (elset/material "
         "`ABQ2CCX_KNOT`): ccx 2.23 would lock the node's other rotations too. A later step's "

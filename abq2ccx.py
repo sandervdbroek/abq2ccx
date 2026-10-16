@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import bisect
 import glob
 import json
 import math
@@ -52,7 +53,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 __version__ = "1.1.0"
 
@@ -1917,6 +1918,194 @@ def bc_steps(segments: List[List[Tuple[bool, Tuple[int, int], bool]]]):
         yield active
 
 
+# ---------------------------------------------------------------------------
+# Velocity / acceleration boundary conditions (ccx prescribes displacements only)
+# ---------------------------------------------------------------------------
+
+# 5-point Gauss-Legendre rule on [-1, 1] (node, weight): exact up to degree 9, so one panel
+# integrates a piecewise-linear or SMOOTH STEP (quintic) amplitude piece - once or twice -
+# exactly.
+_GL5 = ((-0.9061798459386640, 0.2369268850561891), (-0.5384693101056831, 0.4786286704993665),
+        (0.0, 0.5688888888888889), (0.5384693101056831, 0.4786286704993665),
+        (0.9061798459386640, 0.2369268850561891))
+
+
+@dataclass
+class AmplitudeCurve:
+    """An Abaqus *AMPLITUDE as a function of its own time (``value``).  ``breaks``: the
+    times where it is not smooth; ``panel``: the length of one integration panel for a
+    non-polynomial curve (PERIODIC / MODULATED / DECAY; 0 = polynomial pieces);
+    ``total``: TIME=TOTAL TIME; ``absolute``: VALUE=ABSOLUTE (its values replace the
+    magnitude on the card)."""
+    value: Callable[[float], float]
+    breaks: List[float]
+    panel: float = 0.0
+    total: bool = False
+    absolute: bool = False
+
+
+def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
+    """The time function of an Abaqus *AMPLITUDE - TABULAR, EQUALLY SPACED, SMOOTH STEP,
+    PERIODIC, MODULATED or DECAY - or None for the other definitions (USER, SOLUTION
+    DEPENDENT, BUBBLE, ...), data in an INPUT file or unreadable data.  SCALEX/SCALEY then
+    SHIFTX/SHIFTY act on the points of the point-wise forms, as in handle_amplitude and
+    ccx; before its first and after its last point such an amplitude keeps its end values
+    (Abaqus and ccx alike)."""
+    definition = (b.param("DEFINITION") or "TABULAR").strip().upper()
+    total = (b.param("TIME") or "").upper().replace(" ", "") == "TOTALTIME"
+    absolute = (b.param("VALUE") or "").strip().upper() == "ABSOLUTE"
+
+    def num(key: str, default: float) -> float:
+        v = b.param(key)
+        return pf(v) if v not in (None, "") else default
+    try:
+        sx, sy, dx, dy = num("SCALEX", 1.0), num("SCALEY", 1.0), num("SHIFTX", 0.0), num("SHIFTY", 0.0)
+        vals = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+        fixed, begin = num("FIXED INTERVAL", 0.0), num("BEGIN", 0.0)
+    except ValueError:
+        return None
+    if b.has("INPUT") or not vals:
+        return None
+    if definition in ("TABULAR", "SMOOTH STEP", "EQUALLY SPACED"):
+        if definition == "EQUALLY SPACED":
+            if fixed <= 0.0:
+                return None
+            pts = [(begin + i * fixed, a) for i, a in enumerate(vals)]
+        else:
+            pts = [(vals[i], vals[i + 1]) for i in range(0, len(vals) - 1, 2)]
+        ts = [t * sx + dx for t, _ in pts]
+        amps = [a * sy + dy for _, a in pts]
+        if not ts or any(t1 < t0 for t0, t1 in zip(ts, ts[1:])):
+            return None
+        smooth = definition == "SMOOTH STEP"
+
+        def tabular(t: float) -> float:
+            if t <= ts[0]:
+                return amps[0]
+            if t >= ts[-1]:
+                return amps[-1]
+            i = bisect.bisect_right(ts, t) - 1          # ts[i] <= t < ts[i + 1]
+            x = (t - ts[i]) / (ts[i + 1] - ts[i])
+            if smooth:
+                x = x ** 3 * (10.0 - 15.0 * x + 6.0 * x * x)
+            return amps[i] + (amps[i + 1] - amps[i]) * x
+        return AmplitudeCurve(tabular, ts, 0.0, total, absolute)
+    if (sx, sy, dx, dy) != (1.0, 1.0, 0.0, 0.0):
+        return None                 # scaling/shifting of the analytic forms: not modelled
+    if definition == "PERIODIC" and len(vals) >= 4:
+        n = int(vals[0])
+        w, t0, a0 = vals[1], vals[2], vals[3]
+        ab = vals[4:4 + 2 * n]
+        if n < 0 or len(ab) < 2 * n:
+            return None
+
+        def periodic(t: float) -> float:
+            if t < t0:
+                return a0
+            return a0 + sum(ab[2 * k - 2] * math.cos(k * w * (t - t0)) +
+                            ab[2 * k - 1] * math.sin(k * w * (t - t0)) for k in range(1, n + 1))
+        return AmplitudeCurve(periodic, [t0], 2.0 * math.pi / (8.0 * max(n, 1) * abs(w)) if w else 0.0,
+                              total, absolute)
+    if definition == "MODULATED" and len(vals) >= 5:
+        a0, a, t0, w1, w2 = vals[:5]
+
+        def modulated(t: float) -> float:
+            return a0 if t <= t0 else a0 + a * math.sin(w1 * (t - t0)) * math.sin(w2 * (t - t0))
+        w = abs(w1) + abs(w2)
+        return AmplitudeCurve(modulated, [t0], 2.0 * math.pi / (8.0 * w) if w else 0.0, total, absolute)
+    if definition == "DECAY" and len(vals) >= 4 and vals[3] > 0.0:
+        a0, a, t0, td = vals[:4]
+
+        def decay(t: float) -> float:
+            return a0 if t < t0 else a0 + a * math.exp(-(t - t0) / td)
+        return AmplitudeCurve(decay, [t0], td / 4.0, total, absolute)
+    return None
+
+
+def integrate_history(rate: Callable[[float], float], breaks: Sequence[float], period: float,
+                      order: int = 1, x0: float = 0.0, r0: float = 0.0, panel: float = 0.0,
+                      rel_tol: float = 1e-4, max_points: int = 1000):
+    """The motion a velocity (``order`` 1) or acceleration (``order`` 2) history prescribes
+    over a step of length ``period``: x(t) = x0 + int_0^t rate, or x0 + r0 t +
+    int_0^t (t - s) rate(s) ds, t in step time.  Returns (points, x(period), r(period),
+    deviation) with r = r0 + int rate.  ``points`` [(t, x)] are exact - Gauss-Legendre
+    panels between ``breaks`` (exact for polynomial pieces; a non-polynomial curve gets
+    panels no longer than ``panel``) - and dense enough that the straight lines between
+    them, which is what ccx applies, stay within rel_tol of the largest |x - x0| of the
+    step; a piecewise-constant rate (piecewise-linear x) is exact at its breakpoints alone.
+    ``deviation`` is that bound in absolute terms (above rel_tol only where max_points
+    capped the sampling)."""
+    cuts = sorted({0.0, period} | {t for t in breaks if 0.0 < t < period})
+
+    def advance(t0: float, x: float, r: float, t1: float) -> Tuple[float, float]:
+        n = 1 if panel <= 0.0 else max(1, min(4096, math.ceil((t1 - t0) / panel)))
+        h = (t1 - t0) / n
+        dx = dr = 0.0
+        for k in range(n):
+            a = t0 + k * h
+            for xi, w in _GL5:
+                s = a + (xi + 1.0) * 0.5 * h
+                f = rate(s) * w * 0.5 * h
+                dr += f
+                dx += f if order == 1 else (t1 - s) * f
+        return x + dx + (0.0 if order == 1 else r * (t1 - t0)), r + dr
+
+    # the state at every break, and the step's travel (which sets the tolerance) from
+    # coarse samples marched through each smooth piece
+    starts = [(cuts[0], x0, r0)]
+    travel = 0.0
+    for a, c in zip(cuts, cuts[1:]):
+        state = starts[-1]
+        m = 16 if panel <= 0.0 else max(16, min(4096, math.ceil(2.0 * (c - a) / panel)))
+        for k in range(1, m + 1):
+            q = a + (c - a) * k / m if k < m else c
+            state = (q,) + advance(state[0], state[1], state[2], q)
+            travel = max(travel, abs(state[1] - x0))
+        starts.append(state)
+    if travel == 0.0:
+        return [(0.0, x0), (period, x0)], x0, starts[-1][2], 0.0
+
+    def sample(tol: float):
+        pts: List[Tuple[float, float]] = [(0.0, x0)]
+        dev = 0.0
+        for (a, xa, ra), (c, xc, rc) in zip(starts, starts[1:]):
+            if order == 1 and len({rate(a + (xi + 1.0) * 0.5 * (c - a)) for xi, _ in _GL5}) == 1:
+                pts.append((c, xc))                   # constant rate: x is exactly linear
+                continue
+            m = 4 if panel <= 0.0 else max(4, math.ceil((c - a) / panel))
+            if m > max_points:                       # too many oscillations to follow
+                m, dev = max_points, travel
+            spans = []
+            prev = (a, xa, ra)
+            for k in range(1, m + 1):
+                nxt = (a + (c - a) * k / m,) + advance(prev[0], prev[1], prev[2],
+                                                       a + (c - a) * k / m) if k < m else (c, xc, rc)
+                spans.append((prev, nxt, 0))
+                prev = nxt
+            spans.reverse()
+            while spans:
+                (p, xp, rp), (q, xq, rq), depth = spans.pop()
+                checks = [(p + (q - p) * j / 4.0,) + advance(p, xp, rp, p + (q - p) * j / 4.0)
+                          for j in (1, 2, 3)]
+                err = max(abs(xm - (xp + (xq - xp) * (tm - p) / (q - p))) for tm, xm, _ in checks)
+                if err <= tol or depth >= 40:
+                    dev = max(dev, err)
+                    pts.append((q, xq))
+                elif len(pts) + len(spans) > max_points:
+                    return None, dev                    # too fine for max_points
+                else:
+                    spans.append((checks[1], (q, xq, rq), depth + 1))
+                    spans.append(((p, xp, rp), checks[1], depth + 1))
+        return pts, dev
+    tol = rel_tol * travel
+    for _ in range(40):
+        pts, dev = sample(tol)
+        if pts is not None:
+            return pts, starts[-1][1], starts[-1][2], dev
+        tol *= 4.0
+    raise ValueError("velocity history could not be sampled")      # unreachable in practice
+
+
 class Converter:
 
     def __init__(self, report: Report, options) -> None:
@@ -2064,6 +2253,13 @@ class Converter:
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
         self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_mpcs)
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
+        # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
+        # such card, what each step appends for the ones it keeps, and the amplitudes only
+        # they use
+        self._vel_cards: Dict[int, List[object]] = {}
+        self._vel_tail: Dict[int, List[object]] = {}
+        self._vel_only_amps: set = set()
+        self._vel_amp_count = 0
 
     # -- properties ---------------------------------------------------------
     @property
@@ -4011,13 +4207,29 @@ class Converter:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
             out.extend(self.translate_one(b))
+        out.extend(self._boundary_pieces(self._vel_tail.get(self._step_idx, [])))
         out.extend(self._flush_dloads())
         out.extend(self._flush_nodal_loads())
         self._step_temp_dof = None
         out.append("*END STEP")
         return out
 
+    def _boundary_pieces(self, pieces: Sequence[object]) -> List[str]:
+        """Emit planned output: text lines as they are, *BOUNDARY blocks through
+        handle_boundary (so they get every treatment a deck's own BC gets)."""
+        out: List[str] = []
+        for p in pieces:
+            out.extend(self.handle_boundary(p) if isinstance(p, Block) else [p])
+        return out
+
     def handle_boundary(self, b: Block) -> List[str]:
+        if self._bc_type(b) in self._RATE_TYPES and id(b) in self._vel_cards:   # _plan_velocity_bcs
+            pieces = self._vel_cards[id(b)]
+            if id(b) in self._op_new_drop:       # the card's OP=NEW goes with its first block
+                for p in pieces:
+                    if isinstance(p, Block) and p.has("OP"):
+                        self._op_new_drop[id(p)] = self._op_new_drop[id(b)]
+            return self._boundary_pieces(pieces)
         if b.has("USER"):
             return self._user_load_card(b)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -4173,6 +4385,614 @@ class Converter:
             "ZASYMM": [(1, 2), (6, 6)] if rot else [(1, 2)],
         }
         return table.get(name)
+
+    # -- velocity / acceleration boundary conditions -------------------------------
+    _RATE_TYPES = ("VELOCITY", "ACCELERATION")
+    # linear perturbation procedures: the base state does not move, BCs only constrain
+    _PERTURBATION_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC",
+                           "COMPLEX FREQUENCY", "RANDOM RESPONSE", "RESPONSE SPECTRUM",
+                           "SUBSTRUCTURE GENERATE", "MATRIX GENERATE"}
+    # procedures that move nodes over a time period given as the 2nd field of their data line
+    _MOTION_PROCS = {"STATIC", "DYNAMIC", "VISCO", "COUPLED TEMPERATURE-DISPLACEMENT",
+                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "SOILS", "GEOSTATIC"}
+
+    @staticmethod
+    def _bc_type(b: Block) -> str:
+        return (b.param("TYPE") or "DISPLACEMENT").strip().upper()
+
+    def _rate_lines(self, b: Block) -> List[Tuple[str, List[int], str, Optional[str], str]]:
+        """(node spec, DOFs, magnitude text, named type, line text) of each data line of
+        *BOUNDARY ``b`` as it will be emitted (after _plan_coupled_bcs's rewrite of the card,
+        if any).  DOFs are [] where the line names none the converter can read (a blank
+        first DOF, an unknown type); a named type covers DOFs 4-6 where handle_boundary
+        expands it so (_named_bc_rot)."""
+        out = []
+        for rec in self._bc_lines.get(id(b)) or merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) < 2 or not g[0]:
+                continue
+            text = ", ".join(g)
+            if re.fullmatch(r"[-+]?\d+", g[1]):
+                d1 = int(g[1])
+                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
+                out.append((g[0], list(range(min(d1, d2), max(d1, d2) + 1)),
+                            g[3] if len(g) > 3 else "", None, text))
+            elif g[1]:
+                dofs = [d for a, c in (self._named_bc_dofs(g[1], self._named_bc_rot(g[0])) or [])
+                        for d in range(a, c + 1)]
+                out.append((g[0], dofs, "", g[1] if dofs else None, text))
+            else:
+                out.append((g[0], [], "", None, text))
+        return out
+
+    def _step_motion(self, group: List[Block], nlgeom: bool) -> dict:
+        """What the velocity-BC plan needs to know of a step: the time period over which its
+        nodes move (None for Riks, heat transfer, a linear perturbation, ...), the time it
+        adds to the total time (0 for a perturbation step, None when unknown), the default
+        amplitude of its loads and BCs, and whether it is dynamic / under NLGEOM."""
+        step_b = group[0]
+        proc_b = next((x for x in group[1:] if x.keyword in PROC_KW or
+                       x.keyword in self._MOTION_PROCS), None)
+        proc = proc_b.keyword if proc_b is not None else ""
+        explicit = proc == "DYNAMIC" and proc_b.has("EXPLICIT")
+        perturbation = step_b.has("PERTURBATION") or proc in self._PERTURBATION_PROCS
+        period = None
+        advance: Optional[float] = 0.0 if perturbation else None
+        if (proc in self._MOTION_PROCS or proc == "HEAT TRANSFER") and not proc_b.has("RIKS") \
+                and not perturbation:
+            rec = (merged_data_records(proc_b) or [[]])[0]
+            try:
+                advance = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0     # Abaqus default 1
+            except ValueError:
+                advance = None
+            if advance is not None and not advance > 0.0:
+                advance = None
+            if proc != "HEAT TRANSFER":
+                period = advance
+        default = (step_b.param("AMPLITUDE") or "").strip().upper()
+        if explicit:
+            default = "STEP"         # Abaqus/Explicit applies loads and BCs at once
+        elif default not in ("RAMP", "STEP"):
+            # Abaqus: loads and BCs step in dynamics (except quasi-static), ramp elsewhere
+            quasi = proc_b is not None and (proc_b.param("APPLICATION") or "").upper().startswith("QUASI")
+            default = "STEP" if proc == "DYNAMIC" and not quasi else "RAMP"
+        if step_b.has("NLGEOM"):
+            nlgeom = nlgeom or (step_b.param("NLGEOM") or "YES").strip().upper() != "NO"
+        return dict(period=period, advance=advance, default=default, dynamic=proc == "DYNAMIC",
+                    perturbation=perturbation, nlgeom=nlgeom or explicit,
+                    proc=(proc + (", RIKS" if proc_b.has("RIKS") else "")) if proc else "(no procedure)")
+
+    @staticmethod
+    def _bc_history(bc: dict, period: float, t0: Optional[float], u_start: Optional[float],
+                    prev: float):
+        """(value(t), breaks, panel) of the quantity a tracked BC prescribes over a step
+        (t in step time, t0 the total time at the step start), or None if not known."""
+        mode = bc["mode"]
+        if mode == "AMP":
+            c = bc["curve"]
+            if c.total and t0 is None:
+                return None
+            off = t0 if c.total else 0.0
+            k = 1.0 if c.absolute else bc["mag"]
+            return (lambda t: k * c.value(off + t)), [x - off for x in c.breaks], c.panel
+        if mode in ("STEP", "HOLD"):
+            v = bc["mag"] if mode == "STEP" else bc["hold"]
+            return (lambda t: v), [], 0.0
+        if mode == "RAMP":
+            m = bc["mag"]
+            return (lambda t: prev + (m - prev) * t / period), [], 0.0
+        if mode == "FIXED" and u_start is not None:
+            return (lambda t: u_start), [], 0.0
+        return None
+
+    def _plan_velocity_bcs(self, blocks: List[Block]) -> None:
+        """*BOUNDARY, TYPE=VELOCITY / ACCELERATION -> displacement BCs: ccx prescribes
+        displacements only (its *BOUNDARY has no TYPE).
+
+        The DOF moves by the time integral of the prescribed velocity (an acceleration:
+        twice, from the velocity at the step start) from the displacement it has at the
+        start of the step, so the converted BC is a displacement BC whose generated
+        amplitude is that integral: exact at its points, straight between them like any ccx
+        amplitude (integrate_history keeps that within 1e-4 of the step's travel; a
+        constant or piecewise-constant rate is exact).  The rate is the magnitude times the
+        amplitude (VALUE=ABSOLUTE: the amplitude alone; TIME=TOTAL TIME on total time) or,
+        without AMPLITUDE, the step default: STEP holds the magnitude over the step, RAMP
+        ramps the rate from its previous value.  A rate BC a later step keeps (no OP=NEW,
+        not re-specified) keeps moving the DOF in Abaqus - at the rate it ended with, or
+        along a TOTAL TIME amplitude - while a ccx BC with a step-time amplitude stays at
+        its last value (manual, *AMPLITUDE), so that step gets the continued motion before
+        its *END STEP (_vel_tail).  The start displacement and velocity of each DOF are
+        followed through the steps; where the displacement is unknown (the DOF was free, or
+        held by a USER / SUBMODEL BC) a zero rate becomes *BOUNDARY, FIXED (probed: holds
+        the value the previous step ended with) and any other rate cannot be converted.
+        The midside node of an upgraded 2-node beam whose end nodes a card drives gets the
+        mean of their motions, which is what the Abaqus element sees between them."""
+        self._vel_cards = {}
+        self._vel_tail = {}
+        self._vel_only_amps = set()
+        rate_cards = [b for b in blocks if b.keyword == "BOUNDARY" and self._bc_type(b) in self._RATE_TYPES]
+        if not rate_cards:
+            return
+        curves: Dict[str, Optional[AmplitudeCurve]] = {}
+        for b in blocks:
+            if b.keyword == "AMPLITUDE" and b.param("NAME"):
+                curves[b.param("NAME").strip().upper()] = amplitude_curve(b)
+        # amplitudes no other card names (any parameter, e.g. FILM AMPLITUDE=, or data field)
+        named_amps = {(b.param("AMPLITUDE") or "").strip().upper() for b in rate_cards} - {""}
+        others: set = set()
+        for b in blocks:
+            if b.keyword == "AMPLITUDE" or b.keyword in GEOM_KW:
+                continue
+            rate = b.keyword == "BOUNDARY" and self._bc_type(b) in self._RATE_TYPES
+            others.update(v.strip().upper() for k, v in b.params.items()
+                          if v and not (k == "AMPLITUDE" and (rate or b.keyword == "STEP")))
+            others.update(x.upper() for rec in merged_data_records(b) for x in rec if x)
+        self._vel_only_amps = named_amps - others
+        tracked: set = set()
+        for b in rate_cards:
+            for spec, dofs, _, _, _ in self._rate_lines(b):
+                tracked.update((n, d) for n in self._resolve_nodes(spec) for d in dofs if 1 <= d <= 6)
+        v_init: Dict[Tuple[int, int], Optional[float]] = {}
+        for b in blocks:
+            typ = (b.param("TYPE") or "").strip().upper() if b.keyword == "INITIAL CONDITIONS" else ""
+            for rec in merged_data_records(b) if typ in ("VELOCITY", "ROTATING VELOCITY") else []:
+                try:
+                    val = (int(rec[1]), pf(rec[2])) if typ == "VELOCITY" else None
+                except (IndexError, ValueError):
+                    continue
+                for n in self._resolve_nodes(rec[0]) if rec else []:
+                    if val is None:                    # rotating: not followed
+                        v_init.update(((n, d), None) for d in range(1, 7))
+                    else:
+                        v_init[(n, val[0])] = val[1]
+        # per tracked DOF: [displacement, velocity, BC in force] (None: unknown / free)
+        state = {k: [0.0, v_init.get(k, 0.0), None] for k in tracked}
+        model: List[Block] = []
+        groups: List[List[Block]] = []
+        i = 0
+        while i < len(blocks):                       # the step grouping of emit_other
+            if blocks[i].keyword == "STEP":
+                j, group = i, []
+                while j < len(blocks):
+                    group.append(blocks[j])
+                    if blocks[j].keyword == "END STEP":
+                        break
+                    j += 1
+                groups.append(group)
+                i = j + 1
+                continue
+            if blocks[i].keyword == "BOUNDARY" and not groups:
+                model.append(blocks[i])
+            i += 1
+        names = {"VELOCITY": "VEL", "ACCELERATION": "ACC"}
+        stats = {"dev": 0.0, "n": 0}
+        max_points = 1000
+
+        def amp_card(pts: List[Tuple[float, float]], q: str) -> Tuple[str, List[str]]:
+            self._vel_amp_count += 1
+            name = f"ABQ2CCX_{names[q]}{self._vel_amp_count}"
+            toks = [f"{t:.12g}, {x:.12g}" for t, x in pts]
+            return name, [f"*AMPLITUDE, NAME={name}"] + [", ".join(toks[i:i + 4])
+                                                         for i in range(0, len(toks), 4)]
+
+        def runs(ds: Sequence[int]) -> List[Tuple[int, int]]:
+            """Contiguous runs of sorted DOFs."""
+            out: List[Tuple[int, int]] = []
+            for d in ds:
+                if out and out[-1][1] == d - 1:
+                    out[-1] = (out[-1][0], d)
+                else:
+                    out.append((d, d))
+            return out
+
+        def lines(spec: str, dofs: List[int], members: List[Tuple[int, int]], value: str,
+                  named: Optional[str] = None) -> List[str]:
+            """Data lines for ``members`` of a line on spec x dofs: on the spec itself (its
+            named type, when it is all of it and has no value) when they are some DOFs of
+            all its nodes, else per node; DOFs as contiguous runs."""
+            tail = [value] if value else []
+            nodes = self._resolve_nodes(spec)
+            sub = sorted({d for _, d in members})
+            if not nodes or set(members) == {(n, d) for n in nodes for d in sub}:
+                if named and sub == sorted(dofs) and not value:
+                    return [f"{spec}, {named}"]
+                return [", ".join([spec, str(a), str(c)] + tail) for a, c in runs(sub or dofs)]
+            out = []
+            for n in dedup([n for n, _ in members]):
+                out += [", ".join([str(n), str(a), str(c)] + tail)
+                        for a, c in runs(sorted(d for m, d in members if m == n))]
+            return out
+
+        def pieces(op: Optional[str], amp_lines: List[str], entries: List[Tuple[object, str]],
+                   notes: List[str]) -> List[object]:
+            """The generated amplitudes, then one *BOUNDARY per run of lines of one kind
+            (line order kept: a later line overrides an earlier one on the same DOF)."""
+            out: List[object] = list(notes) + list(amp_lines)
+            for sig, text in entries:
+                if sig == "#":
+                    out.append(text)
+                    continue
+                if out and isinstance(out[-1], Block) and getattr(out[-1], "_sig", None) == sig:
+                    out[-1].data.append(text)
+                    continue
+                params = []
+                if op and not any(isinstance(p, Block) for p in out):
+                    params.append(("OP", op))
+                if sig == "FIXED":
+                    params.append(("FIXED", None))
+                elif sig is not None:
+                    params.append(("AMPLITUDE", sig))
+                blk = mkblock("BOUNDARY", params, [text])
+                blk._sig = sig
+                out.append(blk)
+            if op and not any(isinstance(p, Block) for p in out):
+                out.append(mkblock("BOUNDARY", [("OP", op)], []))     # it still removes BCs
+            return out
+
+        def comment(what: str, why: str) -> Tuple[str, str]:
+            self.report.warn(why, once=True)
+            return ("#", f"** [abq2ccx] not converted: {what} -- {why}")
+
+        def constraint_card(b: Block, why: str) -> List[object]:
+            """A rate card where only its constraint can be kept (model data, perturbation)."""
+            entries = []
+            for spec, dofs, mag, named, text in self._rate_lines(b):
+                try:
+                    nonzero = bool(mag) and pf(mag) != 0.0
+                except ValueError:
+                    nonzero = True
+                if not dofs or nonzero:
+                    entries.append(comment(text, f"*BOUNDARY, TYPE={self._bc_type(b)} {why}: "
+                                                 f"only a zero value on readable DOFs can be "
+                                                 f"converted (to a zero displacement BC)."))
+                else:
+                    entries.append((None, f"{spec}, {named}" if named else
+                                    f"{spec}, {dofs[0]}, {dofs[-1]}"))
+            self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION {why}: zero-valued, so "
+                             f"converted to the zero displacement BC it amounts to.", once=True)
+            return pieces(b.param("OP"), [], entries, [])
+
+        for b in model:
+            if self._bc_type(b) in self._RATE_TYPES:
+                self._vel_cards[id(b)] = constraint_card(b, "in model data")
+            for spec, dofs, mag, _, _ in self._rate_lines(b):      # held from the first step on
+                try:
+                    value = pf(mag) if mag and self._bc_type(b) not in self._RATE_TYPES else 0.0
+                except ValueError:
+                    value = 0.0
+                bc = dict(q="DISPLACEMENT", mode="STEP", mag=value, end=value)
+                for k in ((n, d) for n in self._resolve_nodes(spec) for d in dofs):
+                    if k in state:
+                        state[k][2] = bc
+        t0: Optional[float] = 0.0                # total time at the step start (None: unknown)
+        nlgeom = False
+        for s, group in enumerate(groups, 1):
+            info = self._step_motion(group, nlgeom)
+            nlgeom = info["nlgeom"]
+            T = info["period"]
+            cards = [x for x in group[1:] if x.keyword == "BOUNDARY"]
+            if T is None:
+                why = ("in a linear perturbation step (the base state does not move; only the "
+                       "constraint applies)" if info["perturbation"] else
+                       f"in a {info['proc']} step (no time period over which to integrate it)")
+                for b in cards:
+                    if self._bc_type(b) in self._RATE_TYPES:
+                        self._vel_cards[id(b)] = constraint_card(b, why)
+                if not info["perturbation"] and info["proc"] != "HEAT TRANSFER":
+                    for st in state.values():          # nodes moved, by unknown amounts
+                        st[0] = st[1] = None
+                t0 = None if t0 is None or info["advance"] is None else t0 + info["advance"]
+                continue
+            start = {k: (st[0], st[1]) for k, st in state.items()}
+            prev_bc = {k: st[2] for k, st in state.items()}
+            # where a RAMP starts: the value the DOF's earlier BC of that type ended with
+            # (read before this step's end values overwrite a carried BC's)
+            prev_end = {k: (pb["q"], pb.get("end")) for k, pb in prev_bc.items() if pb}
+            op_new = any((b.param("OP") or "").strip().upper() == "NEW" for b in cards)
+            if op_new:
+                for st in state.values():
+                    st[2] = None
+            memo: Dict[tuple, Tuple[dict, object]] = {}
+
+            def motion(bc: dict, u_s: Optional[float], v_s: Optional[float], prev: float):
+                """integrate_history of the DOF under rate BC bc from (u_s, v_s), or None."""
+                key = (id(bc), u_s, v_s, prev)
+                if key not in memo:          # the entry keeps bc alive: no other dict gets its id
+                    h = self._bc_history(bc, T, t0, None, prev)
+                    order = 2 if bc["q"] == "ACCELERATION" else 1
+                    memo[key] = (bc, None if h is None or u_s is None or (order == 2 and v_s is None)
+                                 or too_fast(h) else
+                                 integrate_history(h[0], h[1], T, order, u_s, v_s or 0.0, h[2],
+                                                   max_points=max_points))
+                return memo[key][1]
+
+            def too_fast(h) -> bool:
+                """More than a thousand oscillations in the step: no sampled amplitude can
+                follow them (integrate_history caps its points)."""
+                return h[2] > 0.0 and T / h[2] > 8 * max_points
+
+            def prev_rate(k: Tuple[int, int], bc: dict) -> float:
+                """Where a RAMP of bc on DOF k starts (0 without an earlier BC of its type)."""
+                pe = prev_end.get(k)
+                return (pe[1] or 0.0) if bc["mode"] == "RAMP" and pe and pe[0] == bc["q"] else 0.0
+
+            def convert(bc: dict, keys: List[Tuple[int, int]], shapes: Dict[tuple, str],
+                        amp_lines: List[str], entries: list, driven: dict) -> None:
+                """Entries for the DOFs ``keys`` of a line under rate BC ``bc``."""
+                q, order = bc["q"], 2 if bc["q"] == "ACCELERATION" else 1
+                spec, dofs, named, text = bc["spec"], bc["dofs"], bc.get("named"), bc["text"]
+                if bc["mode"] == "UNKNOWN":
+                    entries.append(comment(text, f"*BOUNDARY, TYPE={q} with AMPLITUDE={bc['amp']}: "
+                                                 f"that amplitude is not one the converter can "
+                                                 f"integrate (TABULAR, EQUALLY SPACED, SMOOTH STEP, "
+                                                 f"PERIODIC, MODULATED, DECAY)."))
+                    return
+                if bc["mode"] == "AMP" and bc["curve"].total and t0 is None:
+                    entries.append(comment(text, f"*BOUNDARY, TYPE={q} with a TIME=TOTAL TIME "
+                                                 f"amplitude after a step whose time period is "
+                                                 f"unknown (Riks, or no procedure)."))
+                    return
+                if bc["mode"] == "AMP" and too_fast((None, None, bc["curve"].panel)):
+                    entries.append(comment(text, f"*BOUNDARY, TYPE={q} whose amplitude oscillates "
+                                                 f"over a thousand times in the step: too fast for "
+                                                 f"a sampled displacement amplitude."))
+                    return
+                groups_: "OrderedDict[tuple, List[Tuple[int, int]]]" = OrderedDict()
+                for k in keys:
+                    u_s, v_s = start.get(k, (0.0, 0.0))
+                    groups_.setdefault((u_s, v_s if order == 2 else 0.0, prev_rate(k, bc)), []).append(k)
+                if not keys:                           # unresolved set: ccx will say so
+                    groups_[(0.0, 0.0, 0.0)] = []
+                for (u_s, v_s, prev), members in groups_.items():
+                    members = members or [(0, d) for d in dofs]
+                    if u_s is None or v_s is None:
+                        still = None if v_s is None else motion(bc, 0.0, v_s, prev)
+                        if still is None or any(x != 0.0 for _, x in still[0]):
+                            entries.append(comment(text, f"*BOUNDARY, TYPE={q} on a DOF whose "
+                                                         f"displacement at the start of the step is "
+                                                         f"unknown (it was free, or held by a "
+                                                         f"USER/SUBMODEL BC, before): ccx prescribes "
+                                                         f"total displacements only."))
+                            continue
+                        # a zero rate holds the DOF where the step finds it: FIXED takes the
+                        # translations (and a rigid body's rotations, which go to its ROT
+                        # NODE's translations); a solid node has no DOFs 4-6 to hold
+                        fix = [(n, d) for n, d in members if d <= 3 or n in self._rb_rot]
+                        rotating = [(n, d) for n, d in members
+                                    if (n, d) not in fix and n in self._rot_nodes]
+                        if fix:
+                            entries += [("FIXED", ln) for ln in lines(spec, dofs, fix, "")]
+                        if rotating:
+                            entries.append(comment(
+                                f"{spec}, DOF {', '.join(map(str, sorted({d for _, d in rotating})))}",
+                                f"*BOUNDARY, TYPE={q}: a zero rate on a shell/beam rotation whose "
+                                f"value at the start of the step is unknown (ccx's *BOUNDARY, "
+                                f"FIXED takes no rotations)."))
+                        continue
+                    pts, _, _, dev = motion(bc, u_s, v_s, prev)
+                    travel = max(abs(x - u_s) for _, x in pts)
+                    if travel == 0.0:
+                        value = "%.12g" % u_s if u_s else ""
+                        entries += [(None, ln) for ln in lines(spec, dofs, members, value, named)]
+                        driven.update((k, (bc, u_s, v_s, prev, None, value or "0")) for k in members)
+                        continue
+                    stats["dev"] = max(stats["dev"], dev / travel)
+                    stats["n"] += 1
+                    absolute = bc["mode"] == "AMP" and bc["curve"].absolute
+                    hold = (bc.get("hold"), bc["mag"]) if bc["mode"] == "HOLD" else None
+                    if u_s == 0.0 and v_s == 0.0 and prev == 0.0 and bc["mag"] and not absolute:
+                        key, value = (q, bc["mode"], bc.get("amp"), hold), "%.12g" % bc["mag"]
+                        scale = bc["mag"]              # motion per unit magnitude, shared
+                    else:                              # the motion itself, shared if identical
+                        key, value = (q, bc["mode"], bc.get("amp"), hold, bc["mag"], absolute,
+                                      u_s, v_s, prev), "1."
+                        scale = 1.0
+                    if key not in shapes:
+                        shapes[key], text_ = amp_card([(t, x / scale) for t, x in pts], q)
+                        amp_lines += text_
+                    entries += [(shapes[key], ln) for ln in lines(spec, dofs, members, value)]
+                    driven.update((k, (bc, u_s, v_s, prev, shapes[key], value)) for k in members)
+                    if info["dynamic"] and order == 1:
+                        f0 = self._bc_history(bc, T, t0, None, prev)[0](0.0)
+                        if abs(f0 - (start.get(members[0], (0.0, 0.0))[1] or 0.0)) > 1e-12 * abs(f0):
+                            self.report.note("*BOUNDARY, TYPE=VELOCITY with a jump in velocity at the "
+                                             "start of a dynamic step: ccx derives the driven node's "
+                                             "velocity from its prescribed displacement, so that "
+                                             "node's own velocity output oscillates for a while "
+                                             "after the jump (it decays); the motion it imposes and "
+                                             "the rest of the model are unaffected (probed on "
+                                             "2.23).", once=True)
+                    if any(n in self._transformed and (d <= 3 or n not in self._rb_rot)
+                           for n, d in members):
+                        self.report.warn("*BOUNDARY, TYPE=VELOCITY/ACCELERATION on a node with a "
+                                         "*TRANSFORM: ccx allows only one amplitude for all DOFs of "
+                                         "such a node; check its other BCs.", once=True)
+
+            def mean_entry(ea: tuple, ec: tuple, m: int, d: int, shapes: Dict[tuple, str],
+                           amp_lines: List[str]) -> Optional[Tuple[object, str]]:
+                """The line that moves midside node m with the mean of the motions of its
+                end nodes (entries ``ea``/``ec`` of a driven map), or None (a velocity and an
+                acceleration end)."""
+                if ea[4] == ec[4]:                 # one amplitude (or none): mean of the values
+                    return (ea[4], f"{m}, {d}, {d}, {(pf(ea[5]) + pf(ec[5])) / 2.0:.12g}")
+                orders = {e[0]["q"] for e in (ea, ec) if e[4] is not None}
+                if len(orders) > 1:
+                    return None
+                order = 2 if orders == {"ACCELERATION"} else 1
+                rates = [(self._bc_history(e[0], T, t0, None, e[3]) if e[4] is not None else None)
+                         or ((lambda t: 0.0), [], 0.0) for e in (ea, ec)]
+                pts, _, _, _ = integrate_history(
+                    lambda t: 0.5 * (rates[0][0](t) + rates[1][0](t)), list(rates[0][1]) +
+                    list(rates[1][1]), T, order, (ea[1] + ec[1]) / 2.0,
+                    ((ea[2] or 0.0) + (ec[2] or 0.0)) / 2.0,
+                    min([h[2] for h in rates if h[2] > 0.0], default=0.0), max_points=max_points)
+                key = ("midside", m, d, ea[4], ec[4], ea[5], ec[5])
+                if key not in shapes:
+                    shapes[key], text_ = amp_card(pts, "ACCELERATION" if order == 2 else "VELOCITY")
+                    amp_lines += text_
+                return (shapes[key], f"{m}, {d}, {d}, 1.")
+
+            def midside(driven: dict, shapes: Dict[tuple, str], amp_lines: List[str],
+                        entries: list, done: set) -> None:
+                """The midside node of an upgraded 2-node beam whose end nodes these lines
+                drive moves with the mean of their motions, which is what the Abaqus element
+                sees between them (handle_boundary interpolates only within one *BOUNDARY
+                block, and the end nodes may get different amplitudes)."""
+                for a, c, m in self._midside.values():
+                    for d in range(1, 7):
+                        ea, ec = driven.get((a, d)), driven.get((c, d))
+                        if ea and ec and (m, d) not in driven:
+                            e = mean_entry(ea, ec, m, d, shapes, amp_lines)
+                            if e is not None:
+                                entries.append(e)
+                                done.add((m, d))
+
+            redefined: set = set()
+            shapes: Dict[tuple, str] = {}
+            step_driven: dict = {}                 # every DOF a rate BC moves in this step
+            mid_done: set = set()
+            for b in cards:
+                q = self._bc_type(b)
+                amp = (b.param("AMPLITUDE") or "").strip()
+                curve = curves.get(amp.upper()) if amp else None
+                rate = q in self._RATE_TYPES
+                amp_lines: List[str] = []
+                entries: list = []
+                driven: dict = {}
+                for spec, dofs, mag_txt, named, text in self._rate_lines(b):
+                    keys = [(n, d) for n in self._resolve_nodes(spec) for d in dofs if (n, d) in state]
+                    try:
+                        mag: Optional[float] = pf(mag_txt) if mag_txt else 0.0
+                    except ValueError:
+                        mag = None
+                    if not rate:
+                        mode = "UNKNOWN" if mag is None or b.has("USER") or b.has("SUBMODEL") else \
+                            "FIXED" if b.has("FIXED") else ("AMP" if curve else "UNKNOWN") if amp \
+                            else "STEP"
+                        bc = dict(q="DISPLACEMENT", mode=mode, mag=mag or 0.0, curve=curve)
+                    else:
+                        bad = mag is None or b.has("USER") or not dofs or \
+                            any(not 1 <= d <= 6 for d in dofs)
+                        if bad:
+                            entries.append(comment(text, f"*BOUNDARY, TYPE={q}: only constant "
+                                                         f"magnitudes on DOFs 1-6 or a known named "
+                                                         f"type (no USER) can be integrated into "
+                                                         f"displacements."))
+                            mode = "UNKNOWN"
+                        elif named:
+                            mode, mag = "STEP", 0.0
+                        else:
+                            mode = ("AMP" if curve else "UNKNOWN") if amp else info["default"]
+                        bc = dict(q=q, mode=mode, mag=mag or 0.0, curve=curve, amp=amp or None,
+                                  spec=spec, dofs=dofs, named=named, text=text)
+                        if mode == "RAMP" and (mag or any(prev_rate(k, bc) for k in keys)):
+                            self.report.warn(f"*BOUNDARY, TYPE={q} without AMPLITUDE in a step whose "
+                                             f"default amplitude is RAMP: taken, like any Abaqus BC, "
+                                             f"as the {q.lower()} ramping from its previous value (0 "
+                                             f"at first) to the given one over the step, so the "
+                                             f"displacement grows quadratically. If the deck means "
+                                             f"a constant {q.lower()}, give it an amplitude (or *STEP, "
+                                             f"AMPLITUDE=STEP).", once=True)
+                        if not bad:
+                            convert(bc, keys, shapes, amp_lines, entries, driven)
+                    for k in keys:
+                        state[k][2] = bc
+                        redefined.add(k)
+                if rate:
+                    midside(driven, shapes, amp_lines, entries, mid_done)
+                    self._vel_cards[id(b)] = pieces(b.param("OP"), amp_lines, entries, [])
+                for spec, dofs, _, _, _ in self._rate_lines(b):   # a later card replaces a BC
+                    for n in self._resolve_nodes(spec):
+                        for d in dofs:
+                            step_driven.pop((n, d), None)
+                step_driven.update(driven)
+            # rate BCs this step keeps from an earlier one keep moving their DOFs
+            tail_amps: List[str] = []
+            tail: list = []
+            tail_driven: dict = {}
+            carried: "OrderedDict[int, List[Tuple[int, int]]]" = OrderedDict()
+            for k in sorted(state):
+                bc = state[k][2]
+                if k not in redefined and bc is not None and bc["q"] in self._RATE_TYPES:
+                    carried.setdefault(id(bc), []).append(k)
+            for keys in carried.values():
+                convert(state[keys[0]][2], keys, shapes, tail_amps, tail, tail_driven)
+            midside(tail_driven, shapes, tail_amps, tail, mid_done)
+            step_driven.update(tail_driven)
+            for a, c, m in self._midside.values():  # end nodes driven by different cards
+                for d in range(1, 7):
+                    ea, ec = step_driven.get((a, d)), step_driven.get((c, d))
+                    if ea and ec and (m, d) not in mid_done and (m, d) not in step_driven:
+                        e = mean_entry(ea, ec, m, d, shapes, tail_amps)
+                        if e is not None:
+                            tail.append(e)
+            tail = [e for e in tail if e[0] not in (None, "FIXED")]   # ccx holds those already
+            if tail:
+                self._vel_tail[s] = pieces(None, tail_amps, tail,
+                                           ["** [abq2ccx] *BOUNDARY, TYPE=VELOCITY/ACCELERATION of "
+                                            "an earlier step, still in force: its motion continues"])
+            # warn where finite rotations about several axes are integrated component-wise
+            if nlgeom:
+                axes: Dict[int, int] = {}
+                for k, st in state.items():
+                    bc = st[2]
+                    if bc is not None and bc["q"] in self._RATE_TYPES and k[1] >= 4:
+                        res = motion(bc, 0.0, 0.0, prev_rate(k, bc))
+                        if res is not None and any(x != 0.0 for _, x in res[0]):
+                            axes[k[0]] = axes.get(k[0], 0) + 1
+                if any(c > 1 for c in axes.values()):
+                    self.report.warn("*BOUNDARY, TYPE=VELOCITY/ACCELERATION on more than one "
+                                     "rotational DOF of a node under NLGEOM: each rotation is "
+                                     "integrated on its own, which is exact only for a rotation "
+                                     "about a fixed axis (finite rotations do not add up).", once=True)
+            # where each DOF ends the step, and the form its BC carries into the next one
+            for k, st in state.items():
+                bc, (u_s, v_s) = st[2], start[k]
+                if bc is None:
+                    st[0] = st[1] = None
+                    continue
+                prev = prev_rate(k, bc) if bc["q"] in self._RATE_TYPES else 0.0
+                h = self._bc_history(bc, T, t0, u_s, prev)
+                bc["end"] = None if h is None else h[0](T)
+                if bc["q"] == "DISPLACEMENT":
+                    st[0] = bc["end"]
+                    st[1] = 0.0 if h is not None and u_s is not None and \
+                        all(h[0](t) == u_s for t in (0.0, 0.5 * T, T)) else None
+                else:
+                    res = motion(bc, u_s, v_s, prev)
+                    still = res is not None and all(x == u_s for _, x in res[0])
+                    st[0] = res[1] if res else None
+                    # only a dynamic step leaves a velocity a later ACCELERATION BC can
+                    # start from (a static step has none, unless nothing moved)
+                    st[1] = (bc["end"] if bc["q"] == "VELOCITY" else res[2] if res else None) \
+                        if info["dynamic"] else (0.0 if still else None)
+            forms: Dict[int, dict] = {}
+            for st in state.values():
+                bc = st[2]
+                if bc is None or bc["mode"] in ("FIXED", "UNKNOWN") or \
+                        (bc["mode"] == "AMP" and bc["curve"].total):
+                    continue                 # holds / unknown / still follows its amplitude
+                if id(bc) not in forms:
+                    forms[id(bc)] = dict(bc, mode="HOLD", hold=bc["end"]) if bc["end"] is not None \
+                        else dict(bc, mode="UNKNOWN")
+                st[2] = forms[id(bc)]
+            t0 = None if t0 is None else t0 + T
+        for b in rate_cards:                       # *BOUNDARY between steps: no step to act in
+            if id(b) not in self._vel_cards:
+                self._vel_cards[id(b)] = constraint_card(b, "outside a step")
+        if stats["n"]:
+            self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION -> displacement BCs whose "
+                             f"generated amplitudes (ABQ2CCX_VEL*/ACC*) are the time integral of the "
+                             f"prescribed history from the displacement at the step start: exact at "
+                             f"their points, straight between them (max deviation {stats['dev']:.1e} "
+                             f"of a step's travel; a constant rate is exact).", once=True)
+        if stats["dev"] > 2e-4:
+            self.report.warn(f"A *BOUNDARY, TYPE=VELOCITY/ACCELERATION history varies too fast to "
+                             f"sample exactly: the generated displacement amplitude deviates by up "
+                             f"to {stats['dev']:.1e} of the step's travel between its points.",
+                             once=True)
 
     def _load_params(self, b: Block, allowed: Sequence[str]) -> "OrderedDict[str, Optional[str]]":
         """Parameters ccx's distributed-load cards read; Abaqus-only ones are dropped —
@@ -5650,6 +6470,12 @@ class Converter:
         return [emit_keyword("RESTART", keep)] + list(b.data)
 
     def handle_amplitude(self, b: Block) -> List[str]:
+        if (b.param("NAME") or "").strip().upper() in self._vel_only_amps:
+            self.report.note("*AMPLITUDE used only by *BOUNDARY, TYPE=VELOCITY/ACCELERATION "
+                             "dropped: those BCs get generated displacement amplitudes that "
+                             "integrate it.", once=True)
+            return [f"** [abq2ccx] *AMPLITUDE, NAME={b.param('NAME')}: integrated into the "
+                    f"displacement amplitudes of the velocity/acceleration BCs using it"]
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         definition = ""
         fixed = None
@@ -6808,6 +7634,7 @@ class Converter:
         self._plan_rigid_couplings(blocks)
         self._plan_connector_rows(blocks)
         self._plan_coupled_bcs(blocks)
+        self._plan_velocity_bcs(blocks)       # after _plan_coupled_bcs: reads its card rewrites
         if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks) and any(
                 any(m in self._plane_only for m in members)
                 for _, members, _ in self._rigid_members(blocks)):

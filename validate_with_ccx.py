@@ -21,8 +21,9 @@ cube and circular-section beam with no initial temperatures, and the loads ccx h
 for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads (cantilevers
 against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
 (local axes), which must match the same models without one, *MPC joints, levers and links
-against statics, and connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those,
-beam theory and exact statics.
+against statics, connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
+theory and exact statics, and velocity / acceleration boundary conditions against their
+time integral and the wave they send through a bar.
 
     python validate_with_ccx.py
 
@@ -343,6 +344,40 @@ def global_twin(deck):
                       + "\n".join(eqs) + "\n")
     step = out[out.index("*Boundary\n"):out.index("*Node Print")]
     return out.replace(step, "*Boundary\nCLAMP, 1, 3\n*Cload\n" + "\n".join(cload) + "\n")
+
+
+def dat_history(dat_path, what, nset):
+    """[(time, rows)] of every ``what`` block ("displacements", "total force") that *NODE
+    PRINT wrote for ``nset`` in a ccx .dat file; rows are lists of floats (node id dropped)."""
+    out, rows = [], None
+    for ln in open(dat_path) if os.path.exists(dat_path) else []:
+        s = ln.strip()
+        if s.startswith(what) and f"for set {nset.upper()} " in s:
+            rows = []
+            out.append((float(s.split()[-1]), rows))
+        elif rows is not None and s:
+            f = s.split()
+            try:
+                vals = [float(x) for x in f]
+            except ValueError:
+                rows = None
+                continue
+            rows.append(vals[1:] if len(vals) == 4 and what != "total force" else vals)
+    return out
+
+
+def frd_last(frd_path, name):
+    """{node: values} of the last ``name`` block (DISP, STRESS, ...) in a ccx .frd file."""
+    last, cur = {}, None
+    for ln in open(frd_path) if os.path.exists(frd_path) else []:
+        if ln.startswith(" -4"):
+            cur = {} if ln.split()[1] == name else None
+        elif ln.startswith(" -1") and cur is not None:
+            n = (len(ln.rstrip()) - 13) // 12
+            cur[int(ln[3:13])] = [float(ln[13 + 12 * i:25 + 12 * i]) for i in range(n)]
+        elif ln.startswith(" -3") and cur is not None:
+            last, cur = cur, None
+    return last
 
 
 def main():
@@ -1107,6 +1142,73 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  transform_spherical_rigid (spherical *TRANSFORM, rigid body "
               f"with a cylindrical one on its reference point): u at {len(u[1])} nodes differs from "
               f"the model in global components by {err:.1e} of max |u| ({scale:.4g})")
+        failures += 0 if ok else 1
+
+    # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs ----------
+    # A column pulled through a rigid reference point: the velocity ramps in by a SMOOTH
+    # STEP (the corpus' davidmorin pattern) and stays in force in a second step, where a ccx
+    # BC would freeze; every increment must sit on the integral of the velocity.
+    inp = os.path.join(tmp, "velocity_bc_column.inp")
+    convert(os.path.join(EXAMPLES, "velocity_bc_column.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    top = dat_history(os.path.join(d, "job.dat"), "displacements", "TOP")
+    rf = dat_history(os.path.join(d, "job.dat"), "total force", "BOTTOM")
+    shutil.rmtree(d, ignore_errors=True)
+
+    def pulled(t):                       # velocity 1 with a SMOOTH STEP over the first 0.001
+        s = min(t / 0.001, 1.0)
+        return 0.001 * s ** 4 * (2.5 - 3 * s + s * s) + max(t - 0.001, 0.0)
+    if status != "solved" or not top or not rf:
+        print(f"FAIL  velocity_bc_column: did not solve ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        failures += 1
+    else:
+        dev = max(abs(r[2] - pulled(t)) for t, rows in top for r in rows) / pulled(0.015)
+        ends = [rows[0][2] for t, rows in top if abs(t - 0.01) < 1e-9 or abs(t - 0.015) < 1e-9]
+        force = -rf[-1][1][0][2] / (1000.0 * pulled(0.015) / 4.0)       # vs E A u / L
+        ok = dev < 1e-4 and len(ends) == 2 and abs(ends[0] - 0.0095) < 1e-9 and \
+            abs(ends[1] - 0.0145) < 1e-9 and abs(force - 1.0) < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  velocity_bc_column (TYPE=VELOCITY, SMOOTH STEP, kept "
+              f"into a 2nd step): top at {ends[0] if ends else float('nan'):.6f} / "
+              f"{ends[1] if len(ends) > 1 else float('nan'):.6f} (integral 0.009500 / 0.014500), "
+              f"{len(top)} increments within {dev:.1e} of the travel; reaction {force:.4f} x E A u/L")
+        failures += 0 if ok else 1
+    # A bar driven at one end, explicit: a constant velocity v sends a wave with stress
+    # -rho c v behind its front (on average: without Abaqus' bulk viscosity the explicit
+    # solution rings behind the step front); as an implicit variant a constant acceleration
+    # a, whose wave stress grows linearly behind the front, -rho c a (t - z / c).
+    src = open(os.path.join(EXAMPLES, "velocity_bc_bar.inp")).read()
+    accel = src.replace("nlgeom=YES\n*Dynamic, Explicit\n , 0.5",
+                        "nlgeom=YES, inc=1000\n*Dynamic, direct\n 0.002, 0.5") \
+        .replace("type=VELOCITY\n DRIVEN, 3, 3, 0.01", "type=ACCELERATION\n DRIVEN, 3, 3, 0.04")
+    for label, text, ref, mean_only in (
+            ("explicit, TYPE=VELOCITY", src, lambda z: -0.01 if z < 0.5 else 0.0, True),
+            ("implicit, TYPE=ACCELERATION", accel, lambda z: -0.04 * (0.5 - z) if z < 0.5 else 0.0,
+             False)):
+        tmp_src = os.path.join(tmp, "velocity_bc_bar_src.inp")
+        with open(tmp_src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, "velocity_bc_bar.inp")
+        convert(tmp_src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        s = frd_last(os.path.join(d, "job.frd"), "STRESS")
+        u = frd_last(os.path.join(d, "job.frd"), "DISP")
+        shutil.rmtree(d, ignore_errors=True)
+        if status != "solved" or not s or 1 not in u:
+            print(f"FAIL  velocity_bc_bar ({label}): did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            failures += 1
+            continue
+        line = [(k / 100.0, s[4 * k + 1][2]) for k in range(101)]     # S33 along the edge x=y=0
+        peak = abs(ref(0.0))
+        diff = [v - ref(z) for z, v in line if 0.1 <= z <= 0.4]
+        mean, worst = abs(sum(diff) / len(diff)) / peak, max(abs(x) for x in diff) / peak
+        ahead = max(abs(v) for z, v in line if z >= 0.6) / peak
+        ok = (mean < 0.02 if mean_only else worst < 0.05) and ahead < 0.01 and \
+            abs(u[1][2] - 0.005) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  velocity_bc_bar ({label}): driven end u = "
+              f"{u[1][2]:.6f} (0.005); wave stress behind the front {mean * 100:.1f}% off on "
+              f"average ({worst * 100:.1f}% at worst), {ahead * 100:.2f}% ahead of it")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

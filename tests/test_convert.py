@@ -146,8 +146,8 @@ def test_comprehensive_coverage():
     # supported, lightly translated
     assert "*CREEP\n" in body and "LAW=STRAIN" not in body   # LAW translated to Norton default
     assert "*USER MATERIAL, CONSTANTS=2" in body
-    # *BOUNDARY TYPE= stripped
-    assert "*BOUNDARY\nNALL, 1, 3, 0." in body
+    # *BOUNDARY, TYPE=VELOCITY: a zero velocity from rest is a zero displacement BC
+    assert "*BOUNDARY\nNALL, 1, 3\n" in body
     # output variable mapping
     assert "S, E, ME, PEEQ" in body                   # LE->E, EE->ME, MISES & ELSE dropped
     assert "U, RF" in body                            # RM->RF, A dropped
@@ -4004,6 +4004,284 @@ def test_transform_spherical_rigid_example():
     assert sorted(got) == [32, 33, 34, 37, 38, 39, 42, 43, 44, 100, rot] and got[100][0] == "C"
     assert f"\n{rot}, 1, 2\n" in body and f"\n{rot}, 3, 0.05\n" in body
     assert rep.n_warnings == 0 and not conv.unloaded_steps and not dangling_refs(reparse(body))
+
+
+# --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION ------------------------------------------
+
+VEL_HEX = HEX + """*NSET, NSET=TOP
+5, 6, 7, 8
+*NSET, NSET=BOT
+1, 2, 3, 4
+*MATERIAL, NAME=M
+*ELASTIC
+1000., 0.
+*DENSITY
+1.
+*SOLID SECTION, ELSET=EALL, MATERIAL=M
+*BOUNDARY
+BOT, 1, 3
+"""
+
+
+def _amplitude(body, name):
+    """The (time, value) points of *AMPLITUDE NAME=name in an emitted deck."""
+    lines = body.splitlines()
+    vals = []
+    for ln in lines[lines.index(f"*AMPLITUDE, NAME={name}") + 1:]:
+        if ln.startswith("*"):
+            break
+        vals += [float(x) for x in ln.split(",")]
+    return list(zip(vals[0::2], vals[1::2]))
+
+
+def _at(points, t):
+    """What ccx applies at time t from tabular points: straight lines, end values held."""
+    if t <= points[0][0]:
+        return points[0][1]
+    for (t0, v0), (t1, v1) in zip(points, points[1:]):
+        if t <= t1:
+            return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+    return points[-1][1]
+
+
+def test_amplitude_curve_definitions():
+    def curve(params, data):
+        return A.amplitude_curve(A.mkblock("AMPLITUDE", [("NAME", "A")] + params, data))
+    c = curve([], ["0., 0., 1., 2., 3., 2."])
+    assert [c.value(t) for t in (-1., 0.5, 2., 9.)] == [0., 1., 2., 2.] and c.breaks == [0., 1., 3.]
+    c = curve([("DEFINITION", "SMOOTH STEP")], ["0., 0., 2., 1."])
+    assert c.value(1.) == 0.5 and abs(c.value(0.5) - 0.103515625) < 1e-15
+    c = curve([("DEFINITION", "EQUALLY SPACED"), ("FIXED INTERVAL", "0.5"), ("BEGIN", "1.")],
+              ["0., 4., 2."])
+    assert [c.value(t) for t in (1., 1.25, 1.5, 2.)] == [0., 2., 4., 2.]
+    c = curve([("SCALEX", "2."), ("SCALEY", "3."), ("SHIFTX", "1."), ("SHIFTY", "-1.")],
+              ["0., 0., 1., 1."])                                  # scaled, then shifted
+    assert c.breaks == [1., 3.] and c.value(2.) == 0.5 and c.value(3.) == 2.
+    c = curve([("DEFINITION", "PERIODIC"), ("TIME", "TOTAL TIME")], ["1, 2., 0.5, 1.", "0., 3."])
+    assert c.total and c.value(0.) == 1. and abs(c.value(1.) - (1. + 3. * math.sin(1.))) < 1e-14
+    c = curve([("DEFINITION", "DECAY"), ("VALUE", "ABSOLUTE")], ["1., 2., 0., 0.5"])
+    assert c.absolute and abs(c.value(1.) - (1. + 2. * math.exp(-2.))) < 1e-14
+    assert curve([("DEFINITION", "USER")], []) is None
+    assert curve([], ["1., 0., 0., 1."]) is None                  # times must not decrease
+
+
+def test_integrate_history_is_exact_at_its_points():
+    pts, x, _, dev = A.integrate_history(lambda t: 5.0, [], 0.005)   # constant: exactly linear
+    assert len(pts) == 2 and abs(x - 0.025) < 1e-15 and dev == 0.0
+    # a SMOOTH STEP velocity over the first 0.001 of a 0.01 step (the davidmorin decks)
+    c = A.amplitude_curve(A.mkblock("AMPLITUDE", [("NAME", "A"), ("DEFINITION", "SMOOTH STEP")],
+                                    ["0., 0., 0.001, 1."]))
+    pts, x, _, dev = A.integrate_history(lambda t: 100.0 * c.value(t), c.breaks, 0.01)
+
+    def exact(t):
+        s = min(t / 0.001, 1.0)
+        return 100.0 * (0.001 * s ** 4 * (2.5 - 3. * s + s * s) + max(t - 0.001, 0.0))
+    assert abs(x - 0.95) < 1e-14 and max(abs(v - exact(t)) for t, v in pts) < 1e-15
+    # between the points, the straight lines ccx applies stay within 1e-4 of the travel
+    worst = max(abs(_at(pts, k * 1e-6) - exact(k * 1e-6)) for k in range(10001))
+    assert worst <= dev + 1e-15 and dev <= 1e-4 * 0.95 and len(pts) < 40
+    # an acceleration from x0, r0: x = x0 + r0 t + a t^2 / 2
+    pts, x, r, _ = A.integrate_history(lambda t: 2.0, [], 1.0, order=2, x0=1.0, r0=-1.0)
+    assert abs(x - 1.0) < 1e-14 and abs(r - 1.0) < 1e-14
+    assert max(abs(v - (1.0 - t + t * t)) for t, v in pts) < 1e-14
+
+
+def test_velocity_bc_integrated_into_displacement_amplitude():
+    deck = VEL_HEX + ("*Amplitude, name=Amp-1, definition=SMOOTH STEP\n0., 0., 0.001, 1\n"
+                      "*Step, nlgeom=YES, inc=10000\n*Static\n0.000001, 0.01, 1e-08, 0.00001\n"
+                      "*Boundary, amplitude=Amp-1, type=VELOCITY\nTOP, 3, 3, 100.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    # the magnitude stays on the line, the amplitude is the motion per unit velocity
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\nTOP, 3, 3, 100\n" in body
+    assert "TYPE=VELOCITY" not in body
+    pts = _amplitude(body, "ABQ2CCX_VEL1")
+    assert pts[0] == (0.0, 0.0) and pts[-2] == (0.001, 0.0005) and pts[-1] == (0.01, 0.0095)
+    assert "\n*AMPLITUDE, NAME=Amp-1" not in body                 # only the velocity used it
+    assert "read as displacements" not in rep.text()
+
+
+def test_velocity_bc_explicit_default_is_constant():
+    deck = VEL_HEX + ("*Step, nlgeom=YES\n*Dynamic, Explicit\n, 0.005\n*Boundary, type=VELOCITY\n"
+                      "TOP, 1, 1\nTOP, 3, 3, 5.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    # Abaqus/Explicit applies a BC without amplitude at once: a constant velocity, u = 5 t
+    assert "*BOUNDARY\nTOP, 1, 1\n*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\nTOP, 3, 3, 5\n" in body
+    assert _amplitude(body, "ABQ2CCX_VEL1") == [(0.0, 0.0), (0.005, 0.005)]
+    assert "jump in velocity at the start of a dynamic step" in rep.text()
+
+
+def test_velocity_bc_carried_into_later_steps_and_ramped():
+    deck = VEL_HEX + ("*Amplitude, name=A1\n0., 0., 0.5, 1., 1., 1.\n"
+                      "*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY, amplitude=A1\n"
+                      "TOP, 3, 3, 0.1\n*End Step\n*Step\n*Static\n0.1, 2.\n*End Step\n"
+                      "*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\nTOP, 3, 3, -0.2\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    steps = body.split("*STEP")
+    assert _amplitude(body, "ABQ2CCX_VEL1")[-1] == (1.0, 0.75)          # 0.1 x 0.75 = 0.075
+    # step 2 keeps the BC: in Abaqus the DOF keeps moving at the velocity it ended with,
+    # where a ccx BC would freeze at its last value
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nTOP, 3, 3, 1.\n*END STEP" in steps[2]
+    assert _amplitude(body, "ABQ2CCX_VEL2") == [(0.0, 0.075), (2.0, 0.275)]
+    # step 3, no amplitude in a static step: the velocity ramps from 0.1 to -0.2
+    pts = _amplitude(body, "ABQ2CCX_VEL3")
+    assert pts[0] == (0.0, 0.275) and pts[-1] == (1.0, 0.225)
+    assert max(abs(v - (0.275 + 0.1 * t - 0.15 * t * t)) for t, v in pts) < 1e-12
+    assert "default amplitude is RAMP" in rep.text()
+
+
+def test_velocity_bc_after_a_free_step():
+    deck = VEL_HEX + ("*Step\n*Static\n*Cload\nTOP, 3, 1.\n*End Step\n"
+                      "*Step\n*Static\n*Boundary, type=VELOCITY\nTOP, 3, 3, 0.5\nTOP, 1, 2\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    # TOP moved freely in step 1, so ccx cannot be given the total displacement: a zero
+    # velocity holds the DOFs where they are (FIXED), another one is left out
+    assert "** [abq2ccx] not converted: TOP, 3, 3" in body
+    assert "*BOUNDARY, FIXED\nTOP, 1, 2\n" in body
+    assert "displacement at the start of the step is unknown" in rep.text()
+
+
+def test_acceleration_bc_from_initial_velocity():
+    deck = VEL_HEX + ("*Initial Conditions, type=VELOCITY\nTOP, 3, 0.5\n*Step\n*Dynamic\n0.1, 1.\n"
+                      "*Boundary, type=ACCELERATION\nTOP, 3, 3, 2.\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    pts = _amplitude(body, "ABQ2CCX_ACC1")                 # u = 0.5 t + t^2
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_ACC1\nTOP, 3, 3, 1.\n" in body and pts[-1] == (1.0, 1.5)
+    assert max(abs(v - (0.5 * t + t * t)) for t, v in pts) < 1e-9
+
+
+def test_velocity_bc_on_rigid_body_reference_point():
+    rigid = (VEL_HEX + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=RP\n100\n"
+             "*Rigid Body, ref node=100, tie nset=TOP\n")
+    deck = rigid + ("*Step, amplitude=STEP\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\n"
+                    "RP, 1, 5\nRP, 6, 6, 0.2\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    # the angular velocity drives the body's ROT NODE (ccx ignores DOFs 4-6 of the REF NODE);
+    # under *STEP, AMPLITUDE=STEP it is constant, so the turn is exactly linear
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\n101, 3, 3, 0.2\n" in body
+    assert _amplitude(body, "ABQ2CCX_VEL1") == [(0.0, 0.0), (1.0, 1.0)]
+    assert "*BOUNDARY\nRP, 1, 3\n101, 1, 2\n" in body and "default amplitude is RAMP" not in rep.text()
+    # a zero velocity from a zero start holds the reference point at zero: the members'
+    # x BC is implied by the body (ccx would stop on it) and taken off (_plan_coupled_bcs)
+    deck = rigid + ("*Step\n*Static\n0.1, 1.\n*Boundary\nTOP, 1, 1\n*Boundary, type=VELOCITY\n"
+                    "RP, 1, 2\nRP, 4, 6\nRP, 3, 3, 0.1\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert {(n, 1) for n in (5, 6, 7, 8)} <= set().union(*conv._bc_drop.values())
+    assert "TOP, 1, 1" not in body
+
+
+def test_velocity_bc_examples():
+    # the decks validate_with_ccx.py runs: the column's reference point follows the
+    # SMOOTH STEP velocity and keeps moving in the second step; the bar's end moves at v
+    body, _, _ = convert(os.path.join(EXAMPLES, "velocity_bc_column.inp"))
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\nRP, 3, 3, 1\n" in body
+    assert _amplitude(body, "ABQ2CCX_VEL1")[-1] == (0.01, 0.0095)
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\nRP, 3, 3, 1.\n*END STEP" in body
+    assert _amplitude(body, "ABQ2CCX_VEL2") == [(0.0, 0.0095), (0.005, 0.0145)]
+    assert not dangling_refs(reparse(body))
+    body, _, _ = convert(os.path.join(EXAMPLES, "velocity_bc_bar.inp"))
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\nDRIVEN, 3, 3, 0.01\n" in body
+    assert _amplitude(body, "ABQ2CCX_VEL1") == [(0.0, 0.0), (0.5, 0.5)]
+    assert not dangling_refs(reparse(body))
+
+
+def test_velocity_bc_card_follows_op_new_drop():
+    # a later step whose velocity card re-specifies every BC with OP=NEW: the converted card
+    # loses OP=NEW like a displacement card would (_plan_op_new_rotations); TIP's x was
+    # free in step 1, so its velocity cannot become a total displacement
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n"
+            "*Element, type=B31, elset=BEAM\n1, 1, 2\n2, 2, 3\n"
+            "*Beam Section, elset=BEAM, material=M, section=RECT\n0.1, 0.1\n0., 0., -1.\n"
+            "*Material, name=M\n*Elastic\n2.1e5, 0.3\n*Nset, nset=ROOT\n1\n*Nset, nset=TIP\n3\n"
+            "*Boundary\nROOT, 1, 6\n*Step\n*Static\n*Cload\nTIP, 2, -1.\n*End Step\n"
+            "*Step\n*Static\n*Boundary, op=NEW, type=VELOCITY\nROOT, 1, 6\nTIP, 1, 1, 0.5\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    step2 = body.split("*STEP")[2]
+    assert "** [abq2ccx] OP=NEW dropped" in step2 and "*BOUNDARY\nROOT, 1, 6\n" in step2
+    assert "OP=NEW\n" not in step2 and "not converted: TIP, 1, 1" in step2
+
+
+def test_velocity_bc_zero_rate_from_unknown_start_holds_what_it_can():
+    # TOP moved freely in step 1: a zero velocity on DOFs 1-6 (or ENCASTRE) of these solid
+    # nodes holds their translations (the solid nodes have no DOFs 4-6 to hold)
+    for line in ("TOP, 1, 6", "TOP, ENCASTRE"):
+        body, _, _ = convert_str(VEL_HEX + "*Step\n*Static\n*Cload\nTOP, 3, 1.\n*End Step\n*Step\n"
+                                           "*Static\n*Boundary, type=VELOCITY\n" + line + "\n*End Step\n")
+        assert "*BOUNDARY, FIXED\nTOP, 1, 3\n*END STEP" in body, line
+    # XSYMM (DOFs 1, 5, 6) on a rigid body's reference point: x on the point, the turns on
+    # its ROT NODE's translations — never a DOF range over 1-6
+    body, _, _ = convert_str(VEL_HEX + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=RP\n100\n"
+                                       "*Rigid Body, ref node=100, tie nset=TOP\n*Step\n*Static\n*Cload\n"
+                                       "RP, 3, 1.\n*End Step\n*Step\n*Static\n*Boundary, type=VELOCITY\n"
+                                       "RP, XSYMM\n*End Step\n")
+    assert "*BOUNDARY, FIXED\nRP, 1, 1\n101, 2, 3\n*END STEP" in body
+
+
+def test_velocity_bc_midside_node_follows_its_end_nodes():
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=BEAM\n1, 1, 2\n"
+            "*Beam Section, elset=BEAM, material=M, section=CIRC\n0.05\n0., 0., -1.\n*Material, name=M\n"
+            "*Elastic\n2.1e5, 0.3\n*Boundary\n1, 1, 2\n1, 4, 6\n2, 1, 2\n"
+            "*Step, amplitude=STEP\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\n1, 3, 3, 1.\n2, 3, 3, 1.\n"
+            "*End Step\n*Step, amplitude=STEP\n*Static\n0.1, 1.\n*End Step\n"
+            "*Step, amplitude=STEP\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\n2, 3, 3, 3.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert list(conv._midside.values()) == [(1, 2, 3)]           # the CIRC beam's midside node
+    steps = body.split("*STEP")
+    assert "1, 3, 3, 1\n2, 3, 3, 1\n3, 3, 3, 1\n" in steps[1]
+    # kept into step 2: the continuation moves the midside node with its ends
+    assert "1, 3, 3, 1.\n2, 3, 3, 1.\n3, 3, 3, 1\n*END STEP" in steps[2]
+    # step 3 re-specifies node 2 only: node 1 keeps moving at 1, node 2 at 3, the midside
+    # node at their mean (2 -> 4)
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL5\n3, 3, 3, 1.\n*END STEP" in steps[3]
+    assert _amplitude(body, "ABQ2CCX_VEL5") == [(0.0, 2.0), (1.0, 4.0)]
+
+
+def test_velocity_bc_ramp_start_does_not_depend_on_node_order():
+    # node 6 shares a TOTAL TIME velocity with node 5 in step 1 and gets its own ramped one
+    # in step 2; step 3 must continue it from where step 2 left it, whichever node comes first
+    ends = []
+    for pair in ("5, 6", "6, 5"):
+        body, _, _ = convert_str(VEL_HEX + f"*Nset, nset=PAIR\n{pair}\n*Amplitude, name=A, time=TOTAL TIME"
+                                           f"\n0., 0., 10., 10.\n*Step\n*Static\n0.1, 1.\n*Boundary, "
+                                           f"type=VELOCITY, amplitude=A\nPAIR, 3, 3, 1.\n*End Step\n"
+                                           f"*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\n6, 3, 3, 5."
+                                           f"\n*End Step\n*Step\n*Static\n0.1, 1.\n*End Step\n")
+        ends.append([_amplitude(body, f"ABQ2CCX_VEL{i}")[-1] for i in (2, 3, 4, 5)])
+    # step 2: node 6 ramps 1 -> 5 (0.5 -> 3.5), node 5 follows A (0.5 -> 2); step 3: node 5
+    # follows A (-> 4.5), node 6 holds 5 (3.5 -> 8.5)
+    assert ends[0] == ends[1] == [(1.0, 3.5), (1.0, 2.0), (1.0, 4.5), (1.0, 8.5)]
+
+
+def test_velocity_bc_unreadable_lines_and_amplitudes():
+    for deck in (VEL_HEX + "*Step\n*Static\n*Boundary, type=VELOCITY\nTOP, , 3, 1.\n*End Step\n",
+                 VEL_HEX + "*Boundary, type=VELOCITY\nTOP, , 3, 0.\n*Step\n*Static\n*End Step\n",
+                 VEL_HEX + "*Step\n*Static\n*Boundary, type=VELOCITY, user\nTOP, FOO\n*End Step\n"):
+        body, _, _ = convert_str(deck)                       # commented, not a crash
+        assert "** [abq2ccx] not converted: TOP, " in body
+    # an amplitude another card also names (FILM AMPLITUDE=) is kept
+    body, conv, _ = convert_str(VEL_HEX + "*Amplitude, name=A\n0., 0., 1., 1.\n*Step\n*Static\n"
+                                          "*Boundary, type=VELOCITY, amplitude=A\nTOP, 3, 3, 1.\n"
+                                          "*Film, film amplitude=A\n1, S1, 20., 5.\n*End Step\n")
+    assert not conv._vel_only_amps and "\n*AMPLITUDE, NAME=A\n" in body
+    # Abaqus/Explicit applies BCs at once whatever *STEP AMPLITUDE says
+    body, _, rep = convert_str(VEL_HEX + "*Step, amplitude=RAMP\n*Dynamic, Explicit\n, 1.\n"
+                                         "*Boundary, type=VELOCITY\nTOP, 3, 3, 1.\n*End Step\n")
+    assert _amplitude(body, "ABQ2CCX_VEL1") == [(0.0, 0.0), (1.0, 1.0)]
+    # too many oscillations to sample; a TOTAL TIME amplitude after a step of unknown length
+    body, _, _ = convert_str(VEL_HEX + "*Amplitude, name=P, definition=PERIODIC\n1, 1e5, 0., 0.\n"
+                                       "0., 1.\n*Step\n*Static\n0.1, 10.\n*Boundary, type=VELOCITY, "
+                                       "amplitude=P\nTOP, 3, 3, 1.\n*End Step\n")
+    assert "oscillates over a thousand times" in body
+    body, _, _ = convert_str(VEL_HEX + "*Amplitude, name=A, time=TOTAL TIME\n0., 0., 10., 10.\n"
+                                       "*Step\n*Static, riks\n0.1, 1.\n*Cload\nTOP, 3, 1.\n*End Step\n"
+                                       "*Step\n*Static\n*Boundary, type=VELOCITY, amplitude=A\n"
+                                       "TOP, 3, 3, 1.\n*End Step\n")
+    assert "TIME=TOTAL TIME amplitude after a step whose time period is unknown" in body
+
+
+def test_velocity_bc_in_frequency_step_keeps_the_constraint():
+    deck = VEL_HEX + "*Step\n*Frequency\n5\n*Boundary, type=VELOCITY\nTOP, 3, 3, 0.\n*End Step\n"
+    body, _, _ = convert_str(deck)
+    assert "*BOUNDARY\nTOP, 3, 3\n" in body and "ABQ2CCX_VEL" not in body
 
 
 if __name__ == "__main__":

@@ -27,7 +27,8 @@ Converter._prescan()   deck-wide facts the handlers need: node kinds, the connec
                        (_plan_mpcs), knot beams (_plan_rigid_couplings), the connectors'
                        constraint rows (_plan_connector_rows), the BCs on rigid-constraint
                        members their reference node imposes or, on a *RIGID BODY, takes over
-                       (_plan_coupled_bcs), …; then _plan_distributions(),
+                       (_plan_coupled_bcs), the velocity / acceleration BCs
+                       (_plan_velocity_bcs), …; then _plan_distributions(),
                        _plan_planar_constraint() and _plan_circ_rotation_knots()
         │
         ▼
@@ -182,6 +183,31 @@ so the converter does it in three places, each exact:
   DOF must keep a nonzero reduced coefficient, so no loop of ties reaches ccx (which would
   hold it at zero). Converter rotation ties that find no free DOF are dropped; anything else
   left over is kept and warned.
+
+## Velocity and acceleration boundary conditions
+
+ccx prescribes displacements only, so `*BOUNDARY, TYPE=VELOCITY / ACCELERATION` becomes a
+displacement BC whose amplitude is the time integral of the prescribed history.
+`amplitude_curve()` turns an Abaqus `*AMPLITUDE` (tabular, equally spaced, smooth step,
+periodic, modulated, decay) into a function of time; `integrate_history()` integrates a rate
+once or twice exactly (Gauss-Legendre panels between the breakpoints) and samples it densely
+enough that ccx's straight lines between the points stay within 1e-4 of the step's travel.
+`_plan_velocity_bcs()` (in `_prescan`, after `_plan_coupled_bcs()`, whose rewrite of a card
+it reads through `_rate_lines()`) follows every DOF such a BC touches through the steps —
+its displacement and velocity at each step start, the BC in force (`OP=NEW` and
+re-specification as in Abaqus) — and plans:
+
+* `_vel_cards`: what replaces each velocity / acceleration card — the generated amplitudes
+  and plain `*BOUNDARY` blocks, which `handle_boundary()` then converts like any deck BC
+  (rigid-body rotations to the `ROT NODE`, midside nodes); the card's `OP=NEW` decision
+  (`_op_new_drop`) goes with its first block;
+* `_vel_tail`: the continued motion of a rate BC a later step keeps, emitted before that
+  step's `*END STEP` (a ccx BC with a step-time amplitude would freeze at its last value),
+  and the mean motion of an upgraded beam's midside node whose end nodes different cards
+  drive.
+
+`_plan_coupled_bcs()` reads a zero velocity from rest as a BC that holds its DOF at zero
+itself (`_bc_states`, kind `rate`).
 
 ## Mesh-generation expanders
 
