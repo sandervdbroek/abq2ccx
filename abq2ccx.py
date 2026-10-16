@@ -1630,13 +1630,20 @@ class Converter:
         self._mpc_bodies: Dict[int, List[dict]] = {}
         self._mpc_thermal = False                  # a step solves for temperatures
         self._mpc_mechanical = True                # ... for displacements
-        self._implied_spc: set = set()             # (node, dof) BCs a rigid constraint fixes
         self._gen_ties: set = set()                # the rotation ties the converter writes
         # explicit dynamics with circular-section beams (_plan_circ_explicit_increment): the
         # smallest min(element length, d / sqrt(2)) / wave speed and its element, and the
         # beams it could not size
         self._circ_explicit: Optional[Tuple[float, int]] = None
         self._circ_explicit_issue = ""
+        # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
+        self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
+        self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
+        self._bc_subsets: Dict[Tuple[int, ...], str] = {}  # remaining nodes of a split line -> set
+        self._coupled_clash: List[Tuple[str, str, int, int, int]] = []  # (kind, emit, node, dof, ref)
+        self._clash_dofs: set = set()              # ... their (node, dof)
+        self._planar_kin: set = set()              # id(coupling card) whose members are all 2-D
+        self._last_planar = False
 
     # -- properties ---------------------------------------------------------
     @property
@@ -3283,7 +3290,9 @@ class Converter:
             if self._op_new_drop.get(id(b)) and (b.param("OP") or "").strip().upper() == "NEW" else []
         out.append(emit_keyword("BOUNDARY", params))
         midside = [ln.split(",") for ln in self._midside_records(b, "boundary")]
-        for rec in merged_data_records(b) + midside:
+        # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
+        recs = self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
+        for rec in recs + midside:
             # Interior blanks are positional (e.g. "node, dof1, , value" = blank last
             # DOF), so trim only trailing empties — never filter interior fields.
             g = [x.strip() for x in rec]
@@ -3294,12 +3303,7 @@ class Converter:
             spec, rest = g[0], g[1:]
             self._check_node_target("BOUNDARY", spec)
             if rest and rest[0] and not re.fullmatch(r"[-+]?\d+", rest[0]):
-                # a named BC on a reference point constrains its rotations as well, even in
-                # a solid-only model
-                rot = self.has_rotational_dof or (not getattr(self.opt, "solid_dof", False) and
-                                                  any(n in self._ref_nodes
-                                                      for n in self._resolve_nodes(spec)))
-                dofs = self._named_bc_dofs(rest[0], rot)
+                dofs = self._named_bc_dofs(rest[0], self._named_bc_rot(spec))
                 if dofs is None:
                     self.report.warn(f"*BOUNDARY type '{rest[0]}' not recognised; line passed through.", once=True)
                     out.append(", ".join(g))
@@ -3319,8 +3323,6 @@ class Converter:
                 out.extend(kept if kept is not None else [", ".join(g)])
             else:
                 out.append(", ".join(g))
-        if self._implied_spc:
-            out = out[:1] + [x for ln in out[1:] for x in self._without_implied(ln)]
         if getattr(self, "_n_inactive_rot", 0):
             self.report.warn("Rotational DOFs (4-6) prescribed on nodes that only belong to plane-"
                              "stress/plane-strain/axisymmetric elements were dropped: those nodes "
@@ -3386,6 +3388,12 @@ class Converter:
             if n not in self._plane_only:
                 out.append(line(str(n), max(lo, 4), min(hi, 6)))
         return out
+
+    def _named_bc_rot(self, spec: str) -> bool:
+        """Whether a named BC (ENCASTRE, XSYMM, ...) on ``spec`` includes rotations: in a model
+        with rotational DOFs, and on a reference point even in a solid-only model."""
+        return self.has_rotational_dof or (not getattr(self.opt, "solid_dof", False) and
+                                           any(n in self._ref_nodes for n in self._resolve_nodes(spec)))
 
     def _named_bc_dofs(self, name: str, rot: Optional[bool] = None) -> Optional[List[Tuple[int, int]]]:
         if rot is None:
@@ -3821,6 +3829,7 @@ class Converter:
         tag = f"ABQ2CCX_KC{self._synth_counter}"
         out: List[str] = []
         ties: List[str] = []
+        top = 2 if id(b) in self._planar_kin else 3     # 2-D members: no DOF 3 (see handle_kinematic)
         # ccx carries the coupling's rotation on DOFs 4-6 of the reference node once a
         # translational group couples it, so knotted shell/beam members can tie theirs
         coupled = any(lo <= 3 for lo, _ in groups) and re.fullmatch(r"[-+]?\d+", ref) is not None
@@ -3838,9 +3847,13 @@ class Converter:
                                      "(4..6); ccx couples translations only — line dropped, "
                                      "rotations are NOT coupled.", once=True)
                 continue
+            if top == 2 and hi > 2:
+                self._note_planar_kinematic()
+                if lo > 2:
+                    continue
             out += [f"*SURFACE, TYPE=NODE, NAME={tag}_{gi}"] + list(ms)
             out += [f"*COUPLING, CONSTRAINT NAME={tag}_{gi}, REF NODE={ref}, SURFACE={tag}_{gi}",
-                    "*KINEMATIC", f"{lo}, {min(hi, 3)}"]
+                    "*KINEMATIC", f"{lo}, {min(hi, top)}"]
         self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per DOF "
                          "range (every member line kept).", once=True)
         return (out + ties) or self._commented(b, "*KINEMATIC COUPLING couples no translational "
@@ -4289,6 +4302,7 @@ class Converter:
                 self.report.warn(f"*COUPLING REF NODE={ref} could not be resolved to a node id; "
                                  f"ccx will reject a set name here.", once=True)
         self._last_coupling = self._coupling_plan.get(id(b))
+        self._last_planar = id(b) in self._planar_kin
         if (self._last_coupling or {}).get("kind") == "rb":
             return self._coupling_as_rigid_body(self._last_coupling)
         if (self._last_coupling or {}).get("kind") == "unsupported":
@@ -4322,10 +4336,14 @@ class Converter:
         vanishes — verified).  Abaqus' empty default means 'all DOFs', so synthesize
         1,3; clamp rotational DOFs to the translational range.  The rotations Abaqus
         couples on knotted shell/beam members are tied to the reference node's DOFs 4-6,
-        which carry the ccx coupling's rotation (see _plan_rigid_couplings)."""
+        which carry the ccx coupling's rotation (see _plan_rigid_couplings).  On 2-D
+        (plane/axisymmetric) members DOF 3 is left out: Abaqus has none there, and ccx holds it
+        fixed itself, so coupling it stops ccx ('dependent side of a MPC and a SPC')."""
         plan, self._last_coupling = self._last_coupling or {}, None
+        planar, self._last_planar = self._last_planar, False
         if plan.get("kind") == "rb":
             return []                 # folded into the *RIGID BODY of the *COUPLING card
+        top = 2 if planar else 3
         lines: List[str] = []
         had_lines = False
         clamped = False
@@ -4344,14 +4362,20 @@ class Converter:
                 self.report.warn("*KINEMATIC line couples only rotational DOFs (4..6); ccx supports "
                                  "1..3 only — line dropped, rotations are NOT coupled.", once=True)
                 continue
-            c1, c2 = min(d1, 3), min(d2, 3)
-            clamped = clamped or (c1, c2) != (d1, d2)
+            if planar and max(d1, d2) > 2:
+                self._note_planar_kinematic()
+                if min(d1, d2) > 2:
+                    continue
+            c1, c2 = min(d1, top), min(d2, top)
+            clamped = clamped or (not planar and (c1, c2) != (d1, d2))
             lines.append(f"{c1}, {c2}")
         if not had_lines:
-            self.report.warn("*KINEMATIC without DOF lines creates NO constraint in ccx (the "
-                             "coupling silently does nothing); synthesized '1, 3' to match the "
-                             "Abaqus default of coupling all DOFs — verify.", once=True)
-            lines = ["1, 3"]
+            self.report.warn(f"*KINEMATIC without DOF lines creates NO constraint in ccx (the "
+                             f"coupling silently does nothing); synthesized '1, {top}' to match the "
+                             f"Abaqus default of coupling all DOFs"
+                             f"{' (in-plane: the nodes are 2-D)' if planar else ''} — verify.",
+                             once=True)
+            lines = [f"1, {top}"]
         ties: List[str] = []
         if plan.get("kind") == "kin" and lines:
             # ccx carries the coupling's rotation on DOFs 4-6 of the reference node
@@ -4362,6 +4386,13 @@ class Converter:
                              + ("; the rotations of the coupled shell/beam nodes are tied to the "
                                 "ref node by *EQUATION)." if ties else ")."), once=True)
         return [emit_keyword("KINEMATIC", b.params)] + lines + ties
+
+    def _note_planar_kinematic(self) -> None:
+        self.report.note("Kinematic coupling of 2-D (plane/axisymmetric) nodes: DOFs above 2 left "
+                         "out of the ccx *KINEMATIC — such nodes have no DOF 3 in Abaqus, and ccx "
+                         "holds it fixed itself and stops on a coupled one ('dependent side of a "
+                         "MPC and a SPC'); they still follow the reference node's in-plane rigid "
+                         "motion.", once=True)
 
     def handle_static(self, b: Block) -> List[str]:
         """``*STATIC, RIKS``: ccx has no arc-length solver, and passed through it would
@@ -4700,6 +4731,7 @@ class Converter:
         self._upgrade_section_beams(blocks)
         self._check_nonpositive_ids()
         self._prescan(blocks)
+        self._warn_coupled_clashes()                # BCs on coupled DOFs left (_prescan)
         self._plan_distributions(blocks)
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
@@ -4971,7 +5003,7 @@ class Converter:
                     self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
                 body["rot"] = self._rb_rot[ref]
         self._plan_rigid_couplings(blocks)
-        self._plan_implied_spcs(blocks)
+        self._plan_coupled_bcs(blocks)
         if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks) and any(
                 any(m in self._plane_only for m in members)
                 for _, members, _ in self._rigid_members(blocks)):
@@ -5458,24 +5490,34 @@ class Converter:
 
     def _boundary_dofs(self, blocks: List[Block]) -> set:
         """(node, dof) pairs a *BOUNDARY constrains in any step."""
-        out: set = set()
-        for b in blocks:
-            if b.keyword != "BOUNDARY":
+        return {(n, d) for b in blocks if b.keyword == "BOUNDARY"
+                for nodes, dofs, _ in self._bc_records(b) for n in nodes for d in dofs}
+
+    def _bc_records(self, b: Block, rot: Optional[bool] = None) -> List[Tuple[List[int], List[int], float]]:
+        """(nodes, DOFs, magnitude) per data line of a *BOUNDARY card, as handle_boundary
+        emits it: a named type (ENCASTRE, XSYMM, ...) has magnitude 0 and includes the
+        rotations where handle_boundary does (``rot`` overrides that), an unreadable
+        magnitude is NaN (equal to nothing)."""
+        out = []
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) < 2 or not g[0]:
                 continue
-            for rec in merged_data_records(b):
-                g = [x.strip() for x in rec]
-                while g and g[-1] == "":
-                    g.pop()
-                if len(g) < 2:
-                    continue
-                if re.fullmatch(r"[-+]?\d+", g[1]):
-                    d1 = int(g[1])
-                    d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
-                    dofs = list(range(min(d1, d2), max(d1, d2) + 1))
-                else:
-                    dofs = [d for a, c in (self._named_bc_dofs(g[1], True) or [])
-                            for d in range(a, c + 1)]
-                out.update((n, d) for n in self._resolve_nodes(g[0]) for d in dofs)
+            if re.fullmatch(r"[-+]?\d+", g[1]):
+                d1 = int(g[1])
+                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
+                dofs = list(range(min(d1, d2), max(d1, d2) + 1))
+                try:
+                    mag = pf(g[3]) if len(g) > 3 and g[3] else 0.0
+                except ValueError:
+                    mag = float("nan")
+            else:
+                named = self._named_bc_dofs(g[1], self._named_bc_rot(g[0]) if rot is None else rot)
+                dofs = [d for a, c in (named or []) for d in range(a, c + 1)]
+                mag = 0.0
+            out.append((self._resolve_nodes(g[0]), dofs, mag))
         return out
 
     def _rigid_members(self, blocks: List[Block]):
@@ -5508,90 +5550,312 @@ class Converter:
             for body in bodies:
                 yield body["ref"], body["members"], {1, 2, 3}
 
-    def _plan_implied_spcs(self, blocks: List[Block]) -> None:
-        """Zero *BOUNDARY values that a rigid constraint already implies, to be left out.
+    # -- *BOUNDARY on rigid-coupling members ------------------------------------
+    def _plan_coupled_bcs(self, blocks: List[Block]) -> None:
+        """ccx makes the coupled DOFs of a rigid coupling's members (and the rotations the
+        converter ties) the dependent side of MPCs, and stops on one that also has a
+        *BOUNDARY ('*ERROR in cascade: ... dependent side of a MPC and a SPC') — an
+        overconstraint Abaqus resolves.  Where the reference node's own BCs impose the
+        member's BC anyway (the same value on that DOF, and no rotation about the other two
+        axes in that step or before it; 2-D: about z) the BC is redundant and is taken off
+        the card: exact, under NLGEOM too, since a rotation about the DOF's own axis leaves
+        that displacement component alone (probed on 2.23: the dropped BCs hold to 1e-20).
+        So is a BC on DOF 3 of a plane/axisymmetric node (Abaqus has none there; ccx's 2-D
+        rigid body makes it dependent).  An imposed BC on a tied rotation stays, and
+        _settle_dependents drops the tie (the BC governs it).  The rest is warned
+        (_warn_coupled_clashes), or with --approximate dropped where Abaqus drops it: a
+        kinematic coupling and an MPC eliminate the constrained DOFs of their nodes, so
+        Abaqus/Standard does not apply a BC there.  Rigid constraints: *RIGID BODY, kinematic
+        couplings and the rigid bodies of *MPC BEAM lines (_plan_mpcs)."""
+        cons = self._rigid_constraints(blocks)
+        if not cons:
+            return
+        relevant = {n for c in cons for n in list(c["trans"]) + list(c["rots"]) + [c["ref"], c["rot"]]}
+        states, cards = self._bc_states(blocks, relevant)
+        # (node, dof) -> its BC is implied in every step one governs it; and its constraint
+        verdict: "OrderedDict[Tuple[int, int], bool]" = OrderedDict()
+        owner: Dict[Tuple[int, int], dict] = {}
+        for c in cons:
+            for m, ds in list(c["trans"].items()) + list(c["rots"].items()):
+                for d in sorted(ds):
+                    steps = [s for s, st in enumerate(states) if (m, d) in st]
+                    if steps:                   # a BC no step keeps in force cannot clash
+                        ok = all(self._bc_implied(c, m, d, states, s) for s in steps)
+                        verdict[(m, d)] = verdict.get((m, d), True) and ok
+                        owner.setdefault((m, d), c)
+        implied, planar3, approx = [], 0, []
+        for (m, d), ok in verdict.items():
+            c = owner[(m, d)]
+            loose = not ok and self._approx and c["kind"] != "rb"
+            if not ok and not loose:
+                # a *RIGID BODY's tied rotation: _settle_dependents reorders the tie so the
+                # body follows the member's BC, as Abaqus moves it to the reference node
+                if not (d > 3 and c["kind"] == "rb"):
+                    self._coupled_clash.append((c["kind"], c["emit"], m, d, c["ref"]))
+                    self._clash_dofs.add((m, d))
+                continue
+            if ok and d > 3:
+                continue        # kept; _settle_dependents drops the tie (the BC governs it)
+            # off every card that names it, so no overridden value stays behind either
+            for card in cards[(m, d)]:
+                self._bc_drop.setdefault(card, set()).add((m, d))
+            if loose:
+                approx.append((m, d))
+            elif d == 3 and c["planar"]:
+                planar3 += 1
+            else:
+                implied.append((m, d))
+        for b in blocks:
+            if b.keyword == "BOUNDARY" and id(b) in self._bc_drop:
+                self._bc_lines[id(b)] = self._bc_lines_without(b, self._bc_drop[id(b)])
+        if implied or planar3:
+            eg = f" (e.g. node {implied[0][0]} DOF {implied[0][1]})" if implied else ""
+            self.report.note(f"*BOUNDARY taken off {len(implied) + planar3} DOF(s) that a rigid "
+                             f"constraint (*RIGID BODY, kinematic coupling, *MPC BEAM) makes follow "
+                             f"its reference node"
+                             f"{eg}: ccx stops on a DOF that is both SPC'd and dependent in an MPC "
+                             f"('*ERROR in cascade ... dependent side of a MPC and a SPC'), and the "
+                             f"reference node's own BCs impose these anyway — the same value on the "
+                             f"DOF and no rotation about the other two axes"
+                             + (" (and DOF 3 of 2-D nodes, which has no meaning there)"
+                                if planar3 else "") + ". Exact.", once=True)
+        if approx:
+            nodes = {m for m, _ in approx}
+            self.report.warn(f"[APPROX] *BOUNDARY taken off {len(approx)} DOF(s) of {len(nodes)} "
+                             f"node(s) that a kinematic coupling or *MPC also constrains (e.g. node "
+                             f"{approx[0][0]} DOF {approx[0][1]}), although the reference node's "
+                             f"BCs do not impose them: the nodes follow the constraint, as in "
+                             f"Abaqus/Standard, which eliminates the constrained DOFs at those "
+                             f"nodes and does not apply a BC there (it warns that the BC 'may not "
+                             f"be applied'). Check the model: the BC region probably overlaps the "
+                             f"constraint by mistake.", once=True)
 
-        ccx eliminates the coupled translations of a rigid constraint's members and stops
-        when one also carries a *BOUNDARY ('*ERROR in cascade: ... dependent side of a MPC
-        and a SPC'); Abaqus resolves such an overconstraint itself.  In a step, a member's
-        zero BC on translation k is implied when the body cannot rotate (zero BCs on the
-        rotations of its reference node: DOF 6 alone for a body of plane / axisymmetric
-        nodes) and the reference node is held at zero in k: the member stays at zero in k
-        anyway.  Where that holds in every step the member's BC is in force (bc_steps),
-        leaving the BC out changes nothing."""
-        self._implied_spc = set()
-        segs: List[List[Tuple[bool, Tuple[int, int], bool]]] = [[]]
+    def _rigid_constraints(self, blocks: List[Block]) -> List[dict]:
+        """The rigid constraints as the converter emits them: per constraint its Abaqus kind
+        ('rb' = *RIGID BODY, 'kin' = a kinematic coupling, 'mpc' = the rigid body of *MPC BEAM
+        lines), how ccx gets it ('emit': 'rb' = a *RIGID BODY, 'kin' = a *KINEMATIC
+        coupling), reference node, explicit ROT NODE (a ccx-style deck), whether all members
+        are 2-D nodes, and per member the translations ccx makes dependent ('trans') and the
+        rotations the converter ties ('rots')."""
+        out: List[dict] = []
+        for i, b in enumerate(blocks):
+            if b.keyword not in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING"):
+                continue
+            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            if ref is None:
+                continue
+            rot = None
+            lines: List[Tuple[List[int], set]] = []      # (nodes, coupled Abaqus DOFs)
+            if b.keyword == "RIGID BODY":
+                kind, tied, rb = "rb", True, True
+                rot = self._first_node(b.param("ROT NODE") or b.param("ROTNODE") or "")
+                tie, pin = self._rigid_body_members(b)
+                lines = [(tie, set(range(1, 7))), (pin, {1, 2, 3})]
+            elif b.keyword == "COUPLING":
+                nxt = blocks[i + 1] if i + 1 < len(blocks) else None
+                if nxt is None or nxt.keyword != "KINEMATIC":
+                    continue
+                plan = (self._coupling_plan.get(id(b)) or {}).get("kind")
+                kind, tied, rb = "kin", plan in ("kin", "rb"), plan == "rb"   # rb: a *RIGID BODY
+                lines = [(self._surface_member_nodes(b.param("SURFACE") or ""),
+                          self._kinematic_dofs(nxt))]
+            else:
+                kind, rb = "kin", False
+                for r in merged_data_records(b):
+                    f = [x for x in r if x != ""]
+                    if not f:
+                        continue
+                    try:          # member, first DOF, last DOF (no DOFs: all of them)
+                        d1 = pint(f[1]) if len(f) > 1 else 1
+                        d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
+                    except ValueError:
+                        continue
+                    lines.append((self._resolve_nodes(f[0]), set(range(min(d1, d2), max(d1, d2) + 1))))
+                tied = any(ds & {1, 2, 3} for _, ds in lines)
+            members = {n for ns, _ in lines for n in ns} - {ref, rot}
+            if not members:
+                continue
+            planar = all(n in self._plane_only for n in members)
+            if planar and kind == "kin":
+                self._planar_kin.add(id(b))
+            top = 2 if planar and not rb else 3
+            tie_ok = tied and self._tie_rotations and ref not in self._transformed and \
+                rot not in self._transformed
+            trans: Dict[int, set] = {}
+            rots: Dict[int, set] = {}
+            for ns, ds in lines:
+                for n in ns:
+                    if n not in members:
+                        continue
+                    trans.setdefault(n, set()).update({1, 2, 3} if rb else
+                                                      {d for d in ds if d <= top})
+                    if tie_ok and n in self._knots and n in self._rot_nodes and \
+                            n not in self._transformed:
+                        rots.setdefault(n, set()).update(ds & {4, 5, 6})
+            out.append(dict(kind=kind, emit="rb" if rb else "kin", ref=ref, rot=rot,
+                            planar=planar, trans=trans, rots=rots))
+        # the rigid bodies of *MPC BEAM lines, emitted as *RIGID BODY with a ROT NODE: the
+        # dependent nodes follow the independent one in displacement and rotation
+        for bodies in self._mpc_bodies.values():
+            for body in bodies:
+                ref = body["ref"]
+                members = set(body["members"]) - {ref, body["rot"]}
+                if not members:
+                    continue
+                tie_ok = self._tie_rotations and ref not in self._transformed
+                out.append(dict(kind="mpc", emit="rb", ref=ref, rot=None,
+                                planar=all(n in self._plane_only for n in members),
+                                trans={n: {1, 2, 3} for n in members},
+                                rots={n: {4, 5, 6} for n in members
+                                      if tie_ok and n in self._knots and n in self._rot_nodes
+                                      and n not in self._transformed}))
+        return out
+
+    def _bc_states(self, blocks: List[Block], nodes: set):
+        """The *BOUNDARY in force on ``nodes`` in each step, as ccx applies them: model data
+        first, OP=NEW on a step's first *BOUNDARY removing the earlier ones.  (node, dof) ->
+        (id of the card, magnitude, amplitude, kind): kind "disp" for a displacement, "rate0"
+        for a zero velocity (the DOF stands still), None for what cannot be compared (FIXED,
+        USER, other velocities, accelerations).  A deck without steps: its model-data state.
+        Also (node, dof) -> ids of every card that names it, in force or overridden.  (bc_steps
+        is the zero / nonzero view of the emitted deck that _settle_dependents uses; this one
+        keeps the values, amplitudes and cards the implied-BC test needs.)"""
+        states: List[Dict[Tuple[int, int], tuple]] = []
+        cards: Dict[Tuple[int, int], List[int]] = {}
+        cur: Dict[Tuple[int, int], tuple] = {}
+        in_step = first = False
         for b in blocks:
             if b.keyword == "STEP":
-                segs.append([])
-            if b.keyword != "BOUNDARY":
-                continue
-            new = (b.param("OP") or "").strip().upper() == "NEW"
-            typed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
-                b.has("FIXED")
-            for rec in merged_data_records(b):
-                g = [x.strip() for x in rec]
-                while g and g[-1] == "":
-                    g.pop()
-                if len(g) < 2:
-                    continue
-                val = ""
-                if re.fullmatch(r"[-+]?\d+", g[1]):
-                    d1 = int(g[1])
-                    d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
-                    dofs = list(range(min(d1, d2), max(d1, d2) + 1))
-                    val = g[3] if len(g) > 3 else ""
-                else:
-                    dofs = [d for a, c in (self._named_bc_dofs(g[1], True) or [])
-                            for d in range(a, c + 1)]
-                try:
-                    zero = not typed and (val == "" or pf(val) == 0.0)
-                except ValueError:
-                    zero = False
-                segs[-1] += [(new, (n, d), zero) for n in self._resolve_nodes(g[0]) for d in dofs]
-        if not any(segs):
-            return
-        cands = []
-        for ref, members, dofs in self._rigid_members(blocks):
-            # a body of plane / axisymmetric nodes only turns about z (Abaqus' 2-D models have
-            # no DOFs 4-5; ccx's 2-D expansion holds them, probed)
-            turns = (6,) if members and all(m in self._plane_only for m in members) else (4, 5, 6)
-            cands += [(m, k, ref, turns) for m in members for k in dofs]
-        seen: set = set()
-        bad: set = set()
-        for active in bc_steps(segs):
-            for m, k, ref, turns in cands:
-                if (m, k) in active:
-                    seen.add((m, k))
-                    if not (active[(m, k)] and active.get((ref, k)) and
-                            all(active.get((ref, r)) for r in turns)):
-                        bad.add((m, k))
-        self._implied_spc = seen - bad
-        if self._implied_spc:
-            self.report.note(f"{len(self._implied_spc)} zero *BOUNDARY DOF(s) on members of a rigid "
-                             f"constraint left out: the reference node is held at zero there and "
-                             f"cannot rotate, so the member stays at zero anyway. ccx stops on a BC "
-                             f"on a DOF it eliminates ('*ERROR in cascade: ... dependent side of a "
-                             f"MPC and a SPC'); Abaqus resolves this overconstraint itself.")
+                in_step = first = True
+            elif b.keyword == "END STEP" and in_step:
+                states.append(dict(cur))
+                in_step = False
+            elif b.keyword == "BOUNDARY":
+                if in_step and first and (b.param("OP") or "").strip().upper() == "NEW":
+                    cur = {}
+                first = False
+                typ = (b.param("TYPE") or "DISPLACEMENT").strip().upper()
+                fixed = b.has("FIXED") or b.has("USER")
+                amp = (b.param("AMPLITUDE") or "").strip().upper()
+                for ns, dofs, mag in self._bc_records(b):
+                    kind = None if fixed else "disp" if typ == "DISPLACEMENT" else \
+                        "rate0" if typ == "VELOCITY" and mag == 0.0 else None
+                    for n in ns:
+                        if n in nodes:
+                            for d in dofs:
+                                cur[(n, d)] = (id(b), mag, amp, kind)
+                                if id(b) not in cards.setdefault((n, d), []):
+                                    cards[(n, d)].append(id(b))
+        if in_step:
+            states.append(dict(cur))
+        return states or [cur], cards
 
-    def _without_implied(self, line: str) -> List[str]:
-        """A *BOUNDARY data line without the (node, DOF) pairs in self._implied_spc: the
-        affected DOFs get one line per remaining node."""
-        f = [x.strip() for x in line.split(",")]
-        if len(f) < 2 or not all(re.fullmatch(r"[-+]?\d+", x) for x in f[1:3] if x):
-            return [line]
-        lo = int(f[1])
-        hi = int(f[2]) if len(f) > 2 and f[2] else lo
-        lo, hi = min(lo, hi), max(lo, hi)
-        nodes = self._resolve_nodes(f[0])
-        if not any((n, d) in self._implied_spc for n in nodes for d in range(lo, hi + 1)):
-            return [line]
-        out: List[str] = []
-        for d in range(lo, hi + 1):
-            keep = [n for n in nodes if (n, d) not in self._implied_spc]
-            spec = [f[0]] if len(keep) == len(nodes) else [str(n) for n in keep]
-            out += [", ".join([s, str(d), str(d)] + f[3:]) for s in spec]
+    def _bc_implied(self, c: dict, m: int, d: int, states, s: int) -> bool:
+        """Do the reference node's BCs in step ``s`` (and before it) impose the BC member ``m``
+        has on DOF ``d`` in step ``s``?  A translation follows the reference node's when the
+        rotations about the other two axes stay zero (rigid motion: u_d = u_ref,d + (θ × r)_d,
+        and a finite rotation about axis d leaves component d alone); a tied rotation equals
+        the reference rotation.  Both then start each step equal, so equal displacement
+        targets (same amplitude) keep them equal; a zero velocity on either side needs the
+        reference DOF held at zero since the first step."""
+        e = states[s][(m, d)]
+        if not e[3]:
+            return False
+        if d == 3 and c["planar"]:
+            return True                  # no DOF 3 on a 2-D node in Abaqus; ccx's is held anyway
+        if m in self._transformed or c["ref"] in self._transformed:
+            return False                 # local DOFs
+        ref = self._ref_bc(c, states[s], d)
+        if ref is None or not ref[3]:
+            return False
+        if e[3] == ref[3] == "disp":
+            same = (e[1] == 0.0 and ref[1] == 0.0) or \
+                (ref[2] == e[2] and abs(ref[1] - e[1]) <= 1e-12 * max(abs(ref[1]), abs(e[1])))
+        else:
+            same = e[1] == 0.0 and self._ref_held(c, states, d, s)
+        if not same or d > 3:
+            return same
+        return all(self._ref_held(c, states, j + 3, s)
+                   for j in ((3,) if c["planar"] else (1, 2, 3)) if j != d)
+
+    def _ref_held(self, c: dict, states, k: int, s: int) -> bool:
+        """Is DOF ``k`` of the reference node held at zero (a zero displacement or velocity)
+        in every step 0..s?  Memoized per constraint."""
+        memo = c.setdefault("held", {})
+        t = s
+        while t >= 0 and (k, t) not in memo:
+            t -= 1
+        held = memo[(k, t)] if t >= 0 else True
+        for u in range(t + 1, s + 1):
+            r = self._ref_bc(c, states[u], k)
+            held = held and r is not None and bool(r[3]) and r[1] == 0.0
+            memo[(k, u)] = held
+        return held
+
+    @staticmethod
+    def _ref_bc(c: dict, st: Dict[Tuple[int, int], tuple], k: int) -> Optional[tuple]:
+        """The BC on DOF ``k`` (1-6) of a constraint's reference node in state ``st``; its
+        rotations may also be given on DOFs 1-3 of an explicit ROT NODE."""
+        e = st.get((c["ref"], k))
+        if e is None and k > 3 and c["rot"] is not None:
+            e = st.get((c["rot"], k - 3))
+        return e
+
+    def _bc_lines_without(self, b: Block, drop: set) -> List[List[str]]:
+        """The records of *BOUNDARY card ``b`` without the (node, DOF) pairs in ``drop``: a line
+        that loses some of its nodes on some DOFs is split per DOF range, onto the remaining
+        node or a node set of the remaining nodes (ABQ2CCX_BCn, registered for emission)."""
+        out: List[List[str]] = []
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) < 2:
+                out.append(g)
+                continue
+            spec, rest = g[0], g[1:]
+            if re.fullmatch(r"[-+]?\d+", rest[0]):
+                last = rest[1] if len(rest) > 1 and rest[1] != "" else rest[0]
+                if not re.fullmatch(r"[-+]?\d+", last):
+                    out.append(g)
+                    continue
+                d1, d2 = int(rest[0]), int(last)
+                dofs, extra = list(range(min(d1, d2), max(d1, d2) + 1)), rest[2:]
+            else:
+                named = self._named_bc_dofs(rest[0], self._named_bc_rot(spec))
+                if named is None:
+                    out.append(g)
+                    continue
+                dofs, extra = [d for a, c in named for d in range(a, c + 1)], []
+            nodes = self._resolve_nodes(spec)
+            if not any((n, d) in drop for n in nodes for d in dofs):
+                out.append(g)
+                continue
+            runs: List[list] = []                  # [first DOF, last DOF, remaining nodes]
+            for d in dofs:
+                keep = [n for n in nodes if (n, d) not in drop]
+                if runs and runs[-1][1] == d - 1 and runs[-1][2] == keep:
+                    runs[-1][1] = d
+                else:
+                    runs.append([d, d, keep])
+            for a, c, keep in runs:
+                if keep:
+                    out.append([spec if len(keep) == len(nodes) else self._node_subset(keep),
+                                str(a), str(c)] + extra)
         return out
+
+    def _node_subset(self, nodes: List[int]) -> str:
+        """A node id, or the name of a node set (ABQ2CCX_BCn) holding ``nodes``."""
+        key = tuple(dedup(nodes))
+        if len(key) == 1:
+            return str(key[0])
+        if key not in self._bc_subsets:
+            k = len(self._bc_subsets) + 1
+            while f"ABQ2CCX_BC{k}" in self.geom.nsets:
+                k += 1
+            self._bc_subsets[key] = f"ABQ2CCX_BC{k}"
+            self.geom.nsets[f"ABQ2CCX_BC{k}"] = list(key)
+        return self._bc_subsets[key]
 
     def _first_node(self, token: str) -> Optional[int]:
         nodes = self._resolve_nodes(token.strip()) if token.strip() else []
@@ -5810,7 +6074,7 @@ class Converter:
                                          for d in (1, 2, 3))
         # ccx turns a BC on a node with a *TRANSFORM into an MPC on its global DOFs
         spc.update((n, d) for n, k in list(spc) if n in transformed and k <= 3 for d in (1, 2, 3))
-        clash = sorted(k for k in busy if k in spc)
+        clash = sorted(k for k in busy if k in spc and k not in self._clash_dofs)
         for n, d in clash[:3]:
             self.report.warn(f"Possible overconstraint: node {n} DOF {d} is eliminated by a "
                              f"{busy[(n, d)]} (ccx builds it from MPCs) AND has a *BOUNDARY. "
@@ -6026,6 +6290,40 @@ class Converter:
                 res.append(line)
         return res
 
+    def _warn_coupled_clashes(self) -> None:
+        """The *BOUNDARY on rigid-constraint member DOFs that the reference node's BCs do not
+        impose (_plan_coupled_bcs): one warning per constraint kind and DOF type, with what
+        ccx does with it and what Abaqus does instead."""
+        what = {"kin": "a kinematic coupling", "rb": "a *RIGID BODY",
+                "mpc": "an *MPC BEAM (a *RIGID BODY in ccx)"}
+        groups: "OrderedDict[Tuple[str, str, bool], List[Tuple[int, int, int]]]" = OrderedDict()
+        for kind, emit, m, d, ref in self._coupled_clash:
+            groups.setdefault((kind, emit, d <= 3), []).append((m, d, ref))
+        for (kind, emit, trans), items in groups.items():
+            m, d, ref = items[0]
+            nodes = len({n for n, _, _ in items})
+            where = (f"node {m} DOF {d} follows reference node {ref} through {what[kind]} and also "
+                     f"has a *BOUNDARY that the reference node's BCs do not impose ({len(items)} "
+                     f"such DOF(s) on {nodes} node(s)). ")
+            if trans:
+                effect = "ccx stops: '*ERROR in cascade ... dependent side of a MPC and a SPC'. "
+            elif emit == "kin":
+                effect = ("The shell/beam rotation keeps the BC and is not tied to the coupling's "
+                          "(ccx cannot have both), unlike in Abaqus. ")
+            else:
+                effect = ("In ccx the body then follows that rotation (the converter's rotation tie "
+                          "is turned round), unlike in Abaqus. ")
+            if kind == "rb":
+                fix = ("Abaqus moves identical BCs on rigid-body nodes to the reference node "
+                       "(adding zero rotations about the other axes) and stops if they differ: put "
+                       "the BC on the reference node instead.")
+            else:
+                fix = ("Abaqus/Standard eliminates the constrained DOFs at these nodes and does not "
+                       "apply a BC there, so the node follows the constraint: take the node out of "
+                       "the BC (or the constraint), or rerun with --approximate to drop such BCs as "
+                       "Abaqus does.")
+            self.report.warn("Possible overconstraint: " + where + effect + fix, once=True)
+
     # ======================================================================
     # Planar models: ccx runs 2-D beams and trusses as 3-D elements
     # ======================================================================
@@ -6217,24 +6515,8 @@ class Converter:
         FIXED or USER values)."""
         typ = (b.param("TYPE") or "").strip().upper()
         moving = typ in ("VELOCITY", "ACCELERATION") or b.has("FIXED") or b.has("USER")
-        for rec in merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
-            if len(g) < 2 or not g[0]:
-                continue
-            value = 0.0
-            if re.fullmatch(r"[-+]?\d+", g[1]):
-                d1 = int(g[1])
-                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
-                ds = set(range(min(d1, d2), max(d1, d2) + 1))
-                try:
-                    value = pf(g[3]) if len(g) > 3 and g[3] else 0.0
-                except ValueError:
-                    value = 1.0                          # a *PARAMETER name: assume it moves
-            else:
-                ds = {d for lo, hi in self._named_bc_dofs(g[1], True) or [] for d in range(lo, hi + 1)}
-            yield self._resolve_nodes(g[0]), ds, moving or value != 0.0
+        for nodes, dofs, mag in self._bc_records(b, rot=True):
+            yield nodes, set(dofs), moving or mag != 0.0     # NaN (a *PARAMETER name): moves
 
     def _bc_dofs_by_node(self, blocks: List[Block]) -> Dict[int, set]:
         """Every DOF some *BOUNDARY (model data or any step) prescribes, per node."""

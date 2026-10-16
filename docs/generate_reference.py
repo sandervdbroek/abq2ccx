@@ -86,7 +86,10 @@ TRANSLATED = {
         "`ABQ2CCX_KNOT`): ccx 2.23 would lock the node's other rotations too. A later step's "
         "`OP=NEW`, once shell/beam nodes have had rotational BCs, is dropped when the step "
         "re-specifies every BC; where it removes BCs, the shell/beam nodes whose rotations it "
-        "would break get knot beams too (ccx 2.23 does not rebuild those rotations after `OP=NEW`).",
+        "would break get knot beams too (ccx 2.23 does not rebuild those rotations after `OP=NEW`). "
+        "On a DOF a rigid constraint also eliminates (ccx stops: dependent side of a MPC and a "
+        "SPC) the BC is taken off where the reference node's own BCs impose it, else warned "
+        "(`--approximate` drops it on a kinematic coupling or an `*MPC`, as Abaqus/Standard does).",
     "*DLOAD": "passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / "
         "`CONSTANT RESULTANT` dropped (warned under NLGEOM).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`.",
@@ -104,7 +107,8 @@ TRANSLATED = {
         "range (the reference node's DOFs 4-6 then take BCs and moments natively); rotation lines "
         "on shell/beam nodes become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`).",
     "*COUPLING / *KINEMATIC": "`REF NODE` set → node number; empty `*KINEMATIC` → `1, 3` (a "
-        "rotations-only card couples nothing); DOFs > 3 clamped. Shell/membrane/beam/truss nodes "
+        "rotations-only card couples nothing); DOFs > 3 clamped; on 2-D nodes `1, 2` (ccx holds "
+        "their DOF 3 itself). Shell/membrane/beam/truss nodes "
         "get a force-free knot beam (elset/material `ABQ2CCX_KNOT`), without which ccx 2.23 "
         "rejects the rigid MPC, and the coupled rotations are tied to the reference node's DOFs "
         "4-6 by `*EQUATION`; a shell/beam `REF NODE` turns the coupling into a `*RIGID BODY` "

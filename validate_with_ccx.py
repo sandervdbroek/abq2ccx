@@ -6,13 +6,15 @@ just structurally-valid text.  It auto-detects a ``ccx`` binary (including the o
 bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
 stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, a shell plate rigidly coupled to a loaded reference point against the same plate
-built from solids, circular-section beams with a held twist and a prescribed rotation
-against beam theory, a circular-section beam in an explicit dynamic step against its
-static deflection, the natural frequencies and buckling loads of planar (B21) beams with
-a rectangular and a circular section, per-element *DISTRIBUTION orientations (a C3D8
-plate and a composite S8R panel) against the same models written with one orientation
-per element, a clamped beam and plate after a later step's *BOUNDARY, OP=NEW, and the
-thermal strains of isotropic materials with an orthotropic / anisotropic expansion.
+built from solids, coupled bars whose coupled nodes also carry BCs against the same
+constraints written without a coupling, circular-section beams with a held twist and a
+prescribed rotation against beam theory, a circular-section beam in an explicit dynamic
+step against its static deflection, the natural frequencies and buckling loads of planar
+(B21) beams with a rectangular and a circular section, per-element *DISTRIBUTION
+orientations (a C3D8 plate and a composite S8R panel) against the same models written with
+one orientation per element, a clamped beam and plate after a later step's *BOUNDARY,
+OP=NEW, and the thermal strains of isotropic materials with an orthotropic / anisotropic
+expansion.
 
     python validate_with_ccx.py
 
@@ -292,6 +294,35 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  coupling_shell_plate (rigid coupling on S8R nodes): RP "
               f"displacement ({us[0]:+.4f}, {us[1]:+.4f}, {us[2]:+.4f}) vs the solid *Rigid Body "
               f"({ur[0]:+.4f}, {ur[1]:+.4f}, {ur[2]:+.4f}), {err * 100:.3f}% of |u|")
+        failures += 0 if ok else 1
+
+    # --- BCs on rigid-coupling members that the reference node's BCs impose -----------
+    # ccx stops on a DOF that is both a coupled DOF of a coupling member and under a
+    # *BOUNDARY, so the converter takes such redundant BCs off. Bar A (coupling + redundant
+    # member BCs) must match bar B (the same constraints as BCs and *EQUATIONs, no coupling)
+    # exactly, and bar C's dropped u3 = 0 must still hold as its end face turns about z
+    # (NLGEOM).
+    inp = os.path.join(tmp, "coupling_bc_bars.inp")
+    convert(os.path.join(EXAMPLES, "coupling_bc_bars.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    u = (dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None) or {}
+    shutil.rmtree(d, ignore_errors=True)
+    a = [u.get(n) for n in range(1, 82)]                        # bar A; bar B is A + 100
+    b = [u.get(n + 100) for n in range(1, 82)]
+    c = [u.get(n) for n in range(273, 282)]                     # bar C's end face
+    if not all(a + b + c):
+        print(f"FAIL  coupling_bc_bars: no displacements ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        err = max(abs(x - y) for p, q in zip(a, b) for x, y in zip(p, q))
+        scale = max(abs(y) for q in b for y in q)
+        moved = max(abs(x) for p in c for x in p)
+        u3 = max(abs(p[2]) for p in c)
+        ok = err <= 1e-9 * scale and moved > 0.1 and u3 <= 1e-9 * moved
+        print(f"{'PASS' if ok else 'FAIL'}  coupling_bc_bars (BCs on coupled nodes): bar A vs the "
+              f"same constraints without a coupling, max |du| = {err:.1e} of |u| {scale:.4f}; bar "
+              f"C's end face |u3| <= {u3:.1e} as it moves {moved:.3f} (NLGEOM)")
         failures += 0 if ok else 1
 
     # --- circular-section beams with rotational BCs: deflections vs beam theory --------------

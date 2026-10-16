@@ -8,8 +8,9 @@ The converter has three layers of tests:
    CalculiX, checking the NAFEMS LE10 benchmark, circular-, pipe- and box-section
    cantilevers, circular-section beams with rotational BCs and in an explicit dynamic
    step, planar beams' frequencies and buckling loads, per-element `*DISTRIBUTION`
-   orientations, a clamped beam and plate across a later step's `*BOUNDARY, OP=NEW`, a
-   rigidly coupled shell plate and the `*MPC` conversions numerically.
+   orientations, a clamped beam and plate across a later step's `*BOUNDARY, OP=NEW`,
+   rigidly coupled models (a shell plate, and bars whose coupled nodes also carry BCs) and
+   the `*MPC` conversions numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -23,7 +24,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (166)
+## 1. Unit tests — `tests/test_convert.py` (170)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -85,7 +86,7 @@ conversion behaviour and referential integrity.
 | `test_dload_unsupported_body_load_dropped` | `*DLOAD` `ROTA` lines are dropped with a warning while supported `GRAV` lines are kept |
 | `test_assembly_node_not_overwritten_by_instance` | assembly-level reference nodes keep their ids and instances are numbered above them (issue #2) |
 | `test_coupling_refnode_set_resolved_and_empty_kinematic` | `*COUPLING, REF NODE=<set>` → node number; an empty `*KINEMATIC` gets `1, 3` (ccx otherwise creates no constraint) |
-| `test_kinematic_rotational_dofs_clamped` | `*KINEMATIC` DOFs above 3 are clamped to ccx's translational range |
+| `test_kinematic_rotational_dofs_clamped` | `*KINEMATIC` DOFs above 3 are clamped to ccx's translational range; on 2-D (plane/axisymmetric) nodes to `1, 2` — an empty card too, and a `*KINEMATIC COUPLING` line `3, 3` is dropped (ccx holds DOF 3 of 2-D nodes itself and stops on a coupled one) |
 | `test_surface_interaction_hard_behavior_synthesized` | an interaction without `*SURFACE BEHAVIOR` gets `PRESSURE-OVERCLOSURE=HARD`; one with a behaviour is left alone |
 | `test_lamina_to_engineering_constants` | `*ELASTIC, TYPE=LAMINA` → `ENGINEERING CONSTANTS` (E3=E2, ν13=ν12, ν23 from G23) |
 | `test_iso_elastic_with_ortho_expansion_becomes_engineering_constants` | an isotropic `*ELASTIC` beside `*EXPANSION, TYPE=ORTHO` → `ENGINEERING CONSTANTS` with the same stiffness (G = E/2(1+ν)) and a NOTE; it is left alone beside an isotropic expansion, as are engineering constants beside an ORTHO one |
@@ -110,11 +111,14 @@ conversion behaviour and referential integrity.
 | `test_history_card_outside_step_commented` | step data (`*CLOAD`) before any `*STEP` is commented out with the reason; model-data `*BOUNDARY` stays |
 | `test_undefined_material_warns` | a section naming an undefined material is warned (with the defined names); a valid deck is not |
 | `test_plane_node_rotational_bc_dropped` | DOFs 4–6 on plane-element nodes are dropped (`L,6,6` gone, `L,1,6`→`L,1,3`); shell nodes keep `1,6` |
-| `test_rigid_coupling_on_shell_nodes_gets_knot_beams` | each shell node of a `*COUPLING`+`*KINEMATIC` gets a force-free knot beam (`B31` to a new free node, elset/material `ABQ2CCX_KNOT`, no density), without which ccx 2.23 rejects the rigid MPC; the rotations an empty `*KINEMATIC` couples are tied to the reference node's DOFs 4–6 by `*EQUATION` — not for a translations-only card, nor on a DOF with a `*BOUNDARY`; solid members get no knots |
+| `test_rigid_coupling_on_shell_nodes_gets_knot_beams` | each shell node of a `*COUPLING`+`*KINEMATIC` gets a force-free knot beam (`B31` to a new free node, elset/material `ABQ2CCX_KNOT`, no density), without which ccx 2.23 rejects the rigid MPC; the rotations an empty `*KINEMATIC` couples are tied to the reference node's DOFs 4–6 by `*EQUATION` — not for a translations-only card, nor on a DOF with a `*BOUNDARY` (warned unless the reference node's own BC imposes it); solid members get no knots |
 | `test_rigid_body_shell_tie_and_pin_members` | `*RIGID BODY` `TIE NSET` shell nodes get their rotations tied to the `ROT NODE`; `PIN NSET` nodes get knots but keep their rotations free |
 | `test_coupling_with_shell_reference_node_becomes_rigid_body` | a kinematic coupling whose `REF NODE` is a shell node becomes a `*RIGID BODY` on the other coupled nodes whose `ROT NODE` follows the node's rotations (a moment on the node stays there); one that couples only some translations is warned instead |
 | `test_rigid_coupling_knots_on_edges_trusses_and_thermal_decks` | an element-edge surface knots only its edge nodes; truss members get knots but no rotation ties; a thermal step gives the knot material a conductivity; a heat-transfer-only deck gets no rotation ties; an explicit step is warned |
 | `test_kinematic_rotation_lines` | a rotations-only `*KINEMATIC` is not given the `1, 3` meant for an empty card; `*KINEMATIC COUPLING` rotation lines on shell nodes become rotation ties |
+| `test_coupled_member_bc_implied_by_reference_dropped` | a `*BOUNDARY` on a rigid-coupling member DOF that the reference node's own BCs impose (that DOF, and no rotation about the other two axes since the first step) is taken off its card — a line keeping some nodes moves onto a set of them (`ABQ2CCX_BCn`); through a kinematic coupling a reference free to turn about z still imposes the members' z; not imposed (a free rotation, another value, a rotation held only from step 2) → kept and warned; an `OP=NEW` that removes the BC needs nothing; a zero velocity on the reference counts as held still from the first step on |
+| `test_coupled_member_bc_conflicts_and_approximate` | a member BC the reference node's BCs do not impose stays and is warned (with the Abaqus semantics); `--approximate` drops it on a kinematic coupling (Abaqus/Standard ignores BCs on the DOFs a kinematic coupling eliminates), `[APPROX]`; a `*RIGID BODY` conflict stays a warning either way |
+| `test_coupled_member_bc_shell_and_planar` | the `dheller1_uprofile` pattern: a coupled shell edge whose reference is one of its own nodes (→ `*RIGID BODY`), every edge node held in x, z and all rotations: the members' x and z BCs go, their rotations stay untied; 2-D: only the in-plane rotation counts, and BCs on DOF 3 of 2-D members go |
 | `test_plastic_hardening_forms` | Johnson-Cook kept native and given the `*RATE DEPENDENT` card ccx needs (C = 0 unless the deck has one); `HARDENING=USER` and Chaboche `PARAMETERS` commented; tabular hardening untouched |
 | `test_field_dependencies_collapsed` | `DEPENDENCIES=1` collapsed to field = 0: interpolated `*ELASTIC` (E = 115500), the f = 0 `*PLASTIC` curve, the nearest `*DENSITY` row |
 | `test_depvar_delete_and_labels` | `*DEPVAR` keeps the count, drops label lines and warns on `DELETE=` |
@@ -193,9 +197,10 @@ conversion behaviour and referential integrity.
 | `test_mpc_tie_ties_rotations_between_knots` | `TIE` between two beam nodes knots both and ties all six DOFs; with a solid or free node only DOFs 1–3; a coupled temperature-displacement step adds DOF 11 |
 | `test_mpc_link_linearised_or_ccx_beam` | `LINK` without `NLGEOM` → the linearised `*EQUATION` (direction cosines, largest component first); under `NLGEOM` → ccx `*MPC BEAM`; on beam nodes under `NLGEOM`, or in a linear-then-`NLGEOM` deck, commented out (the latter converted with `--approximate`, `[APPROX]`) |
 | `test_mpc_beam_lines_become_rigid_bodies` | `BEAM` lines sharing an independent node, or chained through one another, become one `*RIGID BODY` with a `ROT NODE`; shell members get knots and rotation ties; rotational BCs on the independent node move to the `ROT NODE`; a shell independent node's own rotation drives the `ROT NODE`; a node dependent twice is warned and its later line commented |
-| `test_rigid_member_bcs_the_body_implies_are_left_out` | zero BCs on rigid-body members are left out where the reference node is held in that DOF and cannot rotate (a `SYM` set is split around them); not when the body may turn, a value is nonzero or `OP=NEW` releases the reference BCs; a body of plane-strain nodes needs only DOF 6 held, and is warned in a deck with an explicit step |
+| `test_rigid_member_bcs_the_body_implies_are_left_out` | zero BCs on rigid-body members are taken off where the reference node is held in that DOF and cannot rotate (the `SYM` line moves onto a set of its other nodes); not when the body may turn or a value differs, and a BC that `OP=NEW` releases before any step keeps it is left alone; a body of plane-strain nodes needs only DOF 6 held, and is warned in a deck with an explicit step |
 | `test_bc_steps_follow_op_new` | the BCs in force per step: kept from earlier steps, a later value replaces an earlier one, `OP=NEW` starts from none |
 | `test_rotation_tie_on_a_member_bc_makes_the_body_dependent` | a shell member's rotation under a BC makes the `ROT NODE` DOF the tie's dependent term; on a `*KINEMATIC` reference node (whose DOFs 4–6 ccx eliminates itself) the tie is dropped instead |
+| `test_coupling_bc_bars_example` | the `coupling_bc_bars` validation deck: bars A and C lose their 27 redundant end-face BCs, bar B (the same constraints without a coupling) keeps its own; no warnings, no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -223,6 +228,12 @@ deck and runs it in CalculiX:
   one through the thickness, the brick ccx expands an `S8R` into — under `*RIGID BODY`.
   The reference-point displacements must agree within 0.5 % of |u| (they agree to
   0.001 %).
+* **`coupling_bc_bars`** — three `C3D8` bars in one `NLGEOM` step whose coupled end faces
+  also carry BCs that the reference point's own BCs impose (ccx stops on such a BC; the
+  converter takes it off). Bar A, its reference guided along z, must match bar B — the same
+  constraints written as BCs and `*EQUATION`s, no coupling — to 1e-9 (they agree to 2e-18 of
+  |u|); bar C's end face, turning about z under a moment, must keep the dropped u3 = 0 (it
+  does to 7e-21 while it moves 0.77).
 * **`beam_circ_rotation_bcs`** — two `B31` beams with a circular section, which ccx 2.23
   runs as `B32`: one pinned at both ends with its twist held there and a mid-span load, one
   clamped with its tip turned by a prescribed rotation of 0.001 rad. Under a rotational BC
@@ -414,8 +425,7 @@ coupling whose reference node is itself a shell/beam node becomes a `*RIGID BODY
 `ROT NODE` follows that node: kept as a ccx coupling, the node carries two unrelated
 rotations (probed: the beam acts hinged at the coupled face). Not covered: explicit
 dynamics ("linear and nonlinear MPC's depend on each other", with or without the knot
-beams), and coupled DOFs that also carry a `*BOUNDARY` the body does not already hold
-(below).
+beams). Coupled DOFs that also carry a `*BOUNDARY`: *BCs on coupled nodes*, below.
 
 **Abaqus `*MPC` and overconstraints.** `*MPC` used to keep only `PLANE`/`STRAIGHT` and
 `TIE`; any other line commented out the whole card, so four gated decks ran with their
@@ -446,11 +456,9 @@ beams), and coupled DOFs that also carry a `*BOUNDARY` the body does not already
   zero BCs is dropped. A **closed loop** of ties (u1 = u2, u2 = u3, u3 = u1) is not rejected
   by ccx: it warns "zero coefficient on the dependent side" and returns zero displacements —
   a silent wrong result the converter now prevents.
-* A zero BC on a rigid-body member's eliminated DOF is left out when the body already holds
-  that DOF (reference node fixed in it and unable to rotate, in every step the BC is in
-  force — `OP=NEW` included); otherwise it stays and is warned. `dheller1_uprofile` (a
-  coupled U-profile end section that also carries the BCs) now solves; an equivalent model
-  with plain equations and the same knot beams matches it to all printed digits.
+* A `*BOUNDARY` on a rigid constraint member's eliminated DOF is taken off where the
+  reference node's own BCs impose it anyway, and warned otherwise: *BCs on coupled
+  nodes*, below.
 
 Corpus: `dheller1_uprofile` now solves (it stopped on the cascade). Of the four gated
 `BEAM` decks, the hood-hinge modal deck and the barrel vault still solve and now carry the
@@ -467,6 +475,52 @@ free while 38 coupled nodes are clamped) and `sahmotaman_coldforging` (die nodes
 axis keep their BC in steps where the die is released) are real overconstraints and still
 stop there. The explicit `davidmorin` decks now stop on ccx's explicit-MPC limit instead of
 running past the time limit without their constraint. Net: 220 → 219 solving (+1, −2).
+
+**BCs on coupled nodes.** ccx makes the coupled DOFs of every rigid-coupling member the
+dependent side of an MPC (and the converter's rotation ties do the same for shell/beam
+rotations), so a member that also has a `*BOUNDARY` on such a DOF stops ccx: `*ERROR in
+cascade: the DOF corresponding to node N in direction d is detected on the dependent side
+of a MPC and a SPC`. Abaqus resolves the overconstraint — for `*RIGID BODY` it moves
+identical BCs on the dependent nodes to the reference node (adding zero rotations about the
+other axes) and stops if they differ; a kinematic coupling eliminates the coupled DOFs at
+its nodes, so Abaqus/Standard does not apply a BC there and warns. The converter now
+removes such a BC where the reference node's own BCs impose it anyway: the same value on
+that DOF, and no rotation about the other two axes in that step or any before it (2-D: about
+z). That is exact in linear and `NLGEOM` steps alike — the member's displacement along d is
+u_ref,d + (θ × r)_d, and a finite rotation about axis d leaves component d alone — and
+Abaqus' own resolution gives the same model. A zero velocity counts as held still from the
+first step on; BCs on DOF 3 of plane/axisymmetric members go too (Abaqus has no such DOF,
+ccx's 2-D rigid body makes it dependent). The rigid bodies of `*MPC BEAM` lines count as
+rigid constraints too. A member's rotation BC that the reference imposes stays, and the
+rotation tie is dropped (the BC governs it); one it does not impose turns the tie round on a
+`*RIGID BODY`, so the body follows the member's BC, as Abaqus moves it to the reference
+node. Probed on 2.23:
+
+* a `C3D8` bar with its end face under `*RIGID BODY` and a fully fixed reference vs the same
+  bar encastred at that face, and under `*COUPLING` with the reference guided along z vs the
+  same constraints as BCs and `*EQUATION`s: identical displacements (max |Δu| = 0); under
+  `NLGEOM` with the end face turning about z, the dropped u3 = 0 holds to 3e-20;
+* `CPE4` and `CAX4` strips with an edge under `*RIGID BODY` or `*COUPLING`, the reference
+  held in x and about z: the members' x BCs dropped give identical results; these also showed
+  that an empty `*KINEMATIC` must couple `1, 2` on 2-D nodes — `1, 3` stopped every 2-D
+  coupling on DOF 3, which ccx holds fixed itself — now fixed;
+* `dheller1_uprofile` (`S4R` U-profile whose end section is coupled to one of its own
+  nodes, every end node held in x, z and all rotations): 222 member BCs dropped; identical
+  to the same deck with those BCs restored and the coupling replaced by `*EQUATION`
+  u2 = u2(ref) (max |Δu| = 0 over all 4592 nodes). Without the knot beams the same
+  constraints differ by 4.9e-4 of |u| — ccx makes the shell normal rigid at a knot.
+
+`dheller1_uprofile` solves this way (counted above). Where the reference node's BCs do not
+impose a member's BC, the converter warns ("Possible overconstraint: node N DOF d follows reference
+node R …") and leaves it. With `--approximate` it drops it on a kinematic coupling or an
+`*MPC`, as Abaqus/Standard does (`[APPROX]`): `marcello_gori_job_1_3`, whose coupling surface overlaps
+the encastred face at 38 nodes, then solves. A `*RIGID BODY` conflict on a translation stays a warning:
+`abuganza_square_expander` encastres the nodes of a free rigid body in its last step, and
+`sahmotaman_coldforging` releases its dies in the last step while their axis nodes keep
+`XSYMM`. The other decks with BCs on coupled nodes (`frodal_axisymmetric_*`,
+`sahmotaman_upsetting`, and all but two BCs of `jasiuk_research_group_boundarycond_2`,
+whose punch moves along z) are resolved and stop at their next blocker (an undefined
+material or amplitude, UMAT, a damage criterion).
 
 **Planar beams and trusses.** ccx has no planar beam or truss: it runs `B21` "as a B31" and
 `T2D2` as a `T3D2` (manual 6.2.31, 6.2.34), and the converter maps the other 2-D types onto

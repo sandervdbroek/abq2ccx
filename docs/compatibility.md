@@ -27,6 +27,7 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **A rotational DOF of a non-knot shell/beam node does nothing in an `*EQUATION`** | `*MPC TIE` rotations are tied between knots only | probed on 2.23: two beam spans `TIE`d by six equations deflect exactly like a `PIN`ned hinge, as knots like one continuous beam |
 | **A closed loop of `*EQUATION` ties** (u1 = u2, u2 = u3, u3 = u1) is accepted, but ccx then warns "zero coefficient on the dependent side" and **holds the whole loop at zero** | the loop's closing equation is dropped (it follows from the others) | probed on 2.23 |
 | **ccx's explicit stable increment is about 1.3× too large for circular-section beams**: its Courant estimate measures each element by the one-point volume of the 20-node brick a `B32`/`B32R` expands into over its largest face area, and a `CIRC` section's nodes on the circle make that h = min(l, √2·d) — the box around the circle — while the stable limit corresponds to h = 1.01–1.17·d (`RECT`/`PIPE`/`BOX` run at ccx's own increment) | each automatic `*DYNAMIC, EXPLICIT` increment is capped (the data line's 4th field) at ccx's own formula with h = min(l, d/√2), the square through the section's corner nodes; a fixed (`DIRECT`) increment above it is warned, since ccx's mass scaling is sized from the same estimate | ccx sources `calcstabletimeincvol.f`, `gen3dfrom1d.f`; probed on 2.23 (NaN displacements; limit bisected over `B32`/`B32R`, d = 10–80, l = 5–100, ν = 0–0.49; capped, a load raised smoothly and held ends within 1 % of beam theory) |
+| **A rigid coupling makes its members' coupled DOFs MPC dependents too** (`*RIGID BODY` and `*MPC BEAM`: every translation; `*KINEMATIC`: the listed ones), and ccx holds DOF 3 of 2-D nodes itself | a member `*BOUNDARY` that the reference node's own BCs impose is taken off (exact); the others are warned (`--approximate` drops them on a kinematic coupling or an `*MPC`, as Abaqus/Standard does); a 2-D `*KINEMATIC` couples `1, 2` | probed on ccx 2.23 (`*ERROR in cascade`); Abaqus manual: coupled DOFs are eliminated at the coupling nodes, BCs on rigid-body nodes move to the reference node |
 
 ## Version notes
 
@@ -121,7 +122,8 @@ line with the element type and mesh density). A cantilever on linear beams with 
 circular section matches beam theory's tip deflection within 0.4 %, pipe- and
 box-section cantilevers match it within 0.6 %, a shell plate whose edge is rigidly coupled
 to a loaded reference point matches the same plate built from solids under `*RIGID BODY`
-within 0.001 %, circular-section beams with a held twist and a prescribed rotation match
+within 0.001 %, coupled bars whose coupled nodes also carry BCs match the same constraints
+written without a coupling to 2e-18, circular-section beams with a held twist and a prescribed rotation match
 beam theory within 0.2 %, planar `B21` beams' frequencies and buckling loads (rectangular
 and circular sections) match it within 0.6 %, a C3D8 plate and a composite S8R
 variable-angle-tow panel whose fibre angles come from a `*DISTRIBUTION` move exactly like
@@ -188,9 +190,10 @@ resolves the `REF NODE` set and fills an empty `*Kinematic`). Where it couples s
 membrane, beam or truss nodes, ccx 2.23 accepts it only through the knot beams above;
 explicit-dynamics steps cannot run it at all (nor any rigid body on plane or axisymmetric
 nodes: "linear and nonlinear MPC's depend on each other"). A coupled DOF that also carries
-a `*BOUNDARY` stops ccx ("dependent side of a MPC and a SPC") where Abaqus resolves the
-overconstraint; the converter leaves such a BC out where the body already holds that DOF
-(its reference node fixed there and unable to rotate), which is exact, and warns otherwise.
+a `*BOUNDARY` stops ccx ("dependent side of a MPC and a SPC"), an overconstraint Abaqus
+resolves: the converter takes such a BC off where the reference node's own BCs impose it
+anyway (exact), and otherwise warns with what Abaqus does instead — `--approximate` drops it
+on a kinematic coupling or an `*MPC`, as Abaqus/Standard does.
 
 Abaqus `*MPC` is converted line by line: `PIN` and `TIE` become `*EQUATION`s, `BEAM`
 lines become one `*RIGID BODY` per independent node (lines chained through a node form one
@@ -221,3 +224,5 @@ known displacement.
 * "A Guide to Modifying Abaqus Input Files for Use in CalculiX" — <https://calculix.discourse.group/t/a-guide-to-modifying-abaqus-input-files-for-use-in-calculix/1430>
 * CalculiX Discourse — <https://calculix.discourse.group/> · PrePoMax forum — <https://prepomax.discourse.group/>
 * Abaqus Keywords Reference Manual, `*INSTANCE` — <https://www.sharcnet.ca/Software/Abaqus/6.14.2/v6.14/books/key/ch09abk19.html>
+* Abaqus Analysis User's Guide (2016), "Coupling constraints" (kinematic coupling eliminates the coupled DOFs; no BCs on them in Abaqus/Standard) — <https://ceae-server.colorado.edu/v2016/books/usb/pt08ch35s03aus135.html>
+* Abaqus Analysis User's Guide (2016), "Overconstraint checks" (BCs on rigid-body nodes moved to the reference node) — <https://ceae-server.colorado.edu/v2016/books/usb/pt08ch35s06aus140.html>

@@ -77,6 +77,7 @@ Common messages and what to do:
 | `… has NO CalculiX equivalent … emitted unchanged` | cohesive/gasket/connector/rigid element — the deck won't run until you remodel it |
 | `*KEYWORD … emitted as a comment` | no equivalent; the original is preserved as `**` comments for you to edit |
 | `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` sits on a DOF an `*EQUATION`, `*MPC` or rigid body eliminates, and the converter could not resolve it exactly (it reorders equation terms, drops redundant equations and leaves out BCs a rigid body already holds) — ccx will stop; remove one |
+| `*BOUNDARY taken off N DOF(s) that a rigid constraint …` | BCs on coupled nodes that the reference node's own BCs impose anyway were removed — exact; ccx cannot have both |
 | `… member(s) reference undefined … removed` | a set had ids that don't exist; if the count is surprising, check upstream renumbering |
 | `Duplicate node/element id(s) …` | the deck defines an id twice; last one wins (as in Abaqus) |
 | `*ORIENTATION SYSTEM=SPHERICAL …` | ccx has no spherical system; emitted rectangular — verify |

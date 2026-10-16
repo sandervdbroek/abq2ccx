@@ -200,7 +200,7 @@ def test_overconstraint_equation_reordered():
     body, _, _ = convert_str(rb)
     assert _equations(body) == ["9,1,-1.,5,1,1."]
     _, _, rep = convert_str(rb + "*Boundary\n6, 1, 1\n100, 2, 2\n")
-    assert "node 6 DOF 1 is eliminated by a *RIGID BODY" in rep.text()
+    assert "node 6 DOF 1 follows reference node 100 through a *RIGID BODY" in rep.text()
 
 
 def test_mpc_lines_converted_one_by_one():
@@ -298,22 +298,23 @@ def test_rigid_member_bcs_the_body_implies_are_left_out():
             "*Rigid Body, ref node=100, tie nset=TOP\n*Boundary\nSYM, 1, 1\n100, 1, 1\n"
             "100, 3, 6\n*Step\n*Static\n*Boundary\n100, 2, 2, 0.1\n*End Step\n")
     body, conv, rep = convert_str(deck)
-    assert conv._implied_spc == {(5, 1), (8, 1)}
     lines = _live(body)
     i = lines.index("*BOUNDARY")
-    assert lines[i + 1:i + 6] == ["1, 1, 1", "4, 1, 1", "100, 1, 1", "100, 3, 3",
+    assert lines[i + 1:i + 5] == ["ABQ2CCX_BC1, 1, 1", "100, 1, 1", "100, 3, 3",
                                   f"{conv._rb_rot[100]}, 1, 3"]      # SYM without 5 and 8
-    assert "left out" in rep.text()
-    # not implied: the body may turn about y, or a BC is nonzero, or one is released (OP=NEW)
+    assert reparse(body).nsets["ABQ2CCX_BC1"] == [1, 4] and "taken off 2 DOF(s)" in rep.text()
+    # not implied: the body may turn about y, or a BC is nonzero; one that OP=NEW releases
+    # before any step keeps it is left alone (it cannot clash)
     for edit in (("100, 3, 6", "100, 3, 3\n100, 6, 6"), ("SYM, 1, 1", "SYM, 1, 1, 0.01"),
                  ("*Boundary\n100, 2", "*Boundary, op=NEW\n100, 2")):
-        _, conv, _ = convert_str(deck.replace(*edit))
-        assert not conv._implied_spc, edit
+        body, _, rep = convert_str(deck.replace(*edit))
+        assert "ABQ2CCX_BC1" not in body and "taken off" not in rep.text(), edit
     # a body of plane-strain nodes only turns about z; ccx's explicit solver cannot run it
     q = (Q4 + "*Node\n10, 0.5, 2.\n*Nset,nset=TOP\n3,4\n*Rigid Body, ref node=10, tie nset=TOP\n"
          "*Boundary\nL, 1, 1\n10, 1, 1\n10, 6, 6\n")
-    _, conv, rep = convert_str(q)
-    assert conv._implied_spc == {(4, 1)} and "explicit dynamic" not in rep.text()
+    body, _, rep = convert_str(q)
+    assert [l for l in _bc_lines(body) if l.startswith(("L,", "1,", "4,"))] == ["1,1,1"]
+    assert "taken off 1 DOF(s)" in rep.text() and "explicit dynamic" not in rep.text()
     _, _, rep = convert_str(q + "*Step\n*Dynamic, Explicit\n, 1e-4\n*End Step\n")
     assert "plane / axisymmetric elements in a deck with an explicit" in rep.text()
 
@@ -880,15 +881,29 @@ def test_coupling_refnode_set_resolved_and_empty_kinematic():
 
 
 def test_kinematic_rotational_dofs_clamped():
+    def kinematic_line(body):
+        lines = body.splitlines()
+        return lines[next(i for i, l in enumerate(lines) if l.upper().startswith("*KINEMATIC")) + 1]
+    deck = (HEX + "*Node\n9,0.5,0.5,2.\n*Nset, nset=TOP\n5,6,7,8\n*Surface, type=NODE, name=S\n"
+            "TOP\n*Coupling, constraint name=C, ref node=9, surface=S\n*Kinematic\n1, 6\n")
+    body, _, rep = convert_str(deck)
+    assert kinematic_line(body).replace(" ", "") == "1,3"
+    assert "clamped" in rep.text().lower()
+    # 2-D nodes have no DOF 3 in Abaqus, and ccx holds theirs fixed and stops on a coupled one
+    # ('dependent side of a MPC and a SPC', probed on 2.23): plane elements couple 1-2 only
     deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n9,0.5,0.5,1.\n"
             "*Nset, nset=R\n9\n*Element, type=CPS4, elset=E\n1,1,2,3,4\n"
             "*Surface, type=ELEMENT, name=S\nE, S1\n"
             "*Coupling, constraint name=C, ref node=9, surface=S\n*Kinematic\n1, 6\n")
     body, _, rep = convert_str(deck)
-    lines = body.splitlines()
-    ki = next(i for i, l in enumerate(lines) if l.upper().startswith("*KINEMATIC"))
-    assert lines[ki + 1].replace(" ", "") == "1,3"
-    assert "clamped" in rep.text().lower()
+    assert kinematic_line(body).replace(" ", "") == "1,2" and "DOFs above 2 left out" in rep.text()
+    body, _, rep = convert_str(deck.replace("1, 6\n", ""))          # empty card: Abaqus' all
+    assert kinematic_line(body).replace(" ", "") == "1,2" and "synthesized '1, 2'" in rep.text()
+    body, _, _ = convert_str(deck.replace("*Coupling, constraint name=C, ref node=9, surface=S\n"
+                                          "*Kinematic\n1, 6\n",
+                                          "*Nset, nset=M\n1, 2\n*Kinematic Coupling, ref node=9\n"
+                                          "M, 1, 3\nM, 3, 3\n"))
+    assert body.count("*KINEMATIC") == 1 and kinematic_line(body) == "1, 2"     # 3, 3 dropped
 
 
 def test_surface_interaction_hard_behavior_synthesized():
@@ -1313,12 +1328,16 @@ def test_rigid_coupling_on_shell_nodes_gets_knot_beams():
     assert "*KINEMATIC\n1, 3\n*EQUATION" in body
     assert _equations(body) == [f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6)]
     assert "gen3dmpc" in rep.text() and "knot beam" in rep.text()
-    # a DOF list without rotations ties none; a rotation under a *BOUNDARY keeps the BC
+    # a DOF list without rotations ties none; a rotation under a *BOUNDARY keeps the BC (ccx
+    # cannot have both), warned unless the reference node's own BC imposes it
     body, _, _ = convert_str(deck + "2, 2\n")
     assert "B31" in body and not _equations(body)
     body, _, rep = convert_str(deck + "*Boundary\n5, 4, 4\n")
     assert "5,4,1.,100,4,-1." not in _equations(body) and "5,5,1.,100,5,-1." in _equations(body)
-    assert "the BC governs it" in rep.text()
+    assert "keeps the BC and is not tied" in rep.text() and "--approximate" in rep.text()
+    body, _, rep = convert_str(deck + "*Boundary\n5, 4, 4\n100, 4, 4\n")
+    assert "5,4,1.,100,4,-1." not in _equations(body) and "Possible overconstraint" not in rep.text()
+    assert "5, 4, 4" in body                                  # the BC governs it (exact)
     # solid members need no knots: no beams, no note
     body, _, rep = convert_str(HEX + "*Nset,nset=TOP\n5,6,7,8\n*Node\n100,0.5,0.5,2.\n"
                                "*Rigid Body, nset=TOP, ref node=100\n")
@@ -1399,6 +1418,102 @@ def test_kinematic_rotation_lines():
     assert body.count("*COUPLING") == 1
     assert _equations(body) == [f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6)]
     assert "NOT coupled" not in rep.text()
+
+
+def _bc_lines(body):
+    """The *BOUNDARY data lines of a converted deck, blanks removed."""
+    out, inside = [], False
+    for l in _live(body):
+        if l.startswith("*"):
+            inside = l.upper().startswith("*BOUNDARY")
+        elif inside:
+            out.append(l.replace(" ", ""))
+    return out
+
+
+def test_coupled_member_bc_implied_by_reference_dropped():
+    # ccx makes the coupled DOFs of rigid-coupling members dependent and stops on one that also
+    # has a *BOUNDARY ('*ERROR in cascade ... dependent side of a MPC and a SPC'); where the
+    # reference node's own BCs impose it anyway (that DOF, and no rotation about the other two
+    # axes), the BC is taken off — a line keeping some nodes moves onto a set of them
+    deck = (HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6,7,8\n*Nset,nset=SIDE\n1,2,5,6\n"
+            "*Rigid Body, ref node=100, tie nset=TOP\n")
+    body, conv, rep = convert_str(deck + "*Boundary\n100, 1, 6\nTOP, 1, 3\nSIDE, 2, 2\n")
+    rot = conv._rb_rot[100]
+    assert _bc_lines(body) == ["100,1,3", f"{rot},1,3", "ABQ2CCX_BC1,2,2"]
+    assert reparse(body).nsets["ABQ2CCX_BC1"] == [1, 2] and "Exact." in rep.text()
+    assert "overconstraint" not in rep.text()
+    # the same through a kinematic coupling whose reference may only slide in x-y and turn
+    # about z: the members' z is imposed (NLGEOM too: a rotation about z leaves z alone), their
+    # x and y are not — those BCs stay, warned
+    kin = (HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6,7,8\n*Surface, type=node, name=ST\n"
+           "TOP\n*Coupling, constraint name=C, ref node=100, surface=ST\n*Kinematic\n")
+    body, _, rep = convert_str(kin + "*Boundary\n100, 3, 5\nTOP, 1, 3\n")
+    assert _bc_lines(body) == ["100,3,5", "TOP,1,2"]
+    assert "node 5 DOF 1 follows reference node 100 through a kinematic coupling" in rep.text()
+    assert "(8 such DOF(s) on 4 node(s))" in rep.text() and "Exact." in rep.text()
+    # not imposed: a rotation about another axis is free, the values differ, or the reference's
+    # rotation is only held from the second step on (the body may have turned in the first)
+    for bcs in ("100, 1, 2\n100, 4, 4\nTOP, 1, 1\n",         # rotations about y and z free
+                "100, 1, 6\nTOP, 1, 1, 0.1\n"):               # u1 = 0 vs 0.1
+        body, _, rep = convert_str(kin + "*Boundary\n" + bcs)
+        assert "TOP,1,1" in "".join(_bc_lines(body)) and "Possible overconstraint" in rep.text()
+    body, _, rep = convert_str(kin + "*Boundary\nTOP, 1, 1\n100, 1, 3\n*Step\n*Static\n*End Step\n"
+                               "*Step\n*Static\n*Boundary\n100, 4, 6\n*End Step\n")
+    assert "TOP,1,1" in _bc_lines(body) and "Possible overconstraint" in rep.text()
+    body, _, rep = convert_str(kin + "*Boundary\nTOP, 1, 1\n100, 1, 6\n*Step\n*Static\n*End Step\n"
+                               "*Step\n*Static\n*Boundary, op=NEW\n100, 1, 6\n*End Step\n")
+    assert "TOP,1,1" not in _bc_lines(body) and "overconstraint" not in rep.text()
+    # a zero velocity holds the reference still once it does so from the first step
+    body, _, rep = convert_str(kin + "*Boundary\nTOP, 1, 1\n*Step\n*Static\n*Boundary, type=velocity\n"
+                               "100, 1, 1\n100, 4, 6\n100, 3, 3, -1.\n*End Step\n")
+    assert "TOP,1,1" not in _bc_lines(body) and "Exact." in rep.text()
+    body, _, rep = convert_str(kin + "*Boundary\nTOP, 1, 1\n*Step\n*Static\n*Boundary, type=velocity\n"
+                               "100, 1, 1, 0.5\n100, 4, 6\n*End Step\n")
+    assert "TOP,1,1" in _bc_lines(body) and "Possible overconstraint" in rep.text()
+
+
+def test_coupled_member_bc_conflicts_and_approximate():
+    # a member BC the reference node's BCs do not impose stops ccx; Abaqus/Standard ignores it
+    # (a kinematic coupling eliminates the coupled DOFs at its nodes), so --approximate drops
+    # it there; a *RIGID BODY conflict (Abaqus moves identical BCs to the reference node)
+    # stays a warning
+    kin = (HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6,7,8\n*Surface, type=node, name=ST\n"
+           "TOP\n*Coupling, constraint name=C, ref node=100, surface=ST\n*Kinematic\n"
+           "*Boundary\nTOP, ENCASTRE\n")
+    body, _, rep = convert_str(kin)
+    assert _bc_lines(body) == ["TOP,1,3"] and "rerun with --approximate" in rep.text()
+    body, _, rep = convert_str(kin, approximate=True)
+    assert _bc_lines(body) == [] and "[APPROX] *BOUNDARY taken off 12 DOF(s) of 4 node(s)" in rep.text()
+    rb = kin.replace("*Surface, type=node, name=ST\nTOP\n*Coupling, constraint name=C, ref node=100, "
+                     "surface=ST\n*Kinematic\n", "*Rigid Body, ref node=100, tie nset=TOP\n")
+    for approximate in (False, True):
+        body, _, rep = convert_str(rb, approximate=approximate)
+        assert _bc_lines(body) == ["TOP,1,3"] and "[APPROX]" not in rep.text()
+        assert "through a *RIGID BODY" in rep.text() and "put the BC on the reference node" in rep.text()
+
+
+def test_coupled_member_bc_shell_and_planar():
+    # the dheller1_uprofile pattern: a coupled shell edge whose reference node is one of its
+    # own nodes (-> *RIGID BODY), every edge node held in x, z and all rotations: the members'
+    # x and z go, their rotations stay (imposed, so left untied)
+    deck = (S4 + "*Nset, nset=EDGE\n2, 3, 5, 6\n*Surface, type=node, name=SE\nEDGE\n"
+            "*Coupling, constraint name=C, ref node=2, surface=SE\n*Kinematic\n"
+            "*Boundary\nEDGE, 1, 1\nEDGE, 3, 6\n*Step\n*Static\n*Cload\n2, 2, -1.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "*RIGID BODY, NSET=ABQ2CCX_RB1, REF NODE=2" in body
+    assert _bc_lines(body) == ["2,1,1", "2,3,3", "EDGE,4,6"]
+    assert len(_equations(body)) == 3            # only the ROT NODE follows node 2's rotations
+    assert "overconstraint" not in rep.text()
+    # 2-D: the in-plane rotation is the only one; DOF 3 does not exist there (ccx's 2-D rigid
+    # body makes it dependent all the same)
+    q = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n5,2,0\n6,2,1\n100,3,0.5\n*Element,type=CPE4,elset=E\n"
+         "1,1,2,3,4\n2,2,5,6,3\n*Nset,nset=R\n5,6\n*Solid Section,elset=E,material=M\n1.,\n"
+         "*Material,name=M\n*Elastic\n1000.,0.3\n*Rigid Body, ref node=100, tie nset=R\n")
+    body, _, rep = convert_str(q + "*Boundary\n100, 1, 1\n100, 6, 6\nR, 1, 1\nR, 3, 3\n")
+    assert [l for l in _bc_lines(body) if l.startswith("R,")] == [] and "DOF 3 of 2-D nodes" in rep.text()
+    body, _, rep = convert_str(q + "*Boundary\n100, 1, 1\nR, 1, 1\n")      # rotation free
+    assert "R,1,1" in _bc_lines(body) and "Possible overconstraint" in rep.text()
 
 
 def test_plastic_hardening_forms():
@@ -2548,6 +2663,16 @@ def test_op_new_examples():
     assert body.split("*STEP")[2].count("*BOUNDARY, OP=NEW") == 2
     assert list(conv._knots) == [1, 1001, 1101, 1201, 1301, 1401]
     assert not dangling_refs(reparse(body))
+
+
+def test_coupling_bc_bars_example():
+    # the validate_with_ccx.py deck: bar A's redundant end-face BCs (x, y) and bar C's (z) are
+    # taken off, bar B (the same constraints without a coupling) keeps all of its own
+    body, _, rep = convert(os.path.join(EXAMPLES, "coupling_bc_bars.inp"))
+    g = reparse(body)
+    assert not dangling_refs(g), dangling_refs(g)
+    assert [l for l in _bc_lines(body) if l.split(",")[0] in ("A_END", "B_END", "C_END")] == ["B_END,1,2"]
+    assert "*BOUNDARY taken off 27 DOF(s)" in rep.text() and rep.n_warnings == 0
 
 
 if __name__ == "__main__":
