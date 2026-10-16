@@ -18,6 +18,10 @@ Converter.build_geometry()   Pass A: walk blocks in order, fill the geometry reg
                                      expand *NGEN/*NCOPY/*ELGEN/… to explicit nodes/elements
         │
         ▼
+Converter._drop_surface_elements()   surface elements (SFM*) leave the registry; their
+                                     loads become nodal forces later
+        │
+        ▼
 Converter._check_overconstraints()   pre-flight warning for BC-on-dependent-DOF
         │
         ▼
@@ -83,6 +87,16 @@ nodal forces are exact (small strain; NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT
 RESULTANT=YES`); otherwise the line stays commented unless `--approximate`.
 `_dl_state` / `_flush_dloads` do the same bookkeeping for the `*DLOAD` lines that come from
 `*DLOAD` and from `*DSLOAD`, whose `OP=NEW` scopes differ in Abaqus but not in ccx.
+
+Abaqus **surface elements** (`SURFACE_ELEMENTS`: `SFM3D*`, `SFMAX*`, `SFMGAX*`) have no
+stiffness and no ccx counterpart. Right after Pass A, `_drop_surface_elements` moves them out
+of the registry into `_carriers` and out of the element sets (`_carrier_sets` keeps each
+set's full member list) — unless rebar, or mass in a deck where mass acts, keeps them
+(without `--approximate`). `_load_elements` still sees them, so their `TRVEC`/`TRSHR` and
+`P` loads, element-based or on a `*SURFACE` side, go through `_load_faces` like any face; a
+surface element's face carries a pressure *sense* (Abaqus: an element-based `P` along the
+element normal, a surface `P` against the surface normal). `_only_carriers` lets
+`*SURFACE SECTION`, `*SURFACE` and `*EL PRINT` drop what only names them.
 
 The **load audit** (`step_load_audit`) lists the loads active in every step — loads and
 prescribed BC values persist until `OP=NEW`, a perturbation step counts only its own, user
@@ -164,7 +178,8 @@ python validate_with_ccx.py     # converts + runs the examples in CalculiX
 ```
 
 It auto-detects `ccx` (including FreeCAD's bundled binary), runs the example decks, and
-checks the NAFEMS LE10 benchmark stress against the published reference, the tip
+checks the NAFEMS LE10 benchmark stress against the published reference (and with its
+pressure carried by surface elements against the face-pressure result), the tip
 deflections of circular-, pipe- and box-section cantilevers against beam theory, and the
 loads applied as consistent nodal forces (Cook's membrane, beam line loads, Lamé's
 cylinder). It skips cleanly if no `ccx` is found.

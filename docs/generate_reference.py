@@ -70,8 +70,11 @@ TRANSLATED = {
         "`FOLLOWER=NO` / `CONSTANT RESULTANT` dropped (warned under NLGEOM). Element tractions "
         "(`TRVECn`/`TRSHRn`) and beam line loads (`PX`/`PY`/`PZ`/`P1`/`P2` — ccx reads `P1`/`P2` "
         "on a beam as a section-face pressure) → consistent nodal forces, as for `*DSLOAD` "
-        "tractions; user-subroutine labels (`...NU`) commented, naming ccx's `dload.f`. "
-        "`OP=NEW` keeps the `*DSLOAD` pressures Abaqus keeps (ccx's `OP=NEW` would remove them).",
+        "tractions, and so do `TRVEC`/`TRSHR`/`P` on surface elements (which leave the mesh; "
+        "`P` is positive along the element normal); gravity on them adds nothing (no mass), "
+        "other loads on them are commented; user-subroutine labels (`...NU`) commented, naming "
+        "ccx's `dload.f`. `OP=NEW` keeps the `*DSLOAD` pressures Abaqus keeps (ccx's `OP=NEW` "
+        "would remove them).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; surface tractions "
         "(`TRVEC`/`TRSHR`, which ccx has no card for) → consistent nodal forces: the face/edge "
         "shape functions integrated by Gauss quadrature over the undeformed geometry (times the "
@@ -79,7 +82,13 @@ TRANSLATED = {
         "emitted as a `*CLOAD` (one per amplitude, never `OP=NEW`) at the end of the step. Exact in "
         "small-strain steps and, under NLGEOM, for `TRVEC` with `FOLLOWER=NO, CONSTANT "
         "RESULTANT=YES`; any other NLGEOM traction is commented (`--approximate` converts it with an "
-        "`[APPROX]` warning).",
+        "`[APPROX]` warning). A pressure on the `SPOS`/`SNEG` side of surface elements (which leave "
+        "the mesh) → nodal forces too, positive against the surface normal (`SPOS`: the element "
+        "normal); under NLGEOM only with `--approximate`.",
+    "*SURFACE SECTION": "dropped with its surface elements (`SFM3D*`, `SFMAX*`, `SFMGAX*`), "
+        "which leave the mesh — no stiffness, no ccx element — while their loads become nodal "
+        "forces; they stay (and ccx stops on them) if `*REBAR LAYER` or `DENSITY=` in a "
+        "dynamic/frequency step or under gravity gives them physics, unless `--approximate`.",
     "*TIE": "Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept.",
     "*MPC": "`TIE` → per-DOF `*EQUATION`; `PLANE`/`STRAIGHT` kept; others commented.",
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
@@ -131,7 +140,8 @@ TRANSLATED = {
         "accepted.)",
     "*RESTART": "keeps `WRITE`/`READ`/`FREQUENCY`/`STEP`; other params dropped.",
     "*SURFACE": "only `NAME`/`TYPE` kept; shell edges `E1..E4` → `S3..S6` (plane elements "
-        "`S1..S4`); `ANALYTICAL RIGID` / `COMBINE` commented; `SPOS`/`SNEG` flagged.",
+        "`S1..S4`); `ANALYTICAL RIGID` / `COMBINE` commented; `SPOS`/`SNEG` flagged; faces of "
+        "surface elements (not in the ccx mesh) left out, a surface of them only dropped.",
     "*OUTPUT / *NODE OUTPUT / *ELEMENT OUTPUT": "→ `*NODE FILE`/`*EL FILE`; `*OUTPUT` wrapper "
         "dropped.",
     "*NODE FILE / *EL FILE / *NODE PRINT / *EL PRINT": "`POSITION=`/`DIRECTIONS=` stripped, "
@@ -167,6 +177,7 @@ def element_category(t):
         (("COH",), "cohesive"),
         (("CONN",), "connector"),
         (("R3D", "RB2", "RB3", "RAX"), "rigid"),
+        (("SFM",), "surface (load carrier)"),
         (("DC3D", "DC1D"), "heat-transfer continuum"),
         (("C3D",), "3D continuum"),
         (("F3D",), "3D fluid (CFD)"),
@@ -188,6 +199,8 @@ def element_category(t):
 
 
 def element_status(t):
+    if t in A.SURFACE_ELEMENTS:
+        return "left out of the mesh; its loads → consistent nodal forces"
     if t in A.ELEMENT_TYPE_MAP:
         return f"→ `{A.ccx_element_type(t, A.Report())}` (substituted)"
     if t in A.CCX_ELEMENTS:
@@ -216,6 +229,19 @@ def gen_elements():
         rows = [(f"`{t}`", A.ELEMENT_NNODES[t], element_status(t)) for t in cats[cat]]
         parts.append(f"## {cat}\n")
         parts.append(md_table(["Abaqus type", "Nodes", "CalculiX"], rows) + "\n")
+        if cat == "surface (load carrier)":
+            parts.append("Abaqus surface elements have no stiffness (\"membrane elements with zero "
+                         "thickness\") and ccx has none, so they leave the mesh: element sets keep "
+                         "their other members, and the `TRVEC`, `TRSHR` and `P` loads they carry "
+                         "(element-based, or `*DSLOAD` on their `SPOS`/`SNEG` side) become "
+                         "consistent nodal forces on their nodes — the 3-D ones as faces (corners, "
+                         "then midside nodes), the axisymmetric ones as edges (end, middle, end; "
+                         "over the full circle). Abaqus signs: an element-based `P` acts along the "
+                         "element normal (right-hand rule over the nodes; axisymmetric: node 1 → 2 "
+                         "turned counterclockwise), a surface `P` against the surface normal. "
+                         "Elements that carry `*REBAR LAYER`s, or mass (`*SURFACE SECTION, "
+                         "DENSITY=`) in a dynamic or frequency step or under gravity, stay — ccx "
+                         "then stops on them — unless `--approximate`.\n")
         if cat == "beam / truss":
             pairs = ", ".join(f"`{a}` → `{b}`" for a, b in A.CIRC_QUADRATIC.items())
             parts.append("Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is "

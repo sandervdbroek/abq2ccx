@@ -1789,6 +1789,130 @@ def test_distributed_load_examples():
     assert abs(sum(ring.values()) - 2 * math.pi * 10 * 2) < 1e-9 and {d for _, d in ring} == {1}
 
 
+# a surface element on the cube's top face, its normal (right-hand rule) +z: out of the cube
+SKIN = HEX + "*ELEMENT, TYPE=SFM3D4, ELSET=SKIN\n9, 5, 6, 7, 8\n*SURFACE SECTION, ELSET=SKIN\n"
+TOP4 = (5, 6, 7, 8)
+
+
+def test_surface_elements_leave_the_mesh_and_carry_their_loads():
+    deck = SKIN + ("*ELSET, ELSET=BOTH\nEALL, SKIN\n*SURFACE, NAME=TOP\nSKIN, SPOS\n*Step\n*Static\n"
+                   "*Dload\nSKIN, TRVEC, 4., 0., 0., -2.\n*El Print, elset=SKIN\nS\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    geom = reparse(body)
+    assert list(geom.elements) == [1] and geom.elsets["BOTH"] == [1] and "SKIN" not in geom.elsets
+    assert "SFM3D4" not in body and "SURFACE" not in body and "*EL PRINT" not in body
+    assert _cloads(body) == [{(n, 3): -1.0 for n in TOP4}]
+    assert not conv.unloaded_steps and rep.n_warnings == 0 and rep.n_commented == 0
+    assert "1 surface element(s) (SFM3D4) left out of the ccx mesh" in rep.text()
+
+
+def test_surface_element_pressure_sense():
+    # Abaqus: an element-based P is positive along the element normal (+z here, so a suction),
+    # a surface P against the surface normal (SPOS: the element normal, SNEG: its reverse)
+    deck = SKIN + "*SURFACE, NAME=TOP\nSKIN, {}\n*Step\n*Static\n{}\n*End Step\n"
+    for side, load, fz in (("SPOS", "*Dload\nSKIN, P, 4.", 1.0), ("SPOS", "*Dsload\nTOP, P, 4.", -1.0),
+                           ("SNEG", "*Dsload\nTOP, P, 4.", 1.0)):
+        body, conv, _ = convert_str(deck.format(side, load))
+        assert _cloads(body) == [{(n, 3): fz for n in TOP4}], (side, load)
+        assert not conv.unloaded_steps and "*DLOAD" not in body
+    # a surface with faces of both kinds: the solid face keeps ccx's own pressure
+    body, _, rep = convert_str(deck.format("SPOS\nEALL, S2", "*Dsload\nTOP, P, 4."))
+    assert "\nEALL, P2, 4." in body and _cloads(body) == [{(n, 3): -1.0 for n in TOP4}]
+    assert "*SURFACE, NAME=TOP\nEALL, S2\n" in body and "sees only its other faces" in rep.text()
+
+
+def test_quadratic_and_axisymmetric_surface_elements():
+    c3d20 = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+             "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, .5, 0., 0.\n10, 1., .5, 0.\n11, .5, 1., 0.\n"
+             "12, 0., .5, 0.\n13, .5, 0., 1.\n14, 1., .5, 1.\n15, .5, 1., 1.\n16, 0., .5, 1.\n"
+             "17, 0., 0., .5\n18, 1., 0., .5\n19, 1., 1., .5\n20, 0., 1., .5\n"
+             "*Element, type=C3D20, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, "
+             "17, 18, 19, 20\n*Element, type=SFM3D8, elset=SKIN\n2, 5, 6, 7, 8, 13, 14, 15, 16\n"
+             "*Step\n*Static\n*Dload\nSKIN, TRVEC, 12., 0., 0., -1.\n*End Step\n")
+    body, _, _ = convert_str(c3d20)                      # serendipity: -1/12 and 1/3 of the total
+    assert _close(_cloads(body)[0], {**{(n, 3): 1.0 for n in (5, 6, 7, 8)},
+                                     **{(n, 3): -4.0 for n in (13, 14, 15, 16)}})
+    # axisymmetric: the edge r = 2 of a CAX8 (z up), 2 pi r per unit length.  Abaqus turns
+    # node 1 -> node 2 (+z) counterclockwise for the element normal: -r, into the element
+    cax8 = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n5, 1.5, 0.\n6, 2., .5\n7, 1.5, 1.\n"
+            "8, 1., .5\n*Element, type=CAX8, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Element, type={}, elset=SKIN\n2, {}\n*Surface, name=OUT\nSKIN, SPOS\n"
+            "*Step\n*Static\n{}\n*End Step\n")
+    two, three = ("SFMAX1", "2, 3"), ("SFMAX2", "2, 6, 3")
+    for (typ, nodes), load, share in ((two, "*Dload\nSKIN, P, 3.", {2: -1, 3: -1}),
+                                      (two, "*Dsload\nOUT, P, 3.", {2: 1, 3: 1}),
+                                      (two, "*Dload\nSKIN, TRVEC, 3., 1., 0., 5.", {2: 1, 3: 1}),
+                                      (three, "*Dload\nSKIN, P, 3.", {2: -1, 6: -4, 3: -1})):
+        body, conv, _ = convert_str(cax8.format(typ, nodes, load))
+        want = {(n, 1): s * 12 * math.pi / sum(abs(x) for x in share.values())
+                for n, s in share.items()}
+        assert _close(_cloads(body)[0], want, 1e-9), (typ, load)
+        assert typ not in body and not conv.unloaded_steps
+
+
+def test_surface_element_pressure_under_nlgeom_needs_approximate():
+    deck = SKIN + "*Step, nlgeom\n*Static\n*Dload\nSKIN, P, 4.\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert _cloads(body) == [{}] and conv.unloaded_steps == [1]
+    assert "pressure stays normal to the deforming surface" in rep.text()
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert _cloads(body) == [{(n, 3): 1.0 for n in TOP4}] and "[APPROX] *DLOAD P" in rep.text()
+
+
+def test_other_loads_on_surface_elements():
+    deck = SKIN + "*Step\n*Static\n*Dload\n{}\n*End Step\n"
+    # a mass-proportional load: the surface elements carry no mass, the solids keep it
+    body, conv, rep = convert_str(deck.format(", GRAV, 9.81, 0., 0., -1."))
+    assert "\nABQ2CCX_ALL_ELEMENTS, GRAV, 9.81, 0., 0., -1." in body
+    assert reparse(body).elsets["ABQ2CCX_ALL_ELEMENTS"] == [1] and not conv.unloaded_steps
+    body, conv, _ = convert_str(deck.format("SKIN, GRAV, 9.81, 0., 0., -1."))
+    assert "-> no load: it acts only on surface elements" in body and "\n*DLOAD" not in body
+    # loads this conversion does not apply to surface elements are commented out
+    body, conv, rep = convert_str(deck.format("SKIN, BZ, 3."))
+    assert "a BZ load on them is not converted" in rep.text() and conv.unloaded_steps == [1]
+
+
+def test_surface_elements_with_mass_or_rebar_stay_unless_approximate():
+    heavy = SKIN.replace("SECTION, ELSET=SKIN\n", "SECTION, ELSET=SKIN, DENSITY=0.5\n")
+    body, _, rep = convert_str(heavy + "*Step\n*Frequency\n3\n*End Step\n")
+    assert "TYPE=SFM3D4" in body and "carry mass (*SURFACE SECTION, DENSITY=)" in rep.text()
+    body, _, rep = convert_str(heavy + "*Step\n*Frequency\n3\n*End Step\n", approximate=True)
+    assert "SFM3D4" not in body and "[APPROX] Surface elements (SFM3D4) left out" in rep.text()
+    body, _, rep = convert_str(heavy + "*Step\n*Static\n*Dload\nSKIN, P, 4.\n*End Step\n")
+    assert "SFM3D4" not in body and "[APPROX]" not in rep.text()     # mass does not act here
+    rebar = SKIN + "*Rebar Layer\nR1, 0.01, 0.1, , M, 0., 1\n*Step\n*Static\n*End Step\n"
+    body, _, rep = convert_str(rebar)
+    assert "TYPE=SFM3D4" in body and "rebar layers (*REBAR LAYER)" in rep.text()
+
+
+def test_surface_element_on_free_nodes_warns():
+    deck = HEX + ("*Node\n9, 0., 0., 2.\n10, 1., 0., 2.\n11, 1., 1., 2.\n12, 0., 1., 2.\n"
+                  "*Element, type=SFM3D4, elset=SKIN\n9, 9, 10, 11, 12\n")
+    _, _, rep = convert_str(deck)
+    assert "4 node(s) of the surface elements belong to no other element" in rep.text()
+
+
+def test_surface_elements_in_an_assembly_instance():
+    # the shape of petrkryslucsd_problem_le10nafems_mst10: an independent instance holding a
+    # solid and its surface elements (with their section), loaded from the assembly
+    deck = ("*Part, name=P\n*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n"
+            + HEX + "*Element, type=SFM3D4, elset=SKIN\n2, 5, 6, 7, 8\n*Solid Section, elset=EALL, material=M\n"
+              "*Surface Section, elset=SKIN\n*End Instance\n*End Assembly\n*Material, name=M\n"
+              "*Elastic\n1., 0.3\n*Step\n*Static\n*Dload, follower=NO\nA.I1.SKIN, TRVEC, 4., 0., 0., -1.\n"
+              "*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "SFM3D4" not in body and "SURFACE SECTION" not in body and rep.n_commented == 0
+    assert _cloads(body) == [{(n, 3): -1.0 for n in TOP4}] and not conv.unloaded_steps
+
+
+def test_nle10_surface_elements_example():
+    body, conv, _ = convert(os.path.join(EXAMPLES, "nle10_surface_elements.inp"))
+    (skin,) = _cloads(body)
+    area = math.pi / 4 * (3.25 * 2.75 - 2 * 1)                      # the quarter elliptic annulus
+    assert {d for _, d in skin} == {3} and abs(sum(skin.values()) / -1e6 - area) < 1e-4 * area
+    assert "TYPE=SFM3D8" not in body and not conv.unloaded_steps
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

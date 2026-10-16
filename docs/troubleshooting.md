@@ -40,6 +40,11 @@ itself is not the cause — it is verified identical to Abaqus.)
   check the report for a commented-out material card.
 * The element type has no CalculiX equivalent (cohesive/gasket/connector/rigid). The
   report flags these; they must be remodelled (see below).
+* Abaqus surface elements (`SFM3D*`, `SFMAX*`) only get here when the converter kept them:
+  normally they leave the mesh (no stiffness) and their loads become nodal forces, but
+  rebar layers or a mass that acts (`*SURFACE SECTION, DENSITY=` in a dynamic or frequency
+  step, or under gravity) keep them — the report says which. `--approximate` drops them
+  anyway, losing that stiffness or mass.
 
 ### Composite shell errors
 

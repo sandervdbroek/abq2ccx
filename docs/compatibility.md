@@ -24,6 +24,9 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **A `*CLOAD` on a `CPS`/`CPE` node is the total for the section thickness; on a `CAX` node the total over 2π**, as in Abaqus | traction forces are scaled by the thickness / integrated over the full circle | probed on 2.23: each matches a pressure-loaded twin |
 | **`*CLOAD`s on one node DOF (and `*DLOAD`s on one face) add within a step and replace across steps; `OP=NEW` removes only earlier steps' loads** | converted forces are re-emitted as totals, never with `OP=NEW`; ccx's `*DLOAD, OP=NEW` removes the `*DSLOAD` pressures Abaqus keeps, so those are given again | probed on 2.23 |
 | **Abaqus tractions: `FOLLOWER=YES` and `CONSTANT RESULTANT=NO` by default; `FOLLOWER` does not apply to `TRSHR`, whose direction is projected onto the surface in the reference configuration** | nodal forces (fixed in ccx) are exact under NLGEOM only for `TRVEC` with `FOLLOWER=NO, CONSTANT RESULTANT=YES` | Abaqus Keywords manual (`*DSLOAD`, `*DLOAD`) and Analysis User's Guide (distributed loads) |
+| **ccx has no surface element** (`SFM3D*`, `SFMAX*`, `SFMGAX*`: `*ERROR reading *ELEMENT`); **in Abaqus they have no stiffness** ("membrane elements with zero thickness") and carry loads, mass per unit area (`DENSITY=`) or rebar layers | they leave the mesh and their loads become consistent nodal forces; with rebar, or mass that acts (dynamics, frequency, gravity), they stay unless `--approximate` | Abaqus Analysis User's Guide, "Surface elements" and the general / axisymmetric surface element libraries (2016, 2017) |
+| **Abaqus surface-element pressures: an element-based `P` is positive along the positive element normal; a surface-based (`*DSLOAD`) `P` is positive against the surface normal** (`SPOS`: the element normal, `SNEG`: its reverse). The normal is the right-hand rule over the nodes (3-D) or the direction node 1 → 2 turned 90° counterclockwise (axisymmetric) | the converted forces take each sign; an element-based `P` and a `*DSLOAD P` on `SPOS` load opposite ways | the element libraries' load tables (2016, 2017); checked in ccx: an `SFM3D8` skin on the LE10 plate reproduces its face pressure `P2` to 7 digits each way (`validate_with_ccx.py`) |
+| **ccx silently ignores a `*CLOAD` on a node that belongs to no element** | surface elements whose nodes no other element uses are warned | probed on 2.23: no error, zero displacement there |
 
 ## Version notes
 
@@ -60,7 +63,9 @@ line with the element type and mesh density). A cantilever on linear beams with 
 circular section matches beam theory's tip deflection within 0.4 %, pipe- and
 box-section cantilevers match it within 0.6 %, a shell plate whose edge is rigidly coupled
 to a loaded reference point matches the same plate built from solids under `*RIGID BODY`
-within 0.001 %, Cook's membrane under a shear traction matches the published 23.96 within
+within 0.001 %, the LE10 plate with its pressure on a skin of `SFM3D8` surface elements
+(which ccx does not have) reproduces the face-pressure result to 7 digits, Cook's membrane
+under a shear traction matches the published 23.96 within
 0.12 %, cantilevers under beam line loads match q L⁴/(8 E I) within 1.2 %, an axisymmetric
 cylinder under a radial traction matches Lamé within 0.02 %, and the composite-shell and
 assembly decks also solve. This proves the
@@ -69,7 +74,7 @@ sections — is correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
-188 solve in CalculiX under their own loads (14 more solve but load nothing in the source
+189 solve in CalculiX under their own loads (14 more solve but load nothing in the source
 deck) and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
 convert cleanly but use features ccx cannot run, and each was verified to fail no worse
 than the original unconverted deck. Bulk-running every deck

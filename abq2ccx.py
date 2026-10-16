@@ -100,7 +100,19 @@ ELEMENT_NNODES: Dict[str, int] = {
     # heat-transfer continuum (Abaqus-compatible names accepted by ccx)
     "DC3D4": 4, "DC3D6": 6, "DC3D8": 8, "DC3D10": 10, "DC3D15": 15, "DC3D20": 20,
     "DC1D2": 2, "DC1D3": 3,
+    # surface elements (load carriers without stiffness; see SURFACE_ELEMENTS)
+    "SFM3D3": 3, "SFM3D4": 4, "SFM3D4R": 4, "SFM3D6": 6, "SFM3D8": 8, "SFM3D8R": 8,
+    "SFMAX1": 2, "SFMAX2": 3, "SFMGAX1": 2, "SFMGAX2": 3,
 }
+
+# Abaqus surface elements: no stiffness of their own ("membrane elements with zero
+# thickness"), used to carry distributed loads, mass per unit area (*SURFACE SECTION,
+# DENSITY=) or rebar layers.  ccx has no such element ("*ERROR reading *ELEMENT"), so as pure
+# load carriers they leave the mesh and their loads become nodal forces (see
+# Converter._drop_surface_elements).  The 3-D ones are faces (corners, then midside nodes),
+# the axisymmetric ones edges (end, middle, end; SFMGAX twist as in CGAX -> CAX).
+SURFACE_ELEMENTS = {"SFM3D3", "SFM3D4", "SFM3D4R", "SFM3D6", "SFM3D8", "SFM3D8R",
+                    "SFMAX1", "SFMAX2", "SFMGAX1", "SFMGAX2"}
 
 # Element types CalculiX has no native name for -> substitute.  Every entry is
 # NODE-COUNT PRESERVING so connectivity stays valid (a warning is emitted on use).
@@ -228,6 +240,11 @@ def ccx_element_type(typ: str, report: "Report") -> str:
                         f"the pore-pressure DOF is dropped and only the mechanical response is solved — "
                         f"consolidation/seepage is NOT modelled. Verify.", once=True)
         return ccx_element_type(base, report)
+    if typ in SURFACE_ELEMENTS:                 # only when the conversion had to keep them
+        report.warn(f"Element {typ} is an Abaqus surface element; ccx has none and stops with "
+                    f"'*ERROR reading *ELEMENT' (see the warning on why the conversion kept it).",
+                    once=True)
+        return typ
     if typ.startswith(("R3D", "RB2", "RB3", "RAX", "R2D")):
         report.warn(f"Element {typ} is a rigid (R3D/RB) element; ccx has no rigid element — define "
                     f"the region as a *RIGID BODY (NSET + REF NODE/ROT NODE) instead. Emitted "
@@ -1766,6 +1783,10 @@ class Converter:
         self._dl_state: Dict[str, "OrderedDict[tuple, Tuple[str, Optional[str]]]"] = {}
         self._dl_fresh: set = set()                 # (card, key) given in the current step
         self._dl_wiped = False                      # a ccx *DLOAD, OP=NEW in the current step
+        # Abaqus surface elements left out of the ccx mesh (_drop_surface_elements): element ->
+        # (type, nodes), and the full member list of each element set that had some
+        self._carriers: "OrderedDict[int, Tuple[str, List[int]]]" = OrderedDict()
+        self._carrier_sets: Dict[str, List[int]] = {}
 
     # -- properties ---------------------------------------------------------
     @property
@@ -2040,6 +2061,7 @@ class Converter:
             "BEAM SECTION": self.handle_beam_section,
             "COHESIVE SECTION": self.handle_cohesive_section,
             "GASKET SECTION": self.handle_cohesive_section,
+            "SURFACE SECTION": self.handle_surface_section,
             "TIE": self.handle_tie,
             "BOUNDARY": self.handle_boundary,
             "CLOAD": self.handle_cload,
@@ -2588,6 +2610,14 @@ class Converter:
             keep["ORIENTATION"] = b.param("ORIENTATION")
         return [emit_keyword("SOLID SECTION", keep)]
 
+    def handle_surface_section(self, b: Block) -> List[str]:
+        """``*SURFACE SECTION``: the section of surface elements; dropped with them when they
+        leave the ccx mesh (_drop_surface_elements), commented out otherwise (ccx has none)."""
+        if self._only_carriers(b.param("ELSET") or ""):
+            self.report.note("*SURFACE SECTION dropped with its surface elements.", once=True)
+            return []
+        return self.passthrough(b)
+
     def handle_beam_section(self, b: Block) -> List[str]:
         sec = (b.param("SECTION") or "").upper()
         # ccx 2.22 beam profiles: RECT, CIRC (ellipse), PIPE, BOX.  Anything else is a
@@ -3107,7 +3137,8 @@ class Converter:
         (TRVECn / TRSHRn) and beam line loads (PX, PY, PZ, P1, P2) have no ccx card — ccx reads
         P1 / P2 on a beam as a pressure on its expanded section face, i.e. scaled by the
         section width (probed on 2.23) — and become consistent nodal forces
-        (_to_nodal_forces); user-subroutine loads (...NU labels) are commented out."""
+        (_to_nodal_forces), as do the tractions and pressures (P) on surface elements, which
+        are not in the ccx mesh; user-subroutine loads (...NU labels) are commented out."""
         op_new = (b.param("OP") or "").strip().upper() == "NEW"
         if op_new:
             self._reset_nodal_loads("DLOAD")
@@ -3142,6 +3173,26 @@ class Converter:
                     faces, why = self._beam_lines(eids, label) if len(beams) == len(eids) else \
                         ([], f"element set '{g[0]}' mixes beams with other elements")
                     side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
+                    continue
+            # surface elements on the line (no element set: the whole model) are not in the ccx
+            # mesh: a pressure on them becomes nodal forces, a mass-proportional load adds
+            # nothing (they carry no mass unless --approximate dropped it), others are lost
+            carriers = [e for e in self._load_elements(g[0]) if e in self._carriers] if g[0] \
+                else list(self._carriers)
+            if carriers:
+                if label == "P":
+                    faces, why = self._load_faces(carriers, "", shell_reference=True)
+                    side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
+                elif label not in ("GRAV", "CENTRIF"):
+                    side += self._drop_load_line(b, g, f"it loads surface elements, which are not "
+                                                       f"in the ccx mesh, and a {label} load on "
+                                                       f"them is not converted")
+                    continue
+                if not (self.geom.elements if not g[0] else
+                        any(e not in self._carriers for e in self._load_elements(g[0]))):
+                    if label != "P":
+                        side.append(f"** abq2ccx: {', '.join(x for x in g if x)} -> no load: it "
+                                    f"acts only on surface elements, which carry no mass in ccx")
                     continue
             if not g[0] and ALL_ELEMENTS_SET in self.geom.elsets:
                 # Abaqus applies a body load with no element set to the whole model; ccx
@@ -3182,7 +3233,8 @@ class Converter:
 
     def handle_dsload(self, b: Block) -> List[str]:
         """``*DSLOAD``: a surface pressure becomes a ccx *DLOAD face pressure (ccx's P1..P6 face
-        numbers match Abaqus' continuum faces); a surface traction (TRVEC / TRSHR) becomes
+        numbers match Abaqus' continuum faces); a surface traction (TRVEC / TRSHR), and a
+        pressure on the faces of surface elements, which are not in the ccx mesh, become
         consistent nodal forces (_to_nodal_forces); a user-subroutine load (...NU labels) is
         commented out."""
         op_new = (b.param("OP") or "").strip().upper() == "NEW"
@@ -3215,7 +3267,18 @@ class Converter:
                                              not sd else f"'{f[0]}' is a node-based surface (a pressure "
                                                          f"needs element faces)")
                 continue
+            if self._carriers and any(e in self._carriers for token, _ in sd[1]
+                                      for e in self._load_elements(token)):
+                # faces of surface elements, which are not in the ccx mesh: nodal forces
+                if label != "P":
+                    side += self._drop_load_line(b, g, f"surface '{f[0]}' lies on surface "
+                                                       f"elements, whose pressure label is P")
+                    continue
+                faces, why = self._surface_faces(surf, carriers_only=True)
+                side += self._to_nodal_forces(b, "DSLOAD", g, faces, why)
             for token, face in sd[1]:
+                if self._only_carriers(token):
+                    continue
                 if face and re.fullmatch(r"S[1-6]", face):
                     pl = "P" + face[1]
                 else:
@@ -3257,17 +3320,26 @@ class Converter:
     # -- distributed loads as nodal forces, and *DLOAD bookkeeping -------------------
     def _load_elements(self, token: str) -> List[int]:
         """The defined elements a load line targets — a set counts each member once (a set
-        built by *ELGEN lists its master element twice), as the emitted set does."""
-        eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else dedup(self.geom.elset(token))
-        return [e for e in eids if e in self.geom.elements]
+        built by *ELGEN lists its master element twice), as the emitted set does — including
+        the surface elements left out of the ccx mesh (_drop_surface_elements)."""
+        eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else \
+            dedup(self._carrier_sets.get(token.upper()) or self.geom.elset(token))
+        return [e for e in eids if e in self.geom.elements or e in self._carriers]
+
+    def _only_carriers(self, token: str) -> bool:
+        """Whether element ``token`` / the elements of set ``token`` are all surface elements
+        left out of the ccx mesh (so the emitted deck has no such element / set)."""
+        eids = self._load_elements(token) if self._carriers else []
+        return bool(eids) and all(e in self._carriers for e in eids)
 
     def _is_beam(self, eid: int) -> bool:
         info = self.geom.elements.get(eid)
         return bool(info) and info[0].upper().startswith(("B2", "B3", "PIPE"))
 
-    def _surface_faces(self, name: str) -> Tuple[list, Optional[str]]:
+    def _surface_faces(self, name: str, carriers_only: bool = False) -> Tuple[list, Optional[str]]:
         """The element faces / edges of element-based *SURFACE ``name`` (see _load_faces), or
-        why they cannot be resolved."""
+        why they cannot be resolved; with ``carriers_only`` just those on surface elements left
+        out of the ccx mesh."""
         sd = self.surfaces.get(name.upper())
         if sd is None:
             return [], f"surface '{name}' is not defined in the deck"
@@ -3277,6 +3349,10 @@ class Converter:
         seen: set = set()
         for token, face in sd[1]:
             eids = self._load_elements(token)
+            if carriers_only:
+                eids = [e for e in eids if e in self._carriers]
+                if not eids:
+                    continue
             if not eids:
                 return [], f"surface '{name}' member '{token}' matches no element"
             label = (face or "").upper()
@@ -3291,20 +3367,38 @@ class Converter:
     def _load_faces(self, eids: Sequence[int], face: str, shell_reference: bool
                     ) -> Tuple[list, Optional[str]]:
         """Per element, the edge / face a traction acts on as (nodes — corners first, then the
-        midside nodes —, "line" or "area", scale, axisymmetric, planar, n1), or why it cannot
-        be resolved.  ``face``: S1..S6 or 1..6 (continuum faces, plane-element edges), SPOS /
-        SNEG (a shell's reference surface; with ``shell_reference`` also no face at all).
-        A plane-stress / plane-strain edge carries the section thickness as its scale."""
+        midside nodes —, "line" or "area", scale, axisymmetric, planar, n1, sense), or why it
+        cannot be resolved.  ``face``: S1..S6 or 1..6 (continuum faces, plane-element edges),
+        SPOS / SNEG (the reference surface of a shell or surface element; with
+        ``shell_reference`` also no face at all).  A plane-stress / plane-strain edge carries the
+        section thickness as its scale.  ``sense`` (surface elements only): a pressure p acts as
+        the traction p * sense * the normal consistent_nodal_forces passes."""
         out: list = []
         quiet = Report()
         m = re.fullmatch(r"S?([1-6])", face)
         for e in eids:
-            info = self.geom.elements.get(e)
+            info = self.geom.elements.get(e) or self._carriers.get(e)
             if info is None:
                 return [], f"element {e} is not defined"
             typ, conn = info
             cc, n = ccx_element_type(typ, quiet), len(conn)
-            if cc.startswith(PLANE_ELEM_PREFIXES):
+            if typ.upper() in SURFACE_ELEMENTS:
+                if face not in ("SPOS", "SNEG") and not (shell_reference and not face):
+                    return [], (f"face '{face}' of the {typ} element {e} is not its reference "
+                                f"surface (SPOS / SNEG)")
+                # Abaqus: an element-based pressure is positive along the positive element
+                # normal, a surface pressure against the surface normal (SPOS: the element
+                # normal, SNEG: its reverse).  The positive normal of a 3-D surface element is
+                # the right-hand rule over its nodes — the face normal here; an axisymmetric
+                # one turns the direction node 1 -> node 2 counterclockwise, while the edge
+                # normal here turns it clockwise.
+                sense = -1.0 if face == "SPOS" else 1.0
+                if typ.upper().startswith(("SFMAX", "SFMGAX")):
+                    out.append(([conn[0], conn[-1]] + ([conn[1]] if n == 3 else []), "line", 1.0,
+                                True, True, None, -sense))
+                else:
+                    out.append((list(conn), "area", 1.0, False, False, None, sense))
+            elif cc.startswith(PLANE_ELEM_PREFIXES):
                 nc = 3 if n in (3, 6) else 4
                 if not m or int(m.group(1)) > nc or n not in (nc, 2 * nc):
                     return [], f"face '{face}' is not an edge of the {typ} element {e}"
@@ -3312,18 +3406,18 @@ class Converter:
                 pos = [k, k % nc + 1] + ([nc + k] if n == 2 * nc else [])
                 axi = cc.startswith("CAX")
                 out.append(([conn[p - 1] for p in pos], "line",
-                             1.0 if axi else self._section_thick.get(e, 1.0), axi, True, None))
+                             1.0 if axi else self._section_thick.get(e, 1.0), axi, True, None, None))
             elif cc.startswith("C3D"):
                 fam = {4: "TET", 10: "TET", 6: "WEDGE", 15: "WEDGE", 8: "HEX", 20: "HEX"}.get(n)
                 if not fam or not m or int(m.group(1)) not in FACE_NODES[fam]:
                     return [], f"face '{face}' is not a face of the {typ} element {e}"
                 out.append(([conn[p - 1] for p in FACE_NODES[fam][int(m.group(1))] if p <= n], "area",
-                            1.0, False, False, None))
+                            1.0, False, False, None, None))
             elif (cc in SHELL_TYPES or cc.startswith("M3D")) and n in (3, 4, 6, 8):
                 if face not in ("SPOS", "SNEG") and not (shell_reference and not face):
                     return [], (f"face '{face}' of the {typ} element {e} is not its reference "
                                 f"surface (SPOS / SNEG)")
-                out.append((list(conn), "area", 1.0, False, False, None))
+                out.append((list(conn), "area", 1.0, False, False, None, None))
             else:
                 return [], f"element {e} ({typ}) has no face this conversion can load"
         return out, None
@@ -3342,7 +3436,7 @@ class Converter:
                     return [], "the deck's *NORMAL cards redefine the beams' local axes"
                 if n1 is None:
                     return [], f"the cross-section axes of beam {e} are unknown"
-            out.append((nodes, "line", 1.0, False, self._planar_beams, n1))
+            out.append((nodes, "line", 1.0, False, self._planar_beams, n1, None))
         return out, None
 
     def _nodal_load_inexact(self, b: Block, base: str) -> Optional[str]:
@@ -3356,6 +3450,9 @@ class Converter:
             return "under NLGEOM a beam line load acts on the deforming beam"
         if base == "TRSHR":
             return "under NLGEOM a shear traction (TRSHR) stays tangent to the deforming surface"
+        if base == "P":
+            return ("under NLGEOM a pressure stays normal to the deforming surface and acts per "
+                    "unit current area")
         if (b.param("FOLLOWER") or "YES").strip().upper() != "NO":
             return ("under NLGEOM the traction rotates with the surface (FOLLOWER=YES, the Abaqus "
                     "default)")
@@ -3366,13 +3463,14 @@ class Converter:
 
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
                          why: Optional[str]) -> List[str]:
-        """One traction (TRVEC / TRSHR) or beam line-load (PX / PY / PZ / P1 / P2) data line ``g``
-        -> consistent nodal forces (consistent_nodal_forces over ``faces``), registered for
-        the *CLOAD at the end of the step (_flush_nodal_loads).  Returns the comment lines that
-        take the load's place in the deck.  TRVEC: magnitude x the unit direction; TRSHR: the
-        direction projected onto the face (in its undeformed geometry, as in Abaqus) at every
-        integration point; plane-element edges carry the section thickness, axisymmetric edges
-        the full circle; a 2-D model has no third component."""
+        """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2) or surface-element
+        pressure (P) data line ``g`` -> consistent nodal forces (consistent_nodal_forces over
+        ``faces``), registered for the *CLOAD at the end of the step (_flush_nodal_loads).
+        Returns the comment lines that take the load's place in the deck.  TRVEC: magnitude x
+        the unit direction; TRSHR: the direction projected onto the face (in its undeformed
+        geometry, as in Abaqus) at every integration point; P: along the face normal, with each
+        face's sense (_load_faces); plane-element edges carry the section thickness,
+        axisymmetric edges the full circle; a 2-D model has no third component."""
         label = g[1].upper()
         base = label[:5] if label.startswith("TR") else label
         if why:
@@ -3415,7 +3513,7 @@ class Converter:
             def load(p, normal, tangent):
                 return vscale(axis, mag)
         forces: Dict[Tuple[int, int], float] = {}
-        for nodes, kind, scale, axi, planar, n1 in faces:
+        for nodes, kind, scale, axi, planar, n1, sense in faces:
             if base in ("P1", "P2"):
                 def load(p, normal, tangent, n1=n1):
                     n2 = vcross(tangent, n1)
@@ -3424,6 +3522,9 @@ class Converter:
                         return (0.0, 0.0, 0.0)
                     n2 = vunit(n2)
                     return vscale(vcross(n2, tangent) if base == "P1" else n2, mag)
+            elif base == "P":
+                def load(p, normal, tangent, s=sense):
+                    return vscale(normal, mag * s)
             fv = consistent_nodal_forces(kind, [self.geom.nodes[n] for n in nodes], load, axi)
             for nd, v in zip(nodes, fv):
                 for k in range(2 if planar else 3):
@@ -3446,15 +3547,17 @@ class Converter:
                              f"direction and magnitude — the response differs from Abaqus as the "
                              f"mesh deforms. Verify.", once=True)
         self._set_nodal_load(key, forces, amp)
-        what = "surface tractions (TRVEC / TRSHR)" if base.startswith("TR") else \
-            "beam line loads (PX / PY / PZ / P1 / P2)"
+        if base.startswith("TR"):
+            what, lack = "surface tractions (TRVEC / TRSHR)", "ccx has no such load"
+        elif base == "P":
+            what, lack = "pressures (P) on surface elements", "ccx has no surface element"
+        else:
+            what, lack = ("beam line loads (PX / PY / PZ / P1 / P2)", "ccx has no such load (it "
+                          "reads P1 / P2 on a beam as a pressure on the expanded section face)")
         self.report.note(f"*{b.keyword} {what} -> consistent nodal forces in a *CLOAD at the end of "
-                         f"the step: ccx has no such load"
-                         + ("" if base.startswith("TR") else " (it reads P1 / P2 on a beam as a "
-                            "pressure on the expanded section face)")
-                         + ". The shape functions are integrated over the undeformed faces / edges "
-                         "(times the section thickness on plane elements, over the full circle on "
-                         "axisymmetric ones).", once=True)
+                         f"the step: {lack}. The shape functions are integrated over the undeformed "
+                         f"faces / edges (times the section thickness on plane elements, over the "
+                         f"full circle on axisymmetric ones).", once=True)
         res = [sum(v for (_, k), v in forces.items() if k == c) for c in (1, 2, 3)]
         return [f"** abq2ccx: {', '.join(x for x in g if x)} -> nodal forces on "
                 f"{len({n for n, _ in forces})} node(s), resultant ({', '.join('%.6g' % x for x in res)}),"
@@ -3526,8 +3629,8 @@ class Converter:
         self._nodal_emitted = {nd: v for nd, v in target.items() if v[0] != "0"}
         out: List[str] = []
         if groups:
-            out.append("** abq2ccx: consistent nodal forces of the surface tractions / beam line "
-                       "loads converted above")
+            out.append("** abq2ccx: consistent nodal forces of the distributed loads converted "
+                       "above (tractions, beam line loads, pressures on surface elements)")
         for amp, data in groups.items():
             out.append("*CLOAD" + (f", AMPLITUDE={amp}" if amp else ""))
             out.extend(data)
@@ -3651,6 +3754,10 @@ class Converter:
             params[k] = v
         if suppress:
             self.report.note(f"*{b.keyword} with FREQUENCY=0 dropped (output suppressed).", once=True)
+            return []
+        if cc == "EL PRINT" and self._only_carriers(params.get("ELSET") or ""):
+            self.report.note("*EL PRINT on surface elements dropped: they are not in the ccx mesh.",
+                             once=True)
             return []
         if cc == "EL PRINT" and "ELSET" not in params and ALL_ELEMENTS_SET in self.geom.elsets:
             params["ELSET"] = ALL_ELEMENTS_SET
@@ -4643,10 +4750,17 @@ class Converter:
                 self.report.note(f"*SURFACE parameter {k} dropped (ccx's *SURFACE takes only NAME "
                                  f"and TYPE).", once=True)
         out = [emit_keyword("SURFACE", params)]
+        on_carriers = 0
         for rec in merged_data_records(b):
             f = [x for x in rec if x != ""]
             if not f:
                 continue
+            eids = self._load_elements(f[0]) if self._carriers and not is_node else []
+            carried = sum(1 for e in eids if e in self._carriers)
+            if carried:                          # surface elements: not in the ccx mesh
+                on_carriers += 1
+                if carried == len(eids):
+                    continue
             if not re.fullmatch(r"[-+]?\d+", f[0]):
                 known = self.geom.nsets if is_node else self.geom.elsets
                 if f[0].upper() not in known:
@@ -4675,6 +4789,14 @@ class Converter:
             if len(f) >= 2 and re.fullmatch(r"E[1-4]", f[1].upper()):
                 f = [f[0], self._edge_face(f[0], int(f[1][1:]))] + f[2:]
             out.append(", ".join(f))
+        if on_carriers:
+            if len(out) == 1:
+                self.report.note("A *SURFACE on surface elements only is dropped with them; the "
+                                 "loads on it become nodal forces.", once=True)
+                return []
+            self.report.warn(f"*SURFACE {b.param('NAME') or ''}: its faces on surface elements are "
+                             f"left out with them (loads on it still reach them as nodal forces); a "
+                             f"contact, tie or coupling on it sees only its other faces.", once=True)
         return out
 
     def _edge_face(self, token: str, k: int) -> str:
@@ -4701,9 +4823,11 @@ class Converter:
 
     # ======================================================================
     def convert(self, blocks: List[Block]) -> List[str]:
+        raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         self.build_geometry(blocks)
+        self._drop_surface_elements(raw, blocks)
         self._upgrade_section_beams(blocks)
         self._check_nonpositive_ids()
         self._check_overconstraints(blocks)
@@ -4731,6 +4855,70 @@ class Converter:
         out.extend(self.emit_other(blocks))
         self._audit_loads(blocks, out)
         return out
+
+    # procedures and *DLOAD labels in which an element's mass acts
+    _INERTIA_PROCEDURES = {"DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
+                           "COMPLEX FREQUENCY"}
+    _MASS_LOADS = {"GRAV", "CENTRIF", "CENT", "ROTA", "CORIO", "ROTDYNF"}
+
+    def _drop_surface_elements(self, raw: List[Block], blocks: List[Block]) -> None:
+        """Leave Abaqus surface elements (SURFACE_ELEMENTS) out of the ccx mesh — ccx has no
+        such element.  As pure load carriers they add nothing else: they have no stiffness,
+        and their loads become consistent nodal forces on their nodes (_load_faces).  Element
+        sets keep their other members; the full lists stay in _carrier_sets for the loads.
+        Elements that also carry rebar layers (stiffness), or mass (*SURFACE SECTION,
+        DENSITY=) in a deck where mass acts, stay in the mesh — ccx then stops on them — unless
+        --approximate drops them anyway."""
+        found = OrderedDict((e, v) for e, v in self.geom.elements.items()
+                            if v[0].upper() in SURFACE_ELEMENTS)
+        if not found:
+            return
+        kinds = ", ".join(sorted({v[0].upper() for v in found.values()}))
+        why: List[str] = []
+        if any(a.keyword == "SURFACE SECTION" and c.keyword == "REBAR LAYER"
+               for a, c in zip(raw, raw[1:])):
+            why.append("rebar layers (*REBAR LAYER) give them stiffness and mass")
+        dens = [b.param("DENSITY") for b in blocks if b.keyword == "SURFACE SECTION"]
+        try:
+            heavy = any(d and pf(d) != 0.0 for d in dens)
+        except ValueError:                        # an unresolved value: assume a mass
+            heavy = True
+        acts = sorted({b.keyword for b in blocks if b.keyword in self._INERTIA_PROCEDURES} |
+                      {r[1].strip().upper() for b in blocks if b.keyword == "DLOAD"
+                       for r in merged_data_records(b)
+                       if len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS})
+        if heavy and acts:
+            why.append(f"they carry mass (*SURFACE SECTION, DENSITY=), which acts in this deck "
+                       f"({', '.join(acts)})")
+        if why and not self._approx:
+            self.report.warn(f"Surface elements ({kinds}) kept in the mesh: {'; '.join(why)}. ccx "
+                             f"has no surface element and stops with '*ERROR reading *ELEMENT'; "
+                             f"rerun with --approximate to leave them out (losing that) and apply "
+                             f"their loads as nodal forces.")
+            return
+        if why:
+            self.report.warn(f"[APPROX] Surface elements ({kinds}) left out of the mesh although "
+                             f"{'; '.join(why)}: that is lost in ccx. Their loads become nodal "
+                             f"forces. Verify.")
+        for e in found:
+            del self.geom.elements[e]
+        self._carriers = found
+        for name, ids in self.geom.elsets.items():
+            if any(i in found for i in ids):
+                self._carrier_sets[name] = list(ids)
+                self.geom.elsets[name] = [i for i in ids if i not in found]
+        self.report.note(f"{len(found)} surface element(s) ({kinds}) left out of the ccx mesh: they "
+                         f"have no stiffness and ccx has no such element. The loads they carry "
+                         f"(TRVEC, TRSHR, P) become consistent nodal forces on their nodes; element "
+                         f"sets keep their other members.")
+        used = {n for _, conn in self.geom.elements.values() for n in conn}
+        free = {n for _, conn in found.values() for n in conn} - used
+        if free:
+            self.report.warn(f"{len(free)} node(s) of the surface elements belong to no other "
+                             f"element: ccx silently ignores a load on a node without stiffness "
+                             f"(probed on 2.23), so their share of the converted loads acts only "
+                             f"where a constraint (*EQUATION, *MPC, *RIGID BODY, *COUPLING) ties "
+                             f"them to the structure. Verify.")
 
     def _audit_loads(self, blocks: List[Block], out: List[str]) -> None:
         """Guard against a hollow solve: a step the Abaqus deck loads but whose every load
@@ -5258,7 +5446,7 @@ class Converter:
                              "beams); only the implicit steps can run it.", once=True)
         d = vunit((1.0, 1.0, 1.0))
         nid = max(self.geom.nodes)
-        eid = max(self.geom.elements, default=0)
+        eid = max(list(self.geom.elements) + list(self._carriers), default=0)
         elems = []
         for n in knots:
             nid += 1
@@ -5507,8 +5695,8 @@ def dedup_str(seq: Sequence[str]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
-                     "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT", "MASS", "GAP",
-                     "ORIENTATION", "DISTRIBUTION", "SURFACE"}
+                     "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION", "SPRING", "DASHPOT",
+                     "MASS", "GAP", "ORIENTATION", "DISTRIBUTION", "SURFACE"}
 # Part-level constraint cards that reference the part's own nodes/elements/sets: each
 # instance needs its own copy with offset ids and prefixed names (emitted once, raw,
 # they would constrain only one instance — or the wrong nodes after renumbering).
@@ -5859,7 +6047,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         return rotate_about_axis(q, rot[0], rot[1], rot[2]) if rot else q
     for b in parts.get(inst["part"], []) + inst["extra"]:
         if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
-                         "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT", "MASS", "GAP"):
+                         "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION", "SPRING",
+                         "DASHPOT", "MASS", "GAP"):
             nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer)
             if rot and b.keyword == "BEAM SECTION" and len(nb.data) > 1:
                 # the second data line is the beam's n1 direction: it turns with the part
@@ -6337,8 +6526,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--approximate", action="store_true",
                     help="opt-in: reframe constructs ccx cannot run as approximately equivalent "
                          "ones it can (Riks->static, nu>=0.5 clamped, I-beam->equivalent RECT, "
-                         "NLGEOM follower tractions->fixed nodal forces), each with a loud "
-                         "[APPROX] warning")
+                         "NLGEOM follower tractions->fixed nodal forces, surface elements with "
+                         "rebar or mass->left out), each with a loud [APPROX] warning")
     ap.add_argument("--check", action="store_true",
                     help="dry run: parse + convert + report, write nothing")
     ap.add_argument("--strict", action="store_true",

@@ -4,7 +4,8 @@
 This is the proof that the converter produces *runnable, correct* CalculiX input — not
 just structurally-valid text.  It auto-detects a ``ccx`` binary (including the one
 bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
-stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
+stress (also with the pressure carried by surface elements, which ccx does not have),
+the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, a shell plate rigidly coupled to a loaded reference point against the same
 plate built from solids, and the loads ccx has no card for — surface tractions (Cook's
 membrane, Lame's cylinder) and beam line loads (cantilevers against beam theory) —
@@ -126,6 +127,7 @@ def main():
     inp = os.path.join(tmp, "le10.inp")
     convert(os.path.join(EXAMPLES, "nle10_thickplate.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
+    syy = None
     if status != "solved":
         print(f"FAIL  nle10_thickplate did not solve cleanly ({status})")
         print("\n".join(l for l in out.splitlines() if "ERROR" in l or "convergence" in l.lower()))
@@ -143,6 +145,34 @@ def main():
                   f"{syy:+.3f} MPa (reference {ref:+.2f} MPa, {abs(syy-ref)/abs(ref)*100:.1f}% diff)")
             failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # --- the same plate, its pressure carried by SFM3D8 surface elements -------------
+    # ccx has no surface element: the converter leaves the skin out and applies its load as
+    # consistent nodal forces.  The skin's normal points out of the plate, so the pressure on
+    # its SPOS side, an element-based P = -p (Abaqus: positive along the element normal) and
+    # a TRVEC into the plate are all the face pressure above, which they must reproduce.
+    deck = open(os.path.join(EXAMPLES, "nle10_surface_elements.inp")).read()
+    face = syy
+    for how, load in (("*DSLOAD P on SPOS", "*DSLOAD\n TOP,P,  1.0E6\n"),
+                      ("*DLOAD P, element normal", "*DLOAD\n SKIN,P,  -1.0E6\n"),
+                      ("*DLOAD TRVEC", "*DLOAD\n SKIN,TRVEC,  1.0E6, 0., 0., -1.\n")):
+        src = os.path.join(tmp, "skin_src.inp")
+        with open(src, "w") as fh:
+            fh.write(deck.replace("*DSLOAD\n TOP,P,  1.0E6\n", load))
+        inp = os.path.join(tmp, "skin.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        s = frd_stress(os.path.join(d, "job.frd"), 4013) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if s is None or face is None:
+            print(f"FAIL  nle10_surface_elements ({how}): no stress at point D ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        ok = abs(s[1] / 1e6 - face) <= 1e-5 * abs(face)
+        print(f"{'PASS' if ok else 'FAIL'}  nle10_surface_elements (SFM3D8 skin, {how}): SYY at D = "
+              f"{s[1] / 1e6:+.6f} MPa (face pressure {face:+.6f} MPa)")
+        failures += 0 if ok else 1
 
     # --- circular-section cantilever on linear beams: tip deflection vs beam theory --
     # ccx 2.23 rejects linear beams with a circular section, so this checks the B31 -> B32

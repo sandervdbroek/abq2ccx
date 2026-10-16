@@ -5,8 +5,8 @@ The converter has three layers of tests:
 1. **Unit tests** — fast, no solver needed, run on small controlled fixtures and the
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
-   CalculiX, checking the NAFEMS LE10 benchmark and circular-, pipe- and box-section
-   cantilevers numerically.
+   CalculiX, checking the NAFEMS LE10 benchmark (also with its pressure on surface
+   elements) and circular-, pipe- and box-section cantilevers numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -20,7 +20,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (127)
+## 1. Unit tests — `tests/test_convert.py` (149)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -167,6 +167,15 @@ conversion behaviour and referential integrity.
 | `test_dload_without_element_set_loads_the_whole_model` | `, GRAV, ...` (no element set: the whole model in Abaqus) → a whole-model element set |
 | `test_dsload_on_undefined_surface_says_so` | a `*DSLOAD` on a surface the deck never defines says so (it used to say "not element-based") and flags the step |
 | `test_distributed_load_examples` | the Cook, line-load and cylinder examples' converted forces add up to the applied loads (1; q L per beam; 2π a h p) |
+| `test_surface_elements_leave_the_mesh_and_carry_their_loads` | an `SFM3D4` on a C3D8 face leaves the mesh, a set keeps its other member, a set of surface elements only is not emitted, its `*SURFACE SECTION`, `*SURFACE` and `*EL PRINT` are dropped, and its `TRVEC` becomes the face's nodal forces — no warning, nothing commented |
+| `test_surface_element_pressure_sense` | Abaqus signs: an element-based `P` acts along the element normal (right-hand rule), a `*DSLOAD P` against the surface normal (`SPOS`: the element normal, `SNEG`: its reverse); a surface with a solid face as well keeps ccx's own `P2` there and is warned |
+| `test_quadratic_and_axisymmetric_surface_elements` | an `SFM3D8` takes −1/12 and ⅓ of the total on its corners and midsides; `SFMAX1`/`SFMAX2` edges integrate over the full circle (2πr), their element normal turns node 1 → 2 counterclockwise, a `TRVEC` loses its out-of-plane component |
+| `test_surface_element_pressure_under_nlgeom_needs_approximate` | under NLGEOM a pressure on surface elements (a follower load per current area) is commented and the step flagged; `--approximate` converts it with `[APPROX]` |
+| `test_other_loads_on_surface_elements` | gravity on the whole model keeps its set without the (massless) surface elements; gravity on them only is no load; a body force `BZ` on them is commented |
+| `test_surface_elements_with_mass_or_rebar_stay_unless_approximate` | surface elements stay in the mesh (ccx then stops on them) when their mass acts (`DENSITY=` + a frequency step) or they carry `*REBAR LAYER`; `--approximate` drops them with `[APPROX]`; mass in a static step does not keep them |
+| `test_surface_element_on_free_nodes_warns` | surface elements whose nodes belong to no other element are warned (ccx ignores a load on a node without stiffness) |
+| `test_surface_elements_in_an_assembly_instance` | the corpus deck's shape: surface elements and their `*SURFACE SECTION` inside an `*INSTANCE`, a `TRVEC` on `ASSEMBLY.INSTANCE.SET` → nodal forces, nothing commented |
+| `test_nle10_surface_elements_example` | the LE10 example with an `SFM3D8` skin: the converted forces add up to the pressure × the top face's area, along z |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -177,6 +186,12 @@ deck and runs it in CalculiX:
   published −5.38 MPa reference (the converted deck gives −5.65 MPa, a 5 % difference
   in line with the element type and mesh — proving the whole pipeline is correct, not
   just well-formed).
+* **`nle10_surface_elements`** — the same plate with its pressure on a skin of `SFM3D8`
+  surface elements over the top face, which ccx does not have: the converter leaves the skin
+  out and applies its load as consistent nodal forces. Run three ways — `*DSLOAD P` on the
+  skin's `SPOS` side, an element-based `*DLOAD P` of −p (Abaqus: positive along the element
+  normal, which points out of the plate) and a `TRVEC` into the plate — each must reproduce
+  the face-pressure σ_yy at D within 1e-5 (all give −5.650160 MPa, as the face pressure).
 * **`beam_circ_cantilever`** — a cantilever on linear `B31` beams with a circular section,
   which ccx 2.23 rejects; the converter emits `B32` with inserted midside nodes and turns
   the Abaqus radius into ccx's diameters. Checks the tip deflection against beam theory,
@@ -246,10 +261,10 @@ deck and runs it in CalculiX:
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **188 solve** in CalculiX under their own loads and **219 mesh-only decks are
+references; **189 solve** in CalculiX under their own loads and **219 mesh-only decks are
 accepted** by it. 14 more decks solve but load nothing in the source deck itself (an empty
 `*STEP`), so their solution is zero in Abaqus as well; they stay in the gate as conversion
-checks (`source_unloaded=True`), outside the headline count. The other 601 convert cleanly
+checks (`source_unloaded=True`), outside the headline count. The other 600 convert cleanly
 but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
 Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
@@ -375,6 +390,34 @@ there on all 45 nodes to 2e-7. The other 16 traction decks are NLGEOM follower o
 current-area tractions and leave the gate, as do the 3 user-subroutine decks. Net: 220
 gated decks, of which 167 carried their real loads → 202 gated, of which 188 (all but the
 14 `source_unloaded` ones) do.
+
+**Surface elements.** Abaqus surface elements (`SFM3D3/4/4R/6/8/8R`, axisymmetric
+`SFMAX1/2`, `SFMGAX1/2`) have no stiffness of their own — "membrane elements with zero
+thickness" — and mostly serve to carry a load where no solid face is wanted. ccx has no such
+element and stops on them (`*ERROR reading *ELEMENT`), which blocked
+`petrkryslucsd_problem_le10nafems_mst10`: the NAFEMS LE10 plate on 60 `C3D10`, its pressure a
+`*DLOAD TRVEC` on 12 `SFM3D6` over the top face. They now leave the mesh — element sets keep
+their other members; their `*SURFACE SECTION`, and surfaces and `*EL PRINT` on them only, are
+dropped — and their `TRVEC`, `TRSHR` and `P` loads (element-based, or `*DSLOAD` on their
+`SPOS`/`SNEG` side) become consistent nodal forces through the traction machinery above, with
+the same exactness rule (a pressure is a follower load per current area, so under NLGEOM it
+needs `--approximate`). The pressure signs follow the Abaqus element library (2016 and 2017
+manuals alike): an element-based `P` is positive *along* the element normal — the
+right-hand rule over the nodes; for `SFMAX` the direction node 1 → 2 turned
+counterclockwise — while a surface `P` is positive *against* the surface normal (`SPOS`: the
+element normal, `SNEG`: its reverse), so the two are opposite on the same side. Checked in
+ccx: the LE10 example with an `SFM3D8` skin over its top face, loaded by `*DSLOAD P` on
+`SPOS`, by an element-based `P` of −p and by a `TRVEC`, gives σ_yy at D = −5.650160 MPa each
+time, as ccx's own face pressure `P2` does (and +5.650160 for an element-based `P` of +p, a
+suction). Elements that carry rebar, or mass (`*SURFACE SECTION, DENSITY=`) in a dynamic or
+frequency step or under gravity, stay in the mesh unless `--approximate`; nodes that belong
+to no other element are warned, since ccx silently ignores a `*CLOAD` on a node without
+stiffness (probed). The corpus deck now solves: the converted forces add up to the traction
+× the top face's area (5.448 × 10⁶, the quadratic mesh's 5.448 against the quarter elliptic
+annulus' 5.4487), ccx's reaction at the supports equals them to 7 digits, and σ_yy at D is
+−5.449 MPa against the published −5.38 (1.3 %). Net: 203 gated, of which 189 carry their
+real loads. No other corpus deck uses surface elements; every other deck converts as
+before, bar the wording of the comment above converted `*CLOAD`s.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

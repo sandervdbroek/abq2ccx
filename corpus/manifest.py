@@ -13,18 +13,18 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
 dangling references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (202) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (203) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, and executes
   at least one STEP - under the deck's own loads: no step the deck loads may lose all
   its loads in the conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
   14 of them also carry ``source_unloaded=True``: the source deck applies no load,
   prescribed displacement or initial velocity in any step (and has no eigenvalue
   step), so it solves to a zero response. They are kept as conversion checks but left
-  out of the headline count of decks that solve (188).
+  out of the headline count of decks that solve (189).
 * ``parse_only=True`` (219) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (601) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (600) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, connectors, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -427,6 +427,11 @@ CORPUS = [
     dict(name='petrkryslucsd_barrelvault_s3r_fineirreg', expect_solve=True, license='MIT',
          exercises='S3R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/PetrKryslUCSD/FinEtools.jl/main/test/barrelvault_s3r_fineirreg.inp'),
+    dict(name='petrkryslucsd_problem_le10nafems_mst10', expect_solve=True, license='MIT',
+         exercises='C3D10, SFM3D6 — parts/instances/assembly; *Orientation; TRVEC on surface elements',
+         note='NAFEMS LE10: the SFM3D6 surface elements leave the mesh and their traction becomes '
+              'nodal forces (total = traction x area); SYY at D = -5.449 MPa, published -5.38',
+         url='https://raw.githubusercontent.com/PetrKryslUCSD/FinEtools.jl/main/test/problem_LE10NAFEMS_MST10.inp'),
     dict(name='petrkryslucsd_testsets', expect_solve=True, license='MIT',
          exercises='DC3D4 — parts/instances/assembly; thermal',
          url='https://raw.githubusercontent.com/PetrKryslUCSD/FinEtools.jl/main/test/testsets.inp'),
@@ -2980,10 +2985,6 @@ CORPUS = [
          exercises='C3D8R, R3D3, R3D4, MASS… — UMAT; explicit',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/pedrobleme/tribocorrosion_simulation_files/main/calibration_model/block_model.inp'),
-    dict(name='petrkryslucsd_problem_le10nafems_mst10', expect_solve=False, license='MIT',
-         exercises='C3D10, SFM3D6 — parts/instances/assembly; *Orientation',
-         note='ccx limitation: the traction acts on SFM3D6 surface elements, which ccx does not have',
-         url='https://raw.githubusercontent.com/PetrKryslUCSD/FinEtools.jl/main/test/problem_LE10NAFEMS_MST10.inp'),
     dict(name='philipcardiff_test', expect_solve=False, license='MIT',
          exercises='C3D8R — parts/instances/assembly; UMAT; explicit',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
