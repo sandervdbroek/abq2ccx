@@ -118,8 +118,9 @@ These are the silent ones — no error, wrong physics.
   such node; the knot also carries the node's rotations, which `*EQUATION`s tie to the
   coupling's. Circular-section beam nodes with a rotational BC on only some of DOFs 4–6
   (or a nonzero one) get the same beam: without the knot ccx 2.23 locks the node's other
-  rotations too. The beams carry no load — ignore them in the results (whole-model output
-  lists them).
+  rotations too. So do the shell/beam nodes whose rotational BCs a later step's
+  `*BOUNDARY, OP=NEW` would otherwise break. The beams carry no load — ignore them in the
+  results (whole-model output lists them).
 * **`C3D8R` hourglassing.** CalculiX auto-enables hourglass control only from v2.3.
   For bending-dominated linear bricks prefer `C3D8I` or `C3D20R`. There is no
   artificial-energy output in ccx, so check a scaled deformed shape for hourglass modes.

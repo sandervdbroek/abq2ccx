@@ -1692,14 +1692,20 @@ def test_planar_constraint_skips_constrained_and_skewed_nodes():
 
 
 def test_planar_constraint_repeated_after_op_new():
-    # *BOUNDARY, OP=NEW removes the model-data constraint as well (verified on ccx 2.23)
-    deck = PLANAR_BEAM.replace("*End Step\n", "*End Step\n*Step\n*Static\n*Boundary, op=NEW\n"
-                                              "1, ENCASTRE\n*Cload\n4, 2, -1.\n*End Step\n")
-    body, _, _ = convert_str(deck)
+    # *BOUNDARY, OP=NEW removes the model-data constraint as well (verified on ccx 2.23);
+    # here it removes node 4's support
+    step2 = "*End Step\n*Step\n*Static\n*Boundary, op=NEW\n1, ENCASTRE\n*Cload\n4, 2, -1.\n*End Step\n"
+    deck = PLANAR_BEAM.replace("1, ENCASTRE\n", "1, ENCASTRE\n4, 2, 2\n").replace("*End Step\n", step2)
+    body, conv, _ = convert_str(deck)
     first, second = body.split("*STEP")[1:]
     assert "ABQ2CCX_PLANAR" not in first
     assert "*BOUNDARY, OP=NEW\n1, 1, 6\n** [abq2ccx] planar constraint re-applied (OP=NEW removed " \
            "it)\n*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n*CLOAD" in second
+    assert list(conv._knots) == [1]           # the clamp OP=NEW re-specifies (see below)
+    # an OP=NEW that removes nothing is dropped: the constraint stays as it is
+    body, _, _ = convert_str(PLANAR_BEAM.replace("*End Step\n", step2))
+    second = body.split("*STEP")[2]
+    assert "*BOUNDARY, OP=NEW" not in second and "ABQ2CCX_PLANAR" not in second
 
 
 def test_planar_constraint_needs_a_planar_model():
@@ -2076,6 +2082,124 @@ def test_distribution_plate_examples():
     for name in ("distribution_solid_plate_explicit", "distribution_shell_plate_explicit"):
         body, _, _ = convert(os.path.join(EXAMPLES, name + ".inp"))
         assert "*DISTRIBUTION" not in body and not dangling_refs(reparse(body))
+
+
+# a clamped RECT cantilever, static step 1
+STEPPED_BEAM = CIRC_BEAM.replace("section=CIRC\n0.05", "section=RECT\n0.1, 0.2") + """*Step
+*Static
+*Boundary
+1, ENCASTRE
+*Cload
+3, 3, -1.
+*End Step
+"""
+
+# a 2-element S4 plate clamped along x = 0 (ROOT), its tip z prescribed, static step 1
+STEPPED_PLATE = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+4, 0., 1., 0.
+5, 1., 1., 0.
+6, 2., 1., 0.
+*Element, type=S4, elset=PLATE
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*Nset, nset=ROOT
+1, 4
+*Nset, nset=TIP
+3, 6
+*Shell Section, elset=PLATE, material=M
+0.1
+*Material, name=M
+*Elastic
+2.1e5, 0.3
+*Step
+*Static
+*Boundary
+ROOT, ENCASTRE
+TIP, 3, 3, 0.01
+*End Step
+"""
+
+
+def test_op_new_that_removes_nothing_is_dropped():
+    # ccx 2.23 does not rebuild rotational BCs that a later step's *BOUNDARY, OP=NEW
+    # re-specifies on shell/beam nodes (probed: the clamped root becomes a hinge, *FREQUENCY
+    # finds a 0.1 Hz mode); an OP=NEW that removes nothing changes nothing, so it goes
+    deck = STEPPED_BEAM + "*Step\n*Frequency\n4\n*Boundary, op=NEW\n1, 1, 3\n*Boundary, op=NEW\n" \
+                          "1, 4, 6\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    second = body.split("*STEP")[2]
+    assert "*BOUNDARY, OP=NEW" not in body and not conv._knots
+    assert second.count("** [abq2ccx] OP=NEW dropped") == 1 and "*BOUNDARY\n1, 4, 6\n" in second
+    assert "OP=NEW dropped in step(s) 2" in rep.text()
+    # on shells it would also zero unrelated BCs; a changed value is no removal
+    body, conv, _ = convert_str(STEPPED_PLATE + "*Step\n*Static\n*Boundary, op=NEW\nROOT, ENCASTRE\n"
+                                                "TIP, 3, 3, 0.02\n*End Step\n")
+    assert "*BOUNDARY, OP=NEW" not in body and "*BOUNDARY\nROOT, 1, 6\nTIP, 3, 3, 0.02\n" in body
+    # kept where ccx has no rotation constraint to rebuild: in the first step (it builds
+    # them after reading a step), ...
+    body, _, rep = convert_str(STEPPED_BEAM.replace("*Step\n*Static\n*Boundary\n",
+                                                    "*Boundary\n1, ENCASTRE\n*Step\n*Static\n"
+                                                    "*Boundary, op=NEW\n"))
+    assert "*BOUNDARY, OP=NEW\n1, 1, 6\n" in body and "OP=NEW dropped" not in rep.text()
+    # ... without rotational BCs on shell/beam nodes, ...
+    body, _, _ = convert_str(deck.replace("1, ENCASTRE", "1, PINNED\n3, 2, 3").replace("1, 4, 6",
+                                                                                       "3, 2, 3"))
+    assert body.count("*BOUNDARY, OP=NEW") == 2
+    # ... and after *DYNAMIC steps (ccx makes knots of their rotational-BC nodes)
+    body, conv, _ = convert_str(deck.replace("*Static", "*Dynamic\n0.01, 0.1").replace(
+        "*Frequency\n4", "*Dynamic\n0.01, 0.1"))
+    assert body.count("*BOUNDARY, OP=NEW") == 2 and not conv._knots
+
+
+def test_op_new_that_removes_bcs_makes_knots():
+    # an OP=NEW that removes a BC stays; the clamp it re-specifies gets a force-free knot
+    # beam: ccx then carries the node's rotations on a knot, whose BCs OP=NEW handles
+    deck = STEPPED_BEAM.replace("1, ENCASTRE\n", "1, ENCASTRE\n2, 3, 3\n") + \
+        "*Step\n*Static\n*Boundary, op=NEW\n1, ENCASTRE\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert "*BOUNDARY, OP=NEW\n1, 1, 6\n" in body and list(conv._knots) == [1]
+    g = reparse(body)
+    assert g.elsets["ABQ2CCX_KNOT"] == [3] and g.elements[3] == ("B31", [1, 4])
+    assert "OP=NEW in step(s) 2 removes boundary conditions" in rep.text()
+    assert not dangling_refs(g), dangling_refs(g)
+    # a beam node whose rotations OP=NEW releases needs none, ...
+    released = STEPPED_BEAM.replace("1, ENCASTRE\n", "1, ENCASTRE\n3, 3, 3\n") + \
+        "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 3\n3, 3, 3\n*End Step\n"
+    _, conv, _ = convert_str(released)
+    assert not conv._knots
+    # ... unless a later step fixes them again (ccx would not rebuild them either)
+    _, conv, _ = convert_str(released + "*Step\n*Static\n*Boundary\n1, 4, 6\n*End Step\n")
+    assert list(conv._knots) == [1]
+    # shell nodes with rotational BCs before such a step always do: ccx's stale SPC
+    # indices would zero unrelated BCs (probed: a prescribed displacement came out 0)
+    plate = STEPPED_PLATE + "*Step\n*Static\n*Boundary, op=NEW\nROOT, 1, 3\n*End Step\n"
+    body, conv, _ = convert_str(plate)
+    assert list(conv._knots) == [1, 4] and "*ELSET, ELSET=ABQ2CCX_KNOT\n3, 4\n" in body
+
+
+def test_op_new_knots_skipped_with_explicit_steps():
+    # the massless knot beams stop ccx's explicit solver ('*ERROR in calcstabletimeincvol',
+    # probed on 2.23): a deck with an explicit step gets a warning instead
+    deck = STEPPED_PLATE + "*Step\n*Static\n*Boundary, op=NEW\nROOT, 1, 3\n*End Step\n" \
+                           "*Step\n*Dynamic, Explicit\n1e-6, 1e-5\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert not conv._knots and "ABQ2CCX_KNOT" not in body
+    assert "stop ccx's explicit solver" in rep.text() and "from step 2 on" in rep.text()
+
+
+def test_op_new_examples():
+    # the decks validate_with_ccx.py runs: step 2 re-specifies every BC (OP=NEW dropped) /
+    # removes the beam's prop (OP=NEW kept, the beam root and plate root nodes are knots)
+    body, conv, _ = convert(os.path.join(EXAMPLES, "op_new_respecify.inp"))
+    assert "*BOUNDARY, OP=NEW" not in body and not conv._knots
+    assert not dangling_refs(reparse(body))
+    body, conv, _ = convert(os.path.join(EXAMPLES, "op_new_remove.inp"))
+    assert body.split("*STEP")[2].count("*BOUNDARY, OP=NEW") == 2
+    assert list(conv._knots) == [1, 1001, 1101, 1201, 1301, 1401]
+    assert not dangling_refs(reparse(body))
 
 
 if __name__ == "__main__":

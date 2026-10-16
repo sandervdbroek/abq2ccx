@@ -80,7 +80,10 @@ TRANSLATED = {
         "DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 "
         "crashes on them). An element end node of a circular-section beam whose rotational BCs "
         "hold only some of DOFs 4-6, or a nonzero one, gets a force-free knot beam (elset/material "
-        "`ABQ2CCX_KNOT`): ccx 2.23 would lock the node's other rotations too.",
+        "`ABQ2CCX_KNOT`): ccx 2.23 would lock the node's other rotations too. A later step's "
+        "`OP=NEW`, once shell/beam nodes have had rotational BCs, is dropped when the step "
+        "re-specifies every BC; where it removes BCs, the shell/beam nodes whose rotations it "
+        "would break get knot beams too (ccx 2.23 does not rebuild those rotations after `OP=NEW`).",
     "*DLOAD": "passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / "
         "`CONSTANT RESULTANT` dropped (warned under NLGEOM).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`.",

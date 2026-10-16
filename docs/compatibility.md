@@ -22,6 +22,7 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **`*EQUATION`/`*MPC` dependent DOF can't also be an SPC** | pre-flight overconstraint warning | ccx `*EQUATION` section; the `cascade` error on the forums |
 | **ccx has no planar beam or truss**: `B21` "is internally replaced by a B31 element", `T2D2` by a `T3D2`, so their out-of-plane DOFs are free; a rotational BC on every node of an expanded beam stiffens it | in a planar model, fix DOF 3 on the nodes of 2-D beams/trusses, and DOFs 4–5 at one node of a straight beam whose twist is free — on a circular section an element's middle node (twist modes stay in `*FREQUENCY`, warned) | ccx manual 6.2.31, 6.2.34; probed on 2.23 (`B21` frequency deck: every bending mode twice) |
 | **A rotational BC on a circular-section beam node locks its other rotations**: for every rotational BC on a non-knot `B32`/`B32R` node ccx ties the section's midside nodes to the mean of its corners, and a `CIRC` section's eight nodes lie on the circle, where no rigid rotation satisfies that; at a 3-node element's middle node the tied nodes are unused | an element end node whose rotational BCs hold only some of DOFs 4–6, or a nonzero one, gets a force-free knot beam: a knot's BCs act on its rotation node (warned when most nodes need one, or not repaired under an explicit step) | ccx sources `gen3dfrom1d.f`, `gen3dboun.f`; probed on 2.23 (twist held at pinned ends: 0.27 of beam theory, 0.994 with knots) |
+| **A later step's `*BOUNDARY, OP=NEW` loses the rotational BCs it re-specifies on shell/beam nodes**: ccx applies them through mean-rotation MPCs whose angle SPC OP=NEW deletes, and the rebuilt MPC finds no free dependent DOF; on shells stale SPC indices also zero unrelated BCs | from step 2 on, after rotational BCs on shell/beam nodes, an OP=NEW that removes nothing is dropped; where it removes BCs, the shell/beam nodes it would break get knot beams (a deck with an explicit step: warned) | ccx sources `boundarys.f`, `gen3dboun.f`, `usermpc.f` ("no MPC is generated for the mean rotation"); probed on 2.23 (clamped cantilever re-clamped with OP=NEW: tip deflection 1.87e5 instead of 0.595; a prescribed shell displacement of 2 came out 0) |
 
 ## Version notes
 
@@ -87,9 +88,11 @@ beam theory within 0.2 %, planar `B21` beams' frequencies and buckling loads (re
 and circular sections) match it within 0.6 %, a C3D8 plate and a composite S8R
 variable-angle-tow panel whose fibre angles come from a `*DISTRIBUTION` move exactly like
 the same models written with one `*ORIENTATION` and section per element (to 3e-11 and
-exactly), and the composite-shell and assembly decks also solve. This proves the full
-pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face,
-sections — is correct, not merely well-formed.
+exactly), a clamped beam and plate keep their clamps across a later step's
+`*BOUNDARY, OP=NEW` (beam theory within 0.7 %, a prescribed plate displacement exactly),
+and the composite-shell and assembly decks also solve. This proves the full pipeline —
+`*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face, sections — is
+correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,

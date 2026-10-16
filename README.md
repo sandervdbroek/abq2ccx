@@ -101,6 +101,8 @@ PASS  planar_pinned_beam (B21): f1, f2 = 93.67, 373.02 Hz (beam theory 93.81, 37
 PASS  planar_pinned_circ_beam (B21 + CIRC): f1, f2 = 40.81, 163.28 Hz (beam theory 40.62, 162.49), buckling load 16239 (Euler 16278); max 0.5% diff
 PASS  distribution_solid_plate (C3D8 *SOLID SECTION, per-element *DISTRIBUTION orientation): 84 node displacements vs one *ORIENTATION per element, max difference 2.8e-11 of max |u|
 PASS  distribution_shell_plate (composite S8R *SHELL SECTION, per-element *DISTRIBUTION orientation): 69 node displacements vs one *ORIENTATION per element, max difference 0.0e+00 of max |u|
+PASS  op_new_respecify: step 2 beam tip +1.1898 (expected +1.1905, 0.05% diff), plate tip (prescribed) +2.0000 (expected +2.0000, 0.00% diff)
+PASS  op_new_remove: step 2 beam tip +0.5910 (expected +0.5952, 0.71% diff), plate tip (step 1) +4.6380 (expected +4.6380, 0.00% diff)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -127,11 +129,16 @@ seventh run planar `B21` beams (rectangular and circular sections) on pinned sup
 a frequency and a buckling step and compare the first two frequencies and the buckling load
 with beam theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar
 constraint: without it ccx reports 0 Hz modes (the free twist and the unsupported
-out-of-plane motion) and a buckling factor of 1. The last two give every element its own
+out-of-plane motion) and a buckling factor of 1. The next two give every element its own
 fibre angle through a `*DISTRIBUTION`, as a variable-angle-tow layup does: a `C3D8` plate
 (two instances, one rotated; a default line, an element-set line and an additional
 rotation) and a composite `S8R` panel whose plies follow +θ and −θ paths. Every node must
 move exactly as in the same model written with one `*ORIENTATION` and section per element.
+The last two clamp a beam and a plate and give step 2 a `*BOUNDARY, OP=NEW`, which ccx 2.23
+lets drop the clamps' rotations: one step re-specifies every BC (the converter drops its
+OP=NEW), the other removes the beam's prop (the clamped nodes become knots). Converted
+without these repairs, the beam tip moves 1e5 times too far and the plate's prescribed tip
+displacement comes out 0.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -226,6 +233,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
 | rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
 | rotational BCs on `CIRC` beam nodes | knot beam per node | a BC on some of DOFs 4–6 (or a nonzero one) at a circular-section `B32` end node makes ccx 2.23 lock the node's other rotations too (a pinned beam with its twist held deflects 0.3 of beam theory); as a knot the node's BCs hold only the rotations they name |
+| `*BOUNDARY, OP=NEW` in a later step, after rotational BCs on shell/beam nodes | OP=NEW dropped when the step re-specifies every BC; else knot beams on the nodes it would break | ccx 2.23 does not rebuild the rotational BCs it re-specifies (a clamp becomes a hinge) and on shells zeroes unrelated BCs; a knot carries the rotations in a form OP=NEW handles (exact on shells; a beam clamp 0.1–0.7 % stiffer); an explicit step in the deck: warned |
 | `*CONTACT PAIR, TIED` | `*TIE` per surface pair | without `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; face-to-face suggested if ccx struggles) |
 | `*FRICTION` | `mu` only | ccx reads Abaqus' 2nd field (slip rate / mu_k) as its stick slope; `ROUGH` warned (no equivalent) |
 | `*PLASTIC, HARDENING=JOHNSON COOK` | native ccx Johnson-Cook + `*RATE DEPENDENT` | ccx switches JC on only with a rate card (C = 0 added if the deck has none); `HARDENING=USER` / Chaboche `PARAMETERS` commented (material runs elastic) |
@@ -391,6 +399,11 @@ converter warns about the ones it can detect; the rest are here so you know to c
   beam slightly where it bends (0.3–1.3 % with a knot inside a span), which adds up when
   most nodes carry such a BC (warned). Not repaired in a deck with an explicit dynamic step
   (ccx stops on the knot beams; warned).
+* A later step's `*BOUNDARY, OP=NEW` makes ccx 2.23 lose the rotational BCs it re-specifies
+  on shell/beam nodes (a clamp becomes a hinge; on shells it also zeroes unrelated BCs). The
+  converter drops an OP=NEW that removes nothing, and gives the affected nodes knot beams
+  where it does remove BCs (a beam clamp then is 0.1–0.7 % stiffer, as a rigid section);
+  with an explicit step in the deck it can only warn.
 * `*DISTRIBUTION` / variable-angle-tow orientations: ccx 2.23 applies them per element
   only under `*SOLID SECTION`, so the converter splits shell and membrane sections into
   one plain `*ORIENTATION` and section per distinct direction (validated against the same
@@ -424,6 +437,8 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/beam_circ_rotation_bcs.inp`](examples/beam_circ_rotation_bcs.inp) | circular-section `B31` beams with a twist held at pinned supports and a prescribed tip rotation → knot beams |
 | [`examples/planar_pinned_beam.inp`](examples/planar_pinned_beam.inp) | planar `B21` beam on pinned supports: DOF 3 fixed on its nodes and the twist at the pin, `*FREQUENCY` + `*BUCKLE` |
 | [`examples/planar_pinned_circ_beam.inp`](examples/planar_pinned_circ_beam.inp) | the same with a circular section (`B32` in ccx): the twist held at the first element's middle node |
+| [`examples/op_new_respecify.inp`](examples/op_new_respecify.inp) | clamped `B31` beam + `S4` plate, step 2 re-specifies every BC with `*BOUNDARY, OP=NEW` → OP=NEW dropped |
+| [`examples/op_new_remove.inp`](examples/op_new_remove.inp) | the same, step 2's `*BOUNDARY, OP=NEW` removes the beam's prop → knot beams on the clamped nodes |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

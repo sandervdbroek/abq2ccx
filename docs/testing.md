@@ -6,8 +6,9 @@ The converter has three layers of tests:
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
    CalculiX, checking the NAFEMS LE10 benchmark, circular-, pipe- and box-section
-   cantilevers, circular-section beams with rotational BCs, and planar beams'
-   frequencies and buckling loads numerically.
+   cantilevers, circular-section beams with rotational BCs, planar beams' frequencies and
+   buckling loads, per-element `*DISTRIBUTION` orientations, and a clamped beam and plate
+   across a later step's `*BOUNDARY, OP=NEW` numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -21,7 +22,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (148)
+## 1. Unit tests — `tests/test_convert.py` (152)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -160,7 +161,7 @@ conversion behaviour and referential integrity.
 | `test_planar_constraint_reaches_upgraded_midside_nodes` | a `B21` under `SECTION=CIRC` (→ `B32`) has its inserted midside nodes in the planar set |
 | `test_planar_straight_beam_twist_held_at_one_node` | a straight beam on pinned supports gets DOFs 4–5 at one support (its twist is otherwise a 0 Hz mode); with CAE's U1/U2/UR3 clamp, at the clamped node, for a circular section too; a pinned circular-section beam gets them at the middle node of an element next to a support (at an end node ccx 2.23 would lock its bending rotation too), no knot beam; a frame that is not straight needs none |
 | `test_planar_constraint_skips_constrained_and_skewed_nodes` | nodes whose DOF 3 is the dependent term of an `*EQUATION` (an SPC there stops ccx), `*MPC` nodes, rigid-body members and nodes under a `*TRANSFORM` whose 3-axis is not z are left out; a transform about z is kept |
-| `test_planar_constraint_repeated_after_op_new` | a `*BOUNDARY, OP=NEW` step repeats the planar constraint (OP=NEW removes model-data BCs too) |
+| `test_planar_constraint_repeated_after_op_new` | a `*BOUNDARY, OP=NEW` step that removes a BC repeats the planar constraint (OP=NEW removes model-data BCs too) and knots the clamp it re-specifies; one that removes nothing loses its OP=NEW and leaves the constraint as it is |
 | `test_planar_constraint_needs_a_planar_model` | `B21` among 3-D elements, or with nodes off one z plane, gets no constraint and a warning |
 | `test_planar_pinned_beam_example` | the bundled planar beam converts to 20 `B21` with DOF 3 on all 21 nodes and DOFs 4–5 at the pinned end, ahead of the steps, no dangling refs |
 | `test_circ_beam_partial_rotation_bc_gets_knot_beam` | an element end node of a `CIRC` beam whose rotational BCs hold only some rotations (DOFs 1–4 at a pinned end, `XSYMM`), or a nonzero one (a prescribed rotation, even with all three given), gets a force-free knot beam (ccx 2.23 would lock its other rotations); the BC lines are kept; none for full zero clamps, `RECT` beams or a BC on a 3-node element's middle node |
@@ -176,6 +177,10 @@ conversion behaviour and referential integrity.
 | `test_distribution_without_data_comments_out_its_orientation` | a distribution with no data (missing `INPUT=` file): its orientation is commented out with the reason |
 | `test_distribution_not_named_by_an_orientation_commented` | a distribution no `*ORIENTATION` names (a shell-thickness/material distribution in Abaqus) is commented out |
 | `test_distribution_plate_examples` | the `distribution_*_plate` validation pairs: one resolved distribution per instance (default + 10 elements), the S8R panel split into 16 sections, the explicit decks free of distributions; no dangling refs |
+| `test_op_new_that_removes_nothing_is_dropped` | a later step's `*BOUNDARY, OP=NEW` cards that re-specify every BC in effect lose their OP=NEW (one `** [abq2ccx]` comment per step; a changed value is no removal), after rotational BCs on beam or shell nodes; kept in the first step, without rotational BCs on shell/beam nodes, and after `*DYNAMIC` steps |
+| `test_op_new_that_removes_bcs_makes_knots` | an OP=NEW that removes a BC stays and the beam clamp it re-specifies gets a knot beam (`ABQ2CCX_KNOT`); a beam node whose rotations it releases gets none unless a later step fixes them again; shell nodes with rotational BCs before it always get one |
+| `test_op_new_knots_skipped_with_explicit_steps` | with an explicit step in the deck no knot beams are added (they stop ccx's explicit solver), and the removal is warned |
+| `test_op_new_examples` | the two OP=NEW validation decks: no OP=NEW left where step 2 removes nothing; where it removes the prop, OP=NEW stays and the beam root and the five plate root nodes are knots; no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -232,6 +237,14 @@ deck and runs it in CalculiX:
   agree within 1e-6 of max |u| (they agree to 3e-11 and exactly). Converted without the
   rotation built into the axes, the plate misses by 21 %; with the shell section left to
   ccx's own distribution handling, the panel misses by 62 %.
+* **`op_new_respecify`**, **`op_new_remove`** — a clamped `B31` cantilever and a clamped `S4`
+  plate whose step 2 has `*BOUNDARY, OP=NEW`. In the first, step 2 re-specifies every BC
+  (OP=NEW is dropped), doubles the beam's tip load and prescribes the plate tip z = 2: the
+  beam tip moves 1.1898 (beam theory 1.1905, 0.05 %) and the plate tip exactly 2. In the
+  second, step 2 removes the beam's mid-span prop (the clamped nodes become knots): the beam
+  tip moves 0.5910 (beam theory 0.5952; the knot stiffens the clamp by 0.7 %) and the plate
+  tip as in step 1, to 1e-4. Converted as they were, ccx gives 3.7e5 and 0 (the prescribed
+  value lost), 1.9e5 and 2.2e9, and the checks fail.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -452,6 +465,41 @@ parts, exactly, in the thickness + material form and in a composite form with a 
 second orientation and a 90° ply (with I2's section on I1's orientation, they miss by 138 %
 of max |u|). No corpus deck has such a section (the one deck with a `*Shell General Section`
 has no parts), and all 1073 corpus files convert byte-identically.
+
+**`*BOUNDARY, OP=NEW` after rotational BCs on shells and beams.** ccx applies a rotational
+BC on a shell or beam node that is not a knot through a mean-rotation MPC over the expanded
+nodes, whose angle is a hidden SPC (`gen3dboun.f`, run again after each step is read). A
+later step's `*BOUNDARY, OP=NEW` deletes every user SPC — the hidden one too — but keeps the
+MPC, and the MPC for the re-specified BC finds no free dependent DOF (`*WARNING in usermpc:
+no MPC is generated for the mean rotation in node 1 and direction 5`): that rotation is
+free. Probed on 2.23 with a clamped cantilever (L = 1000, 20 elements, `RECT` 20 × 40, tip
+load 10) clamped again with OP=NEW in step 2: the tip deflection went from 0.5949 to
+1.87e5 (`B31`; `B31R`, `B32` and `B32R` alike; a third such step lost a second rotation),
+a following `*FREQUENCY` step found a 0.10 Hz mode (16.72 Hz with the clamp) and `*BUCKLE`
+factors of 0.997–1.003 (13822), and an `NLGEOM` step never converged. On `S4`, `S4R` and
+`S8R` plates the clamp went as well (tip deflections of 1e8–1e9, a 0 Hz mode), and since ccx
+keeps the hidden SPCs' indices for shells, OP=NEW's compaction made them zero unrelated
+BCs: a prescribed tip displacement of 2 came out 0 — without any message. OP=NEW in the
+first step is harmless (ccx builds the MPCs after reading a step), and so are `*DYNAMIC`
+steps (ccx makes knots there) and `*CLOAD, OP=NEW` on moments; a rotation that OP=NEW
+releases, or one first given after it, works. So from the second step on, once shell/beam
+nodes have had rotational BCs, an OP=NEW whose step re-specifies every BC in effect — it
+removes nothing — is dropped: both codes then hold the same model, and ccx updates the
+re-specified values and amplitudes in place. Where OP=NEW does remove BCs, the shell nodes
+that had rotational BCs before it, and the beam nodes that had them before it and get them
+again, get a knot beam as for rigid couplings: ccx then carries their rotations on the
+knot's rotation node, whose BCs OP=NEW removes and re-applies cleanly. The knot is exact on
+shells (deflections and frequencies to 6 digits) and holds a beam section rigid at the node,
+as beam theory does, so a clamped `B31` is 0.65 % stiffer than with ccx's own clamp and a
+`B32R` 0.1 %. A deck with an explicit step gets a warning instead: the massless knot beams
+stop ccx's explicit solver (`*ERROR in calcstabletimeincvol`). Of the 16 corpus decks that
+use OP=NEW with shells or beams, 12 use it in their first step only; in later steps the two
+`igrega348` lattices prescribe only reference nodes and `juliafem_plate_with_hole` (which
+removes a BC in step 2) has no rotational BCs, so neither is affected, while
+`oyvindwpetersen_frame_structure` re-specifies its supports' DOF 4 in step 2. Its OP=NEW is
+dropped — the only corpus deck that converts differently — but it still stops before that,
+on its `SECTION=RECTANGULAR` (with `RECT`: `*ERROR in cascade` in step 1).
+`validate_with_ccx.py` checks both repairs on a clamped beam and plate.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

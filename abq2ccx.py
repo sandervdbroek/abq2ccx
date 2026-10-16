@@ -1524,6 +1524,9 @@ class Converter:
         self._planar_others: List[str] = []
         self._planar_bc: List[str] = []
         self._planar_twist: List[int] = []         # ... the nodes among them with DOFs 4-5 fixed
+        # *BOUNDARY cards whose OP=NEW removes nothing and is dropped: id -> first card of
+        # its step (_plan_op_new_rotations)
+        self._op_new_drop: Dict[int, bool] = {}
         self._jc_with_rate: set = set()
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
@@ -1531,8 +1534,9 @@ class Converter:
         # 2-node beams upgraded to 3-node beams (_upgrade_section_beams): element -> (end node,
         # end node, midside node)
         self._midside: "OrderedDict[int, Tuple[int, int, int]]" = OrderedDict()
-        # knot beams: rigid couplings on shell/beam nodes and rotational BCs on circular-section
-        # beams (see _plan_rigid_couplings, _plan_circ_rotation_knots, _add_knot_beams)
+        # knot beams: rigid couplings on shell/beam nodes, rotational BCs on circular-section
+        # beams and across *BOUNDARY, OP=NEW (see _plan_rigid_couplings,
+        # _plan_circ_rotation_knots, _plan_op_new_rotations, _add_knot_beams)
         self._knots: "OrderedDict[int, int]" = OrderedDict()   # node -> free end of its knot beam
         self._knot_e = 1.0                         # knot-beam modulus / section size / length
         self._knot_a = 1.0
@@ -3054,8 +3058,13 @@ class Converter:
                 self.report.warn("*BOUNDARY LOAD CASE dropped (ccx allows it only in steady-state "
                                  "dynamics; elsewhere it is a fatal error).", once=True)
                 continue
+            if k == "OP" and id(b) in self._op_new_drop:
+                continue                # an OP=NEW that removes nothing (_plan_op_new_rotations)
             params[k] = v
-        out = [emit_keyword("BOUNDARY", params)]
+        out = ["** [abq2ccx] OP=NEW dropped: this step re-specifies every boundary condition in "
+               "effect (ccx 2.23 would not rebuild the shell/beam rotations after it)"] \
+            if self._op_new_drop.get(id(b)) and (b.param("OP") or "").strip().upper() == "NEW" else []
+        out.append(emit_keyword("BOUNDARY", params))
         midside = [ln.split(",") for ln in self._midside_records(b, "boundary")]
         for rec in merged_data_records(b) + midside:
             # Interior blanks are positional (e.g. "node, dof1, , value" = blank last
@@ -3099,7 +3108,7 @@ class Converter:
                              "have no rotations (Abaqus ignores such BCs with a warning), but ccx "
                              "treats them as rotational constraints and 2.23 crashes (bus error) or "
                              "stops in usermpc.", once=True)
-        if self._planar_bc and (b.param("OP") or "").strip().upper() == "NEW":
+        if self._planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
             # OP=NEW also removes the model-data planar constraint (verified on 2.23)
             out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
         return out
@@ -4383,6 +4392,7 @@ class Converter:
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
+        self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
         # errors without the card) — handle_surface_interaction synthesizes HARD for these
         self._si_missing_behavior = set()
@@ -5505,6 +5515,117 @@ class Converter:
                              f"section, which stiffens the beam where it bends (probed: DOF 4 held on "
                              f"every node of a 10-element beam deflects 0.84 of beam theory with the "
                              f"knots, 0.009 without) — verify.", once=True)
+
+    # ======================================================================
+    # *BOUNDARY, OP=NEW after rotational BCs on shell/beam nodes
+    # ======================================================================
+    def _plan_op_new_rotations(self, blocks: List[Block]) -> None:
+        """ccx 2.23 does not rebuild rotational BCs on shell/beam nodes after a later step's
+        *BOUNDARY, OP=NEW (probed; ccx sources boundarys.f, gen3dboun.f, usermpc.f).  ccx
+        applies a rotational BC on a shell/beam node that is not a knot through a mean-
+        rotation MPC whose angle is a hidden SPC.  OP=NEW deletes that SPC with the user's BCs
+        but keeps the MPC, and the re-specified BC's new MPC finds no free dependent DOF
+        ('*WARNING in usermpc: no MPC is generated for the mean rotation'): a clamped B31
+        cantilever then deflects 3e5 times too far, *FREQUENCY finds a 0.1 Hz mode, *BUCKLE
+        factors are ~1 and an NLGEOM step never converges.  On shells the stale SPC indices
+        also zero unrelated BCs (a prescribed displacement came out 0), without any message.
+        OP=NEW in the first step is harmless (ccx builds these MPCs after reading a step), as
+        are *DYNAMIC steps (ccx uses knots there) and *CLOAD, OP=NEW.  From the second step
+        on, once shell/beam nodes have had rotational BCs:
+
+        * a step whose *BOUNDARY cards re-specify every BC in effect removes nothing, so its
+          OP=NEW is dropped (``self._op_new_drop``): the same model in Abaqus and ccx;
+        * a step that does remove BCs keeps OP=NEW, and the shell nodes that had rotational
+          BCs before it (the stale indices) and the beam nodes that had them before it and
+          get them again from it on get a knot beam (``_add_knot_beams``): ccx then carries
+          the node's rotations on a knot, whose BCs OP=NEW removes and re-applies cleanly.
+          Probed: exact on S4/S4R/S8R (6 digits); a knot holds a beam section rigid, which
+          stiffens a B31 clamp by 0.65 % and a B32R one by 0.1 %.  A deck with an explicit
+          step only gets a warning: the massless knot beams stop ccx's explicit solver."""
+        if not self._rot_nodes:
+            return
+        planar = self._boundary_dofs([mkblock("BOUNDARY", data=self._planar_bc[1:])]) \
+            if self._planar_bc else set()
+        state = set(planar)                        # (node, DOF) pairs in effect
+        steps: List[List[Block]] = []               # each step's *BOUNDARY cards ...
+        procs: List[str] = []                       # ... and procedure
+        inside = False
+        for b in blocks:
+            if b.keyword in ("STEP", "END STEP"):
+                inside = b.keyword == "STEP"
+                if inside:
+                    steps.append([])
+                    procs.append("")
+            elif inside and b.keyword == "BOUNDARY":
+                steps[-1].append(b)
+            elif inside and b.keyword in PROC_KW:
+                procs[-1] = procs[-1] or b.keyword
+            elif b.keyword == "BOUNDARY":
+                state |= self._boundary_pairs(b)
+
+        def rotations(pairs: set) -> set:
+            return {n for n, d in pairs if 4 <= d <= 6 and n in self._rot_nodes
+                    and n not in self._knots}
+
+        # ccx acts on OP=NEW on a step's first *BOUNDARY card only; handle_boundary repeats
+        # the planar constraint after it
+        new = [bool(c) and (c[0].param("OP") or "").strip().upper() == "NEW" for c in steps]
+        given = [set().union(*map(self._boundary_pairs, c)) | (planar if nw else set())
+                 for c, nw in zip(steps, new)]
+        later = [set() for _ in range(len(steps) + 1)]   # nodes given rotations in step k or later
+        for k in range(len(steps) - 1, -1, -1):
+            later[k] = later[k + 1] | rotations(given[k])
+        built: set = set()          # nodes whose rotational BCs ccx has made mean-rotation MPCs
+        dropped: List[int] = []
+        removing: List[int] = []
+        knots: set = set()
+        for k, cards in enumerate(steps):
+            if new[k] and k and built:
+                if state <= given[k]:
+                    self._op_new_drop.update({id(c): i == 0 for i, c in enumerate(cards)})
+                    dropped.append(k + 1)
+                else:
+                    removing.append(k + 1)
+                    knots |= (built & self._shell_nodes) | ((built - self._shell_nodes) & later[k])
+            state = given[k] if new[k] else state | given[k]
+            if procs[k] != "DYNAMIC":               # a *DYNAMIC step makes knots instead
+                built |= rotations(state)
+        why = ("ccx 2.23 does not rebuild rotational BCs on shell/beam nodes after OP=NEW (probed: "
+               "a clamped beam becomes a hinge, *FREQUENCY finds ~0 Hz modes, *BUCKLE factors "
+               "near 1; on shells unrelated BC values are zeroed)")
+        if dropped:
+            self.report.note(f"*BOUNDARY, OP=NEW dropped in step(s) {', '.join(map(str, dropped))}: "
+                             f"each re-specifies every boundary condition in effect, so OP=NEW "
+                             f"removes nothing (the same model) — and {why}.", once=True)
+        if not knots:
+            return
+        when = f"*BOUNDARY, OP=NEW in step(s) {', '.join(map(str, removing))} removes boundary " \
+               f"conditions, and {why}."
+        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks):
+            self.report.warn(f"{when} The knot beams that repair this stop ccx's explicit solver "
+                             f"('*ERROR in calcstabletimeincvol': they have no mass), so none were "
+                             f"added: check the rotations of the {len(knots)} shell/beam node(s) "
+                             f"involved from step {removing[0]} on.", once=True)
+            return
+        self._add_knot_beams(sorted(knots), blocks)
+        self.report.note(f"{when} Each of the {len(knots)} shell/beam node(s) whose rotational BCs "
+                         f"it would break got a force-free knot beam (a B31 to a new free node, "
+                         f"elset/material {KNOT_SET}, no density): ccx then carries the node's "
+                         f"rotations on a knot, which OP=NEW handles. A knot holds a beam section "
+                         f"rigid at the node, as beam theory does: a clamped B31 is ~0.7 % stiffer "
+                         f"than with ccx's own clamp (B32R 0.1 %; shells unchanged).", once=True)
+
+    def _boundary_pairs(self, b: Block) -> set:
+        """(node, DOF) pairs one *BOUNDARY card prescribes, upgraded beams' midside nodes
+        included (handle_boundary extends a DOF that both end nodes get to the midside node)."""
+        pairs = self._boundary_dofs([b])
+        if self._midside:
+            by_node: Dict[int, set] = {}
+            for n, d in pairs:
+                by_node.setdefault(n, set()).add(d)
+            pairs |= {(m, d) for a, c, m in self._midside.values()
+                      for d in by_node.get(a, set()) & by_node.get(c, set())}
+        return pairs
 
 
 def dedup_str(seq: Sequence[str]) -> List[str]:

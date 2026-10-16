@@ -1,0 +1,87 @@
+*Heading
+OP=NEW that removes a support: a propped B31 cantilever and an S4 plate
+** Cantilever L = 1000, RECT 20 (z, local 1) x 40 (y), E = 210000, z tip load P = 10: propped
+** at mid-span (step 1) the tip deflects 7 P L^3 / (96 E I) = 0.1302, free (step 2) P L^3 /
+** (3 E I) = 0.5952, with I = 40 * 20^3 / 12.  The S4 plate (1000 x 200 x 10, beside it) is
+** clamped along x = 0 and tip-loaded in both steps, so its tip deflection must not change.
+** Step 2 removes the prop with OP=NEW and repeats the clamps.  ccx 2.23 does not rebuild
+** re-specified rotational BCs on shell/beam nodes after OP=NEW (the beam root turns into a
+** hinge, the plate root too), so abq2ccx makes those nodes knots (knot beams), whose BCs
+** OP=NEW handles; a knot holds the beam section rigid (~0.7 % stiffer clamp).
+*Node
+1, 0., 0., 0.
+21, 1000., 0., 0.
+*Ngen, nset=BEAM_AXIS
+1, 21, 1
+*Element, type=B31, elset=BEAM
+1, 1, 2
+*Elgen, elset=BEAM
+1, 20, 1, 1
+*Nset, nset=BEAM_ROOT
+1
+*Nset, nset=BEAM_MID
+11
+*Nset, nset=BEAM_TIP
+21
+*Beam Section, elset=BEAM, material=STEEL, section=RECT
+20., 40.
+0., 0., -1.
+*Node
+1001, 0., 500., 0.
+1021, 1000., 500., 0.
+1101, 0., 550., 0.
+1121, 1000., 550., 0.
+1201, 0., 600., 0.
+1221, 1000., 600., 0.
+1301, 0., 650., 0.
+1321, 1000., 650., 0.
+1401, 0., 700., 0.
+1421, 1000., 700., 0.
+*Ngen
+1001, 1021, 1
+1101, 1121, 1
+1201, 1221, 1
+1301, 1321, 1
+1401, 1421, 1
+*Element, type=S4, elset=PLATE
+1001, 1001, 1002, 1102, 1101
+*Elgen, elset=PLATE
+1001, 20, 1, 1, 4, 100, 20
+*Nset, nset=PLATE_ROOT, generate
+1001, 1401, 100
+*Nset, nset=PLATE_TIP, generate
+1021, 1421, 100
+*Nset, nset=PLATE_TIPC
+1221
+*Shell Section, elset=PLATE, material=STEEL
+10.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Density
+7.85e-9
+*Step
+*Static
+*Boundary
+BEAM_ROOT, ENCASTRE
+BEAM_MID, 3, 3
+PLATE_ROOT, ENCASTRE
+*Cload
+BEAM_TIP, 3, 10.
+PLATE_TIP, 3, 10.
+*Node print, nset=BEAM_TIP
+U
+*Node print, nset=PLATE_TIPC
+U
+*End Step
+*Step
+*Static
+*Boundary, op=NEW
+BEAM_ROOT, ENCASTRE
+*Boundary, op=NEW
+PLATE_ROOT, ENCASTRE
+*Node print, nset=BEAM_TIP
+U
+*Node print, nset=PLATE_TIPC
+U
+*End Step

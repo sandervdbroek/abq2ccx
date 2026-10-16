@@ -8,8 +8,9 @@ stress, the tip deflections of circular-, pipe- and box-section cantilevers agai
 theory, a shell plate rigidly coupled to a loaded reference point against the same plate
 built from solids, circular-section beams with a held twist and a prescribed rotation
 against beam theory, the natural frequencies and buckling loads of planar (B21) beams with a
-rectangular and a circular section, and per-element *DISTRIBUTION orientations (a C3D8 plate
-and a composite S8R panel) against the same models written with one orientation per element.
+rectangular and a circular section, per-element *DISTRIBUTION orientations (a C3D8 plate
+and a composite S8R panel) against the same models written with one orientation per element,
+and a clamped beam and plate after a later step's *BOUNDARY, OP=NEW.
 
     python validate_with_ccx.py
 
@@ -107,6 +108,24 @@ def dat_displacement(dat_path, node):
         f = ln.split()
         if inblock and len(f) == 4 and f[0] == str(node):
             found = [float(x) for x in f[1:]]
+        elif inblock and f and not f[0].isdigit():
+            inblock = False
+    return found
+
+
+def dat_displacement_history(dat_path, node):
+    """Every displacement (ux, uy, uz) printed for ``node`` by *NODE PRINT in a ccx .dat
+    file, in order (one per printed increment)."""
+    found, inblock = [], False
+    if not os.path.exists(dat_path):
+        return found
+    for ln in open(dat_path):
+        if ln.strip().startswith("displacements"):
+            inblock = True
+            continue
+        f = ln.split()
+        if inblock and len(f) == 4 and f[0] == str(node):
+            found.append([float(x) for x in f[1:]])
         elif inblock and f and not f[0].isdigit():
             inblock = False
     return found
@@ -344,6 +363,37 @@ def main():
                   f"orientation): {len(ue)} node displacements vs one *ORIENTATION per element, "
                   f"max difference {err:.1e} of max |u|")
             failures += 0 if ok else 1
+
+    # --- *BOUNDARY, OP=NEW in a later step on a clamped beam and plate --------------------
+    # ccx 2.23 does not rebuild re-specified rotational BCs on shell/beam nodes after OP=NEW:
+    # converted as they are, these decks' clamped roots become hinges in step 2 (tip
+    # deflections of 1e5 to 1e9) and the plate's prescribed tip z comes out 0.  This checks
+    # both repairs: an OP=NEW that removes nothing is dropped, and where it removes a BC (the
+    # prop) the clamped nodes become knots, which stiffens the beam clamp by ~0.7 %.
+    pl3_3ei = 10.0 * 1000.0 ** 3 / (3 * 210000.0 * 40.0 * 20.0 ** 3 / 12)      # P L^3 / (3 E I)
+    for name in ("op_new_respecify", "op_new_remove"):
+        inp = os.path.join(tmp, name + ".inp")
+        convert(os.path.join(EXAMPLES, name + ".inp"), inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        beam = [u[2] for u in dat_displacement_history(dat, 21)] if status == "solved" else []
+        plate = [u[2] for u in dat_displacement_history(dat, 1221)] if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if len(beam) < 2 or len(plate) < 2:
+            print(f"FAIL  {name}: no step-2 tip displacements ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        if name == "op_new_respecify":      # step 2: twice the load, the plate tip z set to 2
+            refs = [("beam tip", beam[1], 2 * pl3_3ei), ("plate tip (prescribed)", plate[1], 2.0)]
+        else:                               # step 2: the prop removed, the plate as in step 1
+            refs = [("beam tip", beam[1], pl3_3ei), ("plate tip (step 1)", plate[1], plate[0])]
+        diffs = [abs(v - ref) / abs(ref) for _, v, ref in refs]
+        ok = diffs[0] < 0.02 and diffs[1] < 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  {name}: step 2 " + ", ".join(
+            f"{label} {v:+.4f} (expected {ref:+.4f}, {diff * 100:.2f}% diff)"
+            for (label, v, ref), diff in zip(refs, diffs)))
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
