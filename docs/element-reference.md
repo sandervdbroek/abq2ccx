@@ -86,6 +86,8 @@ Direct CalculiX types: **68**. Total recognised: **156**.
 
 Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is `B21` → `B32`, `B31` → `B32`, `B31R` → `B32R` become 3-node beams: ccx 2.23 rejects linear beams with a circular section. Each element gets a new midside node at the midpoint of its end nodes (ccx's order is end, middle, end); element ids and sets are kept, and BCs, temperatures and initial conditions given for both end nodes also reach the midside node.
 
+Under `SECTION=PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), which ccx 2.23 runs only on `B32R`, beams whose emitted type is `B21`, `B31`, `B31R`, `B32` become `B32R`: the 2-node ones get a midside node in the same way, and `B32` only changes type.
+
 ## cohesive
 
 | Abaqus type | Nodes | CalculiX |

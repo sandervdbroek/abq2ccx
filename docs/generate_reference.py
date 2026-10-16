@@ -44,7 +44,10 @@ TRANSLATED = {
         "flagged as unsupported.",
     "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's "
         "two section diameters (`r` → `2r, 2r`), and 2-node beams under it become 3-node beams with "
-        "an inserted midside node (ccx 2.23 rejects linear beams with a circular section; see the "
+        "an inserted midside node (ccx 2.23 rejects linear beams with a circular section). "
+        "`SECTION=PIPE` (outer radius, wall thickness) and `BOX` (`a, b, t1..t4`) data pass through, "
+        "as both codes read them alike, and `THICK PIPE` → `PIPE`; ccx 2.23 runs these sections only "
+        "on `B32R`, so their beams become `B32R` (2-node ones with an inserted midside node; see the "
         "element reference).",
     "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept; `PERTURBATION` kept "
         "only for `*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then "
@@ -191,6 +194,11 @@ def gen_elements():
                          "its end nodes (ccx's order is end, middle, end); element ids and sets are "
                          "kept, and BCs, temperatures and initial conditions given for both end "
                          "nodes also reach the midside node.\n")
+            b32r = ", ".join(f"`{a}`" for a in A.PIPE_BOX_B32R)
+            parts.append("Under `SECTION=PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), which ccx "
+                         f"2.23 runs only on `B32R`, beams whose emitted type is {b32r} become `B32R`: "
+                         "the 2-node ones get a midside node in the same way, and `B32` only changes "
+                         "type.\n")
     return "\n".join(parts)
 
 

@@ -251,6 +251,13 @@ COMPOSITE_SHELL_OK = {"S6", "S8R"}  # CalculiX restricts composite shells to the
 # whose corner nodes cannot follow a circle.  Emitted 2-node type -> the 3-node beam such
 # elements are upgraded to (ccx runs B21 as a B31).
 CIRC_QUADRATIC = {"B21": "B32", "B31": "B32", "B31R": "B32R"}
+# ccx 2.23 accepts PIPE and BOX sections only on B32R ("*BEAM SECTION of type PIPE can only
+# be used for B32R elements"): their integration-point schemes are defined on the expanded
+# C3D20R.  Emitted type -> B32R; a 2-node beam gets a midside node, B32 changes type only.
+PIPE_BOX_B32R = {"B21": "B32R", "B31": "B32R", "B31R": "B32R", "B32": "B32R"}
+# *BEAM SECTION, SECTION= -> the upgrade its beams need (THICK PIPE is emitted as PIPE)
+SECTION_BEAM_UPGRADE = {"CIRC": CIRC_QUADRATIC, "PIPE": PIPE_BOX_B32R, "THICK PIPE": PIPE_BOX_B32R,
+                        "BOX": PIPE_BOX_B32R}
 
 MAX_ENTRIES_PER_LINE = 16  # CalculiX hard limit for entries on a data line
 
@@ -1440,7 +1447,8 @@ class Converter:
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
         self._rb_rot_synth: Dict[int, int] = {}    # ... where the converter created the ROT NODE
-        # CIRC beams upgraded to 3-node beams: element -> (end node, end node, midside node)
+        # 2-node beams upgraded to 3-node beams (_upgrade_section_beams): element -> (end node,
+        # end node, midside node)
         self._midside: "OrderedDict[int, Tuple[int, int, int]]" = OrderedDict()
 
     # -- properties ---------------------------------------------------------
@@ -2281,8 +2289,12 @@ class Converter:
                 self.report.note(f"*BEAM SECTION parameter {k} dropped.", once=True)
         if sec == "THICK PIPE":
             keep["SECTION"] = "PIPE"
-            self.report.note("*BEAM SECTION SECTION=THICK PIPE -> PIPE (same radius/thickness data; "
-                             "ccx expands beams to solids, so thick-wall behaviour is captured).", once=True)
+            self.report.note("*BEAM SECTION SECTION=THICK PIPE -> PIPE (same outer radius / wall "
+                             "thickness data; ccx places PIPE's integration points at the radius "
+                             "that reproduces a thick wall's second moment of area).", once=True)
+        # PIPE (outer radius, wall thickness) and BOX (a, b, t1..t4: a along local 1, b along
+        # local 2, walls t1..t4 at +1, +2, -1, -2) data lines read the same in both codes
+        # (ccx manual 7.3 and Fig. 82; the wall order probed on 2.23), so they pass through.
         data = list(b.data)
         if sec == "CIRC":
             # Abaqus gives the radius; ccx reads the two section DIAMETERS (an ellipse's axis
@@ -3684,13 +3696,13 @@ class Converter:
         return out
 
     def handle_temperature(self, b: Block) -> List[str]:
-        """``*TEMPERATURE`` passes through; the midside nodes of upgraded CIRC beams get the
+        """``*TEMPERATURE`` passes through; the midside nodes of upgraded 2-node beams get the
         mean of their end nodes' values."""
         return self.passthrough(b) + self._midside_records(b, "field")
 
     def handle_normal(self, b: Block) -> List[str]:
         """``*NORMAL`` passes through.  ccx builds a beam's expanded cross-section from the
-        normal in every node, so when both end nodes of an upgraded CIRC beam have an
+        normal in every node, so when both end nodes of an upgraded 2-node beam have an
         explicit normal its midside node gets their normalised mean — otherwise ccx would
         derive that node's normal from the section's n1 instead and twist the element
         wherever the two disagree."""
@@ -3863,7 +3875,7 @@ class Converter:
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         self.build_geometry(blocks)
-        self._upgrade_circ_linear_beams(blocks)
+        self._upgrade_section_beams(blocks)
         self._check_nonpositive_ids()
         self._check_overconstraints(blocks)
         self._prescan(blocks)
@@ -3896,44 +3908,75 @@ class Converter:
     _MIDSIDE_SET_CARDS = {"BOUNDARY", "INITIAL CONDITIONS", "TEMPERATURE", "NODE PRINT",
                           "NODE FILE", "NODE OUTPUT", "RIGID BODY", "TRANSFORM"}
 
-    def _upgrade_circ_linear_beams(self, blocks: List[Block]) -> None:
-        """2-node beams under a ``SECTION=CIRC`` *BEAM SECTION -> 3-node beams.  ccx 2.23
-        stops on them ('Please use quadratic elements for beams with circular cross
-        section'): a linear beam expands to an 8-node brick, whose corner nodes cannot
-        follow a circle.  Each such element gets a midside node at the midpoint of its end
-        nodes (new ids above the highest node; flattened coordinates are already global, so
-        the instance transform is included) and becomes B32/B32R in ccx's end, middle, end
+    def _upgrade_section_beams(self, blocks: List[Block]) -> None:
+        """Beams whose *BEAM SECTION ccx 2.23 rejects on their emitted type -> the type it
+        accepts (``SECTION_BEAM_UPGRADE``).  ``SECTION=CIRC``: 2-node beams stop with 'Please
+        use quadratic elements for beams with circular cross section' (a linear beam expands
+        to an 8-node brick, whose corner nodes cannot follow a circle) and become B32/B32R.
+        ``SECTION=PIPE``/``BOX`` (and THICK PIPE, emitted as PIPE) run only on B32R: B32
+        changes type, 2-node beams become B32R.  A 2-node element gets a midside node at the
+        midpoint of its end nodes (new ids above the highest node; flattened coordinates are
+        already global, so the instance transform is included), in ccx's end, middle, end
         order (probed on 2.23: end, end, middle stops with a nonpositive jacobian).  Element
         ids and element sets are unchanged; node sets follow ``_MIDSIDE_SET_CARDS``."""
-        circ: set = set()
+        table: Dict[int, Tuple[str, Dict[str, str]]] = {}      # element -> (section, upgrade)
         for b in blocks:
-            if b.keyword == "BEAM SECTION" and (b.param("SECTION") or "").strip().upper() == "CIRC":
-                circ.update(self.geom.elset((b.param("ELSET") or "").strip()))
-        if not circ:
+            sec = (b.param("SECTION") or "").strip().upper() if b.keyword == "BEAM SECTION" else ""
+            if sec not in SECTION_BEAM_UPGRADE:
+                continue
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                if e not in table or table[e][1] is not PIPE_BOX_B32R:     # B32R suits CIRC too
+                    table[e] = (sec, SECTION_BEAM_UPGRADE[sec])
+        if not table:
             return
         quiet = Report()
         nodes = self.geom.nodes
         next_id = max(nodes, default=0)
-        kinds: "OrderedDict[str, int]" = OrderedDict()
+        # per case (True: 2-node beam given a midside node, False: B32 retyped) the Abaqus
+        # sections involved and the "TYPE -> new type" counts
+        sections: Dict[bool, set] = {True: set(), False: set()}
+        kinds: Dict[bool, "OrderedDict[str, int]"] = {True: OrderedDict(), False: OrderedDict()}
         for eid, (typ, conn) in list(self.geom.elements.items()):
-            quad = CIRC_QUADRATIC.get(ccx_element_type(typ, quiet)) if eid in circ else None
-            if quad is None or len(conn) != 2 or not all(n in nodes for n in conn):
+            sec, up = table.get(eid, ("", {}))
+            new = up.get(ccx_element_type(typ, quiet)) if up else None
+            if new is None or len(conn) not in (2, 3) or not all(n in nodes for n in conn):
                 continue
-            next_id += 1
-            self.geom.add_node(next_id, vscale(vadd(nodes[conn[0]], nodes[conn[1]]), 0.5))
-            self.geom.elements[eid] = (quad, [conn[0], next_id, conn[1]])
-            self._midside[eid] = (conn[0], conn[1], next_id)
-            self._elem_types.add(quad)
-            kind = f"{typ.upper()} -> {quad}"
-            kinds[kind] = kinds.get(kind, 0) + 1
+            mid = len(conn) == 2
+            if mid:
+                next_id += 1
+                self.geom.add_node(next_id, vscale(vadd(nodes[conn[0]], nodes[conn[1]]), 0.5))
+                self.geom.elements[eid] = (new, [conn[0], next_id, conn[1]])
+                self._midside[eid] = (conn[0], conn[1], next_id)
+            else:
+                self.geom.elements[eid] = (new, conn)
+            self._elem_types.add(new)
+            sections[mid].add(sec)
+            kind = f"{typ.upper()} -> {new}"
+            kinds[mid][kind] = kinds[mid].get(kind, 0) + 1
+
+        def label(mid: bool) -> str:
+            return "/".join(s for s in SECTION_BEAM_UPGRADE if s in sections[mid])
+
+        def counts(mid: bool) -> str:
+            return ", ".join(f"{k}: {v}" for k, v in kinds[mid].items())
+
+        if kinds[False]:
+            self.report.warn(f"SECTION={label(False)} beams: {sum(kinds[False].values())} 3-node "
+                             f"element(s) emitted as B32R instead of B32 ({counts(False)}), with the "
+                             f"same nodes; ccx 2.23 accepts PIPE and BOX sections only on B32R.",
+                             once=True)
         if not self._midside:
             return
+        why = []
+        if "CIRC" in sections[True]:
+            why.append("stops on linear beams with a circular section")
+        if sections[True] - {"CIRC"}:
+            why.append("accepts PIPE and BOX sections only on B32R")
         mids = [m for _, _, m in self._midside.values()]
         span = f"node {mids[0]}" if len(mids) == 1 else f"nodes {mids[0]}-{mids[-1]}"
-        self.report.warn(f"SECTION=CIRC beams: {len(mids)} 2-node element(s) emitted as 3-node beams "
-                         f"({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a new "
-                         f"midside node at its midpoint ({span}); ccx 2.23 stops on "
-                         f"linear beams with a circular section. Element ids and sets are kept, and "
+        self.report.warn(f"SECTION={label(True)} beams: {len(mids)} 2-node element(s) emitted as 3-node "
+                         f"beams ({counts(True)}), each with a new midside node at its midpoint "
+                         f"({span}); ccx 2.23 {' and '.join(why)}. Element ids and sets are kept, and "
                          f"BCs, temperatures and initial conditions on both end nodes also reach the "
                          f"midside node. The quadratic beam is closer to beam theory than the linear "
                          f"one, so results can differ slightly from Abaqus.", once=True)
@@ -3960,13 +4003,13 @@ class Converter:
                 ids.extend(add)
         if skipped:
             self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
-                             f"hold both end nodes of upgraded CIRC beams but a load, constraint or "
+                             f"hold both end nodes of upgraded 2-node beams but a load, constraint or "
                              f"surface card uses them, so the midside nodes were not added (an extra "
                              f"node there would add load or equation terms); *BOUNDARY and "
                              f"temperature lines on them still reach the midside nodes.", once=True)
 
     def _midside_records(self, b: Block, layout: str) -> List[str]:
-        """Extra data lines that carry a per-node card onto the midside nodes of upgraded CIRC
+        """Extra data lines that carry a per-node card onto the midside nodes of upgraded 2-node
         beams: when the card gives both end nodes a value (by id or through a set), the
         midside node gets the linear interpolation, which is what the Abaqus element sees
         between its nodes.  ``layout`` is ``"boundary"`` (node, first DOF[, last DOF[,
@@ -4028,7 +4071,7 @@ class Converter:
         return out
 
     def _note_midside_lines(self, keyword: str) -> None:
-        self.report.note(f"*{keyword} lines given for both end nodes of an upgraded CIRC beam were "
+        self.report.note(f"*{keyword} lines given for both end nodes of an upgraded 2-node beam were "
                          f"extended to its midside node (values interpolated linearly).", once=True)
 
     def _prescan(self, blocks: List[Block]) -> None:

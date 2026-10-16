@@ -186,6 +186,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*ORIENTATION` | `*ORIENTATION` | origin `c` subtracted (axes `a−c`, `b−c`); `DEFINITION=NODES` resolved; `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
 | `*DISTRIBUTION` | passed (solid-section only) | shells not supported by ccx |
 | `*BEAM SECTION, SECTION=CIRC` | radius `r` → diameters `2r, 2r`; 2-node beams → `B32`/`B32R` | ccx reads an ellipse's axis lengths; ccx 2.23 rejects linear beams with a circular section, so each gets a midside node (BCs, temperatures and initial conditions on both end nodes reach it) |
+| `*BEAM SECTION, SECTION=PIPE/BOX/THICK PIPE` | data unchanged, `THICK PIPE` → `PIPE`; beams → `B32R` | both codes read the data alike (outer radius, wall; `a, b, t1..t4`); ccx 2.23 runs these sections only on `B32R`, so 2-node beams get a midside node as for `CIRC` and `B32` only changes type |
 | `*SHELL SECTION, COMPOSITE` | S6/S8R; synth `*ORIENTATION` per ply angle | no inline ply angle in ccx; `SYMMETRIC` layups mirrored; on continuum shells (SC8R) → `*SOLID SECTION` |
 | `*STEP` | `NAME` dropped, `NLGEOM` on step, `AMPLITUDE=RAMP/STEP` kept, `PERTURBATION` only for freq/buckle, `*END STEP` added | explicit steps get `INC=10000000` + `NLGEOM` (Abaqus/Explicit defaults) |
 | `*BOUNDARY ENCASTRE/PINNED/*SYMM` | numeric DOFs | rotational DOFs only if shells/beams (`--solid-dof` to force 1-3) |
@@ -253,7 +254,9 @@ pressure-face labels (`P1..P6`) carry across unchanged. Element handling:
   base (ccx has no mixed u/p formulation).
 * **Upgraded** (warned): 2-node beams under a `*BEAM SECTION, SECTION=CIRC` (`B21`/`B31` →
   `B32`, `B31R` → `B32R`), which ccx 2.23 rejects, get a midside node at each element's
-  midpoint; element ids and sets are kept.
+  midpoint; element ids and sets are kept. Under `SECTION=PIPE`, `BOX` or `THICK PIPE`, which
+  ccx 2.23 runs only on `B32R`, `B21`/`B31`/`B31R` become `B32R` the same way and `B32` →
+  `B32R` keeps its nodes.
 * **Best-effort approximation** (node-count preserving, *strong* warning — behaviour lost):
   cohesive `COH*` and gasket `GK*` → the matching thin continuum (`COH3D8→C3D8`,
   `COH2D4→CPE4`, `GK3D8→C3D8`, …), with `*COHESIVE/GASKET SECTION → *SOLID SECTION`.

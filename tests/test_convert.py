@@ -1358,6 +1358,81 @@ def test_circ_beam_midside_node_gets_sets_bcs_and_fields():
     assert body.split("*INITIAL CONDITIONS")[1] == ", TYPE=temperature\nALLN, 20.\n1, 30.\n4, 25"
 
 
+PIPE_BEAM = CIRC_BEAM.replace("section=CIRC\n0.05", "section=PIPE\n0.05, 0.01")
+B32_PIPE_BEAM = """*Node
+1, 0., 0., 0.
+2, 0.5, 0., 0.
+3, 1., 0., 0.
+*Element, type=B32, elset=BEAM
+1, 1, 2, 3
+*Beam Section, elset=BEAM, material=M, section=PIPE
+0.05, 0.01
+0., 0., -1.
+*Material, name=M
+*Elastic
+2.1e5, 0.3
+"""
+BOX_DATA = "section=BOX\n0.1, 0.06, 0.01, 0.005, 0.01, 0.005"
+
+
+def test_pipe_box_beams_become_b32r():
+    body, conv, rep = convert_str(PIPE_BEAM)
+    # ccx 2.23 runs PIPE and BOX sections only on B32R: a 2-node beam gets a midside node
+    # (end, middle, end; ids and the elset kept) and the data line passes through
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n2, 2, 5, 3\n" in body
+    assert conv.geom.nodes[4] == (0.5, 0.0, 0.0) and "*ELSET, ELSET=BEAM\n1, 2\n" in body
+    assert "SECTION=PIPE\n0.05, 0.01\n0., 0., -1." in body           # outer radius, wall
+    assert "3-node beams (B31 -> B32R: 2)" in rep.text()
+    assert "accepts PIPE and BOX sections only on B32R" in rep.text() and "circular" not in rep.text()
+    for typ in ("B21", "B31R", "PIPE31"):
+        body, _, _ = convert_str(PIPE_BEAM.replace("type=B31", f"type={typ}"))
+        assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body, typ
+    # THICK PIPE runs as PIPE; BOX's a, b, t1..t4 mean the same in both codes
+    body, _, rep = convert_str(PIPE_BEAM.replace("section=PIPE", "section=THICK PIPE"))
+    assert "SECTION=PIPE\n0.05, 0.01\n" in body and "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
+    assert "SECTION=THICK PIPE beams: 2 2-node element(s)" in rep.text()
+    body, _, _ = convert_str(CIRC_BEAM.replace("section=CIRC\n0.05", BOX_DATA))
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
+    assert "SECTION=BOX\n0.1, 0.06, 0.01, 0.005, 0.01, 0.005\n" in body
+    # the midside node joins a node set only a *BOUNDARY uses, as for CIRC beams
+    _, conv, _ = convert_str(PIPE_BEAM + "*Nset, nset=ALLN\n1, 2, 3\n*Boundary\nALLN, 3, 3\n")
+    assert conv.geom.nset("ALLN") == [1, 2, 3, 4, 5]
+
+
+def test_pipe_box_b32_only_changes_type():
+    body, conv, rep = convert_str(B32_PIPE_BEAM)
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 2, 3\n" in body and len(conv.geom.nodes) == 3
+    assert "SECTION=PIPE beams: 1 3-node element(s) emitted as B32R instead of B32 " \
+           "(B32 -> B32R: 1), with the same nodes" in rep.text()
+    assert "midside" not in rep.text()
+    body, _, _ = convert_str(B32_PIPE_BEAM.replace("type=B32", "type=PIPE32")
+                             .replace("section=PIPE\n0.05, 0.01", BOX_DATA))
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 2, 3\n" in body
+    _, _, rep = convert_str(B32_PIPE_BEAM.replace("section=PIPE\n0.05, 0.01", "section=CIRC\n0.05"))
+    assert "B32R" not in rep.text()                     # ccx runs CIRC on B32 as it is
+
+
+def test_mixed_section_beams_report_each_case():
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 3., 0., 0.\n5, 3.5, 0., 0.\n"
+            "6, 4., 0., 0.\n*Element, type=B31, elset=ROD\n1, 1, 2\n*Element, type=B31, elset=TUBE\n"
+            "2, 2, 3\n*Element, type=B32, elset=BOXB\n3, 4, 5, 6\n"
+            "*Beam Section, elset=ROD, material=M, section=CIRC\n0.05\n0., 0., -1.\n"
+            "*Beam Section, elset=TUBE, material=M, section=PIPE\n0.05, 0.01\n0., 0., -1.\n"
+            "*Beam Section, elset=BOXB, material=M, section=BOX\n0.1, 0.1, 0.01, 0.01, 0.01, 0.01\n"
+            "*Material, name=M\n*Elastic\n2.1e5, 0.3\n")
+    body, _, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=B32\n1, 1, 7, 2\n*ELEMENT, TYPE=B32R\n2, 2, 8, 3\n3, 4, 5, 6\n" in body
+    # one line per case, each naming its sections and ccx's reason
+    assert "SECTION=CIRC/PIPE beams: 2 2-node element(s) emitted as 3-node beams (B31 -> B32: 1, " \
+           "B31 -> B32R: 1), each with a new midside node at its midpoint (nodes 7-8); ccx 2.23 " \
+           "stops on linear beams with a circular section and accepts PIPE and BOX sections only " \
+           "on B32R." in rep.text()
+    assert "SECTION=BOX beams: 1 3-node element(s) emitted as B32R instead of B32" in rep.text()
+    # an element under both a PIPE and a later CIRC section stays B32R, which suits both
+    body, _, _ = convert_str(PIPE_BEAM + "*Beam Section, elset=BEAM, material=M, section=CIRC\n0.05\n")
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
+
+
 def test_beam_circ_cantilever_example():
     body, _, _ = convert(os.path.join(EXAMPLES, "beam_circ_cantilever.inp"))
     g = reparse(body)

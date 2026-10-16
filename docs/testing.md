@@ -20,7 +20,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (118)
+## 1. Unit tests — `tests/test_convert.py` (121)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -144,6 +144,9 @@ conversion behaviour and referential integrity.
 | `test_circ_linear_beam_becomes_quadratic` | 2-node beams under `SECTION=CIRC` (rejected by ccx 2.23) → `B32`/`B32R` with a midside node at each midpoint, in ccx's end, middle, end order (`B21`/`B31` → `B32`, `B31R` → `B32R`); element ids and the elset kept; the Abaqus radius → ccx's two diameters; `RECT` beams stay linear |
 | `test_circ_beam_midside_follows_instance_transform` | in a translated and rotated instance the midside node lands at the midpoint of the transformed end nodes |
 | `test_circ_beam_midside_node_gets_sets_bcs_and_fields` | the midside node joins a node set only BCs use, not one a `*CLOAD` counts; `*BOUNDARY` (per DOF), initial temperature/velocity, `*TEMPERATURE` and `*NORMAL` lines on both end nodes are interpolated onto it, replacing a set value that the end nodes override |
+| `test_pipe_box_beams_become_b32r` | ccx 2.23 runs `PIPE`/`BOX` sections only on `B32R`: under `PIPE`, `BOX` and `THICK PIPE` (emitted as `PIPE`), 2-node `B21`/`B31`/`B31R`/`PIPE31` → `B32R` with a midside node, end, middle, end; ids and the elset kept; the `PIPE` (outer radius, wall) and `BOX` (a, b, t1..t4) data lines pass through; the midside node joins a node set only a `*BOUNDARY` uses |
+| `test_pipe_box_b32_only_changes_type` | `B32`/`PIPE32` under `PIPE`/`BOX` → `B32R` with the same nodes and no midside message; `B32` under `CIRC` is left alone |
+| `test_mixed_section_beams_report_each_case` | `CIRC`, `PIPE` and `BOX` beams in one deck: one report line for the midside-node upgrades (naming both sections and both reasons) and one for the retyped `B32`; an element under both a `PIPE` and a `CIRC` section stays `B32R` |
 | `test_beam_circ_cantilever_example` | the bundled CIRC cantilever converts to 20 `B32` with midside nodes and diameters, no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
@@ -232,6 +235,18 @@ section's data as two *diameters* while Abaqus gives the radius: passed through,
 made circular beams 16× too flexible in bending. Both are fixed; the three decks solve
 (215 → 218), the frequency deck's first bending modes match Euler–Bernoulli within 0.6 %,
 and `validate_with_ccx.py` checks a circular cantilever against beam theory.
+
+**Pipe and box beams.** ccx 2.23 accepts `SECTION=PIPE` and `SECTION=BOX` only on `B32R`
+("*BEAM SECTION of type PIPE can only be used for B32R elements"), so beams under them, and
+under `THICK PIPE` (emitted as `PIPE`), now become `B32R`: 2-node beams get the same midside
+nodes, `B32` only changes type. Both data lines mean the same in the two codes — `PIPE` is
+the outer radius and wall thickness; `BOX` is `a` along local 1, `b` along local 2, then the
+walls at +1, +2, −1, −2 (from the manual; a probe with one thick wall under axial tension
+confirms the wall order). A 40-element cantilever's tip deflection is 0.997 (`PIPE`) and
+1.010 (`BOX`) of P L³/(3 E I); `BOX` converges to 1.012 because ccx integrates the walls
+along their centre lines and ignores each wall's own bending stiffness. No corpus deck
+starts solving: the two `PIPE31H` decks that use `THICK PIPE` also need externally supplied
+`<parameter>` values.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
