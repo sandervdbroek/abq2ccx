@@ -956,6 +956,7 @@ def elastic_card(body, material):
 
 ORTHO_EXPANSION = "*Expansion, type=ORTHO\n1e-3, 2e-3, 4e-3\n"
 ANISO_EXPANSION = "*Expansion, type=ANISO\n1e-3, 2e-3, 4e-3, 0., 0., 0.\n"
+SHEARED_EXPANSION = "*Expansion, type=ANISO\n1e-3, 2e-3, 4e-3, 5e-4, 0., 0.\n"
 
 
 def test_iso_elastic_with_ortho_expansion_becomes_engineering_constants():
@@ -1004,11 +1005,12 @@ def test_iso_elastic_temperature_rows_for_ortho_expansion():
 def test_elastic_for_aniso_expansion_becomes_aniso():
     # engineering constants do not help with an ANISO expansion (ccx 2.23 also gets an
     # orthotropic *ELASTIC wrong beside it without an *ORIENTATION): all go out as ANISO
-    body, _, rep = convert_str("*Material, name=ISO\n*Elastic\n1000., 0.2, 50.\n" + ANISO_EXPANSION +
+    # (beside one with a shear coefficient: one without goes out as ORTHO)
+    body, _, rep = convert_str("*Material, name=ISO\n*Elastic\n1000., 0.2, 50.\n" + SHEARED_EXPANSION +
                                "*Material, name=EC\n*Elastic, type=ENGINEERING CONSTANTS\n"
-                               "1000., 2000., 3000., 0.2, 0.25, 0.3, 400., 500.\n600.\n" + ANISO_EXPANSION
-                               + "*Material, name=LAM\n*Elastic, type=LAMINA\n"
-                                 "1000., 600., 0.25, 300., 300., 250.\n" + ANISO_EXPANSION)
+                               "1000., 2000., 3000., 0.2, 0.25, 0.3, 400., 500.\n600.\n"
+                               + SHEARED_EXPANSION + "*Material, name=LAM\n*Elastic, type=LAMINA\n"
+                                 "1000., 600., 0.25, 300., 300., 250.\n" + SHEARED_EXPANSION)
     head, data = elastic_card(body, "ISO")
     assert head == "*ELASTIC, TYPE=ANISO" and [len(ln.split(",")) for ln in data] == [8, 8, 6]
     lam, mu = 1000. * .2 / (1.2 * .6), 1000. / 2.4
@@ -1108,15 +1110,18 @@ def test_nlgeom_turned_ortho_expansion_warned():
 def test_nlgeom_aniso_expansion_warned():
     # an anisotropic expansion stops ccx 2.23's NLGEOM steps ('too many cutbacks', probed)
     # once the deck has temperatures, turned or not, even where the temperature stays
-    w = nlgeom_expansion_warnings(ANISO_EXPANSION, load="")
+    w = nlgeom_expansion_warnings(SHEARED_EXPANSION, load="")
     assert len(w) == 1 and w[0].startswith("[WARNING] Material M: *EXPANSION, TYPE=ANISO in a deck")
+    assert nlgeom_expansion_warnings(SHEARED_EXPANSION, TURNED_30, ", orientation=T")
+    assert not nlgeom_expansion_warnings(SHEARED_EXPANSION, step="*Step\n*Static\n")
+    assert not nlgeom_expansion_warnings(SHEARED_EXPANSION, load="", ic="")
+    # one without shear coefficients goes out as ORTHO, unless its axes are turned
+    assert not nlgeom_expansion_warnings(ANISO_EXPANSION, load="")
     assert nlgeom_expansion_warnings(ANISO_EXPANSION, TURNED_30, ", orientation=T")
-    assert not nlgeom_expansion_warnings(ANISO_EXPANSION, step="*Step\n*Static\n")
-    assert not nlgeom_expansion_warnings(ANISO_EXPANSION, load="", ic="")
     # a material no section uses is not computed at all
     _, _, rep = convert_str(HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Solid Section, elset=EALL, "
                             "material=M\n,\n*Material, name=M\n*Elastic\n1000., 0.2\n*Material, "
-                            "name=SPARE\n*Elastic\n1000., 0.2\n" + ANISO_EXPANSION + TEMPS_IC +
+                            "name=SPARE\n*Elastic\n1000., 0.2\n" + SHEARED_EXPANSION + TEMPS_IC +
                             NLGEOM_STEP + HEATED + "*End Step\n")
     assert "NLGEOM" not in rep.text()
 
@@ -1138,6 +1143,127 @@ def test_nlgeom_expansion_composite_plies():
     assert warned("0.1, 3, PLY, 0.\n0.1, 3, PLY,\n", ", orientation=T")
     assert not warned("0.1, 3, PLY, 0.\n0.1, 3, PLY, 90.\n0.1, 3, PLY, -90.\n")
     assert not warned("0.1, 3, PLY, -30.\n", ", orientation=T")       # back to the global axes
+
+
+def expansion_card(body, material):
+    """The emitted *EXPANSION card of ``material``: (keyword line, data lines)."""
+    lines = body.splitlines()
+    i = lines.index(f"*MATERIAL, NAME={material}")
+    j = next(k for k in range(i + 1, len(lines)) if lines[k].startswith("*EXPANSION"))
+    k = next((k for k in range(j + 1, len(lines)) if lines[k].startswith("*")), len(lines))
+    return lines[j], lines[j + 1:k]
+
+
+def heated_cube(expansion, orientation="", section=""):
+    """A heated C3D8 of material M (isotropic *ELASTIC) in an NLGEOM step: (body, report)."""
+    body, _, rep = convert_str(HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n" + orientation +
+                               f"*Solid Section, elset=EALL, material=M{section}\n,\n*Material, "
+                               "name=M\n*Elastic\n1000., 0.2\n" + expansion + TEMPS_IC +
+                               NLGEOM_STEP + HEATED + "*End Step\n")
+    return body, rep
+
+
+AS_ORTHO_NOTE = "*EXPANSION, TYPE=ANISO without shear coefficients written as TYPE=ORTHO"
+
+
+def test_aniso_expansion_without_shear_written_as_ortho():
+    # ccx 2.23 stops NLGEOM steps on any TYPE=ANISO expansion once the deck has temperatures
+    # (probed), but computes TYPE=ORTHO right in axes no orientation turns: an anisotropic
+    # expansion without shear coefficients goes out as ORTHO (the same thermal strain), and
+    # an isotropic *ELASTIC beside it as engineering constants rather than ANISO
+    body, rep = heated_cube(ANISO_EXPANSION)
+    assert expansion_card(body, "M") == ("*EXPANSION, TYPE=ORTHO", ["1e-3, 2e-3, 4e-3"])
+    assert elastic_card(body, "M")[0] == "*ELASTIC, TYPE=ENGINEERING CONSTANTS"
+    assert rep.text().count(AS_ORTHO_NOTE) == 1 and f"Material M: {AS_ORTHO_NOTE}" in rep.text()
+    assert "in a deck with NLGEOM steps" not in rep.text()
+    # the long type name, blank or negative-zero shears, other parameters, engineering
+    # constants (left as they are beside ORTHO), materials no section uses
+    body, _, rep = convert_str(
+        "*Material, name=A\n*Elastic\n1000., 0.2\n*Expansion, type=ANISOTROPIC, zero=20.\n"
+        "1e-3,2e-3,4e-3\n*Material, name=B\n*Elastic, type=ENGINEERING CONSTANTS\n"
+        "1000., 2000., 3000., 0.2, 0.25, 0.3, 400., 500.\n600.\n*Expansion, type=ANISO\n"
+        "1e-3, 2e-3, 4e-3, -0., , 0.D0\n")
+    assert expansion_card(body, "A") == ("*EXPANSION, TYPE=ORTHO, ZERO=20.", ["1e-3, 2e-3, 4e-3"])
+    assert expansion_card(body, "B") == ("*EXPANSION, TYPE=ORTHO", ["1e-3, 2e-3, 4e-3"])
+    assert elastic_card(body, "B") == ("*ELASTIC, TYPE=ENGINEERING CONSTANTS",
+                                       ["1000., 2000., 3000., 0.2, 0.25, 0.3, 400., 500.", "600."])
+    assert "Material A: " + AS_ORTHO_NOTE in rep.text() and "Material B: " + AS_ORTHO_NOTE in rep.text()
+    # axes that are not turned so that the expansion has shear: the identity orientation
+    # Abaqus/CAE writes, a permutation, a turn about the axis of two equal coefficients
+    for exp, ori in ((ANISO_EXPANSION, "*Orientation, name=T\n1., 0., 0., 0., 1., 0.\n3, 0.\n"),
+                     (ANISO_EXPANSION, "*Orientation, name=T\n0., 1., 0., -1., 0., 0.\n"),
+                     ("*Expansion, type=ANISO\n2e-3, 2e-3, 4e-3, 0., 0., 0.\n", TURNED_30)):
+        body, rep = heated_cube(exp, ori, ", orientation=T")
+        assert expansion_card(body, "M")[0] == "*EXPANSION, TYPE=ORTHO"
+        assert "in a deck with NLGEOM steps" not in rep.text()
+
+
+def test_aniso_expansion_kept_when_turned():
+    # turned axes: as TYPE=ORTHO ccx 2.23 would drop the turned shear in NLGEOM steps without
+    # an error, so the card stays ANISO (beside an ANISO *ELASTIC) and is warned
+    for ori, section in ((TURNED_30, ", orientation=T"),
+                         ("*Orientation, name=T\n1., 0., 0., 0., 1., 0.\n3, 30.\n", ", orientation=T"),
+                         ("*Orientation, name=T, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n",
+                          ", orientation=T")):
+        body, rep = heated_cube(ANISO_EXPANSION, ori, section)
+        assert expansion_card(body, "M") == ("*EXPANSION, TYPE=ANISO", ["1e-3, 2e-3, 4e-3, 0., 0., 0."])
+        assert elastic_card(body, "M")[0] == "*ELASTIC, TYPE=ANISO"
+        assert AS_ORTHO_NOTE not in rep.text()
+        w = [m for m in rep.text().splitlines() if "in a deck with NLGEOM steps" in m]
+        assert len(w) == 1 and "Material M: *EXPANSION, TYPE=ANISO" in w[0]
+    # ... also when only one of the material's sections, or one composite ply, turns it
+    deck = (HEX + "*Element, type=C3D8, elset=E2\n2, 1, 2, 3, 4, 5, 6, 7, 8\n" + TURNED_30 +
+            "*Solid Section, elset=EALL, material=M\n,\n*Solid Section, elset=E2, material=M, "
+            "orientation=T\n,\n*Material, name=M\n*Elastic\n1000., 0.2\n" + ANISO_EXPANSION)
+    assert expansion_card(convert_str(deck)[0], "M")[0] == "*EXPANSION, TYPE=ANISO"
+
+    def ply_card(plies):
+        deck = ("*Node, nset=ALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+                "5, .5, 0., 0.\n6, 1., .5, 0.\n7, .5, 1., 0.\n8, 0., .5, 0.\n"
+                "*Element, type=S8R, elset=P\n1, 1, 2, 3, 4, 5, 6, 7, 8\n" + TURNED_30 +
+                "*Shell Section, elset=P, composite\n" + plies + "*Material, name=PLY\n"
+                "*Elastic, type=LAMINA\n10000., 1000., 0.3, 500., 500., 400.\n" + ANISO_EXPANSION)
+        return expansion_card(convert_str(deck)[0], "PLY")[0]
+
+    assert ply_card("0.1, 3, PLY, 0.\n0.1, 3, PLY, 45.\n") == "*EXPANSION, TYPE=ANISO"
+    assert ply_card("0.1, 3, PLY, T\n") == "*EXPANSION, TYPE=ANISO"     # the ply names T
+    assert ply_card("0.1, 3, PLY, 0.\n0.1, 3, PLY, 90.\n") == "*EXPANSION, TYPE=ORTHO"
+
+
+def test_aniso_expansion_with_shear_kept():
+    # a shear coefficient in any row, data that are no coefficients, or USER: left as ANISO
+    for exp in (SHEARED_EXPANSION,
+                "*Expansion, type=ANISO\n1e-3, 2e-3, 4e-3, 0., 0., 0., 20.\n"
+                "1e-3, 2e-3, 4e-3, 0., 0., 1e-6, 120.\n",
+                "*Expansion, type=ANISO\nEXPDIST\n",
+                "*Expansion, type=ANISO\n1e-3, 2e-3, 4e-3, 0., 0., 0., nan\n",
+                "*Expansion, type=ANISO, user\n1., 2., 3.\n"):
+        body, rep = heated_cube(exp)
+        assert expansion_card(body, "M")[0].startswith("*EXPANSION, TYPE=ANISO")
+        assert elastic_card(body, "M")[0] == "*ELASTIC, TYPE=ANISO"
+        assert AS_ORTHO_NOTE not in rep.text()
+
+
+def test_aniso_expansion_as_ortho_rows_and_dependencies():
+    # temperature rows keep their temperatures; blank shear fields count as zero
+    body, _, _ = convert_str("*Material, name=M\n*Elastic\n1000., 0.2\n*Expansion, type=ANISO\n"
+                             "1e-3, 2e-3, 4e-3, 0., 0., 0., 20.\n1.5e-3, 2.5e-3, 4.5e-3, , , , 120.\n")
+    assert expansion_card(body, "M")[1] == ["1e-3, 2e-3, 4e-3, 20.", "1.5e-3, 2.5e-3, 4.5e-3, 120."]
+    # DEPENDENCIES: the field columns after the temperature are no shear coefficients; the
+    # rows are collapsed to field = 0 first (two lines a row from two field variables on)
+    body, _, rep = convert_str(
+        "*Material, name=ONE\n*Elastic\n1000., 0.2\n*Expansion, type=ANISO, dependencies=1\n"
+        "1e-3, 2e-3, 4e-3, 0., 0., 0., 20., 0.\n9e-3, 9e-3, 9e-3, 0., 0., 0., 20., 1.\n"
+        "1.5e-3, 2.5e-3, 4.5e-3, 0., 0., 0., 120., 0.\n9e-3, 9e-3, 9e-3, 0., 0., 0., 120., 1.\n"
+        "*Material, name=TWO\n*Elastic\n1000., 0.2\n*Expansion, type=ANISO, dependencies=2\n"
+        "1e-3, 2e-3, 4e-3, 0., 0., 0., 20., 0.\n0.\n9e-3, 9e-3, 9e-3, 0., 0., 0., 20., 1.\n2.\n"
+        "*Material, name=SHEAR\n*Elastic\n1000., 0.2\n*Expansion, type=ANISO, dependencies=2\n"
+        "1e-3, 2e-3, 4e-3, 0., 0., 0., 20., 0.\n0.\n9e-3, 9e-3, 9e-3, 1e-6, 0., 0., 20., 1.\n2.\n")
+    assert expansion_card(body, "ONE") == ("*EXPANSION, TYPE=ORTHO",
+                                           ["1e-3, 2e-3, 4e-3, 20.", "1.5e-3, 2.5e-3, 4.5e-3, 120."])
+    assert expansion_card(body, "TWO") == ("*EXPANSION, TYPE=ORTHO", ["1e-3, 2e-3, 4e-3, 20."])
+    assert expansion_card(body, "SHEAR")[0] == "*EXPANSION, TYPE=ANISO"     # in any field state
+    assert "*EXPANSION, DEPENDENCIES=1: ccx has no field-variable dependence" in rep.text()
 
 
 def test_beam_section_unsupported_profile_commented():

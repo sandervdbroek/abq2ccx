@@ -713,6 +713,33 @@ def merged_data_records(block: Block) -> List[List[str]]:
     return records
 
 
+def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
+    """The data rows of a material card with ``nvals`` property values per row: the values,
+    the temperature, then the DEPENDENCIES= field values, as stripped tokens ("" for a blank
+    field), padded or cut to that width.  A row takes as many lines as it needs at 8 entries
+    a line, as Abaqus reads them.  None when the lines do not make whole rows or
+    DEPENDENCIES is not a number."""
+    try:
+        ndep = max(0, int(float(block.param("DEPENDENCIES") or "0")))
+    except ValueError:
+        return None
+    width = nvals + 1 + ndep
+    per_rec = -(-width // 8)
+    lines = [ln for ln in block.data if ln.strip()]
+    if len(lines) % per_rec:
+        return None
+    rows: List[List[str]] = []
+    for i in range(0, len(lines), per_rec):
+        toks: List[str] = []
+        for j, ln in enumerate(lines[i:i + per_rec]):
+            f = [x.strip() for x in ln.split(",")]
+            if j < per_rec - 1:
+                f = (f + [""] * 8)[:8]
+            toks.extend(f)
+        rows.append((toks + [""] * width)[:width])
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Geometry registries (needed to expand mesh-generation cards / flatten)
 # ---------------------------------------------------------------------------
@@ -1890,6 +1917,8 @@ class Converter:
         # its step (_plan_op_new_rotations)
         self._op_new_drop: Dict[int, bool] = {}
         self._jc_with_rate: set = set()
+        # id(*EXPANSION, TYPE=ANISO) written as TYPE=ORTHO -> its material's name
+        self._expansion_as_ortho: Dict[int, str] = {}
         # id(*ELASTIC) -> (TYPE of its material's ORTHO/ANISO *EXPANSION, material name)
         self._elastic_expansion: Dict[int, Tuple[str, str]] = {}
         self._ref_nodes: set = set()
@@ -2286,7 +2315,7 @@ class Converter:
             "DENSITY": self.handle_dependent_material,
             "SPECIFIC HEAT": self.handle_dependent_material,
             "CONDUCTIVITY": self.handle_dependent_material,
-            "EXPANSION": self.handle_dependent_material,
+            "EXPANSION": self.handle_expansion,
             "MOHR COULOMB": self.handle_dependent_material,
             "MOHR COULOMB HARDENING": self.handle_dependent_material,
         }
@@ -2371,19 +2400,9 @@ class Converter:
         if ndep <= 0:
             return None
         width = nvals + 1 + ndep
-        per_rec = -(-width // 8)
-        lines = [ln for ln in b.data if ln.strip()]
-        if not lines or len(lines) % per_rec:
+        recs = material_rows(b, nvals)
+        if not recs:
             return None
-        recs: List[List[str]] = []
-        for i in range(0, len(lines), per_rec):
-            toks: List[str] = []
-            for j, ln in enumerate(lines[i:i + per_rec]):
-                f = [x.strip() for x in ln.split(",")]
-                if j < per_rec - 1:
-                    f = (f + [""] * 8)[:8]
-                toks.extend(f)
-            recs.append((toks + [""] * width)[:width])
 
         def num(x: str) -> float:
             return pf(x) if x.strip() else 0.0
@@ -2675,15 +2694,72 @@ class Converter:
             groups.append(group)
         return groups
 
-    @staticmethod
-    def _expansion_card(group: List[Block]) -> Tuple[Optional[str], Optional[Block]]:
+    def _expansion_card(self, group: List[Block]) -> Tuple[Optional[str], Optional[Block]]:
         """``("ORTHO" | "ANISO", card)`` when a material's (last) *EXPANSION is orthotropic or
-        anisotropic, else ``(None, None)``."""
+        anisotropic as it is written for ccx (_plan_expansion_as_ortho), else ``(None, None)``."""
         exp = [g for g in group if g.keyword == "EXPANSION"]
         typ = (exp[-1].param("TYPE") or "ISO").strip().upper() if exp else "ISO"
         kind = {"ORTHO": "ORTHO", "ORTHOTROPIC": "ORTHO", "ANISO": "ANISO",
                 "ANISOTROPIC": "ANISO"}.get(typ)
+        if kind == "ANISO" and id(exp[-1]) in self._expansion_as_ortho:
+            kind = "ORTHO"
         return (kind, exp[-1]) if kind else (None, None)
+
+    def _plan_expansion_as_ortho(self, blocks: List[Block]) -> None:
+        """The *EXPANSION, TYPE=ANISO cards that handle_expansion writes as TYPE=ORTHO: those
+        whose shear coefficients alpha12, alpha13, alpha23 are zero in every row, unless a
+        section or composite ply that uses the material turns its axes so that the expansion
+        has shear in global axes.  Both types give the same thermal strain in linear steps,
+        but in NLGEOM steps of a deck with temperatures ccx 2.23 stops on any TYPE=ANISO
+        expansion with 'too many cutbacks', while it computes TYPE=ORTHO exactly in such axes
+        (probed: a free heated cube; see _check_nlgeom_expansion).  In turned axes it would
+        drop the turned shear of TYPE=ORTHO there without an error, so such a card stays
+        ANISO and those steps fail loudly.  With USER the data lines hold no coefficients."""
+        self._expansion_as_ortho = {}
+        uses: Optional[List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]] = None
+        for group in self._material_groups(blocks):
+            name = (group[0].param("NAME") or "").strip()
+            for exp in group:
+                if exp.keyword != "EXPANSION" or exp.has("USER") or \
+                        (exp.param("TYPE") or "").strip().upper() not in ("ANISO", "ANISOTROPIC"):
+                    continue
+                rows = material_rows(exp, 6)
+                try:
+                    if not rows or any(pf(x) for r in rows for x in r[3:6] if x) or \
+                            not all(math.isfinite(pf(x)) for r in rows for x in r if x):
+                        continue
+                except ValueError:                  # a distribution name, a parameter, ...
+                    continue
+                if uses is None:
+                    uses = self._material_uses(blocks)
+                if not any(mat == name.upper() and self._expansion_shear(exp, axes)
+                           for mat, axes in uses):
+                    self._expansion_as_ortho[id(exp)] = name
+
+    def handle_expansion(self, b: Block) -> List[str]:
+        """``*EXPANSION``: DEPENDENCIES= collapsed (handle_dependent_material), and an
+        anisotropic one without shear coefficients written as TYPE=ORTHO (alpha11, alpha22,
+        alpha33[, temperature]) where _plan_expansion_as_ortho chose it."""
+        out = self.handle_dependent_material(b)
+        mat = self._expansion_as_ortho.get(id(b))
+        if mat is None:
+            return out
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict(
+            (k, "ORTHO" if k == "TYPE" else v) for k, v in b.params.items() if k != "DEPENDENCIES")
+        lines = [emit_keyword(b.keyword, params)]
+        for ln in out[1:]:                          # one row per line, also once collapsed
+            f = [x.strip() for x in ln.split(",")]
+            f = f[:3] + f[6:]
+            while len(f) > 1 and f[-1] == "":
+                f.pop()
+            lines.append(", ".join(f))
+        self.report.note(f"Material {mat}: *EXPANSION, TYPE=ANISO without shear coefficients "
+                         f"written as TYPE=ORTHO, the same thermal strain: in NLGEOM steps of a "
+                         f"deck with temperatures ccx 2.23 stops on any TYPE=ANISO expansion with "
+                         f"'too many cutbacks', but computes TYPE=ORTHO right where no "
+                         f"*ORIENTATION or ply angle turns the material axes so that it has shear "
+                         f"in global axes, as here.", once=True)
+        return lines
 
     def _plan_elastic_expansion(self, blocks: List[Block]) -> None:
         """The *ELASTIC cards whose material has an orthotropic or anisotropic *EXPANSION,
@@ -2819,6 +2895,8 @@ class Converter:
         * it builds the thermal deformation gradient of a TYPE=ANISO expansion from the wrong
           array, and the step stops with 'too many cutbacks' once the deck has temperatures,
           with or without an *ORIENTATION and even when the temperature does not change.
+          One without shear coefficients goes out as TYPE=ORTHO where its axes are not
+          turned (_plan_expansion_as_ortho), and is checked as such.
 
         Linear steps and NLGEOM=NO are right; the CalculiX sources changed both routines in
         October 2026, after 2.23.  Decks without temperatures have no thermal strain."""
@@ -2846,31 +2924,14 @@ class Converter:
                 kinds[name.upper()] = (kind, exp, name)
         if not kinds:
             return
-        oris = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "ORIENTATION"}
-        uses: List[Tuple[str, str, float]] = []             # (material, orientation, ply angle)
-        for b in blocks:
-            if not b.keyword.endswith("SECTION"):
-                continue
-            base = (b.param("ORIENTATION") or "").strip().upper()
-            if b.has("COMPOSITE") and b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION"):
-                for rec in merged_data_records(b):  # thickness, points, material, angle or name
-                    ply = rec[3] if len(rec) > 3 else ""
-                    if len(rec) < 3 or not rec[2]:
-                        continue
-                    try:
-                        uses.append((rec[2].upper(), base, pf(ply) if ply else 0.0))
-                    except ValueError:
-                        uses.append((rec[2].upper(), ply.upper(), 0.0))
-            elif b.param("MATERIAL"):
-                uses.append(((b.param("MATERIAL") or "").strip().upper(), base, 0.0))
         ortho: List[str] = []
         aniso: List[str] = []
-        for mat, ori, angle in uses:
+        for mat, axes in self._material_uses(blocks):
             kind, exp, name = kinds.get(mat, ("", None, ""))
             if kind == "ANISO" and name not in aniso:
                 aniso.append(name)
             elif kind == "ORTHO" and changes and exp is not None and name not in ortho and \
-                    self._expansion_shear(exp, self._material_axes(oris, ori, angle)):
+                    self._expansion_shear(exp, axes):
                 ortho.append(name)
 
         def names(ms: List[str]) -> str:
@@ -2893,9 +2954,35 @@ class Converter:
                              f"and temperatures. ccx 2.23 builds the thermal deformation gradient of "
                              f"an anisotropic expansion wrongly in NLGEOM steps, so they stop with "
                              f"'too many cutbacks' — with or without an *ORIENTATION, and even where "
-                             f"the temperature does not change. Linear steps are right; an expansion "
-                             f"without shear coefficients runs as TYPE=ORTHO when no *ORIENTATION "
-                             f"turns it.", once=True)
+                             f"the temperature does not change. Linear steps are right. An "
+                             f"expansion without shear coefficients is written as TYPE=ORTHO, which "
+                             f"ccx 2.23 computes right, except where an *ORIENTATION or a composite "
+                             f"ply angle turns it so that it has shear in global axes: TYPE=ORTHO "
+                             f"would lose that shear there without an error.", once=True)
+
+    def _material_uses(self, blocks: List[Block]) -> List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]:
+        """``(MATERIAL, axes)`` for every section and composite ply (shell or solid) that uses
+        a material, its axes as _material_axes gives them (None where they vary)."""
+        oris = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "ORIENTATION"}
+        uses: List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]] = []
+        for b in blocks:
+            if not b.keyword.endswith("SECTION"):
+                continue
+            base = (b.param("ORIENTATION") or "").strip().upper()
+            if b.has("COMPOSITE"):
+                for rec in merged_data_records(b):  # thickness, points, material, angle or name
+                    ply = rec[3] if len(rec) > 3 else ""
+                    if len(rec) < 3 or not rec[2]:
+                        continue
+                    try:
+                        ori, angle = base, (pf(ply) if ply else 0.0)
+                    except ValueError:              # the ply names its own orientation
+                        ori, angle = ply.upper(), 0.0
+                    uses.append((rec[2].upper(), self._material_axes(oris, ori, angle)))
+            elif b.param("MATERIAL"):
+                uses.append(((b.param("MATERIAL") or "").strip().upper(),
+                             self._material_axes(oris, base, 0.0)))
+        return uses
 
     def _material_axes(self, oris: Dict[str, Block], name: str,
                        angle: float) -> Optional[Tuple[Vec, Vec, Vec]]:
@@ -2937,18 +3024,18 @@ class Converter:
 
     @staticmethod
     def _expansion_shear(exp: Block, axes: Optional[Tuple[Vec, Vec, Vec]]) -> bool:
-        """Whether the orthotropic *EXPANSION ``exp`` in material ``axes`` (None: axes that
-        vary) gives a thermal strain with shear in global axes at any of its temperature rows:
-        eps_ij = sum_k alpha_k a_ki a_kj for local axes a_k.  Unreadable data counts as
-        shear."""
-        rows: List[List[float]] = []
-        for rec in merged_data_records(exp):
-            try:
-                v = [pf(x) if x else 0.0 for x in rec[:3]]
-            except ValueError:
-                return True
-            if len(v) == 3:
-                rows.append(v)
+        """Whether the orthotropic *EXPANSION ``exp`` (or an anisotropic one by its normal
+        coefficients) in material ``axes`` (None: axes that vary) gives a thermal strain with
+        shear in global axes at any of its temperature rows: eps_ij = sum_k alpha_k a_ki a_kj
+        for local axes a_k.  Unreadable data counts as shear."""
+        aniso = (exp.param("TYPE") or "").strip().upper() in ("ANISO", "ANISOTROPIC")
+        recs = material_rows(exp, 6 if aniso else 3)
+        if recs is None:
+            return True
+        try:
+            rows = [[pf(x) if x else 0.0 for x in r[:3]] for r in recs]
+        except ValueError:
+            return True
         for a in rows or [[1.0, 2.0, 3.0]]:
             tol = 1e-9 * max(abs(x) for x in a)
             if axes is None:
@@ -6342,6 +6429,7 @@ class Converter:
             elif b.keyword in ("STEP", "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "NODE",
                                "ELEMENT"):
                 jc_block = None
+        self._plan_expansion_as_ortho(blocks)
         self._plan_elastic_expansion(blocks)
         self._check_nlgeom_expansion(blocks)
         # distributed loads that become nodal forces need the plane-section thickness, the

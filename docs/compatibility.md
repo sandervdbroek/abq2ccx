@@ -134,18 +134,32 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
   * it builds the thermal deformation gradient of a `TYPE=ANISO` expansion from the wrong
     array, so the step stops with "too many cutbacks" — with or without an `*ORIENTATION`,
     as soon as the deck has temperatures, even for a pulled cube whose temperature never
-    changes;
+    changes. A `TYPE=ORTHO` expansion with the same α11, α22, α33 runs, and is exact where
+    no orientation turns it so that it has shear in global axes: a free heated C3D8 with
+    α = 1e-3, 2e-3, 4e-3 strains ((1 + α ΔT)² − 1) / 2 to 1e-15 at ΔT = 1, 10 and 100
+    (0.105, 0.22, 0.48 at 100), also with temperature rows, a collapsed `DEPENDENCIES`
+    table, engineering-constants elasticity and an identity `*ORIENTATION`, and one held in
+    x matches the multiplicative split with St. Venant–Kirchhoff elasticity to the digits
+    ccx prints;
   * linear steps (also coupled and `*PLASTIC` ones) and `NLGEOM=NO` are right, and a deck
     without temperatures has no thermal strain to get wrong.
 
   The CalculiX sources changed both routines on 9–10 October 2026 (Dhondtguido/CalculiX
   commits 67faf64 and 2c609be), after 2.23 was posted on 2 November 2025; a build with
-  the change was not tried here. No form of the deck avoids it in 2.23, so the converter
-  only warns, once per kind and naming the materials, when a step has `NLGEOM` (an
-  explicit step counts unless it says `NLGEOM=NO`: the converter switches it on) and a
-  section or composite ply uses a material with an ORTHO expansion in axes turned so that
-  its thermal strain has shear in global axes, in a deck where the temperature changes,
-  or one with an ANISO expansion, in a deck with temperatures.
+  the change was not tried here. One case has an exact form that 2.23 runs: an ANISO
+  expansion whose shear coefficients α12, α13, α23 are zero in every row is the
+  orthotropic expansion α11, α22, α33, so the converter writes it as `TYPE=ORTHO` (a NOTE
+  per material; an isotropic `*ELASTIC` beside it then goes out as `ENGINEERING
+  CONSTANTS`, not `ANISO`: previous item) — unless a section or composite ply that uses
+  the material turns its axes so that the expansion has shear in global axes. There
+  ccx 2.23 would drop that shear from an ORTHO expansion without an error, while with an
+  ANISO one the step at least stops. Otherwise no form of the deck avoids it in 2.23, so
+  the converter only warns, once per kind and naming the materials, when a step has
+  `NLGEOM` (an explicit step counts unless it says `NLGEOM=NO`: the converter switches it
+  on) and a section or composite ply uses a material with an ORTHO expansion in axes
+  turned so that its thermal strain has shear in global axes, in a deck where the
+  temperature changes, or one with an ANISO expansion (with shear coefficients, or turned
+  so), in a deck with temperatures.
 * No 2.24 exists as of October 2026.
 * A few cards are version-gated in older ccx (e.g. `*MEMBRANE SECTION` from 2.14, the
   `*ORIENTATION` rotation line from ~2.15, `C3D8R` hourglass control from 2.3). Check

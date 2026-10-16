@@ -25,7 +25,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (205)
+## 1. Unit tests — `tests/test_convert.py` (209)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -92,11 +92,15 @@ conversion behaviour and referential integrity.
 | `test_lamina_to_engineering_constants` | `*ELASTIC, TYPE=LAMINA` → `ENGINEERING CONSTANTS` (E3=E2, ν13=ν12, ν23 from G23) |
 | `test_iso_elastic_with_ortho_expansion_becomes_engineering_constants` | an isotropic `*ELASTIC` beside `*EXPANSION, TYPE=ORTHO` → `ENGINEERING CONSTANTS` with the same stiffness (G = E/2(1+ν)) and a NOTE; it is left alone beside an isotropic expansion, as are engineering constants beside an ORTHO one |
 | `test_iso_elastic_temperature_rows_for_ortho_expansion` | temperature columns kept; E alone varying needs no extra rows; E and ν varying get rows (E, ν linear in T) until the linearly interpolated stiffness is within 1e-4 between them |
-| `test_elastic_for_aniso_expansion_becomes_aniso` | isotropic, engineering-constants and `LAMINA` `*ELASTIC` beside `TYPE=ANISO` → `TYPE=ANISO` (8/8/5 + T lines); the engineering constants' normal block inverts back to their compliance, the G's sit at D1212/D1313/D2323 |
+| `test_elastic_for_aniso_expansion_becomes_aniso` | isotropic, engineering-constants and `LAMINA` `*ELASTIC` beside a `TYPE=ANISO` expansion with a shear coefficient → `TYPE=ANISO` (8/8/5 + T lines); the engineering constants' normal block inverts back to their compliance, the G's sit at D1212/D1313/D2323 |
 | `test_elastic_left_alone_beside_expansion` | a kept `*PLASTIC` (ccx's nonlinear path) leaves the material alone, a commented-out one does not; an expansion affects only its own material; ν ≥ 0.5 is not rewritten and warned |
 | `test_nlgeom_turned_ortho_expansion_warned` | an `*EXPANSION, TYPE=ORTHO` whose axes an `*ORIENTATION` turns (by its points or its rotation line) is warned in a deck with an `NLGEOM` step (also `NLGEOM=YES`, an explicit step, a coupled step before an `NLGEOM` one) and a temperature change; not for a linear step, `NLGEOM=NO`, no orientation, axes only permuted, an isotropic expansion, coefficients equal across the turn, no temperature change or no temperatures; a temperature row with unequal coefficients and a cylindrical system are warned |
-| `test_nlgeom_aniso_expansion_warned` | an `*EXPANSION, TYPE=ANISO` is warned in a deck with an `NLGEOM` step and temperatures, turned or not and without a temperature change; not in linear steps, without temperatures, or on a material no section uses |
+| `test_nlgeom_aniso_expansion_warned` | an `*EXPANSION, TYPE=ANISO` is warned in a deck with an `NLGEOM` step and temperatures, turned or not and without a temperature change; not in linear steps, without temperatures, or on a material no section uses; one without shear coefficients only where it is turned |
 | `test_nlgeom_expansion_composite_plies` | composite plies: a 45° ply, a ply naming a turned orientation and a turned section orientation are warned; 0/90/−90° plies and a −30° ply on a section orientation turned +30° are not |
+| `test_aniso_expansion_without_shear_written_as_ortho` | an `*EXPANSION, TYPE=ANISO` (or `ANISOTROPIC`) whose shear coefficients are zero, blank or −0 goes out as `TYPE=ORTHO` (α11, α22, α33; `ZERO=` kept) with a NOTE per material, the isotropic `*ELASTIC` beside it as `ENGINEERING CONSTANTS` (engineering constants stay as given), and no `NLGEOM` warning; also under the identity orientation, a permutation, a turn about the axis of two equal coefficients, and on a material no section uses |
+| `test_aniso_expansion_kept_when_turned` | it stays `TYPE=ANISO` (its isotropic `*ELASTIC` → `ANISO`) and is warned under `NLGEOM` where an orientation turns it so that it has shear in global axes — by its points, its rotation line or a cylindrical system — also when only one of two sections does, or a composite ply (45°, or naming a turned orientation); 0/90° plies are rewritten |
+| `test_aniso_expansion_with_shear_kept` | it stays `TYPE=ANISO` where any row has a shear coefficient (also only a later temperature row), where the data are no coefficients (a distribution name, `nan`), and with `USER` |
+| `test_aniso_expansion_as_ortho_rows_and_dependencies` | temperature rows keep their temperatures; with `DEPENDENCIES=1` and `=2` (two lines a row) the field columns are not taken for shear coefficients and the rows are collapsed to field = 0 before the shear columns go; a shear coefficient in any field state keeps the card ANISO |
 | `test_beam_section_unsupported_profile_commented` | `*BEAM SECTION, SECTION=I` (no ccx profile) is commented out with guidance |
 | `test_equally_spaced_amplitude_expanded` | `DEFINITION=EQUALLY SPACED` expands to explicit time/amplitude pairs |
 | `test_assembly_elset_element_member_uses_elem_offset` | an assembly `*Elset` member `I2.1` takes the element offset |
@@ -343,7 +347,8 @@ deck and runs it in CalculiX:
   an orthotropic or anisotropic `*Expansion`, whose stiffness ccx 2.23 gets wrong in linear
   steps once temperatures are defined (the converter writes the `*Elastic` as
   `ENGINEERING CONSTANTS` / `ANISO`): a free cube with its material system turned 30° about
-  z and a free one with an ANISO expansion, against the analytic strain R diag(α ΔT) Rᵀ
+  z and a free one with an ANISO expansion (no shear coefficients, unturned: it goes out as
+  `TYPE=ORTHO` beside engineering constants), against the analytic strain R diag(α ΔT) Rᵀ
   (exact), and a cube held in x whose E and ν vary strongly with temperature, read at
   T = 90 between the given rows: σ_xx = −1.71000 vs −E α_x ΔT = −1.71 and ε_yy, ε_zz within
   1e-6. Converted without the rewrite, the free cubes shrink (a displacement of −964 where
@@ -884,6 +889,29 @@ probe decks it fires on every run ccx got wrong and on no other. Of the four cor
 with an ORTHO expansion only `alexasafonov_pultrusion` has `NLGEOM` steps (coupled, with
 temperatures), and its orientation is the global axes (`1,0,0, 0,1,0` with a 0°
 rotation): not warned.
+
+**An anisotropic expansion without shear coefficients as `TYPE=ORTHO`.** One case of the
+above has an exact form ccx 2.23 runs: an `*EXPANSION, TYPE=ANISO` whose α12, α13, α23 are
+zero in every row is the orthotropic expansion α11, α22, α33, and `TYPE=ORTHO` is exact
+under `NLGEOM` where no orientation turns it so that it has shear in global axes. The
+converter now writes such a card as ORTHO (`_plan_expansion_as_ortho`, `handle_expansion`;
+the isotropic `*ELASTIC` beside it then goes out as engineering constants, not `ANISO`),
+and leaves it ANISO where a section or composite ply turns it so — as ORTHO it would run
+and silently lose the turned shear. Probed with a free heated C3D8 (E = 1000, ν = 0.2,
+α = 1e-3, 2e-3, 4e-3, held 3-2-1; the Green-Lagrange strain from the corner displacements,
+runs judged with `classify_ccx_run`), each deck converted before and after the change, 32
+runs: as ANISO every `NLGEOM` run stops with "too many cutbacks"; as ORTHO every one solves
+with ((1 + α ΔT)² − 1) / 2 to 1e-15 — ΔT = 1, 10 and 100 (0.105, 0.22, 0.48 at 100), blank
+shear fields under `TYPE=ANISOTROPIC`, temperature rows (α interpolated at T = 50: 0.105,
+0.16125, 0.28125), a `DEPENDENCIES=1` table collapsed to field 0, engineering-constants
+elasticity, a `*PLASTIC` material (its isotropic `*ELASTIC` left as given), an identity
+orientation, a 2 × 2 × 2 C3D20R cube. Held in x at ΔT = 100 it
+stretches by 0.2206488 and 0.4240903 in y and z with σ_xx = −76.24165, the multiplicative
+split F = F_m (I + α ΔT) with St. Venant–Kirchhoff elasticity in F_m to the 7 digits ccx
+prints (0.2206488, 0.4240902, −76.2417), and with α1 = α2 = α3 exactly as an isotropic
+expansion. A linear step gives α ΔT either way. Turned 30° about z the card stays ANISO:
+the `NLGEOM` run still stops, the linear one is exact (R diag(α ΔT) Rᵀ). No corpus deck
+has an ANISO expansion; all 1073 corpus files convert byte-identically.
 
 **Hollow solves: loads that did not survive the conversion.** A solve only counts if the
 model carries the deck's loads. A load audit (`step_load_audit`, run on the Abaqus deck and

@@ -155,11 +155,13 @@ These are the silent ones — no error, wrong physics.
   element and procedure, `*PLASTIC` and explicit dynamics included. An `*EXPANSION,
   TYPE=ANISO` makes `NLGEOM` steps stop with "too many cutbacks" as soon as the deck has
   temperatures, turned or not, even where the temperature never changes. Linear steps are
-  right, and no form of the deck avoids either in 2.23 (the CalculiX sources fixed both
-  in October 2026), so the converter only warns, naming the materials: check one
-  element's thermal strain against a hand calculation, or keep the thermal load out of
-  `NLGEOM` steps where that is acceptable. An ANISO expansion without shear coefficients
-  can be given as `TYPE=ORTHO` if no `*ORIENTATION` turns it.
+  right. An ANISO expansion without shear coefficients is written as `TYPE=ORTHO` (a NOTE
+  per material), which runs and is exact — unless an `*ORIENTATION` or a ply angle turns
+  it so that it has shear in global axes: there ORTHO would lose that shear silently, so
+  it stays ANISO and is warned. For the rest no form of the deck avoids either in 2.23
+  (the CalculiX sources fixed both in October 2026), so the converter only warns, naming
+  the materials: check one element's thermal strain against a hand calculation, or keep
+  the thermal load out of `NLGEOM` steps where that is acceptable.
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=` and would use the
   first table row; the converter keeps the Abaqus no-field state (field = 0) and warns.
 * **Per-element (`*DISTRIBUTION`) orientations quietly collapse to one.** ccx 2.23 gives

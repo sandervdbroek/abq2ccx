@@ -294,6 +294,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*NGEN/*NFILL/*NCOPY/*ELGEN/*ELCOPY` | explicit `*NODE`/`*ELEMENT` | no mesh-generation in ccx |
 | `*PART/*INSTANCE/*ASSEMBLY` | flattened, one global numbering | instance transform applied; `inst.node`/`inst.set` resolved |
 | `*ELASTIC, ORTHOTROPIC/ANISOTROPIC` | `ORTHO`/`ANISO` | same constant order |
+| `*EXPANSION, TYPE=ANISO` without shear coefficients | `TYPE=ORTHO` (α11, α22, α33) | the same thermal strain; ccx 2.23 stops `NLGEOM` steps on any ANISO expansion once the deck has temperatures ("too many cutbacks") but computes ORTHO exactly; kept ANISO where an `*ORIENTATION` or ply angle turns it so that it has shear in global axes (ORTHO would silently lose that shear there) |
 | `*ELASTIC` less anisotropic than the material's `*EXPANSION` | isotropic beside `ORTHO` → `ENGINEERING CONSTANTS`; isotropic / orthotropic / engineering constants beside `ANISO` → `ANISO` | same stiffness; otherwise ccx 2.23 uses a wrong stiffness in linear steps once the deck has temperatures (thermal strains, displacements and frequencies all off); temperature rows added so the stiffness interpolation matches Abaqus' to 1e-4; materials with `*PLASTIC`/`*CREEP` left alone |
 | `*ORIENTATION` | `*ORIENTATION` | origin `c` subtracted (axes `a−c`, `b−c`); `DEFINITION=NODES` resolved; `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
 | `*DISTRIBUTION` (per-element orientation) | solids: resolved per element; shells/membranes: one `*ORIENTATION` + section per direction | ccx 2.23 honours a distribution only under `*SOLID SECTION` (default line first, rotation line on the first line only, origin ignored) and gives a shell section its first line; one distribution per orientation; other distributions commented |
@@ -527,7 +528,9 @@ converter warns about the ones it can detect; the rest are here so you know to c
 * Thermal expansion under `NLGEOM`: ccx 2.23 silently loses the shear part of an
   orthotropic `*EXPANSION` whose axes an `*ORIENTATION` or a composite ply angle turns off
   the global axes, and stops with "too many cutbacks" on any `TYPE=ANISO` expansion once the
-  deck has temperatures (linear steps are right). No form of the deck avoids it — the
+  deck has temperatures (linear steps are right). An ANISO expansion without shear
+  coefficients is written as `TYPE=ORTHO`, which runs, where no orientation turns it so
+  that it has shear in global axes; for the rest no form of the deck avoids it — the
   CalculiX sources fixed both after 2.23 — so the converter warns, naming the materials.
 * Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
