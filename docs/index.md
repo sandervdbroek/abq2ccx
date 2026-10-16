@@ -1,47 +1,27 @@
 # abq2ccx documentation
 
-`abq2ccx.py` converts Abaqus `.inp` decks to CalculiX (`ccx`) `.inp` decks. Start with
-the [project README](../README.md) for the overview; this folder is the detailed
-reference.
+`abq2ccx.py` converts Abaqus `.inp` decks to CalculiX (`ccx`) decks. The
+[README](../README.md) is the overview; these pages are the reference.
 
-## Contents
+* **[User guide](user-guide.md)** — options, `--approximate`, workflow, reading the report,
+  the names the converter adds, the Python API.
+* **[Troubleshooting](troubleshooting.md)** — ccx errors and results that look wrong, with
+  causes and fixes.
+* **[Compatibility](compatibility.md)** — the Abaqus and CalculiX facts the converter relies
+  on and their evidence, ccx 2.23 issues, and what does not convert.
+* **[Testing](testing.md)** — unit tests, the end-to-end checks in ccx, and the corpus of
+  1022 real decks.
+* **[Architecture & developer guide](architecture.md)** — the pipeline, the data model, and
+  how to extend the tables and handlers.
+* **[Changelog](../CHANGELOG.md)** — what changed, release by release.
 
-* **[User guide](user-guide.md)** — install, command line, options, workflow, reading
-  the conversion report, and using the converter as a Python module.
-* **[Troubleshooting](troubleshooting.md)** — CalculiX runtime errors and silent-physics
-  gotchas, with causes and fixes.
-* **[Architecture & developer guide](architecture.md)** — the conversion pipeline, the
-  data model, and how to extend the keyword/element/output tables.
-* **[Testing](testing.md)** — the three test layers (unit, end-to-end ccx, real-world
-  corpus) with a description of each test.
-* **[Compatibility & sources](compatibility.md)** — the verified facts the converter
-  relies on, version notes, and where they come from. Includes the **end-to-end
-  validation** against the NAFEMS LE10 benchmark (run it with
-  `python validate_with_ccx.py`) and a **compatibility-limits audit** of what doesn't
-  convert/solve and why (fundamental ccx limits vs. incomplete decks vs. addressable).
+## Generated references
 
-### Generated references (from the code — never out of date)
+Built from the code by `python docs/generate_reference.py` (run it after changing the
+tables; edit the generator, not these files):
 
-* **[Keyword reference](keyword-reference.md)** — every keyword and exactly how it is
-  handled.
-* **[Element reference](element-reference.md)** — every element type, node count, and
+* **[Keyword reference](keyword-reference.md)** — every keyword and how it is handled.
+* **[Element reference](element-reference.md)** — every element type, its node count and
   CalculiX mapping.
-* **[Output-variable reference](output-reference.md)** — output identifier mapping.
-
-Regenerate the three reference files after editing the code with:
-
-```bash
-python docs/generate_reference.py
-```
-
-## At a glance
-
-* One dependency-free Python 3 script; no install.
-* Knows the complete CalculiX 2.22 + 2.23 keyword set; supported cards pass through,
-  unsupported ones are converted to an equivalent or commented with guidance — never
-  silently dropped.
-* Expands mesh-generation cards (`*NCOPY`/`*ELGEN`/…) and flattens
-  `*PART`/`*INSTANCE`/`*ASSEMBLY`.
-* Node and face numbering are verified identical to Abaqus, so connectivity and
-  pressure-face labels pass through unchanged.
-* Validates *structure*, not *physics* — always run `ccx` and sanity-check.
+* **[Output-variable reference](output-reference.md)** — output identifiers and Abaqus'
+  preselected output.

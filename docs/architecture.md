@@ -182,9 +182,12 @@ so the converter does it in three places, each exact:
   held at zero in every step, eliminates connector-only rotations, turns one-DOF rows into
   `*BOUNDARY` lines (repeated after any `OP=NEW`) and keeps under `NLGEOM` only the rows
   that stay exact there; `handle_connector_section()` writes them.
-* `_plan_implied_spcs()` finds zero BCs on rigid-body members that the body already holds
-  (reference node fixed in that DOF and unable to rotate, in every step the BC is in force,
-  `bc_steps()`); `handle_boundary()` leaves them out.
+* `_plan_coupled_bcs()` (in `_prescan`) finds BCs on rigid-constraint members that the
+  reference node's own BCs impose anyway (the same value, no rotation about the other axes
+  while the BC is in force, `bc_steps()`) and takes them off the card; a `*RIGID BODY`'s
+  other member BCs move to its reference node where Abaqus/Standard puts them
+  (`_plan_rigid_body_move()`), and the rest is warned (`_warn_coupled_clashes()`) or, with
+  `--approximate`, dropped where Abaqus drops it. `handle_boundary()` applies the plan.
 * `_settle_dependents()` runs on the finished output: it collects the BCs per step and the
   DOFs ccx eliminates itself, assigns each `*EQUATION` a free DOF by bipartite matching
   (original first term preferred), then accepts the equations in deck order reducing each
@@ -231,9 +234,9 @@ They are plain functions (easy to unit-test) and use the vector helpers
 top-level, parses each part's geometry once, then for every instance offsets the
 node/element ids, applies the instance transform (**translation then rotation**, per
 Abaqus), and emits per-instance geometry/sets/sections. `make_namer()` produces
-`≤20`-character, collision-free set/surface names used consistently by both the
-definitions and the reference-resolver (`resolve()` / `_resolve_field()`), so nothing
-de-syncs. Set this against CalculiX's 20-significant-character name limit.
+collision-free set/surface names within CalculiX's 80-character limit (`CCX_NAME_LIMIT`),
+used consistently by both the definitions and the reference resolver (`resolve()` /
+`_resolve_field()`), so nothing de-syncs.
 
 ## Regenerating the reference docs
 
@@ -247,44 +250,7 @@ Run it after changing any of the tables above so the docs stay in sync.
 
 ## Testing
 
-```bash
-python tests/test_convert.py        # or: pytest tests/
-```
-
-Tests convert the bundled example decks and assert referential consistency plus the
-documented behaviours. When you add a feature, add a focused test next to the existing
-ones (`convert_str(...)` builds a deck from an inline string).
-
-For end-to-end validation against a real solver:
-
-```bash
-python validate_with_ccx.py     # converts + runs the examples in CalculiX
-```
-
-It auto-detects `ccx` (including FreeCAD's bundled binary), runs the example decks, and
-checks the NAFEMS LE10 benchmark stress against the published reference (and with its
-pressure carried by surface elements against the face-pressure result), the tip
-deflections of circular-, pipe- and box-section cantilevers, circular-section beams with
-rotational BCs and in an explicit dynamic step, planar beams' frequencies and buckling
-loads against beam theory, a clamped beam and plate across a later step's
-`*BOUNDARY, OP=NEW`, the loads applied as consistent nodal forces (Cook's membrane,
-beam line loads, Lamé's cylinder, and tractions on nodes with a `*TRANSFORM` against the
-same models without one), and the field output Abaqus preselects (a bar in tension, an
-explicit bar impact without output requests against wave theory, and the contact pressure
-of two blocks pressed together). It skips cleanly if no
-`ccx` is found.
-
-There is also a **corpus** of 1022 genuine Abaqus decks (`corpus/manifest.py`) fetched on
-demand and tested end-to-end:
-
-```bash
-python corpus/fetch.py          # download to corpus/files/ (gitignored)
-python tests/test_corpus.py     # convert all + (if ccx) solve the ones expected to
-```
-
-`tests/test_corpus.py` asserts every deck converts with zero dangling references, that
-decks marked `expect_solve` keep a load in every step their Abaqus deck loads (the load
-audit) and actually solve in ccx (clean exit, no crash, an analysis step runs), while
-mesh-only `parse_only` decks are accepted. To add a deck, append an entry
-to `corpus/manifest.py`. The complete test suite — unit, end-to-end, and corpus, with a
-description of each test — is documented in [testing.md](testing.md).
+When you add a feature, add a focused test to `tests/test_convert.py` next to the existing
+ones (`convert_str(text)` converts an inline deck), an example plus a check in
+`validate_with_ccx.py` when the result can be compared with a reference, and run the corpus.
+[Testing](testing.md) describes the three layers and the gates a change must pass.

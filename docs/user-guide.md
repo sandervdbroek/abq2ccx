@@ -1,134 +1,145 @@
 # User guide
 
-How to install, run, and interpret the output of `abq2ccx.py`.
-
 ## Requirements
 
-* Python 3.7+ (standard library only — no packages to install).
-* To *run* the result you need CalculiX (`ccx`); the converter does not require it.
-
-The whole tool is one file. Copy `abq2ccx.py` anywhere, or run it from the repo.
+* Python 3.7 or later, standard library only. The whole tool is `abq2ccx.py`; copy it
+  anywhere or run it from the repository.
+* CalculiX (`ccx`) only to run the result. `--run` and `validate_with_ccx.py` look for it on
+  `PATH`, in FreeCAD's bundle (FreeCAD 1.1.4 ships ccx 2.23) and in Homebrew/MacPorts;
+  `--run` also takes `--ccx PATH` or `$CCX`.
 
 ## Command line
 
 ```bash
-python abq2ccx.py INPUT.inp [options]
+python abq2ccx.py INPUT.inp [INPUT.inp ...] [options]     # glob patterns allowed
 ```
 
 | Option | Effect |
 | --- | --- |
-| `-o, --output FILE` | output path (default: `<input>_ccx.inp`) |
-| `--solid-dof` | expand `ENCASTRE`/`PINNED`/`*SYMM` using translational DOFs 1–3 only — use for solid-only models that have no rotational DOFs |
-| `--no-log` | do not write the `<output>.log` report file |
-| `--quiet` | do not print the report to stderr |
-| `-h, --help` | usage |
+| `-o, --output FILE` | output file (one input only; default `<input>_ccx.inp`) |
+| `--outdir DIR` | write the outputs, under their default names, into `DIR` |
+| `--solid-dof` | expand `ENCASTRE`/`PINNED`/`*SYMM` to DOFs 1–3 only (solid-only models) |
+| `--approximate` | allow the physics approximations [below](#--approximate), each flagged `[APPROX]` |
+| `--check` | parse, convert and report; write nothing |
+| `--strict` | exit 3 if the conversion produced warnings or commented-out cards |
+| `--json` | print a machine-readable report on stdout |
+| `--run` | run CalculiX on the result |
+| `--ccx PATH` | the CalculiX executable for `--run` (`$CCX` works too) |
+| `--no-log`, `--quiet` | write no `.log` file; print no report on stderr |
+| `--version`, `-h` | version; help |
 
-Outputs:
+**Exit codes:** `0` converted · `1` cannot read or write, or `--run` failed · `2` usage
+error · `3` `--strict` findings · `4` internal conversion error. `--run` fails when ccx
+stops with an `*ERROR`, crashes, or writes NaN/Inf results — ccx 2.23 ends a diverged
+solution with "Job finished" all the same, so `--run` reads the results and names the first
+NaN/Inf value.
 
-* `<output>.inp` — the CalculiX deck. The conversion report is also reproduced as
-  `**` comments at the very top of this file.
-* `<output>.log` — the same report as plain text (unless `--no-log`).
-* stderr — a one-line summary (`N nodes, M elements, K warnings`) plus the report
-  (unless `--quiet`).
+**Outputs:** `<output>.inp`, the CalculiX deck, with the report as `**` comments at the
+top; `<output>.log`, the same report as text; and a one-line summary plus the report on
+stderr. Run the deck with `ccx <output>` (no `.inp` extension).
 
-### Examples
+## `--approximate`
 
-```bash
-python abq2ccx.py model.inp                      # -> model_ccx.inp + model_ccx.log
-python abq2ccx.py model.inp -o run/job.inp       # custom output path
-python abq2ccx.py solid_only.inp --solid-dof     # ENCASTRE -> DOF 1,2,3
-ccx model_ccx                                    # run it (note: no .inp extension)
-```
+Without it, a construct ccx cannot run exactly is commented out or warned, so ccx never runs
+a different model without saying so. With it, these reframings are made, each with an
+`[APPROX]` warning:
+
+* `*STATIC, RIKS` → a plain, load-controlled `*STATIC` (ccx has no arc-length method);
+* `*ELASTIC` with ν ≥ 0.5 → ν = 0.475 (ccx has no hybrid elements);
+* `*BEAM SECTION, SECTION=I` → the rectangle with the same area and strong-axis inertia;
+* surface tractions under NLGEOM that follow the surface or act per current area, and beam
+  line loads under NLGEOM → fixed nodal forces;
+* surface elements that carry mass or rebar → left out of the mesh;
+* a `*BOUNDARY` on DOFs that a kinematic coupling or `*MPC` eliminates → dropped, as
+  Abaqus/Standard ignores it; identical BCs on `*RIGID BODY` nodes → moved to the reference
+  node even where that holds the body more than the BCs did;
+* a connector under NLGEOM whose linear form is not exact (a hinge between two moving
+  bodies) → written in its linear form;
+* an `*MPC LINK` → ccx's distance MPC in a deck whose first step is linear and a later one
+  NLGEOM.
 
 ## Recommended workflow
 
-1. **Export a flat deck if you can.** In Abaqus/CAE, *Model → Edit Keywords* or the
-   input-file export option "Do not use parts and assemblies" produces a deck that
-   skips the `*PART`/`*INSTANCE`/`*ASSEMBLY` flattening step (which is best-effort).
-   The converter flattens assemblies for you, but a flat deck is lower-risk.
-2. **Convert** and **read the report.** Every `[WARNING]` and `[NOTE]` is there for a
-   reason — see [Reading the report](#reading-the-conversion-report) below.
-3. **Resolve commented cards.** Anything emitted as `** abq2ccx: …` has no CalculiX
-   equivalent and needs manual remodelling; the comment says how.
-4. **Run `ccx`** and sanity-check results. Field output (`*OUTPUT, FIELD`, and Abaqus'
-   preselected output — `VARIABLE=PRESELECT`, or a step without output requests — in the
-   ccx variables it has) is in `<job>.frd`; history output for a node or element set
-   (`*OUTPUT, HISTORY`) is printed
-   to `<job>.dat`, as are `.frd` node sets ccx cannot write there — beam and shell nodes
-   (ccx writes such models expanded to 3-D) and reference points. If it stops, see
-   [troubleshooting.md](troubleshooting.md). To confirm your toolchain end-to-end, run
-   `python validate_with_ccx.py` — it converts the bundled examples and runs them in
-   CalculiX (auto-detecting `ccx`, including FreeCAD's bundled copy), and checks the
-   NAFEMS LE10 benchmark stress against its reference value.
+1. **Export a flat deck if you can** (Abaqus/CAE: *Do not use parts and assemblies*). The
+   converter flattens assemblies, but a flat deck is the lower-risk input.
+2. **Convert and read the report.** Every `[WARNING]` and `[NOTE]` is there for a reason.
+3. **Resolve commented cards.** A card emitted as `** abq2ccx: …` has no CalculiX
+   equivalent and needs remodelling; the comment says how.
+4. **Run ccx and check the results.** Field output is in `<job>.frd`; history output for a
+   set is in `<job>.dat`, as are node sets the `.frd` cannot show (beam and shell nodes —
+   ccx writes such models expanded to 3-D — and reference points). If ccx stops, see
+   [troubleshooting](troubleshooting.md). `python validate_with_ccx.py` checks your ccx
+   end to end on the bundled examples.
 
 ## Reading the conversion report
 
-The report has two levels:
+* **`[NOTE]`** — a routine translation you should know about (a parameter dropped, a
+  variable renamed, a default applied). Usually nothing to do.
+* **`[WARNING]`** — something that may be wrong or needs your judgement: an element with no
+  exact equivalent, an unresolved overconstraint, a card commented out, a load that could not
+  be converted.
 
-* **`[NOTE]`** — a routine translation you should be aware of (a parameter dropped, a
-  variable renamed, a default applied). Usually no action needed.
-* **`[WARNING]`** — something that may be wrong or needs your judgement (an element
-  with no exact equivalent, a possible overconstraint, an unsupported card commented
-  out, a non-Cartesian system approximated).
+Messages are de-duplicated. A clean conversion says *"No conversion issues were flagged."*
 
-Messages are de-duplicated, so each distinct issue appears once no matter how many
-times it occurs. A clean conversion prints *"No conversion issues were flagged."*
-
-Common messages and what to do:
-
-| Message fragment | Meaning / action |
+| Message | Meaning and action |
 | --- | --- |
-| `Element X -> Y (… substitution)` | a node-count-preserving swap; verify Y is acceptable for your physics |
-| `… has NO CalculiX equivalent … emitted unchanged` | cohesive/gasket/rigid element — the deck won't run until you remodel it (connector elements are written as constraints instead; see `Connector …` notes) |
-| `*KEYWORD … emitted as a comment` | no equivalent; the original is preserved as `**` comments for you to edit |
-| `*BOUNDARY, TYPE=VELOCITY … whose displacement at the start of the step is unknown` | ccx prescribes total displacements, and that DOF was free (or under a USER/SUBMODEL BC) before: a zero velocity is converted to `*BOUNDARY, FIXED`, any other line is commented out — prescribe the motion as a displacement, or constrain the DOF in the earlier step |
-| `*BOUNDARY, TYPE=VELOCITY with a TABULAR amplitude in a dynamic step` | Abaqus/Standard smooths the velocity curve around its points (`SMOOTH`, default 0.25) so that the acceleration stays finite; the converter integrates the straight-line curve, so the displacement can differ near the points — give the amplitude `SMOOTH=0` in the Abaqus deck to compare like with like |
-| `*BOUNDARY, TYPE=ACCELERATION in a … step: the Abaqus manual says acceleration histories should not be used in static steps` | the converter still integrates it twice from the velocity at the step start, which Abaqus need not reproduce — prescribe a velocity or a displacement instead |
-| `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` sits on a DOF an `*EQUATION`, `*MPC` or rigid body eliminates, and the converter could not resolve it exactly (it reorders equation terms, drops redundant equations, leaves out BCs a rigid body already holds and moves identical ones on a `*RIGID BODY` to its reference node) — ccx will stop; remove one (the message says what Abaqus does and when `--approximate` resolves it) |
-| `*BOUNDARY taken off N DOF(s) that a rigid constraint …` | BCs on coupled nodes that the reference node's own BCs impose anyway were removed — exact; ccx cannot have both |
-| `*BOUNDARY on N DOF(s) of M *RIGID BODY node(s) moved to the reference node …` | identical BCs on rigid-body nodes were put on the reference node with zero rotations about the other axes, as Abaqus/Standard does — `Exact.` when the BC'd nodes hold the same; `[APPROX]` (only with `--approximate`) when the move holds the body more than they do |
-| `… member(s) reference undefined … removed` | a set had ids that don't exist; if the count is surprising, check upstream renumbering |
-| `Duplicate node/element id(s) …` | the deck defines an id twice; last one wins (as in Abaqus) |
-| `*ORIENTATION SYSTEM=SPHERICAL …` | ccx has no spherical system; emitted rectangular — verify |
+| `Element X -> Y (… substitution)` | a node-count-preserving swap; check that Y suits your physics |
+| `… has NO CalculiX equivalent … emitted unchanged` | a cohesive, gasket or rigid element; the deck won't run until it is remodelled |
+| `*KEYWORD … emitted as a comment` | no equivalent; the original is kept as `**` comments for you to edit |
+| `Step N is loaded in the Abaqus deck …, but no load survives the conversion` | every load of that step was commented out; ccx would solve it with no load — see the step's other warnings |
+| `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` on a DOF that an `*EQUATION`, `*MPC` or rigid body eliminates, which the converter could not resolve exactly; ccx will stop. The message says what Abaqus does and whether `--approximate` resolves it |
+| `*BOUNDARY taken off …` / `… moved to the reference node … Exact.` | BCs on rigid-constraint members resolved the way Abaqus does; nothing to do |
+| `*BOUNDARY, TYPE=VELOCITY … start of the step is unknown` | the DOF was free before the step, so its displacement there is unknown: a zero velocity became `*BOUNDARY, FIXED`, anything else was commented out — prescribe a displacement, or constrain the DOF in the earlier step |
+| `… member(s) reference undefined …` | a set named ids that don't exist; check upstream renumbering if the count surprises you |
+| `Duplicate node/element id(s) …` | the deck defines an id twice; the last one wins, as in Abaqus |
 
-## Using it as a Python module
+### Names the converter adds
+
+Everything the converter creates starts with `ABQ2CCX_`:
+
+| Name | What it is |
+| --- | --- |
+| `ABQ2CCX_ALL_NODES`, `ABQ2CCX_ALL_ELEMENTS` | whole-model sets (output requests without a set, default initial temperatures) |
+| `ABQ2CCX_KNOT` | the force-free *knot beams* on shell and beam nodes that carry rigid couplings or rotational BCs; ignore them in the results |
+| `ABQ2CCX_PLANAR` | the nodes of a planar model held in its plane |
+| `ABQ2CCX_RB*`, `ABQ2CCX_MPCB*`, `ABQ2CCX_KC*`, `ABQ2CCX_TIED*` | node sets and surfaces of rigid bodies, `*MPC BEAM` bodies, kinematic couplings and tied contact pairs |
+| `ABQ2CCX_BC*` | node subsets of a BC card that the converter partly moved or removed |
+| `ABQ2CCX_TR*`, `ABQ2CCX_OR*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles) |
+| `ABQ2CCX_VEL*`, `ABQ2CCX_ACC*` | amplitudes that integrate velocity and acceleration BCs |
+| `ABQ2CCX_TP*`, `ABQ2CCX_OUTPUT*` | generated `*TIME POINTS` and output node sets |
+
+Edit the Abaqus deck and convert again rather than editing these by hand.
+
+## Python API
 
 ```python
 import abq2ccx
 
-report = abq2ccx.Report()
-blocks = abq2ccx.read_blocks("model.inp", report)        # parse (+ *INCLUDE)
+result = abq2ccx.convert_file("model.inp", solid_dof=False, approximate=False)
+# or: abq2ccx.convert_text(deck_string, base_dir=".")  — *INCLUDE paths relative to base_dir
 
-class Opt:                                                # options object
-    solid_dof = False
-
-conv = abq2ccx.Converter(report, Opt())
-lines = conv.convert(blocks)                              # list[str] of ccx deck lines
-text = "\n".join(report.header_comment_lines() + lines)
-
-# inspect the parsed/expanded model
-print(len(conv.geom.nodes), "nodes,", len(conv.geom.elements), "elements")
-for level, msg in report.entries:
-    print(level, msg)
+result.text           # the converted deck, report header included
+result.body           # the deck lines without the header
+result.report         # .summary(), .entries: [(level, message)], .n_warnings, .n_notes
+result.geometry       # the flattened, expanded model: .nodes, .elements, .nsets, .elsets
+result.ok             # False if nothing could be converted
 ```
 
-`conv.geom` is the fully expanded, flattened geometry (`nodes`, `elements`, `nsets`,
-`elsets`), useful for your own checks or post-processing.
+The lower-level pieces are `read_blocks(path, report)` (parse, follow `*INCLUDE`) and
+`Converter(report, Options(solid_dof, approximate)).convert(blocks)`; the
+[architecture guide](architecture.md) describes them. `classify_ccx_run(returncode, stdout,
+stderr, job)` is the solve judge that `--run`, `validate_with_ccx.py` and the corpus tests
+share.
 
 ## What is and isn't converted
 
-For the exhaustive lists see the generated references:
+Static, frequency, buckling, implicit and explicit dynamic, steady-state dynamic, heat
+transfer and coupled temperature–displacement analyses of solids, shells and beams are well
+covered, with the common materials, orientations and composite layups, sets, surfaces, BCs,
+loads, ties, equations, couplings, rigid bodies and connectors without a behaviour. Contact
+is translated card by card, but ccx's penalty contact behaves differently — check it. User
+subroutines, connector behaviours, gaskets, inertia relief, Riks and some specialised
+materials and procedures have no equivalent and are flagged for manual work.
 
-* **[keyword-reference.md](keyword-reference.md)** — every keyword and its handling.
-* **[element-reference.md](element-reference.md)** — every element type and its mapping.
-* **[output-reference.md](output-reference.md)** — output-variable mapping.
-
-In short: linear/nonlinear **static, frequency, buckling, dynamic, heat-transfer**
-structural analyses with solids/shells/beams, the common materials, orientation and
-composite layups, sets/surfaces, BCs, loads, ties and equations are well covered, and
-**explicit dynamics** runs natively in ccx. **Contact** is translated card by card (type
-default, tied pairs → `*TIE`, constant friction) but ccx's penalty contact behaves
-differently — verify. **Connectors** without a behaviour become their constraint
-(`JOIN`, `HINGE`, `WELD`, `BEAM`, `LINK`, …); **connector behaviours, gaskets, cohesive
-elements, inertia relief, user subroutines (UMAT/VUMAT/UHARD/USDFLD), Riks and other
-specialised procedures** have no equivalent and are flagged for manual work.
+The generated references list every case: [keywords](keyword-reference.md),
+[elements](element-reference.md), [output variables](output-reference.md).
