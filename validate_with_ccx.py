@@ -7,11 +7,12 @@ bundled with FreeCAD) and checks results against reference values: the NAFEMS LE
 stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, a shell plate rigidly coupled to a loaded reference point against the same plate
 built from solids, circular-section beams with a held twist and a prescribed rotation
-against beam theory, the natural frequencies and buckling loads of planar (B21) beams with a
-rectangular and a circular section, per-element *DISTRIBUTION orientations (a C3D8 plate
-and a composite S8R panel) against the same models written with one orientation per element,
-a clamped beam and plate after a later step's *BOUNDARY, OP=NEW, and the thermal strains
-of isotropic materials with an orthotropic / anisotropic expansion.
+against beam theory, a circular-section beam in an explicit dynamic step against its
+static deflection, the natural frequencies and buckling loads of planar (B21) beams with
+a rectangular and a circular section, per-element *DISTRIBUTION orientations (a C3D8
+plate and a composite S8R panel) against the same models written with one orientation
+per element, a clamped beam and plate after a later step's *BOUNDARY, OP=NEW, and the
+thermal strains of isotropic materials with an orthotropic / anisotropic expansion.
 
     python validate_with_ccx.py
 
@@ -313,6 +314,33 @@ def main():
         ok = abs(u[1] - ref) / abs(ref) < 0.02
         print(f"{'PASS' if ok else 'FAIL'}  beam_circ_rotation_bcs ({label}): deflection = "
               f"{u[1]:+.4f} (beam theory {ref:+.4f}, {abs(u[1] - ref) / abs(ref) * 100:.1f}% diff)")
+        failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
+
+    # --- circular-section beam in an explicit dynamic step: end deflection vs beam theory ---
+    # ccx 2.23 sizes a circular-section beam's explicit increment as if the section were the
+    # box around the circle, about 1.3x its stable limit (the displacements turn NaN): this
+    # checks the maximum increment abq2ccx caps the step with.  The load rises smoothly over
+    # about three periods and is then held, so the beam ends near its static deflection;
+    # L / d = 12, so the reference includes shear (Timoshenko).
+    inp = os.path.join(tmp, "circexpl.inp")
+    convert(os.path.join(EXAMPLES, "beam_circ_explicit.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    e_mod, nu, r, length = 210000.0, 0.3, 10.0, 240.0
+    kappa = 6 * (1 + nu) / (7 + 6 * nu)
+    ref = -1000.0 * (length ** 3 / (48 * e_mod * math.pi * r ** 4 / 4)
+                     + length / (4 * kappa * e_mod / (2 * (1 + nu)) * math.pi * r ** 2))
+    u = dat_displacement(os.path.join(d, "job.dat"), 4) if status == "solved" else None
+    if u is None or not math.isfinite(u[1]):
+        print(f"FAIL  beam_circ_explicit: no finite mid-span deflection ({status}"
+              f"{', ' + str(u[1]) if u else ''})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        ok = abs(u[1] - ref) / abs(ref) < 0.03
+        print(f"{'PASS' if ok else 'FAIL'}  beam_circ_explicit (B31 + CIRC, *DYNAMIC, EXPLICIT): "
+              f"end deflection = {u[1]:+.4f} (beam theory {ref:+.4f}, "
+              f"{abs(u[1] - ref) / abs(ref) * 100:.1f}% diff)")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
 

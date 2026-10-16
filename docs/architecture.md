@@ -169,9 +169,9 @@ python validate_with_ccx.py     # converts + runs the examples in CalculiX
 It auto-detects `ccx` (including FreeCAD's bundled binary), runs the example decks, and
 checks the NAFEMS LE10 benchmark stress against the published reference, the tip
 deflections of circular-, pipe- and box-section cantilevers, circular-section beams with
-rotational BCs, planar beams' frequencies and buckling loads against beam theory, and a
-clamped beam and plate across a later step's `*BOUNDARY, OP=NEW`. It skips cleanly if no
-`ccx` is found.
+rotational BCs and in an explicit dynamic step, planar beams' frequencies and buckling
+loads against beam theory, and a clamped beam and plate across a later step's
+`*BOUNDARY, OP=NEW`. It skips cleanly if no `ccx` is found.
 
 There is also a **corpus** of 1022 genuine Abaqus decks (`corpus/manifest.py`) fetched on
 demand and tested end-to-end:

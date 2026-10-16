@@ -150,6 +150,13 @@ These are the silent ones — no error, wrong physics.
 * **Shells/beams are expanded to 3-D internally.** Add `OUTPUT=3D` to `*NODE FILE` to
   see the expanded geometry and through-thickness stress; otherwise the `.frd` looks
   "wrong." Results for non-axis-aligned beams with applied moments can be off.
+* **NaN displacements in an explicit step with circular-section beams.** ccx 2.23 sizes a
+  `CIRC` beam's stable increment as if its section were the box around the circle and runs
+  it at about 1.3× the limit. The converter caps every automatic `*DYNAMIC, EXPLICIT`
+  increment for such beams (the data line's 4th field; up to twice as many increments as
+  ccx alone would take) and warns about a fixed `DIRECT` increment above that cap — lower
+  it or drop `DIRECT`. Editing the deck by hand, keep the maximum increment at or below
+  0.12·d/c (d the section diameter, c the material's dilatational wave speed).
 * **`*TEMPERATURE` is not a thermal BC.** In a heat-transfer step, a *prescribed*
   temperature is `*BOUNDARY` on DOF 11; `*TEMPERATURE` only supplies the field that
   drives thermal expansion in a mechanical run. Watch K vs °C too.

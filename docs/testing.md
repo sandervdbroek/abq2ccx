@@ -6,10 +6,10 @@ The converter has three layers of tests:
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
    CalculiX, checking the NAFEMS LE10 benchmark, circular-, pipe- and box-section
-   cantilevers, circular-section beams with rotational BCs, planar beams' frequencies and
-   buckling loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate
-   across a later step's `*BOUNDARY, OP=NEW`, a rigidly coupled shell plate and the `*MPC`
-   conversions numerically.
+   cantilevers, circular-section beams with rotational BCs and in an explicit dynamic
+   step, planar beams' frequencies and buckling loads, per-element `*DISTRIBUTION`
+   orientations, a clamped beam and plate across a later step's `*BOUNDARY, OP=NEW`, a
+   rigidly coupled shell plate and the `*MPC` conversions numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -23,7 +23,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (163)
+## 1. Unit tests — `tests/test_convert.py` (166)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -101,6 +101,9 @@ conversion behaviour and referential integrity.
 | `test_initial_stress_geostatic_commented` | a `GEOSTATIC` initial stress (no ccx equivalent) is commented with guidance |
 | `test_approximate_riks_and_default_off` | without the flag `*STATIC, RIKS` is commented out (ccx would silently run plain static) and points at the flag; `--approximate` turns it into plain `*STATIC` |
 | `test_explicit_dynamics_native` | `*DYNAMIC, EXPLICIT` is kept in both modes (ccx integrates explicitly), Abaqus/Explicit-only controls dropped, and the step gets `INC=10000000` + `NLGEOM` |
+| `test_circ_beam_explicit_increment_capped` | an explicit step in a deck with `CIRC` beams gets a maximum increment (4th data field): ccx's own Courant estimate with h = min(element length, d/√2), the square through the section's corner nodes — ccx's h = min(l, √2·d) (the box around the circle) runs them at about 1.3× their stable increment (NaN); a larger deck maximum is lowered, a smaller one or a shorter step period kept; an element shorter than d/√2 sizes it by its length |
+| `test_circ_beam_explicit_increment_left_alone_or_warned` | implicit `*DYNAMIC` and `RECT` beams keep their data line; a fixed increment (`DIRECT USER CONTROL` → `DIRECT`) above the cap is warned (ccx's mass scaling for it is sized from the same overestimate); a `CIRC` material without a density is warned with the 0.12 d/c rule of thumb |
+| `test_beam_circ_explicit_example` | the bundled `beam_circ_explicit` deck gets the cap 4.17e-07 (ccx alone picks 8.3e-7), all `B32`, no dangling refs |
 | `test_approximate_nu_clamp` | `--approximate` clamps ν ≥ 0.5 to 0.475; without the flag ν is untouched |
 | `test_approximate_ibeam_to_rect` | `--approximate` replaces an I-profile with the RECT of equal area and strong-axis inertia |
 | `test_nonpositive_node_number_warns` | a mesh numbered from node 0 (invalid Abaqus input, issue #3) is flagged; a positive-numbered one is not |
@@ -227,6 +230,13 @@ deck and runs it in CalculiX:
   (without the converter's knot beams the first deflects 0.31 of beam theory, the second
   0.76); checks the mid-span deflection, −12.658 vs P L³/(48 E I) = −12.631 (0.2 %), and
   the tip deflection, +0.5004 vs θ L/2 = +0.5 (0.1 %).
+* **`beam_circ_explicit`** — a simply supported `B31` beam with a circular section
+  (L = 240, r = 10, six elements, each twice the diameter) in a `*DYNAMIC, EXPLICIT` step:
+  a mid-span load rises with a `SMOOTH STEP` over about three periods and is then held.
+  ccx 2.23 sizes a `CIRC` beam's stable increment as if its section were the box around
+  the circle and picks 8.3e-7, about 1.3× the limit: the displacements turn NaN. With the
+  converter's maximum increment of 4.17e-7 the beam ends at −0.1756 vs Timoshenko beam
+  theory −0.1773 (1.0 %; ccx's static solution of the same mesh is 0.992 of it).
 * **`planar_pinned_beam`** — a simply supported `B21` beam (rectangular section) with a
   `*FREQUENCY` and a `*BUCKLE` step. ccx runs `B21` as a 3-D `B31`, so this
   checks the planar constraint: the first two frequencies against beam theory, 93.67 and
@@ -510,10 +520,36 @@ on pinned supports gets its twist BC at an element's middle node instead, where 
 else changes: bending frequencies and buckling load as with the twist free, to 4 digits.
 Implicit `*DYNAMIC` turns rotational BCs into knots by itself (identical results with and
 without the knot beams); an explicit step stops on the density-free knot beams
-("*ERROR in calcstabletimeincvol"), so there it is only warned — ccx's explicit solver also
-returned NaN displacements for `CIRC` beams with no rotational BC at all. No corpus deck has
-such a BC, and every corpus deck converts byte-identically; `validate_with_ccx.py` checks
-both 3-D cases and the planar beam against beam theory.
+("*ERROR in calcstabletimeincvol"), so there it is only warned (the NaN displacements ccx's
+explicit solver gave `CIRC` beams even without such a BC have their own cause: below). No
+corpus deck has such a BC, and every corpus deck converts byte-identically;
+`validate_with_ccx.py` checks both 3-D cases and the planar beam against beam theory.
+
+**Circular-section beams in explicit dynamics.** Under `*DYNAMIC, EXPLICIT` ccx 2.23
+returned NaN displacements for `CIRC` beams (`B32` and `B32R`, with and without `NLGEOM`),
+where the same beam with a `RECT`, `PIPE` or `BOX` section runs. The cause is the stable
+increment ccx estimates (`calcstabletimeincvol`): per element critom·h·0.3/(2c) times a
+safety factor 0.8/1.3, with c the dilatational wave speed and h the smallest ratio of the
+one-point volume to a face area of the 20-node brick the beam expands into. A circular
+section puts that brick's corner nodes at 45° on the circle and its midside nodes on the
+section axes (`gen3dfrom1d`), so the one-point volume is the circumscribed box's while the
+side faces are measured by their corner chords: h = min(l, √2·d) for element length l and
+diameter d, where a d × d rectangle gives min(l, d). Bisecting the maximum increment (the
+data line's 4th field, which ccx honours) over `B32`/`B32R`, d = 10–80, l = 5–100,
+ν = 0–0.49 and `NLGEOM` on and off puts the stable limit at the formula with h = 1.01–1.17·d
+once l > d (ccx picks 1.2–1.4× it where l ≥ √2·d, 1.3× for steel), while for l ≤ d ccx's
+own increment holds. The converter therefore caps each automatic explicit increment at
+ccx's formula with h = min(l, d/√2), the square through the section's corner nodes: at
+least 1.4× below the probed limit where ccx's estimate fails, and never above ccx's own
+estimate (ccx still picks a smaller increment where other elements need one). Capped, a
+`CIRC` beam behaves like a `RECT` one: under a load ramped up and then held, both oscillate
+with a 5 % longer period in explicit than in implicit dynamics (ccx's lumped mass), and a
+load raised smoothly over three periods leaves the beam at its static deflection. A fixed
+increment (`DIRECT`) above the cap is only warned: ccx's mass scaling for it is sized from
+the same overestimate, and the run still diverged at 1.2× and 2.4× ccx's estimate. No
+corpus deck has beams in an explicit step, and every corpus deck converts
+byte-identically; `validate_with_ccx.py` checks a `CIRC` beam's end deflection in an
+explicit step against beam theory.
 
 **Per-element (`*DISTRIBUTION`) orientations.** Abaqus gives each element its own material
 axes through a `*DISTRIBUTION` that an `*ORIENTATION` names (CAE discrete orientations,

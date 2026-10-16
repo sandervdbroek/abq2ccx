@@ -1135,6 +1135,83 @@ def test_explicit_dynamics_native():
         assert "no explicit solver" not in rep.text()
 
 
+CIRC_EXPLICIT = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+*Element, type=B31, elset=BEAM
+1, 1, 2
+2, 2, 3
+*Beam Section, elset=BEAM, material=M, section=CIRC
+0.05
+0., 0., -1.
+*Material, name=M
+*Elastic
+2.1e5, 0.3
+*Density
+7.85e-9
+*Boundary
+1, 1, 3
+3, 2, 3
+"""
+
+
+def explicit_step(data, params=""):
+    return f"*Step\n*Dynamic, Explicit{params}\n{data}\n*Cload\n2, 2, -1.\n*End Step\n"
+
+
+def test_circ_beam_explicit_increment_capped():
+    # ccx 2.23 sizes a circular-section beam's explicit increment as if the section were the
+    # box around the circle, about 1.3x its stable limit (NaN displacements); the step's
+    # maximum increment becomes ccx's Courant estimate with the square through the section's
+    # corner nodes: 0.177 min(l, d / sqrt(2)) / c, here d = 0.1 and c = 6.001e6
+    body, conv, rep = convert_str(CIRC_EXPLICIT + explicit_step(", 0.001"))
+    assert "*DYNAMIC, EXPLICIT\n, 0.001, , 2.09e-09\n" in body
+    assert "maximum increment 2.09e-09 set" in rep.text() and conv._circ_explicit[1] == 1
+    # a larger maximum is lowered, a smaller one kept; a period below the cap needs none
+    body, _, _ = convert_str(CIRC_EXPLICIT + explicit_step(", 0.001, , 1e-6"))
+    assert "\n, 0.001, , 2.09e-09\n" in body
+    body, _, rep = convert_str(CIRC_EXPLICIT + explicit_step(", 0.001, , 1e-9"))
+    assert "\n, 0.001, , 1e-9\n" in body and "maximum increment" not in rep.text()
+    body, _, rep = convert_str(CIRC_EXPLICIT + explicit_step(", 1e-9"))
+    assert "\n, 1e-9\n" in body and "maximum increment" not in rep.text()
+    # an element shorter than d / sqrt(2) sets it by its length (ccx's own estimate there)
+    short = CIRC_EXPLICIT.replace("3, 2., 0., 0.", "3, 1.05, 0., 0.")
+    body, conv, _ = convert_str(short + explicit_step(", 0.001"))
+    assert "\n, 0.001, , 1.47e-09\n" in body and conv._circ_explicit[1] == 2
+
+
+def test_circ_beam_explicit_increment_left_alone_or_warned():
+    # implicit dynamics and other sections keep their data line
+    body, conv, _ = convert_str(CIRC_EXPLICIT + "*Step\n*Dynamic\n1e-4, 0.001\n*End Step\n")
+    assert "*DYNAMIC\n1e-4, 0.001\n" in body and conv._circ_explicit is None
+    rect = CIRC_EXPLICIT.replace("section=CIRC\n0.05", "section=RECT\n0.1, 0.1")
+    body, _, rep = convert_str(rect + explicit_step(", 0.001"))
+    assert "*DYNAMIC, EXPLICIT\n, 0.001\n" in body and "maximum increment" not in rep.text()
+    # a fixed increment (DIRECT USER CONTROL -> DIRECT) above the cap is only warned: ccx's
+    # mass scaling for it is sized from the same overestimate
+    direct = ", direct user control"
+    body, _, rep = convert_str(CIRC_EXPLICIT + explicit_step("1e-8, 0.001", direct))
+    assert "*DYNAMIC, EXPLICIT, DIRECT\n1e-8, 0.001\n" in body
+    assert "the fixed increment 1e-8 exceeds" in rep.text()
+    _, _, rep = convert_str(CIRC_EXPLICIT + explicit_step("1e-9, 0.001", direct))
+    assert "fixed increment" not in rep.text()
+    # no density (nor any wave speed): no cap, a warning with the rule of thumb
+    body, _, rep = convert_str(CIRC_EXPLICIT.replace("*Density\n7.85e-9\n", "")
+                               + explicit_step(", 0.001"))
+    assert "*DYNAMIC, EXPLICIT\n, 0.001\n" in body and "0.12 d / c" in rep.text()
+    assert "could not size a cap for ELSET=BEAM (material M has no isotropic" in rep.text()
+
+
+def test_beam_circ_explicit_example():
+    # the deck validate_with_ccx.py checks against beam theory: 6 elements 40 long, d = 20,
+    # steel, so the cap is 0.177 * 20 / sqrt(2) / 6.001e6 (ccx alone would pick 8.3e-7)
+    body, _, _ = convert(os.path.join(EXAMPLES, "beam_circ_explicit.inp"))
+    g = reparse(body)
+    assert "*DYNAMIC, EXPLICIT\n, 6.e-3, , 4.17e-07\n" in body
+    assert {t for t, _ in g.elements.values()} == {"B32"} and not dangling_refs(g)
+
+
 def test_approximate_nu_clamp():
     deck = "*Material,name=m\n*Elastic\n1000., 0.5\n"
     body, _, _ = convert_str(deck)

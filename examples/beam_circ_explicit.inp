@@ -1,0 +1,45 @@
+*Heading
+Circular-section beam in an explicit dynamic step: a smoothly applied load, then held
+** Simply supported B31 beam along x, L = 240, r = 10, 6 elements (each 40 long, twice the
+** diameter), E = 210000, nu = 0.3, rho = 7.85e-9.  Mid-span load P = 1000 in -y, raised
+** with a SMOOTH STEP over 4.5e-3 (about three first-mode periods) and held to 6e-3, so the
+** beam ends at its static deflection: Timoshenko beam theory
+** P L^3 / (48 E I) + P L / (4 k G A) = 0.1773, with k = 6 (1 + nu) / (7 + 6 nu).
+** ccx 2.23 runs circular sections on B32 (abq2ccx adds the midside nodes) expanded into
+** 20-node bricks with the section's nodes on the circle, and sizes their stable increment
+** as if the section were the box around the circle: it picks 8.3e-7, about 1.3x the
+** stable limit, and the displacements turn NaN.  abq2ccx caps the step's maximum
+** increment at 4.17e-7 (0.990 of beam theory at the end).  *Node Print (Abaqus/Standard
+** output; Abaqus/Explicit would use *Output, history) gives the check a printed result.
+*Node
+1, 0., 0., 0.
+7, 240., 0., 0.
+*Ngen, nset=AXIS
+1, 7, 1
+*Nset, nset=MID
+4
+*Element, type=B31, elset=BEAM
+1, 1, 2
+*Elgen, elset=BEAM
+1, 6, 1, 1
+*Beam Section, elset=BEAM, material=STEEL, section=CIRC
+10.
+0., 0., -1.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Density
+7.85e-9
+*Boundary
+1, 1, 3
+7, 2, 3
+*Amplitude, name=SMOOTH, definition=SMOOTH STEP
+0., 0., 4.5e-3, 1.
+*Step
+*Dynamic, Explicit
+, 6.e-3
+*Cload, amplitude=SMOOTH
+MID, 2, -1000.
+*Node Print, nset=MID, frequency=200
+U
+*End Step

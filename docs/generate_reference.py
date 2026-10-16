@@ -70,7 +70,10 @@ TRANSLATED = {
         "`--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
     "*DYNAMIC": "implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; "
         "`APPLICATION=QUASI-STATIC/MODERATE DISSIPATION` → `ALPHA=-0.3333` (and `*STEP "
-        "AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped.",
+        "AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped. An "
+        "explicit step in a deck with circular-section beams gets a maximum time increment "
+        "(4th data field): ccx 2.23 overestimates their stable increment about 1.3-fold "
+        "(NaN displacements); a fixed `DIRECT` increment above it is warned.",
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes).",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "

@@ -1632,6 +1632,11 @@ class Converter:
         self._mpc_mechanical = True                # ... for displacements
         self._implied_spc: set = set()             # (node, dof) BCs a rigid constraint fixes
         self._gen_ties: set = set()                # the rotation ties the converter writes
+        # explicit dynamics with circular-section beams (_plan_circ_explicit_increment): the
+        # smallest min(element length, d / sqrt(2)) / wave speed and its element, and the
+        # beams it could not size
+        self._circ_explicit: Optional[Tuple[float, int]] = None
+        self._circ_explicit_issue = ""
 
     # -- properties ---------------------------------------------------------
     @property
@@ -4398,7 +4403,9 @@ class Converter:
         difference) direct integration natively; its card knows only EXPLICIT, DIRECT,
         ALPHA, SOLVER and RELATIVE TO ABSOLUTE.  Abaqus-only controls are dropped with a
         note (``DIRECT USER CONTROL`` = ccx DIRECT: a fixed, user-given increment); the
-        data line (initial increment, period, min, max) has the same layout in both."""
+        data line (initial increment, period, min, max) has the same layout in both.  An
+        explicit step in a deck with circular-section beams gets a maximum increment
+        (_circ_explicit_increment)."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("EXPLICIT", "DIRECT"):
@@ -4428,7 +4435,10 @@ class Converter:
                                  "into heat in a mechanical step.", once=True)
             else:
                 self.report.note(f"*DYNAMIC parameter {k} dropped (Abaqus-only).", once=True)
-        return [emit_keyword("DYNAMIC", keep)] + list(b.data)
+        data = list(b.data)
+        if "EXPLICIT" in keep:
+            data = self._circ_explicit_increment(keep, data)
+        return [emit_keyword("DYNAMIC", keep)] + data
 
     def handle_initial_conditions(self, b: Block) -> List[str]:
         """``*INITIAL CONDITIONS, TYPE=STRESS/PLASTIC STRAIN/SOLUTION``: Abaqus writes one
@@ -4695,6 +4705,7 @@ class Converter:
         self._plan_planar_constraint(blocks)
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
+        self._plan_circ_explicit_increment(blocks)
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
         # errors without the card) — handle_surface_interaction synthesizes HARD for these
         self._si_missing_behavior = set()
@@ -6510,6 +6521,167 @@ class Converter:
             pairs |= {(m, d) for a, c, m in self._midside.values()
                       for d in by_node.get(a, set()) & by_node.get(c, set())}
         return pairs
+
+    # ======================================================================
+    # Explicit dynamics with circular-section beams
+    # ======================================================================
+    def _plan_circ_explicit_increment(self, blocks: List[Block]) -> None:
+        """ccx sizes an explicit step's increment from a Courant estimate per element
+        (calcstabletimeincvol.f): critom * h * 0.3 / (2 c) times a safety factor 0.8/1.3,
+        with c the material's dilatational wave speed, critom = 1.96 / sqrt(1 - a (1 + a
+        (2 + a))) for ALPHA = a, and h the smallest one-point volume / face area of the
+        20-node brick a 3-node beam expands into.  A circular section puts that brick's
+        corners at 45 degrees on the circle and its midside nodes on the section axes
+        (gen3dfrom1d.f): the one-point volume is the circumscribed box's while the side
+        faces are measured by their corner chords, so h = min(l, sqrt(2) d) (l: element
+        length, d: diameter) and ccx runs CIRC beams at about 1.3x their stable increment —
+        NaN displacements.  Probed on 2.23 by bisecting the maximum increment (B32 and
+        B32R, d = 10-80, l = 5-100, nu = 0-0.49, NLGEOM on and off): the limit is the
+        formula with h = 1.01-1.17 d once l > d, while ccx's own increment holds for
+        l <= d; RECT, PIPE and BOX sections (expanded as rectangles) run at ccx's own
+        increment.  Explicit steps are therefore capped at the formula with h = min(l,
+        d / sqrt(2)), the square through the section's corner nodes: at least 1.4x below
+        the probed limit where ccx's estimate fails, and never above ccx's own estimate.
+        Records the smallest h / c over the B32/B32R beams under a CIRC *BEAM SECTION (and
+        its element), and which beams could not be sized (no isotropic *ELASTIC with a
+        *DENSITY, or no radius)."""
+        self._circ_explicit = None
+        self._circ_explicit_issue = ""
+        if not any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks):
+            return
+        speeds = self._wave_speeds(blocks)
+        nodes = self.geom.nodes
+        best: Optional[Tuple[float, int]] = None
+        missing: List[str] = []
+        for b in blocks:
+            if b.keyword != "BEAM SECTION" or (b.param("SECTION") or "").strip().upper() != "CIRC":
+                continue
+            elset = (b.param("ELSET") or "").strip()
+            elems = [e for e in self.geom.elset(elset) if e in self.geom.elements
+                     and self.geom.elements[e][0] in ("B32", "B32R")
+                     and len(self.geom.elements[e][1]) == 3]
+            if not elems:
+                continue
+            mat = (b.param("MATERIAL") or "").strip().upper()
+            try:
+                d = 2 * pf(merged_data_records(b)[0][0])        # Abaqus gives the radius
+            except (IndexError, ValueError):
+                d = 0.0
+            c = speeds.get(mat)
+            if d <= 0 or not c:
+                missing.append(f"ELSET={elset} (" + ("no readable radius" if d <= 0 else
+                               f"material {mat} has no isotropic *ELASTIC with a *DENSITY") + ")")
+                continue
+            for e in elems:
+                conn = self.geom.elements[e][1]
+                length = vnorm(vsub(nodes[conn[2]], nodes[conn[0]])) \
+                    if conn[0] in nodes and conn[2] in nodes else 0.0
+                if length > 0:
+                    h = min(length, d / math.sqrt(2))
+                    if best is None or h / c < best[0]:
+                        best = (h / c, e)
+        self._circ_explicit = best
+        self._circ_explicit_issue = ", ".join(dedup_str(missing))
+
+    def _wave_speeds(self, blocks: List[Block]) -> Dict[str, float]:
+        """Material (upper-case name) -> the largest dilatational wave speed
+        sqrt(E (1 - nu) / ((1 + nu) (1 - 2 nu) rho)) over its *ELASTIC and *DENSITY rows
+        (all temperatures) — the speed ccx sizes an explicit increment with — for the
+        materials with isotropic elasticity and a positive density."""
+        moduli: Dict[str, List[float]] = {}
+        densities: Dict[str, List[float]] = {}
+        other: set = set()
+        cur: Optional[str] = None
+        for b in blocks:
+            kw = b.keyword
+            if kw == "MATERIAL":
+                cur = (b.param("NAME") or "").strip().upper()
+            elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
+                cur = None
+            elif cur is not None and kw == "ELASTIC":
+                if (b.param("TYPE") or "ISO").strip().upper() not in ("ISO", "ISOTROPIC"):
+                    other.add(cur)
+                for rec in merged_data_records(b):
+                    try:
+                        e = pf(rec[0])
+                        nu = pf(rec[1]) if len(rec) > 1 and rec[1] else 0.0
+                    except (IndexError, ValueError):
+                        continue
+                    if self._approx and nu >= 0.5:
+                        nu = 0.475                          # handle_elastic's clamp
+                    if e > 0 and -1.0 < nu < 0.5:
+                        moduli.setdefault(cur, []).append(e * (1 - nu) / ((1 + nu) * (1 - 2 * nu)))
+            elif cur is not None and kw == "DENSITY":
+                for rec in merged_data_records(b):
+                    try:
+                        rho = pf(rec[0])
+                    except (IndexError, ValueError):
+                        continue
+                    if rho > 0:
+                        densities.setdefault(cur, []).append(rho)
+        return {m: math.sqrt(max(moduli[m]) / min(densities[m]))
+                for m in moduli if m in densities and m not in other}
+
+    def _circ_explicit_increment(self, params: "OrderedDict[str, Optional[str]]",
+                                 data: List[str]) -> List[str]:
+        """The data line of an explicit *DYNAMIC in a deck with circular-section beams
+        (_plan_circ_explicit_increment): the maximum increment (4th field, the same in both
+        codes) becomes ccx's Courant estimate with h = min(l, d / sqrt(2)) unless the
+        deck's own maximum or the step period is no larger.  A fixed increment (DIRECT)
+        above it is only warned: ccx's mass scaling for it is sized from the same
+        overestimate (probed: NaN at 1.2x and 2.4x ccx's estimate, where RECT beams run)."""
+        if self._circ_explicit_issue:
+            self.report.warn(f"*DYNAMIC, EXPLICIT with circular-section (CIRC) beams: ccx 2.23 "
+                             f"runs them at about 1.3x their stable increment (NaN displacements, "
+                             f"probed), and abq2ccx could not size a cap for "
+                             f"{self._circ_explicit_issue}. Set the maximum increment (4th field "
+                             f"of the *DYNAMIC data line) to at most 0.12 d / c (d: section "
+                             f"diameter, c: the material's dilatational wave speed).", once=True)
+        if self._circ_explicit is None:
+            return data
+        try:
+            alpha = min(max(pf(params.get("ALPHA") or "-0.05"), -1.0 / 3.0), 0.0)
+        except ValueError:
+            alpha = -0.05
+        critom = 1.96 / math.sqrt(1.0 - alpha * (1.0 + alpha * (2.0 + alpha)))
+        h_over_c, elem = self._circ_explicit
+        cap = "%.3g" % (critom * 0.3 * (0.8 / 1.3) / 2.0 * h_over_c)
+        top = float(cap)
+        # no data line: ccx runs the step with a period of 1
+        fields = [x.strip() for x in data[0].split(",")] if data else ["", "1."]
+        fields += [""] * (4 - len(fields))
+
+        def num(i: int) -> Optional[float]:
+            try:
+                return pf(fields[i]) if fields[i] else 0.0
+            except ValueError:
+                return None
+
+        if "DIRECT" in params:
+            fixed = num(0)
+            if fixed and fixed > top:
+                self.report.warn(f"*DYNAMIC, EXPLICIT, DIRECT: the fixed increment {fields[0]} "
+                                 f"exceeds the stable increment of the circular-section (CIRC) "
+                                 f"beams (about {cap}, element {elem}). ccx 2.23 overestimates "
+                                 f"it by about 1.3x, and its mass scaling for a larger fixed "
+                                 f"increment is sized from the same estimate, so the run "
+                                 f"diverges (NaN displacements, probed). Use a fixed increment "
+                                 f"of at most {cap}, or drop DIRECT so abq2ccx caps the "
+                                 f"automatic increment.", once=True)
+            return data
+        period, limit = num(1), num(3)
+        if limit is None or 0 < limit <= top or (period is not None and 0 < period <= top):
+            return data
+        fields[3] = cap
+        self.report.note(f"*DYNAMIC, EXPLICIT: maximum increment {cap} set for the circular-"
+                         f"section (CIRC) beams (4th data field; ccx still picks a smaller "
+                         f"increment where other elements need one). ccx 2.23 measures their "
+                         f"expanded section by the box around the circle and runs them at about "
+                         f"1.3x their stable increment: NaN displacements (probed). {cap} is "
+                         f"ccx's own Courant estimate with the square through the section's "
+                         f"corner nodes (smallest at element {elem}), at least 1.4x below the "
+                         f"probed limit.", once=True)
+        return [", ".join(fields)] + data[1:]
 
 
 def dedup_str(seq: Sequence[str]) -> List[str]:

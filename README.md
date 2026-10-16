@@ -64,7 +64,8 @@ RECT with equal area + strong-axis inertia. Off by default — nothing changes s
 Riks step is then commented out, because ccx would otherwise run it as an ordinary
 load-controlled static step without saying so. (`*DYNAMIC, EXPLICIT` needs no reframing:
 ccx integrates explicitly itself, and the converter adds the Abaqus/Explicit defaults ccx
-lacks — no increment cap, `NLGEOM` on.)
+lacks — no increment cap, `NLGEOM` on — and, for circular-section beams, whose stable
+increment ccx 2.23 overestimates, a maximum time increment.)
 
 Then run it in CalculiX (`ccx out`, no extension). The converter validates
 *structure and syntax*, not *physics* — **always read the report** (printed to
@@ -97,6 +98,7 @@ PASS  beam_pipe_box_cantilever (B32 + BOX): tip deflection y = -1.7898 (beam the
 PASS  coupling_shell_plate (rigid coupling on S8R nodes): RP displacement (-0.1025, +0.0191, +1.7152) vs the solid *Rigid Body (-0.1025, +0.0191, +1.7152), 0.001% of |u|
 PASS  beam_circ_rotation_bcs (A: pinned, twist held): deflection = -12.6581 (beam theory -12.6313, 0.2% diff)
 PASS  beam_circ_rotation_bcs (B: tip turned 0.001 rad): deflection = +0.5004 (beam theory +0.5000, 0.1% diff)
+PASS  beam_circ_explicit (B31 + CIRC, *DYNAMIC, EXPLICIT): end deflection = -0.1756 (beam theory -0.1773, 1.0% diff)
 PASS  planar_pinned_beam (B21): f1, f2 = 93.67, 373.02 Hz (beam theory 93.81, 375.25), buckling load 220545 (Euler 221079); max 0.6% diff
 PASS  planar_pinned_circ_beam (B21 + CIRC): f1, f2 = 40.81, 163.28 Hz (beam theory 40.62, 162.49), buckling load 16239 (Euler 16278); max 0.5% diff
 PASS  distribution_solid_plate (C3D8 *SOLID SECTION, per-element *DISTRIBUTION orientation): 84 node displacements vs one *ORIENTATION per element, max difference 2.8e-11 of max |u|
@@ -131,12 +133,16 @@ the reference point's displacement with the same plate built from `C3D20R` brick
 `*RIGID BODY`. The fifth gives two circular-section beams rotational BCs — a twist held at
 pinned supports, a prescribed tip rotation — and compares their deflections with beam
 theory: under a rotational BC ccx 2.23 locks a circular section's other rotations, so this
-needs the converter's knot beams (without them 0.31 and 0.76 of beam theory). The sixth and
-seventh run planar `B21` beams (rectangular and circular sections) on pinned supports through
-a frequency and a buckling step and compare the first two frequencies and the buckling load
-with beam theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar
-constraint: without it ccx reports 0 Hz modes (the free twist and the unsupported
-out-of-plane motion) and a buckling factor of 1. The next two give every element its own
+needs the converter's knot beams (without them 0.31 and 0.76 of beam theory). The sixth
+runs a circular-section beam through an explicit dynamic step — a load raised smoothly and
+then held — and compares its end deflection with beam theory: ccx 2.23 sizes such a beam's
+stable increment as if its section were the box around the circle, so without the
+converter's increment cap the displacements turn NaN. The seventh and eighth run planar
+`B21` beams (rectangular and circular sections) on pinned supports through a frequency
+and a buckling step and compare the first two frequencies and the buckling load with beam
+theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar constraint:
+without it ccx reports 0 Hz modes (the free twist and the unsupported out-of-plane motion)
+and a buckling factor of 1. The next two give every element its own
 fibre angle through a `*DISTRIBUTION`, as a variable-angle-tow layup does: a `C3D8` plate
 (two instances, one rotated; a default line, an element-set line and an additional
 rotation) and a composite `S8R` panel whose plies follow +θ and −θ paths. Every node must
@@ -252,6 +258,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
 | rigid coupling on shell/beam nodes | knot beam per node + rotation `*EQUATION`s | ccx 2.23 rejects a rigid MPC on a shell, membrane, beam or truss node unless ccx made it a *knot*; a force-free `B31` (elset `ABQ2CCX_KNOT`) makes it one, and the rotations Abaqus couples are tied to the coupling's |
+| `*DYNAMIC, EXPLICIT` with `CIRC` beams | maximum time increment set (4th data field) | ccx 2.23 sizes a circular-section beam's stable increment as if its section were the box around the circle and runs it at about 1.3× the limit (NaN displacements); the cap is ccx's own estimate with the square through the section's corner nodes, side d/√2; a fixed (`DIRECT`) increment above it is warned |
 | rotational BCs on `CIRC` beam nodes | knot beam per node | a BC on some of DOFs 4–6 (or a nonzero one) at a circular-section `B32` end node makes ccx 2.23 lock the node's other rotations too (a pinned beam with its twist held deflects 0.3 of beam theory); as a knot the node's BCs hold only the rotations they name |
 | `*BOUNDARY, OP=NEW` in a later step, after rotational BCs on shell/beam nodes | OP=NEW dropped when the step re-specifies every BC; else knot beams on the nodes it would break | ccx 2.23 does not rebuild the rotational BCs it re-specifies (a clamp becomes a hinge) and on shells zeroes unrelated BCs; a knot carries the rotations in a form OP=NEW handles (exact on shells; a beam clamp 0.1–0.7 % stiffer); an explicit step in the deck: warned |
 | `*CONTACT PAIR, TIED` | `*TIE` per surface pair | without `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; face-to-face suggested if ccx struggles) |
@@ -470,6 +477,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/coupling_shell_plate.inp`](examples/coupling_shell_plate.inp) | `S8R` edge `*Coupling`+`*Kinematic` to a loaded reference point → knot beams + rotation ties, `*NGEN`/`*NFILL`/`*ELGEN` |
 | [`examples/coupling_solid_plate.inp`](examples/coupling_solid_plate.inp) | its `C3D20R` + `*Rigid Body, TIE NSET` reference, `*NCOPY` |
 | [`examples/beam_circ_rotation_bcs.inp`](examples/beam_circ_rotation_bcs.inp) | circular-section `B31` beams with a twist held at pinned supports and a prescribed tip rotation → knot beams |
+| [`examples/beam_circ_explicit.inp`](examples/beam_circ_explicit.inp) | circular-section `B31` beam in a `*DYNAMIC, EXPLICIT` step, `SMOOTH STEP` load → `B32` + a maximum time increment |
 | [`examples/planar_pinned_beam.inp`](examples/planar_pinned_beam.inp) | planar `B21` beam on pinned supports: DOF 3 fixed on its nodes and the twist at the pin, `*FREQUENCY` + `*BUCKLE` |
 | [`examples/planar_pinned_circ_beam.inp`](examples/planar_pinned_circ_beam.inp) | the same with a circular section (`B32` in ccx): the twist held at the first element's middle node |
 | [`examples/op_new_respecify.inp`](examples/op_new_respecify.inp) | clamped `B31` beam + `S4` plate, step 2 re-specifies every BC with `*BOUNDARY, OP=NEW` → OP=NEW dropped |
