@@ -84,7 +84,10 @@ TRANSLATED = {
         "RESULTANT=YES`; any other NLGEOM traction is commented (`--approximate` converts it with an "
         "`[APPROX]` warning). A pressure on the `SPOS`/`SNEG` side of surface elements (which leave "
         "the mesh) → nodal forces too, positive against the surface normal (`SPOS`: the element "
-        "normal); under NLGEOM only with `--approximate`.",
+        "normal); under NLGEOM only with `--approximate`. On a node with a `*TRANSFORM` the "
+        "converted forces (also `*DLOAD`'s) are given in its local axes, as ccx and Abaqus read a "
+        "`*CLOAD` there; a node whose axes are unknown (spherical, on the cylinder axis, "
+        "degenerate, two transforms, a 2-D node turned out of plane) leaves the line commented.",
     "*SURFACE SECTION": "dropped with its surface elements (`SFM3D*`, `SFMAX*`, `SFMGAX*`), "
         "which leave the mesh — no stiffness, no ccx element — while their loads become nodal "
         "forces; they stay (and ccx stops on them) if `*REBAR LAYER` or `DENSITY=` in a "

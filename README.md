@@ -107,6 +107,8 @@ PASS  beam_line_load_cantilever (B): applied +1 (q L = +1), tip deflection +0.00
 PASS  beam_line_load_cantilever (C): applied -0.1 (q L = -0.1), tip deflection -0.001583 (beam theory -0.001592, 0.6% diff)
 PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(10) = 0.019667 (Lame 0.019667, 0.00% diff)
 PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(20) = 0.013331 (Lame 0.013333, 0.02% diff)
+PASS  traction_transformed_face with *TRANSFORM (C3D20R face, rectangular + cylindrical): u at 225 nodes differs from the model without it by 0.0e+00 of max |u| (0.01981)
+PASS  cook_membrane_traction with *TRANSFORM (CPS8 edge, in-plane rectangular + cylindrical): u at 33 nodes differs from the model without it by 6.4e-17 of max |u| (25.06)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -130,12 +132,17 @@ misread box dimension would miss beam theory by 18 % or more. The fifth couples 
 plate's edge rigidly to an offset reference point that carries a force and a moment (a
 coupling ccx 2.23 rejects on shell nodes without the converter's knot beams) and compares
 the reference point's displacement with the same plate built from `C3D20R` bricks under
-`*RIGID BODY`. The last three check loads ccx has no card for, which the converter applies
+`*RIGID BODY`. The next three check loads ccx has no card for, which the converter applies
 as consistent nodal forces: a shear traction (`*DSLOAD TRVEC`) on Cook's membrane against
 the published displacement of its loaded edge (23.96, Bergan & Felippa 1985); uniform line
 loads (`*DLOAD PY`, local `P2`, `PZ`) on three cantilevers — `B31`, `B32` and a circular
 `B31` run as `B32` — against q L⁴/(8 E I), with the applied resultants checked against q L;
-and a radial traction on an axisymmetric thick cylinder against Lamé's solution.
+and a radial traction on an axisymmetric thick cylinder against Lamé's solution. The last
+two put a traction on nodes with local axes: ccx, like Abaqus, reads a `*CLOAD` on a node with a
+`*TRANSFORM` in its local axes, so the converted forces are given in them. A `C3D20R` block
+whose loaded face carries a rectangular and a cylindrical transform, and Cook's membrane
+with in-plane ones on its loaded edge, must match the same models without the transforms
+at every printed node (forces left in global components miss by 149 % and 88 % of |u|).
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -231,6 +238,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*DSLOAD`/`*DLOAD` `TRVEC`, `TRSHR` (surface tractions) | consistent nodal forces (`*CLOAD`) | ccx has no traction load: the face/edge shape functions are integrated over the undeformed geometry (× plane thickness, × 2πr axisymmetric; `TRSHR` projected onto the face). Exact in small-strain steps and for NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT RESULTANT=YES`; other NLGEOM tractions only with `--approximate` |
 | `*DLOAD` `PX`/`PY`/`PZ`/`P1`/`P2` on beams | consistent nodal forces (`*CLOAD`) | on the converted element's nodes (incl. inserted midside nodes); ccx's own beam `P1`/`P2` is a section-face pressure |
 | surface elements `SFM3D3/4/4R/6/8/8R`, `SFMAX1/2`, `SFMGAX1/2` | left out of the mesh; their `TRVEC`, `TRSHR`, `P` (`*DLOAD`, or `*DSLOAD` on their `SPOS`/`SNEG` side) → consistent nodal forces | ccx has no surface element; they have no stiffness, so only their loads matter. Element sets keep their other members; `*SURFACE SECTION` and surfaces / `*EL PRINT` on them only are dropped. Abaqus signs: an element-based `P` acts along the element normal, a surface `P` against the surface normal. Kept (ccx then stops on them) if they carry rebar, or mass in a dynamic / frequency step or under gravity — unless `--approximate` |
+| converted nodal forces (above) on nodes with a `*TRANSFORM` | given in each node's local axes | ccx, like Abaqus, reads a `*CLOAD` there in the transformed system: rectangular, or cylindrical at the node's undeformed position, fixed in space (probed on 2.23 for solid, shell, membrane, beam, plane and axisymmetric nodes). The load line is commented out with the reason (the load audit flags a step it leaves unloaded) when those axes are unknown: a spherical transform (ccx has none), a node on the cylinder axis, degenerate or unreadable data, two different transforms on one node, or a 2-D node whose local 3-axis is not the global Z axis |
 | `*BOUNDARY, USER`, `*CLOAD, USER`, `...NU` load labels, `*TEMPERATURE, USER`, `*AMPLITUDE, DEFINITION=USER` | commented out | the Abaqus user subroutine cannot run in ccx, which would call its own stock `uboun.f` / `cload.f` / `dload.f` / ... instead — the warning names the one to port |
 | `*MPC, TIE` | per-DOF `*EQUATION` | `PLANE`/`STRAIGHT` kept |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
@@ -408,6 +416,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/cook_membrane_traction.inp`](examples/cook_membrane_traction.inp) | Cook's membrane, `CPS8`, `*DSLOAD TRVEC` → consistent nodal forces, `*NGEN`/`*NFILL`/`*ELGEN` |
 | [`examples/beam_line_load_cantilever.inp`](examples/beam_line_load_cantilever.inp) | beam line loads `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and an upgraded `CIRC` beam → nodal forces |
 | [`examples/cylinder_traction_cax.inp`](examples/cylinder_traction_cax.inp) | axisymmetric `CAX8` thick cylinder, radial `*DSLOAD TRVEC` (2πr) |
+| [`examples/traction_transformed_face.inp`](examples/traction_transformed_face.inp) | `C3D20R` block, oblique `*DSLOAD TRVEC` on a face whose nodes have a rectangular and a cylindrical `*TRANSFORM` → nodal forces in their local axes |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

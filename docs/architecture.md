@@ -80,6 +80,9 @@ thickness or the axisymmetric flag, beam n1); `consistent_nodal_forces()` integr
 shape functions by Gauss quadrature over each one in its undeformed geometry; and
 `_to_nodal_forces` records the result per (card, target, label) in `_nodal_loads`, in
 Abaqus semantics (a later step replaces a load, `OP=NEW` drops the card's earlier ones).
+Forces on a node with a `*TRANSFORM` are first given in its local axes (`_to_local_axes`,
+`_local_axes`; `_transform_defs` reads the cards into `_transformed`), since ccx and Abaqus read
+a `*CLOAD` there in those axes; a node whose axes are unknown makes the line stay commented.
 At the end of every step `_flush_nodal_loads` writes one `*CLOAD` per amplitude with the
 node DOFs whose total changed (0 where a load went away) — never `OP=NEW`, which in ccx
 would also remove the deck's own concentrated loads. `_nodal_load_inexact` decides whether
@@ -182,7 +185,8 @@ checks the NAFEMS LE10 benchmark stress against the published reference (and wit
 pressure carried by surface elements against the face-pressure result), the tip
 deflections of circular-, pipe- and box-section cantilevers against beam theory, and the
 loads applied as consistent nodal forces (Cook's membrane, beam line loads, Lamé's
-cylinder). It skips cleanly if no `ccx` is found.
+cylinder, and tractions on nodes with a `*TRANSFORM` against the same models without
+one). It skips cleanly if no `ccx` is found.
 
 There is also a **corpus** of 1022 genuine Abaqus decks (`corpus/manifest.py`) fetched on
 demand and tested end-to-end:

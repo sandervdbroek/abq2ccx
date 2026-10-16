@@ -69,8 +69,10 @@ These are the silent ones — no error, wrong physics.
   Abaqus deck (...), but no load survives the conversion`: every load of that step was
   commented out — a user-subroutine load or BC (port it to the ccx subroutine the warning
   names), an NLGEOM follower traction (`--approximate` applies it as fixed nodal forces), a
-  load on an undefined surface. ccx then solves the step with no load at all. A deck that
-  loads nothing even in Abaqus gets a note instead.
+  load on an undefined surface, or a traction on nodes whose `*TRANSFORM` axes are unknown
+  (spherical, a node on the cylinder axis, degenerate data, two transforms on one node).
+  ccx then solves the step with no load at all. A deck that loads nothing even in Abaqus
+  gets a note instead.
 * **A Riks step does not run.** ccx has no arc-length solver; passed through, it would
   silently solve a load-controlled static step instead, so the converter comments the
   `*STATIC, RIKS` card out and ccx stops at that step. `--approximate` accepts the

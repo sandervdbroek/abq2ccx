@@ -52,7 +52,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 __version__ = "1.1.0"
 
@@ -1759,7 +1759,9 @@ class Converter:
         self._rot_nodes: set = set()               # nodes with rotations (shell/beam, not truss)
         self._spc: set = set()                     # (node, dof) under a *BOUNDARY in any step
         self._rot_tied: set = set()                # (node, dof) already tied to a body rotation
-        self._transformed: set = set()             # nodes with a *TRANSFORM (local DOFs)
+        # nodes with a *TRANSFORM (local DOFs) -> its (TYPE letter, a, b), or why its local axes
+        # are unknown (see _transform_defs / _local_axes)
+        self._transformed: Dict[int, Union[Tuple[str, Vec, Vec], str]] = {}
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         self._last_coupling: Optional[dict] = None
         # load audit (see _audit_loads): steps loaded in the deck but not after conversion
@@ -3513,7 +3515,10 @@ class Converter:
             def load(p, normal, tangent):
                 return vscale(axis, mag)
         forces: Dict[Tuple[int, int], float] = {}
+        flat: set = set()                                   # nodes of a 2-D model (DOFs 1-2)
         for nodes, kind, scale, axi, planar, n1, sense in faces:
+            if planar:
+                flat.update(nodes)
             if base in ("P1", "P2"):
                 def load(p, normal, tangent, n1=n1):
                     n2 = vcross(tangent, n1)
@@ -3536,6 +3541,14 @@ class Converter:
                                               "a beam is parallel to its n1 direction")
         big = max((abs(v) for v in forces.values()), default=0.0)
         forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
+        res = [sum(v for (_, k), v in forces.items() if k == c) for c in (1, 2, 3)]   # global
+        n_loaded = len({n for n, _ in forces})
+        local = sorted({n for n, _ in forces if n in self._transformed})
+        if local:
+            forces, why = self._to_local_axes(forces, local, flat)
+            if why:
+                return self._drop_load_line(b, g, why)
+            forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
         amp = b.param("AMPLITUDE")
         key = (card, g[0].upper(), label)
         clash = self._nodal_load_clash(key, forces, amp)
@@ -3558,10 +3571,94 @@ class Converter:
                          f"the step: {lack}. The shape functions are integrated over the undeformed "
                          f"faces / edges (times the section thickness on plane elements, over the "
                          f"full circle on axisymmetric ones).", once=True)
-        res = [sum(v for (_, k), v in forces.items() if k == c) for c in (1, 2, 3)]
+        if local:
+            self.report.note("Converted nodal forces on nodes with a *TRANSFORM are given in each "
+                             "node's local axes, in which ccx (like Abaqus) reads a *CLOAD there: "
+                             "rectangular, or cylindrical at the node's undeformed position, fixed "
+                             "in space.", once=True)
         return [f"** abq2ccx: {', '.join(x for x in g if x)} -> nodal forces on "
-                f"{len({n for n, _ in forces})} node(s), resultant ({', '.join('%.6g' % x for x in res)}),"
-                f" in the *CLOAD at the end of this step"]
+                f"{n_loaded} node(s), resultant ({', '.join('%.6g' % x for x in res)}),"
+                f" in the *CLOAD at the end of this step"
+                + (f"; in the local axes of the {len(local)} with a *TRANSFORM" if local else "")]
+
+    def _transform_defs(self, blocks: List[Block]) -> Dict[int, Union[Tuple[str, Vec, Vec], str]]:
+        """Each node with a *TRANSFORM -> its card's (TYPE letter, a, b), or why the local axes
+        of the node are unknown: an unreadable data line, or several cards (Abaqus allows one
+        per node; ccx takes the last).  Like ccx, only the first letter of TYPE counts."""
+        out: Dict[int, Union[Tuple[str, Vec, Vec], str]] = {}
+        for b in blocks:
+            if b.keyword != "TRANSFORM":
+                continue
+            typ = ((b.param("TYPE") or "").strip().upper() or "R")[0]
+            d: Union[Tuple[str, Vec, Vec], str]
+            try:
+                v = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+                d = (typ, (v[0], v[1], v[2]), (v[3], v[4], v[5]))
+            except (IndexError, ValueError):
+                d = "has a *TRANSFORM whose data line cannot be read"
+            for n in self._resolve_nodes((b.param("NSET") or "").strip()):
+                out[n] = d if out.get(n, d) == d else \
+                    "is in several *TRANSFORM cards (Abaqus allows one per node)"
+        return out
+
+    def _local_axes(self, n: int) -> Union[Tuple[Vec, Vec, Vec], str]:
+        """The local axes 1, 2, 3 in which ccx — like Abaqus — reads a *CLOAD on node ``n``,
+        which has a *TRANSFORM, or why they are unknown.  Probed on 2.23 (solid, shell,
+        membrane, beam, plane and axisymmetric nodes): rectangular — 1 along a, 2 towards b
+        in the plane of a and b, 3 = 1 x 2; cylindrical — 3 along the axis from a to b, 1
+        radial from the axis to the node, 2 = 3 x 1, at the node's undeformed position and
+        fixed in space under NLGEOM, as in Abaqus.  ccx has no spherical system (TYPE=S gives
+        NaN results) and uses the global axes for a node on the cylinder axis."""
+        d = self._transformed[n]
+        if isinstance(d, str):
+            return f"node {n} {d}"
+        typ, a, b = d
+        if typ == "R":
+            e3 = vcross(a, b)
+            if vnorm(e3) <= 1e-9 * vnorm(a) * vnorm(b):
+                return (f"the rectangular *TRANSFORM of node {n} is degenerate (point a at the "
+                        f"origin, or in line with b)")
+            e1, e3 = vunit(a), vunit(e3)
+            return e1, vcross(e3, e1), e3
+        if typ == "C":
+            axis, p = vsub(b, a), vsub(self.geom.nodes[n], a)
+            if not vnorm(axis):
+                return f"the cylindrical *TRANSFORM of node {n} is degenerate (a and b coincide)"
+            e3 = vunit(axis)
+            r = vsub(p, vscale(e3, vdot(p, e3)))
+            if vnorm(r) <= 1e-6 * max(vnorm(axis), vnorm(p)):
+                return (f"node {n} lies on the axis of its cylindrical *TRANSFORM, where the local "
+                        f"directions are undefined (Abaqus rejects such a node; ccx uses the "
+                        f"global axes there)")
+            e1 = vunit(r)
+            return e1, vcross(e3, e1), e3
+        if typ == "S":
+            return f"node {n} has a spherical *TRANSFORM (TYPE=S), which ccx does not have"
+        return f"the *TRANSFORM of node {n} has an unknown TYPE"
+
+    def _to_local_axes(self, forces: Dict[Tuple[int, int], float], nodes: Sequence[int],
+                       flat: set) -> Tuple[Dict[Tuple[int, int], float], Optional[str]]:
+        """Converted nodal forces (global components) with those on ``nodes``, which have a
+        *TRANSFORM, given in each node's local axes (_local_axes) — or why that cannot be done.
+        A node of a 2-D model (in ``flat``) has DOFs 1 and 2 only, so its transform must keep
+        local 3 along the global Z axis (probed: ccx then matches the global load exactly)."""
+        out = {k: v for k, v in forces.items() if k[0] not in self._transformed}
+        for n in nodes:
+            axes = self._local_axes(n)
+            if isinstance(axes, str):
+                return {}, axes
+            f = tuple(forces.get((n, k), 0.0) for k in (1, 2, 3))
+            loc = [vdot(e, f) for e in axes]
+            if n in flat:
+                if math.hypot(axes[2][0], axes[2][1]) > 1e-6:
+                    return {}, (f"the *TRANSFORM of node {n} turns its local 3-direction out of the "
+                                f"global Z axis, so the 2-D node's in-plane force has no local "
+                                f"components")
+                loc[2] = 0.0
+            for k, v in enumerate(loc, 1):
+                if v:
+                    out[(n, k)] = v
+        return out, None
 
     def _nodal_load_clash(self, key: tuple, forces: Dict[Tuple[int, int], float],
                           amp: Optional[str]) -> Optional[str]:
@@ -5349,8 +5446,7 @@ class Converter:
             elif cc.startswith("M3D"):
                 structural.update(conn)
         self._spc = self._boundary_dofs(blocks)
-        self._transformed = {n for b in blocks if b.keyword == "TRANSFORM"
-                             for n in self._resolve_nodes((b.param("NSET") or "").strip())}
+        self._transformed = self._transform_defs(blocks)
         self._coupling_plan = {}
         knots: List[int] = []
         for i, b in enumerate(blocks):

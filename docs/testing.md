@@ -20,7 +20,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (149)
+## 1. Unit tests — `tests/test_convert.py` (156)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -176,6 +176,13 @@ conversion behaviour and referential integrity.
 | `test_surface_element_on_free_nodes_warns` | surface elements whose nodes belong to no other element are warned (ccx ignores a load on a node without stiffness) |
 | `test_surface_elements_in_an_assembly_instance` | the corpus deck's shape: surface elements and their `*SURFACE SECTION` inside an `*INSTANCE`, a `TRVEC` on `ASSEMBLY.INSTANCE.SET` → nodal forces, nothing commented |
 | `test_nle10_surface_elements_example` | the LE10 example with an `SFM3D8` skin: the converted forces add up to the pressure × the top face's area, along z |
+| `test_nodal_forces_on_transformed_nodes_go_into_their_local_axes` | a `TRVEC` on a C3D8 face whose nodes have a `*TRANSFORM`: the forces are given in each node's local axes — rectangular (1 along a, 3 = a × b), cylindrical (1 radial at the node, 2 = 3 × 1, 3 along the axis) — and untransformed nodes keep global components; the comment's resultant stays global |
+| `test_nodal_forces_on_unusable_transforms_are_refused` | the load line is commented, with the reason, and the step flagged, when a loaded node's axes are unknown: a degenerate rectangular (a = 0, a ∥ b) or cylindrical (a = b) transform, a node on the cylinder axis, `TYPE=S`, an unreadable data line, two different transforms on one node (the same one twice is fine) |
+| `test_nodal_forces_on_transformed_2d_nodes` | a `CPS4` edge traction on transformed nodes: an in-plane rectangular transform (local 3 along +z or −z) and a cylinder about z give DOFs 1-2 only; a transform that turns local 3 out of the Z axis is refused |
+| `test_beam_and_surface_element_loads_on_transformed_nodes` | a beam line load `PY` and an `SFM3D4` pressure on transformed nodes are given in their local axes too |
+| `test_transformed_nodal_forces_meet_the_decks_cload_on_local_dofs` | the clash check against the deck's own `*CLOAD` uses the local DOFs: a force rotated onto local DOF 1, which the deck's `*CLOAD` also loads, is refused in a two-step deck (globally the DOFs looked disjoint) |
+| `test_transform_of_a_rotated_instance_rotates_the_local_axes` | a part-level `*TRANSFORM` in an instance turned 90° about z: the converted forces use the turned axes |
+| `test_traction_transformed_face_example` | the `C3D20R` example with a rectangular and a cylindrical transform on its loaded face: each node's forces, turned back from its local axes (computed independently in the test), equal those of the same deck without the transforms; no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -224,6 +231,15 @@ deck and runs it in CalculiX:
   Lamé, within 0.02 % — the full-circle (2πr) convention of axisymmetric nodal forces, which
   ccx shares with Abaqus (probed: a `*CLOAD` on a `CAX4` edge matches the same edge under
   pressure only as the 2π total).
+* **`traction_transformed_face`** and **`cook_membrane_traction` with `*TRANSFORM`** — ccx, like
+  Abaqus, reads a `*CLOAD` on a node with a `*TRANSFORM` in the node's local axes, so the
+  converter gives the nodal forces of a traction there in those axes. A 1 × 1 × 2 `C3D20R` block
+  under an oblique `TRVEC` on its top face, whose nodes carry a rectangular transform on one
+  half and a cylindrical one (skew axis) on the other, and Cook's membrane with in-plane
+  transforms on its loaded edge (rectangular with local 3 = −z; a cylinder about z), are
+  each run with and without the `*TRANSFORM` cards. The displacements (`*NODE PRINT,
+  GLOBAL=YES`) at every printed node must agree within 1e-6 of max |u|. They agree to
+  round-off (0 and 6e-17), where forces left in global components miss by 149 % and 88 %.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -418,6 +434,19 @@ annulus' 5.4487), ccx's reaction at the supports equals them to 7 digits, and σ
 −5.449 MPa against the published −5.38 (1.3 %). Net: 203 gated, of which 189 carry their
 real loads. No other corpus deck uses surface elements; every other deck converts as
 before, bar the wording of the comment above converted `*CLOAD`s.
+
+**Converted loads on nodes with a `*TRANSFORM`.** Both ccx and Abaqus read a `*CLOAD` on a
+node with a `*TRANSFORM` in that node's local axes, but the nodal forces converted from
+tractions, beam line loads and surface-element pressures were written in global
+components. On such a node they now go into its local axes: rectangular, or cylindrical at
+the node's undeformed position. The ccx 2.23 convention was probed on solid, shell, membrane,
+beam, plane and axisymmetric nodes and matches the Abaqus manual (see
+[compatibility.md](compatibility.md)). Where those axes are unknown, the load line is
+commented with the reason and the load audit sees it: a spherical transform (ccx has none
+and gives NaN), a node on the cylinder axis, degenerate or unreadable data, two different
+transforms on one node, or a 2-D node whose local 3-axis leaves the Z axis. Eight corpus
+decks have `*TRANSFORM` nodes, but none puts a converted load on them, and all 1073 corpus
+files convert byte-identically.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

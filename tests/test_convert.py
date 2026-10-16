@@ -12,6 +12,7 @@ expectations.
 
 import math
 import os
+import re
 import sys
 import tempfile
 
@@ -1911,6 +1912,141 @@ def test_nle10_surface_elements_example():
     area = math.pi / 4 * (3.25 * 2.75 - 2 * 1)                      # the quarter elliptic annulus
     assert {d for _, d in skin} == {3} and abs(sum(skin.values()) / -1e6 - area) < 1e-4 * area
     assert "TYPE=SFM3D8" not in body and not conv.unloaded_steps
+
+
+# the cube's top face under a traction along (3, 0, -4): (0.6, 0, -0.8) on each of its nodes
+TRVEC_TOP = HEX + "*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n*Dsload\nTOP, TRVEC, 4., 3., 0., -4.\n*End Step\n"
+
+
+def _transformed(deck, nodes, data, typ="R", nset="TR"):
+    """``deck`` with a *TRANSFORM of ``typ`` on ``nodes``, defined ahead of its first *Step."""
+    return deck.replace("*Step", f"*Nset, nset={nset}\n{nodes}\n*Transform, nset={nset}, type={typ}\n"
+                                 f"{data}\n*Step", 1)
+
+
+def test_nodal_forces_on_transformed_nodes_go_into_their_local_axes():
+    # ccx and Abaqus read a *CLOAD on a node with a *TRANSFORM in its local axes.  Rectangular:
+    # 1 along a (here y), 3 = a x b (z), 2 = 3 x 1 (-x)
+    body, conv, rep = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", "0., 2., 0., -1., 1., 0."))
+    assert _close(_cloads(body)[0], {**{(n, 2): -0.6 for n in TOP4}, **{(n, 3): -0.8 for n in TOP4}})
+    assert ("resultant (2.4, 0, -3.2), in the *CLOAD at the end of this step; in the local axes of "
+            "the 4 with a *TRANSFORM") in body                               # the resultant: global
+    assert not conv.unloaded_steps and rep.n_commented == 0 and "each node's local axes" in rep.text()
+    # nodes without one keep the global components
+    body, _, _ = convert_str(_transformed(TRVEC_TOP, "5, 6", "0., 2., 0., -1., 1., 0."))
+    assert _close(_cloads(body)[0], {(5, 2): -0.6, (6, 2): -0.6, (7, 1): 0.6, (8, 1): 0.6,
+                                     **{(n, 3): -0.8 for n in TOP4}})
+    # cylindrical about the axis x = y = -1 (along +z): 1 radial at the node, 2 = 3 x 1, 3 = z
+    body, _, _ = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", "-1., -1., 0., -1., -1., 2.", "C"))
+    want = {}
+    for n, (x, y) in zip(TOP4, ((0., 0.), (1., 0.), (1., 1.), (0., 1.))):
+        c, s = (x + 1) / math.hypot(x + 1, y + 1), (y + 1) / math.hypot(x + 1, y + 1)
+        want.update({(n, 1): 0.6 * c, (n, 2): -0.6 * s, (n, 3): -0.8})
+    assert _close(_cloads(body)[0], want)
+
+
+def test_nodal_forces_on_unusable_transforms_are_refused():
+    for typ, data, why in (
+            ("R", "0., 0., 0., 0., 1., 0.", "the rectangular *TRANSFORM of node 5 is degenerate"),
+            ("R", "1., 1., 0., 2., 2., 0.", "the rectangular *TRANSFORM of node 5 is degenerate"),
+            ("C", "1., 1., 1., 1., 1., 1.", "the cylindrical *TRANSFORM of node 5 is degenerate"),
+            ("C", "0., 0., 0., 0., 0., 3.", "node 5 lies on the axis of its cylindrical *TRANSFORM"),
+            ("S", "0., 0., 0., 0., 0., 3.", "node 5 has a spherical *TRANSFORM (TYPE=S), which ccx"),
+            ("R", "0., 1., 0.", "node 5 has a *TRANSFORM whose data line cannot be read")):
+        body, conv, rep = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", data, typ))
+        assert _cloads(body) == [{}] and conv.unloaded_steps == [1], (typ, data)
+        assert f"*DSLOAD TRVEC on 'TOP' not converted: {why}" in rep.text(), (typ, data)
+        assert "\n** TOP, TRVEC, 4., 3., 0., -4.\n" in body
+    # Abaqus allows one *TRANSFORM per node (ccx takes the last): two that differ are refused
+    once = _transformed(TRVEC_TOP, "5", "0., 2., 0., -1., 1., 0.")
+    body, conv, rep = convert_str(_transformed(once, "5, 6", "1., 0., 0., 0., 1., 0.", nset="TR2"))
+    assert _cloads(body) == [{}] and "node 5 is in several *TRANSFORM cards" in rep.text()
+    body, conv, _ = convert_str(_transformed(once, "5", "0., 2., 0., -1., 1., 0.", nset="TR2"))
+    assert len(_cloads(body)[0]) == 8 and not conv.unloaded_steps            # the same twice
+
+
+def test_nodal_forces_on_transformed_2d_nodes():
+    deck = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n*Element, type=CPS4, elset=E\n"
+            "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1., 0.3\n*Solid Section, elset=E, material=M\n"
+            "0.5\n*Surface, name=EDGE\nE, S2\n*Step\n*Static\n*Dsload\nEDGE, TRVEC, 3., 0., 1., 7.\n"
+            "*End Step\n")                                     # (0, 0.75) on nodes 2 and 3
+    r2 = 0.75 / math.sqrt(2)
+    body, _, _ = convert_str(_transformed(deck, "2, 3", "1., 1., 0., -1., 1., 0."))
+    assert _close(_cloads(body)[0], {(2, 1): r2, (2, 2): r2, (3, 1): r2, (3, 2): r2})
+    # local 3 along -z: local 2 = 3 x 1 turns the other way; still only DOFs 1 and 2
+    body, _, _ = convert_str(_transformed(deck, "2, 3", "1., 1., 0., 1., -1., 0."))
+    assert _close(_cloads(body)[0], {(2, 1): r2, (2, 2): -r2, (3, 1): r2, (3, 2): -r2})
+    # cylindrical about the z axis through the origin: radial and tangential in the plane
+    body, _, _ = convert_str(_transformed(deck, "2, 3", "0., 0., 0., 0., 0., 1.", "C"))
+    assert _close(_cloads(body)[0], {(2, 2): 0.75, (3, 1): 0.75 / math.sqrt(5),
+                                     (3, 2): 1.5 / math.sqrt(5)})
+    # a local 3-direction out of the model plane leaves the in-plane force no 2-D components
+    body, conv, rep = convert_str(_transformed(deck, "2, 3", "1., 0., 1., 0., 1., 0."))
+    assert _cloads(body) == [{}] and conv.unloaded_steps == [1]
+    assert "the *TRANSFORM of node 2 turns its local 3-direction out of the global Z axis" in rep.text()
+
+
+def test_beam_and_surface_element_loads_on_transformed_nodes():
+    # a beam line load PY on node 3 with local axes 1 = z, 2 = x, 3 = y
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n"
+            "2, 2, 3\n*Material, name=M\n*Elastic\n1., 0.3\n*Beam Section, elset=B, material=M, "
+            "section=RECT\n1., 1.\n0., 0., 1.\n*Step\n*Static\n*Dload\nB, PY, 2.\n*End Step\n")
+    body, _, _ = convert_str(_transformed(beam, "3", "0., 0., 1., 1., 0., 0."))
+    assert _cloads(body) == [{(1, 2): 1.0, (2, 2): 2.0, (3, 3): 1.0}]
+    # a pressure on a surface element (+z on the cube's top nodes) with local axes 1 = z
+    body, conv, _ = convert_str(_transformed(SKIN + "*Surface, name=TOP\nSKIN, SPOS\n*Step\n*Static\n"
+                                                    "*Dload\nSKIN, P, 4.\n*End Step\n",
+                                             "5, 6, 7, 8", "0., 0., 1., 1., 0., 0."))
+    assert _cloads(body) == [{(n, 1): 1.0 for n in TOP4}] and not conv.unloaded_steps
+
+
+def test_transformed_nodal_forces_meet_the_decks_cload_on_local_dofs():
+    # local 1 = z on node 5: the traction's force there shares local DOF 1 with the deck's own
+    # *CLOAD, which a later step would replace in ccx -> refused (globally they look disjoint)
+    deck = _transformed(HEX + "*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n*Cload\n5, 1, 1.\n"
+                              "*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n*End Step\n*Step\n*Static\n"
+                              "*End Step\n", "5", "0., 0., 1., 1., 0., 0.")
+    body, _, rep = convert_str(deck)
+    assert "its nodal force on node 5 DOF 1 would share the entry of the deck's own *CLOAD" in rep.text()
+    assert _cloads(body)[0] == {(5, 1): 1.0}
+
+
+def test_transform_of_a_rotated_instance_rotates_the_local_axes():
+    # the part's identity transform, in an instance turned 90 degrees about z: 1 = y, 2 = -x
+    deck = ("*Part, name=P\n" + HEX + "*Nset, nset=TOPN\n5, 6, 7, 8\n*Transform, nset=TOPN\n"
+            "1., 0., 0., 0., 1., 0.\n*Surface, name=TOP\nEALL, S2\n*Solid Section, elset=EALL, "
+            "material=M\n*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n0., 0., 0.\n"
+            "0., 0., 0., 0., 0., 1., 90.\n*End Instance\n*End Assembly\n*Material, name=M\n"
+            "*Elastic\n1., 0.3\n*Step\n*Static\n*Dsload\nI1.TOP, TRVEC, 4., 1., 0., 0.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    (forces,) = _cloads(body)
+    assert len(forces) == 4 and {d for _, d in forces} == {2} and _close(list(forces.values()), [-1.0] * 4)
+    assert not conv.unloaded_steps
+
+
+def test_traction_transformed_face_example():
+    # the deck validate_with_ccx.py runs: its forces, turned back from each node's local axes,
+    # are those of the same block without the *TRANSFORM cards
+    path = os.path.join(EXAMPLES, "traction_transformed_face.inp")
+    body, conv, _ = convert(path)
+    plain, _, _ = convert_str(re.sub(r"(?m)^\*TRANSFORM.*\n.*\n", "", open(path).read()))
+    (local,), (glob,) = _cloads(body), _cloads(plain)
+    nodes = {n for n, _ in glob}
+    assert len(nodes) == 21 and not conv.unloaded_steps and not dangling_refs(reparse(body))
+    unit = lambda v: [x / math.sqrt(sum(y * y for y in v)) for x in v]    # noqa: E731
+    cross = lambda a, b: [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],   # noqa: E731
+                          a[0] * b[1] - a[1] * b[0]]
+    for n in nodes:
+        i, j = (n - 801) % 10, (n - 801) // 10                    # node (x, y) = (i, j) / 4, z = 2
+        if i <= 2:                                                # rectangular: a, b
+            e1, e3 = unit([1., 2., .5]), unit(cross([1., 2., .5], [-1., 1., 3.]))
+        else:                                                     # cylindrical: axis a -> b
+            e3 = unit([.1, .2, 3.])
+            p = [i / 4 + .5, j / 4 + .3, 2.]
+            e1 = unit([p[k] - sum(x * y for x, y in zip(p, e3)) * e3[k] for k in range(3)])
+        axes = (e1, cross(e3, e1), e3)
+        back = [sum(local.get((n, d + 1), 0.0) * axes[d][k] for d in range(3)) for k in range(3)]
+        assert _close(back, [glob.get((n, k + 1), 0.0) for k in range(3)], 1e-9), n
 
 
 if __name__ == "__main__":

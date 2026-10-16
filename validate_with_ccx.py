@@ -9,7 +9,8 @@ the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, a shell plate rigidly coupled to a loaded reference point against the same
 plate built from solids, and the loads ccx has no card for — surface tractions (Cook's
 membrane, Lame's cylinder) and beam line loads (cantilevers against beam theory) —
-applied as consistent nodal forces.
+applied as consistent nodal forces, also on nodes with a *TRANSFORM (local axes), which
+must match the same models without one.
 
     python validate_with_ccx.py
 
@@ -20,6 +21,7 @@ a clear message), 1 if a check fails.  Requires CalculiX; install it or FreeCAD.
 import glob
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -94,22 +96,28 @@ def frd_stress(frd_path, node):
     return None
 
 
-def dat_displacement(dat_path, node):
-    """Last displacement (ux, uy, uz) printed for ``node`` by *NODE PRINT in a ccx .dat
-    file, or None."""
-    found, inblock = None, False
+def dat_displacements(dat_path):
+    """{node: [ux, uy, uz]}: the last displacement *NODE PRINT wrote for each node in a ccx
+    .dat file (empty if none; a transformed node counts only if printed with GLOBAL=YES)."""
+    found, inblock = {}, False
     if not os.path.exists(dat_path):
-        return None
+        return found
     for ln in open(dat_path):
         if ln.strip().startswith("displacements"):
             inblock = True
             continue
         f = ln.split()
-        if inblock and len(f) == 4 and f[0] == str(node):
-            found = [float(x) for x in f[1:]]
+        if inblock and len(f) == 4 and f[0].isdigit():
+            found[int(f[0])] = [float(x) for x in f[1:]]
         elif inblock and f and not f[0].isdigit():
             inblock = False
     return found
+
+
+def dat_displacement(dat_path, node):
+    """Last displacement (ux, uy, uz) printed for ``node`` by *NODE PRINT in a ccx .dat
+    file, or None."""
+    return dat_displacements(dat_path).get(node)
 
 
 def main():
@@ -314,6 +322,46 @@ def main():
               f"{u[0]:.6f} (Lame {ref:.6f}, {abs(u[0] - ref) / ref * 100:.2f}% diff)")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # Tractions on nodes with local axes: ccx, like Abaqus, reads a *CLOAD on a node with a
+    # *TRANSFORM in its local axes, so the converted forces are given in them.  A block whose
+    # loaded face carries a rectangular and a cylindrical transform, and Cook's membrane with
+    # in-plane ones on its loaded edge (local 3 = -z; a cylinder about z), must match the same
+    # models without the transforms (forces left in global components miss by 149 % / 88 %).
+    cs, sn = math.cos(0.5), math.sin(0.5)
+    cook = open(os.path.join(EXAMPLES, "cook_membrane_traction.inp")).read().replace(
+        "*NODE PRINT, NSET=C\nU\n", "*NODE PRINT, NSET=RIGHT, GLOBAL=YES\nU\n")
+    edge = ("*NSET, NSET=RIGHT_LOW, GENERATE\n3201, 3216, 1\n*NSET, NSET=RIGHT_UP, GENERATE\n"
+            f"3217, 3233, 1\n*TRANSFORM, NSET=RIGHT_LOW, TYPE=R\n{cs!r}, {sn!r}, 0., {sn!r}, {-cs!r}, 0.\n"
+            "*TRANSFORM, NSET=RIGHT_UP, TYPE=C\n10., 20., 0., 10., 20., 1.\n")
+    block = open(os.path.join(EXAMPLES, "traction_transformed_face.inp")).read()
+    for name, how, decks in (
+            ("traction_transformed_face", "C3D20R face, rectangular + cylindrical",
+             (block, re.sub(r"(?m)^\*TRANSFORM.*\n.*\n", "", block))),
+            ("cook_membrane_traction", "CPS8 edge, in-plane rectangular + cylindrical",
+             (cook.replace("*MATERIAL", edge + "*MATERIAL", 1), cook))):
+        u, bad = [], ""
+        for text in decks:
+            src, inp = os.path.join(tmp, "transform_src.inp"), os.path.join(tmp, "transform.inp")
+            with open(src, "w") as fh:
+                fh.write(text)
+            convert(src, inp)
+            d, status, out = run_ccx(ccx, env, inp)
+            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            if status != "solved" and not bad:
+                bad = " / ".join([status] + [l.strip() for l in out.splitlines() if "ERROR" in l])
+            shutil.rmtree(d, ignore_errors=True)
+        if not u[0] or u[0].keys() != u[1].keys():
+            print(f"FAIL  {name} with *TRANSFORM ({how}): no displacements to compare "
+                  f"({bad or 'different nodes printed'})")
+            failures += 1
+            continue
+        scale = max(abs(x) for v in u[1].values() for x in v)
+        err = max(abs(a - b) for n in u[1] for a, b in zip(u[0][n], u[1][n])) / scale
+        ok = err <= 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {name} with *TRANSFORM ({how}): u at {len(u[1])} nodes "
+              f"differs from the model without it by {err:.1e} of max |u| ({scale:.4g})")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
