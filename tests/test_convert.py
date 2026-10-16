@@ -2186,6 +2186,101 @@ def test_initial_temperature_defaults_uncovered_nodes_to_zero():
     assert "ABQ2CCX_ALL_NODES" not in body                           # every node covered
 
 
+HOT_CUBE = HEX + "*Solid Section, elset=EALL, material=M\n,\n*Material, name=M\n*Elastic\n" \
+    "1000., 0.3\n*Expansion\n1.e-5\n*Conductivity\n50.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+HEAT_STEP = "*Step\n*Static\n*Temperature\n1, 100.\n*Node Print\nU\n*End Step\n"
+DEFAULT_IC = ("** [abq2ccx] initial temperatures: the Abaqus default, 0, at every node (ccx reads "
+              "*TEMPERATURE only after thermal initial conditions)\n*INITIAL CONDITIONS, "
+              "TYPE=TEMPERATURE\nABQ2CCX_ALL_NODES, 0.\n*STEP")
+
+
+def test_temperature_without_initial_conditions_starts_at_zero():
+    # Abaqus starts every node at 0 when the deck gives no initial temperatures; ccx stops on
+    # *TEMPERATURE without thermal initial conditions (probed on 2.23: with them a free heated
+    # cube strains alpha T exactly), so they come ahead of the first step
+    body, _, rep = convert_str(HOT_CUBE + HEAT_STEP)
+    assert DEFAULT_IC in body and body.count("*INITIAL CONDITIONS") == 1
+    assert reparse(body).nsets["ABQ2CCX_ALL_NODES"] == list(range(1, 9))
+    assert "every node starts at 0, the Abaqus default" in rep.text() and rep.n_warnings == 0
+    assert "*TEMPERATURE\n1, 100.\n*NODE PRINT" in body
+    # a later step's card: still ahead of the first step, once
+    body, _, _ = convert_str(HOT_CUBE + "*Step\n*Static\n*End Step\n" + HEAT_STEP + HEAT_STEP)
+    assert body.count(DEFAULT_IC) == 1 and body.index(DEFAULT_IC) < body.index("*STATIC")
+    # none without a *TEMPERATURE ccx reads: no card, one outside the steps (commented out)
+    for deck in (HOT_CUBE + "*Step\n*Static\n*End Step\n",
+                 HOT_CUBE + "*Temperature\n1, 100.\n*Step\n*Static\n*End Step\n"):
+        body, _, rep = convert_str(deck)
+        assert "INITIAL CONDITIONS" not in body and "ABQ2CCX_ALL_NODES" not in body
+    # the deck's own initial temperatures are kept as they are when they name every node
+    body, _, rep = convert_str(HOT_CUBE + "*Nset, nset=ALL, generate\n1, 8, 1\n"
+                               "*Initial Conditions, type=temperature\nALL, 20.\n" + HEAT_STEP)
+    assert "*INITIAL CONDITIONS, TYPE=temperature\nALL, 20.\n*STEP" in body
+    assert body.count("*INITIAL CONDITIONS") == 1 and "Abaqus default" not in rep.text()
+
+
+def test_temperature_in_thermal_step_commented_out():
+    # temperature is DOF 11 in heat transfer and coupled temperature-displacement steps:
+    # Abaqus does not allow *TEMPERATURE there, and ccx stops on it even with initial
+    # temperatures (probed on 2.23) — commented out with the reason
+    for proc in ("Heat Transfer, steady state", "Coupled Temperature-Displacement, steady state"):
+        kw = proc.split(",")[0].upper()
+        body, _, rep = convert_str(HOT_CUBE + f"*Step\n*{proc}\n1., 1.\n*Boundary\n7, 11, 11, 50.\n"
+                                   "*Temperature\nEALL, 100.\n*Node Print\nNT\n*End Step\n")
+        assert f"** abq2ccx: *TEMPERATURE in a *{kw} step: temperature is degree of freedom 11" \
+            in body and "\n** *TEMPERATURE\n** EALL, 100.\n*NODE PRINT" in body
+        assert "INITIAL CONDITIONS" not in body                       # no card ccx reads
+        assert "prescribe the temperature with *BOUNDARY on DOF 11" in rep.text()
+        assert rep.n_commented == 1
+    # a mechanical step's card in the same deck stays, and gets its initial temperatures
+    body, _, rep = convert_str(HOT_CUBE + "*Step\n*Heat Transfer, steady state\n1., 1.\n"
+                               "*Temperature\n1, 100.\n*End Step\n" + HEAT_STEP)
+    assert DEFAULT_IC in body and rep.n_commented == 1
+    assert body.split("*STEP")[2].count("\n*TEMPERATURE\n1, 100.") == 1
+
+
+def test_temperature_from_file_without_initial_conditions_warned():
+    # ccx reads FILE= as a CalculiX .frd (with none it runs on undefined temperatures, printing
+    # only "ERROR in readfrd"): the default would turn ccx's stop on the card into a run that
+    # is not the deck's, so none is added, and the report says why
+    body, _, rep = convert_str(HOT_CUBE + "*Step\n*Static\n*Temperature, file=thermal, bstep=1\n"
+                               "*End Step\n" + HEAT_STEP)
+    assert "INITIAL CONDITIONS" not in body and "*TEMPERATURE, FILE=thermal, BSTEP=1" in body
+    assert "*TEMPERATURE, FILE= with no *INITIAL CONDITIONS" in rep.text() and ".frd" in rep.text()
+    # with the deck's own initial temperatures the card passes through without the warning
+    _, _, rep = convert_str(HOT_CUBE + "*Initial Conditions, type=temperature\n1, 0.\n"
+                            "*Step\n*Static\n*Temperature, file=thermal\n*End Step\n")
+    assert "ccx stops on the card" not in rep.text()
+    # a USER card (Abaqus UTEMP) is commented out: only the cards ccx reads count
+    body, _, _ = convert_str(HOT_CUBE + "*Step\n*Static\n*Temperature, user\n1\n*End Step\n")
+    assert "INITIAL CONDITIONS" not in body and "** *TEMPERATURE, USER" in body
+    body, _, _ = convert_str(HOT_CUBE + "*Step\n*Static\n*Temperature, user\n1\n*End Step\n"
+                             + HEAT_STEP)
+    assert DEFAULT_IC in body
+
+
+def test_initial_temperatures_reach_knot_beam_nodes():
+    # the knot beams of circular-section beams are planned after the deck's initial
+    # temperatures are counted; their free nodes need one too (ccx: "no initial temperature
+    # defined in node"), with the default and with the deck's own initial conditions
+    heat = "*Step\n*Static\n*Temperature\nBEAM_N, 100.\n*End Step\n"
+    deck = CIRC_BEAM + "*Nset, nset=BEAM_N\n1, 2, 3\n*Boundary\n1, 1, 4\n3, 2, 4\n"
+    body, conv, _ = convert_str(deck + heat)
+    assert list(conv._knots) == [1, 3] and DEFAULT_IC in body
+    assert sorted(reparse(body).nsets["ABQ2CCX_ALL_NODES"]) == list(range(1, 8))
+    body, _, rep = convert_str(deck + "*Initial Conditions, type=temperature\nBEAM_N, 20.\n" + heat)
+    assert "*INITIAL CONDITIONS, TYPE=temperature\nABQ2CCX_ALL_NODES, 0.\nBEAM_N, 20." in body
+    assert sorted(reparse(body).nsets["ABQ2CCX_ALL_NODES"]) == list(range(1, 8))
+
+
+def test_thermal_no_initial_temperature_example():
+    # the validate_with_ccx.py deck: the default initial temperatures reach every node, the
+    # free node of the knot beam at the circular-section beam's pinned end included
+    body, conv, rep = convert(os.path.join(EXAMPLES, "thermal_no_initial_temperature.inp"))
+    g = reparse(body)
+    assert DEFAULT_IC in body and list(conv._knots) == [11] and not dangling_refs(g)
+    assert sorted(g.nsets["ABQ2CCX_ALL_NODES"]) == sorted(g.nodes) and len(g.nodes) == 14
+
+
 def test_plane_section_blank_thickness_defaults_to_one():
     body, _, _ = convert_str("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n*Element,type=CPS4,elset=E\n1,1,2,3,4\n"
                              "*Solid Section, elset=E, material=M\n,\n*Material,name=M\n*Elastic\n1000.,0.3\n")

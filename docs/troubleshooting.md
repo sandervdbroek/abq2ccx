@@ -100,6 +100,27 @@ converter's output avoids both:
   file alongside the deck and convert again; without it the per-element directions are
   simply unknown.
 
+### `*ERROR reading *TEMPERATURE: a *TEMPERATURE card is detected but - no thermal *INITIAL CONDITIONS are given OR - this is a *HEAT TRANSFER or (UN)COUPLED TEMPERATURE-DISPLACEMENT analysis`, or `*ERROR in checktemp: no initial temperature defined in node N`
+
+ccx reads a `*TEMPERATURE` card only after thermal `*INITIAL CONDITIONS`, and then needs
+an initial temperature in every node. Abaqus needs neither: a node without one starts at 0.
+
+* When a deck applies `*TEMPERATURE` without initial temperatures, the converter adds
+  `*INITIAL CONDITIONS, TYPE=TEMPERATURE` with `ABQ2CCX_ALL_NODES, 0.` ahead of the first
+  step; when the deck's own initial conditions leave nodes out (the free nodes of knot
+  beams too), those get 0 first. Thermal strains then count from 0, as in Abaqus — a deck
+  whose temperatures are absolute (in K, or a room temperature in °C) expands from 0, not
+  from the room, in both codes.
+* Not for a `*TEMPERATURE, FILE=` card (warned): ccx reads `FILE=` as a CalculiX `.frd`
+  results file, not Abaqus' `.odb`/`.fil` — without one it only prints `ERROR in readfrd`
+  and runs on undefined temperatures. Run the heat transfer in ccx and point `FILE=` at its
+  `.frd`, then add the initial temperatures. (A `USER` card, an Abaqus `UTEMP`, is commented
+  out.)
+* In a `*HEAT TRANSFER` or `*COUPLED TEMPERATURE-DISPLACEMENT` step temperature is DOF 11.
+  Abaqus does not allow `*TEMPERATURE` there either, and ccx refuses it even with initial
+  temperatures, so the converter comments it out (warned): prescribe the temperature with
+  `*BOUNDARY` on DOF 11.
+
 ### "Job killed without any error"
 
 Usually out of memory. Big models need a lot of RAM (rule of thumb from the forum:
@@ -215,7 +236,9 @@ These are the silent ones — no error, wrong physics.
   reinterpret.
 * **`*TEMPERATURE` is not a thermal BC.** In a heat-transfer step, a *prescribed*
   temperature is `*BOUNDARY` on DOF 11; `*TEMPERATURE` only supplies the field that
-  drives thermal expansion in a mechanical run. Watch K vs °C too.
+  drives thermal expansion in a mechanical run (in a heat transfer or coupled step the
+  converter comments it out). Watch K vs °C too: without initial temperatures every node
+  starts at 0, in Abaqus and in the converted deck.
 * **Contact differs.** CalculiX contact is penalty-based (node-to-face / face-to-face);
   default stiffness differs from Abaqus and there is no "no separation" behaviour. The
   converter passes `*CONTACT PAIR`/`*SURFACE INTERACTION` through but does not retune

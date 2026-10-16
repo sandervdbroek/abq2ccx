@@ -135,6 +135,7 @@ PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(10) = 0.019667 (Lame 0.019667, 
 PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(20) = 0.013331 (Lame 0.013333, 0.02% diff)
 PASS  traction_transformed_face with *TRANSFORM (C3D20R face, rectangular + cylindrical): u at 225 nodes differs from the model without it by 0.0e+00 of max |u| (0.01981)
 PASS  cook_membrane_traction with *TRANSFORM (CPS8 edge, in-plane rectangular + cylindrical): u at 33 nodes differs from the model without it by 6.4e-17 of max |u| (25.06)
+PASS  thermal_no_initial_temperature (*Temperature, no initial temperatures): cube strain 1.200000e-03 / 1.200000e-03 / 1.200000e-03 (alpha T = 1.200000e-03, 8.6e-16 off); CIRC beam end u_x = +0.120001 (alpha T L = +0.120000, 0.0005% diff)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -468,7 +469,10 @@ converter warns about the ones it can detect; the rest are here so you know to c
 * **Shells/beams are expanded to 3-D internally** — use `*NODE FILE, OUTPUT=3D` to see
   the expanded geometry/through-thickness stress; otherwise results look "wrong."
 * **`*TEMPERATURE` ≠ a thermal BC** — in a heat-transfer step a fixed temperature is
-  `*BOUNDARY` DOF 11; `*TEMPERATURE` is only the field driving thermal expansion.
+  `*BOUNDARY` DOF 11; `*TEMPERATURE` is only the field driving thermal expansion (in a
+  heat transfer or coupled step the converter comments it out). Without initial
+  temperatures every node starts at 0, as in Abaqus: the converter adds them, since ccx
+  reads `*TEMPERATURE` only after thermal `*INITIAL CONDITIONS`.
 * **Contact is penalty-based** (node-to-face / face-to-face); stiffness defaults differ
   from Abaqus, and there is no "no separation" behaviour.
 * **Units are unenforced** — ccx is unitless; mixed unit systems silently corrupt results.
@@ -574,6 +578,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/beam_line_load_cantilever.inp`](examples/beam_line_load_cantilever.inp) | beam line loads `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and an upgraded `CIRC` beam → nodal forces |
 | [`examples/cylinder_traction_cax.inp`](examples/cylinder_traction_cax.inp) | axisymmetric `CAX8` thick cylinder, radial `*DSLOAD TRVEC` (2πr) |
 | [`examples/traction_transformed_face.inp`](examples/traction_transformed_face.inp) | `C3D20R` block, oblique `*DSLOAD TRVEC` on a face whose nodes have a rectangular and a cylindrical `*TRANSFORM` → nodal forces in their local axes |
+| [`examples/thermal_no_initial_temperature.inp`](examples/thermal_no_initial_temperature.inp) | `*Temperature` without initial temperatures (a `C3D8` cube, a `CIRC` beam with a knot beam) → `*INITIAL CONDITIONS, TYPE=TEMPERATURE` at Abaqus' default 0 on every node |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

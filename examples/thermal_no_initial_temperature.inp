@@ -1,0 +1,57 @@
+*Heading
+Heated parts with no initial temperatures: Abaqus starts every node at 0
+** ccx reads *TEMPERATURE only after thermal *INITIAL CONDITIONS and stops otherwise, so
+** abq2ccx adds them at the Abaqus default, 0, for every node.
+** CUBE (nodes 1-8):   one C3D8 unit cube, alpha = 1.2e-5, held 3-2-1 and heated to T = 100:
+**                     strain = alpha T = 1.2e-3 in every direction, no stress.
+** BEAM (nodes 11-13): two B31 elements with a circular section (r = 5, L = 100), pinned at
+**                     x = 0 with the twist held there and on rollers at x = 100, heated to
+**                     T = 100: the far end moves alpha T L = 0.12 along x.  ccx 2.23 runs
+**                     the beam as B32 and needs a knot beam at the pinned end, whose free
+**                     node needs an initial temperature too.
+*Node, nset=CUBE_N
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*Node, nset=BEAM_N
+11, 0., 10., 0.
+12, 50., 10., 0.
+13, 100., 10., 0.
+*Element, type=C3D8, elset=CUBE
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Element, type=B31, elset=BEAM
+2, 11, 12
+3, 12, 13
+*Solid Section, elset=CUBE, material=STEEL
+,
+*Beam Section, elset=BEAM, material=STEEL, section=CIRC
+5.
+0., 0., -1.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Expansion
+1.2e-5
+*Boundary
+1, 1, 3
+2, 2, 3
+4, 3, 3
+11, 1, 4
+13, 2, 3
+*Step
+*Static
+*Temperature
+CUBE_N, 100.
+BEAM_N, 100.
+*Node Print, nset=CUBE_N
+U
+*Node Print, nset=BEAM_N
+U
+*El Print, elset=CUBE
+S, E
+*End Step

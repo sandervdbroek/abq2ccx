@@ -9,9 +9,9 @@ The converter has three layers of tests:
    elements), circular-, pipe- and box-section cantilevers, circular-section beams with
    rotational BCs and in an explicit dynamic step, planar beams' frequencies and buckling
    loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate across a later
-   step's `*BOUNDARY, OP=NEW`, rigidly coupled models (a shell plate, and bars whose coupled
-   nodes also carry BCs), the `*MPC` conversions and the loads applied as nodal forces
-   numerically.
+   step's `*BOUNDARY, OP=NEW`, heated models with no initial temperatures, rigidly coupled
+   models (a shell plate, and bars whose coupled nodes also carry BCs), the `*MPC`
+   conversions and the loads applied as nodal forces numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -25,7 +25,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (210)
+## 1. Unit tests — `tests/test_convert.py` (215)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -167,6 +167,11 @@ conversion behaviour and referential integrity.
 | `test_blankless_keywords_recognised` | blank-less keywords (`*SOLIDSECTION`, `*ELPRINT`, `*ENDSTEP`) are recognised as ccx does |
 | `test_frequency_storage_for_later_modal_step` | `*FREQUENCY` gets `STORAGE=YES` when a later modal/steady-state step needs its eigenmodes |
 | `test_initial_temperature_defaults_uncovered_nodes_to_zero` | nodes an initial-temperature card doesn't list get Abaqus' default 0 (ccx stops otherwise) |
+| `test_temperature_without_initial_conditions_starts_at_zero` | a deck that applies `*TEMPERATURE` without initial temperatures gets `*INITIAL CONDITIONS, TYPE=TEMPERATURE` / `ABQ2CCX_ALL_NODES, 0.` (Abaqus' default, every node) once, right before the first `*STEP` — also when only a later step heats — and a NOTE; none without a card ccx reads (no `*TEMPERATURE`, or one outside the steps); a deck's own initial temperatures that name every node stay as they are |
+| `test_temperature_in_thermal_step_commented_out` | `*TEMPERATURE` in a `*HEAT TRANSFER` or `*COUPLED TEMPERATURE-DISPLACEMENT` step (temperature is DOF 11: Abaqus does not allow it, ccx stops on it) is commented out with a warning and brings no initial temperatures; a mechanical step's card in the same deck stays and does |
+| `test_temperature_from_file_without_initial_conditions_warned` | a `*TEMPERATURE, FILE=` card without initial temperatures gets no default — ccx reads `FILE=` as a CalculiX `.frd`, so the default would turn ccx's stop into a run on undefined temperatures — and a warning; with the deck's own initial temperatures, no warning; a `USER` card is commented out, so it brings no default, and one beside a data-line card does not stop it |
+| `test_initial_temperatures_reach_knot_beam_nodes` | the free nodes of a `CIRC` beam's knot beams (planned after the initial temperatures are counted) get one too: with the default, and from `ABQ2CCX_ALL_NODES, 0.` ahead of the deck's own lines when those name every other node |
+| `test_thermal_no_initial_temperature_example` | the bundled `thermal_no_initial_temperature` deck gets the default initial temperatures on all 14 nodes, the knot beam's free node included; no dangling refs |
 | `test_plane_section_blank_thickness_defaults_to_one` | a blank plane-element thickness becomes Abaqus' default 1.0 |
 | `test_cyclic_hardening_needs_combined_plastic` | `*CYCLIC HARDENING` without a kept `COMBINED` `*PLASTIC`, or in `PARAMETERS` form, is commented out |
 | `test_boundary_on_undefined_set_warns` | a BC on an undefined node set (or on a surface name) is warned |
@@ -390,6 +395,13 @@ deck and runs it in CalculiX:
   each run with and without the `*TRANSFORM` cards. The displacements (`*NODE PRINT,
   GLOBAL=YES`) at every printed node must agree within 1e-6 of max |u|. They agree to
   round-off (0 and 6e-17), where forces left in global components miss by 149 % and 88 %.
+* **`thermal_no_initial_temperature`** — a free `C3D8` unit cube (held 3-2-1) and a
+  two-element `B31` beam with a circular section (L = 100; pinned at one end with its twist
+  held, which gives it a knot beam, on rollers at the other), heated to T = 100 with no
+  initial temperatures. Abaqus starts every node at 0; ccx stops on a `*TEMPERATURE` card
+  without thermal initial conditions, and on a knot beam's free node without one. The cube
+  must strain α T = 1.2e-3 (it does to 9e-16) and the beam's far end move α T L = 0.12
+  (0.1200006). Converted without the default, ccx stops before the step.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -1009,6 +1021,35 @@ and gives NaN), a node on the cylinder axis, degenerate or unreadable data, two 
 transforms on one node, or a 2-D node whose local 3-axis leaves the Z axis. Eight corpus
 decks have `*TRANSFORM` nodes, but none puts a converted load on them, and all 1073 corpus
 files convert byte-identically.
+**`*TEMPERATURE` without initial temperatures.** Found while probing thermal expansion under
+`NLGEOM` (above): a deck
+that applies `*TEMPERATURE` but has no `*INITIAL CONDITIONS, TYPE=TEMPERATURE` stops ccx
+before any step ("a *TEMPERATURE card is detected but - no thermal *INITIAL CONDITIONS are
+given OR - this is a *HEAT TRANSFER or (UN)COUPLED TEMPERATURE-DISPLACEMENT analysis"),
+where Abaqus starts every node at 0 ("If initial conditions are not specified, all initial
+conditions are zero": Analysis User's Guide 2017, *Initial conditions*). Probed on 2.23, a
+free heated `C3D8` cube with `*INITIAL CONDITIONS, TYPE=TEMPERATURE` at 0 on every node
+strains α T exactly (1.2e-3 at every integration point, no stress), so the converter adds
+that card, on the whole-model node set, ahead of the first step. ccx then needs an initial
+temperature in every node ("*ERROR in checktemp: no initial temperature defined in node"),
+which the converter already gave the nodes a deck's own initial conditions leave out — but
+it counted them before planning the knot beams of circular-section beams and `OP=NEW`, so a
+knot beam's free node had none: a heated `CIRC` beam pinned with its twist held stopped even
+with initial temperatures on every one of its own nodes, and now expands within 5e-6 of
+α ΔT L. Only the cards ccx reads count (a `USER` card is commented out), and two cases
+keep ccx's stop. A `*TEMPERATURE, FILE=` card: ccx reads it as a CalculiX `.frd` results
+file, and without one prints only "ERROR in readfrd" (no asterisk, so `classify_ccx_run`
+sees a solve) and runs on undefined temperatures (1.2357 at every node) — warned. And
+`*TEMPERATURE` in a heat transfer or coupled temperature-displacement step, which ccx
+refuses with initial temperatures too and Abaqus does not allow (temperature is DOF 11
+there, prescribed with `*BOUNDARY`): commented out, warned. Not covered: a transient heat
+transfer or coupled step without initial temperatures stops ccx as well ("please define
+initial conditions for the temperature"; `leonghien_cts_2d`/`_3d` and
+`quylavan_thermal_electric_structure` have one). In the corpus only `collinsjesurobo_expansion`
+and `collinsjesurobo_fea`, pipeline decks heated in a later step, convert differently: they
+gain the initial temperatures and still stop where they did (a `*SURFACE` type ccx does not
+know, an unresolved `<wt>` parameter, an external pipe pressure `*DLOAD PE`); all other 1071
+corpus files convert byte-identically. `validate_with_ccx.py` checks the cube and the beam.
 
 **NaN and Inf results.** A solution that diverges ends like any other in ccx 2.23 ("Job
 finished", exit 0): an explicit step on circular-section beams printed NaN for every

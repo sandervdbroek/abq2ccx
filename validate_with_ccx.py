@@ -16,10 +16,11 @@ planar (B21) beams with a rectangular and a circular section, per-element *DISTR
 orientations (a C3D8 plate and a composite S8R panel) against the same models written with
 one orientation per element, a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, the thermal strains of isotropic materials with an orthotropic / anisotropic
-expansion (including the engineering shear coefficients of an anisotropic one), and the
-loads ccx has no card for — surface tractions (Cook's membrane, Lame's cylinder) and beam
-line loads (cantilevers against beam theory) — applied as consistent nodal forces, also on
-nodes with a *TRANSFORM (local axes), which must match the same models without one.
+expansion (including the engineering shear coefficients of an anisotropic one), a heated
+cube and circular-section beam with no initial temperatures, and the loads ccx has no card
+for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads (cantilevers
+against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
+(local axes), which must match the same models without one.
 
     python validate_with_ccx.py
 
@@ -800,6 +801,36 @@ def main():
         ok = err <= 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  {name} with *TRANSFORM ({how}): u at {len(u[1])} nodes "
               f"differs from the model without it by {err:.1e} of max |u| ({scale:.4g})")
+        failures += 0 if ok else 1
+
+    # --- *Temperature without initial temperatures ------------------------------------------
+    # Abaqus starts every node at 0 when a deck gives no initial temperatures; ccx stops on
+    # *TEMPERATURE unless thermal *INITIAL CONDITIONS precede it, so the converter adds them
+    # at 0 for every node — also the free node of the knot beam at the circular-section
+    # beam's pinned end.  A free cube heated to T = 100 must strain alpha T, the beam's far
+    # end move alpha T L.
+    inp = os.path.join(tmp, "no_initial_temperature.inp")
+    convert(os.path.join(EXAMPLES, "thermal_no_initial_temperature.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+    shutil.rmtree(d, ignore_errors=True)
+    alpha_t = 1.2e-5 * 100.0
+    if not u or any(n not in u for n in (1, 2, 4, 5, 13)):
+        print(f"FAIL  thermal_no_initial_temperature: no displacements ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        # the cube's homogeneous strain from the corners at unit offsets x, y, z of node 1
+        h = [[u[n][i] - u[1][i] for n in (2, 4, 5)] for i in range(3)]       # du_i / dx_j
+        eps = [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2,
+               (h[1][2] + h[2][1]) / 2]
+        err_cube = max(abs(x - y) for x, y in zip(eps, [alpha_t] * 3 + [0.0] * 3)) / alpha_t
+        err_beam = abs(u[13][0] - alpha_t * 100.0) / (alpha_t * 100.0)
+        ok = err_cube < 1e-6 and err_beam < 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  thermal_no_initial_temperature (*Temperature, no initial "
+              f"temperatures): cube strain {eps[0]:.6e} / {eps[1]:.6e} / {eps[2]:.6e} (alpha T = "
+              f"{alpha_t:.6e}, {err_cube:.1e} off); CIRC beam end u_x = {u[13][0]:+.6f} (alpha T L "
+              f"= {alpha_t * 100.0:+.6f}, {err_beam * 100:.4f}% diff)")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

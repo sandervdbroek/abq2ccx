@@ -1248,6 +1248,14 @@ PROC_KW = {"STATIC", "FREQUENCY", "BUCKLE", "DYNAMIC", "MODAL DYNAMIC", "HEAT TR
            "UNCOUPLED TEMPERATURE-DISPLACEMENT", "CRACK PROPAGATION", "HCF", "SENSITIVITY",
            "FEASIBLE DIRECTION", "NO ANALYSIS"}
 
+# Procedures in which temperature is a degree of freedom (11): Abaqus does not allow a
+# predefined temperature field (*TEMPERATURE) in their steps — *BOUNDARY prescribes DOF 11
+# there — and ccx stops on the card ("this is a *HEAT TRANSFER or (UN)COUPLED TEMPERATURE-
+# DISPLACEMENT analysis").
+TEMPERATURE_DOF_PROCS = {"HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                         "UNCOUPLED TEMPERATURE-DISPLACEMENT", "COUPLED THERMAL-ELECTRICAL",
+                         "DYNAMIC TEMPERATURE-DISPLACEMENT"}
+
 # Step (history) data: valid only between *STEP and *END STEP.  Outside a step Abaqus
 # rejects these, ccx stops with "*CLOAD should only be used within a STEP" — and ccx 2.23
 # segfaults outright when the deck has no *STEP at all (verified: *CLOAD, *DLOAD,
@@ -1907,6 +1915,9 @@ class Converter:
         self._general_step_seen = False
         self._cyclic_ok: set = set()
         self._temp_ic_fill = False
+        self._temp_ic_default = False
+        self._temp_ic_covered: Optional[set] = None    # nodes the deck's initial temperatures name
+        self._step_temp_dof: Optional[str] = None  # the step's procedure if temperature is a DOF
         # planar 2-D beams/trusses: element -> its PLANAR_LINE_TYPES type, and the model-data
         # *BOUNDARY lines that keep them in their plane (_plan_planar_constraint)
         self._planar_elems: Dict[int, str] = {}
@@ -2238,6 +2249,8 @@ class Converter:
                 i += 1
                 continue
             if b.keyword == "STEP":
+                if self._temp_ic_default and self._step_idx == 0:
+                    out.extend(self._default_temperature_ic())
                 group = []
                 j = i
                 while j < n:
@@ -3907,12 +3920,15 @@ class Converter:
         out = [emit_keyword("STEP", params)]
         self._nodal_fresh, self._nodal_reset, self._cload_new = set(), set(), False
         self._dl_fresh, self._dl_wiped = set(), False
+        self._step_temp_dof = next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS),
+                                   None)
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
             out.extend(self.translate_one(b))
         out.extend(self._flush_dloads())
         out.extend(self._flush_nodal_loads())
+        self._step_temp_dof = None
         out.append("*END STEP")
         return out
 
@@ -5829,7 +5845,16 @@ class Converter:
 
     def handle_temperature(self, b: Block) -> List[str]:
         """``*TEMPERATURE`` passes through; the midside nodes of upgraded 2-node beams get the
-        mean of their end nodes' values.  USER (Abaqus UTEMP) is commented out."""
+        mean of their end nodes' values.  USER (Abaqus UTEMP) is commented out.  In a step where
+        temperature is a degree of freedom (``TEMPERATURE_DOF_PROCS``) Abaqus does not allow
+        the card and ccx stops on it (probed on 2.23, with and without initial temperatures):
+        commented out."""
+        if self._step_temp_dof:
+            return self._commented(b, f"*TEMPERATURE in a *{self._step_temp_dof} step: temperature "
+                                      f"is degree of freedom 11 there, and Abaqus does not allow a "
+                                      f"predefined temperature field in such a step (prescribe the "
+                                      f"temperature with *BOUNDARY on DOF 11); ccx stops on the "
+                                      f"card. Commented out.")
         if b.has("USER"):
             return self._user_load_card(b)
         return self.passthrough(b) + self._midside_records(b, "field")
@@ -5851,6 +5876,31 @@ class Converter:
         if not side:
             return self.passthrough(b)
         return ([emit_keyword(b.keyword, b.params)] + kept if kept else []) + side
+
+    def _default_temperature_ic(self) -> List[str]:
+        """Initial temperatures for a deck that applies ``*TEMPERATURE`` without any: Abaqus
+        starts every node at 0, and ccx reads a *TEMPERATURE card only after thermal
+        *INITIAL CONDITIONS (verified on 2.23: a free heated cube then strains alpha T
+        exactly)."""
+        self.report.note(f"*TEMPERATURE with no *INITIAL CONDITIONS, TYPE=TEMPERATURE: every node "
+                         f"starts at 0, the Abaqus default, so thermal strains count from 0 "
+                         f"(*INITIAL CONDITIONS, TYPE=TEMPERATURE / {ALL_NODES_SET}, 0. added "
+                         f"before the first step); ccx stops on *TEMPERATURE without thermal "
+                         f"initial conditions.", once=True)
+        return ["** [abq2ccx] initial temperatures: the Abaqus default, 0, at every node (ccx "
+                "reads *TEMPERATURE only after thermal initial conditions)",
+                "*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"{ALL_NODES_SET}, 0."]
+
+    def _complete_temperature_ic(self) -> None:
+        """Once a deck has initial temperatures ccx needs one in every node ("no initial
+        temperature defined in node"), also at the free ends of the knot beams planned after
+        _prescan (_plan_circ_rotation_knots, _plan_op_new_rotations): those get the Abaqus
+        default 0 with the other nodes the deck's initial conditions leave out."""
+        cov = self._temp_ic_covered
+        if cov is not None and not self._temp_ic_fill and not set(self.geom.nodes) <= cov:
+            self._temp_ic_fill = True
+        if self._temp_ic_fill or self._temp_ic_default:
+            self.geom.nsets[ALL_NODES_SET] = list(self.geom.nodes)
 
     def handle_normal(self, b: Block) -> List[str]:
         """``*NORMAL`` passes through.  ccx builds a beam's expanded cross-section from the
@@ -6055,6 +6105,7 @@ class Converter:
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_circ_explicit_increment(blocks)
+        self._complete_temperature_ic()         # after every planner that adds knot nodes
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
         # errors without the card) — handle_surface_interaction synthesizes HARD for these
         self._si_missing_behavior = set()
@@ -6472,8 +6523,41 @@ class Converter:
                     if rec and rec[0]:
                         covered.update(self._resolve_nodes(rec[0]))
                 covered.update(int(ln.split(",")[0]) for ln in self._midside_records(b, "field"))
+        self._temp_ic_covered = covered if any_temp_ic else None     # _complete_temperature_ic
         if any_temp_ic and self.geom.nodes and not set(self.geom.nodes) <= covered:
             self._temp_ic_fill = True
+        # ... and with none at all it stops on the first *TEMPERATURE card ("no thermal
+        # *INITIAL CONDITIONS are given"): every node then starts at the Abaqus default, 0,
+        # ahead of the first step (emit_other) — for the cards ccx reads: those outside steps,
+        # in steps where temperature is a DOF and with USER are commented out
+        self._temp_ic_default = False
+        if not any_temp_ic and self.geom.nodes:
+            steps: List[List[Block]] = []          # grouped as emit_other groups them
+            inside = False
+            for b in blocks:
+                if b.keyword == "STEP" and not inside:
+                    inside = True
+                    steps.append([])
+                elif b.keyword == "END STEP":
+                    inside = False
+                elif inside:
+                    steps[-1].append(b)
+            temps = [b for s in steps if not any(x.keyword in TEMPERATURE_DOF_PROCS for x in s)
+                     for b in s if b.keyword == "TEMPERATURE" and not b.has("USER")]
+            # temperatures ccx cannot take from the deck: with them the default would turn
+            # ccx's stop into a run on undefined temperatures (probed on 2.23: with the FILE=
+            # file missing ccx only prints "ERROR in readfrd")
+            if any(b.has("FILE") for b in temps):
+                self.report.warn("*TEMPERATURE, FILE= with no *INITIAL CONDITIONS, TYPE=TEMPERATURE: "
+                                 "ccx stops on the card ('no thermal *INITIAL CONDITIONS'). The "
+                                 "Abaqus default initial temperature (0) was not added: ccx reads "
+                                 "FILE= as a CalculiX .frd results file, not Abaqus' .odb/.fil, and "
+                                 "runs on undefined temperatures without one. Run the heat transfer "
+                                 "in ccx and point FILE= at its .frd, then add the initial "
+                                 "temperatures.", once=True)
+            elif temps:
+                self._temp_ic_default = True
+        if self._temp_ic_fill or self._temp_ic_default:
             self.geom.nsets.setdefault(ALL_NODES_SET, list(self.geom.nodes))
         # Johnson-Cook *PLASTIC cards whose material also has a *RATE DEPENDENT card
         self._jc_with_rate = set()
