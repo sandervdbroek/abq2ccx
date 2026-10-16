@@ -1957,6 +1957,43 @@ def test_composite_ply_orientation_named_per_instance():
     assert "1., 1, M, 45., Ply-2" in body                                       # angle kept
 
 
+def test_shell_general_section_copied_per_instance():
+    # a part's *Shell General Section is copied per instance like a *Shell Section: on the
+    # instance's own set, naming the instance's orientations (also on ply lines).  Emitted
+    # once with the part's names, it named an undefined set and no instance had a section.
+    part = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "5, .5, 0., 0.\n6, 1., .5, 0.\n7, .5, 1., 0.\n8, 0., .5, 0.\n"
+            "*Element, type=S8R, elset=PANEL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Orientation, name=Ori-1\n1., 0., 0., 0., 1., 0.\n"
+            "*Orientation, name=Ori-2\n0., 1., 0., -1., 0., 0.\n{}*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
+            "*Instance, name=I2, part=P\n2., 0., 0.\n0., 0., 0., 0., 0., 1., 90.\n*End Instance\n"
+            "*End Assembly\n*Material, name=M\n*Elastic\n1000., 0.3\n")
+    bodies = {}
+    for form, section in (("material", "*Shell General Section, elset=PANEL, material=M, "
+                                       "orientation=Ori-1\n0.1,\n"),
+                          ("composite", "*Shell General Section, elset=PANEL, composite, "
+                                        "orientation=Ori-1\n0.1, , M, 0., Ply-1\n"
+                                        "0.1, , M, Ori-2, Ply-2\n0.1, , M, 45., Ply-3\n")):
+        body, _, _ = convert_str(part.format(section))
+        live = _live(body)
+        # one section per instance; the sets and orientations they name are all defined
+        assert sum(l.startswith("*SHELL SECTION") for l in live) == 2, form
+        assert all(f"*ORIENTATION, NAME={i}_ORI-{k}" in live for i in ("I1", "I2") for k in (1, 2))
+        g = reparse(body)
+        assert g.elsets["I1_PANEL"] == [1] and g.elsets["I2_PANEL"] == [2]
+        assert not dangling_refs(g), dangling_refs(g)
+        bodies[form] = body
+    for inst, axes in (("I1", "1., 0., 0., 0., 1., 0."), ("I2", "0., 1., 0., -1., 0., 0.")):
+        assert _card(bodies["material"], f"*SHELL SECTION, ELSET={inst}_PANEL, MATERIAL=M, "
+                                         f"ORIENTATION={inst}_ORI-1") == ["0.1"]
+        plies = _card(bodies["composite"], f"*SHELL SECTION, ELSET={inst}_PANEL, COMPOSITE")
+        assert plies[:2] == [f"0.1, , M, {inst}_ORI-1", f"0.1, , M, {inst}_ORI-2"], plies
+        # the 45 deg ply turns this instance's copy of the section axes (I2's are turned)
+        assert _card(bodies["composite"], "*ORIENTATION, NAME=" + plies[2].split(", ")[-1]) == \
+            [axes, "3, 45."]
+
+
 def test_distribution_shell_section_split_per_direction():
     # ccx gives every element of a shell section the distribution's first line, so the
     # section is split into one set + plain orientation + section per distinct direction

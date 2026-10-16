@@ -5520,9 +5520,9 @@ def dedup_str(seq: Sequence[str]) -> List[str]:
 # Assembly flattening (*PART / *INSTANCE / *ASSEMBLY -> flat blocks)
 # ---------------------------------------------------------------------------
 
-PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
-                     "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT", "MASS", "GAP",
-                     "ORIENTATION", "DISTRIBUTION", "SURFACE"}
+PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
+                     "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT",
+                     "MASS", "GAP", "ORIENTATION", "DISTRIBUTION", "SURFACE"}
 # Part-level constraint cards that reference the part's own nodes/elements/sets: each
 # instance needs its own copy with offset ids and prefixed names (emitted once, raw,
 # they would constrain only one instance — or the wrong nodes after renumbering).
@@ -5884,8 +5884,9 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             rect = (b.param("SYSTEM") or "RECTANGULAR").upper().startswith("RECT")
             dist_move[ref] = (rotv if rot else None) if rect else (rotp if rot or any(T) else None)
     for b in inst_blocks:
-        if b.keyword in ("SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
-                         "COHESIVE SECTION", "GASKET SECTION", "SPRING", "DASHPOT", "MASS", "GAP"):
+        if b.keyword in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
+                         "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SPRING",
+                         "DASHPOT", "MASS", "GAP"):
             nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer)
             if b.has("COMPOSITE"):
                 # a ply line (thickness, points, material, angle or orientation, ply name)

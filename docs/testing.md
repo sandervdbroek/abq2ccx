@@ -21,7 +21,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (147)
+## 1. Unit tests — `tests/test_convert.py` (148)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -171,6 +171,7 @@ conversion behaviour and referential integrity.
 | `test_distribution_named_by_two_orientations_gets_two_copies` | two `*ORIENTATION`s naming one distribution get a copy each, listing only their own sections' elements |
 | `test_distribution_flattened_per_instance` | a part's distribution per instance: its name and the orientation's reference to it prefixed, element labels offset, axes turned with a rotated instance |
 | `test_composite_ply_orientation_named_per_instance` | a composite ply line naming one of the part's orientations names the instance's copy; a ply angle is kept |
+| `test_shell_general_section_copied_per_instance` | a part's `*Shell General Section` (thickness + material, and composite) is copied per instance: a `*SHELL SECTION` on each instance's own set, naming its copies of the orientations, also on ply lines; a ply angle turns the instance's own (rotated) axes; no dangling refs |
 | `test_distribution_shell_section_split_per_direction` | a shell section on a distribution orientation → one element set, plain `*ORIENTATION` and section per direction; composite plies: an angle turns the group's axes, a ply may name a distribution orientation of its own |
 | `test_distribution_without_data_comments_out_its_orientation` | a distribution with no data (missing `INPUT=` file): its orientation is commented out with the reason |
 | `test_distribution_not_named_by_an_orientation_commented` | a distribution no `*ORIENTATION` names (a shell-thickness/material distribution in Abaqus) is commented out |
@@ -438,6 +439,19 @@ remains: the five TexGen decks' distribution data lives in `.ori` files not in t
 `shridharbailkeri_solid_plate_cfrp` has a composite section on continuum shells (no layered
 solid section in ccx) and a HASHIN damage criterion ccx rejects, and
 `vineethravi2310_tensile` has a UMAT and a composite solid section.
+
+**Shell general sections in parts.** Flattening copies a part's sections per instance onto
+the instance's renamed sets, but left out `*Shell General Section`: it was emitted once with
+the part's own set and orientation names (`PANEL`, while the instances' sets are `I1_PANEL`
+and `I2_PANEL`), so ccx stopped on the undefined set or orientation and no instance had a
+section; one inside an `*Instance` block was dropped without a trace. It is now copied per
+instance like a `*Shell Section`, its composite ply lines naming the instance's orientations.
+Probed on 2.23 with an `S8R` lamina plate (fibres at 30°) as a part with two instances, one
+turned 90° about z: both instances give the displacements of the same plate written without
+parts, exactly, in the thickness + material form and in a composite form with a ply on a
+second orientation and a 90° ply (with I2's section on I1's orientation, they miss by 138 %
+of max |u|). No corpus deck has such a section (the one deck with a `*Shell General Section`
+has no parts), and all 1073 corpus files convert byte-identically.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after
