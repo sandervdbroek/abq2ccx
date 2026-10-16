@@ -211,12 +211,20 @@ TRANSLATED = {
     "*SURFACE": "only `NAME`/`TYPE` kept; shell edges `E1..E4` → `S3..S6` (plane elements "
         "`S1..S4`); `ANALYTICAL RIGID` / `COMBINE` commented; `SPOS`/`SNEG` flagged; faces of "
         "surface elements (not in the ccx mesh) left out, a surface of them only dropped.",
-    "*OUTPUT / *NODE OUTPUT / *ELEMENT OUTPUT": "→ `*NODE FILE`/`*EL FILE`; `*OUTPUT` wrapper "
-        "dropped.",
+    "*OUTPUT / *NODE OUTPUT / *ELEMENT OUTPUT": "field output → `*NODE FILE`/`*EL FILE` (.frd), "
+        "history output for a set → `*NODE PRINT`/`*EL PRINT` (.dat); the `*OUTPUT` card is dropped "
+        "and its `FREQUENCY`/`NUMBER INTERVAL`/`TIME INTERVAL`/`TIME POINTS` go onto the step's "
+        "first output card (ccx has one for all output of a step: the .frd requests' first, Abaqus' "
+        "defaults kept; intervals → generated `*TIME POINTS`, or a frequency from a fixed or maximum "
+        "increment); `FREQUENCY=0` drops its requests. Per .frd variable one node set (ccx keeps the "
+        "last card's): the whole model before a set, several sets joined; a set the .frd cannot "
+        "show — beam/shell nodes of a model ccx writes expanded, reference points — is also "
+        "printed, or gets `OUTPUT=2D` when the deck's .frd output is only U/V/RF.",
     "*NODE FILE / *EL FILE / *NODE PRINT / *EL PRINT": "`POSITION=`/`DIRECTIONS=` stripped, "
-        "`FREQ`→`FREQUENCY`, `FREQUENCY=0` dropped, variables mapped and filtered against ccx's "
-        "label list for that card (an unknown `*EL PRINT` label stops ccx); a print card "
-        "without a set gets a whole-model set (Abaqus prints everything, ccx nothing).",
+        "`FREQ`→`FREQUENCY` (one per step, as above), `FREQUENCY=0` dropped, variables mapped and "
+        "filtered against ccx's label list for that card (an unknown `*EL PRINT` label stops ccx); "
+        "a print card without a set gets a whole-model set (Abaqus prints everything, ccx "
+        "nothing).",
     "*CONTACT OUTPUT / *CONTACT FILE": "→ `*CONTACT FILE`; `CDISP`/`CSTRESS` kept as ccx's "
         "`CDIS`/`CSTR`, other Abaqus contact variables dropped (a card left empty is dropped).",
     "Step data outside a *STEP": "`*CLOAD`, `*DLOAD`, output and procedure cards before the first "

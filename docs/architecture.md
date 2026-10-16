@@ -29,7 +29,9 @@ Converter._prescan()   deck-wide facts the handlers need: node kinds, the connec
                        members their reference node imposes or, on a *RIGID BODY, takes over
                        (_plan_coupled_bcs), the velocity / acceleration BCs
                        (_plan_velocity_bcs), …; then _plan_distributions(),
-                       _plan_planar_constraint() and _plan_circ_rotation_knots()
+                       _plan_planar_constraint() and _plan_circ_rotation_knots(); last
+                       _plan_output(): each step's output requests fitted to ccx's output
+                       model (.frd or .dat, one node set per variable, one output control)
         │
         ▼
 emit_geometry()  +  emit_other()     Pass B: write nodes/elements/sets from the registry,

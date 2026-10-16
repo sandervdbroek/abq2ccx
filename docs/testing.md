@@ -11,8 +11,8 @@ The converter has three layers of tests:
    loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate across a later
    step's `*BOUNDARY, OP=NEW`, heated models with no initial temperatures, rigidly coupled
    models (a shell plate, and bars whose coupled nodes also carry BCs), the `*MPC`
-   conversions, connector elements, the loads applied as nodal forces and velocity /
-   acceleration BCs numerically.
+   conversions, connector elements, the loads applied as nodal forces, velocity /
+   acceleration BCs and field and history output requested at beam nodes numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -26,7 +26,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (245)
+## 1. Unit tests — `tests/test_convert.py` (253)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -164,6 +164,14 @@ conversion behaviour and referential integrity.
 | `test_rigid_body_reference_rotations_go_to_rot_node` | a `*RIGID BODY` gets an explicit `ROT NODE`; `ENCASTRE` and moments on the reference point reach its DOFs 1–3 (ccx ignores DOFs 4–6 of the REF NODE) |
 | `test_el_print_unknown_labels_dropped` | unknown `*EL PRINT` labels (fatal in ccx) are dropped; a card left empty is dropped |
 | `test_contact_output_maps_to_ccx_labels` | `*CONTACT OUTPUT` → `*CONTACT FILE` with `CDIS`/`CSTR`; names ccx doesn't know (`CPRESS`, `CFORCE`) are dropped, and a card left empty is dropped |
+| `test_history_output_goes_to_print_cards` | `*OUTPUT, HISTORY` + `*NODE OUTPUT, NSET=` → `*NODE PRINT` and `*ELEMENT OUTPUT, ELSET=` → `*EL PRINT` beside the field output's whole-model `*NODE FILE`/`*EL FILE` (no `*NODE FILE, NSET=` left to replace it); a history set the deck never defines is dropped |
+| `test_frd_node_sets_one_per_variable` | per step and `.frd` variable one node set: a whole-model request wins over a set's, U on two sets gets their union (`ABQ2CCX_OUTPUT`, emitted with both sets' nodes), RF on one set stays |
+| `test_frd_set_at_reference_node_printed` | field output at a reference point (a node of no element, in no `.frd`) → `*NODE PRINT`, also when the whole-model request covers the variable |
+| `test_beam_node_set_output_2d_or_printed` | a node set of `B31` nodes in the `.frd`: `OUTPUT=2D` on the first `*NODE FILE` when the deck's `.frd` output is only U/V/RF (step 1 only), a `*NODE PRINT` instead of the `.frd` card when the deck also writes element output |
+| `test_output_frequency_carried_to_the_step` | `*OUTPUT, FREQUENCY=` reaches the step's first output card and the history request follows it (one frequency per step in ccx); the next step resets it (`FREQUENCY=1`); `FREQUENCY=0` drops its requests |
+| `test_output_intervals_to_time_points_or_frequency` | `NUMBER INTERVAL` → a generated `*TIME POINTS, GENERATE` before the first `*STEP` (automatic increments), `TIME INTERVAL` under `DIRECT` → `FREQUENCY` from the fixed increment; the deck's own `*TIME POINTS` are used by name |
+| `test_dynamic_output_defaults_and_explicit_intervals` | implicit `*DYNAMIC` output every 10 increments (the Abaqus default); `*MODAL DYNAMIC` and explicit `DIRECT USER CONTROL` intervals → `FREQUENCY` from the fixed increment, explicit intervals with a maximum increment → `FREQUENCY` from it, without either → warned |
+| `test_beam_output_requests_example` | the bundled `beam_output_requests` deck: `*TIME POINTS` at 0.25…1, `*NODE FILE, NSET=TIP, OUTPUT=2D` and `*NODE PRINT, NSET=MID`; no dangling refs |
 | `test_cload_orientation_warned` | `*CLOAD, ORIENTATION=` (local load axes) is warned |
 | `test_blankless_keywords_recognised` | blank-less keywords (`*SOLIDSECTION`, `*ELPRINT`, `*ENDSTEP`) are recognised as ccx does |
 | `test_frequency_storage_for_later_modal_step` | `*FREQUENCY` gets `STORAGE=YES` when a later modal/steady-state step needs its eigenmodes |
@@ -475,6 +483,15 @@ deck and runs it in CalculiX:
   (explicit ringing up to 6.7 % at the front; Abaqus damps it with bulk viscosity), nothing
   ahead of it, the end at v t = 0.005. Implicit (fixed increments), by an acceleration 0.04:
   the stress follows −ρca(t − z/c) within 1.5 % and the end reaches a t²/2 = 0.005.
+* **`beam_output_requests`** — a `B32` cantilever with a rectangular section (L = 240,
+  12 elements) under a tip load in an `NLGEOM` step, whose deck asks for field output
+  (`U`, `RF`) at the tip node set and history output (`U`) at mid-span, with `NUMBER
+  INTERVAL = 4`. ccx writes a beam model to the `.frd` expanded to 3-D, without the beam
+  nodes; the converter adds `OUTPUT=2D` (the deck's `.frd` output is only U and RF), sends
+  the history to `*NODE PRINT` and the interval to `*TIME POINTS`. Checks the `.frd` tip
+  deflection at t = 0.25, 0.5, 0.75 and 1, −3.2801 vs Timoshenko beam theory −3.3089
+  (0.9 %), and the `.dat` mid-span history at the same times, −1.0236 vs −1.0373 (1.3 %).
+  Without `OUTPUT=2D` the same deck writes four empty `.frd` blocks, and the check fails.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -1261,6 +1278,45 @@ so the converter used to comment it out and ccx stopped at the BC) now reaches i
 its real limit. `sahmotaman_coldforging` still stops at its die-axis overconstraint; its
 second punch has no BC before the step that drives it, so that velocity is not converted
 (warned). Net: +2 (198 → 200 in the gate, 184 → 186 under their own loads).
+
+**Output requests.** Found while checking an explicit beam deck whose `*Output, history` at
+a beam node gave an `.frd` with empty displacement blocks. Probed on 2.23 (and read off
+`elements.f`, `noelfiles.f`, `frdset.c`, `map3dto1d2d.f`, `checkconvergence.c`): a model
+with any beam or shell is written to the `.frd` expanded to 3-D — ccx's default `OUTPUT=3D`
+then, `OUTPUT=2D` for plane, membrane and truss models — so the original nodes of every
+beam, shell, truss, membrane and plane element are missing from it (a `*NODE FILE, NSET=` of
+them writes empty blocks, with or without an explicit `OUTPUT=3D`), and a node of no element
+is in no `.frd`. `OUTPUT=2D`, read in the first step only and global, gives the beam/shell
+nodes the mean displacement and the summed force of the expanded nodes (a `B32` node's U
+equals its `*NODE PRINT` value exactly; solid U and S stay bit-identical), but averages
+stresses through the thickness (an `S8R` plate's ±116.8 bending stress becomes 3e-11).
+`OUTPUT ALL` writes such nodes too but pads the `.frd` mesh with every unused node id, at
+the origin. A `.frd` keeps one node set per variable and step, so the history request's
+`*NODE FILE, NSET=` replaced the field output's whole-model U. ccx has one output control
+per step — the last `FREQUENCY=` or `TIME POINTS=` on any card, kept for later steps — and
+`TIME POINTS` stop ccx under `DIRECT` and in `*MODAL DYNAMIC` and are ignored in explicit
+dynamics (114 increments, 114 `.frd` blocks). So history output for a set now goes to `*NODE
+PRINT` / `*EL PRINT`; each step's `.frd` node requests are resolved per variable (the whole
+model before a set, several sets joined); a `.frd` set with nodes the `.frd` lacks is also
+printed, or gets `OUTPUT=2D` when the deck's `.frd` output is only U/V/RF; and `*OUTPUT`'s
+`FREQUENCY` / `NUMBER INTERVAL` / `TIME INTERVAL` / `TIME POINTS` (and Abaqus' defaults)
+reach the step's first output card, as generated `*TIME POINTS` or a frequency from a fixed
+or maximum increment. Of the 1073 corpus files 787 convert differently, 308 in their cards
+(the rest only in the report's notes): 212 decks send history output to the `.dat`, 39 get
+`*TIME POINTS`, 19 leave a set request to the step's whole-model one (given after it, the
+set used to replace it), 15 print a set the `.frd` cannot show (reference points,
+`louisepb`'s six constraint drivers joined into one set), 2 shell decks get `OUTPUT=2D`, and
+57 explicit decks are warned that ccx writes every increment. Run old and new in ccx, all
+308 keep their verdict (the 32 the corpus gates still solve), and the `.frd` blocks without
+a single node fall from 93542 to 1000 (contact output of a deck without contact, as before):
+`nasa_test_s4r_elementsize`, for one, had no nodal output left, its history sets of shell
+nodes having replaced the whole-model U and RF. `lcharleux_indentation_axi` keeps its field
+output's `FREQUENCY=999999` (31 MB → 0.8 MB of `.frd`), and `idaholab_hopper_hypoplastic`
+writes its explicit output every 0.05 s of a fixed 1e-5 increment (`FREQUENCY=5000`). Where
+a deck's first error is ccx's own — `*DAMAGE INITIATION` with a criterion ccx does not know
+makes its input sizing swallow the following cards — a later `*NODE PRINT` or `*TIME POINTS`
+adds an "increase nprint_" / "nam_" error; those decks stop as before.
+`validate_with_ccx.py` checks a beam deck's `.frd` and `.dat` values against beam theory.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

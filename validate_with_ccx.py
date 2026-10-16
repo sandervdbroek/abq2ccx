@@ -22,8 +22,9 @@ for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads
 against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
 (local axes), which must match the same models without one, *MPC joints, levers and links
 against statics, connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
-theory and exact statics, and velocity / acceleration boundary conditions against their
-time integral and the wave they send through a bar.
+theory and exact statics, velocity / acceleration boundary conditions against their
+time integral and the wave they send through a bar, and field and history output
+requested at beam nodes (the .frd and .dat values against beam theory).
 
     python validate_with_ccx.py
 
@@ -108,6 +109,27 @@ def frd_stress(frd_path, node):
             if ln.startswith(" -1") and int(ln[3:13]) == node:
                 return [float(ln[13 + i * 12:13 + (i + 1) * 12]) for i in range(6)]
     return None
+
+
+def frd_displacement_history(frd_path, node):
+    """[(time, (ux, uy, uz))] of every DISP block of a ccx .frd file that lists ``node``,
+    and the number of DISP blocks that list no node at all."""
+    found, empty, time, inblock, rows = [], 0, None, False, 0
+    if not os.path.exists(frd_path):
+        return found, empty
+    for ln in open(frd_path):
+        if ln.startswith("  100C"):
+            time = float(ln.split()[2])
+        elif ln.startswith(" -4") and ln[5:13].strip() == "DISP":
+            inblock, rows = True, 0
+        elif inblock and ln.startswith(" -1"):
+            rows += 1
+            if int(ln[3:13]) == node:
+                found.append((time, tuple(float(ln[13 + i * 12:25 + i * 12]) for i in range(3))))
+        elif inblock and ln.startswith(" -3"):
+            empty += rows == 0
+            inblock = False
+    return found, empty
 
 
 def dat_displacements(dat_path):
@@ -1209,6 +1231,46 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  velocity_bc_bar ({label}): driven end u = "
               f"{u[1][2]:.6f} (0.005); wave stress behind the front {mean * 100:.1f}% off on "
               f"average ({worst * 100:.1f}% at worst), {ahead * 100:.2f}% ahead of it")
+        failures += 0 if ok else 1
+
+    # --- output requests at beam nodes: field output for a node set, history at a node ----
+    # ccx 2.23 writes a model with beams to the .frd expanded to 3-D, without the original
+    # beam nodes, so a *NODE FILE for a set of them writes empty blocks (shown below without
+    # OUTPUT=2D).  This checks the tip displacements the .frd gets with the OUTPUT=2D abq2ccx
+    # adds, the mid-span history in the .dat (*NODE PRINT), and that both follow the
+    # *TIME POINTS the deck's NUMBER INTERVAL = 4 became.
+    inp = os.path.join(tmp, "beam_output.inp")
+    convert(os.path.join(EXAMPLES, "beam_output_requests.inp"), inp)
+    e, nu, p, length = 210000.0, 0.3, 1000.0, 240.0
+    inertia, area = 10.0 * 20.0 ** 3 / 12, 200.0
+    shear = p / (10 * (1 + nu) / (12 + 11 * nu) * e / (2 * (1 + nu)) * area)  # 1 / (k G A) * P
+    ref_tip = -(p * length ** 3 / (3 * e * inertia) + shear * length)
+    ref_mid = -(p * (length / 2) ** 2 * 2.5 * length / (6 * e * inertia) + shear * length / 2)
+    d, status, out = run_ccx(ccx, env, inp)
+    tip, _ = frd_displacement_history(os.path.join(d, "job.frd"), 25) if status == "solved" else ([], 0)
+    mid = dat_displacement_history(os.path.join(d, "job.dat"), 13) if status == "solved" else []
+    shutil.rmtree(d, ignore_errors=True)
+    bare = os.path.join(tmp, "beam_output_3d.inp")
+    with open(inp) as fi, open(bare, "w") as fo:
+        fo.write(fi.read().replace(", OUTPUT=2D", ""))
+    d, status3d, _ = run_ccx(ccx, env, bare)
+    tip3d, empty3d = frd_displacement_history(os.path.join(d, "job.frd"), 25)
+    shutil.rmtree(d, ignore_errors=True)
+    if len(tip) != 4 or len(mid) != 4:
+        print(f"FAIL  beam_output_requests: {len(tip)} tip displacements in the .frd and "
+              f"{len(mid)} mid-span ones in the .dat, expected 4 each ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        times = [t for t, _ in tip]
+        d_tip, d_mid = abs(tip[-1][1][1] - ref_tip) / abs(ref_tip), abs(mid[-1][1] - ref_mid) / abs(ref_mid)
+        ok = (all(abs(t - k / 4) < 1e-9 for k, t in enumerate(times, 1)) and d_tip < 0.02 and
+              d_mid < 0.02 and status3d == "solved" and not tip3d and empty3d == 4)
+        print(f"{'PASS' if ok else 'FAIL'}  beam_output_requests (*NODE OUTPUT at B32 nodes): .frd tip "
+              f"deflection {tip[-1][1][1]:+.4f} (beam theory {ref_tip:+.4f}, {d_tip * 100:.1f}% diff) "
+              f"at t = {', '.join(f'{t:g}' for t in times)}; .dat mid-span {mid[-1][1]:+.4f} (beam "
+              f"theory {ref_mid:+.4f}, {d_mid * 100:.1f}% diff); without OUTPUT=2D {empty3d} empty "
+              f".frd blocks")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

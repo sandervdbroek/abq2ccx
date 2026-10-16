@@ -2151,6 +2151,138 @@ def test_contact_output_maps_to_ccx_labels():
     assert "*CONTACT FILE" not in body
 
 
+OUT_BEAM = ("*Node\n1, 0., 0., 0.\n7, 60., 0., 0.\n*Ngen, nset=AXIS\n1, 7, 1\n*Nset, nset=TIP\n7\n"
+            "*Element, type=B31, elset=BEAM\n1, 1, 2\n*Elgen, elset=BEAM\n1, 6, 1, 1\n"
+            "*Beam Section, elset=BEAM, material=M, section=RECT\n1., 2.\n0., 0., -1.\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Boundary\n1, ENCASTRE\n")
+
+
+def _step(body, k):
+    """The text of step ``k`` (1-based) of a converted deck."""
+    return body.split("*STEP")[k].split("*END STEP")[0]
+
+
+def test_history_output_goes_to_print_cards():
+    # a ccx .frd keeps one node set per variable: as *NODE FILE, NSET=TOP the history request
+    # replaced the field output's whole-model U (probed on 2.23); *OUTPUT, HISTORY for a set
+    # is a time series there, which ccx writes to the .dat
+    deck = (HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Step\n*Static\n*Output, field\n*Node Output\nU, RF\n"
+            "*Element Output\nS\n*Output, history\n*Node Output, nset=TOP\nU2\n"
+            "*Element Output, elset=EALL\nS11, SDV1\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert ("*NODE FILE\nU, RF\n*EL FILE\nS\n*NODE PRINT, NSET=TOP\nU\n*EL PRINT, ELSET=EALL\n"
+            "S, SDV\n") in _step(body, 1)
+    assert "*NODE FILE, NSET" not in body and "*OUTPUT, HISTORY" in rep.text()
+    # a history set the deck never defines is dropped, not left for ccx to skip with a warning
+    body, _, rep = convert_str(HEX + "*Step\n*Static\n*Output, history\n*Node Output, nset=NOPE\nU\n"
+                               "*End Step\n")
+    assert "NOPE" not in "\n".join(_live(body)) and "not defined" in rep.text()
+
+
+def test_frd_node_sets_one_per_variable():
+    # ccx gives each .frd variable one node set per step (the last card's): a whole-model
+    # request keeps it whole, and a variable requested on several sets gets their union
+    deck = (HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Nset, nset=BOT\n1, 2\n*Step\n*Static\n*Output, field\n"
+            "*Node Output\nU\n*Node Output, nset=TOP\nU, RF\n*End Step\n*Step\n*Static\n"
+            "*Output, field\n*Node Output, nset=TOP\nU\n*Node Output, nset=BOT\nU, RF\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*NODE FILE\nU\n*NODE FILE, NSET=TOP\nRF\n" in _step(body, 1)
+    assert "*NODE FILE, NSET=ABQ2CCX_OUTPUT\nU\n*NODE FILE, NSET=BOT\nRF\n" in _step(body, 2)
+    assert sorted(conv.geom.nsets["ABQ2CCX_OUTPUT"]) == [1, 2, 5, 6, 7, 8]
+    assert "*NSET, NSET=ABQ2CCX_OUTPUT" in body and "union" in rep.text()
+
+
+def test_frd_set_at_reference_node_printed():
+    # a node of no element is in no ccx .frd, not even under a whole-model request: its
+    # field output goes to the .dat
+    deck = (HEX + "*Node\n100, 0.5, 0.5, 2.\n*Nset, nset=RP\n100\n*Nset, nset=TOP\n5, 6, 7, 8\n"
+            "*Rigid Body, ref node=RP, tie nset=TOP\n*Step\n*Static\n*Output, field\n*Node Output\nU\n"
+            "*Node Output, nset=RP\nU, RF\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "*NODE FILE\nU\n*NODE PRINT, NSET=RP\nRF, U\n" in _step(body, 1)
+    assert "never writes a node of no element" in rep.text()
+
+
+def test_beam_node_set_output_2d_or_printed():
+    # ccx writes a beam model to the .frd expanded to 3-D, without the beam nodes: with only
+    # U / V / RF in the .frd -> OUTPUT=2D (first step only; exact for those), with element
+    # output too (which OUTPUT=2D would average through the section) -> the .dat
+    body, _, rep = convert_str(OUT_BEAM + "*Step\n*Static\n*Cload\nTIP, 2, -1.\n*Output, field\n"
+                               "*Node Output, nset=TIP\nU, RF\n*End Step\n*Step\n*Static\n"
+                               "*Output, field\n*Node Output, nset=TIP\nU\n*End Step\n")
+    assert "*NODE FILE, NSET=TIP, OUTPUT=2D\nU, RF\n" in _step(body, 1)
+    assert "OUTPUT=2D" not in _step(body, 2) and "*NODE FILE, NSET=TIP\nU\n" in _step(body, 2)
+    assert "OUTPUT=2D added" in rep.text()
+    body, _, rep = convert_str(OUT_BEAM + "*Step\n*Static\n*Cload\nTIP, 2, -1.\n*Output, field\n"
+                               "*Node Output, nset=TIP\nU\n*Element Output\nS\n*End Step\n")
+    s = _step(body, 1)
+    assert "OUTPUT=2D" not in body and "*NODE PRINT, NSET=TIP\nU\n" in s and "*NODE FILE" not in s
+
+
+def test_output_frequency_carried_to_the_step():
+    # ccx has one output frequency for all output cards of a step and keeps it for later
+    # steps: the .frd requests' wins, and step 2 gets its own back (every increment)
+    deck = (HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Step, nlgeom\n*Static\n0.1, 1.\n"
+            "*Output, field, frequency=10\n*Node Output\nU\n*Output, history, frequency=1\n"
+            "*Node Output, nset=TOP\nU\n*End Step\n*Step, nlgeom\n*Static\n0.1, 1.\n*Output, field\n"
+            "*Node Output\nU\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "*NODE FILE, FREQUENCY=10\nU\n*NODE PRINT, NSET=TOP\nU\n" in _step(body, 1)
+    assert "*NODE FILE, FREQUENCY=1\nU\n" in _step(body, 2)
+    assert "at one frequency" in rep.text()
+    # FREQUENCY=0 on *OUTPUT: Abaqus writes none of its requests
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Output, field, frequency=0\n*Node Output\nU\n"
+                             "*End Step\n")
+    assert "*NODE FILE" not in body
+
+
+def test_output_intervals_to_time_points_or_frequency():
+    # NUMBER INTERVAL / TIME INTERVAL -> *TIME POINTS (before the first *STEP, as ccx needs)
+    # where ccx picks the increments; FREQUENCY from the fixed increment under DIRECT, where
+    # ccx stops on TIME POINTS
+    deck = (HEX + "*Step, nlgeom\n*Static\n0.1, 2.\n*Output, field, number interval=4\n*Node Output\nU\n"
+            "*End Step\n*Step, nlgeom\n*Static, direct\n0.05, 1.\n*Output, field, time interval=0.2\n"
+            "*Node Output\nU\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1, GENERATE\n0.5, 2., 0.5\n*STEP" in body
+    assert "*NODE FILE, TIME POINTS=ABQ2CCX_TP1\nU\n" in _step(body, 1)
+    assert "*NODE FILE, FREQUENCY=4\nU\n" in _step(body, 2)
+    # the deck's own *TIME POINTS are used by name
+    body, _, _ = convert_str(HEX + "*Time Points, name=TP\n0.5, 1.\n*Step, nlgeom\n*Static\n0.1, 1.\n"
+                             "*Output, field, time points=TP\n*Node Output\nU\n*End Step\n")
+    assert "*NODE FILE, TIME POINTS=TP\nU\n" in body and "ABQ2CCX_TP" not in body
+
+
+def test_dynamic_output_defaults_and_explicit_intervals():
+    # Abaqus writes *DYNAMIC (implicit) output every 10 increments by default; *MODAL DYNAMIC
+    # and explicit dynamics take no TIME POINTS in ccx: FREQUENCY from the fixed or the
+    # maximum increment, else a warning
+    body, _, rep = convert_str(HEX + "*Step\n*Dynamic\n0.01, 1.\n*Output, field\n*Node Output\nU\n"
+                               "*End Step\n*Step\n*Frequency\n5\n*End Step\n*Step\n*Modal Dynamic\n"
+                               "0.001, 0.1\n*Output, field, number interval=5\n*Node Output\nU\n*End Step\n")
+    assert "*NODE FILE, FREQUENCY=10\nU\n" in _step(body, 1) and "every 10 increments" in rep.text()
+    assert "*NODE FILE, FREQUENCY=20\nU\n" in _step(body, 3)
+    body, _, _ = convert_str(HEX + "*Step\n*Dynamic, Explicit, direct user control\n1.e-6, 1.e-4\n"
+                             "*Output, field, time interval=2.e-5\n*Node Output\nU\n*End Step\n"
+                             "*Step\n*Dynamic, Explicit\n, 1.e-4, , 1.e-6\n*Output, field, number interval=4\n"
+                             "*Node Output\nU\n*End Step\n")
+    assert "*NODE FILE, FREQUENCY=20\nU\n" in _step(body, 1)
+    assert "*NODE FILE, FREQUENCY=25\nU\n" in _step(body, 2)
+    _, _, rep = convert_str(HEX + "*Step\n*Dynamic, Explicit\n, 1.e-4\n*Output, field\n*Node Output\nU\n"
+                            "*End Step\n")
+    assert "SELECTED time increment" in rep.text()
+
+
+def test_beam_output_requests_example():
+    # the validate_with_ccx.py deck: OUTPUT=2D for the tip set, *NODE PRINT for the history
+    # node, both at the *TIME POINTS NUMBER INTERVAL = 4 became
+    body, _, _ = convert(os.path.join(EXAMPLES, "beam_output_requests.inp"))
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1, GENERATE\n0.25, 1., 0.25\n*STEP" in body
+    assert ("*NODE FILE, NSET=TIP, OUTPUT=2D, TIME POINTS=ABQ2CCX_TP1\nU, RF\n*NODE PRINT, NSET=MID\n"
+            "U\n") in body
+    assert not dangling_refs(reparse(body))
+
+
 def test_cload_orientation_warned():
     _, _, rep = convert_str(HEX + "*Step\n*Static\n*Cload, orientation=O1\n7, 1, 1.\n*End Step\n")
     assert "global axes" in rep.text()

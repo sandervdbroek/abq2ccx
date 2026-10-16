@@ -148,6 +148,7 @@ PASS  transform_spherical_rigid (spherical *TRANSFORM, rigid body with a cylindr
 PASS  velocity_bc_column (TYPE=VELOCITY, SMOOTH STEP, kept into a 2nd step): top at 0.009500 / 0.014500 (integral 0.009500 / 0.014500), 34 increments within 5.0e-05 of the travel; reaction 1.0054 x E A u/L
 PASS  velocity_bc_bar (explicit, TYPE=VELOCITY): driven end u = 0.005000 (0.005); wave stress behind the front 0.6% off on average (6.7% at worst), 0.00% ahead of it
 PASS  velocity_bc_bar (implicit, TYPE=ACCELERATION): driven end u = 0.005000 (0.005); wave stress behind the front 1.1% off on average (1.5% at worst), 0.09% ahead of it
+PASS  beam_output_requests (*NODE OUTPUT at B32 nodes): .frd tip deflection -3.2801 (beam theory -3.3089, 0.9% diff) at t = 0.25, 0.5, 0.75, 1; .dat mid-span -1.0236 (beam theory -1.0373, 1.3% diff); without OUTPUT=2D 4 empty .frd blocks
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -362,7 +363,9 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*PLASTIC, HARDENING=JOHNSON COOK` | native ccx Johnson-Cook + `*RATE DEPENDENT` | ccx switches JC on only with a rate card (C = 0 added if the deck has none); `HARDENING=USER` / Chaboche `PARAMETERS` commented (material runs elastic) |
 | `DEPENDENCIES=n` (field variables) | collapsed to field = 0 | ccx ignores field dependence and in effect uses the first row |
 | `*CREEP, LAW=STRAIN/TIME` | ccx Norton (default) | other laws → `LAW=USER` |
-| `*NODE/ELEMENT OUTPUT`, `*OUTPUT` | `*NODE FILE`/`*EL FILE` | `POSITION=`/`DIRECTIONS=` stripped, `FREQ`→`FREQUENCY` |
+| `*OUTPUT, FIELD` + `*NODE/ELEMENT OUTPUT` | `*NODE FILE`/`*EL FILE` (.frd) | `POSITION=`/`DIRECTIONS=` stripped; one node set per variable and step (ccx keeps the last card's): the whole model before a set, several sets joined; a set the `.frd` cannot show (beam/shell nodes of an expanded model, reference points) is also printed, or gets `OUTPUT=2D` when the `.frd` takes only U/V/RF |
+| `*OUTPUT, HISTORY` + `*NODE/ELEMENT OUTPUT` for a set | `*NODE PRINT`/`*EL PRINT` (.dat) | as a `.frd` set it would replace the step's field output of the same variable |
+| `*OUTPUT` `FREQUENCY`/`NUMBER INTERVAL`/`TIME INTERVAL`/`TIME POINTS` | `FREQUENCY=` or `TIME POINTS=` on the step's first output card | ccx has one per step (the `.frd` requests' first); intervals → generated `*TIME POINTS`, or a frequency from a fixed or maximum increment (explicit dynamics ignores `TIME POINTS`); Abaqus' every-10-increments default in `*DYNAMIC`/`*MODAL DYNAMIC` kept |
 | `*EL PRINT`/`*NODE PRINT` without a set | whole-model set added | Abaqus prints everything; ccx prints nothing |
 | output variables | ccx's own label lists per card | an unknown `*EL PRINT` label stops ccx; `*CONTACT OUTPUT` → `*CONTACT FILE` with `CDIS`/`CSTR` |
 | `*SURFACE` shell edges `E1..E4` | `S3..S6` | on ccx shells `S1`/`S2` are the faces |
@@ -503,8 +506,13 @@ converter warns about the ones it can detect; the rest are here so you know to c
   step, so its loads **persist** into later steps (warned when steps follow).
 * **`C3D8R` hourglassing** — ccx auto-enables hourglass control only from **v2.3**;
   for bending-dominated linear bricks prefer `C3D8I` or `C3D20R`.
-* **Shells/beams are expanded to 3-D internally** — use `*NODE FILE, OUTPUT=3D` to see
-  the expanded geometry/through-thickness stress; otherwise results look "wrong."
+* **Shells/beams are expanded to 3-D internally**, and ccx writes a model with any beam or
+  shell to the `.frd` that way (its default `OUTPUT=3D` then): the expanded geometry and
+  through-thickness stress, under new node numbers, with no value at the original beam/shell
+  nodes. `OUTPUT=2D` maps results back onto them but averages stresses through the
+  thickness. The converter sends history output to the `.dat` and adds `OUTPUT=2D` only for
+  decks that write nothing but U, V and RF to the `.frd` (see
+  [troubleshooting](docs/troubleshooting.md)).
 * **`*TEMPERATURE` ≠ a thermal BC** — in a heat-transfer step a fixed temperature is
   `*BOUNDARY` DOF 11; `*TEMPERATURE` is only the field driving thermal expansion (in a
   heat transfer or coupled step the converter comments it out). Without initial
@@ -635,6 +643,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/transform_spherical_rigid.inp`](examples/transform_spherical_rigid.inp) | `C3D8` block: `*TRANSFORM, TYPE=S` nodes with local loads and supports → a rectangular transform per node; a `*RIGID BODY` whose reference point has a cylindrical transform, partial rotational BCs and a moment → the ROT NODE gets its axes |
 | [`examples/velocity_bc_column.inp`](examples/velocity_bc_column.inp) | `*Boundary, type=VELOCITY` with a `SMOOTH STEP` amplitude on a `*Rigid Body` reference point, kept into a second step |
 | [`examples/velocity_bc_bar.inp`](examples/velocity_bc_bar.inp) | Abaqus/Explicit bar driven by `*Boundary, type=VELOCITY` (wave stress −ρcv); `validate_with_ccx.py` also runs it implicit with `type=ACCELERATION` |
+| [`examples/beam_output_requests.inp`](examples/beam_output_requests.inp) | field output for a set of `B32` nodes → `OUTPUT=2D`, history output at a node → `*NODE PRINT`, `NUMBER INTERVAL` → `*TIME POINTS` |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

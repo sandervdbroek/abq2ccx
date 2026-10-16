@@ -1,0 +1,44 @@
+*Heading
+Output requests at beam nodes: field output for a node set, history output at a node
+** Cantilever along x, L = 240, 10 x 20 rectangular section (20 along y), 12 B32 elements,
+** E = 210000, nu = 0.3; tip load P = 1000 in -y.  Timoshenko beam theory: tip deflection
+** P L^3 / (3 E I) + P L / (k G A) = 3.3089, mid-span P (L/2)^2 (5 L / 2) / (6 E I) +
+** P L / 2 / (k G A) = 1.0373, with k = 10 (1 + nu) / (12 + 11 nu).
+** ccx 2.23 writes a model with beams to the .frd expanded to 3-D, without the original
+** beam nodes, so *NODE FILE, NSET=TIP alone writes empty blocks.  The deck's .frd
+** requests are only U and RF, so abq2ccx adds OUTPUT=2D, which maps the results back onto
+** the beam nodes; the history request goes to *NODE PRINT (.dat), and NUMBER INTERVAL = 4
+** to a *TIME POINTS sequence at 0.25, 0.5, 0.75 and 1 that both files follow.
+*Node
+1, 0., 0., 0.
+25, 240., 0., 0.
+*Ngen, nset=AXIS
+1, 25, 1
+*Nset, nset=TIP
+25
+*Nset, nset=MID
+13
+*Element, type=B32, elset=BEAM
+1, 1, 2, 3
+*Elgen, elset=BEAM
+1, 12, 2, 1
+*Beam Section, elset=BEAM, material=STEEL, section=RECT
+10., 20.
+0., 0., -1.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Boundary
+1, ENCASTRE
+*Step, nlgeom=YES
+*Static
+0.25, 1.
+*Cload
+TIP, 2, -1000.
+*Output, field, number interval=4
+*Node Output, nset=TIP
+U, RF
+*Output, history
+*Node Output, nset=MID
+U
+*End Step

@@ -225,9 +225,29 @@ These are the silent ones — no error, wrong physics.
 * **`C3D8R` hourglassing.** CalculiX auto-enables hourglass control only from v2.3.
   For bending-dominated linear bricks prefer `C3D8I` or `C3D20R`. There is no
   artificial-energy output in ccx, so check a scaled deformed shape for hourglass modes.
-* **Shells/beams are expanded to 3-D internally.** Add `OUTPUT=3D` to `*NODE FILE` to
-  see the expanded geometry and through-thickness stress; otherwise the `.frd` looks
-  "wrong." Results for non-axis-aligned beams with applied moments can be off.
+* **Shells/beams are expanded to 3-D internally — and written that way.** A model with any
+  beam or shell element goes to the `.frd` expanded (ccx 2.23's default is `OUTPUT=3D`
+  then; a model of only plane-stress/strain, axisymmetric, membrane or truss elements
+  defaults to `OUTPUT=2D`): you see the real thickness and the through-thickness stress,
+  but under new node numbers — the `.frd` has no value at the original beam, shell (or, in
+  such a model, truss, membrane, plane-element) nodes, so a `*NODE FILE, NSET=` of such
+  nodes writes empty blocks. A node of no element (a reference point) is in no `.frd`.
+  `OUTPUT=2D` maps the results back onto the original nodes but averages them through the
+  thickness, which removes beam and shell bending stresses; ccx reads it in the first step
+  only and applies it to every output card and step. So the converter sends history output
+  to the `.dat` (`*NODE PRINT` / `*EL PRINT`), also prints a `.frd` node set the `.frd`
+  cannot show, and adds `OUTPUT=2D` only when the deck writes nothing but U, V and RF to
+  the `.frd`. Results for non-axis-aligned beams with applied moments can be off.
+* **Output comes at one frequency per step.** ccx has a single `FREQUENCY=` (or `TIME
+  POINTS=`) for all `.frd` and `.dat` output of a step — the last card's wins, and it
+  carries into later steps — and takes `TIME POINTS` only where it picks the increments
+  (they stop ccx under `DIRECT` and in `*MODAL DYNAMIC`, and explicit dynamics ignores
+  them). The converter puts `*OUTPUT`'s `FREQUENCY` / `NUMBER INTERVAL` / `TIME INTERVAL` /
+  `TIME POINTS` on the step's first output card, the `.frd` requests' first, so history
+  output may come coarser or finer than Abaqus would write it. In an explicit step without a
+  fixed or maximum increment it cannot turn a time interval into increments, and ccx writes
+  every increment (warned): set `FREQUENCY=N` on the step's first output card, with N the
+  interval over the increment ccx prints as "SELECTED time increment".
 * **NaN displacements in an explicit step with circular-section beams.** ccx 2.23 sizes a
   `CIRC` beam's stable increment as if its section were the box around the circle and runs
   it at about 1.3× the limit. The converter caps every automatic `*DYNAMIC, EXPLICIT`

@@ -9,8 +9,8 @@ Circular-section beam in an explicit dynamic step: a smoothly applied load, then
 ** 20-node bricks with the section's nodes on the circle, and sizes their stable increment
 ** as if the section were the box around the circle: it picks 8.3e-7, about 1.3x the
 ** stable limit, and the displacements turn NaN.  abq2ccx caps the step's maximum
-** increment at 4.17e-7 (0.990 of beam theory at the end).  *Node Print (Abaqus/Standard
-** output; Abaqus/Explicit would use *Output, history) gives the check a printed result.
+** increment at 4.17e-7 (0.990 of beam theory at the end).  The history output at MID goes
+** to ccx's .dat (*NODE PRINT), every 200 increments.
 *Node
 1, 0., 0., 0.
 7, 240., 0., 0.
@@ -40,6 +40,7 @@ Circular-section beam in an explicit dynamic step: a smoothly applied load, then
 , 6.e-3
 *Cload, amplitude=SMOOTH
 MID, 2, -1000.
-*Node Print, nset=MID, frequency=200
+*Output, history, frequency=200
+*Node Output, nset=MID
 U
 *End Step

@@ -1503,6 +1503,24 @@ CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", 
 # (verified on an axisymmetric node-to-surface model that solves without it).
 CCX_CONTACT_FILE_LABELS = {"CDIS", "CSTR", "CELS", "PCON"}
 ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
+# Which nodes a ccx 2.23 .frd holds (probed): a model with a beam (B...) or shell (S3, S4,
+# S6, S8...) element is written in its expanded 3-D form — ccx's default OUTPUT=3D then
+# (elements.f) — and the .frd has the expanded nodes only, none of the original nodes of a
+# 1-D/2-D element (CCX_EXPANDED_PREFIXES); a node of no element (a reference point) is in
+# no .frd.  A *NODE FILE set of such nodes writes empty blocks.  OUTPUT=2D (read in the
+# first step only, for the whole run) maps the results back onto the original nodes: the
+# mean displacement of the expanded nodes and the sum of their forces, so the labels below
+# stay exact, while every other field is averaged through the thickness, which removes the
+# bending stresses of beams and shells.
+CCX_FRD_3D_TRIGGER = ("B", "S3", "S4", "S6", "S8")
+CCX_EXPANDED_PREFIXES = ("B", "T2D", "T3D", "S3", "S4", "S6", "S8", "M3D", "CPS", "CPE", "CAX")
+CCX_SOLID_PREFIXES = ("C3D", "DC3D", "F3D")
+FRD_2D_EXACT_LABELS = {"U", "V", "RF", "PU"}
+OUTPUT_CARDS = {"NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "NODE OUTPUT", "ELEMENT OUTPUT",
+                "CONTACT OUTPUT", "CONTACT FILE"}
+# Procedures without time increments: an output frequency means nothing there.
+UNTIMED_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY", "GREEN",
+                 "SUBSTRUCTURE GENERATE", "SENSITIVITY", "FEASIBLE DIRECTION", "NO ANALYSIS"}
 
 
 def ccx_label_ok(label: str, allowed: set) -> bool:
@@ -2202,6 +2220,13 @@ class Converter:
         # beams it could not size
         self._circ_explicit: Optional[Tuple[float, int]] = None
         self._circ_explicit_issue = ""
+        # output requests (see _plan_output)
+        self._out_plan: Dict[int, dict] = {}       # id(output card) -> its ccx cards
+        self._out_notes: Dict[int, List[str]] = {}  # id(*OUTPUT card) -> notes it triggers
+        self._out_ctl: Dict[int, Tuple[str, str]] = {}  # step -> output control (FREQUENCY= ...)
+        self._out_ctl_now: Tuple[str, str] = ("FREQUENCY", "1")   # the one ccx has in force
+        self._out_ctl_step = 0                     # last step whose first output card is out
+        self._out_tp_cards: List[str] = []         # *TIME POINTS to emit before the first *STEP
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
@@ -2530,6 +2555,8 @@ class Converter:
             if b.keyword == "STEP":
                 if self._temp_ic_default and self._step_idx == 0:
                     out.extend(self._default_temperature_ic())
+                out.extend(self._out_tp_cards)          # ccx: *TIME POINTS before any *STEP
+                self._out_tp_cards = []
                 group = []
                 j = i
                 while j < n:
@@ -2620,8 +2647,13 @@ class Converter:
                   "CONTACT OUTPUT", "CONTACT FILE"):
             return self.handle_output(b)
         if kw == "OUTPUT":
-            self.report.note("*OUTPUT wrapper dropped; CalculiX output frequency defaults to every "
-                             "increment (set FREQUENCY= on the file/print cards if needed).", once=True)
+            for msg in self._out_notes.get(id(b), []):
+                self.report.note(msg, once=True)
+            self.report.note("*OUTPUT cards dropped (ccx's own *OUTPUT takes only FREQUENCY): a "
+                             "FIELD request goes to the .frd (*NODE FILE / *EL FILE), a HISTORY "
+                             "request for a set to the .dat (*NODE PRINT / *EL PRINT), and its "
+                             "FREQUENCY / NUMBER INTERVAL / TIME INTERVAL / TIME POINTS onto the "
+                             "step's first output card.", once=True)
             return []
         if kw == "KINEMATIC COUPLING":
             return self.handle_coupling(b)
@@ -5929,67 +5961,104 @@ class Converter:
         return out
 
     def handle_output(self, b: Block) -> List[str]:
-        fmap = {"NODE OUTPUT": "NODE FILE", "ELEMENT OUTPUT": "EL FILE",
-                "NODE FILE": "NODE FILE", "EL FILE": "EL FILE",
-                "NODE PRINT": "NODE PRINT", "EL PRINT": "EL PRINT",
-                "CONTACT OUTPUT": "CONTACT FILE", "CONTACT FILE": "CONTACT FILE"}
-        cc = fmap.get(b.keyword, b.keyword)
+        """An output card -> the ccx cards _plan_output chose for it (the notes on its
+        parameters and variables are given here, where the card stands)."""
+        p = self._out_plan.get(id(b)) or self._lone_output_plan(b)
+        if p["cc"] == "CONTACT FILE":
+            self._contact_card(b, self.report)
+        else:
+            self._output_card(b, p["cc"], self.report)
+        for msg in p["notes"]:
+            self.report.note(msg, once=True)
+        for msg in p["warnings"]:
+            self.report.warn(msg, once=True)
+        return self._emit_output_cards(p["cards"], p["out2d"])
+
+    def _lone_output_plan(self, b: Block) -> dict:
+        """The plan of an output card _plan_output did not see: the card on its own, its
+        FREQUENCY / TIME POINTS kept."""
+        cc = self._output_route(b, None)
+        quiet = Report()
         if cc == "CONTACT FILE":
-            return self._contact_output(b)
+            params, labels = self._contact_card(b, quiet, keep_ctl=True)
+        else:
+            params, labels = self._output_card(b, cc, quiet, keep_ctl=True)
+        off = (params.get("FREQUENCY") or "").strip() == "0"
+        cards = [] if labels is None or off else [(cc, params, labels)]
+        return {"cc": cc, "cards": cards, "notes": [], "warnings": [], "out2d": False}
+
+    @staticmethod
+    def _output_route(b: Block, ctx: Optional[Block]) -> str:
+        """The ccx card that output card ``b`` becomes (``ctx``: the *OUTPUT it follows).
+        History output for a set — a time series at its nodes or elements — goes to the
+        .dat (*NODE PRINT / *EL PRINT), everything else to the .frd."""
+        hist = ctx is not None and ctx.has("HISTORY")
+        if b.keyword in ("CONTACT OUTPUT", "CONTACT FILE"):
+            return "CONTACT FILE"
+        if b.keyword == "NODE OUTPUT":
+            return "NODE PRINT" if hist and b.param("NSET") else "NODE FILE"
+        if b.keyword == "ELEMENT OUTPUT":
+            return "EL PRINT" if hist and b.param("ELSET") else "EL FILE"
+        return b.keyword
+
+    def _output_card(self, b: Block, cc: str, report: "Report", keep_ctl: bool = False):
+        """(parameters, ccx labels) of output card ``b`` written as ``*cc``, with notes on
+        what is dropped or renamed; labels None when nothing of the card is left.  Its
+        FREQUENCY / TIME POINTS are left to the step's output control (_plan_output) unless
+        ``keep_ctl``."""
         members = self.geom.elset((b.param("ELSET") or "").strip()) if b.param("ELSET") else []
         if members and all(e in self._conn for e in members):
-            self.report.note(f"*{b.keyword} on connector elements dropped: they are constraints in "
-                             f"ccx, which has no connector output (CTF, CU, ...).", once=True)
-            return []
+            report.note(f"*{b.keyword} on connector elements dropped: they are constraints in "
+                        f"ccx, which has no connector output (CTF, CU, ...).", once=True)
+            return OrderedDict(), None
         is_print = cc.endswith("PRINT")
         # parameters ccx's *NODE FILE / *EL FILE reader accepts (noelfiles.f); anything else
         # is "parameter not recognized" there
-        file_ok = {"FREQUENCY", "FREQUENCYF", "GLOBAL", "OUTPUT", "SECTION FORCES", "OUTPUT ALL",
-                   "TIME POINTS", "NSET", "LAST ITERATIONS", "CONTACT ELEMENTS", "DOUBLE"}
+        file_ok = {"FREQUENCYF", "GLOBAL", "OUTPUT", "SECTION FORCES", "OUTPUT ALL", "NSET",
+                   "LAST ITERATIONS", "CONTACT ELEMENTS", "DOUBLE"}
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
-        suppress = False
         for k, v in b.params.items():
             if k == "POSITION":
-                self.report.note("Output POSITION=... dropped (ccx extrapolates to nodes automatically).", once=True)
+                report.note("Output POSITION=... dropped (ccx extrapolates to nodes automatically).", once=True)
                 continue
             if k in ("VARIABLE", "MODE", "MODE LIST", "SUMMARY", "LAST MODE"):
-                self.report.note(f"Output parameter {k} dropped.", once=True)
+                report.note(f"Output parameter {k} dropped.", once=True)
                 continue
-            if k in ("FREQ", "FREQUENCY"):
-                if v is not None and v.strip() == "0":
-                    suppress = True
-                params["FREQUENCY"] = v
+            if k in ("FREQ", "FREQUENCY", "TIME POINTS"):
+                if keep_ctl:
+                    params["FREQUENCY" if k == "FREQ" else k] = v
                 continue
             if k == "ELSET" and cc == "EL FILE":
-                self.report.note("*EL FILE ELSET= dropped (ccx writes all elements to .frd; use "
-                                 "*EL PRINT, ELSET= to restrict).", once=True)
+                report.note("*EL FILE ELSET= dropped (ccx writes all elements to .frd; use "
+                            "*EL PRINT, ELSET= to restrict).", once=True)
                 continue
             if not is_print and k not in file_ok:
-                self.report.note(f"*{cc} parameter {k} dropped (not read by ccx).", once=True)
+                report.note(f"*{cc} parameter {k} dropped (not read by ccx).", once=True)
                 continue
             if is_print and k == "DIRECTIONS":
-                self.report.note(f"*{cc} parameter {k} dropped (not read by ccx).", once=True)
+                report.note(f"*{cc} parameter {k} dropped (not read by ccx).", once=True)
                 continue
             params[k] = v
-        if suppress:
-            self.report.note(f"*{b.keyword} with FREQUENCY=0 dropped (output suppressed).", once=True)
-            return []
+        if b.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT") and is_print:
+            # a history request: only its set carries over to the print card
+            key = "NSET" if cc == "NODE PRINT" else "ELSET"
+            params = OrderedDict([(key, b.param(key))])
         if cc == "EL PRINT" and self._only_carriers(params.get("ELSET") or ""):
-            self.report.note("*EL PRINT on surface elements dropped: they are not in the ccx mesh.",
-                             once=True)
-            return []
+            report.note("*EL PRINT on surface elements dropped: they are not in the ccx mesh.",
+                        once=True)
+            return params, None
         if cc == "EL PRINT" and "ELSET" not in params and ALL_ELEMENTS_SET in self.geom.elsets:
             params["ELSET"] = ALL_ELEMENTS_SET
-            self.report.note(f"*EL PRINT without ELSET -> ELSET={ALL_ELEMENTS_SET} (Abaqus prints "
-                             f"every element; ccx prints nothing without a set).", once=True)
+            report.note(f"*EL PRINT without ELSET -> ELSET={ALL_ELEMENTS_SET} (Abaqus prints "
+                        f"every element; ccx prints nothing without a set).", once=True)
         if cc == "NODE PRINT" and "NSET" not in params and ALL_NODES_SET in self.geom.nsets:
             params["NSET"] = ALL_NODES_SET
-            self.report.note(f"*NODE PRINT without NSET -> NSET={ALL_NODES_SET} (Abaqus prints "
-                             f"every node; ccx prints nothing without a set).", once=True)
+            report.note(f"*NODE PRINT without NSET -> NSET={ALL_NODES_SET} (Abaqus prints "
+                        f"every node; ccx prints nothing without a set).", once=True)
         if cc == "EL PRINT" and "ELSET" not in params:
-            self.report.warn("*EL PRINT requires ELSET= in ccx; none present.", once=True)
+            report.warn("*EL PRINT requires ELSET= in ccx; none present.", once=True)
         if cc == "NODE PRINT" and "NSET" not in params:
-            self.report.warn("*NODE PRINT requires NSET= in ccx; none present.", once=True)
+            report.warn("*NODE PRINT requires NSET= in ccx; none present.", once=True)
         invars: List[str] = []
         for rec in merged_data_records(b):
             invars.extend(x for x in rec if x != "")
@@ -6003,20 +6072,20 @@ class Converter:
             # also overflows ccx's 16-entries-per-line reader
             mcomp = re.fullmatch(r"([A-Z]+?)(\d{1,2})", vu)
             if vu not in known_bases and mcomp and mcomp.group(1) in known_bases:
-                self.report.note("Per-component output identifiers (e.g. S11, EE12) collapsed to "
-                                 "their base quantity (ccx writes whole tensors).", once=True)
+                report.note("Per-component output identifiers (e.g. S11, EE12) collapsed to "
+                            "their base quantity (ccx writes whole tensors).", once=True)
                 vu = mcomp.group(1)
             if vu in ABQ_DROP_VARS:
-                self.report.note(f"Output variable {vu} dropped (no ccx equivalent; derive in "
-                                 f"post-processing).", once=True)
+                report.note(f"Output variable {vu} dropped (no ccx equivalent; derive in "
+                            f"post-processing).", once=True)
                 continue
             mapped = ABQ_MAP_VARS.get(vu, vu)
             if mapped != vu:
                 why = ABQ_MAP_CAVEATS.get(vu, "CalculiX naming")
-                self.report.note(f"Output variable {vu} -> {mapped} ({why}).", once=True)
+                report.note(f"Output variable {vu} -> {mapped} ({why}).", once=True)
             if not is_print and mapped in EL_PRINT_ONLY_VARS:
-                self.report.note(f"Output variable {mapped} is valid only on *EL PRINT/*NODE PRINT; "
-                                 f"dropped from *{cc} (.frd).", once=True)
+                report.note(f"Output variable {mapped} is valid only on *EL PRINT/*NODE PRINT; "
+                            f"dropped from *{cc} (.frd).", once=True)
                 continue
             outvars.append(mapped)
         allowed = (CCX_EL_PRINT_LABELS if cc == "EL PRINT" else
@@ -6026,40 +6095,41 @@ class Converter:
             if ccx_label_ok(v, allowed):
                 kept.append(v)
             else:
-                self.report.note(f"Output variable {v} dropped from *{cc} (not a ccx label there"
-                                 f"{'; ccx stops on an unknown *EL PRINT label' if cc == 'EL PRINT' else ''}).",
-                                 once=True)
+                report.note(f"Output variable {v} dropped from *{cc} (not a ccx label there"
+                            f"{'; ccx stops on an unknown *EL PRINT label' if cc == 'EL PRINT' else ''}).",
+                            once=True)
         outvars = kept
         if is_print and not outvars and invars:
-            self.report.note(f"*{cc}: none of its variables exists in ccx; card dropped.", once=True)
-            return []
+            report.note(f"*{cc}: none of its variables exists in ccx; card dropped.", once=True)
+            return params, None
+        if is_print and not invars and b.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT"):
+            report.note(f"*{b.keyword} for history output names no variables (a VARIABLE= "
+                        f"selection has no ccx equivalent); dropped.", once=True)
+            return params, None
         if not outvars and not is_print:
             outvars = ["U"] if cc == "NODE FILE" else ["S"]
-            self.report.note(f"*{cc}: no explicit variables -> default '{outvars[0]}'.", once=True)
-        out = [emit_keyword(cc, params)]
-        if outvars:
-            final = dedup_str(outvars)
-            if len(final) > 16:                       # ccx reads at most 16 entries per line
-                self.report.warn(f"*{cc}: more than 16 output identifiers after mapping; keeping "
-                                 f"the first 16 (ccx line limit).", once=True)
-                final = final[:16]
-            out.append(", ".join(final))
-        return out
+            report.note(f"*{cc}: no explicit variables -> default '{outvars[0]}'.", once=True)
+        final = dedup_str(outvars)
+        if len(final) > 16:                       # ccx reads at most 16 entries per line
+            report.warn(f"*{cc}: more than 16 output identifiers after mapping; keeping "
+                        f"the first 16 (ccx line limit).", once=True)
+            final = final[:16]
+        return params, final
 
-    def _contact_output(self, b: Block) -> List[str]:
+    def _contact_card(self, b: Block, report: "Report", keep_ctl: bool = False):
         """``*CONTACT OUTPUT`` / ``*CONTACT FILE`` -> ccx ``*CONTACT FILE``: Abaqus contact
         variables fold onto ccx's CDIS (opening/slip) and CSTR (pressure/shear); others
-        (forces, areas, status) are dropped; Abaqus-only parameters too."""
+        (forces, areas, status) are dropped; Abaqus-only parameters too.  Returns
+        (parameters, labels), labels None when no ccx contact variable is left."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
-            if k in ("FREQ", "FREQUENCY"):
-                keep["FREQUENCY"] = v
-            elif k in ("TIME POINTS", "LAST ITERATIONS", "CONTACT ELEMENTS", "FREQUENCYF"):
+            if k in ("FREQ", "FREQUENCY", "TIME POINTS"):
+                if keep_ctl:
+                    keep["FREQUENCY" if k == "FREQ" else k] = v
+            elif k in ("LAST ITERATIONS", "CONTACT ELEMENTS", "FREQUENCYF"):
                 keep[k] = v
             else:
-                self.report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx).", once=True)
-        if (keep.get("FREQUENCY") or "").strip() == "0":
-            return []
+                report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx).", once=True)
         labels: List[str] = []
         for rec in merged_data_records(b):
             for v in (x.upper() for x in rec if x != ""):
@@ -6067,17 +6137,465 @@ class Converter:
                 if ccx_label_ok(m, CCX_CONTACT_FILE_LABELS):
                     labels.append(m[:4])
                 else:
-                    self.report.note(f"Contact output variable {v} dropped (ccx writes CDIS, CSTR "
-                                     f"and CELS only; its CSTR includes the contact pressure).",
-                                     once=True)
+                    report.note(f"Contact output variable {v} dropped (ccx writes CDIS, CSTR "
+                                f"and CELS only; its CSTR includes the contact pressure).",
+                                once=True)
         if not labels:
             had = any(x != "" for rec in merged_data_records(b) for x in rec)
             if had:                                 # every requested variable was dropped
-                self.report.note(f"*{b.keyword}: no ccx contact variable requested; card dropped.",
-                                 once=True)
-                return []
+                report.note(f"*{b.keyword}: no ccx contact variable requested; card dropped.",
+                            once=True)
+                return keep, None
             labels = ["CDIS", "CSTR"]
-        return [emit_keyword("CONTACT FILE", keep), ", ".join(dedup_str(labels))]
+        return keep, dedup_str(labels)
+
+    def _emit_output_cards(self, cards: List[tuple], out2d: bool = False) -> List[str]:
+        """Write ``cards`` [(keyword, params, labels)].  The first output card of a step
+        carries the step's output control when ccx would otherwise keep another one (ccx
+        has one for all output cards of a step, and carries it into later steps); with
+        ``out2d`` the first *NODE FILE gets OUTPUT=2D."""
+        out: List[str] = []
+        for i, (kw, params, labels) in enumerate(cards):
+            params = OrderedDict(params)
+            if out2d and kw == "NODE FILE":
+                params["OUTPUT"] = "2D"
+                out2d = False
+            if i == 0:
+                if self._out_ctl_step != self._step_idx:
+                    self._out_ctl_step = self._step_idx
+                    ctl = self._out_ctl.get(self._step_idx)
+                    if ctl and ctl != self._out_ctl_now:
+                        params[ctl[0]] = ctl[1]
+                        self._out_ctl_now = ctl
+            out.append(emit_keyword(kw, params))
+            if labels:
+                out.append(", ".join(labels))
+        return out
+
+    # -- output planning ----------------------------------------------------
+    def _plan_output(self, blocks: List[Block]) -> None:
+        """Fit the output requests of each step to ccx's output model, which differs from
+        Abaqus' in ways that silently lose output (all probed on ccx 2.23):
+
+        * a .frd keeps ONE node set per variable and step: a second *NODE FILE for U on a
+          set replaces the whole-model U of the first;
+        * a .frd has no node of no element (a reference point) and — in a model with a beam
+          or shell — no original node of a beam, shell, truss, membrane or plane element
+          (CCX_EXPANDED_PREFIXES): a set of those writes empty blocks;
+        * one output control, FREQUENCY= or TIME POINTS=, serves every .frd and .dat card
+          of a step: the last one given wins, and it carries over into later steps;
+        * TIME POINTS work only where ccx picks the increments (not under DIRECT, in
+          *MODAL DYNAMIC or in explicit dynamics, where they are ignored).
+
+        So history output for a set (a time series at its nodes or elements) goes to the
+        .dat (_output_route); each .frd variable keeps one node set (the whole model before
+        a set; several sets joined); a .frd set the .frd cannot show gets a *NODE PRINT
+        twin, or OUTPUT=2D when every .frd request of the deck is U / V / RF, which
+        OUTPUT=2D keeps exact; and each step gets one output control, taken from its .frd
+        requests first (_step_output_control)."""
+        quiet = Report()
+        self._out_user_tp = {(b.param("NAME") or "").strip().upper(): b
+                             for b in blocks if b.keyword == "TIME POINTS"}
+        self._out_amp_names = {(b.param("NAME") or "").strip().upper()
+                               for b in blocks if b.keyword in ("AMPLITUDE", "TIME POINTS")}
+        self._out_tp_names: Dict[tuple, str] = {}
+        self._out_subsets: Dict[str, str] = {}      # .frd set -> its nodes missing from the .frd
+        self._used_names |= set(self.geom.nsets) | set(self.geom.elsets)
+        types = {t: ccx_element_type(t, quiet) for t in {t for t, _c in self.geom.elements.values()}}
+        frd3d = any(c.startswith(CCX_FRD_3D_TRIGGER) for c in types.values())
+        solid_nodes: set = set()
+        flat_nodes: set = set()
+        for typ, conn in self.geom.elements.values():
+            if types[typ].startswith(CCX_SOLID_PREFIXES):
+                solid_nodes.update(conn)
+            elif types[typ].startswith(CCX_EXPANDED_PREFIXES):
+                flat_nodes.update(conn)
+        steps: List[Tuple[int, dict, List[dict]]] = []
+        i, k = 0, 0
+        while i < len(blocks):
+            if blocks[i].keyword == "STEP":
+                j = i + 1
+                while j < len(blocks) and blocks[j].keyword != "END STEP":
+                    j += 1
+                k += 1
+                inner = blocks[i + 1:j]
+                timing = self._step_timing(next((x for x in inner if x.keyword in PROC_KW), None))
+                ctx, reqs = None, []
+                for x in inner:
+                    if x.keyword == "OUTPUT":
+                        ctx = x
+                        if (x.param("VARIABLE") or "").strip().upper() in ("PRESELECT", "ALL"):
+                            self._out_notes.setdefault(id(x), []).append(
+                                f"*OUTPUT, VARIABLE={x.param('VARIABLE').strip().upper()}: ccx has "
+                                f"no preselected output, so only the variables named on the "
+                                f"*NODE OUTPUT / *ELEMENT OUTPUT cards that follow are requested.")
+                    elif x.keyword in OUTPUT_CARDS:
+                        reqs.append(self._output_request(x, ctx, timing, quiet))
+                steps.append((k, timing, reqs))
+                i = j
+            i += 1
+        # one .frd node set per variable and step: the whole model before a set, several
+        # sets joined into one
+        unions: Dict[Tuple[str, ...], str] = {}
+        for k, timing, reqs in steps:
+            node_files = [r for r in reqs if r["live"] and r["cc"] == "NODE FILE"]
+            want: "OrderedDict[str, List[Optional[str]]]" = OrderedDict()
+            for r in node_files:
+                for lab in r["labels"]:
+                    sets = want.setdefault(lab, [])
+                    if r["set"] not in sets:
+                        sets.append(r["set"])
+            final: Dict[str, Optional[str]] = {}
+            for lab, sets in want.items():
+                if None in sets or len(sets) == 1:
+                    final[lab] = None if None in sets else sets[0]
+                    continue
+                key = tuple(sorted(sets))
+                if key not in unions:
+                    unions[key] = self._fresh_name("ABQ2CCX_OUTPUT")
+                    self.geom.nsets[unions[key]] = dedup([n for s in key for n in self.geom.nset(s)])
+                final[lab] = unions[key]
+                node_files[0]["notes"].append(
+                    f"*NODE FILE: {lab} requested on node sets {', '.join(sets)} in one step -> "
+                    f"their union, node set {final[lab]} (a ccx .frd keeps one node set per "
+                    f"variable; the last card's would replace the others).")
+            done: set = set()
+            for r in node_files:
+                groups: "OrderedDict[Optional[str], List[str]]" = OrderedDict()
+                for lab in r["labels"]:
+                    s = final[lab]
+                    if s is None and r["set"] is not None:
+                        r["covered"].append(lab)
+                        r["notes"].append(
+                            f"*NODE FILE, NSET={r['set']}: {lab} left to the step's whole-model "
+                            f"request (a ccx .frd keeps one node set per variable, so the set "
+                            f"would replace the whole model).")
+                        continue
+                    if (lab, s) not in done:
+                        done.add((lab, s))
+                        groups.setdefault(s, []).append(lab)
+                r["frd_sets"] = list(groups.items())
+        # OUTPUT=2D when the beam/shell nodes of a .frd set would be missing from the .frd
+        # and every .frd request of the deck is one OUTPUT=2D keeps exact
+        stated = next((v.strip().upper() for _k, _t, reqs in steps[:1] for r in reqs
+                       for v in [r["b"].param("OUTPUT")] if r["frd"] and v), None)
+        frd_reqs = [r for _k, _t, reqs in steps for r in reqs if r["live"] and r["frd"]]
+        hidden_flat = any(s is not None and any(n in flat_nodes and n not in solid_nodes
+                                                for n in self.geom.nset(s))
+                          for r in frd_reqs if r["cc"] == "NODE FILE" for s, _l in r["frd_sets"])
+        shown = solid_nodes | flat_nodes
+        carrier = next((r for r in (steps[0][2] if steps else [])
+                        if r["live"] and r["cc"] == "NODE FILE" and
+                        any(s is None or any(n in shown for n in self.geom.nset(s))
+                            for s, _l in r["frd_sets"])), None)
+        out2d = (frd3d and stated is None and hidden_flat and carrier is not None and
+                 all(r["cc"] == "NODE FILE" and set(r["labels"]) <= FRD_2D_EXACT_LABELS
+                     for r in frd_reqs))
+        if out2d:
+            carrier["out2d"] = True
+            carrier["notes"].append(
+                "OUTPUT=2D added to the first *NODE FILE: ccx writes a model with beams or "
+                "shells to the .frd expanded to 3-D, without the original nodes the deck "
+                "requests output at; OUTPUT=2D (for the whole run) maps the results back onto "
+                "them — exact for U, V and RF, the only .frd variables the deck requests.")
+        two_d = stated == "2D" or (stated is None and (not frd3d or out2d))
+        visible = solid_nodes | (flat_nodes if two_d else set())
+        for k, timing, reqs in steps:
+            for r in reqs:
+                self._out_plan[id(r["b"])] = {"cc": r["cc"], "cards": self._request_cards(r, visible),
+                                             "notes": r["notes"], "warnings": r["warnings"],
+                                             "out2d": r.get("out2d", False)}
+            self._out_ctl[k] = self._step_output_control(k, timing, reqs)
+
+    def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
+        """One output card of a step: where it goes, its labels and the output control it
+        asks for."""
+        sub = b.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
+        ctx = ctx if sub else None
+        cc = self._output_route(b, ctx)
+        if cc == "CONTACT FILE":
+            params, labels = self._contact_card(b, quiet)
+        else:
+            params, labels = self._output_card(b, cc, quiet)
+        ctl, default = self._requested_control(b, ctx, timing)
+        r = {"b": b, "cc": cc, "params": params, "labels": labels, "notes": [], "warnings": [],
+             "frd": cc in ("NODE FILE", "EL FILE", "CONTACT FILE"), "frd_sets": [], "covered": [],
+             "set": (params.get("NSET") or "").strip().upper() or None if cc == "NODE FILE" else None,
+             "ctl": ctl, "default": default, "live": labels is not None and ctl[0] != "OFF"}
+        if labels is not None and ctl[0] == "OFF":
+            r["notes"].append(f"*{b.keyword} with {ctl[1]}=0 dropped (output suppressed)." if ctx is None
+                              else f"*OUTPUT with {ctl[1]}=0: Abaqus writes none of its requests; "
+                                   f"*{b.keyword} dropped.")
+        if r["live"] and cc in ("NODE PRINT", "EL PRINT") and sub:
+            kind, key = ("node", "NSET") if cc == "NODE PRINT" else ("element", "ELSET")
+            name = params[key].strip().upper()
+            pool = self.geom.nsets if kind == "node" else self.geom.elsets
+            if not pool.get(name):
+                r["live"] = False
+                r["warnings"].append(f"History *{b.keyword}, {key}={params[key]}: the {kind} set "
+                                     f"is not defined (or empty) in the converted deck; dropped.")
+            else:
+                r["notes"].append(
+                    "*OUTPUT, HISTORY: *NODE OUTPUT, NSET= -> *NODE PRINT and *ELEMENT OUTPUT, "
+                    "ELSET= -> *EL PRINT (.dat, every output increment, like Abaqus history "
+                    "output): a ccx .frd keeps one node set per variable, so a history set "
+                    "would replace the step's field output, and it has no values at beam or "
+                    "shell nodes or at reference points.")
+        return r
+
+    def _request_cards(self, r: dict, visible: set) -> List[tuple]:
+        """The ccx cards of output request ``r`` (see _plan_output): a .frd node set with
+        nodes the .frd lacks is printed (.dat) too, and leaves the .frd when none of its
+        nodes is there — also when the step's whole-model request covers the set, which
+        lacks those nodes as well."""
+        if not r["live"]:
+            return []
+        if r["cc"] != "NODE FILE":
+            return [(r["cc"], r["params"], r["labels"])]
+        cards: List[tuple] = []
+        parts = [(s, labels, False) for s, labels in r["frd_sets"]]
+        if r["covered"]:
+            parts.append((r["set"], r["covered"], True))
+        for s, labels, covered in parts:
+            params = OrderedDict((k, v) for k, v in r["params"].items() if k != "NSET")
+            if s is not None:
+                params["NSET"] = r["params"]["NSET"] if s == r["set"] else s
+            twin = None
+            if s is not None:
+                ids = [n for n in dedup(self.geom.nset(s)) if n in self.geom.nodes]
+                hidden = [n for n in ids if n not in visible]
+                if hidden:
+                    plabels = [x for x in labels if ccx_label_ok(x, CCX_NODE_PRINT_LABELS)]
+                    whole = len(hidden) == len(ids)
+                    if plabels:
+                        name = r["params"]["NSET"] if s == r["set"] else s
+                        if not whole:
+                            if s not in self._out_subsets:
+                                self._out_subsets[s] = self._fresh_name(f"{s}_DAT")
+                                self.geom.nsets[self._out_subsets[s]] = hidden
+                            name = self._out_subsets[s]
+                        twin = ("NODE PRINT", OrderedDict([("NSET", name)]), plabels)
+                    r["notes"].append(
+                        f"*NODE FILE, NSET={s}: {'its' if whole else f'{len(hidden)} of its'} nodes "
+                        f"are not in a ccx .frd (ccx writes beam and shell models expanded to 3-D, "
+                        f"without the original nodes, and never writes a node of no element) -> "
+                        + (f"*NODE PRINT, NSET={twin[1]['NSET']} (.dat)" if twin else "no ccx output")
+                        + (" instead." if whole else " for those."))
+                    if whole:
+                        labels = []
+            if labels and not covered:
+                cards.append(("NODE FILE", params, labels))
+            if twin:
+                same = next((c for c in cards if c[0] == "NODE PRINT" and c[1] == twin[1]), None)
+                if same:
+                    same[2].extend(x for x in twin[2] if x not in same[2])
+                else:
+                    cards.append(twin)
+        return cards
+
+    @staticmethod
+    def _step_timing(proc: Optional[Block]) -> dict:
+        """How ccx increments a step: kind 'untimed' (no time increments), 'explicit',
+        'fixed' (DIRECT, *MODAL DYNAMIC: every increment the data line's first value) or
+        'auto' (ccx picks the increments); its period, fixed increment and (explicit)
+        maximum increment."""
+        t = {"kind": "auto", "proc": proc.keyword if proc else None, "period": 1.0,
+             "dt": None, "dtmax": None}
+        if proc is None:
+            return t
+        if proc.keyword in UNTIMED_PROCS:
+            t["kind"] = "untimed"
+            return t
+        vals = next((r for r in merged_data_records(proc) if any(x for x in r)), [])
+
+        def num(i: int) -> Optional[float]:
+            try:
+                v = pf(vals[i])
+            except (IndexError, ValueError):
+                return None
+            return v if math.isfinite(v) and v > 0 else None
+        t["period"] = num(1) or 1.0
+        direct = proc.has("DIRECT") or proc.has("DIRECT USER CONTROL")
+        if proc.keyword == "DYNAMIC" and proc.has("EXPLICIT"):
+            t.update(kind="explicit", dt=num(0) if direct else None, dtmax=num(3))
+        elif proc.keyword == "MODAL DYNAMIC" or direct:
+            t.update(kind="fixed", dt=num(0))
+        return t
+
+    @staticmethod
+    def _requested_control(b: Block, ctx: Optional[Block], timing: dict) -> Tuple[tuple, bool]:
+        """(control, defaulted): the output control output card ``b`` (following *OUTPUT
+        ``ctx``) asks for — ('F', n) every n increments, ('D', dt) every dt of step time,
+        ('N', n) n equal intervals of the step, ('P', name) a *TIME POINTS sequence, ('OFF',
+        parameter) — and whether it is the Abaqus default: every increment, every 10 in
+        *DYNAMIC and *MODAL DYNAMIC, and in explicit dynamics 20 intervals for field and
+        200 for history output."""
+        for src in (b,) if ctx is None else (b, ctx):
+            p = src.params
+            for key in ("FREQUENCY", "FREQ", "NUMBER INTERVAL"):
+                if key in p:
+                    try:
+                        n = int(pf((p[key] or "").strip()))
+                    except ValueError:
+                        continue
+                    if n <= 0:
+                        return ("OFF", key), False
+                    return (("N", n) if key == "NUMBER INTERVAL" else ("F", n)), False
+            if "TIME INTERVAL" in p:
+                try:
+                    dt = pf((p["TIME INTERVAL"] or "").strip())
+                except ValueError:
+                    dt = 0.0
+                if dt > 0 and math.isfinite(dt):
+                    return ("D", dt), False
+            if (p.get("TIME POINTS") or "").strip():
+                return ("P", p["TIME POINTS"].strip().upper()), False
+        if ctx is not None:
+            if timing["kind"] == "explicit":
+                return ("N", 200 if ctx.has("HISTORY") else 20), True
+            if timing["proc"] in ("DYNAMIC", "MODAL DYNAMIC"):
+                return ("F", 10), True
+        return ("F", 1), True
+
+    def _step_output_control(self, k: int, timing: dict, reqs: List[dict]) -> Optional[Tuple[str, str]]:
+        """The one output control ccx can give step ``k`` (as FREQUENCY= or TIME POINTS=):
+        its .frd requests' (or, without any, its .dat requests'); the .dat requests' when
+        the .frd's cannot be given.  None when the step has no time increments or nothing
+        can be given.  Notes go to the step's first request."""
+        live = [r for r in reqs if r["live"]]
+        if not live or timing["kind"] == "untimed":
+            return None
+        frd = [r for r in live if r["frd"]]
+        dat = [r for r in live if not r["frd"]]
+        groups = [frd, dat] if frd and dat else [frd or dat]
+        msgs = live[0]["notes"]
+        spacing = None
+        for group in groups:
+            ctl = self._group_control(timing, group, msgs)
+            if ctl[0] == "NONE":
+                spacing = ctl[1] if spacing is None else spacing
+                continue
+            others = [r for g in groups if g is not group for r in g]
+            if any(r["ctl"] != group[0]["ctl"] for r in others):
+                msgs.append("ccx writes all output of a step at one frequency (Abaqus gives each "
+                            "request its own): " + ("the .dat (print / history) requests follow "
+                                                    "the .frd requests'." if group is frd else
+                                                    "the .frd requests here follow the .dat "
+                                                    "requests', whose frequency ccx can give."))
+            return ctl
+        if timing["kind"] == "explicit":
+            live[0]["warnings"].append(
+                f"Step {k}: output every {fmt_num(spacing)} of step time (*OUTPUT NUMBER INTERVAL "
+                f"/ TIME INTERVAL, or the Abaqus/Explicit default of 20 field / 200 history "
+                f"intervals) cannot be given in ccx explicit dynamics, which ignores TIME POINTS "
+                f"and writes every increment: set FREQUENCY=N on the step's first output card, "
+                f"N = {fmt_num(spacing)} / the increment ccx reports as 'SELECTED time "
+                f"increment'.")
+        else:
+            live[0]["warnings"].append(
+                f"Step {k}: output every {fmt_num(spacing)} of step time cannot be given (the "
+                f"step has fixed increments, but its data line names none); ccx writes every "
+                f"increment.")
+        return None
+
+    def _group_control(self, timing: dict, group: List[dict], msgs: List[str]) -> Tuple[str, object]:
+        """The ccx control for the requests ``group`` of a step (see _step_output_control):
+        (parameter, value), or ('NONE', spacing) if ccx cannot give output every
+        ``spacing`` of step time there."""
+        ctls = [r["ctl"] for r in group]
+        freqs = [c[1] for c in ctls if c[0] == "F"]
+        timed = [c for c in ctls if c[0] != "F"]
+        if freqs:
+            if timed:
+                msgs.append("ccx writes all output of a step at one frequency: the requests at "
+                            "time intervals here follow the ones every so many increments.")
+            if all(r["default"] for r in group) and freqs[0] == 10:
+                msgs.append(f"*{timing['proc']}: output every 10 increments, the Abaqus default "
+                            f"for this procedure (ccx's is every increment).")
+            return ("FREQUENCY", str(math.gcd(*freqs)))
+        times = self._control_times(timed, timing["period"])
+        if timing["kind"] == "auto":
+            if len(set(timed)) == 1 and timed[0][0] == "P" and timed[0][1] in self._out_user_tp:
+                return ("TIME POINTS", self._out_user_tp[timed[0][1]].param("NAME").strip())
+            return ("TIME POINTS", self._time_points_card(times, timing["period"]))
+        if times[0] == "U":
+            spacing = times[1]
+        else:
+            gaps = [b - a for a, b in zip((0.0,) + times[1], times[1])]
+            spacing = min((g for g in gaps if g > 1e-12 * timing["period"]), default=timing["period"])
+        if timing["dt"]:
+            n = max(1, int(round(spacing / timing["dt"])))
+            msgs.append(f"Output every {fmt_num(spacing)} of step time in a step with fixed "
+                        f"increments of {fmt_num(timing['dt'])} -> FREQUENCY={n} (ccx takes TIME "
+                        f"POINTS only where it picks the increments; DIRECT and *MODAL DYNAMIC "
+                        f"stop on them).")
+            return ("FREQUENCY", str(n))
+        if timing["dtmax"]:
+            n = max(1, int(spacing / timing["dtmax"] + 1e-9))
+            msgs.append(f"Explicit output every {fmt_num(spacing)} of step time -> FREQUENCY={n} "
+                        f"from the maximum increment {fmt_num(timing['dtmax'])} (ccx ignores TIME "
+                        f"POINTS in explicit dynamics; its stable increment can be smaller, so the "
+                        f"output comes at least that often).")
+            return ("FREQUENCY", str(n))
+        return ("NONE", spacing)
+
+    def _control_times(self, timed: List[tuple], period: float) -> tuple:
+        """Time-based controls of one step -> ('U', dt) every dt of step time, or ('L',
+        times) the sorted union of their times."""
+        if all(c[0] in ("N", "D") for c in timed):
+            dts = sorted({period / c[1] if c[0] == "N" else c[1] for c in timed})
+            if all(abs(d / dts[0] - round(d / dts[0])) < 1e-6 for d in dts):
+                return ("U", dts[0])
+        pts: set = set()
+        for c in timed:
+            if c[0] == "P":
+                pts.update(self._user_time_points(c[1]))
+            else:
+                dt = period / c[1] if c[0] == "N" else c[1]
+                count = min(int(period / dt + 1e-9), 100000)
+                pts.update(round(i * dt, 12) for i in range(1, count + 1))
+        pts.add(period)
+        return ("L", tuple(sorted(pts)))
+
+    def _user_time_points(self, name: str) -> List[float]:
+        """The times of the deck's *TIME POINTS ``name`` (empty if it has none)."""
+        b = self._out_user_tp.get(name)
+        if b is None:
+            return []
+        out: List[float] = []
+        for rec in merged_data_records(b):
+            try:
+                vals = [pf(x) for x in rec if x != ""]
+            except ValueError:
+                continue
+            if b.has("GENERATE") and len(vals) >= 3 and vals[2] > 0:
+                n = min(int((vals[1] - vals[0]) / vals[2] + 1e-9), 100000)
+                out += [vals[0] + i * vals[2] for i in range(n + 1)] + [vals[1]]
+            elif not b.has("GENERATE"):
+                out += vals
+        return [t for t in out if t > 0]
+
+    def _time_points_card(self, times: tuple, period: float) -> str:
+        """A *TIME POINTS card (emitted before the first *STEP) for ``times``; its name."""
+        key = (times[0], round(times[1], 12) if times[0] == "U" else times[1], round(period, 12))
+        if key in self._out_tp_names:
+            return self._out_tp_names[key]
+        n = len(self._out_tp_names) + 1
+        name = f"ABQ2CCX_TP{n}"
+        while name in self._out_amp_names:
+            n += 1
+            name = f"ABQ2CCX_TP{n}"
+        self._out_amp_names.add(name)
+        self._out_tp_names[key] = name
+        if times[0] == "U":
+            self._out_tp_cards += [f"*TIME POINTS, NAME={name}, GENERATE",
+                                   f"{fmt_num(times[1])}, {fmt_num(period)}, {fmt_num(times[1])}"]
+        else:
+            self._out_tp_cards += [f"*TIME POINTS, NAME={name}"] + reflow(list(times), 8)
+        self.report.note("*OUTPUT NUMBER INTERVAL / TIME INTERVAL -> *TIME POINTS (ccx writes "
+                         "the output at those times of the step, cutting increments to reach "
+                         "them, as Abaqus' TIME MARKS=YES).", once=True)
+        return name
 
     def handle_mpc(self, b: Block) -> List[str]:
         """Abaqus ``*MPC``, converted line by line (a line ccx cannot take is commented out
@@ -7279,6 +7797,7 @@ class Converter:
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_circ_explicit_increment(blocks)
         self._complete_temperature_ic()         # after every planner that adds knot nodes
+        self._plan_output(blocks)               # last: it reads the final mesh (knot beams too)
         # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
         # errors without the card) — handle_surface_interaction synthesizes HARD for these
         self._si_missing_behavior = set()
