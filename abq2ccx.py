@@ -246,6 +246,11 @@ def ccx_element_type(typ: str, report: "Report") -> str:
 SHELL_TYPES = {t for t in ELEMENT_NNODES if (t[0] == "S" and not t.startswith("SPRING")) or t.startswith("DS")}
 BEAM_TYPES = {t for t in ELEMENT_NNODES if t[0] == "B" or t.startswith(("T2D", "T3D", "PIPE"))}
 COMPOSITE_SHELL_OK = {"S6", "S8R"}  # CalculiX restricts composite shells to these
+# ccx 2.23 stops on a 2-node beam with a circular section ("Please use quadratic elements
+# for beams with circular cross section"): it expands a linear beam into an 8-node brick,
+# whose corner nodes cannot follow a circle.  Emitted 2-node type -> the 3-node beam such
+# elements are upgraded to (ccx runs B21 as a B31).
+CIRC_QUADRATIC = {"B21": "B32", "B31": "B32", "B31R": "B32R"}
 
 MAX_ENTRIES_PER_LINE = 16  # CalculiX hard limit for entries on a data line
 
@@ -1435,6 +1440,8 @@ class Converter:
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
         self._rb_rot_synth: Dict[int, int] = {}    # ... where the converter created the ROT NODE
+        # CIRC beams upgraded to 3-node beams: element -> (end node, end node, midside node)
+        self._midside: "OrderedDict[int, Tuple[int, int, int]]" = OrderedDict()
 
     # -- properties ---------------------------------------------------------
     @property
@@ -1726,6 +1733,8 @@ class Converter:
             "KINEMATIC": self.handle_kinematic,
             "SURFACE INTERACTION": self.handle_surface_interaction,
             "INITIAL CONDITIONS": self.handle_initial_conditions,
+            "TEMPERATURE": self.handle_temperature,
+            "NORMAL": self.handle_normal,
             "EQUATION": self.handle_equation,
             "STATIC": self.handle_static,
             "DYNAMIC": self.handle_dynamic,
@@ -2274,10 +2283,25 @@ class Converter:
             keep["SECTION"] = "PIPE"
             self.report.note("*BEAM SECTION SECTION=THICK PIPE -> PIPE (same radius/thickness data; "
                              "ccx expands beams to solids, so thick-wall behaviour is captured).", once=True)
+        data = list(b.data)
         if sec == "CIRC":
-            self.report.warn("*BEAM SECTION SECTION=CIRC: Abaqus uses a radius, ccx uses two elliptical "
-                             "axis lengths; verify the dimension line.", once=True)
-        return [emit_keyword("BEAM SECTION", keep)] + list(b.data)
+            # Abaqus gives the radius; ccx reads the two section DIAMETERS (an ellipse's axis
+            # lengths; a lone value is used for both).  Passed through, the radius made the
+            # beam 16x too flexible in bending (probed on 2.23 against PL^3/3EI).
+            first = [x.strip() for x in data[0].split(",") if x.strip()] if data else []
+            try:
+                r = pf(first[0]) if first else 0.0
+            except ValueError:
+                r = 0.0
+            if r > 0:
+                data[0] = "%.12g, %.12g" % (2 * r, 2 * r)
+                self.report.note("*BEAM SECTION SECTION=CIRC: the Abaqus radius r -> ccx's two "
+                                 "section diameters 2r, 2r.", once=True)
+            else:
+                self.report.warn("*BEAM SECTION SECTION=CIRC: no readable radius on the first data "
+                                 "line; ccx expects the two section diameters (2r, 2r) there — "
+                                 "set it by hand.", once=True)
+        return [emit_keyword("BEAM SECTION", keep)] + data
 
     def _ibeam_to_rect(self, b: Block) -> Optional[List[str]]:
         """--approximate: replace an I-profile with the RECT of equal area and equal
@@ -2558,7 +2582,8 @@ class Converter:
                 continue
             params[k] = v
         out = [emit_keyword("BOUNDARY", params)]
-        for rec in merged_data_records(b):
+        midside = [ln.split(",") for ln in self._midside_records(b, "boundary")]
+        for rec in merged_data_records(b) + midside:
             # Interior blanks are positional (e.g. "node, dof1, , value" = blank last
             # DOF), so trim only trailing empties — never filter interior fields.
             g = [x.strip() for x in rec]
@@ -3597,13 +3622,16 @@ class Converter:
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} is not a ccx initial-"
                                       f"condition type (ccx knows {', '.join(sorted(ccx_known))}); "
                                       f"remodel or remove.")
+        layout = {"TEMPERATURE": "field", "VELOCITY": "dof", "DISPLACEMENT": "dof"}.get(typ)
+        midside = self._midside_records(b, layout) if layout else []
         if typ == "TEMPERATURE" and self._temp_ic_fill:
             self.report.note(f"*INITIAL CONDITIONS, TYPE=TEMPERATURE: nodes it does not list get "
                              f"0 first ({ALL_NODES_SET}, 0.) — the Abaqus default; ccx stops on a "
                              f"node without an initial temperature.", once=True)
-            return [emit_keyword("INITIAL CONDITIONS", b.params), f"{ALL_NODES_SET}, 0."] + list(b.data)
+            return [emit_keyword("INITIAL CONDITIONS", b.params), f"{ALL_NODES_SET}, 0."] + \
+                list(b.data) + midside
         if typ not in ("STRESS", "PLASTIC STRAIN", "SOLUTION"):
-            return self.passthrough(b)
+            return self.passthrough(b) + midside
         if b.has("GEOSTATIC"):
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ}, GEOSTATIC (stress varying "
                                       f"with elevation) has no ccx equivalent; compute per-element "
@@ -3653,6 +3681,39 @@ class Converter:
                              f"manually.", once=True)
         if len(out) == 1:
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} had no expandable records.")
+        return out
+
+    def handle_temperature(self, b: Block) -> List[str]:
+        """``*TEMPERATURE`` passes through; the midside nodes of upgraded CIRC beams get the
+        mean of their end nodes' values."""
+        return self.passthrough(b) + self._midside_records(b, "field")
+
+    def handle_normal(self, b: Block) -> List[str]:
+        """``*NORMAL`` passes through.  ccx builds a beam's expanded cross-section from the
+        normal in every node, so when both end nodes of an upgraded CIRC beam have an
+        explicit normal its midside node gets their normalised mean — otherwise ccx would
+        derive that node's normal from the section's n1 instead and twist the element
+        wherever the two disagree."""
+        out = self.passthrough(b)
+        if not self._midside:
+            return out
+        given: Dict[Tuple[int, int], Vec] = {}
+        for rec in merged_data_records(b):
+            f = [x for x in rec if x != ""]
+            try:
+                if len(f) >= 5:
+                    given[(pint(f[0]), pint(f[1]))] = (pf(f[2]), pf(f[3]), pf(f[4]))
+            except ValueError:
+                continue
+        n_out = len(out)
+        for eid, (a, c, m) in self._midside.items():
+            na, nc = given.get((eid, a)), given.get((eid, c))
+            if na and nc and (eid, m) not in given:
+                n = vadd(vunit(na), vunit(nc))
+                if vnorm(n) > 1e-9:
+                    out.append(f"{eid}, {m}, " + ", ".join(_fmt_component(x) for x in vunit(n)))
+        if len(out) > n_out:
+            self._note_midside_lines("NORMAL")
         return out
 
     def handle_surface_interaction(self, b: Block) -> List[str]:
@@ -3802,6 +3863,7 @@ class Converter:
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         self.build_geometry(blocks)
+        self._upgrade_circ_linear_beams(blocks)
         self._check_nonpositive_ids()
         self._check_overconstraints(blocks)
         self._prescan(blocks)
@@ -3826,6 +3888,148 @@ class Converter:
         out.extend(self.emit_geometry())
         out.extend(self.emit_other(blocks))
         return out
+
+    # Cards that read a node set as per-node state or as an output selection: a midside node
+    # between two members belongs to the set too (a *BOUNDARY on every node of a beam must
+    # still fix the whole beam).  Any other use (loads, *EQUATION, *MPC, couplings, node
+    # surfaces) counts the set's nodes, so an extra node would change it.
+    _MIDSIDE_SET_CARDS = {"BOUNDARY", "INITIAL CONDITIONS", "TEMPERATURE", "NODE PRINT",
+                          "NODE FILE", "NODE OUTPUT", "RIGID BODY", "TRANSFORM"}
+
+    def _upgrade_circ_linear_beams(self, blocks: List[Block]) -> None:
+        """2-node beams under a ``SECTION=CIRC`` *BEAM SECTION -> 3-node beams.  ccx 2.23
+        stops on them ('Please use quadratic elements for beams with circular cross
+        section'): a linear beam expands to an 8-node brick, whose corner nodes cannot
+        follow a circle.  Each such element gets a midside node at the midpoint of its end
+        nodes (new ids above the highest node; flattened coordinates are already global, so
+        the instance transform is included) and becomes B32/B32R in ccx's end, middle, end
+        order (probed on 2.23: end, end, middle stops with a nonpositive jacobian).  Element
+        ids and element sets are unchanged; node sets follow ``_MIDSIDE_SET_CARDS``."""
+        circ: set = set()
+        for b in blocks:
+            if b.keyword == "BEAM SECTION" and (b.param("SECTION") or "").strip().upper() == "CIRC":
+                circ.update(self.geom.elset((b.param("ELSET") or "").strip()))
+        if not circ:
+            return
+        quiet = Report()
+        nodes = self.geom.nodes
+        next_id = max(nodes, default=0)
+        kinds: "OrderedDict[str, int]" = OrderedDict()
+        for eid, (typ, conn) in list(self.geom.elements.items()):
+            quad = CIRC_QUADRATIC.get(ccx_element_type(typ, quiet)) if eid in circ else None
+            if quad is None or len(conn) != 2 or not all(n in nodes for n in conn):
+                continue
+            next_id += 1
+            self.geom.add_node(next_id, vscale(vadd(nodes[conn[0]], nodes[conn[1]]), 0.5))
+            self.geom.elements[eid] = (quad, [conn[0], next_id, conn[1]])
+            self._midside[eid] = (conn[0], conn[1], next_id)
+            self._elem_types.add(quad)
+            kind = f"{typ.upper()} -> {quad}"
+            kinds[kind] = kinds.get(kind, 0) + 1
+        if not self._midside:
+            return
+        mids = [m for _, _, m in self._midside.values()]
+        span = f"node {mids[0]}" if len(mids) == 1 else f"nodes {mids[0]}-{mids[-1]}"
+        self.report.warn(f"SECTION=CIRC beams: {len(mids)} 2-node element(s) emitted as 3-node beams "
+                         f"({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a new "
+                         f"midside node at its midpoint ({span}); ccx 2.23 stops on "
+                         f"linear beams with a circular section. Element ids and sets are kept, and "
+                         f"BCs, temperatures and initial conditions on both end nodes also reach the "
+                         f"midside node. The quadratic beam is closer to beam theory than the linear "
+                         f"one, so results can differ slightly from Abaqus.", once=True)
+        names = set(self.geom.nsets)
+        counted: set = set()                    # node sets some other card counts node by node
+        for b in blocks:
+            if b.keyword in GEOM_KW or b.keyword in ELEM_REF_KW or b.keyword == "HEADING" or \
+                    b.keyword in self._MIDSIDE_SET_CARDS:
+                continue
+            toks = {v.strip().upper() for k, v in b.params.items() if v and k in REF_PARAMS}
+            for line in b.data:
+                toks.update(t.strip().upper() for t in line.split(","))
+            counted |= toks & names
+        by_end: Dict[int, List[Tuple[int, int]]] = {}
+        for a, c, m in self._midside.values():
+            by_end.setdefault(a, []).append((c, m))
+        skipped: List[str] = []
+        for name, ids in self.geom.nsets.items():
+            members = set(ids)
+            add = [m for n in dedup(ids) for c, m in by_end.get(n, ()) if c in members]
+            if add and name in counted:
+                skipped.append(name)
+            elif add:
+                ids.extend(add)
+        if skipped:
+            self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
+                             f"hold both end nodes of upgraded CIRC beams but a load, constraint or "
+                             f"surface card uses them, so the midside nodes were not added (an extra "
+                             f"node there would add load or equation terms); *BOUNDARY and "
+                             f"temperature lines on them still reach the midside nodes.", once=True)
+
+    def _midside_records(self, b: Block, layout: str) -> List[str]:
+        """Extra data lines that carry a per-node card onto the midside nodes of upgraded CIRC
+        beams: when the card gives both end nodes a value (by id or through a set), the
+        midside node gets the linear interpolation, which is what the Abaqus element sees
+        between its nodes.  ``layout`` is ``"boundary"`` (node, first DOF[, last DOF[,
+        magnitude]] or a named type), ``"dof"`` (node, DOF, value) or ``"field"`` (node,
+        values...).  Appended after the card's own lines, they override what a set gave the
+        midside node; a value the card already gives it is not repeated."""
+        if not self._midside:
+            return []
+        recs: Dict[int, Dict[int, object]] = {}
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) < 2 or not g[0]:
+                continue
+            vals: Dict[int, object] = {}
+            try:
+                if layout == "field":
+                    vals[0] = [pf(x) if x else 0.0 for x in g[1:]]
+                elif layout == "dof":
+                    vals[int(g[1])] = pf(g[2]) if len(g) > 2 and g[2] else 0.0
+                elif re.fullmatch(r"[-+]?\d+", g[1]):
+                    d1 = int(g[1])
+                    d2 = int(g[2]) if len(g) > 2 and g[2] else d1
+                    mag = pf(g[3]) if len(g) > 3 and g[3] else None
+                    vals.update((d, mag) for d in range(min(d1, d2), max(d1, d2) + 1))
+                else:
+                    for d1, d2 in self._named_bc_dofs(g[1]) or []:
+                        vals.update((d, None) for d in range(d1, d2 + 1))
+            except ValueError:
+                continue
+            for n in self._resolve_nodes(g[0]):
+                recs.setdefault(n, {}).update(vals)
+        out: List[str] = []
+        for a, c, m in self._midside.values():
+            if a not in recs or c not in recs:
+                continue
+            ra, rc, rm = recs[a], recs[c], recs.get(m, {})
+            if layout == "field":
+                mean = [(x + y) / 2.0 for x, y in zip(ra[0], rc[0])]
+                if rm.get(0) != mean:
+                    out.append(", ".join([str(m)] + ["%.12g" % x for x in mean]))
+                continue
+            runs: List[List] = []                # [first DOF, last DOF, value] (value None = blank)
+            for d in sorted(set(ra) & set(rc)):
+                va, vc = ra[d], rc[d]
+                v = None if va is None and vc is None else ((va or 0.0) + (vc or 0.0)) / 2.0
+                if d in rm and rm[d] == v:
+                    continue
+                if layout == "boundary" and runs and runs[-1][1] == d - 1 and runs[-1][2] == v:
+                    runs[-1][1] = d
+                else:
+                    runs.append([d, d, v])
+            for d1, d2, v in runs:
+                head = [str(m), str(d1)] if layout == "dof" else [str(m), str(d1), str(d2)]
+                out.append(", ".join(head + ([] if v is None else ["%.12g" % v])))
+        if out:
+            self._note_midside_lines(b.keyword)
+        return out
+
+    def _note_midside_lines(self, keyword: str) -> None:
+        self.report.note(f"*{keyword} lines given for both end nodes of an upgraded CIRC beam were "
+                         f"extended to its midside node (values interpolated linearly).", once=True)
 
     def _prescan(self, blocks: List[Block]) -> None:
         """Deck-wide facts that individual card handlers need: which nodes can carry
@@ -3925,6 +4129,7 @@ class Converter:
                 for rec in merged_data_records(b):
                     if rec and rec[0]:
                         covered.update(self._resolve_nodes(rec[0]))
+                covered.update(int(ln.split(",")[0]) for ln in self._midside_records(b, "field"))
         if any_temp_ic and self.geom.nodes and not set(self.geom.nodes) <= covered:
             self._temp_ic_fill = True
             self.geom.nsets.setdefault(ALL_NODES_SET, list(self.geom.nodes))

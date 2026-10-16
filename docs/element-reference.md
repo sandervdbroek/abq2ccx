@@ -84,6 +84,8 @@ Direct CalculiX types: **68**. Total recognised: **156**.
 | `T3D2` | 2 | direct |
 | `T3D3` | 3 | direct |
 
+Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is `B21` → `B32`, `B31` → `B32`, `B31R` → `B32R` become 3-node beams: ccx 2.23 rejects linear beams with a circular section. Each element gets a new midside node at the midpoint of its end nodes (ccx's order is end, middle, end); element ids and sets are kept, and BCs, temperatures and initial conditions given for both end nodes also reach the midside node.
+
 ## cohesive
 
 | Abaqus type | Nodes | CalculiX |

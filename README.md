@@ -91,6 +91,7 @@ through CalculiX (it auto-detects `ccx`, including the copy bundled with FreeCAD
 
 ```text
 PASS  nle10_thickplate (NAFEMS LE10): SYY at point D = -5.650 MPa (reference -5.38 MPa, 5.0% diff)
+PASS  beam_circ_cantilever (B31 + CIRC): tip deflection = -4.2290 (beam theory -4.2441, 0.4% diff)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -101,6 +102,8 @@ pressure face. After conversion, CalculiX solves it and reports σ_yy = −5.65 
 point D versus the published reference −5.38 MPa — a 5 % difference, in line with this
 element type and mesh density. That exercises the whole pipeline (mesh expansion,
 node ordering, boundary sets, pressure face, solid section) and confirms it is correct.
+The second check is a cantilever on linear `B31` beams with a circular section: its tip
+deflection is compared with beam theory, P L³/(3 E I).
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -124,9 +127,9 @@ python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
 Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
-references; 215 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
+references; 218 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
 crash, and runs an analysis step), and **219 mesh-only decks** — no `*STEP`, so nothing to
-solve — are **accepted** by ccx. The other 588 convert cleanly but use features ccx cannot
+solve — are **accepted** by ccx. The other 585 convert cleanly but use features ccx cannot
 run (user elements, UMAT/VUMAT and other user subroutines, Riks, cohesive/connector
 elements, piezoelectric/acoustic coupling) or are CAE part fragments / incomplete or
 invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
@@ -182,6 +185,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*ELASTIC, ORTHOTROPIC/ANISOTROPIC` | `ORTHO`/`ANISO` | same constant order |
 | `*ORIENTATION` | `*ORIENTATION` | origin `c` subtracted (axes `a−c`, `b−c`); `DEFINITION=NODES` resolved; `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
 | `*DISTRIBUTION` | passed (solid-section only) | shells not supported by ccx |
+| `*BEAM SECTION, SECTION=CIRC` | radius `r` → diameters `2r, 2r`; 2-node beams → `B32`/`B32R` | ccx reads an ellipse's axis lengths; ccx 2.23 rejects linear beams with a circular section, so each gets a midside node (BCs, temperatures and initial conditions on both end nodes reach it) |
 | `*SHELL SECTION, COMPOSITE` | S6/S8R; synth `*ORIENTATION` per ply angle | no inline ply angle in ccx; `SYMMETRIC` layups mirrored; on continuum shells (SC8R) → `*SOLID SECTION` |
 | `*STEP` | `NAME` dropped, `NLGEOM` on step, `AMPLITUDE=RAMP/STEP` kept, `PERTURBATION` only for freq/buckle, `*END STEP` added | explicit steps get `INC=10000000` + `NLGEOM` (Abaqus/Explicit defaults) |
 | `*BOUNDARY ENCASTRE/PINNED/*SYMM` | numeric DOFs | rotational DOFs only if shells/beams (`--solid-dof` to force 1-3) |
@@ -247,6 +251,9 @@ pressure-face labels (`P1..P6`) carry across unchanged. Element handling:
   `SC6R→C3D6`/`SC8R→C3D8I` (continuum shell → solid), `C3D10M→C3D10`,
   `DASHPOT1/2→DASHPOTA`, `GAPCYL/GAPSPHER→GAPUNI`, and all hybrid `…H` → non-hybrid
   base (ccx has no mixed u/p formulation).
+* **Upgraded** (warned): 2-node beams under a `*BEAM SECTION, SECTION=CIRC` (`B21`/`B31` →
+  `B32`, `B31R` → `B32R`), which ccx 2.23 rejects, get a midside node at each element's
+  midpoint; element ids and sets are kept.
 * **Best-effort approximation** (node-count preserving, *strong* warning — behaviour lost):
   cohesive `COH*` and gasket `GK*` → the matching thin continuum (`COH3D8→C3D8`,
   `COH2D4→CPE4`, `GK3D8→C3D8`, …), with `*COHESIVE/GASKET SECTION → *SOLID SECTION`.
@@ -344,6 +351,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/nle10_thickplate.inp`](examples/nle10_thickplate.inp) | NAFEMS LE10, C3D20, `*NCOPY`+`*ELGEN`+`GEN`/`PERT`, `*DLOAD Px` |
 | [`examples/composite_shell.inp`](examples/composite_shell.inp) | S8R composite layup, orthotropic, `*ORIENTATION`, `ENCASTRE`, `*DSLOAD` |
 | [`examples/assembly_two_blocks.inp`](examples/assembly_two_blocks.inp) | two-instance assembly, `instance.node` reference in a step |
+| [`examples/beam_circ_cantilever.inp`](examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters, `*NGEN`/`*ELGEN` |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

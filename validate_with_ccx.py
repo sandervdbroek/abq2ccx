@@ -3,8 +3,8 @@
 
 This is the proof that the converter produces *runnable, correct* CalculiX input — not
 just structurally-valid text.  It auto-detects a ``ccx`` binary (including the one
-bundled with FreeCAD) and, for the NAFEMS LE10 benchmark, checks the computed stress
-against the published reference value.
+bundled with FreeCAD) and checks two results against reference values: the NAFEMS LE10
+stress, and the tip deflection of a circular-section cantilever against beam theory.
 
     python validate_with_ccx.py
 
@@ -13,6 +13,7 @@ a clear message), 1 if a check fails.  Requires CalculiX; install it or FreeCAD.
 """
 
 import glob
+import math
 import os
 import shutil
 import subprocess
@@ -88,6 +89,24 @@ def frd_stress(frd_path, node):
     return None
 
 
+def dat_displacement(dat_path, node):
+    """Last displacement (ux, uy, uz) printed for ``node`` by *NODE PRINT in a ccx .dat
+    file, or None."""
+    found, inblock = None, False
+    if not os.path.exists(dat_path):
+        return None
+    for ln in open(dat_path):
+        if ln.strip().startswith("displacements"):
+            inblock = True
+            continue
+        f = ln.split()
+        if inblock and len(f) == 4 and f[0] == str(node):
+            found = [float(x) for x in f[1:]]
+        elif inblock and f and not f[0].isdigit():
+            inblock = False
+    return found
+
+
 def main():
     ccx, env = find_ccx()
     if not ccx:
@@ -119,6 +138,25 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  nle10_thickplate (NAFEMS LE10): SYY at point D = "
                   f"{syy:+.3f} MPa (reference {ref:+.2f} MPa, {abs(syy-ref)/abs(ref)*100:.1f}% diff)")
             failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
+
+    # --- circular-section cantilever on linear beams: tip deflection vs beam theory --
+    # ccx 2.23 rejects linear beams with a circular section, so this checks the B31 -> B32
+    # upgrade (midside nodes, node order) and the radius -> diameter conversion together.
+    inp = os.path.join(tmp, "beam.inp")
+    convert(os.path.join(EXAMPLES, "beam_circ_cantilever.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    ref = -1.0 * 100.0 ** 3 / (3 * 1.0e5 * math.pi / 4)          # -P L^3 / (3 E I), r = 1
+    u = dat_displacement(os.path.join(d, "job.dat"), 21) if status == "solved" else None
+    if u is None:
+        print(f"FAIL  beam_circ_cantilever: no tip displacement ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        ok = abs(u[1] - ref) / abs(ref) < 0.02
+        print(f"{'PASS' if ok else 'FAIL'}  beam_circ_cantilever (B31 + CIRC): tip deflection = "
+              f"{u[1]:+.4f} (beam theory {ref:+.4f}, {abs(u[1]-ref)/abs(ref)*100:.1f}% diff)")
+        failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
 
     # --- other decks: confirm they are accepted and solve ----------------------

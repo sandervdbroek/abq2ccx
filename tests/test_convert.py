@@ -1287,6 +1287,86 @@ def test_boundary_on_undefined_set_warns():
     assert "is a *SURFACE" in rep.text()
 
 
+CIRC_BEAM = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+*Element, type=B31, elset=BEAM
+1, 1, 2
+2, 2, 3
+*Beam Section, elset=BEAM, material=M, section=CIRC
+0.05
+0., 0., -1.
+*Material, name=M
+*Elastic
+2.1e5, 0.3
+"""
+
+
+def test_circ_linear_beam_becomes_quadratic():
+    body, conv, rep = convert_str(CIRC_BEAM)
+    # ccx 2.23 rejects linear beams with a circular section: midside nodes 4, 5 at the
+    # element midpoints, B32 in ccx's end, middle, end order; ids and the elset are kept
+    assert "*ELEMENT, TYPE=B32\n1, 1, 4, 2\n2, 2, 5, 3\n" in body
+    assert conv.geom.nodes[4] == (0.5, 0.0, 0.0) and conv.geom.nodes[5] == (1.5, 0.0, 0.0)
+    assert "*ELSET, ELSET=BEAM\n1, 2\n" in body and "3-node beams (B31 -> B32: 2)" in rep.text()
+    # ccx reads the CIRC dimensions as the two diameters: Abaqus radius 0.05 -> 0.1, 0.1
+    assert "SECTION=CIRC\n0.1, 0.1\n0., 0., -1." in body
+    body, _, _ = convert_str(CIRC_BEAM.replace("type=B31", "type=B31R"))
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
+    body, _, _ = convert_str(CIRC_BEAM.replace("type=B31", "type=B21"))   # ccx runs B21 as B31
+    assert "*ELEMENT, TYPE=B32\n1, 1, 4, 2\n" in body
+    body, _, rep = convert_str(CIRC_BEAM.replace("section=CIRC\n0.05", "section=RECT\n0.1, 0.1"))
+    assert "*ELEMENT, TYPE=B31\n1, 1, 2\n" in body and "3-node beams" not in rep.text()
+    _, _, rep = convert_str(CIRC_BEAM.replace("CIRC\n0.05\n", "CIRC\n"))  # no radius line
+    assert "no readable radius" in rep.text()
+
+
+def test_circ_beam_midside_follows_instance_transform():
+    deck = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 2., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n"
+            "*Beam Section, elset=B, material=M, section=CIRC\n0.1\n0., 0., -1.\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I, part=P\n10., 0., 0.\n0., 0., 0., 0., 0., 1., 90.\n"
+            "*End Instance\n*End Assembly\n*Material, name=M\n*Elastic\n1000., 0.3\n")
+    _, conv, _ = convert_str(deck)
+    typ, conn = conv.geom.elements[1]
+    assert typ == "B32" and conn == [1, 3, 2]
+    # ends at R(p + T) = (0, 10, 0) and (0, 12, 0): the midside node is their midpoint
+    assert all(abs(p - q) < 1e-9 for p, q in zip(conv.geom.nodes[3], (0.0, 11.0, 0.0)))
+
+
+def test_circ_beam_midside_node_gets_sets_bcs_and_fields():
+    deck = CIRC_BEAM + ("*Nset, nset=ALLN\n1, 2, 3\n*Nset, nset=LOADED\n2, 3\n"
+                        "*Normal\n1, 1, 0., 1., 0.\n1, 2, 0., 1., 0.\n"
+                        "*Boundary\nALLN, 3, 3\n1, 1, 2\n2, 1, 2\n"
+                        "*Initial Conditions, type=temperature\n1, 20.\n2, 40.\n3, 60.\n"
+                        "*Initial Conditions, type=velocity\n1, 2, 4.\n2, 2, 8.\n"
+                        "*Step\n*Static\n*Cload\nLOADED, 2, -1.\n*Temperature\n1, 100.\n2, 200.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    # a set only BCs use takes the midside nodes (the BC still fixes the whole beam); one a
+    # *CLOAD counts keeps its nodes (an extra node would add load)
+    assert conv.geom.nset("ALLN") == [1, 2, 3, 4, 5] and conv.geom.nset("LOADED") == [2, 3]
+    assert "LOADED hold both end nodes" in rep.text()
+    # node-numbered data on both end nodes is interpolated onto the midside node, per DOF
+    assert "\n2, 1, 2\n4, 1, 2\n" in body and "\n5, 1, 2" not in body
+    assert "\n3, 60.\n4, 30\n5, 50\n" in body and "ABQ2CCX_ALL_NODES" not in body
+    assert "\n2, 2, 8.\n4, 2, 6\n" in body and "\n2, 200.\n4, 150\n" in body
+    assert "\n1, 2, 0., 1., 0.\n1, 4, 0, 1, 0\n" in body          # *NORMAL averaged
+    # a set value the end nodes override is replaced by the interpolation (Abaqus sees
+    # 25 halfway between 30 and 20); where it already matches, nothing is added
+    body, _, _ = convert_str(CIRC_BEAM + "*Nset, nset=ALLN\n1, 2, 3\n"
+                             "*Initial Conditions, type=temperature\nALLN, 20.\n1, 30.\n")
+    assert body.split("*INITIAL CONDITIONS")[1] == ", TYPE=temperature\nALLN, 20.\n1, 30.\n4, 25"
+
+
+def test_beam_circ_cantilever_example():
+    body, _, _ = convert(os.path.join(EXAMPLES, "beam_circ_cantilever.inp"))
+    g = reparse(body)
+    assert [t for t, _ in g.elements.values()] == ["B32"] * 20 and len(g.nodes) == 41
+    assert g.elements[1][1] == [1, 22, 2] and g.nodes[22] == (2.5, 0.0, 0.0)
+    assert "SECTION=CIRC\n2, 2\n" in body                          # radius 1 -> diameters
+    assert not dangling_refs(g), dangling_refs(g)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

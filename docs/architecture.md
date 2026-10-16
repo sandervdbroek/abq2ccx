@@ -137,8 +137,8 @@ python validate_with_ccx.py     # converts + runs the examples in CalculiX
 ```
 
 It auto-detects `ccx` (including FreeCAD's bundled binary), runs the example decks, and
-checks the NAFEMS LE10 benchmark stress against the published reference. It skips
-cleanly if no `ccx` is found.
+checks the NAFEMS LE10 benchmark stress against the published reference and a circular
+cantilever's tip deflection against beam theory. It skips cleanly if no `ccx` is found.
 
 There is also a **corpus** of 1022 genuine Abaqus decks (`corpus/manifest.py`) fetched on
 demand and tested end-to-end:

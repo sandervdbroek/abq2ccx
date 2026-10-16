@@ -5,7 +5,8 @@ The converter has three layers of tests:
 1. **Unit tests** — fast, no solver needed, run on small controlled fixtures and the
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
-   CalculiX, checking the NAFEMS LE10 benchmark numerically.
+   CalculiX, checking the NAFEMS LE10 benchmark and a circular-section cantilever
+   numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -19,7 +20,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (114)
+## 1. Unit tests — `tests/test_convert.py` (118)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -140,6 +141,10 @@ conversion behaviour and referential integrity.
 | `test_plane_section_blank_thickness_defaults_to_one` | a blank plane-element thickness becomes Abaqus' default 1.0 |
 | `test_cyclic_hardening_needs_combined_plastic` | `*CYCLIC HARDENING` without a kept `COMBINED` `*PLASTIC`, or in `PARAMETERS` form, is commented out |
 | `test_boundary_on_undefined_set_warns` | a BC on an undefined node set (or on a surface name) is warned |
+| `test_circ_linear_beam_becomes_quadratic` | 2-node beams under `SECTION=CIRC` (rejected by ccx 2.23) → `B32`/`B32R` with a midside node at each midpoint, in ccx's end, middle, end order (`B21`/`B31` → `B32`, `B31R` → `B32R`); element ids and the elset kept; the Abaqus radius → ccx's two diameters; `RECT` beams stay linear |
+| `test_circ_beam_midside_follows_instance_transform` | in a translated and rotated instance the midside node lands at the midpoint of the transformed end nodes |
+| `test_circ_beam_midside_node_gets_sets_bcs_and_fields` | the midside node joins a node set only BCs use, not one a `*CLOAD` counts; `*BOUNDARY` (per DOF), initial temperature/velocity, `*TEMPERATURE` and `*NORMAL` lines on both end nodes are interpolated onto it, replacing a set value that the end nodes override |
+| `test_beam_circ_cantilever_example` | the bundled CIRC cantilever converts to 20 `B32` with midside nodes and diameters, no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -150,6 +155,10 @@ deck and runs it in CalculiX:
   published −5.38 MPa reference (the converted deck gives −5.65 MPa, a 5 % difference
   in line with the element type and mesh — proving the whole pipeline is correct, not
   just well-formed).
+* **`beam_circ_cantilever`** — a cantilever on linear `B31` beams with a circular section,
+  which ccx 2.23 rejects; the converter emits `B32` with inserted midside nodes and turns
+  the Abaqus radius into ccx's diameters. Checks the tip deflection against beam theory,
+  P L³/(3 E I) = −4.244 (the converted deck gives −4.229, 0.4 %).
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -182,8 +191,8 @@ deck and runs it in CalculiX:
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **215 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
-other 588 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
+references; **218 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
+other 585 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
 other user subroutines, Riks, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
 externally-supplied `<parameter>` values, or nodes numbered from 0) — and each was
@@ -214,6 +223,15 @@ whose rigid coupling 2.23 rejects, and two VCCT decks whose remaining contact (A
 default node-to-surface) does not converge once the unsupported bonded start is gone. Two
 decks that solve stay ungated: one is nondeterministic (ccx's built-in `utemp` stub segfaults
 about 1 run in 6), one takes ~260 s.
+
+**Circular-section beams.** ccx 2.23 also stops on linear beams with a circular section
+("Please use quadratic elements for beams with circular cross section"), which blocked a
+`B21` frequency analysis and two `B31` lattice decks. Such beams are now emitted as
+`B32`/`B32R` with a midside node per element. The same work found that ccx reads a `CIRC`
+section's data as two *diameters* while Abaqus gives the radius: passed through, the radius
+made circular beams 16× too flexible in bending. Both are fixed; the three decks solve
+(215 → 218), the frequency deck's first bending modes match Euler–Bernoulli within 0.6 %,
+and `validate_with_ccx.py` checks a circular cantilever against beam theory.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

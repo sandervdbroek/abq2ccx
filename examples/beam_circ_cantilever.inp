@@ -1,0 +1,34 @@
+*Heading
+Cantilever with a circular cross-section on linear B31 beams
+** L = 100, r = 1, E = 1e5, tip load P = 1 in -y.  Euler-Bernoulli tip deflection:
+** P L^3 / (3 E I) = 4.244, with I = pi r^4 / 4.
+** ccx 2.23 rejects linear beams with a circular section, so abq2ccx emits these as B32
+** with a midside node per element, and turns the Abaqus radius into ccx's diameters.
+*Node
+1, 0., 0., 0.
+21, 100., 0., 0.
+*Ngen, nset=AXIS
+1, 21, 1
+*Element, type=B31, elset=BEAM
+1, 1, 2
+*Elgen, elset=BEAM
+1, 20, 1, 1
+*Nset, nset=ROOT
+1
+*Nset, nset=TIP
+21
+*Beam Section, elset=BEAM, material=MAT, section=CIRC
+1.
+0., 0., -1.
+*Material, name=MAT
+*Elastic
+1.e5, 0.3
+*Boundary
+ROOT, ENCASTRE
+*Step
+*Static
+*Cload
+TIP, 2, -1.
+*Node Print, nset=TIP
+U
+*End Step

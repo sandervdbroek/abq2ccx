@@ -16,7 +16,7 @@ How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.
 | `*SOLID SECTION` | keeps `ELSET`/`MATERIAL`/`ORIENTATION`; other params dropped; an undefined `MATERIAL` is warned (ccx 2.23 can segfault on it). |
 | `*SHELL SECTION` | thickness only (integration-point count dropped); composite plies → one synthesized `*ORIENTATION` per ply angle (S6/S8R only), composed with a base rotation about the normal; `SYMMETRIC` layups mirrored; on continuum shells (SC6R/SC8R, which run as solids) → `*SOLID SECTION` (composite: commented). |
 | `*SHELL GENERAL SECTION` | → `*SHELL SECTION` (thickness+material form); ABD/stiffness form flagged as unsupported. |
-| `*BEAM SECTION` | keeps the supported params; `SECTION=CIRC` radius-vs-axes mismatch flagged. |
+| `*BEAM SECTION` | keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's two section diameters (`r` → `2r, 2r`), and 2-node beams under it become 3-node beams with an inserted midside node (ccx 2.23 rejects linear beams with a circular section; see the element reference). |
 | `*STEP` | `NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept; `PERTURBATION` kept only for `*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then persist); explicit steps get `INC=10000000` + `NLGEOM`; `*END STEP` ensured. |
 | `*STATIC` | `RIKS` commented by default (ccx would silently run it as plain static; `--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned). |
 | `*DYNAMIC` | implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; `APPLICATION=QUASI-STATIC/MODERATE DISSIPATION` → `ALPHA=-0.3333` (and `*STEP AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped. |

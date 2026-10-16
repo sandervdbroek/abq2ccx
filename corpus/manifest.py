@@ -13,13 +13,13 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
 dangling references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (215) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (218) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, and executes
   at least one STEP.
 * ``parse_only=True`` (219) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (588) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (585) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, connectors,
   other user subroutines - or are CAE part fragments / incomplete or invalid source
   decks (see each entry's ``note``). Each was verified to fail no worse than the
@@ -71,6 +71,9 @@ CORPUS = [
     dict(name='a_cgray_trial1', expect_solve=True, license='see source repo',
          exercises='CPS4I',
          url='https://raw.githubusercontent.com/A-CGray/FEMSS4/master/Labs/Old%20Lab/Cantilever/trial1.inp'),
+    dict(name='bbr6464_nat_freq', expect_solve=True, license='see source repo',
+         exercises='B21 — parts/instances/assembly; *Frequency',
+         url='https://raw.githubusercontent.com/BBR6464/Abaqus-Material-Analysis/main/Project_8_Frequancy%20Analysis/nat_freq.inp'),
     dict(name='brieffiniteelementnet_job_1', expect_solve=True, license='GPL-3.0',
          exercises='STRI3 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/BriefFiniteElementNet/BriefFiniteElement.Net/master/Validation/Validation/Case_01/files/Job-1.inp'),
@@ -185,6 +188,12 @@ CORPUS = [
     dict(name='hqdinh_example6', expect_solve=True, license='see source repo',
          exercises='T2D2',
          url='https://raw.githubusercontent.com/hqdinh/Truss-solver/master/example_input_files/example6.inp'),
+    dict(name='igrega348_bcc_sc', expect_solve=True, license='MIT',
+         exercises='B31 — parts/instances/assembly',
+         url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/bcc-sc.inp'),
+    dict(name='igrega348_e11128', expect_solve=True, license='MIT',
+         exercises='B31 — parts/instances/assembly',
+         url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/E11128.inp'),
     dict(name='irfancn_input', expect_solve=True, license='MIT',
          exercises='C3D8T — parts/instances/assembly; UMAT; explicit',
          url='https://raw.githubusercontent.com/irfancn/Abaqus-VUMAT-Gurson_GTN/master/input.inp'),
@@ -1724,10 +1733,6 @@ CORPUS = [
          exercises='— — contact',
          note='source/ccx: *ERROR reading *SURFACE: increase nalset_',
          url='https://raw.githubusercontent.com/Batmanabcdefg/abaqus_umat-1/master/new.inp'),
-    dict(name='bbr6464_nat_freq', expect_solve=False, license='see source repo',
-         exercises='B21 — parts/instances/assembly; *Frequency',
-         note='source/ccx: *ERROR in gen3dfrom1d: element            1 is a linear beam',
-         url='https://raw.githubusercontent.com/BBR6464/Abaqus-Material-Analysis/main/Project_8_Frequancy%20Analysis/nat_freq.inp'),
     dict(name='bibekanandadatta_cantilever_u7_cpe4_elem_80_el', expect_solve=False, license='BSD-3-Clause',
          exercises='U7, CPE4 — *User Element',
          note='ccx limitation: *USER ELEMENT (ccx cannot run UEL)',
@@ -2076,14 +2081,6 @@ CORPUS = [
          exercises='C3D8R, MASS, ROTARYI — parts/instances/assembly; explicit; contact; *Tie',
          note='ccx 2.23: *ERROR reading *ELEMENT:',
          url='https://raw.githubusercontent.com/idaholab/GranularFlowModels/main/examples/ringShear-MDPC.inp'),
-    dict(name='igrega348_bcc_sc', expect_solve=False, license='MIT',
-         exercises='B31 — parts/instances/assembly',
-         note='ccx 2.23: *ERROR in gen3dfrom1d: element            1 is a linear beam element with circular cross s',
-         url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/bcc-sc.inp'),
-    dict(name='igrega348_e11128', expect_solve=False, license='MIT',
-         exercises='B31 — parts/instances/assembly',
-         note='ccx 2.23: *ERROR in gen3dfrom1d: element            1 is a linear beam element with circular cross s',
-         url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/E11128.inp'),
     dict(name='ijwolden_2x2', expect_solve=False, license='see source repo',
          exercises='CPS4R — parts/instances/assembly',
          note="ccx 2.23 *DAMAGE INITIATION supports only a subset of Abaqus' criteria; this one is rejected",

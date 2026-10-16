@@ -49,13 +49,15 @@ Beyond these facts, the converter is checked against a real solve.
 CalculiX (auto-detecting `ccx`, including FreeCAD's bundled binary). The headline
 check is the **NAFEMS LE10 thick-plate benchmark**: the converted deck solves and
 reports σ_yy = −5.65 MPa at point D vs the published reference −5.38 MPa (5 % — in
-line with the element type and mesh density). The composite-shell and assembly decks
-also solve. This proves the full pipeline — `*NCOPY`/`*ELGEN` expansion, node ordering,
-boundary sets, pressure face, sections — is correct, not merely well-formed.
+line with the element type and mesh density). A cantilever on linear beams with a
+circular section matches beam theory's tip deflection within 0.4 %, and the
+composite-shell and assembly decks also solve. This proves the full pipeline —
+`*NCOPY`/`*ELGEN` expansion, node ordering, boundary sets, pressure face, sections — is
+correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
 demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
-215 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
+218 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
 convert cleanly but use features ccx cannot run, and each was verified to fail no worse
 than the original unconverted deck. Bulk-running every deck
 through convert → integrity → ccx is also what drove several converter fixes

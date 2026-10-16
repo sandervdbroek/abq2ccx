@@ -42,7 +42,10 @@ TRANSLATED = {
         "run as solids) → `*SOLID SECTION` (composite: commented).",
     "*SHELL GENERAL SECTION": "→ `*SHELL SECTION` (thickness+material form); ABD/stiffness form "
         "flagged as unsupported.",
-    "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC` radius-vs-axes mismatch flagged.",
+    "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's "
+        "two section diameters (`r` → `2r, 2r`), and 2-node beams under it become 3-node beams with "
+        "an inserted midside node (ccx 2.23 rejects linear beams with a circular section; see the "
+        "element reference).",
     "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept; `PERTURBATION` kept "
         "only for `*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then "
         "persist); explicit steps get `INC=10000000` + `NLGEOM`; `*END STEP` ensured.",
@@ -180,6 +183,14 @@ def gen_elements():
         rows = [(f"`{t}`", A.ELEMENT_NNODES[t], element_status(t)) for t in cats[cat]]
         parts.append(f"## {cat}\n")
         parts.append(md_table(["Abaqus type", "Nodes", "CalculiX"], rows) + "\n")
+        if cat == "beam / truss":
+            pairs = ", ".join(f"`{a}` → `{b}`" for a, b in A.CIRC_QUADRATIC.items())
+            parts.append("Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is "
+                         f"{pairs} become 3-node beams: ccx 2.23 rejects linear beams with a "
+                         "circular section. Each element gets a new midside node at the midpoint of "
+                         "its end nodes (ccx's order is end, middle, end); element ids and sets are "
+                         "kept, and BCs, temperatures and initial conditions given for both end "
+                         "nodes also reach the midside node.\n")
     return "\n".join(parts)
 
 
