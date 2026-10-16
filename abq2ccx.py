@@ -1227,6 +1227,16 @@ ALL_NODES_SET = "ABQ2CCX_ALL_NODES"
 # Element set (and material) of the force-free "knot beams" that make the shell/beam nodes
 # of a rigid coupling ccx knots — see Converter._plan_rigid_couplings.
 KNOT_SET = "ABQ2CCX_KNOT"
+# Why moving *RIGID BODY member BCs to the reference node (as Abaqus does) would hold the
+# body more than the BCs themselves — see Converter._plan_rigid_body_move.
+RB_MOVE_INEXACT = {
+    "geometry": "the BC'd nodes leave the body a rotation that the moved zero rotations fix — "
+                "they lie on one line seen along the DOF, for example, or are a single node",
+    "history": "the body may have turned before the step, its rotations not being held from the "
+               "start, and the BC values would then ramp from the turned position",
+    "overlap": "the reference node's own zero velocity meets a zero displacement on the nodes, or "
+               "the reverse: the same only if the DOF has not moved before the step",
+}
 
 # Abaqus face -> 1-based local node positions (corners, then midsides) of the continuum
 # families; a lower-order element simply has fewer nodes.  Shells use every node for a face
@@ -1640,8 +1650,14 @@ class Converter:
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
         self._bc_subsets: Dict[Tuple[int, ...], str] = {}  # remaining nodes of a split line -> set
-        self._coupled_clash: List[Tuple[str, str, int, int, int]] = []  # (kind, emit, node, dof, ref)
+        # id(*BOUNDARY) -> reference node -> DOF -> value: rigid-body member BCs moved there
+        self._bc_add: Dict[int, "OrderedDict[int, Dict[int, float]]"] = {}
+        self._rb_moved: List[Tuple[int, int, int, frozenset]] = []  # (node, dof, ref, why inexact)
+        # (kind, emit, node, dof, ref, why) left in place; why: '' or, on a *RIGID BODY,
+        # 'differ', 'conflict', 'kind' or 'approx:<reasons>' (see _plan_rigid_body_move)
+        self._coupled_clash: List[Tuple[str, str, int, int, int, str]] = []
         self._clash_dofs: set = set()              # ... their (node, dof)
+        self._span: Optional[float] = None         # model size (bounding-box diagonal), lazily
         self._planar_kin: set = set()              # id(coupling card) whose members are all 2-D
         self._last_planar = False
 
@@ -5557,21 +5573,25 @@ class Converter:
         *BOUNDARY ('*ERROR in cascade: ... dependent side of a MPC and a SPC') — an
         overconstraint Abaqus resolves.  Where the reference node's own BCs impose the
         member's BC anyway (the same value on that DOF, and no rotation about the other two
-        axes in that step or before it; 2-D: about z) the BC is redundant and is taken off
-        the card: exact, under NLGEOM too, since a rotation about the DOF's own axis leaves
-        that displacement component alone (probed on 2.23: the dropped BCs hold to 1e-20).
-        So is a BC on DOF 3 of a plane/axisymmetric node (Abaqus has none there; ccx's 2-D
-        rigid body makes it dependent).  An imposed BC on a tied rotation stays, and
-        _settle_dependents drops the tie (the BC governs it).  The rest is warned
-        (_warn_coupled_clashes), or with --approximate dropped where Abaqus drops it: a
-        kinematic coupling and an MPC eliminate the constrained DOFs of their nodes, so
-        Abaqus/Standard does not apply a BC there.  Rigid constraints: *RIGID BODY, kinematic
-        couplings and the rigid bodies of *MPC BEAM lines (_plan_mpcs)."""
+        axes during the step; 2-D: about z) the BC is redundant and is taken off the card:
+        exact, under NLGEOM too, since a rotation about the DOF's own axis leaves that
+        displacement component alone (probed on 2.23: the dropped BCs hold to 1e-20).  So is
+        a BC on DOF 3 of a plane/axisymmetric node (Abaqus has none there; ccx's 2-D rigid
+        body makes it dependent).  An imposed BC on a tied rotation stays, and
+        _settle_dependents drops the tie (the BC governs it).  A *RIGID BODY's other member
+        BCs go where Abaqus/Standard puts them, onto the reference node
+        (_plan_rigid_body_move).  The rest is warned (_warn_coupled_clashes), or with
+        --approximate dropped where Abaqus drops it: a kinematic coupling and an MPC eliminate
+        the constrained DOFs of their nodes, so Abaqus/Standard does not apply a BC there.
+        Rigid constraints: *RIGID BODY, kinematic couplings and the rigid bodies of *MPC BEAM
+        lines (_plan_mpcs)."""
         cons = self._rigid_constraints(blocks)
         if not cons:
             return
         relevant = {n for c in cons for n in list(c["trans"]) + list(c["rots"]) + [c["ref"], c["rot"]]}
         states, cards = self._bc_states(blocks, relevant)
+        for c in cons:
+            self._coupled_steps(c, states)
         # (node, dof) -> its BC is implied in every step one governs it; and its constraint
         verdict: "OrderedDict[Tuple[int, int], bool]" = OrderedDict()
         owner: Dict[Tuple[int, int], dict] = {}
@@ -5580,18 +5600,26 @@ class Converter:
                 for d in sorted(ds):
                     steps = [s for s, st in enumerate(states) if (m, d) in st]
                     if steps:                   # a BC no step keeps in force cannot clash
-                        ok = all(self._bc_implied(c, m, d, states, s) for s in steps)
+                        ok = all(self._bc_implied(c, m, d, s) for s in steps)
                         verdict[(m, d)] = verdict.get((m, d), True) and ok
                         owner.setdefault((m, d), c)
+        moved: set = set()
+        for c in cons:
+            if c["kind"] == "rb":
+                moved |= self._plan_rigid_body_move(c, cards, verdict, owner)
         implied, planar3, approx = [], 0, []
         for (m, d), ok in verdict.items():
+            if (m, d) in moved:
+                continue
             c = owner[(m, d)]
             loose = not ok and self._approx and c["kind"] != "rb"
             if not ok and not loose:
-                # a *RIGID BODY's tied rotation: _settle_dependents reorders the tie so the
-                # body follows the member's BC, as Abaqus moves it to the reference node
-                if not (d > 3 and c["kind"] == "rb"):
-                    self._coupled_clash.append((c["kind"], c["emit"], m, d, c["ref"]))
+                # a *RIGID BODY's tied rotation that _plan_rigid_body_move left: _settle_dependents
+                # reorders the tie so the body follows the member's BC, as Abaqus moves it to
+                # the reference node — warned where the BCs differ or contradict its own
+                why = c.get("why", {}).get(d, "")
+                if not (d > 3 and c["kind"] == "rb" and not why):
+                    self._coupled_clash.append((c["kind"], c["emit"], m, d, c["ref"], why))
                     self._clash_dofs.add((m, d))
                 continue
             if ok and d > 3:
@@ -5607,7 +5635,9 @@ class Converter:
                 implied.append((m, d))
         for b in blocks:
             if b.keyword == "BOUNDARY" and id(b) in self._bc_drop:
-                self._bc_lines[id(b)] = self._bc_lines_without(b, self._bc_drop[id(b)])
+                self._bc_lines[id(b)] = self._bc_lines_without(b, self._bc_drop[id(b)],
+                                                               self._bc_add.get(id(b)))
+        self._note_rigid_body_moves()
         if implied or planar3:
             eg = f" (e.g. node {implied[0][0]} DOF {implied[0][1]})" if implied else ""
             self.report.note(f"*BOUNDARY taken off {len(implied) + planar3} DOF(s) that a rigid "
@@ -5714,12 +5744,12 @@ class Converter:
     def _bc_states(self, blocks: List[Block], nodes: set):
         """The *BOUNDARY in force on ``nodes`` in each step, as ccx applies them: model data
         first, OP=NEW on a step's first *BOUNDARY removing the earlier ones.  (node, dof) ->
-        (id of the card, magnitude, amplitude, kind): kind "disp" for a displacement, "rate0"
-        for a zero velocity (the DOF stands still), None for what cannot be compared (FIXED,
-        USER, other velocities, accelerations).  A deck without steps: its model-data state.
-        Also (node, dof) -> ids of every card that names it, in force or overridden.  (bc_steps
-        is the zero / nonzero view of the emitted deck that _settle_dependents uses; this one
-        keeps the values, amplitudes and cards the implied-BC test needs.)"""
+        (id of the card, magnitude, amplitude, kind): kind "disp" for a displacement, "rate"
+        for a velocity, None for what cannot be compared (FIXED, USER, accelerations).  A
+        deck without steps: its model-data state.  Also (node, dof) -> ids of every card that
+        names it, in force or overridden.  (bc_steps is the zero / nonzero view of the emitted
+        deck that _settle_dependents uses; this one keeps the values, amplitudes and cards the
+        implied-BC test needs.)"""
         states: List[Dict[Tuple[int, int], tuple]] = []
         cards: Dict[Tuple[int, int], List[int]] = {}
         cur: Dict[Tuple[int, int], tuple] = {}
@@ -5739,7 +5769,7 @@ class Converter:
                 amp = (b.param("AMPLITUDE") or "").strip().upper()
                 for ns, dofs, mag in self._bc_records(b):
                     kind = None if fixed else "disp" if typ == "DISPLACEMENT" else \
-                        "rate0" if typ == "VELOCITY" and mag == 0.0 else None
+                        "rate" if typ == "VELOCITY" else None
                     for n in ns:
                         if n in nodes:
                             for d in dofs:
@@ -5750,47 +5780,304 @@ class Converter:
             states.append(dict(cur))
         return states or [cur], cards
 
-    def _bc_implied(self, c: dict, m: int, d: int, states, s: int) -> bool:
-        """Do the reference node's BCs in step ``s`` (and before it) impose the BC member ``m``
-        has on DOF ``d`` in step ``s``?  A translation follows the reference node's when the
-        rotations about the other two axes stay zero (rigid motion: u_d = u_ref,d + (θ × r)_d,
-        and a finite rotation about axis d leaves component d alone); a tied rotation equals
-        the reference rotation.  Both then start each step equal, so equal displacement
-        targets (same amplitude) keep them equal; a zero velocity on either side needs the
-        reference DOF held at zero since the first step."""
-        e = states[s][(m, d)]
+    def _coupled_steps(self, c: dict, states) -> None:
+        """Per step of rigid constraint ``c`` (c["steps"]): its BC state ('st'), the reference
+        node's own BC on each DOF 1-6 ('ref'), the members under a BC per coupled DOF ('S'),
+        and which reference DOFs are provably zero when the step starts ('z0').  Everything
+        starts at zero; a DOF ends a step at zero under a zero displacement, under a zero
+        velocity when it started at zero, and — on a *RIGID BODY, whose member BCs Abaqus
+        keeps (on the reference node) — the body's u_d and its rotations about the other axes
+        where identical member BCs on DOF d hold them (_move_geometry_ok) from an unturned
+        start.  c["axes"]: the body's rotation axes (2-D: z only)."""
+        axes = (3,) if c["planar"] else (1, 2, 3)
+        on: "OrderedDict[int, List[int]]" = OrderedDict()
+        for m, ds in list(c["trans"].items()) + list(c["rots"].items()):
+            for d in sorted(ds):
+                on.setdefault(d, []).append(m)
+        c["axes"], c["steps"] = axes, []
+        z0 = {k: True for k in range(1, 7)}
+        for s, st in enumerate(states):
+            ref = {k: self._ref_bc(c, st, k) for k in range(1, 7)}
+            members = OrderedDict((d, [m for m in ms if (m, d) in st]) for d, ms in on.items())
+            c["steps"].append(dict(st=st, ref=ref, S={d: ms for d, ms in members.items() if ms},
+                                   z0=dict(z0)))
+            end = {k: bool(ref[k]) and ref[k][1] == 0.0 and
+                   (ref[k][3] == "disp" or (ref[k][3] == "rate" and z0[k])) for k in range(1, 7)}
+            held = []                              # DOFs whose identical member BCs act together
+            for d in ((1, 2) if c["planar"] else (1, 2, 3)) if c["kind"] == "rb" else ():
+                es = [st[(m, d)] for m in members.get(d, ())]
+                if es and all(self._same_bc(e, es[0], False) for e in es):
+                    held.append(d)
+            rot = {j for d in held for j in axes if j != d}
+            if held and all(z0[3 + j] for j in rot) and self._move_geometry_ok(c, s, held):
+                for j in rot:
+                    end[3 + j] = True
+                for d in held:
+                    e = st[(members[d][0], d)]
+                    end[d] = end[d] or (e[1] == 0.0 and (e[3] == "disp" or z0[d]))
+            z0 = end
+
+    def _bc_implied(self, c: dict, m: int, d: int, s: int) -> bool:
+        """Do the reference node's own BCs in step ``s`` impose the BC member ``m`` has on DOF
+        ``d`` there?  A translation follows the reference node's when the rotations about the
+        other two axes stay zero (rigid motion: u_d = u_ref,d + (θ × r)_d, and a finite
+        rotation about axis d leaves component d alone): zero when the step starts, and held
+        by the reference node (_rot_held).  A tied rotation equals the reference rotation.
+        Both then start the step equal, so the same target (_same_bc) keeps them equal."""
+        step = c["steps"][s]
+        e = step["st"][(m, d)]
         if not e[3]:
             return False
         if d == 3 and c["planar"]:
             return True                  # no DOF 3 on a 2-D node in Abaqus; ccx's is held anyway
         if m in self._transformed or c["ref"] in self._transformed:
             return False                 # local DOFs
-        ref = self._ref_bc(c, states[s], d)
-        if ref is None or not ref[3]:
+        r = step["ref"][d]
+        if r is None or not self._same_bc(e, r, step["z0"][d]):
             return False
-        if e[3] == ref[3] == "disp":
-            same = (e[1] == 0.0 and ref[1] == 0.0) or \
-                (ref[2] == e[2] and abs(ref[1] - e[1]) <= 1e-12 * max(abs(ref[1]), abs(e[1])))
-        else:
-            same = e[1] == 0.0 and self._ref_held(c, states, d, s)
-        if not same or d > 3:
-            return same
-        return all(self._ref_held(c, states, j + 3, s)
-                   for j in ((3,) if c["planar"] else (1, 2, 3)) if j != d)
+        return d > 3 or all(self._rot_held(c, s, j) for j in c["axes"] if j != d)
 
-    def _ref_held(self, c: dict, states, k: int, s: int) -> bool:
-        """Is DOF ``k`` of the reference node held at zero (a zero displacement or velocity)
-        in every step 0..s?  Memoized per constraint."""
-        memo = c.setdefault("held", {})
-        t = s
-        while t >= 0 and (k, t) not in memo:
-            t -= 1
-        held = memo[(k, t)] if t >= 0 else True
-        for u in range(t + 1, s + 1):
-            r = self._ref_bc(c, states[u], k)
-            held = held and r is not None and bool(r[3]) and r[1] == 0.0
-            memo[(k, u)] = held
-        return held
+    @staticmethod
+    def _rot_held(c: dict, s: int, j: int) -> bool:
+        """Do the reference node's own BCs keep the body's rotation about axis ``j`` at zero
+        all through step ``s`` — zero at its start, held by a zero displacement or velocity?"""
+        step = c["steps"][s]
+        r = step["ref"][3 + j]
+        return step["z0"][3 + j] and r is not None and r[3] in ("disp", "rate") and r[1] == 0.0
+
+    @staticmethod
+    def _same_bc(e: tuple, r: tuple, zero_start: bool) -> bool:
+        """Do BC entries ``e`` and ``r`` (from _bc_states) drive two DOFs that start the step
+        equal the same way?  The same kind (displacement or velocity) with the same value and
+        amplitude, or zero both; a zero velocity and a zero displacement when the DOF starts
+        at zero (``zero_start``)."""
+        if not e[3] or not r[3]:
+            return False
+        if e[3] == r[3]:
+            return (e[1] == 0.0 and r[1] == 0.0) or \
+                (r[2] == e[2] and abs(r[1] - e[1]) <= 1e-12 * max(abs(r[1]), abs(e[1])))
+        return e[1] == 0.0 and r[1] == 0.0 and zero_start
+
+    def _move_geometry_ok(self, c: dict, s: int, ds: Sequence[int]) -> bool:
+        """Do the members' BCs on translations ``ds`` of *RIGID BODY ``c`` in step ``s`` hold
+        what moving them to the reference node holds — its u_d (d in ds) and its rotations
+        about the other axes (each d: the two axes other than d; 2-D: z)?  In the body's rigid
+        motion u_m = u_ref + θ × r_m a member BC is the row [e_d, r_m × e_d]·(u_ref, θ) (2-D:
+        u_m,1 = u_ref,1 − θ_z r_y, u_m,2 = u_ref,2 + θ_z r_x), and a BC on a tied shell/beam
+        rotation is the row of that body rotation; with the reference node's own BCs these
+        rows must span every moved row.  Then the BCs fix the same DOFs, and under NLGEOM
+        too where the moved model holds every rotation at zero (2-D; two or more DOFs moved;
+        the remaining one held): the constraint rank is that of the unturned body all along.
+        With one DOF d moved and the body free to turn about e_d, the members' translation
+        rows alone must hold both other rotations — their projections on the plane normal to
+        e_d not collinear —, which a turn about e_d leaves as it is."""
+        x0 = self.geom.nodes.get(c["ref"])
+        if x0 is None:
+            return False
+        step, axes, planar = c["steps"][s], c["axes"], c["planar"]
+        rot = sorted({j for d in ds for j in axes if j != d})
+        size = self._model_span()
+        width = 3 if planar else 6
+        col = {1: 0, 2: 1, 6: 2} if planar else {k: k - 1 for k in range(1, 7)}
+
+        def unit(k):
+            v = [0.0] * width
+            v[col[k]] = 1.0
+            return v
+        spun: List[int] = []             # tied rotations under identical member BCs
+        zero: set = set()                # ... those holding the body at zero all through the step
+        for j in axes:
+            es = [step["st"][(m, 3 + j)] for m in step["S"].get(3 + j, ())]
+            if es and all(self._same_bc(e, es[0], False) for e in es):
+                spun.append(3 + j)
+                if es[0][1] == 0.0 and step["z0"][3 + j]:
+                    zero.add(j)
+        free = [j for j in axes if j not in rot and j not in zero and not self._rot_held(c, s, j)]
+        rows: List[List[float]] = []
+        for d in ds:
+            for m in step["S"][d]:
+                p = self.geom.nodes.get(m)
+                if p is None:
+                    return False
+                r = [(p[k] - x0[k]) / size for k in range(3)]
+                if planar:
+                    rows.append([1.0, 0.0, -r[1]] if d == 1 else [0.0, 1.0, r[0]])
+                else:
+                    e = [0.0, 0.0, 0.0]
+                    e[d - 1] = 1.0
+                    rows.append(e + [r[1] * e[2] - r[2] * e[1], r[2] * e[0] - r[0] * e[2],
+                                     r[0] * e[1] - r[1] * e[0]])
+        if free:                         # one DOF moved, the body free to turn about it
+            return self._spans(rows, [unit(3 + j) for j in rot])
+        rows += [unit(k) for k in spun] + [unit(k) for k in col if step["ref"][k] is not None]
+        return self._spans(rows, [unit(d) for d in ds] + [unit(3 + j) for j in rot])
+
+    @staticmethod
+    def _spans(rows: List[List[float]], targets: List[List[float]], tol: float = 1e-6) -> bool:
+        """Is every vector of ``targets`` in the span of ``rows`` (to a relative ``tol``, so a
+        nearly degenerate set counts as degenerate)?  Gram-Schmidt on the rows."""
+        basis: List[List[float]] = []
+        width = len(targets[0]) if targets else 0
+        for v in rows:
+            if len(basis) == width:
+                break
+            norm = math.sqrt(sum(x * x for x in v))
+            w = list(v)
+            for _ in range(2):                    # twice: keeps the basis orthogonal
+                for b in basis:
+                    p = sum(x * y for x, y in zip(w, b))
+                    w = [x - p * y for x, y in zip(w, b)]
+            n = math.sqrt(sum(x * x for x in w))
+            if n > tol * max(norm, 1.0):
+                basis.append([x / n for x in w])
+        for v in targets:
+            w = list(v)
+            for _ in range(2):
+                for b in basis:
+                    p = sum(x * y for x, y in zip(w, b))
+                    w = [x - p * y for x, y in zip(w, b)]
+            if math.sqrt(sum(x * x for x in w)) > tol:
+                return False
+        return True
+
+    def _model_span(self) -> float:
+        if self._span is None:
+            xs = list(self.geom.nodes.values())
+            self._span = math.sqrt(sum((max(p[k] for p in xs) - min(p[k] for p in xs)) ** 2
+                                       for k in range(3))) if xs else 0.0
+            self._span = self._span or 1.0
+        return self._span
+
+    def _plan_rigid_body_move(self, c: dict, cards, verdict, owner) -> set:
+        """Abaqus/Standard moves the BCs on a *RIGID BODY's nodes to its reference node when
+        they are identical (else it stops with an error) and agree with the reference node's
+        own BCs, which it keeps, and adds zero rotations about the other axes to make up for
+        the removed displacement constraints (Analysis User's Guide, 'Overconstraint
+        checks').  That is the same constraint as the BCs themselves where the nodes BC'd on
+        DOF d (one value, one amplitude) hold the body's u_d and its rotations about the other
+        two axes (_move_geometry_ok), and the body has not turned about those axes when the step
+        starts — else the values ramp from a turned position, which a rigid body cannot
+        follow under NLGEOM.  A BC on a tied shell/beam rotation is a BC on the body's
+        rotation itself.  So the move is made by default only where exact, elsewhere only with
+        --approximate.  Decided per DOF over every step; the moved BCs go into the cards that
+        held the members' BCs, so step, OP, amplitude and type stay (_bc_lines_without), and
+        the rotations of a *RIGID BODY reference node reach its ROT NODE through
+        _active_dof_lines.  Returns the (node, DOF) pairs it took over; c["why"][dof] says
+        why the others stay."""
+        groups: "OrderedDict[int, List[int]]" = OrderedDict()
+        for m, ds in list(c["trans"].items()) + list(c["rots"].items()):
+            for d in sorted(ds):
+                if owner.get((m, d)) is c:     # a BC some step keeps in force (_plan_coupled_bcs)
+                    groups.setdefault(d, []).append(m)
+        todo = [d for d, ms in groups.items() if not all(verdict[(m, d)] for m in ms)]
+        why = c.setdefault("why", {})
+        res: Dict[int, list] = {d: [] for d in todo}     # dof -> [(step, outcome, reasons, lines)]
+        for s, step in enumerate(c["steps"]):
+            outs = {d: self._rb_step_outcome(c, d, s) for d in todo if d in step["S"]}
+            moving = [d for d, o in outs.items() if d <= 3 and o[0] in ("move", "approx")]
+            if moving and not self._move_geometry_ok(c, s, moving):
+                for d in moving:
+                    outs[d] = ("approx", outs[d][1] | {"geometry"}, outs[d][2])
+            asked: Dict[int, set] = {}                      # reference DOF -> values asked for
+            for d, (state, _, need) in outs.items():
+                for k, v in need.items():
+                    asked.setdefault(k, set()).add(v)
+            for d, out in outs.items():
+                # a rotation BC on tied shell/beam rotations vs the zero rotation a moved
+                # translation needs: Abaqus finds them inconsistent too
+                if any(len(asked[k]) > 1 for k in out[2]):
+                    out = ("conflict", set(), {})
+                res[d].append((s,) + out)
+        taken: set = set()
+        for d in todo:
+            bad = [o[1] for o in res[d] if o[1] in ("differ", "conflict", "kind")]
+            inexact = set().union(*[o[2] for o in res[d]])
+            if bad or not any(o[1] in ("move", "approx") for o in res[d]):
+                why[d] = min(bad, key=("differ", "conflict", "kind").index) if bad else ""
+                continue
+            if inexact and not self._approx:
+                why[d] = "approx:" + ",".join(sorted(inexact))
+                continue
+            for s, state, _, need in res[d]:
+                step = c["steps"][s]
+                for m in step["S"][d] if need else ():
+                    lines = self._bc_add.setdefault(step["st"][(m, d)][0], OrderedDict()) \
+                        .setdefault(c["ref"], {})
+                    lines.update(need)
+            for m in groups[d]:
+                # off every card that names it, so no overridden value stays behind either
+                for card in cards[(m, d)]:
+                    self._bc_drop.setdefault(card, set()).add((m, d))
+                taken.add((m, d))
+                if not verdict[(m, d)]:
+                    self._rb_moved.append((m, d, c["ref"], frozenset(inexact)))
+        return taken
+
+    def _rb_step_outcome(self, c: dict, d: int, s: int) -> Tuple[str, set, Dict[int, float]]:
+        """How Abaqus resolves the BCs on DOF ``d`` of a *RIGID BODY's nodes in step ``s``:
+        ('implied', ...) when the reference node's own BCs impose them; 'differ' (not
+        identical), 'conflict' (against the reference node's own BCs) or 'kind' (FIXED,
+        USER, an acceleration, local DOFs) when they cannot be moved; else 'move' or
+        'approx' (the reasons it is not the same constraint: 'history', 'overlap'; the
+        caller adds 'geometry') with the lines the reference node needs: {DOF: value} — the
+        BC itself unless the reference node has its own, zero rotations about the other axes
+        unless it holds them already."""
+        step = c["steps"][s]
+        ms = step["S"][d]
+        if all(self._bc_implied(c, m, d, s) for m in ms):
+            return "implied", set(), {}
+        es = [step["st"][(m, d)] for m in ms]
+        if not all(e[3] for e in es) or c["ref"] in self._transformed or \
+                any(m in self._transformed for m in ms):
+            return "kind", set(), {}
+        if not all(self._same_bc(e, es[0], False) for e in es):
+            return "differ", set(), {}
+        e, r = es[0], step["ref"][d]
+        need: Dict[int, float] = {}
+        inexact: set = set()
+        if r is None:
+            need[d] = e[1]
+        elif not self._same_bc(e, r, step["z0"][d]):
+            if not (r[3] and e[1] == 0.0 and r[1] == 0.0):
+                return "conflict", set(), {}
+            inexact.add("overlap")       # a zero velocity against a zero displacement
+        if d <= 3:
+            for j in c["axes"]:
+                if j == d:
+                    continue
+                rr = step["ref"][3 + j]
+                if rr is None:
+                    need[3 + j] = 0.0
+                elif not (rr[3] in ("disp", "rate") and rr[1] == 0.0):
+                    return "conflict", set(), {}
+                if not step["z0"][3 + j]:
+                    inexact.add("history")
+        return ("approx" if inexact else "move"), inexact, need
+
+    def _note_rigid_body_moves(self) -> None:
+        """Report the *RIGID BODY member BCs _plan_rigid_body_move put on reference nodes."""
+        exact = [x for x in self._rb_moved if not x[3]]
+        loose = [x for x in self._rb_moved if x[3]]
+        if exact:
+            m, d, ref, _ = exact[0]
+            self.report.note(f"*BOUNDARY on {len(exact)} DOF(s) of {len({x[0] for x in exact})} "
+                             f"*RIGID BODY node(s) moved to the reference node, translations with zero "
+                             f"rotations about the other axes (e.g. node {m} DOF {d} -> reference node "
+                             f"{ref}), as Abaqus/Standard does: ccx stops on a BC on a node the body drives "
+                             f"('*ERROR in cascade ... dependent side of a MPC and a SPC'), and the "
+                             f"BC'd nodes hold that DOF of the body and its rotations about the "
+                             f"other axes anyway (identical BCs, nodes not on one line seen along "
+                             f"the DOF, body not turned before the step). Exact.", once=True)
+        if loose:
+            m, d, ref, _ = loose[0]
+            reasons = set().union(*[x[3] for x in loose])
+            self.report.warn(f"[APPROX] *BOUNDARY on {len(loose)} DOF(s) of "
+                             f"{len({x[0] for x in loose})} *RIGID BODY node(s) moved to the "
+                             f"reference node, translations with zero rotations about the other axes "
+                             f"(e.g. node {m} DOF {d} -> reference node {ref}), as Abaqus/Standard does, "
+                             f"although that holds the body more than these BCs do: "
+                             + "; ".join(RB_MOVE_INEXACT[k] for k in sorted(reasons)) +
+                             ". Verify.", once=True)
 
     @staticmethod
     def _ref_bc(c: dict, st: Dict[Tuple[int, int], tuple], k: int) -> Optional[tuple]:
@@ -5801,11 +6088,23 @@ class Converter:
             e = st.get((c["rot"], k - 3))
         return e
 
-    def _bc_lines_without(self, b: Block, drop: set) -> List[List[str]]:
+    def _bc_lines_without(self, b: Block, drop: set,
+                          add: "Optional[Dict[int, Dict[int, float]]]" = None) -> List[List[str]]:
         """The records of *BOUNDARY card ``b`` without the (node, DOF) pairs in ``drop``: a line
         that loses some of its nodes on some DOFs is split per DOF range, onto the remaining
-        node or a node set of the remaining nodes (ABQ2CCX_BCn, registered for emission)."""
+        node or a node set of the remaining nodes (ABQ2CCX_BCn, registered for emission).
+        ``add`` (reference node -> DOF -> value) goes in where the first line lost nodes."""
         out: List[List[str]] = []
+        pending: List[List[str]] = []
+        for ref, vals in (add or {}).items():
+            spans: List[list] = []                 # [first DOF, last DOF, value]
+            for k in sorted(vals):
+                if spans and spans[-1][1] == k - 1 and spans[-1][2] == vals[k]:
+                    spans[-1][1] = k
+                else:
+                    spans.append([k, k, vals[k]])
+            pending += [[str(ref), str(a), str(c)] + ([fmt_num(v)] if v else [])
+                        for a, c, v in spans]
         for rec in merged_data_records(b):
             g = [x.strip() for x in rec]
             while g and g[-1] == "":
@@ -5842,7 +6141,9 @@ class Converter:
                 if keep:
                     out.append([spec if len(keep) == len(nodes) else self._node_subset(keep),
                                 str(a), str(c)] + extra)
-        return out
+            out += pending
+            pending = []
+        return out + pending
 
     def _node_subset(self, nodes: List[int]) -> str:
         """A node id, or the name of a node set (ABQ2CCX_BCn) holding ``nodes``."""
@@ -6292,14 +6593,14 @@ class Converter:
 
     def _warn_coupled_clashes(self) -> None:
         """The *BOUNDARY on rigid-constraint member DOFs that the reference node's BCs do not
-        impose (_plan_coupled_bcs): one warning per constraint kind and DOF type, with what
-        ccx does with it and what Abaqus does instead."""
+        impose and that stay (_plan_coupled_bcs): one warning per constraint kind, DOF type and
+        reason, with what ccx does with it and what Abaqus does instead."""
         what = {"kin": "a kinematic coupling", "rb": "a *RIGID BODY",
                 "mpc": "an *MPC BEAM (a *RIGID BODY in ccx)"}
-        groups: "OrderedDict[Tuple[str, str, bool], List[Tuple[int, int, int]]]" = OrderedDict()
-        for kind, emit, m, d, ref in self._coupled_clash:
-            groups.setdefault((kind, emit, d <= 3), []).append((m, d, ref))
-        for (kind, emit, trans), items in groups.items():
+        groups: "OrderedDict[Tuple[str, str, bool, str], List[Tuple[int, int, int]]]" = OrderedDict()
+        for kind, emit, m, d, ref, why in self._coupled_clash:
+            groups.setdefault((kind, emit, d <= 3, why), []).append((m, d, ref))
+        for (kind, emit, trans, why), items in groups.items():
             m, d, ref = items[0]
             nodes = len({n for n, _, _ in items})
             where = (f"node {m} DOF {d} follows reference node {ref} through {what[kind]} and also "
@@ -6312,16 +6613,33 @@ class Converter:
                           "(ccx cannot have both), unlike in Abaqus. ")
             else:
                 effect = ("In ccx the body then follows that rotation (the converter's rotation tie "
-                          "is turned round), unlike in Abaqus. ")
-            if kind == "rb":
-                fix = ("Abaqus moves identical BCs on rigid-body nodes to the reference node "
-                       "(adding zero rotations about the other axes) and stops if they differ: put "
-                       "the BC on the reference node instead.")
-            else:
+                          "is turned round; the first node's, if they differ), unlike in "
+                          "Abaqus. ")
+            move = ("Abaqus/Standard moves identical BCs on rigid-body nodes to the reference node, "
+                    "adding zero rotations about the other axes")
+            if kind != "rb":
                 fix = ("Abaqus/Standard eliminates the constrained DOFs at these nodes and does not "
                        "apply a BC there, so the node follows the constraint: take the node out of "
                        "the BC (or the constraint), or rerun with --approximate to drop such BCs as "
                        "Abaqus does.")
+            elif why.startswith("approx:"):
+                fix = (move + "; here that holds the body more than these BCs do ("
+                       + "; ".join(RB_MOVE_INEXACT[k] for k in why[7:].split(",")) +
+                       "). Rerun with --approximate to move them as Abaqus does, or put the BC on "
+                       "the reference node.")
+            elif why == "differ":
+                fix = ("The BCs differ between the body's nodes, and Abaqus/Standard stops with an "
+                       "error too (it only moves identical BCs to the reference node): put one BC "
+                       "on the reference node instead.")
+            elif why == "conflict":
+                fix = ("They disagree with the reference node's own BCs (on that DOF, or on a "
+                       "rotation about another axis, which the moved BC would hold at zero), and "
+                       "Abaqus/Standard stops with an error too: fix the BCs.")
+            elif why == "kind":
+                fix = (move + ", but the converter does not move a FIXED, USER or acceleration BC "
+                       "or one in local (*TRANSFORM) DOFs: put the BC on the reference node.")
+            else:
+                fix = move + " and stops if they differ: put the BC on the reference node instead."
             self.report.warn("Possible overconstraint: " + where + effect + fix, once=True)
 
     # ======================================================================

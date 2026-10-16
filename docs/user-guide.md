@@ -76,8 +76,9 @@ Common messages and what to do:
 | `Element X -> Y (… substitution)` | a node-count-preserving swap; verify Y is acceptable for your physics |
 | `… has NO CalculiX equivalent … emitted unchanged` | cohesive/gasket/connector/rigid element — the deck won't run until you remodel it |
 | `*KEYWORD … emitted as a comment` | no equivalent; the original is preserved as `**` comments for you to edit |
-| `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` sits on a DOF an `*EQUATION`, `*MPC` or rigid body eliminates, and the converter could not resolve it exactly (it reorders equation terms, drops redundant equations and leaves out BCs a rigid body already holds) — ccx will stop; remove one |
+| `Possible overconstraint: node N DOF d …` | a `*BOUNDARY` sits on a DOF an `*EQUATION`, `*MPC` or rigid body eliminates, and the converter could not resolve it exactly (it reorders equation terms, drops redundant equations, leaves out BCs a rigid body already holds and moves identical ones on a `*RIGID BODY` to its reference node) — ccx will stop; remove one (the message says what Abaqus does and when `--approximate` resolves it) |
 | `*BOUNDARY taken off N DOF(s) that a rigid constraint …` | BCs on coupled nodes that the reference node's own BCs impose anyway were removed — exact; ccx cannot have both |
+| `*BOUNDARY on N DOF(s) of M *RIGID BODY node(s) moved to the reference node …` | identical BCs on rigid-body nodes were put on the reference node with zero rotations about the other axes, as Abaqus/Standard does — `Exact.` when the BC'd nodes hold the same; `[APPROX]` (only with `--approximate`) when the move holds the body more than they do |
 | `… member(s) reference undefined … removed` | a set had ids that don't exist; if the count is surprising, check upstream renumbering |
 | `Duplicate node/element id(s) …` | the deck defines an id twice; last one wins (as in Abaqus) |
 | `*ORIENTATION SYSTEM=SPHERICAL …` | ccx has no spherical system; emitted rectangular — verify |

@@ -88,8 +88,11 @@ TRANSLATED = {
         "re-specifies every BC; where it removes BCs, the shell/beam nodes whose rotations it "
         "would break get knot beams too (ccx 2.23 does not rebuild those rotations after `OP=NEW`). "
         "On a DOF a rigid constraint also eliminates (ccx stops: dependent side of a MPC and a "
-        "SPC) the BC is taken off where the reference node's own BCs impose it, else warned "
-        "(`--approximate` drops it on a kinematic coupling or an `*MPC`, as Abaqus/Standard does).",
+        "SPC) the BC is taken off where the reference node's own BCs impose it; identical ones on "
+        "a `*RIGID BODY` move to its reference node with zero rotations about the other axes, as "
+        "Abaqus/Standard moves them, where the BC'd nodes hold the same DOFs; the rest is warned "
+        "(`--approximate` drops it on a kinematic coupling or an `*MPC` and makes the `*RIGID "
+        "BODY` move, as Abaqus/Standard does).",
     "*DLOAD": "passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / "
         "`CONSTANT RESULTANT` dropped (warned under NLGEOM).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`.",

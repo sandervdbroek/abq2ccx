@@ -60,8 +60,11 @@ FreeCAD-bundled copy, Homebrew/MacPorts) — or point at one with `--ccx`/`$CCX`
 **`--approximate` mode** reframes constructs CalculiX cannot run as *approximately
 equivalent* ones it can, each flagged with a loud `[APPROX]` warning: `*STATIC, RIKS` →
 plain `*STATIC`, incompressible `ν ≥ 0.5` → `0.475`, `*BEAM SECTION, SECTION=I` → the
-RECT with equal area + strong-axis inertia, and a `*BOUNDARY` on DOFs a kinematic coupling
-or an `*MPC` also constrains → dropped, as Abaqus/Standard does (ccx stops on it). Off by
+RECT with equal area + strong-axis inertia, a `*BOUNDARY` on DOFs a kinematic coupling or
+an `*MPC` also constrains → dropped, as Abaqus/Standard does (ccx stops on it), and
+identical BCs on a `*RIGID BODY`'s nodes that hold the body less than Abaqus' resolution
+does → moved to the reference node with zero rotations about the other axes, as
+Abaqus/Standard moves them (by default only where that is the same constraint). Off by
 default — nothing changes silently: a Riks step is then commented out, because ccx would
 otherwise run it as an ordinary load-controlled static step without saying so. (`*DYNAMIC,
 EXPLICIT` needs no reframing: ccx integrates explicitly itself, and the converter adds the
@@ -114,6 +117,7 @@ PASS  equation_overconstraint: solves (ccx rejects the deck as written); tied no
 PASS  op_new_respecify: step 2 beam tip +1.1898 (expected +1.1905, 0.05% diff), plate tip (prescribed) +2.0000 (expected +2.0000, 0.00% diff)
 PASS  op_new_remove: step 2 beam tip +0.5910 (expected +0.5952, 0.71% diff), plate tip (step 1) +4.6380 (expected +4.6380, 0.00% diff)
 PASS  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO *Expansion): free strains 0.0000% / 0.0000% off alpha dT; held cube at T = 90: strains 0.0001% off, sigma_xx = -1.71000 (analytic -1.71000)
+PASS  rigid_body_bc_bars (BCs on *RIGID BODY nodes moved to the reference node): bar A vs the same BCs on the reference point by hand, max |du| = 9.7e-21 of |u| 0.3421; A's far face |u1| <= 9.0e-21 as it moves 0.512 (NLGEOM)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -169,7 +173,12 @@ displacement comes out 0. The thermal check heats unit cubes whose isotropic `*E
 beside an orthotropic or anisotropic `*Expansion` — whose stiffness ccx 2.23 silently gets
 wrong in linear steps once a deck has temperatures (a free cube shrinks) — and compares their
 strains (one has its material system turned 30°) and the stress of a cube held in x, whose E
-and ν vary with temperature, with the analytic values.
+and ν vary with temperature, with the analytic values. The last gives the far face of a
+bar's rigid end cap (a `*RIGID BODY` on its elements) `u1 = 0`, which ccx stops on and the
+converter moves to the reference point with zero rotations about y and z, as Abaqus does —
+implied in a first step that holds the reference point, moved in a second that releases
+it — and compares the bar with the same BCs written on the reference point, in `NLGEOM`
+steps where the cap twists 25° about the axis of the moved BC.
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -267,7 +276,7 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*DYNAMIC, EXPLICIT` with `CIRC` beams | maximum time increment set (4th data field) | ccx 2.23 sizes a circular-section beam's stable increment as if its section were the box around the circle and runs it at about 1.3× the limit (NaN displacements); the cap is ccx's own estimate with the square through the section's corner nodes, side d/√2; a fixed (`DIRECT`) increment above it is warned |
 | rotational BCs on `CIRC` beam nodes | knot beam per node | a BC on some of DOFs 4–6 (or a nonzero one) at a circular-section `B32` end node makes ccx 2.23 lock the node's other rotations too (a pinned beam with its twist held deflects 0.3 of beam theory); as a knot the node's BCs hold only the rotations they name |
 | `*BOUNDARY, OP=NEW` in a later step, after rotational BCs on shell/beam nodes | OP=NEW dropped when the step re-specifies every BC; else knot beams on the nodes it would break | ccx 2.23 does not rebuild the rotational BCs it re-specifies (a clamp becomes a hinge) and on shells zeroes unrelated BCs; a knot carries the rotations in a form OP=NEW handles (exact on shells; a beam clamp 0.1–0.7 % stiffer); an explicit step in the deck: warned |
-| `*BOUNDARY` on rigid-coupling members | taken off where the reference node's own BCs impose it | ccx stops on a DOF that is both SPC'd and an MPC dependent; other such BCs are warned (`--approximate` drops them on a kinematic coupling, as Abaqus/Standard does); a 2-D `*KINEMATIC` couples `1, 2` |
+| `*BOUNDARY` on rigid-coupling members | taken off where the reference node's own BCs impose it; on a `*RIGID BODY` moved to the reference node (+ zero rotations about the other axes) where the BC'd nodes hold the same | ccx stops on a DOF that is both SPC'd and an MPC dependent; other such BCs are warned (`--approximate` drops them on a kinematic coupling and moves identical ones on a `*RIGID BODY`, as Abaqus/Standard does); a 2-D `*KINEMATIC` couples `1, 2` |
 | `*CONTACT PAIR, TIED` | `*TIE` per surface pair | without `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; face-to-face suggested if ccx struggles) |
 | `*FRICTION` | `mu` only | ccx reads Abaqus' 2nd field (slip rate / mu_k) as its stick slope; `ROUGH` warned (no equivalent) |
 | `*PLASTIC, HARDENING=JOHNSON COOK` | native ccx Johnson-Cook + `*RATE DEPENDENT` | ccx switches JC on only with a rate card (C = 0 added if the deck has none); `HARDENING=USER` / Chaboche `PARAMETERS` commented (material runs elastic) |
@@ -293,11 +302,13 @@ eliminated by another constraint, another term of the same equation goes first (
 matching assigns them); an equation that follows from the others and zero BCs (a duplicate,
 or one closing a loop of ties — ccx would silently hold such a loop at zero) is dropped, and
 a `*BOUNDARY` on a rigid constraint member's eliminated DOF that the reference node's own
-BCs impose anyway (the same value, no rotation about the other axes) is taken off. What
-cannot be resolved exactly keeps the `Possible overconstraint` warning, which for a coupled
-node says what Abaqus does instead. Flattened set/surface names are kept
-within CalculiX's **20-significant-character** limit (and uniquified) so instance
-prefixing can't silently collide two sets.
+BCs impose anyway (the same value, no rotation about the other axes) is taken off.
+Identical BCs on a `*RIGID BODY`'s nodes go where Abaqus/Standard puts them, onto the
+reference node with zero rotations about the other axes, wherever the BC'd nodes hold that
+DOF and those rotations themselves (exact). What cannot be resolved exactly keeps the
+`Possible overconstraint` warning, which for a coupled node says what Abaqus does instead.
+Flattened set/surface names are kept within CalculiX's **20-significant-character** limit
+(and uniquified) so instance prefixing can't silently collide two sets.
 
 ### Dropped (organisational) and Commented (no equivalent)
 
@@ -387,9 +398,10 @@ converter warns about the ones it can detect; the rest are here so you know to c
 
 * **Overconstraint** — a `*BOUNDARY` on a DOF that's also an `*EQUATION`/`*MPC`/tie
   dependent → `*ERROR in cascade … dependent side of a MPC and a SPC`. The converter
-  reorders equation terms, drops redundant equations and leaves out BCs a rigid body
-  already implies; what is left is warned — fix by removing the BC or the constraint on
-  that DOF.
+  reorders equation terms, drops redundant equations, leaves out BCs a rigid body already
+  implies and moves identical BCs on a `*RIGID BODY`'s nodes to its reference node where
+  that is the same constraint; what is left is warned — fix by removing the BC or the
+  constraint on that DOF.
 * **Set used before defined** — ccx is order-dependent (Abaqus isn't). The converter
   emits nodes/elements, then sets, then steps, which avoids this.
 * **Set/surface name > 20 significant chars** → silent collision. Handled for the
@@ -435,10 +447,16 @@ converter warns about the ones it can detect; the rest are here so you know to c
   nodes) and a coupling whose shell/beam reference node couples only some translations.
 * A `*BOUNDARY` on a DOF that a rigid constraint also eliminates stops ccx; Abaqus resolves
   it. The converter removes it where the reference node's own BCs impose it anyway (exact).
-  Otherwise it warns: Abaqus/Standard ignores such a BC on a kinematic coupling or an `*MPC`
-  (`--approximate` drops it the same way) and moves identical ones on a `*RIGID BODY` to
-  the reference node — which the converter does for a rotation (the body then follows the
-  member's BC) and leaves to you for a translation.
+  On a kinematic coupling or an `*MPC` Abaqus/Standard ignores any other such BC: the
+  converter warns, and `--approximate` drops it the same way. On a `*RIGID BODY` Abaqus moves identical BCs
+  on the body's nodes to the reference node, adding zero rotations about the other axes;
+  the converter does the same where it changes nothing — the nodes BC'd on a DOF hold that
+  DOF of the body and its rotations about the other axes (seen along the DOF they are not
+  all on one line, or the reference node's own BCs make up the rest), and the body has not
+  turned when the step starts — and otherwise only with `--approximate` (a single BC'd node,
+  a face held in one in-plane direction, a body free before the BC appears). BCs that
+  differ between the body's nodes, or contradict the reference node's own, stop Abaqus too
+  and stay warned; so do `FIXED`/`USER` BCs.
 * A rotational BC on a **circular-section beam** node also locks the node's other rotations
   in ccx 2.23 (it ties the section's midside nodes to its corners, which a circle cannot
   follow). Where a BC holds only some of DOFs 4–6, or a nonzero one, the converter gives the

@@ -7,10 +7,11 @@ bundled with FreeCAD) and checks results against reference values: the NAFEMS LE
 stress, the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, a shell plate rigidly coupled to a loaded reference point against the same plate
 built from solids, coupled bars whose coupled nodes also carry BCs against the same
-constraints written without a coupling, circular-section beams with a held twist and a
-prescribed rotation against beam theory, a circular-section beam in an explicit dynamic
-step against its static deflection, the natural frequencies and buckling loads of planar
-(B21) beams with a rectangular and a circular section, per-element *DISTRIBUTION
+constraints written without a coupling, a bar whose rigid end cap carries BCs on its nodes
+against the same BCs written on its reference point, circular-section beams with a held
+twist and a prescribed rotation against beam theory, a circular-section beam in an explicit
+dynamic step against its static deflection, the natural frequencies and buckling loads of
+planar (B21) beams with a rectangular and a circular section, per-element *DISTRIBUTION
 orientations (a C3D8 plate and a composite S8R panel) against the same models written with
 one orientation per element, a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, and the thermal strains of isotropic materials with an orthotropic / anisotropic
@@ -631,6 +632,37 @@ def main():
               f"(analytic {sxx_ref:+.5f})")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # --- BCs on *RIGID BODY nodes, moved to the reference node -----------------------
+    # Abaqus moves identical BCs on rigid-body nodes to the reference node, adding zero
+    # rotations about the other axes; ccx stops on a BC on a rigid-body node, so the converter
+    # moves them where the BC'd nodes hold the same DOFs. Bar A (far-face u1 = 0 on its rigid
+    # cap: implied in step 1, moved in step 2 once the reference point is released) must match
+    # bar B (the same BCs on its reference point by hand) exactly, and A's far face must keep
+    # u1 = 0 while the cap twists about x (NLGEOM).
+    inp = os.path.join(tmp, "rigid_body_bc_bars.inp")
+    convert(os.path.join(EXAMPLES, "rigid_body_bc_bars.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+    shutil.rmtree(d, ignore_errors=True)
+    a = [u.get(n) for n in range(1, 100)]                       # bar A; bar B is A + 1000
+    b = [u.get(n + 1000) for n in range(1, 100)]
+    far = [u.get(n) for n in range(11, 100, 11)]                # bar A's far face (x = 5)
+    if not all(a + b):
+        print(f"FAIL  rigid_body_bc_bars: no displacements ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        err = max(abs(x - y) for p, q in zip(a, b) for x, y in zip(p, q))
+        scale = max(abs(y) for q in b for y in q)
+        moved = max(abs(p[1]) + abs(p[2]) for p in far)
+        u1 = max(abs(p[0]) for p in far)
+        ok = err <= 1e-9 * scale and moved > 0.1 and u1 <= 1e-9 * moved
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_body_bc_bars (BCs on *RIGID BODY nodes moved to "
+              f"the reference node): bar A vs the same BCs on the reference point by hand, max "
+              f"|du| = {err:.1e} of |u| {scale:.4f}; A's far face |u1| <= {u1:.1e} as it moves "
+              f"{moved:.3f} (NLGEOM)")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

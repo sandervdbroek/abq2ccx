@@ -20,14 +20,24 @@ dependent term of an `*EQUATION`/`*MPC`/tie/coupling **and** the target of a
   constraint member's eliminated DOF when the reference node's own BCs impose it anyway. What remains is warned
   ("Possible overconstraint: node N DOF d …"). Fix those by removing either the BC or the
   constraint on that DOF.
-* **Rigid couplings** (`*RIGID BODY`, `*COUPLING`+`*KINEMATIC`, `*MPC BEAM`) make their members'
-  coupled DOFs dependent. Where the reference node's own BCs already impose a member's BC
+* **Rigid couplings** (`*RIGID BODY`, `*COUPLING`+`*KINEMATIC`, `*MPC BEAM`) make their
+  members' coupled DOFs dependent. Where the reference node's own BCs already impose a member's BC
   (the same value, no rotation about the other two axes), the converter removes it — exact,
-  and Abaqus resolves the redundancy the same way. Where they don't, the warning says what
-  Abaqus does: on a kinematic coupling or an `*MPC` Abaqus/Standard ignores the BC (the node
-  follows the constraint), and `--approximate` drops it the same way; on a `*RIGID BODY`
-  Abaqus moves identical BCs to the reference node (with zero rotations about the other
-  axes), so put them there.
+  and Abaqus resolves the redundancy the same way. On a `*RIGID BODY` Abaqus moves identical
+  BCs on the body's nodes to the reference node, with zero rotations about the other axes,
+  and the converter does the same where that changes nothing (note "moved to the reference
+  node … Exact."). Otherwise the warning says what Abaqus does and why it is not done:
+  * kinematic coupling or `*MPC` — Abaqus/Standard ignores the BC (the node follows the
+    constraint); `--approximate` drops it the same way;
+  * `*RIGID BODY`, "holds the body more than these BCs do" — the BC'd nodes leave the body a
+    rotation the move would fix (one node, one line seen along the DOF, one in-plane
+    direction on a flat face), or the body may have turned before the step (free in an
+    earlier step), or a zero velocity on the reference node meets zero displacements on the
+    nodes. `--approximate` moves them as Abaqus does; or put the BC on the reference node;
+  * `*RIGID BODY`, "the BCs differ between the body's nodes" or "disagree with the reference
+    node's own BCs" — Abaqus stops on these too: fix the BCs (one BC on the reference node);
+  * `*RIGID BODY` with a `FIXED`/`USER`/acceleration BC or local (`*TRANSFORM`) DOFs — not
+    moved by the converter: put the BC on the reference node.
 * The sibling message `*ERROR reading *EQUATION: the DOF corresponding to node N in
   direction d is detected on the dependent side of two different MPC's` has the same
   cause (two equations eliminating one DOF) and the same handling.

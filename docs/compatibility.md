@@ -27,7 +27,7 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 | **A rotational DOF of a non-knot shell/beam node does nothing in an `*EQUATION`** | `*MPC TIE` rotations are tied between knots only | probed on 2.23: two beam spans `TIE`d by six equations deflect exactly like a `PIN`ned hinge, as knots like one continuous beam |
 | **A closed loop of `*EQUATION` ties** (u1 = u2, u2 = u3, u3 = u1) is accepted, but ccx then warns "zero coefficient on the dependent side" and **holds the whole loop at zero** | the loop's closing equation is dropped (it follows from the others) | probed on 2.23 |
 | **ccx's explicit stable increment is about 1.3× too large for circular-section beams**: its Courant estimate measures each element by the one-point volume of the 20-node brick a `B32`/`B32R` expands into over its largest face area, and a `CIRC` section's nodes on the circle make that h = min(l, √2·d) — the box around the circle — while the stable limit corresponds to h = 1.01–1.17·d (`RECT`/`PIPE`/`BOX` run at ccx's own increment) | each automatic `*DYNAMIC, EXPLICIT` increment is capped (the data line's 4th field) at ccx's own formula with h = min(l, d/√2), the square through the section's corner nodes; a fixed (`DIRECT`) increment above it is warned, since ccx's mass scaling is sized from the same estimate | ccx sources `calcstabletimeincvol.f`, `gen3dfrom1d.f`; probed on 2.23 (NaN displacements; limit bisected over `B32`/`B32R`, d = 10–80, l = 5–100, ν = 0–0.49; capped, a load raised smoothly and held ends within 1 % of beam theory) |
-| **A rigid coupling makes its members' coupled DOFs MPC dependents too** (`*RIGID BODY` and `*MPC BEAM`: every translation; `*KINEMATIC`: the listed ones), and ccx holds DOF 3 of 2-D nodes itself | a member `*BOUNDARY` that the reference node's own BCs impose is taken off (exact); the others are warned (`--approximate` drops them on a kinematic coupling or an `*MPC`, as Abaqus/Standard does); a 2-D `*KINEMATIC` couples `1, 2` | probed on ccx 2.23 (`*ERROR in cascade`); Abaqus manual: coupled DOFs are eliminated at the coupling nodes, BCs on rigid-body nodes move to the reference node |
+| **A rigid coupling makes its members' coupled DOFs MPC dependents too** (`*RIGID BODY` and `*MPC BEAM`: every translation; `*KINEMATIC`: the listed ones), and ccx holds DOF 3 of 2-D nodes itself | a member `*BOUNDARY` that the reference node's own BCs impose is taken off (exact); identical ones on a `*RIGID BODY` move to the reference node with zero rotations about the other axes, as Abaqus/Standard moves them, where the BC'd nodes hold the same DOFs (exact; otherwise only with `--approximate`); the others are warned (`--approximate` drops them on a kinematic coupling or an `*MPC`, as Abaqus/Standard does); a 2-D `*KINEMATIC` couples `1, 2` | probed on ccx 2.23 (`*ERROR in cascade`; moved vs hand-placed BCs identical, `C3D8` and `CAX4`, linear and `NLGEOM`); Abaqus manual: coupled DOFs are eliminated at the coupling nodes, identical BCs on rigid-body nodes move to the reference node (non-identical ones are an error) |
 
 ## Version notes
 
@@ -192,8 +192,16 @@ explicit-dynamics steps cannot run it at all (nor any rigid body on plane or axi
 nodes: "linear and nonlinear MPC's depend on each other"). A coupled DOF that also carries
 a `*BOUNDARY` stops ccx ("dependent side of a MPC and a SPC"), an overconstraint Abaqus
 resolves: the converter takes such a BC off where the reference node's own BCs impose it
-anyway (exact), and otherwise warns with what Abaqus does instead — `--approximate` drops it
-on a kinematic coupling or an `*MPC`, as Abaqus/Standard does.
+anyway (exact). On a kinematic coupling or an `*MPC` it otherwise warns — Abaqus/Standard
+eliminates the constrained DOFs and ignores the BC, and `--approximate` drops it the same way. On a `*RIGID
+BODY` Abaqus/Standard moves identical BCs on the body's nodes to its reference node, adding
+zero rotations about the other axes, and stops if they differ; the converter makes the same
+move, in the card that held the BC, wherever it is the same constraint — the BC'd nodes hold
+that DOF of the body and its rotations about the other axes (not all on one line seen along
+the DOF, or with the reference node's own BCs), and the body is unturned when the step
+starts — and with `--approximate` (`[APPROX]`) where it holds the body more than the BCs
+do. BCs that differ between the body's nodes, or contradict the reference node's own, stay
+warned: Abaqus stops on them too.
 
 Abaqus `*MPC` is converted line by line: `PIN` and `TIE` become `*EQUATION`s, `BEAM`
 lines become one `*RIGID BODY` per independent node (lines chained through a node form one

@@ -330,12 +330,20 @@ def test_bc_steps_follow_op_new():
 
 
 def test_rotation_tie_on_a_member_bc_makes_the_body_dependent():
-    # a member rotation under a BC cannot be the tie's dependent term: the ROT NODE's DOF
-    # is (the BC then holds the body's rotation, exact); a *KINEMATIC reference node's
-    # DOFs 4-6 are eliminated by ccx itself, so that tie is dropped (the BC governs it)
-    body, conv, _ = convert_str(S4 + "*Rigid Body, ref node=REF, tie nset=R\n*Boundary\n5, 4, 4\n")
+    # a member rotation under a BC cannot be the tie's dependent term.  On a *RIGID BODY the BC
+    # moves to the ROT NODE, as Abaqus moves it (the tie keeps the member dependent); where it
+    # stays on the members (BCs that differ: warned), the ROT NODE's DOF becomes the first
+    # tie's dependent term (the BC then holds the body's rotation) and the second tie is
+    # dropped.  A *KINEMATIC reference node's DOFs 4-6 are eliminated by ccx itself, so that
+    # tie is dropped (the BC governs it)
+    rb = S4 + "*Rigid Body, ref node=REF, tie nset=R\n*Boundary\n5, 4, 4\n"
+    body, conv, _ = convert_str(rb)
     rot = conv._rb_rot[100]
+    assert _bc_lines(body) == [f"{rot},1,1"] and f"5,4,1.,{rot},1,-1." in _equations(body)
+    body, _, rep = convert_str(rb + "6, 4, 4, 0.01\n")
+    assert _bc_lines(body) == ["5,4,4", "6,4,4,0.01"] and "differ between the body's nodes" in rep.text()
     assert f"{rot},1,-1.,5,4,1." in _equations(body)
+    assert not any(e.startswith("6,4,") for e in _equations(body))
     deck = (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
             "surface=RS\n*Kinematic\n*Boundary\n5, 4, 4\n")
     body, _, rep = convert_str(deck)
@@ -1476,8 +1484,9 @@ def test_coupled_member_bc_implied_by_reference_dropped():
 def test_coupled_member_bc_conflicts_and_approximate():
     # a member BC the reference node's BCs do not impose stops ccx; Abaqus/Standard ignores it
     # (a kinematic coupling eliminates the coupled DOFs at its nodes), so --approximate drops
-    # it there; a *RIGID BODY conflict (Abaqus moves identical BCs to the reference node)
-    # stays a warning
+    # it there; on a *RIGID BODY, Abaqus moves identical member BCs to the reference node
+    # (test_rigid_body_member_bc_moved_to_reference), and BCs that differ between the body's
+    # nodes stop Abaqus too: those stay a warning, --approximate or not
     kin = (HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6,7,8\n*Surface, type=node, name=ST\n"
            "TOP\n*Coupling, constraint name=C, ref node=100, surface=ST\n*Kinematic\n"
            "*Boundary\nTOP, ENCASTRE\n")
@@ -1486,11 +1495,12 @@ def test_coupled_member_bc_conflicts_and_approximate():
     body, _, rep = convert_str(kin, approximate=True)
     assert _bc_lines(body) == [] and "[APPROX] *BOUNDARY taken off 12 DOF(s) of 4 node(s)" in rep.text()
     rb = kin.replace("*Surface, type=node, name=ST\nTOP\n*Coupling, constraint name=C, ref node=100, "
-                     "surface=ST\n*Kinematic\n", "*Rigid Body, ref node=100, tie nset=TOP\n")
+                     "surface=ST\n*Kinematic\n", "*Rigid Body, ref node=100, tie nset=TOP\n"
+                     "*Nset, nset=HALF\n5, 6\n").replace("TOP, ENCASTRE", "TOP, 1, 1\nHALF, 1, 1, 0.1")
     for approximate in (False, True):
         body, _, rep = convert_str(rb, approximate=approximate)
-        assert _bc_lines(body) == ["TOP,1,3"] and "[APPROX]" not in rep.text()
-        assert "through a *RIGID BODY" in rep.text() and "put the BC on the reference node" in rep.text()
+        assert _bc_lines(body) == ["TOP,1,1", "HALF,1,1,0.1"] and "[APPROX]" not in rep.text()
+        assert "through a *RIGID BODY" in rep.text() and "stops with an error too" in rep.text()
 
 
 def test_coupled_member_bc_shell_and_planar():
@@ -1512,8 +1522,103 @@ def test_coupled_member_bc_shell_and_planar():
          "*Material,name=M\n*Elastic\n1000.,0.3\n*Rigid Body, ref node=100, tie nset=R\n")
     body, _, rep = convert_str(q + "*Boundary\n100, 1, 1\n100, 6, 6\nR, 1, 1\nR, 3, 3\n")
     assert [l for l in _bc_lines(body) if l.startswith("R,")] == [] and "DOF 3 of 2-D nodes" in rep.text()
-    body, _, rep = convert_str(q + "*Boundary\n100, 1, 1\nR, 1, 1\n")      # rotation free
-    assert "R,1,1" in _bc_lines(body) and "Possible overconstraint" in rep.text()
+    # the reference node's rotation free: R's u1 at two heights holds it, so the BC moves to
+    # the reference node as Abaqus moves it — the rotation held at zero, on the ROT NODE
+    body, conv, rep = convert_str(q + "*Boundary\n100, 1, 1\nR, 1, 1\n")
+    assert _bc_lines(body) == ["100,1,1", f"{conv._rb_rot[100]},3,3"] and "Exact." in rep.text()
+    assert "overconstraint" not in rep.text()
+
+
+RB_TOP = HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6,7,8\n*Rigid Body, ref node=100, tie nset=TOP\n"
+
+
+def _bc_cards(body):
+    """(header, data lines) of each *BOUNDARY card of a converted deck, blanks removed."""
+    out = []
+    for l in _live(body):
+        if l.startswith("*"):
+            if l.upper().startswith("*BOUNDARY"):
+                out.append((l, []))
+            elif out and out[-1] is not None:
+                out.append(None)
+        elif out and out[-1] is not None:
+            out[-1][1].append(l.replace(" ", ""))
+    return [c for c in out if c is not None]
+
+
+def test_rigid_body_member_bc_moved_to_reference():
+    # Abaqus/Standard moves identical BCs on a *RIGID BODY's nodes to its reference node, with
+    # zero rotations about the other axes ('Overconstraint checks'); where the BC'd nodes hold
+    # those anyway it is the same constraint, so it is done by default — in the card that held
+    # the BC, which keeps its step, OP, amplitude and type
+    body, conv, rep = convert_str(RB_TOP + "*Amplitude, name=A\n0., 0., 1., 1.\n*Step\n*Static\n"
+                                  "*Boundary, amplitude=A\nTOP, 3, 3, 0.25\n*End Step\n")
+    rot = conv._rb_rot[100]
+    assert _bc_cards(body) == [("*BOUNDARY, AMPLITUDE=A", ["100,3,3,0.25", f"{rot},1,2"])]
+    assert "*BOUNDARY on 4 DOF(s) of 4 *RIGID BODY node(s) moved" in rep.text() and "Exact." in rep.text()
+    assert "overconstraint" not in rep.text()           # the manual's symmetry-face example
+    # four face nodes held in all three directions hold the body entirely, although each
+    # direction alone leaves the face a tilt; a line naming other nodes too keeps those
+    body, _, rep = convert_str(RB_TOP + "*Nset, nset=BOTH\n1, 5, 6, 7, 8\n*Boundary\nBOTH, ENCASTRE\n")
+    assert _bc_lines(body) == ["1,1,3", "100,1,3", f"{rot},1,3"] and "overconstraint" not in rep.text()
+    body, _, _ = convert_str(RB_TOP + "*Step\n*Static\n*Boundary, type=velocity\nTOP, 3, 3\n*End Step\n")
+    assert _bc_lines(body) == ["100,3,3", f"{rot},1,2"]     # a zero velocity: the same, as rates
+    # the cold-forging pattern (CAX4): a die's axis nodes keep XSYMM while its reference node is
+    # held in step 1 (implied there, dropped) and released in step 2 (moved: the die cannot
+    # have turned, being held at the end of step 1)
+    q = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n5,0,2\n6,1,2\n100,0,3\n*Element,type=CAX4,elset=E\n"
+         "1,1,2,3,4\n*Element,type=CAX4,elset=DIE\n2,4,3,6,5\n*Nset,nset=AXIS\n4,5\n"
+         "*Solid Section,elset=E,material=M\n1.,\n*Solid Section,elset=DIE,material=M\n1.,\n"
+         "*Material,name=M\n*Elastic\n1000.,0.3\n*Rigid Body, ref node=100, elset=DIE\n*Step\n*Static\n"
+         "*Boundary\n1, 2, 2\n2, 2, 2\nAXIS, XSYMM\n100, ENCASTRE\n*End Step\n*Step\n*Static\n"
+         "*Boundary, op=NEW\n1, 2, 2\n2, 2, 2\nAXIS, XSYMM\n*Cload\n100, 2, -1.\n*End Step\n")
+    body, conv, rep = convert_str(q)
+    rot = conv._rb_rot[100]
+    assert _bc_cards(body) == [("*BOUNDARY", ["1,2,2", "2,2,2", "100,1,3", f"{rot},1,3"]),
+                               ("*BOUNDARY, OP=NEW", ["1,2,2", "2,2,2", "100,1,1", f"{rot},3,3"])]
+    assert "Exact." in rep.text() and "overconstraint" not in rep.text()
+    # a shell edge held in all six DOFs is one line, but its rotation BCs (on the body's
+    # rotation, which the knots' ties make theirs) hold the turn about it; once the BCs are on
+    # the reference node, the edge rotations are tied to the body again
+    body, conv, rep = convert_str(S4 + "*Rigid Body, ref node=100, tie nset=R\n*Boundary\nR, ENCASTRE\n")
+    rot = conv._rb_rot[100]
+    assert _bc_lines(body) == ["100,1,3", f"{rot},1,3"] and "overconstraint" not in rep.text()
+    assert _equations(body) == [f"{n},{k},1.,{rot},{k - 3},-1." for n in (5, 6) for k in (4, 5, 6)]
+    body, _, _ = convert_str(S4 + "*Rigid Body, ref node=100, tie nset=R\n*Boundary\nR, 4, 4, 0.01\n")
+    assert _bc_lines(body) == [f"{rot},1,1,0.01"] and len(_equations(body)) == 6
+
+
+def test_rigid_body_member_bc_move_inexact():
+    # where the BC'd nodes do not hold what the moved BCs hold, Abaqus' move holds the body more
+    # than the model does: a warning by default, the move itself with --approximate
+    for deck, why, moved in (
+            # u1 on a flat face normal to z: the face keeps a (first-order) tilt about y
+            (RB_TOP + "*Boundary\nTOP, 1, 1\n", "lie on one line seen along the DOF",
+             ["100,1,1", "ROT,2,3"]),
+            # free in step 1, the body may have turned before its face is fixed in step 2
+            (RB_TOP + "*Step\n*Static\n*Cload\n100, 1, 1.\n*End Step\n*Step\n*Static\n*Boundary\n"
+             "TOP, ENCASTRE\n*End Step\n", "may have turned before the step", ["100,1,3", "ROT,1,3"]),
+            # a zero velocity on the reference node against zero displacements on the face
+            (RB_TOP + "*Step\n*Static\n*End Step\n*Step\n*Static\n*Boundary, type=velocity\n"
+             "100, 3, 5\n*Boundary\nTOP, 3, 3\n*End Step\n", "own zero velocity meets a zero "
+             "displacement", ["100,3,3", "ROT,1,2"])):
+        body, _, rep = convert_str(deck)
+        assert "Possible overconstraint" in rep.text() and why in rep.text()
+        assert "Rerun with --approximate" in rep.text() and "TOP" in "".join(_bc_lines(body))
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert _bc_lines(body) == [l.replace("ROT", str(conv._rb_rot[100])) for l in moved]
+        assert "[APPROX] *BOUNDARY on" in rep.text() and why in rep.text()
+    # against the reference node's own BCs (another value on the DOF; a turn, in a later step,
+    # that the moved BC would hold at zero) or not comparable (FIXED): nothing moves
+    for deck, why in ((RB_TOP + "*Boundary\n100, 1, 1, 0.5\nTOP, 1, 1\n", "disagree with the reference"),
+                      (RB_TOP + "*Boundary\nTOP, 3, 3\n*Step\n*Static\n*Boundary\n100, 4, 4, 0.1\n"
+                       "*End Step\n", "disagree with the reference"),
+                      (RB_TOP + "*Step\n*Static\n*Boundary, fixed\nTOP, 3, 3\n*End Step\n",
+                       "does not move a FIXED")):
+        for approximate in (False, True):
+            body, _, rep = convert_str(deck, approximate=approximate)
+            assert why in rep.text() and "[APPROX] *BOUNDARY on" not in rep.text()
+            assert any(l.startswith("TOP,") for l in _bc_lines(body))
 
 
 def test_plastic_hardening_forms():
@@ -2673,6 +2778,21 @@ def test_coupling_bc_bars_example():
     assert not dangling_refs(g), dangling_refs(g)
     assert [l for l in _bc_lines(body) if l.split(",")[0] in ("A_END", "B_END", "C_END")] == ["B_END,1,2"]
     assert "*BOUNDARY taken off 27 DOF(s)" in rep.text() and rep.n_warnings == 0
+
+
+def test_rigid_body_bc_bars_example():
+    # the validate_with_ccx.py deck: bar A's far-face u1 = 0 is implied in step 1 (its reference
+    # point fixed) and moved to the reference point in step 2's OP=NEW card, where bar B has
+    # the same BCs by hand
+    body, conv, rep = convert(os.path.join(EXAMPLES, "rigid_body_bc_bars.inp"))
+    g = reparse(body)
+    assert not dangling_refs(g), dangling_refs(g)
+    ra, rb = conv._rb_rot[9001], conv._rb_rot[9002]
+    assert _bc_cards(body) == [
+        ("*BOUNDARY", ["A_FIX,1,3", "B_FIX,1,3", "RP_A,1,3", f"{ra},1,3", "RP_B,1,3", f"{rb},1,3"]),
+        ("*BOUNDARY, OP=NEW", ["A_FIX,1,3", "B_FIX,1,3", "9001,1,1", f"{ra},2,3", "RP_B,1,1",
+                               f"{rb},2,3"])]
+    assert "*BOUNDARY on 9 DOF(s) of 9 *RIGID BODY node(s) moved" in rep.text() and rep.n_warnings == 0
 
 
 if __name__ == "__main__":

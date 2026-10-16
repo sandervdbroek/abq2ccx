@@ -21,7 +21,8 @@ Converter.build_geometry()   Pass A: walk blocks in order, fill the geometry reg
 Converter._prescan()   deck-wide facts the handlers need: node kinds, rigid bodies and their
                        ROT NODEs, the *MPC plan (_plan_mpcs), knot beams
                        (_plan_rigid_couplings), the BCs on rigid-constraint members their
-                       reference node imposes (_plan_coupled_bcs), …; then _plan_distributions(),
+                       reference node imposes or, on a *RIGID BODY, takes over
+                       (_plan_coupled_bcs), …; then _plan_distributions(),
                        _plan_planar_constraint() and _plan_circ_rotation_knots()
         │
         ▼
