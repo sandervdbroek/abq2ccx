@@ -1,0 +1,44 @@
+*HEADING
+Open-ended thick cylinder (inner radius a = 10, outer b = 20, a slice of height 2) under
+internal pressure p = 1, applied as a radial surface traction (*DSLOAD TRVEC) on the
+inner face; CAX8, E = 1000, nu = 0.3. Lame (axial stress 0): u_r(r) = p a^2 / (E (b^2 -
+a^2)) ((1 - nu) r + (1 + nu) b^2 / r), so u_r(a) = 0.019667 and u_r(b) = 0.013333.
+** node (i, j) = 1 + i + 100 j: i = 0..20 from r = a to r = b, j = 0..2 up the slice
+*NODE
+1, 10., 0.
+21, 20., 0.
+201, 10., 2.
+221, 20., 2.
+*NGEN, NSET=BOTTOM
+1, 21, 1
+*NGEN, NSET=TOP
+201, 221, 1
+*NFILL
+BOTTOM, TOP, 2, 100
+*NSET, NSET=INSIDE
+101
+*NSET, NSET=OUTSIDE
+121
+*ELEMENT, TYPE=CAX8, ELSET=RING
+1, 1, 3, 203, 201, 2, 103, 202, 101
+*ELGEN, ELSET=RING
+1, 10, 2, 1
+*ELSET, ELSET=INNER_ELEMENT
+1
+*SURFACE, TYPE=ELEMENT, NAME=INNER
+INNER_ELEMENT, S4
+*MATERIAL, NAME=M
+*ELASTIC
+1000., 0.3
+*SOLID SECTION, ELSET=RING, MATERIAL=M
+*BOUNDARY
+BOTTOM, 2, 2
+*STEP
+*STATIC
+*DSLOAD
+INNER, TRVEC, 1., 1., 0., 0.
+*NODE PRINT, NSET=INSIDE
+U
+*NODE PRINT, NSET=OUTSIDE
+U
+*END STEP

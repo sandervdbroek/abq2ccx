@@ -4,7 +4,11 @@
 Two layers of checking:
   1. CONVERT   — every deck converts without crashing and the result is referentially
                  consistent (every element node / set member resolves). Always runs.
-  2. SOLVE     — optional: if CalculiX (ccx) is found, decks marked ``expect_solve``
+  2. LOADS     — decks marked ``expect_solve`` must keep a load in every step the Abaqus
+                 deck loads (else ccx "solves" that step with no load at all), and
+                 ``source_unloaded`` must flag exactly the decks that load no step. Always
+                 runs.
+  3. SOLVE     — optional: if CalculiX (ccx) is found, decks marked ``expect_solve``
                  must solve (ccx exits 0, prints "Job finished" with no *ERROR and no
                  crash, and runs an analysis STEP), and mesh-only decks marked
                  ``parse_only`` must be accepted by ccx; the rest are recorded only.
@@ -43,11 +47,24 @@ def present():
 
 
 def convert(name):
+    """The converted deck text, its report and the converter (for its load audit)."""
     rep = A.Report()
     blocks = A.read_blocks(os.path.join(FILES, name + ".inp"), rep)
-    body = A.Converter(rep, _opt()).convert(blocks)       # convert first: the header
+    conv = A.Converter(rep, _opt())
+    body = conv.convert(blocks)                           # convert first: the header
     text = "\n".join(rep.header_comment_lines() + body) + "\n"   # lists its warnings
-    return text, rep
+    return text, rep, conv
+
+
+def load_problem(e, conv):
+    """Why an expect_solve deck's conversion fails the load audit, or None: a step the deck
+    loads that keeps no load in ccx, or a source_unloaded flag that does not match."""
+    if conv.unloaded_steps:
+        return f"step(s) {conv.unloaded_steps} lose every load in the conversion"
+    if bool(e.get("source_unloaded")) != conv.source_unloaded:
+        return ("source_unloaded=True, but the deck loads a step" if e.get("source_unloaded")
+                else "the deck loads no step: flag it source_unloaded=True")
+    return None
 
 
 def dangling(text):
@@ -96,8 +113,21 @@ def test_corpus_converts():
         print("corpus/files/ is empty — run 'python corpus/fetch.py' to enable corpus tests.")
         return
     for e in sorted(decks, key=lambda x: x["name"]):
-        text, _ = convert(e["name"])                      # must not raise
+        text, _, _ = convert(e["name"])                   # must not raise
         assert dangling(text) == 0, f"{e['name']}: dangling references after conversion"
+
+
+def test_corpus_loads():
+    """expect_solve decks keep a load in every step the Abaqus deck loads (a step whose loads
+    were all commented out would still 'solve' in ccx, to a zero response), and
+    source_unloaded flags exactly the decks that load no step at all."""
+    decks = [e for e in present() if e["expect_solve"]]
+    if not decks:
+        print("corpus/files/ is empty — run 'python corpus/fetch.py' to enable corpus tests.")
+        return
+    for e in sorted(decks, key=lambda x: x["name"]):
+        problem = load_problem(e, convert(e["name"])[2])
+        assert problem is None, f"{e['name']}: {problem}"
 
 
 def test_classify_ccx_run():
@@ -149,7 +179,7 @@ def main():
     for e in sorted(decks, key=lambda x: x["name"]):
         name = e["name"]
         try:
-            text, rep = convert(name)
+            text, rep, conv = convert(name)
         except Exception as exc:  # noqa: BLE001
             print(f"{name:27s} {'CRASH':>5s}  {type(exc).__name__}: {exc}")
             failures += 1
@@ -158,6 +188,10 @@ def main():
         result = "ok"
         if d:
             result = "DANGLING"
+            failures += 1
+        problem = load_problem(e, conv) if e["expect_solve"] else None
+        if problem:
+            result = f"LOADS: {problem}"
             failures += 1
         ccxcol = "-"
         if ccx:
@@ -177,8 +211,10 @@ def main():
                 ccxcol = {"solved": "solved+", "accepted": "accepted+"}.get(status, "no-solve(ok)")
         print(f"{name:27s} {'ok':>5s} {rep.n_warnings:>3d} {d:>6d} {ccxcol:>13s}  {result}")
     n_solve = sum(1 for e in decks if e["expect_solve"])
+    n_unloaded = sum(1 for e in decks if e["expect_solve"] and e.get("source_unloaded"))
     n_parse = sum(1 for e in decks if e.get("parse_only"))
-    print(f"\n{len(decks)} converted, 0 dangling expected; {n_solve} expected to solve, "
+    print(f"\n{len(decks)} converted, 0 dangling expected; {n_solve} expected to solve under "
+          f"the deck's own loads ({n_unloaded} of them load nothing in the source deck), "
           f"{n_parse} mesh-only (no analysis step) expected to be accepted by ccx.")
     print("All corpus checks passed." if not failures else f"{failures} failure(s).")
     print("\n(the remaining decks are source-deck/analysis limitations — see corpus/manifest.py.)")

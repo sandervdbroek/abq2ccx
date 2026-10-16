@@ -69,6 +69,11 @@ itself is not the cause — it is verified identical to Abaqus.)
   check the report for a commented-out material card.
 * The element type has no CalculiX equivalent (cohesive/gasket/connector/rigid). The
   report flags these; they must be remodelled (see below).
+* Abaqus surface elements (`SFM3D*`, `SFMAX*`) only get here when the converter kept them:
+  normally they leave the mesh (no stiffness) and their loads become nodal forces, but
+  rebar layers or a mass that acts (`*SURFACE SECTION, DENSITY=` in a dynamic or frequency
+  step, or under gravity) keep them — the report says which. `--approximate` drops them
+  anyway, losing that stiffness or mass.
 
 ### Composite shell errors
 
@@ -108,6 +113,14 @@ These are the silent ones — no error, wrong physics.
   the same, so a converted static step keeps its meaning. Abaqus/Explicit defaults to
   `NLGEOM=ON`; the converter therefore adds `NLGEOM` (and a large `INC`) to every
   `*DYNAMIC, EXPLICIT` step.
+* **A step solves to zero displacement.** Check the report for `Step N is loaded in the
+  Abaqus deck (...), but no load survives the conversion`: every load of that step was
+  commented out — a user-subroutine load or BC (port it to the ccx subroutine the warning
+  names), an NLGEOM follower traction (`--approximate` applies it as fixed nodal forces), a
+  load on an undefined surface, or a traction on nodes whose `*TRANSFORM` axes are unknown
+  (spherical, a node on the cylinder axis, degenerate data, two transforms on one node).
+  ccx then solves the step with no load at all. A deck that loads nothing even in Abaqus
+  gets a note instead.
 * **A Riks step does not run.** ccx has no arc-length solver; passed through, it would
   silently solve a load-controlled static step instead, so the converter comments the
   `*STATIC, RIKS` card out and ccx stops at that step. `--approximate` accepts the

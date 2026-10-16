@@ -1,0 +1,83 @@
+*HEADING
+A 1 x 1 x 2 block of C3D20R bricks clamped at its base, an oblique surface traction
+(*DSLOAD TRVEC) on its top face, whose nodes carry local axes: a rectangular *TRANSFORM
+on one half of the face and a cylindrical one (skew axis outside the block) on the other.
+A *CLOAD on such a node acts in its local axes (Abaqus and ccx alike), so the traction's
+nodal forces must be given in them: the displacements match the same block without
+any *TRANSFORM (validate_with_ccx.py).
+** node (i, j, k) = 1 + i + 10 j + 100 k: i, j = 0..4 across, k = 0..8 up the block
+*NODE
+1, 0., 0., 0.
+5, 1., 0., 0.
+41, 0., 1., 0.
+45, 1., 1., 0.
+801, 0., 0., 2.
+805, 1., 0., 2.
+841, 0., 1., 2.
+845, 1., 1., 2.
+*NGEN, NSET=B1
+1, 5, 1
+*NGEN, NSET=B2
+41, 45, 1
+*NFILL
+B1, B2, 4, 10
+*NGEN, NSET=T1
+801, 805, 1
+*NGEN, NSET=T2
+841, 845, 1
+*NFILL
+T1, T2, 4, 10
+*NSET, NSET=BASE, GENERATE
+1, 5, 1
+11, 15, 1
+21, 25, 1
+31, 35, 1
+41, 45, 1
+*NSET, NSET=TOP, GENERATE
+801, 805, 1
+811, 815, 1
+821, 825, 1
+831, 835, 1
+841, 845, 1
+*NFILL
+BASE, TOP, 8, 100
+*NSET, NSET=TOP_RECT, GENERATE
+801, 803, 1
+811, 813, 1
+821, 823, 1
+831, 833, 1
+841, 843, 1
+*NSET, NSET=TOP_CYL, GENERATE
+804, 805, 1
+814, 815, 1
+824, 825, 1
+834, 835, 1
+844, 845, 1
+*ELEMENT, TYPE=C3D20R, ELSET=BLOCK
+1, 1, 3, 23, 21, 201, 203, 223, 221, 2, 13, 22, 11, 202, 213, 222,
+211, 101, 103, 123, 121
+*ELGEN, ELSET=BLOCK
+1, 2, 2, 1, 2, 20, 2, 4, 200, 4
+*ELSET, ELSET=TOP_LAYER, GENERATE
+13, 16, 1
+*SURFACE, TYPE=ELEMENT, NAME=LOADED
+TOP_LAYER, S2
+** local x along (1, 2, 0.5), local y towards (-1, 1, 3)
+*TRANSFORM, NSET=TOP_RECT, TYPE=R
+1., 2., 0.5, -1., 1., 3.
+** radial / tangential / axial about the axis from (-0.5, -0.3, 0) to (-0.4, -0.1, 3)
+*TRANSFORM, NSET=TOP_CYL, TYPE=C
+-0.5, -0.3, 0., -0.4, -0.1, 3.
+*MATERIAL, NAME=M
+*ELASTIC
+1000., 0.3
+*SOLID SECTION, ELSET=BLOCK, MATERIAL=M
+*BOUNDARY
+BASE, ENCASTRE
+*STEP
+*STATIC
+*DSLOAD
+LOADED, TRVEC, 1., 1., -2., -3.
+*NODE PRINT, GLOBAL=YES
+U
+*END STEP

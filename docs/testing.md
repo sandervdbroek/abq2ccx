@@ -5,12 +5,13 @@ The converter has three layers of tests:
 1. **Unit tests** — fast, no solver needed, run on small controlled fixtures and the
    bundled examples.
 2. **End-to-end solver validation** — converts the example decks and runs them in
-   CalculiX, checking the NAFEMS LE10 benchmark, circular-, pipe- and box-section
-   cantilevers, circular-section beams with rotational BCs and in an explicit dynamic
-   step, planar beams' frequencies and buckling loads, per-element `*DISTRIBUTION`
-   orientations, a clamped beam and plate across a later step's `*BOUNDARY, OP=NEW`,
-   rigidly coupled models (a shell plate, and bars whose coupled nodes also carry BCs) and
-   the `*MPC` conversions numerically.
+   CalculiX, checking the NAFEMS LE10 benchmark (also with its pressure on surface
+   elements), circular-, pipe- and box-section cantilevers, circular-section beams with
+   rotational BCs and in an explicit dynamic step, planar beams' frequencies and buckling
+   loads, per-element `*DISTRIBUTION` orientations, a clamped beam and plate across a later
+   step's `*BOUNDARY, OP=NEW`, rigidly coupled models (a shell plate, and bars whose coupled
+   nodes also carry BCs), the `*MPC` conversions and the loads applied as nodal forces
+   numerically.
 3. **Real-world corpus** — 1022 genuine Abaqus decks pulled from the internet, each
    converted and (optionally) solved in CalculiX.
 
@@ -24,7 +25,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (176)
+## 1. Unit tests — `tests/test_convert.py` (205)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -206,6 +207,35 @@ conversion behaviour and referential integrity.
 | `test_bc_steps_follow_op_new` | the BCs in force per step: kept from earlier steps, a later value replaces an earlier one, `OP=NEW` starts from none |
 | `test_rotation_tie_on_a_member_bc_makes_the_body_dependent` | a shell member's rotation under a BC: on a `*RIGID BODY` it moves to the `ROT NODE` (the tie keeps the member dependent); where it stays on the members (BCs that differ, warned) the `ROT NODE` DOF becomes the first tie's dependent term and the second tie is dropped; on a `*KINEMATIC` reference node (whose DOFs 4–6 ccx eliminates itself) the tie is dropped instead |
 | `test_coupling_bc_bars_example` | the `coupling_bc_bars` validation deck: bars A and C lose their 27 redundant end-face BCs, bar B (the same constraints without a coupling) keeps its own; no warnings, no dangling refs |
+| `test_consistent_nodal_forces_integrate_shape_functions` | the face/edge integrator: a unit load gives ¼ per quad4 node, −1/12 and ⅓ on quad8 corners and midsides, ⅙ per tri3 node, 0 and ⅙ on tri6 corners and midsides, ⅙-⅙-⅔ on a 3-node edge, and 2π ∫ N r ds on an axisymmetric edge |
+| `test_dsload_traction_becomes_consistent_nodal_forces` | `*DSLOAD TRVEC` on a C3D8 face → a `*CLOAD` of magnitude × area / 4 per node along the normalised direction; `TRSHR` projected onto the face; a `TRSHR` normal to the face is refused; element-based `TRVEC2` is the same load |
+| `test_traction_on_plane_and_axisymmetric_edges` | a plane-stress edge traction is times the section thickness and in-plane only; an axisymmetric one is over the full circle (2πr) |
+| `test_traction_under_nlgeom_converts_only_when_exact` | under NLGEOM a follower (`FOLLOWER=YES`, the default) or per-current-area (`CONSTANT RESULTANT=NO`) traction is commented and the step flagged; `FOLLOWER=NO, CONSTANT RESULTANT=YES` converts; `--approximate` converts the rest with `[APPROX]` |
+| `test_converted_loads_across_steps_never_use_op_new` | converted forces carry their `AMPLITUDE`; an unchanged load is not re-emitted; `*DSLOAD, OP=NEW` gives the old traction's nodes 0 instead of `OP=NEW`; after the deck's own `*CLOAD, OP=NEW` the converted forces are given again |
+| `test_converted_load_sharing_a_deck_cload_dof` | a converted force on a node DOF the deck's own `*CLOAD` also loads is kept in a one-step deck (ccx adds them) and refused in a multi-step one (ccx would replace one with the other) |
+| `test_beam_line_loads_become_consistent_nodal_forces` | `*DLOAD PY` / `P1` / `P2` / `PZ` on `B31`, `B32`, an upgraded `CIRC` beam (its midside node takes ⅔) and a planar `B21` → nodal forces along the global or local (n1, t × n1) axes |
+| `test_user_subroutine_loads_are_commented_out` | `*BOUNDARY, USER`, `*CLOAD, USER`, a `P1NU` line, `*TEMPERATURE, USER`, a `F1NU` film and `*AMPLITUDE, DEFINITION=USER` are commented, naming `uboun.f` / `cload.f` / `dload.f` / `utemp.f` / `film.f` / `uamplitude.f`; the other lines stay |
+| `test_load_audit_flags_steps_whose_loads_do_not_survive` | a step loaded only by a `*BOUNDARY, USER` is flagged (`unloaded_steps`); an empty step marks the deck `source_unloaded`, a frequency step does not; `step_load_audit` carries loads across steps and resets them only with `OP=NEW` (not the cards before it in the same step) |
+| `test_dload_and_dsload_op_new_keep_each_others_loads` | a `*DLOAD, OP=NEW` keeps the earlier `*DSLOAD` pressure (given again), and a `*DSLOAD, OP=NEW` the earlier gravity — ccx's `OP=NEW` would remove both |
+| `test_dload_without_element_set_loads_the_whole_model` | `, GRAV, ...` (no element set: the whole model in Abaqus) → a whole-model element set |
+| `test_dsload_on_undefined_surface_says_so` | a `*DSLOAD` on a surface the deck never defines says so (it used to say "not element-based") and flags the step |
+| `test_distributed_load_examples` | the Cook, line-load and cylinder examples' converted forces add up to the applied loads (1; q L per beam; 2π a h p) |
+| `test_surface_elements_leave_the_mesh_and_carry_their_loads` | an `SFM3D4` on a C3D8 face leaves the mesh, a set keeps its other member, a set of surface elements only is not emitted, its `*SURFACE SECTION`, `*SURFACE` and `*EL PRINT` are dropped, and its `TRVEC` becomes the face's nodal forces — no warning, nothing commented |
+| `test_surface_element_pressure_sense` | Abaqus signs: an element-based `P` acts along the element normal (right-hand rule), a `*DSLOAD P` against the surface normal (`SPOS`: the element normal, `SNEG`: its reverse); a surface with a solid face as well keeps ccx's own `P2` there and is warned |
+| `test_quadratic_and_axisymmetric_surface_elements` | an `SFM3D8` takes −1/12 and ⅓ of the total on its corners and midsides; `SFMAX1`/`SFMAX2` edges integrate over the full circle (2πr), their element normal turns node 1 → 2 counterclockwise, a `TRVEC` loses its out-of-plane component |
+| `test_surface_element_pressure_under_nlgeom_needs_approximate` | under NLGEOM a pressure on surface elements (a follower load per current area) is commented and the step flagged; `--approximate` converts it with `[APPROX]` |
+| `test_other_loads_on_surface_elements` | gravity on the whole model keeps its set without the (massless) surface elements; gravity on them only is no load; a body force `BZ` on them is commented |
+| `test_surface_elements_with_mass_or_rebar_stay_unless_approximate` | surface elements stay in the mesh (ccx then stops on them) when their mass acts (`DENSITY=` + a frequency step) or they carry `*REBAR LAYER`; `--approximate` drops them with `[APPROX]`; mass in a static step does not keep them |
+| `test_surface_element_on_free_nodes_warns` | surface elements whose nodes belong to no other element are warned (ccx ignores a load on a node without stiffness) |
+| `test_surface_elements_in_an_assembly_instance` | the corpus deck's shape: surface elements and their `*SURFACE SECTION` inside an `*INSTANCE`, a `TRVEC` on `ASSEMBLY.INSTANCE.SET` → nodal forces, nothing commented |
+| `test_nle10_surface_elements_example` | the LE10 example with an `SFM3D8` skin: the converted forces add up to the pressure × the top face's area, along z |
+| `test_nodal_forces_on_transformed_nodes_go_into_their_local_axes` | a `TRVEC` on a C3D8 face whose nodes have a `*TRANSFORM`: the forces are given in each node's local axes — rectangular (1 along a, 3 = a × b), cylindrical (1 radial at the node, 2 = 3 × 1, 3 along the axis) — and untransformed nodes keep global components; the comment's resultant stays global |
+| `test_nodal_forces_on_unusable_transforms_are_refused` | the load line is commented, with the reason, and the step flagged, when a loaded node's axes are unknown: a degenerate rectangular (a = 0, a ∥ b) or cylindrical (a = b) transform, a node on the cylinder axis, `TYPE=S`, an unreadable data line, two different transforms on one node (the same one twice is fine) |
+| `test_nodal_forces_on_transformed_2d_nodes` | a `CPS4` edge traction on transformed nodes: an in-plane rectangular transform (local 3 along +z or −z) and a cylinder about z give DOFs 1-2 only; a transform that turns local 3 out of the Z axis is refused |
+| `test_beam_and_surface_element_loads_on_transformed_nodes` | a beam line load `PY` and an `SFM3D4` pressure on transformed nodes are given in their local axes too |
+| `test_transformed_nodal_forces_meet_the_decks_cload_on_local_dofs` | the clash check against the deck's own `*CLOAD` uses the local DOFs: a force rotated onto local DOF 1, which the deck's `*CLOAD` also loads, is refused in a two-step deck (globally the DOFs looked disjoint) |
+| `test_transform_of_a_rotated_instance_rotates_the_local_axes` | a part-level `*TRANSFORM` in an instance turned 90° about z: the converted forces use the turned axes |
+| `test_traction_transformed_face_example` | the `C3D20R` example with a rectangular and a cylindrical transform on its loaded face: each node's forces, turned back from its local axes (computed independently in the test), equal those of the same deck without the transforms; no dangling refs |
 | `test_rigid_body_bc_bars_example` | the `rigid_body_bc_bars` validation deck: bar A's far-face `u1 = 0` is taken off in step 1 and moved to its reference point (+ `ROT NODE` 2–3) in step 2's `OP=NEW` card, card for card the BCs bar B has by hand; no warnings, no dangling refs |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
@@ -217,6 +247,12 @@ deck and runs it in CalculiX:
   published −5.38 MPa reference (the converted deck gives −5.65 MPa, a 5 % difference
   in line with the element type and mesh — proving the whole pipeline is correct, not
   just well-formed).
+* **`nle10_surface_elements`** — the same plate with its pressure on a skin of `SFM3D8`
+  surface elements over the top face, which ccx does not have: the converter leaves the skin
+  out and applies its load as consistent nodal forces. Run three ways — `*DSLOAD P` on the
+  skin's `SPOS` side, an element-based `*DLOAD P` of −p (Abaqus: positive along the element
+  normal, which points out of the plate) and a `TRVEC` into the plate — each must reproduce
+  the face-pressure σ_yy at D within 1e-5 (all give −5.650160 MPa, as the face pressure).
 * **`beam_circ_cantilever`** — a cantilever on linear `B31` beams with a circular section,
   which ccx 2.23 rejects; the converter emits `B32` with inserted midside nodes and turns
   the Abaqus radius into ccx's diameters. Checks the tip deflection against beam theory,
@@ -320,6 +356,30 @@ deck and runs it in CalculiX:
   on its reference point by hand. Under a moment about x and a force along y the caps twist
   25°: A must match B to 1e-9 (they agree to 1e-20 of |u|), and A's far face must keep
   u1 = 0 (it does to 9e-21 while it moves 0.51).
+* **`cook_membrane_traction`** — Cook's membrane (plane stress, E = 1, ν = 1/3, 16 × 16
+  `CPS8`) under a shear traction on its right edge (`*DSLOAD TRVEC`, total 1), which ccx has
+  no card for: the converter applies consistent nodal forces. Checks the vertical
+  displacement of the loaded edge's midpoint against the published 23.96 (Bergan & Felippa
+  1985): 23.932, 0.12 %. (An independent plane-stress Q8 solution converges to 23.963 there;
+  the top corner converges to 25.19, so the classic reference point is the edge midpoint.)
+* **`beam_line_load_cantilever`** — uniform line loads on three cantilevers: `*DLOAD PY` on
+  `B31`, the local `P2` on `B32` and `PZ` on a circular `B31` run as `B32` with midside nodes.
+  Checks that the converted forces add up to q L exactly and the tip deflections against
+  q L⁴/(8 E I): 0.1 %, 1.2 % and 0.6 % (the 10-element `B32` is stiffest).
+* **`cylinder_traction_cax`** — an open-ended thick cylinder (`CAX8`) under internal pressure
+  applied as a radial traction (`*DSLOAD TRVEC`): u_r at the inner and outer radius against
+  Lamé, within 0.02 % — the full-circle (2πr) convention of axisymmetric nodal forces, which
+  ccx shares with Abaqus (probed: a `*CLOAD` on a `CAX4` edge matches the same edge under
+  pressure only as the 2π total).
+* **`traction_transformed_face`** and **`cook_membrane_traction` with `*TRANSFORM`** — ccx, like
+  Abaqus, reads a `*CLOAD` on a node with a `*TRANSFORM` in the node's local axes, so the
+  converter gives the nodal forces of a traction there in those axes. A 1 × 1 × 2 `C3D20R` block
+  under an oblique `TRVEC` on its top face, whose nodes carry a rectangular transform on one
+  half and a cylindrical one (skew axis) on the other, and Cook's membrane with in-plane
+  transforms on its loaded edge (rectangular with local 3 = −z; a cylinder about z), are
+  each run with and without the `*TRANSFORM` cards. The displacements (`*NODE PRINT,
+  GLOBAL=YES`) at every printed node must agree within 1e-6 of max |u|. They agree to
+  round-off (0 and 6e-17), where forces left in global components miss by 149 % and 88 %.
 * **`composite_shell`**, **`assembly_two_blocks`** — confirm they are accepted by ccx
   and solve.
 
@@ -338,9 +398,14 @@ deck and runs it in CalculiX:
   records its own) into `corpus/files/` (gitignored), and are content-deduplicated so a
   byte-identical fixture shared across repos appears once.
 * **`corpus/fetch.py`** — downloads the manifest's decks.
-* **`tests/test_corpus.py`** — two checks:
+* **`tests/test_corpus.py`** — these checks:
   * `test_corpus_converts` — every present deck converts without crashing and the
     result is referentially consistent (zero dangling references). **Always runs.**
+  * `test_corpus_loads` — an `expect_solve` deck must keep a load in every step the
+    Abaqus deck loads (the converter's load audit, `Converter.unloaded_steps`): a step
+    whose loads were all commented out would still "solve" in ccx, to a zero response.
+    And `source_unloaded=True` must flag exactly the decks that load no step at all.
+    **Always runs** (no ccx needed).
   * `test_corpus_solves` — decks marked `expect_solve` are run in CalculiX and must
     **solve**: ccx exits 0, prints "Job finished" with no `*ERROR` and no crash/abort
     message on stdout or stderr, and executes at least one analysis `STEP`. Mesh-only
@@ -352,9 +417,12 @@ deck and runs it in CalculiX:
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
 **Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
-references; **219 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
-other 584 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
-other user subroutines, Riks, cohesive/connector elements, piezoelectric/acoustic
+references; **188 solve** in CalculiX under their own loads and **219 mesh-only decks are
+accepted** by it. 14 more decks solve but load nothing in the source deck itself (an empty
+`*STEP`), so their solution is zero in Abaqus as well; they stay in the gate as conversion
+checks (`source_unloaded=True`), outside the headline count. The other 601 convert cleanly
+but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
+Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
 coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
 externally-supplied `<parameter>` values, or nodes numbered from 0) — and each was
 verified to fail *no worse than the original, unconverted deck*.
@@ -806,6 +874,83 @@ probe decks it fires on every run ccx got wrong and on no other. Of the four cor
 with an ORTHO expansion only `alexasafonov_pultrusion` has `NLGEOM` steps (coupled, with
 temperatures), and its orientation is the global axes (`1,0,0, 0,1,0` with a 0°
 rotation): not warned.
+
+**Hollow solves: loads that did not survive the conversion.** A solve only counts if the
+model carries the deck's loads. A load audit (`step_load_audit`, run on the Abaqus deck and
+on the converted one) found that 53 of the 220 decks then gated as solving ran with no load
+at all, so ccx "solved" them to zero displacement:
+
+* 36 lost their only load, a surface traction (`*DSLOAD TRVEC` / `TRSHR`), which ccx has no
+  card for and the converter used to comment out;
+* 3 had a user-subroutine BC (`*BOUNDARY, USER`), which went through unchanged, so ccx ran
+  its stock `uboun.f` instead of the deck's `DISP` routine;
+* 14 load nothing in the source deck itself.
+
+Tractions and beam line loads (`*DLOAD PX/PY/PZ/P1/P2`, which ccx reads on a beam as a
+section-face pressure) now become consistent nodal forces: the face/edge shape functions
+integrated by Gauss quadrature over the undeformed geometry, times the plane-section
+thickness (probed: a ccx `*CLOAD` on a `CPS`/`CPE` node is the total for the section
+thickness) or over the full circle on axisymmetric edges (probed: ccx, like Abaqus, takes
+the 2π total there), emitted as a `*CLOAD` at the end of the step. ccx adds `*CLOAD`s on
+one node and DOF within a step and replaces them across steps (probed, as for `*DLOAD`), so
+the converted forces are re-emitted as totals when they change, never with `OP=NEW` (which
+would also remove the deck's own concentrated loads). Nodal forces are exact in small-strain
+steps; under NLGEOM only for a `TRVEC` that keeps its direction and resultant
+(`FOLLOWER=NO, CONSTANT RESULTANT=YES` — the defaults are `YES` / `NO`), since ccx keeps a
+`*CLOAD` fixed. Any other NLGEOM traction stays commented unless `--approximate`.
+User-subroutine loads and BCs are commented out, naming the ccx subroutine to port. The
+audit is now a corpus gate (`test_corpus_loads`).
+
+Of the 36 traction decks, 20 now solve under their real load: their converted forces add up
+to traction × area to 1e-13 per surface, and on `minhnguyenikm_cook_q4_job_2` (`TRSHR`) ccx
+gives the same corner deflection as an independent Q4 solution of the same mesh (1.073028).
+`xzhang66_plainstrain` (element-based `TRSHR2`/`TRSHR4` with end pressures), which ccx
+used to stop on, now solves and joins the gate: ccx matches an independent Q4 solution
+there on all 45 nodes to 2e-7. The other 16 traction decks are NLGEOM follower or
+current-area tractions and leave the gate, as do the 3 user-subroutine decks. Net: 220
+gated decks, of which 167 carried their real loads → 202 gated, of which 188 (all but the
+14 `source_unloaded` ones) do.
+
+**Surface elements.** Abaqus surface elements (`SFM3D3/4/4R/6/8/8R`, axisymmetric
+`SFMAX1/2`, `SFMGAX1/2`) have no stiffness of their own — "membrane elements with zero
+thickness" — and mostly serve to carry a load where no solid face is wanted. ccx has no such
+element and stops on them (`*ERROR reading *ELEMENT`), which blocked
+`petrkryslucsd_problem_le10nafems_mst10`: the NAFEMS LE10 plate on 60 `C3D10`, its pressure a
+`*DLOAD TRVEC` on 12 `SFM3D6` over the top face. They now leave the mesh — element sets keep
+their other members; their `*SURFACE SECTION`, and surfaces and `*EL PRINT` on them only, are
+dropped — and their `TRVEC`, `TRSHR` and `P` loads (element-based, or `*DSLOAD` on their
+`SPOS`/`SNEG` side) become consistent nodal forces through the traction machinery above, with
+the same exactness rule (a pressure is a follower load per current area, so under NLGEOM it
+needs `--approximate`). The pressure signs follow the Abaqus element library (2016 and 2017
+manuals alike): an element-based `P` is positive *along* the element normal — the
+right-hand rule over the nodes; for `SFMAX` the direction node 1 → 2 turned
+counterclockwise — while a surface `P` is positive *against* the surface normal (`SPOS`: the
+element normal, `SNEG`: its reverse), so the two are opposite on the same side. Checked in
+ccx: the LE10 example with an `SFM3D8` skin over its top face, loaded by `*DSLOAD P` on
+`SPOS`, by an element-based `P` of −p and by a `TRVEC`, gives σ_yy at D = −5.650160 MPa each
+time, as ccx's own face pressure `P2` does (and +5.650160 for an element-based `P` of +p, a
+suction). Elements that carry rebar, or mass (`*SURFACE SECTION, DENSITY=`) in a dynamic or
+frequency step or under gravity, stay in the mesh unless `--approximate`; nodes that belong
+to no other element are warned, since ccx silently ignores a `*CLOAD` on a node without
+stiffness (probed). The corpus deck now solves: the converted forces add up to the traction
+× the top face's area (5.448 × 10⁶, the quadratic mesh's 5.448 against the quarter elliptic
+annulus' 5.4487), ccx's reaction at the supports equals them to 7 digits, and σ_yy at D is
+−5.449 MPa against the published −5.38 (1.3 %). Net: one more gated deck; with the other
+changes on this page, 202 decks are gated, 188 of them under their own loads. No other corpus deck uses surface elements; every other deck converts as
+before, bar the wording of the comment above converted `*CLOAD`s.
+
+**Converted loads on nodes with a `*TRANSFORM`.** Both ccx and Abaqus read a `*CLOAD` on a
+node with a `*TRANSFORM` in that node's local axes, but the nodal forces converted from
+tractions, beam line loads and surface-element pressures were written in global
+components. On such a node they now go into its local axes: rectangular, or cylindrical at
+the node's undeformed position. The ccx 2.23 convention was probed on solid, shell, membrane,
+beam, plane and axisymmetric nodes and matches the Abaqus manual (see
+[compatibility.md](compatibility.md)). Where those axes are unknown, the load line is
+commented with the reason and the load audit sees it: a spherical transform (ccx has none
+and gives NaN), a node on the cylinder axis, degenerate or unreadable data, two different
+transforms on one node, or a 2-D node whose local 3-axis leaves the Z axis. Eight corpus
+decks have `*TRANSFORM` nodes, but none puts a converted load on them, and all 1073 corpus
+files convert byte-identically.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

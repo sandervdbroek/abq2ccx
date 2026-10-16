@@ -17,7 +17,8 @@ What it handles:
 * **`*PART`/`*INSTANCE`/`*ASSEMBLY`** → flattened into one global numbering
   (instance translation/rotation applied, references resolved).
 * **Elements** → mapped to CalculiX equivalents, with node-count-preserving
-  substitutions for the ~60 Abaqus types that need them.
+  substitutions for the ~60 Abaqus types that need them; surface elements (`SFM3D*`,
+  `SFMAX*`), which only carry loads, leave the mesh and their loads become nodal forces.
 * **Keywords / parameters / data** → translated (materials, orientation/composites,
   sections, steps, BCs, loads, constraints, output).
 * **Everything else** → classified against the full CalculiX keyword set and either
@@ -61,15 +62,18 @@ FreeCAD-bundled copy, Homebrew/MacPorts) — or point at one with `--ccx`/`$CCX`
 equivalent* ones it can, each flagged with a loud `[APPROX]` warning: `*STATIC, RIKS` →
 plain `*STATIC`, incompressible `ν ≥ 0.5` → `0.475`, `*BEAM SECTION, SECTION=I` → the
 RECT with equal area + strong-axis inertia, a `*BOUNDARY` on DOFs a kinematic coupling or
-an `*MPC` also constrains → dropped, as Abaqus/Standard does (ccx stops on it), and
+an `*MPC` also constrains → dropped, as Abaqus/Standard does (ccx stops on it),
 identical BCs on a `*RIGID BODY`'s nodes that hold the body less than Abaqus' resolution
 does → moved to the reference node with zero rotations about the other axes, as
-Abaqus/Standard moves them (by default only where that is the same constraint). Off by
-default — nothing changes silently: a Riks step is then commented out, because ccx would
-otherwise run it as an ordinary load-controlled static step without saying so. (`*DYNAMIC,
-EXPLICIT` needs no reframing: ccx integrates explicitly itself, and the converter adds the
-Abaqus/Explicit defaults ccx lacks — no increment cap, `NLGEOM` on — and, for circular-
-section beams, whose stable increment ccx 2.23 overestimates, a maximum time increment.)
+Abaqus/Standard moves them (by default only where that is the same constraint), an NLGEOM
+surface traction or surface-element pressure that follows the deforming surface (or acts
+per current area) → fixed nodal forces, and surface elements that carry mass or rebar →
+left out of the mesh. Off by default — nothing changes silently: a Riks step is then
+commented out, because ccx would otherwise run it as an ordinary load-controlled static
+step without saying so. (`*DYNAMIC, EXPLICIT` needs no reframing: ccx integrates
+explicitly itself, and the converter adds the Abaqus/Explicit defaults ccx lacks — no
+increment cap, `NLGEOM` on — and, for circular-section beams, whose stable increment ccx
+2.23 overestimates, a maximum time increment.)
 
 Then run it in CalculiX (`ccx out`, no extension). The converter validates
 *structure and syntax*, not *physics* — **always read the report** (printed to
@@ -96,6 +100,9 @@ through CalculiX (it auto-detects `ccx`, including the copy bundled with FreeCAD
 
 ```text
 PASS  nle10_thickplate (NAFEMS LE10): SYY at point D = -5.650 MPa (reference -5.38 MPa, 5.0% diff)
+PASS  nle10_surface_elements (SFM3D8 skin, *DSLOAD P on SPOS): SYY at D = -5.650160 MPa (face pressure -5.650160 MPa)
+PASS  nle10_surface_elements (SFM3D8 skin, *DLOAD P, element normal): SYY at D = -5.650160 MPa (face pressure -5.650160 MPa)
+PASS  nle10_surface_elements (SFM3D8 skin, *DLOAD TRVEC): SYY at D = -5.650160 MPa (face pressure -5.650160 MPa)
 PASS  beam_circ_cantilever (B31 + CIRC): tip deflection = -4.2290 (beam theory -4.2441, 0.4% diff)
 PASS  beam_pipe_box_cantilever (PIPE31 + PIPE): tip deflection y = -7.1490 (beam theory -7.1886, 0.6% diff)
 PASS  beam_pipe_box_cantilever (B32 + BOX): tip deflection y = -1.7898 (beam theory -1.7887, 0.1% diff), z = -4.5091 (beam theory -4.5265, 0.4% diff)
@@ -118,6 +125,14 @@ PASS  op_new_respecify: step 2 beam tip +1.1898 (expected +1.1905, 0.05% diff), 
 PASS  op_new_remove: step 2 beam tip +0.5910 (expected +0.5952, 0.71% diff), plate tip (step 1) +4.6380 (expected +4.6380, 0.00% diff)
 PASS  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO *Expansion): free strains 0.0000% / 0.0000% off alpha dT; held cube at T = 90: strains 0.0001% off, sigma_xx = -1.71000 (analytic -1.71000)
 PASS  rigid_body_bc_bars (BCs on *RIGID BODY nodes moved to the reference node): bar A vs the same BCs on the reference point by hand, max |du| = 9.7e-21 of |u| 0.3421; A's far face |u1| <= 9.0e-21 as it moves 0.512 (NLGEOM)
+PASS  cook_membrane_traction (TRVEC on CPS8 edges): v_C = 23.932 (reference 23.96, 0.12% diff)
+PASS  beam_line_load_cantilever (A): applied -1 (q L = -1), tip deflection -0.001173 (beam theory -0.001172, 0.1% diff)
+PASS  beam_line_load_cantilever (B): applied +1 (q L = +1), tip deflection +0.001158 (beam theory +0.001172, 1.2% diff)
+PASS  beam_line_load_cantilever (C): applied -0.1 (q L = -0.1), tip deflection -0.001583 (beam theory -0.001592, 0.6% diff)
+PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(10) = 0.019667 (Lame 0.019667, 0.00% diff)
+PASS  cylinder_traction_cax (TRVEC on CAX8): u_r(20) = 0.013331 (Lame 0.013333, 0.02% diff)
+PASS  traction_transformed_face with *TRANSFORM (C3D20R face, rectangular + cylindrical): u at 225 nodes differs from the model without it by 0.0e+00 of max |u| (0.01981)
+PASS  cook_membrane_traction with *TRANSFORM (CPS8 edge, in-plane rectangular + cylindrical): u at 33 nodes differs from the model without it by 6.4e-17 of max |u| (25.06)
 PASS  composite_shell: accepted by ccx and solved
 PASS  assembly_two_blocks: accepted by ccx and solved
 ```
@@ -128,26 +143,31 @@ pressure face. After conversion, CalculiX solves it and reports σ_yy = −5.65 
 point D versus the published reference −5.38 MPa — a 5 % difference, in line with this
 element type and mesh density. That exercises the whole pipeline (mesh expansion,
 node ordering, boundary sets, pressure face, solid section) and confirms it is correct.
-The second check is a cantilever on linear `B31` beams with a circular section: its tip
-deflection is compared with beam theory, P L³/(3 E I). The third does the same for a pipe
+The same plate then carries its pressure on a skin of `SFM3D8` surface elements, which ccx
+does not have: the converter leaves the skin out and applies its load as consistent nodal
+forces, which must reproduce the face-pressure result — given as a pressure on the skin's
+`SPOS` side, as an element-based `P` of −p (Abaqus: positive along the element normal,
+which points out of the plate here) and as a `TRVEC` into the plate.
+The third check is a cantilever on linear `B31` beams with a circular section: its tip
+deflection is compared with beam theory, P L³/(3 E I). The fourth does the same for a pipe
 section on `PIPE31` elements and a box section on `B32` elements, which ccx 2.23 runs only
 on `B32R`. The box has unequal sides and wall pairs and is loaded in both directions, so a
-misread box dimension would miss beam theory by 18 % or more. The fourth couples a shell
+misread box dimension would miss beam theory by 18 % or more. The fifth couples a shell
 plate's edge rigidly to an offset reference point that carries a force and a moment (a
 coupling ccx 2.23 rejects on shell nodes without the converter's knot beams) and compares
 the reference point's displacement with the same plate built from `C3D20R` bricks under
-`*RIGID BODY`. The fifth gives coupled bars' end faces BCs that their reference points'
+`*RIGID BODY`. The sixth gives coupled bars' end faces BCs that their reference points'
 own BCs already impose — ccx stops on such a BC, so the converter takes it off — and
 compares them with the same constraints written as BCs and `*EQUATION`s, in an `NLGEOM`
-step where one end face also turns about the axis of its dropped BC. The sixth gives two
+step where one end face also turns about the axis of its dropped BC. The seventh gives two
 circular-section beams rotational BCs — a twist held at
 pinned supports, a prescribed tip rotation — and compares their deflections with beam
 theory: under a rotational BC ccx 2.23 locks a circular section's other rotations, so this
-needs the converter's knot beams (without them 0.31 and 0.76 of beam theory). The seventh
+needs the converter's knot beams (without them 0.31 and 0.76 of beam theory). The eighth
 runs a circular-section beam through an explicit dynamic step — a load raised smoothly and
 then held — and compares its end deflection with beam theory: ccx 2.23 sizes such a beam's
 stable increment as if its section were the box around the circle, so without the
-converter's increment cap the displacements turn NaN. The eighth and ninth run planar
+converter's increment cap the displacements turn NaN. The ninth and tenth run planar
 `B21` beams (rectangular and circular sections) on pinned supports through a frequency
 and a buckling step and compare the first two frequencies and the buckling load with beam
 theory. ccx runs `B21` as a 3-D `B31`, so this needs the converter's planar constraint:
@@ -173,12 +193,23 @@ displacement comes out 0. The thermal check heats unit cubes whose isotropic `*E
 beside an orthotropic or anisotropic `*Expansion` — whose stiffness ccx 2.23 silently gets
 wrong in linear steps once a deck has temperatures (a free cube shrinks) — and compares their
 strains (one has its material system turned 30°) and the stress of a cube held in x, whose E
-and ν vary with temperature, with the analytic values. The last gives the far face of a
+and ν vary with temperature, with the analytic values. The next gives the far face of a
 bar's rigid end cap (a `*RIGID BODY` on its elements) `u1 = 0`, which ccx stops on and the
 converter moves to the reference point with zero rotations about y and z, as Abaqus does —
 implied in a first step that holds the reference point, moved in a second that releases
 it — and compares the bar with the same BCs written on the reference point, in `NLGEOM`
 steps where the cap twists 25° about the axis of the moved BC.
+The next three check loads ccx has no card for, which the converter applies
+as consistent nodal forces: a shear traction (`*DSLOAD TRVEC`) on Cook's membrane against
+the published displacement of its loaded edge (23.96, Bergan & Felippa 1985); uniform line
+loads (`*DLOAD PY`, local `P2`, `PZ`) on three cantilevers — `B31`, `B32` and a circular
+`B31` run as `B32` — against q L⁴/(8 E I), with the applied resultants checked against q L;
+and a radial traction on an axisymmetric thick cylinder against Lamé's solution. The last
+two put a traction on nodes with local axes: ccx, like Abaqus, reads a `*CLOAD` on a node with a
+`*TRANSFORM` in its local axes, so the converted forces are given in them. A `C3D20R` block
+whose loaded face carries a rectangular and a cylindrical transform, and Cook's membrane
+with in-plane ones on its loaded edge, must match the same models without the transforms
+at every printed node (forces left in global components miss by 149 % and 88 % of |u|).
 
 ```bash
 python validate_with_ccx.py        # requires CalculiX or FreeCAD; skips cleanly if absent
@@ -202,12 +233,15 @@ python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
 Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
-references; 219 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
-crash, and runs an analysis step), and **219 mesh-only decks** — no `*STEP`, so nothing to
-solve — are **accepted** by ccx. The other 584 convert cleanly but use features ccx cannot
-run (user elements, UMAT/VUMAT and other user subroutines, Riks, cohesive/connector
-elements, piezoelectric/acoustic coupling) or are CAE part fragments / incomplete or
-invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
+references; 188 solve in CalculiX under their own loads** (ccx exits 0, prints "Job
+finished" with no `*ERROR` or crash, and runs an analysis step — and every step the
+Abaqus deck loads still carries a load after conversion), and **219 mesh-only decks** — no
+`*STEP`, so nothing to solve — are **accepted** by ccx. 14 more solve but apply no load in
+the source deck itself (an empty `*STEP`: the solution is zero, in Abaqus too); they stay
+in the gate as conversion checks, flagged `source_unloaded`. The other 601 convert cleanly
+but use features ccx cannot run (user elements, UMAT/VUMAT and other user subroutines,
+Riks, NLGEOM follower tractions, cohesive/connector elements, piezoelectric/acoustic
+coupling) or are CAE part fragments / incomplete or invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
 worse than the original. Bulk-running every deck through convert → integrity → ccx (later
 waves gathered by parallel discovery agents across a dozen engineering domains; plus
 adversarial code reviews) surfaced and fixed real converter bugs — keyword-line
@@ -269,6 +303,11 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*BOUNDARY, TYPE=VELOCITY/ACCEL` | `TYPE` dropped | ccx is displacement-only |
 | `*DLOAD, Px` | unchanged | solid face numbering matches Abaqus |
 | `*DSLOAD` (pressure) | `*DLOAD` with `Px` | ccx `*DSLOAD` is submodel-only; shells use `P` |
+| `*DSLOAD`/`*DLOAD` `TRVEC`, `TRSHR` (surface tractions) | consistent nodal forces (`*CLOAD`) | ccx has no traction load: the face/edge shape functions are integrated over the undeformed geometry (× plane thickness, × 2πr axisymmetric; `TRSHR` projected onto the face). Exact in small-strain steps and for NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT RESULTANT=YES`; other NLGEOM tractions only with `--approximate` |
+| `*DLOAD` `PX`/`PY`/`PZ`/`P1`/`P2` on beams | consistent nodal forces (`*CLOAD`) | on the converted element's nodes (incl. inserted midside nodes); ccx's own beam `P1`/`P2` is a section-face pressure |
+| surface elements `SFM3D3/4/4R/6/8/8R`, `SFMAX1/2`, `SFMGAX1/2` | left out of the mesh; their `TRVEC`, `TRSHR`, `P` (`*DLOAD`, or `*DSLOAD` on their `SPOS`/`SNEG` side) → consistent nodal forces | ccx has no surface element; they have no stiffness, so only their loads matter. Element sets keep their other members; `*SURFACE SECTION` and surfaces / `*EL PRINT` on them only are dropped. Abaqus signs: an element-based `P` acts along the element normal, a surface `P` against the surface normal. Kept (ccx then stops on them) if they carry rebar, or mass in a dynamic / frequency step or under gravity — unless `--approximate` |
+| converted nodal forces (above) on nodes with a `*TRANSFORM` | given in each node's local axes | ccx, like Abaqus, reads a `*CLOAD` there in the transformed system: rectangular, or cylindrical at the node's undeformed position, fixed in space (probed on 2.23 for solid, shell, membrane, beam, plane and axisymmetric nodes). The load line is commented out with the reason (the load audit flags a step it leaves unloaded) when those axes are unknown: a spherical transform (ccx has none), a node on the cylinder axis, degenerate or unreadable data, two different transforms on one node, or a 2-D node whose local 3-axis is not the global Z axis |
+| `*BOUNDARY, USER`, `*CLOAD, USER`, `...NU` load labels, `*TEMPERATURE, USER`, `*AMPLITUDE, DEFINITION=USER` | commented out | the Abaqus user subroutine cannot run in ccx, which would call its own stock `uboun.f` / `cload.f` / `dload.f` / ... instead — the warning names the one to port |
 | `*MPC` | line by line: `PIN`/`TIE` → per-DOF `*EQUATION`; `BEAM` → `*RIGID BODY` per independent node; `LINK` → linearised `*EQUATION` (no `NLGEOM`) or ccx `*MPC BEAM` | `PLANE`/`STRAIGHT` kept; a line ccx cannot take (user MPCs, other types) is commented out alone. `TIE` ties shell/beam rotations through knots (ccx ignores DOFs 4–6 of a plain shell/beam node in an `*EQUATION`) and the temperature in thermal steps; BEAM lines chained through a node form one body; ccx's `*MPC BEAM` keeps the distance between two nodes but rejects beam/shell/plane nodes |
 | `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
 | `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
@@ -505,6 +544,7 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | File | Exercises |
 | --- | --- |
 | [`examples/nle10_thickplate.inp`](examples/nle10_thickplate.inp) | NAFEMS LE10, C3D20, `*NCOPY`+`*ELGEN`+`GEN`/`PERT`, `*DLOAD Px` |
+| [`examples/nle10_surface_elements.inp`](examples/nle10_surface_elements.inp) | the same plate, its pressure on an `SFM3D8` skin (`*DSLOAD P` on `SPOS`) → nodal forces |
 | [`examples/composite_shell.inp`](examples/composite_shell.inp) | S8R composite layup, orthotropic, `*ORIENTATION`, `ENCASTRE`, `*DSLOAD` |
 | [`examples/assembly_two_blocks.inp`](examples/assembly_two_blocks.inp) | two-instance assembly, `instance.node` reference in a step |
 | [`examples/beam_circ_cantilever.inp`](examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters, `*NGEN`/`*ELGEN` |
@@ -522,6 +562,10 @@ converter warns about the ones it can detect; the rest are here so you know to c
 | [`examples/mpc_pin_tie_joints.inp`](examples/mpc_pin_tie_joints.inp) | two-span beams joined by `*MPC PIN` (hinge) and `TIE` (rigid joint, knots) |
 | [`examples/mpc_link.inp`](examples/mpc_link.inp) | `*MPC LINK` + `SPRINGA` → linearised `*EQUATION`; ccx `*MPC BEAM` under `NLGEOM` |
 | [`examples/equation_overconstraint.inp`](examples/equation_overconstraint.inp) | `*EQUATION` on a BC'd DOF (terms reordered), a duplicate and a loop of ties (dropped) |
+| [`examples/cook_membrane_traction.inp`](examples/cook_membrane_traction.inp) | Cook's membrane, `CPS8`, `*DSLOAD TRVEC` → consistent nodal forces, `*NGEN`/`*NFILL`/`*ELGEN` |
+| [`examples/beam_line_load_cantilever.inp`](examples/beam_line_load_cantilever.inp) | beam line loads `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and an upgraded `CIRC` beam → nodal forces |
+| [`examples/cylinder_traction_cax.inp`](examples/cylinder_traction_cax.inp) | axisymmetric `CAX8` thick cylinder, radial `*DSLOAD TRVEC` (2πr) |
+| [`examples/traction_transformed_face.inp`](examples/traction_transformed_face.inp) | `C3D20R` block, oblique `*DSLOAD TRVEC` on a face whose nodes have a rectangular and a cylindrical `*TRANSFORM` → nodal forces in their local axes |
 | [`examples/coverage_kitchen_sink.inp`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped/commented cards, output-var mapping |
 
 ## Tests

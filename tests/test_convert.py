@@ -10,7 +10,9 @@ load/section reference resolves) plus a handful of conversion-specific
 expectations.
 """
 
+import math
 import os
+import re
 import sys
 import tempfile
 
@@ -2868,6 +2870,485 @@ def test_coupling_bc_bars_example():
     assert not dangling_refs(g), dangling_refs(g)
     assert [l for l in _bc_lines(body) if l.split(",")[0] in ("A_END", "B_END", "C_END")] == ["B_END,1,2"]
     assert "*BOUNDARY taken off 27 DOF(s)" in rep.text() and rep.n_warnings == 0
+
+
+def _cloads(body):
+    """Per *STEP, the summed *CLOAD data {(node, DOF): value} of a converted deck."""
+    steps, in_cload = [], False
+    for ln in body.splitlines():
+        if ln.startswith("*STEP"):
+            steps.append({})
+        if ln.startswith("*"):
+            in_cload = ln.startswith("*CLOAD")
+        elif in_cload and steps:
+            n, d, v = (x.strip() for x in ln.split(","))
+            steps[-1][(int(n), int(d))] = steps[-1].get((int(n), int(d)), 0.0) + float(v)
+    return steps
+
+
+def _close(got, want, tol=1e-12):
+    """Two {key: value} maps (or value lists) agree to ``tol``."""
+    if isinstance(got, dict):
+        return got.keys() == want.keys() and all(abs(got[k] - want[k]) <= tol for k in got)
+    return len(got) == len(want) and all(abs(a - b) <= tol for a, b in zip(got, want))
+
+
+def test_consistent_nodal_forces_integrate_shape_functions():
+    unit = lambda p, n, t: (1.0, 0.0, 0.0)                        # noqa: E731
+
+    def fx(xyz, kind="area", axi=False):
+        return [f[0] for f in A.consistent_nodal_forces(kind, xyz, unit, axi)]
+    square = [(0., 0., 0.), (1., 0., 0.), (1., 1., 0.), (0., 1., 0.)]
+    sq_mid = [(.5, 0., 0.), (1., .5, 0.), (.5, 1., 0.), (0., .5, 0.)]
+    tri = [(0., 0., 0.), (1., 0., 0.), (0., 1., 0.)]
+    tri_mid = [(.5, 0., 0.), (.5, .5, 0.), (0., .5, 0.)]
+    assert _close(fx(square), [.25] * 4)
+    assert _close(fx(square + sq_mid), [-1 / 12] * 4 + [1 / 3] * 4)    # serendipity quad8
+    assert _close(fx(tri), [1 / 6] * 3)
+    assert _close(fx(tri + tri_mid), [0.] * 3 + [1 / 6] * 3)           # tri6: midsides only
+    line = [(0., 0., 0.), (2., 0., 0.)]
+    assert _close(fx(line, "line"), [1., 1.])
+    assert _close(fx(line + [(1., 0., 0.)], "line"), [1 / 3, 1 / 3, 4 / 3])
+    # axisymmetric edge r = 1..3: over the full circle, f_i = 2 pi * integral(N_i r ds)
+    assert _close(fx([(1., 0., 0.), (3., 0., 0.)], "line", True),
+                  [2 * math.pi * 5 / 3, 2 * math.pi * 7 / 3])
+
+
+def test_dsload_traction_becomes_consistent_nodal_forces():
+    deck = HEX + "*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n*Dsload\nTOP, {}\n*End Step\n"
+    body, conv, _ = convert_str(deck.format("TRVEC, 4., 0., 0., -2."))
+    # 4 x area 1 over the face's 4 nodes, along the normalised direction
+    assert _cloads(body) == [{(n, 3): -1.0 for n in (5, 6, 7, 8)}]
+    assert "*DSLOAD" not in body and "** abq2ccx: TOP, TRVEC, 4., 0., 0., -2. -> nodal forces on 4 " \
+                                     "node(s), resultant (0, 0, -4)" in body
+    assert not conv.unloaded_steps
+    # TRSHR: the direction projected onto the face (and normalised), at every point
+    body, _, _ = convert_str(deck.format("TRSHR, 2., 1., 0., 1."))
+    assert _cloads(body) == [{(n, 1): 0.5 for n in (5, 6, 7, 8)}]
+    body, conv, rep = convert_str(deck.format("TRSHR, 2., 0., 0., 1."))
+    assert _cloads(body) == [{}] and "no shear component" in rep.text()
+    assert conv.unloaded_steps == [1]
+    # an element-based traction on face 2 is the same load
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Dload\nEALL, TRVEC2, 4., 0., 0., -2.\n*End Step\n")
+    assert _cloads(body) == [{(n, 3): -1.0 for n in (5, 6, 7, 8)}]
+
+
+def test_traction_on_plane_and_axisymmetric_edges():
+    deck = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n*Element, type={}, elset=E\n1, 1, 2, 3, 4\n"
+            "*Material, name=M\n*Elastic\n1., 0.3\n*Solid Section, elset=E, material=M\n{}"
+            "*Surface, name=R\nE, S2\n*Step\n*Static\n*Dsload\nR, TRVEC, 3., 0., 1., 7.\n*End Step\n")
+    # plane stress: times the section thickness; a 2-D model has no third component
+    body, _, _ = convert_str(deck.format("CPS4", "0.5\n"))
+    assert _cloads(body) == [{(2, 2): 0.75, (3, 2): 0.75}]
+    # axisymmetric (edge at r = 2): over the full circle, 2 pi r per unit length
+    body, _, _ = convert_str(deck.format("CAX4", ""))
+    assert _close(_cloads(body)[0], {(2, 2): 6 * math.pi, (3, 2): 6 * math.pi}, 1e-9)
+
+
+def test_traction_under_nlgeom_converts_only_when_exact():
+    deck = (HEX + "*Surface, name=TOP\nEALL, S2\n*Step, nlgeom\n*Static\n*Dsload{}\n"
+            "TOP, TRVEC, 4., 0., 0., -1.\n*End Step\n")
+    exact = [{(n, 3): -1.0 for n in (5, 6, 7, 8)}]
+    body, conv, rep = convert_str(deck.format(""))                     # FOLLOWER=YES default
+    assert _cloads(body) == [{}] and conv.unloaded_steps == [1]
+    assert "rotates with the surface (FOLLOWER=YES, the Abaqus default)" in rep.text()
+    assert "Step 1 is loaded in the Abaqus deck (*DSLOAD TRVEC on TOP)" in rep.text()
+    body, conv, rep = convert_str(deck.format(", follower=no"))        # per current area
+    assert _cloads(body) == [{}] and "CONSTANT RESULTANT=NO, the Abaqus default" in rep.text()
+    body, conv, rep = convert_str(deck.format(", follower=no, constant resultant=yes"))
+    assert _cloads(body) == exact and not conv.unloaded_steps and "[APPROX]" not in rep.text()
+    body, conv, rep = convert_str(deck.format(""), approximate=True)
+    assert _cloads(body) == exact and "[APPROX] *DSLOAD TRVEC" in rep.text()
+
+
+def test_converted_loads_across_steps_never_use_op_new():
+    deck = (HEX + "*Surface, name=TOP\nEALL, S2\n*Surface, name=BOT\nEALL, S1\n"
+            "*Amplitude, name=A1\n0., 0., 1., 1.\n"
+            "*Step\n*Static\n*Dsload, amplitude=A1\nTOP, TRVEC, 4., 0., 0., -1.\n*End Step\n"
+            "*Step\n*Static\n*End Step\n"
+            "*Step\n*Static\n*Dsload, op=new\nBOT, TRVEC, 8., 0., 0., 1.\n*End Step\n"
+            "*Step\n*Static\n*Cload, op=new\n1, 1, 5.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    s1, s2, s3, s4 = _cloads(body)
+    assert s1 == {(n, 3): -1.0 for n in (5, 6, 7, 8)} and "*CLOAD, AMPLITUDE=A1" in body
+    assert s2 == {}                                                     # unchanged: ccx keeps it
+    # OP=NEW on the *DSLOAD: the earlier traction goes (0 on its nodes), the new one comes in
+    assert s3 == {**{(n, 3): 0.0 for n in (5, 6, 7, 8)}, **{(n, 3): 2.0 for n in (1, 2, 3, 4)}}
+    # the deck's own *CLOAD, OP=NEW also removes ccx's converted forces: given again
+    assert s4 == {(1, 1): 5.0, **{(n, 3): 2.0 for n in (1, 2, 3, 4)}}
+    assert body.upper().count("OP=NEW") == 1 and not conv.unloaded_steps
+
+
+def test_converted_load_sharing_a_deck_cload_dof():
+    deck = (HEX + "*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n*Cload\n5, 3, 1.\n*Dsload\n"
+            "TOP, TRVEC, 4., 0., 0., -1.\n*End Step\n")
+    body, _, _ = convert_str(deck)                  # one step, one amplitude: the values add
+    assert _cloads(body) == [{(5, 3): 0.0, (6, 3): -1.0, (7, 3): -1.0, (8, 3): -1.0}]
+    body, _, rep = convert_str(deck + "*Step\n*Static\n*End Step\n")
+    assert "share the entry of the deck's own *CLOAD" in rep.text()
+    assert _cloads(body)[0] == {(5, 3): 1.0}
+
+
+def test_beam_line_loads_become_consistent_nodal_forces():
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type={}, elset=B\n{}"
+            "*Material, name=M\n*Elastic\n1., 0.3\n*Beam Section, elset=B, material=M, section={}\n"
+            "{}\n0., 0., 1.\n*Step\n*Static\n*Dload\nB, {}\n*End Step\n")
+    two = "1, 1, 2\n2, 2, 3\n"
+    body, _, _ = convert_str(beam.format("B31", two, "RECT", "1., 1.", "PY, 2."))
+    assert _cloads(body) == [{(1, 2): 1.0, (2, 2): 2.0, (3, 2): 1.0}]
+    # local axes: 1 = n1 (here z), 2 = t x n1 (here -y)
+    body, _, _ = convert_str(beam.format("B31", two, "RECT", "1., 1.", "P1, 2."))
+    assert _cloads(body) == [{(1, 3): 1.0, (2, 3): 2.0, (3, 3): 1.0}]
+    body, _, rep = convert_str(beam.format("B31", two, "RECT", "1., 1.", "P2, 2."))
+    assert _cloads(body) == [{(1, 2): -1.0, (2, 2): -2.0, (3, 2): -1.0}]
+    assert "reads P1 / P2 on a beam as a pressure on the expanded section face" in rep.text()
+    # a 3-node beam (end, middle, end): q L / 6, 2 q L / 3, q L / 6
+    body, _, _ = convert_str(beam.format("B32", "1, 1, 2, 3\n", "RECT", "1., 1.", "PZ, 3."))
+    assert _cloads(body) == [{(1, 3): 1.0, (2, 3): 4.0, (3, 3): 1.0}]
+    # a CIRC B31 runs as B32: its new midside node takes its share
+    body, _, _ = convert_str(beam.format("B31", "1, 1, 3\n", "CIRC", "0.1", "PZ, 3."))
+    assert _cloads(body) == [{(1, 3): 1.0, (4, 3): 4.0, (3, 3): 1.0}]
+    # planar beams: n1 = -z, so P2 acts along t x n1 = +y, and nothing out of plane
+    planar = ("*Node\n1, 0., 0.\n2, 1., 0.\n*Element, type=B21, elset=B\n1, 1, 2\n*Material, "
+              "name=M\n*Elastic\n1., 0.3\n*Beam Section, elset=B, material=M, section=RECT\n1., 1.\n"
+              "*Step\n*Static\n*Dload\nB, P2, 2.\n*End Step\n")
+    body, _, _ = convert_str(planar)
+    assert _cloads(body) == [{(1, 2): 1.0, (2, 2): 1.0}]
+
+
+def test_user_subroutine_loads_are_commented_out():
+    deck = HEX + ("*Nset, nset=TOP\n5, 6, 7, 8\n*Amplitude, name=U1, definition=user, variables=1\n"
+                  "*Step\n*Static\n*Boundary, user\nTOP, 3, 3\n*Cload, user\n5, 1, 1.\n"
+                  "*Dload\nEALL, P1NU, 1.\nEALL, P2, 3.\n*Temperature, user\nTOP\n"
+                  "*Film\nEALL, F1NU, 20., 5.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    for sub in ("uboun.f", "cload.f", "dload.f", "utemp.f", "film.f", "uamplitude.f"):
+        assert sub in rep.text(), sub
+    assert "** *BOUNDARY, USER" in body and "\n*BOUNDARY, USER" not in body
+    assert "\nEALL, P2, 3." in body and "\nEALL, P1NU" not in body and "** EALL, P1NU, 1." in body
+    assert "\n*FILM" not in body and "\n*TEMPERATURE" not in body
+
+
+def test_load_audit_flags_steps_whose_loads_do_not_survive():
+    body, conv, rep = convert_str(HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Step\n*Static\n"
+                                        "*Boundary, user\nTOP, 3, 3\n*End Step\n")
+    assert conv.unloaded_steps == [1] and not conv.source_unloaded
+    assert "Step 1 is loaded in the Abaqus deck (*BOUNDARY on TOP (user subroutine)), but no " \
+           "load survives the conversion" in rep.text()
+    _, conv, rep = convert_str(HEX + "*Step\n*Static\n*End Step\n")
+    assert conv.source_unloaded and not conv.unloaded_steps and "applies no load" in rep.text()
+    _, conv, _ = convert_str(HEX + "*Step\n*Frequency\n4\n*End Step\n")
+    assert not conv.source_unloaded and not conv.unloaded_steps
+    # loads carry over; OP=NEW removes the earlier steps' loads, not the cards before it in its
+    # own step; an eigenvalue step needs none
+    blocks = A.blocks_from_lines("""*STEP\n*STATIC\n*CLOAD\n1, 1, 1.\n*END STEP
+*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1, 0.\n*END STEP
+*STEP\n*STATIC\n*CLOAD, OP=NEW\n2, 1, 1.\n*CLOAD, OP=NEW\n3, 1, 1.\n*END STEP
+*STEP\n*STATIC\n*CLOAD, OP=NEW\n*BOUNDARY\n2, 1, 1, 0.5\n*END STEP
+*STEP\n*STATIC\n*BOUNDARY, OP=NEW\n*END STEP\n*STEP\n*FREQUENCY\n*END STEP""".splitlines())
+    assert A.step_load_audit(blocks, True) == [
+        ["*CLOAD on 1"], ["*CLOAD on 1"], ["*CLOAD on 2", "*CLOAD on 3"],
+        ["*BOUNDARY: prescribed value on 2"], [], None]
+
+
+def test_dload_and_dsload_op_new_keep_each_others_loads():
+    deck = (HEX + "*Surface, name=SF\nEALL, S2\n*Step\n*Static\n*Dsload\nSF, P, 1.\n*Dload\n"
+            "EALL, GRAV, 9.81, 0., 0., -1.\n*End Step\n*Step\n*Static\n{}\n*End Step\n")
+    # Abaqus' *DLOAD, OP=NEW keeps the *DSLOAD pressure, ccx's would remove it: given again
+    body, conv, _ = convert_str(deck.format("*Dload, op=new"))
+    step2 = body.split("*STEP")[2]
+    assert "*DLOAD, OP=NEW" in step2 and "\nEALL, P2, 1." in step2 and "GRAV" not in step2
+    # and the other way round
+    body, conv, _ = convert_str(deck.format("*Dsload, op=new"))
+    step2 = body.split("*STEP")[2]
+    assert "*DLOAD, OP=NEW" in step2 and "\nEALL, GRAV, 9.81, 0., 0., -1." in step2
+    assert "P2" not in step2 and not conv.unloaded_steps
+
+
+def test_dload_without_element_set_loads_the_whole_model():
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Dload\n, GRAV, 9.81, 0., 0., -1.\n*End Step\n")
+    assert "\nABQ2CCX_ALL_ELEMENTS, GRAV, 9.81, 0., 0., -1." in body
+    assert "*ELSET, ELSET=ABQ2CCX_ALL_ELEMENTS\n1\n" in body
+
+
+def test_dsload_on_undefined_surface_says_so():
+    body, conv, rep = convert_str(HEX + "*Step\n*Static\n*Dsload\nNOPE, P, 1.\n*End Step\n")
+    assert "surface 'NOPE' is not defined in the deck" in rep.text() and conv.unloaded_steps == [1]
+
+
+def test_distributed_load_examples():
+    # the decks validate_with_ccx.py runs: the converted forces add up to the applied loads
+    body, conv, _ = convert(os.path.join(EXAMPLES, "cook_membrane_traction.inp"))
+    (cook,) = _cloads(body)
+    assert abs(sum(cook.values()) - 1.0) < 1e-12 and {d for _, d in cook} == {2}
+    assert len(cook) == 33 and not conv.unloaded_steps                 # the loaded edge's nodes
+    body, _, _ = convert(os.path.join(EXAMPLES, "beam_line_load_cantilever.inp"))
+    (beams,) = _cloads(body)
+    for nodes, dof, total in ((range(1, 22), 2, -1.0), (range(101, 122), 3, 1.0),
+                              (list(range(201, 222)) + list(range(222, 242)), 3, -0.1)):
+        assert abs(sum(beams.get((n, dof), 0.0) for n in nodes) - total) < 1e-12
+    body, _, _ = convert(os.path.join(EXAMPLES, "cylinder_traction_cax.inp"))
+    (ring,) = _cloads(body)
+    assert abs(sum(ring.values()) - 2 * math.pi * 10 * 2) < 1e-9 and {d for _, d in ring} == {1}
+
+
+# a surface element on the cube's top face, its normal (right-hand rule) +z: out of the cube
+SKIN = HEX + "*ELEMENT, TYPE=SFM3D4, ELSET=SKIN\n9, 5, 6, 7, 8\n*SURFACE SECTION, ELSET=SKIN\n"
+TOP4 = (5, 6, 7, 8)
+
+
+def test_surface_elements_leave_the_mesh_and_carry_their_loads():
+    deck = SKIN + ("*ELSET, ELSET=BOTH\nEALL, SKIN\n*SURFACE, NAME=TOP\nSKIN, SPOS\n*Step\n*Static\n"
+                   "*Dload\nSKIN, TRVEC, 4., 0., 0., -2.\n*El Print, elset=SKIN\nS\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    geom = reparse(body)
+    assert list(geom.elements) == [1] and geom.elsets["BOTH"] == [1] and "SKIN" not in geom.elsets
+    assert "SFM3D4" not in body and "SURFACE" not in body and "*EL PRINT" not in body
+    assert _cloads(body) == [{(n, 3): -1.0 for n in TOP4}]
+    assert not conv.unloaded_steps and rep.n_warnings == 0 and rep.n_commented == 0
+    assert "1 surface element(s) (SFM3D4) left out of the ccx mesh" in rep.text()
+
+
+def test_surface_element_pressure_sense():
+    # Abaqus: an element-based P is positive along the element normal (+z here, so a suction),
+    # a surface P against the surface normal (SPOS: the element normal, SNEG: its reverse)
+    deck = SKIN + "*SURFACE, NAME=TOP\nSKIN, {}\n*Step\n*Static\n{}\n*End Step\n"
+    for side, load, fz in (("SPOS", "*Dload\nSKIN, P, 4.", 1.0), ("SPOS", "*Dsload\nTOP, P, 4.", -1.0),
+                           ("SNEG", "*Dsload\nTOP, P, 4.", 1.0)):
+        body, conv, _ = convert_str(deck.format(side, load))
+        assert _cloads(body) == [{(n, 3): fz for n in TOP4}], (side, load)
+        assert not conv.unloaded_steps and "*DLOAD" not in body
+    # a surface with faces of both kinds: the solid face keeps ccx's own pressure
+    body, _, rep = convert_str(deck.format("SPOS\nEALL, S2", "*Dsload\nTOP, P, 4."))
+    assert "\nEALL, P2, 4." in body and _cloads(body) == [{(n, 3): -1.0 for n in TOP4}]
+    assert "*SURFACE, NAME=TOP\nEALL, S2\n" in body and "sees only its other faces" in rep.text()
+
+
+def test_quadratic_and_axisymmetric_surface_elements():
+    c3d20 = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+             "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, .5, 0., 0.\n10, 1., .5, 0.\n11, .5, 1., 0.\n"
+             "12, 0., .5, 0.\n13, .5, 0., 1.\n14, 1., .5, 1.\n15, .5, 1., 1.\n16, 0., .5, 1.\n"
+             "17, 0., 0., .5\n18, 1., 0., .5\n19, 1., 1., .5\n20, 0., 1., .5\n"
+             "*Element, type=C3D20, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, "
+             "17, 18, 19, 20\n*Element, type=SFM3D8, elset=SKIN\n2, 5, 6, 7, 8, 13, 14, 15, 16\n"
+             "*Step\n*Static\n*Dload\nSKIN, TRVEC, 12., 0., 0., -1.\n*End Step\n")
+    body, _, _ = convert_str(c3d20)                      # serendipity: -1/12 and 1/3 of the total
+    assert _close(_cloads(body)[0], {**{(n, 3): 1.0 for n in (5, 6, 7, 8)},
+                                     **{(n, 3): -4.0 for n in (13, 14, 15, 16)}})
+    # axisymmetric: the edge r = 2 of a CAX8 (z up), 2 pi r per unit length.  Abaqus turns
+    # node 1 -> node 2 (+z) counterclockwise for the element normal: -r, into the element
+    cax8 = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n5, 1.5, 0.\n6, 2., .5\n7, 1.5, 1.\n"
+            "8, 1., .5\n*Element, type=CAX8, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Element, type={}, elset=SKIN\n2, {}\n*Surface, name=OUT\nSKIN, SPOS\n"
+            "*Step\n*Static\n{}\n*End Step\n")
+    two, three = ("SFMAX1", "2, 3"), ("SFMAX2", "2, 6, 3")
+    for (typ, nodes), load, share in ((two, "*Dload\nSKIN, P, 3.", {2: -1, 3: -1}),
+                                      (two, "*Dsload\nOUT, P, 3.", {2: 1, 3: 1}),
+                                      (two, "*Dload\nSKIN, TRVEC, 3., 1., 0., 5.", {2: 1, 3: 1}),
+                                      (three, "*Dload\nSKIN, P, 3.", {2: -1, 6: -4, 3: -1})):
+        body, conv, _ = convert_str(cax8.format(typ, nodes, load))
+        want = {(n, 1): s * 12 * math.pi / sum(abs(x) for x in share.values())
+                for n, s in share.items()}
+        assert _close(_cloads(body)[0], want, 1e-9), (typ, load)
+        assert typ not in body and not conv.unloaded_steps
+
+
+def test_surface_element_pressure_under_nlgeom_needs_approximate():
+    deck = SKIN + "*Step, nlgeom\n*Static\n*Dload\nSKIN, P, 4.\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert _cloads(body) == [{}] and conv.unloaded_steps == [1]
+    assert "pressure stays normal to the deforming surface" in rep.text()
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert _cloads(body) == [{(n, 3): 1.0 for n in TOP4}] and "[APPROX] *DLOAD P" in rep.text()
+
+
+def test_other_loads_on_surface_elements():
+    deck = SKIN + "*Step\n*Static\n*Dload\n{}\n*End Step\n"
+    # a mass-proportional load: the surface elements carry no mass, the solids keep it
+    body, conv, rep = convert_str(deck.format(", GRAV, 9.81, 0., 0., -1."))
+    assert "\nABQ2CCX_ALL_ELEMENTS, GRAV, 9.81, 0., 0., -1." in body
+    assert reparse(body).elsets["ABQ2CCX_ALL_ELEMENTS"] == [1] and not conv.unloaded_steps
+    body, conv, _ = convert_str(deck.format("SKIN, GRAV, 9.81, 0., 0., -1."))
+    assert "-> no load: it acts only on surface elements" in body and "\n*DLOAD" not in body
+    # loads this conversion does not apply to surface elements are commented out
+    body, conv, rep = convert_str(deck.format("SKIN, BZ, 3."))
+    assert "a BZ load on them is not converted" in rep.text() and conv.unloaded_steps == [1]
+
+
+def test_surface_elements_with_mass_or_rebar_stay_unless_approximate():
+    heavy = SKIN.replace("SECTION, ELSET=SKIN\n", "SECTION, ELSET=SKIN, DENSITY=0.5\n")
+    body, _, rep = convert_str(heavy + "*Step\n*Frequency\n3\n*End Step\n")
+    assert "TYPE=SFM3D4" in body and "carry mass (*SURFACE SECTION, DENSITY=)" in rep.text()
+    body, _, rep = convert_str(heavy + "*Step\n*Frequency\n3\n*End Step\n", approximate=True)
+    assert "SFM3D4" not in body and "[APPROX] Surface elements (SFM3D4) left out" in rep.text()
+    body, _, rep = convert_str(heavy + "*Step\n*Static\n*Dload\nSKIN, P, 4.\n*End Step\n")
+    assert "SFM3D4" not in body and "[APPROX]" not in rep.text()     # mass does not act here
+    rebar = SKIN + "*Rebar Layer\nR1, 0.01, 0.1, , M, 0., 1\n*Step\n*Static\n*End Step\n"
+    body, _, rep = convert_str(rebar)
+    assert "TYPE=SFM3D4" in body and "rebar layers (*REBAR LAYER)" in rep.text()
+
+
+def test_surface_element_on_free_nodes_warns():
+    deck = HEX + ("*Node\n9, 0., 0., 2.\n10, 1., 0., 2.\n11, 1., 1., 2.\n12, 0., 1., 2.\n"
+                  "*Element, type=SFM3D4, elset=SKIN\n9, 9, 10, 11, 12\n")
+    _, _, rep = convert_str(deck)
+    assert "4 node(s) of the surface elements belong to no other element" in rep.text()
+
+
+def test_surface_elements_in_an_assembly_instance():
+    # the shape of petrkryslucsd_problem_le10nafems_mst10: an independent instance holding a
+    # solid and its surface elements (with their section), loaded from the assembly
+    deck = ("*Part, name=P\n*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n"
+            + HEX + "*Element, type=SFM3D4, elset=SKIN\n2, 5, 6, 7, 8\n*Solid Section, elset=EALL, material=M\n"
+              "*Surface Section, elset=SKIN\n*End Instance\n*End Assembly\n*Material, name=M\n"
+              "*Elastic\n1., 0.3\n*Step\n*Static\n*Dload, follower=NO\nA.I1.SKIN, TRVEC, 4., 0., 0., -1.\n"
+              "*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "SFM3D4" not in body and "SURFACE SECTION" not in body and rep.n_commented == 0
+    assert _cloads(body) == [{(n, 3): -1.0 for n in TOP4}] and not conv.unloaded_steps
+
+
+def test_nle10_surface_elements_example():
+    body, conv, _ = convert(os.path.join(EXAMPLES, "nle10_surface_elements.inp"))
+    (skin,) = _cloads(body)
+    area = math.pi / 4 * (3.25 * 2.75 - 2 * 1)                      # the quarter elliptic annulus
+    assert {d for _, d in skin} == {3} and abs(sum(skin.values()) / -1e6 - area) < 1e-4 * area
+    assert "TYPE=SFM3D8" not in body and not conv.unloaded_steps
+
+
+# the cube's top face under a traction along (3, 0, -4): (0.6, 0, -0.8) on each of its nodes
+TRVEC_TOP = HEX + "*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n*Dsload\nTOP, TRVEC, 4., 3., 0., -4.\n*End Step\n"
+
+
+def _transformed(deck, nodes, data, typ="R", nset="TR"):
+    """``deck`` with a *TRANSFORM of ``typ`` on ``nodes``, defined ahead of its first *Step."""
+    return deck.replace("*Step", f"*Nset, nset={nset}\n{nodes}\n*Transform, nset={nset}, type={typ}\n"
+                                 f"{data}\n*Step", 1)
+
+
+def test_nodal_forces_on_transformed_nodes_go_into_their_local_axes():
+    # ccx and Abaqus read a *CLOAD on a node with a *TRANSFORM in its local axes.  Rectangular:
+    # 1 along a (here y), 3 = a x b (z), 2 = 3 x 1 (-x)
+    body, conv, rep = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", "0., 2., 0., -1., 1., 0."))
+    assert _close(_cloads(body)[0], {**{(n, 2): -0.6 for n in TOP4}, **{(n, 3): -0.8 for n in TOP4}})
+    assert ("resultant (2.4, 0, -3.2), in the *CLOAD at the end of this step; in the local axes of "
+            "the 4 with a *TRANSFORM") in body                               # the resultant: global
+    assert not conv.unloaded_steps and rep.n_commented == 0 and "each node's local axes" in rep.text()
+    # nodes without one keep the global components
+    body, _, _ = convert_str(_transformed(TRVEC_TOP, "5, 6", "0., 2., 0., -1., 1., 0."))
+    assert _close(_cloads(body)[0], {(5, 2): -0.6, (6, 2): -0.6, (7, 1): 0.6, (8, 1): 0.6,
+                                     **{(n, 3): -0.8 for n in TOP4}})
+    # cylindrical about the axis x = y = -1 (along +z): 1 radial at the node, 2 = 3 x 1, 3 = z
+    body, _, _ = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", "-1., -1., 0., -1., -1., 2.", "C"))
+    want = {}
+    for n, (x, y) in zip(TOP4, ((0., 0.), (1., 0.), (1., 1.), (0., 1.))):
+        c, s = (x + 1) / math.hypot(x + 1, y + 1), (y + 1) / math.hypot(x + 1, y + 1)
+        want.update({(n, 1): 0.6 * c, (n, 2): -0.6 * s, (n, 3): -0.8})
+    assert _close(_cloads(body)[0], want)
+
+
+def test_nodal_forces_on_unusable_transforms_are_refused():
+    for typ, data, why in (
+            ("R", "0., 0., 0., 0., 1., 0.", "the rectangular *TRANSFORM of node 5 is degenerate"),
+            ("R", "1., 1., 0., 2., 2., 0.", "the rectangular *TRANSFORM of node 5 is degenerate"),
+            ("C", "1., 1., 1., 1., 1., 1.", "the cylindrical *TRANSFORM of node 5 is degenerate"),
+            ("C", "0., 0., 0., 0., 0., 3.", "node 5 lies on the axis of its cylindrical *TRANSFORM"),
+            ("S", "0., 0., 0., 0., 0., 3.", "node 5 has a spherical *TRANSFORM (TYPE=S), which ccx"),
+            ("R", "0., 1., 0.", "node 5 has a *TRANSFORM whose data line cannot be read")):
+        body, conv, rep = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", data, typ))
+        assert _cloads(body) == [{}] and conv.unloaded_steps == [1], (typ, data)
+        assert f"*DSLOAD TRVEC on 'TOP' not converted: {why}" in rep.text(), (typ, data)
+        assert "\n** TOP, TRVEC, 4., 3., 0., -4.\n" in body
+    # Abaqus allows one *TRANSFORM per node (ccx takes the last): two that differ are refused
+    once = _transformed(TRVEC_TOP, "5", "0., 2., 0., -1., 1., 0.")
+    body, conv, rep = convert_str(_transformed(once, "5, 6", "1., 0., 0., 0., 1., 0.", nset="TR2"))
+    assert _cloads(body) == [{}] and "node 5 is in several *TRANSFORM cards" in rep.text()
+    body, conv, _ = convert_str(_transformed(once, "5", "0., 2., 0., -1., 1., 0.", nset="TR2"))
+    assert len(_cloads(body)[0]) == 8 and not conv.unloaded_steps            # the same twice
+
+
+def test_nodal_forces_on_transformed_2d_nodes():
+    deck = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n*Element, type=CPS4, elset=E\n"
+            "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1., 0.3\n*Solid Section, elset=E, material=M\n"
+            "0.5\n*Surface, name=EDGE\nE, S2\n*Step\n*Static\n*Dsload\nEDGE, TRVEC, 3., 0., 1., 7.\n"
+            "*End Step\n")                                     # (0, 0.75) on nodes 2 and 3
+    r2 = 0.75 / math.sqrt(2)
+    body, _, _ = convert_str(_transformed(deck, "2, 3", "1., 1., 0., -1., 1., 0."))
+    assert _close(_cloads(body)[0], {(2, 1): r2, (2, 2): r2, (3, 1): r2, (3, 2): r2})
+    # local 3 along -z: local 2 = 3 x 1 turns the other way; still only DOFs 1 and 2
+    body, _, _ = convert_str(_transformed(deck, "2, 3", "1., 1., 0., 1., -1., 0."))
+    assert _close(_cloads(body)[0], {(2, 1): r2, (2, 2): -r2, (3, 1): r2, (3, 2): -r2})
+    # cylindrical about the z axis through the origin: radial and tangential in the plane
+    body, _, _ = convert_str(_transformed(deck, "2, 3", "0., 0., 0., 0., 0., 1.", "C"))
+    assert _close(_cloads(body)[0], {(2, 2): 0.75, (3, 1): 0.75 / math.sqrt(5),
+                                     (3, 2): 1.5 / math.sqrt(5)})
+    # a local 3-direction out of the model plane leaves the in-plane force no 2-D components
+    body, conv, rep = convert_str(_transformed(deck, "2, 3", "1., 0., 1., 0., 1., 0."))
+    assert _cloads(body) == [{}] and conv.unloaded_steps == [1]
+    assert "the *TRANSFORM of node 2 turns its local 3-direction out of the global Z axis" in rep.text()
+
+
+def test_beam_and_surface_element_loads_on_transformed_nodes():
+    # a beam line load PY on node 3 with local axes 1 = z, 2 = x, 3 = y
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n"
+            "2, 2, 3\n*Material, name=M\n*Elastic\n1., 0.3\n*Beam Section, elset=B, material=M, "
+            "section=RECT\n1., 1.\n0., 0., 1.\n*Step\n*Static\n*Dload\nB, PY, 2.\n*End Step\n")
+    body, _, _ = convert_str(_transformed(beam, "3", "0., 0., 1., 1., 0., 0."))
+    assert _cloads(body) == [{(1, 2): 1.0, (2, 2): 2.0, (3, 3): 1.0}]
+    # a pressure on a surface element (+z on the cube's top nodes) with local axes 1 = z
+    body, conv, _ = convert_str(_transformed(SKIN + "*Surface, name=TOP\nSKIN, SPOS\n*Step\n*Static\n"
+                                                    "*Dload\nSKIN, P, 4.\n*End Step\n",
+                                             "5, 6, 7, 8", "0., 0., 1., 1., 0., 0."))
+    assert _cloads(body) == [{(n, 1): 1.0 for n in TOP4}] and not conv.unloaded_steps
+
+
+def test_transformed_nodal_forces_meet_the_decks_cload_on_local_dofs():
+    # local 1 = z on node 5: the traction's force there shares local DOF 1 with the deck's own
+    # *CLOAD, which a later step would replace in ccx -> refused (globally they look disjoint)
+    deck = _transformed(HEX + "*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n*Cload\n5, 1, 1.\n"
+                              "*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n*End Step\n*Step\n*Static\n"
+                              "*End Step\n", "5", "0., 0., 1., 1., 0., 0.")
+    body, _, rep = convert_str(deck)
+    assert "its nodal force on node 5 DOF 1 would share the entry of the deck's own *CLOAD" in rep.text()
+    assert _cloads(body)[0] == {(5, 1): 1.0}
+
+
+def test_transform_of_a_rotated_instance_rotates_the_local_axes():
+    # the part's identity transform, in an instance turned 90 degrees about z: 1 = y, 2 = -x
+    deck = ("*Part, name=P\n" + HEX + "*Nset, nset=TOPN\n5, 6, 7, 8\n*Transform, nset=TOPN\n"
+            "1., 0., 0., 0., 1., 0.\n*Surface, name=TOP\nEALL, S2\n*Solid Section, elset=EALL, "
+            "material=M\n*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n0., 0., 0.\n"
+            "0., 0., 0., 0., 0., 1., 90.\n*End Instance\n*End Assembly\n*Material, name=M\n"
+            "*Elastic\n1., 0.3\n*Step\n*Static\n*Dsload\nI1.TOP, TRVEC, 4., 1., 0., 0.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    (forces,) = _cloads(body)
+    assert len(forces) == 4 and {d for _, d in forces} == {2} and _close(list(forces.values()), [-1.0] * 4)
+    assert not conv.unloaded_steps
+
+
+def test_traction_transformed_face_example():
+    # the deck validate_with_ccx.py runs: its forces, turned back from each node's local axes,
+    # are those of the same block without the *TRANSFORM cards
+    path = os.path.join(EXAMPLES, "traction_transformed_face.inp")
+    body, conv, _ = convert(path)
+    plain, _, _ = convert_str(re.sub(r"(?m)^\*TRANSFORM.*\n.*\n", "", open(path).read()))
+    (local,), (glob,) = _cloads(body), _cloads(plain)
+    nodes = {n for n, _ in glob}
+    assert len(nodes) == 21 and not conv.unloaded_steps and not dangling_refs(reparse(body))
+    unit = lambda v: [x / math.sqrt(sum(y * y for y in v)) for x in v]    # noqa: E731
+    cross = lambda a, b: [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],   # noqa: E731
+                          a[0] * b[1] - a[1] * b[0]]
+    for n in nodes:
+        i, j = (n - 801) % 10, (n - 801) // 10                    # node (x, y) = (i, j) / 4, z = 2
+        if i <= 2:                                                # rectangular: a, b
+            e1, e3 = unit([1., 2., .5]), unit(cross([1., 2., .5], [-1., 1., 3.]))
+        else:                                                     # cylindrical: axis a -> b
+            e3 = unit([.1, .2, 3.])
+            p = [i / 4 + .5, j / 4 + .3, 2.]
+            e1 = unit([p[k] - sum(x * y for x, y in zip(p, e3)) * e3[k] for k in range(3)])
+        axes = (e1, cross(e3, e1), e3)
+        back = [sum(local.get((n, d + 1), 0.0) * axes[d][k] for d in range(3)) for k in range(3)]
+        assert _close(back, [glob.get((n, k + 1), 0.0) for k in range(3)], 1e-9), n
 
 
 def test_rigid_body_bc_bars_example():

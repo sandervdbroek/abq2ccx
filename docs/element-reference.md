@@ -4,7 +4,7 @@
 
 Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged.
 
-Direct CalculiX types: **68**. Total recognised: **156**.
+Direct CalculiX types: **68**. Total recognised: **166**.
 
 ## 3D continuum
 
@@ -252,3 +252,20 @@ ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` 
 | `STRI3` | 3 | → `S3` (substituted) |
 | `STRI65` | 6 | → `S6` (substituted) |
 | `US3` | 3 | direct |
+
+## surface (load carrier)
+
+| Abaqus type | Nodes | CalculiX |
+| --- | --- | --- |
+| `SFM3D3` | 3 | left out of the mesh; its loads → consistent nodal forces |
+| `SFM3D4` | 4 | left out of the mesh; its loads → consistent nodal forces |
+| `SFM3D4R` | 4 | left out of the mesh; its loads → consistent nodal forces |
+| `SFM3D6` | 6 | left out of the mesh; its loads → consistent nodal forces |
+| `SFM3D8` | 8 | left out of the mesh; its loads → consistent nodal forces |
+| `SFM3D8R` | 8 | left out of the mesh; its loads → consistent nodal forces |
+| `SFMAX1` | 2 | left out of the mesh; its loads → consistent nodal forces |
+| `SFMAX2` | 3 | left out of the mesh; its loads → consistent nodal forces |
+| `SFMGAX1` | 2 | left out of the mesh; its loads → consistent nodal forces |
+| `SFMGAX2` | 3 | left out of the mesh; its loads → consistent nodal forces |
+
+Abaqus surface elements have no stiffness ("membrane elements with zero thickness") and ccx has none, so they leave the mesh: element sets keep their other members, and the `TRVEC`, `TRSHR` and `P` loads they carry (element-based, or `*DSLOAD` on their `SPOS`/`SNEG` side) become consistent nodal forces on their nodes — the 3-D ones as faces (corners, then midside nodes), the axisymmetric ones as edges (end, middle, end; over the full circle). Abaqus signs: an element-based `P` acts along the element normal (right-hand rule over the nodes; axisymmetric: node 1 → 2 turned counterclockwise), a surface `P` against the surface normal. Elements that carry `*REBAR LAYER`s, or mass (`*SURFACE SECTION, DENSITY=`) in a dynamic or frequency step or under gravity, stay — ccx then stops on them — unless `--approximate`.
