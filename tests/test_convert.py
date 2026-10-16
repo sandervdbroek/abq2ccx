@@ -379,11 +379,13 @@ def test_node_surface_drops_weight():
 
 
 def test_contact_pair_default_type():
-    # ccx requires a TYPE on *CONTACT PAIR (Abaqus defaults it); Abaqus-only params drop.
+    # ccx requires a TYPE on *CONTACT PAIR; Abaqus/Standard defaults it to node-to-surface
+    # (and the note points at face-to-face if ccx struggles). Abaqus-only params drop.
     deck = "*SURFACE INTERACTION, NAME=SI\n*CONTACT PAIR, INTERACTION=SI, SUPPLEMENTARY CONSTRAINTS=NO\nA, B\n"
-    body, _, _ = convert_str(deck)
+    body, _, rep = convert_str(deck)
     cp = [l for l in body.splitlines() if l.upper().startswith("*CONTACT PAIR")][0]
-    assert "TYPE=SURFACE TO SURFACE" in cp.upper() and "SUPPLEMENTARY" not in cp.upper()
+    assert "TYPE=NODE TO SURFACE" in cp.upper() and "SUPPLEMENTARY" not in cp.upper()
+    assert "SURFACE TO SURFACE" in rep.text()
 
 
 def test_rigid_body_pin_nset_mapped():
@@ -836,27 +838,34 @@ def test_initial_stress_geostatic_commented():
 
 
 def test_approximate_riks_and_default_off():
-    # --approximate reframes *STATIC, RIKS as plain *STATIC; without it the card is kept
-    # (with a pointer to the flag) so nothing changes silently.
+    # ccx has no Riks solver and would silently run a passed-through *STATIC, RIKS as a
+    # load-controlled static step, so by default the procedure is commented out (ccx then
+    # stops at that step); --approximate reframes it as plain *STATIC.
     deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=T3D2,elset=E\n1,1,2\n"
             "*Step\n*Static, RIKS\n0.01,1.,1e-5,0.1\n*End Step\n")
     body, _, rep = convert_str(deck)
-    assert any(l.upper().startswith("*STATIC, RIKS") for l in body.splitlines())
-    assert "--approximate" in rep.text()
+    live = [l for l in body.splitlines() if not l.startswith("**")]
+    assert not any(l.upper().startswith("*STATIC") for l in live)
+    assert "** *STATIC, RIKS" in body and "--approximate" in rep.text()
     body, _, rep = convert_str(deck, approximate=True)
     lines = [l for l in body.splitlines() if l.upper().startswith("*STATIC")]
     assert lines == ["*STATIC"] and "[APPROX]" in rep.text()
 
 
-def test_approximate_explicit_to_implicit():
+def test_explicit_dynamics_native():
+    # ccx runs *DYNAMIC, EXPLICIT itself: keep it (also under --approximate), drop the
+    # Abaqus/Explicit-only controls, and give the step Abaqus/Explicit's defaults (no
+    # increment cap, NLGEOM on) instead of ccx's 100-increment, linear-geometry ones.
     deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=T3D2,elset=E\n1,1,2\n"
-            "*Step\n*Dynamic, EXPLICIT\n, 0.01\n*End Step\n")
-    body, _, rep = convert_str(deck, approximate=True)
-    lines = body.splitlines()
-    i = next(k for k, l in enumerate(lines) if l.upper().startswith("*DYNAMIC"))
-    assert "EXPLICIT" not in lines[i].upper()
-    assert lines[i + 1].replace(" ", "") == "1e-05,0.01"     # period/1000, period
-    assert "[APPROX]" in rep.text()
+            "*Step\n*Dynamic, Explicit, element by element\n, 0.01\n*End Step\n")
+    for approx in (False, True):
+        body, _, rep = convert_str(deck, approximate=approx)
+        lines = body.splitlines()
+        i = next(k for k, l in enumerate(lines) if l.upper().startswith("*DYNAMIC"))
+        assert lines[i] == "*DYNAMIC, EXPLICIT" and lines[i + 1].replace(" ", "") == ",0.01"
+        step = next(l for l in lines if l.upper().startswith("*STEP"))
+        assert "INC=10000000" in step and "NLGEOM" in step
+        assert "no explicit solver" not in rep.text()
 
 
 def test_approximate_nu_clamp():
@@ -889,6 +898,393 @@ def test_nonpositive_node_number_warns():
     assert "non-positive numbering" in rep.text().lower() and "e.g. 0" in rep.text()
     _, _, rep = convert_str(deck.replace("0,0.,0.", "4,0.,0.").replace("1, 0,1", "1, 4,1"))
     assert "non-positive" not in rep.text().lower()
+
+
+Q4 = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n*Element,type=CPS4,elset=E\n1,1,2,3,4\n"
+      "*Nset,nset=L\n1,4\n*Solid Section,elset=E,material=M\n1.,\n*Material,name=M\n"
+      "*Elastic\n1000.,0.3\n")
+S4 = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n100,2.5,0.5,0\n"
+      "*Element,type=S4,elset=E\n1,1,2,3,4\n2,2,5,6,3\n*Nset,nset=R\n5,6\n*Nset,nset=REF\n100\n"
+      "*Shell Section,elset=E,material=M\n0.1\n*Material,name=M\n*Elastic\n1000.,0.3\n")
+
+
+def _live(body):
+    return [l for l in body.splitlines() if not l.startswith("**")]
+
+
+def test_history_card_outside_step_commented():
+    # Step data before any *STEP is invalid Abaqus; ccx 2.23 segfaults on it when the deck
+    # has no step at all, so it is commented out with the reason.
+    body, _, rep = convert_str(Q4 + "*Boundary\nL,1,2\n*Cload\n3,2,-1.\n")
+    assert not any(l.upper().startswith("*CLOAD") for l in _live(body))
+    assert "** *CLOAD" in body and "history" in rep.text()
+    assert any(l.upper().startswith("*BOUNDARY") for l in _live(body))   # model data stays
+
+
+def test_undefined_material_warns():
+    _, _, rep = convert_str(Q4.replace("material=M", "material=steel"))
+    assert "'STEEL', which is never defined" in rep.text() and "defined: M" in rep.text()
+    _, _, rep = convert_str(Q4)
+    assert "never defined" not in rep.text()
+
+
+def test_plane_node_rotational_bc_dropped():
+    # plane-element nodes have no rotations; ccx 2.23 crashes on a BC there (Abaqus ignores it)
+    body, _, rep = convert_str(Q4 + "*Boundary\nL,1,2\nL,6,6\n*Step\n*Static\n*Boundary\nL,1,6\n*End Step\n")
+    bc = [l.replace(" ", "") for l in _live(body) if l.startswith("L,")]
+    assert bc == ["L,1,2", "L,1,3"] and "Rotational DOFs (4-6)" in rep.text()
+    body, _, rep = convert_str(S4 + "*Boundary\nR,1,6\n")          # shells keep rotations
+    assert "R, 1, 6" in body and "Rotational DOFs" not in rep.text()
+    # named BC in a model that also has beams (so XSYMM expands to rotations too): the
+    # rotational part is dropped on the plane-element nodes only
+    mixed = Q4 + "*Node\n10,2,0\n11,3,0\n*Element,type=B21,elset=B\n2,10,11\n"
+    body, _, _ = convert_str(mixed + "*Boundary\nL, XSYMM\n")
+    assert [l for l in _live(body) if l.startswith("L,")] == ["L, 1, 1"]
+
+
+def test_rigid_coupling_on_shell_nodes_warns():
+    deck = (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
+            "surface=RS\n*Kinematic\n1, 3\n")
+    _, _, rep = convert_str(deck)
+    assert "gen3dmpc" in rep.text()
+    _, _, rep = convert_str(HEX + "*Nset,nset=TOP\n5,6,7,8\n*Node\n100,0.5,0.5,2.\n"
+                            "*Rigid Body, nset=TOP, ref node=100\n")
+    assert "gen3dmpc" not in rep.text()
+
+
+def test_plastic_hardening_forms():
+    mat = "*Material,name=M\n*Elastic\n1000.,0.3\n"
+    # ccx's native Johnson-Cook only switches on with a *RATE DEPENDENT card (alone it
+    # silently runs elastic): a rate-independent one (C = 0) is added, an existing one kept
+    body, _, rep = convert_str(mat + "*Plastic, hardening=Johnson Cook\n300., 500., 0.3, 1., 1500., 20.\n")
+    assert ("*PLASTIC, HARDENING=JOHNSON COOK\n300., 500., 0.3, 1., 1500., 20.\n"
+            "*RATE DEPENDENT, TYPE=JOHNSON COOK\n0., 1.") in body
+    body, _, _ = convert_str(mat + "*Plastic, hardening=Johnson Cook\n300., 500., 0.3, 1.\n"
+                             "*Rate Dependent, type=Johnson Cook\n0.01, 1.\n")
+    assert body.count("*RATE DEPENDENT") == 1 and "0.01, 1." in body
+    body, _, rep = convert_str(mat + "*Plastic, hardening=user, properties=2\n1., 2.\n")
+    assert not any(l.startswith("*PLASTIC") for l in _live(body)) and "UHARD" in rep.text()
+    body, _, _ = convert_str(mat + "*Plastic, hardening=combined, datatype=parameters\n300., 10., 5.\n")
+    assert not any(l.startswith("*PLASTIC") for l in _live(body))
+    body, _, _ = convert_str(mat + "*Plastic\n300., 0.\n400., 0.1\n")
+    assert "*PLASTIC\n300., 0.\n400., 0.1" in body                      # tabular untouched
+
+
+def test_field_dependencies_collapsed():
+    # ccx ignores DEPENDENCIES and in effect uses the first row; collapse to field = 0
+    body, _, rep = convert_str("*Material,name=M\n*Elastic,dependencies=1\n"
+                               "21000.,0.3,0.,-1.\n210000.,0.3,0.,1.\n")
+    assert "*ELASTIC\n115500, 0.3, 0." in body and "DEPENDENCIES=1" in rep.text()
+    body, _, _ = convert_str("*Material,name=M\n*Plastic, dependencies=1\n100.,0.,,0.\n"
+                             "200.,0.1,,0.\n150.,0.,,1.\n250.,0.1,,1.\n")
+    assert "*PLASTIC\n100., 0.\n200., 0.1" in body and "150." not in body
+    body, _, _ = convert_str("*Material,name=M\n*Density, dependencies=1\n1., , 0.5\n2., , 1.\n")
+    assert "*DENSITY\n1.\n" in body + "\n"
+
+
+def test_depvar_delete_and_labels():
+    body, _, rep = convert_str('*Material,name=M\n*Depvar, delete=3\n3,\n1, PEEQ, "eq"\n')
+    assert "*DEPVAR\n3," in body and "PEEQ" not in body and "element deletion" in rep.text()
+
+
+def test_print_cards_without_set_get_whole_model_sets():
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*El Print\nS\n*Node Print\nU\n*End Step\n")
+    assert "*EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS" in body
+    assert "*NODE PRINT, NSET=ABQ2CCX_ALL_NODES" in body
+    assert "*ELSET, ELSET=ABQ2CCX_ALL_ELEMENTS" in body and "*NSET, NSET=ABQ2CCX_ALL_NODES" in body
+
+
+def test_step_amplitude_kept_and_quasi_static_ramp():
+    body, _, _ = convert_str(HEX + "*Step, amp=step\n*Static\n*End Step\n"
+                             "*Step\n*Dynamic, application=quasi-static\n0.01,1.\n*End Step\n")
+    steps = [l for l in body.splitlines() if l.upper().startswith("*STEP")]
+    assert steps == ["*STEP, AMPLITUDE=STEP", "*STEP, AMPLITUDE=RAMP"]
+    assert "*DYNAMIC, ALPHA=-0.3333" in body
+
+
+def test_friction_keeps_only_mu():
+    si = "*Surface Interaction, name=SI\n*Surface Behavior, pressure-overclosure=hard\n"
+    body, _, rep = convert_str(si + "*Friction, exponential decay\n0.3, 0.2, 1.0\n")
+    assert "*FRICTION\n0.3," in body and "EXPONENTIAL" in rep.text()
+    body, _, _ = convert_str(si + "*Friction, slip tolerance=0.005\n 0.2,\n")
+    assert "*FRICTION\n0.2," in body and "SLIP TOLERANCE" not in body.split("*FRICTION")[1]
+    body, _, rep = convert_str(si + "*Friction, rough\n")
+    assert not any(l.startswith("*FRICTION") for l in _live(body)) and "FRICTIONLESS" in rep.text()
+
+
+def test_contact_pair_tied_becomes_tie():
+    body, _, _ = convert_str("*Surface Interaction,name=SI\n*Contact Pair, interaction=SI, tied, "
+                             "adjust=0.01\nA, B\n")
+    assert "*TIE, NAME=ABQ2CCX_TIED1, POSITION TOLERANCE=0.01\nA, B" in body
+    assert "*CONTACT PAIR" not in body
+
+
+def test_composite_symmetric_and_base_rotation():
+    deck = S4.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                      "*Orientation, name=ORI-1\n1.,0.,0.,0.,1.,0.\n3, 45.\n"
+                      "*Shell Section, elset=E, composite, orientation=ORI-1, symmetric\n"
+                      "0.1, 3, M, 0., P1\n0.1, 3, M, 90., P2\n")
+    body, _, _ = convert_str(deck)
+    plies = [l for l in body.splitlines() if l.startswith("0.1, , M")]
+    assert len(plies) == 4 and plies[0] == plies[3] and plies[1] == plies[2]
+    i = body.index("*ORIENTATION, NAME=ABQ2CCX_OR1")
+    assert body[i:].splitlines()[2] == "3, 135."                          # 45 + 90
+
+
+def test_shell_edge_faces_map_to_s3_s6():
+    body, _, _ = convert_str(S4 + "*Surface, name=SS\n1, E1\n2, E4\n")
+    assert "1, S3\n2, S6" in body
+    body, _, _ = convert_str(Q4 + "*Surface, name=SS\n1, E2\n")
+    assert "1, S2" in body
+
+
+def test_amplitude_scaling_applied():
+    body, _, rep = convert_str("*Amplitude, name=A1, scalex=2., scaley=1000.\n0., 0., 1., 1.\n")
+    assert "*AMPLITUDE, NAME=A1\n0, 0, 2, 1000" in body
+    _, _, rep = convert_str("*Amplitude, name=A1, value=absolute\n0., 0., 1., 1.\n")
+    assert "VALUE=ABSOLUTE" in rep.text()
+
+
+def test_kinematic_coupling_keeps_every_line():
+    body, _, _ = convert_str(HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6\n"
+                             "*Kinematic Coupling, ref node=100\nTOP, 1, 1\n7, 3, 3\n")
+    assert body.count("*COUPLING") == 2 and "*KINEMATIC\n1, 1" in body and "*KINEMATIC\n3, 3" in body
+    body, _, rep = convert_str(HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6\n"
+                               "*Kinematic Coupling, ref node=100\nTOP\n7\n")
+    assert body.count("*COUPLING") == 1 and "*KINEMATIC\n1, 3" in body   # all DOFs, solid nodes
+    assert "clamped" not in rep.text()                                    # exact for solids
+
+
+def test_orientation_origin_and_node_definition():
+    body, _, _ = convert_str("*Orientation, name=O1\n11., 10., 0., 10., 11., 0., 10., 10., 0.\n")
+    assert "*ORIENTATION, NAME=O1\n1, 0, 0, 0, 1, 0" in body
+    body, _, _ = convert_str(S4 + "*Orientation, name=O2, definition=nodes\n2, 4, 1\n")
+    assert "*ORIENTATION, NAME=O2\n1, 0, 0, 0, 1, 0" in body
+
+
+def test_equation_node_sets_pair_in_sorted_order():
+    body, _, _ = convert_str(S4 + "*Nset, nset=LEFT\n1, 4, 2\n*Nset, nset=RIGHT\n6, 5, 3\n"
+                             "*Equation\n2\nLEFT, 1, 1., RIGHT, 1, -1.\n")
+    assert "1, 1, 1., 3, 1, -1.\n2\n2, 1, 1., 5, 1, -1.\n2\n4, 1, 1., 6, 1, -1." in body
+
+
+def test_perturbation_static_before_general_step_warns():
+    _, _, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n*Step\n*Static\n*End Step\n")
+    assert "loads persist" in rep.text()
+    _, _, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n")
+    assert "loads persist" not in rep.text()
+
+
+def test_eigen_data_line_layouts():
+    body, _, _ = convert_str(HEX + "*Step\n*Frequency, eigensolver=subspace\n4, 20000.\n*End Step\n")
+    assert "*FREQUENCY\n4, \n" in body + "\n" or "*FREQUENCY\n4,\n" in body + "\n"
+    body, _, _ = convert_str(HEX + "*Step\n*Buckle, eigensolver=lanczos\n5, 0., 100., 7\n*End Step\n")
+    assert "*BUCKLE\n5\n" in body + "\n"
+    body, _, _ = convert_str(HEX + "*Step\n*Frequency\n, 0., 60.\n*End Step\n")
+    assert "*FREQUENCY\n8, 0., 60." in body                       # count capped by the mesh size
+
+
+def test_dsload_follower_warns_under_nlgeom():
+    deck = HEX + "*Surface,name=SF\nEALL, S2\n*Step{}\n*Static\n*Dsload, follower=no\nSF, P, 1.\n*End Step\n"
+    _, _, rep = convert_str(deck.format(", nlgeom"))
+    assert "FOLLOWER=NO dropped" in rep.text()
+    _, _, rep = convert_str(deck.format(""))
+    assert "FOLLOWER=NO dropped" not in rep.text()
+
+
+def test_creep_strain_hardening_warns():
+    _, _, rep = convert_str("*Material,name=M\n*Creep\n1e-10, 3., -0.5\n")
+    assert "TIME hardening" in rep.text()
+    _, _, rep = convert_str("*Material,name=M\n*Creep\n1e-10, 3., 0.\n")
+    assert "TIME hardening" not in rep.text()
+
+
+def test_rigid_body_pin_and_tie_sets_united():
+    body, _, _ = convert_str(S4 + "*Rigid Body, ref node=100, pin nset=R, tie nset=REF\n")
+    assert "*NSET, NSET=ABQ2CCX_RB1\nR, REF" in body and "NSET=ABQ2CCX_RB1" in body.split("*RIGID BODY")[1]
+
+
+def test_initial_solution_continuation_lines():
+    deck = HEX + ("*Material,name=M2\n*Depvar\n10,\n*Initial Conditions, type=solution\n"
+                  "EALL, 1., 2., 3., 4., 5., 6., 7.\n8., 9., 10.\n")
+    body, _, _ = convert_str(deck)
+    assert "1, 1, 1., 2., 3., 4., 5., 6., 7., 8., 9., 10." in body
+    assert "8, 1, 9., 10." not in body                                  # no phantom record
+
+
+def test_keyword_continuation_with_bare_flag():
+    body, _, _ = convert_str(HEX + "*Step, name=S1,\nnlgeom\n*Static\n*End Step\n")
+    assert "*STEP, NLGEOM" in body
+
+
+def test_mesh_generation_curves_bias_and_reflect():
+    body, _, _ = convert_str("*Node\n1, 0., 0., 0.\n10, 5., 5., 0.\n30, 5., 0., 0.\n"
+                             "*Ngen, line=C\n1, 10, 3, 30\n")
+    x4, y4 = (float(v) for v in next(l for l in body.splitlines() if l.startswith("4,")).split(",")[1:3])
+    assert abs((x4 - 5) ** 2 + y4 ** 2 - 25.0) < 1e-6                   # on the r=5 arc
+    body, _, _ = convert_str("*Node\n1,0,0,0\n101,10,0,0\n*Nset,nset=A\n1\n*Nset,nset=B\n101\n"
+                             "*Nfill, bias=0.5\nA, B, 4, 25\n")
+    xs = [float(l.split(",")[1]) for l in body.splitlines() if l.split(",")[0] in ("26", "51", "76")]
+    assert abs(xs[1] / xs[0] - 3.0) < 1e-6                             # intervals 1:2:4:8
+    body, _, _ = convert_str("*Node\n1, 1., 1., 0.\n*Nset, nset=A\n1\n*Ncopy, old set=A, "
+                             "change number=10, reflect=line\n0.,0.,0., 1.,0.,0.\n")
+    assert "11, 1, -1, 0" in body
+
+
+def test_input_data_file_inlined():
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "nodes.inp"), "w") as fh:
+        fh.write("** comment\n1, 0., 0., 0.\n2, 1., 0., 0.\n")
+    with open(os.path.join(d, "main.inp"), "w") as fh:
+        fh.write("*Node, input=nodes.inp\n*Element, type=T3D2, elset=E\n1, 1, 2\n")
+    body, conv, _ = convert(os.path.join(d, "main.inp"))
+    assert set(conv.geom.nodes) == {1, 2} and "INPUT" not in body.upper()
+
+
+def test_parameter_table_not_swallowed():
+    body, _, rep = convert_str("*Parameter Table, type=T1\n1, 2\n*Node\n1,0,0,0\n")
+    assert "*PARAMETER TABLE" in rep.text() and "1, 0, 0, 0" in body
+
+
+def test_element_and_material_defaults():
+    body, _, _ = convert_str("*Node\n1,0,0\n2,1,0\n*Element, type=B23, elset=E\n1,1,2\n")
+    assert "*ELEMENT, TYPE=B31" in body                                  # B23 -> B33 -> B31
+    body, _, _ = convert_str("*Material,name=M\n*Hyperelastic, n=1\n1., 2., 0.01\n")
+    assert "*HYPERELASTIC, POLYNOMIAL, N=1" in body
+
+
+def test_continuum_shell_section_becomes_solid():
+    sc = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,0.1\n6,1,0,0.1\n7,1,1,0.1\n8,0,1,0.1\n"
+          "*Element,type=SC8R,elset=E\n1,1,2,3,4,5,6,7,8\n*Material,name=M\n*Elastic\n1000.,0.3\n")
+    body, _, _ = convert_str(sc + "*Shell Section, elset=E, material=M\n0.1, 5\n")
+    assert "*SOLID SECTION, ELSET=E, MATERIAL=M" in body and "*SHELL SECTION" not in body
+
+
+def test_part_level_constraints_replicated_per_instance():
+    deck = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n"
+            "*Element, type=T3D2, elset=E\n1,1,2\n2,2,3\n*Solid Section, elset=E, material=M\n1.,\n"
+            "*Equation\n2\n1, 1, 1., 3, 1, -1.\n*End Part\n*Assembly, name=A\n"
+            "*Instance, name=I1, part=P\n*End Instance\n*Instance, name=I2, part=P\n10.,0.,0.\n"
+            "*End Instance\n*End Assembly\n*Material, name=M\n*Elastic\n1000., 0.3\n")
+    body, _, _ = convert_str(deck)
+    eqs = [l for l in body.splitlines() if l.endswith(", 1, -1.")]
+    assert eqs == ["1, 1, 1., 3, 1, -1.", "4, 1, 1., 6, 1, -1."]
+
+
+def test_surface_interaction_thickness_line_dropped():
+    body, _, _ = convert_str("*Surface Interaction, name=SI\n1.,\n*Surface Behavior, "
+                             "pressure-overclosure=hard\n")
+    assert "*SURFACE INTERACTION, NAME=SI\n*SURFACE BEHAVIOR" in body
+
+
+def test_load_case_superposition_warned():
+    _, _, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*Load Case, name=LC1\n*Cload\n"
+                            "7, 1, 1.\n*End Load Case\n*End Step\n")
+    assert "SUPERPOSED" in rep.text()
+
+
+def test_abaqus_output_filter_commented():
+    # Abaqus *FILTER (output filter) is not ccx's sensitivity *FILTER, which is an error
+    # outside a *SENSITIVITY step
+    body, _, rep = convert_str(HEX + "*Filter, name=F1, operator=Max, limit=1.0, HALT\n")
+    assert not any(l.upper().startswith("*FILTER") for l in _live(body)) and "*FILTER" in rep.text()
+
+
+def test_surface_undefined_set_warns():
+    _, _, rep = convert_str(HEX + "*Surface, type=element, name=S1\n_missing_S4, S4\n")
+    assert "never defines" in rep.text()
+    _, _, rep = convert_str(HEX + "*Surface, type=element, name=S1\nEALL, S4\n")
+    assert "never defines" not in rep.text()
+
+
+def test_rigid_body_reference_rotations_go_to_rot_node():
+    # ccx ignores BCs/moments on DOFs 4-6 of a *RIGID BODY REF NODE (verified) and carries
+    # the body's rotations on its ROT NODE: one is created and the rotations moved there
+    deck = (HEX + "*Node\n100, 0.5, 0.5, 1.5\n*Nset, nset=TOP\n5,6,7,8\n*Nset, nset=RP\n100\n"
+            "*Rigid Body, ref node=RP, elset=EALL\n*Boundary\nRP, ENCASTRE\n"
+            "*Step\n*Static\n*Cload\nRP, 6, 100.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    rot = max(conv.geom.nodes)
+    assert f"*RIGID BODY, REF NODE=100, ELSET=EALL, ROT NODE={rot}" in body
+    assert "RP, 1, 3" in body and f"{rot}, 1, 3" in body             # ENCASTRE incl. rotations
+    assert f"{rot}, 3, 100." in body and "RP, 6, 100." not in body    # the moment moved
+    assert "ROT NODE" in rep.text()
+
+
+def test_el_print_unknown_labels_dropped():
+    # an unknown *EL PRINT label is fatal in ccx ('label not applicable or unknown')
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*El Print, elset=EALL\nS, DG\n"
+                             "*El Print, elset=EALL\nDG\n*End Step\n")
+    prints = [l for l in body.splitlines() if l.startswith("*EL PRINT")]
+    assert len(prints) == 1 and "*EL PRINT, ELSET=EALL\nS\n" in body + "\n"
+
+
+def test_contact_output_maps_to_ccx_labels():
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Contact Output\nCDISP, CSTRESS, CFORCE\n"
+                             "*End Step\n")
+    assert "*CONTACT FILE\nCDIS, CSTR" in body
+    # names ccx does not know itself are dropped, not folded onto CSTR: switching contact
+    # output on that way made ccx 2.23 abort on a deck that solves without it
+    body, _, _ = convert_str(HEX + "*Step\n*Static\n*Contact Output\nCPRESS\n*End Step\n")
+    assert "*CONTACT FILE" not in body
+
+
+def test_cload_orientation_warned():
+    _, _, rep = convert_str(HEX + "*Step\n*Static\n*Cload, orientation=O1\n7, 1, 1.\n*End Step\n")
+    assert "global axes" in rep.text()
+
+
+def test_blankless_keywords_recognised():
+    # ccx ignores blanks in keyword names: *ENDSTEP / *SOLIDSECTION / *ELPRINT are real cards
+    deck = (HEX.replace("*ELEMENT, TYPE=C3D8", "*ELEMENT,TYPE=C3D8") +
+            "*SOLIDSECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*STEP\n*STATIC\n*ELPRINT, ELSET=EALL\nS\n*ENDSTEP\n*STEP\n*STATIC\n*ENDSTEP\n")
+    body, _, _ = convert_str(deck)
+    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=M" in body and "*EL PRINT, ELSET=EALL" in body
+    assert body.count("*STEP") == 2 and body.count("*END STEP") == 2
+
+
+def test_frequency_storage_for_later_modal_step():
+    deck = HEX + "*Step\n*Frequency\n5\n*End Step\n*Step\n*Modal Dynamic\n0.1, 1.\n*End Step\n"
+    body, _, _ = convert_str(deck)
+    assert "*FREQUENCY, STORAGE=YES" in body
+    body, _, _ = convert_str(HEX + "*Step\n*Frequency\n5\n*End Step\n")
+    assert "STORAGE" not in body
+    # a first-step perturbation frequency feeding steady-state dynamics loses PERTURBATION
+    body, _, _ = convert_str(HEX + "*Step, perturbation\n*Frequency\n5\n*End Step\n"
+                             "*Step, perturbation\n*Steady State Dynamics\n0., 80., 20, 3.\n*End Step\n")
+    assert "*STEP\n*FREQUENCY, STORAGE=YES" in body
+
+
+def test_initial_temperature_defaults_uncovered_nodes_to_zero():
+    body, _, _ = convert_str(HEX + "*Nset, nset=SOME\n1, 2\n*Initial Conditions, type=temperature\nSOME, 20.\n")
+    assert "*INITIAL CONDITIONS, TYPE=temperature\nABQ2CCX_ALL_NODES, 0.\nSOME, 20." in body
+    body, _, _ = convert_str(HEX + "*Initial Conditions, type=temperature\nEALL_NODES, 20.\n"
+                             .replace("EALL_NODES", "1") + "".join(f"{n}, 20.\n" for n in range(2, 9)))
+    assert "ABQ2CCX_ALL_NODES" not in body                           # every node covered
+
+
+def test_plane_section_blank_thickness_defaults_to_one():
+    body, _, _ = convert_str("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n*Element,type=CPS4,elset=E\n1,1,2,3,4\n"
+                             "*Solid Section, elset=E, material=M\n,\n*Material,name=M\n*Elastic\n1000.,0.3\n")
+    assert "*SOLID SECTION, ELSET=E, MATERIAL=M\n1." in body
+
+
+def test_cyclic_hardening_needs_combined_plastic():
+    mat = "*Material,name=M\n*Elastic\n1000.,0.3\n"
+    body, _, _ = convert_str(mat + "*Plastic, hardening=combined, datatype=parameters\n300., 10., 5.\n"
+                             "*Cyclic Hardening, parameters\n300., 50., 5.\n")
+    assert not any(l.startswith(("*PLASTIC", "*CYCLIC")) for l in _live(body))
+    body, _, _ = convert_str(mat + "*Plastic, hardening=combined\n300., 0.\n400., 0.1\n"
+                             "*Cyclic Hardening\n300., 0.\n350., 0.1\n")
+    assert "*CYCLIC HARDENING" in body
+
+
+def test_boundary_on_undefined_set_warns():
+    _, _, rep = convert_str(HEX + "*Boundary\nMISSING, 1, 3\n")
+    assert "never defines" in rep.text()
+    _, _, rep = convert_str(HEX + "*Surface, name=SURF\nEALL, S1\n*Boundary\nSURF, 1, 3\n")
+    assert "is a *SURFACE" in rep.text()
 
 
 if __name__ == "__main__":

@@ -23,13 +23,21 @@ the load-bearing facts and where they come from, so you can trust (or re-verify)
 
 ## Version notes
 
-* The converter targets **CalculiX 2.22**. Keyword syntax for the structural cards is
-  stable across 2.7 → 2.22.
-* The latest release is **2.23** (Nov 2025); it is backward compatible and only adds
-  capability (new `*DAMAGE INITIATION` card, "the first term in an `*EQUATION` can be a
-  node set", linear temperature distributions on `*TEMPERATURE`/`*BOUNDARY`, composite
-  shells in heat transfer, a `C3D8I` correction). None of these break existing
-  Abaqus-style decks. No 2.24 exists as of mid-2026.
+* The converter is written against **CalculiX 2.22–2.23** and validated on **2.23** (the
+  build bundled with FreeCAD 1.1.4). Keyword syntax for the structural cards is stable
+  across 2.7 → 2.23.
+* **2.23** (Nov 2025) adds capability (new `*DAMAGE INITIATION` card, "the first term in
+  an `*EQUATION` can be a node set", linear temperature distributions on
+  `*TEMPERATURE`/`*BOUNDARY`, composite shells in heat transfer, a `C3D8I` correction),
+  but in practice it is **stricter about invalid input** than 2.22. Found in the corpus
+  run, and handled or flagged by the converter:
+  * step data (`*CLOAD`, `*DLOAD`, `*FREQUENCY`, output cards) outside any `*STEP`, a
+    section naming an undefined material, and `*BOUNDARY` DOFs 4–6 on plane-element nodes
+    now **crash** ccx (segfault / bus error) instead of a clean `*ERROR`;
+  * rigid couplings (`*KINEMATIC`, `*RIGID BODY`) on shell or beam nodes stop with
+    `*ERROR in gen3dmpc: nodes belonging to shell elements must not be subject to a RIGID
+    MPC` (2.22 ran them; the current ccx sources only warn).
+* No 2.24 exists as of October 2026.
 * A few cards are version-gated in older ccx (e.g. `*MEMBRANE SECTION` from 2.14, the
   `*ORIENTATION` rotation line from ~2.15, `C3D8R` hourglass control from 2.3). Check
   your target version if you rely on them.
@@ -46,9 +54,10 @@ also solve. This proves the full pipeline — `*NCOPY`/`*ELGEN` expansion, node 
 boundary sets, pressure face, sections — is correct, not merely well-formed.
 
 In addition, a **corpus of 1022 genuine Abaqus decks** (`corpus/manifest.py`, fetched on
-demand) is converted and run: all 1022 convert with zero dangling references and 386 solve
-in CalculiX; the rest convert cleanly but use features ccx cannot run, and each was
-verified to fail no worse than the original unconverted deck. Bulk-running every deck
+demand) is converted and run on ccx 2.23: all 1022 convert with zero dangling references,
+215 solve in CalculiX and 219 mesh-only decks (no `*STEP`) are accepted by it; the rest
+convert cleanly but use features ccx cannot run, and each was verified to fail no worse
+than the original unconverted deck. Bulk-running every deck
 through convert → integrity → ccx is also what drove several converter fixes
 (keyword-line continuation, coupled-temperature `T`-suffix elements, `*PARAMETER`
 arithmetic, `*NFILL` with unequal bounding sets, space-separated `*INSTANCE` transforms).
@@ -70,7 +79,7 @@ through ccx and classified by its failure *and* its source) breaks down as:
 
 | Share | Category | Why no converter can help |
 | --- | --- | --- |
-| ~80% | **Fundamental ccx limits** | The physics isn't in stock ccx: `UMAT`/`VUMAT` user materials (no compiled subroutine), `*USER ELEMENT` (UEL), cohesive elements, explicit dynamics, user MPCs, rigid `R3D` elements, incompressible `ν≥0.5`, per-element distribution orientations — plus genuine non-convergence and degenerate (nonpositive-Jacobian) meshes. |
+| ~80% | **Fundamental ccx limits** | The physics isn't in stock ccx: `UMAT`/`VUMAT` user materials (no compiled subroutine), `*USER ELEMENT` (UEL), cohesive elements, user MPCs, rigid `R3D` elements, Riks arc-length steps, incompressible `ν≥0.5`, per-element distribution orientations — plus genuine non-convergence and degenerate (nonpositive-Jacobian) meshes. |
 | ~4% | **Incomplete source deck** | The deck itself is partial and fails in Abaqus too: no `*MATERIAL` at all, an undefined CAE `_PickedSet`, a material name that doesn't match its section, externally-supplied `<parameter>` values, or a mesh/parser fixture with **no `*STEP`**. |
 | ~15% | **Addressable error, but downstream-blocked** | The *first* error is converter-fixable, but a second, fundamental wall sits behind it. |
 

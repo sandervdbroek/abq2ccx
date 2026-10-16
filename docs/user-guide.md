@@ -115,7 +115,9 @@ For the exhaustive lists see the generated references:
 
 In short: linear/nonlinear **static, frequency, buckling, dynamic, heat-transfer**
 structural analyses with solids/shells/beams, the common materials, orientation and
-composite layups, sets/surfaces, BCs, loads, ties and equations are well covered.
-**Contact** is passed through but not semantically translated. **Connectors, gaskets,
-cohesive elements, inertia relief, advanced material models, and explicit/specialised
-procedures** have no equivalent and are flagged for manual work.
+composite layups, sets/surfaces, BCs, loads, ties and equations are well covered, and
+**explicit dynamics** runs natively in ccx. **Contact** is translated card by card (type
+default, tied pairs → `*TIE`, constant friction) but ccx's penalty contact behaves
+differently — verify. **Connectors, gaskets, cohesive elements, inertia relief, user
+subroutines (UMAT/VUMAT/UHARD/USDFLD), Riks and other specialised procedures** have no
+equivalent and are flagged for manual work.

@@ -2,7 +2,7 @@
 
 # Keyword reference
 
-How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.22 keyword set (**142** cards). Anything in that set is emitted as-is; anything outside it without a translator is commented out with guidance — never silently dropped.
+How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.22 + 2.23 keyword set (**143** cards). Anything in that set is emitted as-is; anything outside it without a translator is commented out with guidance — never silently dropped.
 
 ## Translated / converted to an equivalent
 
@@ -10,39 +10,58 @@ How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.
 | --- | --- |
 | `*NODE / *ELEMENT / *NSET / *ELSET` | parsed into the geometry registry and re-emitted canonically (sets resolved, `GEN`→`GENERATE`, gappy ranges pruned). |
 | `*NGEN / *NFILL / *NCOPY / *ELGEN / *ELCOPY` | expanded into explicit `*NODE`/`*ELEMENT` (CalculiX has no mesh-generation cards). |
-| `*PART / *INSTANCE / *ASSEMBLY` | flattened into one global numbering (instance transform applied, references resolved, names kept ≤20 chars). |
-| `*ELASTIC` | `TYPE` token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`); data passed through (constant order identical). |
-| `*ORIENTATION` | `DEFINITION` dropped; `SPHERICAL`→`RECTANGULAR` (warned); rotation line kept. |
+| `*PART / *INSTANCE / *ASSEMBLY` | flattened into one global numbering (instance transform applied, references resolved, names kept ≤80 chars); part-level constraints (`*EQUATION`, `*MPC`, `*RIGID BODY`, `*COUPLING`, ...) copied per instance; rotated instances rotate `*ORIENTATION` axes, beam `n1` and `*NORMAL` vectors. |
+| `*ORIENTATION` | origin `c` of a 9-value line subtracted from `a`, `b` (ccx has no origin field); `DEFINITION=NODES` resolved to coordinates, `OFFSET TO NODES` commented; `SPHERICAL`→`RECTANGULAR` (warned); rotation line kept. |
 | `*DISTRIBUTION` | passed through with a warning (ccx supports it on `*SOLID SECTION` only). |
-| `*SOLID SECTION` | keeps `ELSET`/`MATERIAL`/`ORIENTATION`; other params dropped. |
-| `*SHELL SECTION` | thickness only (integration-point count dropped); composite plies → one synthesized `*ORIENTATION` per ply angle (S6/S8R only). |
+| `*SOLID SECTION` | keeps `ELSET`/`MATERIAL`/`ORIENTATION`; other params dropped; an undefined `MATERIAL` is warned (ccx 2.23 can segfault on it). |
+| `*SHELL SECTION` | thickness only (integration-point count dropped); composite plies → one synthesized `*ORIENTATION` per ply angle (S6/S8R only), composed with a base rotation about the normal; `SYMMETRIC` layups mirrored; on continuum shells (SC6R/SC8R, which run as solids) → `*SOLID SECTION` (composite: commented). |
 | `*SHELL GENERAL SECTION` | → `*SHELL SECTION` (thickness+material form); ABD/stiffness form flagged as unsupported. |
 | `*BEAM SECTION` | keeps the supported params; `SECTION=CIRC` radius-vs-axes mismatch flagged. |
-| `*STEP` | `NAME` dropped; `NLGEOM` kept on the step; `PERTURBATION` kept only for `*FREQUENCY`/`*BUCKLE`; `*END STEP` ensured. |
-| `*BOUNDARY` | named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped. |
-| `*DLOAD` | passed through (`Px` faces match Abaqus); bare `P` on solids flagged. |
-| `*DSLOAD` | surface pressure → `*DLOAD` with `Px` face labels. |
+| `*STEP` | `NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept; `PERTURBATION` kept only for `*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then persist); explicit steps get `INC=10000000` + `NLGEOM`; `*END STEP` ensured. |
+| `*STATIC` | `RIKS` commented by default (ccx would silently run it as plain static; `--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned). |
+| `*DYNAMIC` | implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; `APPLICATION=QUASI-STATIC/MODERATE DISSIPATION` → `ALPHA=-0.3333` (and `*STEP AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped. |
+| `*FREQUENCY` | Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked (ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes). |
+| `*BUCKLE` | `EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads accuracy/vectors/iterations. |
+| `*HEAT TRANSFER` | `END=` / `MXDEM` dropped. |
+| `*BOUNDARY` | named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped; DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 crashes on them). |
+| `*DLOAD` | passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / `CONSTANT RESULTANT` dropped (warned under NLGEOM). |
+| `*DSLOAD` | surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`. |
 | `*TIE` | Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept. |
 | `*MPC` | `TIE` → per-DOF `*EQUATION`; `PLANE`/`STRAIGHT` kept; others commented. |
-| `*KINEMATIC COUPLING` | → `*RIGID BODY` (all 6 DOFs). |
-| `*CREEP` | Abaqus `LAW=STRAIN/TIME` → ccx Norton (default); other laws → `LAW=USER`. |
-| `*AMPLITUDE` | keeps `NAME`/`TIME`; non-tabular `DEFINITION` flagged. (`*AMP` alias accepted.) |
+| `*EQUATION` | set-name terms resolved to node numbers, multi-node sets paired in sorted order (as Abaqus does unless `UNSORTED`). |
+| `*KINEMATIC COUPLING` | every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF range (the reference node's DOFs 4-6 then take BCs and moments natively). |
+| `*COUPLING / *KINEMATIC` | `REF NODE` set → node number; empty `*KINEMATIC` → `1, 3`; DOFs > 3 clamped; shell/beam nodes warned (ccx 2.23 rejects rigid MPCs there). |
+| `*RIGID BODY` | `PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs 4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); shell/beam nodes warned. |
+| `*CLOAD` | moments on a rigid-body reference point → its `ROT NODE`; `ORIENTATION=` (local axes) and `FOLLOWER=YES` dropped with a warning. |
+| `*CONTACT PAIR` | missing `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; the note suggests `SURFACE TO SURFACE` if ccx struggles to converge); `TIED` → `*TIE`; `SMALL SLIDING` dropped for surface-to-surface; Abaqus-only params dropped. |
+| `*SURFACE INTERACTION` | 2D out-of-plane thickness line dropped; `*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD` synthesized when missing (the Abaqus default). |
+| `*FRICTION` | only `mu` emitted (ccx would read Abaqus' slip-rate / mu_k field as its stick slope); tables / exponential decay / anisotropy warned; `ROUGH` and `mu<=0` dropped. |
+| `*PLASTIC` | `HARDENING=JOHNSON COOK` kept (ccx's native law) and given the `*RATE DEPENDENT, TYPE=JOHNSON COOK` card ccx needs to switch it on (C = 0 if the deck has none); `HARDENING=USER` and `DATATYPE=PARAMETERS` commented (ccx would silently skip them); `DEPENDENCIES` collapsed. |
+| `*ELASTIC / *DENSITY / *SPECIFIC HEAT / *CONDUCTIVITY / *EXPANSION / *MOHR COULOMB` | `TYPE` token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`, same constant order); `DEPENDENCIES=n` (field variables, which ccx ignores) collapsed to the Abaqus no-field state, field = 0. |
+| `*HYPERELASTIC` | no model keyword → `POLYNOMIAL` (Abaqus default); `TEST DATA INPUT` commented. |
+| `*DEPVAR` | SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx). |
+| `*INITIAL CONDITIONS` | `TYPE=STRESS/PLASTIC STRAIN/SOLUTION` expanded per integration point (SOLUTION continuation lines joined by the `*DEPVAR` size); unknown types commented. |
+| `*CREEP` | Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for strain hardening with m ≠ 0); other laws → `LAW=USER`. |
+| `*AMPLITUDE` | keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; `SMOOTH STEP` sampled, `EQUALLY SPACED` expanded, `VALUE=ABSOLUTE` warned. (`*AMP` alias accepted.) |
 | `*RESTART` | keeps `WRITE`/`READ`/`FREQUENCY`/`STEP`; other params dropped. |
-| `*SURFACE` | passed through; `ANALYTICAL RIGID` commented; `SPOS`/`SNEG` flagged. |
+| `*SURFACE` | only `NAME`/`TYPE` kept; shell edges `E1..E4` → `S3..S6` (plane elements `S1..S4`); `ANALYTICAL RIGID` / `COMBINE` commented; `SPOS`/`SNEG` flagged. |
 | `*OUTPUT / *NODE OUTPUT / *ELEMENT OUTPUT` | → `*NODE FILE`/`*EL FILE`; `*OUTPUT` wrapper dropped. |
-| `*NODE FILE / *EL FILE / *NODE PRINT / *EL PRINT` | `POSITION=` stripped, `FREQ`→`FREQUENCY`, `FREQUENCY=0` dropped, variables mapped/filtered. |
+| `*NODE FILE / *EL FILE / *NODE PRINT / *EL PRINT` | `POSITION=`/`DIRECTIONS=` stripped, `FREQ`→`FREQUENCY`, `FREQUENCY=0` dropped, variables mapped and filtered against ccx's label list for that card (an unknown `*EL PRINT` label stops ccx); a print card without a set gets a whole-model set (Abaqus prints everything, ccx nothing). |
+| `*CONTACT OUTPUT / *CONTACT FILE` | → `*CONTACT FILE`; `CDISP`/`CSTRESS` kept as ccx's `CDIS`/`CSTR`, other Abaqus contact variables dropped (a card left empty is dropped). |
+| `Step data outside a *STEP` | `*CLOAD`, `*DLOAD`, output and procedure cards before the first step (or between steps) are commented — Abaqus rejects them and ccx 2.23 segfaults when the deck has no step. |
+| `INPUT= on data cards` | the referenced file's data lines are inlined (ccx reads `INPUT=` only on `*INCLUDE`). |
 
 ## Supported — emitted unchanged
 
 CalculiX accepts these as-is (verified against the ccx 2.22 manual):
 
-`*BASE MOTION`, `*BUCKLE`, `*CFD`, `*CFLUX`, `*CHANGE CONTACT TYPE`, `*CHANGE FRICTION`, `*CHANGE MATERIAL`, `*CHANGE PLASTIC`, `*CHANGE SOLID SECTION`, `*CHANGE SURFACE BEHAVIOR`, `*CLEARANCE`, `*CLOAD`, `*COMPLEX FREQUENCY`, `*CONDUCTIVITY`, `*CONSTRAINT`, `*CONTACT DAMPING`, `*CONTACT FILE`, `*CONTACT OUTPUT`, `*CONTACT PAIR`, `*CONTACT PRINT`, `*CONTROLS`, `*CORRELATION LENGTH`, `*COUPLED TEMPERATURE-DISPLACEMENT`, `*CRACK PROPAGATION`, `*CYCLIC HARDENING`, `*CYCLIC SYMMETRY MODEL`, `*DAMPING`, `*DASHPOT`, `*DEFORMATION PLASTICITY`, `*DENSITY`, `*DEPVAR`, `*DESIGN RESPONSE`, `*DESIGN VARIABLES`, `*DFLUX`, `*DISTRIBUTING`, `*DISTRIBUTING COUPLING`, `*DYNAMIC`, `*ELECTRICAL CONDUCTIVITY`, `*ELECTROMAGNETICS`, `*EQUATION`, `*EXPANSION`, `*FACE PRINT`, `*FEASIBLE DIRECTION`, `*FILM`, `*FLUID CONSTANTS`, `*FLUID SECTION`, `*FREQUENCY`, `*FRICTION`, `*GAP`, `*GAP CONDUCTANCE`, `*GAP HEAT GENERATION`, `*GEOMETRIC CONSTRAINT`, `*GEOMETRIC TOLERANCES`, `*GREEN`, `*HCF`, `*HEADING`, `*HEAT TRANSFER`, `*HYPERELASTIC`, `*HYPERFOAM`, `*INCLUDE`, `*INITIAL CONDITIONS`, `*INITIAL MESH`, `*INITIAL STRAIN INCREASE`, `*KINEMATIC`, `*MAGNETIC PERMEABILITY`, `*MASS`, `*MASS FLOW`, `*MATERIAL`, `*MATRIX ASSEMBLE`, `*MEMBRANE SECTION`, `*MODAL DAMPING`, `*MODAL DYNAMIC`, `*MODEL CHANGE`, `*MOHR COULOMB`, `*MOHR COULOMB HARDENING`, `*NETWORK MPC`, `*NO ANALYSIS`, `*NODAL THICKNESS`, `*NORMAL`, `*OBJECTIVE`, `*PHYSICAL CONSTANTS`, `*PLASTIC`, `*PRE-TENSION SECTION`, `*RADIATE`, `*RATE DEPENDENT`, `*REFINE MESH`, `*RETAINED NODAL DOFS`, `*RIGID BODY`, `*ROBUST DESIGN`, `*SECTION PRINT`, `*SELECT CYCLIC SYMMETRY MODES`, `*SENSITIVITY`, `*SPECIFIC GAS CONSTANT`, `*SPECIFIC HEAT`, `*SPRING`, `*STATIC`, `*STEADY STATE DYNAMICS`, `*SUBMODEL`, `*SUBSTRUCTURE GENERATE`, `*SUBSTRUCTURE MATRIX OUTPUT`, `*SURFACE BEHAVIOR`, `*SURFACE INTERACTION`, `*TEMPERATURE`, `*TIME POINTS`, `*TRANSFORM`, `*UNCOUPLED TEMPERATURE-DISPLACEMENT`, `*USER SECTION`, `*VALUES AT INFINITY`, `*VIEWFACTOR`, `*VISCO`
+`*BASE MOTION`, `*CFD`, `*CFLUX`, `*CHANGE CONTACT TYPE`, `*CHANGE FRICTION`, `*CHANGE MATERIAL`, `*CHANGE PLASTIC`, `*CHANGE SOLID SECTION`, `*CHANGE SURFACE BEHAVIOR`, `*CLEARANCE`, `*COMPLEX FREQUENCY`, `*CONSTRAINT`, `*CONTACT DAMPING`, `*CONTACT PRINT`, `*CONTROLS`, `*CORRELATION LENGTH`, `*COUPLED TEMPERATURE-DISPLACEMENT`, `*CRACK PROPAGATION`, `*CYCLIC HARDENING`, `*CYCLIC SYMMETRY MODEL`, `*DAMPING`, `*DASHPOT`, `*DEFORMATION PLASTICITY`, `*DESIGN RESPONSE`, `*DESIGN VARIABLES`, `*DFLUX`, `*DISTRIBUTING`, `*DISTRIBUTING COUPLING`, `*ELECTRICAL CONDUCTIVITY`, `*ELECTROMAGNETICS`, `*FACE PRINT`, `*FEASIBLE DIRECTION`, `*FILM`, `*FLUID CONSTANTS`, `*FLUID SECTION`, `*GAP`, `*GAP CONDUCTANCE`, `*GAP HEAT GENERATION`, `*GEOMETRIC CONSTRAINT`, `*GEOMETRIC TOLERANCES`, `*GREEN`, `*HCF`, `*HEADING`, `*HYPERFOAM`, `*INCLUDE`, `*INITIAL MESH`, `*INITIAL STRAIN INCREASE`, `*MAGNETIC PERMEABILITY`, `*MASS`, `*MASS FLOW`, `*MATERIAL`, `*MATRIX ASSEMBLE`, `*MEMBRANE SECTION`, `*MODAL DAMPING`, `*MODAL DYNAMIC`, `*MODEL CHANGE`, `*NETWORK MPC`, `*NO ANALYSIS`, `*NODAL THICKNESS`, `*NORMAL`, `*OBJECTIVE`, `*PHYSICAL CONSTANTS`, `*PRE-TENSION SECTION`, `*RADIATE`, `*RATE DEPENDENT`, `*REFINE MESH`, `*RETAINED NODAL DOFS`, `*ROBUST DESIGN`, `*SECTION PRINT`, `*SELECT CYCLIC SYMMETRY MODES`, `*SENSITIVITY`, `*SPECIFIC GAS CONSTANT`, `*SPRING`, `*STEADY STATE DYNAMICS`, `*SUBMODEL`, `*SUBSTRUCTURE GENERATE`, `*SUBSTRUCTURE MATRIX OUTPUT`, `*SURFACE BEHAVIOR`, `*TEMPERATURE`, `*TIME POINTS`, `*TRANSFORM`, `*UNCOUPLED TEMPERATURE-DISPLACEMENT`, `*USER SECTION`, `*VALUES AT INFINITY`, `*VIEWFACTOR`, `*VISCO`
 
 ## Passed through with a heads-up
 
 | Keyword | Note |
 | --- | --- |
-| `*COUPLING` | *COUPLING + *KINEMATIC/*DISTRIBUTING is accepted by recent ccx, but ccx *KINEMATIC requires an explicit DOF list (Abaqus allows none = all 6) — verify. |
+| `*DAMAGE INITIATION` | *DAMAGE INITIATION was added in ccx 2.23 and is emitted unchanged; ccx implements a subset of Abaqus' damage-initiation criteria and has no *DAMAGE EVOLUTION card, so verify your ccx version (>= 2.23), the CRITERION, and that progressive damage is not required to soften/fail the material. |
 | `*USER MATERIAL` | *USER MATERIAL kept, but ccx uses its own umat interface (umat_*.f), not an Abaqus UMAT binary — the subroutine must be ported. |
 | `*USER ELEMENT` | *USER ELEMENT kept; ensure the matching ccx user-element routine is built in. |
 
@@ -54,14 +73,13 @@ CalculiX accepts these as-is (verified against the ccx 2.22 manual):
 
 ## Dropped — organisational, no ccx meaning
 
-Silently dropped (with a note): `*ASSEMBLY`, `*END ASSEMBLY`, `*END INSTANCE`, `*END PART`, `*INSTANCE`, `*MANIFEST`, `*PART`, `*PREPRINT`.
+Silently dropped (with a note): `*ASSEMBLY`, `*END ASSEMBLY`, `*END INSTANCE`, `*END LOAD CASE`, `*END PART`, `*INSTANCE`, `*MANIFEST`, `*PART`, `*PREPRINT`.
 
 Dropped with a warning (can change the model):
 
 | Keyword | Warning |
 | --- | --- |
 | `*SYSTEM` | *SYSTEM (local coordinate system for following *NODE cards) is unsupported by ccx and was dropped; node coordinates defined under it may be in a rotated frame — verify they are global. |
-| `*PARAMETER` | *PARAMETER (parametric input) is unsupported by ccx and was dropped; any <parameter> substitutions will not resolve. |
 | `*UNIT SYSTEM` | *UNIT SYSTEM is unsupported by ccx and was dropped (informational only). |
 
 ## No CalculiX equivalent — commented out with guidance
@@ -74,14 +92,30 @@ Any keyword not in the CalculiX set and without a translator is emitted as `**` 
 | `*INERTIA RELIEF` | ccx has no inertia relief; constrain with a soft spring-to-ground / 3-2-1 set, or balance with the equilibrating load. |
 | `*CONNECTOR SECTION` | connectors have no ccx element; remodel as *RIGID BODY / *MPC / *SPRING / *DASHPOT per the connector behaviour. |
 | `*CONNECTOR BEHAVIOR` | connector behaviour has no ccx equivalent; see *CONNECTOR SECTION. |
-| `*GASKET SECTION` | gaskets have no ccx element/material; approximate with a thin soft solid or *SPRING. |
 | `*GASKET BEHAVIOR` | gasket behaviour has no ccx equivalent. |
 | `*COHESIVE SECTION` | ccx has no cohesive element; model debonding with contact (*SURFACE BEHAVIOR) or a nonlinear *SPRING. |
-| `*DAMAGE INITIATION` | progressive-damage is unsupported by ccx 2.22 (ccx 2.23 adds a *DAMAGE INITIATION card — verify your version and CRITERION). |
-| `*DAMAGE EVOLUTION` | progressive-damage evolution is unsupported by ccx; drop. |
+| `*DAMAGE EVOLUTION` | ccx 2.23 added *DAMAGE INITIATION but not *DAMAGE EVOLUTION, so progressive damage cannot fully run (the material will not soften/fail); drop. |
 | `*FIELD` | *FIELD predefined fields are unsupported; use *INITIAL CONDITIONS / *TEMPERATURE / *DISTRIBUTION instead. |
 | `*REBAR` | rebar/reinforcement layers have no ccx equivalent; mesh reinforcements explicitly. |
 | `*BEAM GENERAL SECTION` | no direct ccx card; use *USER ELEMENT (U1) + *BEAM SECTION, SECTION=GENERAL with A, I11, I12, I22, shear factor. |
 | `*CONCRETE` | concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel. |
 | `*CONCRETE DAMAGED PLASTICITY` | unsupported by ccx; substitute *PLASTIC or remodel. |
 | `*CONNECTOR ELASTICITY` | connector behaviour has no ccx equivalent; see *CONNECTOR SECTION. |
+| `*CONTACT` | Abaqus general contact has no ccx equivalent; define explicit pairs instead: *CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element surfaces (+ *SURFACE INTERACTION / *SURFACE BEHAVIOR). |
+| `*CONTACT INCLUSIONS` | general-contact inclusion list (ALL EXTERIOR is not translatable); create the two surfaces and a *CONTACT PAIR instead. |
+| `*CONTACT EXCLUSIONS` | general-contact exclusion list; not applicable to ccx *CONTACT PAIR. |
+| `*CONTACT PROPERTY ASSIGNMENT` | assigns a general-contact property; in ccx name the *SURFACE INTERACTION via *CONTACT PAIR, INTERACTION= instead. |
+| `*LATENT HEAT` | ccx has no *LATENT HEAT; approximate with an apparent *SPECIFIC HEAT peak cp + L/(Tliq-Tsol) over the melting interval. |
+| `*EMBEDDED ELEMENT` | no ccx equivalent; mesh the reinforcement conformally or tie the embedded nodes with *EQUATION constraints. |
+| `*ALLOWABLE STRESS` | Abaqus 2024 optimisation stress limit; ccx has no equivalent — express a stress constraint via *DESIGN RESPONSE/*CONSTRAINT in a *SENSITIVITY run. |
+| `*REDUCED BASIS GENERATE` | Abaqus 2024 reduced-order-basis generation has no ccx equivalent; drop. |
+| `*SUBMODEL CUT` | Abaqus 2024 submodel-cut card; ccx drives submodels with *SUBMODEL plus *BOUNDARY/*CLOAD, SUBMODEL — remodel using those. |
+| `*WEAR SURFACE PROPERTIES` | Abaqus 2024 surface-wear properties have no ccx equivalent; drop. |
+| `*ELECTRICAL RESISTIVITY` | ccx parameterises conduction by *ELECTRICAL CONDUCTIVITY (the inverse); convert resistivity -> conductivity. |
+| `*ELECTRIC MACHINE LOAD` | Abaqus 2024 electric-machine load has no ccx equivalent; drop. |
+| `*ELECTRIC MACHINE PROPERTY` | Abaqus 2024 electric-machine property has no ccx equivalent; drop. |
+| `*ELEMENT USER OUTPUT VARIABLES` | Abaqus UVARM-style user output; ccx has no equivalent (fill state variables via *DEPVAR + a ccx umat instead). |
+| `*PIEZORESISTIVITY` | Abaqus 2024 piezoresistive coupling has no ccx equivalent; drop. |
+| `*STEP CYCLING` | Abaqus 2025 step cycling has no ccx equivalent; remodel as repeated steps. |
+| `*STEP CYCLING CONTROL` | Abaqus 2025 step-cycling controls have no ccx equivalent; drop. |
+| `*LOAD CASE` | ccx solves one load case per step: the loads of all *LOAD CASE blocks in this step are now SUPERPOSED into one solution — split each load case into its own step (with OP=NEW on the loads). |

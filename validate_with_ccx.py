@@ -52,12 +52,15 @@ def convert(path, out_inp):
     rep = A.Report()
     blocks = A.read_blocks(path, rep)
     conv = A.Converter(rep, type("O", (), {"solid_dof": False})())
-    text = "\n".join(rep.header_comment_lines() + conv.convert(blocks)) + "\n"
+    body = conv.convert(blocks)                     # convert first: the header lists warnings
+    text = "\n".join(rep.header_comment_lines() + body) + "\n"
     with open(out_inp, "w") as fh:
         fh.write(text)
 
 
 def run_ccx(ccx, env, inp_path):
+    """Run ccx; return (workdir, status, combined output) with status from
+    abq2ccx.classify_ccx_run ("solved" / "accepted" / "failed")."""
     d = tempfile.mkdtemp(prefix="ccxval_")
     shutil.copy(inp_path, os.path.join(d, "job.inp"))
     full_env = dict(os.environ)
@@ -65,10 +68,9 @@ def run_ccx(ccx, env, inp_path):
     try:
         r = subprocess.run([ccx, "job"], cwd=d, env=full_env,
                            capture_output=True, text=True, timeout=600)
-        out = r.stdout + r.stderr
+        return d, A.classify_ccx_run(r.returncode, r.stdout, r.stderr), r.stdout + r.stderr
     except Exception as exc:  # noqa: BLE001
-        out = f"failed to launch ccx: {exc}"
-    return d, out
+        return d, "failed", f"failed to launch ccx: {exc}"
 
 
 def frd_stress(frd_path, node):
@@ -86,13 +88,6 @@ def frd_stress(frd_path, node):
     return None
 
 
-def solved(out):
-    # ccx prints "Job finished" only on success; "*ERROR" is fatal. (Do NOT treat the
-    # per-iteration "no convergence" message as failure — it is normal in nonlinear
-    # solves that ultimately converge.)
-    return "Job finished" in out and "*ERROR" not in out
-
-
 def main():
     ccx, env = find_ccx()
     if not ccx:
@@ -107,34 +102,40 @@ def main():
     # --- NAFEMS LE10: run and check the benchmark stress -----------------------
     inp = os.path.join(tmp, "le10.inp")
     convert(os.path.join(EXAMPLES, "nle10_thickplate.inp"), inp)
-    d, out = run_ccx(ccx, env, inp)
-    if not solved(out):
-        print("FAIL  nle10_thickplate did not solve cleanly")
+    d, status, out = run_ccx(ccx, env, inp)
+    if status != "solved":
+        print(f"FAIL  nle10_thickplate did not solve cleanly ({status})")
         print("\n".join(l for l in out.splitlines() if "ERROR" in l or "convergence" in l.lower()))
         failures += 1
     else:
         s = frd_stress(os.path.join(d, "job.frd"), 4013)            # point D = (2,0,0.6)
         syy = s[1] / 1e6 if s else None
         ref = -5.38
-        ok = syy is not None and abs(syy - ref) / abs(ref) < 0.10
-        tag = "PASS" if ok else "FAIL"
-        print(f"{tag}  nle10_thickplate (NAFEMS LE10): SYY at point D = {syy:+.3f} MPa "
-              f"(reference {ref:+.2f} MPa, {abs(syy-ref)/abs(ref)*100:.1f}% diff)")
-        failures += 0 if ok else 1
+        if syy is None:
+            print("FAIL  nle10_thickplate: no stress result at point D (node 4013) in the .frd")
+            failures += 1
+        else:
+            ok = abs(syy - ref) / abs(ref) < 0.10
+            print(f"{'PASS' if ok else 'FAIL'}  nle10_thickplate (NAFEMS LE10): SYY at point D = "
+                  f"{syy:+.3f} MPa (reference {ref:+.2f} MPa, {abs(syy-ref)/abs(ref)*100:.1f}% diff)")
+            failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")
         convert(os.path.join(EXAMPLES, name + ".inp"), inp)
-        _, out = run_ccx(ccx, env, inp)
-        if solved(out):
+        d, status, out = run_ccx(ccx, env, inp)
+        shutil.rmtree(d, ignore_errors=True)
+        if status == "solved":
             print(f"PASS  {name}: accepted by ccx and solved")
         else:
-            print(f"FAIL  {name}: did not solve")
+            print(f"FAIL  {name}: did not solve ({status})")
             print("      " + " / ".join(l.strip() for l in out.splitlines()
                                         if "ERROR" in l or "convergence" in l.lower())[:200])
             failures += 1
 
+    shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'All checks passed.' if not failures else str(failures) + ' check(s) failed.'}")
     return 1 if failures else 0
 

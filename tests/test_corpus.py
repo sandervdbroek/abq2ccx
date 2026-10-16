@@ -19,7 +19,6 @@ run without network. The bundled ``examples/`` are exercised by ``test_convert.p
 """
 
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -68,30 +67,9 @@ def dangling(text):
         os.unlink(p)
 
 
-# What a crashing ccx prints after (or instead of) a clean finish.  The issue #3 deck
-# made unpatched ccx builds print "Job finished" and then abort in glibc's free().
-ABORT_SIGNS = ("free(): ", "double free", "malloc(): ", "corrupted size", "Aborted",
-               "Segmentation fault")
-STEP_RE = re.compile(r"^\s*STEP\s+\d+\s*$", re.M)
-
-
-def classify_ccx_run(returncode, stdout, stderr):
-    """Classify a finished ccx run:
-
-    * ``"solved"``   - exit 0, "Job finished", no ``*ERROR``, no crash/abort, and at
-                       least one analysis STEP executed;
-    * ``"accepted"`` - the same, but no STEP ran (a mesh-only deck ccx only parsed);
-    * ``"failed"``   - anything else, including a crash after "Job finished".
-
-    The per-iteration "no convergence" message is normal in nonlinear solves and is not
-    treated as failure; a run that really gives up prints ``*ERROR``."""
-    if returncode != 0 or "Job finished" not in stdout:
-        return "failed"
-    if "*ERROR" in stdout or "*ERROR" in stderr:
-        return "failed"
-    if any(s in stdout or s in stderr for s in ABORT_SIGNS):
-        return "failed"
-    return "solved" if STEP_RE.search(stdout) else "accepted"
+# The solve judge lives in abq2ccx.py so the corpus test, validate_with_ccx.py and the
+# CLI's --run all apply the same rules (exit code, crash messages, a STEP must run).
+classify_ccx_run = A.classify_ccx_run
 
 
 def run_ccx(ccx, env, text):

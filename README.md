@@ -59,9 +59,12 @@ FreeCAD-bundled copy, Homebrew/MacPorts) — or point at one with `--ccx`/`$CCX`
 
 **`--approximate` mode** reframes constructs CalculiX cannot run as *approximately
 equivalent* ones it can, each flagged with a loud `[APPROX]` warning: `*STATIC, RIKS` →
-plain `*STATIC`, `*DYNAMIC, EXPLICIT` → implicit `*DYNAMIC`, incompressible `ν ≥ 0.5` →
-`0.475`, `*BEAM SECTION, SECTION=I` → the RECT with equal area + strong-axis inertia.
-Off by default — nothing changes silently.
+plain `*STATIC`, incompressible `ν ≥ 0.5` → `0.475`, `*BEAM SECTION, SECTION=I` → the
+RECT with equal area + strong-axis inertia. Off by default — nothing changes silently: a
+Riks step is then commented out, because ccx would otherwise run it as an ordinary
+load-controlled static step without saying so. (`*DYNAMIC, EXPLICIT` needs no reframing:
+ccx integrates explicitly itself, and the converter adds the Abaqus/Explicit defaults ccx
+lacks — no increment cap, `NLGEOM` on.)
 
 Then run it in CalculiX (`ccx out`, no extension). The converter validates
 *structure and syntax*, not *physics* — **always read the report** (printed to
@@ -120,13 +123,13 @@ python corpus/fetch.py             # download the decks into corpus/files/ (giti
 python tests/test_corpus.py        # convert all + (if ccx present) solve them
 ```
 
-Results: **all 1022 convert with zero dangling references; 199 solve in CalculiX** (ccx
-exits 0, prints "Job finished" with no `*ERROR` or crash, and runs an analysis step), and
-**214 mesh-only decks** — no `*STEP`, so nothing to solve — are **accepted** by ccx.
-The other 609 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT,
-explicit dynamics, cohesive/connector elements, piezoelectric/acoustic coupling, other
-user subroutines) or are CAE part fragments / incomplete or invalid source decks — each verified to
-fail *no worse than the original, unconverted deck*. The converter never makes a deck
+Results (CalculiX 2.23, the FreeCAD 1.1.4 build): **all 1022 convert with zero dangling
+references; 215 solve in CalculiX** (ccx exits 0, prints "Job finished" with no `*ERROR` or
+crash, and runs an analysis step), and **219 mesh-only decks** — no `*STEP`, so nothing to
+solve — are **accepted** by ccx. The other 588 convert cleanly but use features ccx cannot
+run (user elements, UMAT/VUMAT and other user subroutines, Riks, cohesive/connector
+elements, piezoelectric/acoustic coupling) or are CAE part fragments / incomplete or
+invalid source decks — each verified to fail *no worse than the original, unconverted deck*. The converter never makes a deck
 worse than the original. Bulk-running every deck through convert → integrity → ccx (later
 waves gathered by parallel discovery agents across a dozen engineering domains; plus
 adversarial code reviews) surfaced and fixed real converter bugs — keyword-line
@@ -177,18 +180,28 @@ track the exact Abaqus↔CalculiX delta). The converter knows the complete **Cal
 | `*NGEN/*NFILL/*NCOPY/*ELGEN/*ELCOPY` | explicit `*NODE`/`*ELEMENT` | no mesh-generation in ccx |
 | `*PART/*INSTANCE/*ASSEMBLY` | flattened, one global numbering | instance transform applied; `inst.node`/`inst.set` resolved |
 | `*ELASTIC, ORTHOTROPIC/ANISOTROPIC` | `ORTHO`/`ANISO` | same constant order |
-| `*ORIENTATION` | `*ORIENTATION` | `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
+| `*ORIENTATION` | `*ORIENTATION` | origin `c` subtracted (axes `a−c`, `b−c`); `DEFINITION=NODES` resolved; `SPHERICAL` unsupported; rotation line kept (ccx ≥ ~2.15) |
 | `*DISTRIBUTION` | passed (solid-section only) | shells not supported by ccx |
-| `*SHELL SECTION, COMPOSITE` | S6/S8R; synth `*ORIENTATION` per ply angle | no inline ply angle in ccx |
-| `*STEP` | `NAME` dropped, `NLGEOM` on step, `PERTURBATION` only for freq/buckle, `*END STEP` added | |
+| `*SHELL SECTION, COMPOSITE` | S6/S8R; synth `*ORIENTATION` per ply angle | no inline ply angle in ccx; `SYMMETRIC` layups mirrored; on continuum shells (SC8R) → `*SOLID SECTION` |
+| `*STEP` | `NAME` dropped, `NLGEOM` on step, `AMPLITUDE=RAMP/STEP` kept, `PERTURBATION` only for freq/buckle, `*END STEP` added | explicit steps get `INC=10000000` + `NLGEOM` (Abaqus/Explicit defaults) |
 | `*BOUNDARY ENCASTRE/PINNED/*SYMM` | numeric DOFs | rotational DOFs only if shells/beams (`--solid-dof` to force 1-3) |
 | `*BOUNDARY, TYPE=VELOCITY/ACCEL` | `TYPE` dropped | ccx is displacement-only |
 | `*DLOAD, Px` | unchanged | solid face numbering matches Abaqus |
 | `*DSLOAD` (pressure) | `*DLOAD` with `Px` | ccx `*DSLOAD` is submodel-only; shells use `P` |
 | `*MPC, TIE` | per-DOF `*EQUATION` | `PLANE`/`STRAIGHT` kept |
-| `*KINEMATIC COUPLING` | `*RIGID BODY` | newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
+| `*KINEMATIC COUPLING` | node-surface `*COUPLING`+`*KINEMATIC` per DOF range | every data line kept; newer `*COUPLING`/`*KINEMATIC`/`*DISTRIBUTING` pass natively |
+| `*RIGID BODY` | explicit `ROT NODE` added | ccx ignores BCs/moments on DOFs 4–6 of the `REF NODE`; they are moved to the `ROT NODE`'s DOFs 1–3 |
+| `*CONTACT PAIR, TIED` | `*TIE` per surface pair | without `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; face-to-face suggested if ccx struggles) |
+| `*FRICTION` | `mu` only | ccx reads Abaqus' 2nd field (slip rate / mu_k) as its stick slope; `ROUGH` warned (no equivalent) |
+| `*PLASTIC, HARDENING=JOHNSON COOK` | native ccx Johnson-Cook + `*RATE DEPENDENT` | ccx switches JC on only with a rate card (C = 0 added if the deck has none); `HARDENING=USER` / Chaboche `PARAMETERS` commented (material runs elastic) |
+| `DEPENDENCIES=n` (field variables) | collapsed to field = 0 | ccx ignores field dependence and in effect uses the first row |
 | `*CREEP, LAW=STRAIN/TIME` | ccx Norton (default) | other laws → `LAW=USER` |
-| `*NODE/ELEMENT OUTPUT`, `*OUTPUT` | `*NODE FILE`/`*EL FILE` | `POSITION=` stripped, `FREQ`→`FREQUENCY` |
+| `*NODE/ELEMENT OUTPUT`, `*OUTPUT` | `*NODE FILE`/`*EL FILE` | `POSITION=`/`DIRECTIONS=` stripped, `FREQ`→`FREQUENCY` |
+| `*EL PRINT`/`*NODE PRINT` without a set | whole-model set added | Abaqus prints everything; ccx prints nothing |
+| output variables | ccx's own label lists per card | an unknown `*EL PRINT` label stops ccx; `*CONTACT OUTPUT` → `*CONTACT FILE` with `CDIS`/`CSTR` |
+| `*SURFACE` shell edges `E1..E4` | `S3..S6` | on ccx shells `S1`/`S2` are the faces |
+| `*AMPLITUDE, SCALEX/SCALEY` | scaled data points | ccx has no such parameters |
+| `INPUT=` on a data card | file contents inlined | ccx reads `INPUT=` only on `*INCLUDE` |
 | `*NSET, nset=X, ELSET=Y` | explicit `*NSET` of the elset's nodes | ccx has no NSET-from-ELSET |
 | `*SHELL GENERAL SECTION` | `*SHELL SECTION` | thickness+material form only; ABD/stiffness form has no equivalent |
 | `*TIE, TYPE=…, ADJUST=…` | `*TIE` (those params stripped) | ccx rejects them; master surface must be element-based |
@@ -282,12 +295,13 @@ converter warns about the ones it can detect; the rest are here so you know to c
 
 **It runs but the physics differs:**
 
-* **`NLGEOM` default** — Abaqus/Explicit defaults geometric nonlinearity **on**;
-  ccx `*STATIC` is linear unless `NLGEOM` is on the `*STEP`. Converting an explicit
-  deck to implicit static can silently drop large-displacement effects.
+* **`NLGEOM` default** — Abaqus/Explicit defaults geometric nonlinearity **on**,
+  ccx is linear unless `NLGEOM` is on the `*STEP`. The converter adds `NLGEOM` to
+  explicit steps; Abaqus/Standard steps are linear by default in both.
 * **Linear perturbation `*STATIC`** uses the base-state (tangent) stiffness in Abaqus;
   the converter maps it to a linear ccx `*STATIC`. Correct for small-strain elastic
-  perturbations — verify if the base state was nonlinear.
+  perturbations — verify if the base state was nonlinear. In ccx the step is a general
+  step, so its loads **persist** into later steps (warned when steps follow).
 * **`C3D8R` hourglassing** — ccx auto-enables hourglass control only from **v2.3**;
   for bending-dominated linear bricks prefer `C3D8I` or `C3D20R`.
 * **Shells/beams are expanded to 3-D internally** — use `*NODE FILE, OUTPUT=3D` to see
@@ -300,15 +314,22 @@ converter warns about the ones it can detect; the rest are here so you know to c
 
 ## Known limitations — review these
 
-* Contact (`*CONTACT PAIR`, `*SURFACE INTERACTION`) is passed through, not
-  translated — property syntax differs in ccx; verify.
-* Assembly flattening is best-effort; rotated instances do **not** rotate part
-  `*ORIENTATION` vectors.
+* Contact is translated card by card (`TYPE` default, `TIED` → `*TIE`, `*FRICTION` →
+  constant `mu`, hard pressure-overclosure synthesized) — ccx's penalty contact still
+  behaves differently from Abaqus; verify. A pair without `TYPE` gets Abaqus' default,
+  node-to-surface; some decks converge in ccx only with `TYPE=SURFACE TO SURFACE` instead.
+* Assembly flattening is best-effort. Part-level constraints (`*EQUATION`, `*MPC`,
+  `*RIGID BODY`, `*COUPLING`, …) are copied per instance; rotated instances rotate
+  `*ORIENTATION` axes, beam `n1` and `*NORMAL`, but not `*DISTRIBUTION` tables.
+* Rigid couplings (`*KINEMATIC`, `*RIGID BODY`) on **shell/beam nodes** are rejected by
+  ccx 2.23 (FreeCAD 1.1 build: `*ERROR in gen3dmpc … RIGID MPC`); ccx 2.22 accepts them.
+  The converter warns.
 * `*DISTRIBUTION` / variable-angle-tow orientation is solid-section-only in ccx.
 * Commented/unsupported cards (connectors, gaskets, cohesive, inertia relief,
   specialised materials/steps) must be remodelled by hand — the report tells you how.
 * The converter validates *structure*, not *physics*. Run `ccx` and sanity-check.
-* Targets CalculiX 2.22–2.23. `*DAMAGE INITIATION` (added in 2.23) is emitted; newer
+* Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written against 2.22–2.23.
+  `*DAMAGE INITIATION` (added in 2.23) is emitted; newer
   Abaqus 2024/2025 cards (`*STEP CYCLING`, `*PIEZORESISTIVITY`, `*ELECTRIC MACHINE …`,
   `*ALLOWABLE STRESS`, …) have no ccx equivalent and are commented with guidance.
   Solid/shell node ordering is verified identical to Abaqus (so connectivity is passed
@@ -337,6 +358,7 @@ invariant that every element substitution preserves node count).
 
 ## Sources
 
+* CalculiX CrunchiX User's Manual v2.23 — <https://www.dhondt.de/ccx_2.23.pdf>
 * CalculiX CrunchiX User's Manual v2.22 — <https://www.dhondt.de/ccx_2.22.pdf>
 * CalculiX CrunchiX User's Manual v2.7 (HTML) — <https://web.mit.edu/calculix_v2.7/CalculiX/ccx_2.7/doc/ccx/ccx.html>
 * `calculix/new_keywords` (Abaqus↔CalculiX keyword delta) — <https://github.com/calculix/new_keywords>

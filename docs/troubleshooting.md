@@ -56,14 +56,33 @@ Usually out of memory. Big models need a lot of RAM (rule of thumb from the foru
 
 These are the silent ones — no error, wrong physics.
 
-* **Geometric nonlinearity (`NLGEOM`) is off by default in a ccx `*STATIC`.** If your
-  Abaqus deck relied on Abaqus/Explicit's default (which is `NLGEOM=ON`), add `NLGEOM`
-  to the `*STEP`. The converter keeps `NLGEOM` when it's explicit in the source but
-  cannot infer the Explicit default.
+* **Geometric nonlinearity (`NLGEOM`) is off by default in ccx.** Abaqus/Standard is
+  the same, so a converted static step keeps its meaning. Abaqus/Explicit defaults to
+  `NLGEOM=ON`; the converter therefore adds `NLGEOM` (and a large `INC`) to every
+  `*DYNAMIC, EXPLICIT` step.
+* **A Riks step does not run.** ccx has no arc-length solver; passed through, it would
+  silently solve a load-controlled static step instead, so the converter comments the
+  `*STATIC, RIKS` card out and ccx stops at that step. `--approximate` accepts the
+  plain-static reframing explicitly.
 * **Linear perturbation vs general static.** A perturbation `*STATIC` uses the
   base-state stiffness in Abaqus; the converter maps it to a linear ccx `*STATIC`.
   Correct for small-strain elastic perturbations — verify if the base state was
-  nonlinear.
+  nonlinear. In ccx it is a general step, so its loads persist into later steps (the
+  converter warns when steps follow).
+* **A material quietly lost its plasticity.** ccx implements tabulated
+  isotropic/kinematic/combined hardening and Johnson-Cook, and silently skips any other
+  `*PLASTIC` card. Its Johnson-Cook law only switches on together with a `*RATE
+  DEPENDENT, TYPE=JOHNSON COOK` card — alone the material runs elastic — so the converter
+  adds a rate-independent one (C = 0) when the deck has none. `HARDENING=USER` and
+  Chaboche `DATATYPE=PARAMETERS` cards are commented out, so the report tells you when a
+  material now runs elastic.
+* **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=` and would use the
+  first table row; the converter keeps the Abaqus no-field state (field = 0) and warns.
+* **A rigid body's reference point ignores rotations.** ccx carries a `*RIGID BODY`'s
+  rotations on DOFs 1–3 of a separate `ROT NODE` and silently ignores BCs and moments on
+  DOFs 4–6 of the `REF NODE` (a moment there does nothing). The converter adds an explicit
+  `ROT NODE` and moves those BCs/moments onto it — keep that in mind when editing the
+  converted deck or reading reaction moments.
 * **`C3D8R` hourglassing.** CalculiX auto-enables hourglass control only from v2.3.
   For bending-dominated linear bricks prefer `C3D8I` or `C3D20R`. There is no
   artificial-energy output in ccx, so check a scaled deformed shape for hourglass modes.

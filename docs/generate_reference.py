@@ -27,33 +27,93 @@ TRANSLATED = {
     "*NGEN / *NFILL / *NCOPY / *ELGEN / *ELCOPY": "expanded into explicit `*NODE`/`*ELEMENT` "
         "(CalculiX has no mesh-generation cards).",
     "*PART / *INSTANCE / *ASSEMBLY": "flattened into one global numbering (instance transform "
-        "applied, references resolved, names kept ≤20 chars).",
-    "*ELASTIC": "`TYPE` token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`); data "
-        "passed through (constant order identical).",
-    "*ORIENTATION": "`DEFINITION` dropped; `SPHERICAL`→`RECTANGULAR` (warned); rotation line kept.",
+        "applied, references resolved, names kept ≤80 chars); part-level constraints (`*EQUATION`, "
+        "`*MPC`, `*RIGID BODY`, `*COUPLING`, ...) copied per instance; rotated instances rotate "
+        "`*ORIENTATION` axes, beam `n1` and `*NORMAL` vectors.",
+    "*ORIENTATION": "origin `c` of a 9-value line subtracted from `a`, `b` (ccx has no origin "
+        "field); `DEFINITION=NODES` resolved to coordinates, `OFFSET TO NODES` commented; "
+        "`SPHERICAL`→`RECTANGULAR` (warned); rotation line kept.",
     "*DISTRIBUTION": "passed through with a warning (ccx supports it on `*SOLID SECTION` only).",
-    "*SOLID SECTION": "keeps `ELSET`/`MATERIAL`/`ORIENTATION`; other params dropped.",
+    "*SOLID SECTION": "keeps `ELSET`/`MATERIAL`/`ORIENTATION`; other params dropped; an undefined "
+        "`MATERIAL` is warned (ccx 2.23 can segfault on it).",
     "*SHELL SECTION": "thickness only (integration-point count dropped); composite plies → one "
-        "synthesized `*ORIENTATION` per ply angle (S6/S8R only).",
+        "synthesized `*ORIENTATION` per ply angle (S6/S8R only), composed with a base rotation "
+        "about the normal; `SYMMETRIC` layups mirrored; on continuum shells (SC6R/SC8R, which "
+        "run as solids) → `*SOLID SECTION` (composite: commented).",
     "*SHELL GENERAL SECTION": "→ `*SHELL SECTION` (thickness+material form); ABD/stiffness form "
         "flagged as unsupported.",
     "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC` radius-vs-axes mismatch flagged.",
-    "*STEP": "`NAME` dropped; `NLGEOM` kept on the step; `PERTURBATION` kept only for "
-        "`*FREQUENCY`/`*BUCKLE`; `*END STEP` ensured.",
-    "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped.",
-    "*DLOAD": "passed through (`Px` faces match Abaqus); bare `P` on solids flagged.",
-    "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels.",
+    "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept; `PERTURBATION` kept "
+        "only for `*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then "
+        "persist); explicit steps get `INC=10000000` + `NLGEOM`; `*END STEP` ensured.",
+    "*STATIC": "`RIKS` commented by default (ccx would silently run it as plain static; "
+        "`--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
+    "*DYNAMIC": "implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; "
+        "`APPLICATION=QUASI-STATIC/MODERATE DISSIPATION` → `ALPHA=-0.3333` (and `*STEP "
+        "AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped.",
+    "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
+        "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes).",
+    "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
+        "accuracy/vectors/iterations.",
+    "*HEAT TRANSFER": "`END=` / `MXDEM` dropped.",
+    "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=` stripped; "
+        "DOFs 4-6 dropped on nodes of plane/axisymmetric elements (no rotations there; ccx 2.23 "
+        "crashes on them).",
+    "*DLOAD": "passed through (`Px` faces match Abaqus); bare `P` on solids flagged; `FOLLOWER=NO` / "
+        "`CONSTANT RESULTANT` dropped (warned under NLGEOM).",
+    "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels; same parameter handling as `*DLOAD`.",
     "*TIE": "Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept.",
     "*MPC": "`TIE` → per-DOF `*EQUATION`; `PLANE`/`STRAIGHT` kept; others commented.",
-    "*KINEMATIC COUPLING": "→ `*RIGID BODY` (all 6 DOFs).",
-    "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default); other laws → `LAW=USER`.",
-    "*AMPLITUDE": "keeps `NAME`/`TIME`; non-tabular `DEFINITION` flagged. (`*AMP` alias accepted.)",
+    "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
+        "(as Abaqus does unless `UNSORTED`).",
+    "*KINEMATIC COUPLING": "every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF "
+        "range (the reference node's DOFs 4-6 then take BCs and moments natively).",
+    "*COUPLING / *KINEMATIC": "`REF NODE` set → node number; empty `*KINEMATIC` → `1, 3`; DOFs > 3 "
+        "clamped; shell/beam nodes warned (ccx 2.23 rejects rigid MPCs there).",
+    "*RIGID BODY": "`PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node "
+        "number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs "
+        "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); shell/beam nodes warned.",
+    "*CLOAD": "moments on a rigid-body reference point → its `ROT NODE`; `ORIENTATION=` (local "
+        "axes) and `FOLLOWER=YES` dropped with a warning.",
+    "*CONTACT PAIR": "missing `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; the note "
+        "suggests `SURFACE TO SURFACE` if ccx struggles to converge); `TIED` → `*TIE`; `SMALL "
+        "SLIDING` dropped for surface-to-surface; Abaqus-only params dropped.",
+    "*SURFACE INTERACTION": "2D out-of-plane thickness line dropped; `*SURFACE BEHAVIOR, "
+        "PRESSURE-OVERCLOSURE=HARD` synthesized when missing (the Abaqus default).",
+    "*FRICTION": "only `mu` emitted (ccx would read Abaqus' slip-rate / mu_k field as its stick "
+        "slope); tables / exponential decay / anisotropy warned; `ROUGH` and `mu<=0` dropped.",
+    "*PLASTIC": "`HARDENING=JOHNSON COOK` kept (ccx's native law) and given the `*RATE "
+        "DEPENDENT, TYPE=JOHNSON COOK` card ccx needs to switch it on (C = 0 if the deck has "
+        "none); `HARDENING=USER` and `DATATYPE=PARAMETERS` commented (ccx would silently skip "
+        "them); `DEPENDENCIES` collapsed.",
+    "*ELASTIC / *DENSITY / *SPECIFIC HEAT / *CONDUCTIVITY / *EXPANSION / *MOHR COULOMB": "`TYPE` "
+        "token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`, same constant order); `DEPENDENCIES=n` (field variables, which ccx ignores) collapsed to the "
+        "Abaqus no-field state, field = 0.",
+    "*HYPERELASTIC": "no model keyword → `POLYNOMIAL` (Abaqus default); `TEST DATA INPUT` commented.",
+    "*DEPVAR": "SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx).",
+    "*INITIAL CONDITIONS": "`TYPE=STRESS/PLASTIC STRAIN/SOLUTION` expanded per integration point "
+        "(SOLUTION continuation lines joined by the `*DEPVAR` size); unknown types commented.",
+    "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for "
+        "strain hardening with m ≠ 0); other laws → `LAW=USER`.",
+    "*AMPLITUDE": "keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; "
+        "`SMOOTH STEP` sampled, `EQUALLY SPACED` expanded, `VALUE=ABSOLUTE` warned. (`*AMP` alias "
+        "accepted.)",
     "*RESTART": "keeps `WRITE`/`READ`/`FREQUENCY`/`STEP`; other params dropped.",
-    "*SURFACE": "passed through; `ANALYTICAL RIGID` commented; `SPOS`/`SNEG` flagged.",
+    "*SURFACE": "only `NAME`/`TYPE` kept; shell edges `E1..E4` → `S3..S6` (plane elements "
+        "`S1..S4`); `ANALYTICAL RIGID` / `COMBINE` commented; `SPOS`/`SNEG` flagged.",
     "*OUTPUT / *NODE OUTPUT / *ELEMENT OUTPUT": "→ `*NODE FILE`/`*EL FILE`; `*OUTPUT` wrapper "
         "dropped.",
-    "*NODE FILE / *EL FILE / *NODE PRINT / *EL PRINT": "`POSITION=` stripped, `FREQ`→`FREQUENCY`, "
-        "`FREQUENCY=0` dropped, variables mapped/filtered.",
+    "*NODE FILE / *EL FILE / *NODE PRINT / *EL PRINT": "`POSITION=`/`DIRECTIONS=` stripped, "
+        "`FREQ`→`FREQUENCY`, `FREQUENCY=0` dropped, variables mapped and filtered against ccx's "
+        "label list for that card (an unknown `*EL PRINT` label stops ccx); a print card "
+        "without a set gets a whole-model set (Abaqus prints everything, ccx nothing).",
+    "*CONTACT OUTPUT / *CONTACT FILE": "→ `*CONTACT FILE`; `CDISP`/`CSTRESS` kept as ccx's "
+        "`CDIS`/`CSTR`, other Abaqus contact variables dropped (a card left empty is dropped).",
+    "Step data outside a *STEP": "`*CLOAD`, `*DLOAD`, output and procedure cards before the first "
+        "step (or between steps) are commented — Abaqus rejects them and ccx 2.23 segfaults when "
+        "the deck has no step.",
+    "INPUT= on data cards": "the referenced file's data lines are inlined (ccx reads `INPUT=` "
+        "only on `*INCLUDE`).",
 }
 
 
@@ -93,7 +153,7 @@ def element_category(t):
 
 def element_status(t):
     if t in A.ELEMENT_TYPE_MAP:
-        return f"→ `{A.ELEMENT_TYPE_MAP[t]}` (substituted)"
+        return f"→ `{A.ccx_element_type(t, A.Report())}` (substituted)"
     if t in A.CCX_ELEMENTS:
         return "direct"
     if t.endswith("H") and t[:-1] in A.CCX_ELEMENTS:
@@ -128,11 +188,16 @@ def gen_keywords():
                "ELCOPY", "ELASTIC", "ORIENTATION", "DISTRIBUTION", "SOLID SECTION", "SHELL SECTION",
                "BEAM SECTION", "STEP", "END STEP", "BOUNDARY", "DLOAD", "DSLOAD", "TIE", "MPC",
                "CREEP", "AMPLITUDE", "RESTART", "SURFACE", "OUTPUT", "NODE OUTPUT", "ELEMENT OUTPUT",
-               "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT"}
+               "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "STATIC", "DYNAMIC", "FREQUENCY",
+               "BUCKLE", "HEAT TRANSFER", "EQUATION", "COUPLING", "KINEMATIC", "RIGID BODY",
+               "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
+               "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
+               "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
+               "CONTACT OUTPUT", "CONTACT FILE"}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",
-             "How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.22 "
+             "How each Abaqus keyword is handled. The converter knows the complete CalculiX 2.22 + 2.23 "
              f"keyword set (**{len(A.CCX_KEYWORDS)}** cards). Anything in that set is emitted as-is; "
              "anything outside it without a translator is commented out with guidance — never "
              "silently dropped.\n",

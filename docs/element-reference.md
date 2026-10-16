@@ -4,7 +4,7 @@
 
 Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged.
 
-Direct CalculiX types: **68**. Total recognised: **148**.
+Direct CalculiX types: **68**. Total recognised: **156**.
 
 ## 3D continuum
 
@@ -66,7 +66,7 @@ Direct CalculiX types: **68**. Total recognised: **148**.
 | `B21` | 2 | direct |
 | `B21H` | 2 | → `B21` (substituted) |
 | `B22` | 3 | → `B32` (substituted) |
-| `B23` | 2 | → `B33` (substituted) |
+| `B23` | 2 | → `B31` (substituted) |
 | `B31` | 2 | direct |
 | `B31H` | 2 | → `B31` (substituted) |
 | `B31R` | 2 | direct |
@@ -80,7 +80,7 @@ Direct CalculiX types: **68**. Total recognised: **148**.
 | `PIPE31` | 2 | → `B31` (substituted) |
 | `PIPE32` | 3 | → `B32` (substituted) |
 | `T2D2` | 2 | direct |
-| `T2D3` | 3 | passed through (verify) |
+| `T2D3` | 3 | → `T3D3` (substituted) |
 | `T3D2` | 2 | direct |
 | `T3D3` | 3 | direct |
 
@@ -88,10 +88,10 @@ Direct CalculiX types: **68**. Total recognised: **148**.
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `COH2D4` | 4 | flagged — no ccx equivalent |
-| `COH3D6` | 6 | flagged — no ccx equivalent |
-| `COH3D8` | 8 | flagged — no ccx equivalent |
-| `COHAX4` | 4 | flagged — no ccx equivalent |
+| `COH2D4` | 4 | → `CPE4` (substituted) |
+| `COH3D6` | 6 | → `C3D6` (substituted) |
+| `COH3D8` | 8 | → `C3D8` (substituted) |
+| `COHAX4` | 4 | → `CAX4` (substituted) |
 
 ## connector
 
@@ -171,6 +171,19 @@ Direct CalculiX types: **68**. Total recognised: **148**.
 | `M3D8R` | 8 | direct |
 | `M3D9` | 9 | passed through (verify) |
 | `M3D9R` | 9 | passed through (verify) |
+
+## other
+
+| Abaqus type | Nodes | CalculiX |
+| --- | --- | --- |
+| `GK2D4` | 4 | → `CPE4` (substituted) |
+| `GK2D6` | 6 | flagged — no ccx equivalent |
+| `GK3D6` | 6 | → `C3D6` (substituted) |
+| `GK3D8` | 8 | → `C3D8` (substituted) |
+| `GKAX4` | 4 | → `CAX4` (substituted) |
+| `GKAX6` | 6 | flagged — no ccx equivalent |
+| `GKPS4` | 4 | → `CPS4` (substituted) |
+| `GKPS6` | 6 | flagged — no ccx equivalent |
 
 ## plane strain
 

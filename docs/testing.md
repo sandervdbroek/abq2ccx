@@ -19,7 +19,7 @@ python tests/test_corpus.py      # 3b. corpus convert + (if ccx) solve
 Every layer skips cleanly when its prerequisite (CalculiX, or a fetched corpus) is
 absent, so `python tests/test_convert.py` always runs offline.
 
-## 1. Unit tests — `tests/test_convert.py` (70)
+## 1. Unit tests — `tests/test_convert.py` (114)
 
 Small inline decks (`convert_str(...)`) and the bundled `examples/`, asserting exact
 conversion behaviour and referential integrity.
@@ -57,7 +57,7 @@ conversion behaviour and referential integrity.
 | `test_descending_set_emits_ascending_generate` | a descending set run emits a valid ascending `GENERATE` (not the ccx-invalid `5, 1, -1`) and still resolves to all members |
 | `test_string_parameter_substitution` | a string-valued `*PARAMETER` (`eltype="CPS4"`) substitutes unquoted, so `type=<eltype>` emits `TYPE=CPS4` (not the ccx-rejected `TYPE="CPS4"`) |
 | `test_node_surface_drops_weight` | a node-based `*SURFACE` line (`NS, 1.`) drops the Abaqus weight to one entry per line |
-| `test_contact_pair_default_type` | `*CONTACT PAIR` gets the required `TYPE=SURFACE TO SURFACE` (Abaqus default) and Abaqus-only params are dropped |
+| `test_contact_pair_default_type` | `*CONTACT PAIR` gets the required `TYPE=NODE TO SURFACE` (the Abaqus/Standard default; the note suggests face-to-face if ccx struggles) and Abaqus-only params are dropped |
 | `test_rigid_body_pin_nset_mapped` | `*RIGID BODY, PIN NSET=…` maps to ccx's `NSET=…` |
 | `test_generate_malformed_token_no_crash` | a non-integer field in a `GENERATE` record skips that record instead of aborting the conversion |
 | `test_instance_qualified_set_param_resolved` | instance-qualified set names in keyword **parameters** (`*EL PRINT, ELSET=I.body`) resolve to the flattened global set |
@@ -91,11 +91,55 @@ conversion behaviour and referential integrity.
 | `test_combined_suffix_element_resolves` | combined suffixes resolve (`C3D8PT→C3D8`, `C3D20RHT→C3D20R`) |
 | `test_initial_stress_expanded_to_integration_points` | `*INITIAL CONDITIONS, TYPE=STRESS` on an elset expands to one line per element and integration point |
 | `test_initial_stress_geostatic_commented` | a `GEOSTATIC` initial stress (no ccx equivalent) is commented with guidance |
-| `test_approximate_riks_and_default_off` | `--approximate` turns `*STATIC, RIKS` into plain `*STATIC`; without the flag the card is kept and points at the flag |
-| `test_approximate_explicit_to_implicit` | `--approximate` turns `*DYNAMIC, EXPLICIT` into implicit `*DYNAMIC` with a period/1000 initial increment |
+| `test_approximate_riks_and_default_off` | without the flag `*STATIC, RIKS` is commented out (ccx would silently run plain static) and points at the flag; `--approximate` turns it into plain `*STATIC` |
+| `test_explicit_dynamics_native` | `*DYNAMIC, EXPLICIT` is kept in both modes (ccx integrates explicitly), Abaqus/Explicit-only controls dropped, and the step gets `INC=10000000` + `NLGEOM` |
 | `test_approximate_nu_clamp` | `--approximate` clamps ν ≥ 0.5 to 0.475; without the flag ν is untouched |
 | `test_approximate_ibeam_to_rect` | `--approximate` replaces an I-profile with the RECT of equal area and strong-axis inertia |
 | `test_nonpositive_node_number_warns` | a mesh numbered from node 0 (invalid Abaqus input, issue #3) is flagged; a positive-numbered one is not |
+| `test_history_card_outside_step_commented` | step data (`*CLOAD`) before any `*STEP` is commented out with the reason; model-data `*BOUNDARY` stays |
+| `test_undefined_material_warns` | a section naming an undefined material is warned (with the defined names); a valid deck is not |
+| `test_plane_node_rotational_bc_dropped` | DOFs 4–6 on plane-element nodes are dropped (`L,6,6` gone, `L,1,6`→`L,1,3`); shell nodes keep `1,6` |
+| `test_rigid_coupling_on_shell_nodes_warns` | a `*KINEMATIC` coupling on shell nodes warns about ccx 2.23's RIGID-MPC error; a solid-node `*RIGID BODY` does not |
+| `test_plastic_hardening_forms` | Johnson-Cook kept native and given the `*RATE DEPENDENT` card ccx needs (C = 0 unless the deck has one); `HARDENING=USER` and Chaboche `PARAMETERS` commented; tabular hardening untouched |
+| `test_field_dependencies_collapsed` | `DEPENDENCIES=1` collapsed to field = 0: interpolated `*ELASTIC` (E = 115500), the f = 0 `*PLASTIC` curve, the nearest `*DENSITY` row |
+| `test_depvar_delete_and_labels` | `*DEPVAR` keeps the count, drops label lines and warns on `DELETE=` |
+| `test_print_cards_without_set_get_whole_model_sets` | `*EL PRINT`/`*NODE PRINT` without a set get the synthesized whole-model sets |
+| `test_step_amplitude_kept_and_quasi_static_ramp` | `*STEP, AMP=STEP` → `AMPLITUDE=STEP`; quasi-static `*DYNAMIC` gets `AMPLITUDE=RAMP` and `ALPHA=-0.3333` |
+| `test_friction_keeps_only_mu` | `*FRICTION` emits only `mu` (exponential decay, slip tolerance); `ROUGH` is dropped with a frictionless warning |
+| `test_contact_pair_tied_becomes_tie` | `*CONTACT PAIR, TIED` → `*TIE` (with `ADJUST` as position tolerance) |
+| `test_composite_symmetric_and_base_rotation` | `SYMMETRIC` layups are mirrored; a ply angle composes with the base orientation's normal rotation (45 + 90 = 135) |
+| `test_shell_edge_faces_map_to_s3_s6` | shell edges `E1..E4` → `S3..S6`; plane-element edges keep `S1..S4` |
+| `test_amplitude_scaling_applied` | `SCALEX`/`SCALEY` are applied to the data; `VALUE=ABSOLUTE` warns |
+| `test_kinematic_coupling_keeps_every_line` | `*KINEMATIC COUPLING` keeps every line as node-surface `*COUPLING` + `*KINEMATIC` per DOF range (all DOFs on solid nodes → one `1, 3` coupling, no clamp warning) |
+| `test_orientation_origin_and_node_definition` | an `*ORIENTATION` origin is subtracted; `DEFINITION=NODES` resolves to coordinates |
+| `test_equation_node_sets_pair_in_sorted_order` | set-based `*EQUATION` pairs nodes in sorted order, as Abaqus does |
+| `test_perturbation_static_before_general_step_warns` | a static perturbation step followed by another step warns that its loads persist; a final one does not |
+| `test_eigen_data_line_layouts` | `EIGENSOLVER=SUBSPACE` max frequency blanked; Lanczos `*BUCKLE` range fields blanked; a blank mode count with a range gets a count (ccx needs one) |
+| `test_dsload_follower_warns_under_nlgeom` | `FOLLOWER=NO` warns only under NLGEOM |
+| `test_creep_strain_hardening_warns` | default (strain-hardening) `*CREEP` with m ≠ 0 warns about ccx's time hardening; m = 0 does not |
+| `test_rigid_body_pin_and_tie_sets_united` | `PIN NSET` + `TIE NSET` together become one union `NSET` |
+| `test_initial_solution_continuation_lines` | `TYPE=SOLUTION` records with more than 7 SDVs are joined by the `*DEPVAR` size, not split into phantom records |
+| `test_keyword_continuation_with_bare_flag` | `*STEP, NAME=S1,` + `NLGEOM` on the next line keeps `NLGEOM` |
+| `test_mesh_generation_curves_bias_and_reflect` | `*NGEN, LINE=C` lands on the arc, `*NFILL, BIAS` grades the intervals, `*NCOPY, REFLECT=LINE` with one data line works |
+| `test_input_data_file_inlined` | `*NODE, INPUT=file` data lines are inlined |
+| `test_parameter_table_not_swallowed` | `*PARAMETER TABLE` is not treated as `*PARAMETER` (it is commented, later cards survive) |
+| `test_element_and_material_defaults` | `B23` → `B33` → `B31` (map applied recursively); bare `*HYPERELASTIC` → `POLYNOMIAL` |
+| `test_continuum_shell_section_becomes_solid` | `*SHELL SECTION` on SC8R elements → `*SOLID SECTION` |
+| `test_part_level_constraints_replicated_per_instance` | a part-level `*EQUATION` is emitted once per instance with offset node ids |
+| `test_surface_interaction_thickness_line_dropped` | the 2D out-of-plane thickness line of `*SURFACE INTERACTION` is dropped |
+| `test_load_case_superposition_warned` | `*LOAD CASE` warns that ccx superposes the load cases |
+| `test_abaqus_output_filter_commented` | an Abaqus output `*FILTER` is commented out (ccx's `*FILTER` is a sensitivity card) |
+| `test_surface_undefined_set_warns` | a `*SURFACE` member set the deck never defines is warned |
+| `test_rigid_body_reference_rotations_go_to_rot_node` | a `*RIGID BODY` gets an explicit `ROT NODE`; `ENCASTRE` and moments on the reference point reach its DOFs 1–3 (ccx ignores DOFs 4–6 of the REF NODE) |
+| `test_el_print_unknown_labels_dropped` | unknown `*EL PRINT` labels (fatal in ccx) are dropped; a card left empty is dropped |
+| `test_contact_output_maps_to_ccx_labels` | `*CONTACT OUTPUT` → `*CONTACT FILE` with `CDIS`/`CSTR`; names ccx doesn't know (`CPRESS`, `CFORCE`) are dropped, and a card left empty is dropped |
+| `test_cload_orientation_warned` | `*CLOAD, ORIENTATION=` (local load axes) is warned |
+| `test_blankless_keywords_recognised` | blank-less keywords (`*SOLIDSECTION`, `*ELPRINT`, `*ENDSTEP`) are recognised as ccx does |
+| `test_frequency_storage_for_later_modal_step` | `*FREQUENCY` gets `STORAGE=YES` when a later modal/steady-state step needs its eigenmodes |
+| `test_initial_temperature_defaults_uncovered_nodes_to_zero` | nodes an initial-temperature card doesn't list get Abaqus' default 0 (ccx stops otherwise) |
+| `test_plane_section_blank_thickness_defaults_to_one` | a blank plane-element thickness becomes Abaqus' default 1.0 |
+| `test_cyclic_hardening_needs_combined_plastic` | `*CYCLIC HARDENING` without a kept `COMBINED` `*PLASTIC`, or in `PARAMETERS` form, is commented out |
+| `test_boundary_on_undefined_set_warns` | a BC on an undefined node set (or on a surface name) is warned |
 
 ## 2. End-to-end validation — `validate_with_ccx.py`
 
@@ -137,13 +181,39 @@ deck and runs it in CalculiX:
 
   Run standalone (`python tests/test_corpus.py`) it prints a per-deck table.
 
-**Results:** all 1022 convert with zero dangling references; **199 solve** in CalculiX
-and **214 mesh-only decks are accepted** by it. The other 609 convert cleanly but use
-features ccx cannot run (user elements, UMAT/VUMAT, explicit dynamics, cohesive/connector
-elements, piezoelectric/acoustic coupling, other user subroutines) or are CAE part
-fragments / incomplete or invalid source decks (e.g. externally-supplied `<parameter>`
-values, or nodes numbered from 0) — and each was verified to fail *no worse than the
-original, unconverted deck*.
+**Results** (CalculiX 2.23, the FreeCAD 1.1.4 build): all 1022 convert with zero dangling
+references; **215 solve** in CalculiX and **219 mesh-only decks are accepted** by it. The
+other 588 convert cleanly but use features ccx cannot run (user elements, UMAT/VUMAT and
+other user subroutines, Riks, cohesive/connector elements, piezoelectric/acoustic
+coupling) or are CAE part fragments / incomplete or invalid source decks (e.g.
+externally-supplied `<parameter>` values, or nodes numbered from 0) — and each was
+verified to fail *no worse than the original, unconverted deck*.
+
+**The ccx 2.23 audit (October 2026).** FreeCAD 1.1.4 moved from ccx 2.22 to 2.23, which is
+stricter about invalid input. A full re-run of the corpus on 2.23 — recording every ccx
+`*WARNING`, crash and result file, not just the judge's verdict — plus a handler-by-handler
+review for silent drops found three kinds of problem, all fixed in the converter:
+
+* **inputs that crash ccx 2.23** (segfault / bus error instead of an `*ERROR`): step data
+  before any `*STEP`, an undefined material on a plane-element section, rotation BCs on
+  plane-element nodes, an unknown `*EL PRINT` label;
+* **places where ccx quietly runs a different model** — the expensive kind, because the
+  run "succeeds": ccx ignores rotations on a `*RIGID BODY` reference node (a moment there
+  did nothing), runs a Riks step as plain static, skips `HARDENING=USER` plasticity and
+  switches its own Johnson-Cook law on only with a `*RATE DEPENDENT` card, ignores
+  field-variable `DEPENDENCIES`, reads Abaqus' slip-rate column as the friction stick
+  slope, drops a `TIED` contact pair (bodies separate), uses shell faces for Abaqus shell
+  *edges*, halves a `SYMMETRIC` layup, and loses part-level constraints of all but one
+  instance;
+* **wrong claims in the converter's own messages** — e.g. that ccx has no explicit solver
+  (it has; explicit decks now run natively) or rejects `*STEP AMPLITUDE=` (it supports it).
+
+Net on 2.23: 199 → 215 solving and 214 → 219 accepted. Four decks lost their gate on
+purpose — a Riks deck (now commented out instead of silently run as static), a shell model
+whose rigid coupling 2.23 rejects, and two VCCT decks whose remaining contact (Abaqus'
+default node-to-surface) does not converge once the unsupported bonded start is gone. Two
+decks that solve stay ungated: one is nondeterministic (ccx's built-in `utemp` stub segfaults
+about 1 run in 6), one takes ~260 s.
 
 Until issue #3 the judge only looked for "Job finished" on stdout, so it counted
 mesh-only decks (which ccx merely parses) as solved and would have missed a crash after

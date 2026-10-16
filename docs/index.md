@@ -37,7 +37,7 @@ python docs/generate_reference.py
 ## At a glance
 
 * One dependency-free Python 3 script; no install.
-* Knows the complete CalculiX 2.22 keyword set; supported cards pass through,
+* Knows the complete CalculiX 2.22 + 2.23 keyword set; supported cards pass through,
   unsupported ones are converted to an equivalent or commented with guidance — never
   silently dropped.
 * Expands mesh-generation cards (`*NCOPY`/`*ELGEN`/…) and flattens

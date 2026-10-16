@@ -9,7 +9,6 @@ How Abaqus field/history output identifiers map to CalculiX `*NODE FILE` / `*EL 
 | Abaqus | CalculiX |
 | --- | --- |
 | `CEEQ` | `PEEQ` |
-| `CELENT` | `EVOL` |
 | `EE` | `ME` |
 | `LE` | `E` |
 | `NE11` | `E` |
@@ -23,8 +22,8 @@ How Abaqus field/history output identifiers map to CalculiX `*NODE FILE` / `*EL 
 
 ## Dropped — no CalculiX equivalent (derive in post-processing)
 
-`A`, `AENER`, `AREA`, `AT`, `CDISP`, `CF`, `CFORCE`, `COORD`, `CSTRESS`, `CTF`, `ELEN`, `IE`, `MISES`, `NE`, `NFLUX`, `NFORC`, `PRESS`, `RBFOR`, `SE`, `SF`, `SM`, `STATUS`, `STH`, `TRESC`, `VENER`
+`A`, `AENER`, `AREA`, `AT`, `CDISP`, `CELENT`, `CF`, `CFORCE`, `COORD`, `CSTRESS`, `CTF`, `DAMAGEC`, `DAMAGEFC`, `DAMAGEFT`, `DAMAGEMC`, `DAMAGEMT`, `DAMAGESHR`, `DAMAGET`, `DMICRT`, `ELEDEN`, `ELEN`, `EPDDEN`, `ESEDEN`, `EVF`, `EVOLAVG`, `IE`, `LODE`, `MISES`, `MMIXDME`, `NE`, `NFLUX`, `NFORC`, `PEEQVAVG`, `PEVAVG`, `PHILSM`, `PRESS`, `PSILSM`, `RBFOR`, `SDEG`, `SE`, `SF`, `SM`, `STATUS`, `STATUSXFEM`, `STH`, `SVAVG`, `TEMP`, `TRESC`, `TRIAX`, `VENER`
 
 ## Valid only on `*EL PRINT` / `*NODE PRINT` (.dat)
 
-Dropped from `*EL FILE`/`*NODE FILE` (.frd): `CELS`, `COORD`, `ELKE`, `ELSE`, `EVOL`.
+Dropped from `*EL FILE`/`*NODE FILE` (.frd): `CELS`, `ELKE`, `ELSE`, `EVOL`.
