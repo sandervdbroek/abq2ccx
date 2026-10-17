@@ -1,0 +1,51 @@
+*Heading
+Simply supported planar beam on two B22 elements: mid-span load, frequency, Euler buckling
+** L = 1000, RECT section 20 (out of plane, local 1) x 40 (in plane, local 2), E = 210000,
+** nu = 0.3, rho = 7.85e-9 (the beam of planar_pinned_beam.inp).  Abaqus integrates its
+** quadratic beams at 2 points along the beam, which makes this mesh exact for the mid-span
+** load: P L^3 / (48 E I) + P L / (4 k G A) = 0.9346 (k = 0.85).  Beam theory: f1 = pi /
+** (2 L^2) sqrt(E I / (rho A)) = 93.81 Hz, P = pi^2 E I / L^2 = 221079.  ccx 2.23 as B32R (2
+** points, as abq2ccx writes it): 0.9985 of the deflection, f1 and P 1.3 % and 1.1 % high; as
+** B32 (3 points): 0.76 of the deflection, f1 10.6 % and P 20.8 % high.
+*Node
+1, 0., 0.
+2, 250., 0.
+3, 500., 0.
+4, 750., 0.
+5, 1000., 0.
+*Element, type=B22, elset=BEAM
+1, 1, 2, 3
+2, 3, 4, 5
+*Nset, nset=PIN
+1
+*Nset, nset=MID
+3
+*Nset, nset=ROLLER
+5
+*Beam Section, elset=BEAM, material=STEEL, section=RECT
+20., 40.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Density
+7.85e-9
+*Boundary
+PIN, 1, 2
+ROLLER, 2, 2
+*Step
+*Frequency
+2
+*End Step
+*Step
+*Buckle
+2
+*Cload
+ROLLER, 1, -1.
+*End Step
+*Step
+*Static
+*Cload, op=NEW
+MID, 2, -1000.
+*Node Print, nset=MID
+U
+*End Step

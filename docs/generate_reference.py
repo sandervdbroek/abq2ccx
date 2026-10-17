@@ -589,19 +589,21 @@ def gen_elements():
                          "CYLINDER / REVOLUTION`) are meshed into the same skins — see the keyword "
                          "reference.\n")
         if cat == "beam / truss":
-            pairs = ", ".join(f"`{a}` → `{b}`" for a, b in A.CIRC_QUADRATIC.items())
-            parts.append("Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is "
-                         f"{pairs} become 3-node beams: ccx 2.23 rejects linear beams with a "
-                         "circular section. Each element gets a new midside node at the midpoint of "
-                         "its end nodes (ccx's order is end, middle, end); element ids and sets are "
-                         "kept, and BCs, temperatures and initial conditions given for both end "
-                         "nodes also reach the midside node. The 3-node beam is a different element "
-                         "than Abaqus' 2-node one, so such a deck counts as reduced physics.\n")
-            b32r = ", ".join(f"`{a}`" for a in A.PIPE_BOX_B32R)
-            parts.append("Under `SECTION=PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), which ccx "
-                         f"2.23 runs only on `B32R`, beams whose emitted type is {b32r} become `B32R`: "
-                         "the 2-node ones get a midside node in the same way, and `B32` only changes "
-                         "type.\n")
+            parts.append(f"Every 3-node beam runs as ccx's `{A.QUADRATIC_BEAM}`, the 20-node brick "
+                         "integrated at 2 × 2 × 2 points: 2 along the beam, as Abaqus integrates its "
+                         "quadratic beams (`B22`, `B32`, `PIPE22`, `PIPE32`). ccx's `B32` integrates at "
+                         "3 × 3 × 3 and locks on coarse meshes (a cantilever's tip deflection under an "
+                         "end load: 0.77 of beam theory on one element, 0.95 on two; exact on any "
+                         f"number of `{A.QUADRATIC_BEAM}`).\n")
+            pairs = ", ".join(f"`{a}` → `{b}`" for a, b in A.QUADRATIC_UPGRADE.items())
+            parts.append("Under a `*BEAM SECTION, SECTION=CIRC`, `PIPE`, `BOX` or `THICK PIPE` (emitted "
+                         f"as `PIPE`), 2-node beams whose emitted type is {pairs} become 3-node beams: "
+                         "ccx 2.23 rejects linear beams with a circular section and runs `PIPE` and "
+                         "`BOX` sections only on `B32R`. Each element gets a new midside node at the "
+                         "midpoint of its end nodes (ccx's order is end, middle, end); element ids and "
+                         "sets are kept, and BCs, temperatures and initial conditions given for both "
+                         "end nodes also reach the midside node. The 3-node beam is a different "
+                         "element than Abaqus' 2-node one, so such a deck counts as reduced physics.\n")
             planar = ", ".join(f"`{t}`" for t in sorted(A.PLANAR_LINE_TYPES))
             parts.append("ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as "
                          f"`T3D2` — so the out-of-plane DOFs of {planar} (and their `H`/`T` variants) "

@@ -121,10 +121,10 @@ physics**; 45 more solve but stay out of that count — 14 load nothing in the s
 (3 of them also unloaded) solve a model with reduced physics, and one converges to a solution
 that is not the deck's (a part that only contact holds drifts away in ccx) — and 221 mesh-only
 decks are accepted. The other 597 need what ccx cannot run — mostly user materials (353) and
-user elements (66). **26 benchmark decks are checked against their published answer**: 19
+user elements (66). **26 benchmark decks are checked against their published answer**: 20
 match Abaqus' result for the same mesh (within 0.5 % for temperatures and frequencies, 1 % for
-stresses and displacements), 7 differ for reasons traced to ccx (its nodal extrapolation,
-plane-stress slab, film integration, mass matrices, coarse shell and beam meshes). See
+stresses and displacements), 6 differ for reasons traced to ccx (its nodal extrapolation,
+plane-stress slab, film integration, mass matrices, a coarse shell mesh, beam clamps). See
 [testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md#published-answers).
 
 ## How it works
@@ -180,11 +180,12 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`composite_plate_s4r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_plate_s4r.inp), [`composite_plate_sc8r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_plate_sc8r.inp) | a simply supported cross-ply plate: composite `S4R` → `S8R`; composite `SC8R` → one `C3D8I` per ply |
 | [`composite_inplane_s4r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_inplane_s4r.inp), [`composite_inplane_sc8r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_inplane_sc8r.inp) | an angle-ply laminate's in-plane stiffness; BCs interpolated onto the new nodes |
 | [`assembly_two_blocks`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/assembly_two_blocks.inp) | two-instance assembly, an `instance.node` reference in a step |
-| [`beam_circ_cantilever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters |
+| [`beam_circ_cantilever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32R` with midside nodes, radius → diameters |
 | [`beam_pipe_box_cantilever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` and `B32` + `SECTION=BOX` → `B32R` |
 | [`beam_circ_rotation_bcs`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_circ_rotation_bcs.inp) | circular-section beams with a held twist and a prescribed rotation → knot beams |
 | [`beam_circ_explicit`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_circ_explicit.inp) | a circular-section beam in `*DYNAMIC, EXPLICIT` → a maximum time increment |
 | [`planar_pinned_beam`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/planar_pinned_beam.inp), [`planar_pinned_circ_beam`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/planar_pinned_circ_beam.inp) | planar `B21` beams in `*FREQUENCY` + `*BUCKLE` → planar constraint |
+| [`planar_b22_two_elements`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/planar_b22_two_elements.inp) | two `B22` → `B32R`, integrated along the beam as Abaqus does |
 | [`beam_line_load_cantilever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_line_load_cantilever.inp) | `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and a `CIRC` beam → nodal forces |
 | [`beam_output_requests`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_output_requests.inp) | output at `B32` nodes → `OUTPUT=2D`, `*NODE PRINT`, `*TIME POINTS` |
 | [`coupling_shell_plate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/coupling_shell_plate.inp), [`coupling_solid_plate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/coupling_solid_plate.inp) | a rigid coupling on `S8R` nodes (knot beams) and its `C3D20R` reference |

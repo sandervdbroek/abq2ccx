@@ -4,6 +4,17 @@ Corpus counts are on the CalculiX version current at the time; from October 2026
 counts only decks that solve their own problem: under their own loads, without reduced
 physics.
 
+## Unreleased
+
+* **Quadratic beams** — every 3-node beam (Abaqus' `B22`, `B32`, `PIPE22`, `PIPE32`, and the
+  2-node beams that circular, pipe and box sections need upgraded) runs as ccx's `B32R`,
+  integrated at 2 points along the beam as Abaqus integrates its quadratic beams, instead of
+  `B32` (3 points), which locks on coarse meshes: NAFEMS NL6 on its own 8 elements now gives
+  Abaqus' answer (was 10 % off), FV2's frequencies come within 2.7 % of it (were 22 % off).
+  A note covers `B32R`'s 50 `*EL PRINT` rows per `RECT`/`CIRC` element (the `--run` digest
+  reads the 8 real ones) and its convergence on coarse members in 3-D `NLGEOM` steps.
+  Published answers: 20 of 26 match Abaqus, 6 differ for a reason traced to ccx.
+
 ## 1.2.1 (October 2026)
 
 * **The output file as the second argument** — `abq2ccx deck.inp out.inp` converts into

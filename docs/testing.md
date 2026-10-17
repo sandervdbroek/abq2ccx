@@ -72,12 +72,13 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | --- | --- | --- | --- |
 | `nle10_thickplate` | NAFEMS LE10 σyy at point D | published −5.38 MPa | −5.650 MPa, 5 % (element and mesh) |
 | `nle10_surface_elements` | the same pressure on an `SFM3D8` skin (`*DSLOAD P` on `SPOS`, element `P`, `TRVEC`) | the face-pressure result | 7 digits |
-| `beam_circ_cantilever`, `beam_pipe_box_cantilever` | tip deflection of `CIRC`, `PIPE` and `BOX` cantilevers | P L³ / 3 E I | ≤ 0.6 % |
+| `beam_circ_cantilever`, `beam_pipe_box_cantilever` | tip deflection of `CIRC`, `PIPE` and `BOX` cantilevers | P L³ / 3 E I | ≤ 1.0 % |
 | `beam_u1_general`, `beam_u1_ibeam`, `beam_u1_unsymmetric_i`, `beam_u1_hex`, `beam_u1_portal` | `U1` beams: a general section with I12 ≠ 0 (tip forces along y and z, a torque, frequencies), an I-section in space (`--approximate`; against the `RECT` it would otherwise get: weak axis 68× too flexible), the unsymmetric I and hexagonal-tube cantilevers of Abaqus' Verification Guide, a planar I-section portal frame under gravity, a line load and a lateral load | unsymmetric bending theory, T L / G J, Euler–Bernoulli frequencies; Abaqus' reference values (0.8931, 1.786e-2; 0.3489, 6.978e-3); the direct-stiffness frame | 1e-6 statics (the frame 2e-7); frequencies ≤ 0.5 % (rotary inertia) |
 | `beam_general_rect`, `beam_general_rect_nl6` | `*BEAM GENERAL SECTION, SECTION=RECT` as ccx's rectangular beam: a cantilever in space; NAFEMS NL6 (NLGEOM, past buckling) on 32 `B22` | P L³ / 3 E I; NL6's published answers | 0.05 %; ≤ 2.4 % |
-| `beam_circ_rotation_bcs` | a held twist at pinned supports; a prescribed tip rotation | beam theory | ≤ 0.2 % |
-| `beam_circ_explicit` | a circular-section beam in `*DYNAMIC, EXPLICIT` | beam theory | 1.0 % |
-| `planar_pinned_beam`, `planar_pinned_circ_beam` | first two frequencies and the buckling load of planar `B21` beams | beam theory, Euler | ≤ 0.6 % |
+| `beam_circ_rotation_bcs` | a held twist at pinned supports; a prescribed tip rotation | beam theory | ≤ 0.3 % |
+| `beam_circ_explicit` | a circular-section beam in `*DYNAMIC, EXPLICIT` | beam theory | 0.7 % |
+| `planar_pinned_beam`, `planar_pinned_circ_beam` | first two frequencies and the buckling load of planar `B21` beams | beam theory, Euler | ≤ 0.8 % |
+| `planar_b22_two_elements` | two `B22` (→ `B32R`) between pins: mid-span deflection, first frequency, buckling load | Abaqus' deflection on this mesh (exact), beam theory, Euler | 0.15 %; ≤ 1.3 % |
 | `beam_line_load_cantilever` | `*DLOAD PY`, `P2`, `PZ`: applied resultant and tip deflection | q L, q L⁴ / 8 E I | ≤ 1.2 % |
 | `beam_output_requests` | output at `B32` nodes in the `.frd` (at `*TIME POINTS`) and the `.dat` | beam theory | ≤ 1.3 % |
 | `coupling_shell_plate` | a rigid coupling on `S8R` nodes (knot beams) | the same plate in `C3D20R` under `*RIGID BODY` | 1e-5 of \|u\| |
@@ -187,7 +188,7 @@ out of its buckle) and 33 (3 of them also unloaded) are `reduced_physics` — co
 plasticity (2), UHARD / VUHARD hardening (4), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
-`B32` (3), I-section `B21` beams run as ccx's Euler–Bernoulli `U1` (3), general contact (2), a
+`B32R` (3), I-section `B21` beams run as ccx's Euler–Bernoulli `U1` (3), general contact (2), a
 dropped `*IMPERFECTION` (1), planar beams whose eigenmodes include twist (1). 221 mesh-only
 decks are accepted. The other 597 stop first on, or (the last row) run without, what they need:
 
@@ -228,7 +229,7 @@ independently, the entry records ccx's value and `why`: the check then holds ccx
 within the same tolerance, so a conversion change still shows, and fails once ccx reaches
 Abaqus' value.
 
-On ccx 2.23, 19 match Abaqus:
+On ccx 2.23, 20 match Abaqus:
 
 | Test | Element, mesh | Quantity | ccx | Abaqus | NAFEMS |
 | --- | --- | --- | --- | --- | --- |
@@ -244,8 +245,9 @@ On ccx 2.23, 19 match Abaqus:
 | FV52 | `C3D20` | modes 4–10 | all of Abaqus' digits | 44.796 … 206.64 | 44.092 … 200.13 |
 | NL1 | `CPE4R`, perfect and hardening plasticity | von Mises after each of 8 steps | Abaqus' 16 values (≤ 0.01 %) | 3.824 … 7.297 | 3.917 … 7.322 |
 | NL2 | `CAX8R`, plasticity | σrr, σθθ at 8 Gauss radii, 80 and 160 MPa | ≤ 0.35 % off | the targets, but 95.8 for σθθ at r = 124.2 under 80 MPa | 98.5 there |
+| NL6 | `B22`, NLGEOM | ux/L, uy/L after both load steps | −0.4503, 0.7242; −1.5818, 0.4231 | −0.447, 0.723; −1.577, 0.427 | −0.440, 0.719; −1.577, 0.421 |
 
-Seven differ for a reason traced to ccx:
+Six differ for a reason traced to ccx:
 
 | Test | Element | ccx | Abaqus | Why |
 | --- | --- | --- | --- | --- |
@@ -254,8 +256,7 @@ Seven differ for a reason traced to ccx:
 | T4 | `DC3D8` fine | 17.954 | 18.91 | ccx integrates `*FILM` consistently, Abaqus lumps it on first-order elements: a separate solution gives 17.954 and 18.914 |
 | FV52 | `C3D8I` | 44.18 … 205.15 | 44.092 … 200.13 | Abaqus lumps first-order masses (Theory Guide, "Implicit dynamic analysis") and condenses the incompatible modes, which ccx keeps as DOFs with a consistent mass: a separate solution gives 44.12 … 156.5 Abaqus' way, 44.18 … 157.9 ccx's |
 | FV12 | `S8R` | mode 9: 7.653 | 7.559 | ccx's `S8R` is a one-layer `C3D20R` solid: modes 4–8 within 0.26 %, mode 9 a coarse-mesh error (ccx: 7.375 at 8 × 8) |
-| FV2 | `B22` | 11.65 … 70.21 | 11.34 … 57.75 | ccx's 3-node beam is one `C3D20` brick, much stiffer than `B22` on 8 elements an arm: one 10 m beam gives 11.65 and 50.50 Hz at n = 2 and 4 (beam theory 11.34, 45.35) |
-| NL6 | `B22`, NLGEOM | ux/L, uy/L: −0.4062, 0.6997; −1.4989, 0.4691 | −0.447, 0.723; −1.577, 0.427 | ccx's `B32` is one 20-node brick integrated at 3 × 3 × 3 points, stiffer than `B22` on 8 elements: 16 give −0.4476, 0.7228; −1.5772, 0.4265, and ccx's `B32R` (2 × 2 × 2) −0.4503, 0.7242; −1.5818, 0.4231 on the 8 |
+| FV2 | `B22` | 11.34, 18.06, 45.90, 59.30 | 11.34, 17.68, 45.69, 57.75 | ccx's beam is a 3-D brick whose clamped or knotted end section cannot contract with Poisson's ratio (0.3): modes 2 and 10, whose arms the crossing clamps, come out 2–3 % stiff on 4 elements an arm (one such arm: 18.08, 59.63 Hz; with ν = 0 17.72, 58.45) |
 
 The other five do not run in ccx 2.23: creep tests 1(a), 2(a) and 5(a) stop on a singular
 matrix once an increment's creep strain is about 20 times the elastic one (Abaqus takes

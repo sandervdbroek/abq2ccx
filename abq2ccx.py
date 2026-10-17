@@ -117,14 +117,16 @@ ELEMENT_NNODES: Dict[str, int] = {
 SURFACE_ELEMENTS = {"SFM3D3", "SFM3D4", "SFM3D4R", "SFM3D6", "SFM3D8", "SFM3D8R",
                     "SFMAX1", "SFMAX2", "SFMGAX1", "SFMGAX2"}
 
-# Element types CalculiX has no native name for -> substitute.  Every entry is
-# NODE-COUNT PRESERVING so connectivity stays valid (a warning is emitted on use).
+# Element types CalculiX has no native name for, or whose ccx namesake integrates differently
+# (B32), -> substitute.  Every entry is NODE-COUNT PRESERVING so connectivity stays valid (a
+# warning is emitted on use).
 ELEMENT_TYPE_MAP: Dict[str, str] = {
     "S3R": "S3", "STRI3": "S3", "STRI65": "S6", "S4R5": "S4R", "S8R5": "S8R",
-    "B23": "B33", "B22": "B32", "B33": "B31", "B33H": "B31",          # no cubic/2-node-2D beams
+    "B23": "B33", "B33": "B31", "B33H": "B31",                        # no cubic beams
+    "B22": "B32R", "B32": "B32R",                                     # 3-node beams: see QUADRATIC_BEAM
     "T2D3": "T3D3",                                                   # 3-node 2D truss -> 3-node 3D truss
-    "B21H": "B21", "B31H": "B31", "B32H": "B32",                      # hybrid beams
-    "PIPE21": "B21", "PIPE22": "B32", "PIPE31": "B31", "PIPE32": "B32",  # internal pressure lost
+    "B21H": "B21", "B31H": "B31", "B32H": "B32R",                     # hybrid beams
+    "PIPE21": "B21", "PIPE22": "B32R", "PIPE31": "B31", "PIPE32": "B32R",  # internal pressure lost
     "CPEG3": "CPE3", "CPEG4": "CPE4", "CPEG4R": "CPE4R", "CPEG6": "CPE6",  # gen. plane strain
     "CPEG8": "CPE8", "CPEG8R": "CPE8R",
     "CGAX3": "CAX3", "CGAX4": "CAX4", "CGAX4R": "CAX4R", "CGAX6": "CAX6",  # gen. axisym (twist lost)
@@ -154,6 +156,8 @@ ELEMENT_TYPE_MAP: Dict[str, str] = {
     "GKPS4": "CPS4", "GKAX4": "CAX4",
 }
 
+_B32R_SAME = ("ccx's B32R integrates a 3-node beam at 2 points along its length, as Abaqus' "
+              "quadratic beams do (ccx's B32 at 3, which locks on coarse meshes)")
 # Substitutions that keep the Abaqus element's solution exactly, with the reason; every other
 # substitution in ELEMENT_TYPE_MAP (or a dropped H / P suffix) replaces Abaqus' element
 # formulation and counts as reduced physics (Converter._reduces).
@@ -162,7 +166,8 @@ EXACT_SUBSTITUTIONS = {
            "conventional shell element library: 'identical to element S3')",
     "CPE3H": "a constant-strain triangle's volume change is constant, so Abaqus' constant "
              "hybrid pressure equals the displacement element's for a compressible material",
-    "B22": "the 3-node beam in the model plane, which the converter keeps planar like B21",
+    "B22": _B32R_SAME + ", and the converter keeps it in the model plane like B21",
+    "B32": _B32R_SAME,
     "T2D3": "the 3-node truss in the model plane, which the converter keeps planar like T2D2",
     **{t: "ccx runs heat transfer on its plane / axisymmetric element of the same interpolation "
           "(a one-element-thick expansion, the temperature uniform through it)"
@@ -370,18 +375,31 @@ COMPOSITE_SHELL_UPGRADE = {"S3": "S6", "S4": "S8R", "S4R": "S8R"}
 # default limit on the solids that adds (--max-ply-elements)
 PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
 PLY_SPLIT_LIMIT = 1000000
+# ccx 2.23 expands a 3-node beam into a 20-node brick: B32 integrated at 3 x 3 x 3 points, B32R
+# at 2 x 2 x 2 (*EL PRINT COORD).  Abaqus integrates its quadratic beams (B22, B32, PIPE22,
+# PIPE32) at 2 points along the beam (Abaqus 2017 "Beam element library", numbering of
+# integration points), and B32R gives their solution on the deck's mesh where B32 locks
+# (probed on 2.23: a RECT cantilever's tip deflection under an end load is exact on 1 to 16
+# B32R, 0.77 / 0.95 / 0.993 of it on 1 / 2 / 4 B32; frequencies, buckling loads and large
+# deflections alike), so every 3-node beam is written as B32R.  Two limits of its reduced
+# integration, not of the conversion: one B32R alone between two nodes that are no knots has
+# zero-energy modes (*FREQUENCY stops in ARPACK, *BUCKLE finds spurious modes); and in a 3-D
+# NLGEOM step members of 2-4 elements can stop converging under large rotations (an
+# out-of-plane instability; holding DOF 3, as in a 2-D model, removes it).
+QUADRATIC_BEAM = "B32R"
+# *EL PRINT rows ccx 2.23 writes per B32R element under a RECT or CIRC section: 50, of which
+# the first 8 are its integration points and the rest no results at any point (PIPE: 16, BOX:
+# 32, all of them integration points)
+B32R_PRINT_ROWS = {"RECT": 8, "CIRC": 8}
 # ccx 2.23 stops on a 2-node beam with a circular section ("Please use quadratic elements
-# for beams with circular cross section"): it expands a linear beam into an 8-node brick,
-# whose corner nodes cannot follow a circle.  Emitted 2-node type -> the 3-node beam such
-# elements are upgraded to (ccx runs B21 as a B31).
-CIRC_QUADRATIC = {"B21": "B32", "B31": "B32", "B31R": "B32R"}
-# ccx 2.23 accepts PIPE and BOX sections only on B32R ("*BEAM SECTION of type PIPE can only
-# be used for B32R elements"): their integration-point schemes are defined on the expanded
-# C3D20R.  Emitted type -> B32R; a 2-node beam gets a midside node, B32 changes type only.
-PIPE_BOX_B32R = {"B21": "B32R", "B31": "B32R", "B31R": "B32R", "B32": "B32R"}
-# *BEAM SECTION, SECTION= -> the upgrade its beams need (THICK PIPE is emitted as PIPE)
-SECTION_BEAM_UPGRADE = {"CIRC": CIRC_QUADRATIC, "PIPE": PIPE_BOX_B32R, "THICK PIPE": PIPE_BOX_B32R,
-                        "BOX": PIPE_BOX_B32R}
+# for beams with circular cross section": it expands a linear beam into an 8-node brick,
+# whose corner nodes cannot follow a circle) and accepts PIPE and BOX sections only on B32R
+# ("*BEAM SECTION of type PIPE can only be used for B32R elements": their integration-point
+# schemes are defined on the expanded C3D20R).  Emitted 2-node type -> the 3-node beam such
+# elements become, with a midside node (ccx runs B21 as a B31).
+QUADRATIC_UPGRADE = {"B21": QUADRATIC_BEAM, "B31": QUADRATIC_BEAM, "B31R": QUADRATIC_BEAM}
+# the *BEAM SECTION, SECTION= values that need it (THICK PIPE is emitted as PIPE)
+SECTION_BEAM_UPGRADE = ("CIRC", "PIPE", "THICK PIPE", "BOX")
 
 # ccx 2.23's own 2-node beam, the user element U1, carries a section given by its properties
 # (*BEAM SECTION, SECTION=GENERAL), which the expanded beams cannot.  Probed on 2.23
@@ -3332,6 +3350,7 @@ class Converter:
         self._planar_elems: Dict[int, str] = {}
         self._planar_others: List[str] = []
         self._planar_bc: List[str] = []
+        self._b32r_rows: set = set()                # B32R elements whose .dat rows outnumber their points
         self._planar_twist: List[int] = []         # ... the nodes among them with DOFs 4-5 fixed
         # *BOUNDARY cards whose OP=NEW removes nothing and is dropped: id -> first card of
         # its step (_plan_op_new_rotations)
@@ -9927,6 +9946,13 @@ class Converter:
             report.warn(f"*{cc}: more than 16 output identifiers after mapping; keeping "
                         f"the first 16 (ccx line limit).", once=True)
             final = final[:16]
+        freq = next((v for k, v in b.params.items() if k in ("F", "FREQ", "FREQUENCY")), None)
+        if cc == "EL PRINT" and final and (freq or "").strip() not in ("0", "0.") and \
+                self._b32r_rows.intersection(self.geom.elset((params.get("ELSET") or "").strip())):
+            report.note(f"*EL PRINT on {QUADRATIC_BEAM} beams with a RECT or CIRC section: ccx 2.23 "
+                        f"prints 50 rows per such element, of which the first 8 are its integration "
+                        f"points (2 along the beam, 2 x 2 across) and the others no results at any "
+                        f"point; the .frd is not affected.", once=True)
         return params, final
 
     def _contact_card(self, b: Block, report: "Report", keep_ctl: bool = False):
@@ -12378,6 +12404,7 @@ class Converter:
         self._plan_shell_axes(blocks)           # after the distributions: their axes
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
+        self._note_quadratic_beams(blocks)      # after the planar constraint
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
@@ -13780,82 +13807,62 @@ class Converter:
                           "NODE FILE", "NODE OUTPUT", "RIGID BODY", "TRANSFORM"}
 
     def _upgrade_section_beams(self, blocks: List[Block]) -> None:
-        """Beams whose *BEAM SECTION ccx 2.23 rejects on their emitted type -> the type it
-        accepts (``SECTION_BEAM_UPGRADE``).  ``SECTION=CIRC``: 2-node beams stop with 'Please
-        use quadratic elements for beams with circular cross section' (a linear beam expands
-        to an 8-node brick, whose corner nodes cannot follow a circle) and become B32/B32R.
-        ``SECTION=PIPE``/``BOX`` (and THICK PIPE, emitted as PIPE) run only on B32R: B32
-        changes type, 2-node beams become B32R.  A 2-node element gets a midside node at the
+        """2-node beams whose *BEAM SECTION ccx 2.23 rejects on them (``SECTION_BEAM_UPGRADE``)
+        -> the 3-node beam (``QUADRATIC_UPGRADE``).  ``SECTION=CIRC``: 2-node beams stop with
+        'Please use quadratic elements for beams with circular cross section' (a linear beam
+        expands to an 8-node brick, whose corner nodes cannot follow a circle).
+        ``SECTION=PIPE``/``BOX`` (and THICK PIPE, emitted as PIPE) run only on B32R, which every
+        3-node beam is written as anyway.  A 2-node element gets a midside node at the
         midpoint of its end nodes (new ids above the highest node; flattened coordinates are
         already global, so the instance transform is included), in ccx's end, middle, end
         order (probed on 2.23: end, end, middle stops with a nonpositive jacobian).  Element
         ids and element sets are unchanged; node sets follow ``_MIDSIDE_SET_CARDS``."""
-        table: Dict[int, Tuple[str, Dict[str, str]]] = {}      # element -> (section, upgrade)
+        table: Dict[int, str] = {}                     # element -> its section (PIPE/BOX first)
         for b in blocks:
-            sec = (b.param("SECTION") or "").strip().upper() if b.keyword == "BEAM SECTION" else \
-                (b.param("SECTION") or "").strip().upper() if b.keyword == "BEAM GENERAL SECTION" else ""
+            sec = (b.param("SECTION") or "").strip().upper() \
+                if b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION") else ""
             if sec not in SECTION_BEAM_UPGRADE:
                 continue
             for e in self.geom.elset((b.param("ELSET") or "").strip()):
-                if e not in table or table[e][1] is not PIPE_BOX_B32R:     # B32R suits CIRC too
-                    table[e] = (sec, SECTION_BEAM_UPGRADE[sec])
+                if table.get(e, "CIRC") == "CIRC":
+                    table[e] = sec
         if not table:
             return
         quiet = Report()
         nodes = self.geom.nodes
         next_id = max(nodes, default=0)
-        # per case (True: 2-node beam given a midside node, False: B32 retyped) the Abaqus
-        # sections involved and the "TYPE -> new type" counts
-        sections: Dict[bool, set] = {True: set(), False: set()}
-        kinds: Dict[bool, "OrderedDict[str, int]"] = {True: OrderedDict(), False: OrderedDict()}
+        sections: set = set()                          # the Abaqus sections involved
+        kinds: "OrderedDict[str, int]" = OrderedDict()   # "TYPE -> new type" counts
         for eid, (typ, conn) in list(self.geom.elements.items()):
-            sec, up = table.get(eid, ("", {}))
-            new = up.get(ccx_element_type(typ, quiet)) if up else None
-            if new is None or len(conn) not in (2, 3) or not all(n in nodes for n in conn):
+            new = QUADRATIC_UPGRADE.get(ccx_element_type(typ, quiet)) if eid in table else None
+            if new is None or len(conn) != 2 or not all(n in nodes for n in conn):
                 continue
-            mid = len(conn) == 2
-            if mid:
-                next_id += 1
-                self.geom.add_node(next_id, vscale(vadd(nodes[conn[0]], nodes[conn[1]]), 0.5))
-                self.geom.elements[eid] = (new, [conn[0], next_id, conn[1]])
-                self._midside[eid] = (conn[0], conn[1], next_id)
-            else:
-                self.geom.elements[eid] = (new, conn)
+            next_id += 1
+            self.geom.add_node(next_id, vscale(vadd(nodes[conn[0]], nodes[conn[1]]), 0.5))
+            self.geom.elements[eid] = (new, [conn[0], next_id, conn[1]])
+            self._midside[eid] = (conn[0], conn[1], next_id)
             self._elem_types.add(new)
-            sections[mid].add(sec)
+            sections.add(table[eid])
             kind = f"{typ.upper()} -> {new}"
-            kinds[mid][kind] = kinds[mid].get(kind, 0) + 1
-
-        def label(mid: bool) -> str:
-            return "/".join(s for s in SECTION_BEAM_UPGRADE if s in sections[mid])
-
-        def counts(mid: bool) -> str:
-            return ", ".join(f"{k}: {v}" for k, v in kinds[mid].items())
-
-        if kinds[False]:
-            self.report.warn(f"SECTION={label(False)} beams: {sum(kinds[False].values())} 3-node "
-                             f"element(s) emitted as B32R instead of B32 ({counts(False)}), with the "
-                             f"same nodes; ccx 2.23 accepts PIPE and BOX sections only on B32R.",
-                             once=True)
-            self._reduces(f"element {', '.join(kinds[False])} (SECTION={label(False)} needs B32R in "
-                          f"ccx)")
+            kinds[kind] = kinds.get(kind, 0) + 1
         if not self._midside:
             return
+        label = "/".join(s for s in SECTION_BEAM_UPGRADE if s in sections)
         why = []
-        if "CIRC" in sections[True]:
+        if "CIRC" in sections:
             why.append("stops on linear beams with a circular section")
-        if sections[True] - {"CIRC"}:
+        if sections - {"CIRC"}:
             why.append("accepts PIPE and BOX sections only on B32R")
         mids = [m for _, _, m in self._midside.values()]
         span = f"node {mids[0]}" if len(mids) == 1 else f"nodes {mids[0]}-{mids[-1]}"
-        self.report.warn(f"SECTION={label(True)} beams: {len(mids)} 2-node element(s) emitted as 3-node "
-                         f"beams ({counts(True)}), each with a new midside node at its midpoint "
-                         f"({span}); ccx 2.23 {' and '.join(why)}. Element ids and sets are kept, and "
-                         f"BCs, temperatures and initial conditions on both end nodes also reach the "
-                         f"midside node. The quadratic beam is closer to beam theory than the linear "
-                         f"one, so results can differ slightly from Abaqus.", once=True)
-        self._reduces(f"element {', '.join(kinds[True])} (SECTION={label(True)} needs a 3-node beam "
-                      f"in ccx)")
+        self.report.warn(f"SECTION={label} beams: {len(mids)} 2-node element(s) emitted as 3-node "
+                         f"beams ({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a "
+                         f"new midside node at its midpoint ({span}); ccx 2.23 {' and '.join(why)}. "
+                         f"Element ids and sets are kept, and BCs, temperatures and initial "
+                         f"conditions on both end nodes also reach the midside node. The quadratic "
+                         f"beam is closer to beam theory than the linear one, so results can differ "
+                         f"slightly from Abaqus.", once=True)
+        self._reduces(f"element {', '.join(kinds)} (SECTION={label} needs a 3-node beam in ccx)")
         names = set(self.geom.nsets)
         counted: set = set()                    # node sets some other card counts node by node
         for b in blocks:
@@ -13883,6 +13890,31 @@ class Converter:
                              f"surface card uses them, so the midside nodes were not added (an extra "
                              f"node there would add load or equation terms); *BOUNDARY and "
                              f"temperature lines on them still reach the midside nodes.", once=True)
+
+    def _note_quadratic_beams(self, blocks: List[Block]) -> None:
+        """Records the B32R (QUADRATIC_BEAM) elements under a RECT or CIRC section, whose *EL
+        PRINT rows outnumber their integration points (``self._b32r_rows``, B32R_PRINT_ROWS),
+        and notes B32R beams with nodes whose DOF 3 is free (a 3-D model; nodes the planar
+        constraint leaves out) in a deck with an NLGEOM step."""
+        quiet = Report()
+        b32r = {e for e, (typ, _) in self.geom.elements.items()
+                if ccx_element_type(typ, quiet) == QUADRATIC_BEAM}
+        if not b32r:
+            return
+        for b in blocks:
+            if b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION") and \
+                    (b.param("SECTION") or "").strip().upper() in B32R_PRINT_ROWS:
+                self._b32r_rows.update(e for e in self.geom.elset((b.param("ELSET") or "").strip())
+                                       if e in b32r)
+        held = set(self.geom.nsets.get(PLANAR_NODES_SET, ()))
+        if any(b.keyword == "STEP" and any(k.startswith("NLGEO") and (v or "YES").strip().upper() != "NO"
+                                           for k, v in b.params.items()) for b in blocks) and \
+                any(not set(self.geom.elements[e][1]) <= held for e in b32r):
+            self.report.note(f"3-node beams run as ccx's {QUADRATIC_BEAM} in an NLGEOM step: where "
+                             f"DOF 3 is not held (a 3-D model), ccx 2.23 can stop converging on "
+                             f"members of 2-4 elements under large rotations ('too many cutbacks', "
+                             f"an out-of-plane instability of its reduced integration); refine such "
+                             f"members if it does.", once=True)
 
     def _between(self) -> List[Tuple[int, int, int, float]]:
         """Every node the converter put on the segment between two nodes, as (a, c, node, s)
@@ -14162,7 +14194,7 @@ class Converter:
             hit = [m for n in conn for c, m in ends.get(n, ()) if c in members]
             if not hit:
                 continue
-            up = {"B31": "B32", "B31R": "B32R"}.get(cc(typ))
+            up = QUADRATIC_UPGRADE.get(cc(typ))
             if len(conn) == 2 and up and e not in general and e not in self._u1:
                 m = mid[(min(conn), max(conn))]
                 els[e] = (up, [conn[0], m, conn[1]])
@@ -18424,7 +18456,7 @@ class Converter:
     def _find_planar_elements(self) -> None:
         """Record the deck's planar beams/trusses (B21, T2D2, ...) and the element types that
         keep the model from being planar — before the beam-section upgrades retype elements
-        (a B21 with a circular section becomes a B32 with a midside node)."""
+        (a B21 with a circular section becomes a B32R with a midside node)."""
         self._planar_elems = {}
         others: set = set()
         skins = set(self.geom.elsets.get(RIGID_SET, []))   # rigid elements' skins (_plan_rigid)
@@ -18440,7 +18472,7 @@ class Converter:
 
     def _plan_planar_constraint(self, blocks: List[Block]) -> None:
         """Keep a planar model's 2-D beams and trusses in their plane.  ccx runs them as 3-D
-        B31/B32/T3D2 elements whose out-of-plane motion nothing restrains (probed on 2.23):
+        B31/B32R/T3D2 elements whose out-of-plane motion nothing restrains (probed on 2.23):
         every bending mode appears twice in *FREQUENCY, *BUCKLE finds out-of-plane buckling,
         and a truss node is a mechanism (0 Hz modes; U3 is solver noise).  Fixing DOF 3 on
         their nodes (midside nodes of upgraded beams included) leaves the in-plane response
@@ -18451,7 +18483,7 @@ class Converter:
         U1/U2/UR3 clamp CAE writes) keeps a rigid twist mode — 0 Hz in *FREQUENCY, *BUCKLE
         factors near 1, an NLGEOM step that stops converging (B31) — so DOFs 4-5 are fixed
         at ONE of its nodes: one whose in-plane rotation is already fixed (no effect on any
-        section), else a support (no effect on B31, B32 RECT, B32R PIPE/BOX).  A beam with a
+        section), else a support (no effect on B31, B32 or B32R).  A beam with a
         circular section gets them at the middle node of an element next to a support
         instead: at an element end node ccx 2.23 would lock the bending rotation as well
         (see _plan_circ_rotation_knots), at a middle node the BC holds only the rotations it
@@ -18729,8 +18761,8 @@ class Converter:
         of their corners (gen3dboun) — exact on a rectangle (RECT, PIPE, BOX), but no rigid
         rotation of a circle satisfies it, so a BC on DOF 4, 5 or 6 at an element end node
         locks the twist and both bending rotations there.  Probed on 2.23 (B32, 10
-        elements): a pinned beam whose twist is held at both supports deflects 0.27 of beam
-        theory (DOF 4 at one end: 0.46), a prescribed tip rotation gives 0.76 of its
+        elements; B32R alike): a pinned beam whose twist is held at both supports deflects
+        0.27 of beam theory (DOF 4 at one end: 0.46), a prescribed tip rotation gives 0.76 of its
         deflection, DOF 4 on every node 0.009.  A knot hands the BCs to its rotation node
         instead, so every element end node of a CIRC beam whose rotational BCs hold only some
         of DOFs 4-6, or a nonzero value, in some step gets a knot beam (_add_knot_beams):
@@ -20489,17 +20521,21 @@ def _deck_steps(path: str) -> Optional[dict]:
     1-3 that the *BOUNDARY cards in effect hold (model-level BCs until an OP=NEW drops
     them; not at a *RIGID BODY's ROT NODE, whose DOFs are rotations), at each node
     (``held``) and per target node set or node (``targets``: {node: DOFs}); the nodes with
-    a *TRANSFORM, set members and the highest node label.  None if the deck cannot be
-    read."""
+    a *TRANSFORM, set members and the highest node label; ``rows``, the .dat rows per element
+    that hold its integration points where ccx prints more (B32R_PRINT_ROWS).  None if the
+    deck cannot be read."""
     try:
         fh = open(path, encoding="utf-8", errors="replace")
     except OSError:
         return None
     sets: Dict[str, list] = {}
+    elsets: Dict[str, list] = {}
+    b32r: set = set()
+    beam_sections: List[Tuple[str, str]] = []
     segs: List[dict] = [{"procedure": None, "bcs": [], "new": False}]   # model data, the steps
     rot: set = set()
     transforms: List[str] = []
-    max_node, kw, params, cur = 0, "", OrderedDict(), None
+    max_node, kw, params, cur, ecur, etype, need = 0, "", OrderedDict(), None, None, "", 0
     with fh:
         for raw in fh:
             ln = raw.strip()
@@ -20509,7 +20545,13 @@ def _deck_steps(path: str) -> Optional[dict]:
                 kw, params = parse_keyword_line(ln)
                 name = (params.get("NSET") or "").strip().upper()
                 cur = sets.setdefault(name, []) if kw in ("NSET", "NODE") and name else None
-                if kw == "STEP":
+                ename = (params.get("ELSET") or "").strip().upper()
+                ecur = elsets.setdefault(ename, []) if kw in ("ELSET", "ELEMENT") and ename else None
+                etype = (params.get("TYPE") or "").strip().upper() if kw == "ELEMENT" else ""
+                need = 0
+                if kw == "BEAM SECTION" and ename:
+                    beam_sections.append((ename, (params.get("SECTION") or "").strip().upper()))
+                elif kw == "STEP":
                     segs.append({"procedure": None, "bcs": [], "new": False})
                 elif kw in PROC_KW and len(segs) > 1 and not segs[-1]["procedure"]:
                     segs[-1]["procedure"] = kw + (", EXPLICIT" if "EXPLICIT" in params else "")
@@ -20525,26 +20567,39 @@ def _deck_steps(path: str) -> Optional[dict]:
                 max_node = max(max_node, int(f[0]))
                 if cur is not None:
                     cur.append(int(f[0]))
-            elif kw == "NSET" and cur is not None:
+            elif kw == "ELEMENT":
+                entries = [x for x in f if x]
+                if need <= 0 and entries and entries[0].isdigit():     # a new element's line
+                    if etype == "B32R":
+                        b32r.add(int(entries[0]))
+                    if ecur is not None:
+                        ecur.append(int(entries[0]))
+                    need = 1 + ELEMENT_NNODES.get(etype, 0)
+                need -= len(entries)                    # its node list may go on (16 per line)
+            elif kw in ("NSET", "ELSET") and (cur if kw == "NSET" else ecur) is not None:
+                into = cur if kw == "NSET" else ecur
                 if "GENERATE" in params:
                     try:
                         a, b, inc = ([pint(x) for x in f if x] + [1])[:3]
-                        cur.extend(range(a, b + 1, max(inc, 1)))
+                        into.extend(range(a, b + 1, max(inc, 1)))
                     except ValueError:
                         pass
                 else:
-                    cur.extend(int(x) if x.isdigit() else x.upper() for x in f if x)
+                    into.extend(int(x) if x.isdigit() else x.upper() for x in f if x)
             elif kw == "BOUNDARY" and len(f) > 1 and f[1].isdigit():
                 d2 = int(f[2]) if len(f) > 2 and f[2].isdigit() else int(f[1])
                 segs[-1]["bcs"].append((f[0].upper(), int(f[1]), d2))
-    memo: Dict[str, List[int]] = {}
+    memo: Dict[Tuple[int, str], List[int]] = {}
 
-    def members(name: str) -> List[int]:
-        if name not in memo:
-            memo[name] = []                             # a set that names itself: nothing more
-            memo[name] = [n for t in sets.get(name, [])
-                          for n in ([t] if isinstance(t, int) else members(t))]
-        return memo[name]
+    def members(name: str, of: Dict[str, list] = sets) -> List[int]:
+        key = (id(of), name)
+        if key not in memo:
+            memo[key] = []                              # a set that names itself: nothing more
+            memo[key] = [n for t in of.get(name, [])
+                         for n in ([t] if isinstance(t, int) else members(t, of))]
+        return memo[key]
+    rows = {e: B32R_PRINT_ROWS[sec] for name, sec in beam_sections if sec in B32R_PRINT_ROWS
+            for e in members(name, elsets) if e in b32r}
     steps, active = [], list(segs[0]["bcs"])
     for seg in segs[1:]:
         active = list(seg["bcs"]) if seg["new"] else active + seg["bcs"]
@@ -20558,7 +20613,7 @@ def _deck_steps(path: str) -> Optional[dict]:
                     held.setdefault(n, set()).update(dofs)
         steps.append({"procedure": seg["procedure"], "held": held, "targets": targets})
     return {"steps": steps, "max_node": max_node, "members": members,
-            "transformed": {n for s in transforms for n in members(s)}}
+            "transformed": {n for s in transforms for n in members(s)}, "rows": rows}
 
 
 def _deck_nearest(path: str, points: Dict[int, List[float]],
@@ -20648,9 +20703,11 @@ def _digest_step(entry: dict, frd: str, blocks, final, info: Optional[dict], dec
                 entry[key] = {"value": best[0], "node": best[1]}
             continue
         found: Optional[Tuple[float, int, str]] = None
+        ips = deck["rows"] if deck and lead == 2 else {}
         for b in final:
             for r in b[4] if b[1] == title else ():
-                if len(r) == lead + width and (keep if lead == 1 else keep_element)(int(r[0])):
+                if len(r) == lead + width and (keep if lead == 1 else keep_element)(int(r[0])) and \
+                        r[1] <= ips.get(int(r[0]), r[1]):
                     v = measure(r[lead:])
                     if v > (found[0] if found else -1.0):
                         found = (v, int(r[0]), b[2])

@@ -1771,7 +1771,7 @@ def test_beam_circ_explicit_example():
     body, _, _ = convert(os.path.join(EXAMPLES, "beam_circ_explicit.inp"))
     g = reparse(body)
     assert "*DYNAMIC, EXPLICIT\n, 6.e-3, , 4.17e-07\n" in body
-    assert {t for t, _ in g.elements.values()} == {"B32"} and not dangling_refs(g)
+    assert {t for t, _ in g.elements.values()} == {"B32R"} and not dangling_refs(g)
 
 
 def test_approximate_nu_clamp():
@@ -3451,16 +3451,16 @@ CIRC_BEAM = """*Node
 def test_circ_linear_beam_becomes_quadratic():
     body, conv, rep = convert_str(CIRC_BEAM)
     # ccx 2.23 rejects linear beams with a circular section: midside nodes 4, 5 at the
-    # element midpoints, B32 in ccx's end, middle, end order; ids and the elset are kept
-    assert "*ELEMENT, TYPE=B32\n1, 1, 4, 2\n2, 2, 5, 3\n" in body
+    # element midpoints, B32R in ccx's end, middle, end order; ids and the elset are kept
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n2, 2, 5, 3\n" in body
     assert conv.geom.nodes[4] == (0.5, 0.0, 0.0) and conv.geom.nodes[5] == (1.5, 0.0, 0.0)
-    assert "*ELSET, ELSET=BEAM\n1, 2\n" in body and "3-node beams (B31 -> B32: 2)" in rep.text()
+    assert "*ELSET, ELSET=BEAM\n1, 2\n" in body and "3-node beams (B31 -> B32R: 2)" in rep.text()
     # ccx reads the CIRC dimensions as the two diameters: Abaqus radius 0.05 -> 0.1, 0.1
     assert "SECTION=CIRC\n0.1, 0.1\n0., 0., -1." in body
     body, _, _ = convert_str(CIRC_BEAM.replace("type=B31", "type=B31R"))
     assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
     body, _, _ = convert_str(CIRC_BEAM.replace("type=B31", "type=B21"))   # ccx runs B21 as B31
-    assert "*ELEMENT, TYPE=B32\n1, 1, 4, 2\n" in body
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
     body, _, rep = convert_str(CIRC_BEAM.replace("section=CIRC\n0.05", "section=RECT\n0.1, 0.1"))
     assert "*ELEMENT, TYPE=B31\n1, 1, 2\n" in body and "3-node beams" not in rep.text()
     _, _, rep = convert_str(CIRC_BEAM.replace("CIRC\n0.05\n", "CIRC\n"))  # no radius line
@@ -3474,7 +3474,7 @@ def test_circ_beam_midside_follows_instance_transform():
             "*End Instance\n*End Assembly\n*Material, name=M\n*Elastic\n1000., 0.3\n")
     _, conv, _ = convert_str(deck)
     typ, conn = conv.geom.elements[1]
-    assert typ == "B32" and conn == [1, 3, 2]
+    assert typ == "B32R" and conn == [1, 3, 2]
     # ends at R(p + T) = (0, 10, 0) and (0, 12, 0): the midside node is their midpoint
     assert all(abs(p - q) < 1e-9 for p, q in zip(conv.geom.nodes[3], (0.0, 11.0, 0.0)))
 
@@ -3544,18 +3544,21 @@ def test_pipe_box_beams_become_b32r():
     assert conv.geom.nset("ALLN") == [1, 2, 3, 4, 5]
 
 
-def test_pipe_box_b32_only_changes_type():
+def test_quadratic_beams_run_as_b32r():
+    # Abaqus integrates its 3-node beams at 2 points along the beam, as ccx's B32R (its B32 at
+    # 3, which locks): the same element, on the same nodes, whatever the section
     body, conv, rep = convert_str(B32_PIPE_BEAM)
     assert "*ELEMENT, TYPE=B32R\n1, 1, 2, 3\n" in body and len(conv.geom.nodes) == 3
-    assert "SECTION=PIPE beams: 1 3-node element(s) emitted as B32R instead of B32 " \
-           "(B32 -> B32R: 1), with the same nodes" in rep.text()
+    assert "Element B32 -> B32R: the same solution" in rep.text() and not conv.reduced_physics
     assert "midside" not in rep.text()
-    body, _, _ = convert_str(B32_PIPE_BEAM.replace("type=B32", "type=PIPE32")
-                             .replace("section=PIPE\n0.05, 0.01", BOX_DATA))
-    assert "*ELEMENT, TYPE=B32R\n1, 1, 2, 3\n" in body
-    _, _, rep = convert_str(B32_PIPE_BEAM.replace("section=PIPE\n0.05, 0.01", "section=CIRC\n0.05"))
-    assert "B32R" not in rep.text()                     # ccx runs CIRC on B32 as it is
-
+    for typ, sec in (("B32", "section=CIRC\n0.05"), ("B32", "section=RECT\n0.1, 0.2"),
+                     ("B22", "section=RECT\n0.1, 0.2"), ("B32H", "section=RECT\n0.1, 0.2"),
+                     ("PIPE32", "section=PIPE\n0.05, 0.01"), ("PIPE22", BOX_DATA)):
+        body, conv, rep = convert_str(B32_PIPE_BEAM.replace("type=B32", f"type={typ}")
+                                      .replace("section=PIPE\n0.05, 0.01", sec))
+        assert "*ELEMENT, TYPE=B32R\n1, 1, 2, 3\n" in body, typ
+        # the hybrid and pipe elements' own physics is dropped, not the beam's integration
+        assert bool(conv.reduced_physics) == (typ in ("B32H", "PIPE32", "PIPE22")), typ
 
 def test_mixed_section_beams_report_each_case():
     deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 3., 0., 0.\n5, 3.5, 0., 0.\n"
@@ -3565,18 +3568,17 @@ def test_mixed_section_beams_report_each_case():
             "*Beam Section, elset=TUBE, material=M, section=PIPE\n0.05, 0.01\n0., 0., -1.\n"
             "*Beam Section, elset=BOXB, material=M, section=BOX\n0.1, 0.1, 0.01, 0.01, 0.01, 0.01\n"
             "*Material, name=M\n*Elastic\n2.1e5, 0.3\n")
-    body, _, rep = convert_str(deck)
-    assert "*ELEMENT, TYPE=B32\n1, 1, 7, 2\n*ELEMENT, TYPE=B32R\n2, 2, 8, 3\n3, 4, 5, 6\n" in body
-    # one line per case, each naming its sections and ccx's reason
-    assert "SECTION=CIRC/PIPE beams: 2 2-node element(s) emitted as 3-node beams (B31 -> B32: 1, " \
-           "B31 -> B32R: 1), each with a new midside node at its midpoint (nodes 7-8); ccx 2.23 " \
-           "stops on linear beams with a circular section and accepts PIPE and BOX sections only " \
-           "on B32R." in rep.text()
-    assert "SECTION=BOX beams: 1 3-node element(s) emitted as B32R instead of B32" in rep.text()
-    # an element under both a PIPE and a later CIRC section stays B32R, which suits both
-    body, _, _ = convert_str(PIPE_BEAM + "*Beam Section, elset=BEAM, material=M, section=CIRC\n0.05\n")
-    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body
-
+    body, conv, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 7, 2\n2, 2, 8, 3\n*ELEMENT, TYPE=B32R\n3, 4, 5, 6\n" in body
+    # one line naming the sections and ccx's reasons; the B32 is B32R anyway (no message)
+    assert "SECTION=CIRC/PIPE beams: 2 2-node element(s) emitted as 3-node beams (B31 -> B32R: " \
+           "2), each with a new midside node at its midpoint (nodes 7-8); ccx 2.23 stops on linear " \
+           "beams with a circular section and accepts PIPE and BOX sections only on B32R." in rep.text()
+    assert "SECTION=BOX" not in rep.text()
+    assert conv.reduced_physics == ["element B31 -> B32R (SECTION=CIRC/PIPE needs a 3-node beam in ccx)"]
+    # an element under both a PIPE and a later CIRC section is reported under PIPE
+    body, _, rep = convert_str(PIPE_BEAM + "*Beam Section, elset=BEAM, material=M, section=CIRC\n0.05\n")
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 4, 2\n" in body and "SECTION=PIPE beams" in rep.text()
 
 def test_beam_pipe_box_cantilever_example():
     body, _, _ = convert(os.path.join(EXAMPLES, "beam_pipe_box_cantilever.inp"))
@@ -3592,7 +3594,7 @@ def test_beam_pipe_box_cantilever_example():
 def test_beam_circ_cantilever_example():
     body, _, _ = convert(os.path.join(EXAMPLES, "beam_circ_cantilever.inp"))
     g = reparse(body)
-    assert [t for t, _ in g.elements.values()] == ["B32"] * 20 and len(g.nodes) == 41
+    assert [t for t, _ in g.elements.values()] == ["B32R"] * 20 and len(g.nodes) == 41
     assert g.elements[1][1] == [1, 22, 2] and g.nodes[22] == (2.5, 0.0, 0.0)
     assert "SECTION=CIRC\n2, 2\n" in body                          # radius 1 -> diameters
     assert not dangling_refs(g), dangling_refs(g)
@@ -3660,7 +3662,7 @@ def test_planar_beams_fix_out_of_plane_dof():
         assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n" in body, typ
     body, conv, _ = convert_str(PLANAR_BEAM.replace("1, 1, 2\n2, 2, 3\n3, 3, 4\n", "1, 1, 2, 3\n")
                                 .replace("type=B21", "type=B22"))
-    assert "*ELEMENT, TYPE=B32\n1, 1, 2, 3\n" in body and conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2, 3]
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 2, 3\n" in body and conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2, 3]
     truss = PLANAR_BEAM.replace("type=B21", "type=T2D2").replace(
         "*Beam Section, elset=BEAM, material=M, section=RECT\n0.1, 0.2",
         "*Solid Section, elset=BEAM, material=M\n0.01").replace("1, ENCASTRE", "1, 1, 2\n4, 2, 2")
@@ -3673,10 +3675,10 @@ def test_planar_beams_fix_out_of_plane_dof():
 
 
 def test_planar_constraint_reaches_upgraded_midside_nodes():
-    # a B21 under a circular section becomes a B32 with midside nodes 5-7 (ccx 2.23 rejects
+    # a B21 under a circular section becomes a B32R with midside nodes 5-7 (ccx 2.23 rejects
     # linear CIRC beams); they would move out of plane just the same
     body, conv, _ = convert_str(PLANAR_BEAM.replace("section=RECT\n0.1, 0.2", "section=CIRC\n0.05"))
-    assert "*ELEMENT, TYPE=B32\n1, 1, 5, 2\n" in body
+    assert "*ELEMENT, TYPE=B32R\n1, 1, 5, 2\n" in body
     assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2, 3, 4, 5, 6, 7]
     assert "*NSET, NSET=ABQ2CCX_PLANAR, GENERATE\n1, 7, 1\n" in body
 
@@ -3838,11 +3840,11 @@ def test_circ_rotation_bc_examples():
     body, conv, _ = convert(os.path.join(EXAMPLES, "beam_circ_rotation_bcs.inp"))
     g = reparse(body)
     assert list(conv._knots) == [1, 21, 121] and len(g.elsets["ABQ2CCX_KNOT"]) == 3
-    assert {t for t, _ in g.elements.values()} == {"B32", "B31"} and not dangling_refs(g)
+    assert {t for t, _ in g.elements.values()} == {"B32R", "B31"} and not dangling_refs(g)
     # ... and the planar circular beam's twist held at the first element's middle node
     body, conv, _ = convert(os.path.join(EXAMPLES, "planar_pinned_circ_beam.inp"))
     g = reparse(body)
-    assert g.elements[1] == ("B32", [1, 22, 2]) and not conv._knots
+    assert g.elements[1] == ("B32R", [1, 22, 2]) and not conv._knots
     assert "*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n22, 4, 5\n" in body.split("*STEP")[0]
     assert g.nset("ABQ2CCX_PLANAR") == list(range(1, 42)) and not dangling_refs(g)
 
@@ -7609,6 +7611,52 @@ def test_results_digest_on_a_fixture():
     assert d[3]["max_mises"]["element"] == 3
 
 
+def test_results_digest_skips_the_rows_b32r_prints_past_its_points():
+    # ccx 2.23 prints 50 *EL PRINT rows per B32R element under a RECT or CIRC section, of
+    # which the first 8 are its integration points; under PIPE all 16 rows are
+    inp = ("*NODE, NSET=NALL\n" + "".join(f"{n}, {n}., 0., 0.\n" for n in range(1, 30)) +
+           "*ELEMENT, TYPE=C3D20, ELSET=SOLID\n9, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, "
+           "21, 22, 23\n1, 24, 25, 26, 27\n"            # a continuation line: no element 1 there
+           "*ELEMENT, TYPE=B32R\n1, 1, 2, 3\n2, 3, 4, 5\n3, 5, 6, 7\n"
+           "*ELSET, ELSET=EB, GENERATE\n1, 2, 1\n*ELSET, ELSET=ROD\nEB\n*ELSET, ELSET=TUBE\n3\n"
+           "*BEAM SECTION, ELSET=ROD, MATERIAL=M, SECTION=RECT\n0.1, 0.2\n0., 0., 1.\n"
+           "*BEAM SECTION, ELSET=TUBE, MATERIAL=M, SECTION=PIPE\n0.1, 0.01\n0., 0., 1.\n"
+           "*STEP\n*STATIC\n*EL PRINT, ELSET=EALL\nS\n*END STEP\n")
+    rows = "".join(f"{e:10d}{k:4d}  {v:.6E}  0.000000E+00  0.000000E+00  0.000000E+00  0.000000E+00  "
+                   f"0.000000E+00\n" for e, k, v in ((1, 8, 5.0), (1, 9, 50.0), (2, 1, 4.0), (2, 50, 70.0),
+                                                     (3, 16, 6.0), (9, 27, 1.0)))
+    d = tempfile.mkdtemp()
+    try:
+        job = os.path.join(d, "job")
+        open(job + ".inp", "w").write(inp)
+        open(job + ".dat", "w").write("\n S T E P       1\n\n INCREMENT     1\n\n stresses (elem, "
+                                      "integ.pnt.,sxx,syy,szz,sxy,sxz,syz) for set EALL and time  "
+                                      "0.1000000E+01\n\n" + rows)
+        assert A._deck_steps(job + ".inp")["rows"] == {1: 8, 2: 8}
+        assert A.ccx_results_digest(job)[0]["max_mises"] == {"value": 6.0, "element": 3, "set": "EALL"}
+    finally:
+        shutil.rmtree(d)
+
+
+def test_b32r_notes_on_its_print_rows_and_3d_nlgeom():
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type={typ}, elset=B\n"
+            "1, 1, 2, 3\n*Beam Section, elset=B, material=M, section={sec}\n0., 0., -1.\n"
+            "*Material, name=M\n*Elastic\n2.1e5, 0.3\n*Step{nl}\n*Static\n*Boundary\n1, 1, 6\n"
+            "*Cload\n3, 2, -1.\n*El Print, elset=B\nS\n*End Step\n")
+    _, conv, rep = convert_str(beam.format(typ="B32", sec="RECT\n0.1, 0.2", nl=", nlgeom"))
+    assert conv._b32r_rows == {1} and "prints 50 rows per such element" in rep.text()
+    assert "ccx 2.23 can stop converging on members of 2-4 elements" in rep.text()
+    _, conv, rep = convert_str(beam.format(typ="B32", sec="PIPE\n0.1, 0.01", nl=""))
+    assert not conv._b32r_rows and "50 rows" not in rep.text() and "stop converging" not in rep.text()
+    _, _, rep = convert_str(beam.format(typ="B32", sec="RECT\n0.1, 0.2", nl="")   # prints nothing
+                            .replace("*El Print, elset=B\nS\n", "*El Print, elset=B, frequency=0\nS\n"))
+    assert "50 rows" not in rep.text()
+    # a 2-D model holds DOF 3, which keeps B32R converging under NLGEOM
+    _, _, rep = convert_str(beam.format(typ="B22", sec="RECT\n0.1, 0.2", nl=", nlgeom")
+                            .replace(", 0.\n2, 1., 0., 0.\n3, 2., 0., 0.", "\n2, 1., 0.\n3, 2., 0."))
+    assert "50 rows" in rep.text() and "stop converging" not in rep.text()
+
+
 def test_instance_map_of_two_blocks():
     path = os.path.join(EXAMPLES, "assembly_two_blocks.inp")
     body, conv, rep = convert(path)
@@ -7788,7 +7836,7 @@ def test_composite_s4r_upgrades_its_linear_neighbours_and_edge_beams():
     body, conv, rep = convert_str(deck)
     g = conv.geom
     assert g.elements[1][0] == "S8R" and g.elements[2][0] == "S8R"
-    assert g.elements[3] == ("B32", [1, 7, 2]) and g.elements[4] == ("B32", [2, 11, 3])
+    assert g.elements[3] == ("B32R", [1, 7, 2]) and g.elements[4] == ("B32R", [2, 11, 3])
     assert g.elements[1][1][4] == 7 and g.elements[2][1][4] == 11       # shell and beam share them
     assert "1 other linear shell(s) joined to them by an edge" in rep.text()
     assert "2 2-node beam(s) along an upgraded edge" in rep.text()

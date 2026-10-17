@@ -1170,7 +1170,7 @@ def main():
         failures += 0 if ok else 1
 
     # --- circular-section cantilever on linear beams: tip deflection vs beam theory --
-    # ccx 2.23 rejects linear beams with a circular section, so this checks the B31 -> B32
+    # ccx 2.23 rejects linear beams with a circular section, so this checks the B31 -> B32R
     # upgrade (midside nodes, node order) and the radius -> diameter conversion together.
     inp = os.path.join(tmp, "beam.inp")
     convert(os.path.join(EXAMPLES, "beam_circ_cantilever.inp"), inp)
@@ -1495,7 +1495,7 @@ def main():
         failures += 0 if ok else 1
 
     # --- circular-section beams with rotational BCs: deflections vs beam theory --------------
-    # Under any rotational BC ccx 2.23 ties a B32 end node's circular section to its corners,
+    # Under any rotational BC ccx 2.23 ties a B32/B32R end node's circular section to its corners,
     # locking the rotations the BC leaves free (beam A, twist held at its pinned ends, then
     # deflects 0.31 of beam theory; beam B, tip turned by a prescribed rotation, 0.76): this
     # checks the knot beams abq2ccx gives such nodes.
@@ -1548,7 +1548,7 @@ def main():
     # ccx runs B21 as a 3-D B31, so this checks the planar constraint: DOF 3 fixed on every
     # node (otherwise nothing holds the beam in its plane) and DOFs 4-5 at one node
     # (otherwise the free twist is a 0 Hz mode and the buckling factor meaningless): at the
-    # pinned end, and on the circular section (a B32 in ccx) at the first element's middle
+    # pinned end, and on the circular section (a B32R in ccx) at the first element's middle
     # node — at the end node ccx 2.23 would lock the bending rotation as well (f1 1.46x).
     beam_refs = {}
     for name, label, ei, rho_a in (
@@ -1577,6 +1577,34 @@ def main():
                   f"{got[2]:.0f} (Euler {refs[2]:.0f}); max {max(diffs) * 100:.1f}% diff")
             failures += 0 if ok else 1
         shutil.rmtree(d, ignore_errors=True)
+
+    # --- two B22 elements: the mesh on which Abaqus' quadratic beam is exact ----------------
+    # Abaqus integrates its 3-node beams at 2 points along the beam, as ccx's B32R, which the
+    # converter writes them as: Abaqus' mid-span deflection (Timoshenko, k = 0.85) to 0.15 %,
+    # f1 and the Euler load to 1.3 % on two elements (ccx's B32, 3 points: 0.76, +11 %, +21 %).
+    inp = os.path.join(tmp, "planar_b22_two_elements.inp")
+    convert(os.path.join(EXAMPLES, "planar_b22_two_elements.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    ei, ga = 210000.0 * 20.0 * 40.0 ** 3 / 12, 210000.0 / 2.6 * 800.0
+    refs = [math.sqrt(ei / (7.85e-9 * 800.0)) * math.pi / 2e6, math.pi ** 2 * ei / 1e6,
+            -(1000.0 * 1000.0 ** 3 / (48 * ei) + 1000.0 * 1000.0 / (4 * 0.85 * ga))]
+    dat = os.path.join(d, "job.dat")
+    got = (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")[:1]
+           + dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")[:1]
+           + [(dat_displacement(dat, 3) or [0.0, None])[1]]) if status == "solved" else []
+    if len(got) < 3 or got[2] is None:
+        print(f"FAIL  planar_b22_two_elements: no frequency / buckling factor / deflection ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        diffs = [abs(g - r) / abs(r) for g, r in zip(got, refs)]
+        ok = max(diffs) < 0.02 and diffs[2] < 0.005
+        print(f"{'PASS' if ok else 'FAIL'}  planar_b22_two_elements (2 x B22 -> B32R): mid-span "
+              f"deflection {got[2]:+.4f} (Abaqus' exact {refs[2]:+.4f}, {diffs[2] * 100:.2f}% diff), "
+              f"f1 {got[0]:.2f} Hz (beam theory {refs[0]:.2f}), buckling load {got[1]:.0f} (Euler "
+              f"{refs[1]:.0f}); max {max(diffs) * 100:.1f}% diff")
+        failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
 
     # --- per-element *DISTRIBUTION orientations vs one *ORIENTATION per element ---------
     # ccx 2.23 gives each element its own distribution line only under a *SOLID SECTION
@@ -1968,7 +1996,7 @@ def main():
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
 
-    # Beam line loads (*DLOAD PY / local P2 / PZ) on B31, B32 and a CIRC B31 run as B32 with
+    # Beam line loads (*DLOAD PY / local P2 / PZ) on B31, B32 and a CIRC B31 run as B32R with
     # midside nodes: the applied resultants are q L, the tip deflections q L^4 / (8 E I).
     inp = os.path.join(tmp, "lineload.inp")
     convert(os.path.join(EXAMPLES, "beam_line_load_cantilever.inp"), inp)

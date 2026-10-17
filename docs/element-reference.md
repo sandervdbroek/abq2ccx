@@ -65,28 +65,28 @@ Direct CalculiX types: **68**. Total recognised: **175**.
 | --- | --- | --- |
 | `B21` | 2 | direct |
 | `B21H` | 2 | → `B21` (substituted: reduced physics) |
-| `B22` | 3 | → `B32` (exact) |
+| `B22` | 3 | → `B32R` (exact) |
 | `B23` | 2 | → `B31` (substituted: reduced physics) |
 | `B31` | 2 | direct |
 | `B31H` | 2 | → `B31` (substituted: reduced physics) |
 | `B31R` | 2 | direct |
-| `B32` | 3 | direct |
-| `B32H` | 3 | → `B32` (substituted: reduced physics) |
+| `B32` | 3 | → `B32R` (exact) |
+| `B32H` | 3 | → `B32R` (substituted: reduced physics) |
 | `B32R` | 3 | direct |
 | `B33` | 2 | → `B31` (substituted: reduced physics) |
 | `B33H` | 2 | → `B31` (substituted: reduced physics) |
 | `PIPE21` | 2 | → `B21` (substituted: reduced physics) |
-| `PIPE22` | 3 | → `B32` (substituted: reduced physics) |
+| `PIPE22` | 3 | → `B32R` (substituted: reduced physics) |
 | `PIPE31` | 2 | → `B31` (substituted: reduced physics) |
-| `PIPE32` | 3 | → `B32` (substituted: reduced physics) |
+| `PIPE32` | 3 | → `B32R` (substituted: reduced physics) |
 | `T2D2` | 2 | direct |
 | `T2D3` | 3 | → `T3D3` (exact) |
 | `T3D2` | 2 | direct |
 | `T3D3` | 3 | direct |
 
-Under a `*BEAM SECTION, SECTION=CIRC`, 2-node beams whose emitted type is `B21` → `B32`, `B31` → `B32`, `B31R` → `B32R` become 3-node beams: ccx 2.23 rejects linear beams with a circular section. Each element gets a new midside node at the midpoint of its end nodes (ccx's order is end, middle, end); element ids and sets are kept, and BCs, temperatures and initial conditions given for both end nodes also reach the midside node. The 3-node beam is a different element than Abaqus' 2-node one, so such a deck counts as reduced physics.
+Every 3-node beam runs as ccx's `B32R`, the 20-node brick integrated at 2 × 2 × 2 points: 2 along the beam, as Abaqus integrates its quadratic beams (`B22`, `B32`, `PIPE22`, `PIPE32`). ccx's `B32` integrates at 3 × 3 × 3 and locks on coarse meshes (a cantilever's tip deflection under an end load: 0.77 of beam theory on one element, 0.95 on two; exact on any number of `B32R`).
 
-Under `SECTION=PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), which ccx 2.23 runs only on `B32R`, beams whose emitted type is `B21`, `B31`, `B31R`, `B32` become `B32R`: the 2-node ones get a midside node in the same way, and `B32` only changes type.
+Under a `*BEAM SECTION, SECTION=CIRC`, `PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), 2-node beams whose emitted type is `B21` → `B32R`, `B31` → `B32R`, `B31R` → `B32R` become 3-node beams: ccx 2.23 rejects linear beams with a circular section and runs `PIPE` and `BOX` sections only on `B32R`. Each element gets a new midside node at the midpoint of its end nodes (ccx's order is end, middle, end); element ids and sets are kept, and BCs, temperatures and initial conditions given for both end nodes also reach the midside node. The 3-node beam is a different element than Abaqus' 2-node one, so such a deck counts as reduced physics.
 
 ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` — so the out-of-plane DOFs of `B21`, `B22`, `B23`, `PIPE21`, `PIPE22`, `T2D2`, `T2D3` (and their `H`/`T` variants) are free in ccx. In a planar model (no 3-D elements, all their nodes at one z) the converter fixes DOF 3 on their nodes, midside nodes included (node set `ABQ2CCX_PLANAR`, model data, repeated after `*BOUNDARY, OP=NEW`), and DOFs 4-5 at one node of a straight beam whose twist nothing restrains (on a circular section, an element's middle node: at an end node ccx 2.23 would lock the bending rotation too). The rotations are not fixed on every node (that stiffens ccx's expanded beams), so `*FREQUENCY` results include twist modes that Abaqus' planar beams do not have (warned).
 

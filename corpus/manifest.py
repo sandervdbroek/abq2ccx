@@ -121,10 +121,12 @@ CORPUS = [
              read=('freq', (1, 2, 9, 10)),
              target=[11.336, 17.709, 45.345, 57.39],
              abaqus=[11.337, 17.676, 45.686, 57.745], tol=0.005,
-             ccx=[11.647, 19.349, 50.434, 70.213],
-             why="ccx expands each 3-node beam into one C3D20 brick, much stiffer than Abaqus' B22 on "
-                 'this mesh of 8 elements a 10 m arm: one pinned 10 m beam of it gives 11.65 and 50.50 '
-                 'Hz for n = 2 and 4 (beam theory 11.34 and 45.35; with 32 elements 11.33 and 45.28)',
+             ccx=[11.342, 18.059, 45.895, 59.304],
+             why="ccx's beam is a 3-D brick whose end section a clamp or knot keeps from contracting "
+                 "with Poisson's ratio (0.3 here), which stiffens the modes whose arms the crossing "
+                 'clamps (2 and 10; 1 and 9 within 0.5 %) on these 4 elements per arm: one such 5 m arm '
+                 'gives 18.08 and 59.63 Hz, with nu = 0 17.72 and 58.45 (Abaqus 17.676 and 57.745, '
+                 'beam theory 17.71 and 57.39)',
              source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv2.htm'),
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv2x22x.inp'),
     dict(name='abaqus2017_nfv32f8c', expect_solve=True,
@@ -328,11 +330,6 @@ CORPUS = [
              read=('disp', 17, ((1, 0, 0), (0, -1, 0)), (1.0, 2.0)),
              target=[-0.44, 0.719, -1.577, 0.421],
              abaqus=[-0.447, 0.723, -1.577, 0.427], tol=0.01, unit=3.2,
-             ccx=[-0.40619, 0.69967, -1.4989, 0.46906],
-             why="ccx runs B32 as one 20-node brick integrated at 3 x 3 x 3 points, stiffer than "
-                 "Abaqus' B22 on these 8 elements: the same beam gives -0.4476, 0.7228, -1.5772, "
-                 "0.4265 on 16 elements and -0.4506, 0.7244, -1.5878, 0.4216 on 64; as ccx's B32R "
-                 "(2 x 2 x 2 points) -0.4503, 0.7242, -1.5818, 0.4231 on these 8",
              source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-nl6.htm'),
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl6x22x.inp'),
     dict(name='abaqus2017_nt1xxf8x', expect_solve=True,
@@ -409,7 +406,7 @@ CORPUS = [
              source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-t2.htm'),
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/onedheattransrad_std_c3d8t.inp'),
     dict(name='bbr6464_nat_freq', expect_solve=True,
-         reduced_physics='its SECTION=CIRC B21 beams run as 3-node B32 (ccx 2.23 stops on linear circular-section beams): a different element', license='see source repo',
+         reduced_physics='its SECTION=CIRC B21 beams run as 3-node B32R (ccx 2.23 stops on linear circular-section beams): a different element', license='see source repo',
          exercises='B21 — parts/instances/assembly; *Frequency',
          url='https://raw.githubusercontent.com/BBR6464/Abaqus-Material-Analysis/main/Project_8_Frequancy%20Analysis/nat_freq.inp'),
     dict(name='brieffiniteelementnet_job_1', expect_solve=True,
@@ -549,11 +546,11 @@ CORPUS = [
          exercises='T2D2',
          url='https://raw.githubusercontent.com/hqdinh/Truss-solver/master/example_input_files/example6.inp'),
     dict(name='igrega348_bcc_sc', expect_solve=True,
-         reduced_physics='its SECTION=CIRC B31 beams run as 3-node B32 (ccx 2.23 stops on linear circular-section beams): a different element', license='MIT',
+         reduced_physics='its SECTION=CIRC B31 beams run as 3-node B32R (ccx 2.23 stops on linear circular-section beams): a different element', license='MIT',
          exercises='B31 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/bcc-sc.inp'),
     dict(name='igrega348_e11128', expect_solve=True,
-         reduced_physics='its SECTION=CIRC B31 beams run as 3-node B32 (ccx 2.23 stops on linear circular-section beams): a different element', license='MIT',
+         reduced_physics='its SECTION=CIRC B31 beams run as 3-node B32R (ccx 2.23 stops on linear circular-section beams): a different element', license='MIT',
          exercises='B31 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/E11128.inp'),
     dict(name='jain_shobhit_job_beamhex', expect_solve=True, license='GPL-3.0',
