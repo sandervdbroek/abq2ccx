@@ -20286,19 +20286,44 @@ def _windows_ccx_candidates() -> List[str]:
     return [c for c in dedup_str(out) if os.path.isfile(c)]
 
 
+def _conda_dll_dirs(exe: str) -> List[str]:
+    """The folders `conda activate` puts on PATH for the conda environment whose Library\\bin
+    holds ``exe`` (those that exist), or [] for an executable outside one.  conda-forge's
+    Windows ccx needs them: it sits in Library\\bin, the GCC runtime DLLs it loads
+    (libgfortran, libgomp) in the environment's bin."""
+    lib_bin = os.path.dirname(os.path.abspath(exe))
+    prefix = os.path.dirname(os.path.dirname(lib_bin))
+    if (os.path.normcase(lib_bin) != os.path.normcase(os.path.join(prefix, "Library", "bin"))
+            or not os.path.isdir(os.path.join(prefix, "conda-meta"))):
+        return []
+    dirs = [os.path.join(prefix, *d) for d in ((), ("Library", "mingw-w64", "bin"),
+                                               ("Library", "usr", "bin"), ("Library", "bin"),
+                                               ("Scripts",), ("bin",))]
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def _ccx_env(exe: str) -> Dict[str, str]:
+    """What the environment of ``exe`` needs beyond the current one: on Windows, its conda
+    environment's folders on PATH."""
+    dirs = _conda_dll_dirs(exe) if os.name == "nt" else []
+    return {"PATH": os.pathsep.join(dirs + [os.environ.get("PATH", "")])} if dirs else {}
+
+
 def find_ccx(override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, str]]:
     """Locate a CalculiX executable: --ccx/$CCX override, PATH, then known install spots
     (FreeCAD, PrePoMax and bConverged on Windows; FreeCAD's macOS bundle, whose dylibs need
-    the ../lib fallback path, Homebrew and MacPorts elsewhere)."""
+    the ../lib fallback path, Homebrew and MacPorts elsewhere).  On Windows a ccx of a conda
+    environment, found or given, runs with the environment's folders on PATH, as `conda
+    activate` sets them."""
     for cand in ([override] if override else []) + \
                 ([os.environ["CCX"]] if not override and os.environ.get("CCX") else []):
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return os.path.abspath(cand), {}          # --run starts it in the output folder
+            return os.path.abspath(cand), _ccx_env(cand)   # --run starts it in the output folder
         return None, {}
     for name in ("ccx", "ccx_2.23", "ccx_2.22", "ccx_2.21", "CalculiX"):
         p = shutil.which(name)
         if p:
-            return p, {}
+            return p, _ccx_env(p)
     if os.name == "nt":
         return next(iter(_windows_ccx_candidates()), None), {}
     candidates = (glob.glob("/Applications/FreeCAD*.app/Contents/Resources/bin/ccx")
@@ -20938,6 +20963,19 @@ def ccx_version(exe: str, env: Optional[Dict[str, str]] = None) -> Optional[str]
     return _ccx_versions[exe]
 
 
+# The exit codes (NTSTATUS) of a Windows program that could not start or that crashed
+_WINDOWS_EXITS = {0xC0000135: "a DLL that ccx needs is missing",
+                  0xC0000139: "a DLL that ccx needs is another version",
+                  0xC000007B: "a DLL that ccx needs is built for another architecture",
+                  0xC00000FD: "stack overflow", 0xC0000005: "access violation"}
+
+
+def _exit_code_text(code: int) -> str:
+    """``exit code N``, saying what Windows means by it where it is a known NTSTATUS."""
+    what = _WINDOWS_EXITS.get(code & 0xFFFFFFFF)
+    return f"exit code 0x{code & 0xFFFFFFFF:08X} ({what})" if what else f"exit code {code}"
+
+
 def _warn_ccx_version(exe: str, version: Optional[str]) -> None:
     if version in CCX_VERSIONS or exe in _ccx_warned:
         return
@@ -21001,7 +21039,7 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
         errs = [ln.strip() for ln in out.splitlines() if "*ERROR" in ln][:3]
         aborts = [s.strip() for s in CCX_ABORT_SIGNS if s in out]
         why = (" | ".join(errs) if errs else
-               f"exit code {p.returncode}" if p.returncode != 0 else
+               _exit_code_text(p.returncode) if p.returncode != 0 else
                f"crash after 'Job finished' ({aborts[0]})" if aborts else
                "no 'Job finished'")
         sys.stderr.write(f"abq2ccx: ccx did NOT finish cleanly: {why}\n")

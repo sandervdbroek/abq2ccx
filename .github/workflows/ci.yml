@@ -85,7 +85,22 @@ jobs:
         env:
           CCX: ${{ steps.calculix.outputs.environment-path }}/${{ matrix.ccx }}
         run: |
-          python -c "import abq2ccx, os, sys; v = abq2ccx.ccx_version(os.environ['CCX']); print('ccx', v); sys.exit(v != '2.23')"
+          # $CCX as --run finds it: on Windows with its conda environment's folders on PATH,
+          # where conda's Windows ccx finds its GCC runtime DLLs
+          python - <<'EOF'
+          import abq2ccx, os, subprocess, sys
+          exe, extra = abq2ccx.find_ccx()
+          if not exe:
+              sys.exit("no ccx at " + os.environ["CCX"])
+          env = dict(os.environ, **extra)
+          version = abq2ccx.ccx_version(exe, env)
+          print("ccx", version, "at", exe)
+          for d in abq2ccx._conda_dll_dirs(exe) or [os.path.dirname(exe)]:
+              print(" ", d, sorted(f for f in os.listdir(d) if f.lower().endswith(".dll")))
+          if version != "2.23":
+              p = subprocess.run([exe, "-v"], env=env, capture_output=True)
+              sys.exit(f"{abq2ccx._exit_code_text(p.returncode)}: {p.stdout!r} {p.stderr!r}")
+          EOF
           [ "$RUNNER_OS" = Windows ] || ulimit -f 4194304      # Windows has no file-size limit
           python validate_with_ccx.py | tee validate.log
           python -c "import os, sys; sys.exit('Using ccx: ' + os.path.abspath(os.environ['CCX']) not in open('validate.log', errors='replace').read())"

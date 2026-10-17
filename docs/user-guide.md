@@ -9,8 +9,9 @@
 * CalculiX (`ccx`) only to run the result. `--run` and `validate_with_ccx.py` take `$CCX`
   (`--run` also `--ccx PATH`), else look on `PATH`, then in FreeCAD (FreeCAD 1.1.4 ships ccx
   2.23), PrePoMax and bConverged installs on Windows, and in FreeCAD's macOS bundle and
-  Homebrew/MacPorts elsewhere. `--run` prints the version it runs and warns if it is not 2.22
-  or 2.23, the versions the converter targets.
+  Homebrew/MacPorts elsewhere. A conda environment's ccx on Windows needs no `conda activate`:
+  it runs with the folders activation would put on `PATH`. `--run` prints the version it runs
+  and warns if it is not 2.22 or 2.23, the versions the converter targets.
 
 ## Command line
 

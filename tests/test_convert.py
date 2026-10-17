@@ -7348,6 +7348,35 @@ def test_find_ccx_override_is_absolute():
     assert ok and missing == (None, {}), (found, missing)
 
 
+def test_find_ccx_in_a_conda_environment():
+    # conda-forge's Windows ccx is <env>\Library\bin\ccx.exe and loads DLLs from the
+    # environment's bin: unless the environment is active, it runs with the folders that
+    # `conda activate` puts on PATH (those that exist, in conda's order)
+    d = tempfile.mkdtemp()
+    try:
+        env = os.path.join(d, "envs", "ccx")
+        exe = _touch(env, "Library", "bin", "ccx.exe")
+        for sub in (("conda-meta",), ("bin",)):
+            os.makedirs(os.path.join(env, *sub))
+        dirs = A._conda_dll_dirs(exe)
+        outside = [A._conda_dll_dirs(_touch(d, "Library", "bin", "ccx.exe")),     # no conda-meta
+                   A._conda_dll_dirs(_touch(env, "bin", "ccx.exe"))]
+        found, extra = A.find_ccx(exe)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert dirs == [env, os.path.join(env, "Library", "bin"), os.path.join(env, "bin")], dirs
+    assert outside == [[], []], outside
+    want = {"PATH": os.pathsep.join(dirs + [os.environ.get("PATH", "")])} if os.name == "nt" else {}
+    assert found == exe and extra == want, (found, extra)
+
+
+def test_run_explains_windows_exit_codes():
+    # a ccx that Windows could not start exits with an NTSTATUS, which --run spells out
+    assert A._exit_code_text(0xC0000135) == "exit code 0xC0000135 (a DLL that ccx needs is missing)"
+    assert A._exit_code_text(-1073741571) == "exit code 0xC00000FD (stack overflow)"
+    assert A._exit_code_text(201) == "exit code 201" and A._exit_code_text(-11) == "exit code -11"
+
+
 def test_cli_output_on_a_cp1252_console():
     # a Latin-1 byte reads as U+FFFD, which the report echoes: on a strict cp1252 stream (a
     # Windows console or redirect) the CLI writes it as an escape instead of raising
@@ -7631,10 +7660,10 @@ def test_results_digest_skips_the_rows_b32r_prints_past_its_points():
     d = tempfile.mkdtemp()
     try:
         job = os.path.join(d, "job")
-        open(job + ".inp", "w").write(inp)
-        open(job + ".dat", "w").write("\n S T E P       1\n\n INCREMENT     1\n\n stresses (elem, "
-                                      "integ.pnt.,sxx,syy,szz,sxy,sxz,syz) for set EALL and time  "
-                                      "0.1000000E+01\n\n" + rows)
+        open(job + ".inp", "w", encoding="utf-8", newline="\n").write(inp)
+        open(job + ".dat", "w", encoding="utf-8", newline="\n").write(
+            "\n S T E P       1\n\n INCREMENT     1\n\n stresses (elem, "
+            "integ.pnt.,sxx,syy,szz,sxy,sxz,syz) for set EALL and time  0.1000000E+01\n\n" + rows)
         assert A._deck_steps(job + ".inp")["rows"] == {1: 8, 2: 8}
         assert A.ccx_results_digest(job)[0]["max_mises"] == {"value": 6.0, "element": 3, "set": "EALL"}
     finally:

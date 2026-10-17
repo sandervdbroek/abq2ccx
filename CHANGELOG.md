@@ -24,6 +24,11 @@ physics.
 * **Default rotation axis** — an `*ORIENTATION` without a rotation line turns about its axis 1
   on shells and membranes, as Abaqus documents, so material direction 1 follows axis 2 (it
   followed the axis closest to the normal); warned where axis 1 lies in the shell.
+* **CalculiX on Windows** — CI now runs `validate_with_ccx.py` and `--run` with conda-forge's
+  Windows ccx 2.23 as well. That ccx does not start outside its activated environment, so
+  `--run` and `validate_with_ccx.py` give a conda environment's ccx the folders `conda
+  activate` puts on `PATH`; and a ccx that Windows cannot start is reported as such ("exit
+  code 0xC0000135 (a DLL that ccx needs is missing)", not 3221225781).
 
 ## 1.2.1 (October 2026)
 
