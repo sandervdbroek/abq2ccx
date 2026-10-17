@@ -89,7 +89,7 @@ with the reason, so ccx never silently runs a different model.
 
 `python validate_with_ccx.py` converts the bundled examples, runs them in CalculiX (it finds
 `ccx`, including FreeCAD's copy) and compares each result with an independent reference. It
-prints one `PASS` line per check, about seventy in all; [testing](docs/testing.md) lists them.
+prints one `PASS` line per check, about a hundred in all; [testing](docs/testing.md) lists them.
 
 | Check | Reference | Agreement |
 | --- | --- | --- |
