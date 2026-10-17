@@ -8015,15 +8015,25 @@ def test_continuum_shell_stack_direction_restacks_the_element():
         name, face = _card_at(body, "*SURFACE")[0].split(", ")
         geo.append(([[g.nodes[n] for n in conn] for _, conn in g.elements.values()], g.elset(name), face))
     assert geo[0] == geo[1] and geo[0][1:] == ([4, 6], "S2")
-    # STACK DIRECTION=ORIENTATION: the isoparametric direction closest to the orientation's axis 3
-    deck = deck1.replace("stack direction=1", "stack direction=ORIENTATION, orientation=VERT").replace(
-        "*Shell Section", "*Orientation, name=VERT\n0., 1., 0., 0., 0., 1.\n*Shell Section")
-    _, conv, _ = convert_str(deck)                     # axis 3 = (0,1,0) x (0,0,1) = x: along x
+    # STACK DIRECTION=ORIENTATION: the isoparametric direction closest to the orientation's
+    # rotation axis, Abaqus' approximate normal (2017 "About shell elements"), by default axis 1
+    # (the elements' direction 1 is z, 2 is x, 3 is y)
+    deck = deck1.replace("stack direction=1", "stack direction=ORIENTATION, orientation=O").replace(
+        "*Shell Section", "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n*Shell Section")
+    _, conv, rep = convert_str(deck)                   # axis 1 = x: along x
     xs = sorted({round(conv.geom.nodes[n][0], 9) for _, conn in conv.geom.elements.values() for n in conn})
     assert xs == [0.0, 0.333333333, 0.666666667, 1.0, 1.333333333, 1.666666667, 2.0], xs
-    deck = deck.replace("0., 1., 0., 0., 0., 1.", "1., 0., 0., 0., 1., 0.")   # axis 3 = z
-    _, conv, _ = convert_str(deck)
-    assert [[conv.geom.nodes[n] for n in conn] for _, conn in conv.geom.elements.values()] == geo[0][0]
+    assert "STACK DIRECTION" not in rep.text()
+    split = {}
+    for rot in ("3, 30.", "2, 0."):                    # about axis 3 = z, about axis 2 = y
+        _, conv, _ = convert_str(deck.replace("1., 0., 0., 0., 1., 0.\n", f"1., 0., 0., 0., 1., 0.\n{rot}\n"))
+        split[rot] = [[conv.geom.nodes[n] for n in conn] for _, conn in conv.geom.elements.values()]
+    ys = sorted({round(p[1], 9) for conn in split["2, 0."] for p in conn})
+    assert split["3, 30."] == geo[0][0] and ys == [0.0, 0.333333333, 0.666666667, 1.0], ys
+    # an orientation whose axes come from each element's nodes: direction 3 (warned)
+    _, conv, rep = convert_str(deck.replace("name=O\n1., 0., 0., 0., 1., 0.", "name=O, definition=OFFSET TO NODES\n1, 2, 4"))
+    assert [[conv.geom.nodes[n] for n in conn] for _, conn in conv.geom.elements.values()] == split["2, 0."]
+    assert "orientation 'O' has no fixed axes here" in rep.text()
 
 
 def test_continuum_shell_layups_meeting_on_an_edge_are_tied():
@@ -8393,10 +8403,15 @@ def test_continuum_shell_axes_follow_the_stack_direction():
     assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, 0, 1"]
     body, _, _ = convert_str(deck.replace(", stack direction=1", ""))
     assert "ABQ2CCX_AXES" not in body
-    # STACK DIRECTION=ORIENTATION: along the orientation's axis 3, -y, whose axes then agree
+    # STACK DIRECTION=ORIENTATION: along the orientation's rotation axis, here 3: -y, whose axes
+    # then agree; without a rotation line along axis 1, here -y too, and Abaqus projects axis 2
     body, _, _ = convert_str(deck.replace("stack direction=1", "stack direction=ORIENTATION, orientation=O")
                              + "*Orientation, name=O\n1., 0., 0., 0., 0., 1.\n3, 0.\n")
     assert "ABQ2CCX_AXES" not in body and "MATERIAL=CFRP, ORIENTATION=O" in body
+    body, _, rep = convert_str(deck.replace("stack direction=1", "stack direction=ORIENTATION, orientation=O")
+                               + "*Orientation, name=O\n0., -1., 0., 1., 0., 0.\n")
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, 0, 1"]
+    assert "STACK DIRECTION" not in rep.text()
     # an SC6R wedge is stacked from nodes 1-3 to 4-6
     wedge = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 0., 1.\n4, 0., -0.1, 0.\n5, 1., -0.1, 0.\n"
              "6, 0., -0.1, 1.\n*Element, type=SC6R, elset=W\n1, 1, 2, 3, 4, 5, 6\n" + COMPOSITE_MAT
@@ -8476,18 +8491,27 @@ def test_continuum_shell_distribution_orientation_shared_with_other_cards():
 
 
 def test_continuum_shell_stack_along_a_cylindrical_orientation():
-    # STACK DIRECTION=ORIENTATION takes the orientation's axis 3 at each element's centre: a
-    # cylindrical system turned about its axis 2 has it radial, so the plies stack outward
+    # STACK DIRECTION=ORIENTATION stacks along the orientation's rotation axis at each element's
+    # centre, axis 1 without a rotation line: a cylindrical system's radial axis (2017 "About
+    # shell elements", Figure 6).  The ring's elements run radially along their direction 1 and
+    # axially along 3, yet the plies stack outward, the 0-degree ply along the hoop
     pts = [(r, math.radians(a), z) for r in (1.0, 1.1) for z in (0.0, 1.0) for a in (0.0, 30.0, 60.0)]
     nodes = "".join(f"{k + 1}, {r * math.cos(t):.9f}, {r * math.sin(t):.9f}, {z}\n" for k, (r, t, z) in enumerate(pts))
-    deck = (f"*Node\n{nodes}*Element, type=SC8R, elset=CYL\n1, 1, 2, 5, 4, 7, 8, 11, 10\n"
-            "2, 2, 3, 6, 5, 8, 9, 12, 11\n" + COMPOSITE_MAT
-            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n2, 90.\n"
+    deck = (f"*Node\n{nodes}*Element, type=SC8R, elset=CYL\n1, 1, 7, 8, 2, 4, 10, 11, 5\n"
+            "2, 2, 8, 9, 3, 5, 11, 12, 6\n" + COMPOSITE_MAT
+            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n"
             "*Shell Section, elset=CYL, composite, stack direction=ORIENTATION, orientation=C\n"
             "1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n")
-    _, conv, _ = convert_str(deck)
+    body, conv, _ = convert_str(deck)
     g = conv.geom
     assert {round(math.hypot(*g.nodes[n][:2]), 9) for n in g.nodes if n > 12} == {1.05}
+    assert g.elements[1] == ("C3D8I", [1, 2, 5, 4, 13, 14, 15, 16])          # the inner ply
+    c, s = math.cos(math.radians(15.0)), math.sin(math.radians(15.0))
+    vals = [float(x) for x in _card_at(body, "*DISTRIBUTION, NAME=CYL_PLY1_AXES")[0].split(",")]
+    assert max(abs(x - y) for x, y in zip(vals, (1, -s, c, 0, 0, 0, 1))) < 1e-8
+    # turned about its axis 3, the plies stack along the cylinder's axis
+    _, conv, _ = convert_str(deck.replace("0., 0., 1.\n*Shell", "0., 0., 1.\n3, 0.\n*Shell"))
+    assert {conv.geom.nodes[n][2] for n in conv.geom.nodes if n > 12} == {0.5}
 
 
 def test_composite_examples_match_the_validation_decks():

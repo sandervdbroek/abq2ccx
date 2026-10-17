@@ -1193,6 +1193,59 @@ def sc_cylinder_hoop_deck(n=24, m=2, t=0.01):
     return "\n".join(lines) + "\n"
 
 
+def sc_cylinder_stack_deck(composite=True, n=24, m=2, t=0.01, eps=1e-3):
+    """sc_cylinder_hoop_deck's cylinder with its SC8R elements numbered radially along their
+    direction 1 and axially along 3, as [0/90/0] plies of SC_PLY or one layer, STACK
+    DIRECTION=ORIENTATION with the cylindrical *ORIENTATION without a rotation line, stretched
+    by the axial strain ``eps`` prescribed at its ends.  Abaqus stacks along the system's axis
+    1, radial (2017 "About shell elements"), so the axial force is the wall's membrane force
+    with the hoop free (sc_cylinder_stack_force); stacked along axis 3 the plies would be
+    slices of the length, the material's axis 3 axial."""
+    nid = lambda i, j, k: 1 + i % n + n * j + n * (m + 1) * k      # noqa: E731
+    lines = ["*Heading", "Thin open cylinder stretched along its axis: SC8R continuum shells "
+             "stacked by a cylindrical *Orientation", "*Node"]
+    for k, r in enumerate((1.0 - t / 2, 1.0 + t / 2)):
+        for j in range(m + 1):
+            for i in range(n):
+                th = 2 * math.pi * i / n
+                lines.append(f"{nid(i, j, k)}, {r * math.cos(th):.12g}, {r * math.sin(th):.12g}, {j / m:.12g}")
+    lines.append("*Element, type=SC8R, elset=CYL")
+    q = [(0, 0), (0, 1), (1, 1), (1, 0)]                  # outward, then around: direction 1 radial
+    for j in range(m):
+        for i in range(n):
+            lines.append(f"{1 + i + n * j}, " + ", ".join(str(nid(i + a, j + c, k)) for c in (0, 1) for a, k in q))
+    lines += ["*Nset, nset=BASE"] + _ids([nid(i, 0, k) for k in (0, 1) for i in range(n)])
+    lines += ["*Nset, nset=TOP"] + _ids([nid(i, m, k) for k in (0, 1) for i in range(n)])
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = SC_PLY
+    lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
+              f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}",
+              "*Orientation, name=CYL, system=CYLINDRICAL", "0., 0., 0., 0., 0., 1."]
+    if composite:
+        lines += ["*Shell Section, elset=CYL, composite, stack direction=ORIENTATION, orientation=CYL",
+                  "1., 3, PLY, 0.", "1., 3, PLY, 90.", "1., 3, PLY, 0."]
+    else:
+        lines += ["*Shell Section, elset=CYL, material=PLY, stack direction=ORIENTATION, orientation=CYL",
+                  f"{t:g}"]
+    lines += ["*Step", "*Static", "*Boundary", "BASE, 3, 3", f"TOP, 3, 3, {eps:g}"]
+    for i, d in ((0, 2), (n // 2, 2), (n // 4, 1), (3 * n // 4, 1)):
+        lines += [f"{nid(i, 0, k)}, {d}, {d}" for k in (0, 1)]
+    lines += ["*Node print, nset=TOP, totals=ONLY", "RF", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def sc_cylinder_stack_force(composite=True, n=24, t=0.01, eps=1e-3):
+    """The axial force sc_cylinder_stack_deck must give: its faceted wall (flat elements, faces
+    t cos(pi / n) apart, mid-surface perimeter 2 n sin(pi / n)) under the axial strain ``eps``
+    with no hoop force, from the plane-stress stiffness of radial plies whose direction 1 is the
+    system's axis 2, the hoop (classical lamination theory; exact for the uniform strain)."""
+    plies = (0.0, 90.0, 0.0) if composite else (0.0,)
+    a11 = a22 = a12 = 0.0
+    for ang in plies:
+        q11, q22, q12 = reduced_stiffness(ang, SC_PLY)[:3]
+        a11, a22, a12 = a11 + q11 * t / len(plies), a22 + q22 * t / len(plies), a12 + q12 * t / len(plies)
+    return n * math.sin(2 * math.pi / n) * (a22 - a12 * a12 / a11) * eps
+
+
 def cylinder_hoop_deck(rotation="", n=24, m=2, t=0.01):
     """A thin open cylinder (radius 1, length 1, axis z) of S4 shells under internal pressure 1,
     an orthotropic ply (INPLANE_PLY) with a cylindrical *ORIENTATION about the axis and an
@@ -3423,6 +3476,23 @@ def main():
         if res:                                    # solved, but without the probe nodes
             print("FAIL  sc_cylinder_hoop: no displacement at the probe nodes")
         failures += 1
+    # STACK DIRECTION=ORIENTATION stacks along the orientation's rotation axis, by default
+    # axis 1: a cylindrical system's radial axis, whatever the elements' numbering
+    for composite in (True, False):
+        tag = "sc_cylinder_stack_" + ("composite" if composite else "plain")
+        res = composite_run(sc_cylinder_stack_deck(composite), tag)
+        if res is None:
+            failures += 1
+            continue
+        want = sc_cylinder_stack_force(composite)
+        got = res[1][0][2] if res[1] else math.inf
+        err = abs(got / want - 1)
+        ok = err < 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (SC8R cylinder numbered radially along direction 1, "
+              f"{'[0/90/0] plies' if composite else 'one layer'}, STACK DIRECTION=ORIENTATION with a "
+              f"cylindrical *ORIENTATION without a rotation line, axial strain): axial force {got:.6g} vs "
+              f"the radially stacked wall's membrane stiffness {want:.6g} ({err:.1e} apart)")
+        failures += 0 if ok else 1
     ref = None
     for plane, tilt in (("XY", 0.0), ("XY", 30.0), ("XZ", 30.0), ("YZ", 30.0)):
         res = composite_run(distribution_panel_deck(plane, tilt), f"distribution_panel_{plane}_{tilt:g}")

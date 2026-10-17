@@ -6615,9 +6615,8 @@ class Converter:
             if base not in PLY_SOLID or len(conn) != ELEMENT_NNODES[base] or \
                     any(x not in self.geom.nodes for x in conn):
                 return None
-            axis3 = self._stack_axis3(b, self._dist_refs, conn) \
-                if len(conn) == 8 and stack == "ORIENTATION" else None
-            order = self._stack_order(conn, stack, axis3) if len(conn) == 8 else tuple(range(1, 7))
+            axis = self._stack_axis(b, conn) if len(conn) == 8 and stack == "ORIENTATION" else None
+            order = self._stack_order(conn, stack, axis) if len(conn) == 8 else tuple(range(1, 7))
             pc = [conn[q - 1] for q in order]
             n, centre = self._stack_geometry(pc[:len(pc) // 2], pc[len(pc) // 2:])
             fr = self._abaqus_frame(e, name, centre) if name else None
@@ -14393,22 +14392,29 @@ class Converter:
         except ValueError:
             return stack
 
-    def _stack_axis3(self, b: Block, dist_oris: set, conn: Sequence[int]) -> Optional[Vec]:
-        """For STACK DIRECTION=ORIENTATION, axis 3 of section ``b``'s orientation at the centre
-        of the element with nodes ``conn`` (a cylindrical system's turns with it), which
-        _stack_order stacks along; None (warned: the stack direction is direction 3) where it
-        has no fixed axes — undefined, or a distribution one (in ``dist_oris``)."""
+    def _stack_axis(self, b: Block, conn: Sequence[int]) -> Optional[Vec]:
+        """For STACK DIRECTION=ORIENTATION, the axis of section ``b``'s orientation that
+        _stack_order stacks along, at the centre of the element with nodes ``conn`` (a
+        cylindrical system's turns with it): the axis of its additional rotation, axis 1
+        without a rotation line.  For shells the orientation "defines an axis about which the
+        local 1 and 2 material directions may be rotated. This axis also defines an
+        approximate normal direction", and Abaqus stacks along the isoparametric direction
+        closest to it (2017 "About shell elements"; its cylindrical example stacks along the
+        radial axis 1).  None (warned: the stack direction is direction 3) where the converter
+        has no axes for it (_orient_axes): undefined, or given by a distribution or by each
+        element's nodes."""
         ori = (b.param("ORIENTATION") or "").strip().upper()
-        if ori in self.orientations and ori not in dist_oris:
+        if ori in self._orient_axes:
             a, bb, system = self.orientations[ori]
             centre = (0.0, 0.0, 0.0)
             for x in conn:
                 centre = vadd(centre, vscale(self.geom.nodes[x], 1.0 / len(conn)))
-            return orientation_frame(a, bb, system, centre, self._orient_rotation.get(ori))[0][2]
+            frame, k = orientation_frame(a, bb, system, centre, self._orient_rotation.get(ori))
+            return frame[(k or 1) - 1]
         self.report.warn(f"*{b.keyword} {(b.param('ELSET') or '').strip()}, STACK DIRECTION=ORIENTATION: "
-                         f"orientation '{ori}' has no fixed axes here (undefined, or given by a "
-                         f"distribution, which Abaqus does not allow there); the stack direction is "
-                         f"taken as direction 3.", once=True)
+                         f"orientation '{ori}' has no fixed axes here (undefined, given by a "
+                         f"distribution, which Abaqus does not allow there, or by each element's "
+                         f"nodes); the stack direction is taken as direction 3.", once=True)
         return None
 
     def _stack_geometry(self, bottom: Sequence[int], top: Sequence[int]) -> Tuple[Vec, Vec]:
@@ -14429,13 +14435,13 @@ class Converter:
             centre = vadd(centre, vscale(q, 1.0 / len(mids)))
         return vunit(vscale(n, -1.0) if vdot(n, up) < 0.0 else n), centre
 
-    def _stack_order(self, conn: List[int], stack: str, frame3: Optional[Vec]) -> Tuple[int, ...]:
+    def _stack_order(self, conn: List[int], stack: str, axis: Optional[Vec]) -> Tuple[int, ...]:
         """The HEX_STACK_ORDER of an 8-node continuum shell for STACK DIRECTION ``stack``; for
-        ORIENTATION the isoparametric direction closest to the orientation's axis 3
-        (``frame3``), in its sense."""
+        ORIENTATION the isoparametric direction closest to the orientation's ``axis``
+        (_stack_axis), in its sense."""
         if stack in ("1", "2", "3"):
             return HEX_STACK_ORDER[int(stack)]
-        if frame3 is None:
+        if axis is None:
             return HEX_STACK_ORDER[3]
         p = [self.geom.nodes[n] for n in conn]
 
@@ -14443,8 +14449,8 @@ class Converter:
             return vscale(vadd(vadd(p[pos[0] - 1], p[pos[1] - 1]), vadd(p[pos[2] - 1], p[pos[3] - 1])), 0.25)
         dirs = {1: vsub(side((2, 3, 7, 6)), side((1, 4, 8, 5))), 2: vsub(side((3, 4, 8, 7)), side((1, 2, 6, 5))),
                 3: vsub(side((5, 6, 7, 8)), side((1, 2, 3, 4)))}
-        best = max(dirs, key=lambda d: abs(vdot(vunit(dirs[d]), frame3)))
-        return HEX_STACK_ORDER[best if vdot(dirs[best], frame3) >= 0.0 else -best]
+        best = max(dirs, key=lambda d: abs(vdot(vunit(dirs[d]), axis)))
+        return HEX_STACK_ORDER[best if vdot(dirs[best], axis) >= 0.0 else -best]
 
     def _plan_ply_split(self, blocks: List[Block]) -> None:
         """Composite continuum shells -> one ccx solid per ply.  ccx runs SC8R / SC6R as C3D8I /
@@ -14510,8 +14516,6 @@ class Converter:
                     if dists[field].param("TABLE"):
                         self._dist_tables.add(dists[field].param("TABLE").strip().upper())
         self._reserve_names()
-        dist_oris = {(b.param("NAME") or "").strip().upper() for b in blocks
-                     if b.keyword == "ORIENTATION" and self._orientation_distribution(b) is not None}
         nodes = self.geom.nodes
         next_n = max(nodes, default=0)
         next_e = max(list(els) + list(self._conn) + list(self._carriers), default=0)
@@ -14531,9 +14535,8 @@ class Converter:
             for e in p["elems"]:
                 typ, conn = els[e]
                 hexa = len(conn) == 8
-                axis3 = self._stack_axis3(p["block"], dist_oris, conn) \
-                    if hexa and p["stack"] == "ORIENTATION" else None
-                order = self._stack_order(conn, p["stack"], axis3) if hexa else (1, 2, 3, 4, 5, 6)
+                axis = self._stack_axis(p["block"], conn) if hexa and p["stack"] == "ORIENTATION" else None
+                order = self._stack_order(conn, p["stack"], axis) if hexa else (1, 2, 3, 4, 5, 6)
                 pc = [conn[q - 1] for q in order]
                 nc = 4 if hexa else 3
                 bottom, top = pc[:nc], pc[nc:]

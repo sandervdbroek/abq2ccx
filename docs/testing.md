@@ -137,6 +137,7 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | `distribution_panel_*` (generated) | a variable-angle-tow `S8R` strip whose `*DISTRIBUTION` b leaves the plate by 30°, in the x-y, x-z and y-z planes | the x-y strip with b in the plate | 7e-12 (ccx alone: 3.3e-2) |
 | `sc_axes_*` (generated) | the ply as a plain `SC8R` / `SC6R` section, thickness free: the orientation turned about its axis 1 in the x-y, x-z and y-z planes (also as a `*DISTRIBUTION`), the plate axes without a rotation line, none in x-z and y-z; an anisotropic ply stacked downwards | the ply's t Q̄ at Abaqus' direction; the anisotropic ply's plane-stress stiffness in Abaqus' axes | 3e-7 (ccx alone: 4e-2–0.99 off) |
 | `sc_cylinder_hoop` (generated) | a cylindrical orientation on an `SC8R` cylinder under internal pressure | thin-wall theory, fibres along the hoop | 0.10 % (ccx alone: 14× too soft) |
+| `sc_cylinder_stack_*` (generated) | an `SC8R` cylinder numbered radially along the elements' direction 1, `STACK DIRECTION=ORIENTATION` with a cylindrical orientation without a rotation line, as `[0/90/0]` plies and as one layer, under an axial strain | the wall's membrane stiffness, plies stacked radially | 3e-6, 2e-5 (stacked along axis 3: 13×, 2.5× too soft) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`
