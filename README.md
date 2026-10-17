@@ -16,7 +16,8 @@ Run the file with Python 3.9 or later — copy it anywhere — or install it as 
 command (`abq2ccx model.inp`, same options):
 
 ```bash
-pipx install git+https://github.com/sandervdbroek/abq2ccx
+pipx install abq2ccx                                       # from PyPI
+pipx install git+https://github.com/sandervdbroek/abq2ccx  # the latest main
 ```
 
 ```bash
@@ -28,7 +29,7 @@ ccx model_ccx                                # run it yourself (no .inp extensio
 ```
 
 Always read the report: it is printed to stderr, written to `*_ccx.log` and repeated as
-`**` comments at the top of the converted deck. The [user guide](docs/user-guide.md) has
+`**` comments at the top of the converted deck. The [user guide](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/user-guide.md) has
 every option, the exit codes and the Python API.
 
 ```python
@@ -69,8 +70,8 @@ print(result.report.summary())               # "N warning(s), M note(s), K comme
   fitted to ccx's `.frd`/`.dat` model, and Abaqus' preselected output.
 
 The exact handling of every keyword, element type and output variable is in the generated
-references: [keywords](docs/keyword-reference.md), [elements](docs/element-reference.md),
-[output variables](docs/output-reference.md).
+references: [keywords](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/keyword-reference.md), [elements](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/element-reference.md),
+[output variables](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/output-reference.md).
 
 **Reduced physics.** Whatever the converter has to drop or replace of the Abaqus model — a
 constitutive behaviour ccx lacks (concrete damaged plasticity, user hardening, Chaboche
@@ -84,14 +85,14 @@ as a close equivalent, each flagged `[APPROX]` — a Riks step as plain static, 
 0.475, an I-section in space as ccx's `U1` beam with too stiff a torsion (or an equivalent
 rectangle where `U1` cannot run), NLGEOM follower tractions as fixed nodal
 forces, a curved analytical rigid surface as flat facets, and a few more
-([full list](docs/user-guide.md#--approximate)). Without it those cards are commented out
+([full list](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/user-guide.md#--approximate)). Without it those cards are commented out
 with the reason, so ccx never silently runs a different model.
 
 ## Validation
 
 `python validate_with_ccx.py` converts the bundled examples, runs them in CalculiX (it finds
 `ccx`, including FreeCAD's copy) and compares each result with an independent reference. It
-prints one `PASS` line per check, about a hundred in all; [testing](docs/testing.md) lists them.
+prints one `PASS` line per check, about a hundred in all; [testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md) lists them.
 
 | Check | Reference | Agreement |
 | --- | --- | --- |
@@ -123,7 +124,7 @@ user elements (66). **26 benchmark decks are checked against their published ans
 match Abaqus' result for the same mesh (within 0.5 % for temperatures and frequencies, 1 % for
 stresses and displacements), 7 differ for reasons traced to ccx (its nodal extrapolation,
 plane-stress slab, film integration, mass matrices, coarse shell and beam meshes). See
-[testing](docs/testing.md#published-answers).
+[testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md#published-answers).
 
 ## How it works
 
@@ -141,7 +142,7 @@ read (+ *INCLUDE, *PARAMETER)  →  flatten *PART/*INSTANCE/*ASSEMBLY
 | Dropped | organisational, no CalculiX meaning | `*PART`/`*INSTANCE`/`*ASSEMBLY` (flattened), `*PREPRINT` |
 | Commented | no equivalent: kept as `**` comments with a warning | `*VISCOELASTIC`, `*CONNECTOR BEHAVIOR`, `*INERTIA RELIEF` |
 
-The [architecture guide](docs/architecture.md) describes the pipeline and how to extend it.
+The [architecture guide](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/architecture.md) describes the pipeline and how to extend it.
 
 ## Limitations
 
@@ -155,14 +156,14 @@ The [architecture guide](docs/architecture.md) describes the pipeline and how to
 * ccx's own first-order elements are not Abaqus': its `CPE4`/`C3D8`/`CAX4` are plain 2×2(×2)
   integration, without Abaqus' selectively reduced volume terms (on a coarse bending mesh
   Abaqus' `CPE4` deflects 9–19 % more for ν 0–0.3), and its `CPS4` is a 3-D slab with a free
-  thickness, not 2-D plane stress ([compatibility](docs/compatibility.md)).
+  thickness, not 2-D plane stress ([compatibility](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/compatibility.md)).
 * Explicit coupled temperature–displacement steps do not run; Riks steps, NLGEOM follower
   tractions and curved analytical rigid surfaces run only with `--approximate`.
 * Contact is translated card by card, but ccx's penalty contact behaves differently from
   Abaqus' — check it.
 * ccx 2.23 gets some valid input wrong without an error. The converter works around what it
-  can and warns about the rest ([compatibility](docs/compatibility.md),
-  [troubleshooting](docs/troubleshooting.md)).
+  can and warns about the rest ([compatibility](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/compatibility.md),
+  [troubleshooting](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/troubleshooting.md)).
 * The converter checks structure, and physics on its benchmarks — not on your model. Run ccx
   and sanity-check the results.
 
@@ -172,44 +173,44 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 
 | File | Exercises |
 | --- | --- |
-| [`nle10_thickplate`](examples/nle10_thickplate.inp) | NAFEMS LE10: C3D20, `*NCOPY` + `*ELGEN`, `GEN`/`PERT`, `*DLOAD Px` |
-| [`nle10_surface_elements`](examples/nle10_surface_elements.inp) | the same plate loaded through an `SFM3D8` skin → nodal forces |
-| [`composite_shell`](examples/composite_shell.inp) | S8R composite layup, orthotropic, `*ORIENTATION`, `ENCASTRE`, `*DSLOAD` |
-| [`composite_plate_s4r`](examples/composite_plate_s4r.inp), [`composite_plate_sc8r`](examples/composite_plate_sc8r.inp) | a simply supported cross-ply plate: composite `S4R` → `S8R`; composite `SC8R` → one `C3D8I` per ply |
-| [`composite_inplane_s4r`](examples/composite_inplane_s4r.inp), [`composite_inplane_sc8r`](examples/composite_inplane_sc8r.inp) | an angle-ply laminate's in-plane stiffness; BCs interpolated onto the new nodes |
-| [`assembly_two_blocks`](examples/assembly_two_blocks.inp) | two-instance assembly, an `instance.node` reference in a step |
-| [`beam_circ_cantilever`](examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters |
-| [`beam_pipe_box_cantilever`](examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` and `B32` + `SECTION=BOX` → `B32R` |
-| [`beam_circ_rotation_bcs`](examples/beam_circ_rotation_bcs.inp) | circular-section beams with a held twist and a prescribed rotation → knot beams |
-| [`beam_circ_explicit`](examples/beam_circ_explicit.inp) | a circular-section beam in `*DYNAMIC, EXPLICIT` → a maximum time increment |
-| [`planar_pinned_beam`](examples/planar_pinned_beam.inp), [`planar_pinned_circ_beam`](examples/planar_pinned_circ_beam.inp) | planar `B21` beams in `*FREQUENCY` + `*BUCKLE` → planar constraint |
-| [`beam_line_load_cantilever`](examples/beam_line_load_cantilever.inp) | `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and a `CIRC` beam → nodal forces |
-| [`beam_output_requests`](examples/beam_output_requests.inp) | output at `B32` nodes → `OUTPUT=2D`, `*NODE PRINT`, `*TIME POINTS` |
-| [`coupling_shell_plate`](examples/coupling_shell_plate.inp), [`coupling_solid_plate`](examples/coupling_solid_plate.inp) | a rigid coupling on `S8R` nodes (knot beams) and its `C3D20R` reference |
-| [`coupling_bc_bars`](examples/coupling_bc_bars.inp) | BCs on coupled nodes that the reference point imposes → taken off |
-| [`rigid_body_bc_bars`](examples/rigid_body_bc_bars.inp) | BCs on `*RIGID BODY` nodes → moved to the reference node, as Abaqus does |
-| [`equation_overconstraint`](examples/equation_overconstraint.inp) | an `*EQUATION` on a BC'd DOF, a duplicate and a loop of ties |
-| [`mpc_beam_lever`](examples/mpc_beam_lever.inp), [`mpc_pin_tie_joints`](examples/mpc_pin_tie_joints.inp), [`mpc_link`](examples/mpc_link.inp) | `*MPC BEAM`, `PIN`, `TIE`, `LINK` |
-| [`connector_hinge_beams`](examples/connector_hinge_beams.inp), [`connector_hinge_bodies`](examples/connector_hinge_bodies.inp), [`connector_ground_hinge`](examples/connector_ground_hinge.inp) | `CONN3D2` `HINGE` connectors between beams, rigid bodies and to ground |
-| [`connector_transform_plate`](examples/connector_transform_plate.inp), [`connector_transform_join`](examples/connector_transform_join.inp) | `JOIN` / `LINK` connectors on nodes with a `*TRANSFORM` |
-| [`mpc_transform`](examples/mpc_transform.inp) | `*MPC` `PIN`, `TIE` and `LINK` on nodes with a `*TRANSFORM` → local DOFs, twin nodes |
-| [`op_new_respecify`](examples/op_new_respecify.inp), [`op_new_remove`](examples/op_new_remove.inp) | `*BOUNDARY, OP=NEW` after rotational BCs on beams and shells |
-| [`distribution_solid_plate`](examples/distribution_solid_plate.inp), [`distribution_shell_plate`](examples/distribution_shell_plate.inp) | per-element `*DISTRIBUTION` orientations (solid, composite S8R); `*_explicit` are their one-orientation-per-element twins |
-| [`thermal_expansion_cubes`](examples/thermal_expansion_cubes.inp) | isotropic `*Elastic` beside ORTHO / ANISO `*Expansion` |
-| [`thermal_no_initial_temperature`](examples/thermal_no_initial_temperature.inp) | `*Temperature` without initial temperatures |
-| [`cook_membrane_traction`](examples/cook_membrane_traction.inp), [`cylinder_traction_cax`](examples/cylinder_traction_cax.inp) | `*DSLOAD TRVEC` on `CPS8` and `CAX8` edges → nodal forces |
-| [`traction_transformed_face`](examples/traction_transformed_face.inp), [`transform_spherical_rigid`](examples/transform_spherical_rigid.inp) | loads on `*TRANSFORM`ed nodes; a spherical transform; a transformed rigid-body reference point |
-| [`transform_rotations`](examples/transform_rotations.inp) | rotational BCs and moments on a transformed kinematic reference point (→ `*RIGID BODY` with a `ROT NODE` in its axes) and beam tip (→ knot, global components) |
-| [`velocity_bc_column`](examples/velocity_bc_column.inp), [`velocity_bc_bar`](examples/velocity_bc_bar.inp) | `*BOUNDARY, TYPE=VELOCITY` (implicit and explicit) |
-| [`default_amplitude_bars`](examples/default_amplitude_bars.inp) | a displacement `*BOUNDARY` and a `*CLOAD` without an amplitude → ramped / stepped as in Abaqus (run as `*DYNAMIC`, `*VISCO`, coupled and explicit) |
-| [`preselect_output_bar`](examples/preselect_output_bar.inp), [`explicit_default_output_bar`](examples/explicit_default_output_bar.inp), [`preselect_contact_blocks`](examples/preselect_contact_blocks.inp) | Abaqus' preselected and default output |
-| [`cps4i_slab_bending`](examples/cps4i_slab_bending.inp) | a `CPS4I` cantilever under an end couple → `C3D8I` slabs (also run as `CPE4I`) |
-| [`shell_pressure_sides`](examples/shell_pressure_sides.inp) | `*DSLOAD P` on a shell's `SPOS` / `SNEG` side and an element-based `P` |
-| [`kinematic_all_dofs`](examples/kinematic_all_dofs.inp) | a bare `*Coupling` + `*Kinematic` (all DOFs) on a solid face, against `*RIGID BODY` |
-| [`assembly_rotated_instances`](examples/assembly_rotated_instances.inp), [`…_flat`](examples/assembly_rotated_instances_flat.inp) | a turned instance with an oriented orthotropic material, against the same model written flat |
-| [`damage_johnson_cook_cubes`](examples/damage_johnson_cook_cubes.inp) | a Johnson-Cook `*DAMAGE INITIATION` → ccx's form, reporting `DUCT` |
-| [`rigid_punch_block`](examples/rigid_punch_block.inp), [`rigid_punch_cylinder`](examples/rigid_punch_cylinder.inp), [`rigid_body_inertia`](examples/rigid_body_inertia.inp) | a rigid `R3D4` punch and the same face as an analytical `CYLINDER` → skins of their rigid body; `MASS` + `ROTARYI` on a rigid plate → point masses |
-| [`coverage_kitchen_sink`](examples/coverage_kitchen_sink.inp) | element substitutions, dropped and commented cards, output-variable mapping |
+| [`nle10_thickplate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/nle10_thickplate.inp) | NAFEMS LE10: C3D20, `*NCOPY` + `*ELGEN`, `GEN`/`PERT`, `*DLOAD Px` |
+| [`nle10_surface_elements`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/nle10_surface_elements.inp) | the same plate loaded through an `SFM3D8` skin → nodal forces |
+| [`composite_shell`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_shell.inp) | S8R composite layup, orthotropic, `*ORIENTATION`, `ENCASTRE`, `*DSLOAD` |
+| [`composite_plate_s4r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_plate_s4r.inp), [`composite_plate_sc8r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_plate_sc8r.inp) | a simply supported cross-ply plate: composite `S4R` → `S8R`; composite `SC8R` → one `C3D8I` per ply |
+| [`composite_inplane_s4r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_inplane_s4r.inp), [`composite_inplane_sc8r`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/composite_inplane_sc8r.inp) | an angle-ply laminate's in-plane stiffness; BCs interpolated onto the new nodes |
+| [`assembly_two_blocks`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/assembly_two_blocks.inp) | two-instance assembly, an `instance.node` reference in a step |
+| [`beam_circ_cantilever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters |
+| [`beam_pipe_box_cantilever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` and `B32` + `SECTION=BOX` → `B32R` |
+| [`beam_circ_rotation_bcs`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_circ_rotation_bcs.inp) | circular-section beams with a held twist and a prescribed rotation → knot beams |
+| [`beam_circ_explicit`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_circ_explicit.inp) | a circular-section beam in `*DYNAMIC, EXPLICIT` → a maximum time increment |
+| [`planar_pinned_beam`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/planar_pinned_beam.inp), [`planar_pinned_circ_beam`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/planar_pinned_circ_beam.inp) | planar `B21` beams in `*FREQUENCY` + `*BUCKLE` → planar constraint |
+| [`beam_line_load_cantilever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_line_load_cantilever.inp) | `*DLOAD PY` / `P2` / `PZ` on `B31`, `B32` and a `CIRC` beam → nodal forces |
+| [`beam_output_requests`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/beam_output_requests.inp) | output at `B32` nodes → `OUTPUT=2D`, `*NODE PRINT`, `*TIME POINTS` |
+| [`coupling_shell_plate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/coupling_shell_plate.inp), [`coupling_solid_plate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/coupling_solid_plate.inp) | a rigid coupling on `S8R` nodes (knot beams) and its `C3D20R` reference |
+| [`coupling_bc_bars`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/coupling_bc_bars.inp) | BCs on coupled nodes that the reference point imposes → taken off |
+| [`rigid_body_bc_bars`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/rigid_body_bc_bars.inp) | BCs on `*RIGID BODY` nodes → moved to the reference node, as Abaqus does |
+| [`equation_overconstraint`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/equation_overconstraint.inp) | an `*EQUATION` on a BC'd DOF, a duplicate and a loop of ties |
+| [`mpc_beam_lever`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/mpc_beam_lever.inp), [`mpc_pin_tie_joints`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/mpc_pin_tie_joints.inp), [`mpc_link`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/mpc_link.inp) | `*MPC BEAM`, `PIN`, `TIE`, `LINK` |
+| [`connector_hinge_beams`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/connector_hinge_beams.inp), [`connector_hinge_bodies`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/connector_hinge_bodies.inp), [`connector_ground_hinge`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/connector_ground_hinge.inp) | `CONN3D2` `HINGE` connectors between beams, rigid bodies and to ground |
+| [`connector_transform_plate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/connector_transform_plate.inp), [`connector_transform_join`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/connector_transform_join.inp) | `JOIN` / `LINK` connectors on nodes with a `*TRANSFORM` |
+| [`mpc_transform`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/mpc_transform.inp) | `*MPC` `PIN`, `TIE` and `LINK` on nodes with a `*TRANSFORM` → local DOFs, twin nodes |
+| [`op_new_respecify`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/op_new_respecify.inp), [`op_new_remove`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/op_new_remove.inp) | `*BOUNDARY, OP=NEW` after rotational BCs on beams and shells |
+| [`distribution_solid_plate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/distribution_solid_plate.inp), [`distribution_shell_plate`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/distribution_shell_plate.inp) | per-element `*DISTRIBUTION` orientations (solid, composite S8R); `*_explicit` are their one-orientation-per-element twins |
+| [`thermal_expansion_cubes`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/thermal_expansion_cubes.inp) | isotropic `*Elastic` beside ORTHO / ANISO `*Expansion` |
+| [`thermal_no_initial_temperature`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/thermal_no_initial_temperature.inp) | `*Temperature` without initial temperatures |
+| [`cook_membrane_traction`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/cook_membrane_traction.inp), [`cylinder_traction_cax`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/cylinder_traction_cax.inp) | `*DSLOAD TRVEC` on `CPS8` and `CAX8` edges → nodal forces |
+| [`traction_transformed_face`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/traction_transformed_face.inp), [`transform_spherical_rigid`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/transform_spherical_rigid.inp) | loads on `*TRANSFORM`ed nodes; a spherical transform; a transformed rigid-body reference point |
+| [`transform_rotations`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/transform_rotations.inp) | rotational BCs and moments on a transformed kinematic reference point (→ `*RIGID BODY` with a `ROT NODE` in its axes) and beam tip (→ knot, global components) |
+| [`velocity_bc_column`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/velocity_bc_column.inp), [`velocity_bc_bar`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/velocity_bc_bar.inp) | `*BOUNDARY, TYPE=VELOCITY` (implicit and explicit) |
+| [`default_amplitude_bars`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/default_amplitude_bars.inp) | a displacement `*BOUNDARY` and a `*CLOAD` without an amplitude → ramped / stepped as in Abaqus (run as `*DYNAMIC`, `*VISCO`, coupled and explicit) |
+| [`preselect_output_bar`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/preselect_output_bar.inp), [`explicit_default_output_bar`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/explicit_default_output_bar.inp), [`preselect_contact_blocks`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/preselect_contact_blocks.inp) | Abaqus' preselected and default output |
+| [`cps4i_slab_bending`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/cps4i_slab_bending.inp) | a `CPS4I` cantilever under an end couple → `C3D8I` slabs (also run as `CPE4I`) |
+| [`shell_pressure_sides`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/shell_pressure_sides.inp) | `*DSLOAD P` on a shell's `SPOS` / `SNEG` side and an element-based `P` |
+| [`kinematic_all_dofs`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/kinematic_all_dofs.inp) | a bare `*Coupling` + `*Kinematic` (all DOFs) on a solid face, against `*RIGID BODY` |
+| [`assembly_rotated_instances`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/assembly_rotated_instances.inp), [`…_flat`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/assembly_rotated_instances_flat.inp) | a turned instance with an oriented orthotropic material, against the same model written flat |
+| [`damage_johnson_cook_cubes`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/damage_johnson_cook_cubes.inp) | a Johnson-Cook `*DAMAGE INITIATION` → ccx's form, reporting `DUCT` |
+| [`rigid_punch_block`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/rigid_punch_block.inp), [`rigid_punch_cylinder`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/rigid_punch_cylinder.inp), [`rigid_body_inertia`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/rigid_body_inertia.inp) | a rigid `R3D4` punch and the same face as an analytical `CYLINDER` → skins of their rigid body; `MASS` + `ROTARYI` on a rigid plate → point masses |
+| [`coverage_kitchen_sink`](https://github.com/sandervdbroek/abq2ccx/blob/main/examples/coverage_kitchen_sink.inp) | element substitutions, dropped and commented cards, output-variable mapping |
 
 ## Tests
 
@@ -219,19 +220,19 @@ python validate_with_ccx.py                             # end-to-end checks in C
 python corpus/fetch.py && python tests/test_corpus.py   # the corpus
 ```
 
-[Testing](docs/testing.md) describes the three layers; GitHub Actions run the first two on
+[Testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md) describes the three layers; GitHub Actions run the first two on
 every push, the unit tests on Linux, macOS and Windows.
 
 ## Documentation
 
-* [User guide](docs/user-guide.md) — options, workflow, reading the report, the Python API.
-* [Troubleshooting](docs/troubleshooting.md) — ccx errors and results that look wrong.
-* [Compatibility](docs/compatibility.md) — the Abaqus/CalculiX facts the converter relies
+* [User guide](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/user-guide.md) — options, workflow, reading the report, the Python API.
+* [Troubleshooting](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/troubleshooting.md) — ccx errors and results that look wrong.
+* [Compatibility](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/compatibility.md) — the Abaqus/CalculiX facts the converter relies
   on, ccx 2.23 issues, and what does not convert.
-* [Testing](docs/testing.md) · [Architecture](docs/architecture.md) ·
-  [Changelog](CHANGELOG.md)
-* Generated references: [keywords](docs/keyword-reference.md) ·
-  [elements](docs/element-reference.md) · [output variables](docs/output-reference.md)
+* [Testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md) · [Architecture](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/architecture.md) ·
+  [Changelog](https://github.com/sandervdbroek/abq2ccx/blob/main/CHANGELOG.md)
+* Generated references: [keywords](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/keyword-reference.md) ·
+  [elements](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/element-reference.md) · [output variables](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/output-reference.md)
 
 ## Sources
 
@@ -245,12 +246,12 @@ every push, the unit tests on Linux, macOS and Windows.
 * CalculiX Discourse — <https://calculix.discourse.group/> · PrePoMax forum —
   <https://prepomax.discourse.group/>
 
-[Compatibility](docs/compatibility.md#sources) lists the Abaqus manual pages behind
+[Compatibility](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/compatibility.md#sources) lists the Abaqus manual pages behind
 individual facts.
 
 ## License
 
-[MIT](LICENSE) © Sander van den Broek. `abq2ccx` is an independent tool, not affiliated
+[MIT](https://github.com/sandervdbroek/abq2ccx/blob/main/LICENSE) © Sander van den Broek. `abq2ccx` is an independent tool, not affiliated
 with or endorsed by Dassault Systèmes (Abaqus) or the CalculiX project. The test corpus is
 fetched on demand and **not** redistributed here; each deck keeps its own upstream license,
-recorded in [`corpus/manifest.py`](corpus/manifest.py).
+recorded in [`corpus/manifest.py`](https://github.com/sandervdbroek/abq2ccx/blob/main/corpus/manifest.py).

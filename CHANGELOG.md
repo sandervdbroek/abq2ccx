@@ -4,7 +4,7 @@ Corpus counts are on the CalculiX version current at the time; from October 2026
 counts only decks that solve their own problem: under their own loads, without reduced
 physics.
 
-## Unreleased (October 2026, still `__version__ = "1.1.0"`) — CalculiX 2.23
+## 1.2.0 (October 2026) — CalculiX 2.23
 
 FreeCAD 1.1.4 moved to ccx 2.23, which is stricter than 2.22 and gets some valid input wrong
 without an error. A full audit and the work that followed:

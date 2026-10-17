@@ -4,7 +4,8 @@
 
 * Python 3.9 or later, standard library only. The whole tool is `abq2ccx.py`; copy it
   anywhere or run it from the repository, or install it as the `abq2ccx` command with
-  `pipx install git+https://github.com/sandervdbroek/abq2ccx` (or `pip install .` in a clone).
+  `pipx install abq2ccx`, or the latest main with
+  `pipx install git+https://github.com/sandervdbroek/abq2ccx` (`pip install .` in a clone).
 * CalculiX (`ccx`) only to run the result. `--run` and `validate_with_ccx.py` take `$CCX`
   (`--run` also `--ccx PATH`), else look on `PATH`, then in FreeCAD (FreeCAD 1.1.4 ships ccx
   2.23), PrePoMax and bConverged installs on Windows, and in FreeCAD's macOS bundle and

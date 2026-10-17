@@ -56,7 +56,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Element reference data
