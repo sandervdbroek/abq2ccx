@@ -362,6 +362,14 @@ def ccx_element_type(typ: str, report: "Report") -> str:
 SHELL_TYPES = {t for t in ELEMENT_NNODES if (t[0] == "S" and not t.startswith("SPRING")) or t.startswith("DS")}
 BEAM_TYPES = {t for t in ELEMENT_NNODES if t[0] == "B" or t.startswith(("T2D", "T3D", "PIPE"))}
 COMPOSITE_SHELL_OK = {"S6", "S8R"}  # CalculiX restricts composite shells to these
+# ccx 2.23 stops on *SHELL SECTION, COMPOSITE on any other shell ('*ERROR reading *SHELL
+# SECTION', probed on S3, S4, S4R, S8): emitted linear shell -> the quadratic shell its
+# composite section runs on, with a node at the middle of every edge (_plan_quadratic_shells)
+COMPOSITE_SHELL_UPGRADE = {"S3": "S6", "S4": "S8R", "S4R": "S8R"}
+# Continuum shells under a composite section: one ccx solid per ply (_plan_ply_split); the
+# default limit on the solids that adds (--max-ply-elements)
+PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
+PLY_SPLIT_LIMIT = 1000000
 # ccx 2.23 stops on a 2-node beam with a circular section ("Please use quadratic elements
 # for beams with circular cross section"): it expands a linear beam into an 8-node brick,
 # whose corner nodes cannot follow a circle.  Emitted 2-node type -> the 3-node beam such
@@ -1309,6 +1317,113 @@ def rotate_about_axis(p: Vec, a: Vec, b: Vec, angle_deg: float) -> Vec:
     term = vadd(vadd(vscale(d, c), vscale(vcross(u, d), s)),
                 vscale(u, vdot(u, d) * (1.0 - c)))
     return vadd(a, term)
+
+
+def orientation_frame(a: Vec, b: Vec, system: str, point: Vec,
+                      rot: Optional[Tuple[int, float]]) -> Tuple[Tuple[Vec, Vec, Vec], Optional[int]]:
+    """The local axes of an *ORIENTATION at ``point`` and the axis of its additional rotation
+    (None without a rotation line): RECTANGULAR — 1 along a, 3 along a x b; CYLINDRICAL — a
+    and b on the axis, 1 radial, 2 tangential, 3 from a to b; then turned about the rotation
+    axis by its angle (degrees)."""
+    if system.upper().startswith("CYL"):
+        e3 = vunit(vsub(b, a))
+        r = vsub(point, a)
+        e1 = vunit(vsub(r, vscale(e3, vdot(r, e3))))
+    else:
+        e1 = vunit(a)
+        e3 = vunit(vcross(a, b))
+    axes = [e1, vcross(e3, e1), e3]
+    k = rot[0] if rot and rot[0] in (1, 2, 3) else None
+    if k and rot[1]:
+        th = math.radians(rot[1])
+        i, j = k % 3, (k + 1) % 3                  # the two axes the rotation turns
+        u, v = axes[i], axes[j]
+        axes[i] = vadd(vscale(u, math.cos(th)), vscale(v, math.sin(th)))
+        axes[j] = vsub(vscale(v, math.cos(th)), vscale(u, math.sin(th)))
+    return (axes[0], axes[1], axes[2]), k
+
+
+def shell_local_axes(normal: Vec, frame: Optional[Tuple[Vec, Vec, Vec]] = None,
+                     axis: Optional[int] = None) -> Tuple[Vec, Vec]:
+    """Abaqus' material directions 1 and 2 on a shell surface with unit normal ``normal``.
+    Without an orientation (Abaqus 2017 "Conventions"): the projection of the global X axis,
+    or of Z where X is within 0.1 degree of the normal.  With one (its turned ``frame``,
+    see orientation_frame, and rotation ``axis``; Abaqus 2017 "Orientations"): the projection
+    of the axis that follows the rotation axis in the cycle 1, 2, 3.  Direction 2 is normal x
+    direction 1.  Abaqus' default rotation axis, 1, 'should have a nonzero component in the
+    direction of the normal' (Keywords *ORIENTATION) — a cylindrical system's radial axis on a
+    cylinder; without a rotation line the axis closest to the normal is taken, which is that
+    one there and axis 3 on a shell in the plane of axes 1 and 2.  (ccx 2.23 projects the
+    turned axis 1 whatever the rotation axis.)"""
+    if frame is None:
+        v = (1.0, 0.0, 0.0)
+        if abs(vdot(v, normal)) > math.cos(math.radians(0.1)):
+            v = (0.0, 0.0, 1.0)
+    else:
+        if axis is None:
+            axis = max((1, 2, 3), key=lambda k: abs(vdot(frame[k - 1], normal)))
+        v = frame[axis % 3]
+    d = vsub(v, vscale(normal, vdot(v, normal)))
+    if vnorm(d) < 1e-9:                            # the axis is along the normal
+        return shell_local_axes(normal) if frame is not None else ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    d = vunit(d)
+    return d, vcross(normal, d)
+
+
+def ply_axes(normal: Vec, axes: Tuple[Vec, Vec], angle: float) -> Tuple[Vec, Vec]:
+    """Shell material directions 1 and 2 turned by a composite layer's ``angle`` (degrees)
+    about the shell normal, as Abaqus applies a layer angle after the projection."""
+    th = math.radians(angle)
+    d = vadd(vscale(axes[0], math.cos(th)), vscale(axes[1], math.sin(th)))
+    return d, vcross(normal, d)
+
+
+# Node order of an 8-node continuum shell restacked along an isoparametric direction (the
+# ply split stacks from the bottom face, nodes 1-4, to the top face, nodes 5-8): STACK
+# DIRECTION -> positions of the element's nodes; a negative direction stacks the other way
+# (STACK DIRECTION=ORIENTATION).  Each keeps the hexahedron right-handed.
+HEX_STACK_ORDER = {3: (1, 2, 3, 4, 5, 6, 7, 8), -3: (5, 8, 7, 6, 1, 4, 3, 2),
+                   1: (1, 4, 8, 5, 2, 3, 7, 6), -1: (2, 6, 7, 3, 1, 5, 8, 4),
+                   2: (1, 5, 6, 2, 4, 8, 7, 3), -2: (4, 3, 7, 8, 1, 2, 6, 5)}
+
+
+def stack_face_map(order: Sequence[int], fam: str = "HEX") -> Dict[int, Tuple[str, int]]:
+    """For a continuum shell restacked by ``order`` (HEX_STACK_ORDER; a 6-node wedge keeps
+    its own), where each face of the element lands on its ply solids: face -> ("first" /
+    "last" / "all", the solid's face number) — the bottom face on the first ply, the top face
+    on the last, a side face on every ply."""
+    faces = FACE_NODES[fam]
+    nc = 4 if fam == "HEX" else 3
+    out: Dict[int, Tuple[str, int]] = {}
+    for f, pos in faces.items():
+        orig = {p for p in pos if p <= 2 * nc}
+        for g, gpos in faces.items():
+            if {order[q - 1] for q in gpos if q <= 2 * nc} == orig:
+                out[f] = ("first" if g == 1 else "last" if g == 2 else "all", g)
+    return out
+
+
+_HEX_EDGES = ((1, 2), (2, 3), (3, 4), (4, 1), (5, 6), (6, 7), (7, 8), (8, 5), (1, 5), (2, 6), (3, 7), (4, 8))
+_WEDGE_EDGES = ((1, 2), (2, 3), (3, 1), (4, 5), (5, 6), (6, 4), (1, 4), (2, 5), (3, 6))
+_TET_EDGES = ((1, 2), (2, 3), (3, 1), (1, 4), (2, 4), (3, 4))
+
+
+def element_edges(typ: str, conn: Sequence[int]) -> List[Tuple[int, int]]:
+    """The corner-to-corner edges of an element: solids (and continuum shells, cohesive and
+    gasket elements) as hexahedra, wedges or tetrahedra by their node count, line elements end
+    to end, any other element (shells, membranes, plane and rigid facets) as a triangle or a
+    quadrilateral."""
+    t, n = typ.upper(), len(conn)
+    if t.startswith(("C3D", "SC6", "SC8", "COH3D", "GK3D", "DC3D", "F3D", "AC3D", "DCC3D")):
+        pairs = {4: _TET_EDGES, 10: _TET_EDGES, 6: _WEDGE_EDGES, 15: _WEDGE_EDGES,
+                 8: _HEX_EDGES, 20: _HEX_EDGES, 27: _HEX_EDGES}.get(n, ())
+    elif t.startswith(("B2", "B3", "T2D", "T3D", "PIPE", "DC1D", "R2D", "RB2", "RB3", "RAX", "SFMAX",
+                       "SFMGAX", "SPRING", "DASHPOT", "GAP", "CONN", "ELBOW", "FRAME")) or n < 3:
+        return [(conn[0], conn[-1])] if n >= 2 else []
+    else:
+        k = 3 if n in (3, 6, 7) else 4
+        pairs = tuple((i + 1, (i + 1) % k + 1) for i in range(k)) if n >= k else ()
+    return [(conn[a - 1], conn[c - 1]) for a, c in pairs]
 
 
 def analytic_profile(b: Block) -> Tuple[Optional[dict], str]:
@@ -3238,6 +3353,24 @@ class Converter:
         # 2-node beams upgraded to 3-node beams (_upgrade_section_beams): element -> (end node,
         # end node, midside node)
         self._midside: "OrderedDict[int, Tuple[int, int, int]]" = OrderedDict()
+        # other nodes the converter puts between two nodes: (a, c, node, s), the node at
+        # a + s (c - a) — the midside nodes of upgraded composite shells and the ply interface
+        # nodes of split continuum shells (_plan_quadratic_shells, _plan_ply_split)
+        self._edge_nodes: List[Tuple[int, int, int, float]] = []
+        self._quad_edges: Dict[int, List[Tuple[int, int, int]]] = {}  # shell -> (a, c, midside)
+        # composite sections on continuum shells written ply by ply: id(section) -> plan, the
+        # *EQUATION lines that hold ply interface nodes on a neighbour's edge, and why the
+        # split was left out (_plan_ply_split)
+        self._ply_sections: Dict[int, dict] = {}
+        self._ply_eq: List[str] = []
+        self._ply_skipped = ""
+        self._ply_unsplit: Dict[int, str] = {}     # id(section) -> why it was not split
+        # ply interface nodes held by those *EQUATIONs: (stack edge end, end, node, fraction);
+        # they take interpolated temperatures and initial conditions, not BCs or set membership
+        self._tied_nodes: List[Tuple[int, int, int, float]] = []
+        self._ply_angle_dists: set = set()         # layer angle distributions the plies take
+        self._identity_ori = ""                    # ABQ2CCX_OR0 once written (_shell_section_cards)
+        self._exact_ori: Dict[Tuple[str, ...], str] = {}   # ply directions -> *ORIENTATION (_exact_ply_cards)
         # knot beams: rigid couplings on shell/beam nodes, rotational BCs on circular-section
         # beams and across *BOUNDARY, OP=NEW (see _plan_rigid_couplings,
         # _plan_circ_rotation_knots, _plan_op_new_rotations, _add_knot_beams)
@@ -3835,6 +3968,7 @@ class Converter:
             "CFLUX": self.handle_flux_film,
             "RADIATE": self.handle_flux_film,
             "NORMAL": self.handle_normal,
+            "NODAL THICKNESS": self.handle_nodal_thickness,
             "EQUATION": self.handle_equation,
             "STATIC": self.handle_static,
             "DYNAMIC": self.handle_dynamic,
@@ -5373,6 +5507,10 @@ class Converter:
         names it (see _plan_distributions), so the card itself emits nothing.  ccx has no
         other kind of distribution."""
         name = (b.param("NAME") or "").strip().upper()
+        if name in self._ply_angle_dists:
+            self.report.note(f"*DISTRIBUTION {name} of composite layer angles: taken into the axes "
+                             f"of the ply solids (no card of its own in ccx).", once=True)
+            return []
         if not (b.param("LOCATION") or "ELEMENT").strip().upper().startswith("ELEM"):
             return self._commented(b, f"*DISTRIBUTION {name}, LOCATION={b.param('LOCATION')}: ccx "
                                       f"takes per-element orientations from element distributions "
@@ -5543,6 +5681,8 @@ class Converter:
             ori = (b.param("ORIENTATION") or "").strip().upper()
             elset = (b.param("ELSET") or "").strip()
             shell = kw in ("SHELL SECTION", "SHELL GENERAL SECTION")
+            if id(b) in self._ply_sections:
+                continue                           # ply solids with their own axes
             if shell and self._continuum_shell_elset(elset):
                 if ori in self._dist_ori and not b.has("COMPOSITE"):    # runs as a solid
                     self._dist_ori[ori]["solid"].update(self._existing(elset))
@@ -6031,14 +6171,17 @@ class Converter:
                                           "thickness + material, or a composite layup.")
             self.report.note("*SHELL GENERAL SECTION -> *SHELL SECTION (membrane/bending stiffness "
                              "semantics are not identical; verify).", once=True)
+        if id(b) in self._ply_sections:
+            return self._ply_section_cards(b)
         if elset and self._continuum_shell_elset(elset):
             # continuum shells run as C3D6/C3D8I solids in ccx, which stops on a shell
             # section there; the thickness comes from the mesh
             if b.has("COMPOSITE"):
-                return self._commented(b, "*SHELL SECTION, COMPOSITE on continuum shells "
-                                          "(SC6R/SC8R): they run as solids in ccx, which has no "
-                                          "layered solid section — mesh the plies as separate "
-                                          "solid layers or use S8R composite shells.")
+                why = self._ply_unsplit.get(id(b)) or self._ply_skipped or "see the warnings"
+                return self._commented(b, f"*SHELL SECTION, COMPOSITE on continuum shells "
+                                          f"(SC6R/SC8R): they run as solids in ccx, which has no "
+                                          f"layered solid section, and the split into one solid per "
+                                          f"ply was left out: {why}.")
             keep_s: "OrderedDict[str, Optional[str]]" = OrderedDict(
                 (k, v) for k, v in b.params.items() if k in ("ELSET", "MATERIAL", "ORIENTATION"))
             self.report.note("*SHELL SECTION on continuum shells (SC6R/SC8R) -> *SOLID SECTION "
@@ -6091,8 +6234,11 @@ class Converter:
                     continue
                 else:
                     self.report.note(f"*SHELL SECTION parameter {k} dropped.", once=True)
+            exact = None if axes else self._exact_ply_cards(b, elset, base, keep)
+            if exact is not None:
+                return exact
             pre: List[str] = []
-            ply_lines: List[str] = []
+            plies: List[Tuple[str, str, Optional[str]]] = []
             for rec in merged_data_records(b):
                 # Positional: thickness, integration-pts, material, angle[, plyname].
                 # Interior blanks are significant, so do NOT filter empty fields out.
@@ -6117,13 +6263,22 @@ class Converter:
                         # a distribution orientation's own rotation is already in its axes
                         oriname = self._plain_dist_orientation(base, axes[base], angle, pre) \
                             if base in axes else self._synth_orientation(base_ori, ply_ori, pre)
-                if oriname:
-                    ply_lines.append(f"{thick}, , {mat}, {oriname}")
-                else:
-                    ply_lines.append(f"{thick}, , {mat}")
+                plies.append((thick, mat, oriname))
+            if any(o for _, _, o in plies) and not all(o for _, _, o in plies):
+                # ccx 2.23 gives a ply line without an orientation the previous line's (probed:
+                # [90, 0] runs as [90, 90]), so the others name the global axes explicitly
+                if not self._identity_ori:
+                    self._identity_ori = "ABQ2CCX_OR0"
+                    pre += [f"*ORIENTATION, NAME={self._identity_ori}", "1., 0., 0., 0., 1., 0."]
+                plies = [(t, m, o or self._identity_ori) for t, m, o in plies]
+                self.report.note("*SHELL SECTION, COMPOSITE: plies without an orientation name the "
+                                 "global axes (ABQ2CCX_OR0) where another ply has one — ccx 2.23 "
+                                 "would give them the previous ply's orientation (probed).", once=True)
+            ply_lines = [f"{t}, , {m}, {o}" if o else f"{t}, , {m}" for t, m, o in plies]
             self.report.note("*SHELL SECTION, COMPOSITE: ply angles converted to synthesized "
-                             "*ORIENTATION cards (rotation about the shell normal). Verify for curved "
-                             "shells.", once=True)
+                             "*ORIENTATION cards (a rotation about the orientation's axis 3, which "
+                             "ccx turns and projects onto the shell as Abaqus turns a layer about the "
+                             "shell normal wherever that axis is the normal).", once=True)
             if b.has("SYMMETRIC"):
                 # Abaqus lists the bottom half of a symmetric layup and mirrors it about the
                 # mid-surface; ccx has no such flag, so write the full stack
@@ -6152,6 +6307,132 @@ class Converter:
                     self.report.note("*SHELL SECTION: integration-point count dropped (ccx wants the "
                                      "thickness only).", once=True)
                 out.append(f[0])
+        return out
+
+    def _exact_ply_cards(self, b: Block, elset: Optional[str], base: str,
+                         keep: "OrderedDict[str, Optional[str]]") -> Optional[List[str]]:
+        """A composite *SHELL SECTION whose plies need their directions element by element, or
+        None where ccx reads the usual ply orientations as Abaqus does.  Abaqus projects the
+        section orientation onto the shell (the axis that follows its rotation axis; without
+        one, global X) and then turns a layer by its angle about the shell normal (shell_local_
+        axes, ply_axes); ccx 2.23 turns an orientation about its own axis k and projects the
+        turned axis 1 (probed), and the converter writes a layer angle as a rotation about axis
+        3.  The two agree where every shell's normal is the orientation's axis 3 — a flat
+        panel in its plane — and not on other planes, reversed normals, curved shells or a
+        rotation about axis 1 or 2.  There each group of elements with the same ply directions
+        gets an element set, an *ORIENTATION per ply with those directions (in the shell's
+        plane, so ccx's projection keeps them) and a section of its own."""
+        if not elset:
+            return None
+        quiet = Report()
+        elems = []
+        for e in dedup(self.geom.elset(elset)):
+            if e not in self.geom.elements:
+                continue
+            typ, conn = self.geom.elements[e]
+            t = ccx_element_type(typ, quiet)
+            if t not in SHELL_TYPES or t.startswith("SC") or len(conn) < 3 or \
+                    any(n not in self.geom.nodes for n in conn):
+                return None
+            elems.append(e)
+        plies: List[Tuple[str, str, str]] = []
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) >= 3 and g[0]:
+                plies.append((g[0], g[2], (g[3] if len(g) > 3 else "").upper()))
+        if not elems or not plies or any(f in self._dist_refs or (base in self._dist_refs and not f)
+                                         for _, _, f in plies):
+            return None
+        if b.has("SYMMETRIC"):
+            plies = plies + plies[::-1]
+        P = self.geom.nodes
+
+        def frame(name: str, center: Vec):
+            a, bb, system = self.orientations[name]
+            return orientation_frame(a, bb, system, center, self._orient_rotation.get(name))
+
+        def ccx_dir(n: Vec, name: str, center: Vec, synth: Optional[float]) -> Optional[Vec]:
+            """ccx's ply direction for the orientation the converter writes: none or the
+            global axes (ccx's default projection, as Abaqus'; probed), the deck's *ORIENTATION
+            as handle_orientation writes it (a cylindrical one without its rotation line), or a
+            synthesized one (_synth_orientation: rectangular, ``synth`` degrees about axis 3);
+            None where ccx's turned axis 1 lies along the normal."""
+            if not name and synth is None:
+                return shell_local_axes(n)[0]
+            a, bb, system = self.orientations[name] if name else \
+                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR")
+            rect = not system.upper().startswith("CYL")
+            if synth is not None:
+                fr, _ = orientation_frame(a, bb, "RECTANGULAR", center, (3, synth))
+            else:
+                fr, _ = orientation_frame(a, bb, "RECTANGULAR" if rect else system, center,
+                                          self._orient_rotation.get(name) if rect else None)
+            v = vsub(fr[0], vscale(n, vdot(fr[0], n)))
+            return vunit(v) if vnorm(v) > 1e-9 else None
+
+        known = lambda name: name in self.orientations      # noqa: E731
+        rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]" = OrderedDict()
+        differs = False
+        for e in elems:
+            conn = self.geom.elements[e][1]
+            c = [P[n] for n in conn[:4 if len(conn) in (4, 8, 9) else 3]]
+            n = vcross(vsub(c[2], c[0]), vsub(c[3], c[1])) if len(c) == 4 else \
+                vcross(vsub(c[1], c[0]), vsub(c[2], c[0]))
+            if vnorm(n) < 1e-30:
+                return None
+            n = vunit(n)
+            center = vscale(vadd(vadd(c[0], c[1]), c[2]), 1.0 / 3.0) if len(c) == 3 else \
+                vscale(vadd(vadd(c[0], c[1]), vadd(c[2], c[3])), 0.25)
+            toks = []
+            for _thick, _mat, field in plies:
+                try:
+                    angle, name = (pf(field), base) if field else (0.0, base)
+                except ValueError:
+                    angle, name = 0.0, field
+                if name and not known(name):
+                    return None
+                fr = frame(name, center) if name else None
+                d1, d2 = ply_axes(n, shell_local_axes(n, *fr) if fr else shell_local_axes(n), angle)
+                # what ccx makes of the orientation the converter would write (_synth_orientation)
+                if angle and name == base:
+                    rot = self._orient_rotation.get(base) if base else None
+                    got = ccx_dir(n, base, center, angle + (rot[1] if rot and rot[0] == 3 else 0.0))
+                else:
+                    got = ccx_dir(n, name, center, None)
+                if got is None or vdot(got, d1) < 1.0 - 1e-6:
+                    differs = True
+                toks.append(tuple(_fmt_component(x) for x in (*d1, *d2)))
+            rows[e] = tuple(toks)
+        if not differs:
+            return None
+        self._reserve_names()
+        groups: "OrderedDict[tuple, List[int]]" = OrderedDict()
+        for e, key in rows.items():
+            groups.setdefault(key, []).append(e)
+        out: List[str] = []
+        for k, (key, members) in enumerate(groups.items(), 1):
+            gname = elset if len(groups) == 1 else self._fresh_name(f"{elset}_P{k}")
+            if gname != elset:
+                out += [f"*ELSET, ELSET={gname}"] + reflow([str(e) for e in members])
+            names = []
+            for tok in key:
+                if tok not in self._exact_ori:
+                    self._exact_ori[tok] = self._fresh_name(f"ABQ2CCX_PLY{len(self._exact_ori) + 1}")
+                    out += [f"*ORIENTATION, NAME={self._exact_ori[tok]}", ", ".join(tok)]
+                names.append(self._exact_ori[tok])
+            params = OrderedDict(keep)
+            params["ELSET"] = gname
+            out.append(emit_keyword("SHELL SECTION", params))
+            out += [f"{thick}, , {mat}, {name}" for (thick, mat, _f), name in zip(plies, names)]
+        self.report.note(f"*SHELL SECTION, COMPOSITE on shells whose normal is not the orientation's "
+                         f"axis 3 (another plane, a reversed normal, a curved shell or a rotation "
+                         f"about axis 1 / 2): each ply's directions given element group by group "
+                         f"({len(groups)} group(s) here) as Abaqus defines them — the orientation "
+                         f"projected onto the shell, then turned by the layer angle about the shell "
+                         f"normal; ccx would turn it about the orientation's axis 3 and project that.",
+                         once=True)
         return out
 
     def handle_membrane_section(self, b: Block) -> List[str]:
@@ -7143,12 +7424,12 @@ class Converter:
                         self._reduces("velocity / acceleration BC on a *TRANSFORM node")
 
             def mean_entry(ea: tuple, ec: tuple, m: int, d: int, shapes: Dict[tuple, str],
-                           amp_lines: List[str]) -> Optional[Tuple[object, str]]:
-                """The line that moves midside node m with the mean of the motions of its
-                end nodes (entries ``ea``/``ec`` of a driven map), or None (a velocity and an
-                acceleration end)."""
+                           amp_lines: List[str], frac: float = 0.5) -> Optional[Tuple[object, str]]:
+                """The line that moves node m, at s along the segment between two end nodes,
+                with the interpolated motion of the ends (entries ``ea``/``ec`` of a driven
+                map), or None (a velocity and an acceleration end)."""
                 if ea[4] == ec[4]:                 # one amplitude (or none): mean of the values
-                    return (ea[4], f"{m}, {d}, {d}, {(pf(ea[5]) + pf(ec[5])) / 2.0:.12g}")
+                    return (ea[4], f"{m}, {d}, {d}, {(1.0 - frac) * pf(ea[5]) + frac * pf(ec[5]):.12g}")
                 orders = {e[0]["q"] for e in (ea, ec) if e[4] is not None}
                 if len(orders) > 1:
                     return None
@@ -7156,9 +7437,9 @@ class Converter:
                 rates = [(self._bc_history(e[0], T, t0, None, e[3]) if e[4] is not None else None)
                          or ((lambda t: 0.0), [], 0.0) for e in (ea, ec)]
                 pts, _, _, _ = integrate_history(
-                    lambda t: 0.5 * (rates[0][0](t) + rates[1][0](t)), list(rates[0][1]) +
-                    list(rates[1][1]), T, order, (ea[1] + ec[1]) / 2.0,
-                    ((ea[2] or 0.0) + (ec[2] or 0.0)) / 2.0,
+                    lambda t: (1.0 - frac) * rates[0][0](t) + frac * rates[1][0](t), list(rates[0][1]) +
+                    list(rates[1][1]), T, order, (1.0 - frac) * ea[1] + frac * ec[1],
+                    (1.0 - frac) * (ea[2] or 0.0) + frac * (ec[2] or 0.0),
                     min([h[2] for h in rates if h[2] > 0.0], default=0.0), max_points=max_points)
                 key = ("midside", m, d, ea[4], ec[4], ea[5], ec[5])
                 if key not in shapes:
@@ -7168,15 +7449,16 @@ class Converter:
 
             def midside(driven: dict, shapes: Dict[tuple, str], amp_lines: List[str],
                         entries: list, done: set) -> None:
-                """The midside node of an upgraded 2-node beam whose end nodes these lines
-                drive moves with the mean of their motions, which is what the Abaqus element
-                sees between them (handle_boundary interpolates only within one *BOUNDARY
-                block, and the end nodes may get different amplitudes)."""
-                for a, c, m in self._midside.values():
+                """A node the converter put between two end nodes these lines drive (an
+                upgraded beam's or shell's midside node, a ply interface node) moves with the
+                interpolated motion of the ends, which is what the Abaqus element sees between
+                them (handle_boundary interpolates only within one *BOUNDARY block, and the end
+                nodes may get different amplitudes)."""
+                for a, c, m, frac in self._between():
                     for d in range(1, 7):
                         ea, ec = driven.get((a, d)), driven.get((c, d))
                         if ea and ec and (m, d) not in driven:
-                            e = mean_entry(ea, ec, m, d, shapes, amp_lines)
+                            e = mean_entry(ea, ec, m, d, shapes, amp_lines, frac)
                             if e is not None:
                                 entries.append(e)
                                 done.add((m, d))
@@ -7265,11 +7547,11 @@ class Converter:
                 convert(state[keys[0]][2], keys, shapes, tail_amps, tail, tail_driven)
             midside(tail_driven, shapes, tail_amps, tail, mid_done)
             step_driven.update(tail_driven)
-            for a, c, m in self._midside.values():  # end nodes driven by different cards
+            for a, c, m, frac in self._between():  # end nodes driven by different cards
                 for d in range(1, 7):
                     ea, ec = step_driven.get((a, d)), step_driven.get((c, d))
                     if ea and ec and (m, d) not in mid_done and (m, d) not in step_driven:
-                        e = mean_entry(ea, ec, m, d, shapes, tail_amps)
+                        e = mean_entry(ea, ec, m, d, shapes, tail_amps, frac)
                         if e is not None:
                             tail.append(e)
             tail = [e for e in tail if e[0] not in (None, "FIXED")]   # ccx holds those already
@@ -7404,7 +7686,7 @@ class Converter:
             if blocks[i].keyword == "BOUNDARY" and not groups:
                 model.append(blocks[i])
             i += 1
-        mid_ends = {m: (a, c) for a, c, m in self._midside.values()}
+        mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
         todo: List[Tuple[int, str, str, Block, List[dict]]] = []   # step, kind, procedure, card, lines
         query: set = set()
         nlgeom = False
@@ -11627,14 +11909,20 @@ class Converter:
         if self._temp_ic_fill or self._temp_ic_default:
             self.geom.nsets[ALL_NODES_SET] = list(self.geom.nodes)
 
+    def handle_nodal_thickness(self, b: Block) -> List[str]:
+        """``*NODAL THICKNESS`` passes through; the nodes the converter put between two nodes
+        that both have a thickness (an upgraded shell's midside node) get the interpolation."""
+        return self.passthrough(b) + self._midside_records(b, "field")
+
     def handle_normal(self, b: Block) -> List[str]:
         """``*NORMAL`` passes through.  ccx builds a beam's expanded cross-section from the
         normal in every node, so when both end nodes of an upgraded 2-node beam have an
         explicit normal its midside node gets their normalised mean — otherwise ccx would
         derive that node's normal from the section's n1 instead and twist the element
-        wherever the two disagree."""
+        wherever the two disagree.  The same holds for the edges of upgraded shells (ccx
+        would average the element normals at the new node)."""
         out = self.passthrough(b)
-        if not self._midside:
+        if not self._midside and not self._quad_edges:
             return out
         given: Dict[Tuple[int, int], Vec] = {}
         for rec in merged_data_records(b):
@@ -11645,14 +11933,18 @@ class Converter:
             except ValueError:
                 continue
         n_out = len(out)
-        for eid, (a, c, m) in self._midside.items():
+        kinds: set = set()
+        edges = [(eid, a, c, m, "beam") for eid, (a, c, m) in self._midside.items()] + \
+            [(eid, a, c, m, "edge") for eid, trip in self._quad_edges.items() for a, c, m in trip]
+        for eid, a, c, m, kind in edges:
             na, nc = given.get((eid, a)), given.get((eid, c))
             if na and nc and (eid, m) not in given:
                 n = vadd(vunit(na), vunit(nc))
                 if vnorm(n) > 1e-9:
                     out.append(f"{eid}, {m}, " + ", ".join(_fmt_component(x) for x in vunit(n)))
+                    kinds.add(kind)
         if len(out) > n_out:
-            self._note_midside_lines("NORMAL")
+            self._note_midside_lines("NORMAL", kinds)
         return out
 
     def handle_surface_interaction(self, b: Block) -> List[str]:
@@ -11880,6 +12172,9 @@ class Converter:
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._upgrade_section_beams(blocks)
         self._plan_u1_beams(blocks)
+        self._plan_quadratic_shells(blocks)     # composite S3 / S4 / S4R -> S6 / S8R
+        self._plan_ply_split(blocks)            # composite SC6R / SC8R -> one solid per ply
+        self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
         self._prescan(blocks)
         self._plan_amplitude_spans(blocks)
@@ -11916,6 +12211,7 @@ class Converter:
         out.extend(self.emit_geometry())
         out.extend(self._knot_section())
         out.extend(self._slab_cards())
+        out.extend(self._ply_cards())
         out.extend(self._node_normal_cards(blocks))
         if self._planar_bc:
             out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "
@@ -13394,15 +13690,32 @@ class Converter:
                              f"node there would add load or equation terms); *BOUNDARY and "
                              f"temperature lines on them still reach the midside nodes.", once=True)
 
+    def _between(self) -> List[Tuple[int, int, int, float]]:
+        """Every node the converter put on the segment between two nodes, as (a, c, node, s)
+        with the node at a + s (c - a), each once: the midside nodes of upgraded beams and
+        shells (a beam along an upgraded shell edge shares the edge's), and the ply interface
+        nodes of split continuum shells."""
+        key = (len(self._midside), len(self._edge_nodes))
+        if getattr(self, "_between_cache", (None,))[0] != key:
+            seen: set = set()
+            out: List[Tuple[int, int, int, float]] = []
+            for a, c, m, s in [(a, c, m, 0.5) for a, c, m in self._midside.values()] + self._edge_nodes:
+                if m not in seen:
+                    seen.add(m)
+                    out.append((a, c, m, s))
+            self._between_cache = (key, out)
+        return self._between_cache[1]
+
     def _midside_records(self, b: Block, layout: str) -> List[str]:
-        """Extra data lines that carry a per-node card onto the midside nodes of upgraded 2-node
-        beams: when the card gives both end nodes a value (by id or through a set), the
-        midside node gets the linear interpolation, which is what the Abaqus element sees
-        between its nodes.  ``layout`` is ``"boundary"`` (node, first DOF[, last DOF[,
-        magnitude]] or a named type), ``"dof"`` (node, DOF, value) or ``"field"`` (node,
-        values...).  Appended after the card's own lines, they override what a set gave the
-        midside node; a value the card already gives it is not repeated."""
-        if not self._midside:
+        """Extra data lines that carry a per-node card onto the nodes the converter put
+        between two nodes (_between: midside nodes of upgraded beams and shells, ply interface
+        nodes): when the card gives both end nodes a value (by id or through a set), the new
+        node gets the linear interpolation, which is what the Abaqus element sees between its
+        nodes.  ``layout`` is ``"boundary"`` (node, first DOF[, last DOF[, magnitude]] or a
+        named type), ``"dof"`` (node, DOF, value) or ``"field"`` (node, values...).  Appended
+        after the card's own lines, they override what a set gave the new node; a value the
+        card already gives it is not repeated."""
+        if not self._midside and not self._edge_nodes and not self._tied_nodes:
             return []
         recs: Dict[int, Dict[int, object]] = {}
         for rec in merged_data_records(b):
@@ -13430,19 +13743,23 @@ class Converter:
             for n in self._resolve_nodes(g[0]):
                 recs.setdefault(n, {}).update(vals)
         out: List[str] = []
-        for a, c, m in self._midside.values():
+        kinds: set = set()
+        beam_mids = {m for _, _, m in self._midside.values()}
+        for a, c, m, s in self._between() + (self._tied_nodes if layout != "boundary" else []):
             if a not in recs or c not in recs:
                 continue
             ra, rc, rm = recs[a], recs[c], recs.get(m, {})
+            n_out = len(out)
             if layout == "field":
-                mean = [(x + y) / 2.0 for x, y in zip(ra[0], rc[0])]
+                mean = [(1.0 - s) * x + s * y for x, y in zip(ra[0], rc[0])]
                 if rm.get(0) != mean:
                     out.append(", ".join([str(m)] + ["%.12g" % x for x in mean]))
+                    kinds.add("beam" if m in beam_mids else "edge")
                 continue
             runs: List[List] = []                # [first DOF, last DOF, value] (value None = blank)
             for d in sorted(set(ra) & set(rc)):
                 va, vc = ra[d], rc[d]
-                v = None if va is None and vc is None else ((va or 0.0) + (vc or 0.0)) / 2.0
+                v = None if va is None and vc is None else (1.0 - s) * (va or 0.0) + s * (vc or 0.0)
                 if d in rm and rm[d] == v:
                     continue
                 if layout == "boundary" and runs and runs[-1][1] == d - 1 and runs[-1][2] == v:
@@ -13452,13 +13769,731 @@ class Converter:
             for d1, d2, v in runs:
                 head = [str(m), str(d1)] if layout == "dof" else [str(m), str(d1), str(d2)]
                 out.append(", ".join(head + ([] if v is None else ["%.12g" % v])))
+            if len(out) > n_out:
+                kinds.add("beam" if m in beam_mids else "edge")
         if out:
-            self._note_midside_lines(b.keyword)
+            self._note_midside_lines(b.keyword, kinds)
         return out
 
-    def _note_midside_lines(self, keyword: str) -> None:
-        self.report.note(f"*{keyword} lines given for both end nodes of an upgraded 2-node beam were "
-                         f"extended to its midside node (values interpolated linearly).", once=True)
+    def _note_midside_lines(self, keyword: str, kinds: Sequence[str] = ("beam",)) -> None:
+        if "beam" in kinds:
+            self.report.note(f"*{keyword} lines given for both end nodes of an upgraded 2-node beam "
+                             f"were extended to its midside node (values interpolated linearly).",
+                             once=True)
+        if "edge" in kinds:
+            self.report.note(f"*{keyword} lines given for both ends of an edge the converter put "
+                             f"nodes on (a shell midside node, ply interface nodes) were extended "
+                             f"to those nodes (values interpolated linearly).", once=True)
+
+    # Cards that read a node set node by node — as state, as an output selection, or as the
+    # members of a constraint that must stay complete (couplings, rigid bodies, the nodes of a
+    # node-based surface for a tie or contact): a node the converter puts between two of the
+    # set's nodes (_between) joins it.  Loads, *EQUATION and *MPC count the set's nodes.
+    _EDGE_SET_CARDS = _MIDSIDE_SET_CARDS | {"KINEMATIC COUPLING", "DISTRIBUTING COUPLING",
+                                            "SUBMODEL", "NODAL THICKNESS"}
+
+    def _extend_edge_sets(self, blocks: List[Block], trips: Sequence[Tuple[int, int, int]]) -> None:
+        """Add each new node of ``trips`` (end a, end c, node) to the node sets that hold both
+        of its ends, unless a card that counts the set's nodes uses the set (an extra node
+        would add load or equation terms; *BOUNDARY and temperature lines still reach the node
+        through _midside_records), and to the node-based *SURFACE and *KINEMATIC / *DISTRIBUTING
+        COUPLING lines that give both ends by number."""
+        if not trips:
+            return
+        names = set(self.geom.nsets)
+        counted: set = set()
+        for b in blocks:
+            if b.keyword in GEOM_KW or b.keyword in ELEM_REF_KW or b.keyword in ("HEADING", "SURFACE") \
+                    or b.keyword in self._EDGE_SET_CARDS:
+                continue
+            toks = {v.strip().upper() for k, v in b.params.items() if v and k in REF_PARAMS}
+            for line in b.data:
+                toks.update(t.strip().upper() for t in line.split(","))
+            counted |= toks & names
+        by_end: Dict[int, List[Tuple[int, int]]] = {}
+        for a, c, m in trips:
+            by_end.setdefault(a, []).append((c, m))
+        skipped: List[str] = []
+        for name, ids in self.geom.nsets.items():
+            members = set(ids)
+            add = [m for n in dedup(ids) for c, m in by_end.get(n, ()) if c in members and m not in members]
+            if not add:
+                continue
+            if name in counted or name in self.geom.unsorted:
+                skipped.append(name)
+            else:
+                ids.extend(add)
+        isint = re.compile(r"[-+]?\d+").fullmatch
+        for b in blocks:
+            if b.keyword == "SURFACE" and (b.param("TYPE") or "").strip().upper() == "NODE":
+                listed = {int(r[0]) for r in merged_data_records(b) if r and isint(r[0])}
+                extra = [m for a, c, m in trips if a in listed and c in listed and m not in listed]
+                if extra:
+                    b.data = list(b.data) + [str(m) for m in dedup(extra)]
+                    self._register_surface(b)
+            elif b.keyword in ("KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
+                extra = self._midside_records(b, "boundary" if b.keyword.startswith("K") else "field")
+                if extra:
+                    b.data = list(b.data) + extra
+        if skipped:
+            self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
+                             f"hold both ends of an edge the converter put nodes on (an upgraded "
+                             f"shell's midside node, ply interface nodes) but a load or constraint "
+                             f"card counts their nodes, so those nodes were not added (an extra node "
+                             f"there would add load or equation terms); *BOUNDARY and temperature "
+                             f"lines on them still reach the new nodes.", once=True)
+
+    def _transform_new_nodes(self, blocks: List[Block]) -> None:
+        """A node the converter put between two nodes of a *TRANSFORM's node set takes the
+        transform too where the set did not take the node (a load card counts the set, or the
+        node is a ply interface node held by *EQUATION): its interpolated BC lines and its ties
+        are in local DOFs, as its ends' are.  A copy of the card on a set of those nodes follows
+        the card."""
+        new_nodes = self._between() + self._tied_nodes
+        if not new_nodes:
+            return
+        for i in range(len(blocks) - 1, -1, -1):
+            b = blocks[i]
+            name = (b.param("NSET") or "").strip()
+            if b.keyword != "TRANSFORM" or not name:
+                continue
+            members = set(self.geom.nset(name))
+            new = dedup([m for a, c, m, _s in new_nodes if a in members and c in members and
+                         m not in members])
+            if not new:
+                continue
+            self._reserve_names()
+            sub = self._fresh_name(f"{name}_NEW")
+            self.geom.nsets[sub] = new
+            params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+            params["NSET"] = sub
+            blocks.insert(i + 1, Block(b.keyword, params, list(b.data), b.part, b.instance))
+            self.report.note("*TRANSFORM copied onto the nodes the converter put between two of its "
+                             "nodes where its node set did not take them (a load counts the set, or "
+                             "the node is held by an *EQUATION): their BCs and ties are in its local "
+                             "DOFs too.", once=True)
+
+    def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
+        """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads
+        *SHELL SECTION, COMPOSITE only on S8R and S6 (probed: '*ERROR reading *SHELL SECTION'
+        on S3, S4, S4R and S8), so the linear shells of a composite section become S8R / S6
+        (COMPOSITE_SHELL_UPGRADE) with a node at the middle of every edge: the same flat
+        facets, layup, thicknesses, orientations, element ids and sets.  Every linear shell
+        joined to them through an edge is upgraded too — a linear neighbour would leave the
+        midside node of their shared edge hanging — and a 2-node beam along an upgraded edge
+        (*BEAM SECTION) becomes the 3-node beam through its midside node, so a stiffener stays
+        joined along the whole edge.  The new nodes join the node sets that hold both ends of
+        their edge (_extend_edge_sets), and BCs, temperatures and initial conditions on both
+        ends reach them (_midside_records)."""
+        quiet = Report()
+        els = self.geom.elements
+        cache: Dict[str, str] = {}
+
+        def cc(typ: str) -> str:
+            if typ not in cache:
+                cache[typ] = ccx_element_type(typ, quiet)
+            return cache[typ]
+
+        corners: Dict[int, List[int]] = {}           # linear shell -> its corner nodes
+        for e, (typ, conn) in els.items():
+            n = {"S3": 3, "S4": 4, "S4R": 4}.get(cc(typ))
+            if not n or len(conn) != n or any(x not in self.geom.nodes for x in conn):
+                continue
+            # a quadrilateral collapsed on one edge is a triangle (ccx stops on a collapsed
+            # S8R: '*ERROR in gen3dnor', probed)
+            ring = [x for k, x in enumerate(conn) if x != conn[k - 1]] if n == 4 else list(conn)
+            if len(ring) >= 3 and len(set(ring)) == len(ring):
+                corners[e] = ring
+        seeds = [e for b in blocks
+                 if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION") and b.has("COMPOSITE")
+                 for e in self.geom.elset((b.param("ELSET") or "").strip()) if e in corners]
+        if not seeds:
+            return
+
+        def edges(e: int) -> List[Tuple[int, int]]:
+            ring = corners[e]
+            return [(ring[k], ring[(k + 1) % len(ring)]) for k in range(len(ring))]
+
+        by_edge: Dict[Tuple[int, int], List[int]] = {}
+        for e in corners:
+            for a, c in edges(e):
+                by_edge.setdefault((min(a, c), max(a, c)), []).append(e)
+        comp, todo = set(seeds), list(dedup(seeds))
+        while todo:                                  # the linear shells joined to them by edges
+            for a, c in edges(todo.pop()):
+                for f in by_edge[(min(a, c), max(a, c))]:
+                    if f not in comp:
+                        comp.add(f)
+                        todo.append(f)
+        nodes = self.geom.nodes
+        next_id = max(nodes, default=0)
+        mid: Dict[Tuple[int, int], int] = {}
+        for a, c, m in self._midside.values():       # a beam's own midside node serves its edge
+            mid.setdefault((min(a, c), max(a, c)), m)
+        made: List[Tuple[int, int, int]] = []
+        kinds: "OrderedDict[str, int]" = OrderedDict()
+        for e in sorted(comp):
+            typ, conn = els[e]
+            mids = []
+            for a, c in edges(e):
+                key = (min(a, c), max(a, c))
+                if key not in mid:
+                    next_id += 1
+                    self.geom.add_node(next_id, vscale(vadd(nodes[a], nodes[c]), 0.5))
+                    mid[key] = next_id
+                    made.append((a, c, next_id))
+                    na, nc = self._node_normals.get(a), self._node_normals.get(c)
+                    if na and nc and vnorm(vadd(na, nc)) > 1e-9:
+                        self._node_normals[next_id] = vunit(vadd(na, nc))
+                mids.append(mid[key])
+            new = "S6" if len(corners[e]) == 3 else COMPOSITE_SHELL_UPGRADE[cc(typ)]
+            self._quad_edges[e] = [(a, c, m) for (a, c), m in zip(edges(e), mids)]
+            els[e] = (new, corners[e] + mids)
+            self._elem_types.add(new)
+            kind = f"{typ.upper()} -> {new}"
+            kinds[kind] = kinds.get(kind, 0) + 1
+        self._edge_nodes += [(a, c, m, 0.5) for a, c, m in made]
+        # 2-node beams along an upgraded edge, and other elements left with a hanging midside node
+        general = {e for b in blocks if b.keyword == "BEAM GENERAL SECTION"
+                   for e in self.geom.elset((b.param("ELSET") or "").strip())}
+        beams, hanging = 0, set()
+        ends: Dict[int, List[Tuple[int, int]]] = {}
+        for a, c, m in made:
+            ends.setdefault(a, []).append((c, m))
+            ends.setdefault(c, []).append((a, m))
+        for e, (typ, conn) in list(els.items()):
+            if e in comp or e in self._midside:
+                continue
+            members = set(conn)
+            hit = [m for n in conn for c, m in ends.get(n, ()) if c in members]
+            if not hit:
+                continue
+            up = {"B31": "B32", "B31R": "B32R"}.get(cc(typ))
+            if len(conn) == 2 and up and e not in general and e not in self._u1:
+                m = mid[(min(conn), max(conn))]
+                els[e] = (up, [conn[0], m, conn[1]])
+                self._midside[e] = (conn[0], conn[1], m)
+                self._elem_types.add(up)
+                beams += 1
+            else:
+                hanging.add(e)
+        self._extend_edge_sets(blocks, made)
+        span = f"node {made[0][2]}" if len(made) == 1 else \
+            f"nodes {made[0][2]}-{made[-1][2]}" if made else "no new node"
+        extra = len(comp) - len(set(seeds))
+        self.report.warn(
+            f"Composite shells: {len(comp)} element(s) emitted as quadratic shells "
+            f"({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a node at the middle "
+            f"of every edge ({span}); ccx 2.23 runs *SHELL SECTION, COMPOSITE only on S8R and S6. "
+            f"The facets, layup, thicknesses, orientations, element ids and sets are kept"
+            + (f"; {extra} other linear shell(s) joined to them by an edge were upgraded too, so no "
+               f"midside node hangs" if extra else "")
+            + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through its "
+               f"midside node" if beams else "")
+            + ". BCs, temperatures and initial conditions on both ends of an edge reach its midside "
+              "node, and so do the node sets of BCs, couplings, ties and output. The quadratic "
+              "shell is more accurate than the linear one on the same mesh, so results differ "
+              "slightly from Abaqus'.", once=True)
+        self._reduces(f"element {', '.join(kinds)} (ccx runs composite shells on S8R / S6 only)")
+        if hanging:
+            self.report.warn(f"{len(hanging)} element(s) (e.g. {sorted(hanging)[0]}, "
+                             f"{els[sorted(hanging)[0]][0]}) share an edge with the upgraded "
+                             f"shells but were not upgraded, so the edge's midside node is not "
+                             f"theirs: the mesh is not conforming there — verify, or tie them.",
+                             once=True)
+            self._reduces("elements left with a hanging midside node of an upgraded shell")
+
+    def _layup(self, b: Block) -> Optional[List[dict]]:
+        """The layers of a composite *SHELL SECTION, bottom first (SYMMETRIC mirrored): each
+        its thickness (relative on continuum shells), material and orientation field (an
+        angle, an *ORIENTATION or a distribution name, or ""), or None when a line has no
+        positive thickness or no material."""
+        plies: List[dict] = []
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            if not any(g):
+                continue
+            g += [""] * 4
+            try:
+                t = pf(g[0])
+            except ValueError:
+                return None
+            if t <= 0.0 or not g[2]:
+                return None
+            plies.append(dict(t=t, mat=g[2], ori=g[3]))
+        if b.has("SYMMETRIC"):
+            plies = plies + plies[::-1]
+        return plies or None
+
+    def _stack_order(self, conn: List[int], stack: str, frame3: Optional[Vec]) -> Tuple[int, ...]:
+        """The HEX_STACK_ORDER of an 8-node continuum shell for STACK DIRECTION ``stack``; for
+        ORIENTATION the isoparametric direction closest to the orientation's axis 3
+        (``frame3``), in its sense."""
+        if stack in ("1", "2", "3"):
+            return HEX_STACK_ORDER[int(stack)]
+        if frame3 is None:
+            return HEX_STACK_ORDER[3]
+        p = [self.geom.nodes[n] for n in conn]
+
+        def side(pos: Sequence[int]) -> Vec:
+            return vscale(vadd(vadd(p[pos[0] - 1], p[pos[1] - 1]), vadd(p[pos[2] - 1], p[pos[3] - 1])), 0.25)
+        dirs = {1: vsub(side((2, 3, 7, 6)), side((1, 4, 8, 5))), 2: vsub(side((3, 4, 8, 7)), side((1, 2, 6, 5))),
+                3: vsub(side((5, 6, 7, 8)), side((1, 2, 3, 4)))}
+        best = max(dirs, key=lambda d: abs(vdot(vunit(dirs[d]), frame3)))
+        return HEX_STACK_ORDER[best if vdot(dirs[best], frame3) >= 0.0 else -best]
+
+    def _plan_ply_split(self, blocks: List[Block]) -> None:
+        """Composite continuum shells -> one ccx solid per ply.  ccx runs SC8R / SC6R as C3D8I /
+        C3D6 solids and has no layered solid section (it reads *SHELL SECTION, COMPOSITE only on
+        S8R and S6), so each element of a composite section on continuum shells becomes a stack
+        of PLY_SOLID solids from its bottom to its top face along the stack direction (STACK
+        DIRECTION=1, 2, 3 or ORIENTATION; SC6R: nodes 1-3 to 4-6), each ply its share of the
+        thickness (Abaqus reads continuum-shell layer thicknesses as relative), with its own
+        material and axes (_ply_section_cards).  The ply interface nodes lie on the element's
+        stack edges, shared by the neighbours with the same layup; where an edge carries other
+        nodes too (another layup, an element with a plain edge there), *EQUATIONs keep the
+        interface nodes on the line between the nodes all of them share.  Ply 1 keeps the
+        element id, the others get new ones; every element set of the element takes all its
+        plies, and *SURFACE faces and element-based face loads go to the plies that carry the
+        face (_remap_ply_faces).  The new nodes join the node sets that hold both ends of
+        their stack edge (_extend_edge_sets), and BCs, temperatures and initial conditions on
+        both ends reach them (_midside_records).  A split adding more than --max-ply-elements
+        solids (PLY_SPLIT_LIMIT) is left out: the sections stay commented out."""
+        els = self.geom.elements
+        plans: List[dict] = []
+        taken: set = set()
+        for b in blocks:
+            if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION") or not b.has("COMPOSITE"):
+                continue
+            elset = (b.param("ELSET") or "").strip()
+            if not elset or not self._continuum_shell_elset(elset):
+                continue
+            plies = self._layup(b)
+            if not plies:
+                self._ply_unsplit[id(b)] = ("its layup could not be read (a layer without a "
+                                            "positive thickness or a material)")
+                continue
+            elems = []
+            for e in dedup(self.geom.elset(elset)):
+                typ, conn = els.get(e, ("", []))
+                base = split_suffixes(typ)[0] if typ.upper() not in PLY_SOLID else typ.upper()
+                if e in taken or base not in PLY_SOLID or len(conn) != ELEMENT_NNODES[base] or \
+                        any(n not in self.geom.nodes for n in conn):
+                    continue
+                elems.append(e)
+            taken.update(elems)
+            stack = (b.param("STACK DIRECTION") or "3").strip().upper()
+            try:
+                stack = str(pint(stack))                   # "1." and the like
+            except ValueError:
+                pass
+            if elems:
+                plans.append(dict(block=b, elset=elset, plies=plies, elems=elems, stack=stack))
+            else:
+                self._ply_unsplit[id(b)] = ("none of its elements can be split (undefined nodes, "
+                                            "or another composite section took them)")
+        if not plans:
+            return
+        total = sum(len(p["elems"]) * len(p["plies"]) for p in plans)
+        limit = getattr(self.opt, "max_ply_elements", PLY_SPLIT_LIMIT)
+        if limit and total > limit:
+            self._ply_skipped = (f"one solid per ply would make {total} elements, more than "
+                                 f"--max-ply-elements ({limit}); rerun with a larger limit to write "
+                                 f"them")
+            return
+        dists = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        for p in plans:
+            for ply in p["plies"]:
+                field = ply["ori"].strip().upper()
+                if field and field not in self.orientations and field in dists:
+                    self._ply_angle_dists.add(field)
+                    if dists[field].param("TABLE"):
+                        self._dist_tables.add(dists[field].param("TABLE").strip().upper())
+        self._reserve_names()
+        dist_oris = {(b.param("NAME") or "").strip().upper() for b in blocks
+                     if b.keyword == "ORIENTATION" and self._orientation_distribution(b) is not None}
+        nodes = self.geom.nodes
+        next_n = max(nodes, default=0)
+        next_e = max(list(els) + list(self._conn) + list(self._carriers), default=0)
+        iface: Dict[Tuple[int, int, float], int] = {}    # (low end, high end, fraction) -> node
+        made: List[Tuple[int, int, int, float]] = []
+        users: Dict[Tuple[int, int], set] = {}           # stack edge -> its elements' fractions
+        own: Dict[int, set] = {}                         # split element -> its stack edges
+        plies_of: Dict[int, List[int]] = {}
+        stack_of: Dict[int, Tuple[Tuple[int, ...], List[int], List[int]]] = {}
+        orig = {e: list(els[e][1]) for p in plans for e in p["elems"]}
+        for p in plans:
+            t = [ply["t"] for ply in p["plies"]]
+            fr = [0.0]
+            for k in range(1, len(t)):
+                fr.append(sum(t[:k]) / sum(t))
+            fr.append(1.0)
+            ori = (p["block"].param("ORIENTATION") or "").strip().upper()
+            axis3 = None
+            if p["stack"] == "ORIENTATION":
+                if ori in self.orientations and ori not in dist_oris:
+                    a, bb, system = self.orientations[ori]
+                    axis3 = orientation_frame(a, bb, system, (0.0, 0.0, 0.0),
+                                              self._orient_rotation.get(ori))[0][2]
+                else:
+                    self.report.warn(f"*SHELL SECTION {p['elset']}, STACK DIRECTION=ORIENTATION: "
+                                     f"orientation '{ori}' has no fixed axes here (undefined, or "
+                                     f"given by a distribution, which Abaqus does not allow there); "
+                                     f"stacked along direction 3.", once=True)
+            for e in p["elems"]:
+                typ, conn = els[e]
+                hexa = len(conn) == 8
+                order = self._stack_order(conn, p["stack"], axis3) if hexa else (1, 2, 3, 4, 5, 6)
+                pc = [conn[q - 1] for q in order]
+                nc = 4 if hexa else 3
+                bottom, top = pc[:nc], pc[nc:]
+                levels = [bottom]
+                for f in fr[1:-1]:
+                    row = []
+                    for bn, tn in zip(bottom, top):
+                        lo, hi, g = (bn, tn, f) if bn < tn else (tn, bn, 1.0 - f)
+                        key = (lo, hi, round(g, 10))
+                        nid = iface.get(key)
+                        if nid is None:
+                            next_n += 1
+                            nid = next_n
+                            self.geom.add_node(nid, vadd(nodes[lo], vscale(vsub(nodes[hi], nodes[lo]), g)))
+                            iface[key] = nid
+                            made.append((lo, hi, nid, g))
+                        row.append(nid)
+                    levels.append(row)
+                levels.append(top)
+                own[e] = set()
+                for bn, tn in zip(bottom, top):
+                    edge = (min(bn, tn), max(bn, tn))
+                    own[e].add(edge)
+                    users.setdefault(edge, set()).add(
+                        tuple(sorted(round(f if bn < tn else 1.0 - f, 10) for f in fr)))
+                ids = [e] + list(range(next_e + 1, next_e + len(fr) - 1))
+                next_e += len(fr) - 2
+                solid = PLY_SOLID["SC8R" if hexa else "SC6R"]
+                for k, eid in enumerate(ids):
+                    els[eid] = (solid, levels[k] + levels[k + 1])
+                plies_of[e] = ids
+                stack_of[e] = (order, bottom, top)
+                self._elem_types.add(solid)
+        # interface nodes on an edge whose elements do not all share them: kept on the line
+        # between the nodes they do share (an element with a plain edge there shares only the ends)
+        plain: set = set()
+        hanging: Dict[int, Tuple[int, int, float]] = {}
+        ply_new = {i for ids in plies_of.values() for i in ids[1:]}
+        for e, (typ, conn) in els.items():
+            if e in ply_new:
+                continue
+            pts = orig.get(e, conn)
+            for a, c in element_edges("SC8R" if e in orig and len(pts) == 8 else
+                                      "SC6R" if e in orig else typ, pts):
+                edge = (min(a, c), max(a, c))
+                if edge in users and edge not in own.get(e, ()):
+                    plain.add(edge)
+        exact = {nid: (lo, hi, g) for lo, hi, nid, g in made}
+        for edge, sets in users.items():
+            every = set(sets) | ({(0.0, 1.0)} if edge in plain else set())
+            if len(every) == 1:
+                continue
+            common = set.intersection(*(set(s) for s in every))
+            for f in set().union(*every) - common:
+                lo = max(x for x in common if x < f)
+                hi = min(x for x in common if x > f)
+                ends = [edge[0] if lo == 0.0 else iface[(edge[0], edge[1], lo)],
+                        edge[1] if hi == 1.0 else iface[(edge[0], edge[1], hi)]]
+                hanging[iface[(edge[0], edge[1], f)]] = (ends[0], ends[1], (f - lo) / (hi - lo))
+        procs = {b.keyword for b in blocks if b.keyword in PROC_KW}
+        dofs = ([1, 2, 3] if not procs or procs - {"HEAT TRANSFER"} else []) + \
+            ([11] if procs & TEMPERATURE_DOF_PROCS else [])
+        for nid, (na, nb, w) in hanging.items():
+            for d in dofs:
+                self._ply_eq += ["3", f"{nid}, {d}, 1., {na}, {d}, {short_real(w - 1.0, 12)}, "
+                                      f"{nb}, {d}, {short_real(-w, 12)}"]
+        self._tied_nodes += [(exact[nid][0], exact[nid][1], nid, exact[nid][2]) for nid in hanging]
+        face_sets = self._remap_ply_faces(blocks, plies_of, stack_of)
+        # every element set of a split element takes all its plies
+        for name, ids in list(self.geom.elsets.items()):
+            if name in face_sets or not any(i in plies_of for i in ids):
+                continue
+            new: List[int] = []
+            for i in ids:
+                new.append(i)
+                if i in plies_of:
+                    new.extend(plies_of[i][1:])
+            self.geom.elsets[name] = new
+        # the plies of each section, grouped by material and layer orientation field
+        for p in plans:
+            groups: "OrderedDict[Tuple[str, str], List[int]]" = OrderedDict()
+            for k, ply in enumerate(p["plies"]):
+                groups.setdefault((ply["mat"].upper(), ply["ori"].upper()), []).append(k)
+            out = []
+            for (mat_u, ori_u), ks in groups.items():
+                name = self._fresh_name(f"{p['elset']}_PLY{ks[0] + 1}")
+                self.geom.elsets[name] = [plies_of[e][k] for k in ks for e in p["elems"]]
+                out.append(dict(set=name, mat=p["plies"][ks[0]]["mat"], ori=p["plies"][ks[0]]["ori"],
+                                plies=ks))
+            self._ply_sections[id(p["block"])] = dict(elset=p["elset"], elems=p["elems"],
+                                                      groups=out, plies_of=plies_of,
+                                                      stack_of=stack_of, n=len(p["plies"]))
+        left = {t.upper() for t, _ in els.values()}
+        self._elem_types = {t for t in self._elem_types if split_suffixes(t)[0] not in PLY_SOLID or t in left}
+        keep = [(lo, hi, nid, f) for lo, hi, nid, f in made if nid not in hanging]
+        self._edge_nodes += keep
+        self._extend_edge_sets(blocks, [(lo, hi, nid) for lo, hi, nid, _f in keep])
+        n_sc6 = sum(1 for e in plies_of if len(stack_of[e][0]) == 6)
+        self.report.warn(
+            f"Composite continuum shells: {len(plies_of)} element(s) written as one solid per ply "
+            f"({sum(len(v) for v in plies_of.values())} solids: SC8R -> C3D8I, SC6R -> C3D6) with "
+            f"{len(made)} ply interface node(s) on their stack edges; ccx has no layered solid "
+            f"section. Each ply has its share of the element's thickness, its material and its "
+            f"axes (the section's or Abaqus' default shell axes, projected onto the shell and "
+            f"turned by the ply angle about the stack direction); ply 1 keeps the element's id, "
+            f"element sets take all plies, faces and face loads go to the plies that carry them, "
+            f"and node sets, BCs and temperatures on both ends of a stack edge reach its "
+            f"interface nodes. The plies are layerwise solids, not Abaqus' continuum shell: "
+            f"equal for thin laminates, closer to 3-D elasticity for thick ones (a simply "
+            f"supported [0/90/0] plate at a/h = 10 deflects within 3 % of Pagano's solution)."
+            + (f" {n_sc6} SC6R wedge stack(s) run as C3D6, which is stiff in bending: a few "
+               f"among hexahedra change a thin laminate's deflection by about 1 %, a mesh of "
+               f"wedges only by tens of %." if n_sc6 else "")
+            + (f" {len(hanging)} interface node(s) on edges the neighbours do not share are "
+               f"held on the shared line by *EQUATIONs." if hanging else ""), once=True)
+        self._reduces("element SC8R / SC6R composite continuum shells -> one C3D8I / C3D6 solid per ply")
+
+    def _remap_ply_faces(self, blocks: List[Block], plies_of: Dict[int, List[int]],
+                         stack_of: Dict[int, tuple]) -> set:
+        """Faces of split continuum shells -> the faces of their ply solids that carry them
+        (stack_face_map: the bottom face on the first ply, the top face on the last, a side
+        face on every ply).  *SURFACE lines and element-based face loads (*DLOAD P1-P6,
+        TRVEC1-6, TRSHR1-6, *DFLUX S1-S6, *FILM F1-F6, *RADIATE R1-R6) that name them get an
+        element set per new face; a load line that names a split element by number for a body
+        load takes all its plies.  Returns the names of the element sets it adds."""
+        isint = re.compile(r"[-+]?\d+").fullmatch
+        maps: Dict[Tuple[int, ...], Dict[int, Tuple[str, int]]] = {}
+        new_sets: "OrderedDict[str, List[int]]" = OrderedDict()
+
+        def remap(token: str, k: int) -> Optional[List[Tuple[str, int]]]:
+            eids = [int(token)] if isint(token) else dedup(self.geom.elset(token))
+            stem = f"ABQ2CCX_E{token}" if isint(token) else token
+            hit = [e for e in eids if e in plies_of]
+            if not hit:
+                return None
+            groups: "OrderedDict[int, List[int]]" = OrderedDict()
+            for e in hit:
+                order = stack_of[e][0]
+                fam = "HEX" if len(order) == 8 else "WEDGE"
+                fm = maps.setdefault(order, stack_face_map(order, fam))
+                if k not in fm:
+                    continue
+                which, g = fm[k]
+                ids = plies_of[e]
+                groups.setdefault(g, []).extend([ids[0]] if which == "first" else
+                                                [ids[-1]] if which == "last" else ids)
+            out: List[Tuple[str, int]] = []
+            rest = [e for e in eids if e not in plies_of]
+            if rest:
+                name = self._fresh_name(f"{stem}_S{k}")
+                new_sets[name] = rest
+                out.append((name, k))
+            for g, ids in groups.items():
+                name = self._fresh_name(f"{stem}_S{k}_PLIES")
+                new_sets[name] = ids
+                out.append((name, g))
+            return out
+
+        labels = {"DLOAD": ("P", "TRVEC", "TRSHR"), "DFLUX": ("S",), "FILM": ("F",), "RADIATE": ("R",)}
+        moved = 0
+        for b in blocks:
+            if b.keyword == "SURFACE" and (b.param("TYPE") or "ELEMENT").strip().upper() == "ELEMENT":
+                data, hit = [], False
+                for line in b.data:
+                    f = [x.strip() for x in line.split(",")]
+                    m = re.fullmatch(r"S([1-6])", f[1].upper()) if len(f) >= 2 and f[0] else None
+                    r = remap(f[0], int(m.group(1))) if m else None
+                    if r is None:
+                        data.append(line)
+                        continue
+                    hit = True
+                    data += [f"{name}, S{g}" for name, g in r]
+                if hit:
+                    b.data = data
+                    self._register_surface(b)
+                    moved += 1
+            elif b.keyword in labels:
+                data, hit = [], False
+                for line in b.data:
+                    f = [x.strip() for x in line.split(",")]
+                    if len(f) < 2 or not f[0]:
+                        data.append(line)
+                        continue
+                    m = re.fullmatch(r"([A-Z]+?)([1-6])(NU)?", f[1].upper())
+                    if m and m.group(1) in labels[b.keyword]:
+                        r = remap(f[0], int(m.group(2)))
+                        if r is None:
+                            data.append(line)
+                            continue
+                        hit = True
+                        data += [", ".join([name, f"{m.group(1)}{g}{m.group(3) or ''}"] + f[2:])
+                                 for name, g in r]
+                    elif isint(f[0]) and int(f[0]) in plies_of:
+                        hit = True
+                        name = self._fresh_name(f"ABQ2CCX_PLIES_{f[0]}")
+                        new_sets[name] = list(plies_of[int(f[0])])
+                        data.append(", ".join([name] + f[1:]))
+                    else:
+                        data.append(line)
+                if hit:
+                    b.data = data
+                    moved += 1
+        self.geom.elsets.update(new_sets)
+        if moved:
+            self.report.note("Faces of split continuum shells (*SURFACE lines, element-based face "
+                             "loads) -> the faces of their ply solids: the bottom face on the "
+                             "first ply, the top face on the last, a side face on every ply.",
+                             once=True)
+        return set(new_sets)
+
+    def _reserve_names(self) -> None:
+        """Every set, surface and orientation name of the deck, which _fresh_name then avoids."""
+        self._used_names |= set(self.geom.elsets) | set(self.geom.nsets) | set(self.surfaces) | \
+            set(self.orientations)
+
+    def _ply_frame(self, e: int, plan: dict, ori: str) -> Tuple[Vec, Tuple[Vec, Vec]]:
+        """The stack normal of split continuum shell ``e`` (its mid-surface normal, from the
+        bottom face to the top face) and Abaqus' shell material directions 1, 2 there
+        (shell_local_axes) for the section or layer orientation ``ori`` ("": none): a plain
+        *ORIENTATION, rectangular or cylindrical at the element's centre, or a *DISTRIBUTION
+        one with the element's own axes, each turned by its additional rotation first."""
+        _order, bottom, top = plan["stack_of"][e]
+        P = self.geom.nodes
+        mids = [vscale(vadd(P[x], P[y]), 0.5) for x, y in zip(bottom, top)]
+        if len(mids) == 4:
+            n = vcross(vsub(mids[2], mids[0]), vsub(mids[3], mids[1]))
+        else:
+            n = vcross(vsub(mids[1], mids[0]), vsub(mids[2], mids[0]))
+        up = (0.0, 0.0, 0.0)
+        for x, y in zip(bottom, top):
+            up = vadd(up, vsub(P[y], P[x]))
+        n = vunit(vscale(n, -1.0) if vdot(n, up) < 0.0 else n)
+        if not ori:
+            return n, shell_local_axes(n)
+        center = (0.0, 0.0, 0.0)
+        for q in mids:
+            center = vadd(center, vscale(q, 1.0 / len(mids)))
+        rot = self._orient_rotation.get(ori)
+        if ori in self._dist_ori:
+            dp = self._dist_ori[ori]
+            tok = dp["vec"].get(e, dp["default"]) or next(iter(dp["vec"].values()), None)
+            if tok is None:
+                return n, shell_local_axes(n)
+            v = [pf(x) for x in tok]
+            # _distribution_lines turned a rectangular distribution's axes already
+            baked = bool(dp["rot"] and dp["rot"][1] and dp["rect"])
+            frame, k = orientation_frame(tuple(v[:3]), tuple(v[3:6]), "RECT" if dp["rect"] else "CYL",
+                                         center, None if baked else rot)
+            return n, shell_local_axes(n, frame, dp["rot"][0] if baked else k)
+        if ori in self.orientations:
+            a, bb, system = self.orientations[ori]
+            frame, k = orientation_frame(a, bb, "RECT" if system.upper().startswith("SPH") else system,
+                                         center, rot)
+            return n, shell_local_axes(n, frame, k)
+        self.report.warn(f"Composite continuum shells: orientation '{ori}' is not defined; the "
+                         f"plies use Abaqus' default shell axes.", once=True)
+        self._reduces(f"undefined ply orientation {ori}")
+        return n, shell_local_axes(n)
+
+    def _angle_distribution(self, name: str) -> Tuple[Optional[float], Dict[int, float]]:
+        """(default, element -> angle) of a *DISTRIBUTION of layer angles (a composite layer's
+        orientation field naming a distribution; Abaqus 2017 Keywords *SHELL SECTION)."""
+        default, vals = None, {}
+        for rec in merged_data_records(self._dists[name]) if name in self._dists else []:
+            if len(rec) < 2 or not rec[1]:
+                continue
+            try:
+                ang = pf(rec[1])
+            except ValueError:
+                continue
+            if rec[0] == "":
+                default = ang
+            elif re.fullmatch(r"[-+]?\d+", rec[0]):
+                vals[int(rec[0])] = ang
+            else:
+                for e in self._existing(rec[0]):
+                    vals[e] = ang
+        return default, vals
+
+    def _ply_section_cards(self, b: Block) -> List[str]:
+        """The ccx cards of a composite section on split continuum shells (_plan_ply_split):
+        per group of plies with one material and layer orientation field an orientation — one
+        *ORIENTATION where every ply solid has the same axes, else a *DISTRIBUTION with a line
+        per solid, which ccx 2.23 gives each element of a *SOLID SECTION — and a *SOLID SECTION.
+        A ply's axes are Abaqus' (_ply_frame): the section's orientation, or the layer's own,
+        projected onto the shell and turned by the layer angle about the stack normal, which
+        becomes the solid's axis 3."""
+        plan = self._ply_sections[id(b)]
+        base = (b.param("ORIENTATION") or "").strip().upper()
+        for k in b.params:
+            if k not in ("ELSET", "COMPOSITE", "ORIENTATION", "STACK DIRECTION", "SYMMETRIC", "LAYUP"):
+                self.report.note(f"*SHELL SECTION parameter {k} dropped with the continuum-shell "
+                                 f"formulation (the ply solids take their stiffness from the "
+                                 f"materials).", once=True)
+        out: List[str] = []
+        frames: Dict[Tuple[int, str], Tuple[Vec, Tuple[Vec, Vec]]] = {}
+        for grp in plan["groups"]:
+            field = grp["ori"].strip().upper()
+            ori, angle, per = base, 0.0, None
+            if field:
+                try:
+                    angle = pf(field)
+                except ValueError:
+                    if field in self._ply_angle_dists:
+                        per = self._angle_distribution(field)
+                    else:
+                        ori = field
+            axes: "OrderedDict[int, Tuple[str, ...]]" = OrderedDict()
+            missing = 0
+            for e in plan["elems"]:
+                if (e, ori) not in frames:
+                    frames[(e, ori)] = self._ply_frame(e, plan, ori)
+                n, l12 = frames[(e, ori)]
+                if per is not None:
+                    ang = per[1].get(e, per[0])
+                    if ang is None:
+                        missing += 1
+                        ang = 0.0
+                else:
+                    ang = angle
+                d1, d2 = ply_axes(n, l12, ang)
+                tok = tuple(_fmt_component(x) for x in (*d1, *d2))
+                for k in grp["plies"]:
+                    axes[plan["plies_of"][e][k]] = tok
+            if missing:
+                self.report.warn(f"Composite continuum shells: {missing} element(s) not listed in the "
+                                 f"layer angle distribution {field}, which has no default line; "
+                                 f"they get 0 degrees — verify.", once=True)
+                self._reduces(f"layer angle distribution {field} without a default line")
+            oname = self._fresh_name(f"{grp['set']}_ORI")
+            if len(set(axes.values())) == 1:
+                out += [f"*ORIENTATION, NAME={oname}", ", ".join(next(iter(axes.values())))]
+            else:
+                dname = self._fresh_name(f"{grp['set']}_AXES")
+                out += [f"*DISTRIBUTION, NAME={dname}"] + \
+                    [f"{eid}, " + ", ".join(tok) for eid, tok in axes.items()] + \
+                    [f"*ORIENTATION, NAME={oname}", dname]
+            out.append(f"*SOLID SECTION, ELSET={grp['set']}, MATERIAL={grp['mat']}, ORIENTATION={oname}")
+        self.report.note("Composite continuum-shell section -> a *SOLID SECTION per material and "
+                         "layer orientation, each with the plies' axes (one *ORIENTATION, or a "
+                         "*DISTRIBUTION with a line per ply solid where the shell curves).", once=True)
+        return out
+
+    def _ply_cards(self) -> List[str]:
+        """Model data of the split continuum shells (_plan_ply_split): the ties that keep ply
+        interface nodes on an edge the neighbours share."""
+        if not self._ply_eq:
+            return []
+        return (["** [abq2ccx] ply interface nodes held on the edge of a neighbour with other "
+                 "nodes there", "*EQUATION"] + self._ply_eq)
 
     # -- beams as ccx's U1 element ------------------------------------------------------
     _U1_CONSTRAINTS = ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING",
@@ -17695,11 +18730,11 @@ class Converter:
         """(node, DOF) pairs one *BOUNDARY card prescribes, upgraded beams' midside nodes
         included (handle_boundary extends a DOF that both end nodes get to the midside node)."""
         pairs = self._boundary_dofs([b])
-        if self._midside:
+        if self._midside or self._edge_nodes:
             by_node: Dict[int, set] = {}
             for n, d in pairs:
                 by_node.setdefault(n, set()).add(d)
-            pairs |= {(m, d) for a, c, m in self._midside.values()
+            pairs |= {(m, d) for a, c, m, _s in self._between()
                       for d in by_node.get(a, set()) & by_node.get(c, set())}
         return pairs
 
@@ -19834,6 +20869,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="opt-in: write *USER MATERIAL materials for ccx's Abaqus-UMAT interface "
                          "(ABAQUS<name>, ABAQUSNL<name> under NLGEOM), for a ccx rebuilt with the "
                          "deck's UMAT; a stock ccx runs its linear-elastic example instead")
+    ap.add_argument("--max-ply-elements", type=int, default=PLY_SPLIT_LIMIT, metavar="N",
+                    help="largest number of solids a composite continuum-shell model may be split "
+                         "into, one per ply (default %(default)s; 0: no limit)")
     ap.add_argument("--check", action="store_true",
                     help="dry run: parse + convert + report, write nothing")
     ap.add_argument("--strict", action="store_true",

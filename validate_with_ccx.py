@@ -683,6 +683,265 @@ def frd_last(frd_path, name):
     return blocks[-1][1] if blocks else {}
 
 
+
+# --- composite shells: analytic laminate references and the example decks ---------------
+# Pagano's cross-ply plate material (E1 = 25 E2, E3 = E2, G12 = G13 = 0.5 E2, G23 = 0.2 E2,
+# nu = 0.25): E1, E2, E3, nu12, nu13, nu23, G12, G13, G23
+PAGANO_PLY = (250000., 10000., 10000., 0.25, 0.25, 0.25, 5000., 5000., 2000.)
+INPLANE_PLY = (140000., 10000., 10000., 0.3, 0.3, 0.45, 5000., 5000., 3450.)
+
+
+def _matmul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(len(b))) for j in range(len(b[0]))]
+            for i in range(len(a))]
+
+
+def _expm(a):
+    """exp(a) of a small matrix: scaling and squaring of the Taylor series."""
+    n = len(a)
+    norm = max(sum(abs(x) for x in row) for row in a)
+    s = max(0, int(math.ceil(math.log2(norm))) + 1) if norm > 0.5 else 0
+    a = [[x / 2 ** s for x in row] for row in a]
+    e = [[float(i == j) for j in range(n)] for i in range(n)]
+    term = [row[:] for row in e]
+    for k in range(1, 30):
+        term = [[x / k for x in row] for row in _matmul(term, a)]
+        e = [[e[i][j] + term[i][j] for j in range(n)] for i in range(n)]
+    for _ in range(s):
+        e = _matmul(e, e)
+    return e
+
+
+def _ply_stiffness(angle, props):
+    """3-D stiffness constants of a 0 or 90 degree ply in plate axes (x, y, z)."""
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = props
+    s = [[1 / e1, -n12 / e1, -n13 / e1], [-n12 / e1, 1 / e2, -n23 / e2], [-n13 / e1, -n23 / e2, 1 / e3]]
+    c = _solve(s, [1.0, 0.0, 0.0]), _solve(s, [0.0, 1.0, 0.0]), _solve(s, [0.0, 0.0, 1.0])
+    k = dict(C11=c[0][0], C12=c[0][1], C13=c[0][2], C22=c[1][1], C23=c[1][2], C33=c[2][2],
+             C44=g23, C55=g13, C66=g12)
+    if angle == 90:
+        k = dict(C11=k["C22"], C12=k["C12"], C13=k["C23"], C22=k["C11"], C23=k["C13"],
+                 C33=k["C33"], C44=k["C55"], C55=k["C44"], C66=k["C66"])
+    return k
+
+
+def pagano_deflection(plies, a, b, q0, z):
+    """Pagano's exact 3-D elasticity solution (J. Compos. Mater. 4, 1970) for a simply
+    supported cross-ply plate under q0 sin(pi x / a) sin(pi y / b) on its top face: the
+    deflection amplitude at height z above the bottom face.  ``plies``: (thickness, angle 0 or
+    90, PAGANO_PLY-like constants), bottom first.  Each ply's 6 state variables (u, v, w,
+    tau_xz, tau_yz, sigma_z) follow a linear ODE in z, so the plate is a product of matrix
+    exponentials with traction-free faces but for the load."""
+    al, be = math.pi / a, math.pi / b
+    mats = []
+    for t, ang, props in plies:
+        k = _ply_stiffness(ang, props)
+        wp = [k["C13"] * al / k["C33"], k["C23"] * be / k["C33"], 0, 0, 0, 1 / k["C33"]]
+        sx = [-k["C11"] * al + k["C13"] * wp[0], -k["C12"] * be + k["C13"] * wp[1], 0, 0, 0, k["C13"] * wp[5]]
+        sy = [-k["C12"] * al + k["C23"] * wp[0], -k["C22"] * be + k["C23"] * wp[1], 0, 0, 0, k["C23"] * wp[5]]
+        txy = [k["C66"] * be, k["C66"] * al, 0, 0, 0, 0]
+        mats.append((t, [[0, 0, -al, 1 / k["C55"], 0, 0], [0, 0, -be, 0, 1 / k["C44"], 0], wp,
+                         [be * p - al * q for p, q in zip(txy, sx)],
+                         [al * p - be * q for p, q in zip(txy, sy)], [0, 0, 0, al, be, 0]]))
+    tr = [[float(i == j) for j in range(6)] for i in range(6)]
+    for t, m in mats:
+        tr = _matmul(_expm([[x * t for x in row] for row in m]), tr)
+    state = _solve([[tr[r][c] for c in range(3)] for r in (3, 4, 5)], [0.0, 0.0, -q0]) + [0.0] * 3
+    z0 = 0.0
+    for t, m in mats:
+        e = _expm([[x * min(t, z - z0) for x in row] for row in m])
+        if z <= z0 + t + 1e-15:
+            return sum(e[2][j] * state[j] for j in range(6))
+        state = [sum(e[i][j] * state[j] for j in range(6)) for i in range(6)]
+        z0 += t
+    return state[2]
+
+
+def reduced_stiffness(angle, props):
+    """Classical lamination theory: the plane-stress stiffness Q-bar (Q11, Q22, Q12, Q66, Q16,
+    Q26) of a ply turned by ``angle`` degrees about the shell normal."""
+    e1, e2, _e3, n12, _n13, _n23, g12, _g13, _g23 = props
+    d = 1 - n12 * n12 * e2 / e1
+    q11, q22, q12, q66 = e1 / d, e2 / d, n12 * e2 / d, g12
+    c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    return (q11 * c ** 4 + 2 * (q12 + 2 * q66) * s * s * c * c + q22 * s ** 4,
+            q11 * s ** 4 + 2 * (q12 + 2 * q66) * s * s * c * c + q22 * c ** 4,
+            (q11 + q22 - 4 * q66) * s * s * c * c + q12 * (s ** 4 + c ** 4),
+            (q11 + q22 - 2 * q12 - 2 * q66) * s * s * c * c + q66 * (s ** 4 + c ** 4),
+            (q11 - q12 - 2 * q66) * s * c ** 3 + (q12 - q22 + 2 * q66) * s ** 3 * c,
+            (q11 - q12 - 2 * q66) * s ** 3 * c + (q12 - q22 + 2 * q66) * s * c ** 3)
+
+
+def navier_deflection(plies, a, b, q0):
+    """Classical lamination theory (Navier): the centre deflection of a simply supported
+    specially orthotropic plate under q0 sin(pi x / a) sin(pi y / b)."""
+    h = sum(t for t, _, _ in plies)
+    d11 = d12 = d22 = d66 = 0.0
+    z = -h / 2
+    for t, ang, props in plies:
+        q11, q22, q12, q66, _, _ = reduced_stiffness(ang, props)
+        w = ((z + t) ** 3 - z ** 3) / 3
+        d11, d22, d12, d66 = d11 + q11 * w, d22 + q22 * w, d12 + q12 * w, d66 + q66 * w
+        z += t
+    al, be = math.pi / a, math.pi / b
+    return q0 / (d11 * al ** 4 + 2 * (d12 + 2 * d66) * al ** 2 * be ** 2 + d22 * be ** 4)
+
+
+def composite_plate_deck(kind="s4r", h=0.01, stack=3, n=8):
+    """examples/composite_plate_<kind>.inp: a simply supported [0/90/0] square plate (a = 1,
+    quarter model) under q = sin(pi x) sin(pi y), one value per element; S4R composite shells
+    or one layer of SC8R continuum shells (thickness parameter h; ``stack`` 1 renumbers the
+    SC8R elements so that STACK DIRECTION=1 is their thickness and loads their face P4)."""
+    half = 0.5
+    head = ["*Heading",
+            f"Simply supported [0/90/0] square plate, {kind.upper()} composite, sinusoidal "
+            f"pressure (quarter model)",
+            "** a = 1, plate 0 <= x, y <= a, this quarter 0 <= x, y <= a/2 with symmetry on x = y = "
+            "a/2; q = sin(pi x) sin(pi y),",
+            "** one value per element (its centre). validate_with_ccx.py runs a/h = 100 and a/h = 10 "
+            "and compares the centre",
+            "** deflection with classical laminate theory (Navier) and Pagano's 3-D elasticity "
+            "solution."]
+    if kind == "s4r":
+        head += ["** ccx 2.23 runs composite shells on S8R / S6 only: abq2ccx makes these S8R, with "
+                 "a node at the middle of every edge.",
+                 "*Parameter", f"h = {h:g}", "t = h / 3.", "*Node"]
+    else:
+        head += ["** One layer of SC8R continuum shells (z = -h/2 to h/2), relative ply thicknesses. "
+                 "ccx has no layered solid",
+                 "** section: abq2ccx writes one C3D8I per ply, with the ply interface nodes on the "
+                 "stack edges.",
+                 "*Parameter", f"h = {h:g}", "zb = -h / 2.", "zt = h / 2.", "*Node"]
+    layers = (("0.",) if kind == "s4r" else ("<zb>", "<zt>"))
+    nid = lambda i, j, k: 1 + i + (n + 1) * j + (n + 1) ** 2 * k      # noqa: E731
+    lines = head
+    for k, z in enumerate(layers):
+        lines += [f"{nid(i, j, k)}, {half * i / n:g}, {half * j / n:g}, {z}"
+                  for j in range(n + 1) for i in range(n + 1)]
+    lines.append(f"*Element, type={'S4R' if kind == 's4r' else 'SC8R'}, elset=PLATE")
+    load = []
+    order = {3: (1, 2, 3, 4, 5, 6, 7, 8), 1: (1, 4, 8, 5, 2, 3, 7, 6)}[stack]
+    for j in range(n):
+        for i in range(n):
+            e = 1 + i + n * j
+            c = [nid(i, j, 0), nid(i + 1, j, 0), nid(i + 1, j + 1, 0), nid(i, j + 1, 0)]
+            if kind != "s4r":
+                c += [nid(i, j, 1), nid(i + 1, j, 1), nid(i + 1, j + 1, 1), nid(i, j + 1, 1)]
+                renum = [0] * 8
+                for pos, node in zip(order, c):       # restacking ``order`` gives back c
+                    renum[pos - 1] = node
+                c = renum
+            lines.append(f"{e}, " + ", ".join(map(str, c)))
+            q = math.sin(math.pi * half * (i + .5) / n) * math.sin(math.pi * half * (j + .5) / n)
+            face = "P" if kind == "s4r" else ("P2" if stack == 3 else "P4")
+            load.append(f"{e}, {face}, {q:.8f}")
+    for name, pick in (("X0", lambda i, j: i == 0), ("Y0", lambda i, j: j == 0),
+                       ("XS", lambda i, j: i == n), ("YS", lambda i, j: j == n),
+                       ("CENTER", lambda i, j: i == n and j == n)):
+        ids = [nid(i, j, k) for k in range(len(layers)) for j in range(n + 1) for i in range(n + 1)
+               if pick(i, j)]
+        lines += [f"*Nset, nset={name}"] + _ids(ids)
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = PAGANO_PLY
+    lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
+              f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}"]
+    if kind == "s4r":
+        lines += ["*Shell Section, elset=PLATE, composite", "<t>, 3, PLY, 0., Ply-1",
+                  "<t>, 3, PLY, 90., Ply-2", "<t>, 3, PLY, 0., Ply-3",
+                  "*Step, name=Load", "*Static", "*Boundary", "X0, 2, 4", "Y0, 1, 1", "Y0, 3, 3",
+                  "Y0, 5, 5", "XS, XSYMM", "YS, YSYMM"]
+    else:
+        lines += [f"*Shell Section, elset=PLATE, composite, stack direction={stack}",
+                  "1., 3, PLY, 0., Ply-1", "1., 3, PLY, 90., Ply-2", "1., 3, PLY, 0., Ply-3",
+                  "*Step, name=Load", "*Static", "*Boundary", "X0, 2, 3", "Y0, 1, 1", "Y0, 3, 3",
+                  "XS, 1, 1", "YS, 2, 2"]
+    lines += ["*Dload"] + load + ["*Node print, nset=CENTER", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def composite_inplane_deck(kind="s4r", plane="XY", n=2):
+    """examples/composite_inplane_<kind>.inp: a 1 x 1 patch of a [30/-60/45]s laminate (S4R
+    composite shells, or SC8R / SC6R continuum shells 0.6 thick) whose every node gets the
+    in-plane displacements of a uniform strain, eps_x, eps_y and gamma_xy = 1e-3 in turn (one
+    step each), the thickness free: the reactions on the edges x = 1 and y = 1 are then the
+    laminate's membrane forces, A11 ... A66 of classical lamination theory times 1e-3.  With
+    ``plane`` "XZ" the patch is turned by 90 degrees about x into the x-z plane."""
+    eps = 1e-3
+    layers = 1 if kind == "s4r" else 2
+    nid = lambda i, j, k: 1 + i + (n + 1) * j + (n + 1) ** 2 * k      # noqa: E731
+
+    def place(x, y, z):
+        return (x, y, z) if plane == "XY" else (x, -z, y)
+    lines = ["*Heading",
+             f"In-plane stiffness of a [30/-60/45]s laminate, {kind.upper()} composite: three "
+             f"uniform strain states",
+             "** Every node gets the in-plane displacements of a uniform strain (eps_x, eps_y, "
+             "gamma_xy = 1e-3, one step each); the",
+             "** thickness is free, so the reactions on the edges x = 1 and y = 1 are the "
+             "laminate's A11 ... A66 times 1e-3.", "*Node"]
+    for k in range(layers):
+        for j in range(n + 1):
+            for i in range(n + 1):
+                x, y, z = place(i / n, j / n, 0.6 * k)
+                lines.append(f"{nid(i, j, k)}, {x:g}, {y:g}, {z:g}")
+    typ = {"s4r": "S4R", "sc8r": "SC8R", "sc6r": "SC6R"}[kind]
+    lines.append(f"*Element, type={typ}, elset=PATCH")
+    e = 0
+    for j in range(n):
+        for i in range(n):
+            b = [nid(i, j, 0), nid(i + 1, j, 0), nid(i + 1, j + 1, 0), nid(i, j + 1, 0)]
+            t = [nid(i, j, 1), nid(i + 1, j, 1), nid(i + 1, j + 1, 1), nid(i, j + 1, 1)]
+            for conn in ([b] if kind == "s4r" else [b + t] if kind == "sc8r" else
+                         [[b[0], b[1], b[2], t[0], t[1], t[2]], [b[0], b[2], b[3], t[0], t[2], t[3]]]):
+                e += 1
+                lines.append(f"{e}, " + ", ".join(map(str, conn)))
+    lines += ["*Nset, nset=XEDGE"] + _ids([nid(n, j, k) for k in range(layers) for j in range(n + 1)])
+    lines += ["*Nset, nset=YEDGE"] + _ids([nid(i, n, k) for k in range(layers) for i in range(n + 1)])
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = INPLANE_PLY
+    t = "0.1" if kind == "s4r" else "1."
+    lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
+              f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}",
+              "*Shell Section, elset=PATCH, composite, symmetric",
+              f"{t}, 3, PLY, 30.", f"{t}, 3, PLY, -60.", f"{t}, 3, PLY, 45."]
+    dof = {1: 1, 2: 2, 3: 3} if plane == "XY" else {1: 1, 2: 3, 3: 2}
+    for name, field in (("eps_x", lambda x, y: (eps * x, 0.0)), ("eps_y", lambda x, y: (0.0, eps * y)),
+                        ("gamma_xy", lambda x, y: (eps / 2 * y, eps / 2 * x))):
+        lines += [f"*Step, name={name}", "*Static", "*Boundary, op=NEW"]
+        for k in range(layers):
+            for j in range(n + 1):
+                for i in range(n + 1):
+                    u, v = field(i / n, j / n)
+                    lines += [f"{nid(i, j, k)}, {dof[1]}, {dof[1]}, {u:g}",
+                              f"{nid(i, j, k)}, {dof[2]}, {dof[2]}, {v:g}"]
+        lines += [f"1, {dof[3]}, {dof[3]}, 0.", "*Node print, nset=XEDGE, totals=ONLY", "RF",
+                  "*Node print, nset=YEDGE, totals=ONLY", "RF", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def laminate_a_reactions(plane="XY"):
+    """The edge reactions composite_inplane_deck's three steps must give (classical lamination
+    theory): per step, the totals (fx, fy, fz) on the edges x = 1 and y = 1 in global axes."""
+    a = [0.0] * 6
+    for ang in (30, -60, 45, 45, -60, 30):
+        a = [x + 0.1 * q for x, q in zip(a, reduced_stiffness(ang, INPLANE_PLY))]
+    a11, a22, a12, a66, a16, a26 = (x * 1e-3 for x in a)
+    steps = [((a11, a16), (a16, a12)), ((a12, a26), (a26, a22)), ((a16, a66), (a66, a26))]
+    out = []
+    for xe, ye in steps:
+        for fx, fy in (xe, ye):
+            out.append((fx, fy, 0.0) if plane == "XY" else (fx, 0.0, fy))
+    return out
+
+
+def dat_totals(dat_path):
+    """The (fx, fy, fz) of every 'total force' block a ccx .dat file holds, in order."""
+    out, lines = [], open(dat_path).read().splitlines() if os.path.exists(dat_path) else []
+    for i, ln in enumerate(lines):
+        if "total force" in ln:
+            nxt = next((x for x in lines[i + 1:] if x.strip()), "")
+            out.append(tuple(float(x) for x in nxt.split()[:3]))
+    return out
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -2596,6 +2855,85 @@ def main():
                     f"the loaded corner")
         print(f"{'PASS' if ok else 'FAIL'}  results digest ({name}): {what}")
         failures += 0 if ok else 1
+    # --- composite shells: S4R -> S8R, SC8R / SC6R -> one solid per ply ---------------------
+    # ccx runs *SHELL SECTION, COMPOSITE on S8R / S6 only and has no layered solid section, so
+    # abq2ccx upgrades composite S4R to S8R (a node at the middle of every edge) and writes a
+    # composite continuum shell as one C3D8I / C3D6 per ply.  A simply supported [0/90/0] plate
+    # under a sinusoidal load against classical lamination theory and Pagano's 3-D elasticity
+    # solution (a/h = 100 and 10), the plate stacked along its elements' direction 1, and the
+    # in-plane stiffness A of a [30/-60/45]s laminate in the x-y and the x-z plane (exact: the
+    # strain is uniform).
+    def composite_run(text, tag):
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        with open(src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"{tag}.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        res = (dat_displacements(dat), dat_totals(dat)) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"FAIL  {tag}: did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        return res
+
+    plies = lambda h: [(h / 3, ang, PAGANO_PLY) for ang in (0, 90, 0)]     # noqa: E731
+    centre_b, centre_t = 81, 162                    # the SC8R plate's centre, bottom and top
+    stacked = {}
+    for kind, h, stack in (("s4r", 0.01, 3), ("sc8r", 0.01, 3), ("sc8r", 0.1, 3), ("sc8r", 0.1, 1)):
+        res = composite_run(composite_plate_deck(kind, h, stack), f"composite_plate_{kind}_{stack}_{h:g}")
+        if res is None:
+            failures += 1
+            continue
+        u = res[0]
+        if kind == "sc8r" and h == 0.1:
+            stacked[stack] = u
+        if stack != 3:
+            continue
+        clt = navier_deflection(plies(h), 1.0, 1.0, 1.0)
+        if kind == "s4r":
+            w = abs(u[81][2])
+            ok = abs(w / clt - 1) < 0.01
+            print(f"{'PASS' if ok else 'FAIL'}  composite_plate_s4r (composite S4R -> S8R, a/h = 100): "
+                  f"centre deflection {w:.6g} vs classical lamination theory {clt:.6g} "
+                  f"({abs(w / clt - 1) * 100:.2f}% diff; Pagano 3-D "
+                  f"{abs(pagano_deflection(plies(h), 1.0, 1.0, 1.0, h / 2)):.6g})")
+        else:
+            ref = [abs(pagano_deflection(plies(h), 1.0, 1.0, 1.0, z)) for z in (0.0, h)]
+            got = [abs(u[n][2]) for n in (centre_b, centre_t)]
+            err = max(abs(g / r - 1) for g, r in zip(got, ref))
+            ok = err < (0.02 if h == 0.01 else 0.03)
+            print(f"{'PASS' if ok else 'FAIL'}  composite_plate_sc8r (composite SC8R -> C3D8I per ply, "
+                  f"a/h = {1 / h:g}): centre deflection bottom / top {got[0]:.6g} / {got[1]:.6g} vs "
+                  f"Pagano's 3-D solution {ref[0]:.6g} / {ref[1]:.6g} ({err * 100:.2f}% diff; "
+                  f"classical lamination theory {clt:.6g})")
+        failures += 0 if ok else 1
+    if len(stacked) == 2:
+        a, b = stacked[3], stacked[1]
+        scale = max(abs(x) for v in a.values() for x in v)
+        err = max(abs(x - y) for nd in a for x, y in zip(a[nd], b.get(nd, (math.inf,) * 3))) / scale
+        ok = set(a) == set(b) and err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  composite_plate_sc8r (STACK DIRECTION=1 on renumbered "
+              f"elements, top-face load P4): {len(b)} centre displacements vs STACK DIRECTION=3, max "
+              f"difference {err:.1e} of max |u|")
+        failures += 0 if ok else 1
+    for kind in ("s4r", "sc8r", "sc6r"):
+        for plane in ("XY", "XZ"):
+            res = composite_run(composite_inplane_deck(kind, plane), f"composite_inplane_{kind}_{plane}")
+            if res is None:
+                failures += 1
+                continue
+            want = laminate_a_reactions(plane)
+            got = res[1]
+            scale = max(abs(x) for r in want for x in r)
+            err = max(abs(x - y) for r, g in zip(want, got) for x, y in zip(r, g)) / scale \
+                if len(got) == len(want) else math.inf
+            ok = err < 1e-4
+            print(f"{'PASS' if ok else 'FAIL'}  composite_inplane_{kind} ([30/-60/45]s, {plane} plane): "
+                  f"edge reactions of three uniform strains vs classical lamination theory's A11 ... "
+                  f"A66, max difference {err:.1e} of the largest")
+            failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

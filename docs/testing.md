@@ -123,6 +123,9 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | a rigid `R2D2` segment and an `R3D4` facet on a spring | an element pressure `P` (on the `R2D2`: per unit depth) | p / k | exact |
 | a stretched cube with a `*USER MATERIAL` | named `UserMat` and `JohnsonCook_Steel` (renamed); with `--abaqus-umat`, small strain and NLGEOM | ccx stops: "no user material subroutine"; ccx's example UMAT: E ε, E ln(1 + ε) | —; exact; 1e-7 |
 | `planar_pinned_beam`, `beam_circ_cantilever`, `assembly_two_blocks` | the `--run` results digest: frequencies and buckling load, largest \|U\| (near the tip node of the expanded beam), the reaction at each support under its Abaqus name | the references above; statics (the applied load) | as above; 6 digits |
+| `composite_plate_s4r` | a simply supported [0/90/0] plate as composite `S4R` (run as `S8R`), a/h = 100, sinusoidal load | classical lamination theory (Navier) | 0.15 % |
+| `composite_plate_sc8r` | the same plate as `SC8R` (one `C3D8I` per ply), a/h = 100 and 10; numbered so that `STACK DIRECTION=1` is the thickness | Pagano's 3-D elasticity solution; `STACK DIRECTION=3` | 0.96 %, 2.3 %; exact |
+| `composite_inplane_s4r`, `composite_inplane_sc8r` (and `SC6R` wedges) | a [30/-60/45]s laminate under three uniform strains, in the x-y and the x-z plane | classical lamination theory's A11 … A66 | ≤ 2e-5 (`S8R`), 1.5e-7 (plies) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`
@@ -194,8 +197,8 @@ decks are accepted. The other 598 stop first on, or (the last row) run without, 
 | 26 | no convergence or divergence (18), or more than the gate's 300 s (8) |
 | 16 | NLGEOM follower tractions (they convert with `--approximate`) |
 | 19 | other ccx errors, one or a few decks each |
-| 26 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure models; composites on `S4R`) |
-| 8 | Abaqus general contact (7) or an XFEM crack (1): ccx has neither, and the converted deck runs without it — not the deck's physics, so not gated |
+| 24 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure models) |
+| 10 | Abaqus general contact (7), an XFEM crack (1) or Hashin damage of composite plies (2): ccx has none of them, and the converted deck runs without it — not the deck's physics, so not gated |
 
 Every one of them was checked to fail no worse than the original, unconverted deck. Fixing
 a first error often only exposes a second, fundamental one behind it, so the converter aims

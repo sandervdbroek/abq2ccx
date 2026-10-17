@@ -51,8 +51,10 @@ required`.** ccx's complex eigenvalue step covers only Coriolis forces and flutt
 damped one (dashpots, damping) has no ccx counterpart. Use `*MODAL DYNAMIC` or `*STEADY
 STATE DYNAMICS` with the damping instead.
 
-**Composite shell errors.** `*SHELL SECTION, COMPOSITE` works only on `S6` and `S8R`; a
-layup on `S4`/`S4R`/`S3` must be re-meshed with quadratic shells.
+**Composite shells.** ccx runs `*SHELL SECTION, COMPOSITE` only on `S6` and `S8R`: the
+converter upgrades composite linear shells to them and writes composite continuum shells
+as one solid per ply. A ply split larger than `--max-ply-elements` is left out (the
+section stays commented); raise the limit to write it.
 
 **`*ERROR reading *ORIENTATION: distribution … has not been defined`, or `matrix found to be
 singular`, with per-element orientations.** In a hand-written deck: a second `*ORIENTATION`

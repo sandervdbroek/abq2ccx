@@ -33,6 +33,15 @@ Converter._plan_rigid()   rigid elements -> skin solids of their rigid body, ana
                           rigid surfaces -> body members, ROTARYI -> point masses
 Converter._plan_u1_beams()   beams under *BEAM GENERAL SECTION / SECTION=I -> ccx's U1 element
                              (all of them or none: see U1_CARD for what ccx 2.23 allows)
+Converter._plan_quadratic_shells()   composite S3 / S4 / S4R (and the linear shells and beams
+                                     joined to them by an edge) -> S6 / S8R / B32 with shared
+                                     midside nodes
+Converter._plan_ply_split()   composite SC6R / SC8R -> one C3D6 / C3D8I per ply: interface
+                              nodes on the stack edges, element sets, surfaces and face loads
+                              moved to the plies (_remap_ply_faces), *EQUATION ties where
+                              layups differ; nodes put between two nodes (_between) join the
+                              node sets that hold both (_extend_edge_sets) and take the BCs
+                              interpolated (_midside_records)
         │
         ▼
 Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANSFORM of each

@@ -70,12 +70,17 @@ TRANSLATED = {
         "factors of 1 are the defaults, and the out-of-plane, bulk-viscosity and drill factors act "
         "only in Abaqus/Explicit); otherwise a warning and reduced physics.",
     "*SHELL SECTION": "thickness only (integration-point count dropped); composite plies → one "
-        "synthesized `*ORIENTATION` per ply angle (S6/S8R only), composed with a base rotation "
-        "about the normal; `SYMMETRIC` layups mirrored; on continuum shells (SC6R/SC8R, which "
-        "run as solids) → `*SOLID SECTION` (composite: commented); with a `*DISTRIBUTION` "
-        "orientation (its own or a ply's) split into one element set, plain `*ORIENTATION` and "
-        "section per distinct direction. `OFFSET=SPOS`/`SNEG` → `0.5`/`-0.5` (ccx takes only "
-        "the number and reads it the same way).",
+        "synthesized `*ORIENTATION` per ply angle, composed with a base rotation about the "
+        "normal, every ply naming one where any does (ccx 2.23 gives a ply without one the "
+        "previous ply's); where a shell's normal is not the orientation's axis 3 the plies get "
+        "their directions per element group, as Abaqus projects them; composite S3/S4/S4R "
+        "elements become S6/S8R (ccx runs composites on those only); `SYMMETRIC` layups mirrored; "
+        "on continuum shells (SC6R/SC8R, which run as solids) → `*SOLID SECTION`, a composite one "
+        "→ one `*SOLID SECTION` per ply material and angle on one solid per ply (up to "
+        "`--max-ply-elements`); with a `*DISTRIBUTION` orientation (its own or a ply's) split "
+        "into one element set, plain `*ORIENTATION` and section per distinct direction. "
+        "`OFFSET=SPOS`/`SNEG` → `0.5`/`-0.5` (ccx takes only the number and reads it the same "
+        "way).",
     "*SHELL GENERAL SECTION": "→ `*SHELL SECTION` (thickness+material form); ABD/stiffness form "
         "flagged as unsupported.",
     "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's "
@@ -466,6 +471,15 @@ def element_status(t):
     if t in A.SLAB_TYPES:
         return (f"→ `C3D8I` slab (exact for small-strain linear elasticity in static steps); otherwise → "
                 f"`{A.ccx_element_type(t, A.Report())}`, reduced physics")
+    if t in A.PLY_SOLID:
+        return (f"→ `{A.ccx_element_type(t, A.Report())}` (substituted: reduced physics); under a "
+                f"composite section one `{A.PLY_SOLID[t]}` per ply")
+    up = A.COMPOSITE_SHELL_UPGRADE.get(A.ccx_element_type(t, A.Report()))
+    if up:
+        own = "direct" if t in A.CCX_ELEMENTS else (
+            f"→ `{A.ccx_element_type(t, A.Report())}` (exact)" if t in A.EXACT_SUBSTITUTIONS else
+            f"→ `{A.ccx_element_type(t, A.Report())}` (substituted: reduced physics)")
+        return f"{own}; under a composite section → `{up}` with midside nodes (reduced physics)"
     if t in A.EXACT_SUBSTITUTIONS:
         return f"→ `{A.ccx_element_type(t, A.Report())}` (exact)"
     if t in A.ELEMENT_TYPE_MAP:
@@ -522,6 +536,16 @@ def gen_elements():
                          "Elements that carry `*REBAR LAYER`s, or mass (`*SURFACE SECTION, "
                          "DENSITY=`) in a dynamic or frequency step or under gravity, stay — ccx "
                          "then stops on them — unless `--approximate`.\n")
+        if cat == "shell":
+            parts.append("ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has "
+                         "no layered solid section. Linear composite shells become `S6`/`S8R` with a "
+                         "node at the middle of every edge, shared with the linear shells and 2-node "
+                         "beams joined to them by an edge, which are upgraded too. Composite "
+                         "continuum shells become one solid per ply, stacked from the bottom face "
+                         "(`STACK DIRECTION`), each its share of the thickness with its material and "
+                         "ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both "
+                         "are validated against classical lamination theory and Pagano's 3-D "
+                         "solution (`validate_with_ccx.py composite_plate_*`).\n")
         if cat == "plane stress":
             parts.append("ccx has no incompatible-mode plane element. `CPS4I` and `CPE4I` (the "
                          "latter on parallelograms: Abaqus adds a fifth, volumetric mode that acts "

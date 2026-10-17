@@ -25,6 +25,7 @@ abq2ccx INPUT.inp [INPUT.inp ...] [options]               # the same, installed
 | `--solid-dof` | expand `ENCASTRE`/`PINNED`/`*SYMM` to DOFs 1–3 only (solid-only models) |
 | `--approximate` | allow the physics approximations [below](#--approximate), each flagged `[APPROX]` |
 | `--abaqus-umat` | write `*USER MATERIAL` materials for ccx's Abaqus-UMAT interface, to run a ccx built with the deck's UMAT ([below](#--abaqus-umat)) |
+| `--max-ply-elements N` | write composite continuum shells as one solid per ply only up to `N` solids (default 1000000; `0`: no limit) |
 | `--check` | parse, convert and report; write nothing |
 | `--strict` | exit 3 if the conversion produced warnings or commented-out cards |
 | `--json` | print a machine-readable report on stdout |
@@ -187,7 +188,8 @@ Everything the converter creates starts with `ABQ2CCX_`:
 | `ABQ2CCX_RS*`, `ABQ2CCX_AS*`, `ABQ2CCX_STAR*` | the skins a surface uses, a meshed analytical surface, and the point masses of a rigid body's rotary inertia |
 | `ABQ2CCX_RB*`, `ABQ2CCX_MPCB*`, `ABQ2CCX_KC*`, `ABQ2CCX_TIED*` | node sets and surfaces of rigid bodies, `*MPC BEAM` bodies, kinematic couplings and tied contact pairs |
 | `ABQ2CCX_BC*` | node subsets of a BC card that the converter partly moved or removed |
-| `ABQ2CCX_TR*`, `ABQ2CCX_OR*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles) |
+| `ABQ2CCX_TR*`, `ABQ2CCX_OR*`, `ABQ2CCX_PLY*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles and directions) |
+| `<elset>_PLY<k>`, `…_ORI`, `…_AXES`; `<set>_S<k>_PLIES` | the ply solids of a composite continuum-shell section from ply `k` on (one material and layer angle), their orientation and per-element axes; the ply faces a surface or face load names |
 | `ABQ2CCX_VEL*`, `ABQ2CCX_ACC*` | amplitudes that integrate velocity and acceleration BCs |
 | `ABQ2CCX_TP*`, `ABQ2CCX_OUTPUT*` | generated `*TIME POINTS` and output node sets |
 | `ABQ2CCX_<material>` | a `*USER MATERIAL` whose name would make ccx run one of its own routines, renamed so ccx stops instead |
@@ -225,9 +227,10 @@ and `dat_blocks` read ccx's result files.
 
 Static, frequency, buckling, implicit and explicit dynamic, steady-state dynamic, heat
 transfer and coupled temperature–displacement analyses of solids, shells and beams are well
-covered, with the common materials, orientations and composite layups, sets, surfaces, BCs,
-loads, ties, equations, couplings, rigid bodies, rigid elements and analytical rigid
-surfaces, and connectors without a behaviour. Contact is translated card by card, but ccx's
+covered, with the common materials, orientations and composite layups (linear composite
+shells run as `S8R`/`S6`, composite continuum shells as one `C3D8I`/`C3D6` per ply), sets,
+surfaces, BCs, loads, ties, equations, couplings, rigid bodies, rigid elements and analytical
+rigid surfaces, and connectors without a behaviour. Contact is translated card by card, but ccx's
 penalty contact behaves differently — check it. User subroutines, connector behaviours,
 gaskets, inertia relief, Riks and some specialised materials and procedures have no
 equivalent and are flagged for manual work.

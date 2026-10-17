@@ -52,7 +52,9 @@ print(result.report.summary())               # "N warning(s), M note(s), K comme
   plain ones) is flagged as reduced physics.
 * **Materials and orientations** — elastic types, plasticity (including Johnson-Cook), the
   Johnson-Cook damage initiation criterion ccx shares with Abaqus, thermal expansion,
-  composite layups and per-element `*DISTRIBUTION` orientations (variable-angle-tow layups).
+  composite layups and per-element `*DISTRIBUTION` orientations (variable-angle-tow layups);
+  composite `S4R`/`S4`/`S3` shells run as `S8R`/`S6`, composite continuum shells (`SC8R`,
+  `SC6R`) as one solid per ply.
 * **Constraints** — `*MPC`, kinematic couplings and rigid bodies (with *knot beams* where
   ccx 2.23 rejects rigid constraints on shell and beam nodes), and the overconstraints ccx
   rejects but Abaqus resolves.
@@ -99,6 +101,7 @@ prints one `PASS` line per check, about a hundred in all; [testing](docs/testing
 | Cook's membrane under a shear traction; a thick cylinder under a radial traction | published 23.96; Lamé | 0.12 %; 0.02 % |
 | rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads, connectors, `*MPC`s and rotations on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
 | per-element `*DISTRIBUTION` orientations (a solid plate, a composite shell) | one `*ORIENTATION` per element | ≤ 3e-11 |
+| a simply supported [0/90/0] plate as composite `S4R` (run as `S8R`) and `SC8R` (one `C3D8I` per ply); a [30/-60/45]s laminate's in-plane stiffness in the x-y and x-z planes (`S4R`, `SC8R`, `SC6R`) | classical lamination theory (Navier, A); Pagano's 3-D elasticity solution | 0.15 % (`S8R`, a/h = 100); 1.0 % / 2.3 % (plies, a/h = 100 / 10); A ≤ 2e-5 |
 | thermal expansion (orthotropic, anisotropic, no initial temperatures) | α ΔT; analytic stress | ≤ 5e-6 |
 | velocity / acceleration BCs; displacement BCs without an amplitude | their time integral; wave theory; Abaqus' default amplitudes | 5e-5 of the travel; wave stress ≈ 1 % on average; exact |
 | preselected and default output, contact output | statics, wave theory | ≤ 0.005 % (static) |
@@ -172,6 +175,8 @@ Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
 | [`nle10_thickplate`](examples/nle10_thickplate.inp) | NAFEMS LE10: C3D20, `*NCOPY` + `*ELGEN`, `GEN`/`PERT`, `*DLOAD Px` |
 | [`nle10_surface_elements`](examples/nle10_surface_elements.inp) | the same plate loaded through an `SFM3D8` skin → nodal forces |
 | [`composite_shell`](examples/composite_shell.inp) | S8R composite layup, orthotropic, `*ORIENTATION`, `ENCASTRE`, `*DSLOAD` |
+| [`composite_plate_s4r`](examples/composite_plate_s4r.inp), [`composite_plate_sc8r`](examples/composite_plate_sc8r.inp) | a simply supported cross-ply plate: composite `S4R` → `S8R`; composite `SC8R` → one `C3D8I` per ply |
+| [`composite_inplane_s4r`](examples/composite_inplane_s4r.inp), [`composite_inplane_sc8r`](examples/composite_inplane_sc8r.inp) | an angle-ply laminate's in-plane stiffness; BCs interpolated onto the new nodes |
 | [`assembly_two_blocks`](examples/assembly_two_blocks.inp) | two-instance assembly, an `instance.node` reference in a step |
 | [`beam_circ_cantilever`](examples/beam_circ_cantilever.inp) | `B31` + `SECTION=CIRC` → `B32` with midside nodes, radius → diameters |
 | [`beam_pipe_box_cantilever`](examples/beam_pipe_box_cantilever.inp) | `PIPE31` + `SECTION=PIPE` and `B32` + `SECTION=BOX` → `B32R` |

@@ -70,6 +70,13 @@ without an error. A full audit and the work that followed:
 * **Materials and orientations** — per-element `*DISTRIBUTION` orientations; the elastic
   forms ccx 2.23 needs beside orthotropic and anisotropic expansion; halved ANISO expansion
   shear coefficients; zero-shear ANISO written as ORTHO; default initial temperatures.
+* **Composite shells** — composite `S3`/`S4`/`S4R` shells run as `S6`/`S8R` with shared
+  midside nodes (with the linear shells and beams joined to them by an edge); composite
+  continuum shells (`SC8R`, `SC6R`) as one `C3D8I`/`C3D6` per ply, with their sets, faces,
+  loads and BCs carried to the plies (`--max-ply-elements`); ply directions as Abaqus defines
+  them on any shell plane, and every ply naming an orientation (ccx 2.23 gives a ply without
+  one the previous ply's). Validated against classical lamination theory and Pagano's 3-D
+  solution.
 * **Output** — requests fitted to ccx's `.frd`/`.dat` model, one output control per step,
   explicit output intervals from ccx's stable increment, Abaqus' preselected field and
   contact output.

@@ -7445,7 +7445,7 @@ def test_user_material_names_never_pick_another_ccx_routine():
                       "*Shell Section, elset=E, composite\n0.1, 3, UserPly, 0.\n0.1, 3, M, 90.\n"
                       "*Material, name=UserPly\n*User Material, constants=1\n7.\n")
     body, _, _ = convert_str(deck)
-    assert "\n0.1, , ABQ2CCX_UserPly\n" in body and "*MATERIAL, NAME=ABQ2CCX_UserPly\n" in body
+    assert "\n0.1, , ABQ2CCX_UserPly, ABQ2CCX_OR0\n" in body and "*MATERIAL, NAME=ABQ2CCX_UserPly\n" in body
     assert not dangling_refs(reparse(body))
 
 
@@ -7695,6 +7695,327 @@ def test_ccx_version_is_read_and_checked():
     assert len(lines) == 2 and "/fake/ccx_221 is ccx 2.21; abq2ccx targets ccx 2.22-2.23" in lines[0]
     assert "could not tell which ccx version /fake/ccx_unknown is" in lines[1]
     assert subprocess.run is real
+# --- composite shells: S4R -> S8R and continuum shells -> one solid per ply ---------------
+
+COMPOSITE_MAT = ("*Material, name=CFRP\n*Elastic, type=ENGINEERING CONSTANTS\n"
+                 "140000., 10000., 10000., 0.3, 0.3, 0.4, 5000., 5000.,\n3500.\n")
+S4R_STRIP = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+             "6, 2., 1., 0.\n*Element, type=S4R, elset=PLATE\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n"
+             "*Nset, nset=CLAMP\n1, 4\n*Nset, nset=TIP\n3, 6\n" + COMPOSITE_MAT)
+SC8R_STRIP = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+              "6, 2., 1., 0.\n11, 0., 0., 0.3\n12, 1., 0., 0.3\n13, 2., 0., 0.3\n14, 0., 1., 0.3\n"
+              "15, 1., 1., 0.3\n16, 2., 1., 0.3\n*Element, type=SC8R, elset=PLATE\n"
+              "1, 1, 2, 5, 4, 11, 12, 15, 14\n2, 2, 3, 6, 5, 12, 13, 16, 15\n"
+              "*Nset, nset=CLAMP\n1, 4, 11, 14\n*Nset, nset=TIP\n3, 6, 13, 16\n" + COMPOSITE_MAT)
+LAYUP = "1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n1., 3, CFRP, 0.\n"
+
+
+def _card_at(body, head):
+    """The data lines of the first card of ``body`` whose keyword line starts with ``head``."""
+    lines = body.splitlines()
+    i = next(k for k, ln in enumerate(lines) if ln.startswith(head))
+    out = []
+    for ln in lines[i + 1:]:
+        if ln.startswith("*"):
+            break
+        out.append(ln)
+    return out
+
+
+def test_composite_s4r_becomes_s8r_with_shared_midside_nodes():
+    # ccx 2.23 reads a composite section only on S8R / S6: the S4R strip becomes two S8R that
+    # share the midside node of their common edge 2-5; ids, sets and the layup stay
+    body, conv, rep = convert_str(S4R_STRIP + "*Shell Section, elset=PLATE, composite\n"
+                                  "0.1, 3, CFRP, 0.\n0.1, 3, CFRP, 90.\n*Step\n*Static\n*Boundary\n"
+                                  "CLAMP, ENCASTRE\n*Cload\nTIP, 3, -1.\n*Node print, nset=TIP\nU\n*End Step\n")
+    assert conv.geom.elements[1] == ("S8R", [1, 2, 5, 4, 7, 8, 9, 10])
+    assert conv.geom.elements[2] == ("S8R", [2, 3, 6, 5, 11, 12, 13, 8])
+    assert conv.geom.nodes[8] == (1.0, 0.5, 0.0)                 # the shared edge 2-5
+    assert "*ELEMENT, TYPE=S8R" in body and "*ELEMENT, TYPE=S4R" not in body
+    # the BC set takes the midside node of its edge 1-4; the CLOAD set does not (it would add
+    # load), and its *NODE PRINT keeps the deck's nodes
+    assert conv.geom.nset("CLAMP") == [1, 4, 10] and conv.geom.nset("TIP") == [3, 6]
+    assert "element S4R -> S8R" in "; ".join(conv.reduced_physics)
+    assert "*ELSET, ELSET=PLATE\n1, 2" in body
+
+
+def test_composite_s4r_bc_lines_reach_the_midside_nodes():
+    # node-numbered BC values on both ends of an edge are interpolated onto its midside node
+    body, _, _ = convert_str(S4R_STRIP + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n"
+                             "*Step\n*Static\n*Boundary\n1, 1, 1, 0.\n2, 1, 1, 0.2\n3, 3, 3, 1.\n"
+                             "6, 3, 3, 3.\n*End Step\n")
+    lines = _card_at(body, "*BOUNDARY")
+    assert "7, 1, 1, 0.1" in lines and "12, 3, 3, 2" in lines
+
+
+def test_composite_s4r_upgrades_its_linear_neighbours_and_edge_beams():
+    # a plain S4R sharing an edge with the composite one and a B31 stiffener along an
+    # upgraded edge are upgraded too: no midside node is left hanging
+    deck = (S4R_STRIP.replace("*Element, type=S4R, elset=PLATE\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n",
+                              "*Element, type=S4R, elset=SKIN\n1, 1, 2, 5, 4\n*Element, type=S4R, "
+                              "elset=METAL\n2, 2, 3, 6, 5\n*Element, type=B31, elset=STRINGER\n"
+                              "3, 1, 2\n4, 2, 3\n")
+            + "*Material, name=AL\n*Elastic\n70000., 0.3\n*Shell Section, elset=SKIN, composite\n"
+            "0.1, 3, CFRP, 0.\n0.1, 3, CFRP, 90.\n*Shell Section, elset=METAL, material=AL\n0.2\n"
+            "*Beam Section, elset=STRINGER, material=AL, section=RECT\n0.1, 0.2\n0., 0., 1.\n")
+    body, conv, rep = convert_str(deck)
+    g = conv.geom
+    assert g.elements[1][0] == "S8R" and g.elements[2][0] == "S8R"
+    assert g.elements[3] == ("B32", [1, 7, 2]) and g.elements[4] == ("B32", [2, 11, 3])
+    assert g.elements[1][1][4] == 7 and g.elements[2][1][4] == 11       # shell and beam share them
+    assert "1 other linear shell(s) joined to them by an edge" in rep.text()
+    assert "2 2-node beam(s) along an upgraded edge" in rep.text()
+
+
+def test_composite_plies_without_orientation_name_the_global_axes():
+    # ccx 2.23 gives a ply line without an orientation the previous line's (probed: a [0/90/0]
+    # plate runs as [0/90/90]); so when one ply has an orientation, all name one
+    body, _, _ = convert_str(S4R_STRIP + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n"
+                             "0.1, 3, CFRP, 90.\n0.1, 3, CFRP, 0.\n")
+    assert "*ORIENTATION, NAME=ABQ2CCX_OR0\n1., 0., 0., 0., 1., 0." in body
+    assert _card_at(body, "*SHELL SECTION") == ["0.1, , CFRP, ABQ2CCX_OR0", "0.1, , CFRP, ABQ2CCX_OR1",
+                                             "0.1, , CFRP, ABQ2CCX_OR0"]
+    body, _, _ = convert_str(S4R_STRIP + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP\n"
+                             "0.1, 3, CFRP\n")
+    assert _card_at(body, "*SHELL SECTION") == ["0.1, , CFRP", "0.1, , CFRP"]      # none: unchanged
+
+
+def test_composite_shell_plies_off_their_axis_get_exact_directions():
+    # Abaqus turns a layer about the shell normal after projecting the section axes; ccx turns
+    # the orientation about its own axis 3.  On a plate in the x-z plane (normal -y) a 30 degree
+    # ply about global z would project onto x: its directions are given element by element
+    xz = S4R_STRIP.replace(", 1., 0.\n", ", 0., 1.\n")         # y -> z: the strip in the x-z plane
+    body, _, rep = convert_str(xz + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 30.\n"
+                               "0.1, 3, CFRP, 0.\n")
+    assert "as Abaqus defines them" in rep.text()
+    c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+    want = [c, 0.0, s]                                        # x turned by +30 about -y
+    lines = body.splitlines()
+    ori = lines[lines.index("*ORIENTATION, NAME=ABQ2CCX_PLY1") + 1]
+    got = [float(x) for x in ori.split(",")]
+    assert max(abs(x - y) for x, y in zip(got[:3], want)) < 1e-8, got
+    assert _card_at(body, "*SHELL SECTION") == ["0.1, , CFRP, ABQ2CCX_PLY1", "0.1, , CFRP, ABQ2CCX_PLY2"]
+    # the same strip in its own x-y plane keeps the usual orientations
+    body, _, rep = convert_str(S4R_STRIP + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 30.\n")
+    assert "as Abaqus defines them" not in rep.text() and "3, 30." in body
+
+
+def test_shell_material_axes_follow_abaqus_rules():
+    nz = (0.0, 0.0, 1.0)
+    assert A.shell_local_axes(nz) == ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    # global X along the normal: the projection of Z
+    d1, d2 = A.shell_local_axes((1.0, 0.0, 0.0))
+    assert d1 == (0.0, 0.0, 1.0) and d2 == (0.0, -1.0, 0.0)
+    # an orientation projects the axis that follows its rotation axis: about axis 1, axis 2;
+    # without a rotation line the axis closest to the normal is the rotation axis
+    frame, k = A.orientation_frame((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR", (0, 0, 0), (1, 0.0))
+    assert k == 1 and A.shell_local_axes(nz, frame, k)[0] == (0.0, 1.0, 0.0)
+    frame, k = A.orientation_frame((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR", (0, 0, 0), None)
+    assert k is None and A.shell_local_axes(nz, frame, k)[0] == (1.0, 0.0, 0.0)
+    frame, k = A.orientation_frame((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), "CYLINDRICAL", (0.0, 2.0, 5.0), None)
+    assert A.shell_local_axes((0.0, 1.0, 0.0), frame, k)[0] == (-1.0, 0.0, 0.0)   # hoop direction
+    frame, k = A.orientation_frame((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR", (0, 0, 0), (3, 90.0))
+    d1, _ = A.shell_local_axes(nz, frame, k)
+    assert max(abs(x - y) for x, y in zip(d1, (0.0, 1.0, 0.0))) < 1e-12
+    # cylindrical: axis 1 radial at the point, 2 tangential, 3 along the axis a -> b
+    frame, _ = A.orientation_frame((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), "CYLINDRICAL", (0.0, 2.0, 5.0), None)
+    assert frame[0] == (0.0, 1.0, 0.0) and frame[2] == (0.0, 0.0, 1.0)
+    # a layer angle turns about the normal: about -z a +90 ply points along -y
+    d1, d2 = A.ply_axes((0.0, 0.0, -1.0), A.shell_local_axes((0.0, 0.0, -1.0)), 90.0)
+    assert max(abs(x - y) for x, y in zip(d1, (0.0, -1.0, 0.0))) < 1e-12
+
+
+def test_continuum_shell_stack_orders_are_right_handed():
+    iso = {1: (-1, -1, -1), 2: (1, -1, -1), 3: (1, 1, -1), 4: (-1, 1, -1), 5: (-1, -1, 1),
+           6: (1, -1, 1), 7: (1, 1, 1), 8: (-1, 1, 1)}
+    for d, order in A.HEX_STACK_ORDER.items():
+        jac = [[sum(iso[i + 1][c] * iso[p][r] / 8.0 for i, p in enumerate(order)) for c in range(3)]
+               for r in range(3)]
+        det = (jac[0][0] * (jac[1][1] * jac[2][2] - jac[1][2] * jac[2][1])
+               - jac[0][1] * (jac[1][0] * jac[2][2] - jac[1][2] * jac[2][0])
+               + jac[0][2] * (jac[1][0] * jac[2][1] - jac[1][1] * jac[2][0]))
+        assert det > 0, d
+        stack = [sum(iso[p][c] for p in order[4:]) - sum(iso[p][c] for p in order[:4]) for c in range(3)]
+        assert stack[abs(d) - 1] * d > 0 and sum(1 for x in stack if x) == 1, (d, stack)
+    assert A.stack_face_map(A.HEX_STACK_ORDER[3]) == {1: ("first", 1), 2: ("last", 2), 3: ("all", 3),
+                                                       4: ("all", 4), 5: ("all", 5), 6: ("all", 6)}
+    assert A.stack_face_map(A.HEX_STACK_ORDER[1])[6] == ("first", 1)          # xi = -1 at the bottom
+    assert A.stack_face_map(A.HEX_STACK_ORDER[1])[4] == ("last", 2)
+
+
+def test_continuum_shell_plies_split_with_shared_interface_nodes():
+    deck = (SC8R_STRIP + "*Elset, elset=E2\n2\n*Surface, name=TOP\nPLATE, S2\n*Surface, name=BOT\n"
+            "PLATE, S1\n*Surface, name=END\nE2, S4\n*Shell Section, elset=PLATE, composite\n" + LAYUP
+            + "*Step\n*Static\n*Boundary\nCLAMP, ENCASTRE\n3, 1, 1, 0.\n13, 1, 1, 0.3\n*Dload\n2, P4, 1.\n"
+            "2, BZ, -1.\n*Dsload\nTOP, P, 0.1\n*Node print, nset=TIP\nU\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    g = conv.geom
+    # three plies a stack, ply 1 keeping the element id; the interface nodes of the shared
+    # stack edges 2-12 and 5-15 serve both stacks
+    assert g.elements[1] == ("C3D8I", [1, 2, 5, 4, 17, 18, 19, 20])
+    assert g.elements[3] == ("C3D8I", [17, 18, 19, 20, 21, 22, 23, 24])
+    assert g.elements[4] == ("C3D8I", [21, 22, 23, 24, 11, 12, 15, 14])
+    assert g.elements[2][1][4:] == [18, 25, 26, 19]
+    assert max(abs(x - y) for x, y in zip(g.nodes[18], (1.0, 0.0, 0.1))) < 1e-12 and \
+        abs(g.nodes[22][2] - 0.2) < 1e-12
+    assert g.elset("PLATE") == [1, 3, 4, 2, 5, 6] and g.elset("E2") == [2, 5, 6]
+    # node sets of BCs and output take the interface nodes of the edges they hold
+    assert g.nset("CLAMP") == [1, 4, 11, 14, 17, 21, 20, 24]
+    assert g.nset("TIP") == [3, 6, 13, 16, 25, 27, 26, 28]
+    # node-numbered BC values interpolate along the stack edge 3-13
+    assert "25, 1, 1, 0.1" in body and "27, 1, 1, 0.2" in body
+    # faces: the top on the last ply, the bottom on the first, a side face on every ply
+    assert _card_at(body, "*SURFACE, NAME=TOP") == ["PLATE_S2_PLIES, S2"] and g.elset("PLATE_S2_PLIES") == [4, 6]
+    assert g.elset("PLATE_S1_PLIES") == [1, 2] and g.elset("E2_S4_PLIES") == [2, 5, 6]
+    assert "ABQ2CCX_E2_S4_PLIES, P4, 1." in body and "ABQ2CCX_PLIES_2, BZ, -1." in body
+    assert g.elset("ABQ2CCX_PLIES_2") == [2, 5, 6]
+    assert "PLATE_S2_PLIES, P2, 0.1" in body                     # *DSLOAD on the top face
+    # one solid section per material and layer angle, with the ply axes; ENCASTRE on solids
+    assert "*SOLID SECTION, ELSET=PLATE_PLY1, MATERIAL=CFRP, ORIENTATION=PLATE_PLY1_ORI" in body
+    assert g.elset("PLATE_PLY1") == [1, 2, 4, 6] and g.elset("PLATE_PLY2") == [3, 5]
+    assert "*ORIENTATION, NAME=PLATE_PLY2_ORI\n0, 1, 0, -1, 0, 0" in body
+    assert "CLAMP, 1, 3" in body and "SHELL SECTION" not in body.split("*STEP")[0].split("** ===")[-1]
+    assert any("one C3D8I / C3D6 solid per ply" in r for r in conv.reduced_physics)
+
+
+def test_continuum_shell_stack_direction_restacks_the_element():
+    # the same strip numbered with its thickness along the elements' direction 1: STACK
+    # DIRECTION=1 splits it into the same solids, and its top face S4 is the last ply's S2
+    order = A.HEX_STACK_ORDER[1]
+
+    def renumber(line):
+        f = [x.strip() for x in line.split(",")]
+        renum = [""] * 8
+        for pos, node in zip(order, f[1:]):
+            renum[pos - 1] = node
+        return ", ".join([f[0]] + renum)
+    deck3 = SC8R_STRIP + "*Shell Section, elset=PLATE, composite\n" + LAYUP
+    lines = deck3.splitlines()
+    i = lines.index("*Element, type=SC8R, elset=PLATE")
+    lines[i + 1], lines[i + 2] = renumber(lines[i + 1]), renumber(lines[i + 2])
+    deck1 = "\n".join(lines).replace("composite\n1.", "composite, stack direction=1\n1.") + "\n"
+    geo = []
+    for deck in (deck3 + "*Surface, name=TOP\nPLATE, S2\n", deck1 + "*Surface, name=TOP\nPLATE, S4\n"):
+        body, conv, _ = convert_str(deck)
+        g = conv.geom
+        name, face = _card_at(body, "*SURFACE")[0].split(", ")
+        geo.append(([[g.nodes[n] for n in conn] for _, conn in g.elements.values()], g.elset(name), face))
+    assert geo[0] == geo[1] and geo[0][1:] == ([4, 6], "S2")
+    # STACK DIRECTION=ORIENTATION: the isoparametric direction closest to the orientation's axis 3
+    deck = deck1.replace("stack direction=1", "stack direction=ORIENTATION, orientation=VERT").replace(
+        "*Shell Section", "*Orientation, name=VERT\n0., 1., 0., 0., 0., 1.\n*Shell Section")
+    _, conv, _ = convert_str(deck)                     # axis 3 = (0,1,0) x (0,0,1) = x: along x
+    xs = sorted({round(conv.geom.nodes[n][0], 9) for _, conn in conv.geom.elements.values() for n in conn})
+    assert xs == [0.0, 0.333333333, 0.666666667, 1.0, 1.333333333, 1.666666667, 2.0], xs
+    deck = deck.replace("0., 1., 0., 0., 0., 1.", "1., 0., 0., 0., 1., 0.")   # axis 3 = z
+    _, conv, _ = convert_str(deck)
+    assert [[conv.geom.nodes[n] for n in conn] for _, conn in conv.geom.elements.values()] == geo[0][0]
+
+
+def test_continuum_shell_layups_meeting_on_an_edge_are_tied():
+    # a three-ply and a two-ply stack share the stack edges 2-12 and 5-15: their interface
+    # nodes there are held on the straight edge, which both stacks share (*EQUATION)
+    deck = (SC8R_STRIP.replace("*Element, type=SC8R, elset=PLATE\n1, 1, 2, 5, 4, 11, 12, 15, 14\n"
+                               "2, 2, 3, 6, 5, 12, 13, 16, 15\n",
+                               "*Element, type=SC8R, elset=A\n1, 1, 2, 5, 4, 11, 12, 15, 14\n"
+                               "*Element, type=SC8R, elset=B\n2, 2, 3, 6, 5, 12, 13, 16, 15\n")
+            + "*Nset, nset=MID\n2, 12\n*Shell Section, elset=A, composite\n" + LAYUP
+            + "*Shell Section, elset=B, composite\n1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n"
+            "*Initial Conditions, type=TEMPERATURE\n2, 20.\n12, 50.\n"
+            "*Step\n*Static\n*Boundary\nCLAMP, ENCASTRE\n*Node print, nset=MID\nU\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    eq = _card_at(body, "*EQUATION")
+    assert len(eq) == 2 * 3 * 6                        # 6 interface nodes, 3 DOFs, 2 lines each
+    assert "25, 1, 1., 2, 1, -0.5, 12, 1, -0.5" in eq   # B's mid-height node on edge 2-12
+    assert "22, 3, 1., 2, 3, -0.3333333333, 12, 3, -0.6666666667" in eq
+    assert "held on the shared line by *EQUATIONs" in rep.text()
+    # the tied nodes join no node set (a BC there would clash with the tie) but take the
+    # temperatures interpolated along their stack edge
+    assert conv.geom.nset("MID") == [2, 12]
+    ic = _card_at(body, "*INITIAL CONDITIONS")
+    assert "25, 35" in ic and "22, 40" in ic and "18, 30" in ic
+
+
+def test_continuum_shell_wedges_and_symmetric_layups_split():
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 1., 0.\n4, 0., 0., 1.\n5, 1., 0., 1.\n"
+            "6, 0., 1., 1.\n*Element, type=SC6R, elset=W\n1, 1, 2, 3, 4, 5, 6\n" + COMPOSITE_MAT
+            + "*Shell Section, elset=W, composite, symmetric\n1., 3, CFRP, 45.\n3., 3, CFRP, -45.\n")
+    body, conv, _ = convert_str(deck)
+    g = conv.geom
+    assert [t for t, _ in g.elements.values()] == ["C3D6"] * 4
+    zs = sorted({round(g.nodes[n][2], 9) for _, conn in g.elements.values() for n in conn})
+    assert zs == [0.0, 0.125, 0.5, 0.875, 1.0]        # relative thicknesses 1 : 3 : 3 : 1
+    assert g.elset("W_PLY1") == [1, 4] and g.elset("W_PLY2") == [2, 3]
+
+
+def test_continuum_shell_split_above_the_limit_is_left_out():
+    deck = SC8R_STRIP + "*Shell Section, elset=PLATE, composite\n" + LAYUP
+    body, conv, rep = convert_str(deck, max_ply_elements=5)
+    assert "one solid per ply would make 6 elements, more than --max-ply-elements (5)" in rep.text()
+    assert "** abq2ccx" in body and conv.geom.elements[1][0] == "SC8R"
+    body, conv, _ = convert_str(deck, max_ply_elements=0)          # 0: no limit
+    assert len(conv.geom.elements) == 6
+
+
+def test_continuum_shell_layer_angle_distribution():
+    # a layer's orientation field may name a distribution of angles (one per element)
+    deck = (SC8R_STRIP + "*Distribution, name=ANG, location=ELEMENT, table=ANG_T\n, 10.\n2, 50.\n"
+            "*Distribution Table, name=ANG_T\nANGLE\n*Shell Section, elset=PLATE, composite\n"
+            "1., 3, CFRP, ANG\n1., 3, CFRP, 0.\n")
+    body, conv, rep = convert_str(deck)
+    lines = _card_at(body, "*DISTRIBUTION, NAME=PLATE_PLY1_AXES")
+    c10, s10 = math.cos(math.radians(10.0)), math.sin(math.radians(10.0))
+    first = [float(x) for x in lines[0].split(",")]
+    assert first[0] == 1 and abs(first[1] - c10) < 1e-8 and abs(first[2] - s10) < 1e-8
+    assert len(lines) == 2 and lines[1].startswith("2, 0.642787")      # cos 50
+    assert "*DISTRIBUTION, NAME=ANG" not in body and "of composite layer angles" in rep.text()
+
+
+def test_composite_shell_plies_on_a_cylinder_follow_the_hoop():
+    # a cylindrical orientation's axis 1 is radial — the shell normal on a cylinder — so ccx
+    # would project nothing; Abaqus projects axis 2 (the hoop direction), axis 1 being the
+    # one closest to the normal
+    nodes = "".join(f"{k + 1}, {math.cos(t):.9f}, {math.sin(t):.9f}, {z}\n" for k, (t, z) in enumerate(
+        (math.radians(a), z) for z in (0.0, 1.0) for a in (0.0, 30.0, 60.0)))
+    deck = (f"*Node\n{nodes}*Element, type=S4R, elset=CYL\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n" + COMPOSITE_MAT
+            + "*Orientation, name=CYLO, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n"
+            "*Shell Section, elset=CYL, composite, orientation=CYLO\n0.1, 3, CFRP, 0.\n0.1, 3, CFRP, 90.\n")
+    body, conv, rep = convert_str(deck)
+    assert "as Abaqus defines them" in rep.text()
+    lines = body.splitlines()
+    first = [float(x) for x in lines[lines.index("*ORIENTATION, NAME=ABQ2CCX_PLY1") + 1].split(",")]
+    t = math.radians(15.0)                             # the first element's middle
+    assert max(abs(x - y) for x, y in zip(first[:3], (-math.sin(t), math.cos(t), 0.0))) < 2e-3, first
+    assert "*ELSET, ELSET=CYL_P1" in body and "*ELSET, ELSET=CYL_P2" in body
+
+
+def test_new_nodes_take_the_transform_of_their_edge():
+    # a *TRANSFORM's set that a *CLOAD counts does not take the midside node, but the node's
+    # interpolated BC is in local DOFs: it gets a copy of the transform
+    deck = (S4R_STRIP + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n0.1, 3, CFRP, 90.\n"
+            "*Transform, nset=CLAMP, type=C\n0., 0., 0., 0., 0., 1.\n*Step\n*Static\n*Boundary\n"
+            "CLAMP, 2, 2\n*Cload\nCLAMP, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert conv.geom.nset("CLAMP") == [1, 4] and conv.geom.nset("CLAMP_NEW") == [10]
+    assert "*TRANSFORM, NSET=CLAMP_NEW, TYPE=C" in body and "10, 2, 2" in body
+
+
+def test_collapsed_composite_quad_becomes_a_triangle():
+    # ccx stops on a collapsed S8R ('*ERROR in gen3dnor'): an S4R with a repeated corner is an S6
+    deck = (S4R_STRIP.replace("2, 2, 3, 6, 5\n", "2, 2, 3, 6, 6\n")
+            + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n")
+    _, conv, _ = convert_str(deck)
+    assert conv.geom.elements[2] == ("S6", [2, 3, 6, 11, 12, 13])
+
+
+def test_composite_examples_match_the_validation_decks():
+    import validate_with_ccx as V
+    for name, text in (("composite_plate_s4r", V.composite_plate_deck("s4r")),
+                       ("composite_plate_sc8r", V.composite_plate_deck("sc8r")),
+                       ("composite_inplane_s4r", V.composite_inplane_deck("s4r")),
+                       ("composite_inplane_sc8r", V.composite_inplane_deck("sc8r"))):
+        with open(os.path.join(EXAMPLES, name + ".inp")) as fh:
+            assert fh.read() == text, f"examples/{name}.inp differs from validate_with_ccx.py's deck"
 
 
 if __name__ == "__main__":
