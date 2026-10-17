@@ -24,6 +24,11 @@ physics.
 * **Default rotation axis** — an `*ORIENTATION` without a rotation line turns about its axis 1
   on shells and membranes, as Abaqus documents, so material direction 1 follows axis 2 (it
   followed the axis closest to the normal); warned where axis 1 lies in the shell.
+* **Continuum-shell material axes** — plain shell sections on continuum shells (`SC8R`,
+  `SC6R`) get Abaqus' material axes (the stack direction as axis 3, the orientation projected
+  onto the mid-surface), where ccx 2.23 would use the orientation's axes unprojected: an
+  `SC8R` hoop-wound cylinder came out 14 times too soft and now matches thin-wall theory to
+  0.10 %.
 * **CalculiX on Windows** — CI now runs `validate_with_ccx.py` and `--run` with conda-forge's
   Windows ccx 2.23 as well. That ccx does not start outside its activated environment, so
   `--run` and `validate_with_ccx.py` give a conda environment's ccx the folders `conda
