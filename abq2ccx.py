@@ -20322,8 +20322,9 @@ CCX_ABORT_SIGNS = ("free(): ", "double free", "malloc(): ", "corrupted size", "A
 _CCX_STEP_RE = re.compile(r"^\s*STEP\s+\d+\s*$", re.M)
 # A solution that went to NaN (an unstable explicit increment, say) still ends with "Job
 # finished" and exit 0; only the results show it: Fortran writes NaN/Infinity to the .dat,
-# C writes NAN/INF to the .frd -- or 1.#QNAN, -1.#IND and 1.#INF in a Windows build whose
-# printf is msvcrt's (MinGW's default); no number holds a "#".
+# C writes NAN/INF to the .frd (-NAN(IND) for 0/0 in a Windows build whose printf is the
+# UCRT's, as conda-forge's is) -- or 1.#QNAN, -1.#IND and 1.#INF in one whose printf is
+# msvcrt's (older MinGW); no number holds a "#".
 _NONFINITE_RE = re.compile(rb"(?i)(?<![a-z])[+-]?(?:nan|inf(?:inity)?)(?![a-z])")
 _DAT_LINE_RE = re.compile(rb"\s*(?:(?P<row>[+-]?(?:\.?\d|(?i:(?:nan|inf(?:inity)?)(?![a-z]))))|[A-Za-z])")
 _DAT_TABLE_RE = re.compile(rb"\s*(?:[A-Z] ){3}")      # "S T E P", "E I G E N V A L U E ..."

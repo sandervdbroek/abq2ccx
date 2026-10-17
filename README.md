@@ -223,7 +223,8 @@ python corpus/fetch.py && python tests/test_corpus.py   # the corpus
 ```
 
 [Testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md) describes the three layers; GitHub Actions run the first two on
-every push, the unit tests on Linux, macOS and Windows.
+every push, the unit tests on Linux, macOS and Windows and the CalculiX checks on Linux and
+Windows.
 
 ## Documentation
 

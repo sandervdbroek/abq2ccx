@@ -16,11 +16,12 @@ that a runaway job cannot fill the disk.
 **CI.** GitHub Actions ([`ci.yml`](../.github/workflows/ci.yml)) run on every push and pull
 request: the unit tests, the generated-reference check and a `pip install .` on Ubuntu, macOS
 and Windows with Python 3.9 (the oldest supported) and the newest; and `validate_with_ccx.py`
-on Ubuntu with conda-forge's `calculix` 2.23 build 2, the build FreeCAD 1.1.4 bundles
-(`conda-meta/calculix-2.23-pl5321h484372f_2.json` in its macOS app), so CI solves with the ccx
-the checks were written on (Ubuntu packages 2.21; later conda-forge builds of 2.23 add fixes
-made after its release). The corpus stays local: it downloads 1052 decks and needs ten
-minutes of ccx.
+and an `abq2ccx --run` on Ubuntu and on Windows (there on Python 3.9, whose `open()` defaults
+to the code page) with conda-forge's `calculix` 2.23 build 2, the build FreeCAD 1.1.4 bundles
+(`conda-meta/calculix-2.23-pl5321h484372f_2.json` in its macOS app; on Windows built by MinGW
+GCC against the UCRT), so CI solves with the ccx the checks were written on (Ubuntu packages
+2.21; later conda-forge builds of 2.23 add fixes made after its release). The corpus stays
+local: it downloads 1052 decks and needs ten minutes of ccx.
 
 ## 1. Unit tests — `tests/test_convert.py`
 
@@ -76,7 +77,7 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | `beam_u1_general`, `beam_u1_ibeam`, `beam_u1_unsymmetric_i`, `beam_u1_hex`, `beam_u1_portal` | `U1` beams: a general section with I12 ≠ 0 (tip forces along y and z, a torque, frequencies), an I-section in space (`--approximate`; against the `RECT` it would otherwise get: weak axis 68× too flexible), the unsymmetric I and hexagonal-tube cantilevers of Abaqus' Verification Guide, a planar I-section portal frame under gravity, a line load and a lateral load | unsymmetric bending theory, T L / G J, Euler–Bernoulli frequencies; Abaqus' reference values (0.8931, 1.786e-2; 0.3489, 6.978e-3); the direct-stiffness frame | 1e-6 statics (the frame 2e-7); frequencies ≤ 0.5 % (rotary inertia) |
 | `beam_general_rect`, `beam_general_rect_nl6` | `*BEAM GENERAL SECTION, SECTION=RECT` as ccx's rectangular beam: a cantilever in space; NAFEMS NL6 (NLGEOM, past buckling) on 32 `B22` | P L³ / 3 E I; NL6's published answers | 0.05 %; ≤ 2.4 % |
 | `beam_circ_rotation_bcs` | a held twist at pinned supports; a prescribed tip rotation | beam theory | ≤ 0.3 % |
-| `beam_circ_explicit` | a circular-section beam in `*DYNAMIC, EXPLICIT` | beam theory | 0.7 % |
+| `beam_circ_explicit` | a circular-section beam in `*DYNAMIC, EXPLICIT`; without the converter's increment cap it diverges | beam theory; the solve judge | 0.7 %; judged nonfinite, the NaN found in the `.dat` and in the `.frd` |
 | `planar_pinned_beam`, `planar_pinned_circ_beam` | first two frequencies and the buckling load of planar `B21` beams | beam theory, Euler | ≤ 0.8 % |
 | `planar_b22_two_elements` | two `B22` (→ `B32R`) between pins: mid-span deflection, first frequency, buckling load | Abaqus' deflection on this mesh (exact), beam theory, Euler | 0.15 %; ≤ 1.3 % |
 | `beam_line_load_cantilever` | `*DLOAD PY`, `P2`, `PZ`: applied resultant and tip deflection | q L, q L⁴ / 8 E I | ≤ 1.2 % |
@@ -174,8 +175,8 @@ The tests:
   (ccx 2.23 ends a diverged solution with "Job finished" and exit 0); **accepted** for a
   mesh-only deck that reads cleanly; **failed** otherwise.
 * `test_classify_ccx_run` — the judge itself, including the "Job finished, then abort" case
-  of issue #3 and NaN/Inf results as ccx 2.23 writes them, also as `1.#QNAN` and `-1.#IND`
-  (a Windows build whose printf is msvcrt's).
+  of issue #3 and NaN/Inf results as ccx 2.23 writes them, also as `-NAN(IND)` (a Windows
+  build whose printf is the UCRT's, as conda-forge's is) and `1.#QNAN` and `-1.#IND` (msvcrt's).
 * `test_corpus_references` — every `expect_solve` deck with a `reference` gives its
   published answer in ccx ([published answers](#published-answers)).
 * `test_hood_hinge_keeps_one_mechanism_mode` — the hood-hinge deck's hinge leaves exactly

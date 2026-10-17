@@ -360,6 +360,8 @@ def test_classify_ccx_run():
                        " 1.00000E+00         NAN-2.00000E+00") == "nonfinite"
         assert results(None, "         INF 0.00000E+00        -INF") == "nonfinite"
         assert A.ccx_nonfinite_result(job) == "job.frd: DISP at 1.66826E-03: 2 INF 0.00000E+00 -INF"
+        # a Windows build whose printf is the UCRT's (conda-forge's): -NAN(IND) for 0/0
+        assert results(None, " 1.00000E+00   -NAN(IND) 0.00000E+00") == "nonfinite"
         # a Windows build whose printf is msvcrt's: 1.#QNAN, -1.#IND (0/0), 1.#INF
         assert results(None, " 1.00000E+00 1.#QNANE+000 0.00000E+00") == "nonfinite"
         assert results(None, "-1.#IND0E+000 0.00000E+00 0.00000E+00") == "nonfinite"

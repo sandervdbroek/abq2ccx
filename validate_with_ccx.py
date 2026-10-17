@@ -16,8 +16,10 @@ built from solids, coupled bars whose coupled nodes also carry BCs against the s
 constraints written without a coupling, a bar whose rigid end cap carries BCs on its nodes
 against the same BCs written on its reference point, circular-section beams with a held
 twist and a prescribed rotation against beam theory, a circular-section beam in an explicit
-dynamic step against its static deflection, the natural frequencies and buckling loads of
-planar (B21) beams with a rectangular and a circular section, per-element *DISTRIBUTION
+dynamic step against its static deflection (and, without the converter's increment cap, its
+NaN results, which the solve judge must find in the .dat and the .frd), the natural
+frequencies and buckling loads of planar (B21) beams with a rectangular and a circular
+section, per-element *DISTRIBUTION
 orientations (a C3D8 plate and a composite S8R panel) against the same models written with
 one orientation per element, the material axes of plain shells and membranes whose
 orientation leaves their plane or has no rotation line (the ply's stiffness at Abaqus'
@@ -227,7 +229,7 @@ def dat_node_blocks(dat_path, title="displacements"):
     blocks, cur = [], None
     if not os.path.exists(dat_path):
         return blocks
-    for ln in open(dat_path):
+    for ln in open(dat_path, encoding="utf-8", errors="replace"):
         if ln.strip().startswith(title):
             cur = {}
             blocks.append(cur)
@@ -1104,7 +1106,8 @@ def distribution_panel_deck(plane="XY", tilt=0.0, nx=8, ny=2):
 
 def dat_totals(dat_path):
     """The (fx, fy, fz) of every 'total force' block a ccx .dat file holds, in order."""
-    out, lines = [], open(dat_path).read().splitlines() if os.path.exists(dat_path) else []
+    out, lines = [], (open(dat_path, encoding="utf-8", errors="replace").read().splitlines()
+                      if os.path.exists(dat_path) else [])
     for i, ln in enumerate(lines):
         if "total force" in ln:
             nxt = next((x for x in lines[i + 1:] if x.strip()), "")
@@ -1276,7 +1279,7 @@ def main():
     # inertia: the gain is the weak axis.
     area, i_strong, i_weak, tj = i_profile(200.0, 100.0, 8.5, 5.6)
     e_mod, g_mod, rho, length = 210000.0, 210000.0 / 2.6, 7.85e-9, 2000.0
-    src_text = open(os.path.join(EXAMPLES, "beam_u1_ibeam.inp")).read()
+    src_text = open(os.path.join(EXAMPLES, "beam_u1_ibeam.inp"), encoding="utf-8").read()
     stub = ("*NODE\n101, 0., 500., 0.\n102, 100., 500., 0.\n*ELEMENT, TYPE=B31, ELSET=STUB\n"
             "101, 101, 102\n*BEAM SECTION, ELSET=STUB, MATERIAL=STEEL, SECTION=RECT\n10., 10.\n"
             "0., 0., 1.\n*NSET, NSET=FAR\n101, 102\n")
@@ -1289,7 +1292,7 @@ def main():
     got = {}
     for label, text in variants:
         src = os.path.join(tmp, "u1_ibeam_src.inp")
-        with open(src, "w") as fh:
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, "u1_ibeam.inp")
         convert(src, inp, approximate=True)
@@ -1396,7 +1399,8 @@ def main():
     d, status, out = run_ccx(ccx, env, inp)
     hist = dat_displacement_history(os.path.join(d, "job.dat"), 65)
     times = [float(m) for m in re.findall(r"displacements \(vx,vy,vz\) for set TIP and time\s+(\S+)",
-                                          open(os.path.join(d, "job.dat")).read())] \
+                                          open(os.path.join(d, "job.dat"), encoding="utf-8",
+                                               errors="replace").read())] \
         if status == "solved" else []
     shutil.rmtree(d, ignore_errors=True)
     ends = [hist[i] for i, t in enumerate(times) if i < len(hist) and t in (1.0, 2.0)]
@@ -1548,6 +1552,36 @@ def main():
               f"end deflection = {u[1]:+.4f} (beam theory {ref:+.4f}, "
               f"{abs(u[1] - ref) / abs(ref) * 100:.1f}% diff)")
         failures += 0 if ok else 1
+    shutil.rmtree(d, ignore_errors=True)
+
+    # --- the same beam without the cap: a diverged run, which the solve judge must catch ---
+    # ccx ends it with "Job finished" and exit 0.  The judge reads the NaN in the .dat
+    # (Fortran's spelling) and must find it in the .frd on its own as well: C's printf spells
+    # it as the C runtime does (NAN on Linux and macOS, -NAN(IND) with Windows' UCRT).
+    with open(inp, encoding="utf-8") as fh:
+        deck = fh.read()
+    uncapped = re.sub(r"(?m)^(\*DYNAMIC, EXPLICIT\n)[^\n]*\n", r"\1, 1.e-3\n", deck, count=1)
+    src = os.path.join(tmp, "circexpl_uncapped.inp")
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(uncapped.replace("*END STEP", "*NODE FILE, FREQUENCY=200\nU\n*END STEP", 1))
+    d, status, out = run_ccx(ccx, env, src)
+    hits = []
+    for ext, scan in ((".dat", A._dat_nonfinite), (".frd", A._frd_nonfinite)):
+        try:
+            with open(os.path.join(d, "job" + ext), "rb") as fh:
+                hits.append(scan(fh))
+        except OSError:
+            hits.append(None)
+
+    def spelling(hit):                  # the first value written as NaN or Inf
+        m = hit and re.search(r"(?i)[+-]?(?:\d\.#\w+|nan(?:\(\w*\))?|inf(?:inity)?)",
+                              hit.split(": ")[-1])
+        return m.group(0) if m else hit or "nothing"
+    ok = uncapped != deck and status == "nonfinite" and all(hits)
+    print(f"{'PASS' if ok else 'FAIL'}  beam_circ_explicit without its increment cap (diverges): "
+          f"judged {status}; NaN/Inf in the .dat as {spelling(hits[0])}, in the .frd as "
+          f"{spelling(hits[1])}" + ("" if uncapped != deck else " (no *DYNAMIC, EXPLICIT to uncap)"))
+    failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
 
     # --- planar beams on pinned supports: frequencies and buckling vs beam theory ---------
@@ -3063,7 +3097,7 @@ def main():
     # strain is uniform).
     def composite_run(text, tag):
         src = os.path.join(tmp, f"{tag}_src.inp")
-        with open(src, "w") as fh:
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, f"{tag}.inp")
         convert(src, inp)

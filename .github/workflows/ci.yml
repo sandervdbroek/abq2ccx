@@ -45,16 +45,33 @@ jobs:
           test -s ci-out/nle10_thickplate_ccx.inp
 
   validate:
-    name: validate_with_ccx.py (Linux, ccx 2.23)
-    runs-on: ubuntu-24.04
+    name: validate_with_ccx.py (${{ matrix.name }}, ccx 2.23)
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+            python: "3.x"
+            ccx: bin/ccx
+          # Python 3.9 reads and writes files in the code page (cp1252) unless told otherwise,
+          # as Pythons before 3.15 do; conda installs Windows programs under Library\bin
+          - name: Windows
+            os: windows-latest
+            python: "3.9"
+            ccx: Library/bin/ccx.exe
+    env:
+      OMP_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: ${{ matrix.python }}
       # conda-forge's calculix 2.23 build 2 is the build FreeCAD 1.1.4 bundles, the ccx the
-      # converter is validated on
+      # converter is validated on (on Windows built by MinGW GCC against the UCRT); OpenBLAS
+      # on both, where Windows would default to MKL
       - uses: mamba-org/setup-micromamba@v3
         id: calculix
         with:
@@ -62,13 +79,20 @@ jobs:
           create-args: >-
             --channel conda-forge
             calculix=2.23=*_2
+            libblas=*=*openblas
           init-shell: none
       - name: validate_with_ccx.py
         env:
-          CCX: ${{ steps.calculix.outputs.environment-path }}/bin/ccx
-          OMP_NUM_THREADS: "1"
+          CCX: ${{ steps.calculix.outputs.environment-path }}/${{ matrix.ccx }}
         run: |
-          { "$CCX" -v || true; } | grep -F "Version 2.23"
-          ulimit -f 4194304
+          python -c "import abq2ccx, os, sys; v = abq2ccx.ccx_version(os.environ['CCX']); print('ccx', v); sys.exit(v != '2.23')"
+          [ "$RUNNER_OS" = Windows ] || ulimit -f 4194304      # Windows has no file-size limit
           python validate_with_ccx.py | tee validate.log
-          grep -q "^Using ccx: " validate.log
+          python -c "import os, sys; sys.exit('Using ccx: ' + os.path.abspath(os.environ['CCX']) not in open('validate.log', errors='replace').read())"
+      - name: abq2ccx --run
+        env:
+          CCX: ${{ steps.calculix.outputs.environment-path }}/${{ matrix.ccx }}
+        run: |
+          python -m pip install .
+          abq2ccx examples/nle10_thickplate.inp --outdir ci-run --run 2>&1 | tee run.log
+          grep -F "results digest from nle10_thickplate_ccx.frd and nle10_thickplate_ccx.dat:" run.log

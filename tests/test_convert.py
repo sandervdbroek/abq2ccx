@@ -7376,21 +7376,24 @@ def test_cli_output_on_a_cp1252_console():
 def test_run_reads_ccx_output_in_any_encoding():
     # ccx echoes deck lines in UTF-8, whatever the console's code page; bytes that decode in
     # neither (0x81 is no cp1252 character, a lone 0xE9 no UTF-8) must not stop --run.  The
-    # stand-in ccx is a script, as bConverged's ccx.bat is on Windows.
+    # stand-in ccx is a script, as bConverged's ccx.bat is on Windows, in a folder named like
+    # Program Files (x86): spaces and parentheses, which cmd.exe parses unless quoted.
     if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
         return                                  # cmd.exe would read the .bat in the OEM code page
     d = tempfile.mkdtemp()
     try:
-        fake = os.path.join(d, "fake_ccx.py")
+        bindir = os.path.join(d, "Program Files (x86)")
+        os.mkdir(bindir)
+        fake = os.path.join(bindir, "fake_ccx.py")
         with open(fake, "w", encoding="utf-8") as fh:
             fh.write("import sys\nsys.stdout.buffer.write(b' STEP 1\\n caf\\xe9 \\xc5\\x81\\n"
                      " Job finished\\n')\n")
         if os.name == "nt":
-            ccx = os.path.join(d, "ccx.bat")
+            ccx = os.path.join(bindir, "ccx.bat")
             with open(ccx, "w", encoding="ascii") as fh:
                 fh.write(f'@"{sys.executable}" "{fake}" %*\n')
         else:
-            ccx = os.path.join(d, "ccx")
+            ccx = os.path.join(bindir, "ccx")
             with open(ccx, "w", encoding="utf-8") as fh:
                 fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n')
             os.chmod(ccx, 0o755)
@@ -8287,7 +8290,7 @@ def test_composite_examples_match_the_validation_decks():
                        ("composite_plate_sc8r", V.composite_plate_deck("sc8r")),
                        ("composite_inplane_s4r", V.composite_inplane_deck("s4r")),
                        ("composite_inplane_sc8r", V.composite_inplane_deck("sc8r"))):
-        with open(os.path.join(EXAMPLES, name + ".inp")) as fh:
+        with open(os.path.join(EXAMPLES, name + ".inp"), encoding="utf-8") as fh:
             assert fh.read() == text, f"examples/{name}.inp differs from validate_with_ccx.py's deck"
 
 
