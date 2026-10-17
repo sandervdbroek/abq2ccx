@@ -20289,8 +20289,8 @@ def _windows_ccx_candidates() -> List[str]:
 def _conda_dll_dirs(exe: str) -> List[str]:
     """The folders `conda activate` puts on PATH for the conda environment whose Library\\bin
     holds ``exe`` (those that exist), or [] for an executable outside one.  conda-forge's
-    Windows ccx needs them: it sits in Library\\bin, the GCC runtime DLLs it loads
-    (libgfortran, libgomp) in the environment's bin."""
+    Windows ccx needs them: it sits in Library\\bin, the ARPACK DLL it loads in
+    Library\\mingw-w64\\bin."""
     lib_bin = os.path.dirname(os.path.abspath(exe))
     prefix = os.path.dirname(os.path.dirname(lib_bin))
     if (os.path.normcase(lib_bin) != os.path.normcase(os.path.join(prefix, "Library", "bin"))

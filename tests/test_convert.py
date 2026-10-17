@@ -7349,22 +7349,23 @@ def test_find_ccx_override_is_absolute():
 
 
 def test_find_ccx_in_a_conda_environment():
-    # conda-forge's Windows ccx is <env>\Library\bin\ccx.exe and loads DLLs from the
-    # environment's bin: unless the environment is active, it runs with the folders that
-    # `conda activate` puts on PATH (those that exist, in conda's order)
+    # conda-forge's Windows ccx is <env>\Library\bin\ccx.exe and loads ARPACK from
+    # <env>\Library\mingw-w64\bin: unless the environment is active, it runs with the folders
+    # that `conda activate` puts on PATH (those that exist, in conda's order)
     d = tempfile.mkdtemp()
     try:
         env = os.path.join(d, "envs", "ccx")
         exe = _touch(env, "Library", "bin", "ccx.exe")
-        for sub in (("conda-meta",), ("bin",)):
-            os.makedirs(os.path.join(env, *sub))
+        _touch(env, "Library", "mingw-w64", "bin", "libarpack.dll")
+        os.makedirs(os.path.join(env, "conda-meta"))
         dirs = A._conda_dll_dirs(exe)
-        outside = [A._conda_dll_dirs(_touch(d, "Library", "bin", "ccx.exe")),     # no conda-meta
-                   A._conda_dll_dirs(_touch(env, "bin", "ccx.exe"))]
         found, extra = A.find_ccx(exe)
+        outside = [A._conda_dll_dirs(_touch(d, "Library", "bin", "ccx.exe")),     # no conda-meta
+                   A._conda_dll_dirs(_touch(env, "Library", "ccx.exe"))]          # not Library\bin
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    assert dirs == [env, os.path.join(env, "Library", "bin"), os.path.join(env, "bin")], dirs
+    assert dirs == [env, os.path.join(env, "Library", "mingw-w64", "bin"),
+                    os.path.join(env, "Library", "bin")], dirs
     assert outside == [[], []], outside
     want = {"PATH": os.pathsep.join(dirs + [os.environ.get("PATH", "")])} if os.name == "nt" else {}
     assert found == exe and extra == want, (found, extra)

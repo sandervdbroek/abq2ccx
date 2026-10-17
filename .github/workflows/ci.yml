@@ -86,7 +86,7 @@ jobs:
           CCX: ${{ steps.calculix.outputs.environment-path }}/${{ matrix.ccx }}
         run: |
           # $CCX as --run finds it: on Windows with its conda environment's folders on PATH,
-          # where conda's Windows ccx finds its GCC runtime DLLs
+          # where conda's Windows ccx finds its ARPACK DLL (Library\mingw-w64\bin)
           python - <<'EOF'
           import abq2ccx, os, subprocess, sys
           exe, extra = abq2ccx.find_ccx()
