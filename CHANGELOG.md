@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Quadratic membranes** — ccx 2.23 leaves the mid-thickness node of a quadratic membrane's
+  corners free in each element it expands (`M3D8R` singular in any mesh of two or more
+  elements, `M3D6` several times too soft, `M3D8` too soft in thick elements). `M3D6`,
+  `M3D8` and `M3D8R` are now written as the solids ccx would make, on nodes held at the
+  membrane nodes by `*EQUATION`; `M3D9` / `M3D9R`, which ccx does not have, the same
+  without their centre node (reduced physics). Strips in tension now give the exact answer,
+  a pressurised sphere thin-wall theory within 0.85 %.
 * **Quadratic beams** — every 3-node beam (Abaqus' `B22`, `B32`, `PIPE22`, `PIPE32`, and the
   2-node beams that circular, pipe and box sections need upgraded) runs as ccx's `B32R`,
   integrated at 2 points along the beam as Abaqus integrates its quadratic beams, instead of

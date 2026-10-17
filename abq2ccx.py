@@ -375,6 +375,11 @@ COMPOSITE_SHELL_UPGRADE = {"S3": "S6", "S4": "S8R", "S4R": "S8R"}
 # default limit on the solids that adds (--max-ply-elements)
 PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
 PLY_SPLIT_LIMIT = 1000000
+# Quadratic membranes, which ccx 2.23 expands with a mid-thickness node free in each element
+# (_plan_quadratic_membranes) -> the solid the converter writes each element as; M3D9 / M3D9R
+# lose their centre node (the 8-node serendipity interpolation)
+QUAD_MEMBRANE_SOLID = {"M3D6": "C3D15", "M3D8": "C3D20", "M3D8R": "C3D20R", "M3D9": "C3D20",
+                       "M3D9R": "C3D20R"}
 # ccx 2.23 expands a 3-node beam into a 20-node brick: B32 integrated at 3 x 3 x 3 points, B32R
 # at 2 x 2 x 2 (*EL PRINT COORD).  Abaqus integrates its quadratic beams (B22, B32, PIPE22,
 # PIPE32) at 2 points along the beam (Abaqus 2017 "Beam element library", numbering of
@@ -3412,6 +3417,20 @@ class Converter:
         # ply interface nodes held by those *EQUATIONs: (stack edge end, end, node, fraction);
         # they take interpolated temperatures and initial conditions, not BCs or set membership
         self._tied_nodes: List[Tuple[int, int, int, float]] = []
+        # quadratic membranes written as solids (_plan_quadratic_membranes): element -> (solid
+        # type, its nodes); the sections that become *SOLID SECTION; the *EQUATION lines that
+        # hold the solids' nodes at the membrane nodes
+        self._qmem: Dict[int, Tuple[str, List[int]]] = {}
+        self._qmem_sections: set = set()
+        self._qmem_eq: List[str] = []
+        self._qmem_mass_acts = False               # mass acts in the deck (a DENSITY= lost)
+        self._qmem_copies: Dict[int, int] = {}     # a solid's node -> its membrane node
+        self._qmem_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}   # membrane node -> *TRANSFORM axes
+        self._qmem_surfaces: Dict[str, str] = {}   # element surface -> its node surface
+        self._qmem_kinematic: set = set()          # id(*COUPLING) followed by *KINEMATIC
+        self._qmem_hidden: Optional[str] = None     # node set of their nodes, for output
+        self._qmem_dists: set = set()              # thickness distributions taken into them
+        self._qmem_dist_tables: set = set()        # ... and their tables
         self._ply_angle_dists: set = set()         # layer angle distributions the plies take
         self._identity_ori = ""                    # ABQ2CCX_OR0 once written (_shell_section_cards)
         # shell and membrane sections whose material directions are given element group by
@@ -3903,12 +3922,20 @@ class Converter:
 
         by_type: "OrderedDict[str, List[Tuple[int, List[int]]]]" = OrderedDict()
         for eid, (typ, conn) in self.geom.elements.items():
-            by_type.setdefault(" U1" if eid in self._u1 else typ, []).append((eid, conn))
+            if eid in self._qmem:                   # quadratic membranes as solids
+                by_type.setdefault(" " + self._qmem[eid][0], []).append((eid, self._qmem[eid][1]))
+            else:
+                by_type.setdefault(" U1" if eid in self._u1 else typ, []).append((eid, conn))
         for typ, items in by_type.items():
             if typ == " U1":                        # beams written as ccx's U1 (_plan_u1_beams)
                 out += [U1_CARD, "*ELEMENT, TYPE=U1"]
                 for eid, conn in items:
                     out.append(f"{eid}, {conn[0]}, {conn[-1]}")
+                continue
+            if typ.startswith(" "):                 # _plan_quadratic_membranes
+                out.append(f"*ELEMENT, TYPE={typ.strip()}")
+                for eid, conn in items:
+                    out.extend(reflow([str(eid)] + [str(c) for c in conn], MAX_ENTRIES_PER_LINE))
                 continue
             out_typ = ccx_element_type(typ, self.report)
             loss = substitution_loss(typ)
@@ -5582,6 +5609,11 @@ class Converter:
             self.report.note(f"*DISTRIBUTION {name} of composite layer angles: taken into the axes "
                              f"of the ply solids (no card of its own in ccx).", once=True)
             return []
+        if name in self._qmem_dists:
+            self.report.note(f"*DISTRIBUTION {name} of membrane thicknesses: taken into the "
+                             f"geometry of the quadratic membranes written as solids (no card of its "
+                             f"own in ccx).", once=True)
+            return []
         if not (b.param("LOCATION") or "ELEMENT").strip().upper().startswith("ELEM"):
             return self._commented(b, f"*DISTRIBUTION {name}, LOCATION={b.param('LOCATION')}: ccx "
                                       f"takes per-element orientations from element distributions "
@@ -5608,6 +5640,10 @@ class Converter:
         if (b.param("NAME") or "").strip().upper() in self._dist_tables:
             self.report.note("*DISTRIBUTION TABLE of an orientation distribution dropped (ccx "
                              "needs no table: its distribution lines are always a, b).", once=True)
+            return []
+        if (b.param("NAME") or "").strip().upper() in self._qmem_dist_tables:
+            self.report.note("*DISTRIBUTION TABLE of a membrane thickness distribution dropped (the "
+                             "thicknesses are in the geometry of the solids).", once=True)
             return []
         return self.passthrough(b)
 
@@ -6779,6 +6815,11 @@ class Converter:
         return out + [emit_keyword("SOLID SECTION", params)]
 
     def handle_membrane_section(self, b: Block) -> List[str]:
+        if id(b) in self._qmem_sections:
+            return self._qmem_section_cards(self._membrane_section_cards(b))
+        return self._membrane_section_cards(b)
+
+    def _membrane_section_cards(self, b: Block) -> List[str]:
         rows = self._exact_axes.get(id(b))
         if rows is not None:
             return self._exact_axes_cards(b, rows, OrderedDict(b.params), list(b.data))
@@ -9671,6 +9712,8 @@ class Converter:
         shells: List[int] = []
         beams: List[int] = []
         for e in (at if at is not None else self._elements_at({n})).get(n, []):
+            if e in self._qmem:                 # a solid on nodes of its own, tied to n
+                continue
             cc = ccx_element_type(self.geom.elements[e][0], quiet)
             if cc in SHELL_TYPES or cc.startswith("M3D"):
                 shells.append(e)
@@ -10176,12 +10219,14 @@ class Converter:
         self._out_subsets: Dict[str, str] = {}      # .frd set -> its nodes missing from the .frd
         self._used_names |= set(self.geom.nsets) | set(self.geom.elsets)
         types = {t: ccx_element_type(t, quiet) for t in {t for e, (t, _c) in self.geom.elements.items()
-                                                         if e not in self._u1}}
+                                                         if e not in self._u1 and e not in self._qmem}}
         frd3d = any(c.startswith(CCX_FRD_3D_TRIGGER) for c in types.values())
         solid_nodes: set = set()
         flat_nodes: set = set()
         for e, (typ, conn) in self.geom.elements.items():
-            if e in self._u1 or types[typ].startswith(CCX_SOLID_PREFIXES):
+            if e in self._qmem:
+                solid_nodes.update(self._qmem[e][1])    # the membrane's nodes are in no element
+            elif e in self._u1 or types[typ].startswith(CCX_SOLID_PREFIXES):
                 solid_nodes.update(conn)            # (ccx writes U1's own nodes to the .frd)
             elif types[typ].startswith(CCX_EXPANDED_PREFIXES):
                 flat_nodes.update(conn)
@@ -10341,6 +10386,13 @@ class Converter:
                 "them — exact for U, V and RF, the only .frd variables the deck requests.")
         two_d = stated == "2D" or (stated is None and (not frd3d or out2d))
         visible = solid_nodes | (flat_nodes if two_d else set())
+        # the nodes of quadratic membranes written as solids are in no ccx element: a request
+        # for the whole model prints them (.dat) too
+        hidden = sorted({n for e in self._qmem for n in self.geom.elements[e][1]} - visible)
+        self._qmem_hidden = None
+        if hidden:
+            self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
+            self.geom.nsets[self._qmem_hidden] = hidden
         for k, timing, reqs in steps:
             self._out_ctl[k] = self._step_output_control(k, timing, reqs)
             for r in reqs:
@@ -10576,6 +10628,14 @@ class Converter:
             if s is not None:
                 params["NSET"] = r["params"]["NSET"] if s == r["set"] else s
             twin = None
+            if s is None and self._qmem_hidden:
+                plabels = [x for x in labels if ccx_label_ok(x, CCX_NODE_PRINT_LABELS)]
+                if plabels:
+                    twin = ("NODE PRINT", OrderedDict([("NSET", self._qmem_hidden)]), plabels)
+                    r["notes"].append(
+                        f"*NODE FILE for the whole model: the nodes of quadratic membranes written "
+                        f"as solids are in no ccx element, so not in the .frd -> *NODE PRINT, "
+                        f"NSET={self._qmem_hidden} (.dat) for them; the .frd shows the solids.")
             if s is not None:
                 ids = [n for n in dedup(self.geom.nset(s)) if n in self.geom.nodes]
                 hidden = [n for n in ids if n not in visible]
@@ -11445,6 +11505,7 @@ class Converter:
             return ["** [abq2ccx] *TIE " + (b.param("NAME") or "") + ": its slave nodes are "
                     "members of the rigid body of its master surface"] + comments
         b = nb
+        pre = self._qmem_tie_slaves(b) if self._qmem else []
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("NAME", "POSITION TOLERANCE", "ADJUST", "CYCLIC SYMMETRY", "MULTISTAGE"):
@@ -11462,7 +11523,57 @@ class Converter:
                 self.report.note(f"*TIE parameter {k} dropped (unsupported by ccx).", once=True)
         self.report.note("*TIE: in ccx the MASTER (independent, 2nd) surface must be element-based; "
                          "a node-based master will be rejected — verify surface roles.", once=True)
-        return [emit_keyword("TIE", keep)] + list(b.data) + comments
+        return pre + [emit_keyword("TIE", keep)] + list(b.data) + comments
+
+    def _qmem_tie_slaves(self, b: Block) -> List[str]:
+        """The *TIE slave surfaces of ``b`` (data lines changed in place) on quadratic membranes
+        written as solids -> node surfaces of the membranes' own nodes (_qmem_node_surface);
+        returns the cards to write before the *TIE."""
+        out: List[str] = []
+        data: List[str] = []
+        for line in b.data:
+            f = [x.strip() for x in line.split(",")]
+            name, cards = self._qmem_node_surface(f[0], "*TIE slave") if f and f[0] else (None, [])
+            out += cards
+            data.append(", ".join([name] + f[1:]) if name else line)
+        b.data = data
+        return out
+
+    def _qmem_node_surface(self, surf: str, what: str) -> Tuple[Optional[str], List[str]]:
+        """An element surface ``surf`` on quadratic membranes written as solids
+        (_plan_quadratic_membranes) -> (the name of a node surface of the membranes' own
+        nodes, its *SURFACE card the first time), else (None, []).  ccx would put a tie or a
+        coupling on the solids' face nodes, which the converter's *EQUATIONs already eliminate
+        — it skips them ('DOF ... is not active; no tied constraint is generated', probed: a
+        SNEG face ties nothing, a SPOS face only in part) — while Abaqus ties and couples a
+        membrane's reference surface, its nodes.  A surface on such membranes and other
+        elements stays as it is, warned."""
+        sd = self.surfaces.get(surf.upper())
+        if sd is None or sd[0].startswith("NODE"):
+            return None, []
+        eids = [e for token, _face in sd[1] for e in
+                ([int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token))]
+        mine = [e for e in eids if e in self._qmem]
+        if not mine:
+            return None, []
+        if len(mine) < len(eids):
+            self.report.warn(f"{what} surface {surf} lies on quadratic membranes written as solids "
+                             f"and on other elements: ccx skips the solids' face nodes the "
+                             f"converter's *EQUATIONs eliminate, so the membranes take part only in "
+                             f"part.", once=True)
+            self._reduces(f"{what} surface {surf} partly on quadratic membranes")
+            return None, []
+        if surf.upper() in self._qmem_surfaces:
+            return self._qmem_surfaces[surf.upper()], []
+        self._reserve_names()
+        name = self._fresh_name(f"{surf}_NODES")
+        self._qmem_surfaces[surf.upper()] = name
+        self.report.note(f"{what} surface {surf} on quadratic membranes written as solids -> node "
+                         f"surface {name} of the membranes' nodes, which Abaqus ties and couples "
+                         f"(ccx would take the solids' face nodes, which the converter's *EQUATIONs "
+                         f"hold).", once=True)
+        return name, ([f"*SURFACE, NAME={name}, TYPE=NODE"] +
+                      [str(n) for n in self._surface_member_nodes(surf)])      # ccx: one entry per line
 
     def handle_restart(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -11757,6 +11868,9 @@ class Converter:
                 self._reduces(f"*RIGID BODY, {k}")
             else:
                 self.report.note(f"*RIGID BODY parameter {k} dropped (Abaqus-only).", once=True)
+        if self._qmem and keep.get("ELSET"):
+            pre += self._qmem_rigid_elset(keep, [v for k, v in b.params.items() if v and
+                                                 k.upper().replace(" ", "") in ("PINNSET", "TIENSET", "NSET")])
         tie, pin = self._rigid_body_members(b)
         if any(k.upper().replace(" ", "") in ("PINNSET", "TIENSET") for k in b.params):
             self.report.note("*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
@@ -11797,6 +11911,37 @@ class Converter:
                 ties += self._rot_node_follows(rot, ref)
             ties += self._rotation_ties([n for n in tie if n != ref], rot, -3)
         return pre + [emit_keyword("RIGID BODY", keep)] + list(b.data) + ties
+
+    def _qmem_rigid_elset(self, keep: "OrderedDict[str, Optional[str]]", sets: Sequence[str]) -> List[str]:
+        """A *RIGID BODY ELSET with quadratic membranes written as solids -> an NSET of its
+        elements' own nodes (``keep`` changed in place; any NSET joins it): ccx would make
+        every node of the solids rigid, the ones the converter's *EQUATIONs eliminate too,
+        while Abaqus moves the membranes' nodes with the body.  Returns the *NSET card.  An
+        ELSET that also has shells or beams stays as it is, warned.  ``sets``: the card's node
+        sets (PIN / TIE NSET), whose nodes join."""
+        ids = dedup(self.geom.elset(keep["ELSET"].strip()))
+        if not any(e in self._qmem for e in ids):
+            return []
+        quiet = Report()
+        if not all(e in self._qmem or ccx_element_type(self.geom.elements[e][0], quiet).startswith(
+                CCX_SOLID_PREFIXES) for e in ids if e in self.geom.elements):
+            self.report.warn(f"*RIGID BODY ELSET={keep['ELSET']} holds quadratic membranes written as "
+                             f"solids and shells or beams: ccx makes the solids' nodes rigid, the ones "
+                             f"the converter's *EQUATIONs eliminate too.", once=True)
+            self._reduces(f"*RIGID BODY ELSET={keep['ELSET']} on quadratic membranes and shells / beams")
+            return []
+        nodes = dedup([n for e in ids if e in self.geom.elements for n in self.geom.elements[e][1]] +
+                      [n for v in sets for n in self._resolve_nodes(v.strip())])
+        self._reserve_names()
+        name = self._fresh_name(f"{keep['ELSET']}_NODES")
+        self.geom.nsets[name] = nodes
+        del keep["ELSET"]
+        keep["NSET"] = name
+        self.report.note("*RIGID BODY ELSET with quadratic membranes written as solids -> an NSET of "
+                         "the elements' own nodes (the membranes' nodes, which Abaqus moves with the "
+                         "body; ccx would take the solids' nodes, which the converter's *EQUATIONs "
+                         "hold).", once=True)
+        return [f"*NSET, NSET={name}"] + reflow([str(n) for n in nodes], MAX_ENTRIES_PER_LINE)
 
     def handle_rotary_inertia(self, b: Block) -> List[str]:
         """``*ROTARY INERTIA``: ccx 2.23 has no ROTARYI element.  On a rigid body the converter
@@ -11937,7 +12082,13 @@ class Converter:
             return self._coupling_as_rigid_body(self._last_coupling)
         if (self._last_coupling or {}).get("kind") == "unsupported":
             self._warn_rigid_unsupported()
-        return [emit_keyword("COUPLING", params)] + list(b.data)
+        pre: List[str] = []
+        if id(b) in self._qmem_kinematic and params.get("SURFACE"):
+            # (a distributing coupling leaves its surface nodes independent: it stays on the
+            # solids' faces, weighted by their areas)
+            name, pre = self._qmem_node_surface(params["SURFACE"].strip(), "*COUPLING, *KINEMATIC")
+            params["SURFACE"] = name or params["SURFACE"]
+        return pre + [emit_keyword("COUPLING", params)] + list(b.data)
 
     def _coupling_as_rigid_body(self, plan: dict) -> List[str]:
         """A kinematic coupling of all translations as the equivalent *RIGID BODY — the same
@@ -12126,7 +12277,7 @@ class Converter:
                                       f"condition type (ccx knows {', '.join(sorted(ccx_known))}); "
                                       f"remodel or remove.")
         layout = {"TEMPERATURE": "field", "VELOCITY": "dof", "DISPLACEMENT": "dof"}.get(typ)
-        midside = self._midside_records(b, layout) if layout else []
+        midside = self._midside_records(b, layout) + self._qmem_records(b, layout) if layout else []
         if typ == "TEMPERATURE" and self._temp_ic_fill:
             self.report.note(f"*INITIAL CONDITIONS, TYPE=TEMPERATURE: nodes it does not list get "
                              f"0 first ({ALL_NODES_SET}, 0.) — the Abaqus default; ccx stops on a "
@@ -12207,7 +12358,7 @@ class Converter:
                              "file, not Abaqus' .odb / .fil, so these temperatures are lost (ccx "
                              "prints 'ERROR in readfrd' without stopping).", once=True)
             self._reduces("*TEMPERATURE, FILE= (Abaqus results file)")
-        return self.passthrough(b) + self._midside_records(b, "field")
+        return self.passthrough(b) + self._midside_records(b, "field") + self._qmem_records(b, "field")
 
     def handle_flux_film(self, b: Block) -> List[str]:
         """``*FILM`` / ``*DFLUX`` / ``*CFLUX`` / ``*RADIATE`` pass through, minus the loads whose
@@ -12371,7 +12522,9 @@ class Converter:
                     params["POSITION TOLERANCE"] = adj
                 except ValueError:
                     pass
-                out += [emit_keyword("TIE", params), f"{f[0]}, {f[1]}"]
+                slave, cards = self._qmem_node_surface(f[0], "*CONTACT PAIR, TIED slave") \
+                    if self._qmem else (None, [])
+                out += cards + [emit_keyword("TIE", params), f"{slave or f[0]}, {f[1]}"]
             if out:
                 self.report.note("*CONTACT PAIR, TIED -> *TIE (same slave/master surfaces; ccx "
                                  "ties the nodes with MPCs instead of a contact formulation).",
@@ -12527,6 +12680,7 @@ class Converter:
         self._plan_u1_beams(blocks)
         self._plan_quadratic_shells(blocks)     # composite S3 / S4 / S4R -> S6 / S8R
         self._plan_ply_split(blocks)            # composite SC6R / SC8R -> one solid per ply
+        self._plan_quadratic_membranes(blocks)  # M3D6 / M3D8 / M3D8R -> the converter's own solids
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
         self._prescan(blocks)
@@ -12568,6 +12722,7 @@ class Converter:
         out.extend(self._knot_section())
         out.extend(self._slab_cards())
         out.extend(self._ply_cards())
+        out.extend(self._qmem_cards())
         out.extend(self._node_normal_cards(blocks))
         if self._planar_bc:
             out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "
@@ -14871,6 +15026,419 @@ class Converter:
         return (["** [abq2ccx] ply interface nodes held on the edge of a neighbour with other "
                  "nodes there", "*EQUATION"] + self._ply_eq)
 
+    # -- quadratic membranes as the converter's own solids -------------------------------
+    # parametric coordinates of the nodes of an 8-node quadrilateral and a 6-node triangle
+    _Q8_POS = ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0),
+               (0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0))
+    _T6_POS = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5))
+
+    @classmethod
+    def _sheet_tangents(cls, pts: Sequence[Vec], a: float, b: float) -> Tuple[Vec, Vec]:
+        """The tangents dx/dxi, dx/deta of an 8-node quadrilateral or a 6-node triangle with
+        points ``pts`` at parametric point (a, b)."""
+        if len(pts) == 8:
+            d = [(0.25 * xi * (1 + et * b) * (2 * xi * a + et * b),
+                  0.25 * et * (1 + xi * a) * (xi * a + 2 * et * b)) for xi, et in cls._Q8_POS[:4]]
+            d += [(-a * (1 - b), -0.5 * (1 - a * a)), (0.5 * (1 - b * b), -b * (1 + a)),
+                  (-a * (1 + b), 0.5 * (1 - a * a)), (-0.5 * (1 - b * b), -b * (1 - a))]
+        else:
+            l0 = 1.0 - a - b
+            d = [(1 - 4 * l0, 1 - 4 * l0), (4 * a - 1, 0.0), (0.0, 4 * b - 1),
+                 (4 * (l0 - a), -4 * a), (4 * b, 4 * a), (-4 * b, 4 * (l0 - b))]
+        return (tuple(sum(dk[0] * p[i] for dk, p in zip(d, pts)) for i in range(3)),
+                tuple(sum(dk[1] * p[i] for dk, p in zip(d, pts)) for i in range(3)))
+
+    @classmethod
+    def _sheet_normal(cls, pts: Sequence[Vec], a: float, b: float) -> Optional[Vec]:
+        """The unit normal (right-hand rule over the nodes) of an 8-node quadrilateral or a
+        6-node triangle with points ``pts`` at parametric point (a, b), None where it is
+        degenerate."""
+        g1, g2 = cls._sheet_tangents(pts, a, b)
+        v = vcross(g1, g2)
+        size = vnorm(g1) * vnorm(g2)
+        return vunit(v) if size > 0.0 and vnorm(v) > 1e-9 * size else None
+
+    # The C3D20R of an 8-node membrane, its fibres private, has one zero-energy mode of its
+    # own (2 x 2 x 2 points): the fibres u_top - u_node in the 8-node hourglass pattern
+    # (xi f, -eta f along the element's xi / eta directions, f 1 at the corners and -1/2 at
+    # the midside nodes), with no neighbour to hold it — ccx's system is singular then
+    # (probed: up to 4e-4 off in uniform tension on some meshes).  These node weights pick
+    # that pattern's xi eta^2 / xi^2 eta content, which no linear or quadratic field has:
+    # the *EQUATION sum_j (W8_j e1 - W7_j e2) . (u_top - u_node)_j = 0 holds only that mode
+    # (an element's condensed stiffness unchanged to 1e-12 where it is flat; where it curves,
+    # closer to a membrane's than without it)
+    _HG_W8 = (-1.0, 1.0, 1.0, -1.0, 0.0, -2.0, 0.0, 2.0)
+    _HG_W7 = (-1.0, -1.0, 1.0, 1.0, 2.0, 0.0, -2.0, 0.0)
+
+    def _plan_quadratic_membranes(self, blocks: List[Block]) -> None:
+        """Quadratic membranes -> one-element-thick solids the converter expands itself.
+
+        ccx 2.23 expands every membrane element into a 3-D element with nodes of its own: a
+        node of several membranes gets a bottom / middle / top triple per element (gen3dnor),
+        each hinged to the node by u_bottom + u_top = 2 u_node (gen3dmembrane).  A quadratic
+        element's corner keeps the middle node of its triple — a node of its C3D15 /
+        C3D20(R) — and ties it to the node only where the node has a *BOUNDARY and one
+        element (gen3dboun; a node of several membranes gets an empty knot, which skips the
+        tie): elsewhere it is free inside its element, which bulges through the thickness.
+        Probed: M3D8R is singular in any mesh of two or more elements, M3D6 up to 6x too soft
+        at any thickness, M3D8 too soft by a share that grows with thickness / element size
+        (0.3 % at 1/25, 3x at 8); linear membranes have no such node and run exactly.
+
+        So each element of QUAD_MEMBRANE_SOLID is written as the solid ccx makes of it, with
+        nodes of its own: per element and node a bottom and a top node at -/+ half the
+        thickness along the element's own normal there, held by *EQUATION u_b + u_t - 2 u_n
+        = 0, and per membrane corner node one mid-thickness node, held by u_m = u_n — the tie
+        ccx misses (not the membrane node itself: ccx's RF at a node of an element leaves out
+        what an *EQUATION carries to it, probed); per C3D20R one equation more for the
+        zero-energy hourglass of its fibres (_HG_W8).  The new nodes have no *TRANSFORM, and
+        each tie runs along its membrane node's local axes.  Probed on 2.23 (C3D20R / C3D20 /
+        C3D15): uniform tension and prescribed
+        strains exact in regular and distorted meshes at any thickness, under NLGEOM too (20 %
+        stretch); a pressurized sphere as ccx's thin S8R shell, linear and NLGEOM.  The
+        element keeps its id, Abaqus type and nodes here (loads, surfaces and sets read it as
+        a membrane: ccx's expanded membrane has the same faces, S1 bottom, S2 top, S3.. the
+        edges); emit_geometry writes the solid.  The membrane nodes belong to no ccx element
+        then, so .frd output there goes to the .dat (_plan_output).  M3D9 / M3D9R become the
+        8-node serendipity solid, their centre node held on its interpolation (reduced
+        physics).  An element without a membrane section, a thickness or a normal stays as
+        it is, warned."""
+        els = self.geom.elements
+        cands = {e for e, (typ, conn) in els.items() if typ.upper() in QUAD_MEMBRANE_SOLID and
+                 len(conn) == ELEMENT_NNODES[typ.upper()] and all(n in self.geom.nodes for n in conn)}
+        if not cands:
+            return
+        nodal: Dict[int, float] = {}
+        for b in blocks:
+            if b.keyword == "NODAL THICKNESS":
+                for r in merged_data_records(b):
+                    if len(r) >= 2 and r[0].strip():
+                        try:
+                            t = pf(r[1])
+                        except ValueError:
+                            continue
+                        for n in self._resolve_nodes(r[0].strip()):
+                            nodal[n] = t
+        dists = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        thick: Dict[int, List[float]] = {}
+        section: Dict[int, Block] = {}
+        left: Dict[str, List[int]] = {}               # why an element stays as it is -> elements
+        for b in blocks:
+            if b.keyword != "MEMBRANE SECTION":
+                continue
+            members = [e for e in dedup(self.geom.elset((b.param("ELSET") or "").strip()))
+                       if e in cands and e not in section]
+            if not members:
+                continue
+            per: Dict[int, float] = {}
+            default: Optional[float] = None
+            field = (b.param("MEMBRANE THICKNESS") or "").strip().upper()
+            if b.has("NODAL THICKNESS"):
+                pass
+            elif field:
+                for r in merged_data_records(dists[field]) if field in dists else []:
+                    try:
+                        t = pf(r[1]) if len(r) > 1 else None
+                    except ValueError:
+                        continue
+                    if not r[0].strip():
+                        default = t
+                    else:
+                        for e in ([int(r[0])] if re.fullmatch(r"[-+]?\d+", r[0].strip())
+                                  else self.geom.elset(r[0].strip())):
+                            per[e] = t
+            else:
+                recs = merged_data_records(b)
+                try:
+                    default = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else None
+                except ValueError:
+                    default = None
+            for e in members:
+                section[e] = b
+                conn = els[e][1]
+                if b.has("NODAL THICKNESS"):
+                    ts = [nodal.get(n) for n in conn]
+                else:
+                    ts = [per.get(e, default)] * len(conn)
+                if any(t is None or t <= 0.0 for t in ts):
+                    left.setdefault("no positive thickness", []).append(e)
+                else:
+                    thick[e] = ts
+        for e in sorted(cands - set(section)):
+            left.setdefault("no *MEMBRANE SECTION", []).append(e)
+        nodes = self.geom.nodes
+        # ccx reads the DOFs of an *EQUATION term on a node with a *TRANSFORM in its local axes
+        # and expands each term into global ones (equations.f), so an equation names such a
+        # node in one local direction only (two would give one global DOF twice, which ccx
+        # 2.23 solves wrongly; probed): the new nodes stay global, and each tie runs along
+        # the local axes of its membrane node
+        frames = self._transform_defs(blocks) if any(b.keyword == "TRANSFORM" for b in blocks) else {}
+        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+        def local(node: int) -> Union[None, Tuple[Vec, Vec, Vec], str]:
+            d = frames.get(node)
+            return d if d is None or isinstance(d, str) else self._transform_axes(node, *d)
+
+        def equations(groups: Sequence[Sequence[Tuple[int, Vec]]], lead: Sequence[int]) -> List[str]:
+            """Each group of terms (node, global coefficient vector) -> an *EQUATION on the nodes'
+            own DOFs; the groups' first (eliminated) terms are distinct DOFs of the ``lead``
+            nodes with the largest smallest coefficient."""
+            rows_: List[List[Tuple[int, int, float]]] = []
+            for terms in groups:
+                out: List[Tuple[int, int, float]] = []
+                for node, v in terms:
+                    ax = local(node) or unit
+                    for k in range(3):
+                        c = vdot(v, ax[k])
+                        if abs(c) > 1e-9 * vnorm(v):
+                            out.append((node, k + 1, c))
+                rows_.append(out)
+            cands = [[x for x in r if x[0] in lead] for r in rows_]
+            best, pick = -1.0, None
+            for combo in itertools.product(*cands) if len(rows_) <= 3 else [[max(c, key=lambda x: abs(x[2]))
+                                                                            for c in cands]]:
+                if len({(x[0], x[1]) for x in combo}) == len(combo) and min(abs(x[2]) for x in combo) > best:
+                    best, pick = min(abs(x[2]) for x in combo), combo
+            text: List[str] = []
+            for r, first in zip(rows_, pick or [r[0] for r in rows_]):
+                r = [first] + [x for x in r if x is not first]
+                text += [str(len(r))] + [", ".join(f"{n}, {d}, {short_real(c)}" for n, d, c in r[i:i + 4])
+                                         for i in range(0, len(r), 4)]
+            return text
+        next_n = max(nodes, default=0)
+        mid_of: Dict[int, int] = {}                   # membrane corner node -> its mid-thickness node
+        rows: List[str] = []
+        for e in sorted(thick):
+            typ, conn = els[e]
+            body = conn[:8]
+            nc = 3 if len(body) == 6 else 4
+            pts = [nodes[n] for n in body]
+            normals = [self._sheet_normal(pts, a, c) for a, c in
+                       (self._T6_POS if nc == 3 else self._Q8_POS)]
+            if any(v is None for v in normals):
+                left.setdefault("a degenerate geometry (no normal at a node)", []).append(e)
+                continue
+            if any(isinstance(local(n), str) for n in conn):
+                left.setdefault("a *TRANSFORM without readable axes on a node", []).append(e)
+                continue
+            bot, top = [], []
+            for n, v, t in zip(body, normals, thick[e]):
+                for row, sign in ((bot, -0.5), (top, 0.5)):
+                    next_n += 1
+                    self.geom.add_node(next_n, vadd(nodes[n], vscale(v, sign * t)))
+                    self._qmem_copies[next_n] = n
+                    row.append(next_n)
+                axes = local(n) or unit                       # bottom + top = 2 x node
+                rows += equations([[(bot[-1], a), (top[-1], a), (n, vscale(a, -2.0))] for a in axes],
+                                  [bot[-1]])
+            mids = []
+            for n in body[:nc]:
+                if n not in mid_of:                           # mid-thickness node = node
+                    next_n += 1
+                    mid_of[n] = next_n
+                    self.geom.add_node(next_n, nodes[n])
+                    self._qmem_copies[next_n] = n
+                    rows += equations([[(next_n, a), (n, vscale(a, -1.0))] for a in local(n) or unit],
+                                      [next_n])
+                mids.append(mid_of[n])
+            if QUAD_MEMBRANE_SOLID[typ.upper()] == "C3D20R":     # the fibre hourglass (_HG_W8)
+                g1, g2 = self._sheet_tangents(pts, 0.0, 0.0)
+                e1, e2 = vunit(g1), vunit(g2)
+                terms: List[Tuple[int, Vec]] = []
+                for j in range(8):
+                    cj = vsub(vscale(e1, self._HG_W8[j]), vscale(e2, self._HG_W7[j]))
+                    if vnorm(cj):
+                        terms += [(top[j], cj), (bot[j], vscale(cj, -1.0))]
+                rows += equations([terms], top)
+            if len(conn) == 9:
+                # the centre node of M3D9 / M3D9R follows the 8-node interpolation of the
+                # element's mid-surface, (bottom + top) / 2
+                w = [-0.25] * 4 + [0.5] * 4
+                rows += equations([[(conn[8], a)] + [(x, vscale(a, -0.5 * w[j])) for j in range(8)
+                                                     for x in (bot[j], top[j])]
+                                   for a in local(conn[8]) or unit], [conn[8]])
+            self._qmem[e] = (QUAD_MEMBRANE_SOLID[typ.upper()],
+                             bot[:nc] + top[:nc] + bot[nc:] + top[nc:] + mids)
+        self._qmem_axes = {n: ax for n in set(self._qmem_copies.values()) for ax in [local(n)]
+                           if ax and not isinstance(ax, str)}
+        self._qmem_eq = rows
+        for why, ids in left.items():
+            kinds = ", ".join(sorted({els[e][0].upper() for e in ids}))
+            self.report.warn(f"{len(ids)} quadratic membrane element(s) ({kinds}) with {why} stay as "
+                             f"they are: ccx 2.23 runs such membranes wrongly (a mid-thickness node "
+                             f"free in each element: M3D8R singular, M3D6 several times too soft, "
+                             f"M3D8 too soft in thick elements; probed).", once=True)
+            self._reduces(f"{kinds} membranes run by ccx's own expansion ({why})")
+        if not self._qmem:
+            return
+        self._qmem_kinematic = {id(b) for b, c in zip(blocks, blocks[1:])
+                                if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
+        self._qmem_mass_acts = any(b.keyword in self._INERTIA_PROCEDURES for b in blocks) or any(
+            len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS
+            for b in blocks if b.keyword == "DLOAD" for r in merged_data_records(b))
+        # each section on them becomes a *SOLID SECTION (handle_membrane_section); a section
+        # that also has elements staying membranes is split into two cards
+        inserts: List[Tuple[int, Block]] = []
+        self._reserve_names()
+        for i, b in enumerate(blocks):
+            if b.keyword != "MEMBRANE SECTION":
+                continue
+            elset = (b.param("ELSET") or "").strip()
+            ids = [e for e in dedup(self.geom.elset(elset)) if e in els]
+            mine = [e for e in ids if e in self._qmem and section.get(e) is b]
+            if not mine:
+                continue
+            if len(mine) == len(ids):
+                self._qmem_sections.add(id(b))
+                continue
+            rest = self._fresh_name(f"{elset}_MEMBRANE")
+            solid = self._fresh_name(f"{elset}_SOLID")
+            self.geom.elsets[rest] = [e for e in ids if e not in mine]
+            self.geom.elsets[solid] = mine
+            b.params["ELSET"] = rest
+            params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+            params["ELSET"] = solid
+            twin = Block(b.keyword, params, list(b.data), b.part, b.instance)
+            self._qmem_sections.add(id(twin))
+            inserts.append((i + 1, twin))
+        for i, twin in reversed(inserts):
+            blocks.insert(i, twin)
+        # a MEMBRANE THICKNESS distribution only these solids read is in their geometry: it
+        # needs no card (ccx has no thickness distribution), nor does a table only it names
+        users: Dict[str, List[Block]] = {}
+        for b in blocks:
+            for k, v in b.params.items():
+                if v and k != "NAME":
+                    users.setdefault(v.strip().upper(), []).append(b)
+        for name in dists:
+            us = users.get(name, [])
+            if us and all(u.keyword == "MEMBRANE SECTION" and
+                          (u.param("MEMBRANE THICKNESS") or "").strip().upper() == name and
+                          all(e in self._qmem for e in dedup(self.geom.elset((u.param("ELSET") or "").strip()))
+                              if e in els) for u in us):
+                self._qmem_dists.add(name)
+        tables: Dict[str, List[str]] = {}
+        for name, d in dists.items():
+            if d.param("TABLE"):
+                tables.setdefault(d.param("TABLE").strip().upper(), []).append(name)
+        self._qmem_dist_tables = {t for t, names in tables.items() if set(names) <= self._qmem_dists}
+        # ccx's RF at a node of an element leaves out what an *EQUATION carries there (probed):
+        # at a held membrane node another element shares, the membranes' share is missing
+        shared = {n for e in self._qmem for n in els[e][1]} & \
+            {n for e, (_t, c) in els.items() if e not in self._qmem for n in c}
+        held = {n for b in blocks if b.keyword == "BOUNDARY" for r in merged_data_records(b)
+                if r and r[0].strip() for n in self._resolve_nodes(r[0].strip())}
+        if shared & held:
+            self.report.warn(f"{len(shared & held)} node(s) held by a *BOUNDARY belong to quadratic "
+                             f"membranes written as solids and to other elements: ccx's RF there "
+                             f"leaves out the membranes' share (its RF at a node of an element omits "
+                             f"what an *EQUATION carries to it; probed). The solution is not "
+                             f"affected.", once=True)
+        counts: "OrderedDict[str, int]" = OrderedDict()
+        for e in self._qmem:
+            kind = f"{els[e][0].upper()} -> {self._qmem[e][0]}"
+            counts[kind] = counts.get(kind, 0) + 1
+        self.report.note(
+            f"Quadratic membranes: {len(self._qmem)} element(s) "
+            f"({', '.join(f'{v} {k}' for k, v in counts.items())}) written as one-element-thick "
+            f"solids with nodes of their own, held at the membrane nodes by *EQUATION (bottom + "
+            f"top = 2 x node; the mid-thickness corner node = node; per C3D20R one equation for a "
+            f"zero-energy hourglass of its own): ccx 2.23 expands quadratic "
+            f"membranes with that corner node free in each element (M3D8R singular, M3D6 several "
+            f"times too soft, M3D8 too soft in thick elements; probed), which these solids fix. "
+            f"Loads, surfaces and sets keep the element ids and faces; the membrane nodes belong to "
+            f"no ccx element now, so their nodal output goes to the .dat (the .frd shows the "
+            f"solids).", once=True)
+        nine = sorted({els[e][0].upper() for e in self._qmem if len(els[e][1]) == 9})
+        if nine:
+            self.report.warn(f"Element {'/'.join(nine)} (9-node membrane) -> the 8-node serendipity "
+                             f"solid ({'/'.join(sorted({QUAD_MEMBRANE_SOLID[t] for t in nine}))}): "
+                             f"ccx has no 9-node element, so the centre node is held on the 8-node "
+                             f"interpolation and its own stiffness is lost.", once=True)
+            self._reduces(f"element {'/'.join(nine)} -> the 8-node serendipity membrane")
+
+    def _qmem_section_cards(self, cards: List[str]) -> List[str]:
+        """The cards of a membrane section on quadratic membranes written as solids
+        (_plan_quadratic_membranes): each *MEMBRANE SECTION -> *SOLID SECTION with its element
+        set, material and orientation (a membrane's orientation and a solid's read alike in
+        ccx 2.23: the turned axes unprojected), without the thickness line."""
+        out: List[str] = []
+        skip = False
+        dropped: set = set()
+        for ln in cards:
+            if ln.startswith("*") and not ln.startswith("**"):
+                skip = False
+                kw, params = parse_keyword_line(ln)
+                if kw == "MEMBRANE SECTION":
+                    out.append(emit_keyword("SOLID SECTION", OrderedDict(
+                        (k, v) for k, v in params.items() if k in ("ELSET", "MATERIAL", "ORIENTATION"))))
+                    dropped |= {k for k in params if k not in ("ELSET", "MATERIAL", "ORIENTATION")}
+                    skip = True
+                    continue
+            elif skip:
+                continue
+            out.append(ln)
+        if "DENSITY" in dropped:
+            self.report.warn("*MEMBRANE SECTION, DENSITY= (mass per unit area added to the "
+                             "material's) dropped with the solid form of quadratic membranes: ccx "
+                             "has no such section mass, so that mass is missing.", once=True)
+            if self._qmem_mass_acts:
+                self._reduces("*MEMBRANE SECTION, DENSITY= (added mass per area)")
+        if "POISSON" in dropped or self._nl_any:
+            self.report.note("Quadratic membranes as solids: their thickness changes with their "
+                             "material's own Poisson's ratio, as ccx's membranes do; Abaqus changes a "
+                             "membrane's thickness under NLGEOM with the section's POISSON (default "
+                             "0.5), which differs at finite strain.", once=True)
+        return out
+
+    def _qmem_records(self, b: Block, layout: str) -> List[str]:
+        """Extra data lines that carry a per-node *TEMPERATURE / *INITIAL CONDITIONS value
+        onto the nodes of the quadratic membranes written as solids: each takes its membrane
+        node's (``layout`` "field": node, values...; "dof": node, DOF, value, turned into the
+        global axes where the membrane node has a *TRANSFORM — the solids' nodes have none).
+        Appended after the card's own lines; boundary conditions never reach these nodes."""
+        if not self._qmem_copies or layout not in ("field", "dof"):
+            return []
+        recs: Dict[int, Dict[int, object]] = {}
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            while g and g[-1] == "":
+                g.pop()
+            if len(g) < 2 or not g[0]:
+                continue
+            try:
+                vals = {0: [pf(x) if x else 0.0 for x in g[1:]]} if layout == "field" else \
+                    {int(g[1]): pf(g[2]) if len(g) > 2 and g[2] else 0.0}
+            except ValueError:
+                continue
+            for n in self._resolve_nodes(g[0]):
+                recs.setdefault(n, {}).update(vals)
+        out: List[str] = []
+        for m, n in self._qmem_copies.items():
+            r = recs.get(n)
+            if not r:
+                continue
+            if layout == "field":
+                out.append(", ".join([str(m)] + ["%.12g" % x for x in r[0]]))
+            elif n in self._qmem_axes and any(d in r for d in (1, 2, 3)):
+                ax = self._qmem_axes[n]
+                g = [sum(float(r.get(k + 1, 0.0)) * ax[k][i] for k in range(3)) for i in range(3)]
+                out += [f"{m}, {i + 1}, {g[i]:.12g}" for i in range(3)]
+                out += [f"{m}, {d}, {float(v):.12g}" for d, v in sorted(r.items()) if d not in (1, 2, 3)]
+            else:
+                out += [f"{m}, {d}, {float(v):.12g}" for d, v in sorted(r.items())]
+        if out:
+            self.report.note(f"*{b.keyword} lines on the nodes of quadratic membranes written as "
+                             f"solids were extended to the solids' own nodes.", once=True)
+        return out
+
+    def _qmem_cards(self) -> List[str]:
+        """Model data of the quadratic membranes written as solids: the *EQUATIONs that hold
+        their nodes at the membrane nodes."""
+        if not self._qmem_eq:
+            return []
+        return (["** [abq2ccx] quadratic membranes as solids: bottom + top = 2 x membrane node, "
+                 "mid-thickness corner node = membrane node", "*EQUATION"] + self._qmem_eq)
+
     # -- beams as ccx's U1 element ------------------------------------------------------
     _U1_CONSTRAINTS = ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING",
                        "MPC", "TIE", "CONTACT PAIR", "CONTACT", "EMBEDDED ELEMENT")
@@ -15484,7 +16052,8 @@ class Converter:
                 for rec in merged_data_records(b):
                     if rec and rec[0]:
                         covered.update(self._resolve_nodes(rec[0]))
-                covered.update(int(ln.split(",")[0]) for ln in self._midside_records(b, "field"))
+                covered.update(int(ln.split(",")[0]) for ln in self._midside_records(b, "field") +
+                               self._qmem_records(b, "field"))
         self._temp_ic_covered = covered if any_temp_ic else None     # _complete_temperature_ic
         if any_temp_ic and self.geom.nodes and not set(self.geom.nodes) <= covered:
             self._temp_ic_fill = True
@@ -15738,11 +16307,12 @@ class Converter:
         kinds: Dict[str, str] = {}
         self._expanded = set()                 # nodes of elements ccx expands to 3-D
         rotn: set = set()                      # shell/beam nodes: rotations of their own
-        for typ, conn in self.geom.elements.values():
+        for e, (typ, conn) in self.geom.elements.items():
             if typ not in kinds:
                 kinds[typ] = ccx_element_type(typ, quiet)
             cc = kinds[typ]
-            if cc in SHELL_TYPES or cc in BEAM_TYPES or cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES):
+            if e not in self._qmem and (cc in SHELL_TYPES or cc in BEAM_TYPES or
+                                        cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES)):
                 self._expanded.update(conn)
             if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
                 rotn.update(conn)
@@ -16206,8 +16776,8 @@ class Converter:
         undefined keep their form (_plan_transformed_rotations).  Returns the last node id."""
         quiet = Report()
         structural = set(self._shell_nodes) | set(self._beam_nodes)
-        for typ, conn in self.geom.elements.values():
-            if ccx_element_type(typ, quiet).startswith("M3D"):
+        for e, (typ, conn) in self.geom.elements.items():
+            if e not in self._qmem and ccx_element_type(typ, quiet).startswith("M3D"):
                 structural.update(conn)
         cands: "OrderedDict[int, List[Tuple[int, bool]]]" = OrderedDict()  # ref -> (id, tied)
         convertible: set = set()             # couplings of all translations, 3-D members
@@ -16790,11 +17360,11 @@ class Converter:
         quiet = Report()
         self._rot_nodes = set()
         structural = self._shell_nodes | self._beam_nodes      # + membranes (no rotations)
-        for typ, conn in self.geom.elements.values():
+        for e, (typ, conn) in self.geom.elements.items():
             cc = ccx_element_type(typ, quiet)
             if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
                 self._rot_nodes.update(conn)
-            elif cc.startswith("M3D"):
+            elif cc.startswith("M3D") and e not in self._qmem:      # (solids: plain nodes)
                 structural.update(conn)
         self._coupling_plan = {}
         knots: List[int] = []
@@ -19967,7 +20537,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                          "BEAM GENERAL SECTION", "MEMBRANE SECTION", "COHESIVE SECTION",
                          "GASKET SECTION", "SURFACE SECTION", "SPRING",
                          "DASHPOT", "MASS", "ROTARY INERTIA", "GAP"):
-            nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer)
+            nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION", "MEMBRANE THICKNESS"), namer)
             if b.has("COMPOSITE"):
                 # a ply line (thickness, points, material, angle or orientation, ply name)
                 # can name one of the part's orientations: this instance's copy
@@ -20954,7 +21524,8 @@ def _digest_step(entry: dict, frd: str, blocks, final, info: Optional[dict], dec
 
 
 def ccx_results_digest(job: str, instances: Sequence[dict] = (),
-                       model: Optional[Tuple[int, int]] = None) -> List[dict]:
+                       model: Optional[Tuple[int, int]] = None,
+                       expanded: Optional[Dict[int, int]] = None) -> List[dict]:
     """A digest of each step of a solved ccx job (its path without the extension), from what
     ``job.frd`` and ``job.dat`` hold, to compare with the Abaqus results:
 
@@ -20971,7 +21542,9 @@ def ccx_results_digest(job: str, instances: Sequence[dict] = (),
     ``job.inp`` gives the procedures and the BCs.  A .frd node above the deck's nodes, one
     ccx added expanding a shell or beam, gets ``near``, the nearest node of the deck.
     ``model`` (Converter.model_labels), the Abaqus model's highest node and element labels,
-    leaves out what the converter added (knot beams, skins, ...); with ``instances``
+    leaves out what the converter added (knot beams, skins, ...) but the nodes of ``expanded``
+    (the solids of quadratic membranes: node -> its membrane node, which becomes its
+    ``near``); with ``instances``
     (Report.instances) a node, element or set of an instance gets ``abaqus``, its
     Instance.label name.  What the files lack is left out."""
     deck = _deck_steps(job + ".inp")
@@ -20990,8 +21563,10 @@ def ccx_results_digest(job: str, instances: Sequence[dict] = (),
     elements = next((b[3] for b in index if b[2] == "ELEMENTS"), None)
     skip = _frd_element_nodes(frd, elements, model[1]) if model and elements is not None else set()
 
+    expanded = expanded or {}
+
     def keep(n: int) -> bool:              # a node of the Abaqus model or of ccx's expansion
-        return n not in skip and (not model or n <= model[0] or n > top)
+        return n not in skip and (not model or n <= model[0] or n > top or n in expanded)
 
     def keep_element(e: int) -> bool:
         return not model or e <= model[1]
@@ -21026,6 +21601,10 @@ def ccx_results_digest(job: str, instances: Sequence[dict] = (),
         for x in far:
             if x["node"] in near:
                 x["near"] = near[x["node"]]
+    for e in digest:
+        for x in (e.get("max_u"), e.get("max_mises")):
+            if x and "node" in x and x["node"] in expanded:
+                x["near"] = expanded[x["node"]]
     names = {c: f"{i['name']}.{a}" for i in instances for a, c in i["names"].items()}
     for e in digest:
         for x in (e.get("max_u"), e.get("max_mises")):
@@ -21118,7 +21697,8 @@ def _warn_ccx_version(exe: str, version: Optional[str]) -> None:
 
 
 def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = True,
-            instances: Sequence[dict] = (), model: Optional[Tuple[int, int]] = None) -> dict:
+            instances: Sequence[dict] = (), model: Optional[Tuple[int, int]] = None,
+            expanded: Optional[Dict[int, int]] = None) -> dict:
     """Run CalculiX on a converted deck.  Returns ``{"code", "ccx", "ccx_version", "status",
     "results"}``: ``code`` 0 if the analysis solves with finite results (or ccx accepts a
     mesh-only deck that has nothing to solve), else 1; ``status`` as classify_ccx_run (None
@@ -21177,7 +21757,7 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     else:
         run["code"] = 0
         try:
-            run["results"] = ccx_results_digest(job, instances, model)
+            run["results"] = ccx_results_digest(job, instances, model, expanded)
         except Exception as exc:    # a convenience: never let it fail a solved run
             sys.stderr.write(f"abq2ccx: could not digest the results ({type(exc).__name__}: {exc})\n")
             return run
@@ -21252,7 +21832,7 @@ def _convert_one(path: str, args) -> int:
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
     run = run_ccx(out_path, args.ccx, args.quiet, not args.json_out, report.instances,
-                  conv.model_labels) if args.run and wrote and not strict else None
+                  conv.model_labels, expanded=conv._qmem_copies) if args.run and wrote and not strict else None
     if args.json_out:
         doc = {
             "tool": "abq2ccx", "version": __version__, "input": path,

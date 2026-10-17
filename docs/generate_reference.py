@@ -93,7 +93,10 @@ TRANSLATED = {
         "takes a membrane's orientation axes unprojected, the global axes without one, so an "
         "orthotropic or anisotropic membrane off them gets Abaqus' directions per element group); "
         "with a `*DISTRIBUTION` orientation split into one element set, plain `*ORIENTATION` and "
-        "section per distinct direction.",
+        "section per distinct direction. On quadratic membranes (`M3D6`, `M3D8`, `M3D8R`, `M3D9`, "
+        "`M3D9R`), which become solids, → `*SOLID SECTION` (split off where linear membranes share "
+        "it); the thickness (data line, `NODAL THICKNESS`, `MEMBRANE THICKNESS`) goes into their "
+        "geometry; `DENSITY` is dropped, warned.",
     "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's "
         "two section diameters (`r` → `2r, 2r`), and 2-node beams under it become 3-node beams with "
         "an inserted midside node (ccx 2.23 rejects linear beams with a circular section). "
@@ -485,6 +488,9 @@ def element_status(t):
     if t in A.PLY_SOLID:
         return (f"→ `{A.ccx_element_type(t, A.Report())}` (substituted: reduced physics); under a "
                 f"composite section one `{A.PLY_SOLID[t]}` per ply")
+    if t in A.QUAD_MEMBRANE_SOLID:
+        return (f"→ `{A.QUAD_MEMBRANE_SOLID[t]}` on nodes of its own, held at the membrane's nodes "
+                + ("(exact)" if t in A.CCX_ELEMENTS else "without its centre node (reduced physics)"))
     up = A.COMPOSITE_SHELL_UPGRADE.get(A.ccx_element_type(t, A.Report()))
     if up:
         own = "direct" if t in A.CCX_ELEMENTS else (
@@ -557,6 +563,15 @@ def gen_elements():
                          "ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both "
                          "are validated against classical lamination theory and Pagano's 3-D "
                          "solution (`validate_with_ccx.py composite_plate_*`).\n")
+        if cat == "membrane":
+            parts.append("ccx 2.23 expands every membrane element into a solid on nodes of its own "
+                         "and leaves the mid-thickness node of a quadratic element's corners free "
+                         "(`M3D8R` singular, `M3D6` and `M3D8` too soft). The converter writes those "
+                         "solids itself: per element and node a bottom and a top node held at the "
+                         "membrane node by `*EQUATION` (bottom + top = 2 × node), per corner node a "
+                         "mid-thickness node equal to it, per `C3D20R` one equation that holds its "
+                         "zero-energy hourglass; loads, faces and sets stay the membrane's "
+                         "(`validate_with_ccx.py quad_membrane_*`).\n")
         if cat == "plane stress":
             parts.append("ccx has no incompatible-mode plane element. `CPS4I` and `CPE4I` (the "
                          "latter on parallelograms: Abaqus adds a fifth, volumetric mode that acts "

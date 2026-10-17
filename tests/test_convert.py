@@ -7759,7 +7759,7 @@ def test_json_has_the_instances_and_the_run():
     # --run: what run_ccx returns lands under "run" and "results" (ccx itself: validate_with_ccx)
     seen = {}
 
-    def fake_run(out_path, override, quiet, digest, instances, model):
+    def fake_run(out_path, override, quiet, digest, instances, model, expanded=None):
         seen.update(digest=digest, instances=instances, model=model)
         return {"code": 0, "ccx": "ccx", "ccx_version": "2.23", "status": "solved",
                 "results": [{"step": 1, "time": 1.0}]}
@@ -8537,6 +8537,201 @@ def test_continuum_shell_stack_along_a_spherical_orientation():
     g = conv.geom
     assert {round(math.sqrt(sum(x * x for x in g.nodes[n])), 9) for n in g.nodes if n > 8} == {10.0}
     assert "STACK DIR" not in rep.text()
+
+
+QM8_STRIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n4, 1.5, 0., 0.\n5, 2., 0., 0.\n"
+             "6, 0., 0.5, 0.\n8, 1., 0.5, 0.\n10, 2., 0.5, 0.\n11, 0., 1., 0.\n12, 0.5, 1., 0.\n"
+             "13, 1., 1., 0.\n14, 1.5, 1., 0.\n15, 2., 1., 0.\n"
+             "*Element, type=M3D8R, elset=SKIN\n1, 1, 3, 13, 11, 2, 8, 12, 6\n2, 3, 5, 15, 13, 4, 10, 14, 8\n"
+             "*Nset, nset=LEFT\n1, 6, 11\n*Nset, nset=RIGHT\n5, 10, 15\n"
+             "*Material, name=M\n*Elastic\n100000., 0.3\n")
+QM_STEP = "*Step\n*Static\n*Boundary\nLEFT, 1, 3\n*Cload\nRIGHT, 1, 1.\n*End Step\n"
+
+
+def _all_equations(body):
+    """Every *EQUATION of a converted deck as a list of (node, DOF, coefficient) terms."""
+    lines, out, i = body.splitlines(), [], 0
+    while i < len(lines):
+        if lines[i] == "*EQUATION":
+            i += 1
+            while i < len(lines) and not lines[i].startswith("*"):
+                n, terms = int(lines[i]), []
+                i += 1
+                while len(terms) < n:
+                    f = [x.strip() for x in lines[i].split(",") if x.strip()]
+                    terms += [(int(f[k]), int(f[k + 1]), float(f[k + 2])) for k in range(0, len(f), 3)]
+                    i += 1
+                out.append(terms)
+        else:
+            i += 1
+    return out
+
+
+def test_quadratic_membranes_become_solids_held_at_their_nodes():
+    # ccx 2.23 leaves the mid-thickness node of a quadratic membrane's corner free in each
+    # element (M3D8R singular, M3D6 / M3D8 too soft; probed): the converter writes the
+    # C3D20R itself, with nodes of its own held at the membrane nodes by *EQUATION
+    body, conv, rep = convert_str(QM8_STRIP + "*Membrane Section, elset=SKIN, material=M\n0.01\n" + QM_STEP)
+    g = reparse(body)
+    assert [g.elements[e][0] for e in (1, 2)] == ["C3D20R", "C3D20R"] and not dangling_refs(g)
+    c1, c2 = g.elements[1][1], g.elements[2][1]
+    assert not set(c1 + c2) & set(range(1, 16))              # the membrane nodes are in no element
+    assert set(c1) & set(c2) == {c1[17], c1[18]} == {c2[16], c2[19]}   # mid nodes of corners 3, 13
+    assert g.nodes[c1[0]] == (0.0, 0.0, -0.005) and g.nodes[c1[4]] == (0.0, 0.0, 0.005)
+    assert g.nodes[c1[16]] == (0.0, 0.0, 0.0)
+    assert _card_at(body, "*SOLID SECTION, ELSET=SKIN, MATERIAL=M") == [] and "TYPE=M3D8R" not in body
+    eqs = _all_equations(body)
+    hinge = [e for e in eqs if len(e) == 3]
+    assert len(hinge) == 2 * 8 * 3 and (c1[0], 1, 1.0) == hinge[0][0] and hinge[0][2] == (1, 1, -2.0)
+    assert len([e for e in eqs if len(e) == 2]) == 6 * 3          # corners 1, 3, 5, 11, 13, 15
+    # one equation per C3D20R holds its fibres' zero-energy hourglass (the top / bottom nodes)
+    hg = [e for e in eqs if len(e) > 3]
+    assert len(hg) == 2 and all(t[0] in c1[:16] for t in hg[0]) and hg[0][0][0] in c1[4:8] + c1[12:16]
+    assert "Quadratic membranes: 2 element(s) (2 M3D8R -> C3D20R)" in rep.text() and not conv.reduced_physics
+    # M3D8 -> C3D20 and M3D6 -> C3D15: no hourglass equation
+    body, _, _ = convert_str((QM8_STRIP + "*Membrane Section, elset=SKIN, material=M\n0.01\n" + QM_STEP)
+                             .replace("M3D8R", "M3D8"))
+    assert "*ELEMENT, TYPE=C3D20\n" in body and max(len(e) for e in _all_equations(body)) == 3
+    tri = QM8_STRIP.replace("type=M3D8R, elset=SKIN\n1, 1, 3, 13, 11, 2, 8, 12, 6\n2, 3, 5, 15, 13, 4, 10, 14, 8",
+                            "type=M3D6, elset=SKIN\n1, 1, 3, 13, 2, 8, 7\n2, 1, 13, 11, 7, 12, 6")
+    tri = tri.replace("8, 1., 0.5, 0.\n", "7, 0.5, 0.5, 0.\n8, 1., 0.5, 0.\n")
+    body, _, _ = convert_str(tri + "*Membrane Section, elset=SKIN, material=M\n0.01\n")
+    g = reparse(body)
+    assert g.elements[1][0] == "C3D15" and len(g.elements[1][1]) == 15 and not dangling_refs(g)
+
+
+def test_quadratic_membrane_sections_loads_and_output():
+    # P on a membrane -> P1 as before (the solid has ccx's own expanded faces); a section on
+    # linear and quadratic membranes splits; *NODE FILE at the membrane nodes -> *NODE PRINT
+    lin = ("*Node\n21, 0., 3., 0.\n22, 1., 3., 0.\n23, 1., 4., 0.\n24, 0., 4., 0.\n"
+           "*Element, type=M3D4, elset=SKIN\n9, 21, 22, 23, 24\n")
+    body, conv, rep = convert_str(QM8_STRIP + lin + "*Membrane Section, elset=SKIN, material=M, density=2.\n0.01\n"
+                                  "*Step\n*Dynamic\n0.1, 1.\n*Boundary\nLEFT, 1, 3\n*Dload\nSKIN, P, 3.\n"
+                                  "*Node File, nset=RIGHT\nU\n*End Step\n")
+    assert _card_at(body, "*MEMBRANE SECTION, ELSET=SKIN_MEMBRANE, MATERIAL=M, DENSITY=2.") == ["0.01"]
+    assert _card_at(body, "*SOLID SECTION, ELSET=SKIN_SOLID, MATERIAL=M") == []
+    g = reparse(body)
+    assert g.elsets["SKIN_MEMBRANE"] == [9] and g.elsets["SKIN_SOLID"] == [1, 2] and g.elements[9][0] == "M3D4"
+    assert _card_at(body, "*DLOAD") == ["SKIN, P1, 3."]
+    assert _card_at(body, "*NODE PRINT, NSET=RIGHT") == ["U"]
+    assert "DENSITY= (mass per unit area" in rep.text() and any("DENSITY" in r for r in conv.reduced_physics)
+    # thickness from *NODAL THICKNESS
+    body, _, _ = convert_str(QM8_STRIP + "*Nodal Thickness\n1, 0.02\n2, 0.02\n3, 0.04\n4, 0.04\n5, 0.04\n6, 0.02\n"
+                             "8, 0.04\n10, 0.04\n11, 0.02\n12, 0.02\n13, 0.04\n14, 0.04\n15, 0.04\n"
+                             "*Membrane Section, elset=SKIN, material=M, nodal thickness\n")
+    g = reparse(body)
+    assert g.nodes[g.elements[1][1][4]] == (0.0, 0.0, 0.01) and g.nodes[g.elements[1][1][5]] == (1.0, 0.0, 0.02)
+    # no thickness: the element stays ccx's own membrane, warned as reduced physics
+    body, conv, rep = convert_str(QM8_STRIP + "*Membrane Section, elset=SKIN, material=M\n\n")
+    assert "*ELEMENT, TYPE=M3D8R" in body and "no positive thickness" in rep.text() and conv.reduced_physics
+
+
+def test_quadratic_membrane_axes_temperatures_and_transforms():
+    # the membrane axes path (_shell_axes_rows) carries over: ccx reads a solid's orientation
+    # unprojected as it reads a membrane's
+    strip = ("*Node\n1, 0., 0., 0.\n2, 0., 0.5, 0.\n3, 0., 1., 0.\n4, 0., 1., 0.5\n5, 0., 1., 1.\n"
+             "6, 0., 0.5, 1.\n7, 0., 0., 1.\n8, 0., 0., 0.5\n"
+             "*Element, type=M3D8R, elset=SKIN\n1, 1, 3, 5, 7, 2, 4, 6, 8\n" + COMPOSITE_MAT
+             + "*Membrane Section, elset=SKIN, material=CFRP\n0.1\n")
+    body, _, _ = convert_str(strip)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 0, 1, 0, -1, 0"]
+    assert _card_at(body, "*SOLID SECTION, ELSET=SKIN, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1") == []
+    # temperatures reach the solids' nodes
+    body, conv, _ = convert_str(QM8_STRIP + "*Nset, nset=ALL\nLEFT, RIGHT, 2, 3, 4, 8, 12, 13, 14\n"
+                                "*Membrane Section, elset=SKIN, material=M\n0.01\n"
+                                "*Initial Conditions, type=TEMPERATURE\nALL, 20.\n"
+                                "*Step\n*Static\n*Temperature\nALL, 120.\n*End Step\n")
+    new = sorted(conv._qmem_copies)
+    assert len(new) == 2 * 16 + 6 and set(_card_at(body, "*TEMPERATURE")[1:]) == {f"{m}, 120" for m in new}
+    # a *TRANSFORM on membrane nodes: the solids' nodes stay global, and each tie names the
+    # transformed node in one local direction (ccx expands each local term into global ones)
+    body, conv, _ = convert_str(QM8_STRIP + "*Transform, nset=RIGHT\n0.8, 0.6, 0., -0.6, 0.8, 0.\n"
+                                "*Membrane Section, elset=SKIN, material=M\n0.01\n" + QM_STEP)
+    assert body.count("*TRANSFORM") == 1
+    for eq in _all_equations(body):
+        named = [n for n, _, _ in eq if n in (5, 10, 15)]
+        assert len(named) == len(set(named)), eq
+    hinge5 = [eq for eq in _all_equations(body) if eq[-1][0] == 5 and eq[-1][2] == -2.0]
+    assert sorted(eq[-1][1] for eq in hinge5) == [1, 2, 3]          # bottom + top = 2 x node, local axes
+
+
+def test_tie_on_quadratic_membranes_ties_their_own_nodes():
+    # ccx would tie the solids' face nodes, which the converter's *EQUATIONs eliminate (it
+    # skips them: 'DOF ... is not active'); the slave becomes the membrane nodes Abaqus ties
+    block = ("*Node\n101, 0., 0., -0.5\n102, 1., 0., -0.5\n103, 1., 1., -0.5\n104, 0., 1., -0.5\n"
+             "105, 0., 0., -0.005\n106, 1., 0., -0.005\n107, 1., 1., -0.005\n108, 0., 1., -0.005\n"
+             "*Element, type=C3D8, elset=BLOCK\n101, 101, 102, 103, 104, 105, 106, 107, 108\n"
+             "*Solid Section, elset=BLOCK, material=M\n")
+    body, conv, rep = convert_str(QM8_STRIP + block + "*Membrane Section, elset=SKIN, material=M\n0.01\n"
+                                  "*Elset, elset=E1\n1\n*Surface, name=MS, type=ELEMENT\nE1, SNEG\n"
+                                  "*Surface, name=BS, type=ELEMENT\nBLOCK, S2\n"
+                                  "*Tie, name=T1, position tolerance=0.02\nMS, BS\n" + QM_STEP)
+    assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["1", "3", "13", "11", "2", "8", "12", "6"]
+    assert _card_at(body, "*TIE, NAME=T1") == ["MS_NODES, BS"] and "node surface MS_NODES" in rep.text()
+    assert not conv.reduced_physics
+
+
+def test_constraints_on_quadratic_membranes_take_their_own_nodes():
+    # a tied contact pair, a kinematic coupling and a rigid body ELSET: ccx would resolve them on
+    # the solids' nodes, which the converter's *EQUATIONs eliminate; Abaqus uses the membrane's
+    deck = (QM8_STRIP + "*Node\n100, 2.5, 0.5, 0.\n*Membrane Section, elset=SKIN, material=M\n0.01\n"
+            "*Elset, elset=E1\n1\n*Surface, name=MS, type=ELEMENT\nE1, SNEG\n")
+    block = ("*Node\n101, 0., 0., -0.5\n102, 1., 0., -0.5\n103, 1., 1., -0.5\n104, 0., 1., -0.5\n"
+             "105, 0., 0., -0.005\n106, 1., 0., -0.005\n107, 1., 1., -0.005\n108, 0., 1., -0.005\n"
+             "*Element, type=C3D8, elset=BLOCK\n101, 101, 102, 103, 104, 105, 106, 107, 108\n"
+             "*Solid Section, elset=BLOCK, material=M\n*Surface, name=BS, type=ELEMENT\nBLOCK, S2\n")
+    body, _, _ = convert_str(deck + block + "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, "
+                             "tied\nMS, BS\n" + QM_STEP)
+    assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["1", "3", "13", "11", "2", "8", "12", "6"]
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED") == ["MS_NODES, BS"]
+    body, _, _ = convert_str(deck + "*Coupling, constraint name=C, ref node=100, surface=MS\n*Kinematic\n" + QM_STEP)
+    assert "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=MS_NODES" in body
+    body, _, _ = convert_str(deck + "*Coupling, constraint name=C, ref node=100, surface=MS\n*Distributing\n"
+                             + QM_STEP)       # its surface nodes stay independent: the faces, area-weighted
+    assert "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=MS\n" in body
+    body, conv, rep = convert_str(deck + "*Elset, elset=E2\n2\n*Rigid Body, ref node=100, elset=E2\n" + QM_STEP)
+    assert _card_at(body, "*NSET, NSET=E2_NODES") == ["3, 5, 15, 13, 4, 10, 14, 8"]
+    assert "*RIGID BODY, REF NODE=100, NSET=E2_NODES" in body and not conv.reduced_physics
+
+
+def test_quadratic_membrane_output_distributions_and_shared_supports():
+    # a whole-model .frd request prints the membrane nodes, which are in no ccx element
+    body, conv, _ = convert_str(QM8_STRIP + "*Membrane Section, elset=SKIN, material=M\n0.01\n" + QM_STEP)
+    assert _card_at(body, "*NODE PRINT, NSET=ABQ2CCX_MEMBRANE_NODES") == ["U, RF"]
+    assert conv.geom.nsets["ABQ2CCX_MEMBRANE_NODES"] == sorted(range(1, 16)[:5]) + [6, 8, 10] + list(range(11, 16))
+    # a MEMBRANE THICKNESS distribution (and its table) is in the solids' geometry: no card,
+    # no reduced physics — also per instance of a part
+    dist = ("*Distribution Table, name=THT\nLENGTH\n*Distribution, name=TH, location=ELEMENT, table=THT\n"
+            ", 0.02\n1, 0.04\n*Membrane Section, elset=SKIN, material=M, membrane thickness=TH\n")
+    body, conv, _ = convert_str(QM8_STRIP + dist + QM_STEP)
+    g = reparse(body)
+    assert g.nodes[g.elements[1][1][0]] == (0.0, 0.0, -0.02) and g.nodes[g.elements[2][1][0]] == (1.0, 0.0, -0.01)
+    assert "*DISTRIBUTION" not in body.split("*HEADING")[-1] and not conv.reduced_physics
+    part = QM8_STRIP.split("*Material")[0].replace("*Nset, nset=LEFT\n1, 6, 11\n*Nset, nset=RIGHT\n5, 10, 15\n", "")
+    asm = ("*Part, name=P\n" + part + dist + "*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n"
+           "*End Instance\n*End Assembly\n*Material, name=M\n*Elastic\n100000., 0.3\n")
+    body, conv, rep = convert_str(asm)
+    assert "C3D20R" in body and "no positive thickness" not in rep.text() and not conv.reduced_physics
+    # a held node a truss shares: ccx's RF there leaves out the membrane's share (warned)
+    body, conv, rep = convert_str(QM8_STRIP + "*Element, type=T3D2, elset=CABLE\n50, 1, 11\n"
+                                  "*Solid Section, elset=CABLE, material=M\n0.01\n"
+                                  "*Membrane Section, elset=SKIN, material=M\n0.01\n" + QM_STEP)
+    assert "2 node(s) held by a *BOUNDARY belong to quadratic membranes" in rep.text()
+    assert not conv.reduced_physics
+
+
+def test_nine_node_membranes_lose_their_centre_node():
+    nine = (QM8_STRIP.replace("6, 0., 0.5, 0.\n", "6, 0., 0.5, 0.\n7, 0.5, 0.5, 0.\n")
+            .replace("10, 2., 0.5, 0.\n", "9, 1.5, 0.5, 0.\n10, 2., 0.5, 0.\n")
+            .replace("M3D8R, elset=SKIN\n1, 1, 3, 13, 11, 2, 8, 12, 6\n2, 3, 5, 15, 13, 4, 10, 14, 8",
+                     "M3D9R, elset=SKIN\n1, 1, 3, 13, 11, 2, 8, 12, 6, 7\n2, 3, 5, 15, 13, 4, 10, 14, 8, 9"))
+    body, conv, rep = convert_str(nine + "*Membrane Section, elset=SKIN, material=M\n0.01\n")
+    g = reparse(body)
+    assert g.elements[1][0] == "C3D20R" and 7 not in g.elements[1][1] and not dangling_refs(g)
+    centre = [eq for eq in _all_equations(body) if eq[0][0] == 7]
+    assert len(centre) == 3 and len(centre[0]) == 17
+    assert "M3D9R (9-node membrane) -> the 8-node serendipity solid" in rep.text()
+    assert any("M3D9R" in r for r in conv.reduced_physics)
 
 
 def test_composite_examples_match_the_validation_decks():

@@ -174,11 +174,13 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | `M3D3` | 3 | direct |
 | `M3D4` | 4 | direct |
 | `M3D4R` | 4 | direct |
-| `M3D6` | 6 | direct |
-| `M3D8` | 8 | direct |
-| `M3D8R` | 8 | direct |
-| `M3D9` | 9 | passed through (verify) |
-| `M3D9R` | 9 | passed through (verify) |
+| `M3D6` | 6 | → `C3D15` on nodes of its own, held at the membrane's nodes (exact) |
+| `M3D8` | 8 | → `C3D20` on nodes of its own, held at the membrane's nodes (exact) |
+| `M3D8R` | 8 | → `C3D20R` on nodes of its own, held at the membrane's nodes (exact) |
+| `M3D9` | 9 | → `C3D20` on nodes of its own, held at the membrane's nodes without its centre node (reduced physics) |
+| `M3D9R` | 9 | → `C3D20R` on nodes of its own, held at the membrane's nodes without its centre node (reduced physics) |
+
+ccx 2.23 expands every membrane element into a solid on nodes of its own and leaves the mid-thickness node of a quadratic element's corners free (`M3D8R` singular, `M3D6` and `M3D8` too soft). The converter writes those solids itself: per element and node a bottom and a top node held at the membrane node by `*EQUATION` (bottom + top = 2 × node), per corner node a mid-thickness node equal to it, per `C3D20R` one equation that holds its zero-energy hourglass; loads, faces and sets stay the membrane's (`validate_with_ccx.py quad_membrane_*`).
 
 ## other
 

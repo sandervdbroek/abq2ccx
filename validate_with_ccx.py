@@ -25,7 +25,8 @@ one orientation per element, the material axes of plain shells, membranes and co
 shells whose orientation leaves their plane or has no rotation line (the ply's stiffness at
 Abaqus' direction), of hoop-wound S4 and SC8R cylinders (thin-wall theory) and of a
 fibre-steered strip whose distribution axes leave the
-plate (the same strip with them in it), a clamped beam and plate after a later step's *BOUNDARY,
+plate (the same strip with them in it), quadratic membranes (strips in tension, also under NLGEOM, and
+a pressurized sphere) against uniaxial stress and thin-wall theory, a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, the thermal strains of isotropic materials with an orthotropic / anisotropic
 expansion (including the engineering shear coefficients of an anisotropic one), a heated
 cube and circular-section beam with no initial temperatures, and the loads ccx has no card
@@ -970,16 +971,43 @@ def abaqus_shell_direction(normal, ori=None):
     return _unit(tuple(x - _dot(v, normal) * c for x, c in zip(v, normal)))
 
 
+def sheet_mesh(typ, nx, ny, lx=1.0, ly=1.0):
+    """(nodes {id: (x, y)}, elements [nodes]) of an lx x ly rectangle of nx x ny cells: 4-node
+    quadrilaterals, 8-node ones (M3D8R, M3D8; M3D9 / M3D9R with their centre node) or two 6-node
+    triangles per cell (M3D6), node ids row by row on the grid of corner and midside points."""
+    quad8, tri6 = typ in ("M3D8R", "M3D8", "M3D9R", "M3D9"), typ == "M3D6"
+    mx, my = (2 * nx, 2 * ny) if quad8 or tri6 else (nx, ny)
+    nid = lambda i, j: 1 + i + (mx + 1) * j      # noqa: E731
+    elems = []
+    for b in range(ny):
+        for a in range(nx):
+            i, j = 2 * a, 2 * b
+            if quad8:
+                elems.append([nid(i, j), nid(i + 2, j), nid(i + 2, j + 2), nid(i, j + 2), nid(i + 1, j),
+                              nid(i + 2, j + 1), nid(i + 1, j + 2), nid(i, j + 1)]
+                             + ([nid(i + 1, j + 1)] if typ in ("M3D9R", "M3D9") else []))
+            elif tri6:
+                elems += [[nid(i, j), nid(i + 2, j), nid(i + 2, j + 2), nid(i + 1, j), nid(i + 2, j + 1),
+                           nid(i + 1, j + 1)],
+                          [nid(i, j), nid(i + 2, j + 2), nid(i, j + 2), nid(i + 1, j + 1), nid(i + 1, j + 2),
+                           nid(i, j + 1)]]
+            else:
+                elems.append([nid(a, b), nid(a + 1, b), nid(a + 1, b + 1), nid(a, b + 1)])
+    used = sorted({x for c in elems for x in c})
+    return {k: (lx * ((k - 1) % (mx + 1)) / mx, ly * ((k - 1) // (mx + 1)) / my) for k in used}, elems
+
+
 def shell_axes_inplane_deck(kind="s4r", plane="XY", orient=True, n=2):
     """A 1 x 1 patch of an orthotropic ply 0.1 thick (INPLANE_PLY): a plain *SHELL SECTION on
-    S4R shells or a *MEMBRANE SECTION on M3D4 membranes, with the orientation TILTED_AXES (or
-    the dict ``orient``, or none), in the x-y, x-z or y-z plane (plate_place, the orientation
-    turned with the patch),
-    under composite_inplane_deck's three uniform strains, every node's displacement given:
-    the edge reactions are t Qbar(theta) of the ply at Abaqus' direction theta."""
+    S4R shells or a *MEMBRANE SECTION on M3D4, M3D8R or M3D6 membranes, with the orientation
+    TILTED_AXES (or the dict ``orient``, or none), in the x-y, x-z or y-z plane (plate_place,
+    the orientation turned with the patch), under composite_inplane_deck's three uniform
+    strains, every node's displacement given: the edge reactions are t Qbar(theta) of the ply
+    at Abaqus' direction theta."""
     eps, place = 1e-3, plate_place(plane)
-    nid = lambda i, j: 1 + i + (n + 1) * j      # noqa: E731
-    typ, card = {"s4r": ("S4R", "*Shell Section"), "m3d4": ("M3D4", "*Membrane Section")}[kind]
+    typ, card = {"s4r": ("S4R", "*Shell Section"), "m3d4": ("M3D4", "*Membrane Section"),
+                 "m3d8r": ("M3D8R", "*Membrane Section"), "m3d6": ("M3D6", "*Membrane Section")}[kind]
+    grid, elems = sheet_mesh(typ, n, n)
     lines = ["*Heading",
              f"In-plane stiffness of an orthotropic ply, plain {typ} {card[1:].lower()} in the "
              f"{plane} plane: three uniform strain states",
@@ -987,15 +1015,12 @@ def shell_axes_inplane_deck(kind="s4r", plane="XY", orient=True, n=2):
              "gamma_xy = 1e-3 of the plate, one step each),",
              "** so the reactions on the edges x = 1 and y = 1 are the ply's t Qbar times 1e-3 at "
              "Abaqus' material direction.", "*Node"]
-    for j in range(n + 1):
-        for i in range(n + 1):
-            lines.append(f"{nid(i, j)}, " + ", ".join(f"{c:.12g}" for c in place((i / n, j / n, 0.0))))
+    for k, (x, y) in grid.items():
+        lines.append(f"{k}, " + ", ".join(f"{c:.12g}" for c in place((x, y, 0.0))))
     lines.append(f"*Element, type={typ}, elset=PATCH")
-    for j in range(n):
-        for i in range(n):
-            lines.append(f"{1 + i + n * j}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}")
-    lines += ["*Nset, nset=XEDGE"] + _ids([nid(n, j) for j in range(n + 1)])
-    lines += ["*Nset, nset=YEDGE"] + _ids([nid(i, n) for i in range(n + 1)])
+    lines += [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+    lines += ["*Nset, nset=XEDGE"] + _ids([k for k, (x, y) in grid.items() if x == 1.0])
+    lines += ["*Nset, nset=YEDGE"] + _ids([k for k, (x, y) in grid.items() if y == 1.0])
     e1, e2, e3, n12, n13, n23, g12, g13, g23 = INPLANE_PLY
     lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
               f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}"]
@@ -1010,12 +1035,75 @@ def shell_axes_inplane_deck(kind="s4r", plane="XY", orient=True, n=2):
     for name, field in (("eps_x", lambda x, y: (eps * x, 0.0)), ("eps_y", lambda x, y: (0.0, eps * y)),
                         ("gamma_xy", lambda x, y: (eps / 2 * y, eps / 2 * x))):
         lines += [f"*Step, name={name}", "*Static", "*Boundary, op=NEW"]
-        for j in range(n + 1):
-            for i in range(n + 1):
-                u = place((*field(i / n, j / n), 0.0))
-                lines += [f"{nid(i, j)}, {d}, {d}, {u[d - 1]:.12g}" for d in (1, 2, 3)]
+        for k, (x, y) in grid.items():
+            u = place((*field(x, y), 0.0))
+            lines += [f"{k}, {d}, {d}, {u[d - 1]:.12g}" for d in (1, 2, 3)]
         lines += ["*Node print, nset=XEDGE, totals=ONLY", "RF", "*Node print, nset=YEDGE, totals=ONLY",
                   "RF", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def quad_membrane_strip_deck(typ, t=0.1, nx=4, ny=2, stretch=None):
+    """A 2 x 1 strip of membranes ``typ`` (E t = 1000, thickness t; nu 0.3) held in x on x = 0,
+    in y at (2, 0), in z everywhere, its edge x = 2 pulled by the consistent nodal forces of a
+    traction 1 per unit length: uniaxial stress, u_x(2) = 2e-3 and u_y(y = 1) = -0.3e-3.  With
+    ``stretch`` lam (nu 0, NLGEOM) the dead load per unit length is E t lam (lam^2 - 1) / 2, a
+    St. Venant-Kirchhoff bar's at that stretch: u_x(2) = 2 (lam - 1)."""
+    grid, elems = sheet_mesh(typ, nx, ny, 2.0, 1.0)
+    nu, q = (0.3, 1.0) if stretch is None else (0.0, 1000.0 * stretch * (stretch ** 2 - 1) / 2)
+    lines = ["*Heading", f"A {typ} strip in uniaxial tension" + (" (NLGEOM)" if stretch else ""), "*Node"]
+    lines += [f"{k}, {x:.12g}, {y:.12g}, 0." for k, (x, y) in grid.items()]
+    lines.append(f"*Element, type={typ}, elset=STRIP")
+    lines += [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+    edge = sorted((y, k) for k, (x, y) in grid.items() if x == 2.0)
+    lines += ["*Nset, nset=ALL"] + _ids(list(grid))
+    lines += ["*Nset, nset=LEFT"] + _ids([k for k, (x, y) in grid.items() if x == 0.0])
+    lines += ["*Nset, nset=PROBE", str(edge[-1][1])]
+    lines += ["*Material, name=M", "*Elastic", f"{1000.0 / t:.12g}, {nu}",
+              "*Membrane Section, elset=STRIP, material=M", f"{t:g}",
+              "*Step" + (", nlgeom, inc=100" if stretch else ""), "*Static"] + (["0.1, 1."] if stretch else [])
+    lines += ["*Boundary", "LEFT, 1, 1", f"{edge[0][1]}, 2, 2", "ALL, 3, 3", "*Cload"]
+    quad = typ != "M3D4"
+    step = 2 if quad else 1
+    force = {}
+    for i in range(0, len(edge) - 1, step):              # consistent forces, edge by edge
+        h = edge[i + step][0] - edge[i][0]
+        for k, w in zip([edge[i + m][1] for m in range(step + 1)], (1 / 6, 2 / 3, 1 / 6) if quad else (0.5, 0.5)):
+            force[k] = force.get(k, 0.0) + w * h * q
+    lines += [f"{k}, 1, {f:.12g}" for k, f in force.items()]
+    lines += ["*Node print, nset=PROBE", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def membrane_sphere_deck(typ, n=16, t=0.01, p=1.0):
+    """An octant of a sphere (radius 1, membranes ``typ`` of thickness t, E 1e5, nu 0.3) meshed
+    by projecting three faces of a cube onto it, n x n cells each, symmetry on the coordinate
+    planes, internal pressure p (*DLOAD P along the outward normal): thin-wall theory gives the
+    radial displacement p (1 - nu) / (2 E t)."""
+    grid, elems = sheet_mesh(typ, n, n)
+    ids, nodes, conn = {}, [], []
+    for k in range(3):                                   # the faces x = 1, y = 1, z = 1
+        local = {}
+        for g, (s_, t_) in grid.items():
+            pt = [0.0, 0.0, 0.0]
+            pt[k], pt[(k + 1) % 3], pt[(k + 2) % 3] = 1.0, s_, t_
+            r = math.sqrt(sum(c * c for c in pt))
+            key = tuple(round(c / r, 9) for c in pt)
+            if key not in ids:
+                ids[key] = len(ids) + 1
+                nodes.append((ids[key], tuple(c / r for c in pt)))
+            local[g] = ids[key]
+        conn += [[local[g] for g in c] for c in elems]
+    lines = ["*Heading", f"A sphere octant of {typ} membranes under internal pressure", "*Node"]
+    lines += [f"{k}, {x:.12g}, {y:.12g}, {z:.12g}" for k, (x, y, z) in nodes]
+    lines.append(f"*Element, type={typ}, elset=SPHERE")
+    lines += [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(conn, 1)]
+    lines += ["*Nset, nset=ALL"] + _ids([k for k, _ in nodes])
+    for d in range(3):
+        lines += [f"*Nset, nset=SYM{d + 1}"] + _ids([k for k, x in nodes if abs(x[d]) < 1e-9])
+    lines += ["*Material, name=M", "*Elastic", "100000., 0.3", "*Membrane Section, elset=SPHERE, material=M",
+              f"{t:g}", "*Step", "*Static", "*Boundary", "SYM1, 1, 1", "SYM2, 2, 2", "SYM3, 3, 3",
+              "*Dload", f"SPHERE, P, {p:g}", "*Node print, nset=ALL", "U", "*End Step"]
     return "\n".join(lines) + "\n"
 
 
@@ -3396,7 +3484,8 @@ def main():
     # the global ones); abq2ccx gives such sections Abaqus' directions element by element.
     for kind, plane, orient in (("s4r", "XY", True), ("s4r", "XZ", True), ("s4r", "YZ", True),
                                 ("m3d4", "XZ", True), ("m3d4", "YZ", True), ("m3d4", "YZ", False),
-                                ("s4r", "XY", PLATE_AXES), ("m3d4", "XZ", PLATE_AXES)):
+                                ("s4r", "XY", PLATE_AXES), ("m3d4", "XZ", PLATE_AXES),
+                                ("m3d8r", "YZ", True), ("m3d6", "XZ", True)):
         tag = f"shell_axes_{kind}_{plane}" + ("" if orient is True else "_norot" if orient else "_default")
         res = composite_run(shell_axes_inplane_deck(kind, plane, orient), tag)
         if res is None:
@@ -3493,6 +3582,43 @@ def main():
               f"{'[0/90/0] plies' if composite else 'one layer'}, STACK DIRECTION=ORIENTATION with a "
               f"cylindrical *ORIENTATION without a rotation line, axial strain): axial force {got:.6g} vs "
               f"the radially stacked wall's membrane stiffness {want:.6g} ({err:.1e} apart)")
+        failures += 0 if ok else 1
+    # --- quadratic membranes: ccx 2.23 expands each element on nodes of its own and leaves the
+    # mid-thickness node of its corners free (M3D8R singular, M3D6 / M3D8 too soft); abq2ccx
+    # writes the solids itself, held at the membrane nodes by *EQUATION
+    for typ in ("M3D8R", "M3D8", "M3D6", "M3D9R"):
+        for stretch in (None, 1.2):
+            tag = f"quad_membrane_{typ.lower()}" + ("_nlgeom" if stretch else "")
+            text = quad_membrane_strip_deck(typ, stretch=stretch)
+            res = composite_run(text, tag)
+            u = res[0].get(int(text.split("*Nset, nset=PROBE\n")[1].split("\n")[0])) if res else None
+            if u is None:
+                if res is not None:                # solved, but without the probe node
+                    print(f"FAIL  {tag}: no displacement at the probe node")
+                failures += 1
+                continue
+            want = (2e-3, -0.3e-3) if stretch is None else (2 * (stretch - 1), 0.0)
+            err = max(abs(u[0] / want[0] - 1), abs(u[1] - want[1]) / abs(want[0]))
+            ok = err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (strip of {typ}, thickness 0.1, uniaxial tension"
+                  + (f", NLGEOM, stretch {stretch}" if stretch else "") + f"): end displacement "
+                  f"{u[0]:.7g}, {u[1]:.4g} vs {want[0]:g}, {want[1]:g}"
+                  + (" (St. Venant-Kirchhoff)" if stretch else "") + f", max difference {err:.1e}")
+            failures += 0 if ok else 1
+    for typ in ("M3D8R", "M3D6"):
+        t = 0.01
+        res = composite_run(membrane_sphere_deck(typ, 16, t), f"quad_membrane_sphere_{typ.lower()}")
+        if res is None:
+            failures += 1
+            continue
+        want = 0.7 / (2 * 1e5 * t)
+        ur = [math.sqrt(sum(c * c for c in v)) for v in res[0].values()]
+        err = max(abs(x / want - 1) for x in ur)
+        ok = err < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  quad_membrane_sphere_{typ.lower()} (sphere octant of {typ}, "
+              f"t/R {t:g}, internal pressure): radial displacement {min(ur):.5g} .. {max(ur):.5g} vs "
+              f"thin-wall theory {want:.5g}, max difference {err * 100:.2f}% (within t/R: ccx loads "
+              f"the inner face of its expanded shells and membranes)")
         failures += 0 if ok else 1
     ref = None
     for plane, tilt in (("XY", 0.0), ("XY", 30.0), ("XZ", 30.0), ("YZ", 30.0)):
