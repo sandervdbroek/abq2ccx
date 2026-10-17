@@ -13099,7 +13099,6 @@ class Converter:
                 typ = self.geom.elements[e][0].upper()
                 kinds[typ] = kinds.get(typ, 0) + 1
             self._u1_cards[id(b)] = plan["cards"]
-        self._elem_types.add("U1")
         inertia = any(b.keyword in self._INERTIA_PROCEDURES for b in blocks)
         shear = [t for t in kinds if t.rstrip("H") not in U1_EULER_BERNOULLI]
         counts = ", ".join(f"{t}: {n}" for t, n in kinds.items())

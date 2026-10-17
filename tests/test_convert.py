@@ -1806,6 +1806,14 @@ def test_u1_planar_ibeam():
     assert "*ELEMENT, TYPE=U1" in body and any("mass" in r for r in conv.reduced_physics)
 
 
+def test_u1_beam_nodes_have_no_dofs_7_to_9():
+    # U1 has DOFs 1-6 (MAXDOF=6): BCs on 7-9 go as on the beams it replaces (ccx stops on
+    # 7 and 9, and reads 8 as the rotation about x)
+    body, _, _ = convert_str(U1_PLANAR + "*Boundary\nTIP, 7, 9\n" + U1_STEP)
+    assert "*ELEMENT, TYPE=U1" in body
+    assert not any(l.replace(" ", "").startswith(("TIP,7", "TIP,8", "TIP,9")) for l in _live(body))
+
+
 def test_u1_general_section_exact_torsion():
     # a general section in space: J = 0.9 (I11 + I22), so a copy of the material with
     # nu' = (1 + nu) / 0.9 - 1 makes U1's torsion G (I11 + I22) the section's G J
