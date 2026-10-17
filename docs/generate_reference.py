@@ -84,9 +84,11 @@ TRANSLATED = {
         "`SECTION=PIPE` (outer radius, wall thickness) and `BOX` (`a, b, t1..t4`) data pass through, "
         "as both codes read them alike, and `THICK PIPE` → `PIPE`; ccx 2.23 runs these sections only "
         "on `B32R`, so their beams become `B32R` (2-node ones with an inserted midside node; see the "
-        "element reference). `SECTION=I` (doubly symmetric, the node at its centroid) runs as ccx's "
-        "`U1` beam where the deck allows it (see `*BEAM GENERAL SECTION`); otherwise it is commented "
-        "out, and under `--approximate` becomes the `RECT` of equal area and strong-axis inertia.",
+        "element reference). `SECTION=I` (a T with one flange zero) with the node at its centroid "
+        "runs as ccx's `U1` beam where the deck allows it (see `*BEAM GENERAL SECTION`): the "
+        "properties of Abaqus' own general-section form of the profile (three rectangles; the "
+        "open thin-walled J with the web between the flanges). Otherwise it is commented out, and "
+        "under `--approximate` becomes the `RECT` of equal area and strong-axis inertia.",
     "*BEAM GENERAL SECTION": "`SECTION=GENERAL` (A, I11, I12, I22, J; n1; E, G) → ccx 2.23's 2-node "
         "beam `U1` (`*USER ELEMENT`, `*BEAM SECTION, SECTION=GENERAL`) with a material from E, G and "
         "`DENSITY`: the principal second moments, n1 turned onto the first principal axis and "
@@ -94,12 +96,13 @@ TRANSLATED = {
         "Euler–Bernoulli beam (its shear term is wrong in 2.23) and a Poisson's ratio that sets its "
         "torsion G (I11 + I22) to G J. `U1` runs only in a linear elastic, isothermal deck without "
         "elements ccx expands, constraints on beam nodes, NLGEOM, `*BUCKLE` or `*DYNAMIC`; there, and "
-        "in space where no Poisson's ratio below 0.5 gives G J (unless `--approximate`; a 2-D model "
-        "holds DOFs 3–5 instead), the card is commented out with the reason. Line loads and gravity "
+        "in space where no Poisson's ratio below 0.5 gives G J or the shear centre lies off the "
+        "centroid (unless `--approximate`; a 2-D model has no torsion and holds DOFs 3–5), the card "
+        "is commented out with the reason. Line loads and gravity "
         "on `U1` become nodal forces with consistent end moments; RF at `U1` nodes is wrong in ccx "
-        "2.23 (warned). `*CENTROID` / `*SHEAR CENTER` off the axis keep the beams off `U1`; after a "
-        "`U1` section they and `*TRANSVERSE SHEAR STIFFNESS`, `*SECTION POINTS` are commented out "
-        "with a note.",
+        "2.23 (warned). `*CENTROID` and `*BEAM SECTION OFFSET` off the axis and `TAPER` keep the "
+        "beams off `U1`; after a `U1` section `*CENTROID`, `*SHEAR CENTER`, `*TRANSVERSE SHEAR "
+        "STIFFNESS` and `*SECTION POINTS` are commented out with a note.",
     "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept (dropped on explicit "
         "steps, which Abaqus/Explicit runs without it); `PERTURBATION` kept only for "
         "`*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then persist); "

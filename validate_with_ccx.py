@@ -7,8 +7,9 @@ bundled with FreeCAD) and checks results against reference values: the NAFEMS LE
 stress (also with the pressure carried by surface elements, which ccx does not have),
 the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, beams under a general or an I section run as ccx's U1 element (cantilevers about
-both axes with I12 nonzero, their twist and frequencies, an I-section portal frame under
-gravity and line loads) against beam theory and a direct-stiffness frame solution, a shell plate rigidly coupled to a loaded reference point against the same plate
+both axes with I12 nonzero, their twist and frequencies, the unsymmetric I cantilever of
+Abaqus' Verification Guide, an I-section portal frame under gravity and line loads) against
+beam theory, Abaqus' reference values and a direct-stiffness frame solution, a shell plate rigidly coupled to a loaded reference point against the same plate
 built from solids, coupled bars whose coupled nodes also carry BCs against the same
 constraints written without a coupling, a bar whose rigid end cap carries BCs on its nodes
 against the same BCs written on its reference point, circular-section beams with a held
@@ -289,10 +290,11 @@ def frame2d(nodes, elems, fixed, loads, udl=()):
 
 def i_profile(h, b, tf, tw):
     """Area, strong-axis and weak-axis second moments and the thin-walled torsion constant
-    of a doubly symmetric I profile (the flanges b x tf, the web tw between them)."""
+    of a doubly symmetric I profile (the flanges b x tf, the web tw between them, as Abaqus
+    takes it for J too)."""
     hw = h - 2 * tf
     return (2 * b * tf + hw * tw, (b * h ** 3 - (b - tw) * hw ** 3) / 12,
-            (2 * tf * b ** 3 + hw * tw ** 3) / 12, (2 * b * tf ** 3 + (h - tf) * tw ** 3) / 3)
+            (2 * tf * b ** 3 + hw * tw ** 3) / 12, (2 * b * tf ** 3 + hw * tw ** 3) / 3)
 
 
 def hinge_bodies_reference():
@@ -836,7 +838,7 @@ def main():
         failures += 0 if ok_static and ok_freq else 1
 
     # An I-section B31 cantilever in space, with --approximate: U1's torsion stiffness is
-    # G (I11 + I22), 381 times G J here, which no Poisson's ratio ccx accepts brings down —
+    # G (I11 + I22), 385 times G J here, which no Poisson's ratio ccx accepts brings down —
     # both bending axes exact against beam theory, the twist U1's.  The same deck with a
     # clamped, unloaded stub beam beside it keeps U1 out (ccx stops on U1 beside any element
     # it expands), so --approximate falls back to the RECT of equal area and strong-axis
@@ -885,6 +887,30 @@ def main():
               f"{1.0e4 * length / (g_mod * tj):.4g} ([APPROX]); the RECT gives strong / weak "
               f"{rect['u_y']:.4g} / {rect['u_z']:.4g} ({(rect['u_y'] / ref['u_y'] - 1) * 100:+.1f} % / "
               f"{(rect['u_z'] / ref['u_z'] - 1) * 100:+.0f} %), f1 {frect[0]:.2f} Hz")
+        failures += 0 if ok else 1
+
+    # The cantilever of Abaqus' Verification Guide ("Verification of beam elements and section
+    # types", eb2jidsd) with its unsymmetric I-section, as planar cubic beams: the tip
+    # deflection and rotation against the guide's reference values and P L^3 / 3 E I11 with
+    # the I11 of Abaqus' own general-section form of the profile (eb32gisd: 1.312095).
+    inp = os.path.join(tmp, "u1_unsym.inp")
+    convert(os.path.join(EXAMPLES, "beam_u1_unsymmetric_i.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    blocks = dat_node_blocks(os.path.join(d, "job.dat"))
+    shutil.rmtree(d, ignore_errors=True)
+    tip = blocks[-1].get(11) if status == "solved" and blocks else None
+    if tip is None:
+        print(f"FAIL  beam_u1_unsymmetric_i: no tip displacement ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        u2, phi3 = tip[1], tip[5]
+        exact = (25.0 * 75.0 ** 3 / (3 * 3.0e6 * 1.312095), 25.0 * 75.0 ** 2 / (2 * 3.0e6 * 1.312095))
+        ok = (abs(u2 - exact[0]) <= 1e-5 * exact[0] and abs(phi3 - exact[1]) <= 1e-5 * exact[1] and
+              abs(u2 - 0.8931) <= 5e-5 and abs(phi3 - 1.786e-2) <= 5e-6)
+        print(f"{'PASS' if ok else 'FAIL'}  beam_u1_unsymmetric_i (B23 + an unsymmetric SECTION=I as U1): "
+              f"u2 = {u2:.6g}, phi3 = {phi3:.6g} (Abaqus Verification Guide 0.8931, 1.786e-2; "
+              f"P L^3 / 3 E I11 = {exact[0]:.6g}, P L^2 / 2 E I11 = {exact[1]:.6g})")
         failures += 0 if ok else 1
 
     # A planar portal frame of I-sections (B23 -> U1, exact Euler-Bernoulli beams) with fixed

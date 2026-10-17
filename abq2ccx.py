@@ -423,15 +423,14 @@ U1_MATERIAL_CARDS = {"MATERIAL", "ELASTIC", "DENSITY", "EXPANSION", "DAMPING", "
                      "SPECIFIC HEAT"}
 U1_NONLINEAR_CARDS = {"ANISOTROPIC HYPERELASTIC", "LOW DENSITY FOAM", "VISCOUS", "HYSTERESIS",
                       "EOS", "TENSILE FAILURE", "SHEAR FAILURE", "GASKET THICKNESS BEHAVIOR"}
-# Abaqus' I12 is the integral of x1 x2 over the section (*BEAM GENERAL SECTION)
-ABAQUS_I12_SIGN = 1.0
 
 
 @dataclass
 class BeamSection:
     """A beam cross-section's properties in the axes of its profile (x1 along n1, x2 along
     n2): area, i11 = integral of x2^2, i12 = integral of x1 x2, i22 = integral of x1^2 (about
-    the centroid), torsion constant j, and the centroid (c1, c2) relative to the beam node."""
+    the centroid), torsion constant j, and the centroid (c1, c2) and shear centre (s1, s2)
+    relative to the beam node."""
     area: float
     i11: float
     i12: float
@@ -439,29 +438,36 @@ class BeamSection:
     j: float
     c1: float = 0.0
     c2: float = 0.0
+    s1: float = 0.0
+    s2: float = 0.0
 
 
 def i_section(l: float, h: float, b1: float, b2: float, t1: float, t2: float,
               t3: float) -> Union[BeamSection, str]:
     """Abaqus' I profile (*BEAM SECTION, SECTION=I: l, h, b1, b2, t1, t2, t3): the bottom
-    flange b1 x t1, the top flange b2 x t2, both centred on the web of thickness t3 between
-    them; the beam node lies l above the bottom face.  Three rectangles; the torsion constant
-    of the thin-walled open section, sum of b t^3 / 3 (web between the flange midlines).
-    Only a doubly symmetric profile is converted (which flange is b1 does not matter there);
-    the reason otherwise."""
-    if min(h, b1, b2, t1, t2, t3) <= 0 or h - t1 - t2 <= 0:
-        return "the I profile's dimensions are not positive, or its flanges overlap"
-    tol = 1e-9 * max(h, b1, b2)
-    if abs(b1 - b2) > tol or abs(t1 - t2) > tol:
-        return "the I profile is not doubly symmetric (flanges differ)"
+    flange b1 x t1 and the top flange b2 x t2 centred on the web of thickness t3 between them,
+    the beam node l above the bottom face; one flange zero is a T.  Abaqus' own general-section
+    form of its verification I profile (Verification Guide, "Verification of beam elements and
+    section types": eb32idsd, eb32gisd) has these values: three rectangles (A, I11, I22) and
+    the open thin-walled torsion constant, sum of b t^3 / 3, with the web between the flanges;
+    the shear centre is the thin-walled one, on the web at the flanges' I22-weighted midline
+    position.  The reason when the dimensions make no I or T."""
+    tee = (b1 == 0.0 and t1 == 0.0) or (b2 == 0.0 and t2 == 0.0)
+    if min(h, t3) <= 0 or min(b1, b2, t1, t2) < 0 or h - t1 - t2 <= 0 or \
+            (not tee and min(b1, b2, t1, t2) <= 0):
+        return "the I profile's dimensions make no I or T (nonpositive, or the flanges overlap)"
     hw = h - t1 - t2
     rects = [(b1, t1, t1 / 2.0), (b2, t2, h - t2 / 2.0), (t3, hw, t1 + hw / 2.0)]  # w, d, y
     area = sum(w * d for w, d, _ in rects)
     ybar = sum(w * d * y for w, d, y in rects) / area
     i11 = sum(w * d ** 3 / 12.0 + w * d * (y - ybar) ** 2 for w, d, y in rects)
     i22 = sum(d * w ** 3 / 12.0 for w, d, _ in rects)
-    j = (b1 * t1 ** 3 + b2 * t2 ** 3 + (h - (t1 + t2) / 2.0) * t3 ** 3) / 3.0
-    return BeamSection(area, i11, 0.0, i22, j, 0.0, ybar - l)
+    j = (b1 * t1 ** 3 + b2 * t2 ** 3 + hw * t3 ** 3) / 3.0
+    f1, f2 = t1 * b1 ** 3, t2 * b2 ** 3
+    if f1 + f2 == 0.0:
+        return "the I profile has no flange"
+    ys = t1 / 2.0 + (h - t1 / 2.0 - t2 / 2.0) * f2 / (f1 + f2)
+    return BeamSection(area, i11, 0.0, i22, j, 0.0, ybar - l, 0.0, ys - l)
 
 
 def beam_section_properties(section: str, recs: List[List[str]]) -> Union[BeamSection, str]:
@@ -490,12 +496,13 @@ def beam_section_properties(section: str, recs: List[List[str]]) -> Union[BeamSe
 def principal_section(p: BeamSection) -> Tuple[float, float, float]:
     """(alpha, ia, ib): the angle that turns n1 towards n2 onto a principal axis of section
     ``p`` and its second moments there, ia = integral of x1'^2 (resisting a displacement
-    along the turned n1, U1's I1) and ib = integral of x2'^2 (U1's I2)."""
-    prod = ABAQUS_I12_SIGN * p.i12
-    alpha = 0.5 * math.atan2(2.0 * prod, p.i22 - p.i11) if prod else 0.0
+    along the turned n1, U1's I1) and ib = integral of x2'^2 (U1's I2).  Abaqus' I12 is the
+    integral of (x1 - x1c)(x2 - x2c) (Analysis User's Guide, "Beam section behavior"; its
+    M1 = E (I11 k1 - I12 k2) for the strain ec + k1 x2 - k2 x1)."""
+    alpha = 0.5 * math.atan2(2.0 * p.i12, p.i22 - p.i11) if p.i12 else 0.0
     c, s = math.cos(alpha), math.sin(alpha)
-    ia = c * c * p.i22 + 2.0 * c * s * prod + s * s * p.i11
-    ib = s * s * p.i22 - 2.0 * c * s * prod + c * c * p.i11
+    ia = c * c * p.i22 + 2.0 * c * s * p.i12 + s * s * p.i11
+    ib = s * s * p.i22 - 2.0 * c * s * p.i12 + c * c * p.i11
     return alpha, ia, ib
 
 MAX_ENTRIES_PER_LINE = 16  # CalculiX hard limit for entries on a data line
@@ -13535,9 +13542,9 @@ class Converter:
         label = self._u1_label(b)
         sec = self._u1_section(b) or ""
         recs = [[x.strip() for x in r] for r in merged_data_records(b)]
-        for k in ("OFFSET1", "OFFSET2", "ORIENTATION", "DEPENDENCIES"):
-            if b.param(k):
-                return f"{label} has {k}=, which U1 cannot take"
+        for k in ("OFFSET1", "OFFSET2", "ORIENTATION", "DEPENDENCIES", "TAPER"):
+            if b.has(k):
+                return f"{label} has {k}, which U1 cannot take"
         p = beam_section_properties(sec, recs)
         if isinstance(p, str):
             return f"{label}: {p}"
@@ -13547,16 +13554,22 @@ class Converter:
             return f"{label}: I22 and J must be positive, and I12^2 < I11 I22"
         size = math.sqrt(p.area)
         for nb in blocks:              # (a flattened part keeps them apart from their section)
-            if nb.keyword in ("CENTROID", "SHEAR CENTER"):
+            if nb.keyword in ("CENTROID", "SHEAR CENTER", "BEAM SECTION OFFSET"):
                 try:
-                    off = [pf(x) for r in merged_data_records(nb) for x in r if x.strip()]
+                    off = [pf(x) for r in merged_data_records(nb) for x in r if x.strip()][:2]
                 except ValueError:
                     return f"a *{nb.keyword} does not read as numbers"
-                if any(abs(x) > 1e-9 * size for x in off):
+                off += [0.0] * (2 - len(off))
+                if nb.keyword == "SHEAR CENTER" and sec == "GENERAL":
+                    p.s1, p.s2 = off                # (any general section may have it)
+                elif nb.keyword != "SHEAR CENTER" and any(abs(x) > 1e-6 * size for x in off):
                     return f"a *{nb.keyword} moves a section off the beam axis, which U1 cannot"
-        if math.hypot(p.c1, p.c2) > 1e-9 * size:
+        if math.hypot(p.c1, p.c2) > 1e-6 * size:     # (the given digits of a centroid)
             return (f"{label}: the beam node is not at the section's centroid (offset "
                     f"{p.c2:.4g} along n2), and U1 has no offset")
+        # Abaqus measures the torque about the shear centre: off the centroid it couples
+        # torsion with bending in space, which U1 cannot (a 2-D model has no torsion)
+        twisted = not planar and math.hypot(p.s1 - p.c1, p.s2 - p.c2) > 1e-6 * size
         # the material: E, nu (G for the general section) and the density
         density: Optional[str] = None
         expansion = False
@@ -13607,15 +13620,20 @@ class Converter:
             nu_u1 = nu if -1.0 < nu < 0.5 else 0.0
         else:
             nu_u1 = e_mod * (p.i11 + p.i22) / (2.0 * g_mod * p.j) - 1.0
-            if not -1.0 + 1e-9 < nu_u1 < 0.5 - 1e-9:
+            stiff = not -1.0 + 1e-9 < nu_u1 < 0.5 - 1e-9
+            if stiff or twisted:
                 ratio = (p.i11 + p.i22) / p.j
+                why = [f"U1's torsion stiffness is G (I11 + I22), here {ratio:.3g} times the "
+                       f"section's G J, and no Poisson's ratio ccx accepts (below 0.5) makes it "
+                       f"G J"] if stiff else []
+                why += [f"its shear centre lies {math.hypot(p.s1 - p.c1, p.s2 - p.c2):.4g} from "
+                        f"the centroid, and U1 couples no torsion with bending"] if twisted else []
                 if not self._approx:
-                    return (f"{label}: U1's torsion stiffness is G (I11 + I22), here {ratio:.3g} "
-                            f"times the section's G J, and no Poisson's ratio ccx accepts (below "
-                            f"0.5) makes it G J; rerun with --approximate to accept the stiffer "
-                            f"torsion")
-                approx = ratio
-                nu_u1 = nu if -1.0 < nu < 0.5 else 0.0
+                    return (f"{label}: {'; '.join(why)}; rerun with --approximate to accept "
+                            f"that")
+                approx = "; ".join(why)
+                if stiff:
+                    nu_u1 = nu if -1.0 < nu < 0.5 else 0.0
         own = b.keyword == "BEAM GENERAL SECTION" or abs(nu_u1 - nu) > 1e-12 * max(1.0, abs(nu))
         g_u1 = e_mod / (2.0 * (1.0 + nu_u1))
         # the principal axes (Abaqus' 2-D beams bend about the 1-axis only)
@@ -13676,10 +13694,8 @@ class Converter:
                     ", ".join(short_real(x, 12) for x in (p.area, ia, 0.0, ib, k)),
                     ", ".join(short_real(x, 12) for x in d)]
         if approx:
-            self.report.warn(f"[APPROX] {label} -> U1 beam elements whose torsion stiffness is "
-                             f"G (I11 + I22), {approx:.3g} times the section's G J: ccx 2.23's U1 "
-                             f"has no torsion constant, and no Poisson's ratio ccx accepts gives it "
-                             f"G J. Torsion is too stiff; bending and axial stiffness are exact. "
+            self.report.warn(f"[APPROX] {label} -> U1 beam elements although {approx}: their "
+                             f"torsion differs from Abaqus'; bending and axial stiffness are exact. "
                              f"Verify.", once=True)
         rho = 0.0
         if density:

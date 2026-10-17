@@ -1802,16 +1802,32 @@ def test_i_section_properties():
     assert abs(p.area - 2724.8) < 1e-9
     assert abs(p.i11 - (100 * 200 ** 3 - 94.4 * 183 ** 3) / 12) < 1e-6           # strong axis
     assert abs(p.i22 - (2 * 8.5 * 100 ** 3 + 183 * 5.6 ** 3) / 12) < 1e-6        # weak axis
-    assert abs(p.j - (2 * 100 * 8.5 ** 3 + 191.5 * 5.6 ** 3) / 3) < 1e-6         # thin-walled
-    assert p.i12 == 0.0 and abs(p.c2) < 1e-12 and p.c1 == 0.0
+    assert abs(p.j - (2 * 100 * 8.5 ** 3 + 183 * 5.6 ** 3) / 3) < 1e-6           # thin-walled
+    assert p.i12 == 0.0 and abs(p.c2) < 1e-12 and p.c1 == 0.0 and abs(p.s2) < 1e-12
     off = A.i_section(80.0, 200.0, 100.0, 100.0, 8.5, 8.5, 5.6)                 # node 20 below
-    assert abs(off.c2 - 20.0) < 1e-9
-    assert isinstance(A.i_section(100.0, 200.0, 100.0, 60.0, 8.5, 8.5, 5.6), str)
+    assert abs(off.c2 - 20.0) < 1e-9 and abs(off.s2 - 20.0) < 1e-9
+    tee = A.i_section(0.0, 2.0, 2.0, 0.0, 0.2, 0.0, 0.2)                        # T: flange down
+    assert abs(tee.area - 0.76) < 1e-12 and abs(tee.s2 - 0.1) < 1e-12           # on the flange
     assert isinstance(A.i_section(100.0, 10.0, 100.0, 100.0, 8.5, 8.5, 5.6), str)
+    assert isinstance(A.i_section(1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.2), str)     # no flange
     g = A.beam_section_properties("GENERAL", [["10.", "80.", "", "84.375", "80."]])
     assert (g.area, g.i11, g.i12, g.i22, g.j) == (10.0, 80.0, 0.0, 84.375, 80.0)
     assert isinstance(A.beam_section_properties("I", [["1.", "2."]]), str)
     assert isinstance(A.beam_section_properties("L", [["1.", "2.", "0.1", "0.1"]]), str)
+
+
+def test_i_section_matches_abaqus_verification():
+    # Abaqus' Verification Guide, "Verification of beam elements and section types": the I
+    # profile of eb32idsd (l at its centroid) and its general-section form in eb32gisd —
+    # A 1.4, I11 1.312095, I12 0, I22 .5846667, J .01866, centroid (0, -.1571428) and shear
+    # centre (0, -.5971428) from a node at mid-height
+    p = A.i_section(1.0428572, 2.4, 3.0, 2.0, 0.2, 0.2, 0.2)
+    assert abs(p.area - 1.4) < 1e-12 and abs(p.i11 - 1.312095) < 1e-6
+    assert abs(p.i22 - 0.5846667) < 1e-7 and abs(p.j - 0.01866) < 1e-5 and p.i12 == 0.0
+    assert abs(p.c2) < 1e-6                                           # the node at the centroid
+    assert abs((p.s2 - p.c2) - (-0.5971428 + 0.1571428)) < 1e-6       # shear centre - centroid
+    # Abaqus' reference tip deflection under 25 at L = 75, E = 3e6: P L^3 / 3 E I11
+    assert abs(25.0 * 75.0 ** 3 / (3 * 3.0e6 * p.i11) - 0.8931) < 1e-4
 
 
 def test_principal_section_turns_n1():
@@ -1893,6 +1909,23 @@ def test_u1_in_space_needs_approximate_for_open_sections():
     body, conv, rep = convert_str(deck, approximate=True)
     assert "*ELEMENT, TYPE=U1" in body and "SECTION=RECT" not in body
     assert "[APPROX]" in rep.text() and "torsion" in rep.text()
+
+
+def test_u1_unsymmetric_i_and_t_sections():
+    # the node at the centroid of an unsymmetric I: exact in a 2-D model (no torsion there);
+    # in space its shear centre lies off the centroid, which U1 cannot couple
+    sec = "1.0428572, 2.4, 3., 2., .2, .2, .2"
+    deck = U1_PLANAR.replace("0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008", sec) + U1_STEP
+    body, conv, _ = convert_str(deck.replace("B21", "B23"))
+    assert "*ELEMENT, TYPE=U1" in body and conv.reduced_physics == []
+    space = deck.replace("B21", "B31").replace("0., 0., -1.", "0., 0., 1.")
+    body, _, rep = convert_str(space)
+    assert "TYPE=U1" not in body and "shear centre lies" in body
+    body, _, rep = convert_str(space, approximate=True)
+    assert "*ELEMENT, TYPE=U1" in body and "[APPROX]" in rep.text() and "shear centre" in rep.text()
+    # a T with its node away from the centroid has an offset: not U1
+    body, _, _ = convert_str(deck.replace(sec, "2., 2., 2., 0., .2, 0., .2"))
+    assert "TYPE=U1" not in body and "not at the section's centroid" in body
 
 
 def test_u1_refusals_keep_todays_section_handling():

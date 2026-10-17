@@ -112,8 +112,9 @@ without an error. A full audit and the work that followed:
   run as ccx 2.23's 2-node beam `U1` where the whole deck allows it (probed: an exact
   Euler–Bernoulli beam once its shear area is large, a wrong shear term, torsion G (I11 + I22),
   wrong nodal forces, linear static and modal steps only, no element ccx expands beside it):
-  principal axes, n1 projected per element, a material copy for G J, line loads and gravity as
-  nodal forces with consistent end moments; in space where G J cannot be had, only with
+  principal axes, n1 projected per element, a material copy for G J, the I (and T) properties
+  of Abaqus' own general-section form, line loads and gravity as nodal forces with consistent
+  end moments; in space where G J cannot be had or the shear centre is off the centroid, only with
   `--approximate`, which otherwise keeps the I → `RECT` route. Three planar I-beam decks solve
   (Euler–Bernoulli for Timoshenko beams: reduced physics).
 * **Published answers** — 30 NAFEMS benchmark decks of the Abaqus 2017 documentation joined

@@ -1,0 +1,30 @@
+*HEADING
+U1 beam: the cantilever of Abaqus' "Verification of beam elements and section types" with its
+unsymmetric I-section (node at the centroid), as planar cubic beams under a tip load.
+*NODE
+1, 0., 0.
+11, 75., 0.
+*NGEN, NSET=AXIS
+1, 11, 2
+*ELEMENT, TYPE=B23, ELSET=EALL
+1, 1, 3
+2, 3, 5
+3, 5, 7
+4, 7, 9
+5, 9, 11
+*NSET, NSET=TIP
+11
+*BEAM SECTION, SECTION=I, MATERIAL=A1, ELSET=EALL
+1.0428572, 2.4, 3., 2., .2, .2, .2
+*MATERIAL, NAME=A1
+*ELASTIC
+3.E6, 0.3
+*BOUNDARY
+1, 1, 6
+*STEP
+*STATIC
+*CLOAD
+11, 2, 25.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
