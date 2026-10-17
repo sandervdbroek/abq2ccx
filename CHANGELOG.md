@@ -29,6 +29,10 @@ physics.
   onto the mid-surface), where ccx 2.23 would use the orientation's axes unprojected: an
   `SC8R` hoop-wound cylinder came out 14 times too soft and now matches thin-wall theory to
   0.10 %.
+* **Stack direction** — `STACK DIRECTION=ORIENTATION` stacks continuum shells along the
+  orientation's rotation axis (axis 1 without a rotation line: radial for a cylindrical or
+  spherical system), as Abaqus does; it stacked along axis 3. `STACK DIR` is read as `STACK
+  DIRECTION`.
 * **CalculiX on Windows** — CI now runs `validate_with_ccx.py` and `--run` with conda-forge's
   Windows ccx 2.23 as well. That ccx does not start outside its activated environment, so
   `--run` and `validate_with_ccx.py` give a conda environment's ccx the folders `conda
