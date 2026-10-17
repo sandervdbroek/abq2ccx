@@ -1,0 +1,49 @@
+*HEADING
+U1 beam: a cantilever with a general section (I12 nonzero, n1 not normal to the axis) under
+tip forces along y and z, a torque, and its first frequencies.  Units mm, N, MPa, t.
+*NODE
+1, 0., 0., 0.
+21, 1000., 0., 0.
+*NGEN, NSET=AXIS
+1, 21
+*ELEMENT, TYPE=B33, ELSET=BEAM
+1, 1, 2
+*ELGEN, ELSET=BEAM
+1, 20, 1, 1
+*NSET, NSET=ROOT
+1
+*NSET, NSET=TIP
+21
+** A, I11, I12, I22, J; the approximate n1 (Abaqus projects it normal to the beam: 0, 0, 1);
+** E, G
+*BEAM GENERAL SECTION, ELSET=BEAM, SECTION=GENERAL, DENSITY=7.85E-9
+1000., 4.E5, 1.5E5, 2.E5, 5.4E5
+0.3, 0., 1.
+210000., 80769.2307692
+*BOUNDARY
+ROOT, 1, 6
+*STEP
+*STATIC
+*CLOAD
+TIP, 2, 100.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*STATIC
+*CLOAD, OP=NEW
+TIP, 3, 100.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*STATIC
+*CLOAD, OP=NEW
+TIP, 4, 1.E5
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*FREQUENCY
+4
+*END STEP

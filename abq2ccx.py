@@ -368,6 +368,129 @@ PIPE_BOX_B32R = {"B21": "B32R", "B31": "B32R", "B31R": "B32R", "B32": "B32R"}
 SECTION_BEAM_UPGRADE = {"CIRC": CIRC_QUADRATIC, "PIPE": PIPE_BOX_B32R, "THICK PIPE": PIPE_BOX_B32R,
                         "BOX": PIPE_BOX_B32R}
 
+# ccx 2.23's own 2-node beam, the user element U1, carries a section given by its properties
+# (*BEAM SECTION, SECTION=GENERAL), which the expanded beams cannot.  Probed on 2.23
+# (cantilevers of 1 to 100 elements, frames, against beam theory):
+# * declared by U1_CARD, without a data line, before *ELEMENT, TYPE=U1;
+# * section data: A, I1, I12, I2, k on the first line — I1 resists a displacement along n1
+#   (Abaqus' I22, the integral of x1^2), I2 one along n2 = t x n1 (Abaqus' I11), I12 must be 0
+#   ('no nonzero cross moment of inertia'), k A is the shear area; more values change
+#   nothing — and n1 on the required second line, which U1 does not project: an n1 that is
+#   not normal to the element bends it wrongly.  ELSET is read to 20 characters (a longer
+#   name: 'element set ... has not yet been defined'), MATERIAL in full;
+# * bending is exact Euler-Bernoulli (cubic) on any mesh when k A is large.  The shear term
+#   is wrong: one element deflects like a Timoshenko beam with phi (phi - 3) / (1 + phi) for
+#   phi = 12 E I / (k G A L^2), stiffer than Euler-Bernoulli, so U1_PHI keeps phi negligible
+#   (an Euler-Bernoulli beam, also if a later ccx fixes the term);
+# * torsion is G (I1 + I2), with no torsion constant of its own, and *ELASTIC stops on
+#   nu >= 0.5: a copy of the material can set G to G J / (I1 + I2) only where
+#   G J > E (I1 + I2) / 3;
+# * the material must be linear elastic and isotropic: a plastic one stops ccx ('no
+#   anisotropic material'), and so do ORIENTATION, OFFSET1 and OFFSET2; a thermal strain
+#   comes out n times too large on n elements (no error);
+# * linear *STATIC, *FREQUENCY, *MODAL DYNAMIC and *STEADY STATE DYNAMICS run; NLGEOM, *BUCKLE
+#   and *DYNAMIC stop ('no second order', 'no buckling', 'no initial strains allowed').  Its
+#   nodal forces are wrong (the axial force has the wrong sign at the first node, the shear
+#   force at the second): RF at its nodes is wrong, and a step ccx iterates (a plastic or
+#   contact part elsewhere) diverges;
+# * GRAV and CENTRIF stop ccx ('no body forces'); *DLOAD P1 / P2 on it apply nothing;
+# * S holds section forces (N, the moments about n2 and n1, the shear forces along n1 and
+#   n2, and the torque times k), E the matching strains; the .frd holds its own nodes;
+# * its mass matrix converges to the Euler-Bernoulli beam with rotary inertia, at O(h^2);
+# * ccx stops ('gen3delem: first thickness ... is zero') when the deck has any element it
+#   expands (beams, trusses, shells, membranes, plane elements) besides U1, even an
+#   unconnected one; solids, springs, dashpots and point masses mix with it.
+U1_CARD = "*USER ELEMENT, TYPE=U1, INTEGRATION POINTS=2, MAXDOF=6, NODES=2"
+U1_PHI = 1e-10                    # 12 E I / (k G A L^2) on every U1 element (at most)
+# Abaqus' 2-node beams, which U1 replaces (a 2-D one in a plane); the cubic B23 / B33 are
+# Euler-Bernoulli beams like U1, the others shear-flexible
+U1_TYPES = {"B21", "B21H", "B23", "B23H", "B31", "B31H", "B33", "B33H"}
+U1_EULER_BERNOULLI = {"B23", "B33"}
+# library profiles whose properties the converter computes from their dimensions
+U1_PROFILES = {"I"}
+# ccx types that can share a deck with U1 (ccx expands none of them)
+U1_COMPANIONS = ("C3D", "F3D", "SPRING", "DASHPOT", "MASS")
+# material cards a U1 beam's material may have (ccx stops on, or iterates with, the others:
+# MATERIAL_OPTION_CARDS, and these)
+U1_MATERIAL_CARDS = {"MATERIAL", "ELASTIC", "DENSITY", "EXPANSION", "DAMPING", "CONDUCTIVITY",
+                     "SPECIFIC HEAT"}
+U1_NONLINEAR_CARDS = {"ANISOTROPIC HYPERELASTIC", "LOW DENSITY FOAM", "VISCOUS", "HYSTERESIS",
+                      "EOS", "TENSILE FAILURE", "SHEAR FAILURE", "GASKET THICKNESS BEHAVIOR"}
+# Abaqus' I12 is the integral of x1 x2 over the section (*BEAM GENERAL SECTION)
+ABAQUS_I12_SIGN = 1.0
+
+
+@dataclass
+class BeamSection:
+    """A beam cross-section's properties in the axes of its profile (x1 along n1, x2 along
+    n2): area, i11 = integral of x2^2, i12 = integral of x1 x2, i22 = integral of x1^2 (about
+    the centroid), torsion constant j, and the centroid (c1, c2) relative to the beam node."""
+    area: float
+    i11: float
+    i12: float
+    i22: float
+    j: float
+    c1: float = 0.0
+    c2: float = 0.0
+
+
+def i_section(l: float, h: float, b1: float, b2: float, t1: float, t2: float,
+              t3: float) -> Union[BeamSection, str]:
+    """Abaqus' I profile (*BEAM SECTION, SECTION=I: l, h, b1, b2, t1, t2, t3): the bottom
+    flange b1 x t1, the top flange b2 x t2, both centred on the web of thickness t3 between
+    them; the beam node lies l above the bottom face.  Three rectangles; the torsion constant
+    of the thin-walled open section, sum of b t^3 / 3 (web between the flange midlines).
+    Only a doubly symmetric profile is converted (which flange is b1 does not matter there);
+    the reason otherwise."""
+    if min(h, b1, b2, t1, t2, t3) <= 0 or h - t1 - t2 <= 0:
+        return "the I profile's dimensions are not positive, or its flanges overlap"
+    tol = 1e-9 * max(h, b1, b2)
+    if abs(b1 - b2) > tol or abs(t1 - t2) > tol:
+        return "the I profile is not doubly symmetric (flanges differ)"
+    hw = h - t1 - t2
+    rects = [(b1, t1, t1 / 2.0), (b2, t2, h - t2 / 2.0), (t3, hw, t1 + hw / 2.0)]  # w, d, y
+    area = sum(w * d for w, d, _ in rects)
+    ybar = sum(w * d * y for w, d, y in rects) / area
+    i11 = sum(w * d ** 3 / 12.0 + w * d * (y - ybar) ** 2 for w, d, y in rects)
+    i22 = sum(d * w ** 3 / 12.0 for w, d, _ in rects)
+    j = (b1 * t1 ** 3 + b2 * t2 ** 3 + (h - (t1 + t2) / 2.0) * t3 ** 3) / 3.0
+    return BeamSection(area, i11, 0.0, i22, j, 0.0, ybar - l)
+
+
+def beam_section_properties(section: str, recs: List[List[str]]) -> Union[BeamSection, str]:
+    """The properties of a beam section from its first data line(s): SECTION=GENERAL of
+    *BEAM GENERAL SECTION (A, I11, I12, I22, J; the centroid at the node, blanks zero), or a
+    profile of U1_PROFILES; the reason when they cannot be had."""
+    first = list(recs[0]) if recs else []
+    while first and first[-1] == "":
+        first.pop()
+    try:
+        v = [pf(x) if x else 0.0 for x in first]
+    except ValueError:
+        return "a section value is not a number (a *PARAMETER?)"
+    if section == "GENERAL":
+        if len(v) < 2:
+            return "SECTION=GENERAL needs A, I11, I12, I22 and J on its first line"
+        area, i11, i12, i22, j = (v + [0.0] * 5)[:5]
+        return BeamSection(area, i11, i12, i22, j)
+    if section == "I":
+        if len(v) < 7:
+            return "SECTION=I needs l, h, b1, b2, t1, t2, t3"
+        return i_section(*v[:7])
+    return f"SECTION={section} has no U1 conversion"
+
+
+def principal_section(p: BeamSection) -> Tuple[float, float, float]:
+    """(alpha, ia, ib): the angle that turns n1 towards n2 onto a principal axis of section
+    ``p`` and its second moments there, ia = integral of x1'^2 (resisting a displacement
+    along the turned n1, U1's I1) and ib = integral of x2'^2 (U1's I2)."""
+    prod = ABAQUS_I12_SIGN * p.i12
+    alpha = 0.5 * math.atan2(2.0 * prod, p.i22 - p.i11) if prod else 0.0
+    c, s = math.cos(alpha), math.sin(alpha)
+    ia = c * c * p.i22 + 2.0 * c * s * prod + s * s * p.i11
+    ib = s * s * p.i22 - 2.0 * c * s * prod + c * c * p.i11
+    return alpha, ia, ib
+
 MAX_ENTRIES_PER_LINE = 16  # CalculiX hard limit for entries on a data line
 
 # ---------------------------------------------------------------------------
@@ -1851,8 +1974,6 @@ SPECIAL_UNSUPPORTED = {
     "FIELD": "*FIELD predefined fields are unsupported; use *INITIAL CONDITIONS / *TEMPERATURE / "
              "*DISTRIBUTION instead.",
     "REBAR": "rebar/reinforcement layers have no ccx equivalent; mesh reinforcements explicitly.",
-    "BEAM GENERAL SECTION": "no direct ccx card; use *USER ELEMENT (U1) + *BEAM SECTION, "
-                            "SECTION=GENERAL with A, I11, I12, I22, shear factor.",
     "CONCRETE": "concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel.",
     "CONCRETE DAMAGED PLASTICITY": "unsupported by ccx; substitute *PLASTIC or remodel.",
     **{f"CONNECTOR {k}": "connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that "
@@ -3034,6 +3155,16 @@ class Converter:
         self._skin_diag: Dict[int, float] = {}      # skin -> its rigid facet's diagonal (Abaqus)
         self._rigid_faces: Dict[str, List[Tuple[int, str]]] = {}   # rigid surface -> skin faces
         self._contact_explicit: Optional[Tuple[float, str]] = None  # see _plan_rigid_contact_increment
+        # beams written as ccx's U1 element (see _plan_u1_beams): element -> its section plan,
+        # the cards that replace each section card (by id), the element sets that carry a
+        # GRAV line's other elements (line set -> set), and why U1 was not used (or None)
+        self._u1: Dict[int, dict] = {}
+        self._u1_cards: Dict[int, List[str]] = {}
+        self._u1_rest: Dict[str, str] = {}
+        self._u1_refused: Optional[str] = None
+        self._u1_taken: set = set()                # names given to U1 sets and materials
+        self._u1_last = False                      # the last beam section card became U1
+        self._u1_pairs: Optional[set] = None       # the U1 elements' end-node pairs (lazy)
 
     # -- properties ---------------------------------------------------------
     @property
@@ -3317,8 +3448,13 @@ class Converter:
 
         by_type: "OrderedDict[str, List[Tuple[int, List[int]]]]" = OrderedDict()
         for eid, (typ, conn) in self.geom.elements.items():
-            by_type.setdefault(typ, []).append((eid, conn))
+            by_type.setdefault(" U1" if eid in self._u1 else typ, []).append((eid, conn))
         for typ, items in by_type.items():
+            if typ == " U1":                        # beams written as ccx's U1 (_plan_u1_beams)
+                out += [U1_CARD, "*ELEMENT, TYPE=U1"]
+                for eid, conn in items:
+                    out.append(f"{eid}, {conn[0]}, {conn[-1]}")
+                continue
             out_typ = ccx_element_type(typ, self.report)
             loss = substitution_loss(typ)
             if loss and typ.upper() not in SLAB_TYPES:    # (_plan_incompatible_slabs says why)
@@ -3409,6 +3545,8 @@ class Converter:
             "SHELL GENERAL SECTION": self.handle_shell_section,
             "MEMBRANE SECTION": self.handle_membrane_section,
             "BEAM SECTION": self.handle_beam_section,
+            "BEAM GENERAL SECTION": self.handle_beam_general_section,
+            **{k: self.handle_beam_section_option for k in self._U1_OPTIONS},
             "COHESIVE SECTION": self.handle_cohesive_section,
             "GASKET SECTION": self.handle_cohesive_section,
             "SURFACE SECTION": self.handle_surface_section,
@@ -3459,6 +3597,8 @@ class Converter:
             "MOHR COULOMB HARDENING": self.handle_dependent_material,
             "SECTION CONTROLS": self.handle_section_controls,
         }
+        if kw not in self._U1_OPTIONS and kw not in ("BEAM SECTION", "BEAM GENERAL SECTION"):
+            self._u1_last = False                # (handle_beam_section_option)
         if kw in handlers:
             return handlers[kw](b)
         if kw in ("NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "NODE OUTPUT", "ELEMENT OUTPUT",
@@ -5436,6 +5576,9 @@ class Converter:
 
     def handle_beam_section(self, b: Block) -> List[str]:
         sec = (b.param("SECTION") or "").upper()
+        self._u1_last = id(b) in self._u1_cards
+        if self._u1_last:
+            return self._u1_cards[id(b)]
         # ccx 2.22 beam profiles: RECT, CIRC (ellipse), PIPE, BOX.  Anything else is a
         # hard "unknown section" error, so comment it out with the escape hatches.
         if sec not in ("", "RECT", "CIRC", "PIPE", "BOX", "THICK PIPE"):
@@ -5443,10 +5586,12 @@ class Converter:
                 approx = self._ibeam_to_rect(b)
                 if approx is not None:
                     return approx
+            u1 = (f" It is not run as ccx's U1 beam element either: {self._u1_refused}."
+                  if self._u1_refused and self._u1_section(b) else "")
             return self._commented(b, f"*BEAM SECTION SECTION={sec} is not a ccx profile (ccx has "
-                                      f"RECT, CIRC, PIPE, BOX; GENERAL only with user element U1). "
-                                      f"Remodel with an equivalent BOX/RECT, or use beam-like solids"
-                                      f"{'' if self._approx else ', or rerun with --approximate'}.")
+                                      f"RECT, CIRC, PIPE, BOX; GENERAL only with user element U1)."
+                                      f"{u1} Remodel with an equivalent BOX/RECT, or use beam-like "
+                                      f"solids{'' if self._approx else ', or rerun with --approximate'}.")
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("ELSET", "MATERIAL", "SECTION", "ORIENTATION", "OFFSET1", "OFFSET2"):
@@ -5481,6 +5626,34 @@ class Converter:
                                  "set it by hand.", once=True)
         return [emit_keyword("BEAM SECTION", keep)] + data
 
+    def handle_beam_general_section(self, b: Block) -> List[str]:
+        """``*BEAM GENERAL SECTION``: ccx has no such card; SECTION=GENERAL (and a profile of
+        U1_PROFILES) runs as ccx's U1 beam where the deck allows it (_plan_u1_beams), else the
+        card is commented out with the reason."""
+        self._u1_last = id(b) in self._u1_cards
+        if self._u1_last:
+            return self._u1_cards[id(b)]
+        why = self._u1_refused if self._u1_refused and self._u1_section(b) else \
+            f"SECTION={(b.param('SECTION') or 'GENERAL').strip().upper()} has no ccx form"
+        return self._commented(b, f"*BEAM GENERAL SECTION has no ccx card, and its beams are not "
+                                  f"run as ccx's U1 beam element: {why}. The beams have no section.")
+
+    def handle_beam_section_option(self, b: Block) -> List[str]:
+        """``*CENTROID`` / ``*SHEAR CENTER`` / ``*TRANSVERSE SHEAR STIFFNESS`` / ``*SECTION
+        POINTS`` after a beam section: commented out (ccx has none).  After a section written
+        as U1 (_plan_u1_beams), which took them into account, they change nothing: the
+        centroid and shear centre are on the beam axis there, U1 is an Euler-Bernoulli beam
+        (the shear stiffness is part of what the elements' conversion drops) and section
+        points only place stress output."""
+        if not self._u1_last:
+            return self.passthrough(b)
+        what = {"CENTROID": "the centroid is on the beam axis",
+                "SHEAR CENTER": "the shear centre is on the beam axis",
+                "TRANSVERSE SHEAR STIFFNESS": "U1 is an Euler-Bernoulli beam (see the element warning)",
+                "SECTION POINTS": "U1 writes section forces, no stresses at section points"}
+        return self._commented(b, f"*{b.keyword} after a beam section written as U1: {what[b.keyword]}.",
+                               reduces=False)
+
     def _ibeam_to_rect(self, b: Block) -> Optional[List[str]]:
         """--approximate: replace an I-profile with the RECT of equal area and equal
         strong-axis inertia.  Weak-axis bending, torsion and shear areas DIFFER."""
@@ -5510,9 +5683,11 @@ class Converter:
             if k in ("ELSET", "MATERIAL", "ORIENTATION", "OFFSET1", "OFFSET2"):
                 keep[k] = val
         keep["SECTION"] = "RECT"
-        self.report.warn("[APPROX] *BEAM SECTION SECTION=I replaced by the RECT with equal area "
-                         "and equal strong-axis inertia; weak-axis bending, torsion and shear "
-                         "response DIFFER. Verify.", once=True)
+        u1 = f" (ccx's U1 beam, which carries the profile, cannot be used: {self._u1_refused})" \
+            if self._u1_refused else ""
+        self.report.warn(f"[APPROX] *BEAM SECTION SECTION=I replaced by the RECT with equal area "
+                         f"and equal strong-axis inertia; weak-axis bending, torsion and shear "
+                         f"response DIFFER{u1}. Verify.", once=True)
         out = [emit_keyword("BEAM SECTION", keep), f"{b_r:.6g}, {h_r:.6g}"]
         if len(recs) > 1:                          # keep the direction-cosine line
             second = [x for x in recs[1] if x != ""]
@@ -7392,6 +7567,19 @@ class Converter:
                         ([], f"element set '{g[0]}' mixes beams with other elements")
                     side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
                     continue
+            if label == "GRAV" and self._u1:
+                # ccx's GRAV stops on U1 ('no body forces'): its share becomes nodal forces,
+                # the line stays for the other elements (on a set of their own)
+                eids = self._load_elements(g[0]) if g[0] else list(self.geom.elements)
+                u1 = [e for e in eids if e in self._u1]
+                if u1:
+                    lines_u1 = [([c[0], c[-1]], "line", self._u1[e]["mass"], False,
+                                 self._u1[e]["planar"], None, None)
+                                for e in u1 for c in [self.geom.elements[e][1]]]
+                    side += self._to_nodal_forces(b, "DLOAD", g, lines_u1, None)
+                    if g[0].upper() not in self._u1_rest:
+                        continue
+                    g = [self._u1_rest[g[0].upper()]] + g[1:]
             # surface elements on the line (no element set: the whole model) are not in the ccx
             # mesh: a pressure on them becomes nodal forces, a mass-proportional load adds
             # nothing (they carry no mass unless --approximate dropped it), others are lost
@@ -7869,6 +8057,13 @@ class Converter:
 
             def load(p, normal, tangent):
                 return vscale(axis, mag)
+        elif base == "GRAV":                    # on U1 beams: per mass (the faces' scale)
+            if vnorm(d) == 0.0:
+                return self._drop_load_line(b, g, "its direction vector is zero", reduces=False)
+            down = vunit(d)                     # ccx and Abaqus normalize it (probed on ccx)
+
+            def load(p, normal, tangent):
+                return vscale(down, mag)
         forces: Dict[Tuple[int, int], float] = {}
         flat: set = set()                                   # nodes of a 2-D model (DOFs 1-2)
         for nodes, kind, scale, axi, planar, n1, sense in faces:
@@ -7890,6 +8085,19 @@ class Converter:
                 for k in range(2 if planar else 3):
                     if v[k]:
                         forces[(nd, k + 1)] = forces.get((nd, k + 1), 0.0) + scale * v[k]
+            if kind == "line" and len(nodes) == 2 and self._u1_edge(nodes):
+                # U1 is a cubic beam: the uniform load's consistent end moments, L^2/12 t x q at
+                # the first node and minus that at the second (exact Euler-Bernoulli nodes)
+                pa, pb = self.geom.nodes[nodes[0]], self.geom.nodes[nodes[1]]
+                t = vsub(pb, pa)
+                span = vnorm(t)
+                t = vunit(t)
+                q = load(vscale(vadd(pa, pb), 0.5), vunit((t[1], -t[0], 0.0)), t)
+                m = vscale(vcross(t, q), scale * span * span / 12.0)
+                for nd, sign in ((nodes[0], 1.0), (nodes[1], -1.0)):
+                    for k in ((2,) if planar else (0, 1, 2)):
+                        if m[k]:
+                            forces[(nd, k + 4)] = forces.get((nd, k + 4), 0.0) + sign * m[k]
         if degenerate and base != "TRSHR":
             return self._drop_load_line(b, g, "a beam is parallel to its n1 direction", reduces=False)
         big = max((abs(v) for v in forces.values()), default=0.0)
@@ -7924,6 +8132,8 @@ class Converter:
             what, lack = "surface tractions (TRVEC / TRSHR)", "ccx has no such load"
         elif base == "P":
             what, lack = "pressures (P) on surface elements", "ccx has no surface element"
+        elif base == "GRAV":
+            what, lack = "gravity (GRAV) on U1 beams", "ccx stops on GRAV on U1 elements"
         else:
             what, lack = ("beam line loads (PX / PY / PZ / P1 / P2)", "ccx has no such load (it "
                           "reads P1 / P2 on a beam as a pressure on the expanded section face)")
@@ -7931,6 +8141,10 @@ class Converter:
                          f"the step: {lack}. The shape functions are integrated over the undeformed "
                          f"faces / edges (times the section thickness on plane elements, over the "
                          f"full circle on axisymmetric ones).", once=True)
+        if any(f[1] == "line" and len(f[0]) == 2 and self._u1_edge(f[0]) for f in faces):
+            self.report.note("On U1 beams, a cubic (Euler-Bernoulli) element, the converted line "
+                             "loads and gravity also get their consistent end moments (L^2/12 per "
+                             "unit load), which make the nodal solution exact.", once=True)
         if local:
             self.report.note("Converted nodal forces on nodes with a *TRANSFORM are given in each "
                              "node's local axes, in which ccx (like Abaqus) reads a *CLOAD there: "
@@ -9002,13 +9216,14 @@ class Converter:
         self._out_tp_names: Dict[tuple, str] = {}
         self._out_subsets: Dict[str, str] = {}      # .frd set -> its nodes missing from the .frd
         self._used_names |= set(self.geom.nsets) | set(self.geom.elsets)
-        types = {t: ccx_element_type(t, quiet) for t in {t for t, _c in self.geom.elements.values()}}
+        types = {t: ccx_element_type(t, quiet) for t in {t for e, (t, _c) in self.geom.elements.items()
+                                                         if e not in self._u1}}
         frd3d = any(c.startswith(CCX_FRD_3D_TRIGGER) for c in types.values())
         solid_nodes: set = set()
         flat_nodes: set = set()
-        for typ, conn in self.geom.elements.values():
-            if types[typ].startswith(CCX_SOLID_PREFIXES):
-                solid_nodes.update(conn)
+        for e, (typ, conn) in self.geom.elements.items():
+            if e in self._u1 or types[typ].startswith(CCX_SOLID_PREFIXES):
+                solid_nodes.update(conn)            # (ccx writes U1's own nodes to the .frd)
             elif types[typ].startswith(CCX_EXPANDED_PREFIXES):
                 flat_nodes.update(conn)
         self._out_yields = self._yielding_materials(blocks)
@@ -11256,6 +11471,7 @@ class Converter:
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._upgrade_section_beams(blocks)
+        self._plan_u1_beams(blocks)
         self._check_nonpositive_ids()
         self._prescan(blocks)
         self._plan_load_cases(blocks)
@@ -12834,6 +13050,421 @@ class Converter:
         self.report.note(f"*{keyword} lines given for both end nodes of an upgraded 2-node beam were "
                          f"extended to its midside node (values interpolated linearly).", once=True)
 
+    # -- beams as ccx's U1 element ------------------------------------------------------
+    _U1_CONSTRAINTS = ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING",
+                       "MPC", "TIE", "CONTACT PAIR", "CONTACT", "EMBEDDED ELEMENT")
+    _U1_PROCEDURES = {"STATIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
+    _U1_LOADS = {"PX", "PY", "PZ", "P1", "P2", "GRAV"}
+    _U1_OPTIONS = ("CENTROID", "SHEAR CENTER", "TRANSVERSE SHEAR STIFFNESS", "SECTION POINTS")
+
+    @staticmethod
+    def _u1_section(b: Block) -> Optional[str]:
+        """The section of a *BEAM SECTION / *BEAM GENERAL SECTION card when U1 can carry it
+        (SECTION=GENERAL of the general section, a profile of U1_PROFILES), else None."""
+        if b.keyword == "BEAM SECTION":
+            sec = (b.param("SECTION") or "").strip().upper()
+            return sec if sec in U1_PROFILES else None
+        if b.keyword == "BEAM GENERAL SECTION":
+            sec = (b.param("SECTION") or "GENERAL").strip().upper()
+            return sec if sec == "GENERAL" or sec in U1_PROFILES else None
+        return None
+
+    def _plan_u1_beams(self, blocks: List[Block]) -> None:
+        """Beams whose section ccx's expanded beams cannot carry — *BEAM GENERAL SECTION and
+        the profiles of U1_PROFILES — as ccx's 2-node beam U1 with *BEAM SECTION, SECTION=
+        GENERAL (what ccx 2.23 does with it: see U1_CARD).  U1 is a linear elastic Euler-
+        Bernoulli beam that ccx runs only beside elements it does not expand and in steps it
+        does not iterate, so it is all or nothing: every such section's beams become U1, or
+        none does and the cards stay as before (commented out; SECTION=I a RECT under
+        --approximate), with the reason in _u1_refused.  Each section card becomes one
+        *BEAM SECTION per direction of n1 among its elements: the area, the second moments
+        about the principal axes with n1 turned onto the first, projected onto each element's
+        normal plane as Abaqus does, and a shear area that makes the beam Euler-Bernoulli
+        (U1_PHI).  U1's torsion stiffness G (I11 + I22) becomes G J through a copy of the
+        material with another Poisson's ratio where ccx takes one; otherwise the beams are U1
+        only under --approximate ([APPROX]: torsion too stiff) — or in a 2-D model, whose
+        out-of-plane DOFs 3-5 are held at every node (_plan_planar_constraint).  Fills _u1
+        (element -> plan), _u1_cards (id(section card) -> its ccx cards) and _u1_rest."""
+        cards = [b for b in blocks if self._u1_section(b)]
+        if not cards:
+            return
+        plans, why = self._u1_plans(blocks, cards)
+        if why:
+            self._u1_refused = why
+            return
+        kinds: "OrderedDict[str, int]" = OrderedDict()
+        for b, plan in plans:
+            for e in plan["elements"]:
+                self._u1[e] = plan
+                typ = self.geom.elements[e][0].upper()
+                kinds[typ] = kinds.get(typ, 0) + 1
+            self._u1_cards[id(b)] = plan["cards"]
+        self._elem_types.add("U1")
+        inertia = any(b.keyword in self._INERTIA_PROCEDURES for b in blocks)
+        shear = [t for t in kinds if t.rstrip("H") not in U1_EULER_BERNOULLI]
+        counts = ", ".join(f"{t}: {n}" for t, n in kinds.items())
+        self.report.note(f"{len(self._u1)} beam element(s) ({counts}) under "
+                         f"{'/'.join(dedup_str([self._u1_label(b) for b in cards]))} -> ccx's "
+                         f"2-node beam U1 with *BEAM SECTION, SECTION=GENERAL (declared by *USER "
+                         f"ELEMENT): the section's area and principal second moments, n1 turned "
+                         f"onto the first principal axis and projected normal to each element "
+                         f"(one card per direction), and a shear area that makes it an Euler-"
+                         f"Bernoulli beam — ccx 2.23's U1 shear term is wrong (probed).", once=True)
+        if shear:
+            self.report.warn(f"Elements {', '.join(shear)} -> U1, an Euler-Bernoulli beam: Abaqus' "
+                             f"{'/'.join(shear)} are shear-flexible (Timoshenko) beams, so their "
+                             f"transverse shear deformation is not modelled; ccx's expanded beams "
+                             f"cannot carry the section.", once=True)
+            self._reduces(f"element {'/'.join(shear)} -> U1 (Euler-Bernoulli: no transverse shear "
+                          f"deformation)")
+        if any(t.endswith("H") for t in kinds):
+            self._reduces("hybrid beams -> U1 (a displacement element)")
+        if inertia and len(shear) < len(kinds):
+            self.report.warn("Abaqus' cubic beams (B23 / B33) -> U1, whose mass matrix differs: its "
+                             "eigenfrequencies approach the same beam (with rotary inertia) only as "
+                             "the mesh is refined (probed: O(h^2)).", once=True)
+            self._reduces("element B23/B33 -> U1 (its mass matrix)")
+        self.report.warn("U1 output in ccx 2.23 (probed): the reaction forces RF at U1 nodes are "
+                         "wrong (U1's nodal forces have the wrong sign at one end), and S on U1 "
+                         "elements holds section forces — N, the moments about n2 and n1, the "
+                         "shear forces along n1 and n2, then the torque times the section's "
+                         "shear factor k (given in each card's comment) — not stresses.", once=True)
+        # a GRAV line on U1 elements and others: ccx's GRAV stops on U1, whose share becomes
+        # nodal forces (handle_dload); the others keep the line on a set of their own
+        for b in blocks:
+            if b.keyword != "DLOAD":
+                continue
+            for rec in merged_data_records(b):
+                g = [x.strip() for x in rec]
+                if len(g) < 2 or g[1].upper() != "GRAV" or g[0].upper() in self._u1_rest:
+                    continue
+                eids = self._load_elements(g[0]) if g[0] else list(self.geom.elements)
+                rest = [e for e in eids if e not in self._u1 and e in self.geom.elements]
+                if rest and len(rest) < len(eids):
+                    name = self._u1_name(f"ABQ2CCX_U1_REST{len(self._u1_rest) + 1}")
+                    self.geom.elsets[name] = rest
+                    self._u1_rest[g[0].upper()] = name
+
+    def _u1_name(self, name: str) -> str:
+        """``name``, or ``name`` with a suffix, so that no node / element set or material of the
+        deck has it."""
+        taken = {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+        base, k = name, 1
+        while name.upper() in taken or name.upper() in self._u1_taken:
+            k += 1
+            name = f"{base}_{k}"
+        self._u1_taken.add(name.upper())
+        return name
+
+    def _u1_edge(self, nodes: Sequence[int]) -> bool:
+        """Whether ``nodes`` are the two end nodes of a U1 element."""
+        if not self._u1:
+            return False
+        if self._u1_pairs is None:
+            self._u1_pairs = {frozenset((c[0], c[-1])) for e in self._u1
+                              for c in [self.geom.elements[e][1]]}
+        return frozenset(nodes) in self._u1_pairs
+
+    @staticmethod
+    def _u1_label(b: Block) -> str:
+        sec = (b.param("SECTION") or "GENERAL").strip().upper()
+        return f"*{b.keyword}" + ("" if b.keyword == "BEAM GENERAL SECTION" and sec == "GENERAL"
+                                  else f", SECTION={sec}")
+
+    def _u1_plans(self, blocks: List[Block], cards: List[Block]
+                  ) -> Tuple[List[Tuple[Block, dict]], Optional[str]]:
+        """The U1 plan of each section card (see _plan_u1_beams), or why the deck's beams cannot
+        be U1 — the first obstacle found."""
+        self._u1_taken |= {(b.param("NAME") or "").strip().upper()
+                           for b in blocks if b.keyword == "MATERIAL"}
+        quiet = Report()
+        member: "OrderedDict[int, Block]" = OrderedDict()
+        for b in cards:
+            elset = (b.param("ELSET") or "").strip()
+            eids = [e for e in dedup(self.geom.elset(elset)) if e in self.geom.elements]
+            if not eids:
+                return [], f"{self._u1_label(b)} names no element (set '{elset}')"
+            for e in eids:
+                typ = self.geom.elements[e][0].upper()
+                if typ not in U1_TYPES:
+                    return [], (f"element {e} under {self._u1_label(b)} is a {typ}; U1 replaces "
+                                f"2-node beams only ({', '.join(sorted(U1_TYPES))})")
+                member[e] = b
+        # ccx 2.23 stops on U1 beside any element it expands; constraints on U1 nodes and
+        # nonlinear models (which ccx iterates, with U1's wrong nodal forces) are left out
+        others = sorted({ccx_element_type(t, quiet) for e, (t, _c) in self.geom.elements.items()
+                         if e not in member})
+        bad = [t for t in others if not t.startswith(U1_COMPANIONS)]
+        if bad:
+            return [], (f"the deck also has {', '.join(bad[:3])} elements, and ccx 2.23 runs U1 "
+                        f"only beside solid, spring, dashpot and mass elements (beside any element "
+                        f"it expands it stops: 'gen3delem: first thickness ... is zero')")
+        kws = {b.keyword for b in blocks}
+        hit = [k for k in self._U1_CONSTRAINTS if k in kws]
+        if hit or self._conn or self._skins:
+            what = f"*{hit[0]}" if hit else "connector" if self._conn else "rigid"
+            return [], (f"the deck has {what} constraints, which this conversion does not write "
+                        f"onto U1 nodes")
+        nodes = {n for e in member for n in self.geom.elements[e][1]}
+        if set(self._node_normals) & nodes or "NORMAL" in kws:
+            return [], "normals redefine the beams' n2 axes, which is not converted for U1"
+        for b in blocks:
+            if b.keyword == "TRANSFORM" and \
+                    set(self._resolve_nodes((b.param("NSET") or "").strip())) & nodes:
+                return [], "a *TRANSFORM acts on beam nodes, which is not converted for U1"
+            if b.keyword == "EQUATION" and self._u1_equation_nodes(b) & nodes:
+                return [], "an *EQUATION ties beam nodes, which is not converted for U1"
+            if b.keyword in ("SPRING", "DASHPOT") and b.has("NONLINEAR"):
+                return [], f"a nonlinear *{b.keyword} (ccx would iterate, with U1's wrong nodal forces)"
+            if b.keyword == "STEP" and any(k.startswith("NLGEO") and (v or "YES").strip().upper() != "NO"
+                                           for k, v in b.params.items()):
+                return [], "a step runs NLGEOM, which U1 cannot ('no second order')"
+            if b.keyword in PROC_KW and (b.keyword not in self._U1_PROCEDURES or b.has("RIKS")):
+                return [], (f"a *{b.keyword}{', RIKS' if b.has('RIKS') else ''} step, which U1 cannot "
+                            f"run (ccx 2.23 runs it in linear *STATIC, *FREQUENCY, *MODAL DYNAMIC "
+                            f"and *STEADY STATE DYNAMICS steps)")
+        groups = {(g[0].param("NAME") or "").strip().upper(): g for g in self._material_groups(blocks)}
+        for name in sorted({m for m, _ in self._material_uses(blocks)}):
+            extra = [g.keyword for g in groups.get(name, [])[1:] if g.keyword not in U1_MATERIAL_CARDS
+                     and (g.keyword in MATERIAL_OPTION_CARDS or g.keyword in U1_NONLINEAR_CARDS)]
+            if extra:
+                return [], (f"material {name} has *{extra[0]}: ccx iterates a nonlinear model, "
+                            f"where U1's wrong nodal forces stop it converging")
+        thermal = any(b.keyword == "TEMPERATURE" or (b.keyword == "INITIAL CONDITIONS" and
+                      (b.param("TYPE") or "").strip().upper() == "TEMPERATURE") for b in blocks)
+        loaded = self._u1_load_obstacle(blocks, member)
+        if loaded:
+            return [], loaded
+        planar = all(e in self._planar_elems for e in member)
+        if not planar and any(e in self._planar_elems for e in member):
+            return [], "2-D and 3-D beams are mixed"
+        if planar:
+            pts = [self.geom.nodes[n] for n in nodes if n in self.geom.nodes]
+            size = max(max(p[i] for p in pts) - min(p[i] for p in pts) for i in range(3)) if pts else 0.0
+            if pts and max(p[2] for p in pts) - min(p[2] for p in pts) > 1e-6 * size:
+                return [], "the 2-D beams' nodes are not in one plane z = const"
+        plans: List[Tuple[Block, dict]] = []
+        ids = {id(c) for c in cards}
+        for i, b in enumerate(blocks):
+            if id(b) not in ids:
+                continue
+            eids = [e for e, c in member.items() if c is b]
+            plan = self._u1_card_plan(blocks, i, eids, groups, planar, thermal)
+            if isinstance(plan, str):
+                return [], plan
+            plans.append((b, plan))
+        return plans, None
+
+    def _u1_equation_nodes(self, b: Block) -> set:
+        """The nodes the terms of *EQUATION card ``b`` name."""
+        out: set = set()
+        left = 0
+        for rec in merged_data_records(b):
+            f = [x.strip() for x in rec if x.strip() != ""]
+            if not f:
+                continue
+            if left <= 0:
+                try:
+                    left = int(float(f[0]))
+                except ValueError:
+                    left = 0
+                continue
+            for k in range(0, len(f) - 2, 3):
+                out.update(self._resolve_nodes(f[k]))
+                left -= 1
+        return out
+
+    def _u1_load_obstacle(self, blocks: List[Block], member: Dict[int, Block]) -> Optional[str]:
+        """Why a load on the U1 candidates ``member`` keeps them from being U1, or None: they
+        take line loads (PX, PY, PZ, P1, P2) and gravity, which become nodal forces."""
+        surf_elems = {}
+        for name, (typ, entries) in self.surfaces.items():
+            if not typ.startswith("NODE"):
+                surf_elems[name] = {e for token, _face in entries for e in self._load_elements(token)}
+        for b in blocks:
+            if b.keyword == "DLOAD":
+                for rec in merged_data_records(b):
+                    g = [x.strip() for x in rec]
+                    if len(g) < 2:
+                        continue
+                    eids = self._load_elements(g[0]) if g[0] else list(self.geom.elements)
+                    if not any(e in member for e in eids):
+                        continue
+                    label = g[1].upper()
+                    if label not in self._U1_LOADS or _is_user_load(b, g):
+                        return (f"a *DLOAD {label} acts on them (U1 takes line loads and gravity, "
+                                f"as nodal forces)")
+            elif b.keyword in ("DSLOAD", "DSFLUX", "FILM", "RADIATE"):
+                names = [x.strip().upper() for r in merged_data_records(b) for x in r[:1]]
+                if any(surf_elems.get(n, set()) & set(member) for n in names):
+                    return f"a *{b.keyword} names their element faces, which U1 has none of"
+        return None
+
+    def _u1_card_plan(self, blocks: List[Block], i: int, eids: List[int],
+                      groups: Dict[str, List[Block]], planar: bool,
+                      thermal: bool) -> Union[dict, str]:
+        """The U1 plan of section card ``blocks[i]`` over its elements ``eids``: the ccx cards
+        (material copy, one *BEAM SECTION per n1 direction) and what the loads need (the mass
+        per length); or why the card cannot be U1."""
+        b = blocks[i]
+        label = self._u1_label(b)
+        sec = self._u1_section(b) or ""
+        recs = [[x.strip() for x in r] for r in merged_data_records(b)]
+        for k in ("OFFSET1", "OFFSET2", "ORIENTATION", "DEPENDENCIES"):
+            if b.param(k):
+                return f"{label} has {k}=, which U1 cannot take"
+        p = beam_section_properties(sec, recs)
+        if isinstance(p, str):
+            return f"{label}: {p}"
+        if p.area <= 0 or p.i11 <= 0:
+            return f"{label}: its area and I11 must be positive"
+        if not planar and (p.i22 <= 0 or p.j <= 0 or p.i12 * p.i12 >= p.i11 * p.i22):
+            return f"{label}: I22 and J must be positive, and I12^2 < I11 I22"
+        size = math.sqrt(p.area)
+        for nb in blocks:              # (a flattened part keeps them apart from their section)
+            if nb.keyword in ("CENTROID", "SHEAR CENTER"):
+                try:
+                    off = [pf(x) for r in merged_data_records(nb) for x in r if x.strip()]
+                except ValueError:
+                    return f"a *{nb.keyword} does not read as numbers"
+                if any(abs(x) > 1e-9 * size for x in off):
+                    return f"a *{nb.keyword} moves a section off the beam axis, which U1 cannot"
+        if math.hypot(p.c1, p.c2) > 1e-9 * size:
+            return (f"{label}: the beam node is not at the section's centroid (offset "
+                    f"{p.c2:.4g} along n2), and U1 has no offset")
+        # the material: E, nu (G for the general section) and the density
+        density: Optional[str] = None
+        expansion = False
+        if b.keyword == "BEAM SECTION":
+            mat = (b.param("MATERIAL") or "").strip()
+            group = groups.get(mat.upper())
+            if not group:
+                return f"{label}: material '{mat}' is not defined"
+            elastic = [g for g in group if g.keyword == "ELASTIC"]
+            rows = [r for g in elastic for r in merged_data_records(g) if any(x.strip() for x in r)]
+            typ = (elastic[0].param("TYPE") or "ISOTROPIC").strip().upper() if elastic else ""
+            if len(elastic) != 1 or typ not in ("ISO", "ISOTROPIC") or len(rows) != 1:
+                return (f"material {mat} is not one isotropic, temperature-independent *ELASTIC "
+                        f"(U1 takes no other)")
+            try:
+                e_mod = pf(rows[0][0])
+                nu = pf(rows[0][1]) if len(rows[0]) > 1 and rows[0][1].strip() else 0.0
+            except ValueError:
+                return f"material {mat}: *ELASTIC does not read as numbers"
+            g_mod = e_mod / (2.0 * (1.0 + nu)) if nu > -1.0 else 0.0
+            dens = [g for g in group if g.keyword == "DENSITY"]
+            drows = [r for g in dens for r in merged_data_records(g) if any(x.strip() for x in r)]
+            if len(drows) > 1:
+                return f"material {mat}: a temperature-dependent *DENSITY"
+            density = drows[0][0].strip() if drows else None
+            expansion = any(g.keyword == "EXPANSION" for g in group)
+        else:
+            mat = ""
+            lines = [r for r in recs[2:] if any(x for x in r)]
+            if len(lines) != 1:
+                return f"{label} needs one line of E, G (and alpha), its third"
+            try:
+                vals = [pf(x) if x else 0.0 for x in lines[0]]
+            except ValueError:
+                return f"{label}: E, G do not read as numbers"
+            e_mod, g_mod = (vals + [0.0, 0.0])[:2]
+            nu = e_mod / (2.0 * g_mod) - 1.0 if g_mod > 0 else 0.0
+            expansion = len(vals) > 2 and vals[2] != 0.0
+            density = b.param("DENSITY")
+        if e_mod <= 0 or g_mod <= 0:
+            return f"{label}: Young's and shear moduli must be positive"
+        if expansion and thermal:
+            return ("the beams' material expands with temperature and the deck sets temperatures: "
+                    "ccx 2.23 gets U1's thermal strain wrong (n times too large on n elements)")
+        # the Poisson's ratio of U1's material: G (I11 + I22) = G J (3-D), as given (2-D)
+        approx = None
+        if planar:
+            nu_u1 = nu if -1.0 < nu < 0.5 else 0.0
+        else:
+            nu_u1 = e_mod * (p.i11 + p.i22) / (2.0 * g_mod * p.j) - 1.0
+            if not -1.0 + 1e-9 < nu_u1 < 0.5 - 1e-9:
+                ratio = (p.i11 + p.i22) / p.j
+                if not self._approx:
+                    return (f"{label}: U1's torsion stiffness is G (I11 + I22), here {ratio:.3g} "
+                            f"times the section's G J, and no Poisson's ratio ccx accepts (below "
+                            f"0.5) makes it G J; rerun with --approximate to accept the stiffer "
+                            f"torsion")
+                approx = ratio
+                nu_u1 = nu if -1.0 < nu < 0.5 else 0.0
+        own = b.keyword == "BEAM GENERAL SECTION" or abs(nu_u1 - nu) > 1e-12 * max(1.0, abs(nu))
+        g_u1 = e_mod / (2.0 * (1.0 + nu_u1))
+        # the principal axes (Abaqus' 2-D beams bend about the 1-axis only)
+        alpha, ia, ib = (0.0, p.i22 if p.i22 > 0 else p.i11, p.i11) if planar else principal_section(p)
+        c, s = math.cos(alpha), math.sin(alpha)
+        given: Vec = (0.0, 0.0, -1.0)
+        if not planar and len(recs) > 1 and len([x for x in recs[1] if x]) >= 3:
+            try:
+                given = tuple(pf(x) if x else 0.0 for x in recs[1][:3])
+            except ValueError:
+                return f"{label}: its n1 direction does not read as numbers"
+        dirs: "OrderedDict[Tuple[float, ...], Tuple[Vec, List[int]]]" = OrderedDict()
+        lmin = math.inf
+        for e in eids:
+            conn = self.geom.elements[e][1]
+            t = vsub(self.geom.nodes[conn[-1]], self.geom.nodes[conn[0]])
+            length = vnorm(t)
+            if length == 0.0:
+                return f"element {e} has zero length"
+            lmin = min(lmin, length)
+            t = vscale(t, 1.0 / length)
+            n2 = vcross(t, given)
+            if vnorm(n2) < 1e-6 * max(vnorm(given), 1e-300):
+                return f"{label}: n1 is parallel to the axis of element {e}"
+            n2 = vunit(n2)
+            n1 = vcross(n2, t)
+            d = vadd(vscale(n1, c), vscale(n2, s))
+            key = tuple(round(x, 9) + 0.0 for x in d)
+            dirs.setdefault(key, (d, []))[1].append(e)
+        need = 12.0 * e_mod * max(ia, ib) / (g_u1 * p.area * lmin * lmin * U1_PHI)
+        k = 10.0 ** math.ceil(math.log10(max(need, 1.0)))
+        name = mat
+        out = [f"** abq2ccx: {label} -> ccx U1 beam elements, *BEAM SECTION, SECTION=GENERAL: A, "
+               f"I1 (along n1), I12 = 0, I2 (along n2) about the principal axes, k = {k:.0e} (an "
+               f"Euler-Bernoulli beam; S6 is the torque times k)"]
+        if own:
+            name = self._u1_name(f"ABQ2CCX_U1_{(mat or 'GENERAL')[:60]}")
+            why = ("from E and G" if b.keyword == "BEAM GENERAL SECTION" else f"a copy of {mat}") + \
+                  ("" if planar or approx else ", Poisson's ratio set so that U1's torsion "
+                                                "stiffness G (I1 + I2) is the section's G J")
+            out += [f"** abq2ccx: material {name}: {why}", f"*MATERIAL, NAME={name}", "*ELASTIC",
+                    f"{short_real(e_mod, 12)}, {short_real(nu_u1, 12)}"]
+            if density:
+                out += ["*DENSITY", density]
+            if b.keyword == "BEAM SECTION":
+                for g in groups[mat.upper()]:
+                    if g.keyword == "DAMPING":
+                        out += [emit_keyword("DAMPING", g.params)] + list(g.data)
+        many = len(dirs) > 1
+        elset = (b.param("ELSET") or "").strip()
+        for d, members in dirs.values():
+            target = elset
+            if many or len(elset) > 20:         # ccx reads at most 20 characters of it here
+                target = self._u1_name("ABQ2CCX_U1")
+                self.geom.elsets[target] = members
+            out += [emit_keyword("BEAM SECTION", OrderedDict([("ELSET", target), ("MATERIAL", name),
+                                                              ("SECTION", "GENERAL")])),
+                    ", ".join(short_real(x, 12) for x in (p.area, ia, 0.0, ib, k)),
+                    ", ".join(short_real(x, 12) for x in d)]
+        if approx:
+            self.report.warn(f"[APPROX] {label} -> U1 beam elements whose torsion stiffness is "
+                             f"G (I11 + I22), {approx:.3g} times the section's G J: ccx 2.23's U1 "
+                             f"has no torsion constant, and no Poisson's ratio ccx accepts gives it "
+                             f"G J. Torsion is too stiff; bending and axial stiffness are exact. "
+                             f"Verify.", once=True)
+        rho = 0.0
+        if density:
+            try:
+                rho = pf(density.split(",")[0])
+            except ValueError:
+                rho = 0.0
+        return {"cards": out, "elements": eids, "mass": rho * p.area, "planar": planar,
+                "material": name}
+
     def _prescan(self, blocks: List[Block]) -> None:
         """Deck-wide facts that individual card handlers need: which nodes can carry
         rotations, which sets *EL PRINT / *NODE PRINT must default to, *DEPVAR sizes,
@@ -13092,12 +13723,14 @@ class Converter:
                     t = 1.0
                 for e in self.geom.elset(b.param("ELSET") or ""):
                     self._section_thick[e] = t
-            elif b.keyword == "BEAM SECTION":
-                # the second data line of a standard profile is the approximate n1 direction
+            elif b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION"):
+                # the second data line of a standard profile (and of a general section) is the
+                # approximate n1 direction
                 n1: Optional[Vec] = None
-                sec = (b.param("SECTION") or "").strip().upper()
+                sec = (b.param("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION"
+                                              else "")).strip().upper()
                 if sec in ("RECT", "CIRC", "PIPE", "BOX", "THICK PIPE", "I", "L", "HEX", "TRAPEZOID",
-                           "ELLIPSE"):
+                           "ELLIPSE", "GENERAL"):
                     n1 = (0.0, 0.0, -1.0)
                     if len(recs) > 1 and len([x for x in recs[1] if x]) >= 3:
                         try:
@@ -16206,7 +16839,10 @@ class Converter:
         held = self._planar_held_nodes(blocks)
         skew = self._planar_skew_nodes(blocks)
         fixed = [n for n in nodes if n not in held and n not in skew]
-        twist, loose = ([], 0) if getattr(self.opt, "solid_dof", False) else \
+        # U1 beams (_plan_u1_beams) have rotations of their own, no expanded section that a
+        # held rotation would stiffen: DOFs 3-5 are held on every node, as in Abaqus' plane
+        u1 = all(e in self._u1 for e in planar)
+        twist, loose = ([], 0) if getattr(self.opt, "solid_dof", False) or u1 else \
             self._planar_twist_nodes(blocks, planar, held)
         left = len(nodes) - len(fixed)
         why = (f"{left} node(s) whose DOF 3 an *EQUATION, *MPC, rigid body, coupling or *TIE "
@@ -16218,7 +16854,7 @@ class Converter:
             self._reduces("2-D beams / trusses with free out-of-plane DOFs")
             return
         self.geom.nsets[PLANAR_NODES_SET] = sorted(fixed)
-        self._planar_bc = ["*BOUNDARY"] + ([f"{PLANAR_NODES_SET}, 3, 3"] if fixed else []) + \
+        self._planar_bc = ["*BOUNDARY"] + ([f"{PLANAR_NODES_SET}, 3, {5 if u1 else 3}"] if fixed else []) + \
             [f"{n}, 4, 5" for n in twist]
         self._planar_twist = list(twist)
         effects = ([] if set(planar.values()) <= PLANAR_TRUSS_TYPES else
@@ -16226,11 +16862,18 @@ class Converter:
                     "out-of-plane buckling"]) + \
                   (["truss nodes would be mechanisms (U3 solver noise, 0 Hz modes)"]
                    if set(planar.values()) & PLANAR_TRUSS_TYPES else [])
-        self.report.note(f"Planar model: ccx runs the 2-D beams/trusses ({kinds}) as 3-D elements "
-                         f"(B21 as a B31, T2D2 as a T3D2), whose out-of-plane motion is free — "
-                         f"{'; '.join(effects)}. DOF 3 is fixed on their {len(fixed)} node(s) (node "
-                         f"set {PLANAR_NODES_SET}, model data, repeated after *BOUNDARY, OP=NEW), as "
-                         f"in Abaqus' planar model{'; ' + why if left else ''}.", once=True)
+        if u1:
+            self.report.note(f"Planar model: the 2-D beams ({kinds}) run as ccx's 3-D U1 beam, whose "
+                             f"out-of-plane motion and twist are free; DOFs 3-5 are fixed on their "
+                             f"{len(fixed)} node(s) (node set {PLANAR_NODES_SET}, model data, repeated "
+                             f"after *BOUNDARY, OP=NEW), as in Abaqus' planar model"
+                             f"{'; ' + why if left else ''}.", once=True)
+        else:
+            self.report.note(f"Planar model: ccx runs the 2-D beams/trusses ({kinds}) as 3-D elements "
+                             f"(B21 as a B31, T2D2 as a T3D2), whose out-of-plane motion is free — "
+                             f"{'; '.join(effects)}. DOF 3 is fixed on their {len(fixed)} node(s) (node "
+                             f"set {PLANAR_NODES_SET}, model data, repeated after *BOUNDARY, OP=NEW), as "
+                             f"in Abaqus' planar model{'; ' + why if left else ''}.", once=True)
         if twist:
             shown = ", ".join(map(str, twist[:5])) + (", ..." if len(twist) > 5 else "")
             circ_mids = {c[1] for e in self._circ_beam_elements(blocks)
@@ -16254,7 +16897,7 @@ class Converter:
                              f"rigid-body/coupling reference nodes are skipped; on a circular section "
                              f"only an element's middle node holds the twist alone).", once=True)
             self._reduces("2-D beam twist unrestrained")
-        if any(t not in PLANAR_TRUSS_TYPES for t in planar.values()) and \
+        if not u1 and any(t not in PLANAR_TRUSS_TYPES for t in planar.values()) and \
                 any(b.keyword in ("FREQUENCY", "COMPLEX FREQUENCY") for b in blocks):
             self.report.warn("*FREQUENCY on a planar beam model: ccx's 3-D beams keep their twist "
                              "(rotation about the beam axis), so the eigenmodes include twist modes "
@@ -17084,7 +17727,7 @@ def dedup_str(seq: Sequence[str]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
-                     "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION",
+                     "BEAM GENERAL SECTION", "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION",
                      "SPRING", "DASHPOT", "MASS", "ROTARY INERTIA", "GAP", "ORIENTATION",
                      "DISTRIBUTION", "SURFACE", "CONNECTOR SECTION"}
 # Part-level constraint cards that reference the part's own nodes/elements/sets: each
@@ -17100,8 +17743,8 @@ PART_CONSTRAINT_KW = {"EQUATION", "MPC", "RIGID BODY", "NODAL THICKNESS", "TRANS
 # element labels of a *DISTRIBUTION.
 # (Nodal loads/BCs — *CLOAD, *CFLUX, *BOUNDARY — are absent, so they take the node offset.)
 ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "DFLUX", "DFILM", "FILM", "RADIATE",
-               "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "MEMBRANE SECTION",
-               "EL PRINT", "EL FILE", "ELEMENT OUTPUT", "DISTRIBUTION"}
+               "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "BEAM GENERAL SECTION",
+               "MEMBRANE SECTION", "EL PRINT", "EL FILE", "ELEMENT OUTPUT", "DISTRIBUTION"}
 
 # Parameters whose VALUE names a node set / element set / surface / node (e.g.
 # ``*EL PRINT, ELSET=Part-1.body`` or ``*RIGID BODY, REF NODE=Part-1.ref``).  An
@@ -17477,8 +18120,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             dist_move[ref] = (rotv if rot else None) if rect else (rotp if rot or any(T) else None)
     for b in inst_blocks:
         if b.keyword in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
-                         "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION",
-                         "SPRING",
+                         "BEAM GENERAL SECTION", "MEMBRANE SECTION", "COHESIVE SECTION",
+                         "GASKET SECTION", "SURFACE SECTION", "SPRING",
                          "DASHPOT", "MASS", "ROTARY INERTIA", "GAP"):
             nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer)
             if b.has("COMPOSITE"):
@@ -17490,7 +18133,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                     if o and not re.fullmatch(r"[-+]?(\d+\.?\d*|\.\d+)([EeDd][-+]?\d+)?", o):
                         f[3] = " " + namer(prefix, o)
                         nb.data[i] = ",".join(f)
-            if rot and b.keyword == "BEAM SECTION" and len(nb.data) > 1:
+            if rot and b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION") and len(nb.data) > 1:
                 # the second data line is the beam's n1 direction: it turns with the part
                 try:
                     v = [pf(x) for x in nb.data[1].split(",") if x.strip()]
@@ -18749,7 +19392,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--quiet", action="store_true", help="suppress the report on stderr")
     ap.add_argument("--approximate", action="store_true",
                     help="opt-in: reframe constructs ccx cannot run as approximately equivalent "
-                         "ones it can (Riks->static, nu>=0.5 clamped, I-beam->equivalent RECT, "
+                         "ones it can (Riks->static, nu>=0.5 clamped, I-beam in space->U1 or RECT, "
                          "NLGEOM follower tractions->fixed nodal forces, surface elements with "
                          "rebar or mass->left out), each with a loud [APPROX] warning")
     ap.add_argument("--abaqus-umat", action="store_true",

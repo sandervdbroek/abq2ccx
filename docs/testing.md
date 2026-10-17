@@ -72,6 +72,7 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | `nle10_thickplate` | NAFEMS LE10 σyy at point D | published −5.38 MPa | −5.650 MPa, 5 % (element and mesh) |
 | `nle10_surface_elements` | the same pressure on an `SFM3D8` skin (`*DSLOAD P` on `SPOS`, element `P`, `TRVEC`) | the face-pressure result | 7 digits |
 | `beam_circ_cantilever`, `beam_pipe_box_cantilever` | tip deflection of `CIRC`, `PIPE` and `BOX` cantilevers | P L³ / 3 E I | ≤ 0.6 % |
+| `beam_u1_general`, `beam_u1_ibeam`, `beam_u1_portal` | `U1` beams: a general section with I12 ≠ 0 (tip forces along y and z, a torque, frequencies), an I-section in space (`--approximate`; against the `RECT` it would otherwise get: weak axis 68× too flexible), a planar I-section portal frame under gravity, a line load and a lateral load | unsymmetric bending theory, T L / G J, Euler–Bernoulli frequencies; the direct-stiffness frame | 1e-6 statics (the frame 2e-7); frequencies ≤ 0.5 % (rotary inertia) |
 | `beam_circ_rotation_bcs` | a held twist at pinned supports; a prescribed tip rotation | beam theory | ≤ 0.2 % |
 | `beam_circ_explicit` | a circular-section beam in `*DYNAMIC, EXPLICIT` | beam theory | 1.0 % |
 | `planar_pinned_beam`, `planar_pinned_circ_beam` | first two frequencies and the buckling load of planar `B21` beams | beam theory, Euler | ≤ 0.6 % |
@@ -168,14 +169,15 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1022 decks convert with no dangling
-reference. 206 are gated `expect_solve`: **165 solve the deck's own physics**; 14 are
+reference. 209 are gated `expect_solve`: **165 solve the deck's own physics**; 14 are
 `source_unloaded`, one is `solver_differs` (a snap-fit insert that only contact holds drifts
-out of its buckle) and 29 (3 of them also unloaded) are `reduced_physics` — concrete damaged
+out of its buckle) and 32 (3 of them also unloaded) are `reduced_physics` — concrete damaged
 plasticity (2), UHARD / VUHARD hardening (4), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
-`B32` (3), general contact (2), a dropped `*IMPERFECTION` (1). 221 mesh-only decks are
-accepted. The other 595 stop first on, or (the last row) run without, what they need:
+`B32` (3), I-section `B21` beams run as ccx's Euler–Bernoulli `U1` (3), general contact (2), a
+dropped `*IMPERFECTION` (1). 221 mesh-only decks are accepted. The other 592 stop first on, or
+(the last row) run without, what they need:
 
 | Decks | First blocker |
 | ---: | --- |
@@ -186,7 +188,7 @@ accepted. The other 595 stop first on, or (the last row) run without, what they 
 | 26 | no convergence or divergence (18), or more than the gate's 300 s (8) |
 | 16 | NLGEOM follower tractions (they convert with `--approximate`) |
 | 15 | other ccx errors, one or a few decks each |
-| 27 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections; cohesive, acoustic, pore-pressure models; composites on `S4R`) |
+| 24 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure models; composites on `S4R`) |
 | 8 | Abaqus general contact (7) or an XFEM crack (1): ccx has neither, and the converted deck runs without it — not the deck's physics, so not gated |
 
 Every one of them was checked to fail no worse than the original, unconverted deck. Fixing

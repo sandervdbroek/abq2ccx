@@ -51,7 +51,10 @@ a different model without saying so. With it, these reframings are made, each wi
 
 * `*STATIC, RIKS` → a plain, load-controlled `*STATIC` (ccx has no arc-length method);
 * `*ELASTIC` with ν ≥ 0.5 → ν = 0.475 (ccx has no hybrid elements);
-* `*BEAM SECTION, SECTION=I` → the rectangle with the same area and strong-axis inertia;
+* I-section and general beam sections in space, where no Poisson's ratio ccx accepts gives
+  ccx's `U1` beam the section's torsion stiffness → `U1` with torsion G (I11 + I22) (bending
+  exact); `SECTION=I` where `U1` cannot run (a deck with shells, NLGEOM, plasticity, …) → the
+  rectangle with the same area and strong-axis inertia;
 * surface tractions under NLGEOM that follow the surface or act per current area, and beam
   line loads under NLGEOM → fixed nodal forces;
 * surface elements that carry mass or rebar → left out of the mesh;

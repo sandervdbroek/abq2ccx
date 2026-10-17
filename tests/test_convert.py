@@ -1739,6 +1739,173 @@ def test_approximate_ibeam_to_rect():
     assert "[APPROX]" in rep.text()
 
 
+def test_i_section_properties():
+    # Abaqus' I profile: l, h, b1, b2, t1, t2, t3 — three rectangles, the web between the flanges
+    p = A.i_section(100.0, 200.0, 100.0, 100.0, 8.5, 8.5, 5.6)
+    assert abs(p.area - 2724.8) < 1e-9
+    assert abs(p.i11 - (100 * 200 ** 3 - 94.4 * 183 ** 3) / 12) < 1e-6           # strong axis
+    assert abs(p.i22 - (2 * 8.5 * 100 ** 3 + 183 * 5.6 ** 3) / 12) < 1e-6        # weak axis
+    assert abs(p.j - (2 * 100 * 8.5 ** 3 + 191.5 * 5.6 ** 3) / 3) < 1e-6         # thin-walled
+    assert p.i12 == 0.0 and abs(p.c2) < 1e-12 and p.c1 == 0.0
+    off = A.i_section(80.0, 200.0, 100.0, 100.0, 8.5, 8.5, 5.6)                 # node 20 below
+    assert abs(off.c2 - 20.0) < 1e-9
+    assert isinstance(A.i_section(100.0, 200.0, 100.0, 60.0, 8.5, 8.5, 5.6), str)
+    assert isinstance(A.i_section(100.0, 10.0, 100.0, 100.0, 8.5, 8.5, 5.6), str)
+    g = A.beam_section_properties("GENERAL", [["10.", "80.", "", "84.375", "80."]])
+    assert (g.area, g.i11, g.i12, g.i22, g.j) == (10.0, 80.0, 0.0, 84.375, 80.0)
+    assert isinstance(A.beam_section_properties("I", [["1.", "2."]]), str)
+    assert isinstance(A.beam_section_properties("L", [["1.", "2.", "0.1", "0.1"]]), str)
+
+
+def test_principal_section_turns_n1():
+    p = A.BeamSection(1000.0, 4.0e5, 1.5e5, 2.0e5, 5.4e5)
+    alpha, ia, ib = A.principal_section(p)
+    mid, rad = 3.0e5, math.hypot(1.0e5, 1.5e5)
+    assert abs(ia - (mid + rad)) < 1e-6 and abs(ib - (mid - rad)) < 1e-6
+    # the product of inertia vanishes in the turned axes, and they keep the sum
+    c, s = math.cos(alpha), math.sin(alpha)
+    assert abs(c * s * (p.i11 - p.i22) + (c * c - s * s) * p.i12) < 1e-6 * p.i11
+    assert abs(ia + ib - p.i11 - p.i22) < 1e-6
+    assert A.principal_section(A.BeamSection(1.0, 2.0, 0.0, 3.0, 1.0)) == (0.0, 3.0, 2.0)
+
+
+# a planar cantilever of two B21 beams under an I profile, clamped at node 1
+U1_PLANAR = ("*Node\n1, 0., 0.\n2, 1., 0.\n3, 2., 0.\n*Element, type=B21, elset=B\n1, 1, 2\n2, 2, 3\n"
+             "*Nset, nset=TIP\n3\n*Beam Section, elset=B, material=STEEL, section=I\n"
+             "0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008\n0., 0., -1.\n*Material, name=STEEL\n"
+             "*Elastic\n2.1e11, 0.3\n*Density\n7850.\n*Boundary\n1, ENCASTRE\n")
+U1_STEP = "*Step\n*Static\n*Cload\nTIP, 2, -1000.\n*End Step\n"
+
+
+def _u1_sections(body):
+    """The (data line, direction line) of each emitted *BEAM SECTION, SECTION=GENERAL."""
+    lines = body.splitlines()
+    return [(lines[i + 1], lines[i + 2]) for i, l in enumerate(lines)
+            if l.startswith("*BEAM SECTION") and l.endswith("SECTION=GENERAL")]
+
+
+def test_u1_planar_ibeam():
+    # a 2-D I-beam runs as ccx's U1: A, I22 (along n1), 0, I11 (along n2), a large shear
+    # factor; DOFs 3-5 held on every node; Timoshenko -> Euler-Bernoulli is reduced physics
+    body, conv, rep = convert_str(U1_PLANAR + U1_STEP)
+    assert A.U1_CARD in body and "*ELEMENT, TYPE=U1" in body and "TYPE=B21" not in body
+    p = A.i_section(0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008)
+    (data, n1), = _u1_sections(body)
+    v = [float(x) for x in data.split(",")]
+    assert abs(v[0] - p.area) < 1e-12 and abs(v[1] - p.i22) < 1e-15 and v[2] == 0.0
+    assert abs(v[3] - p.i11) < 1e-15 and v[4] >= 1e6
+    assert [float(x) for x in n1.split(",")] == [0.0, 0.0, -1.0]
+    assert "ABQ2CCX_PLANAR, 3, 5" in body
+    assert any("B21 -> U1" in r for r in conv.reduced_physics), conv.reduced_physics
+    assert "RF at U1 nodes" in rep.text()
+    # B23 (Abaqus' cubic Euler-Bernoulli beam) is U1's own formulation: exact in statics
+    body, conv, _ = convert_str((U1_PLANAR + U1_STEP).replace("B21", "B23"))
+    assert "*ELEMENT, TYPE=U1" in body and conv.reduced_physics == []
+    # ... but not in a frequency step (U1's mass matrix)
+    body, conv, _ = convert_str((U1_PLANAR + "*Step\n*Frequency\n3\n*End Step\n").replace("B21", "B23"))
+    assert "*ELEMENT, TYPE=U1" in body and any("mass" in r for r in conv.reduced_physics)
+
+
+def test_u1_general_section_exact_torsion():
+    # a general section in space: J = 0.9 (I11 + I22), so a copy of the material with
+    # nu' = (1 + nu) / 0.9 - 1 makes U1's torsion G (I11 + I22) the section's G J
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B33, elset=B\n1, 1, 2\n"
+            "*Beam General Section, elset=B, section=GENERAL, density=7850.\n"
+            "1e-3, 4e-7, 0., 2e-7, 5.4e-7\n0., 0., 1.\n2.1e11, 8.076923076923e10\n"
+            "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n2, 4, 10.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*MATERIAL, NAME=ABQ2CCX_U1_GENERAL" in body and "*DENSITY\n7850." in body
+    i = body.index("*MATERIAL, NAME=ABQ2CCX_U1_GENERAL")
+    e_mod, nu = (float(x) for x in body[i:].splitlines()[2].split(","))
+    assert abs(e_mod - 2.1e11) < 1 and abs(nu - (1.3 / 0.9 - 1.0)) < 1e-9
+    assert conv.reduced_physics == [] and "[APPROX]" not in rep.text()
+
+
+def test_u1_in_space_needs_approximate_for_open_sections():
+    deck = U1_PLANAR.replace("B21", "B31").replace("0., 0., -1.", "0., 0., 1.") + U1_STEP
+    body, conv, rep = convert_str(deck)
+    assert "TYPE=U1" not in body and "torsion stiffness is G (I11 + I22)" in body
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert "*ELEMENT, TYPE=U1" in body and "SECTION=RECT" not in body
+    assert "[APPROX]" in rep.text() and "torsion" in rep.text()
+
+
+def test_u1_refusals_keep_todays_section_handling():
+    shell = "*Node\n10, 0., 1.\n11, 1., 1.\n12, 1., 2.\n13, 0., 2.\n*Element, type=CPS4, elset=P\n9, 10, 11, 12, 13\n"
+    cases = {
+        "beside solid, spring, dashpot and mass": U1_PLANAR + shell + U1_STEP,
+        "NLGEOM": U1_PLANAR + U1_STEP.replace("*Step", "*Step, nlgeom=YES"),
+        "*BUCKLE": U1_PLANAR + "*Step\n*Buckle\n2\n*Cload\nTIP, 1, -1.\n*End Step\n",
+        "*PLASTIC": U1_PLANAR.replace("*Density", "*Plastic\n2.5e8, 0.\n*Density") + U1_STEP,
+        "*DYNAMIC": U1_PLANAR + "*Step\n*Dynamic\n0.01, 1.\n*End Step\n",
+        "CENTRIF": U1_PLANAR + U1_STEP.replace("*End Step", "*Dload\nB, CENTRIF, 10., 0., 0., 0., 0., 0., 1.\n*End Step"),
+    }
+    for why, deck in cases.items():
+        body, _, rep = convert_str(deck)
+        assert "TYPE=U1" not in body, why
+        assert why in rep.text(), (why, rep.text())
+    # with --approximate the I profile falls back to the RECT there
+    body, _, rep = convert_str(cases["NLGEOM"], approximate=True)
+    assert "SECTION=RECT" in body and "U1 beam, which carries the profile, cannot be used" in rep.text()
+
+
+def test_u1_line_load_and_gravity_become_nodal_forces_with_end_moments():
+    # PY on a U1 beam: forces q L / 2 and the cubic element's consistent moments +-q L^2 / 12;
+    # GRAV (which ccx refuses on U1) the same with rho A g
+    body, _, _ = convert_str(U1_PLANAR + "*Step\n*Static\n*Dload\nB, PY, -12.\n, GRAV, 9.81, 0., -1., 0.\n*End Step\n")
+    assert ", GRAV" not in "\n".join(_live(body))
+    cl = _live(body)[_live(body).index("*CLOAD"):]
+    loads = {(int(l.split(",")[0]), int(l.split(",")[1])): float(l.split(",")[2])
+             for l in cl[1:] if l[0].isdigit()}
+    q = -12.0 - 7850.0 * A.i_section(0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008).area * 9.81
+    assert abs(loads[(2, 2)] - q) < 1e-9 * abs(q) and abs(loads[(3, 2)] - q / 2) < 1e-9 * abs(q)
+    assert abs(loads[(1, 6)] - q / 12) < 1e-9 * abs(q) and abs(loads[(3, 6)] + q / 12) < 1e-9 * abs(q)
+    assert (2, 6) not in loads                                  # the inner moments cancel
+
+
+def test_u1_gravity_beside_solids_and_long_set_names():
+    # U1 beside a C3D8: the GRAV line keeps the solid on a set of its own; a section set
+    # name longer than 20 characters (ccx reads 20 there) gets a short alias
+    deck = (U1_PLANAR.replace("B21", "B31").replace("elset=B", "elset=A_VERY_LONG_BEAM_SET_NAME")
+            .replace("0., 0., -1.", "0., 0., 1.") + HEX.replace("1, 1,2,3,4,5,6,7,8", "9, 11,12,13,14,15,16,17,18")
+            .replace("*NODE\n1, ", "*NODE\n11, ").replace("\n2, ", "\n12, ").replace("\n3, ", "\n13, ")
+            .replace("\n4, ", "\n14, ").replace("\n5, ", "\n15, ").replace("\n6, ", "\n16, ")
+            .replace("\n7, ", "\n17, ").replace("\n8, ", "\n18, ")
+            + "*Solid Section, elset=EALL, material=STEEL\n*Boundary\n11, 1, 3\n12, 1, 3\n13, 1, 3\n14, 1, 3\n"
+            "*Step\n*Static\n*Dload\n, GRAV, 9.81, 0., -1., 0.\n*End Step\n")
+    body, conv, rep = convert_str(deck.replace("B31", "B33"), approximate=True)
+    assert "*ELEMENT, TYPE=U1" in body, rep.text()
+    assert "ABQ2CCX_U1_REST1, GRAV" in body and conv.geom.elset("ABQ2CCX_U1_REST1") == [9]
+    (data, _n1), = _u1_sections(body)
+    assert "ELSET=ABQ2CCX_U1," in body and conv.geom.elset("ABQ2CCX_U1") == [1, 2]
+
+
+def test_u1_n1_projected_per_element_direction():
+    # a frame in space: n1 (0, 0, 1) is normal to both members; a skew n1 is projected on
+    # each element's normal plane, one card per direction
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n*Element, type=B33, elset=B\n"
+            "1, 1, 2\n2, 2, 3\n*Beam General Section, elset=B, section=GENERAL\n"
+            "1e-3, 4e-7, 0., 4e-7, 7.5e-7\n0.5, 0.5, 1.\n2.1e11, 8.076923076923e10\n"
+            "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n3, 3, 10.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    dirs = sorted(tuple(float(x) for x in n1.split(",")) for _, n1 in _u1_sections(body))
+    r = 1 / math.sqrt(1.25)
+    want = [(0.0, 0.5 * r, r), (0.5 * r, 0.0, r)]
+    assert all(abs(x - y) < 1e-9 for d, w in zip(dirs, want) for x, y in zip(d, w)), dirs
+    assert sorted(conv.geom.elset(s) for s in ("ABQ2CCX_U1", "ABQ2CCX_U1_2")) == [[1], [2]]
+
+
+def test_beam_general_section_in_a_part_is_per_instance():
+    deck = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B33, elset=B\n1, 1, 2\n"
+            "*Beam General Section, elset=B, section=GENERAL\n1e-3, 4e-7, 0., 4e-7, 7.5e-7\n"
+            "0., 0., 1.\n2.1e11, 8.076923076923e10\n*End Part\n*Assembly, name=A\n"
+            "*Instance, name=I1, part=P\n*End Instance\n*End Assembly\n"
+            "*Boundary\nI1.1, 1, 6\n*Step\n*Static\n*Cload\nI1.2, 2, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=U1" in body, rep.text()
+    (data, n1), = _u1_sections(body)
+
+
 def test_nonpositive_node_number_warns():
     # Abaqus requires positive node numbers; a deck numbered from 0 (issue #3) is invalid
     # input and ccx behaves unpredictably on it, so the converter must flag it.

@@ -137,6 +137,8 @@ of the probes on the bundled examples ([testing](testing.md#2-end-to-end--valida
 | ccx's explicit increment leaves out a contact spring whose slave and master nodes are both constrained — a plane or axisymmetric model's expanded nodes against a rigid surface's — so that contact runs at the elements' increment | caps the step's maximum increment at ccx's own contact formula with the slave nodes' masses, times 0.8 | source `calcstabletimeinccont.f`; probed (a plane rigid punch bounced, the block top 3.3 times its travel; capped, it equals the punch given its motion node by node) |
 | ccx's explicit stable increment needs a density on every element (with a zero one: "time increment is too small; divergence") | gives skins in a deck with an explicit step 1e-9 of the deck's largest density and a wave speed 1e-3 of the deck's | probed (a free rigid plate moves exactly v t) |
 | ccx's `DASHPOTA` acts in `*DYNAMIC` and not in `*FREQUENCY`, as in Abaqus; ccx's `*COMPLEX FREQUENCY` needs `CORIOLIS` or `FLUTTER` (no damped eigenvalues) | passes `SPRINGA`, `DASHPOTA` and `MASS` through; a damped `*COMPLEX FREQUENCY` reaches ccx as it is, which stops | probed (a damped oscillator: 0.1 %) |
+| ccx has no I, L or other open profile and no `*BEAM GENERAL SECTION`; its 2-node user element `U1` (`*BEAM SECTION, SECTION=GENERAL`: A, I1, I12, I2, k, then n1) takes a section by its properties. It bends as an exact Euler–Bernoulli beam on any mesh once k A is large; its shear term makes it stiffer than Euler–Bernoulli; its torsion is G (I1 + I2); I12 must be 0 and n1 normal to the element | writes such beams as `U1`: principal second moments with n1 turned onto the first principal axis and projected normal to each element (one card per direction), a large k; a material copy whose Poisson's ratio sets G (I1 + I2) to G J where ccx takes one (ν < 0.5), else `U1` only with `--approximate` or in a 2-D model, whose DOFs 3–5 it holds; Timoshenko beams (`B21`, `B31`) on `U1` are reduced physics | the 2.23 binary (`e_c3d_u1`, `resultsmech_u1`); probed (cantilevers of 1–100 elements: one element's tip flexibility is a Timoshenko beam's with φ(φ − 3)/(1 + φ)); `validate_with_ccx.py` `beam_u1_*` |
+| ccx 2.23 runs `U1` only in a linear elastic model with no element it expands (beams, trusses, shells, membranes, plane elements), in linear `*STATIC`, `*FREQUENCY`, `*MODAL DYNAMIC` and `*STEADY STATE DYNAMICS` steps. Its nodal forces are wrong (RF; a step ccx iterates diverges); `GRAV`/`CENTRIF` stop it and `P1`/`P2` do nothing; a thermal strain comes out n times too large; `S` holds section forces, the torque times k; `SECTION=GENERAL` reads `ELSET` to 20 characters | uses `U1` only where the whole deck allows it — otherwise the section card stays as before, with the reason; line loads and gravity on `U1` become nodal forces with consistent end moments; warns about RF and S; gives a longer set name a short alias | probed |
 | ccx prints axisymmetric reactions per 2° sector | — (× 180 gives Abaqus' whole-circumference value) | probed |
 | ccx has no preselected output; its `*NODE FILE` rejects `A`, and `V` in steady-state dynamics | writes Abaqus' preselected field output per procedure in ccx labels ([output reference](output-reference.md)) | Abaqus 2017 "Output to the output database"; probed |
 | ccx has no contact stabilization: until contact closes, a body that only contact holds has no stiffness in those directions, and ccx's static solve lets it drift | converts the deck as written; such a corpus deck is flagged `solver_differs` | probed (`marcello_gori_snap_fit_tr1`: the insert slides out sideways and contact never forms; with its free DOFs held, it does) |
@@ -162,13 +164,13 @@ for any non-trivial deck. The converter classifies every keyword — translated,
 organisational, or commented with guidance — and the [keyword reference](keyword-reference.md)
 gives the full split.
 
-Of the 1022 corpus decks, 595 do not solve; most need what stock ccx does not have: user
+Of the 1022 corpus decks, 592 do not solve; most need what stock ccx does not have: user
 materials (353 decks), user elements (66), and other user subroutines, Riks, explicit coupled
 temperature–displacement steps, cohesive and acoustic models, Abaqus general contact. Others are
-incomplete source decks (50). Another 29 solve only a model with reduced physics — the
+incomplete source decks (50). Another 32 solve only a model with reduced physics — the
 conversion had to drop or replace part of it (concrete damaged plasticity, user hardening,
 Chaboche back-stresses, field-dependent properties, hybrid / modified / thin-shell elements,
-general contact, an imperfection), and one converges to a solution that is not the deck's (a
+Euler–Bernoulli `U1` beams for Timoshenko ones, general contact, an imperfection), and one converges to a solution that is not the deck's (a
 body that only contact holds drifts away before the contact closes) — all kept out of the
 count of faithful solves. The
 [testing page](testing.md#3-corpus--corpus-and-teststest_corpuspy) breaks them down. Fixing a first error often only exposes a second, fundamental one, so the

@@ -90,6 +90,8 @@ Under `SECTION=PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), which ccx 2.23 
 
 ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as `T3D2` — so the out-of-plane DOFs of `B21`, `B22`, `B23`, `PIPE21`, `PIPE22`, `T2D2`, `T2D3` (and their `H`/`T` variants) are free in ccx. In a planar model (no 3-D elements, all their nodes at one z) the converter fixes DOF 3 on their nodes, midside nodes included (node set `ABQ2CCX_PLANAR`, model data, repeated after `*BOUNDARY, OP=NEW`), and DOFs 4-5 at one node of a straight beam whose twist nothing restrains (on a circular section, an element's middle node: at an end node ccx 2.23 would lock the bending rotation too). The rotations are not fixed on every node (that stiffens ccx's expanded beams), so `*FREQUENCY` results include twist modes that Abaqus' planar beams do not have (warned).
 
+Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, `SECTION=I`) — `B21`, `B21H`, `B23`, `B23H`, `B31`, `B31H`, `B33`, `B33H` — are written as `U1`, all of the deck's or none (see the keyword reference). `U1` is a cubic Euler–Bernoulli beam: exact for `B23`/`B33` in statics; the shear-flexible ones lose their shear deformation, and its mass matrix differs from Abaqus' cubic beams' (reduced physics). In a 2-D model DOFs 3–5 are held at every `U1` node.
+
 ## cohesive
 
 | Abaqus type | Nodes | CalculiX |

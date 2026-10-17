@@ -31,6 +31,8 @@ Converter._plan_incompatible_slabs()   CPS4I / CPE4I -> C3D8I slabs (top nodes, 
 Converter._plan_rigid()   rigid elements -> skin solids of their rigid body, analytical
                           surfaces meshed into skins, *RIGID BODY cards -> TIE NSETs, ties to
                           rigid surfaces -> body members, ROTARYI -> point masses
+Converter._plan_u1_beams()   beams under *BEAM GENERAL SECTION / SECTION=I -> ccx's U1 element
+                             (all of them or none: see U1_CARD for what ccx 2.23 allows)
         │
         ▼
 Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANSFORM of each

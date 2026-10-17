@@ -6,7 +6,9 @@ just structurally-valid text.  It auto-detects a ``ccx`` binary (including the o
 bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
 stress (also with the pressure carried by surface elements, which ccx does not have),
 the tip deflections of circular-, pipe- and box-section cantilevers against beam
-theory, a shell plate rigidly coupled to a loaded reference point against the same plate
+theory, beams under a general or an I section run as ccx's U1 element (cantilevers about
+both axes with I12 nonzero, their twist and frequencies, an I-section portal frame under
+gravity and line loads) against beam theory and a direct-stiffness frame solution, a shell plate rigidly coupled to a loaded reference point against the same plate
 built from solids, coupled bars whose coupled nodes also carry BCs against the same
 constraints written without a coupling, a bar whose rigid end cap carries BCs on its nodes
 against the same BCs written on its reference point, circular-section beams with a held
@@ -210,6 +212,87 @@ def _solve(a, b):
                 f = m[r][c] / m[c][c]
                 m[r] = [x - f * y for x, y in zip(m[r], m[c])]
     return [m[i][n] / m[i][i] for i in range(n)]
+
+
+def dat_node_blocks(dat_path, title="displacements"):
+    """Every *NODE PRINT block of ``title`` in a ccx .dat file, in order, as {node: values}
+    (all columns: six on a node with rotations, such as a U1 beam's)."""
+    blocks, cur = [], None
+    if not os.path.exists(dat_path):
+        return blocks
+    for ln in open(dat_path):
+        if ln.strip().startswith(title):
+            cur = {}
+            blocks.append(cur)
+            continue
+        f = ln.split()
+        if cur is not None and len(f) >= 4 and f[0].isdigit():
+            cur[int(f[0])] = [float(x) for x in f[1:]]
+        elif cur is not None and f:
+            cur = None
+    return blocks
+
+
+def frame2d(nodes, elems, fixed, loads, udl=()):
+    """A plane Euler-Bernoulli frame by the direct stiffness method, with consistent loads
+    (the exact nodal solution of beam theory).  ``nodes`` {id: (x, y)}; ``elems`` [(a, b, E,
+    A, I)]; ``fixed`` {(node, dof)} with dof 1, 2 (translations) or 6 (the rotation);
+    ``loads`` {(node, dof): value}; ``udl`` [(element index, qx, qy)] global loads per length.
+    Returns {(node, dof): displacement}."""
+    ids = sorted(nodes)
+    idx = {(n, d): 3 * i + k for i, n in enumerate(ids) for k, d in enumerate((1, 2, 6))}
+    size = 3 * len(ids)
+    stiff = [[0.0] * size for _ in range(size)]
+    force = [0.0] * size
+    for key, v in loads.items():
+        force[idx[key]] += v
+    for j, (a, b, e_mod, area, inertia) in enumerate(elems):
+        (xa, ya), (xb, yb) = nodes[a], nodes[b]
+        length = math.hypot(xb - xa, yb - ya)
+        c, s = (xb - xa) / length, (yb - ya) / length
+        ea, ei = e_mod * area / length, e_mod * inertia / length ** 3
+        local = [[0.0] * 6 for _ in range(6)]
+        local[0][0] = local[3][3] = ea
+        local[0][3] = local[3][0] = -ea
+        bend = [[12, 6 * length, -12, 6 * length],
+                [6 * length, 4 * length ** 2, -6 * length, 2 * length ** 2],
+                [-12, -6 * length, 12, -6 * length],
+                [6 * length, 2 * length ** 2, -6 * length, 4 * length ** 2]]
+        at = (1, 2, 4, 5)
+        for r in range(4):
+            for q in range(4):
+                local[at[r]][at[q]] = ei * bend[r][q]
+        rot = [[0.0] * 6 for _ in range(6)]
+        for o in (0, 3):
+            rot[o][o], rot[o][o + 1], rot[o + 1][o], rot[o + 1][o + 1], rot[o + 2][o + 2] = c, s, -s, c, 1.0
+        glob = [[sum(rot[p][r] * local[p][t] * rot[t][q] for p in range(6) for t in range(6))
+                 for q in range(6)] for r in range(6)]
+        dofs = [idx[(a, 1)], idx[(a, 2)], idx[(a, 6)], idx[(b, 1)], idx[(b, 2)], idx[(b, 6)]]
+        for r in range(6):
+            for q in range(6):
+                stiff[dofs[r]][dofs[q]] += glob[r][q]
+        for k, qx, qy in udl:
+            if k == j:
+                qa, qt = qx * c + qy * s, -qx * s + qy * c        # along, across the member
+                fl = [qa * length / 2, qt * length / 2, qt * length ** 2 / 12,
+                      qa * length / 2, qt * length / 2, -qt * length ** 2 / 12]
+                for r in range(6):
+                    force[dofs[r]] += sum(rot[p][r] * fl[p] for p in range(6))
+    held = {idx[k] for k in fixed}
+    free = [i for i in range(size) if i not in held]
+    sol = _solve([[stiff[r][q] for q in free] for r in free], [force[r] for r in free])
+    u = [0.0] * size
+    for i, v in zip(free, sol):
+        u[i] = v
+    return {k: u[i] for k, i in idx.items()}
+
+
+def i_profile(h, b, tf, tw):
+    """Area, strong-axis and weak-axis second moments and the thin-walled torsion constant
+    of a doubly symmetric I profile (the flanges b x tf, the web tw between them)."""
+    hw = h - 2 * tf
+    return (2 * b * tf + hw * tw, (b * h ** 3 - (b - tw) * hw ** 3) / 12,
+            (2 * tf * b ** 3 + hw * tw ** 3) / 12, (2 * b * tf ** 3 + (h - tf) * tw ** 3) / 3)
 
 
 def hinge_bodies_reference():
@@ -705,6 +788,138 @@ def main():
                           f"{abs(v - ref) / abs(ref) * 100:.1f}% diff)" for axis, v, ref in res))
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # --- sections ccx's expanded beams cannot carry, as ccx's U1 beam element -----------
+    # A B33 cantilever with a general section (I12 nonzero, n1 not normal to the beam):
+    # tip forces along y and z against unsymmetric bending theory, a torque against
+    # T L / (G J) (U1's torsion G (I11 + I22) set to G J through a material copy's Poisson's
+    # ratio) and the first bending frequencies against the Euler-Bernoulli cantilever about
+    # the principal axes (U1 adds rotary inertia; its mass converges at O(h^2)).
+    def f_cantilever(e_mod, inertia, rho_a, length, beta=1.875104069):
+        return beta ** 2 / (2 * math.pi * length ** 2) * math.sqrt(e_mod * inertia / rho_a)
+
+    eig = "E I G E N V A L U E   O U T P U T"
+    inp = os.path.join(tmp, "u1_general.inp")
+    convert(os.path.join(EXAMPLES, "beam_u1_general.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    tips = [b.get(21) for b in dat_node_blocks(os.path.join(d, "job.dat"))[:3]]
+    freqs = dat_eigen_table(os.path.join(d, "job.dat"), eig)
+    shutil.rmtree(d, ignore_errors=True)
+    if status != "solved" or len(tips) < 3 or None in tips or len(freqs) < 2:
+        print(f"FAIL  beam_u1_general: no results ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        e_mod, g_mod, area, rho, length = 210000.0, 80769.2307692, 1000.0, 7.85e-9, 1000.0
+        i11, i12, i22, tj = 4.0e5, 1.5e5, 2.0e5, 5.4e5
+        det = i11 * i22 - i12 * i12
+
+        def tip(f1, f2):
+            """(u_y, u_z) of a tip force (f1 along n1 = z, f2 along n2 = -y): L^3 / 3E times
+            the inverse of [[I22, I12], [I12, I11]] (the integrals of x1^2, x1 x2, x2^2)."""
+            c = length ** 3 / (3 * e_mod * det)
+            d1, d2 = c * (i11 * f1 - i12 * f2), c * (-i12 * f1 + i22 * f2)
+            return -d2, d1
+        mid, rad = (i11 + i22) / 2, math.hypot((i11 - i22) / 2, i12)
+        rows = [("F_y", tips[0][1:3], tip(0.0, -100.0)), ("F_z", tips[1][1:3], tip(100.0, 0.0))]
+        rows += [("twist", [tips[2][3]], [1.0e5 * length / (g_mod * tj)])]
+        ok_static = all(abs(v - r) <= 1e-5 * max(abs(x) for x in ref) for _, got, ref in rows
+                        for v, r in zip(got, ref))
+        f_ref = [f_cantilever(e_mod, i, rho * area, length) for i in (mid - rad, mid + rad)]
+        ok_freq = all(abs(f - r) <= 0.005 * r for f, r in zip(freqs[:2], f_ref))
+        print(f"{'PASS' if ok_static and ok_freq else 'FAIL'}  beam_u1_general (B33 + *BEAM GENERAL "
+              f"SECTION, I12 /= 0, as U1): "
+              + "; ".join(f"{name} = " + ", ".join(f"{v:+.6g}" for v in got) + " (theory "
+                          + ", ".join(f"{r:+.6g}" for r in ref) + ")" for name, got, ref in rows)
+              + "; f1, f2 = " + ", ".join(f"{f:.3f}" for f in freqs[:2]) + " Hz (Euler-Bernoulli "
+              + ", ".join(f"{r:.3f}" for r in f_ref) + ")")
+        failures += 0 if ok_static and ok_freq else 1
+
+    # An I-section B31 cantilever in space, with --approximate: U1's torsion stiffness is
+    # G (I11 + I22), 381 times G J here, which no Poisson's ratio ccx accepts brings down —
+    # both bending axes exact against beam theory, the twist U1's.  The same deck with a
+    # clamped, unloaded stub beam beside it keeps U1 out (ccx stops on U1 beside any element
+    # it expands), so --approximate falls back to the RECT of equal area and strong-axis
+    # inertia: the gain is the weak axis.
+    area, i_strong, i_weak, tj = i_profile(200.0, 100.0, 8.5, 5.6)
+    e_mod, g_mod, rho, length = 210000.0, 210000.0 / 2.6, 7.85e-9, 2000.0
+    src_text = open(os.path.join(EXAMPLES, "beam_u1_ibeam.inp")).read()
+    stub = ("*NODE\n101, 0., 500., 0.\n102, 100., 500., 0.\n*ELEMENT, TYPE=B31, ELSET=STUB\n"
+            "101, 101, 102\n*BEAM SECTION, ELSET=STUB, MATERIAL=STEEL, SECTION=RECT\n10., 10.\n"
+            "0., 0., 1.\n*NSET, NSET=FAR\n101, 102\n")
+    variants = (("U1", src_text),
+                ("RECT", src_text.replace("*BOUNDARY\nROOT, 1, 6\n",
+                                          stub + "*BOUNDARY\nROOT, 1, 6\nFAR, 1, 6\n")))
+    ref = {"u_y": 1000.0 * length ** 3 / (3 * e_mod * i_strong),
+           "u_z": 100.0 * length ** 3 / (3 * e_mod * i_weak)}
+    f_ref = [f_cantilever(e_mod, i, rho * area, length) for i in (i_weak, i_strong)]
+    got = {}
+    for label, text in variants:
+        src = os.path.join(tmp, "u1_ibeam_src.inp")
+        with open(src, "w") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, "u1_ibeam.inp")
+        convert(src, inp, approximate=True)
+        d, status, out = run_ccx(ccx, env, inp)
+        blocks = dat_node_blocks(os.path.join(d, "job.dat"))[:3]
+        freqs = dat_eigen_table(os.path.join(d, "job.dat"), eig)
+        shutil.rmtree(d, ignore_errors=True)
+        if status == "solved" and len(blocks) == 3 and all(21 in b for b in blocks) and len(freqs) > 1:
+            got[label] = ({"u_y": blocks[0][21][1], "u_z": blocks[1][21][2]},
+                          blocks[2][21][3] if len(blocks[2][21]) > 3 else None, freqs[:2])
+    if set(got) != {"U1", "RECT"}:
+        print(f"FAIL  beam_u1_ibeam: no results for {', '.join(sorted({'U1', 'RECT'} - set(got)))}")
+        failures += 1
+    else:
+        (u1, twist, fu1), (rect, _, frect) = got["U1"], got["RECT"]
+        err = {k: abs(u1[k] - ref[k]) / ref[k] for k in ref}
+        twist_u1 = 1.0e4 * length / (g_mod * (i_strong + i_weak))
+        # (U1's rotary inertia lowers the strong-axis frequency by 0.4 % here)
+        ok = (max(err.values()) < 1e-4 and abs(twist - twist_u1) <= 1e-4 * twist_u1 and
+              all(abs(f - r) <= 0.01 * r for f, r in zip(fu1, f_ref)))
+        print(f"{'PASS' if ok else 'FAIL'}  beam_u1_ibeam (B31 + SECTION=I in space, --approximate "
+              f"U1): strong-axis tip deflection {u1['u_y']:.6g} (beam theory {ref['u_y']:.6g}), weak "
+              f"axis {u1['u_z']:.6g} ({ref['u_z']:.6g}), f1, f2 = {fu1[0]:.2f}, {fu1[1]:.2f} Hz "
+              f"({f_ref[0]:.2f}, {f_ref[1]:.2f}); twist {twist:.4g} = T L / G (I11 + I22), "
+              f"{(i_strong + i_weak) / tj:.0f} times stiffer than T L / G J = "
+              f"{1.0e4 * length / (g_mod * tj):.4g} ([APPROX]); the RECT gives strong / weak "
+              f"{rect['u_y']:.4g} / {rect['u_z']:.4g} ({(rect['u_y'] / ref['u_y'] - 1) * 100:+.1f} % / "
+              f"{(rect['u_z'] / ref['u_z'] - 1) * 100:+.0f} %), f1 {frect[0]:.2f} Hz")
+        failures += 0 if ok else 1
+
+    # A planar portal frame of I-sections (B23 -> U1, exact Euler-Bernoulli beams) with fixed
+    # bases under its own weight (GRAV, which ccx refuses on U1: nodal forces), a line load
+    # on the beam (P2) and a lateral load, against the direct-stiffness solution with
+    # consistent loads: every node's displacements and rotation.
+    inp = os.path.join(tmp, "u1_portal.inp")
+    convert(os.path.join(EXAMPLES, "beam_u1_portal.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    blocks = dat_node_blocks(os.path.join(d, "job.dat"))
+    shutil.rmtree(d, ignore_errors=True)
+    if status != "solved" or not blocks or len(blocks[-1]) != 25:
+        print(f"FAIL  beam_u1_portal: no results ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        col, bm = i_profile(300.0, 150.0, 10.7, 7.1), i_profile(400.0, 180.0, 13.5, 8.6)
+        nodes = {k: (0.0, 500.0 * (k - 1)) for k in range(1, 10)}
+        nodes.update({k: (750.0 * (k - 9), 4000.0) for k in range(10, 18)})
+        nodes.update({k: (6000.0, 4000.0 - 500.0 * (k - 17)) for k in range(18, 26)})
+        elems = [(k, k + 1, 210000.0, *(bm if 9 <= k <= 16 else col)[:2]) for k in range(1, 25)]
+        udl = [(j, 0.0, -7.85e-9 * e[3] * 9810.0 - (20.0 if 9 <= e[0] <= 16 else 0.0))
+               for j, e in enumerate(elems)]
+        fixed = {(n, k) for n in (1, 25) for k in (1, 2, 6)}
+        sol = frame2d(nodes, elems, fixed, {(9, 1): 20000.0}, udl)
+        res = blocks[-1]
+        top = max(abs(sol[(n, k)]) for n in nodes for k in (1, 2))
+        dev = max(abs(res[n][0] - sol[(n, 1)]) + abs(res[n][1] - sol[(n, 2)]) for n in nodes) / top
+        rdev = max(abs(res[n][5] - sol[(n, 6)]) for n in nodes) / max(abs(sol[(n, 6)]) for n in nodes)
+        ok = dev < 1e-5 and rdev < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  beam_u1_portal (B23 + SECTION=I as U1, GRAV, P2): "
+              f"sway {res[9][0]:.6g} (Euler-Bernoulli frame {sol[(9, 1)]:.6g}), mid-span "
+              f"{res[13][1]:.6g} ({sol[(13, 2)]:.6g}); largest difference {dev:.1e} of the largest "
+              f"displacement, {rdev:.1e} of the largest rotation")
+        failures += 0 if ok else 1
 
     # --- rigid coupling on shell nodes vs the same plate as solids under *Rigid Body --
     # ccx 2.23 rejects a rigid coupling on shell nodes that are not knots, so this checks the

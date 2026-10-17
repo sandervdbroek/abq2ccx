@@ -79,7 +79,8 @@ problem.
 
 **`--approximate`** (off by default) lets the converter reframe what ccx cannot run exactly
 as a close equivalent, each flagged `[APPROX]` — a Riks step as plain static, ν ≥ 0.5 as
-0.475, an I-section as an equivalent rectangle, NLGEOM follower tractions as fixed nodal
+0.475, an I-section in space as ccx's `U1` beam with too stiff a torsion (or an equivalent
+rectangle where `U1` cannot run), NLGEOM follower tractions as fixed nodal
 forces, a curved analytical rigid surface as flat facets, and a few more
 ([full list](docs/user-guide.md#--approximate)). Without it those cards are commented out
 with the reason, so ccx never silently runs a different model.
@@ -94,7 +95,7 @@ prints one `PASS` line per check, about seventy in all; [testing](docs/testing.m
 | --- | --- | --- |
 | NAFEMS LE10 thick plate (`*NCOPY`, `*ELGEN`, pressure face) | published σyy at D = −5.38 MPa | −5.650 MPa, 5 % (element and mesh) |
 | the same plate loaded through `SFM3D8` surface elements | its face-pressure result | 7 digits |
-| circular, pipe, box and planar beams; beam line loads; pinned, tied and hinged spans | beam theory, Euler buckling | ≤ 1.3 % |
+| circular, pipe, box and planar beams; I and general sections as ccx's `U1` beam (cantilevers, a portal frame); beam line loads; pinned, tied and hinged spans | beam theory, Euler buckling, the direct-stiffness frame | ≤ 1.3 % |
 | Cook's membrane under a shear traction; a thick cylinder under a radial traction | published 23.96; Lamé | 0.12 %; 0.02 % |
 | rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads, connectors, `*MPC`s and rotations on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
 | per-element `*DISTRIBUTION` orientations (a solid plate, a composite shell) | one `*ORIENTATION` per element | ≤ 3e-11 |
@@ -110,10 +111,10 @@ prints one `PASS` line per check, about seventy in all; [testing](docs/testing.m
 A **corpus of 1022 genuine Abaqus decks** from about 180 public repositories (CAE exports,
 UMAT and UEL decks, explicit and coupled models, …) is fetched on demand and run through
 convert → integrity check → ccx. On ccx 2.23 all 1022 convert with no dangling reference;
-**165 solve the deck's own physics**; 41 more solve but stay out of that count — 14 load
-nothing in the source deck, 29 (3 of them also unloaded) solve a model with reduced physics,
+**165 solve the deck's own physics**; 44 more solve but stay out of that count — 14 load
+nothing in the source deck, 32 (3 of them also unloaded) solve a model with reduced physics,
 and one converges to a solution that is not the deck's (a part that only contact holds drifts
-away in ccx) — and 221 mesh-only decks are accepted. The other 595 need what ccx cannot run — mostly user
+away in ccx) — and 221 mesh-only decks are accepted. The other 592 need what ccx cannot run — mostly user
 materials (353) and user elements (66). See [testing](docs/testing.md).
 
 ## How it works

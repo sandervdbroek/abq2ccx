@@ -1,0 +1,51 @@
+*HEADING
+U1 beam: an I-section cantilever (200 x 100 x 8.5 x 5.6, web along y) under tip forces about
+both axes, a torque, and its first frequencies.  Units mm, N, MPa, t.
+*NODE
+1, 0., 0., 0.
+21, 2000., 0., 0.
+*NGEN, NSET=AXIS
+1, 21
+*ELEMENT, TYPE=B31, ELSET=BEAM
+1, 1, 2
+*ELGEN, ELSET=BEAM
+1, 20, 1, 1
+*NSET, NSET=ROOT
+1
+*NSET, NSET=TIP
+21
+*BEAM SECTION, ELSET=BEAM, MATERIAL=STEEL, SECTION=I
+100., 200., 100., 100., 8.5, 8.5, 5.6
+0., 0., 1.
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*DENSITY
+7.85E-9
+*BOUNDARY
+ROOT, 1, 6
+*STEP
+*STATIC
+*CLOAD
+TIP, 2, 1000.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*STATIC
+*CLOAD, OP=NEW
+TIP, 3, 100.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*STATIC
+*CLOAD, OP=NEW
+TIP, 4, 1.E4
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*FREQUENCY
+4
+*END STEP

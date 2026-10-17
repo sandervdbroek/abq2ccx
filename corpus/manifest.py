@@ -13,7 +13,7 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
 dangling references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (206) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (209) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
@@ -22,11 +22,12 @@ dangling references). Each entry carries one of three expectations:
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
-  - ``reduced_physics='<what>'`` (29, 3 of them also source_unloaded): the conversion
+  - ``reduced_physics='<what>'`` (32, 3 of them also source_unloaded): the conversion
     drops or replaces part of the Abaqus model - a constitutive behaviour (concrete
     damaged plasticity, user hardening, Chaboche back-stresses, field-dependent
     elasticity), an element formulation (hybrid, modified or thin-shell elements run as
-    ccx's plain ones, linear circular-section beams as 3-node ones), a section control,
+    ccx's plain ones, linear circular-section beams as 3-node ones, Timoshenko beams as ccx's
+    Euler-Bernoulli U1), a section control,
     an interaction (general contact) or an imperfection - so ccx solves a different
     problem (``Converter.reduced_physics``; test_corpus.py checks the flag matches);
   - ``solver_differs='<why>'`` (1): the conversion keeps the deck's physics, but ccx's
@@ -37,7 +38,7 @@ dangling references). Each entry carries one of three expectations:
 * ``parse_only=True`` (221) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (595) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (592) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -1906,13 +1907,13 @@ CORPUS = [
          exercises='CPE4R — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
          url='https://raw.githubusercontent.com/BristolCompositesInstitute/abaqus-modern-fortran/main/jobs/single-element.inp'),
-    dict(name='burakbayramli_beam_problem_keyword', expect_solve=False, license='see source repo',
-         exercises='B21 — mesh-gen',
-         note='ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile (--approximate runs it as the RECT of equal area and strong-axis inertia)',
+    dict(name='burakbayramli_beam_problem_keyword', expect_solve=True, license='see source repo',
+         exercises='B21 -> U1 (SECTION=I) — mesh-gen',
+         reduced_physics='B21 -> U1: an Euler-Bernoulli beam (ccx has no I profile; its U1 beam carries the section exactly, without shear deformation)',
          url='https://raw.githubusercontent.com/burakbayramli/books/master/Introduction_to_Finite_Element_Analysis_Using_MATLAB_Khennane/List_of_Abaqus_files/Beam_Problem_keyword.inp'),
-    dict(name='burakbayramli_frame_problem_keyword', expect_solve=False, license='see source repo',
-         exercises='B21 — mesh-gen',
-         note='ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile (--approximate runs it as the RECT of equal area and strong-axis inertia)',
+    dict(name='burakbayramli_frame_problem_keyword', expect_solve=True, license='see source repo',
+         exercises='B21 -> U1 (SECTION=I) — mesh-gen',
+         reduced_physics='B21 -> U1: an Euler-Bernoulli beam (ccx has no I profile; its U1 beam carries the section exactly, without shear deformation)',
          url='https://raw.githubusercontent.com/burakbayramli/books/master/Introduction_to_Finite_Element_Analysis_Using_MATLAB_Khennane/List_of_Abaqus_files/Frame_Problem_keyword.inp'),
     dict(name='burakbayramli_lshapeheat', expect_solve=False, license='see source repo',
          exercises='DC2D3, DC2D4 — parts/instances/assembly; thermal',
@@ -1930,9 +1931,9 @@ CORPUS = [
          exercises='CPE4 — *Parameter; contact',
          note="ccx limitation: VCCT debonding — *INITIAL CONDITIONS, TYPE=CONTACT (bonded crack faces), *DEBOND and *FRACTURE CRITERION — and the direct-cyclic *FATIGUE step have no ccx equivalent; without the bond ccx stops in step 1 ('too many cutbacks')",
          url='https://raw.githubusercontent.com/CAEAssistant-Group/Fatigue-induced-debonding-of-a-double-cantilever-beam-in-Abaqus/main/Abaqus_Double_Cantilever_Beam_Fatigue_2024.inp'),
-    dict(name='chang_liu_0520_h_shape_20steel_beam_20element', expect_solve=False, license='see source repo',
-         exercises='B21 — parts/instances/assembly',
-         note="ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile, so ccx stops ('gen3delem: first thickness ... is zero'); it solves only with --approximate (an equivalent RECT section)",
+    dict(name='chang_liu_0520_h_shape_20steel_beam_20element', expect_solve=True, license='see source repo',
+         exercises='B21 -> U1 (SECTION=I) — parts/instances/assembly',
+         reduced_physics='B21 -> U1: an Euler-Bernoulli beam (ccx has no I profile; its U1 beam carries the section exactly, without shear deformation)',
          url='https://raw.githubusercontent.com/Chang-Liu-0520/FEM-of-H-shape-steel-using-ABAQUS/master/H-shape%20steel-beam%20element.inp'),
     dict(name='cmmai_job_1', expect_solve=False, license='see source repo',
          exercises='C3D8 — parts/instances/assembly; UMAT',
@@ -2343,7 +2344,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/jgomezc1/ABAQUS-US/master/INPUT_FILES/UNIUSER_UEL8.inp'),
     dict(name='jiangk_cn_teeter', expect_solve=False, license='see source repo',
          exercises='B31, CONN3D2 BEAM + HINGE — parts/instances/assembly; *Orientation; *Frequency',
-         note='ccx limitation: *BEAM GENERAL SECTION (no ccx card: the beams have no section) and a beam-end *SURFACE (END1) ccx rejects; the BEAM connector -> *RIGID BODY on the kinematic coupling, the HINGE commented out (it would hold a rigid-body member at zero)',
+         note="ccx limitation: *BEAM GENERAL SECTION (ccx's U1 beam carries it, but not beside the deck's couplings: the beams have no section) and a beam-end *SURFACE (END1) ccx rejects; the BEAM connector -> *RIGID BODY on the kinematic coupling, the HINGE commented out (it would hold a rigid-body member at zero)",
          url='https://raw.githubusercontent.com/jiangk-cn/Abaqus_MAC/master/Abaqus_teeter_inp/teeter.inp'),
     dict(name='jianyingwu_bending_umat', expect_solve=False, license='see source repo',
          exercises='CPS4T — UMAT; coupled temp-displacement',
@@ -2451,7 +2452,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/8.%20Modal%20Analysis/4.%20Mode%20Participation%20Factor%20and%20Effective%20Mass/DOF.inp'),
     dict(name='marcello_gori_harmonic_analysis', expect_solve=False, license='MIT',
          exercises='S4, B31 — parts/instances/assembly; *Frequency',
-         note='ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile (--approximate runs it as the RECT of equal area and strong-axis inertia)',
+         note="ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile, and ccx 2.23's U1 beam, which carries it, cannot share a deck with the S4 shells (--approximate runs it as the RECT of equal area and strong-axis inertia)",
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/12.%20Project.%20Two-Story%20Building/Harmonic_Analysis.inp'),
     dict(name='marcello_gori_job_1_3', expect_solve=False, license='MIT',
          exercises='C3D8, C3D6 — parts/instances/assembly',
@@ -2480,7 +2481,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/9.%20Damping/1.%20Spring%20Dashpot%20Damping/Spring_Mass_Damper.inp'),
     dict(name='marcello_gori_static_all_modal_nlgeom', expect_solve=False, license='MIT',
          exercises='S4, B31 — parts/instances/assembly; *Frequency',
-         note='ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile (--approximate runs it as the RECT of equal area and strong-axis inertia)',
+         note="ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile, and ccx 2.23's U1 beam, which carries it, cannot share a deck with the S4 shells or run NLGEOM (--approximate runs it as the RECT of equal area and strong-axis inertia)",
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/12.%20Project.%20Two-Story%20Building/Static_All_Modal_NLGEOM.inp'),
     dict(name='mauroarcidiacono_hcp_umat', expect_solve=False, license='MIT',
          exercises='C3D8 — parts/instances/assembly; UMAT',
@@ -2956,7 +2957,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/Oyvindwpetersen/abaqustools/main/example/frame/frame_structure.inp'),
     dict(name='oyvindwpetersen_simple_truss', expect_solve=False, license='GPL-3.0',
          exercises='B31 — parts/instances/assembly; *Frequency',
-         note='ccx limitation: *BEAM GENERAL SECTION (no ccx card)',
+         note="ccx limitation: *BEAM GENERAL SECTION in space: ccx 2.23's U1 beam, which carries it, takes torsion as G (I11 + I22), twice the section's G J here, and no Poisson's ratio ccx accepts corrects that; with --approximate the static step solves, and ccx's ARPACK finds 34 of the 50 eigenvalues the *FREQUENCY step asks for ('too many eigenvalues requested')",
          url='https://raw.githubusercontent.com/Oyvindwpetersen/abaqustools/main/example/truss/simple_truss.inp'),
     dict(name='oyvindwpetersen_simple_trussjointc', expect_solve=False, license='GPL-3.0',
          exercises='B31, JOINTC — parts/instances/assembly; *Orientation; *Frequency',

@@ -106,9 +106,18 @@ without an error. A full audit and the work that followed:
   argument ccx supplies differently. The temperature line ccx reads after a multiple of 8
   constants is added; thermal user materials (ccx's empty `umatht`) and VUMATs are warned.
 
-Corpus: 165 decks solve their own problem; 29 more solve with reduced physics, 14 load
+* **Beam sections the expanded beams cannot carry** — `*BEAM GENERAL SECTION` and `SECTION=I`
+  run as ccx 2.23's 2-node beam `U1` where the whole deck allows it (probed: an exact
+  Euler–Bernoulli beam once its shear area is large, a wrong shear term, torsion G (I11 + I22),
+  wrong nodal forces, linear static and modal steps only, no element ccx expands beside it):
+  principal axes, n1 projected per element, a material copy for G J, line loads and gravity as
+  nodal forces with consistent end moments; in space where G J cannot be had, only with
+  `--approximate`, which otherwise keeps the I → `RECT` route. Three planar I-beam decks solve
+  (Euler–Bernoulli for Timoshenko beams: reduced physics).
+
+Corpus: 165 decks solve their own problem; 32 more solve with reduced physics, 14 load
 nothing (3 both) and one drifts to a solution that is not the deck's; 221 mesh-only decks are
-accepted, 595 need what ccx cannot run.
+accepted, 592 need what ccx cannot run.
 
 ## 1.1.0 (July 2026)
 

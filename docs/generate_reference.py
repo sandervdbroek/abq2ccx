@@ -81,7 +81,22 @@ TRANSLATED = {
         "`SECTION=PIPE` (outer radius, wall thickness) and `BOX` (`a, b, t1..t4`) data pass through, "
         "as both codes read them alike, and `THICK PIPE` → `PIPE`; ccx 2.23 runs these sections only "
         "on `B32R`, so their beams become `B32R` (2-node ones with an inserted midside node; see the "
-        "element reference).",
+        "element reference). `SECTION=I` (doubly symmetric, the node at its centroid) runs as ccx's "
+        "`U1` beam where the deck allows it (see `*BEAM GENERAL SECTION`); otherwise it is commented "
+        "out, and under `--approximate` becomes the `RECT` of equal area and strong-axis inertia.",
+    "*BEAM GENERAL SECTION": "`SECTION=GENERAL` (A, I11, I12, I22, J; n1; E, G) → ccx 2.23's 2-node "
+        "beam `U1` (`*USER ELEMENT`, `*BEAM SECTION, SECTION=GENERAL`) with a material from E, G and "
+        "`DENSITY`: the principal second moments, n1 turned onto the first principal axis and "
+        "projected normal to each element (one card per direction), a shear area that makes `U1` an "
+        "Euler–Bernoulli beam (its shear term is wrong in 2.23) and a Poisson's ratio that sets its "
+        "torsion G (I11 + I22) to G J. `U1` runs only in a linear elastic, isothermal deck without "
+        "elements ccx expands, constraints on beam nodes, NLGEOM, `*BUCKLE` or `*DYNAMIC`; there, and "
+        "in space where no Poisson's ratio below 0.5 gives G J (unless `--approximate`; a 2-D model "
+        "holds DOFs 3–5 instead), the card is commented out with the reason. Line loads and gravity "
+        "on `U1` become nodal forces with consistent end moments; RF at `U1` nodes is wrong in ccx "
+        "2.23 (warned). `*CENTROID` / `*SHEAR CENTER` off the axis keep the beams off `U1`; after a "
+        "`U1` section they and `*TRANSVERSE SHEAR STIFFNESS`, `*SECTION POINTS` are commented out "
+        "with a note.",
     "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept (dropped on explicit "
         "steps, which Abaqus/Explicit runs without it); `PERTURBATION` kept only for "
         "`*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then persist); "
@@ -552,6 +567,13 @@ def gen_elements():
                          "rotations are not fixed on every node (that stiffens ccx's expanded beams), so "
                          "`*FREQUENCY` results include twist modes that Abaqus' planar beams do not "
                          "have (warned).\n")
+            types = ", ".join(f"`{t}`" for t in sorted(A.U1_TYPES))
+            parts.append("Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL "
+                         f"SECTION`, `SECTION=I`) — {types} — are written as `U1`, all of the deck's "
+                         "or none (see the keyword reference). `U1` is a cubic Euler–Bernoulli beam: "
+                         "exact for `B23`/`B33` in statics; the shear-flexible ones lose their shear "
+                         "deformation, and its mass matrix differs from Abaqus' cubic beams' (reduced "
+                         "physics). In a 2-D model DOFs 3–5 are held at every `U1` node.\n")
     return "\n".join(parts)
 
 
