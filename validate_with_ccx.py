@@ -814,6 +814,28 @@ def main():
         failures += 0 if ok else 1
     else:
         failures += 1
+    # a second link (10 above the first, loaded less) on a second LINK line of the same card:
+    # ccx reads one MPC per *MPC card, so each *MPC BEAM needs its own (both in one card
+    # stop ccx: 'increase nk_')
+    second = [("3, 7., 1., 0.\n", "3, 7., 1., 0.\n11, 0., 0., 10.\n12, 3., 4., 10.\n13, 7., 1., 10.\n"),
+              ("*Nset, nset=FIXED\n1, 3\n", "*Nset, nset=FIXED\n1, 3, 11, 13\n"),
+              ("*Nset, nset=ALLN\n1, 2, 3\n", "*Nset, nset=ALLN\n1, 2, 3, 11, 12, 13\n"),
+              ("elset=SPRING\n1, 3, 2\n", "elset=SPRING\n1, 3, 2\n2, 13, 12\n"),
+              ("LINK, 2, 1\n", "LINK, 2, 1\nLINK, 12, 11\n"), ("2, 3, 3\n", "2, 3, 3\n12, 3, 3\n"),
+              ("*Step\n*Static\n", "*Step, nlgeom=YES\n*Static\n0.05, 1., 1e-5, 0.25\n"),
+              ("2, 1, 10.", "2, 1, -2000.\n12, 1, -1500.")]
+    u = solve("mpc_link", subs=second, nodes=(2, 12))
+    if u:
+        lengths = [math.dist((3 + u[n][0], 4 + u[n][1], u[n][2]), (0.0, 0.0, 0.0)) for n in (2, 12)]
+        turns = [math.degrees(math.atan2(4 + u[n][1], 3 + u[n][0]) - math.atan2(4, 3))
+                 for n in (2, 12)]
+        ok = max(rel(x, 5.0) for x in lengths) < 1e-6 and min(turns) > 10
+        print(f"{'PASS' if ok else 'FAIL'}  mpc_link, two LINK lines in one card, NLGEOM: lengths "
+              f"{lengths[0]:.7f} / {lengths[1]:.7f} (5) after turning {turns[0]:.1f} / "
+              f"{turns[1]:.1f} degrees")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
     # --- connector elements (CONN3D2): ccx has no connector element; abq2ccx writes each
     # connector's kinematic constraint as *EQUATION / *BOUNDARY / *RIGID BODY / *MPC -------
     # the same joints, lever and link as above, written as connectors, must give the same

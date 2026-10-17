@@ -267,6 +267,25 @@ def test_mpc_link_linearised_or_ccx_beam():
     assert "*MPC\nBEAM, 2, 1" in body and "[APPROX] *MPC LINK" in rep.text()
 
 
+def test_mpc_lines_ccx_reads_get_one_card_each():
+    # ccx reads one MPC per *MPC card — its type from the first line, every later node as a
+    # further node of it — and reserves a BEAM MPC's extra node once per card (probed: two
+    # BEAM lines in one card stop ccx, 'increase nk_'; a second PLANE / STRAIGHT line's
+    # nodes silently land on the first line's plane / line).  So each LINK node pair under
+    # NLGEOM — of several lines, or of one line pairing node sets — and each PLANE /
+    # STRAIGHT line gets a card of its own, in deck order
+    deck = ("*Node\n1,0,0,0\n2,3,4,0\n11,0,0,10\n12,3,4,10\n21,0,0,20\n22,3,4,20\n"
+            "31,0,0,-2\n32,1,0,-2\n33,0,1,-2\n34,.3,.3,-2\n41,0,0,-5\n42,1,0,-5\n43,.5,0,-5\n"
+            "*Nset,nset=A\n22, 12\n*Nset,nset=B\n21, 11\n*MPC\nLINK, 2, 1\nPLANE, 31, 32, 33, 34\n"
+            "LINK, A, B\nSTRAIGHT, 41, 42, 43\n*Step, nlgeom=YES\n*Static\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    lines = _live(body)
+    cards = [lines[i + 1:i + 3] for i, l in enumerate(lines) if l == "*MPC"]
+    assert [c[0] for c in cards] == ["BEAM, 2, 1", "PLANE, 31, 32, 33, 34", "BEAM, 12, 11",
+                                     "BEAM, 22, 21", "STRAIGHT, 41, 42, 43"]
+    assert all(c[1].startswith("*") for c in cards)                 # one line per card
+
+
 def test_mpc_beam_lines_become_rigid_bodies():
     # BEAM ties displacements AND rotations of the first node to a rigid beam from the
     # second: lines sharing a second node — or chained through one another — form one

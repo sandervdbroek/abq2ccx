@@ -8057,14 +8057,20 @@ class Converter:
         """Abaqus ``*MPC``, converted line by line (a line ccx cannot take is commented out
         on its own, the rest of the card is kept), from the deck-wide plan of _plan_mpcs:
 
-        * PLANE / STRAIGHT: native ccx MPCs, kept;
+        * PLANE / STRAIGHT: native ccx MPCs, kept, each line in a card of its own (as the
+          *MPC BEAM of a LINK below): ccx reads one MPC per *MPC card, its type from the
+          first line and every later node as a further node of it, and reserves the extra
+          node of a BEAM MPC once per card (mpcs.f, allocation.f; probed on 2.23: two BEAM
+          lines in one card stop ccx, 'increase nk_', and ccx silently puts a second PLANE /
+          STRAIGHT line's nodes on the first line's plane / straight line);
         * PIN (equal displacements) and TIE (all common DOFs equal) -> per-DOF *EQUATION,
           exact; TIE ties rotations only between shell/beam nodes, which get knot beams —
           ccx ignores DOFs 4-6 of a non-knot shell/beam node in an *EQUATION (probed: a
           tied beam joint stays a hinge);
         * LINK (constant distance, rotations free) -> its linearised *EQUATION when no step
-          runs NLGEOM, else ccx's *MPC BEAM, which keeps the distance between two nodes
-          (probed) but rejects nodes of beam/truss/shell/membrane/plane elements;
+          runs NLGEOM, else ccx's *MPC BEAM, one card per node pair, which keeps the distance
+          between two nodes (probed) but rejects nodes of beam/truss/shell/membrane/plane
+          elements;
         * BEAM (rigid beam: displacements AND rotations) -> one *RIGID BODY per independent
           node, emitted at the card where its first line appears;
         * user MPCs (a numeric type) and the other Abaqus types are commented out."""
@@ -8120,8 +8126,8 @@ class Converter:
                                      "rotations of two shell/beam nodes (made ccx knots for it) "
                                      "and the temperature in thermal steps.", once=True)
         out: List[str] = []
-        if native:
-            out += ["*MPC"] + native
+        for line in native:                 # one card per MPC (see above)
+            out += ["*MPC", line]
         out += eqs
         for body in self._mpc_bodies.get(id(b), []):
             out += self._mpc_rigid_body(body)

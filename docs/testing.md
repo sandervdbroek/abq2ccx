@@ -69,7 +69,7 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `equation_overconstraint` | an `*EQUATION` on a BC'd DOF, a duplicate, a loop of ties | ccx rejects the deck as written | solves, ties held |
 | `mpc_beam_lever` | `*MPC BEAM` lever, linear and NLGEOM | statics; a 10⁴× stiffer beam lever | 0.04 %; ≤ 4e-5 |
 | `mpc_pin_tie_joints` | `PIN` hinge and `TIE` joint between beam spans | beam theory | 0.33 % |
-| `mpc_link` | `LINK`, linearised and NLGEOM | statics; constant length | exact; 1e-7 |
+| `mpc_link` | `LINK`, linearised and NLGEOM (also two `LINK` lines in one card) | statics; constant length | exact; 1e-7 |
 | connector variants of the three `*MPC` examples | `JOIN`, `WELD`, `BEAM`, `LINK` connectors | the `*MPC` versions | exact |
 | `connector_hinge_beams` | a `HINGE` releases in-plane bending and transmits out-of-plane | beam theory | 0.33 % |
 | `connector_hinge_bodies` | a hinge between two rigid bodies, oblique axis, offset joint | exact solution | 6e-8 |

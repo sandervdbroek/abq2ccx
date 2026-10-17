@@ -40,6 +40,10 @@ without an error. A full audit and the work that followed:
   line by line; `*EQUATION` overconstraints settled exactly; BCs on rigid-constraint members
   resolved as Abaqus does; connector elements without a behaviour as their constraints,
   also on transformed nodes; `*TRANSFORM` cases ccx gets wrong handled or warned.
+* **One `*MPC` card per ccx MPC** — `PLANE` and `STRAIGHT` lines, and the `*MPC BEAM` of each
+  `LINK` node pair under NLGEOM, each get a card of their own, as ccx reads one MPC per card:
+  two `LINK` pairs in one card stopped ccx ("increase nk_"), and a second `PLANE` or
+  `STRAIGHT` line's nodes were silently put on the first line's plane or line.
 * **Materials and orientations** — per-element `*DISTRIBUTION` orientations; the elastic
   forms ccx 2.23 needs beside orthotropic and anisotropic expansion; halved ANISO expansion
   shear coefficients; zero-shear ANISO written as ORTHO; default initial temperatures.
