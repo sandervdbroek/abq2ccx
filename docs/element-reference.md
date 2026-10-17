@@ -4,7 +4,7 @@
 
 Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged. A substitution is exact only where noted; any other replaces Abaqus' element formulation, which the converter records as reduced physics (`Converter.reduced_physics`, a header warning): ccx then solves a different discretization than Abaqus.
 
-Direct CalculiX types: **68**. Total recognised: **167**.
+Direct CalculiX types: **68**. Total recognised: **175**.
 
 ## 3D continuum
 
@@ -184,6 +184,14 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
+| `DC2D3` | 3 | → `CPS3` (exact) |
+| `DC2D4` | 4 | → `CPS4` (exact) |
+| `DC2D6` | 6 | → `CPS6` (exact) |
+| `DC2D8` | 8 | → `CPS8` (exact) |
+| `DCAX3` | 3 | → `CAX3` (exact) |
+| `DCAX4` | 4 | → `CAX4` (exact) |
+| `DCAX6` | 6 | → `CAX6` (exact) |
+| `DCAX8` | 8 | → `CAX8` (exact) |
 | `GK2D4` | 4 | → `CPE4` (substituted: reduced physics) |
 | `GK2D6` | 6 | flagged — no ccx equivalent |
 | `GK3D6` | 6 | → `C3D6` (substituted: reduced physics) |

@@ -30,7 +30,10 @@ TRANSLATED = {
         "`*NORMAL` line for each shell element there, as Abaqus uses it (ccx would average the "
         "element normals); on beam nodes it is dropped (reduced physics).",
     "*NGEN / *NFILL / *NCOPY / *ELGEN / *ELCOPY": "expanded into explicit `*NODE`/`*ELEMENT` "
-        "(CalculiX has no mesh-generation cards).",
+        "(CalculiX has no mesh-generation cards); an `*NFILL` set holds its bounding nodes too, as in "
+        "Abaqus. `*NMAP` maps the coordinates (`RECTANGULAR`, `CYLINDRICAL`, `SPHERICAL`, `ROTATION`, "
+        "`TRANSLATION`, `SCALE`; `*NODE` normals turn with the local axes); `DIAMOND`, `TOROIDAL`, "
+        "`BLENDED` are not converted (reduced physics).",
     "*PART / *INSTANCE / *ASSEMBLY": "flattened into one global numbering (instance transform "
         "applied, references resolved, names kept ≤80 chars); part-level constraints (`*EQUATION`, "
         "`*MPC`, `*RIGID BODY`, `*COUPLING`, ...) copied per instance; a part's `*DISTRIBUTION` gets "
@@ -118,7 +121,10 @@ TRANSLATED = {
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes).",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
         "accuracy/vectors/iterations.",
-    "*HEAT TRANSFER": "`END=` / `MXDEM` dropped.",
+    "*HEAT TRANSFER": "`END=` / `MXDEM` dropped. A transient step without `DELTMX` gets `DIRECT`: "
+        "Abaqus then takes fixed increments of the initial increment, ccx its own. A transient step "
+        "with temperature DOFs and no initial temperatures starts every node at 0, the Abaqus "
+        "default (ccx 2.23 stops without them).",
     "*COUPLED TEMPERATURE-DISPLACEMENT": "passed through. ccx 2.23 solves the transient form as a "
         "dynamic step (HHT) with the mass of every `*DENSITY` and `*MASS`, where Abaqus/Standard "
         "neglects inertia: in such a deck the densities and `*MASS` values are divided by 10³⁰ and "
@@ -242,7 +248,7 @@ TRANSLATED = {
         "BCs (a duplicate, a loop's closing tie) dropped. A term on DOFs 4-6 of a rigid-body "
         "reference point → its `ROT NODE`'s DOFs 1-3 (ccx ignores DOFs 4-6 of the REF NODE); an "
         "equation with a term on DOFs 4-6 of any other node with a `*TRANSFORM` is commented out "
-        "(ccx 2.23 misreads such terms).",
+        "(ccx 2.23 misreads such terms). Each equation of a card is resolved on its own.",
     "*KINEMATIC COUPLING": "every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF "
         "range (the reference node's DOFs 4-6 then take BCs and moments natively); rotation lines "
         "on shell/beam nodes become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`).",
@@ -352,7 +358,8 @@ TRANSLATED = {
     "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for "
         "strain hardening with m ≠ 0); other laws → `LAW=USER`.",
     "*AMPLITUDE": "keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; "
-        "`SMOOTH STEP` sampled, `EQUALLY SPACED` expanded, `VALUE=ABSOLUTE` warned, "
+        "`SMOOTH STEP` sampled, `EQUALLY SPACED` expanded, `PERIODIC` / `MODULATED` / `DECAY` "
+        "sampled over the steps' time (200 points a period), `VALUE=ABSOLUTE` warned, "
         "`DEFINITION=USER` (Abaqus `UAMP`) commented, naming ccx's `uamplitude.f`. (`*AMP` alias "
         "accepted.)",
     "*RESTART": "keeps `WRITE`/`READ`/`FREQUENCY`/`STEP`; other params dropped.",

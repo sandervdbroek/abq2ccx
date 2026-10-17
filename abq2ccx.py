@@ -102,6 +102,7 @@ ELEMENT_NNODES: Dict[str, int] = {
     # heat-transfer continuum (Abaqus-compatible names accepted by ccx)
     "DC3D4": 4, "DC3D6": 6, "DC3D8": 8, "DC3D10": 10, "DC3D15": 15, "DC3D20": 20,
     "DC1D2": 2, "DC1D3": 3,
+    "DC2D3": 3, "DC2D4": 4, "DC2D6": 6, "DC2D8": 8, "DCAX3": 3, "DCAX4": 4, "DCAX6": 6, "DCAX8": 8,
     # surface elements (load carriers without stiffness; see SURFACE_ELEMENTS)
     "SFM3D3": 3, "SFM3D4": 4, "SFM3D4R": 4, "SFM3D6": 6, "SFM3D8": 8, "SFM3D8R": 8,
     "SFMAX1": 2, "SFMAX2": 3, "SFMGAX1": 2, "SFMGAX2": 3,
@@ -134,6 +135,9 @@ ELEMENT_TYPE_MAP: Dict[str, str] = {
     "DASHPOT1": "DASHPOTA", "DASHPOT2": "DASHPOTA",
     "GAPCYL": "GAPUNI", "GAPSPHER": "GAPUNI",
     "CPS4I": "CPS4", "CPE4I": "CPE4",
+    # 2-D / axisymmetric heat transfer: ccx's plane and axisymmetric elements carry it
+    "DC2D3": "CPS3", "DC2D4": "CPS4", "DC2D6": "CPS6", "DC2D8": "CPS8",
+    "DCAX3": "CAX3", "DCAX4": "CAX4", "DCAX6": "CAX6", "DCAX8": "CAX8",
     # hybrid continuum -> non-hybrid base (ccx has no mixed u/p formulation)
     "C3D4H": "C3D4", "C3D6H": "C3D6", "C3D8H": "C3D8", "C3D8RH": "C3D8R", "C3D8IH": "C3D8I",
     "C3D10H": "C3D10", "C3D15H": "C3D15", "C3D20H": "C3D20", "C3D20RH": "C3D20R",
@@ -160,6 +164,9 @@ EXACT_SUBSTITUTIONS = {
              "hybrid pressure equals the displacement element's for a compressible material",
     "B22": "the 3-node beam in the model plane, which the converter keeps planar like B21",
     "T2D3": "the 3-node truss in the model plane, which the converter keeps planar like T2D2",
+    **{t: "ccx runs heat transfer on its plane / axisymmetric element of the same interpolation "
+          "(a one-element-thick expansion, the temperature uniform through it)"
+       for t in ("DC2D3", "DC2D4", "DC2D6", "DC2D8", "DCAX3", "DCAX4", "DCAX6", "DCAX8")},
 }
 # What the other substitutions drop (Abaqus 2017 element libraries), for the warning.
 SUBSTITUTION_LOSS = {
@@ -1508,7 +1515,10 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
 def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NFILL`` -> linear fill of nodes between two node sets.  ``BIAS=b`` grades the
     spacing geometrically (adjacent intervals in ratio 1/b, so b < 1 concentrates nodes
-    toward the first set, as in Abaqus)."""
+    toward the first set, as in Abaqus).  Returns the nodes the card's NSET receives: the
+    generated ones and the bounding nodes of every filled line (Abaqus 2017 Keywords *NFILL:
+    "the nodes created by this operation (including the bounding nodes)").  The bounding sets
+    pair in their sorted order, as Abaqus node sets are sorted unless declared UNSORTED."""
     created: List[int] = []
     bias = 1.0
     if block.param("BIAS"):
@@ -1536,7 +1546,8 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
         if len(f) < 4:
             report.warn("*NFILL record needs set1,set2,nintervals,ninc; skipped.")
             continue
-        s1, s2 = geom.nset(f[0]), geom.nset(f[1])
+        s1, s2 = (geom.nset(s) if s.upper() in geom.unsorted else sorted(set(geom.nset(s)))
+                  for s in f[:2])
         nint, ninc = pint(f[2]), pint(f[3])
         if not s1 or not s2:
             report.warn("*NFILL node set is empty; skipped.")
@@ -1557,6 +1568,7 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
             pa, pb = geom.nodes.get(a), geom.nodes.get(b)
             if pa is None or pb is None:
                 continue
+            created += [a, b]
             for j in range(1, nint):
                 nid = a + j * ninc
                 t = frac(j, nint)
@@ -1636,6 +1648,111 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
             if new:
                 geom.add_to_nset(new, [new_id])
     return created
+
+
+def expand_nmap(block: Block, geom: Geometry, normals: Dict[int, Vec], report: Report) -> Optional[str]:
+    """``*NMAP``: maps the coordinates of the nodes in NSET at this point of the deck (Abaqus
+    2017 Keywords *NMAP).  TYPE=RECTANGULAR / CYLINDRICAL / SPHERICAL read them as local
+    coordinates (x, y, z / r, theta, z / R, theta, phi; angles in degrees), scaled first by
+    the factors of the third data line, of the system with origin a, axis a-b (x for
+    RECTANGULAR, z for CYLINDRICAL, the polar axis for SPHERICAL) and c in its x-y / theta = 0
+    plane; only a given: a plain shift.  ROTATION turns them by the angle about the axis a-b
+    through c, TRANSLATION moves them along a-b by the magnitude, SCALE scales them about a.
+    DEFINITION=NODES names a, b, c by node.  A *NODE normal of a mapped node is a vector in
+    the same local axes and turns with them.  Returns what was not converted (DIAMOND,
+    TOROIDAL, BLENDED, unreadable data), or None."""
+    typ = (block.param("TYPE") or "RECTANGULAR").strip().upper()
+    if typ not in ("RECTANGULAR", "CYLINDRICAL", "SPHERICAL", "ROTATION", "TRANSLATION", "SCALE"):
+        report.warn(f"*NMAP, TYPE={typ} is not converted; its nodes keep their unmapped "
+                    f"coordinates.", once=True)
+        return f"*NMAP, TYPE={typ} coordinate mapping skipped"
+    by_nodes = (block.param("DEFINITION") or "").strip().upper().startswith("NODE")
+    recs = [[x.strip() for x in rec] for rec in merged_data_records(block)]
+    try:
+        def points(rec: List[str], count: int) -> List[Optional[Vec]]:
+            if by_nodes:
+                ids = [pint(x) for x in rec[:count] if x]
+                return [geom.nodes[i] for i in ids] + [None] * (count - len(ids))
+            v = [pf(x) if x else 0.0 for x in rec]
+            return [tuple(v[3 * i:3 * i + 3] + [0.0] * (3 - len(v[3 * i:3 * i + 3]))) if len(v) > 3 * i
+                    else None for i in range(count)]
+        first = points(recs[0] if recs else [], 2)
+        a, b = first[0] or (0.0, 0.0, 0.0), first[1]
+        rest = recs[1:]
+        if typ in ("RECTANGULAR", "CYLINDRICAL", "SPHERICAL", "ROTATION"):
+            c = points(rest[0], 1)[0] if rest else None
+            rest = rest[1:]
+        nums = [pf(x) if x else 0.0 for x in (rest[0] if rest else [])]
+    except (ValueError, KeyError):
+        report.warn("*NMAP data could not be read; its nodes keep their unmapped coordinates.",
+                    once=True)
+        return "*NMAP coordinate mapping skipped (unreadable data)"
+    ids = [n for n in dict.fromkeys(geom.nset(block.param("NSET") or "")) if n in geom.nodes]
+    if typ in ("ROTATION", "TRANSLATION") and (b is None or vnorm(vsub(b, a)) == 0.0):
+        report.warn(f"*NMAP, TYPE={typ} without an axis a-b; skipped.", once=True)
+        return f"*NMAP, TYPE={typ} coordinate mapping skipped (no axis)"
+    if typ == "ROTATION":
+        o = c or (0.0, 0.0, 0.0)
+        tip = vadd(o, vsub(b, a))
+        ang = nums[0] if nums else 0.0
+        for n in ids:
+            geom.nodes[n] = rotate_about_axis(geom.nodes[n], o, tip, ang)
+            if n in normals:
+                normals[n] = rotate_about_axis(normals[n], (0.0, 0.0, 0.0), vsub(b, a), ang)
+        return None
+    if typ == "TRANSLATION":
+        shift = vscale(vunit(vsub(b, a)), nums[0] if nums else 0.0)
+        for n in ids:
+            geom.nodes[n] = vadd(geom.nodes[n], shift)
+        return None
+    if typ == "SCALE":
+        s = [x or 1.0 for x in (nums + [0.0, 0.0, 0.0])[:3]]
+        for n in ids:
+            p = geom.nodes[n]
+            geom.nodes[n] = tuple(a[i] + s[i] * (p[i] - a[i]) for i in range(3))
+        return None
+    s = [x or 1.0 for x in (nums + [0.0, 0.0, 0.0])[:3]]
+    if b is None or vnorm(vsub(b, a)) == 0.0:          # only a: a plain shift
+        if typ == "RECTANGULAR":
+            for n in ids:
+                geom.nodes[n] = vadd(a, geom.nodes[n])
+            return None
+        report.warn(f"*NMAP, TYPE={typ} without point b; skipped.", once=True)
+        return f"*NMAP, TYPE={typ} coordinate mapping skipped (no axis)"
+    ax = vunit(vsub(b, a))
+    ref = vsub(c, a) if c is not None else (0.0, 0.0, 0.0)
+    ref = vsub(ref, vscale(ax, vdot(ref, ax)))
+    if vnorm(ref) < 1e-12 * max(1.0, vnorm(vsub(b, a))):   # c on the axis: any perpendicular
+        ref = vcross(ax, (1.0, 0.0, 0.0) if abs(ax[0]) < 0.9 else (0.0, 1.0, 0.0))
+    if typ == "RECTANGULAR":
+        e1, e2 = ax, vunit(ref)
+        e3 = vcross(e1, e2)
+    else:
+        e3, e1 = ax, vunit(ref)
+        e2 = vcross(e3, e1)
+    for n in ids:
+        p = geom.nodes[n]
+        q = (p[0] * s[0], p[1] * s[1], p[2] * s[2])
+        if typ == "RECTANGULAR":
+            axes = (e1, e2, e3)
+            geom.nodes[n] = vadd(a, vadd(vadd(vscale(e1, q[0]), vscale(e2, q[1])), vscale(e3, q[2])))
+        elif typ == "CYLINDRICAL":
+            ct, st = math.cos(math.radians(q[1])), math.sin(math.radians(q[1]))
+            er = vadd(vscale(e1, ct), vscale(e2, st))
+            axes = (er, vadd(vscale(e1, -st), vscale(e2, ct)), e3)
+            geom.nodes[n] = vadd(a, vadd(vscale(er, q[0]), vscale(e3, q[2])))
+        else:
+            ct, st = math.cos(math.radians(q[1])), math.sin(math.radians(q[1]))
+            cp, sp = math.cos(math.radians(q[2])), math.sin(math.radians(q[2]))
+            er = vadd(vscale(vadd(vscale(e1, ct), vscale(e2, st)), cp), vscale(e3, sp))
+            axes = (er, vadd(vscale(e1, -st), vscale(e2, ct)),
+                    vadd(vscale(vadd(vscale(e1, ct), vscale(e2, st)), -sp), vscale(e3, cp)))
+            geom.nodes[n] = vadd(a, vscale(er, q[0]))
+        if n in normals:
+            m = normals[n]
+            normals[n] = vunit(vadd(vadd(vscale(axes[0], m[0]), vscale(axes[1], m[1])),
+                                    vscale(axes[2], m[2])))
+    return None
 
 
 def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
@@ -2798,10 +2915,24 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
                               None if smooth < 0.0 else smooth)
     if (sx, sy, dx, dy) != (1.0, 1.0, 0.0, 0.0):
         return None                 # scaling/shifting of the analytic forms: not modelled
-    if definition == "PERIODIC" and len(vals) >= 4:
-        n = int(vals[0])
-        w, t0, a0 = vals[1], vals[2], vals[3]
-        ab = vals[4:4 + 2 * n]
+    if definition == "PERIODIC":
+        # by lines: N, omega, t0, A0 (A0 may be left out or blank: 0), then the A_k, B_k
+        # pairs (Abaqus 2017 Keywords *AMPLITUDE); a blank field reads 0, a line's trailing
+        # comma adds no entry
+        recs = [list(rec) for rec in merged_data_records(b)]
+        for rec in recs:
+            while rec and not rec[-1].strip():
+                rec.pop()
+        try:
+            head = [pf(x) if x.strip() else 0.0 for x in (recs[0] if recs else [])]
+            ab = [pf(x) if x.strip() else 0.0 for rec in recs[1:] for x in rec]
+        except ValueError:
+            return None
+        if len(head) < 3:
+            return None
+        n = int(head[0])
+        w, t0, a0 = head[1], head[2], head[3] if len(head) > 3 else 0.0
+        ab = ab[:2 * n]
         if n < 0 or len(ab) < 2 * n:
             return None
 
@@ -3202,8 +3333,9 @@ class Converter:
             elif kw == "ELCOPY":
                 expand_elcopy(b, self.geom, self.report)
             elif kw == "NMAP":
-                self.report.warn("*NMAP (coordinate mapping) is not supported; skipped.")
-                self._reduces("*NMAP coordinate mapping skipped")
+                skipped = expand_nmap(b, self.geom, self._node_normals, self.report)
+                if skipped:
+                    self._reduces(skipped)
             elif kw == "ORIENTATION":
                 self._register_orientation(b)
             elif kw == "SURFACE":
@@ -5087,11 +5219,19 @@ class Converter:
             out.append(", ".join(v))
         if len(recs) > 1:
             v = [x for x in recs[1] if x != ""]
+            try:
+                zero = len(v) < 2 or pf(v[1]) == 0.0
+            except ValueError:
+                zero = False
             if v:
                 system = (params.get("SYSTEM") or "RECTANGULAR").upper()
                 if system.startswith("RECT"):
                     out.append(", ".join(v))
                     self.report.note("*ORIENTATION additional-rotation line kept (needs ccx >= ~2.15).", once=True)
+                elif zero:
+                    self.report.note(f"*ORIENTATION SYSTEM={system}: the additional-rotation line "
+                                     f"has a zero angle (it turns nothing) and was dropped (ccx "
+                                     f"allows it only for rectangular systems).", once=True)
                 else:
                     # ccx: "additional rotation ... is only allowed for rectangular systems"
                     self.report.warn(f"*ORIENTATION SYSTEM={system}: the additional-rotation line is "
@@ -10423,7 +10563,10 @@ class Converter:
 
     def handle_heat_transfer(self, b: Block) -> List[str]:
         """``*HEAT TRANSFER``: Abaqus' END= (stop at steady state) and MXDEM have no ccx
-        parameter; ccx keeps STEADY STATE, DELTMX, SOLVER, STORAGE, TIME RESET, ..."""
+        parameter; ccx keeps STEADY STATE, DELTMX, SOLVER, STORAGE, TIME RESET, ...  A
+        transient step without DELTMX runs fixed increments of its initial increment in Abaqus
+        (2017 "Uncoupled heat transfer analysis"), automatic ones in ccx unless DIRECT: DIRECT
+        is added."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("END", "MXDEM"):
@@ -10431,6 +10574,11 @@ class Converter:
                                  f"its full time period).", once=True)
             else:
                 keep[k] = v
+        if not b.has("STEADY STATE") and not b.param("DELTMX") and not b.has("DIRECT"):
+            keep["DIRECT"] = None
+            self.report.note("Transient *HEAT TRANSFER without DELTMX -> DIRECT: Abaqus then takes "
+                             "fixed time increments equal to the initial increment, ccx would choose "
+                             "its own.", once=True)
         return [emit_keyword("HEAT TRANSFER", keep)] + list(b.data)
 
     def _pair_lines(self, b: Block, what: str) -> Tuple[Optional[Block], List[str], bool]:
@@ -10596,9 +10744,18 @@ class Converter:
                                       "Abaqus user subroutine UAMP, which ccx cannot call (its own "
                                       "is uamplitude.f). Commented out: the loads that use it stop "
                                       "ccx ('nonexistent amplitude') until the subroutine is ported.", reduces=False)
-        elif definition in ("PERIODIC", "MODULATED", "DECAY", "SOLUTION DEPENDENT", "ACTUATOR"):
+        elif definition in ("PERIODIC", "MODULATED", "DECAY"):
+            sampled = self._sample_amplitude(b)
+            if sampled is not None:
+                return [emit_keyword("AMPLITUDE", keep)] + sampled
             # first data line holds series constants, not (t, A) pairs — passing it
             # through would be silent garbage
+            return self._commented(b, f"*AMPLITUDE DEFINITION={definition} could not be sampled "
+                                      f"(unreadable data, SHIFTX/SHIFTY/SCALEX/SCALEY, or no step time "
+                                      f"to sample over); its data is not time/amplitude pairs: "
+                                      f"sample the curve into a TABULAR amplitude manually.",
+                                   reduces=False)
+        elif definition in ("SOLUTION DEPENDENT", "ACTUATOR"):
             return self._commented(b, f"*AMPLITUDE DEFINITION={definition} has no ccx equivalent and "
                                       f"its data is not time/amplitude pairs; sample the curve into a "
                                       f"TABULAR amplitude manually.", reduces=False)
@@ -10607,6 +10764,62 @@ class Converter:
                              f"TABULAR.", once=True)
             self._reduces(f"*AMPLITUDE, DEFINITION={definition} read as TABULAR")
         return [emit_keyword("AMPLITUDE", keep)] + scaled(list(b.data))
+
+    def _plan_amplitude_spans(self, blocks: List[Block]) -> None:
+        """The longest step time and the total time of the deck's steps, over which
+        _sample_amplitude tabulates an analytic amplitude (None if a step's time period is
+        unknown)."""
+        self._amp_span: Optional[Tuple[float, float]] = None
+        groups: List[List[Block]] = []
+        cur: Optional[List[Block]] = None
+        for b in blocks:
+            if b.keyword == "STEP" and cur is None:
+                cur = [b]
+            elif cur is not None:
+                cur.append(b)
+                if b.keyword == "END STEP":
+                    groups.append(cur)
+                    cur = None
+        longest = total = 0.0
+        nlgeom = False
+        for group in groups:
+            info = self._step_motion(group, nlgeom)
+            nlgeom = info["nlgeom"]
+            if info["advance"] is None:
+                return
+            longest, total = max(longest, info["advance"]), total + info["advance"]
+        if total > 0.0:
+            self._amp_span = (longest, total)
+
+    def _sample_amplitude(self, b: Block) -> Optional[List[str]]:
+        """``*AMPLITUDE, DEFINITION=PERIODIC / MODULATED / DECAY`` (amplitude_curve) as
+        time/amplitude pairs over the time the steps use it: step time up to the longest
+        step, or with TIME=TOTAL TIME the total time.  ccx interpolates linearly between the
+        points, which are 1/25 of the curve's integration panel apart (200 per shortest
+        period of a Fourier series) and include its start t0; the note gives the largest
+        deviation of the straight lines from the curve.  None if the curve or the span is
+        unknown."""
+        curve = amplitude_curve(b)
+        span = getattr(self, "_amp_span", None)
+        if curve is None or span is None or not curve.panel > 0.0:
+            return None
+        end = span[1] if curve.total else span[0]
+        n = max(1, math.ceil(end / (curve.panel / 25.0) * (1.0 - 1e-3)))   # even spacing
+        if n > 20000:
+            return None
+        ts = sorted({end * k / n for k in range(n + 1)} |
+                    {t for t in curve.breaks if 0.0 < t < end})
+        pts = [(t, curve.value(t)) for t in ts]
+        scale = max(abs(a) for _, a in pts) or 1.0
+        dev = max(abs(curve.value(0.5 * (t0 + t1)) - 0.5 * (a0 + a1))
+                  for (t0, a0), (t1, a1) in zip(pts, pts[1:])) if len(pts) > 1 else 0.0
+        definition = (b.param("DEFINITION") or "").strip().upper()
+        self.report.note(f"*AMPLITUDE DEFINITION={definition} sampled into {len(pts)} time/"
+                         f"amplitude points over its {'total' if curve.total else 'step'} time 0 to "
+                         f"{end:g} (ccx has no analytic amplitudes): the straight lines between them "
+                         f"stay within {dev / scale:.1e} of the curve's largest value.", once=True)
+        pairs = [f"{t:.9g}, {a:.9g}" for t, a in pts]
+        return [", ".join(pairs[i:i + 4]) for i in range(0, len(pairs), 4)]
 
     def _smooth_step_to_tabular(self, b: Block) -> Optional[List[str]]:
         """Sample Abaqus' SMOOTH STEP quintic (a = A0 + (A1-A0)*x^3*(10-15x+6x^2)) into
@@ -10836,26 +11049,28 @@ class Converter:
     def _equation_block_lines(self, b: Block) -> List[str]:
         """``*EQUATION``: ccx 2.22 requires node NUMBERS in the terms; Abaqus/CAE decks
         (esp. periodic-BC lattices) write node SETS.  Resolve single-node sets directly;
-        expand equal-length multi-node sets into one equation per node pairing."""
-        recs = [[x for x in rec if x != ""] for rec in merged_data_records(b)]
-        recs = [r for r in recs if r]
-        if not recs:
-            return [emit_keyword("EQUATION", b.params)] + list(b.data)
-        toks: List[str] = [t for r in recs[1:] for t in r]
-        if len(toks) % 3 != 0 or not any(not re.fullmatch(r"[-+]?[\d.eE+-]+", t) for t in toks[0::3]):
-            return [emit_keyword("EQUATION", b.params)] + list(b.data)   # all-numeric: untouched
-        terms = [(toks[i], toks[i + 1], toks[i + 2]) for i in range(0, len(toks), 3)]
-        resolved: List[Tuple[List[int], str, str]] = []
-        for tok, dof, coef in terms:
-            if re.fullmatch(r"[-+]?\d+", tok):
-                resolved.append(([int(tok)], dof, coef))
-            else:
+        expand equal-length multi-node sets into one equation per node pairing.  A card may
+        hold several equations (each a line with its number of terms, then the terms), each
+        resolved on its own."""
+        unchanged = [emit_keyword("EQUATION", b.params)] + list(b.data)
+        eqs = self._equation_terms(b)
+        if not eqs:
+            return unchanged
+        if all(re.fullmatch(r"[-+]?[\d.eE+-]+", tok) for eq in eqs for tok, _, _ in eq):
+            return unchanged                                    # all-numeric: untouched
+        out: List[str] = [emit_keyword("EQUATION", b.params)]
+        for terms in eqs:
+            resolved: List[Tuple[List[int], str, str]] = []
+            for tok, dof, coef in terms:
+                if re.fullmatch(r"[-+]?\d+", tok):
+                    resolved.append(([int(tok)], dof, coef))
+                    continue
                 nodes = self.geom.nset(tok)
                 if not nodes:
                     self.report.warn(f"*EQUATION references set '{tok}' which resolves to no nodes; "
                                      f"card left unchanged — ccx 2.22 rejects set names here "
                                      f"(2.23 accepts them).", once=True)
-                    return [emit_keyword("EQUATION", b.params)] + list(b.data)
+                    return unchanged
                 # Abaqus applies a set-based equation node by node in the set's SORTED
                 # order (ascending ids) unless the set was declared UNSORTED
                 if tok.upper() not in self.geom.unsorted:
@@ -10863,19 +11078,18 @@ class Converter:
                 else:
                     nodes = dedup(nodes)
                 resolved.append((list(nodes), dof, coef))
-        sizes = {len(n) for n, _, _ in resolved if len(n) > 1}
-        if len(sizes) > 1:
-            self.report.warn("*EQUATION mixes node sets of different sizes; card left unchanged — "
-                             "rewrite with explicit nodes.", once=True)
-            return [emit_keyword("EQUATION", b.params)] + list(b.data)
-        n_eq = sizes.pop() if sizes else 1
-        out: List[str] = [emit_keyword("EQUATION", b.params)]
-        for i in range(n_eq):
-            trip = [(nodes[i] if len(nodes) > 1 else nodes[0], dof, coef)
-                    for nodes, dof, coef in resolved]
-            out.append(str(len(trip)))
-            for j in range(0, len(trip), 4):          # ccx: at most 12 entries per line
-                out.append(", ".join(f"{n}, {d}, {c}" for n, d, c in trip[j:j + 4]))
+            sizes = {len(n) for n, _, _ in resolved if len(n) > 1}
+            if len(sizes) > 1:
+                self.report.warn("*EQUATION mixes node sets of different sizes; card left unchanged "
+                                 "— rewrite with explicit nodes.", once=True)
+                return unchanged
+            n_eq = sizes.pop() if sizes else 1
+            for i in range(n_eq):
+                trip = [(nodes[i] if len(nodes) > 1 else nodes[0], dof, coef)
+                        for nodes, dof, coef in resolved]
+                out.append(str(len(trip)))
+                for j in range(0, len(trip), 4):      # ccx: at most 12 entries per line
+                    out.append(", ".join(f"{n}, {d}, {c}" for n, d, c in trip[j:j + 4]))
         self.report.note("*EQUATION set-name terms resolved to node numbers (ccx 2.22 needs "
                          "explicit nodes; multi-node sets expanded pairwise).", once=True)
         return out
@@ -11199,7 +11413,17 @@ class Converter:
         """Initial temperatures for a deck that applies ``*TEMPERATURE`` without any: Abaqus
         starts every node at 0, and ccx reads a *TEMPERATURE card only after thermal
         *INITIAL CONDITIONS (verified on 2.23: a free heated cube then strains alpha T
-        exactly)."""
+        exactly).  The same for a deck with a transient heat transfer or coupled step and no
+        initial temperatures, which ccx 2.23 stops on."""
+        if self._temp_ic_default == "transient":
+            self.report.note(f"Transient step with temperature degrees of freedom and no *INITIAL "
+                             f"CONDITIONS, TYPE=TEMPERATURE: every node starts at 0, the Abaqus "
+                             f"default ({ALL_NODES_SET}, 0. added before the first step); ccx 2.23 "
+                             f"stops without initial temperatures ('please define initial "
+                             f"conditions for the temperature').", once=True)
+            return ["** [abq2ccx] initial temperatures: the Abaqus default, 0, at every node (ccx "
+                    "needs them for a transient step with temperature DOFs)",
+                    "*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"{ALL_NODES_SET}, 0."]
         self.report.note(f"*TEMPERATURE with no *INITIAL CONDITIONS, TYPE=TEMPERATURE: every node "
                          f"starts at 0, the Abaqus default, so thermal strains count from 0 "
                          f"(*INITIAL CONDITIONS, TYPE=TEMPERATURE / {ALL_NODES_SET}, 0. added "
@@ -11475,6 +11699,7 @@ class Converter:
         self._plan_u1_beams(blocks)
         self._check_nonpositive_ids()
         self._prescan(blocks)
+        self._plan_amplitude_spans(blocks)
         self._plan_load_cases(blocks)
         self._plan_rigid_planar_holds()             # after _prescan: the bodies' ROT NODEs
         self._warn_coupled_clashes()                # BCs on coupled DOFs left (_prescan)
@@ -13682,6 +13907,12 @@ class Converter:
                                  "temperatures.", once=True)
             elif temps:
                 self._temp_ic_default = True
+            # a transient step with temperature DOFs stops ccx 2.23 without them too ("please
+            # define initial conditions for the temperature"), where Abaqus starts from 0
+            if not self._temp_ic_default and any(
+                    x.keyword in TEMPERATURE_DOF_PROCS and not x.has("STEADY STATE")
+                    for s in steps for x in s):
+                self._temp_ic_default = "transient"
         if self._temp_ic_fill or self._temp_ic_default:
             self.geom.nsets.setdefault(ALL_NODES_SET, list(self.geom.nodes))
         # Johnson-Cook *PLASTIC cards whose material also has a *RATE DEPENDENT card

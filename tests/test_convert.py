@@ -170,6 +170,18 @@ def test_element_substitutions():
         assert A.ELEMENT_NNODES[abq] == A.ELEMENT_NNODES[ccx], (abq, ccx)
 
 
+def test_heat_transfer_plane_and_axisymmetric_elements():
+    # DC2D* / DCAX* run as ccx's plane / axisymmetric element of the same interpolation, the
+    # temperature uniform through its one-element-thick expansion (NAFEMS T2, T3: DC2D8 as
+    # CPS8 gives Abaqus' temperatures)
+    quad = "*Node\n1,1.,0.\n2,2.,0.\n3,2.,1.\n4,1.,1.\n5,1.5,0.\n6,2.,.5\n7,1.5,1.\n8,1.,.5\n"
+    for abq, ccx, conn in (("DC2D4", "CPS4", "1,1,2,3,4"), ("DC2D8", "CPS8", "1,1,2,3,4,5,6,7,8"),
+                           ("DCAX4", "CAX4", "1,1,2,3,4"), ("DCAX8", "CAX8", "1,1,2,3,4,5,6,7,8")):
+        body, conv, rep = convert_str(quad + f"*Element, type={abq}, elset=E\n{conn}\n")
+        assert f"*ELEMENT, TYPE={ccx}\n{conn.replace(',', ', ')}" in body, body
+        assert conv.reduced_physics == [] and rep.n_warnings == 0 and "same solution" in rep.text()
+
+
 def test_nset_from_elset():
     # ccx has no *NSET, ELSET=...; the converter expands it to the elset's nodes.
     body, conv, _ = convert_str(HEX + "*NSET, NSET=CLAMP, ELSET=EALL\n")
@@ -544,6 +556,23 @@ def test_nfill_unequal_bounding_sets():
             "*NFILL\nLEFT,RIGHT,2,50\n")      # 2 intervals, node increment 50
     _, conv, _ = convert_str(deck)
     assert {51, 52, 53} <= set(conv.geom.nodes)   # interior of the 3 common pairs
+
+
+def test_nfill_set_holds_its_bounding_nodes():
+    # Abaqus 2017 Keywords *NFILL: NSET gets "the nodes created by this operation (including
+    # the bounding nodes)", so a fill between two such sets reaches their edge rows too (the
+    # NAFEMS FV52 C3D8I and T4 DC3D20 decks lost them: a nonpositive jacobian in ccx). The
+    # bounding sets pair in sorted order, as Abaqus node sets are sorted (X2 runs backwards).
+    deck = ("*NODE\n1,0.,0.,0.\n3,2.,0.,0.\n201,0.,2.,0.\n203,2.,2.,0.\n"
+            "*NGEN,NSET=X1\n1,3\n*NGEN,NSET=X2\n203,201,-1\n*NFILL,NSET=BASE\nX1,X2,2,100\n"
+            "*NCOPY,OLD SET=BASE,NEW SET=TOP,CHANGE NUMBER=2000,SHIFT\n0.,0.,1.\n0.,0.,0.,0.,0.,1.,0.\n"
+            "*NFILL,NSET=ALL\nBASE,TOP,2,1000\n")
+    _, conv, _ = convert_str(deck)
+    g = conv.geom
+    assert sorted(set(g.nset("BASE"))) == [1, 2, 3, 101, 102, 103, 201, 202, 203]
+    assert all(g.nodes[n + 1000] == (g.nodes[n][0], g.nodes[n][1], 0.5) for n in g.nset("BASE"))
+    assert g.nodes[102] == (1.0, 1.0, 0.0) and g.nodes[101] == (0.0, 1.0, 0.0)
+    assert len(set(g.nset("ALL"))) == 27
 
 
 def test_generate_malformed_token_no_crash():
@@ -1070,6 +1099,34 @@ def test_smooth_step_amplitude_sampled():
                                                                       for k in range(9)))
     assert worst < 7.3e-5, worst
     assert "sampled" in rep.text().lower()
+
+
+def test_periodic_amplitude_sampled_over_the_step_time():
+    # ccx has no analytic amplitudes: PERIODIC / DECAY / MODULATED become points over the step
+    # time (NAFEMS T3: T = 100 sin(pi t / 40) at one end, its first data line without A0)
+    heat = ("*Material, name=M\n*Conductivity\n35.\n*Density\n7200.\n*Specific Heat\n440.5\n"
+            "*Solid Section, elset=EALL, material=M\n")
+    amp = "*Amplitude, name=SINE, definition=PERIODIC\n1, 0.07854, 0.\n0., 100.\n"
+    step = "*Step\n*Heat Transfer\n1., 32.\n*Boundary, amplitude=SINE\n1, 11, 11, 1.\n*End Step\n"
+    body, conv, rep = convert_str(HEX + heat + amp + step)
+    pts = [tuple(float(x) for x in pair.split(","))
+           for ln in _card(body, "*AMPLITUDE, NAME=SINE") for pair in re.findall(r"[^,]+,[^,]+", ln)]
+    assert pts[0] == (0.0, 0.0) and pts[-1][0] == 32.0 and len(pts) == 81    # 0.4 apart
+    assert max(abs(a - 100.0 * math.sin(0.07854 * t)) for t, a in pts) < 1e-6
+    mid = max(abs(0.5 * (a0 + a1) - 100.0 * math.sin(0.07854 * 0.5 * (t0 + t1)))
+              for (t0, a0), (t1, a1) in zip(pts, pts[1:]))
+    assert mid < 100.0 * 1.3e-4 and "sampled into 81 time/amplitude points" in rep.text()
+    assert conv.reduced_physics == []
+    # DECAY over the longest step (here 2.0); without a step there is no time to sample: commented
+    decay = "*Amplitude, name=D, definition=DECAY\n1., 2., 0.5, 0.25\n"
+    body, _, _ = convert_str(HEX + heat + decay + step.replace("1., 32.", "1., 2.")
+                             .replace("amplitude=SINE", "amplitude=D"))
+    pts = [tuple(float(x) for x in pair.split(","))
+           for ln in _card(body, "*AMPLITUDE, NAME=D") for pair in re.findall(r"[^,]+,[^,]+", ln)]
+    assert pts[-1][0] == 2.0 and abs(dict(pts)[0.5] - 3.0) < 1e-12
+    assert abs(dict(pts)[1.0] - (1.0 + 2.0 * math.exp(-2.0))) < 1e-8          # 9 digits
+    body, _, rep = convert_str(HEX + heat + amp)
+    assert "** *AMPLITUDE, NAME=SINE" in body.upper() and "could not be sampled" in rep.text()
 
 
 def test_dload_unsupported_body_load_dropped():
@@ -2388,10 +2445,29 @@ def test_orientation_origin_and_node_definition():
     assert "*ORIENTATION, NAME=O2\n1, 0, 0, 0, 1, 0" in body
 
 
+def test_orientation_zero_additional_rotation_on_a_cylindrical_system():
+    # ccx takes the additional-rotation line only for rectangular systems; a zero angle turns
+    # nothing, so leaving it out is exact (NAFEMS LE2: "1, 0.")
+    deck = HEX + "*Orientation, name=ORI, system=cylindrical\n0.,0.,0., 0.,0.,1.\n1, 0.\n"
+    _, conv, rep = convert_str(deck)
+    assert conv.reduced_physics == [] and "zero angle" in rep.text()
+    _, conv, _ = convert_str(deck.replace("1, 0.", "1, 30."))
+    assert conv.reduced_physics == ["*ORIENTATION additional rotation on a non-rectangular system dropped"]
+
+
 def test_equation_node_sets_pair_in_sorted_order():
     body, _, _ = convert_str(S4 + "*Nset, nset=LEFT\n1, 4, 2\n*Nset, nset=RIGHT\n6, 5, 3\n"
                              "*Equation\n2\nLEFT, 1, 1., RIGHT, 1, -1.\n")
     assert "1, 1, 1., 3, 1, -1.\n2\n2, 1, 1., 5, 1, -1.\n2\n4, 1, 1., 6, 1, -1." in body
+
+
+def test_equation_card_with_several_set_equations():
+    # one *EQUATION card may hold several equations (NAFEMS FV42: TOP-BOT, then MID_1-BOT_1);
+    # each resolves its node sets on its own, where the card used to reach ccx with set names
+    body, _, _ = convert_str(S4 + "*Nset, nset=A\n1, 2\n*Nset, nset=B\n3, 4\n*Nset, nset=C\n5\n"
+                             "*Nset, nset=D\n6\n*Equation\n2\nA, 1, 1., B, 1, -1.\n2\nC, 2, 1., D, 2, -1.\n")
+    assert ("*EQUATION\n2\n1, 1, 1., 3, 1, -1.\n2\n2, 1, 1., 4, 1, -1.\n2\n5, 2, 1., 6, 2, -1."
+            in body), body
 
 
 def test_perturbation_static_before_general_step_warns():
@@ -3107,6 +3183,27 @@ def test_temperature_without_initial_conditions_starts_at_zero():
                                "*Initial Conditions, type=temperature\nALL, 20.\n" + HEAT_STEP)
     assert "*INITIAL CONDITIONS, TYPE=temperature\nALL, 20.\n*STEP" in body
     assert body.count("*INITIAL CONDITIONS") == 1 and "Abaqus default" not in rep.text()
+
+
+def test_transient_heat_transfer_fixed_increments_and_initial_temperatures():
+    # Abaqus' transient *HEAT TRANSFER without DELTMX takes fixed increments of its initial
+    # increment (2017 "Uncoupled heat transfer analysis"), ccx its own unless DIRECT; and with no
+    # initial temperatures Abaqus starts from 0, where ccx 2.23 stops ("please define initial
+    # conditions for the temperature") — NAFEMS T3: 30.29 against Abaqus' 36.09 before
+    deck = HEX + ("*Material, name=M\n*Conductivity\n35.\n*Density\n7200.\n*Specific Heat\n440.5\n"
+                  "*Solid Section, elset=EALL, material=M\n*Step\n*Heat Transfer{}\n1., 32.\n"
+                  "*Boundary\n1, 11, 11, 10.\n*End Step\n")
+    body, _, rep = convert_str(deck.format(""))
+    assert "*HEAT TRANSFER, DIRECT\n1., 32." in body and "-> DIRECT" in rep.text()
+    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nABQ2CCX_ALL_NODES, 0.\n*STEP" in body
+    assert "ccx 2.23 stops without initial temperatures" in rep.text()
+    body, _, _ = convert_str(deck.format(", deltmx=5."))              # automatic in both
+    assert "*HEAT TRANSFER, DELTMX=5.\n" in body and body.count("INITIAL CONDITIONS") == 1
+    body, _, _ = convert_str(deck.format(", steady state"))          # no time, no start state
+    assert "DIRECT" not in body and "INITIAL CONDITIONS" not in body
+    body, _, _ = convert_str(deck.format("").replace("*Step", "*Initial Conditions, type=temperature\n"
+                                                     "EALL, 20.\n*Step"))
+    assert "Abaqus default" not in body
 
 
 def test_temperature_in_thermal_step_commented_out():
@@ -6234,6 +6331,31 @@ def test_node_system_cylindrical_and_spherical():
     assert abs(nz) < 1e-12
     nx, ny, nz = conv._node_normals[2]
     assert abs(nx) < 1e-12 and abs(ny - math.sqrt(3) / 2) < 1e-12 and abs(nz - 0.5) < 1e-12
+
+
+def test_nmap_maps_nodes_and_their_normals():
+    # NAFEMS LE2 writes its cylindrical shell in (r, theta, z) and maps it with *NMAP,
+    # TYPE=CYLINDRICAL; its *NODE normals (1, 0, 0) are radial in those local axes
+    deck = ("*Node\n1, 1., 10., 0.5, 1., 0., 0.\n2, 2., 0., 0.\n*Nset, nset=ALL\n1, 2\n"
+            "*Nmap, nset=ALL, type=CYLINDRICAL\n0.,0.,0.,0.,0.,1.\n1.,0.,0.\n")
+    _, conv, _ = convert_str(deck)
+    c, s = math.cos(math.radians(10.)), math.sin(math.radians(10.))
+    assert max(abs(u - v) for u, v in zip(conv.geom.nodes[1], (c, s, 0.5))) < 1e-12
+    assert max(abs(u - v) for u, v in zip(conv._node_normals[1], (c, s, 0.))) < 1e-12
+    assert conv.geom.nodes[2] == (2.0, 0.0, 0.0) and conv.reduced_physics == []
+    # RECTANGULAR: x along a-b, y toward c, local coordinates scaled by the third line first
+    _, conv, _ = convert_str("*Node\n1, 1., 2., 3.\n*Nset, nset=N\n1\n*Nmap, nset=N, type=RECTANGULAR\n"
+                             "1.,1.,1.,1.,2.,1.\n0.,1.,1.\n2.,0.,1.\n")
+    assert max(abs(u - v) for u, v in zip(conv.geom.nodes[1], (-1., 3., 4.))) < 1e-12
+    # ROTATION by 90 degrees about z through c = (1, 0, 0); SPHERICAL (R, theta, phi)
+    _, conv, _ = convert_str("*Node\n1, 2., 0., 0.\n*Nset, nset=N\n1\n*Nmap, nset=N, type=ROTATION\n"
+                             "0.,0.,0.,0.,0.,1.\n1.,0.,0.\n90.\n")
+    assert max(abs(u - v) for u, v in zip(conv.geom.nodes[1], (1., 1., 0.))) < 1e-12
+    _, conv, _ = convert_str("*Node\n1, 2., 90., 30.\n*Nset, nset=N\n1\n*Nmap, nset=N, type=SPHERICAL\n"
+                             "0.,0.,0.,0.,0.,1.\n1.,0.,0.\n")
+    assert max(abs(u - v) for u, v in zip(conv.geom.nodes[1], (0., math.sqrt(3.), 1.))) < 1e-12
+    _, conv, rep = convert_str(deck.replace("CYLINDRICAL", "TOROIDAL"))
+    assert conv.reduced_physics == ["*NMAP, TYPE=TOROIDAL coordinate mapping skipped"]
 
 
 def test_node_normals_become_normal_cards():
