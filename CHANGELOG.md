@@ -14,6 +14,13 @@ physics.
   A note covers `B32R`'s 50 `*EL PRINT` rows per `RECT`/`CIRC` element (the `--run` digest
   reads the 8 real ones) and its convergence on coarse members in 3-D `NLGEOM` steps.
   Published answers: 20 of 26 match Abaqus, 6 differ for a reason traced to ccx.
+* **Shell and membrane material directions** — oriented `*SHELL SECTION`, `*SHELL GENERAL
+  SECTION` and `*MEMBRANE SECTION` sections (composites and `*DISTRIBUTION`s included) get
+  Abaqus' material directions per element group wherever ccx 2.23 places them otherwise: ccx
+  projects the orientation's axis 1 onto a shell (axis 3 where axis 1 is the normal), uses a
+  membrane's 3-D axes unprojected, and takes a cylindrical system once per element. A
+  pressurised orthotropic cylinder with a cylindrical orientation came out 14 times too soft;
+  it now matches thin-wall theory to 0.35 %.
 
 ## 1.2.1 (October 2026)
 
