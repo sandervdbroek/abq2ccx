@@ -4,6 +4,13 @@ Corpus counts are on the CalculiX version current at the time; from October 2026
 counts only decks that solve their own problem: under their own loads, without reduced
 physics.
 
+## 1.2.1 (October 2026)
+
+* **The output file as the second argument** — `abq2ccx deck.inp out.inp` converts into
+  `out.inp` (and `out.log`) when `out.inp` is new or abq2ccx wrote it, so a rerun overwrites
+  it; two existing Abaqus decks still convert as a batch, so this form never overwrites a deck
+  abq2ccx did not write. `-o` works as before.
+
 ## 1.2.0 (October 2026) — CalculiX 2.23
 
 FreeCAD 1.1.4 moved to ccx 2.23, which is stricter than 2.22 and gets some valid input wrong

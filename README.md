@@ -22,6 +22,7 @@ pipx install git+https://github.com/sandervdbroek/abq2ccx  # the latest main
 
 ```bash
 python3 abq2ccx.py model.inp                 # -> model_ccx.inp (+ model_ccx.log)
+python3 abq2ccx.py model.inp ccx_model.inp   # -> ccx_model.inp (+ ccx_model.log)
 python3 abq2ccx.py decks/*.inp --outdir out  # batch-convert into a directory
 python3 abq2ccx.py model.inp --run           # convert, run CalculiX, digest its results
 python3 abq2ccx.py model.inp --check         # report only, write nothing

@@ -7401,6 +7401,33 @@ def test_run_reads_ccx_output_in_any_encoding():
     assert code == 0
 
 
+def test_cli_second_deck_is_the_output_when_new_or_written_by_abq2ccx():
+    # "abq2ccx deck.inp out.inp" converts into out.inp where out.inp is new or abq2ccx wrote
+    # it (so a rerun overwrites it); two existing Abaqus decks still convert as a batch, and
+    # --outdir keeps the batch reading
+    from contextlib import redirect_stderr
+    d = tempfile.mkdtemp()
+    a, b, out = (os.path.join(d, n) for n in ("a.inp", "b.inp", "out.inp"))
+    for path in (a, b):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(HEX)
+    try:
+        codes = [A.main([a, out, "--quiet"]), A.main([a, out, "--quiet"])]   # new, then rerun
+        first = sorted(os.listdir(d))
+        codes.append(A.main([a, b, "--quiet"]))                              # a batch
+        with open(b, encoding="utf-8") as fh:
+            b_kept = fh.read() == HEX
+        with redirect_stderr(io.StringIO()) as err:
+            codes.append(A.main([a, os.path.join(d, "new.inp"), "--outdir", d, "--quiet"]))
+        last = sorted(os.listdir(d))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert codes == [0, 0, 0, 1] and "cannot read" in err.getvalue(), codes
+    assert first == ["a.inp", "b.inp", "out.inp", "out.log"], first
+    assert b_kept and last == ["a.inp", "a_ccx.inp", "a_ccx.log", "b.inp", "b_ccx.inp",
+                               "b_ccx.log", "out.inp", "out.log"], last
+
+
 UMAT_CUBE = HEX + """*MATERIAL, NAME={name}
 *USER MATERIAL, CONSTANTS=2
 210000., 0.3

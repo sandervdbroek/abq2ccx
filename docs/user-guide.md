@@ -17,7 +17,12 @@
 ```bash
 python abq2ccx.py INPUT.inp [INPUT.inp ...] [options]     # glob patterns allowed
 abq2ccx INPUT.inp [INPUT.inp ...] [options]               # the same, installed
+abq2ccx INPUT.inp OUTPUT.inp [options]                    # into OUTPUT.inp
 ```
+
+With two `.inp` files, the second is the output when it does not exist yet or abq2ccx wrote
+it (so a rerun overwrites it); two existing Abaqus decks convert as a batch, so this form never
+overwrites a deck abq2ccx did not write.
 
 | Option | Effect |
 | --- | --- |

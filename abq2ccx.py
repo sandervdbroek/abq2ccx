@@ -56,7 +56,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # ---------------------------------------------------------------------------
 # Element reference data
@@ -640,6 +640,10 @@ MAX_ENTRIES_PER_LINE = 16  # CalculiX hard limit for entries on a data line
 # ---------------------------------------------------------------------------
 
 
+# The second line of every deck abq2ccx writes (Report.header_comment_lines).
+CONVERTED_MARK = "** Converted from Abaqus to CalculiX by abq2ccx"
+
+
 class Report:
     """Collects warnings / notes emitted during conversion."""
 
@@ -693,7 +697,7 @@ class Report:
 
     def header_comment_lines(self) -> List[str]:
         lines = ["** ====================================================================",
-                 f"** Converted from Abaqus to CalculiX by abq2ccx v{__version__}",
+                 f"{CONVERTED_MARK} v{__version__}",
                  f"** {self.summary()} — review below; find commented cards with '** abq2ccx:'.",
                  "** --------------------------------------------------------------------"]
         if not self.entries:
@@ -20844,6 +20848,22 @@ def _tolerant_stdio() -> None:
             pass
 
 
+def _output_argument(deck: str, out: str) -> bool:
+    """Whether ``abq2ccx deck.inp out.inp`` names the output: ``out`` is an .inp path, no
+    glob pattern nor the deck itself, and is new or a deck abq2ccx wrote; two existing Abaqus
+    decks are a batch, so no deck is overwritten that abq2ccx did not write."""
+    same = os.path.normcase(os.path.abspath(deck)) == os.path.normcase(os.path.abspath(out))
+    if same or any(ch in deck + out for ch in "*?[") or not out.lower().endswith(".inp"):
+        return False
+    if not os.path.exists(out):
+        return True
+    try:
+        with open(out, encoding="utf-8", errors="replace") as fh:
+            return any(next(fh, "").startswith(CONVERTED_MARK) for _ in range(3))
+    except OSError:                                 # a directory, unreadable
+        return False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     _tolerant_stdio()
     ap = argparse.ArgumentParser(
@@ -20852,7 +20872,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         epilog="Exit codes: 0 converted; 1 cannot read/write; 2 usage error; "
                "3 --strict findings; 4 internal conversion error. "
                "The output is a starting point: always review the [WARNING]/[NOTE] lines.")
-    ap.add_argument("input", nargs="+", help="Abaqus input deck(s) (.inp); glob patterns allowed")
+    ap.add_argument("input", nargs="+",
+                    help="Abaqus input deck(s) (.inp); glob patterns allowed. With two, "
+                         "DECK.inp OUT.inp, the second is the output when it is new or "
+                         "abq2ccx wrote it")
     ap.add_argument("-o", "--output", help="output file (single input only; default: <input>_ccx.inp)")
     ap.add_argument("--outdir", help="write outputs (default names) into this directory")
     ap.add_argument("--solid-dof", action="store_true",
@@ -20883,6 +20906,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--ccx", help="CalculiX executable to use with --run ($CCX also honoured)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
+    if len(args.input) == 2 and not (args.output or args.outdir) and _output_argument(*args.input):
+        args.output = args.input.pop()             # abq2ccx deck.inp out.inp
 
     inputs: List[str] = []
     for pat in args.input:
