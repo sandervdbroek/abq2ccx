@@ -4019,8 +4019,8 @@ def test_shell_general_section_copied_per_instance():
     part = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
             "5, .5, 0., 0.\n6, 1., .5, 0.\n7, .5, 1., 0.\n8, 0., .5, 0.\n"
             "*Element, type=S8R, elset=PANEL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
-            "*Orientation, name=Ori-1\n1., 0., 0., 0., 1., 0.\n"
-            "*Orientation, name=Ori-2\n0., 1., 0., -1., 0., 0.\n{}*End Part\n"
+            "*Orientation, name=Ori-1\n1., 0., 0., 0., 1., 0.\n3, 0.\n"
+            "*Orientation, name=Ori-2\n0., 1., 0., -1., 0., 0.\n3, 0.\n{}*End Part\n"
             "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
             "*Instance, name=I2, part=P\n2., 0., 0.\n0., 0., 0., 0., 0., 1., 90.\n*End Instance\n"
             "*End Assembly\n*Material, name=M\n*Elastic\n1000., 0.3\n")
@@ -4070,7 +4070,7 @@ def test_distribution_shell_section_split_per_direction():
     deck = S4.replace("*Shell Section,elset=E,material=M\n0.1\n",
                       "*Distribution, name=DP\n, 1., 0., 0., 0., 1., 0.\n2, 0., 1., 0., -1., 0., 0.\n"
                       "*Distribution, name=DM\n, 1., 0., 0., 0., 1., 0.\n2, 0., -1., 0., 1., 0., 0.\n"
-                      "*Orientation, name=OP\nDP\n*Orientation, name=OM\nDM\n"
+                      "*Orientation, name=OP\nDP\n3, 0.\n*Orientation, name=OM\nDM\n3, 0.\n"
                       "*Shell Section, elset=E, composite, orientation=OP\n0.1, 3, M, 30.\n"
                       "0.1, 3, M, OM\n")
     body, _, _ = convert_str(deck)
@@ -7882,11 +7882,17 @@ def test_shell_material_axes_follow_abaqus_rules():
     d1, d2 = A.shell_local_axes((1.0, 0.0, 0.0))
     assert d1 == (0.0, 0.0, 1.0) and d2 == (0.0, -1.0, 0.0)
     # an orientation projects the axis that follows its rotation axis: about axis 1, axis 2;
-    # without a rotation line the axis closest to the normal is the rotation axis
+    # without a rotation line Abaqus' default rotation axis is 1 (2017 "Orientations"), also
+    # where it lies in the shell (warned), and where the next axis is the normal the default
+    # directions are taken (warned)
     frame, k = A.orientation_frame((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR", (0, 0, 0), (1, 0.0))
     assert k == 1 and A.shell_local_axes(nz, frame, k)[0] == (0.0, 1.0, 0.0)
     frame, k = A.orientation_frame((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR", (0, 0, 0), None)
-    assert k is None and A.shell_local_axes(nz, frame, k)[0] == (1.0, 0.0, 0.0)
+    assert k is None and A.shell_local_axes(nz, frame, k) == ((0.0, 1.0, 0.0), (-1.0, 0.0, 0.0))
+    assert "lies in the shell" in A.shell_axes_caveat(nz, frame, k)
+    assert A.shell_local_axes((0.0, 1.0, 0.0), frame, k)[0] == (1.0, 0.0, 0.0)
+    assert "is the shell normal" in A.shell_axes_caveat((0.0, 1.0, 0.0), frame, k)
+    assert A.shell_axes_caveat(nz, frame, 3) is None and A.shell_axes_caveat((1.0, 0.0, 0.0), frame, k) is None
     frame, k = A.orientation_frame((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), "CYLINDRICAL", (0.0, 2.0, 5.0), None)
     assert A.shell_local_axes((0.0, 1.0, 0.0), frame, k)[0] == (-1.0, 0.0, 0.0)   # hoop direction
     frame, k = A.orientation_frame((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR", (0, 0, 0), (3, 90.0))
@@ -8095,11 +8101,15 @@ def test_plain_shell_section_gets_abaqus_axes():
     assert "given element group by element group (1 group(s) here)" in rep.text()
     assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 1, 0, -1, 0, 0"]
     assert _card_at(body, "*SHELL SECTION, ELSET=PLATE, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1") == ["0.1"]
-    # in the x-z plane without a rotation line the axis closest to the normal, 2, is the
-    # rotation axis: Abaqus projects axis 3, z (ccx would project axis 1, x)
+    # without a rotation line Abaqus turns about axis 1 and projects axis 2: y on the x-y strip
+    # (ccx would project axis 1, x); in the x-z plane y is the normal, which Abaqus leaves
+    # undocumented: the default directions, x as in ccx, warned
+    body, _, rep = convert_str(S4R_STRIP + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n" + sec)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 1, 0, -1, 0, 0"]
+    assert "*SHELL SECTION PLATE: orientation O: it has no rotation line" in rep.text()
     xz = S4R_STRIP.replace(", 1., 0.\n", ", 0., 1.\n")
-    body, _, _ = convert_str(xz + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n" + sec)
-    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 0, 1, -1, 0, 0"]
+    body, _, rep = convert_str(xz + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n" + sec)
+    assert "ABQ2CCX_AXES" not in body and "its axis 2, which Abaqus projects" in rep.text()
     # a rotation about axis 3 is read alike, and an isotropic material has no directions
     for deck in (S4R_STRIP + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n3, 30.\n" + sec,
                  xz.replace("type=ENGINEERING CONSTANTS\n140000., 10000., 10000., 0.3, 0.3, 0.4, 5000., "
@@ -8107,6 +8117,21 @@ def test_plain_shell_section_gets_abaqus_axes():
         body, conv, rep = convert_str(deck)
         assert "ABQ2CCX_AXES" not in body and "MATERIAL=CFRP, ORIENTATION=O" in body
     assert conv._mat_symmetry == {"CFRP": None}
+
+
+def test_orientation_rotation_line_defaults():
+    # Keywords *ORIENTATION: the rotation axis defaults to 1, the angle to 0.  A line "3" keeps
+    # the x-y strip's cards; ", 30." turns about axis 1 and is written so for ccx 2.23, which
+    # reads a blank axis as no rotation and stops on a bare angle
+    sec = "*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.1, 5\n"
+    ori = "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n"
+    body, conv, rep = convert_str(S4R_STRIP + ori + "3\n" + sec)
+    assert conv._orient_rotation["O"] == (3, 0.0) and "ABQ2CCX_AXES" not in body
+    assert "no rotation line" not in rep.text()
+    body, conv, _ = convert_str(S4R_STRIP + ori + ", 30.\n" + sec)
+    assert conv._orient_rotation["O"] == (1, 30.0)
+    assert _card_at(body, "*ORIENTATION, NAME=O") == ["1., 0., 0., 0., 1., 0.", "1, 30."]
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 1, 0, -1, 0, 0"]
 
 
 def test_orientation_by_nodes_after_the_card_is_resolved_before_planning():
@@ -8230,11 +8255,17 @@ def test_cylindrical_orientation_turning_across_an_element_is_warned():
     nodes = "".join(f"{k + 1}, {x:.9f}, {y:.9f}, 0.\n" for k, (x, y) in enumerate(pts))
     elems = "".join(f"{i + 1}, {i + 1}, {(i + 1) % 8 + 1}, {(i + 1) % 8 + 9}, {i + 9}\n" for i in range(8))
     deck = (f"*Node\n{nodes}*Element, type=S4R, elset=DISK\n{elems}" + COMPOSITE_MAT
-            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n"
+            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n3, 0.\n"
             "*Shell Section, elset=DISK, material=CFRP, orientation=C\n0.1\n")
     body, conv, rep = convert_str(deck)
     assert re.search(r"turns the material directions by up to 2[23] degrees across an element", rep.text())
     assert conv.reduced_physics and "ABQ2CCX_AXES" not in body    # ccx's own radial agrees at the centre
+    # without the rotation line Abaqus turns about axis 1, radial in the disk, and projects
+    # axis 2: the hoop direction (normal -z here), element group by element group
+    body, _, rep = convert_str(deck.replace("3, 0.\n", ""))
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == \
+        ["-0.382683432, 0.923879533, 0, 0.923879533, 0.382683432, 0"]
+    assert "orientation C: it has no rotation line" in rep.text()
     _, conv, rep = convert_str(deck.replace("material=CFRP", "material=ISO") + "*Material, name=ISO\n*Elastic\n1., 0.3\n")
     assert "across an element" not in rep.text() and not conv.reduced_physics
 

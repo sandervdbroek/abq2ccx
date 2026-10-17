@@ -20,7 +20,8 @@ dynamic step against its static deflection, the natural frequencies and buckling
 planar (B21) beams with a rectangular and a circular section, per-element *DISTRIBUTION
 orientations (a C3D8 plate and a composite S8R panel) against the same models written with
 one orientation per element, the material axes of plain shells and membranes whose
-orientation leaves their plane (the ply's stiffness at Abaqus' direction), of a hoop-wound
+orientation leaves their plane or has no rotation line (the ply's stiffness at Abaqus'
+direction), of a hoop-wound
 cylinder (thin-wall theory) and of a fibre-steered strip whose distribution axes leave the
 plate (the same strip with them in it), a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, the thermal strains of isotropic materials with an orthotropic / anisotropic
@@ -943,19 +944,22 @@ def plate_place(plane):
 # an orientation in plate coordinates whose axis 1 leaves the plate, turned about it: Abaqus
 # projects its turned axis 2 onto the plate (ccx 2.23 would project axis 1, the plate's x)
 TILTED_AXES = dict(a=(2.0, 0.0, 1.0), b=(0.0, 1.0, 0.0), rot=(1, 30.0))
+# the plate's own axes without a rotation line: Abaqus turns them about axis 1 by default
+# (2017 "Orientations") and projects axis 2, the plate's y (ccx 2.23: axis 1, x)
+PLATE_AXES = dict(a=(1.0, 0.0, 0.0), b=(0.0, 1.0, 0.0), rot=None)
 
 
 def abaqus_shell_direction(normal, ori=None):
     """Abaqus' material direction 1 on a flat shell with unit ``normal`` (2017 "Orientations"
-    and "Conventions"): an orientation dict(a, b, rot=(k, degrees)) has axis 1 along a and 3
-    along a x b, turned about axis k, and projects axis k + 1 (cyclic) onto the shell; without
-    one, the projection of global X, or of Z where X is the normal."""
+    and "Conventions"): an orientation dict(a, b, rot=(k, degrees) or None for axis 1, 0) has
+    axis 1 along a and 3 along a x b, turned about axis k, and projects axis k + 1 (cyclic)
+    onto the shell; without one, the projection of global X, or of Z where X is the normal."""
     if ori is None:
         v = (0.0, 0.0, 1.0) if abs(normal[0]) > math.cos(math.radians(0.1)) else (1.0, 0.0, 0.0)
     else:
         e1, e3 = _unit(ori["a"]), _unit(_cross(ori["a"], ori["b"]))
         axes = [e1, _cross(e3, e1), e3]
-        k, deg = ori["rot"]
+        k, deg = ori["rot"] or (1, 0.0)
         v = _rotate(axes[k % 3], axes[k - 1], math.radians(deg))
     return _unit(tuple(x - _dot(v, normal) * c for x, c in zip(v, normal)))
 
@@ -963,7 +967,8 @@ def abaqus_shell_direction(normal, ori=None):
 def shell_axes_inplane_deck(kind="s4r", plane="XY", orient=True, n=2):
     """A 1 x 1 patch of an orthotropic ply 0.1 thick (INPLANE_PLY): a plain *SHELL SECTION on
     S4R shells or a *MEMBRANE SECTION on M3D4 membranes, with the orientation TILTED_AXES (or
-    none), in the x-y, x-z or y-z plane (plate_place, the orientation turned with the patch),
+    the dict ``orient``, or none), in the x-y, x-z or y-z plane (plate_place, the orientation
+    turned with the patch),
     under composite_inplane_deck's three uniform strains, every node's displacement given:
     the edge reactions are t Qbar(theta) of the ply at Abaqus' direction theta."""
     eps, place = 1e-3, plate_place(plane)
@@ -990,9 +995,10 @@ def shell_axes_inplane_deck(kind="s4r", plane="XY", orient=True, n=2):
               f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}"]
     sec = f"{card}, elset=PATCH, material=PLY"
     if orient:
-        a, b = place(TILTED_AXES["a"]), place(TILTED_AXES["b"])
-        lines += ["*Orientation, name=TILTED", ", ".join(f"{c:.12g}" for c in (*a, *b)),
-                  "{}, {:g}".format(*TILTED_AXES["rot"])]
+        axes = TILTED_AXES if orient is True else orient
+        a, b = place(axes["a"]), place(axes["b"])
+        lines += ["*Orientation, name=TILTED", ", ".join(f"{c:.12g}" for c in (*a, *b))]
+        lines += ["{}, {:g}".format(*axes["rot"])] if axes["rot"] else []
         sec += ", orientation=TILTED"
     lines += [sec, "0.1"]
     for name, field in (("eps_x", lambda x, y: (eps * x, 0.0)), ("eps_y", lambda x, y: (0.0, eps * y)),
@@ -1010,8 +1016,8 @@ def shell_axes_inplane_deck(kind="s4r", plane="XY", orient=True, n=2):
 def shell_axes_angle(plane, orient=True):
     """The plate angle of Abaqus' material direction 1 in shell_axes_inplane_deck (degrees)."""
     place = plate_place(plane)
-    ori = dict(a=place(TILTED_AXES["a"]), b=place(TILTED_AXES["b"]), rot=TILTED_AXES["rot"]) \
-        if orient else None
+    axes = TILTED_AXES if orient is True else orient
+    ori = dict(a=place(axes["a"]), b=place(axes["b"]), rot=axes["rot"]) if orient else None
     d = abaqus_shell_direction(place((0.0, 0.0, 1.0)), ori)
     return math.degrees(math.atan2(_dot(d, place((0.0, 1.0, 0.0))), _dot(d, place((1.0, 0.0, 0.0)))))
 
@@ -3132,8 +3138,9 @@ def main():
     # after the rotation axis) and gives a membrane its orientation's axes unprojected (or
     # the global ones); abq2ccx gives such sections Abaqus' directions element by element.
     for kind, plane, orient in (("s4r", "XY", True), ("s4r", "XZ", True), ("s4r", "YZ", True),
-                                ("m3d4", "XZ", True), ("m3d4", "YZ", True), ("m3d4", "YZ", False)):
-        tag = f"shell_axes_{kind}_{plane}" + ("" if orient else "_default")
+                                ("m3d4", "XZ", True), ("m3d4", "YZ", True), ("m3d4", "YZ", False),
+                                ("s4r", "XY", PLATE_AXES), ("m3d4", "XZ", PLATE_AXES)):
+        tag = f"shell_axes_{kind}_{plane}" + ("" if orient is True else "_norot" if orient else "_default")
         res = composite_run(shell_axes_inplane_deck(kind, plane, orient), tag)
         if res is None:
             failures += 1
@@ -3144,8 +3151,9 @@ def main():
         err = max(abs(x - y) for r, g in zip(want, got) for x, y in zip(r, g)) / scale \
             if len(got) == len(want) else math.inf
         ok = err < 1e-4
-        print(f"{'PASS' if ok else 'FAIL'}  {tag} (plain {kind.upper()}, "
-              f"{'an orientation turned about its axis 1' if orient else 'no orientation'}, {plane} "
+        what = "an orientation turned about its axis 1" if orient is True else \
+            "the plate axes without a rotation line" if orient else "no orientation"
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (plain {kind.upper()}, {what}, {plane} "
               f"plane): edge reactions of three uniform strains vs the ply's t Qbar at Abaqus' "
               f"direction {theta:.2f} deg, max difference {err:.1e} of the largest")
         failures += 0 if ok else 1

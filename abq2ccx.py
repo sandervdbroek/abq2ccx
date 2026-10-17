@@ -1371,25 +1371,42 @@ def shell_local_axes(normal: Vec, frame: Optional[Tuple[Vec, Vec, Vec]] = None,
     Without an orientation (Abaqus 2017 "Conventions"): the projection of the global X axis,
     or of Z where X is within 0.1 degree of the normal.  With one (its turned ``frame``,
     see orientation_frame, and rotation ``axis``; Abaqus 2017 "Orientations"): the projection
-    of the axis that follows the rotation axis in the cycle 1, 2, 3.  Direction 2 is normal x
-    direction 1.  Abaqus' default rotation axis, 1, 'should have a nonzero component in the
-    direction of the normal' (Keywords *ORIENTATION) — a cylindrical system's radial axis on a
-    cylinder; without a rotation line the axis closest to the normal is taken, which is that
-    one there and axis 3 on a shell in the plane of axes 1 and 2.  (ccx 2.23 projects the
-    turned axis 1 whatever the rotation axis.)"""
+    of the axis that follows the rotation axis in the cycle 1, 2, 3 — without a rotation line
+    Abaqus "will by default use the local 1-axis", so axis 2, also where axis 1 lies in the
+    shell (Keywords *ORIENTATION: it "should have a nonzero component in the direction of
+    the normal").  Where that axis is the normal (not documented) the default directions.
+    Direction 2 is normal x direction 1.  (ccx 2.23 projects the turned axis 1 whatever the
+    rotation axis.)"""
     if frame is None:
         v = (1.0, 0.0, 0.0)
         if abs(vdot(v, normal)) > math.cos(math.radians(0.1)):
             v = (0.0, 0.0, 1.0)
     else:
-        if axis is None:
-            axis = max((1, 2, 3), key=lambda k: abs(vdot(frame[k - 1], normal)))
-        v = frame[axis % 3]
+        v = frame[(axis or 1) % 3]
     d = vsub(v, vscale(normal, vdot(v, normal)))
     if vnorm(d) < 1e-9:                            # the axis is along the normal
         return shell_local_axes(normal) if frame is not None else ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
     d = vunit(d)
     return d, vcross(normal, d)
+
+
+def shell_axes_caveat(normal: Vec, frame: Tuple[Vec, Vec, Vec], axis: Optional[int]) -> Optional[str]:
+    """Why Abaqus' projection of an orientation onto a shell (shell_local_axes) needs checking,
+    or None: the projected axis is the normal (Abaqus does not document the outcome), or —
+    without a rotation line — the default rotation axis 1 lies in the shell, against the
+    Keywords note, so direction 1 follows axis 2."""
+    k = axis or 1
+    v = frame[k % 3]
+    if vnorm(vsub(v, vscale(normal, vdot(v, normal)))) < 1e-9:
+        return (f"its axis {k % 3 + 1}, which Abaqus projects after rotation axis {k}"
+                f"{' (the default without a rotation line)' if axis is None else ''}, is the shell "
+                f"normal; Abaqus does not document that case, and the converter takes the default "
+                f"shell directions")
+    if axis is None and abs(vdot(frame[0], normal)) < 1e-6:
+        return ("it has no rotation line, so Abaqus turns it about its axis 1, which lies in the "
+                "shell, and projects axis 2 as material direction 1 (2017 \"Orientations\"); a "
+                "line \"3, 0.\" would make axis 1 direction 1")
+    return None
 
 
 def ply_axes(normal: Vec, axes: Tuple[Vec, Vec], angle: float) -> Tuple[Vec, Vec]:
@@ -3844,14 +3861,17 @@ class Converter:
             self._orient_axes.add(name)
         else:
             self._orient_axes.discard(name)
-        # optional additional-rotation line: local axis, angle (degrees)
+        # optional additional-rotation line: local axis (default 1), angle (degrees, default 0)
         recs = merged_data_records(b)
         rot = None
-        if len(recs) > 1:
-            f = [x for x in recs[1] if x != ""]
+        if len(recs) > 1 and any(recs[1]):
+            f = recs[1] + ["", ""]
             try:
-                if len(f) >= 2:
-                    rot = (pint(f[0]), pf(f[1]))
+                axis = pint(f[0]) if f[0] else 1
+                try:
+                    rot = (axis, pf(f[1]) if f[1] else 0.0)
+                except ValueError:                 # an angle distribution: not converted
+                    rot = (axis, 0.0)
             except ValueError:
                 rot = None
         self._orient_rotation[name] = rot
@@ -5519,6 +5539,8 @@ class Converter:
             out.append(", ".join(v))
         if len(recs) > 1:
             v = [x for x in recs[1] if x != ""]
+            if v and recs[1][0] == "":                 # Abaqus' default axis, 1 (ccx 2.23 reads a
+                v = ["1"] + v                          # blank one as none, stops on a bare angle)
             try:
                 zero = len(v) < 2 or pf(v[1]) == 0.0
             except ValueError:
@@ -6515,7 +6537,7 @@ class Converter:
                 return None
             n, centre, corners = geo
             toks = []
-            for _thick, _mat, spec in layers:
+            for (_thick, _mat, spec), sym in zip(layers, syms):
                 try:
                     angle, name = (pf(spec), base) if spec else (0.0, base)
                 except ValueError:
@@ -6524,6 +6546,10 @@ class Converter:
                 got = self._ccx_frame(e, name, angle, centre)
                 if (name and fr is None) or got is None:
                     return None
+                why = shell_axes_caveat(n, *fr) if fr and sym else None
+                if why:
+                    self.report.warn(f"*{b.keyword} {elset}: orientation {name}: {why} — verify the "
+                                     f"material directions.", once=True)
                 d1, d2 = ply_axes(n, shell_local_axes(n, *fr) if fr else shell_local_axes(n), angle)
                 if fr and (not self._dist_ori[name]["rect"] if name in self._dist_refs
                            else self.orientations[name][2].upper().startswith("CYL")):
@@ -6628,15 +6654,17 @@ class Converter:
         if composite:
             self.report.note(f"*SHELL SECTION, COMPOSITE on shells whose normal is not the "
                              f"orientation's axis 3 (another plane, a reversed normal, a curved shell "
-                             f"or a rotation about axis 1 / 2): each ply's directions given element "
-                             f"group by group ({len(groups)} group(s) here) as Abaqus defines them — "
+                             f"or a rotation about axis 1 / 2, axis 1 also without a rotation line): "
+                             f"each ply's directions given element group by group "
+                             f"({len(groups)} group(s) here) as Abaqus defines them — "
                              f"the orientation projected onto the shell, then turned by the layer "
                              f"angle about the shell normal; ccx would turn it about the "
                              f"orientation's axis 3 and project that.", once=True)
         else:
             self.report.note(f"*{b.keyword} whose material directions ccx would place otherwise "
-                             f"(an orientation turned about axis 1 / 2 or not in the shell's plane, "
-                             f"a cylindrical system on a cylinder, a membrane off the x-y plane): "
+                             f"(an orientation turned about axis 1 / 2 — axis 1 also without a rotation "
+                             f"line — or not in the shell's plane, a cylindrical system on a cylinder, "
+                             f"a membrane off the x-y plane): "
                              f"Abaqus' directions — the orientation projected onto the shell — given "
                              f"element group by element group ({len(groups)} group(s) here); ccx "
                              f"would project the turned axis 1 onto a shell and take a membrane's "
@@ -14609,6 +14637,10 @@ class Converter:
             center = vadd(center, vscale(q, 1.0 / len(mids)))
         fr = self._abaqus_frame(e, ori, center)
         if fr is not None:
+            why = shell_axes_caveat(n, *fr)
+            if why:
+                self.report.warn(f"Composite continuum shells: orientation {ori}: {why} — verify the "
+                                 f"ply directions.", once=True)
             return n, shell_local_axes(n, *fr)
         self.report.warn(f"Composite continuum shells: orientation '{ori}' has no axes the converter "
                          f"can form (undefined, OFFSET TO NODES, unresolved nodes, or a *DISTRIBUTION "
