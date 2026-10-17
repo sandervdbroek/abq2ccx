@@ -798,7 +798,7 @@ class Block:
 # ``AMP=`` on a load card is "parameter not recognized" in ccx, so the load silently
 # loses its amplitude).
 PARAM_ALIASES = {"GEN": "GENERATE", "PERT": "PERTURBATION", "PERTURB": "PERTURBATION",
-                 "AMP": "AMPLITUDE", "POS": "POSITION", "SECT": "SECTION"}
+                 "AMP": "AMPLITUDE", "POS": "POSITION", "SECT": "SECTION", "STACK DIR": "STACK DIRECTION"}
 # Abaqus keyword abbreviations CalculiX does not accept.
 KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 
@@ -1345,12 +1345,16 @@ def orientation_frame(a: Vec, b: Vec, system: str, point: Vec,
                       rot: Optional[Tuple[int, float]]) -> Tuple[Tuple[Vec, Vec, Vec], Optional[int]]:
     """The local axes of an *ORIENTATION at ``point`` and the axis of its additional rotation
     (None without a rotation line): RECTANGULAR — 1 along a, 3 along a x b; CYLINDRICAL — a
-    and b on the axis, 1 radial, 2 tangential, 3 from a to b; then turned about the rotation
-    axis by its angle (degrees)."""
+    and b on the axis, 1 radial, 2 tangential, 3 from a to b; SPHERICAL — a the centre, b on
+    the polar axis, 1 radial, 2 circumferential, 3 meridional towards b (2017 "Orientations",
+    Figure 1); then turned about the rotation axis by its angle (degrees)."""
     if system.upper().startswith("CYL"):
         e3 = vunit(vsub(b, a))
         r = vsub(point, a)
         e1 = vunit(vsub(r, vscale(e3, vdot(r, e3))))
+    elif system.upper().startswith("SPH"):
+        e1 = vunit(vsub(point, a))
+        e3 = vcross(e1, vunit(vcross(vunit(vsub(b, a)), e1)))
     else:
         e1 = vunit(a)
         e3 = vunit(vcross(a, b))
@@ -14395,14 +14399,14 @@ class Converter:
     def _stack_axis(self, b: Block, conn: Sequence[int]) -> Optional[Vec]:
         """For STACK DIRECTION=ORIENTATION, the axis of section ``b``'s orientation that
         _stack_order stacks along, at the centre of the element with nodes ``conn`` (a
-        cylindrical system's turns with it): the axis of its additional rotation, axis 1
-        without a rotation line.  For shells the orientation "defines an axis about which the
-        local 1 and 2 material directions may be rotated. This axis also defines an
-        approximate normal direction", and Abaqus stacks along the isoparametric direction
-        closest to it (2017 "About shell elements"; its cylindrical example stacks along the
-        radial axis 1).  None (warned: the stack direction is direction 3) where the converter
-        has no axes for it (_orient_axes): undefined, or given by a distribution or by each
-        element's nodes."""
+        cylindrical or spherical system's turns with it, orientation_frame): the axis of its
+        additional rotation, axis 1 without a rotation line.  For shells the orientation
+        "defines an axis about which the local 1 and 2 material directions may be rotated.
+        This axis also defines an approximate normal direction", and Abaqus stacks along the
+        isoparametric direction closest to it (2017 "About shell elements"; its cylindrical
+        example stacks along the radial axis 1).  None (warned: the stack direction is
+        direction 3) where the converter has no axes for it (_orient_axes): undefined, or
+        given by a distribution or by each element's nodes."""
         ori = (b.param("ORIENTATION") or "").strip().upper()
         if ori in self._orient_axes:
             a, bb, system = self.orientations[ori]

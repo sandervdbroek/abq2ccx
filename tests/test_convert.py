@@ -7934,6 +7934,9 @@ def test_shell_material_axes_follow_abaqus_rules():
     # cylindrical: axis 1 radial at the point, 2 tangential, 3 along the axis a -> b
     frame, _ = A.orientation_frame((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), "CYLINDRICAL", (0.0, 2.0, 5.0), None)
     assert frame[0] == (0.0, 1.0, 0.0) and frame[2] == (0.0, 0.0, 1.0)
+    # spherical: a the centre, b on the polar axis; 1 radial, 2 circumferential, 3 meridional
+    frame, _ = A.orientation_frame((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), "SPHERICAL", (0.0, 2.0, 0.0), None)
+    assert frame == ((0.0, 1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
     # a layer angle turns about the normal: about -z a +90 ply points along -y
     d1, d2 = A.ply_axes((0.0, 0.0, -1.0), A.shell_local_axes((0.0, 0.0, -1.0)), 90.0)
     assert max(abs(x - y) for x, y in zip(d1, (0.0, -1.0, 0.0))) < 1e-12
@@ -8026,8 +8029,9 @@ def test_continuum_shell_stack_direction_restacks_the_element():
     assert "STACK DIRECTION" not in rep.text()
     split = {}
     for rot in ("3, 30.", "2, 0."):                    # about axis 3 = z, about axis 2 = y
-        _, conv, _ = convert_str(deck.replace("1., 0., 0., 0., 1., 0.\n", f"1., 0., 0., 0., 1., 0.\n{rot}\n"))
+        _, conv, rep = convert_str(deck.replace("1., 0., 0., 0., 1., 0.\n", f"1., 0., 0., 0., 1., 0.\n{rot}\n"))
         split[rot] = [[conv.geom.nodes[n] for n in conn] for _, conn in conv.geom.elements.values()]
+        assert "STACK DIRECTION" not in rep.text()
     ys = sorted({round(p[1], 9) for conn in split["2, 0."] for p in conn})
     assert split["3, 30."] == geo[0][0] and ys == [0.0, 0.333333333, 0.666666667, 1.0], ys
     # an orientation whose axes come from each element's nodes: direction 3 (warned)
@@ -8512,6 +8516,27 @@ def test_continuum_shell_stack_along_a_cylindrical_orientation():
     # turned about its axis 3, the plies stack along the cylinder's axis
     _, conv, _ = convert_str(deck.replace("0., 0., 1.\n*Shell", "0., 0., 1.\n3, 0.\n*Shell"))
     assert {conv.geom.nodes[n][2] for n in conv.geom.nodes if n > 12} == {0.5}
+
+
+def test_continuum_shell_stack_along_a_spherical_orientation():
+    # a spherical system's axis 1 is radial from its centre a: a patch of a sphere whose element
+    # runs around along direction 1, outward along 2 and down along 3 stacks outward (read as a
+    # rectangular system, the centre at the origin gave no axis at all); STACK DIR abbreviates
+    # STACK DIRECTION, as Abaqus allows
+    def sph(r, ph, th):
+        ph, th = math.radians(ph), math.radians(th)
+        return (r * math.sin(th) * math.cos(ph), r * math.sin(th) * math.sin(ph), r * math.cos(th))
+    corners = [(9.99, 0, 30), (9.99, 10, 30), (10.01, 10, 30), (10.01, 0, 30),
+               (9.99, 0, 40), (9.99, 10, 40), (10.01, 10, 40), (10.01, 0, 40)]
+    nodes = "".join(f"{i + 1}, " + ", ".join(f"{x:.12f}" for x in sph(*c)) + "\n" for i, c in enumerate(corners))
+    deck = (f"*Node\n{nodes}*Element, type=SC8R, elset=CAP\n1, 1, 2, 3, 4, 5, 6, 7, 8\n" + COMPOSITE_MAT
+            + "*Orientation, name=SPH, system=SPHERICAL\n0., 0., 0., 0., 0., 1.\n"
+            "*Shell Section, elset=CAP, composite, stack dir=ORIENTATION, orientation=SPH\n"
+            "1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n")
+    _, conv, rep = convert_str(deck)
+    g = conv.geom
+    assert {round(math.sqrt(sum(x * x for x in g.nodes[n])), 9) for n in g.nodes if n > 8} == {10.0}
+    assert "STACK DIR" not in rep.text()
 
 
 def test_composite_examples_match_the_validation_decks():

@@ -1237,7 +1237,8 @@ def sc_cylinder_stack_force(composite=True, n=24, t=0.01, eps=1e-3):
     """The axial force sc_cylinder_stack_deck must give: its faceted wall (flat elements, faces
     t cos(pi / n) apart, mid-surface perimeter 2 n sin(pi / n)) under the axial strain ``eps``
     with no hoop force, from the plane-stress stiffness of radial plies whose direction 1 is the
-    system's axis 2, the hoop (classical lamination theory; exact for the uniform strain)."""
+    system's axis 2, the hoop (classical lamination theory, which the faceted model follows to
+    about 2e-5: its hoop and thickness contractions do not quite fit at the corners)."""
     plies = (0.0, 90.0, 0.0) if composite else (0.0,)
     a11 = a22 = a12 = 0.0
     for ang in plies:
