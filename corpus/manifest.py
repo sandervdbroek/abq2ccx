@@ -10,19 +10,20 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 `python corpus/fetch.py` to download into corpus/files/ (gitignored), then
 `python tests/test_corpus.py`.
 
-1022 decks from ~179 public GitHub repositories. Every deck converts cleanly (zero
-dangling references). Each entry carries one of three expectations:
+1052 decks: 1022 from ~179 public GitHub repositories, and 30 NAFEMS benchmark decks of the
+Abaqus 2017 documentation (``abaqus2017_*``). Every deck converts cleanly (zero dangling
+references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (209) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (233) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
   conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
-  Three flags keep such a deck out of the headline count of faithful solves (165):
+  Three flags keep such a deck out of the headline count of faithful solves (188):
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
-  - ``reduced_physics='<what>'`` (32, 3 of them also source_unloaded): the conversion
+  - ``reduced_physics='<what>'`` (33, 3 of them also source_unloaded): the conversion
     drops or replaces part of the Abaqus model - a constitutive behaviour (concrete
     damaged plasticity, user hardening, Chaboche back-stresses, field-dependent
     elasticity), an element formulation (hybrid, modified or thin-shell elements run as
@@ -38,11 +39,17 @@ dangling references). Each entry carries one of three expectations:
 * ``parse_only=True`` (221) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (592) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (598) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
   worse than the original unconverted deck.
+
+A deck with a published answer (the benchmark decks, and the copy of Abaqus' LE1 CPS3
+deck) carries ``reference=dict(quantity, read, target, abaqus, tol, source)``: what to read
+from ccx's results, the NAFEMS target and Abaqus' result for the deck's mesh, which
+test_corpus.py checks ccx against (``ccx`` and ``why`` where ccx answers differently for a
+reason traced to ccx; see docs/testing.md, "Published answers").
 
 This corpus was assembled in waves, the later ones by fanning out parallel discovery
 agents across many engineering domains (composites, geotech, biomechanics,
@@ -90,6 +97,300 @@ CORPUS = [
     dict(name='a_cgray_trial1', expect_solve=True, license='see source repo',
          exercises='CPS4I (-> exact C3D8I slabs)',
          url='https://raw.githubusercontent.com/A-CGray/FEMSS4/master/Labs/Old%20Lab/Cantilever/trial1.inp'),
+    dict(name='abaqus2017_nfv1268x', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV12 free thin square plate, S8R: *NFILL, *FREQUENCY with a shift, DOF 6 held',
+         reference=dict(
+             quantity='eigenfrequencies of modes 4-9, Hz (modes 1-3 rigid)',
+             read=('freq', (4, 5, 6, 7, 8, 9)),
+             target=[1.622, 2.36, 2.922, 4.233, 4.233, 7.416],
+             abaqus=[1.626, 2.369, 2.935, 4.185, 4.185, 7.559], tol=0.005,
+             ccx=[1.6268, 2.3729, 2.9402, 4.1958, 4.1958, 7.6527],
+             why="ccx runs S8R as a one-layer C3D20R solid, not Abaqus' shell element: modes 4-8 "
+                 "within 0.26 % of Abaqus' S8R, mode 9 1.24 % stiffer, a coarse-mesh error of that "
+                 "element (the same plate in ccx: 7.375 Hz at 8 x 8, 7.355 at 16 x 16)",
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv12.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv1268x.inp'),
+    dict(name='abaqus2017_nfv2x22x', expect_solve=True,
+         reduced_physics='its 2-D beams run as 3-D ones, so *FREQUENCY also finds their twist modes',
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV2 pin-ended double cross, B22: *MPC TIE at the crossing, planar beams, '
+                   '*FREQUENCY',
+         reference=dict(
+             quantity='eigenfrequencies of modes 1, 2, 9 and 10, Hz (the first of each group)',
+             read=('freq', (1, 2, 9, 10)),
+             target=[11.336, 17.709, 45.345, 57.39],
+             abaqus=[11.337, 17.676, 45.686, 57.745], tol=0.005,
+             ccx=[11.647, 19.349, 50.434, 70.213],
+             why="ccx expands each 3-node beam into one C3D20R brick, much stiffer than Abaqus' B22 on "
+                 'this mesh of 8 elements a 10 m arm: one pinned 10 m beam of it gives 11.65 and 50.50 '
+                 'Hz for n = 2 and 4 (beam theory 11.34 and 45.35; with 32 elements 11.33 and 45.28)',
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv2.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv2x22x.inp'),
+    dict(name='abaqus2017_nfv32f8c', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV32 cantilevered tapered membrane, CPS8: *NFILL, *FREQUENCY',
+         reference=dict(
+             quantity='eigenfrequencies of modes 1-6, Hz',
+             read=('freq', (1, 2, 3, 4, 5, 6)),
+             target=[44.623, 130.03, 162.7, 246.05, 379.9, 391.44],
+             abaqus=[44.636, 130.14, 162.72, 246.63, 382.02, 391.55], tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv32.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv32f8c.inp'),
+    dict(name='abaqus2017_nfv41f8c', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV41 free cylinder, CAX8: unsupported *FREQUENCY with a shift',
+         reference=dict(
+             quantity='eigenfrequencies of modes 2-6, Hz (mode 1 rigid)',
+             read=('freq', (2, 3, 4, 5, 6)),
+             target=[243.53, 377.41, 394.11, 397.72, 405.28],
+             abaqus=[243.5, 377.46, 394.3, 397.97, 406.44], tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv41.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv41f8c.inp'),
+    dict(name='abaqus2017_nfv4268c', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV42 thick hollow sphere, CAX8: *NODE SYSTEM=C, *TRANSFORM, set-based '
+                   '*EQUATIONs (two in a card)',
+         reference=dict(
+             quantity='eigenfrequencies of modes 1-5, Hz',
+             read=('freq', (1, 2, 3, 4, 5)),
+             target=[369.91, 838.03, 1451.2, 2111.7, 2795.8],
+             abaqus=[370.97, 840.49, 1457.3, 2137.9, 2861.1], tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv42.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv4268c.inp'),
+    dict(name='abaqus2017_nfv52fkc', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV52 simply supported solid square plate, C3D20: *NFILL, *MODAL FILE / OUTPUT',
+         reference=dict(
+             quantity='eigenfrequencies of modes 4-10, Hz (modes 1-3 rigid)',
+             read=('freq', (4, 5, 6, 7, 8, 9, 10)),
+             target=[44.092, 106.66, 106.66, 156.23, 193.58, 200.13, 200.13],
+             abaqus=[44.796, 110.54, 110.54, 169.1, 193.92, 206.64, 206.64], tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv52.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv52fkc.inp'),
+    dict(name='abaqus2017_nfv52i8f', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV52 simply supported solid square plate, C3D8I: *NFILL of *NFILL sets, '
+                   '*ELGEN in three directions',
+         reference=dict(
+             quantity='eigenfrequencies of modes 4-10, Hz (modes 1-3 rigid)',
+             read=('freq', (4, 5, 6, 7, 8, 9, 10)),
+             target=[44.092, 106.66, 106.66, 156.23, 193.58, 200.13, 200.13],
+             abaqus=[44.092, 106.66, 106.66, 156.23, 193.58, 200.13, 200.13], tol=0.005,
+             ccx=[44.18, 107.12, 107.12, 158.03, 193.27, 205.15, 205.15],
+             why="Abaqus lumps the mass of first-order elements (2017 Theory Guide, 'Implicit dynamic "
+                 "analysis') and condenses C3D8I's incompatible modes out; ccx keeps them as degrees "
+                 'of freedom with a consistent mass: an independent solution of this mesh gives 44.12, '
+                 "106.7, 156.5 Hz the Abaqus way and 44.18, 107.1, 157.9 ccx's",
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv52.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv52i8f.inp'),
+    dict(name='abaqus2017_nle10c_c3d10', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE10 thick plate, C3D10 coarse: *BOUNDARY / *DLOAD OP=NEW, element-set '
+                   'pressure',
+         reference=dict(
+             quantity='SYY at point D (node 86), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 86),
+             target=-5.38,
+             abaqus=-5.44, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le10.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle10c_c3d10.inp'),
+    dict(name='abaqus2017_nle10f_c3d10', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE10 thick plate, C3D10 fine: *BOUNDARY / *DLOAD OP=NEW, element-set pressure',
+         reference=dict(
+             quantity='SYY at point D (node 585), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 585),
+             target=-5.38,
+             abaqus=-5.77, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le10.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle10f_c3d10.inp'),
+    dict(name='abaqus2017_nle10fkc', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE10 thick plate, C3D20 coarse: *NCOPY, *ELGEN, a pressure element set with '
+                   'gaps',
+         reference=dict(
+             quantity='SYY at point D (node 4013), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 4013),
+             target=-5.38,
+             abaqus=-6.72, tol=0.01, unit=1e6,
+             ccx=-7.3432,
+             why="ccx extrapolates a C3D20's 27 integration-point stresses to its nodes by a "
+                 "least-squares fit of the 20 nodal functions, Abaqus through all 27 points: ccx's own "
+                 "integration-point stresses give -6.724 MPa at D Abaqus' way",
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le10.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle10fkc.inp'),
+    dict(name='abaqus2017_nle10rkf', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE10 thick plate, C3D20R fine: *NCOPY, *ELGEN, a pressure element set with '
+                   'gaps',
+         reference=dict(
+             quantity='SYY at point D (node 4013), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 4013),
+             target=-5.38,
+             abaqus=-5.53, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le10.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle10rkf.inp'),
+    dict(name='abaqus2017_nle1xf6f', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE1 elliptic membrane, CPS6 fine: *ELGEN, *DLOAD P3, XSYMM / YSYMM',
+         reference=dict(
+             quantity='SYY at point D (node 801), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 801),
+             target=92.7,
+             abaqus=94.01, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le1.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle1xf6f.inp'),
+    dict(name='abaqus2017_nle1xf8f', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE1 elliptic membrane, CPS8 fine: *ELGEN, *DLOAD P3, XSYMM / YSYMM',
+         reference=dict(
+             quantity='SYY at point D (node 801), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 801),
+             target=92.7,
+             abaqus=92.81, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le1.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle1xf8f.inp'),
+    dict(name='abaqus2017_nle1xr8f', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE1 elliptic membrane, CPS8R fine: *ELGEN, *DLOAD P3, XSYMM / YSYMM',
+         reference=dict(
+             quantity='SYY at point D (node 801), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 801),
+             target=92.7,
+             abaqus=90.07, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le1.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle1xr8f.inp'),
+    dict(name='abaqus2017_nle2x68f', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE2 cylindrical shell bending patch test, S8R: *NMAP CYLINDRICAL, *NODE '
+                   'normals, *TRANSFORM, cylindrical *ORIENTATION, edge moments',
+         reference=dict(
+             quantity='tangential stress on the outer surface at point E (node 101), the .frd node nearest '
+                      'r = 1.005 there (ccx expands the shell), MPa',
+             read=('stress', (-0.116093, 0.993238, 0.0), (0.998205, 0.116673, 0.3)),
+             target=60.0,
+             abaqus=59.7, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le2.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle2x68f.inp'),
+    dict(name='abaqus2017_nle5x68c', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS LE5 Z-section cantilever, S8R: shell junctions, ENCASTRE, edge shear as '
+                   '*CLOAD',
+         reference=dict(
+             quantity='SXX at point A (node 5, the flange edge at x = 2.5) on the mid-surface: the .frd '
+                      'node there (ccx expands the shell), MPa',
+             read=('stress', (1, 0, 0), (2.5, -1.0, -1.0)),
+             target=-108.0,
+             abaqus=-109.85, tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le5.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nle5x68c.inp'),
+    dict(name='abaqus2017_nnl1xr4x', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS NL1 prescribed biaxial strain history, CPE4R: *PLASTIC perfect and hardening, '
+                   '8 steps of *BOUNDARY OP=NEW, *STATIC DIRECT',
+         reference=dict(
+             quantity='von Mises stress after steps 1-8, element 1 (perfect plasticity, node 1) then '
+                      'element 11 (hardening, node 11), .frd, MPa',
+             read=('mises', (1, 11), (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)),
+             target=[5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 3.917, 5.0, 5.0, 5.862, 5.482, 6.362, 6.64,
+                     7.322, 4.23, 5.673],
+             abaqus=[5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 3.824, 5.0, 5.0, 5.862, 5.482, 6.359, 6.626,
+                     7.297, 4.114, 5.532], tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-nl1.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl1xr4x.inp'),
+    dict(name='abaqus2017_nnl2xr8x', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS NL2 axisymmetric thick cylinder, CAX8R: perfect plasticity under internal '
+                   'pressure in 5 steps',
+         reference=dict(
+             quantity='radial and hoop stress (.dat SXX, SZZ) at the 8 Gauss radii 104.2-193.7 (elements '
+                      '1-4, points 1 and 2) under 80 and 160 MPa, MPa',
+             read=('ipstress', tuple((e, ip, k) for e in (1, 2, 3, 4) for ip in (1, 2) for k in (0, 2)),
+                   (1.0, 5.0)),
+             target=[-71.55, 124.9, -52.89, 106.2, -42.46, 98.5, -31.19, 84.52, -23.16, 76.49,
+                     -13.14, 66.48, -7.643, 60.98, -1.769, 55.1, -150.1, 89.92, -124.9, 115.2,
+                     -107.9, 132.1, -86.61, 153.3, -68.61, 170.9, -41.94, 195.9, -24.55, 195.9,
+                     -5.682, 177.0],
+             abaqus=[-71.55, 124.9, -52.89, 106.2, -42.46, 95.8, -31.19, 84.52, -23.16, 76.49,
+                     -13.14, 66.48, -7.643, 60.98, -1.769, 55.1, -150.1, 89.92, -124.9, 115.2,
+                     -107.9, 132.1, -86.61, 153.3, -68.61, 170.9, -41.94, 195.9, -24.55, 195.9,
+                     -5.682, 177.0], tol=0.01, unit=1e6,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-nl2.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl2xr8x.inp'),
+    dict(name='abaqus2017_nt1xxf8x', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS T1 membrane with a hot spot, CPS8: *TEMPERATURE without initial temperatures, '
+                   "*EQUATION ties across the hot spot's edge",
+         reference=dict(
+             quantity='SYY at point D (node 208, outside the hot spot), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 208),
+             target=50.0,
+             abaqus=51.53, tol=0.01, unit=1e6,
+             ccx=52.863,
+             why='ccx runs CPS8 as a one-element-thick C3D20 slab with a free thickness, not as 2-D '
+                 "plane stress (SZZ = 2.8 MPa at D, at the hot spot's edge); a 2-D plane-stress CPS8 "
+                 "solution of this mesh gives 51.533 MPa, Abaqus' 51.53",
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-t1.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nt1xxf8x.inp'),
+    dict(name='abaqus2017_nt2xx28x', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS T2 1-D heat transfer with radiation, DC2D8: *RADIATE, *PHYSICAL CONSTANTS, '
+                   'steady state',
+         reference=dict(
+             quantity='temperature at B (node 21), .frd, degC',
+             read=('temp', 21),
+             target=653.84,
+             abaqus=653.85, tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-t2.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nt2xx28x.inp'),
+    dict(name='abaqus2017_nt3xx28f', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS T3 1-D transient heat transfer, DC2D8 fine: *AMPLITUDE DEFINITION=PERIODIC, '
+                   'transient *HEAT TRANSFER without DELTMX or initial temperatures',
+         reference=dict(
+             quantity='temperature at x = 0.08 (node 17) at 32 s, .frd, degC',
+             read=('temp', 17),
+             target=36.6,
+             abaqus=36.09, tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-t3.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nt3xx28f.inp'),
+    dict(name='abaqus2017_nt4xx38f', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS T4 2-D heat transfer with convection, DC3D8 fine: *FILM, *NFILL',
+         reference=dict(
+             quantity='temperature at E (node 303), .frd, degC',
+             read=('temp', 303),
+             target=18.3,
+             abaqus=18.91, tol=0.005,
+             ccx=17.954,
+             why='ccx integrates *FILM over a face with the consistent matrix, Abaqus lumps it on '
+                 'first-order heat-transfer elements: an independent 2-D solution of this mesh gives '
+                 '17.954 consistent, 18.914 lumped',
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-t4.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nt4xx38f.inp'),
+    dict(name='abaqus2017_nt4xx3kc', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS T4 2-D heat transfer with convection, DC3D20 coarse: *FILM, *NFILL of *NFILL '
+                   'sets',
+         reference=dict(
+             quantity='temperature at E (node 303), .frd, degC',
+             read=('temp', 303),
+             target=18.3,
+             abaqus=17.89, tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-t4.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nt4xx3kc.inp'),
+    dict(name='abaqus2017_onedheattransrad_std_c3d8t', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS T2 1-D heat transfer with radiation, C3D8T: steady *COUPLED '
+                   'TEMPERATURE-DISPLACEMENT, *RADIATE',
+         reference=dict(
+             quantity='temperature at B (node 1), .frd, degC',
+             read=('temp', 1),
+             target=653.84,
+             abaqus=653.85, tol=0.005,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-t2.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/onedheattransrad_std_c3d8t.inp'),
     dict(name='bbr6464_nat_freq', expect_solve=True,
          reduced_physics='its SECTION=CIRC B21 beams run as 3-node B32 (ccx 2.23 stops on linear circular-section beams): a different element', license='see source repo',
          exercises='B21 — parts/instances/assembly; *Frequency',
@@ -458,6 +759,12 @@ CORPUS = [
          url='https://raw.githubusercontent.com/mo-hanxuan/FEMcy/main/tests/elliptic_membrane/element_quadratic/ellip_membrane_quadritic_trig_neumann.inp'),
     dict(name='nafems_le1_cps3', expect_solve=True, license='MIT',
          exercises='NAFEMS LE1 elliptic membrane, CPS3; *OUTPUT,FIELD; *RESTART; blank-DOF *BOUNDARY',
+         reference=dict(
+             quantity='SYY at point D (node 10), .frd nodal stress, MPa',
+             read=('stress', (0, 1, 0), 10),
+             target=92.7,
+             abaqus=51.04, tol=0.01,
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-le1.htm'),
          url='https://media.githubusercontent.com/media/nschloe/meshio/main/tests/meshes/abaqus/nle1xf3c.inp'),
     dict(name='parafem_fixnd_cube_4x_abaqus_direct', expect_solve=True, license='see source repo',
          exercises='DC3D4 — parts/instances/assembly; thermal',
@@ -1623,6 +1930,58 @@ CORPUS = [
 
     # --- convert cleanly, but ccx cannot run the analysis (or incomplete source) ---
 
+    dict(name='abaqus2017_ncr1ar8x', expect_solve=False,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS creep test 1(a), uniaxial secondary creep, CPS8R: *CREEP LAW=TIME, *VISCO '
+                   'CETOL',
+         note="ccx limitation: its Norton creep stops on a singular matrix ('matrix found to be "
+              "singular') once an increment's creep strain is about 20 times the elastic strain - "
+              'here at 6.6 h of 1000 (likewise a 3-D C3D20R cube written for ccx); Abaqus takes '
+              'increments of about 100 h. Until then ux = 100 (sigma/E + 0.01 t) exactly; target: '
+              'creep strain 0.01 t, 10.0 at 1000 h',
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/ncr1ar8x.inp'),
+    dict(name='abaqus2017_ncr2ar8x', expect_solve=False,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS creep test 2(a), biaxial secondary creep, CPS8R: *CREEP LAW=TIME, *VISCO '
+                   'CETOL',
+         note="ccx limitation: its Norton creep stops on a singular matrix ('matrix found to be "
+              "singular') at 6.6 h of 1000, as in test 1(a); target: equivalent creep strain 0.01 "
+              't, 10.0 at 1000 h',
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/ncr2ar8x.inp'),
+    dict(name='abaqus2017_ncr5ar8x', expect_solve=False,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS creep test 5(a), plane strain biaxial creep, CPE8R: *CREEP LAW=TIME, *VISCO '
+                   'CETOL',
+         note="ccx limitation: its Norton creep stops on a singular matrix ('matrix found to be "
+              "singular') at 168 h of 1000, as in test 1(a); target: creep strains 0.1321 and "
+              '-0.1318 at 1000 h',
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/ncr5ar8x.inp'),
+    dict(name='abaqus2017_nfv4x32x', expect_solve=False,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS FV4 cantilever with off-centre point masses, B32 CIRC: *MASS, *MPC BEAM, '
+                   '*FREQUENCY',
+         note="ccx limitation: a *FREQUENCY step stops ('add_bo_st: coefficient should be 0') when "
+              '*MASS elements sit on *RIGID BODY members - here the point masses the *MPC BEAM '
+              'offsets carry (reproduced on two point masses on a spring-held rigid body written '
+              'for ccx); target 1.723, 1.727, 7.413, 9.972, 18.155, 26.957 Hz',
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv4x32x.inp'),
+    dict(name='abaqus2017_nnl5x22x', expect_solve=False,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS NL5 cantilever rolled up by an end moment, B22: *BEAM GENERAL SECTION, NLGEOM',
+         note="ccx limitation: *BEAM GENERAL SECTION has no ccx card, and ccx's U1 beam, which "
+              "can carry one, takes only 2-node beams in linear steps, not these NLGEOM B22 (ccx "
+              "stops: '*ERROR in gen3delem: first thickness'); target at M L / (2 pi E I) = 1: "
+              "ux / L = -1, uy / L = 0, rotation 2 pi",
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl5x22x.inp'),
+    dict(name='abaqus2017_nnl6x22x', expect_solve=False,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS NL6 cantilever with an axial end load past buckling, B22: *BEAM GENERAL '
+                   'SECTION, NLGEOM',
+         note="ccx limitation: *BEAM GENERAL SECTION has no ccx card, and ccx's U1 beam, which "
+              "can carry one, takes only 2-node beams in linear steps, not these NLGEOM B22 (ccx "
+              "stops: '*ERROR in gen3delem: first thickness'); target at P L^2 / (2 pi E I) = "
+              "22.493: ux / L = -1.577, uy / L = 0.421",
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl6x22x.inp'),
     dict(name='asurovi_45_vcct', expect_solve=False, license='see source repo',
          exercises='CPE4I — parts/instances/assembly; *Orientation; contact',
          note='VCCT debonding: the bonded start (*INITIAL CONDITIONS, TYPE=CONTACT) has no ccx equivalent, and the remaining contact pair - node-to-surface, the Abaqus default - does not converge in ccx (it runs as face-to-face contact, without the bond)',

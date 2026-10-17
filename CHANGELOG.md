@@ -116,10 +116,21 @@ without an error. A full audit and the work that followed:
   nodal forces with consistent end moments; in space where G J cannot be had, only with
   `--approximate`, which otherwise keeps the I → `RECT` route. Three planar I-beam decks solve
   (Euler–Bernoulli for Timoshenko beams: reduced physics).
+* **Published answers** — 30 NAFEMS benchmark decks of the Abaqus 2017 documentation joined
+  the corpus, and 25 decks are checked against their published answer (`reference`,
+  `test_corpus_references`): 19 give Abaqus' result for the same mesh, 6 differ for reasons
+  traced to ccx. They found converter faults, fixed: `*NFILL` sets hold their bounding
+  nodes; each equation of an `*EQUATION` card resolves its sets; `DC2D*` / `DCAX*` run as
+  ccx's plane and axisymmetric elements; `*NMAP` maps coordinates and normals; `PERIODIC`,
+  `MODULATED` and `DECAY` amplitudes are sampled; a transient `*HEAT TRANSFER` without
+  `DELTMX` takes Abaqus' fixed increments, and transient thermal steps start from 0 without
+  initial temperatures; a zero extra rotation of a cylindrical `*ORIENTATION` is no reduced
+  physics.
 
-Corpus: 165 decks solve their own problem; 32 more solve with reduced physics, 14 load
+Corpus: 188 decks solve their own problem; 33 more solve with reduced physics, 14 load
 nothing (3 both) and one drifts to a solution that is not the deck's; 221 mesh-only decks are
-accepted, 592 need what ccx cannot run.
+accepted, 598 need what ccx cannot run; 25 give their published answer (6 with a documented
+ccx difference).
 
 ## 1.1.0 (July 2026)
 

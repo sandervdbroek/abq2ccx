@@ -108,14 +108,19 @@ prints one `PASS` line per check, about seventy in all; [testing](docs/testing.m
 | a rigid flat punch of `R3D4`, `R2D2` or `RAX2` elements or the same face as an analytical surface, also turned under NLGEOM and in explicit dynamics; a block tied to a turning rigid plate; pressure on rigid elements; `MASS` + `ROTARYI` on a rigid plate | ccx's penalty contact law; the punch given its motion node by node; p / k; spring frequencies | ≤ 8e-7 of \|u\|, mostly round-off |
 | a faceted analytical sphere on a block (`--approximate`) | Hertz | 2.3 % (finite block, penalty contact) |
 
-A **corpus of 1022 genuine Abaqus decks** from about 180 public repositories (CAE exports,
-UMAT and UEL decks, explicit and coupled models, …) is fetched on demand and run through
-convert → integrity check → ccx. On ccx 2.23 all 1022 convert with no dangling reference;
-**165 solve the deck's own physics**; 44 more solve but stay out of that count — 14 load
-nothing in the source deck, 32 (3 of them also unloaded) solve a model with reduced physics,
-and one converges to a solution that is not the deck's (a part that only contact holds drifts
-away in ccx) — and 221 mesh-only decks are accepted. The other 592 need what ccx cannot run — mostly user
-materials (353) and user elements (66). See [testing](docs/testing.md).
+A **corpus of 1052 genuine Abaqus decks** — 1022 from about 180 public repositories (CAE
+exports, UMAT and UEL decks, explicit and coupled models, …) and 30 NAFEMS benchmark decks of
+the Abaqus 2017 documentation — is fetched on demand and run through convert → integrity check
+→ ccx. On ccx 2.23 all 1052 convert with no dangling reference; **188 solve the deck's own
+physics**; 45 more solve but stay out of that count — 14 load nothing in the source deck, 33
+(3 of them also unloaded) solve a model with reduced physics, and one converges to a solution
+that is not the deck's (a part that only contact holds drifts away in ccx) — and 221 mesh-only
+decks are accepted. The other 598 need what ccx cannot run — mostly user materials (353) and
+user elements (66). **25 benchmark decks are checked against their published answer**: 19
+match Abaqus' result for the same mesh (within 0.5 % for temperatures and frequencies, 1 % for
+stresses), 6 differ for reasons traced to ccx (its nodal extrapolation, plane-stress slab, film
+integration, mass matrices, coarse shell and beam meshes). See
+[testing](docs/testing.md#published-answers).
 
 ## How it works
 

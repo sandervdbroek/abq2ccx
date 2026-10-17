@@ -19,6 +19,9 @@ Two layers of checking:
                  crash, runs an analysis STEP, and writes no NaN/Inf to the .dat or
                  .frd), and mesh-only decks marked ``parse_only`` must be accepted by
                  ccx; the rest are recorded only.
+     ANSWERS   — optional, with ccx: an ``expect_solve`` deck with a ``reference`` (the
+                 Abaqus benchmark decks) must give its published answer (see
+                 ``reference_check``).
 
 Usage:
     python corpus/fetch.py          # first, download the decks (network)
@@ -109,7 +112,11 @@ def dangling(text):
 classify_ccx_run = A.classify_ccx_run
 
 
-def run_ccx(ccx, env, text):
+def run_ccx(ccx, env, text, read=None):
+    """The solve judge's verdict on ``text`` in ccx; with ``read`` (a function of the job path
+    without its extension, run on the result files before they are deleted) the pair
+    (verdict, what it returns): None when the job did not solve, the exception when the
+    results do not hold what it reads."""
     d = tempfile.mkdtemp()
     open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n").write(text)
     fe = dict(os.environ)
@@ -117,11 +124,119 @@ def run_ccx(ccx, env, text):
     try:
         p = subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True,
                            encoding="utf-8", errors="replace", timeout=300)
-        return classify_ccx_run(p.returncode, p.stdout, p.stderr, os.path.join(d, "job"))
+        status = classify_ccx_run(p.returncode, p.stdout, p.stderr, os.path.join(d, "job"))
+        if read is None:
+            return status
+        if status != "solved":
+            return status, None
+        try:
+            return status, read(os.path.join(d, "job"))
+        except (OSError, LookupError, ValueError) as exc:
+            return status, exc
     except subprocess.TimeoutExpired:
-        return "failed"
+        return "failed" if read is None else ("failed", None)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# --- published answers ----------------------------------------------------------
+# A deck's ``reference`` (corpus/manifest.py) names a quantity of the deck's ccx results by
+# ``read``, read through the shared .frd / .dat readers (abq2ccx.frd_index / frd_rows /
+# dat_blocks, and validate_with_ccx.py's on top of them):
+#   ("stress", (dx, dy, dz), node)   normal stress along the direction at a node of the last
+#                                    .frd STRESS block (nodal, extrapolated and averaged by
+#                                    ccx); the node as a number, or as a point: the nearest
+#                                    .frd node (shells and beams are expanded in the .frd)
+#   ("temp", node)                   temperature of the last .frd NDTEMP block
+#   ("freq", (mode, ...))            eigenfrequencies (cycles/time) of the .dat
+#   ("mises", (node, ...), (t, ...)) von Mises stress of the .frd STRESS block at each total
+#                                    time, for each node
+#   ("ipstress", ((elem, ip, k), ...), (t, ...))   .dat *EL PRINT stress component k (sxx,
+#                                    syy, szz, sxy, sxz, syz) at an integration point, at each
+#                                    total time
+
+def frd_nodes(frd_path):
+    """{node: (x, y, z)} of the node block of a ccx .frd file."""
+    for _, _, name, off in A.frd_index(frd_path):
+        if name == "NODES":
+            return {n: tuple(v[:3]) for n, v in A.frd_rows(frd_path, off)}
+    return {}
+
+
+def dat_ip_stresses(dat_path):
+    """[(time, {(element, integration point): [sxx, syy, szz, sxy, sxz, syz]})] of every
+    stress table *EL PRINT wrote to a ccx .dat file."""
+    return [(t, {(int(r[0]), int(r[1])): r[2:] for r in rows if len(r) == 8})
+            for _, title, _, t, rows in A.dat_blocks(dat_path) if title == "stresses"]
+
+
+def _at(blocks, t):
+    """The last of [(time, data)] at total time ``t``."""
+    hit = [b for tb, b in blocks if abs(tb - t) <= 1e-6 * max(1.0, abs(t))]
+    if not hit:
+        raise KeyError(f"no output at time {t}")
+    return hit[-1]
+
+
+def reference_values(job, read):
+    """The values ``read`` names in the ccx results of ``job`` (its path without extension)."""
+    kind = read[0]
+    if kind == "freq":
+        f = V.dat_eigen_table(job + ".dat", "E I G E N V A L U E   O U T P U T")
+        return [f[m - 1] for m in read[1]]
+    if kind == "temp":
+        return [V.frd_blocks(job + ".frd", "NDTEMP")[-1][1][read[1]][0]]
+    if kind == "stress":
+        d, node = read[1], read[2]
+        if not isinstance(node, int):
+            xyz = frd_nodes(job + ".frd")
+            node = min(xyz, key=lambda n: sum((a - b) ** 2 for a, b in zip(xyz[n], node)))
+        sxx, syy, szz, sxy, syz, szx = V.frd_blocks(job + ".frd", "STRESS")[-1][1][node]
+        t = [[sxx, sxy, szx], [sxy, syy, syz], [szx, syz, szz]]
+        return [sum(d[i] * t[i][j] * d[j] for i in range(3) for j in range(3)) /
+                sum(x * x for x in d)]
+    if kind == "mises":
+        blocks = V.frd_blocks(job + ".frd", "STRESS")
+        out = []
+        for node in read[1]:
+            for tt in read[2]:
+                sxx, syy, szz, sxy, syz, szx = _at(blocks, tt)[node]
+                out.append((0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2) +
+                            3.0 * (sxy ** 2 + syz ** 2 + szx ** 2)) ** 0.5)
+        return out
+    if kind == "ipstress":
+        tables = dat_ip_stresses(job + ".dat")
+        return [_at(tables, tt)[(el, ip)][k] for tt in read[2] for el, ip, k in read[1]]
+    raise ValueError(f"unknown reference read {kind!r}")
+
+
+def reference_check(e, values):
+    """(verdict, line) for a deck's ``reference`` and the values ccx gave (divided by
+    ``unit``, as published).  Each value must be within ``tol`` (relative) of its yardstick:
+    Abaqus' published result for the deck's mesh (``abaqus``), or ``ccx`` where the manifest
+    records that ccx gives another answer, with ``why`` (traced to ccx, not to the conversion;
+    the line then also says how far it is from Abaqus).  "PASS", "DIFFERS" (an explained ccx
+    difference reproduced) or "MISS"."""
+    ref = e["reference"]
+    listify = lambda x: list(x) if isinstance(x, (list, tuple)) else [x]
+    abaqus, target = listify(ref["abaqus"]), listify(ref["target"])
+    yard = listify(ref.get("ccx", ref["abaqus"]))
+    tol = ref["tol"]
+    if not isinstance(values, list) or len(values) != len(yard):
+        return "MISS", f"{e['name']}: {ref['quantity']}: no value read ({values!r})"
+    values = [v / ref.get("unit", 1.0) for v in values]          # e.g. Pa -> the MPa published
+    dev = lambda got, want: max(abs(g - w) / abs(w) for g, w in zip(got, want))
+    fmt = lambda xs: ", ".join(f"{x:.5g}" for x in xs)
+    line = (f"{e['name']}: {ref['quantity']}: ccx {fmt(values)}; Abaqus {fmt(abaqus)} "
+            f"({dev(values, abaqus):.2%} off); NAFEMS {fmt(target)} ({dev(values, target):.2%} off)")
+    if "ccx" in ref and dev(values, abaqus) <= tol:
+        return "MISS", line + "; within tolerance of Abaqus now: drop the reference's ccx/why"
+    if dev(values, yard) > tol:
+        return "MISS", line + (f"; expected ccx {fmt(yard)} within {tol:.1%}"
+                               if "ccx" in ref else f"; tolerance {tol:.1%}")
+    if "ccx" in ref:
+        return "DIFFERS", line + f"; ccx differs: {ref['why']}"
+    return "PASS", line
 
 
 # --- pytest entry points ------------------------------------------------------
@@ -274,6 +389,24 @@ def eigenvalues(dat_path):
     return vals
 
 
+def test_corpus_references():
+    """expect_solve decks with a ``reference`` (Abaqus' benchmark decks: NAFEMS LE, T, FV, NL)
+    give their published answer in ccx (reference_check)."""
+    decks = [e for e in present() if e.get("reference") and e["expect_solve"]]
+    ccx, env = V.find_ccx()
+    if not decks or not ccx:
+        print("no reference decks or no ccx found — skipping the answer checks.")
+        return
+    misses = []
+    for e in sorted(decks, key=lambda x: x["name"]):
+        status, values = run_ccx(ccx, env, convert(e["name"])[0],
+                                 lambda job: reference_values(job, e["reference"]["read"]))
+        verdict, line = reference_check(e, values)
+        if verdict == "MISS":
+            misses.append(f"{line} [{status}]")
+    assert not misses, "published answers missed:\n" + "\n".join(misses)
+
+
 def test_hood_hinge_keeps_one_mechanism_mode():
     """marcello_gori_hood_hinge_mechanism, a free-free *FREQUENCY of two hinge brackets
     joined by a CONN3D2 HINGE: 6 rigid-body modes and the hinge's mechanism mode, then
@@ -310,6 +443,7 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     failures = 0
+    answers = []
     for e in sorted(decks, key=lambda x: x["name"]):
         name = e["name"]
         try:
@@ -333,7 +467,15 @@ def main():
             failures += 1
         ccxcol = "-"
         if ccx:
-            status = run_ccx(ccx, env, text)
+            if e.get("reference") and e["expect_solve"]:
+                status, values = run_ccx(ccx, env, text,
+                                         lambda job: reference_values(job, e["reference"]["read"]))
+                answers.append(reference_check(e, values))
+                if answers[-1][0] == "MISS" and status == "solved":
+                    result = "ANSWER MISSED (see below)"
+                    failures += 1
+            else:
+                status = run_ccx(ccx, env, text)
             if e["expect_solve"]:
                 ccxcol = "SOLVED" if status == "solved" else status.upper()
                 if status != "solved":
@@ -362,6 +504,12 @@ def main():
           f"{n_reduced} solve a model with reduced physics, {n_differs} solve to a solution "
           f"that is not the deck's; {n_faithful} faithful solves), "
           f"{n_parse} mesh-only (no analysis step) expected to be accepted by ccx.")
+    if answers:
+        print(f"\nPublished answers ({sum(v == 'PASS' for v, _ in answers)} match Abaqus, "
+              f"{sum(v == 'DIFFERS' for v, _ in answers)} differ for a reason traced to ccx, "
+              f"{sum(v == 'MISS' for v, _ in answers)} missed):")
+        for verdict, line in answers:
+            print(f"  {verdict:7s} {line}")
     print("All corpus checks passed." if not failures else f"{failures} failure(s).")
     print("\n(the remaining decks are source-deck/analysis limitations — see corpus/manifest.py.)")
     return 1 if failures else 0

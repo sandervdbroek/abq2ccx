@@ -10,7 +10,7 @@
 * **[Compatibility](compatibility.md)** — the Abaqus and CalculiX facts the converter relies
   on and their evidence, ccx 2.23 issues, and what does not convert.
 * **[Testing](testing.md)** — unit tests, the end-to-end checks in ccx, and the corpus of
-  1022 real decks.
+  1052 real decks, 25 of them checked against their published answers.
 * **[Architecture & developer guide](architecture.md)** — the pipeline, the data model, and
   how to extend the tables and handlers.
 * **[Changelog](../CHANGELOG.md)** — what changed, release by release.
