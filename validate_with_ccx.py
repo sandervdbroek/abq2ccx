@@ -7,9 +7,11 @@ bundled with FreeCAD) and checks results against reference values: the NAFEMS LE
 stress (also with the pressure carried by surface elements, which ccx does not have),
 the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, beams under a general or an I section run as ccx's U1 element (cantilevers about
-both axes with I12 nonzero, their twist and frequencies, the unsymmetric I cantilever of
-Abaqus' Verification Guide, an I-section portal frame under gravity and line loads) against
-beam theory, Abaqus' reference values and a direct-stiffness frame solution, a shell plate rigidly coupled to a loaded reference point against the same plate
+both axes with I12 nonzero, their twist and frequencies, the unsymmetric I and hexagonal
+cantilevers of Abaqus' Verification Guide, an I-section portal frame under gravity and line
+loads) against beam theory, Abaqus' reference values and a direct-stiffness frame solution,
+general beam sections with a ccx profile (a RECT cantilever, NAFEMS NL6 under NLGEOM) against
+beam theory and NL6's published answers, a shell plate rigidly coupled to a loaded reference point against the same plate
 built from solids, coupled bars whose coupled nodes also carry BCs against the same
 constraints written without a coupling, a bar whose rigid end cap carries BCs on its nodes
 against the same BCs written on its reference point, circular-section beams with a held
@@ -911,6 +913,75 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  beam_u1_unsymmetric_i (B23 + an unsymmetric SECTION=I as U1): "
               f"u2 = {u2:.6g}, phi3 = {phi3:.6g} (Abaqus Verification Guide 0.8931, 1.786e-2; "
               f"P L^3 / 3 E I11 = {exact[0]:.6g}, P L^2 / 2 E I11 = {exact[1]:.6g})")
+        failures += 0 if ok else 1
+
+    # A hexagonal tube (HEX, d 2, t .2) on the same cantilever in space as U1: closed and
+    # doubly symmetric, so its torsion is exact through the material's Poisson's ratio — the
+    # tip deflection and rotation against the guide's reference values, the twist against
+    # T L / G J with Abaqus' closed thin-walled J (the guide's own analytical twist, 2.796e-4,
+    # is a thick-walled value; it says closed sections may differ by several percent).
+    inp = os.path.join(tmp, "u1_hex.inp")
+    convert(os.path.join(EXAMPLES, "beam_u1_hex.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    blocks = dat_node_blocks(os.path.join(d, "job.dat"))
+    shutil.rmtree(d, ignore_errors=True)
+    if status != "solved" or len(blocks) < 3 or any(11 not in b for b in blocks[:3]):
+        print(f"FAIL  beam_u1_hex: no tip results ({status})")
+        failures += 1
+    else:
+        rm = 2.0 - 0.2 / math.sqrt(3.0)
+        j_hex = 4.5 * rm ** 3 * 0.2
+        u2, phi3, twist = blocks[0][11][1], blocks[0][11][5], blocks[2][11][3]
+        ok = (abs(u2 - 0.3489) <= 5e-5 and abs(phi3 - 6.978e-3) <= 5e-7 and
+              abs(blocks[1][11][2] - u2) <= 1e-6 * u2 and
+              abs(twist - 25.0 * 75.0 / (3.0e6 / 2.6 * j_hex)) <= 1e-5 * twist)
+        print(f"{'PASS' if ok else 'FAIL'}  beam_u1_hex (B33 + SECTION=HEX as U1, in space): u2 = "
+              f"{u2:.6g} along y and {blocks[1][11][2]:.6g} along z, phi3 = {phi3:.6g} (Abaqus "
+              f"Verification Guide 0.3489, 6.978e-3); twist {twist:.6g} (T L / G J "
+              f"{25.0 * 75.0 / (3.0e6 / 2.6 * j_hex):.6g})")
+        failures += 0 if ok else 1
+
+    # *BEAM GENERAL SECTION with a ccx profile becomes ccx's beam section with a material from
+    # E and G: a RECT cantilever in space against beam theory about both axes, and NAFEMS NL6
+    # (an axial end load past buckling, NLGEOM, G not given in a plane) on 32 B22 beams against
+    # its published answers (Abaqus' own, on 8 B22: -0.447 / 0.723 and -1.577 / 0.427).
+    inp = os.path.join(tmp, "gs_rect.inp")
+    convert(os.path.join(EXAMPLES, "beam_general_rect.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    blocks = dat_node_blocks(os.path.join(d, "job.dat"))
+    shutil.rmtree(d, ignore_errors=True)
+    ref = (100.0 * 1000.0 ** 3 / (3 * 210000.0 * 20.0 * 40.0 ** 3 / 12),
+           100.0 * 1000.0 ** 3 / (3 * 210000.0 * 40.0 * 20.0 ** 3 / 12))
+    if status != "solved" or len(blocks) < 2:
+        print(f"FAIL  beam_general_rect: no tip results ({status})")
+        failures += 1
+    else:
+        got = (blocks[0][21][1], blocks[1][21][2])
+        ok = all(abs(g - r) <= 0.002 * r for g, r in zip(got, ref))
+        print(f"{'PASS' if ok else 'FAIL'}  beam_general_rect (*BEAM GENERAL SECTION, SECTION=RECT -> "
+              f"ccx's B31 + RECT): tip deflection {got[0]:.6g} / {got[1]:.6g} (beam theory "
+              f"{ref[0]:.6g} / {ref[1]:.6g})")
+        failures += 0 if ok else 1
+    inp = os.path.join(tmp, "gs_nl6.inp")
+    convert(os.path.join(EXAMPLES, "beam_general_rect_nl6.inp"), inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    hist = dat_displacement_history(os.path.join(d, "job.dat"), 65)
+    times = [float(m) for m in re.findall(r"displacements \(vx,vy,vz\) for set TIP and time\s+(\S+)",
+                                          open(os.path.join(d, "job.dat")).read())] \
+        if status == "solved" else []
+    shutil.rmtree(d, ignore_errors=True)
+    ends = [hist[i] for i, t in enumerate(times) if i < len(hist) and t in (1.0, 2.0)]
+    if status != "solved" or len(ends) < 2:
+        print(f"FAIL  beam_general_rect_nl6: no results at the ends of the steps ({status})")
+        failures += 1
+    else:
+        got = [(u[0] / 3.2, -u[1] / 3.2) for u in (ends[0], ends[-1])]
+        pub = [(-0.440, 0.719), (-1.577, 0.421)]
+        ok = all(abs(g - p) <= 0.03 * abs(p) for gu, pu in zip(got, pub) for g, p in zip(gu, pu))
+        print(f"{'PASS' if ok else 'FAIL'}  beam_general_rect_nl6 (NAFEMS NL6, *BEAM GENERAL SECTION, "
+              f"SECT=RECT on B22, NLGEOM): ux/L, -uy/L = " +
+              "; ".join(f"{g[0]:+.4f}, {g[1]:.4f} (published {p[0]:+.3f}, {p[1]:.3f})"
+                        for g, p in zip(got, pub)))
         failures += 0 if ok else 1
 
     # A planar portal frame of I-sections (B23 -> U1, exact Euler-Bernoulli beams) with fixed

@@ -1,0 +1,40 @@
+*HEADING
+NAFEMS NL6 (straight cantilever, axial end load past buckling with a small transverse
+load) on 32 planar B22 beams with a general RECT section 0.1 x 0.1 (E only: Abaqus does not
+use G in a plane). Units m, N, Pa.
+*NODE
+1, 0.
+65, 3.2
+*NGEN
+1, 65
+*NSET, NSET=TIP
+65
+*ELEMENT, TYPE=B22
+1, 1, 2, 3
+*ELGEN, ELSET=BEAM
+1, 32, 2, 1
+*BEAM GENERAL SECTION, ELSET=BEAM, SECT=RECT
+0.1, 0.1
+0., 0., -1.
+210.E9,
+*BOUNDARY
+1, 1, 2
+1, 6
+*STEP, NLGEOM, INC=200
+*STATIC
+.05, 1.
+*CLOAD
+65, 1, -0.545165E6
+65, 2, -0.545165E4
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP, NLGEOM, INC=200
+*STATIC
+.05, 1.
+*CLOAD
+65, 1, -3.844E6
+65, 2, -3.844E4
+*NODE PRINT, NSET=TIP
+U
+*END STEP

@@ -116,7 +116,10 @@ without an error. A full audit and the work that followed:
   of Abaqus' own general-section form, line loads and gravity as nodal forces with consistent
   end moments; in space where G J cannot be had or the shear centre is off the centroid, only with
   `--approximate`, which otherwise keeps the I → `RECT` route. Three planar I-beam decks solve
-  (Euler–Bernoulli for Timoshenko beams: reduced physics).
+  (Euler–Bernoulli for Timoshenko beams: reduced physics). The `HEX`, `TRAPEZOID` and
+  `ARBITRARY` profiles follow, with Abaqus' formulas (Verification Guide), and a general
+  section with a `RECT`, `CIRC`, `PIPE` or `BOX` profile becomes ccx's own beam section with a
+  material from E and G (NAFEMS NL6 runs: its published answers on a finer mesh).
 * **Published answers** — 30 NAFEMS benchmark decks of the Abaqus 2017 documentation joined
   the corpus, and 25 decks are checked against their published answer (`reference`,
   `test_corpus_references`): 19 give Abaqus' result for the same mesh, 6 differ for reasons

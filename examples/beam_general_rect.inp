@@ -1,0 +1,35 @@
+*HEADING
+A general beam section with a library profile (RECT 20 x 40, E and G given) on a B31
+cantilever, which ccx runs as its own rectangular beam: tip forces along y and z.
+Units mm, N, MPa.
+*NODE
+1, 0., 0., 0.
+21, 1000., 0., 0.
+*NGEN, NSET=AXIS
+1, 21
+*ELEMENT, TYPE=B31, ELSET=BEAM
+1, 1, 2
+*ELGEN, ELSET=BEAM
+1, 20, 1, 1
+*NSET, NSET=TIP
+21
+*BEAM GENERAL SECTION, ELSET=BEAM, SECTION=RECT
+20., 40.
+0., 0., 1.
+210000., 80769.2307692
+*BOUNDARY
+1, 1, 6
+*STEP
+*STATIC
+*CLOAD
+TIP, 2, 100.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*STATIC
+*CLOAD, OP=NEW
+TIP, 3, 100.
+*NODE PRINT, NSET=TIP
+U
+*END STEP

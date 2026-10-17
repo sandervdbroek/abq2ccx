@@ -1830,6 +1830,51 @@ def test_i_section_matches_abaqus_verification():
     assert abs(25.0 * 75.0 ** 3 / (3 * 3.0e6 * p.i11) - 0.8931) < 1e-4
 
 
+def test_library_profiles_match_abaqus_verification():
+    # Abaqus' Verification Guide cantilever (L 75, E 3e6, P 25): reference tip deflections of
+    # its HEX (d 2, t .2) and of the thin-walled box built as an ARBITRARY section
+    u2 = lambda i: 25.0 * 75.0 ** 3 / (3 * 3.0e6 * i)
+    h = A.hex_section(2.0, 0.2)
+    assert abs(u2(h.i11) - 0.3489) < 5e-5 and h.i11 == h.i22 and h.exact_j
+    rm = 2.0 - 0.2 / math.sqrt(3.0)                                  # Bredt on the median line
+    assert abs(h.j - 4 * (1.5 * math.sqrt(3) * rm ** 2) ** 2 / (6 * rm / 0.2)) < 1e-12
+    box = [[x.strip() for x in l.split(",")] for l in
+           ["8, -1.9, -.95, -1.9, 0., .2", "-1.9, .95, .2", "0., .95, .1", "1.9, .95, .1",
+            "1.9, 0., .2", "1.9, -.95, .2", "0., -.95, .1", "-1.9, -.95, .1"]]
+    b = A.arbitrary_section(box)
+    assert abs(u2(b.i11) - 1.278) < 0.005 and abs(b.c1) < 1e-12 and abs(b.c2) < 1e-12
+    assert abs(b.j - 4 * (3.8 * 1.9) ** 2 / (2 * 3.8 / 0.1 + 2 * 1.9 / 0.2)) < 1e-9   # one closed cell
+    assert not b.exact_j and not b.shear_known
+    # an open ARBITRARY profile (legs along x2 and x1 from the corner): thin-walled line
+    # integrals about the centroid (.5, .5), J the sum of L t^3 / 3
+    ell = A.arbitrary_section([["2", "0", "2", "0", "0", ".1"], ["2", "0", ".1"]])
+    assert abs(ell.area - 0.4) < 1e-12 and abs(ell.j - 2 * 2 * 0.001 / 3) < 1e-12
+    assert abs(ell.c1 - 0.5) < 1e-12 and abs(ell.c2 - 0.5) < 1e-12
+    assert abs(ell.i11 - (0.1 * (1.5 ** 3 + 0.5 ** 3) / 3 + 0.1 * 2 * 0.25)) < 1e-12   # each leg
+    assert abs(ell.i12 + 0.1) < 1e-12                                   # both legs: -0.05
+    # TRAPEZOID: exact area and moments; a square one is the square
+    sq = A.trapezoid_section(2.0, 2.0, 2.0, 1.0)
+    assert sq.area == 4.0 and abs(sq.i11 - 4 / 3) < 1e-12 and abs(sq.i22 - 4 / 3) < 1e-12 and sq.c2 == 0
+    tr = A.trapezoid_section(3.0, 2.0, 1.0, 0.0)
+    assert abs(tr.area - 4.0) < 1e-12 and abs(tr.c2 - 2 * (3 + 2) / (3 * 4)) < 1e-12
+    assert abs(A.rect_torsion(1.0, 1.0) - 0.1406) < 1e-4 and abs(A.rect_torsion(2.0, 1.0) - 0.4574) < 1e-4
+    assert "legs" in A.beam_section_properties("L", [["4.", "4.", ".1", ".1"]])
+
+
+def test_beam_n1_line_counts_the_lines():
+    # blank data lines are not kept, so a default (blank) n1 line is found by counting
+    blk = lambda kw, params, data: A.Block(kw, A.OrderedDict(params), data)
+    g = "BEAM GENERAL SECTION"
+    assert A.beam_n1_line(blk(g, [("SECTION", "RECT")], ["1., 2.", "0., 0., -1.", "2e5, 8e4"])) == 1
+    assert A.beam_n1_line(blk(g, [("SECTION", "RECT")], ["1., 2.", "2e5, 8e4, 1e-5"])) is None
+    arb = ["2, 0., 1., 0., 0., .1", "1., 0., .1"]
+    assert A.beam_n1_line(blk(g, [("SECTION", "ARBITRARY")], arb + ["0., 0., 1.", "2e5, 8e4"])) == 2
+    assert A.beam_n1_line(blk("BEAM SECTION", [("SECTION", "ARBITRARY")], arb + ["0., 0., 1."])) == 2
+    assert A.beam_n1_line(blk("BEAM SECTION", [("SECTION", "I")], ["1, 2, 1, 1, .1, .1, .1"])) is None
+    assert A.beam_n1_line(blk(g, [("SECTION", "GENERAL"), ("TAPER", None)],
+                              ["1, 2, 0, 3, 4", "1, 2, 0, 3, 4", "0, 1, 0", "2e5, 8e4"])) == 2
+
+
 def test_principal_section_turns_n1():
     p = A.BeamSection(1000.0, 4.0e5, 1.5e5, 2.0e5, 5.4e5)
     alpha, ia, ib = A.principal_section(p)
@@ -1926,6 +1971,68 @@ def test_u1_unsymmetric_i_and_t_sections():
     # a T with its node away from the centroid has an offset: not U1
     body, _, _ = convert_str(deck.replace(sec, "2., 2., 2., 0., .2, 0., .2"))
     assert "TYPE=U1" not in body and "not at the section's centroid" in body
+
+
+def test_u1_hex_trapezoid_arbitrary_and_l():
+    # HEX: closed and doubly symmetric, J = 0.9 (I11 + I22): exact in space through nu'
+    hexdeck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B33, elset=B\n1, 1, 2\n"
+               "*Beam Section, elset=B, material=M, section=HEX\n2., .2\n0., 0., 1.\n"
+               "*Material, name=M\n*Elastic\n3e6, 0.3\n*Boundary\n1, 1, 6\n"
+               "*Step\n*Static\n*Cload\n2, 4, 1.\n*End Step\n")
+    body, conv, rep = convert_str(hexdeck)
+    assert "*ELEMENT, TYPE=U1" in body and conv.reduced_physics == [] and "[APPROX]" not in rep.text()
+    assert "*MATERIAL, NAME=ABQ2CCX_U1_M" in body                        # nu' for G J
+    # TRAPEZOID: exact in a 2-D model with the node at its centroid; in space only --approximate
+    trap = U1_PLANAR.replace("section=I\n0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008",
+                             "section=TRAPEZOID\n0.3, 0.2, 0.1, 0.0833333333333333") + U1_STEP
+    body, conv, _ = convert_str(trap.replace("B21", "B23"))
+    assert "*ELEMENT, TYPE=U1" in body and conv.reduced_physics == []
+    space = trap.replace("B21", "B33").replace("0., 0., -1.", "0., 0., 1.")
+    body, _, _ = convert_str(space)
+    assert "TYPE=U1" not in body and "numerically" in body
+    body, _, rep = convert_str(space, approximate=True)
+    assert "*ELEMENT, TYPE=U1" in body and "[APPROX]" in rep.text()
+    # ARBITRARY (beams in space only), a symmetric I with the node at its centroid: Abaqus
+    # computes its torsion constant numerically, so U1 only with --approximate
+    arb = space.replace("section=TRAPEZOID\n0.3, 0.2, 0.1, 0.0833333333333333",
+                        "section=ARBITRARY\n5, -.1, -.1, .1, -.1, .01\n0., -.1, 0.\n0., .1, .01\n"
+                        ".1, .1, 0.\n-.1, .1, .01")
+    body, _, _ = convert_str(arb)
+    assert "TYPE=U1" not in body and "numerically" in body
+    body, _, rep = convert_str(arb, approximate=True)
+    assert "*ELEMENT, TYPE=U1" in body and "[APPROX]" in rep.text()
+    # L: the node at its legs' corner, never at its centroid
+    ell = U1_PLANAR.replace("section=I\n0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008",
+                            "section=L\n0.1, 0.1, 0.01, 0.01") + U1_STEP
+    body, _, _ = convert_str(ell)
+    assert "TYPE=U1" not in body and "legs" in body
+
+
+def test_general_section_library_profiles_become_expanded_beams():
+    # *BEAM GENERAL SECTION with a ccx profile: ccx's beam section and a material from E, G
+    # (nu = 0 in a 2-D model, where Abaqus does not use G); SECT= abbreviates SECTION
+    planar = ("*Node\n1, 0., 0.\n3, 2., 0.\n*Ngen\n1, 3\n*Element, type=B22, elset=B\n1, 1, 2, 3\n"
+              "*Beam General Section, elset=B, sect=RECT\n0.1, 0.2\n0., 0., -1.\n210e9,\n"
+              "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n3, 2, -1.\n*End Step\n")
+    body, conv, rep = convert_str(planar)
+    lines = body.splitlines()
+    i = lines.index("*ELASTIC")
+    assert lines[i + 1].replace(" ", "") == "210000000000.,0." and "TYPE=B32" in body
+    j = next(k for k, l in enumerate(lines) if l.startswith("*BEAM SECTION"))
+    assert "SECTION=RECT" in lines[j] and lines[j + 1].replace(" ", "") == "0.1,0.2"
+    assert conv.reduced_physics == []
+    space = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n"
+             "*Beam General Section, elset=B, section=CIRC, density=7800.\n0.1\n\n2e11, 8e10, 1.2e-5\n"
+             "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n2, 2, -1.\n*End Step\n")
+    body, conv, _ = convert_str(space)
+    lines = body.splitlines()
+    i = lines.index("*ELASTIC")
+    e_mod, nu = (float(x) for x in lines[i + 1].split(","))
+    assert abs(nu - 0.25) < 1e-12 and "*DENSITY\n7800." in body and "*EXPANSION" in body
+    j = next(k for k, l in enumerate(lines) if l.startswith("*BEAM SECTION"))
+    assert lines[j + 1].replace(" ", "") == "0.2,0.2" and "TYPE=B32" in body     # r -> 2r; 3 nodes
+    body, _, _ = convert_str(space.replace("2e11, 8e10, 1.2e-5", "2e11,"))   # no G in space
+    assert "*BEAM SECTION" not in "\n".join(_live(body)) and "no G" in body
 
 
 def test_u1_refusals_keep_todays_section_handling():

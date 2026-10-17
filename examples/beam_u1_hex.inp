@@ -1,0 +1,43 @@
+*HEADING
+U1 beam: a cantilever in space with a hexagonal tube section (d 2, t .2): tip forces along
+y and z and a torque (U1's torsion set to the section's G J through the material).
+*NODE
+1, 0., 0., 0.
+11, 75., 0., 0.
+*NGEN, NSET=AXIS
+1, 11
+*ELEMENT, TYPE=B33, ELSET=BEAM
+1, 1, 2
+*ELGEN, ELSET=BEAM
+1, 10, 1, 1
+*NSET, NSET=TIP
+11
+*BEAM SECTION, ELSET=BEAM, MATERIAL=A1, SECTION=HEX
+2., .2
+0., 0., 1.
+*MATERIAL, NAME=A1
+*ELASTIC
+3.E6, 0.3
+*BOUNDARY
+1, 1, 6
+*STEP
+*STATIC
+*CLOAD
+TIP, 2, 25.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*STATIC
+*CLOAD, OP=NEW
+TIP, 3, 25.
+*NODE PRINT, NSET=TIP
+U
+*END STEP
+*STEP
+*STATIC
+*CLOAD, OP=NEW
+TIP, 4, 25.
+*NODE PRINT, NSET=TIP
+U
+*END STEP

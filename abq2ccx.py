@@ -414,7 +414,9 @@ U1_PHI = 1e-10                    # 12 E I / (k G A L^2) on every U1 element (at
 U1_TYPES = {"B21", "B21H", "B23", "B23H", "B31", "B31H", "B33", "B33H"}
 U1_EULER_BERNOULLI = {"B23", "B33"}
 # library profiles whose properties the converter computes from their dimensions
-U1_PROFILES = {"I"}
+U1_PROFILES = {"I", "HEX", "TRAPEZOID", "ARBITRARY", "L"}
+# *BEAM GENERAL SECTION profiles that ccx's expanded beams have (Converter._general_as_beam_section)
+GENERAL_EXPANDED = {"RECT", "CIRC", "PIPE", "BOX"}
 # ccx types that can share a deck with U1 (ccx expands none of them)
 U1_COMPANIONS = ("C3D", "F3D", "SPRING", "DASHPOT", "MASS")
 # material cards a U1 beam's material may have (ccx stops on, or iterates with, the others:
@@ -440,6 +442,8 @@ class BeamSection:
     c2: float = 0.0
     s1: float = 0.0
     s2: float = 0.0
+    exact_j: bool = True                        # Abaqus' own value of j (not a numerical one)
+    shear_known: bool = True                    # (s1, s2) known
 
 
 def i_section(l: float, h: float, b1: float, b2: float, t1: float, t2: float,
@@ -470,10 +474,118 @@ def i_section(l: float, h: float, b1: float, b2: float, t1: float, t2: float,
     return BeamSection(area, i11, 0.0, i22, j, 0.0, ybar - l, 0.0, ys - l)
 
 
+def hex_section(d: float, t: float) -> Union[BeamSection, str]:
+    """Abaqus' HEX profile (d, t): a regular hexagonal tube with its outer circumradius d (the
+    vertices on the 1-axis) and wall thickness t, the node at its centre.  The exact annulus —
+    Abaqus' verification hexagon (d 2, t .2) has the reference tip deflection .3489 = P L^3 /
+    3 E I with it — and the closed thin-walled torsion constant 4 Ac^2 / (perimeter / t) on
+    the wall's median line, Abaqus' formula for closed thin-walled sections."""
+    ri = d - 2.0 * t / math.sqrt(3.0)
+    if min(d, t) <= 0 or ri <= 0:
+        return "the HEX profile's dimensions are not positive, or its wall fills it"
+    i = 5.0 * math.sqrt(3.0) / 16.0 * (d ** 4 - ri ** 4)
+    rm = (d + ri) / 2.0
+    return BeamSection(1.5 * math.sqrt(3.0) * (d * d - ri * ri), i, 0.0, i, 4.5 * rm ** 3 * t)
+
+
+def rect_torsion(a: float, b: float) -> float:
+    """The St. Venant torsion constant of a solid a x b rectangle (series solution)."""
+    w, h = min(a, b), max(a, b)
+    s = sum(math.tanh(n * math.pi * h / (2.0 * w)) / n ** 5 for n in range(1, 40, 2))
+    return h * w ** 3 / 3.0 * (1.0 - 192.0 / math.pi ** 5 * w / h * s)
+
+
+def trapezoid_section(a: float, b: float, c: float, d: float) -> Union[BeamSection, str]:
+    """Abaqus' TRAPEZOID profile (a, b, c, d): the bottom width a, the height b and the top
+    width c, symmetric about the 2-axis, the node d above the bottom.  Exact area and second
+    moments.  Abaqus computes its torsion constant numerically (a Prandtl stress-function model
+    of the section), and its shear centre is off the centroid in general: here the rectangle
+    of the mean width gives j, and the shear centre is not known."""
+    if min(a, b, c) < 0 or b <= 0 or a + c <= 0:
+        return "the TRAPEZOID profile's dimensions are not positive"
+    area = b * (a + c) / 2.0
+    ybar = b * (a + 2.0 * c) / (3.0 * (a + c))
+    i11 = b ** 3 * (a * a + 4.0 * a * c + c * c) / (36.0 * (a + c))
+    i22 = b * (a + c) * (a * a + c * c) / 48.0
+    return BeamSection(area, i11, 0.0, i22, rect_torsion((a + c) / 2.0, b), 0.0, ybar - d,
+                       exact_j=False, shear_known=False)
+
+
+def arbitrary_section(recs: List[List[str]]) -> Union[BeamSection, str]:
+    """Abaqus' ARBITRARY profile: n thin-walled straight segments between points in the section
+    axes (line 1: n, the first two points and the first thickness; then one point and the
+    thickness of the segment ending there per line).  Abaqus integrates each segment along its
+    line ("no bending stiffness about the line joining the end points of the segment"), so
+    the area and second moments are line integrals of the thickness; it computes the torsion
+    constant numerically (a Prandtl model), here the open thin-walled sum of L t^3 / 3, or
+    4 Ac^2 / sum of L / t for a single closed cell; the shear centre is not known."""
+    try:
+        n = int(float(recs[0][0]))
+        first = [pf(x) if x else 0.0 for x in (recs[0][1:6] + [""] * 5)[:5]]
+        pts = [(first[0], first[1]), (first[2], first[3])]
+        ts = [first[4]]
+        for r in recs[1:n]:
+            v = [pf(x) if x else 0.0 for x in (r[:3] + [""] * 3)[:3]]
+            pts.append((v[0], v[1]))
+            ts.append(v[2])
+    except (IndexError, ValueError):
+        return "the ARBITRARY profile's data do not read as numbers"
+    if n < 2 or len(ts) != n or min(ts) < 0:
+        return "the ARBITRARY profile needs at least two segments, each with a thickness"
+    segs = [(pts[k], pts[k + 1], ts[k], math.dist(pts[k], pts[k + 1])) for k in range(n)]
+    area = sum(t * ln for _, _, t, ln in segs)
+    if area <= 0:
+        return "the ARBITRARY profile has no area"
+    c1 = sum(t * ln * (p[0] + q[0]) / 2.0 for p, q, t, ln in segs) / area
+    c2 = sum(t * ln * (p[1] + q[1]) / 2.0 for p, q, t, ln in segs) / area
+    cc = (c1, c2)
+
+    def moment(i: int, j: int) -> float:
+        """The integral of t (x_i - c_i)(x_j - c_j) along the segments (exact on straight ones)."""
+        return sum(t * ln * (2.0 * (p[i] - cc[i]) * (p[j] - cc[j]) + (p[i] - cc[i]) * (q[j] - cc[j]) +
+                             (q[i] - cc[i]) * (p[j] - cc[j]) + 2.0 * (q[i] - cc[i]) * (q[j] - cc[j])) / 6.0
+                   for p, q, t, ln in segs)
+    size = max(ln for *_, ln in segs)
+    if math.dist(pts[0], pts[-1]) <= 1e-9 * size and all(t > 0 for t in ts):
+        enclosed = abs(sum(p[0] * q[1] - q[0] * p[1] for p, q, _, _ in segs)) / 2.0
+        j = 4.0 * enclosed ** 2 / sum(ln / t for _, _, t, ln in segs)
+    else:
+        j = sum(ln * t ** 3 for _, _, t, ln in segs) / 3.0
+    return BeamSection(area, moment(1, 1), moment(0, 1), moment(0, 0), j, c1, c2,
+                       exact_j=False, shear_known=False)
+
+
+def beam_n1_line(b: "Block") -> Optional[int]:
+    """The index in ``b.data`` of the n1 line of a *BEAM SECTION / *BEAM GENERAL SECTION card,
+    or None when it has none.  Blank data lines are not kept, so a blank (default) n1 line is
+    not in ``b.data`` and the lines are counted: the geometry (an ARBITRARY profile's segment
+    lines, a TAPER section's two lines; a MESHED section starts with n1), the n1 line, then a
+    general section's line of E, G, ...  (A general section with temperature-dependent moduli
+    has several such lines: it reads as having none.)"""
+    sec = (b.param("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION" else "")
+           ).strip().upper()
+    data = [ln for ln in b.data if ln.strip()]
+    geo = 1
+    if sec == "ARBITRARY":
+        try:
+            geo = int(float(data[0].split(",")[0]))
+        except (IndexError, ValueError):
+            return None
+    elif b.keyword == "BEAM GENERAL SECTION" and sec == "MESHED":
+        return 0 if len(data) == 3 else None
+    elif b.keyword == "BEAM GENERAL SECTION" and b.has("TAPER"):
+        geo = 2
+    if b.keyword == "BEAM GENERAL SECTION" and sec != "NONLINEAR GENERAL":
+        return geo if len(data) == geo + 2 else None
+    return geo if len(data) > geo else None
+
+
 def beam_section_properties(section: str, recs: List[List[str]]) -> Union[BeamSection, str]:
     """The properties of a beam section from its first data line(s): SECTION=GENERAL of
     *BEAM GENERAL SECTION (A, I11, I12, I22, J; the centroid at the node, blanks zero), or a
     profile of U1_PROFILES; the reason when they cannot be had."""
+    if section == "ARBITRARY":
+        return arbitrary_section(recs)
     first = list(recs[0]) if recs else []
     while first and first[-1] == "":
         first.pop()
@@ -486,10 +598,18 @@ def beam_section_properties(section: str, recs: List[List[str]]) -> Union[BeamSe
             return "SECTION=GENERAL needs A, I11, I12, I22 and J on its first line"
         area, i11, i12, i22, j = (v + [0.0] * 5)[:5]
         return BeamSection(area, i11, i12, i22, j)
+    need = {"I": 7, "HEX": 2, "TRAPEZOID": 4}.get(section)
+    if need and len(v) < need:
+        return f"SECTION={section} needs {need} dimensions"
     if section == "I":
-        if len(v) < 7:
-            return "SECTION=I needs l, h, b1, b2, t1, t2, t3"
         return i_section(*v[:7])
+    if section == "HEX":
+        return hex_section(*v[:2])
+    if section == "TRAPEZOID":
+        return trapezoid_section(*v[:4])
+    if section == "L":
+        return ("Abaqus puts the L profile's beam node where its legs' median lines meet, never at "
+                "its centroid, and U1 has no offset")
     return f"SECTION={section} has no U1 conversion"
 
 
@@ -648,7 +768,7 @@ class Block:
 # ``AMP=`` on a load card is "parameter not recognized" in ccx, so the load silently
 # loses its amplitude).
 PARAM_ALIASES = {"GEN": "GENERATE", "PERT": "PERTURBATION", "PERTURB": "PERTURBATION",
-                 "AMP": "AMPLITUDE", "POS": "POSITION"}
+                 "AMP": "AMPLITUDE", "POS": "POSITION", "SECT": "SECTION"}
 # Abaqus keyword abbreviations CalculiX does not accept.
 KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 
@@ -5775,16 +5895,72 @@ class Converter:
         return [emit_keyword("BEAM SECTION", keep)] + data
 
     def handle_beam_general_section(self, b: Block) -> List[str]:
-        """``*BEAM GENERAL SECTION``: ccx has no such card; SECTION=GENERAL (and a profile of
-        U1_PROFILES) runs as ccx's U1 beam where the deck allows it (_plan_u1_beams), else the
-        card is commented out with the reason."""
+        """``*BEAM GENERAL SECTION``: ccx has no such card.  A RECT, CIRC, PIPE or BOX profile
+        becomes the *BEAM SECTION of ccx's expanded beams with a material from its E and G
+        (_general_as_beam_section); SECTION=GENERAL and the profiles of U1_PROFILES run as
+        ccx's U1 beam where the deck allows it (_plan_u1_beams); otherwise the card is
+        commented out with the reason."""
         self._u1_last = id(b) in self._u1_cards
         if self._u1_last:
             return self._u1_cards[id(b)]
+        sec = (b.param("SECTION") or "GENERAL").strip().upper()
+        if sec in GENERAL_EXPANDED:
+            done = self._general_as_beam_section(b, sec)
+            if isinstance(done, list):
+                return done
+            return self._commented(b, f"*BEAM GENERAL SECTION, SECTION={sec}: {done}. The beams "
+                                      f"have no section.")
         why = self._u1_refused if self._u1_refused and self._u1_section(b) else \
-            f"SECTION={(b.param('SECTION') or 'GENERAL').strip().upper()} has no ccx form"
+            f"SECTION={sec} has no ccx form"
         return self._commented(b, f"*BEAM GENERAL SECTION has no ccx card, and its beams are not "
                                   f"run as ccx's U1 beam element: {why}. The beams have no section.")
+
+    def _general_as_beam_section(self, b: Block, sec: str) -> Union[List[str], str]:
+        """A *BEAM GENERAL SECTION with a profile of ccx's expanded beams (GENERAL_EXPANDED) as
+        their *BEAM SECTION, after a material made from its line of E, G and the thermal
+        expansion coefficient (and DENSITY): ccx's beam integrates the same profile with
+        E and nu = E / 2G - 1.  In a 2-D model Abaqus does not use G (*BEAM GENERAL SECTION),
+        and the general section has no Poisson effect: nu = 0 there.  Why not, as a string."""
+        for k in ("TAPER", "DEPENDENCIES"):
+            if b.has(k):
+                return f"{k} is not converted"
+        recs = [[x.strip() for x in r] for r in merged_data_records(b) if any(x.strip() for x in r)]
+        n1_at = beam_n1_line(b)
+        eg = recs[1 + (n1_at is not None):]
+        if len(recs) < 2 or len(eg) != 1:
+            return ("it needs one line of E, G (and alpha) after its geometry and n1 lines "
+                    "(several, with temperatures, are not converted)")
+        try:
+            vals = [pf(x) if x else 0.0 for x in eg[0]]
+        except ValueError:
+            return "its E, G do not read as numbers"
+        e_mod, g_mod, alpha = (vals + [0.0, 0.0, 0.0])[:3]
+        if e_mod <= 0:
+            return "its Young's modulus is not positive"
+        if self._planar_beams:
+            nu = 0.0
+        else:
+            nu = e_mod / (2.0 * g_mod) - 1.0 if g_mod > 0 else math.inf
+            if not -1.0 < nu < 0.5:
+                return (f"ccx's beam takes a material with nu = E / 2G - 1 between -1 and 0.5, here "
+                        f"{'no G' if g_mod <= 0 else f'{nu:.4g}'}")
+        name = self._u1_name(f"ABQ2CCX_{sec}_MATERIAL")
+        out = [f"** abq2ccx: *BEAM GENERAL SECTION, SECTION={sec} -> ccx's beam section with "
+               f"material {name} (E, nu = {'0 in a 2-D model' if self._planar_beams else 'E / 2G - 1'})",
+               f"*MATERIAL, NAME={name}", "*ELASTIC", f"{short_real(e_mod, 12)}, {short_real(nu, 12)}"]
+        if b.param("DENSITY"):
+            out += ["*DENSITY", b.param("DENSITY")]
+        if alpha:
+            zero = b.param("ZERO")
+            out += [emit_keyword("EXPANSION", OrderedDict([("ZERO", zero)]) if zero else OrderedDict()),
+                    short_real(alpha, 12)]
+        keep = OrderedDict([("ELSET", b.param("ELSET")), ("MATERIAL", name), ("SECTION", sec)])
+        data = [b.data[0]] + ([b.data[n1_at]] if n1_at is not None else [])
+        self.report.note("*BEAM GENERAL SECTION with a RECT, CIRC, PIPE or BOX profile -> ccx's "
+                         "*BEAM SECTION of the same profile with a material made from its E and G "
+                         "(nu = E / 2G - 1; 0 in a 2-D model, where Abaqus does not use G).",
+                         once=True)
+        return out + self.handle_beam_section(Block("BEAM SECTION", keep, data))
 
     def handle_beam_section_option(self, b: Block) -> List[str]:
         """``*CENTROID`` / ``*SHEAR CENTER`` / ``*TRANSVERSE SHEAR STIFFNESS`` / ``*SECTION
@@ -13126,7 +13302,8 @@ class Converter:
         ids and element sets are unchanged; node sets follow ``_MIDSIDE_SET_CARDS``."""
         table: Dict[int, Tuple[str, Dict[str, str]]] = {}      # element -> (section, upgrade)
         for b in blocks:
-            sec = (b.param("SECTION") or "").strip().upper() if b.keyword == "BEAM SECTION" else ""
+            sec = (b.param("SECTION") or "").strip().upper() if b.keyword == "BEAM SECTION" else \
+                (b.param("SECTION") or "").strip().upper() if b.keyword == "BEAM GENERAL SECTION" else ""
             if sec not in SECTION_BEAM_UPGRADE:
                 continue
             for e in self.geom.elset((b.param("ELSET") or "").strip()):
@@ -13569,7 +13746,7 @@ class Converter:
                     f"{p.c2:.4g} along n2), and U1 has no offset")
         # Abaqus measures the torque about the shear centre: off the centroid it couples
         # torsion with bending in space, which U1 cannot (a 2-D model has no torsion)
-        twisted = not planar and math.hypot(p.s1 - p.c1, p.s2 - p.c2) > 1e-6 * size
+        twisted = not planar and p.shear_known and math.hypot(p.s1 - p.c1, p.s2 - p.c2) > 1e-6 * size
         # the material: E, nu (G for the general section) and the density
         density: Optional[str] = None
         expansion = False
@@ -13598,9 +13775,12 @@ class Converter:
             expansion = any(g.keyword == "EXPANSION" for g in group)
         else:
             mat = ""
-            lines = [r for r in recs[2:] if any(x for x in r)]
+            n1_at = beam_n1_line(b)
+            geo = int(pf(recs[0][0])) if sec == "ARBITRARY" else 1
+            lines = recs[geo + (0 if n1_at is None else 1):]
             if len(lines) != 1:
-                return f"{label} needs one line of E, G (and alpha), its third"
+                return (f"{label} needs one line of E, G (and alpha) after its geometry and n1 "
+                        f"lines (several, with temperatures, are not converted)")
             try:
                 vals = [pf(x) if x else 0.0 for x in lines[0]]
             except ValueError:
@@ -13621,13 +13801,17 @@ class Converter:
         else:
             nu_u1 = e_mod * (p.i11 + p.i22) / (2.0 * g_mod * p.j) - 1.0
             stiff = not -1.0 + 1e-9 < nu_u1 < 0.5 - 1e-9
-            if stiff or twisted:
+            if stiff or twisted or not p.exact_j or not p.shear_known:
                 ratio = (p.i11 + p.i22) / p.j
                 why = [f"U1's torsion stiffness is G (I11 + I22), here {ratio:.3g} times the "
                        f"section's G J, and no Poisson's ratio ccx accepts (below 0.5) makes it "
                        f"G J"] if stiff else []
                 why += [f"its shear centre lies {math.hypot(p.s1 - p.c1, p.s2 - p.c2):.4g} from "
                         f"the centroid, and U1 couples no torsion with bending"] if twisted else []
+                why += ["Abaqus computes its torsion constant numerically (a Prandtl model of the "
+                        "section), which J here only approximates"] if not p.exact_j else []
+                why += ["its shear centre, which Abaqus takes the torque about, is not computed "
+                        "here"] if not p.shear_known else []
                 if not self._approx:
                     return (f"{label}: {'; '.join(why)}; rerun with --approximate to accept "
                             f"that")
@@ -13640,9 +13824,10 @@ class Converter:
         alpha, ia, ib = (0.0, p.i22 if p.i22 > 0 else p.i11, p.i11) if planar else principal_section(p)
         c, s = math.cos(alpha), math.sin(alpha)
         given: Vec = (0.0, 0.0, -1.0)
-        if not planar and len(recs) > 1 and len([x for x in recs[1] if x]) >= 3:
+        n1_at = beam_n1_line(b)
+        if not planar and n1_at is not None and len([x for x in recs[n1_at] if x]) >= 3:
             try:
-                given = tuple(pf(x) if x else 0.0 for x in recs[1][:3])
+                given = tuple(pf(x) if x else 0.0 for x in recs[n1_at][:3])
             except ValueError:
                 return f"{label}: its n1 direction does not read as numbers"
         dirs: "OrderedDict[Tuple[float, ...], Tuple[Vec, List[int]]]" = OrderedDict()
@@ -13971,17 +14156,18 @@ class Converter:
                 for e in self.geom.elset(b.param("ELSET") or ""):
                     self._section_thick[e] = t
             elif b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION"):
-                # the second data line of a standard profile (and of a general section) is the
-                # approximate n1 direction
+                # the approximate n1 direction, a data line of its own (beam_n1_line), (0, 0, -1)
+                # when it is left blank
                 n1: Optional[Vec] = None
                 sec = (b.param("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION"
                                               else "")).strip().upper()
                 if sec in ("RECT", "CIRC", "PIPE", "BOX", "THICK PIPE", "I", "L", "HEX", "TRAPEZOID",
-                           "ELLIPSE", "GENERAL"):
+                           "ELLIPSE", "GENERAL", "ARBITRARY"):
                     n1 = (0.0, 0.0, -1.0)
-                    if len(recs) > 1 and len([x for x in recs[1] if x]) >= 3:
+                    at = beam_n1_line(b)
+                    if at is not None and len([x for x in recs[at] if x]) >= 3:
                         try:
-                            n1 = tuple(pf(x) for x in [x for x in recs[1] if x][:3])
+                            n1 = tuple(pf(x) for x in [x for x in recs[at] if x][:3])
                         except ValueError:
                             n1 = None
                 for e in self.geom.elset(b.param("ELSET") or ""):
@@ -18380,12 +18566,14 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                     if o and not re.fullmatch(r"[-+]?(\d+\.?\d*|\.\d+)([EeDd][-+]?\d+)?", o):
                         f[3] = " " + namer(prefix, o)
                         nb.data[i] = ",".join(f)
-            if rot and b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION") and len(nb.data) > 1:
-                # the second data line is the beam's n1 direction: it turns with the part
+            at = beam_n1_line(nb) if rot and b.keyword in ("BEAM SECTION",
+                                                            "BEAM GENERAL SECTION") else None
+            if at is not None and at < len(nb.data):
+                # the beam's n1 direction (its own data line) turns with the part
                 try:
-                    v = [pf(x) for x in nb.data[1].split(",") if x.strip()]
+                    v = [pf(x) for x in nb.data[at].split(",") if x.strip()]
                     if len(v) >= 3:
-                        nb.data[1] = ", ".join(_fmt_component(x) for x in rotv((v[0], v[1], v[2])))
+                        nb.data[at] = ", ".join(_fmt_component(x) for x in rotv((v[0], v[1], v[2])))
                 except ValueError:
                     pass
             if rot and b.keyword == "ROTARY INERTIA" and not b.param("ORIENTATION") and nb.data:

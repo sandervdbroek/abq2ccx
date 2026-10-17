@@ -95,7 +95,7 @@ prints one `PASS` line per check, about a hundred in all; [testing](docs/testing
 | --- | --- | --- |
 | NAFEMS LE10 thick plate (`*NCOPY`, `*ELGEN`, pressure face) | published σyy at D = −5.38 MPa | −5.650 MPa, 5 % (element and mesh) |
 | the same plate loaded through `SFM3D8` surface elements | its face-pressure result | 7 digits |
-| circular, pipe, box and planar beams; I and general sections as ccx's `U1` beam (cantilevers, a portal frame); beam line loads; pinned, tied and hinged spans | beam theory, Euler buckling, the direct-stiffness frame | ≤ 1.3 % |
+| circular, pipe, box and planar beams; I, hexagonal and general sections as ccx's `U1` beam (cantilevers, a portal frame), general sections with a ccx profile (NAFEMS NL6); beam line loads; pinned, tied and hinged spans | beam theory, Euler buckling, the direct-stiffness frame, Abaqus' and NAFEMS' published answers | ≤ 2.4 % |
 | Cook's membrane under a shear traction; a thick cylinder under a radial traction | published 23.96; Lamé | 0.12 %; 0.02 % |
 | rigid couplings, `*MPC`s, connectors, BCs on coupled nodes, loads, connectors, `*MPC`s and rotations on `*TRANSFORM`ed nodes | the same model built another way (solids, hand-written equations, no transform) | ≤ 4e-5 of \|u\|, mostly exact |
 | per-element `*DISTRIBUTION` orientations (a solid plate, a composite shell) | one `*ORIENTATION` per element | ≤ 3e-11 |
