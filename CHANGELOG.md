@@ -21,6 +21,9 @@ physics.
   membrane's 3-D axes unprojected, and takes a cylindrical system once per element. A
   pressurised orthotropic cylinder with a cylindrical orientation came out 14 times too soft;
   it now matches thin-wall theory to 0.35 %.
+* **Default rotation axis** — an `*ORIENTATION` without a rotation line turns about its axis 1
+  on shells and membranes, as Abaqus documents, so material direction 1 follows axis 2 (it
+  followed the axis closest to the normal); warned where axis 1 lies in the shell.
 
 ## 1.2.1 (October 2026)
 
