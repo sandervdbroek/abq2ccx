@@ -18,6 +18,7 @@ of the probes on the bundled examples ([testing](testing.md#2-end-to-end--valida
 | `*NFILL` with bounding sets of different lengths ignores the longer set's extra nodes | does the same | Abaqus 2017 "Node definition" |
 | ccx accepts set and surface names up to 80 characters | keeps flattened names within 80, unique | probed (longer: "set name too long") |
 | ccx reads only the first 20 characters of a numeric field, without an error when the cut is still a number (`6.000000000000000E-01` → 6) | writes at most 12 significant digits | probed |
+| Abaqus reads a blank data field as zero unless the field has a default (no `*DLOAD` or `*DSLOAD` field has one); ccx 2.23 reads a blank `*DLOAD` field as zero too, so a dropped one moves the fields after it one place up | keeps every `*DLOAD` and `*DSLOAD` field in its place, a blank number written `0.` | Abaqus "Input syntax rules", Keywords manual (`*DLOAD`, `*DSLOAD`); sources `splitline.f`, `dloads.f`; probed (`EALL, GRAV, 9810., , , -1.` without its blanks pulls a column along −x; a `CENTRIF` line without its blank axis point has an axis of length zero: NaN) |
 | A keyword line ending in a comma continues its parameters on the next line | splices them; never merges a data line | Abaqus input syntax |
 | Coupled temperature–displacement elements have the base element's name in ccx (`C3D8T` ≡ `C3D8`); the step supplies the temperature DOF | strips the `T` | ccx element sections |
 | `NSET=` on `*NODE`, `ELSET=` on `*ELEMENT`, `GENERATE` on sets are accepted; an `*NSET` built from an `ELSET` is not | uses the first; expands the second | ccx manual |
@@ -205,6 +206,10 @@ engineering shear measure of `*EXPANSION, TYPE=ANISO`, which no Abaqus page stat
   checks" — <https://ceae-server.colorado.edu/v2016/books/usb/pt08ch35s06aus140.html>
 * Abaqus 2017 documentation (MIT mirror): Conventions —
   <https://abaqus-docs.mit.edu/2017/English/SIMACAEMODRefMap/simamod-c-conventions.htm>;
+  Input syntax rules —
+  <https://abaqus-docs.mit.edu/2017/English/SIMACAEMODRefMap/simamod-c-inputsyntax.htm>;
+  `*DLOAD` — <https://abaqus-docs.mit.edu/2017/English/SIMACAEKEYRefMap/simakey-r-dload.htm>;
+  `*DSLOAD` — <https://abaqus-docs.mit.edu/2017/English/SIMACAEKEYRefMap/simakey-r-dsload.htm>;
   Thermal expansion —
   <https://abaqus-docs.mit.edu/2017/English/SIMACAEMATRefMap/simamat-c-thermalexpan.htm>;
   UEXPAN — <https://abaqus-docs.mit.edu/2017/English/SIMACAESUBRefMap/simasub-c-uexpan.htm>;

@@ -20,7 +20,9 @@ expansion (including the engineering shear coefficients of an anisotropic one), 
 cube and circular-section beam with no initial temperatures, and the loads ccx has no card
 for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads (cantilevers
 against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
-(local axes), which must match the same models without one, *MPC joints, levers and links
+(local axes), which must match the same models without one, body loads written with blank
+fields (gravity on a column, a spinning disc) against statics and the rotating-disc
+solution, *MPC joints, levers and links
 against statics — PIN, TIE and LINK also on nodes with a *TRANSFORM, against the same model
 without it (linear and NLGEOM) — connector elements (JOIN, WELD, BEAM, LINK, HINGE) against those, beam
 theory and exact statics — also on nodes with a *TRANSFORM, against the same models without
@@ -1420,6 +1422,50 @@ def main():
         ok = err <= 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  {name} with *TRANSFORM ({how}): u at {len(u[1])} nodes "
               f"differs from the model without it by {err:.1e} of max |u| ({scale:.4g})")
+        failures += 0 if ok else 1
+
+    # --- body loads written with blank fields -----------------------------------------------
+    # Abaqus (and ccx) read a blank *DLOAD field as zero; a dropped one moves the fields after
+    # it up.  Gravity along -z on a clamped column ('COLUMN, GRAV, 9810., , , -1.' pulled along
+    # -x) and a quarter disc spinning about the z axis through the origin (a blank axis point
+    # left the axis direction (0, 0, 0): NaN; blank axis components 1-2 made it the x axis).
+    # The base must carry the column's weight rho g V along +z (less the load ccx applies at
+    # the base nodes themselves, half the bottom element's weight), and the disc's radial
+    # displacement must be the plane-stress rotating-disc solution (C3D20 mesh: 0.34 % off).
+    weight = 7.85e-9 * 9810.0 * 10.0 * 10.0 * 100.0
+
+    def spun(r, a=20.0, b=100.0, nu=0.3):                     # rho w^2 = 7.85e-3, E = 210000
+        return 7.85e-3 / (8 * 210000.0) * ((3 + nu) * (1 - nu) * (a * a + b * b) * r
+                                            + (3 + nu) * (1 + nu) * a * a * b * b / r
+                                            - (1 - nu * nu) * r ** 3)
+    blank = open(os.path.join(EXAMPLES, "dload_blank_fields.inp")).read()
+    for how, text in (("element sets; blank axis point and axis components 1-2", blank),
+                      ("no element set for gravity; blank axis components 1-2", blank.replace(
+                          "\nCOLUMN, GRAV, 9810., , , -1.\n", "\n, GRAV, 9810., , , -1.\n").replace(
+                          "\nDISC, CENTRIF, 1.E6, , , , , , 1.\n",
+                          "\nDISC, CENTRIF, 1.E6, 0., 0., 0., , , 1.\n"))):
+        src, inp = os.path.join(tmp, "blank_src.inp"), os.path.join(tmp, "blank.inp")
+        with open(src, "w") as fh:
+            fh.write(text)
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        rf = dat_history(os.path.join(d, "job.dat"), "total force", "BASE")
+        u = dat_displacements(os.path.join(d, "job.dat"))
+        shutil.rmtree(d, ignore_errors=True)
+        if status != "solved" or not rf or 1001 not in u or 1009 not in u:
+            print(f"FAIL  dload_blank_fields ({how}): {status}, no base reaction or disc "
+                  f"displacement")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            failures += 1
+            continue
+        fx, fy, fz = rf[-1][1][0]
+        err_rf = max(abs(fx), abs(fy), abs(fz - 0.95 * weight)) / weight
+        err_u = max(abs(u[n][0] / spun(r) - 1) for n, r in ((1001, 20.0), (1009, 100.0)))
+        ok = err_rf < 1e-6 and err_u < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  dload_blank_fields ({how}): base reaction "
+              f"({fx:+.3g}, {fy:+.3g}, {fz:+.7f}) (0, 0, 0.95 rho g V = {0.95 * weight:+.7f}); disc "
+              f"u_r = {u[1001][0]:.5e} / {u[1009][0]:.5e} at r = 20 / 100 (theory {spun(20.0):.5e} / "
+              f"{spun(100.0):.5e}, {err_u * 100:.2f}% off)")
         failures += 0 if ok else 1
 
     # --- *Temperature without initial temperatures ------------------------------------------

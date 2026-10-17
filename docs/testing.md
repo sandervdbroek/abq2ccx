@@ -21,7 +21,7 @@ They cover:
 
 * **Input syntax** — keyword-line continuations, `*PARAMETER` arithmetic (a safe AST
   evaluator, not `eval`), `INPUT=` files, abbreviations, Fortran `D` exponents, blank-less
-  keywords.
+  keywords, blank data fields kept in place.
 * **Mesh generation and assemblies** — `*NGEN`/`*NFILL`/`*NCOPY`/`*ELGEN`/`*ELCOPY`
   (curves, bias, reflection), instance transforms (translation before rotation),
   instance-qualified references, part-level sections and constraints copied per instance,
@@ -85,6 +85,7 @@ converter. It prints one `PASS`/`FAIL` line per check.
 | `cook_membrane_traction` | `*DSLOAD TRVEC` on `CPS8` edges | published 23.96 | 0.12 % |
 | `cylinder_traction_cax` | radial `TRVEC` on a thick `CAX8` cylinder | Lamé | 0.02 % |
 | `traction_transformed_face`, Cook's membrane with a `*TRANSFORM` | tractions on transformed nodes | the same models without the transform | round-off |
+| `dload_blank_fields` | `GRAV` and `CENTRIF` lines with blank fields (also without an element set): a clamped column, a spinning quarter disc | statics (the base carries the weight along z); the plane-stress rotating disc | round-off; ≤ 0.34 % |
 | `transform_spherical_rigid` | a spherical `*TRANSFORM`; a transformed rigid-body reference point | the model in global components | exact |
 | `transform_rotations` | rotational BCs and moments on a transformed kinematic reference point and beam tip, linear and NLGEOM | the model in global components (an untransformed `ROT NODE` held by an `*EQUATION`, a knot beam) | 2e-8 of \|u\| (before: 130 %) |
 | `velocity_bc_column` | `TYPE=VELOCITY` with a `SMOOTH STEP`, kept into a second step | the integral of the velocity | 5e-5 of the travel |

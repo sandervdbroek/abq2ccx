@@ -7115,8 +7115,7 @@ class Converter:
         side: List[str] = []                                # converted / commented-out lines
         for rec in merged_data_records(b):
             g = [x.strip() for x in rec]
-            f = [x for x in g if x != ""]
-            if not f:
+            if not any(g):
                 continue
             label = g[1].upper() if len(g) >= 2 else ""
             if label in DLOAD_UNSUPPORTED:
@@ -7167,37 +7166,41 @@ class Converter:
                 if not (self.geom.elements if not g[0] else
                         any(e not in self._carriers for e in self._load_elements(g[0]))):
                     if label != "P":
-                        side.append(f"** abq2ccx: {', '.join(x for x in g if x)} -> no load: it "
-                                    f"acts only on surface elements, which carry no mass in ccx")
+                        side.append(f"** abq2ccx: {', '.join(g)} -> no load: it acts only on "
+                                    f"surface elements, which carry no mass in ccx")
                     continue
             if not g[0] and ALL_ELEMENTS_SET in self.geom.elsets:
                 # Abaqus applies a body load with no element set to the whole model; ccx
                 # needs a set (without one the line read as 'GRAV, 9.81, ...' is garbage)
                 g = [ALL_ELEMENTS_SET] + g[1:]
-                f = [x for x in g if x != ""]
                 self.report.note(f"*DLOAD line without an element set (Abaqus: the whole model) -> "
                                  f"ELSET {ALL_ELEMENTS_SET}.", once=True)
             if self._slabs and re.fullmatch(r"P[1-4]", label) and g[0] and \
                     set(self._load_elements(g[0])) <= set(self._slabs):
                 label = f"P{int(label[1]) + 2}"    # a 2-D edge is a side face of its C3D8I slab
-                f = [f[0], label] + f[2:]
-            family = self._sheet_family(f[0]) if label == "P" else None
+                g = [g[0], label] + g[2:]
+            family = self._sheet_family(g[0]) if label == "P" else None
             if family == "membrane":
-                f = [f[0], "P1"] + f[2:]               # ccx stops on P on a membrane
+                g = [g[0], "P1"] + g[2:]               # ccx stops on P on a membrane
                 label = "P1"
             if family:
-                self.report.note(f"*DLOAD P on {family}s -> ccx *DLOAD {f[1]}: both push along the "
+                self.report.note(f"*DLOAD P on {family}s -> ccx *DLOAD {g[1]}: both push along the "
                                  f"positive element normal (probed on 2.23; Abaqus 2017 element "
                                  f"libraries). Exact.", once=True)
             elif label == "P":
                 self.report.warn("*DLOAD label 'P' has no face number; CalculiX needs P1..P6 for element "
                                  "pressure. Verify.", once=True)
+            # Abaqus reads a blank field as zero (no *DLOAD field has another default), and so
+            # does ccx (probed on 2.23): every field stays in its place, a blank number goes
+            # out as 0. — dropped, it moves the fields after it up, and ccx pulls
+            # 'EALL, GRAV, 9810., , , -1.' along -x or spins a CENTRIF line with a blank axis
+            # point about an axis of length zero (NaN)
+            g = g[:2] + [x or "0." for x in g[2:]]
             if self._mass_scale and label in ("GRAV", "CENTRIF") and len(g) > 2 and g[2]:
                 # the masses it acts on are divided by the scale (_plan_coupled_inertia)
                 g = g[:2] + ["%.12g" % (pf(g[2]) * self._mass_scale)] + g[3:]
-                f = [x for x in g if x != ""]
-            body.append(", ".join(f))
-            lines.append(((f[0].upper(), label), body[-1], f[2] if len(f) > 2 else ""))
+            body.append(", ".join(g))
+            lines.append(((g[0].upper(), label), body[-1], g[2] if len(g) > 2 else ""))
         had_data = any(x != "" for rec in merged_data_records(b) for x in rec)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         if body or op_new:
@@ -7237,11 +7240,11 @@ class Converter:
         side: List[str] = []
         for rec in merged_data_records(b):
             g = [x.strip() for x in rec]
-            f = [x for x in g if x != ""]
-            if len(f) < 2:
+            if len([x for x in g if x]) < 2:
                 continue
-            surf, label = f[0].upper(), f[1].upper()
-            mag = f[2] if len(f) > 2 else ""
+            # read in place: a blank field is zero (Abaqus), not the next field's value
+            surf, label = g[0].upper(), g[1].upper()
+            mag = g[2] if len(g) > 2 else ""
             if _is_user_load(b, g):
                 side += self._user_load_line(b, g)
                 continue
@@ -7250,20 +7253,20 @@ class Converter:
                 side += self._to_nodal_forces(b, "DSLOAD", g, faces, why)
                 continue
             if not re.fullmatch(r"P[1-6]?", label):
-                side += self._drop_load_line(b, f, f"the load type {label} has no ccx equivalent (ccx "
+                side += self._drop_load_line(b, g, f"the load type {label} has no ccx equivalent (ccx "
                                                    f"surface loads are pressures)")
                 continue
             sd = self.surfaces.get(surf)
             if not sd or sd[0].startswith("NODE"):
-                side += self._drop_load_line(b, f, f"surface '{f[0]}' is not defined in the deck" if
-                                             not sd else f"'{f[0]}' is a node-based surface (a pressure "
+                side += self._drop_load_line(b, g, f"surface '{g[0]}' is not defined in the deck" if
+                                             not sd else f"'{g[0]}' is a node-based surface (a pressure "
                                                          f"needs element faces)", reduces=False)
                 continue
             if self._carriers and any(e in self._carriers for token, _ in sd[1]
                                       for e in self._load_elements(token)):
                 # faces of surface elements, which are not in the ccx mesh: nodal forces
                 if label != "P":
-                    side += self._drop_load_line(b, g, f"surface '{f[0]}' lies on surface "
+                    side += self._drop_load_line(b, g, f"surface '{g[0]}' lies on surface "
                                                        f"elements, whose pressure label is P")
                     continue
                 faces, why = self._surface_faces(surf, carriers_only=True)
@@ -7690,7 +7693,7 @@ class Converter:
                              "node's local axes, in which ccx (like Abaqus) reads a *CLOAD there: "
                              "rectangular, or cylindrical at the node's undeformed position, fixed "
                              "in space.", once=True)
-        return [f"** abq2ccx: {', '.join(x for x in g if x)} -> nodal forces on "
+        return [f"** abq2ccx: {', '.join(g)} -> nodal forces on "
                 f"{n_loaded} node(s), resultant ({', '.join('%.6g' % x for x in res)}),"
                 f" in the *CLOAD at the end of this step"
                 + (f"; in the local axes of the {len(local)} with a *TRANSFORM" if local else "")]
@@ -8422,7 +8425,7 @@ class Converter:
     def _drop_load_line(self, b: Block, g: Sequence[str], why: str, reduces: bool = True) -> List[str]:
         """Comment out one load data line, with the reason — reduced physics unless ``reduces``
         is False (a line Abaqus would not apply either)."""
-        text = ", ".join(x for x in g if x)
+        text = ", ".join(g).rstrip(", ")          # blank fields kept in place (they are zeros)
         label = g[1].upper() if len(g) > 1 else ""
         msg = f"*{b.keyword} {label} on '{g[0]}' not converted: {why}. Commented out."
         self.report.n_commented += 1

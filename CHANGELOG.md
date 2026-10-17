@@ -27,7 +27,9 @@ without an error. A full audit and the work that followed:
 * **Loads** — surface tractions, beam line loads and surface-element loads as consistent
   nodal forces, in the local axes of `*TRANSFORM`ed nodes; user-subroutine loads and BCs
   commented out, naming the ccx subroutine; velocity and acceleration BCs integrated into
-  displacement BCs, with Abaqus' default amplitudes.
+  displacement BCs, with Abaqus' default amplitudes; blank `*DLOAD` and `*DSLOAD` fields
+  kept in place as zeros (dropped, they moved the fields after them: `GRAV` pulled along the
+  wrong axis, a `CENTRIF` axis came out wrong or of length zero).
 * **Default amplitudes** — displacement BCs without an amplitude follow Abaqus where its
   default departs from ccx's: ramped from the previous value where ccx would step them
   (implicit dynamics, `*VISCO`, transient coupled steps), held where they are in explicit

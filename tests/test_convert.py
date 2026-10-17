@@ -4050,6 +4050,47 @@ def test_dload_without_element_set_loads_the_whole_model():
     assert "*ELSET, ELSET=ABQ2CCX_ALL_ELEMENTS\n1\n" in body
 
 
+def test_dload_blank_fields_stay_in_place():
+    # Abaqus reads a blank data field as zero.  Dropped, it moved the fields after it up: ccx
+    # read 'EALL, GRAV, 9810., , , -1.' as gravity along -x, and a CENTRIF line with a blank
+    # axis point as one with no axis direction (NaN results; probed on 2.23)
+    deck = HEX + "*Step\n*Static\n*Dload\n{}\n*End Step\n"
+    for src, want in (("EALL, GRAV, 9810., , , -1.", "EALL, GRAV, 9810., 0., 0., -1."),
+                      (", GRAV, 9810., , , -1.", "ABQ2CCX_ALL_ELEMENTS, GRAV, 9810., 0., 0., -1."),
+                      ("EALL, GRAV, , 0., 0., -1.", "EALL, GRAV, 0., 0., 0., -1."),
+                      ("EALL, CENTRIF, 1.E6, , , , , , 1.",
+                       "EALL, CENTRIF, 1.E6, 0., 0., 0., 0., 0., 1."),
+                      ("EALL, CENTRIF, 1.E6, 0., 0., 0., , , 1.",
+                       "EALL, CENTRIF, 1.E6, 0., 0., 0., 0., 0., 1."),
+                      ("EALL, GRAV, 9.81, 0., -1.", "EALL, GRAV, 9.81, 0., -1."),   # 2-D, as given
+                      ("EALL, P2, 5., ,", "EALL, P2, 5.")):          # trailing blanks: nothing after
+        body, _, _ = convert_str(deck.format(src))
+        assert "\n" + want + "\n" in body, (src, body)
+    # given again after ccx's *DLOAD, OP=NEW removed it (_flush_dloads): the same line
+    body, _, _ = convert_str(HEX + "*Surface, name=SF\nEALL, S2\n*Step\n*Static\n*Dload\n"
+                                   "EALL, GRAV, 9.81, , , -1.\n*Dsload\nSF, P, 1.\n*End Step\n"
+                                   "*Step\n*Static\n*Dsload, op=new\nSF, P, 2.\n*End Step\n")
+    step2 = body.split("*STEP")[2]
+    assert "*DLOAD, OP=NEW" in step2 and "\nEALL, GRAV, 9.81, 0., 0., -1." in step2
+
+
+def test_dsload_and_commented_load_lines_keep_blank_fields():
+    deck = HEX + "*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n{}\n*End Step\n"
+    # a traction with blank direction components: along -z (4 x area 1 over 4 nodes)
+    body, _, _ = convert_str(deck.format("*Dsload\nTOP, TRVEC, 4., , , -1."))
+    assert _cloads(body) == [{(n, 3): -1.0 for n in (5, 6, 7, 8)}]
+    assert "** abq2ccx: TOP, TRVEC, 4., , , -1. -> nodal forces on 4 node(s)" in body
+    # a commented-out line is the deck's own, to restore as it was
+    for card, line in (("*Dsload", "TOP, TRVECNU, 4., , , -1."),
+                       ("*Dload", "EALL, TRVEC2NU, 4., , , -1."),
+                       ("*Dload, orientation=OR", "EALL, TRVEC2, 4., , , -1.")):
+        body, _, _ = convert_str(deck.format(card + "\n" + line))
+        assert "\n** " + line + "\n" in body, (line, body)
+    # a pressure's fields are read in place: a blank surface name is not the label
+    body, conv, rep = convert_str(deck.format("*Dsload\n, P, 5."))
+    assert "surface '' is not defined in the deck" in rep.text() and conv.unloaded_steps == [1]
+
+
 def test_dsload_on_undefined_surface_says_so():
     body, conv, rep = convert_str(HEX + "*Step\n*Static\n*Dsload\nNOPE, P, 1.\n*End Step\n")
     assert "surface 'NOPE' is not defined in the deck" in rep.text() and conv.unloaded_steps == [1]
