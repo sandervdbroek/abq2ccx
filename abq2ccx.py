@@ -3374,7 +3374,13 @@ class Converter:
         self._tied_nodes: List[Tuple[int, int, int, float]] = []
         self._ply_angle_dists: set = set()         # layer angle distributions the plies take
         self._identity_ori = ""                    # ABQ2CCX_OR0 once written (_shell_section_cards)
-        self._exact_ori: Dict[Tuple[str, ...], str] = {}   # ply directions -> *ORIENTATION (_exact_ply_cards)
+        # shell and membrane sections whose material directions are given element group by
+        # element group (_plan_shell_axes): id(section) -> element -> a, b tokens per layer
+        self._exact_axes: Dict[int, "OrderedDict[int, Tuple[Tuple[str, ...], ...]]"] = {}
+        self._exact_ori: Dict[Tuple[str, ...], str] = {}   # directions -> *ORIENTATION (_exact_axes_cards)
+        self._exact_only: set = set()              # orientations no other card reads than those
+        self._orient_axes: set = set()             # orientations whose axes are known (_register_orientation)
+        self._mat_symmetry: Dict[str, Optional[str]] = {}  # material -> None / "ortho" / "aniso"
         # knot beams: rigid couplings on shell/beam nodes, rotational BCs on circular-section
         # beams and across *BOUNDARY, OP=NEW (see _plan_rigid_couplings,
         # _plan_circ_rotation_knots, _plan_op_new_rotations, _add_knot_beams)
@@ -3604,6 +3610,9 @@ class Converter:
                 self._register_orientation(b)
             elif kw == "SURFACE":
                 self._register_surface(b)
+        for b in blocks:                        # DEFINITION=NODES: nodes may follow the card
+            if b.keyword == "ORIENTATION" and (b.param("DEFINITION") or "").strip().upper().startswith("NODES"):
+                self._register_orientation(b)
 
     def _cartesian_nodes(self, blocks: List[Block]) -> List[Block]:
         """``blocks`` with every *NODE, SYSTEM=C / S card rewritten in Cartesian coordinates
@@ -3809,6 +3818,13 @@ class Converter:
         if pts is not None:                   # name on its data line, not coordinates
             a, bvec = (pts[0], pts[1], pts[2]), (pts[3], pts[4], pts[5])
         self.orientations[name] = (a, bvec, system)
+        # the global axes above are a placeholder where the points cannot be formed, the axes
+        # come from each element's nodes (OFFSET TO NODES) or the system is not one of these
+        definition = (b.param("DEFINITION") or "COORDINATES").strip().upper()
+        if pts is not None and not definition.startswith("OFFSET") and system.startswith(("RECT", "CYL", "SPH")):
+            self._orient_axes.add(name)
+        else:
+            self._orient_axes.discard(name)
         # optional additional-rotation line: local axis, angle (degrees)
         recs = merged_data_records(b)
         rot = None
@@ -5497,6 +5513,12 @@ class Converter:
                     self.report.note(f"*ORIENTATION SYSTEM={system}: the additional-rotation line "
                                      f"has a zero angle (it turns nothing) and was dropped (ccx "
                                      f"allows it only for rectangular systems).", once=True)
+                elif (b.param("NAME") or "").strip().upper() in self._exact_only:
+                    self.report.note(f"*ORIENTATION SYSTEM={system}: the additional-rotation line "
+                                     f"was dropped (ccx allows it only for rectangular systems); "
+                                     f"the shell and membrane sections that use it get their "
+                                     f"material directions element by element, the rotation "
+                                     f"applied.", once=True)
                 else:
                     # ccx: "additional rotation ... is only allowed for rectangular systems"
                     self.report.warn(f"*ORIENTATION SYSTEM={system}: the additional-rotation line is "
@@ -5591,7 +5613,8 @@ class Converter:
                 params["SYSTEM"] = "RECTANGULAR"
             else:
                 params[k] = v
-        if plan["dropped_rot"]:
+        # sections with the directions element by element (_shell_axes_rows) keep the rotation
+        if plan["dropped_rot"] and (plan["solid"] or plan["inexact"] or not plan["split"]):
             self.report.warn(f"*ORIENTATION {name}: an additional rotation is not allowed by ccx "
                              f"for a non-rectangular system and was dropped — verify material "
                              f"directions.", once=True)
@@ -5679,7 +5702,7 @@ class Converter:
             self._dist_ori[name] = dict(dist=ref, copy=copy, rect=rect, rot=rot,
                                         dropped_rot=dropped, default=default, vec=vec,
                                         has_data=default is not None or bool(vec),
-                                        solid=set(), split=False)
+                                        solid=set(), split=False, inexact=False)
         for b in blocks:
             kw = b.keyword
             ori = (b.param("ORIENTATION") or "").strip().upper()
@@ -5795,6 +5818,14 @@ class Converter:
             self.report.warn(f"*{b.keyword} {elset}: {uncovered} element(s) are not listed in its "
                              f"*DISTRIBUTION orientation, which has no default line (Abaqus "
                              f"requires one); they get the first line's axes — verify.", once=True)
+        for o in involved:
+            self._dist_ori[o]["split"] = True
+        rows = self._shell_axes_rows(b)
+        if rows is not None:                       # directions element group by element group
+            self._exact_axes[id(b)] = rows
+            return
+        for o in involved:
+            self._dist_ori[o]["inexact"] = True    # its plain per-direction orientations
         split = []
         for k, (key, members) in enumerate(groups.items(), 1):
             gname = elset if len(groups) == 1 else self._fresh_name(f"{elset}_G{k}")
@@ -5802,8 +5833,6 @@ class Converter:
                 self.geom.elsets[gname] = members
             split.append((gname, dict(zip(involved, key))))
         self._dist_split[id(b)] = split
-        for o in involved:
-            self._dist_ori[o]["split"] = True
         self.report.note(f"*{b.keyword} with a *DISTRIBUTION orientation split into one element "
                          f"set, plain *ORIENTATION and section per distinct direction (ccx 2.23 "
                          f"gives every element of a shell or membrane section the "
@@ -6238,9 +6267,9 @@ class Converter:
                     continue
                 else:
                     self.report.note(f"*SHELL SECTION parameter {k} dropped.", once=True)
-            exact = None if axes else self._exact_ply_cards(b, elset, base, keep)
-            if exact is not None:
-                return exact
+            rows = self._exact_axes.get(id(b))
+            if rows is not None:
+                return self._exact_axes_cards(b, rows, keep)
             pre: List[str] = []
             plies: List[Tuple[str, str, Optional[str]]] = []
             for rec in merged_data_records(b):
@@ -6299,10 +6328,7 @@ class Converter:
                 self.report.note(f"*SHELL SECTION parameter {k} dropped.", once=True)
         if "ELSET" in keep:
             keep["ELSET"] = elset
-        pre = []
-        if base in axes:
-            keep["ORIENTATION"] = self._plain_dist_orientation(base, axes[base], 0.0, pre)
-        out = pre + [emit_keyword("SHELL SECTION", keep)]
+        data: List[str] = []
         recs = merged_data_records(b)
         if recs:
             f = [x for x in recs[0] if x != ""]
@@ -6310,35 +6336,21 @@ class Converter:
                 if len(f) > 1:
                     self.report.note("*SHELL SECTION: integration-point count dropped (ccx wants the "
                                      "thickness only).", once=True)
-                out.append(f[0])
-        return out
+                data.append(f[0])
+        rows = self._exact_axes.get(id(b))
+        if rows is not None:
+            return self._exact_axes_cards(b, rows, keep, data)
+        pre = []
+        if base in axes:
+            keep["ORIENTATION"] = self._plain_dist_orientation(base, axes[base], 0.0, pre)
+        return pre + [emit_keyword("SHELL SECTION", keep)] + data
 
-    def _exact_ply_cards(self, b: Block, elset: Optional[str], base: str,
-                         keep: "OrderedDict[str, Optional[str]]") -> Optional[List[str]]:
-        """A composite *SHELL SECTION whose plies need their directions element by element, or
-        None where ccx reads the usual ply orientations as Abaqus does.  Abaqus projects the
-        section orientation onto the shell (the axis that follows its rotation axis; without
-        one, global X) and then turns a layer by its angle about the shell normal (shell_local_
-        axes, ply_axes); ccx 2.23 turns an orientation about its own axis k and projects the
-        turned axis 1 (probed), and the converter writes a layer angle as a rotation about axis
-        3.  The two agree where every shell's normal is the orientation's axis 3 — a flat
-        panel in its plane — and not on other planes, reversed normals, curved shells or a
-        rotation about axis 1 or 2.  There each group of elements with the same ply directions
-        gets an element set, an *ORIENTATION per ply with those directions (in the shell's
-        plane, so ccx's projection keeps them) and a section of its own."""
-        if not elset:
-            return None
-        quiet = Report()
-        elems = []
-        for e in dedup(self.geom.elset(elset)):
-            if e not in self.geom.elements:
-                continue
-            typ, conn = self.geom.elements[e]
-            t = ccx_element_type(typ, quiet)
-            if t not in SHELL_TYPES or t.startswith("SC") or len(conn) < 3 or \
-                    any(n not in self.geom.nodes for n in conn):
-                return None
-            elems.append(e)
+    def _section_layers(self, b: Block) -> List[Tuple[str, str, str]]:
+        """(thickness, material, orientation field in upper case) of each layer of a shell or
+        membrane section: a composite's ply lines (a SYMMETRIC layup mirrored), else the
+        section's material with a blank field."""
+        if not b.has("COMPOSITE"):
+            return [("", (b.param("MATERIAL") or "").strip(), "")]
         plies: List[Tuple[str, str, str]] = []
         for rec in merged_data_records(b):
             g = [x.strip() for x in rec]
@@ -6346,100 +6358,276 @@ class Converter:
                 g.pop()
             if len(g) >= 3 and g[0]:
                 plies.append((g[0], g[2], (g[3] if len(g) > 3 else "").upper()))
-        if not elems or not plies or any(f in self._dist_refs or (base in self._dist_refs and not f)
-                                         for _, _, f in plies):
+        return plies + plies[::-1] if b.has("SYMMETRIC") else plies
+
+    def _shell_geometry(self, e: int) -> Optional[Tuple[Vec, Vec, List[Vec]]]:
+        """The unit normal of shell or membrane element ``e`` (from its corners, in Abaqus' node
+        order), the centre of its corners and the corners; None for a degenerate element."""
+        conn = self.geom.elements[e][1]
+        c = [self.geom.nodes[x] for x in conn[:4 if len(conn) in (4, 8, 9) else 3]]
+        n = vcross(vsub(c[2], c[0]), vsub(c[3], c[1])) if len(c) == 4 else \
+            vcross(vsub(c[1], c[0]), vsub(c[2], c[0]))
+        if vnorm(n) < 1e-30:
             return None
-        if b.has("SYMMETRIC"):
-            plies = plies + plies[::-1]
-        P = self.geom.nodes
+        centre = vscale(vadd(vadd(c[0], c[1]), c[2]), 1.0 / 3.0) if len(c) == 3 else \
+            vscale(vadd(vadd(c[0], c[1]), vadd(c[2], c[3])), 0.25)
+        return vunit(n), centre, c
 
-        def frame(name: str, center: Vec):
-            a, bb, system = self.orientations[name]
-            return orientation_frame(a, bb, system, center, self._orient_rotation.get(name))
+    def _dist_values(self, e: int, name: str) -> Optional[List[float]]:
+        """The a, b values *DISTRIBUTION orientation ``name`` gives element ``e``: its line, else
+        the default line, else the first (as _plan_split); None without data."""
+        dp = self._dist_ori.get(name)
+        if not dp or not dp["has_data"]:
+            return None
+        tok = dp["vec"].get(e, dp["default"]) or next(iter(dp["vec"].values()), None)
+        return [pf(x) for x in tok] if tok else None
 
-        def ccx_dir(n: Vec, name: str, center: Vec, synth: Optional[float]) -> Optional[Vec]:
-            """ccx's ply direction for the orientation the converter writes: none or the
-            global axes (ccx's default projection, as Abaqus'; probed), the deck's *ORIENTATION
-            as handle_orientation writes it (a cylindrical one without its rotation line), or a
-            synthesized one (_synth_orientation: rectangular, ``synth`` degrees about axis 3);
-            None where ccx's turned axis 1 lies along the normal."""
-            if not name and synth is None:
-                return shell_local_axes(n)[0]
-            a, bb, system = self.orientations[name] if name else \
-                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR")
-            rect = not system.upper().startswith("CYL")
-            if synth is not None:
-                fr, _ = orientation_frame(a, bb, "RECTANGULAR", center, (3, synth))
-            else:
-                fr, _ = orientation_frame(a, bb, "RECTANGULAR" if rect else system, center,
-                                          self._orient_rotation.get(name) if rect else None)
-            v = vsub(fr[0], vscale(n, vdot(fr[0], n)))
-            return vunit(v) if vnorm(v) > 1e-9 else None
-
-        known = lambda name: name in self.orientations      # noqa: E731
-        rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]" = OrderedDict()
-        differs = False
-        for e in elems:
-            conn = self.geom.elements[e][1]
-            c = [P[n] for n in conn[:4 if len(conn) in (4, 8, 9) else 3]]
-            n = vcross(vsub(c[2], c[0]), vsub(c[3], c[1])) if len(c) == 4 else \
-                vcross(vsub(c[1], c[0]), vsub(c[2], c[0]))
-            if vnorm(n) < 1e-30:
+    def _abaqus_frame(self, e: int, name: str, centre: Vec
+                      ) -> Optional[Tuple[Tuple[Vec, Vec, Vec], Optional[int]]]:
+        """Abaqus' local system of orientation ``name`` at element ``e`` (centre ``centre``) and
+        the axis of its additional rotation (orientation_frame): a plain *ORIENTATION,
+        rectangular or cylindrical (spherical as rectangular), or a *DISTRIBUTION one with the
+        element's own line, its rotation — which _distribution_lines turned a rectangular one's
+        vectors by — applied once.  None where the axes are unknown (_orient_axes)."""
+        rot = self._orient_rotation.get(name)
+        if name in self._dist_refs:
+            v = self._dist_values(e, name)
+            if v is None:
                 return None
-            n = vunit(n)
-            center = vscale(vadd(vadd(c[0], c[1]), c[2]), 1.0 / 3.0) if len(c) == 3 else \
-                vscale(vadd(vadd(c[0], c[1]), vadd(c[2], c[3])), 0.25)
+            dp = self._dist_ori[name]
+            baked = bool(dp["rot"] and dp["rot"][1] and dp["rect"])
+            frame, k = orientation_frame(tuple(v[:3]), tuple(v[3:6]), "RECT" if dp["rect"] else "CYL",
+                                         centre, None if baked else rot)
+            return frame, (dp["rot"][0] if baked else k)
+        if name not in self._orient_axes:
+            return None
+        a, bb, system = self.orientations[name]
+        return orientation_frame(a, bb, "RECT" if system.upper().startswith("SPH") else system,
+                                 centre, rot)
+
+    def _ccx_frame(self, e: int, name: str, angle: float, centre: Vec) -> Optional[Tuple[Vec, Vec, Vec]]:
+        """The local system ccx 2.23 builds at element ``e`` from the orientation the converter
+        otherwise writes for the section or layer orientation ``name`` and a composite layer
+        ``angle`` (degrees): the global axes for none; a *DISTRIBUTION orientation's plain one
+        per direction, the angle about its axis 3 (_plain_dist_orientation); a layer angle on a
+        plain orientation as a rectangular one turned about its axis 3, with that orientation's
+        own rotation about axis 3 (_synth_orientation); else the deck's *ORIENTATION as
+        handle_orientation writes it, a cylindrical one without its rotation.  None where it is
+        unknown."""
+        if name in self._dist_refs:
+            v = self._dist_values(e, name)
+            if v is None:
+                return None
+            rect = self._dist_ori[name]["rect"]
+            return orientation_frame(tuple(v[:3]), tuple(v[3:6]), "RECT" if rect else "CYL", centre,
+                                     (3, angle) if angle and rect else None)[0]
+        if name and name not in self._orient_axes:
+            return None
+        a, bb, system = self.orientations[name] if name else \
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), "RECTANGULAR")
+        rot = self._orient_rotation.get(name) if name else None
+        if angle:
+            total = angle + (rot[1] if rot and rot[0] == 3 else 0.0)
+            return orientation_frame(a, bb, "RECTANGULAR", centre, (3, total))[0]
+        cyl = system.upper().startswith("CYL")
+        return orientation_frame(a, bb, system if cyl else "RECTANGULAR", centre, None if cyl else rot)[0]
+
+    @staticmethod
+    def _ccx_shell_direction(frame: Tuple[Vec, Vec, Vec], n: Vec) -> Optional[Vec]:
+        """ccx 2.23's material direction 1 on a shell with unit normal ``n`` from the local system
+        ``frame``: its axis 1 projected onto the shell, or its axis 3 where axis 1 is the normal
+        (probed: axis 1 at 0.01 degree from the normal, axis 3 at 0.001); None in between."""
+        p1 = vsub(frame[0], vscale(n, vdot(frame[0], n)))
+        if vnorm(p1) > 1.7e-4:
+            return vunit(p1)
+        if vnorm(p1) > 1.8e-5:
+            return None
+        p3 = vsub(frame[2], vscale(n, vdot(frame[2], n)))
+        return vunit(p3) if vnorm(p3) > 1.7e-4 else None
+
+    def _shell_axes_rows(self, b: Block) -> Optional["OrderedDict[int, Tuple[Tuple[str, ...], ...]]"]:
+        """Per element of a shell or membrane section, Abaqus' material directions 1 and 2 of
+        each layer (one for a plain section) as the six a, b tokens of an *ORIENTATION — or None
+        where ccx reads the cards the converter otherwise writes the same way on every element,
+        where no material depends on its axes, or where the check cannot be made.
+
+        Abaqus (2017 "Orientations") projects the orientation onto the shell — the axis that
+        follows its rotation axis (shell_local_axes; without one, global X, or Z where X is the
+        normal) — and turns a composite layer about the normal (ply_axes).  ccx 2.23 (probed on
+        S3, S4, S4R, S6, S8R, M3D3, M3D4 and M3D4R): a shell projects the orientation's turned
+        axis 1 (_ccx_shell_direction) and takes direction 2 = normal x direction 1; a membrane
+        takes the turned axes unprojected (without an orientation the global axes).  So they
+        agree on a shell whose orientation turns about axis 3 — for a layer angle, the normal —
+        and on a membrane whose axes 1 and 3 are its direction 1 and normal (either sign for an
+        orthotropic material).  Elsewhere each element gets the directions in its own plane, a
+        = direction 1, b = normal x direction 1, which a shell's projection keeps and which
+        are a membrane's axes.
+
+        ccx takes a shell or membrane orientation once per element, at its centre (probed: a
+        cylindrical one on an annulus runs exactly as one rectangular orientation per element),
+        Abaqus at each integration point: where a cylindrical system turns the directions by more
+        than 5 degrees across an element, that is warned as reduced physics."""
+        elset = (b.param("ELSET") or "").strip()
+        layers = self._section_layers(b)
+        syms = [self._mat_symmetry.get(mat.upper(), "aniso") for _t, mat, _f in layers]
+        # a plain section of an isotropic material has no directions; a composite keeps its
+        # plies' (also isotropic ones: their usual cards would warn about rotations)
+        if not elset or not layers or not (b.has("COMPOSITE") or any(syms)):
+            return None
+        aniso = "aniso" in syms
+        membrane = b.keyword == "MEMBRANE SECTION"
+        base = (b.param("ORIENTATION") or "").strip().upper()
+        quiet = Report()
+        elems = []
+        for e in dedup(self.geom.elset(elset)):
+            if e not in self.geom.elements:
+                continue
+            typ, conn = self.geom.elements[e]
+            t = ccx_element_type(typ, quiet)
+            if not (t.startswith("M3D") if membrane else t in SHELL_TYPES and not t.startswith(("SC", "SAX"))) \
+                    or len(conn) < 3 or any(x not in self.geom.nodes for x in conn):
+                return None
+            elems.append(e)
+        rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]" = OrderedDict()
+        differs, spread = False, 0.0
+        for e in elems:
+            geo = self._shell_geometry(e)
+            if geo is None:
+                return None
+            n, centre, corners = geo
             toks = []
-            for _thick, _mat, field in plies:
+            for _thick, _mat, spec in layers:
                 try:
-                    angle, name = (pf(field), base) if field else (0.0, base)
+                    angle, name = (pf(spec), base) if spec else (0.0, base)
                 except ValueError:
-                    angle, name = 0.0, field
-                if name and not known(name):
+                    angle, name = 0.0, spec
+                fr = self._abaqus_frame(e, name, centre) if name else None
+                got = self._ccx_frame(e, name, angle, centre)
+                if (name and fr is None) or got is None:
                     return None
-                fr = frame(name, center) if name else None
                 d1, d2 = ply_axes(n, shell_local_axes(n, *fr) if fr else shell_local_axes(n), angle)
-                # what ccx makes of the orientation the converter would write (_synth_orientation)
-                if angle and name == base:
-                    rot = self._orient_rotation.get(base) if base else None
-                    got = ccx_dir(n, base, center, angle + (rot[1] if rot and rot[0] == 3 else 0.0))
+                if fr and (not self._dist_ori[name]["rect"] if name in self._dist_refs
+                           else self.orientations[name][2].upper().startswith("CYL")):
+                    for q in corners:                  # the directions there (same normal)
+                        dq = ply_axes(n, shell_local_axes(n, *self._abaqus_frame(e, name, q)), angle)[0]
+                        spread = max(spread, math.degrees(math.acos(min(1.0, abs(vdot(dq, d1))))))
+                if membrane:
+                    c1, c3 = vdot(got[0], d1), vdot(got[2], n)
+                    same = min(c1, c3) > 1.0 - 1e-6 if aniso else min(abs(c1), abs(c3)) > 1.0 - 1e-6
                 else:
-                    got = ccx_dir(n, name, center, None)
-                if got is None or vdot(got, d1) < 1.0 - 1e-6:
-                    differs = True
+                    p = self._ccx_shell_direction(got, n)
+                    same = p is not None and vdot(p, d1) > 1.0 - 1e-6
+                differs = differs or not same
                 toks.append(tuple(_fmt_component(x) for x in (*d1, *d2)))
             rows[e] = tuple(toks)
-        if not differs:
-            return None
+        if spread > 5.0 and any(syms):
+            self.report.warn(f"*{b.keyword} {elset}: its cylindrical orientation turns the material "
+                             f"directions by up to {spread:.0f} degrees across an element (near the "
+                             f"system's axis); ccx 2.23 takes a shell or membrane orientation once per "
+                             f"element, at its centre (probed), Abaqus at each integration point — "
+                             f"refine the mesh there or verify.")
+            self._reduces(f"*{b.keyword} {elset}: material directions of a cylindrical orientation "
+                          f"at element centres, up to {spread:.0f} degrees apart within an element")
+        return rows if differs else None
+
+    def _plan_material_symmetry(self, blocks: List[Block]) -> None:
+        """How each material depends on its axes (_mat_symmetry): None for isotropic cards only,
+        "ortho" with orthotropic ones (the same after a half turn about a material axis), else
+        "aniso" — anisotropic cards and user materials."""
+        for name, opts in self._material_options(blocks).items():
+            sym = None
+            for c in opts[1:]:
+                typ = (c.param("TYPE") or "").strip().upper()
+                tensor = c.keyword in ("ELASTIC", "EXPANSION", "CONDUCTIVITY")
+                if c.keyword == "USER MATERIAL" or (c.keyword == "HYPERELASTIC" and c.has("ANISOTROPIC")) \
+                        or (tensor and typ in ("ANISOTROPIC", "ANISO")):
+                    sym = "aniso"
+                elif c.keyword == "POTENTIAL" or (tensor and typ in ("ENGINEERING CONSTANTS", "LAMINA",
+                                                                     "ORTHOTROPIC", "ORTHO")):
+                    sym = sym or "ortho"
+            self._mat_symmetry[name] = sym
+
+    def _plan_shell_axes(self, blocks: List[Block]) -> None:
+        """The shell and membrane sections that need their material directions element group by
+        element group (_shell_axes_rows; those with *DISTRIBUTION orientations were planned in
+        _plan_split), and the orientations no other card reads (_exact_only): a cylindrical
+        one's dropped rotation then loses nothing."""
+        only: Dict[str, bool] = {}
+        for b in blocks:
+            kw = b.keyword
+            if kw in ("SHELL SECTION", "MEMBRANE SECTION") or (
+                    kw == "SHELL GENERAL SECTION" and (b.has("MATERIAL") or b.has("COMPOSITE"))):
+                if not (id(b) in self._ply_sections or id(b) in self._dist_split or id(b) in self._exact_axes
+                        or self._continuum_shell_elset(b.param("ELSET"))):
+                    rows = self._shell_axes_rows(b)
+                    if rows is not None:
+                        self._exact_axes[id(b)] = rows
+            names = {(b.param("ORIENTATION") or "").strip().upper()}
+            if b.has("COMPOSITE"):
+                names |= {f for _t, _m, f in self._section_layers(b)}
+            if kw == "CONNECTOR SECTION":
+                names |= {x.strip().upper() for r in merged_data_records(b) for x in r}
+            for name in names - {""}:
+                only[name] = only.get(name, True) and id(b) in self._exact_axes
+        self._exact_only = {name for name, yes in only.items() if yes}
+
+    def _exact_axes_cards(self, b: Block, rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]",
+                          keep: "OrderedDict[str, Optional[str]]", data: Sequence[str] = ()) -> List[str]:
+        """The cards of a shell or membrane section whose material directions go element group
+        by element group (_shell_axes_rows): per group of elements with the same directions an
+        element set, an *ORIENTATION per direction pair not written yet, and the section with
+        the parameters ``keep`` — a composite's plies each naming its own, a plain section (data
+        lines ``data``) its one."""
+        composite = b.has("COMPOSITE")
+        kw = "MEMBRANE SECTION" if b.keyword == "MEMBRANE SECTION" else "SHELL SECTION"
+        elset = keep.get("ELSET") or (b.param("ELSET") or "").strip()
         self._reserve_names()
         groups: "OrderedDict[tuple, List[int]]" = OrderedDict()
         for e, key in rows.items():
             groups.setdefault(key, []).append(e)
+        layers = self._section_layers(b)
         out: List[str] = []
         for k, (key, members) in enumerate(groups.items(), 1):
-            gname = elset if len(groups) == 1 else self._fresh_name(f"{elset}_P{k}")
+            gname = elset if len(groups) == 1 else self._fresh_name(f"{elset}_{'P' if composite else 'AX'}{k}")
             if gname != elset:
                 out += [f"*ELSET, ELSET={gname}"] + reflow([str(e) for e in members])
             names = []
             for tok in key:
                 if tok not in self._exact_ori:
-                    self._exact_ori[tok] = self._fresh_name(f"ABQ2CCX_PLY{len(self._exact_ori) + 1}")
+                    prefix = "ABQ2CCX_PLY" if composite else "ABQ2CCX_AXES"
+                    self._exact_ori[tok] = self._fresh_name(f"{prefix}{len(self._exact_ori) + 1}")
                     out += [f"*ORIENTATION, NAME={self._exact_ori[tok]}", ", ".join(tok)]
                 names.append(self._exact_ori[tok])
             params = OrderedDict(keep)
             params["ELSET"] = gname
-            out.append(emit_keyword("SHELL SECTION", params))
-            out += [f"{thick}, , {mat}, {name}" for (thick, mat, _f), name in zip(plies, names)]
-        self.report.note(f"*SHELL SECTION, COMPOSITE on shells whose normal is not the orientation's "
-                         f"axis 3 (another plane, a reversed normal, a curved shell or a rotation "
-                         f"about axis 1 / 2): each ply's directions given element group by group "
-                         f"({len(groups)} group(s) here) as Abaqus defines them — the orientation "
-                         f"projected onto the shell, then turned by the layer angle about the shell "
-                         f"normal; ccx would turn it about the orientation's axis 3 and project that.",
-                         once=True)
+            if composite:
+                out.append(emit_keyword(kw, params))
+                out += [f"{thick}, , {mat}, {name}" for (thick, mat, _f), name in zip(layers, names)]
+            else:
+                params["ORIENTATION"] = names[0]
+                out += [emit_keyword(kw, params)] + list(data)
+        if composite:
+            self.report.note(f"*SHELL SECTION, COMPOSITE on shells whose normal is not the "
+                             f"orientation's axis 3 (another plane, a reversed normal, a curved shell "
+                             f"or a rotation about axis 1 / 2): each ply's directions given element "
+                             f"group by group ({len(groups)} group(s) here) as Abaqus defines them — "
+                             f"the orientation projected onto the shell, then turned by the layer "
+                             f"angle about the shell normal; ccx would turn it about the "
+                             f"orientation's axis 3 and project that.", once=True)
+        else:
+            self.report.note(f"*{b.keyword} whose material directions ccx would place otherwise "
+                             f"(an orientation turned about axis 1 / 2 or not in the shell's plane, "
+                             f"a cylindrical system on a cylinder, a membrane off the x-y plane): "
+                             f"Abaqus' directions — the orientation projected onto the shell — given "
+                             f"element group by element group ({len(groups)} group(s) here); ccx "
+                             f"would project the turned axis 1 onto a shell and take a membrane's "
+                             f"axes unprojected.", once=True)
         return out
 
     def handle_membrane_section(self, b: Block) -> List[str]:
+        rows = self._exact_axes.get(id(b))
+        if rows is not None:
+            return self._exact_axes_cards(b, rows, OrderedDict(b.params), list(b.data))
         split = self._dist_split.get(id(b))
         if split is None:
             return self.passthrough(b)
@@ -12185,7 +12373,9 @@ class Converter:
         self._plan_load_cases(blocks)
         self._plan_rigid_planar_holds()             # after _prescan: the bodies' ROT NODEs
         self._warn_coupled_clashes()                # BCs on coupled DOFs left (_prescan)
+        self._plan_material_symmetry(blocks)
         self._plan_distributions(blocks)
+        self._plan_shell_axes(blocks)           # after the distributions: their axes
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
@@ -14385,26 +14575,13 @@ class Converter:
         center = (0.0, 0.0, 0.0)
         for q in mids:
             center = vadd(center, vscale(q, 1.0 / len(mids)))
-        rot = self._orient_rotation.get(ori)
-        if ori in self._dist_ori:
-            dp = self._dist_ori[ori]
-            tok = dp["vec"].get(e, dp["default"]) or next(iter(dp["vec"].values()), None)
-            if tok is None:
-                return n, shell_local_axes(n)
-            v = [pf(x) for x in tok]
-            # _distribution_lines turned a rectangular distribution's axes already
-            baked = bool(dp["rot"] and dp["rot"][1] and dp["rect"])
-            frame, k = orientation_frame(tuple(v[:3]), tuple(v[3:6]), "RECT" if dp["rect"] else "CYL",
-                                         center, None if baked else rot)
-            return n, shell_local_axes(n, frame, dp["rot"][0] if baked else k)
-        if ori in self.orientations:
-            a, bb, system = self.orientations[ori]
-            frame, k = orientation_frame(a, bb, "RECT" if system.upper().startswith("SPH") else system,
-                                         center, rot)
-            return n, shell_local_axes(n, frame, k)
-        self.report.warn(f"Composite continuum shells: orientation '{ori}' is not defined; the "
-                         f"plies use Abaqus' default shell axes.", once=True)
-        self._reduces(f"undefined ply orientation {ori}")
+        fr = self._abaqus_frame(e, ori, center)
+        if fr is not None:
+            return n, shell_local_axes(n, *fr)
+        self.report.warn(f"Composite continuum shells: orientation '{ori}' has no axes the converter "
+                         f"can form (undefined, OFFSET TO NODES, unresolved nodes, or a *DISTRIBUTION "
+                         f"without data); the plies use Abaqus' default shell axes.", once=True)
+        self._reduces(f"ply orientation {ori} without axes")
         return n, shell_local_axes(n)
 
     def _angle_distribution(self, name: str) -> Tuple[Optional[float], Dict[int, float]]:

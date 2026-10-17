@@ -194,7 +194,8 @@ Everything the converter creates starts with `ABQ2CCX_`:
 | `ABQ2CCX_RS*`, `ABQ2CCX_AS*`, `ABQ2CCX_STAR*` | the skins a surface uses, a meshed analytical surface, and the point masses of a rigid body's rotary inertia |
 | `ABQ2CCX_RB*`, `ABQ2CCX_MPCB*`, `ABQ2CCX_KC*`, `ABQ2CCX_TIED*` | node sets and surfaces of rigid bodies, `*MPC BEAM` bodies, kinematic couplings and tied contact pairs |
 | `ABQ2CCX_BC*` | node subsets of a BC card that the converter partly moved or removed |
-| `ABQ2CCX_TR*`, `ABQ2CCX_OR*`, `ABQ2CCX_PLY*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles and directions) |
+| `ABQ2CCX_TR*`, `ABQ2CCX_OR*`, `ABQ2CCX_PLY*`, `ABQ2CCX_AXES*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles and directions, shell and membrane material directions) |
+| `<elset>_P<k>`, `<elset>_AX<k>` | the element groups of a composite / plain shell or membrane section whose material directions are written group by group |
 | `<elset>_PLY<k>`, `…_ORI`, `…_AXES`; `<set>_S<k>_PLIES` | the ply solids of a composite continuum-shell section from ply `k` on (one material and layer angle), their orientation and per-element axes; the ply faces a surface or face load names |
 | `ABQ2CCX_VEL*`, `ABQ2CCX_ACC*` | amplitudes that integrate velocity and acceleration BCs |
 | `ABQ2CCX_TP*`, `ABQ2CCX_OUTPUT*` | generated `*TIME POINTS` and output node sets |

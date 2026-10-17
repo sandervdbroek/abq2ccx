@@ -72,8 +72,11 @@ TRANSLATED = {
     "*SHELL SECTION": "thickness only (integration-point count dropped); composite plies → one "
         "synthesized `*ORIENTATION` per ply angle, composed with a base rotation about the "
         "normal, every ply naming one where any does (ccx 2.23 gives a ply without one the "
-        "previous ply's); where a shell's normal is not the orientation's axis 3 the plies get "
-        "their directions per element group, as Abaqus projects them; composite S3/S4/S4R "
+        "previous ply's); where ccx would place the material directions of an orthotropic or "
+        "anisotropic section otherwise than Abaqus (another plane, a rotation about axis 1 or 2, "
+        "a curved shell, a `*DISTRIBUTION` whose axis 3 is not the normal) each element group "
+        "gets Abaqus' directions, plies included, as `*ORIENTATION`s in the shell's plane; "
+        "composite S3/S4/S4R "
         "elements become S6/S8R (ccx runs composites on those only); `SYMMETRIC` layups mirrored; "
         "on continuum shells (SC6R/SC8R, which run as solids) → `*SOLID SECTION`, a composite one "
         "→ one `*SOLID SECTION` per ply material and angle on one solid per ply (up to "
@@ -83,6 +86,11 @@ TRANSLATED = {
         "way).",
     "*SHELL GENERAL SECTION": "→ `*SHELL SECTION` (thickness+material form); ABD/stiffness form "
         "flagged as unsupported.",
+    "*MEMBRANE SECTION": "passed through; material directions as for `*SHELL SECTION` (ccx 2.23 "
+        "takes a membrane's orientation axes unprojected, the global axes without one, so an "
+        "orthotropic or anisotropic membrane off them gets Abaqus' directions per element group); "
+        "with a `*DISTRIBUTION` orientation split into one element set, plain `*ORIENTATION` and "
+        "section per distinct direction.",
     "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's "
         "two section diameters (`r` → `2r, 2r`), and 2-node beams under it become 3-node beams with "
         "an inserted midside node (ccx 2.23 rejects linear beams with a circular section). "
@@ -619,6 +627,7 @@ def gen_elements():
 def gen_keywords():
     handled = {"NODE", "ELEMENT", "NSET", "ELSET", "NGEN", "NFILL", "NCOPY", "NMAP", "ELGEN",
                "ELCOPY", "ELASTIC", "ORIENTATION", "DISTRIBUTION", "SOLID SECTION", "SHELL SECTION",
+               "MEMBRANE SECTION",
                "BEAM SECTION", "STEP", "END STEP", "BOUNDARY", "DLOAD", "DSLOAD", "TIE", "MPC",
                "CREEP", "AMPLITUDE", "RESTART", "SURFACE", "OUTPUT", "NODE OUTPUT", "ELEMENT OUTPUT",
                "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "STATIC", "DYNAMIC", "FREQUENCY",

@@ -8035,6 +8035,173 @@ def test_collapsed_composite_quad_becomes_a_triangle():
     assert conv.geom.elements[2] == ("S6", [2, 3, 6, 11, 12, 13])
 
 
+def _orientation_values(body, name):
+    return [float(x) for x in _card_at(body, f"*ORIENTATION, NAME={name}")[0].split(",")]
+
+
+def test_plain_shell_section_gets_abaqus_axes():
+    # Abaqus projects the axis after an orientation's rotation axis onto the shell, ccx 2.23 its
+    # turned axis 1: about axis 1 on the x-y strip Abaqus' direction 1 is the turned axis 2, y
+    sec = "*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.1, 5\n"
+    body, conv, rep = convert_str(S4R_STRIP + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n1, 30.\n" + sec)
+    assert "given element group by element group (1 group(s) here)" in rep.text()
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 1, 0, -1, 0, 0"]
+    assert _card_at(body, "*SHELL SECTION, ELSET=PLATE, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1") == ["0.1"]
+    # in the x-z plane without a rotation line the axis closest to the normal, 2, is the
+    # rotation axis: Abaqus projects axis 3, z (ccx would project axis 1, x)
+    xz = S4R_STRIP.replace(", 1., 0.\n", ", 0., 1.\n")
+    body, _, _ = convert_str(xz + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n" + sec)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 0, 1, -1, 0, 0"]
+    # a rotation about axis 3 is read alike, and an isotropic material has no directions
+    for deck in (S4R_STRIP + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n3, 30.\n" + sec,
+                 xz.replace("type=ENGINEERING CONSTANTS\n140000., 10000., 10000., 0.3, 0.3, 0.4, 5000., "
+                            "5000.,\n3500.", "\n70000., 0.3") + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n" + sec):
+        body, conv, rep = convert_str(deck)
+        assert "ABQ2CCX_AXES" not in body and "MATERIAL=CFRP, ORIENTATION=O" in body
+    assert conv._mat_symmetry == {"CFRP": None}
+
+
+def test_orientation_by_nodes_after_the_card_is_resolved_before_planning():
+    deck = ("*Orientation, name=O, definition=NODES\n101, 102\n1, 30.\n" + S4R_STRIP
+            + "*Node\n101, 0., 1., 0.\n102, -1., 0., 0.\n"
+            "*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.1\n")
+    body, conv, _ = convert_str(deck)
+    assert conv.orientations["O"][:2] == ((0.0, 1.0, 0.0), (-1.0, 0.0, 0.0))
+    # axis 1 = y, 3 = z, turned about y: Abaqus projects axis 2 (-x turned out of the plate), -x
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["-1, 0, 0, 0, -1, 0"]
+
+
+def test_membrane_section_gets_abaqus_axes():
+    # ccx 2.23 gives a membrane its orientation's axes unprojected (the global ones without
+    # one): on a y-z strip, normal x, Abaqus' direction 1 is the projection of Z
+    strip = ("*Node\n1, 0., 0., 0.\n2, 0., 1., 0.\n3, 0., 2., 0.\n4, 0., 0., 1.\n5, 0., 1., 1.\n6, 0., 2., 1.\n"
+             "*Element, type=M3D4, elset=SKIN\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n" + COMPOSITE_MAT
+             + "*Membrane Section, elset=SKIN, material=CFRP\n0.1\n")
+    body, _, rep = convert_str(strip)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 0, 1, 0, -1, 0"]
+    assert _card_at(body, "*MEMBRANE SECTION, ELSET=SKIN, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1") == ["0.1"]
+    # an x-y strip whose normal is -z: the global axes turned half about x, the same for an
+    # orthotropic material, not for an anisotropic one
+    xy = strip.replace("1, 0., 0., 0.\n2, 0., 1., 0.\n3, 0., 2., 0.\n4, 0., 0., 1.\n5, 0., 1., 1.\n6, 0., 2., 1.",
+                       "1, 0., 0., 0.\n2, 0., 1., 0.\n3, 0., 2., 0.\n4, 1., 0., 0.\n5, 1., 1., 0.\n6, 1., 2., 0.")
+    body, _, _ = convert_str(xy)
+    assert "ORIENTATION" not in body.split("*MEMBRANE SECTION")[1].splitlines()[0]
+    aniso = ("*Elastic, type=ANISOTROPIC\n" + ", ".join(["100."] * 8) + "\n" + ", ".join(["10."] * 8)
+             + "\n" + ", ".join(["10."] * 5) + "\n")
+    body, conv, _ = convert_str(xy.replace("*Elastic, type=ENGINEERING CONSTANTS\n140000., 10000., 10000., 0.3, "
+                                           "0.3, 0.4, 5000., 5000.,\n3500.\n", aniso))
+    assert conv._mat_symmetry["CFRP"] == "aniso"
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, -1, 0"]     # x, -z cross x
+
+
+def test_cylindrical_orientation_on_a_plain_shell_cylinder():
+    # the system's axis 1, radial, is the normal: Abaqus turns about it and projects axis 2 (the
+    # hoop direction, here turned 25 degrees towards the axis); ccx would project axis 1 and
+    # drop the rotation, which the element-by-element axes keep
+    nodes = "".join(f"{k + 1}, {math.cos(t):.9f}, {math.sin(t):.9f}, {z}\n" for k, (t, z) in enumerate(
+        (math.radians(a), z) for z in (0.0, 1.0) for a in (0.0, 30.0, 60.0)))
+    deck = (f"*Node\n{nodes}*Element, type=S4R, elset=CYL\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n" + COMPOSITE_MAT
+            + "*Orientation, name=CYLO, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n1, 25.\n"
+            "*Shell Section, elset=CYL, material=CFRP, orientation=CYLO\n0.1\n")
+    body, conv, rep = convert_str(deck)
+    t, r = math.radians(15.0), math.radians(25.0)
+    want = (-math.sin(t) * math.cos(r), math.cos(t) * math.cos(r), math.sin(r))
+    assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_AXES1")[:3], want)) < 1e-6
+    assert "*ELSET, ELSET=CYL_AX1" in body and "*ELSET, ELSET=CYL_AX2" in body
+    assert "the rotation applied" in rep.text() and not conv.reduced_physics
+    # the same as a cylindrical *DISTRIBUTION (one line scaled): the rotation is kept too
+    deck = deck.replace("*Orientation, name=CYLO, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n",
+                        "*Distribution, name=D, location=ELEMENT, table=T\n, 0., 0., 0., 0., 0., 1.\n"
+                        "2, 0., 0., 0., 0., 0., 2.\n*Distribution Table, name=T\ncoord3D, coord3D\n"
+                        "*Orientation, name=CYLO, system=CYLINDRICAL\nD\n")
+    body, conv, rep = convert_str(deck)
+    assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_AXES1")[:3], want)) < 1e-6
+    assert "*DISTRIBUTION" not in body and "was dropped" not in rep.text() and not conv.reduced_physics
+
+
+def test_distribution_orientation_on_a_plain_shell_gets_abaqus_axes():
+    # each element's distribution line turned about its axis 1: Abaqus projects the turned
+    # axis 2, ccx would project axis 1 of the per-direction orientations
+    deck = (S4R_STRIP + "*Distribution, name=D, location=ELEMENT, table=T\n, 1., 0., 0., 0., 1., 0.\n"
+            "2, 0., 1., 0., -1., 0., 0.\n*Distribution Table, name=T\ncoord3D, coord3D\n"
+            "*Orientation, name=O\nD\n1, 30.\n*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.1\n")
+    body, conv, rep = convert_str(deck)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 1, 0, -1, 0, 0"]
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES2") == ["-1, 0, 0, 0, -1, 0"]
+    assert "*ELSET, ELSET=PLATE_AX1\n1\n" in body and "*ELSET, ELSET=PLATE_AX2\n2\n" in body
+    assert "*DISTRIBUTION" not in body and "_A1" not in body
+
+
+def test_distribution_composite_with_axis_3_off_the_normal_gets_exact_plies():
+    # b out of the plate tilts the distribution's axis 3: Abaqus still projects axis 1 (the
+    # rotation line names axis 3) and turns the 45-degree ply about the normal
+    deck = (S4R_STRIP + "*Distribution, name=D, location=ELEMENT, table=T\n, 1., 0., 0., 0., 0.866025404, 0.5\n"
+            "*Distribution Table, name=T\ncoord3D, coord3D\n*Orientation, name=O\nD\n3, 0.\n"
+            "*Shell Section, elset=PLATE, composite, orientation=O\n0.1, 3, CFRP, 0.\n0.1, 3, CFRP, 45.\n")
+    body, _, rep = convert_str(deck)
+    assert "as Abaqus defines them" in rep.text() and "*DISTRIBUTION" not in body
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_PLY1") == ["1, 0, 0, 0, 1, 0"]
+    c = math.sqrt(0.5)
+    assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_PLY2"), (c, c, 0, -c, c, 0))) < 1e-8
+    # with b in the plate ccx turns the ply about the normal as Abaqus does: the usual split
+    body, _, rep = convert_str(deck.replace("0., 0.866025404, 0.5", "0., 1., 0."))
+    assert "as Abaqus defines them" not in rep.text() and "3, 45." in body
+
+
+def test_orientation_without_axes_is_not_given_made_up_directions():
+    # an orientation from each element's nodes, or one whose points are missing, has no axes
+    # the converter knows: its sections keep naming it (commented out, so ccx stops)
+    xz = S4R_STRIP.replace(", 1., 0.\n", ", 0., 1.\n")
+    sec = "*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.1\n"
+    for ori in ("*Orientation, name=O, definition=OFFSET TO NODES\n1, 2, 4\n", "*Orientation, name=O\n1., 0., 0.\n"):
+        body, conv, _ = convert_str(xz + ori + sec)
+        assert "ABQ2CCX_AXES" not in body and "MATERIAL=CFRP, ORIENTATION=O" in body
+    # a composite ply split on such an orientation warns, as for an undefined one
+    body, conv, rep = convert_str(SC8R_STRIP + "*Orientation, name=O, definition=OFFSET TO NODES\n1, 2, 4\n"
+                                  "*Shell Section, elset=PLATE, composite, orientation=O\n" + LAYUP)
+    assert "has no axes the converter can form" in rep.text()
+    assert any("ply orientation O without axes" in r for r in conv.reduced_physics)
+
+
+def test_isotropic_composite_keeps_its_exact_plies():
+    # isotropic plies need no directions, but their usual cards would turn a 45-degree ply on an
+    # orientation rotated about axis 1 and warn: the plies keep their exact directions instead
+    deck = (S4R_STRIP + "*Material, name=AL\n*Elastic\n70000., 0.3\n*Orientation, name=O\n"
+            "1., 0., 0., 0., 1., 0.\n1, 30.\n*Shell Section, elset=PLATE, composite, orientation=O\n"
+            "0.1, 3, AL, 0.\n0.1, 3, AL, 45.\n")
+    body, conv, rep = convert_str(deck)
+    assert "as Abaqus defines them" in rep.text()
+    assert conv.reduced_physics == ["element S4R -> S8R (ccx runs composite shells on S8R / S6 only)"]
+
+
+def test_cylindrical_orientation_turning_across_an_element_is_warned():
+    # ccx takes a shell orientation once per element: on an annulus of 8 elements a cylindrical
+    # system turns by 45 degrees across one, which Abaqus follows point by point
+    pts = [(r * math.cos(math.radians(45.0 * i)), r * math.sin(math.radians(45.0 * i)))
+           for r in (1.0, 2.0) for i in range(8)]
+    nodes = "".join(f"{k + 1}, {x:.9f}, {y:.9f}, 0.\n" for k, (x, y) in enumerate(pts))
+    elems = "".join(f"{i + 1}, {i + 1}, {(i + 1) % 8 + 1}, {(i + 1) % 8 + 9}, {i + 9}\n" for i in range(8))
+    deck = (f"*Node\n{nodes}*Element, type=S4R, elset=DISK\n{elems}" + COMPOSITE_MAT
+            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n"
+            "*Shell Section, elset=DISK, material=CFRP, orientation=C\n0.1\n")
+    body, conv, rep = convert_str(deck)
+    assert re.search(r"turns the material directions by up to 2[23] degrees across an element", rep.text())
+    assert conv.reduced_physics and "ABQ2CCX_AXES" not in body    # ccx's own radial agrees at the centre
+    _, conv, rep = convert_str(deck.replace("material=CFRP", "material=ISO") + "*Material, name=ISO\n*Elastic\n1., 0.3\n")
+    assert "across an element" not in rep.text() and not conv.reduced_physics
+
+
+def test_material_symmetry_classes():
+    deck = (S4R_STRIP + "*Material, name=ISO\n*Elastic\n200000., 0.3\n*Plastic\n250., 0.\n"
+            "*Material, name=EXP\n*Elastic\n200000., 0.3\n*Expansion, type=ORTHO\n1e-5, 2e-5, 3e-5\n"
+            "*Material, name=HILL\n*Elastic\n200000., 0.3\n*Plastic\n250., 0.\n*Potential\n1., 1.1, 1., 1., 1., 1.\n"
+            "*Material, name=COND\n*Conductivity, type=ANISO\n1., 2., 3., 0.1, 0., 0.\n"
+            "*Material, name=UM\n*User Material, constants=1\n1.\n")
+    _, conv, _ = convert_str(deck)
+    assert {k: conv._mat_symmetry[k] for k in ("CFRP", "ISO", "EXP", "HILL", "COND", "UM")} == \
+        dict(CFRP="ortho", ISO=None, EXP="ortho", HILL="ortho", COND="aniso", UM="aniso")
+
+
 def test_composite_examples_match_the_validation_decks():
     import validate_with_ccx as V
     for name, text in (("composite_plate_s4r", V.composite_plate_deck("s4r")),
