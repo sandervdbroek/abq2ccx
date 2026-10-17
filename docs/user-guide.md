@@ -85,22 +85,42 @@ differently ([compatibility](compatibility.md#materials)). A stock ccx runs its 
 example there, so build one with the deck's UMAT:
 
 1. Unpack the ccx 2.23 sources (`ccx_2.23.src.tar.bz2`, <https://www.dhondt.de>) and build
-   SPOOLES 2.2 and ARPACK as its README describes.
+   SPOOLES 2.2 (`make lib`, with `CC` set in `Make.inc` and `drawTree.c` renamed `draw.c` in
+   `Tree/src/makeGlobalLib`) and ARPACK, without which ccx 2.23 does not link.
 2. Save the deck's UMAT as `src/umat.f` in place of ccx's example (the routine is `umat`, with
    Abaqus' arguments), next to an `ABA_PARAM.INC` holding `implicit real*8(a-h,o-z)` and
    `parameter (nprecd=2)`. ccx has no Abaqus utility routines (`XIT`, `SINV`, `SPRINC`,
    `ROTSIG`, …): supply those it calls.
-3. `make` in `src` with gfortran and run the converted deck with the new executable.
+3. `make ccx_2.23` in `src` with gfortran, a LAPACK in `LIBS` (ccx calls `dgesv`; give
+   libraries as file paths, as the Makefile also lists them as prerequisites), and run the
+   converted deck with the new `ccx_2.23`. On macOS with Homebrew's gcc 13, compile the C
+   files with Apple clang (`-Wno-int-conversion -Wno-incompatible-pointer-types
+   -Wno-implicit-function-declaration -Wno-implicit-int -Wno-return-mismatch`, SPOOLES also
+   `-std=gnu89`) and link with `SDKROOT=$(xcrun --show-sdk-path)`.
+
+Built this way with a J2 UMAT (isotropic hardening, radial return), a `C3D8` and a `CPE4`
+cantilever bent well past yield give exactly the reactions and stresses of the same models with
+`*ELASTIC` and `*PLASTIC`.
 
 A ccx built with `-DCALCULIX_EXTERNAL_BEHAVIOURS_SUPPORT` (`src/Makefile_MFront`) loads the
 UMAT from a shared library instead: rename the material `@ABAQUS_<LIB>_<FUNCTION>` for the
 function `<FUNCTION>` in `lib<LIB>.so` (ccx manual 8.5); FreeCAD's ccx has no such support.
-In ccx 2.23 `umat_abaqusnl.f` never sets U0, so under `ABAQUSNL` the stress at the start of
-an increment is undefined: a UMAT that adds to it (plasticity, damage) needs U0 set there
-first, or `ABAQUS<name>` where strains and rotations stay small. A `TYPE=THERMAL` user
-material always goes to `umatht.f` (Abaqus' UMATHT arguments first; ccx uses only FLUX and
-DFDG). ccx has no VUMAT interface: an Abaqus/Explicit deck's user material must be ported to a
-UMAT, and the option leaves it alone.
+In ccx 2.23 `umat_abaqusnl.f` never sets U0, so under `ABAQUSNL` a UMAT that adds to the
+stress it gets (plasticity, damage) goes wrong: under NLGEOM that J2 cantilever's tip reaction
+stayed near its first increment's value, 70 % low at the end. Set U0 after the first
+`um1(3,2)=um1(2,3)` line, and it matches ccx's own plasticity to 2e-5:
+
+```fortran
+      do jj=1,6
+        u0(kal(1,jj),kal(2,jj))=xm1(jj)/wum1(1)+xm2(jj)/wum1(2)
+     &       +xm3(jj)/wum1(3)
+        u0(kal(2,jj),kal(1,jj))=u0(kal(1,jj),kal(2,jj))
+      enddo
+```
+
+A `TYPE=THERMAL` user material always goes to `umatht.f` (Abaqus' UMATHT arguments first; ccx
+uses only FLUX and DFDG). ccx has no VUMAT interface: an Abaqus/Explicit deck's user material
+must be ported to a UMAT, and the option leaves it alone.
 
 ## Recommended workflow
 

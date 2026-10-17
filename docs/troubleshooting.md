@@ -108,8 +108,8 @@ converter comments `*TEMPERATURE` out there.
 * **A `--abaqus-umat` material is linear elastic, or a thermal user material conducts no
   heat.** That is a stock ccx: its Abaqus-UMAT interface holds a linear-elastic example and
   its `umatht` is empty. Run the ccx built with the deck's routines. Under `ABAQUSNL` (NLGEOM)
-  ccx 2.23 hands the UMAT an undefined stress at the start of each increment
-  ([user guide](user-guide.md#--abaqus-umat)).
+  ccx 2.23 hands the UMAT an undefined stress at the start of each increment; the
+  [user guide](user-guide.md#--abaqus-umat) has the fix.
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=`; the converter keeps
   the Abaqus no-field state (field = 0): exact (a note) when the deck sets no field variable
   and the table gives that state, reduced physics (warned) otherwise.

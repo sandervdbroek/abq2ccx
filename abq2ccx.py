@@ -4173,11 +4173,12 @@ class Converter:
             if nl:
                 self.report.warn("--abaqus-umat: ccx 2.23's umat_abaqusnl.f never computes U0, the "
                                  "right stretch tensor at the start of the increment, so the STRESS "
-                                 "it passes in is undefined: only a UMAT that computes the stress "
-                                 "from the total strain or DFGRD1 (a hyperelastic one) runs right. "
-                                 "For an incremental UMAT set U0 in umat_abaqusnl.f first, or, where "
-                                 "strains and rotations stay small, rename the material ABAQUS<name> "
-                                 "(small strain).", once=True)
+                                 "it passes in is undefined (zero in a test build, where a J2 UMAT's "
+                                 "stress then never built up): only a UMAT that computes the stress "
+                                 "from the total strain or DFGRD1 (a hyperelastic one) runs right as "
+                                 "it is. Set U0 in umat_abaqusnl.f (the user guide gives the lines) "
+                                 "or, where strains and rotations stay small, rename the material "
+                                 "ABAQUS<name> (small strain).", once=True)
                 notes = ["STRAN, DSTRAN, DROT: the logarithmic strain, its increment and the "
                          "rotation increment, in the corotational frame as in Abaqus; ccx assumes "
                          "an isotropic thermal expansion"]

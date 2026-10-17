@@ -105,6 +105,8 @@ without an error. A full audit and the work that followed:
   `ABAQUSNL<name>` under NLGEOM) to run in a ccx built with the deck's UMAT, with a note per
   argument ccx supplies differently. The temperature line ccx reads after a multiple of 8
   constants is added; thermal user materials (ccx's empty `umatht`) and VUMATs are warned.
+  Checked in a ccx 2.23 built with a J2 UMAT, which also showed that ccx's `ABAQUSNL`
+  interface breaks incremental UMATs (the user guide has the fix).
 
 * **Beam sections the expanded beams cannot carry** — `*BEAM GENERAL SECTION` and `SECTION=I`
   run as ccx 2.23's 2-node beam `U1` where the whole deck allows it (probed: an exact
