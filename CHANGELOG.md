@@ -127,10 +127,10 @@ without an error. A full audit and the work that followed:
   (Euler–Bernoulli for Timoshenko beams: reduced physics). The `HEX`, `TRAPEZOID` and
   `ARBITRARY` profiles follow, with Abaqus' formulas (Verification Guide), and a general
   section with a `RECT`, `CIRC`, `PIPE` or `BOX` profile becomes ccx's own beam section with a
-  material from E and G (NAFEMS NL6 runs: its published answers on a finer mesh).
+  material from E and G (NAFEMS NL6 runs, and its Benchmarks deck is gated with its answer).
 * **Published answers** — 30 NAFEMS benchmark decks of the Abaqus 2017 documentation joined
-  the corpus, and 25 decks are checked against their published answer (`reference`,
-  `test_corpus_references`): 19 give Abaqus' result for the same mesh, 6 differ for reasons
+  the corpus, and 26 decks are checked against their published answer (`reference`,
+  `test_corpus_references`): 19 give Abaqus' result for the same mesh, 7 differ for reasons
   traced to ccx. They found converter faults, fixed: `*NFILL` sets hold their bounding
   nodes; each equation of an `*EQUATION` card resolves its sets; `DC2D*` / `DCAX*` run as
   ccx's plane and axisymmetric elements; `*NMAP` maps coordinates and normals; `PERIODIC`,
@@ -139,9 +139,9 @@ without an error. A full audit and the work that followed:
   initial temperatures; a zero extra rotation of a cylindrical `*ORIENTATION` is no reduced
   physics.
 
-Corpus: 188 decks solve their own problem; 33 more solve with reduced physics, 14 load
+Corpus: 189 decks solve their own problem; 33 more solve with reduced physics, 14 load
 nothing (3 both) and one drifts to a solution that is not the deck's; 221 mesh-only decks are
-accepted, 598 need what ccx cannot run; 25 give their published answer (6 with a documented
+accepted, 597 need what ccx cannot run; 26 give their published answer (7 with a documented
 ccx difference).
 
 ## 1.1.0 (July 2026)

@@ -4,7 +4,7 @@
 | --- | --- | --- | --- |
 | Unit tests | `python tests/test_convert.py` (or `pytest tests/`) | nothing | exact conversion behaviour on small inline decks and the bundled examples |
 | End-to-end | `python validate_with_ccx.py` | CalculiX | the converted examples solve and match independent references |
-| Corpus | `python corpus/fetch.py`, then `python tests/test_corpus.py` | network once; CalculiX for the solve test | 1052 real decks convert cleanly, keep their loads and solve; 25 of Abaqus' NAFEMS benchmark decks give their published answer |
+| Corpus | `python corpus/fetch.py`, then `python tests/test_corpus.py` | network once; CalculiX for the solve test | 1052 real decks convert cleanly, keep their loads and solve; 26 of Abaqus' NAFEMS benchmark decks give their published answer |
 
 Each layer skips cleanly when its prerequisite is missing, so the unit tests always run
 offline. Before handing over a change, run all three and check that
@@ -178,7 +178,7 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1052 decks convert with no dangling
-reference. 233 are gated `expect_solve`: **188 solve the deck's own physics**; 14 are
+reference. 234 are gated `expect_solve`: **189 solve the deck's own physics**; 14 are
 `source_unloaded`, one is `solver_differs` (a snap-fit insert that only contact holds drifts
 out of its buckle) and 33 (3 of them also unloaded) are `reduced_physics` — concrete damaged
 plasticity (2), UHARD / VUHARD hardening (4), field-dependent elasticity set by USDFLD or a
@@ -186,7 +186,7 @@ user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
 `B32` (3), I-section `B21` beams run as ccx's Euler–Bernoulli `U1` (3), general contact (2), a
 dropped `*IMPERFECTION` (1), planar beams whose eigenmodes include twist (1). 221 mesh-only
-decks are accepted. The other 598 stop first on, or (the last row) run without, what they need:
+decks are accepted. The other 597 stop first on, or (the last row) run without, what they need:
 
 | Decks | First blocker |
 | ---: | --- |
@@ -194,10 +194,10 @@ decks are accepted. The other 598 stop first on, or (the last row) run without, 
 | 66 | a user element (UEL) |
 | 50 | an incomplete or invalid source deck (undefined sets or materials, external parameters, CAE fragments) |
 | 34 | an explicit coupled temperature–displacement step (28), or `*MATRIX GENERATE` (6) |
-| 26 | no convergence or divergence (18), or more than the gate's 300 s (8) |
+| 27 | no convergence or divergence (19), or more than the gate's 300 s (8) |
 | 16 | NLGEOM follower tractions (they convert with `--approximate`) |
 | 19 | other ccx errors, one or a few decks each |
-| 24 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure models) |
+| 22 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure models) |
 | 10 | Abaqus general contact (7), an XFEM crack (1) or Hashin damage of composite plies (2): ccx has none of them, and the converted deck runs without it — not the deck's physics, so not gated |
 
 Every one of them was checked to fail no worse than the original, unconverted deck. Fixing
@@ -209,20 +209,21 @@ cost.
 
 30 decks are Abaqus' own benchmark decks: NAFEMS tests of the Abaqus 2017 Benchmarks Manual,
 from the documentation mirror at abaqus-docs.mit.edu (Dassault Systèmes' decks, fetched on
-demand and not redistributed). The 24 that run carry a `reference`, as does the corpus's copy
+demand and not redistributed). The 25 that run carry a `reference`, as does the corpus's copy
 of Abaqus' LE1 `CPS3` deck: a quantity, where ccx writes it (a `.frd` nodal stress or
-temperature, `.dat` eigenfrequencies or integration-point stresses), the NAFEMS target and
-Abaqus' published result for the deck's own mesh. `test_corpus_references` runs them in ccx
-and compares; `python tests/test_corpus.py` prints the comparison.
+temperature, `.dat` eigenfrequencies, integration-point stresses or displacements), the
+NAFEMS target and Abaqus' published result for the deck's own mesh. `test_corpus_references`
+runs them in ccx and compares; `python tests/test_corpus.py` prints the comparison.
 
 The yardstick is Abaqus' result for the same mesh: it has the same discretization error, so
 the tolerance only covers what the two codes do differently with one mesh — ccx's
 one-element-thick expansion of plane, shell and beam elements, its nodal extrapolation, the
-digits Abaqus prints: 0.5 % for temperatures and frequencies, 1 % for stresses. A conversion
-error moves an answer far more (NAFEMS T3 on ccx's own time increments: −16 %). Where ccx
-answers differently for a reason traced to ccx and checked independently, the entry records
-ccx's value and `why`: the check then holds ccx to that value within the same tolerance, so a
-conversion change still shows, and fails once ccx reaches Abaqus' value.
+digits Abaqus prints: 0.5 % for temperatures and frequencies, 1 % for stresses and
+displacements. A conversion error moves an answer far more (NAFEMS T3 on ccx's own time
+increments: −16 %). Where ccx answers differently for a reason traced to ccx and checked
+independently, the entry records ccx's value and `why`: the check then holds ccx to that value
+within the same tolerance, so a conversion change still shows, and fails once ccx reaches
+Abaqus' value.
 
 On ccx 2.23, 19 match Abaqus:
 
@@ -241,7 +242,7 @@ On ccx 2.23, 19 match Abaqus:
 | NL1 | `CPE4R`, perfect and hardening plasticity | von Mises after each of 8 steps | Abaqus' 16 values (≤ 0.01 %) | 3.824 … 7.297 | 3.917 … 7.322 |
 | NL2 | `CAX8R`, plasticity | σrr, σθθ at 8 Gauss radii, 80 and 160 MPa | ≤ 0.35 % off | the targets, but 95.8 for σθθ at r = 124.2 under 80 MPa | 98.5 there |
 
-Six differ for a reason traced to ccx:
+Seven differ for a reason traced to ccx:
 
 | Test | Element | ccx | Abaqus | Why |
 | --- | --- | --- | --- | --- |
@@ -250,16 +251,18 @@ Six differ for a reason traced to ccx:
 | T4 | `DC3D8` fine | 17.954 | 18.91 | ccx integrates `*FILM` consistently, Abaqus lumps it on first-order elements: a separate solution gives 17.954 and 18.914 |
 | FV52 | `C3D8I` | 44.18 … 205.15 | 44.092 … 200.13 | Abaqus lumps first-order masses (Theory Guide, "Implicit dynamic analysis") and condenses the incompatible modes, which ccx keeps as DOFs with a consistent mass: a separate solution gives 44.12 … 156.5 Abaqus' way, 44.18 … 157.9 ccx's |
 | FV12 | `S8R` | mode 9: 7.653 | 7.559 | ccx's `S8R` is a one-layer `C3D20R` solid: modes 4–8 within 0.26 %, mode 9 a coarse-mesh error (ccx: 7.375 at 8 × 8) |
-| FV2 | `B22` | 11.65 … 70.21 | 11.34 … 57.75 | ccx's 3-node beam is one `C3D20R` brick, much stiffer than `B22` on 8 elements an arm: one 10 m beam gives 11.65 and 50.50 Hz at n = 2 and 4 (beam theory 11.34, 45.35) |
+| FV2 | `B22` | 11.65 … 70.21 | 11.34 … 57.75 | ccx's 3-node beam is one `C3D20` brick, much stiffer than `B22` on 8 elements an arm: one 10 m beam gives 11.65 and 50.50 Hz at n = 2 and 4 (beam theory 11.34, 45.35) |
+| NL6 | `B22`, NLGEOM | ux/L, uy/L: −0.4062, 0.6997; −1.4989, 0.4691 | −0.447, 0.723; −1.577, 0.427 | ccx's `B32` is one 20-node brick integrated at 3 × 3 × 3 points, stiffer than `B22` on 8 elements: 16 give −0.4476, 0.7228; −1.5772, 0.4265, and ccx's `B32R` (2 × 2 × 2) −0.4503, 0.7242; −1.5818, 0.4231 on the 8 |
 
-The other six do not run in ccx 2.23: creep tests 1(a), 2(a) and 5(a) stop on a singular
+The other five do not run in ccx 2.23: creep tests 1(a), 2(a) and 5(a) stop on a singular
 matrix once an increment's creep strain is about 20 times the elastic one (Abaqus takes
 increments of about 100 h; ccx is exact until it stops); FV4 stops in its `*FREQUENCY` step
-("add_bo_st") because `*MASS` elements sit on `*RIGID BODY` members; NL5 and NL6 need
-`*BEAM GENERAL SECTION`. These decks also found converter faults, fixed with them: `*NFILL`
-sets without their bounding nodes, one `*EQUATION` card with several set equations, 2-D and
-axisymmetric heat-transfer elements, `*NMAP`, `PERIODIC` amplitudes, and the increments and
-initial temperatures of transient heat transfer.
+("add_bo_st") because `*MASS` elements sit on `*RIGID BODY` members; NL5 stops at about 90°
+of end rotation ("increment size smaller than minimum") on 8 or 32 elements, as `B32` or
+`B32R`. These decks also found converter faults, fixed with them: `*NFILL` sets without their
+bounding nodes, one `*EQUATION` card with several set equations, 2-D and axisymmetric
+heat-transfer elements, `*NMAP`, `PERIODIC` amplitudes, and the increments and initial
+temperatures of transient heat transfer.
 
 ### Adding a deck
 

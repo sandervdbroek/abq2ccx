@@ -14,12 +14,12 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 Abaqus 2017 documentation (``abaqus2017_*``). Every deck converts cleanly (zero dangling
 references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (233) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (234) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
   conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
-  Three flags keep such a deck out of the headline count of faithful solves (188):
+  Three flags keep such a deck out of the headline count of faithful solves (189):
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
@@ -39,7 +39,7 @@ references). Each entry carries one of three expectations:
 * ``parse_only=True`` (221) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (598) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (597) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -122,7 +122,7 @@ CORPUS = [
              target=[11.336, 17.709, 45.345, 57.39],
              abaqus=[11.337, 17.676, 45.686, 57.745], tol=0.005,
              ccx=[11.647, 19.349, 50.434, 70.213],
-             why="ccx expands each 3-node beam into one C3D20R brick, much stiffer than Abaqus' B22 on "
+             why="ccx expands each 3-node beam into one C3D20 brick, much stiffer than Abaqus' B22 on "
                  'this mesh of 8 elements a 10 m arm: one pinned 10 m beam of it gives 11.65 and 50.50 '
                  'Hz for n = 2 and 4 (beam theory 11.34 and 45.35; with 32 elements 11.33 and 45.28)',
              source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv2.htm'),
@@ -318,6 +318,23 @@ CORPUS = [
                      -5.682, 177.0], tol=0.01, unit=1e6,
              source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-nl2.htm'),
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl2xr8x.inp'),
+    dict(name='abaqus2017_nnl6x22x', expect_solve=True,
+         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
+         exercises='NAFEMS NL6 cantilever with an axial end load past buckling, B22: *BEAM GENERAL '
+                   'SECTION, SECT=RECT, NLGEOM in two load steps',
+         reference=dict(
+             quantity='tip (node 17) ux / L and uy / L downwards after steps 1 and 2 (load levels '
+                      '3.190 and 22.493), .dat',
+             read=('disp', 17, ((1, 0, 0), (0, -1, 0)), (1.0, 2.0)),
+             target=[-0.44, 0.719, -1.577, 0.421],
+             abaqus=[-0.447, 0.723, -1.577, 0.427], tol=0.01, unit=3.2,
+             ccx=[-0.40619, 0.69967, -1.4989, 0.46906],
+             why="ccx runs B32 as one 20-node brick integrated at 3 x 3 x 3 points, stiffer than "
+                 "Abaqus' B22 on these 8 elements: the same beam gives -0.4476, 0.7228, -1.5772, "
+                 "0.4265 on 16 elements and -0.4506, 0.7244, -1.5878, 0.4216 on 64; as ccx's B32R "
+                 "(2 x 2 x 2 points) -0.4503, 0.7242, -1.5818, 0.4231 on these 8",
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-nl6.htm'),
+         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl6x22x.inp'),
     dict(name='abaqus2017_nt1xxf8x', expect_solve=True,
          license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
          exercises='NAFEMS T1 membrane with a hot spot, CPS8: *TEMPERATURE without initial temperatures, '
@@ -1968,20 +1985,12 @@ CORPUS = [
     dict(name='abaqus2017_nnl5x22x', expect_solve=False,
          license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
          exercises='NAFEMS NL5 cantilever rolled up by an end moment, B22: *BEAM GENERAL SECTION, NLGEOM',
-         note="ccx limitation: *BEAM GENERAL SECTION has no ccx card, and ccx's U1 beam, which "
-              "can carry one, takes only 2-node beams in linear steps, not these NLGEOM B22 (ccx "
-              "stops: '*ERROR in gen3delem: first thickness'); target at M L / (2 pi E I) = 1: "
-              "ux / L = -1, uy / L = 0, rotation 2 pi",
+         note="ccx limitation: ccx stops at about 90 degrees of end rotation, half-way through step "
+              "1 ('increment size smaller than minimum'), on 8 or 32 elements, as B32 or B32R, with "
+              "the deck's increments or fixed ones of 0.005; until then 32 elements follow the "
+              "elastica within 0.1 % of L; target at M L / (2 pi E I) = 1: ux / L = -1, uy / L = "
+              "0, rotation 2 pi",
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl5x22x.inp'),
-    dict(name='abaqus2017_nnl6x22x', expect_solve=False,
-         license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
-         exercises='NAFEMS NL6 cantilever with an axial end load past buckling, B22: *BEAM GENERAL '
-                   'SECTION, NLGEOM',
-         note="ccx limitation: *BEAM GENERAL SECTION has no ccx card, and ccx's U1 beam, which "
-              "can carry one, takes only 2-node beams in linear steps, not these NLGEOM B22 (ccx "
-              "stops: '*ERROR in gen3delem: first thickness'); target at P L^2 / (2 pi E I) = "
-              "22.493: ux / L = -1.577, uy / L = 0.421",
-         url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl6x22x.inp'),
     dict(name='asurovi_45_vcct', expect_solve=False, license='see source repo',
          exercises='CPE4I — parts/instances/assembly; *Orientation; contact',
          note='VCCT debonding: the bonded start (*INITIAL CONDITIONS, TYPE=CONTACT) has no ccx equivalent, and the remaining contact pair - node-to-surface, the Abaqus default - does not converge in ccx (it runs as face-to-face contact, without the bond)',

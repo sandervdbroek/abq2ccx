@@ -154,6 +154,9 @@ def run_ccx(ccx, env, text, read=None):
 #   ("ipstress", ((elem, ip, k), ...), (t, ...))   .dat *EL PRINT stress component k (sxx,
 #                                    syy, szz, sxy, sxz, syz) at an integration point, at each
 #                                    total time
+#   ("disp", node, ((dx, dy, dz), ...), (t, ...))   .dat *NODE PRINT displacement of a node
+#                                    along each direction, at each total time (a beam's own
+#                                    node, which the expanded .frd lacks)
 
 def frd_nodes(frd_path):
     """{node: (x, y, z)} of the node block of a ccx .frd file."""
@@ -168,6 +171,13 @@ def dat_ip_stresses(dat_path):
     stress table *EL PRINT wrote to a ccx .dat file."""
     return [(t, {(int(r[0]), int(r[1])): r[2:] for r in rows if len(r) == 8})
             for _, title, _, t, rows in A.dat_blocks(dat_path) if title == "stresses"]
+
+
+def dat_displacements(dat_path):
+    """[(time, {node: [ux, uy, uz]})] of every displacement table *NODE PRINT wrote to a ccx
+    .dat file."""
+    return [(t, {int(r[0]): r[1:4] for r in rows if len(r) >= 4})
+            for _, title, _, t, rows in A.dat_blocks(dat_path) if title == "displacements"]
 
 
 def _at(blocks, t):
@@ -207,6 +217,11 @@ def reference_values(job, read):
     if kind == "ipstress":
         tables = dat_ip_stresses(job + ".dat")
         return [_at(tables, tt)[(el, ip)][k] for tt in read[2] for el, ip, k in read[1]]
+    if kind == "disp":
+        node = read[1]
+        tables = [(t, u[node]) for t, u in dat_displacements(job + ".dat") if node in u]
+        return [sum(a * b for a, b in zip(_at(tables, tt), d)) / sum(x * x for x in d) ** 0.5
+                for tt in read[3] for d in read[2]]
     raise ValueError(f"unknown reference read {kind!r}")
 
 
