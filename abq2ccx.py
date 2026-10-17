@@ -5655,12 +5655,12 @@ class Converter:
             else:
                 params[k] = v
         # sections with the directions element by element (_shell_axes_rows) keep the rotation
-        if plan["dropped_rot"] and (plan["solid"] or plan["inexact"] or not plan["split"]):
+        if plan["dropped_rot"] and (plan["solid"] or plan["inexact"] or plan["other"] or not plan["split"]):
             self.report.warn(f"*ORIENTATION {name}: an additional rotation is not allowed by ccx "
                              f"for a non-rectangular system and was dropped — verify material "
                              f"directions.", once=True)
             self._reduces("*ORIENTATION additional rotation on a non-rectangular system dropped")
-        if plan["split"] and not plan["solid"]:
+        if plan["split"] and not plan["solid"] and not plan["other"]:
             return []                              # its shell sections carry their own axes
         first = plan["default"]
         head = [", " + ", ".join(first)] if first else []
@@ -5743,7 +5743,7 @@ class Converter:
             self._dist_ori[name] = dict(dist=ref, copy=copy, rect=rect, rot=rot,
                                         dropped_rot=dropped, default=default, vec=vec,
                                         has_data=default is not None or bool(vec),
-                                        solid=set(), split=False, inexact=False)
+                                        solid=set(), split=False, inexact=False, other=False)
         for b in blocks:
             kw = b.keyword
             ori = (b.param("ORIENTATION") or "").strip().upper()
@@ -5762,6 +5762,7 @@ class Converter:
                 if ori in self._dist_ori:
                     self._dist_ori[ori]["solid"].update(self._existing(elset))
             elif ori in self._dist_ori:
+                self._dist_ori[ori]["other"] = True    # names it in the ccx deck
                 self.report.warn(f"*{kw}, ORIENTATION={ori}: a *DISTRIBUTION orientation gives "
                                  f"per-element axes to sections only; ccx gives this card the "
                                  f"distribution's first (default) axes — verify.", once=True)
@@ -6261,6 +6262,9 @@ class Converter:
             self.report.note("*SHELL SECTION on continuum shells (SC6R/SC8R) -> *SOLID SECTION "
                              "(they run as C3D6/C3D8I solids; thickness comes from the mesh).",
                              once=True)
+            rows = self._exact_axes.get(id(b))
+            if rows is not None:
+                return self._continuum_axes_cards(b, rows, keep_s)
             return [emit_keyword("SOLID SECTION", keep_s)]
         split = self._dist_split.get(id(b))
         if split is None:
@@ -6575,6 +6579,64 @@ class Converter:
                           f"at element centres, up to {spread:.0f} degrees apart within an element")
         return rows if differs else None
 
+    def _continuum_axes_rows(self, b: Block) -> Optional["OrderedDict[int, Tuple[Tuple[str, ...], ...]]"]:
+        """Per element of a plain shell section on continuum shells, which run as C3D6 / C3D8I
+        solids under a *SOLID SECTION, Abaqus' material directions 1 and 2 as the six a, b
+        tokens of an *ORIENTATION — or None where ccx reads the deck's orientation the same
+        way on every element, where the material does not depend on its axes, or where the
+        check cannot be made.
+
+        Abaqus treats a continuum shell as a shell (2017 "About shell elements", "Continuum
+        shell element library"): its normal and material direction 3 is the stack direction,
+        from the bottom face to the top face (STACK DIRECTION; HEX_STACK_ORDER), and directions
+        1, 2 are the orientation projected onto the mid-surface (shell_local_axes; without one
+        global X, or Z where X is the normal), taken at its one in-plane integration point.
+        ccx 2.23 gives a solid its orientation's turned axes unprojected (the global ones
+        without one), a cylindrical system's at each integration point (probed on C3D8I and
+        C3D6 by the stiffness of a patch under six uniform strains).  So they agree where the
+        orientation's axes 1 and 3 are direction 1 and the normal (either sign for an
+        orthotropic material) — for a cylindrical system, throughout the element."""
+        elset = (b.param("ELSET") or "").strip()
+        mat = (b.param("MATERIAL") or "").strip().upper()
+        sym = self._mat_symmetry.get(mat, "aniso")
+        if not elset or not mat or sym is None:
+            return None
+        name = (b.param("ORIENTATION") or "").strip().upper()
+        stack = self._stack_direction(b)
+        cyl = bool(name) and (not self._dist_ori[name]["rect"] if name in self._dist_ori else
+                              name in self.orientations and self.orientations[name][2].upper().startswith("CYL"))
+        rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]" = OrderedDict()
+        differs = False
+        for e in dedup(self.geom.elset(elset)):
+            if e not in self.geom.elements:
+                continue
+            typ, conn = self.geom.elements[e]
+            base = split_suffixes(typ)[0]
+            if base not in PLY_SOLID or len(conn) != ELEMENT_NNODES[base] or \
+                    any(x not in self.geom.nodes for x in conn):
+                return None
+            axis3 = self._stack_axis3(b, self._dist_refs, conn) \
+                if len(conn) == 8 and stack == "ORIENTATION" else None
+            order = self._stack_order(conn, stack, axis3) if len(conn) == 8 else tuple(range(1, 7))
+            pc = [conn[q - 1] for q in order]
+            n, centre = self._stack_geometry(pc[:len(pc) // 2], pc[len(pc) // 2:])
+            fr = self._abaqus_frame(e, name, centre) if name else None
+            if vnorm(n) < 0.5 or (name and fr is None):
+                return None
+            why = shell_axes_caveat(n, *fr) if fr else None
+            if why:
+                self.report.warn(f"*{b.keyword} {elset}: orientation {name}: {why} — verify the "
+                                 f"material directions.", once=True)
+            d1, d2 = shell_local_axes(n, *fr) if fr else shell_local_axes(n)
+            for p in [centre] + ([self.geom.nodes[x] for x in conn] if cyl else []):
+                got = self._ccx_frame(e, name, 0.0, p)
+                if got is None:
+                    return None
+                c1, c3 = vdot(got[0], d1), vdot(got[2], n)
+                differs = differs or (min(c1, c3) if sym == "aniso" else min(abs(c1), abs(c3))) < 1.0 - 1e-6
+            rows[e] = (tuple(_fmt_component(x) for x in (*d1, *d2)),)
+        return rows if differs else None
+
     def _plan_material_symmetry(self, blocks: List[Block]) -> None:
         """How each material depends on its axes (_mat_symmetry): None for isotropic cards only,
         "ortho" with orthotropic ones (the same after a half turn about a material axis), else
@@ -6595,15 +6657,26 @@ class Converter:
     def _plan_shell_axes(self, blocks: List[Block]) -> None:
         """The shell and membrane sections that need their material directions element group by
         element group (_shell_axes_rows; those with *DISTRIBUTION orientations were planned in
-        _plan_split), and the orientations no other card reads (_exact_only): a cylindrical
-        one's dropped rotation then loses nothing."""
+        _plan_split), the plain shell sections on continuum shells that need them element by
+        element (_continuum_axes_rows), and the orientations no other card reads
+        (_exact_only): a cylindrical one's dropped rotation then loses nothing."""
         only: Dict[str, bool] = {}
         for b in blocks:
             kw = b.keyword
             if kw in ("SHELL SECTION", "MEMBRANE SECTION") or (
                     kw == "SHELL GENERAL SECTION" and (b.has("MATERIAL") or b.has("COMPOSITE"))):
-                if not (id(b) in self._ply_sections or id(b) in self._dist_split or id(b) in self._exact_axes
-                        or self._continuum_shell_elset(b.param("ELSET"))):
+                if id(b) in self._ply_sections or id(b) in self._dist_split or id(b) in self._exact_axes:
+                    pass
+                elif self._continuum_shell_elset(b.param("ELSET")):
+                    rows = None if b.has("COMPOSITE") or kw == "MEMBRANE SECTION" else \
+                        self._continuum_axes_rows(b)
+                    if rows is not None:
+                        self._exact_axes[id(b)] = rows
+                        ori = (b.param("ORIENTATION") or "").strip().upper()
+                        if ori in self._dist_ori:          # its solid section names it no more
+                            self._dist_ori[ori]["solid"].difference_update(rows)
+                            self._dist_ori[ori]["split"] = True
+                else:
                     rows = self._shell_axes_rows(b)
                     if rows is not None:
                         self._exact_axes[id(b)] = rows
@@ -6670,6 +6743,37 @@ class Converter:
                              f"would project the turned axis 1 onto a shell and take a membrane's "
                              f"axes unprojected.", once=True)
         return out
+
+    def _continuum_axes_cards(self, b: Block, rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]",
+                              keep: "OrderedDict[str, Optional[str]]") -> List[str]:
+        """The *SOLID SECTION (parameters ``keep``) of a plain shell section on continuum shells
+        whose material directions go element by element (_continuum_axes_rows), a = direction
+        1 and b = direction 2, so that axis 3 is the stack direction: one *ORIENTATION where
+        every element has the same, else a *DISTRIBUTION with a line per element, which ccx
+        2.23 gives each element of a *SOLID SECTION."""
+        axes = OrderedDict((e, toks[0]) for e, toks in rows.items())
+        self._reserve_names()
+        params = OrderedDict(keep)
+        out: List[str] = []
+        if len(set(axes.values())) == 1:
+            tok = next(iter(axes.values()))
+            if tok not in self._exact_ori:
+                self._exact_ori[tok] = self._fresh_name(f"ABQ2CCX_AXES{len(self._exact_ori) + 1}")
+                out += [f"*ORIENTATION, NAME={self._exact_ori[tok]}", ", ".join(tok)]
+            params["ORIENTATION"] = self._exact_ori[tok]
+        else:
+            elset = (b.param("ELSET") or "").strip()
+            dname, oname = self._fresh_name(f"{elset}_AXES"), self._fresh_name(f"{elset}_ORI")
+            out += [f"*DISTRIBUTION, NAME={dname}"] + [f"{e}, " + ", ".join(tok) for e, tok in axes.items()] + \
+                [f"*ORIENTATION, NAME={oname}", dname]
+            params["ORIENTATION"] = oname
+        self.report.note(f"*{b.keyword} on continuum shells whose material directions ccx's solids "
+                         f"would place otherwise (the global axes off the x-y plane, an orientation's "
+                         f"axes unprojected, a cylindrical system at each integration point): Abaqus' "
+                         f"directions — the orientation projected onto the mid-surface, the stack "
+                         f"direction as direction 3 — given by one *ORIENTATION, or element by element "
+                         f"through a *DISTRIBUTION.", once=True)
+        return out + [emit_keyword("SOLID SECTION", params)]
 
     def handle_membrane_section(self, b: Block) -> List[str]:
         rows = self._exact_axes.get(id(b))
@@ -14279,6 +14383,52 @@ class Converter:
             plies = plies + plies[::-1]
         return plies or None
 
+    @staticmethod
+    def _stack_direction(b: Block) -> str:
+        """The STACK DIRECTION of a shell section on continuum shells: "1", "2", "3" (the
+        default) or "ORIENTATION"."""
+        stack = (b.param("STACK DIRECTION") or "3").strip().upper()
+        try:
+            return str(pint(stack))                    # "1." and the like
+        except ValueError:
+            return stack
+
+    def _stack_axis3(self, b: Block, dist_oris: set, conn: Sequence[int]) -> Optional[Vec]:
+        """For STACK DIRECTION=ORIENTATION, axis 3 of section ``b``'s orientation at the centre
+        of the element with nodes ``conn`` (a cylindrical system's turns with it), which
+        _stack_order stacks along; None (warned: the stack direction is direction 3) where it
+        has no fixed axes — undefined, or a distribution one (in ``dist_oris``)."""
+        ori = (b.param("ORIENTATION") or "").strip().upper()
+        if ori in self.orientations and ori not in dist_oris:
+            a, bb, system = self.orientations[ori]
+            centre = (0.0, 0.0, 0.0)
+            for x in conn:
+                centre = vadd(centre, vscale(self.geom.nodes[x], 1.0 / len(conn)))
+            return orientation_frame(a, bb, system, centre, self._orient_rotation.get(ori))[0][2]
+        self.report.warn(f"*{b.keyword} {(b.param('ELSET') or '').strip()}, STACK DIRECTION=ORIENTATION: "
+                         f"orientation '{ori}' has no fixed axes here (undefined, or given by a "
+                         f"distribution, which Abaqus does not allow there); the stack direction is "
+                         f"taken as direction 3.", once=True)
+        return None
+
+    def _stack_geometry(self, bottom: Sequence[int], top: Sequence[int]) -> Tuple[Vec, Vec]:
+        """The unit mid-surface normal of a continuum shell stacked from its ``bottom`` to its
+        ``top`` face (corner nodes, in the order of the bottom face), pointing from the bottom
+        to the top (zero for a degenerate element), and the centre of the mid-surface corners."""
+        P = self.geom.nodes
+        mids = [vscale(vadd(P[x], P[y]), 0.5) for x, y in zip(bottom, top)]
+        if len(mids) == 4:
+            n = vcross(vsub(mids[2], mids[0]), vsub(mids[3], mids[1]))
+        else:
+            n = vcross(vsub(mids[1], mids[0]), vsub(mids[2], mids[0]))
+        up = (0.0, 0.0, 0.0)
+        for x, y in zip(bottom, top):
+            up = vadd(up, vsub(P[y], P[x]))
+        centre = (0.0, 0.0, 0.0)
+        for q in mids:
+            centre = vadd(centre, vscale(q, 1.0 / len(mids)))
+        return vunit(vscale(n, -1.0) if vdot(n, up) < 0.0 else n), centre
+
     def _stack_order(self, conn: List[int], stack: str, frame3: Optional[Vec]) -> Tuple[int, ...]:
         """The HEX_STACK_ORDER of an 8-node continuum shell for STACK DIRECTION ``stack``; for
         ORIENTATION the isoparametric direction closest to the orientation's axis 3
@@ -14336,13 +14486,9 @@ class Converter:
                     continue
                 elems.append(e)
             taken.update(elems)
-            stack = (b.param("STACK DIRECTION") or "3").strip().upper()
-            try:
-                stack = str(pint(stack))                   # "1." and the like
-            except ValueError:
-                pass
             if elems:
-                plans.append(dict(block=b, elset=elset, plies=plies, elems=elems, stack=stack))
+                plans.append(dict(block=b, elset=elset, plies=plies, elems=elems,
+                                  stack=self._stack_direction(b)))
             else:
                 self._ply_unsplit[id(b)] = ("none of its elements can be split (undefined nodes, "
                                             "or another composite section took them)")
@@ -14382,21 +14528,11 @@ class Converter:
             for k in range(1, len(t)):
                 fr.append(sum(t[:k]) / sum(t))
             fr.append(1.0)
-            ori = (p["block"].param("ORIENTATION") or "").strip().upper()
-            axis3 = None
-            if p["stack"] == "ORIENTATION":
-                if ori in self.orientations and ori not in dist_oris:
-                    a, bb, system = self.orientations[ori]
-                    axis3 = orientation_frame(a, bb, system, (0.0, 0.0, 0.0),
-                                              self._orient_rotation.get(ori))[0][2]
-                else:
-                    self.report.warn(f"*SHELL SECTION {p['elset']}, STACK DIRECTION=ORIENTATION: "
-                                     f"orientation '{ori}' has no fixed axes here (undefined, or "
-                                     f"given by a distribution, which Abaqus does not allow there); "
-                                     f"stacked along direction 3.", once=True)
             for e in p["elems"]:
                 typ, conn = els[e]
                 hexa = len(conn) == 8
+                axis3 = self._stack_axis3(p["block"], dist_oris, conn) \
+                    if hexa and p["stack"] == "ORIENTATION" else None
                 order = self._stack_order(conn, p["stack"], axis3) if hexa else (1, 2, 3, 4, 5, 6)
                 pc = [conn[q - 1] for q in order]
                 nc = 4 if hexa else 3
@@ -14620,21 +14756,9 @@ class Converter:
         *ORIENTATION, rectangular or cylindrical at the element's centre, or a *DISTRIBUTION
         one with the element's own axes, each turned by its additional rotation first."""
         _order, bottom, top = plan["stack_of"][e]
-        P = self.geom.nodes
-        mids = [vscale(vadd(P[x], P[y]), 0.5) for x, y in zip(bottom, top)]
-        if len(mids) == 4:
-            n = vcross(vsub(mids[2], mids[0]), vsub(mids[3], mids[1]))
-        else:
-            n = vcross(vsub(mids[1], mids[0]), vsub(mids[2], mids[0]))
-        up = (0.0, 0.0, 0.0)
-        for x, y in zip(bottom, top):
-            up = vadd(up, vsub(P[y], P[x]))
-        n = vunit(vscale(n, -1.0) if vdot(n, up) < 0.0 else n)
+        n, center = self._stack_geometry(bottom, top)
         if not ori:
             return n, shell_local_axes(n)
-        center = (0.0, 0.0, 0.0)
-        for q in mids:
-            center = vadd(center, vscale(q, 1.0 / len(mids)))
         fr = self._abaqus_frame(e, ori, center)
         if fr is not None:
             why = shell_axes_caveat(n, *fr)

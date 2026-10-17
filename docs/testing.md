@@ -135,6 +135,8 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | `shell_axes_*` (generated) | an orthotropic ply on plain `S4R` shells and `M3D4` membranes under three uniform strains, an orientation turned about its axis 1 (and a membrane without one) in the x-y, x-z and y-z planes, and the plate's axes without a rotation line (Abaqus: direction 1 = axis 2) | the ply's t Q̄ at Abaqus' direction | 3e-7 (ccx alone: 0.9–1.0 off) |
 | `cylinder_hoop` (generated) | a cylindrical orientation on an `S4` cylinder under internal pressure, also turned about its axis 3 | thin-wall theory, fibres along the hoop | 0.35 % (ccx alone: 14× too soft) |
 | `distribution_panel_*` (generated) | a variable-angle-tow `S8R` strip whose `*DISTRIBUTION` b leaves the plate by 30°, in the x-y, x-z and y-z planes | the x-y strip with b in the plate | 7e-12 (ccx alone: 3.3e-2) |
+| `sc_axes_*` (generated) | the ply as a plain `SC8R` / `SC6R` section, thickness free: the orientation turned about its axis 1 in the x-y, x-z and y-z planes (also as a `*DISTRIBUTION`), the plate axes without a rotation line, none in x-z and y-z; an anisotropic ply stacked downwards | the ply's t Q̄ at Abaqus' direction; the anisotropic ply's plane-stress stiffness in Abaqus' axes | 3e-7 (ccx alone: 4e-2–0.99 off) |
+| `sc_cylinder_hoop` (generated) | a cylindrical orientation on an `SC8R` cylinder under internal pressure | thin-wall theory, fibres along the hoop | 0.10 % (ccx alone: 14× too soft) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`

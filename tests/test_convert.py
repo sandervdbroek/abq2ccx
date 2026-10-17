@@ -8314,6 +8314,182 @@ def test_material_symmetry_classes():
         dict(CFRP="ortho", ISO=None, EXP="ortho", HILL="ortho", COND="aniso", UM="aniso")
 
 
+def _placed(deck, place):
+    """``deck`` with the coordinates of its *Node lines mapped by ``place``."""
+    out, nodes = [], False
+    for line in deck.splitlines():
+        if line.startswith("*"):
+            nodes = line.lower() == "*node"
+        elif nodes:
+            f = line.split(",")
+            line = f[0] + "".join(f", {c:g}" for c in place(tuple(float(x) for x in f[1:4])))
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+SC8R_XZ = _placed(SC8R_STRIP, lambda p: (p[0], -p[2], p[1]))      # the strip in the x-z plane, normal -y
+ANISO_CFRP = ("*Elastic, type=ANISOTROPIC\n" + ", ".join(["100."] * 8) + "\n" + ", ".join(["10."] * 8)
+              + "\n" + ", ".join(["10."] * 5) + "\n")
+
+
+def test_continuum_shell_section_gets_abaqus_axes():
+    # a plain section on continuum shells runs as a *SOLID SECTION, whose orientation ccx 2.23
+    # takes unprojected (the global axes without one); Abaqus projects it onto the mid-surface,
+    # the stack direction as axis 3
+    sec = "*Shell Section, elset=PLATE, material=CFRP{}\n0.3\n"
+    body, _, _ = convert_str(SC8R_STRIP + sec.format(""))
+    assert "*SOLID SECTION, ELSET=PLATE, MATERIAL=CFRP" in body.splitlines() and "ABQ2CCX_AXES" not in body
+    # in the x-z plane direction 2 is z and the normal -y (ccx: y and z)
+    body, conv, rep = convert_str(SC8R_XZ + sec.format(""))
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, 0, 1"]
+    assert "*SOLID SECTION, ELSET=PLATE, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body
+    assert "on continuum shells whose material directions ccx's solids would place otherwise" in rep.text()
+    assert conv.reduced_physics == ["element SC8R -> C3D8I"]
+    body, _, _ = convert_str(SC8R_XZ.replace("*Shell Section", "*Shell General Section") + sec.format("")
+                             .replace("*Shell Section", "*Shell General Section"))
+    assert "MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body
+    # turned about axis 1, Abaqus projects axis 2 (y); turned about axis 3 it is ccx's axis 1
+    ori = "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n{}, 30.\n"
+    body, _, _ = convert_str(SC8R_STRIP + ori.format(1) + sec.format(", orientation=O"))
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 1, 0, -1, 0, 0"]
+    body, _, _ = convert_str(SC8R_STRIP + ori.format(3) + sec.format(", orientation=O"))
+    assert "ABQ2CCX_AXES" not in body and "*SOLID SECTION, ELSET=PLATE, MATERIAL=CFRP, ORIENTATION=O" in body
+    # without a rotation line Abaqus turns about axis 1, here in the plate: direction 1 is axis 2
+    body, _, rep = convert_str(SC8R_STRIP + "*Orientation, name=O\n1., 0., 0., 0., 1., 0.\n" + sec.format(", orientation=O"))
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["0, 1, 0, -1, 0, 0"]
+    assert "it has no rotation line, so Abaqus turns it about its axis 1" in rep.text()
+    # an isotropic material has no directions
+    iso = SC8R_XZ.replace("type=ENGINEERING CONSTANTS\n140000., 10000., 10000., 0.3, 0.3, 0.4, 5000., 5000.,\n"
+                          "3500.", "\n70000., 0.3")
+    body, _, _ = convert_str(iso + sec.format(""))
+    assert "ABQ2CCX_AXES" not in body
+    # stacked downwards: the global axes turned half about x, the same for an orthotropic
+    # material, not for an anisotropic one
+    down = SC8R_STRIP.replace("1, 1, 2, 5, 4, 11, 12, 15, 14\n2, 2, 3, 6, 5, 12, 13, 16, 15",
+                              "1, 11, 14, 15, 12, 1, 4, 5, 2\n2, 12, 15, 16, 13, 2, 5, 6, 3")
+    body, _, _ = convert_str(down + sec.format(""))
+    assert "ABQ2CCX_AXES" not in body
+    body, _, _ = convert_str(down.replace(COMPOSITE_MAT.split("\n", 1)[1], ANISO_CFRP) + sec.format(""))
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, -1, 0"]
+
+
+def test_continuum_shell_axes_follow_the_stack_direction():
+    # the x-z strip numbered with its thickness along the elements' direction 1: with STACK
+    # DIRECTION=1 its directions are the strip's own (x, z; normal -y); read along direction 3
+    # its normal would be z, whose shell axes x, y are ccx's own
+    order = A.HEX_STACK_ORDER[1]
+
+    def renumber(line):
+        f = [x.strip() for x in line.split(",")]
+        renum = [""] * 8
+        for pos, node in zip(order, f[1:]):
+            renum[pos - 1] = node
+        return ", ".join([f[0]] + renum)
+    lines = SC8R_XZ.splitlines()
+    i = lines.index("*Element, type=SC8R, elset=PLATE")
+    lines[i + 1], lines[i + 2] = renumber(lines[i + 1]), renumber(lines[i + 2])
+    deck = "\n".join(lines) + "\n*Shell Section, elset=PLATE, material=CFRP, stack direction=1\n0.3\n"
+    body, _, _ = convert_str(deck)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, 0, 1"]
+    body, _, _ = convert_str(deck.replace(", stack direction=1", ""))
+    assert "ABQ2CCX_AXES" not in body
+    # STACK DIRECTION=ORIENTATION: along the orientation's axis 3, -y, whose axes then agree
+    body, _, _ = convert_str(deck.replace("stack direction=1", "stack direction=ORIENTATION, orientation=O")
+                             + "*Orientation, name=O\n1., 0., 0., 0., 0., 1.\n3, 0.\n")
+    assert "ABQ2CCX_AXES" not in body and "MATERIAL=CFRP, ORIENTATION=O" in body
+    # an SC6R wedge is stacked from nodes 1-3 to 4-6
+    wedge = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 0., 1.\n4, 0., -0.1, 0.\n5, 1., -0.1, 0.\n"
+             "6, 0., -0.1, 1.\n*Element, type=SC6R, elset=W\n1, 1, 2, 3, 4, 5, 6\n" + COMPOSITE_MAT
+             + "*Shell Section, elset=W, material=CFRP\n0.1\n")
+    body, _, _ = convert_str(wedge)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, 0, 1"]
+    assert "*SOLID SECTION, ELSET=W, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body
+
+
+def test_continuum_shell_cylindrical_orientation_gets_axes_element_by_element():
+    # an SC8R ring stacked outward: the system's axis 1, radial, is the normal; Abaqus turns about
+    # it and projects axis 2 at the element's centre, ccx would take the system's axes (fibres
+    # radial) at each integration point and drop the rotation
+    pts = [(r, math.radians(a), z) for r in (1.0, 1.1) for z in (0.0, 1.0) for a in (0.0, 30.0, 60.0)]
+    nodes = "".join(f"{k + 1}, {r * math.cos(t):.9f}, {r * math.sin(t):.9f}, {z}\n" for k, (r, t, z) in enumerate(pts))
+    deck = (f"*Node\n{nodes}*Element, type=SC8R, elset=CYL\n1, 1, 2, 5, 4, 7, 8, 11, 10\n"
+            "2, 2, 3, 6, 5, 8, 9, 12, 11\n" + COMPOSITE_MAT
+            + "*Orientation, name=CYLO, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n1, 25.\n"
+            "*Shell Section, elset=CYL, material=CFRP, orientation=CYLO\n0.1\n")
+    body, conv, rep = convert_str(deck)
+    lines = _card_at(body, "*DISTRIBUTION, NAME=CYL_AXES")
+    t, r = math.radians(15.0), math.radians(25.0)
+    want = (1.0, -math.sin(t) * math.cos(r), math.cos(t) * math.cos(r), math.sin(r),     # direction 1
+            math.sin(t) * math.sin(r), -math.cos(t) * math.sin(r), math.cos(r))         # radial x it
+    vals = [float(x) for x in lines[0].split(",")]
+    assert len(lines) == 2 and len(vals) == 7 and max(abs(x - y) for x, y in zip(vals, want)) < 1e-6
+    assert _card_at(body, "*ORIENTATION, NAME=CYL_ORI") == ["CYL_AXES"]
+    assert "*SOLID SECTION, ELSET=CYL, MATERIAL=CFRP, ORIENTATION=CYL_ORI" in body
+    assert "the rotation applied" in rep.text() and conv.reduced_physics == ["element SC8R -> C3D8I"]
+    # on an annulus the system agrees with Abaqus' axes at the element centres, not across
+    # them: Abaqus takes them at the centre, ccx would at each integration point
+    pts = [(r * math.cos(math.radians(45.0 * i)), r * math.sin(math.radians(45.0 * i)), z)
+           for z in (0.0, 0.1) for r in (1.0, 2.0) for i in range(8)]
+    nodes = "".join(f"{k + 1}, {x:.9f}, {y:.9f}, {z}\n" for k, (x, y, z) in enumerate(pts))
+    elems = "".join(f"{i + 1}, {i + 1}, {i + 9}, {(i + 1) % 8 + 9}, {(i + 1) % 8 + 1}, {i + 17}, {i + 25}, "
+                    f"{(i + 1) % 8 + 25}, {(i + 1) % 8 + 17}\n" for i in range(8))
+    disk = (f"*Node\n{nodes}*Element, type=SC8R, elset=DISK\n{elems}" + COMPOSITE_MAT
+            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n3, 0.\n"
+            "*Shell Section, elset=DISK, material=CFRP, orientation=C\n0.1\n")
+    body, _, _ = convert_str(disk)
+    c, s = math.cos(math.radians(22.5)), math.sin(math.radians(22.5))
+    lines = _card_at(body, "*DISTRIBUTION, NAME=DISK_AXES")
+    assert len(lines) == 8 and max(abs(float(x) - y) for x, y in zip(lines[0].split(","), (1, c, s, 0, -s, c, 0))) < 1e-8
+
+
+def test_continuum_shell_distribution_orientation_gets_abaqus_axes():
+    # each element's distribution line turned about its axis 1: Abaqus projects the turned axis 2,
+    # ccx would take the turned axes as they are; the deck's distribution is then not needed
+    deck = (SC8R_STRIP + "*Distribution, name=D, location=ELEMENT, table=T\n, 1., 0., 0., 0., 1., 0.\n"
+            "2, 0., 1., 0., -1., 0., 0.\n*Distribution Table, name=T\ncoord3D, coord3D\n"
+            "*Orientation, name=O\nD\n1, 30.\n*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.3\n")
+    body, conv, rep = convert_str(deck)
+    assert _card_at(body, "*DISTRIBUTION, NAME=PLATE_AXES") == ["1, 0, 1, 0, -1, 0, 0", "2, -1, 0, 0, 0, -1, 0"]
+    assert "*SOLID SECTION, ELSET=PLATE, MATERIAL=CFRP, ORIENTATION=PLATE_ORI" in body
+    assert not {"*DISTRIBUTION, NAME=D", "*ORIENTATION, NAME=O"} & set(body.splitlines())
+    # turned about axis 3, ccx's per-element lines agree: the deck's distribution stays
+    body, _, _ = convert_str(deck.replace("1, 30.", "3, 30."))
+    assert "*DISTRIBUTION, NAME=D" in body.splitlines() and "MATERIAL=CFRP, ORIENTATION=O" in body
+
+
+def test_continuum_shell_distribution_orientation_shared_with_other_cards():
+    # a C3D8 solid on the same distribution orientation keeps its line in the deck's distribution
+    # (the continuum shells have their own), and a card that is no section still finds it
+    deck = (SC8R_STRIP + "*Node\n21, 3., 0., 0.\n22, 4., 0., 0.\n23, 4., 1., 0.\n24, 3., 1., 0.\n"
+            "25, 3., 0., 1.\n26, 4., 0., 1.\n27, 4., 1., 1.\n28, 3., 1., 1.\n*Element, type=C3D8, elset=BLOCK\n"
+            "3, 21, 22, 23, 24, 25, 26, 27, 28\n*Distribution, name=D, location=ELEMENT, table=T\n"
+            ", 1., 0., 0., 0., 1., 0.\n3, 0., 1., 0., -1., 0., 0.\n*Distribution Table, name=T\ncoord3D, coord3D\n"
+            "*Orientation, name=O\nD\n1, 30.\n*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.3\n")
+    body, _, _ = convert_str(deck + "*Solid Section, elset=BLOCK, material=CFRP, orientation=O\n")
+    lines = _card_at(body, "*DISTRIBUTION, NAME=D")
+    assert lines[0].startswith(", ") and [ln.split(",")[0] for ln in lines[1:]] == ["3"]
+    assert "*SOLID SECTION, ELSET=PLATE, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body   # both: default line
+    body, _, rep = convert_str(deck + "*Element, type=SPRING2, elset=SPR\n50, 3, 13\n"
+                               "*Spring, elset=SPR, orientation=O\n1, 1\n100.\n")
+    assert {"*DISTRIBUTION, NAME=D", "*ORIENTATION, NAME=O"} <= set(body.splitlines())
+    assert "*SPRING, ELSET=SPR, ORIENTATION=O" in body and "MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body
+
+
+def test_continuum_shell_stack_along_a_cylindrical_orientation():
+    # STACK DIRECTION=ORIENTATION takes the orientation's axis 3 at each element's centre: a
+    # cylindrical system turned about its axis 2 has it radial, so the plies stack outward
+    pts = [(r, math.radians(a), z) for r in (1.0, 1.1) for z in (0.0, 1.0) for a in (0.0, 30.0, 60.0)]
+    nodes = "".join(f"{k + 1}, {r * math.cos(t):.9f}, {r * math.sin(t):.9f}, {z}\n" for k, (r, t, z) in enumerate(pts))
+    deck = (f"*Node\n{nodes}*Element, type=SC8R, elset=CYL\n1, 1, 2, 5, 4, 7, 8, 11, 10\n"
+            "2, 2, 3, 6, 5, 8, 9, 12, 11\n" + COMPOSITE_MAT
+            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n2, 90.\n"
+            "*Shell Section, elset=CYL, composite, stack direction=ORIENTATION, orientation=C\n"
+            "1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n")
+    _, conv, _ = convert_str(deck)
+    g = conv.geom
+    assert {round(math.hypot(*g.nodes[n][:2]), 9) for n in g.nodes if n > 12} == {1.05}
+
+
 def test_composite_examples_match_the_validation_decks():
     import validate_with_ccx as V
     for name, text in (("composite_plate_s4r", V.composite_plate_deck("s4r")),

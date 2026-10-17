@@ -21,10 +21,10 @@ NaN results, which the solve judge must find in the .dat and the .frd), the natu
 frequencies and buckling loads of planar (B21) beams with a rectangular and a circular
 section, per-element *DISTRIBUTION
 orientations (a C3D8 plate and a composite S8R panel) against the same models written with
-one orientation per element, the material axes of plain shells and membranes whose
-orientation leaves their plane or has no rotation line (the ply's stiffness at Abaqus'
-direction), of a hoop-wound
-cylinder (thin-wall theory) and of a fibre-steered strip whose distribution axes leave the
+one orientation per element, the material axes of plain shells, membranes and continuum
+shells whose orientation leaves their plane or has no rotation line (the ply's stiffness at
+Abaqus' direction), of hoop-wound S4 and SC8R cylinders (thin-wall theory) and of a
+fibre-steered strip whose distribution axes leave the
 plate (the same strip with them in it), a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, the thermal strains of isotropic materials with an orthotropic / anisotropic
 expansion (including the engineering shear coefficients of an anisotropic one), a heated
@@ -695,6 +695,9 @@ def frd_last(frd_path, name):
 # nu = 0.25): E1, E2, E3, nu12, nu13, nu23, G12, G13, G23
 PAGANO_PLY = (250000., 10000., 10000., 0.25, 0.25, 0.25, 5000., 5000., 2000.)
 INPLANE_PLY = (140000., 10000., 10000., 0.3, 0.3, 0.45, 5000., 5000., 3450.)
+# INPLANE_PLY's plane-stress constants with other through-thickness ones: a solid ply whose
+# material axis 2 or 3 leaves the plate is stiffer or softer in it than t Qbar
+SC_PLY = (140000., 10000., 4000., 0.3, 0.2, 0.45, 5000., 3000., 2000.)
 
 
 def _matmul(a, b):
@@ -923,13 +926,14 @@ def composite_inplane_deck(kind="s4r", plane="XY", n=2):
     return "\n".join(lines) + "\n"
 
 
-def laminate_a_reactions(plane="XY", plies=(30, -60, 45, 45, -60, 30)):
+def laminate_a_reactions(plane="XY", plies=(30, -60, 45, 45, -60, 30), q=None):
     """The edge reactions composite_inplane_deck's three steps must give (classical lamination
-    theory, layers 0.1 thick at the angles ``plies`` in the plate): per step, the totals (fx,
-    fy, fz) on the edges x = 1 and y = 1 in global axes."""
+    theory, layers 0.1 thick at the angles ``plies`` in the plate, or one layer of plane-stress
+    stiffness ``q``): per step, the totals (fx, fy, fz) on the edges x = 1 and y = 1 in global
+    axes."""
     a = [0.0] * 6
-    for ang in plies:
-        a = [x + 0.1 * q for x, q in zip(a, reduced_stiffness(ang, INPLANE_PLY))]
+    for qs in [q] if q else [reduced_stiffness(ang, INPLANE_PLY) for ang in plies]:
+        a = [x + 0.1 * y for x, y in zip(a, qs)]
     a11, a22, a12, a66, a16, a26 = (x * 1e-3 for x in a)
     steps = [((a11, a16), (a16, a12)), ((a12, a26), (a26, a22)), ((a16, a66), (a66, a26))]
     return [plate_place(plane)((fx, fy, 0.0)) for xe, ye in steps for fx, fy in (xe, ye)]
@@ -1022,6 +1026,171 @@ def shell_axes_angle(plane, orient=True):
     ori = dict(a=place(axes["a"]), b=place(axes["b"]), rot=axes["rot"]) if orient else None
     d = abaqus_shell_direction(place((0.0, 0.0, 1.0)), ori)
     return math.degrees(math.atan2(_dot(d, place((0.0, 1.0, 0.0))), _dot(d, place((1.0, 0.0, 0.0)))))
+
+
+def sc_axes_inplane_deck(kind="sc8r", plane="XY", orient=True, n=2, dist=False, aniso=False):
+    """shell_axes_inplane_deck's patch as continuum shells 0.1 thick (SC8R, or SC6R wedges)
+    with a plain *SHELL SECTION of SC_PLY: every node gets the in-plane displacements of the
+    three uniform strains and the thickness is free (composite_inplane_deck), so the edge
+    reactions are t Qbar of the ply at Abaqus' material direction where its axis 3 is the
+    stack direction.  The orientation is TILTED_AXES, the dict ``orient`` or none; ``dist``
+    gives it as a *DISTRIBUTION, every other element's line turned half about the plate normal
+    (the same directions for the orthotropic ply); ``aniso`` stacks SC8R elements downwards,
+    without an orientation, on SC_ANISO (aniso_patch_reactions)."""
+    eps, place = 1e-3, plate_place(plane)
+    nid = lambda i, j, k: 1 + i + (n + 1) * j + (n + 1) ** 2 * k      # noqa: E731
+    typ = {"sc8r": "SC8R", "sc6r": "SC6R"}[kind]
+    lines = ["*Heading",
+             f"In-plane stiffness of an orthotropic ply, plain {typ} shell section in the {plane} "
+             f"plane: three uniform strain states",
+             "** Every node gets the in-plane displacements of a uniform strain (eps_x, eps_y, "
+             "gamma_xy = 1e-3 of the plate, one step each)",
+             "** and the thickness is free, so the reactions on the edges x = 1 and y = 1 are the "
+             "ply's t Qbar times 1e-3 at Abaqus' direction.", "*Node"]
+    for k in range(2):
+        for j in range(n + 1):
+            for i in range(n + 1):
+                z = 0.1 * (1 - k if aniso else k)
+                lines.append(f"{nid(i, j, k)}, " + ", ".join(f"{c:.12g}" for c in place((i / n, j / n, z))))
+    lines.append(f"*Element, type={typ}, elset=PATCH")
+    e = 0
+    for j in range(n):
+        for i in range(n):
+            q = [(i, j), (i, j + 1), (i + 1, j + 1), (i + 1, j)] if aniso else \
+                [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
+            b, t = [nid(*p, 0) for p in q], [nid(*p, 1) for p in q]
+            for conn in ([b + t] if kind == "sc8r" else
+                         [[b[0], b[1], b[2], t[0], t[1], t[2]], [b[0], b[2], b[3], t[0], t[2], t[3]]]):
+                e += 1
+                lines.append(f"{e}, " + ", ".join(map(str, conn)))
+    lines += ["*Nset, nset=XEDGE"] + _ids([nid(n, j, k) for k in range(2) for j in range(n + 1)])
+    lines += ["*Nset, nset=YEDGE"] + _ids([nid(i, n, k) for k in range(2) for i in range(n + 1)])
+    lines += ["*Material, name=PLY"]
+    if aniso:
+        d = SC_ANISO
+        vals = [d[r][c] for c in range(6) for r in range(c + 1)]     # D1111, D1122, D2222, ...
+        lines += ["*Elastic, type=ANISOTROPIC"] + [", ".join(f"{v:.12g}" for v in vals[i:i + 8])
+                                                   for i in range(0, 21, 8)]
+    else:
+        e1, e2, e3, n12, n13, n23, g12, g13, g23 = SC_PLY
+        lines += ["*Elastic, type=ENGINEERING CONSTANTS",
+                  f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}"]
+    sec = "*Shell Section, elset=PATCH, material=PLY"
+    if orient:
+        axes = TILTED_AXES if orient is True else orient
+        a, b = place(axes["a"]), place(axes["b"])
+        if dist:
+            half = [place((-x, -y, z)) for x, y, z in (axes["a"], axes["b"])]
+            lines += ["*Distribution, name=TILTED_D, location=ELEMENT, table=TILTED_T",
+                      ", " + ", ".join(f"{c:.12g}" for c in (*a, *b))]
+            lines += [f"{k}, " + ", ".join(f"{c:.12g}" for c in ((*half[0], *half[1]) if k % 2 else (*a, *b)))
+                      for k in range(1, e + 1)]
+            lines += ["*Distribution Table, name=TILTED_T", "coord3D, coord3D",
+                      "*Orientation, name=TILTED", "TILTED_D"]
+        else:
+            lines += ["*Orientation, name=TILTED", ", ".join(f"{c:.12g}" for c in (*a, *b))]
+        lines += ["{}, {:g}".format(*axes["rot"])] if axes["rot"] else []
+        sec += ", orientation=TILTED"
+    lines += [sec, "0.1"]
+    normal = [abs(c) for c in place((0.0, 0.0, 1.0))].index(1.0) + 1
+    dofs = [d for d in (1, 2, 3) if d != normal]
+    for name, field in (("eps_x", lambda x, y: (eps * x, 0.0)), ("eps_y", lambda x, y: (0.0, eps * y)),
+                        ("gamma_xy", lambda x, y: (eps / 2 * y, eps / 2 * x))):
+        lines += [f"*Step, name={name}", "*Static", "*Boundary, op=NEW"]
+        for k in range(2):
+            for j in range(n + 1):
+                for i in range(n + 1):
+                    u = place((*field(i / n, j / n), 0.0))
+                    lines += [f"{nid(i, j, k)}, {d}, {d}, {u[d - 1]:.12g}" for d in dofs]
+        lines += [f"1, {normal}, {normal}, 0.", "*Node print, nset=XEDGE, totals=ONLY", "RF",
+                  "*Node print, nset=YEDGE, totals=ONLY", "RF", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+VOIGT = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))    # Abaqus / ccx order 11 22 33 12 13 23
+
+
+def _ortho_stiffness6(props):
+    """The 6 x 6 stiffness (VOIGT order, engineering shear strains) of engineering constants."""
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = props
+    s = [[1 / e1, -n12 / e1, -n13 / e1], [-n12 / e1, 1 / e2, -n23 / e2], [-n13 / e1, -n23 / e2, 1 / e3]]
+    cols = [_solve(s, [float(i == j) for i in range(3)]) for j in range(3)]
+    c = [[0.0] * 6 for _ in range(6)]
+    for i in range(3):
+        for j in range(3):
+            c[i][j] = cols[j][i]
+    c[3][3], c[4][4], c[5][5] = g12, g13, g23
+    return c
+
+
+def _turned_stiffness(c6, q):
+    """The 6 x 6 stiffness ``c6`` of a material whose axes are the columns of ``q``, in the axes
+    those columns are given in."""
+    idx = {}
+    for k, (i, j) in enumerate(VOIGT):
+        idx[(i, j)] = idx[(j, i)] = k
+    r = range(3)
+    return [[sum(q[i][a] * q[j][b] * q[k][c] * q[m][d] * c6[idx[(a, b)]][idx[(c, d)]]
+                 for a in r for b in r for c in r for d in r) for (k, m) in VOIGT] for (i, j) in VOIGT]
+
+
+def _plane_stress(c6):
+    """(Q11, Q22, Q12, Q66, Q16, Q26) of the 6 x 6 stiffness ``c6`` where sigma_33, tau_13 and
+    tau_23 vanish (a free thickness)."""
+    io, oo = (0, 1, 3), (2, 4, 5)
+    q = {}
+    for a in io:
+        x = _solve([[c6[r][s] for s in oo] for r in oo], [c6[r][a] for r in oo])
+        for b in io:
+            q[(b, a)] = c6[b][a] - sum(c6[b][r] * xr for r, xr in zip(oo, x))
+    return q[(0, 0)], q[(1, 1)], q[(0, 1)], q[(3, 3)], q[(0, 3)], q[(1, 3)]
+
+
+# SC_PLY with its fibres turned 30 degrees about axis 3 of the material axes: an anisotropic
+# (monoclinic) ply whose couplings change sign when axis 2 is reversed
+_c30, _s30 = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+SC_ANISO = _turned_stiffness(_ortho_stiffness6(SC_PLY), [[_c30, -_s30, 0.0], [_s30, _c30, 0.0], [0.0, 0.0, 1.0]])
+
+
+def aniso_patch_reactions(plane="XY"):
+    """The edge reactions of sc_axes_inplane_deck(aniso=True): Abaqus' material axes of the
+    downward stack are the plate's x, -y and -z (2017 "Conventions"), so SC_ANISO's in-plane
+    couplings act reversed (ccx's global axes would keep them)."""
+    c = _turned_stiffness(SC_ANISO, [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+    return laminate_a_reactions(plane, q=_plane_stress(c))
+
+
+def sc_cylinder_hoop_deck(n=24, m=2, t=0.01):
+    """cylinder_hoop_deck's cylinder as one layer of SC8R continuum shells (mean radius 1,
+    thickness t, stacked outward) of SC_PLY with the cylindrical *ORIENTATION, internal pressure
+    1 on the inner face: Abaqus projects the system's axis 2, the hoop direction, onto the
+    mid-surface, so thin-wall theory gives the mid-surface radial displacement r_i / (E1 t)."""
+    nid = lambda i, j, k: 1 + i % n + n * j + n * (m + 1) * k      # noqa: E731
+    lines = ["*Heading", "Thin open cylinder of a hoop-wound orthotropic ply under internal "
+             "pressure: SC8R continuum shells with a cylindrical *Orientation", "*Node"]
+    for k, r in enumerate((1.0 - t / 2, 1.0 + t / 2)):
+        for j in range(m + 1):
+            for i in range(n):
+                th = 2 * math.pi * i / n
+                lines.append(f"{nid(i, j, k)}, {r * math.cos(th):.12g}, {r * math.sin(th):.12g}, {j / m:.12g}")
+    lines.append("*Element, type=SC8R, elset=CYL")
+    for j in range(m):
+        for i in range(n):
+            q = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
+            lines.append(f"{1 + i + n * j}, " + ", ".join(str(nid(a, c, k)) for k in (0, 1) for a, c in q))
+    lines += ["*Nset, nset=BASE"] + _ids([nid(i, 0, k) for k in (0, 1) for i in range(n)])
+    lines += ["*Nset, nset=PROBE"] + _ids([nid(n // 8, m // 2, k) for k in (0, 1)])
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = SC_PLY
+    lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
+              f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}",
+              "*Orientation, name=HOOP, system=CYLINDRICAL", "0., 0., 0., 0., 0., 1.",
+              "*Shell Section, elset=CYL, material=PLY, orientation=HOOP", f"{t:g}",
+              "*Step", "*Static", "*Boundary", "BASE, 3, 3"]
+    for i, d in ((0, 2), (n // 2, 2), (n // 4, 1), (3 * n // 4, 1)):
+        lines += [f"{nid(i, 0, k)}, {d}, {d}" for k in (0, 1)]
+    lines += ["*Dload"] + [f"{e}, P1, 1." for e in range(1, n * m + 1)]      # the inner face
+    lines += ["*Node print, nset=PROBE", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
 
 
 def cylinder_hoop_deck(rotation="", n=24, m=2, t=0.01):
@@ -3207,6 +3376,53 @@ def main():
               f"fibres along the hoop {hoop:.6g} ({err * 100:.2f}% diff; turned about axis 3 by 25 "
               f"deg: {same:.1e} apart)")
         failures += 0 if ok else 1
+    # plain shell sections on continuum shells run as C3D8I / C3D6 solids, which ccx 2.23 gives
+    # their orientation's axes unprojected (the global ones without one); Abaqus projects it
+    # onto the mid-surface with the stack direction as axis 3
+    for tag, kind, plane, orient, extra in (
+            ("XY", "sc8r", "XY", True, ""), ("XZ", "sc8r", "XZ", True, ""), ("YZ", "sc8r", "YZ", True, ""),
+            ("XZ_default", "sc8r", "XZ", False, ""), ("YZ_default", "sc8r", "YZ", False, ""),
+            ("YZ", "sc6r", "YZ", True, ""), ("XZ_norot", "sc8r", "XZ", PLATE_AXES, ""),
+            ("XZ_dist", "sc8r", "XZ", True, "dist"), ("XY_down_aniso", "sc8r", "XY", False, "aniso")):
+        tag = f"sc_axes_{kind}_{tag}"
+        res = composite_run(sc_axes_inplane_deck(kind, plane, orient, dist=extra == "dist",
+                                                 aniso=extra == "aniso"), tag)
+        if res is None:
+            failures += 1
+            continue
+        if extra == "aniso":
+            want, ref = aniso_patch_reactions(plane), "an anisotropic ply's plane-stress stiffness in Abaqus' axes"
+            what = "no orientation, stacked downwards"
+        else:
+            theta = shell_axes_angle(plane, orient)
+            want, ref = laminate_a_reactions(plane, (theta,)), f"the ply's t Qbar at Abaqus' direction {theta:.2f} deg"
+            what = ("a *DISTRIBUTION orientation" if extra else "an orientation") + " turned about its axis 1" \
+                if orient is True else "the plate axes without a rotation line" if orient else "no orientation"
+        got = res[1]
+        scale = max(abs(x) for r in want for x in r)
+        err = max(abs(x - y) for r, g in zip(want, got) for x, y in zip(r, g)) / scale \
+            if len(got) == len(want) else math.inf
+        ok = err < 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (plain shell section on {kind.upper()}, {what}, {plane} "
+              f"plane, thickness free): edge reactions of three uniform strains vs {ref}, max difference "
+              f"{err:.1e} of the largest")
+        failures += 0 if ok else 1
+    res = composite_run(sc_cylinder_hoop_deck(), "sc_cylinder_hoop")
+    u = res[0] if res else {}
+    probe = [1 + 24 // 8 + 24 * (2 // 2) + 24 * 3 * k for k in (0, 1)]    # inner and outer node at 45 deg
+    if all(p in u for p in probe):
+        ur = sum(u[p][0] + u[p][1] for p in probe) / (2 * math.sqrt(2.0))
+        hoop = (1.0 - 0.005) / (SC_PLY[0] * 0.01)
+        err = abs(ur / hoop - 1)
+        ok = err < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  sc_cylinder_hoop (SC8R, cylindrical *ORIENTATION on a "
+              f"cylinder, internal pressure): mid-surface radial displacement {ur:.6g} vs thin-wall "
+              f"theory with the fibres along the hoop {hoop:.6g} ({err * 100:.2f}% diff)")
+        failures += 0 if ok else 1
+    else:
+        if res:                                    # solved, but without the probe nodes
+            print("FAIL  sc_cylinder_hoop: no displacement at the probe nodes")
+        failures += 1
     ref = None
     for plane, tilt in (("XY", 0.0), ("XY", 30.0), ("XZ", 30.0), ("YZ", 30.0)):
         res = composite_run(distribution_panel_deck(plane, tilt), f"distribution_panel_{plane}_{tilt:g}")
