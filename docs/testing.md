@@ -54,6 +54,9 @@ They cover:
   requests, numerical controls); `*NODE, SYSTEM=` coordinates and `*NODE` normals.
 * **Output** — the `.frd`/`.dat` mapping, output frequencies, preselected field and contact
   output, ccx's label lists.
+* **`--run`** — the `.frd`/`.dat` readers and the results digest on a cut-down job in ccx's
+  formats (`tests/fixtures/digest`), the ccx version check, an assembly's instance map
+  (offsets, renamed sets, the capped listing) and `--json`.
 
 Every bundled example is also converted and checked for referential consistency: no
 dangling set, surface, material, orientation or amplitude reference.
@@ -116,6 +119,7 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | the plane punch in explicit dynamics | `R2D2` skins at the increment the converter caps (ccx leaves this contact out of its estimate) | the punch given its motion node by node at that increment | exact |
 | a rigid `R2D2` segment and an `R3D4` facet on a spring | an element pressure `P` (on the `R2D2`: per unit depth) | p / k | exact |
 | a stretched cube with a `*USER MATERIAL` | named `UserMat` and `JohnsonCook_Steel` (renamed); with `--abaqus-umat`, small strain and NLGEOM | ccx stops: "no user material subroutine"; ccx's example UMAT: E ε, E ln(1 + ε) | —; exact; 1e-7 |
+| `planar_pinned_beam`, `beam_circ_cantilever`, `assembly_two_blocks` | the `--run` results digest: frequencies and buckling load, largest \|U\| (near the tip node of the expanded beam), the reaction at each support under its Abaqus name | the references above; statics (the applied load) | as above; 6 digits |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`

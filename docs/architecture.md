@@ -313,7 +313,8 @@ node/element ids, applies the instance transform (**translation then rotation**,
 Abaqus), and emits per-instance geometry/sets/sections. `make_namer()` produces
 collision-free set/surface names within CalculiX's 80-character limit (`CCX_NAME_LIMIT`),
 used consistently by both the definitions and the reference resolver (`resolve()` /
-`_resolve_field()`), so nothing de-syncs.
+`_resolve_field()`), so nothing de-syncs. Each instance's offsets, label ranges and renamed
+sets and surfaces go to `Report.instances`: the instance map of the report and of `--json`.
 
 ## Regenerating the reference docs
 

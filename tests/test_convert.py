@@ -7060,6 +7060,206 @@ def test_user_material_card_as_ccx_reads_it():
         "MATERIAL=Plain", "MATERIAL=Other") + "*MATERIAL, NAME=Other\n*ELASTIC\n1., 0.3\n")
     assert "*USER MATERIAL, CONSTANTS=2" in body and not conv.reduced_physics
 
+
+# --- --run: the results digest and the instance map -----------------------------------------
+# tests/fixtures/digest/job.{inp,frd,dat}: ccx's formats, cut down.  The Abaqus model is nodes
+# 1-12 and elements 1-2 (element 2 a shell that ccx writes expanded, as nodes 21-24); node 13
+# and element 3 (a knot beam, expanded as nodes 31-32) are the converter's.  Step 1 (*STATIC,
+# two increments), 2 (*FREQUENCY), 3 (*BUCKLE), 4 (*STATIC after *BOUNDARY, OP=NEW).
+DIGEST_JOB = os.path.join(ROOT, "tests", "fixtures", "digest", "job")
+
+
+def test_frd_and_dat_readers_on_a_fixture():
+    frd = DIGEST_JOB + ".frd"
+    index = A.frd_index(frd)
+    assert [(s, t, n) for s, t, n, _ in index] == [
+        (0, None, "NODES"), (0, None, "ELEMENTS"), (1, 0.5, "DISP"), (1, 1.0, "DISP"),
+        (1, 1.0, "STRESS"), (1, 1.0, "FORC"), (2, 12.5, "DISP"), (2, 30.25, "DISP"),
+        (4, 2.0, "DISP"), (4, 2.0, "FORC"), (4, 2.0, "SDV")]
+    rows = dict(A.frd_rows(frd, index[3][3]))
+    assert rows[23] == [0.012, 0.012, 0.1] and rows[13] == [0.0, 0.0, 5.0] and len(rows) == 17
+    assert dict(A.frd_rows(frd, index[0][3]))[24] == [0.0, 1.0, 1.05]          # coordinates
+    assert dict(A.frd_rows(frd, index[-1][3])) == {1: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]}
+    assert A._frd_element_nodes(frd, index[1][3], 2) == {31, 32}
+    blocks = list(A.dat_blocks(DIGEST_JOB + ".dat"))
+    assert [(s, t, n, time, len(r)) for s, t, n, time, r in blocks] == [
+        (1, "displacements", "TOP", 0.5, 4), (1, "forces", "RP", 0.5, 1),
+        (1, "total force", "CORNER", 0.5, 1), (1, "displacements", "TOP", 1.0, 4),
+        (1, "forces", "RP", 1.0, 1), (1, "total force", "CORNER", 1.0, 1),
+        (2, "E I G E N V A L U E   O U T P U T", "", None, 2),
+        (2, "P A R T I C I P A T I O N   F A C T O R S", "", None, 2),
+        (3, "B U C K L I N G   F A C T O R   O U T P U T", "", None, 2), (4, "stresses", "EALL", 2.0, 3)]
+    assert blocks[3][4][0] == [5, 0.0, 1e-101, 0.1]      # Fortran's 1.000000-101 (no E)
+    assert blocks[6][4][1] == [2, 0.3612546e5, 0.1900664e3, 30.25, 0.0]
+    assert list(A.dat_blocks(DIGEST_JOB + ".missing")) == [] and A.frd_index(DIGEST_JOB + ".missing") == []
+
+
+def test_results_digest_supports_from_the_deck():
+    deck = A._deck_steps(DIGEST_JOB + ".inp")
+    assert deck["max_node"] == 13 and deck["transformed"] == {11, 12}
+    assert deck["members"]("ALLBC") == [1, 2, 3, 4, 5, 6, 7, 8]          # nested names, GENERATE
+    one, two, _, four = deck["steps"]
+    assert [s["procedure"] for s in deck["steps"]] == ["STATIC", "FREQUENCY", "BUCKLE", "STATIC"]
+    # model-level BOT and the step's TOP / RP / SIDE; not the ROT NODE 10 (rotations)
+    assert list(one["targets"]) == ["BOT", "TOP", "RP", "SIDE"] and 10 not in one["held"]
+    assert one["held"][5] == {3} and one["held"][9] == {1, 2, 3} and one["targets"]["SIDE"] == {11: {1}, 12: {1}}
+    assert two["held"] == one["held"]                    # carried over
+    assert list(four["targets"]) == ["BOT"] and set(four["held"]) == {1, 2, 3, 4}   # OP=NEW
+
+
+def test_results_digest_on_a_fixture():
+    inst = [{"name": "I1", "part": "P", "node_offset": 0, "element_offset": 0, "nodes": [1, 12],
+             "elements": [1, 2], "names": {"BOTTOM": "BOT"}}]
+    d = A.ccx_results_digest(DIGEST_JOB, inst, (12, 2))
+    assert [e["step"] for e in d] == [1, 2, 3, 4]
+    s1 = d[0]
+    assert s1["procedure"] == "STATIC" and s1["time"] == 1.0
+    # the last increment's |U|, not t = 0.5's node 6; converter node 13 and the knot's 31-32
+    # left out; ccx's node 23, expanded from the shell, sits next to node 7
+    u = dict(s1["max_u"])
+    assert abs(u.pop("value") - math.sqrt(2 * 0.012 ** 2 + 0.1 ** 2)) < 1e-15
+    assert u == {"node": 23, "near": 7, "abaqus": "I1.7"}
+    assert s1["max_mises"] == {"value": 100.0, "node": 3, "abaqus": "I1.3"}
+    # RF over the DOFs each BC holds: TOP only in z (its x RF 0.4 is no reaction); RP from the
+    # .dat (no element: not in the .frd); CORNER's TOTALS=ONLY print; SIDE (local axes) left out
+    assert s1["rf"] == [{"set": "RP", "rf": [0.0, 0.0, -24.0]},
+                        {"set": "BOT", "rf": [0.0, 0.0, -12.0], "abaqus": "I1.BOTTOM"},
+                        {"set": "TOP", "rf": [0.0, 0.0, 12.0]},
+                        {"set": "CORNER", "rf": [-0.5, -1.5, -3.0]}]
+    assert d[1] == {"step": 2, "procedure": "FREQUENCY", "frequencies": [12.5, 30.25]}
+    assert d[2] == {"step": 3, "procedure": "BUCKLE", "buckling_factors": [3.5, 7.25]}
+    assert d[3]["max_mises"] == {"value": 40.0, "element": 1, "set": "EALL", "abaqus": "I1.1"}
+    assert d[3]["rf"] == [{"set": "BOT", "rf": [0.0, 0.0, -4.0], "abaqus": "I1.BOTTOM"}]
+    assert A.format_results_digest(d) == [
+        "  step 1 *STATIC, time 1: max |U| 0.1014 near node 7 [I1.7]; max Mises 100 at node 3 [I1.3]",
+        "    sum of RF: RP (0, 0, -24); BOT [I1.BOTTOM] (0, 0, -12); TOP (0, 0, 12); +1 more",
+        "  step 2 *FREQUENCY: 2 frequencies (cycles/time) 12.5, 30.25",
+        "  step 3 *BUCKLE: 2 buckling factors 3.5, 7.25",
+        "  step 4 *STATIC, time 2: max |U| 0.5 at node 7 [I1.7]; max Mises 40 in element 1 [I1.1] "
+        "(set EALL)",
+        "    sum of RF: BOT [I1.BOTTOM] (0, 0, -4)"]
+    # without the model's labels nothing is left out
+    d = A.ccx_results_digest(DIGEST_JOB)
+    assert d[0]["max_u"] == {"value": 5.0, "node": 13}
+    assert d[0]["max_mises"] == {"value": 2000.0, "node": 31, "near": 7}
+    assert d[3]["max_mises"]["element"] == 3
+
+
+def test_instance_map_of_two_blocks():
+    path = os.path.join(EXAMPLES, "assembly_two_blocks.inp")
+    body, conv, rep = convert(path)
+    assert rep.instances == [
+        {"name": "I1", "part": "BLOCK", "node_offset": 0, "element_offset": 0, "nodes": [1, 8],
+         "elements": [1, 1], "names": {"BOT": "I1_BOT", "TOPF": "I1_TOPF", "ALL": "I1_ALL"}},
+        {"name": "I2", "part": "BLOCK", "node_offset": 8, "element_offset": 1, "nodes": [9, 16],
+         "elements": [2, 2], "names": {"BOT": "I2_BOT", "TOPF": "I2_TOPF", "ALL": "I2_ALL"}}]
+    assert conv.model_labels == (16, 2)
+    g = reparse(body)
+    part = {1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 1, 0), 4: (0, 1, 0), 5: (0, 0, 1), 6: (1, 0, 1),
+            7: (1, 1, 1), 8: (0, 1, 1)}
+    for inst, shift in zip(rep.instances, (0.0, 2.0)):       # I2 is translated by x = 2
+        for n, (x, y, z) in part.items():                    # ccx label = Abaqus label + offset
+            assert g.nodes[n + inst["node_offset"]] == (x + shift, y, z)
+        assert sorted(g.nsets[inst["names"]["BOT"]]) == [n + inst["node_offset"] for n in (1, 2, 3, 4)]
+        assert g.elsets[inst["names"]["ALL"]] == [1 + inst["element_offset"]]
+    assert A.instance_label(rep.instances, 15) == "I2.7" and A.instance_label(rep.instances, 3) == "I1.3"
+    assert A.instance_label(rep.instances, 2, "element") == "I2.1"
+    assert A.instance_label(rep.instances, 17) is None
+    log = rep.text().splitlines()
+    assert log[-3:] == [
+        "Instances (ccx label = Abaqus label + offset; Abaqus Instance.name -> ccx name):",
+        "  I1 (part BLOCK): nodes 1-8 (+0), elements 1-1 (+0); BOT -> I1_BOT, TOPF -> I1_TOPF, ALL -> I1_ALL",
+        "  I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1); BOT -> I2_BOT, TOPF -> I2_TOPF, ALL -> I2_ALL"]
+    head = rep.header_comment_lines()
+    assert "**   I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1); BOT -> I2_BOT," in head
+    assert "**     TOPF -> I2_TOPF, ALL -> I2_ALL" in head       # wrapped between pairs
+
+
+def test_instance_map_of_rotated_instances():
+    body, conv, rep = convert(os.path.join(EXAMPLES, "assembly_rotated_instances.inp"))
+    i1, i2 = rep.instances
+    assert (i1["nodes"], i1["elements"], i2["nodes"], i2["elements"]) == ([1, 20], [1, 4], [21, 40], [5, 8])
+    assert (i2["node_offset"], i2["element_offset"]) == (20, 4)
+    assert i2["names"] == {"ROOT": "I2_ROOT", "TIP": "I2_TIP", "ALL": "I2_ALL", "TOPF": "I2_TOPF"}
+    # the part's sets keep their members, offset; the instance-qualified loads of the deck
+    # (I1.TIP, I2.TIP, I2.5, I2.TOPF) name the same ccx entities
+    g = reparse(body)
+    for inst in (i1, i2):
+        assert sorted(g.nsets[inst["names"]["ROOT"]]) == [n + inst["node_offset"] for n in (1, 6, 11, 16)]
+        assert sorted(g.nsets[inst["names"]["TIP"]]) == [n + inst["node_offset"] for n in (5, 10, 15, 20)]
+    assert "*CLOAD\nI1_TIP, 3, -0.25\nI2_TIP, 1, 0.5\n25, 2, -1.\n" in body      # I2.5: 5 + 20
+    assert "*SURFACE, TYPE=ELEMENT, NAME=I2_TOPF\nI2_ALL, S2\n" in body
+
+
+def test_instance_map_listing_is_capped():
+    part = ("*PART, NAME=P\n*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*ELEMENT, TYPE=T3D2, ELSET=E\n1, 1, 2\n"
+            + "".join(f"*NSET, NSET=S{k}\n1\n" for k in range(10)) + "*END PART\n*ASSEMBLY, NAME=A\n")
+    insts = "".join(f"*INSTANCE, NAME=I{k}, PART=P\n{k}., 0., 0.\n*END INSTANCE\n" for k in range(25))
+    _, _, rep = convert_str(part + insts + "*END ASSEMBLY\n")
+    assert len(rep.instances) == 25 and rep.instances[24]["node_offset"] == 48
+    lines = rep.instance_lines()
+    assert len(lines) == 22 and lines[-1] == "  ... and 5 more instance(s) (--json lists them all)"
+    assert lines[1].endswith("S7 -> I0_S7, +3 more")        # 10 sets and E: 8 names shown
+
+
+def test_json_has_the_instances_and_the_run():
+    import contextlib
+    import json
+    path = os.path.join(EXAMPLES, "assembly_two_blocks.inp")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert A.main([path, "--check", "--json"]) == 0
+    doc = json.loads(out.getvalue())
+    assert [i["name"] for i in doc["instances"]] == ["I1", "I2"] and "run" not in doc
+    # --run: what run_ccx returns lands under "run" and "results" (ccx itself: validate_with_ccx)
+    seen = {}
+
+    def fake_run(out_path, override, quiet, digest, instances, model):
+        seen.update(digest=digest, instances=instances, model=model)
+        return {"code": 0, "ccx": "ccx", "ccx_version": "2.23", "status": "solved",
+                "results": [{"step": 1, "time": 1.0}]}
+    real = A.run_ccx
+    A.run_ccx = fake_run
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert A.main([path, "--outdir", d, "--run", "--json", "--quiet"]) == 0
+    finally:
+        A.run_ccx = real
+    doc = json.loads(out.getvalue())
+    assert doc["run"] == {"ccx": "ccx", "ccx_version": "2.23", "status": "solved"}
+    assert doc["results"] == [{"step": 1, "time": 1.0}]
+    assert seen == {"digest": False, "instances": doc["instances"], "model": (16, 2)}
+
+
+def test_ccx_version_is_read_and_checked():
+    import contextlib
+    import subprocess
+
+    class Done:
+        def __init__(self, text):
+            self.stdout, self.stderr, self.returncode = text, "", 201
+    real = A.subprocess.run
+    calls = []
+    A.subprocess.run = lambda cmd, **kw: (calls.append(cmd), Done("\nThis is Version 2.21\n\n"))[1]
+    try:
+        assert A.ccx_version("/fake/ccx_221") == "2.21" and calls == [["/fake/ccx_221", "-v"]]
+        assert A.ccx_version("/fake/ccx_221") == "2.21" and len(calls) == 1      # asked once
+    finally:
+        A.subprocess.run = real
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        A._warn_ccx_version("/fake/ccx_221", "2.21")
+        A._warn_ccx_version("/fake/ccx_221", "2.21")             # once per executable
+        A._warn_ccx_version("/fake/ccx_223", "2.23")
+        A._warn_ccx_version("/fake/ccx_unknown", None)
+    lines = err.getvalue().splitlines()
+    assert len(lines) == 2 and "/fake/ccx_221 is ccx 2.21; abq2ccx targets ccx 2.22-2.23" in lines[0]
+    assert "could not tell which ccx version /fake/ccx_unknown is" in lines[1]
+    assert subprocess.run is real
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

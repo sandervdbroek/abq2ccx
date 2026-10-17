@@ -8,7 +8,8 @@
 * CalculiX (`ccx`) only to run the result. `--run` and `validate_with_ccx.py` take `$CCX`
   (`--run` also `--ccx PATH`), else look on `PATH`, then in FreeCAD (FreeCAD 1.1.4 ships ccx
   2.23), PrePoMax and bConverged installs on Windows, and in FreeCAD's macOS bundle and
-  Homebrew/MacPorts elsewhere.
+  Homebrew/MacPorts elsewhere. `--run` prints the version it runs and warns if it is not 2.22
+  or 2.23, the versions the converter targets.
 
 ## Command line
 
@@ -27,7 +28,7 @@ abq2ccx INPUT.inp [INPUT.inp ...] [options]               # the same, installed
 | `--check` | parse, convert and report; write nothing |
 | `--strict` | exit 3 if the conversion produced warnings or commented-out cards |
 | `--json` | print a machine-readable report on stdout |
-| `--run` | run CalculiX on the result |
+| `--run` | run CalculiX on the result and print a digest of its results |
 | `--ccx PATH` | the CalculiX executable for `--run` (`$CCX` works too) |
 | `--no-log`, `--quiet` | write no `.log` file; print no report on stderr |
 | `--version`, `-h` | version; help |
@@ -108,7 +109,13 @@ UMAT, and the option leaves it alone.
    equivalent and needs remodelling; the comment says how.
 4. **Run ccx and check the results.** Field output is in `<job>.frd`; history output for a
    set is in `<job>.dat`, as are node sets the `.frd` cannot show (beam and shell nodes —
-   ccx writes such models expanded to 3-D — and reference points). If ccx stops, see
+   ccx writes such models expanded to 3-D — and reference points). After a clean run,
+   `--run` prints a digest of each step to set beside your Abaqus results: the largest |U|
+   and von Mises stress and their node, the reaction (sum of RF) at each `*BOUNDARY`,
+   eigenfrequencies or buckling factors, the time reached
+   ([output reference](output-reference.md#results-digest---run)). In an assembly a ccx
+   label is the Abaqus label plus its instance's offset, as the report's instance map
+   lists, and the digest names nodes and sets `Instance.label`. If ccx stops, see
    [troubleshooting](troubleshooting.md). `python validate_with_ccx.py` checks your ccx
    end to end on the bundled examples.
 
@@ -177,7 +184,8 @@ result = abq2ccx.convert_file("model.inp", solid_dof=False, approximate=False, a
 
 result.text           # the converted deck, report header included
 result.body           # the deck lines without the header
-result.report         # .summary(), .entries: [(level, message)], .n_warnings, .n_notes
+result.report         # .summary(), .entries: [(level, message)], .n_warnings, .n_notes,
+                      # .instances: an assembly's instance map
 result.geometry       # the flattened, expanded model: .nodes, .elements, .nsets, .elsets
 result.ok             # False if nothing could be converted
 ```
@@ -186,7 +194,8 @@ The lower-level pieces are `read_blocks(path, report)` (parse, follow `*INCLUDE`
 `Converter(report, Options(solid_dof, approximate, abaqus_umat)).convert(blocks)`; the
 [architecture guide](architecture.md) describes them. `classify_ccx_run(returncode, stdout,
 stderr, job)` is the solve judge that `--run`, `validate_with_ccx.py` and the corpus tests
-share.
+share; `ccx_results_digest(job)` is the digest `--run` prints, and `frd_index`, `frd_rows`
+and `dat_blocks` read ccx's result files.
 
 ## What is and isn't converted
 

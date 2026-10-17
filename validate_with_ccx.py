@@ -45,9 +45,10 @@ the same model written flat, and rigid tools: a rigid flat punch (rigid elements
 the same face as an analytical surface) against the penalty contact law and a punch given
 the motion node by node, also turned under NLGEOM, a block tied to a turning rigid plate, a
 rigid plate's MASS and ROTARYI on springs against its frequencies, (--approximate) a
-faceted analytical sphere against Hertz, and user materials: renamed so ccx stops rather
-than run its own routines, and (--abaqus-umat) through ccx's Abaqus-UMAT interfaces, whose
-stock example UMAT gives E eps and E ln(1 + eps).
+faceted analytical sphere against Hertz, user materials: renamed so ccx stops rather than
+run its own routines, and (--abaqus-umat) through ccx's Abaqus-UMAT interfaces, whose stock
+example UMAT gives E eps and E ln(1 + eps); and the results digest of --run against the
+beam, buckling and statics references above.
 
     python validate_with_ccx.py
 
@@ -77,6 +78,7 @@ def find_ccx():
 
 
 def convert(path, out_inp, approximate=False, abaqus_umat=False):
+    """Convert ``path`` to ``out_inp``; returns the report and the converter."""
     rep = A.Report()
     blocks = A.read_blocks(path, rep)
     conv = A.Converter(rep, type("O", (), {"solid_dof": False, "approximate": approximate,
@@ -85,6 +87,7 @@ def convert(path, out_inp, approximate=False, abaqus_umat=False):
     text = "\n".join(rep.header_comment_lines() + body) + "\n"
     with open(out_inp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
+    return rep, conv
 
 
 def run_ccx(ccx, env, inp_path):
@@ -104,131 +107,61 @@ def run_ccx(ccx, env, inp_path):
 
 
 def frd_stress(frd_path, node):
-    """Extrapolated nodal stress vector at ``node`` from a ccx .frd file, or None."""
-    inblock = False
-    for ln in open(frd_path, encoding="utf-8"):
-        if "STRESS" in ln and ln.lstrip().startswith("-4"):
-            inblock = True
-            continue
-        if inblock:
-            if ln.startswith(" -3"):
-                break
-            if ln.startswith(" -1") and int(ln[3:13]) == node:
-                return [float(ln[13 + i * 12:13 + (i + 1) * 12]) for i in range(6)]
-    return None
+    """Extrapolated nodal stress vector at ``node`` from the first STRESS block of a ccx .frd
+    file, or None."""
+    first = next((off for _, _, name, off in A.frd_index(frd_path) if name == "STRESS"), None)
+    vals = dict(A.frd_rows(frd_path, first)).get(node) if first is not None else None
+    return vals[:6] if vals else None
 
 
 def frd_displacement_history(frd_path, node):
     """[(time, (ux, uy, uz))] of every DISP block of a ccx .frd file that lists ``node``,
     and the number of DISP blocks that list no node at all."""
-    found, empty, time, inblock, rows = [], 0, None, False, 0
-    if not os.path.exists(frd_path):
-        return found, empty
-    for ln in open(frd_path, encoding="utf-8"):
-        if ln.startswith("  100C"):
-            time = float(ln.split()[2])
-        elif ln.startswith(" -4") and ln[5:13].strip() == "DISP":
-            inblock, rows = True, 0
-        elif inblock and ln.startswith(" -1"):
-            rows += 1
-            if int(ln[3:13]) == node:
-                found.append((time, tuple(float(ln[13 + i * 12:25 + i * 12]) for i in range(3))))
-        elif inblock and ln.startswith(" -3"):
-            empty += rows == 0
-            inblock = False
-    return found, empty
+    blocks = frd_blocks(frd_path, "DISP")
+    return [(time, tuple(vals[node][:3])) for time, vals in blocks if node in vals], \
+        sum(1 for _, vals in blocks if not vals)
 
 
 def frd_blocks(frd_path, name):
     """[(time, {node: values})] of every .frd result block called ``name`` (DISP, FORC,
     STRESS, TOSTRAIN, VELO ...)."""
-    found, time, cur = [], None, None
-    if not os.path.exists(frd_path):
-        return found
-    for ln in open(frd_path, encoding="utf-8"):
-        if ln.startswith("  100C"):
-            time = float(ln[12:24])
-        elif ln.startswith(" -4"):
-            cur = {} if ln[5:13].strip() == name else None
-            if cur is not None:
-                found.append((time, cur))
-        elif cur is not None and ln.startswith(" -1"):
-            n = (len(ln.rstrip()) - 13) // 12
-            cur[int(ln[3:13])] = [float(ln[13 + i * 12:25 + i * 12]) for i in range(n)]
-        elif ln.startswith(" -3"):
-            cur = None
-    return found
+    return [(time, dict(A.frd_rows(frd_path, off))) for _, time, n, off in A.frd_index(frd_path)
+            if n == name]
+
+
+def dat_tables(dat_path, title):
+    """The rows of every .dat table or print block whose title starts with ``title``."""
+    return [rows for _, t, _, _, rows in A.dat_blocks(dat_path) if t.startswith(title)]
 
 
 def dat_displacements(dat_path):
     """{node: [ux, uy, uz]}: the last displacement *NODE PRINT wrote for each node in a ccx
     .dat file (empty if none; a transformed node counts only if printed with GLOBAL=YES)."""
-    found, inblock = {}, False
-    if not os.path.exists(dat_path):
-        return found
-    for ln in open(dat_path, encoding="utf-8"):
-        if ln.strip().startswith("displacements"):
-            inblock = True
-            continue
-        f = ln.split()
-        if inblock and len(f) == 4 and f[0].isdigit():
-            found[int(f[0])] = [float(x) for x in f[1:]]
-        elif inblock and f and not f[0].isdigit():
-            inblock = False
-    return found
+    return {int(r[0]): r[1:] for rows in dat_tables(dat_path, "displacements") for r in rows
+            if len(r) == 4}
 
 
 def dat_displacement_history(dat_path, node):
     """Every displacement (ux, uy, uz) printed for ``node`` by *NODE PRINT in a ccx .dat
     file, in order (one per printed increment)."""
-    found, inblock = [], False
-    if not os.path.exists(dat_path):
-        return found
-    for ln in open(dat_path, encoding="utf-8"):
-        if ln.strip().startswith("displacements"):
-            inblock = True
-            continue
-        f = ln.split()
-        if inblock and len(f) == 4 and f[0] == str(node):
-            found.append([float(x) for x in f[1:]])
-        elif inblock and f and not f[0].isdigit():
-            inblock = False
-    return found
+    return [r[1:] for rows in dat_tables(dat_path, "displacements") for r in rows
+            if len(r) == 4 and r[0] == node]
 
 
 def dat_el_stress(dat_path, elem):
     """Mean stress (sxx, syy, szz, sxy, sxz, syz) over the integration points of ``elem`` in
     the last *EL PRINT stress table of a ccx .dat file, or None."""
-    rows, inblock = [], False
-    if not os.path.exists(dat_path):
-        return None
-    for ln in open(dat_path, encoding="utf-8"):
-        if ln.strip().startswith("stresses"):
-            rows, inblock = [], True
-            continue
-        f = ln.split()
-        if inblock and len(f) == 8 and f[0] == str(elem):
-            rows.append([float(x) for x in f[2:]])
-        elif inblock and f and not f[0].isdigit():
-            inblock = False
+    rows = [r[2:] for r in (dat_tables(dat_path, "stresses") or [[]])[-1] if len(r) == 8 and r[0] == elem]
     return [sum(r[k] for r in rows) / len(rows) for k in range(6)] if rows else None
 
 
 def dat_el_scalar(dat_path, title):
     """{element: value at its first integration point} from the last *EL PRINT table of a
     scalar (PEEQ, DUCT) whose heading starts with ``title`` in a ccx .dat file."""
-    found, inblock = {}, False
-    if not os.path.exists(dat_path):
-        return found
-    for ln in open(dat_path, encoding="utf-8"):
-        if ln.strip().startswith(title):
-            found, inblock = {}, True
-            continue
-        f = ln.split()
-        if inblock and len(f) == 3 and f[0].isdigit():
-            found.setdefault(int(f[0]), float(f[2]))
-        elif inblock and f and not f[0].isdigit():
-            inblock = False
+    found = {}
+    for r in (dat_tables(dat_path, title) or [[]])[-1]:
+        if len(r) == 3:
+            found.setdefault(int(r[0]), r[2])
     return found
 
 
@@ -236,21 +169,8 @@ def dat_eigen_table(dat_path, title):
     """The rows of the first eigenvalue table titled ``title`` in a ccx .dat file: the
     frequencies (cycles/time) under "E I G E N V A L U E   O U T P U T", or the factors
     under "B U C K L I N G   F A C T O R   O U T P U T"."""
-    if not os.path.exists(dat_path):
-        return []
-    rows, inblock = [], False
-    for ln in open(dat_path, encoding="utf-8"):
-        if title in ln:
-            inblock = True
-            continue
-        f = ln.split()
-        if not inblock or not f:
-            continue
-        if f[0].isdigit() and len(f) in (2, 5):
-            rows.append(float(f[3] if len(f) == 5 else f[1]))
-        elif rows:
-            break
-    return rows
+    rows = (dat_tables(dat_path, title) or [[]])[0]
+    return [r[3] if len(r) == 5 else r[1] for r in rows if len(r) in (2, 5)]
 
 
 def dat_displacement(dat_path, node):
@@ -417,21 +337,9 @@ def global_twin(deck):
 def dat_history(dat_path, what, nset):
     """[(time, rows)] of every ``what`` block ("displacements", "total force") that *NODE
     PRINT wrote for ``nset`` in a ccx .dat file; rows are lists of floats (node id dropped)."""
-    out, rows = [], None
-    for ln in open(dat_path, encoding="utf-8") if os.path.exists(dat_path) else []:
-        s = ln.strip()
-        if s.startswith(what) and f"for set {nset.upper()} " in s:
-            rows = []
-            out.append((float(s.split()[-1]), rows))
-        elif rows is not None and s:
-            f = s.split()
-            try:
-                vals = [float(x) for x in f]
-            except ValueError:
-                rows = None
-                continue
-            rows.append(vals[1:] if len(vals) == 4 and what != "total force" else vals)
-    return out
+    return [(time, [r[1:] if len(r) == 4 and what != "total force" else r for r in rows])
+            for _, title, s, time, rows in A.dat_blocks(dat_path)
+            if title.startswith(what) and s == nset.upper()]
 
 
 # --- rigid tools: Abaqus decks built here, so that each variant differs only in the tool ----
@@ -684,16 +592,8 @@ def umat_cube_deck(name, nlgeom=False):
 
 def frd_last(frd_path, name):
     """{node: values} of the last ``name`` block (DISP, STRESS, ...) in a ccx .frd file."""
-    last, cur = {}, None
-    for ln in open(frd_path, encoding="utf-8") if os.path.exists(frd_path) else []:
-        if ln.startswith(" -4"):
-            cur = {} if ln.split()[1] == name else None
-        elif ln.startswith(" -1") and cur is not None:
-            n = (len(ln.rstrip()) - 13) // 12
-            cur[int(ln[3:13])] = [float(ln[13 + 12 * i:25 + 12 * i]) for i in range(n)]
-        elif ln.startswith(" -3") and cur is not None:
-            last, cur = cur, None
-    return last
+    blocks = frd_blocks(frd_path, name)
+    return blocks[-1][1] if blocks else {}
 
 
 def main():
@@ -915,6 +815,7 @@ def main():
     # (otherwise the free twist is a 0 Hz mode and the buckling factor meaningless): at the
     # pinned end, and on the circular section (a B32 in ccx) at the first element's middle
     # node — at the end node ccx 2.23 would lock the bending rotation as well (f1 1.46x).
+    beam_refs = {}
     for name, label, ei, rho_a in (
             ("planar_pinned_beam", "B21", 210000.0 * 20.0 * 40.0 ** 3 / 12, 7.85e-9 * 20.0 * 40.0),
             ("planar_pinned_circ_beam", "B21 + CIRC", 210000.0 * math.pi * 10.0 ** 4 / 4,
@@ -924,7 +825,7 @@ def main():
         d, status, out = run_ccx(ccx, env, inp)
         length = 1000.0
         c = math.sqrt(ei / rho_a) * math.pi / (2 * length ** 2)            # in-plane E I
-        refs = [c, 4 * c, math.pi ** 2 * ei / length ** 2]                 # f1, f2, Euler load
+        refs = beam_refs[name] = [c, 4 * c, math.pi ** 2 * ei / length ** 2]   # f1, f2, Euler load
         dat = os.path.join(d, "job.dat")
         got = (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")[:2]
                + dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")[:1]) \
@@ -2343,6 +2244,45 @@ def main():
         what = "ABAQUSNL, NLGEOM: E ln(1.001)" if nlgeom else "ABAQUS: E 0.001"
         print(f"{'PASS' if ok else 'FAIL'}  umat_abaqus_interface ({what}): a stock ccx runs its example "
               f"UMAT, S33 = {f'{s[2]:.4f}' if s else status} (reference {ref:.4f})")
+        failures += 0 if ok else 1
+
+    # --- the --run results digest (abq2ccx.ccx_results_digest) against the references above:
+    # the planar beam's frequencies and buckling load (beam theory, Euler), the circular-section
+    # cantilever's tip deflection (P L^3 / 3 E I; ccx writes the beam expanded, so its largest
+    # |U| is at a node next to the tip node 21), and the two-block assembly's reactions, which
+    # statics makes the applied load (-100 in z on I2.7), at the names Abaqus gives them.
+    for name in ("planar_pinned_beam", "beam_circ_cantilever", "assembly_two_blocks"):
+        inp = os.path.join(tmp, name + ".inp")
+        rep, conv = convert(os.path.join(EXAMPLES, name + ".inp"), inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dg = A.ccx_results_digest(os.path.join(d, "job"), rep.instances, conv.model_labels) \
+            if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if not dg:
+            print(f"FAIL  results digest ({name}): no digest ({status})")
+            failures += 1
+            continue
+        if name == "planar_pinned_beam":
+            got = [x for e in dg for x in e.get("frequencies", [])[:2] + e.get("buckling_factors", [])[:1]]
+            ok = len(got) == 3 and max(abs(g - r) / r for g, r in zip(got, beam_refs[name])) < 0.02
+            what = (f"f1, f2 = {got[0]:.2f}, {got[1]:.2f} Hz, buckling load {got[2]:.0f} (beam theory "
+                    + ", ".join(f"{r:.2f}" for r in beam_refs[name][:2])
+                    + f", Euler {beam_refs[name][2]:.0f})" if len(got) == 3 else str(dg))
+        elif name == "beam_circ_cantilever":
+            u, ref = dg[0].get("max_u", {}), 1.0 * 100.0 ** 3 / (3 * 1.0e5 * math.pi / 4)
+            ok = u.get("near") == 21 and abs(u["value"] - ref) / ref < 0.02
+            what = (f"max |U| {u.get('value', float('nan')):.4f} near node {u.get('near')} (beam "
+                    f"theory at node 21: {ref:.4f})")
+        else:
+            rf = {r.get("set"): r for r in dg[0].get("rf", [])}
+            u = dg[0].get("max_u", {})
+            ok = "FIX2" in rf and rf["FIX2"]["rf"][:2] == [0.0, 0.0] and \
+                abs(rf["FIX2"]["rf"][2] - 100.0) < 1e-3 and \
+                rf.get("FIX", {}).get("rf") == [0.0, 0.0, 0.0] and u.get("abaqus") == "I2.7"
+            what = (f"sum of RF on FIX2 {rf.get('FIX2', {}).get('rf')} (applied: -100 in z) and FIX "
+                    f"{rf.get('FIX', {}).get('rf')}; max |U| at node {u.get('node')} [{u.get('abaqus')}], "
+                    f"the loaded corner")
+        print(f"{'PASS' if ok else 'FAIL'}  results digest ({name}): {what}")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

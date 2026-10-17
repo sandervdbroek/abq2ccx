@@ -385,6 +385,9 @@ class Report:
         # what the ccx model drops or replaces of the Abaqus model (Converter._reduces;
         # kept here so deck reading, mesh generation and assembly flattening record it too)
         self.reduced: List[str] = []
+        # the instances of a flattened assembly (flatten_assembly): name, part, ccx label
+        # ranges, offsets and renamed sets and surfaces
+        self.instances: List[dict] = []
 
     def reduce(self, what: str) -> None:
         """Record reduced physics: ``what`` part of the Abaqus model the ccx model drops or
@@ -434,13 +437,37 @@ class Report:
             for i, chunk in enumerate(_wrap(msg, 66)):
                 prefix = f"** [{level}] " if i == 0 else "**          "
                 lines.append(prefix + chunk)
+        for line in self.instance_lines():
+            indent = (len(line) - len(line.lstrip())) * " "
+            for i, chunk in enumerate(_wrap(line.replace(" -> ", "\0"), 66)):   # keep pairs whole
+                lines.append("** " + indent + ("  " if i else "") + chunk.replace("\0", " -> "))
         lines.append("** ====================================================================")
         return lines
 
     def text(self) -> str:
-        if not self.entries:
-            return "No conversion issues were flagged.\n"
-        return "\n".join(f"[{level}] {msg}" for level, msg in self.entries) + "\n"
+        lines = [f"[{level}] {msg}" for level, msg in self.entries] or \
+            ["No conversion issues were flagged."]
+        return "\n".join(lines + self.instance_lines()) + "\n"
+
+    def instance_lines(self, limit: int = 20, names: int = 8) -> List[str]:
+        """The instance map of a flattened assembly (none for a flat deck): each instance's
+        ccx node and element labels with the offset added to its Abaqus labels, and its
+        renamed sets and surfaces; at most ``limit`` instances and ``names`` names each."""
+        if not self.instances:
+            return []
+        lines = ["Instances (ccx label = Abaqus label + offset; Abaqus Instance.name -> ccx name):"]
+        for inst in self.instances[:limit]:
+            spans = [f"{what} {rng[0]}-{rng[1]} (+{off})" if rng else f"no {what}" for what, rng, off in
+                     (("nodes", inst["nodes"], inst["node_offset"]),
+                      ("elements", inst["elements"], inst["element_offset"]))]
+            ren = [f"{a} -> {c}" for a, c in inst["names"].items()]
+            more = [f"+{len(ren) - names} more"] if len(ren) > names else []
+            lines.append(f"  {inst['name']} (part {inst['part']}): {', '.join(spans)}"
+                         + (f"; {', '.join(ren[:names] + more)}" if ren else ""))
+        if len(self.instances) > limit:
+            lines.append(f"  ... and {len(self.instances) - limit} more instance(s) (--json lists "
+                         f"them all)")
+        return lines
 
 
 def _wrap(text: str, width: int) -> List[str]:
@@ -2964,6 +2991,7 @@ class Converter:
         self._conn_plan: Dict[int, dict] = {}      # id(*CONNECTOR SECTION) -> its plan
         self._conn_beam: List[Tuple[int, int, int]] = []    # rigid links: (a, b, id(section))
         self._conn_knots: List[int] = []           # shell/beam nodes whose rotations they use
+        self.model_labels: Optional[Tuple[int, int]] = None    # set by convert()
         self._conn_bcs: List[str] = []             # their *BOUNDARY lines (held in every step)
         self._conn_held: set = set()               # (node, DOF) held at zero in every step
         self._conn_bc_dofs: set = set()            # (node, DOF) with a BC in any step
@@ -11219,6 +11247,11 @@ class Converter:
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         self.build_geometry(blocks)
         self._drop_surface_elements(raw, blocks)
+        # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
+        # beams, skins, slab layers, ...) are numbered above them (ccx_results_digest)
+        self.model_labels = (max(self.geom.nodes, default=0),
+                             max(list(self.geom.elements) + list(self._carriers) + list(self._conn),
+                                 default=0))
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
         self._find_planar_elements()            # before the beam upgrades below retype them
@@ -17362,7 +17395,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     'independent' ones put it inside *Instance...*End Instance), offset node/element ids
     past the running maxima, apply the instance translation+rotation, and remap its
     sets/sections/surfaces.  Returns ``(blocks, new_gmax_node, new_gmax_elem,
-    (node_off, elem_off))`` or ``None`` if the instance has no mesh."""
+    (node_off, elem_off), entry)`` with the instance's Report.instances entry, or ``None``
+    if the instance has no mesh."""
     geo_conv = Converter(report, options)
     geo_conv.build_geometry(parts.get(inst["part"], []) + inst["extra"])
     geo = geo_conv.geom
@@ -17408,10 +17442,13 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     for typ, edata in conns.items():
         out.append(mkblock("ELEMENT", [("TYPE", typ)], edata))
 
+    renamed: "OrderedDict[str, str]" = OrderedDict()       # Abaqus set/surface -> ccx name
     for sname, ids in geo.nsets.items():
-        out.append(set_block("NSET", namer(inst["name"], sname), [i + node_off for i in ids]))
+        renamed[sname] = namer(inst["name"], sname)
+        out.append(set_block("NSET", renamed[sname], [i + node_off for i in ids]))
     for sname, ids in geo.elsets.items():
-        out.append(set_block("ELSET", namer(inst["name"], sname), [i + elem_off for i in ids]))
+        renamed[sname] = namer(inst["name"], sname)
+        out.append(set_block("ELSET", renamed[sname], [i + elem_off for i in ids]))
 
     # per-instance sections / orientations / surfaces (remap names).  Use .get() (as the
     # build_geometry call above does): an independent instance can carry its own mesh while
@@ -17510,13 +17547,22 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                 nb.data[1] = ", ".join(namer(prefix, x.strip()) if x.strip() else ""
                                        for x in nb.data[1].split(","))
             out.append(nb)
-        elif b.keyword == "SURFACE" and (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES:
-            out.append(_place_analytic(b, prefix, namer, rotp))
         elif b.keyword == "SURFACE":
-            out.append(_remap_surface(b, prefix, namer, node_off, elem_off))
+            if (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES:
+                out.append(_place_analytic(b, prefix, namer, rotp))
+            else:
+                out.append(_remap_surface(b, prefix, namer, node_off, elem_off))
+            if b.param("NAME"):
+                renamed[b.param("NAME").strip().upper()] = out[-1].param("NAME")
         elif b.keyword in PART_CONSTRAINT_KW:
             out.append(_remap_part_constraint(b, prefix, namer, node_off, elem_off, rotv, rotp))
-    return out, gmax_node, gmax_elem, (node_off, elem_off)
+    eids = list(geo.elements) + list(geo_conv._conn)
+    entry = {"name": inst["name"], "part": inst["part"], "node_offset": node_off,
+             "element_offset": elem_off,
+             "nodes": [min(geo.nodes) + node_off, max(geo.nodes) + node_off] if geo.nodes else None,
+             "elements": [min(eids) + elem_off, max(eids) + elem_off] if eids else None,
+             "names": dict(renamed)}
+    return out, gmax_node, gmax_elem, (node_off, elem_off), entry
 
 
 def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Block]:
@@ -17664,8 +17710,9 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     constraints -> resolve leftover instance-qualified references."""
     report.note("Model uses *PART/*INSTANCE/*ASSEMBLY: flattened to a single global mesh — each "
                 "instance's nodes and elements numbered above the previous ones, its translation and "
-                "rotation applied, its sets, surfaces and sections renamed per instance "
-                "(validate_with_ccx.py assembly_rotated_instances: a turned instance with an oriented "
+                "rotation applied, its sets, surfaces and sections renamed per instance (the "
+                "instance map below lists the offsets and names; "
+                "validate_with_ccx.py assembly_rotated_instances: a turned instance with an oriented "
                 "orthotropic material, instance-qualified loads and a surface pressure solves "
                 "exactly like the same model written flat).", once=True)
     namer = make_namer(report)
@@ -17690,9 +17737,10 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
         res = _emit_instance(inst, parts, namer, report, options, gmax_node, gmax_elem)
         if res is None:
             continue
-        inst_blocks, gmax_node, gmax_elem, offs = res
+        inst_blocks, gmax_node, gmax_elem, offs, entry = res
         out.extend(inst_blocks)
         maps[inst["name"]] = offs
+        report.instances.append(entry)
 
     out.extend(_emit_assembly_blocks(assembly_blocks, maps, namer))
     out.extend(post)
@@ -18003,41 +18051,568 @@ def classify_ccx_run(returncode, stdout: str, stderr: str, job: Optional[str] = 
     return "nonfinite" if job and ccx_nonfinite_result(job) else "solved"
 
 
-def run_ccx(out_path: str, override: Optional[str], quiet: bool) -> int:
-    """Run CalculiX on a converted deck; 0 if the analysis solves with finite results (or
-    ccx accepts a mesh-only deck that has nothing to solve), 1 otherwise."""
+# ---------------------------------------------------------------------------
+# ccx results: .frd / .dat readers and the --run digest
+# ---------------------------------------------------------------------------
+
+
+def frd_index(path: str) -> List[Tuple[int, Optional[float], str, int]]:
+    """Every block of a ccx .frd file as ``(step, time, name, offset)``, in file order: the
+    node coordinates (name ``NODES``) and the elements (``ELEMENTS``), both step 0, and each
+    nodal result block (``DISP``, ``STRESS``, ``FORC``, ``NDTEMP``, ...) with the step of
+    the ``1PSTEP`` record before it (0 without one) and the value of its ``100C`` record:
+    the total time, or a mode's frequency or buckling factor.  frd_rows reads a block of
+    nodes at ``offset``.  Empty if the file cannot be read."""
+    found: List[Tuple[int, Optional[float], str, int]] = []
+    step, time, pos = 0, None, 0
+    try:
+        with open(path, "rb") as fh:
+            for ln in fh:
+                pos += len(ln)
+                if ln.startswith(b" -4"):
+                    found.append((step, time, ln[5:13].strip().decode("latin-1"), pos))
+                elif ln.startswith(b"  100C"):
+                    try:
+                        time = float(ln[12:24])
+                    except ValueError:
+                        time = None
+                elif ln.startswith(b"    1PSTEP"):
+                    f = ln.split()
+                    step = int(f[3]) if len(f) > 3 and f[3].isdigit() else step
+                elif ln.startswith((b"    2C", b"    3C")):
+                    found.append((0, None, "NODES" if ln[4:5] == b"2" else "ELEMENTS", pos))
+    except OSError:
+        return []
+    return found
+
+
+def _frd_numbers(ln: bytes) -> List[float]:
+    s = ln.rstrip()
+    return [float(s[i:i + 12]) for i in range(13, len(s) - 11, 12)]
+
+
+def frd_rows(path: str, offset: int) -> Iterator[Tuple[int, List[float]]]:
+    """``(node, values)`` for each node of the .frd block at ``offset`` (see frd_index): its
+    coordinates or result components, those of a ``-2`` continuation line included."""
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        node: Optional[int] = None
+        vals: List[float] = []
+        for ln in fh:
+            if ln.startswith(b" -1"):
+                if node is not None:
+                    yield node, vals
+                node, vals = int(ln[3:13]), _frd_numbers(ln)
+            elif ln.startswith(b" -2"):
+                vals.extend(_frd_numbers(ln))
+            elif ln.startswith(b" -3"):
+                break
+        if node is not None:
+            yield node, vals
+
+
+def _frd_element_nodes(path: str, offset: int, above: int) -> set:
+    """The nodes of the elements labelled above ``above`` in the .frd element block at
+    ``offset``: ccx writes a shell or beam expanded, under its own label."""
+    nodes: set = set()
+    take = False
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        for ln in fh:
+            if ln.startswith(b" -1"):
+                take = int(ln[3:13]) > above
+            elif ln.startswith(b" -2"):
+                if take:
+                    s = ln.rstrip()
+                    nodes.update(int(s[i:i + 10]) for i in range(3, len(s) - 9, 10))
+            elif ln.startswith(b" -3"):
+                break
+    return nodes
+
+
+_DAT_STEP_RE = re.compile(r"S T E P\s+(\d+)$")
+_DAT_TITLE_RE = re.compile(r"(?:[A-Z] ){3}")          # "E I G E N V A L U E   O U T P U T"
+
+
+def _dat_float(tok: str) -> float:
+    try:
+        return float(tok)
+    except ValueError:              # Fortran drops the E of a 3-digit exponent: 0.1234567-100
+        m = re.fullmatch(r"([-+]?[\d.]+)([-+]\d{3})", tok)
+        if not m:
+            raise
+        return float(f"{m.group(1)}E{m.group(2)}")
+
+
+def dat_blocks(path: str) -> Iterator[Tuple[int, str, str, Optional[float], List[List[float]]]]:
+    """Every table of a ccx .dat file as ``(step, title, set, time, rows)``, in order: the
+    print blocks, titled ``displacements``, ``stresses``, ``forces``, ``total force``, ...
+    with the set and time of their heading, and ccx's own tables, titled as printed
+    (``E I G E N V A L U E   O U T P U T``, ...) with set "" and time None.  ``rows`` are
+    the numbers of each line."""
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    step, cur = 0, None
+    with fh:
+        for ln in fh:
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                row = [_dat_float(x) for x in s.split()] if s[0] in "0123456789+-." else None
+            except ValueError:
+                row = None
+            if row is not None:
+                if cur is not None:
+                    cur[4].append(row)
+                continue
+            heading = " and time " in s or s.startswith("INCREMENT") or _DAT_TITLE_RE.match(s)
+            if cur is not None and (cur[4] or heading):       # text after its rows ends a table
+                yield cur[0], cur[1], cur[2], cur[3], cur[4]
+                cur = None
+            m = _DAT_STEP_RE.match(s)
+            if m:
+                step = int(m.group(1))
+            elif " and time " in s:
+                head, _, t = s.rpartition(" and time ")
+                try:
+                    time = _dat_float(t.split()[0])
+                except (ValueError, IndexError):
+                    time = math.nan
+                cur = [step, re.split(r" \(| for ", head, maxsplit=1)[0],
+                       head.split("for set ", 1)[1].split()[0] if "for set " in head else "", time, []]
+            elif _DAT_TITLE_RE.match(s):
+                cur = [step, s, "", None, []]
+        if cur is not None:
+            yield cur[0], cur[1], cur[2], cur[3], cur[4]
+
+
+def _deck_steps(path: str) -> Optional[dict]:
+    """What the results digest reads from a ccx deck: per *STEP its procedure and the DOFs
+    1-3 that the *BOUNDARY cards in effect hold (model-level BCs until an OP=NEW drops
+    them; not at a *RIGID BODY's ROT NODE, whose DOFs are rotations), at each node
+    (``held``) and per target node set or node (``targets``: {node: DOFs}); the nodes with
+    a *TRANSFORM, set members and the highest node label.  None if the deck cannot be
+    read."""
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    sets: Dict[str, list] = {}
+    segs: List[dict] = [{"procedure": None, "bcs": [], "new": False}]   # model data, the steps
+    rot: set = set()
+    transforms: List[str] = []
+    max_node, kw, params, cur = 0, "", OrderedDict(), None
+    with fh:
+        for raw in fh:
+            ln = raw.strip()
+            if not ln or ln.startswith("**"):
+                continue
+            if ln.startswith("*"):
+                kw, params = parse_keyword_line(ln)
+                name = (params.get("NSET") or "").strip().upper()
+                cur = sets.setdefault(name, []) if kw in ("NSET", "NODE") and name else None
+                if kw == "STEP":
+                    segs.append({"procedure": None, "bcs": [], "new": False})
+                elif kw in PROC_KW and len(segs) > 1 and not segs[-1]["procedure"]:
+                    segs[-1]["procedure"] = kw + (", EXPLICIT" if "EXPLICIT" in params else "")
+                elif kw == "BOUNDARY" and (params.get("OP") or "").strip().upper() == "NEW":
+                    segs[-1]["new"] = True
+                elif kw == "RIGID BODY" and (params.get("ROT NODE") or "").strip().isdigit():
+                    rot.add(int(params["ROT NODE"]))
+                elif kw == "TRANSFORM" and name:
+                    transforms.append(name)
+                continue
+            f = [x.strip() for x in ln.split(",")]
+            if kw == "NODE" and f[0].isdigit():
+                max_node = max(max_node, int(f[0]))
+                if cur is not None:
+                    cur.append(int(f[0]))
+            elif kw == "NSET" and cur is not None:
+                if "GENERATE" in params:
+                    try:
+                        a, b, inc = ([pint(x) for x in f if x] + [1])[:3]
+                        cur.extend(range(a, b + 1, max(inc, 1)))
+                    except ValueError:
+                        pass
+                else:
+                    cur.extend(int(x) if x.isdigit() else x.upper() for x in f if x)
+            elif kw == "BOUNDARY" and len(f) > 1 and f[1].isdigit():
+                d2 = int(f[2]) if len(f) > 2 and f[2].isdigit() else int(f[1])
+                segs[-1]["bcs"].append((f[0].upper(), int(f[1]), d2))
+    memo: Dict[str, List[int]] = {}
+
+    def members(name: str) -> List[int]:
+        if name not in memo:
+            memo[name] = []                             # a set that names itself: nothing more
+            memo[name] = [n for t in sets.get(name, [])
+                          for n in ([t] if isinstance(t, int) else members(t))]
+        return memo[name]
+    steps, active = [], list(segs[0]["bcs"])
+    for seg in segs[1:]:
+        active = list(seg["bcs"]) if seg["new"] else active + seg["bcs"]
+        held: Dict[int, set] = {}
+        targets: "OrderedDict[str, Dict[int, set]]" = OrderedDict()
+        for tgt, d1, d2 in active:
+            dofs = set(range(min(d1, d2), max(d1, d2) + 1)) & {1, 2, 3}
+            for n in ([int(tgt)] if tgt.isdigit() else members(tgt)) if dofs else ():
+                if n not in rot:
+                    targets.setdefault(tgt, {}).setdefault(n, set()).update(dofs)
+                    held.setdefault(n, set()).update(dofs)
+        steps.append({"procedure": seg["procedure"], "held": held, "targets": targets})
+    return {"steps": steps, "max_node": max_node, "members": members,
+            "transformed": {n for s in transforms for n in members(s)}}
+
+
+def _deck_nearest(path: str, points: Dict[int, List[float]],
+                  upto: Optional[int] = None) -> Dict[int, int]:
+    """For each point (keyed by anything) the nearest *NODE of a ccx deck (labelled ``upto``
+    at most, if given), the first on a tie."""
+    pts = [(k, (list(p) + [0.0, 0.0, 0.0])[:3]) for k, p in points.items()]
+    best: Dict[int, Tuple[float, int]] = {}
+    node = False
+    try:
+        fh = open(path, encoding="utf-8", errors="replace") if pts else None
+    except OSError:
+        fh = None
+    if fh is None:
+        return {}
+    with fh:
+        for raw in fh:
+            if raw.startswith("*"):
+                if not raw.startswith("**"):
+                    node = parse_keyword_line(raw.strip())[0] == "NODE"
+                continue
+            if not node:
+                continue
+            f = raw.split(",")
+            try:
+                n, x = int(f[0]), [pf(v) for v in f[1:4] if v.strip()] + [0.0, 0.0]
+            except ValueError:
+                continue
+            if upto is not None and n > upto:
+                continue
+            for k, p in pts:
+                d = (x[0] - p[0]) ** 2
+                if k in best and d >= best[k][0]:
+                    continue
+                d += (x[1] - p[1]) ** 2 + (x[2] - p[2]) ** 2
+                if k not in best or d < best[k][0]:
+                    best[k] = (d, n)
+    return {k: n for k, (_, n) in best.items()}
+
+
+def instance_label(instances: Sequence[dict], label: int, kind: str = "node") -> Optional[str]:
+    """``Instance.label``, the Abaqus name of a ccx node (or element, ``kind="element"``) of
+    a flattened instance (Report.instances); None outside the instances."""
+    rng, off = ("nodes", "node_offset") if kind == "node" else ("elements", "element_offset")
+    for inst in instances:
+        if inst[rng] and inst[rng][0] <= label <= inst[rng][1]:
+            return f"{inst['name']}.{label - inst[off]}"
+    return None
+
+
+def _mises(s: Sequence[float]) -> float:
+    return math.sqrt(0.5 * ((s[0] - s[1]) ** 2 + (s[1] - s[2]) ** 2 + (s[2] - s[0]) ** 2)
+                     + 3.0 * (s[3] ** 2 + s[4] ** 2 + s[5] ** 2))
+
+
+def _norm3(v: Sequence[float]) -> float:
+    return math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+
+
+def _largest(rows, measure) -> Optional[Tuple[float, int]]:
+    """``(value, label)`` of the row with the largest finite ``measure``, the first on a tie."""
+    best: Optional[Tuple[float, int]] = None
+    for label, vals in rows:
+        v = measure(vals)
+        if v > (best[0] if best else -1.0):
+            best = (v, label)
+    return best
+
+
+def _digest_step(entry: dict, frd: str, blocks, final, info: Optional[dict], deck,
+                 keep: Callable[[int], bool], keep_element: Callable[[int], bool]) -> None:
+    """Fill a step's digest entry (see ccx_results_digest) from its .frd blocks and the .dat
+    prints of its last increment (``final``); ``keep`` and ``keep_element`` pass the nodes
+    and elements of the Abaqus model."""
+    times = [b[1] for b in blocks if b[1] is not None] + [b[3] for b in final]
+    if times:
+        entry["time"] = max(times)
+    last = {b[2]: b[3] for b in blocks}                   # the step's last block of each name
+    # (key, .frd block, measure, its components, .dat title, the labels leading a .dat row:
+    # a node, or an element and an integration point)
+    for key, block, measure, width, title, lead in (("max_u", "DISP", _norm3, 3, "displacements", 1),
+                                                    ("max_mises", "STRESS", _mises, 6, "stresses", 2)):
+        if block in last:
+            best = _largest(((n, v) for n, v in frd_rows(frd, last[block]) if len(v) >= width and keep(n)),
+                            measure)
+            if best:
+                entry[key] = {"value": best[0], "node": best[1]}
+            continue
+        found: Optional[Tuple[float, int, str]] = None
+        for b in final:
+            for r in b[4] if b[1] == title else ():
+                if len(r) == lead + width and (keep if lead == 1 else keep_element)(int(r[0])):
+                    v = measure(r[lead:])
+                    if v > (found[0] if found else -1.0):
+                        found = (v, int(r[0]), b[2])
+        if found:
+            entry[key] = {"value": found[0], ("node" if lead == 1 else "element"): found[1],
+                          "set": found[2]}
+    held = info["held"] if info else {}
+    if not held:
+        return
+    vec: Dict[int, List[float]] = {}
+    if "FORC" in last:
+        vec.update((n, v[:3]) for n, v in frd_rows(frd, last["FORC"]) if n in held)
+    printed: "OrderedDict[str, List[int]]" = OrderedDict()
+    totals = {}
+    for b in final:
+        if b[1] == "forces":
+            for r in b[4]:
+                if len(r) == 4:
+                    vec[int(r[0])] = r[1:]
+                    printed.setdefault(b[2], []).append(int(r[0]))
+        elif b[1] == "total force" and b[4] and len(b[4][0]) == 3:
+            totals[b[2]] = b[4][0]
+    # a BC's reaction is RF over the DOFs it holds; a set printed with RF sums them over the
+    # DOFs any BC holds, as Abaqus' RF there.  The converter's own planar / slab holds and
+    # nodes (keep) are no Abaqus BCs.
+    groups = [(k, v) for k, v in info["targets"].items() if k not in (PLANAR_NODES_SET, SLAB_NODES_SET)]
+    groups += [(k, {n: held[n] for n in nodes if n in held}) for k, nodes in printed.items()
+               if k not in info["targets"]]
+    rf: List[Tuple[str, List[float]]] = []
+    seen: set = set()                                   # (node, DOF) sets summed already
+    scale = max((abs(x) for v in vec.values() for x in v), default=0.0)
+    for name, dofs in sorted(groups, key=lambda g: g[0].isdigit()):   # sets before single nodes
+        dofs = {n: d for n, d in dofs.items() if keep(n)}
+        key = frozenset((n, x) for n, d in dofs.items() for x in d)
+        if dofs and key not in seen and all(n in vec and n not in deck["transformed"] for n in dofs):
+            parts = [[vec[n][x - 1] for n, d in dofs.items() if x in d] for x in (1, 2, 3)]
+            sums = [(sum(p), sum(abs(v) for v in p)) for p in parts]
+            # a zero: below what the files' 6-7 digits resolve of its terms, or round-off
+            rf.append((name, [s if abs(s) > max(1e-5 * size, 1e-9 * scale) else 0.0
+                              for s, size in sums]))
+            seen.add(key)
+    for name, total in totals.items():         # TOTALS=ONLY: a set held in DOFs 1-3 throughout
+        nodes = list(dict.fromkeys(deck["members"](name)))
+        key = frozenset((n, x) for n in nodes for x in (1, 2, 3))
+        if nodes and name not in info["targets"] and key not in seen and all(
+                held.get(n, set()) >= {1, 2, 3} and keep(n) and n not in deck["transformed"]
+                for n in nodes):
+            rf.append((name, list(total)))
+            seen.add(key)
+    rf.sort(key=lambda r: -_norm3(r[1]))
+    if rf:
+        entry["rf"] = [{"node": int(name)} if name.isdigit() else {"set": name} for name, _ in rf]
+        for r, (_, v) in zip(entry["rf"], rf):
+            r["rf"] = v
+
+
+def ccx_results_digest(job: str, instances: Sequence[dict] = (),
+                       model: Optional[Tuple[int, int]] = None) -> List[dict]:
+    """A digest of each step of a solved ccx job (its path without the extension), from what
+    ``job.frd`` and ``job.dat`` hold, to compare with the Abaqus results:
+
+    * a *FREQUENCY step: ``frequencies`` (cycles/time); a *BUCKLE step:
+      ``buckling_factors``; both from the .dat's tables;
+    * any other step, at its last increment: ``time`` (the total time, as ccx writes it);
+      ``max_u`` and ``max_mises``, the largest |U| and von Mises stress and their node,
+      from the .frd, else from the .dat prints (with the ``set``; an ``element`` for a
+      stress); ``rf``, for each *BOUNDARY target and each set printed with RF, the sum of
+      RF over the DOFs 1-3 that the step's *BOUNDARY cards hold there, which is what
+      Abaqus' RF sums to (ccx's RF also holds the applied loads, so a sum over all nodes
+      is zero) — from the .dat print, else from the .frd if it lists every node.
+
+    ``job.inp`` gives the procedures and the BCs.  A .frd node above the deck's nodes, one
+    ccx added expanding a shell or beam, gets ``near``, the nearest node of the deck.
+    ``model`` (Converter.model_labels), the Abaqus model's highest node and element labels,
+    leaves out what the converter added (knot beams, skins, ...); with ``instances``
+    (Report.instances) a node, element or set of an instance gets ``abaqus``, its
+    Instance.label name.  What the files lack is left out."""
+    deck = _deck_steps(job + ".inp")
+    frd = job + ".frd"
+    index = frd_index(frd)
+    tables: Dict[int, Dict[str, list]] = {}       # step -> title -> rows: ccx's own tables
+    final: Dict[int, list] = {}                   # step -> the print blocks of its last time
+    for b in dat_blocks(job + ".dat"):
+        if b[3] is None:
+            tables.setdefault(b[0], {}).setdefault(b[1], b[4])
+        elif b[0] not in final or b[3] > final[b[0]][0][3]:
+            final[b[0]] = [b]
+        elif b[3] == final[b[0]][0][3]:
+            final[b[0]].append(b)
+    top = deck["max_node"] if deck else 0
+    elements = next((b[3] for b in index if b[2] == "ELEMENTS"), None)
+    skip = _frd_element_nodes(frd, elements, model[1]) if model and elements is not None else set()
+
+    def keep(n: int) -> bool:              # a node of the Abaqus model or of ccx's expansion
+        return n not in skip and (not model or n <= model[0] or n > top)
+
+    def keep_element(e: int) -> bool:
+        return not model or e <= model[1]
+    digest: List[dict] = []
+    nsteps = max([len(deck["steps"]) if deck else 0] + [b[0] for b in index] + list(tables) + list(final))
+    for s in range(1, nsteps + 1):
+        info = deck["steps"][s - 1] if deck and s <= len(deck["steps"]) else None
+        entry: dict = {"step": s}
+        if info and info["procedure"]:
+            entry["procedure"] = info["procedure"]
+        proc = entry.get("procedure", "")
+        eigen = tables.get(s, {}).get("E I G E N V A L U E   O U T P U T", [])
+        buckle = tables.get(s, {}).get("B U C K L I N G   F A C T O R   O U T P U T", [])
+        if proc == "FREQUENCY" or (not proc and eigen):
+            if eigen:
+                entry["frequencies"] = [r[3] for r in eigen if len(r) == 5]
+        elif proc == "BUCKLE" or (not proc and buckle):
+            if buckle:
+                entry["buckling_factors"] = [r[1] for r in buckle if len(r) == 2]
+        elif proc not in ("COMPLEX FREQUENCY", "STEADY STATE DYNAMICS"):
+            _digest_step(entry, frd, [b for b in index if b[0] == s], final.get(s, []), info, deck,
+                         keep, keep_element)
+        if len(entry) > 1 + ("procedure" in entry):
+            digest.append(entry)
+    far = [x for e in digest for x in (e.get("max_u"), e.get("max_mises"))
+           if x and deck and "node" in x and "set" not in x and x["node"] > top]
+    coords = next((b[3] for b in index if b[2] == "NODES"), None)
+    if far and coords is not None:
+        want = {x["node"] for x in far}
+        near = _deck_nearest(job + ".inp", {n: v for n, v in frd_rows(frd, coords) if n in want},
+                             model[0] if model else None)
+        for x in far:
+            if x["node"] in near:
+                x["near"] = near[x["node"]]
+    names = {c: f"{i['name']}.{a}" for i in instances for a, c in i["names"].items()}
+    for e in digest:
+        for x in (e.get("max_u"), e.get("max_mises")):
+            q = x and (instance_label(instances, x["element"], "element") if "element" in x else
+                       instance_label(instances, x.get("near", x["node"])))
+            if q:
+                x["abaqus"] = q
+        for r in e.get("rf", ()):
+            q = names.get(r["set"]) if "set" in r else instance_label(instances, r["node"])
+            if q:
+                r["abaqus"] = q
+    return digest
+
+
+def format_results_digest(digest: Sequence[dict], sums: int = 3, values: int = 8) -> List[str]:
+    """The digest as text: a line or two per step, with at most ``values`` frequencies or
+    buckling factors and ``sums`` RF sums (the largest) each."""
+    def g(x: float) -> str:
+        return f"{x:.4g}"
+
+    def where(x: dict) -> str:
+        at = (f" in element {x['element']}" if "element" in x else
+              f" near node {x['near']}" if "near" in x else f" at node {x['node']}")
+        return at + (f" [{x['abaqus']}]" if "abaqus" in x else "") + \
+            (f" (set {x['set']})" if "set" in x else "")
+    lines = []
+    for e in digest:
+        head = f"  step {e['step']}" + (f" *{e['procedure']}" if "procedure" in e else "")
+        for key, what in (("frequencies", "frequencies (cycles/time)"),
+                          ("buckling_factors", "buckling factors")):
+            if key in e:
+                v = e[key]
+                lines.append(f"{head}: {len(v)} {what} " + ", ".join(g(x) for x in v[:values])
+                             + (", ..." if len(v) > values else ""))
+        if "frequencies" in e or "buckling_factors" in e:
+            continue
+        parts = [f"{label} {g(e[key]['value'])}" + (where(e[key]) if e[key]["value"] else "")
+                 for key, label in (("max_u", "max |U|"), ("max_mises", "max Mises")) if key in e]
+        lines.append(head + (f", time {g(e['time'])}" if "time" in e else "")
+                     + (": " + "; ".join(parts) if parts else ""))
+        rf = e.get("rf", [])
+        sums_txt = [(f"node {r['node']}" if "node" in r else r["set"])
+                    + (f" [{r['abaqus']}]" if "abaqus" in r else "")
+                    + " (" + ", ".join(g(c) for c in r["rf"]) + ")" for r in rf[:sums]]
+        if sums_txt:
+            lines.append("    sum of RF: " + "; ".join(sums_txt)
+                         + (f"; +{len(rf) - sums} more" if len(rf) > sums else ""))
+    return lines
+
+
+CCX_VERSIONS = ("2.22", "2.23")      # the ccx versions the converter targets (validated on 2.23)
+_ccx_versions: Dict[str, Optional[str]] = {}
+_ccx_warned: set = set()
+
+
+def ccx_version(exe: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The version that ``exe -v`` prints (``"2.23"``), or None."""
+    if exe not in _ccx_versions:
+        try:
+            p = subprocess.run([exe, "-v"], env=env, capture_output=True, encoding="utf-8",
+                               errors="replace", timeout=60)
+            m = re.search(r"Version\s+(\d+\.\d+)", p.stdout + p.stderr)
+        except (OSError, subprocess.SubprocessError):
+            m = None
+        _ccx_versions[exe] = m.group(1) if m else None
+    return _ccx_versions[exe]
+
+
+def _warn_ccx_version(exe: str, version: Optional[str]) -> None:
+    if version in CCX_VERSIONS or exe in _ccx_warned:
+        return
+    _ccx_warned.add(exe)
+    what = f"{exe} is ccx {version}" if version else f"could not tell which ccx version {exe} is"
+    sys.stderr.write(f"abq2ccx: warning: {what}; abq2ccx targets ccx {CCX_VERSIONS[0]}-"
+                     f"{CCX_VERSIONS[-1]} (validated on {CCX_VERSIONS[-1]}), and other versions may "
+                     f"stop on or solve some converted cards differently.\n")
+
+
+def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = True,
+            instances: Sequence[dict] = (), model: Optional[Tuple[int, int]] = None) -> dict:
+    """Run CalculiX on a converted deck.  Returns ``{"code", "ccx", "ccx_version", "status",
+    "results"}``: ``code`` 0 if the analysis solves with finite results (or ccx accepts a
+    mesh-only deck that has nothing to solve), else 1; ``status`` as classify_ccx_run (None
+    if no ccx ran); ``results`` a solved run's ccx_results_digest (``instances``, ``model``),
+    which is also printed unless ``quiet`` or not ``digest``.  Warns once per executable when
+    its version is not one the converter targets."""
+    run: dict = {"code": 1, "ccx": None, "ccx_version": None, "status": None, "results": None}
     exe, extra_env = find_ccx(override)
     if not exe:
         sys.stderr.write("abq2ccx: no CalculiX executable found (searched --ccx/$CCX, PATH, "
                          "FreeCAD, PrePoMax and bConverged installs, Homebrew/MacPorts); "
                          "install ccx or pass --ccx PATH.\n")
-        return 1
+        return run
     env = dict(os.environ)
     env.update(extra_env)
+    version = ccx_version(exe, env)
+    run.update(ccx=exe, ccx_version=version)
     stem = os.path.splitext(os.path.basename(out_path))[0]
     cwd = os.path.dirname(os.path.abspath(out_path))
     if not quiet:
-        sys.stderr.write(f"abq2ccx: running {exe} {stem}\n")
+        sys.stderr.write(f"abq2ccx: running {exe} {stem}" + (f" (ccx {version})" if version else "")
+                         + "\n")
+    if version:
+        _warn_ccx_version(exe, version)
     try:
         p = subprocess.run([exe, stem], cwd=cwd, env=env, capture_output=True,
                            encoding="utf-8", errors="replace")   # it echoes UTF-8 deck lines
     except OSError as exc:
         sys.stderr.write(f"abq2ccx: could not run ccx: {exc}\n")
-        return 1
+        run["status"] = "failed"
+        return run
     out = p.stdout + p.stderr
     if not quiet:
         sys.stderr.write(out)
+    if not version:                             # the banner of the run: "CalculiX Version 2.23"
+        m = re.search(r"CalculiX Version\s+(\d+\.\d+)", p.stdout)
+        run["ccx_version"] = version = m.group(1) if m else None
+        _warn_ccx_version(exe, version)
     job = os.path.join(cwd, stem)
-    status = classify_ccx_run(p.returncode, p.stdout, p.stderr, job)
+    status = run["status"] = classify_ccx_run(p.returncode, p.stdout, p.stderr, job)
     if status == "accepted":
         sys.stderr.write("abq2ccx: ccx accepted the deck, but it has no analysis step — "
                          "nothing was solved.\n")
-        return 0
-    if status == "nonfinite":
+        run["code"] = 0
+    elif status == "nonfinite":
         sys.stderr.write(f"abq2ccx: ccx finished, but its results hold NaN/Inf values (the "
                          f"solution diverged): {ccx_nonfinite_result(job)}\n")
-        return 1
-    if status == "failed":
+    elif status == "failed":
         errs = [ln.strip() for ln in out.splitlines() if "*ERROR" in ln][:3]
         aborts = [s.strip() for s in CCX_ABORT_SIGNS if s in out]
         why = (" | ".join(errs) if errs else
@@ -18045,8 +18620,22 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool) -> int:
                f"crash after 'Job finished' ({aborts[0]})" if aborts else
                "no 'Job finished'")
         sys.stderr.write(f"abq2ccx: ccx did NOT finish cleanly: {why}\n")
-        return 1
-    return 0
+    else:
+        run["code"] = 0
+        try:
+            run["results"] = ccx_results_digest(job, instances, model)
+        except Exception as exc:    # a convenience: never let it fail a solved run
+            sys.stderr.write(f"abq2ccx: could not digest the results ({type(exc).__name__}: {exc})\n")
+            return run
+        if digest and not quiet:
+            lines = format_results_digest(run["results"])
+            named = any("abaqus" in x for e in run["results"] for x in
+                        [e.get("max_u", {}), e.get("max_mises", {})] + e.get("rf", []))
+            head = f"abq2ccx: ccx solved {stem}" + (
+                f"; results digest from {stem}.frd and {stem}.dat"
+                + (" (Abaqus Instance.label in brackets)" if named else "") + ":" if lines else ".")
+            sys.stderr.write("\n".join([head] + lines) + "\n")
+    return run
 
 
 def _convert_one(path: str, args) -> int:
@@ -18100,8 +18689,18 @@ def _convert_one(path: str, args) -> int:
             except OSError as exc:
                 sys.stderr.write(f"abq2ccx: cannot write {log_path}: {exc}\n")
 
+    if not args.json_out and not args.quiet:
+        verb = "checked" if args.check else "wrote"
+        sys.stderr.write(f"abq2ccx: {verb} {path if args.check else out_path} "
+                         f"({len(conv.geom.nodes)} nodes, {len(conv.geom.elements)} elements, "
+                         f"{report.summary()})\n")
+        sys.stderr.write(report.text())
+
+    strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
+    run = run_ccx(out_path, args.ccx, args.quiet, not args.json_out, report.instances,
+                  conv.model_labels) if args.run and wrote and not strict else None
     if args.json_out:
-        print(json.dumps({
+        doc = {
             "tool": "abq2ccx", "version": __version__, "input": path,
             "output": out_path if wrote else None, "check_only": bool(args.check),
             "nodes": len(conv.geom.nodes), "elements": len(conv.geom.elements),
@@ -18109,19 +18708,15 @@ def _convert_one(path: str, args) -> int:
                        "commented_cards": report.n_commented},
             "entries": [{"level": lvl, "message": m} for lvl, m in report.entries],
             "ok": report.n_warnings == 0 and report.n_commented == 0,
-        }))
-    elif not args.quiet:
-        verb = "checked" if args.check else "wrote"
-        sys.stderr.write(f"abq2ccx: {verb} {path if args.check else out_path} "
-                         f"({len(conv.geom.nodes)} nodes, {len(conv.geom.elements)} elements, "
-                         f"{report.summary()})\n")
-        sys.stderr.write(report.text())
-
-    if args.strict and (report.n_warnings > 0 or report.n_commented > 0):
+            "instances": report.instances,
+        }
+        if run is not None:
+            doc["run"] = {k: run[k] for k in ("ccx", "ccx_version", "status")}
+            doc["results"] = run["results"]
+        print(json.dumps(doc))
+    if strict:
         return 3
-    if args.run and wrote:
-        return run_ccx(out_path, args.ccx, args.quiet)
-    return 0
+    return run["code"] if run else 0
 
 
 def _tolerant_stdio() -> None:

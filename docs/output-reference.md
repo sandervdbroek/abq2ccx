@@ -47,3 +47,16 @@ Its contact output (`CSTRESS`, `CDISP`), which Abaqus writes where the model has
 | `*HEAT TRANSFER` | NT, RFL | HFL | — | — |
 | `*COUPLED TEMPERATURE-DISPLACEMENT` | U, RF, NT, RFL | S, E, PEEQ, HFL | CDIS, CSTR | CF |
 | `*DYNAMIC, EXPLICIT` | U, V, RF | S, E, PEEQ | CSTR | A, EVF and the volume averages |
+
+## Results digest (`--run`)
+
+After a run that solves, `--run` prints a line or two per step, read from the `.frd` and `.dat` (`ccx_results_digest`), to set beside the Abaqus results; `--json` gives it under `results`, one object per step, with `run` (the ccx, its version, the status). Values are at the step's last increment.
+
+| Key | What |
+| --- | --- |
+| `time` | the total time reached, as ccx writes it |
+| `max_u`, `max_mises` | the largest \|U\| and von Mises stress and their node (`.frd`), or the printed set and node or element (`.dat`) where the `.frd` lacks them |
+| `rf` | per `*BOUNDARY` target, RF summed over the DOFs 1–3 it holds; per set printed with RF, over those any BC holds there. That is what Abaqus' RF sums to: ccx's RF also holds the applied loads. From the `.dat`, else the `.frd` if it has all the nodes (it lacks reference points and shell and beam nodes) |
+| `frequencies`, `buckling_factors` | of a `*FREQUENCY` (cycles/time) or `*BUCKLE` step |
+
+A node ccx adds expanding a shell or beam is given `near` the deck's node; the converter's own nodes and elements (knot beams, skins) are left out; in an assembly `[Instance.label]` (`abaqus`) names the node, element or set as Abaqus does, from the report's instance map (`instances` in `--json`). Steady-state dynamics and complex frequency steps are not digested.

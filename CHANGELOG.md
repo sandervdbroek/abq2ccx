@@ -73,6 +73,12 @@ without an error. A full audit and the work that followed:
 * **Output** — requests fitted to ccx's `.frd`/`.dat` model, one output control per step,
   explicit output intervals from ccx's stable increment, Abaqus' preselected field and
   contact output.
+* **`--run` results digest** — after a clean run, a line or two per step to set beside the
+  Abaqus results (largest |U| and von Mises stress and their node, the sum of RF at each
+  `*BOUNDARY`, eigenfrequencies or buckling factors, the time reached), also under `results`
+  in `--json`; the ccx version printed and checked against 2.22–2.23; an assembly's instance
+  map (label offsets, renamed sets and surfaces) in the report and `--json`, which the
+  digest uses to name nodes and sets `Instance.label`.
 * **Crash guards** — step data outside a step, undefined materials, rotational DOFs on plane
   nodes and other inputs that crash ccx 2.23 are commented, warned or dropped.
 * **First ccx errors of non-solving decks** — `*DAMAGE INITIATION` in the form ccx 2.23
