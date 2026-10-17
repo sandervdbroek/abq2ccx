@@ -91,6 +91,13 @@ without an error. A full audit and the work that followed:
   docs said 3.7). On Windows, `--run` and `validate_with_ccx.py` find ccx in FreeCAD,
   PrePoMax and bConverged installs, and ccx's output, the reports and the generated docs no
   longer depend on the code page.
+* **User materials** — a `*USER MATERIAL` whose name would make ccx run one of its own
+  routines (`USER…` and `@…` are empty in a stock ccx, `ABAQUS…` a linear-elastic example,
+  `JOHNSONCOOK…` and ten more ccx's own laws) is renamed `ABQ2CCX_<name>`, so ccx stops on
+  it; `--abaqus-umat` writes user materials for ccx's Abaqus-UMAT interface (`ABAQUS<name>`,
+  `ABAQUSNL<name>` under NLGEOM) to run in a ccx built with the deck's UMAT, with a note per
+  argument ccx supplies differently. The temperature line ccx reads after a multiple of 8
+  constants is added; thermal user materials (ccx's empty `umatht`) and VUMATs are warned.
 
 Corpus: 165 decks solve their own problem; 29 more solve with reduced physics, 14 load
 nothing (3 both) and one drifts to a solution that is not the deck's; 221 mesh-only decks are

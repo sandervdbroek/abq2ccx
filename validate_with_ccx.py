@@ -44,8 +44,10 @@ SNEG faces and element-based against the Navier plate solution (the sign of each
 the same model written flat, and rigid tools: a rigid flat punch (rigid elements, and
 the same face as an analytical surface) against the penalty contact law and a punch given
 the motion node by node, also turned under NLGEOM, a block tied to a turning rigid plate, a
-rigid plate's MASS and ROTARYI on springs against its frequencies, and (--approximate) a
-faceted analytical sphere against Hertz.
+rigid plate's MASS and ROTARYI on springs against its frequencies, (--approximate) a
+faceted analytical sphere against Hertz, and user materials: renamed so ccx stops rather
+than run its own routines, and (--abaqus-umat) through ccx's Abaqus-UMAT interfaces, whose
+stock example UMAT gives E eps and E ln(1 + eps).
 
     python validate_with_ccx.py
 
@@ -74,10 +76,11 @@ def find_ccx():
     return A.find_ccx()
 
 
-def convert(path, out_inp, approximate=False):
+def convert(path, out_inp, approximate=False, abaqus_umat=False):
     rep = A.Report()
     blocks = A.read_blocks(path, rep)
-    conv = A.Converter(rep, type("O", (), {"solid_dof": False, "approximate": approximate})())
+    conv = A.Converter(rep, type("O", (), {"solid_dof": False, "approximate": approximate,
+                                           "abaqus_umat": abaqus_umat})())
     body = conv.convert(blocks)                     # convert first: the header lists warnings
     text = "\n".join(rep.header_comment_lines() + body) + "\n"
     with open(out_inp, "w", encoding="utf-8", newline="\n") as fh:
@@ -665,6 +668,18 @@ def rigid_pressure_deck(kind="R2D2", thick=0.5, p=2.0, k=4.0):
     lines += ["*BOUNDARY", f"BN, 1, {2 if kind == 'R2D2' else 3}", "*STEP", "*STATIC", "*BOUNDARY"] + held
     lines += ["*DLOAD", f"R, P, {p:g}", "*NODE PRINT, NSET=REF", "U", "*END STEP"]
     return "\n".join(lines) + "\n"
+
+
+def umat_cube_deck(name, nlgeom=False):
+    """A unit cube stretched 0.001 along z, free to contract, whose material is a *USER
+    MATERIAL with the constants of ccx's example Abaqus UMAT (E = 210000, nu = 0.3)."""
+    return ("*NODE\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=E\n1,1,2,3,4,5,6,7,8\n"
+            f"*MATERIAL, NAME={name}\n*USER MATERIAL, CONSTANTS=2\n210000., 0.3\n"
+            f"*SOLID SECTION, ELSET=E, MATERIAL={name}\n*NSET, NSET=TOP\n5,6,7,8\n"
+            "*BOUNDARY\n1,1,3\n2,2,3\n3,3,3\n4,1,1\n4,3,3\n"
+            f"*STEP{', NLGEOM' if nlgeom else ''}\n*STATIC\n0.25, 1.\n*BOUNDARY\nTOP,3,3,0.001\n"
+            "*EL PRINT, ELSET=E\nS\n*END STEP\n")
 
 
 def frd_last(frd_path, name):
@@ -2295,6 +2310,39 @@ def main():
         what = "segment of length 1 (section 0.5 thick)" if kind == "R2D2" else "unit facet"
         print(f"{'PASS' if ok else 'FAIL'}  rigid_pressure ({kind}): P = 2 on a rigid {what} against a "
               f"spring k = 4: u = {u if u is not None else r['status']} (p / k = 0.5)")
+        failures += 0 if ok else 1
+
+    # --- user materials on a stock ccx: the name guard and --abaqus-umat --------------
+    # ccx hands a *USER MATERIAL to the routine its name starts with: USER... to an empty stub
+    # in a stock ccx, JOHNSONCOOK... to its own Johnson-Cook law.  Renamed, the material stops
+    # ccx instead.  --abaqus-umat writes it for ccx's Abaqus-UMAT interface, where a stock ccx
+    # has a linear-elastic example: the stretched cube gives S33 = E eps through ABAQUS (small
+    # strain) and E ln(1 + eps) through ABAQUSNL (NLGEOM, logarithmic strain).
+    src = os.path.join(tmp, "umat_src.inp")
+    for name in ("UserMat", "JohnsonCook_Steel"):
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(umat_cube_deck(name))
+        inp = os.path.join(tmp, "umat.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        shutil.rmtree(d, ignore_errors=True)
+        ok = (status == "failed" and "no user material subroutine" in out
+              and "ABQ2CCX_" + name.upper() in out)
+        print(f"{'PASS' if ok else 'FAIL'}  umat_guard ({name}): renamed ABQ2CCX_{name}, ccx stops with "
+              f"'no user material subroutine' ({status})")
+        failures += 0 if ok else 1
+    for nlgeom, ref in ((False, 210.0), (True, 210000.0 * math.log(1.001))):
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(umat_cube_deck("UserMat", nlgeom))
+        inp = os.path.join(tmp, "umat.inp")
+        convert(src, inp, abaqus_umat=True)
+        d, status, out = run_ccx(ccx, env, inp)
+        s = dat_el_stress(os.path.join(d, "job.dat"), 1) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        ok = s is not None and abs(s[2] / ref - 1) < 1e-4
+        what = "ABAQUSNL, NLGEOM: E ln(1.001)" if nlgeom else "ABAQUS: E 0.001"
+        print(f"{'PASS' if ok else 'FAIL'}  umat_abaqus_interface ({what}): a stock ccx runs its example "
+              f"UMAT, S33 = {f'{s[2]:.4f}' if s else status} (reference {ref:.4f})")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

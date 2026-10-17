@@ -73,7 +73,7 @@ CalculiX accepts these as-is (verified against the ccx 2.22 manual):
 
 | Keyword | Note |
 | --- | --- |
-| `*USER MATERIAL` | *USER MATERIAL kept, but ccx uses its own umat interface (umat_*.f), not an Abaqus UMAT binary — the subroutine must be ported. |
+| `*USER MATERIAL` | *USER MATERIAL kept, but the Abaqus subroutine does not run in a stock ccx: a mechanical one stops ccx ('no user material subroutine'; a name that would pick one of ccx's own routines gets ABQ2CCX_ in front), a thermal one runs ccx's empty umatht (no conduction, no error). --abaqus-umat writes mechanical ones for ccx's Abaqus-UMAT interface, for a ccx rebuilt with the deck's UMAT. |
 | `*USER ELEMENT` | *USER ELEMENT kept; ensure the matching ccx user-element routine is built in. |
 
 ## Same name, different meaning (warned)

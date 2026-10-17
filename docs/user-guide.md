@@ -23,6 +23,7 @@ abq2ccx INPUT.inp [INPUT.inp ...] [options]               # the same, installed
 | `--outdir DIR` | write the outputs, under their default names, into `DIR` |
 | `--solid-dof` | expand `ENCASTRE`/`PINNED`/`*SYMM` to DOFs 1–3 only (solid-only models) |
 | `--approximate` | allow the physics approximations [below](#--approximate), each flagged `[APPROX]` |
+| `--abaqus-umat` | write `*USER MATERIAL` materials for ccx's Abaqus-UMAT interface, to run a ccx built with the deck's UMAT ([below](#--abaqus-umat)) |
 | `--check` | parse, convert and report; write nothing |
 | `--strict` | exit 3 if the conversion produced warnings or commented-out cards |
 | `--json` | print a machine-readable report on stdout |
@@ -67,6 +68,35 @@ a different model without saying so. With it, these reframings are made, each wi
   bodies) → written in its linear form;
 * an `*MPC LINK` → ccx's distance MPC in a deck whose first step is linear and a later one
   NLGEOM.
+
+## `--abaqus-umat`
+
+ccx picks the routine for a `*USER MATERIAL` by the start of the material name. Without the
+option, a material whose name would pick one of ccx's own routines (`USER…`, `ABAQUS…`,
+`JOHNSONCOOK…`, …) is renamed `ABQ2CCX_<name>`, so ccx stops with "no user material
+subroutine" instead of running another material. With it, every mechanical user material
+becomes `ABAQUS<name>` for ccx's Abaqus-UMAT interface (small strain), or `ABAQUSNL<name>` in
+a deck with NLGEOM steps (logarithmic strain); a note names each UMAT argument ccx supplies
+differently ([compatibility](compatibility.md#materials)). A stock ccx runs its linear-elastic
+example there, so build one with the deck's UMAT:
+
+1. Unpack the ccx 2.23 sources (`ccx_2.23.src.tar.bz2`, <https://www.dhondt.de>) and build
+   SPOOLES 2.2 and ARPACK as its README describes.
+2. Save the deck's UMAT as `src/umat.f` in place of ccx's example (the routine is `umat`, with
+   Abaqus' arguments), next to an `ABA_PARAM.INC` holding `implicit real*8(a-h,o-z)` and
+   `parameter (nprecd=2)`. ccx has no Abaqus utility routines (`XIT`, `SINV`, `SPRINC`,
+   `ROTSIG`, …): supply those it calls.
+3. `make` in `src` with gfortran and run the converted deck with the new executable.
+
+A ccx built with `-DCALCULIX_EXTERNAL_BEHAVIOURS_SUPPORT` (`src/Makefile_MFront`) loads the
+UMAT from a shared library instead: rename the material `@ABAQUS_<LIB>_<FUNCTION>` for the
+function `<FUNCTION>` in `lib<LIB>.so` (ccx manual 8.5); FreeCAD's ccx has no such support.
+In ccx 2.23 `umat_abaqusnl.f` never sets U0, so under `ABAQUSNL` the stress at the start of
+an increment is undefined: a UMAT that adds to it (plasticity, damage) needs U0 set there
+first, or `ABAQUS<name>` where strains and rotations stay small. A `TYPE=THERMAL` user
+material always goes to `umatht.f` (Abaqus' UMATHT arguments first; ccx uses only FLUX and
+DFDG). ccx has no VUMAT interface: an Abaqus/Explicit deck's user material must be ported to a
+UMAT, and the option leaves it alone.
 
 ## Recommended workflow
 
@@ -129,9 +159,11 @@ Everything the converter creates starts with `ABQ2CCX_`:
 | `ABQ2CCX_TR*`, `ABQ2CCX_OR*` | synthesized `*TRANSFORM` node sets and `*ORIENTATION`s (spherical transforms, rotation-node axes, composite ply angles) |
 | `ABQ2CCX_VEL*`, `ABQ2CCX_ACC*` | amplitudes that integrate velocity and acceleration BCs |
 | `ABQ2CCX_TP*`, `ABQ2CCX_OUTPUT*` | generated `*TIME POINTS` and output node sets |
+| `ABQ2CCX_<material>` | a `*USER MATERIAL` whose name would make ccx run one of its own routines, renamed so ccx stops instead |
 
-One name is ccx's own: `AMPLITUDE=RAMP12357111317` on a `*BOUNDARY` is ccx's step ramp, which
-the converter uses where Abaqus/Standard ramps a displacement BC that ccx would apply at once.
+Two names are ccx's own: `AMPLITUDE=RAMP12357111317` on a `*BOUNDARY` is ccx's step ramp, which
+the converter uses where Abaqus/Standard ramps a displacement BC that ccx would apply at once,
+and the `ABAQUS`/`ABAQUSNL` in front of a user material's name with `--abaqus-umat`.
 
 Edit the Abaqus deck and convert again rather than editing these by hand.
 
@@ -140,7 +172,7 @@ Edit the Abaqus deck and convert again rather than editing these by hand.
 ```python
 import abq2ccx
 
-result = abq2ccx.convert_file("model.inp", solid_dof=False, approximate=False)
+result = abq2ccx.convert_file("model.inp", solid_dof=False, approximate=False, abaqus_umat=False)
 # or: abq2ccx.convert_text(deck_string, base_dir=".")  — *INCLUDE paths relative to base_dir
 
 result.text           # the converted deck, report header included
@@ -151,7 +183,7 @@ result.ok             # False if nothing could be converted
 ```
 
 The lower-level pieces are `read_blocks(path, report)` (parse, follow `*INCLUDE`) and
-`Converter(report, Options(solid_dof, approximate)).convert(blocks)`; the
+`Converter(report, Options(solid_dof, approximate, abaqus_umat)).convert(blocks)`; the
 [architecture guide](architecture.md) describes them. `classify_ccx_run(returncode, stdout,
 stderr, job)` is the solve judge that `--run`, `validate_with_ccx.py` and the corpus tests
 share.

@@ -1749,10 +1749,40 @@ SEMANTIC_TRAP = {
 }
 # Supported by ccx but worth a heads-up about a behavioural/interface difference.
 PASS_WITH_NOTE = {
-    "USER MATERIAL": "*USER MATERIAL kept, but ccx uses its own umat interface (umat_*.f), not an "
-                     "Abaqus UMAT binary — the subroutine must be ported.",
+    "USER MATERIAL": "*USER MATERIAL kept, but the Abaqus subroutine does not run in a stock ccx: "
+                     "a mechanical one stops ccx ('no user material subroutine'; a name that would "
+                     "pick one of ccx's own routines gets ABQ2CCX_ in front), a thermal one runs "
+                     "ccx's empty umatht (no conduction, no error). --abaqus-umat writes mechanical "
+                     "ones for ccx's Abaqus-UMAT interface, for a ccx rebuilt with the deck's UMAT.",
     "USER ELEMENT": "*USER ELEMENT kept; ensure the matching ccx user-element routine is built in.",
 }
+# ccx hands a mechanical *USER MATERIAL to the routine its name starts with (umat_main.f, the
+# same in FreeCAD's 2.23 build): ABAQUS / ABAQUSNL -> the Abaqus-UMAT interface (a stock ccx has
+# a linear-elastic example there), USER -> umat_user and @ -> a shared library (empty in a stock
+# ccx: no stress, no stiffness), the rest -> ccx's own laws; any other name stops with "no user
+# material subroutine".  ccx reads names upper-cased and without blanks, quotes kept (so a
+# quoted name never matches).  The prefix is cut off before the routine sees the name.
+UMAT_NAME_PREFIXES = ("@", "ABAQUS", "ANISO_CREEP", "CIARLET_EL", "COMPRESSION_ONLY",
+                      "ELASTIC_FIBER", "IDEAL_GAS", "JOHNSONCOOK", "LIN_EL_COROT", "LIN_ISO_EL",
+                      "SINGLE_CRYSTAL", "TENSION_ONLY", "UNDO_NLGEOM_LIN_EL",
+                      "UNDO_NLGEOM_LIN_ISO_EL", "USER")
+# The Abaqus UMAT arguments ccx's interface (umat_abaqus.f, umat_abaqusnl.f) does not supply or
+# reads back, or supplies differently from Abaqus: one note each with --abaqus-umat.
+UMAT_ARGUMENT_NOTES = (
+    "CELENT (characteristic element length): not supplied, its value is undefined",
+    "LAYER, KSPT: not supplied (undefined); ccx runs shells as 3-D elements",
+    "PREDEF, DPRED: not supplied (undefined); ccx has no predefined field variables",
+    "SSE, SPD, SCD (energies): ignored",
+    "RPL, DDSDDT, DRPLDE, DRPLDT (heat generation and thermal tangents): ignored",
+    "TEMP, DTEMP: the temperature at the end of the increment, and 0 (Abaqus: at its start, and "
+    "the increment)",
+    "NDI, NSHR, NTENS: always 3, 3, 6 — ccx runs plane, axisymmetric, shell and beam elements as "
+    "3-D elements",
+    "DDSDDE: used as (DDSDDE + DDSDDE^T)/2 (ccx's tangent is symmetric)",
+    "PNEWDT: comes in as -1 (Abaqus: a large value); any value above 0 the UMAT sets redoes the "
+    "increment, scaled by it, so PNEWDT = MIN(PNEWDT, x) never cuts back and PNEWDT > 1 is a redo",
+    "KSTEP: JSTEP(1), (3), (4) as Abaqus, JSTEP(2) is ccx's own procedure number",
+)
 # Abaqus output / diagnostics requests ccx has no card for: commented out, the solution is
 # unchanged.
 OUTPUT_ONLY_KEYWORDS = {
@@ -2740,6 +2770,8 @@ class Converter:
         self.report = report
         self.opt = options
         self._approx = bool(getattr(options, "approximate", False))
+        self._abaqus_umat = bool(getattr(options, "abaqus_umat", False))
+        self._umat_explicit = False      # an Abaqus/Explicit deck: user materials are VUMATs
         self.geom = Geometry()
         self.orientations: Dict[str, Tuple[Vec, Vec, str]] = {}
         self._orient_rotation: Dict[str, Optional[Tuple[int, float]]] = {}
@@ -3387,6 +3419,7 @@ class Converter:
             "PLASTIC": self.handle_plastic,
             "DAMAGE INITIATION": self.handle_damage_initiation,
             "DEPVAR": self.handle_depvar,
+            "USER MATERIAL": self.handle_user_material,
             "CYCLIC HARDENING": self.handle_cyclic_hardening,
             "HYPERELASTIC": self.handle_hyperelastic,
             "DENSITY": self.handle_dependent_material,
@@ -3452,7 +3485,7 @@ class Converter:
             self.report.warn(SEMANTIC_TRAP[kw], once=True)
         elif kw in PASS_WITH_NOTE:
             self.report.note(PASS_WITH_NOTE[kw], once=True)
-            if kw in ("USER MATERIAL", "USER ELEMENT"):
+            if kw == "USER ELEMENT":
                 self._reduces(f"*{kw} (the Abaqus subroutine does not run in ccx)")
         elif kw not in CCX_KEYWORDS:
             if kw in OUTPUT_ONLY_KEYWORDS:
@@ -3904,6 +3937,188 @@ class Converter:
                                       "HARDENING=COMBINED in its material is an error in ccx; "
                                       "commented out.", reduces=False)
         return self.passthrough(b)
+
+    def _plan_user_materials(self, blocks: List[Block]) -> List[Block]:
+        """The blocks with each mechanical *USER MATERIAL material named for the routine ccx
+        should call (UMAT_NAME_PREFIXES).  A name that would pick one of ccx's own routines
+        becomes ABQ2CCX_<name>, so ccx stops with 'no user material subroutine' instead of
+        running a different material.  With --abaqus-umat it becomes ABAQUS<name> for ccx's
+        Abaqus-UMAT interface (umat_abaqus.f: Green-Lagrange strain, which is Abaqus' strain for
+        small deformations), ABAQUSNL<name> in a deck with NLGEOM steps (umat_abaqusnl.f:
+        logarithmic strain and rotation increments, as Abaqus under NLGEOM) — not in an
+        Abaqus/Explicit deck, whose user materials are VUMATs.  The *MATERIAL and every
+        reference to it (MATERIAL=, composite plies) are renamed."""
+        mech: "OrderedDict[str, str]" = OrderedDict()     # upper-case NAME -> NAME
+        cur = None
+        for b in blocks:                          # ccx gives a card to the *MATERIAL last read
+            if b.keyword == "MATERIAL":
+                cur = (b.param("NAME") or "").strip()
+            elif b.keyword == "USER MATERIAL" and cur and \
+                    (b.param("TYPE") or "").strip().upper() != "THERMAL":
+                mech[cur.upper()] = cur
+        self._umat_explicit = any((b.keyword == "DYNAMIC" and b.has("EXPLICIT")) or
+                                  b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT" for b in blocks)
+        if not mech:
+            return blocks
+        abaqus = self._abaqus_umat and not self._umat_explicit
+        nl = abaqus and any(b.keyword == "STEP" and b.has("NLGEOM") and
+                            (b.param("NLGEOM") or "YES").strip().upper() != "NO" for b in blocks)
+        prefix = "ABAQUSNL" if nl else "ABAQUS"
+        taken = {(b.param("NAME") or "").strip().upper() for b in blocks if b.keyword == "MATERIAL"}
+        ren: Dict[str, str] = {}
+        for key, name in mech.items():
+            bare = re.sub(r"\s", "", name).upper()                  # as ccx reads it
+            hit = next((p for p in UMAT_NAME_PREFIXES if bare.startswith(p)), None)
+            if not abaqus and hit is None:
+                continue
+            cmname = re.sub(r'[\s"]', "", name)      # quoted, ccx would keep the quotes
+            base = prefix + cmname if abaqus else "ABQ2CCX_" + name
+            new, i = base[:CCX_NAME_LIMIT], 1
+            while new.upper() in taken:
+                i += 1
+                new = base[:CCX_NAME_LIMIT - len(str(i)) - 1] + f"_{i}"
+            taken.add(new.upper())
+            ren[key] = new
+            if not abaqus:
+                what = {"ABAQUS": "its Abaqus-UMAT interface, which in a stock ccx is a linear-"
+                                  "elastic example",
+                        "USER": "its umat_user routine, empty in a stock ccx (no stress, no "
+                                "stiffness)",
+                        "@": "a shared-library material, empty in a stock ccx"}.get(
+                            hit, f"its own {hit} material law")
+                self.report.note(f"*USER MATERIAL {name}: material renamed {new} — ccx hands a user "
+                                 f"material whose name starts with {hit} to {what} instead of "
+                                 f"stopping with 'no user material subroutine'.")
+                continue
+            iface = ("umat_abaqusnl.f: logarithmic strain, for the NLGEOM steps" if nl
+                     else "umat_abaqus.f: small strain")
+            self.report.warn(f"--abaqus-umat: material {name} written as {new} for ccx's Abaqus-"
+                             f"UMAT interface ({iface}). Only a ccx rebuilt with the deck's UMAT "
+                             f"runs it (see the user guide); a stock ccx runs its linear-elastic "
+                             f"example instead (PROPS(1) as E, PROPS(2) as Poisson's ratio), "
+                             f"without an error.")
+            if new[len(prefix):].upper() != cmname.upper():
+                self.report.warn(f"--abaqus-umat: {new} is cut or numbered to stay a unique ccx "
+                                 f"name of at most {CCX_NAME_LIMIT} characters, so the UMAT sees "
+                                 f"CMNAME {new[len(prefix):].upper()}, not {cmname.upper()}.")
+        if abaqus:
+            if nl:
+                self.report.warn("--abaqus-umat: ccx 2.23's umat_abaqusnl.f never computes U0, the "
+                                 "right stretch tensor at the start of the increment, so the STRESS "
+                                 "it passes in is undefined: only a UMAT that computes the stress "
+                                 "from the total strain or DFGRD1 (a hyperelastic one) runs right. "
+                                 "For an incremental UMAT set U0 in umat_abaqusnl.f first, or, where "
+                                 "strains and rotations stay small, rename the material ABAQUS<name> "
+                                 "(small strain).", once=True)
+                notes = ["STRAN, DSTRAN, DROT: the logarithmic strain, its increment and the "
+                         "rotation increment, in the corotational frame as in Abaqus; ccx assumes "
+                         "an isotropic thermal expansion"]
+            else:
+                notes = ["STRAN, DSTRAN, STRESS, DROT: the Green-Lagrange strain and its increment, "
+                         "the second Piola-Kirchhoff stress and DROT = identity — Abaqus' values "
+                         "for small strains and rotations"]
+            notes += list(UMAT_ARGUMENT_NOTES)
+            notes.append(f"CMNAME: the material name upper-cased, without blanks or quotes, "
+                         f"{prefix} cut off")
+            counts = set()
+            for b in blocks:
+                if b.keyword == "DEPVAR":
+                    vals = [x for r in merged_data_records(b) for x in r if x != ""]
+                    try:
+                        counts.add(int(float(vals[0])))
+                    except (IndexError, ValueError):
+                        pass
+            if len(counts) > 1:
+                notes.append("NSTATV: the largest *DEPVAR in the model (Abaqus: the material's own)")
+            for text in notes:
+                self.report.note(f"Abaqus-UMAT interface, {text}.", once=True)
+        if not ren:
+            return blocks
+
+        def ply(line: str) -> str:                # thickness, points, material, ...
+            f = line.split(",")
+            if len(f) > 2 and f[2].strip().upper() in ren:
+                f[2] = " " + ren[f[2].strip().upper()]
+            return ",".join(f)
+
+        out: List[Block] = []
+        for b in blocks:
+            params, data = b.params, b.data
+            key = "NAME" if b.keyword == "MATERIAL" else "MATERIAL"
+            if (b.param(key) or "").strip().upper() in ren:
+                params = OrderedDict(params)
+                params[key] = ren[(b.param(key) or "").strip().upper()]
+            if b.keyword.endswith("SECTION") and b.has("COMPOSITE"):
+                data = [ply(d) for d in b.data]
+            out.append(b if params is b.params and data == b.data
+                       else Block(b.keyword, params, data, b.part, b.instance))
+        return out
+
+    def handle_user_material(self, b: Block) -> List[str]:
+        """``*USER MATERIAL``, named for ccx's routines by _plan_user_materials.  ccx reads
+        CONSTANTS and TYPE=THERMAL, and a temperature after the last constant (8 constants a
+        line, as Abaqus): for a multiple of 8 constants that is a line of its own, without
+        which ccx stops ('anisotropic definition is not complete').  A thermal one goes to
+        ccx's umatht, whatever the material's name: empty in a stock ccx, which then runs the
+        material with no heat conduction and no error (probed on 2.23)."""
+        thermal = (b.param("TYPE") or "").strip().upper() == "THERMAL"
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        for k, v in b.params.items():
+            if k == "CONSTANTS":
+                params[k] = v
+            elif k == "TYPE":
+                if thermal:
+                    params[k] = "THERMAL"
+            elif k == "UNSYMM":
+                self.report.note("*USER MATERIAL, UNSYMM dropped: ccx uses the symmetric part of the "
+                                 "material's tangent, which can slow the convergence, not change "
+                                 "the solution.", once=True)
+            else:
+                self.report.note(f"*USER MATERIAL, {k} dropped (not a ccx parameter"
+                                 f"{'; ccx has no hybrid elements' if k == 'HYBRID FORMULATION' else ''}"
+                                 f").", once=True)
+        data = list(b.data)
+        try:
+            n = int(float(b.param("CONSTANTS") or "0"))
+        except ValueError:
+            n = 0
+        lines = [d for d in data if d.strip()]
+        if not thermal and n > 0 and n % 8 == 0 and len(lines) == n // 8:
+            data = lines + ["0."]
+            self.report.note(f"*USER MATERIAL, CONSTANTS={n}: ccx reads a temperature after the "
+                             f"last constant, for a multiple of 8 constants on a line of its own "
+                             f"(without it ccx stops: 'anisotropic definition is not complete'); "
+                             f"0. added — one set of constants, used at every temperature.",
+                             once=True)
+        mat = self._card_material.get(id(b))
+        used = mat is None or mat.upper() in self._used_materials
+        if thermal:
+            self.report.warn(f"*USER MATERIAL, TYPE=THERMAL (material {mat or '?'}): ccx hands every "
+                             f"thermal user material to its umatht routine, whatever the name, and "
+                             f"a stock ccx's umatht is empty, so ccx runs this material with no heat "
+                             f"conduction and no error. A ccx rebuilt with the deck's UMATHT as "
+                             f"umatht.f runs it (Abaqus' arguments come first; ccx uses only FLUX "
+                             f"and DFDG, so the heat capacity comes from *SPECIFIC HEAT).")
+            why = "*USER MATERIAL, TYPE=THERMAL (ccx's umatht is empty in a stock ccx)"
+        elif self._umat_explicit:
+            (self.report.warn if self._abaqus_umat else self.report.note)(
+                "*USER MATERIAL in an Abaqus/Explicit deck is a VUMAT, which ccx cannot call: ccx "
+                "has no VUMAT interface (its user materials, explicit steps included, go through "
+                "its UMAT interfaces), so ccx stops with 'no user material subroutine'"
+                + (" and --abaqus-umat leaves these materials alone" if self._abaqus_umat else "")
+                + ". Port the VUMAT to a UMAT to run it.", once=True)
+            why = "*USER MATERIAL (a VUMAT: ccx has no VUMAT interface)"
+        elif self._abaqus_umat:
+            why = "*USER MATERIAL (only a ccx rebuilt with the deck's UMAT runs it)"
+        else:
+            self.report.note("*USER MATERIAL kept: the Abaqus UMAT does not run in a stock ccx, which "
+                             "stops with 'no user material subroutine'. --abaqus-umat writes it for "
+                             "ccx's Abaqus-UMAT interface, for a ccx rebuilt with the deck's UMAT "
+                             "(see the user guide).", once=True)
+            why = "*USER MATERIAL (the Abaqus subroutine does not run in ccx)"
+        if used:
+            self._reduces(why)
+        return [emit_keyword("USER MATERIAL", params)] + data
 
     def handle_depvar(self, b: Block) -> List[str]:
         """``*DEPVAR``: ccx reads only the SDV count.  Abaqus' DELETE= (element deletion
@@ -11001,6 +11216,7 @@ class Converter:
         raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
+        blocks = self._plan_user_materials(blocks)    # before anything reads material names
         self.build_geometry(blocks)
         self._drop_surface_elements(raw, blocks)
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
@@ -17586,9 +17802,11 @@ def default_output(input_path: str) -> str:
 class Options:
     """Conversion options (the CLI argparse namespace also satisfies this contract)."""
 
-    def __init__(self, solid_dof: bool = False, approximate: bool = False) -> None:
+    def __init__(self, solid_dof: bool = False, approximate: bool = False,
+                 abaqus_umat: bool = False) -> None:
         self.solid_dof = solid_dof
         self.approximate = approximate
+        self.abaqus_umat = abaqus_umat
 
 
 class Result:
@@ -17605,25 +17823,26 @@ class Result:
         return bool(self.body)
 
 
-def convert_file(path: str, solid_dof: bool = False, approximate: bool = False) -> Result:
+def convert_file(path: str, solid_dof: bool = False, approximate: bool = False,
+                 abaqus_umat: bool = False) -> Result:
     """One-call module API: convert an Abaqus deck file to CalculiX text."""
     report = Report()
     blocks = read_blocks(path, report)
-    conv = Converter(report, Options(solid_dof, approximate))
+    conv = Converter(report, Options(solid_dof, approximate, abaqus_umat))
     body = conv.convert(blocks) if blocks else []
     text = ("\n".join(report.header_comment_lines() + body) + "\n") if body else ""
     return Result(text, body, report, conv.geom)
 
 
 def convert_text(text: str, solid_dof: bool = False, base_dir: str = ".",
-                 approximate: bool = False) -> Result:
+                 approximate: bool = False, abaqus_umat: bool = False) -> Result:
     """Convert Abaqus deck text; ``*INCLUDE`` paths resolve relative to ``base_dir``."""
     import tempfile
     fd, p = tempfile.mkstemp(suffix=".inp", dir=base_dir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        return convert_file(p, solid_dof, approximate)
+        return convert_file(p, solid_dof, approximate, abaqus_umat)
     finally:
         os.unlink(p)
 
@@ -17937,6 +18156,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "ones it can (Riks->static, nu>=0.5 clamped, I-beam->equivalent RECT, "
                          "NLGEOM follower tractions->fixed nodal forces, surface elements with "
                          "rebar or mass->left out), each with a loud [APPROX] warning")
+    ap.add_argument("--abaqus-umat", action="store_true",
+                    help="opt-in: write *USER MATERIAL materials for ccx's Abaqus-UMAT interface "
+                         "(ABAQUS<name>, ABAQUSNL<name> under NLGEOM), for a ccx rebuilt with the "
+                         "deck's UMAT; a stock ccx runs its linear-elastic example instead")
     ap.add_argument("--check", action="store_true",
                     help="dry run: parse + convert + report, write nothing")
     ap.add_argument("--strict", action="store_true",

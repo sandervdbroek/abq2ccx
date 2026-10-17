@@ -137,7 +137,8 @@ The [architecture guide](docs/architecture.md) describes the pipeline and how to
 ## Limitations
 
 * User subroutines (UMAT/VUMAT, UEL, DLOAD, DISP, …) do not run in stock ccx. Such cards are
-  commented out, naming the ccx subroutine to port.
+  commented out, naming the ccx subroutine to port; a UMAT runs in a ccx built with it
+  (`--abaqus-umat`), a VUMAT has no ccx interface.
 * Cohesive and gasket elements run as thin continua (their traction-separation law is lost;
   warned). Abaqus general contact (`*CONTACT`), connector behaviours, inertia relief and
   materials such as viscoelasticity and concrete damaged plasticity have no equivalent and

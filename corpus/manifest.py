@@ -2225,11 +2225,9 @@ CORPUS = [
          url='https://raw.githubusercontent.com/InstituteOfMechanics/Thermomechanical_Gradient_Enhanced_Damage_UMAT/main/numerical_examples/reduced_section_plate_test/tensileTest.inp'),
     dict(name='irfancn_input', expect_solve=False, license='MIT',
          exercises='C3D8T — parts/instances/assembly; UMAT; explicit',
-         note="ccx limitation: VUMAT (Gurson-GTN; no user material subroutine in ccx). "
-              "ccx runs its *USER MATERIAL stub, which returns zero stress; only the "
-              "explicit step survives that: with no elastic constants its stable "
-              "increment is 6.2e29, so the whole step is one increment (all stresses "
-              "0, total strains up to 7e5)",
+         note="ccx limitation: VUMAT (Gurson-GTN; ccx has no VUMAT interface). Named "
+              "user_mat, it went to ccx's empty umat_user, which ran the explicit step "
+              "with zero stress; renamed ABQ2CCX_user_mat, it stops ccx",
          url='https://raw.githubusercontent.com/irfancn/Abaqus-VUMAT-Gurson_GTN/master/input.inp'),
     dict(name='irfancn_viscoelastic_input', expect_solve=False, license='MIT',
          exercises='C3D8 — parts/instances/assembly; UMAT',
@@ -3818,10 +3816,9 @@ CORPUS = [
          url='https://raw.githubusercontent.com/Tubakabura/ABAQUS-cpp-User-Subroutines/main/linearelastic/plate_builtin.inp'),
     dict(name='tubakabura_plate_user', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; UMAT; explicit',
-         note="ccx limitation: UMAT (no user material subroutine in ccx). ccx runs its "
-              "*USER MATERIAL stub, which returns zero stress; only the explicit step "
-              "survives that: with no elastic constants its stable increment is "
-              "6.2e29, so the whole step is one increment (all stresses 0)",
+         note="ccx limitation: VUMAT (ccx has no VUMAT interface). Named user, it went "
+              "to ccx's empty umat_user, which ran the explicit step with zero stress; "
+              "renamed ABQ2CCX_user, it stops ccx",
          url='https://raw.githubusercontent.com/Tubakabura/ABAQUS-cpp-User-Subroutines/main/linearelastic/plate_user.inp'),
     dict(name='universal_ctags_input', expect_solve=False, license='GPL-2.0',
          exercises='CPE4R — parts/instances/assembly; UMAT',

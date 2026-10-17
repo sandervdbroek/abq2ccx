@@ -40,6 +40,12 @@ with `DENSITY` and a thickness, whose mass the conversion would lose: `--approxi
 converts them without it. Surface elements reach ccx only when they carry rebar or mass
 that acts; `--approximate` leaves them out anyway.
 
+**`*ERROR in umat: no user material subroutine defined for material …`.** The deck's UMAT does
+not run in a stock ccx: convert with `--abaqus-umat` and run a ccx built with the UMAT
+([user guide](user-guide.md#--abaqus-umat)). In an Abaqus/Explicit deck it is a VUMAT, which
+must first be ported to a UMAT. A material named `ABQ2CCX_…` was renamed so that ccx stops
+here rather than run one of its own routines.
+
 **`*ERROR reading *COMPLEX FREQUENCY: either parameter CORIOLIS or parameter FLUTTER is
 required`.** ccx's complex eigenvalue step covers only Coriolis forces and flutter; Abaqus'
 damped one (dashpots, damping) has no ccx counterpart. Use `*MODAL DYNAMIC` or `*STEADY
@@ -99,6 +105,11 @@ converter comments `*TEMPERATURE` out there.
   expansion stops with "too many cutbacks".** A ccx 2.23 bug; the converter warns, naming
   the materials. Check one element's thermal strain by hand, or keep the thermal load out of
   NLGEOM steps.
+* **A `--abaqus-umat` material is linear elastic, or a thermal user material conducts no
+  heat.** That is a stock ccx: its Abaqus-UMAT interface holds a linear-elastic example and
+  its `umatht` is empty. Run the ccx built with the deck's routines. Under `ABAQUSNL` (NLGEOM)
+  ccx 2.23 hands the UMAT an undefined stress at the start of each increment
+  ([user guide](user-guide.md#--abaqus-umat)).
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=`; the converter keeps
   the Abaqus no-field state (field = 0): exact (a note) when the deck sets no field variable
   and the table gives that state, reduced physics (warned) otherwise.
@@ -186,8 +197,8 @@ The converter keeps these as `**` comments with guidance:
 * **Inertia relief** → soft springs to ground or a 3-2-1 constraint.
 * **Unsupported materials** (`*VISCOELASTIC`, `*CONCRETE …`, `*DAMAGE EVOLUTION`, …) → the
   nearest supported model.
-* **User subroutines** → port them to ccx's (`umat.f`, `dload.f`, `uboun.f`, …), as the
-  warning names.
+* **User subroutines** → port them to ccx's (`dload.f`, `uboun.f`, …), as the warning names.
+  A UMAT runs as it is in a ccx built with it (`--abaqus-umat`); a VUMAT must become a UMAT.
 
 ## Reporting a conversion problem
 

@@ -115,6 +115,7 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | a faceted analytical sphere (`--approximate`) | the indentation force on a block | Hertz | 2.3 % (finite block, penalty contact) |
 | the plane punch in explicit dynamics | `R2D2` skins at the increment the converter caps (ccx leaves this contact out of its estimate) | the punch given its motion node by node at that increment | exact |
 | a rigid `R2D2` segment and an `R3D4` facet on a spring | an element pressure `P` (on the `R2D2`: per unit depth) | p / k | exact |
+| a stretched cube with a `*USER MATERIAL` | named `UserMat` and `JohnsonCook_Steel` (renamed); with `--abaqus-umat`, small strain and NLGEOM | ccx stops: "no user material subroutine"; ccx's example UMAT: E ε, E ln(1 + ε) | —; exact; 1e-7 |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`

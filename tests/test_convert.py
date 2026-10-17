@@ -6964,6 +6964,102 @@ def test_run_reads_ccx_output_in_any_encoding():
     assert code == 0
 
 
+UMAT_CUBE = HEX + """*MATERIAL, NAME={name}
+*USER MATERIAL, CONSTANTS=2
+210000., 0.3
+*DEPVAR
+3
+*SOLID SECTION, ELSET=EALL, MATERIAL={name}
+*BOUNDARY
+1, 1, 3
+*STEP{step}
+*STATIC
+*CLOAD
+7, 3, 1.
+*END STEP
+"""
+
+
+def test_user_material_names_never_pick_another_ccx_routine():
+    # ccx hands a *USER MATERIAL to the routine its name starts with (upper-cased): to its
+    # Abaqus-UMAT interface, empty stubs or its own laws.  Such a material is renamed, so ccx
+    # stops with 'no user material subroutine' instead of running another material.
+    for prefix in A.UMAT_NAME_PREFIXES:
+        name = prefix.lower() + "Mat" if prefix != "@" else "@Mat"
+        body, conv, rep = convert_str(UMAT_CUBE.format(name=name, step=""))
+        assert f"*MATERIAL, NAME=ABQ2CCX_{name}\n" in body, prefix
+        assert f"MATERIAL=ABQ2CCX_{name}\n" in body, prefix
+        assert f"material renamed ABQ2CCX_{name}" in rep.text(), prefix
+        assert "*USER MATERIAL, CONSTANTS=2\n210000., 0.3\n" in body
+        assert "*USER MATERIAL (the Abaqus subroutine does not run in ccx)" in conv.reduced_physics
+    # other names stop ccx as they are: ccx keeps the quotes of a quoted name
+    for name in ("Steel", '"user mat"'):
+        body, _, rep = convert_str(UMAT_CUBE.format(name=name, step=""))
+        assert f"*MATERIAL, NAME={name}\n" in body and "renamed" not in rep.text()
+    # only a user material is dispatched by its name; the new name is unique
+    deck = UMAT_CUBE.format(name="UserMat", step="") + ("*MATERIAL, NAME=ABQ2CCX_UserMat\n"
+                                                        "*ELASTIC\n1., 0.3\n*MATERIAL, NAME=Abaqus_Steel\n"
+                                                        "*ELASTIC\n1., 0.3\n")
+    body, _, rep = convert_str(deck)
+    assert "*MATERIAL, NAME=ABQ2CCX_UserMat_2\n" in body and "MATERIAL=ABQ2CCX_UserMat_2\n" in body
+    assert "*MATERIAL, NAME=ABQ2CCX_UserMat\n" in body and "*MATERIAL, NAME=Abaqus_Steel\n" in body
+    # composite plies name the material too
+    deck = S4.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                      "*Shell Section, elset=E, composite\n0.1, 3, UserPly, 0.\n0.1, 3, M, 90.\n"
+                      "*Material, name=UserPly\n*User Material, constants=1\n7.\n")
+    body, _, _ = convert_str(deck)
+    assert "\n0.1, , ABQ2CCX_UserPly\n" in body and "*MATERIAL, NAME=ABQ2CCX_UserPly\n" in body
+    assert not dangling_refs(reparse(body))
+
+
+def test_abaqus_umat_writes_user_materials_for_the_abaqus_interface():
+    body, conv, rep = convert_str(UMAT_CUBE.format(name="UserMat", step=""), abaqus_umat=True)
+    assert "*MATERIAL, NAME=ABAQUSUserMat\n" in body and "MATERIAL=ABAQUSUserMat\n" in body
+    assert "*USER MATERIAL, CONSTANTS=2\n210000., 0.3\n*DEPVAR\n3," in body
+    assert "umat_abaqus.f: small strain" in rep.text() and "linear-elastic example" in rep.text()
+    for arg in ("STRAN, DSTRAN, STRESS, DROT", "CELENT", "LAYER, KSPT", "PREDEF, DPRED",
+                "SSE, SPD, SCD", "RPL, DDSDDT, DRPLDE, DRPLDT", "TEMP, DTEMP", "NDI, NSHR, NTENS",
+                "DDSDDE", "PNEWDT", "KSTEP", "CMNAME"):
+        assert f"Abaqus-UMAT interface, {arg}" in rep.text(), arg
+    assert "NSTATV" not in rep.text() and "U0" not in rep.text()
+    assert conv.reduced_physics == ["*USER MATERIAL (only a ccx rebuilt with the deck's UMAT runs it)"]
+    # NLGEOM: the logarithmic-strain interface, whose start-of-increment stress 2.23 gets wrong
+    body, _, rep = convert_str(UMAT_CUBE.format(name="Mat", step=", NLGEOM"), abaqus_umat=True)
+    assert "*MATERIAL, NAME=ABAQUSNLMat\n" in body and "never computes U0" in rep.text()
+    # ccx reads the name without blanks and would keep quotes; at most 80 characters
+    body, _, rep = convert_str(UMAT_CUBE.format(name='"my mat"', step=""), abaqus_umat=True)
+    assert "*MATERIAL, NAME=ABAQUSmymat\n" in body and "MATERIAL=ABAQUSmymat\n" in body
+    body, _, rep = convert_str(UMAT_CUBE.format(name="M" * 76, step=""), abaqus_umat=True)
+    assert f"*MATERIAL, NAME=ABAQUS{'M' * 74}\n" in body and "so the UMAT sees CMNAME" in rep.text()
+    # Abaqus/Explicit: a VUMAT, which ccx cannot call: guarded as without the option
+    deck = UMAT_CUBE.format(name="UserMat", step="").replace(
+        "*STATIC", "*DYNAMIC, EXPLICIT\n, 1e-4").replace("*DEPVAR", "*DENSITY\n7.8e-9\n*DEPVAR")
+    body, conv, rep = convert_str(deck, abaqus_umat=True)
+    assert "*MATERIAL, NAME=ABQ2CCX_UserMat\n" in body and "ABAQUS" not in body
+    assert "no VUMAT interface" in rep.text() and "Abaqus-UMAT interface," not in rep.text()
+
+
+def test_user_material_card_as_ccx_reads_it():
+    # ccx reads a temperature after the last constant: for 8 constants a line of its own;
+    # it knows CONSTANTS and TYPE=THERMAL only
+    card = ("*USER MATERIAL, CONSTANTS={n}, UNSYMM, TYPE=MECHANICAL\n{data}"
+            "*USER MATERIAL, TYPE=THERMAL, CONSTANTS=1\n50.\n")
+    for n, data, extra in ((8, "1.,2.,3.,4.,5.,6.,7.,8.\n", True), (2, "1.,2.\n", False),
+                           (16, "1.,2.,3.,4.,5.,6.,7.,8.\n9.,10.,11.,12.,13.,14.,15.,16.\n", True),
+                           (10, "1.,2.,3.,4.,5.,6.,7.,8.\n9.,10.\n", False)):
+        deck = UMAT_CUBE.format(name="Plain", step="").replace(
+            "*USER MATERIAL, CONSTANTS=2\n210000., 0.3\n", card.format(n=n, data=data))
+        body, conv, rep = convert_str(deck)
+        assert f"*USER MATERIAL, CONSTANTS={n}\n{data}{'0.' + chr(10) if extra else ''}*USER" in body, n
+        assert ("on a line of its own" in rep.text()) == extra
+        assert "*USER MATERIAL, TYPE=THERMAL, CONSTANTS=1\n50.\n" in body
+        assert "UNSYMM dropped" in rep.text() and "TYPE=MECHANICAL" not in body
+        assert "umatht" in rep.text() and len(conv.reduced_physics) == 2
+    # a material no section uses changes nothing
+    body, conv, _ = convert_str(UMAT_CUBE.format(name="Plain", step="").replace(
+        "MATERIAL=Plain", "MATERIAL=Other") + "*MATERIAL, NAME=Other\n*ELASTIC\n1., 0.3\n")
+    assert "*USER MATERIAL, CONSTANTS=2" in body and not conv.reduced_physics
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
