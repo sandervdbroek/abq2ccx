@@ -260,6 +260,31 @@ def element_node_count(typ: str) -> Optional[int]:
     return None
 
 
+def split_suffixes(typ: str) -> Tuple[str, str]:
+    """(base, dropped letters) of a suffix element — coupled-temperature ``T``, hybrid ``H``,
+    pore-pressure ``P`` in any combination (C3D8T, CAX4RP, C3D8PT, C3D20RHT): trailing
+    suffix letters stripped until a known base is reached.  ``(typ, "")`` for any other
+    type, a known one included."""
+    typ = typ.upper()
+    base, dropped = typ, ""
+    while len(base) > 1 and base[-1] in "THP" and \
+            base not in CCX_ELEMENTS and base not in ELEMENT_TYPE_MAP:
+        dropped += base[-1]
+        base = base[:-1]
+    if dropped and (base in CCX_ELEMENTS or base in ELEMENT_TYPE_MAP):
+        return base, dropped
+    return typ, ""
+
+
+def keeps_dof8(typ: str) -> bool:
+    """Whether elements of Abaqus type ``typ`` carry DOF 8 (pore, fluid or acoustic
+    pressure) in the converted deck: acoustic and acoustic-structural interface elements,
+    hydrostatic fluid, fluid link and fluid pipe elements, ccx's CFD elements and user
+    elements, all emitted as they are.  Pore-pressure elements lose it with their ``P``
+    suffix (ccx_element_type)."""
+    return re.match(r"AC|ASI|F(2D2|AX2|3D\d+|LINK|PC?[23]D2)$|V?U\d+$", typ.upper()) is not None
+
+
 def ccx_element_type(typ: str, report: "Report") -> str:
     """Return the CalculiX element name for an Abaqus type, substituting where
     needed (node-count preserving) and warning on anything not directly supported."""
@@ -286,16 +311,10 @@ def ccx_element_type(typ: str, report: "Report") -> str:
         return sub
     if typ in CCX_ELEMENTS:
         return typ
-    # Suffix elements — coupled-temperature ``T``, hybrid ``H``, pore-pressure ``P`` — in
-    # any combination (C3D8T, CAX4RP, C3D8PT, C3D20RHT): strip trailing suffix letters
-    # until a known base is reached, warn once per dropped capability, and resolve the
-    # base (which may itself need mapping, e.g. C3D10MT -> C3D10M -> C3D10).
-    base, dropped = typ, ""
-    while len(base) > 1 and base[-1] in "THP" and \
-            base not in CCX_ELEMENTS and base not in ELEMENT_TYPE_MAP:
-        dropped += base[-1]
-        base = base[:-1]
-    if dropped and (base in CCX_ELEMENTS or base in ELEMENT_TYPE_MAP):
+    # Suffix elements: warn once per dropped capability, and resolve the base (which may
+    # itself need mapping, e.g. C3D10MT -> C3D10M -> C3D10).
+    base, dropped = split_suffixes(typ)
+    if dropped:
         if "T" in dropped:
             report.warn(f"Element {typ} -> {base} (CalculiX uses the base element for coupled "
                         f"temperature-displacement; the temperature DOF comes from the step).", once=True)
@@ -2732,6 +2751,8 @@ class Converter:
         self._no_rot: set = set()                      # ... and of trusses: no rotations at all
         self._shell_nodes: set = set()
         self._beam_nodes: set = set()
+        self._pore_nodes: set = set()                  # nodes of pore-pressure elements
+        self._cavity_refs: Dict[int, str] = {}         # *FLUID CAVITY reference node -> name
         self._n_inactive_rot = 0
         self._n_inactive_rot_truss = 0
         self._depvar_counts: set = set()
@@ -5715,11 +5736,17 @@ class Converter:
                              f"(incomplete export?); ccx stops with 'node set {spec.upper()} has not "
                              f"yet been defined'.", once=True)
 
-    # Abaqus DOFs ccx has no form of ('*ERROR in bounadd: unknown DOF'; it knows 1-6, 8 and
-    # 11), with the element types that have them (a user element may have any DOF): a BC on
-    # such a DOF where no element of the model has it is inactive, and Abaqus ignores it
-    # (with a warning)
+    # Abaqus DOFs ccx has no form of, with the element types that have them in the converted
+    # deck (a user element may have any DOF): a BC on such a DOF where no element of the
+    # model has it is inactive, and Abaqus ignores it (with a warning).  ccx stops on 7 and 9
+    # ('*ERROR in bounadd: unknown DOF'; it knows 1-6, 8 and 11) and maps 8 onto its own DOF
+    # 4, a pressure or potential only in its CFD and electromagnetic models (probed on 2.23):
+    # on a shell or beam node it silently holds or prescribes the rotation about x, on a
+    # plane or axisymmetric node ccx crashes, on a solid node or a node of no element it
+    # does nothing.  A pore-pressure element's DOF 8 goes with its P suffix, a fluid
+    # cavity's with its card (_note_dropped_dof)
     _UNKNOWN_DOF_ELEMENTS = {7: ("warping", lambda t: re.match(r"B3\dOS|V?U\d+$", t) is not None),
+                             8: ("pore, fluid or acoustic pressure", keeps_dof8),
                              9: ("electric potential",
                                  lambda t: t.endswith("E") or t.startswith("Q3D") or
                                  re.match(r"V?U\d+$", t) is not None)}
@@ -5750,11 +5777,42 @@ class Converter:
                            [", ".join([spec, str(start), str(d - 1)] + extra)])
             start = d + 1
         for d in drop:
-            self.report.note(f"*BOUNDARY on DOF {d} ({self._UNKNOWN_DOF_ELEMENTS[d][0]}) dropped: "
-                             f"no element of the model has that DOF, so Abaqus ignores the BC (with "
-                             f"a warning), and ccx, which has no such DOF, would stop ('unknown "
-                             f"DOF').", once=True)
+            self._note_dropped_dof(spec, d)
         return out
+
+    def _note_dropped_dof(self, spec: str, d: int) -> None:
+        """Report the BC on DOF ``d`` of ``spec`` that _known_dof_lines leaves out: a note
+        where Abaqus ignores it too, a warning where the deck's DOF 8 is lost in ccx."""
+        if d == 8:
+            nodes = self._resolve_nodes(spec)
+            cavities = sorted({self._cavity_refs[n] for n in nodes if n in self._cavity_refs})
+            if cavities:
+                self.report.warn(f"*BOUNDARY on DOF 8 of the reference node of *FLUID CAVITY "
+                                 f"{', '.join(cavities)} dropped: it prescribes the cavity "
+                                 f"pressure, which loads the cavity surface, but ccx has no fluid "
+                                 f"cavity (the card is commented out) and would silently ignore "
+                                 f"DOF 8 on a node without elements. That load is LOST: a "
+                                 f"prescribed cavity pressure acts as a pressure on the cavity "
+                                 f"surface's faces.", once=True)
+                return
+            if any(n in self._pore_nodes for n in nodes):
+                self.report.warn("*BOUNDARY on DOF 8 (pore pressure) dropped: the pore-pressure "
+                                 "elements lose that DOF with their P suffix, so the converted "
+                                 "deck has no pore pressure to prescribe (the drainage conditions "
+                                 "go with the consolidation physics). ccx would read DOF 8 as the "
+                                 "rotation about x, which crashes it on plane/axisymmetric "
+                                 "nodes.", once=True)
+                return
+            self.report.note("*BOUNDARY on DOF 8 (pore, fluid or acoustic pressure) dropped on "
+                             "nodes where no element has that DOF: Abaqus ignores the BC there "
+                             "(with a warning), while ccx would read it as the rotation about x "
+                             "(holding it on shell/beam nodes, crashing on plane/axisymmetric "
+                             "ones).", once=True)
+            return
+        self.report.note(f"*BOUNDARY on DOF {d} ({self._UNKNOWN_DOF_ELEMENTS[d][0]}) dropped: "
+                         f"no element of the model has that DOF, so Abaqus ignores the BC (with "
+                         f"a warning), and ccx, which has no such DOF, would stop ('unknown "
+                         f"DOF').", once=True)
 
     def _active_dof_lines(self, spec: str, d1: int, d2: int, extra: List[str]) -> Optional[List[str]]:
         """BC data lines for DOFs d1..d2 on ``spec`` with the rotational DOFs (4-6) moved or
@@ -12530,13 +12588,16 @@ class Converter:
         whether field variables are ever set, and the step count."""
         quiet = Report()
         emitted: Dict[str, str] = {}
+        pore: Dict[str, bool] = {}
         plane: Dict[int, bool] = {}
         no_rot: Dict[int, bool] = {}
         self._shell_nodes = set()
         self._beam_nodes = set()
+        self._pore_nodes = set()
         for typ, conn in self.geom.elements.values():
             if typ not in emitted:
                 emitted[typ] = ccx_element_type(typ, quiet)
+                pore[typ] = "P" in split_suffixes(typ)[1]
             cc = emitted[typ]
             is_plane = cc.startswith(PLANE_ELEM_PREFIXES)
             translational = is_plane or cc.startswith(("T2D", "T3D"))
@@ -12547,6 +12608,16 @@ class Converter:
                 self._shell_nodes.update(conn)
             elif cc in BEAM_TYPES:
                 self._beam_nodes.update(conn)
+            if pore[typ]:
+                self._pore_nodes.update(conn)
+        # the reference node of a surface-based fluid cavity carries the cavity pressure on
+        # its DOF 8; ccx has no fluid cavity (the card is commented out)
+        self._cavity_refs = {}
+        for b in blocks:
+            if b.keyword == "FLUID CAVITY":
+                ref = (b.param("REF NODE") or b.param("REFNODE") or "").strip()
+                for n in self._resolve_nodes(ref) if ref else []:
+                    self._cavity_refs[n] = (b.param("NAME") or "").strip() or "(unnamed)"
         # nodes that only belong to plane-stress/strain/axisymmetric continuum elements:
         # they have no rotational DOFs at all — unless they are the reference/rotation node
         # of a rigid body or coupling, which carries the body's rotations (the C3D8I slabs of

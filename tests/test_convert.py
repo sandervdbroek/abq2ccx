@@ -817,10 +817,56 @@ def test_boundary_on_inactive_unknown_dof_dropped():
     deck = HEX + ("*Nset, nset=TOP\n5,6,7,8\n*Step\n*Static\n*Boundary\nTOP, 9, 9, 500.\n"
                   "TOP, 1, 9\n*End Step\n")
     body, _, rep = convert_str(deck)
-    assert "TOP, 9, 9" not in body and "TOP, 1, 6\nTOP, 8, 8" in body
+    assert "TOP, 9, 9" not in body and "TOP, 1, 6\n" in body and "TOP, 8, 8" not in body
     assert any("DOF 9 (electric potential) dropped" in m for _, m in rep.entries)
     body, _, _ = convert_str(deck.replace("TYPE=C3D8", "TYPE=C3D8E"))
     assert "TOP, 9, 9, 500." in body
+
+
+def test_boundary_on_dof8_dropped_where_the_ccx_model_has_none():
+    # ccx 2.23 reads DOF 8 as its DOF 4 (probed): the rotation about x of a shell or beam node,
+    # held or prescribed without a message; a crash on plane nodes; nothing on solid nodes
+    step = "*Step\n*Static\n*Boundary\nTOP, 8, 8, 0.5\nTOP, 1, 8\n*Cload\nTOP, 3, 1.\n*End Step\n"
+    deck = HEX + "*Nset, nset=TOP\n5,6,7,8\n" + step
+    body, _, rep = convert_str(deck)                   # no element has DOF 8: Abaqus ignores it
+    assert "TOP, 8, 8" not in body and "TOP, 1, 6\n*CLOAD" in body
+    assert any(lvl == "NOTE" and "DOF 8 (pore, fluid or acoustic pressure) dropped" in m
+               for lvl, m in rep.entries)
+    shell = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n*Element, type=S4, elset=P\n1,1,2,3,4\n"
+             "*Material, name=m\n*Elastic\n1., 0.3\n*Shell Section, elset=P, material=m\n0.1\n"
+             "*Nset, nset=TOP\n3, 4\n")
+    body, _, _ = convert_str(shell + step)              # it would hold the shell's rotation
+    assert "TOP, 8, 8" not in body and "TOP, 1, 6\n*CLOAD" in body
+    # a pore-pressure element loses DOF 8 with its P suffix: the BC goes with it (warned)
+    body, _, rep = convert_str(deck.replace("TYPE=C3D8", "TYPE=C3D8P"))
+    assert "TOP, 8, 8" not in body and "TOP, 1, 6\n*CLOAD" in body
+    assert any(lvl == "WARNING" and "DOF 8 (pore pressure) dropped" in m for lvl, m in rep.entries)
+    # elements emitted with their DOF 8 keep the BC (here ccx's CFD element)
+    body, _, _ = convert_str(HEX + "*Element, type=F3D4, elset=F\n2, 1, 2, 3, 5\n"
+                                   "*Nset, nset=TOP\n5,6,7,8\n" + step)
+    assert "TOP, 8, 8, 0.5" in body
+    assert all(A.keeps_dof8(t) for t in ("AC3D8", "ACIN3D4", "ASI3D4", "F3D4", "FAX2", "FLINK",
+                                          "FPC3D2", "U12", "VU1"))
+    assert not any(A.keeps_dof8(t) for t in ("C3D8P", "CPE8P", "CAX8RP", "S4R", "FRAME3D"))
+    # the default-amplitude planner leaves the line out as handle_boundary does
+    dyn = HEX + ("*Material, name=m\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, "
+                 "elset=EALL, material=m\n*Nset, nset=TOP\n5,6,7,8\n*Step\n*Dynamic\n0.1, 1.\n"
+                 "*Boundary\nTOP, 3, 3, 0.1\nTOP, 8, 8, 5.\nTOP, 1, 1, 0.01\n*End Step\n")
+    body, _, _ = convert_str(dyn)
+    assert "*BOUNDARY, AMPLITUDE=RAMP12357111317\nTOP, 3, 3, 0.1\nTOP, 1, 1, 0.01\n" in body
+
+
+def test_fluid_cavity_pressure_bc_dropped_and_its_step_unloaded():
+    # DOF 8 of a *FLUID CAVITY reference node is the cavity pressure: in Abaqus the BC loads
+    # the cavity surface; ccx has no fluid cavity and ignores DOF 8 on a node of no element
+    deck = HEX + ("*Node\n99, 0.5, 0.5, 0.5\n*Surface, type=ELEMENT, name=CAVS\nEALL, S1\n"
+                  "*Fluid Behavior, name=WATER\n*Fluid Density\n1.\n*Fluid Cavity, name=CAV, "
+                  "behavior=WATER, refnode=99, surface=CAVS\n*Step\n*Static\n*Boundary\n"
+                  "99, 8, 8, 0.1\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "99, 8, 8" not in body and conv.unloaded_steps == [1]
+    assert any(lvl == "WARNING" and "*FLUID CAVITY CAV dropped" in m and "LOST" in m
+               for lvl, m in rep.entries)
 
 
 def test_inactive_dof_lines_leave_no_empty_or_split_card():

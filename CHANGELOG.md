@@ -77,8 +77,10 @@ without an error. A full audit and the work that followed:
   reads (Johnson-Cook kept as an output-only criterion, other criteria commented);
   Poisson's ratio 0 on E-only `*ELASTIC` lines; unused cohesive `TYPE=TRACTION`
   elasticity commented; BCs on DOFs a node does not have (truss rotations, DOFs 7
-  and 9) dropped; `OFFSET=SPOS`/`SNEG` as numbers; the source-deck faults among the
-  rest named in the corpus notes.
+  and 9) dropped, and DOF 8, which ccx 2.23 reads as the rotation about x, where the
+  converted model has no pore, fluid or acoustic pressure (warned where a pore-pressure
+  element or a `*FLUID CAVITY` lost it); `OFFSET=SPOS`/`SNEG` as numbers; the
+  source-deck faults among the rest named in the corpus notes.
 
 Corpus: 165 decks solve their own problem; 29 more solve with reduced physics, 14 load
 nothing (3 both) and one drifts to a solution that is not the deck's; 221 mesh-only decks are
