@@ -1,0 +1,56 @@
+name: Release
+
+# Publishing a GitHub release whose tag is "v" + __version__ (v1.2.0 for "1.2.0") builds the
+# sdist and wheel and uploads them to PyPI by trusted publishing: PyPI trusts this workflow
+# file in the "pypi" environment, so no token is stored.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build the distributions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - name: The release tag is the version
+        run: |
+          version="$(python -c 'import abq2ccx; print(abq2ccx.__version__)')"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::release tag $GITHUB_REF_NAME, but __version__ is $version (tag v$version)"
+            exit 1
+          fi
+      - name: Unit tests
+        run: python tests/test_convert.py
+      - name: Build
+        run: |
+          python -m pip install build
+          python -m build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Upload to PyPI
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

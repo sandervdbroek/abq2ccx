@@ -345,3 +345,10 @@ ones (`convert_str(text)` converts an inline deck), an example plus a check in
 [Testing](testing.md) describes the three layers and the gates a change must pass. Give every
 `open()` of a deck or document `encoding="utf-8"`: CI runs the tests on Windows, where the
 default is the code page.
+
+## Releasing
+
+Set `__version__` and the changelog heading, then publish a GitHub release tagged `v` +
+`__version__` (`v1.2.0`). [`release.yml`](../.github/workflows/release.yml) checks the tag,
+runs the unit tests, builds the sdist and wheel and uploads them to PyPI by trusted
+publishing: PyPI trusts that workflow in the `pypi` environment, so no token is stored.

@@ -97,7 +97,8 @@ without an error. A full audit and the work that followed:
   element or a `*FLUID CAVITY` lost it); `OFFSET=SPOS`/`SNEG` as numbers; the
   source-deck faults among the rest named in the corpus notes.
 * **Packaging, CI and Windows** — `pipx install git+https://github.com/sandervdbroek/abq2ccx`
-  installs an `abq2ccx` command (`pyproject.toml`; copying the file still works). GitHub
+  installs an `abq2ccx` command (`pyproject.toml`; copying the file still works), and
+  publishing a GitHub release uploads it to PyPI (`release.yml`). GitHub
   Actions run the unit tests and the reference check on Linux, macOS and Windows (Python 3.9
   and the newest) and `validate_with_ccx.py` on FreeCAD 1.1.4's ccx build. Python 3.9 is the
   real minimum: the converter already called `math.gcd` with more than two arguments (the
