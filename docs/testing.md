@@ -162,7 +162,8 @@ The tests:
   (ccx 2.23 ends a diverged solution with "Job finished" and exit 0); **accepted** for a
   mesh-only deck that reads cleanly; **failed** otherwise.
 * `test_classify_ccx_run` — the judge itself, including the "Job finished, then abort" case
-  of issue #3 and NaN/Inf results as ccx 2.23 writes them.
+  of issue #3 and NaN/Inf results as ccx 2.23 writes them, also as `1.#QNAN` and `-1.#IND`
+  (a Windows build whose printf is msvcrt's).
 * `test_hood_hinge_keeps_one_mechanism_mode` — the hood-hinge deck's hinge leaves exactly
   one mechanism mode besides the six rigid-body modes.
 

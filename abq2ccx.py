@@ -17964,7 +17964,8 @@ CCX_ABORT_SIGNS = ("free(): ", "double free", "malloc(): ", "corrupted size", "A
 _CCX_STEP_RE = re.compile(r"^\s*STEP\s+\d+\s*$", re.M)
 # A solution that went to NaN (an unstable explicit increment, say) still ends with "Job
 # finished" and exit 0; only the results show it: Fortran writes NaN/Infinity to the .dat,
-# C writes NAN/INF to the .frd.
+# C writes NAN/INF to the .frd -- or 1.#QNAN, -1.#IND and 1.#INF in a Windows build whose
+# printf is msvcrt's (MinGW's default); no number holds a "#".
 _NONFINITE_RE = re.compile(rb"(?i)(?<![a-z])[+-]?(?:nan|inf(?:inity)?)(?![a-z])")
 _DAT_LINE_RE = re.compile(rb"\s*(?:(?P<row>[+-]?(?:\.?\d|(?i:(?:nan|inf(?:inity)?)(?![a-z]))))|[A-Za-z])")
 _DAT_TABLE_RE = re.compile(rb"\s*(?:[A-Z] ){3}")      # "S T E P", "E I G E N V A L U E ..."
@@ -18000,7 +18001,7 @@ def _frd_nonfinite(fh) -> Optional[str]:
     block, at = "", ""
     for ln in fh:
         if ln.startswith((b" -1", b" -2")):         # one node's values
-            if (b"N" in ln or b"n" in ln) and _NONFINITE_RE.search(ln):
+            if b"#" in ln or ((b"N" in ln or b"n" in ln) and _NONFINITE_RE.search(ln)):
                 return f"{block} at {at}: {_squash(ln[3:])}"
         elif ln.startswith(b" -4"):                 # " -4  DISP        4    1"
             block = _squash(ln[3:]).split(" ")[0]

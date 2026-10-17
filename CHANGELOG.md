@@ -96,7 +96,8 @@ without an error. A full audit and the work that followed:
   real minimum: the converter already called `math.gcd` with more than two arguments (the
   docs said 3.7). On Windows, `--run` and `validate_with_ccx.py` find ccx in FreeCAD,
   PrePoMax and bConverged installs, and ccx's output, the reports and the generated docs no
-  longer depend on the code page.
+  longer depend on the code page; the solve judge also reads msvcrt's NaN spellings
+  (`1.#QNAN`, `-1.#IND`) in the `.frd`.
 * **User materials** — a `*USER MATERIAL` whose name would make ccx run one of its own
   routines (`USER…` and `@…` are empty in a stock ccx, `ABAQUS…` a linear-elastic example,
   `JOHNSONCOOK…` and ten more ccx's own laws) is renamed `ABQ2CCX_<name>`, so ccx stops on
