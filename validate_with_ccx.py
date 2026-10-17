@@ -53,7 +53,6 @@ Exits 0 if every available check passes (or ccx is not installed — then it ski
 a clear message), 1 if a check fails.  Requires CalculiX; install it or FreeCAD.
 """
 
-import glob
 import math
 import os
 import re
@@ -70,25 +69,9 @@ EXAMPLES = os.path.join(ROOT, "examples")
 
 
 def find_ccx():
-    """Return (ccx_path, extra_env) or (None, {})."""
-    for name in ("ccx", "ccx_2.23", "ccx_2.22", "ccx_2.21", "ccx_2.20", "CalculiX"):
-        p = shutil.which(name)
-        if p:
-            return p, {}
-    candidates = (
-        glob.glob("/Applications/FreeCAD*.app/Contents/Resources/bin/ccx")
-        + glob.glob("/usr/local/bin/ccx*") + glob.glob("/opt/homebrew/bin/ccx*")
-        + glob.glob("/opt/local/bin/ccx*")
-    )
-    for c in candidates:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            env = {}
-            libdir = os.path.join(os.path.dirname(os.path.dirname(c)), "lib")
-            if os.path.isdir(libdir):  # FreeCAD bundle: its .dylib/.so live in ../lib
-                env["DYLD_FALLBACK_LIBRARY_PATH"] = libdir
-                env["LD_LIBRARY_PATH"] = libdir
-            return c, env
-    return None, {}
+    """Return (ccx_path, extra_env) or (None, {}), searched as --run searches: $CCX, PATH,
+    FreeCAD, PrePoMax and bConverged installs, Homebrew, MacPorts."""
+    return A.find_ccx()
 
 
 def convert(path, out_inp, approximate=False):
@@ -97,7 +80,7 @@ def convert(path, out_inp, approximate=False):
     conv = A.Converter(rep, type("O", (), {"solid_dof": False, "approximate": approximate})())
     body = conv.convert(blocks)                     # convert first: the header lists warnings
     text = "\n".join(rep.header_comment_lines() + body) + "\n"
-    with open(out_inp, "w") as fh:
+    with open(out_inp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
 
 
@@ -109,8 +92,8 @@ def run_ccx(ccx, env, inp_path):
     full_env = dict(os.environ)
     full_env.update(env)
     try:
-        r = subprocess.run([ccx, "job"], cwd=d, env=full_env,
-                           capture_output=True, text=True, timeout=600)
+        r = subprocess.run([ccx, "job"], cwd=d, env=full_env, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=600)
         status = A.classify_ccx_run(r.returncode, r.stdout, r.stderr, os.path.join(d, "job"))
         return d, status, r.stdout + r.stderr
     except Exception as exc:  # noqa: BLE001
@@ -120,7 +103,7 @@ def run_ccx(ccx, env, inp_path):
 def frd_stress(frd_path, node):
     """Extrapolated nodal stress vector at ``node`` from a ccx .frd file, or None."""
     inblock = False
-    for ln in open(frd_path):
+    for ln in open(frd_path, encoding="utf-8"):
         if "STRESS" in ln and ln.lstrip().startswith("-4"):
             inblock = True
             continue
@@ -138,7 +121,7 @@ def frd_displacement_history(frd_path, node):
     found, empty, time, inblock, rows = [], 0, None, False, 0
     if not os.path.exists(frd_path):
         return found, empty
-    for ln in open(frd_path):
+    for ln in open(frd_path, encoding="utf-8"):
         if ln.startswith("  100C"):
             time = float(ln.split()[2])
         elif ln.startswith(" -4") and ln[5:13].strip() == "DISP":
@@ -159,7 +142,7 @@ def frd_blocks(frd_path, name):
     found, time, cur = [], None, None
     if not os.path.exists(frd_path):
         return found
-    for ln in open(frd_path):
+    for ln in open(frd_path, encoding="utf-8"):
         if ln.startswith("  100C"):
             time = float(ln[12:24])
         elif ln.startswith(" -4"):
@@ -180,7 +163,7 @@ def dat_displacements(dat_path):
     found, inblock = {}, False
     if not os.path.exists(dat_path):
         return found
-    for ln in open(dat_path):
+    for ln in open(dat_path, encoding="utf-8"):
         if ln.strip().startswith("displacements"):
             inblock = True
             continue
@@ -198,7 +181,7 @@ def dat_displacement_history(dat_path, node):
     found, inblock = [], False
     if not os.path.exists(dat_path):
         return found
-    for ln in open(dat_path):
+    for ln in open(dat_path, encoding="utf-8"):
         if ln.strip().startswith("displacements"):
             inblock = True
             continue
@@ -216,7 +199,7 @@ def dat_el_stress(dat_path, elem):
     rows, inblock = [], False
     if not os.path.exists(dat_path):
         return None
-    for ln in open(dat_path):
+    for ln in open(dat_path, encoding="utf-8"):
         if ln.strip().startswith("stresses"):
             rows, inblock = [], True
             continue
@@ -234,7 +217,7 @@ def dat_el_scalar(dat_path, title):
     found, inblock = {}, False
     if not os.path.exists(dat_path):
         return found
-    for ln in open(dat_path):
+    for ln in open(dat_path, encoding="utf-8"):
         if ln.strip().startswith(title):
             found, inblock = {}, True
             continue
@@ -253,7 +236,7 @@ def dat_eigen_table(dat_path, title):
     if not os.path.exists(dat_path):
         return []
     rows, inblock = [], False
-    for ln in open(dat_path):
+    for ln in open(dat_path, encoding="utf-8"):
         if title in ln:
             inblock = True
             continue
@@ -432,7 +415,7 @@ def dat_history(dat_path, what, nset):
     """[(time, rows)] of every ``what`` block ("displacements", "total force") that *NODE
     PRINT wrote for ``nset`` in a ccx .dat file; rows are lists of floats (node id dropped)."""
     out, rows = [], None
-    for ln in open(dat_path) if os.path.exists(dat_path) else []:
+    for ln in open(dat_path, encoding="utf-8") if os.path.exists(dat_path) else []:
         s = ln.strip()
         if s.startswith(what) and f"for set {nset.upper()} " in s:
             rows = []
@@ -687,7 +670,7 @@ def rigid_pressure_deck(kind="R2D2", thick=0.5, p=2.0, k=4.0):
 def frd_last(frd_path, name):
     """{node: values} of the last ``name`` block (DISP, STRESS, ...) in a ccx .frd file."""
     last, cur = {}, None
-    for ln in open(frd_path) if os.path.exists(frd_path) else []:
+    for ln in open(frd_path, encoding="utf-8") if os.path.exists(frd_path) else []:
         if ln.startswith(" -4"):
             cur = {} if ln.split()[1] == name else None
         elif ln.startswith(" -1") and cur is not None:
@@ -699,6 +682,7 @@ def frd_last(frd_path, name):
 
 
 def main():
+    A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
     if not ccx:
         print("CalculiX (ccx) not found — skipping end-to-end validation.")
@@ -737,13 +721,13 @@ def main():
     # consistent nodal forces.  The skin's normal points out of the plate, so the pressure on
     # its SPOS side, an element-based P = -p (Abaqus: positive along the element normal) and
     # a TRVEC into the plate are all the face pressure above, which they must reproduce.
-    deck = open(os.path.join(EXAMPLES, "nle10_surface_elements.inp")).read()
+    deck = open(os.path.join(EXAMPLES, "nle10_surface_elements.inp"), encoding="utf-8").read()
     face = syy
     for how, load in (("*DSLOAD P on SPOS", "*DSLOAD\n TOP,P,  1.0E6\n"),
                       ("*DLOAD P, element normal", "*DLOAD\n SKIN,P,  -1.0E6\n"),
                       ("*DLOAD TRVEC", "*DLOAD\n SKIN,TRVEC,  1.0E6, 0., 0., -1.\n")):
         src = os.path.join(tmp, "skin_src.inp")
-        with open(src, "w") as fh:
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(deck.replace("*DSLOAD\n TOP,P,  1.0E6\n", load))
         inp = os.path.join(tmp, "skin.inp")
         convert(src, inp)
@@ -984,11 +968,11 @@ def main():
         """Convert an example (optionally with text substitutions), run it and return the
         last printed displacement of each node, or None."""
         src = os.path.join(EXAMPLES, name + ".inp")
-        text = open(src).read()
+        text = open(src, encoding="utf-8").read()
         for a, b in subs:
             text = text.replace(a, b)
         tmp_src = os.path.join(tmp, f"{name}_{len(subs)}_src.inp")
-        with open(tmp_src, "w") as fh:
+        with open(tmp_src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, f"{name}_{len(subs)}.inp")
         convert(tmp_src, inp)
@@ -1339,7 +1323,7 @@ def main():
     convert(os.path.join(EXAMPLES, "beam_line_load_cantilever.inp"), inp)
     applied = {"A": [0.0] * 3, "B": [0.0] * 3, "C": [0.0] * 3}
     in_cload = False
-    for ln in open(inp):
+    for ln in open(inp, encoding="utf-8"):
         if ln.startswith("*"):
             in_cload = ln.startswith("*CLOAD")
         elif in_cload:
@@ -1390,12 +1374,12 @@ def main():
     # in-plane ones on its loaded edge (local 3 = -z; a cylinder about z), must match the same
     # models without the transforms (forces left in global components miss by 149 % / 88 %).
     cs, sn = math.cos(0.5), math.sin(0.5)
-    cook = open(os.path.join(EXAMPLES, "cook_membrane_traction.inp")).read().replace(
+    cook = open(os.path.join(EXAMPLES, "cook_membrane_traction.inp"), encoding="utf-8").read().replace(
         "*NODE PRINT, NSET=C\nU\n", "*NODE PRINT, NSET=RIGHT, GLOBAL=YES\nU\n")
     edge = ("*NSET, NSET=RIGHT_LOW, GENERATE\n3201, 3216, 1\n*NSET, NSET=RIGHT_UP, GENERATE\n"
             f"3217, 3233, 1\n*TRANSFORM, NSET=RIGHT_LOW, TYPE=R\n{cs!r}, {sn!r}, 0., {sn!r}, {-cs!r}, 0.\n"
             "*TRANSFORM, NSET=RIGHT_UP, TYPE=C\n10., 20., 0., 10., 20., 1.\n")
-    block = open(os.path.join(EXAMPLES, "traction_transformed_face.inp")).read()
+    block = open(os.path.join(EXAMPLES, "traction_transformed_face.inp"), encoding="utf-8").read()
     for name, how, decks in (
             ("traction_transformed_face", "C3D20R face, rectangular + cylindrical",
              (block, re.sub(r"(?m)^\*TRANSFORM.*\n.*\n", "", block))),
@@ -1404,7 +1388,7 @@ def main():
         u, bad = [], ""
         for text in decks:
             src, inp = os.path.join(tmp, "transform_src.inp"), os.path.join(tmp, "transform.inp")
-            with open(src, "w") as fh:
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
             convert(src, inp)
             d, status, out = run_ccx(ccx, env, inp)
@@ -1438,14 +1422,14 @@ def main():
         return 7.85e-3 / (8 * 210000.0) * ((3 + nu) * (1 - nu) * (a * a + b * b) * r
                                             + (3 + nu) * (1 + nu) * a * a * b * b / r
                                             - (1 - nu * nu) * r ** 3)
-    blank = open(os.path.join(EXAMPLES, "dload_blank_fields.inp")).read()
+    blank = open(os.path.join(EXAMPLES, "dload_blank_fields.inp"), encoding="utf-8").read()
     for how, text in (("element sets; blank axis point and axis components 1-2", blank),
                       ("no element set for gravity; blank axis components 1-2", blank.replace(
                           "\nCOLUMN, GRAV, 9810., , , -1.\n", "\n, GRAV, 9810., , , -1.\n").replace(
                           "\nDISC, CENTRIF, 1.E6, , , , , , 1.\n",
                           "\nDISC, CENTRIF, 1.E6, 0., 0., 0., , , 1.\n"))):
         src, inp = os.path.join(tmp, "blank_src.inp"), os.path.join(tmp, "blank.inp")
-        with open(src, "w") as fh:
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         convert(src, inp)
         d, status, out = run_ccx(ccx, env, inp)
@@ -1503,11 +1487,11 @@ def main():
     # point has a cylindrical one (ccx carries the body's rotations on its ROT NODE, which gets
     # the same axes).  The example's local loads, radial roller, circumferential support and
     # held rotations must act as in the same model written in global components.
-    deck = open(os.path.join(EXAMPLES, "transform_spherical_rigid.inp")).read()
+    deck = open(os.path.join(EXAMPLES, "transform_spherical_rigid.inp"), encoding="utf-8").read()
     u, bad = [], ""
     for text in (deck, global_twin(deck)):
         src, inp = os.path.join(tmp, "local_src.inp"), os.path.join(tmp, "local.inp")
-        with open(src, "w") as fh:
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         convert(src, inp)
         d, status, out = run_ccx(ccx, env, inp)
@@ -1576,7 +1560,7 @@ def main():
         u, bad = [], ""
         for i, t in enumerate((text, twin)):
             src, inp = os.path.join(tmp, f"ct{i}_src.inp"), os.path.join(tmp, f"ct{i}.inp")
-            with open(src, "w") as fh:
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(t)
             convert(src, inp)
             d, status, out = run_ccx(ccx, env, inp)
@@ -1594,17 +1578,17 @@ def main():
               f"without the *TRANSFORM by {err:.1e} of max |u| ({scale:.4g})")
         return 0 if ok else 1
     untransformed = lambda t: re.sub(r"(?mi)^\*Transform.*\n.*\n", "", t)  # noqa: E731
-    plate = open(os.path.join(EXAMPLES, "connector_transform_plate.inp")).read()
+    plate = open(os.path.join(EXAMPLES, "connector_transform_plate.inp"), encoding="utf-8").read()
     failures += same_as("connector_transform_plate (JOIN to a rigid plate on a cylindrically "
                         "transformed face, LINK to a transformed node)", plate, untransformed(plate))
-    join = open(os.path.join(EXAMPLES, "connector_transform_join.inp")).read()
+    join = open(os.path.join(EXAMPLES, "connector_transform_join.inp"), encoding="utf-8").read()
     failures += same_as("connector_transform_join (JOIN to a transformed face)", join,
                         untransformed(join))
     nl_join = join.replace("*Step\n*Static\n", "*Step, nlgeom=YES\n*Static\n0.1, 1., 1e-6, 0.2\n") \
         .replace("TIP, 1, 1.\nTIP, 2, -2.\nTIP, 3, 0.5", "TIP, 1, 40.\nTIP, 2, -80.\nTIP, 3, 20.")
     failures += same_as("connector_transform_join, NLGEOM x40 (max |u| 2.8 on a unit block)",
                         nl_join, untransformed(nl_join))
-    hinge = open(os.path.join(EXAMPLES, "connector_hinge_bodies.inp")).read().replace(
+    hinge = open(os.path.join(EXAMPLES, "connector_hinge_bodies.inp"), encoding="utf-8").read().replace(
         "*Node Print, nset=OUT", "*Node Print, nset=OUT, global=YES")
     rect, cyl = ("R", (1., 2., 0.5), (-1., 0.3, 1.)), ("C", (0.3, -0.2, -0.4), (1.1, 0.9, 1.6))
     failures += same_as("connector_hinge_bodies with a rectangular *TRANSFORM on reference point 1",
@@ -1612,7 +1596,7 @@ def main():
     failures += same_as("connector_hinge_bodies with a cylindrical *TRANSFORM on reference point 3 "
                         "(its moment in the local axes)",
                         with_transform(hinge, 3, *cyl, (0.2, 0.5, -0.1)), hinge)
-    ground = open(os.path.join(EXAMPLES, "connector_ground_hinge.inp")).read().replace(
+    ground = open(os.path.join(EXAMPLES, "connector_ground_hinge.inp"), encoding="utf-8").read().replace(
         "*Node Print, nset=OUT", "*Node Print, nset=OUT, global=YES")
     failures += same_as("connector_ground_hinge, NLGEOM, with a rectangular *TRANSFORM on its "
                         "reference point (moments in the local axes)",
@@ -1632,7 +1616,7 @@ def main():
     # and under NLGEOM (the LINK as ccx's *MPC BEAM).  The equations in global components
     # (abq2ccx before) miss here by 103-111 % of max |u| (ccx only warns of a zero coefficient
     # in cascade), in the probes by 44-190 % without a message, or stop ccx.
-    mpc_tr = open(os.path.join(EXAMPLES, "mpc_transform.inp")).read()
+    mpc_tr = open(os.path.join(EXAMPLES, "mpc_transform.inp"), encoding="utf-8").read()
     rp_xyz = (2.6, 0.35, 0.2)
     failures += same_as("mpc_transform (PIN / TIE across faces with different *TRANSFORMs, a "
                         "LINK to a transformed node)", mpc_tr, untransformed(mpc_tr))
@@ -1651,7 +1635,7 @@ def main():
     # whose ROT NODE has its axes, the beam tip a knot with its moments in global components.
     # The twin: no *TRANSFORM, a *RIGID BODY with an untransformed ROT NODE 101 whose rotation
     # about local 2 an *EQUATION holds, a knot beam at the tip, everything in global components.
-    rot_deck = open(os.path.join(EXAMPLES, "transform_rotations.inp")).read()
+    rot_deck = open(os.path.join(EXAMPLES, "transform_rotations.inp"), encoding="utf-8").read()
     ea = local_axes("C", (0.3, -0.2, -0.4), (1.1, 0.9, 1.6), (4.0, 0.5, 0.5))
     eb = local_axes("R", (1., 2., 0.5), (-1., 0.3, 1.), (2.5, 3., 0.))
 
@@ -1710,7 +1694,7 @@ def main():
     # -rho c v behind its front (on average: without Abaqus' bulk viscosity the explicit
     # solution rings behind the step front); as an implicit variant a constant acceleration
     # a, whose wave stress grows linearly behind the front, -rho c a (t - z / c).
-    src = open(os.path.join(EXAMPLES, "velocity_bc_bar.inp")).read()
+    src = open(os.path.join(EXAMPLES, "velocity_bc_bar.inp"), encoding="utf-8").read()
     accel = src.replace("nlgeom=YES\n*Dynamic, Explicit\n , 0.5",
                         "nlgeom=YES, inc=1000\n*Dynamic, direct\n 0.002, 0.5") \
         .replace("type=VELOCITY\n DRIVEN, 3, 3, 0.01", "type=ACCELERATION\n DRIVEN, 3, 3, 0.04")
@@ -1719,7 +1703,7 @@ def main():
             ("implicit, TYPE=ACCELERATION", accel, lambda z: -0.04 * (0.5 - z) if z < 0.5 else 0.0,
              False)):
         tmp_src = os.path.join(tmp, "velocity_bc_bar_src.inp")
-        with open(tmp_src, "w") as fh:
+        with open(tmp_src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, "velocity_bc_bar.inp")
         convert(tmp_src, inp)
@@ -1757,7 +1741,7 @@ def main():
     # Abaqus/Explicit ignores the value of such a BC and holds the DOF (zero velocity): the
     # driven top stays at 0, and the loaded top, held by one in the second step, stays where
     # the first step left it.
-    src = open(os.path.join(EXAMPLES, "default_amplitude_bars.inp")).read()
+    src = open(os.path.join(EXAMPLES, "default_amplitude_bars.inp"), encoding="utf-8").read()
     dyn = "*Dynamic, direct\n 0.005, 1."
     visco = src.replace(dyn, "*Visco, cetol=0.001\n 0.1, 1.").replace(
         "*Density\n 0.15625\n", "*Density\n 0.15625\n*Creep, law=TIME\n 1e-30, 1., 0.\n")
@@ -1771,7 +1755,7 @@ def main():
     for label, text in (("*DYNAMIC", src), ("*VISCO", visco),
                         ("*COUPLED TEMPERATURE-DISPLACEMENT", coupled), ("*DYNAMIC, EXPLICIT", explicit)):
         tmp_src = os.path.join(tmp, "default_amplitude_bars_src.inp")
-        with open(tmp_src, "w") as fh:
+        with open(tmp_src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, "default_amplitude_bars.inp")
         convert(tmp_src, inp)
@@ -1827,7 +1811,7 @@ def main():
     # second (abq2ccx warns about this).  With the masses as given, the heated top misses its
     # static position by up to 30 % of the expansion and the loaded top swings between -66 %
     # and +63 % of its extension about its static position.
-    src = open(os.path.join(EXAMPLES, "coupled_quasistatic_bars.inp")).read()
+    src = open(os.path.join(EXAMPLES, "coupled_quasistatic_bars.inp"), encoding="utf-8").read()
     heat = src.replace("type=C3D8T", "type=DC3D8").replace("*Coupled Temperature-displacement",
                                                            "*Heat Transfer")
     for cut in ("*Element, type=MASS, elset=WEIGHTS\n201, 17\n202, 18\n203, 19\n204, 20\n",
@@ -1839,7 +1823,7 @@ def main():
     found = {}
     for label, text in (("coupled", src), ("heat", heat)):
         tmp_src = os.path.join(tmp, "coupled_quasistatic_bars_src.inp")
-        with open(tmp_src, "w") as fh:
+        with open(tmp_src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, "coupled_quasistatic_bars.inp")
         convert(tmp_src, inp)
@@ -1902,7 +1886,7 @@ def main():
     mid = dat_displacement_history(os.path.join(d, "job.dat"), 13) if status == "solved" else []
     shutil.rmtree(d, ignore_errors=True)
     bare = os.path.join(tmp, "beam_output_3d.inp")
-    with open(inp) as fi, open(bare, "w") as fo:
+    with open(inp, encoding="utf-8") as fi, open(bare, "w", encoding="utf-8", newline="\n") as fo:
         fo.write(fi.read().replace(", OUTPUT=2D", ""))
     d, status3d, _ = run_ccx(ccx, env, bare)
     tip3d, empty3d = frd_displacement_history(os.path.join(d, "job.frd"), 25)
@@ -1961,7 +1945,7 @@ def main():
     # rho)), then moves back to 0 at 2 L / c, the end of the step.
     inp = os.path.join(tmp, "explicit_default_output_bar.inp")
     convert(os.path.join(EXAMPLES, "explicit_default_output_bar.inp"), inp)
-    with open(inp) as fh:
+    with open(inp, encoding="utf-8") as fh:
         freq = re.search(r"\*NODE FILE, FREQUENCY=(\d+)", fh.read())
     d, status, out = run_ccx(ccx, env, inp)
     disp, velo = frd_blocks(os.path.join(d, "job.frd"), "DISP"), frd_blocks(os.path.join(d, "job.frd"), "VELO")
@@ -2021,8 +2005,8 @@ def main():
     # sigma_xx = -M y / I at every integration point, sigma_zz = 0 / nu sigma_xx.
     for kind, ep in (("CPS4I", 1000.0), ("CPE4I", 1000.0 / (1 - 0.3 ** 2))):
         src = os.path.join(tmp, f"slab_{kind}_src.inp")
-        with open(src, "w") as fh:
-            fh.write(open(os.path.join(EXAMPLES, "cps4i_slab_bending.inp")).read().replace("CPS4I", kind))
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(open(os.path.join(EXAMPLES, "cps4i_slab_bending.inp"), encoding="utf-8").read().replace("CPS4I", kind))
         inp = os.path.join(tmp, f"slab_{kind}.inp")
         convert(src, inp)
         d, status, out = run_ccx(ccx, env, inp)
@@ -2076,10 +2060,10 @@ def main():
                                                       "SURFACE=END\n*KINEMATIC\n",
                                                       "*RIGID BODY, NSET=FACE, REF NODE=REF\n"),))):
         src = os.path.join(tmp, f"kin_{kind}_src.inp")
-        text = open(os.path.join(EXAMPLES, "kinematic_all_dofs.inp")).read()
+        text = open(os.path.join(EXAMPLES, "kinematic_all_dofs.inp"), encoding="utf-8").read()
         for a, b in subs:
             text = text.replace(a, b)
-        with open(src, "w") as fh:
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, f"kin_{kind}.inp")
         convert(src, inp)
@@ -2131,12 +2115,12 @@ def main():
     # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which
     # it deletes an element, out of reach so that it only reports): in uniaxial tension the
     # indicator is PEEQ / (d1 + d2 exp(-d3 / 3)), and the run is the same as without the card.
-    src = open(os.path.join(EXAMPLES, "damage_johnson_cook_cubes.inp")).read()
+    src = open(os.path.join(EXAMPLES, "damage_johnson_cook_cubes.inp"), encoding="utf-8").read()
     card = "*DAMAGE INITIATION, CRITERION=JOHNSON COOK\n0.2, 0.3, 1.5, 0., 0., 1878., 293., 1.\n"
     runs = {}
     for label, text in (("with", src), ("without", src.replace(card, ""))):
         path = os.path.join(tmp, f"jc_{label}_src.inp")
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, f"jc_{label}.inp")
         convert(path, inp)
@@ -2169,7 +2153,7 @@ def main():
     # the motion, must give the same block.
     def rigid_run(text, name, approximate=False):
         src = os.path.join(tmp, name + "_src.inp")
-        with open(src, "w") as fh:
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         inp = os.path.join(tmp, name + ".inp")
         convert(src, inp, approximate)
@@ -2283,7 +2267,7 @@ def main():
     # surface out of its stable increment, so the converter caps the step's increment; the
     # punch given its motion node by node, run at that increment, is the reference
     r = rigid_run(rigid_punch_explicit_deck("elements"), "rigid_explicit_elements")
-    with open(os.path.join(tmp, "rigid_explicit_elements.inp")) as fh:
+    with open(os.path.join(tmp, "rigid_explicit_elements.inp"), encoding="utf-8") as fh:
         m = re.search(r"(?m)^\*DYNAMIC, EXPLICIT[^\n]*\n([^\n]*)", fh.read())
     fields = [x.strip() for x in m.group(1).split(",")] if m else []
     cap = float(fields[3]) if len(fields) > 3 and fields[3] else None

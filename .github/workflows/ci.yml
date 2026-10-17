@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash        # on every OS, with pipefail
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported Python and the newest.  Ubuntu stays on 24.04: setup-python
+        # has no Python 3.9 for later Ubuntu releases.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+        python: ["3.9", "3.x"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python tests/test_convert.py
+      - name: Generated references match the code
+        run: |
+          python docs/generate_reference.py
+          git diff --exit-code
+      - name: Install with pip and run the abq2ccx command
+        run: |
+          python -m pip install .
+          python -c "import importlib.metadata as m, abq2ccx; assert m.version('abq2ccx') == abq2ccx.__version__"
+          abq2ccx --version
+          abq2ccx examples/nle10_thickplate.inp --outdir ci-out --quiet
+          test -s ci-out/nle10_thickplate_ccx.inp
+
+  validate:
+    name: validate_with_ccx.py (Linux, ccx 2.23)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      # conda-forge's calculix 2.23 build 2 is the build FreeCAD 1.1.4 bundles, the ccx the
+      # converter is validated on
+      - uses: mamba-org/setup-micromamba@v3
+        id: calculix
+        with:
+          environment-name: ccx
+          create-args: >-
+            --channel conda-forge
+            calculix=2.23=*_2
+          init-shell: none
+      - name: validate_with_ccx.py
+        env:
+          CCX: ${{ steps.calculix.outputs.environment-path }}/bin/ccx
+          OMP_NUM_THREADS: "1"
+        run: |
+          { "$CCX" -v || true; } | grep -F "Version 2.23"
+          ulimit -f 4194304
+          python validate_with_ccx.py | tee validate.log
+          grep -q "^Using ccx: " validate.log

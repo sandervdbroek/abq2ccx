@@ -90,7 +90,7 @@ def dangling(text):
     rep = A.Report()
     fd, p = tempfile.mkstemp(suffix=".inp")
     os.close(fd)
-    open(p, "w").write(text)
+    open(p, "w", encoding="utf-8", newline="\n").write(text)
     try:
         c = A.Converter(rep, _opt())
         c.build_geometry(A.read_blocks(p, rep))
@@ -111,12 +111,12 @@ classify_ccx_run = A.classify_ccx_run
 
 def run_ccx(ccx, env, text):
     d = tempfile.mkdtemp()
-    open(os.path.join(d, "job.inp"), "w").write(text)
+    open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n").write(text)
     fe = dict(os.environ)
     fe.update(env)
     try:
         p = subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True,
-                           text=True, timeout=300)
+                           encoding="utf-8", errors="replace", timeout=300)
         return classify_ccx_run(p.returncode, p.stdout, p.stderr, os.path.join(d, "job"))
     except subprocess.TimeoutExpired:
         return "failed"
@@ -204,7 +204,7 @@ def test_classify_ccx_run():
                 if os.path.exists(job + ext):
                     os.unlink(job + ext)
                 if text is not None:
-                    open(job + ext, "w").write(text)
+                    open(job + ext, "w", encoding="utf-8", newline="\n").write(text)
             return classify_ccx_run(0, ok, "", job)
 
         finite = " 1.00000E+00-2.00000E+00 0.00000E+00"
@@ -258,7 +258,7 @@ def test_corpus_solves():
 def eigenvalues(dat_path):
     """The eigenvalues a ccx *FREQUENCY step printed to its .dat file."""
     vals, on = [], False
-    for ln in open(dat_path):
+    for ln in open(dat_path, encoding="utf-8"):
         f = ln.split()
         if "E I G E N V A L U E   O U T P U T" in ln:
             on = True
@@ -281,10 +281,11 @@ def test_hood_hinge_keeps_one_mechanism_mode():
         return
     d = tempfile.mkdtemp()
     try:
-        open(os.path.join(d, "job.inp"), "w").write(convert(name)[0])
+        open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n").write(convert(name)[0])
         fe = dict(os.environ)
         fe.update(env)
-        subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True, text=True, timeout=300)
+        subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True, encoding="utf-8",
+                       errors="replace", timeout=300)
         lam = eigenvalues(os.path.join(d, "job.dat"))
     finally:
         shutil.rmtree(d, ignore_errors=True)

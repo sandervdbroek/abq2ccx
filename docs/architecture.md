@@ -330,4 +330,6 @@ Run it after changing any of the tables above so the docs stay in sync.
 When you add a feature, add a focused test to `tests/test_convert.py` next to the existing
 ones (`convert_str(text)` converts an inline deck), an example plus a check in
 `validate_with_ccx.py` when the result can be compared with a reference, and run the corpus.
-[Testing](testing.md) describes the three layers and the gates a change must pass.
+[Testing](testing.md) describes the three layers and the gates a change must pass. Give every
+`open()` of a deck or document `encoding="utf-8"`: CI runs the tests on Windows, where the
+default is the code page.

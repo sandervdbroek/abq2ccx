@@ -2,16 +2,19 @@
 
 ## Requirements
 
-* Python 3.7 or later, standard library only. The whole tool is `abq2ccx.py`; copy it
-  anywhere or run it from the repository.
-* CalculiX (`ccx`) only to run the result. `--run` and `validate_with_ccx.py` look for it on
-  `PATH`, in FreeCAD's bundle (FreeCAD 1.1.4 ships ccx 2.23) and in Homebrew/MacPorts;
-  `--run` also takes `--ccx PATH` or `$CCX`.
+* Python 3.9 or later, standard library only. The whole tool is `abq2ccx.py`; copy it
+  anywhere or run it from the repository, or install it as the `abq2ccx` command with
+  `pipx install git+https://github.com/sandervdbroek/abq2ccx` (or `pip install .` in a clone).
+* CalculiX (`ccx`) only to run the result. `--run` and `validate_with_ccx.py` take `$CCX`
+  (`--run` also `--ccx PATH`), else look on `PATH`, then in FreeCAD (FreeCAD 1.1.4 ships ccx
+  2.23), PrePoMax and bConverged installs on Windows, and in FreeCAD's macOS bundle and
+  Homebrew/MacPorts elsewhere.
 
 ## Command line
 
 ```bash
 python abq2ccx.py INPUT.inp [INPUT.inp ...] [options]     # glob patterns allowed
+abq2ccx INPUT.inp [INPUT.inp ...] [options]               # the same, installed
 ```
 
 | Option | Effect |

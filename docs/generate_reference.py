@@ -663,7 +663,7 @@ def main():
     for name, text in [("keyword-reference.md", gen_keywords()),
                        ("element-reference.md", gen_elements()),
                        ("output-reference.md", gen_output())]:
-        with open(os.path.join(HERE, name), "w") as fh:
+        with open(os.path.join(HERE, name), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text.rstrip() + "\n")
         print("wrote", os.path.join("docs", name))
 

@@ -10,9 +10,11 @@ load/section reference resolves) plus a handful of conversion-specific
 expectations.
 """
 
+import io
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 
@@ -42,7 +44,7 @@ def convert_str(text, **overrides):
     fd, path = tempfile.mkstemp(suffix=".inp")
     os.close(fd)
     try:
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         return convert(path, **overrides)
     finally:
@@ -70,7 +72,7 @@ def reparse(body):
     fd, path = tempfile.mkstemp(suffix=".inp")
     os.close(fd)
     try:
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(body)
         blocks = A.read_blocks(path, report)
         conv = A.Converter(report, Opt())
@@ -2282,9 +2284,9 @@ def test_mesh_generation_curves_bias_and_reflect():
 
 def test_input_data_file_inlined():
     d = tempfile.mkdtemp()
-    with open(os.path.join(d, "nodes.inp"), "w") as fh:
+    with open(os.path.join(d, "nodes.inp"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write("** comment\n1, 0., 0., 0.\n2, 1., 0., 0.\n")
-    with open(os.path.join(d, "main.inp"), "w") as fh:
+    with open(os.path.join(d, "main.inp"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write("*Node, input=nodes.inp\n*Element, type=T3D2, elset=E\n1, 1, 2\n")
     body, conv, _ = convert(os.path.join(d, "main.inp"))
     assert set(conv.geom.nodes) == {1, 2} and "INPUT" not in body.upper()
@@ -4352,7 +4354,7 @@ def test_traction_transformed_face_example():
     # are those of the same block without the *TRANSFORM cards
     path = os.path.join(EXAMPLES, "traction_transformed_face.inp")
     body, conv, _ = convert(path)
-    plain, _, _ = convert_str(re.sub(r"(?m)^\*TRANSFORM.*\n.*\n", "", open(path).read()))
+    plain, _, _ = convert_str(re.sub(r"(?m)^\*TRANSFORM.*\n.*\n", "", open(path, encoding="utf-8").read()))
     (local,), (glob,) = _cloads(body), _cloads(plain)
     nodes = {n for n, _ in glob}
     assert len(nodes) == 21 and not conv.unloaded_steps and not dangling_refs(reparse(body))
@@ -5396,7 +5398,7 @@ def _knot_of(deck, n):
     fd, path = tempfile.mkstemp(suffix=".inp")
     os.close(fd)
     try:
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(deck)
         blocks = A.read_blocks(path, A.Report())
     finally:
@@ -6836,7 +6838,7 @@ def test_rigid_examples_match_the_validation_decks():
                        ("rigid_punch_cylinder", V.rigid_punch_deck("3d", "analytic")),
                        ("rigid_body_inertia", V.rigid_inertia_deck())):
         path = os.path.join(EXAMPLES, name + ".inp")
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             assert fh.read() == text, f"examples/{name}.inp differs from validate_with_ccx.py's deck"
         body, _, _ = convert(path)
         g = reparse(body)
@@ -6849,11 +6851,118 @@ def _blocks_of(text):
     fd, path = tempfile.mkstemp(suffix=".inp")
     os.close(fd)
     try:
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
         return A.read_blocks(path, A.Report())
     finally:
         os.unlink(path)
+
+
+def _touch(*parts):
+    os.makedirs(os.path.join(*parts[:-1]), exist_ok=True)
+    open(os.path.join(*parts), "wb").close()
+    os.chmod(os.path.join(*parts), 0o755)
+    return os.path.join(*parts)
+
+
+def test_find_ccx_in_windows_installs():
+    # FreeCAD (Program Files or a per-user install, newest first), PrePoMax (unzipped, or
+    # nested by Explorer's "Extract All"; the static build first) and bConverged (its ccx.bat)
+    d = tempfile.mkdtemp()
+    pf, pf86, local, home, drive = (os.path.join(d, n) for n in ("pf", "pf86", "local", "home", "c"))
+    want = [_touch(pf, "FreeCAD 1.10", "bin", "ccx.exe"), _touch(pf, "FreeCAD 1.9", "bin", "ccx.exe"),
+            _touch(pf, "FreeCAD 0.21", "bin", "ccx.exe"),
+            _touch(local, "Programs", "FreeCAD 1.0", "bin", "ccx.exe"),
+            _touch(drive, "PrePoMax v3.0.0", "Solver", "ccx_dynamic.exe"),
+            _touch(home, "Downloads", "PrePoMax v2.4.0", "PrePoMax v2.4.0", "Solver", "ccx_static.exe"),
+            _touch(home, "Downloads", "PrePoMax v2.4.0", "PrePoMax v2.4.0", "Solver", "ccx_dynamic.exe"),
+            _touch(pf86, "bConverged", "CalculiX", "bin", "ccx.bat"),
+            _touch(pf86, "bConverged", "CalculiX", "bin", "ccx.exe")]
+    _touch(pf, "FreeCAD 1.1", "bin", "FreeCAD.exe")                  # no ccx in it
+    saved = dict(os.environ)
+    try:
+        os.environ.update({"ProgramFiles": pf, "ProgramW6432": pf, "ProgramFiles(x86)": pf86,
+                           "LOCALAPPDATA": local, "USERPROFILE": home, "SystemDrive": drive})
+        got = A._windows_ccx_candidates()
+        if os.name == "nt":                     # the whole search, with nothing on PATH
+            os.environ["PATH"] = ""
+            os.environ.pop("CCX", None)
+            assert A.find_ccx() == (want[0], {}), A.find_ccx()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        shutil.rmtree(d, ignore_errors=True)
+    assert got == want, got
+
+
+def test_find_ccx_override_is_absolute():
+    # --run starts ccx in the output folder, so a relative --ccx / $CCX must not stay relative
+    d, cwd = tempfile.mkdtemp(), os.getcwd()
+    try:
+        exe = _touch(d, "myccx.exe")
+        os.chdir(d)
+        (found, env), missing = A.find_ccx("myccx.exe"), A.find_ccx("nonexistent.exe")
+        ok = bool(found) and os.path.isabs(found) and os.path.samefile(found, exe) and not env
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(d, ignore_errors=True)
+    assert ok and missing == (None, {}), (found, missing)
+
+
+def test_cli_output_on_a_cp1252_console():
+    # a Latin-1 byte reads as U+FFFD, which the report echoes: on a strict cp1252 stream (a
+    # Windows console or redirect) the CLI writes it as an escape instead of raising
+    # UnicodeEncodeError, on stdout as on stderr
+    d = tempfile.mkdtemp()
+    deck = os.path.join(d, "latin1.inp")
+    with open(deck, "wb") as fh:
+        fh.write(b"caf\xe9\n*NODE\n1, 0., 0., 0.\n")
+    out, err = (io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict", newline="\n")
+                for _ in range(2))
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        code = A.main([deck, "--check"])
+        print("ccx 2.23 \u2192 \u03bd", file=sys.stdout)
+        out.flush()
+        err.flush()
+    finally:
+        sys.stdout, sys.stderr = saved
+        shutil.rmtree(d, ignore_errors=True)
+    assert code == 0
+    assert b"before any keyword ignored: 'caf\\ufffd'" in err.buffer.getvalue(), err.buffer.getvalue()
+    assert out.buffer.getvalue() == b"ccx 2.23 \\u2192 \\u03bd\n", out.buffer.getvalue()
+
+
+def test_run_reads_ccx_output_in_any_encoding():
+    # ccx echoes deck lines in UTF-8, whatever the console's code page; bytes that decode in
+    # neither (0x81 is no cp1252 character, a lone 0xE9 no UTF-8) must not stop --run.  The
+    # stand-in ccx is a script, as bConverged's ccx.bat is on Windows.
+    if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
+        return                                  # cmd.exe would read the .bat in the OEM code page
+    d = tempfile.mkdtemp()
+    try:
+        fake = os.path.join(d, "fake_ccx.py")
+        with open(fake, "w", encoding="utf-8") as fh:
+            fh.write("import sys\nsys.stdout.buffer.write(b' STEP 1\\n caf\\xe9 \\xc5\\x81\\n"
+                     " Job finished\\n')\n")
+        if os.name == "nt":
+            ccx = os.path.join(d, "ccx.bat")
+            with open(ccx, "w", encoding="ascii") as fh:
+                fh.write(f'@"{sys.executable}" "{fake}" %*\n')
+        else:
+            ccx = os.path.join(d, "ccx")
+            with open(ccx, "w", encoding="utf-8") as fh:
+                fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n')
+            os.chmod(ccx, 0o755)
+        deck = os.path.join(d, "hex.inp")
+        with open(deck, "w", encoding="utf-8") as fh:
+            fh.write(HEX + "*STEP\n*STATIC\n*END STEP\n")
+        code = A.main([deck, "--run", "--ccx", ccx, "--quiet"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert code == 0
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

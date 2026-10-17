@@ -17628,18 +17628,54 @@ def convert_text(text: str, solid_dof: bool = False, base_dir: str = ".",
         os.unlink(p)
 
 
+def _newest_first(paths: List[str]) -> List[str]:
+    """Paths in descending version order: FreeCAD 1.10 before 1.9 before 0.21."""
+    return sorted(paths, reverse=True, key=lambda p: [int(t) if t.isdigit() else t.lower()
+                                                      for t in re.split(r"(\d+)", p)])
+
+
+def _windows_ccx_candidates() -> List[str]:
+    """The ccx executables of Windows installs, most likely first: FreeCAD (all-users or
+    per-user install, newest first), PrePoMax (a portable folder; its static build needs
+    no MKL DLLs), then bConverged, whose ccx.bat sets up what its ccx.exe needs."""
+    env = os.environ.get
+    programs = dedup_str([p for p in (env("ProgramFiles"), env("ProgramW6432"),
+                                      env("ProgramFiles(x86)")) if p])
+    if env("LOCALAPPDATA"):
+        programs.append(os.path.join(env("LOCALAPPDATA"), "Programs"))
+    home = env("USERPROFILE")
+    portable = programs + [env("SystemDrive", "C:") + os.sep] + (
+        [home] + [os.path.join(home, d) for d in ("Desktop", "Downloads", "Documents")]
+        if home else [])
+
+    def find(roots, *parts):
+        return [p for r in roots for p in _newest_first(
+            glob.glob(os.path.join(glob.escape(r), *parts)))]
+
+    out = find(programs, "FreeCAD*", "bin", "ccx.exe")
+    for nest in (["PrePoMax*"], ["PrePoMax*", "PrePoMax*"]):      # unzipped, or "Extract All"
+        for solver in find(portable, *nest, "Solver"):
+            out += [os.path.join(solver, exe) for exe in ("ccx_static.exe", "ccx_dynamic.exe")]
+    out += [os.path.join(r, "bConverged", "CalculiX", "bin", exe)
+            for r in programs for exe in ("ccx.bat", "ccx.exe")]
+    return [c for c in dedup_str(out) if os.path.isfile(c)]
+
+
 def find_ccx(override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, str]]:
-    """Locate a CalculiX executable: --ccx/$CCX override, PATH, then known bundle spots
-    (incl. FreeCAD's copy, whose dylibs need the ../lib fallback path)."""
+    """Locate a CalculiX executable: --ccx/$CCX override, PATH, then known install spots
+    (FreeCAD, PrePoMax and bConverged on Windows; FreeCAD's macOS bundle, whose dylibs need
+    the ../lib fallback path, Homebrew and MacPorts elsewhere)."""
     for cand in ([override] if override else []) + \
                 ([os.environ["CCX"]] if not override and os.environ.get("CCX") else []):
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand, {}
+            return os.path.abspath(cand), {}          # --run starts it in the output folder
         return None, {}
     for name in ("ccx", "ccx_2.23", "ccx_2.22", "ccx_2.21", "CalculiX"):
         p = shutil.which(name)
         if p:
             return p, {}
+    if os.name == "nt":
+        return next(iter(_windows_ccx_candidates()), None), {}
     candidates = (glob.glob("/Applications/FreeCAD*.app/Contents/Resources/bin/ccx")
                   + glob.glob("/usr/local/bin/ccx*") + glob.glob("/opt/homebrew/bin/ccx*")
                   + glob.glob("/opt/local/bin/ccx*"))
@@ -17753,8 +17789,9 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool) -> int:
     ccx accepts a mesh-only deck that has nothing to solve), 1 otherwise."""
     exe, extra_env = find_ccx(override)
     if not exe:
-        sys.stderr.write("abq2ccx: no CalculiX executable found (searched --ccx/$CCX, PATH, the "
-                         "FreeCAD bundle, Homebrew/MacPorts); install ccx or pass --ccx PATH.\n")
+        sys.stderr.write("abq2ccx: no CalculiX executable found (searched --ccx/$CCX, PATH, "
+                         "FreeCAD, PrePoMax and bConverged installs, Homebrew/MacPorts); "
+                         "install ccx or pass --ccx PATH.\n")
         return 1
     env = dict(os.environ)
     env.update(extra_env)
@@ -17763,7 +17800,8 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool) -> int:
     if not quiet:
         sys.stderr.write(f"abq2ccx: running {exe} {stem}\n")
     try:
-        p = subprocess.run([exe, stem], cwd=cwd, env=env, capture_output=True, text=True)
+        p = subprocess.run([exe, stem], cwd=cwd, env=env, capture_output=True,
+                           encoding="utf-8", errors="replace")   # it echoes UTF-8 deck lines
     except OSError as exc:
         sys.stderr.write(f"abq2ccx: could not run ccx: {exc}\n")
         return 1
@@ -17867,7 +17905,19 @@ def _convert_one(path: str, args) -> int:
     return 0
 
 
+def _tolerant_stdio() -> None:
+    """Write what stdout and stderr cannot encode (a deck's U+FFFD or a report's arrow on a
+    cp1252 console or redirect on Windows) as backslash escapes instead of raising
+    UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):        # None, closed, or not a TextIOWrapper
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _tolerant_stdio()
     ap = argparse.ArgumentParser(
         prog="abq2ccx",
         description="Convert Abaqus .inp file(s) to CalculiX (ccx) .inp files.",

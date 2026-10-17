@@ -83,6 +83,14 @@ without an error. A full audit and the work that followed:
   converted model has no pore, fluid or acoustic pressure (warned where a pore-pressure
   element or a `*FLUID CAVITY` lost it); `OFFSET=SPOS`/`SNEG` as numbers; the
   source-deck faults among the rest named in the corpus notes.
+* **Packaging, CI and Windows** — `pipx install git+https://github.com/sandervdbroek/abq2ccx`
+  installs an `abq2ccx` command (`pyproject.toml`; copying the file still works). GitHub
+  Actions run the unit tests and the reference check on Linux, macOS and Windows (Python 3.9
+  and the newest) and `validate_with_ccx.py` on FreeCAD 1.1.4's ccx build. Python 3.9 is the
+  real minimum: the converter already called `math.gcd` with more than two arguments (the
+  docs said 3.7). On Windows, `--run` and `validate_with_ccx.py` find ccx in FreeCAD,
+  PrePoMax and bConverged installs, and ccx's output, the reports and the generated docs no
+  longer depend on the code page.
 
 Corpus: 165 decks solve their own problem; 29 more solve with reduced physics, 14 load
 nothing (3 both) and one drifts to a solution that is not the deck's; 221 mesh-only decks are

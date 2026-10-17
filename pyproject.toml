@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abq2ccx"
+dynamic = ["version"]
+description = "Convert Abaqus .inp decks to CalculiX (ccx) decks"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sander van den Broek" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["abaqus", "calculix", "ccx", "finite element", "converter"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/sandervdbroek/abq2ccx"
+
+[project.scripts]
+abq2ccx = "abq2ccx:main"
+
+[tool.setuptools]
+py-modules = ["abq2ccx"]
+
+[tool.setuptools.dynamic]
+version = { attr = "abq2ccx.__version__" }

@@ -12,6 +12,13 @@ physics happens unless you ask for it with `--approximate`.
 
 ## Quick start
 
+Run the file with Python 3.9 or later — copy it anywhere — or install it as the `abq2ccx`
+command (`abq2ccx model.inp`, same options):
+
+```bash
+pipx install git+https://github.com/sandervdbroek/abq2ccx
+```
+
 ```bash
 python3 abq2ccx.py model.inp                 # -> model_ccx.inp (+ model_ccx.log)
 python3 abq2ccx.py decks/*.inp --outdir out  # batch-convert into a directory
@@ -200,7 +207,8 @@ python validate_with_ccx.py                             # end-to-end checks in C
 python corpus/fetch.py && python tests/test_corpus.py   # the corpus
 ```
 
-[Testing](docs/testing.md) describes the three layers.
+[Testing](docs/testing.md) describes the three layers; GitHub Actions run the first two on
+every push, the unit tests on Linux, macOS and Windows.
 
 ## Documentation
 

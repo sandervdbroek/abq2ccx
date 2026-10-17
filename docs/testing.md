@@ -13,6 +13,15 @@ generated: edit the generator, not the `.md`). The corpus solve test runs every 
 in ccx and takes about ten minutes; run ccx under a file-size cap (`ulimit -f 4194304`) so
 that a runaway job cannot fill the disk.
 
+**CI.** GitHub Actions ([`ci.yml`](../.github/workflows/ci.yml)) run on every push and pull
+request: the unit tests, the generated-reference check and a `pip install .` on Ubuntu, macOS
+and Windows with Python 3.9 (the oldest supported) and the newest; and `validate_with_ccx.py`
+on Ubuntu with conda-forge's `calculix` 2.23 build 2, the build FreeCAD 1.1.4 bundles
+(`conda-meta/calculix-2.23-pl5321h484372f_2.json` in its macOS app), so CI solves with the ccx
+the checks were written on (Ubuntu packages 2.21; later conda-forge builds of 2.23 add fixes
+made after its release). The corpus stays local: it downloads 1022 decks and needs ten
+minutes of ccx.
+
 ## 1. Unit tests — `tests/test_convert.py`
 
 Each test converts a small inline deck (`convert_str(text)`) or a bundled example and
@@ -51,9 +60,9 @@ dangling set, surface, material, orientation or amplitude reference.
 
 ## 2. End-to-end — `validate_with_ccx.py`
 
-Converts the examples, runs them in CalculiX (found on `PATH`, in FreeCAD's bundle or in
-Homebrew/MacPorts) and compares the results with references that do not come from the
-converter. It prints one `PASS`/`FAIL` line per check.
+Converts the examples, runs them in CalculiX (found as `--run` finds it: `$CCX`, `PATH`,
+FreeCAD, PrePoMax and bConverged installs, Homebrew/MacPorts) and compares the results with
+references that do not come from the converter. It prints one `PASS`/`FAIL` line per check.
 
 | Example | Check | Reference | Agreement |
 | --- | --- | --- | --- |

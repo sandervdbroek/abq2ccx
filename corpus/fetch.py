@@ -29,7 +29,7 @@ def main():
                 data = r.read().decode("utf-8", "replace")
             if "*" not in data:
                 raise ValueError("downloaded content does not look like an .inp deck")
-            with open(path, "w") as fh:
+            with open(path, "w", encoding="utf-8", newline="") as fh:  # line ends as fetched
                 fh.write(data)
             print(f"  ok   {entry['name']:28s} ({len(data.splitlines())} lines)  [{entry['license']}]")
             ok += 1
