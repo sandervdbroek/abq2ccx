@@ -20,8 +20,12 @@ and an `abq2ccx --run` on Ubuntu and on Windows (there on Python 3.9, whose `ope
 to the code page) with conda-forge's `calculix` 2.23 build 2, the build FreeCAD 1.1.4 bundles
 (`conda-meta/calculix-2.23-pl5321h484372f_2.json` in its macOS app; on Windows built by MinGW
 GCC against the UCRT), so CI solves with the ccx the checks were written on (Ubuntu packages
-2.21; later conda-forge builds of 2.23 add fixes made after its release). The corpus stays
-local: it downloads 1052 decks and needs ten minutes of ccx.
+2.21; later conda-forge builds of 2.23 add fixes made after its release). The two runs agree
+to every printed digit except how NaN is spelled (`-NAN` on Linux, `-NAN(IND)` on Windows)
+and the sixth digit of one buckling factor. ARPACK converges it only to `*BUCKLE`'s default
+accuracy of 1 %, so each platform's BLAS lands on its own value: 223458 on Linux, 223460 on
+Windows, 223459 on macOS. The corpus stays local: it downloads 1052 decks and needs ten
+minutes of ccx.
 
 ## 1. Unit tests — `tests/test_convert.py`
 
