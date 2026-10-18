@@ -38,7 +38,8 @@ TRANSLATED = {
         "applied, references resolved, names kept ≤80 chars); part-level constraints (`*EQUATION`, "
         "`*MPC`, `*RIGID BODY`, `*COUPLING`, ...) copied per instance; a part's `*DISTRIBUTION` gets "
         "per-instance names (also where an `*ORIENTATION` or a composite ply names it) and offset "
-        "element labels; rotated instances rotate `*ORIENTATION` axes (also per-element "
+        "element labels; a part's `*ORIENTATION, DEFINITION=NODES` names each instance's own "
+        "nodes; rotated instances rotate `*ORIENTATION` axes (also per-element "
         "`*DISTRIBUTION` axes), beam `n1`, `*NODE` normals and `*NORMAL` vectors. Proved by "
         "`validate_with_ccx.py` (`assembly_rotated_instances`: the same results as the model "
         "written flat).",
