@@ -45,6 +45,10 @@ physics.
   `--run` and `validate_with_ccx.py` give a conda environment's ccx the folders `conda
   activate` puts on `PATH`; and a ccx that Windows cannot start is reported as such ("exit
   code 0xC0000135 (a DLL that ccx needs is missing)", not 3221225781).
+* **Node-defined orientations in instanced parts** — a part's `*ORIENTATION, DEFINITION=NODES`
+  now names each instance's own nodes (every copy named the first instance's, or other nodes
+  behind an assembly-level reference point); without node c a moved instance gets the part's
+  axes turned with it.
 
 ## 1.2.1 (October 2026)
 
