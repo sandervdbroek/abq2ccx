@@ -3590,6 +3590,12 @@ class Converter:
         self._dl_state: Dict[str, "OrderedDict[tuple, Tuple[str, Optional[str]]]"] = {}
         self._dl_fresh: set = set()                 # (card, key) given in the current step
         self._dl_wiped = False                      # a ccx *DLOAD, OP=NEW in the current step
+        # pressures on shells / membranes split between the faces of ccx's expanded element
+        # (_plan_sheet_pressure): load token -> [(face-1 target, top-face surface, weight of
+        # face 1, weight of face 2)], and the *ELSET / *SURFACE cards those names need
+        self._sheet_split: Dict[str, List[Tuple[str, str, float, float]]] = {}
+        self._sheet_cards: List[str] = []
+        self._sheet_surfaces: set = set()          # their names
         # Abaqus surface elements left out of the ccx mesh (_drop_surface_elements): element ->
         # (type, nodes), and the full member list of each element set that had some
         self._carriers: "OrderedDict[int, Tuple[str, List[int]]]" = OrderedDict()
@@ -8674,7 +8680,7 @@ class Converter:
             if family:
                 self.report.note(f"*DLOAD P on {family}s -> ccx *DLOAD {g[1]}: both push along the "
                                  f"positive element normal (probed on 2.23; Abaqus 2017 element "
-                                 f"libraries). Exact.", once=True)
+                                 f"libraries).", once=True)
             elif label == "P":
                 self.report.warn("*DLOAD label 'P' has no face number; CalculiX needs P1..P6 for element "
                                  "pressure. Verify.", once=True)
@@ -8684,6 +8690,12 @@ class Converter:
             # 'EALL, GRAV, 9810., , , -1.' along -x or spins a CENTRIF line with a blank axis
             # point about an axis of length zero (NaN)
             g = g[:2] + [x or "0." for x in g[2:]]
+            split = self._sheet_lines(g[0], label, g[2] if len(g) > 2 else "", 1.0) if family else None
+            if split is not None:                     # both faces of the expanded element
+                for ln, key, mag in split:
+                    body.append(ln)
+                    lines.append((key, ln, mag))
+                continue
             if self._mass_scale and label in ("GRAV", "CENTRIF") and len(g) > 2 and g[2]:
                 # the masses it acts on are divided by the scale (_plan_coupled_inertia)
                 g = g[:2] + ["%.12g" % (pf(g[2]) * self._mass_scale)] + g[3:]
@@ -8712,7 +8724,7 @@ class Converter:
             return self._commented(b, "*DLOAD has no CalculiX-compatible load lines; dropped.")
         # a *DLOAD with no data at all is valid ccx (OP=NEW clears previous distributed
         # loads; plain is a no-op) — pass it through unchanged
-        return [emit_keyword("DLOAD", params)] + body + side
+        return [emit_keyword("DLOAD", params)] + self._surfaces_last(body) + side
 
     def handle_dsload(self, b: Block) -> List[str]:
         """``*DSLOAD``: a surface pressure becomes a ccx *DLOAD face pressure (ccx's P1..P6 face
@@ -8779,11 +8791,17 @@ class Converter:
                                      f"{pl}, with the sign flipped on SPOS: Abaqus pushes a surface "
                                      f"pressure against the surface normal (SPOS along -n, SNEG along "
                                      f"+n), ccx's {pl} pushes along +n (probed on 2.23; Abaqus 2017 "
-                                     f"element libraries). Exact.", once=True)
+                                     f"element libraries).", once=True)
                     if sign < 0 and mag.strip() and self._signed(mag, sign) == mag:
                         self.report.warn(f"*DSLOAD on '{surf}' (SPOS): magnitude '{mag}' is not a "
                                          f"number, so its sign could not be flipped for ccx's {pl} "
                                          f"(which pushes along +n): negate it.", once=True)
+                    split = self._sheet_lines(token, pl, mag, sign)
+                    if split is not None:             # both faces of the expanded element
+                        for ln, key, m2 in split:
+                            body.append(ln)
+                            lines.append((key, ln, m2))
+                        continue
                 else:
                     self.report.warn(f"*DSLOAD on '{surf}': face '{face or '?'}' has no ccx Px "
                                      f"equivalent (ccx needs P1..P6 for element pressure); emitted "
@@ -8810,7 +8828,7 @@ class Converter:
                 keep.pop("OP", None)
             if op_new:
                 self._dload_op_new("DSLOAD", wipe)
-            out = [emit_keyword("DLOAD", keep)] + body
+            out = [emit_keyword("DLOAD", keep)] + self._surfaces_last(body)
         elif op_new:
             self._dload_op_new("DSLOAD", False)
         self._track_dloads("DSLOAD", b, lines)
@@ -8919,9 +8937,118 @@ class Converter:
     # libraries): Abaqus' element-based P and ccx's *DLOAD P / P1 push along the positive
     # element normal (ccx shells read P, P1 and P2 alike; on a membrane ccx stops on P and
     # pushes P2 along -n); a surface-based Abaqus P pushes against the surface's normal —
-    # SPOS along -n, SNEG along +n.  -> (ccx label, sign) for SNEG / SPOS faces.
+    # SPOS along -n, SNEG along +n.  -> (ccx label, sign) for SNEG / SPOS faces.  Where the
+    # load lands: _plan_sheet_pressure.
     _SHEET_PRESSURE = {("shell", "SNEG"): ("P", 1.0), ("shell", "SPOS"): ("P", -1.0),
                        ("membrane", "SNEG"): ("P1", 1.0), ("membrane", "SPOS"): ("P1", -1.0)}
+
+    def _plan_sheet_pressure(self, blocks: List[Block]) -> None:
+        """Abaqus applies a shell's or membrane's pressure (*DLOAD P; *DSLOAD P on SPOS / SNEG)
+        to its reference surface, ccx 2.23 to a face of the solid it expands the element into:
+        a shell's P, P1 and P2 alike to the bottom face (face 1, t (0.5 + o) below the
+        reference surface for OFFSET o; dloads.f), whose area is off by O(t/R) — a sphere's
+        (1 - t/2R)^2, also for ccx's own S8R, and a quadratic membrane's solid alike.  Only a
+        *DLOAD on a facial surface reaches the top face (S2): each such pressure is split,
+        0.5 - o of it on face 1 and 0.5 + o on face 2, weights with no first moment about the
+        reference surface — so the force is exact to O((t/R)^2) at every point (a sphere's
+        total 1 + (1 - 4 o^2) (t/2R)^2), whatever ccx's nodal normals or knots, and under
+        NLGEOM, where both faces follow the deformation; without an offset the mean stress
+        through the thickness a one-face load leaves in ccx's 3-D solid (-p/2, whose Poisson
+        strain is of the same order) vanishes too, as in Abaqus' plane-stress elements.  Probed
+        on spheres and cylinders, t/R 0.01 to 0.1.  Here: one top-face surface per load set
+        (per offset within it)."""
+        tokens: "OrderedDict[str, str]" = OrderedDict()
+        for b in blocks:
+            for rec in merged_data_records(b) if b.keyword in ("DLOAD", "DSLOAD") else []:
+                g = [x.strip() for x in rec]
+                if len(g) < 2 or g[1].upper() != "P" or _is_user_load(b, g):
+                    continue
+                if b.keyword == "DLOAD":                # no set: the whole model (handle_dload)
+                    token = g[0] or (ALL_ELEMENTS_SET if ALL_ELEMENTS_SET in self.geom.elsets else "")
+                    if token:
+                        tokens.setdefault(token.upper(), token)
+                    continue
+                sd = self.surfaces.get(g[0].upper())
+                for token, face in sd[1] if sd and not sd[0].startswith("NODE") else []:
+                    if face in ("SPOS", "SNEG"):
+                        tokens.setdefault(token.upper(), token)
+        if not tokens:
+            return
+        offset: Dict[int, Optional[float]] = {}
+        for b in blocks:
+            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION"):
+                o = (b.param("OFFSET") or "0").strip().upper()
+                try:
+                    val: Optional[float] = {"SPOS": 0.5, "SNEG": -0.5}[o] if o in ("SPOS", "SNEG") else pf(o)
+                except ValueError:
+                    val = None
+                for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                    offset[e] = val
+        cards: List[str] = []
+        for key, token in tokens.items():
+            if self._only_carriers(token) or not self._sheet_family(token):
+                continue
+            if not self._sheet_split:
+                self._reserve_names()               # (the names below avoid the deck's)
+            groups: "OrderedDict[Optional[float], List[int]]" = OrderedDict()
+            for e in self._load_elements(token):
+                if e in self.geom.elements:
+                    groups.setdefault(offset.get(e, 0.0), []).append(e)
+            if None in groups:
+                self.report.warn(f"Pressure on the shells of '{token}': their OFFSET is not a number, "
+                                 f"so the pressure stays on the bottom face of ccx's expanded element, "
+                                 f"off Abaqus' reference surface by O(t/R) in area. Verify.", once=True)
+                continue
+            plan: List[Tuple[str, str, float, float]] = []
+            for k, (o, eids) in enumerate(groups.items(), 1):
+                target = token if len(groups) == 1 else self._fresh_name(f"ABQ2CCX_P{k}_{key}")
+                if len(groups) > 1:
+                    self._emit_set(cards, "ELSET", target, eids)
+                surf = self._fresh_name(f"ABQ2CCX_TOP_{key}" + (f"_{k}" if len(groups) > 1 else ""))
+                if 0.5 + o:
+                    cards += [f"*SURFACE, NAME={surf}, TYPE=ELEMENT", f"{target}, S2"]
+                    self._sheet_surfaces.add(surf)
+                plan.append((target, surf, 0.5 - o, 0.5 + o))
+            self._sheet_split[key] = plan
+        if cards:
+            self._sheet_cards = ["** abq2ccx: top faces (S2) of shells / membranes that carry a pressure: "
+                                 "ccx 2.23 loads only the bottom face otherwise"] + cards
+
+    def _sheet_lines(self, token: str, label: str, mag: str, sign: float):
+        """[(line, key, magnitude)]: the ccx *DLOAD lines of an Abaqus pressure ``mag`` pushing
+        along ``sign`` times the element normal on the shells / membranes of ``token``, split
+        between the faces of their expanded element (_plan_sheet_pressure: ``label`` on face 1,
+        P on the top-face surface); None where ``token`` is not split or ``mag`` is no number."""
+        plan = self._sheet_split.get(token.upper())
+        try:
+            p = sign * pf(mag) if mag.strip() else 0.0
+        except ValueError:
+            plan = None
+        if not plan:
+            return None
+        out = []
+        for target, surf, w1, w2 in plan:
+            for name, lab, w in ((target, label, w1), (surf, "P", -w2)):
+                if w:
+                    v = fmt_num(float("%.12g" % (w * p)))
+                    out.append((f"{name}, {lab}, {v}", (name.upper(), lab), v))
+        self.report.note("Pressure on shells / membranes (Abaqus: on the reference surface) split "
+                         "between the faces of ccx's expanded element: 0.5 - o of it on the bottom "
+                         "face (P / P1), 0.5 + o on the top face (surface ABQ2CCX_TOP_..., S2), o "
+                         "the OFFSET. ccx 2.23 loads a shell's bottom face only (P, P1 and P2 alike), "
+                         "whose area is off by O(t/R) — (1 - t/2R)^2 on a sphere — and leaves a mean "
+                         "stress -p/2 through the thickness of its 3-D solid. The split is exact to "
+                         "O((t/R)^2), also under NLGEOM (probed).", once=True)
+        return out
+
+    def _surfaces_last(self, lines: List[str]) -> List[str]:
+        """The data lines of one ccx *DLOAD card with those on the top-face surfaces
+        (_plan_sheet_pressure) moved to the end, each part in order: dloads.f never resets its
+        'surface' flag within a card, so ccx 2.23 reads an element-set line after a surface line
+        as a surface (element 10 e + face): the load is lost or misplaced without a message, or
+        ccx crashes (probed)."""
+        top = [ln.split(",")[0].strip().upper() in self._sheet_surfaces for ln in lines]
+        return [ln for ln, t in zip(lines, top) if not t] + [ln for ln, t in zip(lines, top) if t]
 
     @staticmethod
     def _signed(mag: str, sign: float) -> str:
@@ -10016,7 +10143,7 @@ class Converter:
                              "other card's loads are given again at the end of the step.", once=True)
         for amp, data in groups.items():
             out.append("*DLOAD" + (f", AMPLITUDE={amp}" if amp else ""))
-            out.extend(data)
+            out.extend(self._surfaces_last(data))
         return out
 
     def handle_output(self, b: Block) -> List[str]:
@@ -12755,6 +12882,7 @@ class Converter:
         self._plan_material_symmetry(blocks)
         self._plan_distributions(blocks)
         self._plan_shell_axes(blocks)           # after the distributions: their axes
+        self._plan_sheet_pressure(blocks)       # after _plan_distributions resets the used names
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._note_quadratic_beams(blocks)      # after the planar constraint
@@ -12787,6 +12915,7 @@ class Converter:
         out.extend(self._slab_cards())
         out.extend(self._ply_cards())
         out.extend(self._qmem_cards())
+        out.extend(self._sheet_cards)
         out.extend(self._node_normal_cards(blocks))
         if self._planar_bc:
             out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "

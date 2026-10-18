@@ -112,7 +112,7 @@ def test_composite_shell():
     assert "*ORIENTATION, NAME=ABQ2CCX_OR1" in body   # ply angle -> synthesized orientation
     assert "3, 45." in body                           # rotation about shell normal
     assert "EDGE, 1, 6" in body                       # ENCASTRE on shell -> 6 DOF
-    assert "PLATE, P, 0.01" in body                   # *DSLOAD -> *DLOAD (shell pressure)
+    assert "PLATE, P, 0.005\nABQ2CCX_TOP_PLATE, P, -0.005" in body   # *DSLOAD -> both faces
     assert "S, E, PEEQ" in body                       # LE->E, PE->PEEQ, CF dropped, deduped
     assert not dangling_refs(reparse(body))
 
@@ -980,22 +980,124 @@ def test_dsload_unmappable_face_warns():
 def test_shell_and_membrane_pressure_sides():
     # Abaqus pushes a surface pressure against the surface normal (SPOS along -n, SNEG along
     # +n) and an element-based *DLOAD P along +n; ccx's *DLOAD P on a shell and P1 on a
-    # membrane push along +n, and ccx stops on P on a membrane (probed on 2.23).
+    # membrane push along +n, and ccx stops on P on a membrane (probed on 2.23).  Half of it
+    # goes on the top face (S2), where a pressure pushes along -n (_plan_sheet_pressure)
     def card(typ, face=None):
         load = (f"*Surface,type=element,name=sf\ne, {face}\n*Step\n*Static\n*Dsload\nsf, P, 5.0\n"
                 if face else "*Step\n*Static\n*Dload\ne, P, 5.0\n")
         deck = (f"*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n*Element,type={typ},elset=e\n"
                 f"1,1,2,3,4\n" + load + "*End Step\n")
         body, _, rep = convert_str(deck)
-        return [ln for ln in body.splitlines() if ln.startswith("e, P")][0], rep
-    assert card("S4", "SPOS")[0] == "e, P, -5."
-    assert card("S4", "SNEG")[0] == "e, P, 5.0"
-    assert card("S4")[0] == "e, P, 5.0"
-    assert card("M3D4", "SPOS")[0] == "e, P1, -5."
-    assert card("M3D4", "SNEG")[0] == "e, P1, 5.0"
-    assert card("M3D4")[0] == "e, P1, 5.0"
+        assert _card_at(body, "*SURFACE, NAME=ABQ2CCX_TOP_E, TYPE=ELEMENT") == ["e, S2"]
+        return _card_at(body, "*DLOAD"), rep
+    assert card("S4", "SPOS")[0] == ["e, P, -2.5", "ABQ2CCX_TOP_E, P, 2.5"]
+    assert card("S4", "SNEG")[0] == ["e, P, 2.5", "ABQ2CCX_TOP_E, P, -2.5"]
+    assert card("S4")[0] == ["e, P, 2.5", "ABQ2CCX_TOP_E, P, -2.5"]
+    assert card("M3D4", "SPOS")[0] == ["e, P1, -2.5", "ABQ2CCX_TOP_E, P, 2.5"]
+    assert card("M3D4", "SNEG")[0] == ["e, P1, 2.5", "ABQ2CCX_TOP_E, P, -2.5"]
+    assert card("M3D4")[0] == ["e, P1, 2.5", "ABQ2CCX_TOP_E, P, -2.5"]
     for typ, face in (("S4", "SPOS"), ("S4", None), ("M3D4", None)):
         assert card(typ, face)[1].n_warnings == 0, card(typ, face)[1].text()
+
+
+SHEET_PAIR = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,2.,0.,0.\n6,2.,1.,0.\n"
+              "*Element,type=S4,elset=E\n1,1,2,3,4\n*Element,type=S4,elset=F\n2,2,5,6,3\n"
+              "*Elset, elset=BOTH\nE, F\n*Material, name=M\n*Elastic\n1e6, 0.3\n")
+
+
+def test_sheet_pressure_split_by_offset():
+    # Abaqus loads a shell's reference surface, ccx 2.23 only the bottom face of its expanded
+    # solid: 0.5 - o of the pressure goes there, 0.5 + o on the top face (S2) for OFFSET o —
+    # no first moment about the reference surface (_plan_sheet_pressure)
+    def card(off, load="*Dload\nE, P, 4."):
+        sec = f"*Shell Section, elset=BOTH, material=M{off}\n0.1\n*Surface, name=SF\nE, SPOS\n"
+        body, _, rep = convert_str(SHEET_PAIR + sec + "*Step\n*Static\n" + load + "\n*End Step\n")
+        return _card_at(body, "*DLOAD"), body, rep
+    assert card(", offset=SPOS")[0] == ["ABQ2CCX_TOP_E, P, -4."]       # the top face is the reference
+    assert card(", offset=SPOS", "*Dsload\nSF, P, 4.")[0] == ["ABQ2CCX_TOP_E, P, 4."]
+    lines, body, _ = card(", offset=SNEG")
+    assert lines == ["E, P, 4."] and "ABQ2CCX_TOP" not in body        # the bottom face is
+    assert card(", offset=0.25")[0] == ["E, P, 1.", "ABQ2CCX_TOP_E, P, -3."]
+    lines, body, _ = card("")
+    assert lines == ["E, P, 2.", "ABQ2CCX_TOP_E, P, -2."]
+    assert _card_at(body, "*SURFACE, NAME=ABQ2CCX_TOP_E, TYPE=ELEMENT") == ["E, S2"]
+    assert body.index("*SURFACE, NAME=ABQ2CCX_TOP_E") < body.index("*STEP")
+    # an offset that is no number (a distribution): the one-face load stays, warned
+    lines, body, rep = card(", offset=OFFDIST")
+    assert lines == ["E, P, 4."] and "OFFSET is not a number" in rep.text()
+    # one load set over shells of two offsets: an element set and a top surface per offset
+    sec = ("*Shell Section, elset=E, material=M\n0.1\n*Shell Section, elset=F, material=M, offset=SPOS\n"
+           "0.1\n*Surface, name=SG\nBOTH, SNEG\n")
+    body, _, _ = convert_str(SHEET_PAIR + sec + "*Step\n*Static\n*Dsload\nSG, P, 1.1\n*End Step\n")
+    assert _card_at(body, "*DLOAD") == ["ABQ2CCX_P1_BOTH, P, 0.55", "ABQ2CCX_TOP_BOTH_1, P, -0.55",
+                                        "ABQ2CCX_TOP_BOTH_2, P, -1.1"]
+    g = reparse(body)
+    assert g.elsets["ABQ2CCX_P1_BOTH"] == [1] and g.elsets["ABQ2CCX_P2_BOTH"] == [2] and not dangling_refs(g)
+    assert _card_at(body, "*SURFACE, NAME=ABQ2CCX_TOP_BOTH_2, TYPE=ELEMENT") == ["ABQ2CCX_P2_BOTH, S2"]
+
+
+def test_sheet_pressure_split_across_steps_and_names():
+    # Abaqus' *DSLOAD, OP=NEW keeps the *DLOAD pressure, ccx's *DLOAD, OP=NEW removes it: both
+    # of its faces are given again
+    deck = (SHEET_PAIR + "*Shell Section, elset=BOTH, material=M\n0.1\n*Surface, name=SF\nF, SNEG\n"
+            "*Step\n*Static\n*Dload\nE, P, 2.\n*Dsload\nSF, P, 3.\n*End Step\n"
+            "*Step\n*Static\n*Dsload, op=new\nSF, P, 5.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    step2 = body.split("*STEP")[2]
+    assert "*DLOAD, OP=NEW\nF, P, 2.5\nABQ2CCX_TOP_F, P, -2.5\n" in step2.upper()
+    assert "\nE, P, 1.\nABQ2CCX_TOP_E, P, -1.\n" in step2 and not conv.unloaded_steps
+    # a zero pressure removes the load (Abaqus), on both faces
+    body, _, _ = convert_str(deck.replace("*Dsload, op=new\nSF, P, 5.", "*Dload\nE, P, 0."))
+    assert "\nE, P, 0.\nABQ2CCX_TOP_E, P, 0.\n" in body.split("*STEP")[2]
+    # a set name too long for ccx's 80 characters with the prefix: cut (_fresh_name)
+    long = "S" * 70
+    body, _, _ = convert_str(SHEET_PAIR.replace("elset=E\n", f"elset={long}\n") +
+                             f"*Shell Section, elset={long}, material=M\n0.1\n*Step\n*Static\n*Dload\n"
+                             f"{long}, P, 2.\n*End Step\n")
+    top = ("ABQ2CCX_TOP_" + long)[:80]
+    assert _card_at(body, "*DLOAD") == [f"{long}, P, 1.", f"{top}, P, -1."]
+    assert _card_at(body, f"*SURFACE, NAME={top}, TYPE=ELEMENT") == [f"{long}, S2"]
+
+
+def test_sheet_pressure_surface_lines_last():
+    # ccx 2.23 never resets dloads.f's 'surface' flag within a *DLOAD card: an element-set line
+    # after a surface line is read as a surface (its load lost or misplaced, or ccx crashes;
+    # probed), so every card lists the top-face surfaces last
+    sec = "*Shell Section, elset=BOTH, material=M\n0.1\n*Surface, name=SA\nE, SNEG\n*Surface, name=SB\nF, SNEG\n"
+    deck = SHEET_PAIR + sec + "*Step\n*Static\n{}\n*End Step\n"
+    want = ["E, P, 0.5", "F, P, 0.5", "ABQ2CCX_TOP_E, P, -0.5", "ABQ2CCX_TOP_F, P, -0.5"]
+    for load in ("*Dload\nE, P, 1.\nF, P, 1.", "*Dsload\nSA, P, 1.\nSB, P, 1."):
+        body, _, _ = convert_str(deck.format(load))
+        assert _card_at(body, "*DLOAD") == want, load
+    # a set over two offsets: both bottom-face lines first
+    body, _, _ = convert_str(SHEET_PAIR + "*Shell Section, elset=E, material=M\n0.1\n*Shell Section, "
+                             "elset=F, material=M, offset=-0.25\n0.1\n*Step\n*Static\n*Dload\nBOTH, P, 1.\n*End Step\n")
+    assert _card_at(body, "*DLOAD") == ["ABQ2CCX_P1_BOTH, P, 0.5", "ABQ2CCX_P2_BOTH, P, 0.75",
+                                        "ABQ2CCX_TOP_BOTH_1, P, -0.5", "ABQ2CCX_TOP_BOTH_2, P, -0.25"]
+    # the loads given again after ccx's *DLOAD, OP=NEW (_flush_dloads): one card, surfaces last
+    body, _, _ = convert_str(deck.format("*Dload\nE, P, 1.\n*Dload\nF, P, 1.\n*Dsload\nSA, P, 1.").replace(
+        "*End Step\n", "*End Step\n*Step\n*Static\n*Dsload, op=new\nSB, P, 1.\n*End Step\n"))
+    step2 = body.split("*STEP")[2]
+    assert step2.split("removed them)\n")[1].startswith("*DLOAD\n" + "\n".join(want) + "\n"), step2
+
+
+def test_sheet_pressure_names_and_whole_model():
+    # generated names never collide: set K over two offsets, and a loaded set named K_1
+    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,2.,0.,0.\n6,2.,1.,0.\n7,3.,0.,0.\n"
+            "8,3.,1.,0.\n*Element,type=S4,elset=A\n1,1,2,3,4\n*Element,type=S4,elset=B\n2,2,5,6,3\n"
+            "*Element,type=S4,elset=K_1\n3,5,7,8,6\n*Elset, elset=K\nA, B\n*Material, name=M\n*Elastic\n"
+            "1e6, 0.3\n*Shell Section, elset=A, material=M\n0.1\n*Shell Section, elset=B, material=M, "
+            "offset=0.25\n0.1\n*Shell Section, elset=K_1, material=M\n0.1\n*Step\n*Static\n*Dload\n"
+            "K, P, 1.\nK_1, P, 1.\n*End Step\n")
+    body, _, _ = convert_str(deck)
+    surfs = [ln.split("NAME=")[1].split(",")[0] for ln in body.splitlines() if ln.startswith("*SURFACE, NAME=ABQ2CCX")]
+    assert len(surfs) == 3 and len(set(surfs)) == 3, surfs
+    g = reparse(body)
+    assert not dangling_refs(g)
+    # a pressure line without an element set loads the whole model (Abaqus): split too
+    body, _, _ = convert_str(SHEET_PAIR + "*Shell Section, elset=BOTH, material=M\n0.1\n*Step\n*Static\n"
+                             "*Dload\n, P, 2.\n*End Step\n")
+    assert _card_at(body, "*DLOAD") == ["ABQ2CCX_ALL_ELEMENTS, P, 1.", "ABQ2CCX_TOP_ABQ2CCX_ALL_ELEMENTS, P, -1."]
 
 
 def test_ngen_descending_range_warns():
@@ -8822,7 +8924,8 @@ def test_quadratic_membrane_sections_loads_and_output():
     assert _card_at(body, "*SOLID SECTION, ELSET=SKIN_SOLID, MATERIAL=M") == []
     g = reparse(body)
     assert g.elsets["SKIN_MEMBRANE"] == [9] and g.elsets["SKIN_SOLID"] == [1, 2] and g.elements[9][0] == "M3D4"
-    assert _card_at(body, "*DLOAD") == ["SKIN, P1, 3."]
+    assert _card_at(body, "*DLOAD") == ["SKIN, P1, 1.5", "ABQ2CCX_TOP_SKIN, P, -1.5"]
+    assert _card_at(body, "*SURFACE, NAME=ABQ2CCX_TOP_SKIN") == ["SKIN, S2"]
     assert _card_at(body, "*NODE PRINT, NSET=RIGHT") == ["U"]
     assert "DENSITY= (mass per unit area" in rep.text() and any("DENSITY" in r for r in conv.reduced_physics)
     # thickness from *NODAL THICKNESS

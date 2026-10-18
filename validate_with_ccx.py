@@ -52,7 +52,9 @@ preselects: a bar in tension with only Abaqus/CAE's *Output, variable=PRESELECT 
 and a bar impact in an explicit step without any output request (20 output frames, the
 free end against 1-D wave theory), CPS4I / CPE4I cantilevers written as C3D8I slabs under
 an end couple against beam theory (deflection and stresses), shell pressure on the SPOS and
-SNEG faces and element-based against the Navier plate solution (the sign of each), a bare
+SNEG faces and element-based against the Navier plate solution (the sign of each), and on
+shell and membrane spheres and a cylinder against the pressure force on the reference surface
+and thin-wall theory, a bare
 *KINEMATIC (all DOFs) against *RIGID BODY, an assembly with a turned instance against
 the same model written flat, and rigid tools: a rigid flat punch (rigid elements, and
 the same face as an analytical surface) against the penalty contact law and a punch given
@@ -974,9 +976,10 @@ def abaqus_shell_direction(normal, ori=None):
 
 def sheet_mesh(typ, nx, ny, lx=1.0, ly=1.0):
     """(nodes {id: (x, y)}, elements [nodes]) of an lx x ly rectangle of nx x ny cells: 4-node
-    quadrilaterals, 8-node ones (M3D8R, M3D8; M3D9 / M3D9R with their centre node) or two 6-node
-    triangles per cell (M3D6), node ids row by row on the grid of corner and midside points."""
-    quad8, tri6 = typ in ("M3D8R", "M3D8", "M3D9R", "M3D9"), typ == "M3D6"
+    quadrilaterals, 8-node ones (M3D8R, M3D8, S8R; M3D9 / M3D9R with their centre node) or two
+    6-node triangles per cell (M3D6, S6), node ids row by row on the grid of corner and midside
+    points."""
+    quad8, tri6 = typ in ("M3D8R", "M3D8", "M3D9R", "M3D9", "S8R"), typ in ("M3D6", "S6")
     mx, my = (2 * nx, 2 * ny) if quad8 or tri6 else (nx, ny)
     nid = lambda i, j: 1 + i + (mx + 1) * j      # noqa: E731
     elems = []
@@ -1076,11 +1079,16 @@ def quad_membrane_strip_deck(typ, t=0.1, nx=4, ny=2, stretch=None):
     return "\n".join(lines) + "\n"
 
 
-def membrane_sphere_deck(typ, n=16, t=0.01, p=1.0):
-    """An octant of a sphere (radius 1, membranes ``typ`` of thickness t, E 1e5, nu 0.3) meshed
-    by projecting three faces of a cube onto it, n x n cells each, symmetry on the coordinate
-    planes, internal pressure p (*DLOAD P along the outward normal): thin-wall theory gives the
-    radial displacement p (1 - nu) / (2 E t)."""
+def sheet_sphere_deck(typ, n=16, t=0.01, p=1.0, load="P", offset=None, nlgeom=False, nu=0.3, sets=1):
+    """An octant of a sphere (radius 1 at the nodes, shells or membranes ``typ`` of thickness t,
+    E 1e5, Poisson's ratio nu) meshed by projecting three faces of a cube onto it, n x n cells
+    each, symmetry on the coordinate planes, internal pressure p on the reference surface: a
+    *DLOAD P along the outward element normal, or (``load`` "SNEG" / "SPOS") a *DSLOAD on that
+    side, -p on SPOS (a surface pressure pushes against the surface normal); a shell section's
+    OFFSET ``offset``; ``sets`` 2: the load given on two element sets (one patch, the other two)
+    in one card.  Abaqus: the total force on the x = 0 plane is p times the reference
+    surface's projected area (pi / 4) and thin-wall theory gives the radial displacement
+    p (1 - nu) / (2 E t)."""
     grid, elems = sheet_mesh(typ, n, n)
     ids, nodes, conn = {}, [], []
     for k in range(3):                                   # the faces x = 1, y = 1, z = 1
@@ -1095,16 +1103,53 @@ def membrane_sphere_deck(typ, n=16, t=0.01, p=1.0):
                 nodes.append((ids[key], tuple(c / r for c in pt)))
             local[g] = ids[key]
         conn += [[local[g] for g in c] for c in elems]
-    lines = ["*Heading", f"A sphere octant of {typ} membranes under internal pressure", "*Node"]
+    sec = (f"*Membrane Section, elset=SPHERE, material=M" if typ.startswith("M3D") else
+           f"*Shell Section, elset=SPHERE, material=M" + (f", offset={offset}" if offset else ""))
+    lines = ["*Heading", f"A sphere octant of {typ} under internal pressure", "*Node"]
     lines += [f"{k}, {x:.12g}, {y:.12g}, {z:.12g}" for k, (x, y, z) in nodes]
     lines.append(f"*Element, type={typ}, elset=SPHERE")
     lines += [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(conn, 1)]
     lines += ["*Nset, nset=ALL"] + _ids([k for k, _ in nodes])
     for d in range(3):
         lines += [f"*Nset, nset=SYM{d + 1}"] + _ids([k for k, x in nodes if abs(x[d]) < 1e-9])
-    lines += ["*Material, name=M", "*Elastic", "100000., 0.3", "*Membrane Section, elset=SPHERE, material=M",
-              f"{t:g}", "*Step", "*Static", "*Boundary", "SYM1, 1, 1", "SYM2, 2, 2", "SYM3, 3, 3",
-              "*Dload", f"SPHERE, P, {p:g}", "*Node print, nset=ALL", "U", "*End Step"]
+    if sets == 2:
+        lines += ["*Elset, elset=SPH1"] + _ids(range(1, len(elems) + 1))
+        lines += ["*Elset, elset=SPH2"] + _ids(range(len(elems) + 1, len(conn) + 1))
+    lines += ["*Material, name=M", "*Elastic", f"100000., {nu:g}", sec, f"{t:g}"]
+    lines += [] if load == "P" else ["*Surface, name=INNER", f"SPHERE, {load}"]
+    lines += ["*Step" + (", nlgeom, inc=100" if nlgeom else ""), "*Static"] + (["0.1, 1."] if nlgeom else [])
+    lines += ["*Boundary", "SYM1, 1, 1", "SYM2, 2, 2", "SYM3, 3, 3"]
+    lines += ["*Dload"] + [f"{s}, P, {p:g}" for s in (["SPHERE"] if sets == 1 else ["SPH1", "SPH2"])] \
+        if load == "P" else \
+        ["*Dsload", f"INNER, P, {-p if load == 'SPOS' else p:g}"]
+    lines += ["*Node print, nset=SYM1, totals=ONLY", "RF", "*Node print, nset=ALL", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def sheet_cylinder_deck(typ, n=8, t=0.1, p=1.0, nu=0.3):
+    """Half a cylinder (radius 1 at the nodes, length 1 along z; shells or membranes ``typ`` of
+    thickness t, E 1e5, Poisson's ratio nu), n x n cells over theta 0..180 deg and z, symmetric
+    about y = 0 (u_y and the rotation about z held: ccx's hinge there is nearly singular), held
+    in z on z = 0 and in x at (0, 1, 0), open at z = 1, internal pressure p (*DLOAD P along the
+    outward normal).  Abaqus: the y-force on the plane y = 0 is p times the projected area
+    2 R L = 2 and thin-wall theory gives the radial displacement p R^2 / (E t)."""
+    grid, elems = sheet_mesh(typ, n, n, math.pi, 1.0)
+    nodes = {k: (math.cos(th), math.sin(th), z) for k, (th, z) in grid.items()}
+    top = min(nodes, key=lambda k: abs(nodes[k][0]) + abs(nodes[k][1] - 1) + abs(nodes[k][2]))
+    sec = "*Membrane Section" if typ.startswith("M3D") else "*Shell Section"
+    lines = ["*Heading", f"Half a cylinder of {typ} under internal pressure", "*Node"]
+    lines += [f"{k}, {0.0 if abs(x) < 1e-12 else x:.12g}, {0.0 if abs(y) < 1e-12 else y:.12g}, {z:.12g}"
+              for k, (x, y, z) in nodes.items()]
+    lines.append(f"*Element, type={typ}, elset=TUBE")
+    lines += [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+    lines += ["*Nset, nset=ALL"] + _ids(list(nodes))
+    lines += ["*Nset, nset=FLOOR"] + _ids([k for k, (x, y, z) in nodes.items() if abs(y) < 1e-9])
+    lines += ["*Nset, nset=BASE"] + _ids([k for k, (x, y, z) in nodes.items() if z == 0.0])
+    lines += ["*Material, name=M", "*Elastic", f"100000., {nu:g}", f"{sec}, elset=TUBE, material=M", f"{t:g}",
+              "*Step", "*Static", "*Boundary", "FLOOR, 2, 2"] + (["FLOOR, 6, 6"] if sec[1] == "S" else []) + \
+             ["BASE, 3, 3", f"{top}, 1, 1",
+              "*Dload", f"TUBE, P, {p:g}", "*Node print, nset=FLOOR, totals=ONLY", "RF",
+              "*Node print, nset=ALL", "U", "*End Step"]
     return "\n".join(lines) + "\n"
 
 
@@ -3740,18 +3785,72 @@ def main():
             failures += 0 if ok else 1
     for typ in ("M3D8R", "M3D6"):
         t = 0.01
-        res = composite_run(membrane_sphere_deck(typ, 16, t), f"quad_membrane_sphere_{typ.lower()}")
+        res = composite_run(sheet_sphere_deck(typ, 16, t), f"quad_membrane_sphere_{typ.lower()}")
         if res is None:
             failures += 1
             continue
         want = 0.7 / (2 * 1e5 * t)
         ur = [math.sqrt(sum(c * c for c in v)) for v in res[0].values()]
         err = max(abs(x / want - 1) for x in ur)
-        ok = err < 0.01
+        ok = err < 0.005
         print(f"{'PASS' if ok else 'FAIL'}  quad_membrane_sphere_{typ.lower()} (sphere octant of {typ}, "
               f"t/R {t:g}, internal pressure): radial displacement {min(ur):.5g} .. {max(ur):.5g} vs "
-              f"thin-wall theory {want:.5g}, max difference {err * 100:.2f}% (within t/R: ccx loads "
-              f"the inner face of its expanded shells and membranes)")
+              f"thin-wall theory {want:.5g}, max difference {err * 100:.2f}%")
+        failures += 0 if ok else 1
+    # --- shell / membrane pressure on the reference surface: ccx 2.23 loads one face of its
+    # expanded element (a shell's P, P1 and P2 alike the bottom one, whose area is off by
+    # O(t/R)) and that leaves a mean stress -p/2 through the thickness of its 3-D solid; abq2ccx
+    # splits the pressure between both faces.  Sphere octants and a half cylinder, t/R 0.1, nu
+    # 0.3: the symmetry-plane reaction against p times the reference surface's projected area
+    # (on a sphere times 1 + (1 - 4 o^2) (t/2R)^2, the split's residual for OFFSET o; NLGEOM:
+    # the deformed sphere's), the mean radial displacement against thin-wall theory
+    t, e_mod = 0.1, 1e5
+    for typ, kw, tag in (("S8R", {}, "s8r"), ("S8R", {"load": "SNEG"}, "s8r_sneg"),
+                         ("S8R", {"load": "SPOS"}, "s8r_spos"), ("S8R", {"sets": 2}, "s8r_two_sets"),
+                         ("S6", {}, "s6"),
+                         ("S8R", {"offset": "SPOS", "nu": 0.0}, "s8r_offset"),
+                         ("S8R", {"nlgeom": True}, "s8r_nlgeom"), ("S4R", {}, "s4r"),
+                         ("M3D4", {}, "m3d4"), ("M3D8R", {}, "m3d8r"), ("M3D6", {}, "m3d6"), ("S8R", None, "cylinder_s8r")):
+        tag = "sheet_pressure_" + tag
+        linear = typ in ("S4R", "M3D4")
+        if kw is None:
+            text, nu, p = sheet_cylinder_deck(typ, 8, t), 0.3, 1.0
+        else:
+            nu = kw.get("nu", 0.3)
+            p = 0.05 * 2 * e_mod * t / (1 - nu) if kw.get("nlgeom") else 1.0     # ~5 % stretch
+            text = sheet_sphere_deck(typ, 16 if linear else 8, t, p, **kw)
+        res = composite_run(text, tag)
+        if res is None:
+            failures += 1
+            continue
+        pts = {int(ln.split(",")[0]): [float(c) for c in ln.split(",")[1:]]
+               for ln in text.split("*Node\n")[1].split("*Element")[0].splitlines()}
+        if kw is None:
+            for x in pts.values():
+                x[2] = 0.0
+        ur = sum(_dot(res[0][k], [c / math.sqrt(_dot(x, x)) for c in x]) for k, x in pts.items()) / len(pts)
+        o = 0.5 if kw and kw.get("offset") else 0.0
+        if kw is None:
+            force, want_f, want_u = -res[1][-1][1], 2 * p, p / (e_mod * t)
+        else:
+            r = 1 + ur if kw.get("nlgeom") else 1.0
+            force, want_f, want_u = -res[1][-1][0], p * math.pi / 4 * r ** 2 * (1 + (1 - 4 * o * o) * (t / 2 / r) ** 2), \
+                p * (1 - nu) / (2 * e_mod * t)
+        err_f, err_u = abs(force / want_f - 1), abs(ur / want_u - 1)
+        # linear elements: ccx's RF at a held node leaves out its own share of the face load
+        # (1 - O(h^2)), and M3D4's force barely moves (each element its own flat slab); its
+        # displacement does (the through-thickness stress)
+        checks = [err_f < (5e-3 if linear else 5e-4)] if typ != "M3D4" else []
+        checks += [] if kw and kw.get("nlgeom") else [err_u < 5e-3]
+        ok = all(checks)
+        what = ("half cylinder" if kw is None else "sphere octant") + f" of {typ}, t/R {t:g}, " + \
+            ("*DLOAD P" if not kw or "load" not in kw else f"*DSLOAD on {kw['load']}") + \
+            (" on two sets in one card" if kw and kw.get("sets") else "") + \
+            (", OFFSET=SPOS, nu 0" if o else "") + (", NLGEOM (5 % stretch)" if kw and kw.get("nlgeom") else "")
+        disp = "" if kw and kw.get("nlgeom") else \
+            f", mean radial displacement {ur:.6g} vs thin-wall {want_u:.6g} ({err_u * 100:.2f}% off)"
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): pressure force {force:.6g} vs {want_f:.6g} "
+              f"({err_f * 100:.3f}% off){disp}")
         failures += 0 if ok else 1
     ref = None
     for plane, tilt in (("XY", 0.0), ("XY", 30.0), ("XZ", 30.0), ("YZ", 30.0)):
