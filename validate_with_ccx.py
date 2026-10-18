@@ -1153,6 +1153,110 @@ def sheet_cylinder_deck(typ, n=8, t=0.1, p=1.0, nu=0.3):
     return "\n".join(lines) + "\n"
 
 
+def membrane_skin_deck(typ, tied=True, flip=False, t=0.02):
+    """A membrane skin (thickness t, E t = 2000, nu 0.3) on a 2 x 1 x 0.2 C3D8 block (E 1000)
+    clamped at its bottom, every node held in z and the skin's end x = 0 like the block's, its
+    edge x = 2 pulled by 1 in x.  ``tied``: the skin on nodes of its own half a thickness above
+    the block, its SNEG face (SPOS with ``flip``: the element normal reversed) tied to the
+    block's top without a POSITION TOLERANCE; else on the block's top nodes — the same model,
+    a tie of coincident meshes.  -> (deck, the node at the middle of the pulled edge)."""
+    nx, ny, nz, lx, ly, h = 8, 4, 2, 2.0, 1.0, 0.2
+    bid = lambda i, j, k: 1 + i + (nx + 1) * (j + (ny + 1) * k)      # noqa: E731
+    sid = (lambda i, j: 1000 + i + (nx + 1) * j) if tied else (lambda i, j: bid(i, j, nz))   # noqa: E731
+    lines = ["*Heading", f"A {typ} skin {'tied to' if tied else 'sharing the nodes of'} a block", "*Node"]
+    lines += [f"{bid(i, j, k)}, {lx * i / nx:.12g}, {ly * j / ny:.12g}, {h * (k / nz - 1):.12g}"
+              for k in range(nz + 1) for j in range(ny + 1) for i in range(nx + 1)]
+    if tied:
+        lines += [f"{sid(i, j)}, {lx * i / nx:.12g}, {ly * j / ny:.12g}, {t / 2:.12g}"
+                  for j in range(ny + 1) for i in range(nx + 1)]
+    lines.append("*Element, type=C3D8, elset=BLOCK")
+    lines += [f"{1 + i + nx * (j + ny * k)}, " + ", ".join(str(bid(i + a, j + b, k + c)) for c in (0, 1)
+                                                         for a, b in ((0, 0), (1, 0), (1, 1), (0, 1)))
+              for k in range(nz) for j in range(ny) for i in range(nx)]
+    lines.append(f"*Element, type={typ}, elset=SKIN")
+    e = 1000
+    for j in range(ny):
+        for i in range(nx):
+            c = [sid(i, j), sid(i + 1, j), sid(i + 1, j + 1), sid(i, j + 1)]
+            c = c[::-1] if flip else c
+            for cell in ([c[:3], [c[0], c[2], c[3]]] if typ == "M3D3" else [c]):
+                e += 1
+                lines.append(f"{e}, " + ", ".join(map(str, cell)))
+    top = list(range(1 + nx * ny * (nz - 1), 1 + nx * ny * nz))
+    lines += ["*Nset, nset=ALL"] + _ids(sorted({bid(i, j, k) for k in range(nz + 1) for j in range(ny + 1)
+                                                for i in range(nx + 1)} | {sid(i, j) for j in range(ny + 1)
+                                                                            for i in range(nx + 1)}))
+    lines += ["*Nset, nset=BOTTOM"] + _ids([bid(i, j, 0) for j in range(ny + 1) for i in range(nx + 1)])
+    lines += ["*Nset, nset=END"] + _ids(sorted({bid(0, j, nz) for j in range(ny + 1)} |
+                                               {sid(0, j) for j in range(ny + 1)}))
+    lines += ["*Nset, nset=PROBE", str(sid(nx, ny // 2))]
+    lines += ["*Elset, elset=TOP"] + _ids(top)
+    lines += ["*Material, name=BLOCK", "*Elastic", "1000., 0.3", "*Material, name=SKIN", "*Elastic",
+              f"{2000.0 / t:.12g}, 0.3", "*Solid Section, elset=BLOCK, material=BLOCK",
+              "*Membrane Section, elset=SKIN, material=SKIN", f"{t:g}",
+              "*Surface, name=BLOCK_TOP, type=ELEMENT", "TOP, S2"]
+    if tied:
+        lines += ["*Surface, name=SKIN_FACE, type=ELEMENT", f"SKIN, {'SPOS' if flip else 'SNEG'}",
+                  "*Tie, name=GLUE", "SKIN_FACE, BLOCK_TOP"]
+    lines += ["*Step", "*Static", "*Boundary", "BOTTOM, 1, 2", "END, 1, 2", "ALL, 3, 3", "*Cload"]
+    lines += [f"{sid(nx, j)}, 1, {(0.5 if j in (0, ny) else 1.0) / ny:.12g}" for j in range(ny + 1)]
+    lines += ["*Node print, nset=PROBE", "U", "*End Step"]
+    return "\n".join(lines) + "\n", sid(nx, ny // 2)
+
+
+def membrane_mass_deck(typ, rho=7.0, area_mass=2.0, t=0.01):
+    """A 2 x 1 membrane strip ``typ`` (thickness t, E 1e5, material density rho, *MEMBRANE
+    SECTION DENSITY=area_mass — a mass per unit area added to the material's; none if 0) held
+    in-plane at its ends x = 0 and 2 and in z everywhere, its first three frequencies wanted:
+    the same model as area_mass 0 with the density rho + area_mass / t."""
+    grid, elems = sheet_mesh(typ, 4, 2, 2.0, 1.0)
+    lines = ["*Heading", f"A {typ} strip with a section mass: in-plane frequencies", "*Node"]
+    lines += [f"{k}, {x:.12g}, {y:.12g}, 0." for k, (x, y) in grid.items()]
+    lines.append(f"*Element, type={typ}, elset=SKIN")
+    lines += [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+    lines += ["*Nset, nset=ALL"] + _ids(list(grid))
+    lines += ["*Nset, nset=ENDS"] + _ids([k for k, (x, _y) in grid.items() if x in (0.0, 2.0)])
+    lines += ["*Material, name=M", "*Elastic", "1e5, 0.3", "*Density", f"{rho:.12g}",
+              "*Membrane Section, elset=SKIN, material=M" + (f", density={area_mass:g}" if area_mass else ""),
+              f"{t:g}", "*Step", "*Frequency", "3", "*Boundary", "ENDS, 1, 2", "ALL, 3, 3", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def sheet_coupling_deck(typ, face, t=0.02):
+    """A 2 x 1 strip of membranes or shells ``typ`` (E t = 2000, nu 0) held in x on x = 0, in y
+    at the origin, in z everywhere; its last element column joined by a kinematic coupling of
+    the translations on its ``face`` side to a reference node at (2.5, 0.5, 0) pulled by 1 in x:
+    the end column moves rigidly, so the strip's end moves (2 - h) / 2000 (h = 0.25, the
+    column's width).  -> (deck, the node at the middle of the strip's end)."""
+    nx, ny = 8, 4
+    nid = lambda i, j: 1 + i + (nx + 1) * j      # noqa: E731
+    lines = ["*Heading", f"A {typ} strip with a kinematic coupling on its {face} face", "*Node"]
+    lines += [f"{nid(i, j)}, {2.0 * i / nx:.12g}, {1.0 * j / ny:.12g}, 0." for j in range(ny + 1)
+              for i in range(nx + 1)] + ["999, 2.5, 0.5, 0."]
+    lines.append(f"*Element, type={typ}, elset=STRIP")
+    e, last = 0, []
+    for j in range(ny):
+        for i in range(nx):
+            c = [nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)]
+            for cell in ([c[:3], [c[0], c[2], c[3]]] if typ in ("M3D3", "S3") else [c]):
+                e += 1
+                lines.append(f"{e}, " + ", ".join(map(str, cell)))
+                if i == nx - 1:
+                    last.append(e)
+    lines += ["*Elset, elset=LAST"] + _ids(last)
+    lines += ["*Nset, nset=ALL"] + _ids([nid(i, j) for j in range(ny + 1) for i in range(nx + 1)])
+    lines += ["*Nset, nset=LEFT"] + _ids([nid(0, j) for j in range(ny + 1)])
+    lines += ["*Material, name=M", "*Elastic", f"{2000.0 / t:.12g}, 0.",
+              f"*{'Membrane' if typ.startswith('M3D') else 'Shell'} Section, elset=STRIP, material=M", f"{t:g}",
+              "*Surface, name=END_FACE, type=ELEMENT", f"LAST, {face}",
+              "*Coupling, constraint name=END, ref node=999, surface=END_FACE", "*Kinematic", "1, 3",
+              "*Step", "*Static", "*Boundary", "LEFT, 1, 1", f"{nid(0, 0)}, 2, 2", "ALL, 3, 3", "999, 2, 6",
+              "*Cload", "999, 1, 1.", "*Node print, nset=END_NODE", "U", "*End Step"]
+    lines.insert(lines.index("*Material, name=M"), "*Nset, nset=END_NODE")
+    lines.insert(lines.index("*Material, name=M"), str(nid(nx, ny // 2)))
+    return "\n".join(lines) + "\n", nid(nx, ny // 2)
+
+
 def shell_axes_angle(plane, orient=True):
     """The plate angle of Abaqus' material direction 1 in shell_axes_inplane_deck (degrees)."""
     place = plate_place(plane)
@@ -3851,6 +3955,71 @@ def main():
             f", mean radial displacement {ur:.6g} vs thin-wall {want_u:.6g} ({err_u * 100:.2f}% off)"
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): pressure force {force:.6g} vs {want_f:.6g} "
               f"({err_f * 100:.3f}% off){disp}")
+        failures += 0 if ok else 1
+    # --- a *TIE / tied pair / kinematic coupling on membrane faces: ccx would take its expanded
+    # membrane's face, whose bottom nodes its hinge eliminates (SNEG ties nothing, SPOS ties a
+    # face that shears through the thickness); abq2ccx takes the membrane nodes, as Abaqus does
+    for typ, flip, pair in (("M3D4", False, False), ("M3D4", True, False), ("M3D4R", False, False),
+                            ("M3D3", True, False), ("M3D4", False, True)):
+        face = "SPOS" if flip else "SNEG"
+        tag = f"membrane_{'tied_pair' if pair else 'tie'}_{typ.lower()}_{face.lower()}"
+        text, probe = membrane_skin_deck(typ, True, flip)
+        if pair:
+            text = text.replace("*Tie, name=GLUE\nSKIN_FACE, BLOCK_TOP",
+                                "*Surface Interaction, name=GLUE\n*Contact Pair, interaction=GLUE, tied\n"
+                                "SKIN_FACE, BLOCK_TOP")
+        ref_text, ref_probe = membrane_skin_deck(typ, False)
+        res, ref = composite_run(text, tag), composite_run(ref_text, tag + "_ref")
+        if res is None or ref is None:
+            failures += 1
+            continue
+        got, want = res[0].get(probe, [math.inf])[0], ref[0].get(ref_probe, [math.nan])[0]
+        err = abs(got / want - 1)
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({typ} skin {'tied by a *CONTACT PAIR, TIED' if pair else 'tied'} "
+              f"by its {face} face to a block, no position tolerance): end displacement {got:.7g} vs "
+              f"{want:.7g} with the skin on the block's nodes ({err:.1e} apart; native ccx: "
+              f"{'untied, about 1e-3' if face == 'SNEG' else 'its face tied, 5.9 % stiff'})")
+        failures += 0 if ok else 1
+    # *MEMBRANE SECTION, DENSITY= (mass per area added to the material's; ccx has no section
+    # mass) -> a copy of the material with DENSITY / t more: the frequencies of the same strip
+    # whose material has that density
+    for typ in ("M3D4", "M3D8R"):
+        tag = f"membrane_area_mass_{typ.lower()}"
+        freqs = []
+        for k, text in enumerate((membrane_mass_deck(typ), membrane_mass_deck(typ, 7.0 + 2.0 / 0.01, 0.0))):
+            src, inp = os.path.join(tmp, f"{tag}_{k}_src.inp"), os.path.join(tmp, f"{tag}_{k}.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            convert(src, inp)
+            d, status, out = run_ccx(ccx, env, inp)
+            freqs.append(dat_eigen_table(os.path.join(d, "job.dat"), "E I G E N V A L U E   O U T P U T")
+                         if status == "solved" else [])
+            shutil.rmtree(d, ignore_errors=True)
+        if min(len(f) for f in freqs) < 3:
+            print(f"FAIL  {tag}: no frequencies ({status})")
+            failures += 1
+            continue
+        err = max(abs(a / b - 1) for a, b in zip(freqs[0][:3], freqs[1][:3]))
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({typ} strip, material density 7, thickness 0.01, "
+              f"section DENSITY=2): first frequencies {', '.join(f'{x:.6g}' for x in freqs[0][:3])} vs "
+              f"{', '.join(f'{x:.6g}' for x in freqs[1][:3])} with density 207 in the material ({err:.1e} "
+              f"apart; the section mass dropped: 5.4x higher)")
+        failures += 0 if ok else 1
+    for typ, face in (("M3D4", "SNEG"), ("M3D3", "SPOS"), ("M3D4R", "SNEG"), ("S4", "SNEG"), ("S3", "SPOS")):
+        tag = f"sheet_coupling_{typ.lower()}_{face.lower()}"
+        text, probe = sheet_coupling_deck(typ, face)
+        res = composite_run(text, tag)
+        if res is None:
+            failures += 1
+            continue
+        got, want = res[0].get(probe, [math.inf])[0], 1.75 / 2000
+        err = abs(got / want - 1)
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({typ} strip, kinematic coupling on its last column's "
+              f"{face} face, pulled): end displacement {got:.7g} vs {want:.7g} for a rigid end column "
+              f"({err:.1e} apart; ccx on the faces: M3D4 1.2 % off, M3D4R 0.3 %, M3D3 / S3 / S4 crash)")
         failures += 0 if ok else 1
     ref = None
     for plane, tilt in (("XY", 0.0), ("XY", 30.0), ("XZ", 30.0), ("YZ", 30.0)):

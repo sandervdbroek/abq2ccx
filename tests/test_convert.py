@@ -8920,14 +8920,16 @@ def test_quadratic_membrane_sections_loads_and_output():
     body, conv, rep = convert_str(QM8_STRIP + lin + "*Membrane Section, elset=SKIN, material=M, density=2.\n0.01\n"
                                   "*Step\n*Dynamic\n0.1, 1.\n*Boundary\nLEFT, 1, 3\n*Dload\nSKIN, P, 3.\n"
                                   "*Node File, nset=RIGHT\nU\n*End Step\n")
-    assert _card_at(body, "*MEMBRANE SECTION, ELSET=SKIN_MEMBRANE, MATERIAL=M, DENSITY=2.") == ["0.01"]
-    assert _card_at(body, "*SOLID SECTION, ELSET=SKIN_SOLID, MATERIAL=M") == []
+    # DENSITY= (mass per area) -> a material copy with DENSITY / t, for both forms
+    assert "*MEMBRANE SECTION, ELSET=SKIN_MEMBRANE, MATERIAL=M_MEMBRANE_MASS\n0.01\n" in body
+    assert _card_at(body, "*SOLID SECTION, ELSET=SKIN_SOLID, MATERIAL=M_MEMBRANE_MASS") == []
+    assert "*MATERIAL, NAME=M_MEMBRANE_MASS\n*ELASTIC\n100000., 0.3\n*DENSITY\n200.\n" in body
     g = reparse(body)
     assert g.elsets["SKIN_MEMBRANE"] == [9] and g.elsets["SKIN_SOLID"] == [1, 2] and g.elements[9][0] == "M3D4"
     assert _card_at(body, "*DLOAD") == ["SKIN, P1, 1.5", "ABQ2CCX_TOP_SKIN, P, -1.5"]
     assert _card_at(body, "*SURFACE, NAME=ABQ2CCX_TOP_SKIN") == ["SKIN, S2"]
     assert _card_at(body, "*NODE PRINT, NSET=RIGHT") == ["U"]
-    assert "DENSITY= (mass per unit area" in rep.text() and any("DENSITY" in r for r in conv.reduced_physics)
+    assert "material M_MEMBRANE_MASS, a copy of M" in rep.text() and not conv.reduced_physics
     # thickness from *NODAL THICKNESS
     body, _, _ = convert_str(QM8_STRIP + "*Nodal Thickness\n1, 0.02\n2, 0.02\n3, 0.04\n4, 0.04\n5, 0.04\n6, 0.02\n"
                              "8, 0.04\n10, 0.04\n11, 0.02\n12, 0.02\n13, 0.04\n14, 0.04\n15, 0.04\n"
@@ -8982,6 +8984,139 @@ def test_tie_on_quadratic_membranes_ties_their_own_nodes():
     assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["1", "3", "13", "11", "2", "8", "12", "6"]
     assert _card_at(body, "*TIE, NAME=T1") == ["MS_NODES, BS"] and "node surface MS_NODES" in rep.text()
     assert not conv.reduced_physics
+
+
+LM4_SKIN = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n6, 2., 1., 0.\n"
+            "101, 0., 0., -0.5\n102, 1., 0., -0.5\n103, 1., 1., -0.5\n104, 0., 1., -0.5\n"
+            "105, 0., 0., -0.005\n106, 1., 0., -0.005\n107, 1., 1., -0.005\n108, 0., 1., -0.005\n"
+            "*Element, type=M3D4, elset=SKIN\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n"
+            "*Element, type=C3D8, elset=BLOCK\n101, 101, 102, 103, 104, 105, 106, 107, 108\n"
+            "*Nset, nset=LEFT\n1, 4\n*Material, name=M\n*Elastic\n100000., 0.3\n"
+            "*Membrane Section, elset=SKIN, material=M\n0.01\n*Solid Section, elset=BLOCK, material=M\n"
+            "*Elset, elset=E1\n1\n*Surface, name=MS, type=ELEMENT\nE1, SNEG\n"
+            "*Surface, name=BS, type=ELEMENT\nBLOCK, S2\n")
+LM4_STEP = "*Step\n*Static\n*Boundary\nLEFT, 1, 3\n*Cload\n3, 1, 1.\n*End Step\n"
+
+
+def test_tie_on_linear_membranes_ties_their_nodes():
+    # ccx ties its expanded membrane's face, whose bottom nodes its own membrane hinge eliminates:
+    # SNEG ties nothing, SPOS ties a face that shears through the thickness (probed); Abaqus ties
+    # the membrane nodes, its tolerance measured from them (no membrane thickness in a *TIE)
+    body, conv, rep = convert_str(LM4_SKIN + "*Tie, name=T1\nMS, BS\n" + LM4_STEP)
+    assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["1", "2", "5", "4"]
+    # Abaqus' default, written out (ccx's is far smaller): 10 % of the master facet diagonal
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.141421") == ["MS_NODES, BS"]
+    assert "node surface MS_NODES" in rep.text() and not conv.reduced_physics
+    body, _, _ = convert_str(LM4_SKIN + "*Tie, name=T1, position tolerance=0.02\nMS, BS\n" + LM4_STEP)
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.02") == ["MS_NODES, BS"]
+    body, _, _ = convert_str(LM4_SKIN + "*Tie, name=T1, type=NODE TO SURFACE\nMS, BS\n" + LM4_STEP)
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.0707107") == ["MS_NODES, BS"]
+    # ccx reads one line of a *TIE card: several lines -> one card each
+    body, _, rep = convert_str(LM4_SKIN + "*Surface, name=S1, type=ELEMENT\nSKIN, SPOS\n"
+                               "*Tie, name=T1, position tolerance=0.02\nBS, MS\nMS, BS\n" + LM4_STEP)
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.02") == ["BS, MS"]
+    assert _card_at(body, "*TIE, NAME=T1_2, POSITION TOLERANCE=0.02") == ["MS_NODES, BS"]
+    assert "one *TIE per line" in rep.text()
+    # a tied contact pair counts the membrane's half thickness: ccx's default tolerance (2.5 % of
+    # the master edges) plus t / 2
+    body, _, _ = convert_str(LM4_SKIN + "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\n"
+                             "MS, BS\n" + LM4_STEP)
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED1, POSITION TOLERANCE=0.03") == ["MS_NODES, BS"]
+    # a surface on membranes and solids stays, warned
+    body, conv, rep = convert_str(LM4_SKIN + "*Surface, name=MIX, type=ELEMENT\nE1, SNEG\nBLOCK, S1\n"
+                                  "*Tie, name=T1\nMIX, BS\n" + LM4_STEP)
+    assert _card_at(body, "*TIE, NAME=T1") == ["MIX, BS"] and "lies on membranes and on other" in rep.text()
+    assert conv.reduced_physics
+    # a slave node that is a node of the master face stays out (ccx would tie it to itself and
+    # loop in its cascade); with every slave node on the master the line ties nothing
+    shared = LM4_SKIN.replace("1, 1, 2, 5, 4\n", "1, 105, 2, 5, 4\n")
+    body, _, _ = convert_str(shared + "*Tie, name=T1\nMS, BS\n" + LM4_STEP)
+    assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["2", "5", "4"]
+    on_top = LM4_SKIN.replace("1, 1, 2, 5, 4\n", "1, 105, 106, 107, 108\n")
+    body, _, _ = convert_str(on_top + "*Tie, name=T1\nMS, BS\n" + LM4_STEP)
+    assert "*TIE" not in body.split("*HEADING")[-1].replace("** [abq2ccx] *TIE", "")
+    assert "every slave node of MS is a node of BS" in body
+
+
+def test_tied_pair_of_a_membrane_on_a_rigid_surface_counts_its_thickness():
+    # Abaqus' tied contact counts membrane thickness ("Defining tied contact"): a membrane whose
+    # SNEG face rests on a rigid plate (its nodes half a thickness above) joins the plate's body
+    deck = ("*Node\n1, 0., 0., 0.05\n2, 1., 0., 0.05\n3, 1., 1., 0.05\n4, 0., 1., 0.05\n"
+            "11, 0., 0., 0.\n12, 1., 0., 0.\n13, 1., 1., 0.\n14, 0., 1., 0.\n19, 0.5, 0.5, -1.\n"
+            "*Element, type=M3D4, elset=SKIN\n1, 1, 2, 3, 4\n*Element, type=R3D4, elset=RIG\n11, 11, 12, 13, 14\n"
+            "*Rigid Body, ref node=19, elset=RIG\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Membrane Section, elset=SKIN, material=M\n0.1\n*Surface, name=MS\nSKIN, SNEG\n"
+            "*Surface, name=MAST\nRIG, SPOS\n*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\n"
+            "MS, MAST\n*Step\n*Static\n*Boundary\n19, 1, 6\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert "ABQ2CCX_TIED" not in body and not conv.reduced_physics
+    rb = next(ln for ln in body.splitlines() if ln.startswith("*RIGID BODY"))
+    members = [int(x) for x in _card_at(body, f"*NSET, NSET={rb.split('NSET=')[1].split(',')[0]}")[0].split(",")]
+    assert {1, 2, 3, 4} <= set(members) and conv.geom.nodes[1][2] == 0.05      # not moved: touching
+
+
+def test_kinematic_couplings_on_membrane_and_shell_faces_take_their_nodes():
+    # ccx would couple the expanded faces: 1.2 % off on M3D4, a crash (SIGBUS) on M3D3 and on the
+    # shells the converter knots for the coupling (probed); Abaqus couples the surface's nodes
+    cpl = "*Node\n9, 3., 0.5, 0.\n*Coupling, constraint name=C, ref node=9, surface=MS\n*Kinematic\n1, 3\n"
+    body, _, rep = convert_str(LM4_SKIN + cpl + LM4_STEP)
+    assert "*COUPLING, CONSTRAINT NAME=C, REF NODE=9, SURFACE=MS_NODES" in body
+    assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["1", "2", "5", "4"]
+    # a reference node on the surface stays out of it
+    body, _, _ = convert_str(LM4_SKIN + cpl.replace("ref node=9", "ref node=5") + LM4_STEP)
+    assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["1", "2", "4"]
+    shell = LM4_SKIN.replace("type=M3D4, elset=SKIN", "type=S4, elset=SKIN").replace(
+        "*Membrane Section, elset=SKIN, material=M\n0.01", "*Shell Section, elset=SKIN, material=M\n0.01")
+    body, _, rep = convert_str(shell + cpl + LM4_STEP)
+    assert "SURFACE=MS_NODES" in body and "on shells -> node surface MS_NODES" in rep.text()
+    # a shell's *TIE slave stays its face (ccx ties the expanded face)
+    body, _, _ = convert_str(shell + "*Tie, name=T1\nMS, BS\n" + LM4_STEP)
+    assert _card_at(body, "*TIE, NAME=T1") == ["MS, BS"]
+    # a coupling acts on nodes: a surface on membranes and solid faces takes all their nodes
+    body, _, _ = convert_str(LM4_SKIN + "*Surface, name=MIX, type=ELEMENT\nE1, SNEG\nBLOCK, S1\n"
+                             + cpl.replace("surface=MS", "surface=MIX") + LM4_STEP)
+    assert "SURFACE=MIX_NODES" in body
+    assert _card_at(body, "*SURFACE, NAME=MIX_NODES, TYPE=NODE") == ["1", "2", "5", "4", "101", "102", "103", "104"]
+    # ccx takes a distributing coupling only on an element surface: on ccx's own membranes it
+    # spreads the load over faces its hinge holds (M3D4 about 2 % off, M3D3 nothing): warned
+    body, conv, rep = convert_str(LM4_SKIN + cpl.replace("*Kinematic", "*Distributing") + LM4_STEP)
+    assert "REF NODE=9, SURFACE=MS\n" in body and "*DISTRIBUTING on membrane faces" in rep.text()
+    assert any("DISTRIBUTING" in r for r in conv.reduced_physics)
+
+
+def test_membrane_section_density_and_poisson():
+    # ccx has no section mass and no thickness law: both parameters leave the card, said so
+    dense = LM4_SKIN.replace("material=M\n0.01", "material=M, density=2., poisson=0.3\n0.01")
+    body, conv, rep = convert_str(dense + LM4_STEP)
+    assert "*MEMBRANE SECTION, ELSET=SKIN, MATERIAL=M\n0.01\n" in body
+    assert "DENSITY= dropped: ccx has no section mass, and no step" in rep.text()
+    assert "POISSON= dropped: Abaqus changes a membrane's thickness with it only under NLGEOM" in rep.text()
+    assert not conv.reduced_physics
+    # where mass acts: a copy of the material carries DENSITY / t (2 / 0.01) — also beside the
+    # material's own density
+    body, conv, rep = convert_str(dense + "*Step\n*Frequency\n3\n*End Step\n")
+    assert "*MEMBRANE SECTION, ELSET=SKIN, MATERIAL=M_MEMBRANE_MASS\n0.01\n" in body
+    assert "*MATERIAL, NAME=M_MEMBRANE_MASS\n*ELASTIC\n100000., 0.3\n*DENSITY\n200.\n" in body
+    assert "*SOLID SECTION, ELSET=BLOCK, MATERIAL=M\n" in body and not conv.reduced_physics
+    body, _, _ = convert_str(dense.replace("*Elastic\n100000., 0.3\n", "*Elastic\n100000., 0.3\n*Density\n7.\n")
+                             + "*Step\n*Frequency\n3\n*End Step\n")
+    assert "*MATERIAL, NAME=M_MEMBRANE_MASS\n*ELASTIC\n100000., 0.3\n*DENSITY\n207.\n" in body
+    # a varying thickness cannot go into one copy: dropped, warned, reduced physics
+    _, conv, rep = convert_str(dense.replace("density=2., poisson=0.3\n0.01", "density=2., nodal thickness\n")
+                               + "*Nodal Thickness\n1, 0.01\n2, 0.01\n3, 0.02\n4, 0.01\n5, 0.01\n6, 0.02\n"
+                               + "*Step\n*Frequency\n3\n*End Step\n")
+    assert "DENSITY= (mass per unit area added to the material's) dropped" in rep.text()
+    assert any("DENSITY" in r for r in conv.reduced_physics)
+    # under NLGEOM the thickness follows the material's own ratio in ccx: 0.3 against the default
+    # 0.5 -> warned (1 - 0.3 / 0.7 = 0.571); the same ratio -> a note
+    nl = LM4_STEP.replace("*Step\n", "*Step, nlgeom\n")
+    _, _, rep = convert_str(LM4_SKIN + nl)
+    assert "differs at finite strain by about 0.571 x (e11 + e22)" in rep.text()
+    _, _, rep = convert_str(LM4_SKIN.replace("material=M\n0.01", "material=M, poisson=0.3\n0.01") + nl)
+    assert "with their material (the same ratio)" in rep.text() and "differs at finite strain" not in rep.text()
+    # POISSON=MATERIAL, Abaqus/Explicit's default, thins with the material as ccx does
+    _, _, rep = convert_str(LM4_SKIN.replace("material=M\n0.01", "material=M, poisson=MATERIAL\n0.01") + nl)
+    assert "POISSON=MATERIAL" in rep.text() and "differs at finite strain" not in rep.text()
 
 
 def test_constraints_on_quadratic_membranes_take_their_own_nodes():

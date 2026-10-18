@@ -13,6 +13,16 @@ physics.
   Each such pressure is now split between the two faces (0.5 − o and 0.5 + o for `OFFSET`
   o): the force matches Abaqus to O((t/R)²) — 0.25 % at t/R 0.1 on a sphere, exact on a
   cylinder — also under NLGEOM.
+* **Membrane ties and couplings** — a `*TIE` or tied `*CONTACT PAIR` slave surface and a
+  kinematic coupling's surface on ccx's own membranes (`M3D3`, `M3D4`, `M3D4R`) now take the
+  membrane nodes, as Abaqus does: ccx tied an `SNEG` face not at all and an `SPOS` face
+  5.9 % too stiff (a skin on a block), and coupled such faces 1.2 % off or crashed, as it did
+  on shell faces, which couplings now also take by their nodes. Such a tie gets Abaqus'
+  position tolerance written out, ccx's own default being some 20 times smaller (quadratic
+  membranes' ties without a tolerance stayed open), and a `*TIE` with several lines becomes
+  one per line (ccx read only the first). `*MEMBRANE SECTION, DENSITY=`, a mass per area,
+  goes into a copy of the material (frequencies were 5.4 times too high in a test);
+  `POISSON`, which ccx ignores, is warned about where it changes the `NLGEOM` thickness.
 * **Quadratic membranes** — ccx 2.23 leaves the mid-thickness node of a quadratic membrane's
   corners free in each element it expands (`M3D8R` singular in any mesh of two or more
   elements, `M3D6` several times too soft, `M3D8` too soft in thick elements). `M3D6`,

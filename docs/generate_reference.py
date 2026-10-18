@@ -98,7 +98,12 @@ TRANSLATED = {
         "section per distinct direction. On quadratic membranes (`M3D6`, `M3D8`, `M3D8R`, `M3D9`, "
         "`M3D9R`), which become solids, → `*SOLID SECTION` (split off where linear membranes share "
         "it); the thickness (data line, `NODAL THICKNESS`, `MEMBRANE THICKNESS`) goes into their "
-        "geometry; `DENSITY` is dropped, warned.",
+        "geometry. ccx has no `DENSITY` (mass per area added to the material's) or `POISSON` "
+        "(Abaqus' thickness change under `NLGEOM`): where mass acts, `DENSITY` goes into a copy of "
+        "the material with `DENSITY` / thickness more (a varying thickness: warned, reduced "
+        "physics); `POISSON` (default 0.5; `MATERIAL`, Abaqus/Explicit's default, as ccx) is "
+        "warned under `NLGEOM` where it differs from the ratio ccx's membranes thin with, their "
+        "material's (elastic: its own; 0.5 with plasticity).",
     "*BEAM SECTION": "keeps the supported params; `SECTION=CIRC`: the Abaqus radius becomes ccx's "
         "two section diameters (`r` → `2r, 2r`), and 2-node beams under it become 3-node beams with "
         "an inserted midside node (ccx 2.23 rejects linear beams with a circular section). "
@@ -252,7 +257,14 @@ TRANSLATED = {
         "analytical master: the slave facets'), measured from a slave shell's side towards the "
         "master unless `NO THICKNESS` — join that rigid body (`NO ROTATION`: translations only), "
         "moved to touch the surface unless `ADJUST=NO` — exact, where ccx's tie follows an "
-        "`NLGEOM` rotation of the body only linearly and stops explicit dynamics.",
+        "`NLGEOM` rotation of the body only linearly and stops explicit dynamics. A slave surface "
+        "on membranes → a node surface of their nodes, which Abaqus ties (ccx would tie its "
+        "expanded membrane's face, whose bottom nodes its hinge eliminates: `SNEG` ties nothing, "
+        "`SPOS` a face that shears through the thickness), with Abaqus' position tolerance "
+        "written out (given, or its default; ccx's own is some 20 times smaller), which a `*TIE` "
+        "measures from the membrane nodes as ccx does (a tied pair adds the half thickness, also "
+        "onto a rigid surface); nodes of the master face stay out. One `*TIE` per data line: ccx "
+        "reads only a card's first.",
     "*MPC": "line by line: `PIN` → `*EQUATION` on DOFs 1-3; `TIE` → per-DOF `*EQUATION` "
             "(shell/beam rotations through knots, DOF 11 in thermal steps); `BEAM` → one "
             "`*RIGID BODY` per independent node (chained lines one body); `LINK` → linearised "
@@ -296,7 +308,11 @@ TRANSLATED = {
         "whose `ROT NODE` follows it. A coupling of all translations whose `REF NODE` has a "
         "`*TRANSFORM` and a rotation the deck uses (rotational BCs other than all three held at "
         "zero, moments, `*EQUATION` terms, connectors) becomes a `*RIGID BODY` whose `ROT NODE` "
-        "has the node's local axes (ccx's coupling would read them about the global ones).",
+        "has the node's local axes (ccx's coupling would read them about the global ones). An "
+        "element surface on membranes or shells → a node surface of their nodes, which Abaqus "
+        "couples (ccx would couple the expanded faces: 1.2 % off on `M3D4`, a crash on `M3D3` "
+        "and on knotted shells); a `*DISTRIBUTING` one on ccx's own membranes is warned (ccx "
+        "spreads it over faces their hinge holds: about 2 % off, nothing on `M3D3`).",
     "*RIGID BODY": "`PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node "
         "number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs "
         "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); a reference point with a "
@@ -341,7 +357,8 @@ TRANSLATED = {
         "`cflux.f` / `radiate.f` (kept, ccx would run its stock subroutine instead).",
     "*CONTACT PAIR": "missing `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; the note "
         "suggests `SURFACE TO SURFACE` if ccx struggles to converge); `TIED` → `*TIE` (on a rigid "
-        "master: its slave nodes join the rigid body, see `*TIE`); `SMALL SLIDING` dropped for "
+        "master: its slave nodes join the rigid body; on membranes their nodes, see `*TIE`); "
+        "`SMALL SLIDING` dropped for "
         "surface-to-surface; Abaqus-only params dropped. A line naming an analytical surface "
         "that is not meshed is commented out, the card's other lines kept.",
     "*SURFACE INTERACTION": "2D out-of-plane thickness line dropped; `*SURFACE BEHAVIOR, "

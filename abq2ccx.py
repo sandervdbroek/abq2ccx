@@ -367,6 +367,7 @@ def ccx_element_type(typ: str, report: "Report") -> str:
 SHELL_TYPES = {t for t in ELEMENT_NNODES if (t[0] == "S" and not t.startswith("SPRING")) or t.startswith("DS")}
 BEAM_TYPES = {t for t in ELEMENT_NNODES if t[0] == "B" or t.startswith(("T2D", "T3D", "PIPE"))}
 COMPOSITE_SHELL_OK = {"S6", "S8R"}  # CalculiX restricts composite shells to these
+SHEET_SHELLS = {"S3", "S4", "S4R", "S6", "S8", "S8R"}   # the shells ccx expands (not SC6R / SC8R)
 # ccx 2.23 stops on *SHELL SECTION, COMPOSITE on any other shell ('*ERROR reading *SHELL
 # SECTION', probed on S3, S4, S4R, S8): emitted linear shell -> the quadratic shell its
 # composite section runs on, with a node at the middle of every edge (_plan_quadratic_shells)
@@ -3451,11 +3452,16 @@ class Converter:
         self._qmem: Dict[int, Tuple[str, List[int]]] = {}
         self._qmem_sections: set = set()
         self._qmem_eq: List[str] = []
-        self._qmem_mass_acts = False               # mass acts in the deck (a DENSITY= lost)
+        self._mem_mass_acts = False                # mass acts in the deck (a DENSITY= lost)
         self._qmem_copies: Dict[int, int] = {}     # a solid's node -> its membrane node
         self._qmem_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}   # membrane node -> *TRANSFORM axes
-        self._qmem_surfaces: Dict[str, str] = {}   # element surface -> its node surface
-        self._qmem_kinematic: set = set()          # id(*COUPLING) followed by *KINEMATIC
+        self._mem_thick: Dict[int, float] = {}     # membrane element -> its largest thickness
+        self._mem_surfaces: Dict[tuple, str] = {}  # element surface on membranes -> node surface
+        self._kinematic_ids: set = set()           # id(*COUPLING) followed by *KINEMATIC
+        self._distributing_ids: set = set()        # ... by *DISTRIBUTING
+        self._mem_thinning: Dict[str, Optional[float]] = {}  # membrane material -> its thinning ratio
+        self._explicit_deck = False                # a *DYNAMIC, EXPLICIT step
+        self._tie_names: set = set()               # the deck's *TIE names (handle_tie adds cards)
         self._qmem_hidden: Optional[str] = None     # node set of their nodes, for output
         self._qmem_dists: set = set()              # thickness distributions taken into them
         self._qmem_dist_tables: set = set()        # ... and their tables
@@ -6885,6 +6891,7 @@ class Converter:
         return out + [emit_keyword("SOLID SECTION", params)]
 
     def handle_membrane_section(self, b: Block) -> List[str]:
+        self._membrane_section_extras(b)
         if id(b) in self._qmem_sections:
             return self._qmem_section_cards(self._membrane_section_cards(b))
         return self._membrane_section_cards(b)
@@ -11696,7 +11703,6 @@ class Converter:
             return ["** [abq2ccx] *TIE " + (b.param("NAME") or "") + ": its slave nodes are "
                     "members of the rigid body of its master surface"] + comments
         b = nb
-        pre = self._qmem_tie_slaves(b) if self._qmem else []
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("NAME", "POSITION TOLERANCE", "ADJUST", "CYCLIC SYMMETRY", "MULTISTAGE"):
@@ -11714,57 +11720,130 @@ class Converter:
                 self.report.note(f"*TIE parameter {k} dropped (unsupported by ccx).", once=True)
         self.report.note("*TIE: in ccx the MASTER (independent, 2nd) surface must be element-based; "
                          "a node-based master will be rejected — verify surface roles.", once=True)
-        return pre + [emit_keyword("TIE", keep)] + list(b.data) + comments
-
-    def _qmem_tie_slaves(self, b: Block) -> List[str]:
-        """The *TIE slave surfaces of ``b`` (data lines changed in place) on quadratic membranes
-        written as solids -> node surfaces of the membranes' own nodes (_qmem_node_surface);
-        returns the cards to write before the *TIE."""
+        lines = [ln for ln in b.data if ln.strip()]
+        if len(lines) > 1:
+            self.report.note("*TIE with several slave / master lines -> one *TIE per line: ccx reads "
+                             "only the first line of a card (probed on 2.23: it skips the next with "
+                             "'Card image cannot be interpreted').", once=True)
+            self._reserve_names()
+            self._used_names |= self._tie_names
         out: List[str] = []
-        data: List[str] = []
-        for line in b.data:
+        for i, line in enumerate(lines):
+            params = OrderedDict(keep)
+            if i:
+                params["NAME"] = self._fresh_name(f"{(keep.get('NAME') or 'TIE').strip()}_{i + 1}")
             f = [x.strip() for x in line.split(",")]
-            name, cards = self._qmem_node_surface(f[0], "*TIE slave") if f and f[0] else (None, [])
-            out += cards
-            data.append(", ".join([name] + f[1:]) if name else line)
-        b.data = data
-        return out
+            master = f[1] if len(f) > 1 else ""
+            name, cards = self._membrane_node_surface(
+                f[0], "*TIE slave", exclude=set(self._surface_member_nodes(master))) \
+                if f[0] and not (b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE")) else (None, [])
+            if name == "":
+                out.append(f"** [abq2ccx] *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
+                           f"node of {master}, which joins them already")
+                continue
+            if name:
+                params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
+                    b.param("POSITION TOLERANCE"), f[0], master, b, False), 6)
+                line = ", ".join([name] + f[1:])
+            out += cards + [emit_keyword("TIE", params), line]
+        return out + comments
 
-    def _qmem_node_surface(self, surf: str, what: str) -> Tuple[Optional[str], List[str]]:
-        """An element surface ``surf`` on quadratic membranes written as solids
-        (_plan_quadratic_membranes) -> (the name of a node surface of the membranes' own
-        nodes, its *SURFACE card the first time), else (None, []).  ccx would put a tie or a
-        coupling on the solids' face nodes, which the converter's *EQUATIONs already eliminate
-        — it skips them ('DOF ... is not active; no tied constraint is generated', probed: a
-        SNEG face ties nothing, a SPOS face only in part) — while Abaqus ties and couples a
-        membrane's reference surface, its nodes.  A surface on such membranes and other
-        elements stays as it is, warned."""
+    def _membrane_node_surface(self, surf: str, what: str, shells: bool = False,
+                               exclude: Optional[set] = None) -> Tuple[Optional[str], List[str]]:
+        """An element surface ``surf`` on membranes -> (the name of a node surface of the
+        membranes' own nodes, its *SURFACE card the first time), else (None, []).  ccx would
+        tie or couple the faces of its expanded membranes, or of the solids quadratic ones
+        become (_plan_quadratic_membranes), whose bottom nodes a hinge eliminates (bottom + top
+        = 2 x node: ccx's gen3dmembrane, the converter's *EQUATIONs) — it skips those ('DOF ...
+        is not active'), so an SNEG face ties nothing, and an SPOS face ties a face that shears
+        through the thickness — while Abaqus ties and couples a membrane's reference surface,
+        its nodes.  Probed on 2.23 (M3D3 / M3D4 / M3D4R skins tied to a block): the node surface
+        reproduces the skin sharing the block's nodes exactly; SPOS faces were 0.1-6 % off.
+        With ``shells`` (a kinematic coupling, which acts on the surface's nodes, also those of
+        other elements' faces) conventional shells count too: ccx 2.23 crashes (SIGBUS)
+        coupling the faces of shells the converter knotted for it (_plan_rigid_couplings).  A
+        tie's surface on membranes and other elements stays as it is, warned.  Nodes of
+        ``exclude`` stay out (a tie's master-face nodes, a coupling's reference node: ccx
+        would tie them to themselves and loop in its cascade, "zero coefficient on the
+        dependent side"); with none left the name is "" (nothing to tie)."""
         sd = self.surfaces.get(surf.upper())
         if sd is None or sd[0].startswith("NODE"):
             return None, []
-        eids = [e for token, _face in sd[1] for e in
-                ([int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token))]
-        mine = [e for e in eids if e in self._qmem]
+        eids = self._surface_elements(surf)
+        quiet = Report()
+        mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
+                or (shells and ccx_element_type(self.geom.elements[e][0], quiet) in SHEET_SHELLS)]
         if not mine:
             return None, []
-        if len(mine) < len(eids):
-            self.report.warn(f"{what} surface {surf} lies on quadratic membranes written as solids "
-                             f"and on other elements: ccx skips the solids' face nodes the "
-                             f"converter's *EQUATIONs eliminate, so the membranes take part only in "
-                             f"part.", once=True)
-            self._reduces(f"{what} surface {surf} partly on quadratic membranes")
+        if len(mine) < len(eids) and not shells:
+            self.report.warn(f"{what} surface {surf} lies on membranes and on other elements: ccx "
+                             f"skips the membranes' face nodes their hinge to the membrane node "
+                             f"eliminates, so the membranes take part only in part.", once=True)
+            self._reduces(f"{what} surface {surf} partly on membranes")
             return None, []
-        if surf.upper() in self._qmem_surfaces:
-            return self._qmem_surfaces[surf.upper()], []
+        nodes = self._surface_member_nodes(surf)
+        keep = [n for n in nodes if n not in (exclude or ())]
+        if not keep:
+            return "", []
+        key = (surf.upper(), len(keep) < len(nodes) and tuple(keep))
+        if key in self._mem_surfaces:
+            return self._mem_surfaces[key], []
         self._reserve_names()
         name = self._fresh_name(f"{surf}_NODES")
-        self._qmem_surfaces[surf.upper()] = name
-        self.report.note(f"{what} surface {surf} on quadratic membranes written as solids -> node "
-                         f"surface {name} of the membranes' nodes, which Abaqus ties and couples "
-                         f"(ccx would take the solids' face nodes, which the converter's *EQUATIONs "
-                         f"hold).", once=True)
-        return name, ([f"*SURFACE, NAME={name}, TYPE=NODE"] +
-                      [str(n) for n in self._surface_member_nodes(surf)])      # ccx: one entry per line
+        self._mem_surfaces[key] = name
+        if any(not self.geom.elements[e][0].upper().startswith("M3D") and e not in self._qmem for e in mine):
+            self.report.note(f"{what} surface {surf} on shells -> node surface {name} of their "
+                             f"nodes, which Abaqus couples (ccx 2.23 crashes coupling the faces of "
+                             f"the shells it knots; probed).", once=True)
+        else:
+            self.report.note(f"{what} surface {surf} on membranes -> node surface {name} of the "
+                             f"membranes' nodes, which Abaqus ties and couples (ccx would take its "
+                             f"expanded faces, whose bottom nodes its membrane hinge eliminates: an "
+                             f"SNEG face ties nothing, an SPOS face shears through the thickness; "
+                             f"probed).", once=True)
+        return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]  # ccx: one per line
+
+    def _surface_elements(self, surf: str) -> List[int]:
+        """The elements of the faces of element surface ``surf`` (in the mesh)."""
+        sd = self.surfaces.get(surf.upper())
+        if sd is None or sd[0].startswith("NODE"):
+            return []
+        return dedup([e for token, _face in sd[1] for e in
+                      ([int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token))
+                      if e in self.geom.elements])
+
+    def _membrane_tie_tolerance(self, given: Optional[str], slave: str, master: str, b: Block,
+                                pair: bool) -> float:
+        """The POSITION TOLERANCE of a tie whose slave surface ``slave`` on membranes became
+        their node surface, written out because ccx's default (2.5 % of a master triangle's
+        centroid-to-edge distance) is some 20 times smaller than Abaqus': the ``given`` one,
+        else Abaqus' default — a *TIE's 10 % (surface-to-surface) or 5 % (node-to-surface) of
+        the typical master facet diagonal ("Mesh tie constraints"); a tied pair's 2.5 % of the
+        master faces' edges, as _plan_rigid_ties takes it.  A *TIE measures it from the
+        membrane nodes, as ccx does (Abaqus accounts for shell thickness, "not ... beam or
+        membrane thickness"); a tied contact pair's adjustment zone counts the membrane's half
+        thickness ("accounting for any shell or membrane thickness"), unless NO THICKNESS."""
+        try:
+            tol = pf(given or "0")
+        except ValueError:
+            tol = 0.0
+        if tol <= 0.0:
+            def faces(surf: str) -> List[List[Vec]]:
+                return [self._face_points(e, f) for token, f in self.surfaces.get(surf.upper(), ("", []))[1]
+                        for e in ([int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token))
+                        if e in self.geom.elements]
+            pts = faces(master) or faces(slave)        # (as for an analytical master)
+            if pair:
+                edges = [vnorm(vsub(q[(i + 1) % len(q)], q[i])) for q in pts if len(q) > 1
+                         for i in range(len(q))]
+                tol = 0.025 * sum(edges) / len(edges) if edges else 0.0
+            else:
+                form = (b.param("TYPE") or "").replace(" ", "").upper()
+                n2s = form == "NODETOSURFACE" or (self._explicit_deck and form != "SURFACETOSURFACE")
+                tol = (0.05 if n2s else 0.10) * self._mean_diagonal(pts)
+        half = 0.0 if not pair or b.has("NO THICKNESS") else \
+            0.5 * max([self._mem_thick.get(e, 0.0) for e in self._surface_elements(slave)] or [0.0])
+        return tol + half
 
     def handle_restart(self, b: Block) -> List[str]:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -12274,11 +12353,20 @@ class Converter:
         if (self._last_coupling or {}).get("kind") == "unsupported":
             self._warn_rigid_unsupported()
         pre: List[str] = []
-        if id(b) in self._qmem_kinematic and params.get("SURFACE"):
-            # (a distributing coupling leaves its surface nodes independent: it stays on the
-            # solids' faces, weighted by their areas)
-            name, pre = self._qmem_node_surface(params["SURFACE"].strip(), "*COUPLING, *KINEMATIC")
+        if id(b) in self._kinematic_ids and params.get("SURFACE"):
+            name, pre = self._membrane_node_surface(params["SURFACE"].strip(), "*COUPLING, *KINEMATIC", True,
+                                                    set(self._resolve_nodes((params.get("REF NODE") or "").strip())))
             params["SURFACE"] = name or params["SURFACE"]
+        elif id(b) in self._distributing_ids and any(
+                e not in self._qmem and self.geom.elements[e][0].upper().startswith("M3D")
+                for e in self._surface_elements((params.get("SURFACE") or "").strip())):
+            # ccx takes a distributing coupling only on an element surface (the converter's
+            # solids of quadratic membranes carry it exactly; probed)
+            self.report.warn("*COUPLING, *DISTRIBUTING on membrane faces: ccx spreads the load over "
+                             "its expanded membranes' faces, whose bottom nodes its hinge eliminates "
+                             "(probed: M3D4 about 2 % off, M3D3 transmits nothing), and takes no node "
+                             "surface here.", once=True)
+            self._reduces("*COUPLING, *DISTRIBUTING on membrane faces")
         return pre + [emit_keyword("COUPLING", params)] + list(b.data)
 
     def _coupling_as_rigid_body(self, plan: dict) -> List[str]:
@@ -12713,8 +12801,15 @@ class Converter:
                     params["POSITION TOLERANCE"] = adj
                 except ValueError:
                     pass
-                slave, cards = self._qmem_node_surface(f[0], "*CONTACT PAIR, TIED slave") \
-                    if self._qmem else (None, [])
+                slave, cards = self._membrane_node_surface(f[0].strip(), "*CONTACT PAIR, TIED slave",
+                                                           exclude=set(self._surface_member_nodes(f[1].strip())))
+                if slave == "":
+                    out.append(f"** [abq2ccx] *CONTACT PAIR, TIED: every slave node of {f[0].strip()} is a "
+                               f"node of {f[1].strip()}, which joins them already")
+                    continue
+                if slave:
+                    params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
+                        adj, f[0].strip(), f[1].strip(), b, True), 6)
                 out += cards + [emit_keyword("TIE", params), f"{slave or f[0]}, {f[1]}"]
             if out:
                 self.report.note("*CONTACT PAIR, TIED -> *TIE (same slave/master surfaces; ccx "
@@ -13722,6 +13817,11 @@ class Converter:
         onto the master."""
         explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         shells = self._shell_thicknesses(blocks)
+        # a tied contact pair counts membrane thickness too, a *TIE only shells' (Abaqus 2017
+        # "Defining tied contact", "Mesh tie constraints")
+        mem = {e for e, (typ, _c) in self.geom.elements.items() if typ.upper().startswith("M3D")}
+        mem_t = {e: max(ts) for e, ts in self._membrane_thicknesses(blocks, mem)[0].items()
+                 if ts and all(t is not None and t > 0.0 for t in ts)} if mem else {}
         taken = {n for r in blocks if r.keyword == "RIGID BODY"
                  for part in self._rigid_body_members(r) for n in part}
         for b in blocks:
@@ -13800,10 +13900,10 @@ class Converter:
                     tol_k = tol
                 # half thickness of a slave shell node on its side towards the master
                 half: Dict[int, Tuple[float, float, Vec]] = {}
-                if not no_thick:
+                if not no_thick or pair:
                     for e, f in slave_faces:
-                        if e in shells:
-                            t_e, off = shells[e]
+                        if (e in shells and not no_thick) or (e in mem_t and pair):
+                            t_e, off = shells[e] if e in shells else (mem_t[e], 0.0)
                             nrm = self._shell_normal(e)
                             for n in self.geom.elements[e][1]:
                                 if n not in half or t_e > half[n][0]:
@@ -15271,6 +15371,121 @@ class Converter:
     _HG_W8 = (-1.0, 1.0, 1.0, -1.0, 0.0, -2.0, 0.0, 2.0)
     _HG_W7 = (-1.0, -1.0, 1.0, 1.0, 2.0, 0.0, -2.0, 0.0)
 
+    def _membrane_thicknesses(self, blocks: List[Block], elements: set
+                              ) -> Tuple["OrderedDict[int, List[Optional[float]]]", Dict[int, Block]]:
+        """The thickness at each node of the membrane ``elements`` a *MEMBRANE SECTION names
+        (the first that does) — from *NODAL THICKNESS, its MEMBRANE THICKNESS distribution or
+        its data line; None where none is given — and that section."""
+        els = self.geom.elements
+        nodal: Dict[int, float] = {}
+        for b in blocks:
+            if b.keyword == "NODAL THICKNESS":
+                for r in merged_data_records(b):
+                    if len(r) >= 2 and r[0].strip():
+                        try:
+                            t = pf(r[1])
+                        except ValueError:
+                            continue
+                        for n in self._resolve_nodes(r[0].strip()):
+                            nodal[n] = t
+        dists = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        thick: "OrderedDict[int, List[Optional[float]]]" = OrderedDict()
+        section: Dict[int, Block] = {}
+        for b in blocks:
+            if b.keyword != "MEMBRANE SECTION":
+                continue
+            members = [e for e in dedup(self.geom.elset((b.param("ELSET") or "").strip()))
+                       if e in elements and e not in section]
+            if not members:
+                continue
+            per: Dict[int, Optional[float]] = {}
+            default: Optional[float] = None
+            field = (b.param("MEMBRANE THICKNESS") or "").strip().upper()
+            if b.has("NODAL THICKNESS"):
+                pass
+            elif field:
+                for r in merged_data_records(dists[field]) if field in dists else []:
+                    try:
+                        t = pf(r[1]) if len(r) > 1 else None
+                    except ValueError:
+                        continue
+                    if not r[0].strip():
+                        default = t
+                    else:
+                        for e in ([int(r[0])] if re.fullmatch(r"[-+]?\d+", r[0].strip())
+                                  else self.geom.elset(r[0].strip())):
+                            per[e] = t
+            else:
+                recs = merged_data_records(b)
+                try:
+                    default = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else None
+                except ValueError:
+                    default = None
+            for e in members:
+                section[e] = b
+                conn = els[e][1]
+                thick[e] = [nodal.get(n) for n in conn] if b.has("NODAL THICKNESS") else \
+                    [per.get(e, default)] * len(conn)
+        return thick, section
+
+    _THERMAL_PROCEDURES = {"HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                           "COUPLED THERMAL-ELECTRICAL", "COUPLED THERMAL-ELECTRICAL-STRUCTURAL"}
+
+    def _plan_membrane_density(self, blocks: List[Block], thick: "OrderedDict[int, List[Optional[float]]]",
+                               section: Dict[int, Block], opts: Dict[str, List[Block]]) -> None:
+        """*MEMBRANE SECTION, DENSITY= is a mass per unit area the membrane carries besides its
+        material's (Abaqus 2017 Keywords); ccx has no section mass.  In a deck where mass acts,
+        a section of one thickness t gets a copy of its material, inserted after it, whose
+        *DENSITY rows hold DENSITY / t more: the same mass per area, inertia and gravity load,
+        also on the converter's solids of quadratic membranes.  Not where the thickness varies
+        or the copy would change a heat capacity (a specific heat in a deck with temperature
+        steps) or a user material's name: DENSITY= then stays for _membrane_section_extras,
+        which warns."""
+        if not self._mem_mass_acts:
+            return
+        thermal = any(b.keyword in self._THERMAL_PROCEDURES for b in blocks)
+        taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+        copies: Dict[Tuple[str, float], str] = {}
+        for b in list(blocks):
+            if b.keyword != "MEMBRANE SECTION" or not b.param("DENSITY"):
+                continue
+            mat = (b.param("MATERIAL") or "").strip().upper()
+            group = opts.get(mat)
+            ts = {t for e, sec in section.items() if sec is b for t in thick[e]}
+            try:
+                rho_a = pf(b.param("DENSITY") or "")
+                dens = [[pf(r[0])] + [x.strip() for x in r[1:]] for c in group or [] if c.keyword == "DENSITY"
+                        for r in merged_data_records(c) if r and r[0].strip()]
+            except ValueError:
+                continue
+            if not group or len(ts) != 1 or None in ts or min(t or 0.0 for t in ts) <= 0.0 or any(
+                    c.keyword == "USER MATERIAL" or (thermal and c.keyword == "SPECIFIC HEAT") for c in group):
+                continue
+            add = rho_a / float(ts.pop() or 1.0)
+            if (mat, add) not in copies:
+                name, k = f"{mat}_MEMBRANE_MASS", 1
+                while name in taken:
+                    k += 1
+                    name = f"{mat}_MEMBRANE_MASS_{k}"
+                taken.add(name)
+                clone = [Block(c.keyword, OrderedDict(c.params), list(c.data), c.part, c.instance)
+                         for c in group if c is group[0] or (c.keyword in MATERIAL_OPTION_CARDS and
+                                                             c.keyword != "DENSITY")]
+                clone[0].params["NAME"] = name
+                d = next((c for c in group if c.keyword == "DENSITY"), None)
+                clone.append(Block("DENSITY", OrderedDict(d.params) if d else OrderedDict(),
+                                   [", ".join([short_real(r[0] + add, 12)] + r[1:]) for r in dens] or
+                                   [short_real(add, 12)], group[0].part, group[0].instance))
+                at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
+                blocks[at:at] = clone
+                copies[(mat, add)] = name
+                self._mem_thinning[name] = self._mem_thinning.get(mat)
+                self.report.note(f"*MEMBRANE SECTION, DENSITY= (a mass per unit area added to the "
+                                 f"material's) -> material {name}, a copy of {mat} whose *DENSITY "
+                                 f"holds DENSITY / thickness more (ccx has no section mass).", once=True)
+            b.params["MATERIAL"] = copies[(mat, add)]
+            del b.params["DENSITY"]
+
     def _plan_quadratic_membranes(self, blocks: List[Block]) -> None:
         """Quadratic membranes -> one-element-thick solids the converter expands itself.
 
@@ -15304,66 +15519,53 @@ class Converter:
         physics).  An element without a membrane section, a thickness or a normal stays as
         it is, warned."""
         els = self.geom.elements
-        cands = {e for e, (typ, conn) in els.items() if typ.upper() in QUAD_MEMBRANE_SOLID and
-                 len(conn) == ELEMENT_NNODES[typ.upper()] and all(n in self.geom.nodes for n in conn)}
+        self._kinematic_ids = {id(b) for b, c in zip(blocks, blocks[1:])
+                               if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
+        self._distributing_ids = {id(b) for b, c in zip(blocks, blocks[1:])
+                                  if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
+        self._explicit_deck = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        self._tie_names = {(b.param("NAME") or "").strip().upper() for b in blocks if b.keyword == "TIE"}
+        mem = {e for e, (typ, _c) in els.items() if typ.upper().startswith("M3D")}
+        if not mem:
+            return
+        self._mem_mass_acts = any(b.keyword in self._INERTIA_PROCEDURES for b in blocks) or any(
+            len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS
+            for b in blocks if b.keyword == "DLOAD" for r in merged_data_records(b))
+        opts = self._material_options(blocks)
+        for b in blocks:
+            if b.keyword == "MEMBRANE SECTION":
+                mat = (b.param("MATERIAL") or "").strip().upper()
+                cards = opts.get(mat, [])[1:]
+                el = [c for c in cards if c.keyword == "ELASTIC"]
+                nu: Optional[float] = None
+                if any(c.keyword == "PLASTIC" for c in cards):
+                    nu = 0.5                        # plastic flow keeps the volume
+                elif el and not any(c.keyword.startswith("HYPER") for c in cards) and \
+                        (el[0].param("TYPE") or "ISOTROPIC").strip().upper() in ("ISOTROPIC", "ISO"):
+                    try:
+                        nu = self._card_values(el[0], 2)[1]
+                    except ValueError:
+                        nu = None
+                self._mem_thinning[mat] = nu
+        ts_all, section = self._membrane_thicknesses(blocks, mem)
+        self._mem_thick = {e: max(ts) for e, ts in ts_all.items()
+                           if ts and all(t is not None and t > 0.0 for t in ts)}
+        self._plan_membrane_density(blocks, ts_all, section, opts)
+        cands = {e for e in mem if els[e][0].upper() in QUAD_MEMBRANE_SOLID and
+                 len(els[e][1]) == ELEMENT_NNODES[els[e][0].upper()] and
+                 all(n in self.geom.nodes for n in els[e][1])}
         if not cands:
             return
-        nodal: Dict[int, float] = {}
-        for b in blocks:
-            if b.keyword == "NODAL THICKNESS":
-                for r in merged_data_records(b):
-                    if len(r) >= 2 and r[0].strip():
-                        try:
-                            t = pf(r[1])
-                        except ValueError:
-                            continue
-                        for n in self._resolve_nodes(r[0].strip()):
-                            nodal[n] = t
         dists = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "DISTRIBUTION"}
         thick: Dict[int, List[float]] = {}
-        section: Dict[int, Block] = {}
         left: Dict[str, List[int]] = {}               # why an element stays as it is -> elements
-        for b in blocks:
-            if b.keyword != "MEMBRANE SECTION":
+        for e, ts in ts_all.items():
+            if e not in cands:
                 continue
-            members = [e for e in dedup(self.geom.elset((b.param("ELSET") or "").strip()))
-                       if e in cands and e not in section]
-            if not members:
-                continue
-            per: Dict[int, float] = {}
-            default: Optional[float] = None
-            field = (b.param("MEMBRANE THICKNESS") or "").strip().upper()
-            if b.has("NODAL THICKNESS"):
-                pass
-            elif field:
-                for r in merged_data_records(dists[field]) if field in dists else []:
-                    try:
-                        t = pf(r[1]) if len(r) > 1 else None
-                    except ValueError:
-                        continue
-                    if not r[0].strip():
-                        default = t
-                    else:
-                        for e in ([int(r[0])] if re.fullmatch(r"[-+]?\d+", r[0].strip())
-                                  else self.geom.elset(r[0].strip())):
-                            per[e] = t
+            if any(t is None or t <= 0.0 for t in ts):
+                left.setdefault("no positive thickness", []).append(e)
             else:
-                recs = merged_data_records(b)
-                try:
-                    default = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else None
-                except ValueError:
-                    default = None
-            for e in members:
-                section[e] = b
-                conn = els[e][1]
-                if b.has("NODAL THICKNESS"):
-                    ts = [nodal.get(n) for n in conn]
-                else:
-                    ts = [per.get(e, default)] * len(conn)
-                if any(t is None or t <= 0.0 for t in ts):
-                    left.setdefault("no positive thickness", []).append(e)
-                else:
-                    thick[e] = ts
+                thick[e] = [float(t) for t in ts if t is not None]
         for e in sorted(cands - set(section)):
             left.setdefault("no *MEMBRANE SECTION", []).append(e)
         nodes = self.geom.nodes
@@ -15471,11 +15673,6 @@ class Converter:
             self._reduces(f"{kinds} membranes run by ccx's own expansion ({why})")
         if not self._qmem:
             return
-        self._qmem_kinematic = {id(b) for b, c in zip(blocks, blocks[1:])
-                                if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
-        self._qmem_mass_acts = any(b.keyword in self._INERTIA_PROCEDURES for b in blocks) or any(
-            len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS
-            for b in blocks if b.keyword == "DLOAD" for r in merged_data_records(b))
         # each section on them becomes a *SOLID SECTION (handle_membrane_section); a section
         # that also has elements staying membranes is split into two cards
         inserts: List[Tuple[int, Block]] = []
@@ -15564,7 +15761,6 @@ class Converter:
         ccx 2.23: the turned axes unprojected), without the thickness line."""
         out: List[str] = []
         skip = False
-        dropped: set = set()
         for ln in cards:
             if ln.startswith("*") and not ln.startswith("**"):
                 skip = False
@@ -15572,24 +15768,65 @@ class Converter:
                 if kw == "MEMBRANE SECTION":
                     out.append(emit_keyword("SOLID SECTION", OrderedDict(
                         (k, v) for k, v in params.items() if k in ("ELSET", "MATERIAL", "ORIENTATION"))))
-                    dropped |= {k for k in params if k not in ("ELSET", "MATERIAL", "ORIENTATION")}
                     skip = True
                     continue
             elif skip:
                 continue
             out.append(ln)
-        if "DENSITY" in dropped:
-            self.report.warn("*MEMBRANE SECTION, DENSITY= (mass per unit area added to the "
-                             "material's) dropped with the solid form of quadratic membranes: ccx "
-                             "has no such section mass, so that mass is missing.", once=True)
-            if self._qmem_mass_acts:
-                self._reduces("*MEMBRANE SECTION, DENSITY= (added mass per area)")
-        if "POISSON" in dropped or self._nl_any:
-            self.report.note("Quadratic membranes as solids: their thickness changes with their "
-                             "material's own Poisson's ratio, as ccx's membranes do; Abaqus changes a "
-                             "membrane's thickness under NLGEOM with the section's POISSON (default "
-                             "0.5), which differs at finite strain.", once=True)
         return out
+
+    def _membrane_section_extras(self, b: Block) -> None:
+        """Take DENSITY= and POISSON= off *MEMBRANE SECTION ``b``: ccx has neither (it says so
+        only in its log).  DENSITY, a mass per unit area added to the material's, is missing
+        wherever mass acts, unless _plan_membrane_density moved it into a copy of the material.
+        POISSON is the effective Poisson's ratio with which Abaqus changes a membrane's
+        thickness under NLGEOM (default 0.5 in Abaqus/Standard; MATERIAL, Abaqus/Explicit's
+        default, thins with the material); ccx's membranes, its own and the converter's solids,
+        thin with their material (_mem_thinning: an elastic one's ratio, 0.5 with plastic flow),
+        the same where the two agree (Abaqus 2017 Keywords *MEMBRANE SECTION)."""
+        dens = b.params.pop("DENSITY", None)
+        pois = b.params.pop("POISSON", None)
+        if dens is not None and self._mem_mass_acts:
+            self.report.warn("*MEMBRANE SECTION, DENSITY= (mass per unit area added to the "
+                             "material's) dropped where a copy of the material cannot carry it (the "
+                             "section's thickness varies, or the copy would change a heat capacity or "
+                             "a user material's name): "
+                             "ccx has no section mass, so the membranes lack it in this deck's "
+                             "dynamic or frequency steps or mass loads.", once=True)
+            self._reduces("*MEMBRANE SECTION, DENSITY= (added mass per area)")
+        elif dens is not None:
+            self.report.note("*MEMBRANE SECTION, DENSITY= dropped: ccx has no section mass, and no "
+                             "step or load of this deck uses mass.", once=True)
+        if not self._nl_any:
+            if pois is not None:
+                self.report.note("*MEMBRANE SECTION, POISSON= dropped: Abaqus changes a membrane's "
+                                 "thickness with it only under NLGEOM, which no step of this deck "
+                                 "uses.", once=True)
+            return
+        if (pois or "").strip().upper() == "MATERIAL" or (not pois and self._explicit_deck):
+            self.report.note("*MEMBRANE SECTION: POISSON=MATERIAL (Abaqus/Explicit's default) "
+                             "changes a membrane's thickness with its material, as ccx's membranes "
+                             "do.", once=True)
+            return
+        try:
+            nu_s = pf(pois) if pois else 0.5
+        except ValueError:
+            self.report.note(f"*MEMBRANE SECTION, POISSON={pois}: not a number; taken as 0.5, "
+                             f"Abaqus/Standard's default.", once=True)
+            nu_s = 0.5
+        nu_m = self._mem_thinning.get((b.param("MATERIAL") or "").strip().upper())
+        if nu_m is None or abs(nu_m - nu_s) < 1e-6 or nu_s >= 1.0 or nu_m >= 1.0:
+            same = "the same ratio" if nu_m is not None else "not a plain elastic or plastic one: verify"
+            self.report.note(f"*MEMBRANE SECTION under NLGEOM: Abaqus changes a membrane's "
+                             f"thickness with the section's POISSON ({nu_s:g}), ccx's membranes "
+                             f"with their material ({same}).", once=True)
+            return
+        k = abs(nu_s / (1.0 - nu_s) - nu_m / (1.0 - nu_m))
+        self.report.warn(f"*MEMBRANE SECTION under NLGEOM: Abaqus changes a membrane's thickness "
+                         f"with the section's POISSON ({nu_s:g}{'' if pois else ', the default'}), "
+                         f"ccx's membranes with their material (Poisson's ratio {nu_m:g}): the "
+                         f"thickness, and with it the membrane force, differs at finite strain by "
+                         f"about {k:.3g} x (e11 + e22).", once=True)
 
     def _qmem_records(self, b: Block, layout: str) -> List[str]:
         """Extra data lines that carry a per-node *TEMPERATURE / *INITIAL CONDITIONS value
