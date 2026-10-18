@@ -8295,18 +8295,21 @@ def test_isotropic_composite_keeps_its_exact_plies():
 
 
 def test_cylindrical_orientation_turning_across_an_element_is_warned():
-    # ccx takes a shell orientation once per element: on an annulus of 8 elements a cylindrical
-    # system turns by 45 degrees across one, which Abaqus follows point by point
+    # ccx takes a shell orientation once per element: on an annulus of 8 S4 elements a
+    # cylindrical system turns by 45 degrees across one, which Abaqus follows to its four
+    # integration points; an S4R has one, at the centre, where ccx takes it too
     pts = [(r * math.cos(math.radians(45.0 * i)), r * math.sin(math.radians(45.0 * i)))
            for r in (1.0, 2.0) for i in range(8)]
     nodes = "".join(f"{k + 1}, {x:.9f}, {y:.9f}, 0.\n" for k, (x, y) in enumerate(pts))
     elems = "".join(f"{i + 1}, {i + 1}, {(i + 1) % 8 + 1}, {(i + 1) % 8 + 9}, {i + 9}\n" for i in range(8))
-    deck = (f"*Node\n{nodes}*Element, type=S4R, elset=DISK\n{elems}" + COMPOSITE_MAT
+    deck = (f"*Node\n{nodes}*Element, type=S4, elset=DISK\n{elems}" + COMPOSITE_MAT
             + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n3, 0.\n"
             "*Shell Section, elset=DISK, material=CFRP, orientation=C\n0.1\n")
     body, conv, rep = convert_str(deck)
     assert re.search(r"turns the material directions by up to 2[23] degrees across an element", rep.text())
     assert conv.reduced_physics and "ABQ2CCX_AXES" not in body    # ccx's own radial agrees at the centre
+    _, conv, rep = convert_str(deck.replace("type=S4,", "type=S4R,"))
+    assert "across an element" not in rep.text() and not conv.reduced_physics
     # without the rotation line Abaqus turns about axis 1, radial in the disk, and projects
     # axis 2: the hoop direction (normal -z here), element group by element group
     body, _, rep = convert_str(deck.replace("3, 0.\n", ""))
@@ -8586,6 +8589,164 @@ def test_node_orientation_of_a_solid_section_turns_with_each_instance():
     body, _, _ = convert_str(deck.replace("name=O, definition=NODES\n2, 4, 1",
                                           "name=O, system=CYLINDRICAL, definition=NODES\n1, 5"))
     assert _card_at(body, "*ORIENTATION, NAME=I2_O") == ["5, 0, 0, 5, 0, 1"]
+
+
+def _sph(r, th, ph):
+    """The point at radius ``r``, colatitude ``th`` and longitude ``ph`` (degrees) about the origin."""
+    th, ph = math.radians(th), math.radians(ph)
+    return (r * math.sin(th) * math.cos(ph), r * math.sin(th) * math.sin(ph), r * math.cos(th))
+
+
+# a patch of a sphere of radius 10 about the origin at colatitudes 40-50 degrees and longitudes 0-20:
+# nodes 1-3 and 4-6 on its two parallels (11-16 on the outer face of a continuum shell)
+SPHERE_PATCH_NODES = "".join(f"{10 * k + 3 * i + j + 1}, " + ", ".join(f"{x:.12f}" for x in _sph(r, 40 + 10 * i, 10 * j)) + "\n"
+                             for k, r in ((0, 10.0), (1, 10.02)) for i in range(2) for j in range(3))
+SPH_ORIENTATION = "*Orientation, name=SPH, system=SPHERICAL\n0., 0., 0., 0., 0., 1.\n"
+
+
+def test_spherical_orientation_on_a_plain_shell_sphere():
+    # Abaqus' spherical system: 1 radial from the centre a, 2 along the parallels, 3 along the
+    # meridians towards b (2017 "Orientations"); turned about axis 1, the normal, Abaqus projects
+    # axis 2.  ccx has none and reads the rectangular card the converter writes as zero axes
+    deck = ("*Node\n" + "".join(ln + "\n" for ln in SPHERE_PATCH_NODES.splitlines()[:6])
+            + "*Element, type=S4R, elset=CAP\n1, 1, 4, 5, 2\n2, 2, 5, 6, 3\n" + COMPOSITE_MAT + SPH_ORIENTATION
+            + "*Shell Section, elset=CAP, material=CFRP, orientation=SPH\n0.02\n")
+    body, conv, rep = convert_str(deck)
+    s, c = math.sin(math.radians(5.0)), math.cos(math.radians(5.0))
+    assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_AXES1")[:3], (-s, c, 0.0))) < 1e-9
+    assert _orientation_values(body, "ABQ2CCX_AXES1")[5] > 0.7            # direction 2 up the meridian
+    assert "*ELSET, ELSET=CAP_AX1" in body and "*ORIENTATION, NAME=SPH, SYSTEM=RECTANGULAR" in body
+    assert "no element reads it" in rep.text() and not conv.reduced_physics
+    # membranes alike (ccx takes their axes unprojected: a = direction 1, b = normal x it)
+    body, conv, _ = convert_str(deck.replace("type=S4R", "type=M3D4").replace("*Shell Section", "*Membrane Section"))
+    assert _orientation_values(body, "ABQ2CCX_AXES1")[:3] == _orientation_values(convert_str(deck)[0], "ABQ2CCX_AXES1")[:3]
+    assert "*MEMBRANE SECTION, ELSET=CAP_AX1, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body and not conv.reduced_physics
+    # turned 90 degrees about axis 1, Abaqus projects axis 3: the meridian towards the pole
+    body, _, _ = convert_str(deck.replace("0., 0., 1.\n*Shell", "0., 0., 1.\n1, 90.\n*Shell"))
+    want = (-math.cos(math.radians(45.0)) * c, -math.cos(math.radians(45.0)) * s, math.sin(math.radians(45.0)))
+    assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_AXES1")[:3], want)) < 2e-3
+    # a solid that reads the card too takes it rectangular: reduced physics, as before
+    block = "*Node\n" + "".join(f"{101 + k}, {k % 2}., {k // 2 % 2}., {k // 4}.\n" for k in range(8)) + \
+        "*Element, type=C3D8, elset=BLOCK\n9, 101, 102, 104, 103, 105, 106, 108, 107\n"
+    _, conv, rep = convert_str(deck + block + "*Solid Section, elset=BLOCK, material=CFRP, orientation=SPH\n")
+    assert "SYSTEM=SPHERICAL is unsupported by ccx" in rep.text()
+    assert "*ORIENTATION, SYSTEM=SPHERICAL written rectangular" in conv.reduced_physics
+
+
+def test_spherical_orientation_on_continuum_shells():
+    # a plain section gets Abaqus' axes per element (the stack direction radial), composite
+    # plies their own: no element reads the rectangular card, so it loses nothing
+    deck = ("*Node\n" + SPHERE_PATCH_NODES + "*Element, type=SC8R, elset=CAP\n1, 1, 4, 5, 2, 11, 14, 15, 12\n"
+            "2, 2, 5, 6, 3, 12, 15, 16, 13\n" + COMPOSITE_MAT + SPH_ORIENTATION)
+    s, c = math.sin(math.radians(5.0)), math.cos(math.radians(5.0))
+    body, conv, rep = convert_str(deck + "*Shell Section, elset=CAP, material=CFRP, orientation=SPH\n0.02\n")
+    vals = [float(x) for x in _card_at(body, "*DISTRIBUTION, NAME=CAP_AXES")[0].split(",")]
+    assert vals[0] == 1 and max(abs(x - y) for x, y in zip(vals[1:4], (-s, c, 0.0))) < 1e-9
+    assert "no element reads it" in rep.text() and conv.reduced_physics == ["element SC8R -> C3D8I"]
+    body, conv, rep = convert_str(deck + "*Shell Section, elset=CAP, composite, orientation=SPH\n"
+                                  "1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n")
+    vals = [float(x) for x in _card_at(body, "*DISTRIBUTION, NAME=CAP_PLY1_AXES")[0].split(",")]
+    assert max(abs(x - y) for x, y in zip(vals[1:4], (-s, c, 0.0))) < 1e-9
+    assert "no element reads it" in rep.text()
+    assert conv.reduced_physics == ["element SC8R / SC6R composite continuum shells -> one C3D8I / C3D6 solid per ply"]
+
+
+def test_composite_continuum_shells_keep_a_cylindrical_rotation_line():
+    # the plies take their axes, rotation applied, from the orientation themselves, so the
+    # rotation line ccx refuses on a cylindrical system loses nothing
+    pts = [(r, math.radians(a), z) for r in (1.0, 1.1) for z in (0.0, 1.0) for a in (0.0, 30.0, 60.0)]
+    nodes = "".join(f"{k + 1}, {r * math.cos(t):.9f}, {r * math.sin(t):.9f}, {z}\n" for k, (r, t, z) in enumerate(pts))
+    deck = (f"*Node\n{nodes}*Element, type=SC8R, elset=CYL\n1, 1, 2, 5, 4, 7, 8, 11, 10\n"
+            "2, 2, 3, 6, 5, 8, 9, 12, 11\n" + COMPOSITE_MAT
+            + "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n1, 25.\n"
+            "*Shell Section, elset=CYL, composite, orientation=C\n1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n")
+    body, conv, rep = convert_str(deck)
+    assert "the rotation applied" in rep.text() and "not allowed by ccx" not in rep.text()
+    assert conv.reduced_physics == ["element SC8R / SC6R composite continuum shells -> one C3D8I / C3D6 solid per ply"]
+    t, r = math.radians(15.0), math.radians(25.0)        # the hoop direction turned towards the axis
+    vals = [float(x) for x in _card_at(body, "*DISTRIBUTION, NAME=CYL_PLY1_AXES")[0].split(",")]
+    want = (-math.sin(t) * math.cos(r), math.cos(t) * math.cos(r), math.sin(r))
+    assert max(abs(x - y) for x, y in zip(vals[1:4], want)) < 1e-6
+    # the same system as a cylindrical *DISTRIBUTION
+    body, conv, rep = convert_str(deck.replace(
+        "*Orientation, name=C, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n",
+        "*Distribution, name=D, location=ELEMENT, table=T\n, 0., 0., 0., 0., 0., 1.\n"
+        "*Distribution Table, name=T\ncoord3D, coord3D\n*Orientation, name=C, system=CYLINDRICAL\nD\n"))
+    vals = [float(x) for x in _card_at(body, "*DISTRIBUTION, NAME=CYL_PLY1_AXES")[0].split(",")]
+    assert max(abs(x - y) for x, y in zip(vals[1:4], want)) < 1e-6 and "was dropped" not in rep.text()
+    assert conv.reduced_physics == ["element SC8R / SC6R composite continuum shells -> one C3D8I / C3D6 solid per ply"]
+
+
+def test_orientation_axes_are_undefined_on_the_axis():
+    # a point on a spherical system's polar axis (also off it by a rounding error) or at its
+    # centre, or on a cylindrical system's axis, has no circumferential direction
+    sph = lambda p, rot=None: A.orientation_frame((0., 0., 0.), (0., 0., 1.), "SPHERICAL", p, rot)   # noqa: E731
+    assert A.frame_defined(*sph((0.0, 2.0, 0.0)))
+    assert not any(A.frame_defined(*sph(p)) for p in ((0., 0., 1.), (1.2e-16, 0., -1.), (0., 0., 0.)))
+    assert not A.frame_defined(*A.orientation_frame((0., 0., 0.), (1., 1., 1.), "CYLINDRICAL",
+                                                    (0.3, 0.3, 0.3 + 1e-12), None))
+    # what a shell projects after rotation axis 3, axis 1, is radial there; turned, it is not
+    assert A.frame_defined(*sph((0., 0., 1.), (3, 0.0))) and not A.frame_defined(*sph((0., 0., 1.), (3, 30.0)))
+    nz = (0.0, 0.0, 1.0)
+    assert A.shell_local_axes(nz, *sph((0., 0., 1.))) == A.shell_local_axes(nz)
+    assert "its axis 2, which Abaqus projects, is undefined at an element's centre" in \
+        A.shell_axes_caveat(nz, *sph((0., 0., 1.)))
+    assert "is the shell normal" in A.shell_axes_caveat(nz, *sph((0., 0., 1.), (3, 0.0)))
+    # a shell element centred on the pole: the default directions, warned
+    deck = ("*Node\n1, -0.1, -0.1, 1.\n2, 0.1, -0.1, 1.\n3, 0.1, 0.1, 1.\n4, -0.1, 0.1, 1.\n"
+            "*Element, type=S4R, elset=TOP\n1, 1, 2, 3, 4\n" + COMPOSITE_MAT + SPH_ORIENTATION
+            + "*Shell Section, elset=TOP, material=CFRP, orientation=SPH\n0.01\n")
+    body, _, rep = convert_str(deck)
+    assert _card_at(body, "*ORIENTATION, NAME=ABQ2CCX_AXES1") == ["1, 0, 0, 0, 1, 0"]
+    assert "orientation SPH: its axis 2, which Abaqus projects, is undefined at an element's centre" in rep.text()
+    # an S4 there, integrated at four points around the pole: their directions part by 90 degrees
+    _, conv, rep = convert_str(deck.replace("type=S4R", "type=S4"))
+    assert "turns the material directions by up to 90 degrees across an element" in rep.text()
+    # stacked along the system's axis 3, which the pole does not define: along direction 3, warned
+    cap = ("*Node\n" + "".join(f"{k + 1}, {x}, {y}, {z}\n" for k, (x, y, z) in enumerate(
+        (x, y, z) for z in (9.99, 10.01) for x, y in ((-0.1, -0.1), (0.1, -0.1), (0.1, 0.1), (-0.1, 0.1))))
+        + "*Element, type=SC8R, elset=TOP\n1, 1, 2, 3, 4, 5, 6, 7, 8\n" + COMPOSITE_MAT + SPH_ORIENTATION
+        + "3, 0.\n*Shell Section, elset=TOP, composite, stack direction=ORIENTATION, orientation=SPH\n"
+        "1., 3, CFRP, 0.\n1., 3, CFRP, 90.\n")
+    _, conv, rep = convert_str(cap)
+    assert "orientation 'SPH' has no axis 3 at the centre of an element" in rep.text()
+    assert {round(conv.geom.nodes[n][2], 9) for n in conv.geom.nodes if n > 8} == {10.0}
+
+
+def _sphere_shells(m, rotation="", quad="S4R", tri="S3", section="*Shell Section"):
+    """A sphere of radius 1 about the origin meshed along its parallels and meridians (2 m rings
+    of 4 m elements, ``tri`` at the poles, ``quad`` elsewhere) of CFRP on SPH_ORIENTATION."""
+    nr, na = 2 * m, 4 * m
+    nid = lambda i, j: 1 if i == 0 else 2 + (nr - 1) * na if i == nr else 2 + (i - 1) * na + j % na  # noqa: E731
+    nodes = "".join(f"{nid(i, j)}, " + ", ".join(f"{x:.12g}" for x in _sph(1.0, 180.0 * i / nr, 360.0 * j / na)) + "\n"
+                    for i in range(nr + 1) for j in (range(na) if 0 < i < nr else (0,)))
+    tris = [(nid(0, 0), nid(1, j), nid(1, j + 1)) for j in range(na)] + \
+        [(nid(nr, 0), nid(nr - 1, j + 1), nid(nr - 1, j)) for j in range(na)]
+    quads = [(nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)) for i in range(1, nr - 1) for j in range(na)]
+    elems = f"*Element, type={tri}, elset=SPHERE\n" + "".join(f"{e}, {a}, {b}, {c}\n" for e, (a, b, c) in enumerate(tris, 1))
+    elems += f"*Element, type={quad}, elset=SPHERE\n" + "".join(
+        f"{e}, " + ", ".join(map(str, q)) + "\n" for e, q in enumerate(quads, len(tris) + 1))
+    return (f"*Node\n{nodes}{elems}" + COMPOSITE_MAT + SPH_ORIENTATION + (rotation + "\n" if rotation else "")
+            + f"{section}, elset=SPHERE, material=CFRP, orientation=SPH\n0.01\n")
+
+
+def test_spherical_orientation_turning_across_an_element_is_warned():
+    # 30-degree S4 elements: along the parallels the system turns by some 11 degrees within one,
+    # which Abaqus follows to its four integration points and ccx takes at the centre
+    _, conv, rep = convert_str(_sphere_shells(3, quad="S4"))
+    assert re.search(r"its spherical orientation turns the material directions by up to 1[0-9] degrees "
+                     r"across an element;", rep.text())
+    assert conv.reduced_physics and "spherical orientation at element centres" in conv.reduced_physics[0]
+    # 7.5-degree ones: under 4 degrees, no element corner on the poles counting
+    _, conv, rep = convert_str(_sphere_shells(12, quad="S4"))
+    assert "across an element" not in rep.text() and not conv.reduced_physics
+    # S3 and S4R take the directions at their one integration point, the centre, as ccx does
+    _, conv, rep = convert_str(_sphere_shells(3, "3, 25."))
+    assert "across an element" not in rep.text() and not conv.reduced_physics
+    # a flat membrane projects onto its own plane: turned about axis 3, the radial axis 1 Abaqus
+    # projects tilts across each facet of 7.5 degrees by some 12 degrees
+    _, conv, rep = convert_str(_sphere_shells(12, "3, 25.", "M3D4", "M3D3", "*Membrane Section"))
+    assert re.search(r"turns the material directions by up to 1[0-9] degrees across an element", rep.text())
 
 
 QM8_STRIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n4, 1.5, 0., 0.\n5, 2., 0., 0.\n"

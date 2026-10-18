@@ -40,6 +40,15 @@ physics.
   orientation's rotation axis (axis 1 without a rotation line: radial for a cylindrical or
   spherical system), as Abaqus does; it stacked along axis 3. `STACK DIR` is read as `STACK
   DIRECTION`.
+* **Spherical orientations** — shell, membrane and continuum-shell sections (plies included) on
+  a `SYSTEM=SPHERICAL` `*ORIENTATION` get Abaqus' spherical material directions per element
+  (1 radial, 2 along the parallels, 3 along the meridians); ccx 2.23 has no spherical system
+  and read the rectangular card the converter writes instead (no axes at all for a sphere
+  centred at the origin). Where only such sections read the card, it is no longer reduced
+  physics. A pressurised orthotropic sphere now matches membrane theory to 0.35–1.2 %. A
+  cylindrical or spherical system turning within an element is no longer reported for
+  elements Abaqus integrates at their centre alone (`S3`, `S4R`, `M3D3`, `M3D4R` ...), as ccx
+  takes the orientation there too.
 * **CalculiX on Windows** — CI now runs `validate_with_ccx.py` and `--run` with conda-forge's
   Windows ccx 2.23 as well. That ccx does not start outside its activated environment, so
   `--run` and `validate_with_ccx.py` give a conda environment's ccx the folders `conda

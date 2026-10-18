@@ -45,9 +45,10 @@ TRANSLATED = {
         "written flat).",
     "*ORIENTATION": "origin `c` of a 9-value line subtracted from `a`, `b` (ccx has no origin "
         "field); `DEFINITION=NODES` resolved to coordinates, `OFFSET TO NODES` commented; "
-        "`SPHERICAL`→`RECTANGULAR` (warned); rotation line kept (a blank axis as 1, Abaqus' "
-        "default). One that names a `*DISTRIBUTION` is preceded by that distribution in ccx's form "
-        "(see `*DISTRIBUTION`).",
+        "`SPHERICAL`→`RECTANGULAR` (warned; a note where only shell, membrane and continuum-shell "
+        "sections read it, which get Abaqus' spherical directions per element); rotation line "
+        "kept (a blank axis as 1, Abaqus' default). One that names a `*DISTRIBUTION` is preceded "
+        "by that distribution in ccx's form (see `*DISTRIBUTION`).",
     "*DISTRIBUTION": "per-element orientations, in the form ccx 2.23 runs correctly: each "
         "`*ORIENTATION` naming one gets its own copy (ccx gives a distribution to the first only), "
         "resolved to one line per element of its solid sections — default line first, origin "

@@ -1352,14 +1352,20 @@ def orientation_frame(a: Vec, b: Vec, system: str, point: Vec,
     (None without a rotation line): RECTANGULAR — 1 along a, 3 along a x b; CYLINDRICAL — a
     and b on the axis, 1 radial, 2 tangential, 3 from a to b; SPHERICAL — a the centre, b on
     the polar axis, 1 radial, 2 circumferential, 3 meridional towards b (2017 "Orientations",
-    Figure 1); then turned about the rotation axis by its angle (degrees)."""
+    Figure 1); then turned about the rotation axis by its angle (degrees).  The axes a point
+    on a cylindrical system's axis or a spherical system's polar axis (within 1e-9 of the
+    model's scale, a rounding error) or at its centre does not define are zero vectors
+    (frame_defined)."""
     if system.upper().startswith("CYL"):
         e3 = vunit(vsub(b, a))
         r = vsub(point, a)
-        e1 = vunit(vsub(r, vscale(e3, vdot(r, e3))))
+        rp = vsub(r, vscale(e3, vdot(r, e3)))
+        e1 = vunit(rp) if vnorm(rp) > 1e-9 * max(vnorm(r), vnorm(vsub(b, a))) else (0.0, 0.0, 0.0)
     elif system.upper().startswith("SPH"):
-        e1 = vunit(vsub(point, a))
-        e3 = vcross(e1, vunit(vcross(vunit(vsub(b, a)), e1)))
+        r = vsub(point, a)
+        e1 = vunit(r) if vnorm(r) > 1e-9 * vnorm(vsub(b, a)) else (0.0, 0.0, 0.0)
+        c = vcross(vunit(vsub(b, a)), e1)
+        e3 = vcross(e1, vunit(c)) if vnorm(c) > 1e-9 else (0.0, 0.0, 0.0)
     else:
         e1 = vunit(a)
         e3 = vunit(vcross(a, b))
@@ -1374,6 +1380,20 @@ def orientation_frame(a: Vec, b: Vec, system: str, point: Vec,
     return (axes[0], axes[1], axes[2]), k
 
 
+def frame_defined(frame: Tuple[Vec, Vec, Vec], axis: Optional[int] = None) -> bool:
+    """Whether the axis a shell projects (the one after rotation ``axis``, see
+    shell_local_axes) of an orientation_frame is defined at its point: a cylindrical system's
+    axis, a spherical system's polar axis and centre leave some axes zero vectors, and a
+    rotation that turns one of them in leaves the turned axes short."""
+    return abs(vnorm(frame[(axis or 1) % 3]) - 1.0) < 1e-6
+
+
+# Abaqus shells and membranes integrated at one point in their plane, the element's centre
+# (2017 element libraries, "Numbering of integration points for output"): their material
+# directions are those at the centre, where ccx takes a shell or membrane orientation too
+ONE_POINT_SHEETS = {"S3", "S3R", "S3RS", "S4R", "S4R5", "S4RS", "S4RSW", "M3D3", "M3D4R"}
+
+
 def shell_local_axes(normal: Vec, frame: Optional[Tuple[Vec, Vec, Vec]] = None,
                      axis: Optional[int] = None) -> Tuple[Vec, Vec]:
     """Abaqus' material directions 1 and 2 on a shell surface with unit normal ``normal``.
@@ -1383,13 +1403,15 @@ def shell_local_axes(normal: Vec, frame: Optional[Tuple[Vec, Vec, Vec]] = None,
     of the axis that follows the rotation axis in the cycle 1, 2, 3 — without a rotation line
     Abaqus "will by default use the local 1-axis", so axis 2, also where axis 1 lies in the
     shell (Keywords *ORIENTATION: it "should have a nonzero component in the direction of
-    the normal").  Where that axis is the normal (not documented) the default directions.
-    Direction 2 is normal x direction 1.  (ccx 2.23 projects the turned axis 1 whatever the
-    rotation axis.)"""
+    the normal").  Where that axis is the normal, or is not defined at the point
+    (frame_defined; neither is documented), the default directions.  Direction 2 is normal x
+    direction 1.  (ccx 2.23 projects the turned axis 1 whatever the rotation axis.)"""
     if frame is None:
         v = (1.0, 0.0, 0.0)
         if abs(vdot(v, normal)) > math.cos(math.radians(0.1)):
             v = (0.0, 0.0, 1.0)
+    elif not frame_defined(frame, axis):
+        return shell_local_axes(normal)
     else:
         v = frame[(axis or 1) % 3]
     d = vsub(v, vscale(normal, vdot(v, normal)))
@@ -1401,10 +1423,15 @@ def shell_local_axes(normal: Vec, frame: Optional[Tuple[Vec, Vec, Vec]] = None,
 
 def shell_axes_caveat(normal: Vec, frame: Tuple[Vec, Vec, Vec], axis: Optional[int]) -> Optional[str]:
     """Why Abaqus' projection of an orientation onto a shell (shell_local_axes) needs checking,
-    or None: the projected axis is the normal (Abaqus does not document the outcome), or —
-    without a rotation line — the default rotation axis 1 lies in the shell, against the
-    Keywords note, so direction 1 follows axis 2."""
+    or None: the projected axis is not defined at the point or is the normal (Abaqus documents
+    neither outcome), or — without a rotation line — the default rotation axis 1 lies in the
+    shell, against the Keywords note, so direction 1 follows axis 2."""
     k = axis or 1
+    if not frame_defined(frame, axis):
+        return (f"its axis {k % 3 + 1}, which Abaqus projects, is undefined at an element's centre (on "
+                f"the axis of a cylindrical or spherical system, at a spherical system's centre, or a "
+                f"rectangular one's point a at the origin or in line with b); Abaqus does not document "
+                f"that case, and the converter takes the default shell directions there")
     v = frame[k % 3]
     if vnorm(vsub(v, vscale(normal, vdot(v, normal)))) < 1e-9:
         return (f"its axis {k % 3 + 1}, which Abaqus projects after rotation axis {k}"
@@ -3407,6 +3434,7 @@ class Converter:
         # nodes of split continuum shells (_plan_quadratic_shells, _plan_ply_split)
         self._edge_nodes: List[Tuple[int, int, int, float]] = []
         self._quad_edges: Dict[int, List[Tuple[int, int, int]]] = {}  # shell -> (a, c, midside)
+        self._quad_from: Dict[int, str] = {}       # such a shell -> its type in the deck
         # composite sections on continuum shells written ply by ply: id(section) -> plan, the
         # *EQUATION lines that hold ply interface nodes on a neighbour's edge, and why the
         # split was left out (_plan_ply_split)
@@ -5531,9 +5559,15 @@ class Converter:
             if k == "DEFINITION":
                 continue
             if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
-                self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
-                                 "RECTANGULAR — verify the local system.", once=True)
-                self._reduces("*ORIENTATION, SYSTEM=SPHERICAL written rectangular")
+                if (b.param("NAME") or "").strip().upper() in self._exact_only:
+                    self.report.note("*ORIENTATION SYSTEM=SPHERICAL: ccx has no spherical system, so the "
+                                     "card is written as RECTANGULAR, but no element reads it: the shell "
+                                     "and membrane sections that use it get Abaqus' spherical directions "
+                                     "element by element, at each element's centre.", once=True)
+                else:
+                    self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
+                                     "RECTANGULAR — verify the local system.", once=True)
+                    self._reduces("*ORIENTATION, SYSTEM=SPHERICAL written rectangular")
                 params["SYSTEM"] = "RECTANGULAR"
             else:
                 params[k] = v
@@ -5695,7 +5729,8 @@ class Converter:
             else:
                 params[k] = v
         # sections with the directions element by element (_shell_axes_rows) keep the rotation
-        if plan["dropped_rot"] and (plan["solid"] or plan["inexact"] or plan["other"] or not plan["split"]):
+        if plan["dropped_rot"] and (plan["solid"] or plan["inexact"] or plan["other"]
+                                    or not (plan["split"] or plan["plies"])):
             self.report.warn(f"*ORIENTATION {name}: an additional rotation is not allowed by ccx "
                              f"for a non-rectangular system and was dropped — verify material "
                              f"directions.", once=True)
@@ -5783,14 +5818,18 @@ class Converter:
             self._dist_ori[name] = dict(dist=ref, copy=copy, rect=rect, rot=rot,
                                         dropped_rot=dropped, default=default, vec=vec,
                                         has_data=default is not None or bool(vec),
-                                        solid=set(), split=False, inexact=False, other=False)
+                                        solid=set(), split=False, inexact=False, other=False,
+                                        plies=False)
         for b in blocks:
             kw = b.keyword
             ori = (b.param("ORIENTATION") or "").strip().upper()
             elset = (b.param("ELSET") or "").strip()
             shell = kw in ("SHELL SECTION", "SHELL GENERAL SECTION")
-            if id(b) in self._ply_sections:
-                continue                           # ply solids with their own axes
+            if id(b) in self._ply_sections:        # ply solids with their own axes, the
+                for o in {ori} | {f for _t, _m, f in self._section_layers(b)}:   # rotation applied
+                    if o in self._dist_ori:
+                        self._dist_ori[o]["plies"] = True
+                continue
             if shell and self._continuum_shell_elset(elset):
                 if ori in self._dist_ori and not b.has("COMPOSITE"):    # runs as a solid
                     self._dist_ori[ori]["solid"].update(self._existing(elset))
@@ -6471,9 +6510,10 @@ class Converter:
                       ) -> Optional[Tuple[Tuple[Vec, Vec, Vec], Optional[int]]]:
         """Abaqus' local system of orientation ``name`` at element ``e`` (centre ``centre``) and
         the axis of its additional rotation (orientation_frame): a plain *ORIENTATION,
-        rectangular or cylindrical (spherical as rectangular), or a *DISTRIBUTION one with the
-        element's own line, its rotation — which _distribution_lines turned a rectangular one's
-        vectors by — applied once.  None where the axes are unknown (_orient_axes)."""
+        rectangular, cylindrical or spherical, or a *DISTRIBUTION one with the element's own
+        line (a spherical one as the rectangular system it is written as), its rotation — which
+        _distribution_lines turned a rectangular one's vectors by — applied once.  None where
+        the axes are unknown (_orient_axes)."""
         rot = self._orient_rotation.get(name)
         if name in self._dist_refs:
             v = self._dist_values(e, name)
@@ -6487,8 +6527,15 @@ class Converter:
         if name not in self._orient_axes:
             return None
         a, bb, system = self.orientations[name]
-        return orientation_frame(a, bb, "RECT" if system.upper().startswith("SPH") else system,
-                                 centre, rot)
+        return orientation_frame(a, bb, system, centre, rot)
+
+    def _turning_system(self, name: str) -> Optional[str]:
+        """"cylindrical" or "spherical" where _abaqus_frame turns orientation ``name``'s axes
+        from point to point, else None."""
+        if name in self._dist_refs:
+            return None if name not in self._dist_ori or self._dist_ori[name]["rect"] else "cylindrical"
+        system = self.orientations[name][2].upper() if name in self.orientations else ""
+        return "cylindrical" if system.startswith("CYL") else "spherical" if system.startswith("SPH") else None
 
     def _ccx_frame(self, e: int, name: str, angle: float, centre: Vec) -> Optional[Tuple[Vec, Vec, Vec]]:
         """The local system ccx 2.23 builds at element ``e`` from the orientation the converter
@@ -6497,8 +6544,8 @@ class Converter:
         per direction, the angle about its axis 3 (_plain_dist_orientation); a layer angle on a
         plain orientation as a rectangular one turned about its axis 3, with that orientation's
         own rotation about axis 3 (_synth_orientation); else the deck's *ORIENTATION as
-        handle_orientation writes it, a cylindrical one without its rotation.  None where it is
-        unknown."""
+        handle_orientation writes it, a cylindrical one without its rotation, a spherical one
+        as rectangular.  None where it is unknown."""
         if name in self._dist_refs:
             v = self._dist_values(e, name)
             if v is None:
@@ -6550,8 +6597,11 @@ class Converter:
 
         ccx takes a shell or membrane orientation once per element, at its centre (probed: a
         cylindrical one on an annulus runs exactly as one rectangular orientation per element),
-        Abaqus at each integration point: where a cylindrical system turns the directions by more
-        than 5 degrees across an element, that is warned as reduced physics."""
+        Abaqus at each integration point: where a cylindrical or spherical system turns the
+        directions by more than 5 degrees across an element integrated at more than one point
+        (ONE_POINT_SHEETS take them at the centre), that is warned as reduced physics — on the
+        element's own plane, as a membrane or a flat facet has it.  (ccx has no spherical
+        system: handle_orientation writes one as rectangular.)"""
         elset = (b.param("ELSET") or "").strip()
         layers = self._section_layers(b)
         syms = [self._mat_symmetry.get(mat.upper(), "aniso") for _t, mat, _f in layers]
@@ -6574,12 +6624,15 @@ class Converter:
                 return None
             elems.append(e)
         rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]" = OrderedDict()
-        differs, spread = False, 0.0
+        differs, spread, worst = False, 0.0, ""
         for e in elems:
             geo = self._shell_geometry(e)
             if geo is None:
                 return None
             n, centre, corners = geo
+            # the deck's own element (a composite S3 / S4 / S4R runs as S6 / S8R): integrated at
+            # one point, the centre, it takes the directions there, as ccx does
+            many = split_suffixes(self._quad_from.get(e, self.geom.elements[e][0]))[0] not in ONE_POINT_SHEETS
             toks = []
             for (_thick, _mat, spec), sym in zip(layers, syms):
                 try:
@@ -6595,11 +6648,17 @@ class Converter:
                     self.report.warn(f"*{b.keyword} {elset}: orientation {name}: {why} — verify the "
                                      f"material directions.", once=True)
                 d1, d2 = ply_axes(n, shell_local_axes(n, *fr) if fr else shell_local_axes(n), angle)
-                if fr and (not self._dist_ori[name]["rect"] if name in self._dist_refs
-                           else self.orientations[name][2].upper().startswith("CYL")):
-                    for q in corners:                  # the directions there (same normal)
-                        dq = ply_axes(n, shell_local_axes(n, *self._abaqus_frame(e, name, q)), angle)[0]
-                        spread = max(spread, math.degrees(math.acos(min(1.0, abs(vdot(dq, d1))))))
+                system = self._turning_system(name) if fr and sym and many else None
+                if system:
+                    # the directions at the corners (none at a corner on the axis) against those
+                    # at the centre, or at the first corner where the centre has none
+                    dirs = [ply_axes(n, shell_local_axes(n, *fq), angle)[0]
+                            for fq in (self._abaqus_frame(e, name, q) for q in corners) if frame_defined(*fq)]
+                    ref = d1 if frame_defined(*fr) else dirs[0] if dirs else None
+                    for dq in dirs:
+                        turn = math.degrees(math.acos(min(1.0, abs(vdot(dq, ref)))))
+                        if turn > spread:
+                            spread, worst = turn, system
                 if membrane:
                     c1, c3 = vdot(got[0], d1), vdot(got[2], n)
                     same = min(c1, c3) > 1.0 - 1e-6 if aniso else min(abs(c1), abs(c3)) > 1.0 - 1e-6
@@ -6609,13 +6668,14 @@ class Converter:
                 differs = differs or not same
                 toks.append(tuple(_fmt_component(x) for x in (*d1, *d2)))
             rows[e] = tuple(toks)
-        if spread > 5.0 and any(syms):
-            self.report.warn(f"*{b.keyword} {elset}: its cylindrical orientation turns the material "
-                             f"directions by up to {spread:.0f} degrees across an element (near the "
-                             f"system's axis); ccx 2.23 takes a shell or membrane orientation once per "
-                             f"element, at its centre (probed), Abaqus at each integration point — "
-                             f"refine the mesh there or verify.")
-            self._reduces(f"*{b.keyword} {elset}: material directions of a cylindrical orientation "
+        if spread > 5.0:
+            near = " (near the system's axis)" if worst == "cylindrical" else ""
+            self.report.warn(f"*{b.keyword} {elset}: its {worst} orientation turns the material "
+                             f"directions by up to {spread:.0f} degrees across an element{near}; ccx "
+                             f"2.23 takes a shell or membrane orientation once per element, at its "
+                             f"centre (probed), Abaqus at each integration point — refine the mesh "
+                             f"there or verify.")
+            self._reduces(f"*{b.keyword} {elset}: material directions of a {worst} orientation "
                           f"at element centres, up to {spread:.0f} degrees apart within an element")
         return rows if differs else None
 
@@ -6697,8 +6757,10 @@ class Converter:
         """The shell and membrane sections that need their material directions element group by
         element group (_shell_axes_rows; those with *DISTRIBUTION orientations were planned in
         _plan_split), the plain shell sections on continuum shells that need them element by
-        element (_continuum_axes_rows), and the orientations no other card reads
-        (_exact_only): a cylindrical one's dropped rotation then loses nothing."""
+        element (_continuum_axes_rows), and the orientations no other card reads than these and
+        the split composite continuum shells, whose ply solids get their own axes
+        (_ply_section_cards) — _exact_only: a cylindrical one's dropped rotation then loses
+        nothing, nor a spherical one written as rectangular."""
         only: Dict[str, bool] = {}
         for b in blocks:
             kw = b.keyword
@@ -6725,7 +6787,7 @@ class Converter:
             if kw == "CONNECTOR SECTION":
                 names |= {x.strip().upper() for r in merged_data_records(b) for x in r}
             for name in names - {""}:
-                only[name] = only.get(name, True) and id(b) in self._exact_axes
+                only[name] = only.get(name, True) and (id(b) in self._exact_axes or id(b) in self._ply_sections)
         self._exact_only = {name for name, yes in only.items() if yes}
 
     def _exact_axes_cards(self, b: Block, rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]",
@@ -6765,8 +6827,9 @@ class Converter:
                 out += [emit_keyword(kw, params)] + list(data)
         if composite:
             self.report.note(f"*SHELL SECTION, COMPOSITE on shells whose normal is not the "
-                             f"orientation's axis 3 (another plane, a reversed normal, a curved shell "
-                             f"or a rotation about axis 1 / 2, axis 1 also without a rotation line): "
+                             f"orientation's axis 3 (another plane, a reversed normal, a curved shell, "
+                             f"a spherical system, which ccx lacks, or a rotation about axis 1 / 2, "
+                             f"axis 1 also without a rotation line): "
                              f"each ply's directions given element group by group "
                              f"({len(groups)} group(s) here) as Abaqus defines them — "
                              f"the orientation projected onto the shell, then turned by the layer "
@@ -6776,7 +6839,7 @@ class Converter:
             self.report.note(f"*{b.keyword} whose material directions ccx would place otherwise "
                              f"(an orientation turned about axis 1 / 2 — axis 1 also without a rotation "
                              f"line — or not in the shell's plane, a cylindrical system on a cylinder, "
-                             f"a membrane off the x-y plane): "
+                             f"a spherical system, which ccx lacks, a membrane off the x-y plane): "
                              f"Abaqus' directions — the orientation projected onto the shell — given "
                              f"element group by element group ({len(groups)} group(s) here); ccx "
                              f"would project the turned axis 1 onto a shell and take a membrane's "
@@ -6808,7 +6871,8 @@ class Converter:
             params["ORIENTATION"] = oname
         self.report.note(f"*{b.keyword} on continuum shells whose material directions ccx's solids "
                          f"would place otherwise (the global axes off the x-y plane, an orientation's "
-                         f"axes unprojected, a cylindrical system at each integration point): Abaqus' "
+                         f"axes unprojected, a cylindrical system at each integration point, a "
+                         f"spherical system, which ccx lacks): Abaqus' "
                          f"directions — the orientation projected onto the mid-surface, the stack "
                          f"direction as direction 3 — given by one *ORIENTATION, or element by element "
                          f"through a *DISTRIBUTION.", once=True)
@@ -14464,6 +14528,7 @@ class Converter:
                 mids.append(mid[key])
             new = "S6" if len(corners[e]) == 3 else COMPOSITE_SHELL_UPGRADE[cc(typ)]
             self._quad_edges[e] = [(a, c, m) for (a, c), m in zip(edges(e), mids)]
+            self._quad_from[e] = typ
             els[e] = (new, corners[e] + mids)
             self._elem_types.add(new)
             kind = f"{typ.upper()} -> {new}"
@@ -14561,17 +14626,23 @@ class Converter:
         isoparametric direction closest to it (2017 "About shell elements"; its cylindrical
         example stacks along the radial axis 1).  None (warned: the stack direction is
         direction 3) where the converter has no axes for it (_orient_axes): undefined, or
-        given by a distribution or by each element's nodes."""
+        given by a distribution or by each element's nodes; or where the element's centre does
+        not define that axis (frame_defined)."""
         ori = (b.param("ORIENTATION") or "").strip().upper()
+        where = f"*{b.keyword} {(b.param('ELSET') or '').strip()}, STACK DIRECTION=ORIENTATION"
         if ori in self._orient_axes:
             a, bb, system = self.orientations[ori]
             centre = (0.0, 0.0, 0.0)
             for x in conn:
                 centre = vadd(centre, vscale(self.geom.nodes[x], 1.0 / len(conn)))
             frame, k = orientation_frame(a, bb, system, centre, self._orient_rotation.get(ori))
-            return frame[(k or 1) - 1]
-        self.report.warn(f"*{b.keyword} {(b.param('ELSET') or '').strip()}, STACK DIRECTION=ORIENTATION: "
-                         f"orientation '{ori}' has no fixed axes here (undefined, given by a "
+            if vnorm(frame[(k or 1) - 1]) > 0.5:
+                return frame[(k or 1) - 1]
+            self.report.warn(f"{where}: orientation '{ori}' has no axis {k or 1} at the centre of an "
+                             f"element (on the system's axis, or at a spherical system's centre); "
+                             f"its stack direction is taken as direction 3.", once=True)
+            return None
+        self.report.warn(f"{where}: orientation '{ori}' has no fixed axes here (undefined, given by a "
                          f"distribution, which Abaqus does not allow there, or by each element's "
                          f"nodes); the stack direction is taken as direction 3.", once=True)
         return None
@@ -14915,8 +14986,9 @@ class Converter:
         """The stack normal of split continuum shell ``e`` (its mid-surface normal, from the
         bottom face to the top face) and Abaqus' shell material directions 1, 2 there
         (shell_local_axes) for the section or layer orientation ``ori`` ("": none): a plain
-        *ORIENTATION, rectangular or cylindrical at the element's centre, or a *DISTRIBUTION
-        one with the element's own axes, each turned by its additional rotation first."""
+        *ORIENTATION, rectangular, or cylindrical or spherical at the element's centre, or a
+        *DISTRIBUTION one with the element's own axes, each turned by its additional rotation
+        first."""
         _order, bottom, top = plan["stack_of"][e]
         n, center = self._stack_geometry(bottom, top)
         if not ori:

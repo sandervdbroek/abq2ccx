@@ -23,7 +23,8 @@ section, per-element *DISTRIBUTION
 orientations (a C3D8 plate and a composite S8R panel) against the same models written with
 one orientation per element, the material axes of plain shells, membranes and continuum
 shells whose orientation leaves their plane or has no rotation line (the ply's stiffness at
-Abaqus' direction), of hoop-wound S4 and SC8R cylinders (thin-wall theory) and of a
+Abaqus' direction), of hoop-wound S4 and SC8R cylinders (thin-wall theory), of spheres of
+orthotropic S4R and SC8R shells and SC8R plies with a spherical system (membrane theory) and of a
 fibre-steered strip whose distribution axes leave the
 plate (the same strip with them in it), quadratic membranes (strips in tension, also under NLGEOM, and
 a pressurized sphere) against uniaxial stress and thin-wall theory, a clamped beam and plate after a later step's *BOUNDARY,
@@ -1365,6 +1366,83 @@ def cylinder_hoop_deck(rotation="", n=24, m=2, t=0.01):
     lines += [f"{e}, P, 1." for e in range(1, n * m + 1)]       # along the outward normal
     lines += ["*Node print, nset=PROBE", "U", "*End Step"]
     return "\n".join(lines) + "\n"
+
+
+def sphere_hoop_deck(kind="s4r", rotation="", m=24, n=24, t=0.01):
+    """A thin sphere (mean radius 1, centre at the origin, thickness t) under internal pressure
+    1, meshed along its parallels and meridians (2 m rings from pole to pole, 4 n elements
+    around: S3 / SC6R at the poles, S4R / SC8R elsewhere) and held against rigid-body motion
+    only, at four nodes of the equator: a plain section of INPLANE_PLY on S4R shells or SC8R
+    continuum shells (stacked outward, the pressure on the inner face), or [0/90/0] SC8R plies
+    (``kind`` "s4r", "sc8r", "sc8r_composite"), with a spherical *ORIENTATION about the z axis
+    and an optional rotation line.  The system's axis 1, radial, is the normal: Abaqus projects
+    its axis 2, along the parallels (a rotation about axis 3 keeps it there).  Returns the deck
+    and (colatitude, longitude, the node of each layer) of the nodes between colatitudes 30 and
+    150 degrees, where sphere_membrane applies."""
+    nr, na = 2 * m, 4 * n
+    radii = (1.0,) if kind == "s4r" else (1.0 - t / 2, 1.0 + t / 2)
+    per = 2 + (nr - 1) * na                            # nodes per layer: the poles, the rings
+    nid = lambda i, j, k=0: (1 if i == 0 else per if i == nr else 2 + (i - 1) * na + j % na) + per * k  # noqa: E731
+    lines = ["*Heading", "Thin sphere of an orthotropic ply wound along its parallels under internal "
+             "pressure: a spherical *Orientation", "*Node"]
+    for k, r in enumerate(radii):
+        for i in range(nr + 1):
+            th = math.pi * i / nr
+            for j in range(na) if 0 < i < nr else (0,):
+                ph = 2 * math.pi * j / na
+                lines.append(f"{nid(i, j, k)}, {r * math.sin(th) * math.cos(ph):.12g}, "
+                             f"{r * math.sin(th) * math.sin(ph):.12g}, {r * math.cos(th):.12g}")
+    caps = [(nid(0, 0), nid(1, j), nid(1, j + 1)) for j in range(na)] + \
+        [(nid(nr, 0), nid(nr - 1, j + 1), nid(nr - 1, j)) for j in range(na)]
+    quads = [(nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)) for i in range(1, nr - 1) for j in range(na)]
+    shell = kind == "s4r"
+    elems = [(("S3" if shell else "SC6R"), c) for c in caps] + [(("S4R" if shell else "SC8R"), c) for c in quads]
+    for typ in dict.fromkeys(ty for ty, _ in elems):
+        lines.append(f"*Element, type={typ}, elset=SPHERE")
+        lines += [f"{e}, " + ", ".join(str(x) for x in (c if shell else c + tuple(x + per for x in c)))
+                  for e, (ty, c) in enumerate(elems, 1) if ty == typ]
+    probes = [(math.pi * i / nr, 2 * math.pi * j / na, tuple(nid(i, j, k) for k in range(len(radii))))
+              for i in range(nr // 6, nr - nr // 6 + 1) for j in range(na)]
+    lines += ["*Nset, nset=PROBE"] + _ids([x for _th, _ph, ks in probes for x in ks])
+    e1, e2, e3, n12, n13, n23, g12, g13, g23 = INPLANE_PLY
+    lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
+              f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}",
+              "*Orientation, name=SPH, system=SPHERICAL", "0., 0., 0., 0., 0., 1."]
+    lines += [rotation] if rotation else []
+    if kind == "sc8r_composite":
+        lines += ["*Shell Section, elset=SPHERE, composite, orientation=SPH",
+                  "1., 3, PLY, 0.", "1., 3, PLY, 90.", "1., 3, PLY, 0."]
+    else:
+        lines += ["*Shell Section, elset=SPHERE, material=PLY, orientation=SPH", f"{t:g}, 5" if shell else f"{t:g}"]
+    lines += ["*Step", "*Static", "*Boundary"]
+    for k in range(len(radii)):                       # the equator at 0, 90, 180 and 270 degrees
+        lines += [f"{nid(m, 0, k)}, 2, 3", f"{nid(m, 2 * n, k)}, 2, 3", f"{nid(m, n, k)}, 1, 1",
+                  f"{nid(m, n, k)}, 3, 3", f"{nid(m, 3 * n, k)}, 3, 3"]
+    lines += ["*Dload"] + (["SPHERE, P, 1."] if shell else [f"{e}, P1, 1." for e in range(1, len(elems) + 1)])
+    lines += ["*Node print, nset=PROBE", "U", "*End Step"]
+    return "\n".join(lines) + "\n", probes
+
+
+def sphere_membrane(theta, kind="s4r", t=0.01):
+    """Membrane theory for sphere_hoop_deck at colatitude ``theta`` (radians): the radial and the
+    meridional displacement (along increasing colatitude).  Equilibrium alone gives both stress
+    resultants, p rp^2 / 2 with the pressure on a surface of radius rp: the shells' reference
+    surface (rp = 1, as Abaqus loads them), the continuum shells' inner face (1 - t / 2); the
+    plies' membrane stiffness, direction 1 along the parallels, gives the strains ec along them
+    and em along the meridians.  With the equator a plane of symmetry the meridional
+    displacement is (em - ec) sin(theta) ln tan(theta / 2) and the radial one ec - u cot(theta);
+    near the poles, where the material directions turn about a point, the shell bends instead."""
+    rp = 1.0 if kind == "s4r" else 1.0 - t / 2
+    force = rp * rp / 2
+    a11 = a22 = a12 = 0.0
+    plies = (0.0, 90.0, 0.0) if kind == "sc8r_composite" else (0.0,)
+    for ang in plies:
+        q11, q22, q12 = reduced_stiffness(ang, INPLANE_PLY)[:3]
+        a11, a22, a12 = a11 + q11 * t / len(plies), a22 + q22 * t / len(plies), a12 + q12 * t / len(plies)
+    det = a11 * a22 - a12 * a12
+    ec, em = force * (a22 - a12) / det, force * (a11 - a12) / det
+    u = (em - ec) * math.sin(theta) * math.log(math.tan(theta / 2))
+    return ec - u / math.tan(theta), u
 
 
 def distribution_panel_deck(plane="XY", tilt=0.0, nx=8, ny=2):
@@ -3607,6 +3685,36 @@ def main():
               f"{'[0/90/0] plies' if composite else 'one layer'}, STACK DIRECTION=ORIENTATION with a "
               f"cylindrical *ORIENTATION without a rotation line, axial strain): axial force {got:.6g} vs "
               f"the radially stacked wall's membrane stiffness {want:.6g} ({err:.1e} apart)")
+        failures += 0 if ok else 1
+    # ccx 2.23 has no spherical system (abq2ccx writes the card as a rectangular one, which a
+    # sphere centred at the origin leaves without axes); the shells take Abaqus' spherical
+    # directions element by element
+    for kind, rot in (("s4r", ""), ("s4r", "3, 25."), ("sc8r", ""), ("sc8r_composite", "")):
+        tag = f"sphere_hoop_{kind}" + ("_rot3" if rot else "")
+        text, probes = sphere_hoop_deck(kind, rot)
+        res = composite_run(text, tag)
+        u = res[0] if res else {}
+        if not all(x in u for _th, _ph, ks in probes for x in ks):
+            if res:                                # solved, but without the probe nodes
+                print(f"FAIL  {tag}: no displacement at the probe nodes")
+            failures += 1
+            continue
+        err = scale = 0.0
+        for th, ph, ks in probes:
+            v = [sum(u[x][c] for x in ks) / len(ks) for c in range(3)]      # the mid-surface
+            radial = math.sin(th) * (math.cos(ph) * v[0] + math.sin(ph) * v[1]) + math.cos(th) * v[2]
+            merid = math.cos(th) * (math.cos(ph) * v[0] + math.sin(ph) * v[1]) - math.sin(th) * v[2]
+            want = sphere_membrane(th, kind)
+            err = max(err, abs(radial - want[0]), abs(merid - want[1]))
+            scale = max(scale, abs(want[0]), abs(want[1]))
+        ok = err < (0.02 if kind == "s4r" else 0.01) * scale
+        what = {"s4r": "plain S4R", "sc8r": "plain SC8R", "sc8r_composite": "[0/90/0] SC8R plies"}[kind]
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}, spherical *ORIENTATION"
+              + (" turned about axis 3" if rot else "") + f", internal pressure): radial and meridional "
+              f"displacement at colatitudes 30-150 deg vs membrane theory with the fibres along the "
+              f"parallels, max difference {err / scale * 100:.2f}% of the largest {scale:.4g}"
+              + (" (ccx loads the inner face of its expanded shells: 1 % less load at this t/R)"
+                 if kind == "s4r" else ""))
         failures += 0 if ok else 1
     # --- quadratic membranes: ccx 2.23 expands each element on nodes of its own and leaves the
     # mid-thickness node of its corners free (M3D8R singular, M3D6 / M3D8 too soft); abq2ccx
