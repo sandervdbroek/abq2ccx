@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Shell and membrane pressure on the reference surface** — Abaqus applies it to the reference
+  surface, ccx 2.23 to one face of the solid it expands the element into: on a shell the
+  bottom face for every label, whose area is off by O(t/R) (a sphere's force 10 % low at
+  t/R 0.1), leaving a mean stress −p/2 through the thickness (an `M3D4` sphere's displacement 5 % high).
+  Each such pressure is now split between the two faces (0.5 − o and 0.5 + o for `OFFSET`
+  o): the force matches Abaqus to O((t/R)²) — 0.25 % at t/R 0.1 on a sphere, exact on a
+  cylinder — also under NLGEOM.
 * **Quadratic membranes** — ccx 2.23 leaves the mid-thickness node of a quadratic membrane's
   corners free in each element it expands (`M3D8R` singular in any mesh of two or more
   elements, `M3D6` several times too soft, `M3D8` too soft in thick elements). `M3D6`,
