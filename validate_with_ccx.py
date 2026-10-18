@@ -3141,6 +3141,31 @@ def main():
         print(f"FAIL  assembly_rotated_instances: the two models printed different nodes "
               f"({len(ua)} / {len(uf)})")
         failures += 1
+    # the part's orientation by nodes, with node c (8, 6, 2) and without (7, 6: the origin is
+    # the part's, which moves with I2): each instance's copy takes its own nodes (I2 took I1's)
+    src = open(os.path.join(EXAMPLES, "assembly_rotated_instances.inp"), encoding="utf-8").read()
+    for tag, line in (("assembly_rotated_instances_nodes", "8, 6, 2"),
+                      ("assembly_rotated_instances_nodes_no_c", "7, 6")):
+        text = src.replace("*ORIENTATION, NAME=ORI\n1., 1., 0., -1., 1., 0.\n",
+                           f"*ORIENTATION, NAME=ORI, DEFINITION=NODES\n{line}\n")
+        path = os.path.join(tmp, tag + "_src.inp")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, tag + ".inp")
+        convert(path, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        un = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+        if len(uf) == 40 and set(un) == set(uf):
+            scale = max(abs(x) for v in uf.values() for x in v)
+            err = max(abs(a - b) for n in uf for a, b in zip(un[n], uf[n])) / scale
+            ok = text != src and err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (the part's orientation by nodes {line}): "
+                  f"displacements max difference {err:.1e} of max |u| from the model written flat")
+            failures += 0 if ok else 1
+        else:
+            print(f"FAIL  {tag}: the two models printed different nodes ({len(un)} / {len(uf)})")
+            failures += 1
     # --- Johnson-Cook damage initiation: ccx's indicator, the model unchanged -------
     # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which
     # it deletes an element, out of reach so that it only reports): in uniaxial tension the

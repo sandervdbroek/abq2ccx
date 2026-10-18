@@ -20582,6 +20582,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             if ref.upper() in dists:
                 # the axes come from the part's *DISTRIBUTION: name this instance's copy
                 nb.data[0] = ", ".join([namer(prefix, ref)] + nb.data[0].split(",")[1:])
+            elif nb.data and (b.param("DEFINITION") or "").strip().upper().startswith("NODES"):
+                _remap_node_orientation(nb, geo.nodes, node_off, rotv if rot or any(T) else None, report)
             elif (rot or any(T)) and nb.data and \
                     (b.param("DEFINITION") or "COORDINATES").upper().startswith("COORD"):
                 # rectangular axes are direction points measured from the origin (or from
@@ -20832,6 +20834,37 @@ def _remap_distribution(b: Block, prefix: str, namer, elem_off: int, move) -> Bl
                 vals = [_fmt_component(x) for i in range(0, len(v), 3) for x in move(tuple(v[i:i + 3]))]
         data.append(", ".join([label] + vals))
     return Block(b.keyword, p, data)
+
+
+def _remap_node_orientation(b: Block, nodes: Dict[int, Vec], node_off: int, turn,
+                            report: Report) -> None:
+    """One instance's copy (in place) of a part's *ORIENTATION, DEFINITION=NODES.  Its node
+    labels are the part's: they name this instance's nodes, ``node_off`` higher, which carry
+    the instance's transform.  Without node c a rectangular system's origin is the part's
+    (Keywords *ORIENTATION: the global origin), which the instance moves: there a and b are
+    written as the part's node positions ``nodes`` turned by ``turn`` (None: the instance
+    leaves the part where it is), as a part's DEFINITION=COORDINATES axes are turned
+    ("Orientations": rotated according to each instance's positioning)."""
+    f = [x.strip() for x in b.data[0].split(",")]
+    while f and f[-1] == "":
+        f.pop()
+    ids: List[Optional[int]] = []
+    for x in f[:3]:
+        try:
+            n = pint(x)
+        except (ValueError, OverflowError):
+            n = 0
+        ids.append(n if n > 0 else None)
+    rect = (b.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("RECT")
+    if turn is not None and rect and len(ids) >= 2 and (len(ids) < 3 or ids[2] is None) \
+            and ids[0] in nodes and ids[1] in nodes:
+        b.params["DEFINITION"] = "COORDINATES"
+        b.data[0] = ", ".join(_fmt_component(x) for n in ids[:2] for x in turn(nodes[n]))
+        report.note("*ORIENTATION, DEFINITION=NODES without node c in a moved instance: a and b "
+                    "written as coordinates, the part's node positions turned with the instance "
+                    "(the origin is the part's, which moves with it).", once=True)
+        return
+    b.data[0] = ", ".join([x if n is None else str(n + node_off) for x, n in zip(f, ids)] + f[3:])
 
 
 def _remap_named(b: Block, prefix: str, keys: Sequence[str], namer) -> Block:

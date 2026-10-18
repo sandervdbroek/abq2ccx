@@ -8539,6 +8539,55 @@ def test_continuum_shell_stack_along_a_spherical_orientation():
     assert "STACK DIR" not in rep.text()
 
 
+NODE_ORI_ASSEMBLY = ("*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
+                     "*Instance, name=I2, part=P\n5., 0., 0.\n5., 0., 0., {}, 90.\n*End Instance\n"
+                     "*End Assembly\n")
+
+
+def test_continuum_shell_stack_along_a_node_orientation_of_each_instance():
+    # *ORIENTATION, DEFINITION=NODES in a *Part names the part's nodes: each instance's copy
+    # names its own.  I2, moved 5 along x and turned 90 degrees about y, stacks along its 0.3
+    # thickness, now along x (it took I1's nodes and stacked across its 1.0 side)
+    deck = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "5, 0., 0., 0.3\n6, 1., 0., 0.3\n7, 1., 1., 0.3\n8, 0., 1., 0.3\n"
+            "*Element, type=SC8R, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Orientation, name=O, definition=NODES\n5, 2, 1\n"
+            "*Shell Section, elset=E, composite, stack direction=ORIENTATION, orientation=O\n"
+            "0.1, 3, CFRP, 0.\n0.1, 3, CFRP, 90.\n*End Part\n"
+            + NODE_ORI_ASSEMBLY.format("5., 1., 0.") + COMPOSITE_MAT)
+    _, conv, _ = convert_str(deck)
+    g = conv.geom
+    a, b = conv.orientations["I2_O"][:2]
+    assert max(abs(x - y) for x, y in zip(a + b, (0.3, 0., 0., 0., 0., -1.))) < 1e-12
+    for inst, along in (("I1", 2), ("I2", 0)):
+        for ply in ("PLY1", "PLY2"):
+            (e,) = g.elset(f"{inst}_E_{ply}")
+            xyz = [g.nodes[n] for n in g.elements[e][1]]
+            size = [max(p[i] for p in xyz) - min(p[i] for p in xyz) for i in range(3)]
+            assert max(abs(s - (0.15 if i == along else 1.0)) for i, s in enumerate(size)) < 1e-12, (inst, size)
+
+
+def test_node_orientation_of_a_solid_section_turns_with_each_instance():
+    # a part's solid-section axes by nodes 2 (x), 4 (y) and origin 1: I2, moved 5 along x and
+    # turned 90 degrees about z, gets them turned (it took I1's).  Without node c the origin is
+    # the part's, which moves with I2: a and b are the part's directions turned (I2's own nodes
+    # 2 and 4 seen from the global origin would put axis 1 along (5, 1, 0)).  Behind a reference
+    # point numbered first, I1 too names its own nodes (it took the point and I1's nodes 1 and
+    # 3).  A cylindrical system's axis points move like nodes
+    deck = ("*Part, name=P\n" + HEX + "*Orientation, name=O, definition=NODES\n2, 4, 1\n"
+            "*Solid Section, elset=EALL, material=CFRP, orientation=O\n*End Part\n"
+            + NODE_ORI_ASSEMBLY.format("5., 0., 1.") + COMPOSITE_MAT)
+    rp = "*Assembly, name=A\n*Node\n1, 9., 9., 9.\n"
+    for text in (deck, deck.replace("2, 4, 1\n", "2, 4\n"), deck.replace("*Assembly, name=A\n", rp)):
+        body, _, _ = convert_str(text)
+        assert _card_at(body, "*ORIENTATION, NAME=I1_O") == ["1, 0, 0, 0, 1, 0"]
+        assert _card_at(body, "*ORIENTATION, NAME=I2_O") == ["0, 1, 0, -1, 0, 0"]
+        assert "*SOLID SECTION, ELSET=I2_EALL, MATERIAL=CFRP, ORIENTATION=I2_O" in body
+    body, _, _ = convert_str(deck.replace("name=O, definition=NODES\n2, 4, 1",
+                                          "name=O, system=CYLINDRICAL, definition=NODES\n1, 5"))
+    assert _card_at(body, "*ORIENTATION, NAME=I2_O") == ["5, 0, 0, 5, 0, 1"]
+
+
 QM8_STRIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n4, 1.5, 0., 0.\n5, 2., 0., 0.\n"
              "6, 0., 0.5, 0.\n8, 1., 0.5, 0.\n10, 2., 0.5, 0.\n11, 0., 1., 0.\n12, 0.5, 1., 0.\n"
              "13, 1., 1., 0.\n14, 1.5, 1., 0.\n15, 2., 1., 0.\n"
