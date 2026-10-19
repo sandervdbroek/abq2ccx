@@ -75,7 +75,15 @@ physics.
   where Abaqus linearizes them (a cantilever under a tip moment 9 % stiffer at 0.1 rad). In a
   deck with a `*DYNAMIC` step and no NLGEOM every `*RIGID BODY`, `*MPC BEAM` body and kinematic
   coupling, on solid, knotted shell/beam or 2-D nodes, is now written as the linear `*EQUATION`s
-  u = u_ref + θ × d (nodes with a `*TRANSFORM` keep the `*RIGID BODY`).
+  u = u_ref + θ × d, one card per constraint (on a member with a `*TRANSFORM` along its local
+  axes: 2.5e-6 off the linear answer, where the `*RIGID BODY` was 7 % off; knot beams only where
+  rotations are tied). A transformed reference node keeps the `*RIGID BODY`, warned as reduced
+  physics, as does a deck whose linear `*DYNAMIC` step comes before an NLGEOM step.
+* **BCs on the nodes of those linear rigid constraints** — ccx solves with such a BC kept (it
+  had a false "ccx stops" warning). A kinematic coupling's or `*MPC BEAM`'s is now dropped, as
+  Abaqus does: it eliminates that DOF. A `*RIGID BODY`'s that cannot be moved to the reference
+  node is warned as reduced physics. The notes no longer describe a `*RIGID BODY` that isn't
+  written.
 * **`*BOUNDARY, OP=NEW` as ccx reads it** — ccx 2.23 acts on `OP=NEW` on a step's first
   `*BOUNDARY` only; the converter's step walkers (load audit, results digest, velocity BCs,
   constraint and connector checks) took it on any card. An `OP=NEW` on a later card only,

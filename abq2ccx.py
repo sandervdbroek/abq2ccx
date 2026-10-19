@@ -3827,7 +3827,8 @@ class Converter:
         self._bc_subsets: Dict[Tuple[int, ...], str] = {}  # remaining nodes of a split line -> set
         # id(*BOUNDARY) -> reference node -> DOF -> value: rigid-body member BCs moved there
         self._bc_add: Dict[int, "OrderedDict[int, Dict[int, float]]"] = {}
-        self._rb_moved: List[Tuple[int, int, int, frozenset]] = []  # (node, dof, ref, why inexact)
+        # (node, dof, ref, why inexact, the body is linear *EQUATIONs)
+        self._rb_moved: List[Tuple[int, int, int, frozenset, bool]] = []
         # (kind, emit, node, dof, ref, why) left in place; why: '' or, on a *RIGID BODY,
         # 'differ', 'conflict', 'kind' or 'approx:<reasons>' (see _plan_rigid_body_move)
         self._coupled_clash: List[Tuple[str, str, int, int, int, str]] = []
@@ -3910,10 +3911,10 @@ class Converter:
         self._conn_bc_dofs: set = set()            # (node, DOF) with a BC in any step
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
         self._conn_rot: set = set()                # rotation nodes made for connector rotations
-        self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_mpcs)
-        # a *DYNAMIC step and no NLGEOM: rigid constraints become linear *EQUATIONs (_plan_mpcs,
-        # _rigid_body_lines)
-        self._lin_dyn = False
+        self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_deck_facts)
+        # a *DYNAMIC step and no NLGEOM: rigid constraints become linear *EQUATIONs
+        # (_plan_deck_facts, _rigid_body_lines); a linear *DYNAMIC step before an NLGEOM one
+        self._linear_rigid = self._dyn_before_nl = False
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
         # such card, what each step appends for the ones it keeps, and the amplitudes only
@@ -7968,7 +7969,7 @@ class Converter:
                 if not held:
                     self._warn_rot_frame(n)
             self.report.note("Rotational BCs on a *RIGID BODY reference point moved to DOFs 1-3 "
-                             "of its ROT NODE (ccx ignores DOFs 4-6 of the REF NODE).", once=True)
+                             "of its ROT NODE (" + self._rot_node_why() + ").", once=True)
             return out
         if not self._no_rot:
             return None
@@ -9180,7 +9181,7 @@ class Converter:
             out.extend(got if isinstance(got, list) else self._rot_refused(b, n, got))
         if moved:
             self.report.note("Moments on a *RIGID BODY reference point moved to DOFs 1-3 of its "
-                             "ROT NODE (ccx ignores DOFs 4-6 of the REF NODE).", once=True)
+                             "ROT NODE (" + self._rot_node_why() + ").", once=True)
         return out
 
     def handle_dload(self, b: Block) -> List[str]:
@@ -12183,17 +12184,19 @@ class Converter:
         ref, rot, members = body["ref"], body["rot"], body["members"]
         self._synth_counter += 1
         name = f"ABQ2CCX_MPCB{self._synth_counter}"
-        out = self._rigid_body_lines([f"*NSET, NSET={name}"] + reflow([str(n) for n in members]) +
-                                     [f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}"],
-                                     ref, rot, members)
+        out, eq = self._rigid_body_lines([f"*NSET, NSET={name}"] + reflow([str(n) for n in members]) +
+                                         [f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}"],
+                                         ref, rot, members)
         if (ref in self._knots and ref in self._rot_nodes) or body.get("follow"):
             out += self._rot_node_follows(rot, ref)
         out += self._rotation_ties(members, rot, -3)
-        self.report.note("*MPC BEAM -> *RIGID BODY: the lines that share an independent node "
-                         "(or chain through one another) form one rigid body about it; the "
-                         "dependent nodes follow it in displacement and rotation, exact at any "
-                         "rotation (BCs and moments on the independent node's DOFs 4-6 act on "
-                         "the body's rotation).", once=True)
+        self.report.note("*MPC BEAM -> " + ("the linear *EQUATIONs of a rigid body" if eq else "*RIGID BODY")
+                         + ": the lines that share an independent node (or chain through one "
+                         "another) form one rigid body about it; the dependent nodes follow it in "
+                         "displacement and rotation, " + ("linearized as in Abaqus here" if eq else
+                                                          "exact at any rotation")
+                         + " (BCs and moments on the independent node's DOFs 4-6 act on the body's "
+                         "rotation).", once=True)
         return out
 
     def handle_coupling(self, b: Block) -> List[str]:
@@ -12874,11 +12877,16 @@ class Converter:
             pre = self._qmem_rigid_elset(keep, [v for k, v in b.params.items() if v and
                                                 k.upper().replace(" ", "") in ("PINNSET", "TIENSET", "NSET")])
         tie, pin = self._rigid_body_members(b)
+        # written as linear *EQUATIONs (_rigid_body_lines), as the planners saw it
+        ref0 = self._ref_node(b)
+        rot0 = self._first_node(b.param("ROT NODE") or b.param("ROTNODE") or "")
+        eq = self._rigid_as_eq(ref0, self._rb_rot_synth.get(ref0) if rot0 is None else rot0, tie + pin)
         if any(k.upper().replace(" ", "") in ("PINNSET", "TIENSET") for k in b.params):
-            self.report.note("*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
-                             "rigidly with REF NODE); the rotations of TIE (and ELSET) shell/beam "
-                             "nodes are tied to the body, those of PIN nodes stay free, as in "
-                             "Abaqus.", once=True)
+            self.report.note(("*RIGID BODY, PIN/TIE NSET: the" if eq else
+                              "*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
+                              "rigidly with REF NODE); the") + " rotations of TIE (and ELSET) "
+                             "shell/beam nodes are tied to the body, those of PIN nodes stay free, "
+                             "as in Abaqus.", once=True)
         # ccx requires REF NODE / ROT NODE to be node NUMBERS; CAE writes reference-point
         # set names (_PickedSet47) — resolve single-node sets, exactly as for *COUPLING.
         for key in ("REF NODE", "ROT NODE"):
@@ -12901,11 +12909,14 @@ class Converter:
         own = ref in self._knots and ref in self._rot_nodes    # a shell/beam reference node
         if ref in self._rb_rot_synth and not keep.get("ROT NODE"):
             keep["ROT NODE"] = str(self._rb_rot_synth[ref])
-            self.report.note("*RIGID BODY: explicit ROT NODE added — ccx carries the body's "
-                             "rotations on its DOFs 1-3 and ignores DOFs 4-6 of the REF NODE, so "
-                             + ("it is tied to the rotations of the shell/beam reference node."
-                                if own else "rotational BCs and moments on the reference point "
-                                            "are moved there."), once=True)
+            if own or not eq:
+                self.report.note("*RIGID BODY: explicit ROT NODE added — " +
+                                 ("the linear equations carry the body's rotation on its DOFs 1-3, "
+                                  "so " if eq else "ccx carries the body's rotations on its DOFs 1-3 "
+                                                   "and ignores DOFs 4-6 of the REF NODE, so ")
+                                 + ("it is tied to the rotations of the shell/beam reference node."
+                                    if own else "rotational BCs and moments on the reference point "
+                                                "are moved there."), once=True)
         rot = self._first_node(keep.get("ROT NODE") or "")
         ties: List[str] = []
         if ref is not None and rot is not None:
@@ -12913,7 +12924,7 @@ class Converter:
                 ties += self._rot_node_follows(rot, ref)
             ties += self._rotation_ties([n for n in tie if n != ref], rot, -3)
         card = union + pre + [emit_keyword("RIGID BODY", keep)] + list(b.data)
-        return self._rigid_body_lines(card, ref, rot, tie + pin) + ties
+        return self._rigid_body_lines(card, ref, rot, tie + pin)[0] + ties
 
     def _qmem_rigid_elset(self, keep: "OrderedDict[str, Optional[str]]", sets: Sequence[str]) -> List[str]:
         """A *RIGID BODY ELSET with quadratic membranes written as solids -> an NSET of its
@@ -13138,14 +13149,15 @@ class Converter:
             return []
         self._synth_counter += 1
         name = f"ABQ2CCX_RB{self._synth_counter}"
-        out = self._rigid_body_lines([f"*NSET, NSET={name}"] + reflow([str(n) for n in members]) +
-                                     [f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}"],
-                                     ref, rot, members)
+        out, eq = self._rigid_body_lines([f"*NSET, NSET={name}"] + reflow([str(n) for n in members]) +
+                                         [f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}"],
+                                         ref, rot, members)
         if plan["kind"] == "rb":
             out += self._rot_node_follows(rot, ref)
-            self.report.note("*COUPLING + *KINEMATIC with a shell/beam REF NODE -> *RIGID BODY on "
-                             "the coupled nodes (the reference node itself left out), with a ROT "
-                             "NODE tied to the reference node's rotations: as a ccx kinematic "
+            self.report.note("*COUPLING + *KINEMATIC with a shell/beam REF NODE -> "
+                             + ("the linear *EQUATIONs of a rigid body" if eq else "*RIGID BODY")
+                             + " on the coupled nodes (the reference node itself left out), with a "
+                             "ROT NODE tied to the reference node's rotations: as a ccx kinematic "
                              "coupling the node would carry two unrelated rotations.", once=True)
         out += self._rotation_ties(members, rot, -3, sorted(plan["dofs"]))
         return out
@@ -14009,9 +14021,30 @@ class Converter:
         """Facts about the whole deck that planners and handlers read: whether a step runs
         explicit dynamics, whether one is not heat transfer alone (a deck without steps
         counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
-        the *TIE names and the linear perturbation steps.  No planner adds or replaces such
-        cards."""
+        the *TIE names, the linear perturbation steps and which steps run NLGEOM.  No planner
+        adds or replaces such cards.
+
+        Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
+        linear *EQUATIONs (``_linear_rigid``) in a deck with a *DYNAMIC step and no NLGEOM: see
+        _rigid_body_lines.  ``_dyn_before_nl``: a geometrically linear implicit *DYNAMIC step
+        runs before the first NLGEOM step, where ccx turns the RIGID MPCs those decks keep."""
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        steps: List[bool] = []                   # per *STEP: it runs NLGEOM
+        dyn: List[bool] = []                     # ... it is an implicit *DYNAMIC step
+        for b in blocks:
+            if b.keyword == "STEP":
+                nl = b.param("NLGEOM")
+                steps.append("NLGEOM" in b.params and (nl or "YES").strip().upper() != "NO")
+                dyn.append(False)
+            elif b.keyword == "DYNAMIC" and b.has("EXPLICIT") and steps:
+                steps[-1] = True               # the converter runs explicit steps with NLGEOM
+            elif b.keyword == "DYNAMIC" and steps:
+                dyn[-1] = True
+        # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
+        self._nl_any, self._nl_all = any(steps), bool(steps) and steps[0]
+        self._linear_rigid = not self._nl_any and any(b.keyword == "DYNAMIC" for b in blocks)
+        first_nl = steps.index(True) if self._nl_any else 0
+        self._dyn_before_nl = any(d for d in dyn[:first_nl])
         self._explicit_deck = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         self._mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
         self._kinematic_ids = {id(b) for b, c in zip(blocks, blocks[1:])
@@ -18100,6 +18133,15 @@ class Converter:
         self._plan_rot_axes(self._rb_rot)              # the connector rows use them
         self._plan_connector_rows(blocks)
         self._plan_coupled_bcs(blocks)
+        # ccx's RIGID MPCs in a geometrically linear *DYNAMIC step: a *RIGID BODY kept there is
+        # warned where it is written (_rigid_body_lines)
+        emits = {c["emit"] for c in self._rigid_constraints(blocks)} \
+            if self._dyn_before_nl or self._linear_rigid else set()
+        if self._dyn_before_nl and emits - {"eq"}:
+            self._warn_finite_rigid()
+        elif self._linear_rigid and "kin" in emits:
+            self._warn_finite_rigid("a kinematic coupling of shell, beam or 2-D nodes has a line "
+                                    "without linear equations (a *TRANSFORM, or rotations only)")
         self._plan_velocity_bcs(blocks)       # after _plan_coupled_bcs: reads its card rewrites
         if self._explicit_deck and any(
                 any(m in self._plane_only for m in members)
@@ -18391,16 +18433,6 @@ class Converter:
         root: exact at any rotation, where linear *EQUATION ties hold for small ones only."""
         self._mpc_plan = {}
         self._mpc_bodies = {}
-        steps: List[bool] = []
-        for b in blocks:
-            if b.keyword == "STEP":
-                nl = b.param("NLGEOM")
-                steps.append("NLGEOM" in b.params and (nl or "YES").strip().upper() != "NO")
-            elif b.keyword == "DYNAMIC" and b.has("EXPLICIT") and steps:
-                steps[-1] = True               # the converter runs explicit steps with NLGEOM
-        # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
-        self._nl_any, self._nl_all = any(steps), bool(steps) and steps[0]
-        self._lin_dyn = not self._nl_any and any(b.keyword == "DYNAMIC" for b in blocks)
         # a TIE also ties the temperature (DOF 11) where a step has one; a heat-transfer-only
         # deck has no displacements to tie
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
@@ -18928,7 +18960,7 @@ class Converter:
             if dynamic:
                 plain = bool(members) and (
                     not any(n in structural or n in self._plane_only for n in members) or
-                    (self._lin_dyn and all(self._kin_form(ref, ns, ds) == "eq" for ns, ds in groups)))
+                    (self._linear_rigid and all(self._kin_form(ref, ns, ds) == "eq" for ns, ds in groups)))
                 dyn.setdefault(ref, []).append((id(b), plain, plain and any(
                     self._kin_form(ref, ns, ds) in ("rb", "eq") for ns, ds in groups)))
             if legacy or ref not in self._transformed or ref in self._rb_rot or \
@@ -19524,13 +19556,33 @@ class Converter:
                 structural.update(conn)
         self._coupling_plan = {}
         knots: List[int] = []
+
+        def needed(ref: Optional[int], groups, eq: Callable[[Sequence[int], set], bool]) -> List[int]:
+            # the nodes of (members, DOFs) groups that need a knot: all shell/beam/membrane ones
+            # under ccx's RIGID MPCs; with linear *EQUATIONs (``eq``: _rigid_body_lines,
+            # _kin_form) only those whose rotations are tied, and a reference node whose
+            # rotations the ROT NODE follows (_rot_node_follows)
+            out = [ref] if ref in self._rot_nodes else []
+            for ns, ds in groups:
+                if not eq(ns, ds):
+                    out += [n for n in [ref] + list(ns) if n in structural]
+                elif ds & {4, 5, 6}:
+                    out += [n for n in ns if n in self._rot_nodes]
+            return [n for n in out if n is not None]
+
+        def kin_eq(ref: int):
+            return lambda ns, ds: self._kin_form(ref, [n for n in ns if n != ref], ds) == "eq"
         for i, b in enumerate(blocks):
             ref = self._ref_node(b)
             if b.keyword == "RIGID BODY":
                 tie, pin = self._rigid_body_members(b)
                 if ref is None or not any(n in structural for n in tie + pin + [ref]):
                     continue
-                knots += [n for n in [ref] + tie + pin if n in structural]
+                rot = self._first_node(b.param("ROT NODE") or b.param("ROTNODE") or "")
+                eq = self._rigid_as_eq(ref, self._rb_rot_synth.get(ref) if rot is None else rot,
+                                       tie + pin)
+                knots += needed(ref, [(tie, {1, 2, 3, 4, 5, 6}), (pin, {1, 2, 3})],
+                                lambda ns, ds: eq)
                 if ref in self._rot_nodes:
                     # the reference node's own rotation drives the body (its ROT NODE is tied
                     # to it), so BCs and moments on DOFs 4-6 stay on the node
@@ -19542,7 +19594,8 @@ class Converter:
                 members = self._surface_member_nodes(b.param("SURFACE") or "")
                 dofs = self._kinematic_dofs(nxt)
                 if id(b) in self._kin_rb:          # a *RIGID BODY (_plan_kinematic_rot_nodes)
-                    knots += [n for n in members if n in structural]
+                    knots += needed(None, [([n for n in members if n != ref], dofs)],
+                                    kin_eq(ref) if id(b) in self._kin_dyn else lambda ns, ds: False)
                     self._coupling_plan[id(b)] = {"kind": "kdyn" if id(b) in self._kin_dyn else "rbk",
                                                   "ref": ref, "dofs": dofs,
                                                   "rot": self._kin_rb[id(b)],
@@ -19557,15 +19610,18 @@ class Converter:
                 elif {1, 2, 3} <= dofs and ref in self._rot_nodes:
                     rot = max(self.geom.nodes) + 1
                     self.geom.add_node(rot, self.geom.nodes[ref])
-                    knots += [ref] + [n for n in members if n in structural]
+                    eq = self._rigid_as_eq(ref, rot, members)
+                    knots += needed(ref, [([n for n in members if n != ref], dofs)],
+                                    lambda ns, ds: eq)
                     self._coupling_plan[id(b)] = {"kind": "rb", "ref": ref, "rot": rot, "dofs": dofs,
                                                   "members": [n for n in members if n != ref]}
                 else:
                     self._coupling_plan[id(b)] = {"kind": "unsupported"}
             elif b.keyword == "KINEMATIC COUPLING":
                 if id(b) in self._kin_rb:          # (_plan_kinematic_rot_nodes)
-                    knots += [n for ns, _ in self._legacy_kinematic_groups(b) for n in ns
-                              if n in structural and n != ref]
+                    knots += needed(None, [([n for n in ns if n != ref], ds)
+                                           for ns, ds in self._legacy_kinematic_groups(b)],
+                                    kin_eq(ref) if id(b) in self._kin_dyn else lambda ns, ds: False)
                     self._coupling_plan[id(b)] = {"kind": "kdyn", "ref": ref,
                                                   "rot": self._kin_rb[id(b)]}
                     continue
@@ -19588,7 +19644,8 @@ class Converter:
         for bodies in self._mpc_bodies.values():
             for body in bodies:
                 ref, members = body["ref"], body["members"]
-                knots += [n for n in [ref] + members if n in structural]
+                eq = self._rigid_as_eq(ref, body["rot"], members)
+                knots += needed(ref, [(members, {1, 2, 3, 4, 5, 6})], lambda ns, ds: eq)
                 if ref in self._rot_nodes and any(n in structural for n in [ref] + members):
                     self._rb_rot.pop(ref, None)
                 elif ref in kin:
@@ -19815,11 +19872,12 @@ class Converter:
         body makes it dependent).  An imposed BC on a tied rotation stays, and
         _settle_dependents drops the tie (the BC governs it).  A *RIGID BODY's other member
         BCs go where Abaqus/Standard puts them, onto the reference node
-        (_plan_rigid_body_move).  The rest is warned (_warn_coupled_clashes), or with
-        --approximate dropped where Abaqus drops it: a kinematic coupling and an MPC eliminate
-        the constrained DOFs of their nodes, so Abaqus/Standard does not apply a BC there.
-        Rigid constraints: *RIGID BODY, kinematic couplings and the rigid bodies of *MPC BEAM
-        lines (_plan_mpcs)."""
+        (_plan_rigid_body_move).  The rest is warned (_warn_coupled_clashes), or dropped where
+        Abaqus drops it — a kinematic coupling and an MPC eliminate the constrained DOFs of
+        their nodes, so Abaqus/Standard does not apply a BC there: by default where the
+        constraint is written as linear *EQUATIONs (emit 'eq', _rigid_constraints; ccx would
+        reorder them and keep the BC), else with --approximate.  Rigid constraints: *RIGID
+        BODY, kinematic couplings and the rigid bodies of *MPC BEAM lines (_plan_mpcs)."""
         cons = self._rigid_constraints(blocks)
         if not cons:
             return
@@ -19842,12 +19900,13 @@ class Converter:
         for c in cons:
             if c["kind"] == "rb":
                 moved |= self._plan_rigid_body_move(c, cards, verdict, owner)
-        implied, planar3, approx = [], 0, []
+        implied, planar3, approx, abaqus = [], 0, [], []
+        eq_only = True                   # every implied BC is on a constraint of linear equations
         for (m, d), ok in verdict.items():
             if (m, d) in moved:
                 continue
             c = owner[(m, d)]
-            loose = not ok and self._approx and c["kind"] != "rb"
+            loose = not ok and c["kind"] != "rb" and (self._approx or c["emit"] == "eq")
             if not ok and not loose:
                 # a *RIGID BODY's tied rotation that _plan_rigid_body_move left: _settle_dependents
                 # reorders the tie so the body follows the member's BC, as Abaqus moves it to
@@ -19863,11 +19922,13 @@ class Converter:
             for card in cards[(m, d)]:
                 self._bc_drop.setdefault(card, set()).add((m, d))
             if loose:
-                approx.append((m, d))
-            elif d == 3 and c["planar"]:
-                planar3 += 1
+                (abaqus if c["emit"] == "eq" else approx).append((m, d))
             else:
-                implied.append((m, d))
+                if d == 3 and c["planar"]:
+                    planar3 += 1
+                else:
+                    implied.append((m, d))
+                eq_only = eq_only and c["emit"] == "eq"
         for b in blocks:
             if b.keyword == "BOUNDARY" and id(b) in self._bc_drop:
                 self._bc_lines[id(b)] = self._bc_lines_without(b, self._bc_drop[id(b)],
@@ -19878,10 +19939,11 @@ class Converter:
             self.report.note(f"*BOUNDARY taken off {len(implied) + planar3} DOF(s) that a rigid "
                              f"constraint (*RIGID BODY, kinematic coupling, *MPC BEAM) makes follow "
                              f"its reference node"
-                             f"{eg}: ccx stops on a DOF that is both SPC'd and dependent in an MPC "
-                             f"('*ERROR in cascade ... dependent side of a MPC and a SPC'), and the "
-                             f"reference node's own BCs impose these anyway — the same value on the "
-                             f"DOF and no rotation about the other two axes"
+                             + (f"{eg}: they are redundant, the" if eq_only else
+                                f"{eg}: ccx stops on a DOF that is both SPC'd and dependent in an MPC "
+                                "('*ERROR in cascade ... dependent side of a MPC and a SPC'), and the")
+                             + " reference node's own BCs impose these anyway — the same value on the "
+                             "DOF and no rotation about the other two axes"
                              + (" (and DOF 3 of 2-D nodes, which has no meaning there)"
                                 if planar3 else "") + ". Exact.", once=True)
         if approx:
@@ -19894,15 +19956,30 @@ class Converter:
                              f"nodes and does not apply a BC there (it warns that the BC 'may not "
                              f"be applied'). Check the model: the BC region probably overlaps the "
                              f"constraint by mistake.", once=True)
+        if abaqus:
+            nodes = {m for m, _ in abaqus}
+            self.report.warn(f"*BOUNDARY taken off {len(abaqus)} DOF(s) of {len(nodes)} node(s) that "
+                             f"a kinematic coupling or *MPC BEAM, written as linear *EQUATIONs here, "
+                             f"also constrains (e.g. node {abaqus[0][0]} DOF {abaqus[0][1]}), although "
+                             f"the reference node's BCs do not impose them: Abaqus/Standard "
+                             f"eliminates the constrained DOFs at those nodes and does not apply a BC "
+                             f"there (it warns that the BC 'may not be applied'), so the nodes follow "
+                             f"the constraint (ccx would keep the BC and move the constraint with it). "
+                             f"Check the model: the BC region probably overlaps the constraint by "
+                             f"mistake.", once=True)
 
     def _rigid_constraints(self, blocks: List[Block]) -> List[dict]:
         """The rigid constraints as the converter emits them: per constraint its Abaqus kind
         ('rb' = *RIGID BODY, 'kin' = a kinematic coupling, 'mpc' = the rigid body of *MPC BEAM
         lines), how ccx gets it ('emit': 'rb' = a *RIGID BODY, 'kin' = a *KINEMATIC
-        coupling), reference node, explicit ROT NODE (a ccx-style deck), whether all members
-        are 2-D nodes, and per member the translations ccx makes dependent ('trans') and the
-        rotations the converter ties ('rots')."""
+        coupling, 'eq' = linear *EQUATIONs: _rigid_body_lines, _kin_form; a coupling with lines
+        of both gets one entry each), reference node, explicit ROT NODE (a ccx-style deck),
+        whether all members are 2-D nodes, and per member the translations ccx makes dependent
+        ('trans') and the rotations the converter ties ('rots')."""
         out: List[dict] = []
+
+        def body_emit(ref: int, rot: Optional[int], members) -> str:
+            return "eq" if self._rigid_as_eq(ref, rot, members) else "rb"
         for i, b in enumerate(blocks):
             if b.keyword not in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING"):
                 continue
@@ -19911,47 +19988,56 @@ class Converter:
                 continue
             rot = None
             lines: List[Tuple[List[int], set]] = []      # (nodes, coupled Abaqus DOFs)
+            plan = (self._coupling_plan.get(id(b)) or {}).get("kind")
             if b.keyword == "RIGID BODY":
                 kind, tied, rb = "rb", True, True
                 rot = self._first_node(b.param("ROT NODE") or b.param("ROTNODE") or "")
                 tie, pin = self._rigid_body_members(b)
                 lines = [(tie, set(range(1, 7))), (pin, {1, 2, 3})]
+                emit = body_emit(ref, rot if rot is not None else self._rb_rot_synth.get(ref),
+                                 tie + pin)
             elif b.keyword == "COUPLING":
                 nxt = blocks[i + 1] if i + 1 < len(blocks) else None
                 if nxt is None or nxt.keyword != "KINEMATIC":
                     continue
-                plan = (self._coupling_plan.get(id(b)) or {}).get("kind")
                 kind, tied, rb = "kin", plan in ("kin", "rb", "rbk", "kdyn"), plan in ("rb", "rbk")
                 lines = [(self._surface_member_nodes(b.param("SURFACE") or ""),
                           self._kinematic_dofs(nxt))]
+                emit = body_emit(ref, self._coupling_plan[id(b)]["rot"], lines[0][0]) if rb \
+                    else "kin"
             else:
-                kind, rb = "kin", False
+                kind, rb, emit = "kin", False, "kin"
                 lines = self._legacy_kinematic_groups(b)
                 tied = any(ds & {1, 2, 3} for _, ds in lines)
-            if id(b) in self._kin_dyn:               # the lines it leaves out constrain nothing
-                lines = [(ns, ds) for ns, ds in lines if self._kin_form(ref, ns, ds) in ("rb", "eq")]
-            members = {n for ns, _ in lines for n in ns} - {ref, rot}
-            if not members:
-                continue
-            planar = all(n in self._plane_only for n in members)
-            if planar and kind == "kin":
-                self._planar_kin.add(id(b))
-            top = 2 if planar and not rb else 3
-            tie_ok = tied and self._tie_rotations and ref not in self._transformed and \
-                rot not in self._transformed
-            trans: Dict[int, set] = {}
-            rots: Dict[int, set] = {}
-            for ns, ds in lines:
-                for n in ns:
-                    if n not in members:
-                        continue
-                    trans.setdefault(n, set()).update({1, 2, 3} if rb else
-                                                      {d for d in ds if d <= top})
-                    if tie_ok and n in self._knots and n in self._rot_nodes and \
-                            n not in self._transformed:
-                        rots.setdefault(n, set()).update(ds & {4, 5, 6})
-            out.append(dict(kind=kind, emit="rb" if rb else "kin", ref=ref, rot=rot,
-                            planar=planar, trans=trans, rots=rots))
+            # a coupling written without ccx's *KINEMATIC (_kin_dynamic_cards): each line as
+            # _kin_form says, the ones it leaves out constraining nothing
+            sets = [(emit, lines)]
+            if id(b) in self._kin_dyn:
+                forms = [self._kin_form(ref, ns, ds) for ns, ds in lines]
+                sets = [(e, [ln for ln, f in zip(lines, forms) if f == e]) for e in ("eq", "rb")]
+            for emit, lines in sets:
+                members = {n for ns, _ in lines for n in ns} - {ref, rot}
+                if not members:
+                    continue
+                planar = all(n in self._plane_only for n in members)
+                if planar and kind == "kin":
+                    self._planar_kin.add(id(b))
+                top = 2 if planar and not rb else 3
+                tie_ok = tied and self._tie_rotations and ref not in self._transformed and \
+                    rot not in self._transformed
+                trans: Dict[int, set] = {}
+                rots: Dict[int, set] = {}
+                for ns, ds in lines:
+                    for n in ns:
+                        if n not in members:
+                            continue
+                        trans.setdefault(n, set()).update({1, 2, 3} if rb else
+                                                          {d for d in ds if d <= top})
+                        if tie_ok and n in self._knots and n in self._rot_nodes and \
+                                n not in self._transformed:
+                            rots.setdefault(n, set()).update(ds & {4, 5, 6})
+                out.append(dict(kind=kind, emit=emit, ref=ref, rot=rot,
+                                planar=planar, trans=trans, rots=rots))
         # the rigid bodies of *MPC BEAM lines, emitted as *RIGID BODY with a ROT NODE: the
         # dependent nodes follow the independent one in displacement and rotation
         for bodies in self._mpc_bodies.values():
@@ -19961,7 +20047,8 @@ class Converter:
                 if not members:
                     continue
                 tie_ok = self._tie_rotations and ref not in self._transformed
-                out.append(dict(kind="mpc", emit="rb", ref=ref, rot=None,
+                out.append(dict(kind="mpc", emit=body_emit(ref, body["rot"], body["members"]),
+                                ref=ref, rot=None,
                                 planar=all(n in self._plane_only for n in members),
                                 trans={n: {1, 2, 3} for n in members},
                                 rots={n: {4, 5, 6} for n in members
@@ -20235,7 +20322,7 @@ class Converter:
                     self._bc_drop.setdefault(card, set()).add((m, d))
                 taken.add((m, d))
                 if not verdict[(m, d)]:
-                    self._rb_moved.append((m, d, c["ref"], frozenset(inexact)))
+                    self._rb_moved.append((m, d, c["ref"], frozenset(inexact), c["emit"] == "eq"))
         return taken
 
     def _rb_step_outcome(self, c: dict, d: int, s: int) -> Tuple[str, set, Dict[int, float]]:
@@ -20284,17 +20371,19 @@ class Converter:
         exact = [x for x in self._rb_moved if not x[3]]
         loose = [x for x in self._rb_moved if x[3]]
         if exact:
-            m, d, ref, _ = exact[0]
+            m, d, ref, _, _ = exact[0]
             self.report.note(f"*BOUNDARY on {len(exact)} DOF(s) of {len({x[0] for x in exact})} "
                              f"*RIGID BODY node(s) moved to the reference node, translations with zero "
                              f"rotations about the other axes (e.g. node {m} DOF {d} -> reference node "
-                             f"{ref}), as Abaqus/Standard does: ccx stops on a BC on a node the body drives "
-                             f"('*ERROR in cascade ... dependent side of a MPC and a SPC'), and the "
-                             f"BC'd nodes hold that DOF of the body and its rotations about the "
-                             f"other axes anyway (identical BCs, nodes not on one line seen along "
-                             f"the DOF, body not turned before the step). Exact.", once=True)
+                             f"{ref}), as Abaqus/Standard does: "
+                             + ("" if all(x[4] for x in exact) else
+                                "ccx stops on a BC on a node the body drives ('*ERROR in cascade ... "
+                                "dependent side of a MPC and a SPC'), and ")
+                             + "the BC'd nodes hold that DOF of the body and its rotations about the "
+                             "other axes anyway (identical BCs, nodes not on one line seen along "
+                             "the DOF, body not turned before the step). Exact.", once=True)
         if loose:
-            m, d, ref, _ = loose[0]
+            m, d, ref, _, _ = loose[0]
             reasons = set().union(*[x[3] for x in loose])
             self.report.warn(f"[APPROX] *BOUNDARY on {len(loose)} DOF(s) of "
                              f"{len({x[0] for x in loose})} *RIGID BODY node(s) moved to the "
@@ -20441,36 +20530,94 @@ class Converter:
         BODY it is in ccx (the same RIGID MPCs; exact, probed); under NLGEOM a coupling of
         some translations has neither ('drop'; --approximate: 'eq', linear equations being
         exact for small rotations only: 7 % off at 0.36 rad), nor has a coupling of no
-        translation ('none').  Linear equations need nodes without a *TRANSFORM."""
+        translation ('none').  Linear equations need terms ccx reads (_rigid_eq_refused)."""
         trans = dofs & {1, 2, 3}
         if not trans:
             return "none"
-        local = any(n in self._transformed for n in [ref] + list(members))
-        if not self._nl_any and not local:
+        local = self._rigid_eq_refused(ref, members, dofs) is not None
+        if self._linear_rigid and not local:
             return "eq"
         if trans == {1, 2, 3}:
             return "rb"
         return "eq" if self._approx and not local else "drop"
+
+    def _rigid_eq_refused(self, ref: int, members: Sequence[int], dofs: Optional[set] = None,
+                          rot: Optional[int] = None) -> Optional[str]:
+        """Why the linear *EQUATIONs (_kin_rows) of a rigid constraint of ``members`` on ``ref``
+        (coupled DOFs ``dofs``, None: all; rotation on ROT NODE ``rot``) cannot be written in
+        the DOFs ccx reads, or None.  ccx reads the terms of a node with a *TRANSFORM in its local
+        axes: a member's rows go along those axes, one local term each, where every translation
+        is coupled (a coupling's DOFs are global ones; a 2-D member's local 3-axis must be Z).
+        A transformed reference node (or ROT NODE, which then has its axes) would give one
+        equation several local terms of one node, which ccx 2.23 mis-assembles."""
+        if ref in self._transformed or rot in self._transformed or rot in self._rot_axes:
+            return "its reference node has a *TRANSFORM"
+        for m in members:
+            if m not in self._transformed:
+                continue
+            ax = self._local_axes(m)
+            plane = m in self._plane_only
+            if isinstance(ax, str):
+                return "the local axes of a node with a *TRANSFORM are undefined"
+            if dofs is not None and not ({1, 2} if plane else {1, 2, 3}) <= dofs:
+                return "it couples some translations of a node with a *TRANSFORM"
+            if plane and abs(ax[2][2]) < 1.0 - 1e-9:
+                return "the *TRANSFORM of a 2-D node turns its local 3-axis out of Z"
+        return None
+
+    def _rigid_as_eq(self, ref: Optional[int], rot: Optional[int], members: Sequence[int]) -> bool:
+        """Whether _rigid_body_lines writes the rigid body of ``members`` on ``ref`` with ROT
+        NODE ``rot`` as linear *EQUATIONs (the planners' view of it)."""
+        return self._linear_rigid and ref in self.geom.nodes and rot in self.geom.nodes and \
+            self._rigid_eq_refused(ref, [n for n in members if n in self.geom.nodes and
+                                         n not in (ref, rot)], rot=rot) is None
 
     def _kin_rows(self, ref: int, rot: int, members: Sequence[int],
                   dofs: set) -> List[List[Tuple[int, int, float]]]:
         """The linear *EQUATIONs of a kinematic coupling (_kin_form 'eq') or rigid body
         (_rigid_body_lines): for each member m and coupled translation j, u_j(m) - u_j(ref) -
         (theta x d)_j = 0, d = x_m - x_ref, theta the rotation on DOFs 1-3 of ``rot`` — ccx's
-        RIGID MPC at the initial geometry.  A 2-D member has no DOF 3 (ccx holds it itself)."""
+        RIGID MPC at the initial geometry.  A 2-D member has no DOF 3 (ccx holds it itself).
+        A member with a *TRANSFORM (_rigid_eq_refused) has its rows along its local axes e,
+        e . u(m) - e . u(ref) - (d x e) . theta = 0, where ccx reads its one local term (as
+        _tie_rows), in an order in which ccx finds a dependent for each."""
         x0 = self.geom.nodes[ref]
         rows: List[List[Tuple[int, int, float]]] = []
         for m in members:
             d = vsub(self.geom.nodes[m], x0)
             tol = 1e-12 * max(vnorm(d), 1.0)
-            for j in sorted(dofs & ({1, 2} if m in self._plane_only else {1, 2, 3})):
+            plane = m in self._plane_only
+            ax = self._mpc_frame(m)
+            if isinstance(ax, tuple):
+                own = []
+                for i in range(2 if plane else 3):
+                    e, c = ax[i], vcross(d, ax[i])
+                    own.append([(m, i + 1, 1.0)] +
+                               [(ref, k + 1, -e[k]) for k in range(3) if abs(e[k]) > 1e-12] +
+                               [(rot, k + 1, -c[k]) for k in range(3) if abs(c[k]) > tol])
+                rows += self._ccx_dependent_order(own, ax)
+                continue
+            for j in sorted(dofs & ({1, 2} if plane else {1, 2, 3})):
                 c = vcross(d, tuple(float(k == j - 1) for k in range(3)))   # (theta x d)_j = c . theta
                 rows.append([(m, j, 1.0), (ref, j, -1.0)] +
                             [(rot, k + 1, -c[k]) for k in range(3) if abs(c[k]) > tol])
         return rows
 
+    @staticmethod
+    def _linear_rigid_lines(ref: int, rot: int,
+                            rows: Sequence[Sequence[Tuple[int, int, float]]]) -> List[str]:
+        """The one *EQUATION card of a rigid constraint's linear equations (_kin_rows; a card
+        per equation would make a large body's output four times as long as its *RIGID
+        BODY), under a comment that names its ROT NODE: its DOFs 1-3 are rotations
+        (_deck_steps reads it)."""
+        if not rows:
+            return []
+        return [f"** abq2ccx: linear rigid constraint, REF NODE={ref}, ROT NODE={rot} (its DOFs "
+                f"1-3: the rotation)", "*EQUATION"] + \
+            [x for rw in rows for x in equation_rows(rw, "{:.12g}".format)]
+
     def _rigid_body_lines(self, card: List[str], ref: Optional[int], rot: Optional[int],
-                          members: Sequence[int]) -> List[str]:
+                          members: Sequence[int]) -> Tuple[List[str], bool]:
         """A ccx *RIGID BODY (``card``: it and the *NSET it names) of ``members`` on ``ref``
         with ROT NODE ``rot`` — or, in a deck with a *DYNAMIC step and no NLGEOM (explicit
         steps run with it), the linear *EQUATIONs u(m) = u(ref) + theta x (x_m - x_ref) on
@@ -20479,20 +20626,40 @@ class Converter:
         analysis ... the rigid body constraints are linearized'), but ccx turns their RIGID
         MPCs with the finite rotation in a *DYNAMIC step (probed: a solid cantilever under a
         tip moment 0.5 % stiffer at 0.01 rad, 9 % at 0.1 rad, the stress at the body 38 % off;
-        linear equations exact).  ccx reads the *EQUATION terms of a node with a *TRANSFORM
-        in its local axes, so such a body keeps the card."""
+        linear equations exact).  A body whose equations ccx would not read right keeps the
+        card (_rigid_eq_refused), warned.  Also returns whether the equations were written."""
         members = [n for n in dedup(members) if n not in (ref, rot) and n in self.geom.nodes]
-        if not self._lin_dyn or ref not in self.geom.nodes or rot not in self.geom.nodes:
-            return card
-        if any(n in self._transformed for n in [ref, rot] + members):
-            self.report.note("Rigid body on nodes with a *TRANSFORM in a deck with a *DYNAMIC step "
-                             "and no NLGEOM: written as ccx's *RIGID BODY, whose RIGID MPCs ccx "
-                             "turns with the finite rotation in a *DYNAMIC step (Abaqus linearizes "
-                             "them: a 0.1 rad rotation 9 % off, probed); linear *EQUATIONs would "
-                             "read the transformed nodes' terms in their local axes.", once=True)
-            return card
+        if not self._linear_rigid or ref not in self.geom.nodes or rot not in self.geom.nodes:
+            return card, False
+        why = self._rigid_eq_refused(ref, members, rot=rot)
+        if why:
+            self._warn_finite_rigid(why)
+            return card, False
         self._note_linear_rigid()
-        return self._equation_lines(self._kin_rows(ref, rot, members, {1, 2, 3}))
+        return self._linear_rigid_lines(ref, rot, self._kin_rows(ref, rot, members, {1, 2, 3})), True
+
+    def _rot_node_why(self) -> str:
+        """Why a reference node's rotational BCs and moments go to its ROT NODE."""
+        return "the body's rotation is carried there" if self._linear_rigid else \
+            "ccx ignores DOFs 4-6 of the REF NODE"
+
+    def _warn_finite_rigid(self, why: Optional[str] = None) -> None:
+        """A rigid constraint left to ccx's RIGID MPCs in a geometrically linear *DYNAMIC step,
+        where ccx turns them with the finite rotation and Abaqus linearizes them: in a deck of
+        linear rigid equations because ``why`` (_rigid_eq_refused), or (``why`` None) in one
+        whose *DYNAMIC step runs before an NLGEOM step (_dyn_before_nl)."""
+        if why:
+            msg = (f"Rigid constraint (*RIGID BODY, kinematic coupling or *MPC BEAM) in a deck with a "
+                   f"*DYNAMIC step and no NLGEOM written as ccx's *RIGID BODY / *KINEMATIC, not as "
+                   f"the linear *EQUATIONs of the other ones: {why}. ")
+        else:
+            msg = ("Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM) in a deck whose "
+                   "*DYNAMIC step runs without NLGEOM before an NLGEOM step: written as ccx's RIGID "
+                   "MPCs (exact under NLGEOM), which ccx also turns with the finite rotation in the "
+                   "linear *DYNAMIC step. ")
+        self.report.warn(msg + "Abaqus linearizes rigid constraints in a geometrically linear step "
+                         "(probed: a tip rotation of 0.01 rad 0.5 % off, 0.1 rad 9 %).", once=True)
+        self._reduces("rigid constraint turned with the finite rotation in a linear *DYNAMIC step")
 
     def _note_linear_rigid(self) -> None:
         self.report.note("Rigid constraints (*RIGID BODY, *MPC BEAM, kinematic couplings) in a deck "
@@ -20517,10 +20684,13 @@ class Converter:
         rows: List[List[Tuple[int, int, float]]] = []
         ties: List[str] = []
         forms: set = set()
+        local: Optional[str] = None             # why a group has no linear equations (a *TRANSFORM)
         for nodes, dofs in groups:
             nodes = [n for n in dedup(nodes) if n not in (ref, rot)]
             form = self._kin_form(ref, nodes, dofs)
             forms.add(form)
+            if form in ("rb", "drop"):
+                local = local or self._rigid_eq_refused(ref, nodes, dofs)
             if form == "rb":
                 body += nodes
             elif form == "eq":
@@ -20532,8 +20702,10 @@ class Converter:
             name = f"ABQ2CCX_RB{self._synth_counter}"
             out += [f"*NSET, NSET={name}"] + reflow([str(n) for n in dedup(body)])
             out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
-        out += self._equation_lines(rows) + ties
-        if self._lin_dyn and any(n in self._expanded for ns, _ in groups for n in ns):
+            if self._linear_rigid:
+                self._warn_finite_rigid(local)
+        out += self._linear_rigid_lines(ref, rot, rows) + ties
+        if self._linear_rigid and any(n in self._expanded for ns, _ in groups for n in ns):
             self._note_linear_rigid()        # (ccx's coupling would solve: its MPCs chain)
         elif out:
             self.report.note("Kinematic coupling in a deck with a *DYNAMIC step: ccx 2.23 solves no "
@@ -20545,21 +20717,19 @@ class Converter:
                              "the linear *EQUATIONs Abaqus solves, u(node) = u(ref) + theta x d on "
                              "each coupled translation (exact); under NLGEOM, coupling all "
                              "translations, as a *RIGID BODY (the same RIGID MPCs as ccx's "
-                             "coupling; exact) — so also with a *TRANSFORM on its nodes, where a "
-                             "linear *DYNAMIC step then turns the body with the finite rotation.",
+                             "coupling; exact), and so where a *TRANSFORM leaves no linear form.",
                              once=True)
         if rows and self._nl_any:
             self.report.warn("[APPROX] Kinematic coupling of only some translations in a deck "
                              "with a *DYNAMIC step and NLGEOM -> linear *EQUATIONs (u(node) = "
                              "u(ref) + theta x d at the initial geometry): exact while the "
                              "reference node turns little (7 % off at 0.36 rad, probed).", once=True)
-        local = any(n in self._transformed for ns, _ in groups for n in [ref] + list(ns))
         drop = ("Kinematic coupling of only some translations in a deck with a *DYNAMIC step: "
                 "ccx 2.23 solves no *DYNAMIC step with ccx's *COUPLING + *KINEMATIC here (every "
                 "free DOF would stay at its initial value), a *RIGID BODY couples all "
-                "translations, and the linear *EQUATIONs Abaqus solves without NLGEOM are "
-                + ("written for nodes without a *TRANSFORM only" if local else
-                   "exact for small rotations only under NLGEOM")
+                "translations, and the linear *EQUATIONs Abaqus solves without NLGEOM "
+                + (f"cannot be written ({local})" if local else
+                   "are exact for small rotations only under NLGEOM")
                 + "; commented out — the constraint is missing."
                 + ("" if local else " Rerun with --approximate to write the linear equations."))
         what = "kinematic coupling of some translations in a dynamic step"
@@ -21107,7 +21277,9 @@ class Converter:
     def _warn_coupled_clashes(self) -> None:
         """The *BOUNDARY on rigid-constraint member DOFs that the reference node's BCs do not
         impose and that stay (_plan_coupled_bcs): one warning per constraint kind, DOF type and
-        reason, with what ccx does with it and what Abaqus does instead."""
+        reason, with what ccx does with it and what Abaqus does instead.  Where the constraint
+        is linear *EQUATIONs (emit 'eq': only a *RIGID BODY's stay) ccx solves with the BC kept,
+        _settle_dependents reordering them, a model Abaqus does not solve: reduced physics."""
         what = {"kin": "a kinematic coupling", "rb": "a *RIGID BODY",
                 "mpc": "an *MPC BEAM (a *RIGID BODY in ccx)"}
         groups: "OrderedDict[Tuple[str, str, bool, str], List[Tuple[int, int, int]]]" = OrderedDict()
@@ -21119,7 +21291,10 @@ class Converter:
             where = (f"node {m} DOF {d} follows reference node {ref} through {what[kind]} and also "
                      f"has a *BOUNDARY that the reference node's BCs do not impose ({len(items)} "
                      f"such DOF(s) on {nodes} node(s)). ")
-            if trans:
+            if trans and emit == "eq":
+                effect = ("ccx keeps the BC as written: the body's linear *EQUATIONs are reordered "
+                          "so that the body follows it, unlike in Abaqus. ")
+            elif trans:
                 effect = "ccx stops: '*ERROR in cascade ... dependent side of a MPC and a SPC'. "
             elif emit == "kin":
                 effect = ("The shell/beam rotation keeps the BC and is not tied to the coupling's "
@@ -21154,6 +21329,8 @@ class Converter:
             else:
                 fix = move + " and stops if they differ: put the BC on the reference node instead."
             self.report.warn("Possible overconstraint: " + where + effect + fix, once=True)
+            if emit == "eq":
+                self._reduces("*BOUNDARY on *RIGID BODY nodes kept as written")
 
     # ======================================================================
     # Planar models: ccx runs 2-D beams and trusses as 3-D elements
@@ -23767,8 +23944,9 @@ def dat_blocks(path: str) -> Iterator[Tuple[int, str, str, Optional[float], List
 
 def _deck_steps(path: str) -> Optional[dict]:
     """What the results digest reads from a ccx deck: per *STEP its procedure and the DOFs
-    1-3 that the *BOUNDARY cards in effect hold (bc_steps; not at a *RIGID BODY's ROT NODE,
-    whose DOFs are rotations), at each node (``held``) and per target node set or node
+    1-3 that the *BOUNDARY cards in effect hold (bc_steps; not at a ROT NODE, whose DOFs are
+    rotations: a *RIGID BODY's, or one the converter's comment names for a rigid constraint
+    written as linear equations, _linear_rigid_lines), at each node (``held``) and per target node set or node
     (``targets``: {node: DOFs}); the nodes with a *TRANSFORM, set members and the highest
     node label; ``rows``, the .dat rows per element that hold its integration points where
     ccx prints more (B32R_PRINT_ROWS).  None if the deck cannot be read."""
@@ -23789,6 +23967,10 @@ def _deck_steps(path: str) -> Optional[dict]:
     with fh:
         for raw in fh:
             ln = raw.strip()
+            if ln.startswith("** abq2ccx: linear rigid constraint,"):
+                m = re.search(r"ROT NODE=(\d+)", ln)
+                if m:
+                    rot.add(int(m.group(1)))
             if not ln or ln.startswith("**"):
                 continue
             if ln.startswith("*"):
