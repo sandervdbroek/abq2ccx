@@ -17685,15 +17685,28 @@ class Converter:
                     blocks[i + 1].keyword == "KINEMATIC" and \
                     self._kinematic_dofs(blocks[i + 1]) & {1, 2, 3}:
                 refs.add(ref)
-            elif b.keyword == "KINEMATIC COUPLING":
-                for rec in merged_data_records(b):
-                    f = [x for x in rec if x != ""]
-                    try:
-                        if f and (len(f) < 2 or min(pint(x) for x in f[1:3]) <= 3):
-                            refs.add(ref)
-                    except ValueError:
-                        pass
+            elif b.keyword == "KINEMATIC COUPLING" and any(
+                    dofs and min(dofs) <= 3 for _, dofs in self._kinematic_coupling_lines(b)):
+                refs.add(ref)
         return refs
+
+    def _kinematic_coupling_lines(self, b: Block) -> List[Tuple[List[int], Optional[set]]]:
+        """The member lines of a *KINEMATIC COUPLING: (nodes, coupled DOFs: first to last,
+        all six when none are given; None when they are not numbers).  Blank lines are
+        skipped."""
+        out: List[Tuple[List[int], Optional[set]]] = []
+        for r in merged_data_records(b):
+            f = [x for x in r if x != ""]
+            if not f:
+                continue
+            try:
+                d1 = pint(f[1]) if len(f) > 1 else 1
+                d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
+                dofs: Optional[set] = set(range(min(d1, d2), max(d1, d2) + 1))
+            except ValueError:
+                dofs = None
+            out.append((self._resolve_nodes(f[0]), dofs))
+        return out
 
     def _plan_kinematic_rot_nodes(self, blocks: List[Block], next_id: int) -> int:
         """ccx builds a kinematic coupling (couplings.f) as RIGID MPCs on an internal rotation
@@ -18388,17 +18401,9 @@ class Converter:
                     self._coupling_plan[id(b)] = {"kind": "kdyn", "ref": ref,
                                                   "rot": self._kin_rb[id(b)]}
                     continue
-                members, translational = [], False
-                for r in merged_data_records(b):
-                    f = [x for x in r if x != ""]
-                    if not f:
-                        continue
-                    members += self._resolve_nodes(f[0])
-                    try:          # member, first DOF, last DOF (no DOFs: all of them)
-                        translational = translational or len(f) < 2 or min(
-                            pint(f[1]), pint(f[2]) if len(f) > 2 else pint(f[1])) <= 3
-                    except ValueError:
-                        pass
+                lines = self._kinematic_coupling_lines(b)
+                members = [n for nodes, _ in lines for n in nodes]
+                translational = any(dofs and min(dofs) <= 3 for _, dofs in lines)
                 if ref is None or not translational or \
                         not any(n in structural for n in members + [ref]):
                     continue
@@ -18624,17 +18629,8 @@ class Converter:
                 yield ref, [n for n in members if n != ref], \
                     self._kinematic_dofs(blocks[i + 1]) & {1, 2, 3}
             elif b.keyword == "KINEMATIC COUPLING":
-                for r in merged_data_records(b):
-                    f = [x for x in r if x != ""]
-                    if not f:
-                        continue
-                    try:
-                        d1 = pint(f[1]) if len(f) > 1 else 1
-                        d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 3)
-                    except (IndexError, ValueError):
-                        continue
-                    yield ref, [n for n in self._resolve_nodes(f[0]) if n != ref], \
-                        set(range(min(d1, d2), max(d1, d2) + 1)) & {1, 2, 3}
+                for nodes, dofs in self._legacy_kinematic_groups(b):
+                    yield ref, [n for n in nodes if n != ref], dofs & {1, 2, 3}
         for bodies in self._mpc_bodies.values():
             for body in bodies:
                 yield body["ref"], body["members"], {1, 2, 3}
@@ -18764,16 +18760,7 @@ class Converter:
                           self._kinematic_dofs(nxt))]
             else:
                 kind, rb = "kin", False
-                for r in merged_data_records(b):
-                    f = [x for x in r if x != ""]
-                    if not f:
-                        continue
-                    try:          # member, first DOF, last DOF (no DOFs: all of them)
-                        d1 = pint(f[1]) if len(f) > 1 else 1
-                        d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
-                    except ValueError:
-                        continue
-                    lines.append((self._resolve_nodes(f[0]), set(range(min(d1, d2), max(d1, d2) + 1))))
+                lines = self._legacy_kinematic_groups(b)
                 tied = any(ds & {1, 2, 3} for _, ds in lines)
             if id(b) in self._kin_dyn:               # the lines it leaves out constrain nothing
                 lines = [(ns, ds) for ns, ds in lines if self._kin_form(ref, ns, ds) in ("rb", "eq")]
@@ -19295,20 +19282,9 @@ class Converter:
         return dofs or set(range(1, 7))
 
     def _legacy_kinematic_groups(self, b: Block) -> List[Tuple[List[int], set]]:
-        """(nodes, DOFs) of each line of a *KINEMATIC COUPLING card (member, first DOF, last
-        DOF; no DOFs: all of them); unreadable lines are skipped."""
-        out: List[Tuple[List[int], set]] = []
-        for r in merged_data_records(b):
-            f = [x for x in r if x != ""]
-            if not f:
-                continue
-            try:
-                d1 = pint(f[1]) if len(f) > 1 else 1
-                d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
-            except ValueError:
-                continue
-            out.append((self._resolve_nodes(f[0]), set(range(min(d1, d2), max(d1, d2) + 1))))
-        return out
+        """(nodes, DOFs) of each line of a *KINEMATIC COUPLING card whose DOFs read
+        (_kinematic_coupling_lines)."""
+        return [(ns, ds) for ns, ds in self._kinematic_coupling_lines(b) if ds is not None]
 
     def _kin_form(self, ref: int, members: Sequence[int], dofs: set) -> str:
         """How a kinematic coupling of plain 3-D members in a deck with a *DYNAMIC step is
