@@ -20828,7 +20828,8 @@ PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", 
 # instance needs its own copy with offset ids and prefixed names (emitted once, raw,
 # they would constrain only one instance — or the wrong nodes after renumbering).
 PART_CONSTRAINT_KW = {"EQUATION", "MPC", "RIGID BODY", "NODAL THICKNESS", "TRANSFORM",
-                      "COUPLING", "KINEMATIC", "DISTRIBUTING", "KINEMATIC COUPLING", "NORMAL"}
+                      "COUPLING", "KINEMATIC", "DISTRIBUTING", "KINEMATIC COUPLING", "NORMAL",
+                      "DISTRIBUTING COUPLING", "PRE-TENSION SECTION"}
 
 
 # Keywords whose members are elements, so a bare instance-qualified id (``I2.7``) takes
@@ -21022,8 +21023,9 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
                            rotv, rotp) -> Block:
     """One instance's copy of a part-level constraint card: numeric node/element ids
     offset, set/surface names prefixed exactly like the instance's own sets, direction
-    vectors (*NORMAL, rectangular *TRANSFORM) rotated and axis points (cylindrical /
-    spherical *TRANSFORM) moved with the instance (``rotv`` / ``rotp``)."""
+    vectors (*NORMAL, rectangular *TRANSFORM, a *PRE-TENSION SECTION's normal) rotated and
+    axis points (cylindrical / spherical *TRANSFORM) moved with the instance (``rotv`` /
+    ``rotp``)."""
     def node(tok: str) -> str:
         if re.fullmatch(r"[-+]?\d+", tok):
             return str(int(tok) + node_off) if int(tok) > 0 else tok
@@ -21046,6 +21048,11 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
         p["ELSET"] = namer(prefix, p["ELSET"].strip())
     if kw == "COUPLING" and p.get("CONSTRAINT NAME"):
         p["CONSTRAINT NAME"] = namer(prefix, p["CONSTRAINT NAME"].strip())
+    if kw == "PRE-TENSION SECTION":
+        if p.get("NODE"):
+            p["NODE"] = node(p["NODE"].strip())
+        if p.get("ELEMENT"):
+            p["ELEMENT"] = elem(p["ELEMENT"].strip())
     data: List[str] = []
     if kw == "EQUATION":
         pending = 0                                  # terms still to read for this equation
@@ -21064,7 +21071,7 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
                 f[i] = node(f[i])
             pending -= len(f) // 3
             data.append(", ".join(f))
-    elif kw in ("MPC", "NODAL THICKNESS", "KINEMATIC COUPLING", "NORMAL"):
+    elif kw in ("MPC", "NODAL THICKNESS", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING", "NORMAL"):
         for ln in b.data:
             f = [x.strip() for x in ln.split(",")]
             if kw == "MPC":
@@ -21081,6 +21088,14 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
             elif f:
                 f[0] = node(f[0])
             data.append(", ".join(f))
+    elif kw == "PRE-TENSION SECTION" and b.data:
+        try:                                         # the normal (optional) turns with the part
+            v = [pf(x) for x in b.data[0].split(",") if x.strip()]
+            data = [", ".join(_fmt_component(x) for x in rotv((v[0], v[1], v[2])))] if len(v) >= 3 \
+                else list(b.data[:1])
+        except ValueError:
+            data = list(b.data[:1])
+        data += list(b.data[1:])
     elif kw == "TRANSFORM" and b.data:
         move = rotv if (b.param("TYPE") or "R").strip().upper().startswith("R") else rotp
         try:
@@ -21297,6 +21312,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                 renamed[b.param("NAME").strip().upper()] = out[-1].param("NAME")
         elif b.keyword in PART_CONSTRAINT_KW:
             out.append(_remap_part_constraint(b, prefix, namer, node_off, elem_off, rotv, rotp))
+    for kw in dedup([b.keyword for b in inst["extra"]
+                     if b.keyword not in GEOM_KW | PART_PER_INSTANCE | PART_CONSTRAINT_KW]):
+        report.warn(f"*{kw} inside an *INSTANCE left out: only an instance's mesh, sets, surfaces, "
+                    f"sections, orientations, distributions and constraints are written per "
+                    f"instance — verify.", once=True)
+        report.reduce(f"*{kw} inside an *INSTANCE left out")
     eids = list(geo.elements) + list(geo_conv._conn)
     entry = {"name": inst["name"], "part": inst["part"], "node_offset": node_off,
              "element_offset": elem_off,

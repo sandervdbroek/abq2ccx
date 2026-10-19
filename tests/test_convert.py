@@ -2842,6 +2842,35 @@ def test_part_level_constraints_replicated_per_instance():
     assert eqs == ["1, 1, 1., 3, 1, -1.", "4, 1, 1., 6, 1, -1."]
 
 
+PART_BOLT = ("*Part, name=P\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n"
+             "6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n9,0.,0.,2.\n10,1.,0.,2.\n11,1.,1.,2.\n12,0.,1.,2.\n"
+             "98,0.5,0.5,3.\n99,0.5,0.5,1.\n*Element, type=C3D8, elset=BAR\n1,1,2,3,4,5,6,7,8\n"
+             "2,5,6,7,8,9,10,11,12\n*Element, type=DCOUP3D, elset=DC\n3,98\n*Nset, nset=TOP\n9,10,11,12\n"
+             "*Elset, elset=LOW\n1\n*Surface, name=CUT\nLOW, S2\n*Solid Section, elset=BAR, material=M\n"
+             "{part}*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n{i1}*End Instance\n"
+             "*Instance, name=I2, part=P\n3., 0., 0.\n3., 0., 0., 4., 0., 0., 90.\n{i2}*End Instance\n"
+             "*End Assembly\n*Material, name=M\n*Elastic\n1000., 0.3\n")
+BOLT_CARDS = "*Distributing Coupling, elset=DC\nTOP, 1.\n*Pre-tension Section, surface=CUT, node=99\n0., 0., 1.\n"
+
+
+def test_part_level_distributing_coupling_and_pretension_per_instance():
+    # each instance gets its own copy: its names, node ids and turned normal (written once, raw,
+    # they named the part's sets: ccx stopped, validate_with_ccx.py assembly_bolts)
+    body, _, _ = convert_str(PART_BOLT.format(part=BOLT_CARDS, i1="", i2=""))
+    assert "*DISTRIBUTING COUPLING, ELSET=I1_DC\nI1_TOP, 1.\n" in body
+    assert "*DISTRIBUTING COUPLING, ELSET=I2_DC\nI2_TOP, 1.\n" in body
+    assert "*PRE-TENSION SECTION, SURFACE=I1_CUT, NODE=99\n0, 0, 1\n" in body
+    assert "*PRE-TENSION SECTION, SURFACE=I2_CUT, NODE=198\n0, -1, 0\n" in body
+    assert "ELSET=DC\n" not in body and "SURFACE=CUT," not in body
+    # inside an *INSTANCE: that instance's (it was left out without a word), and a card the
+    # flattener does not write per instance is warned
+    body, conv, rep = convert_str(PART_BOLT.format(part="", i1=BOLT_CARDS, i2="*Hourglass Stiffness\n1.\n"))
+    assert "*DISTRIBUTING COUPLING, ELSET=I1_DC\nI1_TOP, 1.\n" in body and "I2_DC\nI2_TOP" not in body
+    assert "*PRE-TENSION SECTION, SURFACE=I1_CUT, NODE=99\n" in body and "SURFACE=I2_CUT" not in body
+    assert "*HOURGLASS STIFFNESS inside an *INSTANCE left out" in rep.text()
+    assert conv.reduced_physics == ["*HOURGLASS STIFFNESS inside an *INSTANCE left out"]
+
+
 def test_surface_interaction_thickness_line_dropped():
     body, _, _ = convert_str("*Surface Interaction, name=SI\n1.,\n*Surface Behavior, "
                              "pressure-overclosure=hard\n")

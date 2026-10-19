@@ -1868,6 +1868,36 @@ def blank_nu_cube_deck():
             CUBE8_HELD + "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 47.5\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
+def assembly_bolts_deck():
+    """Two instances, the second turned 90 degrees about x (its z axis along -y), of a part
+    with a bolt (two C3D8 along z, length 2, both ends held) with a *PRE-TENSION SECTION at
+    mid-length (node 99, loaded by 1000) and a unit block held at its bottom whose top a
+    *DISTRIBUTING COUPLING (DCOUP3D node 98) loads by 100 along the part's -z.  E 210000,
+    nu 0: the bolt's cut closes 1000 x 2 / E, the block shortens 100 / E."""
+    part = ["*PART, NAME=P", "*NODE"]
+    part += [f"{1 + i + 2 * j + 4 * k}, {float(i)}, {float(j)}, {float(k)}"
+             for k in range(3) for j in range(2) for i in range(2)]
+    part += [f"{21 + i + 2 * j + 4 * k}, {2.0 + i}, {float(j)}, {float(k)}"
+             for k in range(2) for j in range(2) for i in range(2)]
+    part += ["98, 2.5, 0.5, 2.", "99, 0.5, 0.5, 1.", "*ELEMENT, TYPE=C3D8, ELSET=BOLT",
+             "1, 1, 2, 4, 3, 5, 6, 8, 7", "2, 5, 6, 8, 7, 9, 10, 12, 11",
+             "*ELEMENT, TYPE=C3D8, ELSET=BLK", "3, 21, 22, 24, 23, 25, 26, 28, 27",
+             "*ELEMENT, TYPE=DCOUP3D, ELSET=DC", "4, 98", "*ELSET, ELSET=LOW", "1",
+             "*NSET, NSET=ENDS", "1, 2, 3, 4, 9, 10, 11, 12", "*NSET, NSET=BOT", "21, 22, 23, 24",
+             "*NSET, NSET=TOPF", "25, 26, 27, 28", "*NSET, NSET=PT", "99", "*NSET, NSET=RP", "98",
+             "*SURFACE, NAME=CUT", "LOW, S2", "*SOLID SECTION, ELSET=BOLT, MATERIAL=M",
+             "*SOLID SECTION, ELSET=BLK, MATERIAL=M", "*PRE-TENSION SECTION, SURFACE=CUT, NODE=99",
+             "0., 0., 1.", "*DISTRIBUTING COUPLING, ELSET=DC", "TOPF, 1.", "*END PART"]
+    asm = ["*ASSEMBLY, NAME=A", "*INSTANCE, NAME=I1, PART=P", "*END INSTANCE",
+           "*INSTANCE, NAME=I2, PART=P", "0., 5., 0.", "0., 5., 0., 1., 5., 0., 90.", "*END INSTANCE",
+           "*END ASSEMBLY", "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0."]
+    step = ["*STEP", "*STATIC", "*BOUNDARY", "I1.ENDS, 1, 3", "I2.ENDS, 1, 3", "I1.BOT, 1, 3",
+            "I2.BOT, 1, 3", "*CLOAD", "I1.PT, 1, 1000.", "I2.PT, 1, 1000.", "I1.RP, 3, -100.",
+            "I2.RP, 2, 100.", "*NODE PRINT, NSET=I1.PT", "U", "*NODE PRINT, NSET=I2.PT", "U",
+            "*NODE PRINT, NSET=I1.TOPF", "U", "*NODE PRINT, NSET=I2.TOPF", "U", "*END STEP"]
+    return "\n".join(part + asm + step) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -4438,6 +4468,23 @@ def main():
               f"(190 / 190000), lateral {lateral:.1e} (nu 0; read as 0.475 without its temperature: "
               f"-4.75e-4)")
     failures += 0 if u and ok else 1
+    # part-level *PRE-TENSION SECTION / *DISTRIBUTING COUPLING in two instances (written once
+    # with the part's names, they stopped ccx); instance 2's node ids are 99 higher
+    u = review_run(assembly_bolts_deck(), "assembly_bolts", dat_displacements)
+    if u:
+        closed = [u.get(n, [math.inf])[0] for n in (99, 198)]
+        short = [-u.get(n, [0.0, 0.0, math.inf])[2] for n in (25, 26, 27, 28)] + \
+                [u.get(n, [0.0, math.inf])[1] for n in (124, 125, 126, 127)]
+        want_c, want_s = 1000.0 * 2.0 / 210000.0, 100.0 / 210000.0
+        err = max([abs(x / want_c - 1) for x in closed] + [abs(x / want_s - 1) for x in short])
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  assembly_bolts (two instances, one turned 90 deg, of a "
+              f"part with a *PRE-TENSION SECTION and a *DISTRIBUTING COUPLING): pre-tension closure "
+              f"{closed[0]:.7g}, {closed[1]:.7g} vs F L / E A {want_c:.7g}, coupled block tops "
+              f"shortened {min(short):.7g} to {max(short):.7g} vs F / E A {want_s:.7g} "
+              f"(max {err:.1e} off)")
+    failures += 0 if u and ok else 1
+
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")
