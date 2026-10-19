@@ -14144,7 +14144,7 @@ class Converter:
         explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         shells = self._shell_thicknesses(blocks)
         # a tied contact pair counts membrane thickness too, a *TIE only shells' (Abaqus 2017
-        # "Defining tied contact", "Mesh tie constraints")
+        # "Defining tied contact", "Mesh tie constraints"), unless NO THICKNESS
         mem = {e for e, (typ, _c) in self.geom.elements.items() if typ.upper().startswith("M3D")}
         mem_t = {e: max(ts) for e, ts in self._membrane_thicknesses(blocks, mem)[0].items()
                  if ts and all(t is not None and t > 0.0 for t in ts)} if mem else {}
@@ -14228,7 +14228,8 @@ class Converter:
                 half: Dict[int, Tuple[float, float, Vec]] = {}
                 if not no_thick or pair:
                     for e, f in slave_faces:
-                        if (e in shells and not no_thick) or (e in mem_t and pair):
+                        if (e in shells and not no_thick) or \
+                                (e in mem_t and pair and not b.has("NO THICKNESS")):
                             t_e, off = shells[e] if e in shells else (mem_t[e], 0.0)
                             nrm = self._shell_normal(e)
                             for n in self.geom.elements[e][1]:

@@ -9474,6 +9474,10 @@ def test_tied_pair_of_a_membrane_on_a_rigid_surface_counts_its_thickness():
     rb = next(ln for ln in body.splitlines() if ln.startswith("*RIGID BODY"))
     members = [int(x) for x in _card_at(body, f"*NSET, NSET={rb.split('NSET=')[1].split(',')[0]}")[0].split(",")]
     assert {1, 2, 3, 4} <= set(members) and conv.geom.nodes[1][2] == 0.05      # not moved: touching
+    # NO THICKNESS measures from the membrane nodes, as _membrane_tie_tolerance does: ADJUST
+    # then moves them onto the plate
+    body, conv, _ = convert_str(deck.replace("tied\n", "tied, no thickness, adjust=0.1\n"))
+    assert "ABQ2CCX_TIED" not in body and conv.geom.nodes[1][2] == 0.0
 
 
 def test_kinematic_couplings_on_membrane_and_shell_faces_take_their_nodes():
