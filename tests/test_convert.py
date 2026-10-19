@@ -2758,6 +2758,11 @@ def test_kinematic_coupling_keeps_every_line():
                                "*Kinematic Coupling, ref node=100\nTOP\n7\n")
     assert body.count("*COUPLING") == 1 and "*KINEMATIC\n1, 3" in body   # all DOFs, solid nodes
     assert "clamped" not in rep.text()                                    # exact for solids
+    # a blank line (only commas) is skipped, also by the explicit-step planners (an IndexError)
+    deck = (HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6\n*Solid Section, elset=EALL, material=M\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-9\n*Kinematic Coupling, ref node=100\n"
+            "TOP, 1, 3\n{}*Step\n*Dynamic, Explicit\n, 1e-4\n*Boundary\n100, 3, 3, 0.01\n*End Step\n")
+    assert convert_str(deck.format(",\n"))[0] == convert_str(deck.format(""))[0]
 
 
 def test_orientation_origin_and_node_definition():

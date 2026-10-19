@@ -18415,6 +18415,8 @@ class Converter:
             elif b.keyword == "KINEMATIC COUPLING":
                 for r in merged_data_records(b):
                     f = [x for x in r if x != ""]
+                    if not f:
+                        continue
                     try:
                         d1 = pint(f[1]) if len(f) > 1 else 1
                         d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 3)
