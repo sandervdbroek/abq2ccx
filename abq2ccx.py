@@ -827,16 +827,11 @@ def canonical_keyword(keyword: str) -> str:
                  set(SPECIAL_UNSUPPORTED) | set(SEMANTIC_TRAP) | set(PASS_WITH_NOTE) |
                  OUTPUT_ONLY_KEYWORDS | set(NUMERICAL_KEYWORDS) | MATERIAL_OPTION_CARDS |
                  U1_NONLINEAR_CARDS | HISTORY_ONLY_KW | TEMPERATURE_DOF_PROCS |
-                 set(Converter._U1_OPTIONS) | Converter._PERTURBATION_PROCS |
-                 Converter._THERMAL_PROCEDURES | Converter._OTHER_PROCEDURES |
-                 {"KINEMATIC COUPLING", "SHELL GENERAL SECTION", "BEAM GENERAL SECTION",
-                  "COHESIVE SECTION", "GASKET SECTION", "CONNECTOR SECTION", "PARAMETER",
-                  "SYSTEM", "UNIT SYSTEM",
-                  "DISTRIBUTING COUPLING", "RATE DEPENDENT", "INITIAL CONDITIONS",
-                  "SURFACE INTERACTION", "SURFACE BEHAVIOR", "CONTACT PAIR",
-                  "ROTARY INERTIA", "SURFACE SECTION", "SECTION CONTROLS", "DISTRIBUTION TABLE",
-                  "BEAM SECTION OFFSET", "FLUID CAVITY", "REBAR LAYER", "SUBSPACE DYNAMIC",
-                  "ELEMENT OPERATOR"})
+                 set(Converter._HANDLERS) | set(Converter._U1_OPTIONS) |
+                 Converter._PERTURBATION_PROCS | Converter._THERMAL_PROCEDURES |
+                 Converter._OTHER_PROCEDURES |
+                 {"PARAMETER", "BEAM SECTION OFFSET", "FLUID CAVITY", "REBAR LAYER",
+                  "SUBSPACE DYNAMIC", "ELEMENT OPERATOR"})
         for k in known:
             _KEYWORD_BY_COMPACT.setdefault(k.replace(" ", ""), k)
     if " " in keyword:
@@ -4238,81 +4233,84 @@ class Converter:
         return out
 
     # -- dispatch -----------------------------------------------------------
+    # card keyword -> the method that converts it (translate_one; the U1 options of a *BEAM
+    # SECTION, _U1_OPTIONS, go to handle_beam_section_option)
+    _HANDLERS = {
+        "ELASTIC": "handle_elastic",
+        "ORIENTATION": "handle_orientation",
+        "DISTRIBUTION": "handle_distribution",
+        "DISTRIBUTION TABLE": "handle_distribution_table",
+        "SOLID SECTION": "handle_solid_section",
+        "SHELL SECTION": "handle_shell_section",
+        "SHELL GENERAL SECTION": "handle_shell_section",
+        "MEMBRANE SECTION": "handle_membrane_section",
+        "BEAM SECTION": "handle_beam_section",
+        "BEAM GENERAL SECTION": "handle_beam_general_section",
+        "COHESIVE SECTION": "handle_cohesive_section",
+        "GASKET SECTION": "handle_cohesive_section",
+        "SURFACE SECTION": "handle_surface_section",
+        "TRANSFORM": "handle_transform",
+        "TIE": "handle_tie",
+        "BOUNDARY": "handle_boundary",
+        "CLOAD": "handle_cload",
+        "DLOAD": "handle_dload",
+        "DSLOAD": "handle_dsload",
+        "MPC": "handle_mpc",
+        "CONNECTOR SECTION": "handle_connector_section",
+        "RESTART": "handle_restart",
+        "AMPLITUDE": "handle_amplitude",
+        "SURFACE": "handle_surface",
+        "CREEP": "handle_creep",
+        "FRICTION": "handle_friction",
+        "CONTACT PAIR": "handle_contact_pair",
+        "RIGID BODY": "handle_rigid_body",
+        "ROTARY INERTIA": "handle_rotary_inertia",
+        "COUPLING": "handle_coupling_card",
+        "KINEMATIC": "handle_kinematic",
+        "SURFACE INTERACTION": "handle_surface_interaction",
+        "INITIAL CONDITIONS": "handle_initial_conditions",
+        "TEMPERATURE": "handle_temperature",
+        "FILM": "handle_flux_film",
+        "DFLUX": "handle_flux_film",
+        "CFLUX": "handle_flux_film",
+        "RADIATE": "handle_flux_film",
+        "NORMAL": "handle_normal",
+        "NODAL THICKNESS": "handle_nodal_thickness",
+        "EQUATION": "handle_equation",
+        "STATIC": "handle_static",
+        "DYNAMIC": "handle_dynamic",
+        "FREQUENCY": "handle_frequency",
+        "BUCKLE": "handle_buckle",
+        "HEAT TRANSFER": "handle_heat_transfer",
+        "PLASTIC": "handle_plastic",
+        "DAMAGE INITIATION": "handle_damage_initiation",
+        "DEPVAR": "handle_depvar",
+        "USER MATERIAL": "handle_user_material",
+        "CYCLIC HARDENING": "handle_cyclic_hardening",
+        "HYPERELASTIC": "handle_hyperelastic",
+        "DENSITY": "handle_dependent_material",
+        "SPECIFIC HEAT": "handle_dependent_material",
+        "MASS": "handle_mass",
+        "CONDUCTIVITY": "handle_dependent_material",
+        "EXPANSION": "handle_expansion",
+        "MOHR COULOMB": "handle_dependent_material",
+        "MOHR COULOMB HARDENING": "handle_dependent_material",
+        "SECTION CONTROLS": "handle_section_controls",
+        "PRE-TENSION SECTION": "handle_pretension_section",
+        **dict.fromkeys(OUTPUT_CARDS, "handle_output"),
+        "KINEMATIC COUPLING": "handle_coupling",
+    }
+
     def translate_one(self, b: Block) -> List[str]:
         kw = b.keyword
         if id(b) in self._dp_unused:                  # _plan_deformation_plasticity
             return self._commented(b, self._dp_unused[id(b)], reduces=False)
-        handlers = {
-            "ELASTIC": self.handle_elastic,
-            "ORIENTATION": self.handle_orientation,
-            "DISTRIBUTION": self.handle_distribution,
-            "DISTRIBUTION TABLE": self.handle_distribution_table,
-            "SOLID SECTION": self.handle_solid_section,
-            "SHELL SECTION": self.handle_shell_section,
-            "SHELL GENERAL SECTION": self.handle_shell_section,
-            "MEMBRANE SECTION": self.handle_membrane_section,
-            "BEAM SECTION": self.handle_beam_section,
-            "BEAM GENERAL SECTION": self.handle_beam_general_section,
-            **{k: self.handle_beam_section_option for k in self._U1_OPTIONS},
-            "COHESIVE SECTION": self.handle_cohesive_section,
-            "GASKET SECTION": self.handle_cohesive_section,
-            "SURFACE SECTION": self.handle_surface_section,
-            "TRANSFORM": self.handle_transform,
-            "TIE": self.handle_tie,
-            "BOUNDARY": self.handle_boundary,
-            "CLOAD": self.handle_cload,
-            "DLOAD": self.handle_dload,
-            "DSLOAD": self.handle_dsload,
-            "MPC": self.handle_mpc,
-            "CONNECTOR SECTION": self.handle_connector_section,
-            "RESTART": self.handle_restart,
-            "AMPLITUDE": self.handle_amplitude,
-            "SURFACE": self.handle_surface,
-            "CREEP": self.handle_creep,
-            "FRICTION": self.handle_friction,
-            "CONTACT PAIR": self.handle_contact_pair,
-            "RIGID BODY": self.handle_rigid_body,
-            "ROTARY INERTIA": self.handle_rotary_inertia,
-            "COUPLING": self.handle_coupling_card,
-            "PRE-TENSION SECTION": self.handle_pretension_section,
-            "KINEMATIC": self.handle_kinematic,
-            "SURFACE INTERACTION": self.handle_surface_interaction,
-            "INITIAL CONDITIONS": self.handle_initial_conditions,
-            "TEMPERATURE": self.handle_temperature,
-            "FILM": self.handle_flux_film,
-            "DFLUX": self.handle_flux_film,
-            "CFLUX": self.handle_flux_film,
-            "RADIATE": self.handle_flux_film,
-            "NORMAL": self.handle_normal,
-            "NODAL THICKNESS": self.handle_nodal_thickness,
-            "EQUATION": self.handle_equation,
-            "STATIC": self.handle_static,
-            "DYNAMIC": self.handle_dynamic,
-            "FREQUENCY": self.handle_frequency,
-            "BUCKLE": self.handle_buckle,
-            "HEAT TRANSFER": self.handle_heat_transfer,
-            "PLASTIC": self.handle_plastic,
-            "DAMAGE INITIATION": self.handle_damage_initiation,
-            "DEPVAR": self.handle_depvar,
-            "USER MATERIAL": self.handle_user_material,
-            "CYCLIC HARDENING": self.handle_cyclic_hardening,
-            "HYPERELASTIC": self.handle_hyperelastic,
-            "DENSITY": self.handle_dependent_material,
-            "SPECIFIC HEAT": self.handle_dependent_material,
-            "MASS": self.handle_mass,
-            "CONDUCTIVITY": self.handle_dependent_material,
-            "EXPANSION": self.handle_expansion,
-            "MOHR COULOMB": self.handle_dependent_material,
-            "MOHR COULOMB HARDENING": self.handle_dependent_material,
-            "SECTION CONTROLS": self.handle_section_controls,
-        }
         if kw not in self._U1_OPTIONS and kw not in ("BEAM SECTION", "BEAM GENERAL SECTION"):
             self._u1_last = False                # (handle_beam_section_option)
-        if kw in handlers:
-            return handlers[kw](b)
-        if kw in ("NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "NODE OUTPUT", "ELEMENT OUTPUT",
-                  "CONTACT OUTPUT", "CONTACT FILE"):
-            return self.handle_output(b)
+        name = self._HANDLERS.get(kw) or \
+            ("handle_beam_section_option" if kw in self._U1_OPTIONS else None)
+        if name:
+            return getattr(self, name)(b)
         if kw == "OUTPUT":
             for msg in self._out_notes.get(id(b), []):
                 self.report.note(msg, once=True)
@@ -4322,8 +4320,6 @@ class Converter:
                              "FREQUENCY / NUMBER INTERVAL / TIME INTERVAL / TIME POINTS onto the "
                              "step's first output card.", once=True)
             return self._anchored_output(b)        # a preselected request's cards
-        if kw == "KINEMATIC COUPLING":
-            return self.handle_coupling(b)
         if kw == "PARAMETER":
             self.report.note("*PARAMETER card dropped; its <name> substitutions were already "
                              "applied to the deck (ccx has no parametric input).", once=True)
