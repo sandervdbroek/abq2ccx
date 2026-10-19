@@ -4392,20 +4392,28 @@ class Converter:
         ``reduces``) unless ``reduces`` is False: an output request, a numerical control, or a
         card Abaqus itself would not apply (reported as a NOTE).  So is a material option of a
         material that no section or composite ply uses: it changes nothing in the analysis."""
-        self.report.n_commented += 1
         if reduces is not False and b.keyword in MATERIAL_OPTION_CARDS:
             mat = self._card_material.get(id(b))
             if mat and mat.upper() not in self._used_materials:
                 reduces = False
                 msg += f" No section uses material {mat}, so this changes nothing."
-        if reduces is False:
-            self.report.note(msg, once=True)
-        else:
+        return self._comment_out(msg, [emit_keyword(b.keyword, b.params)] + list(b.data),
+                                 reduces if reduces is not True else f"*{b.keyword}",
+                                 warn=reduces is not False)
+
+    def _comment_out(self, msg: str, lines: Sequence[str], reduces: Union[bool, str],
+                     comment: Optional[str] = None, warn: bool = True) -> List[str]:
+        """Card text ``lines`` as comment lines under '** abq2ccx: ' + ``comment`` (else
+        ``msg``), with ``msg`` reported as a warning (a note unless ``warn``) and, unless
+        ``reduces`` is False, ``reduces`` recorded as reduced physics.  One commented card."""
+        self.report.n_commented += 1
+        if warn:
             self.report.warn(msg, once=True)
-            self._reduces(reduces if isinstance(reduces, str) else f"*{b.keyword}")
-        out = ["** abq2ccx: " + msg, "** " + emit_keyword(b.keyword, b.params)]
-        out += ["** " + d for d in b.data]
-        return out
+        else:
+            self.report.note(msg, once=True)
+        if reduces is not False:
+            self._reduces(reduces)
+        return ["** abq2ccx: " + (msg if comment is None else comment)] + ["** " + x for x in lines]
 
     # -- model-data handlers ------------------------------------------------
     def _collapse_dependencies(self, b: Block, nvals: int) -> Optional[List[str]]:
@@ -10317,13 +10325,12 @@ class Converter:
                       "displacement one with a generated amplitude, has no form in global "
                       "components")
         what = "BCs" if b.keyword == "BOUNDARY" else "moments"
-        self.report.n_commented += 1
-        self.report.warn(f"*{b.keyword} on DOFs 4-6 of a node with a *TRANSFORM (e.g. node {n}) "
-                         f"commented out — the rotational {what} are missing: Abaqus reads them in "
-                         f"the node's local axes, and {why}.", once=True)
-        self._reduces(f"*{b.keyword} on DOFs 4-6 of a node with a *TRANSFORM")
-        return [f"** abq2ccx: node {n}, DOFs 4-6 of this *{b.keyword} left out: no exact form in "
-                f"ccx 2.23 ({why})"]
+        return self._comment_out(
+            f"*{b.keyword} on DOFs 4-6 of a node with a *TRANSFORM (e.g. node {n}) commented out "
+            f"— the rotational {what} are missing: Abaqus reads them in the node's local axes, "
+            f"and {why}.", [], f"*{b.keyword} on DOFs 4-6 of a node with a *TRANSFORM",
+            comment=f"node {n}, DOFs 4-6 of this *{b.keyword} left out: no exact form in ccx "
+                    f"2.23 ({why})")
 
     def _to_local_axes(self, forces: Dict[Tuple[int, int], float], nodes: Sequence[int],
                        flat: set) -> Tuple[Dict[Tuple[int, int], float], Optional[str]]:
@@ -10428,11 +10435,7 @@ class Converter:
         text = ", ".join(g).rstrip(", ")          # blank fields kept in place (they are zeros)
         label = g[1].upper() if len(g) > 1 else ""
         msg = f"*{b.keyword} {label} on '{g[0]}' not converted: {why}. Commented out."
-        self.report.n_commented += 1
-        self.report.warn(msg, once=True)
-        if reduces:
-            self._reduces(f"*{b.keyword} {label} load dropped")
-        return ["** abq2ccx: " + msg, "** " + text]
+        return self._comment_out(msg, [text], reduces and f"*{b.keyword} {label} load dropped")
 
     def _user_load_line(self, b: Block, g: Sequence[str]) -> List[str]:
         """A load line whose magnitude comes from an Abaqus user subroutine (a ...NU label)."""
@@ -11575,7 +11578,7 @@ class Converter:
                                 f"{'ground' if it['b'] is None else it['b']})" for it in its)
             out += self._commented(mkblock("CONNECTOR SECTION", b.params.items(),
                                            list(b.data) + [f"connector element(s) {listing}"]),
-                                   reason, reduces=not (reason.startswith("Connector element on an undefined node") or "is a 3-D connection type" in reason))
+                                   reason, reduces=its[0].get("reduces", True))
         return out
 
     # -- *EQUATION terms on nodes with a *TRANSFORM ---------------------------------
@@ -12000,11 +12003,8 @@ class Converter:
                    f"({self._analytic_skipped[gone]}).")
             if not drop and not any(x.strip() for x in keep):
                 return None, self._commented(b, msg), True
-            self.report.n_commented += 1
-            self.report.warn(msg + " Its lines are commented out; the card's other lines are kept.",
-                             once=True)
-            self._reduces(f"*{b.keyword}")
-            comments = ["** abq2ccx: " + msg] + ["** " + ln for ln in gone_lines]
+            comments = self._comment_out(msg + " Its lines are commented out; the card's other "
+                                         "lines are kept.", gone_lines, f"*{b.keyword}", comment=msg)
         empty = not any(x.strip() for x in keep)
         return Block(b.keyword, b.params, keep), comments, empty
 
@@ -12568,17 +12568,16 @@ class Converter:
                 elif any(n in self._transformed for n in nodes):
                     bad = bad or next(n for n in nodes if n in self._transformed)
         if bad is not None:
-            self.report.n_commented += 1
-            self.report.warn(f"*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (e.g. "
-                             f"node {bad}) commented out — the constraint is missing: ccx 2.23 "
-                             f"reads DOF 4 there about the global axis and DOFs 5-6 through an "
-                             f"out-of-range read of the transformation matrix (terms on the node's "
-                             f"translations with undefined coefficients, or it stops; probed), "
-                             f"while Abaqus reads them in the local axes. Write the constraint "
-                             f"without the rotations of transformed nodes.", once=True)
-            self._reduces("*EQUATION on DOFs 4-6 of a node with a *TRANSFORM")
-            return ["** abq2ccx: *EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM "
-                    "(misread by ccx 2.23) commented out"] + ["** " + x for x in out]
+            return self._comment_out(
+                f"*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (e.g. node {bad}) "
+                f"commented out — the constraint is missing: ccx 2.23 reads DOF 4 there about the "
+                f"global axis and DOFs 5-6 through an out-of-range read of the transformation "
+                f"matrix (terms on the node's translations with undefined coefficients, or it "
+                f"stops; probed), while Abaqus reads them in the local axes. Write the constraint "
+                f"without the rotations of transformed nodes.", out,
+                "*EQUATION on DOFs 4-6 of a node with a *TRANSFORM",
+                comment="*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (misread by "
+                        "ccx 2.23) commented out")
         if not moved:
             return out
         self.report.note("*EQUATION terms on DOFs 4-6 of a *RIGID BODY reference node moved to DOFs "
@@ -17624,6 +17623,7 @@ class Converter:
                     it["route"], it["reason"] = "skip", ("Connector element on an undefined node, "
                                                          "or with the same node twice; commented "
                                                          "out — the connector is missing.")
+                    it["reduces"] = False          # input Abaqus rejects: no physics is lost
                     continue
                 if na is not None and nb is not None:
                     it["d"] = vsub(self.geom.nodes[nb], self.geom.nodes[na])
@@ -17635,6 +17635,7 @@ class Converter:
                         it["route"], it["reason"] = "skip", (f"*CONNECTOR SECTION: {label} on a "
                                                              f"CONN2D2 element (REVOLUTE is a 3-D "
                                                              f"connection type); commented out.")
+                        it["reduces"] = False      # (as above)
                     elif axes is None or other is None:
                         it["route"], it["reason"] = "skip", (
                             "*CONNECTOR SECTION: the local directions of a REVOLUTE / HINGE "
