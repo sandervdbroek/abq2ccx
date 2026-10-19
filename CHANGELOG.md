@@ -18,6 +18,19 @@ physics.
   card the flattener cannot place is now warned; circular-section beam knots no longer depend
   on the order of a step's `OP=NEW` cards; an `*ORIENTATION, DEFINITION=NODES` with an
   undefined node no longer takes the next nodes as its points.
+* **More code-review fixes** — blank-free spellings of every keyword the converter knows by name
+  (`*ROTARYINERTIA`, `*SECTIONCONTROLS`, `*ENERGYPRINT`, ...) reach their handlers; a
+  mesh-generation record with a non-numeric field (an undefined `<parameter>`) is skipped with a
+  warning instead of failing the conversion, and `*NCOPY, MULTIPLE` copies in linear time;
+  `*STEP, NLGEO` is read as `NLGEOM`; `*ELASTIC, TYPE=LAMINA` collapses `DEPENDENCIES` rows like
+  the other types and reads a blank field as 0; a tied pair's `NO THICKNESS` holds on a rigid
+  master too; a connector or rotary inertia whose orientation has no fixed axes (a
+  distribution's) is refused instead of taking the global axes; a blank `*KINEMATIC COUPLING`
+  line no longer stops explicit decks. Now reported: unreadable `*PLASTIC` dependency rows,
+  `*PARAMETER` expressions that cannot be evaluated, a prescribed value only ccx loses after a
+  frequency step's `OP=NEW`, and constraints on rotations of transformed nodes that are
+  commented out (reduced physics; `SCALE STRESS=1.00` no longer is). Converted decks mark all
+  the converter's comments `** abq2ccx:`.
 * **Initial stresses and deformation plasticity on oriented sections** — `*INITIAL CONDITIONS,
   TYPE=STRESS / PLASTIC STRAIN` are turned out of the orientation's axes, in which Abaqus gives
   them, into the global ones ccx 2.23 reads them in — at each of ccx's integration points on a
