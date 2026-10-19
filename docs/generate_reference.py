@@ -338,6 +338,9 @@ TRANSLATED = {
         "thickness (`OFFSET` shifts them) and is not written; `DENSITY` with a thickness "
         "(rigid-element mass) leaves the elements unconverted unless `--approximate`; an "
         "analytical surface that is not meshed comments the body out.",
+    "*PRE-TENSION SECTION": "`NODE` / `ELEMENT` set → its node / element number (Abaqus' set "
+        "holds one; ccx 2.23 stops on a set name), also instance-qualified at the assembly "
+        "level; any other set is warned and left for ccx to stop on.",
     "*ROTARY INERTIA": "ccx 2.23 has no `ROTARYI` element: on a rigid body with a `*MASS`, the "
         "body's summed rotary inertia becomes six point masses on its principal axes around the "
         "body node with the largest mass, a negative `*MASS` there that takes their mass back, "
@@ -693,7 +696,7 @@ def gen_keywords():
                "CREEP", "AMPLITUDE", "RESTART", "SURFACE", "OUTPUT", "NODE OUTPUT", "ELEMENT OUTPUT",
                "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "STATIC", "DYNAMIC", "FREQUENCY",
                "BUCKLE", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT", "MASS", "EQUATION",
-               "COUPLING", "KINEMATIC", "RIGID BODY",
+               "COUPLING", "KINEMATIC", "RIGID BODY", "PRE-TENSION SECTION",
                "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",

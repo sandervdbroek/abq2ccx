@@ -31,6 +31,11 @@ physics.
   frequency step's `OP=NEW`, and constraints on rotations of transformed nodes that are
   commented out (reduced physics; `SCALE STRESS=1.00` no longer is). Converted decks mark all
   the converter's comments `** abq2ccx:`.
+* **Pre-tension nodes named by a set** — `*PRE-TENSION SECTION, NODE=` (and a truss or beam
+  cut's `ELEMENT=`) naming a set of one node (element), as Abaqus allows, is written with its
+  number: ccx 2.23 reads only a number there and stopped on the set name. Instance-qualified
+  names at the assembly level resolve too; a set of several members or none is warned and left
+  for ccx to stop on, as Abaqus would.
 * **Initial stresses and deformation plasticity on oriented sections** — `*INITIAL CONDITIONS,
   TYPE=STRESS / PLASTIC STRAIN` are turned out of the orientation's axes, in which Abaqus gives
   them, into the global ones ccx 2.23 reads them in — at each of ccx's integration points on a
