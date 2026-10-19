@@ -1888,6 +1888,11 @@ def test_approximate_nu_clamp():
     assert "1000., 0.5" in body                                # untouched by default
     body, _, rep = convert_str(deck, approximate=True)
     assert "1000., 0.475" in body and "[APPROX]" in rep.text()
+    # blank fields are positional (a blank nu is 0): the other rows keep them and their
+    # temperatures (they became "190000., 0.475", validate_with_ccx.py approximate_blank_nu)
+    body, _, _ = convert_str("*Material,name=m\n*Elastic\n200000., 0.5, 20.\n190000., , 100.\n"
+                             "180000., 0.45, 200.,\n", approximate=True)
+    assert "*ELASTIC\n200000., 0.475, 20.\n190000., , 100.\n180000., 0.45, 200." in body
 
 
 def test_approximate_ibeam_to_rect():

@@ -1860,6 +1860,14 @@ def tied_strip_deck(symmetric=True):
     return "\n".join(lines) + "\n"
 
 
+def blank_nu_cube_deck():
+    """A C3D8 cube at temperature 100 pulled by a stress of 190: *ELASTIC rows E 200000, nu 0.5
+    at 20 (which --approximate clamps to 0.475) and E 190000, nu blank (0) at 100."""
+    return (CUBE8 + "*NSET, NSET=ALLN\n1, 2, 3, 4, 5, 6, 7, 8\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            "200000., 0.5, 20.\n190000., , 100.\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nALLN, 100.\n" +
+            CUBE8_HELD + "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 47.5\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -4419,6 +4427,17 @@ def main():
               f"deflection {got:.7g} vs {want:.7g} with all four plies listed ({err:.1e} apart; taken "
               f"half as thick, its tie was left to ccx: 3.3x)")
     failures += 0 if all(strips) and ok else 1
+    # --approximate's Poisson clamp beside a blank nu (that row became "E, 0.475")
+    u = review_run(blank_nu_cube_deck(), "approximate_blank_nu", dat_displacements, approximate=True)
+    if u:
+        v = u.get(7, [math.inf] * 3)
+        lateral = max(abs(v[0]), abs(v[1]))
+        ok = lateral < 1e-12 and abs(v[2] / 1e-3 - 1) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  approximate_blank_nu (--approximate; *ELASTIC nu 0.5 at "
+              f"T 20 and a blank nu at T 100, a cube at 100 pulled by 190): axial strain {v[2]:.7g} "
+              f"(190 / 190000), lateral {lateral:.1e} (nu 0; read as 0.475 without its temperature: "
+              f"-4.75e-4)")
+    failures += 0 if u and ok else 1
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")

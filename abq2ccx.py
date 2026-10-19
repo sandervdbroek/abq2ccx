@@ -5009,16 +5009,18 @@ class Converter:
                                      "(ccx stops on the line: 'not enough constants').", once=True)
         if self._approx and cc == "ISO":
             newdata, clamped = [], False
-            for rec in ([p.strip() for p in ln.split(",")] for ln in data):
-                f = [x for x in rec if x != ""]
-                if len(f) >= 2:
+            for ln in data:
+                f = [p.strip() for p in ln.split(",")]
+                while len(f) > 1 and f[-1] == "":
+                    f.pop()
+                if len(f) >= 2 and f[1]:            # blanks are positional: a blank nu is 0
                     try:
                         if pf(f[1]) >= 0.5:
                             f[1] = "0.475"
                             clamped = True
                     except ValueError:
                         pass
-                if f:
+                if any(f):
                     newdata.append(", ".join(f))
             if clamped:
                 self.report.warn("[APPROX] *ELASTIC Poisson ratio >= 0.5 clamped to 0.475 (ccx "
