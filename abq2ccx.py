@@ -7607,7 +7607,7 @@ class Converter:
         first DOF, an unknown type); a named type covers DOFs 4-6 where handle_boundary
         expands it so (_named_bc_rot)."""
         out = []
-        for rec in self._bc_lines.get(id(b)) or merged_data_records(b):
+        for rec in self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b):
             g = [x.strip() for x in rec]
             while g and g[-1] == "":
                 g.pop()

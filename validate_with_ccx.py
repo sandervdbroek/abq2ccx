@@ -1793,6 +1793,10 @@ def dat_totals(dat_path):
 
 # --- decks for the checks of fixes found in the 19 Oct 2026 code review ------------------------
 
+CUBE8 = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+         "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
+         "1, 1, 2, 3, 4, 5, 6, 7, 8\n*NSET, NSET=TOP\n5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n"
+         "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n")
 
 def planar_coupled_tip_deck(coupled=True, n=10):
     """A B21 cantilever (length 1000, RECT 20 x 40) loaded at its tip, or through a reference
@@ -1809,6 +1813,16 @@ def planar_coupled_tip_deck(coupled=True, n=10):
     lines += ["*STEP", "*STATIC", "*BOUNDARY", "1, ENCASTRE", "*CLOAD",
               f"{tip + 1 if coupled else tip}, 2, -100.", "*NODE PRINT", "U", "*END STEP"]
     return "\n".join(lines) + "\n"
+
+
+def coupled_velocity_deck():
+    """A C3D8 cube held at its bottom, its top face kinematically coupled to node 100: one
+    *BOUNDARY, TYPE=VELOCITY moves node 100 at 2 along x (rotations held), a second gives the
+    coupled top nodes the same velocity — a BC the coupling implies (ccx stops on it)."""
+    return (CUBE8 + "*NODE\n100, 0.5, 0.5, 1.\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n"
+            "1e-3\n*KINEMATIC COUPLING, REF NODE=100\nTOP, 1, 3\n*STEP\n*DYNAMIC\n0.01, 1.\n"
+            "*BOUNDARY\nBOT, 1, 3\n*BOUNDARY, TYPE=VELOCITY\n100, 1, 1, 2.\n100, 4, 6, 0.\n"
+            "*BOUNDARY, TYPE=VELOCITY\nTOP, 1, 1, 2.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
 def main():
@@ -4331,6 +4345,16 @@ def main():
               f"{want:.7g} loaded at the tip ({err:.1e} apart: the tip's knot beam), out of plane "
               f"{off:.1e}")
     failures += 0 if all(tips) and ok else 1
+    # a velocity BC card the coupling implies, left out whole (it came back, and ccx stopped)
+    u = review_run(coupled_velocity_deck(), "coupled_velocity_card", dat_displacements)
+    if u:
+        got = [u.get(n, [math.inf])[0] for n in (5, 6, 7, 8)]
+        ok = max(abs(x - 2.0) for x in got) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  coupled_velocity_card (a cube's coupled top face given "
+              f"its reference node's velocity 2 by a second *BOUNDARY, TYPE=VELOCITY): top face at "
+              f"{', '.join(f'{x:.7g}' for x in got)} after time 1 (2; the card as written stops ccx: "
+              f"'dependent side of a MPC and a SPC')")
+    failures += 0 if u and ok else 1
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")

@@ -6125,6 +6125,21 @@ def test_velocity_bc_on_rigid_body_reference_point():
     assert "TOP, 1, 1" not in body
 
 
+def test_velocity_bc_card_a_coupling_implies_is_left_out_whole():
+    # the members' velocity equals the reference node's, which also holds the rotations:
+    # _plan_coupled_bcs takes every line off the second card, so none of it is written (its raw
+    # lines came back once, as a BC on coupled DOFs: ccx stopped, 'dependent side of a MPC and a
+    # SPC', validate_with_ccx.py coupled_velocity_card)
+    deck = (HEX + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=TOP\n5, 6, 7, 8\n*Nset, nset=BOT\n1, 2, 3, 4\n"
+            "*Kinematic Coupling, ref node=100\nTOP, 1, 3\n*Step\n*Dynamic\n0.01, 1.\n*Boundary\n"
+            "BOT, 1, 3\n*Boundary, type=VELOCITY\n100, 1, 1, 2.\n100, 4, 6, 0.\n"
+            "*Boundary, type=VELOCITY\nTOP, 1, 1, 2.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\n100, 1, 1, 2\n*BOUNDARY\n100, 4, 6\n*NODE" in body
+    assert "TOP, 1, 1" not in body and "taken off 4 DOF(s)" in rep.text()
+    assert "Possible overconstraint" not in rep.text()
+
+
 def test_velocity_bc_finite_rotations_about_several_axes_warned():
     # the manual's example: three turns about z in one static step, a quarter turn about x
     # in the next; integrated per component, the second is wrong under NLGEOM
