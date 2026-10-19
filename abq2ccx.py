@@ -4603,20 +4603,28 @@ class Converter:
                              "combined law (isotropic part from *CYCLIC HARDENING) — verify the "
                              "response under load reversal.", once=True)
             self._reduces("*PLASTIC, HARDENING=COMBINED (Abaqus' nonlinear kinematic fit)")
+        try:
+            unit_scale = pf((b.param("SCALE STRESS") or "").strip() or "1") == 1.0
+        except ValueError:
+            unit_scale = False
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "HARDENING":
                 params[k] = hard
             elif k == "DEPENDENCIES":
                 continue
-            elif k == "RATE" or (k == "SCALE STRESS" and (v or "").strip() not in ("", "1", "1.",
-                                                                                 "1.0")):
+            elif k == "RATE" or (k == "SCALE STRESS" and not unit_scale):
                 self.report.warn(f"*PLASTIC, {k}={v} dropped (not a ccx parameter): the hardening "
                                  f"curve ccx uses differs from Abaqus'.", once=True)
                 self._reduces(f"*PLASTIC, {k}")
             else:
                 self.report.note(f"*PLASTIC parameter {k} dropped (not a ccx parameter).", once=True)
         data = self._collapse_dependencies(b, 2) if b.has("DEPENDENCIES") else None
+        if data is None and b.has("DEPENDENCIES"):
+            self.report.warn("*PLASTIC, DEPENDENCIES=...: rows could not be parsed; passed through "
+                             "— ccx has no field variables and reads every row as a point of one "
+                             "hardening curve. Verify.", once=True)
+            self._reduces("*PLASTIC field-variable dependence")
         return [emit_keyword("PLASTIC", params)] + (data if data is not None else list(b.data))
 
     def _plan_material_cards(self, blocks: List[Block]) -> None:

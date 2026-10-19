@@ -2621,6 +2621,10 @@ def test_plastic_hardening_forms():
     assert not any(l.startswith("*PLASTIC") for l in _live(body))
     body, _, _ = convert_str(mat + "*Plastic\n300., 0.\n400., 0.1\n")
     assert "*PLASTIC\n300., 0.\n400., 0.1" in body                      # tabular untouched
+    # SCALE STRESS is read as a number: 1.00 and 1e0 change nothing, 2 is reduced physics
+    for scale, reduced in (("1.00", []), ("1e0", []), ("2.", ["*PLASTIC, SCALE STRESS"])):
+        _, conv, _ = convert_str(mat + f"*Plastic, scale stress={scale}\n300., 0.\n400., 0.1\n")
+        assert conv.reduced_physics == reduced, scale
 
 
 def test_field_dependencies_collapsed():
@@ -2631,6 +2635,10 @@ def test_field_dependencies_collapsed():
     body, _, _ = convert_str("*Material,name=M\n*Plastic, dependencies=1\n100.,0.,,0.\n"
                              "200.,0.1,,0.\n150.,0.,,1.\n250.,0.1,,1.\n")
     assert "*PLASTIC\n100., 0.\n200., 0.1" in body and "150." not in body
+    # rows that cannot be read are passed through, warned and reduced physics, as on *ELASTIC
+    _, conv, rep = convert_str("*Material,name=M\n*Plastic, dependencies=1\n100.,0.,20.,abc\n")
+    assert "*PLASTIC, DEPENDENCIES=...: rows could not be parsed" in rep.text()
+    assert conv.reduced_physics == ["*PLASTIC field-variable dependence"]
     body, _, _ = convert_str("*Material,name=M\n*Density, dependencies=1\n1., , 0.5\n2., , 1.\n")
     assert "*DENSITY\n1.\n" in body + "\n"
 
