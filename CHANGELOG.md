@@ -30,9 +30,11 @@ physics.
   a `*BUCKLE` step after a gravity or centrifugal preload, or any step after a `*STEP,
   PERTURBATION` `*BUCKLE` under its own weight. Such a step now gets a zero `GRAV` line, which
   loads nothing (a column's factor under a gravity preload: the same as with the preload as
-  nodal forces). `*TEMPERATURE` in a `*BUCKLE` step, which ccx refuses ("temperature loading is
-  not allowed in a linear buckling step") and Abaqus scales with the factor, is commented out
-  as reduced physics.
+  nodal forces). A plain `*STEP` + `*BUCKLE` after a general step gets `PERTURBATION`: Abaqus
+  always buckles about the preloaded base state, ccx without it buckled the unloaded structure
+  (the column: 10.81 for 6.11). `*TEMPERATURE` in a `*BUCKLE` step, which ccx refuses
+  ("temperature loading is not allowed in a linear buckling step") and Abaqus scales with the
+  factor, is commented out as reduced physics.
 
 ## 1.3.0 (October 2026)
 

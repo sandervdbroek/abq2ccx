@@ -5126,6 +5126,24 @@ def test_zero_body_load_where_ccx_would_hold_none():
     # no body load before: nothing to keep
     got, _, rep = steps(_deck_step("Static", load), buckle, _deck_step("Buckle\n2", grav))
     assert "GRAV, 0." not in "".join(got) and "holds no body load" not in rep.text()
+    # a *BUCKLE without PERTURBATION keeps its loads into the next step in ccx: none needed
+    # there (it is the first step: after a general step it gets PERTURBATION, below)
+    got = steps(_deck_step("Buckle\n2", grav + load), _deck_step("Frequency\n3"))[0]
+    assert got[1].startswith("\n*BUCKLE") and [s.count("GRAV, 0.") for s in got[1:]] == [0, 0]
+
+
+def test_buckle_after_a_general_step_gets_perturbation():
+    # Abaqus always buckles about the base state, its preload's stresses included; ccx 2.23
+    # without *STEP, PERTURBATION buckles the unloaded structure (probed: a column under a
+    # gravity preload, 6.11 vs 10.81), so a plain *BUCKLE step after a general step gets it
+    grav, buckle = "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n", _deck_step("Buckle\n2", "*Cload\n7, 3, -1.\n")
+    body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", grav) + buckle)
+    assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == ["", ", PERTURBATION"]
+    assert "*STEP, PERTURBATION written on a *BUCKLE step after a general step" in rep.text()
+    assert "EALL, GRAV, 0., 0., 0., -1." in body and not conv.reduced_physics
+    # first, or after perturbation steps only: no preload, left as it is
+    body, _, rep = convert_str(BUCKLE_CUBE + _deck_step("Frequency\n3") + buckle)
+    assert "PERTURBATION" not in body and "PERTURBATION written" not in rep.text()
 
 
 def test_temperature_in_a_buckle_step_commented_out():
@@ -5150,6 +5168,11 @@ def test_temperature_in_a_buckle_step_commented_out():
     # a static step's temperatures stay
     body, conv, _ = convert_str(BUCKLE_CUBE + _deck_step("Static", temp))
     assert "\n*TEMPERATURE\nALL, 100.\n" in body and not conv.reduced_physics
+    # the audit's wording follows its own step count (a *STEP before *END STEP replaces the
+    # open step): the step it flags is the static one
+    _, conv, rep = convert_str(BUCKLE_CUBE + "*Step\n*Buckle\n2\n*Cload\n7, 3, -1.\n" +
+                               _deck_step("Static", "*Dsload\nSURFX, P, 1.\n"))
+    assert conv.unloaded_steps == [1] and "no load at all, to a zero response" in rep.text()
 
 
 def test_dload_without_element_set_loads_the_whole_model():

@@ -7506,6 +7506,12 @@ class Converter:
             # ccx's default here anyway; it makes ccx define its step ramp, which the
             # displacement BCs of this step use (_plan_default_amplitudes)
             params["AMPLITUDE"] = "STEP"
+        if proc == "BUCKLE" and "PERTURBATION" not in params and self._general_step_seen:
+            params["PERTURBATION"] = None
+            self.report.note("*STEP, PERTURBATION written on a *BUCKLE step after a general step: "
+                             "Abaqus always buckles about the base state, its preload's stresses "
+                             "included; ccx 2.23 without PERTURBATION buckles the unloaded structure "
+                             "(probed: a column under a gravity preload, 6.11 vs 10.81).", once=True)
         if proc in ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO") and not step_block.has("PERTURBATION"):
             self._general_step_seen = True
@@ -15552,12 +15558,17 @@ class Converter:
         dst = step_load_audit(blocks_from_lines(out), user_loads=False)
         self.source_unloaded = bool(src) and all(s == [] for s in src)
         self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1) if s and d == []]
-        procs: List[Optional[str]] = []             # each *STEP's procedure, as counted above
-        for b in blocks:
+        procs: List[Optional[str]] = []             # each step's procedure, counted as there:
+        cur: Optional[List[str]] = None             # a *STEP before *END STEP replaces the open one
+        for b in list(blocks) + [Block("END STEP", OrderedDict())]:
             if b.keyword == "STEP":
-                procs.append(None)
-            elif b.keyword in PROC_KW and procs and procs[-1] is None:
-                procs[-1] = b.keyword
+                cur = []
+            elif b.keyword != "END STEP":
+                if cur is not None:
+                    cur.append(b.keyword)
+            elif cur is not None:
+                procs.append(next((k for k in cur if k in PROC_KW), None))
+                cur = None
         for i in self.unloaded_steps:
             lost = src[i - 1]
             self.report.warn(f"Step {i} is loaded in the Abaqus deck ({'; '.join(lost[:3])}"
