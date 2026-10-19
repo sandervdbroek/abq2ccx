@@ -1791,6 +1791,26 @@ def dat_totals(dat_path):
     return out
 
 
+# --- decks for the checks of fixes found in the 19 Oct 2026 code review ------------------------
+
+
+def planar_coupled_tip_deck(coupled=True, n=10):
+    """A B21 cantilever (length 1000, RECT 20 x 40) loaded at its tip, or through a reference
+    node kinematically coupled (*COUPLING, *KINEMATIC) to the tip node."""
+    tip = n + 1
+    lines = ["*NODE"] + [f"{i + 1}, {100.0 * i:g}, 0." for i in range(n + 1)]
+    lines += ["*ELEMENT, TYPE=B21, ELSET=BEAM"] + [f"{i + 1}, {i + 1}, {i + 2}" for i in range(n)]
+    lines += ["*BEAM SECTION, ELSET=BEAM, MATERIAL=M, SECTION=RECT", "20., 40.", "*MATERIAL, NAME=M",
+              "*ELASTIC", "210000., 0.3"]
+    if coupled:
+        lines += ["*NODE", f"{tip + 1}, {100.0 * n:g}, 0.", "*NSET, NSET=TIP", str(tip),
+                  "*SURFACE, NAME=TIPS, TYPE=NODE", "TIP", f"*COUPLING, REF NODE={tip + 1}, "
+                  "SURFACE=TIPS, CONSTRAINT NAME=C", "*KINEMATIC"]
+    lines += ["*STEP", "*STATIC", "*BOUNDARY", "1, ENCASTRE", "*CLOAD",
+              f"{tip + 1 if coupled else tip}, 2, -100.", "*NODE PRINT", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -4279,6 +4299,38 @@ def main():
               f"difference {err:.1e} of max |u|")
         failures += 0 if ok else 1
 
+    # --- decks the converter got wrong before the 19 Oct 2026 code review ------------------
+    def review_run(text, tag, read, approximate=False):
+        """``read(.dat path)`` of ``text`` converted and solved, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        try:
+            convert(src, inp, approximate=approximate)
+        except Exception as exc:  # noqa: BLE001
+            print(f"FAIL  {tag}: the conversion failed ({exc!r})")
+            return None
+        d, status, out = run_ccx(ccx, env, inp)
+        res = read(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if not res:
+            print(f"FAIL  {tag}: no results ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        return res
+
+    # a planar beam's tip node coupled to a reference node (the converter stopped on it)
+    tips = [review_run(planar_coupled_tip_deck(c), "planar_coupled_tip" + ("" if c else "_ref"),
+                       dat_displacements) for c in (True, False)]
+    if all(tips):
+        got, want = tips[0].get(11, [0.0, math.inf])[1], tips[1].get(11, [0.0, math.nan])[1]
+        off = max(abs(v[2]) for v in tips[0].values())
+        err = abs(got / want - 1)
+        ok = err < 1e-4 and off < 1e-9 * abs(want)
+        print(f"{'PASS' if ok else 'FAIL'}  planar_coupled_tip (B21 cantilever, its tip coupled by "
+              f"*COUPLING, *KINEMATIC to the loaded reference node): tip deflection {got:.7g} vs "
+              f"{want:.7g} loaded at the tip ({err:.1e} apart: the tip's knot beam), out of plane "
+              f"{off:.1e}")
+    failures += 0 if all(tips) and ok else 1
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")

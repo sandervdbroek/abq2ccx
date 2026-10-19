@@ -3842,6 +3842,21 @@ def test_planar_constraint_skips_constrained_and_skewed_nodes():
     assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2]
 
 
+def test_planar_constraint_skips_coupled_and_tied_nodes():
+    # a *COUPLING's surface nodes and the slave nodes of a *TIE or a tied *CONTACT PAIR follow
+    # their constraint (these decks once stopped the converter: AttributeError)
+    tip = "*Nset, nset=TIP\n4\n*Surface, name=TIPS, type=NODE\nTIP\n"
+    coupling = "*Node\n5, 3., 0.\n" + tip + "*Coupling, ref node=5, surface=TIPS, constraint name=C\n*Kinematic\n"
+    _, conv, rep = convert_str(PLANAR_BEAM.replace("*Step", coupling + "*Step", 1))
+    assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2, 3]
+    assert "1 node(s) whose DOF 3 an *EQUATION, *MPC, rigid body, coupling or *TIE" in rep.text()
+    base = tip + "*Elset, elset=E1\n1\n*Surface, name=BASE\nE1, SPOS\n"
+    for tie in ("*Tie, name=T\nTIPS, BASE\n",
+                "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\nTIPS, BASE\n"):
+        _, conv, _ = convert_str(PLANAR_BEAM.replace("*Step", base + tie + "*Step", 1))
+        assert conv.geom.nset("ABQ2CCX_PLANAR") == [1, 2, 3], tie
+
+
 def test_planar_constraint_repeated_after_op_new():
     # *BOUNDARY, OP=NEW removes the model-data constraint as well (verified on ccx 2.23);
     # here it removes node 4's support

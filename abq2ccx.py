@@ -20026,7 +20026,7 @@ class Converter:
                 ref = (b.param("REF NODE") or b.param("REFNODE") or "").strip()
                 held.update(self._resolve_nodes(ref) if ref else [])
                 if kw == "COUPLING":
-                    held.update(self._surface_nodes((b.param("SURFACE") or "").strip()))
+                    held.update(self._surface_member_nodes((b.param("SURFACE") or "").strip()))
                 else:
                     for rec in merged_data_records(b):
                         if rec and rec[0].strip():
@@ -20034,7 +20034,7 @@ class Converter:
             elif kw == "TIE" or (kw == "CONTACT PAIR" and b.has("TIED")):
                 for rec in merged_data_records(b):
                     if rec and rec[0].strip():
-                        held.update(self._surface_nodes(rec[0].strip()))
+                        held.update(self._surface_member_nodes(rec[0].strip()))
         return held
 
     def _planar_skew_nodes(self, blocks: List[Block]) -> set:
