@@ -777,7 +777,7 @@ def gen_output():
                  {v for labels in A.CCX_ENERGY_LABELS.values() for v in labels})) +
              " — and in a nonlinear calculation stops when that is not the first step. The "
              "converter then adds `ENER` to the first step's `*EL FILE` (or an `*EL FILE` card "
-             "for it).\n",
+             "for it), and keeps it out of the steps after it, into which ccx would carry it.\n",
              "## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)\n",
              "Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the "
              "output database*, table 1) as the whole-model ccx cards it becomes. Abaqus also "

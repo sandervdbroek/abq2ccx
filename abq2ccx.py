@@ -10910,8 +10910,7 @@ class Converter:
         if hidden:
             self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
             self.geom.nsets[self._qmem_hidden] = hidden
-        groups = step_groups(blocks)[1]
-        self._energy_from_step_one(steps, groups[0][0] if groups else None)
+        self._energy_from_step_one(steps, [g[0] for g in step_groups(blocks)[1]])
         for k, timing, reqs in steps:
             self._out_ctl[k] = self._step_output_control(k, timing, reqs)
             for r in reqs:
@@ -11084,7 +11083,7 @@ class Converter:
         return visible
 
     def _energy_from_step_one(self, steps: List[Tuple[int, dict, List[dict]]],
-                              first: Optional[Block]) -> None:
+                              anchors: List[Block]) -> None:
         """ccx 2.23 computes element energies from the first step that needs them on: an
         implicit *DYNAMIC or transient (un)coupled temperature-displacement step, whatever it
         requests (dynamics.f: "for implicit dynamic calculations the energy balance is always
@@ -11094,10 +11093,13 @@ class Converter:
         are nonlinear there.  Probed: a static (also NLGEOM), *FREQUENCY, *BUCKLE, *VISCO,
         explicit or heat transfer step followed by one stops ccx, with or without output
         requests.  So where a later step needs energies, step 1 requests ENER on its first
-        *EL FILE, or on an *EL FILE of its own at the *STEP (``first``), which has no say in
-        the step's output control.  A card with FREQUENCY=0 would not do (ccx skips it), and
-        a linear later step would not need it, which the converter cannot tell (NLGEOM,
-        plasticity, contact)."""
+        *EL FILE, or on an *EL FILE of its own at its *STEP (``anchors``: the steps' *STEP
+        cards).  ccx keeps a step's *EL FILE requests in the next steps that give none (an
+        *EL FILE replaces them, a *NODE FILE does not; probed), so a step 2 without one gets
+        step 1's back without ENER, or an empty *EL FILE, which clears them.  These cards have
+        no say in their step's output control.  A card with FREQUENCY=0 would not do (ccx
+        skips it), and a linear later step would not need it, which the converter cannot tell
+        (NLGEOM, plasticity, contact)."""
         for k, timing, reqs in steps:
             why = [f"step {k}, {timing['energy']},"] if timing.get("energy") else []
             why += [f"step {k}'s *{r['cc']} {lab} request" for r in reqs if r["live"]
@@ -11106,23 +11108,31 @@ class Converter:
                 break
         else:
             return
-        if k == 1 or first is None:
+        if k == 1 or len(anchors) < len(steps):
             return
-        msg = (f"{why[0]} makes ccx 2.23 compute element energies, which in a nonlinear "
-               f"calculation (every implicit dynamic or transient coupled step is one in ccx) it "
-               f"accepts only from the first step on — it stops otherwise (\"energy output "
-               f"requests, if any, must be specified in the first step\").")
-        reqs = steps[0][2]
-        el = next((r for r in reqs if r["live"] and r["cc"] == "EL FILE" and len(r["labels"]) < 16),
-                  None)
-        if el is not None:
-            el["labels"] = el["labels"] + ["ENER"]
-            el["notes"].append(f"ENER added to step 1's *EL FILE: {msg}")
-            return
-        reqs.append({"b": mkblock("EL FILE"), "cc": "EL FILE", "params": OrderedDict(),
-                     "labels": ["ENER"], "notes": [f"*EL FILE ENER added to step 1: {msg}"],
-                     "warnings": [], "frd": True, "frd_sets": [], "covered": [], "set": None,
-                     "ctl": None, "default": True, "live": True, "anchor": first})
+
+        def card(params: "OrderedDict[str, Optional[str]]", labels: List[str], anchor: Block) -> dict:
+            return {"b": mkblock("EL FILE"), "cc": "EL FILE", "params": params, "labels": labels,
+                    "notes": [], "warnings": [], "frd": True, "frd_sets": [], "covered": [],
+                    "set": None, "ctl": None, "default": True, "live": True, "anchor": anchor}
+        files = [r for r in steps[0][2] if r["live"] and r["cc"] == "EL FILE"]
+        again = ""
+        if not any(r["live"] and r["cc"] == "EL FILE" for r in steps[1][2]):
+            steps[1][2].extend([card(OrderedDict(r["params"]), list(r["labels"]), anchors[1])
+                                for r in files] or [card(OrderedDict(), [], anchors[1])])
+            again = (", and step 1's *EL FILE written again without it in step 2" if files else
+                     ", and an empty *EL FILE to step 2") + " (ccx would carry it on there)"
+        el = next((r for r in files if len(r["labels"]) < 16), None)
+        what = "ENER added to step 1's *EL FILE"
+        if el is None:
+            el, what = card(OrderedDict(), [], anchors[0]), "*EL FILE ENER added to step 1"
+            steps[0][2].append(el)
+        el["labels"] = el["labels"] + ["ENER"]
+        el["notes"].append(
+            f"{what}{again}: {why[0]} makes ccx 2.23 compute element energies, which in a "
+            f"nonlinear calculation (every implicit dynamic or transient coupled step is one in "
+            f"ccx) it accepts only from the first step on — it stops otherwise (\"energy output "
+            f"requests, if any, must be specified in the first step\").")
 
     def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
         """One output card of a step: where it goes, its labels and the output control it

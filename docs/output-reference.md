@@ -30,7 +30,7 @@ Dropped from `*EL FILE`/`*NODE FILE` (.frd): `CELS`, `ELKE`, `ELSE`, `EVOL`.
 
 ## Energies from the first step
 
-ccx 2.23 computes element energies from the first step that needs them on — an implicit `*DYNAMIC` or a transient coupled temperature-displacement step, or a request for `CELS`, `ELKE`, `ELSE`, `ENER` — and in a nonlinear calculation stops when that is not the first step. The converter then adds `ENER` to the first step's `*EL FILE` (or an `*EL FILE` card for it).
+ccx 2.23 computes element energies from the first step that needs them on — an implicit `*DYNAMIC` or a transient coupled temperature-displacement step, or a request for `CELS`, `ELKE`, `ELSE`, `ENER` — and in a nonlinear calculation stops when that is not the first step. The converter then adds `ENER` to the first step's `*EL FILE` (or an `*EL FILE` card for it), and keeps it out of the steps after it, into which ccx would carry it.
 
 ## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)
 

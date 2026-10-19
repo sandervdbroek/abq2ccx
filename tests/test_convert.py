@@ -3542,17 +3542,28 @@ def test_energy_requested_from_the_first_step():
     assert "ENER" not in _step(body, 2)
     assert "ENER added to step 1's *EL FILE: step 2, an implicit *DYNAMIC, makes ccx 2.23 " \
            "compute element energies" in rep.text()
-    # or on an *EL FILE card of its own at the step's end, which has no say in the step's
+    # ccx keeps a step's *EL FILE in the next steps that give none: a step 2 without one gets
+    # step 1's back without ENER (what ccx carried before)
+    body, _, rep = convert_str(HEX + STEEL + "*Step\n*Static\n" + load + "*End Step\n*Step\n"
+                               "*Dynamic\n0.01, 1.\n*Output, field\n*Node Output\nU\n*End Step\n")
+    assert _step(body, 2).endswith("*NODE FILE, FREQUENCY=10\nU\n*EL FILE\nS, E\n")
+    assert "ENER added to step 1's *EL FILE, and step 1's *EL FILE written again without it in " \
+           "step 2 (ccx would carry it on there)" in rep.text()
+    # or ENER on an *EL FILE card of its own at the step's end, which has no say in the step's
     # output control: after a *FREQUENCY step's preselected U, output switched off, history
-    # output every 5 increments (the step's control stays on its first card)
-    for step1, cards in (("*Frequency\n3\n", "*NODE FILE\nU\n"),
-                         ("*Static\n" + load + "*Output, field, frequency=0\n*Node Output\nU\n",
-                          load.upper()),
-                         ("*Static\n" + load + "*Output, history, frequency=5\n*Element Output, "
-                          "elset=EALL\nS\n", "*EL PRINT, ELSET=EALL, FREQUENCY=5\nS\n")):
+    # output every 5 increments (the step's control stays on its first card); a step 2 without
+    # an *EL FILE then gets an empty one, which clears it in ccx
+    for step1, cards, step2 in (("*Frequency\n3\n", "*NODE FILE\nU\n", "*EL FILE\nS, E\n"),
+                                ("*Static\n" + load + "*Output, field, frequency=0\n*Node "
+                                 "Output\nU\n", load.upper(), "0.01, 1.\n*EL FILE\n"),
+                                ("*Static\n" + load + "*Output, history, frequency=5\n*Element "
+                                 "Output, elset=EALL\nS\n", "*EL PRINT, ELSET=EALL, FREQUENCY=5\nS\n",
+                                 "0.01, 1.\n*EL FILE\n")):
         body, _, rep = convert_str(HEX + STEEL + "*Step\n" + step1 + "*End Step\n" + dyn)
         assert _step(body, 1).endswith(cards + "*EL FILE\nENER\n"), _step(body, 1)
-        assert "*EL FILE ENER added to step 1: step 2, an implicit *DYNAMIC," in rep.text()
+        assert _step(body, 2).endswith(step2), _step(body, 2)
+        assert "*EL FILE ENER added to step 1" in rep.text()
+        assert ("and an empty *EL FILE to step 2" in rep.text()) == (step2 == "0.01, 1.\n*EL FILE\n")
     # a transient coupled step and a later energy request in a nonlinear step stop ccx alike
     for step2, why in (("*Coupled Temperature-displacement\n0.1, 1.\n",
                         "step 2, a transient *COUPLED TEMPERATURE-DISPLACEMENT,"),
