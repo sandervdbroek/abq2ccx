@@ -1148,13 +1148,16 @@ def merged_data_records(block: Block) -> List[List[str]]:
     node count (``_register_elements``), and material/constraint data lines are passed
     through verbatim, so nothing here needs continuation merging.  Interior blank fields
     are preserved (they are positional placeholders)."""
-    records: List[List[str]] = []
-    for line in block.data:
-        fields = [p.strip() for p in line.split(",")]
-        while fields and fields[-1] == "":
-            fields.pop()
-        records.append(fields)
-    return records
+    return [trimmed_fields(line.split(",")) for line in block.data]
+
+
+def trimmed_fields(fields: Sequence[str]) -> List[str]:
+    """A data record's fields, stripped, without the trailing blank ones (interior blanks are
+    positional: ``node, dof1, , value`` has a blank last DOF)."""
+    g = [x.strip() for x in fields]
+    while g and g[-1] == "":
+        g.pop()
+    return g
 
 
 def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
@@ -3965,9 +3968,7 @@ class Converter:
     def _register_nodes(self, b: Block) -> None:
         ids = []
         for rec in merged_data_records(b):
-            f = [x.strip() for x in rec]
-            while f and f[-1] == "":
-                f.pop()
+            f = trimmed_fields(rec)
             if not f:
                 continue
             try:                            # fields by position; a blank one is 0, as in Abaqus
@@ -5137,9 +5138,7 @@ class Converter:
                 return None
         rows: List[str] = []
         for ln in lines:
-            f = [x.strip() for x in ln.split(",")]
-            while f and f[-1] == "":
-                f.pop()
+            f = trimmed_fields(ln.split(","))
             if not f:
                 continue
             try:                                # by position: a blank field is 0, as in Abaqus
@@ -6777,9 +6776,7 @@ class Converter:
             return [("", (b.param("MATERIAL") or "").strip(), "")]
         plies: List[Tuple[str, str, str]] = []
         for rec in merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+            g = trimmed_fields(rec)
             if len(g) >= 3 and g[0]:
                 plies.append((g[0], g[2], (g[3] if len(g) > 3 else "").upper()))
         return plies + plies[::-1] if b.has("SYMMETRIC") else plies
@@ -7510,15 +7507,13 @@ class Converter:
         midside = [] if getattr(b, "_no_midside", False) else \
             [ln.split(",") for ln in self._midside_records(b, "boundary")]
         # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
-        recs = self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
+        recs = self._bc_card_records(b)
         self._rot_hit = []
         head, inactive = len(out), False          # inactive: a line left out (no such DOF)
         for rec in recs + midside:
             # Interior blanks are positional (e.g. "node, dof1, , value" = blank last
             # DOF), so trim only trailing empties — never filter interior fields.
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+            g = trimmed_fields(rec)
             if not g:
                 continue
             spec, rest = g[0], g[1:]
@@ -7781,10 +7776,8 @@ class Converter:
         first DOF, an unknown type); a named type covers DOFs 4-6 where handle_boundary
         expands it so (_named_bc_rot)."""
         out = []
-        for rec in self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+        for rec in self._bc_card_records(b):
+            g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
                 continue
             text = ", ".join(g)
@@ -8593,12 +8586,10 @@ class Converter:
         the line, which then stays as it is), magnitude (text; ``num``: its value, None if
         unreadable), resolved nodes, and ``ends``: the nodes whose state decides the line -
         its own, a midside node's end nodes for that node."""
-        recs = self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
+        recs = self._bc_card_records(b)
         out: List[dict] = []
         for rec in list(recs) + [ln.split(",") for ln in self._midside_records(b, "boundary")]:
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+            g = trimmed_fields(rec)
             if not g:
                 continue
             ln = dict(text=", ".join(g), spec=g[0], named=None, dofs=[], value="", num=0.0)
@@ -10068,10 +10059,8 @@ class Converter:
                         if n in nodes:
                             out.setdefault(n, []).append((d, num(f[2] if len(f) > 2 else "")))
             return out
-        for rec in self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+        for rec in self._bc_card_records(b):
+            g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
                 continue
             if re.fullmatch(r"[-+]?\d+", g[1]):
@@ -15047,9 +15036,7 @@ class Converter:
             return []
         recs: Dict[int, Dict[int, object]] = {}
         for rec in merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+            g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
                 continue
             vals: Dict[int, object] = {}
@@ -16357,9 +16344,7 @@ class Converter:
             return []
         recs: Dict[int, Dict[int, object]] = {}
         for rec in merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+            g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
                 continue
             try:
@@ -18587,9 +18572,7 @@ class Converter:
         magnitude is NaN (equal to nothing)."""
         out = []
         for rec in merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+            g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
                 continue
             if re.fullmatch(r"[-+]?\d+", g[1]):
@@ -19179,9 +19162,7 @@ class Converter:
             pending += [[str(ref), str(a), str(c)] + ([fmt_num(v)] if v else [])
                         for a, c, v in spans]
         for rec in merged_data_records(b):
-            g = [x.strip() for x in rec]
-            while g and g[-1] == "":
-                g.pop()
+            g = trimmed_fields(rec)
             if len(g) < 2:
                 out.append(g)
                 continue
@@ -19426,6 +19407,11 @@ class Converter:
             return [conn[p - 1] for p in FACE_NODES[fam][int(m.group(1))] if p <= n]
         return list(conn)
 
+    def _bc_card_records(self, b: Block) -> List[List[str]]:
+        """The data records of *BOUNDARY card ``b`` as written: those _plan_coupled_bcs left
+        on it (_bc_lines; none when it took them all), else the card's own."""
+        return self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b)
+
     def _resolve_nodes(self, token: str) -> List[int]:
         if re.fullmatch(r"[-+]?\d+", token):
             return [int(token)]
@@ -19468,10 +19454,7 @@ class Converter:
         isint = re.compile(r"[-+]?\d+").fullmatch
 
         def fields(j: int) -> List[str]:
-            f = [x.strip() for x in out[j].split(",")]
-            while f and f[-1] == "":
-                f.pop()
-            return f
+            return trimmed_fields(out[j].split(","))
         inline: Dict[str, List[int]] = {}        # node sets / node surfaces the handlers wrote
         nsurf: Dict[str, List[int]] = {}
 
@@ -21452,9 +21435,7 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
     if kw == "EQUATION":
         pending = 0                                  # terms still to read for this equation
         for ln in b.data:
-            f = [x.strip() for x in ln.split(",")]
-            while f and f[-1] == "":
-                f.pop()
+            f = trimmed_fields(ln.split(","))
             if pending == 0:
                 data.append(ln)                      # term count line
                 try:
@@ -21941,9 +21922,7 @@ def _remap_node_orientation(b: Block, nodes: Dict[int, Vec], node_off: int, turn
     written as the part's node positions ``nodes`` turned by ``turn`` (None: the instance
     leaves the part where it is), as a part's DEFINITION=COORDINATES axes are turned
     ("Orientations": rotated according to each instance's positioning)."""
-    f = [x.strip() for x in b.data[0].split(",")]
-    while f and f[-1] == "":
-        f.pop()
+    f = trimmed_fields(b.data[0].split(","))
     ids: List[Optional[int]] = []
     for x in f[:3]:
         try:
