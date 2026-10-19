@@ -1316,6 +1316,14 @@ def equation_rows(terms: Sequence[tuple], coef: Callable[[object], str] = str) -
                                 for i in range(0, len(terms), 4)]
 
 
+def amplitude_lines(pts: Sequence[Tuple[float, float]], per_line: int = 4,
+                    digits: int = 12) -> List[str]:
+    """The 'time, amplitude' data lines of an *AMPLITUDE, ``per_line`` pairs a line, to
+    ``digits`` significant digits (12: at most 19 characters, inside the 20 ccx reads)."""
+    items = [f"{t:.{digits}g}, {a:.{digits}g}" for t, a in pts]
+    return [", ".join(items[i:i + per_line]) for i in range(0, len(items), per_line)]
+
+
 def compress_ids(ids: Sequence[int]) -> List[str]:
     """Emit ids as a single ``GENERATE`` triple when they form an arithmetic run,
     otherwise as explicit comma-separated lines (<=16 per line).  Returns the data
@@ -7975,9 +7983,7 @@ class Converter:
         def amp_card(pts: List[Tuple[float, float]], q: str) -> Tuple[str, List[str]]:
             self._vel_amp_count += 1
             name = f"ABQ2CCX_{names[q]}{self._vel_amp_count}"
-            toks = [f"{t:.12g}, {x:.12g}" for t, x in pts]
-            return name, [f"*AMPLITUDE, NAME={name}"] + [", ".join(toks[i:i + 4])
-                                                         for i in range(0, len(toks), 4)]
+            return name, [f"*AMPLITUDE, NAME={name}"] + amplitude_lines(pts)
 
         def runs(ds: Sequence[int]) -> List[Tuple[int, int]]:
             """Contiguous runs of sorted DOFs."""
@@ -12217,8 +12223,7 @@ class Converter:
                 self.report.note("*AMPLITUDE SCALEX/SCALEY applied to the data points (ccx has no "
                                  "such parameters).", once=True)
                 pts = [(t * scale[0], a * scale[1]) for t, a in pts]
-            items = [f"{t:.12g}, {a:.12g}" for t, a in pts]
-            return [", ".join(items[i:i + per_line]) for i in range(0, len(items), per_line)]
+            return amplitude_lines(pts, per_line)
 
         def scaled(lines: List[str]) -> List[str]:
             """The deck's own 'time, amplitude' lines, rewritten only where SCALEX/SCALEY apply."""
@@ -12326,8 +12331,7 @@ class Converter:
                          f"amplitude points over its {'total' if curve.total else 'step'} time 0 to "
                          f"{end:g} (ccx has no analytic amplitudes): the straight lines between them "
                          f"stay within {dev / scale:.1e} of the curve's largest value.", once=True)
-        pairs = [f"{t:.9g}, {a:.9g}" for t, a in pts]
-        return [", ".join(pairs[i:i + 4]) for i in range(0, len(pairs), 4)]
+        return amplitude_lines(pts, 4, 9)
 
     def _smooth_step_to_tabular(self, b: Block) -> Optional[List[Tuple[float, float]]]:
         """Sample Abaqus' SMOOTH STEP quintic (a = A0 + (A1-A0)*x^3*(10-15x+6x^2)) into
