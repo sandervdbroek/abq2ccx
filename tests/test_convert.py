@@ -5865,6 +5865,10 @@ def test_transformed_beam_node_rotations_in_global_components_on_a_knot():
     want = {(3, 4 + k): e[0][k] + 2. * e[2][k] for k in range(3)}
     assert _close(_cloads(body)[0], want, 1e-10)
     assert "got a force-free knot beam" in rep.text() and rep.n_warnings == 0
+    # DOF +6 or 06 is DOF 6, as ccx reads it (both moments were kept local, no knot)
+    for dof in ("+6", "06"):
+        body, conv, _ = convert_str(_tip(f"*Cload\n3, 4, 1.\n3, {dof}, 2.\n"))
+        assert 3 in conv._knots and _close(_cloads(body)[0], want, 1e-10), dof
     # three local rotations prescribed: their global values
     body, _, _ = convert_str(_tip("*Boundary\n3, 4, 4, 0.01\n3, 5, 6, 0.02\n"))
     rows = {l.split(",")[1]: float(l.split(",")[3]) for l in _bc_lines(body) if l.startswith("3,")}

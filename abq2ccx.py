@@ -1245,6 +1245,13 @@ def pint(token) -> int:
     return int(pf(token))
 
 
+def dof_number(token: str) -> Optional[int]:
+    """A load or BC line's DOF field as handle_cload and ccx read it: an integer, so ``+6``
+    and ``06`` are DOF 6; None for anything else (a named BC type, a blank)."""
+    token = token.strip()
+    return int(token) if re.fullmatch(r"[-+]?\d+", token) else None
+
+
 def short_real(x: float, digits: int = 9) -> str:
     """A real for a ccx data field: at most ``digits`` significant digits (ccx 2.23 reads only
     the first 20 characters of a field) and always with a decimal point or exponent."""
@@ -9897,10 +9904,11 @@ class Converter:
         if b.keyword == "CLOAD":
             for ln in b.data:
                 f = [x.strip() for x in ln.split(",")]
-                if len(f) >= 2 and re.fullmatch(r"[456]", f[1]):
+                d = dof_number(f[1]) if len(f) >= 2 else None
+                if d is not None and 4 <= d <= 6:
                     for n in self._resolve_nodes(f[0]):
                         if n in nodes:
-                            out.setdefault(n, []).append((int(f[1]), num(f[2] if len(f) > 2 else "")))
+                            out.setdefault(n, []).append((d, num(f[2] if len(f) > 2 else "")))
             return out
         for rec in self._bc_lines[id(b)] if id(b) in self._bc_lines else merged_data_records(b):
             g = [x.strip() for x in rec]
@@ -17240,7 +17248,7 @@ class Converter:
         for b in blocks:
             if b.keyword == "CLOAD":
                 for rec in merged_data_records(b):
-                    if len(rec) > 1 and re.fullmatch(r"[456]", rec[1].strip()):
+                    if len(rec) > 1 and (dof_number(rec[1]) or 0) in (4, 5, 6):
                         turned.update(self._resolve_nodes(rec[0].strip()))
         self._conn_turned = turned
         # rotations that exist apart from the connectors: reference / rotation nodes of
@@ -17517,7 +17525,8 @@ class Converter:
             elif b.keyword == "CLOAD":
                 for rec in merged_data_records(b):
                     f = [x.strip() for x in rec]
-                    if len(f) > 1 and re.fullmatch(r"[456]", f[1]) and n in self._resolve_nodes(f[0]):
+                    if len(f) > 1 and (dof_number(f[1]) or 0) in (4, 5, 6) and \
+                            n in self._resolve_nodes(f[0]):
                         return True
             elif b.keyword == "EQUATION":
                 if any(4 <= d <= 6 and n in ns for ns, d in self._equation_dofs(b)):
