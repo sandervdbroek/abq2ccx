@@ -8287,6 +8287,50 @@ def test_plane_and_axisymmetric_rigid_segments():
         assert r < 1e-12 or abs(abs(math.degrees(math.atan2(p[2], p[0]))) - 1.0) < 1e-9
 
 
+def test_parameter_names_without_blanks():
+    # Abaqus ignores blanks in parameter names: POSITIONTOLERANCE= is POSITION TOLERANCE=
+    _, p = A.parse_keyword_line("*Tie, name=T, positionTolerance=0.1, no  rotation, stackdir=1")
+    assert list(p) == ["NAME", "POSITION TOLERANCE", "NO ROTATION", "STACK DIRECTION"]
+    src = open(A.__file__, encoding="utf-8").read()            # every multi-word name read
+    read = set(re.findall(r'\.(?:u?param|has)\("([A-Z0-9-]+(?: [A-Z0-9-]+)+)"', src))
+    assert read and read <= set(A.MULTIWORD_PARAMS), read - set(A.MULTIWORD_PARAMS)
+    # converted exactly as spelled with blanks (the *TIE lost its tolerance and tied nothing,
+    # NO ROTATION became a note, the *COUPLING's REFNODE set went out unresolved and ccx stopped,
+    # the *ELCOPY copied nothing, a *HYPERELASTIC, NEOHOOKE got a POLYNOMIAL in front)
+    import validate_with_ccx as V
+    names = ("OLD SET", "NEW SET", "ELEMENT SHIFT", "SHIFT NODES", "POSITION TOLERANCE",
+             "REF NODE", "CONSTRAINT NAME")
+    deck = V.compact_params_deck()
+    for extra in ("", ", NO ROTATION"):
+        compact = deck.replace("=0.1", "=0.1" + extra.replace(" ", ""))
+        blank = deck.replace("=0.1", "=0.1" + extra)
+        for name in names:
+            blank = blank.replace(name.replace(" ", ""), name)
+        got, want = convert_str(compact), convert_str(blank)
+        assert got[0] == want[0] and got[2].entries == want[2].entries
+        assert got[1].reduced_physics == want[1].reduced_physics
+    body, conv, _ = got
+    assert "*TIE, NAME=GLUE, POSITION TOLERANCE=0.1" in body and "2, 9, 10, 11, 12" in body
+    assert "*COUPLING, REF NODE=100, SURFACE=TOPS, CONSTRAINT NAME=PULL" in body
+    assert any("NO ROTATION" in r for r in conv.reduced_physics)
+    for card in ("*Hyperelastic, neohooke", "*Hyperelastic,\nneohooke"):      # also continued
+        hyper = HEX + f"*Material, name=R\n{card}\n1., 0.01\n"
+        assert "*HYPERELASTIC, NEO HOOKE\n1., 0.01" in convert_str(hyper)[0]
+    # a part's TIENSET / PINNSET renamed per instance, an assembly's resolved (they stayed TIP)
+    part = (HEX + "*Nset, nset=TIP\n5, 6, 7, 8\n*Nset, nset=BASE\n1, 2, 3, 4\n*Node\n100, 0.5, 0.5, 2.\n"
+            "*Solid Section, elset=EALL, material=M\n{rb}")
+    deck = ("*Part, name=P\n" + part + "*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n"
+            "*End Instance\n*Instance, name=I2, part=P\n5., 0., 0.\n*End Instance\n{arb}*End Assembly\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Step\n*Static\n*Boundary\nI1.BASE, 1, 3\n"
+            "I2.BASE, 1, 3\n*End Step\n")
+    for name in ("TIE NSET", "PIN NSET"):
+        for rb, arb in ((f"*Rigid Body, ref node=100, {name}=TIP\n", ""),
+                        ("", f"*Rigid Body, ref node=I1.100, {name}=I1.TIP\n")):
+            got = convert_str(deck.format(rb=rb.replace(name, name.replace(" ", "")),
+                                          arb=arb.replace(name, name.replace(" ", ""))))[0]
+            assert got == convert_str(deck.format(rb=rb, arb=arb))[0] and "NSET=I1_TIP" in got
+
+
 def test_rb3d2_links_join_their_rigid_body():
     deck = ("*NODE\n1,0.,0.,0.\n2,1.,0.,0.\n3,2.,0.,0.\n*ELEMENT, TYPE=RB3D2, ELSET=L\n1,1,2\n2,2,3\n"
             "*RIGID BODY, REF NODE=1, ELSET=L\n*STEP\n*STATIC\n*BOUNDARY\n1,1,6\n*END STEP\n")

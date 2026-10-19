@@ -816,6 +816,27 @@ PARAM_ALIASES = {"GEN": "GENERATE", "PERT": "PERTURBATION", "PERTURB": "PERTURBA
                  "NLGEO": "NLGEOM"}
 # Abaqus keyword abbreviations CalculiX does not accept.
 KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
+# The multi-word parameter names the converter reads.  Abaqus (like ccx) ignores blanks in
+# parameter names, so parse_keyword_line maps ``REFNODE=`` / ``POSITIONTOLERANCE=`` to these.
+MULTIWORD_PARAMS = (
+    "ANALYTICAL SURFACE", "CHANGE NUMBER", "CONSTANT RESULTANT", "CONSTRAINT NAME",
+    "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY", "DIRECT USER CONTROL",
+    "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT CONVERSION", "ELEMENT DELETION",
+    "ELEMENT SHIFT", "EXPONENTIAL DECAY", "FILLET RADIUS", "FIXED INTERVAL",
+    "HYBRID FORMULATION", "IMPROVED DT METHOD", "INITIAL GAP OPENING", "KINEMATIC SPLIT",
+    "LAST ITERATIONS", "LAST MODE", "LENGTH RATIO", "LOAD CASE", "MAX DEGRADATION",
+    "MEMBRANE THICKNESS", "MODE LIST", "NEO HOOKE", "NEW SET", "NO ROTATION", "NO SEPARATION",
+    "NO THICKNESS", "NODAL THICKNESS", "NUMBER INTERVAL", "OLD SET", "OUTPUT ALL",
+    "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "RAMP INITIAL STRESS",
+    "REDUCED POLYNOMIAL", "REF NODE", "RELATIVE TO ABSOLUTE", "ROT NODE", "SCALE FACTOR",
+    "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHIFT NODES",
+    "SHOCK SMOOTHING", "SMALL SLIDING", "SPH FORMULATION", "SPH SMOOTHING LENGTH",
+    "SPH TENSILE INSTABILITY CONTROL", "STACK DIRECTION", "STEADY STATE", "TEST DATA INPUT",
+    "THERMAL NETWORK", "TIE NSET", "TIED NSET", "TIME DELAY", "TIME INTERVAL", "TIME POINTS",
+    "TIME RESET", "TOTAL FORCE", "TOTAL TIME AT START", "TWO STEP", "VAN DER WAALS",
+    "WEIGHT FACTOR")
+_PARAM_BY_COMPACT = {k.replace(" ", ""): k for k in MULTIWORD_PARAMS + tuple(PARAM_ALIASES)
+                     if " " in k}
 
 
 _KEYWORD_BY_COMPACT: Dict[str, str] = {}
@@ -843,6 +864,14 @@ def canonical_keyword(keyword: str) -> str:
     return _KEYWORD_BY_COMPACT.get(keyword, keyword)
 
 
+def _param_name(key: str) -> str:
+    """The spelling the converter reads for parameter name ``key``: upper case, one blank
+    between words (``REFNODE`` -> ``REF NODE``), abbreviations expanded."""
+    key = " ".join(key.split()).upper()
+    key = _PARAM_BY_COMPACT.get(key.replace(" ", ""), key)
+    return PARAM_ALIASES.get(key, key)
+
+
 def parse_keyword_line(line: str) -> Tuple[str, "OrderedDict[str, Optional[str]]"]:
     """``*EL PRINT, POSITION=AVERAGED AT NODES, ELSET=EOUT`` ->
     ("EL PRINT", {"POSITION": "AVERAGED AT NODES", "ELSET": "EOUT"})."""
@@ -854,13 +883,8 @@ def parse_keyword_line(line: str) -> Tuple[str, "OrderedDict[str, Optional[str]]
     for tok in tokens[1:]:
         if not tok:
             continue
-        if "=" in tok:
-            key, val = tok.split("=", 1)
-            key = key.strip().upper()
-            params[PARAM_ALIASES.get(key, key)] = val.strip()
-        else:
-            key = tok.strip().upper()
-            params[PARAM_ALIASES.get(key, key)] = None
+        key, eq, val = tok.partition("=")
+        params[_param_name(key)] = val.strip() if eq else None
     return keyword, params
 
 
@@ -1031,7 +1055,7 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
     def is_params(text: str) -> bool:
         if "=" in text:
             return True
-        toks = [t.strip().upper() for t in text.split(",") if t.strip()]
+        toks = [_param_name(t) for t in text.split(",") if t.strip()]
         return bool(toks) and all(t in bare_flags for t in toks)
 
     out: List[str] = []
@@ -1978,10 +2002,10 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
 
 def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NCOPY`` -> copy a node set with SHIFT (translate/rotate) or REFLECT."""
-    old = block.param("OLD SET") or block.param("OLDSET")
-    new = block.param("NEW SET") or block.param("NEWSET")
+    old = block.param("OLD SET")
+    new = block.param("NEW SET")
     try:
-        change = pint(block.param("CHANGE NUMBER") or block.param("CHANGENUMBER") or 0)
+        change = pint(block.param("CHANGE NUMBER") or 0)
         multiple = pint(block.param("MULTIPLE") or 1)
     except ValueError:
         _skip_unreadable(report, "*NCOPY card")
@@ -2218,8 +2242,8 @@ def expand_elcopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     except ValueError:
         _skip_unreadable(report, "*ELCOPY card")
         return []
-    old = block.param("OLD SET") or block.param("OLDSET")
-    new = block.param("NEW SET") or block.param("NEWSET")
+    old = block.param("OLD SET")
+    new = block.param("NEW SET")
     if not old:
         report.warn("*ELCOPY without OLD SET ignored.")
         return []
@@ -5681,7 +5705,7 @@ class Converter:
         for i, g in enumerate(step_groups(blocks)[1], 1):
             proc = next((x for x in g[1:] if x.keyword in PROC_KW), None)
             if proc is not None and proc.keyword == "COUPLED TEMPERATURE-DISPLACEMENT" and \
-                    not (proc.has("STEADY STATE") or proc.has("STEADYSTATE")):
+                    not proc.has("STEADY STATE"):
                 coupled.append((i, g))
         if not coupled:
             return
@@ -11086,7 +11110,7 @@ class Converter:
             if proc is not None and (
                     proc.keyword == "DYNAMIC" and timing["kind"] != "explicit" or
                     proc.keyword.endswith("COUPLED TEMPERATURE-DISPLACEMENT") and
-                    not (proc.has("STEADY STATE") or proc.has("STEADYSTATE"))):
+                    not proc.has("STEADY STATE")):
                 kind = "an implicit" if proc.keyword == "DYNAMIC" else "a transient"
                 timing["energy"] = f"{kind} *{proc.keyword}"
             ctx, reqs, odb, add, own = None, [], False, False, []
@@ -12206,7 +12230,7 @@ class Converter:
         node's rotations still drive them, and unlike *RIGID BODY its DOFs 4-6 take BCs and
         moments); rotation ranges on knotted shell/beam members become *EQUATION ties to
         those DOFs.  (The newer *COUPLING/*KINEMATIC/*DISTRIBUTING are native ccx keywords.)"""
-        ref = (b.param("REF NODE") or b.param("REFNODE") or "").strip()
+        ref = (b.param("REF NODE") or "").strip()
         recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
         recs = [r for r in recs if r]
         if not ref or not recs:
@@ -12846,8 +12870,7 @@ class Converter:
             b = Block(b.keyword, b.params, [])
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         union: List[str] = []
-        node_sets = [v for k, v in b.params.items()
-                     if k.upper().replace(" ", "") in ("PINNSET", "TIENSET", "NSET") and v]
+        node_sets = [v for k, v in b.params.items() if k in ("PIN NSET", "TIE NSET", "NSET") and v]
         if len(node_sets) > 1:
             # PIN NSET and TIE NSET together: ccx has one NSET, so use their union rather
             # than letting the second silently replace the first
@@ -12856,18 +12879,13 @@ class Converter:
             union = [f"*NSET, NSET={name}"] + reflow(node_sets, MAX_ENTRIES_PER_LINE)
             node_sets = [name]
         for k, v in b.params.items():
-            ku = k.upper().replace(" ", "")
-            if ku in ("PINNSET", "TIENSET", "NSET"):
+            if k in ("PIN NSET", "TIE NSET", "NSET"):
                 keep["NSET"] = node_sets[0]
-            elif ku == "REFNODE":
-                keep["REF NODE"] = v
-            elif ku == "ROTNODE":
-                keep["ROT NODE"] = v
-            elif ku == "ELSET":
-                keep["ELSET"] = v
-            elif ku in ("POSITION", "DENSITY"):
+            elif k in ("REF NODE", "ROT NODE", "ELSET"):
+                keep[k] = v
+            elif k in ("POSITION", "DENSITY"):
                 self.report.warn(f"*RIGID BODY parameter {k} dropped (Abaqus-only): the body's "
-                                 f"{'reference point position' if ku == 'POSITION' else 'mass'} "
+                                 f"{'reference point position' if k == 'POSITION' else 'mass'} "
                                  f"differs in ccx.", once=True)
                 self._reduces(f"*RIGID BODY, {k}")
             else:
@@ -12875,13 +12893,13 @@ class Converter:
         pre: List[str] = []
         if self._qmem and keep.get("ELSET"):
             pre = self._qmem_rigid_elset(keep, [v for k, v in b.params.items() if v and
-                                                k.upper().replace(" ", "") in ("PINNSET", "TIENSET", "NSET")])
+                                                k in ("PIN NSET", "TIE NSET", "NSET")])
         tie, pin = self._rigid_body_members(b)
         # written as linear *EQUATIONs (_rigid_body_lines), as the planners saw it
         ref0 = self._ref_node(b)
-        rot0 = self._first_node(b.param("ROT NODE") or b.param("ROTNODE") or "")
+        rot0 = self._first_node(b.param("ROT NODE") or "")
         eq = self._rigid_as_eq(ref0, self._rb_rot_synth.get(ref0) if rot0 is None else rot0, tie + pin)
-        if any(k.upper().replace(" ", "") in ("PINNSET", "TIENSET") for k in b.params):
+        if b.has("PIN NSET") or b.has("TIE NSET"):
             self.report.note(("*RIGID BODY, PIN/TIE NSET: the" if eq else
                               "*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
                               "rigidly with REF NODE); the") + " rotations of TIE (and ELSET) "
@@ -15107,28 +15125,26 @@ class Converter:
                         if sk and sk[0] != e:
                             nodes.extend(self.geom.elements[sk[0]][1])
             nodes.extend(members_of.get(id(b), []))
-            for k, v in b.params.items():
-                if k.replace(" ", "") == "TIENSET" and v:
-                    nodes.extend(self.geom.nset(v))
+            if b.param("TIE NSET"):
+                nodes.extend(self.geom.nset(b.param("TIE NSET")))
             name = self._rigid_set_name("ABQ2CCX_RBN")
             self._rigid_own_sets.add(name)
             ref = self._ref_node(b)
             self.geom.nsets[name] = [n for n in dedup(nodes) if n in self.geom.nodes and n != ref]
             params: "OrderedDict[str, Optional[str]]" = OrderedDict()
             for k, v in b.params.items():
-                if k.replace(" ", "") in ("ELSET", "TIENSET", "ANALYTICALSURFACE", "DENSITY",
-                                          "OFFSET", "NODALTHICKNESS"):
+                if k in ("ELSET", "TIE NSET", "ANALYTICAL SURFACE", "DENSITY", "OFFSET",
+                         "NODAL THICKNESS"):
                     continue
                 params[k] = v
             params["TIE NSET"] = name
             pins = (pins_of or {}).get(id(b), [])
             if pins:
-                old = [n for k, v in b.params.items() if k.replace(" ", "") == "PINNSET" and v
-                       for n in self.geom.nset(v)]
+                old = self.geom.nset(b.param("PIN NSET")) if b.param("PIN NSET") else []
                 pname = self._rigid_set_name("ABQ2CCX_RBN")
                 self._rigid_own_sets.add(pname)
                 self.geom.nsets[pname] = dedup(old + pins)
-                params = OrderedDict((k, v) for k, v in params.items() if k.replace(" ", "") != "PINNSET")
+                params.pop("PIN NSET", None)
                 params["PIN NSET"] = pname
             b.params = params
             b.data = []
@@ -15301,13 +15317,12 @@ class Converter:
             old: List[int] = []
             tset = None
             for k, v in body.params.items():
-                ku = k.replace(" ", "")
-                if ku == "TIENSET" and v and v.strip().upper() in self._rigid_own_sets:
+                if k == "TIE NSET" and v and v.strip().upper() in self._rigid_own_sets:
                     tset = v.strip().upper()           # the converter's own: extend it
                     params[k] = v
-                elif ku == "TIENSET" and v:
+                elif k == "TIE NSET" and v:
                     old += self.geom.nset(v)
-                elif ku == "ELSET" and v:
+                elif k == "ELSET" and v:
                     old += [n for e in self.geom.elset(v) if e in self.geom.elements
                             for n in self.geom.elements[e][1]]
                 else:
@@ -18071,7 +18086,7 @@ class Converter:
         self._cavity_refs = {}
         for b in blocks:
             if b.keyword == "FLUID CAVITY":
-                ref = (b.param("REF NODE") or b.param("REFNODE") or "").strip()
+                ref = (b.param("REF NODE") or "").strip()
                 for n in self._resolve_nodes(ref) if ref else []:
                     self._cavity_refs[n] = (b.param("NAME") or "").strip() or "(unnamed)"
         # nodes that only belong to plane-stress/strain/axisymmetric continuum elements:
@@ -18092,7 +18107,7 @@ class Converter:
         for b in blocks:
             if b.keyword in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
                 for k, v in b.params.items():
-                    if k.replace(" ", "") in ("REFNODE", "ROTNODE") and v:
+                    if k in ("REF NODE", "ROT NODE") and v:
                         refs = self._resolve_nodes(v.strip())[:1]
                         self._plane_only.difference_update(refs)
                         self._ref_nodes.update(refs)
@@ -18109,11 +18124,11 @@ class Converter:
         for b in blocks:
             if b.keyword != "RIGID BODY":
                 continue
-            refs = self._resolve_nodes((b.param("REF NODE") or b.param("REFNODE") or "").strip())
+            refs = self._resolve_nodes((b.param("REF NODE") or "").strip())
             if not refs or refs[0] in self._rb_rot:
                 continue
             ref = refs[0]
-            rots = self._resolve_nodes((b.param("ROT NODE") or b.param("ROTNODE") or "").strip())
+            rots = self._resolve_nodes((b.param("ROT NODE") or "").strip())
             if rots:
                 self._rb_rot[ref] = rots[0]
                 continue
@@ -18701,7 +18716,7 @@ class Converter:
         for b in blocks:
             if b.keyword in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
                 for k, v in b.params.items():
-                    if k.replace(" ", "") in ("REFNODE", "ROTNODE") and v:
+                    if k in ("REF NODE", "ROT NODE") and v:
                         refs.update(self._resolve_nodes(v.strip())[:1])
             elif b.keyword == "MPC" and not b.has("USER"):
                 for f in self._mpc_fields(b):
@@ -19578,7 +19593,7 @@ class Converter:
                 tie, pin = self._rigid_body_members(b)
                 if ref is None or not any(n in structural for n in tie + pin + [ref]):
                     continue
-                rot = self._first_node(b.param("ROT NODE") or b.param("ROTNODE") or "")
+                rot = self._first_node(b.param("ROT NODE") or "")
                 eq = self._rigid_as_eq(ref, self._rb_rot_synth.get(ref) if rot is None else rot,
                                        tie + pin)
                 knots += needed(ref, [(tie, {1, 2, 3, 4, 5, 6}), (pin, {1, 2, 3})],
@@ -19991,7 +20006,7 @@ class Converter:
             plan = (self._coupling_plan.get(id(b)) or {}).get("kind")
             if b.keyword == "RIGID BODY":
                 kind, tied, rb = "rb", True, True
-                rot = self._first_node(b.param("ROT NODE") or b.param("ROTNODE") or "")
+                rot = self._first_node(b.param("ROT NODE") or "")
                 tie, pin = self._rigid_body_members(b)
                 lines = [(tie, set(range(1, 7))), (pin, {1, 2, 3})]
                 emit = body_emit(ref, rot if rot is not None else self._rb_rot_synth.get(ref),
@@ -20475,10 +20490,9 @@ class Converter:
         return nodes[0] if nodes else None
 
     def _ref_node(self, b: Block) -> Optional[int]:
-        """The reference node of a *RIGID BODY, *COUPLING or *KINEMATIC COUPLING: REF NODE= or
-        its blank-free spelling REFNODE= (Abaqus ignores blanks in parameter names;
-        handle_rigid_body writes it as REF NODE)."""
-        return self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+        """The reference node of a *RIGID BODY, *COUPLING or *KINEMATIC COUPLING (REF NODE=;
+        parse_keyword_line maps the blank-free REFNODE= to it)."""
+        return self._first_node(b.param("REF NODE") or "")
 
     def _rigid_body_members(self, b: Block) -> Tuple[List[int], List[int]]:
         """(tie, pin) members of an Abaqus *RIGID BODY: TIE NSET and ELSET nodes move with
@@ -20487,14 +20501,13 @@ class Converter:
         tie: List[int] = []
         pin: List[int] = []
         for k, v in b.params.items():
-            ku = k.upper().replace(" ", "")
             if not v:
                 continue
-            if ku == "PINNSET":
+            if k == "PIN NSET":
                 pin.extend(self.geom.nset(v))
-            elif ku in ("TIENSET", "NSET"):
+            elif k in ("TIE NSET", "NSET"):
                 tie.extend(self.geom.nset(v))
-            elif ku == "ELSET":
+            elif k == "ELSET":
                 for e in self.geom.elset(v):
                     if e in self.geom.elements:
                         tie.extend(self.geom.elements[e][1])
@@ -21838,14 +21851,13 @@ class Converter:
                         held.update(self._resolve_nodes(tok))
             elif kw == "RIGID BODY":
                 for k, v in b.params.items():
-                    key = k.replace(" ", "")
-                    if v and key in ("NSET", "PINNSET", "TIENSET"):
+                    if v and k in ("NSET", "PIN NSET", "TIE NSET"):
                         held.update(self.geom.nset(v.strip()))
-                    elif v and key == "ELSET":
+                    elif v and k == "ELSET":
                         for e in self.geom.elset(v.strip()):
                             held.update(self.geom.elements[e][1] if e in self.geom.elements else [])
             elif kw in ("COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
-                ref = (b.param("REF NODE") or b.param("REFNODE") or "").strip()
+                ref = (b.param("REF NODE") or "").strip()
                 held.update(self._resolve_nodes(ref) if ref else [])
                 if kw == "COUPLING":
                     held.update(self._surface_member_nodes((b.param("SURFACE") or "").strip()))
@@ -22758,9 +22770,8 @@ ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "DFLUX", "DFILM", "FILM", "RADIATE",
 # ``*EL PRINT, ELSET=Part-1.body`` or ``*RIGID BODY, REF NODE=Part-1.ref``).  An
 # instance-qualified value here must be resolved exactly like a data-line member;
 # a plain name is already global.  (REF/ROT NODE point at a node or 1-node set.)
-REF_PARAMS = {"NSET", "ELSET", "SURFACE", "SLAVE", "MASTER",
-              "REF NODE", "REFNODE", "ROT NODE", "ROTNODE", "PIN NSET", "TIE NSET",
-              "ANALYTICAL SURFACE"}
+REF_PARAMS = {"NSET", "ELSET", "SURFACE", "SLAVE", "MASTER", "REF NODE", "ROT NODE", "PIN NSET",
+              "TIE NSET", "ANALYTICAL SURFACE"}
 # ... and those that do so on one card only: the pre-tension node and the truss or beam
 # element of a *PRE-TENSION SECTION (a number or a one-member set).
 CARD_REF_PARAMS = {"PRE-TENSION SECTION": ("NODE", "ELEMENT")}
@@ -22954,7 +22965,7 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
 
     kw = b.keyword
     p: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
-    for k in ("REF NODE", "REFNODE", "ROT NODE", "ROTNODE"):
+    for k in ("REF NODE", "ROT NODE"):
         if p.get(k):
             p[k] = node(p[k].strip())
     for k in ("NSET", "PIN NSET", "TIE NSET", "SURFACE", "ANALYTICAL SURFACE"):

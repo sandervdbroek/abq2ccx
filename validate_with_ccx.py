@@ -2487,6 +2487,33 @@ def frequency_preload_deck(nlgeom=False, pert=False, preload="grav"):
                              "*END STEP"]) + "\n"
 
 
+def compact_params_deck():
+    """Two unit C3D8 cubes 0.05 apart (E 1000, nu 0) held at the bottom on rollers, every
+    multi-word parameter name written without blanks: the upper cube an *ELCOPY of the lower
+    (ELEMENTSHIFT, SHIFTNODES), tied to it (POSITIONTOLERANCE=0.1, so the tie closes the gap and
+    the upper cube is 1.05 tall), pulled by 1.0 on a reference node coupled to its top
+    (*COUPLING, REFNODE).  Uniaxial stress 1: the reference node rises 2.05e-3, the lower cube's
+    top 1e-3."""
+    xy = ((0, 0), (1, 0), (1, 1), (0, 1))
+    nodes = [f"{4 * k + i + 1}, {x}., {y}., {z}" for k, z in enumerate((0.0, 1.0, 1.05, 2.05))
+             for i, (x, y) in enumerate(xy)]
+    return "\n".join(
+        ["*NODE"] + nodes + ["100, 0.5, 0.5, 2.05", "*ELEMENT, TYPE=C3D8, ELSET=LOW",
+                             "1, 1, 2, 3, 4, 5, 6, 7, 8",
+                             "*ELCOPY, OLDSET=LOW, NEWSET=UP, ELEMENTSHIFT=1, SHIFTNODES=8",
+                             "*NSET, NSET=RP", "100", "*NSET, NSET=TOP", "13, 14, 15, 16",
+                             "*NSET, NSET=OUT", "6, 100", "*SURFACE, NAME=LOWTOP", "LOW, S2",
+                             "*SURFACE, NAME=UPBOT", "UP, S1", "*SURFACE, TYPE=NODE, NAME=TOPS", "TOP",
+                             "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.",
+                             "*SOLID SECTION, ELSET=LOW, MATERIAL=M",
+                             "*SOLID SECTION, ELSET=UP, MATERIAL=M",
+                             "*TIE, NAME=GLUE, POSITIONTOLERANCE=0.1", "UPBOT, LOWTOP",
+                             "*COUPLING, REFNODE=RP, SURFACE=TOPS, CONSTRAINTNAME=PULL",
+                             "*KINEMATIC", "1, 3", "*BOUNDARY", "1, 1, 3", "2, 2, 3", "3, 3",
+                             "4, 1", "4, 3", "*STEP", "*STATIC", "*CLOAD", "100, 3, 1.",
+                             "*NODE PRINT, NSET=OUT", "U", "*END STEP"]) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -5565,6 +5592,19 @@ def main():
               f"(ccx 2.23 as written: 2.389, only the top moved)")
     else:
         print("FAIL  buckle_displacement: a run gave no results")
+    failures += 0 if ok else 1
+
+    # parameter names without blanks (REFNODE=, POSITIONTOLERANCE=, ...): ccx rejected the
+    # *COUPLING, the *TIE lost its tolerance and tied nothing, the *ELCOPY copied nothing
+    u = review_run(compact_params_deck(), "compact_param_names", dat_displacements)
+    ok = bool(u)
+    if ok:
+        top, mid = u.get(100, [math.nan] * 3)[2], u.get(6, [math.nan] * 3)[2]
+        ok = abs(top / 2.05e-3 - 1) < 1e-6 and abs(mid / 1e-3 - 1) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  compact_param_names (two C3D8 cubes, the upper an *ELCOPY "
+              f"tied to the lower across a 0.05 gap, pulled through a *COUPLING; ELEMENTSHIFT=, "
+              f"POSITIONTOLERANCE=, REFNODE= without blanks): the reference node rose {top:.7g} "
+              f"(2.05e-3), the lower cube's top {mid:.7g} (1e-3)")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

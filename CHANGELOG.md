@@ -32,6 +32,13 @@ physics.
   tests), called that run solved. It now needs each step to show the structure of its matrix
   or its number of equations, and calls a run where one does not **unsolved**: `--run` names
   the step and exits 1. No corpus deck changes status.
+* **Parameter names without blanks** — Abaqus ignores blanks in parameter names, but the
+  converter read most multi-word names only as spelled with them. So `*TIE,
+  POSITIONTOLERANCE=` was dropped and ccx tied nothing (displacements of about 1e12),
+  `*COUPLING, REFNODE=<set>` went out unresolved and ccx stopped, `*ELCOPY, ELEMENTSHIFT=,
+  SHIFTNODES=` copied nothing, an assembly left a part's `TIENSET=` / `PINNSET=` unrenamed,
+  `*TIE, NOROTATION` lost its reduced-physics warning and `*HYPERELASTIC, NEOHOOKE` got a
+  `POLYNOMIAL` in front. Such names now read as their blank spelling everywhere.
 * **Body forces after `*DLOAD, OP=NEW`** — ccx 2.23's `*DLOAD, OP=NEW` removes the earlier
   pressures and `GRAV` / `CENTRIF` loads but keeps `BX`, `BY` and `BZ`, which Abaqus removes. So
   they stayed on after a deck's own `OP=NEW`, after a linear perturbation step and in a
