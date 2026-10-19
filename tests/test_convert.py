@@ -4851,6 +4851,10 @@ def test_general_step_after_perturbation_gets_the_base_state():
     # without a perturbation step nothing changes
     body, _, rep = convert_str(PERT.replace("*Step\n*Frequency\n3\n{}*End Step\n", "").format(""))
     assert "HOLD" not in body and "perturbation" not in rep.text()
+    # nor where the emitted steps do not match the deck's (a *STEP without *END STEP): warned
+    body, conv, rep = convert_str(PERT.replace("*Temperature\nALL, 100.\n*End Step\n",
+                                               "*Temperature\nALL, 100.\n").format("", ""))
+    assert "HOLD" not in body and "steps do not match" in rep.text() and conv.reduced_physics
     # Abaqus keeps NLGEOM on; ccx 2.23 forgets it after a *FREQUENCY step (probed: the next
     # static step ran linear), so it is written there
     body, conv, rep = convert_str(PERT.replace("*Step\n*Static\n*Cload", "*Step, nlgeom\n*Static\n*Cload")
@@ -4882,6 +4886,28 @@ def test_base_state_after_perturbation_values_and_keys():
     assert ("*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 3, -1.\n6, 3, -1.\n8, 3, -1.\n"
             "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nEALL, GRAV, 9.81, 0., 0., -1.\n"
             "*CLOAD\n7, 3, -2.\n*DLOAD\n1, P2, 2.\n") in body
+    # a gravity along the same direction, written otherwise, replaces it
+    body, _, _ = convert_str(deck.format("*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n",
+                                         "*Dload\nEALL, GRAV, 20., 0, 0, -2\n"))
+    assert body.split("*STEP")[3].count("GRAV") == 1
+    # OP=NEW on a later card, which ccx ignores: a bare one first (Abaqus: the earlier steps' go)
+    body, _, _ = convert_str(deck.format("*Cload\n7, 1, 1.\n", "*Cload\n6, 1, 1.\n*Cload, op=NEW\n7, 2, 1.\n"))
+    assert "*STATIC\n** abq2ccx: the loads, BCs and temperatures of step 1 given again (linear " \
+           "perturbation step(s) 2 in between)\n*CLOAD, OP=NEW\n*CLOAD\n6, 1, 1.\n" in body
+    # a load the step gives again after a *BUCKLE (which dropped it) ramps from 0 in ccx
+    _, conv, rep = convert_str(deck.replace("*Frequency\n3\n", "*Buckle\n2\n*Cload\n7, 3, -1.\n")
+                               .format("*Cload\n7, 1, 1.\n", "*Cload\n7, 1, 2.\n"))
+    assert "[NOTE] Step 3 gives again *CLOAD values" in rep.text() and not conv.reduced_physics
+    # a shell pressure's top-face surface: on the elements the step does not load itself
+    shells = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+              "6, 2., 1., 0.\n*Element, type=S4, elset=SH\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Material, "
+              "name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Shell Section, elset=SH, material=M\n0.1\n"
+              "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Dload\nSH, P, 1.\n*End Step\n*Step\n"
+              "*Frequency\n3\n*End Step\n*Step\n*Static\n*Dload\n1, P, 2.\n*End Step\n")
+    body, _, _ = convert_str(shells)
+    assert "*SURFACE, NAME=ABQ2CCX_BASE_ABQ2CCX_TOP_SH, TYPE=ELEMENT\n2, S2\n*STEP" in body
+    assert ("*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n2, P, 0.5\nABQ2CCX_BASE_ABQ2CCX_TOP_SH, P, -0.5\n"
+            "*DLOAD\n1, P, 1.\nABQ2CCX_TOP_1, P, -1.\n") in body
 
 
 def test_perturbation_step_nodal_forces_do_not_carry_over():
@@ -4897,6 +4923,13 @@ def test_perturbation_step_nodal_forces_do_not_carry_over():
     body, _, _ = convert_str(deck.format(""))
     assert _cloads(body)[2] == {(n, 1): 0.25 for n in (5, 6, 7, 8)}
     assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 1, 0.25" in body
+    # ccx holds step 2's forces until the restore, and a *BUCKLE step drops the earlier ones:
+    # its own are given in full (they were left out as unchanged, and it buckled under none)
+    buckle = deck.replace("*Step\n*Static\n{}*End Step\n", "*Step\n*Buckle\n2\n*Dsload\n"
+                          "S2, TRVEC, 1., 1., 0., 0.\n*End Step\n*Step\n*Static\n*End Step\n")
+    assert _cloads(convert_str(buckle)[0])[2:] == [{(n, 1): 0.25 for n in (5, 6, 7, 8)}] * 2
+    buckle = buckle.replace("*Step\n*Frequency\n3\n*Dsload\nS2, TRVEC, 2., 1., 0., 0.\n*End Step\n", "")
+    assert _cloads(convert_str(buckle)[0])[1] == {(n, 1): 0.25 for n in (5, 6, 7, 8)}
 
 
 def test_base_state_after_a_first_perturbation_step_beams_and_couplings():
