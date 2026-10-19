@@ -2033,6 +2033,65 @@ def kinematic_dynamic_deck(dofs="1, 3", nlgeom=False, proc="dynamic"):
             "100, 6, 6, 0.2\n*NODE PRINT, NSET=MID\nU\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
+# member kind -> (reference node position, its translation, its rotation, free nodes)
+RIGID_DYNAMIC = {"solid": ((0.5, 0.5, 2.), (0.4, 0., 0.), (0.3, 0., 0.2), (5, 6, 7, 8)),
+                 "shell": ((4.5, 0.5, 0.), (0.025, 0., 0.1), (0.05, -0.05, 0.), (3, 13)),
+                 "planar": ((5.5, 0.5, 0.), (0.05, 0.2, 0.), (0., 0., 0.1), (3, 13))}
+
+
+def rigid_dynamic_deck(member="solid", proc="dynamic"):
+    """Members moved rigidly by node 100, which moves and turns over a slow step: the top face
+    of a column of two C3D8 (``member`` 'solid': a *RIGID BODY; 'mpc': *MPC BEAM lines), or the
+    tip edge of a strip of four S4 ('shell': a *RIGID BODY, so their rotations follow too) or
+    CPS4 ('planar') clamped at the other end.  ``proc`` 'dynamic': the Abaqus deck, a linear
+    *DYNAMIC step; 'static': the same mesh in a *STATIC step with the members' DOFs prescribed
+    to the linear rigid motion u = u_100 + theta x d (shell rotations: theta), the answer of
+    Abaqus' linearized rigid body (RIGID_DYNAMIC: the motion and the free nodes)."""
+    x0, t0, th, _ = RIGID_DYNAMIC["solid" if member == "mpc" else member]
+    if member in ("solid", "mpc"):
+        nodes = {1: (0., 0., 0.), 2: (1., 0., 0.), 3: (1., 1., 0.), 4: (0., 1., 0.), 5: (0., 0., 1.),
+                 6: (1., 0., 1.), 7: (1., 1., 1.), 8: (0., 1., 1.), 9: (0., 0., 2.), 10: (1., 0., 2.),
+                 11: (1., 1., 2.), 12: (0., 1., 2.)}
+        mesh = ("*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 5, 6, 7, 8, 9, 10, 11, 12\n"
+                "*NSET, NSET=FIX\n1, 2, 3, 4\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n"
+                "*ELASTIC\n1000., 0.3\n*DENSITY\n1e-3\n")
+        fixed, tip, dofs = "FIX, 1, 3\n", (9, 10, 11, 12), (1, 2, 3)
+    else:
+        planar = member == "planar"
+        nodes = {}
+        for i in range(5):
+            nodes[1 + i] = (i + 1. if planar else float(i), 0., 0.)
+            nodes[11 + i] = (i + 1. if planar else float(i), 1., 0.)
+        mesh = (f"*ELEMENT, TYPE={'CPS4' if planar else 'S4'}, ELSET=EALL\n"
+                + "".join(f"{1 + i}, {1 + i}, {2 + i}, {12 + i}, {11 + i}\n" for i in range(4))
+                + ("*SOLID SECTION, ELSET=EALL, MATERIAL=M\n1.\n" if planar else
+                   "*SHELL SECTION, ELSET=EALL, MATERIAL=M\n0.1\n")
+                + f"*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n{'1e-6' if planar else '1e-8'}\n")
+        fixed = "1, 1, 2\n11, 1, 2\n" if planar else "1, 1, 6\n11, 1, 6\n"
+        tip, dofs = (5, 15), ((1, 2) if planar else (1, 2, 3))
+    xyz = (lambda v: v[:2]) if member == "planar" else (lambda v: v)
+    deck = "*NODE\n" + "".join(f"{n}, " + ", ".join(map(str, xyz(x))) + "\n" for n, x in nodes.items())
+    deck += "*NSET, NSET=NALL\n" + ", ".join(map(str, nodes)) + "\n" + mesh
+    deck += "*AMPLITUDE, NAME=R, DEFINITION=SMOOTH STEP\n0., 0., 1., 1.\n" if proc == "dynamic" else ""
+    if proc == "dynamic":
+        deck += "*NODE\n100, " + ", ".join(map(str, xyz(x0))) + "\n*NSET, NSET=TIP\n"
+        deck += ", ".join(map(str, tip)) + ("\n*MPC\nBEAM, TIP, 100\n" if member == "mpc" else
+                                            "\n*RIGID BODY, REF NODE=100, TIE NSET=TIP\n")
+        drive = "".join(f"100, {j + 1}, {j + 1}, {t0[j]}\n" for j in range(len(dofs)))
+        drive += "".join(f"100, {k}, {k}, {th[k - 4]}\n" for k in ((6,) if member == "planar" else (4, 5, 6)))
+        return (deck + "*STEP, INC=1000\n*DYNAMIC\n0.01, 1.\n*BOUNDARY\n" + fixed
+                + "*BOUNDARY, AMPLITUDE=R\n" + drive + "*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+    bcs = ""
+    for m in tip:
+        d = [nodes[m][i] - x0[i] for i in range(3)]
+        w = (th[1] * d[2] - th[2] * d[1], th[2] * d[0] - th[0] * d[2], th[0] * d[1] - th[1] * d[0])
+        bcs += "".join(f"{m}, {j}, {j}, {t0[j - 1] + w[j - 1]:.12g}\n" for j in dofs)
+        if member == "shell":
+            bcs += "".join(f"{m}, {k}, {k}, {th[k - 4]}\n" for k in (4, 5, 6))
+    return (deck + "*STEP\n*STATIC\n*BOUNDARY\n" + fixed + bcs
+            + "*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+
+
 def tied_strip_deck(symmetric=True):
     """A composite S4R strip [0/90/90/0] of thickness 2 (its plies listed, or the bottom two
     with SYMMETRIC), cantilevered from a clamped rigid R3D4 plate below its first element by
@@ -4792,6 +4851,33 @@ def main():
                   f"displacements vs ccx's own coupling in a static step, max difference {err:.1e} of "
                   f"max |u|; the free middle nodes moved {mid:.2f} of it (ccx's coupling sets up no "
                   f"equations in a dynamic step: they stayed at 0)")
+        elif u:
+            print(f"FAIL  {tag}: the static reference did not solve ({status})")
+        failures += 0 if ok else 1
+    # rigid constraints in a linear *DYNAMIC step (ccx turns its RIGID MPCs with the finite
+    # rotation there: 3-7 % off), against the linear rigid motion prescribed in a *STATIC step
+    for member in ("solid", "mpc", "shell", "planar"):
+        tag = f"rigid_dynamic_{member}"
+        u = review_run(rigid_dynamic_deck(member), tag, dat_displacements)
+        src = os.path.join(tmp, f"{tag}_ref.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(rigid_dynamic_deck(member, "static"))
+        d, status, out = run_ccx(ccx, env, src)
+        ref = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+        free = RIGID_DYNAMIC["solid" if member == "mpc" else member][3]
+        ok = bool(u) and bool(ref) and all(n in ref for n in free)
+        if ok:
+            scale = max(math.hypot(*v) for v in ref.values())
+            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
+            moved = min(math.hypot(*u.get(n, (0.0,) * 3)) for n in free) / scale
+            ok = err < 1e-3 and moved > 0.1
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'*MPC BEAM lines' if member == 'mpc' else 'a *RIGID BODY'} "
+                  f"on {'solid' if member == 'mpc' else member} members driven by a node that moves "
+                  f"and turns over a slow linear "
+                  f"dynamic step): {len(ref)} node displacements vs the linear rigid motion prescribed "
+                  f"in a static step, max difference {err:.1e} of max |u|; the free nodes moved "
+                  f"{moved:.2f} of it (ccx's *RIGID BODY turns with the finite rotation there)")
         elif u:
             print(f"FAIL  {tag}: the static reference did not solve ({status})")
         failures += 0 if ok else 1

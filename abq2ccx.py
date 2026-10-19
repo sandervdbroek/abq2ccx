@@ -3844,6 +3844,9 @@ class Converter:
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
         self._conn_rot: set = set()                # rotation nodes made for connector rotations
         self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_mpcs)
+        # a *DYNAMIC step and no NLGEOM: rigid constraints become linear *EQUATIONs (_plan_mpcs,
+        # _rigid_body_lines)
+        self._lin_dyn = False
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
         # such card, what each step appends for the ones it keeps, and the amplitudes only
@@ -11835,8 +11838,9 @@ class Converter:
         ref, rot, members = body["ref"], body["rot"], body["members"]
         self._synth_counter += 1
         name = f"ABQ2CCX_MPCB{self._synth_counter}"
-        out = [f"*NSET, NSET={name}"] + reflow([str(n) for n in members])
-        out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
+        out = self._rigid_body_lines([f"*NSET, NSET={name}"] + reflow([str(n) for n in members]) +
+                                     [f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}"],
+                                     ref, rot, members)
         if (ref in self._knots and ref in self._rot_nodes) or body.get("follow"):
             out += self._rot_node_follows(rot, ref)
         out += self._rotation_ties(members, rot, -3)
@@ -12493,16 +12497,16 @@ class Converter:
                              "area, which the skins' contact faces carry).", once=True)
             b = Block(b.keyword, b.params, [])
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
-        pre: List[str] = []
+        union: List[str] = []
         node_sets = [v for k, v in b.params.items()
                      if k.upper().replace(" ", "") in ("PINNSET", "TIENSET", "NSET") and v]
         if len(node_sets) > 1:
             # PIN NSET and TIE NSET together: ccx has one NSET, so use their union rather
             # than letting the second silently replace the first
             self._synth_counter += 1
-            union = f"ABQ2CCX_RB{self._synth_counter}"
-            pre = [f"*NSET, NSET={union}"] + reflow(node_sets, MAX_ENTRIES_PER_LINE)
-            node_sets = [union]
+            name = f"ABQ2CCX_RB{self._synth_counter}"
+            union = [f"*NSET, NSET={name}"] + reflow(node_sets, MAX_ENTRIES_PER_LINE)
+            node_sets = [name]
         for k, v in b.params.items():
             ku = k.upper().replace(" ", "")
             if ku in ("PINNSET", "TIENSET", "NSET"):
@@ -12520,9 +12524,10 @@ class Converter:
                 self._reduces(f"*RIGID BODY, {k}")
             else:
                 self.report.note(f"*RIGID BODY parameter {k} dropped (Abaqus-only).", once=True)
+        pre: List[str] = []
         if self._qmem and keep.get("ELSET"):
-            pre += self._qmem_rigid_elset(keep, [v for k, v in b.params.items() if v and
-                                                 k.upper().replace(" ", "") in ("PINNSET", "TIENSET", "NSET")])
+            pre = self._qmem_rigid_elset(keep, [v for k, v in b.params.items() if v and
+                                                k.upper().replace(" ", "") in ("PINNSET", "TIENSET", "NSET")])
         tie, pin = self._rigid_body_members(b)
         if any(k.upper().replace(" ", "") in ("PINNSET", "TIENSET") for k in b.params):
             self.report.note("*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
@@ -12562,7 +12567,8 @@ class Converter:
             if own:
                 ties += self._rot_node_follows(rot, ref)
             ties += self._rotation_ties([n for n in tie if n != ref], rot, -3)
-        return pre + [emit_keyword("RIGID BODY", keep)] + list(b.data) + ties
+        card = union + pre + [emit_keyword("RIGID BODY", keep)] + list(b.data)
+        return self._rigid_body_lines(card, ref, rot, tie + pin) + ties
 
     def _qmem_rigid_elset(self, keep: "OrderedDict[str, Optional[str]]", sets: Sequence[str]) -> List[str]:
         """A *RIGID BODY ELSET with quadratic membranes written as solids -> an NSET of its
@@ -12787,8 +12793,9 @@ class Converter:
             return []
         self._synth_counter += 1
         name = f"ABQ2CCX_RB{self._synth_counter}"
-        out = [f"*NSET, NSET={name}"] + reflow([str(n) for n in members])
-        out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
+        out = self._rigid_body_lines([f"*NSET, NSET={name}"] + reflow([str(n) for n in members]) +
+                                     [f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}"],
+                                     ref, rot, members)
         if plan["kind"] == "rb":
             out += self._rot_node_follows(rot, ref)
             self.report.note("*COUPLING + *KINEMATIC with a shell/beam REF NODE -> *RIGID BODY on "
@@ -17671,6 +17678,7 @@ class Converter:
                 steps[-1] = True               # the converter runs explicit steps with NLGEOM
         # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
         self._nl_any, self._nl_all = any(steps), bool(steps) and steps[0]
+        self._lin_dyn = not self._nl_any and any(b.keyword == "DYNAMIC" for b in blocks)
         # a TIE also ties the temperature (DOF 11) where a step has one; a heat-transfer-only
         # deck has no displacements to tie
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
@@ -18169,7 +18177,9 @@ class Converter:
         solve (their MPCs chain, which keeps the flag; probed).  So in a deck with a *DYNAMIC
         step every coupling whose members are plain 3-D nodes is written without ccx's
         *KINEMATIC, as _kin_form says (``_kin_dyn``; every coupling on the reference node, or
-        none, sharing its ROT NODE).  Returns the last node id."""
+        none, sharing its ROT NODE).  Without NLGEOM so is one on knotted shell/beam or 2-D
+        members whose every line becomes linear equations: ccx would turn its RIGID MPCs with
+        the finite rotation (_rigid_body_lines).  Returns the last node id."""
         structural = set(self._shell_nodes) | set(self._beam_nodes)
         for e, (typ, conn) in self.geom.elements.items():
             if e not in self._qmem and ccx_type(typ).startswith("M3D"):
@@ -18194,8 +18204,9 @@ class Converter:
                 members = [n for n in self._surface_member_nodes(b.param("SURFACE") or "") if n != ref]
                 groups = [(members, self._kinematic_dofs(blocks[i + 1]))]
             if dynamic:
-                plain = bool(members) and not any(n in structural or n in self._plane_only
-                                                  for n in members)
+                plain = bool(members) and (
+                    not any(n in structural or n in self._plane_only for n in members) or
+                    (self._lin_dyn and all(self._kin_form(ref, ns, ds) == "eq" for ns, ds in groups)))
                 dyn.setdefault(ref, []).append((id(b), plain, plain and any(
                     self._kin_form(ref, ns, ds) in ("rb", "eq") for ns, ds in groups)))
             if legacy or ref not in self._transformed or ref in self._rb_rot or \
@@ -18830,7 +18841,9 @@ class Converter:
                 else:
                     self._coupling_plan[id(b)] = {"kind": "unsupported"}
             elif b.keyword == "KINEMATIC COUPLING":
-                if id(b) in self._kin_rb:          # plain members (_plan_kinematic_rot_nodes)
+                if id(b) in self._kin_rb:          # (_plan_kinematic_rot_nodes)
+                    knots += [n for ns, _ in self._legacy_kinematic_groups(b) for n in ns
+                              if n in structural and n != ref]
                     self._coupling_plan[id(b)] = {"kind": "kdyn", "ref": ref,
                                                   "rot": self._kin_rb[id(b)]}
                     continue
@@ -19186,7 +19199,7 @@ class Converter:
                 if nxt is None or nxt.keyword != "KINEMATIC":
                     continue
                 plan = (self._coupling_plan.get(id(b)) or {}).get("kind")
-                kind, tied, rb = "kin", plan in ("kin", "rb", "rbk"), plan in ("rb", "rbk")
+                kind, tied, rb = "kin", plan in ("kin", "rb", "rbk", "kdyn"), plan in ("rb", "rbk")
                 lines = [(self._surface_member_nodes(b.param("SURFACE") or ""),
                           self._kinematic_dofs(nxt))]
             else:
@@ -19748,29 +19761,68 @@ class Converter:
 
     def _kin_rows(self, ref: int, rot: int, members: Sequence[int],
                   dofs: set) -> List[List[Tuple[int, int, float]]]:
-        """The linear *EQUATIONs of a kinematic coupling (_kin_form 'eq'): for each member m and
-        coupled translation j, u_j(m) - u_j(ref) - (theta x d)_j = 0, d = x_m - x_ref, theta
-        the rotation on DOFs 1-3 of ``rot`` — ccx's RIGID MPC at the initial geometry."""
+        """The linear *EQUATIONs of a kinematic coupling (_kin_form 'eq') or rigid body
+        (_rigid_body_lines): for each member m and coupled translation j, u_j(m) - u_j(ref) -
+        (theta x d)_j = 0, d = x_m - x_ref, theta the rotation on DOFs 1-3 of ``rot`` — ccx's
+        RIGID MPC at the initial geometry.  A 2-D member has no DOF 3 (ccx holds it itself)."""
         x0 = self.geom.nodes[ref]
         rows: List[List[Tuple[int, int, float]]] = []
         for m in members:
             d = vsub(self.geom.nodes[m], x0)
             tol = 1e-12 * max(vnorm(d), 1.0)
-            for j in sorted(dofs & {1, 2, 3}):
+            for j in sorted(dofs & ({1, 2} if m in self._plane_only else {1, 2, 3})):
                 c = vcross(d, tuple(float(k == j - 1) for k in range(3)))   # (theta x d)_j = c . theta
                 rows.append([(m, j, 1.0), (ref, j, -1.0)] +
                             [(rot, k + 1, -c[k]) for k in range(3) if abs(c[k]) > tol])
         return rows
 
+    def _rigid_body_lines(self, card: List[str], ref: Optional[int], rot: Optional[int],
+                          members: Sequence[int]) -> List[str]:
+        """A ccx *RIGID BODY (``card``: it and the *NSET it names) of ``members`` on ``ref``
+        with ROT NODE ``rot`` — or, in a deck with a *DYNAMIC step and no NLGEOM (explicit
+        steps run with it), the linear *EQUATIONs u(m) = u(ref) + theta x (x_m - x_ref) on
+        each translation (_kin_rows).  Abaqus linearizes rigid bodies, kinematic couplings and
+        *MPC BEAM there ('If rigid bodies are used in a geometrically linear Abaqus/Standard
+        analysis ... the rigid body constraints are linearized'), but ccx turns their RIGID
+        MPCs with the finite rotation in a *DYNAMIC step (probed: a solid cantilever under a
+        tip moment 0.5 % stiffer at 0.01 rad, 9 % at 0.1 rad, the stress at the body 38 % off;
+        linear equations exact).  ccx reads the *EQUATION terms of a node with a *TRANSFORM
+        in its local axes, so such a body keeps the card."""
+        members = [n for n in dedup(members) if n not in (ref, rot) and n in self.geom.nodes]
+        if not self._lin_dyn or ref not in self.geom.nodes or rot not in self.geom.nodes:
+            return card
+        if any(n in self._transformed for n in [ref, rot] + members):
+            self.report.note("Rigid body on nodes with a *TRANSFORM in a deck with a *DYNAMIC step "
+                             "and no NLGEOM: written as ccx's *RIGID BODY, whose RIGID MPCs ccx "
+                             "turns with the finite rotation in a *DYNAMIC step (Abaqus linearizes "
+                             "them: a 0.1 rad rotation 9 % off, probed); linear *EQUATIONs would "
+                             "read the transformed nodes' terms in their local axes.", once=True)
+            return card
+        self._note_linear_rigid()
+        return self._equation_lines(self._kin_rows(ref, rot, members, {1, 2, 3}))
+
+    def _note_linear_rigid(self) -> None:
+        self.report.note("Rigid constraints (*RIGID BODY, *MPC BEAM, kinematic couplings) in a deck "
+                         "with a *DYNAMIC step and no NLGEOM -> the linear *EQUATIONs Abaqus "
+                         "solves there (it linearizes rigid constraints in a geometrically linear "
+                         "analysis): u(node) = u(ref) + theta x d on each translation, theta on "
+                         "DOFs 1-3 of the ROT NODE (where the reference node's rotational BCs, "
+                         "moments and equation terms go). ccx turns its own RIGID MPCs with the "
+                         "finite rotation in a *DYNAMIC step even without NLGEOM (probed: 9 % "
+                         "off at 0.1 rad); knotted shell/beam members keep their rotation ties.",
+                         once=True)
+
     def _kin_dynamic_cards(self, b: Block, plan: dict,
                            groups: Sequence[Tuple[Sequence[int], set]]) -> List[str]:
-        """A kinematic coupling of plain 3-D members in a deck with a *DYNAMIC step: each
-        (members, DOFs) group as _kin_form says — a *RIGID BODY with the reference node's ROT
-        NODE, linear *EQUATIONs to the reference node and that ROT NODE, or left out (the card
-        commented out when nothing is left)."""
+        """A kinematic coupling in a deck with a *DYNAMIC step, of plain 3-D members (or, without
+        NLGEOM, any: _plan_kinematic_rot_nodes): each (members, DOFs) group as _kin_form says —
+        a *RIGID BODY with the reference node's ROT NODE, linear *EQUATIONs to the reference
+        node and that ROT NODE (the rotations of knotted shell/beam members tied to it), or
+        left out (the card commented out when nothing is left)."""
         ref, rot = plan["ref"], plan["rot"]
         body: List[int] = []
         rows: List[List[Tuple[int, int, float]]] = []
+        ties: List[str] = []
         forms: set = set()
         for nodes, dofs in groups:
             nodes = [n for n in dedup(nodes) if n not in (ref, rot)]
@@ -19780,14 +19832,17 @@ class Converter:
                 body += nodes
             elif form == "eq":
                 rows += self._kin_rows(ref, rot, nodes, dofs)
+                ties += self._rotation_ties(nodes, rot, -3, sorted(dofs))
         out: List[str] = []
         if body:
             self._synth_counter += 1
             name = f"ABQ2CCX_RB{self._synth_counter}"
             out += [f"*NSET, NSET={name}"] + reflow([str(n) for n in dedup(body)])
             out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
-        out += self._equation_lines(rows)
-        if out:
+        out += self._equation_lines(rows) + ties
+        if self._lin_dyn and any(n in self._expanded for ns, _ in groups for n in ns):
+            self._note_linear_rigid()        # (ccx's coupling would solve: its MPCs chain)
+        elif out:
             self.report.note("Kinematic coupling in a deck with a *DYNAMIC step: ccx 2.23 solves no "
                              "*DYNAMIC step of a model whose *COUPLING + *KINEMATIC chain no MPCs "
                              "(every free DOF stays at its initial value, with no message; probed), "

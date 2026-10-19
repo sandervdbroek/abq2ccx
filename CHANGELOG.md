@@ -4,6 +4,15 @@ Corpus counts are on the CalculiX version current at the time; from October 2026
 counts only decks that solve their own problem: under their own loads, without reduced
 physics.
 
+## Unreleased
+
+* **Rigid constraints in linear dynamic steps** — in a `*DYNAMIC` step ccx 2.23 turns the RIGID
+  MPCs of `*RIGID BODY` and kinematic couplings with the finite rotation even without NLGEOM,
+  where Abaqus linearizes them (a cantilever under a tip moment 9 % stiffer at 0.1 rad). In a
+  deck with a `*DYNAMIC` step and no NLGEOM every `*RIGID BODY`, `*MPC BEAM` body and kinematic
+  coupling, on solid, knotted shell/beam or 2-D nodes, is now written as the linear `*EQUATION`s
+  u = u_ref + θ × d (nodes with a `*TRANSFORM` keep the `*RIGID BODY`).
+
 ## 1.3.0 (October 2026)
 
 Material directions as Abaqus defines them on shells, membranes and continuum shells (composite

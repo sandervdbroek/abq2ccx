@@ -6199,23 +6199,103 @@ def test_kinematic_coupling_in_a_dynamic_deck():
     assert 9 not in conv._rb_rot and "RP,2,6" in _bc_lines(body)     # no ROT NODE for it
     body, conv, rep = convert_str(some + step.format(", nlgeom"), approximate=True)
     assert len(_equation_terms(body)) == 8 and "[APPROX] Kinematic coupling" in rep.text()
-    # a reference node shared with a *RIGID BODY: one ROT NODE, one rotation
+    # a reference node shared with a *RIGID BODY (linear equations too: see
+    # test_rigid_constraints_in_a_linear_dynamic_deck): one ROT NODE, one rotation
     shared = KIN9 + "*Nset, nset=BOTN\n1, 2\n*Rigid Body, ref node=RP, tie nset=BOTN\n"
     body, conv, _ = convert_str(shared + step.format("").replace("1, 1, 3\n2, 1, 3\n", ""))
     rot = conv._rb_rot[9]
-    assert f"*RIGID BODY, REF NODE=9, NSET=BOTN, ROT NODE={rot}" in body
+    assert "*RIGID BODY" not in "\n".join(_live(body))
     assert {t[0] for t in _equation_terms(body)[0]} == {5, 9, rot}
-    # unchanged: a deck without a *DYNAMIC step, and couplings ccx solves in one (their
-    # knotted shell or 2-D members chain the MPCs; probed)
+    assert {t[0] for row in _equation_terms(body) if row[0][0] in (1, 2) for t in row} == {1, 2, 9, rot}
+    # unchanged: a deck without a *DYNAMIC step, and under NLGEOM the couplings ccx solves in
+    # one (their knotted shell or 2-D members chain the MPCs; probed)
     body, conv, _ = convert_str(KIN9 + KIN9_STEP)
     assert "*COUPLING" in body and "*KINEMATIC\n1, 3" in body and 9 not in conv._rb_rot
-    dyn = "*Step\n*Dynamic\n0.01, 1.\n*End Step\n"
+    dyn = "*Step, nlgeom\n*Dynamic\n0.01, 1.\n*End Step\n"
     for deck in (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
                       "surface=RS\n*Kinematic\n1, 3\n" + dyn,
                  Q4 + "*Node\n9, 0.5, 2.\n*Surface, type=node, name=LS\nL\n*Coupling, constraint "
                       "name=C, ref node=9, surface=LS\n*Kinematic\n" + dyn):
         body, conv, _ = convert_str(deck)
         assert "*COUPLING" in body and "*KINEMATIC" in body and not conv._kin_dyn
+
+
+def test_rigid_constraints_in_a_linear_dynamic_deck():
+    # Abaqus linearizes rigid constraints in a geometrically linear analysis, but ccx turns
+    # their RIGID MPCs with the finite rotation in a *DYNAMIC step even without NLGEOM (9 %
+    # off at 0.1 rad; validate_with_ccx.py rigid_dynamic_*): there every *RIGID BODY, *MPC
+    # BEAM body and kinematic coupling is the linear equations u = u_ref + theta x d, theta on
+    # the ROT NODE, which takes the reference node's rotational BCs
+    step = ("*Step{}\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\nRP, 2, 6\n"
+            "*Boundary\nRP, 1, 1, 0.1\n*End Step\n")
+    rp = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+    body, _, _ = convert_str(KIN9 + step.format(""))
+    eqs = _equation_terms(body)          # the kinematic coupling's (node 5: d = (-0.5, -0.5, -1))
+    assert eqs[0] == [(5, 1, 1.), (9, 1, -1.), (10, 2, 1.), (10, 3, -0.5)] and len(eqs) == 12
+    cards = ("*Rigid Body, ref node=RP, tie nset=TOPN\n", "*Rigid Body, ref node=RP, pin nset=TOPN\n",
+             "*MPC\nBEAM, TOPN, 9\n", "*Element, type=R3D4, elset=RIG\n2, 5, 6, 7, 8\n"
+                                    "*Rigid Body, ref node=RP, elset=RIG\n")
+    for card in cards:
+        body, conv, rep = convert_str(rp + card + step.format(""))
+        live = "\n".join(_live(body))
+        assert "*RIGID BODY" not in live and "ABQ2CCX_MPCB" not in live
+        rot = conv._rb_rot[9]
+        assert {"RP,2,3", f"{rot},1,3"} <= set(_bc_lines(body))
+        if "R3D4" not in card:
+            assert _equation_terms(body) == eqs
+        else:                    # the rigid element's skin nodes (and its own nodes) follow it
+            assert len(_equation_terms(body)) == 24 and all(
+                row[1][0] == 9 and {t[0] for t in row[2:]} <= {rot} for row in _equation_terms(body))
+        assert "Rigid constraints (*RIGID BODY, *MPC BEAM, kinematic couplings) in a deck with a " \
+               "*DYNAMIC step and no NLGEOM" in rep.text()
+        assert rep.n_warnings == 0 and not conv.reduced_physics
+        # unchanged: under NLGEOM (explicit steps run with it) and without a *DYNAMIC step
+        for deck in (rp + card + step.format(", nlgeom"),
+                     rp + card + step.format("").replace("*Dynamic\n", "*Dynamic, explicit\n"),
+                     rp + card + step.format("").replace("*Dynamic\n0.01, 1.\n", "*Static\n")):
+            body, conv, _ = convert_str(deck)
+            assert "*RIGID BODY" in body and not _equation_terms(body)
+    # nodes with a *TRANSFORM keep the *RIGID BODY: ccx reads their equation terms in local axes
+    body, conv, rep = convert_str(rp + "*Transform, nset=TOPN\n0.8, 0.6, 0., -0.6, 0.8, 0.\n"
+                                  + cards[0] + step.format(""))
+    assert "*RIGID BODY" in body and not _equation_terms(body)
+    assert "Rigid body on nodes with a *TRANSFORM in a deck with a *DYNAMIC step" in rep.text()
+    # knotted shell members: their translations and (TIE, coupled rotations) rotations follow
+    sdyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 6\n4, 1, 6\n*Boundary\nREF, 3, 3, 0.1\n*End Step\n"
+    coupling = "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n"
+    for card, ties in (("*Rigid Body, ref node=REF, tie nset=R\n", True),
+                       ("*Rigid Body, ref node=REF, pin nset=R\n", False),
+                       ("*MPC\nBEAM, R, 100\n", True), (coupling + "*Kinematic\n", True),
+                       (coupling + "*Kinematic\n1, 3\n", False),
+                       ("*Kinematic Coupling, ref node=REF\nR, 1, 6\n", True)):
+        body, conv, rep = convert_str(S4 + card + sdyn)
+        eqs = _equation_terms(body)
+        assert sorted(conv._knots) == [5, 6] and conv._rb_rot == {100: 101}
+        assert "*RIGID BODY" not in "\n".join(_live(body)) and "*COUPLING" not in body
+        assert eqs[:3] == [[(5, 1, 1.), (100, 1, -1.), (101, 3, -0.5)],      # d = (-0.5, -0.5, 0)
+                           [(5, 2, 1.), (100, 2, -1.), (101, 3, 0.5)],
+                           [(5, 3, 1.), (100, 3, -1.), (101, 1, 0.5), (101, 2, -0.5)]]
+        assert len(eqs) == (12 if ties else 6) and (not ties or [(5, 4, 1.), (101, 1, -1.)] in eqs)
+        assert rep.n_warnings == 0 and not conv.reduced_physics
+    # 2-D members: DOFs 1-2 only (ccx holds DOF 3 itself), turning about z
+    qdyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n2, 1, 2\n3, 1, 2\n*Boundary\n9, 1, 1, 0.1\n*End Step\n"
+    for card in ("*Rigid Body, ref node=9, tie nset=L\n",
+                 "*Surface, type=node, name=LS\nL\n*Coupling, constraint name=C, ref node=9, "
+                 "surface=LS\n*Kinematic\n"):
+        body, conv, rep = convert_str(Q4 + "*Node\n9, -0.5, 0.5\n" + card + qdyn)
+        assert _equation_terms(body) == [[(1, 1, 1.), (9, 1, -1.), (10, 3, -0.5)],
+                                         [(1, 2, 1.), (9, 2, -1.), (10, 3, -0.5)],
+                                         [(4, 1, 1.), (9, 1, -1.), (10, 3, 0.5)],
+                                         [(4, 2, 1.), (9, 2, -1.), (10, 3, -0.5)]]
+        assert "*COUPLING" not in body and rep.n_warnings == 0 and not conv.reduced_physics
+    # a beam reference node: the ROT NODE follows its rotations
+    beam = ("*Node\n10, 0.5, 0.5, 3.\n*Element, type=B31, elset=B\n2, 9, 10\n*Beam Section, elset=B, "
+            "material=M, section=RECT\n1., 1.\n1., 0., 0.\n*Material, name=M\n*Elastic\n1000., 0.3\n")
+    body, conv, _ = convert_str(rp + beam + cards[0] + step.format(""))
+    eqs = _equation_terms(body)
+    rot = {t[0] for row in eqs[:12] for t in row[2:]}.pop()
+    assert len(eqs) == 15 and eqs[12:] == [[(rot, k, 1.), (9, k + 3, -1.)] for k in (1, 2, 3)]
+    assert "*RIGID BODY" not in "\n".join(_live(body))
 
 
 def test_equation_terms_on_rigid_body_reference_rotations_move_to_the_rot_node():
