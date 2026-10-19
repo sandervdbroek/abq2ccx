@@ -2428,6 +2428,13 @@ def test_kinematic_rotation_lines():
     assert body.count("*COUPLING") == 1
     assert _equations(body) == [f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6)]
     assert "NOT coupled" not in rep.text()
+    # on solid nodes the rotation line is dropped; the conversion note covers converted lines
+    # only, and none when nothing is converted
+    body, _, rep = convert_str(HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6\n"
+                               "*Kinematic Coupling, ref node=100\nTOP, 1, 3\nTOP, 4, 6\n")
+    assert "NOT coupled" in rep.text() and "every member line kept" not in rep.text()
+    _, _, rep = convert_str(HEX + "*Node\n100,0.5,0.5,2.\n*Kinematic Coupling, ref node=100\n5, 4, 6\n")
+    assert "couples no translational DOF" in rep.text() and "per DOF range" not in rep.text()
 
 
 def _bc_lines(body):
@@ -2779,6 +2786,9 @@ def test_orientation_origin_and_node_definition():
     assert "\n** *ORIENTATION, NAME=O4, DEFINITION=nodes\n** 2, 4, 9\n" in body
     assert "*ORIENTATION, NAME=O5\n1, 0, 0, 0, 1, 0" in body
     assert "O5" in conv._orient_axes and not {"O3", "O4"} & conv._orient_axes
+    # a cylindrical system's a, b are not measured from c: c is dropped, and the note says so
+    body, _, rep = convert_str("*Orientation, name=C, system=cylindrical\n0., 0., 0., 0., 0., 1., 5., 0., 0.\n")
+    assert "coordinates beyond points a,b dropped" in rep.text() and "origin c" not in rep.text()
 
 
 def test_orientation_zero_additional_rotation_on_a_cylindrical_system():

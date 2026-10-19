@@ -5768,8 +5768,9 @@ class Converter:
                     self.orientations[name] = (tuple(pts[0:3]), tuple(pts[3:6]),
                                                self.orientations[name][2])
             elif len(v) > 6:
-                try:
-                    has_origin = len(v) >= 9 and any(pf(x) != 0.0 for x in v[6:9])
+                rect = (b.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("RECT")
+                try:            # (only a rectangular system measures a, b from c: _orientation_points)
+                    has_origin = rect and len(v) >= 9 and any(pf(x) != 0.0 for x in v[6:9])
                 except ValueError:
                     has_origin = False
                 if pts is not None and has_origin:
@@ -11683,7 +11684,7 @@ class Converter:
 
     def handle_coupling(self, b: Block) -> List[str]:
         """Abaqus standalone ``*KINEMATIC COUPLING, REF NODE=r`` (data: node/nset, first DOF,
-        last DOF — one line per member).  Every line is kept, as node surfaces with ccx
+        last DOF — one line per member).  The lines become node surfaces with ccx
         ``*COUPLING`` + ``*KINEMATIC`` per DOF range (ccx couples translations; the reference
         node's rotations still drive them, and unlike *RIGID BODY its DOFs 4-6 take BCs and
         moments); rotation ranges on knotted shell/beam members become *EQUATION ties to
@@ -11738,8 +11739,9 @@ class Converter:
             out += [f"*SURFACE, TYPE=NODE, NAME={tag}_{gi}"] + list(ms)
             out += [f"*COUPLING, CONSTRAINT NAME={tag}_{gi}, REF NODE={ref}, SURFACE={tag}_{gi}",
                     "*KINEMATIC", f"{lo}, {min(hi, top)}"]
-        self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per DOF "
-                         "range (every member line kept).", once=True)
+        if out:
+            self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per DOF "
+                             "range.", once=True)
         return (out + ties) or self._commented(b, "*KINEMATIC COUPLING couples no translational "
                                                   "DOF; dropped.")
 
