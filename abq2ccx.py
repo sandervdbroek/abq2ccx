@@ -54,7 +54,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
 __version__ = "1.2.1"
 
@@ -2137,7 +2137,10 @@ def expand_elcopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     return created
 
 
-def dedup(seq: Sequence[int]) -> List[int]:
+_T = TypeVar("_T")
+
+
+def dedup(seq: Sequence[_T]) -> List[_T]:
     seen, out = set(), []
     for x in seq:
         if x not in seen:
@@ -3000,7 +3003,7 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool) -> List[Optional[
             loads = [d for card in active.values() for d in card.values()] + initial["STRESS"]
             if proc in ("DYNAMIC", "MODAL DYNAMIC"):
                 loads += initial["VELOCITY"]
-            out.append(dedup_str(loads))
+            out.append(dedup(loads))
         step = None
     return out
 
@@ -10235,7 +10238,7 @@ class Converter:
     def handle_output(self, b: Block) -> List[str]:
         """An output card -> the ccx cards _plan_output chose for it (the notes on its
         parameters and variables are given here, where the card stands)."""
-        p = self._out_plan.get(id(b)) or self._lone_output_plan(b)
+        p = self._out_plan[id(b)]
         if p["cc"] == "CONTACT FILE":
             self._contact_card(p.get("src", b), self.report)
         elif p["cc"]:
@@ -10253,19 +10256,6 @@ class Converter:
             self.report.warn(msg, once=True)
         return self._emit_output_cards(p["cards"], p["out2d"])
 
-    def _lone_output_plan(self, b: Block) -> dict:
-        """The plan of an output card _plan_output did not see: the card on its own, its
-        FREQUENCY / TIME POINTS kept."""
-        cc = self._output_route(b, None)
-        quiet = Report()
-        if cc == "CONTACT FILE":
-            params, labels = self._contact_card(b, quiet, keep_ctl=True)
-        else:
-            params, labels = self._output_card(b, cc, quiet, keep_ctl=True)
-        off = (params.get("FREQUENCY") or "").strip() == "0"
-        cards = [] if labels is None or off else [(cc, params, labels)]
-        return {"cc": cc, "cards": cards, "notes": [], "warnings": [], "out2d": False}
-
     @staticmethod
     def _output_route(b: Block, ctx: Optional[Block]) -> str:
         """The ccx card that output card ``b`` becomes (``ctx``: the *OUTPUT it follows).
@@ -10280,11 +10270,10 @@ class Converter:
             return "EL PRINT" if hist and b.param("ELSET") else "EL FILE"
         return b.keyword
 
-    def _output_card(self, b: Block, cc: str, report: "Report", keep_ctl: bool = False):
+    def _output_card(self, b: Block, cc: str, report: "Report"):
         """(parameters, ccx labels) of output card ``b`` written as ``*cc``, with notes on
         what is dropped or renamed; labels None when nothing of the card is left.  Its
-        FREQUENCY / TIME POINTS are left to the step's output control (_plan_output) unless
-        ``keep_ctl``."""
+        FREQUENCY / TIME POINTS are left to the step's output control (_plan_output)."""
         members = self.geom.elset((b.param("ELSET") or "").strip()) if b.param("ELSET") else []
         if members and all(e in self._conn for e in members):
             report.note(f"*{b.keyword} on connector elements dropped: they are constraints in "
@@ -10304,8 +10293,6 @@ class Converter:
                 report.note(f"Output parameter {k} dropped.", once=True)
                 continue
             if k in ("FREQ", "FREQUENCY", "TIME POINTS"):
-                if keep_ctl:
-                    params["FREQUENCY" if k == "FREQ" else k] = v
                 continue
             if k == "ELSET" and cc == "EL FILE":
                 report.note("*EL FILE ELSET= dropped (ccx writes all elements to .frd; use "
@@ -10396,7 +10383,7 @@ class Converter:
         if not outvars and not is_print:
             outvars = ["U"] if cc == "NODE FILE" else ["S"]
             report.note(f"*{cc}: no explicit variables -> default '{outvars[0]}'.", once=True)
-        final = dedup_str(outvars)
+        final = dedup(outvars)
         if len(final) > 16:                       # ccx reads at most 16 entries per line
             report.warn(f"*{cc}: more than 16 output identifiers after mapping; keeping "
                         f"the first 16 (ccx line limit).", once=True)
@@ -10410,19 +10397,16 @@ class Converter:
                         f"point; the .frd is not affected.", once=True)
         return params, final
 
-    def _contact_card(self, b: Block, report: "Report", keep_ctl: bool = False):
+    def _contact_card(self, b: Block, report: "Report"):
         """``*CONTACT OUTPUT`` / ``*CONTACT FILE`` -> ccx ``*CONTACT FILE``: Abaqus contact
         variables fold onto ccx's CDIS (opening/slip) and CSTR (pressure/shear); others
         (forces, areas, status) are dropped; Abaqus-only parameters too.  Returns
         (parameters, labels), labels None when no ccx contact variable is left."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
-            if k in ("FREQ", "FREQUENCY", "TIME POINTS"):
-                if keep_ctl:
-                    keep["FREQUENCY" if k == "FREQ" else k] = v
-            elif k in ("LAST ITERATIONS", "CONTACT ELEMENTS", "FREQUENCYF"):
+            if k in ("LAST ITERATIONS", "CONTACT ELEMENTS", "FREQUENCYF"):
                 keep[k] = v
-            else:
+            elif k not in ("FREQ", "FREQUENCY", "TIME POINTS"):  # the step's output control
                 report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx).", once=True)
         labels: List[str] = []
         for rec in merged_data_records(b):
@@ -10441,7 +10425,7 @@ class Converter:
                             once=True)
                 return keep, None
             labels = ["CDIS", "CSTR"]
-        return keep, dedup_str(labels)
+        return keep, dedup(labels)
 
     def _emit_output_cards(self, cards: List[tuple], out2d: bool = False) -> List[str]:
         """Write ``cards`` [(keyword, params, labels)].  The first output card of a step
@@ -10852,7 +10836,7 @@ class Converter:
         if not labels and not own:
             return None
         return mkblock(b.keyword, [(p, v) for p, v in b.params.items() if p != "VARIABLE"],
-                       [", ".join(dedup_str(list(labels) + own))])
+                       [", ".join(dedup(list(labels) + own))])
 
     def _carried_requests(self, anchor: Block, held: Optional[list], timing: dict,
                           quiet: "Report", k: int) -> List[dict]:
@@ -11296,7 +11280,7 @@ class Converter:
                     out += [", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in eq[i:i + 4])
                             for i in range(0, len(eq), 4)]
         if bcs:
-            bcs = dedup_str(bcs)
+            bcs = dedup(bcs)
             out = ["*BOUNDARY"] + bcs + out
             self._conn_bcs += [x for x in bcs if x not in self._conn_bcs]
         for body in self._mpc_bodies.get(id(b), []):
@@ -16009,7 +15993,7 @@ class Converter:
         shear = [t for t in kinds if t.rstrip("H") not in U1_EULER_BERNOULLI]
         counts = ", ".join(f"{t}: {n}" for t, n in kinds.items())
         self.report.note(f"{len(self._u1)} beam element(s) ({counts}) under "
-                         f"{'/'.join(dedup_str([self._u1_label(b) for b in cards]))} -> ccx's "
+                         f"{'/'.join(dedup([self._u1_label(b) for b in cards]))} -> ccx's "
                          f"2-node beam U1 with *BEAM SECTION, SECTION=GENERAL (declared by *USER "
                          f"ELEMENT): the section's area and principal second moments, n1 turned "
                          f"onto the first principal axis and projected normal to each element "
@@ -19358,10 +19342,10 @@ class Converter:
     # ======================================================================
     # Planar models: ccx runs 2-D beams and trusses as 3-D elements
     # ======================================================================
-    # procedures a C3D8I slab is probed to reproduce (static bending: small strain, no thermal
-    # or dynamic terms); its mass and geometric stiffness are not compared, so a *FREQUENCY or
-    # *BUCKLE step keeps the plain element, as reduced physics
-    _SLAB_PROCEDURES = {"STATIC"}
+    # a C3D8I slab is probed to reproduce static bending only (small strain, no thermal or
+    # dynamic terms); its mass and geometric stiffness are not compared, so a deck with a step
+    # of any other procedure (a *FREQUENCY or *BUCKLE step too) keeps the plain element, as
+    # reduced physics
     _OTHER_PROCEDURES = {"FREQUENCY", "BUCKLE",
                          "DYNAMIC", "MODAL DYNAMIC", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY",
                          "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
@@ -20260,7 +20244,7 @@ class Converter:
                     if best is None or h / c < best[0]:
                         best = (h / c, e)
         self._circ_explicit = best
-        self._circ_explicit_issue = ", ".join(dedup_str(missing))
+        self._circ_explicit_issue = ", ".join(dedup(missing))
 
     # ccx's lumped node mass over its contact area share for the expanded faces of plane /
     # axisymmetric slave edges, times rho A / (K L) (A: element area, L: edge length) — node-
@@ -20642,15 +20626,6 @@ class Converter:
                              f"slave nodes' masses (smallest at element {elem}) times 0.8.",
                              once=True)
         return [", ".join(fields)] + data[1:]
-
-
-def dedup_str(seq: Sequence[str]) -> List[str]:
-    seen, out = set(), []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -21515,8 +21490,8 @@ def _windows_ccx_candidates() -> List[str]:
     per-user install, newest first), PrePoMax (a portable folder; its static build needs
     no MKL DLLs), then bConverged, whose ccx.bat sets up what its ccx.exe needs."""
     env = os.environ.get
-    programs = dedup_str([p for p in (env("ProgramFiles"), env("ProgramW6432"),
-                                      env("ProgramFiles(x86)")) if p])
+    programs = dedup([p for p in (env("ProgramFiles"), env("ProgramW6432"),
+                                  env("ProgramFiles(x86)")) if p])
     if env("LOCALAPPDATA"):
         programs.append(os.path.join(env("LOCALAPPDATA"), "Programs"))
     home = env("USERPROFILE")
@@ -21534,7 +21509,7 @@ def _windows_ccx_candidates() -> List[str]:
             out += [os.path.join(solver, exe) for exe in ("ccx_static.exe", "ccx_dynamic.exe")]
     out += [os.path.join(r, "bConverged", "CalculiX", "bin", exe)
             for r in programs for exe in ("ccx.bat", "ccx.exe")]
-    return [c for c in dedup_str(out) if os.path.isfile(c)]
+    return [c for c in dedup(out) if os.path.isfile(c)]
 
 
 def _conda_dll_dirs(exe: str) -> List[str]:
