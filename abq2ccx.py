@@ -799,6 +799,10 @@ class Block:
     def param(self, key: str, default: Optional[str] = None) -> Optional[str]:
         return self.params.get(key.upper(), default)
 
+    def uparam(self, key: str) -> str:
+        """The value of parameter ``key``, stripped and upper-cased; "" when it is absent."""
+        return (self.params.get(key.upper()) or "").strip().upper()
+
     def has(self, key: str) -> bool:
         return key.upper() in self.params
 
@@ -1570,7 +1574,7 @@ def analytic_profile(b: Block) -> Tuple[Optional[dict], str]:
     are left out, as within a part), the profile's start point and its segments ("LINE",
     end), ("CIRCL", end, centre) and ("PARAB", middle, end) in the profile plane (Abaqus
     Keywords Reference, *SURFACE).  (None, why) when the card cannot be read."""
-    typ = (b.param("TYPE") or "").strip().upper()
+    typ = b.uparam("TYPE")
     recs = [r for r in merged_data_records(b) if any(x for x in r)]
     frame: List[Vec] = []
     i = 0
@@ -2071,7 +2075,7 @@ def expand_nmap(block: Block, geom: Geometry, normals: Dict[int, Vec], report: R
         report.warn(f"*NMAP, TYPE={typ} is not converted; its nodes keep their unmapped "
                     f"coordinates.", once=True)
         return f"*NMAP, TYPE={typ} coordinate mapping skipped"
-    by_nodes = (block.param("DEFINITION") or "").strip().upper().startswith("NODE")
+    by_nodes = block.uparam("DEFINITION").startswith("NODE")
     recs = [[x.strip() for x in rec] for rec in merged_data_records(block)]
     try:
         def points(rec: List[str], count: int) -> List[Optional[Vec]]:
@@ -3038,7 +3042,7 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
 
     def apply(b: Block, into: Dict[str, Dict[tuple, str]], explicit: bool = False) -> None:
         card = into.setdefault(b.keyword, {})
-        if (b.param("OP") or "").strip().upper() == "NEW":
+        if b.uparam("OP") == "NEW":
             # OP=NEW removes what earlier steps applied, not the cards before it in this
             # step (Abaqus; probed on ccx 2.23 for *CLOAD and *BOUNDARY)
             kept = fresh.get(b.keyword, set())
@@ -3064,7 +3068,7 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
             elif kw in LOAD_CARD_FIELD:           # model-data *BOUNDARY
                 apply(b, state)
             elif kw == "INITIAL CONDITIONS":
-                typ = (b.param("TYPE") or "").strip().upper()
+                typ = b.uparam("TYPE")
                 # the values: node, DOF, velocity | node set, angular velocity, axis ... |
                 # element, stress components
                 lo, hi = {"VELOCITY": (2, 3), "ROTATING VELOCITY": (1, 2)}.get(typ, (1, None))
@@ -3380,7 +3384,7 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
     (Abaqus and ccx alike)."""
     definition = (b.param("DEFINITION") or "TABULAR").strip().upper()
     total = (b.param("TIME") or "").upper().replace(" ", "") == "TOTALTIME"
-    absolute = (b.param("VALUE") or "").strip().upper() == "ABSOLUTE"
+    absolute = b.uparam("VALUE") == "ABSOLUTE"
 
     def num(key: str, default: float) -> float:
         v = b.param(key)
@@ -3920,7 +3924,7 @@ class Converter:
             elif kw == "SURFACE":
                 self._register_surface(b)
         for b in blocks:                        # DEFINITION=NODES: nodes may follow the card
-            if b.keyword == "ORIENTATION" and (b.param("DEFINITION") or "").strip().upper().startswith("NODES"):
+            if b.keyword == "ORIENTATION" and b.uparam("DEFINITION").startswith("NODES"):
                 self._register_orientation(b)
 
     def _cartesian_nodes(self, blocks: List[Block]) -> List[Block]:
@@ -4836,7 +4840,7 @@ class Converter:
             if b.keyword == "MATERIAL":
                 cur = (b.param("NAME") or "").strip()
             elif b.keyword == "USER MATERIAL" and cur and \
-                    (b.param("TYPE") or "").strip().upper() != "THERMAL":
+                    b.uparam("TYPE") != "THERMAL":
                 mech[cur.upper()] = cur
         self._umat_explicit = any((b.keyword == "DYNAMIC" and b.has("EXPLICIT")) or
                                   b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT" for b in blocks)
@@ -4846,7 +4850,7 @@ class Converter:
         nl = abaqus and any(b.keyword == "STEP" and b.has("NLGEOM") and
                             (b.param("NLGEOM") or "YES").strip().upper() != "NO" for b in blocks)
         prefix = "ABAQUSNL" if nl else "ABAQUS"
-        taken = {(b.param("NAME") or "").strip().upper() for b in blocks if b.keyword == "MATERIAL"}
+        taken = {b.uparam("NAME") for b in blocks if b.keyword == "MATERIAL"}
         ren: Dict[str, str] = {}
         for key, name in mech.items():
             bare = re.sub(r"\s", "", name).upper()                  # as ccx reads it
@@ -4928,9 +4932,9 @@ class Converter:
         for b in blocks:
             params, data = b.params, b.data
             key = "NAME" if b.keyword == "MATERIAL" else "MATERIAL"
-            if (b.param(key) or "").strip().upper() in ren:
+            if b.uparam(key) in ren:
                 params = OrderedDict(params)
-                params[key] = ren[(b.param(key) or "").strip().upper()]
+                params[key] = ren[b.uparam(key)]
             if b.keyword.endswith("SECTION") and b.has("COMPOSITE"):
                 data = [ply(d) for d in b.data]
             out.append(b if params is b.params and data == b.data
@@ -4944,7 +4948,7 @@ class Converter:
         which ccx stops ('anisotropic definition is not complete').  A thermal one goes to
         ccx's umatht, whatever the material's name: empty in a stock ccx, which then runs the
         material with no heat conduction and no error (probed on 2.23)."""
-        thermal = (b.param("TYPE") or "").strip().upper() == "THERMAL"
+        thermal = b.uparam("TYPE") == "THERMAL"
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "CONSTANTS":
@@ -5206,7 +5210,7 @@ class Converter:
             name = (group[0].param("NAME") or "").strip()
             for exp in group:
                 if exp.keyword != "EXPANSION" or exp.has("USER") or \
-                        (exp.param("TYPE") or "").strip().upper() not in ("ANISO", "ANISOTROPIC"):
+                        exp.uparam("TYPE") not in ("ANISO", "ANISOTROPIC"):
                     continue
                 rows = material_rows(exp, 6)
                 try:
@@ -5281,7 +5285,7 @@ class Converter:
             return None if len(Converter._johnson_cook_values(b)[1]) >= 3 else (
                 "*PLASTIC, HARDENING=JOHNSON COOK: data line could not be parsed (need A, B, n, "
                 "m); commented out — the material now runs elastic.")
-        if (b.param("DATATYPE") or "").strip().upper().startswith("PARAM"):
+        if b.uparam("DATATYPE").startswith("PARAM"):
             return ("*PLASTIC, DATATYPE=PARAMETERS (Chaboche back-stress parameters) has no ccx "
                     "equivalent — ccx would read them as one stress/strain point. Commented out: "
                     "the material now runs elastic; tabulate the hardening curve instead.")
@@ -5413,7 +5417,7 @@ class Converter:
         named = set(self._used_materials)
         for b in blocks:
             if b.keyword != "MATERIAL" and b.param("MATERIAL"):
-                named.add((b.param("MATERIAL") or "").strip().upper())
+                named.add(b.uparam("MATERIAL"))
             if b.keyword in ("REBAR LAYER", "EULERIAN SECTION"):
                 named.update(x.strip().upper() for r in merged_data_records(b) for x in r)
         for m in dps:
@@ -5490,7 +5494,7 @@ class Converter:
                                "UNCOUPLED TEMPERATURE-DISPLACEMENT"})
         if not nlgeom or not (changes or any(
                 b.keyword == "INITIAL CONDITIONS" and
-                (b.param("TYPE") or "").strip().upper() == "TEMPERATURE" for b in blocks)):
+                b.uparam("TYPE") == "TEMPERATURE" for b in blocks)):
             return
         kinds: Dict[str, Tuple[str, Block, str]] = {}      # MATERIAL -> (kind, *EXPANSION, name)
         for group in self._material_groups(blocks):
@@ -5647,9 +5651,9 @@ class Converter:
                          f"mass: a strongly nonlinear step may need smaller increments than *STATIC "
                          f"would.", once=True)
         jumps = {n for n, g in coupled
-                 if (g[0].param("AMPLITUDE") or "").strip().upper() != "RAMP" and any(
+                 if g[0].uparam("AMPLITUDE") != "RAMP" and any(
                      b.keyword in ("CLOAD", "DLOAD", "DSLOAD") and
-                     (not b.param("AMPLITUDE") or (b.param("OP") or "").strip().upper() == "NEW")
+                     (not b.param("AMPLITUDE") or b.uparam("OP") == "NEW")
                      for b in g)}
         # so does a mechanical BC that a *BOUNDARY, OP=NEW releases: its reaction drops at the
         # step start (probed: a bar whose top BC carried its load overshoots the same way when
@@ -5685,7 +5689,7 @@ class Converter:
                 keys = {(n, d) for spec, dofs, *_ in self._rate_lines(b)
                         for n in (self._resolve_nodes(spec) or [spec.upper()]) for d in dofs
                         if d <= 6 and carries(n, d)}
-                if step and (b.param("OP") or "").strip().upper() == "NEW":
+                if step and b.uparam("OP") == "NEW":
                     active = {k for k in active if k in fresh}
                 active |= keys
                 fresh |= keys
@@ -5734,12 +5738,12 @@ class Converter:
     def _material_uses(self, blocks: List[Block]) -> List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]:
         """``(MATERIAL, axes)`` for every section and composite ply (shell or solid) that uses
         a material, its axes as _material_axes gives them (None where they vary)."""
-        oris = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "ORIENTATION"}
+        oris = {b.uparam("NAME"): b for b in blocks if b.keyword == "ORIENTATION"}
         uses: List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]] = []
         for b in blocks:
             if not b.keyword.endswith("SECTION"):
                 continue
-            base = (b.param("ORIENTATION") or "").strip().upper()
+            base = b.uparam("ORIENTATION")
             for _t, mat, ply in self._section_layers(b):    # a composite's plies, or its material
                 if not mat:
                     continue
@@ -5761,7 +5765,7 @@ class Converter:
         if name:
             b = oris.get(name)
             if b is None or not (b.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("RECT") \
-                    or (b.param("DEFINITION") or "").strip().upper().startswith("OFFSET"):
+                    or b.uparam("DEFINITION").startswith("OFFSET"):
                 return None
             pts = self._orientation_points(b)           # None for a distribution's name
             if pts is None:
@@ -5794,7 +5798,7 @@ class Converter:
         coefficients) in material ``axes`` (None: axes that vary) gives a thermal strain with
         shear in global axes at any of its temperature rows: eps_ij = sum_k alpha_k a_ki a_kj
         for local axes a_k.  Unreadable data counts as shear."""
-        aniso = (exp.param("TYPE") or "").strip().upper() in ("ANISO", "ANISOTROPIC")
+        aniso = exp.uparam("TYPE") in ("ANISO", "ANISOTROPIC")
         recs = material_rows(exp, 6 if aniso else 3)
         if recs is None:
             return True
@@ -5849,10 +5853,10 @@ class Converter:
                                       "the system by coordinates or a *DISTRIBUTION.", reduces=False)
         if self._orientation_distribution(b) is not None:
             return self._distribution_orientation(b)
-        name = (b.param("NAME") or "").strip().upper()
+        name = b.uparam("NAME")
         params = self._orientation_params(b, name in self._lossless_ori)
         out = [emit_keyword("ORIENTATION", params)]
-        if (b.param("SYSTEM") or "").strip().upper().startswith("SPHER") and \
+        if b.uparam("SYSTEM").startswith("SPHER") and \
                 name in self._lossless_ori and name in self._free_readers:
             # sections without direction dependence read it: any valid axes are as good, and
             # ccx prints their element stresses in the axes it reads (NaN on zero axes, probed)
@@ -5928,7 +5932,7 @@ class Converter:
             if k == "DEFINITION":
                 continue
             if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
-                name = (b.param("NAME") or "").strip().upper()
+                name = b.uparam("NAME")
                 if not lossless:
                     self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
                                      "RECTANGULAR — verify the local system.", once=True)
@@ -5970,7 +5974,7 @@ class Converter:
         """An orientation distribution is re-emitted right before each *ORIENTATION that
         names it (see _plan_distributions), so the card itself emits nothing.  ccx has no
         other kind of distribution."""
-        name = (b.param("NAME") or "").strip().upper()
+        name = b.uparam("NAME")
         if name in self._ply_angle_dists:
             self.report.note(f"*DISTRIBUTION {name} of composite layer angles: taken into the axes "
                              f"of the ply solids (no card of its own in ccx).", once=True)
@@ -6003,11 +6007,11 @@ class Converter:
                                   f"section or material each.", reduces=name in self._param_values)
 
     def handle_distribution_table(self, b: Block) -> List[str]:
-        if (b.param("NAME") or "").strip().upper() in self._dist_tables:
+        if b.uparam("NAME") in self._dist_tables:
             self.report.note("*DISTRIBUTION TABLE of an orientation distribution dropped (ccx "
                              "needs no table: its distribution lines are always a, b).", once=True)
             return []
-        if (b.param("NAME") or "").strip().upper() in self._qmem_dist_tables:
+        if b.uparam("NAME") in self._qmem_dist_tables:
             self.report.note("*DISTRIBUTION TABLE of a membrane thickness distribution dropped (the "
                              "thicknesses are in the geometry of the solids).", once=True)
             return []
@@ -6033,7 +6037,7 @@ class Converter:
     def _distribution_orientation(self, b: Block) -> List[str]:
         """An *ORIENTATION that names a *DISTRIBUTION, preceded by the distribution in the
         form ccx 2.23 runs correctly (see _plan_distributions)."""
-        name = (b.param("NAME") or "").strip().upper()
+        name = b.uparam("NAME")
         ref = self._orientation_distribution(b)
         plan = self._dist_ori.get(name)
         if plan is None and ref in self._dists:
@@ -6108,7 +6112,7 @@ class Converter:
         for b in blocks:
             if b.keyword != "ORIENTATION":
                 continue
-            name = (b.param("NAME") or "").strip().upper()
+            name = b.uparam("NAME")
             ref = self._orientation_distribution(b)
             if ref is None:
                 plain.add(name)
@@ -6145,7 +6149,7 @@ class Converter:
                                         solid=set(), split=False, other=False)
         for b in blocks:
             kw = b.keyword
-            ori = (b.param("ORIENTATION") or "").strip().upper()
+            ori = b.uparam("ORIENTATION")
             elset = (b.param("ELSET") or "").strip()
             shell = kw in ("SHELL SECTION", "SHELL GENERAL SECTION")
             if id(b) in self._ply_sections:        # ply solids with their own axes, the rotation applied
@@ -6239,7 +6243,7 @@ class Converter:
                 if o in self._dist_ori and o not in involved:
                     involved.append(o)
         involved = [o for o in involved if self._dist_ori[o]["has_data"]]
-        elset = (b.param("ELSET") or "").strip().upper()
+        elset = b.uparam("ELSET")
         if not involved or not elset:
             return
         groups: "OrderedDict[tuple, List[int]]" = OrderedDict()
@@ -6332,7 +6336,7 @@ class Converter:
         elements, element deletion / degradation / viscous regularization with progressive
         damage, distortion control on C3D10HS, and the Abaqus/Explicit-only options in an
         explicit step.  Elsewhere the card does nothing in Abaqus either."""
-        name = (b.param("NAME") or "").strip().upper()
+        name = b.uparam("NAME")
         types = self._sc_types.get(name, set())
         why: List[str] = []
         hourglass = sorted(t for t in types if t.startswith(self._HOURGLASS_PREFIXES))
@@ -6368,7 +6372,7 @@ class Converter:
         # 2 its rotational scale (shells), 3-5 Explicit-only scales (out-of-plane hourglass,
         # bulk viscosity), 6 C3D4H's pressure hourglass scale, 7 not used, 8 the Explicit drill
         # scale; a second line holds SPH (Explicit) settings.  ENHANCED ignores the data line.
-        enhanced = (b.param("HOURGLASS") or "").strip().upper() == "ENHANCED"
+        enhanced = b.uparam("HOURGLASS") == "ENHANCED"
         rec = [x.strip() for r in merged_data_records(b) for x in r]
         for i, x in enumerate(rec):
             try:
@@ -6927,7 +6931,7 @@ class Converter:
             return None
         aniso = "aniso" in syms
         membrane = b.keyword == "MEMBRANE SECTION"
-        base = (b.param("ORIENTATION") or "").strip().upper()
+        base = b.uparam("ORIENTATION")
         elems = []
         for e in dedup(self.geom.elset(elset)):
             if e not in self.geom.elements:
@@ -7012,11 +7016,11 @@ class Converter:
         orientation's axes 1 and 3 are direction 1 and the normal (either sign for an
         orthotropic material) — for a cylindrical system, throughout the element."""
         elset = (b.param("ELSET") or "").strip()
-        mat = (b.param("MATERIAL") or "").strip().upper()
+        mat = b.uparam("MATERIAL")
         sym = self._mat_symmetry.get(mat, "aniso")
         if not elset or not mat or sym is None:
             return None
-        name = (b.param("ORIENTATION") or "").strip().upper()
+        name = b.uparam("ORIENTATION")
         cyl = bool(name) and (not self._dist_ori[name]["rect"] if name in self._dist_ori else
                               name in self.orientations and self.orientations[name][2].upper().startswith("CYL"))
         rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]" = OrderedDict()
@@ -7055,7 +7059,7 @@ class Converter:
         order = self._stack_order(conn, stack, axis) if len(conn) == 8 else tuple(range(1, 7))
         pc = [conn[q - 1] for q in order]
         n, centre = self._stack_geometry(pc[:len(pc) // 2], pc[len(pc) // 2:])
-        name = (b.param("ORIENTATION") or "").strip().upper()
+        name = b.uparam("ORIENTATION")
         fr = self._abaqus_frame(e, name, centre) if name else None
         if vnorm(n) < 0.5 or (name and fr is None):
             return None
@@ -7077,7 +7081,7 @@ class Converter:
                 self._frame_bound_mats.add(name)
             sym = None
             for c in opts[1:]:
-                typ = (c.param("TYPE") or "").strip().upper()
+                typ = c.uparam("TYPE")
                 tensor = c.keyword in ("ELASTIC", "EXPANSION", "CONDUCTIVITY")
                 if c.keyword == "USER MATERIAL" or (c.keyword == "HYPERELASTIC" and c.has("ANISOTROPIC")) \
                         or (tensor and typ in ("ANISOTROPIC", "ANISO")):
@@ -7101,7 +7105,7 @@ class Converter:
         its element stresses in them, NaN on zero axes, so handle_orientation writes a spherical
         one as the global axes.  (ccx's *DEFORMATION PLASTICITY depends on the axes, so such a
         section reads none in ccx: _dp_axes.)"""
-        lossless = {(b.param("NAME") or "").strip().upper(): True for b in blocks if b.keyword == "ORIENTATION"}
+        lossless = {b.uparam("NAME"): True for b in blocks if b.keyword == "ORIENTATION"}
         for b in blocks:
             kw = b.keyword
             if kw in ("SHELL SECTION", "MEMBRANE SECTION") or (
@@ -7113,7 +7117,7 @@ class Converter:
                         self._continuum_axes_rows(b)
                     if rows is not None:
                         self._exact_axes[id(b)] = rows
-                        ori = (b.param("ORIENTATION") or "").strip().upper()
+                        ori = b.uparam("ORIENTATION")
                         if ori in self._dist_ori:          # its solid section names it no more
                             self._dist_ori[ori]["solid"].difference_update(rows)
                             self._dist_ori[ori]["split"] = True
@@ -7121,7 +7125,7 @@ class Converter:
                     rows = self._shell_axes_rows(b)
                     if rows is not None:
                         self._exact_axes[id(b)] = rows
-            names = {(b.param("ORIENTATION") or "").strip().upper()}
+            names = {b.uparam("ORIENTATION")}
             if b.has("COMPOSITE"):
                 names |= {f for _t, _m, f in self._section_layers(b)}
             if kw == "CONNECTOR SECTION":
@@ -7147,7 +7151,7 @@ class Converter:
         if b.has("COMPOSITE") or not (kw in ("SOLID SECTION", "SHELL SECTION", "MEMBRANE SECTION")
                                       or kw == "SHELL GENERAL SECTION" and b.has("MATERIAL")):
             return False
-        mat = (b.param("MATERIAL") or "").strip().upper()
+        mat = b.uparam("MATERIAL")
         return bool(mat) and self._mat_symmetry.get(mat, "aniso") is None
 
     def _dp_axes(self, mat: Optional[str], ori: Optional[str]) -> Optional[str]:
@@ -7290,7 +7294,7 @@ class Converter:
         split = self._dist_split.get(id(b))
         if split is None:
             return self.passthrough(b)
-        base = (b.param("ORIENTATION") or "").strip().upper()
+        base = b.uparam("ORIENTATION")
         out: List[str] = []
         for gname, axes in split:
             params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
@@ -7520,7 +7524,7 @@ class Converter:
             params[k] = v
         out = ["** abq2ccx: OP=NEW dropped: this step re-specifies every boundary condition in "
                "effect (ccx 2.23 would not rebuild the shell/beam rotations after it)"] \
-            if self._op_new_drop.get(id(b)) and (b.param("OP") or "").strip().upper() == "NEW" else []
+            if self._op_new_drop.get(id(b)) and b.uparam("OP") == "NEW" else []
         out.append(emit_keyword("BOUNDARY", params))
         # (the pieces of a card _plan_default_amplitudes splits carry their midside lines)
         midside = [] if getattr(b, "_no_midside", False) else \
@@ -7843,8 +7847,8 @@ class Converter:
         # Table 1): STEP in Abaqus/Explicit and in transient procedures, RAMP in static and
         # steady-state ones; *STEP AMPLITUDE overrides it in Abaqus/Standard
         quasi = proc == "DYNAMIC" and \
-            (proc_b.param("APPLICATION") or "").strip().upper().startswith("QUASI")
-        default = (step_b.param("AMPLITUDE") or "").strip().upper()
+            proc_b.uparam("APPLICATION").startswith("QUASI")
+        default = step_b.uparam("AMPLITUDE")
         if explicit:
             default = "STEP"
         elif default not in ("RAMP", "STEP"):
@@ -7870,7 +7874,7 @@ class Converter:
         # in *STATIC and steady-state heat transfer / (un)coupled steps, STEP in any other
         # (dynamics, *VISCO, transient), unless the *STEP card handle_step writes has
         # AMPLITUDE= (explicit steps get none; quasi-static dynamics gets RAMP)
-        written = (step_b.param("AMPLITUDE") or "").strip().upper()
+        written = step_b.uparam("AMPLITUDE")
         if quasi and written not in ("RAMP", "STEP"):
             written = "RAMP"
         if explicit:
@@ -8027,7 +8031,7 @@ class Converter:
             if b.keyword == "AMPLITUDE" and b.param("NAME"):
                 curves[b.param("NAME").strip().upper()] = amplitude_curve(b)
         # amplitudes no other card names (any parameter, e.g. FILM AMPLITUDE=, or data field)
-        named_amps = {(b.param("AMPLITUDE") or "").strip().upper() for b in rate_cards} - {""}
+        named_amps = {b.uparam("AMPLITUDE") for b in rate_cards} - {""}
         others: set = set()
         for b in blocks:
             if b.keyword == "AMPLITUDE" or b.keyword in GEOM_KW:
@@ -8043,7 +8047,7 @@ class Converter:
                 tracked.update((n, d) for n in self._resolve_nodes(spec) for d in dofs if 1 <= d <= 6)
         v_init: Dict[Tuple[int, int], Optional[float]] = {}
         for b in blocks:
-            typ = (b.param("TYPE") or "").strip().upper() if b.keyword == "INITIAL CONDITIONS" else ""
+            typ = b.uparam("TYPE") if b.keyword == "INITIAL CONDITIONS" else ""
             for rec in merged_data_records(b) if typ in ("VELOCITY", "ROTATING VELOCITY") else []:
                 try:
                     val = (int(rec[1]), pf(rec[2])) if typ == "VELOCITY" else None
@@ -8097,7 +8101,7 @@ class Converter:
             # where a RAMP starts: the value the DOF's earlier BC of that type ended with
             # (read before this step's end values overwrite a carried BC's)
             prev_end = {k: (pb["q"], pb.get("end")) for k, pb in prev_bc.items() if pb}
-            op_new = any((b.param("OP") or "").strip().upper() == "NEW" for b in cards)
+            op_new = any(b.uparam("OP") == "NEW" for b in cards)
             if op_new:
                 for st in state.values():
                     st[2] = None
@@ -8666,7 +8670,7 @@ class Converter:
             if s in need:
                 out[s] = (set(at_zero), set(held))
             cards = [x for x in group[1:] if x.keyword == "BOUNDARY"]
-            if any((x.param("OP") or "").strip().upper() == "NEW" for x in cards):
+            if any(x.uparam("OP") == "NEW" for x in cards):
                 held.clear()
             new: set = set()
             for x in cards:
@@ -8873,7 +8877,7 @@ class Converter:
         Abaqus ORIENTATION= (local load axes) and FOLLOWER=YES have no ccx counterpart."""
         if b.has("USER"):
             return self._user_load_card(b)
-        if (b.param("OP") or "").strip().upper() == "NEW":
+        if b.uparam("OP") == "NEW":
             self._cload_new = True        # it also removes the converted nodal forces (ccx)
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
@@ -8942,7 +8946,7 @@ class Converter:
         section width (probed on 2.23) — and become consistent nodal forces
         (_to_nodal_forces), as do the tractions and pressures (P) on surface elements, which
         are not in the ccx mesh; user-subroutine loads (...NU labels) are commented out."""
-        op_new = (b.param("OP") or "").strip().upper() == "NEW"
+        op_new = b.uparam("OP") == "NEW"
         if op_new:
             self._reset_nodal_loads("DLOAD")
         body: List[str] = []
@@ -9086,7 +9090,7 @@ class Converter:
         pressure on the faces of surface elements, which are not in the ccx mesh, become
         consistent nodal forces (_to_nodal_forces); a user-subroutine load (...NU labels) is
         commented out."""
-        op_new = (b.param("OP") or "").strip().upper() == "NEW"
+        op_new = b.uparam("OP") == "NEW"
         if op_new:
             self._reset_nodal_loads("DSLOAD")
         body: List[str] = []
@@ -9698,7 +9702,7 @@ class Converter:
     def _transform_card(b: Block) -> Union[Tuple[str, Vec, Vec], str]:
         """A *TRANSFORM card's (TYPE letter, a, b), or why its data line cannot be read.  Like
         ccx, only the first letter of TYPE counts."""
-        typ = ((b.param("TYPE") or "").strip().upper() or "R")[0]
+        typ = (b.uparam("TYPE") or "R")[0]
         try:
             v = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
             return typ, (v[0], v[1], v[2]), (v[3], v[4], v[5])
@@ -10125,7 +10129,7 @@ class Converter:
         for b, s, items in cards:
             if b.keyword != "BOUNDARY":
                 continue
-            if (b.param("OP") or "").strip().upper() == "NEW":
+            if b.uparam("OP") == "NEW":
                 state = {j: e for j, e in state.items() if e[2] == s}
             if n not in items:
                 continue
@@ -10134,7 +10138,7 @@ class Converter:
                                                "condition on the rotations has no form in global "
                                                "components")
                 continue
-            amp = (b.param("AMPLITUDE") or "").strip().upper() or None
+            amp = b.uparam("AMPLITUDE") or None
             for d, v in items[n]:
                 state[d] = (v, amp, s)
             self._rot_lines[(id(b), n)] = self._rot_bc_global(n, axes, state, amp, s)
@@ -10150,18 +10154,18 @@ class Converter:
         for b, s, items in cards:
             if b.keyword != "CLOAD":
                 continue
-            if (b.param("OP") or "").strip().upper() == "NEW":
+            if b.uparam("OP") == "NEW":
                 state = {j: e for j, e in state.items() if e[2] == s}
             if n not in items:
                 continue
-            amp = (b.param("AMPLITUDE") or "").strip().upper() or None
+            amp = b.uparam("AMPLITUDE") or None
             lines: List[str] = []
             if s not in verdict:
                 group = groups[s]
                 respec = {d for _, its in group for d, _ in its}
                 carried = {j: e for j, e in state.items() if j not in respec and e[0] != 0.0}
                 why = None
-                if len({(c.param("AMPLITUDE") or "").strip().upper() for c, _ in group}) > 1:
+                if len({c.uparam("AMPLITUDE") for c, _ in group}) > 1:
                     why = ("this step loads the rotations with different amplitudes, which share "
                            "the global DOFs in ccx")
                 elif any(e[1] is not None or amp is not None for e in carried.values()):
@@ -10220,7 +10224,7 @@ class Converter:
                         if b.has("COMPOSITE") else pf(recs[0][0])
                     key: tuple = ("S", thick, (b.param("OFFSET") or "0").strip().upper())
                 else:
-                    key = ("B", (b.param("SECTION") or "").strip().upper(),
+                    key = ("B", b.uparam("SECTION"),
                            tuple(pf(x) for x in recs[0]))
             except (IndexError, ValueError):
                 continue
@@ -10727,9 +10731,9 @@ class Converter:
         OUTPUT=2D keeps exact; and each step gets one output control, taken from its .frd
         requests first (_step_output_control)."""
         quiet = Report()
-        self._out_user_tp = {(b.param("NAME") or "").strip().upper(): b
+        self._out_user_tp = {b.uparam("NAME"): b
                              for b in blocks if b.keyword == "TIME POINTS"}
-        self._out_amp_names = {(b.param("NAME") or "").strip().upper()
+        self._out_amp_names = {b.uparam("NAME")
                                for b in blocks if b.keyword in ("AMPLITUDE", "TIME POINTS")}
         self._out_tp_names: Dict[tuple, str] = {}
         self._out_subsets: Dict[str, str] = {}      # .frd set -> its nodes missing from the .frd
@@ -10807,8 +10811,8 @@ class Converter:
             for x in inner:
                 if x.keyword == "OUTPUT":
                     ctx, odb = x, True
-                    add = add or (x.param("OP") or "").strip().upper() in ("ADD", "REPLACE")
-                    var = (x.param("VARIABLE") or "").strip().upper()
+                    add = add or x.uparam("OP") in ("ADD", "REPLACE")
+                    var = x.uparam("VARIABLE")
                     if not x.has("FIELD"):
                         if var in ("PRESELECT", "ALL"):
                             self._out_notes.setdefault(id(x), []).append(
@@ -10822,7 +10826,7 @@ class Converter:
                 elif x.keyword in OUTPUT_CARDS:
                     sub = x.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
                     if sub and ctx is not None and ctx.has("FIELD") and \
-                            (ctx.param("VARIABLE") or "").strip().upper() == "ALL":
+                            ctx.uparam("VARIABLE") == "ALL":
                         self._out_notes.setdefault(id(ctx), []).append(
                             f"*{x.keyword} under *OUTPUT, FIELD, VARIABLE=ALL dropped (Abaqus "
                             f"ignores the individual requests then).")
@@ -11088,7 +11092,7 @@ class Converter:
         (the procedure's preselected variables of that kind, plus the ones it names) or
         VARIABLE=ALL (the names ignored, as Abaqus does) as the plain card the planner reads;
         None when nothing is left; any other card unchanged."""
-        var = (b.param("VARIABLE") or "").strip().upper()
+        var = b.uparam("VARIABLE")
         if var not in ("PRESELECT", "ALL") or ctx is None or not ctx.has("FIELD"):
             return b
         if b.keyword == "CONTACT OUTPUT":
@@ -11119,7 +11123,7 @@ class Converter:
                                                  timing, "PRESELECT", quiet, k, why="carried")
             elif x.keyword == "OUTPUT":
                 reqs += self._preselect_requests(anchor, x, timing,
-                                                 (x.param("VARIABLE") or "").strip().upper(),
+                                                 x.uparam("VARIABLE"),
                                                  quiet, k, why="carried")
             else:
                 src = self._preselect_card(x, ctx, timing)
@@ -12174,7 +12178,7 @@ class Converter:
         return [emit_keyword("RESTART", keep)] + list(b.data)
 
     def handle_amplitude(self, b: Block) -> List[str]:
-        if (b.param("NAME") or "").strip().upper() in self._vel_only_amps:
+        if b.uparam("NAME") in self._vel_only_amps:
             self.report.note("*AMPLITUDE used only by *BOUNDARY, TYPE=VELOCITY/ACCELERATION "
                              "dropped: those BCs get generated displacement amplitudes that "
                              "integrate it.", once=True)
@@ -12327,7 +12331,7 @@ class Converter:
         scale = max(abs(a) for _, a in pts) or 1.0
         dev = max(abs(curve.value(0.5 * (t0 + t1)) - 0.5 * (a0 + a1))
                   for (t0, a0), (t1, a1) in zip(pts, pts[1:])) if len(pts) > 1 else 0.0
-        definition = (b.param("DEFINITION") or "").strip().upper()
+        definition = b.uparam("DEFINITION")
         self.report.note(f"*AMPLITUDE DEFINITION={definition} sampled into {len(pts)} time/"
                          f"amplitude points over its {'total' if curve.total else 'step'} time 0 to "
                          f"{end:g} (ccx has no analytic amplitudes): the straight lines between them "
@@ -12414,7 +12418,7 @@ class Converter:
         shell/beam reference node drives the ROT NODE (see _plan_rigid_couplings).  Rigid
         elements and analytical surfaces reach here as a TIE NSET of their skins' nodes
         (_plan_rigid); one whose analytical surface could not be meshed is commented out."""
-        surf = (b.param("ANALYTICAL SURFACE") or "").strip().upper()
+        surf = b.uparam("ANALYTICAL SURFACE")
         if surf:
             why = self._analytic_skipped.get(surf, "it was not converted")
             return self._commented(b, f"*RIGID BODY with ANALYTICAL SURFACE={surf}: the surface "
@@ -12888,14 +12892,14 @@ class Converter:
         shell section (_continuum_frame), ("ply", section, ply group) for a ply solid of a split
         composite one (_ply_group_axes), ("unsplit", section, element) under one left whole, and
         ("general", section, element) under a *SHELL GENERAL SECTION, which takes section forces."""
-        if not any(b.keyword == "INITIAL CONDITIONS" and (b.param("TYPE") or "").strip().upper()
+        if not any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE")
                    in ("STRESS", "PLASTIC STRAIN") for b in blocks):
             return
         for b in blocks:
             if not b.keyword.endswith("SECTION"):
                 continue
             elset = (b.param("ELSET") or "").strip()
-            name = (b.param("ORIENTATION") or "").strip().upper()
+            name = b.uparam("ORIENTATION")
             if b.keyword == "SHELL GENERAL SECTION" and (id(b) in self._ply_sections or
                                                        self._continuum_shell_elset(elset)):
                 for e in self._existing(elset):        # the ply solids too
@@ -13005,7 +13009,7 @@ class Converter:
                               "axes the converter forms")
             got = self._continuum_frame(b, x)
             if got is None:
-                name = (b.param("ORIENTATION") or "").strip().upper()
+                name = b.uparam("ORIENTATION")
                 return None, ("the converter cannot form their shell axes (a degenerate element"
                               + (f", or orientation {name}'s axes are not known: DEFINITION=OFFSET TO "
                                  f"NODES, a *DISTRIBUTION without data, or no such orientation"
@@ -13378,8 +13382,8 @@ class Converter:
         if (b.param("TYPE") or "").upper().startswith("ANALYTICAL"):
             return self._commented(b, "*SURFACE TYPE=ANALYTICAL RIGID is unsupported by ccx; mesh the "
                                       "rigid surface with elements instead.", reduces=False)
-        name = (b.param("NAME") or "").strip().upper()
-        if (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES:
+        name = b.uparam("NAME")
+        if b.uparam("TYPE") in ANALYTIC_SURFACES:
             if name in self._analytic:
                 elset, face = self._analytic[name]
                 return [f"*SURFACE, NAME={b.param('NAME')}, TYPE=ELEMENT", f"{elset}, {face}"]
@@ -13576,7 +13580,7 @@ class Converter:
                                if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
         self._distributing_ids = {id(b) for b, c in zip(blocks, blocks[1:])
                                   if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
-        self._tie_names = {(b.param("NAME") or "").strip().upper() for b in blocks if b.keyword == "TIE"}
+        self._tie_names = {b.uparam("NAME") for b in blocks if b.keyword == "TIE"}
 
     # procedures and *DLOAD labels in which an element's mass acts
     _INERTIA_PROCEDURES = {"DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
@@ -13687,7 +13691,7 @@ class Converter:
         rigid = OrderedDict((e, (t.upper(), list(c))) for e, (t, c) in self.geom.elements.items()
                             if t.upper() in RIGID_ELEMENTS)
         analytic = [b for b in blocks if b.keyword == "SURFACE" and
-                    (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES]
+                    b.uparam("TYPE") in ANALYTIC_SURFACES]
         if not rigid and not analytic:
             self._plan_rotary_stars(blocks)        # rigid bodies of the deck's own elements
             self._plan_skin_material(blocks)
@@ -13818,14 +13822,14 @@ class Converter:
             items = per_card[id(b)]
             if len(items) != len(recs) or any(rest or not sides for _, _, _, rest, sides in items):
                 continue
-            faces_of[(b.param("NAME") or "").strip().upper()] = [
+            faces_of[b.uparam("NAME")] = [
                 self._skins[(e, side)] for _, _, rid, _, sides in items for side in sides
                 for e in rid if (e, side) in self._skins]
         members_of: Dict[int, List[int]] = {}   # id(*RIGID BODY) -> nodes its skins / surface add
         for b in analytic:
             self._mesh_analytic(b, blocks, axisym, members_of, deck_nodes)
         for name, (elset, face) in self._analytic.items():
-            body = next((r for r in bodies if (r.param("ANALYTICAL SURFACE") or "").strip().upper()
+            body = next((r for r in bodies if r.uparam("ANALYTICAL SURFACE")
                          == name), None)
             if body is not None:
                 faces_of[name] = [(e, face) for e in self.geom.elsets.get(elset, [])]
@@ -14148,10 +14152,10 @@ class Converter:
         then names their contact faces (self._analytic), and its rigid body takes their nodes
         (``members_of``).  Facets are about the slave faces' size (_analytic_size); straight
         segments stay exact however they are cut."""
-        name = (b.param("NAME") or "").strip().upper()
-        typ = (b.param("TYPE") or "").strip().upper()
+        name = b.uparam("NAME")
+        typ = b.uparam("TYPE")
         body = next((r for r in blocks if r.keyword == "RIGID BODY" and
-                     (r.param("ANALYTICAL SURFACE") or "").strip().upper() == name), None)
+                     r.uparam("ANALYTICAL SURFACE") == name), None)
         prof, why = analytic_profile(b)
         if prof is None:
             self._analytic_skipped[name] = f"its data cannot be read ({why})"
@@ -14862,7 +14866,7 @@ class Converter:
         """The axes (rows) a *ROTARY INERTIA's values refer to: global, or a rectangular
         *ORIENTATION's (x along a, y towards b, z = x cross y); None for any other system and
         where the orientation's axes are not known (_orient_axes)."""
-        name = (card.param("ORIENTATION") or "").strip().upper()
+        name = card.uparam("ORIENTATION")
         if not name:
             return [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
         o = self.orientations.get(name)
@@ -14948,7 +14952,7 @@ class Converter:
         ids and element sets are unchanged; node sets follow ``_MIDSIDE_SET_CARDS``."""
         table: Dict[int, str] = {}                     # element -> its section (PIPE/BOX first)
         for b in blocks:
-            sec = (b.param("SECTION") or "").strip().upper() \
+            sec = b.uparam("SECTION") \
                 if b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION") else ""
             if sec not in SECTION_BEAM_UPGRADE:
                 continue
@@ -15030,7 +15034,7 @@ class Converter:
             return
         for b in blocks:
             if b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION") and \
-                    (b.param("SECTION") or "").strip().upper() in B32R_PRINT_ROWS:
+                    b.uparam("SECTION") in B32R_PRINT_ROWS:
                 self._b32r_rows.update(e for e in self.geom.elset((b.param("ELSET") or "").strip())
                                        if e in b32r)
         held = set(self.geom.nsets.get(PLANAR_NODES_SET, ()))
@@ -15176,7 +15180,7 @@ class Converter:
                 ids.extend(add)
         isint = re.compile(r"[-+]?\d+").fullmatch
         for b in blocks:
-            if b.keyword == "SURFACE" and (b.param("TYPE") or "").strip().upper() == "NODE":
+            if b.keyword == "SURFACE" and b.uparam("TYPE") == "NODE":
                 listed = {int(r[0]) for r in merged_data_records(b) if r and isint(r[0])}
                 extra = [m for a, c, m in trips if a in listed and c in listed and m not in listed]
                 if extra:
@@ -15392,7 +15396,7 @@ class Converter:
         direction 3) where the converter has no axes for it (_orient_axes): undefined, or
         given by a distribution or by each element's nodes; or where the element's centre does
         not define that axis (frame_defined)."""
-        ori = (b.param("ORIENTATION") or "").strip().upper()
+        ori = b.uparam("ORIENTATION")
         where = f"*{b.keyword} {(b.param('ELSET') or '').strip()}, STACK DIRECTION=ORIENTATION"
         if ori in self._orient_axes:
             a, bb, system = self.orientations[ori]
@@ -15501,7 +15505,7 @@ class Converter:
                                  f"--max-ply-elements ({limit}); rerun with a larger limit to write "
                                  f"them")
             return
-        dists = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        dists = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
         for p in plans:
             for ply in p["plies"]:
                 field = ply["ori"].strip().upper()
@@ -15835,7 +15839,7 @@ class Converter:
             return self._ply_axes_cache[key]
         plan = self._ply_sections[id(b)]
         field = grp["ori"].strip().upper()
-        ori, angle, per = (b.param("ORIENTATION") or "").strip().upper(), 0.0, None
+        ori, angle, per = b.uparam("ORIENTATION"), 0.0, None
         if field:
             try:
                 angle = pf(field)
@@ -15938,7 +15942,7 @@ class Converter:
                             continue
                         for n in self._resolve_nodes(r[0].strip()):
                             nodal[n] = t
-        dists = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        dists = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
         thick: "OrderedDict[int, List[Optional[float]]]" = OrderedDict()
         section: Dict[int, Block] = {}
         for b in blocks:
@@ -15950,7 +15954,7 @@ class Converter:
                 continue
             per: Dict[int, Optional[float]] = {}
             default: Optional[float] = None
-            field = (b.param("MEMBRANE THICKNESS") or "").strip().upper()
+            field = b.uparam("MEMBRANE THICKNESS")
             if b.has("NODAL THICKNESS"):
                 pass
             elif field:
@@ -15998,7 +16002,7 @@ class Converter:
         for b in list(blocks):
             if b.keyword != "MEMBRANE SECTION" or not b.param("DENSITY"):
                 continue
-            mat = (b.param("MATERIAL") or "").strip().upper()
+            mat = b.uparam("MATERIAL")
             group = opts.get(mat)
             ts = {t for e, sec in section.items() if sec is b for t in thick[e]}
             try:
@@ -16077,7 +16081,7 @@ class Converter:
         opts = self._material_options(blocks)
         for b in blocks:
             if b.keyword == "MEMBRANE SECTION":
-                mat = (b.param("MATERIAL") or "").strip().upper()
+                mat = b.uparam("MATERIAL")
                 cards = opts.get(mat, [])[1:]
                 el = [c for c in cards if c.keyword == "ELASTIC"]
                 nu: Optional[float] = None
@@ -16099,7 +16103,7 @@ class Converter:
                  all(n in self.geom.nodes for n in els[e][1])}
         if not cands:
             return
-        dists = {(b.param("NAME") or "").strip().upper(): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        dists = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
         thick: Dict[int, List[float]] = {}
         left: Dict[str, List[int]] = {}               # why an element stays as it is -> elements
         for e, ts in ts_all.items():
@@ -16252,7 +16256,7 @@ class Converter:
         for name in dists:
             us = users.get(name, [])
             if us and all(u.keyword == "MEMBRANE SECTION" and
-                          (u.param("MEMBRANE THICKNESS") or "").strip().upper() == name and
+                          u.uparam("MEMBRANE THICKNESS") == name and
                           all(e in self._qmem for e in dedup(self.geom.elset((u.param("ELSET") or "").strip()))
                               if e in els) for u in us):
                 self._qmem_dists.add(name)
@@ -16356,7 +16360,7 @@ class Converter:
             self.report.note(f"*MEMBRANE SECTION, POISSON={pois}: not a number; taken as 0.5, "
                              f"Abaqus/Standard's default.", once=True)
             nu_s = 0.5
-        nu_m = self._mem_thinning.get((b.param("MATERIAL") or "").strip().upper())
+        nu_m = self._mem_thinning.get(b.uparam("MATERIAL"))
         if nu_m is None or abs(nu_m - nu_s) < 1e-6 or nu_s >= 1.0 or nu_m >= 1.0:
             same = "the same ratio" if nu_m is not None else "not a plain elastic or plastic one: verify"
             self.report.note(f"*MEMBRANE SECTION under NLGEOM: Abaqus changes a membrane's "
@@ -16429,7 +16433,7 @@ class Converter:
         """The section of a *BEAM SECTION / *BEAM GENERAL SECTION card when U1 can carry it
         (SECTION=GENERAL of the general section, a profile of U1_PROFILES), else None."""
         if b.keyword == "BEAM SECTION":
-            sec = (b.param("SECTION") or "").strip().upper()
+            sec = b.uparam("SECTION")
             return sec if sec in U1_PROFILES else None
         if b.keyword == "BEAM GENERAL SECTION":
             sec = (b.param("SECTION") or "GENERAL").strip().upper()
@@ -16541,7 +16545,7 @@ class Converter:
                   ) -> Tuple[List[Tuple[Block, dict]], Optional[str]]:
         """The U1 plan of each section card (see _plan_u1_beams), or why the deck's beams cannot
         be U1 — the first obstacle found."""
-        self._u1_taken |= {(b.param("NAME") or "").strip().upper()
+        self._u1_taken |= {b.uparam("NAME")
                            for b in blocks if b.keyword == "MATERIAL"}
         member: "OrderedDict[int, Block]" = OrderedDict()
         for b in cards:
@@ -16588,7 +16592,7 @@ class Converter:
                 return [], (f"a *{b.keyword}{', RIKS' if b.has('RIKS') else ''} step, which U1 cannot "
                             f"run (ccx 2.23 runs it in linear *STATIC, *FREQUENCY, *MODAL DYNAMIC "
                             f"and *STEADY STATE DYNAMICS steps)")
-        groups = {(g[0].param("NAME") or "").strip().upper(): g for g in self._material_groups(blocks)}
+        groups = {g[0].uparam("NAME"): g for g in self._material_groups(blocks)}
         for name in sorted({m for m, _ in self._material_uses(blocks)}):
             extra = [g.keyword for g in groups.get(name, [])[1:] if g.keyword not in U1_MATERIAL_CARDS
                      and (g.keyword in MATERIAL_OPTION_CARDS or g.keyword in U1_NONLINEAR_CARDS)]
@@ -16596,7 +16600,7 @@ class Converter:
                 return [], (f"material {name} has *{extra[0]}: ccx iterates a nonlinear model, "
                             f"where U1's wrong nodal forces stop it converging")
         thermal = any(b.keyword == "TEMPERATURE" or (b.keyword == "INITIAL CONDITIONS" and
-                      (b.param("TYPE") or "").strip().upper() == "TEMPERATURE") for b in blocks)
+                      b.uparam("TYPE") == "TEMPERATURE") for b in blocks)
         loaded = self._u1_load_obstacle(blocks, member)
         if loaded:
             return [], loaded
@@ -16982,7 +16986,7 @@ class Converter:
                          if e in self.geom.elements}
                 name = b.param("CONTROLS").strip().upper()
                 self._sc_types.setdefault(name, set()).update(types)
-                if (b.param("MATERIAL") or "").strip().upper() in hyper:
+                if b.uparam("MATERIAL") in hyper:
                     self._sc_hyper.add(name)
         self._sc_damage = any(b.keyword in ("DAMAGE EVOLUTION", "DAMAGE INITIATION") for b in blocks)
         self._step_idx = 0
@@ -17511,7 +17515,7 @@ class Converter:
         cur = None
         for b in blocks:
             if b.keyword == "CONNECTOR BEHAVIOR":
-                cur = (b.param("NAME") or "").strip().upper()
+                cur = b.uparam("NAME")
             elif cur is not None and b.keyword.startswith("CONNECTOR ") and \
                     b.keyword != "CONNECTOR SECTION":
                 rich.add(cur)
@@ -17545,7 +17549,7 @@ class Converter:
                     trans = rot = "?"
             t = None if trans in CONN_UNCONSTRAINED else trans
             r = None if rot in CONN_UNCONSTRAINED else rot
-            beh = (b.param("BEHAVIOR") or "").strip().upper()
+            beh = b.uparam("BEHAVIOR")
             why = None
             if trans == "?":
                 kind, why = "skip", (f"*CONNECTOR SECTION: connection type {label} is not an Abaqus "
@@ -18815,12 +18819,12 @@ class Converter:
                 states.append(dict(cur))
                 in_step = False
             elif b.keyword == "BOUNDARY":
-                if in_step and first and (b.param("OP") or "").strip().upper() == "NEW":
+                if in_step and first and b.uparam("OP") == "NEW":
                     cur = {}
                 first = False
                 typ = (b.param("TYPE") or "DISPLACEMENT").strip().upper()
                 fixed = b.has("FIXED") or b.has("USER")
-                amp = (b.param("AMPLITUDE") or "").strip().upper()
+                amp = b.uparam("AMPLITUDE")
                 for ns, dofs, mag in self._bc_records(b):
                     kind = None if fixed else "disp" if typ == "DISPLACEMENT" else \
                         "rate" if typ == "VELOCITY" else None
@@ -18880,7 +18884,7 @@ class Converter:
             if b.keyword == "STEP":
                 segs.append([])
             elif b.keyword == "BOUNDARY":
-                new = (b.param("OP") or "").strip().upper() == "NEW"
+                new = b.uparam("OP") == "NEW"
                 typed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
                     b.has("FIXED") or b.has("USER")
                 for ns, dofs, mag in self._bc_records(b, True):
@@ -20003,7 +20007,7 @@ class Converter:
                 if c.keyword in self._NOT_MATERIAL:
                     break
                 opts.append(c)
-            out[(g[0].param("NAME") or "").strip().upper()] = opts
+            out[g[0].uparam("NAME")] = opts
         return out
 
     @staticmethod
@@ -20064,7 +20068,7 @@ class Converter:
             extra = [k for k in b.params if k not in ("ELSET", "MATERIAL", "CONTROLS")]
             if extra:
                 return f"their *SOLID SECTION has {', '.join(extra)}"
-            mat = (b.param("MATERIAL") or "").strip().upper()
+            mat = b.uparam("MATERIAL")
             for c in groups.get(mat, [None])[1:]:
                 if c.keyword not in ("ELASTIC", "DENSITY"):
                     return f"material {mat} has *{c.keyword}"
@@ -20507,7 +20511,7 @@ class Converter:
         """(nodes, DOFs, moves) per data line of the *BOUNDARY ``b``; ``moves`` is True when
         the line prescribes a value other than 0 (or the card velocities, accelerations,
         FIXED or USER values)."""
-        typ = (b.param("TYPE") or "").strip().upper()
+        typ = b.uparam("TYPE")
         moving = typ in ("VELOCITY", "ACCELERATION") or b.has("FIXED") or b.has("USER")
         for nodes, dofs, mag in self._bc_records(b, rot=True):
             yield nodes, set(dofs), moving or mag != 0.0     # NaN (a *PARAMETER name): moves
@@ -20527,7 +20531,7 @@ class Converter:
         """Elements under a *BEAM SECTION with SECTION=CIRC."""
         circ: set = set()
         for b in blocks:
-            if b.keyword == "BEAM SECTION" and (b.param("SECTION") or "").strip().upper() == "CIRC":
+            if b.keyword == "BEAM SECTION" and b.uparam("SECTION") == "CIRC":
                 circ.update(self.geom.elset((b.param("ELSET") or "").strip()))
         return {e for e in circ if e in self.geom.elements}
 
@@ -20650,7 +20654,7 @@ class Converter:
             elif b.keyword == "BOUNDARY":
                 # OP=NEW on a step's first card only, as _bc_states: Abaqus/CAE writes it on
                 # every card of the step, which keeps the cards before it
-                if first and (b.param("OP") or "").strip().upper() == "NEW":
+                if first and b.uparam("OP") == "NEW":
                     active = {}
                 first = False
                 for nodes, ds, moving in self._boundary_records(b):
@@ -20742,7 +20746,7 @@ class Converter:
 
         # ccx acts on OP=NEW on a step's first *BOUNDARY card only; handle_boundary repeats
         # the planar constraint after it
-        new = [bool(c) and (c[0].param("OP") or "").strip().upper() == "NEW" for c in steps]
+        new = [bool(c) and c[0].uparam("OP") == "NEW" for c in steps]
         given = [set().union(*map(self._boundary_pairs, c)) | (planar if nw else set())
                  for c, nw in zip(steps, new)]
         later = [set() for _ in range(len(steps) + 1)]   # nodes given rotations in step k or later
@@ -20832,7 +20836,7 @@ class Converter:
         best: Optional[Tuple[float, int]] = None
         missing: List[str] = []
         for b in blocks:
-            if b.keyword != "BEAM SECTION" or (b.param("SECTION") or "").strip().upper() != "CIRC":
+            if b.keyword != "BEAM SECTION" or b.uparam("SECTION") != "CIRC":
                 continue
             elset = (b.param("ELSET") or "").strip()
             elems = [e for e in self.geom.elset(elset) if e in self.geom.elements
@@ -20840,7 +20844,7 @@ class Converter:
                      and len(self.geom.elements[e][1]) == 3]
             if not elems:
                 continue
-            mat = (b.param("MATERIAL") or "").strip().upper()
+            mat = b.uparam("MATERIAL")
             try:
                 d = 2 * pf(merged_data_records(b)[0][0])        # Abaqus gives the radius
             except (IndexError, ValueError):
@@ -20900,15 +20904,15 @@ class Converter:
             kw = b.keyword
             vals = [x for r in merged_data_records(b) for x in r if x != ""]
             if kw == "MATERIAL":
-                mat, inter = (b.param("NAME") or "").strip().upper(), None
+                mat, inter = b.uparam("NAME"), None
             elif kw == "SURFACE INTERACTION":
-                inter, mat = (b.param("NAME") or "").strip().upper(), None
+                inter, mat = b.uparam("NAME"), None
                 k_of[inter] = None
             elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
                 mat = inter = None
                 if kw == "SOLID SECTION":
                     for e in self.geom.elset((b.param("ELSET") or "").strip()):
-                        mat_of[e] = (b.param("MATERIAL") or "").strip().upper()
+                        mat_of[e] = b.uparam("MATERIAL")
             elif mat and kw == "DENSITY":
                 try:
                     r = min(pf(rec[0]) for rec in merged_data_records(b) if rec and rec[0])
@@ -20937,7 +20941,7 @@ class Converter:
                 continue
             f2f = (b.param("TYPE") or "").replace(" ", "").upper() == "SURFACETOSURFACE"
             coef = self.CONTACT_MASS_AREA["F2F" if f2f else "N2F"]
-            kpen = k_of.get((b.param("INTERACTION") or "").strip().upper()) or k_hard
+            kpen = k_of.get(b.uparam("INTERACTION")) or k_hard
             for rec in merged_data_records(b):
                 toks = [x.strip().upper() for x in rec if x.strip()]
                 if len(toks) < 2 or toks[1] not in self._rigid_faces:
@@ -20990,7 +20994,7 @@ class Converter:
         for b in blocks:
             kw = b.keyword
             if kw == "MATERIAL":
-                cur = (b.param("NAME") or "").strip().upper()
+                cur = b.uparam("NAME")
             elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
                 cur = None
             elif cur is not None and kw == "ELASTIC":
@@ -21028,7 +21032,7 @@ class Converter:
         for b in blocks:
             kw = b.keyword
             if kw == "MATERIAL":
-                cur = (b.param("NAME") or "").strip().upper()
+                cur = b.uparam("NAME")
             elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
                 cur = None
             elif cur is not None and kw == "ELASTIC":
@@ -21093,14 +21097,14 @@ class Converter:
                 except (IndexError, ValueError):
                     return None
                 return v if math.isfinite(v) and v > 0 else None
-            mats = [(b.param("MATERIAL") or "").strip().upper()]
+            mats = [b.uparam("MATERIAL")]
             sec: dict = {}
             if b.has("COMPOSITE"):                  # plies: thickness, -, material, ...
                 plies = [r for r in range(len(recs)) if num(r, 0)]
                 sec["t"] = sum(num(r, 0) for r in plies) * (2 if b.has("SYMMETRIC") else 1)
                 mats = [recs[r][2].strip().upper() for r in plies if len(recs[r]) > 2]
             elif b.keyword == "BEAM SECTION":
-                shape = (b.param("SECTION") or "").strip().upper()
+                shape = b.uparam("SECTION")
                 if shape in ("RECT", "BOX") and num(0, 0) and num(0, 1):
                     sec["rect"] = (num(0, 0), num(0, 1))
                 elif shape in ("CIRC", "PIPE", "THICK PIPE") and num(0, 0):
@@ -21646,7 +21650,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     # the part's orientation distributions move like the axes of the *ORIENTATION that
     # names them (None: unchanged by this instance's transform)
     inst_blocks = parts.get(inst["part"], []) + inst["extra"]
-    dists = {(b.param("NAME") or "").strip().upper() for b in inst_blocks if b.keyword == "DISTRIBUTION"}
+    dists = {b.uparam("NAME") for b in inst_blocks if b.keyword == "DISTRIBUTION"}
     dist_move = {}
     for b in inst_blocks:
         ref = b.data[0].split(",")[0].strip().upper() if b.keyword == "ORIENTATION" and b.data else ""
@@ -21703,7 +21707,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             if ref.upper() in dists:
                 # the axes come from the part's *DISTRIBUTION: name this instance's copy
                 nb.data[0] = ", ".join([namer(prefix, ref)] + nb.data[0].split(",")[1:])
-            elif nb.data and (b.param("DEFINITION") or "").strip().upper().startswith("NODES"):
+            elif nb.data and b.uparam("DEFINITION").startswith("NODES"):
                 _remap_node_orientation(nb, geo.nodes, node_off, rotv if rot or any(T) else None, report)
             elif (rot or any(T)) and nb.data and \
                     (b.param("DEFINITION") or "COORDINATES").upper().startswith("COORD"):
@@ -21720,7 +21724,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                     pass
             out.append(nb)
         elif b.keyword == "DISTRIBUTION":
-            name = (b.param("NAME") or "").strip().upper()
+            name = b.uparam("NAME")
             move = dist_move[name] if name in dist_move else (rotv if rot else None)
             out.append(_remap_distribution(b, prefix, namer, elem_off, move))
         elif b.keyword == "CONNECTOR SECTION":
@@ -21730,7 +21734,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                                        for x in nb.data[1].split(","))
             out.append(nb)
         elif b.keyword == "SURFACE":
-            if (b.param("TYPE") or "").strip().upper() in ANALYTIC_SURFACES:
+            if b.uparam("TYPE") in ANALYTIC_SURFACES:
                 out.append(_place_analytic(b, prefix, namer, rotp))
             else:
                 out.append(_remap_surface(b, prefix, namer, node_off, elem_off))
@@ -22010,7 +22014,7 @@ def _place_analytic(b: Block, prefix: str, namer, rotp) -> Block:
     p: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
     if p.get("NAME"):
         p["NAME"] = namer(prefix, p["NAME"].strip())
-    typ = (b.param("TYPE") or "").strip().upper()
+    typ = b.uparam("TYPE")
     prof, _ = analytic_profile(b)
     if prof is None:
         return Block("SURFACE", p, list(b.data))
