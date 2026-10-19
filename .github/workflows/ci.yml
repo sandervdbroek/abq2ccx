@@ -56,11 +56,12 @@ jobs:
             os: ubuntu-24.04
             python: "3.x"
             ccx: bin/ccx
-          # Python 3.9 reads and writes files in the code page (cp1252) unless told otherwise,
-          # as Pythons before 3.15 do; conda installs Windows programs under Library\bin
+          # Python 3.13 reads and writes files in the code page (cp1252) unless told otherwise,
+          # as Pythons before 3.15 do, and the runner image has it (3.9 takes 35 s to install);
+          # conda installs Windows programs under Library\bin
           - name: Windows
             os: windows-latest
-            python: "3.9"
+            python: "3.13"
             ccx: Library/bin/ccx.exe
     env:
       OMP_NUM_THREADS: "1"
