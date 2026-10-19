@@ -12213,7 +12213,7 @@ class Converter:
         for ln in data:
             f = [x.strip() for x in ln.split(",")]
             try:
-                mus.append(float(f[0]))
+                mus.append(pf(f[0]))
             except (IndexError, ValueError):
                 continue
         if not mus or max(mus) <= 0.0:

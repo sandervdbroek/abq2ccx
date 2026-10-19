@@ -547,6 +547,12 @@ def test_frictionless_friction_dropped():
     assert any(l.strip().upper().startswith("*FRICTION") for l in body2.splitlines())
 
 
+def test_friction_coefficient_with_fortran_exponent():
+    # 3.D-1 is 0.3 (read with float(), it made the pair frictionless with only a note)
+    body, _, rep = convert_str("*SURFACE INTERACTION, NAME=SI\n*FRICTION\n3.D-1,\n")
+    assert "*FRICTION\n0.3," in body and "no positive coefficient" not in rep.text()
+
+
 def test_nfill_unequal_bounding_sets():
     # *NFILL whose two bounding node sets differ in length fills the common (zip)
     # pairs instead of skipping — a real deck may carry one spurious extra edge node.
