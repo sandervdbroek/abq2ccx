@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import ast
 import bisect
+import functools
 import glob
 import itertools
 import json
@@ -210,7 +211,7 @@ def substitution_loss(typ: str) -> Optional[str]:
     t = typ.upper()
     if t in CCX_ELEMENTS or t in EXACT_SUBSTITUTIONS:
         return None
-    sub = ccx_element_type(t, Report())
+    sub = ccx_type(t)
     if sub == t:
         return None
     base, dropped = t, ""
@@ -362,6 +363,12 @@ def ccx_element_type(typ: str, report: "Report") -> str:
     report.warn(f"Element {typ} is unknown to this converter; emitted unchanged — confirm your "
                 f"ccx version supports it.", once=True)
     return typ
+
+
+@functools.lru_cache(maxsize=None)
+def ccx_type(typ: str) -> str:
+    """ccx_element_type without its notes and warnings (emit_geometry gives those)."""
+    return ccx_element_type(typ, Report())
 
 
 SHELL_TYPES = {t for t in ELEMENT_NNODES if (t[0] == "S" and not t.startswith("SPRING")) or t.startswith("DS")}
@@ -6375,8 +6382,7 @@ class Converter:
         data = list(b.data)
         thick = data[0].split(",")[0].strip() if data else ""
         if not thick and b.param("ELSET"):
-            quiet = Report()
-            types = {ccx_element_type(self.geom.elements[e][0], quiet)
+            types = {ccx_type(self.geom.elements[e][0])
                      for e in self.geom.elset(b.param("ELSET") or "") if e in self.geom.elements}
             if types and any(t.startswith(("CPS", "CPE")) for t in types):
                 data = ["1."] + data[1:]
@@ -6899,13 +6905,12 @@ class Converter:
         aniso = "aniso" in syms
         membrane = b.keyword == "MEMBRANE SECTION"
         base = (b.param("ORIENTATION") or "").strip().upper()
-        quiet = Report()
         elems = []
         for e in dedup(self.geom.elset(elset)):
             if e not in self.geom.elements:
                 continue
             typ, conn = self.geom.elements[e]
-            t = ccx_element_type(typ, quiet)
+            t = ccx_type(typ)
             if not (t.startswith("M3D") if membrane else t in SHELL_TYPES and not t.startswith(("SC", "SAX"))) \
                     or len(conn) < 3 or any(x not in self.geom.nodes for x in conn):
                 return None
@@ -9263,8 +9268,7 @@ class Converter:
     def _sheet_family(self, token: str) -> Optional[str]:
         """"shell" or "membrane" when the elements of ``token`` are all conventional shells,
         all membranes, or a mix ("membrane": the label that works on both), else None."""
-        quiet = Report()
-        types = {ccx_element_type(self.geom.elements[e][0], quiet) for e in self._load_elements(token)
+        types = {ccx_type(self.geom.elements[e][0]) for e in self._load_elements(token)
                  if e in self.geom.elements}
         if not types or not all(t in SHELL_TYPES or t.startswith("M3D") for t in types):
             return None
@@ -9436,14 +9440,13 @@ class Converter:
         section thickness as its scale.  ``sense`` (surface elements only): a pressure p acts as
         the traction p * sense * the normal consistent_nodal_forces passes."""
         out: list = []
-        quiet = Report()
         m = re.fullmatch(r"S?([1-6])", face)
         for e in eids:
             info = self.geom.elements.get(e) or self._carriers.get(e)
             if info is None:
                 return [], f"element {e} is not defined"
             typ, conn = info
-            cc, n = ccx_element_type(typ, quiet), len(conn)
+            cc, n = ccx_type(typ), len(conn)
             if typ.upper() in SURFACE_ELEMENTS:
                 if face not in ("SPOS", "SNEG") and not (shell_reference and not face):
                     return [], (f"face '{face}' of the {typ} element {e} is not its reference "
@@ -9961,10 +9964,9 @@ class Converter:
             return
         dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
         explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
-        quiet = Report()
         beam_nodes = {n for typ, conn in self.geom.elements.values()
-                      if ccx_element_type(typ, quiet) in BEAM_TYPES and
-                      not ccx_element_type(typ, quiet).startswith(("T2D", "T3D")) for n in conn}
+                      if ccx_type(typ) in BEAM_TYPES and
+                      not ccx_type(typ).startswith(("T2D", "T3D")) for n in conn}
         sections = self._knot_sections(blocks)
         at = self._elements_at(set(used))
         # a circular section's mean-rotation BC locks the node's other rotations too
@@ -10239,13 +10241,12 @@ class Converter:
         converter knot beam, trusses or other elements at the node decide it too."""
         if n in self._knots:
             return True
-        quiet = Report()
         shells: List[int] = []
         beams: List[int] = []
         for e in (at if at is not None else self._elements_at({n})).get(n, []):
             if e in self._qmem:                 # a solid on nodes of its own, tied to n
                 continue
-            cc = ccx_element_type(self.geom.elements[e][0], quiet)
+            cc = ccx_type(self.geom.elements[e][0])
             if cc in SHELL_TYPES or cc.startswith("M3D"):
                 shells.append(e)
             elif cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D")):
@@ -10731,8 +10732,8 @@ class Converter:
         self._out_tp_names: Dict[tuple, str] = {}
         self._out_subsets: Dict[str, str] = {}      # .frd set -> its nodes missing from the .frd
         self._used_names |= set(self.geom.nsets) | set(self.geom.elsets)
-        types = {t: ccx_element_type(t, quiet) for t in {t for e, (t, _c) in self.geom.elements.items()
-                                                         if e not in self._u1 and e not in self._qmem}}
+        types = {t: ccx_type(t) for t in {t for e, (t, _c) in self.geom.elements.items()
+                                          if e not in self._u1 and e not in self._qmem}}
         frd3d = any(c.startswith(CCX_FRD_3D_TRIGGER) for c in types.values())
         solid_nodes: set = set()
         flat_nodes: set = set()
@@ -12078,9 +12079,8 @@ class Converter:
         if sd is None or sd[0].startswith("NODE"):
             return None, []
         eids = self._surface_elements(surf)
-        quiet = Report()
         mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
-                or (shells and ccx_element_type(self.geom.elements[e][0], quiet) in SHEET_SHELLS)]
+                or (shells and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS)]
         if not mine:
             return None, []
         if len(mine) < len(eids) and not shells:
@@ -12497,8 +12497,7 @@ class Converter:
         ids = dedup(self.geom.elset(keep["ELSET"].strip()))
         if not any(e in self._qmem for e in ids):
             return []
-        quiet = Report()
-        if not all(e in self._qmem or ccx_element_type(self.geom.elements[e][0], quiet).startswith(
+        if not all(e in self._qmem or ccx_type(self.geom.elements[e][0]).startswith(
                 CCX_SOLID_PREFIXES) for e in ids if e in self.geom.elements):
             self.report.warn(f"*RIGID BODY ELSET={keep['ELSET']} holds quadratic membranes written as "
                              f"solids and shells or beams: ccx makes the solids' nodes rigid, the ones "
@@ -13453,8 +13452,7 @@ class Converter:
         (verified: a tie on S1 of a shell edge silently ties nothing); plane elements
         number their edges S1..S4 like Abaqus."""
         eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token)
-        quiet = Report()
-        types = {ccx_element_type(self.geom.elements[e][0], quiet) for e in eids
+        types = {ccx_type(self.geom.elements[e][0]) for e in eids
                  if e in self.geom.elements}
         if types and all(t.startswith(PLANE_ELEM_PREFIXES) for t in types):
             self.report.note("*SURFACE edge faces E1..E4 of plane elements -> ccx S1..S4 (same "
@@ -14940,13 +14938,12 @@ class Converter:
                     table[e] = sec
         if not table:
             return
-        quiet = Report()
         nodes = self.geom.nodes
         next_id = max(nodes, default=0)
         sections: set = set()                          # the Abaqus sections involved
         kinds: "OrderedDict[str, int]" = OrderedDict()   # "TYPE -> new type" counts
         for eid, (typ, conn) in list(self.geom.elements.items()):
-            new = QUADRATIC_UPGRADE.get(ccx_element_type(typ, quiet)) if eid in table else None
+            new = QUADRATIC_UPGRADE.get(ccx_type(typ)) if eid in table else None
             if new is None or len(conn) != 2 or not all(n in nodes for n in conn):
                 continue
             next_id += 1
@@ -15008,9 +15005,8 @@ class Converter:
         PRINT rows outnumber their integration points (``self._b32r_rows``, B32R_PRINT_ROWS),
         and notes B32R beams with nodes whose DOF 3 is free (a 3-D model; nodes the planar
         constraint leaves out) in a deck with an NLGEOM step."""
-        quiet = Report()
         b32r = {e for e, (typ, _) in self.geom.elements.items()
-                if ccx_element_type(typ, quiet) == QUADRATIC_BEAM}
+                if ccx_type(typ) == QUADRATIC_BEAM}
         if not b32r:
             return
         for b in blocks:
@@ -15224,18 +15220,10 @@ class Converter:
         joined along the whole edge.  The new nodes join the node sets that hold both ends of
         their edge (_extend_edge_sets), and BCs, temperatures and initial conditions on both
         ends reach them (_midside_records)."""
-        quiet = Report()
         els = self.geom.elements
-        cache: Dict[str, str] = {}
-
-        def cc(typ: str) -> str:
-            if typ not in cache:
-                cache[typ] = ccx_element_type(typ, quiet)
-            return cache[typ]
-
         corners: Dict[int, List[int]] = {}           # linear shell -> its corner nodes
         for e, (typ, conn) in els.items():
-            n = {"S3": 3, "S4": 4, "S4R": 4}.get(cc(typ))
+            n = {"S3": 3, "S4": 4, "S4R": 4}.get(ccx_type(typ))
             if not n or len(conn) != n or any(x not in self.geom.nodes for x in conn):
                 continue
             # a quadrilateral collapsed on one edge is a triangle (ccx stops on a collapsed
@@ -15285,7 +15273,7 @@ class Converter:
                     if na and nc and vnorm(vadd(na, nc)) > 1e-9:
                         self._node_normals[next_id] = vunit(vadd(na, nc))
                 mids.append(mid[key])
-            new = "S6" if len(corners[e]) == 3 else COMPOSITE_SHELL_UPGRADE[cc(typ)]
+            new = "S6" if len(corners[e]) == 3 else COMPOSITE_SHELL_UPGRADE[ccx_type(typ)]
             self._quad_edges[e] = [(a, c, m) for (a, c), m in zip(edges(e), mids)]
             self._quad_from[e] = typ
             els[e] = (new, corners[e] + mids)
@@ -15308,7 +15296,7 @@ class Converter:
             hit = [m for n in conn for c, m in ends.get(n, ()) if c in members]
             if not hit:
                 continue
-            up = QUADRATIC_UPGRADE.get(cc(typ))
+            up = QUADRATIC_UPGRADE.get(ccx_type(typ))
             if len(conn) == 2 and up and e not in general and e not in self._u1:
                 m = mid[(min(conn), max(conn))]
                 els[e] = (up, [conn[0], m, conn[1]])
@@ -16548,7 +16536,6 @@ class Converter:
         be U1 — the first obstacle found."""
         self._u1_taken |= {(b.param("NAME") or "").strip().upper()
                            for b in blocks if b.keyword == "MATERIAL"}
-        quiet = Report()
         member: "OrderedDict[int, Block]" = OrderedDict()
         for b in cards:
             elset = (b.param("ELSET") or "").strip()
@@ -16563,7 +16550,7 @@ class Converter:
                 member[e] = b
         # ccx 2.23 stops on U1 beside any element it expands; constraints on U1 nodes and
         # nonlinear models (which ccx iterates, with U1's wrong nodal forces) are left out
-        others = sorted({ccx_element_type(t, quiet) for e, (t, _c) in self.geom.elements.items()
+        others = sorted({ccx_type(t) for e, (t, _c) in self.geom.elements.items()
                          if e not in member})
         bad = [t for t in others if not t.startswith(U1_COMPANIONS)]
         if bad:
@@ -16857,7 +16844,6 @@ class Converter:
         """Deck-wide facts that individual card handlers need: which nodes can carry
         rotations, which sets *EL PRINT / *NODE PRINT must default to, *DEPVAR sizes,
         whether field variables are ever set, and the step count."""
-        quiet = Report()
         emitted: Dict[str, str] = {}
         pore: Dict[str, bool] = {}
         plane: Dict[int, bool] = {}
@@ -16867,7 +16853,7 @@ class Converter:
         self._pore_nodes = set()
         for typ, conn in self.geom.elements.values():
             if typ not in emitted:
-                emitted[typ] = ccx_element_type(typ, quiet)
+                emitted[typ] = ccx_type(typ)
                 pore[typ] = "P" in split_suffixes(typ)[1]
             cc = emitted[typ]
             is_plane = cc.startswith(PLANE_ELEM_PREFIXES)
@@ -17270,13 +17256,12 @@ class Converter:
         self._mpc_thermal = any(k in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                                       "UNCOUPLED TEMPERATURE-DISPLACEMENT") for k in procs)
         self._mpc_mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
-        quiet = Report()
         kinds: Dict[str, str] = {}
         self._expanded = set()                 # nodes of elements ccx expands to 3-D
         rotn: set = set()                      # shell/beam nodes: rotations of their own
         for e, (typ, conn) in self.geom.elements.items():
             if typ not in kinds:
-                kinds[typ] = ccx_element_type(typ, quiet)
+                kinds[typ] = ccx_type(typ)
             cc = kinds[typ]
             if e not in self._qmem and (cc in SHELL_TYPES or cc in BEAM_TYPES or
                                         cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES)):
@@ -17507,10 +17492,9 @@ class Converter:
         self._conn_knots = []
         if not self._conn:
             return
-        quiet = Report()
         rotn: set = set()                       # shell/beam nodes: rotations of their own
         for typ, conn in self.geom.elements.values():
-            cc = ccx_element_type(typ, quiet)
+            cc = ccx_type(typ)
             if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
                 rotn.update(conn)
         segs = self._bc_segments(blocks)
@@ -17742,10 +17726,9 @@ class Converter:
         rotated model: exact, linear and NLGEOM; as a kinematic coupling 34-253 % off).
         Couplings of some translations, 2-D ones and reference nodes whose axes are
         undefined keep their form (_plan_transformed_rotations).  Returns the last node id."""
-        quiet = Report()
         structural = set(self._shell_nodes) | set(self._beam_nodes)
         for e, (typ, conn) in self.geom.elements.items():
-            if e not in self._qmem and ccx_element_type(typ, quiet).startswith("M3D"):
+            if e not in self._qmem and ccx_type(typ).startswith("M3D"):
                 structural.update(conn)
         cands: "OrderedDict[int, List[Tuple[int, bool]]]" = OrderedDict()  # ref -> (id, tied)
         convertible: set = set()             # couplings of all translations, 3-D members
@@ -18326,11 +18309,10 @@ class Converter:
         that form: ccx then carries two unrelated rotations on the node (probed: the beam
         acts as if hinged at the coupled face), so it becomes a *RIGID BODY whose ROT NODE
         follows the reference node's own rotation."""
-        quiet = Report()
         self._rot_nodes = set()
         structural = self._shell_nodes | self._beam_nodes      # + membranes (no rotations)
         for e, (typ, conn) in self.geom.elements.items():
-            cc = ccx_element_type(typ, quiet)
+            cc = ccx_type(typ)
             if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
                 self._rot_nodes.update(conn)
             elif cc.startswith("M3D") and e not in self._qmem:      # (solids: plain nodes)
@@ -19303,7 +19285,7 @@ class Converter:
             return []
         typ, conn = info
         if typ not in types:
-            types[typ] = ccx_element_type(typ, Report())
+            types[typ] = ccx_type(typ)
         cc, f, n = types[typ], (face or "").upper(), len(conn)
         if cc in SHELL_TYPES or cc.startswith("M3D"):
             # SPOS/SNEG (ccx S1/S2) cover the whole element; edges are E1..E4 (ccx S3..S6)
@@ -20104,14 +20086,13 @@ class Converter:
                         given.add((pint(f[0]), pint(f[1])))
                     except (ValueError, IndexError):
                         continue
-        quiet = Report()
         knots = set(self.geom.elset(KNOT_SET)) if self._knots else set()
         lines, beams = [], set()
         for eid, (typ, conn) in self.geom.elements.items():
             hit = [n for n in conn if n in self._node_normals]
             if not hit or any(n not in self.geom.nodes for n in conn):
                 continue
-            sub = ccx_element_type(typ, quiet)
+            sub = ccx_type(typ)
             if sub not in SHELL_TYPES:
                 # a beam's n2 comes from the normal; trusses and the converter's own knot
                 # beams have no cross-section orientation to lose
@@ -20976,7 +20957,6 @@ class Converter:
                 continue
             for e in self.geom.elset((b.param("ELSET") or "").strip()):
                 sized[e] = (max(cs), sec)
-        quiet = Report()
         types: Dict[str, str] = {}
         best: Optional[Tuple[float, int]] = None
         for e, (c, sec) in sized.items():
@@ -20984,7 +20964,7 @@ class Converter:
                 continue
             typ, conn = self.geom.elements[e]
             if typ not in types:
-                types[typ] = ccx_element_type(typ, quiet)
+                types[typ] = ccx_type(typ)
             if any(n not in self.geom.nodes for n in conn):
                 continue
             hf = courant_length(types[typ], [self.geom.nodes[n] for n in conn], sec)
