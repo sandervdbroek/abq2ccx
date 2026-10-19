@@ -5795,21 +5795,17 @@ class Converter:
                 return d == 6 and n in rotating
             return n not in self._plane_only if d == 3 else n in rotating
 
-        acts = op_new_cards(blocks)
-        active: set = set()
-        before: set = set()
-        step = 0
-        for b in blocks + [Block("STEP", OrderedDict())]:
-            if b.keyword == "STEP":
-                if step in transient and before - active:
-                    jumps.add(step)
-                step, before = step + 1, set(active)
-            elif b.keyword == "BOUNDARY":
-                if id(b) in acts:
-                    active = set()
-                active |= {(n, d) for spec, dofs, *_ in self._rate_lines(b)
-                           for n in (self._resolve_nodes(spec) or [spec.upper()]) for d in dofs
-                           if d <= 6 and carries(n, d)}
+        given = {id(b): [((n, d), True) for spec, dofs, *_ in self._rate_lines(b)
+                         for n in (self._resolve_nodes(spec) or [spec.upper()]) for d in dofs
+                         if d <= 6 and carries(n, d)]
+                 for b in blocks if b.keyword == "BOUNDARY"}
+        # the BCs in force as a step starts: the model data's, then the last general step's
+        before = set(next(bc_steps(step_groups(blocks)[0], lambda b: given[id(b)])))
+        for s, active in enumerate(bc_steps(blocks, lambda b: given[id(b)], self._pert_idx), 1):
+            if s in transient and before - set(active):
+                jumps.add(s)
+            if s not in self._pert_idx:
+                before = set(active)
         if jumps:
             self.report.warn(f"Transient *COUPLED TEMPERATURE-DISPLACEMENT (step "
                              f"{', '.join(str(n) for n in sorted(jumps))}): a mechanical load without "
@@ -8914,43 +8910,39 @@ class Converter:
         FIXED, a BC carried from before (a nonzero one with an amplitude may follow a total-
         time curve: not), and in Abaqus/Explicit a new displacement without AMPLITUDE (a
         zero velocity) - or puts it there with a new zero displacement.  And the pairs with
-        a BC in force when it starts (ccx matches a BC re-specified there to the old one)."""
+        a BC in force when it starts (ccx matches a BC re-specified there to the old one).
+        After a linear perturbation step the BCs are the last general step's again (bc_steps)."""
         at_zero = set(query)
-        held: Dict[Tuple[int, int], Tuple[str, float, bool]] = {}
 
-        def apply(b: Block, new: set) -> None:
+        def entries(b: Block) -> list:
+            """(pair, (kind, value, amplitude?, card)) of a *BOUNDARY's pairs in ``query``."""
             kind = "fixed" if b.has("FIXED") else "other" if b.has("USER") or b.has("SUBMODEL") \
                 else {"DISPLACEMENT": "disp", "VELOCITY": "vel"}.get(self._bc_type(b), "other")
             amp = bool((b.param("AMPLITUDE") or "").strip())
-            for nodes, dofs, mag in self._bc_records(b):
-                for k in ((n, d) for n in nodes for d in dofs):
-                    if k in query:
-                        held[k] = (kind, mag, amp)
-                        new.add(k)
-
-        for b in model:
-            apply(b, set())
+            return [((n, d), (kind, mag, amp, id(b))) for nodes, dofs, mag in self._bc_records(b)
+                    for n in nodes for d in dofs if (n, d) in query]
+        cards = model + [b for g in groups for b in g]
+        given = {id(b): entries(b) for b in cards if b.keyword == "BOUNDARY"}
+        held = next(bc_steps(model, lambda b: given[id(b)]))        # the model data's
         out: Dict[int, Tuple[set, set]] = {}
         nlgeom = False
-        acts = op_new_cards([b for g in groups for b in g])
-        for s, group in enumerate(groups, 1):
+        for s, (group, end) in enumerate(zip(groups, bc_steps(cards, lambda b: given[id(b)],
+                                                                self._pert_idx)), 1):
             info = self._step_motion(group, nlgeom)
             nlgeom = info["nlgeom"]
             if s in need:
                 out[s] = (set(at_zero), set(held))
-            cards = [x for x in group[1:] if x.keyword == "BOUNDARY"]
-            if any(id(x) in acts for x in cards):          # OP=NEW on its first *BOUNDARY
-                held.clear()
-            new: set = set()
-            for x in cards:
-                apply(x, new)
+            end = dict(end)
+            if s not in self._pert_idx:
+                held = end
             if info["perturbation"] or info["proc"] == "HEAT TRANSFER":
                 continue
+            mine = {id(x) for x in group}
             for k in query:
-                kind, mag, amp = held.get(k, ("free", 0.0, False))
+                kind, mag, amp, src = end.get(k, ("free", 0.0, False, None))
                 if kind == "fixed" or (kind == "vel" and mag == 0.0):
                     continue
-                if kind == "disp" and k not in new:
+                if kind == "disp" and src not in mine:
                     if amp and mag != 0.0:
                         at_zero.discard(k)
                 elif kind == "disp" and info["explicit"] and not amp:
@@ -10312,7 +10304,7 @@ class Converter:
                              f"evaluates the transform elsewhere; on the knot they are written in "
                              f"global components (exact). A knot holds the beam section rigid at "
                              f"the node, as beam theory does.", once=True)
-        acts = op_new_cards(blocks)
+        acts = op_new_cards(blocks, ("BOUNDARY", "CLOAD"))
         for n, mode in self._rot_mode.items():
             if mode == "global":
                 self._rot_global_lines(n, self._local_axes(n), cards, acts)
@@ -10383,7 +10375,7 @@ class Converter:
         """_rot_lines for node ``n``, whose rotational BCs and moments ccx applies about the
         global axes: each card's are rewritten in global components where the step semantics
         let them (Abaqus: a BC or load given in a later step replaces that DOF's, OP=NEW
-        removes the earlier steps' - for BCs, on the cards in ``acts`` (op_new_cards); ccx:
+        removes the earlier steps' - on the cards in ``acts`` (op_new_cards); ccx:
         likewise per global DOF, loads given within a step add up).
 
         * BCs: the state after each card (the local rotations held, their values) as its
@@ -10395,11 +10387,20 @@ class Converter:
           loads some of the node's local rotations also gives the components of the ones an
           earlier step loaded and this one leaves (they carry on in Abaqus, while ccx replaces
           the global DOFs), if they have no amplitude; a step whose cards have different
-          amplitudes has no such form."""
+          amplitudes has no such form.  A linear perturbation step's moments are its own (ccx
+          removes the earlier *CLOADs there, or ignores loads), unless it is a *MODAL DYNAMIC
+          step that keeps the earlier ones on (_modal_held).
+
+        After a linear perturbation step (``self._pert_idx``) both start again from the last
+        general step's state, which _restore_base_states gives ccx again (as bc_steps)."""
+        pert = self._pert_idx
         state: Dict[int, Tuple[float, Optional[str], int]] = {}
+        base, cur = state, 0                    # the last general step's state; the step
         for b, s, items in cards:
             if b.keyword != "BOUNDARY":
                 continue
+            if s != cur:
+                state, base, cur = (dict(base), base, s) if cur in pert else (state, dict(state), s)
             if id(b) in acts:
                 state = {}
             if n not in items:
@@ -10414,6 +10415,7 @@ class Converter:
                 state[d] = (v, amp, s)
             self._rot_lines[(id(b), n)] = self._rot_bc_global(n, axes, state, amp, s)
         state = {}
+        base, cur = state, 0
         groups: Dict[int, List[Tuple[Block, List[Tuple[int, float]]]]] = {}
         for b, s, items in cards:
             if b.keyword == "CLOAD" and n in items:
@@ -10425,8 +10427,10 @@ class Converter:
         for b, s, items in cards:
             if b.keyword != "CLOAD":
                 continue
-            if b.uparam("OP") == "NEW":
-                state = {j: e for j, e in state.items() if e[2] == s}
+            if s != cur:
+                state, base, cur = (dict(base), base, s) if cur in pert else (state, dict(state), s)
+            if id(b) in acts:
+                state = {}
             if n not in items:
                 continue
             amp = b.uparam("AMPLITUDE") or None
@@ -10434,7 +10438,9 @@ class Converter:
             if s not in verdict:
                 group = groups[s]
                 respec = {d for _, its in group for d, _ in its}
-                carried = {j: e for j, e in state.items() if j not in respec and e[0] != 0.0}
+                own = s in pert and s not in self._modal_held
+                carried = {} if own else \
+                    {j: e for j, e in state.items() if j not in respec and e[0] != 0.0}
                 why = None
                 if len({c.uparam("AMPLITUDE") for c, _ in group}) > 1:
                     why = ("this step loads the rotations with different amplitudes, which share "
@@ -18693,7 +18699,7 @@ class Converter:
                 rotn.update(conn)
         given = {id(b): self._bc_zero_entries(b) for b in blocks if b.keyword == "BOUNDARY"}
         held: Optional[set] = None              # (node, DOF) held at zero in every step
-        for active in bc_steps(blocks, lambda b: given[id(b)]):
+        for active in bc_steps(blocks, lambda b: given[id(b)], self._pert_idx):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
         self._conn_held = held or set()
@@ -21102,9 +21108,10 @@ class Converter:
             except ValueError:
                 cands.append([])
         assign = self._match_dependents(eqs, cands, transformed)
-        # held at zero by a BC in every step
+        # held at zero by a BC in every step (a linear perturbation step's BCs end with it:
+        # _restore_base_states frees them in the next general step)
         held: Optional[set] = None
-        for active in bc_steps(bc_cards, lambda b: given[id(b)]):
+        for active in bc_steps(bc_cards, lambda b: given[id(b)], self._pert_idx):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
         held = held or set()
@@ -22103,7 +22110,7 @@ class Converter:
                             moves.add(n)
             return out
 
-        for st in bc_steps(blocks, rotations):           # the BCs each step solves with
+        for st in bc_steps(blocks, rotations, self._pert_idx):     # the BCs each step solves with
             active: Dict[int, set] = {}                  # node -> rotations a BC holds
             for n, d in st:
                 active.setdefault(n, set()).add(d)

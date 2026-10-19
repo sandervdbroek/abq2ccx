@@ -4367,6 +4367,11 @@ def test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes():
     _, conv, rep = convert_str(CIRC_BEAM + "*Nset, nset=ALL\n1, 2, 3\n*Boundary\n1, 1, 3\n"
                                "3, 2, 3\nALL, 4, 4\n" + CIRC_STATIC)
     assert list(conv._knots) == [1, 2, 3] and "3 of the 3 element end nodes" in rep.text()
+    # a perturbation step's BCs end with it: step 3 holds only DOF 4 of node 1
+    _, conv, rep = convert_str(CIRC_BEAM + "*Density\n7.85e-9\n*Boundary\n1, 1, 3\n3, 2, 3\n*Step\n"
+                               "*Frequency\n3\n*Boundary\n1, 4, 6\n*End Step\n*Step\n*Static\n"
+                               "*Boundary\n1, 4, 4\n*Cload\n2, 2, -1.\n*End Step\n")
+    assert list(conv._knots) == [1] and "Rotational BCs on circular-section beams" in rep.text()
 
 
 def test_circ_rotation_bc_examples():
@@ -5334,6 +5339,30 @@ def test_base_state_after_a_first_perturbation_step_beams_and_couplings():
     assert "Possible overconstraint" in rep.text()
     body, _, rep = convert_str(kin.format("100, 1, 3", "100, 4, 6", "100, 4, 6\n"))
     assert _bc_lines(body)[-1] == "TOP,1,1" and "Possible overconstraint" in rep.text()
+
+
+def test_bcs_of_a_perturbation_step_do_not_hold_in_later_steps():
+    # the BC-state walkers read a linear perturbation step's BCs as Abaqus does, for that step
+    # only (bc_steps' restore): _restore_base_states frees them in the next general step.  An
+    # *EQUATION on DOFs that only a *FREQUENCY step holds is not "redundant in every step":
+    # it ties them in step 2.  ccx stops on it in the frequency step (probed): warned
+    deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, "
+            "elset=EALL, material=M\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*Equation\n2\n"
+            "7, 2, 1., 6, 2, -1.\n*Step\n*Frequency\n3\n*Boundary\n7, 2, 2\n6, 2, 2\n*End Step\n"
+            "*Step\n*Static\n*Cload\n7, 2, 10.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert _equations(body) == ["7,2,1.,6,2,-1."] and "redundant" not in rep.text()
+    assert "node 7 DOF 2 is on the dependent side of an *EQUATION" in rep.text()
+    # a JOIN connector off a beam node whose rotations only the frequency step holds: its rows
+    # keep the node's rotation (theta_a x d), on a knot
+    conn = (HEX + "*Node\n20, 3.,0.,0.\n21, 2.,0.,0.\n*Element, type=B31, elset=B\n2, 20, 21\n"
+            "*Beam Section, elset=B, material=M, section=RECT\n1.,1.\n0.,0.,1.\n*Solid Section, "
+            "elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n"
+            "*Element, type=CONN3D2, elset=H\n30, 21, 2\n*Connector Section, elset=H\nJoin,\n"
+            "*Boundary\n20, 1, 6\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n*Step\n*Frequency\n3\n"
+            "*Boundary\n21, 4, 6\n*End Step\n*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, _ = convert_str(conn)
+    assert conv._conn_knots == [21] and "\n2, 2, 1, 21, 2, -1, 21, 6, 1\n" in body
 
 
 BUCKLE_CUBE = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Elset, elset=ROT\n1\n*Material, name=M\n"
@@ -7190,6 +7219,24 @@ def test_transformed_moments_carry_on_over_steps_on_a_knot():
     assert _close(_cloads(body)[1], {(3, 4 + k): 2. * e[2][k] for k in range(3)}, 1e-10)
 
 
+def test_transformed_rotations_around_a_perturbation_step():
+    # a linear perturbation step's moments are its own (ccx removes the earlier *CLOADs at a
+    # *BUCKLE step): no carried components there, which would add the base moments to the
+    # buckling load; the next general step carries the base state's on, not the buckle's
+    e = _axes_rect(*TIP_AB)
+    body, _, _ = convert_str(_tip("*Cload\n3, 4, 1.\n3, 5, 1.\n*End Step\n*Step\n*Buckle\n2\n"
+                                  "*Cload\n3, 6, 2.\n*End Step\n*Step\n*Static\n*Cload\n3, 4, 3.\n"))
+    _, s2, s3 = _cloads(body)
+    assert _close(s2, {(3, 4 + k): 2. * e[2][k] for k in range(3)}, 1e-10)
+    assert _close(s3, {(3, 4 + k): 3. * e[0][k] + e[1][k] for k in range(3)}, 1e-10)
+    # a *FREQUENCY step's rotation hold ends with it (a transform about z: local 4 = global 5)
+    body, _, _ = convert_str(_tip("*Boundary\n3, 4, 4, 0.01\n*End Step\n*Step\n*Frequency\n3\n"
+                                  "*Boundary\n3, 6, 6\n*End Step\n*Step\n*Static\n*Boundary\n"
+                                  "3, 4, 4, 0.02\n", "0., 1., 0., -1., 0., 0."))
+    assert "*BOUNDARY\n3, 5, 5, 0.01\n3, 6, 6\n" in _step(body, 2)
+    assert "*BOUNDARY\n3, 5, 5, 0.02\n" in _step(body, 3) and "3, 6, 6" not in _step(body, 3)
+
+
 def test_transformed_rotations_on_a_frame_joint_and_in_dynamic_decks():
     # a frame joint is a ccx knot (two beam directions): read about the global axes there
     frame = TIP3.replace("2, 2, 3\n", "2, 2, 3\n3, 3, 4\n").replace(
@@ -7686,6 +7733,16 @@ def test_default_amplitude_ramp_only_where_it_changes_something():
     assert f"*BOUNDARY, OP=NEW\n1, 1, 6\n2, 1, 2\n{RAMP}\n2, 3, 3, 0.2\n*BOUNDARY\n2, 4, 6\n" \
            f"3, 1, 2\n{RAMP}\n3, 3, 3, 0.1\n*BOUNDARY\n3, 4, 6\n" in st, st
     assert st.count("OP=NEW") == 1
+
+
+def test_default_amplitude_rest_state_after_a_perturbation_step():
+    # a perturbation step's BC ends with it: node 7, which step 2 moves, is not at rest when
+    # step 3 starts, so its zero BC ramps back (as without the frequency step's BC)
+    for first in ("*Boundary\n7, 3, 3\n", ""):
+        body, conv, _ = convert_str(VEL_HEX + f"*Step\n*Frequency\n3\n{first}*End Step\n"
+                                    "*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n*Step\n*Dynamic\n"
+                                    "0.01, 0.1\n*Boundary\n7, 3, 3, 0.\n*End Step\n")
+        assert conv._ramp_steps == {3} and f"{RAMP}\n7, 3, 3, 0.\n" in _step(body, 3), first
 
 
 def test_default_amplitude_explicit_holds_the_dof():
@@ -8224,6 +8281,20 @@ def test_coupled_inertia_load_jump_warned():
                                   "*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n*BOUNDARY, OP=NEW\n"
                                   "BOT, 1, 3\n*END STEP\n")
     assert conv._mass_scale == 1e30 and "a mechanical load without AMPLITUDE" not in rep.text()
+
+
+def test_coupled_inertia_release_after_a_perturbation_step():
+    # a coupled step starts from the last general step's BCs: one that a perturbation step
+    # adds is not released by the next step's OP=NEW, one that it removes is
+    pert = "*STEP, PERTURBATION\n*STATIC\n*BOUNDARY{}\n*END STEP\n"
+    last = ("*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n*BOUNDARY, OP=NEW\nBOT, 1, 3\n"
+            "*END STEP\n")
+    for held, card, warned in (("TOP, 11, 11, 100.\n", "\n8, 3, 3", False),
+                               ("TOP, 3, 3\n", ", OP=NEW\nBOT, 1, 3", True)):
+        body, conv, rep = convert_str(COUPLED_HEX + "*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n"
+                                      f"*BOUNDARY\n{held}*END STEP\n" + pert.format(card) + last)
+        assert conv._mass_scale == 1e30, held
+        assert ("(step 3): a mechanical load without AMPLITUDE" in rep.text()) == warned, held
 
 
 def test_coupled_inertia_dependencies_rows():

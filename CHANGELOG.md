@@ -6,6 +6,16 @@ physics.
 
 ## Unreleased
 
+* **BCs and moments after a linear perturbation step** — Abaqus drops a perturbation step's
+  BCs and loads after it, and the converter gives ccx the base state again, but six planners
+  still read them as carried on. An `*EQUATION` on DOFs that only a `*FREQUENCY` step held was
+  dropped as redundant, so its tie was gone in the next general step (now kept; ccx stops on
+  it in the frequency step, warned). A JOIN connector off a beam node whose rotations only such
+  a step held lost that rotation. On a `*TRANSFORM` node written in global components, the
+  step's rotation hold or moment came back in the next general step, and a `*BUCKLE` step's
+  load included the earlier moments (buckling factor 0.9 % off). A zero BC in a later
+  `*DYNAMIC` step could be stepped instead of ramped, and the transient coupled step's
+  released-BC warning compared the wrong BCs.
 * **Coupling `ORIENTATION=`** — Abaqus couples the DOFs in the orientation's axes. In a
   `*DYNAMIC` deck the coupling's equations tied the global DOFs instead (40 % off with some
   translations coupled), a `*KINEMATIC COUPLING` card lost the parameter, and a part-level

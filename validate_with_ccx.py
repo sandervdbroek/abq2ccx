@@ -75,7 +75,9 @@ and the same decks without them; and decks a code review found converted wrongly
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
 a part's pre-tension section and distributing coupling in turned instances, and a static step
-after a linear perturbation step (the state before it again).
+after a linear perturbation step (the state before it again; also a transformed beam joint's
+rotations and moments, a zero BC ramped in a *DYNAMIC step and a JOIN off a beam node, against
+the same decks without the perturbation step's BC or the *TRANSFORM).
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -2375,6 +2377,76 @@ def perturbation_restore_deck(pert=None):
          "27, 2, 2, 0.1", "*TEMPERATURE", "TE, 100.", "*END STEP"] +
         (steps[pert] + ["*END STEP"] if pert else []) +
         ["*STEP", "*STATIC", "*NODE PRINT, NSET=TIPS", "U", "*END STEP"]) + "\n"
+
+
+def pert_frame_deck(case, pert=True, twin=False, n=4):
+    """A B31 frame (E 2.1e5, RECT 0.1 x 0.05, ``n`` elements per member): a beam along x from
+    node 1 (clamped) to a joint at x = 2 (a ccx knot) and a column up from it, the joint with a
+    *TRANSFORM.  "moment" (oblique local axes): a static step turns the joint by moments about
+    local 1 and 2, the linear perturbation step ``pert`` ("buckle": *BUCKLE; "static": *STEP,
+    PERTURBATION *STATIC; False: left out) loads it about local 3, and a last static step
+    triples the moment about local 1 (the one about local 2 carries on); ``twin``: without the
+    *TRANSFORM, the moments in global components.  "bc" (local axes about z): the first step
+    turns local 1 and 3 by 0.01, a *FREQUENCY step holds local 3 at zero, the last step turns
+    local 1 to 0.02 (local 3 stays at 0.01)."""
+    j = 2 * n + 1                                     # the joint
+    lines = (["*NODE"] + [f"{i + 1}, {i / n!r}, 0., 0." for i in range(2 * n + 1)] +
+             [f"{j + k}, 2., 0., {k / n!r}" for k in range(1, n + 1)] + ["*ELEMENT, TYPE=B31, ELSET=B"] +
+             [f"{i}, {i}, {i + 1}" for i in range(1, 2 * n + 1)] +
+             [f"{2 * n + k}, {j + k - 1}, {j + k}" for k in range(1, n + 1)] +
+             ["*NSET, NSET=FREE", f"{n}, {j + n}", "*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT",
+              "0.1, 0.05", "0., 1., 0.", "*MATERIAL, NAME=M", "*ELASTIC", "2.1e5, 0.3", "*DENSITY",
+              "7.8e-9", "*BOUNDARY", "1, 1, 6"])
+    ab = ((0.6, 0.8, 0.), (-0.8, 0.6, 0.5)) if case == "moment" else ((0., 1., 0.), (-1., 0., 0.))
+    if not twin:
+        lines += ["*NSET, NSET=TIP", str(j), "*TRANSFORM, NSET=TIP", ", ".join(map(repr, ab[0] + ab[1]))]
+    e3 = _unit(_cross(*ab))
+    axes = (_unit(ab[0]), _cross(e3, _unit(ab[0])), e3)
+
+    def moments(ms):
+        if not twin:
+            return ["*CLOAD"] + [f"{j}, {d}, {m!r}" for d, m in ms.items()]
+        return ["*CLOAD"] + [f"{j}, {k + 4}, {sum(m * axes[d - 4][k] for d, m in ms.items())!r}"
+                             for k in range(3)]
+    out = ["*NODE PRINT, NSET=FREE", "U", "*END STEP"]
+    if case == "bc":
+        steps = [["*STEP", "*STATIC", "*BOUNDARY", f"{j}, 4, 4, 0.01", f"{j}, 6, 6, 0.01"] + out,
+                 ["*STEP", "*FREQUENCY", "2", "*BOUNDARY", f"{j}, 6, 6", "*END STEP"] if pert else [],
+                 ["*STEP", "*STATIC", "*BOUNDARY", f"{j}, 4, 4, 0.02"] + out]
+    else:
+        steps = [["*STEP", "*STATIC"] + moments({4: 0.01, 5: 0.01}) + out,
+                 (["*STEP", "*BUCKLE", "2"] + moments({6: 1.}) + ["*END STEP"] if pert == "buckle" else
+                  ["*STEP, PERTURBATION", "*STATIC"] + moments({6: 1.}) + out if pert else []),
+                 ["*STEP", "*STATIC"] + moments({4: 0.03, 5: 0.01} if twin else {4: 0.03}) + out]
+    return "\n".join(lines + [x for st in steps for x in st]) + "\n"
+
+
+def pert_rest_deck(held=True):
+    """A unit C3D8 cube (E 1000, nu 0, rho 1) held at its bottom: a *FREQUENCY step that holds
+    node 7 in z (``held``), a static step pulling node 7 up, and a *DYNAMIC step taking it back
+    to 0 with a displacement BC without AMPLITUDE (Abaqus/Standard ramps it)."""
+    return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=BOT\n1, 2, 3, 4\n*NSET, NSET=TOP\n5, 6, 7, 8\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            "1000., 0.\n*DENSITY\n1.\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*BOUNDARY\nBOT, 1, 3\n"
+            "*STEP\n*FREQUENCY\n3\n" + ("*BOUNDARY\n7, 3, 3\n" if held else "") + "*END STEP\n"
+            "*STEP\n*STATIC\n*CLOAD\n7, 3, 10.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n*STEP\n"
+            "*DYNAMIC\n0.01, 0.1\n*BOUNDARY\n7, 3, 3, 0.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def pert_join_deck(held="21, 4, 6"):
+    """A unit C3D8 cube (E 1000, nu 0.3) held on its x = 0 face, joined by a CONN3D2 JOIN from
+    its node 2 to the end 21 of a B31 cantilever 1 away (a beam node's rotation turns the
+    offset); a *FREQUENCY step holds ``held``, then a static step loads the cube's node 7."""
+    return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n20, 3.,0.,0.\n21, 2.,0.,0.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
+            "1, 1,2,3,4,5,6,7,8\n*ELEMENT, TYPE=B31, ELSET=B\n2, 20, 21\n*NSET, NSET=OUT\n2, 6, 7, 21\n"
+            "*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n0.2, 0.2\n0., 0., 1.\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*DENSITY\n1e-3\n*ELEMENT, TYPE=CONN3D2, ELSET=H\n30, 21, 2\n*CONNECTOR SECTION, ELSET=H\n"
+            "JOIN,\n*BOUNDARY\n20, 1, 6\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n"
+            f"*STEP\n*FREQUENCY\n3\n*BOUNDARY\n{held}\n*END STEP\n"
+            "*STEP\n*STATIC\n*CLOAD\n7, 3, 1.\n*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
 
 
 def modal_own_loads_deck(base=True):
@@ -5522,6 +5594,73 @@ def main():
                   f"a static step giving nothing): the last step's "
                   f"displacements are the first step's ({err:.1e} apart; each cube's corner moved "
                   f"at least {moved:.3g} in a free DOF)")
+        failures += 0 if ok else 1
+    # the planners' BC and moment states after a linear perturbation step: the base state again
+    def same(runs, k=None):
+        """The largest difference between the NODE PRINT blocks of two runs (block ``k`` only,
+        or all), and the largest |u| of the second (the reference)."""
+        got, ref = runs
+        if k is None and len(got) != len(ref):
+            return math.inf, 0.0
+        pairs = [(got[k], ref[k])] if k is not None else list(zip(got, ref))
+        err = max(abs(a - b) for g, r in pairs for n, v in r.items()
+                  for a, b in zip(g.get(n, [math.inf] * 3), v))
+        return err, max(abs(x) for _, r in pairs for v in r.values() for x in v)
+
+    # a rotation a *FREQUENCY step holds on a transformed joint (global components: it came back
+    # in the next general step, held at the frequency step's zero)
+    runs = [review_run(pert_frame_deck("bc", pert), "pert_rotation_bc" + ("" if pert else "_ref"),
+                       dat_node_blocks) for pert in (True, False)]
+    ok = all(runs)
+    if ok:
+        err, moved = same(runs, -1)
+        ok = err < 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  pert_rotation_bc (a B31 frame's joint with a *TRANSFORM "
+              f"turned about local 1 and 3 by 0.01, held about local 3 in a *FREQUENCY step, then "
+              f"turned about local 1 to 0.02): the last step's displacements are the ones without "
+              f"the frequency step ({err:.1e} apart, free nodes moved {moved:.3g})")
+    failures += 0 if ok else 1
+    # moments on it: a perturbation step's are its own (the base moments were added to its
+    # load), and the next general step's are the base state's (the buckle's came back)
+    for pert, what in (("buckle", "*BUCKLE"), ("static", "*STEP, PERTURBATION *STATIC")):
+        runs = [review_run(pert_frame_deck("moment", pert, twin), f"pert_moment_{pert}" +
+                           ("_twin" if twin else ""),
+                           lambda dat: (dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T"),
+                                        dat_node_blocks(dat)))
+                for twin in (False, True)]
+        ok = all(runs) and len(runs[0][1]) == len(runs[1][1]) >= 2
+        if ok:
+            err, moved = same([r[1] for r in runs])
+            lam = [r[0] for r in runs]
+            ok = err < 1e-9 * moved and moved > 1e-3 and (pert == "static" or (
+                len(lam[0]) == len(lam[1]) == 2 and
+                max(abs(a / b - 1) for a, b in zip(*lam)) < 1e-6))
+            print(f"{'PASS' if ok else 'FAIL'}  pert_moment_{pert} (moments about local 1 and 2 on a "
+                  f"B31 frame's joint with an oblique *TRANSFORM, one about local 3 in a {what} step, "
+                  f"then the first tripled): every displacement as with the moments in global "
+                  f"components and no *TRANSFORM ({err:.1e} apart, free nodes moved {moved:.3g})"
+                  + (f", buckling factors {lam[0][0]:.7g} vs {lam[1][0]:.7g}" if pert == "buckle" else ""))
+        elif all(runs):
+            print(f"FAIL  pert_moment_{pert}: {len(runs[0][1])} vs {len(runs[1][1])} displacement tables")
+        failures += 0 if ok else 1
+    # a zero BC without AMPLITUDE in a *DYNAMIC step after a perturbation step that held the DOF
+    # (it counted as at rest, so ccx stepped it), and a JOIN connector off a beam node whose
+    # rotation only a *FREQUENCY step holds (its rows lost the rotation)
+    for tag, decks, what in (
+            ("pert_rest_ramp", (pert_rest_deck(True), pert_rest_deck(False)),
+             "a cube's corner held in a *FREQUENCY step, pulled up in a static step and brought "
+             "back by a zero BC in a *DYNAMIC step: its motion as without the frequency step's BC"),
+            ("pert_join_rotation", (pert_join_deck("21, 4, 6"), pert_join_deck("6, 3, 3")),
+             "a cube JOINed to a beam end whose rotations a *FREQUENCY step holds, then loaded: "
+             "as with the frequency step holding another DOF")):
+        runs = [review_run(text, tag + ("" if k == 0 else "_ref"), dat_node_blocks)
+                for k, text in enumerate(decks)]
+        ok = all(runs)
+        if ok:
+            err, moved = same(runs)
+            ok = err < 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): every displacement table "
+                  f"{err:.1e} apart, nodes moved {moved:.3g}")
         failures += 0 if ok else 1
     # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
     # it too): the response to its own loads alone
