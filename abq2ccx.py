@@ -804,7 +804,8 @@ class Block:
 # ``AMP=`` on a load card is "parameter not recognized" in ccx, so the load silently
 # loses its amplitude).
 PARAM_ALIASES = {"GEN": "GENERATE", "PERT": "PERTURBATION", "PERTURB": "PERTURBATION",
-                 "AMP": "AMPLITUDE", "POS": "POSITION", "SECT": "SECTION", "STACK DIR": "STACK DIRECTION"}
+                 "AMP": "AMPLITUDE", "POS": "POSITION", "SECT": "SECTION", "STACK DIR": "STACK DIRECTION",
+                 "NLGEO": "NLGEOM"}
 # Abaqus keyword abbreviations CalculiX does not accept.
 KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 

@@ -2671,6 +2671,19 @@ def test_step_amplitude_kept_and_quasi_static_ramp():
     assert "*DYNAMIC, ALPHA=-0.3333" in body
 
 
+def test_step_nlgeo_abbreviates_nlgeom():
+    # Abaqus reads the abbreviation NLGEO as NLGEOM (real decks write NLGEO=NO): the step is
+    # written NLGEOM, as the B32R note and the U1 planner already read it
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=B32, elset=B\n1, 1, 2, 3\n"
+            "*Beam Section, elset=B, material=M, section=RECT\n0.1, 0.1\n0., 0., 1.\n*Material, name=M\n"
+            "*Elastic\n1000., 0.3\n*Boundary\n1, 1, 6\n*Step, nlgeo\n*Static\n*Cload\n3, 2, 1.\n*End Step\n")
+    body, _, rep = convert_str(beam)
+    assert "*STEP, NLGEOM\n" in body and "in an NLGEOM step" in rep.text()
+    assert "NLGEO dropped" not in rep.text()
+    body, _, _ = convert_str(beam.replace("nlgeo", "nlgeo=NO"))
+    assert "*STEP, NLGEOM=NO\n" in body
+
+
 def test_friction_keeps_only_mu():
     si = "*Surface Interaction, name=SI\n*Surface Behavior, pressure-overclosure=hard\n"
     body, _, rep = convert_str(si + "*Friction, exponential decay\n0.3, 0.2, 1.0\n")
