@@ -858,7 +858,8 @@ def test_damage_initiation_criteria_ccx_cannot_run_are_commented():
 def test_damage_initiation_johnson_cook_kept_with_ccx_second_line():
     # Abaqus' Johnson-Cook data (d1-d5, melting and transition temperature, reference strain
     # rate) are ccx's first line; ccx wants a second, the damage at which it deletes the
-    # element (which crashes 2.23): 1E30 keeps the criterion an output, as in Abaqus.
+    # element (a deletion can stop or crash 2.23): 1E30 keeps the criterion an output, as in
+    # Abaqus.
     body, _, rep = convert_str(HEX + JC_MATERIAL + JC_STEP)
     lines = body.splitlines()
     i = lines.index("*DAMAGE INITIATION, CRITERION=JOHNSON COOK")
@@ -933,7 +934,8 @@ def test_boundary_on_inactive_unknown_dof_dropped():
 
 def test_boundary_on_dof8_dropped_where_the_ccx_model_has_none():
     # ccx 2.23 reads DOF 8 as its DOF 4 (probed): the rotation about x of a shell or beam node,
-    # held or prescribed without a message; a crash on plane nodes; nothing on solid nodes
+    # held or prescribed without a message; a crash on plane nodes (builds without the fix of
+    # CalculiX PR #200); nothing on solid nodes
     step = "*Step\n*Static\n*Boundary\nTOP, 8, 8, 0.5\nTOP, 1, 8\n*Cload\nTOP, 3, 1.\n*End Step\n"
     deck = HEX + "*Nset, nset=TOP\n5,6,7,8\n" + step
     body, _, rep = convert_str(deck)                   # no element has DOF 8: Abaqus ignores it
@@ -2246,6 +2248,23 @@ def test_u1_refusals_keep_todays_section_handling():
     assert "SECTION=RECT" in body and "U1 beam, which carries the profile, cannot be used" in rep.text()
 
 
+def test_u1_kept_out_beside_deformation_plasticity():
+    # ccx 2.23 runs a model with a *Deformation Plasticity material under NLGEOM, which stops a
+    # U1 beam ('no second order'): beside a solid of that law the beams are not U1
+    deck = (HEX + "*Node\n11, 0., 5., 0.\n12, 10., 5., 0.\n*Element, type=B31, elset=B\n21, 11, 12\n"
+            "*Beam General Section, elset=B, section=GENERAL\n0.01, 8.3e-6, 0., 8.3e-6, 1.4e-5\n"
+            "0., 0., -1.\n2.e5, 8.e4\n*Solid Section, elset=EALL, material=DP\n,\n*Material, name=DP\n"
+            "*Deformation Plasticity\n2.e5, 0.3, 250., 5., 0.5\n*Boundary\n11, 1, 6\n1, 1, 3\n"
+            "*Step\n*Static\n*Cload\n12, 2, 1.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "TYPE=U1" not in body
+    assert "material DP has *DEFORMATION PLASTICITY, with which ccx 2.23 runs every step under " \
+           "NLGEOM" in rep.text()
+    body, _, _ = convert_str(deck.replace("*Deformation Plasticity\n2.e5, 0.3, 250., 5., 0.5",
+                                          "*Elastic\n2.e5, 0.3"))
+    assert "TYPE=U1" in body
+
+
 def test_u1_line_load_and_gravity_become_nodal_forces_with_end_moments():
     # PY on a U1 beam: forces q L / 2 and the cubic element's consistent moments +-q L^2 / 12;
     # GRAV (which ccx refuses on U1) the same with rho A g
@@ -2330,8 +2349,8 @@ def _live(body):
 
 
 def test_history_card_outside_step_commented():
-    # Step data before any *STEP is invalid Abaqus; ccx 2.23 segfaults on it when the deck
-    # has no step at all, so it is commented out with the reason.
+    # Step data before any *STEP is invalid Abaqus; ccx rejects it (2.23 segfaults where such
+    # a card ends the deck with a data line, as here), so it is commented out with the reason.
     body, _, rep = convert_str(Q4 + "*Boundary\nL,1,2\n*Cload\n3,2,-1.\n")
     assert not any(l.upper().startswith("*CLOAD") for l in _live(body))
     assert "** *CLOAD" in body and "history" in rep.text()
@@ -2346,7 +2365,8 @@ def test_undefined_material_warns():
 
 
 def test_plane_node_rotational_bc_dropped():
-    # plane-element nodes have no rotations; ccx 2.23 crashes on a BC there (Abaqus ignores it)
+    # plane-element nodes have no rotations; ccx 2.23 builds without the fix of CalculiX PR #200
+    # crash on a BC there (Abaqus ignores it)
     body, _, rep = convert_str(Q4 + "*Boundary\nL,1,2\nL,6,6\n*Step\n*Static\n*Boundary\nL,1,6\n*End Step\n")
     bc = [l.replace(" ", "") for l in _live(body) if l.startswith("L,")]
     assert bc == ["L,1,2", "L,1,3"] and "Rotational DOFs (4-6)" in rep.text()

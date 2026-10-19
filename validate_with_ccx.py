@@ -32,7 +32,8 @@ on a plane-stress element (tau / G), deformation-plasticity bars on oriented sec
 bars without an orientation), quadratic membranes (strips in tension, also under NLGEOM, and
 a pressurized sphere) against uniaxial stress and thin-wall theory, a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, the thermal strains of isotropic materials with an orthotropic / anisotropic
-expansion (including the engineering shear coefficients of an anisotropic one), a heated
+expansion (including the engineering shear coefficients of an anisotropic one) and of every
+*Elastic form beside an anisotropic one (also under NLGEOM), a heated
 cube and circular-section beam with no initial temperatures, and the loads ccx has no card
 for — surface tractions (Cook's membrane, Lame's cylinder) and beam line loads (cantilevers
 against beam theory) — applied as consistent nodal forces, also on nodes with a *TRANSFORM
@@ -1701,6 +1702,109 @@ def local_to_global(ab, s):
     return [g[0][0], g[1][1], g[2][2], g[0][1], g[0][2], g[1][2]]
 
 
+# thermal_expansion_elastic_forms: an orthotropic material's engineering constants, and the
+# normal and (Abaqus' engineering) shear coefficients of its ANISO *Expansion
+EXP_EC = (150000., 10000., 12000., 0.3, 0.25, 0.4, 5000., 6000., 3500.)
+EXP_ALPHA = (1e-5, 2e-5, 3e-5)
+EXP_SHEAR = (8e-6, -6e-6, 4e-6)
+# (case, *Elastic form, expansion with shear terms, material axes TURNED_AB)
+EXP_FORMS_LINEAR = (("EC_SHEAR", "ec", True, False), ("ORTHO_PLAIN", "ortho", False, False),
+                    ("EC_TURNED", "ec", False, True), ("ORTHO_TURNED", "ortho", True, True),
+                    ("ANISO_TURNED", "aniso", True, True), ("ISO_TURNED", "iso", True, True))
+EXP_FORMS_NLGEOM = (("EC_PLAIN", "ec", False, False), ("ORTHO_PLAIN", "ortho", False, False))
+# the 21 constants of Abaqus' *Elastic, type=ANISOTROPIC as (row, column) of the VOIGT matrix
+ABAQUS_ANISO_ORDER = ((0, 0), (0, 1), (1, 1), (0, 2), (1, 2), (2, 2), (0, 3), (1, 3), (2, 3), (3, 3),
+                      (0, 4), (1, 4), (2, 4), (3, 4), (4, 4), (0, 5), (1, 5), (2, 5), (3, 5), (4, 5),
+                      (5, 5))
+
+
+def expansion_form_stiffness(form):
+    """The 6 x 6 stiffness (VOIGT order, engineering shear) in its material axes of a
+    thermal_expansion_elastic_forms *Elastic form: isotropic, EXP_EC's (as engineering constants
+    or orthotropic D's), or EXP_EC's with normal-shear couplings (anisotropic)."""
+    if form == "iso":
+        return _ortho_stiffness6((200000.,) * 3 + (0.3,) * 3 + (200000. / 2.6,) * 3)
+    c = _ortho_stiffness6(EXP_EC)
+    if form == "aniso":
+        for (i, j), v in (((0, 3), 1500.), ((1, 5), -400.), ((2, 4), 600.), ((3, 4), 300.)):
+            c[i][j] = c[j][i] = v
+    return c
+
+
+def expansion_forms_deck(cases, nlgeom=False, dt=100.0):
+    """thermal_expansion_elastic_forms: per case k (name, *Elastic form, shear terms, turned) a
+    free unit C3D8 cube held 3-2-1 (nodes 100 k + 1-8) and a clamped one (100 k + 11-18), heated
+    by ``dt``, of a material with that *Elastic beside an ANISO *Expansion (EXP_ALPHA, with
+    EXP_SHEAR or zero shear terms) in TURNED_AB's axes or the global ones.  Returns the deck
+    and, per case, (first node of the free cube, of the clamped cube, the global thermal strain,
+    the clamped cube's global stress), each (11, 22, 33, 12, 13, 23) with tensor shear."""
+    lines = ["*Heading", "*Elastic forms beside an anisotropic *Expansion", "*Node, nset=NALL"]
+    model, expect = [], []
+    for k, (name, form, shear, turned) in enumerate(cases, 1):
+        free, held = 100 * k + 1, 100 * k + 11
+        for base, x0 in ((free, 4.0 * k), (held, 4.0 * k + 2.0)):
+            lines += [f"{base + i}, {x + x0:g}, {y}., {z}." for i, (x, y, z) in enumerate(CUBE_CORNERS)]
+        c = expansion_form_stiffness(form)
+        if form == "iso":
+            elastic = ["*Elastic", "200000., 0.3"]
+        elif form == "ec":
+            elastic = ["*Elastic, type=ENGINEERING CONSTANTS", ", ".join(f"{v:g}" for v in EXP_EC[:8]),
+                       f"{EXP_EC[8]:g}"]
+        else:
+            ij = ABAQUS_ANISO_ORDER if form == "aniso" else \
+                ((0, 0), (0, 1), (1, 1), (0, 2), (1, 2), (2, 2), (3, 3), (4, 4), (5, 5))
+            vals = [f"{c[i][j]:.12g}" for i, j in ij]
+            elastic = [f"*Elastic, type={'ANISOTROPIC' if form == 'aniso' else 'ORTHOTROPIC'}"]
+            elastic += [", ".join(vals[i:i + 8]) for i in range(0, len(vals), 8)]
+        terms = EXP_SHEAR if shear else (0.0, 0.0, 0.0)
+        section = f"*Solid Section, elset=E_{name}, material=M_{name}"
+        model += [f"*Element, type=C3D8, elset=E_{name}",
+                  f"{100 * k + 1}, " + ", ".join(str(free + i) for i in range(8)),
+                  f"{100 * k + 2}, " + ", ".join(str(held + i) for i in range(8)),
+                  f"*Nset, nset=C_{name}", ", ".join(str(held + i) for i in range(8)),
+                  section + (", orientation=TURNED" if turned else ""),
+                  ",", f"*Material, name=M_{name}"] + elastic + \
+                 ["*Expansion, type=ANISO", ", ".join(f"{a:g}" for a in EXP_ALPHA + terms),
+                  "*Boundary", f"{free}, 1, 3", f"{free + 1}, 2, 3", f"{free + 3}, 3, 3", f"C_{name}, 1, 3"]
+        eps = [a * dt for a in EXP_ALPHA] + [a * dt / 2 for a in terms]
+        eng = eps[:3] + [2 * e for e in eps[3:]]
+        sig = [-sum(c[i][j] * eng[j] for j in range(6)) for i in range(6)]
+        if turned:
+            eps, sig = local_to_global(TURNED_AB, eps), local_to_global(TURNED_AB, sig)
+        expect.append((free, held, eps, sig))
+    lines += ["*Orientation, name=TURNED", ", ".join(f"{x:g}" for x in TURNED_AB[0] + TURNED_AB[1])]
+    lines += model + ["*Initial Conditions, type=TEMPERATURE", "NALL, 0.",
+                      "*Step, nlgeom" if nlgeom else "*Step", "*Static"] + (["0.25, 1."] if nlgeom else [])
+    lines += ["*Temperature", f"NALL, {dt:g}", "*Node Print, nset=NALL", "U, RF", "*End Step"]
+    return "\n".join(lines) + "\n", expect
+
+
+def expansion_forms_errors(dat, expect):
+    """(worst relative error of the free cubes' strains, of the clamped cubes' stresses) of an
+    expansion_forms_deck run against its ``expect``; None when results are missing.  The strain
+    comes from the corner displacements, the stress from the reaction forces on the clamped
+    cube's faces x = 1, y = 1 and z = 1 (their sums are the stress columns of a unit cube)."""
+    u = dat_displacements(dat)
+    forces = dat_node_blocks(dat, "forces")
+    if not forces:
+        return None
+    rf = forces[-1]
+    worst = [0.0, 0.0]
+    for free, held, eps_ref, sig_ref in expect:
+        corner = [u.get(free + k) for k in (0, 1, 3, 4)]
+        if any(v is None for v in corner) or any(held + k not in rf for k in range(8)):
+            return None
+        h = [[corner[j + 1][i] - corner[0][i] for j in range(3)] for i in range(3)]   # du_i / dx_j
+        eps = [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2,
+               (h[1][2] + h[2][1]) / 2]
+        faces = [[k for k, p in enumerate(CUBE_CORNERS) if p[j] == 1] for j in range(3)]
+        col = [[sum(rf[held + k][i] for k in faces[j]) for i in range(3)] for j in range(3)]
+        sig = [col[0][0], col[1][1], col[2][2], col[1][0], col[2][0], col[2][1]]
+        for w, got, ref in ((0, eps, eps_ref), (1, sig, sig_ref)):
+            worst[w] = max(worst[w], max(abs(g - r) for g, r in zip(got, ref)) / max(abs(r) for r in ref))
+    return worst
+
+
 def ic_cube_deck(kind):
     """A free unit C3D8 cube (held against rigid motion only) with an initial stress IC_STRESS
     (``kind`` "stress"; E 1000, nu 0.25) or plastic strain IC_PLASTIC ("plastic"; a *Plastic
@@ -3199,6 +3303,43 @@ def main():
               f"(analytic {sxx_ref:+.5f})")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # --- orthotropic / anisotropic *Elastic forms beside an ANISO *Expansion -----------------
+    # Beside a TYPE=ANISO expansion, ccx 2.23 also misreads an orthotropic or engineering-
+    # constants *Elastic in linear steps where no orientation applies (a free heated cube gets
+    # spurious shear strains, near 1e27 with shear terms), and it stops every NLGEOM step on
+    # an ANISO expansion ('too many cutbacks').  The converter writes such an *Elastic as ANISO
+    # and an unturned ANISO expansion without shear terms as ORTHO.  Each case is a free cube
+    # (its strains against alpha dT) and a clamped one (its face reactions against -C alpha dT);
+    # the linear deck has turned and unturned materials of every *Elastic form, the NLGEOM one
+    # the unturned expansions without shear terms (second-order terms: 1e-2 there).
+    res = []
+    for cases, nlgeom, tol in ((EXP_FORMS_LINEAR, False, 1e-5), (EXP_FORMS_NLGEOM, True, 1e-2)):
+        src = os.path.join(tmp, f"expansion_forms{'_nlgeom' if nlgeom else ''}_abq.inp")
+        deck, expect = expansion_forms_deck(cases, nlgeom)
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"expansion_forms{'_nlgeom' if nlgeom else ''}.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        errs = expansion_forms_errors(os.path.join(d, "job.dat"), expect) if status == "solved" else None
+        res.append((len(cases), status, errs, tol, out))
+        shutil.rmtree(d, ignore_errors=True)
+    if any(errs is None for _, _, errs, _, _ in res):
+        print("FAIL  thermal_expansion_elastic_forms: no displacements / reactions "
+              f"({', '.join(status for _, status, _, _, _ in res)})")
+        for *_, out in res:
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        ok = all(max(errs) < tol for _, _, errs, tol, _ in res)
+        (n_lin, _, lin, _, _), (n_nl, _, nl, _, _) = res
+        print(f"{'PASS' if ok else 'FAIL'}  thermal_expansion_elastic_forms (isotropic / orthotropic / "
+              f"engineering-constants / anisotropic *Elastic beside ANISO *Expansion): {n_lin} linear "
+              f"cases, free strains {lin[0] * 100:.5f}% / clamped stresses {lin[1] * 100:.5f}% off; "
+              f"{n_nl} NLGEOM cases (ANISO without shear terms written as ORTHO) {nl[0] * 100:.3f}% / "
+              f"{nl[1] * 100:.3f}% off")
+        failures += 0 if ok else 1
 
     # --- BCs on *RIGID BODY nodes, moved to the reference node -----------------------
     # Abaqus moves identical BCs on rigid-body nodes to the reference node, adding zero

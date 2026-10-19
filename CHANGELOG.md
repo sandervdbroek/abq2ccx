@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **U1 beams beside a deformation-plasticity solid** — ccx 2.23 runs a model with a
+  `*DEFORMATION PLASTICITY` material under NLGEOM, where its U1 beam stops ("no second order").
+  Such a deck no longer gets U1 beams; its beam sections are handled as where U1 cannot run.
+* **Notes on ccx 2.23 crashes and thermal expansion, made exact** — a card ccx rejects (step
+  data outside a step, a section naming an undefined material) segfaults it only as the deck's
+  last card with a data line; DOFs 4–6 and 8 on plane nodes crash only builds without the fix
+  of CalculiX PR #200; a damage deletion stops SPOOLES once nodes are left without elements and
+  crashes any solver on the last element.
+  The NLGEOM expansion warnings no longer call linear steps right in ccx itself: they are right
+  as converted, with the `*ELASTIC` rewrite, which `validate_with_ccx.py
+  thermal_expansion_elastic_forms` now checks for every `*ELASTIC` form, turned and not.
 * **`*DSLOAD` and `*DLOAD, OP=NEW` in one step** — ccx 2.23 has one `OP=NEW` flag for both
   cards and acts on it on a step's first one only, and the converter writes `*DSLOAD` as
   `*DLOAD`. So a step with a `*DSLOAD`, then a `*DLOAD, OP=NEW` (or the other way round), which

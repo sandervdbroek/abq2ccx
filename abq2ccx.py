@@ -2282,8 +2282,11 @@ TEMPERATURE_DOF_PROCS = {"HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
 
 # Step (history) data: valid only between *STEP and *END STEP.  Outside a step Abaqus
 # rejects these, ccx stops with "*CLOAD should only be used within a STEP" — and ccx 2.23
-# segfaults outright when the deck has no *STEP at all (verified: *CLOAD, *DLOAD,
-# *FREQUENCY, *NODE FILE).  (*BOUNDARY, *CONTROLS and *RESTART are legal model data.)
+# segfaults instead when the rejected card is the last card of the deck and has a data line:
+# calinput's skip loop then reads past the end of the input (CalculiX PR #190; verified in a
+# deck without *STEP ending in *CLOAD, *DLOAD, *FREQUENCY or *NODE FILE; a card that does not
+# end the deck, or *STATIC without a data line, gets the message).  (*BOUNDARY, *CONTROLS
+# and *RESTART are legal model data.)
 HISTORY_ONLY_KW = PROC_KW | {
     "CLOAD", "DLOAD", "DSLOAD", "TEMPERATURE", "CFLUX", "DFLUX", "DSFLUX", "FILM", "SFILM",
     "RADIATE", "SRADIATE", "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "NODE OUTPUT",
@@ -2293,7 +2296,9 @@ HISTORY_ONLY_KW = PROC_KW | {
 
 # Emitted ccx types of plane-stress / plane-strain / axisymmetric continuum elements.
 # Their nodes have NO rotational DOFs; ccx turns a *BOUNDARY on DOF 4-6 there into
-# rotational constraints and ccx 2.23 then crashes (bus error) or stops in usermpc.
+# rotational constraints, and a ccx 2.23 build without the fix of CalculiX PR #200 then
+# crashes (bus error, segfault), stops in usermpc or runs, varying from run to run (probed;
+# conda-forge's build 8, which carries such a fix, runs).
 PLANE_ELEM_PREFIXES = ("CPS", "CPE", "CAX")
 
 # Sets synthesized for *EL PRINT / *NODE PRINT cards that name no set (Abaqus default:
@@ -2832,8 +2837,14 @@ COUPLED_MASS_SCALE = 1e30
 # as (E, nu): E becomes lambda + 2 mu and nu becomes lambda, a wrong stiffness for every
 # load, without an error.  A free heated cube (E = 1000, nu = 0.2, alpha = 1e-3, 2e-3, 4e-3)
 # shrinks with strains near -2, with or without an *ORIENTATION; frequencies come out 17x
-# too low.  An orthotropic or engineering-constants *ELASTIC fails the same way with an
-# ANISO expansion unless an *ORIENTATION applies.
+# too low.  An orthotropic or engineering-constants *ELASTIC beside an ANISO expansion gets a
+# wrong stiffness too where no *ORIENTATION applies: a free heated cube has the right normal
+# strains but spurious shear strains, and strains near 1e27 once the expansion has shear
+# coefficients.  A clamped cube's thermal stress is right in all of these: the element
+# stiffness is wrong, not the thermal load.  Converted, every such combination is right in
+# linear steps (probed: isotropic, orthotropic, engineering-constants and anisotropic
+# *ELASTIC beside ORTHO and ANISO expansions, turned and not; validate_with_ccx.py
+# thermal_expansion_cubes, thermal_expansion_elastic_forms).
 # (emitted *ELASTIC type, expansion type) -> the type that works, with the same stiffness.
 ELASTIC_FOR_EXPANSION = {("ISO", "ORTHO"): "ENGINEERING CONSTANTS", ("ISO", "ANISO"): "ANISO",
                          ("ENGINEERING CONSTANTS", "ANISO"): "ANISO", ("ORTHO", "ANISO"): "ANISO"}
@@ -4302,8 +4313,9 @@ class Converter:
                 out.extend(self._commented(
                     b, f"*{b.keyword} is step (history) data but appears {where}: Abaqus rejects "
                        f"that, ccx stops with '*{b.keyword} should only be used within a STEP', "
-                       f"and ccx 2.23 segfaults when the deck has no *STEP at all. Commented out "
-                       f"— move it into a step if it was meant to apply.", reduces=False))
+                       f"and ccx 2.23 segfaults instead when it is the deck's last card and has a "
+                       f"data line. Commented out — move it into a step if it was meant to "
+                       f"apply.", reduces=False))
             else:
                 out.extend(self.translate_one(b))
         out.extend(self._rigid_model_cards())          # a deck without *STEP
@@ -4737,7 +4749,10 @@ class Converter:
         rate; the indicator sums the plastic strain increments over the strain at
         initiation), but (probed on 2.23):
         * the data take a second line, the indicator at which ccx deletes the element
-          (without it: 'damage definition is not complete'), and deleting one crashes 2.23;
+          (without it: 'damage definition is not complete'), and a deletion can stop 2.23:
+          calcdamage.f leaves the DOFs of nodes that no element holds any more in the system,
+          on which the SPOOLES solver fails (a singular matrix: exit 255, no message), and
+          with any solver ccx crashes once the last element is deleted;
         * every *DAMAGE INITIATION card goes to the deck's last *MATERIAL, whichever
           material it follows, and a later card overwrites an earlier one;
         * ccx stops unless that material is plastic and every step is a nonlinear *STATIC
@@ -4859,9 +4874,11 @@ class Converter:
         self.report.note(f"{head}: ccx 2.23 evaluates Abaqus' Johnson-Cook criterion (below the "
                          f"reference strain rate its rate term is linear, 1 + d4 (rate/ref - 1), "
                          f"not 1 + d4 ln(rate/ref)), but it wants a second data line with the "
-                         f"damage at which it deletes the element, and deleting one crashes "
-                         f"2.23: 1E30 there keeps every element, so the criterion only reports "
-                         f"the damage indicator (*EL FILE / *EL PRINT label DUCT; Abaqus' JCCRT)"
+                         f"damage at which it deletes the element, and a deletion can stop or "
+                         f"crash 2.23 (with SPOOLES once nodes are left without elements, with "
+                         f"any solver when the last element goes): 1E30 there keeps every "
+                         f"element, so the criterion only reports the damage indicator (*EL "
+                         f"FILE / *EL PRINT label DUCT; Abaqus' JCCRT)"
                          + ("; its *DAMAGE EVOLUTION is dropped (see that warning), so past "
                             "initiation the material keeps its undamaged response, unlike in "
                             "Abaqus." if evolution else
@@ -5257,12 +5274,14 @@ class Converter:
         """The *EXPANSION, TYPE=ANISO cards that handle_expansion writes as TYPE=ORTHO: those
         whose shear coefficients alpha12, alpha13, alpha23 are zero in every row, unless a
         section or composite ply that uses the material turns its axes so that the expansion
-        has shear in global axes.  Both types give the same thermal strain in linear steps,
-        but in NLGEOM steps of a deck with temperatures ccx 2.23 stops on any TYPE=ANISO
-        expansion with 'too many cutbacks', while it computes TYPE=ORTHO exactly in such axes
-        (probed: a free heated cube; see _check_nlgeom_expansion).  In turned axes it would
-        drop the turned shear of TYPE=ORTHO there without an error, so such a card stays
-        ANISO and those steps fail loudly.  With USER the data lines hold no coefficients."""
+        has shear in global axes.  Both types give the same thermal strain in linear steps
+        once the *ELASTIC has the form ELASTIC_FOR_EXPANSION gives it for the type written
+        here (_expansion_card), but in NLGEOM steps of a deck with temperatures ccx 2.23
+        stops on any TYPE=ANISO expansion with 'too many cutbacks', while it computes
+        TYPE=ORTHO exactly in such axes (probed: a free heated cube; see
+        _check_nlgeom_expansion).  In turned axes it would drop the turned shear of
+        TYPE=ORTHO there without an error, so such a card stays ANISO and those steps fail
+        loudly.  With USER the data lines hold no coefficients."""
         self._expansion_as_ortho = {}
         uses: Optional[List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]] = None
         for group in self._material_groups(blocks):
@@ -5444,8 +5463,8 @@ class Converter:
                     "applies")
         self.report.note(f"Material {mat}: {what} *ELASTIC written as TYPE={target} with the same "
                          f"stiffness because of its *EXPANSION, TYPE={kind}: in linear steps of a "
-                         f"deck with temperatures, ccx 2.23 uses a wrong stiffness (and thermal "
-                         f"strains) for {why}."
+                         f"deck with temperatures, ccx 2.23 uses a wrong element stiffness, for "
+                         f"every load, for {why}."
                          + (f" {added} temperature row(s) added between the given ones: ccx "
                             f"interpolates the converted stiffness linearly in temperature, Abaqus "
                             f"the given constants, and the extra rows keep the two within "
@@ -5535,7 +5554,9 @@ class Converter:
           One without shear coefficients goes out as TYPE=ORTHO where its axes are not
           turned (_plan_expansion_as_ortho), and is checked as such.
 
-        Linear steps and NLGEOM=NO are right; the CalculiX sources changed both routines in
+        Linear steps (NLGEOM=NO too) are right as converted: ccx 2.23 gets them wrong only
+        where the *ELASTIC is less anisotropic than the expansion, which handle_elastic
+        rewrites (ELASTIC_FOR_EXPANSION).  The CalculiX sources changed both NLGEOM routines in
         October 2026, after 2.23.  Decks without temperatures have no thermal strain.  A
         *DEFORMATION PLASTICITY material runs every step under NLGEOM in ccx
         (_plan_deformation_plasticity)."""
@@ -5585,8 +5606,9 @@ class Converter:
                              f"error, with any *ELASTIC form, element type or procedure (probed: a "
                              f"free cube turned 30 deg keeps its normal strains but gets no shear "
                              f"strain; a [30/-30]s laminate's in-plane thermal strains come out 8 and "
-                             f"41 % off). Linear steps are right, and no form of the deck avoids it in "
-                             f"ccx 2.23: check the thermal strains against a hand calculation.",
+                             f"41 % off). The converted deck's linear steps are right; no form of "
+                             f"the deck avoids this in ccx 2.23: check the thermal strains against "
+                             f"a hand calculation.",
                              once=True)
             self._reduces("thermal shear of a turned ORTHO *EXPANSION under NLGEOM (ccx 2.23 drops it)")
         if aniso:
@@ -5594,8 +5616,9 @@ class Converter:
                              f"and temperatures. ccx 2.23 builds the thermal deformation gradient of "
                              f"an anisotropic expansion wrongly in NLGEOM steps, so they stop with "
                              f"'too many cutbacks' — with or without an *ORIENTATION, and even where "
-                             f"the temperature does not change. Linear steps are right. An "
-                             f"expansion without shear coefficients is written as TYPE=ORTHO, which "
+                             f"the temperature does not change. The converted deck's linear steps "
+                             f"are right. An expansion without shear coefficients is written as "
+                             f"TYPE=ORTHO, which "
                              f"ccx 2.23 computes right, except where an *ORIENTATION or a composite "
                              f"ply angle turns it so that it has shear in global axes: TYPE=ORTHO "
                              f"would lose that shear there without an error.", once=True)
@@ -7702,8 +7725,9 @@ class Converter:
                              "stress/plane-strain/axisymmetric elements were dropped: those nodes "
                              "have no rotations in Abaqus (their active DOFs are 1 and 2; Abaqus 2017 "
                              "two-dimensional solid element library), so such a BC constrains "
-                             "nothing there, while ccx treats it as a rotational constraint and 2.23 "
-                             "crashes (bus error) or stops in usermpc. Exact.", once=True)
+                             "nothing there, while ccx treats it as a rotational constraint, on "
+                             "which ccx 2.23 builds without a fix (CalculiX PR #200) crash or stop "
+                             "in usermpc. Exact.", once=True)
         if self._n_inactive_rot_truss:
             self.report.warn("Rotational DOFs (4-6) prescribed on nodes that only belong to truss "
                              "elements (or trusses and plane elements) were dropped: those nodes have "
@@ -7746,9 +7770,9 @@ class Converter:
     # ('*ERROR in bounadd: unknown DOF'; it knows 1-6, 8 and 11) and maps 8 onto its own DOF
     # 4, a pressure or potential only in its CFD and electromagnetic models (probed on 2.23):
     # on a shell or beam node it silently holds or prescribes the rotation about x, on a
-    # plane or axisymmetric node ccx crashes, on a solid node or a node of no element it
-    # does nothing.  A pore-pressure element's DOF 8 goes with its P suffix, a fluid
-    # cavity's with its card (_note_dropped_dof)
+    # plane or axisymmetric node 2.23 builds without the fix noted at PLANE_ELEM_PREFIXES
+    # crash, on a solid node or a node of no element it does nothing.  A pore-pressure
+    # element's DOF 8 goes with its P suffix, a fluid cavity's with its card (_note_dropped_dof)
     _UNKNOWN_DOF_ELEMENTS = {7: ("warping", lambda t: re.match(r"B3\dOS|V?U\d+$", t) is not None),
                              8: ("pore, fluid or acoustic pressure", keeps_dof8),
                              9: ("electric potential",
@@ -7804,14 +7828,14 @@ class Converter:
                                  "elements lose that DOF with their P suffix, so the converted "
                                  "deck has no pore pressure to prescribe (the drainage conditions "
                                  "go with the consolidation physics). ccx would read DOF 8 as the "
-                                 "rotation about x, which crashes it on plane/axisymmetric "
-                                 "nodes.", once=True)
+                                 "rotation about x, which crashes 2.23 builds without a fix "
+                                 "on plane/axisymmetric nodes.", once=True)
                 return
             self.report.note("*BOUNDARY on DOF 8 (pore, fluid or acoustic pressure) dropped on "
                              "nodes where no element has that DOF: Abaqus ignores the BC there "
                              "(with a warning), while ccx would read it as the rotation about x "
-                             "(holding it on shell/beam nodes, crashing on plane/axisymmetric "
-                             "ones).", once=True)
+                             "(holding it on shell/beam nodes, crashing 2.23 builds without a "
+                             "fix on plane/axisymmetric ones).", once=True)
             return
         self.report.note(f"*BOUNDARY on DOF {d} ({self._UNKNOWN_DOF_ELEMENTS[d][0]}) dropped: "
                          f"no element of the model has that DOF, so Abaqus ignores the BC (with "
@@ -11237,8 +11261,8 @@ class Converter:
     def _preselect_labels(self, proc: Optional[str], var: str) -> Tuple[List[str], List[str]]:
         """(*NODE FILE labels, *EL FILE labels) of Abaqus' preselected field output in a
         ``proc`` step (PRESELECT_FIELD); VARIABLE=ALL adds the strain energy density (not
-        the state variables: SDV on a model with *DEPVAR but no user material crashes ccx
-        2.23, probed)."""
+        the state variables: *EL FILE SDV in a linear *STATIC step of a model with *DEPVAR
+        segfaults ccx 2.23, which never allocates the nodal array there, probed)."""
         node, elem = PRESELECT_FIELD.get(proc or "", ((), ()))
         elem = [x for x in elem if x != "PEEQ" or self._out_yields]
         if var == "ALL" and "S" in elem:
@@ -17339,6 +17363,9 @@ class Converter:
                             f"and *STEADY STATE DYNAMICS steps)")
         groups = {g[0].uparam("NAME"): g for g in self._material_groups(blocks)}
         for name in sorted({m for m, _ in self._material_uses(blocks)}):
+            if any(g.keyword == "DEFORMATION PLASTICITY" for g in groups.get(name, [])[1:]):
+                return [], (f"material {name} has *DEFORMATION PLASTICITY, with which ccx 2.23 "
+                            f"runs every step under NLGEOM, which U1 cannot ('no second order')")
             extra = [g.keyword for g in groups.get(name, [])[1:] if g.keyword not in U1_MATERIAL_CARDS
                      and (g.keyword in MATERIAL_OPTION_CARDS or g.keyword in U1_NONLINEAR_CARDS)]
             if extra:
@@ -17895,8 +17922,9 @@ class Converter:
 
     def _check_undefined_materials(self, blocks: List[Block]) -> None:
         """A section naming a material the deck never defines is invalid input; ccx stops
-        with 'nonexistent material' — and ccx 2.23 segfaults instead when the section has
-        a data line (e.g. a plane-element thickness).  Flag it so the crash is explained."""
+        with 'nonexistent material' — and ccx 2.23 segfaults instead when the section is the
+        last card of the deck and has a data line (e.g. a plane-element thickness), as for
+        any card it rejects there (HISTORY_ONLY_KW).  Flag it so the stop is explained."""
         defined = {(b.param("NAME") or "").upper() for b in blocks if b.keyword == "MATERIAL"}
         missing: "OrderedDict[str, str]" = OrderedDict()
         for b in blocks:
@@ -17912,8 +17940,9 @@ class Converter:
             known = (f"defined: {', '.join(sorted(defined)[:6])}" if defined
                      else "the deck defines no *MATERIAL at all — is a material *INCLUDE missing?")
             self.report.warn(f"A section (ELSET={elset}) references material '{nm}', which is never "
-                             f"defined ({known}). ccx stops with 'nonexistent material', and ccx "
-                             f"2.23 segfaults instead when the section has a data line.", once=True)
+                             f"defined ({known}). ccx stops with 'nonexistent material' (ccx 2.23 "
+                             f"segfaults instead when the section is the deck's last card and has "
+                             f"a data line).", once=True)
 
     def _check_nonpositive_ids(self) -> None:
         """Abaqus requires positive node numbers; a deck numbered from 0 (some mesh

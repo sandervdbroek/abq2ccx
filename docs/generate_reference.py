@@ -66,7 +66,7 @@ TRANSLATED = {
     "*DISTRIBUTION TABLE": "dropped for an orientation distribution (ccx needs no table; its lines "
         "are always `a, b`); otherwise commented.",
     "*SOLID SECTION": "keeps `ELSET`/`MATERIAL`/`ORIENTATION`; other params dropped; an undefined "
-        "`MATERIAL` is warned (ccx 2.23 can segfault on it). On `CPS4I`/`CPE4I` elements written as "
+        "`MATERIAL` is warned (ccx 2.23 segfaults on it where the section is the deck's last card). On `CPS4I`/`CPE4I` elements written as "
         "`C3D8I` slabs: no thickness line (it is the slab's depth), and plane stress through a "
         "generated `<material>_PLANE_STRESS` `ORTHO` material (see the element reference).",
     "*SECTION CONTROLS": "no ccx card (ccx's elements have their own, fixed formulation): "
@@ -197,7 +197,8 @@ TRANSLATED = {
         "where the DOF may have moved; a rotation or a node with a `*TRANSFORM` it cannot hold is "
         "kept, warned). Zero lines on DOFs still at zero stay as they are. DOFs 4-6 "
         "dropped on nodes of plane/axisymmetric or truss elements (no rotations there, Abaqus "
-        "ignores them; ccx 2.23 crashes or stops on them), and DOFs 7 (warping) and 9 (electric "
+        "ignores them; ccx stops on them at truss nodes, and 2.23 builds without a fix crash at "
+        "plane ones), and DOFs 7 (warping) and 9 (electric "
         "potential), which ccx does not have, where no element of the model has them; DOF 8 "
         "(pore, fluid or acoustic pressure), which ccx reads as the rotation about x, where no "
         "element of the converted model has it: pore-pressure elements lose it with their `P` "
@@ -398,7 +399,7 @@ TRANSLATED = {
     "*DAMAGE INITIATION": "ccx 2.23 evaluates `RICE TRACEY` and `JOHNSON COOK` only. `JOHNSON "
         "COOK` (d1-d5, melting and transition temperature, reference strain rate, as in Abaqus) "
         "is kept with the second data line ccx wants, the damage at which it deletes the element, "
-        "set to `1E30` (a deletion crashes 2.23): it then only reports the damage indicator "
+        "set to `1E30` (a deletion can stop or crash 2.23): it then only reports the damage indicator "
         "(`DUCT`, to which Abaqus' `JCCRT` maps), as Abaqus does without a `*DAMAGE EVOLUTION` — "
         "where ccx reads it as meant: the deck's last `*MATERIAL` (ccx gives every card to it), "
         "plastic, all steps nonlinear `*STATIC`/`*DYNAMIC`, one card. Any other card is "
@@ -494,8 +495,8 @@ TRANSLATED = {
         "`*TIE`), and where ccx 2.23 aborts on it: a model with axisymmetric elements whose "
         "`.frd` also gets `S`, unless every pair is `SURFACE TO SURFACE`.",
     "Step data outside a *STEP": "`*CLOAD`, `*DLOAD`, output and procedure cards before the first "
-        "step (or between steps) are commented — Abaqus rejects them and ccx 2.23 segfaults when "
-        "the deck has no step.",
+        "step (or between steps) are commented — Abaqus rejects them, and ccx 2.23 segfaults when "
+        "such a card ends the deck with a data line.",
     "INPUT= on data cards": "the referenced file's data lines are inlined (ccx reads `INPUT=` "
         "only on `*INCLUDE`).",
     "Load audit": "every step the Abaqus deck loads (loads, prescribed values, initial "

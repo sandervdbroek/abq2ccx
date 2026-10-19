@@ -105,6 +105,7 @@ explicit time integration): ccx 2.23 ends a step that sets up none with "Job fin
 | `op_new_respecify`, `op_new_remove` | clamps across a later step's `*BOUNDARY, OP=NEW` | expected deflections | ≤ 0.7 % |
 | `distribution_solid_plate`, `distribution_shell_plate` | per-element `*DISTRIBUTION` orientations | their `*_explicit` twins (one orientation per element) | ≤ 3e-11 |
 | `thermal_expansion_cubes` | isotropic `*Elastic` beside ORTHO / ANISO `*Expansion` (with shear terms) | α ΔT; analytic stress | ≤ 1e-6 |
+| `thermal_expansion_elastic_forms` | isotropic, orthotropic, engineering-constants and anisotropic `*Elastic` beside an ANISO `*Expansion`, turned and not; also NLGEOM | α ΔT; clamped stress −C α ΔT | ≤ 1e-5; 1e-2 NLGEOM |
 | `thermal_no_initial_temperature` | `*Temperature` without initial temperatures | α T, α T L | ≤ 5e-6 |
 | `cook_membrane_traction` | `*DSLOAD TRVEC` on `CPS8` edges | published 23.96 | 0.12 % |
 | `cylinder_traction_cax` | radial `TRVEC` on a thick `CAX8` cylinder | Lamé | 0.02 % |
