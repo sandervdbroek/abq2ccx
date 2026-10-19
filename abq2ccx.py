@@ -1803,6 +1803,13 @@ def _ngen_curve(kind: str, p1: Vec, p2: Vec, extra: Optional[Vec], normal: Optio
     return lambda t: vadd(vscale(p1, 1 - t), vscale(p2, t))
 
 
+def _skip_unreadable(report: Report, what: str) -> None:
+    """A mesh-generation record or card with a non-numeric field (an undefined <parameter>,
+    say) is skipped, as *NODE skips such a record: its nodes or elements are missing."""
+    report.warn(f"Skipped a {what} with non-numeric data; verify the deck.", once=True)
+    report.reduce(f"{what} with non-numeric data skipped")
+
+
 def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NGEN`` -> nodes between two existing end nodes, on a straight line (default),
     a circular arc about a centre node (LINE=C) or a parabola through a midside node
@@ -1814,15 +1821,19 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
         f = [x for x in rec if x != ""]
         if len(f) < 2:
             continue
-        n1, n2 = pint(f[0]), pint(f[1])
-        inc = pint(f[2]) if len(f) > 2 and f[2] else 1
+        try:
+            n1, n2 = pint(f[0]), pint(f[1])
+            inc = pint(f[2]) if len(f) > 2 and f[2] else 1
+            nx = pint(f[3]) if kind in ("C", "P") and len(f) > 3 else 0
+        except ValueError:
+            _skip_unreadable(report, "*NGEN record")
+            continue
         if n1 not in geom.nodes or n2 not in geom.nodes:
             report.warn(f"*NGEN endpoints {n1},{n2} not both defined; skipped.")
             continue
         p1, p2 = geom.nodes[n1], geom.nodes[n2]
         extra = None
         if kind in ("C", "P"):
-            nx = pint(f[3]) if len(f) > 3 else 0
             extra = geom.nodes.get(nx)
         normal = None
         if len(f) >= 7:
@@ -1836,7 +1847,7 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
                         f"is missing or the arc is degenerate (a 180-degree arc needs the normal "
                         f"on the data line); nodes {n1}..{n2} not generated.", once=True)
             continue
-        ids = list(range(n1, n2 + (1 if inc > 0 else -1), inc))
+        ids = list(range(n1, n2 + (1 if inc > 0 else -1), inc)) if inc else []
         if not ids:
             report.warn(f"*NGEN endpoints {n1},{n2} with increment {inc} generated no nodes "
                         f"(check the ordering/sign of the range); skipped.", once=True)
@@ -1890,7 +1901,11 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
             continue
         s1, s2 = (geom.nset(s) if s.upper() in geom.unsorted else sorted(set(geom.nset(s)))
                   for s in f[:2])
-        nint, ninc = pint(f[2]), pint(f[3])
+        try:
+            nint, ninc = pint(f[2]), pint(f[3])
+        except ValueError:
+            _skip_unreadable(report, "*NFILL record")
+            continue
         if not s1 or not s2:
             report.warn("*NFILL node set is empty; skipped.")
             continue
@@ -1923,8 +1938,12 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NCOPY`` -> copy a node set with SHIFT (translate/rotate) or REFLECT."""
     old = block.param("OLD SET") or block.param("OLDSET")
     new = block.param("NEW SET") or block.param("NEWSET")
-    change = pint(block.param("CHANGE NUMBER") or block.param("CHANGENUMBER") or 0)
-    multiple = pint(block.param("MULTIPLE") or 1)
+    try:
+        change = pint(block.param("CHANGE NUMBER") or block.param("CHANGENUMBER") or 0)
+        multiple = pint(block.param("MULTIPLE") or 1)
+    except ValueError:
+        _skip_unreadable(report, "*NCOPY card")
+        return []
     if not old:
         report.warn("*NCOPY without OLD SET ignored.")
         return []
@@ -1936,26 +1955,29 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     recs = [r for r in merged_data_records(block) if any(x != "" for x in r)]
     created: List[int] = []
 
-    def transform_shift(p: Vec, mult: int) -> Vec:
-        shift = (0.0, 0.0, 0.0)
-        if recs:
-            v = [pf(x) for x in recs[0] if x != ""]
-            if len(v) >= 3:
-                shift = (v[0], v[1], v[2])
-        out = p
-        for _ in range(mult):
-            out = vadd(out, shift)
-            if len(recs) > 1:                       # optional rotation line
-                v = [pf(x) for x in recs[1] if x != ""]
-                if len(v) >= 7:
-                    a, b, ang = (v[0], v[1], v[2]), (v[3], v[4], v[5]), v[6]
-                    out = rotate_about_axis(out, a, b, ang)
-        return out
-
     reflect = None
     for key in ("REFLECT",):
         if block.has(key):
             reflect = (block.param(key) or "").upper()
+    # SHIFT: a translation, then an optional rotation line, applied once per copy
+    shift: Vec = (0.0, 0.0, 0.0)
+    turn = None
+    try:
+        v = [pf(x) for x in recs[0] if x != ""] if recs and not reflect else []
+        if len(v) >= 3:
+            shift = (v[0], v[1], v[2])
+        v = [pf(x) for x in recs[1] if x != ""] if len(recs) > 1 and not reflect else []
+        if len(v) >= 7:
+            turn = ((v[0], v[1], v[2]), (v[3], v[4], v[5]), v[6])
+    except ValueError:
+        _skip_unreadable(report, "*NCOPY card")
+        return []
+
+    def transform_shift(p: Vec) -> Vec:
+        out = vadd(p, shift)
+        if turn is not None:
+            out = rotate_about_axis(out, *turn)
+        return out
     if block.has("POLE"):
         report.warn("*NCOPY, POLE is not supported by the converter; nodes are copied with the "
                     "SHIFT/REFLECT data only — verify the generated nodes.", once=True)
@@ -1970,21 +1992,24 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
             vals = []
         pts = [(vals[i], vals[i + 1], vals[i + 2]) for i in range(0, len(vals) - 2, 3)]
 
+    orig = {nid: geom.nodes[nid] for nid in src if nid in geom.nodes}
+    cur = orig
     for m in range(1, multiple + 1):
+        if not reflect:                             # copy m: one more shift of copy m - 1
+            cur = {nid: transform_shift(p) for nid, p in cur.items()}
         for nid in src:
-            p = geom.nodes.get(nid)
-            if p is None:
+            if nid not in orig:
                 continue
             new_id = nid + change * m
             if reflect:
-                np_ = reflect_point(p, reflect, pts)
+                np_ = reflect_point(orig[nid], reflect, pts)
                 if np_ is None:
                     report.warn(f"*NCOPY REFLECT={reflect} could not be applied (too few or "
                                 f"degenerate points); skipped.", once=True)
                     continue
                 newp = np_
             else:
-                newp = transform_shift(p, m)
+                newp = cur[nid]
             geom.add_node(new_id, newp)
             created.append(new_id)
             if new:
@@ -2105,19 +2130,23 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
         f = [x for x in rec if x != ""]
         if not f:
             continue
-        master = pint(f[0])
+        try:
+            master = pint(f[0])
+            triples = []
+            rest = f[1:]
+            for i in range(0, len(rest), 3):
+                grp = rest[i:i + 3]
+                n = pint(grp[0])
+                ninc = pint(grp[1]) if len(grp) > 1 and grp[1] else 1
+                einc = pint(grp[2]) if len(grp) > 2 and grp[2] else 1
+                triples.append((n, ninc, einc))
+        except ValueError:
+            _skip_unreadable(report, "*ELGEN record")
+            continue
         if master not in geom.elements:
             report.warn(f"*ELGEN master element {master} not defined; skipped.")
             continue
         typ, conn = geom.elements[master]
-        triples = []
-        rest = f[1:]
-        for i in range(0, len(rest), 3):
-            grp = rest[i:i + 3]
-            n = pint(grp[0])
-            ninc = pint(grp[1]) if len(grp) > 1 and grp[1] else 1
-            einc = pint(grp[2]) if len(grp) > 2 and grp[2] else 1
-            triples.append((n, ninc, einc))
         # nested loops over up to three generation directions
         ranges = [range(t[0]) for t in triples]
         while len(ranges) < 3:
@@ -2141,8 +2170,12 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
 
 def expand_elcopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*ELCOPY`` -> copy an element set with element- and node-number shifts."""
-    eshift = pint(block.param("ELEMENT SHIFT") or 0)
-    nshift = pint(block.param("SHIFT NODES") or 0)
+    try:
+        eshift = pint(block.param("ELEMENT SHIFT") or 0)
+        nshift = pint(block.param("SHIFT NODES") or 0)
+    except ValueError:
+        _skip_unreadable(report, "*ELCOPY card")
+        return []
     old = block.param("OLD SET") or block.param("OLDSET")
     new = block.param("NEW SET") or block.param("NEWSET")
     if not old:

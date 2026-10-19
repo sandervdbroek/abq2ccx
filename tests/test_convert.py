@@ -593,6 +593,23 @@ def test_generate_malformed_token_no_crash():
     assert list(conv.geom.elset("GOOD")) == [1, 2, 3]
 
 
+def test_mesh_generation_skips_unreadable_records():
+    # a non-numeric field (here an undefined <parameter>) in a mesh-generation card skips that
+    # record or card with a warning, as on *NODE, instead of aborting the conversion
+    ends = "*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n10, 9., 0., 0.\n*ELEMENT, TYPE=T3D2, ELSET=E\n1, 1, 2\n"
+    for kw, card in (("*NGEN record", "*NGEN, NSET=L\n1, 10, <n>\n"),
+                     ("*NFILL record", "*NSET, NSET=A\n1\n*NSET, NSET=B\n10\n*NFILL\nA, B, <n>, 1\n"),
+                     ("*NCOPY card", "*NSET, NSET=A\n1, 2\n*NCOPY, OLD SET=A, CHANGE NUMBER=100, SHIFT\n"
+                                     "<dx>, 0., 0.\n"),
+                     ("*ELGEN record", "*ELGEN, ELSET=E\n1, <n>, 1, 1\n"),
+                     ("*ELCOPY card", "*ELCOPY, ELEMENT SHIFT=<k>, OLD SET=E, SHIFT NODES=1\n")):
+        _, conv, rep = convert_str(ends + card + "*NGEN\n1, 10, 0\n")
+        assert f"Skipped a {kw} with non-numeric data" in rep.text(), (kw, rep.text())
+        assert sorted(conv.geom.nodes) == [1, 2, 10] and list(conv.geom.elements) == [1]
+        assert any("non-numeric" in r for r in conv.reduced_physics)
+        assert "with increment 0 generated no nodes" in rep.text()
+
+
 def test_string_parameter_substitution():
     # A string-valued *PARAMETER (quoted) must substitute as its *unquoted* value, so
     # `*Element, type=<eltype>` with eltype="CPS4" emits TYPE=CPS4 (not TYPE="CPS4",
