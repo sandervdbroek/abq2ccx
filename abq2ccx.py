@@ -19449,15 +19449,7 @@ class Converter:
         of ties, which ccx would hold at zero).  An equation left without a free DOF stays
         as it is, with a warning, except the converter's own rotation ties, which are
         dropped (the *BOUNDARY then governs that rotation)."""
-        cards: List[Tuple[str, "OrderedDict[str, Optional[str]]", int, List[int]]] = []
-        for j, line in enumerate(out):
-            if line.startswith("**"):
-                continue
-            if line.startswith("*"):
-                kw, params = parse_keyword_line(line)
-                cards.append((kw, params, j, []))
-            elif cards and line.strip():
-                cards[-1][3].append(j)
+        cards = self._emitted_cards(out)
         isint = re.compile(r"[-+]?\d+").fullmatch
 
         def fields(j: int) -> List[str]:
@@ -19578,27 +19570,7 @@ class Converter:
                              f"CalculiX will stop with '*ERROR in cascade ... dependent side of a "
                              f"MPC and a SPC'. Remove the BC or the constraint on that DOF.",
                              once=True)
-        # the equations: (card, [(node, dof, coefficient text), ...])
-        eqs: List[Tuple[int, List[Tuple[int, int, str]]]] = []
-        for ci, (kw, params, _, data) in enumerate(cards):
-            if kw != "EQUATION" or params:
-                continue
-            toks = [t for j in data for t in fields(j) if t]
-            parsed: List[List[Tuple[int, int, str]]] = []
-            pos = 0
-            try:
-                while pos < len(toks):
-                    cnt = pint(toks[pos])
-                    trip = toks[pos + 1:pos + 1 + 3 * cnt]
-                    pos += 1 + 3 * cnt
-                    if cnt < 1 or len(trip) < 3 * cnt or \
-                            not all(isint(trip[q]) and isint(trip[q + 1]) for q in range(0, len(trip), 3)):
-                        raise ValueError
-                    parsed.append([(int(trip[q]), int(trip[q + 1]), trip[q + 2])
-                                   for q in range(0, len(trip), 3)])
-            except (ValueError, IndexError):
-                continue                       # set names / unreadable: left as written
-            eqs += [(ci, terms) for terms in parsed]
+        eqs = self._emitted_equations(out, cards)
         if not eqs:
             return out
         # the local axes of the transformed nodes (ccx reads any TYPE but C as rectangular)
@@ -19671,47 +19643,7 @@ class Converter:
                               dofs.count((n, d)) == 1 and abs(pf(c)) > 1e-9 * big])
             except ValueError:
                 cands.append([])
-        assign: Dict[int, Tuple[int, int]] = {}
-        owner: Dict[Tuple[int, int], int] = {}
-        for e, (_, terms) in enumerate(eqs):
-            t0 = terms[0][:2]
-            if cands[e] and cands[e][0] == t0 and t0 not in owner:
-                assign[e], owner[t0] = t0, e
-
-        def augment(start: int) -> bool:
-            via: Dict[Tuple[int, int], int] = {}
-
-            def options(e: int):                # free DOFs first, then the ones to displace
-                return iter(sorted(cands[e], key=lambda c: (c in owner, c[1] <= 3 and
-                                                            c[0] in transformed)))
-            stack = [(start, options(start))]
-            budget = 20000
-            while stack and budget > 0:
-                e, it = stack[-1]
-                nxt = None
-                for c in it:
-                    if c in via:
-                        continue
-                    via[c] = e
-                    budget -= 1
-                    if c not in owner:         # free DOF: shift the assignments along the path
-                        while True:
-                            w = via[c]
-                            prev = assign.get(w)
-                            assign[w], owner[c] = c, w
-                            if w == start:
-                                return True
-                            c = prev
-                    nxt = owner[c]
-                    break
-                if nxt is None:
-                    stack.pop()
-                else:
-                    stack.append((nxt, options(nxt)))
-            return False
-        for e in range(len(eqs)):
-            if e not in assign:
-                augment(e)
+        assign = self._match_dependents(eqs, cands, transformed)
         # held at zero by a BC in every step
         held: Optional[set] = None
         for active in bc_steps(segs):
@@ -19800,20 +19732,6 @@ class Converter:
             else:
                 final.append(terms)
                 stuck.append(dofs[0])
-        new_cards: Dict[int, List[str]] = {}
-        by_card: "OrderedDict[int, List[int]]" = OrderedDict()
-        for e, (ci, _) in enumerate(eqs):
-            by_card.setdefault(ci, []).append(e)
-        for ci, es in by_card.items():
-            if all(final[e] is eqs[e][1] for e in es):
-                continue                           # this card stays as written
-            lines: List[str] = []
-            for e in es:
-                terms = final[e]
-                if terms is None:
-                    continue
-                lines += equation_rows(terms)
-            new_cards[ci] = lines
         if moved or rewritten:
             self.report.note(f"*EQUATION: {moved + rewritten} equation(s) reordered so that the "
                              f"eliminated (first) term is a DOF without a *BOUNDARY that no other "
@@ -19843,6 +19761,124 @@ class Converter:
                              f"another constraint. CalculiX will stop with '*ERROR in cascade ... "
                              f"dependent side of a MPC and a SPC' (or '... two different MPC's'). "
                              f"Remove the BC or the constraint on that DOF.", once=True)
+        return self._with_equations(out, cards, eqs, final)
+
+    @staticmethod
+    def _emitted_cards(out: List[str]) -> List[Tuple[str, "OrderedDict[str, Optional[str]]", int,
+                                                     List[int]]]:
+        """The keyword cards of the converted deck ``out``: (keyword, parameters, index of its
+        line, indices of its data lines); comment lines skipped."""
+        cards: List[Tuple[str, "OrderedDict[str, Optional[str]]", int, List[int]]] = []
+        for j, line in enumerate(out):
+            if line.startswith("**"):
+                continue
+            if line.startswith("*"):
+                kw, params = parse_keyword_line(line)
+                cards.append((kw, params, j, []))
+            elif cards and line.strip():
+                cards[-1][3].append(j)
+        return cards
+
+    @staticmethod
+    def _emitted_equations(out: List[str], cards: List[tuple]
+                           ) -> List[Tuple[int, List[Tuple[int, int, str]]]]:
+        """The equations of the converted deck's *EQUATION cards (_emitted_cards ``cards``):
+        (card index, [(node, DOF, coefficient text), ...]); a card that names a set or does not
+        read is left out (it stays as written)."""
+        isint = re.compile(r"[-+]?\d+").fullmatch
+        eqs: List[Tuple[int, List[Tuple[int, int, str]]]] = []
+        for ci, (kw, params, _, data) in enumerate(cards):
+            if kw != "EQUATION" or params:
+                continue
+            toks = [t for j in data for t in (x.strip() for x in out[j].split(",")) if t]
+            parsed: List[List[Tuple[int, int, str]]] = []
+            pos = 0
+            try:
+                while pos < len(toks):
+                    cnt = pint(toks[pos])
+                    trip = toks[pos + 1:pos + 1 + 3 * cnt]
+                    pos += 1 + 3 * cnt
+                    if cnt < 1 or len(trip) < 3 * cnt or \
+                            not all(isint(trip[q]) and isint(trip[q + 1]) for q in range(0, len(trip), 3)):
+                        raise ValueError
+                    parsed.append([(int(trip[q]), int(trip[q + 1]), trip[q + 2])
+                                   for q in range(0, len(trip), 3)])
+            except (ValueError, IndexError):
+                continue
+            eqs += [(ci, terms) for terms in parsed]
+        return eqs
+
+    @staticmethod
+    def _match_dependents(eqs: List[Tuple[int, List[Tuple[int, int, str]]]],
+                          cands: List[List[Tuple[int, int]]], transformed: set
+                          ) -> Dict[int, Tuple[int, int]]:
+        """Equation -> the DOF it eliminates, a bipartite matching over the candidate DOFs
+        ``cands`` of each equation: its first term where that is a candidate, the others by
+        augmenting paths, so one equation can hand its DOF to another with no other choice."""
+        assign: Dict[int, Tuple[int, int]] = {}
+        owner: Dict[Tuple[int, int], int] = {}
+        for e, (_, terms) in enumerate(eqs):
+            t0 = terms[0][:2]
+            if cands[e] and cands[e][0] == t0 and t0 not in owner:
+                assign[e], owner[t0] = t0, e
+
+        def augment(start: int) -> bool:
+            via: Dict[Tuple[int, int], int] = {}
+
+            def options(e: int):                # free DOFs first, then the ones to displace
+                return iter(sorted(cands[e], key=lambda c: (c in owner, c[1] <= 3 and
+                                                            c[0] in transformed)))
+            stack = [(start, options(start))]
+            budget = 20000
+            while stack and budget > 0:
+                e, it = stack[-1]
+                nxt = None
+                for c in it:
+                    if c in via:
+                        continue
+                    via[c] = e
+                    budget -= 1
+                    if c not in owner:         # free DOF: shift the assignments along the path
+                        while True:
+                            w = via[c]
+                            prev = assign.get(w)
+                            assign[w], owner[c] = c, w
+                            if w == start:
+                                return True
+                            c = prev
+                    nxt = owner[c]
+                    break
+                if nxt is None:
+                    stack.pop()
+                else:
+                    stack.append((nxt, options(nxt)))
+            return False
+        for e in range(len(eqs)):
+            if e not in assign:
+                augment(e)
+        return assign
+
+    @staticmethod
+    def _with_equations(out: List[str], cards: List[tuple],
+                        eqs: List[Tuple[int, List[Tuple[int, int, str]]]],
+                        final: List[Optional[List[Tuple[int, int, str]]]]) -> List[str]:
+        """``out`` with each *EQUATION card whose equations changed written again from
+        ``final`` (the terms of each equation of ``eqs``; None: dropped); a card left without
+        an equation goes."""
+        new_cards: Dict[int, List[str]] = {}
+        by_card: "OrderedDict[int, List[int]]" = OrderedDict()
+        for e, (ci, _) in enumerate(eqs):
+            by_card.setdefault(ci, []).append(e)
+        for ci, es in by_card.items():
+            if all(final[e] is eqs[e][1] for e in es):
+                continue                           # this card stays as written
+            lines: List[str] = []
+            for e in es:
+                terms = final[e]
+                if terms is None:
+                    continue
+                lines += equation_rows(terms)
+            new_cards[ci] = lines
         if not new_cards:
             return out
         drop_lines: set = set()
