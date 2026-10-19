@@ -74,6 +74,10 @@ time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank 
 a part's pre-tension section and distributing coupling in turned instances, and a static step
 after a linear perturbation step (the state before it again).
 
+Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
+an eigenvalue), and a run counts as solved only if ccx's output shows each step's equations
+(or explicit time integration): a step that sets up none still ends in "Job finished".
+
     python validate_with_ccx.py
 
 Exits 0 if every available check passes (or ccx is not installed — then it skips with
@@ -114,9 +118,24 @@ def convert(path, out_inp, approximate=False, abaqus_umat=False):
     return rep, conv
 
 
+def unsolved_steps(stdout):
+    """The steps whose ccx output shows no solve: an implicit step prints the number of
+    equations it set up, an explicit one "Explicit time integration".  A step that sets up no
+    equations (ccx 2.23: a *DYNAMIC step with *COUPLING, *KINEMATIC) prints neither and runs to
+    "Job finished" with every free DOF at 0."""
+    found = []
+    parts = re.split(r"(?m)^ STEP\s+(\d+)\s*$", stdout)
+    for step, text in zip(parts[1::2], parts[2::2]):
+        m = re.search(r"number of equations\s*\n\s*(\d+)", text)
+        if not (m and int(m.group(1)) > 0) and "Explicit time integration" not in text:
+            found.append(int(step))
+    return found
+
+
 def run_ccx(ccx, env, inp_path):
     """Run ccx; return (workdir, status, combined output) with status from
-    abq2ccx.classify_ccx_run ("solved" / "nonfinite" / "accepted" / "failed")."""
+    abq2ccx.classify_ccx_run ("solved" / "nonfinite" / "accepted" / "failed"), or "unsolved"
+    where it says "solved" or "nonfinite" but a step shows no solve (unsolved_steps)."""
     d = tempfile.mkdtemp(prefix="ccxval_")
     shutil.copy(inp_path, os.path.join(d, "job.inp"))
     full_env = dict(os.environ)
@@ -125,7 +144,13 @@ def run_ccx(ccx, env, inp_path):
         r = subprocess.run([ccx, "job"], cwd=d, env=full_env, capture_output=True,
                            encoding="utf-8", errors="replace", timeout=600)
         status = A.classify_ccx_run(r.returncode, r.stdout, r.stderr, os.path.join(d, "job"))
-        return d, status, r.stdout + r.stderr
+        out = r.stdout + r.stderr
+        idle = unsolved_steps(r.stdout) if status in ("solved", "nonfinite") else []
+        if idle:
+            status = "unsolved"
+            out += (f"\n*ERROR (validate_with_ccx): step {', '.join(map(str, idle))} shows no "
+                    f"solve (no equations set up, no explicit time integration)\n")
+        return d, status, out
     except Exception as exc:  # noqa: BLE001
         return d, "failed", f"failed to launch ccx: {exc}"
 
@@ -4117,6 +4142,7 @@ def main():
               f"{1 / eps_f:.6f}) at PEEQ {peeq[2]:.5f}, DUCT {duct[1]:g} in the cube without the "
               f"criterion, results {'identical to' if same else 'DIFFERENT from'} the run "
               f"without the card")
+        failures += 0 if ok else 1
     # --- rigid elements and analytical rigid surfaces ---------------------------------
     # ccx has neither: the converter gives each facet a force-free skin element that the rigid
     # body carries.  Against frictionless HARD contact (ccx: a linear law of slope K = 50 x the
@@ -4177,10 +4203,14 @@ def main():
         fp = sum(r[1] for r in got["prescribed"]["tool"][-1][1])
         errs = [rows_diff(got[t]["top"][-1][1], ub) for t in ("elements", "analytic")]
         forces = [got[t]["ref"][-1][1][0][1] for t in ("elements", "analytic")]
-        ok = all(du <= 1e-6 * sc for du, sc in errs) and all(abs(f / fp - 1) < 1e-5 for f in forces)
+        sc = errs[0][1]                                  # the block top under the prescribed punch
+        ok = sc > 0.5 * dd and all(du <= 1e-6 * sc for du, _ in errs) and \
+            all(abs(f / fp - 1) < 1e-5 for f in forces)
+        apart = max(du / s if s else math.inf for du, s in errs)
         print(f"{'PASS' if ok else 'FAIL'}  rigid_punch (axisymmetric, node-to-surface): RAX2 skins and a "
-              f"SEGMENTS surface move the block as the prescribed punch does ({max(e[0] / e[1] for e in errs):.1e} "
-              f"apart); reactions {forces[0]:+.6f}, {forces[1]:+.6f} vs {fp:+.6f} (per 2-degree sector)")
+              f"SEGMENTS surface move the block as the prescribed punch does ({apart:.1e} apart; the "
+              f"block top moved {sc / dd:.3f} d); reactions {forces[0]:+.6f}, {forces[1]:+.6f} vs "
+              f"{fp:+.6f} (per 2-degree sector)")
         failures += 0 if ok else 1
     # NLGEOM: the punch pushed in and turned (3-D 0.05 rad about x, plane 0.03 rad about z)
     for dim, th in (("3d", 0.05), ("planar", 0.03)):
@@ -4254,11 +4284,11 @@ def main():
     else:
         du, sc = rows_diff(r["top"][-1][1], ref_run["top"][-1][1])
         f_s, f_p = r["ref"][-1][1][0][1], sum(row[1] for row in ref_run["tool"][-1][1])
-        ok = du <= 1e-6 * sc and abs(f_s / f_p - 1) < 1e-5
+        ok = sc > 0.5 * dd and du <= 1e-6 * sc and abs(f_s / f_p - 1) < 1e-5
         print(f"{'PASS' if ok else 'FAIL'}  rigid_punch_explicit (planar, R2D2 skins): maximum increment "
               f"{cap:g} set by the converter (ccx's own estimate leaves this contact out); block top "
-              f"{du / sc:.1e} of |u| from the punch given its motion node by node at that increment, "
-              f"reaction {f_s:+.6f} vs {f_p:+.6f}")
+              f"{du / sc if sc else math.inf:.1e} of |u| from the punch given its motion node by node "
+              f"at that increment (it moved {sc / dd:.3f} d), reaction {f_s:+.6f} vs {f_p:+.6f}")
         failures += 0 if ok else 1
     # pressure on rigid elements: positive along the element normal; an R2D2 per unit depth
     for kind, axis in (("R2D2", 1), ("R3D4", 2)):
@@ -5079,6 +5109,9 @@ def main():
     # a static step after a linear perturbation step (ccx 2.23 carried the perturbation step's
     # loads and BCs on, and dropped or zeroed the earlier ones): the first step's state again
     ref = review_run(perturbation_restore_deck(), "perturbation_restore_ref", dat_displacements)
+    # (solve evidence: each cube's printed corner moves, node 27 in its free DOFs 1 and 3)
+    moved = min(max(abs(x) for k, x in enumerate(ref.get(n, [0.0] * 3)) if (n, k) != (27, 1))
+                for n in (7, 17, 27, 37)) if ref else 0.0
     for pert, what in (("freq", "a *FREQUENCY step changing them all"),
                        ("buckle", "a *STEP, PERTURBATION + *BUCKLE step changing them all"),
                        ("modal", "a *FREQUENCY step and a *MODAL DYNAMIC step changing the loads")):
@@ -5087,11 +5120,12 @@ def main():
         if ok:
             err = max(abs(a - b) for n in (7, 17, 27, 37)
                       for a, b in zip(u.get(n, [math.inf] * 3), ref.get(n, [math.nan] * 3)))
-            ok = err < 1e-9
+            ok = err < 1e-9 and moved > 1e-3
             print(f"{'PASS' if ok else 'FAIL'}  perturbation_restore_{pert} (four cubes given a "
                   f"*CLOAD, a pressure, a prescribed displacement and a temperature, {what}, then "
                   f"a static step giving nothing): the last step's "
-                  f"displacements are the first step's ({err:.1e} apart)")
+                  f"displacements are the first step's ({err:.1e} apart; each cube's corner moved "
+                  f"at least {moved:.3g} in a free DOF)")
         failures += 0 if ok else 1
     # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
     # it too): the response to its own loads alone
@@ -5107,6 +5141,9 @@ def main():
               f"pressure, gravity and a traction, then *FREQUENCY and a *MODAL DYNAMIC step with a "
               f"*CLOAD and a traction of its own): its response is the one without the static "
               f"loads ({err:.1e} apart; the corner moved {moved:.3g} in the first increment)")
+    elif all(runs):
+        print(f"FAIL  modal_own_loads: {min(len(r) for r in runs)} increments printed, not 3")
+    failures += 0 if ok else 1
     # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
     # aborted after the step that held no body load (the converter writes a zero GRAV there)
     def factors(dat):
@@ -5143,13 +5180,19 @@ def main():
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
+    # (loaded, every BC zero: any displacement is the solve's)
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")
         convert(os.path.join(EXAMPLES, name + ".inp"), inp)
         d, status, out = run_ccx(ccx, env, inp)
+        disp = frd_last(os.path.join(d, "job.frd"), "DISP") if status == "solved" else {}
         shutil.rmtree(d, ignore_errors=True)
-        if status == "solved":
-            print(f"PASS  {name}: accepted by ccx and solved")
+        moved = max((abs(x) for v in disp.values() for x in v[:3]), default=0.0)
+        if status == "solved" and moved > 0.0:
+            print(f"PASS  {name}: accepted by ccx and solved (largest |u| {moved:.4g} in the .frd)")
+        elif status == "solved":
+            print(f"FAIL  {name}: solved, but no node moves in the .frd ({len(disp)} nodes)")
+            failures += 1
         else:
             print(f"FAIL  {name}: did not solve ({status})")
             print("      " + " / ".join(l.strip() for l in out.splitlines()

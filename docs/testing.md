@@ -72,6 +72,9 @@ dangling set, surface, material, orientation or amplitude reference.
 Converts the examples, runs them in CalculiX (found as `--run` finds it: `$CCX`, `PATH`,
 FreeCAD, PrePoMax and bConverged installs, Homebrew/MacPorts) and compares the results with
 references that do not come from the converter. It prints one `PASS`/`FAIL` line per check.
+Each check reads something ccx must solve for (a free node's motion, a reaction, a stress, an
+eigenvalue), and a run counts as solved only if ccx's output shows each step's equations (or
+explicit time integration): ccx 2.23 ends a step that sets up none with "Job finished".
 
 | Example | Check | Reference | Agreement |
 | --- | --- | --- | --- |
@@ -121,7 +124,7 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | `assembly_rotated_instances` (also `_nodes`, `_nodes_no_c`) | a turned instance with an oriented orthotropic material (the part's orientation by coordinates, or by nodes with and without node c), instance-qualified loads, a surface pressure | the same model written flat by hand | exact (coordinates and displacements; by nodes before: 9 % of \|u\|) |
 | `pretension_node_set` (also `_part`, `_assembly`), `pretension_element_set` (generated) | a `C3D8` bolt whose `*PRE-TENSION SECTION` names its node by a one-node set (also two instances, one turned, of a part with the card, or with assembly-level cards naming `I1.PT` and an assembly set); a `B31` bolt naming its cut element and node by sets | F L / E A; the card with `ELEMENT=1, NODE=99` | 1e-6; exact (ccx stopped on the set names) |
 | `damage_johnson_cook_cubes` | a Johnson-Cook `*DAMAGE INITIATION`: ccx's indicator `DUCT` (from `JCCRT`) in uniaxial tension; the run with the card against the run without | PEEQ / (d1 + d2 e^(−d3/3)); identical results | 5e-7; exact |
-| `rigid_punch_block`, `rigid_punch_cylinder`, and generated plane and axisymmetric twins | a rigid flat punch of `R3D4`, `R2D2` or `RAX2` elements, or the same face as a `CYLINDER` / `SEGMENTS` analytical surface | ccx's penalty law A d / (L/E′ + 1/K); the punch given its motion node by node | 2e-7; ≤ 1e-14 |
+| `rigid_punch_block`, `rigid_punch_cylinder`, and generated plane and axisymmetric twins | a rigid flat punch of `R3D4`, `R2D2` or `RAX2` elements, or the same face as a `CYLINDER` / `SEGMENTS` analytical surface | ccx's penalty law A d / (L/E′ + 1/K); the punch given its motion node by node (the block top must move) | 2e-7; ≤ 1e-14 |
 | the same punches turned under NLGEOM (0.05 rad; plane 0.03 rad) | rigid skins and analytical surfaces | the punch given the exact motion | ≤ 8e-7 of \|u\| |
 | a block tied to a turning rigid plate (`R3D4`, `CYLINDER`) | a `*TIE` to a rigid surface, NLGEOM | its top given the exact motion | 1.8e-7 (ccx's own tie: 1.3e-2) |
 | `rigid_body_inertia` | `MASS` + `ROTARYI` of an `R3D4` plate on springs | its translation and rotation frequencies | 1.9e-7 |
@@ -155,12 +158,11 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | `rigid_tie_symmetric_layup` (generated) | a `[0/90]s` `S4R` strip tied to a clamped rigid plate | the strip with its four plies listed | exact (half the thickness: 3.3× too soft) |
 | `approximate_blank_nu` (generated) | `--approximate` beside an `*ELASTIC` row with a blank ν at the cube's temperature | uniaxial stress, ν 0 | exact (ν 0.475) |
 | `assembly_bolts` (generated) | two instances, one turned, of a part with a `*PRE-TENSION SECTION` and a `*DISTRIBUTING COUPLING` | F L / E A, F / E A | 1e-6 (ccx stopped on the part's names) |
-| `perturbation_restore_*` (generated) | cubes given a `*CLOAD`, a pressure, a prescribed displacement and a temperature, a `*FREQUENCY` (or `*STEP, PERTURBATION` + `*BUCKLE`) step changing them all (or, after a `*FREQUENCY` step, a `*MODAL DYNAMIC` one changing the loads), then a static step giving nothing | the first step's state | exact (before: 0.49 off) |
+| `perturbation_restore_*` (generated) | cubes given a `*CLOAD`, a pressure, a prescribed displacement and a temperature, a `*FREQUENCY` (or `*STEP, PERTURBATION` + `*BUCKLE`) step changing them all (or, after a `*FREQUENCY` step, a `*MODAL DYNAMIC` one changing the loads), then a static step giving nothing | the first step's state; each cube's corner must move | exact (before: 0.49 off) |
 | `modal_own_loads` (generated) | a cube loaded statically (a `*CLOAD`, a pressure, gravity, a traction), then `*FREQUENCY` and a `*MODAL DYNAMIC` step with loads of its own | the same deck without the static loads | exact (before: 0.013 off) |
-| `perturbation_restore_*` (generated) | cubes given a `*CLOAD`, a pressure, a prescribed displacement and a temperature, a `*FREQUENCY` (or `*STEP, PERTURBATION` + `*BUCKLE`) step changing them all, then a static step giving nothing | the first step's state | exact (before: 0.49 off) |
 | `buckle_gravity_preload` (generated) | a `C3D8` column under gravity in a static step, then a `*BUCKLE` step loaded at its top (`*STEP, PERTURBATION` and a plain `*STEP`) | the same gravity as nodal forces (exact on bricks) | exact (ccx aborted after the buckle step; the plain step ignored the preload) |
 | `buckle_self_weight_then_static` (generated) | the column buckling under its weight and a top load, then a static step pulling its top sideways | the buckle step alone; the static step alone | exact (ccx aborted after the static step) |
-| `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
+| `composite_shell`, `assembly_two_blocks` | accepted and solved; a node moves | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`
 
