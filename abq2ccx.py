@@ -3740,6 +3740,9 @@ class Converter:
         self._out_ctl_step = 0                     # last step whose first output card is out
         self._out_tp_cards: List[str] = []         # *TIME POINTS to emit before the first *STEP
         self._out_contact = {"abaqus": False, "pairs": 0, "nts": False, "flat": False, "axi": False}
+        self._courant: Optional[Tuple[float, int]] = None   # (min h f / c, element), _courant_min
+        self._amp_span: Optional[Tuple[float, float]] = None    # (_plan_amplitude_spans)
+        self._si_missing_behavior: set = set()        # (_plan_surface_behavior)
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
@@ -10747,7 +10750,35 @@ class Converter:
             "flat": not frd3d and any(c.startswith(PLANE_ELEM_PREFIXES + ("M3D",))
                                       for c in types.values()),
             "axi": any(c.startswith("CAX") for c in types.values())}
-        self._courant = None                    # (min h f / c, element), see _courant_min
+        steps = self._step_output_requests(blocks, quiet)
+        self._contact_requests_checked(steps)
+        self._join_frd_sets(steps)
+        visible = self._plan_out2d(steps, frd3d, solid_nodes, flat_nodes)
+        # the nodes of quadratic membranes written as solids are in no ccx element: a request
+        # for the whole model prints them (.dat) too
+        hidden = sorted({n for e in self._qmem for n in self.geom.elements[e][1]} - visible)
+        self._qmem_hidden = None
+        if hidden:
+            self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
+            self.geom.nsets[self._qmem_hidden] = hidden
+        for k, timing, reqs in steps:
+            self._out_ctl[k] = self._step_output_control(k, timing, reqs)
+            for r in reqs:
+                # the cards are written where their anchor stands: the output card itself, the
+                # *OUTPUT of a preselected request, or the *STEP of Abaqus' default output
+                p = self._out_plan.setdefault(id(r.get("anchor", r["b"])), {
+                    "cc": r["cc"], "src": r["b"], "cards": [], "notes": [], "warnings": [],
+                    "out2d": False})
+                p["cards"] += self._request_cards(r, visible)
+                p["notes"] += r["notes"]
+                p["warnings"] += r["warnings"]
+                p["out2d"] = p["out2d"] or r.get("out2d", False)
+
+    def _step_output_requests(self, blocks: List[Block], quiet: "Report"
+                              ) -> List[Tuple[int, dict, List[dict]]]:
+        """The output requests of each step: (step number, its timing, the requests),
+        those Abaqus carries over into a step that makes none of its own included; the
+        output cards that are dropped get their plan here."""
         steps: List[Tuple[int, dict, List[dict]]] = []
         # The field output requests Abaqus keeps for a later step without requests of its
         # own, per kind of step (general, linear perturbation): None while there are none
@@ -10817,9 +10848,12 @@ class Converter:
                 carried[pert] = (held if held is not None else [("DEFAULT", None)]) + own
             prev_pert = pert
             steps.append((k, timing, reqs))
-        self._contact_requests_checked(steps)
-        # one .frd node set per variable and step: the whole model before a set, several
-        # sets joined into one
+        return steps
+
+    def _join_frd_sets(self, steps: List[Tuple[int, dict, List[dict]]]) -> None:
+        """The .frd node sets of each step's *NODE FILE requests (``frd_sets``): one node
+        set per variable and step, as a ccx .frd keeps it — the whole model before a set,
+        several sets joined into one."""
         unions: Dict[Tuple[str, ...], str] = {}
         for k, timing, reqs in steps:
             node_files = [r for r in reqs if r["live"] and r["cc"] == "NODE FILE"]
@@ -10859,8 +10893,12 @@ class Converter:
                         done.add((lab, s))
                         groups.setdefault(s, []).append(lab)
                 r["frd_sets"] = list(groups.items())
-        # OUTPUT=2D when the beam/shell nodes of a .frd set would be missing from the .frd
-        # and every .frd request of the deck is one OUTPUT=2D keeps exact
+
+    def _plan_out2d(self, steps: List[Tuple[int, dict, List[dict]]], frd3d: bool,
+                    solid_nodes: set, flat_nodes: set) -> set:
+        """OUTPUT=2D on the first *NODE FILE when the beam / shell nodes of a .frd set would
+        be missing from the .frd and every .frd request of the deck is one OUTPUT=2D keeps
+        exact; returns the nodes the .frd shows."""
         stated = next((v.strip().upper() for _k, _t, reqs in steps[:1] for r in reqs
                        for v in [r["b"].param("OUTPUT")] if r["frd"] and v), None)
         frd_reqs = [r for _k, _t, reqs in steps for r in reqs if r["live"] and r["frd"]]
@@ -10884,25 +10922,7 @@ class Converter:
                 "them — exact for U, V and RF, the only .frd variables the deck requests.")
         two_d = stated == "2D" or (stated is None and (not frd3d or out2d))
         visible = solid_nodes | (flat_nodes if two_d else set())
-        # the nodes of quadratic membranes written as solids are in no ccx element: a request
-        # for the whole model prints them (.dat) too
-        hidden = sorted({n for e in self._qmem for n in self.geom.elements[e][1]} - visible)
-        self._qmem_hidden = None
-        if hidden:
-            self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
-            self.geom.nsets[self._qmem_hidden] = hidden
-        for k, timing, reqs in steps:
-            self._out_ctl[k] = self._step_output_control(k, timing, reqs)
-            for r in reqs:
-                # the cards are written where their anchor stands: the output card itself, the
-                # *OUTPUT of a preselected request, or the *STEP of Abaqus' default output
-                p = self._out_plan.setdefault(id(r.get("anchor", r["b"])), {
-                    "cc": r["cc"], "src": r["b"], "cards": [], "notes": [], "warnings": [],
-                    "out2d": False})
-                p["cards"] += self._request_cards(r, visible)
-                p["notes"] += r["notes"]
-                p["warnings"] += r["warnings"]
-                p["out2d"] = p["out2d"] or r.get("out2d", False)
+        return visible
 
     def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
         """One output card of a step: where it goes, its labels and the output control it
@@ -12266,7 +12286,7 @@ class Converter:
         """The longest step time and the total time of the deck's steps, over which
         _sample_amplitude tabulates an analytic amplitude (None if a step's time period is
         unknown)."""
-        self._amp_span: Optional[Tuple[float, float]] = None
+        self._amp_span = None
         longest = total = 0.0
         nlgeom = False
         for group in step_groups(blocks)[1]:
@@ -12287,7 +12307,7 @@ class Converter:
         deviation of the straight lines from the curve.  None if the curve or the span is
         unknown."""
         curve = amplitude_curve(b)
-        span = getattr(self, "_amp_span", None)
+        span = self._amp_span
         if curve is None or span is None or not curve.panel > 0.0:
             return None
         end = span[1] if curve.total else span[0]
@@ -13263,7 +13283,7 @@ class Converter:
                                  "here; Abaqus ignores the line in 3-D).", once=True)
         out = [emit_keyword("SURFACE INTERACTION", b.params)]
         name = (b.param("NAME") or "").upper()
-        if name and name in getattr(self, "_si_missing_behavior", set()):
+        if name and name in self._si_missing_behavior:
             self.report.note(f"*SURFACE INTERACTION {name} has no *SURFACE BEHAVIOR; added "
                              f"PRESSURE-OVERCLOSURE=HARD (the Abaqus default) so *CONTACT PAIR "
                              f"does not fail.", once=True)
@@ -13494,17 +13514,7 @@ class Converter:
         self._plan_rigid_contact_increment(blocks)
         self._complete_temperature_ic()         # after every planner that adds knot nodes
         self._plan_output(blocks)               # last: it reads the final mesh (knot beams too)
-        # interactions with no *SURFACE BEHAVIOR (Abaqus default = hard contact; ccx
-        # errors without the card) — handle_surface_interaction synthesizes HARD for these
-        self._si_missing_behavior = set()
-        cur_si = None
-        for blk in blocks:
-            if blk.keyword == "SURFACE INTERACTION":
-                cur_si = (blk.param("NAME") or "").upper()
-                if cur_si:
-                    self._si_missing_behavior.add(cur_si)
-            elif blk.keyword == "SURFACE BEHAVIOR" and cur_si:
-                self._si_missing_behavior.discard(cur_si)
+        self._plan_surface_behavior(blocks)
         out: List[str] = []
         for b in blocks:
             if b.keyword == "HEADING":
@@ -13532,6 +13542,20 @@ class Converter:
                              + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
                              "own solution (see the warnings above).")
         return out
+
+    def _plan_surface_behavior(self, blocks: List[Block]) -> None:
+        """The interactions with no *SURFACE BEHAVIOR (``_si_missing_behavior``): Abaqus'
+        default is hard contact, ccx errors without the card, so handle_surface_interaction
+        writes HARD for them."""
+        self._si_missing_behavior = set()
+        cur_si = None
+        for blk in blocks:
+            if blk.keyword == "SURFACE INTERACTION":
+                cur_si = (blk.param("NAME") or "").upper()
+                if cur_si:
+                    self._si_missing_behavior.add(cur_si)
+            elif blk.keyword == "SURFACE BEHAVIOR" and cur_si:
+                self._si_missing_behavior.discard(cur_si)
 
     def _plan_deck_facts(self, blocks: List[Block]) -> None:
         """Facts about the whole deck that planners and handlers read: whether a step runs
