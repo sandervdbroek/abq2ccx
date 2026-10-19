@@ -5060,6 +5060,12 @@ def test_connector_hinge_between_reference_points():
         [f"{r3},{k},1,{r1},{k},-1" for k in (1, 2)]
     assert "CONN3D2" not in body and "ELSET=H" not in body and "undefined" not in rep.text()
     assert "Connector elements -> ccx constraints" in rep.text()
+    # the axes of a distribution orientation are per element: none to take (were global x)
+    dist = RP2.replace("*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n",
+                       "*Distribution, name=AXD\n, 0., 0., 1., 1., 0., 0.\n*Orientation, name=AX\nAXD\n")
+    body, conv, rep = convert_str(dist)
+    assert not _equations(body) and conv.reduced_physics == ["*CONNECTOR SECTION"]
+    assert "connector (its *ORIENTATION) are missing or not rectangular" in rep.text()
     # an oblique axis and an offset joint: rows over three rotation components, and node b
     # keeps its offset d in node a's turning system (u_3 - u_1 - theta_1 x d = 0)
     oblique = RP2.replace("3, 0.,0.,0.", "3, 0.,0.,2.").replace("0., 0., 1., 1., 0., 0.",
@@ -7331,6 +7337,12 @@ def test_rotary_inertia_on_a_rigid_body_becomes_point_masses():
                                    "1., 1., 1.\n*STEP\n*FREQUENCY\n2\n*END STEP\n")
     assert "ROTARYI" not in body.split("** ===")[-1] and f"*MATERIAL, NAME={A.RIGID_SET}" in body
     assert "*MASS, ELSET=ABQ2CCX_STAR" in body
+    # a distribution orientation has no axes to take (they were the global ones): refused
+    _, conv, rep = convert_str(deck.replace("*ROTARY INERTIA, ELSET=PI\n", "*Distribution, name=OD\n"
+                                            ", 0., 0., 1., 1., 0., 0.\n*Orientation, name=O\nOD\n"
+                                            "*ROTARY INERTIA, ELSET=PI, ORIENTATION=O\n"))
+    assert "an orientation without fixed rectangular axes: not converted" in rep.text()
+    assert "*ROTARY INERTIA" in conv.reduced_physics
 
 
 def test_tie_to_a_rigid_surface_makes_the_slave_nodes_members():

@@ -6039,7 +6039,7 @@ class Converter:
             elif kw in ("SOLID SECTION", "COHESIVE SECTION", "GASKET SECTION"):
                 if ori in self._dist_ori:
                     self._dist_ori[ori]["solid"].update(self._existing(elset))
-            elif ori in self._dist_ori:
+            elif ori in self._dist_ori and kw != "ROTARY INERTIA":   # (no ccx card: _rotary_axes)
                 self._dist_ori[ori]["other"] = True    # names it in the ccx deck
                 self.report.warn(f"*{kw}, ORIENTATION={ori}: a *DISTRIBUTION orientation gives "
                                  f"per-element axes to sections only; ccx gives this card the "
@@ -14534,9 +14534,9 @@ class Converter:
                     self.report.note("*ROTARY INERTIA products of inertia (I12, I13, I23) read as "
                                      "the inertia tensor's off-diagonal components.", once=True)
             if not ok:
-                self.report.warn("*ROTARY INERTIA with an unreadable value or an orientation that "
-                                 "is not rectangular: not converted (ccx has no ROTARYI element).",
-                                 once=True)
+                self.report.warn("*ROTARY INERTIA with an unreadable value or an orientation "
+                                 "without fixed rectangular axes: not converted (ccx has no "
+                                 "ROTARYI element).", once=True)
                 continue
             if axisym:
                 if inertial and not self._approx:
@@ -14644,12 +14644,14 @@ class Converter:
 
     def _rotary_axes(self, card: Block) -> Optional[List[Vec]]:
         """The axes (rows) a *ROTARY INERTIA's values refer to: global, or a rectangular
-        *ORIENTATION's (x along a, y towards b, z = x cross y); None for any other system."""
+        *ORIENTATION's (x along a, y towards b, z = x cross y); None for any other system and
+        where the orientation's axes are not known (_orient_axes)."""
         name = (card.param("ORIENTATION") or "").strip().upper()
         if not name:
             return [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
         o = self.orientations.get(name)
-        if not o or not o[2].upper().startswith("RECT") or self._orient_rotation.get(name):
+        if not o or not o[2].upper().startswith("RECT") or self._orient_rotation.get(name) or \
+                name not in self._orient_axes:
             return None
         e1 = vunit(o[0])
         e2 = vunit(vsub(o[1], vscale(e1, vdot(o[1], e1))))
@@ -17228,10 +17230,11 @@ class Converter:
     # -- connector elements (CONN3D2 / CONN2D2) ------------------------------------
     def _conn_axes(self, name: str) -> Optional[Tuple[Vec, Vec, Vec]]:
         """Unit local directions (e1, e2, e3) of the rectangular *ORIENTATION ``name``, its
-        additional rotation applied, or None."""
+        additional rotation applied, or None (also where its axes are not known: a
+        distribution's, say, _orient_axes)."""
         key = name.strip().strip('"').upper()
         hit = next((k for k in self.orientations if k.strip('"') == key), None)
-        if hit is None:
+        if hit is None or hit not in self._orient_axes:
             return None
         a, bvec, system = self.orientations[hit]
         e1, e3 = vunit(a), vunit(vcross(a, bvec))
