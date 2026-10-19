@@ -3851,6 +3851,10 @@ class Converter:
         self._restore_pairs: Dict[int, set] = {}    # ... -> the base state's (node, DOF) BCs
         self._restore_procs: Dict[int, set] = {}    # ... -> the perturbation procedures before
         self._restore_yields = False                # a material yields or creeps
+        # *MODAL DYNAMIC steps ccx starts from a deformed or moving model -> the step whose
+        # end state that is, and those of them that keep the earlier loads (_plan_modal_starts)
+        self._modal_moving: Dict[int, int] = {}
+        self._modal_held: set = set()
         # the converted-load bookkeeping before the current run of perturbation steps:
         # (_nodal_loads, _nodal_emitted, _dl_state)
         self._load_base: tuple = (OrderedDict(), {}, {})
@@ -7519,6 +7523,18 @@ class Converter:
                                  once=True)
                 self._reduces("*DYNAMIC step after a *BUCKLE / *MODAL DYNAMIC step (ccx starts it "
                               "from that step's displacements)")
+        if self._step_idx in self._modal_moving:
+            held = self._step_idx in self._modal_held
+            self.report.warn(f"*MODAL DYNAMIC step {self._step_idx}: ccx 2.23 starts it from the "
+                             f"displacements and velocities at the end of step "
+                             f"{self._modal_moving[self._step_idx]}, which Abaqus does not carry "
+                             f"into it (CONTINUE=YES continues only a modal dynamic or static "
+                             f"perturbation step right before it); ccx starts from rest right "
+                             f"after a *FREQUENCY step (probed)."
+                             + (" That step's loads stay on, so the state it reached stays in "
+                                "the results (a static step's as a constant offset)." if held
+                                else ""), once=True)
+            self._reduces("*MODAL DYNAMIC step started from a deformed or moving model")
         nl = params.get("NLGEOM", "")
         # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
         self._step_nlgeom = self._step_nlgeom or \
@@ -7535,11 +7551,16 @@ class Converter:
         if pert and self._step_idx - 1 not in self._pert_idx:
             self._load_base = (self._nodal_loads, dict(self._nodal_emitted), self._dl_state)
         if pert:
-            self._nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in self._load_base[0].items())
-            self._dl_state = {o: OrderedDict(st) for o, st in self._load_base[2].items()}
-            if "PERTURBATION" in params or proc in ("BUCKLE", "STEADY STATE DYNAMICS"):
+            # (a *MODAL DYNAMIC step that keeps the loads ccx holds goes on from them)
+            held = self._step_idx in self._modal_held
+            start = (self._nodal_loads, self._dl_state) if held else (self._load_base[0], self._load_base[2])
+            self._nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in start[0].items())
+            self._dl_state = {o: OrderedDict(st) for o, st in start[1].items()}
+            if "PERTURBATION" in params or proc in ("BUCKLE", "STEADY STATE DYNAMICS") or \
+                    (proc == "MODAL DYNAMIC" and not held):
                 # ccx drops the earlier *CLOADs at the start of such a step (*BUCKLE and SSD the
-                # *DLOADs too; probed): its loads are its own, given in full
+                # *DLOADs too; probed), a *MODAL DYNAMIC step both through the OP=NEW cards
+                # _modal_own_loads gives it: its loads are its own, given in full
                 self._nodal_loads, self._nodal_emitted = OrderedDict(), {}
                 if proc != "FREQUENCY":
                     self._dl_state = {}
@@ -13626,6 +13647,7 @@ class Converter:
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
         self._plan_base_restore(blocks)         # after _plan_load_cases (its dropped BCs)
         self._plan_late_op_new(blocks)          # after _plan_load_cases
+        self._plan_modal_starts(blocks)
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
@@ -13655,6 +13677,7 @@ class Converter:
         out.extend(self.emit_other(blocks))
         out = self._settle_dependents(out)
         out = self._restore_base_states(out)
+        out = self._modal_own_loads(out)        # after the loads the restore gives back
         self._audit_loads(blocks, out)
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
@@ -15031,10 +15054,71 @@ class Converter:
     # GRAV on a set, then on its element in a later step, adds up; a face load is replaced)
     _BODY_LOADS = ("GRAV", "CENTRIF", "NEWTON")
     # the procedures after which ccx 2.23 has dropped what a card gave before (probed; a
-    # *STEP, PERTURBATION does it for *CLOAD and *TEMPERATURE too)
-    _RESETS = {"CLOAD": ("BUCKLE", "STEADY STATE DYNAMICS"),
-               "DLOAD": ("BUCKLE", "STEADY STATE DYNAMICS"),
+    # *STEP, PERTURBATION does it for *CLOAD and *TEMPERATURE too; *MODAL DYNAMIC: the
+    # loads, through _modal_own_loads' OP=NEW, unless it keeps them)
+    _RESETS = {"CLOAD": ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"),
+               "DLOAD": ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"),
                "TEMPERATURE": ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC")}
+
+    def _modal_own_loads(self, out: List[str]) -> List[str]:
+        """Give each *MODAL DYNAMIC step its own loads only, as Abaqus does in a linear
+        perturbation step.  ccx 2.23 applies every *CLOAD and *DLOAD (pressures, GRAV, CENTRIF)
+        it holds from earlier steps in a modal dynamic step, on top of the step's own (probed);
+        temperatures, initial stresses and the BC values a *FREQUENCY step zeroed do not act
+        there.  So a bare *CLOAD / *DLOAD, OP=NEW opens the step's cards of that type where
+        earlier steps gave such loads (ccx reads the .eig file as before), except in a step
+        that keeps them (_plan_modal_starts).  handle_step writes the step's converted nodal
+        forces in full; the next general step gets the base state back (_restore_base_states,
+        which runs first: the loads it gives back count)."""
+        held = {"CLOAD": False, "DLOAD": False}     # ccx holds such loads from earlier steps
+        insert: Dict[int, List[str]] = {}           # line -> the cards written before it
+        step: Optional[dict] = None
+        card, n = "", 0
+        for i, raw in enumerate(out):
+            s = raw.strip()
+            if not s or s.startswith("**"):
+                continue
+            if not s.startswith("*"):
+                if step is not None and card in held:
+                    step["data"].add(card)
+                elif step is not None and card == step["proc"]:
+                    step["at"] = i + 1              # (after the procedure's data lines)
+                continue
+            card, params = parse_keyword_line(s)
+            if card == "STEP":
+                n += 1
+                step = {"proc": None, "at": None, "first": {}, "data": set()}
+            elif step is None:
+                continue
+            elif card in PROC_KW and step["proc"] is None:
+                step["proc"], step["at"] = card, i + 1
+            elif card in held and card not in step["first"]:
+                step["first"][card] = (i, (params.get("OP") or "").strip().upper() == "NEW")
+            elif card == "END STEP":
+                if step["proc"] == "MODAL DYNAMIC" and n not in self._modal_held:
+                    for kw in held:
+                        first = step["first"].get(kw)
+                        if held[kw] and not (first and first[1]):
+                            at = min(step["at"], first[0]) if first else step["at"]
+                            insert.setdefault(at, ["** abq2ccx: a modal dynamic step's loads are "
+                                                   "its own (ccx 2.23 would apply the earlier "
+                                                   "steps' here too)"]).append(f"*{kw}, OP=NEW")
+                            step["first"][kw] = (at, True)
+                for kw in held:
+                    first = step["first"].get(kw)
+                    held[kw] = kw in step["data"] or (held[kw] and not (first and first[1]))
+                step = None
+        if not insert:
+            return out
+        self.report.note("*MODAL DYNAMIC: *CLOAD / *DLOAD, OP=NEW written at the start of the step: "
+                         "Abaqus applies only the loads a linear perturbation step gives itself, ccx "
+                         "2.23 the earlier steps' too (probed). A general step after it gets them "
+                         "back.", once=True)
+        res: List[str] = []
+        for i, raw in enumerate(out):
+            res.extend(insert.get(i, []))
+            res.append(raw)
+        return res
 
     def _restore_base_states(self, out: List[str]) -> List[str]:
         """Start each general step after Abaqus linear perturbation steps (_plan_base_restore)
@@ -15310,7 +15394,8 @@ class Converter:
             # loads and temperatures the step gives again after a step that dropped them start
             # from 0 / the initial temperature in ccx, from the base state in Abaqus
             reset = {kw for kw in regiven for k in between
-                     if procs.get(k) in self._RESETS[kw] or
+                     if (procs.get(k) in self._RESETS[kw] and
+                         (kw == "TEMPERATURE" or k not in self._modal_held)) or
                      (kw != "DLOAD" and k in heads and heads[k].has("PERTURBATION"))}
             if reset and procs.get(s) == "STATIC":
                 what = " and ".join(f"*{kw}" for kw in self._RESTORED if kw in reset)
@@ -21267,6 +21352,52 @@ class Converter:
                         self._restore_new.add(s)
             state = pairs if new else state | pairs
             last, since, held = s, set(), set()
+
+    # what loads a ccx modal dynamic step (step_load_audit's descriptions; temperatures and
+    # initial stresses do not act there, probed)
+    _MODAL_LOADS = ("*CLOAD", "*DLOAD", "*DSLOAD", "*BOUNDARY", "*BASE MOTION")
+
+    def _plan_modal_starts(self, blocks: List[Block]) -> None:
+        """The *MODAL DYNAMIC steps ccx 2.23 starts from a deformed or moving model, which
+        Abaqus does not carry into the step (``_modal_moving``: step -> the step whose end
+        state it starts from): CONTINUE=YES continues only the modal dynamic or static
+        perturbation step right before.  ccx starts one from rest right after a *FREQUENCY or
+        *BUCKLE step, else from what it holds: the end state of the step before, after
+        steady-state dynamics the last general step's (probed).  A general step leaves the
+        model deformed where it is loaded (step_load_audit), a modal dynamic step moving where
+        it has loads that act there or started so.  Right after a general step, the loads ccx
+        holds stay on in the modal step (``_modal_held``, no OP=NEW): they hold the model in
+        that step's state, which a static step's results then carry as a constant offset,
+        where without them it would vibrate about the undeformed one."""
+        self._modal_moving, self._modal_held = {}, set()
+        groups = step_groups(blocks)[1]
+        procs = [next((b.keyword for b in g[1:] if b.keyword in PROC_KW), "") for g in groups]
+        if "MODAL DYNAMIC" not in procs:
+            return
+        audit = step_load_audit(blocks, user_loads=True, abaqus=True)
+        state = base = None                     # the step whose end state ccx holds, if not rest
+        general = False                         # the step before is a general one in ccx
+        for s, (group, proc) in enumerate(zip(groups, procs), 1):
+            loads = (audit[s - 1] if s <= len(audit) else None) or []
+            if proc == "MODAL DYNAMIC":
+                prev = procs[s - 2] if s > 1 else ""
+                card = next(b for b in group[1:] if b.keyword == proc)
+                if state is not None and not (card.uparam("CONTINUE") == "YES" and (
+                        prev == proc or (prev == "STATIC" and s - 1 in self._pert_idx))):
+                    self._modal_moving[s] = state
+                    if general:
+                        self._modal_held.add(s)
+                moving = any(d.startswith(self._MODAL_LOADS) for d in loads)
+                state, general = s if state is not None or moving else None, False
+            elif proc in ("FREQUENCY", "BUCKLE"):
+                state, general = None, False
+            elif proc == "STEADY STATE DYNAMICS":
+                state, general = base, False
+            elif proc in self._PERTURBATION_PROCS or proc == "HEAT TRANSFER":
+                general = False
+            else:                                   # (a static perturbation step: general in ccx)
+                state = base = s if loads or (s in self._pert_idx and base is not None) else None
+                general = True
 
     def _plan_op_new_rotations(self, blocks: List[Block]) -> None:
         """ccx 2.23 does not rebuild rotational BCs on shell/beam nodes after a later step's

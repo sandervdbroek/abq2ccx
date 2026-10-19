@@ -2154,8 +2154,9 @@ def perturbation_restore_deck(pert=None):
     """Four unit C3D8 cubes side by side (E 1000, nu 0, alpha 1e-3), each held statically at
     three corners.  A static step gives one cube each a *CLOAD, a face pressure, a prescribed
     displacement and temperature 100; the linear perturbation step ``pert`` (left out when
-    None) changes all four, adds a load and a pressure and holds a free DOF; a last static
-    step gives nothing, so it must end where the first one did."""
+    None) changes all four, adds a load and a pressure and holds a free DOF ("modal": a
+    *FREQUENCY step, then a *MODAL DYNAMIC step changing the loads); a last static step gives
+    nothing, so it must end where the first one did."""
     nodes = [f"{10 * k + i + 1}, {3.0 * k + x}, {float(y)}, {float(z)}" for k in range(4)
              for i, (x, y, z) in enumerate(((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
                                             (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)))]
@@ -2164,7 +2165,10 @@ def perturbation_restore_deck(pert=None):
     change = ["*CLOAD", "7, 1, 3.", "7, 2, 1.", "*DLOAD", "2, P2, 3.", "2, P4, 1.", "*BOUNDARY",
               "27, 2, 2, 0.3", "27, 1, 1, 0.5"]
     steps = {"freq": ["*STEP", "*FREQUENCY", "3"] + change + ["*TEMPERATURE", "TE, 300."],
-             "buckle": ["*STEP, PERTURBATION", "*BUCKLE", "2"] + change}   # (no *TEMPERATURE there)
+             "buckle": ["*STEP, PERTURBATION", "*BUCKLE", "2"] + change,   # (no *TEMPERATURE there)
+             # (Abaqus takes no BC or temperature in a modal dynamic step)
+             "modal": ["*STEP", "*FREQUENCY", "3", "*END STEP", "*STEP", "*MODAL DYNAMIC",
+                       "0.001, 0.003"] + change[:6]}
     return "\n".join(
         ["*NODE, NSET=ALLN"] + nodes + ["*ELEMENT, TYPE=C3D8, ELSET=EALL"] + elems +
         ["*NSET, NSET=TE, GENERATE", "31, 38", "*NSET, NSET=TIPS", "7, 17, 27, 37",
@@ -2175,6 +2179,28 @@ def perturbation_restore_deck(pert=None):
          "27, 2, 2, 0.1", "*TEMPERATURE", "TE, 100.", "*END STEP"] +
         (steps[pert] + ["*END STEP"] if pert else []) +
         ["*STEP", "*STATIC", "*NODE PRINT, NSET=TIPS", "U", "*END STEP"]) + "\n"
+
+
+def modal_own_loads_deck(base=True):
+    """A unit C3D8 cube (E 1000, nu 0, rho 1e-3) held statically at three corners: a static
+    step loads it (``base``: a *CLOAD, a face pressure, gravity and a traction, which becomes
+    nodal forces), a *FREQUENCY step follows, then a *MODAL DYNAMIC step with a *CLOAD and a
+    traction of its own.  Abaqus applies a modal dynamic step's own loads only, so its
+    response must not depend on ``base``."""
+    nodes = [f"{i + 1}, {float(x)}, {float(y)}, {float(z)}" for i, (x, y, z) in enumerate(
+        ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)))]
+    loads = ["*CLOAD", "6, 2, 1.", "*DLOAD", "1, P2, 1.", "EALL, GRAV, 1000., 1., 0., 0.",
+             "*DSLOAD", "SIDE, TRVEC, 1., 0., 0., 1."] if base else []
+    return "\n".join(
+        ["*NODE"] + nodes + ["*ELEMENT, TYPE=C3D8, ELSET=EALL", "1, 1, 2, 3, 4, 5, 6, 7, 8",
+                             "*NSET, NSET=N7", "7", "*SURFACE, NAME=TOP", "EALL, S2",
+                             "*SURFACE, NAME=SIDE", "EALL, S4", "*MATERIAL, NAME=M", "*ELASTIC",
+                             "1000., 0.", "*DENSITY", "1.E-3", "*SOLID SECTION, ELSET=EALL, MATERIAL=M",
+                             "*BOUNDARY", "1, 1, 3", "2, 2, 3", "4, 3, 3", "*STEP", "*STATIC"] +
+        loads + ["*END STEP", "*STEP", "*FREQUENCY", "10", "*END STEP", "*STEP", "*MODAL DYNAMIC",
+                 "0.001, 0.003", "*CLOAD", "7, 2, 1.", "*DSLOAD", "TOP, TRVEC, 1., 1., 0., 0.",
+                 "*OUTPUT, FIELD, FREQUENCY=1", "*NODE OUTPUT", "U", "*NODE PRINT, NSET=N7", "U",
+                 "*END STEP"]) + "\n"
 
 
 def main():
@@ -4923,7 +4949,9 @@ def main():
     # a static step after a linear perturbation step (ccx 2.23 carried the perturbation step's
     # loads and BCs on, and dropped or zeroed the earlier ones): the first step's state again
     ref = review_run(perturbation_restore_deck(), "perturbation_restore_ref", dat_displacements)
-    for pert, what in (("freq", "*FREQUENCY"), ("buckle", "*STEP, PERTURBATION + *BUCKLE")):
+    for pert, what in (("freq", "a *FREQUENCY step changing them all"),
+                       ("buckle", "a *STEP, PERTURBATION + *BUCKLE step changing them all"),
+                       ("modal", "a *FREQUENCY step and a *MODAL DYNAMIC step changing the loads")):
         u = review_run(perturbation_restore_deck(pert), "perturbation_restore_" + pert, dat_displacements)
         ok = bool(u and ref)
         if ok:
@@ -4931,10 +4959,25 @@ def main():
                       for a, b in zip(u.get(n, [math.inf] * 3), ref.get(n, [math.nan] * 3)))
             ok = err < 1e-9
             print(f"{'PASS' if ok else 'FAIL'}  perturbation_restore_{pert} (four cubes given a "
-                  f"*CLOAD, a pressure, a prescribed displacement and a temperature, a {what} step "
-                  f"changing them all, then a static step giving nothing): the last step's "
+                  f"*CLOAD, a pressure, a prescribed displacement and a temperature, {what}, then "
+                  f"a static step giving nothing): the last step's "
                   f"displacements are the first step's ({err:.1e} apart)")
         failures += 0 if ok else 1
+    # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
+    # it too): the response to its own loads alone
+    runs = [review_run(modal_own_loads_deck(b), "modal_own_loads" + ("" if b else "_ref"),
+                       dat_node_blocks) for b in (True, False)]
+    ok = all(runs) and min(len(r) for r in runs) >= 3
+    if ok:
+        got, want = [[blk.get(7, [math.nan] * 3) for blk in r[:3]] for r in runs]
+        err = max(abs(a - b) for g, w in zip(got, want) for a, b in zip(g, w))
+        moved = max(abs(x) for x in want[0])
+        ok = err < 1e-12 and moved > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  modal_own_loads (a cube loaded statically by a *CLOAD, a "
+              f"pressure, gravity and a traction, then *FREQUENCY and a *MODAL DYNAMIC step with a "
+              f"*CLOAD and a traction of its own): its response is the one without the static "
+              f"loads ({err:.1e} apart; the corner moved {moved:.3g} in the first increment)")
+    failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

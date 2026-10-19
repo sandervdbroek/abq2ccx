@@ -16,6 +16,15 @@ physics.
   `*BOUNDARY` only; the converter's step walkers (load audit, results digest, velocity BCs,
   constraint and connector checks) took it on any card. An `OP=NEW` on a later card only,
   which Abaqus does not allow, is dropped and warned.
+* **Loads in `*MODAL DYNAMIC` steps** — a modal dynamic step applies only its own loads, as
+  Abaqus does in a linear perturbation step. ccx 2.23 applied the earlier steps' `*CLOAD` and
+  `*DLOAD` (pressures, gravity, centrifugal loads) there too (a statically preloaded cube: 0.013
+  off a response of 0.016). The step now opens with `*CLOAD` / `*DLOAD, OP=NEW` where earlier
+  steps gave such loads, and its loads converted to nodal forces are written in full. A modal
+  dynamic step that ccx starts from a deformed or moving model, which Abaqus does not carry
+  into it, is flagged: after a loaded general step (whose loads then stay on, so a static
+  deflection stays in its results as an offset) or a moving modal dynamic step without
+  `CONTINUE=YES`.
 
 ## 1.3.0 (October 2026)
 

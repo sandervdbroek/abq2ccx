@@ -147,8 +147,9 @@ TRANSLATED = {
         "explicit steps get `INC=10000000` + `NLGEOM`; a step whose displacement BCs get ccx's "
         "step ramp (see `*BOUNDARY`) gets `AMPLITUDE=STEP`, ccx's default there; a general step "
         "after linear perturbation steps starts with the last general step's loads, BCs, "
-        "temperatures and `NLGEOM` given again (ccx carries a perturbation step's on); `*END "
-        "STEP` ensured.",
+        "temperatures and `NLGEOM` given again (ccx carries a perturbation step's on); a "
+        "`*MODAL DYNAMIC` step's loads are its own (`*CLOAD` / `*DLOAD, OP=NEW` first where "
+        "earlier steps gave such loads, which ccx 2.23 applies there too); `*END STEP` ensured.",
     "*STATIC": "`RIKS` commented by default (ccx would silently run it as plain static; "
         "`--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
     "*DYNAMIC": "implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; "

@@ -4976,6 +4976,85 @@ def test_perturbation_step_nodal_forces_do_not_carry_over():
     assert _cloads(convert_str(buckle)[0])[1] == {(n, 1): 0.25 for n in (5, 6, 7, 8)}
 
 
+MODAL = (HEX + "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
+         "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Surface, name=S2\nEALL, S2\n*Surface, name=S4\n"
+         "EALL, S4\n*Step\n*Static\n{}*End Step\n*Step\n*Frequency\n3\n*End Step\n*Step\n*Modal Dynamic\n"
+         "0.001, 0.003\n{}*End Step\n")
+
+
+def test_modal_dynamic_step_applies_its_own_loads_only():
+    # Abaqus applies only the loads a linear perturbation step gives; ccx 2.23 applies the
+    # earlier steps' *CLOAD and *DLOAD (pressures, GRAV) in a *MODAL DYNAMIC step too (probed:
+    # it moved from rest under the static step's load).  So the step opens with OP=NEW cards
+    # (ccx still reads its .eig file), its converted nodal forces are given in full, and the
+    # general step after it gets the base state back
+    body, conv, rep = convert_str(MODAL.format("*Cload\n6, 2, 1.\n*Dload\n1, P2, 1.\n"
+                                               "EALL, GRAV, 9.81, 0., 0., -1.\n*Dsload\n"
+                                               "S4, TRVEC, 1., 0., 0., 1.\n",
+                                               "*Cload\n7, 2, 1.\n*Dsload\nS2, TRVEC, 4., 1., 0., 0.\n")
+                                  + "*Step\n*Static\n*End Step\n")
+    steps = body.split("*STEP")
+    assert steps[3].startswith("\n*MODAL DYNAMIC\n0.001, 0.003\n** abq2ccx: a modal dynamic step's "
+                               "loads are its own (ccx 2.23 would apply the earlier steps' here too)\n"
+                               "*CLOAD, OP=NEW\n*DLOAD, OP=NEW\n*CLOAD\n7, 2, 1.\n"), steps[3]
+    cl = _cloads(body)
+    assert cl[2] == {(7, 2): 1.0, **{(n, 1): 1.0 for n in (5, 6, 7, 8)}} and cl[3] == cl[0]
+    assert "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n1, P2, 1.\nEALL, GRAV" in steps[4]
+    assert "Abaqus applies only the loads a linear perturbation step gives itself" in rep.text()
+    assert not conv.reduced_physics and not conv.unloaded_steps
+    # no earlier load of a type: no card for it; the step's own first card with OP=NEW does it
+    third = convert_str(MODAL.format("*Cload\n6, 2, 1.\n", "*Cload, op=NEW\n7, 2, 1.\n"))[0].split("*STEP")[3]
+    assert "OP=NEW" in third and third.count("*CLOAD") == 1 and "*DLOAD" not in third
+    body, _, rep = convert_str(MODAL.format("", "*Cload\n7, 2, 1.\n"))
+    assert "OP=NEW" not in body and "a linear perturbation step gives itself" not in rep.text()
+    # a load the general step after it gives again ramps from 0 in ccx (step 3 dropped it)
+    _, conv, rep = convert_str(MODAL.format("*Cload\n6, 2, 1.\n", "") +
+                               "*Step\n*Static\n*Cload\n6, 2, 2.\n*End Step\n")
+    assert "[NOTE] Step 4 gives again *CLOAD values" in rep.text() and not conv.reduced_physics
+    # the loads that general step gets back count for a later modal dynamic step
+    body, _, _ = convert_str(MODAL.format("*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n", "*Cload\n7, 2, 1.\n") +
+                             "*Step\n*Static\n*End Step\n*Step\n*Frequency\n3\n*End Step\n"
+                             "*Step\n*Modal Dynamic\n0.001, 0.003\n*Cload\n7, 2, 1.\n*End Step\n")
+    assert "own (ccx 2.23 would apply the earlier steps' here too)\n*DLOAD, OP=NEW\n*CLOAD\n7, 2, 1.\n" \
+           in body.split("*STEP")[6]
+
+
+def test_modal_dynamic_step_started_moving_is_flagged():
+    # ccx 2.23 starts a *MODAL DYNAMIC step from rest only right after a *FREQUENCY (or *BUCKLE)
+    # step, else from the displacements and velocities it holds (probed); Abaqus does not carry
+    # them into the step: CONTINUE=YES continues only a modal dynamic or static perturbation
+    # step right before it
+    two = MODAL.format("*Cload\n6, 2, 1.\n", "{}") + "*Step\n*Modal Dynamic{}\n0.001, 0.003\n*End Step\n"
+    body, conv, rep = convert_str(two.format("*Cload\n7, 2, 1.\n", ""))
+    assert "*MODAL DYNAMIC step 4: ccx 2.23 starts it from the displacements and velocities at the " \
+           "end of step 3" in rep.text() and conv.reduced_physics
+    assert "*CLOAD, OP=NEW" in body.split("*STEP")[4]
+    # not when it continues, or when the step before is at rest (a temperature does not act in
+    # a modal dynamic step; nor do initial stresses)
+    for own, cont in (("*Cload\n7, 2, 1.\n", ", continue=YES"), ("", ""), ("*Temperature\nALL, 10.\n", "")):
+        _, conv, rep = convert_str(two.replace("*Material", "*Nset, nset=ALL, generate\n1, 8, 1\n"
+                                               "*Initial Conditions, type=temperature\nALL, 0.\n"
+                                               "*Initial Conditions, type=stress\n1, 1., 0., 0., 0., 0., "
+                                               "0.\n*Material").format(own, cont))
+        assert "starts it from the displacements" not in rep.text() and not conv.reduced_physics, own
+    # a loaded general step between the frequency and the modal dynamic step: its loads stay on,
+    # which hold the model in its state (without them it would vibrate about the undeformed one)
+    deck = MODAL.replace("*Step\n*Static\n{}*End Step\n*Step\n*Frequency\n3\n*End Step\n",
+                         "*Step\n*Frequency\n3\n*End Step\n*Step\n*Static\n{}*End Step\n")
+    body, conv, rep = convert_str(deck.format("*Cload\n6, 2, 1.\n*Dsload\nS4, TRVEC, 1., 0., 0., 1.\n",
+                                              "*Cload\n7, 2, 1.\n"))
+    assert "at the end of step 2" in rep.text() and "That step's loads stay on" in rep.text()
+    assert conv.reduced_physics and "OP=NEW" not in body.split("*STEP")[3]
+    assert _cloads(body)[2] == {(7, 2): 1.0}            # (the traction's forces stay as they are)
+    _, conv, rep = convert_str(deck.format("", "*Cload\n7, 2, 1.\n"))
+    assert "starts it from the displacements" not in rep.text() and not conv.reduced_physics
+    # a static perturbation step continued with CONTINUE=YES (its own load goes)
+    body, _, rep = convert_str(deck.replace("*Step\n*Static", "*Step, perturbation\n*Static")
+                               .replace("*Modal Dynamic\n", "*Modal Dynamic, continue=YES\n")
+                               .format("*Cload\n6, 2, 1.\n", ""))
+    assert "starts it from the displacements" not in rep.text() and "*CLOAD, OP=NEW" in body.split("*STEP")[3]
+
+
 def test_base_state_after_a_first_perturbation_step_beams_and_couplings():
     # a perturbation step first: the base state is the model data's
     deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
