@@ -5900,6 +5900,7 @@ def test_equation_on_rotations_of_a_transformed_node_is_commented_out():
     body, conv, rep = convert_str(beams)
     assert not _equation_terms(body) and "** *EQUATION" in body
     assert "*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (e.g. node 3)" in rep.text()
+    assert "*EQUATION on DOFs 4-6 of a node with a *TRANSFORM" in conv.reduced_physics
     # a solid node's (no rotations in Abaqus; ccx misreads DOFs 5-6 just the same)
     solid = _transformed(HEX + "*Equation\n2\n2, 5, 1., 1, 1, -1.\n" + STEP, "2", YX)
     body, _, rep = convert_str(solid)
@@ -5957,10 +5958,11 @@ def test_transformed_beam_node_rotations_in_global_components_on_a_knot():
     body, _, _ = convert_str(_tip("*Boundary\n3, ENCASTRE\n*Cload\n2, 2, 1.\n"))
     assert [l for l in _bc_lines(body) if l.startswith("3,")] == ["3,1,3", "3,4,6"]
     # two oblique local rotations held: no global form — commented out, warned
-    body, _, rep = convert_str(_tip("*Boundary\n3, 4, 5\n*Cload\n2, 2, 1.\n"))
+    body, conv, rep = convert_str(_tip("*Boundary\n3, 4, 5\n*Cload\n2, 2, 1.\n"))
     assert not [l for l in _bc_lines(body) if l.startswith("3,")]
     assert "node 3, DOFs 4-6 of this *BOUNDARY left out" in body
     assert "*BOUNDARY on DOFs 4-6 of a node with a *TRANSFORM (e.g. node 3) commented out" in rep.text()
+    assert conv.reduced_physics == ["*BOUNDARY on DOFs 4-6 of a node with a *TRANSFORM"]
     # ... unless they span global axes: a transform about z (local 3 = z)
     body, _, rep = convert_str(_tip("*Boundary\n3, 4, 5\n3, 6, 6, 0.01\n", "0.6, 0.8, 0., -0.8, 0.6, 0."))
     assert [l for l in _bc_lines(body) if l.startswith("3,")] == ["3,4,4", "3,5,5", "3,6,6,0.01"]
@@ -7230,6 +7232,11 @@ def test_analytical_segments_exact_or_approximate():
     assert "not converted" in rep.text() and "--approximate" in rep.text()
     for kw in ("*SURFACE, TYPE=SEGMENTS", "*RIGID BODY", "*CONTACT PAIR"):
         assert f"** {kw}" in body                                   # commented out, all three
+    # a *TIE's line on that surface is commented out, its other lines kept: reduced physics
+    tie = (ANALYTIC_2D + "*SURFACE, NAME=BOT\nTOPE, S1\n*SURFACE, NAME=RT\nTOPE, S2\n" +
+           curved[len(ANALYTIC_2D):].split("*SURFACE INTERACTION")[0] + "*TIE, NAME=T1\nTOP, TOOL\nBOT, RT\n")
+    body, conv, _ = convert_str(tie)
+    assert "\nBOT, RT" in body and "** TOP, TOOL" in body and "*TIE" in conv.reduced_physics
     body, _, rep = convert_str(curved, approximate=True)
     msg = [m for _, m in rep.entries if m.startswith("[APPROX] Analytical rigid surface TOOL")]
     assert msg and "degrees" in msg[0] and "chord sag" in msg[0]

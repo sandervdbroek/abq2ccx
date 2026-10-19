@@ -10193,6 +10193,7 @@ class Converter:
         self.report.warn(f"*{b.keyword} on DOFs 4-6 of a node with a *TRANSFORM (e.g. node {n}) "
                          f"commented out — the rotational {what} are missing: Abaqus reads them in "
                          f"the node's local axes, and {why}.", once=True)
+        self._reduces(f"*{b.keyword} on DOFs 4-6 of a node with a *TRANSFORM")
         return [f"** abq2ccx: node {n}, DOFs 4-6 of this *{b.keyword} left out: no exact form in "
                 f"ccx 2.23 ({why})"]
 
@@ -11877,6 +11878,7 @@ class Converter:
             self.report.n_commented += 1
             self.report.warn(msg + " Its lines are commented out; the card's other lines are kept.",
                              once=True)
+            self._reduces(f"*{b.keyword}")
             comments = ["** abq2ccx: " + msg] + ["** " + ln for ln in gone_lines]
         empty = not any(x.strip() for x in keep)
         return Block(b.keyword, b.params, keep, b.part, b.instance), comments, empty
@@ -12455,6 +12457,7 @@ class Converter:
                              f"translations with undefined coefficients, or it stops; probed), "
                              f"while Abaqus reads them in the local axes. Write the constraint "
                              f"without the rotations of transformed nodes.", once=True)
+            self._reduces("*EQUATION on DOFs 4-6 of a node with a *TRANSFORM")
             return ["** abq2ccx: *EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM "
                     "(misread by ccx 2.23) commented out"] + ["** " + x for x in out]
         if not moved:
