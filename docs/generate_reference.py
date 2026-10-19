@@ -255,6 +255,9 @@ TRANSLATED = {
         "which leave the mesh — no stiffness, no ccx element — while their loads become nodal "
         "forces; they stay (and ccx stops on them) if `*REBAR LAYER` or `DENSITY=` in a "
         "dynamic/frequency step or under gravity gives them physics, unless `--approximate`.",
+    "*COHESIVE SECTION / *GASKET SECTION": "→ `*SOLID SECTION` (`ELSET`, `MATERIAL`, "
+        "`ORIENTATION` kept): ccx has no cohesive or gasket element, so they run as thin continuum "
+        "elements without the traction-separation / closure law (reduced physics).",
     "*TIE": "Abaqus-only params (`TYPE=`) stripped; `ADJUST`/`POSITION TOLERANCE` kept. A line "
         "whose master is a rigid surface (rigid elements' skins, a meshed analytical surface) is "
         "not written: the slave nodes Abaqus ties — `TIED NSET`, or those within the position "
@@ -300,9 +303,10 @@ TRANSLATED = {
         "reference point → its `ROT NODE`'s DOFs 1-3 (ccx ignores DOFs 4-6 of the REF NODE); an "
         "equation with a term on DOFs 4-6 of any other node with a `*TRANSFORM` is commented out "
         "(ccx 2.23 misreads such terms). Each equation of a card is resolved on its own.",
-    "*KINEMATIC COUPLING": "every line kept, as node-surface `*COUPLING` + `*KINEMATIC` per DOF "
-        "range (the reference node's DOFs 4-6 then take BCs and moments natively); rotation lines "
-        "on shell/beam nodes become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`).",
+    "*KINEMATIC COUPLING": "node-surface `*COUPLING` + `*KINEMATIC` per DOF range (the reference "
+        "node's DOFs 4-6 then take BCs and moments natively); rotation lines on shell/beam nodes "
+        "become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`), on other nodes they are dropped "
+        "(reduced physics).",
     "*COUPLING / *KINEMATIC": "`REF NODE` set → node number; empty `*KINEMATIC` (Abaqus: all "
         "DOFs) → `1, 3`, which moves the nodes rigidly with the reference node's translations and "
         "rotations (`validate_with_ccx.py kinematic_all_dofs`: the same as `*RIGID BODY`); a "
@@ -409,6 +413,11 @@ TRANSLATED = {
     "*HYPERELASTIC": "no model keyword → `POLYNOMIAL` (Abaqus default); `TEST DATA INPUT` commented.",
     "*DEPVAR": "SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx; "
         "reduced physics).",
+    "*USER MATERIAL": "kept, but the Abaqus subroutine does not run in a stock ccx: a mechanical "
+        "one stops ccx ('no user material subroutine'; a name that would pick one of ccx's own "
+        "routines gets `ABQ2CCX_` in front), a thermal one runs ccx's empty `umatht` (no "
+        "conduction, no error). `--abaqus-umat` writes mechanical ones for ccx's Abaqus-UMAT "
+        "interface, for a ccx rebuilt with the deck's UMAT.",
     "*INITIAL CONDITIONS": "`TYPE=STRESS/PLASTIC STRAIN/SOLUTION` expanded per integration point "
         "(SOLUTION continuation lines joined by the `*DEPVAR` size); stresses and plastic strains "
         "turned out of an orientation's axes into the global ones ccx reads (at each integration "
@@ -689,7 +698,7 @@ def gen_keywords():
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
                "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
-               "CONNECTOR SECTION", "TRANSFORM", "DAMAGE INITIATION"}
+               "CONNECTOR SECTION", "TRANSFORM", "DAMAGE INITIATION", "USER MATERIAL"}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",

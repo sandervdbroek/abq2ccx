@@ -2403,11 +2403,6 @@ SEMANTIC_TRAP = {
 }
 # Supported by ccx but worth a heads-up about a behavioural/interface difference.
 PASS_WITH_NOTE = {
-    "USER MATERIAL": "*USER MATERIAL kept, but the Abaqus subroutine does not run in a stock ccx: "
-                     "a mechanical one stops ccx ('no user material subroutine'; a name that would "
-                     "pick one of ccx's own routines gets ABQ2CCX_ in front), a thermal one runs "
-                     "ccx's empty umatht (no conduction, no error). --abaqus-umat writes mechanical "
-                     "ones for ccx's Abaqus-UMAT interface, for a ccx rebuilt with the deck's UMAT.",
     "USER ELEMENT": "*USER ELEMENT kept; ensure the matching ccx user-element routine is built in.",
 }
 # ccx hands a mechanical *USER MATERIAL to the routine its name starts with (umat_main.f, the
@@ -2471,8 +2466,6 @@ SPECIAL_UNSUPPORTED = {
     "CONNECTOR LOAD": "loads connector components, which the converted connector (ccx "
                       "constraints, no connector element) does not have; the load is missing.",
     "GASKET BEHAVIOR": "gasket behaviour has no ccx equivalent.",
-    "COHESIVE SECTION": "ccx has no cohesive element; model debonding with contact (*SURFACE "
-                        "BEHAVIOR) or a nonlinear *SPRING.",
     "DAMAGE EVOLUTION": "ccx 2.23 added *DAMAGE INITIATION but not *DAMAGE EVOLUTION, so "
                         "progressive damage cannot fully run (the material will not soften/fail); drop.",
     "FIELD": "*FIELD predefined fields are unsupported; use *INITIAL CONDITIONS / *TEMPERATURE / "
