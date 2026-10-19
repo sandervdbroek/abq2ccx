@@ -358,13 +358,57 @@ def test_rigid_member_bcs_the_body_implies_are_left_out():
 
 
 def test_bc_steps_follow_op_new():
-    # a step keeps the BCs before it and a later value replaces an earlier one; OP=NEW
-    # in a step starts from none
-    k1, k2 = (1, 1), (2, 1)
-    steps = [dict(a) for a in A.bc_steps([[(False, k1, True)], [(False, k2, False)],
-                                          [(True, k2, True)], []])]
-    assert steps == [{k1: True, k2: False}, {k2: True}, {k2: True}]
-    assert [dict(a) for a in A.bc_steps([[(False, k1, True)]])] == [{k1: True}]
+    # a step keeps the BCs before it and a later value replaces an earlier one; OP=NEW on a
+    # step's first *BOUNDARY starts it from none (also without data lines), on a later card
+    # ccx 2.23 ignores it; a deck without steps gives its model data's BCs
+    deck = A.blocks_from_lines("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1, 0.5
+*END STEP\n*STEP\n*STATIC\n*BOUNDARY, OP=NEW\n2, 1, 1\n*BOUNDARY, OP=NEW\n3, 1, 1\n*END STEP
+*STEP\n*STATIC\n*BOUNDARY\n4, 1, 1\n*BOUNDARY, OP=NEW\n5, 1, 1\n*END STEP
+*STEP\n*STATIC\n*BOUNDARY, OP=NEW\n*END STEP""".splitlines())
+
+    def zero(b):
+        return [((int(f[0]), int(f[1])), len(f) < 4 or float(f[3]) == 0.0)
+                for f in (ln.split(",") for ln in b.data)]
+    assert [dict(a) for a in A.bc_steps(deck, zero)] == [
+        {(1, 1): True, (2, 1): False}, {(2, 1): True, (3, 1): True},
+        {(2, 1): True, (3, 1): True, (4, 1): True, (5, 1): True}, {}]
+    assert [b.data for b in deck if id(b) in A.op_new_cards(deck)] == [["2, 1, 1"], []]
+    assert [dict(a) for a in A.bc_steps(deck[:1], zero)] == [{(1, 1): True}]
+
+
+def test_op_new_on_a_later_boundary_card_only():
+    # ccx 2.23 ignores OP=NEW after a step's first *BOUNDARY (probed: TOP keeps step 1's
+    # u3 = 0.01 in step 2), and Abaqus requires it on every *BOUNDARY of the step if on any
+    steps = ("*Step\n*Static\n*Boundary{}\nTOP, 3, 3, {}\n*End Step\n"
+             "*Step\n*Static\n*Boundary\nBOT, 1, 3\n*Boundary, op=NEW\n5, 1, 1\n*End Step\n")
+    deck = VEL_HEX + steps.format("", "0.01")
+    body, _, rep = convert_str(deck)
+    # the converted deck says what ccx does: the OP=NEW goes, with a warning
+    assert "*BOUNDARY, OP=NEW" not in body and "** abq2ccx: OP=NEW dropped: ccx 2.23 ignores it " \
+        "after a step's first *BOUNDARY, which has none\n*BOUNDARY\n5, 1, 1\n" in body
+    assert "*BOUNDARY, OP=NEW in step(s) 2 on a later card but not on the step's first" in rep.text()
+    # the step walkers read it so: TOP's prescribed u3 still loads step 2, in either deck ...
+    load = ["*BOUNDARY: prescribed value on TOP"]
+    assert A.step_load_audit(A.blocks_from_lines(deck.splitlines()), True, abaqus=True)[1] == load
+    assert A.step_load_audit(A.blocks_from_lines(body.splitlines()), False)[1] == load
+    # ... the results digest of a deck that keeps the OP=NEW holds it ...
+    d = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        two = A._deck_steps(os.path.join(d, "job.inp"))["steps"][1]
+    finally:
+        shutil.rmtree(d)
+    assert two["held"][5] == {1, 3} and two["held"][6] == {3} and two["held"][1] == {1, 2, 3}
+    # ... and a velocity BC of step 1 keeps moving TOP in step 2
+    body, _, _ = convert_str(VEL_HEX + steps.format(", type=VELOCITY", "0.1"))
+    assert "of an earlier step, still in force: its motion continues" in body.split("*STEP")[2]
+    # after a linear perturbation step such a step gets the base state back, as any step
+    # without OP=NEW does (a bare OP=NEW first removed the model data's BCs as well)
+    third = convert_str(PERT.format("*Boundary\n6, 1, 1\n", "*Boundary\n8, 2, 2, 0.2\n"
+                                    "*Boundary, op=NEW\n5, 1, 1\n"))[0].split("*STEP")[3]
+    assert "*BOUNDARY, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n1, 1, 3\n2, 2, 3\n4, 3, 3\n" in third
+    assert "OP=NEW dropped" in third and "*BOUNDARY, OP=NEW\n" not in third
 
 
 def test_rotation_tie_on_a_member_bc_makes_the_body_dependent():

@@ -57,7 +57,8 @@ Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANS
                        (_plan_velocity_bcs), …; then _plan_load_cases() (a *BUCKLE step's
                        LOAD CASE=2 BCs), _plan_distributions(),
                        _plan_planar_constraint(), _plan_circ_rotation_knots(),
-                       _plan_op_new_rotations() and _plan_transformed_rotations()
+                       _plan_late_op_new(), _plan_op_new_rotations() and
+                       _plan_transformed_rotations()
                        (rotational BCs / moments of transformed shell/beam and
                        kinematic reference nodes: kept, knot + global components, or
                        refused, per card); last
@@ -167,6 +168,9 @@ prescribed BC values persist until `OP=NEW`, a perturbation step counts only its
 subroutine magnitudes count in the Abaqus deck but not in ccx's (its stock subroutine would
 run). `_audit_loads` compares the two and fills `unloaded_steps` / `source_unloaded`, which
 `tests/test_corpus.py` gates on.
+
+The **BCs in force per step** come from `bc_steps()` as ccx 2.23 reads them: `OP=NEW` acts on
+a step's first `*BOUNDARY` only (`op_new_cards()`, which the other step walkers use too).
 
 The **reduced-physics record** (`Converter.reduced_physics`, kept on the `Report` as
 `Report.reduced`, so deck reading, mesh generation and flattening add to it too) names what
@@ -297,7 +301,7 @@ once or twice exactly (Gauss-Legendre panels between the breakpoints) and sample
 enough that ccx's straight lines between the points stay within 1e-4 of the step's travel.
 `_plan_velocity_bcs()` (in `_prescan`, after `_plan_coupled_bcs()`, whose rewrite of a card
 it reads through `_rate_lines()`) follows every DOF such a BC touches through the steps —
-its displacement and velocity at each step start, the BC in force (`OP=NEW` and
+its displacement and velocity at each step start, the BC in force (`op_new_cards()`, and
 re-specification as in Abaqus) — and plans:
 
 * `_vel_cards`: what replaces each velocity / acceleration card — the generated amplitudes

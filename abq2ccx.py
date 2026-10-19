@@ -3028,7 +3028,8 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
     """Per *STEP, in order: None for an eigenvalue extraction (it needs no load), else the
     loads active in the step — an empty list means the step solves with no load at all,
     i.e. to a zero response.  Loads and prescribed BCs carry over to later steps until an
-    OP=NEW card of the same keyword; a linear-perturbation step counts only its own loads.
+    OP=NEW on a step's first card of the same keyword (op_new_cards: ccx's reading, and
+    Abaqus' on a valid deck); a linear-perturbation step counts only its own loads.
     Initial velocities load a dynamic step, initial stresses any step.
 
     ``user_loads``: whether a magnitude that comes from a user subroutine (USER, ...NU
@@ -3038,17 +3039,13 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
     (its cards do not carry over); ccx carries them on."""
     state: Dict[str, Dict[tuple, str]] = {}
     initial: Dict[str, List[str]] = {"VELOCITY": [], "STRESS": []}
-    fresh: Dict[str, set] = {}             # keys (re)defined in the current step, per card
+    acts = op_new_cards(blocks, tuple(LOAD_CARD_FIELD))
 
     def apply(b: Block, into: Dict[str, Dict[tuple, str]], explicit: bool = False) -> None:
+        if id(b) in acts:
+            into[b.keyword] = {}
         card = into.setdefault(b.keyword, {})
-        if b.uparam("OP") == "NEW":
-            # OP=NEW removes what earlier steps applied, not the cards before it in this
-            # step (Abaqus; probed on ccx 2.23 for *CLOAD and *BOUNDARY)
-            kept = fresh.get(b.keyword, set())
-            into[b.keyword] = card = {k: v for k, v in card.items() if k in kept}
         for key, desc in _load_entries(b, user_loads, explicit):
-            fresh.setdefault(b.keyword, set()).add(key)
             if desc:
                 card[key] = desc
             else:
@@ -3060,7 +3057,6 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
         kw = b.keyword
         if kw == "STEP":
             step = [b]
-            fresh.clear()
             continue
         if kw != "END STEP":
             if step is not None:
@@ -3325,22 +3321,59 @@ def step_groups(blocks: Sequence[Block]) -> Tuple[List[Block], List[List[Block]]
     return model, groups
 
 
-def bc_steps(segments: List[List[Tuple[bool, Tuple[int, int], bool]]]):
-    """Yield the *BOUNDARY DOFs in force in each step, as {(node, dof): held at zero}, from
-    the BC entries (OP=NEW, (node, dof), zero value) of the model data (segments[0]) and of
-    each step.  Abaqus and ccx semantics: a step keeps the BCs in force before it, a later
-    value on a DOF replaces the earlier one, and a step with a *BOUNDARY, OP=NEW starts from
-    none.  A deck without steps yields the model data's BCs.  (One dict, updated in place.)"""
-    active: Dict[Tuple[int, int], bool] = {}
-    for _, k, z in segments[0]:
-        active[k] = z
-    if len(segments) == 1:
-        yield active
-    for seg in segments[1:]:
-        if any(new for new, _, _ in seg):
-            active = {}
-        for _, k, z in seg:
-            active[k] = z
+def op_new_cards(cards: Sequence[Block], keywords: Tuple[str, ...] = ("BOUNDARY",)) -> set:
+    """ids of the ``keywords`` cards whose OP=NEW ccx 2.23 acts on: a step's first card of
+    its keyword (one before the first *STEP has nothing to remove).  ccx ignores it on a
+    later card ('OP=NEW only makes sense on the first *BOUNDARY card within a step'; probed
+    on *BOUNDARY and *CLOAD), and Abaqus requires it on every card of the type in the step
+    if on any (Analysis User's Guide, boundary conditions and loads; LOAD CASE=2 in a
+    *BUCKLE step aside): the two read every valid Abaqus deck alike."""
+    acts: set = set()
+    seen: set = set()                 # the keywords met since the last *STEP / *END STEP
+    for b in cards:
+        if b.keyword in ("STEP", "END STEP"):
+            seen = set()
+        elif b.keyword in keywords:
+            if b.keyword not in seen and b.uparam("OP") == "NEW":
+                acts.add(id(b))
+            seen.add(b.keyword)
+    return acts
+
+
+def bc_steps(cards: Sequence[Block], entries: Callable[[Block], Sequence[Tuple[object, object]]],
+             restore: Union[set, Sequence[int]] = ()) -> Iterator[dict]:
+    """The *BOUNDARY entries in force in each step as ccx 2.23 applies them, {key: value}
+    from ``entries(card)``, the (key, value) pairs of a *BOUNDARY card (called once per card,
+    in deck order): model data first, a step keeps what is in force before it, a later value
+    on a key replaces the earlier one, and OP=NEW on a step's first *BOUNDARY card removes
+    what is in force (op_new_cards).  After a step in ``restore`` (1-based: Abaqus' linear
+    perturbation steps, which _restore_base_states makes ccx undo) the next one starts from
+    what the last other step left.  One dict per *STEP, at its *END STEP (or the next
+    *STEP, or the deck's end); a deck without steps yields the model data's.  Later cards
+    may update a yielded dict: copy what is kept."""
+    acts = op_new_cards(cards)
+    active: dict = {}
+    base = active                     # what the last step not in ``restore`` left
+    step = 0
+    in_step = stepped = False
+    for b in cards:
+        if b.keyword == "STEP":
+            if in_step:
+                yield active
+            step += 1
+            if step - 1 not in restore:
+                base = dict(active)
+            in_step = stepped = True
+        elif b.keyword == "END STEP" and in_step:
+            yield active
+            in_step = False
+            if step in restore:
+                active = dict(base)
+        elif b.keyword == "BOUNDARY":
+            if id(b) in acts:
+                active = {}
+            active.update(entries(b))
+    if in_step or not stepped:
         yield active
 
 
@@ -3605,9 +3638,9 @@ class Converter:
         self._planar_bc: List[str] = []
         self._b32r_rows: set = set()                # B32R elements whose .dat rows outnumber their points
         self._planar_twist: List[int] = []         # ... the nodes among them with DOFs 4-5 fixed
-        # *BOUNDARY cards whose OP=NEW removes nothing and is dropped: id -> first card of
-        # its step (_plan_op_new_rotations)
-        self._op_new_drop: Dict[int, bool] = {}
+        # *BOUNDARY cards whose OP=NEW is dropped: id -> the comment written in its place, if
+        # any (_plan_late_op_new, _plan_op_new_rotations)
+        self._op_new_drop: Dict[int, Optional[str]] = {}
         self._jc_with_rate: set = set()
         # id(material card) -> its material; the materials sections use; id(*DAMAGE
         # INITIATION) -> (material, evolution follows, why commented or None) (_plan_material_cards)
@@ -5671,7 +5704,7 @@ class Converter:
                      for b in g)}
         # so does a mechanical BC that a *BOUNDARY, OP=NEW releases: its reaction drops at the
         # step start (probed: a bar whose top BC carried its load overshoots the same way when
-        # a coupled step releases it).  OP=NEW keeps what the step's own earlier cards gave.
+        # a coupled step releases it).  OP=NEW acts on a step's first *BOUNDARY (op_new_cards).
         transient = {n for n, _ in coupled}
         # a 2-D model: plane and axisymmetric elements, 2-D beams, rigid elements and
         # connectors, and dimensionless springs and masses only
@@ -5691,22 +5724,21 @@ class Converter:
                 return d == 6 and n in rotating
             return n not in self._plane_only if d == 3 else n in rotating
 
+        acts = op_new_cards(blocks)
         active: set = set()
         before: set = set()
-        step, fresh = 0, set()
+        step = 0
         for b in blocks + [Block("STEP", OrderedDict())]:
             if b.keyword == "STEP":
                 if step in transient and before - active:
                     jumps.add(step)
-                step, before, fresh = step + 1, set(active), set()
+                step, before = step + 1, set(active)
             elif b.keyword == "BOUNDARY":
-                keys = {(n, d) for spec, dofs, *_ in self._rate_lines(b)
-                        for n in (self._resolve_nodes(spec) or [spec.upper()]) for d in dofs
-                        if d <= 6 and carries(n, d)}
-                if step and b.uparam("OP") == "NEW":
-                    active = {k for k in active if k in fresh}
-                active |= keys
-                fresh |= keys
+                if id(b) in acts:
+                    active = set()
+                active |= {(n, d) for spec, dofs, *_ in self._rate_lines(b)
+                           for n in (self._resolve_nodes(spec) or [spec.upper()]) for d in dofs
+                           if d <= 6 and carries(n, d)}
         if jumps:
             self.report.warn(f"Transient *COUPLED TEMPERATURE-DISPLACEMENT (step "
                              f"{', '.join(str(n) for n in sorted(jumps))}): a mechanical load without "
@@ -7576,11 +7608,10 @@ class Converter:
                     params["LOAD CASE"] = part
                 continue
             if k == "OP" and id(b) in self._op_new_drop:
-                continue                # an OP=NEW that removes nothing (_plan_op_new_rotations)
+                continue                # _plan_late_op_new, _plan_op_new_rotations
             params[k] = v
-        out = ["** abq2ccx: OP=NEW dropped: this step re-specifies every boundary condition in "
-               "effect (ccx 2.23 would not rebuild the shell/beam rotations after it)"] \
-            if self._op_new_drop.get(id(b)) and b.uparam("OP") == "NEW" else []
+        said = self._op_new_drop.get(id(b))
+        out = [said] if said and b.uparam("OP") == "NEW" else []
         out.append(emit_keyword("BOUNDARY", params))
         # (the pieces of a card _plan_default_amplitudes splits carry their midside lines)
         midside = [] if getattr(b, "_no_midside", False) else \
@@ -8146,6 +8177,7 @@ class Converter:
                         state[k][2] = bc
         t0: Optional[float] = 0.0                # total time at the step start (None: unknown)
         nlgeom = False
+        acts = op_new_cards(blocks)
         for s, group in enumerate(groups, 1):
             info = self._step_motion(group, nlgeom)
             nlgeom = info["nlgeom"]
@@ -8168,8 +8200,7 @@ class Converter:
             # where a RAMP starts: the value the DOF's earlier BC of that type ended with
             # (read before this step's end values overwrite a carried BC's)
             prev_end = {k: (pb["q"], pb.get("end")) for k, pb in prev_bc.items() if pb}
-            op_new = any(b.uparam("OP") == "NEW" for b in cards)
-            if op_new:
+            if any(id(b) in acts for b in cards):          # OP=NEW on its first *BOUNDARY
                 for st in state.values():
                     st[2] = None
             memo: Dict[tuple, Tuple[dict, object]] = {}
@@ -8731,13 +8762,14 @@ class Converter:
             apply(b, set())
         out: Dict[int, Tuple[set, set]] = {}
         nlgeom = False
+        acts = op_new_cards([b for g in groups for b in g])
         for s, group in enumerate(groups, 1):
             info = self._step_motion(group, nlgeom)
             nlgeom = info["nlgeom"]
             if s in need:
                 out[s] = (set(at_zero), set(held))
             cards = [x for x in group[1:] if x.keyword == "BOUNDARY"]
-            if any(x.uparam("OP") == "NEW" for x in cards):
+            if any(id(x) in acts for x in cards):          # OP=NEW on its first *BOUNDARY
                 held.clear()
             new: set = set()
             for x in cards:
@@ -10110,9 +10142,10 @@ class Converter:
                              f"evaluates the transform elsewhere; on the knot they are written in "
                              f"global components (exact). A knot holds the beam section rigid at "
                              f"the node, as beam theory does.", once=True)
+        acts = op_new_cards(blocks)
         for n, mode in self._rot_mode.items():
             if mode == "global":
-                self._rot_global_lines(n, self._local_axes(n), cards)
+                self._rot_global_lines(n, self._local_axes(n), cards, acts)
             elif mode == "refuse":
                 for b, _, items in cards:
                     if n in items:
@@ -10175,12 +10208,13 @@ class Converter:
         return "0." if abs(v) <= 1e-12 * scale else "%.12g" % v
 
     def _rot_global_lines(self, n: int, axes: Tuple[Vec, Vec, Vec],
-                          cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]]) -> None:
+                          cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]],
+                          acts: set) -> None:
         """_rot_lines for node ``n``, whose rotational BCs and moments ccx applies about the
         global axes: each card's are rewritten in global components where the step semantics
         let them (Abaqus: a BC or load given in a later step replaces that DOF's, OP=NEW
-        removes the earlier steps'; ccx: likewise per global DOF, loads given within a step
-        add up).
+        removes the earlier steps' - for BCs, on the cards in ``acts`` (op_new_cards); ccx:
+        likewise per global DOF, loads given within a step add up).
 
         * BCs: the state after each card (the local rotations held, their values) as its
           global values — all three local rotations, or a set whose axes span global ones (a
@@ -10196,8 +10230,8 @@ class Converter:
         for b, s, items in cards:
             if b.keyword != "BOUNDARY":
                 continue
-            if b.uparam("OP") == "NEW":
-                state = {j: e for j, e in state.items() if e[2] == s}
+            if id(b) in acts:
+                state = {}
             if n not in items:
                 continue
             if self._bc_type(b) != "DISPLACEMENT" or b.has("FIXED") or b.has("USER"):
@@ -13591,6 +13625,7 @@ class Converter:
         self._note_quadratic_beams(blocks)      # after the planar constraint
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
         self._plan_base_restore(blocks)         # after _plan_load_cases (its dropped BCs)
+        self._plan_late_op_new(blocks)          # after _plan_load_cases
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
@@ -15015,10 +15050,11 @@ class Converter:
         given again replaces the earlier one), and *BOUNDARY with OP=NEW where a perturbation
         step held a DOF the base state leaves free (_restore_new).  A card type whose first
         card in the step has OP=NEW is left to it; OP=NEW on a later card, which ccx ignores,
-        gets a bare one first.  A value a step-time amplitude drove is given at its end
-        value (ccx and Abaqus hold it there; TIME=TOTAL TIME amplitudes are kept), all on the
-        constant amplitude HOLD_AMP: every value is in force from the first increment, as in
-        Abaqus (plain lines ramp from 0 where the perturbation step removed them)."""
+        gets a bare one first (a *BOUNDARY's is gone: _plan_late_op_new).  A value a step-time
+        amplitude drove is given at its end value (ccx and Abaqus hold it there; TIME=TOTAL
+        TIME amplitudes are kept), all on the constant amplitude HOLD_AMP: every value is in
+        force from the first increment, as in Abaqus (plain lines ramp from 0 where the
+        perturbation step removed them)."""
         if not self._restore_from:
             return out
         # the emitted cards: (card, step (0: model data, -1: between steps), its last line)
@@ -17925,15 +17961,15 @@ class Converter:
             cc = ccx_type(typ)
             if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
                 rotn.update(conn)
-        segs = self._bc_segments(blocks)
+        given = {id(b): self._bc_zero_entries(b) for b in blocks if b.keyword == "BOUNDARY"}
         held: Optional[set] = None              # (node, DOF) held at zero in every step
-        for active in bc_steps(segs):
+        for active in bc_steps(blocks, lambda b: given[id(b)]):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
         self._conn_held = held or set()
-        self._conn_bc_dofs = {k for seg in segs for _, k, _ in seg}
+        self._conn_bc_dofs = {k for es in given.values() for k, _ in es}
         # nodes whose rotation is loaded or prescribed (not just held at zero)
-        turned = {n for seg in segs for _, (n, d), _ in seg
+        turned = {n for es in given.values() for (n, d), _ in es
                   if 4 <= d <= 6 and (n, d) not in self._conn_held}
         for b in blocks:
             if b.keyword == "CLOAD":
@@ -19248,52 +19284,30 @@ class Converter:
         return out
 
     def _bc_states(self, blocks: List[Block], nodes: set):
-        """The *BOUNDARY in force on ``nodes`` in each step, as ccx applies them: model data
-        first, OP=NEW on a step's first *BOUNDARY removing the earlier ones; a linear
-        perturbation step's BCs act in that step only (Abaqus; _restore_base_states gives
-        ccx the base state again after it).  (node, dof) -> (id of the card, magnitude,
-        amplitude, kind): kind "disp" for a displacement, "rate" for a velocity, None for
-        what cannot be compared (FIXED, USER, accelerations).  A deck without steps: its
-        model-data state.  Also (node, dof) -> ids of every card that names it, in force or
-        overridden.  (bc_steps is the zero / nonzero view of the emitted deck that
-        _settle_dependents uses; this one keeps the values, amplitudes and cards the
-        implied-BC test needs.)"""
-        states: List[Dict[Tuple[int, int], tuple]] = []
+        """The *BOUNDARY in force on ``nodes`` in each step, as ccx applies them (bc_steps): a
+        linear perturbation step's BCs act in that step only (Abaqus; _restore_base_states
+        gives ccx the base state again after it).  (node, dof) -> (id of the card, magnitude,
+        amplitude, kind): kind "disp" for a displacement, "rate" for a velocity, None for what
+        cannot be compared (FIXED, USER, accelerations).  A deck without steps: its model-data
+        state.  Also (node, dof) -> ids of every card that names it, in force or overridden.
+        (_bc_zero_entries gives the zero / nonzero view _plan_connectors uses; this one keeps
+        the values, amplitudes and cards the implied-BC test needs.)"""
+        given: Dict[int, List[Tuple[Tuple[int, int], tuple]]] = {}
         cards: Dict[Tuple[int, int], List[int]] = {}
-        cur: Dict[Tuple[int, int], tuple] = {}
-        base = cur                                 # what the last general step left
-        in_step = first = False
-        step = 0
         for b in blocks:
-            if b.keyword == "STEP":
-                in_step = first = True
-                step += 1
-                if step - 1 not in self._pert_idx:
-                    base = dict(cur)
-            elif b.keyword == "END STEP" and in_step:
-                states.append(dict(cur))
-                in_step = False
-                if step in self._pert_idx:
-                    cur = dict(base)
-            elif b.keyword == "BOUNDARY":
-                if in_step and first and b.uparam("OP") == "NEW":
-                    cur = {}
-                first = False
-                typ = (b.param("TYPE") or "DISPLACEMENT").strip().upper()
-                fixed = b.has("FIXED") or b.has("USER")
-                amp = b.uparam("AMPLITUDE")
-                for ns, dofs, mag in self._bc_records(b):
-                    kind = None if fixed else "disp" if typ == "DISPLACEMENT" else \
-                        "rate" if typ == "VELOCITY" else None
-                    for n in ns:
-                        if n in nodes:
-                            for d in dofs:
-                                cur[(n, d)] = (id(b), mag, amp, kind)
-                                if id(b) not in cards.setdefault((n, d), []):
-                                    cards[(n, d)].append(id(b))
-        if in_step:
-            states.append(dict(cur))
-        return states or [cur], cards
+            if b.keyword != "BOUNDARY":
+                continue
+            typ = (b.param("TYPE") or "DISPLACEMENT").strip().upper()
+            kind = None if b.has("FIXED") or b.has("USER") else "disp" if typ == "DISPLACEMENT" \
+                else "rate" if typ == "VELOCITY" else None
+            amp = b.uparam("AMPLITUDE")
+            given[id(b)] = [((n, d), (id(b), mag, amp, kind))
+                            for ns, dofs, mag in self._bc_records(b) for n in ns if n in nodes
+                            for d in dofs]
+            for k, _ in given[id(b)]:
+                if id(b) not in cards.setdefault(k, []):
+                    cards[k].append(id(b))
+        return [dict(st) for st in bc_steps(blocks, lambda b: given[id(b)], self._pert_idx)], cards
 
     def _coupled_steps(self, c: dict, states) -> None:
         """Per step of rigid constraint ``c`` (c["steps"]): its BC state ('st'), the reference
@@ -19333,21 +19347,14 @@ class Converter:
             if s + 1 not in self._pert_idx:      # a perturbation step leaves the base state
                 z0 = end
 
-    def _bc_segments(self, blocks: List[Block]) -> List[List[Tuple[bool, Tuple[int, int], bool]]]:
-        """The source deck's *BOUNDARY entries for bc_steps: (OP=NEW, (node, DOF), zero value)
-        of the model data and of each step.  A named BC counts its rotations too (it fixes
-        them wherever the node has rotations, also ones a connector gives it)."""
-        segs: List[List[Tuple[bool, Tuple[int, int], bool]]] = [[]]
-        for b in blocks:
-            if b.keyword == "STEP":
-                segs.append([])
-            elif b.keyword == "BOUNDARY":
-                new = b.uparam("OP") == "NEW"
-                typed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
-                    b.has("FIXED") or b.has("USER")
-                for ns, dofs, mag in self._bc_records(b, True):
-                    segs[-1] += [(new, (n, d), not typed and mag == 0.0) for n in ns for d in dofs]
-        return segs
+    def _bc_zero_entries(self, b: Block) -> List[Tuple[Tuple[int, int], bool]]:
+        """The entries of the source deck's *BOUNDARY ``b`` for bc_steps: ((node, DOF), held
+        at zero).  A named BC counts its rotations too (it fixes them wherever the node has
+        rotations, also ones a connector gives it)."""
+        typed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
+            b.has("FIXED") or b.has("USER")
+        return [((n, d), not typed and mag == 0.0)
+                for ns, dofs, mag in self._bc_records(b, True) for n in ns for d in dofs]
 
     def _bc_implied(self, c: dict, m: int, d: int, s: int) -> bool:
         """Do the reference node's own BCs in step ``s`` impose the BC member ``m`` has on DOF
@@ -19990,7 +19997,8 @@ class Converter:
         def surface_nodes(name: str) -> List[int]:
             return nsurf.get(name.upper()) or self._surface_member_nodes(name)
         spc: set = set()
-        segs: List[List[Tuple[bool, Tuple[int, int], bool]]] = [[]]   # BCs: model, each step
+        bc_cards: List[Block] = []              # *STEP, *END STEP and *BOUNDARY, for bc_steps
+        given: Dict[int, List[Tuple[Tuple[int, int], bool]]] = {}   # a *BOUNDARY's entries
         transformed: set = set()
         tcard: Dict[int, Optional[Tuple[str, Vec, Vec]]] = {}   # node -> its (last) *TRANSFORM
         bc_first: Dict[Tuple[int, int], int] = {}               # (node, DOF) -> card of 1st BC
@@ -20000,10 +20008,11 @@ class Converter:
         busy: Dict[Tuple[int, int], str] = {}
         taken_too: set = set()
         for ci, (kw, params, _, data) in enumerate(cards):
-            if kw == "STEP":
-                segs.append([])
+            if kw in ("STEP", "END STEP"):
+                bc_cards.append(Block(kw, params))
             elif kw == "BOUNDARY":
-                new = (params.get("OP") or "").strip().upper() == "NEW"
+                bc_cards.append(Block(kw, params))
+                entries = given[id(bc_cards[-1])] = []
                 for j in data:
                     f = fields(j)
                     if len(f) < 2 or not isint(f[1]):
@@ -20017,7 +20026,7 @@ class Converter:
                     for n in nodes_of(f[0]):
                         for d in range(min(d1, d2), max(d1, d2) + 1):
                             spc.add((n, d))
-                            segs[-1].append((new, (n, d), z))
+                            entries.append(((n, d), z))
                             bc_first.setdefault((n, d), ci)
             elif kw == "TRANSFORM":
                 ns = nodes_of((params.get("NSET") or "").strip())
@@ -20157,7 +20166,7 @@ class Converter:
         assign = self._match_dependents(eqs, cands, transformed)
         # held at zero by a BC in every step
         held: Optional[set] = None
-        for active in bc_steps(segs):
+        for active in bc_steps(bc_cards, lambda b: given[id(b)]):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
         held = held or set()
@@ -21137,35 +21146,27 @@ class Converter:
         if not ends or all(p == "HEAT TRANSFER" for p in procs):
             return
         twist = set(self._planar_twist) & ends
-        active: Dict[int, set] = {}                      # node -> rotations a BC holds now
         moves: set = set()                               # nodes given a nonzero rotation
         need: List[int] = []
 
-        def check() -> None:                             # the BCs a step solves with
+        def rotations(b: Block) -> List[Tuple[Tuple[int, int], bool]]:
+            out = []
+            for nodes, ds, moving in self._boundary_records(b):
+                for n in (nodes if ds & {4, 5, 6} else []):
+                    if n in ends:
+                        out += [((n, d), True) for d in sorted(ds & {4, 5, 6})]
+                        if moving:
+                            moves.add(n)
+            return out
+
+        for st in bc_steps(blocks, rotations):           # the BCs each step solves with
+            active: Dict[int, set] = {}                  # node -> rotations a BC holds
+            for n, d in st:
+                active.setdefault(n, set()).add(d)
             for n in sorted((set(active) | twist) & ends):
                 rot = active.get(n, set()) | ({4, 5} if n in twist else set())
                 if rot and (rot != {4, 5, 6} or n in moves):
                     need.append(n)
-
-        first = False                                    # the next *BOUNDARY is a step's first
-        for b in blocks:
-            if b.keyword == "STEP":
-                first = True
-            elif b.keyword == "BOUNDARY":
-                # OP=NEW on a step's first card only, as _bc_states: Abaqus/CAE writes it on
-                # every card of the step, which keeps the cards before it
-                if first and b.uparam("OP") == "NEW":
-                    active = {}
-                first = False
-                for nodes, ds, moving in self._boundary_records(b):
-                    for n in (nodes if ds & {4, 5, 6} else []):
-                        if n in ends:
-                            active.setdefault(n, set()).update(ds & {4, 5, 6})
-                            if moving:
-                                moves.add(n)
-            elif b.keyword == "END STEP":
-                check()
-        check()
         turned = {n for b in blocks if b.keyword == "TRANSFORM"
                   for n in self._resolve_nodes((b.param("NSET") or "").strip())}
         need = [n for n in dedup(need) if n not in turned and n not in self._ref_nodes
@@ -21201,6 +21202,34 @@ class Converter:
             self._reduces("knot beams for rotational BCs on circular-section beams")
 
     # ======================================================================
+    # *BOUNDARY, OP=NEW on a later card of a step
+    # ======================================================================
+    def _plan_late_op_new(self, blocks: List[Block]) -> None:
+        """A step whose first *BOUNDARY has no OP=NEW and a later one has: ccx 2.23 ignores it
+        there (op_new_cards), so the earlier steps' BCs stay in force, and Abaqus requires it
+        on every *BOUNDARY card of a step if on any (a *BUCKLE step's LOAD CASE=2 cards aside,
+        which are left out: _plan_load_cases).  The OP=NEW is dropped, so that ccx does not
+        act on it where the cards before it leave no line, and warned."""
+        cards = [b for b in blocks if id(b) not in self._lc_drop]
+        acts = op_new_cards(cards)
+        late: List[int] = []
+        for s, group in enumerate(step_groups(cards)[1], 1):
+            bcs = [b for b in group if b.keyword == "BOUNDARY"]
+            new = [b for b in bcs if b.uparam("OP") == "NEW"]
+            if new and not any(id(b) in acts for b in bcs):
+                self._op_new_drop.update((id(b), "** abq2ccx: OP=NEW dropped: ccx 2.23 ignores it "
+                                                 "after a step's first *BOUNDARY, which has none")
+                                         for b in new)
+                late.append(s)
+        if late:
+            self.report.warn(f"*BOUNDARY, OP=NEW in step(s) {', '.join(map(str, late))} on a later "
+                             f"card but not on the step's first: Abaqus requires it on every "
+                             f"*BOUNDARY card of a step if on any, and ccx 2.23 acts on it on the "
+                             f"first only (probed), so the boundary conditions of the earlier steps "
+                             f"stay in force. Dropped; give every *BOUNDARY card of the step OP=NEW "
+                             f"if they are to be removed.", once=True)
+
+    # ======================================================================
     # *BOUNDARY, OP=NEW after rotational BCs on shell/beam nodes
     # ======================================================================
     def _plan_base_restore(self, blocks: List[Block]) -> None:
@@ -21211,14 +21240,15 @@ class Converter:
         base state's BCs in Abaqus too), ``_restore_pairs`` (step -> the (node, DOF) pairs the
         base state's *BOUNDARY holds).  That *BOUNDARY needs OP=NEW where a perturbation step
         held a pair that neither the base state nor the step itself holds (``_restore_new``):
-        a BC on a free DOF lasts in ccx until OP=NEW.  OP=NEW on a later card of the step,
-        which ccx ignores there, removes the base state too: a bare OP=NEW then."""
+        a BC on a free DOF lasts in ccx until OP=NEW.  OP=NEW counts where ccx acts on it
+        (op_new_cards): a later card's goes (_plan_late_op_new)."""
         self._restore_from, self._restore_new, self._restore_pairs = {}, set(), {}
         self._restore_procs = {}
         if not self._pert_idx:
             return
         self._restore_yields = self._yielding_materials(blocks)
         model, groups = step_groups(blocks)
+        acts = op_new_cards([b for b in blocks if id(b) not in self._lc_drop])
         state = {k for b in model if b.keyword == "BOUNDARY" for k in self._boundary_pairs(b)}
         last, since, held = 0, set(), set()     # the perturbation procedures since, what they hold
         for s, group in enumerate(groups, 1):
@@ -21228,14 +21258,14 @@ class Converter:
                 since |= {b.keyword for b in group[1:] if b.keyword in PROC_KW} or {""}
                 held |= pairs
                 continue
-            new = [b.uparam("OP") == "NEW" for b in cards]
+            new = any(id(b) in acts for b in cards)
             if since:
                 self._restore_from[s], self._restore_procs[s] = last, since
-                if new[:1] != [True]:
-                    self._restore_pairs[s] = set() if any(new) else set(state)
-                    if any(new) or held - state - pairs:
+                if not new:
+                    self._restore_pairs[s] = set(state)
+                    if held - state - pairs:
                         self._restore_new.add(s)
-            state = pairs if new[:1] == [True] or (since and any(new)) else state | pairs
+            state = pairs if new else state | pairs
             last, since, held = s, set(), set()
 
     def _plan_op_new_rotations(self, blocks: List[Block]) -> None:
@@ -21279,9 +21309,10 @@ class Converter:
             return {n for n, d in pairs if 4 <= d <= 6 and n in self._rot_nodes
                     and n not in self._knots}
 
-        # ccx acts on OP=NEW on a step's first *BOUNDARY card only; handle_boundary repeats
-        # the planar constraint after it
-        new = [bool(c) and c[0].uparam("OP") == "NEW" for c in steps]
+        # the steps whose OP=NEW ccx acts on (op_new_cards); handle_boundary repeats the
+        # planar constraint after it
+        acts = op_new_cards(blocks)
+        new = [any(id(b) in acts for b in c) for c in steps]
         given = [set().union(*map(self._boundary_pairs, c)) | (planar if nw else set())
                  for c, nw in zip(steps, new)]
         # a general step after a perturbation step gets the base state's BCs again
@@ -21299,7 +21330,11 @@ class Converter:
         for k, cards in enumerate(steps):
             if new[k] and k and built:
                 if state <= given[k]:
-                    self._op_new_drop.update({id(c): i == 0 for i, c in enumerate(cards)})
+                    self._op_new_drop.update({id(c): None for c in cards})
+                    self._op_new_drop[id(cards[0])] = (
+                        "** abq2ccx: OP=NEW dropped: this step re-specifies every boundary "
+                        "condition in effect (ccx 2.23 would not rebuild the shell/beam rotations "
+                        "after it)")
                     dropped.append(k + 1)
                 else:
                     removing.append(k + 1)
@@ -22979,12 +23014,11 @@ def dat_blocks(path: str) -> Iterator[Tuple[int, str, str, Optional[float], List
 
 def _deck_steps(path: str) -> Optional[dict]:
     """What the results digest reads from a ccx deck: per *STEP its procedure and the DOFs
-    1-3 that the *BOUNDARY cards in effect hold (model-level BCs until an OP=NEW drops
-    them; not at a *RIGID BODY's ROT NODE, whose DOFs are rotations), at each node
-    (``held``) and per target node set or node (``targets``: {node: DOFs}); the nodes with
-    a *TRANSFORM, set members and the highest node label; ``rows``, the .dat rows per element
-    that hold its integration points where ccx prints more (B32R_PRINT_ROWS).  None if the
-    deck cannot be read."""
+    1-3 that the *BOUNDARY cards in effect hold (bc_steps; not at a *RIGID BODY's ROT NODE,
+    whose DOFs are rotations), at each node (``held``) and per target node set or node
+    (``targets``: {node: DOFs}); the nodes with a *TRANSFORM, set members and the highest
+    node label; ``rows``, the .dat rows per element that hold its integration points where
+    ccx prints more (B32R_PRINT_ROWS).  None if the deck cannot be read."""
     try:
         fh = open(path, encoding="utf-8", errors="replace")
     except OSError:
@@ -22993,7 +23027,9 @@ def _deck_steps(path: str) -> Optional[dict]:
     elsets: Dict[str, list] = {}
     b32r: set = set()
     beam_sections: List[Tuple[str, str]] = []
-    segs: List[dict] = [{"procedure": None, "bcs": [], "new": False}]   # model data, the steps
+    procedures: List[Optional[str]] = []             # per *STEP
+    bc_cards: List[Block] = []                       # *STEP, *END STEP, *BOUNDARY: bc_steps
+    given: Dict[int, List[Tuple[Tuple[str, int, int], bool]]] = {}   # a *BOUNDARY's lines
     rot: set = set()
     transforms: List[str] = []
     max_node, kw, params, cur, ecur, etype, need = 0, "", OrderedDict(), None, None, "", 0
@@ -23010,14 +23046,15 @@ def _deck_steps(path: str) -> Optional[dict]:
                 ecur = elsets.setdefault(ename, []) if kw in ("ELSET", "ELEMENT") and ename else None
                 etype = (params.get("TYPE") or "").strip().upper() if kw == "ELEMENT" else ""
                 need = 0
+                if kw in ("STEP", "END STEP", "BOUNDARY"):
+                    bc_cards.append(Block(kw, params))
+                    given[id(bc_cards[-1])] = []
                 if kw == "BEAM SECTION" and ename:
                     beam_sections.append((ename, (params.get("SECTION") or "").strip().upper()))
                 elif kw == "STEP":
-                    segs.append({"procedure": None, "bcs": [], "new": False})
-                elif kw in PROC_KW and len(segs) > 1 and not segs[-1]["procedure"]:
-                    segs[-1]["procedure"] = kw + (", EXPLICIT" if "EXPLICIT" in params else "")
-                elif kw == "BOUNDARY" and (params.get("OP") or "").strip().upper() == "NEW":
-                    segs[-1]["new"] = True
+                    procedures.append(None)
+                elif kw in PROC_KW and procedures and not procedures[-1]:
+                    procedures[-1] = kw + (", EXPLICIT" if "EXPLICIT" in params else "")
                 elif kw == "RIGID BODY" and (params.get("ROT NODE") or "").strip().isdigit():
                     rot.add(int(params["ROT NODE"]))
                 elif kw == "TRANSFORM" and name:
@@ -23049,7 +23086,7 @@ def _deck_steps(path: str) -> Optional[dict]:
                     into.extend(int(x) if x.isdigit() else x.upper() for x in f if x)
             elif kw == "BOUNDARY" and len(f) > 1 and f[1].isdigit():
                 d2 = int(f[2]) if len(f) > 2 and f[2].isdigit() else int(f[1])
-                segs[-1]["bcs"].append((f[0].upper(), int(f[1]), d2))
+                given[id(bc_cards[-1])].append(((f[0].upper(), int(f[1]), d2), True))
     memo: Dict[Tuple[int, str], List[int]] = {}
 
     def members(name: str, of: Dict[str, list] = sets) -> List[int]:
@@ -23061,9 +23098,8 @@ def _deck_steps(path: str) -> Optional[dict]:
         return memo[key]
     rows = {e: B32R_PRINT_ROWS[sec] for name, sec in beam_sections if sec in B32R_PRINT_ROWS
             for e in members(name, elsets) if e in b32r}
-    steps, active = [], list(segs[0]["bcs"])
-    for seg in segs[1:]:
-        active = list(seg["bcs"]) if seg["new"] else active + seg["bcs"]
+    steps = []
+    for proc, active in zip(procedures, bc_steps(bc_cards, lambda b: given[id(b)])):
         held: Dict[int, set] = {}
         targets: "OrderedDict[str, Dict[int, set]]" = OrderedDict()
         for tgt, d1, d2 in active:
@@ -23072,7 +23108,7 @@ def _deck_steps(path: str) -> Optional[dict]:
                 if n not in rot:
                     targets.setdefault(tgt, {}).setdefault(n, set()).update(dofs)
                     held.setdefault(n, set()).update(dofs)
-        steps.append({"procedure": seg["procedure"], "held": held, "targets": targets})
+        steps.append({"procedure": proc, "held": held, "targets": targets})
     return {"steps": steps, "max_node": max_node, "members": members,
             "transformed": {n for s in transforms for n in members(s)}, "rows": rows}
 

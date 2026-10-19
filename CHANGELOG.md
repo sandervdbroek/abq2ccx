@@ -12,6 +12,10 @@ physics.
   deck with a `*DYNAMIC` step and no NLGEOM every `*RIGID BODY`, `*MPC BEAM` body and kinematic
   coupling, on solid, knotted shell/beam or 2-D nodes, is now written as the linear `*EQUATION`s
   u = u_ref + θ × d (nodes with a `*TRANSFORM` keep the `*RIGID BODY`).
+* **`*BOUNDARY, OP=NEW` as ccx reads it** — ccx 2.23 acts on `OP=NEW` on a step's first
+  `*BOUNDARY` only; the converter's step walkers (load audit, results digest, velocity BCs,
+  constraint and connector checks) took it on any card. An `OP=NEW` on a later card only,
+  which Abaqus does not allow, is dropped and warned.
 
 ## 1.3.0 (October 2026)
 
