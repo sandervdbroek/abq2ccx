@@ -2709,6 +2709,15 @@ def test_orientation_origin_and_node_definition():
     assert "*ORIENTATION, NAME=O1\n1, 0, 0, 0, 1, 0" in body
     body, _, _ = convert_str(S4 + "*Orientation, name=O2, definition=nodes\n2, 4, 1\n")
     assert "*ORIENTATION, NAME=O2\n1, 0, 0, 0, 1, 0" in body
+    # the nodes count by position: an undefined one (here 9) leaves no axes, where the others
+    # moved up into its place; c may be 0, blank or left out (the global origin)
+    body, conv, _ = convert_str(S4 + "*Orientation, name=O3, definition=nodes\n9, 2, 4\n"
+                                "*Orientation, name=O4, definition=nodes\n2, 4, 9\n"
+                                "*Orientation, name=O5, definition=nodes\n2, 4, 0\n")
+    assert "\n** *ORIENTATION, NAME=O3, DEFINITION=nodes\n** 9, 2, 4\n" in body
+    assert "\n** *ORIENTATION, NAME=O4, DEFINITION=nodes\n** 2, 4, 9\n" in body
+    assert "*ORIENTATION, NAME=O5\n1, 0, 0, 0, 1, 0" in body
+    assert "O5" in conv._orient_axes and not {"O3", "O4"} & conv._orient_axes
 
 
 def test_orientation_zero_additional_rotation_on_a_cylindrical_system():

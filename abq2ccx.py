@@ -5638,19 +5638,20 @@ class Converter:
     def _orientation_points(self, b: Block) -> Optional[List[float]]:
         """The ccx ``a, b`` direction points of an Abaqus *ORIENTATION, or None when they
         cannot be formed.  Abaqus measures a and b from the optional origin c (9-value
-        line), and DEFINITION=NODES gives node numbers instead of coordinates."""
+        line), and DEFINITION=NODES gives node numbers instead of coordinates, by position:
+        a, b and c (0, blank or none: the global origin), each a defined node."""
         recs = merged_data_records(b)
         v = [x for x in recs[0] if x != ""] if recs else []
         definition = (b.param("DEFINITION") or "COORDINATES").strip().upper()
         rect = (b.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("RECT")
         try:
             if definition.startswith("NODES"):
-                ids = [pint(x) for x in v[:3]]
-                pts = [self.geom.nodes[i] for i in ids if i in self.geom.nodes]
-                if len(pts) < 2:
+                ids = [pint(x) if x else 0 for x in ((recs[0] if recs else []) + ["", "", ""])[:3]]
+                if any(i not in self.geom.nodes for i in ids[:2]) or \
+                        (ids[2] and ids[2] not in self.geom.nodes):
                     return None
-                a, bb = pts[0], pts[1]
-                c = pts[2] if len(pts) > 2 else (0.0, 0.0, 0.0)
+                a, bb = self.geom.nodes[ids[0]], self.geom.nodes[ids[1]]
+                c = self.geom.nodes[ids[2]] if ids[2] else (0.0, 0.0, 0.0)
             else:
                 nums = [pf(x) for x in v]
                 if len(nums) < 6:
