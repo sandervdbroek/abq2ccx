@@ -788,9 +788,6 @@ class Block:
     keyword: str                                   # upper-case, no leading '*', spaces kept
     params: "OrderedDict[str, Optional[str]]"      # PARAM (upper) -> value (orig case) or None
     data: List[str] = field(default_factory=list)  # raw data lines (comments/newlines stripped)
-    # parsing context (Abaqus part/instance this block belongs to), if any
-    part: Optional[str] = None
-    instance: Optional[str] = None
 
     def param(self, key: str, default: Optional[str] = None) -> Optional[str]:
         return self.params.get(key.upper(), default)
@@ -3935,7 +3932,7 @@ class Converter:
                 rest = ([repr(x) for x in nxyz] + f[7:]) if nxyz else f[4:]
                 data.append(", ".join([f[0]] + [repr(x) for x in xyz] + rest))
             params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
-            out.append(Block(b.keyword, params, data, b.part, b.instance))
+            out.append(Block(b.keyword, params, data))
             self.report.note("*NODE, SYSTEM=C / S: cylindrical (R, theta, Z) and spherical (R, "
                              "theta, phi) coordinates converted to Cartesian (Abaqus 'Node "
                              "definition': angles in degrees, theta about Z from X, phi up from "
@@ -4914,7 +4911,7 @@ class Converter:
             if b.keyword.endswith("SECTION") and b.has("COMPOSITE"):
                 data = [ply(d) for d in b.data]
             out.append(b if params is b.params and data == b.data
-                       else Block(b.keyword, params, data, b.part, b.instance))
+                       else Block(b.keyword, params, data))
         return out
 
     def handle_user_material(self, b: Block) -> List[str]:
@@ -11791,7 +11788,6 @@ class Converter:
         except ValueError:
             return self._commented(b, "*KINEMATIC COUPLING DOF fields could not be parsed; edit "
                                       "manually.", reduces=False)
-        members = [m for ms in groups.values() for m in ms]
         if (self._coupling_plan.get(id(b)) or {}).get("kind") == "unsupported":
             self._warn_rigid_unsupported()
         self._synth_counter += 1
@@ -11997,7 +11993,7 @@ class Converter:
             self._reduces(f"*{b.keyword}")
             comments = ["** abq2ccx: " + msg] + ["** " + ln for ln in gone_lines]
         empty = not any(x.strip() for x in keep)
-        return Block(b.keyword, b.params, keep, b.part, b.instance), comments, empty
+        return Block(b.keyword, b.params, keep), comments, empty
 
     def handle_tie(self, b: Block) -> List[str]:
         drop = any(i == id(b) for (i, _) in self._tie_to_rigid)
@@ -12418,7 +12414,7 @@ class Converter:
             self.report.note("*RIGID BODY data line dropped (ccx's *RIGID BODY has none; Abaqus "
                              "reads it only in Abaqus/Explicit, as the rigid elements' thickness / "
                              "area, which the skins' contact faces carry).", once=True)
-            b = Block(b.keyword, b.params, [], b.part, b.instance)
+            b = Block(b.keyword, b.params, [])
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         pre: List[str] = []
         node_sets = [v for k, v in b.params.items()
@@ -14766,7 +14762,6 @@ class Converter:
                 continue
             if ref in planar or planar_model:
                 tensor = [[tensor[2][2] / 2, 0.0, 0.0], [0.0, tensor[2][2] / 2, 0.0], [0.0, 0.0, tensor[2][2]]]
-            nodes = [n for _, e in items for n in [rot_elems[e]]]
             tie, pin = self._rigid_body_members(body)
             pool = [n for n in dedup(([ref] if ref is not None else []) + tie + pin) if n in self.geom.nodes]
             centre = max(pool, key=lambda n: mass_at.get(n, 0.0), default=None)
@@ -15211,7 +15206,7 @@ class Converter:
             self.geom.nsets[sub] = new
             params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
             params["NSET"] = sub
-            blocks.insert(i + 1, Block(b.keyword, params, list(b.data), b.part, b.instance))
+            blocks.insert(i + 1, Block(b.keyword, params, list(b.data)))
             self.report.note("*TRANSFORM copied onto the nodes the converter put between two of its "
                              "nodes where its node set did not take them (a load counts the set, or "
                              "the node is held by an *EQUATION): their BCs and ties are in its local "
@@ -16018,14 +16013,14 @@ class Converter:
                     k += 1
                     name = f"{mat}_MEMBRANE_MASS_{k}"
                 taken.add(name)
-                clone = [Block(c.keyword, OrderedDict(c.params), list(c.data), c.part, c.instance)
+                clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
                          for c in group if c is group[0] or (c.keyword in MATERIAL_OPTION_CARDS and
                                                              c.keyword != "DENSITY")]
                 clone[0].params["NAME"] = name
                 d = next((c for c in group if c.keyword == "DENSITY"), None)
                 clone.append(Block("DENSITY", OrderedDict(d.params) if d else OrderedDict(),
                                    [", ".join([short_real(r[0] + add, 12)] + r[1:]) for r in dens] or
-                                   [short_real(add, 12)], group[0].part, group[0].instance))
+                                   [short_real(add, 12)]))
                 at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
                 blocks[at:at] = clone
                 copies[(mat, add)] = name
@@ -16245,7 +16240,7 @@ class Converter:
             b.params["ELSET"] = rest
             params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
             params["ELSET"] = solid
-            twin = Block(b.keyword, params, list(b.data), b.part, b.instance)
+            twin = Block(b.keyword, params, list(b.data))
             self._qmem_sections.add(id(twin))
             inserts.append((i + 1, twin))
         for i, twin in reversed(inserts):
