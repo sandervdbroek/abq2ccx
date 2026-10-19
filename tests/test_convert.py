@@ -8771,13 +8771,15 @@ def test_isotropic_sections_lose_nothing_on_a_spherical_orientation():
     body, conv, rep = convert_str(block + ISO_STEEL + SPH_ORIENTATION + solid)
     assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and "ORIENTATION=SPH" in body
     assert not conv.reduced_physics and "written as the global axes" in rep.text()
-    # ccx's *DEFORMATION PLASTICITY depends on the axes (CalculiX issue #160), not on the global ones
-    body, conv, _ = convert_str(block + DEFORMATION_STEEL + SPH_ORIENTATION + solid)
-    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
-    # Abaqus reads initial stresses in the orientation's axes, ccx in global ones; an orthotropic
-    # section and a spring use the axes too: reduced physics, the card as before
-    for deck in (block + ISO_STEEL + SPH_ORIENTATION + solid + "*Initial Conditions, type=STRESS\n9, 1., 0., 0., 0., 0., 0.\n",
-                 block + COMPOSITE_MAT + SPH_ORIENTATION + solid.replace("STEEL", "CFRP"),
+    # ccx's *DEFORMATION PLASTICITY depends on the axes (CalculiX issue #160): its section reads none;
+    # initial stresses, which Abaqus reads in the orientation's axes, are written in global ones
+    for extra in ("", "*Initial Conditions, type=STRESS\n9, 1., 0., 0., 0., 0., 0.\n"):
+        for mat in (DEFORMATION_STEEL, ISO_STEEL):
+            body, conv, _ = convert_str(block + mat + SPH_ORIENTATION + solid + extra)
+            assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
+            assert ("ORIENTATION=SPH" in body) == (mat == ISO_STEEL)
+    # an orthotropic section and a spring use the axes: reduced physics, the card as before
+    for deck in (block + COMPOSITE_MAT + SPH_ORIENTATION + solid.replace("STEEL", "CFRP"),
                  block + ISO_STEEL + SPH_ORIENTATION + solid + "*Element, type=SPRINGA, elset=SP\n19, 101, 108\n"
                  "*Spring, elset=SP, orientation=SPH\n\n10.\n"):
         body, conv, _ = convert_str(deck)
@@ -8809,18 +8811,192 @@ def test_isotropic_sections_lose_nothing_on_a_spherical_orientation():
 
 def test_isotropic_sections_lose_nothing_by_a_dropped_cylindrical_rotation():
     # ccx refuses a rotation line on a cylindrical system: an isotropic section loses nothing by
-    # it, but ccx's *DEFORMATION PLASTICITY its results (CalculiX issue #160) and an orthotropic
-    # section its directions; a cylindrical *DISTRIBUTION alike
+    # it, nor a *DEFORMATION PLASTICITY one, which reads no orientation in ccx (CalculiX issue
+    # #160), but an orthotropic section its directions; a cylindrical *DISTRIBUTION alike
     sec = "*Solid Section, elset=EALL, material=STEEL, orientation=CYL\n"
     plain = "*Orientation, name=CYL, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n1, 30.\n"
     for cyl in (plain, "*Distribution, name=D, location=ELEMENT, table=T\n, 0., 0., 0., 0., 0., 1.\n"
                        "*Distribution Table, name=T\ncoord3D, coord3D\n*Orientation, name=CYL, system=CYLINDRICAL\nD\n1, 30.\n"):
-        body, conv, _ = convert_str(HEX + ISO_STEEL + cyl + sec)
-        assert not conv.reduced_physics and "1, 30." not in body
-        for mat in (DEFORMATION_STEEL, COMPOSITE_MAT.replace("CFRP", "STEEL")):
-            _, conv, _ = convert_str(HEX + mat + cyl + sec)
-            assert conv.reduced_physics == ["*ORIENTATION additional rotation on a non-rectangular system dropped"]
+        for mat in (ISO_STEEL, DEFORMATION_STEEL):
+            body, conv, _ = convert_str(HEX + mat + cyl + sec)
+            assert not conv.reduced_physics and "1, 30." not in body
+            assert ("*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL" in body.splitlines()) == (mat == DEFORMATION_STEEL)
+        _, conv, _ = convert_str(HEX + COMPOSITE_MAT.replace("CFRP", "STEEL") + cyl + sec)
+        assert conv.reduced_physics == ["*ORIENTATION additional rotation on a non-rectangular system dropped"]
     assert "no direction dependence lose nothing" in convert_str(HEX + ISO_STEEL + plain + sec)[2].text()
+
+
+TURNED_ORIENTATION = "*Orientation, name=OR\n0.8, 0.6, 0., -0.36, 0.48, 0.8\n"
+DP_FLAG = "*DEFORMATION PLASTICITY on an orientation (CalculiX issue #160)"
+
+
+def test_deformation_plasticity_sections_name_no_orientation():
+    # ccx 2.23's *DEFORMATION PLASTICITY depends on an orientation's axes (CalculiX issue #160: up
+    # to 84 % off on turned ones, a hang on zero ones), Abaqus' isotropic law does not: its solid,
+    # shell, membrane and continuum-shell sections and composite plies name none in ccx
+    sec = "*Solid Section, elset=EALL, material=STEEL, orientation=OR\n"
+    body, conv, rep = convert_str(HEX + DEFORMATION_STEEL + TURNED_ORIENTATION + sec)
+    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL" in body.splitlines()
+    assert not conv.reduced_physics and "CalculiX issue #160" in rep.text() and "in global axes" in rep.text()
+    quad = "*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type={}, elset=PLATE\n1, 1, 2, 3, 4\n"
+    for kw, typ in (("Shell", "S4R"), ("Membrane", "M3D4")):
+        body, conv, _ = convert_str(quad.format(typ) + DEFORMATION_STEEL + TURNED_ORIENTATION
+                                    + f"*{kw} Section, elset=PLATE, material=STEEL, orientation=OR\n0.1\n")
+        assert f"*{kw.upper()} SECTION, ELSET=PLATE, MATERIAL=STEEL" in body.splitlines()
+        assert not conv.reduced_physics
+    body, conv, _ = convert_str(HEX.replace("C3D8", "SC8R") + DEFORMATION_STEEL + TURNED_ORIENTATION
+                                + "*Shell Section, elset=EALL, material=STEEL, orientation=OR\n1.\n")
+    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL" in body.splitlines() and DP_FLAG not in conv.reduced_physics
+    # a ply of it names the global axes, as ccx would give it the previous ply's orientation
+    s8r = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0.5, 0., 0.\n6, 1., 0.5, 0.\n"
+           "7, 0.5, 1., 0.\n8, 0., 0.5, 0.\n*Element, type=S8R, elset=PLATE\n1, 1, 2, 3, 4, 5, 6, 7, 8\n")
+    for ori in ("*Orientation, name=OR\n1., 0., 0., 0., 1., 0.\n3, 0.\n", TURNED_ORIENTATION):
+        body, conv, _ = convert_str(s8r + DEFORMATION_STEEL + COMPOSITE_MAT + ori
+                                    + "*Shell Section, elset=PLATE, composite, orientation=OR\n"
+                                      "0.1, 3, STEEL, 30.\n0.1, 3, CFRP, 30.\n")
+        plies = [ln for ln in body.splitlines() if ln.startswith("0.1, , ")]
+        assert len(plies) == 2 and plies[0] == "0.1, , STEEL, ABQ2CCX_OR0" and not plies[1].endswith("OR0")
+        assert DP_FLAG not in conv.reduced_physics
+    body, conv, _ = convert_str(HEX.replace("C3D8", "SC8R") + DEFORMATION_STEEL + COMPOSITE_MAT
+                                + "*Shell Section, elset=EALL, composite\n0.5, 3, STEEL, 0.\n0.5, 3, CFRP, 90.\n")
+    solids = [ln for ln in body.splitlines() if ln.startswith("*SOLID SECTION")]
+    assert len(solids) == 2 and "ORIENTATION" not in solids[0] and "MATERIAL=CFRP, ORIENTATION=" in solids[1]
+    # with an option that depends on the axes the orientation stays: reduced physics
+    body, conv, _ = convert_str(HEX + DEFORMATION_STEEL + "*Expansion, type=ORTHO\n1e-5, 2e-5, 3e-5\n"
+                                + TURNED_ORIENTATION + sec)
+    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL, ORIENTATION=OR" in body.splitlines()
+    assert DP_FLAG in conv.reduced_physics
+
+
+def _ic_values(body, head="*INITIAL CONDITIONS, TYPE=STRESS"):
+    """{(element, integration point): [values]} of the live card ``head``."""
+    return {(int(r[0]), int(r[1])): [float(x) for x in r[2:]]
+            for r in (ln.split(", ") for ln in _card(body, head))}
+
+
+def test_initial_stress_and_plastic_strain_turned_into_global_axes():
+    # Abaqus reads them in the axes of the element's orientation (2017 Keywords *INITIAL
+    # CONDITIONS), ccx 2.23 in global ones (probed): one rotation per element on a rectangular
+    # system; a plastic strain's engineering shear also halved, ccx reading tensor components
+    sec = "*Solid Section, elset=EALL, material=STEEL, orientation=OR\n"
+    quarter = "*Orientation, name=OR\n0., 1., 0., -1., 0., 0.\n"        # local 1 = global y
+    body, conv, rep = convert_str(HEX + ISO_STEEL + quarter + sec
+                                  + "*Initial Conditions, type=STRESS\nEALL, 100., 0., 0., 0., 0., 0.\n")
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS") == [f"1, {k}, 0., 100., 0., 0., 0., 0." for k in range(1, 9)]
+    assert not conv.reduced_physics and "written in global axes" in rep.text()
+    body, conv, rep = convert_str(HEX + ISO_STEEL + quarter + sec
+                                  + "*Initial Conditions, type=PLASTIC STRAIN\nEALL, 0., 0., 0., 0.002, 0., 0.\n")
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=PLASTIC STRAIN")[0] == "1, 1, 0., 0., 0., -0.001, 0., 0."
+    frame = A.orientation_frame((0.8, 0.6, 0.), (-0.36, 0.48, 0.8), "RECTANGULAR", (0., 0., 0.), None)[0]
+    body, conv, _ = convert_str(HEX + ISO_STEEL + TURNED_ORIENTATION + sec
+                                + "*Initial Conditions, type=STRESS\nEALL, 100., -40., 25., 30., -20., 15.\n")
+    want = A.tensor_to_global(frame, [100., -40., 25., 30., -20., 15.])
+    got = _ic_values(body)
+    assert len(got) == 8 and all(_close(v, want, 1e-9) for v in got.values()) and not conv.reduced_physics
+    # a *DISTRIBUTION gives each element its own axes: element 2 turned, element 1 on the default line
+    two = HEX + "*NODE\n9, 2.,0.,0.\n10, 2.,1.,0.\n11, 2.,0.,1.\n12, 2.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n" \
+        "2, 2,9,10,3,6,11,12,7\n"
+    dist = ("*Distribution, name=D, location=ELEMENT, table=T\n, 1., 0., 0., 0., 1., 0.\n2, 0., 1., 0., -1., 0., 0.\n"
+            "*Distribution Table, name=T\ncoord3D, coord3D\n*Orientation, name=OR\nD\n")
+    body, conv, _ = convert_str(two + ISO_STEEL + dist + sec
+                                + "*Initial Conditions, type=STRESS\nEALL, 100., 0., 0., 0., 0., 0.\n")
+    rows = _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")
+    assert rows[0] == "1, 1, 100., 0., 0., 0., 0., 0." and rows[8] == "2, 1, 0., 100., 0., 0., 0., 0."
+    assert not conv.reduced_physics
+    # a cylindrical system turns at each of ccx's integration points: a hoop stress on a box at
+    # x = 1 .. 2, y = 0 .. 1 about the z axis
+    box = HEX.replace("1, 0.,0.,0.", "1, 1.,0.,0.").replace("2, 1.,0.,0.", "2, 2.,0.,0.").replace(
+        "3, 1.,1.,0.", "3, 2.,1.,0.").replace("4, 0.,1.,0.", "4, 1.,1.,0.").replace(
+        "5, 0.,0.,1.", "5, 1.,0.,1.").replace("6, 1.,0.,1.", "6, 2.,0.,1.").replace(
+        "7, 1.,1.,1.", "7, 2.,1.,1.").replace("8, 0.,1.,1.", "8, 1.,1.,1.")
+    cyl = "*Orientation, name=OR, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n"
+    for typ, g in (("C3D8", 0.5 / math.sqrt(3)), ("C3D8R", 0.0)):
+        body, conv, _ = convert_str(box.replace("C3D8", typ) + ISO_STEEL + cyl + sec
+                                    + "*Initial Conditions, type=STRESS\nEALL, 0., 100., 0., 0., 0., 0.\n")
+        got = _ic_values(body)
+        pts = [(1.5 + a, 0.5 + b) for _c in (0, 1) for b in (-g, g) for a in (-g, g)] if g else [(1.5, 0.5)]
+        assert len(got) == len(pts) and not conv.reduced_physics
+        for k, (x, y) in enumerate(pts, 1):
+            th = math.atan2(y, x)
+            assert _close(got[(1, k)], [100 * math.sin(th) ** 2, 100 * math.cos(th) ** 2, 0.,
+                                        -100 * math.sin(th) * math.cos(th), 0., 0.], 1e-9)
+    # a plane-strain element with its axis 3 normal to the plane turns in it, else reduced physics
+    sq = "*Node\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*Element, type=CPE4, elset=EALL\n1, 1, 2, 3, 4\n"
+    plane = f"*Orientation, name=OR\n{math.cos(math.radians(30))}, 0.5, 0., -0.5, {math.cos(math.radians(30))}, 0.\n"
+    psec = sec.replace("orientation=OR\n", "orientation=OR\n1.\n")
+    ic = "*Initial Conditions, type=STRESS\nEALL, 100., 0., 0., 0.\n"
+    body, conv, _ = convert_str(sq + ISO_STEEL + plane + psec + ic)
+    assert _close(_ic_values(body)[(1, 1)], [75., 25., 0., 25 * math.sqrt(3), 0., 0.], 1e-9)
+    assert not conv.reduced_physics
+    flag = ["*INITIAL CONDITIONS, TYPE=STRESS in an orientation's axes, not turned"]
+    body, conv, rep = convert_str(sq + ISO_STEEL + TURNED_ORIENTATION + psec + ic)
+    assert conv.reduced_physics == flag and "not normal to the model plane" in rep.text()
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., 0., 0., 0."
+    # axes undefined at an integration point (on a cylindrical system's axis), unknown axes and a
+    # continuum shell's local directions: the values as given, reduced physics
+    on_axis = "*Orientation, name=OR, system=CYLINDRICAL\n0.5, 0.5, 0., 0.5, 0.5, 1.\n"
+    for deck, why in ((HEX.replace("C3D8", "C3D8R") + ISO_STEEL + on_axis + sec, "undefined at an integration point"),
+                      (HEX + ISO_STEEL + "*Orientation, name=OR, definition=OFFSET TO NODES\n1, 2, 4\n" + sec,
+                       "are not known"),
+                      (HEX.replace("C3D8", "SC8R") + ISO_STEEL + TURNED_ORIENTATION
+                       + "*Shell Section, elset=EALL, material=STEEL, orientation=OR\n1.\n", "a *SHELL SECTION")):
+        body, conv, rep = convert_str(deck + "*Initial Conditions, type=STRESS\nEALL, 100., 0., 0., 0., 0., 0.\n")
+        assert flag[0] in conv.reduced_physics and why in rep.text()
+        assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., 0., 0., 0., 0., 0."
+
+
+def test_ccx_integration_points_where_ccx_prints_them():
+    # ccx 2.23's *EL PRINT, COORD on one distorted element of each type (curved edges for the
+    # quadratic ones): its integration points in its order, at which initial conditions on a
+    # cylindrical or spherical orientation are turned
+    def warp(x, y, z=None):
+        if z is None:
+            return 2.0 + x + 0.15 * y * y, 3.0 + 0.8 * y + 0.12 * x * x, 0.0
+        return (2.0 + x + 0.15 * y * y + 0.1 * z, 3.0 + 0.8 * y + 0.12 * x * x - 0.05 * z * x,
+                1.0 + 0.6 * z + 0.1 * x * y)
+    hex8 = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1), (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)]
+    hex20 = hex8 + [(0, -1, -1), (1, 0, -1), (0, 1, -1), (-1, 0, -1), (0, -1, 1), (1, 0, 1), (0, 1, 1),
+                    (-1, 0, 1), (-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)]
+    tet10 = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (.5, 0, 0), (.5, .5, 0), (0, .5, 0), (0, 0, .5),
+             (.5, 0, .5), (0, .5, .5)]
+    wed6 = [(0, 0, -1), (1, 0, -1), (0, 1, -1), (0, 0, 1), (1, 0, 1), (0, 1, 1)]
+    wed15 = wed6 + [(.5, 0, -1), (.5, .5, -1), (0, .5, -1), (.5, 0, 1), (.5, .5, 1), (0, .5, 1), (0, 0, 0),
+                    (1, 0, 0), (0, 1, 0)]
+    quad8 = [(-1, -1), (1, -1), (1, 1), (-1, 1), (0, -1), (1, 0), (0, 1), (-1, 0)]
+    printed = {
+        "C3D20": (hex20, {1: (1.237944, 2.422323, 0.5952420), 14: (2.0, 3.0, 1.0),
+                          27: (2.942056, 3.661677, 1.524758)}),
+        "C3D15": (wed15, {1: (2.093374, 3.143122, 0.5380198), 5: (2.670833, 3.186667, 1.011111),
+                          9: (2.310793, 3.530212, 1.475869)}),
+        "C3D10": (tet10, {1: (2.154881, 3.111894, 1.084828), 2: (2.602095, 3.147637, 1.091008),
+                          3: (2.203422, 3.469665, 1.091008), 4: (2.199602, 3.108804, 1.353156)}),
+        "C3D6": (wed6, {1: (2.325598, 3.316289, 0.6535898), 2: (2.441068, 3.297044, 1.346410)}),
+        "CPS8": (quad8, {1: (1.315403, 2.452323), 14: (2.0, 3.0)}),      # in its plane: ccx's layers are off it
+    }
+    for typ, (ref, want) in printed.items():
+        pts = A.ccx_integration_points(typ, [warp(*p) for p in ref])
+        assert len(pts) == A.ELEMENT_IP_COUNT[typ]
+        assert all(_close(pts[k - 1][:len(w)], w, 2e-6) for k, w in want.items()), typ
+    assert A.ccx_integration_points("C3D8", [(0., 0., 0.)] * 4) is None
+
+
+def test_initial_conditions_in_ccx_component_order():
+    # Abaqus orders a plane-stress element's components 11, 22, 12, ccx reads a third value as zz
+    # (probed); a plastic strain's shear is engineering in Abaqus, tensor in ccx (probed: xy = 0.01
+    # shears a free cube by 0.02); records ccx reads alike stay as written
+    sq = "*Node\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*Element, type=CPS4, elset=EALL\n1, 1, 2, 3, 4\n"
+    sec = "*Solid Section, elset=EALL, material=STEEL\n1.\n"
+    body, conv, rep = convert_str(sq + ISO_STEEL + sec + "*Initial Conditions, type=STRESS\nEALL, 0., 0., 100.\n")
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS") == [f"1, {k}, 0., 0., 0., 100., 0., 0." for k in range(1, 9)]
+    assert not conv.reduced_physics and "third value as zz" in rep.text()
+    body, _, _ = convert_str(sq + ISO_STEEL + sec + "*Initial Conditions, type=STRESS\nEALL, 0.0, 50000.0, 0.0,\n")
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 0.0, 50000.0, 0.0"
+    plastic = ISO_STEEL + "*Plastic\n250., 0.\n*Solid Section, elset=EALL, material=STEEL\n"
+    head = "*INITIAL CONDITIONS, TYPE=PLASTIC STRAIN"
+    body, _, rep = convert_str(HEX + plastic + "*Initial Conditions, type=PLASTIC STRAIN\nEALL, 0.004, -0.002, -0.002, 0.003, 0., 0.\n")
+    assert _card(body, head)[0] == "1, 1, 0.004, -0.002, -0.002, 0.0015, 0., 0." and "engineering shear" in rep.text()
+    body, _, _ = convert_str(HEX + plastic + "*Initial Conditions, type=PLASTIC STRAIN\nEALL, 0.004, -0.002, -0.002\n")
+    assert _card(body, head)[0] == "1, 1, 0.004, -0.002, -0.002"
 
 
 def test_composite_continuum_shells_keep_a_cylindrical_rotation_line():

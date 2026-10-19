@@ -50,7 +50,9 @@ TRANSLATED = {
         "directions per element or has an isotropic material, a spherical one then written as the "
         "global axes); a rectangular one's rotation line kept (a blank axis as 1, Abaqus' default). "
         "One that names a `*DISTRIBUTION` is preceded "
-        "by that distribution in ccx's form (see `*DISTRIBUTION`).",
+        "by that distribution in ccx's form (see `*DISTRIBUTION`). Sections and plies of a "
+        "`*DEFORMATION PLASTICITY` material name none: ccx 2.23's results depend on the axes "
+        "(CalculiX issue #160), Abaqus' do not.",
     "*DISTRIBUTION": "per-element orientations, in the form ccx 2.23 runs correctly: each "
         "`*ORIENTATION` naming one gets its own copy (ccx gives a distribution to the first only), "
         "resolved to one line per element of its solid sections — default line first, origin "
@@ -406,7 +408,10 @@ TRANSLATED = {
     "*DEPVAR": "SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx; "
         "reduced physics).",
     "*INITIAL CONDITIONS": "`TYPE=STRESS/PLASTIC STRAIN/SOLUTION` expanded per integration point "
-        "(SOLUTION continuation lines joined by the `*DEPVAR` size); unknown types commented.",
+        "(SOLUTION continuation lines joined by the `*DEPVAR` size); stresses and plastic strains "
+        "turned out of an orientation's axes into the global ones ccx reads (at each integration "
+        "point on a cylindrical or spherical system), in ccx's component order and shear measure; "
+        "unknown types commented.",
     "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for "
         "strain hardening with m ≠ 0); other laws → `LAW=USER`.",
     "*AMPLITUDE": "keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; "

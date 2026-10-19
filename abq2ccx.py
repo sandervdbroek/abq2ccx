@@ -1389,6 +1389,16 @@ def frame_defined(frame: Tuple[Vec, Vec, Vec], axis: Optional[int] = None) -> bo
     return abs(vnorm(frame[(axis or 1) % 3]) - 1.0) < 1e-6
 
 
+def tensor_to_global(frame: Tuple[Vec, Vec, Vec], s: Sequence[float]) -> List[float]:
+    """The global components (11, 22, 33, 12, 13, 23) of the symmetric tensor whose components
+    ``s``, in that order, are given in the local axes ``frame`` (unit axes 1, 2, 3 in global
+    components): sum over i, j of s_ij e_i e_j."""
+    m = ((s[0], s[3], s[4]), (s[3], s[1], s[5]), (s[4], s[5], s[2]))
+    g = [[sum(frame[i][p] * m[i][j] * frame[j][q] for i in range(3) for j in range(3))
+          for q in range(3)] for p in range(3)]
+    return [g[0][0], g[1][1], g[2][2], g[0][1], g[0][2], g[1][2]]
+
+
 # Abaqus shells and membranes integrated at one point in their plane, the element's centre
 # (2017 element libraries, "Numbering of integration points for output"): their material
 # directions are those at the centre, where ccx takes a shell or membrane orientation too
@@ -3068,6 +3078,77 @@ def _shape(kind: str, n: int, a: float, b: float = 0.0) -> Tuple[List[float], Li
     return N, da, db
 
 
+_HEX_CORNER = tuple((a, b, c) for c in (-1.0, 1.0) for a, b in _Q4_CORNER)
+_HEX_MID = tuple((a, b, c) for c in (-1.0, 1.0) for a, b in _Q8_MID) + \
+    tuple((a, b, 0.0) for a, b in _Q4_CORNER)
+
+
+def _solid_shape(n: int, x: float, y: float, z: float) -> List[float]:
+    """Shape functions at natural point (x, y, z) of a solid with ``n`` nodes in Abaqus' (and
+    ccx's) node order: a hexahedron (8 / 20 nodes, on [-1, 1]^3), a tetrahedron (4 / 10, volume
+    coordinates x, y, z) or a wedge (6 / 15, triangle coordinates x, y and z on [-1, 1])."""
+    if n in (8, 20):
+        N = [(1 + x * a) * (1 + y * b) * (1 + z * c) / 8 * ((x * a + y * b + z * c - 2) if n == 20 else 1)
+             for a, b, c in _HEX_CORNER]
+        return N + [(1 - x * x if a == 0 else 1 + x * a) * (1 - y * y if b == 0 else 1 + y * b)
+                    * (1 - z * z if c == 0 else 1 + z * c) / 4 for a, b, c in (_HEX_MID if n == 20 else ())]
+    if n in (4, 10):
+        L = [1 - x - y - z, x, y, z]
+        return L if n == 4 else [l * (2 * l - 1) for l in L] + \
+            [4 * L[i] * L[j] for i, j in ((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3))]
+    L = [1 - x - y, x, y]
+    if n == 6:
+        return [l * (1 - z) / 2 for l in L] + [l * (1 + z) / 2 for l in L]
+    edges = ((0, 1), (1, 2), (2, 0))
+    return [l * ((2 * l - 1) * (1 - z) - (1 - z * z)) / 2 for l in L] + \
+        [l * ((2 * l - 1) * (1 + z) - (1 - z * z)) / 2 for l in L] + \
+        [2 * L[i] * L[j] * (1 - z) for i, j in edges] + [2 * L[i] * L[j] * (1 + z) for i, j in edges] + \
+        [l * (1 - z * z) for l in L]
+
+
+# ccx 2.23's integration points in its order, the first natural coordinate fastest (probed:
+# *EL PRINT, COORD on a distorted element of each type matches these to its print precision):
+# solids by type (node count, points); plane and axisymmetric elements, which ccx runs as solids
+# of 2 or 3 layers of their in-plane points (CPS4: its 4 points, twice), by the type's suffix
+_IP_G2, _IP_G3 = 1.0 / math.sqrt(3.0), math.sqrt(0.6)
+_IP_SQ2 = tuple((a, b) for b in (-_IP_G2, _IP_G2) for a in (-_IP_G2, _IP_G2))
+_IP_SQ3 = tuple((a, b) for b in (-_IP_G3, 0.0, _IP_G3) for a in (-_IP_G3, 0.0, _IP_G3))
+_IP_TRI3 = ((1 / 6, 1 / 6), (2 / 3, 1 / 6), (1 / 6, 2 / 3))
+_IP_TET4 = ((0.1381966011250105,) * 3, (0.5854101966249685, 0.1381966011250105, 0.1381966011250105),
+            (0.1381966011250105, 0.5854101966249685, 0.1381966011250105),
+            (0.1381966011250105, 0.1381966011250105, 0.5854101966249685))
+CCX_SOLID_IPS = {
+    "C3D8": (8, tuple((a, b, c) for c in (-_IP_G2, _IP_G2) for a, b in _IP_SQ2)),
+    "C3D8R": (8, ((0.0, 0.0, 0.0),)),
+    "C3D20": (20, tuple((a, b, c) for c in (-_IP_G3, 0.0, _IP_G3) for a, b in _IP_SQ3)),
+    "C3D4": (4, ((0.25, 0.25, 0.25),)), "C3D10": (10, _IP_TET4), "C3D10T": (10, _IP_TET4),
+    "C3D6": (6, ((1 / 3, 1 / 3, -_IP_G2), (1 / 3, 1 / 3, _IP_G2))),
+    "C3D15": (15, tuple((a, b, c) for c in (-_IP_G3, 0.0, _IP_G3) for a, b in _IP_TRI3)),
+}
+CCX_SOLID_IPS["C3D8I"] = CCX_SOLID_IPS["C3D8"]
+CCX_SOLID_IPS["C3D20R"] = (20, CCX_SOLID_IPS["C3D8"][1])
+CCX_PLANE_IPS = {"3": ((1 / 3, 1 / 3),), "4": _IP_SQ2, "4R": ((0.0, 0.0),), "6": _IP_TRI3,
+                 "8": _IP_SQ3, "8R": _IP_SQ2}
+
+
+def ccx_integration_points(typ: str, xyz: Sequence[Vec]) -> Optional[List[Vec]]:
+    """Where ccx 2.23 integrates an element of its type ``typ`` on nodes ``xyz``: the
+    ELEMENT_IP_COUNT points in its order — for a plane or axisymmetric element those of the
+    2-D element, layer after layer (ccx's solid of it has them off the model plane, an
+    axisymmetric one on a sector).  None for another type or node count."""
+    if typ in CCX_SOLID_IPS:
+        n, pts = CCX_SOLID_IPS[typ]
+        weights = [_solid_shape(n, *p) for p in pts]
+    elif typ[:3] in ("CPS", "CPE", "CAX") and typ[3:] in CCX_PLANE_IPS and typ in ELEMENT_IP_COUNT:
+        n, pts = int(typ[3:].rstrip("R")), CCX_PLANE_IPS[typ[3:]]
+        weights = [_shape("area", n, a, b)[0] for a, b in pts] * (ELEMENT_IP_COUNT[typ] // len(pts))
+    else:
+        return None
+    if len(xyz) != n:
+        return None
+    return [tuple(sum(w * p[k] for w, p in zip(N, xyz)) for k in range(3)) for N in weights]
+
+
 def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: bool = False
                             ) -> List[Vec]:
     """f_i = integral of N_i t over one edge or face in its undeformed geometry, by Gauss
@@ -3469,7 +3550,7 @@ class Converter:
         self._qmem_dists: set = set()              # thickness distributions taken into them
         self._qmem_dist_tables: set = set()        # ... and their tables
         self._ply_angle_dists: set = set()         # layer angle distributions the plies take
-        self._identity_ori = ""                    # ABQ2CCX_OR0 once written (_shell_section_cards)
+        self._identity_ori = ""                    # ABQ2CCX_OR0 once written (_identity_orientation)
         # shell and membrane sections whose material directions are given element group by
         # element group (_plan_shell_axes): id(section) -> element -> a, b tokens per layer
         self._exact_axes: Dict[int, "OrderedDict[int, Tuple[Tuple[str, ...], ...]]"] = {}
@@ -3479,7 +3560,8 @@ class Converter:
         self._free_readers: set = set()            # ... named by a section without direction dependence
         self._orient_axes: set = set()             # orientations whose axes are known (_register_orientation)
         self._mat_symmetry: Dict[str, Optional[str]] = {}  # material -> None / "ortho" / "aniso"
-        self._frame_bound_mats: set = set()        # isotropic ones whose ccx law depends on the axes
+        self._frame_bound_mats: set = set()        # *DEFORMATION PLASTICITY ones (_dp_axes)
+        self._ic_ori: Dict[int, Tuple[str, str]] = {}  # element -> its section, orientation (_plan_ic_axes)
         # knot beams: rigid couplings on shell/beam nodes, rotational BCs on circular-section
         # beams and across *BOUNDARY, OP=NEW (see _plan_rigid_couplings,
         # _plan_circ_rotation_knots, _plan_op_new_rotations, _add_knot_beams)
@@ -6135,6 +6217,8 @@ class Converter:
                 self._reduces("*SOLID SECTION, COMPOSITE")
             else:
                 self.report.note(f"*SOLID SECTION parameter {k} dropped (unused by ccx).", once=True)
+        if self._dp_axes(keep.get("MATERIAL"), keep.get("ORIENTATION")) is None:
+            keep.pop("ORIENTATION", None)
         data = list(b.data)
         thick = data[0].split(",")[0].strip() if data else ""
         if not thick and b.param("ELSET"):
@@ -6164,7 +6248,7 @@ class Converter:
                          f"*ELASTIC, TYPE=... will be rejected by ccx). Verify.", once=True)
         self._reduces(f"*{b.keyword} (the {kind} law)")
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict([("ELSET", elset), ("MATERIAL", mat)])
-        if b.param("ORIENTATION"):
+        if self._dp_axes(mat, b.param("ORIENTATION")):
             keep["ORIENTATION"] = b.param("ORIENTATION")
         return [emit_keyword("SOLID SECTION", keep)]
 
@@ -6384,6 +6468,8 @@ class Converter:
             rows = self._exact_axes.get(id(b))
             if rows is not None:
                 return self._continuum_axes_cards(b, rows, keep_s)
+            if self._dp_axes(keep_s.get("MATERIAL"), keep_s.get("ORIENTATION")) is None:
+                keep_s.pop("ORIENTATION", None)
             return [emit_keyword("SOLID SECTION", keep_s)]
         split = self._dist_split.get(id(b))
         if split is None:
@@ -6460,14 +6546,12 @@ class Converter:
                         # a distribution orientation's own rotation is already in its axes
                         oriname = self._plain_dist_orientation(base, axes[base], angle, pre) \
                             if base in axes else self._synth_orientation(base_ori, ply_ori, pre)
-                plies.append((thick, mat, oriname))
+                plies.append((thick, mat, self._dp_axes(mat, oriname)))
             if any(o for _, _, o in plies) and not all(o for _, _, o in plies):
                 # ccx 2.23 gives a ply line without an orientation the previous line's (probed:
                 # [90, 0] runs as [90, 90]), so the others name the global axes explicitly
-                if not self._identity_ori:
-                    self._identity_ori = "ABQ2CCX_OR0"
-                    pre += [f"*ORIENTATION, NAME={self._identity_ori}", "1., 0., 0., 0., 1., 0."]
-                plies = [(t, m, o or self._identity_ori) for t, m, o in plies]
+                ident = self._identity_orientation(pre)
+                plies = [(t, m, o or ident) for t, m, o in plies]
                 self.report.note("*SHELL SECTION, COMPOSITE: plies without an orientation name the "
                                  "global axes (ABQ2CCX_OR0) where another ply has one — ccx 2.23 "
                                  "would give them the previous ply's orientation (probed).", once=True)
@@ -6505,9 +6589,19 @@ class Converter:
         if rows is not None:
             return self._exact_axes_cards(b, rows, keep, data)
         pre = []
-        if base in axes:
+        if self._dp_axes(keep.get("MATERIAL"), keep.get("ORIENTATION")) is None:
+            keep.pop("ORIENTATION", None)
+        elif base in axes:
             keep["ORIENTATION"] = self._plain_dist_orientation(base, axes[base], 0.0, pre)
         return pre + [emit_keyword("SHELL SECTION", keep)] + data
+
+    def _identity_orientation(self, pre: List[str]) -> str:
+        """The *ORIENTATION along the global axes, ABQ2CCX_OR0, its card added to ``pre`` where
+        first used."""
+        if not self._identity_ori:
+            self._identity_ori = "ABQ2CCX_OR0"
+            pre += [f"*ORIENTATION, NAME={self._identity_ori}", "1., 0., 0., 0., 1., 0."]
+        return self._identity_ori
 
     def _section_layers(self, b: Block) -> List[Tuple[str, str, str]]:
         """(thickness, material, orientation field in upper case) of each layer of a shell or
@@ -6781,7 +6875,7 @@ class Converter:
         "ortho" with orthotropic ones (the same after a half turn about a material axis), else
         "aniso" — anisotropic cards and user materials.  _frame_bound_mats: those with
         *DEFORMATION PLASTICITY, an isotropic law whose results depend on the orientation's axes
-        in ccx 2.23 (CalculiX issue #160; see _plan_shell_axes)."""
+        in ccx 2.23 (CalculiX issue #160; see _dp_axes)."""
         for name, opts in self._material_options(blocks).items():
             if any(c.keyword == "DEFORMATION PLASTICITY" for c in opts[1:]):
                 self._frame_bound_mats.add(name)
@@ -6809,10 +6903,9 @@ class Converter:
         such a section the same results on any axes (probed on C3D8, C3D8I, C3D8R, C3D20R, S4R
         and M3D4: elastic, also under NLGEOM, *PLASTIC, Neo-Hooke, *CREEP, *EXPANSION) but prints
         its element stresses in them, NaN on zero axes, so handle_orientation writes a spherical
-        one as the global axes; *DEFORMATION PLASTICITY depends on the axes in ccx (up to 76 % on
-        turned ones, a hang on zero ones; CalculiX issue #160), so it counts on those only."""
+        one as the global axes.  (ccx's *DEFORMATION PLASTICITY depends on the axes, so such a
+        section reads none in ccx: _dp_axes.)"""
         lossless = {(b.param("NAME") or "").strip().upper(): True for b in blocks if b.keyword == "ORIENTATION"}
-        local_ic = self._local_ic_elements(blocks)
         for b in blocks:
             kw = b.keyword
             if kw in ("SHELL SECTION", "MEMBRANE SECTION") or (
@@ -6838,10 +6931,9 @@ class Converter:
             if kw == "CONNECTOR SECTION":
                 names |= {x.strip().upper() for r in merged_data_records(b) for x in r}
             own = id(b) in self._exact_axes or id(b) in self._ply_sections
-            free = not own and self._direction_free(b, local_ic)
-            bound = (b.param("MATERIAL") or "").strip().upper() in self._frame_bound_mats
+            free = not own and self._direction_free(b)
             for name in names - {""}:
-                ok = own or free and (not bound or self._global_axes_card(name))
+                ok = own or free
                 lossless[name] = lossless.get(name, True) and ok
                 if own:
                     self._axes_readers.add(name)
@@ -6849,40 +6941,45 @@ class Converter:
                     self._free_readers.add(name)
         self._lossless_ori = {name for name, yes in lossless.items() if yes}
 
-    def _direction_free(self, b: Block, local_ic: set) -> bool:
+    def _direction_free(self, b: Block) -> bool:
         """Whether section ``b`` names an orientation for nothing the physics depends on: a plain
         solid, shell or membrane section (a shell general section given by its material) whose
-        material has no direction dependence (_mat_symmetry), unless its elements have initial
-        stresses or plastic strains (``local_ic``), which Abaqus reads in the orientation's axes
-        (2017 Keywords *INITIAL CONDITIONS) and ccx 2.23 in global ones (probed)."""
+        material has no direction dependence (_mat_symmetry).  (Initial stresses and plastic
+        strains, which Abaqus reads in the orientation's axes, are written in global ones:
+        _ic_rows.)"""
         kw = b.keyword
         if b.has("COMPOSITE") or not (kw in ("SOLID SECTION", "SHELL SECTION", "MEMBRANE SECTION")
                                       or kw == "SHELL GENERAL SECTION" and b.has("MATERIAL")):
             return False
         mat = (b.param("MATERIAL") or "").strip().upper()
-        return bool(mat) and self._mat_symmetry.get(mat, "aniso") is None and \
-            not local_ic.intersection(self.geom.elset((b.param("ELSET") or "").strip()))
+        return bool(mat) and self._mat_symmetry.get(mat, "aniso") is None
 
-    def _local_ic_elements(self, blocks: List[Block]) -> set:
-        """The elements given initial stresses, plastic strains or backstresses, which Abaqus
-        reads in the axes of an orientation."""
-        out: set = set()
-        for b in blocks:
-            if b.keyword == "INITIAL CONDITIONS" and \
-                    (b.param("TYPE") or "").strip().upper() in ("STRESS", "PLASTIC STRAIN", "HARDENING"):
-                for rec in merged_data_records(b):
-                    tok = rec[0].strip() if rec else ""
-                    if re.fullmatch(r"[-+]?\d+", tok):
-                        out.add(int(tok))
-                    elif tok:
-                        out.update(self.geom.elset(tok))
-        return out
-
-    def _global_axes_card(self, name: str) -> bool:
-        """Whether handle_orientation writes orientation ``name`` as the global axes where only
-        sections without direction dependence read it: a plain spherical one."""
-        return name in self.orientations and name not in self._dist_refs and \
-            self.orientations[name][2].upper().startswith("SPH")
+    def _dp_axes(self, mat: Optional[str], ori: Optional[str]) -> Optional[str]:
+        """The orientation a section or composite ply of material ``mat`` names in ccx, given the
+        one ``ori`` it would name otherwise: none for a *DEFORMATION PLASTICITY material without
+        other direction dependence (_mat_symmetry).  The law is isotropic, so Abaqus' results do
+        not depend on the axes, but ccx 2.23's do (CalculiX issue #160; probed on C3D8, C3D8I,
+        C3D8R and C3D20R bars: up to 84 % off on turned axes, a hang on zero ones, exact on the
+        global ones), so leaving the orientation out is exact.  A material that depends on the
+        axes otherwise keeps it: reduced physics."""
+        m = (mat or "").strip().upper()
+        if not ori or m not in self._frame_bound_mats:
+            return ori
+        if self._mat_symmetry.get(m, "aniso") is None:
+            self.report.note(f"*DEFORMATION PLASTICITY material {m}: its sections are written without "
+                             f"their orientation — the law is isotropic, so Abaqus' results do not "
+                             f"depend on the axes, but ccx 2.23's do (CalculiX issue #160: up to 84 % "
+                             f"off on turned axes, a hang on zero ones; probed). ccx reports their "
+                             f"stresses and strains in global axes, Abaqus in the orientation's.",
+                             once=True)
+            return None
+        self.report.warn(f"*DEFORMATION PLASTICITY material {m} on an orientation: the material's "
+                         f"other options depend on the axes, so the orientation stays, but ccx 2.23's "
+                         f"deformation plasticity gives other results on turned axes than Abaqus' "
+                         f"(CalculiX issue #160: up to 84 % off; a hang on zero axes) — verify.",
+                         once=True)
+        self._reduces("*DEFORMATION PLASTICITY on an orientation (CalculiX issue #160)")
+        return ori
 
     def _exact_axes_cards(self, b: Block, rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]",
                           keep: "OrderedDict[str, Optional[str]]", data: Sequence[str] = ()) -> List[str]:
@@ -6914,10 +7011,17 @@ class Converter:
             params = OrderedDict(keep)
             params["ELSET"] = gname
             if composite:
+                plies = [(thick, mat, self._dp_axes(mat, name))
+                         for (thick, mat, _f), name in zip(layers, names)]
+                if not all(o for _t, _m, o in plies):  # ccx gives a ply line without one the last one's
+                    ident = self._identity_orientation(out)
+                    plies = [(t, m, o or ident) for t, m, o in plies]
                 out.append(emit_keyword(kw, params))
-                out += [f"{thick}, , {mat}, {name}" for (thick, mat, _f), name in zip(layers, names)]
+                out += [f"{thick}, , {mat}, {name}" for thick, mat, name in plies]
             else:
-                params["ORIENTATION"] = names[0]
+                params["ORIENTATION"] = self._dp_axes(params.get("MATERIAL"), names[0])
+                if not params["ORIENTATION"]:
+                    del params["ORIENTATION"]
                 out += [emit_keyword(kw, params)] + list(data)
         if composite:
             self.report.note(f"*SHELL SECTION, COMPOSITE on shells whose normal is not the "
@@ -6963,6 +7067,8 @@ class Converter:
             out += [f"*DISTRIBUTION, NAME={dname}"] + [f"{e}, " + ", ".join(tok) for e, tok in axes.items()] + \
                 [f"*ORIENTATION, NAME={oname}", dname]
             params["ORIENTATION"] = oname
+        if self._dp_axes(params.get("MATERIAL"), params["ORIENTATION"]) is None:
+            del params["ORIENTATION"]
         self.report.note(f"*{b.keyword} on continuum shells whose material directions ccx's solids "
                          f"would place otherwise (the global axes off the x-y plane, an orientation's "
                          f"axes unprojected, a cylindrical system at each integration point, a "
@@ -6982,6 +7088,9 @@ class Converter:
         rows = self._exact_axes.get(id(b))
         if rows is not None:
             return self._exact_axes_cards(b, rows, OrderedDict(b.params), list(b.data))
+        if self._dp_axes(b.param("MATERIAL"), b.param("ORIENTATION")) is None and b.has("ORIENTATION"):
+            return [emit_keyword("MEMBRANE SECTION", OrderedDict(
+                (k, v) for k, v in b.params.items() if k != "ORIENTATION"))] + list(b.data)
         split = self._dist_split.get(id(b))
         if split is None:
             return self.passthrough(b)
@@ -12603,6 +12712,106 @@ class Converter:
             data = self._circ_explicit_increment(keep, data)
         return [emit_keyword("DYNAMIC", keep)] + data
 
+    def _plan_ic_axes(self, blocks: List[Block]) -> None:
+        """The section, and the orientation it names, of each element that has one, in a deck
+        with initial stresses or plastic strains (_ic_ori), which Abaqus reads in the
+        orientation's axes (_ic_rows)."""
+        if not any(b.keyword == "INITIAL CONDITIONS" and (b.param("TYPE") or "").strip().upper()
+                   in ("STRESS", "PLASTIC STRAIN") for b in blocks):
+            return
+        for b in blocks:
+            name = (b.param("ORIENTATION") or "").strip().upper()
+            if name and b.keyword.endswith("SECTION"):
+                for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                    self._ic_ori[e] = (b.keyword, name)
+
+    def _ic_rows(self, typ: str, eid: int, ctype: str, v: List[float], n: int,
+                 unrotated: Dict[str, int]) -> Optional[List[List[str]]]:
+        """The values ccx is to read at each of the ``n`` integration points of element ``eid``
+        (ccx type ``ctype``) for the values ``v`` of an *INITIAL CONDITIONS, TYPE=STRESS / PLASTIC
+        STRAIN record, or None where it reads the record as Abaqus does.  Abaqus orders the
+        components as the element type does — a plane-stress element 11, 22, 12, a plane-strain
+        or axisymmetric one 11, 22, 33, 12, a solid 11, 22, 33, 12, 13, 23, strains with
+        engineering shear components (2017 Conventions: Abaqus "always reports shear strain as
+        engineering shear strain", and initial plastic strains are copied from its PE output; no
+        page states the measure for this input) — and gives them in the axes of the
+        orientation that applies to the element (Keywords *INITIAL CONDITIONS).  ccx 2.23 reads
+        xx, yy, zz, xy, xz, yz in global axes, a plastic strain's shear as tensor components
+        (probed: a third value on CPS4 is szz; a free cube's initial plastic strain xy = 0.01
+        shears it by 0.02; stresses and plastic strains on a turned orientation act along the
+        global axes).  So the values are turned into global axes — one rotation per element on
+        a rectangular system, one per integration point (ccx_integration_points) on a
+        cylindrical or spherical one; where the axes are not known there, they stay as given
+        (``unrotated`` counts the elements by the reason: reduced physics)."""
+        family = ctype[:3] if ctype[:3] in ("CPS", "CPE", "CAX") else "C3D"
+        order = {"CPS": (0, 1, 3), "CPE": (0, 1, 2, 3), "CAX": (0, 1, 2, 3)}.get(family, range(6))
+        s = [0.0] * 6
+        for k, x in zip(order, v):
+            s[k] = x
+        changed = family == "CPS" and len(v) > 2 and v[2] != 0.0
+        if changed:
+            self.report.note(f"*INITIAL CONDITIONS, TYPE={typ} on plane-stress elements: Abaqus' "
+                             f"components 11, 22, 12 written as ccx's xx, yy, zz = 0, xy (ccx reads a "
+                             f"third value as zz; probed).", once=True)
+        if typ == "PLASTIC STRAIN" and any(s[3:]):
+            s[3:] = [x / 2 for x in s[3:]]
+            changed = True
+            self.report.note("*INITIAL CONDITIONS, TYPE=PLASTIC STRAIN: the shear components halved — "
+                             "Abaqus gives engineering shear strains (2017 Conventions), ccx 2.23 reads "
+                             "tensor components (probed).", once=True)
+        rows = [s]
+        if eid in self._ic_ori and any(s):
+            frames, why = self._ic_frames(eid, ctype, self._ic_ori[eid], family != "C3D")
+            if frames is None:
+                unrotated[why] = unrotated.get(why, 0) + 1
+            else:
+                rows = [tensor_to_global(f, s) for f in frames]
+                scale = max(abs(x) for x in s)
+                if any(abs(x - y) > 1e-12 * scale for r in rows for x, y in zip(r, s)):
+                    changed = True
+                    self.report.note(f"*INITIAL CONDITIONS, TYPE={typ} on elements with an "
+                                     f"orientation: Abaqus reads the values in its axes, ccx 2.23 in "
+                                     f"global ones (probed), so they are written in global axes — "
+                                     f"turned once per element on a rectangular system, at each "
+                                     f"integration point on a cylindrical or spherical one.", once=True)
+        if not changed:
+            return None
+        scale = max(abs(x) for r in rows for x in r)
+        out = [[short_real(x if abs(x) > 1e-12 * scale else 0.0, 12) for x in r] for r in rows]
+        return out * n if len(out) == 1 else out
+
+    def _ic_frames(self, eid: int, ctype: str, entry: Tuple[str, str], planar: bool
+                   ) -> Tuple[Optional[List[Tuple[Vec, Vec, Vec]]], str]:
+        """Abaqus' axes of the orientation of element ``eid``'s section (``entry``: its keyword
+        and orientation name; _ic_ori) for its initial conditions (_ic_rows): one frame on a
+        rectangular system, one per integration point of its ccx type ``ctype`` on a cylindrical
+        or spherical one — or None and why they are not known there.  A plane or axisymmetric
+        element (``planar``) needs axis 3 normal to the model plane."""
+        kw, name = entry
+        if kw != "SOLID SECTION":
+            return None, f"they are in a *{kw}, whose local directions the converter does not form"
+        conn = self.geom.elements[eid][1]
+        pts: Optional[List[Vec]] = [(0.0, 0.0, 0.0)]
+        if self._turning_system(name):
+            pts = None if any(x not in self.geom.nodes for x in conn) else \
+                ccx_integration_points(ctype, [self.geom.nodes[x] for x in conn])
+            if pts is None:
+                return None, f"ccx's integration points of their type {ctype} are not known"
+        frames = []
+        for p in pts:
+            got = self._abaqus_frame(eid, name, p)
+            if got is None:
+                return None, (f"the axes of orientation {name} are not known (DEFINITION=OFFSET TO "
+                              f"NODES, a *DISTRIBUTION without data, or no such orientation)")
+            if any(abs(vnorm(a) - 1.0) > 1e-6 for a in got[0]):
+                return None, (f"orientation {name} leaves its axes undefined at an integration point "
+                              f"(on a cylindrical system's axis, at a spherical system's centre or on "
+                              f"its polar axis)")
+            if planar and abs(abs(got[0][2][2]) - 1.0) > 1e-9:
+                return None, f"axis 3 of orientation {name} is not normal to the model plane"
+            frames.append(got[0])
+        return frames, ""
+
     def handle_initial_conditions(self, b: Block) -> List[str]:
         """``*INITIAL CONDITIONS, TYPE=STRESS/PLASTIC STRAIN/SOLUTION``: Abaqus writes one
         line per element/elset with NO integration-point column; ccx requires one line per
@@ -12652,6 +12861,8 @@ class Converter:
                                  "them apart — each line was taken as its own record. Verify.",
                                  once=True)
                 self._reduces("*INITIAL CONDITIONS, TYPE=SOLUTION records misread")
+        tensor = typ in ("STRESS", "PLASTIC STRAIN") and not (b.has("REBAR") or b.has("SECTION POINTS"))
+        unrotated: Dict[str, int] = {}
         for f in records:
             tok, vals = f[0], f[1:]
             eids = [int(tok)] if re.fullmatch(r"[-+]?\d+", tok) else self.geom.elset(tok)
@@ -12659,15 +12870,27 @@ class Converter:
                 self.report.warn(f"*INITIAL CONDITIONS TYPE={typ}: '{tok}' matches no element or "
                                  f"elset; record dropped.", once=True)
                 continue
+            try:
+                v = [pf(x) for x in vals] if tensor else None
+            except ValueError:
+                v = None
             for eid in eids:
                 info = self.geom.elements.get(eid)
-                n = ELEMENT_IP_COUNT.get(ccx_element_type(info[0], self.report)) if info else None
+                ctype = ccx_element_type(info[0], self.report) if info else ""
+                n = ELEMENT_IP_COUNT.get(ctype)
                 if not n:
                     skipped += 1
                     continue
+                rows = self._ic_rows(typ, eid, ctype, v, n, unrotated) if v else None
                 for k in range(1, n + 1):
-                    out.extend(reflow([str(eid), str(k)] + vals, MAX_ENTRIES_PER_LINE))
+                    out.extend(reflow([str(eid), str(k)] + (rows[k - 1] if rows else vals),
+                                      MAX_ENTRIES_PER_LINE))
                 expanded += 1
+        for why, count in unrotated.items():
+            self.report.warn(f"*INITIAL CONDITIONS TYPE={typ}: {count} element(s) have their values in "
+                             f"the axes of an orientation (Abaqus), but {why}: they are written as they "
+                             f"are, which ccx reads as global components — verify.", once=True)
+            self._reduces(f"*INITIAL CONDITIONS, TYPE={typ} in an orientation's axes, not turned")
         if expanded:
             self.report.warn(f"*INITIAL CONDITIONS TYPE={typ} expanded to ccx's per-integration-"
                              f"point format (uniform value per element; 2D elements use the "
@@ -13040,6 +13263,7 @@ class Converter:
         self._plan_material_symmetry(blocks)
         self._plan_distributions(blocks)
         self._plan_shell_axes(blocks)           # after the distributions: their axes
+        self._plan_ic_axes(blocks)
         self._plan_sheet_pressure(blocks)       # after _plan_distributions resets the used names
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
@@ -15336,6 +15560,10 @@ class Converter:
         out: List[str] = []
         frames: Dict[Tuple[int, str], Tuple[Vec, Tuple[Vec, Vec]]] = {}
         for grp in plan["groups"]:
+            oname = self._fresh_name(f"{grp['set']}_ORI")
+            if self._dp_axes(grp["mat"], oname) is None:
+                out.append(f"*SOLID SECTION, ELSET={grp['set']}, MATERIAL={grp['mat']}")
+                continue
             field = grp["ori"].strip().upper()
             ori, angle, per = base, 0.0, None
             if field:
@@ -15368,7 +15596,6 @@ class Converter:
                                  f"layer angle distribution {field}, which has no default line; "
                                  f"they get 0 degrees — verify.", once=True)
                 self._reduces(f"layer angle distribution {field} without a default line")
-            oname = self._fresh_name(f"{grp['set']}_ORI")
             if len(set(axes.values())) == 1:
                 out += [f"*ORIENTATION, NAME={oname}", ", ".join(next(iter(axes.values())))]
             else:

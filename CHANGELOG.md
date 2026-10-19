@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **Initial stresses and deformation plasticity on oriented sections** — `*INITIAL CONDITIONS,
+  TYPE=STRESS / PLASTIC STRAIN` are turned out of the orientation's axes, in which Abaqus gives
+  them, into the global ones ccx 2.23 reads them in — at each of ccx's integration points on a
+  cylindrical or spherical system (a free cube on a turned system relaxed 158 % off before).
+  Records ccx misread get its form too: a plane-stress element's S12 (read as szz) and a
+  plastic strain's engineering shear (ccx reads tensor components). The sections and plies of a
+  `*DEFORMATION PLASTICITY` material are written without their orientation: the law is
+  isotropic, but ccx's results depended on the axes (CalculiX issue #160: a `C3D20R` bar 84 %
+  off, a hang on zero axes).
 * **Orientations isotropic sections read** — a spherical `*ORIENTATION` and a cylindrical one's
   rotation line, which ccx 2.23 lacks, are no longer reduced physics where every section that
   reads them is isotropic or gets Abaqus' directions per element: ccx's results do not depend on

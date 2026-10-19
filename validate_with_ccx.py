@@ -26,7 +26,10 @@ shells whose orientation leaves their plane or has no rotation line (the ply's s
 Abaqus' direction), of hoop-wound S4 and SC8R cylinders (thin-wall theory), of spheres of
 orthotropic S4R and SC8R shells and SC8R plies with a spherical system (membrane theory) and of a
 fibre-steered strip whose distribution axes leave the
-plate (the same strip with them in it), quadratic membranes (strips in tension, also under NLGEOM, and
+plate (the same strip with them in it), initial stresses and plastic strains given in a turned
+and a cylindrical orientation (a free cube's strains, an annulus' closed-form displacement) and
+on a plane-stress element (tau / G), deformation-plasticity bars on oriented sections (the same
+bars without an orientation), quadratic membranes (strips in tension, also under NLGEOM, and
 a pressurized sphere) against uniaxial stress and thin-wall theory, a clamped beam and plate after a later step's *BOUNDARY,
 OP=NEW, the thermal strains of isotropic materials with an orthotropic / anisotropic
 expansion (including the engineering shear coefficients of an anisotropic one), a heated
@@ -1601,6 +1604,132 @@ def sphere_membrane(theta, kind="s4r", t=0.01):
     ec, em = force * (a22 - a12) / det, force * (a11 - a12) / det
     u = (em - ec) * math.sin(theta) * math.log(math.tan(theta / 2))
     return ec - u / math.tan(theta), u
+
+
+# a turned rectangular system (points a, b) for the initial-condition and deformation-plasticity
+# checks, and the corners of a unit cube in Abaqus' C3D8 order
+TURNED_AB = ((0.8, 0.6, 0.0), (-0.36, 0.48, 0.8))
+CUBE_CORNERS = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
+IC_STRESS = (100.0, -40.0, 25.0, 30.0, -20.0, 15.0)
+IC_PLASTIC = (0.004, -0.001, -0.003, 0.002, -0.0015, 0.001)        # engineering shear, as Abaqus
+
+
+def local_to_global(ab, s):
+    """The global components (11, 22, 33, 12, 13, 23) of the symmetric tensor ``s`` given in the
+    rectangular system of points ``ab``: R s R^T, R's columns its unit axes."""
+    e1 = _unit(ab[0])
+    e3 = _unit(_cross(ab[0], ab[1]))
+    e2 = _cross(e3, e1)
+    r = [[e1[i], e2[i], e3[i]] for i in range(3)]
+    g = _matmul(_matmul(r, [[s[0], s[3], s[4]], [s[3], s[1], s[5]], [s[4], s[5], s[2]]]),
+                [list(x) for x in zip(*r)])
+    return [g[0][0], g[1][1], g[2][2], g[0][1], g[0][2], g[1][2]]
+
+
+def ic_cube_deck(kind):
+    """A free unit C3D8 cube (held against rigid motion only) with an initial stress IC_STRESS
+    (``kind`` "stress"; E 1000, nu 0.25) or plastic strain IC_PLASTIC ("plastic"; a *Plastic
+    material that stays elastic) given in TURNED_AB's axes, which Abaqus reads them in (2017
+    Keywords *INITIAL CONDITIONS)."""
+    lines = ["*Heading", f"Free cube with an initial {kind} given in a turned *Orientation", "*Node, nset=ALL"]
+    lines += [f"{k}, {x}., {y}., {z}." for k, (x, y, z) in enumerate(CUBE_CORNERS, 1)]
+    lines += ["*Element, type=C3D8, elset=CUBE", "1, 1, 2, 3, 4, 5, 6, 7, 8",
+              "*Orientation, name=TURNED", ", ".join(f"{x:g}" for x in TURNED_AB[0] + TURNED_AB[1]),
+              "*Material, name=M", "*Elastic", "1000., 0.25"]
+    lines += ["*Plastic", "1.e6, 0.", "1.1e6, 1."] if kind == "plastic" else []
+    vals = IC_PLASTIC if kind == "plastic" else IC_STRESS
+    lines += ["*Solid Section, elset=CUBE, material=M, orientation=TURNED",
+              f"*Initial Conditions, type={'PLASTIC STRAIN' if kind == 'plastic' else 'STRESS'}",
+              "CUBE, " + ", ".join(f"{x:g}" for x in vals),
+              "*Boundary", "1, 1, 3", "2, 2, 3", "4, 3, 3", "*Step", "*Static",
+              "*Node Print, nset=ALL", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def ic_annulus_deck(nr=8, nt=18, t=0.1, a=1.0, b=2.0, s0=100.0):
+    """A quarter annulus a < r < b of C3D20R (nr x nt elements, thickness t; the planes x = 0 and
+    y = 0 held normal, every node in z: plane strain; E 1000, nu 0.3) with a uniform initial
+    hoop stress s0 in a cylindrical *Orientation about the z axis, whose axis 2 is
+    tangential.  Returns the deck and {node: (x, y)}."""
+    ids: dict = {}
+
+    def nid(i, j, k):                                  # half steps radially, around, in z
+        if (i, j, k) not in ids:
+            r, th = a + (b - a) * i / (2 * nr), math.pi / 2 * j / (2 * nt)
+            ids[(i, j, k)] = (len(ids) + 1, r * math.cos(th), r * math.sin(th), t * k / 2)
+        return ids[(i, j, k)][0]
+    lines = ["*Heading", "Quarter annulus with an initial hoop stress in a cylindrical *Orientation"]
+    elems = []
+    for i in range(0, 2 * nr, 2):
+        for j in range(0, 2 * nt, 2):
+            pts = [(i, j, 0), (i + 2, j, 0), (i + 2, j + 2, 0), (i, j + 2, 0), (i, j, 2), (i + 2, j, 2),
+                   (i + 2, j + 2, 2), (i, j + 2, 2), (i + 1, j, 0), (i + 2, j + 1, 0), (i + 1, j + 2, 0),
+                   (i, j + 1, 0), (i + 1, j, 2), (i + 2, j + 1, 2), (i + 1, j + 2, 2), (i, j + 1, 2),
+                   (i, j, 1), (i + 2, j, 1), (i + 2, j + 2, 1), (i, j + 2, 1)]
+            elems.append([nid(*p) for p in pts])
+    nodes = sorted(ids.values())
+    lines += ["*Node, nset=ALL"] + [f"{n}, {x:.12f}, {y:.12f}, {z:.12f}" for n, x, y, z in nodes]
+    lines += ["*Element, type=C3D20R, elset=RING"]
+    for e, conn in enumerate(elems, 1):
+        lines += [f"{e}, " + ", ".join(map(str, conn[:15])) + ",", ", ".join(map(str, conn[15:]))]
+    lines += ["*Nset, nset=X0"] + _ids([n for n, x, _y, _z in nodes if abs(x) < 1e-9])
+    lines += ["*Nset, nset=Y0"] + _ids([n for n, _x, y, _z in nodes if abs(y) < 1e-9])
+    lines += ["*Orientation, name=CYL, system=CYLINDRICAL", "0., 0., 0., 0., 0., 1.",
+              "*Material, name=M", "*Elastic", "1000., 0.3",
+              "*Solid Section, elset=RING, material=M, orientation=CYL",
+              "*Initial Conditions, type=STRESS", f"RING, 0., {s0:g}, 0., 0., 0., 0.",
+              "*Boundary", "X0, 1, 1", "Y0, 2, 2", "ALL, 3, 3", "*Step", "*Static",
+              "*Node Print, nset=ALL", "U", "*End Step"]
+    return "\n".join(lines) + "\n", {n: (x, y) for n, x, y, _z in nodes}
+
+
+def annulus_hoop_displacement(r, s0=100.0, e=1000.0, nu=0.3, a=1.0, b=2.0):
+    """The radial displacement at radius r of ic_annulus_deck: with sigma = s0 e_t e_t + C eps
+    the plane-strain annulus' radial equilibrium is (lambda + 2 mu)(u'' + u'/r - u/r^2) = s0 / r,
+    so u = c r ln r + A r + B / r, c = s0 / (2 (lambda + 2 mu)), with A and B from the free
+    surfaces sigma_r(a) = sigma_r(b) = 0, sigma_r = (lambda + 2 mu) u' + lambda u / r."""
+    lam, mu = e * nu / ((1 + nu) * (1 - 2 * nu)), e / (2 * (1 + nu))
+    big = lam + 2 * mu
+    c = s0 / (2 * big)
+    bb = (big + lam) * c * math.log(b / a) / ((big - lam) * (1 / b ** 2 - 1 / a ** 2))
+    aa = ((big - lam) * bb / a ** 2 - (big + lam) * c * math.log(a) - big * c) / (big + lam)
+    return c * r * math.log(r) + aa * r + bb / r
+
+
+def dp_bar_deck(typ, ori):
+    """A 4 x 1 x 1 bar of *Deformation Plasticity steel (four C3D8 or C3D20R), clamped at x = 0,
+    pulled, bent and sheared at its tip past yield (NLGEOM, as ccx runs that law anyway), on no
+    orientation, TURNED_AB, a cylindrical system or a spherical one centred at the bar's
+    clamped corner (``ori`` "none", "turned", "cylindrical", "spherical")."""
+    quad = typ == "C3D20R"
+    ids: dict = {}
+
+    def nid(p):                                        # p in half units
+        return ids.setdefault(p, len(ids) + 1)
+    elems = []
+    for i in range(0, 8, 2):
+        c = [(i, 0, 0), (i + 2, 0, 0), (i + 2, 2, 0), (i, 2, 0), (i, 0, 2), (i + 2, 0, 2), (i + 2, 2, 2), (i, 2, 2)]
+        mid = [tuple((p + q) // 2 for p, q in zip(c[x], c[y])) for x, y in
+               ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7))]
+        elems.append([nid(p) for p in c + (mid if quad else [])])
+    lines = ["*Heading", f"Deformation plasticity bar, orientation: {ori}", "*Node, nset=ALL"]
+    lines += [f"{n}, " + ", ".join(f"{x / 2:.12g}" for x in p) for p, n in ids.items()]
+    lines += [f"*Element, type={typ}, elset=BAR"]
+    for e, conn in enumerate(elems, 1):
+        lines += [f"{e}, " + ", ".join(map(str, conn[:15])) + ("," if len(conn) > 15 else "")]
+        lines += [", ".join(map(str, conn[15:]))] if len(conn) > 15 else []
+    clamp = [n for p, n in ids.items() if p[0] == 0]
+    tip = [n for p, n in ids.items() if p[0] == 8]
+    lines += ["*Nset, nset=CLAMP"] + _ids(clamp) + ["*Nset, nset=TIP"] + _ids(tip)
+    lines += {"none": [], "turned": ["*Orientation, name=O", ", ".join(f"{x:g}" for x in TURNED_AB[0] + TURNED_AB[1])],
+              "cylindrical": ["*Orientation, name=O, system=CYLINDRICAL", "-3., -2., -1., -3., 5., 2."],
+              "spherical": ["*Orientation, name=O, system=SPHERICAL", "0., 0., 0., 0., 0., 1."]}[ori]
+    lines += ["*Material, name=STEEL", "*Deformation Plasticity", "210000., 0.3, 250., 5., 0.5",
+              "*Solid Section, elset=BAR, material=STEEL" + ("" if ori == "none" else ", orientation=O"),
+              "*Boundary", "CLAMP, 1, 3", "*Step, nlgeom, inc=200", "*Static", "0.05, 1., 1e-6, 0.1", "*Cload"]
+    lines += [f"{n}, {d}, {f / len(tip):.9g}" for n in tip for d, f in ((1, 280.0), (2, 12.0), (3, 6.0))]
+    lines += ["*Node Print, nset=ALL", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
 
 
 def distribution_panel_deck(plane="XY", tilt=0.0, nx=8, ny=2):
@@ -3878,6 +4007,101 @@ def main():
               + (" (ccx loads the inner face of its expanded shells: 1 % less load at this t/R)"
                  if kind.startswith("s4r") else ""))
         failures += 0 if ok else 1
+
+    # --- initial stresses and plastic strains given in an orientation's axes -----------------
+    # Abaqus reads them in the axes of the element's orientation, ccx 2.23 in global ones, and a
+    # plastic strain's shear as tensor components (Abaqus: engineering); abq2ccx turns them into
+    # global axes, at each integration point on a cylindrical system.  A free cube relaxes its
+    # initial stress to eps = -C^-1 sigma and takes its plastic strain stress-free; a quarter
+    # annulus with a uniform hoop stress has a closed-form radial displacement; a CPS4 square's
+    # initial shear (Abaqus' third component on plane stress, ccx's fourth) relaxes by tau / G
+    def faithful_run(text, tag):
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"{tag}.inp")
+        _rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if u is None or conv.reduced_physics:
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if u is None else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return u
+
+    for kind in ("stress", "plastic"):
+        tag = f"initial_{kind}_turned"
+        u = faithful_run(ic_cube_deck(kind), tag)
+        if u is None:
+            failures += 1
+            continue
+        h = [[u[k][i] - u[1][i] for k in (2, 4, 5)] for i in range(3)]      # du_i / dx_j
+        eps = [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2,
+               (h[1][2] + h[2][1]) / 2]
+        if kind == "stress":
+            sg = local_to_global(TURNED_AB, IC_STRESS)
+            want = [-(1.25 * x - (0.25 * sum(sg[:3]) if k < 3 else 0.0)) / 1000.0 for k, x in enumerate(sg)]
+        else:
+            want = local_to_global(TURNED_AB, IC_PLASTIC[:3] + tuple(x / 2 for x in IC_PLASTIC[3:]))
+        err = max(abs(x - y) for x, y in zip(eps, want)) / max(abs(y) for y in want)
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (free C3D8 cube, an initial "
+              + ("stress" if kind == "stress" else "plastic strain with engineering shear terms")
+              + f" in a turned rectangular *Orientation): strains {err:.1e} of the largest off "
+              + ("-C^-1 R sigma R^T" if kind == "stress" else "R eps_p R^T, stress-free"))
+        failures += 0 if ok else 1
+    text, xy = ic_annulus_deck()
+    u = faithful_run(text, "initial_stress_cylindrical")
+    if u is None:
+        failures += 1
+    else:
+        err = scale = 0.0
+        for n, (x, y) in xy.items():
+            th, want = math.atan2(y, x), annulus_hoop_displacement(math.hypot(x, y))
+            err = max(err, abs(u[n][0] * math.cos(th) + u[n][1] * math.sin(th) - want),
+                      abs(u[n][1] * math.cos(th) - u[n][0] * math.sin(th)))
+            scale = max(scale, abs(want))
+        ok = err < 1e-4 * scale
+        print(f"{'PASS' if ok else 'FAIL'}  initial_stress_cylindrical (C3D20R quarter annulus in plane "
+              f"strain, a uniform hoop stress in a cylindrical *Orientation): displacement vs the "
+              f"closed form, max difference {err / scale:.1e} of the largest {scale:.4g}")
+        failures += 0 if ok else 1
+    u = faithful_run("*Heading\nUnit square with an initial shear stress\n*Node, nset=ALL\n1, 0., 0.\n"
+                     "2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*Element, type=CPS4, elset=SQ\n1, 1, 2, 3, 4\n"
+                     "*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, elset=SQ, material=M\n1.\n"
+                     "*Initial Conditions, type=STRESS\nSQ, 0., 0., 100.\n*Boundary\n1, 1, 2\n2, 2, 2\n"
+                     "*Step\n*Static\n*Node Print, nset=ALL\nU\n*End Step\n", "initial_stress_plane_stress")
+    if u is None:
+        failures += 1
+    else:
+        ok = abs(u[4][0] + 0.2) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  initial_stress_plane_stress (CPS4 square, initial S12 = 100, "
+              f"G = 500): shear {u[4][0]:+.6f} (-tau / G = -0.2)")
+        failures += 0 if ok else 1
+
+    # --- *Deformation Plasticity on an orientation ------------------------------------------
+    # an isotropic law, so Abaqus' results do not depend on the axes, but ccx 2.23's do (CalculiX
+    # issue #160: up to 84 % off on turned axes, a hang on zero ones): abq2ccx writes its sections
+    # without the orientation, and a bar on any must move as the one without
+    for typ in ("C3D8", "C3D20R"):
+        ref = faithful_run(dp_bar_deck(typ, "none"), f"deformation_plasticity_{typ.lower()}")
+        if ref is None:
+            failures += 1
+            continue
+        scale = max(abs(x) for v in ref.values() for x in v)
+        for ori in ("turned", "cylindrical", "spherical"):
+            tag = f"deformation_plasticity_{typ.lower()}_{ori}"
+            u = faithful_run(dp_bar_deck(typ, ori), tag)
+            if u is None:
+                failures += 1
+                continue
+            err = max(abs(x - y) for n in ref for x, y in zip(u.get(n, [math.inf] * 3), ref[n])) / scale
+            ok = err < 1e-9
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (four {typ} past yield, a {ori} *Orientation): "
+                  f"displacements {err:.1e} of the largest {scale:.4g} off the bar without one")
+            failures += 0 if ok else 1
     # --- quadratic membranes: ccx 2.23 expands each element on nodes of its own and leaves the
     # mid-thickness node of its corners free (M3D8R singular, M3D6 / M3D8 too soft); abq2ccx
     # writes the solids itself, held at the membrane nodes by *EQUATION
