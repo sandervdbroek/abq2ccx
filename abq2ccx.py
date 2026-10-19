@@ -3703,7 +3703,7 @@ class Converter:
         # (id(card), line) -> [(why, node pair)] for the line's pairs that are commented out
         self._mpc_refused: Dict[Tuple[int, int], List[Tuple[str, Tuple[int, int]]]] = {}
         self._mpc_thermal = False                  # a step solves for temperatures
-        self._mpc_mechanical = True                # ... for displacements
+        self._mechanical = True                    # a step is not heat transfer alone
         # node with a *TRANSFORM -> its twin: a new node without one that follows it (u_twin =
         # u_node), through which a constraint uses the node's global displacement (_dir_terms);
         # the twins whose equations are written
@@ -3755,7 +3755,6 @@ class Converter:
         self._lc_drop: set = set()                 # id(*BOUNDARY, LOAD CASE=2) left out
         self._param_values: set = set()            # parameter values in the deck (_prescan)
         self._sc_types: Dict[str, set] = {}        # *SECTION CONTROLS name -> its Abaqus types
-        self._sc_explicit = False
         self._sc_damage = False
         self._sc_hyper: set = set()
         # distributed loads emitted as consistent nodal forces (see _flush_nodal_loads):
@@ -6306,7 +6305,7 @@ class Converter:
             if k == "NAME":
                 continue
             if k in self._SC_EXPLICIT_ONLY:
-                if self._sc_explicit:
+                if self._explicit_deck:
                     why.append(f"{k}={v} (explicit step)")
             elif k == "HOURGLASS":
                 # the default: ENHANCED on hyperelastic / hyperfoam materials and (Standard)
@@ -6315,14 +6314,14 @@ class Converter:
                 changed = [t for t in hourglass if v != (
                     "ENHANCED" if name in self._sc_hyper or
                     t.startswith(("C3D10M", "CPS6M", "CPE6M", "CAX6M", "CPEG6M")) else
-                    "RELAX STIFFNESS" if self._sc_explicit else "STIFFNESS")]
+                    "RELAX STIFFNESS" if self._explicit_deck else "STIFFNESS")]
                 if changed:
                     why.append(f"HOURGLASS={v} on {', '.join(changed)}")
             elif k in ("ELEMENT DELETION", "MAX DEGRADATION", "VISCOSITY"):
                 if self._sc_damage or any(t.startswith(("COH", "CONN")) for t in types):
                     why.append(f"{k}={v} (progressive damage)")
             elif k == "DISTORTION CONTROL":
-                if self._sc_explicit or "C3D10HS" in types:
+                if self._explicit_deck or "C3D10HS" in types:
                     why.append(f"{k}={v}")
             elif k == "INITIAL GAP OPENING":
                 if any(t.startswith("COH") and "P" in t[3:] for t in types):
@@ -6344,8 +6343,8 @@ class Converter:
                 continue                         # the default value / not used
             if (i == 0 and hourglass and not enhanced) or scale is None or \
                     (i == 1 and not enhanced and any(t.startswith("S4R") for t in hourglass)) or \
-                    (i in (2, 3, 4, 7) and self._sc_explicit) or (i == 5 and "C3D4H" in types) or \
-                    (i > 7 and self._sc_explicit):
+                    (i in (2, 3, 4, 7) and self._explicit_deck) or (i == 5 and "C3D4H" in types) or \
+                    (i > 7 and self._explicit_deck):
                 why.append(f"data-line value {i + 1} = {x}")
         if not types:
             return self._commented(b, f"*SECTION CONTROLS {name or ''}: no section uses it; commented "
@@ -9944,8 +9943,7 @@ class Converter:
         self._rot_mode, self._rot_lines = {}, {}
         if not self._transformed or getattr(self.opt, "solid_dof", False):
             return
-        procs = [b for b in blocks if b.keyword in PROC_KW]
-        if procs and all(b.keyword == "HEAT TRANSFER" for b in procs):
+        if not self._mechanical:
             return
         kin = self._kinematic_refs(blocks)
         own = {n for n in self._transformed if n not in self._rb_rot and
@@ -9963,7 +9961,6 @@ class Converter:
         if not used:
             return
         dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
-        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         beam_nodes = {n for typ, conn in self.geom.elements.values()
                       if ccx_type(typ) in BEAM_TYPES and
                       not ccx_type(typ).startswith(("T2D", "T3D")) for n in conn}
@@ -9993,7 +9990,7 @@ class Converter:
                     mode = "global"
                 elif knot is False and not dynamic and len(many) == 1 and n not in circ:
                     mode = "keep"
-                elif explicit:
+                elif self._explicit_deck:
                     mode = "keep" if trivial else "refuse"
                     refused[n] = ("ccx's explicit solver stops on the knot beam that would carry "
                                   "them in global components, and without one ccx makes the node a "
@@ -11456,11 +11453,11 @@ class Converter:
                 for dep, ind in arg:
                     both = all(n in self._knots and n in self._rot_nodes for n in (dep, ind))
                     dofs = ((1, 2, 3, 4, 5, 6) if typ == "TIE" and both and self._tie_rotations
-                            else (1, 2, 3)) if self._mpc_mechanical else ()
+                            else (1, 2, 3)) if self._mechanical else ()
                     if typ == "TIE" and self._mpc_thermal:
                         dofs += (11,)
                     # the displacements in the local DOFs of nodes with a *TRANSFORM
-                    rows = self._tie_rows(dep, ind) if self._mpc_mechanical else None
+                    rows = self._tie_rows(dep, ind) if self._mechanical else None
                     if rows is not None:
                         eqs += self._twin_lines(rows) + self._equation_lines(rows)
                         local = True
@@ -11472,7 +11469,7 @@ class Converter:
                                          "rotations (solid or free node): only the displacements "
                                          "are tied — ccx has no rotations on the other node.",
                                          once=True)
-                if typ == "PIN" and not self._mpc_mechanical:
+                if typ == "PIN" and not self._mechanical:
                     self.report.note("*MPC PIN ties displacements only; a heat-transfer-only deck "
                                      "has none, so it was left out.", once=True)
                 else:
@@ -13473,6 +13470,7 @@ class Converter:
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
+        self._plan_deck_facts(blocks)
         self.build_geometry(blocks)
         self._drop_surface_elements(raw, blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
@@ -13546,6 +13544,20 @@ class Converter:
                              + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
                              "own solution (see the warnings above).")
         return out
+
+    def _plan_deck_facts(self, blocks: List[Block]) -> None:
+        """Facts about the whole deck that planners and handlers read: whether a step runs
+        explicit dynamics, whether one is not heat transfer alone (a deck without steps
+        counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
+        and the *TIE names.  No planner adds or replaces such cards."""
+        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        self._explicit_deck = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        self._mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
+        self._kinematic_ids = {id(b) for b, c in zip(blocks, blocks[1:])
+                               if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
+        self._distributing_ids = {id(b) for b, c in zip(blocks, blocks[1:])
+                                  if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
+        self._tie_names = {(b.param("NAME") or "").strip().upper() for b in blocks if b.keyword == "TIE"}
 
     # procedures and *DLOAD labels in which an element's mass acts
     _INERTIA_PROCEDURES = {"DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
@@ -13661,7 +13673,6 @@ class Converter:
             self._plan_rotary_stars(blocks)        # rigid bodies of the deck's own elements
             self._plan_skin_material(blocks)
             return
-        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         axisym = any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values())
         bodies = [b for b in blocks if b.keyword == "RIGID BODY"]
         deck_nodes = list(self.geom.nodes.values())
@@ -13678,7 +13689,7 @@ class Converter:
             members = [e for e in self.geom.elset((b.param("ELSET") or "").strip()) if e in rigid]
             if not members:
                 continue
-            if not explicit:
+            if not self._explicit_deck:
                 if b.data and any(x.strip() for x in b.data):
                     self.report.note("*RIGID BODY data line (rigid-element thickness / area) "
                                      "dropped: Abaqus/Standard ignores it (it is Abaqus/Explicit "
@@ -13823,7 +13834,6 @@ class Converter:
         largest one and a modulus that keeps the wave speed 1e-3 of the deck's (see _plan_rigid)."""
         if not self.geom.elsets.get(RIGID_SET):
             return
-        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         moduli = []
         dens = []
         for b in blocks:
@@ -13837,7 +13847,7 @@ class Converter:
         e_ref, rho_ref = max(moduli or [1.0]), max(dens or [1.0])
         thermal = any(b.keyword in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                                     "UNCOUPLED TEMPERATURE-DISPLACEMENT") for b in blocks)
-        if explicit:
+        if self._explicit_deck:
             rho = 1e-9 * rho_ref
             self._skin_material = (rho * (1e-3 * math.sqrt(e_ref / rho_ref)) ** 2, rho, thermal)
         else:
@@ -14335,7 +14345,6 @@ class Converter:
         ccx's *TIE would, as the converter writes such a pair on deformable surfaces as one:
         within ADJUST (a distance) or ccx's default 2.5 % of the master faces' edges, moved
         onto the master."""
-        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         shells = self._shell_thicknesses(blocks)
         # a tied contact pair counts membrane thickness too, a *TIE only shells' (Abaqus 2017
         # "Defining tied contact", "Mesh tie constraints"), unless NO THICKNESS
@@ -14408,7 +14417,8 @@ class Converter:
                     if pair:
                         tol_k = 0.025 * (sum(edge) / len(edge))
                     else:
-                        n2s = node_based or form == "NODETOSURFACE" or (explicit and form != "SURFACETOSURFACE")
+                        n2s = node_based or form == "NODETOSURFACE" or \
+                            (self._explicit_deck and form != "SURFACETOSURFACE")
                         if toks[1] in self._analytic:      # the slave side's size (Abaqus)
                             base = self._node_spacing(slaves) if node_based else \
                                 self._mean_diagonal([self._face_points(e, f) for e, f in slave_faces])
@@ -15570,7 +15580,7 @@ class Converter:
                         edge[1] if hi == 1.0 else iface[(edge[0], edge[1], hi)]]
                 hanging[iface[(edge[0], edge[1], f)]] = (ends[0], ends[1], (f - lo) / (hi - lo))
         procs = {b.keyword for b in blocks if b.keyword in PROC_KW}
-        dofs = ([1, 2, 3] if not procs or procs - {"HEAT TRANSFER"} else []) + \
+        dofs = ([1, 2, 3] if self._mechanical else []) + \
             ([11] if procs & TEMPERATURE_DOF_PROCS else [])
         for nid, (na, nb, w) in hanging.items():
             for d in dofs:
@@ -16046,12 +16056,6 @@ class Converter:
         physics).  An element without a membrane section, a thickness or a normal stays as
         it is, warned."""
         els = self.geom.elements
-        self._kinematic_ids = {id(b) for b, c in zip(blocks, blocks[1:])
-                               if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
-        self._distributing_ids = {id(b) for b, c in zip(blocks, blocks[1:])
-                                  if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
-        self._explicit_deck = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
-        self._tie_names = {(b.param("NAME") or "").strip().upper() for b in blocks if b.keyword == "TIE"}
         mem = {e for e, (typ, _c) in els.items() if typ.upper().startswith("M3D")}
         if not mem:
             return
@@ -16929,7 +16933,7 @@ class Converter:
         self._plan_connector_rows(blocks)
         self._plan_coupled_bcs(blocks)
         self._plan_velocity_bcs(blocks)       # after _plan_coupled_bcs: reads its card rewrites
-        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks) and any(
+        if self._explicit_deck and any(
                 any(m in self._plane_only for m in members)
                 for _, members, _ in self._rigid_members(blocks)):
             self.report.warn("Rigid constraint (*RIGID BODY, kinematic coupling or *MPC BEAM) on "
@@ -16971,7 +16975,6 @@ class Converter:
                 self._sc_types.setdefault(name, set()).update(types)
                 if (b.param("MATERIAL") or "").strip().upper() in hyper:
                     self._sc_hyper.add(name)
-        self._sc_explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         self._sc_damage = any(b.keyword in ("DAMAGE EVOLUTION", "DAMAGE INITIATION") for b in blocks)
         self._step_idx = 0
         self._step_nlgeom = False
@@ -17249,7 +17252,6 @@ class Converter:
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
         self._mpc_thermal = any(k in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                                       "UNCOUPLED TEMPERATURE-DISPLACEMENT") for k in procs)
-        self._mpc_mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
         kinds: Dict[str, str] = {}
         self._expanded = set()                 # nodes of elements ccx expands to 3-D
         rotn: set = set()                      # shell/beam nodes: rotations of their own
@@ -17302,7 +17304,7 @@ class Converter:
                 elif typ != "LINK":
                     self._mpc_plan[key] = self._plan_mpc_transforms(key, typ, (typ.lower(), pairs),
                                                                     rotn)
-                elif not self._mpc_mechanical:          # no displacements to keep a distance in
+                elif not self._mechanical:              # no displacements to keep a distance in
                     self._mpc_plan[key] = ("link-none", pairs)
                 else:
                     self._mpc_plan[key] = self._plan_mpc_transforms(
@@ -17393,7 +17395,7 @@ class Converter:
         mode, pairs = plan
         if mode not in ("pin", "tie", "link-eq") or not self._transformed:
             return plan
-        moves = self._mpc_mechanical                               # translations are tied
+        moves = self._mechanical                                   # translations are tied
         kept: List[Tuple[int, int]] = []
         refused: List[Tuple[str, Tuple[int, int]]] = []
         for a, b in pairs:
@@ -17404,7 +17406,7 @@ class Converter:
                 refused.append((f"*MPC {typ} on a node without defined local axes: {why}. "
                                 f"Abaqus does not define that node's local directions, in which "
                                 f"its *EQUATION terms would have to be written", (a, b)))
-            elif mode == "tie" and self._mpc_mechanical and a in rotn and b in rotn and \
+            elif mode == "tie" and self._mechanical and a in rotn and b in rotn and \
                     (a in self._transformed or b in self._transformed):
                 refused.append((self._MPC_OWN_ROTATION, (a, b)))
             else:
@@ -17530,9 +17532,6 @@ class Converter:
                 rich.add(cur)
             else:
                 cur = None
-        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
-        mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
-        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         items: List[Tuple[dict, int]] = []
         planned: set = set()
         for b in blocks:
@@ -17572,7 +17571,7 @@ class Converter:
                                      "damping, stops, locks, friction, ...): ccx has no connector "
                                      "element to carry it; commented out — the connector is "
                                      "missing.")
-            elif not mechanical:
+            elif not self._mechanical:
                 kind = "free"
                 self.report.note("Connector elements left out: a heat-transfer-only deck has no "
                                  "displacements for them to constrain.", once=True)
@@ -17670,7 +17669,7 @@ class Converter:
                 it["route"], it["reason"] = "skip", ("Connector LINK to ground has no length to "
                                                      "keep (Abaqus puts the ground point at the "
                                                      "other node); commented out.")
-            if it["route"] != "rows" or explicit:   # (explicit dynamics: no equations on knots)
+            if it["route"] != "rows" or self._explicit_deck:   # (explicit: no equations on knots)
                 continue
             ends = [a, b] if it["rot"] is not None else \
                 [a] if vnorm(it["d"]) > 0.0 else []
@@ -18064,7 +18063,7 @@ class Converter:
                                 "local axes (a rectangular *TRANSFORM), in which Abaqus reads "
                                 "those BCs and moments." if any(self._rb_rot[n] in self._rot_axes
                                                                 for n in synth) else ""))
-        explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        explicit = self._explicit_deck
         nl = self._nl_any or explicit
         carriers = set(self._rb_rot.values())          # rotation nodes (DOFs 1-3 turn)
         synth_nodes = {self._rb_rot[n] for n in synth}
@@ -18395,9 +18394,8 @@ class Converter:
             return
         # a heat-transfer-only deck makes thermal knots without rotations ('*ERROR in gen3dmpc:
         # ... a rotational DOF is constrained'), so nothing is tied there
-        procs = [b for b in blocks if b.keyword in PROC_KW]
-        self._tie_rotations = not procs or any(b.keyword != "HEAT TRANSFER" for b in procs)
-        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in procs):
+        self._tie_rotations = self._mechanical
+        if self._explicit_deck:
             self.report.warn("Rigid coupling on shell/beam nodes in a deck with an explicit dynamic "
                              "step: ccx's explicit solver stops on it ('linear and nonlinear MPC's "
                              "depend on each other', probed on 2.23 with and without the knot "
@@ -20507,7 +20505,7 @@ class Converter:
         if not need:
             return
         shown = ", ".join(map(str, need[:5])) + (", ..." if len(need) > 5 else "")
-        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks):
+        if self._explicit_deck:
             self.report.warn(f"Rotational BCs on {len(need)} element end node(s) of circular-section "
                              f"beams ({shown}) hold only some rotations, or a nonzero one: ccx 2.23 "
                              f"locks the node's other rotations as well (probed: a pinned beam with "
@@ -20612,7 +20610,7 @@ class Converter:
             return
         when = f"*BOUNDARY, OP=NEW in step(s) {', '.join(map(str, removing))} removes boundary " \
                f"conditions, and {why}."
-        if any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks):
+        if self._explicit_deck:
             self.report.warn(f"{when} The knot beams that repair this stop ccx's explicit solver "
                              f"('*ERROR in calcstabletimeincvol': they have no mass), so none were "
                              f"added: check the rotations of the {len(knots)} shell/beam node(s) "
@@ -20663,7 +20661,7 @@ class Converter:
         *DENSITY, or no radius)."""
         self._circ_explicit = None
         self._circ_explicit_issue = ""
-        if not any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks):
+        if not self._explicit_deck:
             return
         speeds = self._wave_speeds(blocks)
         nodes = self.geom.nodes
@@ -20726,8 +20724,7 @@ class Converter:
         constant (ccx takes material 1's) or the LINEAR slope — for the maximum increment of
         explicit *DYNAMIC steps (_circ_explicit_increment)."""
         self._contact_explicit = None
-        if not self._rigid_faces or not any(b.keyword == "DYNAMIC" and b.has("EXPLICIT")
-                                            for b in blocks):
+        if not self._rigid_faces or not self._explicit_deck:
             return
         rho: Dict[str, float] = {}
         first_e: List[float] = []
