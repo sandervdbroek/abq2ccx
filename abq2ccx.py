@@ -2590,6 +2590,12 @@ CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", 
 # CONTACT_OUTPUT_ISSUES.
 CCX_CONTACT_FILE_LABELS = {"CDIS", "CSTR", "CELS", "PCON"}
 ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
+# The output labels that make ccx compute element energies, per card (probed on 2.23); an
+# implicit *DYNAMIC and a transient (un)coupled temperature-displacement step do so whatever
+# they request.  In a nonlinear calculation ccx stops when that starts after the first step
+# (Converter._energy_from_step_one).
+CCX_ENERGY_LABELS = {"EL FILE": ("ENER",), "EL PRINT": ("ENER", "ELSE", "ELKE"),
+                     "CONTACT FILE": ("CELS",)}
 # Contact output (*CONTACT FILE CDIS/CSTR) ccx 2.23 cannot write, probed on a block pressed
 # onto another (plane strain/stress, axisymmetric and 3-D solid elements of every order and
 # shape, a shell and a membrane plate; static, NLGEOM, *VISCO, implicit and explicit
@@ -10904,6 +10910,8 @@ class Converter:
         if hidden:
             self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
             self.geom.nsets[self._qmem_hidden] = hidden
+        groups = step_groups(blocks)[1]
+        self._energy_from_step_one(steps, groups[0][0] if groups else None)
         for k, timing, reqs in steps:
             self._out_ctl[k] = self._step_output_control(k, timing, reqs)
             for r in reqs:
@@ -10939,6 +10947,14 @@ class Converter:
                 timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
             pert = timing["proc"] in PERTURBATION_PROCS or group[0].has("PERTURBATION")
             timing["pert"] = pert
+            # ccx computes element energies in every implicit dynamic and transient (un)coupled
+            # temperature-displacement step (_energy_from_step_one)
+            if proc is not None and (
+                    proc.keyword == "DYNAMIC" and timing["kind"] != "explicit" or
+                    proc.keyword.endswith("COUPLED TEMPERATURE-DISPLACEMENT") and
+                    not (proc.has("STEADY STATE") or proc.has("STEADYSTATE"))):
+                kind = "an implicit" if proc.keyword == "DYNAMIC" else "a transient"
+                timing["energy"] = f"{kind} *{proc.keyword}"
             ctx, reqs, odb, add, own = None, [], False, False, []
             for x in inner:
                 if x.keyword == "OUTPUT":
@@ -11066,6 +11082,47 @@ class Converter:
         two_d = stated == "2D" or (stated is None and (not frd3d or out2d))
         visible = solid_nodes | (flat_nodes if two_d else set())
         return visible
+
+    def _energy_from_step_one(self, steps: List[Tuple[int, dict, List[dict]]],
+                              first: Optional[Block]) -> None:
+        """ccx 2.23 computes element energies from the first step that needs them on: an
+        implicit *DYNAMIC or transient (un)coupled temperature-displacement step, whatever it
+        requests (dynamics.f: "for implicit dynamic calculations the energy balance is always
+        calculated"), or an energy output request (CCX_ENERGY_LABELS).  In a nonlinear step it
+        stops when that is not the first step ("energy output requests, if any, must be
+        specified in the first step", CalculiX.c), and those dynamic and coupled steps always
+        are nonlinear there.  Probed: a static (also NLGEOM), *FREQUENCY, *BUCKLE, *VISCO,
+        explicit or heat transfer step followed by one stops ccx, with or without output
+        requests.  So where a later step needs energies, step 1 requests ENER on its first
+        *EL FILE, or on an *EL FILE of its own at the *STEP (``first``), which has no say in
+        the step's output control.  A card with FREQUENCY=0 would not do (ccx skips it), and
+        a linear later step would not need it, which the converter cannot tell (NLGEOM,
+        plasticity, contact)."""
+        for k, timing, reqs in steps:
+            why = [f"step {k}, {timing['energy']},"] if timing.get("energy") else []
+            why += [f"step {k}'s *{r['cc']} {lab} request" for r in reqs if r["live"]
+                    for lab in r["labels"] if lab[:4] in CCX_ENERGY_LABELS.get(r["cc"], ())]
+            if why:
+                break
+        else:
+            return
+        if k == 1 or first is None:
+            return
+        msg = (f"{why[0]} makes ccx 2.23 compute element energies, which in a nonlinear "
+               f"calculation (every implicit dynamic or transient coupled step is one in ccx) it "
+               f"accepts only from the first step on — it stops otherwise (\"energy output "
+               f"requests, if any, must be specified in the first step\").")
+        reqs = steps[0][2]
+        el = next((r for r in reqs if r["live"] and r["cc"] == "EL FILE" and len(r["labels"]) < 16),
+                  None)
+        if el is not None:
+            el["labels"] = el["labels"] + ["ENER"]
+            el["notes"].append(f"ENER added to step 1's *EL FILE: {msg}")
+            return
+        reqs.append({"b": mkblock("EL FILE"), "cc": "EL FILE", "params": OrderedDict(),
+                     "labels": ["ENER"], "notes": [f"*EL FILE ENER added to step 1: {msg}"],
+                     "warnings": [], "frd": True, "frd_sets": [], "covered": [], "set": None,
+                     "ctl": None, "default": True, "live": True, "anchor": first})
 
     def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
         """One output card of a step: where it goes, its labels and the output control it
@@ -11397,8 +11454,9 @@ class Converter:
         """The one output control ccx can give step ``k`` (as FREQUENCY= or TIME POINTS=):
         its .frd requests' (or, without any, its .dat requests'); the .dat requests' when
         the .frd's cannot be given.  None when the step has no time increments or nothing
-        can be given.  Notes go to the step's first request."""
-        live = [r for r in reqs if r["live"]]
+        can be given.  Notes go to the step's first request.  A request without a control
+        of its own (_energy_from_step_one's card) has no say."""
+        live = [r for r in reqs if r["live"] and r["ctl"]]
         if not live or timing["kind"] == "untimed":
             return None
         frd = [r for r in live if r["frd"]]

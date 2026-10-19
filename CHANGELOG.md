@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Implicit dynamics after a first step** — ccx 2.23 computes element energies from the first
+  step that needs them on: every implicit `*DYNAMIC` and transient coupled
+  temperature-displacement step, or an `ENER`, `ELSE`, `ELKE` or `CELS` request. In a nonlinear
+  calculation it stops when that is not the first step ("energy output requests, if any, must
+  be specified in the first step"), so a static, frequency or other first step followed by such
+  a step never ran. The first step now requests `ENER` on its `*EL FILE` (on a card of its own
+  where it has none): a cube preloaded in a static step and then let go in an implicit
+  `*DYNAMIC` step swings from its static deflection as u0 cos ωt (3.4e-4 of u0 apart).
 * **Rigid constraints in linear dynamic steps** — in a `*DYNAMIC` step ccx 2.23 turns the RIGID
   MPCs of `*RIGID BODY` and kinematic couplings with the finite rotation even without NLGEOM,
   where Abaqus linearizes them (a cantilever under a tip moment 9 % stiffer at 0.1 rad). In a

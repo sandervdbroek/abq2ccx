@@ -2092,6 +2092,28 @@ def rigid_dynamic_deck(member="solid", proc="dynamic"):
             + "*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
 
 
+def energy_steps_deck(first=None, second="dynamic"):
+    """CUBE8 (E 1000, nu 0) held at its bottom and its top face in x and y: one degree of
+    freedom, the top face's z, with stiffness E A / L = 1000 and the top face's consistent mass
+    rho A L / 3 = 0.1, so omega = 100.  A *STATIC step pulls it by 4 x 0.25 (u0 = 1e-3), then
+    ``second``: 'dynamic' lets it go for one period in 250 fixed increments (u0 cos 100 t),
+    'coupled' heats it by 100 in a transient coupled temperature-displacement step (alpha 1e-5:
+    2e-3 at the end, its lateral expansion held).  ``first`` 'frequency' puts a *FREQUENCY step
+    before them (100 / 2 pi Hz)."""
+    coupled = second == "coupled"
+    last = ("*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n*BOUNDARY\nTOP, 11, 11, 100.\n"
+            "BOT, 11, 11, 100.\n" if coupled else "*STEP, INC=1000\n*DYNAMIC, DIRECT\n"
+            "2.51327412287E-4, 0.0628318530718\n*CLOAD, OP=NEW\n")
+    return ((CUBE8.replace("TYPE=C3D8,", "TYPE=C3D8T,") if coupled else CUBE8) +
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*DENSITY\n0.3\n" +
+            ("*CONDUCTIVITY\n1.\n*SPECIFIC HEAT\n1.\n*EXPANSION\n1.E-5\n*INITIAL CONDITIONS, "
+             "TYPE=TEMPERATURE\nTOP, 0.\nBOT, 0.\n" if coupled else "") +
+            "*BOUNDARY\nBOT, 1, 3\nTOP, 1, 2\n" +
+            ("*STEP\n*FREQUENCY\n1\n*END STEP\n" if first == "frequency" else "") +
+            "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 0.25\n*END STEP\n" + last +
+            "*OUTPUT, HISTORY, FREQUENCY=1\n*NODE OUTPUT, NSET=TOP\nU\n*END STEP\n")
+
+
 def tied_strip_deck(symmetric=True):
     """A composite S4R strip [0/90/90/0] of thickness 2 (its plies listed, or the bottom two
     with SYMMETRIC), cantilevered from a clamped rigid R3D4 plate below its first element by
@@ -4946,6 +4968,35 @@ def main():
                   f"{moved:.2f} of it (ccx's *RIGID BODY turns with the finite rotation there)")
         elif u:
             print(f"FAIL  {tag}: the static reference did not solve ({status})")
+        failures += 0 if ok else 1
+    # an implicit *DYNAMIC or transient coupled step after a static step, which ccx 2.23 stopped
+    # on ("energy output requests, if any, must be specified in the first step"; abq2ccx now
+    # requests ENER in step 1): the one-DOF cube starts from the static step's deflection
+    for first, second in ((None, "dynamic"), ("frequency", "dynamic"), (None, "coupled")):
+        tag = f"energy_{second}" + (f"_after_{first}" if first else "")
+        res = review_run(energy_steps_deck(first, second), tag, lambda dat: (
+            dat_history(dat, "displacements", "TOP"),
+            dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")))
+        hist, freqs = res or ([], [])
+        ok = bool(hist) and (first is None or bool(freqs))
+        if res and not ok:
+            print(f"FAIL  {tag}: no displacements{' or frequency' if first else ''} printed")
+        if ok and second == "dynamic":
+            err = max(abs(rows[0][2] / 1e-3 - math.cos(100.0 * (t - 1.0))) for t, rows in hist)
+            ferr = abs(freqs[0] * 2.0 * math.pi / 100.0 - 1.0) if first else 0.0
+            ok = len(hist) == 250 and err < 1e-3 and ferr < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a one-DOF cube pulled to 1e-3 in a static "
+                  f"step{' after a *FREQUENCY step' if first else ''}, then let go in an implicit "
+                  f"*DYNAMIC step): {len(hist)} increments of one period within {err:.1e} of the "
+                  f"swing 1e-3 cos 100 t" + (f", frequency {freqs[0]:.7g} vs 100 / 2 pi ({ferr:.1e} "
+                  f"apart)" if first else "") + " (before: ccx stopped at the *DYNAMIC step)")
+        elif ok:
+            got = hist[-1][1][0][2]
+            ok = abs(got / 2e-3 - 1.0) < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (the cube pulled to 1e-3 in a static step, then "
+                  f"heated by 100 in a transient coupled temperature-displacement step, its lateral "
+                  f"expansion held): top at {got:.7g} vs 1e-3 + alpha dT L = 2e-3 (before: ccx stopped "
+                  f"at the coupled step)")
         failures += 0 if ok else 1
     # a SYMMETRIC layup's thickness in a tie to a rigid plate (counted half, ccx got the tie)
     strips = [review_run(tied_strip_deck(sym), "rigid_tie_symmetric_layup" + ("" if sym else "_ref"),

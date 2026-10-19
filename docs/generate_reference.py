@@ -770,6 +770,14 @@ def gen_output():
              "## Valid only on `*EL PRINT` / `*NODE PRINT` (.dat)\n",
              "Dropped from `*EL FILE`/`*NODE FILE` (.frd): "
              + ", ".join(f"`{v}`" for v in sorted(A.EL_PRINT_ONLY_VARS)) + ".\n",
+             "## Energies from the first step\n",
+             "ccx 2.23 computes element energies from the first step that needs them on — an "
+             "implicit `*DYNAMIC` or a transient coupled temperature-displacement step, or a "
+             "request for " + ", ".join(f"`{v}`" for v in sorted(
+                 {v for labels in A.CCX_ENERGY_LABELS.values() for v in labels})) +
+             " — and in a nonlinear calculation stops when that is not the first step. The "
+             "converter then adds `ENER` to the first step's `*EL FILE` (or an `*EL FILE` card "
+             "for it).\n",
              "## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)\n",
              "Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the "
              "output database*, table 1) as the whole-model ccx cards it becomes. Abaqus also "

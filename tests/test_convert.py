@@ -3530,6 +3530,51 @@ def test_preselect_output_examples():
     assert not dangling_refs(reparse(body))
 
 
+def test_energy_requested_from_the_first_step():
+    # ccx 2.23 computes element energies from the first step that needs them on: an implicit
+    # *DYNAMIC or a transient coupled temperature-displacement step whatever it requests, else
+    # an energy output request; in a nonlinear step it stops when that is not the first step
+    # ("energy output requests, if any, must be specified in the first step"; probed).  Step 1
+    # then requests ENER: on its *EL FILE, the step's own cards otherwise unchanged
+    load, dyn = "*Cload\n8, 3, 1.\n", "*Step\n*Dynamic\n0.01, 1.\n*End Step\n"
+    body, _, rep = convert_str(HEX + STEEL + "*Step\n*Static\n" + load + "*End Step\n" + dyn)
+    assert _step(body, 1).endswith("*NODE FILE\nU, RF\n*EL FILE\nS, E, ENER\n")
+    assert "ENER" not in _step(body, 2)
+    assert "ENER added to step 1's *EL FILE: step 2, an implicit *DYNAMIC, makes ccx 2.23 " \
+           "compute element energies" in rep.text()
+    # or on an *EL FILE card of its own at the step's end, which has no say in the step's
+    # output control: after a *FREQUENCY step's preselected U, output switched off, history
+    # output every 5 increments (the step's control stays on its first card)
+    for step1, cards in (("*Frequency\n3\n", "*NODE FILE\nU\n"),
+                         ("*Static\n" + load + "*Output, field, frequency=0\n*Node Output\nU\n",
+                          load.upper()),
+                         ("*Static\n" + load + "*Output, history, frequency=5\n*Element Output, "
+                          "elset=EALL\nS\n", "*EL PRINT, ELSET=EALL, FREQUENCY=5\nS\n")):
+        body, _, rep = convert_str(HEX + STEEL + "*Step\n" + step1 + "*End Step\n" + dyn)
+        assert _step(body, 1).endswith(cards + "*EL FILE\nENER\n"), _step(body, 1)
+        assert "*EL FILE ENER added to step 1: step 2, an implicit *DYNAMIC," in rep.text()
+    # a transient coupled step and a later energy request in a nonlinear step stop ccx alike
+    for step2, why in (("*Coupled Temperature-displacement\n0.1, 1.\n",
+                        "step 2, a transient *COUPLED TEMPERATURE-DISPLACEMENT,"),
+                       ("*Static\n*Output, field\n*Element Output\nS, ENER\n",
+                        "step 2's *EL FILE ENER request"),
+                       ("*Static\n*Output, history\n*Element Output, elset=EALL\nELSE\n",
+                        "step 2's *EL PRINT ELSE request")):
+        body, _, rep = convert_str(HEX + STEEL + "*Step, nlgeom\n*Static\n" + load + "*End Step\n"
+                                   "*Step, nlgeom\n" + step2 + "*End Step\n")
+        assert _step(body, 1).endswith("*EL FILE\nS, E, ENER\n") and why in rep.text(), why
+    # nothing where step 1 already computes them, or no later step needs them: a steady-state
+    # coupled step, an explicit step, energies requested in step 1
+    for steps in ("*Step\n*Static\n" + load + "*End Step\n*Step\n*Coupled Temperature-"
+                  "displacement, steady state\n0.1, 1.\n*End Step\n",
+                  "*Step\n*Static\n" + load + "*End Step\n*Step\n*Dynamic, explicit\n, 1e-5\n"
+                  "*End Step\n", "*Step\n*Dynamic\n0.01, 1.\n" + load + "*End Step\n" + dyn,
+                  "*Step\n*Static\n" + load + "*Output, field\n*Element Output\nENER\n*End Step\n"
+                  + dyn):
+        body, _, rep = convert_str(HEX + STEEL + steps)
+        assert "ENER added" not in rep.text() and "S, E, ENER" not in body, steps
+
+
 def test_courant_length_matches_ccx_223():
     # h * f of ccx's explicit increment estimate against the increments ccx 2.23 printed for
     # one element of each type (steel: c = 6.0010e6; dt = 0.8/1.3 * 1.91722 * h f / (2 c)).
