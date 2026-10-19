@@ -59,7 +59,9 @@ SNEG faces and element-based against the Navier plate solution (the sign of each
 shell and membrane spheres and a cylinder against the pressure force on the reference surface
 and thin-wall theory, a bare
 *KINEMATIC (all DOFs) against *RIGID BODY, an assembly with a turned instance against
-the same model written flat, and rigid tools: a rigid flat punch (rigid elements, and
+the same model written flat, bolts whose pre-tension node (or beam cut) a one-member set
+names against F L / E A (the card that names them by number), and rigid tools:
+a rigid flat punch (rigid elements, and
 the same face as an analytical surface) against the penalty contact law and a punch given
 the motion node by node, also turned under NLGEOM, a block tied to a turning rigid plate, a
 rigid plate's MASS and ROTARYI on springs against its frequencies, (--approximate) a
@@ -443,6 +445,50 @@ def dat_history(dat_path, what, nset):
     return [(time, [r[1:] if len(r) == 4 and what != "total force" else r for r in rows])
             for _, title, s, time, rows in A.dat_blocks(dat_path)
             if title.startswith(what) and s == nset.upper()]
+
+
+def pretension_bolt_deck(level="model"):
+    """A bolt of two C3D8 along z (1 x 1, length 2, E 210000, nu 0), both ends held, cut at
+    mid-length by a *PRE-TENSION SECTION whose node 99 is loaded by 1000: the cut closes
+    F L / E A.  NODE= names the one-node set PT.  ``level`` "part" / "assembly": the bolt is a
+    part with two instances, the second turned 90 degrees about x (its node 99 is global node
+    198), and the card is the part's, or written at the assembly level for each instance,
+    naming I1.PT and an assembly set of I2's node 99."""
+    part = ["*NODE"] + [f"{1 + i + 2 * j + 4 * k}, {float(i)}, {float(j)}, {float(k)}"
+                        for k in range(3) for j in range(2) for i in range(2)]
+    part += ["99, 0.5, 0.5, 1.", "*ELEMENT, TYPE=C3D8, ELSET=BOLT", "1, 1, 2, 4, 3, 5, 6, 8, 7",
+             "2, 5, 6, 8, 7, 9, 10, 12, 11", "*ELSET, ELSET=LOW", "1", "*NSET, NSET=ENDS",
+             "1, 2, 3, 4, 9, 10, 11, 12", "*NSET, NSET=PT", "99", "*SURFACE, NAME=CUT", "LOW, S2",
+             "*SOLID SECTION, ELSET=BOLT, MATERIAL=M"]
+    card = ["*PRE-TENSION SECTION, SURFACE=CUT, NODE=PT", "0., 0., 1."]
+    if level == "model":
+        model, pre = part + card, [""]
+    else:
+        asm = ["*ASSEMBLY, NAME=A", "*INSTANCE, NAME=I1, PART=P", "*END INSTANCE", "*INSTANCE, NAME=I2, PART=P",
+               "0., 5., 0.", "0., 5., 0., 1., 5., 0., 90.", "*END INSTANCE"]
+        if level == "assembly":
+            asm += ["*NSET, NSET=PT2, INSTANCE=I2", "99", "*PRE-TENSION SECTION, SURFACE=I1.CUT, NODE=I1.PT",
+                    "0., 0., 1.", "*PRE-TENSION SECTION, SURFACE=I2.CUT, NODE=PT2", "0., -1., 0."]
+        model = (["*PART, NAME=P"] + part + (card if level == "part" else []) + ["*END PART"] + asm
+                 + ["*END ASSEMBLY"])
+        pre = ["I1.", "I2."]
+    step = (["*STEP", "*STATIC", "*BOUNDARY"] + [f"{p}ENDS, 1, 3" for p in pre] + ["*CLOAD"]
+            + [f"{p}PT, 1, 1000." for p in pre] + [x for p in pre for x in (f"*NODE PRINT, NSET={p}PT", "U")]
+            + ["*END STEP"])
+    return "\n".join(model + ["*MATERIAL, NAME=M", "*ELASTIC", "210000., 0."] + step) + "\n"
+
+
+def pretension_beam_deck(element="CUTEL", node="PT"):
+    """Two B31 along x (RECT 1 x 1, length 1 each, E 210000), both ends clamped, the first the
+    cut of a *PRE-TENSION SECTION (ELEMENT= its number or the one-element set CUTEL) whose
+    node 99 (NODE= 99 or the one-node set PT) is loaded by 1000."""
+    return "\n".join(["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 2., 0., 0.", "99, 1., 0., 0.",
+                      "*ELEMENT, TYPE=B31, ELSET=BOLT", "1, 1, 2", "2, 2, 3", "*ELSET, ELSET=CUTEL", "1",
+                      "*NSET, NSET=PT", "99", "*BEAM SECTION, ELSET=BOLT, MATERIAL=M, SECTION=RECT",
+                      "1., 1.", "0., 0., 1.", f"*PRE-TENSION SECTION, ELEMENT={element}, NODE={node}",
+                      "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.", "*STEP", "*STATIC", "*BOUNDARY",
+                      "1, 1, 6", "3, 1, 6", "*CLOAD", "99, 1, 1000.", "*NODE PRINT, NSET=PT", "U",
+                      "*END STEP"]) + "\n"
 
 
 # --- rigid tools: Abaqus decks built here, so that each variant differs only in the tool ----
@@ -3641,6 +3687,46 @@ def main():
         else:
             print(f"FAIL  {tag}: the two models printed different nodes ({len(un)} / {len(uf)})")
             failures += 1
+    # --- *PRE-TENSION SECTION, NODE= / ELEMENT= a one-member set (as Abaqus allows): ccx 2.23
+    # reads only a number there and stops on a set name ('*ERROR reading *PRE-TENSION SECTION')
+    def pretension_closures(text, tag, nodes):
+        """The pre-tension nodes' DOF 1 (the cut's closure) of ``text`` converted and solved."""
+        src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+        if any(n not in u for n in nodes):
+            print(f"FAIL  {tag}: no closure printed ({status})")
+            print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+            return None
+        return [u[n][0] for n in nodes]
+
+    want = 1000.0 * 2.0 / 210000.0
+    for level, where in (("model", ""), ("part", "; a part's card, two instances, one turned"),
+                         ("assembly", "; two instances, one turned, the cards at the assembly level "
+                                      "naming I1.PT and an assembly set")):
+        tag = "pretension_node_set" + ("" if level == "model" else "_" + level)
+        got = pretension_closures(pretension_bolt_deck(level), tag, (99,) if level == "model" else (99, 198))
+        if got is None:
+            failures += 1
+            continue
+        err = max(abs(g / want - 1) for g in got)
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a C3D8 bolt cut by a *PRE-TENSION SECTION whose NODE= "
+              f"is a one-node set{where}): closure {', '.join(f'{g:.7g}' for g in got)} vs F L / E A = "
+              f"{want:.7g} ({err:.1e} apart; the set name stops ccx)")
+        failures += 0 if ok else 1
+    got = pretension_closures(pretension_beam_deck(), "pretension_element_set", (99,))
+    ref = pretension_closures(pretension_beam_deck("1", "99"), "pretension_element_set_ref", (99,))
+    if got and ref:
+        ok = abs(got[0] / ref[0] - 1) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  pretension_element_set (a B31 bolt whose *PRE-TENSION SECTION "
+              f"names its cut element and node by one-member sets): closure {got[0]:.7g} vs {ref[0]:.7g} "
+              f"with ELEMENT=1, NODE=99 (the set names stop ccx)")
+    failures += 0 if got and ref and ok else 1
     # --- Johnson-Cook damage initiation: ccx's indicator, the model unchanged -------
     # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which
     # it deletes an element, out of reach so that it only reports): in uniaxial tension the

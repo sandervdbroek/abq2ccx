@@ -2951,6 +2951,44 @@ def test_part_level_distributing_coupling_and_pretension_per_instance():
     assert conv.reduced_physics == ["*HOURGLASS STIFFNESS inside an *INSTANCE left out"]
 
 
+def test_pretension_node_and_element_sets_resolved():
+    # Abaqus takes NODE= as a node number or a set of exactly that node, ELEMENT= (a truss or
+    # beam cut) likewise; ccx 2.23 stops on a set name there ('*ERROR reading *PRE-TENSION
+    # SECTION'), so a one-member set is written as its number (validate_with_ccx.py
+    # pretension_node_set*)
+    bar = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n"
+           "8,0.,1.,1.\n9,0.,0.,2.\n10,1.,0.,2.\n11,1.,1.,2.\n12,0.,1.,2.\n99,0.5,0.5,1.\n"
+           "*Element, type=C3D8, elset=BAR\n1,1,2,3,4,5,6,7,8\n2,5,6,7,8,9,10,11,12\n*Elset, elset=LOW\n1\n"
+           "*Nset, nset=PT\n99\n*Nset, nset=TWO\n99, 5\n*Surface, name=CUT\nLOW, S2\n"
+           "*Solid Section, elset=BAR, material=M\n*Material, name=M\n*Elastic\n210000., 0.\n")
+    body, _, rep = convert_str(bar + "*Pre-tension Section, surface=CUT, node=PT\n0., 0., 1.\n")
+    assert "*PRE-TENSION SECTION, SURFACE=CUT, NODE=99\n0., 0., 1." in body
+    assert "*PRE-TENSION SECTION NODE=<set> written as the set's node number" in rep.text()
+    # any other set: Abaqus rejects it too, and ccx stops on it rather than solve without the cut
+    for name, why in (("TWO", "a set of 2 nodes"), ("NOSUCH", "no node set")):
+        body, conv, rep = convert_str(bar + f"*Pre-tension Section, surface=CUT, node={name}\n")
+        assert f"*PRE-TENSION SECTION, SURFACE=CUT, NODE={name}" in body.splitlines()
+        assert f"[WARNING] *PRE-TENSION SECTION NODE={name} names {why}" in rep.text()
+        assert not conv.reduced_physics
+    # a part's card naming its set: each instance's copy names that instance's node
+    body, _, _ = convert_str(PART_BOLT.format(part="*Nset, nset=PT\n99\n*Pre-tension Section, surface=CUT, "
+                                                   "node=PT\n0., 0., 1.\n", i1="", i2=""))
+    assert "*PRE-TENSION SECTION, SURFACE=I1_CUT, NODE=99\n0, 0, 1\n" in body
+    assert "*PRE-TENSION SECTION, SURFACE=I2_CUT, NODE=198\n0, -1, 0\n" in body
+    # at the assembly level: instance-qualified sets and numbers (an element number takes the
+    # element offset) and an assembly set
+    beams = ("*Part, name=B\n*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,2.,0.,0.\n99,1.,0.,0.\n"
+             "*Element, type=B31, elset=BOLT\n1,1,2\n2,2,3\n*Elset, elset=CUTEL\n1\n*Nset, nset=PT\n99\n"
+             "*Beam Section, elset=BOLT, material=M, section=RECT\n1., 1.\n0., 0., 1.\n*End Part\n"
+             "*Assembly, name=A\n*Instance, name=I1, part=B\n*End Instance\n*Instance, name=I2, part=B\n"
+             "0., 5., 0.\n*End Instance\n*Nset, nset=PT2, instance=I2\n99\n"
+             "*Pre-tension Section, element=I1.CUTEL, node=I1.PT\n*Pre-tension Section, {i2}\n"
+             "*End Assembly\n*Material, name=M\n*Elastic\n210000., 0.\n")
+    for i2 in ("element=I2.1, node=PT2", "element=I2.CUTEL, node=I2.99", "element=3, node=I2.PT"):
+        body, _, _ = convert_str(beams.format(i2=i2))
+        assert "*PRE-TENSION SECTION, ELEMENT=1, NODE=99\n*PRE-TENSION SECTION, ELEMENT=3, NODE=198\n" in body
+
+
 def test_surface_interaction_thickness_line_dropped():
     body, _, _ = convert_str("*Surface Interaction, name=SI\n1.,\n*Surface Behavior, "
                              "pressure-overclosure=hard\n")

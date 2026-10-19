@@ -4243,6 +4243,7 @@ class Converter:
             "RIGID BODY": self.handle_rigid_body,
             "ROTARY INERTIA": self.handle_rotary_inertia,
             "COUPLING": self.handle_coupling_card,
+            "PRE-TENSION SECTION": self.handle_pretension_section,
             "KINEMATIC": self.handle_kinematic,
             "SURFACE INTERACTION": self.handle_surface_interaction,
             "INITIAL CONDITIONS": self.handle_initial_conditions,
@@ -12587,6 +12588,31 @@ class Converter:
             self._reduces("*COUPLING, *DISTRIBUTING on membrane faces")
         return pre + [emit_keyword("COUPLING", params)] + list(b.data)
 
+    def handle_pretension_section(self, b: Block) -> List[str]:
+        """``*PRE-TENSION SECTION``: Abaqus takes NODE= as the pre-tension node's number or a
+        node set of exactly that node, and ELEMENT= (a truss or beam cut) as an element number
+        or a one-element set (Keywords Reference); ccx 2.23 reads only a number there and stops
+        on a set name ('*ERROR reading *PRE-TENSION SECTION', probed).  A one-member set is
+        written as its number; any other set is left for ccx to stop on, as Abaqus would."""
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+        for key, what, members in (("NODE", "node", self.geom.nset),
+                                   ("ELEMENT", "element", self.geom.elset)):
+            ref = (params.get(key) or "").strip()
+            if not ref or re.fullmatch(r"[-+]?\d+", ref):
+                continue
+            ids = dedup(members(ref))
+            if len(ids) == 1:
+                params[key] = str(ids[0])
+                self.report.note(f"*PRE-TENSION SECTION {key}=<set> written as the set's {what} "
+                                 f"number (ccx 2.23 reads a number there and stops on a set name; "
+                                 f"Abaqus' set holds exactly one {what}).", once=True)
+            else:
+                self.report.warn(f"*PRE-TENSION SECTION {key}={ref} names "
+                                 + (f"a set of {len(ids)} {what}s (Abaqus takes exactly one)" if ids
+                                    else f"no {what} set (or an empty one)")
+                                 + "; left as it is: ccx stops on the set name.", once=True)
+        return [emit_keyword(b.keyword, params)] + list(b.data)
+
     def _coupling_as_rigid_body(self, plan: dict) -> List[str]:
         """A kinematic coupling of all translations as the equivalent *RIGID BODY — the same
         RIGID MPCs in ccx.  With a shell/beam reference node ("rb") ccx would otherwise carry
@@ -20929,6 +20955,9 @@ ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "DFLUX", "DFILM", "FILM", "RADIATE",
 REF_PARAMS = {"NSET", "ELSET", "SURFACE", "SLAVE", "MASTER",
               "REF NODE", "REFNODE", "ROT NODE", "ROTNODE", "PIN NSET", "TIE NSET",
               "ANALYTICAL SURFACE"}
+# ... and those that do so on one card only: the pre-tension node and the truss or beam
+# element of a *PRE-TENSION SECTION (a number or a one-member set).
+CARD_REF_PARAMS = {"PRE-TENSION SECTION": ("NODE", "ELEMENT")}
 
 
 def _split_instance_ref(tok: str, maps) -> Optional[Tuple[str, str]]:
@@ -21499,7 +21528,7 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
         #     known instance are touched, so a definition's own name (LOADED, I2_BODY) and
         #     unrelated params (MATERIAL=, NAME=) are left untouched.
         for k, v in list(blk.params.items()):
-            if v and "." in v and k in REF_PARAMS:
+            if v and "." in v and (k in REF_PARAMS or k in CARD_REF_PARAMS.get(blk.keyword, ())):
                 ent = "elem" if ("ELSET" in k or "ELEMENT" in k) else \
                       "node" if ("NSET" in k or "NODE" in k) else entity
                 blk.params[k] = _resolve_field(v, maps, ent, namer)
