@@ -4827,7 +4827,7 @@ def test_general_step_after_perturbation_gets_the_base_state():
     body, conv, rep = convert_str(PERT.format("*Cload\n7, 2, 1.\n*Boundary\n6, 1, 1, 0.5\n",
                                               "*Cload\n7, 1, 2.\n"))
     steps = body.split("*STEP")
-    assert steps[0].endswith("*AMPLITUDE, NAME=ABQ2CCX_HOLD\n0., 1., 1., 1.\n")
+    assert steps[0].endswith("*AMPLITUDE, NAME=ABQ2CCX_HOLD\n0, 1, 1, 1\n")
     assert "HOLD" not in steps[1] + steps[2] and "OP=NEW" not in steps[2]
     assert steps[3].startswith("\n*STATIC\n** abq2ccx: the loads, BCs and temperatures of step 1 "
                                "given again (linear perturbation step(s) 2 in between)\n"
