@@ -3086,6 +3086,45 @@ def main():
             for (label, v, ref), diff in zip(refs, diffs)))
         failures += 0 if ok else 1
 
+    # --- *DSLOAD and *DLOAD, OP=NEW in one step ---------------------------------------------
+    # ccx 2.23 has one OP=NEW flag for *DLOAD and *DSLOAD and acts on it on a step's first
+    # card only.  A 1 x 1 x 0.5 column on its base: step 1 under gravity and a top pressure;
+    # step 2 adds a body force up and a pressure on the (held) base, OP=NEW on its second card:
+    # Abaqus removes the gravity (*DLOAD, OP=NEW) or the top pressure (*DSLOAD, OP=NEW).  The
+    # top's uz: -p L / E, -rho g L^2 / (2 E), +b L^2 / (2 E) (converted before: both loads kept)
+    column = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 0.5\n"
+              "6, 1., 0., 0.5\n7, 1., 1., 0.5\n8, 0., 1., 0.5\n*Element, type=C3D8, elset=EALL\n"
+              "1, 1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=TOP\n5, 6, 7, 8\n*Surface, name=ST\n"
+              "EALL, S2\n*Surface, name=SB\nEALL, S1\n*Solid Section, elset=EALL, material=M\n"
+              "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1.\n*Boundary\n1, 1, 3\n"
+              "2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n*Step\n*Static\n*Dload\n"
+              "EALL, GRAV, 9.81, 0., 0., -1.\n*Dsload\nST, P, 1.\n*Node Print, nset=TOP\nU\n"
+              "*End Step\n*Step\n*Static\n{}\n*Node Print, nset=TOP\nU\n*End Step\n")
+    grav, top, up = -9.81 * 0.25 / 2000.0, -0.5 / 1000.0, 0.25 / 2000.0
+    for how, cards, ref in (("*DSLOAD, then *DLOAD, OP=NEW",
+                             "*Dsload\nSB, P, 2.\n*Dload, op=NEW\nEALL, BZ, 1.", top + up),
+                            ("*DLOAD, then *DSLOAD, OP=NEW",
+                             "*Dload\nEALL, BZ, 1.\n*Dsload, op=NEW\nSB, P, 2.", grav + up)):
+        src = os.path.join(tmp, "dload_op_new_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(column.format(cards))
+        inp = os.path.join(tmp, "dload_op_new.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        uz = [u[2] for u in dat_displacement_history(os.path.join(d, "job.dat"), 7)] \
+            if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if len(uz) != 2:
+            print(f"FAIL  dload_op_new ({how}): no top displacement in both steps ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        refs = [grav + top, ref]
+        ok = all(abs(v - r) <= 1e-5 * abs(r) for v, r in zip(uz, refs))
+        print(f"{'PASS' if ok else 'FAIL'}  dload_op_new ({how}): top uz " + ", ".join(
+            f"step {k} {v:+.6e} (expected {r:+.6e})" for k, (v, r) in enumerate(zip(uz, refs), 1)))
+        failures += 0 if ok else 1
+
     # --- isotropic *Elastic beside an orthotropic / anisotropic *Expansion -----------------
     # ccx 2.23 uses a wrong stiffness for this combination in linear steps once the deck has
     # temperatures (a free heated cube shrinks), so the converter writes such *Elastic cards

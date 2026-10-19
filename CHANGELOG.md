@@ -6,6 +6,11 @@ physics.
 
 ## Unreleased
 
+* **`*DSLOAD` and `*DLOAD, OP=NEW` in one step** — ccx 2.23 has one `OP=NEW` flag for both
+  cards and acts on it on a step's first one only, and the converter writes `*DSLOAD` as
+  `*DLOAD`. So a step with a `*DSLOAD`, then a `*DLOAD, OP=NEW` (or the other way round), which
+  is valid Abaqus, kept the earlier steps' loads that Abaqus removes (a block's gravity from
+  step 1 stayed on in step 2). A bare `*DLOAD, OP=NEW` now opens such a step.
 * **Implicit dynamics after a first step** — ccx 2.23 computes element energies from the first
   step that needs them on: every implicit `*DYNAMIC` and transient coupled
   temperature-displacement step, or an `ENER`, `ELSE`, `ELKE` or `CELS` request. In a nonlinear

@@ -3333,7 +3333,8 @@ def op_new_cards(cards: Sequence[Block], keywords: Tuple[str, ...] = ("BOUNDARY"
     later card ('OP=NEW only makes sense on the first *BOUNDARY card within a step'; probed
     on *BOUNDARY and *CLOAD), and Abaqus requires it on every card of the type in the step
     if on any (Analysis User's Guide, boundary conditions and loads; LOAD CASE=2 in a
-    *BUCKLE step aside): the two read every valid Abaqus deck alike."""
+    *BUCKLE step aside): the two read every valid Abaqus deck alike.  (ccx's *DLOAD and
+    *DSLOAD share one, unlike Abaqus'; the conversion writes *DLOAD only: _dload_op_new_first.)"""
     acts: set = set()
     seen: set = set()                 # the keywords met since the last *STEP / *END STEP
     for b in cards:
@@ -7588,6 +7589,7 @@ class Converter:
                 continue
             out.extend(self.translate_one(b))
         out.extend(self._boundary_pieces(self._vel_tail.get(self._step_idx, [])))
+        self._dload_op_new_first(out)
         out.extend(self._flush_dloads())
         out.extend(self._flush_nodal_loads())
         out.extend(self._anchored_output(step_block))  # Abaqus' default output, if any
@@ -10603,12 +10605,36 @@ class Converter:
 
     def _dload_op_new(self, origin: str, wipes: bool = True) -> None:
         """OP=NEW on a *DLOAD / *DSLOAD: Abaqus removes that card's loads of earlier steps.  An
-        emitted ccx *DLOAD, OP=NEW (``wipes``) removes the other card's too, so they are given
-        again at the end of the step (_flush_dloads)."""
+        emitted ccx *DLOAD, OP=NEW (``wipes``; on the step's first *DLOAD: _dload_op_new_first)
+        removes the other card's too, so they are given again at the end of the step
+        (_flush_dloads)."""
         state = self._dl_state.setdefault(origin, OrderedDict())
         for key in [k for k in state if (origin, k) not in self._dl_fresh]:
             del state[key]
         self._dl_wiped = self._dl_wiped or wipes
+
+    def _dload_op_new_first(self, out: List[str]) -> None:
+        """ccx 2.23 acts on OP=NEW on a step's first *DLOAD / *DSLOAD card only (one flag for
+        both), so where the step's *DLOAD, OP=NEW follows another *DLOAD written for it
+        (valid Abaqus: *DSLOAD, then *DLOAD, OP=NEW, or the other way round) a bare one goes
+        before that first card (``out``: the step's lines so far)."""
+        if not self._dl_wiped:
+            return
+        for i, raw in enumerate(out):
+            s = raw.strip()
+            if not s.startswith("*") or s.startswith("**"):
+                continue
+            kw, params = parse_keyword_line(s)
+            if kw != "DLOAD":
+                continue
+            if (params.get("OP") or "").strip().upper() != "NEW":
+                out[i:i] = ["** abq2ccx: the step's later *DLOAD, OP=NEW, here: ccx 2.23 acts on "
+                            "it on a step's first *DLOAD only", "*DLOAD, OP=NEW"]
+                self.report.note("*DLOAD / *DSLOAD, OP=NEW after another distributed-load card of "
+                                 "the step: ccx 2.23 acts on OP=NEW on a step's first *DLOAD / "
+                                 "*DSLOAD only (one flag for both), so a bare *DLOAD, OP=NEW is "
+                                 "written before that card.", once=True)
+            return
 
     def _flush_dloads(self) -> List[str]:
         """After a ccx *DLOAD, OP=NEW in this step: the distributed loads of earlier steps that

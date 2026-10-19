@@ -4905,6 +4905,30 @@ def test_dload_and_dsload_op_new_keep_each_others_loads():
     step2 = body.split("*STEP")[2]
     assert "*DLOAD, OP=NEW" in step2 and "\nEALL, GRAV, 9.81, 0., 0., -1." in step2
     assert "P2" not in step2 and not conv.unloaded_steps
+    assert "the step's later *DLOAD, OP=NEW" not in body     # (on its first card already)
+
+
+def test_dload_op_new_after_the_other_distributed_load_card():
+    # ccx 2.23 has one OP=NEW flag for *DLOAD and *DSLOAD and acts on it on a step's first card
+    # only: a *DLOAD, OP=NEW after a *DSLOAD (or the other way round, valid Abaqus) left the
+    # loads Abaqus removes in force (probed: a block's gravity from step 1 stayed on in step 2).
+    # A bare one opens the step; the loads Abaqus keeps are given again after the step's own
+    deck = (HEX + "*Surface, name=SF\nEALL, S2\n*Surface, name=SB\nEALL, S1\n*Step\n*Static\n"
+            "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n*Dsload\nSF, P, 1.\n*End Step\n"
+            "*Step\n*Static\n{}\n*End Step\n")
+    pressure, bz = ["EALL, P1, 2."], ["EALL, BZ, 1."]
+    for cards, given, gone in (
+            ("*Dsload\nSB, P, 2.\n*Dload, op=NEW\nEALL, BZ, 1.", [pressure, bz, ["EALL, P2, 1."]],
+             "GRAV"),
+            ("*Dload\nEALL, BZ, 1.\n*Dsload, op=NEW\nSB, P, 2.",
+             [bz, pressure, ["EALL, GRAV, 9.81, 0., 0., -1."]], "P2")):
+        body, conv, rep = convert_str(deck.format(cards))
+        blocks = A.blocks_from_lines(body.splitlines())
+        dl = [b for b in A.step_groups(blocks)[1][1] if b.keyword == "DLOAD"]
+        assert id(dl[0]) in A.op_new_cards(blocks, ("DLOAD",)) and not dl[0].data
+        assert [b.data for b in dl[1:]] == given
+        assert gone not in body.split("*STEP")[2] and not conv.unloaded_steps
+        assert "on a step's first *DLOAD / *DSLOAD only" in rep.text()
 
 
 # a static step (a load, a pressure, a prescribed displacement, temperatures), a *FREQUENCY
