@@ -5087,14 +5087,22 @@ class Converter:
     def _lamina_to_engineering_constants(self, b: Block) -> Optional[List[str]]:
         """``*ELASTIC, TYPE=LAMINA`` (E1,E2,nu12,G12,G13,G23[,T]) has no ccx equivalent;
         expand to ENGINEERING CONSTANTS assuming transverse isotropy: E3=E2, nu13=nu12,
-        nu23 from G23=E2/(2(1+nu23)).  Returns None if the data cannot be parsed."""
+        nu23 from G23=E2/(2(1+nu23)).  DEPENDENCIES= rows are collapsed first, as on the
+        other types.  Returns None if the data cannot be parsed."""
+        lines = list(b.data)
+        if b.has("DEPENDENCIES"):
+            lines = self._collapse_dependencies(b, 6)
+            if lines is None:
+                return None
         rows: List[str] = []
-        for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
+        for ln in lines:
+            f = [x.strip() for x in ln.split(",")]
+            while f and f[-1] == "":
+                f.pop()
             if not f:
                 continue
-            try:
-                v = [pf(x) for x in f]
+            try:                                # by position: a blank field is 0, as in Abaqus
+                v = [pf(x) if x else 0.0 for x in f]
             except ValueError:
                 return None
             if len(v) < 6:
@@ -5106,7 +5114,8 @@ class Converter:
             rows.append(f"{G23:.6g}" + (f", {v[6]:.6g}" if len(v) > 6 else ""))
         if not rows:
             return None
-        params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict(
+            (k, v) for k, v in b.params.items() if k != "DEPENDENCIES")
         params["TYPE"] = "ENGINEERING CONSTANTS"
         self.report.warn("*ELASTIC TYPE=LAMINA -> ENGINEERING CONSTANTS with assumed transverse "
                          "isotropy (E3=E2, nu13=nu12, nu23 derived from G23). ccx expands shells "

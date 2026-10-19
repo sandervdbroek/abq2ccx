@@ -1354,6 +1354,14 @@ def test_lamina_to_engineering_constants():
     assert abs(row1[5] - nu23) < 1e-6
     assert [float(x) for x in lines[el + 2].split(",")] == [3800.]
     assert "transverse" in rep.text().lower()
+    # DEPENDENCIES: collapsed to the field-0 rows (the parameter dropped), as on the other
+    # types; fields are read by position, a blank one being 0
+    body, _, rep = convert_str("*Material, name=cfrp\n*Elastic, type=LAMINA, dependencies=1\n"
+                               "140e3, 10e3, , 5e3, 5e3, 3.5e3, 20., 0.\n"
+                               "130e3, 9e3, 0.3, 4.5e3, 4.5e3, 3.2e3, 20., 1.\n")
+    assert _card_at(body, "*ELASTIC, TYPE=ENGINEERING CONSTANTS") == [
+        "140000, 10000, 10000, 0, 0, 0.428571, 5000, 5000", "3500, 20"]
+    assert "DEPENDENCIES=1: ccx has no field-variable dependence; collapsed" in rep.text()
 
 
 def elastic_card(body, material):
