@@ -5388,14 +5388,8 @@ class Converter:
         amplitude that jumps, a *MODEL CHANGE, unbalanced initial stresses); ccx's alpha is
         kept.  (An initial contact overclosure is no such start: ccx closes it at the first
         increment exactly, with either alpha.)"""
-        groups: List[List[Block]] = []
-        for b in blocks:
-            if b.keyword == "STEP":
-                groups.append([b])
-            elif groups and groups[-1][-1].keyword != "END STEP":
-                groups[-1].append(b)
         coupled: List[Tuple[int, List[Block]]] = []    # (step number, its cards)
-        for i, g in enumerate(groups, 1):
+        for i, g in enumerate(step_groups(blocks)[1], 1):
             proc = next((x for x in g[1:] if x.keyword in PROC_KW), None)
             if proc is not None and proc.keyword == "COUPLED TEMPERATURE-DISPLACEMENT" and \
                     not (proc.has("STEADY STATE") or proc.has("STEADYSTATE")):
@@ -12117,19 +12111,9 @@ class Converter:
         _sample_amplitude tabulates an analytic amplitude (None if a step's time period is
         unknown)."""
         self._amp_span: Optional[Tuple[float, float]] = None
-        groups: List[List[Block]] = []
-        cur: Optional[List[Block]] = None
-        for b in blocks:
-            if b.keyword == "STEP" and cur is None:
-                cur = [b]
-            elif cur is not None:
-                cur.append(b)
-                if b.keyword == "END STEP":
-                    groups.append(cur)
-                    cur = None
         longest = total = 0.0
         nlgeom = False
-        for group in groups:
+        for group in step_groups(blocks)[1]:
             info = self._step_motion(group, nlgeom)
             nlgeom = info["nlgeom"]
             if info["advance"] is None:
@@ -16871,15 +16855,7 @@ class Converter:
         mode BCs that differ from the base state's cannot be had in ccx: the modes then get the
         base state's BCs (reduced physics).  Fills ``self._lc_drop``."""
         self._lc_drop = set()
-        step: List[Block] = []
-        groups: List[List[Block]] = []
-        for b in blocks:
-            if b.keyword == "STEP":
-                step = []
-                groups.append(step)
-            elif b.keyword != "END STEP":
-                step.append(b)
-        for g in groups:
+        for g in step_groups(blocks)[1]:
             bcs = [b for b in g if b.keyword == "BOUNDARY"]
             two = [b for b in bcs if (b.param("LOAD CASE") or "1").strip() == "2"]
             if not two:
@@ -20301,19 +20277,12 @@ class Converter:
         state = set(planar)                        # (node, DOF) pairs in effect
         steps: List[List[Block]] = []               # each step's *BOUNDARY cards ...
         procs: List[str] = []                       # ... and procedure
-        inside = False
-        for b in blocks:
-            if b.keyword in ("STEP", "END STEP"):
-                inside = b.keyword == "STEP"
-                if inside:
-                    steps.append([])
-                    procs.append("")
-            elif inside and b.keyword == "BOUNDARY":
-                steps[-1].append(b)
-            elif inside and b.keyword in PROC_KW:
-                procs[-1] = procs[-1] or b.keyword
-            elif b.keyword == "BOUNDARY":
-                state |= self._boundary_pairs(b)
+        for step, cards in deck_parts(blocks):
+            if step:
+                steps.append([b for b in cards if b.keyword == "BOUNDARY"])
+                procs.append(next((b.keyword for b in cards if b.keyword in PROC_KW), ""))
+            elif cards[0].keyword == "BOUNDARY":
+                state |= self._boundary_pairs(cards[0])
 
         def rotations(pairs: set) -> set:
             return {n for n, d in pairs if 4 <= d <= 6 and n in self._rot_nodes
