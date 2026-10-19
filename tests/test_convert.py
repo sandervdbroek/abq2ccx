@@ -5999,6 +5999,64 @@ def test_kinematic_reference_node_that_stays_a_coupling_gets_global_components()
     assert "the local rotation axes held are not a set of global ones" in rep.text()
 
 
+def test_kinematic_coupling_in_a_dynamic_deck():
+    # ccx 2.23 sets up no equations for a *DYNAMIC step of a model whose *COUPLING + *KINEMATIC
+    # chain no MPCs: every free DOF stays at its initial value (validate_with_ccx.py
+    # kinematic_dynamic_*).  Without NLGEOM the coupling is the linear equations Abaqus solves,
+    # u = u_ref + theta x d, theta on a ROT NODE that takes the rotational BCs
+    step = ("*Step{}\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\nRP, 2, 6\n"
+            "*Boundary\nRP, 1, 1, 0.1\n*End Step\n")
+    body, conv, rep = convert_str(KIN9 + step.format(""))
+    rot = conv._rb_rot[9]
+    assert "*COUPLING" not in body and "*KINEMATIC" not in body and "*RIGID BODY" not in body
+    eqs = _equation_terms(body)
+    assert len(eqs) == 12        # node 5: d = (-0.5, -0.5, -1), (theta x d)_1 = -theta_2 + theta_3 / 2
+    assert eqs[0] == [(5, 1, 1.), (9, 1, -1.), (rot, 2, 1.), (rot, 3, -0.5)]
+    assert {"RP,2,3", f"{rot},1,3"} <= set(_bc_lines(body))
+    assert "Kinematic coupling in a deck with a *DYNAMIC step" in rep.text()
+    assert rep.n_warnings == 0 and not conv.reduced_physics
+    # the legacy card alike
+    legacy = KIN9.split("*Surface")[0] + "*Kinematic Coupling, ref node=RP\nTOPN, 1, 3\n"
+    body, conv, _ = convert_str(legacy + step.format(""))
+    assert _equation_terms(body) == eqs and "*COUPLING" not in body
+    # under NLGEOM (explicit steps run with it) a coupling of all translations is the *RIGID
+    # BODY it is in ccx, the same RIGID MPCs
+    for deck in (KIN9 + step.format(", nlgeom"), legacy + step.format(", nlgeom"),
+                 KIN9 + step.format("").replace("*Dynamic\n", "*Dynamic, explicit\n")):
+        body, conv, rep = convert_str(deck)
+        rot = conv._rb_rot[9]
+        assert f"*RIGID BODY, NSET=ABQ2CCX_RB1, REF NODE=9, ROT NODE={rot}" in body
+        assert not _equation_terms(body) and "*COUPLING" not in body and not conv.reduced_physics
+    # some translations: linear equations without NLGEOM; under NLGEOM nothing exact
+    # (equations: 7 % off at 0.36 rad), so commented out, or --approximate's equations
+    some = KIN9.replace("*Kinematic\n1, 6\n", "*Kinematic\n1, 2\n")
+    body, conv, _ = convert_str(some + step.format(""))
+    assert len(_equation_terms(body)) == 8 and not conv.reduced_physics
+    body, conv, rep = convert_str(some + step.format(", nlgeom"))
+    assert "** *COUPLING" in body and "** *KINEMATIC\n** 1, 2" in body and not _equation_terms(body)
+    assert conv.reduced_physics and "--approximate to write the linear equations" in rep.text()
+    assert 9 not in conv._rb_rot and "RP,2,6" in _bc_lines(body)     # no ROT NODE for it
+    body, conv, rep = convert_str(some + step.format(", nlgeom"), approximate=True)
+    assert len(_equation_terms(body)) == 8 and "[APPROX] Kinematic coupling" in rep.text()
+    # a reference node shared with a *RIGID BODY: one ROT NODE, one rotation
+    shared = KIN9 + "*Nset, nset=BOTN\n1, 2\n*Rigid Body, ref node=RP, tie nset=BOTN\n"
+    body, conv, _ = convert_str(shared + step.format("").replace("1, 1, 3\n2, 1, 3\n", ""))
+    rot = conv._rb_rot[9]
+    assert f"*RIGID BODY, REF NODE=9, NSET=BOTN, ROT NODE={rot}" in body
+    assert {t[0] for t in _equation_terms(body)[0]} == {5, 9, rot}
+    # unchanged: a deck without a *DYNAMIC step, and couplings ccx solves in one (their
+    # knotted shell or 2-D members chain the MPCs; probed)
+    body, conv, _ = convert_str(KIN9 + KIN9_STEP)
+    assert "*COUPLING" in body and "*KINEMATIC\n1, 3" in body and 9 not in conv._rb_rot
+    dyn = "*Step\n*Dynamic\n0.01, 1.\n*End Step\n"
+    for deck in (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
+                      "surface=RS\n*Kinematic\n1, 3\n" + dyn,
+                 Q4 + "*Node\n9, 0.5, 2.\n*Surface, type=node, name=LS\nL\n*Coupling, constraint "
+                      "name=C, ref node=9, surface=LS\n*Kinematic\n" + dyn):
+        body, conv, _ = convert_str(deck)
+        assert "*COUPLING" in body and "*KINEMATIC" in body and not conv._kin_dyn
+
+
 def test_equation_terms_on_rigid_body_reference_rotations_move_to_the_rot_node():
     # ccx carries a *RIGID BODY's rotation on DOFs 1-3 of its ROT NODE and ignores DOFs 4-6
     # of the REF NODE: an *EQUATION term there acted as a fixed zero (probed: 100 % off), or
@@ -6373,7 +6431,8 @@ def test_velocity_bc_card_a_coupling_implies_is_left_out_whole():
             "BOT, 1, 3\n*Boundary, type=VELOCITY\n100, 1, 1, 2.\n100, 4, 6, 0.\n"
             "*Boundary, type=VELOCITY\nTOP, 1, 1, 2.\n*End Step\n")
     body, _, rep = convert_str(deck)
-    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\n100, 1, 1, 2\n*BOUNDARY\n100, 4, 6\n*NODE" in body
+    # (in a *DYNAMIC step the coupling is linear equations, its rotation on the ROT NODE 101)
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\n100, 1, 1, 2\n*BOUNDARY\n101, 1, 3\n*NODE" in body
     assert "TOP, 1, 1" not in body and "taken off 4 DOF(s)" in rep.text()
     assert "Possible overconstraint" not in rep.text()
 

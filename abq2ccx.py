@@ -3679,7 +3679,11 @@ class Converter:
         self._rot_axes_warned = False
         # kinematic couplings whose transformed reference node carries its rotation on a ROT
         # NODE of a *RIGID BODY instead (_plan_kinematic_rot_nodes): id(*COUPLING) -> ROT NODE
-        self._kin_rb: Dict[int, int] = {}
+        self._kin_rb: Dict[int, Optional[int]] = {}
+        # ... and those of plain 3-D members in a deck with a *DYNAMIC step, written without
+        # ccx's *KINEMATIC (_kin_form; ROT NODE None where all are left out); id(*COUPLING /
+        # *KINEMATIC COUPLING)
+        self._kin_dyn: set = set()
         # deck BCs / moments on DOFs 4-6 of a transformed shell/beam node or kinematic
         # reference node (_plan_transformed_rotations): node -> "keep" / "global" / "refuse",
         # and per (id(card), node) the lines that replace them (or why they are left out)
@@ -11777,6 +11781,8 @@ class Converter:
                                       "no members); edit manually.", reduces=False)
         if not re.fullmatch(r"[-+]?\d+", ref) and self.geom.nset(ref):
             ref = str(self.geom.nset(ref)[0])
+        if (self._coupling_plan.get(id(b)) or {}).get("kind") == "kdyn":
+            return self._kin_dynamic_cards(b, self._coupling_plan[id(b)], self._legacy_kinematic_groups(b))
         groups: "OrderedDict[Tuple[int, int], List[str]]" = OrderedDict()
         try:
             for r in recs:
@@ -12650,6 +12656,9 @@ class Converter:
         self._last_planar = id(b) in self._planar_kin
         if (self._last_coupling or {}).get("kind") in ("rb", "rbk"):
             return self._coupling_as_rigid_body(self._last_coupling)
+        if (self._last_coupling or {}).get("kind") == "kdyn":
+            plan = self._last_coupling
+            return self._kin_dynamic_cards(b, plan, [(plan["members"], plan["dofs"])])
         if (self._last_coupling or {}).get("kind") == "unsupported":
             self._warn_rigid_unsupported()
         pre: List[str] = []
@@ -12731,6 +12740,9 @@ class Converter:
         planar, self._last_planar = self._last_planar, False
         if plan.get("kind") in ("rb", "rbk"):
             return []                 # folded into the *RIGID BODY of the *COUPLING card
+        if plan.get("kind") == "kdyn":                # written by the *COUPLING card
+            return ["** " + emit_keyword("KINEMATIC", b.params)] + ["** " + d for d in b.data] \
+                if plan.get("commented") else []
         top = 2 if planar else 3
         lines: List[str] = []
         had_lines = False
@@ -17718,22 +17730,51 @@ class Converter:
         equation terms are moved — read in the local axes (probed on 2.23 against the
         rotated model: exact, linear and NLGEOM; as a kinematic coupling 34-253 % off).
         Couplings of some translations, 2-D ones and reference nodes whose axes are
-        undefined keep their form (_plan_transformed_rotations).  Returns the last node id."""
+        undefined keep their form (_plan_transformed_rotations).
+
+        ccx 2.23 also solves no *DYNAMIC step (implicit or explicit) of a model in which
+        kinematic couplings chain no MPCs: it sets up no equations, and every free DOF stays
+        at its initial value, with no message (probed; the Windows build stops in u_calloc).
+        ccx ties the coupling's rotation node to the reference node with linear MPCs labelled
+        ROTTRACOUPLING, which cascade.c counts as user MPCs in a nonlinear step and so skips
+        the matrix structure, and nonlingeo's initial-acceleration call of nonlinmpc clears
+        the flag that would build it later.  Couplings on knotted shell/beam or 2-D members
+        solve (their MPCs chain, which keeps the flag; probed).  So in a deck with a *DYNAMIC
+        step every coupling whose members are plain 3-D nodes is written without ccx's
+        *KINEMATIC, as _kin_form says (``_kin_dyn``; every coupling on the reference node, or
+        none, sharing its ROT NODE).  Returns the last node id."""
         structural = set(self._shell_nodes) | set(self._beam_nodes)
         for e, (typ, conn) in self.geom.elements.items():
             if e not in self._qmem and ccx_type(typ).startswith("M3D"):
                 structural.update(conn)
+        dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
         cands: "OrderedDict[int, List[Tuple[int, bool]]]" = OrderedDict()  # ref -> (id, tied)
         convertible: set = set()             # couplings of all translations, 3-D members
+        # ref -> (id, its members are plain, it constrains anything: a ROT NODE is needed)
+        dyn: "OrderedDict[int, List[Tuple[int, bool, bool]]]" = OrderedDict()
         for i, b in enumerate(blocks):
-            if b.keyword != "COUPLING" or i + 1 >= len(blocks) or blocks[i + 1].keyword != "KINEMATIC":
+            legacy = b.keyword == "KINEMATIC COUPLING"
+            if not legacy and (b.keyword != "COUPLING" or i + 1 >= len(blocks) or
+                               blocks[i + 1].keyword != "KINEMATIC"):
                 continue
             ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
-            if ref is None or ref not in self._transformed or ref in self._rb_rot or \
-                    ref in structural or isinstance(self._local_axes(ref), str):
+            if ref is None or ref in structural:
+                continue
+            if legacy:
+                groups = self._legacy_kinematic_groups(b)
+                members = [n for ns, _ in groups for n in ns if n != ref]
+            else:
+                members = [n for n in self._surface_member_nodes(b.param("SURFACE") or "") if n != ref]
+                groups = [(members, self._kinematic_dofs(blocks[i + 1]))]
+            if dynamic:
+                plain = bool(members) and not any(n in structural or n in self._plane_only
+                                                  for n in members)
+                dyn.setdefault(ref, []).append((id(b), plain, plain and any(
+                    self._kin_form(ref, ns, ds) in ("rb", "eq") for ns, ds in groups)))
+            if legacy or ref not in self._transformed or ref in self._rb_rot or \
+                    isinstance(self._local_axes(ref), str):
                 continue
             dofs = self._kinematic_dofs(blocks[i + 1])
-            members = [n for n in self._surface_member_nodes(b.param("SURFACE") or "") if n != ref]
             if not {1, 2, 3} <= dofs or not members or all(n in self._plane_only for n in members):
                 cands.setdefault(ref, []).append((id(b), False))
                 continue
@@ -17750,8 +17791,20 @@ class Converter:
                 self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
                 for c, _ in cs:
                     self._kin_rb[c] = next_id
-        if self._kin_rb:
-            self.report.note(f"{len(self._kin_rb)} kinematic coupling(s) with a *TRANSFORM on the "
+        n_transformed = len(self._kin_rb)
+        for ref, cs in dyn.items():
+            if not all(plain for _, plain, _ in cs) or all(c in self._kin_rb for c, _, _ in cs):
+                continue
+            rot = self._rb_rot.get(ref)
+            if rot is None and any(live for _, _, live in cs):
+                next_id += 1
+                self.geom.add_node(next_id, self.geom.nodes.get(ref, (0.0, 0.0, 0.0)))
+                self._rb_rot[ref] = self._rb_rot_synth[ref] = rot = next_id
+            for c, _, _ in cs:
+                self._kin_rb[c] = rot           # (None: every one left out, no ROT NODE)
+                self._kin_dyn.add(c)
+        if n_transformed:
+            self.report.note(f"{n_transformed} kinematic coupling(s) with a *TRANSFORM on the "
                              f"reference node written as *RIGID BODY with a ROT NODE in the node's "
                              f"local axes (the same RIGID MPCs in ccx): ccx's kinematic coupling "
                              f"carries the rotation on an internal node without the *TRANSFORM, "
@@ -18331,7 +18384,8 @@ class Converter:
                 dofs = self._kinematic_dofs(nxt)
                 if id(b) in self._kin_rb:          # a *RIGID BODY (_plan_kinematic_rot_nodes)
                     knots += [n for n in members if n in structural]
-                    self._coupling_plan[id(b)] = {"kind": "rbk", "ref": ref, "dofs": dofs,
+                    self._coupling_plan[id(b)] = {"kind": "kdyn" if id(b) in self._kin_dyn else "rbk",
+                                                  "ref": ref, "dofs": dofs,
                                                   "rot": self._kin_rb[id(b)],
                                                   "members": [n for n in members if n != ref]}
                     continue
@@ -18350,6 +18404,10 @@ class Converter:
                 else:
                     self._coupling_plan[id(b)] = {"kind": "unsupported"}
             elif b.keyword == "KINEMATIC COUPLING":
+                if id(b) in self._kin_rb:          # plain members (_plan_kinematic_rot_nodes)
+                    self._coupling_plan[id(b)] = {"kind": "kdyn", "ref": ref,
+                                                  "rot": self._kin_rb[id(b)]}
+                    continue
                 members, translational = [], False
                 for r in merged_data_records(b):
                     f = [x for x in r if x != ""]
@@ -18737,6 +18795,8 @@ class Converter:
                         continue
                     lines.append((self._resolve_nodes(f[0]), set(range(min(d1, d2), max(d1, d2) + 1))))
                 tied = any(ds & {1, 2, 3} for _, ds in lines)
+            if id(b) in self._kin_dyn:               # the lines it leaves out constrain nothing
+                lines = [(ns, ds) for ns, ds in lines if self._kin_form(ref, ns, ds) in ("rb", "eq")]
             members = {n for ns, _ in lines for n in ns} - {ref, rot}
             if not members:
                 continue
@@ -19252,6 +19312,127 @@ class Converter:
                 continue
             dofs.update(range(min(d1, d2), max(d1, d2) + 1))
         return dofs or set(range(1, 7))
+
+    def _legacy_kinematic_groups(self, b: Block) -> List[Tuple[List[int], set]]:
+        """(nodes, DOFs) of each line of a *KINEMATIC COUPLING card (member, first DOF, last
+        DOF; no DOFs: all of them); unreadable lines are skipped."""
+        out: List[Tuple[List[int], set]] = []
+        for r in merged_data_records(b):
+            f = [x for x in r if x != ""]
+            if not f:
+                continue
+            try:
+                d1 = pint(f[1]) if len(f) > 1 else 1
+                d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
+            except ValueError:
+                continue
+            out.append((self._resolve_nodes(f[0]), set(range(min(d1, d2), max(d1, d2) + 1))))
+        return out
+
+    def _kin_form(self, ref: int, members: Sequence[int], dofs: set) -> str:
+        """How a kinematic coupling of plain 3-D members in a deck with a *DYNAMIC step is
+        written (``_kin_dyn``, see _plan_kinematic_rot_nodes), with the reference node's
+        rotation on DOFs 1-3 of its ROT NODE: 'eq' — linear *EQUATIONs (_kin_rows), the
+        coupling Abaqus solves without NLGEOM (exact; in a *DYNAMIC step ccx turns a
+        *RIGID BODY's RIGID MPCs with the finite rotation even without NLGEOM: 7 % off at
+        0.36 rad, probed); 'rb' — under NLGEOM, a coupling of all translations as the *RIGID
+        BODY it is in ccx (the same RIGID MPCs; exact, probed); under NLGEOM a coupling of
+        some translations has neither ('drop'; --approximate: 'eq', linear equations being
+        exact for small rotations only: 7 % off at 0.36 rad), nor has a coupling of no
+        translation ('none').  Linear equations need nodes without a *TRANSFORM."""
+        trans = dofs & {1, 2, 3}
+        if not trans:
+            return "none"
+        local = any(n in self._transformed for n in [ref] + list(members))
+        if not self._nl_any and not local:
+            return "eq"
+        if trans == {1, 2, 3}:
+            return "rb"
+        return "eq" if self._approx and not local else "drop"
+
+    def _kin_rows(self, ref: int, rot: int, members: Sequence[int],
+                  dofs: set) -> List[List[Tuple[int, int, float]]]:
+        """The linear *EQUATIONs of a kinematic coupling (_kin_form 'eq'): for each member m and
+        coupled translation j, u_j(m) - u_j(ref) - (theta x d)_j = 0, d = x_m - x_ref, theta
+        the rotation on DOFs 1-3 of ``rot`` — ccx's RIGID MPC at the initial geometry."""
+        x0 = self.geom.nodes[ref]
+        rows: List[List[Tuple[int, int, float]]] = []
+        for m in members:
+            d = vsub(self.geom.nodes[m], x0)
+            tol = 1e-12 * max(vnorm(d), 1.0)
+            for j in sorted(dofs & {1, 2, 3}):
+                c = vcross(d, tuple(float(k == j - 1) for k in range(3)))   # (theta x d)_j = c . theta
+                rows.append([(m, j, 1.0), (ref, j, -1.0)] +
+                            [(rot, k + 1, -c[k]) for k in range(3) if abs(c[k]) > tol])
+        return rows
+
+    def _kin_dynamic_cards(self, b: Block, plan: dict,
+                           groups: Sequence[Tuple[Sequence[int], set]]) -> List[str]:
+        """A kinematic coupling of plain 3-D members in a deck with a *DYNAMIC step: each
+        (members, DOFs) group as _kin_form says — a *RIGID BODY with the reference node's ROT
+        NODE, linear *EQUATIONs to the reference node and that ROT NODE, or left out (the card
+        commented out when nothing is left)."""
+        ref, rot = plan["ref"], plan["rot"]
+        body: List[int] = []
+        rows: List[List[Tuple[int, int, float]]] = []
+        forms: set = set()
+        for nodes, dofs in groups:
+            nodes = [n for n in dedup(nodes) if n not in (ref, rot)]
+            form = self._kin_form(ref, nodes, dofs)
+            forms.add(form)
+            if form == "rb":
+                body += nodes
+            elif form == "eq":
+                rows += self._kin_rows(ref, rot, nodes, dofs)
+        out: List[str] = []
+        if body:
+            self._synth_counter += 1
+            name = f"ABQ2CCX_RB{self._synth_counter}"
+            out += [f"*NSET, NSET={name}"] + reflow([str(n) for n in dedup(body)])
+            out.append(f"*RIGID BODY, NSET={name}, REF NODE={ref}, ROT NODE={rot}")
+        out += self._equation_lines(rows)
+        if out:
+            self.report.note("Kinematic coupling in a deck with a *DYNAMIC step: ccx 2.23 solves no "
+                             "*DYNAMIC step of a model whose *COUPLING + *KINEMATIC chain no MPCs "
+                             "(every free DOF stays at its initial value, with no message; probed), "
+                             "so a coupling of plain 3-D nodes is written without them, the "
+                             "reference node's rotation on DOFs 1-3 of a ROT NODE (where its "
+                             "rotational BCs, moments and equation terms go): without NLGEOM as "
+                             "the linear *EQUATIONs Abaqus solves, u(node) = u(ref) + theta x d on "
+                             "each coupled translation (exact); under NLGEOM, coupling all "
+                             "translations, as a *RIGID BODY (the same RIGID MPCs as ccx's "
+                             "coupling; exact) — so also with a *TRANSFORM on its nodes, where a "
+                             "linear *DYNAMIC step then turns the body with the finite rotation.",
+                             once=True)
+        if rows and self._nl_any:
+            self.report.warn("[APPROX] Kinematic coupling of only some translations in a deck "
+                             "with a *DYNAMIC step and NLGEOM -> linear *EQUATIONs (u(node) = "
+                             "u(ref) + theta x d at the initial geometry): exact while the "
+                             "reference node turns little (7 % off at 0.36 rad, probed).", once=True)
+        local = any(n in self._transformed for ns, _ in groups for n in [ref] + list(ns))
+        drop = ("Kinematic coupling of only some translations in a deck with a *DYNAMIC step: "
+                "ccx 2.23 solves no *DYNAMIC step with ccx's *COUPLING + *KINEMATIC here (every "
+                "free DOF would stay at its initial value), a *RIGID BODY couples all "
+                "translations, and the linear *EQUATIONs Abaqus solves without NLGEOM are "
+                + ("written for nodes without a *TRANSFORM only" if local else
+                   "exact for small rotations only under NLGEOM")
+                + "; commented out — the constraint is missing."
+                + ("" if local else " Rerun with --approximate to write the linear equations."))
+        what = "kinematic coupling of some translations in a dynamic step"
+        none = ("Kinematic coupling of only rotational DOFs (4..6) of nodes without rotations: "
+                "ccx couples translations only (and its *KINEMATIC would keep a *DYNAMIC step from "
+                "solving); commented out — rotations are NOT coupled.")
+        if not out:
+            plan["commented"] = True
+            return self._commented(b, drop if "drop" in forms else none,
+                                   reduces=what if "drop" in forms else "*KINEMATIC rotation-only coupling")
+        if "drop" in forms:
+            self.report.warn(drop, once=True)
+            self._reduces(what)
+        if "none" in forms:
+            self.report.warn(none, once=True)
+            self._reduces("*KINEMATIC rotation-only coupling")
+        return out
 
     def _surface_member_nodes(self, name: str) -> List[int]:
         """The nodes a *COUPLING on surface ``name`` acts on: a node surface's nodes, or the

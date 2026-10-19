@@ -47,6 +47,13 @@ physics.
   frequency step's `OP=NEW`, and constraints on rotations of transformed nodes that are
   commented out (reduced physics; `SCALE STRESS=1.00` no longer is). Converted decks mark all
   the converter's comments `** abq2ccx:`.
+* **Kinematic couplings in dynamic steps** — ccx 2.23 solves no `*DYNAMIC` step (implicit or
+  explicit) of a model whose `*COUPLING` + `*KINEMATIC` chain no MPCs: it sets up no equations,
+  and every free DOF kept its initial value, with no message. In a deck with a `*DYNAMIC` step
+  a coupling of solid or free nodes is now the linear `*EQUATION`s Abaqus solves without NLGEOM,
+  or a `*RIGID BODY` under NLGEOM; under NLGEOM one of only some translations is commented out
+  (`--approximate`: the linear equations). `davidmorinntnu_example_vuhard_v1` / `_v2` had run
+  with their specimens' lateral DOFs frozen; their DOF-2 couplings are now commented out.
 * **Pre-tension nodes named by a set** — `*PRE-TENSION SECTION, NODE=` (and a truss or beam
   cut's `ELEMENT=`) naming a set of one node (element), as Abaqus allows, is written with its
   number: ccx 2.23 reads only a number there and stopped on the set name. Instance-qualified
