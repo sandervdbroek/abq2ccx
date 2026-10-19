@@ -5084,6 +5084,74 @@ def test_base_state_after_a_first_perturbation_step_beams_and_couplings():
     assert _bc_lines(body)[-1] == "TOP,1,1" and "Possible overconstraint" in rep.text()
 
 
+BUCKLE_CUBE = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Elset, elset=ROT\n1\n*Material, name=M\n"
+               "*Elastic\n1000., 0.\n*Density\n1e-3\n*Expansion\n1e-3\n*Solid Section, elset=EALL, "
+               "material=M\n*Initial Conditions, type=temperature\nALL, 0.\n"
+               "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+
+
+def _deck_step(proc, cards="", head=""):
+    return f"*Step{head}\n*{proc}\n{cards}*End Step\n"
+
+
+def test_zero_body_load_where_ccx_would_hold_none():
+    # ccx 2.23 aborts (it frees its body-load table twice) at the end of a step that holds no
+    # body load once an earlier step held one, and may leave the .dat empty (probed): reading
+    # *BUCKLE drops the earlier loads, and a *STEP, PERTURBATION *BUCKLE step's own are deleted
+    # after it.  A zero GRAV line there loads nothing (probed: the same factors and results)
+    def steps(*parts):
+        body, conv, rep = convert_str(BUCKLE_CUBE + "".join(parts))
+        return body.split("*STEP"), conv, rep
+
+    grav, load = "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n", "*Cload\n7, 3, -1.\n"
+    zero = ("** abq2ccx: a body load of zero: ccx 2.23 aborts after a step without body loads "
+            "once an earlier step had one\n*DLOAD\n{}, GRAV, 0., 0., 0., -1.\n*END STEP")
+    buckle = _deck_step("Buckle\n2", load, ", perturbation")
+    got, conv, rep = steps(_deck_step("Static", grav), buckle)
+    assert "GRAV, 0." not in got[1] and zero.format("EALL") in got[2]
+    assert "Step 2 holds no body load in ccx 2.23 after an earlier step held one" in rep.text()
+    assert not conv.reduced_physics and not conv.unloaded_steps
+    # a CENTRIF preload: the zero line goes on its set; a *DLOAD, OP=NEW keeps ccx's entries
+    got = steps(_deck_step("Static", "*Dload\nROT, CENTRIF, 100., 0., 0., 0., 0., 0., 1.\n"),
+                _deck_step("Static", "*Dload, op=NEW\n"), buckle)[0]
+    assert "GRAV, 0." not in got[2] and zero.format("ROT") in got[3]
+    # a buckle under its own gravity needs none; the step after it does (ccx deleted it),
+    # whatever its procedure, unless the base state's gravity is given again there
+    for nxt in (_deck_step("Static", "*Cload\n7, 1, 1.\n"), _deck_step("Frequency\n3")):
+        got = steps(_deck_step("Buckle\n2", grav + load, ", perturbation"), nxt)[0]
+        assert "GRAV, 0." not in got[1] and zero.format("EALL") in got[2]
+    got = steps(_deck_step("Static", grav), buckle, buckle, _deck_step("Static"))[0]
+    assert [s.count("GRAV, 0.") for s in got[1:]] == [0, 1, 1, 0]
+    assert "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nEALL, GRAV, 9.81, 0., 0., -1.\n" in got[4]
+    # no body load before: nothing to keep
+    got, _, rep = steps(_deck_step("Static", load), buckle, _deck_step("Buckle\n2", grav))
+    assert "GRAV, 0." not in "".join(got) and "holds no body load" not in rep.text()
+
+
+def test_temperature_in_a_buckle_step_commented_out():
+    # Abaqus scales a *BUCKLE step's temperature change with the buckling factor (thermal
+    # buckling); ccx 2.23 stops on it ("temperature loading is not allowed in a linear
+    # buckling step"), and no load gives its stresses in ccx's *BUCKLE (probed): reduced physics
+    temp = "*Temperature\nALL, 100.\n"
+    body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Buckle\n2", temp + "*Cload\n7, 3, -1.\n"))
+    assert "** abq2ccx: *TEMPERATURE in a *BUCKLE step: Abaqus scales the change of temperature" \
+           in body and "** *TEMPERATURE\n** ALL, 100.\n*CLOAD\n7, 3, -1.\n" in body
+    assert "Commented out: ccx's buckling factors are those of the step's other loads alone." \
+           in rep.text()
+    assert conv.reduced_physics == ["temperatures of a *BUCKLE step (thermal buckling load)"]
+    assert not conv.unloaded_steps
+    # its only load: the factors mean nothing (the load audit says so too)
+    _, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", temp) +
+                               _deck_step("Buckle\n2", "*Temperature\nALL, 300.\n", ", perturbation"))
+    assert "are meaningless, the step has no other load" in rep.text() and conv.unloaded_steps == [2]
+    assert "Step 2 is loaded in the Abaqus deck (*TEMPERATURE on ALL), but no load survives the " \
+           "conversion: ccx would solve it with no load at all, so its buckling factors mean " \
+           "nothing." in rep.text()
+    # a static step's temperatures stay
+    body, conv, _ = convert_str(BUCKLE_CUBE + _deck_step("Static", temp))
+    assert "\n*TEMPERATURE\nALL, 100.\n" in body and not conv.reduced_physics
+
+
 def test_dload_without_element_set_loads_the_whole_model():
     body, _, _ = convert_str(HEX + "*Step\n*Static\n*Dload\n, GRAV, 9.81, 0., 0., -1.\n*End Step\n")
     assert "\nABQ2CCX_ALL_ELEMENTS, GRAV, 9.81, 0., 0., -1." in body

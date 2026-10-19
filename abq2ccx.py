@@ -3626,6 +3626,7 @@ class Converter:
         self._freq_storage = False
         self._general_step_seen = False
         self._step_proc: Optional[str] = None      # the procedure of the step being emitted
+        self._buckle_loaded = False                 # a *BUCKLE step loaded by more than temperatures
         self._cyclic_ok: set = set()
         self._temp_ic_fill = False
         self._temp_ic_default = False
@@ -7544,6 +7545,9 @@ class Converter:
         self._dl_fresh, self._dl_wiped = set(), False
         self._step_temp_dof = next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS),
                                    None)
+        self._buckle_loaded = proc == "BUCKLE" and any(
+            desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
+            for _, desc in _load_entries(b, user_loads=True))
         # a linear perturbation step's loads act in it only (Abaqus): the converted loads it
         # starts from are the base state's, and so are the next general step's, which ccx
         # gets back at its start (_restore_base_states); _nodal_emitted follows what ccx holds
@@ -13287,13 +13291,26 @@ class Converter:
         mean of their end nodes' values.  USER (Abaqus UTEMP) is commented out.  In a step where
         temperature is a degree of freedom (``TEMPERATURE_DOF_PROCS``) Abaqus does not allow
         the card and ccx stops on it (probed on 2.23, with and without initial temperatures):
-        commented out."""
+        commented out.  So is a *BUCKLE step's: Abaqus scales its change from the base state
+        with the buckling factor (thermal buckling); ccx 2.23 stops on temperature loading in a
+        linear buckling step, and no load it takes there stands in for it: nodal forces give
+        other stresses, prescribed displacements (the same stresses in a static step) other
+        factors (probed).  So that load is lost."""
         if self._step_temp_dof:
             return self._commented(b, f"*TEMPERATURE in a *{self._step_temp_dof} step: temperature "
                                       f"is degree of freedom 11 there, and Abaqus does not allow a "
                                       f"predefined temperature field in such a step (prescribe the "
                                       f"temperature with *BOUNDARY on DOF 11); ccx stops on the "
                                       f"card. Commented out.", reduces=False)
+        if self._step_proc == "BUCKLE":
+            return self._commented(b, "*TEMPERATURE in a *BUCKLE step: Abaqus scales the change of "
+                                      "temperature from the base state with the buckling factor "
+                                      "(thermal buckling); ccx 2.23 stops on temperature loading in "
+                                      "a linear buckling step, and no load it takes there stands in "
+                                      "for it. Commented out: ccx's buckling factors " +
+                                   ("are those of the step's other loads alone." if self._buckle_loaded
+                                    else "are meaningless, the step has no other load."),
+                                   reduces="temperatures of a *BUCKLE step (thermal buckling load)")
         if b.has("USER"):
             return self._user_load_card(b)
         if b.has("FILE"):
@@ -13678,6 +13695,7 @@ class Converter:
         out = self._settle_dependents(out)
         out = self._restore_base_states(out)
         out = self._modal_own_loads(out)        # after the loads the restore gives back
+        out = self._keep_body_loads(out)        # after the restore, which gives body loads too
         self._audit_loads(blocks, out)
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
@@ -15474,6 +15492,57 @@ class Converter:
                  if used_hold[0] else []) + model_cards
         return res
 
+    def _keep_body_loads(self, out: List[str]) -> List[str]:
+        """ccx 2.23 aborts (SIGABRT: it frees its body-load table twice) at the end of a step
+        that holds no *DLOAD body load (GRAV, CENTRIF, NEWTON) once an earlier step held one,
+        and may leave the .dat empty (probed).  A step holds none when it gives none and is a
+        *BUCKLE step (reading *BUCKLE drops the earlier loads) or follows a *STEP, PERTURBATION
+        *BUCKLE step (ccx deletes that step's loads at its end); *DLOAD, OP=NEW keeps ccx's
+        entries, at zero.  Such a step gets a zero GRAV line on the last body load's element
+        set, which loads nothing (probed: the same buckling factors, frequencies and
+        displacements, and the job finishes)."""
+        holds = seen = dropped = pert = False
+        card = proc = token = None
+        insert: Dict[int, Optional[str]] = {}      # *END STEP line -> the zero line's set
+        steps: List[int] = []
+        for i, raw in enumerate(out):
+            s = raw.strip()
+            if not s or s.startswith("**"):
+                continue
+            if not s.startswith("*"):
+                f = [x.strip() for x in s.split(",")]
+                if card == "DLOAD" and len(f) > 1 and f[0] and f[1].upper() in self._BODY_LOADS:
+                    holds, token = True, f[0]
+                continue
+            card, params = parse_keyword_line(s)
+            if card == "STEP":
+                steps.append(i)
+                proc, pert, holds = None, "PERTURBATION" in params, holds and not dropped
+            elif card in PROC_KW and steps and proc is None:
+                proc, holds = card, holds and card != "BUCKLE"
+            elif card == "END STEP":
+                if seen and not holds:
+                    insert[i], holds = token, True
+                seen, dropped = seen or holds, proc == "BUCKLE" and pert
+        if not insert:
+            return out
+        filled = [str(sum(1 for k in steps if k < i)) for i in insert]
+        self.report.note(f"Step{'s' if len(filled) > 1 else ''} {', '.join(filled)} "
+                         f"hold{'' if len(filled) > 1 else 's'} no body load in ccx 2.23 after an "
+                         f"earlier step held one (*BUCKLE drops the earlier loads, and ccx deletes "
+                         f"a *STEP, PERTURBATION *BUCKLE step's own after it), and ccx then aborts "
+                         f"at the step's end (probed). A zero GRAV line is written there: it loads "
+                         f"nothing (probed: the same buckling factors and results, and the job "
+                         f"finishes).", once=True)
+        res: List[str] = []
+        for i, raw in enumerate(out):
+            if i in insert:
+                res += ["** abq2ccx: a body load of zero: ccx 2.23 aborts after a step without "
+                        "body loads once an earlier step had one", "*DLOAD",
+                        f"{insert[i]}, GRAV, 0., 0., 0., -1."]
+            res.append(raw)
+        return res
+
     def _audit_loads(self, blocks: List[Block], out: List[str]) -> None:
         """Guard against a hollow solve: a step the Abaqus deck loads but whose every load
         was commented out (or became a stock ccx user subroutine) would still run — to a
@@ -15483,12 +15552,20 @@ class Converter:
         dst = step_load_audit(blocks_from_lines(out), user_loads=False)
         self.source_unloaded = bool(src) and all(s == [] for s in src)
         self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1) if s and d == []]
+        procs: List[Optional[str]] = []             # each *STEP's procedure, as counted above
+        for b in blocks:
+            if b.keyword == "STEP":
+                procs.append(None)
+            elif b.keyword in PROC_KW and procs and procs[-1] is None:
+                procs[-1] = b.keyword
         for i in self.unloaded_steps:
             lost = src[i - 1]
             self.report.warn(f"Step {i} is loaded in the Abaqus deck ({'; '.join(lost[:3])}"
                              f"{'; ...' if len(lost) > 3 else ''}), but no load survives the "
-                             f"conversion: ccx would solve it with no load at all, to a zero "
-                             f"response. See the commented-out load cards.")
+                             f"conversion: ccx would solve it with no load at all, "
+                             + ("so its buckling factors mean nothing" if procs[i - 1:i] == ["BUCKLE"]
+                                else "to a zero response") +
+                             ". See the commented-out load cards.")
             self._reduces(f"step {i}: every load lost")
         if self.source_unloaded:
             self.report.note("The Abaqus deck applies no load, prescribed displacement or "

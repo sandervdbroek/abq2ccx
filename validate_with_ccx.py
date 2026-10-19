@@ -2203,6 +2203,45 @@ def modal_own_loads_deck(base=True):
                  "*END STEP"]) + "\n"
 
 
+def buckle_gravity_deck(preload="grav", static=False, buckle=True, n=2, m=20):
+    """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
+    clamped at its base, loaded 1e5 down at its top centre (node set TIP) in a *STEP,
+    PERTURBATION *BUCKLE step.  ``preload`` before it, in a static step: "grav" (gravity
+    9810: its weight 1.54e6), "nodal" (the same as nodal forces, a brick's weight / 8 at each
+    of its nodes, which is exact on bricks), "" (none), or "self" (gravity in the *BUCKLE step
+    itself, no static step).  ``static``: a static step after it pulling TIP sideways by
+    1e3; ``buckle``: False leaves the *BUCKLE step out."""
+    h, dz, rho_g = 0.1 / n, 2.0 / m, 7850.0 * 9810.0
+    ids = {(i, j, k): 1 + i + (n + 1) * (j + (n + 1) * k)
+           for k in range(m + 1) for j in range(n + 1) for i in range(n + 1)}
+    elems = [[ids[(i + a, j + b, k + z)] for z in (0, 1) for a, b in ((0, 0), (1, 0), (1, 1), (0, 1))]
+             for k in range(m) for j in range(n) for i in range(n)]
+    share: dict = {}
+    for c in elems:
+        for v in c:
+            share[v] = share.get(v, 0.0) + rho_g * h * h * dz / 8.0
+    base = [v for (i, j, k), v in ids.items() if k == 0]
+    lines = (["*NODE"] + [f"{v}, {i * h:.6g}, {j * h:.6g}, {k * dz:.6g}" for (i, j, k), v in ids.items()]
+             + ["*ELEMENT, TYPE=C3D8, ELSET=EALL"]
+             + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+             + ["*NSET, NSET=BASE"] + [", ".join(map(str, base[s:s + 16])) for s in range(0, len(base), 16)]
+             + ["*NSET, NSET=TIP", str(ids[(n // 2, n // 2, m)]), "*MATERIAL, NAME=STEEL", "*ELASTIC",
+                "210.e9, 0.3", "*DENSITY", "7850.", "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL",
+                "*BOUNDARY", "BASE, 1, 3"])
+    grav = ["*DLOAD", "EALL, GRAV, 9810., 0., 0., -1."]
+    if preload in ("grav", "nodal"):
+        lines += ["*STEP", "*STATIC"] + (grav if preload == "grav" else
+                                         ["*CLOAD"] + [f"{v}, 3, {-f:.12g}" for v, f in share.items()])
+        lines += ["*END STEP"]
+    if buckle:
+        lines += ["*STEP, PERTURBATION", "*BUCKLE", "2"] + (grav if preload == "self" else []) + \
+            ["*CLOAD", "TIP, 3, -1.e5", "*END STEP"]
+    if static:
+        lines += ["*STEP", "*STATIC", "*CLOAD", "TIP, 1, 1.e3", "*NODE PRINT, NSET=TIP", "U",
+                  "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -4977,6 +5016,38 @@ def main():
               f"pressure, gravity and a traction, then *FREQUENCY and a *MODAL DYNAMIC step with a "
               f"*CLOAD and a traction of its own): its response is the one without the static "
               f"loads ({err:.1e} apart; the corner moved {moved:.3g} in the first increment)")
+    # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
+    # aborted after the step that held no body load (the converter writes a zero GRAV there)
+    def factors(dat):
+        return dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")
+
+    lam = [review_run(buckle_gravity_deck(p), "buckle_gravity_" + (p or "none"), factors)
+           for p in ("grav", "nodal", "")]
+    ok = all(lam)
+    if ok:
+        err = abs(lam[0][0] / lam[1][0] - 1)
+        ok = err < 1e-6 and lam[0][0] < 0.8 * lam[2][0]
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_gravity_preload (a C3D8 column under gravity in "
+              f"a static step, then a *STEP, PERTURBATION *BUCKLE step loaded at its top): factor "
+              f"{lam[0][0]:.7g} vs {lam[1][0]:.7g} with the gravity as nodal forces ({err:.1e} "
+              f"apart; {lam[2][0]:.7g} without it)")
+    failures += 0 if ok else 1
+    lam = review_run(buckle_gravity_deck("self"), "buckle_self_weight", factors)
+    both = review_run(buckle_gravity_deck("self", static=True), "buckle_self_weight_static",
+                      lambda dat: factors(dat) and (factors(dat), dat_displacements(dat)))
+    ref = review_run(buckle_gravity_deck("", static=True, buckle=False), "buckle_self_weight_ref",
+                     dat_displacements)
+    ok = bool(lam and both and ref)
+    if ok:
+        tip = next(iter(ref))
+        err = max(abs(a - b) for a, b in zip(both[1].get(tip, [math.inf] * 3), ref[tip])) / \
+            max(abs(x) for x in ref[tip])
+        ok = both[0][0] == lam[0] and err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_self_weight_then_static (the column buckling "
+              f"under its weight and the top load in a *STEP, PERTURBATION *BUCKLE step, then a "
+              f"static step pulling its top sideways): factor {both[0][0]:.7g} ({lam[0]:.7g} "
+              f"without the static step), top displacement as in a static-only run ({err:.1e} "
+              f"apart)")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
