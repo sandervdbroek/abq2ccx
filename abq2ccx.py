@@ -820,11 +820,18 @@ def canonical_keyword(keyword: str) -> str:
     if not _KEYWORD_BY_COMPACT:
         known = (set(CCX_KEYWORDS) | GEOM_KW | set(DROP_KEYWORDS) | set(DROP_WARN_KEYWORDS) |
                  set(SPECIAL_UNSUPPORTED) | set(SEMANTIC_TRAP) | set(PASS_WITH_NOTE) |
+                 OUTPUT_ONLY_KEYWORDS | set(NUMERICAL_KEYWORDS) | MATERIAL_OPTION_CARDS |
+                 U1_NONLINEAR_CARDS | HISTORY_ONLY_KW | TEMPERATURE_DOF_PROCS |
+                 set(Converter._U1_OPTIONS) | Converter._PERTURBATION_PROCS |
+                 Converter._THERMAL_PROCEDURES | Converter._OTHER_PROCEDURES |
                  {"KINEMATIC COUPLING", "SHELL GENERAL SECTION", "BEAM GENERAL SECTION",
                   "COHESIVE SECTION", "GASKET SECTION", "CONNECTOR SECTION", "PARAMETER",
                   "SYSTEM", "UNIT SYSTEM",
                   "DISTRIBUTING COUPLING", "RATE DEPENDENT", "INITIAL CONDITIONS",
-                  "SURFACE INTERACTION", "SURFACE BEHAVIOR", "CONTACT PAIR"})
+                  "SURFACE INTERACTION", "SURFACE BEHAVIOR", "CONTACT PAIR",
+                  "ROTARY INERTIA", "SURFACE SECTION", "SECTION CONTROLS", "DISTRIBUTION TABLE",
+                  "BEAM SECTION OFFSET", "FLUID CAVITY", "REBAR LAYER", "SUBSPACE DYNAMIC",
+                  "ELEMENT OPERATOR"})
         for k in known:
             _KEYWORD_BY_COMPACT.setdefault(k.replace(" ", ""), k)
     if " " in keyword:

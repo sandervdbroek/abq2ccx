@@ -3440,6 +3440,24 @@ def test_blankless_keywords_recognised():
     assert body.count("*STEP") == 2 and body.count("*END STEP") == 2
 
 
+def test_blankless_spellings_of_handled_and_tabled_keywords():
+    # *ENERGYPRINT is the output request *ENERGY PRINT (a note, no reduced physics), and
+    # *ROTARYINERTIA / *SECTIONCONTROLS reach their handlers like the spellings with blanks
+    plain = HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
+    step = "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n*EnergyPrint\n*End Step\n"
+    _, conv, rep = convert_str(plain + step)
+    assert "*ENERGY PRINT: an output" in rep.text() and conv.reduced_physics == []
+    sc = plain.replace("material=M\n", "material=M, controls=EC\n") + \
+        "*SectionControls, name=EC, second order accuracy=YES\n1., 1., 1.\n" + step
+    _, conv, rep = convert_str(sc)
+    assert conv.reduced_physics == [] and "changes nothing" in rep.text()
+    deck = RIGID_PLATE + ("*ELEMENT, TYPE=MASS, ELSET=PM\n10, 9\n*MASS, ELSET=PM\n6.\n"
+                          "*ELEMENT, TYPE=ROTARYI, ELSET=PI\n11, 9\n*ROTARYINERTIA, ELSET=PI\n"
+                          "1.5, 2., 1., 0., 0., 0.\n*STEP\n*FREQUENCY\n3\n*END STEP\n")
+    body, conv, _ = convert_str(deck)
+    assert "*MASS, ELSET=ABQ2CCX_STAR" in body and conv.reduced_physics == []
+
+
 def test_frequency_storage_for_later_modal_step():
     deck = HEX + "*Step\n*Frequency\n5\n*End Step\n*Step\n*Modal Dynamic\n0.1, 1.\n*End Step\n"
     body, _, _ = convert_str(deck)
