@@ -12229,40 +12229,37 @@ class Converter:
         ``*COUPLING`` + ``*KINEMATIC`` per DOF range (ccx couples translations; the reference
         node's rotations still drive them, and unlike *RIGID BODY its DOFs 4-6 take BCs and
         moments); rotation ranges on knotted shell/beam members become *EQUATION ties to
-        those DOFs.  (The newer *COUPLING/*KINEMATIC/*DISTRIBUTING are native ccx keywords.)"""
-        ref = (b.param("REF NODE") or "").strip()
-        recs = [[x for x in r if x != ""] for r in merged_data_records(b)]
-        recs = [r for r in recs if r]
-        if not ref or not recs:
+        those DOFs.  (The newer *COUPLING/*KINEMATIC/*DISTRIBUTING are native ccx keywords.)
+        A card with a DOF field that does not read is commented out (_coupling_groups)."""
+        ref = self._ref_node(b)
+        recs = self._kinematic_coupling_records(b)
+        if ref is None or not recs:
             return self._commented(b, "*KINEMATIC COUPLING could not be converted (no REF NODE or "
                                       "no members); edit manually.", reduces=False)
-        if not re.fullmatch(r"[-+]?\d+", ref) and self.geom.nset(ref):
-            ref = str(self.geom.nset(ref)[0])
-        if (self._coupling_plan.get(id(b)) or {}).get("kind") == "kdyn":
-            return self._kin_dynamic_cards(b, self._coupling_plan[id(b)], self._legacy_kinematic_groups(b))
-        groups: "OrderedDict[Tuple[int, int], List[str]]" = OrderedDict()
-        try:
-            for r in recs:
-                d1 = pint(r[1]) if len(r) > 1 else 1
-                d2 = pint(r[2]) if len(r) > 2 else (d1 if len(r) > 1 else 6)
-                groups.setdefault((min(d1, d2), max(d1, d2)), []).append(r[0])
-        except ValueError:
+        if any(dofs is None for _, dofs in recs):
             return self._commented(b, "*KINEMATIC COUPLING DOF fields could not be parsed; edit "
                                       "manually.", reduces=False)
-        if (self._coupling_plan.get(id(b)) or {}).get("kind") == "unsupported":
+        plan = self._coupling_plan.get(id(b)) or {}
+        if plan.get("kind") == "kdyn":
+            return self._kin_dynamic_cards(b, plan, plan["groups"])
+        groups: "OrderedDict[Tuple[int, int], List[str]]" = OrderedDict()
+        for tok, dofs in recs:
+            groups.setdefault((min(dofs), max(dofs)), []).append(tok)
+        if plan.get("kind") == "unsupported":
             self._warn_rigid_unsupported()
         self._synth_counter += 1
         tag = f"ABQ2CCX_KC{self._synth_counter}"
+        ori = (b.param("ORIENTATION") or "").strip()       # (ccx reads the DOFs in its axes too)
         out: List[str] = []
         ties: List[str] = []
         top = 2 if id(b) in self._planar_kin else 3     # 2-D members: no DOF 3 (see handle_kinematic)
         # ccx carries the coupling's rotation on DOFs 4-6 of the reference node once a
         # translational group couples it, so knotted shell/beam members can tie theirs
-        coupled = any(lo <= 3 for lo, _ in groups) and re.fullmatch(r"[-+]?\d+", ref) is not None
+        coupled = any(lo <= 3 for lo, _ in groups)
         for gi, ((lo, hi), ms) in enumerate(groups.items(), 1):
             nodes = [n for m in ms for n in self._resolve_nodes(m)]
             if hi > 3 and coupled:
-                ties += self._rotation_ties(nodes, int(ref), 0, range(max(lo, 4), hi + 1))
+                ties += self._rotation_ties(nodes, ref, 0, range(max(lo, 4), hi + 1))
             if hi > 3 and any(n in self._rot_nodes and n not in self._knots for n in nodes):
                 self.report.warn("*KINEMATIC COUPLING DOFs above 3 clamped: ccx *KINEMATIC couples "
                                  "translations only, so the rotations of the coupled shell/beam "
@@ -12279,8 +12276,8 @@ class Converter:
                 if lo > 2:
                     continue
             out += [f"*SURFACE, TYPE=NODE, NAME={tag}_{gi}"] + list(ms)
-            out += [f"*COUPLING, CONSTRAINT NAME={tag}_{gi}, REF NODE={ref}, SURFACE={tag}_{gi}",
-                    "*KINEMATIC", f"{lo}, {min(hi, top)}"]
+            out += [f"*COUPLING, CONSTRAINT NAME={tag}_{gi}, REF NODE={ref}, SURFACE={tag}_{gi}"
+                    + (f", ORIENTATION={ori}" if ori else ""), "*KINEMATIC", f"{lo}, {min(hi, top)}"]
         if out:
             self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per DOF "
                              "range.", once=True)
@@ -18888,23 +18885,19 @@ class Converter:
         not a shell/beam reference node, whose coupling becomes a *RIGID BODY."""
         refs: set = set()
         for i, b in enumerate(blocks):
-            ref = self._ref_node(b)
-            if ref is None or ref in self._rot_nodes or id(b) in self._kin_rb:
+            cg = self._coupling_groups(blocks, i)
+            if cg is None or cg[0] in self._rot_nodes or id(b) in self._kin_rb:
                 continue
-            if b.keyword == "COUPLING" and i + 1 < len(blocks) and \
-                    blocks[i + 1].keyword == "KINEMATIC" and \
-                    self._kinematic_dofs(blocks[i + 1]) & {1, 2, 3}:
-                refs.add(ref)
-            elif b.keyword == "KINEMATIC COUPLING" and any(
-                    dofs and min(dofs) <= 3 for _, dofs in self._kinematic_coupling_lines(b)):
-                refs.add(ref)
+            if any(ds & {1, 2, 3} for _, ds in cg[1]):
+                refs.add(cg[0])
         return refs
 
-    def _kinematic_coupling_lines(self, b: Block) -> List[Tuple[List[int], Optional[set]]]:
-        """The member lines of a *KINEMATIC COUPLING: (nodes, coupled DOFs: first to last,
-        all six when none are given; None when they are not numbers).  Blank lines are
+    @staticmethod
+    def _kinematic_coupling_records(b: Block) -> List[Tuple[str, Optional[set]]]:
+        """The member lines of a *KINEMATIC COUPLING: (node or set, coupled DOFs: first to
+        last, all six when none are given; None when they are not numbers).  Blank lines are
         skipped."""
-        out: List[Tuple[List[int], Optional[set]]] = []
+        out: List[Tuple[str, Optional[set]]] = []
         for r in merged_data_records(b):
             f = [x for x in r if x != ""]
             if not f:
@@ -18915,8 +18908,48 @@ class Converter:
                 dofs: Optional[set] = set(range(min(d1, d2), max(d1, d2) + 1))
             except ValueError:
                 dofs = None
-            out.append((self._resolve_nodes(f[0]), dofs))
+            out.append((f[0], dofs))
         return out
+
+    def _kinematic_coupling_lines(self, b: Block) -> List[Tuple[List[int], Optional[set]]]:
+        """_kinematic_coupling_records with the members as nodes."""
+        return [(self._resolve_nodes(tok), dofs) for tok, dofs in self._kinematic_coupling_records(b)]
+
+    def _coupling_groups(self, blocks: List[Block], i: int, live: bool = False) -> \
+            Optional[Tuple[int, List[Tuple[List[int], set]]]]:
+        """(reference node, [(members, coupled DOFs)]) of the kinematic coupling at
+        ``blocks[i]``: a *COUPLING followed by *KINEMATIC (its surface's nodes and the card's
+        DOFs) or a *KINEMATIC COUPLING (one group per line, none when a line's DOFs do not
+        read: handle_coupling comments that card out), the reference node left out of the
+        members; None for any other card or without a reference node.  ``live``: only the
+        groups the converted deck writes (in a coupling of ``_kin_dyn``, those _kin_form
+        writes)."""
+        b = blocks[i]
+        native = b.keyword == "COUPLING" and i + 1 < len(blocks) and blocks[i + 1].keyword == "KINEMATIC"
+        ref = self._ref_node(b) if native or b.keyword == "KINEMATIC COUPLING" else None
+        if ref is None:
+            return None
+        if native:
+            groups = [(self._surface_member_nodes(b.param("SURFACE") or ""),
+                       self._kinematic_dofs(blocks[i + 1]))]
+        else:
+            lines = self._kinematic_coupling_lines(b)
+            groups = [] if any(ds is None for _, ds in lines) else lines
+        groups = [([n for n in ns if n != ref], ds) for ns, ds in groups]
+        if live and id(b) in self._kin_dyn:
+            frame = self._coupling_frame(b)
+            groups = [(ns, ds) for ns, ds in groups if self._kin_form(ref, ns, ds, frame) in ("rb", "eq")]
+        return ref, groups
+
+    def _coupling_frame(self, b: Block) -> Union[None, str, Tuple[Vec, Vec, Vec]]:
+        """The axes of a kinematic coupling's ORIENTATION=, in which Abaqus couples the DOFs
+        (their initial directions; they turn with the reference node under NLGEOM): None
+        without one, a rectangular orientation's axes (_conn_axes), else why they are not
+        known."""
+        name = (b.param("ORIENTATION") or "").strip()
+        if not name:
+            return None
+        return self._conn_axes(name) or f"its ORIENTATION={name} is not a rectangular orientation with known axes"
 
     def _plan_kinematic_rot_nodes(self, blocks: List[Block], next_id: int) -> int:
         """ccx builds a kinematic coupling (couplings.f) as RIGID MPCs on an internal rotation
@@ -18959,29 +18992,26 @@ class Converter:
         # ref -> (id, its members are plain, it constrains anything: a ROT NODE is needed)
         dyn: "OrderedDict[int, List[Tuple[int, bool, bool]]]" = OrderedDict()
         for i, b in enumerate(blocks):
-            legacy = b.keyword == "KINEMATIC COUPLING"
-            if not legacy and (b.keyword != "COUPLING" or i + 1 >= len(blocks) or
-                               blocks[i + 1].keyword != "KINEMATIC"):
+            cg = self._coupling_groups(blocks, i)
+            # (an undefined reference node: left to ccx, which stops on it as Abaqus does)
+            if cg is None or cg[0] in structural or cg[0] not in self.geom.nodes:
                 continue
-            ref = self._ref_node(b)
-            if ref is None or ref in structural:
+            ref, groups = cg
+            if not groups:                     # a card handle_coupling comments out
                 continue
-            if legacy:
-                groups = self._legacy_kinematic_groups(b)
-                members = [n for ns, _ in groups for n in ns if n != ref]
-            else:
-                members = [n for n in self._surface_member_nodes(b.param("SURFACE") or "") if n != ref]
-                groups = [(members, self._kinematic_dofs(blocks[i + 1]))]
+            members = [n for ns, _ in groups for n in ns]
             if dynamic:
+                frame = self._coupling_frame(b)
                 plain = bool(members) and (
                     not any(n in structural or n in self._plane_only for n in members) or
-                    (self._linear_rigid and all(self._kin_form(ref, ns, ds) == "eq" for ns, ds in groups)))
+                    (self._linear_rigid and all(self._kin_form(ref, ns, ds, frame) == "eq"
+                                                for ns, ds in groups)))
                 dyn.setdefault(ref, []).append((id(b), plain, plain and any(
-                    self._kin_form(ref, ns, ds) in ("rb", "eq") for ns, ds in groups)))
-            if legacy or ref not in self._transformed or ref in self._rb_rot or \
-                    isinstance(self._local_axes(ref), str):
+                    self._kin_form(ref, ns, ds, frame) in ("rb", "eq") for ns, ds in groups)))
+            if b.keyword == "KINEMATIC COUPLING" or ref not in self._transformed or \
+                    ref in self._rb_rot or isinstance(self._local_axes(ref), str):
                 continue
-            dofs = self._kinematic_dofs(blocks[i + 1])
+            dofs = groups[0][1]
             if not {1, 2, 3} <= dofs or not members or all(n in self._plane_only for n in members):
                 cands.setdefault(ref, []).append((id(b), False))
                 continue
@@ -19585,8 +19615,9 @@ class Converter:
                     out += [n for n in ns if n in self._rot_nodes]
             return [n for n in out if n is not None]
 
-        def kin_eq(ref: int):
-            return lambda ns, ds: self._kin_form(ref, [n for n in ns if n != ref], ds) == "eq"
+        def kin_eq(ref: int, b: Block):
+            frame = self._coupling_frame(b)
+            return lambda ns, ds: self._kin_form(ref, [n for n in ns if n != ref], ds, frame) == "eq"
         for i, b in enumerate(blocks):
             ref = self._ref_node(b)
             if b.keyword == "RIGID BODY":
@@ -19603,18 +19634,16 @@ class Converter:
                     # to it), so BCs and moments on DOFs 4-6 stay on the node
                     self._rb_rot.pop(ref, None)
             elif b.keyword == "COUPLING":
-                nxt = blocks[i + 1] if i + 1 < len(blocks) else None
-                if ref is None or nxt is None or nxt.keyword != "KINEMATIC":
+                cg = self._coupling_groups(blocks, i)
+                if cg is None:
                     continue
-                members = self._surface_member_nodes(b.param("SURFACE") or "")
-                dofs = self._kinematic_dofs(nxt)
+                members, dofs = cg[1][0]
                 if id(b) in self._kin_rb:          # a *RIGID BODY (_plan_kinematic_rot_nodes)
-                    knots += needed(None, [([n for n in members if n != ref], dofs)],
-                                    kin_eq(ref) if id(b) in self._kin_dyn else lambda ns, ds: False)
+                    knots += needed(None, [(members, dofs)],
+                                    kin_eq(ref, b) if id(b) in self._kin_dyn else lambda ns, ds: False)
                     self._coupling_plan[id(b)] = {"kind": "kdyn" if id(b) in self._kin_dyn else "rbk",
                                                   "ref": ref, "dofs": dofs,
-                                                  "rot": self._kin_rb[id(b)],
-                                                  "members": [n for n in members if n != ref]}
+                                                  "rot": self._kin_rb[id(b)], "members": members}
                     continue
                 if not dofs & {1, 2, 3} or not any(n in structural for n in members + [ref]):
                     continue
@@ -19626,24 +19655,23 @@ class Converter:
                     rot = max(self.geom.nodes) + 1
                     self.geom.add_node(rot, self.geom.nodes[ref])
                     eq = self._rigid_as_eq(ref, rot, members)
-                    knots += needed(ref, [([n for n in members if n != ref], dofs)],
-                                    lambda ns, ds: eq)
+                    knots += needed(ref, [(members, dofs)], lambda ns, ds: eq)
                     self._coupling_plan[id(b)] = {"kind": "rb", "ref": ref, "rot": rot, "dofs": dofs,
-                                                  "members": [n for n in members if n != ref]}
+                                                  "members": members}
                 else:
                     self._coupling_plan[id(b)] = {"kind": "unsupported"}
             elif b.keyword == "KINEMATIC COUPLING":
+                cg = self._coupling_groups(blocks, i)
+                if cg is None:
+                    continue
+                members = [n for ns, _ in cg[1] for n in ns]
                 if id(b) in self._kin_rb:          # (_plan_kinematic_rot_nodes)
-                    knots += needed(None, [([n for n in ns if n != ref], ds)
-                                           for ns, ds in self._legacy_kinematic_groups(b)],
-                                    kin_eq(ref) if id(b) in self._kin_dyn else lambda ns, ds: False)
-                    self._coupling_plan[id(b)] = {"kind": "kdyn", "ref": ref,
+                    knots += needed(None, cg[1], kin_eq(ref, b) if id(b) in self._kin_dyn
+                                    else lambda ns, ds: False)
+                    self._coupling_plan[id(b)] = {"kind": "kdyn", "ref": ref, "groups": cg[1],
                                                   "rot": self._kin_rb[id(b)]}
                     continue
-                lines = self._kinematic_coupling_lines(b)
-                members = [n for nodes, _ in lines for n in nodes]
-                translational = any(dofs and min(dofs) <= 3 for _, dofs in lines)
-                if ref is None or not translational or \
+                if not any(ds & {1, 2, 3} for _, ds in cg[1]) or \
                         not any(n in structural for n in members + [ref]):
                     continue
                 if ref in structural:
@@ -19853,7 +19881,8 @@ class Converter:
     def _rigid_members(self, blocks: List[Block]):
         """(reference node, members, coupled translations) of every rigid constraint ccx
         builds from RIGID MPCs: *RIGID BODY, kinematic couplings and the rigid bodies of
-        *MPC BEAM lines.  ccx eliminates the members' coupled translations."""
+        *MPC BEAM lines.  ccx eliminates the members' coupled translations (only those the
+        converted deck writes: _coupling_groups)."""
         for i, b in enumerate(blocks):
             ref = self._ref_node(b)
             if ref is None:
@@ -19861,14 +19890,9 @@ class Converter:
             if b.keyword == "RIGID BODY":
                 tie, pin = self._rigid_body_members(b)
                 yield ref, [n for n in tie + pin if n != ref], {1, 2, 3}
-            elif b.keyword == "COUPLING" and i + 1 < len(blocks) and \
-                    blocks[i + 1].keyword == "KINEMATIC":
-                members = self._surface_member_nodes(b.param("SURFACE") or "")
-                yield ref, [n for n in members if n != ref], \
-                    self._kinematic_dofs(blocks[i + 1]) & {1, 2, 3}
-            elif b.keyword == "KINEMATIC COUPLING":
-                for nodes, dofs in self._legacy_kinematic_groups(b):
-                    yield ref, [n for n in nodes if n != ref], dofs & {1, 2, 3}
+                continue
+            for nodes, dofs in (self._coupling_groups(blocks, i, live=True) or (ref, []))[1]:
+                yield ref, nodes, dofs & {1, 2, 3}
         for bodies in self._mpc_bodies.values():
             for body in bodies:
                 yield body["ref"], body["members"], {1, 2, 3}
@@ -20011,24 +20035,23 @@ class Converter:
                 lines = [(tie, set(range(1, 7))), (pin, {1, 2, 3})]
                 emit = body_emit(ref, rot if rot is not None else self._rb_rot_synth.get(ref),
                                  tie + pin)
-            elif b.keyword == "COUPLING":
-                nxt = blocks[i + 1] if i + 1 < len(blocks) else None
-                if nxt is None or nxt.keyword != "KINEMATIC":
-                    continue
-                kind, tied, rb = "kin", plan in ("kin", "rb", "rbk", "kdyn"), plan in ("rb", "rbk")
-                lines = [(self._surface_member_nodes(b.param("SURFACE") or ""),
-                          self._kinematic_dofs(nxt))]
-                emit = body_emit(ref, self._coupling_plan[id(b)]["rot"], lines[0][0]) if rb \
-                    else "kin"
             else:
-                kind, rb, emit = "kin", False, "kin"
-                lines = self._legacy_kinematic_groups(b)
-                tied = any(ds & {1, 2, 3} for _, ds in lines)
+                lines = (self._coupling_groups(blocks, i) or (ref, []))[1]
+                if not lines:
+                    continue
+                kind, rb = "kin", plan in ("rb", "rbk")
+                if b.keyword == "COUPLING":
+                    tied = plan in ("kin", "rb", "rbk", "kdyn")
+                    emit = body_emit(ref, self._coupling_plan[id(b)]["rot"], lines[0][0]) if rb \
+                        else "kin"
+                else:
+                    tied, emit = any(ds & {1, 2, 3} for _, ds in lines), "kin"
             # a coupling written without ccx's *KINEMATIC (_kin_dynamic_cards): each line as
             # _kin_form says, the ones it leaves out constraining nothing
             sets = [(emit, lines)]
             if id(b) in self._kin_dyn:
-                forms = [self._kin_form(ref, ns, ds) for ns, ds in lines]
+                frame = self._coupling_frame(b)
+                forms = [self._kin_form(ref, ns, ds, frame) for ns, ds in lines]
                 sets = [(e, [ln for ln, f in zip(lines, forms) if f == e]) for e in ("eq", "rb")]
             for emit, lines in sets:
                 members = {n for ns, _ in lines for n in ns} - {ref, rot}
@@ -20528,12 +20551,8 @@ class Converter:
             dofs.update(range(min(d1, d2), max(d1, d2) + 1))
         return dofs or set(range(1, 7))
 
-    def _legacy_kinematic_groups(self, b: Block) -> List[Tuple[List[int], set]]:
-        """(nodes, DOFs) of each line of a *KINEMATIC COUPLING card whose DOFs read
-        (_kinematic_coupling_lines)."""
-        return [(ns, ds) for ns, ds in self._kinematic_coupling_lines(b) if ds is not None]
-
-    def _kin_form(self, ref: int, members: Sequence[int], dofs: set) -> str:
+    def _kin_form(self, ref: int, members: Sequence[int], dofs: set,
+                  frame: Union[None, str, Tuple[Vec, Vec, Vec]] = None) -> str:
         """How a kinematic coupling of plain 3-D members in a deck with a *DYNAMIC step is
         written (``_kin_dyn``, see _plan_kinematic_rot_nodes), with the reference node's
         rotation on DOFs 1-3 of its ROT NODE: 'eq' — linear *EQUATIONs (_kin_rows), the
@@ -20543,11 +20562,15 @@ class Converter:
         BODY it is in ccx (the same RIGID MPCs; exact, probed); under NLGEOM a coupling of
         some translations has neither ('drop'; --approximate: 'eq', linear equations being
         exact for small rotations only: 7 % off at 0.36 rad), nor has a coupling of no
-        translation ('none').  Linear equations need terms ccx reads (_rigid_eq_refused)."""
+        translation ('none').  Linear equations need terms ccx reads (_rigid_eq_refused), and
+        for some translations the axes of the coupling's ORIENTATION (``frame``,
+        _coupling_frame)."""
         trans = dofs & {1, 2, 3}
         if not trans:
             return "none"
         local = self._rigid_eq_refused(ref, members, dofs) is not None
+        if isinstance(frame, str) and not self._kin_all_translations(members, dofs):
+            return "drop"
         if self._linear_rigid and not local:
             return "eq"
         if trans == {1, 2, 3}:
@@ -20629,6 +20652,43 @@ class Converter:
                 f"1-3: the rotation)", "*EQUATION"] + \
             [x for rw in rows for x in equation_rows(rw, "{:.12g}".format)]
 
+    def _kin_all_translations(self, members: Sequence[int], dofs: set) -> bool:
+        """Whether ``dofs`` couple every translation of ``members`` (in 2-D: 1 and 2), so the
+        coupling's ORIENTATION does not change the constraint."""
+        return dofs >= ({1, 2} if members and all(n in self._plane_only for n in members) else {1, 2, 3})
+
+    def _kin_rows_along(self, ref: int, rot: int, members: Sequence[int], dofs: set,
+                        axes: Tuple[Vec, Vec, Vec]) -> List[List[Tuple[int, int, float]]]:
+        """_kin_rows for a coupling with an ORIENTATION of axes ``axes``: Abaqus couples the
+        translations along them, e_j . (u(m) - u(ref) - theta x d) = 0 for each coupled j
+        (the rotation term theta . (d x e_j)).  A member's rows are reduced (Gauss-Jordan) on
+        its own DOFs, so each eliminates one of them, listed first, that no other row has.
+        A 2-D member keeps its in-plane terms (ccx holds DOF 3 itself)."""
+        x0 = self.geom.nodes[ref]
+        rows: List[List[Tuple[int, int, float]]] = []
+        for m in members:
+            d = vsub(self.geom.nodes[m], x0)
+            ks = (1, 2) if m in self._plane_only else (1, 2, 3)
+            own: List["OrderedDict[Tuple[int, int], float]"] = []
+            for j in sorted(dofs & set(ks)):
+                e, c = axes[j - 1], vcross(d, axes[j - 1])
+                own.append(OrderedDict([((m, k), e[k - 1]) for k in ks] +
+                                       [((ref, k), -e[k - 1]) for k in ks] +
+                                       [((rot, k + 1), -c[k]) for k in range(3)]))
+            for i, rw in enumerate(own):
+                p = max(((m, k) for k in ks if (m, k) in rw), key=lambda q: abs(rw[q]))
+                for other in own:
+                    f = other.pop(p, 0.0) / rw[p] if other is not rw else 0.0
+                    for q, v in rw.items():
+                        if f and q != p:
+                            other[q] = other.get(q, 0.0) - f * v
+                own[i] = OrderedDict([(p, rw[p])] + [(q, v) for q, v in rw.items() if q != p])
+            for rw in own:
+                piv = next(iter(rw.values()))
+                top = max(abs(v) for v in rw.values())
+                rows.append([(n, k, v / piv) for (n, k), v in rw.items() if abs(v) > 1e-12 * top])
+        return rows
+
     def _rigid_body_lines(self, card: List[str], ref: Optional[int], rot: Optional[int],
                           members: Sequence[int]) -> Tuple[List[str], bool]:
         """A ccx *RIGID BODY (``card``: it and the *NSET it names) of ``members`` on ``ref``
@@ -20693,21 +20753,30 @@ class Converter:
         node and that ROT NODE (the rotations of knotted shell/beam members tied to it), or
         left out (the card commented out when nothing is left)."""
         ref, rot = plan["ref"], plan["rot"]
+        frame = self._coupling_frame(b)
         body: List[int] = []
         rows: List[List[Tuple[int, int, float]]] = []
         ties: List[str] = []
         forms: set = set()
-        local: Optional[str] = None             # why a group has no linear equations (a *TRANSFORM)
+        local: Optional[str] = None     # why a group has no linear equations (a *TRANSFORM, ...)
+        undefined = [n for ns, _ in groups for n in ns if n not in self.geom.nodes]
+        if undefined:
+            self.report.warn(f"Kinematic coupling on node(s) not defined in the deck (e.g. node "
+                             f"{undefined[0]}): left out of the coupling (Abaqus rejects such a "
+                             f"deck).", once=True)
         for nodes, dofs in groups:
-            nodes = [n for n in dedup(nodes) if n not in (ref, rot)]
-            form = self._kin_form(ref, nodes, dofs)
+            nodes = [n for n in dedup(nodes) if n not in (ref, rot) and n in self.geom.nodes]
+            form = self._kin_form(ref, nodes, dofs, frame)
             forms.add(form)
             if form in ("rb", "drop"):
-                local = local or self._rigid_eq_refused(ref, nodes, dofs)
+                local = local or self._rigid_eq_refused(ref, nodes, dofs) or \
+                    (frame if form == "drop" and isinstance(frame, str) else None)
             if form == "rb":
                 body += nodes
             elif form == "eq":
-                rows += self._kin_rows(ref, rot, nodes, dofs)
+                rows += self._kin_rows(ref, rot, nodes, dofs) \
+                    if frame is None or self._kin_all_translations(nodes, dofs) else \
+                    self._kin_rows_along(ref, rot, nodes, dofs, frame)
                 ties += self._rotation_ties(nodes, rot, -3, sorted(dofs))
         out: List[str] = []
         if body:
@@ -22975,6 +23044,8 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
         p["ELSET"] = namer(prefix, p["ELSET"].strip())
     if kw == "COUPLING" and p.get("CONSTRAINT NAME"):
         p["CONSTRAINT NAME"] = namer(prefix, p["CONSTRAINT NAME"].strip())
+    if kw in ("COUPLING", "KINEMATIC COUPLING") and p.get("ORIENTATION"):
+        p["ORIENTATION"] = namer(prefix, p["ORIENTATION"].strip())     # the instance's copy
     if kw == "PRE-TENSION SECTION":
         if p.get("NODE"):
             p["NODE"] = node(p["NODE"].strip())

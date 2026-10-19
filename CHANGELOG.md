@@ -6,6 +6,20 @@ physics.
 
 ## Unreleased
 
+* **Coupling `ORIENTATION=`** — Abaqus couples the DOFs in the orientation's axes. In a
+  `*DYNAMIC` deck the coupling's equations tied the global DOFs instead (40 % off with some
+  translations coupled), a `*KINEMATIC COUPLING` card lost the parameter, and a part-level
+  coupling named the part's orientation, so ccx stopped ("nonexistent orientation"). The
+  equations now tie the local DOFs (a non-rectangular orientation with some translations
+  coupled is commented out, with a warning), the card keeps `ORIENTATION=`, and each instance
+  names its own copy.
+* **Kinematic couplings in `*DYNAMIC` decks** — a coupling on an undefined node stopped the
+  converter (KeyError); undefined members are now left out with a warning, and an undefined
+  reference node is left to ccx, which stops on it. A `*KINEMATIC COUPLING` line whose DOFs do
+  not read was dropped without a word; the card is now commented out, as in static decks, and
+  no longer counts as a constraint (a static deck took its members' own BCs off). A connector
+  on the members of a coupling that is commented out is now written; it was refused as if the
+  coupling held them.
 * **Preloads in `*FREQUENCY` steps** — Abaqus includes a preload's stress stiffness in a
   frequency step only when the base state has NLGEOM; ccx 2.23 includes the base state only
   with `*STEP, PERTURBATION`, whatever the NLGEOM. A `*FREQUENCY` step after an NLGEOM general

@@ -6778,6 +6778,113 @@ def test_kinematic_coupling_in_a_dynamic_deck():
         assert "*COUPLING" in body and "*KINEMATIC" in body and not conv._kin_dyn
 
 
+KIN_DYN_STEP = ("*Step{}\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+                "*Cload\nRP, 1, 10.\n*End Step\n")
+KIN_RP = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+
+
+def test_kinematic_coupling_in_a_dynamic_deck_on_undefined_nodes_and_unreadable_lines():
+    # a coupling on an undefined node raised KeyError in a *DYNAMIC deck (49b2610 converted it;
+    # Abaqus rejects such a deck): undefined members are left out, with a warning, and an
+    # undefined reference node is left to ccx, which stops on it ('*ERROR reading *COUPLING')
+    step = KIN_DYN_STEP.format("")
+    for cards in ("*Kinematic Coupling, ref node=RP\nTOPN, 1, 3\n999, 1, 3\n",
+                  "*Surface, type=node, name=TOPS\nTOPN\n999\n*Coupling, constraint name=C1, "
+                  "ref node=RP, surface=TOPS\n*Kinematic\n"):
+        body, conv, rep = convert_str(KIN_RP + cards + step)
+        eqs = _equation_terms(body)
+        assert len(eqs) == 12 and 999 not in {t[0] for row in eqs for t in row}
+        assert "Kinematic coupling on node(s) not defined in the deck (e.g. node 999)" in rep.text()
+    for cards in ("*Kinematic Coupling, ref node=555\nTOPN, 1, 3\n",
+                  "*Surface, type=node, name=TOPS\nTOPN\n*Coupling, constraint name=C1, ref node=555, "
+                  "surface=TOPS\n*Kinematic\n"):
+        body, conv, _ = convert_str(KIN_RP + cards + step)
+        assert "REF NODE=555" in body and not conv._kin_dyn and not _equation_terms(body)
+    # a *KINEMATIC COUPLING line whose DOFs do not read: the card is commented out in any deck
+    # (a dynamic deck dropped the line without a word), and it constrains nothing (node 5 keeps
+    # its own BC, which a static deck took off as implied by the coupling)
+    bad = KIN_RP + "*Kinematic Coupling, ref node=RP\n5, 1, 3\n6, X, 3\n*Boundary\nRP, 1, 6\n5, 1, 1\n"
+    for deck in (bad + step, bad + step.replace("*Dynamic\n0.01, 1.\n", "*Static\n")):
+        body, conv, rep = convert_str(deck)
+        assert "** 6, X, 3" in body and "DOF fields could not be parsed" in rep.text()
+        assert not _equation_terms(body) and not conv._kin_dyn and "5,1,1" in _bc_lines(body)
+
+
+def test_connector_on_the_members_of_a_coupling_left_out_of_a_dynamic_deck():
+    # a coupling that a *DYNAMIC deck comments out (some translations under NLGEOM) eliminates
+    # nothing, so a connector on its members is written (it was refused for a rigid-body member)
+    second = ("*Node\n11, 2., 0., 0.\n12, 3., 0., 0.\n13, 3., 1., 0.\n14, 2., 1., 0.\n15, 2., 0., 1.\n"
+              "16, 3., 0., 1.\n17, 3., 1., 1.\n18, 2., 1., 1.\n*Element, type=C3D8, elset=EALL\n"
+              "2, 11, 12, 13, 14, 15, 16, 17, 18\n")
+    cpl = ("*Surface, type=node, name=TOPS\nTOPN\n*Coupling, constraint name=C1, ref node=RP, "
+           "surface=TOPS\n*Kinematic\n1, 2\n")
+    for conn, want in (("50, 6, 15", [[(15, d, 1.), (6, d, -1.)] for d in (1, 2, 3)]), ("50, 5", None)):
+        deck = (KIN_RP + second + f"*Element, type=CONN3D2, elset=CE\n{conn}\n*Connector Section, "
+                f"elset=CE\nJOIN\n" + cpl + KIN_DYN_STEP.format(", nlgeom"))
+        body, conv, rep = convert_str(deck)
+        assert "** *COUPLING" in body and "Connector" not in "".join(m for lv, m in rep.entries
+                                                                      if lv == "WARNING")
+        if want:
+            assert _equation_terms(body) == want
+        else:                                    # the grounded JOIN holds node 5
+            assert {"5,1,1", "5,2,2", "5,3,3"} <= set(_bc_lines(body))
+
+
+def test_kinematic_coupling_orientation():
+    # Abaqus couples the DOFs in the axes of the coupling's ORIENTATION: the linear equations of
+    # a *DYNAMIC deck tie e_j . (u - u_ref - theta x d) (they tied global j), the legacy card
+    # keeps ORIENTATION= for ccx (it was dropped), and a part-level coupling names its
+    # instance's copy of the orientation (ccx stopped: 'nonexistent orientation')
+    ori = "*Orientation, name=OR1\n0.8, 0., 0.6, 0., 1., 0.\n"        # e1 = (0.8, 0, 0.6), e2 = y
+    e = [(0.8, 0., 0.6), (0., 1., 0.), (-0.6, 0., 0.8)]
+    cpl = ("*Surface, type=node, name=TOPS\nTOPN\n*Coupling, constraint name=C1, ref node=RP, "
+           "surface=TOPS, orientation={o}\n*Kinematic\n{d}\n")
+    legacy = "*Kinematic Coupling, ref node=RP, orientation={o}\nTOPN, {d}\n"
+    step = KIN_DYN_STEP.format("")
+    for card in (cpl, legacy):
+        for dofs in ("1, 1", "2, 2", "1, 2", "2, 3"):
+            body, conv, rep = convert_str(KIN_RP + ori + card.format(o="OR1", d=dofs) + step)
+            rot, (lo, hi) = conv._rb_rot[9], map(int, dofs.split(", "))
+            eqs = _equation_terms(body)
+            assert len(eqs) == 4 * (hi - lo + 1) and not conv.reduced_physics
+            assert len({row[0][:2] for row in eqs}) == len(eqs) and all(row[0][2] == 1. for row in eqs)
+            # a rigid motion with any slip along the free local axes satisfies them, a slip
+            # along a coupled one does not
+            x = {5: (0., 0., 1.), 6: (1., 0., 1.), 7: (1., 1., 1.), 8: (0., 1., 1.), 9: (0.5, 0.5, 2.)}
+            ur, th = (0.3, -0.2, 0.1), (0.05, 0.02, -0.04)
+            u = {9: ur, rot: th}
+            for m in (5, 6, 7, 8):
+                t = _cross(th, tuple(a - b for a, b in zip(x[m], x[9])))
+                u[m] = tuple(ur[k] + t[k] + sum(0.1 * m * e[j][k] for j in range(3)
+                                                 if not lo <= j + 1 <= hi) for k in range(3))
+            res = lambda: max(abs(sum(c * u[n][d - 1] for n, d, c in row)) for row in eqs)
+            assert res() < 1e-12
+            u[6] = tuple(v + 1e-3 * w for v, w in zip(u[6], e[lo - 1]))
+            assert res() > 1e-4
+    # all translations: the orientation changes nothing; axes that are not known: some
+    # translations are commented out
+    body, _, _ = convert_str(KIN_RP + ori + cpl.format(o="OR1", d="1, 3") + step)
+    plain, _, _ = convert_str(KIN_RP + cpl.format(o="OR1", d="1, 3").replace(", orientation=OR1", "") + step)
+    assert _equation_terms(body) == _equation_terms(plain) and len(_equation_terms(body)) == 12
+    cyl = "*Orientation, name=OR1, system=cylindrical\n0., 0., 0., 0., 0., 1.\n"
+    body, conv, rep = convert_str(KIN_RP + cyl + cpl.format(o="OR1", d="1, 2") + step)
+    assert "** *COUPLING" in body and not _equation_terms(body) and conv.reduced_physics
+    assert "cannot be written (its ORIENTATION=OR1 is not a rectangular" in rep.text()
+    # the legacy card in a static deck: ccx reads the orientation
+    body, _, _ = convert_str(KIN_RP + ori + legacy.format(o="OR1", d="1, 1") + KIN9_STEP)
+    assert "SURFACE=ABQ2CCX_KC1_1, ORIENTATION=OR1\n*KINEMATIC\n1, 1\n" in body
+    # part level: each instance's coupling names its own orientation
+    part = (ori.replace("OR1", "ORI") + "*Surface, type=node, name=TS\nTOP\n*Coupling, constraint name=C1, "
+            "ref node=98, surface=TS, orientation=ORI\n*Kinematic\n1, 1\n"
+            "*Kinematic Coupling, ref node=99, orientation=ORI\nTOP, 2, 2\n")
+    body, _, _ = convert_str(PART_BOLT.format(part=part, i1="", i2=""))
+    for i in ("I1", "I2"):
+        assert f"*ORIENTATION, NAME={i}_ORI\n" in body
+        assert f"*COUPLING, CONSTRAINT NAME={i}_C1, REF NODE=" in body
+        assert body.count(f"ORIENTATION={i}_ORI") == 2
+    assert "ORIENTATION=ORI" not in body
+
+
 def test_rigid_constraints_in_a_linear_dynamic_deck():
     # Abaqus linearizes rigid constraints in a geometrically linear analysis, but ccx turns
     # their RIGID MPCs with the finite rotation in a *DYNAMIC step even without NLGEOM (9 %

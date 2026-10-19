@@ -2127,27 +2127,46 @@ def amplitude_close_times_deck(definition="EQUALLY SPACED"):
             "*STEP, NLGEOM\n*STATIC, DIRECT\n0.00005, 0.0002\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
-def kinematic_dynamic_deck(dofs="1, 3", nlgeom=False, proc="dynamic", member_bc=False):
+def kinematic_dynamic_deck(dofs="1, 3", nlgeom=False, proc="dynamic", member_bc=False, ori=False,
+                           legacy=False, part=False):
     """A column of two C3D8 held at its bottom, its top face TOP kinematically coupled (DOFs
     ``dofs``) to node 100, which moves 0.4 along x and turns 0.3 about x and 0.2 about z over
     a slow step: ``proc`` dynamic, explicit or static (ccx solves its own coupling there, so
     that deck also runs as it is: the static limit).  The middle nodes MID are free.
     ``member_bc``: a *BOUNDARY on DOF 3 of coupled node 9 too, which Abaqus does not apply
-    (the coupling eliminates that DOF)."""
+    (the coupling eliminates that DOF).  ``ori``: the DOFs in the axes of an *ORIENTATION,
+    e1 = (0.8, 0, 0.6), e2 = y; ``legacy``: the coupling as a *KINEMATIC COUPLING card;
+    ``part``: the model a part instanced twice (I2 3 along x, its nodes numbered 100 above
+    I1's)."""
     step = {"dynamic": "*DYNAMIC\n0.01, 1.\n", "explicit": "*DYNAMIC, EXPLICIT\n, 1.\n",
             "static": "*STATIC\n0.05, 1.\n"}[proc]
-    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
-            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, 0., 0., 2.\n10, 1., 0., 2.\n"
-            "11, 1., 1., 2.\n12, 0., 1., 2.\n100, 0.5, 0.5, 2.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
-            "1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 5, 6, 7, 8, 9, 10, 11, 12\n*NSET, NSET=TOP\n9, 10, 11, 12\n"
-            "*NSET, NSET=MID\n5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n"
-            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
-            "*DENSITY\n1e-3\n*SURFACE, TYPE=NODE, NAME=ST\nTOP\n*COUPLING, CONSTRAINT NAME=C, "
-            f"REF NODE=100, SURFACE=ST\n*KINEMATIC\n{dofs}\n*AMPLITUDE, NAME=R\n0., 0., 1., 1.\n"
-            f"*STEP{', NLGEOM' if nlgeom else ''}, INC=1000\n{step}*BOUNDARY\nBOT, 1, 3\n"
-            + ("9, 3, 3\n" if member_bc else "") +
-            "*BOUNDARY, AMPLITUDE=R\n100, 1, 1, 0.4\n100, 2, 3\n100, 4, 4, 0.3\n100, 5, 5\n"
-            "100, 6, 6, 0.2\n*NODE PRINT, NSET=MID\nU\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+    o = ", ORIENTATION=OR1" if ori else ""
+    cpl = (f"*KINEMATIC COUPLING, REF NODE=100{o}\nTOP, {dofs}\n" if legacy else
+           "*SURFACE, TYPE=NODE, NAME=ST\nTOP\n*COUPLING, CONSTRAINT NAME=C, "
+           f"REF NODE=100, SURFACE=ST{o}\n*KINEMATIC\n{dofs}\n")
+    model = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+             "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, 0., 0., 2.\n10, 1., 0., 2.\n"
+             "11, 1., 1., 2.\n12, 0., 1., 2.\n100, 0.5, 0.5, 2.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
+             "1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 5, 6, 7, 8, 9, 10, 11, 12\n*NSET, NSET=TOP\n9, 10, 11, 12\n"
+             "*NSET, NSET=MID\n5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n"
+             "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n")
+    mat = "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1e-3\n"
+    ori_card = "*ORIENTATION, NAME=OR1\n0.8, 0., 0.6, 0., 1., 0.\n" if ori else ""
+    pre, refs = (["I1.", "I2."], ["R1", "R2"]) if part else ([""], ["100"])
+    if part:
+        model = ("*PART, NAME=P\n" + model + ori_card + cpl + "*END PART\n*ASSEMBLY, NAME=A\n"
+                 "*INSTANCE, NAME=I1, PART=P\n*END INSTANCE\n*INSTANCE, NAME=I2, PART=P\n3., 0., 0.\n"
+                 "*END INSTANCE\n*NSET, NSET=R1, INSTANCE=I1\n100\n*NSET, NSET=R2, INSTANCE=I2\n100\n"
+                 "*END ASSEMBLY\n" + mat)
+    else:
+        model += mat + ori_card + cpl
+    return (model + f"*AMPLITUDE, NAME=R\n0., 0., 1., 1.\n*STEP{', NLGEOM' if nlgeom else ''}, "
+            f"INC=1000\n{step}*BOUNDARY\n" + "".join(f"{p}BOT, 1, 3\n" for p in pre) +
+            ("9, 3, 3\n" if member_bc else "") +
+            "*BOUNDARY, AMPLITUDE=R\n" + "".join(f"{r}, 1, 1, 0.4\n{r}, 2, 3\n{r}, 4, 4, 0.3\n"
+                                                 f"{r}, 5, 5\n{r}, 6, 6, 0.2\n" for r in refs) +
+            "".join(f"*NODE PRINT, NSET={p}MID\nU\n*NODE PRINT, NSET={p}TOP\nU\n" for p in pre) +
+            "*END STEP\n")
 
 
 # member kind -> (reference node position, its translation, its rotation, free nodes)
@@ -5286,25 +5305,41 @@ def main():
         failures += 0 if ok else 1
     # kinematic couplings in *DYNAMIC steps (ccx's own *COUPLING + *KINEMATIC set up no
     # equations there: every free DOF stayed at 0), against ccx's own coupling in a slow
-    # *STATIC step, the static limit
-    for tag, kw in (("kinematic_dynamic_linear", {}), ("kinematic_dynamic_nlgeom", {"nlgeom": True}),
-                    ("kinematic_dynamic_some_dofs", {"dofs": "1, 2"}),
-                    ("kinematic_dynamic_explicit", {"proc": "explicit"}),
-                    ("kinematic_dynamic_member_bc", {"member_bc": True})):
+    # *STATIC step, the static limit; and couplings with an ORIENTATION (ccx reads its axes:
+    # the dynamic equations tied global DOFs, the *KINEMATIC COUPLING card lost it, and a
+    # part-level coupling named the part's orientation, which ccx stopped on)
+    dyn = "ccx's coupling sets up no equations in a dynamic step: they stayed at 0"
+    for tag, kw, why in (
+            ("kinematic_dynamic_linear", {}, dyn), ("kinematic_dynamic_nlgeom", {"nlgeom": True}, dyn),
+            ("kinematic_dynamic_some_dofs", {"dofs": "1, 2"}, dyn),
+            ("kinematic_dynamic_explicit", {"proc": "explicit"}, dyn),
+            ("kinematic_dynamic_member_bc", {"member_bc": True}, dyn),
+            ("kinematic_dynamic_orientation", {"dofs": "1, 2", "ori": True},
+             "in a tilted *ORIENTATION; its equations tied global x and y"),
+            ("kinematic_dynamic_legacy_orientation", {"dofs": "1, 2", "ori": True, "legacy": True},
+             "a *KINEMATIC COUPLING card with an *ORIENTATION"),
+            ("kinematic_static_legacy_orientation",
+             {"dofs": "1, 2", "ori": True, "legacy": True, "proc": "static"},
+             "a *KINEMATIC COUPLING card with an *ORIENTATION, which it lost"),
+            ("kinematic_static_part_orientation",
+             {"dofs": "1, 2", "ori": True, "part": True, "proc": "static"},
+             "both instances of a part coupled in its *ORIENTATION; ccx stopped on the deck")):
         u = review_run(kinematic_dynamic_deck(**kw), tag, dat_displacements)
         src = os.path.join(tmp, f"{tag}_ref.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             # (the converter runs an explicit step with NLGEOM)
             fh.write(kinematic_dynamic_deck(kw.get("dofs", "1, 3"),
-                                            kw.get("nlgeom", kw.get("proc") == "explicit"), "static"))
+                                            kw.get("nlgeom", kw.get("proc") == "explicit"), "static",
+                                            ori=kw.get("ori", False)))
         d, status, out = run_ccx(ccx, env, src)
         ref = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
         shutil.rmtree(d, ignore_errors=True)
         ok = bool(u) and set(ref) == set(range(5, 13))
         if ok:
+            offs = (0, 100) if kw.get("part") else (0,)        # I2's nodes
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-            mid = min(math.hypot(*u.get(n, (0.0,) * 3)) for n in (5, 6, 7, 8)) / scale
+            err = max(math.dist(u.get(n + o, (math.inf,) * 3), ref[n]) for n in ref for o in offs) / scale
+            mid = min(math.hypot(*u.get(n + o, (0.0,) * 3)) for n in (5, 6, 7, 8) for o in offs) / scale
             # (the member BC: Abaqus does not apply it, and the converter drops it; ccx kept
             # it, holding node 9 at u3 = 0, where it follows the coupling to -0.15)
             held = abs(u.get(9, (0.0,) * 3)[2]) / scale
@@ -5312,10 +5347,10 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a column's top face kinematically coupled "
                   f"({kw.get('dofs', '1, 3')}) to a node that moves and turns over a slow "
                   f"{kw.get('proc', 'dynamic')} step{', NLGEOM' if 'nlgeom' in kw else ''}"
-                  f"{', a *BOUNDARY on a coupled DOF' if 'member_bc' in kw else ''}): 8 node "
-                  f"displacements vs ccx's own coupling in a static step, max difference {err:.1e} of "
-                  f"max |u|; the free middle nodes moved {mid:.2f} of it (ccx's coupling sets up no "
-                  f"equations in a dynamic step: they stayed at 0), node 9 {held:.2f} along z")
+                  f"{', a *BOUNDARY on a coupled DOF' if 'member_bc' in kw else ''}): "
+                  f"{8 * len(offs)} node displacements vs ccx's own coupling in a static step, max "
+                  f"difference {err:.1e} of max |u|; the free middle nodes moved {mid:.2f} of it "
+                  f"({why})" + (f", node 9 {held:.2f} along z" if "member_bc" in kw else ""))
         elif u:
             print(f"FAIL  {tag}: the static reference did not solve ({status})")
         failures += 0 if ok else 1
