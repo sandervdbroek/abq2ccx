@@ -14386,12 +14386,7 @@ class Converter:
                 tris: List[Tuple[Vec, Vec, Vec]] = []
                 edge = []
                 for sk, face in faces:
-                    typ, conn = self.geom.elements[sk]
-                    fam = "WEDGE" if typ == "C3D6" else "HEX"
-                    m = re.fullmatch(r"S(\d)", face)
-                    pos = FACE_NODES[fam][int(m.group(1))] if m else ()
-                    corners = [self.geom.nodes[conn[i - 1]] for i in pos[:(3 if fam == "WEDGE" and
-                                                                          face in ("S1", "S2") else 4)]]
+                    corners = self._face_points(sk, face)
                     for i in range(len(corners)):
                         edge.append(vnorm(vsub(corners[(i + 1) % len(corners)], corners[i])))
                     tris += [(corners[0], corners[i], corners[i + 1]) for i in range(1, len(corners) - 1)]
