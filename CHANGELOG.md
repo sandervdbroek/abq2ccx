@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **Two output intervals in one step** — time-based output controls of one step that share no
+  spacing (`*OUTPUT, FIELD, TIME INTERVAL=0.3` beside `TIME INTERVAL=0.2`, `NUMBER INTERVAL=20`
+  beside `TIME INTERVAL=0.03`, `TIME POINTS` beside an interval) stopped the converter with a
+  TypeError. They now get one `*TIME POINTS` list of all their times, to 12 digits. A
+  `TIME POINTS=` that names no `*TIME POINTS` card is warned.
+* **Malformed input reported instead of crashing the converter** — a `*RIGID BODY` `PIN NSET`
+  / `TIE NSET` with no value (dropped; a card left with no set is commented out); a rigid
+  master surface with an element of no `*RIGID BODY` (its `*TIE` is left to ccx); an element on
+  an undefined node (warned; a traction or beam line load on it is commented out); a
+  `*PARAMETER` value beyond the float range (`10**5000`; `9**9**9` ran for minutes); `*BOUNDARY`
+  DOFs above 30 (left out; a range in the millions stalled the converter).
 * **BCs and moments after a linear perturbation step** — Abaqus drops a perturbation step's
   BCs and loads after it, and the converter gives ccx the base state again, but six planners
   still read them as carried on. An `*EQUATION` on DOFs that only a `*FREQUENCY` step held was

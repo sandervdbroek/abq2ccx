@@ -531,6 +531,18 @@ def test_unresolved_parameter_is_reported():
     assert "resolved 2 parameter(s)" in rep.text() and "*PARAMETER: b could not be evaluated" in rep.text()
 
 
+def test_parameter_values_beyond_the_float_range_are_refused():
+    # 10**5000 crashed the <L> substitution (Python prints no integer of over 4300 digits),
+    # 9**9**9 was worked out for minutes: refused, reported and substituted as written
+    import time
+    for expr in ("10**5000", "9**9**9", "pow(9, 9**9)", "10**300 * 10**300", "'a' * 10**9"):
+        t = time.time()
+        body, conv, rep = convert_str(f"*PARAMETER\nL = {expr}\nM = 2**10\n*HEADING\nlength <L>\n"
+                                      f"*NODE\n1, <M>, 0., 0.\n*ELEMENT, TYPE=MASS, ELSET=E\n1, 1\n")
+        assert time.time() - t < 5 and "*PARAMETER: L could not be evaluated" in rep.text()
+        assert f"length {expr}" in body and conv.geom.nodes[1][0] == 1024.0
+
+
 def test_no_residual_parameter_tokens():
     deck = ("*PARAMETER\nx = 1.5\n*NODE\n1, <x>, 0., 0.\n2, <x>, 1., 0.\n"
             "*ELEMENT, TYPE=T3D2, ELSET=E\n1, 1, 2\n")
@@ -700,6 +712,19 @@ def test_rigid_body_pin_nset_mapped():
     body, _, _ = convert_str(deck)
     rb = [l for l in body.splitlines() if "RIGID BODY" in l.upper()][0]
     assert "NSET=RN" in rb.upper() and "PIN NSET" not in rb.upper()
+
+
+def test_rigid_body_node_set_parameter_without_a_value():
+    # PIN NSET / TIE NSET with no value (this crashed): dropped, warned; a card left with no
+    # node or element set, which Abaqus and ccx stop on, is commented out
+    deck = "*NODE\n1,0,0,0\n2,1,0,0\n3,2,0,0\n*ELEMENT, TYPE=T3D2, ELSET=E\n1, 1, 2\n"
+    body, conv, rep = convert_str(deck + "*RIGID BODY, REF NODE=3, PIN NSET\n")
+    assert "PIN NSET names no node set" in rep.text() and "** *RIGID BODY, REF NODE=3, PIN NSET" in body
+    assert "*RIGID BODY" in conv.reduced_physics
+    body, _, rep = convert_str(deck + "*RIGID BODY, REF NODE=3, ELSET=E, TIE NSET=\n")
+    rb = [l for l in body.splitlines() if l.startswith("*RIGID BODY")]
+    assert len(rb) == 1 and rb[0].startswith("*RIGID BODY, REF NODE=3, ELSET=E") and "NSET" not in rb[0]
+    assert "TIE NSET names no node set" in rep.text() and "PIN/TIE NSET mapped" not in rep.text()
 
 
 def test_meshgen_float_formatted_integers():
@@ -930,6 +955,18 @@ def test_boundary_on_inactive_unknown_dof_dropped():
     assert any("DOF 9 (electric potential) dropped" in m for _, m in rep.entries)
     body, _, _ = convert_str(deck.replace("TYPE=C3D8", "TYPE=C3D8E"))
     assert "TOP, 9, 9, 500." in body
+
+
+def test_boundary_dofs_above_30_left_out():
+    # Abaqus numbers DOFs 1-30: a range past 30 is cut there, a line wholly above it dropped,
+    # warned (a range in the millions stalled the planners, which expand it node by node)
+    import time
+    deck = HEX + ("*Nset, nset=BOT\n1, 2, 3, 4\n*Step\n*Static\n*Boundary\nBOT, 1, 3000000\n"
+                  "5, 40, 50\n*Cload\n7, 3, 1.\n*End Step\n")
+    t = time.time()
+    body, _, rep = convert_str(deck)
+    assert time.time() - t < 10 and "2 *BOUNDARY line(s) name DOFs above 30" in rep.text()
+    assert "BOT, 1, 6\n" in body and "3000000" not in body and "5, 40" not in body
 
 
 def test_boundary_on_dof8_dropped_where_the_ccx_model_has_none():
@@ -3349,6 +3386,30 @@ def test_output_intervals_to_time_points_or_frequency():
     assert "*NODE FILE, TIME POINTS=TP\nU\n" in body and "ABQ2CCX_TP" not in body
 
 
+def test_output_time_controls_without_a_common_spacing():
+    # time-based output controls of one step that share no spacing -> one *TIME POINTS list of
+    # all their times (this crashed: the list branch had never run), 12 digits a time
+    step = ("*Step, nlgeom\n*Static\n{}\n*Boundary\n1, 1, 3\n*Cload\n7, 3, 1.\n"
+            "*Output, field, {}\n*Node Output\nU\n*Output, field, {}\n*Element Output\nS\n*End Step\n")
+    body, _, _ = convert_str(HEX + step.format("0.1, 1.", "time interval=0.3", "time interval=0.2"))
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1\n0.2, 0.3, 0.4, 0.6, 0.8, 0.9, 1.\n*STEP" in body
+    assert "*NODE FILE, TIME POINTS=ABQ2CCX_TP1\nU\n" in _step(body, 1)
+    body, _, _ = convert_str(HEX + step.format("0.1, 1.", "number interval=20", "time interval=0.03"))
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1\n0.03, 0.05, 0.06, 0.09, 0.1, 0.12, 0.15, 0.18\n" in body
+    tp = "*Time Points, name=TP1\n0.25, 0.5, 1.\n"
+    body, _, _ = convert_str(HEX + tp + step.format("0.1, 1.", "time points=TP1", "time interval=0.3"))
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1\n0.25, 0.3, 0.5, 0.6, 0.9, 1.\n" in body
+    # a GENERATE time of the deck's own is 7.000000000000001e-05 in repr; ccx reads 20 characters
+    tp = "*Time Points, name=TP1, generate\n0., 1.e-4, 1.e-5\n"
+    body, _, _ = convert_str(HEX + tp + step.format("1.e-5, 1.e-4", "time points=TP1", "time interval=3.e-5"))
+    lines = body.split("NAME=ABQ2CCX_TP1\n")[1].split("*STEP")[0].split()
+    assert "7e-05," in lines and max(len(x) for x in lines) <= 20
+    # TIME POINTS naming no card: Abaqus stops; reported, the other request's times kept
+    body, _, rep = convert_str(HEX + step.format("0.1, 1.", "time points=NOPE", "time interval=0.3"))
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1\n0.3, 0.6, 0.9, 1.\n" in body
+    assert "the deck has no *TIME POINTS named NOPE" in rep.text()
+
+
 def test_dynamic_output_defaults_and_explicit_intervals():
     # Abaqus writes *DYNAMIC (implicit) output every 10 increments by default; *MODAL DYNAMIC
     # and explicit dynamics take no TIME POINTS in ccx: FREQUENCY from the fixed or the
@@ -5594,6 +5655,21 @@ def test_dsload_and_commented_load_lines_keep_blank_fields():
 def test_dsload_on_undefined_surface_says_so():
     body, conv, rep = convert_str(HEX + "*Step\n*Static\n*Dsload\nNOPE, P, 1.\n*End Step\n")
     assert "surface 'NOPE' is not defined in the deck" in rep.text() and conv.unloaded_steps == [1]
+
+
+def test_loads_on_elements_with_an_undefined_node():
+    # an element on an undefined node is warned (Abaqus stops on it); a traction or beam line
+    # load on it, which becomes nodal forces, is commented out (this crashed)
+    deck = HEX.replace("5, 0.,0.,1.\n", "") + ("*Surface, name=S\nEALL, S2\n*Step\n*Static\n"
+                                               "*Dsload\nS, TRVEC, 1., 0., 0., 1.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "1 element(s) name an undefined node (element 1: node 5)" in rep.text()
+    assert "** abq2ccx: *DSLOAD TRVEC on 'S' not converted: element 1 has an undefined node" in body
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n2, 2, 3\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Beam Section, elset=B, material=M, section=RECT\n"
+            "0.1, 0.1\n0., 0., -1.\n*Step\n*Static\n*Boundary\n1, 1, 6\n*Dload\nB, PY, 1.\n*End Step\n")
+    _, _, rep = convert_str(beam)
+    assert "*DLOAD PY on 'B' not converted: beam 2 has an undefined node" in rep.text()
 
 
 def test_distributed_load_examples():
@@ -8646,6 +8722,21 @@ def test_tie_to_a_rigid_surface_makes_the_slave_nodes_members():
     assert "*TIE" not in body.replace("** abq2ccx: *TIE", "") and "join that rigid body" in rep.text()
     m = re.search(r"\*RIGID BODY, REF NODE=9, NSET=([^,\s]+)", body)
     assert {5, 6, 7, 8} <= set(reparse(body).nset(m.group(1)))
+
+
+def test_tie_to_a_rigid_surface_with_elements_of_no_rigid_body():
+    # a rigid master surface on an element of no *RIGID BODY (Abaqus stops on such an element):
+    # the *TIE is left to ccx whichever face comes first (this crashed when it came first)
+    deck = (HEX + "*NODE\n11, 0.,0.,1.\n12, 1.,0.,1.\n13, 1.,1.,1.\n14, 0.,1.,1.\n15, 2.,0.,1.\n"
+            "16, 2.,1.,1.\n9, 0.5,0.5,2.\n*ELEMENT, TYPE=R3D4, ELSET=PLATE\n2, 11, 14, 13, 12\n"
+            "*ELEMENT, TYPE=R3D4, ELSET=LOOSE\n3, 12, 13, 16, 15\n*ELSET, ELSET=TOPE\n1\n"
+            "*SURFACE, NAME=TOP\nTOPE, S2\n*SURFACE, NAME=TOOL\n{}"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*RIGID BODY, REF NODE=9, ELSET=PLATE\n*TIE, NAME=GLUE\nTOP, TOOL\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n*END STEP\n")
+    for faces in ("LOOSE, SPOS\nPLATE, SPOS\n", "PLATE, SPOS\nLOOSE, SPOS\n"):
+        body, _, rep = convert_str(deck.format(faces))
+        assert "*TIE, NAME=GLUE\nTOP, TOOL\n" in body and "belong to no *RIGID BODY" in rep.text()
 
 
 def test_instanced_analytical_surface_moves_with_its_instance():

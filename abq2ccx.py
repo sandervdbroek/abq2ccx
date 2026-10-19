@@ -910,8 +910,20 @@ def _split_commas(line: str) -> List[str]:
 # ``_safe_eval_param`` (an AST walk), NOT ``eval`` — there is no attribute/subscript
 # access, so a malicious deck cannot reach ``__globals__``/``os`` and execute code.
 _PARAM_EVAL_CONSTS: Dict[str, float] = {"pi": math.pi, "e": math.e}
+
+
+def _param_pow(a, b, *mod):
+    """``a ** b`` for a *PARAMETER expression, refusing an integer result beyond the float
+    range: Python would work out ``9**9**9`` for minutes, and cannot print an integer of
+    more than 4300 digits."""
+    if (not mod and isinstance(a, int) and isinstance(b, int) and b > 0 and abs(a) > 1
+            and b * math.log2(abs(a)) > 1024):
+        raise ValueError("number too large")
+    return pow(a, b, *mod)
+
+
 _PARAM_EVAL_FUNCS: Dict[str, object] = {
-    "abs": abs, "min": min, "max": max, "round": round, "pow": pow,
+    "abs": abs, "min": min, "max": max, "round": round, "pow": _param_pow,
     "int": int, "float": float,
     **{k: getattr(math, k) for k in (
         "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp",
@@ -920,7 +932,7 @@ _PARAM_EVAL_FUNCS: Dict[str, object] = {
 }
 _PARAM_BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
                  ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
-                 ast.Mod: operator.mod, ast.Pow: operator.pow}
+                 ast.Mod: operator.mod, ast.Pow: _param_pow}
 _PARAM_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
 
@@ -929,7 +941,14 @@ def _safe_eval_param(expr: str, names: Dict[str, object]) -> object:
     or builtin access — so, unlike ``eval``, it cannot be coerced into running code.
     ``names`` supplies values for bare identifiers (user parameters and the math
     constants); ``_PARAM_EVAL_FUNCS`` supplies functions reachable only as ``f(...)``.
-    Raises ``ValueError`` on anything outside the arithmetic grammar."""
+    Raises ``ValueError`` on anything outside the arithmetic grammar, and on an integer
+    beyond the float range or a string over 100000 characters (an FE value is neither)."""
+    def checked(v: object) -> object:
+        if (isinstance(v, int) and v.bit_length() > 1024) or (isinstance(v, str)
+                                                                and len(v) > 100000):
+            raise ValueError("value too large")
+        return v
+
     def ev(node: ast.AST) -> object:
         if isinstance(node, ast.Expression):
             return ev(node.body)
@@ -946,14 +965,19 @@ def _safe_eval_param(expr: str, names: Dict[str, object]) -> object:
                 return names[node.id]
             raise ValueError(f"unknown name {node.id!r}")
         if isinstance(node, ast.BinOp) and type(node.op) in _PARAM_BINOPS:
-            return _PARAM_BINOPS[type(node.op)](ev(node.left), ev(node.right))
+            a, b = ev(node.left), ev(node.right)
+            if isinstance(node.op, ast.Mult) and isinstance(a, str) != isinstance(b, str):
+                text, n = (a, b) if isinstance(a, str) else (b, a)
+                if isinstance(n, int) and len(text) * n > 100000:
+                    raise ValueError("string too long")
+            return checked(_PARAM_BINOPS[type(node.op)](a, b))
         if isinstance(node, ast.UnaryOp) and type(node.op) in _PARAM_UNARYOPS:
             return _PARAM_UNARYOPS[type(node.op)](ev(node.operand))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
             fn = _PARAM_EVAL_FUNCS.get(node.func.id)
             if not callable(fn):
                 raise ValueError(f"call to {node.func.id!r} not allowed")
-            return fn(*[ev(a) for a in node.args])
+            return checked(fn(*[ev(a) for a in node.args]))
         raise ValueError("unsupported expression")
     return ev(ast.parse(expr, mode="eval"))
 
@@ -1004,7 +1028,8 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                     ns[name] = val          # visible to later defs resolved in this same pass
                     progressed = True
                     unresolved.discard(name)
-                except Exception:           # noqa: BLE001 — unresolved (maybe forward ref)
+                except (ValueError, ArithmeticError, TypeError, SyntaxError, RecursionError):
+                    # unresolved (maybe a forward reference)
                     params.setdefault(name, expr)
                     unresolved.add(name)
             if not progressed:
@@ -1014,7 +1039,8 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                     "<name> tokens (ccx has no *PARAMETER).", once=True)
         if bad:
             report.warn(f"*PARAMETER: {', '.join(dedup(bad))} could not be evaluated (the converter "
-                        f"reads numbers, quoted strings, arithmetic and math functions), so the "
+                        f"reads numbers, quoted strings, arithmetic and math functions, within the "
+                        f"float range), so the "
                         f"expression is substituted as written — verify.", once=True)
 
     if not params:
@@ -4032,6 +4058,43 @@ class Converter:
         for b in blocks:                        # DEFINITION=NODES: nodes may follow the card
             if b.keyword == "ORIENTATION" and b.uparam("DEFINITION").startswith("NODES"):
                 self._register_orientation(b)
+
+    def _warn_undefined_element_nodes(self) -> None:
+        """Warn on elements that name an undefined node (Abaqus stops on them)."""
+        nodes = self.geom.nodes
+        bad = [e for e, (_t, conn) in self.geom.elements.items() if any(k not in nodes for k in conn)]
+        if bad:
+            n = next(k for k in self.geom.elements[bad[0]][1] if k not in nodes)
+            self.report.warn(f"{len(bad)} element(s) name an undefined node (element {bad[0]}: "
+                             f"node {n}); Abaqus stops on this, and ccx 2.23 reads the node at the "
+                             f"origin. Tractions and line loads on them are not converted.")
+
+    def _bc_dofs_in_range(self, blocks: List[Block]) -> List[Block]:
+        """``blocks`` with the DOFs above 30 left out of every *BOUNDARY line (Abaqus numbers
+        its DOFs 1-30), before any planner expands a line's DOF range, per node in places."""
+        out: List[Block] = []
+        cut: List[str] = []
+        for b in blocks:
+            if b.keyword != "BOUNDARY":
+                out.append(b)
+                continue
+            data, before = [], len(cut)
+            for rec in merged_data_records(b):
+                f = [x.strip() for x in rec]
+                if len(f) > 1 and re.fullmatch(r"[-+]?\d+", f[1]):
+                    d1 = int(f[1])
+                    d2 = int(f[2]) if len(f) > 2 and re.fullmatch(r"[-+]?\d+", f[2]) else d1
+                    if max(d1, d2) > 30:
+                        cut.append(", ".join(f))
+                        if min(d1, d2) > 30:
+                            continue
+                        f = [f[0], str(min(d1, d2)), "30"] + f[3:]
+                data.append(", ".join(f))
+            out.append(Block(b.keyword, b.params, data) if len(cut) > before else b)
+        if cut:
+            self.report.warn(f"{len(cut)} *BOUNDARY line(s) name DOFs above 30, which Abaqus does "
+                             f"not have (first: '{cut[0]}'): those DOFs are left out.")
+        return out
 
     def _cartesian_nodes(self, blocks: List[Block]) -> List[Block]:
         """``blocks`` with every *NODE, SYSTEM=C / S card rewritten in Cartesian coordinates
@@ -9723,6 +9786,8 @@ class Converter:
                 return [], f"element {e} is not defined"
             typ, conn = info
             cc, n = ccx_type(typ), len(conn)
+            if any(k not in self.geom.nodes for k in conn):
+                return [], f"element {e} has an undefined node"
             if typ.upper() in SURFACE_ELEMENTS:
                 if face not in ("SPOS", "SNEG") and not (shell_reference and not face):
                     return [], (f"face '{face}' of the {typ} element {e} is not its reference "
@@ -9770,6 +9835,8 @@ class Converter:
         out: list = []
         for e in eids:
             typ, conn = self.geom.elements[e]
+            if any(k not in self.geom.nodes for k in conn):
+                return [], f"beam {e} has an undefined node"
             nodes = [conn[0], conn[-1]] + ([conn[1]] if len(conn) == 3 else [])
             n1 = (0.0, 0.0, -1.0) if self._planar_beams else self._beam_n1.get(e)
             if label in ("P1", "P2"):
@@ -11814,6 +11881,9 @@ class Converter:
         """The times of the deck's *TIME POINTS ``name`` (empty if it has none)."""
         b = self._out_user_tp.get(name)
         if b is None:
+            self.report.warn(f"TIME POINTS={name} on an output request: the deck has no *TIME "
+                             f"POINTS named {name} (Abaqus stops on this); it adds no output "
+                             f"times.", once=True)
             return []
         out: List[float] = []
         for rec in merged_data_records(b):
@@ -11844,7 +11914,10 @@ class Converter:
             self._out_tp_cards += [f"*TIME POINTS, NAME={name}, GENERATE",
                                    f"{fmt_num(times[1])}, {fmt_num(period)}, {fmt_num(times[1])}"]
         else:
-            self._out_tp_cards += [f"*TIME POINTS, NAME={name}"] + reflow(list(times), 8)
+            # 12 digits (short_real): a user *TIME POINTS, GENERATE time can run to 21
+            # characters in repr, and ccx reads 20
+            self._out_tp_cards += ([f"*TIME POINTS, NAME={name}"]
+                                   + reflow(list(dict.fromkeys(short_real(t, 12) for t in times[1])), 8))
         self.report.note("*OUTPUT NUMBER INTERVAL / TIME INTERVAL -> *TIME POINTS (ccx writes "
                          "the output at those times of the step, cutting increments to reach "
                          "them, as Abaqus' TIME MARKS=YES).", once=True)
@@ -12883,7 +12956,11 @@ class Converter:
             node_sets = [name]
         for k, v in b.params.items():
             if k in ("PIN NSET", "TIE NSET", "NSET"):
-                keep["NSET"] = node_sets[0]
+                if node_sets:
+                    keep["NSET"] = node_sets[0]
+                if not v:
+                    self.report.warn(f"*RIGID BODY parameter {k} names no node set (Abaqus "
+                                     f"stops on this): dropped.", once=True)
             elif k in ("REF NODE", "ROT NODE", "ELSET"):
                 keep[k] = v
             elif k in ("POSITION", "DENSITY"):
@@ -12893,6 +12970,9 @@ class Converter:
                 self._reduces(f"*RIGID BODY, {k}")
             else:
                 self.report.note(f"*RIGID BODY parameter {k} dropped (Abaqus-only).", once=True)
+        if not keep.get("NSET") and not keep.get("ELSET"):
+            return self._commented(b, "*RIGID BODY names no node set or element set (Abaqus and "
+                                      "ccx stop on this).")
         pre: List[str] = []
         if self._qmem and keep.get("ELSET"):
             pre = self._qmem_rigid_elset(keep, [v for k, v in b.params.items() if v and
@@ -12902,7 +12982,7 @@ class Converter:
         ref0 = self._ref_node(b)
         rot0 = self._first_node(b.param("ROT NODE") or "")
         eq = self._rigid_as_eq(ref0, self._rb_rot_synth.get(ref0) if rot0 is None else rot0, tie + pin)
-        if b.has("PIN NSET") or b.has("TIE NSET"):
+        if b.param("PIN NSET") or b.param("TIE NSET"):
             self.report.note(("*RIGID BODY, PIN/TIE NSET: the" if eq else
                               "*RIGID BODY: Abaqus PIN/TIE NSET mapped to ccx NSET (the set moves "
                               "rigidly with REF NODE); the") + " rotations of TIE (and ELSET) "
@@ -13946,13 +14026,14 @@ class Converter:
 
     # ======================================================================
     def convert(self, blocks: List[Block]) -> List[str]:
-        blocks = self._cartesian_nodes(blocks)
+        blocks = self._bc_dofs_in_range(self._cartesian_nodes(blocks))
         raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         self._plan_deck_facts(blocks)
         self.build_geometry(blocks)
+        self._warn_undefined_element_nodes()
         self._drop_surface_elements(raw, blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
         # beams, skins, slab layers, ...) are numbered above them (ccx_results_digest)
@@ -14901,9 +14982,9 @@ class Converter:
                 faces = faces_of.get(toks[1])
                 if not faces:
                     continue
-                owners = {id(skin_body[sk]) for sk, _ in faces if sk in skin_body}
-                if len(owners) != 1:
-                    continue
+                owners = {id(skin_body.get(sk)) for sk, _ in faces}
+                if len(owners) != 1 or faces[0][0] not in skin_body:
+                    continue                    # several bodies, or rigid faces of none
                 body = skin_body[faces[0][0]]
                 tris: List[Tuple[Vec, Vec, Vec]] = []
                 edge = []

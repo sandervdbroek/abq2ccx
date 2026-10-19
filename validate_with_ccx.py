@@ -4235,6 +4235,50 @@ def main():
               f".frd blocks")
         failures += 0 if ok else 1
 
+    # Two field requests every 0.3 and every 0.2 of the step share no spacing: one *TIME POINTS
+    # list of both requests' times (the converter crashed on it).  A bar of three unit cubes
+    # (nu = 0, NLGEOM: ccx solves a linear step in one increment) pulled by a ramped dead tip
+    # load P t: the section keeps its area, so S11 = P t / A, and the stretch l of the St
+    # Venant-Kirchhoff bar solves E (l^2 - 1) / 2 = S11 / l; ux = L (l - 1).
+    bar = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n"
+           "8,0.,1.,1.\n9,2.,0.,0.\n10,2.,1.,0.\n11,2.,0.,1.\n12,2.,1.,1.\n13,3.,0.,0.\n14,3.,1.,0.\n"
+           "15,3.,0.,1.\n16,3.,1.,1.\n*Element, type=C3D8, elset=ALL\n1, 1,2,3,4,5,6,7,8\n"
+           "2, 2,9,10,3,6,11,12,7\n3, 9,13,14,10,11,15,16,12\n*Nset, nset=TIP\n13, 14, 15, 16\n"
+           "*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, elset=ALL, material=M\n"
+           "*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n*Step, nlgeom\n*Static\n0.1, 1.\n*Cload\n"
+           "TIP, 1, 0.25\n*Output, field, time interval=0.3\n*Node Output, nset=TIP\nU\n"
+           "*Output, field, time interval=0.2\n*Element Output\nS\n*End Step\n")
+    src = os.path.join(tmp, "two_intervals_src.inp")
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(bar)
+    inp = os.path.join(tmp, "two_intervals.inp")
+    convert(src, inp)
+    d, status, out = run_ccx(ccx, env, inp)
+    frd = os.path.join(d, "job.frd")
+    disp, stress = (frd_blocks(frd, "DISP"), frd_blocks(frd, "STRESS")) if status == "solved" else ([], [])
+    shutil.rmtree(d, ignore_errors=True)
+    want = [0.2, 0.3, 0.4, 0.6, 0.8, 0.9, 1.0]
+    if len(disp) != len(want) or len(stress) != len(want):
+        print(f"FAIL  output_two_time_intervals: {len(disp)} DISP / {len(stress)} STRESS .frd "
+              f"blocks, expected {len(want)} each ({status})")
+        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+        failures += 1
+    else:
+        def bar_ux(t):
+            lam = 1.0 + t / 1000.0
+            for _ in range(20):
+                lam -= (1000.0 * (lam ** 2 - 1) / 2 - t / lam) / (1000.0 * lam + t / lam ** 2)
+            return 3.0 * (lam - 1)
+        dev_t = max(abs(t - w) for (t, _), w in zip(disp + stress, want + want))
+        dev_u = max(abs(v[n][0] / bar_ux(t) - 1) for t, v in disp for n in (13, 14, 15, 16))
+        dev_s = max(abs(s[0] / t - 1) for t, v in stress for s in v.values())
+        ok = dev_t < 1e-9 and dev_u < 1e-5 and dev_s < 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  output_two_time_intervals (*OUTPUT every 0.3 and every "
+              f"0.2): .frd U and S at t = {', '.join(f'{t:g}' for t, _ in disp)}; tip ux = "
+              f"{disp[-1][1][16][0]:.7f} at t = 1 ({bar_ux(1.0):.7f}); ux within {dev_u:.1e}, "
+              f"S11 within {dev_s:.1e} of P t / A")
+        failures += 0 if ok else 1
+
     # --- Abaqus' preselected and default field output ---------------------------------
     # A bar in tension with only the two requests Abaqus/CAE writes (*Output, field / history,
     # variable=PRESELECT): ccx has no preselected output and wrote the mesh only; abq2ccx
