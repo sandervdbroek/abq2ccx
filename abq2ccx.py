@@ -5726,19 +5726,14 @@ class Converter:
             if not b.keyword.endswith("SECTION"):
                 continue
             base = (b.param("ORIENTATION") or "").strip().upper()
-            if b.has("COMPOSITE"):
-                for rec in merged_data_records(b):  # thickness, points, material, angle or name
-                    ply = rec[3] if len(rec) > 3 else ""
-                    if len(rec) < 3 or not rec[2]:
-                        continue
-                    try:
-                        ori, angle = base, (pf(ply) if ply else 0.0)
-                    except ValueError:              # the ply names its own orientation
-                        ori, angle = ply.upper(), 0.0
-                    uses.append((rec[2].upper(), self._material_axes(oris, ori, angle)))
-            elif b.param("MATERIAL"):
-                uses.append(((b.param("MATERIAL") or "").strip().upper(),
-                             self._material_axes(oris, base, 0.0)))
+            for _t, mat, ply in self._section_layers(b):    # a composite's plies, or its material
+                if not mat:
+                    continue
+                try:
+                    ori, angle = base, (pf(ply) if ply else 0.0)
+                except ValueError:                  # the ply names its own orientation
+                    ori, angle = ply, 0.0
+                uses.append((mat.upper(), self._material_axes(oris, ori, angle)))
         return uses
 
     def _material_axes(self, oris: Dict[str, Block], name: str,
@@ -6226,8 +6221,7 @@ class Converter:
         composite ply's) into element groups that share the same axes."""
         involved = [ori] if ori in self._dist_ori else []
         if b.has("COMPOSITE"):
-            for rec in merged_data_records(b):
-                o = rec[3].strip().upper() if len(rec) > 3 else ""
+            for _t, _m, o in self._section_layers(b):
                 if o in self._dist_ori and o not in involved:
                     involved.append(o)
         involved = [o for o in involved if self._dist_ori[o]["has_data"]]
@@ -6708,16 +6702,7 @@ class Converter:
                 return self._exact_axes_cards(b, rows, keep)
             pre: List[str] = []
             plies: List[Tuple[str, str, Optional[str]]] = []
-            for rec in merged_data_records(b):
-                # Positional: thickness, integration-pts, material, angle[, plyname].
-                # Interior blanks are significant, so do NOT filter empty fields out.
-                g = [x.strip() for x in rec]
-                while g and g[-1] == "":
-                    g.pop()
-                if len(g) < 3 or g[0] == "":
-                    continue
-                thick, mat = g[0], g[2]
-                ply_ori = g[3] if len(g) > 3 else ""
+            for thick, mat, ply_ori in self._section_layers(b):    # (SYMMETRIC: mirrored)
                 if ply_ori == "":
                     oriname = self._plain_dist_orientation(base, axes[base], 0.0, pre) \
                         if base in axes else (base or None)
@@ -6725,7 +6710,7 @@ class Converter:
                     try:                                  # Abaqus: numeric ply angle
                         angle = float(ply_ori)
                     except ValueError:                    # already an *ORIENTATION name
-                        oriname = ply_ori.upper()
+                        oriname = ply_ori
                         if oriname in axes:
                             oriname = self._plain_dist_orientation(oriname, axes[oriname], 0.0, pre)
                     else:
@@ -6748,8 +6733,7 @@ class Converter:
                              "shell normal wherever that axis is the normal).", once=True)
             if b.has("SYMMETRIC"):
                 # Abaqus lists the bottom half of a symmetric layup and mirrors it about the
-                # mid-surface; ccx has no such flag, so write the full stack
-                ply_lines = ply_lines + ply_lines[::-1]
+                # mid-surface; ccx has no such flag, so the full stack is written
                 self.report.note("*SHELL SECTION, COMPOSITE, SYMMETRIC: plies mirrored about the "
                                  "mid-surface (ccx needs the full layup).", once=True)
             return pre + [emit_keyword("SHELL SECTION", keep)] + ply_lines
@@ -17180,10 +17164,8 @@ class Converter:
             if not b.keyword.endswith("SECTION"):
                 continue
             names = [b.param("MATERIAL")] if b.param("MATERIAL") else []
-            if b.has("COMPOSITE"):                       # ply lines: thick, nip, material, ...
-                for rec in merged_data_records(b):
-                    if len(rec) > 2 and rec[2].strip():
-                        names.append(rec[2].strip())
+            if b.has("COMPOSITE"):
+                names += [m for _t, m, _o in self._section_layers(b) if m]
             for nm in names:
                 if nm and nm.upper() not in defined and nm.upper() not in missing:
                     missing[nm.upper()] = b.param("ELSET") or "?"
