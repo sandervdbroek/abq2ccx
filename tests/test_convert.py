@@ -4719,6 +4719,18 @@ def test_load_audit_flags_steps_whose_loads_do_not_survive():
     assert A.step_load_audit(blocks, True) == [
         ["*CLOAD on 1"], ["*CLOAD on 1"], ["*CLOAD on 2", "*CLOAD on 3"],
         ["*BOUNDARY: prescribed value on 2"], [], None]
+    # in Abaqus a frequency step is a perturbation step: its cards do not carry over (ccx's
+    # do), so a prescribed value its OP=NEW removes in ccx is lost in the conversion
+    freq = ("*Step\n*Static\n*Boundary\n7, 1, 1, 0.5\n*End Step\n*Step\n*Frequency\n3\n"
+            "*Boundary, op=NEW\n7, 1, 1\n*End Step\n*Step\n*Static\n*End Step\n")
+    blocks = A.blocks_from_lines(freq.splitlines())
+    assert A.step_load_audit(blocks, True, abaqus=True)[2] == ["*BOUNDARY: prescribed value on 7"]
+    assert A.step_load_audit(blocks, False)[2] == []
+    _, conv, rep = convert_str(HEX + freq)
+    assert conv.unloaded_steps == [3] and "Step 3 is loaded in the Abaqus deck" in rep.text()
+    blocks = A.blocks_from_lines(freq.replace("*Boundary, op=NEW\n7, 1, 1\n", "*Cload\n7, 1, 1.\n")
+                                 .splitlines())
+    assert A.step_load_audit(blocks, True, abaqus=True)[2] == ["*BOUNDARY: prescribed value on 7"]
 
 
 def test_dload_and_dsload_op_new_keep_each_others_loads():

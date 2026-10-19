@@ -2997,7 +2997,8 @@ def _load_entries(b: Block, user_loads: bool, explicit: bool = False
     return out
 
 
-def step_load_audit(blocks: Sequence[Block], user_loads: bool) -> List[Optional[List[str]]]:
+def step_load_audit(blocks: Sequence[Block], user_loads: bool,
+                    abaqus: bool = False) -> List[Optional[List[str]]]:
     """Per *STEP, in order: None for an eigenvalue extraction (it needs no load), else the
     loads active in the step — an empty list means the step solves with no load at all,
     i.e. to a zero response.  Loads and prescribed BCs carry over to later steps until an
@@ -3006,7 +3007,9 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool) -> List[Optional[
 
     ``user_loads``: whether a magnitude that comes from a user subroutine (USER, ...NU
     labels) counts.  It does in an Abaqus deck; in a ccx deck the stock ccx subroutine
-    would run in place of the deck's own, so it does not."""
+    would run in place of the deck's own, so it does not.  ``abaqus``: the deck is read as
+    Abaqus reads it, where an eigenvalue extraction is always a linear-perturbation step
+    (its cards do not carry over); ccx carries them on."""
     state: Dict[str, Dict[tuple, str]] = {}
     initial: Dict[str, List[str]] = {"VELOCITY": [], "STRESS": []}
     fresh: Dict[str, set] = {}             # keys (re)defined in the current step, per card
@@ -3056,8 +3059,8 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool) -> List[Optional[
         if step is None:
             continue
         proc = next((x.keyword for x in step if x.keyword in PROC_KW), None)
-        perturb = proc in PERTURBATION_PROCEDURES or (step[0].has("PERTURBATION") and
-                                                      proc not in LOAD_FREE_PROCEDURES)
+        perturb = proc in PERTURBATION_PROCEDURES or (abaqus and proc in LOAD_FREE_PROCEDURES) or \
+            (step[0].has("PERTURBATION") and proc not in LOAD_FREE_PROCEDURES)
         active = {} if perturb else state
         explicit = any(x.keyword == "DYNAMIC" and x.has("EXPLICIT") for x in step)
         for x in step[1:]:
@@ -14705,7 +14708,7 @@ class Converter:
         was commented out (or became a stock ccx user subroutine) would still run — to a
         zero response.  Fills ``unloaded_steps`` (1-based) and ``source_unloaded`` (the deck
         itself applies no load in any step and has no eigenvalue step)."""
-        src = step_load_audit(blocks, user_loads=True)
+        src = step_load_audit(blocks, user_loads=True, abaqus=True)
         dst = step_load_audit(blocks_from_lines(out), user_loads=False)
         self.source_unloaded = bool(src) and all(s == [] for s in src)
         self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1) if s and d == []]
