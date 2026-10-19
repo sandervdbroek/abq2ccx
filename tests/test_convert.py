@@ -4851,6 +4851,16 @@ def test_general_step_after_perturbation_gets_the_base_state():
     # without a perturbation step nothing changes
     body, _, rep = convert_str(PERT.replace("*Step\n*Frequency\n3\n{}*End Step\n", "").format(""))
     assert "HOLD" not in body and "perturbation" not in rep.text()
+    # Abaqus keeps NLGEOM on; ccx 2.23 forgets it after a *FREQUENCY step (probed: the next
+    # static step ran linear), so it is written there
+    body, conv, rep = convert_str(PERT.replace("*Step\n*Static\n*Cload", "*Step, nlgeom\n*Static\n*Cload")
+                                  .format("", ""))
+    assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == [", NLGEOM", "", ", NLGEOM"]
+    assert "ccx 2.23 forgets it after a *FREQUENCY" in rep.text() and not conv.reduced_physics
+    # a *DYNAMIC step after a *BUCKLE: ccx starts it from the buckle step's displacements
+    deck = PERT.replace("*Frequency\n3\n", "*Buckle\n2\n").rsplit("*Static\n", 1)
+    _, conv, rep = convert_str("*Dynamic\n0.01, 0.05\n".join(deck).format("*Cload\n7, 3, -1.\n", ""))
+    assert "starts it from that step's displacements" in rep.text() and conv.reduced_physics
 
 
 def test_base_state_after_perturbation_values_and_keys():

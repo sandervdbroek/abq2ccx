@@ -3816,6 +3816,7 @@ class Converter:
         self._restore_from: Dict[int, int] = {}     # step -> the last general step before it
         self._restore_new: set = set()              # ... whose *BOUNDARY part needs OP=NEW
         self._restore_pairs: Dict[int, set] = {}    # ... -> the base state's (node, DOF) BCs
+        self._restore_procs: Dict[int, set] = {}    # ... -> the perturbation procedures before
         # pressures on shells / membranes split between the faces of ccx's expanded element
         # (_plan_sheet_pressure): load token -> [(face-1 target, top-face surface, weight of
         # face 1, weight of face 2)], and the *ELSET / *SURFACE cards those names need
@@ -7464,6 +7465,21 @@ class Converter:
         if proc in ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO") and not step_block.has("PERTURBATION"):
             self._general_step_seen = True
+        if self._step_idx in self._restore_from:
+            if self._step_nlgeom and "NLGEOM" not in params:
+                params["NLGEOM"] = None
+                self.report.note("*STEP, NLGEOM written on a general step after a linear "
+                                 "perturbation step: Abaqus keeps NLGEOM on once a step has "
+                                 "switched it on, ccx 2.23 forgets it after a *FREQUENCY or "
+                                 "*BUCKLE step (probed: the next static step ran linear).", once=True)
+            if proc == "DYNAMIC" and self._restore_procs[self._step_idx] & {"BUCKLE", "MODAL DYNAMIC"}:
+                self.report.warn("*DYNAMIC step after a *BUCKLE or *MODAL DYNAMIC step: ccx 2.23 "
+                                 "starts it from that step's displacements, not from the last "
+                                 "general step's (probed: it oscillates about the static state "
+                                 "the loads given again hold). Run the perturbation step last.",
+                                 once=True)
+                self._reduces("*DYNAMIC step after a *BUCKLE / *MODAL DYNAMIC step (ccx starts it "
+                              "from that step's displacements)")
         nl = params.get("NLGEOM", "")
         # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
         self._step_nlgeom = self._step_nlgeom or \
@@ -21040,32 +21056,35 @@ class Converter:
     def _plan_base_restore(self, blocks: List[Block]) -> None:
         """The general steps that follow a linear perturbation step, which _restore_base_states
         gives the base state again: ``_restore_from`` (step -> the last general step before
-        it, 0 for the model data) and, unless the step's own *BOUNDARY has OP=NEW (which
+        it, 0 for the model data), ``_restore_procs`` (-> the perturbation steps' procedures
+        in between) and, unless the step's own *BOUNDARY has OP=NEW (which
         removes the base state's BCs in Abaqus too), ``_restore_pairs`` (step -> the (node,
         DOF) pairs the base state's *BOUNDARY holds).  That *BOUNDARY needs OP=NEW where a
         perturbation step held a pair that neither the base state nor the step itself holds
         (``_restore_new``): a BC on a free DOF lasts in ccx until OP=NEW."""
         self._restore_from, self._restore_new, self._restore_pairs = {}, set(), {}
+        self._restore_procs = {}
         if not self._pert_idx:
             return
         model, groups = step_groups(blocks)
         state = {k for b in model if b.keyword == "BOUNDARY" for k in self._boundary_pairs(b)}
-        last, since, held = 0, False, set()     # held: what the perturbation steps since hold
+        last, since, held = 0, set(), set()     # the perturbation procedures since, what they hold
         for s, group in enumerate(groups, 1):
             cards = [b for b in group[1:] if b.keyword == "BOUNDARY" and id(b) not in self._lc_drop]
             pairs = {k for b in cards for k in self._boundary_pairs(b)}
             if s in self._pert_idx:
-                since, held = True, held | pairs
+                since |= {b.keyword for b in group[1:] if b.keyword in PROC_KW} or {""}
+                held |= pairs
                 continue
             new = [(b.param("OP") or "").strip().upper() == "NEW" for b in cards]
             if since:
-                self._restore_from[s] = last
+                self._restore_from[s], self._restore_procs[s] = last, since
                 if not any(new):
                     self._restore_pairs[s] = set(state)
                     if held - state - pairs:
                         self._restore_new.add(s)
             state = pairs if new[:1] == [True] else state | pairs
-            last, since, held = s, False, set()
+            last, since, held = s, set(), set()
 
     def _plan_op_new_rotations(self, blocks: List[Block]) -> None:
         """ccx 2.23 does not rebuild rotational BCs on shell/beam nodes after a later step's
