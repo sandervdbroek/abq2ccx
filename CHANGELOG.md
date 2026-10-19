@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **General steps after linear perturbation steps** — a step that follows a `*FREQUENCY`,
+  `*BUCKLE`, modal or steady-state dynamics or `*STEP, PERTURBATION` step starts from the last
+  general step's state, as in Abaqus. ccx 2.23 carried the perturbation step's loads and BC
+  changes on, zeroed prescribed BC values after `*FREQUENCY` and dropped earlier loads and
+  temperatures after `*BUCKLE` (cubes' next static step: 0.49 off), and forgot NLGEOM. Those
+  loads, BCs and temperatures are now given again at the step's start, without the loads it
+  gives itself, on a constant amplitude `ABQ2CCX_HOLD` (`*BOUNDARY, OP=NEW` where the
+  perturbation step held a free DOF), and NLGEOM is written again. A `*DYNAMIC` step after
+  `*BUCKLE` or `*MODAL DYNAMIC`, which ccx starts from that step's displacements, is flagged.
+  A `*BUCKLE` step's loads converted to nodal forces are written in full, as ccx drops the
+  earlier ones there (one repeating the static step's traction buckled under no load).
 * **Deformation plasticity in small-strain steps** — ccx 2.23 runs `*DEFORMATION PLASTICITY`
   under NLGEOM, in the logarithmic strain and the Cauchy stress, where Abaqus takes the small
   strain without NLGEOM: such steps are now flagged as reduced physics (a bar in tension strains
