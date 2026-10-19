@@ -3649,7 +3649,10 @@ class Converter:
         self._synth_counter = 0
         self._has_sensitivity = False
         self._freq_storage = False
+        self._initial_stresses = False
+        self._plain_freq_exact = True
         self._general_step_seen = False
+        self._base_nlgeom = False                   # NLGEOM in a general step so far
         self._step_proc: Optional[str] = None      # the procedure of the step being emitted
         self._buckle_loaded = False                 # a *BUCKLE step loaded by more than temperatures
         self._buckle_preloaded: Dict[int, bool] = {}   # *BUCKLE step -> a general step before it
@@ -7438,6 +7441,74 @@ class Converter:
         return name
 
     # -- step / load / bc handlers -----------------------------------------
+    # what a base state holds beside the preload's stresses and deformation, which ccx 2.23's
+    # plain *FREQUENCY leaves out and Abaqus keeps after a step without NLGEOM: the contact
+    # status, temperatures and fields (ccx: the initial ones; probed), the material's tangent
+    # or damaged moduli, removed elements (_prescan)
+    _BASE_STATE_CARDS = {"CONTACT PAIR", "CONTACT", "GAP", "TEMPERATURE", "FIELD",
+                         "USER DEFINED FIELD", "HYPERELASTIC", "HYPERFOAM", "HYPOELASTIC",
+                         "USER MATERIAL", "DAMAGE INITIATION", "CONCRETE DAMAGED PLASTICITY",
+                         "CONCRETE", "BRITTLE CRACKING", "MODEL CHANGE"}
+
+    def _frequency_perturbation(self, given: bool) -> bool:
+        """Whether a *FREQUENCY step gets *STEP, PERTURBATION (``given``: the deck's).  Abaqus
+        extracts frequencies about the base state with the preload's initial stress and load
+        stiffness only if the base state includes nonlinear geometry (NLGEOM in an earlier
+        general step), and never with initial stresses in a first step (Abaqus manual,
+        "Natural frequency extraction").  ccx 2.23 includes the base state (stresses, deformed
+        geometry, temperatures, contact) only with PERTURBATION, whatever the base step's
+        NLGEOM, and its plain *FREQUENCY is the unloaded model at its initial temperatures
+        (probed: a column under 0.37 of its buckling load, 16.87 Hz vs 20.95 Hz).  ccx's modal
+        and steady-state dynamics refuse an .eig file written by a perturbation frequency step
+        ('created with perturbation info')."""
+        if not self._general_step_seen:
+            if given and self._freq_storage:
+                self.report.note("*STEP, PERTURBATION dropped on the first *FREQUENCY step "
+                                 "(no preload before it, so nothing changes; ccx's modal / "
+                                 "steady-state dynamics step refuses perturbation "
+                                 "eigenmodes).", once=True)
+            elif given and self._initial_stresses:
+                self.report.note("*STEP, PERTURBATION dropped on a *FREQUENCY step with no general "
+                                 "step before it: Abaqus leaves initial stresses out there (only an "
+                                 "NLGEOM general step brings their stiffness in), ccx 2.23's "
+                                 "PERTURBATION would include them (probed).", once=True)
+            else:
+                return given
+            return False
+        if not self._base_nlgeom:
+            if given and self._plain_freq_exact:
+                self.report.note("*STEP, PERTURBATION dropped on a *FREQUENCY step after general "
+                                 "steps without NLGEOM: Abaqus then leaves the preload's stress "
+                                 "stiffness out, ccx 2.23's PERTURBATION would include it (probed); "
+                                 "nothing else in the deck's base state needs it.", once=True)
+                return False
+            if given:
+                self.report.warn("*FREQUENCY step with PERTURBATION after general steps without "
+                                 "NLGEOM: ccx 2.23 includes the preload's stress stiffness there, "
+                                 "which Abaqus leaves out; PERTURBATION is kept for the rest of the "
+                                 "base state (contact, temperatures, material state), which ccx's "
+                                 "plain step would lose.", once=True)
+                self._reduces("*FREQUENCY step after a linear preload: ccx adds its stress stiffness")
+        elif not given and not self._freq_storage:
+            self.report.note("*STEP, PERTURBATION written on a *FREQUENCY step after an NLGEOM "
+                             "general step: Abaqus includes the preload's stress stiffness there, "
+                             "ccx 2.23 only with PERTURBATION (probed: a column under 0.37 of its "
+                             "buckling load, 16.87 Hz vs 20.95 Hz without).", once=True)
+            return True
+        elif not given:
+            self.report.warn("*FREQUENCY step after an NLGEOM general step, whose eigenmodes a "
+                             "modal / steady-state dynamics step reads: Abaqus includes the "
+                             "preload's stress stiffness, ccx 2.23 only with PERTURBATION, which "
+                             "that step then refuses; left out.", once=True)
+            self._reduces("prestress of a *FREQUENCY step that modal / steady-state dynamics read")
+            return False
+        if given and self._freq_storage:
+            self.report.warn("*FREQUENCY step with PERTURBATION after a general step: "
+                             "ccx's later modal / steady-state dynamics step refuses "
+                             "these (prestressed) eigenmodes — drop PERTURBATION to "
+                             "run it without the prestress.", once=True)
+        return given
+
     def handle_step(self, group: List[Block]) -> List[str]:
         step_block = group[0]
         inner = group[1:]
@@ -7451,21 +7522,10 @@ class Converter:
             if k == "NAME":
                 continue
             if k == "PERTURBATION":
-                if proc == "FREQUENCY" and self._freq_storage:
-                    # ccx's modal / steady-state dynamics refuses an .eig file written by a
-                    # perturbation frequency step ('created with perturbation info')
-                    if self._general_step_seen:
+                if proc == "FREQUENCY":
+                    if self._frequency_perturbation(True):
                         params[k] = v
-                        self.report.warn("*FREQUENCY step with PERTURBATION after a general step: "
-                                         "ccx's later modal / steady-state dynamics step refuses "
-                                         "these (prestressed) eigenmodes — drop PERTURBATION to "
-                                         "run it without the prestress.", once=True)
-                    else:
-                        self.report.note("*STEP, PERTURBATION dropped on the first *FREQUENCY step "
-                                         "(no preload before it, so nothing changes; ccx's modal / "
-                                         "steady-state dynamics step refuses perturbation "
-                                         "eigenmodes).", once=True)
-                elif proc in ("FREQUENCY", "BUCKLE"):
+                elif proc == "BUCKLE":
                     params[k] = v
                 elif proc != "STATIC":
                     self.report.note(f"*STEP, PERTURBATION dropped on a *{proc} step (ccx reads it only "
@@ -7552,9 +7612,21 @@ class Converter:
                              "(probed: a column under a gravity preload, 6.11 vs 10.81).", once=True)
         if proc == "BUCKLE":
             self._buckle_preloaded[self._step_idx] = self._general_step_seen   # (_buckle_displacements)
+        if proc == "BUCKLE" and not self._general_step_seen and self._initial_stresses:
+            self.report.warn("*BUCKLE step with initial stresses and no general step before it: "
+                             "Abaqus buckles about them (the initial conditions are its base "
+                             "state), ccx 2.23 leaves them out there, with or without PERTURBATION "
+                             "(probed; after a general step it includes them).", once=True)
+            self._reduces("initial stresses left out of a *BUCKLE step's base state")
+        if proc == "FREQUENCY" and not step_block.has("PERTURBATION") and \
+                self._frequency_perturbation(False):
+            params["PERTURBATION"] = None
         if proc in ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO") and not step_block.has("PERTURBATION"):
             self._general_step_seen = True
+            # NLGEOM stays on once a step has it (Abaqus): the base state of the steps after
+            self._base_nlgeom = self._base_nlgeom or \
+                ("NLGEOM" in params and (params["NLGEOM"] or "YES").strip().upper() != "NO")
         if self._step_idx in self._restore_from:
             if self._step_nlgeom and "NLGEOM" not in params:
                 params["NLGEOM"] = None
@@ -15722,11 +15794,11 @@ class Converter:
           *BUCKLE card (probed: the column preloaded by that top displacement then buckles as
           when the preload is the reaction force, to 7 digits);
         * the step's own nonzero BC values are its buckling load: before any general step,
-          and without initial stresses, Abaqus buckles the unloaded model, so PERTURBATION is
-          dropped; after one, ccx has no form that keeps the preload: warned."""
+          where ccx 2.23's *BUCKLE leaves initial stresses out with or without PERTURBATION
+          (probed; handle_step warns), PERTURBATION is dropped; after one, ccx has no form
+          that keeps the preload: warned."""
         steps: List[dict] = []
         state: Dict[Tuple[str, int], Tuple[str, bool]] = {}    # (TARGET, DOF) -> (target, nonzero)
-        stressed = False
         insert: Dict[int, List[str]] = {}
         cur: Optional[dict] = None
         card: Optional[str] = None
@@ -15743,8 +15815,6 @@ class Converter:
                     steps.append(cur)
                     continue
                 if cur is None:
-                    stressed = stressed or (card == "INITIAL CONDITIONS" and (
-                        params.get("TYPE") or "").upper() in ("STRESS", "PLASTIC STRAIN"))
                     continue
                 if cur["proc"] is not None and cur["at"] is None:
                     cur["at"] = i                   # the first card after the procedure's
@@ -15805,7 +15875,7 @@ class Converter:
                                  once=True)
             if not st["valued"]:
                 continue
-            if not stressed and same and not self._buckle_preloaded.get(n, True):
+            if same and not self._buckle_preloaded.get(n, True):
                 st["params"].pop("PERTURBATION")
                 out[st["line"]] = emit_keyword("STEP", st["params"])
                 self.report.note("*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed "
@@ -15815,7 +15885,7 @@ class Converter:
                                  "(probed: factor 2.39 for 40.9); its plain *BUCKLE does.", once=True)
                 continue
             self.report.warn(f"*BUCKLE step {n} is loaded by a prescribed displacement on a preloaded "
-                             f"model (a general step or initial stresses before it): ccx 2.23 does "
+                             f"model (a general step before it): ccx 2.23 does "
                              f"not solve a *STEP, PERTURBATION *BUCKLE step for its prescribed "
                              f"displacements — only those nodes move, so the buckling load's "
                              f"stresses sit in the elements next to them (probed: factor 2.39 for "
@@ -18081,6 +18151,13 @@ class Converter:
         # steady-state dynamics step to read them ("cannot open eigenvalue file")
         self._freq_storage = any(b.keyword in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS",
                                                "COMPLEX FREQUENCY") for b in blocks)
+        # what a perturbation step's base state holds (_frequency_perturbation; a first
+        # *BUCKLE step: handle_step)
+        self._initial_stresses = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "STRESS"
+                                     for b in blocks)
+        self._plain_freq_exact = not any(
+            (b.keyword in self._BASE_STATE_CARDS and not (b.keyword == "CONTACT PAIR" and b.has("TIED")))
+            or (b.keyword in ("SPRING", "CONNECTOR ELASTICITY") and b.has("NONLINEAR")) for b in blocks)
         # *CYCLIC HARDENING is read by ccx only after a *PLASTIC, HARDENING=COMBINED of the
         # same material (one the converter does not comment out); Johnson-Cook *PLASTIC cards
         # whose material also has a *RATE DEPENDENT card

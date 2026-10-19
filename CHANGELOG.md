@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **Preloads in `*FREQUENCY` steps** — Abaqus includes a preload's stress stiffness in a
+  frequency step only when the base state has NLGEOM; ccx 2.23 includes the base state only
+  with `*STEP, PERTURBATION`, whatever the NLGEOM. A `*FREQUENCY` step after an NLGEOM general
+  step now gets `PERTURBATION` (a column under gravity: 20.74 Hz, before 25.02 as if unloaded),
+  and after general steps without NLGEOM loses it (25.02 Hz, before 20.74), unless contact,
+  temperatures or base-state-dependent material need it there (warned as reduced physics).
+  Where a modal or steady-state dynamics step reads the modes, which ccx refuses from a
+  perturbation step, the prestress is left out (warned). Initial stresses before a first
+  `*FREQUENCY` step drop its `PERTURBATION` (Abaqus leaves them out there); before a first
+  `*BUCKLE` step, where ccx leaves them out and Abaqus does not, they are warned as reduced
+  physics.
 * **`*EL FILE` output that stopped or crashed ccx 2.23** — in a model with U1 beams, ccx stops
   writing `ENER` or `SDV` to the .frd ("only coded for fields with 6 entries"), even in a
   linear static step, so `*OUTPUT, FIELD, VARIABLE=ALL` never ran there. In a model with state

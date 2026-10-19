@@ -5151,10 +5151,11 @@ def test_general_step_after_perturbation_gets_the_base_state():
                                                "*Temperature\nALL, 100.\n").format("", ""))
     assert "HOLD" not in body and "steps do not match" in rep.text() and conv.reduced_physics
     # Abaqus keeps NLGEOM on; ccx 2.23 forgets it after a *FREQUENCY step (probed: the next
-    # static step ran linear), so it is written there
+    # static step ran linear), so it is written there (the *FREQUENCY step after NLGEOM gets
+    # PERTURBATION: test_frequency_prestress_follows_the_base_steps_nlgeom)
     body, conv, rep = convert_str(PERT.replace("*Step\n*Static\n*Cload", "*Step, nlgeom\n*Static\n*Cload")
                                   .format("", ""))
-    assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == [", NLGEOM", "", ", NLGEOM"]
+    assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == [", NLGEOM", ", PERTURBATION", ", NLGEOM"]
     assert "ccx 2.23 forgets it after a *FREQUENCY" in rep.text() and not conv.reduced_physics
     # a *DYNAMIC step after a *BUCKLE: ccx starts it from the buckle step's displacements
     deck = PERT.replace("*Frequency\n3\n", "*Buckle\n2\n").rsplit("*Static\n", 1)
@@ -5395,6 +5396,54 @@ def test_buckle_after_a_general_step_gets_perturbation():
     # first, or after perturbation steps only: no preload, left as it is
     body, _, rep = convert_str(BUCKLE_CUBE + _deck_step("Frequency\n3") + buckle)
     assert "PERTURBATION" not in body and "PERTURBATION written" not in rep.text()
+    # initial stresses as its only preload: Abaqus buckles about them, ccx 2.23 leaves them out
+    # in a first *BUCKLE step with or without PERTURBATION (probed; after a general step it
+    # includes them)
+    stress = "*Initial Conditions, type=stress\nEALL, 0., 0., -1., 0., 0., 0.\n"
+    _, conv, rep = convert_str(BUCKLE_CUBE + stress + buckle)
+    assert "ccx 2.23 leaves them out there" in rep.text() and conv.reduced_physics
+    _, conv, rep = convert_str(BUCKLE_CUBE + stress + _deck_step("Static") + buckle)
+    assert "leaves them out" not in rep.text() and not conv.reduced_physics
+
+
+def test_frequency_prestress_follows_the_base_steps_nlgeom():
+    # Abaqus extracts frequencies with the preload's stress stiffness only if the base state
+    # includes NLGEOM, never with initial stresses in a first step; ccx 2.23 includes the base
+    # state only with *STEP, PERTURBATION, whatever the earlier steps' NLGEOM (probed: a
+    # column under 0.37 of its buckling load, 16.87 Hz vs 20.95 Hz); its modal / steady-state
+    # dynamics refuse perturbation eigenmodes
+    load, modal = "*Cload\n7, 3, -1.\n", _deck_step("Modal Dynamic\n0.1, 1.")
+
+    def heads(pre, freq="", after="", head="", model=BUCKLE_CUBE):
+        body, conv, rep = convert_str(model + pre + _deck_step("Frequency\n3", freq, head) + after)
+        return [s.split("\n")[0] for s in body.split("*STEP")[1:]], conv.reduced_physics, rep.text()
+
+    nl, lin = _deck_step("Static", load, ", nlgeom"), _deck_step("Static", load)
+    got, red, rep = heads(nl)
+    assert got == [", NLGEOM", ", PERTURBATION"] and not red
+    assert "PERTURBATION written on a *FREQUENCY step after an NLGEOM" in rep
+    assert heads(nl, head=", perturbation")[:2] == ([", NLGEOM", ", PERTURBATION"], [])
+    # NLGEOM stays on once a step has it
+    assert heads(nl + lin)[0] == [", NLGEOM", "", ", PERTURBATION"]
+    # without NLGEOM: no prestress in Abaqus, so ccx's PERTURBATION goes
+    got, red, rep = heads(lin, head=", perturbation")
+    assert got == ["", ""] and not red and "dropped on a *FREQUENCY step after general" in rep
+    assert heads(lin)[:2] == (["", ""], [])
+    # ... unless the base state holds more that only PERTURBATION brings along (here its
+    # temperatures, which ccx's plain step resets to the initial ones): warned
+    got, red, rep = heads(_deck_step("Static", load + "*Temperature\nALL, 50.\n"), head=", perturbation")
+    assert got == ["", ", PERTURBATION"] and red and "ccx 2.23 includes the preload's stress" in rep
+    # a modal dynamics step reads the eigenmodes: the deck's PERTURBATION kept (ccx then
+    # refuses them, warned as before); none written, the prestress left out
+    got, red, rep = heads(nl, after=modal)
+    assert got == [", NLGEOM", "", ""] and red and "that step then refuses; left out" in rep
+    got, red, rep = heads(nl, after=modal, head=", perturbation")
+    assert got == [", NLGEOM", ", PERTURBATION", ""] and not red and "refuses these" in rep
+    # a first step: initial stresses are left out in Abaqus, ccx's PERTURBATION would add them
+    stress = BUCKLE_CUBE + "*Initial Conditions, type=stress\nEALL, 0., 0., -1., 0., 0., 0.\n"
+    got, red, rep = heads("", head=", perturbation", model=stress)
+    assert got == [""] and not red and "Abaqus leaves initial stresses out there" in rep
+    assert heads("", head=", perturbation")[:2] == ([", PERTURBATION"], [])
 
 
 def test_buckle_perturbation_prescribed_displacements():
@@ -5408,15 +5457,18 @@ def test_buckle_perturbation_prescribed_displacements():
     assert "*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed displacement" in rep.text()
     body, _, _ = convert_str(BUCKLE_CUBE + _deck_step("Frequency\n3") + buckle)
     assert "PERTURBATION" not in body
-    # after a general step (or on initial stresses) no ccx form keeps the preload
+    # after a general step no ccx form keeps the preload
     body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", cload) + buckle)
     assert body.count("*STEP, PERTURBATION\n*BUCKLE") == 1
     assert conv.reduced_physics == ["*BUCKLE step 2 loaded by a prescribed displacement after a "
                                     "preload (ccx does not solve for it)"]
     assert "*BUCKLE step 2 is loaded by a prescribed displacement on a preloaded model" in rep.text()
+    # initial stresses before it: ccx's *BUCKLE leaves them out there anyway (probed), so the
+    # plain step solves the displacement and only they are lost
     ic = "*Initial Conditions, type=stress\nEALL, 1., 0., 0., 0., 0., 0.\n"
     body, conv, _ = convert_str(BUCKLE_CUBE + ic + buckle)
-    assert "*STEP, PERTURBATION\n*BUCKLE" in body and len(conv.reduced_physics) == 1
+    assert "*STEP\n*BUCKLE" in body
+    assert conv.reduced_physics == ["initial stresses left out of a *BUCKLE step's base state"]
     # a value held on from the base state is no load: given again at 0, first in the step
     pre = _deck_step("Static", disp)
     body, conv, rep = convert_str(BUCKLE_CUBE + pre + _deck_step("Buckle\n2", cload, ", perturbation") +

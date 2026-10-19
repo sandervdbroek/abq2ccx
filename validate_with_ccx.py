@@ -2467,6 +2467,16 @@ def buckle_displacement_deck(case, force=0.0, d=-1e-4, n=2, m=20):
     return "\n".join(lines + ["*End Step"]) + "\n"
 
 
+def frequency_preload_deck(nlgeom=False, pert=False, preload="grav"):
+    """buckle_gravity_deck's column under ``preload`` in a static step (``nlgeom``: with
+    NLGEOM), then a *FREQUENCY step for 4 modes, ``pert``: on a *STEP, PERTURBATION."""
+    deck = buckle_gravity_deck(preload, buckle=False)
+    if nlgeom:
+        deck = deck.replace("*STEP\n*STATIC", "*STEP, NLGEOM\n*STATIC")
+    return deck + "\n".join(["*STEP, PERTURBATION" if pert else "*STEP", "*FREQUENCY", "4",
+                             "*END STEP"]) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -5483,6 +5493,21 @@ def main():
               f"static step pulling its top sideways): factor {both[0][0]:.7g} ({lam[0]:.7g} "
               f"without the static step), top displacement as in a static-only run ({err:.1e} "
               f"apart)")
+    failures += 0 if ok else 1
+    # Abaqus' frequencies include the preload's stress stiffness only after NLGEOM; ccx 2.23's
+    # only with PERTURBATION, whatever the earlier steps' NLGEOM
+    f = [review_run(frequency_preload_deck(nl, pert, p), "frequency_preload_" + tag,
+                    lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+         for nl, pert, p, tag in ((True, False, "grav", "nlgeom"), (True, True, "grav", "nlgeom_pert"),
+                                  (False, True, "grav", "linear_pert"), (False, False, "", "none"))]
+    ok = all(f)
+    if ok:
+        err = max(abs(f[0][0] / f[1][0] - 1), abs(f[2][0] / f[3][0] - 1))
+        ok = err < 1e-9 and f[0][0] < 0.9 * f[3][0]
+        print(f"{'PASS' if ok else 'FAIL'}  frequency_preload (the column under gravity in a static "
+              f"step, then a *FREQUENCY step): with NLGEOM, a plain *STEP {f[0][0]:.7g} vs "
+              f"{f[1][0]:.7g} written with PERTURBATION; without NLGEOM, PERTURBATION {f[2][0]:.7g} "
+              f"vs {f[3][0]:.7g} unloaded (max {err:.1e} apart)")
     failures += 0 if ok else 1
 
     # *BUCKLE loaded by a prescribed displacement: ccx 2.23 does not solve a *STEP, PERTURBATION
