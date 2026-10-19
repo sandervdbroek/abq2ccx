@@ -7102,6 +7102,8 @@ def test_plane_and_axisymmetric_rigid_segments():
     rot = conv._rb_rot[9]
     holds = f"*BOUNDARY\n9, 3, 3\n{rot}, 1, 2\n"
     assert body.count(holds) == 2                                  # model data + after OP=NEW
+    # REFNODE= (no blank) is the same parameter: the same deck (it lost the holds)
+    assert convert_str(plane.replace("REF NODE=9", "REFNODE=9"))[0] == body
     m = re.search(r"\*RIGID BODY, REF NODE=9, NSET=([^,\s]+)", body)
     assert {11, 12} <= set(g.nset(m.group(1)))                     # the segment's own nodes too
     # RAX2 in an axisymmetric model: the +/-1 degree sector ccx expands CAX elements to

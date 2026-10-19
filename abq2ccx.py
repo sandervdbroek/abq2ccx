@@ -13497,7 +13497,7 @@ class Converter:
                     if rigid[e][0] != "RB3D2":
                         need[e].update(sides)
                 entries.append((b, k, rid, [e for e in eids if e not in rigid], sides))
-        refs = {self._first_node(b.param("REF NODE") or "") for b in bodies} - {None}
+        refs = {self._ref_node(b) for b in bodies} - {None}
         self._plan_skin_elements(blocks, rigid, need, shift, refs)
         for b, k, rid, rest, sides in entries:
             lines: List[str] = []
@@ -14031,7 +14031,7 @@ class Converter:
         members_of.setdefault(id(body), []).extend(
             n for e in new_elems for n in self.geom.elements[e][1])
         if typ == "SEGMENTS":
-            ref = self._first_node(body.param("REF NODE") or "")
+            ref = self._ref_node(body)
             if ref is not None:
                 self._rigid_planar_refs.append(ref)
         what = ("a plane" if typ == "SEGMENTS" and not axisym else "an axisymmetric"
@@ -14357,7 +14357,7 @@ class Converter:
                     nodes.extend(self.geom.nset(v))
             name = self._rigid_set_name("ABQ2CCX_RBN")
             self._rigid_own_sets.add(name)
-            ref = self._first_node(b.param("REF NODE") or "")
+            ref = self._ref_node(b)
             self.geom.nsets[name] = [n for n in dedup(nodes) if n in self.geom.nodes and n != ref]
             params: "OrderedDict[str, Optional[str]]" = OrderedDict()
             for k, v in b.params.items():
@@ -14378,7 +14378,7 @@ class Converter:
             b.params = params
             b.data = []
             if any(e in planar for e in elems):
-                ref = self._first_node(b.param("REF NODE") or "")
+                ref = self._ref_node(b)
                 if ref is not None:
                     self._rigid_planar_refs.append(ref)
 
@@ -14419,7 +14419,7 @@ class Converter:
         for b in blocks:
             if b.keyword != "RIGID BODY" or b.param("ANALYTICAL SURFACE"):
                 continue                # an unmeshed analytical surface: commented out
-            ref = self._first_node(b.param("REF NODE") or "")
+            ref = self._ref_node(b)
             tie, pin = self._rigid_body_members(b)
             for n in [ref] + tie + pin:
                 if n is not None:
@@ -14448,7 +14448,7 @@ class Converter:
         nid, eid = self._next_ids()
         for items in per_body.values():
             body = items[0][0]
-            ref = self._first_node(body.param("REF NODE") or "")
+            ref = self._ref_node(body)
             tensor = [[0.0] * 3 for _ in range(3)]
             ok = True
             for _, e in items:
@@ -18959,6 +18959,11 @@ class Converter:
     def _first_node(self, token: str) -> Optional[int]:
         nodes = self._resolve_nodes(token.strip()) if token.strip() else []
         return nodes[0] if nodes else None
+
+    def _ref_node(self, b: Block) -> Optional[int]:
+        """The reference node of a *RIGID BODY: REF NODE= or its blank-free spelling REFNODE=
+        (Abaqus ignores blanks in parameter names; handle_rigid_body writes it as REF NODE)."""
+        return self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
 
     def _rigid_body_members(self, b: Block) -> Tuple[List[int], List[int]]:
         """(tie, pin) members of an Abaqus *RIGID BODY: TIE NSET and ELSET nodes move with
