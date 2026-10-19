@@ -12038,22 +12038,29 @@ class Converter:
             else:
                 self.report.note(f"*AMPLITUDE parameter {k} dropped.", once=True)
 
-        def scaled(pairs: List[str]) -> List[str]:
-            """Apply SCALEX/SCALEY to 'time, amplitude' lines (Abaqus scales, then shifts —
-            SHIFTX/SHIFTY stay on the card for ccx to apply)."""
+        def pairs_text(pts: List[Tuple[float, float]], per_line: int) -> List[str]:
+            """'time, amplitude' lines of ``pts``, ``per_line`` pairs a line, after SCALEX /
+            SCALEY (Abaqus scales, then shifts — SHIFTX/SHIFTY stay on the card for ccx to
+            apply).  12 digits: ccx reads 20 characters, and 6 merged distinct times (1e-4
+            apart at t = 100)."""
+            if scale != [1.0, 1.0]:
+                self.report.note("*AMPLITUDE SCALEX/SCALEY applied to the data points (ccx has no "
+                                 "such parameters).", once=True)
+                pts = [(t * scale[0], a * scale[1]) for t, a in pts]
+            items = [f"{t:.12g}, {a:.12g}" for t, a in pts]
+            return [", ".join(items[i:i + per_line]) for i in range(0, len(items), per_line)]
+
+        def scaled(lines: List[str]) -> List[str]:
+            """The deck's own 'time, amplitude' lines, rewritten only where SCALEX/SCALEY apply."""
             if scale == [1.0, 1.0]:
-                return pairs
+                return lines
             try:
-                vals = [pf(x) for ln in pairs for x in ln.split(",") if x.strip()]
+                vals = [pf(x) for ln in lines for x in ln.split(",") if x.strip()]
             except ValueError:
                 self.report.warn("*AMPLITUDE SCALEX/SCALEY could not be applied (non-numeric "
                                  "data); amplitude left unscaled — verify.", once=True)
-                return pairs
-            self.report.note("*AMPLITUDE SCALEX/SCALEY applied to the data points (ccx has no "
-                             "such parameters).", once=True)
-            pts = [f"{vals[i] * scale[0]:.6g}, {vals[i + 1] * scale[1]:.6g}"
-                   for i in range(0, len(vals) - 1, 2)]
-            return [", ".join(pts[i:i + 4]) for i in range(0, len(pts), 4)]
+                return lines
+            return pairs_text([(vals[i], vals[i + 1]) for i in range(0, len(vals) - 1, 2)], 4)
 
         if definition == "SMOOTH STEP":
             sampled = self._smooth_step_to_tabular(b)
@@ -12061,7 +12068,7 @@ class Converter:
                 self.report.note("*AMPLITUDE DEFINITION=SMOOTH STEP sampled into tabular points, "
                                  "100 per interval (ccx has no smooth step): the table follows the "
                                  "quintic ramp to 7.2e-5 of each step's change.", once=True)
-                return [emit_keyword("AMPLITUDE", keep)] + scaled(sampled)
+                return [emit_keyword("AMPLITUDE", keep)] + pairs_text(sampled, 1)
             self.report.warn("*AMPLITUDE DEFINITION=SMOOTH STEP could not be parsed; emitted as "
                              "TABULAR (linear between points) — verify.", once=True)
             self._reduces("*AMPLITUDE, SMOOTH STEP read as TABULAR")
@@ -12077,7 +12084,7 @@ class Converter:
                     self.report.note("*AMPLITUDE DEFINITION=EQUALLY SPACED expanded to explicit "
                                      "time/amplitude pairs.", once=True)
                     return [emit_keyword("AMPLITUDE", keep)] + \
-                           scaled([f"{begin + i * fixed:.6g}, {a:.6g}" for i, a in enumerate(vals)])
+                           pairs_text([(begin + i * fixed, a) for i, a in enumerate(vals)], 1)
             return self._commented(b, "*AMPLITUDE DEFINITION=EQUALLY SPACED could not be expanded "
                                       "(missing/invalid FIXED INTERVAL or data); rebuild as TABULAR.", reduces=False)
         elif definition == "USER":
@@ -12152,7 +12159,7 @@ class Converter:
         pairs = [f"{t:.9g}, {a:.9g}" for t, a in pts]
         return [", ".join(pairs[i:i + 4]) for i in range(0, len(pairs), 4)]
 
-    def _smooth_step_to_tabular(self, b: Block) -> Optional[List[str]]:
+    def _smooth_step_to_tabular(self, b: Block) -> Optional[List[Tuple[float, float]]]:
         """Sample Abaqus' SMOOTH STEP quintic (a = A0 + (A1-A0)*x^3*(10-15x+6x^2)) into
         tabular time/amplitude pairs ccx can use.  Returns None if the data is unparsable."""
         pts: List[Tuple[float, float]] = []
@@ -12166,7 +12173,7 @@ class Converter:
             return None
         if len(pts) < 2:
             return None
-        out: List[str] = [f"{pts[0][0]:.6g}, {pts[0][1]:.6g}"]
+        out = [pts[0]]
         N = 100                     # samples per interval: within 7.2e-5 of the quintic's step
         for (t0, a0), (t1, a1) in zip(pts, pts[1:]):
             if t1 <= t0:
@@ -12174,7 +12181,7 @@ class Converter:
             for k in range(1, N + 1):
                 x = k / N
                 a = a0 + (a1 - a0) * x**3 * (10.0 - 15.0 * x + 6.0 * x * x)
-                out.append(f"{t0 + (t1 - t0) * x:.6g}, {a:.6g}")
+                out.append((t0 + (t1 - t0) * x, a))
         return out
 
     def handle_friction(self, b: Block) -> List[str]:

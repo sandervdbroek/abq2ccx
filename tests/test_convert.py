@@ -2670,6 +2670,19 @@ def test_amplitude_scaling_applied():
     assert "VALUE=ABSOLUTE" in rep.text()
 
 
+def test_amplitude_times_close_together_stay_apart():
+    # written to 6 digits, the points 1e-4 apart from BEGIN=100 fell on t = 100, and a SMOOTH
+    # STEP from 10 to 10.001 became one jump (validate_with_ccx.py amplitude_close_times)
+    body, _, _ = convert_str("*Amplitude, name=EQ, definition=EQUALLY SPACED, fixed interval=1e-4, "
+                             "begin=100.\n0., 0.5, 1.\n*Amplitude, name=SS, definition=SMOOTH STEP\n"
+                             "10., 0., 10.001, 1.\n*Amplitude, name=TAB, scalex=1.0000001\n"
+                             "0., 0., 1., 0.1234567891\n")
+    assert _amplitude(body, "EQ") == [(100.0, 0.0), (100.0001, 0.5), (100.0002, 1.0)]
+    ss = _amplitude(body, "SS")
+    assert len({t for t, _ in ss}) == 101 and ss[50] == (10.0005, 0.5) and ss[-1] == (10.001, 1.0)
+    assert _amplitude(body, "TAB") == [(0.0, 0.0), (1.0000001, 0.1234567891)]
+
+
 def test_kinematic_coupling_keeps_every_line():
     body, _, _ = convert_str(HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6\n"
                              "*Kinematic Coupling, ref node=100\nTOP, 1, 1\n7, 3, 3\n")

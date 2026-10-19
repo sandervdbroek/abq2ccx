@@ -1797,6 +1797,9 @@ CUBE8 = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 
          "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
          "1, 1, 2, 3, 4, 5, 6, 7, 8\n*NSET, NSET=TOP\n5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n"
          "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n")
+# a cube held at its bottom without restraining its lateral contraction
+CUBE8_HELD = "*BOUNDARY\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+
 
 def planar_coupled_tip_deck(coupled=True, n=10):
     """A B21 cantilever (length 1000, RECT 20 x 40) loaded at its tip, or through a reference
@@ -1823,6 +1826,18 @@ def coupled_velocity_deck():
             "1e-3\n*KINEMATIC COUPLING, REF NODE=100\nTOP, 1, 3\n*STEP\n*DYNAMIC\n0.01, 1.\n"
             "*BOUNDARY\nBOT, 1, 3\n*BOUNDARY, TYPE=VELOCITY\n100, 1, 1, 2.\n100, 4, 6, 0.\n"
             "*BOUNDARY, TYPE=VELOCITY\nTOP, 1, 1, 2.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def amplitude_close_times_deck(definition="EQUALLY SPACED"):
+    """A C3D8 cube (E 1e6) pulled by 1 through an amplitude that rises from total time 100 to
+    100.0002 — EQUALLY SPACED points 1e-4 apart, or a SMOOTH STEP — over a step of 100 and
+    four fixed increments of an NLGEOM step (ccx runs a linear static step in one increment)."""
+    amp = ("*AMPLITUDE, NAME=A, TIME=TOTAL TIME, DEFINITION=EQUALLY SPACED, FIXED INTERVAL=0.0001, "
+           "BEGIN=100.\n0., 0.5, 1.\n" if definition == "EQUALLY SPACED" else
+           "*AMPLITUDE, NAME=A, TIME=TOTAL TIME, DEFINITION=SMOOTH STEP\n100., 0., 100.0002, 1.\n")
+    return (CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1e6, 0.\n" + amp + CUBE8_HELD +
+            "*STEP\n*STATIC\n100., 100.\n*CLOAD, AMPLITUDE=A\nTOP, 3, 0.25\n*END STEP\n"
+            "*STEP, NLGEOM\n*STATIC, DIRECT\n0.00005, 0.0002\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
 def main():
@@ -4355,6 +4370,23 @@ def main():
               f"{', '.join(f'{x:.7g}' for x in got)} after time 1 (2; the card as written stops ccx: "
               f"'dependent side of a MPC and a SPC')")
     failures += 0 if u and ok else 1
+    # amplitude points 1e-4 apart at total time 100 (written to 6 digits, they fell on t = 100)
+    for definition, want in (("EQUALLY SPACED", (0.25, 0.5, 0.75, 1.0)),
+                             ("SMOOTH STEP", (0.103515625, 0.5, 0.896484375, 1.0))):
+        tag = "amplitude_close_times_" + definition.split()[0].lower()
+        hist = review_run(amplitude_close_times_deck(definition), tag,
+                          lambda dat: dat_displacement_history(dat, 5))
+        ok = bool(hist) and len(hist) == 4
+        if ok:
+            got = [h[2] / hist[-1][2] for h in hist]
+            ok = max(abs(g - w) for g, w in zip(got, want)) < 1e-5
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a cube pulled through *AMPLITUDE, DEFINITION="
+                  f"{definition}, rising from total time 100 to 100.0002): displacement after each "
+                  f"fixed increment {', '.join(f'{g:.6g}' for g in got)} of the last (the amplitude: "
+                  f"{', '.join(f'{w:g}' for w in want)}; the full load at each with the times merged)")
+        elif hist:
+            print(f"FAIL  {tag}: {len(hist)} increments printed, not 4")
+        failures += 0 if ok else 1
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")
