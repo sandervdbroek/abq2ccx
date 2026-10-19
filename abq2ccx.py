@@ -3607,7 +3607,6 @@ class Converter:
         # masses go out divided by it, specific heats and GRAV / CENTRIF magnitudes
         # multiplied by it (_plan_coupled_inertia); None: as in the deck
         self._mass_scale: Optional[float] = None
-        self._expansion_material: Dict[int, str] = {}   # id(*EXPANSION) -> its material's name
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
         self._rb_rot_synth: Dict[int, int] = {}    # ... where the converter created the ROT NODE
@@ -4579,7 +4578,7 @@ class Converter:
             lines[i] = ", ".join(f).rstrip()
             halved = True
         if halved:
-            mat = self._expansion_material.get(id(b), "?")
+            mat = self._card_material.get(id(b)) or "?"
             self.report.note(f"Material {mat}: the shear coefficients alpha12, alpha13, alpha23 of "
                              f"its *EXPANSION, TYPE=ANISO halved — Abaqus gives them as engineering "
                              f"shear strain per degree (gamma12 = alpha12 dT, the shear measure of "
@@ -4592,29 +4591,17 @@ class Converter:
         and Johnson-Cook; any other card is silently skipped (verified: HARDENING=USER runs
         purely elastic without a word).  Johnson-Cook gets the *RATE DEPENDENT card ccx
         needs to switch it on; user / parametric (Chaboche) forms are commented out."""
+        why = self._plastic_problem(b)
+        if why is not None:
+            return self._commented(b, why)
         hard = (b.param("HARDENING") or "ISOTROPIC").strip().upper()
         hard_n = hard.replace(" ", "").replace("-", "")
-        if hard_n == "USER":
-            return self._commented(b, "*PLASTIC, HARDENING=USER needs an Abaqus UHARD/VUHARD "
-                                      "subroutine, which ccx does not have — ccx would silently "
-                                      "skip the card. Commented out: the material now runs purely "
-                                      "elastic; supply a tabulated *PLASTIC curve instead.")
         if hard_n == "JOHNSONCOOK":
             # ccx has Johnson-Cook natively (A, B, n, m, T_melt, T_transition, as in Abaqus),
             # but activates it only together with *RATE DEPENDENT, TYPE=JOHNSON COOK — alone,
             # the card silently leaves the material elastic (verified on 2.23).  Abaqus
             # without *RATE DEPENDENT is rate-independent, i.e. C = 0.
-            vals = [x.strip() for x in (b.data[0].split(",") if b.data else [])]
-            while vals and vals[-1] == "":
-                vals.pop()
-            try:
-                nums = [pf(x) if x else 0.0 for x in vals]
-            except ValueError:
-                nums = []
-            if len(nums) < 3:
-                return self._commented(b, "*PLASTIC, HARDENING=JOHNSON COOK: data line could not "
-                                          "be parsed (need A, B, n, m); commented out — the "
-                                          "material now runs elastic.")
+            vals, nums = self._johnson_cook_values(b)
             if len(nums) < 4 or nums[3] <= 0.0:
                 vals = (vals + [""] * 4)[:max(4, len(vals))]
                 vals[3] = "1."
@@ -4630,15 +4617,6 @@ class Converter:
                                  "(C = 0) was added — as in Abaqus without *RATE DEPENDENT.",
                                  once=True)
             return out
-        if (b.param("DATATYPE") or "").strip().upper().startswith("PARAM"):
-            return self._commented(b, "*PLASTIC, DATATYPE=PARAMETERS (Chaboche back-stress "
-                                      "parameters) has no ccx equivalent — ccx would read them as "
-                                      "one stress/strain point. Commented out: the material now "
-                                      "runs elastic; tabulate the hardening curve instead.")
-        if hard_n not in ("ISOTROPIC", "KINEMATIC", "COMBINED"):
-            return self._commented(b, f"*PLASTIC, HARDENING={hard} is not a ccx hardening law "
-                                      f"(ISOTROPIC, KINEMATIC, COMBINED) — ccx would silently skip "
-                                      f"the card. Commented out: the material now runs elastic.")
         if hard_n == "COMBINED":
             self.report.warn("*PLASTIC, HARDENING=COMBINED: Abaqus fits a nonlinear-kinematic "
                              "(Chaboche) model to these data, while ccx reads the table as its own "
@@ -5047,6 +5025,9 @@ class Converter:
                              "default; ccx requires it explicitly).", once=True)
         return [emit_keyword("HYPERELASTIC", params)] + list(b.data)
 
+    # --approximate: a Poisson's ratio of 0.5 or more, which ccx rejects, becomes this
+    _NU_CLAMP = 0.475
+
     def handle_elastic(self, b: Block) -> List[str]:
         typ = " ".join((b.param("TYPE") or "ISO").split()).upper()
         if typ == "LAMINA":
@@ -5113,16 +5094,17 @@ class Converter:
                 if len(f) >= 2 and f[1]:            # blanks are positional: a blank nu is 0
                     try:
                         if pf(f[1]) >= 0.5:
-                            f[1] = "0.475"
+                            f[1] = str(self._NU_CLAMP)
                             clamped = True
                     except ValueError:
                         pass
                 if any(f):
                     newdata.append(", ".join(f))
             if clamped:
-                self.report.warn("[APPROX] *ELASTIC Poisson ratio >= 0.5 clamped to 0.475 (ccx "
-                                 "rejects incompressible nu; slight compressibility introduced — "
-                                 "use *HYPERELASTIC for true incompressibility). Verify.", once=True)
+                self.report.warn(f"[APPROX] *ELASTIC Poisson ratio >= 0.5 clamped to {self._NU_CLAMP} "
+                                 f"(ccx rejects incompressible nu; slight compressibility "
+                                 f"introduced — use *HYPERELASTIC for true incompressibility). "
+                                 f"Verify.", once=True)
                 data = newdata
         return self._fit_elastic_to_expansion(b, cc, [emit_keyword("ELASTIC", params)] + data)
 
@@ -5268,19 +5250,42 @@ class Converter:
 
     @staticmethod
     def _plastic_kept(b: Block) -> bool:
-        """Whether handle_plastic emits this *PLASTIC card rather than commenting it out
-        (user, parametric or unknown hardening, unreadable Johnson-Cook data)."""
-        hard = (b.param("HARDENING") or "ISOTROPIC").strip().upper().replace(" ", "").replace("-", "")
-        if hard == "JOHNSONCOOK":
-            vals = [x.strip() for x in (b.data[0].split(",") if b.data else [])]
-            while vals and vals[-1] == "":
-                vals.pop()
-            try:
-                return len([pf(x) if x else 0.0 for x in vals]) >= 3
-            except ValueError:
-                return False
-        return hard in ("ISOTROPIC", "KINEMATIC", "COMBINED") and \
-            not (b.param("DATATYPE") or "").strip().upper().startswith("PARAM")
+        """Whether handle_plastic emits this *PLASTIC card rather than commenting it out."""
+        return Converter._plastic_problem(b) is None
+
+    @staticmethod
+    def _plastic_problem(b: Block) -> Optional[str]:
+        """Why handle_plastic comments *PLASTIC card ``b`` out (user, parametric or unknown
+        hardening, unreadable Johnson-Cook data), or None: it is emitted."""
+        hard = (b.param("HARDENING") or "ISOTROPIC").strip().upper()
+        hard_n = hard.replace(" ", "").replace("-", "")
+        if hard_n == "USER":
+            return ("*PLASTIC, HARDENING=USER needs an Abaqus UHARD/VUHARD subroutine, which ccx "
+                    "does not have — ccx would silently skip the card. Commented out: the "
+                    "material now runs purely elastic; supply a tabulated *PLASTIC curve instead.")
+        if hard_n == "JOHNSONCOOK":
+            return None if len(Converter._johnson_cook_values(b)[1]) >= 3 else (
+                "*PLASTIC, HARDENING=JOHNSON COOK: data line could not be parsed (need A, B, n, "
+                "m); commented out — the material now runs elastic.")
+        if (b.param("DATATYPE") or "").strip().upper().startswith("PARAM"):
+            return ("*PLASTIC, DATATYPE=PARAMETERS (Chaboche back-stress parameters) has no ccx "
+                    "equivalent — ccx would read them as one stress/strain point. Commented out: "
+                    "the material now runs elastic; tabulate the hardening curve instead.")
+        if hard_n not in ("ISOTROPIC", "KINEMATIC", "COMBINED"):
+            return (f"*PLASTIC, HARDENING={hard} is not a ccx hardening law (ISOTROPIC, "
+                    f"KINEMATIC, COMBINED) — ccx would silently skip the card. Commented out: the "
+                    f"material now runs elastic.")
+        return None
+
+    @staticmethod
+    def _johnson_cook_values(b: Block) -> Tuple[List[str], List[float]]:
+        """The fields of a Johnson-Cook *PLASTIC's data line (trailing blanks dropped) and
+        their values (a blank one 0); no values when a field is not a number."""
+        vals = trimmed_fields(b.data[0].split(",") if b.data else [])
+        try:
+            return vals, [pf(x) if x else 0.0 for x in vals]
+        except ValueError:
+            return vals, []
 
     def _fit_elastic_to_expansion(self, b: Block, cc: str, out: List[str]) -> List[str]:
         """The emitted *ELASTIC card ``out`` (ccx type ``cc``) in the form ccx 2.23 needs beside
@@ -16957,29 +16962,21 @@ class Converter:
         self._freq_storage = any(b.keyword in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS",
                                                "COMPLEX FREQUENCY") for b in blocks)
         # *CYCLIC HARDENING is read by ccx only after a *PLASTIC, HARDENING=COMBINED of the
-        # same material (one the converter does not comment out)
-        self._cyclic_ok = set()
-        combined = False
-        for b in blocks:
-            if b.keyword == "MATERIAL":
-                combined = False
-            elif b.keyword == "PLASTIC":
-                combined = ((b.param("HARDENING") or "").upper() == "COMBINED" and
-                            not (b.param("DATATYPE") or "").upper().startswith("PARAM"))
-            elif b.keyword == "CYCLIC HARDENING" and combined:
-                self._cyclic_ok.add(id(b))
-        # the material each *EXPANSION card belongs to (named in handle_dependent_material's
-        # notes); a gasket or connector behavior's expansion has none
-        self._expansion_material = {}
-        mat = "?"
-        for b in blocks:
-            if b.keyword == "MATERIAL":
-                mat = (b.param("NAME") or "?").strip()
-            elif b.keyword in ("STEP", "GASKET BEHAVIOR", "CONNECTOR BEHAVIOR") or \
-                    b.keyword.endswith("SECTION"):
-                mat = "?"
-            elif b.keyword == "EXPANSION":
-                self._expansion_material[id(b)] = mat
+        # same material (one the converter does not comment out); Johnson-Cook *PLASTIC cards
+        # whose material also has a *RATE DEPENDENT card
+        self._cyclic_ok, self._jc_with_rate = set(), set()
+        for group in self._material_groups(blocks):
+            combined, jc_block = False, None
+            for b in group[1:]:
+                if b.keyword == "PLASTIC":
+                    combined = ((b.param("HARDENING") or "").upper() == "COMBINED" and
+                                not (b.param("DATATYPE") or "").upper().startswith("PARAM"))
+                    if (b.param("HARDENING") or "").upper().replace(" ", "") == "JOHNSONCOOK":
+                        jc_block = b
+                elif b.keyword == "CYCLIC HARDENING" and combined:
+                    self._cyclic_ok.add(id(b))
+                elif b.keyword == "RATE DEPENDENT" and jc_block is not None:
+                    self._jc_with_rate.add(id(jc_block))
         # Abaqus gives nodes without an initial temperature 0; ccx stops ("no initial
         # temperature defined in node ...") once any are missing
         self._temp_ic_fill = False
@@ -17026,20 +17023,6 @@ class Converter:
                 self._temp_ic_default = "transient"
         if self._temp_ic_fill or self._temp_ic_default:
             self.geom.nsets.setdefault(ALL_NODES_SET, list(self.geom.nodes))
-        # Johnson-Cook *PLASTIC cards whose material also has a *RATE DEPENDENT card
-        self._jc_with_rate = set()
-        jc_block = None
-        for b in blocks:
-            if b.keyword == "MATERIAL":
-                jc_block = None
-            elif b.keyword == "PLASTIC" and \
-                    (b.param("HARDENING") or "").upper().replace(" ", "") == "JOHNSONCOOK":
-                jc_block = b
-            elif b.keyword == "RATE DEPENDENT" and jc_block is not None:
-                self._jc_with_rate.add(id(jc_block))
-            elif b.keyword in ("STEP", "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "NODE",
-                               "ELEMENT"):
-                jc_block = None
         self._plan_material_cards(blocks)
         self._plan_deformation_plasticity(blocks)   # before the expansion check: NLGEOM in ccx
         self._plan_expansion_as_ortho(blocks)
@@ -20953,7 +20936,7 @@ class Converter:
                     except (IndexError, ValueError):
                         continue
                     if self._approx and nu >= 0.5:
-                        nu = 0.475                          # handle_elastic's clamp
+                        nu = self._NU_CLAMP                 # handle_elastic's clamp
                     if e > 0 and -1.0 < nu < 0.5:
                         moduli.setdefault(cur, []).append(e * (1 - nu) / ((1 + nu) * (1 - 2 * nu)))
             elif cur is not None and kw == "DENSITY":
