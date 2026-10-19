@@ -141,7 +141,8 @@ TRANSLATED = {
         "beams off `U1`; after a `U1` section `*CENTROID`, `*SHEAR CENTER`, `*TRANSVERSE SHEAR "
         "STIFFNESS` and `*SECTION POINTS` are commented out with a note.",
     "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept (dropped on explicit "
-        "steps, which Abaqus/Explicit runs without it); `PERTURBATION` kept only for "
+        "steps, which Abaqus/Explicit runs without it; `NLGEOM=NO` with `*DEFORMATION "
+        "PLASTICITY`, see there); `PERTURBATION` kept only for "
         "`*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then persist); "
         "explicit steps get `INC=10000000` + `NLGEOM`; a step whose displacement BCs get ccx's "
         "step ramp (see `*BOUNDARY`) gets `AMPLITUDE=STEP`, ccx's default there; `*END STEP` "
@@ -414,6 +415,12 @@ TRANSLATED = {
         "(ε12 = α12 ΔT). In a deck with a transient `*COUPLED TEMPERATURE-DISPLACEMENT` step the "
         "densities are divided and the specific heats multiplied by 10³⁰ (see there).",
     "*HYPERELASTIC": "no model keyword → `POLYNOMIAL` (Abaqus default); `TEST DATA INPUT` commented.",
+    "*DEFORMATION PLASTICITY": "passed through. Reading it, ccx 2.23 runs the whole model under "
+        "NLGEOM, the law in the logarithmic strain and the Cauchy stress, so a small-strain step "
+        "(no `NLGEOM`) with it is reduced physics: Abaqus takes the small strain. An explicit "
+        "`NLGEOM=NO` is dropped, as ccx then reads the small strain as a Green-Lagrange one. One "
+        "that nothing uses is commented out. Its sections and plies name no orientation (see "
+        "`*ORIENTATION`).",
     "*DEPVAR": "SDV count kept; label lines dropped; `DELETE=` warned (no element deletion in ccx; "
         "reduced physics).",
     "*USER MATERIAL": "kept, but the Abaqus subroutine does not run in a stock ccx: a mechanical "
@@ -701,7 +708,8 @@ def gen_keywords():
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
                "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
-               "CONNECTOR SECTION", "TRANSFORM", "DAMAGE INITIATION", "USER MATERIAL"}
+               "CONNECTOR SECTION", "TRANSFORM", "DAMAGE INITIATION", "USER MATERIAL",
+               "DEFORMATION PLASTICITY"}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",

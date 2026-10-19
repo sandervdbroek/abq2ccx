@@ -9156,6 +9156,49 @@ def test_deformation_plasticity_sections_name_no_orientation():
     assert DP_FLAG in conv.reduced_physics
 
 
+DP_SMALL = "*DEFORMATION PLASTICITY in a small-strain step (ccx 2.23 runs it under NLGEOM)"
+DP_SECTION = "*Solid Section, elset=EALL, material=STEEL\n"
+
+
+def _steps(body):
+    return [ln for ln in body.splitlines() if ln.startswith("*STEP")]
+
+
+def test_deformation_plasticity_in_small_strain_steps_is_reduced_physics():
+    # ccx 2.23 switches NLGEOM on when it reads *DEFORMATION PLASTICITY and computes the law in the
+    # logarithmic strain and the Cauchy stress (probed), Abaqus in the small strain without NLGEOM;
+    # with an explicit NLGEOM=NO ccx reads the small strain as a Green-Lagrange one: dropped
+    static = "*Static\n0.1, 1.\n*Cload\n2, 1, 10.\n*End Step\n"
+    for step in ("*Step\n", "*Step, nlgeom=NO\n", "*Step, perturbation\n"):
+        body, conv, rep = convert_str(HEX + DEFORMATION_STEEL + DP_SECTION + step + static)
+        assert _steps(body) == ["*STEP"] and conv.reduced_physics == [DP_SMALL]
+        assert "logarithmic strain and the Cauchy stress" in rep.text()
+        assert ("Each NLGEOM=NO is dropped" in rep.text()) == ("NO" in step)
+    # under NLGEOM, which stays on for the later steps in Abaqus, ccx's law is Abaqus'
+    body, conv, _ = convert_str(HEX + DEFORMATION_STEEL + DP_SECTION + "*Step, nlgeom\n" + static
+                                + "*Step, nlgeom=NO\n" + static)
+    assert _steps(body) == ["*STEP, NLGEOM", "*STEP"] and not conv.reduced_physics
+    # a frequency step from the unloaded state takes the elastic stiffness in both
+    _, conv, _ = convert_str(HEX + DEFORMATION_STEEL + DP_SECTION + "*Step\n*Frequency\n5\n*End Step\n")
+    assert not conv.reduced_physics
+    # other materials keep NLGEOM=NO
+    body, conv, _ = convert_str(HEX + ISO_STEEL + DP_SECTION + "*Step, nlgeom=NO\n" + static)
+    assert _steps(body) == ["*STEP, NLGEOM=NO"] and not conv.reduced_physics
+    # ... also beside a *DEFORMATION PLASTICITY material nothing uses: it is commented out, as
+    # ccx would switch NLGEOM on for the whole model on reading it
+    spare = DEFORMATION_STEEL.replace("STEEL", "SPARE") + "*Density\n7.8e-9\n"
+    body, conv, rep = convert_str(HEX + ISO_STEEL + spare + DP_SECTION + "*Step, nlgeom=NO\n" + static)
+    assert _steps(body) == ["*STEP, NLGEOM=NO"] and not conv.reduced_physics
+    assert "** *MATERIAL, NAME=SPARE" in body and "** *DENSITY" in body and "*ELASTIC" in body.splitlines()
+    assert "material SPARE: no card uses it" in rep.text() and rep.n_commented == 3
+    # the NLGEOM thermal-expansion checks see ccx's NLGEOM
+    dp = ("*Element, type=C3D8, elset=DP\n2, 1, 2, 3, 4, 5, 6, 7, 8\n" + DEFORMATION_STEEL
+          + "*Solid Section, elset=DP, material=STEEL\n")
+    assert not nlgeom_expansion_warnings(ORTHO_EXPANSION, TURNED_30, ", orientation=T", "*Step\n*Static\n")
+    assert len(nlgeom_expansion_warnings(ORTHO_EXPANSION, TURNED_30 + dp, ", orientation=T",
+                                         "*Step\n*Static\n")) == 1
+
+
 def _ic_values(body, head="*INITIAL CONDITIONS, TYPE=STRESS"):
     """{(element, integration point): [values]} of the live card ``head``."""
     return {(int(r[0]), int(r[1])): [float(x) for x in r[2:]]

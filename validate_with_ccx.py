@@ -1781,6 +1781,34 @@ def dp_bar_deck(typ, ori):
     return "\n".join(lines) + "\n"
 
 
+def dp_cube_deck(step, p=500.0):
+    """A free unit C3D8 cube of the *Deformation Plasticity steel of dp_bar_deck on rollers at
+    x = 0, pulled by four equal tip forces (nominal stress ``p``) in an Abaqus step headed by
+    ``step`` ("*Step": small strain by default)."""
+    lines = ["*Heading", "Deformation plasticity cube in a small-strain step", "*Node, nset=ALL"]
+    lines += [f"{k}, {x}., {y}., {z}." for k, (x, y, z) in enumerate(
+        ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)), 1)]
+    lines += ["*Element, type=C3D8, elset=CUBE", "1, 1, 2, 3, 4, 5, 6, 7, 8", "*Nset, nset=X0",
+              "1, 4, 5, 8", "*Material, name=STEEL", "*Deformation Plasticity", "210000., 0.3, 250., 5., 0.5",
+              "*Solid Section, elset=CUBE, material=STEEL", "*Boundary", "X0, 1, 1", "1, 2, 3", "5, 2, 2",
+              "4, 3, 3", step, "*Static", "0.1, 1.", "*Cload"]
+    lines += [f"{n}, 1, {p / 4:.9g}" for n in (2, 3, 6, 7)]
+    lines += ["*Node Print, nset=ALL", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def dp_uniaxial_strains(p, e=210000.0, nu=0.3, s0=250.0, n=5.0, alpha=0.5):
+    """The strain of a free bar under nominal stress ``p``: (ccx 2.23's *Deformation Plasticity,
+    Ramberg-Osgood in the logarithmic strain and the Cauchy stress p / lateral stretch^2;
+    Abaqus' small-strain law, Ramberg-Osgood in the small strain and p)."""
+    def plastic(s):
+        return alpha * (abs(s) / s0) ** (n - 1)
+    s = p
+    for _ in range(100):
+        s = p * math.exp(2 * (nu + 0.5 * plastic(s)) * s / e)
+    return math.expm1(s / e * (1 + plastic(s))), p / e * (1 + plastic(p))
+
+
 def distribution_panel_deck(plane="XY", tilt=0.0, nx=8, ny=2):
     """A variable-angle-tow S8R composite strip (40 x 10, 0.25-thick layers [0 / 45 / -45 / 90]
     on a per-element *DISTRIBUTION orientation whose fibre angle runs from 0 to 70 degrees
@@ -4307,6 +4335,28 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (four {typ} past yield, a {ori} *Orientation): "
                   f"displacements {err:.1e} of the largest {scale:.4g} off the bar without one")
             failures += 0 if ok else 1
+    # ... and in a small-strain step: ccx 2.23 runs the law under NLGEOM, in the logarithmic
+    # strain and the Cauchy stress, where Abaqus takes the small strain (reduced physics), and
+    # with an explicit NLGEOM=NO reads the small strain as a Green-Lagrange one, so abq2ccx
+    # drops that: both spellings strain as ccx's law says
+    want, small = dp_uniaxial_strains(500.0)
+    for step in ("*Step", "*Step, nlgeom=NO"):
+        tag = "deformation_plasticity_small_strain" + ("_nlgeom_no" if "NO" in step else "")
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(dp_cube_deck(step))
+        _rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        eps = sum(u[n][0] for n in (2, 3, 6, 7)) / 4 if u else math.nan
+        flagged = len(conv.reduced_physics) == 1 and "small-strain step" in conv.reduced_physics[0]
+        ok = flagged and abs(eps / want - 1) < 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a free C3D8 cube pulled to 2 sigma0, '{step}'): "
+              f"strain {eps:.6g}, ccx's law {want:.6g} ({eps / want - 1:+.1e}), "
+              f"{(eps / small - 1) * 100:+.1f} % past Abaqus' small-strain {small:.6g}; "
+              + ("reduced physics" if flagged else f"reduced physics: {conv.reduced_physics}"))
+        failures += 0 if ok else 1
     # --- quadratic membranes: ccx 2.23 expands each element on nodes of its own and leaves the
     # mid-thickness node of its corners free (M3D8R singular, M3D6 / M3D8 too soft); abq2ccx
     # writes the solids itself, held at the membrane nodes by *EQUATION

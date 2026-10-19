@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Deformation plasticity in small-strain steps** — ccx 2.23 runs `*DEFORMATION PLASTICITY`
+  under NLGEOM, in the logarithmic strain and the Cauchy stress, where Abaqus takes the small
+  strain without NLGEOM: such steps are now flagged as reduced physics (a bar in tension strains
+  0.39 % more at σ0, 12 % at 2σ0). An explicit `NLGEOM=NO`, with which ccx reads the small
+  strain as a Green-Lagrange one (32 % at 2σ0), is dropped, so both spellings run the same
+  law, and a material of the law that nothing uses is commented out (ccx ran the whole model
+  under NLGEOM for it).
 * **Code-review fixes** — a planar `B21`/`T2D2` model with a `*COUPLING`, `*TIE` or tied
   `*CONTACT PAIR` no longer stops the converter; a `TYPE=VELOCITY` card a rigid constraint
   implies whole is left out (it came back, and ccx stopped); amplitude points are written to

@@ -3643,6 +3643,8 @@ class Converter:
         self._orient_axes: set = set()             # orientations whose axes are known (_register_orientation)
         self._mat_symmetry: Dict[str, Optional[str]] = {}  # material -> None / "ortho" / "aniso"
         self._frame_bound_mats: set = set()        # *DEFORMATION PLASTICITY ones (_dp_axes)
+        self._dp_nlgeom = False                    # one stays: ccx runs NLGEOM (_plan_deformation_plasticity)
+        self._dp_unused: Dict[int, str] = {}       # cards of an unused one -> why commented out
         self._ic_ori: Dict[int, Tuple[str, str]] = {}  # element -> its section, orientation (_plan_ic_axes)
         # knot beams: rigid couplings on shell/beam nodes, rotational BCs on circular-section
         # beams and across *BOUNDARY, OP=NEW (see _plan_rigid_couplings,
@@ -4211,6 +4213,8 @@ class Converter:
     # -- dispatch -----------------------------------------------------------
     def translate_one(self, b: Block) -> List[str]:
         kw = b.keyword
+        if id(b) in self._dp_unused:                  # _plan_deformation_plasticity
+            return self._commented(b, self._dp_unused[id(b)], reduces=False)
         handlers = {
             "ELASTIC": self.handle_elastic,
             "ORIENTATION": self.handle_orientation,
@@ -5337,6 +5341,70 @@ class Converter:
                          once=True)
         return lines
 
+    def _plan_deformation_plasticity(self, blocks: List[Block]) -> None:
+        """How the deck's *DEFORMATION PLASTICITY materials run in ccx 2.23, which switches
+        nonlinear geometry on for the whole model when it reads such a material, even one no
+        section uses, and computes the law in the logarithmic strain ln V and the Cauchy
+        stress (probed on homogeneously deformed C3D8 cubes: uniaxial strain and stress,
+        simple and pure shear, turned; a total law, as Abaqus').  Abaqus runs it with the
+        small strain in a step without NLGEOM (2017 Theory and Materials guides, "Deformation
+        plasticity": meant for small-displacement analysis), so such a step is reduced
+        physics: a bar in tension strains 0.39 % more than Abaqus' law at sigma0 and 12 % more
+        at 2 sigma0 (alpha 0.5, n 5).  An explicit NLGEOM=NO is dropped (_dp_nlgeom,
+        handle_step): with it ccx turns nonlinear geometry off but still reads the small strain
+        as a Green-Lagrange one and returns a second Piola-Kirchhoff stress (32 % more strain
+        at 2 sigma0, a pressure under pure shear strain), so both spellings of Abaqus'
+        small-strain step run the same law.  A material that no section, composite ply or
+        other card names is commented out (_dp_unused): it changes nothing in Abaqus."""
+        opts = self._material_options(blocks)
+        dps = [m for m, cards in opts.items()
+               if any(c.keyword == "DEFORMATION PLASTICITY" for c in cards[1:])]
+        if not dps:
+            return
+        named = set(self._used_materials)
+        for b in blocks:
+            if b.keyword != "MATERIAL" and b.param("MATERIAL"):
+                named.add((b.param("MATERIAL") or "").strip().upper())
+            if b.keyword in ("REBAR LAYER", "EULERIAN SECTION"):
+                named.update(x.strip().upper() for r in merged_data_records(b) for x in r)
+        for m in dps:
+            if m in named:
+                self._dp_nlgeom = True
+                continue
+            name = (opts[m][0].param("NAME") or "").strip()
+            why = (f"*DEFORMATION PLASTICITY material {name}: no card uses it, so it changes nothing "
+                   f"in Abaqus, but ccx 2.23 would switch nonlinear geometry on for the whole model "
+                   f"on reading it; commented out.")
+            self._dp_unused.update((id(c), why) for c in opts[m])
+        if not self._dp_nlgeom:
+            return
+        nl = small = explicit_no = False
+        for cards in step_groups(blocks)[1]:
+            step = cards[0]
+            given = (step.param("NLGEOM") or "YES").strip().upper() if step.has("NLGEOM") else None
+            nl = nl or given not in (None, "NO")         # once on, on for every later step (Abaqus)
+            explicit_no = explicit_no or given == "NO"
+            proc = next((c for c in cards if c.keyword in PROC_KW), None)
+            if proc is not None and proc.keyword in ("STATIC", "DYNAMIC", "VISCO",
+                                                      "COUPLED TEMPERATURE-DISPLACEMENT",
+                                                      "UNCOUPLED TEMPERATURE-DISPLACEMENT") \
+                    and not proc.has("EXPLICIT") and (not nl or step.has("PERTURBATION")):
+                small = True
+        if not small:
+            return
+        names = ", ".join((opts[m][0].param("NAME") or "").strip() for m in dps if m in named)
+        self.report.warn(f"*DEFORMATION PLASTICITY ({names}) in a small-strain step: ccx 2.23 switches "
+                         f"nonlinear geometry on for the whole model when it reads the law and "
+                         f"computes it in the logarithmic strain and the Cauchy stress, while Abaqus "
+                         f"runs it with the small strain in a step without NLGEOM. Probed on a bar in "
+                         f"uniaxial tension (alpha 0.5, n 5): 0.39 % more strain than Abaqus' law at "
+                         f"sigma0, 3.6 % at 1.6 sigma0, 12 % at 2 sigma0."
+                         + (" Each NLGEOM=NO is dropped: with it ccx turns nonlinear geometry off but "
+                            "still reads the small strain as a Green-Lagrange strain (32 % more "
+                            "strain at 2 sigma0, a pressure under pure shear)." if explicit_no else "")
+                         + " No form of the deck gives Abaqus' small-strain law in ccx 2.23.", once=True)
+        self._reduces("*DEFORMATION PLASTICITY in a small-strain step (ccx 2.23 runs it under NLGEOM)")
+
     def _check_nlgeom_expansion(self, blocks: List[Block]) -> None:
         """Warn about thermal expansions that ccx 2.23 computes wrongly in NLGEOM steps, which
         no form of the deck avoids.  There it splits the deformation gradient into a
@@ -5356,8 +5424,10 @@ class Converter:
           turned (_plan_expansion_as_ortho), and is checked as such.
 
         Linear steps and NLGEOM=NO are right; the CalculiX sources changed both routines in
-        October 2026, after 2.23.  Decks without temperatures have no thermal strain."""
-        nlgeom, step = False, None
+        October 2026, after 2.23.  Decks without temperatures have no thermal strain.  A
+        *DEFORMATION PLASTICITY material runs every step under NLGEOM in ccx
+        (_plan_deformation_plasticity)."""
+        nlgeom, step = self._dp_nlgeom, None
         for b in blocks:
             if b.keyword == "STEP":
                 step = b
@@ -7296,6 +7366,8 @@ class Converter:
                     self.report.warn(f"*STEP AMPLITUDE={v}: ccx accepts only RAMP or STEP here; "
                                      f"dropped.", once=True)
                 continue
+            if k == "NLGEOM" and self._dp_nlgeom and (v or "YES").strip().upper() == "NO":
+                continue        # ccx misreads its *DEFORMATION PLASTICITY then (_plan_deformation_plasticity)
             if k in ("NLGEOM", "INC", "INCF", "THERMAL NETWORK", "SHOCK SMOOTHING"):
                 params[k] = v
                 continue
@@ -16907,6 +16979,7 @@ class Converter:
                                "ELEMENT"):
                 jc_block = None
         self._plan_material_cards(blocks)
+        self._plan_deformation_plasticity(blocks)   # before the expansion check: NLGEOM in ccx
         self._plan_expansion_as_ortho(blocks)
         self._plan_elastic_expansion(blocks)
         self._check_nlgeom_expansion(blocks)
