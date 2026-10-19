@@ -17682,7 +17682,7 @@ class Converter:
         not a shell/beam reference node, whose coupling becomes a *RIGID BODY."""
         refs: set = set()
         for i, b in enumerate(blocks):
-            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            ref = self._ref_node(b)
             if ref is None or ref in self._rot_nodes or id(b) in self._kin_rb:
                 continue
             if b.keyword == "COUPLING" and i + 1 < len(blocks) and \
@@ -17742,7 +17742,7 @@ class Converter:
             if not legacy and (b.keyword != "COUPLING" or i + 1 >= len(blocks) or
                                blocks[i + 1].keyword != "KINEMATIC"):
                 continue
-            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            ref = self._ref_node(b)
             if ref is None or ref in structural:
                 continue
             if legacy:
@@ -17926,8 +17926,7 @@ class Converter:
         body_of = {m: body for bodies in self._mpc_bodies.values() for body in bodies
                    for m in body["members"]}
         for b in blocks:
-            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "") \
-                if b.keyword == "RIGID BODY" else None
+            ref = self._ref_node(b) if b.keyword == "RIGID BODY" else None
             if ref is not None:
                 for m in self._rigid_body_members(b)[0]:
                     if m != ref:
@@ -18351,7 +18350,7 @@ class Converter:
         self._coupling_plan = {}
         knots: List[int] = []
         for i, b in enumerate(blocks):
-            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            ref = self._ref_node(b)
             if b.keyword == "RIGID BODY":
                 tie, pin = self._rigid_body_members(b)
                 if ref is None or not any(n in structural for n in tie + pin + [ref]):
@@ -18617,7 +18616,7 @@ class Converter:
         builds from RIGID MPCs: *RIGID BODY, kinematic couplings and the rigid bodies of
         *MPC BEAM lines.  ccx eliminates the members' coupled translations."""
         for i, b in enumerate(blocks):
-            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            ref = self._ref_node(b)
             if ref is None:
                 continue
             if b.keyword == "RIGID BODY":
@@ -18749,7 +18748,7 @@ class Converter:
         for i, b in enumerate(blocks):
             if b.keyword not in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING"):
                 continue
-            ref = self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
+            ref = self._ref_node(b)
             if ref is None:
                 continue
             rot = None
@@ -19259,8 +19258,9 @@ class Converter:
         return nodes[0] if nodes else None
 
     def _ref_node(self, b: Block) -> Optional[int]:
-        """The reference node of a *RIGID BODY: REF NODE= or its blank-free spelling REFNODE=
-        (Abaqus ignores blanks in parameter names; handle_rigid_body writes it as REF NODE)."""
+        """The reference node of a *RIGID BODY, *COUPLING or *KINEMATIC COUPLING: REF NODE= or
+        its blank-free spelling REFNODE= (Abaqus ignores blanks in parameter names;
+        handle_rigid_body writes it as REF NODE)."""
         return self._first_node(b.param("REF NODE") or b.param("REFNODE") or "")
 
     def _rigid_body_members(self, b: Block) -> Tuple[List[int], List[int]]:
