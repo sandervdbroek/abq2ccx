@@ -59,7 +59,7 @@ They cover:
   (`Converter.reduced_physics`), and what does not count (exact substitutions, output
   requests, numerical controls); `*NODE, SYSTEM=` coordinates and `*NODE` normals.
 * **Output** — the `.frd`/`.dat` mapping, output frequencies, preselected field and contact
-  output, ccx's label lists, `ENER` from the first step.
+  output, ccx's label lists, `ENER` from the first step, `*EL FILE` labels ccx cannot write.
 * **`--run`** — the `.frd`/`.dat` readers and the results digest on a cut-down job in ccx's
   formats (`tests/fixtures/digest`), the ccx version check, an assembly's instance map
   (offsets, renamed sets, the capped listing) and `--json`.
@@ -156,6 +156,7 @@ setting up its system: ccx 2.23 ends a step that sets up none with "Job finished
 | `kinematic_dynamic_linear`, `_nlgeom`, `_some_dofs`, `_explicit` (generated) | a column's top face kinematically coupled (all or two translations) to a node that moves and turns over a slow `*DYNAMIC` step: linear, NLGEOM, explicit | ccx's own coupling in a slow `*STATIC` step (the static limit); the free middle nodes must move | 6e-5 to 3.5e-4, the dynamic effect (ccx's coupling: no equations, the middle nodes stayed at 0) |
 | `rigid_dynamic_solid`, `_mpc`, `_shell`, `_planar` (generated) | a `*RIGID BODY` (`*MPC BEAM` lines) on a column's top face or a clamped `S4` / `CPS4` strip's tip edge, driven by a node that moves and turns over a slow linear `*DYNAMIC` step | the linear rigid motion u_ref + θ × d prescribed in a `*STATIC` step; the free nodes must move | 2.5e-6, 2.5e-6, 2.4e-4 (ccx's own shells in a dynamic step), 0 (ccx's `*RIGID BODY`: 7e-2, 7e-2, 1.7e-2, 4.5e-2) |
 | `energy_dynamic`, `_after_frequency`, `energy_coupled` (generated) | a one-DOF cube pulled in a static step (also after a `*FREQUENCY` step), then let go in an implicit `*DYNAMIC` step or heated in a transient coupled temperature-displacement step | u0 cos ωt and ω / 2π; u0 + α ΔT L | 3.4e-4 of u0, 2.7e-7; exact (ccx stopped: energies first needed after step 1) |
+| `el_file_u1_ener`, `el_file_depvar_sdv`, `el_file_carried_sdv`, `el_file_plastic_sdv` (generated) | a `U1` cantilever with `VARIABLE=ALL` (`ENER`); cubes with `S, SDV` requested: `*DEPVAR` in a linear static step, then (NLGEOM, or a plastic material) `*FREQUENCY` and `*STEADY STATE DYNAMICS` steps ccx carried `SDV` into | P L³ / 3 E I; 100 / E; the same decks without `SDV` | exact (ccx stopped / segfaulted) |
 | `rigid_tie_symmetric_layup` (generated) | a `[0/90]s` `S4R` strip tied to a clamped rigid plate | the strip with its four plies listed | exact (half the thickness: 3.3× too soft) |
 | `approximate_blank_nu` (generated) | `--approximate` beside an `*ELASTIC` row with a blank ν at the cube's temperature | uniaxial stress, ν 0 | exact (ν 0.475) |
 | `assembly_bolts` (generated) | two instances, one turned, of a part with a `*PRE-TENSION SECTION` and a `*DISTRIBUTING COUPLING` | F L / E A, F / E A | 1e-6 (ccx stopped on the part's names) |

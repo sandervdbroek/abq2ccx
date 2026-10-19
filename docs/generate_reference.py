@@ -783,7 +783,15 @@ def gen_output():
                  {v for labels in A.CCX_ENERGY_LABELS.values() for v in labels})) +
              " — and in a nonlinear calculation stops when that is not the first step. The "
              "converter then adds `ENER` to the first step's `*EL FILE` (or an `*EL FILE` card "
-             "for it), and keeps it out of the steps after it, into which ccx would carry it.\n",
+             "for it), and keeps it out of the steps after it, into which ccx would carry it "
+             "(not in a model with `U1` beams, which is linear).\n",
+             "## `*EL FILE` labels ccx 2.23 cannot write\n",
+             "`ENER` and `SDV` in a model with `U1` beams (ccx stops: 'only coded for fields with "
+             "6 entries'); `SDV` of a model with state variables in a linear `*STATIC` or a "
+             "`*STEADY STATE DYNAMICS` step (ccx segfaults), and in `*FREQUENCY` and `*BUCKLE`, "
+             "where ccx skips it but segfaults on one carried over from an earlier step. The "
+             "converter drops them and says so; `*EL PRINT` writes them (no `SDV` in "
+             "`*FREQUENCY`/`*BUCKLE`).\n",
              "## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)\n",
              "Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the "
              "output database*, table 1) as the whole-model ccx cards it becomes. Abaqus also "

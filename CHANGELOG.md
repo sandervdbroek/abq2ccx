@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **`*EL FILE` output that stopped or crashed ccx 2.23** — in a model with U1 beams, ccx stops
+  writing `ENER` or `SDV` to the .frd ("only coded for fields with 6 entries"), even in a
+  linear static step, so `*OUTPUT, FIELD, VARIABLE=ALL` never ran there. In a model with state
+  variables (`*DEPVAR`, a plastic or creeping material), `SDV` segfaults ccx in a linear
+  `*STATIC` or a `*STEADY STATE DYNAMICS` step, and in a `*FREQUENCY` or `*BUCKLE` step that
+  ccx carried the request into from an earlier step. These labels are now dropped there, with
+  a note (a warning for U1's `ENER`); `*EL PRINT` still writes them. A U1 model no longer gets
+  `ENER` in its first step: it is linear, and ccx takes energy requests from any step there.
 * **A step that solved nothing is no solve** — ccx 2.23 can run a step that sets up no system
   of equations to "Job finished" and exit 0, every free DOF left at its initial value (a
   `*DYNAMIC` step whose kinematic couplings chain no MPCs, which the converter avoids). The

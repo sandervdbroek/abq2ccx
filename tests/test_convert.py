@@ -3606,6 +3606,88 @@ def test_energy_requested_from_the_first_step():
         assert "ENER added" not in rep.text() and "S, E, ENER" not in body, steps
 
 
+U1_CANTILEVER = ("*Node\n1, 0., 0., 0.\n2, 500., 0., 0.\n3, 1000., 0., 0.\n*Element, type=B31, "
+                 "elset=B\n1, 1, 2\n2, 2, 3\n*Beam General Section, elset=B, section=GENERAL\n"
+                 "1000., 4.e5, 0., 2.e5, 5.4e5\n0., 0., 1.\n210000., 80769.2307692\n*Boundary\n"
+                 "1, 1, 6\n")
+
+
+def test_u1_el_file_without_ener_and_sdv():
+    # ccx 2.23 extrapolates element values to the nodes of a U1 beam for six-component fields
+    # only and stops on ENER and SDV ('only coded for fields with 6 entries'; probed, also in a
+    # linear *STATIC step): dropped from every *EL FILE of a model with U1 beams
+    load = "*Cload\n3, 2, 100.\n"
+    msg = "dropped: ccx 2.23 stops writing {} to the .frd of a model with U1 beams"
+    for out, el, level, what in (
+            ("*Output, field, variable=ALL\n", "*EL FILE\nS, E\n", "WARNING", "*EL FILE ENER"),
+            ("*Output, field\n*Element Output\nS, ENER, SDV\n", "*EL FILE\nS\n", "WARNING",
+             "*EL FILE ENER and SDV"),
+            ("*Output, field\n*Element Output\nS, SDV\n", "*EL FILE\nS\n", "NOTE", "*EL FILE SDV")):
+        body, _, rep = convert_str(U1_CANTILEVER + "*Step\n*Static\n" + load + out + "*End Step\n")
+        assert "TYPE=U1" in body and el in _step(body, 1) and ", ENER" not in body, out
+        word = "them" if " and " in what else "it"
+        assert (level, f"{what} {msg.format(word)} ('extrapolation for element of type u1 is only "
+                f"coded for fields with 6 entries'); *EL PRINT writes {word} (.dat).") in rep.entries
+    # a model with U1 beams is linear, where ccx takes energies from a later step on (probed:
+    # *EL PRINT ENER from step 2), so step 1 gets no ENER for them; an *EL FILE of ENER alone
+    # is left empty, which replaces step 1's as the request would
+    for out, step2 in (("*Output, field\n*Element Output\nENER\n", "*EL FILE\n"),
+                       ("*Output, history\n*Element Output, elset=B\nENER\n",
+                        "*EL PRINT, ELSET=B\nENER\n")):
+        body, _, rep = convert_str(U1_CANTILEVER + "*Step\n*Static\n" + load + "*End Step\n"
+                                   "*Step\n*Static\n" + load + out + "*End Step\n")
+        assert _step(body, 1).endswith("*EL FILE\nS, E\n") and "ENER added" not in rep.text(), out
+        assert step2 in _step(body, 2), _step(body, 2)
+    # without U1 (refused under NLGEOM) the request stays
+    body, _, _ = convert_str(U1_CANTILEVER + "*Step, nlgeom\n*Static\n" + load +
+                             "*Output, field, variable=ALL\n*End Step\n")
+    assert "TYPE=U1" not in body and "*EL FILE\nS, E, ENER\n" in body
+
+
+def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
+    # ccx 2.23 has no nodal state variables in a linear *STATIC (linstatic.c), *FREQUENCY,
+    # *BUCKLE and *STEADY STATE DYNAMICS step and segfaults writing *EL FILE SDV there in a
+    # model with state variables (probed; it skips SDV given in a *FREQUENCY / *BUCKLE step,
+    # not SDV carried into one): SDV dropped there
+    depvar = ("*Material, name=M\n*Elastic\n210000., 0.3\n*Density\n7.85e-9\n*Depvar\n2\n*User "
+              "Defined Field\n*Solid Section, elset=EALL, material=M\n")
+    bc = "*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+    load, out = "*Cload\n8, 3, 1.\n", "*Output, field\n*Element Output\nS, SDV\n"
+    static = "*Step{}\n*Static\n" + load + "{}*End Step\n"
+    freq = "*Step\n*Frequency\n3\n{}*End Step\n"
+    ssd = "*Step\n*Steady State Dynamics\n100., 2000., 3\n" + load + "{}*End Step\n"
+    for steps, k, why in (
+            (static.format("", out), 1, "from a linear *STATIC step (no NLGEOM, no plastic, "
+                                        "creeping, hyperelastic or user material): ccx 2.23 has no "
+                                        "nodal state variables there and segfaults writing SDV to "
+                                        "the .frd; *EL PRINT SDV (.dat) runs."),
+            (freq.format(out), 1, "from a *FREQUENCY step: ccx 2.23 writes no state variables "
+                                  "there (it skips SDV requested in the step"),
+            (freq.format("") + ssd.format(out), 2, "from a *STEADY STATE DYNAMICS step: ccx 2.23 "
+                                                    "has no nodal state variables there")):
+        body, _, rep = convert_str(HEX + depvar + bc + steps)
+        assert "*EL FILE\nS\n" in _step(body, k) and "SDV" not in _step(body, k), _step(body, k)
+        assert f"*EL FILE SDV dropped {why}" in rep.text(), steps
+    # a step ccx iterates (NLGEOM, also carried on; a plastic or hyperelastic material), a
+    # model without state variables and a *MODAL DYNAMIC step keep it
+    plastic = STEEL.replace("*Density", "*Plastic\n250., 0.\n*Density")
+    hyper = depvar.replace("*Elastic\n210000., 0.3", "*Hyperelastic, neo hooke\n80000., 1.e-5")
+    for model, steps in ((depvar, static.format(", nlgeom", out)),
+                         (depvar, static.format(", nlgeom", "") + static.format("", out)),
+                         (plastic, static.format("", out)), (hyper, static.format("", out)),
+                         (STEEL, static.format("", out)),
+                         (depvar, freq.format("") + "*Step\n*Modal Dynamic\n1.e-5, 1.e-4\n" + load
+                          + out + "*End Step\n")):
+        body, _, rep = convert_str(HEX + model + bc + steps)
+        assert "S, SDV" in body.split("*STEP")[-1] and "SDV dropped" not in rep.text(), steps
+    # ccx carries an *EL FILE into the next steps that give none: a *FREQUENCY step after one
+    # with SDV gets an empty one (Abaqus writes no element output there)
+    body, _, rep = convert_str(HEX + plastic + bc + static.format("", out) + freq.format(""))
+    assert _step(body, 1).endswith("*EL FILE\nS, SDV\n") and _step(body, 2).endswith("*EL FILE\n")
+    assert "Empty *EL FILE added to step 2: Abaqus writes no element field output there, and " \
+           "ccx would carry an earlier step's *EL FILE SDV into a *FREQUENCY step" in rep.text()
+
+
 def test_courant_length_matches_ccx_223():
     # h * f of ccx's explicit increment estimate against the increments ccx 2.23 printed for
     # one element of each type (steel: c = 6.0010e6; dt = 0.8/1.3 * 1.91722 * h f / (2 c)).

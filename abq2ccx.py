@@ -2601,6 +2601,13 @@ ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
 # (Converter._energy_from_step_one).
 CCX_ENERGY_LABELS = {"EL FILE": ("ENER",), "EL PRINT": ("ENER", "ELSE", "ELKE"),
                      "CONTACT FILE": ("CELS",)}
+# The procedures in which ccx 2.23 has no nodal state variables (arpack.c, arpackbu.c and
+# steadystate.c never allocate them, nor does linstatic.c, which runs a linear *STATIC step),
+# so that *EL FILE SDV segfaults it in a model with state variables (Converter._el_file_stops),
+# and the material cards with which ccx iterates every *STATIC step besides a kept *PLASTIC
+# and *CREEP (probed on 2.23).
+NO_NODAL_SDV_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS"}
+CCX_ITERATED_MATERIALS = {"USER MATERIAL", "HYPERELASTIC", "HYPERFOAM", "DEFORMATION PLASTICITY"}
 # Contact output (*CONTACT FILE CDIS/CSTR) ccx 2.23 cannot write, probed on a block pressed
 # onto another (plane strain/stress, axisymmetric and 3-D solid elements of every order and
 # shape, a shell and a membrane plate; static, NLGEOM, *VISCO, implicit and explicit
@@ -10963,7 +10970,9 @@ class Converter:
         if hidden:
             self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
             self.geom.nsets[self._qmem_hidden] = hidden
-        self._energy_from_step_one(steps, [g[0] for g in step_groups(blocks)[1]])
+        groups = step_groups(blocks)[1]
+        self._energy_from_step_one(steps, [g[0] for g in groups])
+        self._el_file_stops(blocks, steps, groups)
         for k, timing, reqs in steps:
             self._out_ctl[k] = self._step_output_control(k, timing, reqs)
             for r in reqs:
@@ -11152,7 +11161,11 @@ class Converter:
         step 1's back without ENER, or an empty *EL FILE, which clears them.  These cards have
         no say in their step's output control.  A card with FREQUENCY=0 would not do (ccx
         skips it), and a linear later step would not need it, which the converter cannot tell
-        (NLGEOM, plasticity, contact)."""
+        (NLGEOM, plasticity, contact) — except in a model with U1 beams, which is linear in
+        every step (_u1_plans) and whose *EL FILE cannot hold ENER (_el_file_stops): there
+        ccx takes energies from a later step on (probed: *EL PRINT ENER from step 2)."""
+        if self._u1:
+            return
         for k, timing, reqs in steps:
             why = [f"step {k}, {timing['energy']},"] if timing.get("energy") else []
             why += [f"step {k}'s *{r['cc']} {lab} request" for r in reqs if r["live"]
@@ -11163,11 +11176,7 @@ class Converter:
             return
         if k == 1 or len(anchors) < len(steps):
             return
-
-        def card(params: "OrderedDict[str, Optional[str]]", labels: List[str], anchor: Block) -> dict:
-            return {"b": mkblock("EL FILE"), "cc": "EL FILE", "params": params, "labels": labels,
-                    "notes": [], "warnings": [], "frd": True, "frd_sets": [], "covered": [],
-                    "set": None, "ctl": None, "default": True, "live": True, "anchor": anchor}
+        card = self._added_el_file
         files = [r for r in steps[0][2] if r["live"] and r["cc"] == "EL FILE"]
         again = ""
         if not any(r["live"] and r["cc"] == "EL FILE" for r in steps[1][2]):
@@ -11186,6 +11195,84 @@ class Converter:
             f"nonlinear calculation (every implicit dynamic or transient coupled step is one in "
             f"ccx) it accepts only from the first step on — it stops otherwise (\"energy output "
             f"requests, if any, must be specified in the first step\").")
+
+    @staticmethod
+    def _added_el_file(params: "OrderedDict[str, Optional[str]]", labels: List[str],
+                       anchor: Block) -> dict:
+        """An *EL FILE request the converter adds at ``anchor``, with no say in its step's
+        output control."""
+        return {"b": mkblock("EL FILE"), "cc": "EL FILE", "params": params, "labels": labels,
+                "notes": [], "warnings": [], "frd": True, "frd_sets": [], "covered": [],
+                "set": None, "ctl": None, "default": True, "live": True, "anchor": anchor}
+
+    def _el_file_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
+                       groups: List[List[Block]]) -> None:
+        """Keep the *EL FILE labels out that stop or crash ccx 2.23 writing the .frd (probed):
+
+        * ENER and SDV in a model with U1 beams (_plan_u1_beams), in any step: ccx extrapolates
+          element values to U1's nodes for six-component fields only (S, E, ME) and stops on
+          these ('extrapolation for element of type u1 is only coded for fields with 6
+          entries'; PEEQ, HFL and DUCT it writes only for plastic or heat-transfer models,
+          which U1 is never in); *EL PRINT writes them;
+        * SDV in a model with state variables (*DEPVAR, a plastic or creeping material) in a
+          step ccx runs without nodal state variables (NO_NODAL_SDV_PROCS), where it
+          segfaults: a linear *STATIC step — no NLGEOM from this or an earlier step, no RIKS,
+          and no material ccx iterates (a kept *PLASTIC, *CREEP, CCX_ITERATED_MATERIALS) —,
+          *STEADY STATE DYNAMICS, and *FREQUENCY / *BUCKLE, where ccx skips an SDV request of
+          the step's own ('does not make sense') but not one carried over from an earlier
+          step.  In a linear static step no material changes the state variables.
+
+        ccx keeps an *EL FILE in the next steps that give none, so a step of the second kind
+        without an *EL FILE gets an empty one where ccx would carry SDV into it: Abaqus writes
+        no element field output there (its requests are written in every step, _plan_output)."""
+        u1 = bool(self._u1)
+        state = self._out_yields or any(n > 0 for n in self._depvar_counts)
+        if not (u1 or state) or len(groups) < len(steps):
+            return
+        iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
+        nlgeom = False
+        held: List[str] = []                # the *EL FILE labels ccx carries into a step
+        for (k, timing, reqs), group in zip(steps, groups):
+            nlgeom = nlgeom or any(key.startswith("NLGEO") and (v or "YES").strip().upper() != "NO"
+                                   for key, v in group[0].params.items())
+            proc = next((x for x in group[1:] if x.keyword in PROC_KW), None)
+            linear = timing["proc"] == "STATIC" and not (nlgeom or iterated or proc.has("RIKS"))
+            sdv = state and (linear or timing["proc"] in NO_NODAL_SDV_PROCS)
+            where = ("a linear *STATIC step (no NLGEOM, no plastic, creeping, hyperelastic or "
+                     "user material)" if linear else f"a *{timing['proc']} step")
+            files = [r for r in reqs if r["live"] and r["cc"] == "EL FILE"]
+            if sdv and not files and any(lab[:3] == "SDV" for lab in held):
+                files = [self._added_el_file(OrderedDict(), [], group[0])]
+                files[0]["notes"].append(
+                    f"Empty *EL FILE added to step {k}: Abaqus writes no element field output "
+                    f"there, and ccx would carry an earlier step's *EL FILE SDV into {where}, "
+                    f"where ccx 2.23 has no nodal state variables and segfaults.")
+                reqs.append(files[0])
+            for r in files:
+                ener = [lab for lab in r["labels"] if u1 and lab[:4] == "ENER"]
+                sdvs = [lab for lab in r["labels"] if (u1 or sdv) and lab[:3] == "SDV"]
+                if not (ener or sdvs):
+                    continue
+                r["labels"] = [lab for lab in r["labels"] if lab not in ener + sdvs]
+                if u1:
+                    (r["warnings"] if ener else r["notes"]).append(
+                        f"*EL FILE {' and '.join(ener + sdvs)} dropped: ccx 2.23 stops writing "
+                        f"{'them' if ener and sdvs else 'it'} to the .frd of a model with U1 beams "
+                        f"('extrapolation for element of type u1 is only coded for fields with 6 "
+                        f"entries'); *EL PRINT writes {'them' if ener and sdvs else 'it'} (.dat).")
+                elif timing["proc"] in ("FREQUENCY", "BUCKLE"):
+                    r["notes"].append(
+                        f"*EL FILE SDV dropped from {where}: ccx 2.23 writes no state variables "
+                        f"there (it skips SDV requested in the step: 'does not make sense for a "
+                        f"frequency or bucking calculation') and segfaults on *EL FILE SDV "
+                        f"carried into it from an earlier step.")
+                else:
+                    r["notes"].append(
+                        f"*EL FILE SDV dropped from {where}: ccx 2.23 has no nodal state "
+                        f"variables there and segfaults writing SDV to the .frd; *EL PRINT SDV "
+                        f"(.dat) runs.")
+            if files:
+                held = [lab for r in files for lab in r["labels"]]
 
     def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
         """One output card of a step: where it goes, its labels and the output control it

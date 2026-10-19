@@ -69,7 +69,9 @@ rigid plate's MASS and ROTARYI on springs against its frequencies, (--approximat
 faceted analytical sphere against Hertz, user materials: renamed so ccx stops rather than
 run its own routines, and (--abaqus-umat) through ccx's Abaqus-UMAT interfaces, whose stock
 example UMAT gives E eps and E ln(1 + eps); the results digest of --run against the
-beam, buckling and statics references above; and decks a code review found converted wrongly:
+beam, buckling and statics references above; *EL FILE requests ccx stopped or crashed on
+(ENER beside U1 beams, SDV where ccx has no nodal state variables) against beam theory, 100 / E
+and the same decks without them; and decks a code review found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
 a part's pre-tension section and distributing coupling in turned instances, and a static step
@@ -2224,6 +2226,37 @@ def energy_steps_deck(first=None, second="dynamic"):
             ("*STEP\n*FREQUENCY\n1\n*END STEP\n" if first == "frequency" else "") +
             "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 0.25\n*END STEP\n" + last +
             "*OUTPUT, HISTORY, FREQUENCY=1\n*NODE OUTPUT, NSET=TOP\nU\n*END STEP\n")
+
+
+def el_file_stops_deck(case, sdv=True):
+    """Decks with *EL FILE output that stopped or crashed ccx 2.23 before (the converter's
+    _el_file_stops).  'u1': a B31 cantilever (length 1000, A 1000, I11 4e5 about n1 = z, ten
+    elements) under *BEAM GENERAL SECTION, run as U1, pulled by 100 along y at its tip, with
+    *OUTPUT, FIELD, VARIABLE=ALL (ENER): tip deflection P L^3 / 3 E I11.  The others: CUBE8
+    (E 210000, nu 0.3) pulled by 4 x 25 with S and SDV (``sdv``) requested, its top moving
+    100 / E: 'depvar', of an elastic material with *DEPVAR, in a linear static step; 'carried',
+    the same under NLGEOM, then a *FREQUENCY and a *STEADY STATE DYNAMICS step without element
+    output, into which ccx carried SDV; 'plastic', of a plastic material (yield 250, never
+    reached), then a *FREQUENCY step without element output."""
+    field = "*OUTPUT, FIELD\n*ELEMENT OUTPUT\nS{}\n*NODE OUTPUT\nU\n".format(", SDV" if sdv else "")
+    history = "*OUTPUT, HISTORY\n*NODE OUTPUT, NSET={}\nU\n"
+    if case == "u1":
+        return ("*NODE\n1, 0., 0., 0.\n11, 1000., 0., 0.\n*NGEN, NSET=AXIS\n1, 11\n*ELEMENT, "
+                "TYPE=B31, ELSET=BEAM\n1, 1, 2\n*ELGEN, ELSET=BEAM\n1, 10, 1, 1\n*NSET, NSET=TIP\n"
+                "11\n*BEAM GENERAL SECTION, ELSET=BEAM, SECTION=GENERAL\n1000., 4.E5, 0., 2.E5, "
+                "5.4E5\n0., 0., 1.\n210000., 80769.2307692\n*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n"
+                "*CLOAD\nTIP, 2, 100.\n*OUTPUT, FIELD, VARIABLE=ALL\n" + history.format("TIP") +
+                "*END STEP\n")
+    law = "*PLASTIC\n250., 0.\n" if case == "plastic" else "*DEPVAR\n2\n*USER DEFINED FIELD\n"
+    steps = (f"*STEP{', NLGEOM' if case == 'carried' else ''}\n*STATIC\n*CLOAD\nTOP, 3, 25.\n"
+             + field + history.format("TOP") + "*END STEP\n")
+    if case != "depvar":
+        steps += "*STEP\n*FREQUENCY\n3\n*END STEP\n"
+    if case == "carried":
+        steps += ("*STEP\n*STEADY STATE DYNAMICS\n1.E5, 3.E5, 3\n*CLOAD\nTOP, 3, 25.\n*OUTPUT, "
+                  "FIELD\n*NODE OUTPUT\nU\n" + history.format("TOP") + "*END STEP\n")
+    return (CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n210000., 0.3\n*DENSITY\n7.85E-9\n" + law +
+            CUBE8_HELD + steps)
 
 
 def tied_strip_deck(symmetric=True):
@@ -5289,6 +5322,56 @@ def main():
                   f"heated by 100 in a transient coupled temperature-displacement step, its lateral "
                   f"expansion held): top at {got:.7g} vs 1e-3 + alpha dT L = 2e-3 (before: ccx stopped "
                   f"at the coupled step)")
+        failures += 0 if ok else 1
+    # *EL FILE requests ccx 2.23 stopped or crashed on, which abq2ccx now drops: ENER and SDV of
+    # a model with U1 beams ('only coded for fields with 6 entries'), SDV of a model with state
+    # variables in a linear static step or carried into a *FREQUENCY / *STEADY STATE DYNAMICS
+    # step (segfaults).  The U1 tip against beam theory, the cube's top against 100 / E, and the
+    # carried runs against the same decks without SDV requested (every displacement table)
+    tip = review_run(el_file_stops_deck("u1"), "el_file_u1_ener", dat_node_blocks)
+    if tip:
+        got, want = (tip[0].get(11) or [0.0, math.nan])[1], 100.0 * 1000.0 ** 3 / (3 * 210000.0 * 4.0e5)
+        ok = abs(got / want - 1.0) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  el_file_u1_ener (a B31 cantilever under *BEAM GENERAL "
+              f"SECTION as U1, *OUTPUT, FIELD, VARIABLE=ALL): tip deflection {got:.7g} vs P L^3 / 3 E I "
+              f"= {want:.7g} (before: ccx stopped writing ENER)")
+    failures += 0 if tip and ok else 1
+    top = review_run(el_file_stops_deck("depvar"), "el_file_depvar_sdv", dat_displacements)
+    if top:
+        got = [top.get(n, [0.0, 0.0, math.nan])[2] for n in (5, 6, 7, 8)]
+        ok = max(abs(u * 210000.0 / 100.0 - 1.0) for u in got) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  el_file_depvar_sdv (a cube of an elastic material with "
+              f"*DEPVAR pulled in a linear static step, S and SDV requested): top at "
+              f"{', '.join(f'{u:.7g}' for u in got)} vs 100 / E = {100.0 / 210000.0:.7g} (before: ccx "
+              f"segfaulted)")
+    failures += 0 if top and ok else 1
+
+    def disp_tables(dat):
+        return ([(time, rows) for _, title, _s, time, rows in A.dat_blocks(dat)
+                 if title.startswith("displacements")],
+                dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+    for case, what in (("carried", "*DEPVAR, NLGEOM, then *FREQUENCY and *STEADY STATE DYNAMICS"),
+                       ("plastic", "a plastic material, then *FREQUENCY")):
+        runs = [review_run(el_file_stops_deck(case, sdv), f"el_file_{case}_sdv" + ("" if sdv else "_ref"),
+                           disp_tables) for sdv in (True, False)]
+        ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) > 1 and len(runs[0][1]) == 3
+        if ok:
+            (tables, freqs), (ref_tables, ref_freqs) = runs
+            diff = max(abs(a - b) / (max(abs(x) for r in rr for x in r[1:]) or 1.0)
+                       for (_t, rows), (_rt, rr) in zip(tables, ref_tables)
+                       for row, rrow in zip(rows, rr) for a, b in zip(row, rrow))
+            stretch = [r[3] * 210000.0 / 100.0 for r in tables[0][1]]
+            ssd = max((abs(x) for t, rows in tables if t >= 1.0e5 for r in rows for x in r[1:]),
+                      default=0.0)
+            ok = (diff < 1e-9 and freqs == ref_freqs and max(abs(s - 1.0) for s in stretch) < 1e-3
+                  and (case == "plastic" or ssd > 1e-5))
+            print(f"{'PASS' if ok else 'FAIL'}  el_file_{case}_sdv (a cube of {what}, S and SDV "
+                  f"requested in step 1): {len(tables)} displacement tables within {diff:.1e} of the "
+                  f"same deck without SDV, top at {min(stretch):.6f} x 100 / E, f1 = {freqs[0]:.7g} Hz"
+                  + (f", steady-state |u| up to {ssd:.3g}" if case == "carried" else "")
+                  + " (before: ccx segfaulted in step 2)")
+        elif all(runs):
+            print(f"FAIL  el_file_{case}_sdv: tables or frequencies missing")
         failures += 0 if ok else 1
     # a SYMMETRIC layup's thickness in a tie to a rigid plate (counted half, ccx got the tie)
     strips = [review_run(tied_strip_deck(sym), "rigid_tie_symmetric_layup" + ("" if sym else "_ref"),

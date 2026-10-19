@@ -30,7 +30,11 @@ Dropped from `*EL FILE`/`*NODE FILE` (.frd): `CELS`, `ELKE`, `ELSE`, `EVOL`.
 
 ## Energies from the first step
 
-ccx 2.23 computes element energies from the first step that needs them on — an implicit `*DYNAMIC` or a transient coupled temperature-displacement step, or a request for `CELS`, `ELKE`, `ELSE`, `ENER` — and in a nonlinear calculation stops when that is not the first step. The converter then adds `ENER` to the first step's `*EL FILE` (or an `*EL FILE` card for it), and keeps it out of the steps after it, into which ccx would carry it.
+ccx 2.23 computes element energies from the first step that needs them on — an implicit `*DYNAMIC` or a transient coupled temperature-displacement step, or a request for `CELS`, `ELKE`, `ELSE`, `ENER` — and in a nonlinear calculation stops when that is not the first step. The converter then adds `ENER` to the first step's `*EL FILE` (or an `*EL FILE` card for it), and keeps it out of the steps after it, into which ccx would carry it (not in a model with `U1` beams, which is linear).
+
+## `*EL FILE` labels ccx 2.23 cannot write
+
+`ENER` and `SDV` in a model with `U1` beams (ccx stops: 'only coded for fields with 6 entries'); `SDV` of a model with state variables in a linear `*STATIC` or a `*STEADY STATE DYNAMICS` step (ccx segfaults), and in `*FREQUENCY` and `*BUCKLE`, where ccx skips it but segfaults on one carried over from an earlier step. The converter drops them and says so; `*EL PRINT` writes them (no `SDV` in `*FREQUENCY`/`*BUCKLE`).
 
 ## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)
 
