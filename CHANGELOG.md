@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **`*BUCKLE` loaded by prescribed displacements** — ccx 2.23 does not solve a `*STEP,
+  PERTURBATION` `*BUCKLE` step for prescribed displacements: only the prescribed nodes move,
+  by every nonzero BC value in force, so the buckling factors were wrong (a column pushed down
+  at its top: 2.389 for 40.87). Such a step now drops `PERTURBATION` when no general step
+  precedes it (ccx's plain `*BUCKLE` solves the displacement); nonzero BCs held on from earlier
+  steps, which are no load in an Abaqus perturbation step, are given again at 0 there; a step
+  loaded by its own prescribed displacement after a general step is warned as reduced physics.
 * **U1 beams beside a deformation-plasticity solid** — ccx 2.23 runs a model with a
   `*DEFORMATION PLASTICITY` material under NLGEOM, where its U1 beam stops ("no second order").
   Such a deck no longer gets U1 beams; its beam sections are handled as where U1 cannot run.

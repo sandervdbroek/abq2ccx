@@ -163,6 +163,7 @@ explicit time integration): ccx 2.23 ends a step that sets up none with "Job fin
 | `modal_own_loads` (generated) | a cube loaded statically (a `*CLOAD`, a pressure, gravity, a traction), then `*FREQUENCY` and a `*MODAL DYNAMIC` step with loads of its own | the same deck without the static loads | exact (before: 0.013 off) |
 | `buckle_gravity_preload` (generated) | a `C3D8` column under gravity in a static step, then a `*BUCKLE` step loaded at its top (`*STEP, PERTURBATION` and a plain `*STEP`) | the same gravity as nodal forces (exact on bricks) | exact (ccx aborted after the buckle step; the plain step ignored the preload) |
 | `buckle_self_weight_then_static` (generated) | the column buckling under its weight and a top load, then a static step pulling its top sideways | the buckle step alone; the static step alone | exact (ccx aborted after the static step) |
+| `buckle_displacement` (generated) | a `C3D20R` column pushed down at its top in a `*STEP, PERTURBATION` `*BUCKLE` step; the same push as a static preload before a buckling step loaded at mid-height | the top tied and given the static reaction as a force; Euler | 2.4e-7; Euler 0.4 % (ccx 2.23 as written: 2.389 for 40.87, only the top moved) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved; a node moves | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`

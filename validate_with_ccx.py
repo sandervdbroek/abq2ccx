@@ -2394,6 +2394,63 @@ def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=
     return "\n".join(lines) + "\n"
 
 
+def buckle_displacement_deck(case, force=0.0, d=-1e-4, n=2, m=20):
+    """A C3D20R column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3), clamped at its
+    base, its top nodes (TOP) held in z: fixed-guided, Euler load pi^2 EI / L^2.  ``case``:
+    "own" a *STEP, PERTURBATION *BUCKLE step pushing TOP down by ``d``; "static" a static
+    step doing so that prints TOP's reaction; "tied" TOP tied in z by *EQUATION to its first
+    node, a *STEP, PERTURBATION *BUCKLE step loading that node by ``force``; "preload" the
+    static step pushing TOP down, then a *STEP, PERTURBATION *BUCKLE step loaded by 1e5 down
+    on the mid-height nodes (MID); "tied_preload" the same with the tie, the preload the
+    force ``force`` (0: none) and the tie's node held in z in the buckle step."""
+    h, dz = 0.1 / n / 2, 2.0 / m / 2                 # half steps
+    ids = {}
+    for k in range(2 * m + 1):
+        for j in range(2 * n + 1):
+            for i in range(2 * n + 1):
+                if i % 2 + j % 2 + k % 2 <= 1:
+                    ids[(i, j, k)] = len(ids) + 1
+    elems = []
+    for k in range(0, 2 * m, 2):
+        for j in range(0, 2 * n, 2):
+            for i in range(0, 2 * n, 2):
+                bot = [(i + a, j + b, k) for a, b in ((0, 0), (2, 0), (2, 2), (0, 2))]
+                top = [(x, y, z + 2) for x, y, z in bot]
+                mid = [tuple((p + q) // 2 for p, q in zip(u, v)) for u, v in
+                       [(bot[s], bot[(s + 1) % 4]) for s in range(4)] +
+                       [(top[s], top[(s + 1) % 4]) for s in range(4)] + list(zip(bot, top))]
+                elems.append([ids[p] for p in bot + top + mid])
+    tops = [v for (i, j, k), v in ids.items() if k == 2 * m]
+    ring = [v for (i, j, k), v in ids.items() if k == m]
+
+    def nset(name, vs):
+        return [f"*Nset, nset={name}"] + [", ".join(map(str, vs[s:s + 16])) for s in range(0, len(vs), 16)]
+    lines = (["*Node"] + [f"{v}, {i * h:.9g}, {j * h:.9g}, {k * dz:.9g}" for (i, j, k), v in ids.items()]
+             + ["*Element, type=C3D20R, elset=EALL"]
+             + [f"{e}, " + ", ".join(map(str, c[:15])) + ",\n" + ", ".join(map(str, c[15:]))
+                for e, c in enumerate(elems, 1)]
+             + nset("BASE", [v for (i, j, k), v in ids.items() if k == 0]) + nset("TOP", tops)
+             + nset("MID", ring) + ["*Material, name=STEEL", "*Elastic", "210.e9, 0.3",
+                                   "*Solid Section, elset=EALL, material=STEEL", "*Boundary", "BASE, 1, 3"])
+    if case.startswith("tied"):
+        lines += ["*Equation"] + [x for v in tops[1:] for x in ("2", f"{v}, 3, 1., {tops[0]}, 3, -1.")]
+    push = ["*Boundary", f"TOP, 3, 3, {d}"]
+    buckle = ["*Step, perturbation", "*Buckle", "3"]
+    ring_load = ["*Cload"] + [f"{v}, 3, {-1e5 / len(ring):.15g}" for v in ring]
+    if case == "own":
+        lines += buckle + push
+    elif case == "static":
+        lines += ["*Step", "*Static"] + push + ["*Node Print, nset=TOP, totals=only", "RF"]
+    elif case == "tied":
+        lines += buckle + ["*Cload", f"{tops[0]}, 3, {force!r}"]
+    elif case == "preload":
+        lines += ["*Step", "*Static"] + push + ["*End Step"] + buckle + ring_load
+    elif case == "tied_preload":
+        lines += ["*Step", "*Static"] + (["*Cload", f"{tops[0]}, 3, {force!r}"] if force else []) + \
+            ["*End Step"] + buckle + ["*Boundary", f"{tops[0]}, 3, 3, 0."] + ring_load
+    return "\n".join(lines + ["*End Step"]) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -5318,6 +5375,45 @@ def main():
               f"static step pulling its top sideways): factor {both[0][0]:.7g} ({lam[0]:.7g} "
               f"without the static step), top displacement as in a static-only run ({err:.1e} "
               f"apart)")
+    failures += 0 if ok else 1
+
+    # *BUCKLE loaded by a prescribed displacement: ccx 2.23 does not solve a *STEP, PERTURBATION
+    # *BUCKLE step for it (only the prescribed nodes move: 2.389 for 40.87); the converter drops
+    # PERTURBATION before any general step and gives held-on values again at 0 after one
+    def buckle_state(dat):
+        """(the factors, the buckle step's static DISP block: the one before its 3 modes)."""
+        blocks = frd_blocks(dat[:-4] + ".frd", "DISP")
+        return factors(dat) and len(blocks) >= 4 and (factors(dat), blocks[-4][1])
+
+    reaction = review_run(buckle_displacement_deck("static"), "buckle_displacement_static",
+                          lambda dat: (dat_totals(dat) or [None])[-1])
+    runs = [review_run(buckle_displacement_deck(c, f), "buckle_displacement_" + c + tag, buckle_state)
+            for c, f, tag in (("own", 0.0, ""), ("tied", reaction[2] if reaction else 0.0, ""),
+                              ("preload", 0.0, ""),
+                              ("tied_preload", reaction[2] if reaction else 0.0, ""),
+                              ("tied_preload", 0.0, "_none"))]
+    ok = bool(reaction) and all(runs)
+    if ok:
+        (own, s_own), (tied, _), (pre, s_pre), (ref, s_ref), (none, _) = runs
+        euler = math.pi ** 2 * 210e9 * 0.1 ** 4 / 12 / 2.0 ** 2 / -reaction[2]
+        err = max(abs(own[0] / tied[0] - 1), abs(pre[0] / ref[0] - 1))
+        # the buckling load's static solution: a node at mid-height moved by half the push (ccx
+        # without the fix: only the top did), and the preloaded column's equals the reference's
+        half = sum(1 for u in s_own.values() if abs(u[2] / -0.5e-4 - 1) < 0.01)
+        scale = max(abs(u[2]) for u in s_ref.values())
+        apart = max(abs(u[2] - s_ref.get(v, [math.inf] * 3)[2]) for v, u in s_pre.items()) / scale
+        ok = err < 1e-5 and half >= 1 and apart < 1e-6 and scale > 0 and \
+            abs(own[0] / euler - 1) < 0.01 and abs(pre[0] / none[0] - 1) > 0.005
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_displacement (a C3D20R column pushed down 1e-4 at "
+              f"its top in a *STEP, PERTURBATION *BUCKLE step, and the same push as a static preload "
+              f"before a buckling step loaded at mid-height): factor {own[0]:.7g} vs {tied[0]:.7g} "
+              f"with the top tied and given the static reaction (Euler {euler:.4g}), preloaded "
+              f"{pre[0]:.7g} vs {ref[0]:.7g} with that force as the preload ({none[0]:.7g} without "
+              f"it): max {err:.1e} apart; {half} mid-height nodes moved half the push in the "
+              f"buckling load's solution, the preloaded one {apart:.1e} off the reference's "
+              f"(ccx 2.23 as written: 2.389, only the top moved)")
+    else:
+        print("FAIL  buckle_displacement: a run gave no results")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

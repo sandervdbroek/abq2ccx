@@ -5246,6 +5246,43 @@ def test_buckle_after_a_general_step_gets_perturbation():
     assert "PERTURBATION" not in body and "PERTURBATION written" not in rep.text()
 
 
+def test_buckle_perturbation_prescribed_displacements():
+    # ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for prescribed displacements:
+    # only those nodes move, by every nonzero BC value in force (probed: 2.389 for 40.87)
+    disp, cload = "*Boundary\n7, 3, 3, -0.01\n", "*Cload\n6, 1, 1.\n"
+    buckle = _deck_step("Buckle\n2", disp, ", perturbation")
+    # its own prescribed displacement before any general step: the plain *BUCKLE solves it
+    body, conv, rep = convert_str(BUCKLE_CUBE + buckle)
+    assert "*STEP\n*BUCKLE\n2\n*BOUNDARY\n7, 3, 3, -0.01\n" in body and not conv.reduced_physics
+    assert "*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed displacement" in rep.text()
+    body, _, _ = convert_str(BUCKLE_CUBE + _deck_step("Frequency\n3") + buckle)
+    assert "PERTURBATION" not in body
+    # after a general step (or on initial stresses) no ccx form keeps the preload
+    body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", cload) + buckle)
+    assert body.count("*STEP, PERTURBATION\n*BUCKLE") == 1
+    assert conv.reduced_physics == ["*BUCKLE step 2 loaded by a prescribed displacement after a "
+                                    "preload (ccx does not solve for it)"]
+    assert "*BUCKLE step 2 is loaded by a prescribed displacement on a preloaded model" in rep.text()
+    ic = "*Initial Conditions, type=stress\nEALL, 1., 0., 0., 0., 0., 0.\n"
+    body, conv, _ = convert_str(BUCKLE_CUBE + ic + buckle)
+    assert "*STEP, PERTURBATION\n*BUCKLE" in body and len(conv.reduced_physics) == 1
+    # a value held on from the base state is no load: given again at 0, first in the step
+    pre = _deck_step("Static", disp)
+    body, conv, rep = convert_str(BUCKLE_CUBE + pre + _deck_step("Buckle\n2", cload, ", perturbation") +
+                                  _deck_step("Static", "*Cload\n6, 1, 2.\n"))
+    assert "*BUCKLE\n2\n** abq2ccx: boundary conditions held on from earlier steps, at 0: no load " \
+           "in a perturbation step\n*BOUNDARY\n7, 3, 3, 0.\n*CLOAD\n6, 1, 1.\n" in body
+    assert "\n*BOUNDARY, AMPLITUDE=ABQ2CCX_HOLD\n7, 3, 3, -0.01\n" in body.split("*BUCKLE")[1]
+    assert not conv.reduced_physics and "given again at 0 there" in rep.text()
+    # ... unless the step gives that DOF itself, or its OP=NEW removes it; zero values stay
+    for own in ("*Boundary\n7, 3, 3, 0.\n", "*Boundary, op=NEW\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"):
+        body, conv, _ = convert_str(BUCKLE_CUBE + pre + _deck_step("Buckle\n2", own + cload, ", perturbation"))
+        assert "held on from earlier" not in body and not conv.reduced_physics
+    body, _, _ = convert_str(BUCKLE_CUBE + _deck_step("Static", "*Boundary\n7, 3, 3\n") +
+                             _deck_step("Buckle\n2", cload, ", perturbation"))
+    assert "held on from earlier" not in body
+
+
 def test_temperature_in_a_buckle_step_commented_out():
     # Abaqus scales a *BUCKLE step's temperature change with the buckling factor (thermal
     # buckling); ccx 2.23 stops on it ("temperature loading is not allowed in a linear

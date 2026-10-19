@@ -3645,6 +3645,7 @@ class Converter:
         self._general_step_seen = False
         self._step_proc: Optional[str] = None      # the procedure of the step being emitted
         self._buckle_loaded = False                 # a *BUCKLE step loaded by more than temperatures
+        self._buckle_preloaded: Dict[int, bool] = {}   # *BUCKLE step -> a general step before it
         self._cyclic_ok: set = set()
         self._temp_ic_fill = False
         self._temp_ic_default = False
@@ -7542,6 +7543,8 @@ class Converter:
                              "Abaqus always buckles about the base state, its preload's stresses "
                              "included; ccx 2.23 without PERTURBATION buckles the unloaded structure "
                              "(probed: a column under a gravity preload, 6.11 vs 10.81).", once=True)
+        if proc == "BUCKLE":
+            self._buckle_preloaded[self._step_idx] = self._general_step_seen   # (_buckle_displacements)
         if proc in ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO") and not step_block.has("PERTURBATION"):
             self._general_step_seen = True
@@ -13818,6 +13821,7 @@ class Converter:
         out.extend(self.emit_other(blocks))
         out = self._settle_dependents(out)
         out = self._restore_base_states(out)
+        out = self._buckle_displacements(out)   # after the BCs the restore gives back
         out = self._modal_own_loads(out)        # after the loads the restore gives back
         out = self._keep_body_loads(out)        # after the restore, which gives body loads too
         self._audit_loads(blocks, out)
@@ -15615,6 +15619,126 @@ class Converter:
                 ([f"*AMPLITUDE, NAME={hold}"] + amplitude_lines([(0.0, 1.0), (1.0, 1.0)])
                  if used_hold[0] else []) + model_cards
         return res
+
+    def _buckle_displacements(self, out: List[str]) -> List[str]:
+        """ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for its prescribed
+        displacements: the free nodes stay put and only the prescribed ones move, by every
+        nonzero value in force (the step's own and those held on from earlier steps alike), so
+        the buckling load's stresses sit in the elements next to them (probed: a C3D20R column
+        clamped at its base and pushed down at its top buckles at 2.389 for 40.87).  ccx's
+        plain *BUCKLE solves them (40.87, as with the top tied and given the reaction force).
+        In a converted *BUCKLE step with PERTURBATION:
+
+        * a nonzero BC value held on from earlier, which is no load in an Abaqus perturbation
+          step (its BC values change the base state's), is given again at 0 right after the
+          *BUCKLE card (probed: the column preloaded by that top displacement then buckles as
+          when the preload is the reaction force, to 7 digits);
+        * the step's own nonzero BC values are its buckling load: before any general step,
+          and without initial stresses, Abaqus buckles the unloaded model, so PERTURBATION is
+          dropped; after one, ccx has no form that keeps the preload: warned."""
+        steps: List[dict] = []
+        state: Dict[Tuple[str, int], Tuple[str, bool]] = {}    # (TARGET, DOF) -> (target, nonzero)
+        stressed = False
+        insert: Dict[int, List[str]] = {}
+        cur: Optional[dict] = None
+        card: Optional[str] = None
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        for i, raw in enumerate(out):
+            s = raw.strip()
+            if not s or s.startswith("**"):
+                continue
+            if s.startswith("*"):
+                card, params = parse_keyword_line(s)
+                if card == "STEP":
+                    cur = {"line": i, "params": params, "proc": None, "at": None, "held": dict(state),
+                           "own": set(), "valued": False, "bcs": 0}
+                    steps.append(cur)
+                    continue
+                if cur is None:
+                    stressed = stressed or (card == "INITIAL CONDITIONS" and (
+                        params.get("TYPE") or "").upper() in ("STRESS", "PLASTIC STRAIN"))
+                    continue
+                if cur["proc"] is not None and cur["at"] is None:
+                    cur["at"] = i                   # the first card after the procedure's
+                if card in PROC_KW and cur["proc"] is None:
+                    cur["proc"] = card
+                elif card == "BOUNDARY":
+                    if not cur["bcs"] and (params.get("OP") or "").upper() == "NEW":
+                        state.clear()
+                        cur["held"] = {}
+                    cur["bcs"] += 1
+                elif card == "END STEP":
+                    held = {k: t for k, (t, v) in cur["held"].items() if v and k not in cur["own"]}
+                    if cur["proc"] == "BUCKLE" and "PERTURBATION" in cur["params"] and held:
+                        dofs: "OrderedDict[str, List[int]]" = OrderedDict()
+                        for (_, d), t in held.items():
+                            dofs.setdefault(t, []).append(d)
+                            state[(t.upper(), d)] = (t, False)
+                        lines = []
+                        for t, ds in dofs.items():
+                            ds.sort()
+                            start = ds[0]
+                            for j, d in enumerate(ds):
+                                if j + 1 == len(ds) or ds[j + 1] != d + 1:
+                                    lines.append(f"{t}, {start}, {d}, 0.")
+                                    start = ds[j + 1] if j + 1 < len(ds) else d
+                        insert[cur["at"]] = ["** abq2ccx: boundary conditions held on from earlier "
+                                             "steps, at 0: no load in a perturbation step",
+                                             "*BOUNDARY"] + lines
+                    cur = None
+                continue
+            if card != "BOUNDARY":
+                continue
+            rec = [x.strip() for x in s.split(",")]
+            try:
+                first = int(rec[1])
+                last = int(rec[2]) if len(rec) > 2 and rec[2] else first
+            except (IndexError, ValueError):
+                continue
+            try:
+                valued = any(k in params for k in ("FIXED", "USER", "SUBMODEL")) or \
+                    (len(rec) > 3 and bool(rec[3]) and pf(rec[3]) != 0.0)
+            except ValueError:
+                valued = True
+            for d in range(max(first, 1), min(last, 6) + 1):
+                state[(rec[0].upper(), d)] = (rec[0], valued)
+                if cur is not None:
+                    cur["own"].add((rec[0].upper(), d))
+                    cur["valued"] = cur["valued"] or valued
+        same = len(steps) == self._step_idx           # (the deck's steps, numbered alike)
+        for n, st in enumerate(steps, 1):
+            if st["proc"] != "BUCKLE" or "PERTURBATION" not in st["params"]:
+                continue
+            if st["at"] in insert:
+                self.report.note("*BUCKLE step with PERTURBATION: the nonzero boundary conditions "
+                                 "held on from earlier steps are given again at 0 there. They are no "
+                                 "load in an Abaqus perturbation step, while ccx 2.23 takes every "
+                                 "nonzero value in force as part of the buckling load (probed).",
+                                 once=True)
+            if not st["valued"]:
+                continue
+            if not stressed and same and not self._buckle_preloaded.get(n, True):
+                st["params"].pop("PERTURBATION")
+                out[st["line"]] = emit_keyword("STEP", st["params"])
+                self.report.note("*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed "
+                                 "displacement loads and no general step precedes (the same "
+                                 "unloaded model): ccx 2.23 does not solve a perturbation buckling "
+                                 "step for its prescribed displacements, only those nodes move "
+                                 "(probed: factor 2.39 for 40.9); its plain *BUCKLE does.", once=True)
+                continue
+            self.report.warn(f"*BUCKLE step {n} is loaded by a prescribed displacement on a preloaded "
+                             f"model (a general step or initial stresses before it): ccx 2.23 does "
+                             f"not solve a *STEP, PERTURBATION *BUCKLE step for its prescribed "
+                             f"displacements — only those nodes move, so the buckling load's "
+                             f"stresses sit in the elements next to them (probed: factor 2.39 for "
+                             f"40.9) — and without PERTURBATION it would leave out the preload. "
+                             f"Load the buckling step by forces instead (e.g. the displaced nodes "
+                             f"tied by *EQUATION to one node that is given the force).")
+            self._reduces(f"*BUCKLE step {n} loaded by a prescribed displacement after a preload "
+                          f"(ccx does not solve for it)")
+        for i in sorted(insert, reverse=True):
+            out[i:i] = insert[i]
+        return out
 
     def _keep_body_loads(self, out: List[str]) -> List[str]:
         """ccx 2.23 aborts (SIGABRT: it frees its body-load table twice) at the end of a step

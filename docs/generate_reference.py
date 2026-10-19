@@ -169,7 +169,11 @@ TRANSLATED = {
         "accuracy/vectors/iterations. A `*BUCKLE` step, or the step after a `*STEP, PERTURBATION` "
         "one, that would hold no body load once an earlier step held one gets a zero `GRAV` line "
         "(ccx 2.23 aborts after such a step). Its `*TEMPERATURE`, which ccx refuses there, is "
-        "commented out: Abaqus scales the change with the factor (thermal buckling), reduced physics.",
+        "commented out: Abaqus scales the change with the factor (thermal buckling), reduced physics. "
+        "ccx 2.23 does not solve a `*STEP, PERTURBATION` `*BUCKLE` step for prescribed "
+        "displacements (only those nodes move): there nonzero BCs held on from earlier steps are "
+        "given again at 0, and a step loaded by its own drops `PERTURBATION` before any general "
+        "step, else is warned (reduced physics).",
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped. A transient step without `DELTMX` gets `DIRECT`: "
         "Abaqus then takes fixed increments of the initial increment, ccx its own. A transient step "
         "with temperature DOFs and no initial temperatures starts every node at 0, the Abaqus "
