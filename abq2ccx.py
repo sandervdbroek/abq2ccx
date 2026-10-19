@@ -1306,6 +1306,17 @@ def reflow(values: Sequence, per_line: int = MAX_ENTRIES_PER_LINE) -> List[str]:
     return lines or [""]
 
 
+def dof_runs(ds: Sequence[int]) -> List[Tuple[int, int]]:
+    """The contiguous runs (first, last) of the sorted DOFs ``ds``."""
+    out: List[Tuple[int, int]] = []
+    for d in ds:
+        if out and out[-1][1] == d - 1:
+            out[-1] = (out[-1][0], d)
+        else:
+            out.append((d, d))
+    return out
+
+
 def equation_rows(terms: Sequence[tuple], coef: Callable[[object], str] = str) -> List[str]:
     """One equation of an *EQUATION card: its number of terms, then the (node, DOF,
     coefficient) terms four per line (ccx reads at most 12 entries per line), each
@@ -7899,6 +7910,88 @@ class Converter:
             return (lambda t: u_start), [], 0.0
         return None
 
+    # -- velocity / acceleration BCs: the pieces _plan_velocity_bcs writes --------------
+    _RATE_AMP_PREFIX = {"VELOCITY": "VEL", "ACCELERATION": "ACC"}
+
+    def _rate_amplitude(self, pts: List[Tuple[float, float]], q: str) -> Tuple[str, List[str]]:
+        """A new *AMPLITUDE of the displacement points ``pts`` that a *BOUNDARY, TYPE=``q``
+        becomes: (its name, its lines)."""
+        self._vel_amp_count += 1
+        name = f"ABQ2CCX_{self._RATE_AMP_PREFIX[q]}{self._vel_amp_count}"
+        return name, [f"*AMPLITUDE, NAME={name}"] + amplitude_lines(pts)
+
+    def _rate_bc_lines(self, spec: str, dofs: List[int], members: List[Tuple[int, int]], value: str,
+                       named: Optional[str] = None) -> List[str]:
+        """Data lines for ``members`` of a line on spec x dofs: on the spec itself (its
+        named type, when it is all of it and has no value) when they are some DOFs of
+        all its nodes, else per node; DOFs as contiguous runs."""
+        tail = [value] if value else []
+        nodes = self._resolve_nodes(spec)
+        sub = sorted({d for _, d in members})
+        if not nodes or set(members) == {(n, d) for n in nodes for d in sub}:
+            if named and sub == sorted(dofs) and not value:
+                return [f"{spec}, {named}"]
+            return [", ".join([spec, str(a), str(c)] + tail) for a, c in dof_runs(sub or dofs)]
+        out = []
+        for n in dedup([n for n, _ in members]):
+            out += [", ".join([str(n), str(a), str(c)] + tail)
+                    for a, c in dof_runs(sorted(d for m, d in members if m == n))]
+        return out
+
+    @staticmethod
+    def _bc_pieces(op: Optional[str], amp_lines: List[str], entries: List[Tuple[object, str]],
+                   notes: List[str]) -> List[object]:
+        """The generated amplitudes, then one *BOUNDARY per run of lines of one kind
+        (line order kept: a later line overrides an earlier one on the same DOF)."""
+        out: List[object] = list(notes) + list(amp_lines)
+        for sig, text in entries:
+            if sig == "#":
+                out.append(text)
+                continue
+            if out and isinstance(out[-1], Block) and getattr(out[-1], "_sig", None) == sig:
+                out[-1].data.append(text)
+                continue
+            params = []
+            if op and not any(isinstance(p, Block) for p in out):
+                params.append(("OP", op))
+            if sig == "FIXED":
+                params.append(("FIXED", None))
+            elif sig is not None:
+                params.append(("AMPLITUDE", sig))
+            blk = mkblock("BOUNDARY", params, [text])
+            blk._sig = sig
+            out.append(blk)
+        if op and not any(isinstance(p, Block) for p in out):
+            out.append(mkblock("BOUNDARY", [("OP", op)], []))     # it still removes BCs
+        return out
+
+    def _rate_line_comment(self, what: str, why: str, reduces: bool = True) -> Tuple[str, str]:
+        """A rate BC line that is not converted: warned, and the comment line in its place."""
+        self.report.warn(why, once=True)
+        if reduces:
+            self._reduces("*BOUNDARY, TYPE=VELOCITY/ACCELERATION line not converted")
+        return ("#", f"** abq2ccx: not converted: {what} -- {why}")
+
+    def _rate_constraint_card(self, b: Block, why: str) -> List[object]:
+        """A rate card where only its constraint can be kept (model data, perturbation)."""
+        entries = []
+        for spec, dofs, mag, named, text in self._rate_lines(b):
+            try:
+                nonzero = bool(mag) and pf(mag) != 0.0
+            except ValueError:
+                nonzero = True
+            if not dofs or nonzero:
+                entries.append(self._rate_line_comment(
+                    text, f"*BOUNDARY, TYPE={self._bc_type(b)} {why}: only a zero value on "
+                          f"readable DOFs can be converted (to a zero displacement BC).",
+                    why not in ("in model data", "outside a step")))
+            else:
+                entries.append((None, f"{spec}, {named}" if named else
+                                f"{spec}, {dofs[0]}, {dofs[-1]}"))
+        self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION {why}: zero-valued, so "
+                         f"converted to the zero displacement BC it amounts to.", once=True)
+        return self._bc_pieces(b.param("OP"), [], entries, [])
+
     def _plan_velocity_bcs(self, blocks: List[Block]) -> None:
         """*BOUNDARY, TYPE=VELOCITY / ACCELERATION -> displacement BCs: ccx prescribes
         displacements only (its *BOUNDARY has no TYPE).
@@ -7965,98 +8058,12 @@ class Converter:
         state = {k: [0.0, v_init.get(k, 0.0), None] for k in tracked}
         model, groups = step_groups(blocks)
         model = [b for b in model if b.keyword == "BOUNDARY"]
-        names = {"VELOCITY": "VEL", "ACCELERATION": "ACC"}
         stats = {"dev": 0.0, "n": 0}
         max_points = 1000
 
-        def amp_card(pts: List[Tuple[float, float]], q: str) -> Tuple[str, List[str]]:
-            self._vel_amp_count += 1
-            name = f"ABQ2CCX_{names[q]}{self._vel_amp_count}"
-            return name, [f"*AMPLITUDE, NAME={name}"] + amplitude_lines(pts)
-
-        def runs(ds: Sequence[int]) -> List[Tuple[int, int]]:
-            """Contiguous runs of sorted DOFs."""
-            out: List[Tuple[int, int]] = []
-            for d in ds:
-                if out and out[-1][1] == d - 1:
-                    out[-1] = (out[-1][0], d)
-                else:
-                    out.append((d, d))
-            return out
-
-        def lines(spec: str, dofs: List[int], members: List[Tuple[int, int]], value: str,
-                  named: Optional[str] = None) -> List[str]:
-            """Data lines for ``members`` of a line on spec x dofs: on the spec itself (its
-            named type, when it is all of it and has no value) when they are some DOFs of
-            all its nodes, else per node; DOFs as contiguous runs."""
-            tail = [value] if value else []
-            nodes = self._resolve_nodes(spec)
-            sub = sorted({d for _, d in members})
-            if not nodes or set(members) == {(n, d) for n in nodes for d in sub}:
-                if named and sub == sorted(dofs) and not value:
-                    return [f"{spec}, {named}"]
-                return [", ".join([spec, str(a), str(c)] + tail) for a, c in runs(sub or dofs)]
-            out = []
-            for n in dedup([n for n, _ in members]):
-                out += [", ".join([str(n), str(a), str(c)] + tail)
-                        for a, c in runs(sorted(d for m, d in members if m == n))]
-            return out
-
-        def pieces(op: Optional[str], amp_lines: List[str], entries: List[Tuple[object, str]],
-                   notes: List[str]) -> List[object]:
-            """The generated amplitudes, then one *BOUNDARY per run of lines of one kind
-            (line order kept: a later line overrides an earlier one on the same DOF)."""
-            out: List[object] = list(notes) + list(amp_lines)
-            for sig, text in entries:
-                if sig == "#":
-                    out.append(text)
-                    continue
-                if out and isinstance(out[-1], Block) and getattr(out[-1], "_sig", None) == sig:
-                    out[-1].data.append(text)
-                    continue
-                params = []
-                if op and not any(isinstance(p, Block) for p in out):
-                    params.append(("OP", op))
-                if sig == "FIXED":
-                    params.append(("FIXED", None))
-                elif sig is not None:
-                    params.append(("AMPLITUDE", sig))
-                blk = mkblock("BOUNDARY", params, [text])
-                blk._sig = sig
-                out.append(blk)
-            if op and not any(isinstance(p, Block) for p in out):
-                out.append(mkblock("BOUNDARY", [("OP", op)], []))     # it still removes BCs
-            return out
-
-        def comment(what: str, why: str, reduces: bool = True) -> Tuple[str, str]:
-            self.report.warn(why, once=True)
-            if reduces:
-                self._reduces("*BOUNDARY, TYPE=VELOCITY/ACCELERATION line not converted")
-            return ("#", f"** abq2ccx: not converted: {what} -- {why}")
-
-        def constraint_card(b: Block, why: str) -> List[object]:
-            """A rate card where only its constraint can be kept (model data, perturbation)."""
-            entries = []
-            for spec, dofs, mag, named, text in self._rate_lines(b):
-                try:
-                    nonzero = bool(mag) and pf(mag) != 0.0
-                except ValueError:
-                    nonzero = True
-                if not dofs or nonzero:
-                    entries.append(comment(text, f"*BOUNDARY, TYPE={self._bc_type(b)} {why}: "
-                                                 f"only a zero value on readable DOFs can be "
-                                                 f"converted (to a zero displacement BC).",
-                                           why not in ("in model data", "outside a step")))
-                else:
-                    entries.append((None, f"{spec}, {named}" if named else
-                                    f"{spec}, {dofs[0]}, {dofs[-1]}"))
-            self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION {why}: zero-valued, so "
-                             f"converted to the zero displacement BC it amounts to.", once=True)
-            return pieces(b.param("OP"), [], entries, [])
-
         for b in model:
             if self._bc_type(b) in self._RATE_TYPES:
-                self._vel_cards[id(b)] = constraint_card(b, "in model data")
+                self._vel_cards[id(b)] = self._rate_constraint_card(b, "in model data")
             for spec, dofs, mag, _, _ in self._rate_lines(b):      # held from the first step on
                 try:
                     value = pf(mag) if mag and self._bc_type(b) not in self._RATE_TYPES else 0.0
@@ -8079,7 +8086,7 @@ class Converter:
                        f"in a {info['proc']} step (no time period over which to integrate it)")
                 for b in cards:
                     if self._bc_type(b) in self._RATE_TYPES:
-                        self._vel_cards[id(b)] = constraint_card(b, why)
+                        self._vel_cards[id(b)] = self._rate_constraint_card(b, why)
                 if not info["perturbation"] and info["proc"] != "HEAT TRANSFER":
                     for st in state.values():          # nodes moved, by unknown amounts
                         st[0] = st[1] = None
@@ -8142,18 +8149,18 @@ class Converter:
                 q, order = bc["q"], 2 if bc["q"] == "ACCELERATION" else 1
                 spec, dofs, named, text = bc["spec"], bc["dofs"], bc.get("named"), bc["text"]
                 if bc["mode"] == "UNKNOWN":
-                    entries.append(comment(text, f"*BOUNDARY, TYPE={q} with AMPLITUDE={bc['amp']}: "
+                    entries.append(self._rate_line_comment(text, f"*BOUNDARY, TYPE={q} with AMPLITUDE={bc['amp']}: "
                                                  f"that amplitude is not one the converter can "
                                                  f"integrate (TABULAR, EQUALLY SPACED, SMOOTH STEP, "
                                                  f"PERIODIC, MODULATED, DECAY)."))
                     return
                 if bc["mode"] == "AMP" and bc["curve"].total and t0 is None:
-                    entries.append(comment(text, f"*BOUNDARY, TYPE={q} with a TIME=TOTAL TIME "
+                    entries.append(self._rate_line_comment(text, f"*BOUNDARY, TYPE={q} with a TIME=TOTAL TIME "
                                                  f"amplitude after a step whose time period is "
                                                  f"unknown (Riks, or no procedure)."))
                     return
                 if bc["mode"] == "AMP" and too_fast((None, None, bc["curve"].panel)):
-                    entries.append(comment(text, f"*BOUNDARY, TYPE={q} whose amplitude oscillates "
+                    entries.append(self._rate_line_comment(text, f"*BOUNDARY, TYPE={q} whose amplitude oscillates "
                                                  f"over a thousand times in the step: too fast for "
                                                  f"a sampled displacement amplitude."))
                     return
@@ -8184,7 +8191,7 @@ class Converter:
                     if u_s is None or v_s is None:
                         still = None if v_s is None else motion(bc, 0.0, v_s, prev)
                         if still is None or any(x != 0.0 for _, x in still[0]):
-                            entries.append(comment(text, f"*BOUNDARY, TYPE={q} on a DOF whose "
+                            entries.append(self._rate_line_comment(text, f"*BOUNDARY, TYPE={q} on a DOF whose "
                                                          f"displacement at the start of the step is "
                                                          f"unknown (it was free, or held by a "
                                                          f"USER/SUBMODEL BC, before): ccx prescribes "
@@ -8195,9 +8202,9 @@ class Converter:
                         fix = [(n, d) for n, d in members if self._holdable(n, d)]
                         rotating = [(n, d) for n, d in members if self._holdable(n, d) is False]
                         if fix:
-                            entries += [("FIXED", ln) for ln in lines(spec, dofs, fix, "")]
+                            entries += [("FIXED", ln) for ln in self._rate_bc_lines(spec, dofs, fix, "")]
                         if rotating:
-                            entries.append(comment(
+                            entries.append(self._rate_line_comment(
                                 f"{spec}, DOF {', '.join(map(str, sorted({d for _, d in rotating})))}",
                                 f"*BOUNDARY, TYPE={q}: a zero rate on a DOF whose value at the start "
                                 f"of the step is unknown and that ccx's *BOUNDARY, FIXED cannot hold "
@@ -8208,7 +8215,7 @@ class Converter:
                     travel = max(abs(x - u_s) for _, x in pts)
                     if travel == 0.0:
                         value = "%.12g" % u_s if u_s else ""
-                        entries += [(None, ln) for ln in lines(spec, dofs, members, value, named)]
+                        entries += [(None, ln) for ln in self._rate_bc_lines(spec, dofs, members, value, named)]
                         driven.update((k, (bc, u_s, v_s, prev, None, value or "0")) for k in members)
                         continue
                     stats["dev"] = max(stats["dev"], dev / travel)
@@ -8223,9 +8230,9 @@ class Converter:
                                       u_s, v_s, prev), "1."
                         scale = 1.0
                     if key not in shapes:
-                        shapes[key], text_ = amp_card([(t, x / scale) for t, x in pts], q)
+                        shapes[key], text_ = self._rate_amplitude([(t, x / scale) for t, x in pts], q)
                         amp_lines += text_
-                    entries += [(shapes[key], ln) for ln in lines(spec, dofs, members, value)]
+                    entries += [(shapes[key], ln) for ln in self._rate_bc_lines(spec, dofs, members, value)]
                     driven.update((k, (bc, u_s, v_s, prev, shapes[key], value)) for k in members)
                     if info["dynamic"] and order == 1:
                         f0 = self._bc_history(bc, T, t0, None, prev)[0](0.0)
@@ -8264,7 +8271,7 @@ class Converter:
                     min([h[2] for h in rates if h[2] > 0.0], default=0.0), max_points=max_points)
                 key = ("midside", m, d, ea[4], ec[4], ea[5], ec[5])
                 if key not in shapes:
-                    shapes[key], text_ = amp_card(pts, "ACCELERATION" if order == 2 else "VELOCITY")
+                    shapes[key], text_ = self._rate_amplitude(pts, "ACCELERATION" if order == 2 else "VELOCITY")
                     amp_lines += text_
                 return (shapes[key], f"{m}, {d}, {d}, 1.")
 
@@ -8314,7 +8321,7 @@ class Converter:
                         bad = mag is None or b.has("USER") or not dofs or \
                             any(not 1 <= d <= 6 for d in dofs)
                         if bad:
-                            entries.append(comment(text, f"*BOUNDARY, TYPE={q}: only constant "
+                            entries.append(self._rate_line_comment(text, f"*BOUNDARY, TYPE={q}: only constant "
                                                          f"magnitudes on DOFs 1-6 or a known named "
                                                          f"type (no USER) can be integrated into "
                                                          f"displacements."))
@@ -8349,7 +8356,7 @@ class Converter:
                         redefined.add(k)
                 if rate:
                     midside(driven, shapes, amp_lines, entries, mid_done)
-                    self._vel_cards[id(b)] = pieces(b.param("OP"), amp_lines, entries, [])
+                    self._vel_cards[id(b)] = self._bc_pieces(b.param("OP"), amp_lines, entries, [])
                 for spec, dofs, _, _, _ in self._rate_lines(b):   # a later card replaces a BC
                     for n in self._resolve_nodes(spec):
                         for d in dofs:
@@ -8377,7 +8384,7 @@ class Converter:
                             tail.append(e)
             tail = [e for e in tail if e[0] not in (None, "FIXED")]   # ccx holds those already
             if tail:
-                self._vel_tail[s] = pieces(None, tail_amps, tail,
+                self._vel_tail[s] = self._bc_pieces(None, tail_amps, tail,
                                            ["** abq2ccx: *BOUNDARY, TYPE=VELOCITY/ACCELERATION of "
                                             "an earlier step, still in force: its motion continues"])
             # warn where finite rotations about several axes are integrated component-wise:
@@ -8435,7 +8442,7 @@ class Converter:
             t0 = None if t0 is None else t0 + T
         for b in rate_cards:                       # *BOUNDARY between steps: no step to act in
             if id(b) not in self._vel_cards:
-                self._vel_cards[id(b)] = constraint_card(b, "outside a step")
+                self._vel_cards[id(b)] = self._rate_constraint_card(b, "outside a step")
         if stats["n"]:
             self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION -> displacement BCs whose "
                              f"generated amplitudes (ABQ2CCX_VEL*/ACC*) are the time integral of the "
