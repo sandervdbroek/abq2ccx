@@ -12116,8 +12116,7 @@ class Converter:
         sd = self.surfaces.get(surf.upper())
         if sd is None or sd[0].startswith("NODE"):
             return []
-        return dedup([e for token, _face in sd[1] for e in
-                      ([int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token))
+        return dedup([e for token, _face in sd[1] for e in self._resolve_elements(token)
                       if e in self.geom.elements])
 
     def _membrane_tie_tolerance(self, given: Optional[str], slave: str, master: str, b: Block,
@@ -12138,8 +12137,7 @@ class Converter:
         if tol <= 0.0:
             def faces(surf: str) -> List[List[Vec]]:
                 return [self._face_points(e, f) for token, f in self.surfaces.get(surf.upper(), ("", []))[1]
-                        for e in ([int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token))
-                        if e in self.geom.elements]
+                        for e in self._resolve_elements(token) if e in self.geom.elements]
             pts = faces(master) or faces(slave)        # (as for an analytical master)
             if pair:
                 edges = [vnorm(vsub(q[(i + 1) % len(q)], q[i])) for q in pts if len(q) > 1
@@ -13451,7 +13449,7 @@ class Converter:
         shells and membranes S1/S2 are the bottom/top faces and the edges are S3..S6
         (verified: a tie on S1 of a shell edge silently ties nothing); plane elements
         number their edges S1..S4 like Abaqus."""
-        eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token)
+        eids = self._resolve_elements(token)
         types = {ccx_type(self.geom.elements[e][0]) for e in eids
                  if e in self.geom.elements}
         if types and all(t.startswith(PLANE_ELEM_PREFIXES) for t in types):
@@ -13479,9 +13477,7 @@ class Converter:
         self._drop_surface_elements(raw, blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
         # beams, skins, slab layers, ...) are numbered above them (ccx_results_digest)
-        self.model_labels = (max(self.geom.nodes, default=0),
-                             max(list(self.geom.elements) + list(self._carriers) + list(self._conn),
-                                 default=0))
+        self.model_labels = self._next_ids()
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
         self._find_planar_elements()            # before the beam upgrades below retype them
@@ -13737,7 +13733,7 @@ class Converter:
                 f = [x for x in rec if x != ""]
                 if not f:
                     continue
-                eids = [int(f[0])] if re.fullmatch(r"[-+]?\d+", f[0]) else dedup(self.geom.elset(f[0]))
+                eids = dedup(self._resolve_elements(f[0]))
                 rid = [e for e in eids if e in rigid]
                 if not rid:
                     continue
@@ -14095,7 +14091,7 @@ class Converter:
                         for e in self._node_elems().get(n, [])[:1]:
                             edges(self.geom.elements[e][1])
                     continue
-                eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token)
+                eids = self._resolve_elements(token)
                 for e in eids[:5000]:
                     edges(self._face_nodes(e, face, types))
         if not lengths:
@@ -14401,8 +14397,7 @@ class Converter:
                 stype, sfaces = self.surfaces.get(toks[0], ("ELEMENT", []))
                 node_based = stype.startswith("NODE")
                 slave_faces = [] if node_based else [
-                    (e, f) for tok, f in sfaces
-                    for e in ([int(tok)] if re.fullmatch(r"[-+]?\d+", tok) else self.geom.elset(tok))
+                    (e, f) for tok, f in sfaces for e in self._resolve_elements(tok)
                     if e in self.geom.elements]
                 if node_based:
                     slaves = dedup([n for tok, _ in sfaces for n in self._resolve_nodes(tok)])
@@ -15645,7 +15640,7 @@ class Converter:
         new_sets: "OrderedDict[str, List[int]]" = OrderedDict()
 
         def remap(token: str, k: int) -> Optional[List[Tuple[str, int]]]:
-            eids = [int(token)] if isint(token) else dedup(self.geom.elset(token))
+            eids = dedup(self._resolve_elements(token))
             stem = f"ABQ2CCX_E{token}" if isint(token) else token
             hit = [e for e in eids if e in plies_of]
             if not hit:
@@ -15945,8 +15940,7 @@ class Converter:
                     if not r[0].strip():
                         default = t
                     else:
-                        for e in ([int(r[0])] if re.fullmatch(r"[-+]?\d+", r[0].strip())
-                                  else self.geom.elset(r[0].strip())):
+                        for e in self._resolve_elements(r[0].strip()):
                             per[e] = t
             else:
                 recs = merged_data_records(b)
@@ -18464,8 +18458,7 @@ class Converter:
                             pass
                 self._knot_k = max([k for k in ks if k > 0] or [1.0])
         d = vunit((1.0, 1.0, 1.0))
-        nid = max(self.geom.nodes)
-        eid = max(list(self.geom.elements) + list(self._carriers) + list(self._conn), default=0)
+        nid, eid = self._next_ids()
         elems = []
         for n in nodes:
             nid += 1
@@ -19274,7 +19267,7 @@ class Converter:
             if sd[0].startswith("NODE"):
                 nodes.extend(self._resolve_nodes(token))
                 continue
-            eids = [int(token)] if re.fullmatch(r"[-+]?\d+", token) else self.geom.elset(token)
+            eids = self._resolve_elements(token)
             for e in eids:
                 nodes.extend(self._face_nodes(e, face, types))
         return dedup(nodes)
@@ -19306,6 +19299,11 @@ class Converter:
         if re.fullmatch(r"[-+]?\d+", token):
             return [int(token)]
         return self.geom.nset(token)
+
+    def _resolve_elements(self, token: str) -> List[int]:
+        if re.fullmatch(r"[-+]?\d+", token):
+            return [int(token)]
+        return self.geom.elset(token)
 
     # -- dependent DOFs of the converted deck ------------------------------------
     def _settle_dependents(self, out: List[str]) -> List[str]:
@@ -20790,7 +20788,7 @@ class Converter:
                     m = re.fullmatch(r"S([1-4])", (face or "").upper())
                     if not m:
                         continue
-                    for e in ([int(tok)] if re.fullmatch(r"[-+]?\d+", tok) else self.geom.elset(tok)):
+                    for e in self._resolve_elements(tok):
                         typ, conn = self.geom.elements.get(e, ("", []))
                         n = len(conn)
                         density = rho.get(mat_of.get(e, ""))
