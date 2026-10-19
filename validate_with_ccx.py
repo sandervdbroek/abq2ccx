@@ -1840,6 +1840,26 @@ def amplitude_close_times_deck(definition="EQUALLY SPACED"):
             "*STEP, NLGEOM\n*STATIC, DIRECT\n0.00005, 0.0002\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
+def tied_strip_deck(symmetric=True):
+    """A composite S4R strip [0/90/90/0] of thickness 2 (its plies listed, or the bottom two
+    with SYMMETRIC), cantilevered from a clamped rigid R3D4 plate below its first element by
+    a *TIE (position tolerance 0.1, no adjustment): those nodes touch it with the bottom face."""
+    nodes = [f"{11 + 10 * j + i}, {float(i)}, {float(j)}, 1." for j in range(2) for i in range(5)]
+    elems = [f"{2 + i}, {11 + i}, {12 + i}, {22 + i}, {21 + i}" for i in range(4)]
+    plies = ["0.5, 3, M, 0.", "0.5, 3, M, 90."] + ([] if symmetric else ["0.5, 3, M, 90.", "0.5, 3, M, 0."])
+    lines = (["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 1., 1., 0.", "4, 0., 1., 0.",
+              "100, 0.5, 0.5, 0."] + nodes + ["*ELEMENT, TYPE=R3D4, ELSET=RIG", "1, 1, 2, 3, 4",
+              "*ELEMENT, TYPE=S4R, ELSET=STRIP"] + elems +
+             ["*NSET, NSET=TIP", "15, 25", "*RIGID BODY, REF NODE=100, ELSET=RIG",
+              "*SURFACE, NAME=MASTER", "RIG, SPOS", "*SURFACE, NAME=SLAVE", "STRIP, SNEG",
+              "*SHELL SECTION, ELSET=STRIP, COMPOSITE" + (", SYMMETRIC" if symmetric else "")] + plies +
+             ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3",
+              "*TIE, NAME=T, POSITION TOLERANCE=0.1, ADJUST=NO", "SLAVE, MASTER", "*STEP", "*STATIC",
+              "*BOUNDARY", "100, 1, 6", "*CLOAD", "TIP, 3, -0.01", "*NODE PRINT, NSET=TIP", "U",
+              "*END STEP"])
+    return "\n".join(lines) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -4387,6 +4407,18 @@ def main():
         elif hist:
             print(f"FAIL  {tag}: {len(hist)} increments printed, not 4")
         failures += 0 if ok else 1
+    # a SYMMETRIC layup's thickness in a tie to a rigid plate (counted half, ccx got the tie)
+    strips = [review_run(tied_strip_deck(sym), "rigid_tie_symmetric_layup" + ("" if sym else "_ref"),
+                         dat_displacements) for sym in (True, False)]
+    if all(strips):
+        got, want = strips[0].get(15, [0.0, 0.0, math.inf])[2], strips[1].get(15, [0.0, 0.0, math.nan])[2]
+        err = abs(got / want - 1)
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_tie_symmetric_layup (a composite S4R strip [0/90]s "
+              f"tied to a clamped rigid plate under its first element, POSITION TOLERANCE=0.1): tip "
+              f"deflection {got:.7g} vs {want:.7g} with all four plies listed ({err:.1e} apart; taken "
+              f"half as thick, its tie was left to ccx: 3.3x)")
+    failures += 0 if all(strips) and ok else 1
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")

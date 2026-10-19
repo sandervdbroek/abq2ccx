@@ -5967,6 +5967,12 @@ def test_ccx_knot_prediction():
     # shells: a flat plate's shared edge is one group, a fold of 90 deg two
     assert _knot_of(S4, 2) is False
     assert _knot_of(S4.replace("5,2,0,0\n6,2,1,0", "5,1,0,1\n6,1,1,1"), 2) is True
+    # a SYMMETRIC layup is its plies mirrored: 2 x 0.025 is the other element's 0.1
+    sym = S4.replace("*Shell Section,elset=E,material=M\n0.1\n", "*Elset,elset=E1\n1\n*Elset,elset=E2\n2\n"
+                     "*Shell Section,elset=E1,material=M\n0.1\n*Shell Section,elset=E2,composite,"
+                     "symmetric\n0.025,3,M,0.\n0.025,3,M,90.\n")
+    assert _knot_of(sym, 2) is False
+    assert _knot_of(sym.replace("0.025,3,M,90.\n", "0.025,3,M,90.\n0.01,3,M,0.\n"), 2) is True
 
 
 # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION ------------------------------------------
@@ -7387,6 +7393,13 @@ def test_tie_to_a_rigid_surface_follows_abaqus_tolerances():
     body, conv, _ = convert_str(shell.format(", NO THICKNESS, POSITION TOLERANCE=0.2"))
     assert {1, 2, 3, 4} <= _body_members(body)
     assert all(abs(conv.geom.nodes[n][2] - 1.0) < 1e-12 for n in (1, 2, 3, 4))
+    # a SYMMETRIC layup lists the bottom half of its plies: 0.05 / 0.05 mirrored is the 0.2 shell
+    # above (counted as 0.1, its nodes were moved to 0.95, into the master)
+    sym = shell.replace("*SHELL SECTION, ELSET=SH, MATERIAL=M\n0.2\n", "*SHELL SECTION, ELSET=SH, "
+                        "COMPOSITE, SYMMETRIC\n0.05, 3, M, 0.\n0.05, 3, M, 90.\n")
+    body, conv, _ = convert_str(sym.format(""))
+    assert {1, 2, 3, 4} <= _body_members(body)
+    assert all(abs(conv.geom.nodes[n][2] - 0.9) < 1e-12 for n in (1, 2, 3, 4))
 
 
 def test_unconverted_analytical_surface_comments_only_its_lines():

@@ -10044,7 +10044,8 @@ class Converter:
             recs = [r for r in recs if r]
             try:
                 if b.keyword.startswith("SHELL"):
-                    thick = sum(pf(r[0]) for r in recs) if b.has("COMPOSITE") else pf(recs[0][0])
+                    thick = sum(pf(t) for t, _m, _o in self._section_layers(b)) \
+                        if b.has("COMPOSITE") else pf(recs[0][0])
                     key: tuple = ("S", thick, (b.param("OFFSET") or "0").strip().upper())
                 else:
                     key = ("B", (b.param("SECTION") or "").strip().upper(),
@@ -14213,14 +14214,15 @@ class Converter:
 
     def _shell_thicknesses(self, blocks: List[Block]) -> Dict[int, Tuple[float, float]]:
         """Conventional shell element -> (thickness, OFFSET as a fraction: SPOS 0.5, SNEG
-        -0.5) from its *SHELL SECTION / *SHELL GENERAL SECTION (a layup: its plies' sum)."""
+        -0.5) from its *SHELL SECTION / *SHELL GENERAL SECTION (a layup: its plies' sum, a
+        SYMMETRIC one mirrored)."""
         out: Dict[int, Tuple[float, float]] = {}
         for b in blocks:
             if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION"):
                 continue
             recs = [r for r in merged_data_records(b) if any(x for x in r)]
             try:
-                t = sum(pf(r[0]) for r in recs if r and r[0]) if b.has("COMPOSITE") else \
+                t = sum(pf(t) for t, _m, _o in self._section_layers(b)) if b.has("COMPOSITE") else \
                     (pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 0.0)
             except ValueError:
                 continue
@@ -20653,7 +20655,7 @@ class Converter:
             sec: dict = {}
             if b.has("COMPOSITE"):                  # plies: thickness, -, material, ...
                 plies = [r for r in range(len(recs)) if num(r, 0)]
-                sec["t"] = sum(num(r, 0) for r in plies)
+                sec["t"] = sum(num(r, 0) for r in plies) * (2 if b.has("SYMMETRIC") else 1)
                 mats = [recs[r][2].strip().upper() for r in plies if len(recs[r]) > 2]
             elif b.keyword == "BEAM SECTION":
                 shape = (b.param("SECTION") or "").strip().upper()
