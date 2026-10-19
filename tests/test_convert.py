@@ -2820,10 +2820,15 @@ def test_equation_card_with_several_set_equations():
 
 
 def test_perturbation_static_before_general_step_warns():
-    _, _, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n*Step\n*Static\n*End Step\n")
-    assert "loads persist" in rep.text()
+    # ccx runs it as a general step: the next general step gets its loads back
+    # (_restore_base_states) but starts from its deformed state
+    _, conv, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n*Step\n*Static\n*End Step\n")
+    assert "starts from its deformed state" in rep.text() and conv.reduced_physics
+    _, conv, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n*Step, perturbation\n"
+                                     "*Static\n*End Step\n")
+    assert "loads persist" in rep.text() and conv.reduced_physics
     _, _, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n")
-    assert "loads persist" not in rep.text()
+    assert "loads persist" not in rep.text() and "deformed state" not in rep.text()
 
 
 def test_eigen_data_line_layouts():
@@ -4773,14 +4778,16 @@ def test_load_audit_flags_steps_whose_loads_do_not_survive():
         ["*CLOAD on 1"], ["*CLOAD on 1"], ["*CLOAD on 2", "*CLOAD on 3"],
         ["*BOUNDARY: prescribed value on 2"], [], None]
     # in Abaqus a frequency step is a perturbation step: its cards do not carry over (ccx's
-    # do), so a prescribed value its OP=NEW removes in ccx is lost in the conversion
+    # do), so its OP=NEW removes a prescribed value only in ccx — which the conversion gives
+    # back in step 3 (_restore_base_states)
     freq = ("*Step\n*Static\n*Boundary\n7, 1, 1, 0.5\n*End Step\n*Step\n*Frequency\n3\n"
             "*Boundary, op=NEW\n7, 1, 1\n*End Step\n*Step\n*Static\n*End Step\n")
     blocks = A.blocks_from_lines(freq.splitlines())
     assert A.step_load_audit(blocks, True, abaqus=True)[2] == ["*BOUNDARY: prescribed value on 7"]
     assert A.step_load_audit(blocks, False)[2] == []
-    _, conv, rep = convert_str(HEX + freq)
-    assert conv.unloaded_steps == [3] and "Step 3 is loaded in the Abaqus deck" in rep.text()
+    body, conv, rep = convert_str(HEX + freq)
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_HOLD\n7, 1, 1, 0.5\n" in body.split("*STEP")[3]
+    assert not conv.unloaded_steps and "Step 3 is loaded in the Abaqus deck" not in rep.text()
     blocks = A.blocks_from_lines(freq.replace("*Boundary, op=NEW\n7, 1, 1\n", "*Cload\n7, 1, 1.\n")
                                  .splitlines())
     assert A.step_load_audit(blocks, True, abaqus=True)[2] == ["*BOUNDARY: prescribed value on 7"]
@@ -4798,6 +4805,117 @@ def test_dload_and_dsload_op_new_keep_each_others_loads():
     step2 = body.split("*STEP")[2]
     assert "*DLOAD, OP=NEW" in step2 and "\nEALL, GRAV, 9.81, 0., 0., -1." in step2
     assert "P2" not in step2 and not conv.unloaded_steps
+
+
+# a static step (a load, a pressure, a prescribed displacement, temperatures), a *FREQUENCY
+# step with the given cards, and a static step with the given cards
+PERT = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.\n"
+        "*Density\n1e-3\n*Expansion\n1e-3\n*Solid Section, elset=EALL, material=M\n"
+        "*Initial Conditions, type=temperature\nALL, 0.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+        "*Step\n*Static\n*Cload\n7, 1, 1.\n*Dload\n1, P2, 1.\n*Boundary\n8, 2, 2, 0.1\n"
+        "*Temperature\nALL, 100.\n*End Step\n"
+        "*Step\n*Frequency\n3\n{}*End Step\n*Step\n*Static\n{}*End Step\n")
+
+
+def test_general_step_after_perturbation_gets_the_base_state():
+    # Abaqus continues from the last general step's state after a linear perturbation step;
+    # ccx 2.23 carries the perturbation step's loads and BCs on (probed: its *CLOAD loaded
+    # step 3, its BC held node 6) and zeroes prescribed BC values.  So step 3 starts with the
+    # base state given again, at once (the constant amplitude), without the load it gives
+    # itself (ccx adds up a load given twice in one step), and with OP=NEW on the *BOUNDARY
+    # where the perturbation step held a DOF the base state leaves free
+    body, conv, rep = convert_str(PERT.format("*Cload\n7, 2, 1.\n*Boundary\n6, 1, 1, 0.5\n",
+                                              "*Cload\n7, 1, 2.\n"))
+    steps = body.split("*STEP")
+    assert steps[0].endswith("*AMPLITUDE, NAME=ABQ2CCX_HOLD\n0., 1., 1., 1.\n")
+    assert "HOLD" not in steps[1] + steps[2] and "OP=NEW" not in steps[2]
+    assert steps[3].startswith("\n*STATIC\n** abq2ccx: the loads, BCs and temperatures of step 1 "
+                               "given again (linear perturbation step(s) 2 in between)\n"
+                               "*BOUNDARY, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+                               "8, 2, 2, 0.1\n*CLOAD, OP=NEW\n*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n"
+                               "1, P2, 1.\n*TEMPERATURE, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nALL, 100.\n"
+                               "*CLOAD\n7, 1, 2.\n"), steps[3]
+    assert "Step 3 follows a linear perturbation step" in rep.text()
+    assert not conv.reduced_physics and not conv.unloaded_steps
+    # a changed value needs no OP=NEW; nor does a *FREQUENCY step without cards, after which
+    # ccx 2.23 still has zeroed the prescribed values (from the first nonzero line on)
+    third = convert_str(PERT.format("*Boundary\n8, 2, 2, 0.3\n", ""))[0].split("*STEP")[3]
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_HOLD\n1, 1, 3\n2, 2, 3\n4, 3, 3\n8, 2, 2, 0.1\n" \
+           "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n7, 1, 1.\n" in third
+    third = convert_str(PERT.format("", ""))[0].split("*STEP")[3]
+    assert "*BOUNDARY, AMPLITUDE=ABQ2CCX_HOLD\n8, 2, 2, 0.1\n*CLOAD, OP=NEW" in third
+    # a card the step gives with OP=NEW is left to it (it removes the base state in Abaqus too)
+    third = convert_str(PERT.format("", "*Cload, op=NEW\n7, 2, 1.\n*Boundary, op=NEW\n1, 1, 3\n"
+                                        "2, 2, 3\n4, 3, 3\n"))[0].split("*STEP")[3]
+    assert third.count("*CLOAD") == third.count("*BOUNDARY") == 1 and "\n*DLOAD, OP=NEW" in third
+    # without a perturbation step nothing changes
+    body, _, rep = convert_str(PERT.replace("*Step\n*Frequency\n3\n{}*End Step\n", "").format(""))
+    assert "HOLD" not in body and "perturbation" not in rep.text()
+
+
+def test_base_state_after_perturbation_values_and_keys():
+    deck = HEX + ("*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
+                  "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Nset, nset=TOP\n5, 6, 7, 8\n"
+                  "*Amplitude, name=A\n0., 0., 2., 4.\n*Amplitude, name=T, time=total time\n0., 0., 10., 10.\n"
+                  "*Step\n*Static\n0.5, 1.\n{}*End Step\n*Step\n*Frequency\n3\n*End Step\n"
+                  "*Step\n*Static\n{}*End Step\n")
+    # a step-time amplitude's value at the end of its step (A(1) = 2: ccx and Abaqus hold it
+    # there), a TIME=TOTAL TIME one kept as it is
+    body, _, _ = convert_str(deck.format("*Cload, amplitude=A\n7, 1, 1.\n*Cload, amplitude=T\n7, 2, 1.\n",
+                                         ""))
+    assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n7, 1, 2.\n*CLOAD, AMPLITUDE=T\n7, 2, 1.\n" in body
+    # the step's own loads are left out: a set's other nodes are given one by one, a face
+    # load on an element of a set it loads goes; a body load is one per set and direction
+    body, _, _ = convert_str(deck.format("*Cload\nTOP, 3, -1.\n*Dload\nEALL, P2, 1.\n"
+                                         "EALL, GRAV, 9.81, 0., 0., -1.\n",
+                                         "*Cload\n7, 3, -2.\n*Dload\n1, P2, 2.\n"))
+    assert ("*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 3, -1.\n6, 3, -1.\n8, 3, -1.\n"
+            "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nEALL, GRAV, 9.81, 0., 0., -1.\n"
+            "*CLOAD\n7, 3, -2.\n*DLOAD\n1, P2, 2.\n") in body
+
+
+def test_perturbation_step_nodal_forces_do_not_carry_over():
+    # converted loads (nodal forces) of a perturbation step are not the state the next step
+    # starts from: step 3 re-gives its own traction (the same as step 2's), or none
+    deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
+            "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Surface, name=S2\nEALL, S2\n"
+            "*Step\n*Static\n*Dsload\nS2, TRVEC, 1., 1., 0., 0.\n*End Step\n*Step\n*Frequency\n3\n"
+            "*Dsload\nS2, TRVEC, 2., 1., 0., 0.\n*End Step\n*Step\n*Static\n{}*End Step\n")
+    body, _, _ = convert_str(deck.format("*Dsload\nS2, TRVEC, 2., 1., 0., 0.\n"))
+    assert _cloads(body)[2] == {(n, 1): 0.5 for n in (5, 6, 7, 8)}
+    assert "*CLOAD, OP=NEW\n** abq2ccx: S2, TRVEC" in body
+    body, _, _ = convert_str(deck.format(""))
+    assert _cloads(body)[2] == {(n, 1): 0.25 for n in (5, 6, 7, 8)}
+    assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 1, 0.25" in body
+
+
+def test_base_state_after_a_first_perturbation_step_beams_and_couplings():
+    # a perturbation step first: the base state is the model data's
+    deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
+            "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Step\n*Frequency\n3\n*Boundary\n"
+            "6, 1, 1\n*End Step\n*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n")
+    second = convert_str(deck)[0].split("*STEP")[2]
+    assert second.startswith("\n*STATIC\n** abq2ccx: the loads, BCs and temperatures before the "
+                             "first step given again (linear perturbation step(s) 1 in between)\n"
+                             "*BOUNDARY, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+                             "*CLOAD\n7, 1, 1.\n"), second
+    # the restore's OP=NEW would break the clamp's rotations in ccx 2.23: it gets a knot
+    deck = STEPPED_BEAM + "*Step\n*Frequency\n2\n*Boundary\n3, 2, 2\n*End Step\n*Step\n*Static\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert "*BOUNDARY, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n1, 1, 6\n" in body and list(conv._knots) == [1]
+    assert "OP=NEW in step(s) 3 removes boundary conditions" in rep.text()
+    # a reference-node BC of the perturbation step does not impose step 3's member BC, nor
+    # does its hold on the rotations make step 3 start unturned (_bc_states, _coupled_steps)
+    kin = (HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6,7,8\n*Surface, type=node, name=ST\n"
+           "TOP\n*Coupling, constraint name=C, ref node=100, surface=ST\n*Kinematic\n*Boundary\n{}\n"
+           "*Step\n*Static\n*End Step\n*Step\n*Frequency\n2\n*Boundary\n{}\n*End Step\n"
+           "*Step\n*Static\n*Boundary\n{}TOP, 1, 1\n*End Step\n")
+    body, _, rep = convert_str(kin.format("100, 4, 6", "100, 1, 1", ""))
+    assert _bc_lines(body) == ["100,4,6", "100,1,1", "100,4,6", "TOP,1,1"]
+    assert "*BOUNDARY, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n100, 4, 6\n*BOUNDARY\nTOP, 1, 1\n" in body
+    assert "Possible overconstraint" in rep.text()
+    body, _, rep = convert_str(kin.format("100, 1, 3", "100, 4, 6", "100, 4, 6\n"))
+    assert _bc_lines(body)[-1] == "TOP,1,1" and "Possible overconstraint" in rep.text()
 
 
 def test_dload_without_element_set_loads_the_whole_model():

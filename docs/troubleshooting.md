@@ -155,8 +155,11 @@ converter comments `*TEMPERATURE` out there.
   output oscillates for a while; the motion is unaffected.
 * **A Riks step does not run.** ccx has no arc-length method and would run it as plain
   static, so the converter comments it out; `--approximate` accepts the plain static step.
-* **Linear perturbation steps.** A perturbation `*STATIC` becomes a general linear step in
-  ccx: right for small elastic perturbations, and its loads persist into later steps (warned).
+* **Linear perturbation steps.** ccx carries a perturbation step's loads and BC changes into
+  later steps, so a general step after one starts with the last general step's loads, BCs and
+  temperatures given again (`ABQ2CCX_HOLD`). A perturbation `*STATIC` becomes a general linear
+  step in ccx: right for small elastic perturbations, but later steps start from its deformed
+  state (warned).
 * **Results at beam and shell nodes are missing from the `.frd`.** ccx writes a model with
   beams or shells expanded to 3-D, under new node numbers. The converter sends history output
   to the `.dat`, prints the node sets the `.frd` cannot show, and adds `OUTPUT=2D` only when

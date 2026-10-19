@@ -143,10 +143,11 @@ TRANSLATED = {
     "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept (dropped on explicit "
         "steps, which Abaqus/Explicit runs without it; `NLGEOM=NO` with `*DEFORMATION "
         "PLASTICITY`, see there); `PERTURBATION` kept only for "
-        "`*FREQUENCY`/`*BUCKLE` (warned when general steps follow, since its loads then persist); "
+        "`*FREQUENCY`/`*BUCKLE` (warned when steps follow, which start from its deformed state); "
         "explicit steps get `INC=10000000` + `NLGEOM`; a step whose displacement BCs get ccx's "
-        "step ramp (see `*BOUNDARY`) gets `AMPLITUDE=STEP`, ccx's default there; `*END STEP` "
-        "ensured.",
+        "step ramp (see `*BOUNDARY`) gets `AMPLITUDE=STEP`, ccx's default there; a general step "
+        "after linear perturbation steps starts with the last general step's loads, BCs and "
+        "temperatures given again (ccx carries a perturbation step's on); `*END STEP` ensured.",
     "*STATIC": "`RIKS` commented by default (ccx would silently run it as plain static; "
         "`--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
     "*DYNAMIC": "implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; "

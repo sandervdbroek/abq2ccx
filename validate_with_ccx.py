@@ -71,7 +71,8 @@ example UMAT gives E eps and E ln(1 + eps); the results digest of --run against 
 beam, buckling and statics references above; and decks a code review found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
-and a part's pre-tension section and distributing coupling in turned instances.
+a part's pre-tension section and distributing coupling in turned instances, and a static step
+after a linear perturbation step (the state before it again).
 
     python validate_with_ccx.py
 
@@ -2088,6 +2089,33 @@ def assembly_bolts_deck():
             "I2.RP, 2, 100.", "*NODE PRINT, NSET=I1.PT", "U", "*NODE PRINT, NSET=I2.PT", "U",
             "*NODE PRINT, NSET=I1.TOPF", "U", "*NODE PRINT, NSET=I2.TOPF", "U", "*END STEP"]
     return "\n".join(part + asm + step) + "\n"
+
+
+def perturbation_restore_deck(pert=None):
+    """Four unit C3D8 cubes side by side (E 1000, nu 0, alpha 1e-3), each held statically at
+    three corners.  A static step gives one cube each a *CLOAD, a face pressure, a prescribed
+    displacement and temperature 100; the linear perturbation step ``pert`` (left out when
+    None) changes all four, adds a load and a pressure and holds a free DOF; a last static
+    step gives nothing, so it must end where the first one did."""
+    nodes = [f"{10 * k + i + 1}, {3.0 * k + x}, {float(y)}, {float(z)}" for k in range(4)
+             for i, (x, y, z) in enumerate(((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+                                            (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)))]
+    elems = [f"{k + 1}, " + ", ".join(str(10 * k + i) for i in range(1, 9)) for k in range(4)]
+    held = [f"{10 * k + n}, {d}" for k in range(4) for n, d in ((1, "1, 3"), (2, "2, 3"), (4, "3, 3"))]
+    change = ["*CLOAD", "7, 1, 3.", "7, 2, 1.", "*DLOAD", "2, P2, 3.", "2, P4, 1.", "*BOUNDARY",
+              "27, 2, 2, 0.3", "27, 1, 1, 0.5"]
+    steps = {"freq": ["*STEP", "*FREQUENCY", "3"] + change + ["*TEMPERATURE", "TE, 300."],
+             "buckle": ["*STEP, PERTURBATION", "*BUCKLE", "2"] + change}   # (no *TEMPERATURE there)
+    return "\n".join(
+        ["*NODE, NSET=ALLN"] + nodes + ["*ELEMENT, TYPE=C3D8, ELSET=EALL"] + elems +
+        ["*NSET, NSET=TE, GENERATE", "31, 38", "*NSET, NSET=TIPS", "7, 17, 27, 37",
+         "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*DENSITY", "1.E-3", "*EXPANSION", "1.E-3",
+         "*SOLID SECTION, ELSET=EALL, MATERIAL=M", "*INITIAL CONDITIONS, TYPE=TEMPERATURE",
+         "ALLN, 0.", "*BOUNDARY"] + held +
+        ["*STEP", "*STATIC", "*CLOAD", "7, 1, 1.", "*DLOAD", "2, P2, 1.", "*BOUNDARY",
+         "27, 2, 2, 0.1", "*TEMPERATURE", "TE, 100.", "*END STEP"] +
+        (steps[pert] + ["*END STEP"] if pert else []) +
+        ["*STEP", "*STATIC", "*NODE PRINT, NSET=TIPS", "U", "*END STEP"]) + "\n"
 
 
 def main():
@@ -4806,6 +4834,21 @@ def main():
               f"shortened {min(short):.7g} to {max(short):.7g} vs F / E A {want_s:.7g} "
               f"(max {err:.1e} off)")
     failures += 0 if u and ok else 1
+    # a static step after a linear perturbation step (ccx 2.23 carried the perturbation step's
+    # loads and BCs on, and dropped or zeroed the earlier ones): the first step's state again
+    ref = review_run(perturbation_restore_deck(), "perturbation_restore_ref", dat_displacements)
+    for pert, what in (("freq", "*FREQUENCY"), ("buckle", "*STEP, PERTURBATION + *BUCKLE")):
+        u = review_run(perturbation_restore_deck(pert), "perturbation_restore_" + pert, dat_displacements)
+        ok = bool(u and ref)
+        if ok:
+            err = max(abs(a - b) for n in (7, 17, 27, 37)
+                      for a, b in zip(u.get(n, [math.inf] * 3), ref.get(n, [math.nan] * 3)))
+            ok = err < 1e-9
+            print(f"{'PASS' if ok else 'FAIL'}  perturbation_restore_{pert} (four cubes given a "
+                  f"*CLOAD, a pressure, a prescribed displacement and a temperature, a {what} step "
+                  f"changing them all, then a static step giving nothing): the last step's "
+                  f"displacements are the first step's ({err:.1e} apart)")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     for name in ("composite_shell", "assembly_two_blocks"):

@@ -3810,6 +3810,12 @@ class Converter:
         self._dl_state: Dict[str, "OrderedDict[tuple, Tuple[str, Optional[str]]]"] = {}
         self._dl_fresh: set = set()                 # (card, key) given in the current step
         self._dl_wiped = False                      # a ccx *DLOAD, OP=NEW in the current step
+        # Abaqus' linear perturbation steps (1-based), and the general steps after them that
+        # start from the base state again (_plan_base_restore, _restore_base_states)
+        self._pert_idx: set = set()
+        self._restore_from: Dict[int, int] = {}     # step -> the last general step before it
+        self._restore_new: set = set()              # ... whose *BOUNDARY part needs OP=NEW
+        self._restore_pairs: Dict[int, set] = {}    # ... -> the base state's (node, DOF) BCs
         # pressures on shells / membranes split between the faces of ccx's expanded element
         # (_plan_sheet_pressure): load token -> [(face-1 target, top-face surface, weight of
         # face 1, weight of face 2)], and the *ELSET / *SURFACE cards those names need
@@ -7382,6 +7388,15 @@ class Converter:
                     self.report.note(f"*STEP, PERTURBATION dropped on a *{proc} step (ccx reads it only "
                                      f"on *FREQUENCY / *BUCKLE; it runs *{proc} as a linear "
                                      f"procedure anyway).", once=True)
+                elif self._step_idx < self._n_steps and \
+                        not set(range(self._step_idx + 1, self._n_steps + 1)) <= self._pert_idx:
+                    self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
+                                     "general step, so the next general step starts from its deformed "
+                                     "state (its loads and boundary conditions are given back there) "
+                                     "— an Abaqus perturbation leaves the base state untouched. Move "
+                                     "the perturbation load case after the last general step.", once=True)
+                    self._reduces("*STEP, PERTURBATION on a static step before a general step (its "
+                                  "response stays)")
                 elif self._step_idx < self._n_steps:
                     self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
                                      "general step, so its loads persist into the following steps "
@@ -7458,6 +7473,11 @@ class Converter:
         self._dl_fresh, self._dl_wiped = set(), False
         self._step_temp_dof = next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS),
                                    None)
+        # a linear perturbation step's loads act in it only: the next general step starts
+        # from the state before it (in ccx too, _restore_base_states)
+        base = (OrderedDict((k, (dict(f), a)) for k, (f, a) in self._nodal_loads.items()),
+                dict(self._nodal_emitted), {o: OrderedDict(st) for o, st in self._dl_state.items()}) \
+            if self._step_idx in self._pert_idx else None
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
@@ -7465,6 +7485,8 @@ class Converter:
         out.extend(self._boundary_pieces(self._vel_tail.get(self._step_idx, [])))
         out.extend(self._flush_dloads())
         out.extend(self._flush_nodal_loads())
+        if base:
+            self._nodal_loads, self._nodal_emitted, self._dl_state = base
         out.extend(self._anchored_output(step_block))  # Abaqus' default output, if any
         self._step_temp_dof = None
         out.append("*END STEP")
@@ -7815,6 +7837,17 @@ class Converter:
                 out.append((g[0], dofs, "", g[1] if dofs else None, text))
             else:
                 out.append((g[0], [], "", None, text))
+        return out
+
+    def _perturbation_steps(self, blocks: List[Block]) -> set:
+        """The 1-based numbers of Abaqus' linear perturbation steps (a perturbation procedure,
+        or *STEP, PERTURBATION): their loads and BC changes act in that step only, and the
+        next general step continues from the last general step's state."""
+        out = set()
+        for s, group in enumerate(step_groups(blocks)[1], 1):
+            if group[0].has("PERTURBATION") or \
+                    any(b.keyword in self._PERTURBATION_PROCS for b in group[1:]):
+                out.add(s)
         return out
 
     def _step_motion(self, group: List[Block], nlgeom: bool) -> dict:
@@ -13519,6 +13552,7 @@ class Converter:
         self._plan_planar_constraint(blocks)
         self._note_quadratic_beams(blocks)      # after the planar constraint
         self._plan_circ_rotation_knots(blocks)          # after the planar DOF 4-5 picks
+        self._plan_base_restore(blocks)         # after _plan_load_cases (its dropped BCs)
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
@@ -13547,6 +13581,7 @@ class Converter:
                     "plane (3-D bodies in ccx)"] + self._rigid_planar_bc
         out.extend(self.emit_other(blocks))
         out = self._settle_dependents(out)
+        out = self._restore_base_states(out)
         self._audit_loads(blocks, out)
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
@@ -13572,7 +13607,8 @@ class Converter:
         """Facts about the whole deck that planners and handlers read: whether a step runs
         explicit dynamics, whether one is not heat transfer alone (a deck without steps
         counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
-        and the *TIE names.  No planner adds or replaces such cards."""
+        the *TIE names and the linear perturbation steps.  No planner adds or replaces such
+        cards."""
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
         self._explicit_deck = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         self._mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
@@ -13581,6 +13617,7 @@ class Converter:
         self._distributing_ids = {id(b) for b, c in zip(blocks, blocks[1:])
                                   if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
         self._tie_names = {b.uparam("NAME") for b in blocks if b.keyword == "TIE"}
+        self._pert_idx = self._perturbation_steps(blocks)
 
     # procedures and *DLOAD labels in which an element's mass acts
     _INERTIA_PROCEDURES = {"DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
@@ -14910,6 +14947,293 @@ class Converter:
         for name, m in self._star_masses:          # ccx reads 20 characters of a field
             out += [f"*MASS, ELSET={name}", short_real(m, 12)]
         return out
+
+    # -- the base state after linear perturbation steps ----------------------------------
+    HOLD_AMP = "ABQ2CCX_HOLD"
+    _RESTORED = ("BOUNDARY", "CLOAD", "DLOAD", "TEMPERATURE")
+    # the first value field of a data line (*TEMPERATURE: the temperature, then a shell's
+    # gradients)
+    _VALUE_FIELD = {"BOUNDARY": 3, "CLOAD": 2, "DLOAD": 2, "TEMPERATURE": 1}
+    # ccx 2.23 keeps one body load per set as written and direction, not per element (probed:
+    # GRAV on a set, then on its element in a later step, adds up; a face load is replaced)
+    _BODY_LOADS = ("GRAV", "CENTRIF", "NEWTON")
+
+    def _restore_base_states(self, out: List[str]) -> List[str]:
+        """Start each general step after Abaqus linear perturbation steps (_plan_base_restore)
+        from the base state: the loads, BCs and temperatures in force at the end of the last
+        general step.  Abaqus continues from that state.  ccx 2.23 carries what a
+        perturbation step gives on into the next step, and its procedures change what they
+        do not give (probed): *FREQUENCY zeroes prescribed BC values; *STEP, PERTURBATION,
+        *BUCKLE and *STEADY STATE DYNAMICS remove the earlier *CLOADs, *BUCKLE and steady-state
+        dynamics the *DLOADs too; most reset the temperatures to their initial values.  So,
+        right after the step's procedure, the base state's lines are given again from the
+        emitted deck: *CLOAD / *DLOAD / *TEMPERATURE with OP=NEW, leaving out the loads the
+        step gives itself (ccx adds up a load given twice in one step; a BC or temperature
+        given again replaces the earlier one), and *BOUNDARY with OP=NEW where a perturbation
+        step held a DOF the base state leaves free (_restore_new).  A card type the step gives
+        with OP=NEW is left to it.  A value a step-time amplitude drove is given at its end
+        value (ccx and Abaqus hold it there; TIME=TOTAL TIME amplitudes are kept), all on the
+        constant amplitude HOLD_AMP: every value is in force from the first increment, as in
+        Abaqus (plain lines ramp from 0 where the perturbation step removed them)."""
+        if not self._restore_from:
+            return out
+        # the emitted cards: [line, keyword, params, data records, step (0: model data, -1:
+        # between steps), last line]
+        cards: List[list] = []
+        keep = set(self._RESTORED) | {"NSET", "ELSET", "AMPLITUDE"} | PROC_KW
+        step, in_step, cur = 0, False, None
+        for i, raw in enumerate(out):
+            s = raw.strip()
+            if not s or s.startswith("**"):
+                continue
+            if s.startswith("*"):
+                kw, params = parse_keyword_line(s)
+                if kw == "STEP":
+                    step, in_step = step + 1, True
+                cur = [i, kw, params, [], step if in_step else (0 if not step else -1), i]
+                cards.append(cur)
+                if kw == "END STEP":
+                    in_step = False
+            elif cur is not None:
+                cur[5] = i
+                if cur[1] in keep:
+                    rec = [x.strip() for x in s.split(",")]
+                    while rec and rec[-1] == "":
+                        rec.pop()
+                    cur[3].append(rec)
+        sets: Dict[Tuple[str, str], List[list]] = {}
+        amps: Dict[str, Optional[AmplitudeCurve]] = {}
+        period: Dict[int, Optional[float]] = {}
+        procs: Dict[int, str] = {}
+        by_step: Dict[int, List[list]] = {}
+        anchor: Dict[int, int] = {}                 # step -> the line its restore follows
+        for c in cards:
+            kw, p, s = c[1], c[2], c[4]
+            if kw in ("NSET", "ELSET"):
+                sets.setdefault((kw, (p.get(kw) or "").strip().upper()), []).append(c)
+            elif kw == "AMPLITUDE" and p.get("NAME"):
+                amps[p["NAME"].strip().upper()] = amplitude_curve(
+                    Block(kw, p, [", ".join(rec) for rec in c[3]]))
+            elif kw == "STEP":
+                anchor[s] = c[5]
+            elif kw in PROC_KW and s > 0 and s not in procs:
+                procs[s], anchor[s] = kw, c[5]
+                rec = c[3][0] if c[3] else []
+                try:
+                    period[s] = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
+                except ValueError:
+                    period[s] = None
+            if kw in self._RESTORED and s >= 0:
+                by_step.setdefault(s, []).append(c)
+        memo: Dict[Tuple[str, str], Optional[List[int]]] = {}
+
+        def members(kind: str, token: str) -> Optional[List[int]]:
+            """The ids a node / element token names (None: not a set this deck defines)."""
+            if re.fullmatch(r"[-+]?\d+", token):
+                return [int(token)]
+            key = (kind, token.upper())
+            if key not in memo:
+                memo[key] = None                   # (a set naming itself)
+                memo[key] = set_ids(kind, sets[key]) if key in sets else None
+            return memo[key]
+
+        def set_ids(kind: str, defs: List[list]) -> Optional[List[int]]:
+            ids: List[int] = []
+            for c in defs:
+                for rec in c[3]:
+                    f = [x for x in rec if x]
+                    if "GENERATE" in c[2]:
+                        try:
+                            ids += range(pint(f[0]), pint(f[1]) + 1, pint(f[2]) if len(f) > 2 else 1)
+                        except (IndexError, ValueError):
+                            return None
+                        continue
+                    for x in f:
+                        sub = members(kind, x)
+                        if sub is None:
+                            return None
+                        ids += sub
+            return ids
+
+        def keys(kw: str, rec: List[str]) -> List[tuple]:
+            """What a *CLOAD / *DLOAD line loads, as ccx keys it: a node DOF, an element face
+            (a surface or unknown set: its name), a body load per set and direction."""
+            label = rec[1].upper() if len(rec) > 1 else ""
+            if kw == "CLOAD":
+                ns, d = members("NSET", rec[0]), dof_number(label)
+                return [(n, d) for n in ns] if ns is not None and d else [(rec[0].upper(), label)]
+            if label not in self._BODY_LOADS:
+                es = members("ELSET", rec[0])
+                if es is not None:
+                    return [(e, label) for e in es]
+            return [(rec[0].upper(), label) + tuple(rec[3:] if label in self._BODY_LOADS else ())]
+
+        def op_new(c: list) -> bool:
+            return (c[2].get("OP") or "").strip().upper() == "NEW"
+
+        hold = self.HOLD_AMP
+        while hold in amps:
+            hold += "_"
+        used_hold = [False]
+
+        def line(c: list, rec: List[str], s: int) -> Tuple[tuple, str]:
+            """(the card parameters, the data line) of a base-state line given again in step
+            ``s``: its end value on the constant amplitude, or as it is on a TIME=TOTAL TIME
+            amplitude (and a FIXED / USER card's line, and a BC on a node with a *TRANSFORM,
+            where ccx allows one amplitude per node)."""
+            kw, p = c[1], c[2]
+            params = [(k, v) for k, v in p.items() if k not in ("OP", "AMPLITUDE", "TIME DELAY")]
+            amp = (p.get("AMPLITUDE") or "").strip().upper()
+            factor: Optional[float] = 1.0
+            if amp and amp != self.CCX_RAMP:        # (ccx's step ramp ends at the full value)
+                curve = amps[amp] if amp in amps else None
+                if (curve and curve.total) or c[4] == 0:      # it goes on as it is
+                    return tuple(params + [(k, v) for k, v in p.items()
+                                           if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
+                try:
+                    factor = curve.value(period[c[4]] - pf(p.get("TIME DELAY") or "0")) \
+                        if curve and period.get(c[4]) is not None else None
+                except ValueError:
+                    factor = None
+                if factor is None:
+                    self.report.warn(f"*{kw} given again in step {s}, after a linear perturbation "
+                                     f"step: the value amplitude {amp} reached at the end of step "
+                                     f"{c[4]} is unknown to the converter, so the line keeps the "
+                                     f"amplitude, which ccx evaluates in step {s} again.", once=True)
+                    self._reduces(f"*{kw} on amplitude {amp} after a perturbation step")
+                    return tuple(params + [(k, v) for k, v in p.items()
+                                           if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
+            rec = list(rec)
+            if factor != 1.0:
+                for j in range(self._VALUE_FIELD[kw], len(rec) if kw == "TEMPERATURE" else
+                               min(len(rec), self._VALUE_FIELD[kw] + 1)):
+                    try:
+                        rec[j] = short_real(pf(rec[j]) * factor, 12) if rec[j] else rec[j]
+                    except ValueError:
+                        pass
+            if "FIXED" in p or "USER" in p or (kw == "BOUNDARY" and self._transformed and any(
+                    n in self._transformed for n in members("NSET", rec[0]) or [])):
+                return tuple(params), ", ".join(rec)
+            used_hold[0] = True
+            return tuple(params + [("AMPLITUDE", hold)]), ", ".join(rec)
+
+        def valued(c: list, rec: List[str]) -> bool:
+            """Whether a BC line holds a DOF at anything but a fixed zero."""
+            try:
+                return bool(c[2].get("AMPLITUDE")) or "FIXED" in c[2] or \
+                    (len(rec) > 3 and bool(rec[3]) and pf(rec[3]) != 0.0)
+            except ValueError:
+                return True
+
+        def restore(s: int) -> List[str]:
+            """The cards that give step ``s`` the base state again."""
+            own = by_step.get(s, [])
+            touched = {c[1] for k in range(self._restore_from[s] + 1, s) for c in by_step.get(k, [])}
+            res: List[str] = []
+            for kw in self._RESTORED:
+                mine = [c for c in own if c[1] == kw]
+                if any(op_new(c) for c in mine) or (kw == "BOUNDARY" and s not in self._restore_pairs) \
+                        or (kw == "TEMPERATURE" and procs.get(s) in TEMPERATURE_DOF_PROCS):
+                    continue
+                entries: List[Tuple[list, List[str]]] = []
+                if kw in contrib:
+                    given = {k for c in mine for rec in c[3] if rec and rec[0] for k in keys(kw, rec)}
+                    for c, rec, ks in contrib[kw]:
+                        left = [k for k in ks if owner[kw].get(k) == c[4] and k not in given]
+                        if len(left) == len(ks):
+                            entries.append((c, rec))
+                        else:                       # per node DOF / element face
+                            entries += [(c, [str(k[0])] + ([str(k[1])] if kw == "CLOAD" else rec[1:2])
+                                         + rec[2:]) for k in left]
+                    if not entries and kw not in touched:
+                        continue
+                else:
+                    entries = list(lines[kw])
+                    if kw == "BOUNDARY" and s not in self._restore_new and kw not in touched:
+                        # only *FREQUENCY's zeroed values to give back: from the first valued
+                        # line on (a later zero line may override it)
+                        first = next((j for j, (c, rec) in enumerate(entries) if valued(c, rec)), None)
+                        entries = entries[first:] if first is not None else []
+                    if not entries and kw not in touched:
+                        continue
+                runs: List[list] = []
+                for c, rec in entries:
+                    params, text = line(c, rec, s)
+                    if runs and runs[-1][0] == params:
+                        runs[-1][1].append(text)
+                    else:
+                        runs.append([params, [text]])
+                if kw != "BOUNDARY" or s in self._restore_new:
+                    runs = runs or [[(), []]]
+                    runs[0][0] = (("OP", "NEW"),) + runs[0][0]
+                for params, texts in runs:
+                    res.append(emit_keyword(kw, OrderedDict(params)))
+                    res += self._surfaces_last(texts) if kw == "DLOAD" else texts
+            return res
+
+        # the base state, step by step (a perturbation step's cards do not change it)
+        lines: Dict[str, List[Tuple[list, List[str]]]] = {"BOUNDARY": [], "TEMPERATURE": []}
+        contrib: Dict[str, List[Tuple[list, List[str], List[tuple]]]] = {"CLOAD": [], "DLOAD": []}
+        owner: Dict[str, Dict[tuple, int]] = {"CLOAD": {}, "DLOAD": {}}
+        insert: Dict[int, List[str]] = {}
+        done: List[int] = []
+        for s in range(max(by_step.keys() | anchor.keys() | {0}) + 1):
+            if s in self._pert_idx:
+                continue
+            if s in self._restore_from and s in anchor:
+                got = restore(s)
+                if got:
+                    last = self._restore_from[s]
+                    insert[anchor[s]] = [f"** abq2ccx: the loads, BCs and temperatures "
+                                         f"{'of step %d' % last if last else 'before the first step'} "
+                                         f"given again (linear perturbation step(s) "
+                                         f"{', '.join(map(str, range(last + 1, s)))} in between)"] + got
+                    done.append(s)
+            first: set = set()
+            for c in by_step.get(s, []):
+                kw = c[1]
+                if kw not in first:
+                    first.add(kw)
+                    if op_new(c):                   # ccx: OP on a step's first card only
+                        if kw in lines:
+                            lines[kw] = []
+                        else:
+                            contrib[kw], owner[kw] = [], {}
+                for rec in c[3]:
+                    if not rec or not rec[0]:
+                        continue
+                    if kw in lines:
+                        lines[kw].append((c, rec))
+                    else:
+                        ks = keys(kw, rec)
+                        contrib[kw].append((c, rec, ks))
+                        for k in ks:
+                            owner[kw][k] = s
+            for kw in contrib:                      # forget what later steps replaced
+                contrib[kw] = [e for e in contrib[kw] if any(owner[kw].get(k) == e[0][4] for k in e[2])]
+        if not insert:
+            return out
+        self.report.note(f"Step{'s' if len(done) > 1 else ''} {', '.join(map(str, done))} "
+                         f"follow{'' if len(done) > 1 else 's'} a linear perturbation step: "
+                         f"Abaqus continues from the last general step's state, while ccx 2.23 "
+                         f"carries a perturbation step's loads and BC changes on, and its own "
+                         f"procedures change that state (probed: *FREQUENCY zeroes prescribed BC "
+                         f"values; *BUCKLE, *STEP, PERTURBATION and steady-state dynamics remove "
+                         f"earlier loads and reset temperatures). The loads, boundary conditions "
+                         f"and temperatures of that state are given again at the start of "
+                         f"{'those steps' if len(done) > 1 else 'it'}"
+                         + (f", in force at once (amplitude {hold})" if used_hold[0] else "") + ".",
+                         once=True)
+        res: List[str] = []
+        for i, raw in enumerate(out):
+            res.append(raw)
+            res.extend(insert.get(i, []))
+        if used_hold[0]:
+            k = next(j for j, raw in enumerate(res) if raw.strip().upper().startswith("*STEP")
+                     and parse_keyword_line(raw.strip())[0] == "STEP")
+            res[k:k] = [f"** abq2ccx: a constant amplitude, for the state given again after linear "
+                        f"perturbation steps", f"*AMPLITUDE, NAME={hold}", "0., 1., 1., 1."]
+        return res
 
     def _audit_loads(self, blocks: List[Block], out: List[str]) -> None:
         """Guard against a hollow solve: a step the Abaqus deck loads but whose every load
@@ -18801,23 +19125,32 @@ class Converter:
 
     def _bc_states(self, blocks: List[Block], nodes: set):
         """The *BOUNDARY in force on ``nodes`` in each step, as ccx applies them: model data
-        first, OP=NEW on a step's first *BOUNDARY removing the earlier ones.  (node, dof) ->
-        (id of the card, magnitude, amplitude, kind): kind "disp" for a displacement, "rate"
-        for a velocity, None for what cannot be compared (FIXED, USER, accelerations).  A
-        deck without steps: its model-data state.  Also (node, dof) -> ids of every card that
-        names it, in force or overridden.  (bc_steps is the zero / nonzero view of the emitted
-        deck that _settle_dependents uses; this one keeps the values, amplitudes and cards the
+        first, OP=NEW on a step's first *BOUNDARY removing the earlier ones; a linear
+        perturbation step's BCs act in that step only (Abaqus; _restore_base_states gives
+        ccx the base state again after it).  (node, dof) -> (id of the card, magnitude,
+        amplitude, kind): kind "disp" for a displacement, "rate" for a velocity, None for
+        what cannot be compared (FIXED, USER, accelerations).  A deck without steps: its
+        model-data state.  Also (node, dof) -> ids of every card that names it, in force or
+        overridden.  (bc_steps is the zero / nonzero view of the emitted deck that
+        _settle_dependents uses; this one keeps the values, amplitudes and cards the
         implied-BC test needs.)"""
         states: List[Dict[Tuple[int, int], tuple]] = []
         cards: Dict[Tuple[int, int], List[int]] = {}
         cur: Dict[Tuple[int, int], tuple] = {}
+        base = cur                                 # what the last general step left
         in_step = first = False
+        step = 0
         for b in blocks:
             if b.keyword == "STEP":
                 in_step = first = True
+                step += 1
+                if step - 1 not in self._pert_idx:
+                    base = dict(cur)
             elif b.keyword == "END STEP" and in_step:
                 states.append(dict(cur))
                 in_step = False
+                if step in self._pert_idx:
+                    cur = dict(base)
             elif b.keyword == "BOUNDARY":
                 if in_step and first and b.uparam("OP") == "NEW":
                     cur = {}
@@ -18873,7 +19206,8 @@ class Converter:
                 for d in held:
                     e = st[(members[d][0], d)]
                     end[d] = end[d] or (e[1] == 0.0 and (e[3] == "disp" or z0[d]))
-            z0 = end
+            if s + 1 not in self._pert_idx:      # a perturbation step leaves the base state
+                z0 = end
 
     def _bc_segments(self, blocks: List[Block]) -> List[List[Tuple[bool, Tuple[int, int], bool]]]:
         """The source deck's *BOUNDARY entries for bc_steps: (OP=NEW, (node, DOF), zero value)
@@ -20703,6 +21037,36 @@ class Converter:
     # ======================================================================
     # *BOUNDARY, OP=NEW after rotational BCs on shell/beam nodes
     # ======================================================================
+    def _plan_base_restore(self, blocks: List[Block]) -> None:
+        """The general steps that follow a linear perturbation step, which _restore_base_states
+        gives the base state again: ``_restore_from`` (step -> the last general step before
+        it, 0 for the model data) and, unless the step's own *BOUNDARY has OP=NEW (which
+        removes the base state's BCs in Abaqus too), ``_restore_pairs`` (step -> the (node,
+        DOF) pairs the base state's *BOUNDARY holds).  That *BOUNDARY needs OP=NEW where a
+        perturbation step held a pair that neither the base state nor the step itself holds
+        (``_restore_new``): a BC on a free DOF lasts in ccx until OP=NEW."""
+        self._restore_from, self._restore_new, self._restore_pairs = {}, set(), {}
+        if not self._pert_idx:
+            return
+        model, groups = step_groups(blocks)
+        state = {k for b in model if b.keyword == "BOUNDARY" for k in self._boundary_pairs(b)}
+        last, since, held = 0, False, set()     # held: what the perturbation steps since hold
+        for s, group in enumerate(groups, 1):
+            cards = [b for b in group[1:] if b.keyword == "BOUNDARY" and id(b) not in self._lc_drop]
+            pairs = {k for b in cards for k in self._boundary_pairs(b)}
+            if s in self._pert_idx:
+                since, held = True, held | pairs
+                continue
+            new = [(b.param("OP") or "").strip().upper() == "NEW" for b in cards]
+            if since:
+                self._restore_from[s] = last
+                if not any(new):
+                    self._restore_pairs[s] = set(state)
+                    if held - state - pairs:
+                        self._restore_new.add(s)
+            state = pairs if new[:1] == [True] else state | pairs
+            last, since, held = s, False, set()
+
     def _plan_op_new_rotations(self, blocks: List[Block]) -> None:
         """ccx 2.23 does not rebuild rotational BCs on shell/beam nodes after a later step's
         *BOUNDARY, OP=NEW (probed; ccx sources boundarys.f, gen3dboun.f, usermpc.f).  ccx
@@ -20749,6 +21113,11 @@ class Converter:
         new = [bool(c) and c[0].uparam("OP") == "NEW" for c in steps]
         given = [set().union(*map(self._boundary_pairs, c)) | (planar if nw else set())
                  for c, nw in zip(steps, new)]
+        # a general step after a perturbation step gets the base state's BCs again
+        # (_restore_base_states), with OP=NEW where one the perturbation step added must go
+        for s, base in self._restore_pairs.items():
+            new[s - 1] = s in self._restore_new
+            given[s - 1] = given[s - 1] | base | (planar if new[s - 1] else set())
         later = [set() for _ in range(len(steps) + 1)]   # nodes given rotations in step k or later
         for k in range(len(steps) - 1, -1, -1):
             later[k] = later[k + 1] | rotations(given[k])
