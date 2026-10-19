@@ -36,7 +36,9 @@ TRANSLATED = {
         "`BLENDED` are not converted (reduced physics).",
     "*PART / *INSTANCE / *ASSEMBLY": "flattened into one global numbering (instance transform "
         "applied, references resolved, names kept ≤80 chars); part-level constraints (`*EQUATION`, "
-        "`*MPC`, `*RIGID BODY`, `*COUPLING`, ...) copied per instance; a part's `*DISTRIBUTION` gets "
+        "`*MPC`, `*RIGID BODY`, `*COUPLING`, `*DISTRIBUTING COUPLING`, `*PRE-TENSION SECTION`, ...) "
+        "copied per instance, also from inside an `*INSTANCE` (another card there is left out, "
+        "warned); a part's `*DISTRIBUTION` gets "
         "per-instance names (also where an `*ORIENTATION` or a composite ply names it) and offset "
         "element labels; a part's `*ORIENTATION, DEFINITION=NODES` names each instance's own "
         "nodes; rotated instances rotate `*ORIENTATION` axes (also per-element "

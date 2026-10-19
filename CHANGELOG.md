@@ -6,6 +6,18 @@ physics.
 
 ## Unreleased
 
+* **Code-review fixes** — a planar `B21`/`T2D2` model with a `*COUPLING`, `*TIE` or tied
+  `*CONTACT PAIR` no longer stops the converter; a `TYPE=VELOCITY` card a rigid constraint
+  implies whole is left out (it came back, and ccx stopped); amplitude points are written to
+  12 digits (6 merged times 1e-4 apart at t = 100); a `SYMMETRIC` layup counts its mirrored
+  plies in rigid ties, ccx's knot test and the explicit increment (a tie left to ccx: 3.3×
+  too soft); `*FRICTION` reads `3.D-1`; `--approximate`'s Poisson clamp keeps blank fields; a
+  moment on DOF `+6` of a transformed beam node is DOF 6; `*RIGID BODY, REFNODE=` keeps a plane
+  body's holds; a part's `*DISTRIBUTING COUPLING` and `*PRE-TENSION SECTION` are copied per
+  instance (ccx stopped on the part's names), also from inside an `*INSTANCE`, where another
+  card the flattener cannot place is now warned; circular-section beam knots no longer depend
+  on the order of a step's `OP=NEW` cards; an `*ORIENTATION, DEFINITION=NODES` with an
+  undefined node no longer takes the next nodes as its points.
 * **Initial stresses and deformation plasticity on oriented sections** — `*INITIAL CONDITIONS,
   TYPE=STRESS / PLASTIC STRAIN` are turned out of the orientation's axes, in which Abaqus gives
   them, into the global ones ccx 2.23 reads them in — at each of ccx's integration points on a

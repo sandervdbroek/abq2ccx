@@ -65,8 +65,11 @@ the motion node by node, also turned under NLGEOM, a block tied to a turning rig
 rigid plate's MASS and ROTARYI on springs against its frequencies, (--approximate) a
 faceted analytical sphere against Hertz, user materials: renamed so ccx stops rather than
 run its own routines, and (--abaqus-umat) through ccx's Abaqus-UMAT interfaces, whose stock
-example UMAT gives E eps and E ln(1 + eps); and the results digest of --run against the
-beam, buckling and statics references above.
+example UMAT gives E eps and E ln(1 + eps); the results digest of --run against the
+beam, buckling and statics references above; and decks a code review found converted wrongly:
+a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
+time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
+and a part's pre-tension section and distributing coupling in turned instances.
 
     python validate_with_ccx.py
 
