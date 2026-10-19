@@ -156,6 +156,9 @@ references that do not come from the converter. It prints one `PASS`/`FAIL` line
 | `assembly_bolts` (generated) | two instances, one turned, of a part with a `*PRE-TENSION SECTION` and a `*DISTRIBUTING COUPLING` | F L / E A, F / E A | 1e-6 (ccx stopped on the part's names) |
 | `perturbation_restore_*` (generated) | cubes given a `*CLOAD`, a pressure, a prescribed displacement and a temperature, a `*FREQUENCY` (or `*STEP, PERTURBATION` + `*BUCKLE`) step changing them all (or, after a `*FREQUENCY` step, a `*MODAL DYNAMIC` one changing the loads), then a static step giving nothing | the first step's state | exact (before: 0.49 off) |
 | `modal_own_loads` (generated) | a cube loaded statically (a `*CLOAD`, a pressure, gravity, a traction), then `*FREQUENCY` and a `*MODAL DYNAMIC` step with loads of its own | the same deck without the static loads | exact (before: 0.013 off) |
+| `perturbation_restore_*` (generated) | cubes given a `*CLOAD`, a pressure, a prescribed displacement and a temperature, a `*FREQUENCY` (or `*STEP, PERTURBATION` + `*BUCKLE`) step changing them all, then a static step giving nothing | the first step's state | exact (before: 0.49 off) |
+| `buckle_gravity_preload` (generated) | a `C3D8` column under gravity in a static step, then a `*STEP, PERTURBATION` `*BUCKLE` step loaded at its top | the same gravity as nodal forces (exact on bricks) | exact (ccx aborted after the buckle step) |
+| `buckle_self_weight_then_static` (generated) | the column buckling under its weight and a top load, then a static step pulling its top sideways | the buckle step alone; the static step alone | exact (ccx aborted after the static step) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`

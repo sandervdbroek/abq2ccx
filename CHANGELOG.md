@@ -25,6 +25,14 @@ physics.
   into it, is flagged: after a loaded general step (whose loads then stay on, so a static
   deflection stays in its results as an offset) or a moving modal dynamic step without
   `CONTINUE=YES`.
+* **`*BUCKLE` steps that ccx 2.23 aborted or stopped on** — ccx 2.23 aborts (SIGABRT, the `.dat`
+  sometimes empty) at the end of a step that holds no body load once an earlier step held one:
+  a `*BUCKLE` step after a gravity or centrifugal preload, or any step after a `*STEP,
+  PERTURBATION` `*BUCKLE` under its own weight. Such a step now gets a zero `GRAV` line, which
+  loads nothing (a column's factor under a gravity preload: the same as with the preload as
+  nodal forces). `*TEMPERATURE` in a `*BUCKLE` step, which ccx refuses ("temperature loading is
+  not allowed in a linear buckling step") and Abaqus scales with the factor, is commented out
+  as reduced physics.
 
 ## 1.3.0 (October 2026)
 

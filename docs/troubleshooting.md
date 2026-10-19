@@ -159,7 +159,8 @@ converter comments `*TEMPERATURE` out there.
   later steps, so a general step after one starts with the last general step's loads, BCs and
   temperatures given again (`ABQ2CCX_HOLD`). A perturbation `*STATIC` becomes a general linear
   step in ccx: right for small elastic perturbations, but later steps start from its deformed
-  state (warned).
+  state (warned). ccx refuses temperatures in a `*BUCKLE` step, so a thermal buckling load is
+  lost (warned).
 * **Results at beam and shell nodes are missing from the `.frd`.** ccx writes a model with
   beams or shells expanded to 3-D, under new node numbers. The converter sends history output
   to the `.dat`, prints the node sets the `.frd` cannot show, and adds `OUTPUT=2D` only when

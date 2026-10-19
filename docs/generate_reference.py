@@ -164,7 +164,10 @@ TRANSLATED = {
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes).",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
-        "accuracy/vectors/iterations.",
+        "accuracy/vectors/iterations. A `*BUCKLE` step, or the step after a `*STEP, PERTURBATION` "
+        "one, that would hold no body load once an earlier step held one gets a zero `GRAV` line "
+        "(ccx 2.23 aborts after such a step). Its `*TEMPERATURE`, which ccx refuses there, is "
+        "commented out: Abaqus scales the change with the factor (thermal buckling), reduced physics.",
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped. A transient step without `DELTMX` gets `DIRECT`: "
         "Abaqus then takes fixed increments of the initial increment, ccx its own. A transient step "
         "with temperature DOFs and no initial temperatures starts every node at 0, the Abaqus "
@@ -370,7 +373,8 @@ TRANSLATED = {
         "`*TRANSFORM`); `ORIENTATION=` (local axes) and `FOLLOWER=YES` dropped with a warning; "
         "`USER` commented, naming ccx's `cload.f`.",
     "*TEMPERATURE": "passed through (upgraded beams' midside nodes get their end nodes' mean); "
-        "`USER` (Abaqus `UTEMP`) commented, naming ccx's `utemp.f`.",
+        "`USER` (Abaqus `UTEMP`) commented, naming ccx's `utemp.f`; in a `*BUCKLE` step commented "
+        "(see `*BUCKLE`).",
     "*FILM / *DFLUX / *CFLUX / *RADIATE": "passed through, except loads from an Abaqus user "
         "subroutine (`USER`, a `...NU` label): commented, naming ccx's `film.f` / `dflux.f` / "
         "`cflux.f` / `radiate.f` (kept, ccx would run its stock subroutine instead).",

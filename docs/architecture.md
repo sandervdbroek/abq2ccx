@@ -78,6 +78,8 @@ Converter._settle_dependents()   choose each *EQUATION's eliminated (first) term
 Converter._restore_base_states()   a general step after linear perturbation steps starts with
                                    the last general step's loads, BCs and temperatures given
                                    again (_plan_base_restore: where its *BOUNDARY needs OP=NEW)
+Converter._keep_body_loads()   a zero GRAV line in a step that would hold no body load after
+                               one did (*BUCKLE drops them; ccx 2.23 aborts after such a step)
 Converter._audit_loads()     load audit: step_load_audit() on the Abaqus blocks and on the
                              output; a step loaded there but not here is warned
 ```
