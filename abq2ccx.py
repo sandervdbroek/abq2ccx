@@ -1308,6 +1308,14 @@ def reflow(values: Sequence, per_line: int = MAX_ENTRIES_PER_LINE) -> List[str]:
     return lines or [""]
 
 
+def equation_rows(terms: Sequence[tuple], coef: Callable[[object], str] = str) -> List[str]:
+    """One equation of an *EQUATION card: its number of terms, then the (node, DOF,
+    coefficient) terms four per line (ccx reads at most 12 entries per line), each
+    coefficient written by ``coef``."""
+    return [str(len(terms))] + [", ".join(f"{n}, {d}, {coef(c)}" for n, d, c in terms[i:i + 4])
+                                for i in range(0, len(terms), 4)]
+
+
 def compress_ids(ids: Sequence[int]) -> List[str]:
     """Emit ids as a single ``GENERATE`` triple when they form an arithmetic run,
     otherwise as explicit comma-separated lines (<=16 per line).  Returns the data
@@ -11521,10 +11529,7 @@ class Converter:
                 rows, approx = True, approx or bool(it.get("approx"))
                 local = local or bool(it.get("local"))
                 bcs += [f"{n}, {d}, {d}" for n, d in it["bcs"]]
-                for eq in it["eqs"]:
-                    out += ["*EQUATION", str(len(eq))]
-                    out += [", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in eq[i:i + 4])
-                            for i in range(0, len(eq), 4)]
+                out += self._equation_lines(it["eqs"])
         if bcs:
             bcs = dedup(bcs)
             out = ["*BOUNDARY"] + bcs + out
@@ -11687,9 +11692,7 @@ class Converter:
         """*EQUATION cards for ``rows`` of (node, DOF, coefficient), four terms per line."""
         out: List[str] = []
         for rw in rows:
-            out += ["*EQUATION", str(len(rw))]
-            out += [", ".join(f"{n}, {d}, {c:.12g}" for n, d, c in rw[i:i + 4])
-                    for i in range(0, len(rw), 4)]
+            out += ["*EQUATION"] + equation_rows(rw, "{:.12g}".format)
         return out
 
     def _twin_lines(self, rows: Sequence[Sequence[Tuple[int, int, float]]]) -> List[str]:
@@ -12580,9 +12583,7 @@ class Converter:
                          once=True)
         lines = [out[0]]
         for eq in eqs:
-            lines.append(str(len(eq)))
-            for j in range(0, len(eq), 4):            # ccx: at most 12 entries per line
-                lines.append(", ".join(f"{n}, {d}, {c}" for n, d, c in eq[j:j + 4]))
+            lines += equation_rows(eq)
         return lines
 
     def _equation_block_lines(self, b: Block) -> List[str]:
@@ -12626,9 +12627,7 @@ class Converter:
             for i in range(n_eq):
                 trip = [(nodes[i] if len(nodes) > 1 else nodes[0], dof, coef)
                         for nodes, dof, coef in resolved]
-                out.append(str(len(trip)))
-                for j in range(0, len(trip), 4):      # ccx: at most 12 entries per line
-                    out.append(", ".join(f"{n}, {d}, {c}" for n, d, c in trip[j:j + 4]))
+                out += equation_rows(trip)
         self.report.note("*EQUATION set-name terms resolved to node numbers (ccx 2.22 needs "
                          "explicit nodes; multi-node sets expanded pairwise).", once=True)
         return out
@@ -16147,8 +16146,7 @@ class Converter:
             text: List[str] = []
             for r, first in zip(rows_, pick or [r[0] for r in rows_]):
                 r = [first] + [x for x in r if x is not first]
-                text += [str(len(r))] + [", ".join(f"{n}, {d}, {short_real(c)}" for n, d, c in r[i:i + 4])
-                                         for i in range(0, len(r), 4)]
+                text += equation_rows(r, short_real)
             return text
         next_n = max(nodes, default=0)
         mid_of: Dict[int, int] = {}                   # membrane corner node -> its mid-thickness node
@@ -19870,9 +19868,7 @@ class Converter:
                 terms = final[e]
                 if terms is None:
                     continue
-                lines.append(str(len(terms)))
-                for q in range(0, len(terms), 4):
-                    lines.append(", ".join(f"{n}, {d}, {c}" for n, d, c in terms[q:q + 4]))
+                lines += equation_rows(terms)
             new_cards[ci] = lines
         if moved or rewritten:
             self.report.note(f"*EQUATION: {moved + rewritten} equation(s) reordered so that the "
