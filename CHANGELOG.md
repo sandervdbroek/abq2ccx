@@ -4,7 +4,13 @@ Corpus counts are on the CalculiX version current at the time; from October 2026
 counts only decks that solve their own problem: under their own loads, without reduced
 physics.
 
-## Unreleased
+## 1.3.0 (October 2026)
+
+Material directions as Abaqus defines them on shells, membranes and continuum shells (composite
+plies, stack directions and spherical systems included); ccx's own membranes and quadratic beams
+written so that ccx 2.23 solves them right; initial stresses and deformation plasticity on
+oriented sections; general steps after perturbation steps; and the fixes and cleanups of a
+whole-file code review. Corpus on ccx 2.23: 232 decks gated, 189 solving their own physics.
 
 * **General steps after linear perturbation steps** — a step that follows a `*FREQUENCY`,
   `*BUCKLE`, modal or steady-state dynamics or `*STEP, PERTURBATION` step starts from the last
