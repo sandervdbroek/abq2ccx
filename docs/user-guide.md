@@ -43,9 +43,9 @@ overwrites a deck abq2ccx did not write.
 
 **Exit codes:** `0` converted · `1` cannot read or write, or `--run` failed · `2` usage
 error · `3` `--strict` findings · `4` internal conversion error. `--run` fails when ccx
-stops with an `*ERROR`, crashes, or writes NaN/Inf results — ccx 2.23 ends a diverged
-solution with "Job finished" all the same, so `--run` reads the results and names the first
-NaN/Inf value.
+stops with an `*ERROR`, crashes, writes NaN/Inf results or runs a step that sets up no
+equations — ccx 2.23 ends a diverged solution, and such a step, with "Job finished" all the
+same, so `--run` reads the results and names the first NaN/Inf value, or the step.
 
 **Outputs:** `<output>.inp`, the CalculiX deck, with the report as `**` comments at the
 top; `<output>.log`, the same report as text; and a one-line summary plus the report on

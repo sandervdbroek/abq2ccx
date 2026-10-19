@@ -23350,7 +23350,13 @@ def find_ccx(override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, s
 # print "Job finished" and then abort in glibc's free() (issue #3).
 CCX_ABORT_SIGNS = ("free(): ", "double free", "malloc(): ", "corrupted size", "Aborted",
                    "Segmentation fault")
-_CCX_STEP_RE = re.compile(r"^\s*STEP\s+\d+\s*$", re.M)
+_CCX_STEP_RE = re.compile(r"^\s*STEP\s+(\d+)\s*$", re.M)
+# What ccx prints in each step it solves, as it sets up the step's system: "Determining the
+# structure of the matrix" (implicit and explicit steps) and "number of equations" with the
+# count (implicit; 0 where every DOF is prescribed, whose response still follows; *GREEN and
+# *SUBSTRUCTURE GENERATE print only this)
+_CCX_SOLVE_RE = re.compile(r"Determining the structure of the matrix"
+                           r"|number of equations\s*\n\s*\d+")
 # A solution that went to NaN (an unstable explicit increment, say) still ends with "Job
 # finished" and exit 0; only the results show it: Fortran writes NaN/Infinity to the .dat,
 # C writes NAN/INF to the .frd (-NAN(IND) for 0/0 in a Windows build whose printf is the
@@ -23417,13 +23423,26 @@ def ccx_nonfinite_result(job: str) -> Optional[str]:
     return None
 
 
+def ccx_unsolved_steps(stdout: str) -> List[int]:
+    """The steps whose ccx output shows no solve: no matrix structure and no number of
+    equations.  ccx 2.23 runs a step that sets up no system (a *DYNAMIC step, implicit or
+    explicit, whose kinematic couplings chain no MPCs: see _plan_kinematic_rot_nodes) to "Job
+    finished" and exit 0, every free DOF at its initial value; the explicit one still prints
+    "Explicit time integration".  Reads ccx's stdout as a pipe gives it: written to a file,
+    ccx's Fortran output (the STEP lines) is buffered and lands after its C output."""
+    parts = _CCX_STEP_RE.split(stdout)
+    return [int(n) for n, text in zip(parts[1::2], parts[2::2]) if not _CCX_SOLVE_RE.search(text)]
+
+
 def classify_ccx_run(returncode, stdout: str, stderr: str, job: Optional[str] = None) -> str:
     """Classify a finished ccx run:
 
     * ``"solved"``    - exit 0, "Job finished", no ``*ERROR``, no crash/abort message, at
-                        least one analysis STEP executed, and (given ``job``, the job's
-                        path without the extension) every value its .dat print blocks
-                        and .frd result blocks hold is finite;
+                        least one analysis STEP executed, each showing a solve, and (given
+                        ``job``, the job's path without the extension) every value its .dat
+                        print blocks and .frd result blocks hold is finite;
+    * ``"unsolved"``  - the same, but a step shows no solve: ccx finishes a step that sets
+                        up no equations like any other (see ccx_unsolved_steps);
     * ``"nonfinite"`` - the same, but the results hold NaN or Inf: ccx finishes a
                         diverged solution like any other (see ccx_nonfinite_result);
     * ``"accepted"``  - no STEP ran (a mesh-only deck ccx only parsed), otherwise clean;
@@ -23439,6 +23458,8 @@ def classify_ccx_run(returncode, stdout: str, stderr: str, job: Optional[str] = 
         return "failed"
     if not _CCX_STEP_RE.search(stdout):
         return "accepted"
+    if ccx_unsolved_steps(stdout):
+        return "unsolved"
     return "nonfinite" if job and ccx_nonfinite_result(job) else "solved"
 
 
@@ -24049,6 +24070,11 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
         sys.stderr.write("abq2ccx: ccx accepted the deck, but it has no analysis step — "
                          "nothing was solved.\n")
         run["code"] = 0
+    elif status == "unsolved":
+        idle = ccx_unsolved_steps(p.stdout)
+        sys.stderr.write(f"abq2ccx: ccx finished, but {'steps' if len(idle) > 1 else 'step'} "
+                         f"{', '.join(map(str, idle))} set up no system of equations: ccx solved "
+                         f"nothing there, and the results are not a solution.\n")
     elif status == "nonfinite":
         sys.stderr.write(f"abq2ccx: ccx finished, but its results hold NaN/Inf values (the "
                          f"solution diverged): {ccx_nonfinite_result(job)}\n")

@@ -76,8 +76,8 @@ a part's pre-tension section and distributing coupling in turned instances, and 
 after a linear perturbation step (the state before it again).
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
-an eigenvalue), and a run counts as solved only if ccx's output shows each step's equations
-(or explicit time integration): a step that sets up none still ends in "Job finished".
+an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
+its system (abq2ccx.classify_ccx_run): a step that sets up none still ends in "Job finished".
 
     python validate_with_ccx.py
 
@@ -119,24 +119,9 @@ def convert(path, out_inp, approximate=False, abaqus_umat=False):
     return rep, conv
 
 
-def unsolved_steps(stdout):
-    """The steps whose ccx output shows no solve: an implicit step prints the number of
-    equations it set up, an explicit one "Explicit time integration".  A step that sets up no
-    equations (ccx 2.23: a *DYNAMIC step with *COUPLING, *KINEMATIC) prints neither and runs to
-    "Job finished" with every free DOF at 0."""
-    found = []
-    parts = re.split(r"(?m)^ STEP\s+(\d+)\s*$", stdout)
-    for step, text in zip(parts[1::2], parts[2::2]):
-        m = re.search(r"number of equations\s*\n\s*(\d+)", text)
-        if not (m and int(m.group(1)) > 0) and "Explicit time integration" not in text:
-            found.append(int(step))
-    return found
-
-
 def run_ccx(ccx, env, inp_path):
     """Run ccx; return (workdir, status, combined output) with status from
-    abq2ccx.classify_ccx_run ("solved" / "nonfinite" / "accepted" / "failed"), or "unsolved"
-    where it says "solved" or "nonfinite" but a step shows no solve (unsolved_steps)."""
+    abq2ccx.classify_ccx_run ("solved" / "unsolved" / "nonfinite" / "accepted" / "failed")."""
     d = tempfile.mkdtemp(prefix="ccxval_")
     shutil.copy(inp_path, os.path.join(d, "job.inp"))
     full_env = dict(os.environ)
@@ -146,11 +131,9 @@ def run_ccx(ccx, env, inp_path):
                            encoding="utf-8", errors="replace", timeout=600)
         status = A.classify_ccx_run(r.returncode, r.stdout, r.stderr, os.path.join(d, "job"))
         out = r.stdout + r.stderr
-        idle = unsolved_steps(r.stdout) if status in ("solved", "nonfinite") else []
-        if idle:
-            status = "unsolved"
-            out += (f"\n*ERROR (validate_with_ccx): step {', '.join(map(str, idle))} shows no "
-                    f"solve (no equations set up, no explicit time integration)\n")
+        if status == "unsolved":                # the checks print the *ERROR lines of a failure
+            idle = ", ".join(map(str, A.ccx_unsolved_steps(r.stdout)))
+            out += f"\n*ERROR (validate_with_ccx): step {idle} set up no system of equations\n"
         return d, status, out
     except Exception as exc:  # noqa: BLE001
         return d, "failed", f"failed to launch ccx: {exc}"

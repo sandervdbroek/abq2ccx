@@ -8527,19 +8527,8 @@ def test_run_reads_ccx_output_in_any_encoding():
     try:
         bindir = os.path.join(d, "Program Files (x86)")
         os.mkdir(bindir)
-        fake = os.path.join(bindir, "fake_ccx.py")
-        with open(fake, "w", encoding="utf-8") as fh:
-            fh.write("import sys\nsys.stdout.buffer.write(b' STEP 1\\n caf\\xe9 \\xc5\\x81\\n"
-                     " Job finished\\n')\n")
-        if os.name == "nt":
-            ccx = os.path.join(bindir, "ccx.bat")
-            with open(ccx, "w", encoding="ascii") as fh:
-                fh.write(f'@"{sys.executable}" "{fake}" %*\n')
-        else:
-            ccx = os.path.join(bindir, "ccx")
-            with open(ccx, "w", encoding="utf-8") as fh:
-                fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n')
-            os.chmod(ccx, 0o755)
+        ccx = _fake_ccx(bindir, b" STEP 1\n caf\xe9 \xc5\x81\n Determining the structure of the "
+                                b"matrix:\n number of equations\n 24\n Job finished\n")
         deck = os.path.join(d, "hex.inp")
         with open(deck, "w", encoding="utf-8") as fh:
             fh.write(HEX + "*STEP\n*STATIC\n*END STEP\n")
@@ -8547,6 +8536,71 @@ def test_run_reads_ccx_output_in_any_encoding():
     finally:
         shutil.rmtree(d, ignore_errors=True)
     assert code == 0
+
+
+def _fake_ccx(bindir, out):
+    """A stand-in ccx in ``bindir`` that writes the bytes ``out`` to stdout: a script, as
+    bConverged's ccx.bat is on Windows (where cmd.exe reads it in the OEM code page)."""
+    fake = os.path.join(bindir, "fake_ccx.py")
+    with open(fake, "w", encoding="utf-8") as fh:
+        fh.write(f"import sys\nsys.stdout.buffer.write({out!r})\n")
+    if os.name == "nt":
+        ccx = os.path.join(bindir, "ccx.bat")
+        with open(ccx, "w", encoding="ascii") as fh:
+            fh.write(f'@"{sys.executable}" "{fake}" %*\n')
+    else:
+        ccx = os.path.join(bindir, "ccx")
+        with open(ccx, "w", encoding="utf-8") as fh:
+            fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n')
+        os.chmod(ccx, 0o755)
+    return ccx
+
+
+def test_run_fails_on_a_step_that_solves_nothing():
+    # ccx 2.23 skips the matrix structure in a *DYNAMIC step whose kinematic couplings chain
+    # no MPCs: the step sets up no system of equations, yet runs to "Job finished" and exit 0,
+    # every free DOF at its initial value.  --run names the step and fails.  The stand-in ccx
+    # prints ccx 2.23's output for a *STATIC step and then such a step, cut down.
+    from contextlib import redirect_stderr
+    if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
+        return                                  # cmd.exe would read the .bat in the OEM code page
+    out = (" STEP            1\n\n Static analysis was selected\n\n Decascading the MPC's\n\n"
+           " Determining the structure of the matrix:\n number of equations\n 13\n\n"
+           " STEP            2\n\n Dynamic analysis was selected\n\n Newton-Raphson iterative "
+           "procedure is active\n\n Decascading the MPC's\n\n increment 1 attempt 1 \n\n"
+           " largest residual force= 0.000000 in node 1 and dof 0\n largest increment of disp= "
+           "0.000000e+00\n\n convergence\n\n Job finished\n\n")
+    d = tempfile.mkdtemp()
+    try:
+        ccx = _fake_ccx(d, out.encode())
+        deck = os.path.join(d, "hex.inp")
+        with open(deck, "w", encoding="utf-8") as fh:
+            fh.write(HEX + "*STEP\n*STATIC\n*END STEP\n*STEP\n*DYNAMIC\n0.01, 1.\n*END STEP\n")
+        with redirect_stderr(io.StringIO()) as err:
+            code = A.main([deck, "--run", "--ccx", ccx, "--quiet"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert code == 1
+    assert "step 2 set up no system of equations: ccx solved nothing there" in err.getvalue(), \
+        err.getvalue()
+    # with step 2's system set up, the same run solves
+    solved = out.replace(" increment 1", " Determining the structure of the matrix:\n number of "
+                                         "equations\n 12\n\n increment 1")
+    assert A.ccx_unsolved_steps(out) == [2] and A.ccx_unsolved_steps(solved) == []
+    assert A.classify_ccx_run(0, solved, "") == "solved"
+    # what each step must show: the structure of its matrix (explicit steps too: the step that
+    # sets up none still prints "Explicit time integration") or its number of equations (0
+    # where every DOF is prescribed; *GREEN and *SUBSTRUCTURE GENERATE print only that)
+    step = " STEP            1\n\n{}\n Job finished\n"
+    structure = " Determining the structure of the matrix:\n"
+    explicit = (" Explicit time integration: Volumetric COURANT initial stable time "
+                "increment:4.575976e-04\n")
+    for shown, status in ((structure + " number of equations\n 0\n", "solved"),
+                          (" number of equations\n 36\n", "solved"),
+                          (structure + explicit, "solved"),
+                          (explicit, "unsolved"),
+                          (" Dynamic analysis was selected\n", "unsolved")):
+        assert A.classify_ccx_run(0, step.format(shown), "") == status, (shown, status)
 
 
 def test_cli_second_deck_is_the_output_when_new_or_written_by_abq2ccx():

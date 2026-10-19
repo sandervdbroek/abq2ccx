@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **A step that solved nothing is no solve** — ccx 2.23 can run a step that sets up no system
+  of equations to "Job finished" and exit 0, every free DOF left at its initial value (a
+  `*DYNAMIC` step whose kinematic couplings chain no MPCs, which the converter avoids). The
+  solve judge, `classify_ccx_run` (shared by `--run`, `validate_with_ccx.py` and the corpus
+  tests), called that run solved. It now needs each step to show the structure of its matrix
+  or its number of equations, and calls a run where one does not **unsolved**: `--run` names
+  the step and exits 1. No corpus deck changes status.
 * **Body forces after `*DLOAD, OP=NEW`** — ccx 2.23's `*DLOAD, OP=NEW` removes the earlier
   pressures and `GRAV` / `CENTRIF` loads but keeps `BX`, `BY` and `BZ`, which Abaqus removes. So
   they stayed on after a deck's own `OP=NEW`, after a linear perturbation step and in a

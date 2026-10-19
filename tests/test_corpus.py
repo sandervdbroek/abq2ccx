@@ -298,7 +298,8 @@ def test_corpus_fidelity():
 
 def test_classify_ccx_run():
     """The solve judge itself (no ccx needed)."""
-    ok = " STEP            1\n\n Job finished\n"
+    ok = (" STEP            1\n\n Static analysis was selected\n\n Determining the structure of "
+          "the matrix:\n number of equations\n 24\n\n Job finished\n")
     assert classify_ccx_run(0, ok, "") == "solved"
     assert classify_ccx_run(0, " Job finished\n", "") == "accepted"     # mesh-only: no STEP ran
     # issue #3: unpatched ccx printed "Job finished", then aborted in glibc's free()
@@ -309,7 +310,48 @@ def test_classify_ccx_run():
     assert classify_ccx_run(201, " *ERROR reading *NODE: node number 0 is not positive\n",
                             "") == "failed"
     # per-iteration non-convergence is normal in nonlinear solves, not a failure
-    assert classify_ccx_run(0, " STEP 1\n no convergence\n Job finished\n", "") == "solved"
+    assert classify_ccx_run(0, ok.replace(" Job", " no convergence\n Job"), "") == "solved"
+
+    # A step that sets up no system of equations also ends with "Job finished" and exit 0:
+    # ccx 2.23 skips the matrix structure in a *DYNAMIC step whose kinematic couplings chain
+    # no MPCs, and every free DOF keeps its initial value.  Each step must show the
+    # structure of its matrix or its number of equations.  Lines as ccx 2.23 writes them to
+    # a pipe (a *STATIC step, then that *DYNAMIC step), cut down.
+    static = (" STEP            1\n\n Static analysis was selected\n\n Decascading the MPC's\n\n"
+              " Determining the structure of the matrix:\n Using up to 1 cpu(s) for setting up "
+              "the structure of the matrix.\n number of equations\n 13\n number of nonzero lower "
+              "triangular matrix elements\n 78\n\n Factoring the system of equations using the "
+              "symmetric spooles solver\n\n")
+    idle = (" STEP            2\n\n Dynamic analysis was selected\n\n Newton-Raphson iterative "
+            "procedure is active\n\n Decascading the MPC's\n\n Using up to 1 cpu(s) for the "
+            "stress calculation.\n\n increment 1 attempt 1 \n increment size= 1.000000e-02\n\n"
+            " iteration 1\n\n average force= 0.641026\n time avg. forc= 0.641026\n largest "
+            "residual force= 0.000000 in node 1 and dof 0\n largest increment of disp= "
+            "0.000000e+00\n largest correction to disp= 0.000000e+00\n\n convergence\n\n")
+    end = " Job finished\n\n"
+    assert classify_ccx_run(0, static + idle + end, "") == "unsolved"
+    assert A.ccx_unsolved_steps(static + idle + end) == [2]
+    assert classify_ccx_run(0, idle.replace("2\n", "1\n", 1) + end, "") == "unsolved"
+    # the same step with its system set up solves
+    solved = idle.replace(" Using", " Determining the structure of the matrix:\n number of "
+                                    "equations\n 12\n\n Using", 1)
+    assert classify_ccx_run(0, static + solved + end, "") == "solved"
+    # every DOF prescribed: 0 equations, and the response to the prescribed values
+    assert classify_ccx_run(0, ok.replace(" 24\n", " 0\n"), "") == "solved"
+    # *GREEN and *SUBSTRUCTURE GENERATE print the number of equations only
+    assert classify_ccx_run(0, " STEP            1\n\n Decascading the MPC's\n\n number of "
+                               "equations\n 36\n\n" + end, "") == "solved"
+    # explicit: the structure of the (mass) matrix; the step that sets up none still prints
+    # "Explicit time integration"
+    explicit = (" STEP            1\n\n Dynamic analysis was selected\n\n Newton-Raphson iterative "
+                "procedure is active\n\n Decascading the MPC's\n\n Determining the structure of "
+                "the matrix:\n Using up to 1 cpu(s) for setting up the structure of the matrix.\n"
+                "\n Calculating Material Wave Speeds...\n\n Explicit time integration: "
+                "Volumetric COURANT initial stable time increment:4.575976e-04\n\n")
+    assert classify_ccx_run(0, explicit + end, "") == "solved"
+    no_structure = explicit.replace(" Determining the structure of the matrix:\n Using up to 1 "
+                                    "cpu(s) for setting up the structure of the matrix.\n", "")
+    assert classify_ccx_run(0, no_structure + end, "") == "unsolved"
 
     # A diverged solution also ends with "Job finished" and exit 0 (an explicit step on a
     # circular-section beam whose increment ccx misjudged gave NaN for every value): the
@@ -372,6 +414,8 @@ def test_classify_ccx_run():
                                                "time 0.1668256E-03: 4 NaN NaN NaN")
         assert classify_ccx_run(0, " *ERROR in e_c3d\n" + ok, "", job) == "failed"
         assert classify_ccx_run(0, " Job finished\n", "", job) == "accepted"   # no STEP ran
+        # a step that solved nothing: its results are no solution, finite or not
+        assert classify_ccx_run(0, static + idle + end, "", job) == "unsolved"
 
 
 def test_corpus_solves():
