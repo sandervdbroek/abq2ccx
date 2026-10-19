@@ -117,10 +117,10 @@ A **corpus of 1052 genuine Abaqus decks** — 1022 from about 180 public reposit
 exports, UMAT and UEL decks, explicit and coupled models, …) and 30 NAFEMS benchmark decks of
 the Abaqus 2017 documentation — is fetched on demand and run through convert → integrity check
 → ccx. On ccx 2.23 all 1052 convert with no dangling reference; **189 solve the deck's own
-physics**; 45 more solve but stay out of that count — 14 load nothing in the source deck, 33
+physics**; 43 more solve but stay out of that count — 14 load nothing in the source deck, 31
 (3 of them also unloaded) solve a model with reduced physics, and one converges to a solution
 that is not the deck's (a part that only contact holds drifts away in ccx) — and 221 mesh-only
-decks are accepted. The other 597 need what ccx cannot run — mostly user materials (353) and
+decks are accepted. The other 599 need what ccx cannot run — mostly user materials (353) and
 user elements (66). **26 benchmark decks are checked against their published answer**: 20
 match Abaqus' result for the same mesh (within 0.5 % for temperatures and frequencies, 1 % for
 stresses and displacements), 6 differ for reasons traced to ccx (its nodal extrapolation,

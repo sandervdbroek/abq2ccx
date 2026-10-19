@@ -206,15 +206,15 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1052 decks convert with no dangling
-reference. 234 are gated `expect_solve`: **189 solve the deck's own physics**; 14 are
+reference. 232 are gated `expect_solve`: **189 solve the deck's own physics**; 14 are
 `source_unloaded`, one is `solver_differs` (a snap-fit insert that only contact holds drifts
-out of its buckle) and 33 (3 of them also unloaded) are `reduced_physics` — concrete damaged
-plasticity (2), UHARD / VUHARD hardening (4), field-dependent elasticity set by USDFLD or a
+out of its buckle) and 31 (3 of them also unloaded) are `reduced_physics` — concrete damaged
+plasticity (2), UHARD / VUHARD hardening (2), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
 `B32R` (3), I-section `B21` beams run as ccx's Euler–Bernoulli `U1` (3), general contact (2), a
 dropped `*IMPERFECTION` (1), planar beams whose eigenmodes include twist (1). 221 mesh-only
-decks are accepted. The other 597 stop first on, or (the last row) run without, what they need:
+decks are accepted. The other 599 stop first on, or (the last row) run without, what they need:
 
 | Decks | First blocker |
 | ---: | --- |
@@ -226,7 +226,7 @@ decks are accepted. The other 597 stop first on, or (the last row) run without, 
 | 16 | NLGEOM follower tractions (they convert with `--approximate`) |
 | 19 | other ccx errors, one or a few decks each |
 | 22 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure models) |
-| 10 | Abaqus general contact (7), an XFEM crack (1) or Hashin damage of composite plies (2): ccx has none of them, and the converted deck runs without it — not the deck's physics, so not gated |
+| 12 | Abaqus general contact (7), an XFEM crack (1), Hashin damage of composite plies (2) or the only path of the load, kinematic couplings of some translations in an explicit NLGEOM step (2): ccx has none of them, and the converted deck runs without it — not the deck's physics, so not gated |
 
 Every one of them was checked to fail no worse than the original, unconverted deck. Fixing
 a first error often only exposes a second, fundamental one behind it, so the converter aims

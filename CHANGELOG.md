@@ -64,7 +64,8 @@ physics.
   a coupling of solid or free nodes is now the linear `*EQUATION`s Abaqus solves without NLGEOM,
   or a `*RIGID BODY` under NLGEOM; under NLGEOM one of only some translations is commented out
   (`--approximate`: the linear equations). `davidmorinntnu_example_vuhard_v1` / `_v2` had run
-  with their specimens' lateral DOFs frozen; their DOF-2 couplings are now commented out.
+  with their specimens' lateral DOFs frozen; their DOF-2 couplings are now commented out, which
+  leaves the specimens without load, so the corpus no longer gates them (232 `expect_solve`).
 * **Pre-tension nodes named by a set** — `*PRE-TENSION SECTION, NODE=` (and a truss or beam
   cut's `ELEMENT=`) naming a set of one node (element), as Abaqus allows, is written with its
   number: ccx 2.23 reads only a number there and stopped on the set name. Instance-qualified

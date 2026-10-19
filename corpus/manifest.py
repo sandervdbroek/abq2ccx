@@ -14,7 +14,7 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 Abaqus 2017 documentation (``abaqus2017_*``). Every deck converts cleanly (zero dangling
 references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (234) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (232) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
@@ -23,7 +23,7 @@ references). Each entry carries one of three expectations:
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
-  - ``reduced_physics='<what>'`` (33, 3 of them also source_unloaded): the conversion
+  - ``reduced_physics='<what>'`` (31, 3 of them also source_unloaded): the conversion
     drops or replaces part of the Abaqus model - a constitutive behaviour (concrete
     damaged plasticity, user hardening, Chaboche back-stresses, field-dependent
     elasticity), an element formulation (hybrid, modified or thin-shell elements run as
@@ -39,7 +39,7 @@ references). Each entry carries one of three expectations:
 * ``parse_only=True`` (221) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (597) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (599) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -990,13 +990,19 @@ CORPUS = [
     dict(name='burakbayramli_tower', expect_solve=True, license='see source repo',
          exercises='T2D2',
          url='https://raw.githubusercontent.com/burakbayramli/books/master/Fundamental_Finite_Element_Analysis_and_Applications_Bhatti/AbaqusUse/TrussAnalysis/tower.inp'),
-    dict(name='davidmorinntnu_example_vuhard_v1', expect_solve=True,
-         reduced_physics='*PLASTIC, HARDENING=USER (VUHARD) has no ccx counterpart: the material runs elastic; its kinematic couplings of DOF 2 in the explicit (NLGEOM) step are commented out (ccx 2.23 solves no dynamic step with its *KINEMATIC, and nothing else is exact), so no load reaches the specimens', license='MIT',
+    dict(name='davidmorinntnu_example_vuhard_v1', expect_solve=False, license='MIT',
          exercises='C3D8R — parts/instances/assembly; explicit',
+         note="runs without its load: the specimens are loaded only through kinematic couplings of "
+              "DOF 2 in the explicit NLGEOM step, which have no exact ccx form (ccx 2.23 solves no "
+              "dynamic step with its *KINEMATIC) and are commented out; *PLASTIC, HARDENING=USER "
+              "(VUHARD) has no ccx counterpart either. Not the deck's physics, so not gated.",
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_UHARD/example_VUHARD_V1.inp'),
-    dict(name='davidmorinntnu_example_vuhard_v2', expect_solve=True,
-         reduced_physics='*PLASTIC, HARDENING=USER (VUHARD), *INELASTIC HEAT FRACTION and adiabatic heating have no ccx counterpart: the material runs elastic and isothermal; its kinematic couplings of DOF 2 in the explicit (NLGEOM) step are commented out (ccx 2.23 solves no dynamic step with its *KINEMATIC, and nothing else is exact), so no load reaches the specimens', license='MIT',
+    dict(name='davidmorinntnu_example_vuhard_v2', expect_solve=False, license='MIT',
          exercises='C3D8R — parts/instances/assembly; explicit',
+         note="runs without its load: the specimens are loaded only through kinematic couplings of "
+              "DOF 2 in the explicit NLGEOM step, which have no exact ccx form (ccx 2.23 solves no "
+              "dynamic step with its *KINEMATIC) and are commented out; *PLASTIC, HARDENING=USER "
+              "(VUHARD), *INELASTIC HEAT FRACTION and adiabatic heating has no ccx counterpart either. Not the deck's physics, so not gated.",
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_UHARD/example_VUHARD_V2.inp'),
     dict(name='dithoap_cube_cyclic_disp', expect_solve=True,
          reduced_physics="Chaboche *PLASTIC (two back-stresses) and Voce *CYCLIC HARDENING have no ccx form (probed on 2.23: its tabulated isotropic hardening has no Bauschinger effect, its tabulated kinematic one does not follow the curve): the material runs elastic", license='MIT',
