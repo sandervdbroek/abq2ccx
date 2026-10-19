@@ -473,8 +473,18 @@ def test_parameter_forward_reference():
     # Abaqus does not require parameters to be defined before use.
     deck = ("*PARAMETER\na = b*2\nb = 3.0\n*NODE\n1, <a>, 0., 0.\n"
             "*ELEMENT, TYPE=MASS, ELSET=E\n1, 1\n")
-    _, conv, _ = convert_str(deck)
-    assert conv.geom.nodes[1][0] == 6.0
+    _, conv, rep = convert_str(deck)
+    assert conv.geom.nodes[1][0] == 6.0 and "resolved 2 parameter(s)" in rep.text()
+
+
+def test_unresolved_parameter_is_reported():
+    # an expression the converter cannot evaluate is substituted as written, warned, and not
+    # counted as resolved
+    deck = ("*PARAMETER\na = 2.0\nb = foo(a)\nc = a * 3\n*NODE\n1, <a>, 0., <c>\n2, <b>, 0., 0.\n"
+            "*ELEMENT, TYPE=MASS, ELSET=E\n1, 1\n")
+    _, conv, rep = convert_str(deck)
+    assert conv.geom.nodes[1] == (2.0, 0.0, 6.0) and 2 not in conv.geom.nodes
+    assert "resolved 2 parameter(s)" in rep.text() and "*PARAMETER: b could not be evaluated" in rep.text()
 
 
 def test_no_residual_parameter_tokens():

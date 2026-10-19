@@ -961,6 +961,7 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
 
     if raw_defs:                            # resolve, iterating to handle forward references
         user_names = {nm for nm, _ in raw_defs}
+        unresolved: set = set()
         for _ in range(len(raw_defs) + 1):
             progressed = False
             # math constants are visible, but a user parameter of the same name
@@ -975,12 +976,19 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                     params[name] = val
                     ns[name] = val          # visible to later defs resolved in this same pass
                     progressed = True
+                    unresolved.discard(name)
                 except Exception:           # noqa: BLE001 — unresolved (maybe forward ref)
                     params.setdefault(name, expr)
+                    unresolved.add(name)
             if not progressed:
                 break
-        report.note(f"*PARAMETER: resolved {len(raw_defs)} parameter(s) and substituted <name> "
-                    "tokens (ccx has no *PARAMETER).", once=True)
+        bad = [nm for nm, _ in raw_defs if nm in unresolved]
+        report.note(f"*PARAMETER: resolved {len(raw_defs) - len(bad)} parameter(s) and substituted "
+                    "<name> tokens (ccx has no *PARAMETER).", once=True)
+        if bad:
+            report.warn(f"*PARAMETER: {', '.join(dedup(bad))} could not be evaluated (the converter "
+                        f"reads numbers, quoted strings, arithmetic and math functions), so the "
+                        f"expression is substituted as written — verify.", once=True)
 
     if not params:
         return lines
