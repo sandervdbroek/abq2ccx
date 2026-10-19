@@ -7366,7 +7366,7 @@ class Converter:
 
     def handle_boundary(self, b: Block) -> List[str]:
         if id(b) in self._lc_drop:                   # _plan_load_cases, before any other plan
-            return ["** [abq2ccx] *BOUNDARY, LOAD CASE=2 (buckling-mode BCs) left out: ccx has one "
+            return ["** abq2ccx: *BOUNDARY, LOAD CASE=2 (buckling-mode BCs) left out: ccx has one "
                     "set of BCs per step"]
         if self._bc_type(b) in self._RATE_TYPES and id(b) in self._vel_cards:   # _plan_velocity_bcs
             pieces = self._vel_cards[id(b)]
@@ -7408,7 +7408,7 @@ class Converter:
             if k == "OP" and id(b) in self._op_new_drop:
                 continue                # an OP=NEW that removes nothing (_plan_op_new_rotations)
             params[k] = v
-        out = ["** [abq2ccx] OP=NEW dropped: this step re-specifies every boundary condition in "
+        out = ["** abq2ccx: OP=NEW dropped: this step re-specifies every boundary condition in "
                "effect (ccx 2.23 would not rebuild the shell/beam rotations after it)"] \
             if self._op_new_drop.get(id(b)) and (b.param("OP") or "").strip().upper() == "NEW" else []
         out.append(emit_keyword("BOUNDARY", params))
@@ -7474,11 +7474,11 @@ class Converter:
                              "rotational DOFs').", once=True)
         if self._planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
             # OP=NEW also removes the model-data planar constraint (verified on 2.23)
-            out += ["** [abq2ccx] planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
+            out += ["** abq2ccx: planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
         if self._slab_bc and (params.get("OP") or "").strip().upper() == "NEW":
-            out += ["** [abq2ccx] slab thickness DOF held again (OP=NEW removed it)"] + self._slab_bc
+            out += ["** abq2ccx: slab thickness DOF held again (OP=NEW removed it)"] + self._slab_bc
         if self._rigid_planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
-            out += ["** [abq2ccx] plane rigid bodies held in their plane again (OP=NEW removed "
+            out += ["** abq2ccx: plane rigid bodies held in their plane again (OP=NEW removed "
                     "it)"] + self._rigid_planar_bc
         if self._conn_bcs and (params.get("OP") or "").strip().upper() == "NEW":
             # bare lines: on a card with FIXED or an amplitude they would take it on too
@@ -7939,7 +7939,7 @@ class Converter:
             self.report.warn(why, once=True)
             if reduces:
                 self._reduces("*BOUNDARY, TYPE=VELOCITY/ACCELERATION line not converted")
-            return ("#", f"** [abq2ccx] not converted: {what} -- {why}")
+            return ("#", f"** abq2ccx: not converted: {what} -- {why}")
 
         def constraint_card(b: Block, why: str) -> List[object]:
             """A rate card where only its constraint can be kept (model data, perturbation)."""
@@ -8285,7 +8285,7 @@ class Converter:
             tail = [e for e in tail if e[0] not in (None, "FIXED")]   # ccx holds those already
             if tail:
                 self._vel_tail[s] = pieces(None, tail_amps, tail,
-                                           ["** [abq2ccx] *BOUNDARY, TYPE=VELOCITY/ACCELERATION of "
+                                           ["** abq2ccx: *BOUNDARY, TYPE=VELOCITY/ACCELERATION of "
                                             "an earlier step, still in force: its motion continues"])
             # warn where finite rotations about several axes are integrated component-wise:
             # a node turned about more than one axis in this step, or about another axis
@@ -8441,10 +8441,10 @@ class Converter:
                 entries: List[Tuple[Optional[str], str]] = []
                 for ln, cs in zip(lines, cls):
                     entries += self._default_amp_entries(ln, cs)
-                note = ("** [abq2ccx] displacement BC without AMPLITUDE, ramped from its value at "
+                note = ("** abq2ccx: displacement BC without AMPLITUDE, ramped from its value at "
                         "the end of the previous step as in Abaqus/Standard: AMPLITUDE="
                         f"{self.CCX_RAMP} is ccx's own step ramp" if kind == "ramp" else
-                        "** [abq2ccx] displacement BC without AMPLITUDE in an explicit step: "
+                        "** abq2ccx: displacement BC without AMPLITUDE in an explicit step: "
                         "Abaqus/Explicit ignores its value and holds the DOF where it is (zero "
                         "velocity)")
                 self._amp_cards[id(b)] = [note] + self._bc_runs(b.param("OP"), entries)
@@ -11927,7 +11927,7 @@ class Converter:
                              "0.05 rad, probed on 2.23) and stops explicit dynamics; a tied node "
                              "moves rigidly with the body, as in Abaqus.", once=True)
         if empty:
-            return ["** [abq2ccx] *TIE " + (b.param("NAME") or "") + ": its slave nodes are "
+            return ["** abq2ccx: *TIE " + (b.param("NAME") or "") + ": its slave nodes are "
                     "members of the rigid body of its master surface"] + comments
         b = nb
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -11965,7 +11965,7 @@ class Converter:
                 f[0], "*TIE slave", exclude=set(self._surface_member_nodes(master))) \
                 if f[0] and not (b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE")) else (None, [])
             if name == "":
-                out.append(f"** [abq2ccx] *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
+                out.append(f"** abq2ccx: *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
                            f"node of {master}, which joins them already")
                 continue
             if name:
@@ -12086,7 +12086,7 @@ class Converter:
             self.report.note("*AMPLITUDE used only by *BOUNDARY, TYPE=VELOCITY/ACCELERATION "
                              "dropped: those BCs get generated displacement amplitudes that "
                              "integrate it.", once=True)
-            return [f"** [abq2ccx] *AMPLITUDE, NAME={b.param('NAME')}: integrated into the "
+            return [f"** abq2ccx: *AMPLITUDE, NAME={b.param('NAME')}: integrated into the "
                     f"displacement amplitudes of the velocity/acceleration BCs using it"]
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         definition = ""
@@ -12280,7 +12280,7 @@ class Converter:
                              "dropped, so this interaction becomes FRICTIONLESS. Re-add *FRICTION "
                              "with a large mu (or tie the surfaces) to approximate no-slip.", once=True)
             self._reduces("*FRICTION, ROUGH (frictionless in ccx)")
-            return ["** [abq2ccx] *FRICTION, ROUGH dropped (no ccx equivalent)"]
+            return ["** abq2ccx: *FRICTION, ROUGH dropped (no ccx equivalent)"]
         for k in b.params:
             if k not in ("DEPENDENCIES",):
                 level = self.report.warn if k in ("EXPONENTIAL DECAY", "ANISOTROPIC", "TAUMAX",
@@ -12304,7 +12304,7 @@ class Converter:
             self.report.note("*FRICTION with no positive coefficient dropped — ccx treats the absence "
                              "of *FRICTION as frictionless, whereas a zero/empty coefficient is a hard "
                              "error there. Re-add it with mu>0 if you need friction.", once=True)
-            return ["** [abq2ccx] *FRICTION dropped (frictionless / no positive coefficient)"]
+            return ["** abq2ccx: *FRICTION dropped (frictionless / no positive coefficient)"]
         mu = mus[0] if mus[0] > 0.0 else max(mus)
         if len(set(mus)) > 1 or len(data) > 1 or any(
                 x.strip() for ln in data for x in ln.split(",")[1:]):
@@ -13008,7 +13008,7 @@ class Converter:
                              f"default ({ALL_NODES_SET}, 0. added before the first step); ccx 2.23 "
                              f"stops without initial temperatures ('please define initial "
                              f"conditions for the temperature').", once=True)
-            return ["** [abq2ccx] initial temperatures: the Abaqus default, 0, at every node (ccx "
+            return ["** abq2ccx: initial temperatures: the Abaqus default, 0, at every node (ccx "
                     "needs them for a transient step with temperature DOFs)",
                     "*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"{ALL_NODES_SET}, 0."]
         self.report.note(f"*TEMPERATURE with no *INITIAL CONDITIONS, TYPE=TEMPERATURE: every node "
@@ -13016,7 +13016,7 @@ class Converter:
                          f"(*INITIAL CONDITIONS, TYPE=TEMPERATURE / {ALL_NODES_SET}, 0. added "
                          f"before the first step); ccx stops on *TEMPERATURE without thermal "
                          f"initial conditions.", once=True)
-        return ["** [abq2ccx] initial temperatures: the Abaqus default, 0, at every node (ccx "
+        return ["** abq2ccx: initial temperatures: the Abaqus default, 0, at every node (ccx "
                 "reads *TEMPERATURE only after thermal initial conditions)",
                 "*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"{ALL_NODES_SET}, 0."]
 
@@ -13120,7 +13120,7 @@ class Converter:
                              "follows the body's NLGEOM rotation only linearly (1.3 % off at 0.05 "
                              "rad, probed on 2.23) and stops explicit dynamics.", once=True)
         if empty:
-            return ["** [abq2ccx] *CONTACT PAIR " + (b.param("INTERACTION") or "") + ": its slave "
+            return ["** abq2ccx: *CONTACT PAIR " + (b.param("INTERACTION") or "") + ": its slave "
                     "nodes are members of the rigid body of its master surface"] + comments
         return self._contact_pair_lines(nb) + comments
 
@@ -13143,7 +13143,7 @@ class Converter:
                 slave, cards = self._membrane_node_surface(f[0].strip(), "*CONTACT PAIR, TIED slave",
                                                            exclude=set(self._surface_member_nodes(f[1].strip())))
                 if slave == "":
-                    out.append(f"** [abq2ccx] *CONTACT PAIR, TIED: every slave node of {f[0].strip()} is a "
+                    out.append(f"** abq2ccx: *CONTACT PAIR, TIED: every slave node of {f[0].strip()} is a "
                                f"node of {f[1].strip()}, which joins them already")
                     continue
                 if slave:
@@ -13353,10 +13353,10 @@ class Converter:
         out.extend(self._sheet_cards)
         out.extend(self._node_normal_cards(blocks))
         if self._planar_bc:
-            out += ["** [abq2ccx] planar model: keep the 2-D beams/trusses in their plane (ccx "
+            out += ["** abq2ccx: planar model: keep the 2-D beams/trusses in their plane (ccx "
                     "runs them as 3-D elements)"] + self._planar_bc
         if self._rigid_planar_bc:
-            out += ["** [abq2ccx] keep the rigid bodies of plane rigid elements / surfaces in their "
+            out += ["** abq2ccx: keep the rigid bodies of plane rigid elements / surfaces in their "
                     "plane (3-D bodies in ccx)"] + self._rigid_planar_bc
         out.extend(self.emit_other(blocks))
         out = self._settle_dependents(out)
@@ -14694,7 +14694,7 @@ class Converter:
         out: List[str] = []
         if self.geom.elsets.get(RIGID_SET) and self._skin_material:
             e, rho, thermal = self._skin_material
-            out += ["** [abq2ccx] force-free skins of the rigid elements / analytical surfaces "
+            out += ["** abq2ccx: force-free skins of the rigid elements / analytical surfaces "
                     "(their rigid bodies move them; see the header)",
                     f"*MATERIAL, NAME={RIGID_SET}", "*ELASTIC", f"{short_real(e)}, 0.",
                     "*DENSITY", short_real(rho)]
@@ -15672,7 +15672,7 @@ class Converter:
         interface nodes on an edge the neighbours share."""
         if not self._ply_eq:
             return []
-        return (["** [abq2ccx] ply interface nodes held on the edge of a neighbour with other "
+        return (["** abq2ccx: ply interface nodes held on the edge of a neighbour with other "
                  "nodes there", "*EQUATION"] + self._ply_eq)
 
     # -- quadratic membranes as the converter's own solids -------------------------------
@@ -16222,7 +16222,7 @@ class Converter:
         their nodes at the membrane nodes."""
         if not self._qmem_eq:
             return []
-        return (["** [abq2ccx] quadratic membranes as solids: bottom + top = 2 x membrane node, "
+        return (["** abq2ccx: quadratic membranes as solids: bottom + top = 2 x membrane node, "
                  "mid-thickness corner node = membrane node", "*EQUATION"] + self._qmem_eq)
 
     # -- beams as ccx's U1 element ------------------------------------------------------
@@ -19946,7 +19946,7 @@ class Converter:
         the held thickness DOF."""
         if not self._slabs:
             return []
-        return (["** [abq2ccx] CPS4I / CPE4I as C3D8I slabs: top nodes follow the 2-D nodes in "
+        return (["** abq2ccx: CPS4I / CPE4I as C3D8I slabs: top nodes follow the 2-D nodes in "
                  "plane, thickness DOF held"] + self._slab_eq + self._slab_bc)
 
     def _reduces(self, what: str) -> None:

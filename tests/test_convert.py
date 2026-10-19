@@ -3552,7 +3552,7 @@ def test_initial_temperature_defaults_uncovered_nodes_to_zero():
 HOT_CUBE = HEX + "*Solid Section, elset=EALL, material=M\n,\n*Material, name=M\n*Elastic\n" \
     "1000., 0.3\n*Expansion\n1.e-5\n*Conductivity\n50.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
 HEAT_STEP = "*Step\n*Static\n*Temperature\n1, 100.\n*Node Print\nU\n*End Step\n"
-DEFAULT_IC = ("** [abq2ccx] initial temperatures: the Abaqus default, 0, at every node (ccx reads "
+DEFAULT_IC = ("** abq2ccx: initial temperatures: the Abaqus default, 0, at every node (ccx reads "
               "*TEMPERATURE only after thermal initial conditions)\n*INITIAL CONDITIONS, "
               "TYPE=TEMPERATURE\nABQ2CCX_ALL_NODES, 0.\n*STEP")
 
@@ -4029,7 +4029,7 @@ def test_planar_constraint_repeated_after_op_new():
     body, conv, _ = convert_str(deck)
     first, second = body.split("*STEP")[1:]
     assert "ABQ2CCX_PLANAR" not in first
-    assert "*BOUNDARY, OP=NEW\n1, 1, 6\n** [abq2ccx] planar constraint re-applied (OP=NEW removed " \
+    assert "*BOUNDARY, OP=NEW\n1, 1, 6\n** abq2ccx: planar constraint re-applied (OP=NEW removed " \
            "it)\n*BOUNDARY\nABQ2CCX_PLANAR, 3, 3\n*CLOAD" in second
     assert list(conv._knots) == [1]           # the clamp OP=NEW re-specifies (see below)
     # an OP=NEW that removes nothing is dropped: the constraint stays as it is
@@ -4471,7 +4471,7 @@ def test_op_new_that_removes_nothing_is_dropped():
     body, conv, rep = convert_str(deck)
     second = body.split("*STEP")[2]
     assert "*BOUNDARY, OP=NEW" not in body and not conv._knots
-    assert second.count("** [abq2ccx] OP=NEW dropped") == 1 and "*BOUNDARY\n1, 4, 6\n" in second
+    assert second.count("** abq2ccx: OP=NEW dropped") == 1 and "*BOUNDARY\n1, 4, 6\n" in second
     assert "OP=NEW dropped in step(s) 2" in rep.text()
     # on shells it would also zero unrelated BCs; a changed value is no removal
     body, conv, _ = convert_str(STEPPED_PLATE + "*Step\n*Static\n*Boundary, op=NEW\nROOT, ENCASTRE\n"
@@ -6291,7 +6291,7 @@ def test_velocity_bc_after_a_free_step():
     body, _, rep = convert_str(deck)
     # TOP moved freely in step 1, so ccx cannot be given the total displacement: a zero
     # velocity holds the DOFs where they are (FIXED), another one is left out
-    assert "** [abq2ccx] not converted: TOP, 3, 3" in body
+    assert "** abq2ccx: not converted: TOP, 3, 3" in body
     assert "*BOUNDARY, FIXED\nTOP, 1, 2\n" in body
     assert "displacement at the start of the step is unknown" in rep.text()
 
@@ -6383,7 +6383,7 @@ def test_velocity_bc_card_follows_op_new_drop():
             "*Step\n*Static\n*Boundary, op=NEW, type=VELOCITY\nROOT, 1, 6\nTIP, 1, 1, 0.5\n*End Step\n")
     body, _, _ = convert_str(deck)
     step2 = body.split("*STEP")[2]
-    assert "** [abq2ccx] OP=NEW dropped" in step2 and "*BOUNDARY\nROOT, 1, 6\n" in step2
+    assert "** abq2ccx: OP=NEW dropped" in step2 and "*BOUNDARY\nROOT, 1, 6\n" in step2
     assert "OP=NEW\n" not in step2 and "not converted: TIP, 1, 1" in step2
 
 
@@ -6481,7 +6481,7 @@ def test_velocity_bc_unreadable_lines_and_amplitudes():
                  VEL_HEX + "*Boundary, type=VELOCITY\nTOP, , 3, 0.\n*Step\n*Static\n*End Step\n",
                  VEL_HEX + "*Step\n*Static\n*Boundary, type=VELOCITY, user\nTOP, FOO\n*End Step\n"):
         body, _, _ = convert_str(deck)                       # commented, not a crash
-        assert "** [abq2ccx] not converted: TOP, " in body
+        assert "** abq2ccx: not converted: TOP, " in body
     # an amplitude another card also names (FILM AMPLITUDE=) is kept
     body, conv, _ = convert_str(VEL_HEX + "*Amplitude, name=A\n0., 0., 1., 1.\n*Step\n*Static\n"
                                           "*Boundary, type=VELOCITY, amplitude=A\nTOP, 3, 3, 1.\n"
@@ -7416,7 +7416,7 @@ def test_tie_to_a_rigid_surface_makes_the_slave_nodes_members():
             "*RIGID BODY, REF NODE=9, ELSET=PLATE\n*TIE, NAME=GLUE\nTOP, TOOL\n"
             "*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n*END STEP\n")
     body, _, rep = convert_str(deck)
-    assert "*TIE" not in body.replace("** [abq2ccx] *TIE", "") and "join that rigid body" in rep.text()
+    assert "*TIE" not in body.replace("** abq2ccx: *TIE", "") and "join that rigid body" in rep.text()
     m = re.search(r"\*RIGID BODY, REF NODE=9, NSET=([^,\s]+)", body)
     assert {5, 6, 7, 8} <= set(reparse(body).nset(m.group(1)))
 
@@ -7553,7 +7553,7 @@ def _body_members(body, ref=9):
 def test_tied_contact_pair_to_a_rigid_surface_makes_the_slave_nodes_members():
     body, _, rep = convert_str(TIED_PLATE.format("*SURFACE INTERACTION, NAME=G\n"
                                                  "*CONTACT PAIR, INTERACTION=G, TIED\nTOP, TOOL\n"))
-    assert "*TIE" not in body and "*CONTACT PAIR" not in body.replace("** [abq2ccx] *CONTACT PAIR", "")
+    assert "*TIE" not in body and "*CONTACT PAIR" not in body.replace("** abq2ccx: *CONTACT PAIR", "")
     assert {5, 6, 7, 8} <= _body_members(body) and "join that rigid body" in rep.text()
 
 
@@ -9530,7 +9530,7 @@ def test_tie_on_linear_membranes_ties_their_nodes():
     assert _card_at(body, "*SURFACE, NAME=MS_NODES, TYPE=NODE") == ["2", "5", "4"]
     on_top = LM4_SKIN.replace("1, 1, 2, 5, 4\n", "1, 105, 106, 107, 108\n")
     body, _, _ = convert_str(on_top + "*Tie, name=T1\nMS, BS\n" + LM4_STEP)
-    assert "*TIE" not in body.split("*HEADING")[-1].replace("** [abq2ccx] *TIE", "")
+    assert "*TIE" not in body.split("*HEADING")[-1].replace("** abq2ccx: *TIE", "")
     assert "every slave node of MS is a node of BS" in body
 
 
