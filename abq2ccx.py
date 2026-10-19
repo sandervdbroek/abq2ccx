@@ -3206,8 +3206,38 @@ def blocks_from_lines(lines: Sequence[str]) -> List[Block]:
 
 
 # ---------------------------------------------------------------------------
-# Converter
+# Steps
 # ---------------------------------------------------------------------------
+
+
+def deck_parts(blocks: Sequence[Block]) -> Iterator[Tuple[bool, List[Block]]]:
+    """The deck in order: (True, a step's cards from its *STEP through its *END STEP) and
+    (False, [a card outside the steps]).  A step without *END STEP runs on to the next one
+    (taking in the steps between) or to the end of the deck, as emit_other writes it."""
+    i, n = 0, len(blocks)
+    while i < n:
+        if blocks[i].keyword == "STEP":
+            j = i
+            while j < n - 1 and blocks[j].keyword != "END STEP":
+                j += 1
+            yield True, list(blocks[i:j + 1])
+            i = j + 1
+        else:
+            yield False, [blocks[i]]
+            i += 1
+
+
+def step_groups(blocks: Sequence[Block]) -> Tuple[List[Block], List[List[Block]]]:
+    """(the cards before the first *STEP, each step's cards from its *STEP through its
+    *END STEP) — the steps as emit_other writes them (deck_parts)."""
+    model: List[Block] = []
+    groups: List[List[Block]] = []
+    for step, cards in deck_parts(blocks):
+        if step:
+            groups.append(cards)
+        elif not groups:
+            model += cards
+    return model, groups
 
 
 def bc_steps(segments: List[List[Tuple[bool, Tuple[int, int], bool]]]):
@@ -4103,42 +4133,26 @@ class Converter:
 
     def emit_other(self, blocks: List[Block]) -> List[str]:
         out: List[str] = []
-        i, n = 0, len(blocks)
-        while i < n:
-            b = blocks[i]
-            if b.keyword == "HEADING" or b.keyword in GEOM_KW:
-                i += 1
-                continue
-            if b.keyword == "STEP":
+        for step, cards in deck_parts(blocks):
+            b = cards[0]
+            if step:
                 out.extend(self._rigid_model_cards())   # after the deck's materials
                 if self._temp_ic_default and self._step_idx == 0:
                     out.extend(self._default_temperature_ic())
                 out.extend(self._out_tp_cards)          # ccx: *TIME POINTS before any *STEP
                 self._out_tp_cards = []
-                group = []
-                j = i
-                while j < n:
-                    group.append(blocks[j])
-                    if blocks[j].keyword == "END STEP":
-                        break
-                    j += 1
-                out.extend(self.handle_step(group))
-                i = j + 1
+                out.extend(self.handle_step(cards))
+            elif b.keyword in ("HEADING", "END STEP") or b.keyword in GEOM_KW:
                 continue
-            if b.keyword == "END STEP":
-                i += 1
-                continue
-            if b.keyword in HISTORY_ONLY_KW:
+            elif b.keyword in HISTORY_ONLY_KW:
                 where = "before the first *STEP" if self._step_idx == 0 else "between steps"
                 out.extend(self._commented(
                     b, f"*{b.keyword} is step (history) data but appears {where}: Abaqus rejects "
                        f"that, ccx stops with '*{b.keyword} should only be used within a STEP', "
                        f"and ccx 2.23 segfaults when the deck has no *STEP at all. Commented out "
                        f"— move it into a step if it was meant to apply.", reduces=False))
-                i += 1
-                continue
-            out.extend(self.translate_one(b))
-            i += 1
+            else:
+                out.extend(self.translate_one(b))
         out.extend(self._rigid_model_cards())          # a deck without *STEP
         return out
 
@@ -7780,23 +7794,8 @@ class Converter:
                         v_init[(n, val[0])] = val[1]
         # per tracked DOF: [displacement, velocity, BC in force] (None: unknown / free)
         state = {k: [0.0, v_init.get(k, 0.0), None] for k in tracked}
-        model: List[Block] = []
-        groups: List[List[Block]] = []
-        i = 0
-        while i < len(blocks):                       # the step grouping of emit_other
-            if blocks[i].keyword == "STEP":
-                j, group = i, []
-                while j < len(blocks):
-                    group.append(blocks[j])
-                    if blocks[j].keyword == "END STEP":
-                        break
-                    j += 1
-                groups.append(group)
-                i = j + 1
-                continue
-            if blocks[i].keyword == "BOUNDARY" and not groups:
-                model.append(blocks[i])
-            i += 1
+        model, groups = step_groups(blocks)
+        model = [b for b in model if b.keyword == "BOUNDARY"]
         names = {"VELOCITY": "VEL", "ACCELERATION": "ACC"}
         stats = {"dev": 0.0, "n": 0}
         max_points = 1000
@@ -8324,23 +8323,8 @@ class Converter:
         A zero line on DOFs still at zero when the step starts (_dofs_at_rest) means the
         same either way and stays as it is."""
         self._amp_cards, self._ramp_steps = {}, set()
-        model: List[Block] = []
-        groups: List[List[Block]] = []
-        i = 0
-        while i < len(blocks):                       # the step grouping of emit_other
-            if blocks[i].keyword == "STEP":
-                j, group = i, []
-                while j < len(blocks):
-                    group.append(blocks[j])
-                    if blocks[j].keyword == "END STEP":
-                        break
-                    j += 1
-                groups.append(group)
-                i = j + 1
-                continue
-            if blocks[i].keyword == "BOUNDARY" and not groups:
-                model.append(blocks[i])
-            i += 1
+        model, groups = step_groups(blocks)
+        model = [b for b in model if b.keyword == "BOUNDARY"]
         mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
         todo: List[Tuple[int, str, str, Block, List[dict]]] = []   # step, kind, procedure, card, lines
         query: set = set()
@@ -10620,75 +10604,67 @@ class Converter:
         # its preselected variables, "DEFAULT" for the preselected default
         carried: Dict[bool, Optional[list]] = {False: None, True: None}
         prev_pert = False
-        i, k = 0, 0
-        while i < len(blocks):
-            if blocks[i].keyword == "STEP":
-                j = i + 1
-                while j < len(blocks) and blocks[j].keyword != "END STEP":
-                    j += 1
-                k += 1
-                inner = blocks[i + 1:j]
-                proc = next((x for x in inner if x.keyword in PROC_KW), None)
-                timing = self._step_timing(proc)
-                if timing["kind"] == "explicit":
-                    timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
-                    timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
-                pert = timing["proc"] in PERTURBATION_PROCS or blocks[i].has("PERTURBATION")
-                timing["pert"] = pert
-                ctx, reqs, odb, add, own = None, [], False, False, []
-                for x in inner:
-                    if x.keyword == "OUTPUT":
-                        ctx, odb = x, True
-                        add = add or (x.param("OP") or "").strip().upper() in ("ADD", "REPLACE")
-                        var = (x.param("VARIABLE") or "").strip().upper()
-                        if not x.has("FIELD"):
-                            if var in ("PRESELECT", "ALL"):
-                                self._out_notes.setdefault(id(x), []).append(
-                                    f"*OUTPUT, HISTORY, VARIABLE={var}: Abaqus' preselected history "
-                                    f"output (whole-model energies ALLIE, ALLKE, ...) has no ccx "
-                                    f"counterpart; dropped.")
-                            continue
+        for k, group in enumerate(step_groups(blocks)[1], 1):
+            inner = group[1:]
+            proc = next((x for x in inner if x.keyword in PROC_KW), None)
+            timing = self._step_timing(proc)
+            if timing["kind"] == "explicit":
+                timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
+                timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
+            pert = timing["proc"] in PERTURBATION_PROCS or group[0].has("PERTURBATION")
+            timing["pert"] = pert
+            ctx, reqs, odb, add, own = None, [], False, False, []
+            for x in inner:
+                if x.keyword == "OUTPUT":
+                    ctx, odb = x, True
+                    add = add or (x.param("OP") or "").strip().upper() in ("ADD", "REPLACE")
+                    var = (x.param("VARIABLE") or "").strip().upper()
+                    if not x.has("FIELD"):
                         if var in ("PRESELECT", "ALL"):
-                            own.append((x, None))
-                            reqs += self._preselect_requests(x, x, timing, var, quiet, k)
-                    elif x.keyword in OUTPUT_CARDS:
-                        sub = x.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
-                        if sub and ctx is not None and ctx.has("FIELD") and \
-                                (ctx.param("VARIABLE") or "").strip().upper() == "ALL":
-                            self._out_notes.setdefault(id(ctx), []).append(
-                                f"*{x.keyword} under *OUTPUT, FIELD, VARIABLE=ALL dropped (Abaqus "
-                                f"ignores the individual requests then).")
-                            self._out_plan[id(x)] = {"cc": None, "cards": [], "notes": [],
-                                                     "warnings": [], "out2d": False}
-                            continue
-                        src = self._preselect_card(x, ctx, timing) if sub else x
-                        if src is None:     # a preselected request with no ccx label here
-                            self._out_plan[id(x)] = {"cc": None, "cards": [], "warnings": [],
-                                                     "out2d": False, "notes": [
-                                f"*{x.keyword}, VARIABLE=PRESELECT in a *{timing['proc']} step: "
-                                f"Abaqus preselects no such variable there; dropped."]}
-                            continue
-                        if sub and ctx is not None and ctx.has("FIELD"):
-                            own.append((x, ctx))
-                        r = self._output_request(src, ctx, timing, quiet)
-                        r["anchor"] = x
-                        reqs.append(r)
-                if odb and not add:
-                    carried[pert] = own
-                else:
-                    # Abaqus: a step without output database requests keeps those in force —
-                    # of the previous general step, or of the previous step when both are
-                    # perturbation steps — and the first such step writes the preselected
-                    # output; OP=ADD / REPLACE keeps them beside the step's own.  ccx keeps
-                    # its cards too, but at the previous step's frequency (or time points)
-                    # and as a step in between left them, so they are written again
-                    held = carried[pert] if (not pert or prev_pert) else None
-                    reqs += self._carried_requests(blocks[i], held, timing, quiet, k)
-                    carried[pert] = (held if held is not None else [("DEFAULT", None)]) + own
-                prev_pert = pert
-                steps.append((k, timing, reqs))
-                i = j
-            i += 1
+                            self._out_notes.setdefault(id(x), []).append(
+                                f"*OUTPUT, HISTORY, VARIABLE={var}: Abaqus' preselected history "
+                                f"output (whole-model energies ALLIE, ALLKE, ...) has no ccx "
+                                f"counterpart; dropped.")
+                        continue
+                    if var in ("PRESELECT", "ALL"):
+                        own.append((x, None))
+                        reqs += self._preselect_requests(x, x, timing, var, quiet, k)
+                elif x.keyword in OUTPUT_CARDS:
+                    sub = x.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
+                    if sub and ctx is not None and ctx.has("FIELD") and \
+                            (ctx.param("VARIABLE") or "").strip().upper() == "ALL":
+                        self._out_notes.setdefault(id(ctx), []).append(
+                            f"*{x.keyword} under *OUTPUT, FIELD, VARIABLE=ALL dropped (Abaqus "
+                            f"ignores the individual requests then).")
+                        self._out_plan[id(x)] = {"cc": None, "cards": [], "notes": [],
+                                                 "warnings": [], "out2d": False}
+                        continue
+                    src = self._preselect_card(x, ctx, timing) if sub else x
+                    if src is None:     # a preselected request with no ccx label here
+                        self._out_plan[id(x)] = {"cc": None, "cards": [], "warnings": [],
+                                                 "out2d": False, "notes": [
+                            f"*{x.keyword}, VARIABLE=PRESELECT in a *{timing['proc']} step: "
+                            f"Abaqus preselects no such variable there; dropped."]}
+                        continue
+                    if sub and ctx is not None and ctx.has("FIELD"):
+                        own.append((x, ctx))
+                    r = self._output_request(src, ctx, timing, quiet)
+                    r["anchor"] = x
+                    reqs.append(r)
+            if odb and not add:
+                carried[pert] = own
+            else:
+                # Abaqus: a step without output database requests keeps those in force —
+                # of the previous general step, or of the previous step when both are
+                # perturbation steps — and the first such step writes the preselected
+                # output; OP=ADD / REPLACE keeps them beside the step's own.  ccx keeps
+                # its cards too, but at the previous step's frequency (or time points)
+                # and as a step in between left them, so they are written again
+                held = carried[pert] if (not pert or prev_pert) else None
+                reqs += self._carried_requests(group[0], held, timing, quiet, k)
+                carried[pert] = (held if held is not None else [("DEFAULT", None)]) + own
+            prev_pert = pert
+            steps.append((k, timing, reqs))
         self._contact_requests_checked(steps)
         # one .frd node set per variable and step: the whole model before a set, several
         # sets joined into one
@@ -16791,16 +16767,7 @@ class Converter:
         # in steps where temperature is a DOF and with USER are commented out
         self._temp_ic_default = False
         if not any_temp_ic and self.geom.nodes:
-            steps: List[List[Block]] = []          # grouped as emit_other groups them
-            inside = False
-            for b in blocks:
-                if b.keyword == "STEP" and not inside:
-                    inside = True
-                    steps.append([])
-                elif b.keyword == "END STEP":
-                    inside = False
-                elif inside:
-                    steps[-1].append(b)
+            steps = step_groups(blocks)[1]
             temps = [b for s in steps if not any(x.keyword in TEMPERATURE_DOF_PROCS for x in s)
                      for b in s if b.keyword == "TEMPERATURE" and not b.has("USER")]
             # temperatures ccx cannot take from the deck: with them the default would turn
