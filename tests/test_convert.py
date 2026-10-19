@@ -2689,11 +2689,14 @@ def test_orientation_origin_and_node_definition():
 
 def test_orientation_zero_additional_rotation_on_a_cylindrical_system():
     # ccx takes the additional-rotation line only for rectangular systems; a zero angle turns
-    # nothing, so leaving it out is exact (NAFEMS LE2: "1, 0.")
+    # nothing, so leaving it out is exact (NAFEMS LE2: "1, 0."), and so is a turn no card uses
     deck = HEX + "*Orientation, name=ORI, system=cylindrical\n0.,0.,0., 0.,0.,1.\n1, 0.\n"
     _, conv, rep = convert_str(deck)
     assert conv.reduced_physics == [] and "zero angle" in rep.text()
-    _, conv, _ = convert_str(deck.replace("1, 0.", "1, 30."))
+    _, conv, rep = convert_str(deck.replace("1, 0.", "1, 30."))
+    assert conv.reduced_physics == [] and "no card uses it" in rep.text()
+    _, conv, _ = convert_str(deck.replace("1, 0.", "1, 30.") + COMPOSITE_MAT
+                             + "*Solid Section, elset=EALL, material=CFRP, orientation=ORI\n")
     assert conv.reduced_physics == ["*ORIENTATION additional rotation on a non-rectangular system dropped"]
 
 
@@ -8751,6 +8754,73 @@ def test_spherical_orientation_on_continuum_shells():
     assert max(abs(x - y) for x, y in zip(vals[1:4], (-s, c, 0.0))) < 1e-9
     assert "no element reads it" in rep.text()
     assert conv.reduced_physics == ["element SC8R / SC6R composite continuum shells -> one C3D8I / C3D6 solid per ply"]
+
+
+ISO_STEEL = "*Material, name=STEEL\n*Elastic\n210000., 0.3\n"
+DEFORMATION_STEEL = "*Material, name=STEEL\n*Deformation Plasticity\n210000., 0.3, 250., 5., 0.5\n"
+
+
+def test_isotropic_sections_lose_nothing_on_a_spherical_orientation():
+    # ccx 2.23 gives an isotropic section the same results on any axes (probed on C3D8, C3D8I,
+    # C3D8R, C3D20R, S4R, M3D4), but prints its element stresses in them: NaN on the rectangular
+    # stand-in of a sphere centred at the origin, so the card becomes the global axes
+    block = "*Node\n" + "".join(f"{101 + k}, {k % 2}., {k // 2 % 2}., {2 + k // 4}.\n" for k in range(8)) + \
+        "*Element, type=C3D8, elset=BLOCK\n9, 101, 102, 104, 103, 105, 106, 108, 107\n"
+    solid = "*Solid Section, elset=BLOCK, material=STEEL, orientation=SPH\n"
+    head = "*ORIENTATION, NAME=SPH, SYSTEM=RECTANGULAR"
+    body, conv, rep = convert_str(block + ISO_STEEL + SPH_ORIENTATION + solid)
+    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and "ORIENTATION=SPH" in body
+    assert not conv.reduced_physics and "written as the global axes" in rep.text()
+    # ccx's *DEFORMATION PLASTICITY depends on the axes (CalculiX issue #160), not on the global ones
+    body, conv, _ = convert_str(block + DEFORMATION_STEEL + SPH_ORIENTATION + solid)
+    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
+    # Abaqus reads initial stresses in the orientation's axes, ccx in global ones; an orthotropic
+    # section and a spring use the axes too: reduced physics, the card as before
+    for deck in (block + ISO_STEEL + SPH_ORIENTATION + solid + "*Initial Conditions, type=STRESS\n9, 1., 0., 0., 0., 0., 0.\n",
+                 block + COMPOSITE_MAT + SPH_ORIENTATION + solid.replace("STEEL", "CFRP"),
+                 block + ISO_STEEL + SPH_ORIENTATION + solid + "*Element, type=SPRINGA, elset=SP\n19, 101, 108\n"
+                 "*Spring, elset=SP, orientation=SPH\n\n10.\n"):
+        body, conv, _ = convert_str(deck)
+        assert _card(body, head) == ["0., 0., 0., 0., 0., 1."]
+        assert conv.reduced_physics == ["*ORIENTATION, SYSTEM=SPHERICAL written rectangular"]
+    # isotropic shells, membranes and continuum shells (stacked along the orientation, as in
+    # Abaqus' LE3 hemisphere) alike, also beside orthotropic shells with their own directions
+    cap = "*Node\n" + "".join(ln + "\n" for ln in SPHERE_PATCH_NODES.splitlines()[:6]) + \
+        "*Element, type=S4R, elset=CAP\n1, 1, 4, 5, 2\n2, 2, 5, 6, 3\n"
+    shell = "*Shell Section, elset=CAP, material=STEEL, orientation=SPH\n0.02\n"
+    for deck in (cap + ISO_STEEL + SPH_ORIENTATION + shell,
+                 cap.replace("S4R", "M3D4") + ISO_STEEL + SPH_ORIENTATION + shell.replace("Shell", "Membrane")):
+        body, conv, _ = convert_str(deck)
+        assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
+    body, conv, rep = convert_str(cap + COMPOSITE_MAT + SPH_ORIENTATION + shell.replace("STEEL", "CFRP")
+                                  + block + ISO_STEEL + solid)
+    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
+    assert "element by element" in rep.text() and "no direction dependence" in rep.text()
+    sc = ("*Node\n" + SPHERE_PATCH_NODES + "*Element, type=SC8R, elset=CAP\n1, 1, 4, 5, 2, 11, 14, 15, 12\n"
+          "2, 2, 5, 6, 3, 12, 15, 16, 13\n" + ISO_STEEL + SPH_ORIENTATION
+          + "*Shell Section, elset=CAP, material=STEEL, orientation=SPH, stack direction=ORIENTATION\n0.02\n")
+    body, conv, _ = convert_str(sc)
+    assert "*SOLID SECTION, ELSET=CAP, MATERIAL=STEEL, ORIENTATION=SPH" in body
+    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and conv.reduced_physics == ["element SC8R -> C3D8I"]
+    # a card no section uses loses nothing either
+    _, conv, rep = convert_str(block + ISO_STEEL + SPH_ORIENTATION + solid.replace(", orientation=SPH", ""))
+    assert not conv.reduced_physics and "no card uses it" in rep.text()
+
+
+def test_isotropic_sections_lose_nothing_by_a_dropped_cylindrical_rotation():
+    # ccx refuses a rotation line on a cylindrical system: an isotropic section loses nothing by
+    # it, but ccx's *DEFORMATION PLASTICITY its results (CalculiX issue #160) and an orthotropic
+    # section its directions; a cylindrical *DISTRIBUTION alike
+    sec = "*Solid Section, elset=EALL, material=STEEL, orientation=CYL\n"
+    plain = "*Orientation, name=CYL, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n1, 30.\n"
+    for cyl in (plain, "*Distribution, name=D, location=ELEMENT, table=T\n, 0., 0., 0., 0., 0., 1.\n"
+                       "*Distribution Table, name=T\ncoord3D, coord3D\n*Orientation, name=CYL, system=CYLINDRICAL\nD\n1, 30.\n"):
+        body, conv, _ = convert_str(HEX + ISO_STEEL + cyl + sec)
+        assert not conv.reduced_physics and "1, 30." not in body
+        for mat in (DEFORMATION_STEEL, COMPOSITE_MAT.replace("CFRP", "STEEL")):
+            _, conv, _ = convert_str(HEX + mat + cyl + sec)
+            assert conv.reduced_physics == ["*ORIENTATION additional rotation on a non-rectangular system dropped"]
+    assert "no direction dependence lose nothing" in convert_str(HEX + ISO_STEEL + plain + sec)[2].text()
 
 
 def test_composite_continuum_shells_keep_a_cylindrical_rotation_line():

@@ -6,6 +6,12 @@ physics.
 
 ## Unreleased
 
+* **Orientations isotropic sections read** — a spherical `*ORIENTATION` and a cylindrical one's
+  rotation line, which ccx 2.23 lacks, are no longer reduced physics where every section that
+  reads them is isotropic or gets Abaqus' directions per element: ccx's results do not depend on
+  the axes there (probed). A spherical one is then written as the global axes: on its
+  rectangular stand-in, without axes for a sphere centred at the origin, ccx printed NaN element
+  stresses, and hung with `*DEFORMATION PLASTICITY`.
 * **Shell and membrane pressure on the reference surface** — Abaqus applies it to the reference
   surface, ccx 2.23 to one face of the solid it expands the element into: on a shell the
   bottom face for every label, whose area is off by O(t/R) (a sphere's force 10 % low at

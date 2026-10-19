@@ -699,6 +699,7 @@ def frd_last(frd_path, name):
 # nu = 0.25): E1, E2, E3, nu12, nu13, nu23, G12, G13, G23
 PAGANO_PLY = (250000., 10000., 10000., 0.25, 0.25, 0.25, 5000., 5000., 2000.)
 INPLANE_PLY = (140000., 10000., 10000., 0.3, 0.3, 0.45, 5000., 5000., 3450.)
+ISO_STEEL = (200000., 200000., 200000., 0.3, 0.3, 0.3, 200000. / 2.6, 200000. / 2.6, 200000. / 2.6)
 # INPLANE_PLY's plane-stress constants with other through-thickness ones: a solid ply whose
 # material axis 2 or 3 leaves the plate is stiffer or softer in it than t Qbar
 SC_PLY = (140000., 10000., 4000., 0.3, 0.2, 0.45, 5000., 3000., 2000.)
@@ -1524,16 +1525,20 @@ def sphere_hoop_deck(kind="s4r", rotation="", m=24, n=24, t=0.01):
     only, at four nodes of the equator: a plain section of INPLANE_PLY on S4R shells or SC8R
     continuum shells (stacked outward, the pressure on the inner face), or [0/90/0] SC8R plies
     (``kind`` "s4r", "sc8r", "sc8r_composite"), with a spherical *ORIENTATION about the z axis
-    and an optional rotation line.  The system's axis 1, radial, is the normal: Abaqus projects
+    and an optional rotation line; "s4r_iso" and "sc8r_iso" are plain sections of isotropic
+    steel, the continuum shells stacked along the orientation (Abaqus' LE3 hemisphere has one),
+    with their element stresses printed.  The system's axis 1, radial, is the normal: Abaqus projects
     its axis 2, along the parallels (a rotation about axis 3 keeps it there).  Returns the deck
     and (colatitude, longitude, the node of each layer) of the nodes between colatitudes 30 and
     150 degrees, where sphere_membrane applies."""
     nr, na = 2 * m, 4 * n
+    iso = kind.endswith("_iso")
+    kind = kind[:-4] if iso else kind
     radii = (1.0,) if kind == "s4r" else (1.0 - t / 2, 1.0 + t / 2)
     per = 2 + (nr - 1) * na                            # nodes per layer: the poles, the rings
     nid = lambda i, j, k=0: (1 if i == 0 else per if i == nr else 2 + (i - 1) * na + j % na) + per * k  # noqa: E731
-    lines = ["*Heading", "Thin sphere of an orthotropic ply wound along its parallels under internal "
-             "pressure: a spherical *Orientation", "*Node"]
+    lines = ["*Heading", ("Thin isotropic sphere" if iso else "Thin sphere of an orthotropic ply wound "
+             "along its parallels") + " under internal pressure: a spherical *Orientation", "*Node"]
     for k, r in enumerate(radii):
         for i in range(nr + 1):
             th = math.pi * i / nr
@@ -1554,21 +1559,23 @@ def sphere_hoop_deck(kind="s4r", rotation="", m=24, n=24, t=0.01):
               for i in range(nr // 6, nr - nr // 6 + 1) for j in range(na)]
     lines += ["*Nset, nset=PROBE"] + _ids([x for _th, _ph, ks in probes for x in ks])
     e1, e2, e3, n12, n13, n23, g12, g13, g23 = INPLANE_PLY
-    lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
-              f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}",
-              "*Orientation, name=SPH, system=SPHERICAL", "0., 0., 0., 0., 0., 1."]
+    lines += ["*Material, name=PLY"] + (["*Elastic", f"{ISO_STEEL[0]:g}, {ISO_STEEL[3]:g}"] if iso else [
+        "*Elastic, type=ENGINEERING CONSTANTS",
+        f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}"])
+    lines += ["*Orientation, name=SPH, system=SPHERICAL", "0., 0., 0., 0., 0., 1."]
     lines += [rotation] if rotation else []
     if kind == "sc8r_composite":
         lines += ["*Shell Section, elset=SPHERE, composite, orientation=SPH",
                   "1., 3, PLY, 0.", "1., 3, PLY, 90.", "1., 3, PLY, 0."]
     else:
-        lines += ["*Shell Section, elset=SPHERE, material=PLY, orientation=SPH", f"{t:g}, 5" if shell else f"{t:g}"]
+        lines += ["*Shell Section, elset=SPHERE, material=PLY, orientation=SPH"
+                  + (", stack direction=ORIENTATION" if iso and not shell else ""), f"{t:g}, 5" if shell else f"{t:g}"]
     lines += ["*Step", "*Static", "*Boundary"]
     for k in range(len(radii)):                       # the equator at 0, 90, 180 and 270 degrees
         lines += [f"{nid(m, 0, k)}, 2, 3", f"{nid(m, 2 * n, k)}, 2, 3", f"{nid(m, n, k)}, 1, 1",
                   f"{nid(m, n, k)}, 3, 3", f"{nid(m, 3 * n, k)}, 3, 3"]
     lines += ["*Dload"] + (["SPHERE, P, 1."] if shell else [f"{e}, P1, 1." for e in range(1, len(elems) + 1)])
-    lines += ["*Node print, nset=PROBE", "U", "*End Step"]
+    lines += ["*Node print, nset=PROBE", "U"] + (["*El print, elset=SPHERE", "S"] if iso else []) + ["*End Step"]
     return "\n".join(lines) + "\n", probes
 
 
@@ -1580,13 +1587,15 @@ def sphere_membrane(theta, kind="s4r", t=0.01):
     plies' membrane stiffness, direction 1 along the parallels, gives the strains ec along them
     and em along the meridians.  With the equator a plane of symmetry the meridional
     displacement is (em - ec) sin(theta) ln tan(theta / 2) and the radial one ec - u cot(theta);
-    near the poles, where the material directions turn about a point, the shell bends instead."""
-    rp = 1.0 if kind == "s4r" else 1.0 - t / 2
+    near the poles, where the material directions turn about a point, the shell bends instead.
+    An isotropic sphere ("_iso") expands evenly: no meridional displacement."""
+    props = ISO_STEEL if kind.endswith("_iso") else INPLANE_PLY
+    rp = 1.0 if kind.startswith("s4r") else 1.0 - t / 2
     force = rp * rp / 2
     a11 = a22 = a12 = 0.0
     plies = (0.0, 90.0, 0.0) if kind == "sc8r_composite" else (0.0,)
     for ang in plies:
-        q11, q22, q12 = reduced_stiffness(ang, INPLANE_PLY)[:3]
+        q11, q22, q12 = reduced_stiffness(ang, props)[:3]
         a11, a22, a12 = a11 + q11 * t / len(plies), a22 + q22 * t / len(plies), a12 + q12 * t / len(plies)
     det = a11 * a22 - a12 * a12
     ec, em = force * (a22 - a12) / det, force * (a11 - a12) / det
@@ -3837,8 +3846,10 @@ def main():
         failures += 0 if ok else 1
     # ccx 2.23 has no spherical system (abq2ccx writes the card as a rectangular one, which a
     # sphere centred at the origin leaves without axes); the shells take Abaqus' spherical
-    # directions element by element
-    for kind, rot in (("s4r", ""), ("s4r", "3, 25."), ("sc8r", ""), ("sc8r_composite", "")):
+    # directions element by element, and isotropic ones read the global axes instead (on zero
+    # axes ccx prints NaN element stresses)
+    for kind, rot in (("s4r", ""), ("s4r", "3, 25."), ("sc8r", ""), ("sc8r_composite", ""),
+                      ("s4r_iso", ""), ("sc8r_iso", "")):
         tag = f"sphere_hoop_{kind}" + ("_rot3" if rot else "")
         text, probes = sphere_hoop_deck(kind, rot)
         res = composite_run(text, tag)
@@ -3856,14 +3867,16 @@ def main():
             want = sphere_membrane(th, kind)
             err = max(err, abs(radial - want[0]), abs(merid - want[1]))
             scale = max(scale, abs(want[0]), abs(want[1]))
-        ok = err < (0.02 if kind == "s4r" else 0.01) * scale
-        what = {"s4r": "plain S4R", "sc8r": "plain SC8R", "sc8r_composite": "[0/90/0] SC8R plies"}[kind]
+        ok = err < (0.02 if kind.startswith("s4r") else 0.01) * scale
+        what = {"s4r": "plain S4R", "sc8r": "plain SC8R", "sc8r_composite": "[0/90/0] SC8R plies",
+                "s4r_iso": "isotropic S4R", "sc8r_iso": "isotropic SC8R stacked along the orientation"}[kind]
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}, spherical *ORIENTATION"
               + (" turned about axis 3" if rot else "") + f", internal pressure): radial and meridional "
-              f"displacement at colatitudes 30-150 deg vs membrane theory with the fibres along the "
-              f"parallels, max difference {err / scale * 100:.2f}% of the largest {scale:.4g}"
+              f"displacement at colatitudes 30-150 deg vs membrane theory"
+              + ("" if kind.endswith("_iso") else " with the fibres along the parallels")
+              + f", max difference {err / scale * 100:.2f}% of the largest {scale:.4g}"
               + (" (ccx loads the inner face of its expanded shells: 1 % less load at this t/R)"
-                 if kind == "s4r" else ""))
+                 if kind.startswith("s4r") else ""))
         failures += 0 if ok else 1
     # --- quadratic membranes: ccx 2.23 expands each element on nodes of its own and leaves the
     # mid-thickness node of its corners free (M3D8R singular, M3D6 / M3D8 too soft); abq2ccx

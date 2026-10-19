@@ -3471,9 +3471,12 @@ class Converter:
         # element group (_plan_shell_axes): id(section) -> element -> a, b tokens per layer
         self._exact_axes: Dict[int, "OrderedDict[int, Tuple[Tuple[str, ...], ...]]"] = {}
         self._exact_ori: Dict[Tuple[str, ...], str] = {}   # directions -> *ORIENTATION (_exact_axes_cards)
-        self._exact_only: set = set()              # orientations no other card reads than those
+        self._lossless_ori: set = set()            # orientations ccx's form of loses nothing (_plan_shell_axes)
+        self._axes_readers: set = set()            # ... named by a section with its own axes
+        self._free_readers: set = set()            # ... named by a section without direction dependence
         self._orient_axes: set = set()             # orientations whose axes are known (_register_orientation)
         self._mat_symmetry: Dict[str, Optional[str]] = {}  # material -> None / "ortho" / "aniso"
+        self._frame_bound_mats: set = set()        # isotropic ones whose ccx law depends on the axes
         # knot beams: rigid couplings on shell/beam nodes, rotational BCs on circular-section
         # beams and across *BOUNDARY, OP=NEW (see _plan_rigid_couplings,
         # _plan_circ_rotation_knots, _plan_op_new_rotations, _add_knot_beams)
@@ -5566,24 +5569,17 @@ class Converter:
                                       "the system by coordinates or a *DISTRIBUTION.", reduces=False)
         if self._orientation_distribution(b) is not None:
             return self._distribution_orientation(b)
-        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
-        for k, v in b.params.items():
-            if k == "DEFINITION":
-                continue
-            if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
-                if (b.param("NAME") or "").strip().upper() in self._exact_only:
-                    self.report.note("*ORIENTATION SYSTEM=SPHERICAL: ccx has no spherical system, so the "
-                                     "card is written as RECTANGULAR, but no element reads it: the shell "
-                                     "and membrane sections that use it get Abaqus' spherical directions "
-                                     "element by element, at each element's centre.", once=True)
-                else:
-                    self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
-                                     "RECTANGULAR — verify the local system.", once=True)
-                    self._reduces("*ORIENTATION, SYSTEM=SPHERICAL written rectangular")
-                params["SYSTEM"] = "RECTANGULAR"
-            else:
-                params[k] = v
+        name = (b.param("NAME") or "").strip().upper()
+        params = self._orientation_params(b, name in self._lossless_ori)
         out = [emit_keyword("ORIENTATION", params)]
+        if (b.param("SYSTEM") or "").strip().upper().startswith("SPHER") and \
+                name in self._lossless_ori and name in self._free_readers:
+            # sections without direction dependence read it: any valid axes are as good, and
+            # ccx prints their element stresses in the axes it reads (NaN on zero axes, probed)
+            pts = self._orientation_points(b)
+            if definition.startswith("NODES") and pts is not None and name in self.orientations:
+                self.orientations[name] = (tuple(pts[0:3]), tuple(pts[3:6]), self.orientations[name][2])
+            return out + ["1., 0., 0., 0., 1., 0."]
         recs = merged_data_records(b)
         if recs:
             v = [x for x in recs[0] if x != ""]
@@ -5596,7 +5592,6 @@ class Converter:
                 v = [_fmt_component(x) for x in pts]
                 self.report.note("*ORIENTATION, DEFINITION=NODES resolved to coordinates (ccx "
                                  "takes points a, b).", once=True)
-                name = (b.param("NAME") or "").upper()
                 if name in self.orientations:      # nodes may follow the card in the deck
                     self.orientations[name] = (tuple(pts[0:3]), tuple(pts[3:6]),
                                                self.orientations[name][2])
@@ -5631,12 +5626,10 @@ class Converter:
                     self.report.note(f"*ORIENTATION SYSTEM={system}: the additional-rotation line "
                                      f"has a zero angle (it turns nothing) and was dropped (ccx "
                                      f"allows it only for rectangular systems).", once=True)
-                elif (b.param("NAME") or "").strip().upper() in self._exact_only:
+                elif name in self._lossless_ori:
                     self.report.note(f"*ORIENTATION SYSTEM={system}: the additional-rotation line "
                                      f"was dropped (ccx allows it only for rectangular systems); "
-                                     f"the shell and membrane sections that use it get their "
-                                     f"material directions element by element, the rotation "
-                                     f"applied.", once=True)
+                                     f"{self._lossless_why(name, 'the rotation applied')}.", once=True)
                 else:
                     # ccx: "additional rotation ... is only allowed for rectangular systems"
                     self.report.warn(f"*ORIENTATION SYSTEM={system}: the additional-rotation line is "
@@ -5644,6 +5637,52 @@ class Converter:
                                      f"— verify material directions.", once=True)
                     self._reduces("*ORIENTATION additional rotation on a non-rectangular system dropped")
         return out
+
+    def _orientation_params(self, b: Block, lossless: bool) -> "OrderedDict[str, Optional[str]]":
+        """The parameters of *ORIENTATION ``b`` for ccx: DEFINITION dropped, and SYSTEM=SPHERICAL,
+        which ccx lacks, written as RECTANGULAR — reduced physics unless ``lossless``
+        (_lossless_ori)."""
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        for k, v in b.params.items():
+            if k == "DEFINITION":
+                continue
+            if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
+                name = (b.param("NAME") or "").strip().upper()
+                if not lossless:
+                    self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
+                                     "RECTANGULAR — verify the local system.", once=True)
+                    self._reduces("*ORIENTATION, SYSTEM=SPHERICAL written rectangular")
+                elif name in self._free_readers:
+                    why = self._lossless_why(name, "at each element's centre")
+                    self.report.note(f"*ORIENTATION SYSTEM=SPHERICAL: ccx has no spherical system, so "
+                                     f"the card is written as the global axes; {why}. ccx reports "
+                                     f"their stresses and strains in global axes, Abaqus in the "
+                                     f"spherical ones.", once=True)
+                elif name in self._axes_readers:
+                    self.report.note("*ORIENTATION SYSTEM=SPHERICAL: ccx has no spherical system, so the "
+                                     "card is written as RECTANGULAR, but no element reads it: the shell "
+                                     "and membrane sections that use it get Abaqus' spherical directions "
+                                     "element by element, at each element's centre.", once=True)
+                else:
+                    self.report.note("*ORIENTATION SYSTEM=SPHERICAL: ccx has no spherical system, so the "
+                                     "card is written as RECTANGULAR; no card uses it.", once=True)
+                params["SYSTEM"] = "RECTANGULAR"
+            else:
+                params[k] = v
+        return params
+
+    def _lossless_why(self, name: str, how: str) -> str:
+        """Why ccx's form of orientation ``name`` (in _lossless_ori) loses nothing: which of its
+        sections get their material directions element by element (``how``) and which have none
+        it could change."""
+        why = []
+        if name in self._axes_readers:
+            why.append(f"the shell and membrane sections that use it get their material directions "
+                       f"element by element, {how}")
+        if name in self._free_readers:
+            why.append("the sections whose materials have no direction dependence lose nothing by it "
+                       "(probed: the same results as without an orientation)")
+        return "; ".join(why) or "no card uses it"
 
     # -- *DISTRIBUTION orientations -----------------------------------------
     def handle_distribution(self, b: Block) -> List[str]:
@@ -5729,20 +5768,12 @@ class Converter:
                                       f"lines (INPUT= file missing?), so the per-element material "
                                       f"directions are unknown and the sections that use it "
                                       f"cannot run until the data is supplied.", reduces=False)
-        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
-        for k, v in b.params.items():
-            if k == "DEFINITION":
-                continue
-            if k == "SYSTEM" and v and v.upper().startswith("SPHER"):
-                self.report.warn("*ORIENTATION SYSTEM=SPHERICAL is unsupported by ccx; emitted as "
-                                 "RECTANGULAR — verify the local system.", once=True)
-                self._reduces("*ORIENTATION, SYSTEM=SPHERICAL written rectangular")
-                params["SYSTEM"] = "RECTANGULAR"
-            else:
-                params[k] = v
-        # sections with the directions element by element (_shell_axes_rows) keep the rotation
-        if plan["dropped_rot"] and (plan["solid"] or plan["inexact"] or plan["other"]
-                                    or not (plan["split"] or plan["plies"])):
+        # its lines are written as they are, whatever reads them (_abaqus_frame reads a spherical
+        # one as rectangular)
+        params = self._orientation_params(b, False)
+        # sections with the directions element by element (_shell_axes_rows) keep the rotation,
+        # and those without direction dependence lose nothing (_lossless_ori)
+        if plan["dropped_rot"] and name not in self._lossless_ori:
             self.report.warn(f"*ORIENTATION {name}: an additional rotation is not allowed by ccx "
                              f"for a non-rectangular system and was dropped — verify material "
                              f"directions.", once=True)
@@ -5830,17 +5861,13 @@ class Converter:
             self._dist_ori[name] = dict(dist=ref, copy=copy, rect=rect, rot=rot,
                                         dropped_rot=dropped, default=default, vec=vec,
                                         has_data=default is not None or bool(vec),
-                                        solid=set(), split=False, inexact=False, other=False,
-                                        plies=False)
+                                        solid=set(), split=False, other=False)
         for b in blocks:
             kw = b.keyword
             ori = (b.param("ORIENTATION") or "").strip().upper()
             elset = (b.param("ELSET") or "").strip()
             shell = kw in ("SHELL SECTION", "SHELL GENERAL SECTION")
-            if id(b) in self._ply_sections:        # ply solids with their own axes, the
-                for o in {ori} | {f for _t, _m, f in self._section_layers(b)}:   # rotation applied
-                    if o in self._dist_ori:
-                        self._dist_ori[o]["plies"] = True
+            if id(b) in self._ply_sections:        # ply solids with their own axes, the rotation applied
                 continue
             if shell and self._continuum_shell_elset(elset):
                 if ori in self._dist_ori and not b.has("COMPOSITE"):    # runs as a solid
@@ -5957,8 +5984,6 @@ class Converter:
         if rows is not None:                       # directions element group by element group
             self._exact_axes[id(b)] = rows
             return
-        for o in involved:
-            self._dist_ori[o]["inexact"] = True    # its plain per-direction orientations
         split = []
         for k, (key, members) in enumerate(groups.items(), 1):
             gname = elset if len(groups) == 1 else self._fresh_name(f"{elset}_G{k}")
@@ -6751,8 +6776,12 @@ class Converter:
     def _plan_material_symmetry(self, blocks: List[Block]) -> None:
         """How each material depends on its axes (_mat_symmetry): None for isotropic cards only,
         "ortho" with orthotropic ones (the same after a half turn about a material axis), else
-        "aniso" — anisotropic cards and user materials."""
+        "aniso" — anisotropic cards and user materials.  _frame_bound_mats: those with
+        *DEFORMATION PLASTICITY, an isotropic law whose results depend on the orientation's axes
+        in ccx 2.23 (CalculiX issue #160; see _plan_shell_axes)."""
         for name, opts in self._material_options(blocks).items():
+            if any(c.keyword == "DEFORMATION PLASTICITY" for c in opts[1:]):
+                self._frame_bound_mats.add(name)
             sym = None
             for c in opts[1:]:
                 typ = (c.param("TYPE") or "").strip().upper()
@@ -6769,11 +6798,18 @@ class Converter:
         """The shell and membrane sections that need their material directions element group by
         element group (_shell_axes_rows; those with *DISTRIBUTION orientations were planned in
         _plan_split), the plain shell sections on continuum shells that need them element by
-        element (_continuum_axes_rows), and the orientations no other card reads than these and
-        the split composite continuum shells, whose ply solids get their own axes
-        (_ply_section_cards) — _exact_only: a cylindrical one's dropped rotation then loses
-        nothing, nor a spherical one written as rectangular."""
-        only: Dict[str, bool] = {}
+        element (_continuum_axes_rows), and the orientations ccx's form of loses nothing
+        (_lossless_ori: a cylindrical one without the rotation ccx refuses, a spherical one,
+        which ccx lacks): every card that names them is one of these sections or a split
+        composite continuum shell, whose plies get their own axes (_axes_readers), or a section
+        without direction dependence (_direction_free; _free_readers), or none is.  ccx 2.23 gives
+        such a section the same results on any axes (probed on C3D8, C3D8I, C3D8R, C3D20R, S4R
+        and M3D4: elastic, also under NLGEOM, *PLASTIC, Neo-Hooke, *CREEP, *EXPANSION) but prints
+        its element stresses in them, NaN on zero axes, so handle_orientation writes a spherical
+        one as the global axes; *DEFORMATION PLASTICITY depends on the axes in ccx (up to 76 % on
+        turned ones, a hang on zero ones; CalculiX issue #160), so it counts on those only."""
+        lossless = {(b.param("NAME") or "").strip().upper(): True for b in blocks if b.keyword == "ORIENTATION"}
+        local_ic = self._local_ic_elements(blocks)
         for b in blocks:
             kw = b.keyword
             if kw in ("SHELL SECTION", "MEMBRANE SECTION") or (
@@ -6798,9 +6834,52 @@ class Converter:
                 names |= {f for _t, _m, f in self._section_layers(b)}
             if kw == "CONNECTOR SECTION":
                 names |= {x.strip().upper() for r in merged_data_records(b) for x in r}
+            own = id(b) in self._exact_axes or id(b) in self._ply_sections
+            free = not own and self._direction_free(b, local_ic)
+            bound = (b.param("MATERIAL") or "").strip().upper() in self._frame_bound_mats
             for name in names - {""}:
-                only[name] = only.get(name, True) and (id(b) in self._exact_axes or id(b) in self._ply_sections)
-        self._exact_only = {name for name, yes in only.items() if yes}
+                ok = own or free and (not bound or self._global_axes_card(name))
+                lossless[name] = lossless.get(name, True) and ok
+                if own:
+                    self._axes_readers.add(name)
+                elif ok:
+                    self._free_readers.add(name)
+        self._lossless_ori = {name for name, yes in lossless.items() if yes}
+
+    def _direction_free(self, b: Block, local_ic: set) -> bool:
+        """Whether section ``b`` names an orientation for nothing the physics depends on: a plain
+        solid, shell or membrane section (a shell general section given by its material) whose
+        material has no direction dependence (_mat_symmetry), unless its elements have initial
+        stresses or plastic strains (``local_ic``), which Abaqus reads in the orientation's axes
+        (2017 Keywords *INITIAL CONDITIONS) and ccx 2.23 in global ones (probed)."""
+        kw = b.keyword
+        if b.has("COMPOSITE") or not (kw in ("SOLID SECTION", "SHELL SECTION", "MEMBRANE SECTION")
+                                      or kw == "SHELL GENERAL SECTION" and b.has("MATERIAL")):
+            return False
+        mat = (b.param("MATERIAL") or "").strip().upper()
+        return bool(mat) and self._mat_symmetry.get(mat, "aniso") is None and \
+            not local_ic.intersection(self.geom.elset((b.param("ELSET") or "").strip()))
+
+    def _local_ic_elements(self, blocks: List[Block]) -> set:
+        """The elements given initial stresses, plastic strains or backstresses, which Abaqus
+        reads in the axes of an orientation."""
+        out: set = set()
+        for b in blocks:
+            if b.keyword == "INITIAL CONDITIONS" and \
+                    (b.param("TYPE") or "").strip().upper() in ("STRESS", "PLASTIC STRAIN", "HARDENING"):
+                for rec in merged_data_records(b):
+                    tok = rec[0].strip() if rec else ""
+                    if re.fullmatch(r"[-+]?\d+", tok):
+                        out.add(int(tok))
+                    elif tok:
+                        out.update(self.geom.elset(tok))
+        return out
+
+    def _global_axes_card(self, name: str) -> bool:
+        """Whether handle_orientation writes orientation ``name`` as the global axes where only
+        sections without direction dependence read it: a plain spherical one."""
+        return name in self.orientations and name not in self._dist_refs and \
+            self.orientations[name][2].upper().startswith("SPH")
 
     def _exact_axes_cards(self, b: Block, rows: "OrderedDict[int, Tuple[Tuple[str, ...], ...]]",
                           keep: "OrderedDict[str, Optional[str]]", data: Sequence[str] = ()) -> List[str]:
