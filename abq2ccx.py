@@ -14846,15 +14846,15 @@ class Converter:
             self._between_cache = (key, out)
         return self._between_cache[1]
 
-    def _midside_records(self, b: Block, layout: str) -> List[str]:
+    def _midside_records(self, b: Block, layout: str, only: Optional[set] = None) -> List[str]:
         """Extra data lines that carry a per-node card onto the nodes the converter put
         between two nodes (_between: midside nodes of upgraded beams and shells, ply interface
-        nodes): when the card gives both end nodes a value (by id or through a set), the new
-        node gets the linear interpolation, which is what the Abaqus element sees between its
-        nodes.  ``layout`` is ``"boundary"`` (node, first DOF[, last DOF[, magnitude]] or a
-        named type), ``"dof"`` (node, DOF, value) or ``"field"`` (node, values...).  Appended
-        after the card's own lines, they override what a set gave the new node; a value the
-        card already gives it is not repeated."""
+        nodes; with ``only``, those of its nodes): when the card gives both end nodes a value
+        (by id or through a set), the new node gets the linear interpolation, which is what the
+        Abaqus element sees between its nodes.  ``layout`` is ``"boundary"`` (node, first
+        DOF[, last DOF[, magnitude]] or a named type), ``"dof"`` (node, DOF, value) or
+        ``"field"`` (node, values...).  Appended after the card's own lines, they override
+        what a set gave the new node; a value the card already gives it is not repeated."""
         if not self._midside and not self._edge_nodes and not self._tied_nodes:
             return []
         recs: Dict[int, Dict[int, object]] = {}
@@ -14886,7 +14886,7 @@ class Converter:
         kinds: set = set()
         beam_mids = {m for _, _, m in self._midside.values()}
         for a, c, m, s in self._between() + (self._tied_nodes if layout != "boundary" else []):
-            if a not in recs or c not in recs:
+            if a not in recs or c not in recs or (only is not None and m not in only):
                 continue
             ra, rc, rm = recs[a], recs[c], recs.get(m, {})
             n_out = len(out)
@@ -14972,7 +14972,8 @@ class Converter:
                     b.data = list(b.data) + [str(m) for m in dedup(extra)]
                     self._register_surface(b)
             elif b.keyword in ("KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
-                extra = self._midside_records(b, "boundary" if b.keyword.startswith("K") else "field")
+                extra = self._midside_records(b, "boundary" if b.keyword.startswith("K") else "field",
+                                              only={m for _a, _c, m in trips})
                 if extra:
                     b.data = list(b.data) + extra
         if skipped:

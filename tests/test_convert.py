@@ -3734,6 +3734,19 @@ def test_circ_beam_midside_node_gets_sets_bcs_and_fields():
     assert body.split("*INITIAL CONDITIONS")[1] == ", TYPE=temperature\nALLN, 20.\n1, 30.\n4, 25"
 
 
+def test_circ_beam_midside_node_and_couplings_whatever_else_the_deck_has():
+    # a coupling on both beam ends keeps them alone (_MIDSIDE_SET_CARDS); the midside node
+    # used to join it as soon as a composite shell elsewhere was upgraded (_extend_edge_sets)
+    shell = ("*Node\n201, 5., 5., 0.\n202, 6., 5., 0.\n203, 6., 6., 0.\n204, 5., 6., 0.\n"
+             "*Element, type=S4R, elset=PLATE\n201, 201, 202, 203, 204\n"
+             "*Shell Section, elset=PLATE, composite\n0.1, 3, M, , 0.\n0.1, 3, M, , 90.\n")
+    cpl = "*Node\n100, 0.5, 1., 0.\n*Kinematic Coupling, ref node=100\n1, 1, 6\n2, 1, 6\n"
+    for deck in (CIRC_BEAM + cpl, CIRC_BEAM + shell + cpl):
+        body, _, rep = convert_str(deck)
+        assert _card_at(body, "*SURFACE, TYPE=NODE, NAME=ABQ2CCX_KC1_1") == ["1", "2"]
+        assert "*KINEMATIC COUPLING lines given" not in rep.text()
+
+
 PIPE_BEAM = CIRC_BEAM.replace("section=CIRC\n0.05", "section=PIPE\n0.05, 0.01")
 B32_PIPE_BEAM = """*Node
 1, 0., 0., 0.
