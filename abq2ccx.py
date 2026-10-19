@@ -20222,10 +20222,16 @@ class Converter:
                 if rot and (rot != {4, 5, 6} or n in moves):
                     need.append(n)
 
+        first = False                                    # the next *BOUNDARY is a step's first
         for b in blocks:
-            if b.keyword == "BOUNDARY":
-                if (b.param("OP") or "").strip().upper() == "NEW":
+            if b.keyword == "STEP":
+                first = True
+            elif b.keyword == "BOUNDARY":
+                # OP=NEW on a step's first card only, as _bc_states: Abaqus/CAE writes it on
+                # every card of the step, which keeps the cards before it
+                if first and (b.param("OP") or "").strip().upper() == "NEW":
                     active = {}
+                first = False
                 for nodes, ds, moving in self._boundary_records(b):
                     for n in (nodes if ds & {4, 5, 6} else []):
                         if n in ends:

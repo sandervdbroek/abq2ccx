@@ -3987,6 +3987,12 @@ def test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes():
         "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 4\n3, 2, 4\n*End Step\n"
     _, conv, _ = convert_str(deck)
     assert list(conv._knots) == [1, 3]
+    # Abaqus/CAE writes OP=NEW on every *BOUNDARY of such a step: a later card keeps the ones
+    # before it in the step (the knot depended on the order of the cards)
+    for cards in ("3, 4, 4\n*Boundary, op=NEW\n1, 1, 6\n", "1, 1, 6\n*Boundary, op=NEW\n3, 4, 4\n"):
+        _, conv, _ = convert_str(CIRC_BEAM + "*Step\n*Static\n*Boundary, op=NEW\n" + cards +
+                                 "*Cload\n2, 2, -1.\n*End Step\n")
+        assert list(conv._knots) == [3], cards
     # a node with a *TRANSFORM gets its knot from _plan_transformed_rotations, which writes the
     # local rotation in global components there (local 1 = y: DOF 5); none in a heat-transfer-
     # only deck
