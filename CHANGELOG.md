@@ -6,6 +6,12 @@ physics.
 
 ## Unreleased
 
+* **Body forces after `*DLOAD, OP=NEW`** — ccx 2.23's `*DLOAD, OP=NEW` removes the earlier
+  pressures and `GRAV` / `CENTRIF` loads but keeps `BX`, `BY` and `BZ`, which Abaqus removes. So
+  they stayed on after a deck's own `OP=NEW`, after a linear perturbation step and in a
+  `*MODAL DYNAMIC` step (a bar's tip after a step 2 under gravity: 4.5e-3 for -9e-3). The
+  converter now writes zero lines for them after every `OP=NEW` ccx acts on, leaving out the
+  elements the step loads itself (ccx stops on two amplitudes for one element).
 * **`*BUCKLE` loaded by prescribed displacements** — ccx 2.23 does not solve a `*STEP,
   PERTURBATION` `*BUCKLE` step for prescribed displacements: only the prescribed nodes move,
   by every nonzero BC value in force, so the buckling factors were wrong (a column pushed down

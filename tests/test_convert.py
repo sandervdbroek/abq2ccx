@@ -4951,6 +4951,75 @@ def test_dload_op_new_after_the_other_distributed_load_card():
         assert "on a step's first *DLOAD / *DSLOAD only" in rep.text()
 
 
+# a bar of three elements along x (E1: the first, E23: the others), held at its root
+BAR3 = (HEX3.split("*Element")[0] + "*Element, type=C3D8, elset=ALL\n1, 1,2,3,4,5,6,7,8\n"
+        "2, 2,9,10,3,6,11,12,7\n3, 9,13,14,10,11,15,16,12\n*Elset, elset=E1\n1\n*Elset, elset=E23\n"
+        "2, 3\n*Surface, name=SB\nALL, S1\n*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1.\n"
+        "*Solid Section, elset=ALL, material=M\n*Amplitude, name=A\n0., 1., 1., 1.\n"
+        "*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n")
+ZERO_BODY = ("** abq2ccx: the body forces of earlier steps removed (ccx 2.23's *DLOAD, OP=NEW keeps "
+             "them)\n*DLOAD\n")
+
+
+def test_dload_op_new_removes_earlier_body_forces():
+    # ccx 2.23's *DLOAD, OP=NEW removes the earlier pressures and GRAV / CENTRIF loads but keeps
+    # BX / BY / BZ (dloads.f; probed, also on an amplitude), which Abaqus removes: zero lines
+    # for them follow the OP=NEW card (a zero replaces the value: probed)
+    deck = BAR3 + "*Step\n*Static\n*Dload\nALL, BX, 3.\nALL, BY, 1.\n*End Step\n*Step\n*Static\n{}*End Step\n"
+    body, conv, rep = convert_str(deck.format("*Dload, op=NEW\nALL, GRAV, 2., -1., 0., 0.\n"))
+    assert "*DLOAD, OP=NEW\nALL, GRAV, 2., -1., 0., 0.\n" + ZERO_BODY + "ALL, BX, 0.\nALL, BY, 0.\n" \
+           in body.split("*STEP")[2]
+    assert "ccx 2.23 keeps the BX / BY / BZ body forces of earlier steps" in rep.text()
+    assert not conv.reduced_physics and not conv.unloaded_steps
+    # one the step gives again needs none
+    body, _, _ = convert_str(deck.format("*Dload, op=NEW\nALL, BX, 2.\n"))
+    assert "*DLOAD, OP=NEW\nALL, BX, 2.\n" + ZERO_BODY + "ALL, BY, 0.\n*" in body
+    # nor do the elements the step loads itself: ccx adds up a second value one step gives an
+    # element, and stops on another amplitude ('*ERROR in loadadd'; probed), so the rest of the
+    # set goes element by element; a set the step leaves alone goes as it is
+    body, _, _ = convert_str(deck.format("*Dload, op=NEW, amplitude=A\nE1, BX, 2.\n"))
+    assert "*DLOAD, OP=NEW, AMPLITUDE=A\nE1, BX, 2.\n" + ZERO_BODY + "2, BX, 0.\n3, BX, 0.\n" \
+           "ALL, BY, 0.\n*" in body
+    body, _, _ = convert_str(deck.replace("ALL, BX, 3.\nALL, BY, 1.", "E1, BX, 3.\nE23, BX, 3.")
+                             .format("*Dload, op=NEW, amplitude=A\nE1, BX, 2.\n"))
+    assert ZERO_BODY + "E23, BX, 0.\n*" in body
+    # *DLOAD without OP=NEW keeps them (Abaqus too), and so does *DSLOAD, OP=NEW (the converted
+    # *DLOAD, OP=NEW's loads given again: _flush_dloads); nothing to remove after a removal
+    for cards in ("*Dload\nALL, BZ, 1.\n", "*Dsload, op=NEW\nSB, P, 2.\n"):
+        body, _, rep = convert_str(deck.format(cards))
+        assert ZERO_BODY not in body and "ccx 2.23 keeps the BX" not in rep.text()
+    body, _, _ = convert_str(deck.format("*Dload, op=NEW\n") +
+                             "*Step\n*Static\n*Dload, op=NEW\nALL, BZ, 1.\n*End Step\n")
+    assert body.count(ZERO_BODY) == 1 and ZERO_BODY + "ALL, BX, 0.\nALL, BY, 0.\n" in body.split("*STEP")[2]
+    # a *DLOAD, OP=NEW after the step's *DSLOAD: after the bare one that opens the step
+    # (_dload_op_new_first)
+    body, _, _ = convert_str(deck.format("*Dsload\nSB, P, 2.\n*Dload, op=NEW\nALL, BZ, 1.\n"))
+    assert "on a step's first *DLOAD only\n*DLOAD, OP=NEW\n" + ZERO_BODY + "ALL, BX, 0.\nALL, BY, 0.\n" \
+           "*DLOAD\nALL, P1, 2.\n*DLOAD, OP=NEW\nALL, BZ, 1.\n" in body
+
+
+def test_body_forces_of_perturbation_steps_removed():
+    # the base state given again after a linear perturbation step (_restore_base_states) and a
+    # modal dynamic step's own loads (_modal_own_loads) open with *DLOAD, OP=NEW, which leaves
+    # the body forces in force that earlier steps gave (probed: a bar's tip after a static
+    # perturbation step with BX, and in a modal dynamic step after a static step with BX)
+    deck = (BAR3 + "*Step\n*Static\n*Dload\nALL, GRAV, 2., -1., 0., 0.\n*End Step\n{}"
+            "*Step\n*Static\n*End Step\n")
+    for pert in ("*Step, perturbation\n*Static\n*Dload\nALL, BX, 3.\n*End Step\n",
+                 "*Step\n*Frequency\n3\n*Dload\nALL, BX, 3.\n*End Step\n"):
+        body, _, _ = convert_str(deck.format(pert))
+        assert "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nALL, GRAV, 2., -1., 0., 0.\n" + ZERO_BODY + \
+               "ALL, BX, 0.\n" in body.split("*STEP")[3]
+    body, _, _ = convert_str(MODAL.format("*Dload\nEALL, BX, 3.\n", "*Cload\n7, 2, 1.\n") +
+                             "*Step\n*Static\n*End Step\n")
+    steps = body.split("*STEP")
+    assert "here too)\n*DLOAD, OP=NEW\n" + ZERO_BODY + "EALL, BX, 0.\n*CLOAD\n7, 2, 1.\n" \
+           in steps[3], steps[3]
+    # the general step after it gets the body force back
+    assert "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nEALL, BX, 3.\n*NODE FILE" in steps[4] and \
+        ZERO_BODY not in steps[4]
+
+
 # a static step (a load, a pressure, a prescribed displacement, temperatures), a *FREQUENCY
 # step with the given cards, and a static step with the given cards
 PERT = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.\n"

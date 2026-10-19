@@ -3311,6 +3311,48 @@ def main():
             f"step {k} {v:+.6e} (expected {r:+.6e})" for k, (v, r) in enumerate(zip(uz, refs), 1)))
         failures += 0 if ok else 1
 
+    # --- body forces after *DLOAD, OP=NEW ----------------------------------------------------
+    # ccx 2.23's *DLOAD, OP=NEW keeps the BX / BY / BZ of earlier steps (Abaqus removes them),
+    # so the converter writes zero lines for them.  A bar of three unit cubes along x (nu = 0)
+    # held at its root, under BX = 3 in step 1: tip ux = b L^2 / (2 E).  Step 2 removes it with
+    # OP=NEW and loads the bar by gravity along -x, or its first cube by BX = 2 on an amplitude;
+    # or step 3 follows a perturbation step with BX on the bar under gravity (converted before:
+    # the BX stayed on, 4.5e-3, 1.3e-2, 4.5e-3)
+    bar = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n"
+           "8,0.,1.,1.\n9,2.,0.,0.\n10,2.,1.,0.\n11,2.,0.,1.\n12,2.,1.,1.\n13,3.,0.,0.\n14,3.,1.,0.\n"
+           "15,3.,0.,1.\n16,3.,1.,1.\n*Element, type=C3D8, elset=ALL\n1, 1,2,3,4,5,6,7,8\n"
+           "2, 2,9,10,3,6,11,12,7\n3, 9,13,14,10,11,15,16,12\n*Elset, elset=E1\n1\n*Nset, nset=TIP\n16\n"
+           "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1.\n*Solid Section, elset=ALL, material=M\n"
+           "*Amplitude, name=A\n0., 1., 1., 1.\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n")
+    step = "*Step{}\n*Static\n{}*Node Print, nset=TIP\nU\n*End Step\n"
+    bx, grav = 3.0 * 9.0 / 2000.0, -2.0 * 9.0 / 2000.0
+    for how, deck, ref in (
+            ("gravity after OP=NEW", step.format("", "*Dload\nALL, BX, 3.\n") +
+             step.format("", "*Dload, op=NEW\nALL, GRAV, 2., -1., 0., 0.\n"), [bx, grav]),
+            ("first cube on an amplitude after OP=NEW", step.format("", "*Dload\nALL, BX, 3.\n") +
+             step.format("", "*Dload, op=NEW, amplitude=A\nE1, BX, 2.\n"), [bx, 2.0 / 2000.0]),
+            ("after a perturbation step", step.format("", "*Dload\nALL, GRAV, 2., -1., 0., 0.\n") +
+             step.format(", perturbation", "*Dload\nALL, BX, 3.\n") + step.format("", ""), [grav, grav])):
+        src = os.path.join(tmp, "body_force_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(bar + deck)
+        inp = os.path.join(tmp, "body_force.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        ux = [u[0] for u in dat_displacement_history(os.path.join(d, "job.dat"), 16)] \
+            if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if len(ux) < 2:
+            print(f"FAIL  dload_op_new_body_force ({how}): no tip displacement in each step ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        got = [ux[0], ux[-1]]
+        ok = all(abs(v - r) <= 1e-5 * abs(r) for v, r in zip(got, ref))
+        print(f"{'PASS' if ok else 'FAIL'}  dload_op_new_body_force ({how}): tip ux " + ", ".join(
+            f"step {k} {v:+.6e} (expected {r:+.6e})" for k, v, r in zip((1, len(ux)), got, ref)))
+        failures += 0 if ok else 1
+
     # --- isotropic *Elastic beside an orthotropic / anisotropic *Expansion -----------------
     # ccx 2.23 uses a wrong stiffness for this combination in linear steps once the deck has
     # temperatures (a free heated cube shrinks), so the converter writes such *Elastic cards

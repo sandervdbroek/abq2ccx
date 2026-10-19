@@ -244,7 +244,8 @@ TRANSLATED = {
         "which have no section thickness, per unit depth); gravity on rigid "
         "elements alone applies nothing (they carry no mass), a body force per volume on them is "
         "commented. `OP=NEW` keeps the `*DSLOAD` pressures Abaqus keeps (ccx's `OP=NEW` "
-        "would remove them). GRAV and CENTRIF magnitudes are multiplied by 10³⁰ where the masses "
+        "would remove them) and removes the earlier `BX` / `BY` / `BZ` with zero lines (ccx's "
+        "keeps them). GRAV and CENTRIF magnitudes are multiplied by 10³⁰ where the masses "
         "are divided by it (see `*COUPLED TEMPERATURE-DISPLACEMENT`).",
     "*DSLOAD": "surface pressure → `*DLOAD` with `Px` face labels (on the `SPOS` / `SNEG` side of "
         "rigid elements: their skins' face); on a shell's / membrane's "

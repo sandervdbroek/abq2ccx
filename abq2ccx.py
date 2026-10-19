@@ -13823,6 +13823,7 @@ class Converter:
         out = self._restore_base_states(out)
         out = self._buckle_displacements(out)   # after the BCs the restore gives back
         out = self._modal_own_loads(out)        # after the loads the restore gives back
+        out = self._clear_body_forces(out)      # after every pass that writes *DLOAD, OP=NEW
         out = self._keep_body_loads(out)        # after the restore, which gives body loads too
         self._audit_loads(blocks, out)
         if self.reduced_physics:
@@ -15789,6 +15790,107 @@ class Converter:
                         "body loads once an earlier step had one", "*DLOAD",
                         f"{insert[i]}, GRAV, 0., 0., 0., -1."]
             res.append(raw)
+        return res
+
+    # the *DLOAD labels ccx 2.23's OP=NEW leaves in force: dloads.f resets the P / I face loads
+    # and the GRAV / CENTRIF / NEWTON table only (probed: also on an amplitude)
+    _KEPT_BY_OP_NEW = ("BX", "BY", "BZ")
+
+    def _clear_body_forces(self, out: List[str]) -> List[str]:
+        """Where ccx 2.23 acts on a *DLOAD, OP=NEW (a step's first *DLOAD: the deck's own,
+        _dload_op_new_first's, _restore_base_states' and _modal_own_loads'), the converted step
+        gives every distributed load that stays in force, as in Abaqus.  But that OP=NEW keeps
+        the BX / BY / BZ body forces of earlier steps (_KEPT_BY_OP_NEW), so those on elements the
+        step does not load with that label get a zero line after the OP=NEW card (a zero
+        replaces the value: probed).  The elements the step loads itself are left out: ccx adds
+        up the values one step gives an element, and stops when their amplitudes differ."""
+        memo: Dict[str, list] = {}
+
+        def keys(token: str, label: str) -> List[tuple]:
+            """(element, label) per element of a line's set (an unknown set: its name)."""
+            t = token.upper()
+            if t not in memo:
+                memo[t] = self._load_elements(token) or [t]
+            return [(e, label) for e in memo[t]]
+
+        held: "OrderedDict[tuple, str]" = OrderedDict()    # (element, label) -> its line's set
+        given: "OrderedDict[tuple, list]" = OrderedDict()   # ... in the open step -> [set, sum]
+        insert: Dict[int, List[str]] = {}
+        cleared: List[str] = []
+        card, n, at = None, 0, None
+        in_step = first = seen = False
+
+        def close() -> None:
+            nonlocal held
+            if at is not None:                  # ccx acted on OP=NEW in this step
+                left = [k for k in held if k not in given]
+                lines, gone = [], set()
+                for k in left:
+                    if k in gone:
+                        continue
+                    whole = keys(held[k], k[1])
+                    if not any(x in given for x in whole):
+                        lines.append(f"{held[k]}, {k[1]}, 0.")
+                        gone.update(whole)
+                    else:
+                        lines.append(f"{k[0]}, {k[1]}, 0.")
+                        gone.add(k)
+                if lines:
+                    insert[at] = ["** abq2ccx: the body forces of earlier steps removed (ccx 2.23's "
+                                  "*DLOAD, OP=NEW keeps them)", "*DLOAD"] + lines
+                    cleared.append(str(n))
+                held = OrderedDict()
+            for k, (token, total) in given.items():
+                if total:
+                    held[k] = token
+                else:
+                    held.pop(k, None)
+
+        for i, raw in enumerate(out):
+            s = raw.strip()
+            if not s or s.startswith("**"):
+                continue
+            if not s.startswith("*"):
+                if card == "DLOAD" and in_step:
+                    if first and at is not None:
+                        at = i
+                    f = [x.strip() for x in s.split(",")]
+                    label = f[1].upper() if len(f) > 1 else ""
+                    if f[0] and label in self._KEPT_BY_OP_NEW:
+                        try:
+                            v = pf(f[2]) if len(f) > 2 and f[2] else 0.0
+                        except ValueError:
+                            v = 1.0                 # (not a number: counts as a load)
+                        for k in keys(f[0], label):
+                            g = given.setdefault(k, [f[0], 0.0])
+                            g[0], g[1] = f[0], g[1] + v
+                continue
+            card, params = parse_keyword_line(s)
+            first = False
+            if card == "STEP":
+                if in_step:
+                    close()
+                n, in_step, at, seen = n + 1, True, None, False
+                given = OrderedDict()
+            elif card == "END STEP" and in_step:
+                close()
+                in_step = False
+            elif card == "DLOAD" and in_step and not seen:
+                seen = first = True
+                if (params.get("OP") or "").strip().upper() == "NEW":
+                    at = i
+        if in_step:
+            close()
+        if not insert:
+            return out
+        self.report.note(f"*DLOAD, OP=NEW: ccx 2.23 keeps the BX / BY / BZ body forces of earlier "
+                         f"steps (it removes pressures and GRAV / CENTRIF loads; probed), Abaqus "
+                         f"removes them -> zero lines for them after the OP=NEW card (step"
+                         f"{'s' if len(cleared) > 1 else ''} {', '.join(cleared)}).", once=True)
+        res: List[str] = []
+        for i, raw in enumerate(out):
+            res.append(raw)
+            res.extend(insert.get(i, []))
         return res
 
     def _audit_loads(self, blocks: List[Block], out: List[str]) -> None:
