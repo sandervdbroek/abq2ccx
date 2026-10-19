@@ -430,9 +430,9 @@ TRANSLATED = {
         "interface, for a ccx rebuilt with the deck's UMAT.",
     "*INITIAL CONDITIONS": "`TYPE=STRESS/PLASTIC STRAIN/SOLUTION` expanded per integration point "
         "(SOLUTION continuation lines joined by the `*DEPVAR` size); stresses and plastic strains "
-        "turned out of an orientation's axes into the global ones ccx reads (at each integration "
-        "point on a cylindrical or spherical system), in ccx's component order and shear measure; "
-        "unknown types commented.",
+        "turned out of an orientation's axes, or a continuum shell's own, into the global ones ccx "
+        "reads (at each integration point on a cylindrical or spherical system), in ccx's component "
+        "order and shear measure; `REBAR` and `SECTION POINTS` records and unknown types commented.",
     "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for "
         "strain hardening with m ≠ 0); other laws → `LAW=USER`.",
     "*AMPLITUDE": "keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; "

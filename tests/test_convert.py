@@ -9263,17 +9263,136 @@ def test_initial_stress_and_plastic_strain_turned_into_global_axes():
     body, conv, rep = convert_str(sq + ISO_STEEL + TURNED_ORIENTATION + psec + ic)
     assert conv.reduced_physics == flag and "not normal to the model plane" in rep.text()
     assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., 0., 0., 0."
-    # axes undefined at an integration point (on a cylindrical system's axis), unknown axes and a
-    # continuum shell's local directions: the values as given, reduced physics
+    # axes undefined at an integration point (on a cylindrical system's axis) and unknown axes:
+    # the values as given, reduced physics
     on_axis = "*Orientation, name=OR, system=CYLINDRICAL\n0.5, 0.5, 0., 0.5, 0.5, 1.\n"
     for deck, why in ((HEX.replace("C3D8", "C3D8R") + ISO_STEEL + on_axis + sec, "undefined at an integration point"),
                       (HEX + ISO_STEEL + "*Orientation, name=OR, definition=OFFSET TO NODES\n1, 2, 4\n" + sec,
-                       "are not known"),
-                      (HEX.replace("C3D8", "SC8R") + ISO_STEEL + TURNED_ORIENTATION
-                       + "*Shell Section, elset=EALL, material=STEEL, orientation=OR\n1.\n", "a *SHELL SECTION")):
+                       "are not known")):
         body, conv, rep = convert_str(deck + "*Initial Conditions, type=STRESS\nEALL, 100., 0., 0., 0., 0., 0.\n")
         assert flag[0] in conv.reduced_physics and why in rep.text()
         assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., 0., 0., 0., 0., 0."
+
+
+def test_initial_stress_on_continuum_shells_in_their_shell_axes():
+    # Abaqus' continuum shells have the components 11, 22, 12 (2017 "Continuum shell element
+    # library"), which it reads in the shell's material directions with or without an orientation:
+    # 1, 2 on the mid-surface (the orientation projected, else global X, or Z where X is the
+    # normal), 3 the stack direction; ccx 2.23 reads xx, yy, zz, xy, xz, yz on its C3D8I / C3D6 in
+    # global axes (probed), so they are written in that form, turned once per element
+    full = [100., -40., 0., 30., 0., 0.]              # S11, S22, S12 in ccx's order
+    ic = "*Initial Conditions, type=STRESS\nEALL, 100., -40., 30.\n"
+    sec = "*Shell Section, elset=EALL, material=STEEL\n1.\n"
+    sc8r = HEX.replace("C3D8", "SC8R")
+    flag = "*INITIAL CONDITIONS, TYPE=STRESS in a continuum shell's axes, not turned"
+    # in the x-y plane, stacked up z: Abaqus' axes are the global ones; S12 is ccx's fourth value
+    body, conv, rep = convert_str(sc8r + ISO_STEEL + sec + ic)
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS") == [f"1, {k}, 100., -40., 0., 30., 0., 0."
+                                                               for k in range(1, 9)]
+    assert conv.reduced_physics == ["element SC8R -> C3D8I"] and "TYPE=STRESS on continuum shells" in rep.text()
+    body, conv, rep = convert_str(sc8r + ISO_STEEL + sec + "*Initial Conditions, type=STRESS\nEALL, 100, -40, 0\n")
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100, -40, 0"    # as written
+    assert "TYPE=STRESS on continuum shells" not in rep.text()
+    # values past the third are not Abaqus' components: left out, warned
+    body, conv, rep = convert_str(sc8r + ISO_STEEL + sec + "*Initial Conditions, type=STRESS\n"
+                                  "EALL, 100., -40., 30., 7., 8., 9.\n")
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., -40., 0., 30., 0., 0."
+    assert "values past the third left out" in rep.text()
+
+    def turned(deck, frame, head="*INITIAL CONDITIONS, TYPE=STRESS", vals=full):
+        body, conv, rep = convert_str(deck)
+        got = _ic_values(body, head)
+        want = A.tensor_to_global(frame, vals)
+        assert got and all(_close(v, want, 1e-9) for v in got.values()), (got, want)
+        assert not [r for r in conv.reduced_physics if "INITIAL" in r]
+        return got, rep
+    # stacked down z (the top face listed first): direction 2 = -y, 3 = -z
+    down = sc8r.replace("1, 1,2,3,4,5,6,7,8", "1, 5,6,7,8,1,2,3,4")
+    got, rep = turned(down + ISO_STEEL + sec + ic, ((1., 0., 0.), (0., -1., 0.), (0., 0., -1.)))
+    assert got[(1, 1)] == [100., -40., 0., -30., 0., 0.] and len(got) == 8
+    assert "in the shell's material directions, also without an orientation" in rep.text()
+    # a plate in the y-z plane (normal x): global Z projected is direction 1, 2 = x cross z = -y
+    yz = sc8r.replace("2, 1.,0.,0.", "2, 0.,1.,0.").replace("3, 1.,1.,0.", "3, 0.,1.,1.").replace(
+        "4, 0.,1.,0.", "4, 0.,0.,1.").replace("5, 0.,0.,1.", "5, 1.,0.,0.").replace(
+        "6, 1.,0.,1.", "6, 1.,1.,0.").replace("8, 0.,1.,1.", "8, 1.,0.,1.")
+    got, _ = turned(yz + ISO_STEEL + sec + ic, ((0., 0., 1.), (0., -1., 0.), (1., 0., 0.)))
+    assert _close(got[(1, 1)], [0., -40., 100., 0., 0., -30.], 1e-9)
+    # STACK DIRECTION=1: the element's first isoparametric direction is the normal (here global x)
+    turned(sc8r + ISO_STEEL + sec.replace("material=STEEL", "material=STEEL, stack direction=1") + ic,
+           ((0., 0., 1.), (0., -1., 0.), (1., 0., 0.)))
+    # an orientation, projected onto the mid-surface: without a rotation line Abaqus turns it about
+    # axis 1 and projects axis 2 (shell_local_axes)
+    frame = A.orientation_frame((0.8, 0.6, 0.), (-0.36, 0.48, 0.8), "RECTANGULAR", (0., 0., 0.), None)[0]
+    d1, d2 = A.shell_local_axes((0., 0., 1.), frame, None)
+    oriented = sec.replace("material=STEEL", "material=STEEL, orientation=OR")
+    turned(sc8r + ISO_STEEL + TURNED_ORIENTATION + oriented + ic, (d1, d2, (0., 0., 1.)))
+    d1, d2 = A.shell_local_axes((0., 0., 1.), frame, 3)
+    turned(sc8r + ISO_STEEL + TURNED_ORIENTATION + "3, 0.\n" + oriented + ic, (d1, d2, (0., 0., 1.)))
+    # an SC6R wedge (stacked from nodes 1-3 to 4-6), its two points
+    wedge = ("*Node\n1, 0., 0., 0.\n2, 0., 1., 0.\n3, 0., 0., 1.\n4, 0.1, 0., 0.\n5, 0.1, 1., 0.\n"
+             "6, 0.1, 0., 1.\n*Element, type=SC6R, elset=EALL\n1, 1, 2, 3, 4, 5, 6\n")
+    got, _ = turned(wedge + ISO_STEEL + sec + ic, ((0., 0., 1.), (0., -1., 0.), (1., 0., 0.)))
+    assert len(got) == 2
+    # a plastic strain's engineering shear is halved first
+    turned(down + ISO_STEEL + "*Plastic\n250., 0.\n" + sec + "*Initial Conditions, type=PLASTIC STRAIN\n"
+           "EALL, 0.004, -0.001, 0.002\n", ((1., 0., 0.), (0., -1., 0.), (0., 0., -1.)),
+           "*INITIAL CONDITIONS, TYPE=PLASTIC STRAIN", [0.004, -0.001, 0., 0.001, 0., 0.])
+    # axes the converter cannot form: the values as given, reduced physics
+    body, conv, rep = convert_str(down + ISO_STEEL + "*Orientation, name=OR, definition=OFFSET TO NODES\n1, 2, 4\n"
+                                  + oriented + ic)
+    assert flag in conv.reduced_physics and "cannot form their shell axes" in rep.text()
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., -40., 0., 30., 0., 0."
+    # a *SHELL GENERAL SECTION takes section forces and moments per unit width: left out
+    body, conv, rep = convert_str(down + ISO_STEEL + "*Shell General Section, elset=EALL, material=STEEL\n1.\n" + ic)
+    assert "*INITIAL CONDITIONS, TYPE=STRESS on a *SHELL GENERAL SECTION (section forces)" in conv.reduced_physics
+    assert "section forces and moments per unit width" in rep.text() and "\n*INITIAL CONDITIONS" not in body
+
+
+def test_initial_stress_on_split_continuum_shells_in_each_plys_axes():
+    # a composite continuum shell runs as one solid per ply: a record by element set or by the
+    # element's label reaches every ply solid, each turned by its own ply axes (the section's
+    # directions turned by the layer angle about the stack normal); also where a deformation
+    # plasticity ply's solid section names no orientation, Abaqus' axes still apply
+    full = [100., -40., 0., 30., 0., 0.]
+    down = HEX.replace("C3D8", "SC8R").replace("1, 1,2,3,4,5,6,7,8", "1, 5,6,7,8,1,2,3,4")
+    n = (0., 0., -1.)
+    plies = {0.: ((1., 0., 0.), (0., -1., 0.), n), 90.: ((0., -1., 0.), (-1., 0., 0.), n)}
+    layup = "*Shell Section, elset=EALL, composite\n0.5, 3, CFRP, 0.\n0.5, 3, {}, 90.\n"
+    for tok in ("EALL", "1"):
+        for second in ("CFRP", "STEEL"):
+            body, conv, rep = convert_str(down + COMPOSITE_MAT + DEFORMATION_STEEL + layup.format(second)
+                                          + f"*Initial Conditions, type=STRESS\n{tok}, 100., -40., 30.\n")
+            got = _ic_values(body)
+            assert {e for e, _k in got} == {1, 2} and len(got) == 16
+            assert all(_close(got[(1, k)], A.tensor_to_global(plies[0.], full), 1e-9) for k in range(1, 9))
+            assert all(_close(got[(2, k)], A.tensor_to_global(plies[90.], full), 1e-9) for k in range(1, 9))
+            assert not [r for r in conv.reduced_physics if "INITIAL" in r]
+            if second == "STEEL":                          # its solid section names no orientation
+                assert any(ln.startswith("*SOLID SECTION") and "MATERIAL=STEEL" in ln and "ORIENTATION" not in ln
+                           for ln in body.splitlines())
+    # state variables too: the element's label names all its ply solids
+    body, _, _ = convert_str(down + COMPOSITE_MAT + "*Depvar\n1\n" + layup.format("CFRP")
+                             + "*Initial Conditions, type=SOLUTION\n1, 5.\n")
+    assert {ln.split(",")[0] for ln in _card(body, "*INITIAL CONDITIONS, TYPE=SOLUTION")} == {"1", "2"}
+    # a split left out (over --max-ply-elements): no ply axes, the values not turned, reduced physics
+    body, conv, rep = convert_str(down + COMPOSITE_MAT + layup.format("CFRP")
+                                  + "*Initial Conditions, type=STRESS\nEALL, 100., -40., 30.\n", max_ply_elements=1)
+    assert "*INITIAL CONDITIONS, TYPE=STRESS in a continuum shell's axes, not turned" in conv.reduced_physics
+    assert "not split into ply solids" in rep.text()
+    assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., -40., 0., 30., 0., 0."
+
+
+def test_initial_conditions_on_rebars_and_section_points_commented_out():
+    # ccx has no rebars and no section points: an Abaqus record (element, rebar name, value) stops
+    # ccx, one at a section point (element, point, values) is read with the point number as the
+    # first component (probed) — both commented out, reduced physics
+    sec = "*Solid Section, elset=EALL, material=STEEL\n"
+    for opt, rec, label in (("REBAR", "EALL, BAR, 100.", "*INITIAL CONDITIONS, TYPE=STRESS, REBAR"),
+                            ("SECTION POINTS", "EALL, 1, 100., 0., 0., 0., 0., 0.",
+                             "*INITIAL CONDITIONS, TYPE=STRESS, SECTION POINTS")):
+        body, conv, rep = convert_str(HEX + ISO_STEEL + sec + f"*Initial Conditions, type=STRESS, {opt}\n{rec}\n")
+        assert "*INITIAL CONDITIONS" not in [ln.split(",")[0] for ln in body.splitlines()]
+        assert f"** *INITIAL CONDITIONS, TYPE=STRESS, {opt}" in body and label in conv.reduced_physics
 
 
 def test_ccx_integration_points_where_ccx_prints_them():

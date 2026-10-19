@@ -13,6 +13,15 @@ physics.
   strain as a Green-Lagrange one (32 % at 2σ0), is dropped, so both spellings run the same
   law, and a material of the law that nothing uses is commented out (ccx ran the whole model
   under NLGEOM for it).
+* **Initial conditions on continuum shells** — `*INITIAL CONDITIONS, TYPE=STRESS / PLASTIC
+  STRAIN` on `SC8R` / `SC6R` are read as Abaqus' components for them, 11, 22, 12 (the third was
+  taken as S33), in the shell's material directions, which apply also without an orientation (3
+  the stack direction; a composite ply's turned by its angle), and turned into the global axes
+  ccx 2.23 reads on its `C3D8I` / `C3D6` (a free plate off the x-y plane relaxed 55 % off
+  before, `[0/90/0]` plies up to 13×). A split element's label reaches all its ply solids, as
+  its element sets did. Left out as reduced physics: a `*SHELL GENERAL SECTION`'s values, which
+  are section forces, rebar records, which ccx stopped on, and section point records, which it
+  read with the point number as a stress.
 * **Code-review fixes** — a planar `B21`/`T2D2` model with a `*COUPLING`, `*TIE` or tied
   `*CONTACT PAIR` no longer stops the converter; a `TYPE=VELOCITY` card a rigid constraint
   implies whole is left out (it came back, and ccx stopped); amplitude points are written to

@@ -1745,6 +1745,92 @@ def annulus_hoop_displacement(r, s0=100.0, e=1000.0, nu=0.3, a=1.0, b=2.0):
     return c * r * math.log(r) + aa * r + bb / r
 
 
+# the continuum-shell initial-condition checks: a plate off the x-y plane (unit normal
+# SC_IC_NORMAL, rows along SC_IC_ROW), an orientation whose axes leave it, turned 25 degrees about
+# axis 3 (Abaqus projects the turned axis 1), Abaqus' continuum-shell components 11, 22, 12 (2017
+# "Continuum shell element library") of a stress and a plastic strain (engineering shear), and an
+# in-plane strain the same in any ply's axes
+SC_IC_NORMAL = (1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0)
+SC_IC_ROW = (2.0 / math.sqrt(5.0), -1.0 / math.sqrt(5.0), 0.0)
+SC_IC_ORIENT = dict(a=(0.3, 0.9, -0.2), b=(-0.8, 0.2, 0.4), rot=(3, 25.0))
+SC_IC_STRESS = (100.0, -40.0, 30.0)
+SC_IC_PLASTIC = (0.004, -0.001, 0.002)
+SC_IC_EPS0 = 1e-3
+
+
+def sc_ic_ply_relaxed():
+    """The initial stress (11, 22, 12) of sc_ic_plate_deck's plies, Q (e, e, 0) with SC_PLY's
+    plane-stress stiffness Q and e = SC_IC_EPS0, and the strain (11, 22, 33, 12, 13, 23; tensor
+    shear) it relaxes to in a ply's axes: -e in the plane, the free thickness's Poisson strain."""
+    e1, e2, _e3, n12, n13, n23 = SC_PLY[:6]
+    d = 1.0 - n12 * n12 * e2 / e1
+    q11, q22, q12 = e1 / d, e2 / d, n12 * e2 / d
+    s11, s22 = (q11 + q12) * SC_IC_EPS0, (q12 + q22) * SC_IC_EPS0
+    return (s11, s22, 0.0), (-SC_IC_EPS0, -SC_IC_EPS0, n13 * s11 / e1 + n23 * s22 / e2, 0.0, 0.0, 0.0)
+
+
+def sc_ic_plate_deck(kind="sc8r", ic="stress", orient=False, plies=None, n=3, t=0.1):
+    """A free 1 x 1 continuum-shell plate t thick off the x-y plane (SC_IC_NORMAL; n x n SC8R,
+    or two SC6R wedges per cell; held against rigid motion only) with an initial stress
+    SC_IC_STRESS (``ic`` "stress"; E 1000, nu 0.25) or plastic strain SC_IC_PLASTIC ("plastic"; a
+    *Plastic material that stays elastic) in Abaqus' shell axes: the orientation SC_IC_ORIENT
+    projected onto the plate (``orient``), else global X projected.  With ``plies`` (layer
+    angles) it is a composite of SC_PLY plies with the initial stress of sc_ic_ply_relaxed in
+    each ply's axes, the shell axes turned by its angle: every ply relaxes to the same uniform
+    strain only where its values are turned by its own axes.  Returns the deck, {node: xyz} and
+    the shell axes (direction 1, 2, the normal)."""
+    nrm, row = SC_IC_NORMAL, SC_IC_ROW
+    col = _cross(nrm, row)
+    nid = lambda i, j, k: 1 + i + (n + 1) * j + (n + 1) ** 2 * k      # noqa: E731
+    xyz = {nid(i, j, k): tuple(i / n * a + j / n * b + t * k * c for a, b, c in zip(row, col, nrm))
+           for k in range(2) for j in range(n + 1) for i in range(n + 1)}
+    typ = kind.upper()
+    lines = ["*Heading", f"Free {typ} plate off the x-y plane, an initial {ic} in Abaqus' shell axes",
+             "*Node, nset=ALL"] + [f"{k}, " + ", ".join(f"{c:.15g}" for c in p) for k, p in sorted(xyz.items())]
+    lines.append(f"*Element, type={typ}, elset=PLATE")
+    e = 0
+    for j in range(n):
+        for i in range(n):
+            q = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
+            b, tp = [nid(*p, 0) for p in q], [nid(*p, 1) for p in q]
+            for conn in ([b + tp] if typ == "SC8R" else
+                         [[b[0], b[1], b[2], tp[0], tp[1], tp[2]], [b[0], b[2], b[3], tp[0], tp[2], tp[3]]]):
+                e += 1
+                lines.append(f"{e}, " + ", ".join(map(str, conn)))
+    ori = SC_IC_ORIENT if orient else None
+    if ori:
+        lines += ["*Orientation, name=TILTED", ", ".join(f"{c:g}" for c in (*ori["a"], *ori["b"])),
+                  "{}, {:g}".format(*ori["rot"])]
+    on = ", orientation=TILTED" if ori else ""
+    if plies:
+        sig = sc_ic_ply_relaxed()[0]
+        e1, e2, e3, n12, n13, n23, g12, g13, g23 = SC_PLY
+        lines += ["*Material, name=PLY", "*Elastic, type=ENGINEERING CONSTANTS",
+                  f"{e1:g}, {e2:g}, {e3:g}, {n12:g}, {n13:g}, {n23:g}, {g12:g}, {g13:g},", f"{g23:g}",
+                  f"*Shell Section, elset=PLATE, composite{on}"] + [f"1., 3, PLY, {ang:g}" for ang in plies]
+    else:
+        sig = SC_IC_PLASTIC if ic == "plastic" else SC_IC_STRESS
+        lines += ["*Material, name=M", "*Elastic", "1000., 0.25"]
+        lines += ["*Plastic", "1.e6, 0.", "1.1e6, 1."] if ic == "plastic" else []
+        lines += [f"*Shell Section, elset=PLATE, material=M{on}", f"{t:g}"]
+    lines += [f"*Initial Conditions, type={'PLASTIC STRAIN' if ic == 'plastic' else 'STRESS'}",
+              "PLATE, " + ", ".join(f"{x:.15g}" for x in sig),
+              "*Boundary", f"{nid(0, 0, 0)}, 1, 3", f"{nid(n, 0, 0)}, 2, 3", f"{nid(0, n, 0)}, 1, 1",
+              "*Step", "*Static", "*Node Print, nset=ALL", "U", "*End Step"]
+    d1 = abaqus_shell_direction(nrm, ori)
+    return "\n".join(lines) + "\n", xyz, (d1, _cross(nrm, d1), nrm)
+
+
+def fit_strain(u, xyz):
+    """The uniform strain (11, 22, 33, 12, 13, 23; tensor shear) whose displacements, with a rigid
+    motion, fit ``u`` at the nodes ``xyz`` best (least squares)."""
+    ids = [k for k in xyz if k in u]
+    rows = [(1.0,) + tuple(xyz[k]) for k in ids]
+    ata = [[sum(r[i] * r[j] for r in rows) for j in range(4)] for i in range(4)]
+    h = [_solve(ata, [sum(r[i] * u[k][c] for r, k in zip(rows, ids)) for i in range(4)])[1:] for c in range(3)]
+    return [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2, (h[1][2] + h[2][1]) / 2]
+
+
 def dp_bar_deck(typ, ori):
     """A 4 x 1 x 1 bar of *Deformation Plasticity steel (four C3D8 or C3D20R), clamped at x = 0,
     pulled, bent and sheared at its tip past yield (NLGEOM, as ccx runs that law anyway), on no
@@ -4248,7 +4334,7 @@ def main():
     # initial stress to eps = -C^-1 sigma and takes its plastic strain stress-free; a quarter
     # annulus with a uniform hoop stress has a closed-form radial displacement; a CPS4 square's
     # initial shear (Abaqus' third component on plane stress, ccx's fourth) relaxes by tau / G
-    def faithful_run(text, tag):
+    def faithful_run(text, tag, allow=()):
         src = os.path.join(tmp, f"{tag}_src.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
@@ -4257,9 +4343,10 @@ def main():
         d, status, out = run_ccx(ccx, env, inp)
         u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
         shutil.rmtree(d, ignore_errors=True)
-        if u is None or conv.reduced_physics:
+        lost = [r for r in conv.reduced_physics if not r.startswith(allow)] if allow else conv.reduced_physics
+        if u is None or lost:
             print(f"FAIL  {tag}: " + (f"did not solve ({status})" if u is None else
-                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+                                      "reduced physics: " + "; ".join(lost)))
             print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
             return None
         return u
@@ -4312,6 +4399,40 @@ def main():
         ok = abs(u[4][0] + 0.2) < 1e-9
         print(f"{'PASS' if ok else 'FAIL'}  initial_stress_plane_stress (CPS4 square, initial S12 = 100, "
               f"G = 500): shear {u[4][0]:+.6f} (-tau / G = -0.2)")
+        failures += 0 if ok else 1
+    # a continuum shell's are its components 11, 22, 12 in its material directions, with or
+    # without an orientation (1, 2 on the mid-surface, 3 the stack direction; a composite ply's
+    # turned by its angle); ccx 2.23 reads them on its C3D8I / C3D6 in global axes.  A free plate
+    # off the x-y plane relaxes an initial stress to -C^-1 R sigma R^T and takes a plastic strain
+    # stress-free; [0/90/0] plies with an initial stress Q (e, e, 0) relax to one uniform strain
+    # (the element substitution and the ply split are the only reduced physics)
+    for kind, ic, orient, plies in (("sc8r", "stress", False, None), ("sc6r", "stress", False, None),
+                                    ("sc8r", "stress", True, None), ("sc8r", "plastic", False, None),
+                                    ("sc8r", "stress", False, (0, 90, 0)), ("sc6r", "stress", True, (0, 90, 0))):
+        tag = f"initial_{ic}_{kind}" + ("_plies" if plies else "") + ("_oriented" if orient else "")
+        text, xyz, axes = sc_ic_plate_deck(kind, ic, orient, plies)
+        u = faithful_run(text, tag, allow=("element SC",))
+        if u is None:
+            failures += 1
+            continue
+        eps = fit_strain(u, xyz)
+        if plies:
+            want, ref = local_to_global(axes[:2], sc_ic_ply_relaxed()[1]), "every ply's relaxed strain"
+        elif ic == "plastic":
+            p11, p22, g12 = SC_IC_PLASTIC
+            want, ref = local_to_global(axes[:2], (p11, p22, 0.0, g12 / 2, 0.0, 0.0)), "R eps_p R^T, stress-free"
+        else:
+            s11, s22, s12 = SC_IC_STRESS
+            sg = local_to_global(axes[:2], (s11, s22, 0.0, s12, 0.0, 0.0))
+            want = [-(1.25 * x - (0.25 * sum(sg[:3]) if k < 3 else 0.0)) / 1000.0 for k, x in enumerate(sg)]
+            ref = "-C^-1 R sigma R^T"
+        err = max(abs(x - y) for x, y in zip(eps, want)) / max(abs(y) for y in want)
+        ok = err < 1e-4
+        what = ("[0/90/0] plies, initial S11, S22 = Q (e, e)" if plies else
+                "initial PE11, PE22, PE12 (engineering)" if ic == "plastic" else "initial S11, S22, S12")
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (free {kind.upper()} plate off the x-y plane, {what} in "
+              f"Abaqus' shell axes" + (", a projected *ORIENTATION" if orient else "") + f"): strains "
+              f"{err:.1e} of the largest off {ref}")
         failures += 0 if ok else 1
 
     # --- *Deformation Plasticity on an orientation ------------------------------------------
