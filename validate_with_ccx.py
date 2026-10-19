@@ -1868,13 +1868,22 @@ def planar_coupled_tip_deck(coupled=True, n=10):
 
 
 def coupled_velocity_deck():
-    """A C3D8 cube held at its bottom, its top face kinematically coupled to node 100: one
-    *BOUNDARY, TYPE=VELOCITY moves node 100 at 2 along x (rotations held), a second gives the
-    coupled top nodes the same velocity — a BC the coupling implies (ccx stops on it)."""
-    return (CUBE8 + "*NODE\n100, 0.5, 0.5, 1.\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n"
-            "1e-3\n*KINEMATIC COUPLING, REF NODE=100\nTOP, 1, 3\n*STEP\n*DYNAMIC\n0.01, 1.\n"
+    """A column of two C3D8 held at its bottom, its top face a *RIGID BODY (TIE NSET) on node
+    100: one *BOUNDARY, TYPE=VELOCITY moves node 100 at 2 along x (rotations held), a second
+    gives the top nodes the same velocity — a BC the rigid constraint implies (ccx stops on it).
+    A rigid body, not a kinematic coupling: in a *DYNAMIC step ccx 2.23 sets up no equations
+    for a model with *COUPLING, *KINEMATIC (every free DOF stays at 0, and its Windows build
+    stops in u_calloc on the size of the empty matrix).  The middle nodes MID are free."""
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, 0., 0., 2.\n10, 1., 0., 2.\n"
+            "11, 1., 1., 2.\n12, 0., 1., 2.\n100, 0.5, 0.5, 2.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 5, 6, 7, 8, 9, 10, 11, 12\n*NSET, NSET=TOP\n9, 10, 11, 12\n"
+            "*NSET, NSET=MID\n5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*DENSITY\n1e-3\n*RIGID BODY, REF NODE=100, TIE NSET=TOP\n*STEP\n*DYNAMIC\n0.01, 1.\n"
             "*BOUNDARY\nBOT, 1, 3\n*BOUNDARY, TYPE=VELOCITY\n100, 1, 1, 2.\n100, 4, 6, 0.\n"
-            "*BOUNDARY, TYPE=VELOCITY\nTOP, 1, 1, 2.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+            "*BOUNDARY, TYPE=VELOCITY\nTOP, 1, 1, 2.\n*NODE PRINT, NSET=TOP\nU\n"
+            "*NODE PRINT, NSET=MID\nU\n*END STEP\n")
 
 
 def amplitude_close_times_deck(definition="EQUALLY SPACED"):
@@ -4507,15 +4516,18 @@ def main():
               f"{want:.7g} loaded at the tip ({err:.1e} apart: the tip's knot beam), out of plane "
               f"{off:.1e}")
     failures += 0 if all(tips) and ok else 1
-    # a velocity BC card the coupling implies, left out whole (it came back, and ccx stopped)
+    # a velocity BC card a rigid constraint implies, left out whole (it came back, and ccx
+    # stopped); the free middle nodes show that ccx solved the step
     u = review_run(coupled_velocity_deck(), "coupled_velocity_card", dat_displacements)
     if u:
-        got = [u.get(n, [math.inf])[0] for n in (5, 6, 7, 8)]
-        ok = max(abs(x - 2.0) for x in got) < 1e-9
-        print(f"{'PASS' if ok else 'FAIL'}  coupled_velocity_card (a cube's coupled top face given "
+        got = [u.get(n, [math.inf])[0] for n in (9, 10, 11, 12)]
+        mid = [u.get(n, [0.0])[0] for n in (5, 6, 7, 8)]
+        ok = max(abs(x - 2.0) for x in got) < 1e-9 and all(0.1 < x < 1.9 for x in mid)
+        print(f"{'PASS' if ok else 'FAIL'}  coupled_velocity_card (a column's rigid top face given "
               f"its reference node's velocity 2 by a second *BOUNDARY, TYPE=VELOCITY): top face at "
               f"{', '.join(f'{x:.7g}' for x in got)} after time 1 (2; the card as written stops ccx: "
-              f"'dependent side of a MPC and a SPC')")
+              f"'dependent side of a MPC and a SPC'), free middle nodes at "
+              f"{', '.join(f'{x:.4g}' for x in mid)}")
     failures += 0 if u and ok else 1
     # amplitude points 1e-4 apart at total time 100 (written to 6 digits, they fell on t = 100)
     for definition, want in (("EQUALLY SPACED", (0.25, 0.5, 0.75, 1.0)),
