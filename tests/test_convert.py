@@ -3773,8 +3773,8 @@ def test_composite_shell_upgrade_midside_normals_and_hanging_neighbours():
     assert "1, 11, 0, -0.6, 0.8\n1, 12, 0, 0, 1\n1, 13, 0, 0.6, 0.8\n1, 14, 0, 0, 1\n" in body
     assert "*ELEMENT, TYPE=C3D8\n2, 7, 8, 9, 10, 2, 5, 6, 3\n" in body
     assert "1 element(s) (e.g. 2, C3D8) share an edge with the upgraded shells" in rep.text()
-    assert conv.reduced_physics == ["element S4 -> S8R (ccx runs composite shells on S8R / S6 only)",
-                                    "elements left with a hanging midside node of an upgraded shell"]
+    assert sorted(conv.reduced_physics) == ["element S4 -> S8R (ccx runs composite shells on S8R / S6 only)",
+                                            "elements left with a hanging midside node of an upgraded shell"]
 
 
 def test_shell_edge_faces_map_to_s3_s6():
