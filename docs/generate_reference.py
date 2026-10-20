@@ -45,7 +45,9 @@ TRANSLATED = {
         "per-instance names (also where an `*ORIENTATION` or a composite ply names it) and offset "
         "element labels; a part's `*ORIENTATION, DEFINITION=NODES` names each instance's own "
         "nodes; rotated instances rotate `*ORIENTATION` axes (also per-element "
-        "`*DISTRIBUTION` axes), beam `n1`, `*NODE` normals and `*NORMAL` vectors. Proved by "
+        "`*DISTRIBUTION` axes), beam `n1`, `*NODE` normals, `*NORMAL` vectors and the part's "
+        "DOF-numbered data (`*EQUATION` terms, couplings of some DOFs, `SPRING1`/`SPRING2`/"
+        "`DASHPOT1` DOFs, `*GAP` directions, a hinge's axis). Proved by "
         "`validate_with_ccx.py` (`assembly_rotated_instances`: the same results as the model "
         "written flat).",
     "*ORIENTATION": "origin `c` of a 9-value line subtracted from `a`, `b` (ccx has no origin "
@@ -202,7 +204,10 @@ TRANSLATED = {
         "such a step (no `AMPLITUDE`), or a BC that `*BOUNDARY, OP=NEW` releases there, is warned: "
         "ccx's HHT integration overshoots the jump by 5 % at the first increment.",
     "*MASS": "passed through; in a deck with a transient `*COUPLED TEMPERATURE-DISPLACEMENT` step "
-        "divided by 10³⁰ with the densities (see there).",
+        "divided by 10³⁰ with the densities (see there). `TYPE=ANISOTROPIC` → the isotropic mass "
+        "M11 that ccx 2.23 reads (exact only when the three are equal; else reduced physics).",
+    "*DASHPOT": "of `DASHPOT1` / `DASHPOT2` elements: written without its DOF line, which ccx reads as "
+        "a coefficient and stops on in a dynamic step, and without `ORIENTATION` (see the elements).",
     "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=VELOCITY`/"
         "`ACCELERATION` → a displacement BC whose generated amplitude integrates the history from "
         "the DOF's state at the step start (continued in later steps that keep it). Without "
@@ -655,6 +660,9 @@ def _element_status(t):
         return "on a rigid body with a `*MASS`: six point masses (exact); otherwise flagged"
     if t in A.CONN_TYPES:
         return "not emitted — its `*CONNECTOR SECTION` becomes ccx constraints"
+    if t == "DASHPOT1":
+        return ("→ `DASHPOTA` to a new ground node that `*EQUATION`s keep on its DOF's line (exact, "
+                "also under `NLGEOM`); on a rotational DOF left out (reduced physics)")
     if t.startswith(A.UNSUPPORTED_ELEM_PREFIXES):
         return "flagged — no ccx equivalent"
     return "passed through (verify)"

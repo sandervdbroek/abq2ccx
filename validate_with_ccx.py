@@ -3970,6 +3970,102 @@ def rotated_instance_dofs_deck():
     return part + asm + "*STEP\n*STATIC\n" + "\n".join(bc + cl + out) + "\n*END STEP\n", rots
 
 
+def _instances_of_p():
+    """The *ASSEMBLY of part P instanced as ROTATED_INSTANCES, and {instance: R}."""
+    rots, asm = {}, "*ASSEMBLY, NAME=A\n"
+    for name, rot in ROTATED_INSTANCES.items():
+        rots[name] = (lambda v: tuple(v)) if rot is None else (
+            lambda v, e=_unit([y - x for x, y in zip(rot[0], rot[1])]), p=math.radians(rot[2]):
+            _rotate(v, e, p))
+        asm += f"*INSTANCE, NAME={name}, PART=P\n"
+        if rot is not None:
+            asm += (", ".join(f"{x:g}" for x in rot[0]) + "\n" +
+                    ", ".join(f"{x:g}" for x in (*rot[0], *rot[1], rot[2])) + "\n")
+        asm += "*END INSTANCE\n"
+    return asm + "*END ASSEMBLY\n", rots
+
+
+def rotated_instance_point_deck(kind):
+    """A part P of node 1 (instance set M) and node 2 at the same place (set GR, held), its
+    DOF-numbered data in the part's axes, instanced as ROTATED_INSTANCES; node 1 loaded by R F
+    in each, in an NLGEOM step.  ``kind`` "dashpot": a point mass 1 on a SPRING1 on DOF 1 (k
+    100) and DASHPOT1 elements on DOFs 2 (c 10) and 3 (c 20), F = (0.5, 1, 1), *DYNAMIC over
+    1 s; "gap": SPRING1s on DOFs 1, 2, 3 (k 100, 100, 10) and a GAPUNI from 1 to 2, clearance
+    0.02 along the part's z, F = (1, 2, 1), *STATIC (free, node 1 would move 0.1 along z).
+    Node 1 printed in global components.  Returns the deck and {instance: R}."""
+    part = "*PART, NAME=P\n*NODE\n1, 0., 0., 0.\n2, 0., 0., 0.\n*NSET, NSET=M\n1\n*NSET, NSET=GR\n2\n"
+    springs = ((1, "100."),) if kind == "dashpot" else ((1, "100."), (2, "100."), (3, "10."))
+    part += "".join(f"*ELEMENT, TYPE=SPRING1, ELSET=S{d}\n1{d}, 1\n*SPRING, ELSET=S{d}\n{d}\n{k}\n"
+                    for d, k in springs)
+    if kind == "dashpot":
+        part += ("*ELEMENT, TYPE=MASS, ELSET=EM\n10, 1\n*MASS, ELSET=EM\n1.\n"
+                 "*ELEMENT, TYPE=DASHPOT1, ELSET=D2\n22, 1\n*DASHPOT, ELSET=D2\n2\n10.\n"
+                 "*ELEMENT, TYPE=DASHPOT1, ELSET=D3\n23, 1\n*DASHPOT, ELSET=D3\n3\n20.\n")
+        step, force = "*DYNAMIC, DIRECT\n0.005, 1.\n", (0.5, 1.0, 1.0)
+    else:
+        part += "*ELEMENT, TYPE=GAPUNI, ELSET=G\n30, 1, 2\n*GAP, ELSET=G\n0.02, 0., 0., 1.\n"
+        step, force = "*STATIC\n0.1, 1.\n", (1.0, 2.0, 1.0)
+    asm, rots = _instances_of_p()
+    deck = part + "*END PART\n" + asm + "*BOUNDARY\n" + "".join(f"{n}.GR, 1, 3\n" for n in rots)
+    deck += "*STEP, NLGEOM, INC=1000\n" + step + "*CLOAD\n"
+    for name, r in rots.items():
+        deck += "".join(f"{name}.M, {k + 1}, {x:.12g}\n" for k, x in enumerate(r(force)))
+    deck += "".join(f"*NODE PRINT, NSET={n}.M, GLOBAL=YES, FREQUENCY=20\nU\n" for n in rots)
+    return deck + "*END STEP\n", rots
+
+
+def rotated_instance_constraints_deck():
+    """A part P of two C3D8 unit cubes held at their bases, constraints in its axes: cube A's top
+    face coupled by *COUPLING, *DISTRIBUTING of DOFs 1-5 (the moment about the part's z
+    released) to node 9 above it, cube B's top face by *COUPLING, *KINEMATIC to node 19 above
+    it, and a HINGE connector from 9 to 19, free about the part's x — node 9's rotation about z
+    is held by the hinge alone.  Instanced as ROTATED_INSTANCES; node 9 loaded by R (0.3, -0.2,
+    0.5) and the moment R (0.1, 0.2, 0.15).  Returns the deck and {instance: R}."""
+    corners = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
+    nodes = [f"{o + i + 1}, {x0 + x}., {y}., {z}." for o, x0 in ((0, 0), (10, 2))
+             for i, (x, y, z) in enumerate(corners)]
+    part = ("*PART, NAME=P\n*NODE\n" + "\n".join(nodes) + "\n9, 0.5, 0.5, 1.5\n19, 2.5, 0.5, 1.5\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=CA\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=CB\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*ELEMENT, TYPE=CONN3D2, ELSET=CN\n5, 9, 19\n*NSET, NSET=BASE\n1, 2, 3, 4, 11, 12, 13, 14\n"
+            "*NSET, NSET=BODY\n5, 6, 7, 8, 9, 15, 16, 17, 18, 19\n*SOLID SECTION, ELSET=CA, MATERIAL=M\n"
+            "*SOLID SECTION, ELSET=CB, MATERIAL=M\n*CONNECTOR SECTION, ELSET=CN\nHINGE,\n"
+            "*SURFACE, NAME=TA\nCA, S2\n*SURFACE, NAME=TB\nCB, S2\n"
+            "*COUPLING, CONSTRAINT NAME=CD, REF NODE=9, SURFACE=TA\n*DISTRIBUTING\n1, 5\n"
+            "*COUPLING, CONSTRAINT NAME=CK, REF NODE=19, SURFACE=TB\n*KINEMATIC\n*END PART\n")
+    asm, rots = _instances_of_p()
+    deck = part + asm + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*STEP\n*STATIC\n*BOUNDARY\n"
+    deck += "".join(f"{n}.BASE, 1, 3\n" for n in rots) + "*CLOAD\n"
+    for name, r in rots.items():
+        deck += "".join(f"{name}.9, {k + 1}, {x:.12g}\n" for k, x in
+                        enumerate((*r((0.3, -0.2, 0.5)), *r((0.1, 0.2, 0.15)))))
+    deck += "".join(f"*NODE PRINT, NSET={n}.BODY, GLOBAL=YES\nU\n" for n in rots)
+    return deck + "*END STEP\n", rots
+
+
+def dashpot1_ground_deck():
+    """Free point masses (1 each) on dashpots c = 10 in a *DYNAMIC, NLGEOM step of 2 s, each
+    pushed by 1 along its dashpot and by 1 across it: DASHPOT1s on node 1's DOF 1 of an
+    ORIENTATION 30 degrees about z, on node 2's DOF 2 of its *TRANSFORM 45 degrees about z (its
+    loads local), on node 3's global DOF 3; and a DASHPOT2 on DOF 1 of nodes 4 (held)
+    and 5 along x, node 5 held across.  Along a dashpot a mass moves u = t/10 - (1 - e^(-10 t))
+    / 100 (0.19 at t = 2), across it t^2 / 2 (2, as far as the converter's ground node is).
+    Printed in global components."""
+    c, s, r = math.cos(math.radians(30)), math.sin(math.radians(30)), math.sqrt(0.5)
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 1., 0.\n4, 1., 1., 0.\n5, 2., 1., 0.\n"
+            "*ELEMENT, TYPE=MASS, ELSET=EM\n11, 1\n12, 2\n13, 3\n15, 5\n*MASS, ELSET=EM\n1.\n"
+            f"*ORIENTATION, NAME=OR\n{c:.15f}, {s:.15f}, 0., {-s:.15f}, {c:.15f}, 0.\n"
+            f"*NSET, NSET=N2\n2\n*TRANSFORM, NSET=N2\n{r:.15f}, {r:.15f}, 0., {-r:.15f}, {r:.15f}, 0.\n"
+            "*ELEMENT, TYPE=DASHPOT1, ELSET=D1\n21, 1\n*ELEMENT, TYPE=DASHPOT1, ELSET=D2\n22, 2\n"
+            "*ELEMENT, TYPE=DASHPOT1, ELSET=D3\n23, 3\n*ELEMENT, TYPE=DASHPOT2, ELSET=D5\n25, 4, 5\n"
+            "*DASHPOT, ELSET=D1, ORIENTATION=OR\n1\n10.\n*DASHPOT, ELSET=D2\n2\n10.\n"
+            "*DASHPOT, ELSET=D3\n3\n10.\n*DASHPOT, ELSET=D5\n1, 1\n10.\n"
+            "*NSET, NSET=PROBE\n1, 2, 3, 5\n*BOUNDARY\n4, 1, 3\n5, 2, 3\n"
+            "*STEP, NLGEOM, INC=1000\n*DYNAMIC, DIRECT\n0.01, 2.\n*CLOAD\n"
+            f"1, 1, {c:.15f}\n1, 2, {s:.15f}\n1, 3, 1.\n2, 2, 1.\n2, 1, 1.\n3, 3, 1.\n3, 1, 1.\n5, 1, 1.\n"
+            "*NODE PRINT, NSET=PROBE, GLOBAL=YES, FREQUENCY=200\nU\n*END STEP\n")
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
@@ -9960,6 +10056,83 @@ def main():
               f"couplings and SPRING1 / SPRING2 in instances turned 90 degrees about x and 40 about "
               f"(1, 2, 3)): their 16 nodes move R u of the unturned instance's (max |u| {scale:.3g}; "
               f"{errs['I1']:.1e} / {errs['I2']:.1e} apart)")
+    failures += 0 if ok else 1
+
+    # DASHPOT1 (a node's DOF to ground, acting along a fixed direction): ccx has none, and the
+    # converter dropped it as a 2-node element; now a DASHPOTA to a ground node that *EQUATIONs
+    # keep on the DOF's line. A DASHPOT2's DOF line stopped ccx ('the damping coefficient may
+    # depend on temperature and frequency only').
+    u = review_run(dashpot1_ground_deck(), "dashpot1_ground", dat_displacements)
+    ok = bool(u) and all(n in u for n in (1, 2, 3, 5))
+    if ok:
+        c30, s30, r = math.cos(math.radians(30)), math.sin(math.radians(30)), math.sqrt(0.5)
+        along, across = 0.2 - (1.0 - math.exp(-20.0)) / 100.0, 2.0
+        got = {"ORIENTATION": (_dot(u[1], (c30, s30, 0.0)), _dot(u[1], (0.0, 0.0, 1.0)), _dot(u[1], (-s30, c30, 0.0))),
+               "*TRANSFORM": (_dot(u[2], (-r, r, 0.0)), _dot(u[2], (r, r, 0.0)), u[2][2]),
+               "global": (u[3][2], u[3][0], u[3][1]), "DASHPOT2": (u[5][0], across, 0.0)}
+        err = max(max(abs(a - along), abs(b - across), abs(z)) for a, b, z in got.values())
+        ok = err < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  dashpot1_ground (DASHPOT1 along an ORIENTATION axis, a *TRANSFORM "
+              f"axis and a global DOF, and a DASHPOT2, c = 10, unit masses, *DYNAMIC NLGEOM): along each "
+              f"dashpot {', '.join(f'{v[0]:.6f}' for v in got.values())} (t/10 - (1 - e^-10t)/100 = "
+              f"{along:.6f}), across {got['global'][1]:.6f} ({across:g}); {err:.1e} off")
+    else:
+        print("FAIL  dashpot1_ground: no displacements of the four masses")
+    failures += 0 if ok else 1
+
+    # DASHPOT1, SPRING1 and a GAPUNI's closure direction in rotated instances, under NLGEOM
+    # (Abaqus turns them with the instance, and keeps the directions fixed in space; the
+    # converter dropped DASHPOT1 and kept the gap's part direction): each turned instance's
+    # node moves R u of the unturned one's at every printed increment
+    def point_history(dat):
+        out = {}
+        for _, title, s, _, rows in A.dat_blocks(dat):
+            if title.startswith("displacements") and rows:
+                out.setdefault(s, []).append(rows[0][1:])
+        return out
+    for kind, what, want in (("dashpot", "a mass on a SPRING1 and two DASHPOT1, *DYNAMIC", (None, 0.09, 0.0475)),
+                             ("gap", "SPRING1s and a GAPUNI of clearance 0.02, *STATIC", (0.01, 0.02, 0.02))):
+        deck, rots = rotated_instance_point_deck(kind)
+        hist = review_run(deck, f"rotated_instance_{kind}", point_history)
+        base = (hist or {}).get("I0_M", [])
+        ok = bool(base) and all(len(hist.get(f"{n}_M", [])) == len(base) for n in ("I1", "I2"))
+        if ok:
+            errs = {n: max(abs(a - b) for u0, u in zip(base, hist[f"{n}_M"]) for a, b in zip(u, rots[n](u0)))
+                    for n in ("I1", "I2")}
+            end = base[-1]
+            # the unturned node's end: the dashpots' t/10 - (1 - e^-10t)/100 and t/20 -
+            # (1 - e^-20t)/400 (5e-5 off at dt 0.005), the gap's clearance and the springs' F/k
+            near = max(abs(a - w) for a, w in zip(end, want) if w is not None)
+            ok = max(errs.values()) < 1e-6 * max(abs(x) for x in end) and near < 2e-4
+            print(f"{'PASS' if ok else 'FAIL'}  rotated_instance_{kind} ({what}, NLGEOM, in instances turned 90 "
+                  f"degrees about x and 40 about (1, 2, 3)): the node moves R u of the unturned instance's at "
+                  f"each of {len(base)} increments ({errs['I1']:.1e} / {errs['I2']:.1e} apart), the unturned "
+                  f"one to {', '.join(f'{x:.5f}' for x in end)} ({near:.1e} off "
+                  f"{', '.join('-' if w is None else f'{w:g}' for w in want)})")
+        else:
+            print(f"FAIL  rotated_instance_{kind}: no displacement history of the three instances' node")
+        failures += 0 if ok else 1
+
+    # a part's *DISTRIBUTING that releases a moment and a HINGE connector without an
+    # orientation, in rotated instances (Abaqus: the part's axes; the converter kept the global
+    # ones: 30 % / 41 % of max |u| off)
+    deck, rots = rotated_instance_constraints_deck()
+    tabs = review_run(deck, "rotated_instance_constraints", instance_tables)
+    ok = bool(tabs)
+    if ok:
+        base = tabs.get("I0_BODY", {})
+        scale = max((abs(x) for v in base.values() for x in v), default=0.0)
+        errs = {}
+        for name in ("I1", "I2"):
+            got = tabs.get(f"{name}_BODY", {})
+            errs[name] = max(abs(a - c) for n0, n in zip(sorted(base), sorted(got))
+                             for a, c in zip(got[n], rots[name](base[n0]))) \
+                if len(got) == len(base) == 10 else math.inf
+        ok = scale > 1e-3 and max(errs.values()) < 1e-6 * scale
+        print(f"{'PASS' if ok else 'FAIL'}  rotated_instance_constraints (a part's *DISTRIBUTING of DOFs 1-5 "
+              f"and a HINGE connector between two cubes' couplings, in instances turned 90 degrees about x "
+              f"and 40 about (1, 2, 3)): their 10 nodes move R u of the unturned instance's (max |u| "
+              f"{scale:.3g}; {errs['I1']:.1e} / {errs['I2']:.1e} apart)")
     failures += 0 if ok else 1
 
     # --- indented keyword lines and abbreviations, read as Abaqus reads them: a free cube

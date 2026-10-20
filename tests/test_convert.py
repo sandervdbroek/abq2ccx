@@ -4459,6 +4459,123 @@ def test_part_section_options_follow_their_section():
     assert "*HOURGLASS STIFFNESS" in next(ln for ln in lines[at + 1:] if ln.startswith("*"))
 
 
+ROT_PART2 = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n6, 1., 0., 1.\n"
+             "7, 1., 1., 1.\n8, 0., 1., 1.\n9, 0.5, 0.5, 2.\n10, 2., 0., 0.\n11, 2., 0., 0.\n12, 3., 0., 0.\n"
+             "*Element, type=C3D8, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*Solid Section, elset=E, material=M\n"
+             "*Element, type=GAPUNI, elset=G\n2, 10, 11\n*Gap, elset=G\n0.1, 1., 0., 0., 2.\n"
+             "*Element, type=DASHPOT1, elset=D1\n3, 12\n*Dashpot, elset=D1\n2\n10.\n"
+             "*Element, type=CONN3D2, elset=CN\n4, 9, 12\n*Connector Section, elset=CN\nHinge,\n"
+             "*Surface, name=TOP\nE, S2\n*Coupling, constraint name=C, ref node=9, surface=TOP\n*Distributing\n"
+             "1, 5\n")
+
+
+def test_rotated_instance_turns_gaps_dashpots_and_constraint_axes():
+    # a GAPUNI's closure direction, a DASHPOT1's DOF, a *DISTRIBUTING's released moment and a
+    # HINGE without node a's orientation are in the part's axes: they kept the global ones
+    # (validate_with_ccx.py rotated_instance_gap / _dashpot / _constraints)
+    nl = ROT_TAIL + "*Step, nlgeom\n*Static\n*End Step\n"      # (keeps ccx's distributing card)
+    body, conv, rep = convert_str(_instanced(ROT_PART2, "0., 0., 0., 1., 0., 0., 90.", tail=nl))
+    # 90 degrees about x: part x stays (the gap, the hinge), part y is global z, part z global -y
+    assert "*GAP, ELSET=I_G\n0.1, 1, 0, 0, 2.\n" in body and "ABQ2CCX_AXES" not in body
+    assert "*COUPLING, CONSTRAINT NAME=I_C, REF NODE=9, SURFACE=I_TOP\n*DISTRIBUTING\n1, 3\n4, 4\n6, 6\n" in body
+    assert "*DASHPOT, ELSET=I_D1\n10.\n" in body                # (the DOF line goes: _plan_dashpots)
+    assert "*EQUATION\n1\n13, 3, 1\n*EQUATION\n2\n13, 2, 1, 12, 2, -1\n" in body   # ground node on z
+    assert conv.geom.nodes[13] == (3.0, 0.0, -math.sqrt(14.0)) and conv.geom.elements[3] == ("DASHPOTA", [12, 13])
+    assert "couplings of some DOFs and DASHPOT1 elements are turned with it" in rep.text()
+    # 30 degrees about z: the instance's axes; the gap's direction cosines turned, its area kept
+    moment = ROT_TAIL + "*Step\n*Static\n*Cload\nI.9, 4, 1.\n*End Step\n"     # (node 9's rotation used)
+    body, conv, rep = convert_str(_instanced(ROT_PART2, "0., 0., 0., 0., 0., 1., 30.", tail=moment))
+    assert "*GAP, ELSET=I_G\n0.1, 0.866025404, 0.5, 0, 2.\n" in body
+    c, s = math.cos(math.radians(30.0)), 0.5
+    near = lambda vs, ws: all(abs(a - b) < 1e-12 for v, w in zip(vs, ws) for a, b in zip(v, w))  # noqa: E731
+    plans = list(conv._dist_plans.values())
+    assert len(plans) == 1 and plans[0]["rots"] == [4, 5] and near(plans[0]["axes"], [(c, s, 0.0), (-s, c, 0.0)])
+    hinge = next(it for sec in conv._conn_plan.values() for it in sec["items"])
+    assert near([hinge["e1"]], [(c, s, 0.0)])
+    g = conv.geom.elements[3][1][1]                                          # (the ground node)
+    assert f"*EQUATION\n2\n{g}, 2, 0.866025403784, {g}, 1, -0.5\n" in body      # u_g . R e2 = 0
+    assert "REVOLUTE / HINGE connectors without an orientation of node a" in rep.text()
+    assert conv.reduced_physics == []
+    # a release the rotation keeps (about z: rotations 4, 5 stay 4, 5) and an unturned hinge
+    body, conv, _ = convert_str(_instanced(ROT_PART2, "0., 0., 0., 0., 0., 1., 90.", tail=nl))
+    assert "SURFACE=I_TOP\n*DISTRIBUTING\n1, 5\n" in body and "ABQ2CCX_AXES" not in \
+        body.split("*CONNECTOR")[0].split("*COUPLING")[-1]
+
+
+def test_assembly_transform_at_a_turned_part_equation_warned():
+    # Abaqus allows one *TRANSFORM per node; at a node that only the assembly transforms it
+    # does not document which axes a rotated part's equation means there
+    part = ROT_PART.format(nl="", sp2="1, 1", coupling="")
+    tail = ("*Nset, nset=AT, instance=I\n5\n*Transform, nset=AT\n0., 1., 0., -1., 0., 0.\n")
+    deck = _instanced(part, "0., 0., 0., 1., 0., 0., 90.", tail=ROT_TAIL).replace(
+        "*End Instance\n*End Assembly\n", "*End Instance\n" + tail + "*End Assembly\n")
+    _, conv, rep = convert_str(deck)
+    assert "an assembly-level *TRANSFORM acts at a node of its part's *EQUATION (e.g. node 5)" in rep.text()
+    assert conv.reduced_physics == []
+    _, _, rep = convert_str(deck.replace("0., 0., 0., 1., 0., 0., 90.", "0., 0., 0., 1., 0., 0., 0."))
+    assert "assembly-level *TRANSFORM" not in rep.text()              # (an unturned part: no question)
+
+
+def test_dashpot1_to_a_ground_node_on_its_line():
+    # DASHPOT1 (one node) was read as a 2-node element and dropped with its set; the *DASHPOT
+    # DOF line of DASHPOT1 / DASHPOT2 stopped ccx in a *DYNAMIC step (validate_with_ccx.py
+    # dashpot1_ground)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 2., 0., 0.\n3, 0., 1., 0.\n*Element, type=DASHPOT1, elset=D1\n11, 1\n"
+            "*Dashpot, elset=D1, orientation=OR\n1\n10.\n*Orientation, name=OR\n0.6, 0.8, 0., -0.8, 0.6, 0.\n"
+            "*Element, type=DASHPOT2, elset=D2\n12, 2, 3\n*Dashpot, elset=D2\n1, 1\n10.\n"
+            "*Element, type=DASHPOT1, elset=D4\n13, 3\n*Dashpot, elset=D4\n5\n10.\n"
+            "*Element, type=MASS, elset=EM\n14, 1\n*Mass, elset=EM\n1.\n"
+            "*Step, nlgeom\n*Dynamic\n0.1, 1.\n*Cload\n1, 1, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    span = math.sqrt(5.0)
+    assert conv.geom.elements[11] == ("DASHPOTA", [1, 4])
+    assert all(abs(a - b) < 1e-12 for a, b in zip(conv.geom.nodes[4], (-0.6 * span, -0.8 * span, 0.0)))
+    # u_4 . v = 0, u_4 . w = u_1 . w for the two w normal to v = (0.6, 0.8, 0)
+    assert "*EQUATION\n2\n4, 2, 0.8, 4, 1, 0.6\n" in body and "\n4, 3, -1, 1, 3, 1\n" in body
+    assert "*DASHPOT, ELSET=D1\n10.\n" in body and "*DASHPOT, ELSET=D2\n10.\n" in body
+    # a rotational DASHPOT1: left out with its set member, warned
+    assert 13 not in conv.geom.elements and "DASHPOT1 element(s) 13 left out: its DOF 5 is a rotation" in rep.text()
+    assert conv.reduced_physics == ["DASHPOT1 element left out", "element DASHPOT2 -> DASHPOTA"]
+    # where a step solves for temperatures the ground node's is tied to its node's (free, it
+    # stopped ccx: exit 255)
+    body, conv, _ = convert_str(deck.replace("*Dynamic\n0.1, 1.\n", "*Coupled Temperature-displacement\n0.1, 1.\n"))
+    assert "*EQUATION\n2\n4, 11, 1, 1, 11, -1\n" in body
+
+
+def test_anisotropic_point_mass_written_as_ccx_reads_it():
+    # ccx 2.23 reads TYPE=ANISOTROPIC's first value as an isotropic mass (probed): it was
+    # passed through without a word
+    deck = ("*Node\n1, 0., 0., 0.\n*Element, type=MASS, elset=EM\n1, 1\n"
+            "*Mass, elset=EM, type=ANISOTROPIC, orientation=OR\n1., 4., 9.\n*Boundary\n1, 1, 3\n")
+    body, conv, rep = convert_str(deck)
+    assert "*MASS, ELSET=EM\n1.\n" in body and "ANISO" not in body.split("*MASS")[1]
+    assert conv.reduced_physics == ["*MASS, TYPE=ANISOTROPIC written as an isotropic mass"]
+    body, conv, rep = convert_str(deck.replace("1., 4., 9.", "2., 2., 2."))
+    assert "*MASS, ELSET=EM\n2.\n" in body and conv.reduced_physics == []
+    assert "three equal principal masses written as the isotropic mass" in rep.text()
+
+
+def test_oriented_couplings_under_nlgeom():
+    # an oriented kinematic coupling of some translations under NLGEOM: Abaqus turns its axes with
+    # the reference node, ccx 2.23 does not (probed); a kept *DISTRIBUTING card with an
+    # ORIENTATION reads its reference node's loads in those axes (probed)
+    deck = (HEX + "*Node\n9, 0.5, 0.5, 2.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=EALL, material=M\n*Orientation, name=OR\n0.6, 0.8, 0., -0.8, 0.6, 0.\n"
+            "*Surface, name=TOP\nEALL, S2\n*Coupling, constraint name=C, ref node=9, surface=TOP, "
+            "orientation=OR\n*Kinematic\n1, 2\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+            "*Step, nlgeom\n*Static\n*Cload\n9, 1, 1.\n*End Step\n")
+    _, conv, rep = convert_str(deck)
+    assert conv.reduced_physics == ["oriented kinematic coupling of some translations under NLGEOM"]
+    _, conv, _ = convert_str(deck.replace("*Kinematic\n1, 2\n", "*Kinematic\n1, 3\n"))
+    assert conv.reduced_physics == []
+    _, conv, _ = convert_str(deck.replace("*Step, nlgeom", "*Step"))
+    assert conv.reduced_physics == []
+    _, conv, rep = convert_str(deck.replace("*Kinematic\n1, 2\n", "*Distributing\n1, 5\n"))
+    assert "with an ORIENTATION: ccx 2.23 then reads the reference node's loads in the orientation's axes" \
+        in rep.text()
+    assert "*CLOAD on the reference node of an oriented *DISTRIBUTING card read in its axes" in conv.reduced_physics
+
+
 def test_pretension_node_and_element_sets_resolved():
     # Abaqus takes NODE= as a node number or a set of exactly that node, ELEMENT= (a truss or
     # beam cut) likewise; ccx 2.23 stops on a set name there ('*ERROR reading *PRE-TENSION

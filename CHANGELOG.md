@@ -6,6 +6,19 @@ physics.
 
 ## Unreleased
 
+* **`DASHPOT1`, and more part data in rotated instances** — a `DASHPOT1` (a node's DOF to
+  ground) was read as a 2-node element and dropped with its set, so ccx stopped on its
+  `*DASHPOT`. It is now a `DASHPOTA` to a new ground node that `*EQUATION`s keep on the DOF's
+  line: exact, also under `NLGEOM` (probed). The `*DASHPOT` DOF line of `DASHPOT1` /
+  `DASHPOT2` is dropped; ccx read it as a coefficient and stopped in a `*DYNAMIC` step. In a
+  rotated instance, a `*GAP` closure direction, a `DASHPOT1` DOF, the moments a `*DISTRIBUTING`
+  releases and the axis of a `HINGE` / `REVOLUTE` without an orientation now turn with the
+  part. A warning comes where an assembly `*TRANSFORM` sits on a node of a turned part
+  `*EQUATION` (Abaqus does not document it). `*MASS, TYPE=ANISOTROPIC` is written as the
+  isotropic M11 that ccx reads, as reduced physics unless all three are equal. Two NLGEOM
+  cases count as reduced physics: an oriented coupling of some translations (ccx does not turn
+  its axes) and a kept `*DISTRIBUTING` card with an `ORIENTATION` whose reference node is
+  loaded (ccx reads those loads in its axes).
 * **Two rotational BCs on a shell node** — ccx 2.23 then holds both rotations in the shell
   plane, so also the third, free one where its axis is not the normal: `ZSYMM` on half a
   cylindrical panel was 52-63 % off the whole panel. Where the free axis lies in the shell

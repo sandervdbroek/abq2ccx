@@ -112,7 +112,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `DASHPOT1` | 2 | → `DASHPOTA` (substituted: reduced physics) |
+| `DASHPOT1` | 1 | → `DASHPOTA` to a new ground node that `*EQUATION`s keep on its DOF's line (exact, also under `NLGEOM`); on a rotational DOF left out (reduced physics) |
 | `DASHPOT2` | 2 | → `DASHPOTA` (substituted: reduced physics) |
 | `DASHPOTA` | 2 | direct |
 | `DCOUP3D` | 1 | direct |
