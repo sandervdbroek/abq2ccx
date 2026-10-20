@@ -15625,7 +15625,7 @@ class Converter:
                              "nodes (ccx takes either an NSET or an ELSET, not both).", once=True)
         # written as linear *EQUATIONs (_rigid_body_lines), as the planners saw it
         ref0 = self._ref_node(b)
-        rot0 = self._first_node(b.param("ROT NODE") or "")
+        rot0 = self._rot_node(b)
         eq = self._rigid_as_eq(ref0, self._rb_rot_synth.get(ref0) if rot0 is None else rot0, tie + pin)
         if b.param("PIN NSET") or b.param("TIE NSET"):
             self.report.note(("*RIGID BODY, PIN/TIE NSET: the" if eq else
@@ -22585,10 +22585,8 @@ class Converter:
         # its DOF 8; ccx has no fluid cavity (the card is commented out)
         self._cavity_refs = {}
         for b in blocks:
-            if b.keyword == "FLUID CAVITY":
-                ref = (b.param("REF NODE") or "").strip()
-                for n in self._resolve_nodes(ref) if ref else []:
-                    self._cavity_refs[n] = (b.param("NAME") or "").strip() or "(unnamed)"
+            if b.keyword == "FLUID CAVITY" and self._ref_node(b) is not None:
+                self._cavity_refs[self._ref_node(b)] = (b.param("NAME") or "").strip() or "(unnamed)"
         # nodes that only belong to plane-stress/strain/axisymmetric continuum elements:
         # they have no rotational DOFs at all — unless they are the reference/rotation node
         # of a rigid body or coupling, which carries the body's rotations (the C3D8I slabs of
@@ -22606,11 +22604,9 @@ class Converter:
         self._ref_nodes = set(mpc_refs)
         for b in blocks:
             if b.keyword in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
-                for k, v in b.params.items():
-                    if k in ("REF NODE", "ROT NODE") and v:
-                        refs = self._resolve_nodes(v.strip())[:1]
-                        self._plane_only.difference_update(refs)
-                        self._ref_nodes.update(refs)
+                refs = {self._ref_node(b), self._rot_node(b)} - {None}
+                self._plane_only.difference_update(refs)
+                self._ref_nodes.update(refs)
         # ... and with truss nodes: the nodes without rotational DOFs, where Abaqus ignores a
         # rotational BC (_active_dof_lines)
         self._no_rot = {n for n, p in no_rot.items() if p} - self._ref_nodes
@@ -22624,13 +22620,11 @@ class Converter:
         for b in blocks:
             if b.keyword != "RIGID BODY":
                 continue
-            refs = self._resolve_nodes((b.param("REF NODE") or "").strip())
-            if not refs or refs[0] in self._rb_rot:
+            ref, rot = self._ref_node(b), self._rot_node(b)
+            if ref is None or ref in self._rb_rot:
                 continue
-            ref = refs[0]
-            rots = self._resolve_nodes((b.param("ROT NODE") or "").strip())
-            if rots:
-                self._rb_rot[ref] = rots[0]
+            if rot is not None:
+                self._rb_rot[ref] = rot
                 continue
             next_id += 1
             self.geom.add_node(next_id, self.geom.nodes.get(ref, (0.0, 0.0, 0.0)))
@@ -23236,9 +23230,7 @@ class Converter:
         refs: set = set()
         for b in blocks:
             if b.keyword in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
-                for k, v in b.params.items():
-                    if k in ("REF NODE", "ROT NODE") and v:
-                        refs.update(self._resolve_nodes(v.strip())[:1])
+                refs.update({self._ref_node(b), self._rot_node(b)} - {None})
             elif b.keyword == "MPC" and not b.has("USER"):
                 for f in self._mpc_fields(b):
                     if f[0].upper() == "BEAM":
@@ -24185,7 +24177,7 @@ class Converter:
                 tie, pin = self._rigid_body_members(b)
                 if ref is None or not any(n in structural for n in tie + pin + [ref]):
                     continue
-                rot = self._first_node(b.param("ROT NODE") or "")
+                rot = self._rot_node(b)
                 eq = self._rigid_as_eq(ref, self._rb_rot_synth.get(ref) if rot is None else rot,
                                        tie + pin)
                 knots += needed(ref, [(tie, {1, 2, 3, 4, 5, 6}), (pin, {1, 2, 3})],
@@ -24651,7 +24643,7 @@ class Converter:
             plan = (self._coupling_plan.get(id(b)) or {}).get("kind")
             if b.keyword == "RIGID BODY":
                 kind, tied, rb = "rb", True, True
-                rot = self._first_node(b.param("ROT NODE") or "")
+                rot = self._rot_node(b)
                 tie, pin = self._rigid_body_members(b)
                 lines = [(tie, set(range(1, 7))), (pin, {1, 2, 3})]
                 emit = body_emit(ref, rot if rot is not None else self._rb_rot_synth.get(ref),
@@ -25183,6 +25175,10 @@ class Converter:
         """The reference node of a *RIGID BODY, *COUPLING or *KINEMATIC COUPLING (REF NODE=;
         parse_keyword_line maps the blank-free REFNODE= to it)."""
         return self._first_node(b.param("REF NODE") or "")
+
+    def _rot_node(self, b: Block) -> Optional[int]:
+        """The ROT NODE of a *RIGID BODY, *COUPLING or *KINEMATIC COUPLING (None if not given)."""
+        return self._first_node(b.param("ROT NODE") or "")
 
     def _rigid_body_members(self, b: Block) -> Tuple[List[int], List[int]]:
         """(tie, pin) members of an Abaqus *RIGID BODY: TIE NSET and ELSET nodes move with
