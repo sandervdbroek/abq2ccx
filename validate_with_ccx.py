@@ -2010,7 +2010,7 @@ def ic_temperature_cards_deck():
     return "\n".join(lines) + "\n"
 
 
-def mesh_generation_ring_deck(generated=True, nr=4, nt=8, a=1.0, b=2.0, h=0.1, p=1.0):
+def mesh_generation_ring_deck(generated=True, nr=4, nt=8, a=1.0, b=2.0, h=0.1, p=1.0, skew=0.0):
     """A quarter annulus a < r < b of C3D8 (nr x nt elements, thickness h; the planes x = 0 and
     y = 0 held normal, every node in z: plane strain; E 1000, nu 0.3) under an internal pressure
     p.  ``generated``: the mesh comes from Abaqus' generation cards with blank (default) fields
@@ -2018,7 +2018,9 @@ def mesh_generation_ring_deck(generated=True, nr=4, nt=8, a=1.0, b=2.0, h=0.1, p
     outer one backwards, its normal in 8-10), the radial lines by *NFILL with the default
     increment, the top face by *NCOPY, MULTIPLE (translated once, then turned nt + 1 times
     from a seed line at -90 / nt degrees) and the elements by *ELGEN with blank increments.
-    Otherwise every node and element is listed, at the same places."""
+    ``skew``: each arc's end nodes at r (1 -/+ skew), which Abaqus moves radially onto one
+    circle (their mean distance, r: "Node definition").  Otherwise every node and element is
+    listed, at the same places."""
     def bot(k, r):
         return 1 + 10 * k + r
 
@@ -2031,8 +2033,9 @@ def mesh_generation_ring_deck(generated=True, nr=4, nt=8, a=1.0, b=2.0, h=0.1, p
     lines = ["*Heading", "Quarter annulus under internal pressure, plane strain"]
     if generated:
         dth = 90.0 / nt
-        lines += ["*Node", f"{bot(0, 0)}, {a}, 0., 0.", f"{bot(nt, 0)}, 0., {a}, 0.",
-                  f"{bot(0, nr)}, {b}, 0., 0.", f"{bot(nt, nr)}, 0., {b}, 0.",
+        lo, hi = 1.0 - skew, 1.0 + skew
+        lines += ["*Node", f"{bot(0, 0)}, {a * lo!r}, 0., 0.", f"{bot(nt, 0)}, 0., {a * hi!r}, 0.",
+                  f"{bot(0, nr)}, {b * hi!r}, 0., 0.", f"{bot(nt, nr)}, 0., {b * lo!r}, 0.",
                   "*Ngen, line=C, nset=INNER", f"{bot(0, 0)}, {bot(nt, 0)}, 10, , 0., 0., 0.",
                   "*Ngen, line=C, nset=OUTER", f"{bot(nt, nr)}, {bot(0, nr)}, -10, , 0., 0., 0., 0., 0., -1.",
                   "*Nfill, nset=BOT", f"INNER, OUTER, {nr}", "*Node, nset=SEED"]
@@ -7275,6 +7278,24 @@ def main():
               f"with the mesh listed ({err:.1e} apart, largest {moved:.4g}); radial displacements "
               f"{lame[0][1]:.5g} and {lame[1][1]:.5g} at r = a, b vs Lame {lame[0][0]:.5g} and "
               f"{lame[1][0]:.5g} ({off:.1%} off)")
+        failures += 0 if ok else 1
+    # *NGEN, LINE=C end nodes at unequal distances from the centre move radially onto one
+    # circle (Abaqus "Node definition"); the arcs were spirals between them, off the top face
+    u = faithful_run(mesh_generation_ring_deck(skew=0.05), "ngen_arc_radial_ends")
+    if u is None or None in runs:
+        failures += 1
+    else:
+        t = runs[1]
+        moved = max(abs(x) for v in u.values() for x in v)
+        err = ccx_ratio(max(abs(x - y) for n in t for x, y in zip(u.get(n, [math.inf] * 3), t[n])), moved)
+        ends = [(1.3 / 3000.0 * (0.4 * r + 4.0 / r), u.get(n, [math.inf])[0]) for n, r in ((1, 1.0), (5, 2.0))]
+        off = max(abs(got / want - 1) for want, got in ends)
+        ok = err < 1e-9 and moved > 1e-3 and off < 0.02
+        print(f"{'PASS' if ok else 'FAIL'}  ngen_arc_radial_ends (the quarter annulus of "
+              f"mesh_generation_fields with each *NGEN arc's end nodes at r (1 -/+ 0.05)): every "
+              f"displacement as with the mesh listed on the circles r = a, b ({err:.1e} apart, largest "
+              f"{moved:.4g}); radial displacements {ends[0][1]:.5g} and {ends[1][1]:.5g} at the moved "
+              f"end nodes vs Lame {ends[0][0]:.5g} and {ends[1][0]:.5g} ({off:.1%} off)")
         failures += 0 if ok else 1
     # *NCOPY, POLE: the pole node number (or the pole's coordinates) was read as a translation
     u = faithful_run(ncopy_pole_deck(), "ncopy_pole")

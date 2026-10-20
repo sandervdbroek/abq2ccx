@@ -1179,6 +1179,86 @@ def test_ngen_parabola_through_midside_point():
     # a midside node the deck does not define: the line is not generated
     _, conv, rep = convert_str(deck.replace("1, 5, 1, 100", "1, 5, 1, 99"))
     assert "*NGEN LINE=P: the midside node is missing" in rep.text() and 3 not in conv.geom.nodes
+    assert conv.reduced_physics == ["*NGEN line skipped (its nodes not generated)"]
+
+
+def test_ngen_skipped_lines_are_reduced_physics():
+    # a skipped *NGEN line leaves its nodes out of the model: reduced physics, not only a warning
+    ends = "*NODE\n1, 0., 0., 0.\n10, 9., 0., 0.\n"
+    for card, warned in (("*NGEN\n1\n", "*NGEN record needs two end nodes"),
+                         ("*NGEN\n1, 12\n", "*NGEN endpoints 1,12 not both defined"),
+                         ("*NGEN, LINE=C\n1, 10, 1, 99\n", "*NGEN LINE=C: the centre node is missing"),
+                         ("*NGEN\n10, 1\n", "*NGEN endpoints 10,1 with increment 1 generated no nodes")):
+        _, conv, rep = convert_str(ends + card)
+        assert warned in rep.text(), (card, rep.text())
+        assert sorted(conv.geom.nodes) == [1, 10]
+        assert conv.reduced_physics == ["*NGEN line skipped (its nodes not generated)"], card
+    # adjacent end nodes have no node between them to lose
+    _, conv, rep = convert_str("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*NGEN\n2, 1\n")
+    assert "generated no nodes" in rep.text() and conv.reduced_physics == []
+
+
+def test_ngen_arc_end_nodes_move_radially():
+    # Abaqus "Node definition": "The coordinates of the end nodes will be adjusted radially if
+    # the circle cannot be passed through both points" (the radius is not given): both end
+    # nodes move onto their mean distance, and the arc keeps that radius (it was a spiral)
+    deck = "*NODE\n1, 1., 0., 0.\n11, 0., 1.2, 0.\n100, 0., 0., 0.\n*NGEN, LINE=C, NSET=A\n1, 11, 1, 100\n"
+    _, conv, rep = convert_str(deck)
+    g = conv.geom.nodes
+    assert g[1] == (1.1, 0.0, 0.0) and abs(g[11][1] - 1.1) < 1e-15 and g[11][0] == 0.0
+    assert all(abs(math.hypot(*g[n][:2]) - 1.1) < 1e-12 for n in range(1, 12))
+    assert abs(math.degrees(math.atan2(g[6][1], g[6][0])) - 45.0) < 1e-9
+    assert "*NGEN LINE=C: 1 line(s) with end nodes at unequal distances from the centre (nodes " \
+           "1, 11: 1, 1.2)" in rep.text() and conv.reduced_physics == []
+    # within a relative 1e-6 (rounded coordinates) the end nodes stay, without a word
+    _, conv, rep = convert_str(deck.replace("0., 1.2, 0.", "0., 1.0000001, 0."))
+    assert conv.geom.nodes[1] == (1.0, 0.0, 0.0) and conv.geom.nodes[11] == (0.0, 1.0000001, 0.0)
+    assert "unequal distances" not in rep.text()
+
+
+def test_generate_lines_read_by_position():
+    # one reader (expand_generate) for every *NSET / *ELSET, GENERATE line, by position: a blank
+    # or 0 increment is 1, a negative one counts down; a blank first or last skips the line
+    assert A.expand_generate(["1", "9", ""]) == A.expand_generate(["1", "9", "0"]) == list(range(1, 10))
+    assert A.expand_generate(["9", "1", "-4"]) == [9, 5, 1] and A.expand_generate(["1", "7", "3", "99"]) == [1, 4, 7]
+    for bad in (["1", "", "4"], ["", "4"], ["5"], ["1", "<n>"]):
+        try:
+            A.expand_generate(bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    # the handler: the blank last member was compacted away (1, , 4 read as 1 to 4)
+    _, conv, rep = convert_str("*NODE\n1, 0., 0., 0.\n*NSET, NSET=A, GENERATE\n1, , 4\n9, 1, -4\n")
+    assert conv.geom.nset("A") == [9, 5, 1]
+    assert "Skipped a *NSET, GENERATE line (set A) with a blank first or last member" in rep.text()
+    assert conv.reduced_physics == ["*NSET, GENERATE line (set A) with a blank first or last member skipped"]
+    # ... in an instance too (the flattener hands the line to the handler)
+    _, conv, rep = convert_str("*Part, name=P\n*Node\n1, 0., 0., 0.\n*End Part\n*Assembly, name=A\n"
+                               "*Instance, name=I, part=P\n*End Instance\n"
+                               "*Nset, nset=S, instance=I, generate\n1, , 4\n*End Assembly\n")
+    assert "with a blank first or last member" in rep.text() and conv.geom.nset("S") == []
+    # the planners: the emitted deck's sets (EmittedSets), the results digest (_deck_steps)
+    # and the equation planner's handler-written sets read the same, where they read
+    # increment 0 as an error, a descending run as nothing and a line without its increment
+    # (two fields) as nothing
+    lines = ["*NODE", "1, 0., 0., 0.", "*NSET, NSET=G, GENERATE", "6, 2, -2", "1, 3, 0", "*NSET, NSET=H, GENERATE", "1, 3"]
+    sets = A.EmittedSets().read(A.EmittedDeck(lines))
+    assert sets.members("NSET", "G") == [6, 4, 2, 1, 2, 3] and sets.members("NSET", "H") == [1, 2, 3]
+    d = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines + ["*STEP", "*STATIC", "*BOUNDARY", "G, 1, 1", "*END STEP"]) + "\n")
+        assert A._deck_steps(os.path.join(d, "job.inp"))["steps"][0]["held"] == {n: {1} for n in (1, 2, 3, 4, 6)}
+    finally:
+        shutil.rmtree(d)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 3., 0., 0.\n*Element, type=T3D2, "
+            "elset=E\n1, 1, 2\n2, 2, 3\n3, 3, 4\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n4, 1, 1.\n*End Step\n")
+    _, conv, _ = convert_str(deck)
+    out = conv._settle_dependents(A.EmittedDeck(
+        ["*NODE", "2, 1., 0., 0.", "4, 3., 0., 0.", "*NSET, NSET=ABQ2CCX_GEN, GENERATE", "2, 3",
+         "*EQUATION", "2", "2, 1, 1., 4, 1, -1.", "*STEP", "*STATIC", "*BOUNDARY", "ABQ2CCX_GEN, 1, 1",
+         "*END STEP"]))
+    assert "4, 1, -1., 2, 1, 1." in out.lines        # node 2's held DOF 1 is not eliminated
 
 
 def test_nfill_bias_and_unsupported_options():

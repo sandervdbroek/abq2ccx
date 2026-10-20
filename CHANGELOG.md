@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **`*NGEN` arcs and skipped lines; GENERATE lines by position** — when a `LINE=C` arc's end
+  nodes lie at unequal distances from its centre, Abaqus moves them radially onto one circle.
+  Both now move onto their mean distance, with a warning (Abaqus' documentation does not give
+  the radius); the arc was a spiral between them. An `*NGEN` line skipped for a missing end
+  node or centre now counts as reduced physics. `*NSET` / `*ELSET, GENERATE` lines are read by
+  position everywhere: a line with a blank first or last member is skipped (it was compacted,
+  so `1, , 4` read as 1 to 4), and the planners read a negative or zero increment the way the
+  set handler does.
 * **More `*EQUATION`s held by BCs in some steps** — two more cases no longer stop ccx 2.23
   ('dependent side of a MPC and a SPC'). In the first, each step holds one DOF of the equation
   ("crossed" holds); the BC at zero moves onto the DOF that step leaves free. In the second,

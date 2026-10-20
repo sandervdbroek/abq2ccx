@@ -2016,17 +2016,17 @@ class Geometry:
         return self.elsets.get(name.upper(), [])
 
 
-def expand_generate(fields: List[str]) -> List[int]:
-    """``start, end[, inc]`` -> explicit list of ids.  ValueError for a malformed
-    (non-integer) field: the caller reports the line and goes on, as *NODE / *ELEMENT skip
+def expand_generate(fields: Sequence[str]) -> List[int]:
+    """A GENERATE data line (*NSET / *ELSET) ``first, last[, increment]`` -> its ids, read by
+    position (Abaqus 2017 Keywords: the increment's default is 1; here a blank or 0 one is 1,
+    a negative one counts down); fields after the third are not read.  The one reader of these
+    lines, for the handlers and the planners alike.  ValueError for a blank first or last or
+    a non-integer field: the caller reports the line and goes on, as *NODE / *ELEMENT skip
     one bad line rather than abort the file."""
-    nums = [int(float(f)) for f in fields if f != ""]
-    if len(nums) == 2:
-        start, end, inc = nums[0], nums[1], 1
-    elif len(nums) >= 3:
-        start, end, inc = nums[0], nums[1], nums[2]
-    else:
-        return nums
+    g = [x.strip() for x in fields[:3]] + ["", ""]
+    if not g[0] or not g[1]:
+        raise ValueError("a GENERATE line needs its first and last member")
+    start, end, inc = pint(g[0]), pint(g[1]), pint(g[2]) if g[2] else 1
     if inc == 0:
         inc = 1
     return list(range(start, end + (1 if inc > 0 else -1), inc))
@@ -2686,23 +2686,25 @@ def reflect_point(p: Vec, kind: str, data: Sequence[Vec]) -> Optional[Vec]:
 def _ngen_curve(kind: str, p1: Vec, p2: Vec, extra: Optional[Vec], normal: Optional[Vec]):
     """Point generator for one *NGEN line: straight, circular arc about the centre node
     (LINE=C) or parabola through the midside node at t=0.5 (LINE=P).  Returns a function
-    t -> point, or None when the curve is undefined (missing/degenerate extra node)."""
+    t -> point, or None when the curve is undefined (missing/degenerate extra node).  An
+    arc's radius is the end nodes' mean distance from the centre (expand_ngen moves them onto
+    it where they differ)."""
     if kind == "C":
         if extra is None:
             return None
         v1, v2 = vsub(p1, extra), vsub(p2, extra)
         r1, r2 = vnorm(v1), vnorm(v2)
         n = vunit(normal) if normal and vnorm(normal) > 0.0 else vunit(vcross(v1, v2))
-        if r1 == 0.0 or vnorm(n) == 0.0:
+        if r1 == 0.0 or r2 == 0.0 or vnorm(n) == 0.0:
             return None                     # 180-degree arc needs the normal on the card
         u1 = vscale(v1, 1.0 / r1)
         w = vcross(n, u1)
         theta = math.atan2(vdot(v2, w), vdot(v2, u1))
         if theta <= 0.0:
             theta += 2.0 * math.pi
+        radius = (r1 + r2) / 2.0
         return lambda t: vadd(extra, vscale(vadd(vscale(u1, math.cos(t * theta)),
-                                                 vscale(w, math.sin(t * theta))),
-                                            r1 + t * (r2 - r1)))
+                                                 vscale(w, math.sin(t * theta))), radius))
     if kind == "P":
         if extra is None:
             return None
@@ -2711,11 +2713,12 @@ def _ngen_curve(kind: str, p1: Vec, p2: Vec, extra: Optional[Vec], normal: Optio
     return lambda t: vadd(vscale(p1, 1 - t), vscale(p2, t))
 
 
-def _skip_unreadable(report: Report, what: str) -> None:
+def _skip_unreadable(report: Report, what: str, why: str = "non-numeric data") -> None:
     """A mesh-generation record or card with a non-numeric field (an undefined <parameter>,
-    say) is skipped, as *NODE skips such a record: its nodes or elements are missing."""
-    report.warn(f"Skipped a {what} with non-numeric data; verify the deck.", once=True)
-    report.reduce(f"{what} with non-numeric data skipped")
+    say; ``why`` names other unreadable data) is skipped, as *NODE skips such a record: its
+    nodes or elements are missing."""
+    report.warn(f"Skipped a {what} with {why}; verify the deck.", once=True)
+    report.reduce(f"{what} with {why} skipped")
 
 
 def system_point(v: Sequence[float], system: str) -> Vec:
@@ -2738,16 +2741,25 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
     Fields by position (Abaqus 2017 Keywords *NGEN): the end nodes, the increment (blank: 1),
     the extra point's node (4) or, without one, its coordinates (5-7, in the SYSTEM= frame, a
     blank one 0: "the node number will take precedence over the coordinates"), and an arc's
-    normal (8-10).  Nodes are spaced evenly in arc angle / curve parameter."""
+    normal (8-10).  Nodes are spaced evenly in arc angle / curve parameter.  End nodes at
+    unequal distances from an arc's centre move radially onto their mean distance ("Node
+    definition": "The coordinates of the end nodes will be adjusted radially if the circle
+    cannot be passed through both points"; it does not give the radius).  A skipped line's
+    nodes are missing: reduced physics."""
     kind = (block.param("LINE") or "S").strip().upper()[:1]
     system = (block.param("SYSTEM") or "R").strip().upper()[:1]
     created: List[int] = []
+    moved: List[Tuple[int, int, float, float]] = []
+
+    def skip(msg: str, once: bool = True) -> None:
+        report.warn(msg, once=once)
+        report.reduce("*NGEN line skipped (its nodes not generated)")
     for rec in merged_data_records(block):
         if not rec:
             continue
         g = rec + [""] * 9
         if not g[0] or not g[1]:
-            report.warn("*NGEN record needs two end nodes; skipped.", once=True)
+            skip("*NGEN record needs two end nodes; skipped.")
             continue
         try:
             n1, n2 = pint(g[0]), pint(g[1])
@@ -2759,7 +2771,7 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
             _skip_unreadable(report, "*NGEN record")
             continue
         if n1 not in geom.nodes or n2 not in geom.nodes:
-            report.warn(f"*NGEN endpoints {n1},{n2} not both defined; skipped.")
+            skip(f"*NGEN endpoints {n1},{n2} not both defined; skipped.", once=False)
             continue
         p1, p2 = geom.nodes[n1], geom.nodes[n2]
         extra = None
@@ -2767,22 +2779,38 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
             extra = geom.nodes.get(nx) if nx is not None else point
         curve = _ngen_curve(kind, p1, p2, extra, normal)
         if curve is None:
-            report.warn(f"*NGEN LINE={kind}: the {'centre' if kind == 'C' else 'midside'} node "
-                        f"is missing or the arc is degenerate (a 180-degree arc needs the normal "
-                        f"on the data line); nodes {n1}..{n2} not generated.", once=True)
+            skip(f"*NGEN LINE={kind}: the {'centre' if kind == 'C' else 'midside'} node "
+                 f"is missing or the arc is degenerate (a 180-degree arc needs the normal "
+                 f"on the data line); nodes {n1}..{n2} not generated.")
             continue
         ids = list(range(n1, n2 + (1 if inc > 0 else -1), inc)) if inc else []
         if not ids:
-            report.warn(f"*NGEN endpoints {n1},{n2} with increment {inc} generated no nodes "
-                        f"(check the ordering/sign of the range); skipped.", once=True)
+            msg = (f"*NGEN endpoints {n1},{n2} with increment {inc} generated no nodes "
+                   f"(check the ordering/sign of the range); skipped.")
+            if abs(n2 - n1) > 1:            # nodes between them are missing
+                skip(msg)
+            else:
+                report.warn(msg, once=True)
             continue
+        if kind == "C":
+            r1, r2 = vnorm(vsub(p1, extra)), vnorm(vsub(p2, extra))
+            if abs(r1 - r2) > 1e-6 * max(r1, r2):
+                moved.append((n1, n2, r1, r2))
+                for nid, p, r in ((n1, p1, r1), (n2, p2, r2)):
+                    geom.add_node(nid, vadd(extra, vscale(vsub(p, extra), (r1 + r2) / (2.0 * r))))
         steps = len(ids) - 1
         for k, nid in enumerate(ids):
             if nid in (n1, n2):
-                created.append(nid)         # end nodes keep their own coordinates
+                created.append(nid)         # end nodes keep their coordinates (or move as above)
                 continue
             geom.add_node(nid, curve(k / steps if steps else 0.0))
             created.append(nid)
+    if moved:
+        n1, n2, r1, r2 = moved[0]
+        report.warn(f"*NGEN LINE=C: {len(moved)} line(s) with end nodes at unequal distances from "
+                    f"the centre (nodes {n1}, {n2}: {r1:.6g}, {r2:.6g}); Abaqus adjusts the end "
+                    f"nodes radially so that the circle passes through both (\"Node definition\", "
+                    f"which does not give the radius): both moved onto their mean distance.")
     if kind in ("C", "P"):
         report.note(f"*NGEN LINE={kind}: nodes spaced evenly in {'arc angle' if kind == 'C' else 'the parabola parameter'}.",
                     once=True)
@@ -5081,10 +5109,10 @@ class EmittedSets:
                 continue
             for rec in b.records():
                 f = [x for x in rec if x]
-                if b.has("GENERATE"):
+                if b.has("GENERATE") and f:
                     try:
-                        ids += range(pint(f[0]), pint(f[1]) + 1, pint(f[2]) if len(f) > 2 else 1)
-                    except (IndexError, ValueError):
+                        ids += expand_generate(rec)
+                    except ValueError:
                         return None
                     continue
                 for x in f:
@@ -6814,9 +6842,11 @@ class Converter:
                 continue
             if gen:
                 try:
-                    ids.extend(expand_generate(f))
+                    ids.extend(expand_generate(rec))
                 except ValueError:
-                    _skip_unreadable(self.report, f"*{b.keyword}, GENERATE line (set {name})")
+                    _skip_unreadable(self.report, f"*{b.keyword}, GENERATE line (set {name})",
+                                     "non-numeric data" if len(rec) > 1 and rec[0] and rec[1]
+                                     else "a blank first or last member")
             else:
                 for tok in f:
                     if re.fullmatch(r"[-+]?\d+", tok):
@@ -27655,13 +27685,15 @@ class Converter:
         for card in cards:
             kw, params = card.keyword, card.params
             if kw == "NSET" and (params.get("NSET") or "").upper() not in self.geom.nsets:
-                toks = [t for j in card.rows for t in fields(j) if t]
                 ids: List[int] = []
                 if "GENERATE" in params:
-                    for a, c, inc in zip(toks[0::3], toks[1::3], toks[2::3]):
-                        ids += list(range(pint(a), pint(c) + 1, max(pint(inc), 1)))
+                    for j in card.rows:
+                        try:
+                            ids += expand_generate(fields(j))
+                        except ValueError:          # a blank or unreadable line: no members
+                            continue
                 else:
-                    for t in toks:
+                    for t in (t for j in card.rows for t in fields(j) if t):
                         ids += nodes_of(t)
                 inline[(params.get("NSET") or "").upper()] = ids
             elif kw == "SURFACE" and (params.get("TYPE") or "").upper() == "NODE":
@@ -30463,9 +30495,9 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
                     continue
                 if gen:
                     try:
-                        base = expand_generate(f)
+                        base = expand_generate(rec)
                     except ValueError:              # left for _register_set to report
-                        out.append(mkblock(kw, [(kw, name.upper()), ("GENERATE", None)], [", ".join(f)]))
+                        out.append(mkblock(kw, [(kw, name.upper()), ("GENERATE", None)], [", ".join(rec)]))
                         continue
                     ids.extend(x + (off or 0) for x in base)
                 else:
@@ -31243,9 +31275,8 @@ def _deck_steps(path: str) -> Optional[dict]:
                 into = cur if kw == "NSET" else ecur
                 if "GENERATE" in params:
                     try:
-                        a, b, inc = ([pint(x) for x in f if x] + [1])[:3]
-                        into.extend(range(a, b + 1, max(inc, 1)))
-                    except ValueError:
+                        into.extend(expand_generate(f))
+                    except ValueError:                  # a blank or unreadable line
                         pass
                 else:
                     into.extend(int(x) if x.isdigit() else x.upper() for x in f if x)
