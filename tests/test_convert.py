@@ -12290,6 +12290,56 @@ def _converter_classes(tree):
     return [conv] + [classes[b.id] for b in conv.bases if isinstance(b, ast.Name) and b.id in classes]
 
 
+def test_attribute_owners():
+    # Converter's concerns (its mixins: _Mesh, _Loads, ...) own the attributes their methods
+    # write: a second class writing one (assigned, item-stored, augmented, mutated in place) is
+    # shared state across concerns, allowed only here, with why.  __init__ (every default) and
+    # convert / _convert (the orchestrator) don't count.  A static check of the source.
+    allow = {
+        "_used_names": "the deck's names, which each concern adding a set, surface, orientation "
+                       "or amplitude reserves (_fresh_name)",
+        "_synth_counter": "one counter numbers the converter's own names: rigid bodies, couplings "
+                          "(_Constraints), tied contact pairs (_Mesh)",
+        "_dist_tables": "the *DISTRIBUTION TABLEs of rewritten distributions: the axes' "
+                        "(_plan_distributions) and the ply split's",
+    }
+    import ast
+    with open(A.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    mutators = {"add", "update", "append", "extend", "setdefault", "pop", "popitem", "discard",
+                "clear", "remove", "insert", "move_to_end", "difference_update",
+                "intersection_update"}
+
+    def own(node):          # self.X, self.X[...][...] -> X (not self.X.y: another object's)
+        while isinstance(node, ast.Subscript):
+            node = node.value
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and \
+                node.value.id == "self":
+            return node.attr
+        return None
+    writers = {}
+    for cls in _converter_classes(tree):
+        for f in cls.body:
+            if not isinstance(f, ast.FunctionDef) or f.name in ("__init__", "convert", "_convert"):
+                continue
+            for n in ast.walk(f):
+                targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else \
+                    [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+                found = [own(e) for t in targets
+                         for e in (t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t])]
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and \
+                        n.func.attr in mutators:
+                    found.append(own(n.func.value))
+                for a in filter(None, found):
+                    writers.setdefault(a, {}).setdefault(cls.name, set()).add(f.name)
+    shared = {a: by for a, by in writers.items() if len(by) > 1}
+    assert len(writers) > 200 and shared.keys() <= allow.keys(), \
+        {a: {c: sorted(ms) for c, ms in shared[a].items()}
+         for a in sorted(shared.keys() - allow.keys())}
+    assert len(_converter_classes(tree)) > 1 and shared.keys() == allow.keys(), \
+        sorted(allow.keys() - shared.keys())        # (an entry no longer shared goes)
+
+
 def test_no_planner_reads_a_fact_only_a_later_planner_writes():
     # Converter._convert runs its planners in order: one that reads, through any method it calls,
     # an attribute only a later planner writes sees __init__'s default (code review 3: the
