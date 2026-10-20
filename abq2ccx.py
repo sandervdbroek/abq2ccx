@@ -13394,7 +13394,7 @@ class Converter:
                              f"evaluates the transform elsewhere; on the knot they are written in "
                              f"global components (exact). A knot holds the beam section rigid at "
                              f"the node, as beam theory does.", once=True)
-        acts = op_new_cards(blocks, ("BOUNDARY", "CLOAD"), self.steps.lc2)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks)
         for n, mode in self._rot_mode.items():
             if mode == "global":
                 self._rot_global_lines(n, self._local_axes(n), cards, acts)
@@ -13555,6 +13555,9 @@ class Converter:
 
         After a linear perturbation step (``self._pert_idx``) both start again from the last
         general step's state, which _restore_base_states gives ccx again (as bc_steps)."""
+        # (not StepModel.states: it needs the state after each card; it counts the steps per
+        # *STEP card, as ``cards`` does, an unterminated *STEP's later one as a step against
+        # _pert_idx's count; moments add up within a step)
         pert = self._pert_idx
         state: Dict[int, Tuple[float, Optional[str], int]] = {}
         base, cur = state, 0                    # the last general step's state; the step
