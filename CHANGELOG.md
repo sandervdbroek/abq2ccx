@@ -332,6 +332,12 @@ physics.
 * **12 significant digits** — the constants of `*ELASTIC, TYPE=LAMINA`, rows interpolated at
   field variable 0 (`DEPENDENCIES=`), the `--approximate` I-beam's `RECT` and the `*FRICTION`
   coefficient were written to 6 (up to 5e-6 off); they now get 12, as every other real.
+* **`*EQUATION` terms that ccx holds twice** — ccx 2.23 mis-assembles an equation that holds a
+  DOF twice: the constraint holds, the answer does not. A deck's own equation with a term
+  written twice (78 % of max |u| off), or with several local translations of a transformed
+  node whose axes share a global component (108-130 %), passed through; under NLGEOM ccx did
+  not converge. Repeated terms are now summed, and such local terms go through the node's
+  untransformed twin, as `*MPC PIN` does since 1.4.0 (exact, also under NLGEOM).
 
 ## 1.4.0 (October 2026)
 

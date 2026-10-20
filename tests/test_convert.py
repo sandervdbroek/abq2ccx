@@ -10277,6 +10277,44 @@ def test_equation_on_rotations_of_a_transformed_node_is_commented_out():
     assert len(_equation_terms(body)) == 1 and "DOFs 4-6 of a node with a *TRANSFORM" not in rep.text()
 
 
+def test_equation_terms_on_one_dof_are_summed():
+    # ccx 2.23 mis-assembles an *EQUATION that holds a (node, DOF) twice: the constraint holds,
+    # the answer does not (probed: 78 % of max |u| off, no convergence under NLGEOM); summed,
+    # it is the same equation, exact.  A sum that cancels drops out; other terms keep their text.
+    eqs = ("*Equation\n3\n2, 1, 1., 1, 1, -0.4, 1, 1, -0.6\n"
+           "*Equation\n5\n2, 2, 1., 1, 2, -1., 3, 1, 0.25, 3, 1, -0.25\n4, 3, 2.\n")
+    body, conv, rep = convert_str(HEX + eqs + STEP)
+    assert _equation_terms(body) == [[(2, 1, 1.), (1, 1, -1.)], [(2, 2, 1.), (1, 2, -1.), (4, 3, 2.)]]
+    assert "2, 2, 1., 1, 2, -1., 4, 3, 2." in body
+    assert "*EQUATION terms on the same node and DOF summed into one" in rep.text()
+    assert not conv._twins and rep.n_warnings == 0
+    # an equation whose terms all cancel is 0 = 0
+    body, _, _ = convert_str(HEX + "*Equation\n2\n2, 1, 1., 2, 1, -1.\n" + STEP)
+    assert not _equation_terms(body) and "*EQUATION left out: its terms cancel (0 = 0)" in body
+    # an equation without repeats is written as it is
+    body, _, rep = convert_str(HEX + "*Equation\n2\n2, 1, 1., 1, 1, -0.5\n" + STEP)
+    assert "*EQUATION\n2\n2, 1, 1., 1, 1, -0.5" in body and "summed" not in rep.text()
+
+
+def test_equation_local_translations_sharing_a_global_dof_use_a_twin():
+    # ccx reads *EQUATION terms on DOFs 1-3 of a transformed node in its local axes and expands
+    # each into the global DOFs of its axis: three local terms of node 9 (u_1,x = u_9,x, in
+    # node 9's cylindrical axes) repeat global DOFs, which ccx 2.23 mis-assembles (probed:
+    # 108-130 % of max |u| off).  They go through node 9's twin, in global components (exact).
+    terms = ", ".join(f"9, {j + 1}, {-CYL9_AXES[j][0]!r}" for j in range(3))
+    body, conv, rep = convert_str(CYL9 + f"*Equation\n4\n1, 1, 1., {terms}\n" + STEP)
+    twin = conv._twins[9]
+    eqs = _equation_terms(body)
+    assert [(1, 1, 1.), (twin, 1, -1.)] in [[(n, d, round(c, 12)) for n, d, c in eq] for eq in eqs]
+    assert len(eqs) == 4 and not _ccx_expansion_repeats(body)
+    assert sum(1 for eq in eqs if {n for n, _, _ in eq} == {9, twin}) == 3
+    assert "written on the node's twin, in global components" in rep.text() and rep.n_warnings == 0
+    # local axes that share no global component (local 1 = y, 2 = -x): written as they are
+    body, conv, rep = convert_str(_transformed(HEX + "*Node\n9, 2., 0., 0.\n*Equation\n3\n"
+                                               "1, 1, 1., 9, 1, 0.5, 9, 2, 0.5\n" + STEP, "9", YX))
+    assert not conv._twins and _equation_terms(body) == [[(1, 1, 1.), (9, 1, .5), (9, 2, .5)]]
+
+
 # a B31 cantilever 1-2-3 (section axes oblique), clamped at 1, a *TRANSFORM on the tip 3
 TIP3 = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=B31, elset=B\n"
         "1, 1, 2\n2, 2, 3\n*Beam Section, elset=B, material=M, section=RECT\n1., 0.5\n0., 0.6, 0.8\n"

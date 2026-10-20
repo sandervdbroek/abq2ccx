@@ -1,0 +1,175 @@
+*Heading
+abq2ccx validation: two orthotropic blocks on uneven meshes, tied face to face by the deck's
+own *EQUATIONs u_b - u_a = 0 (one per interface node pair and DOF), block A held at its
+bottom, block B loaded obliquely at its top.  validate_with_ccx.py writes the equations
+with repeated terms and in the local axes of a *TRANSFORM on block A's face nodes, which
+must give the same displacements.
+*Node
+1, 0, 0, 0
+2, 0.3, 0, 0
+3, 1, 0, 0
+4, 0, 0.845, 0
+5, 0.3, 0.845, 0
+6, 1, 0.845, 0
+7, 0, 1.3, 0
+8, 0.3, 1.3, 0
+9, 1, 1.3, 0
+10, 0, 0, 0.4
+11, 0.3, 0, 0.4
+12, 1, 0, 0.4
+13, 0, 0.845, 0.4
+14, 0.3, 0.845, 0.4
+15, 1, 0.845, 0.4
+16, 0, 1.3, 0.4
+17, 0.3, 1.3, 0.4
+18, 1, 1.3, 0.4
+19, 0, 0, 1
+20, 0.3, 0, 1
+21, 1, 0, 1
+22, 0, 0.845, 1
+23, 0.3, 0.845, 1
+24, 1, 0.845, 1
+25, 0, 1.3, 1
+26, 0.3, 1.3, 1
+27, 1, 1.3, 1
+101, 0, 0, 1
+102, 0.7, 0, 1
+103, 1, 0, 1
+104, 0, 0.26, 1
+105, 0.7, 0.26, 1
+106, 1, 0.26, 1
+107, 0, 1.3, 1
+108, 0.7, 1.3, 1
+109, 1, 1.3, 1
+110, 0, 0, 1.8
+111, 0.7, 0, 1.8
+112, 1, 0, 1.8
+113, 0, 0.26, 1.8
+114, 0.7, 0.26, 1.8
+115, 1, 0.26, 1.8
+116, 0, 1.3, 1.8
+117, 0.7, 1.3, 1.8
+118, 1, 1.3, 1.8
+*Element, type=C3D8, elset=A
+1, 1, 2, 5, 4, 10, 11, 14, 13
+2, 2, 3, 6, 5, 11, 12, 15, 14
+3, 4, 5, 8, 7, 13, 14, 17, 16
+4, 5, 6, 9, 8, 14, 15, 18, 17
+5, 10, 11, 14, 13, 19, 20, 23, 22
+6, 11, 12, 15, 14, 20, 21, 24, 23
+7, 13, 14, 17, 16, 22, 23, 26, 25
+8, 14, 15, 18, 17, 23, 24, 27, 26
+*Element, type=C3D8, elset=B
+101, 101, 102, 105, 104, 110, 111, 114, 113
+102, 102, 103, 106, 105, 111, 112, 115, 114
+103, 104, 105, 108, 107, 113, 114, 117, 116
+104, 105, 106, 109, 108, 114, 115, 118, 117
+*Nset, nset=BOTTOM
+1, 2, 3, 4, 5, 6, 7, 8, 9
+*Nset, nset=FACE
+19, 20, 21, 22, 23, 24, 25, 26, 27
+*Nset, nset=TOP
+110, 111, 112, 113, 114, 115, 116, 117, 118
+*Nset, nset=OUT, generate
+1, 118, 1
+*Solid Section, elset=A, material=ORTHO
+*Solid Section, elset=B, material=SOFT
+*Material, name=ORTHO
+*Elastic, type=ENGINEERING CONSTANTS
+1000., 300., 600., 0.2, 0.25, 0.3, 200., 150.
+100.
+*Material, name=SOFT
+*Elastic
+500., 0.3
+*Equation
+2
+101, 1, 1., 19, 1, -1.
+*Equation
+2
+101, 2, 1., 19, 2, -1.
+*Equation
+2
+101, 3, 1., 19, 3, -1.
+*Equation
+2
+102, 1, 1., 20, 1, -1.
+*Equation
+2
+102, 2, 1., 20, 2, -1.
+*Equation
+2
+102, 3, 1., 20, 3, -1.
+*Equation
+2
+103, 1, 1., 21, 1, -1.
+*Equation
+2
+103, 2, 1., 21, 2, -1.
+*Equation
+2
+103, 3, 1., 21, 3, -1.
+*Equation
+2
+104, 1, 1., 22, 1, -1.
+*Equation
+2
+104, 2, 1., 22, 2, -1.
+*Equation
+2
+104, 3, 1., 22, 3, -1.
+*Equation
+2
+105, 1, 1., 23, 1, -1.
+*Equation
+2
+105, 2, 1., 23, 2, -1.
+*Equation
+2
+105, 3, 1., 23, 3, -1.
+*Equation
+2
+106, 1, 1., 24, 1, -1.
+*Equation
+2
+106, 2, 1., 24, 2, -1.
+*Equation
+2
+106, 3, 1., 24, 3, -1.
+*Equation
+2
+107, 1, 1., 25, 1, -1.
+*Equation
+2
+107, 2, 1., 25, 2, -1.
+*Equation
+2
+107, 3, 1., 25, 3, -1.
+*Equation
+2
+108, 1, 1., 26, 1, -1.
+*Equation
+2
+108, 2, 1., 26, 2, -1.
+*Equation
+2
+108, 3, 1., 26, 3, -1.
+*Equation
+2
+109, 1, 1., 27, 1, -1.
+*Equation
+2
+109, 2, 1., 27, 2, -1.
+*Equation
+2
+109, 3, 1., 27, 3, -1.
+*Boundary
+BOTTOM, 1, 3
+*Step
+*Static
+*Cload
+TOP, 1, 2.
+TOP, 2, -1.5
+TOP, 3, 3.
+*Node Print, nset=OUT, global=YES
+U
+*End Step

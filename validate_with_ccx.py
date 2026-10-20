@@ -5592,6 +5592,44 @@ def main():
     failures += same_as("mpc_transform, NLGEOM x5, with a cylindrical *TRANSFORM on the reference "
                         "point", with_transform(nl_mpc_tr, 301, *cyl, rp_xyz),
                         untransformed(nl_mpc_tr))
+    # A deck's own *EQUATIONs that hold a DOF twice in ccx: a term written twice, or several
+    # local translations of a transformed node whose axes share a global component.
+    # examples/equation_tie.inp ties two orthotropic blocks on uneven meshes by u_b - u_a = 0;
+    # written with each a-term split in two (and a cancelling pair), or in the local axes of a
+    # cylindrical *TRANSFORM on block A's face nodes, it must give the same displacements
+    # (abq2ccx sums the terms, and writes the local ones on the nodes' twins).  As written,
+    # ccx 2.23 missed by 78 % and 108-130 % of max |u| without a message, and did not converge
+    # under NLGEOM.
+    tie = open(os.path.join(EXAMPLES, "equation_tie.inp"), encoding="utf-8").read()
+    tie_eq = re.compile(r"\*Equation\n2\n(\d+), (\d), 1\., (\d+), \d, -1\.\n")
+    tie_xyz = {int(f[0]): [float(x) for x in f[1:4]] for f in
+               (ln.split(",") for ln in tie.split("*Node\n", 1)[1].split("*", 1)[0].splitlines())}
+
+    def split_terms(deck):
+        def sub(m):
+            b, d, a = m.groups()
+            pair = f", {a}, {int(d) % 3 + 1}, 0.25, {a}, {int(d) % 3 + 1}, -0.25" if d == "2" else ""
+            return f"*Equation\n{5 if pair else 3}\n{b}, {d}, 1., {a}, {d}, -0.4, {a}, {d}, -0.6{pair}\n"
+        return tie_eq.sub(sub, deck)
+
+    def local_terms(deck, typ, a, b):
+        def sub(m):
+            bn, d, an = m.groups()
+            ax = local_axes(typ, a, b, tie_xyz[int(an)])
+            return (f"*Equation\n4\n{bn}, {d}, 1., " +
+                    ", ".join(f"{an}, {j + 1}, {-ax[j][int(d) - 1]:.15g}" for j in range(3)) + "\n")
+        card = f"*Transform, nset=FACE, type={typ}\n" + ", ".join(repr(float(v)) for v in a + b) + "\n"
+        return tie_eq.sub(sub, deck).replace("*Step", card + "*Step", 1)
+    nl_tie = tie.replace("*Step\n*Static\n", "*Step, nlgeom=YES\n*Static\n0.1, 1., 1e-6, 0.2\n") \
+        .replace("TOP, 1, 2.\nTOP, 2, -1.5\nTOP, 3, 3.", "TOP, 1, 20.\nTOP, 2, -15.\nTOP, 3, 30.")
+    failures += same_as("equation_tie with each term of block A split in two (and a cancelling "
+                        "pair)", split_terms(tie), tie)
+    failures += same_as("equation_tie in the local axes of a cylindrical *TRANSFORM on block A's "
+                        "face", local_terms(tie, *cyl), tie)
+    failures += same_as("equation_tie, NLGEOM x10 (max |u| 1.3), with split terms",
+                        split_terms(nl_tie), nl_tie)
+    failures += same_as("equation_tie, NLGEOM x10, in the local axes of a cylindrical *TRANSFORM",
+                        local_terms(nl_tie, *cyl), nl_tie)
     # Rotational BCs and moments on DOFs 4-6 of nodes with a *TRANSFORM, which ccx 2.23 applies
     # about the global axes on a kinematic reference point and a knot (and as clashing mean-
     # rotation MPCs on a plain beam node): the reference point's coupling becomes a *RIGID BODY

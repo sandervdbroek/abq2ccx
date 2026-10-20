@@ -14840,15 +14840,25 @@ class Converter:
     # ccx (like Abaqus) reads an *EQUATION term on DOF 1-3 of a node with a *TRANSFORM as a
     # local DOF j and expands it into the global DOFs g of e_j whose component is 1e-5 or more
     # (equations.f).  ccx 2.23 mis-assembles an equation that then holds a global DOF twice —
-    # several local terms of one node do that — unless a substitution of another MPC into it
-    # first merges the repeats (cascade.c): the stiffness of its eliminated DOF is spread over
-    # the repeated terms with each cross term counted once (probed: an untransformed equation
-    # with a term split in two halves is 100 % off, the constraint itself still holds).  So an
-    # *MPC equation holds a node's local terms only where no two of them share a global DOF —
-    # one local term, or several whose axes have no global component in common (probed: exact,
-    # also under NLGEOM) — and uses the node's twin otherwise (_dir_terms).  (Connector rows
-    # between two transformed nodes keep several; the three local dependents of node b then
-    # name each other's DOFs, so ccx's cascade merges the repeats: probed exact.)
+    # several local terms of one node do that, as does a term written twice — unless a
+    # substitution of another MPC into it first merges the repeats (cascade.c): the stiffness
+    # of its eliminated DOF is spread over the repeated terms with each cross term counted once
+    # (mafillsm.f; probed: an untransformed equation with a term split in two halves is 78-100 %
+    # off, the constraint itself still holds).  So an *MPC equation holds a node's local terms
+    # only where no two of them share a global DOF — one local term, or several whose axes have
+    # no global component in common (probed: exact, also under NLGEOM) — and uses the node's
+    # twin otherwise (_dir_terms); a deck's own *EQUATION gets its repeated terms summed and
+    # the same twins (_ccx_equation_terms).  (Connector rows between two transformed nodes
+    # keep several; the three local dependents of node b then name each other's DOFs, so
+    # ccx's cascade merges the repeats: probed exact.)
+    @staticmethod
+    def _ccx_repeats(ax: Tuple[Vec, Vec, Vec], js: Sequence[int]) -> bool:
+        """Whether terms on the distinct local DOFs ``js`` (1-3) of a node with axes ``ax``
+        share a global DOF once ccx expands each into the components of 1e-5 or more of its
+        axis (equations.f)."""
+        spans = [{g for g in range(3) if abs(ax[j - 1][g]) >= 1e-5} for j in js]
+        return any(p & q for p, q in itertools.combinations(spans, 2))
+
     def _mpc_frame(self, n: int) -> Union[None, str, Tuple[Vec, Vec, Vec]]:
         """The local axes in which ccx reads *EQUATION terms on DOFs 1-3 of node ``n``: None
         for the global ones, or why they are undefined (_local_axes)."""
@@ -14884,8 +14894,7 @@ class Converter:
             return [(n, k + 1, v[k]) for k in range(3) if abs(v[k]) > tol]
         c = [vdot(v, e) for e in ax]
         js = [j for j in range(3) if abs(c[j]) > tol]
-        spans = [{g for g in range(3) if abs(ax[j][g]) >= 1e-5} for j in js]
-        if all(not (p & q) for p, q in itertools.combinations(spans, 2)):
+        if not self._ccx_repeats(ax, [j + 1 for j in js]):
             return [(n, j + 1, c[j]) for j in js]
         twin = self._mpc_twin(n) if plan else self._twins[n]
         return [(twin, k + 1, v[k]) for k in range(3) if abs(v[k]) > tol]
@@ -15882,7 +15891,11 @@ class Converter:
           DOFs 5-6 through an out-of-range read of the 3 x 3 transformation matrix (terms on
           the node's translations with undefined coefficients, or 'SPC in node ... in
           transformed coordinates cannot be converted in MPC'; probed), with no exact form —
-          the equation is commented out."""
+          the equation is commented out.
+
+        Then the terms on one node and DOF are summed, and local translations of a transformed
+        node that ccx would expand into a repeated global DOF go through the node's twin
+        (_ccx_equation_terms): ccx 2.23 mis-assembles an equation that holds a DOF twice."""
         out = self._equation_block_lines(b)
         card = mkblock("EQUATION", data=out[1:])
         eqs = self._equation_terms(card)
@@ -15908,31 +15921,73 @@ class Converter:
                 "*EQUATION on DOFs 4-6 of a node with a *TRANSFORM",
                 comment="*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (misread by "
                         "ccx 2.23) commented out")
-        if not moved:
+        summed = twinned = False
+        for i, eq in enumerate(eqs):
+            got = self._ccx_equation_terms(eq)
+            if got is not None:
+                eqs[i], s, t = got
+                summed, twinned = summed or s, twinned or t
+        if not (moved or summed or twinned):
             return out
-        self.report.note("*EQUATION terms on DOFs 4-6 of a *RIGID BODY reference node moved to DOFs "
-                         "1-3 of its ROT NODE, which carries the body's rotation (ccx ignores DOFs "
-                         "4-6 of the REF NODE: a term there would act as a fixed zero; probed).",
-                         once=True)
-        lines = [out[0]]
+        if moved:
+            self.report.note("*EQUATION terms on DOFs 4-6 of a *RIGID BODY reference node moved to "
+                             "DOFs 1-3 of its ROT NODE, which carries the body's rotation (ccx "
+                             "ignores DOFs 4-6 of the REF NODE: a term there would act as a fixed "
+                             "zero; probed).", once=True)
+        if summed:
+            self.report.note("*EQUATION terms on the same node and DOF summed into one (a sum that "
+                             "cancels is left out): ccx 2.23 mis-assembles an equation that holds a "
+                             "DOF twice — the constraint holds, the answer does not (probed: 78 % "
+                             "of max |u| off, no convergence under NLGEOM).", once=True)
+        if twinned:
+            self.report.note("*EQUATION with several local translations of a node with a "
+                             "*TRANSFORM whose axes share a global component: those terms are "
+                             "written on the node's twin, in global components (ccx expands each "
+                             "local term into the global DOFs of its axis, and 2.23 mis-assembles "
+                             "an equation that then holds a DOF twice; probed: 108-130 % of max "
+                             "|u| off, no convergence under NLGEOM; exact through the twin).",
+                             once=True)
+            self._note_twins()
+        rows = [[(int(n), 0, 0.0) for n, _, _ in eq] for eq in eqs
+                if all(re.fullmatch(r"[-+]?\d+", n.strip()) for n, _, _ in eq)]
+        lines = (self._twin_lines(rows) if twinned else []) + [out[0]]
         for eq in eqs:
-            lines += equation_rows(eq)
+            if eq:
+                lines += equation_rows(eq)
+        if len(lines) == 1:
+            return ["** abq2ccx: *EQUATION left out: its terms cancel (0 = 0)"]
         return lines
 
     def _equation_block_lines(self, b: Block) -> List[str]:
         """``*EQUATION``: ccx 2.22 requires node NUMBERS in the terms; Abaqus/CAE decks
         (esp. periodic-BC lattices) write node SETS.  Resolve single-node sets directly;
-        expand equal-length multi-node sets into one equation per node pairing.  A card may
-        hold several equations (each a line with its number of terms, then the terms), each
-        resolved on its own."""
+        expand equal-length multi-node sets into one equation per node pairing
+        (_expanded_equations).  A card may hold several equations (each a line with its
+        number of terms, then the terms), each resolved on its own."""
         unchanged = [emit_keyword("EQUATION", b.params)] + list(b.data)
         eqs = self._equation_terms(b)
         if not eqs:
             return unchanged
         if all(re.fullmatch(r"[-+]?[\d.eE+-]+", tok) for eq in eqs for tok, _, _ in eq):
             return unchanged                                    # all-numeric: untouched
+        eqs, why = self._expanded_equations(b)
+        if why:
+            self.report.warn(why, once=True)
+            return unchanged
         out: List[str] = [emit_keyword("EQUATION", b.params)]
-        for terms in eqs:
+        for trip in eqs:
+            out += equation_rows(trip)
+        self.report.note("*EQUATION set-name terms resolved to node numbers (ccx 2.22 needs "
+                         "explicit nodes; multi-node sets expanded pairwise).", once=True)
+        return out
+
+    def _expanded_equations(self, b: Block) -> Tuple[List[List[Tuple[str, str, str]]], str]:
+        """The equations of *EQUATION card ``b`` as (node, DOF, coefficient) fields with its
+        node-set terms expanded, and why they cannot be ('' if they can).  Abaqus applies a
+        set-based equation node by node in the set's SORTED order (ascending ids) unless the
+        set was declared UNSORTED, one equation per node pairing."""
+        out: List[List[Tuple[str, str, str]]] = []
+        for terms in self._equation_terms(b):
             resolved: List[Tuple[List[int], str, str]] = []
             for tok, dof, coef in terms:
                 if re.fullmatch(r"[-+]?\d+", tok):
@@ -15940,30 +15995,72 @@ class Converter:
                     continue
                 nodes = self.geom.nset(tok)
                 if not nodes:
-                    self.report.warn(f"*EQUATION references set '{tok}' which resolves to no nodes; "
-                                     f"card left unchanged — ccx 2.22 rejects set names here "
-                                     f"(2.23 accepts them).", once=True)
-                    return unchanged
-                # Abaqus applies a set-based equation node by node in the set's SORTED
-                # order (ascending ids) unless the set was declared UNSORTED
-                if tok.upper() not in self.geom.unsorted:
-                    nodes = sorted(set(nodes))
-                else:
-                    nodes = dedup(nodes)
+                    return [], (f"*EQUATION references set '{tok}' which resolves to no nodes; "
+                                f"card left unchanged — ccx 2.22 rejects set names here (2.23 "
+                                f"accepts them).")
+                nodes = sorted(set(nodes)) if tok.upper() not in self.geom.unsorted else dedup(nodes)
                 resolved.append((list(nodes), dof, coef))
             sizes = {len(n) for n, _, _ in resolved if len(n) > 1}
             if len(sizes) > 1:
-                self.report.warn("*EQUATION mixes node sets of different sizes; card left unchanged "
-                                 "— rewrite with explicit nodes.", once=True)
-                return unchanged
-            n_eq = sizes.pop() if sizes else 1
-            for i in range(n_eq):
-                trip = [(nodes[i] if len(nodes) > 1 else nodes[0], dof, coef)
-                        for nodes, dof, coef in resolved]
-                out += equation_rows(trip)
-        self.report.note("*EQUATION set-name terms resolved to node numbers (ccx 2.22 needs "
-                         "explicit nodes; multi-node sets expanded pairwise).", once=True)
-        return out
+                return [], ("*EQUATION mixes node sets of different sizes; card left unchanged — "
+                            "rewrite with explicit nodes.")
+            for i in range(sizes.pop() if sizes else 1):
+                out.append([(str(nodes[i] if len(nodes) > 1 else nodes[0]), dof, coef)
+                            for nodes, dof, coef in resolved])
+        return out, ""
+
+    def _plan_equation_twins(self, blocks: List[Block]) -> None:
+        """The twins (_mpc_twin) of the nodes with a *TRANSFORM whose local translations a
+        deck's *EQUATION holds so that ccx would repeat a global DOF (_ccx_equation_terms),
+        made before the mesh is written."""
+        if self._transformed:
+            for b in blocks:
+                if b.keyword == "EQUATION":
+                    for eq in self._expanded_equations(b)[0]:
+                        self._ccx_equation_terms(eq, plan=True)
+
+    def _ccx_equation_terms(self, eq: Sequence[Tuple[str, str, str]], plan: bool = False
+                            ) -> Optional[Tuple[List[Tuple[str, str, str]], bool, bool]]:
+        """Equation ``eq`` of a deck's *EQUATION ((node, DOF, coefficient) fields) as ccx 2.23
+        assembles it right: (its fields, whether repeated terms were summed, whether terms
+        went through a twin), or None where a field is not a number.  ccx mis-assembles an
+        equation that holds a (node, DOF) twice (see _mpc_frame; probed: 78 % of max |u| off
+        with a term split in two, no convergence under NLGEOM), so repeated terms are summed —
+        the same equation; a sum that cancels drops out — and the local translations of a node
+        with a *TRANSFORM that ccx would expand into a repeated global DOF become the global
+        terms of the node's twin (_dir_terms; made when ``plan``), largest first."""
+        try:
+            nums = [(int(t), int(d), pf(c)) for t, d, c in eq]
+        except ValueError:
+            return None
+        coef: "OrderedDict[Tuple[int, int], float]" = OrderedDict()
+        for n, d, c in nums:
+            coef[(n, d)] = coef.get((n, d), 0.0) + c
+        summed = len(coef) < len(nums)
+        split = {n for n in {n for n, d in coef if d <= 3}
+                 if isinstance(self._mpc_frame(n), tuple) and (plan or n in self._twins) and
+                 self._ccx_repeats(self._mpc_frame(n), [d for m, d in coef if m == n and d <= 3])}
+        if not summed and not split:
+            return list(eq), False, False
+        text = {(n, d): c for (n, d, _), (_, _, c) in zip(nums, eq)}
+        big = max(abs(c) for c in coef.values())
+        once = {k for k in coef if sum(1 for n, d, _ in nums if (n, d) == k) == 1}
+        out: List[Tuple[str, str, str]] = []
+        done: set = set()
+        for (n, d), c in coef.items():
+            if n in split and d <= 3:
+                if n in done:
+                    continue
+                done.add(n)
+                ax = self._mpc_frame(n)
+                v = tuple(sum(coef.get((n, j + 1), 0.0) * ax[j][k] for j in range(3)) for k in range(3))
+                out += [(str(m), str(k), f"{x:.12g}") for m, k, x in
+                        sorted(self._dir_terms(n, v, plan), key=lambda t: -abs(t[2]))]
+            elif (n, d) in once:
+                out.append((str(n), str(d), text[(n, d)]))
+            elif abs(c) > 1e-12 * big:
+                out.append((str(n), str(d), f"{c:.12g}"))
+        return out, summed, bool(split)
 
     def _split_coupling_refs(self, blocks: List[Block]) -> List[Block]:
         """``blocks`` with each *COUPLING whose REF NODE= names a set of several nodes written
@@ -22967,6 +23064,7 @@ class Converter:
         self._transformed = self._transform_defs(blocks)
         self._plan_connectors(blocks)
         self._plan_mpcs(blocks)
+        self._plan_equation_twins(blocks)
         mpc_refs = [body["ref"] for bodies in self._mpc_bodies.values() for body in bodies]
         self._plane_only.difference_update(mpc_refs)
         self._ref_nodes = set(mpc_refs)
