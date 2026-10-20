@@ -94,7 +94,9 @@ amplitude over steps, gravity per set and direction) against the plain loads Aba
 and rigid-body reference nodes: a shell REF NODE with a *TRANSFORM in a dynamic step against
 the deck without it, the reaction at a REF NODE on an element outside the body against a free
 one, a BEAM connector driven at node b against a hand-written *RIGID BODY, and an initial spin
-against the rigid rotation.
+against the rigid rotation; an orthotropic expansion on a shell off the x-y plane (its stretch
+along direction 1), temperatures at section points (a plate and a RECT cantilever against plate
+and beam theory) and midside nodes between ends heated on two cards (the one-card decks).
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -4215,6 +4217,47 @@ def shell_gradient_deck(etype):
             f"{ids[(order, 0)]}, 2, 3\n{ids[(0, order)]}, 3, 3\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\n"
             f"NALL, 0.\n*STEP\n*STATIC\n*TEMPERATURE\nNALL, 100., 100.\n*NODE PRINT, NSET=NALL\nU\n"
             f"*END STEP\n"), ids[(2 * order, 0)]
+
+
+def inclined_shell_deck(exp, nlgeom):
+    """One S4 in the plane through the z axis at -45 degrees, without an *ORIENTATION (material
+    direction 1 is global X projected onto it: along edge 1-2), E 1000, nu 0, an *EXPANSION
+    ``exp`` ("ORTHO" or a zero-shear "ANISO") of 1e-3 along direction 1 only, heated by 10 in a
+    static step (``nlgeom``): edge 1-2 stretches by 0.01, node 2 by (0.007071, -0.007071, 0)."""
+    data = "1e-3, 0., 0." if exp == "ORTHO" else "1e-3, 0., 0., 0., 0., 0."
+    return ("*NODE\n1, 0., 0., 0.\n2, 0.70710678, -0.70710678, 0.\n3, 0.70710678, -0.70710678, 1.\n"
+            "4, 0., 0., 1.\n*ELEMENT, TYPE=S4, ELSET=E\n1, 1, 2, 3, 4\n*NSET, NSET=ALL\n1, 2, 3, 4\n"
+            f"*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*EXPANSION, TYPE={exp}\n{data}\n"
+            "*SHELL SECTION, ELSET=E, MATERIAL=M\n0.01\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nALL, 0.\n"
+            f"*STEP{', NLGEOM' if nlgeom else ''}\n*STATIC\n1., 1.\n*BOUNDARY\n1, 1, 6\n2, 3, 3\n4, 1, 2\n"
+            "*TEMPERATURE\nALL, 10.\n*NODE PRINT, NSET=ALL\nU\n*END STEP\n")
+
+
+def point_beam_deck(values):
+    """A cantilever of four B32 along x (length 2, RECT 0.1 x 0.1, n1 = (0, 0, -1), so local 2
+    is +y; E 1000, nu 0, expansion 1e-3) of a *BEAM SECTION, TEMPERATURE=VALUES heated by
+    ``values`` at the section's corners (1 at -1 -2, then counterclockwise): (0, 0, 10, 10) is a
+    mean of 5 and a gradient of 100 along local 2, so the tip (node 9) moves by x 0.01 and by
+    y -0.2 (the hotter +y side longer: curvature 0.1 towards -y)."""
+    return ("*NODE\n" + "".join(f"{k + 1}, {0.25 * k}, 0., 0.\n" for k in range(9)) +
+            "*ELEMENT, TYPE=B32, ELSET=B\n" + "".join(f"{e + 1}, {2 * e + 1}, {2 * e + 2}, {2 * e + 3}\n"
+                                                    for e in range(4)) +
+            "*NSET, NSET=NALL, GENERATE\n1, 9, 1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*EXPANSION\n"
+            "1.E-3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT, TEMPERATURE=VALUES\n0.1, 0.1\n"
+            "0., 0., -1.\n*BOUNDARY\n1, 1, 6\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0.\n*STEP\n"
+            f"*STATIC\n*TEMPERATURE\nNALL, {values}\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+
+
+def midside_temperature_deck(ic_cards, step_cards):
+    """A circular-section B31 bar along x (length 1, E 1000, nu 0.3, expansion 1e-3; ccx needs
+    B32R: the converter adds a midside node), clamped at A (node 1), with initial
+    temperatures and step temperatures on ``ic_cards`` / ``step_cards`` (one card each);
+    prints B's (node 2) motion."""
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*ELEMENT, TYPE=B31, ELSET=EB\n1, 1, 2\n*NSET, NSET=A\n1\n"
+            "*NSET, NSET=B\n2\n*NSET, NSET=AB\n1, 2\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*EXPANSION\n"
+            "1e-3\n*BEAM SECTION, ELSET=EB, MATERIAL=M, SECTION=CIRC\n0.05\n0., 0., -1.\n*BOUNDARY\nA, 1, 6\n" +
+            "".join(f"*INITIAL CONDITIONS, TYPE=TEMPERATURE\n{c}\n" for c in ic_cards) + "*STEP\n*STATIC\n" +
+            "".join(f"*TEMPERATURE\n{c}\n" for c in step_cards) + "*NODE PRINT, NSET=B\nU\n*END STEP\n")
 
 
 def ramped_rotation_deck(step, twin=False):
@@ -11059,6 +11102,83 @@ def main():
     else:
         print("FAIL  shell_gradient: a run gave no results")
     failures += 0 if ok else 1
+    # a shell off the x-y plane has the material axes of its own plane (code review 3): ccx 2.23
+    # gets an orthotropic expansion right in a linear step and drops its turned shear under
+    # NLGEOM (half the stretch), which the converter flags now; a zero-shear ANISO expansion
+    # stays ANISO there (ccx stops on it loudly) instead of going out as ORTHO
+    flag = "thermal shear of a turned ORTHO *EXPANSION under NLGEOM (ccx 2.23 drops it)"
+    got = {}
+    for exp, nl in (("ORTHO", False), ("ORTHO", True), ("ANISO", True)):
+        tag = f"inclined_shell_{exp.lower()}_{'nl' if nl else 'lin'}"
+        text = inclined_shell_deck(exp, nl)
+        u = review_run(text, tag, dat_displacements) if exp == "ORTHO" else {}
+        if exp != "ORTHO":                          # (ccx stops on it: converted only)
+            with open(os.path.join(tmp, f"{tag}_src.inp"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        _, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
+        with open(os.path.join(tmp, f"{tag}_flag.inp"), encoding="utf-8") as fh:
+            card = next((ln for ln in fh if ln.startswith("*EXPANSION")), "").strip()
+        got[(exp, nl)] = (u.get(2) if u is not None else None, flag in conv.reduced_physics, card)
+    ok = got[("ORTHO", False)][0] is not None and got[("ORTHO", True)][0] is not None
+    if ok:
+        (lin, f0, _), (nlg, f1, _), (_, _, aniso) = got[("ORTHO", False)], got[("ORTHO", True)], got[("ANISO", True)]
+        ok = max(abs(lin[0] - 0.0070710678), abs(lin[1] + 0.0070710678)) < 1e-7 and not f0 and \
+            abs(nlg[0] - 0.0035355339) < 1e-6 and f1 and aniso == "*EXPANSION, TYPE=ANISO"
+        print(f"{'PASS' if ok else 'FAIL'}  inclined_shell_expansion (an S4 at -45 degrees about z with "
+              f"an ORTHO expansion along direction 1, heated by 10): node 2 at ({lin[0]:.7g}, {lin[1]:.7g}) "
+              f"in a linear step (0.007071, -0.007071), {'flagged' if f0 else 'not flagged'}; "
+              f"x {nlg[0]:.7g} under NLGEOM (ccx drops the turned shear), "
+              f"{'flagged' if f1 else 'NOT flagged'} reduced physics; zero-shear ANISO written as "
+              f"'{aniso}'")
+    else:
+        print("FAIL  inclined_shell_expansion: a run gave no results")
+    failures += 0 if ok else 1
+    # *SHELL SECTION, TEMPERATURE=n: the line's values at n points through the thickness went to
+    # ccx, which read the second as a gradient (a uniformly heated plate bent); written as ccx's
+    # (temperature, gradient): the plate of shell_gradient as points 95, 100, 105 (100 and 100
+    # through t 0.1) and as 100 at every point
+    got = {}
+    for tag, pts in (("linear", "95., 100., 105."), ("uniform", "100., 100., 100.")):
+        text, far = shell_gradient_deck("S8R")
+        text = text.replace("MATERIAL=M\n0.1\n", "MATERIAL=M, TEMPERATURE=3\n0.1\n").replace(
+            "NALL, 100., 100.\n", f"NALL, {pts}\n")
+        u = review_run(text, f"shell_points_{tag}", dat_displacements)
+        got[tag] = u.get(far) if u else None
+    ok = all(got.values())
+    if ok:
+        lin, uni = got["linear"], got["uniform"]
+        ok = abs(lin[0] - 0.2) < 1e-9 and abs(lin[2] + 0.1) < 1e-9 and abs(uni[0] - 0.2) < 1e-9 and \
+            abs(uni[2]) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  shell_section_points (the S8R plate of shell_gradient with "
+              f"*SHELL SECTION, TEMPERATURE=3): corner at x {lin[0]:.7g}, z {lin[2]:.7g} for points 95, "
+              f"100, 105 (0.2, -0.1: temperature 100, gradient 100), x {uni[0]:.7g}, z {uni[2]:.3g} for "
+              f"100 at every point (0.2, flat)")
+    else:
+        print("FAIL  shell_section_points: a run gave no results")
+    failures += 0 if ok else 1
+    # *BEAM SECTION, TEMPERATURE=VALUES: a RECT cantilever heated linearly across its depth
+    u = review_run(point_beam_deck("0., 0., 10., 10."), "beam_section_points", dat_displacements)
+    tip = u.get(9) if u else None
+    ok = tip is not None and abs(tip[0] - 0.01) < 1e-7 and abs(tip[1] + 0.2) < 1e-6
+    print(f"{'PASS' if ok else 'FAIL'}  beam_section_points (a B32 cantilever, *BEAM SECTION, SECTION=RECT, "
+          f"TEMPERATURE=VALUES, its corners at 0, 0, 10, 10): tip at x {tip[0] if tip else math.nan:.7g}, "
+          f"y {tip[1] if tip else math.nan:.7g} (0.01, -0.2: mean 5, gradient 100 along local 2)")
+    failures += 0 if ok else 1
+    # a midside node the converter adds between ends given temperatures on two cards (initial
+    # conditions, a step's *TEMPERATURE) got none: the bar moved 0.0678 where it stays put
+    for tag, two, one in (("ic", (["A, 100.", "B, 100."], ["AB, 150."]), (["A, 100.\nB, 100."], ["AB, 150."])),
+                          ("step", (["AB, 0."], ["A, 100.", "B, 100."]), (["AB, 0."], ["A, 100.\nB, 100."]))):
+        runs = [review_run(midside_temperature_deck(*d), f"midside_temperature_{tag}" + ref, dat_displacements)
+                for d, ref in ((two, ""), (one, "_ref"))]
+        ok = all(runs)
+        if ok:
+            got, want = runs[0].get(2, [math.inf]), runs[1].get(2, [math.nan])
+            err = max(abs(a - b) for a, b in zip(got, want))
+            ok = err < 1e-9 * abs(want[0]) and abs(want[0]) > 0.01
+            print(f"{'PASS' if ok else 'FAIL'}  midside_temperature_{tag} (a CIRC B31 bar, written as B32R "
+                  f"with a midside node, its ends {'given initial temperatures' if tag == 'ic' else 'heated'} "
+                  f"on two cards): end moved {got[0]:.7g} vs {want[0]:.7g} with one card ({err:.1e} apart)")
+        failures += 0 if ok else 1
     # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
     # aborted after the step that held no body load (the converter writes a zero GRAV there)
     lam = [review_run(buckle_gravity_deck(p, pert=pert), "buckle_gravity_" + (p or "none") + tag, factors)

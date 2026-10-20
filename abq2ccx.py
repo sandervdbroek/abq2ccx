@@ -2029,6 +2029,12 @@ def merged_data_records(block: Block) -> List[List[str]]:
     return out
 
 
+def record_key(fields: Sequence[str]) -> Tuple[str, ...]:
+    """A data record by its text: its nonblank fields, stripped, in upper case — what a plan
+    for a record keeps where a later planner may add or split the card's other records."""
+    return tuple(x.strip().upper() for x in fields if x.strip())
+
+
 def trimmed_fields(fields: Sequence[str]) -> List[str]:
     """A data record's fields, stripped, without the trailing blank ones (interior blanks are
     positional: ``node, dof1, , value`` has a blank last DOF)."""
@@ -5914,6 +5920,17 @@ class EmitState:
         # the step's *CFLUX / *DFLUX / *FILM / *RADIATE entries (node DOF or element face) ->
         # the amplitude of its line (Converter._track_heat)
         self.heat_taken: Dict[tuple, tuple] = {}
+        # the deck's temperatures in force, node -> its values (temperature, then gradients;
+        # none: 0, Abaqus' default), for the nodes the converter put between two
+        # (Converter._midside_temperatures): the initial conditions', the general steps' up to
+        # the card being written, and those the current step reads (temps_now: those, or a
+        # perturbation step's own changes from 0), each with the AMPLITUDE of the card of the
+        # current step that gave it ("" for none)
+        self.temps_ic: Dict[int, Tuple[float, ...]] = {}
+        self.temps: Dict[int, Tuple[float, ...]] = {}
+        self.temps_now: Dict[int, Tuple[float, ...]] = self.temps
+        self.temps_amp: Dict[int, str] = {}
+        self.temps_loose: set = set()       # ... those whose line in the current step is not exact
         # the converted-load bookkeeping before the current run of perturbation steps:
         # (nodal_loads, nodal_emitted, dl_state, cl_state)
         self.load_base: tuple = (OrderedDict(), {}, {}, OrderedDict())
@@ -5927,6 +5944,24 @@ class EmitState:
         self.last_coupling: Optional[dict] = None   # the last *COUPLING's plan (its *KINEMATIC, ...)
         self.last_planar = False                    # ... all its members are 2-D
         self.rot_hit: List[int] = []                # the *BOUNDARY's planned nodes met so far
+
+    def give_temperatures(self, vals: Dict[int, Tuple[float, ...]], ic: bool, new: bool = False,
+                          amp: str = "") -> None:
+        """A temperature card's values ``vals`` take effect: an *INITIAL CONDITIONS card's in
+        the initial state, which the steps start from; a step card's (AMPLITUDE ``amp``) in
+        the current step's — ``new`` (OP=NEW): the initial one first, a perturbation step's
+        none."""
+        if ic:
+            self.temps_ic.update(vals)
+            self.temps.update(vals)
+            return
+        if new:
+            self.temps_now.clear()
+            self.temps_amp.clear()
+            if self.step is None or not self.step.perturbation:
+                self.temps_now.update(self.temps_ic)
+        self.temps_now.update(vals)
+        self.temps_amp.update(dict.fromkeys(vals, amp))
 
     def next_step(self, steps: "StepModel") -> Step:
         """The cursor moves to the next of ``steps`` (handle_step, at its *STEP card)."""
@@ -5961,6 +5996,8 @@ class EmitState:
         self.dl_fresh, self.dl_wiped, self.dl_taken = set(), False, {}
         self.cl_fresh, self.cl_taken = set(), {}
         self.heat_taken = {}
+        self.temps_now, self.temps_amp = {} if step.perturbation else self.temps, {}
+        self.temps_loose = set()
         if step.perturbation and (self.prev is None or not self.prev.perturbation):
             self.load_base = (self.nodal_loads, dict(self.nodal_emitted), self.dl_state,
                               self.cl_state)
@@ -6922,6 +6959,7 @@ class Converter:
         # elements whose section reads a temperature line's values at section points
         # (TEMPERATURE=n shell, TEMPERATURE=VALUES beam sections), not as gradients
         self._point_temps: set = set()
+        self._point_beams: set = set()              # ... the beams among them (_plan_point_temperatures)
         # planar 2-D beams/trusses: element -> its PLANAR_LINE_TYPES type, and the model-data
         # *BOUNDARY lines that keep them in their plane (_plan_planar_constraint)
         self._planar_elems: Dict[int, str] = {}
@@ -7240,7 +7278,7 @@ class Converter:
         # are (name -> why); the skin material (modulus, density, thermal); the planar bodies'
         # reference nodes and their out-of-plane BCs; the rotary-inertia stars' masses
         self._skins: Dict[Tuple[int, str], Tuple[int, str]] = {}
-        self._rigid_lines: Dict[Tuple[int, int], List[str]] = {}
+        self._rigid_lines: Dict[Tuple[int, tuple], List[str]] = {}   # (id(*SURFACE), record_key)
         self._analytic: Dict[str, Tuple[str, str]] = {}
         self._analytic_skipped: Dict[str, str] = {}
         # *CONTACT PAIR self-contact lines (_plan_self_contact): id(card) -> (the card as
@@ -7263,7 +7301,7 @@ class Converter:
         self._rotary_done: set = set()             # id(*ROTARY INERTIA) carried by a star
         self._rigid_own_sets: set = set()          # the bodies' node sets the converter made
         self._node_elem_map: Optional[Dict[int, List[int]]] = None   # node -> elements (lazy)
-        self._tie_to_rigid: set = set()            # (id(*TIE), record) -> slave nodes joined the body
+        self._tie_to_rigid: set = set()            # (id(*TIE), record_key) -> slave nodes joined the body
         self._skin_depth: Dict[int, float] = {}     # plane skin -> its depth (z = -T .. T)
         self._skin_diag: Dict[int, float] = {}      # skin -> its rigid facet's diagonal (Abaqus)
         self._rigid_faces: Dict[str, List[Tuple[int, str]]] = {}   # rigid surface -> skin faces
@@ -7886,6 +7924,7 @@ class Converter:
                 self.emit.out_tp_cards = []
                 out.extend(self.handle_step(cards))
                 self.emit.proc = None                   # (no step's after its *END STEP)
+                self._warn_loose_midside_temperatures()
             elif b.keyword in ("HEADING", "END STEP") or b.keyword in GEOM_KW:
                 continue
             elif b.keyword in HISTORY_ONLY_KW:       # (_move_between_cards moved the others)
@@ -9136,7 +9175,7 @@ class Converter:
         TYPE=ORTHO there without an error, so such a card stays ANISO and those steps fail
         loudly.  With USER the data lines hold no coefficients."""
         self._expansion_as_ortho = {}
-        uses: Optional[List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]] = None
+        cands: List[Tuple[str, Block]] = []
         for group in self._material_groups(blocks):
             name = (group[0].param("NAME") or "").strip()
             for exp in group:
@@ -9150,11 +9189,11 @@ class Converter:
                         continue
                 except ValueError:                  # a distribution name, a parameter, ...
                     continue
-                if uses is None:
-                    uses = self._material_uses(blocks)
-                if not any(mat == name.upper() and self._expansion_shear(exp, axes)
-                           for mat, axes in uses):
-                    self._expansion_as_ortho[id(exp)] = name
+                cands.append((name, exp))
+        uses = self._material_uses(blocks, {name.upper() for name, _ in cands}) if cands else []
+        for name, exp in cands:
+            if not any(mat == name.upper() and self._expansion_shear(exp, axes) for mat, axes in uses):
+                self._expansion_as_ortho[id(exp)] = name
 
     def handle_expansion(self, b: Block) -> List[str]:
         """``*EXPANSION``: DEPENDENCIES= collapsed and the shear coefficients of an anisotropic
@@ -9403,9 +9442,9 @@ class Converter:
         free heated unit cubes and plates):
 
         * it treats every *EXPANSION, TYPE=ORTHO as diagonal in global axes: where an
-          *ORIENTATION or a composite ply angle turns the material axes so that the thermal
-          strain has shear in global axes, the shear is dropped, without an error, with every
-          *ELASTIC form and element type (C3D8/8R/8I/20R, S4, S8R and composite S8R, M3D4),
+          *ORIENTATION, a composite ply angle or a shell's own plane (_sheet_axes) turns the
+          material axes so that the thermal strain has shear in global axes, the shear is
+          dropped, without an error, with every *ELASTIC form and element type (C3D8/8R/8I/20R, S4, S8R and composite S8R, M3D4),
           in static, dynamic, explicit and coupled temperature-displacement steps, also with
           *PLASTIC.  Axes that the orientation only permutes are right;
         * it builds the thermal deformation gradient of a TYPE=ANISO expansion from the wrong
@@ -9439,7 +9478,7 @@ class Converter:
             return
         ortho: List[str] = []
         aniso: List[str] = []
-        for mat, axes in self._material_uses(blocks):
+        for mat, axes in self._material_uses(blocks, {m for m, (k, _e, _n) in kinds.items() if k == "ORTHO"}):
             kind, exp, name = kinds.get(mat, ("", None, ""))
             if kind == "ANISO" and name not in aniso:
                 aniso.append(name)
@@ -9453,9 +9492,10 @@ class Converter:
 
         if ortho:
             self.report.warn(f"{names(ortho)}: *EXPANSION, TYPE=ORTHO in material axes that an "
-                             f"*ORIENTATION or a composite ply angle turns off the global axes, in a "
-                             f"deck with NLGEOM steps. In NLGEOM steps ccx 2.23 drops the shear "
-                             f"that such a turned thermal strain has in global axes, without an "
+                             f"*ORIENTATION, a composite ply angle or a shell off the x-y plane turns "
+                             f"off the global axes, in a deck with NLGEOM steps. In NLGEOM steps ccx "
+                             f"2.23 drops the shear that such a turned thermal strain has in global "
+                             f"axes, without an "
                              f"error, with any *ELASTIC form, element type or procedure (probed: a "
                              f"free cube turned 30 deg keeps its normal strains but gets no shear "
                              f"strain; a [30/-30]s laminate's in-plane thermal strains come out 8 and "
@@ -9472,9 +9512,9 @@ class Converter:
                              f"the temperature does not change. The converted deck's linear steps "
                              f"are right. An expansion without shear coefficients is written as "
                              f"TYPE=ORTHO, which "
-                             f"ccx 2.23 computes right, except where an *ORIENTATION or a composite "
-                             f"ply angle turns it so that it has shear in global axes: TYPE=ORTHO "
-                             f"would lose that shear there without an error.", once=True)
+                             f"ccx 2.23 computes right, except where an *ORIENTATION, a composite "
+                             f"ply angle or a shell's plane turns it so that it has shear in global "
+                             f"axes: TYPE=ORTHO would lose that shear there without an error.", once=True)
 
     def _plan_coupled_inertia(self, blocks: List[Block]) -> None:
         """Abaqus/Standard's transient *COUPLED TEMPERATURE-DISPLACEMENT neglects inertia
@@ -9673,22 +9713,83 @@ class Converter:
             row += 1
         return lines
 
-    def _material_uses(self, blocks: List[Block]) -> List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]:
+    def _material_uses(self, blocks: List[Block], axes_of: Optional[set] = None
+                       ) -> List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]]:
         """``(MATERIAL, axes)`` for every section and composite ply (shell or solid) that uses
-        a material, its axes as _material_axes gives them (None where they vary)."""
+        a material, its axes as _material_axes gives them (None where they vary) — for the
+        materials ``axes_of`` on a shell, membrane or continuum shell, its elements' own
+        (_sheet_axes)."""
         oris = {b.uparam("NAME"): b for b in blocks if b.keyword == "ORIENTATION"}
         uses: List[Tuple[str, Optional[Tuple[Vec, Vec, Vec]]]] = []
         for b in blocks:
             if not b.keyword.endswith("SECTION"):
                 continue
             base = b.uparam("ORIENTATION")
+            sheet = b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION", "MEMBRANE SECTION")
             for _t, mat, ply in self._section_layers(b):    # a composite's plies, or its material
                 if not mat:
                     continue
                 angle = _ply_angle(ply) if ply else 0.0
                 ori, angle = (base, angle) if angle is not None else (ply, 0.0)   # else: a name
-                uses.append((mat.upper(), self._material_axes(oris, ori, angle)))
+                axes = self._material_axes(oris, ori, angle)
+                if sheet and axes is not None and mat.upper() in (axes_of or ()):
+                    axes = self._sheet_axes(b, ori, angle, axes)
+                uses.append((mat.upper(), axes))
         return uses
+
+    def _sheet_axes(self, b: Block, ori: str, angle: float,
+                    plain: Tuple[Vec, Vec, Vec]) -> Optional[Tuple[Vec, Vec, Vec]]:
+        """Abaqus' material axes (directions 1, 2 and the normal) of a layer of the shell,
+        membrane or continuum-shell section ``b`` with the rectangular orientation ``ori``
+        ("": none) and layer ``angle``, where all its elements have the same: the orientation
+        (without one, global X, or Z where X is the normal) projected onto each element and
+        turned by the angle about the normal (shell_local_axes, ply_axes; a continuum shell's
+        normal is its stack direction) — so the global axes only on a shell in the x-y plane.
+        The ccx deck has them too (_plan_shell_axes, the ply split).  None where they differ
+        (an axis of either sign counts as the same) or cannot be formed; ``plain`` (the
+        orientation's axes, _material_axes) on a section with none of these elements."""
+        if ori and ori not in self._orient_axes:
+            return None
+        plan = self._ply_sections.get(id(b))
+        elems = plan["elems"] if plan else dedup(self.geom.elset((b.param("ELSET") or "").strip()))
+        membrane = b.keyword == "MEMBRANE SECTION"
+        found: Optional[Tuple[Vec, Vec, Vec]] = None
+        keys: set = set()
+        for e in elems:
+            if plan:
+                n, centre = self._stack_geometry(*plan["stack_of"][e][1:])
+            elif e not in self.geom.elements:
+                continue
+            else:
+                typ, conn = self.geom.elements[e]
+                t = ccx_type(typ)
+                if split_suffixes(typ)[0] in PLY_SOLID and not membrane:
+                    got = self._continuum_normal(b, e)
+                    if got is None:
+                        return None
+                    n, centre = got
+                elif t.startswith("M3D") if membrane else \
+                        t in SHELL_TYPES and not t.startswith(("SC", "SAX")):
+                    geo = self._shell_geometry(e) if len(conn) >= 3 and \
+                        all(x in self.geom.nodes for x in conn) else None
+                    if geo is None:
+                        return None
+                    n, centre = geo[0], geo[1]
+                else:
+                    continue
+            if vnorm(n) < 0.5:
+                return None
+            # (a rectangular orientation without a distribution: _material_axes; _abaqus_frame)
+            fr = orientation_frame(*self.orientations[ori], centre, self._orient_rotation.get(ori)) \
+                if ori else None
+            d1, d2 = ply_axes(n, shell_local_axes(n, *fr) if fr else shell_local_axes(n), angle)
+            axes = (d1, d2, n)
+            keys.add(tuple(tuple(round(x * s, 9) + 0.0 for x in v) for v in axes
+                           for s in [1.0 if next((x for x in v if abs(x) > 1e-9), 1.0) > 0 else -1.0]))
+            if len(keys) > 1:
+                return None
+            found = found or axes
+        return found or plain
 
     def _material_axes(self, oris: Dict[str, Block], name: str,
                        angle: float) -> Optional[Tuple[Vec, Vec, Vec]]:
@@ -11130,6 +11231,23 @@ class Converter:
         (shell_local_axes; without one global X, or Z where X is the normal).  None for an
         element that is not a continuum shell on defined nodes, a degenerate one, or an
         orientation whose axes the converter does not know (_abaqus_frame)."""
+        got = self._continuum_normal(b, e)
+        name = b.uparam("ORIENTATION")
+        fr = self._abaqus_frame(e, name, got[1]) if got and name else None
+        if got is None or (name and fr is None):
+            return None
+        n, centre = got
+        why = shell_axes_caveat(n, *fr) if fr else None
+        if why:
+            self.report.warn(f"*{b.keyword} {(b.param('ELSET') or '').strip()}: orientation {name}: "
+                             f"{why} — verify the material directions.", once=True)
+        d1, d2 = shell_local_axes(n, *fr) if fr else shell_local_axes(n)
+        return d1, d2, n, centre
+
+    def _continuum_normal(self, b: Block, e: int) -> Optional[Tuple[Vec, Vec]]:
+        """The stack direction of continuum shell ``e`` under section ``b`` (_continuum_frame)
+        and the centre of its mid-surface; None for an element that is not a continuum shell
+        on defined nodes, or a degenerate one."""
         typ, conn = self.geom.elements[e]
         base = split_suffixes(typ)[0]
         if base not in PLY_SOLID or len(conn) != ELEMENT_NNODES[base] or \
@@ -11140,16 +11258,7 @@ class Converter:
         order = self._stack_order(conn, stack, axis) if len(conn) == 8 else tuple(range(1, 7))
         pc = [conn[q - 1] for q in order]
         n, centre = self._stack_geometry(pc[:len(pc) // 2], pc[len(pc) // 2:])
-        name = b.uparam("ORIENTATION")
-        fr = self._abaqus_frame(e, name, centre) if name else None
-        if vnorm(n) < 0.5 or (name and fr is None):
-            return None
-        why = shell_axes_caveat(n, *fr) if fr else None
-        if why:
-            self.report.warn(f"*{b.keyword} {(b.param('ELSET') or '').strip()}: orientation {name}: "
-                             f"{why} — verify the material directions.", once=True)
-        d1, d2 = shell_local_axes(n, *fr) if fr else shell_local_axes(n)
-        return d1, d2, n, centre
+        return (n, centre) if vnorm(n) >= 0.5 else None
 
     def _plan_material_symmetry(self, blocks: List[Block]) -> None:
         """How each material depends on its axes (_mat_symmetry): None for isotropic cards only,
@@ -19309,8 +19418,8 @@ class Converter:
         the whole card is commented —, comment lines, whether no line is left)."""
         drop = {k for (i, k) in self._tie_to_rigid if i == id(b)}
         keep, gone_lines, gone = [], [], None
-        for k, ln in enumerate(b.data):
-            if k in drop:
+        for ln in b.data:
+            if record_key(ln.split(",")) in drop:
                 continue
             hit = next((t.strip().upper() for t in ln.split(",")[:2]
                         if t.strip().upper() in self._analytic_skipped), None)
@@ -21995,7 +22104,8 @@ class Converter:
             for rec in merged_data_records(b):
                 if rec and rec[0].strip():
                     self._check_node_target(f"INITIAL CONDITIONS, TYPE={typ}", rec[0].strip())
-        midside = self._midside_records(b, layout) + self._qmem_records(b, layout) if layout else []
+        midside = (self._midside_temperatures(b, None) if typ == "TEMPERATURE" else
+                   self._midside_records(b, layout)) + self._qmem_records(b, layout) if layout else []
         if typ == "TEMPERATURE":
             fill = self._temperature_ic_fill(b.params)
             if fill:
@@ -22195,7 +22305,8 @@ class Converter:
                                    reduces="temperatures of a *BUCKLE step (thermal buckling load)")
         if b.has("USER"):
             return self._user_load_card(b)
-        if b.uparam("OP") == "NEW" and (self.emit.sp_adds or id(b) in self._op_new_drop):
+        new = b.uparam("OP") == "NEW"
+        if new and (self.emit.sp_adds or id(b) in self._op_new_drop):
             self._op_new_load(b)                    # (the base state's temperatures stay)
             b = Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items() if k != "OP"), b.data)
         if b.has("FILE"):
@@ -22203,7 +22314,63 @@ class Converter:
                              "file, not Abaqus' .odb / .fil, so these temperatures are lost (ccx "
                              "prints 'ERROR in readfrd' without stopping).", once=True)
             self._reduces("*TEMPERATURE, FILE= (Abaqus results file)")
-        return self.passthrough(b) + self._midside_records(b, "field") + self._qmem_records(b, "field")
+        return self.passthrough(b) + self._midside_temperatures(b, new) + self._qmem_records(b, "field")
+
+    def _midside_temperatures(self, b: Block, new: Optional[bool]) -> List[str]:
+        """The lines of temperature card ``b`` for the nodes the converter put between two
+        (_midside_records): where the card gives either end, the interpolation of the ends'
+        values in force after it (EmitState.give_temperatures; ``new``: the step card's OP=NEW,
+        None for an *INITIAL CONDITIONS card), which the Abaqus element sees between its nodes.
+        Exact for initial conditions, in a perturbation step, and in a general step where the
+        end the card does not give keeps its value through the step or ramps as the card's
+        lines do: the card and that end's card of this step have the same AMPLITUDE, or
+        neither has one and the step ramps both (a value of 0 needs neither).  Otherwise the
+        node follows the card's amplitude: EmitState.temps_loose, warned after the step where
+        that is the node's last line in it (_warn_loose_midside_temperatures)."""
+        vals: Dict[int, Tuple[float, ...]] = {}
+        for rec in merged_data_records(b):
+            g = trimmed_fields(rec)
+            if len(g) < 2 or not g[0]:
+                continue
+            try:
+                v = tuple(pf(x) if x else 0.0 for x in g[1:])
+            except ValueError:
+                continue
+            for n in self._resolve_nodes(g[0]):
+                vals[n] = v
+        st = self.emit
+        ic = new is None
+        if new:
+            st.give_temperatures({}, False, new=True)       # (the values OP=NEW leaves)
+        held = st.temps_ic if ic else st.temps_now
+        amp = "" if ic else b.uparam("AMPLITUDE")
+        if not ic and st.step is not None and not st.step.perturbation:
+            for a, c, m, _s in self._between() + self._tied_nodes:
+                if a not in vals and c not in vals:
+                    continue
+                other = None if a in vals and c in vals else c if a in vals else a
+                if other is not None and any(held.get(other, ())) and st.temps_amp.get(other, "") != amp:
+                    st.temps_loose.add(m)
+                else:
+                    st.temps_loose.discard(m)       # (ccx keeps a node's last line of the step)
+        out = self._midside_records(b, "field", held=held)
+        st.give_temperatures(vals, ic, amp=amp)
+        return out
+
+    def _warn_loose_midside_temperatures(self) -> None:
+        """After a step: the nodes whose last temperature line in it is not exact
+        (_midside_temperatures)."""
+        if self.emit.temps_loose:
+            self.report.warn(f"{len(self.emit.temps_loose)} node(s) the converter put between two "
+                             f"nodes (midside nodes of upgraded elements, ply interface nodes) lie "
+                             f"between ends whose temperatures vary on different amplitudes in a step "
+                             f"(cards with other AMPLITUDEs, or one end kept from before the step "
+                             f"while the other varies on one): such a node follows the interpolation "
+                             f"of the end values on its last card's amplitude, where the Abaqus "
+                             f"element varies each end on its own.", once=True)
+            self._reduces("temperatures of nodes the converter added between nodes given on "
+                          "cards with other amplitudes")
+            self.emit.temps_loose = set()
 
     def handle_flux_film(self, b: Block) -> List[str]:
         """``*FILM`` / ``*DFLUX`` / ``*CFLUX`` / ``*RADIATE`` pass through, minus the loads whose
@@ -22427,9 +22594,14 @@ class Converter:
         and S8R, and ignores it on S4 and S4R, which it expands into C3D8I / C3D8R (probed: no
         thermal bending, in a step and as an initial condition alike); no input reaches the
         temperatures of the expanded nodes.  A gradient the deck never changes from its
-        initial one strains nothing, in either program."""
-        flat = {n for e, (typ, conn) in self.geom.elements.items()
+        initial one strains nothing, in either program.  Likewise the gradients that
+        _plan_point_temperatures gives the B31 / B31R of a TEMPERATURE=VALUES beam section,
+        which ccx 2.23 ignores too (probed; B32 / B32R read them)."""
+        flat = {n: "shell" for e, (typ, conn) in self.geom.elements.items()
                 if ccx_type(typ) in ("S4", "S4R") and e not in self._point_temps for n in conn}
+        flat.update((n, "beam") for e in self._point_beams if e in self.geom.elements
+                    and ccx_type(self.geom.elements[e][0]) in ("B31", "B31R")
+                    for n in self.geom.elements[e][1])
         initial: Dict[int, tuple] = {}
         changed: set = set()
         for kw in ("INITIAL CONDITIONS", "TEMPERATURE") if flat else ():
@@ -22451,12 +22623,275 @@ class Converter:
                             initial[n] = g
                         elif g != initial.get(n, ()) or (g and b.param("AMPLITUDE")):
                             changed.add(n)
-        if changed:
+        shells = [n for n in changed if flat[n] == "shell"]
+        if shells:
             self.report.warn(f"Temperatures change the gradient through the thickness of S4 / S4R "
-                             f"shells on {len(changed)} node(s), which ccx 2.23 ignores on these "
+                             f"shells on {len(shells)} node(s), which ccx 2.23 ignores on these "
                              f"elements (probed: S3, S6, S8 and S8R read it), so their thermal "
                              f"bending is lost. Mesh those shells with S8R to keep it.")
             self._reduces("temperature gradient on S4 / S4R shells (ccx ignores it)")
+        if len(shells) < len(changed):
+            self.report.warn(f"Temperatures at the points of a *BEAM SECTION, TEMPERATURE=VALUES "
+                             f"vary across the section on {len(changed) - len(shells)} node(s) of "
+                             f"B31 / B31R beams: written as gradients, which ccx 2.23 ignores on "
+                             f"these elements (probed: B32 / B32R read them), so their thermal "
+                             f"bending is lost. Mesh those beams with B32 to keep it.")
+            self._reduces("temperature gradient on B31 / B31R beams (ccx ignores it)")
+
+    # The temperature points of a *BEAM SECTION, TEMPERATURE=VALUES (Abaqus 2017 "Beam
+    # cross-section library", the figures of temperature input at specific points): their
+    # number in a plane and in space
+    BEAM_TEMPERATURE_POINTS = {"RECT": (3, 4), "BOX": (3, 4), "CIRC": (3, 4), "PIPE": (3, 4),
+                               "THICK PIPE": (3, 4), "HEX": (3, 6), "I": (3, 5), "L": (2, 3),
+                               "TRAPEZOID": (3, 4)}
+
+    def _plan_point_temperatures(self, blocks: List[Block]) -> None:
+        """Temperature lines on the nodes of a *SHELL SECTION (*SHELL GENERAL SECTION),
+        TEMPERATURE=n or a *BEAM SECTION, TEMPERATURE=VALUES give the temperatures at points
+        of the section; ccx 2.23 reads a shell's line as (temperature at the reference
+        surface, gradient through the thickness) and a beam's as (temperature, gradient along
+        local 2, along local 1), as Abaqus' default GRADIENTS form, so a uniformly heated plate
+        would bend.  Each such line (*TEMPERATURE, *INITIAL CONDITIONS, TYPE=TEMPERATURE) is
+        written in that form (_point_line), split per node group where its nodes read it
+        otherwise; the sections' elements leave _point_temps (the lines are gradient lines
+        now), and the beams' join _point_beams.  Lines of more than seven values continue on
+        the next lines, as many as the model's largest count needs (Keywords *TEMPERATURE).
+        Continuum shells take nodal temperatures (2017 "Using a shell section integrated
+        during the analysis"): their lines go through.  Abaqus assumes the nodes of an element
+        read their lines as its section does; where a node's sections read a line otherwise,
+        the first one's form is written: warned, reduced physics."""
+        readers: Dict[int, tuple] = {}
+        for b in blocks:
+            r = self._point_reader(b)
+            if r is not None:
+                for e in self._existing(b.param("ELSET") or ""):
+                    readers.setdefault(e, r)
+        self._point_beams = {e for e, r in readers.items() if r[0] == "BEAM"}
+        if not readers:
+            return
+        by_node: Dict[int, List[tuple]] = {}
+        for e, r in readers.items():
+            for n in self.geom.elements[e][1]:
+                if r not in by_node.setdefault(n, []):
+                    by_node[n].append(r)
+        count = max(self._point_count(r) or 1 for r in readers.values())
+        span = 1 + -(-(count - 7) // 8) if count > 7 else 1
+        memo: Dict[tuple, Tuple[Tuple[float, ...], str]] = {}
+        why: "OrderedDict[str, None]" = OrderedDict()
+        clash = 0
+
+        def line(n: int, v: Tuple[float, ...]) -> Tuple[float, ...]:
+            nonlocal clash
+            outs = []
+            for r in by_node[n]:
+                if (r, v) not in memo:
+                    memo[(r, v)] = self._point_line(r, v)
+                outs.append(memo[(r, v)])
+            if any(o[0] != outs[0][0] for o in outs[1:]):
+                clash += 1
+            if outs[0][1]:
+                why[outs[0][1]] = None
+            return outs[0][0]
+
+        self._reserve_names()
+        for b in blocks:
+            if not (b.keyword == "TEMPERATURE" and not b.has("FILE") and not b.has("USER") or
+                    b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "TEMPERATURE"):
+                continue
+            lines = [ln for ln in b.data if ln.strip()] if span == 1 else list(b.data)
+            records = [sum((ln.split(",") for ln in lines[i:i + span]), [])
+                       for i in range(0, len(lines), span)]
+            data: List[str] = []
+            hit = False
+            for rec in records:
+                g = trimmed_fields(rec)
+                nodes = self._resolve_nodes(g[0]) if len(g) > 1 and g[0] else []
+                mine = [n for n in nodes if n in by_node]
+                try:
+                    v = tuple(pf(x) if x else 0.0 for x in g[1:])
+                except ValueError:
+                    mine = []
+                if not mine:
+                    data.append(", ".join(g[:4] if span > 1 else g))
+                    continue
+                hit = True
+                groups: "OrderedDict[Tuple[float, ...], List[int]]" = OrderedDict()
+                rest = [n for n in nodes if n not in by_node]
+                for n in mine:
+                    groups.setdefault(line(n, v), []).append(n)
+                if rest:
+                    data.append(", ".join([self._point_set(g[0], rest)] + g[1:4]))
+                for out, ns in groups.items():
+                    target = g[0] if not rest and len(groups) == 1 else self._point_set(g[0], ns)
+                    data.append(", ".join([target] + [short_real(x, 12) for x in out]))
+            if hit:
+                b.data = data
+        self._point_temps -= set(readers)
+        shells = any(r[0] != "BEAM" for r in readers.values())
+        beams = any(r[0] == "BEAM" for r in readers.values())
+        self.report.note(" ".join(
+            (["*SHELL SECTION, TEMPERATURE=n: the temperature lines on its nodes give the "
+              "temperatures at n equally spaced points through each layer; written as ccx's "
+              "(temperature at the reference surface, gradient through the thickness), exact "
+              "where they vary linearly through the thickness."] if shells else []) +
+            (["*BEAM SECTION, TEMPERATURE=VALUES: the temperature lines on its nodes give the "
+              "temperatures at the section's temperature points; written as ccx's (temperature, "
+              "gradients along local 2 and 1), exact where they are equal, or vary linearly "
+              "across a RECT section (across a CIRC, PIPE or THICK PIPE one in a plane)."]
+             if beams else [])), once=True)
+        for w in why:
+            self.report.warn(w, once=True)
+            self._reduces("temperatures at section points (TEMPERATURE=n / VALUES) not exact as ccx's "
+                          "temperature and gradients")
+        if clash:
+            self.report.warn(f"{clash} node(s) belong to elements whose sections read their "
+                             f"temperature lines otherwise (other TEMPERATURE= points, layups or "
+                             f"thicknesses); Abaqus assumes they agree, ccx takes one line per node: "
+                             f"the first section's form is written — verify.", once=True)
+            self._reduces("temperature lines read otherwise by sections sharing a node")
+
+    def _point_set(self, name: str, nodes: List[int]) -> str:
+        """A node set of ``nodes`` (part of the line target ``name``) for a rewritten
+        temperature line: the node itself for one node."""
+        if len(nodes) == 1:
+            return str(nodes[0])
+        new = self._fresh_name(f"{name}_T")
+        self.geom.nsets[new] = list(nodes)
+        return new
+
+    def _point_reader(self, b: Block) -> Optional[tuple]:
+        """How a section card reads temperature points (_plan_point_temperatures), or None for
+        one that reads gradients: ("SHELL", id, the points' positions through the thickness
+        from the mid-surface, bottom first (n >= 2: 1 + layers x (n - 1) shared at the layer
+        interfaces; n = 1: None), the layers' (bottom, top) positions, thickness (None: nodal
+        or distributed), OFFSET fraction (None: a distribution)); ("BEAM", id, SECTION, in a
+        plane, its dimensions); ("FLAT", id, None) where the points or ccx's reading of a
+        gradient are not known (axisymmetric shells): only equal values are exact."""
+        kw = b.keyword
+        if kw in ("SHELL SECTION", "SHELL GENERAL SECTION"):
+            val = b.uparam("TEMPERATURE")
+            if not val or val.startswith("GRAD"):
+                return None
+            elset = b.param("ELSET") or ""
+            if self._continuum_shell_elset(elset):
+                return None
+            if any(self.geom.elements[e][0].upper().startswith("SAX") for e in self._existing(elset)):
+                return ("FLAT", id(b), None)        # (ccx's reading of an axisymmetric gradient: unprobed)
+            try:
+                n = pint(val)
+                if n < 1:
+                    raise ValueError
+                layers = [pf(x) for x, _m, _o in self._section_layers(b, strict=True)] if \
+                    b.has("COMPOSITE") else [pf((merged_data_records(b) or [[""]])[0][0])]
+            except (ValueError, IndexError):
+                return ("FLAT", id(b), None)
+            total = sum(layers)
+            if not layers or total <= 0.0 or any(h <= 0.0 for h in layers):
+                return ("FLAT", id(b), None)
+            bounds, z = [], -0.5 * total
+            for h in layers:
+                bounds.append((z, z + h))
+                z += h
+            pts = None if n == 1 else tuple(
+                [bounds[0][0]] + [lo + (hi - lo) * k / (n - 1) for lo, hi in bounds for k in range(1, n)])
+            thick = None if b.has("NODAL THICKNESS") or b.has("SHELL THICKNESS") else total
+            return ("SHELL", id(b), pts, tuple(bounds), thick, offset_fraction(b.param("OFFSET")))
+        if kw == "BEAM SECTION" and b.uparam("TEMPERATURE") == "VALUES":
+            sec = b.uparam("SECTION")
+            planar = any(self.geom.elements[e][0].upper() in PLANAR_LINE_TYPES
+                         for e in self._existing(b.param("ELSET") or ""))
+            try:
+                dims = tuple(pf(x) for x in (merged_data_records(b) or [[]])[0] if x)
+            except ValueError:
+                dims = ()
+            return ("BEAM", id(b), sec, planar, dims)
+        return None
+
+    def _point_count(self, r: tuple) -> Optional[int]:
+        """The number of temperature values a node of reader ``r`` (_point_reader) takes."""
+        if r[0] == "SHELL":
+            return len(r[2]) if r[2] is not None else len(r[3])
+        if r[0] == "BEAM":
+            pts = self.BEAM_TEMPERATURE_POINTS.get(r[2])
+            return pts[0 if r[3] else 1] if pts else None
+        return None
+
+    def _point_line(self, r: tuple, v: Tuple[float, ...]) -> Tuple[Tuple[float, ...], str]:
+        """ccx's (temperature[, gradients]) for the values ``v`` at the temperature points of
+        reader ``r`` (_point_reader; missing values 0, Abaqus' blank), and why that is not
+        exact ("" where it is).  Equal values: the temperature alone (ccx: gradient 0).  A
+        shell: Abaqus interpolates linearly between the points (a constant per layer for n =
+        1; 2017 "Using a shell section integrated during the analysis"), and the line that
+        keeps the profile's mean and first moment through the thickness — the same section
+        forces in a homogeneous elastic shell — is exact where the profile is linear; its
+        temperature is the one at the reference surface (OFFSET), where ccx 2.23 reads it
+        otherwise (probed: an offset shell's nodes stretch by alpha (T - g OFFSET t / 3), not
+        alpha T).  A RECT beam: the corners in space (1 at -1, -2, then 2, 3, 4 counterclockwise),
+        bottom, centre and top in a plane — exact where the values are linear across it; in a
+        plane, CIRC, PIPE and THICK PIPE alike (bottom, centre, top: at -r, 0, r)."""
+        k = self._point_count(r)
+        if k is not None:
+            v = (v + (0.0,) * k)[:k]
+        if v and max(v) - min(v) <= 1e-12 * max(abs(x) for x in v):
+            return (v[0],), ""
+        if r[0] == "SHELL":
+            pts, bounds, thick, off = r[2], r[3], r[4], r[5]
+            total = bounds[-1][1] - bounds[0][0]
+            if pts is not None:
+                segs = [(pts[i], pts[i + 1], v[i], v[i + 1]) for i in range(len(pts) - 1)]
+            else:
+                segs = [(lo, hi, x, x) for (lo, hi), x in zip(bounds, v)]
+            i0 = sum((x1 + x2) * (z2 - z1) / 2.0 for z1, z2, x1, x2 in segs)
+            i1 = sum((z2 - z1) * (x1 * (2 * z1 + z2) + x2 * (z1 + 2 * z2)) / 6.0 for z1, z2, x1, x2 in segs)
+            mean, grad = i0 / total, 12.0 * i1 / total ** 3
+            tol = 1e-9 * max(abs(x) for x in v)
+            exact = pts is not None and all(abs(x - mean - grad * z) <= tol for z, x in zip(pts, v))
+            ref = mean + grad * (off or 0.0) * total
+            if not exact:
+                return (ref, grad), ("Temperatures at the points of a *SHELL SECTION, TEMPERATURE=n "
+                                     "that do not vary linearly through the thickness: written as the "
+                                     "linear profile with the same mean and first moment (the same "
+                                     "section forces in a homogeneous elastic shell; Abaqus' stresses "
+                                     "through the thickness differ).")
+            if thick is None:
+                return (ref, grad), ("Temperatures that vary through the thickness of a *SHELL SECTION, "
+                                     "TEMPERATURE=n with NODAL THICKNESS / SHELL THICKNESS: their gradient "
+                                     "is taken over the section's data-line thickness, not each node's.")
+            if off is None or off:
+                return (ref, grad), ("Temperatures that vary through the thickness of a *SHELL SECTION, "
+                                     "TEMPERATURE=n with an OFFSET: written as Abaqus' temperature at the "
+                                     "reference surface and gradient, which ccx 2.23 reads otherwise on an "
+                                     "offset shell (probed: its nodes stretch by alpha (T - g OFFSET t / 3), "
+                                     "not alpha T).")
+            return (ref, grad), ""
+        if r[0] == "BEAM":
+            sec, planar, dims = r[2], r[3], r[4]
+            half = (dims[1] / 2.0 if sec == "RECT" and len(dims) > 1 else
+                    dims[0] if sec in ("CIRC", "PIPE", "THICK PIPE") and dims else 0.0) if planar else 0.0
+            if half > 0.0:
+                grad = (v[2] - v[0]) / (2.0 * half)
+                if abs(v[1] - (v[0] + v[2]) / 2.0) <= 1e-9 * max(abs(x) for x in v):
+                    return (v[1], grad), ""
+                return (v[1], grad), ("Temperatures at the points of a *BEAM SECTION, TEMPERATURE=VALUES "
+                                      "that do not vary linearly across the section: written as the "
+                                      "centre's temperature and the gradient between the bottom and top "
+                                      "points.")
+            if sec == "RECT" and not planar and len(dims) > 1 and dims[0] > 0.0 and dims[1] > 0.0:
+                t1, t2, t3, t4 = v
+                g1 = (t2 + t3 - t1 - t4) / (2.0 * dims[0])
+                g2 = (t3 + t4 - t1 - t2) / (2.0 * dims[1])
+                out = (sum(v) / 4.0, g2, g1)
+                if abs(t1 - t2 + t3 - t4) <= 1e-9 * max(abs(x) for x in v):
+                    return out, ""
+                return out, ("Temperatures at the corners of a *BEAM SECTION, SECTION=RECT, "
+                             "TEMPERATURE=VALUES that do not vary linearly across the section: "
+                             "written as their mean and the gradients between the sides (the same "
+                             "section forces in an elastic beam).")
+        return (sum(v) / len(v),), ("Temperatures that differ between the points of a section "
+                                    "with temperatures at points (TEMPERATURE=n or VALUES) where the "
+                                    "converter writes no gradient (point positions it does not use, "
+                                    "an axisymmetric shell): written as their mean, without the "
+                                    "variation across the section.")
 
     def _default_temperature_ic(self) -> List[str]:
         """Initial temperatures for a deck that applies ``*TEMPERATURE`` without any: Abaqus
@@ -22754,12 +23189,12 @@ class Converter:
                                  f"and TYPE).", once=True)
         out = [emit_keyword("SURFACE", params)]
         on_carriers = 0
-        for k, rec in enumerate(merged_data_records(b)):
+        for rec in merged_data_records(b):
             f = [x for x in rec if x != ""]
             if not f:
                 continue
-            if (id(b), k) in self._rigid_lines:       # faces of rigid elements -> their skins
-                out.extend(self._rigid_lines[(id(b), k)])
+            if (id(b), record_key(f)) in self._rigid_lines:     # faces of rigid elements -> their skins
+                out.extend(self._rigid_lines[(id(b), record_key(f))])
                 self.report.note("*SURFACE faces of rigid elements (SPOS / SNEG; no label: both) -> "
                                  "the matching faces of their skins.", once=True)
                 continue
@@ -23075,7 +23510,8 @@ class Converter:
         self._check_nlgeom_expansion(blocks)
         self._plan_coupled_inertia(blocks)
         self._plan_load_facts(blocks)           # after the mesh planners: the final element types
-        self._plan_shell_gradients(blocks)      # after _plan_load_facts: the temperature points
+        self._plan_point_temperatures(blocks)   # after _plan_load_facts: the temperature points
+        self._plan_shell_gradients(blocks)      # after it: the gradients it writes
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_dashpots(blocks)             # after the planners above: the nodes' *TRANSFORM axes
         self._plan_transformed_springs(blocks)  # likewise
@@ -23572,11 +24008,11 @@ class Converter:
                              "*ROTARY INERTIA elements are. Verify the body's inertia.")
         # the sides the deck's surfaces use, and the surface records that name rigid elements
         need: Dict[int, set] = {e: set() for e in rigid}
-        entries: List[Tuple[Block, int, List[int], List[int], str]] = []
+        entries: List[Tuple[Block, List[str], List[int], List[int], str]] = []
         for b in blocks:
             if b.keyword != "SURFACE" or (b.param("TYPE") or "ELEMENT").strip().upper() != "ELEMENT":
                 continue
-            for k, rec in enumerate(merged_data_records(b)):
+            for rec in merged_data_records(b):
                 f = [x for x in rec if x != ""]
                 if not f:
                     continue
@@ -23598,10 +24034,10 @@ class Converter:
                 for e in rid:
                     if rigid[e][0] != "RB3D2":
                         need[e].update(sides)
-                entries.append((b, k, rid, [e for e in eids if e not in rigid], sides))
+                entries.append((b, f, rid, [e for e in eids if e not in rigid], sides))
         refs = {self._ref_node(b) for b in bodies} - {None}
         self._plan_skin_elements(blocks, rigid, need, shift, refs)
-        for b, k, rid, rest, sides in entries:
+        for b, f, rid, rest, sides in entries:
             lines: List[str] = []
             for side in sides:
                 by_face: "OrderedDict[str, List[int]]" = OrderedDict()
@@ -23614,11 +24050,10 @@ class Converter:
                     self.geom.elsets[name] = sks
                     lines.append(f"{name}, {face}")
             if rest:
-                f = [x for x in merged_data_records(b)[k] if x != ""]
                 name = self._rigid_set_name("ABQ2CCX_RS")
                 self.geom.elsets[name] = rest
                 lines.append(", ".join([name] + f[1:]))
-            self._rigid_lines[(id(b), k)] = lines
+            self._rigid_lines[(id(b), record_key(f))] = lines
         # the skin faces of the surfaces made of rigid elements only, and each skin's body
         faces_of: Dict[str, List[Tuple[int, str]]] = {}
         skin_body: Dict[int, Block] = {}
@@ -24311,7 +24746,7 @@ class Converter:
                     tol = pf(b.param("POSITION TOLERANCE") or "0")
                 except ValueError:
                     tol = 0.0
-            for k, rec in enumerate(merged_data_records(b)):
+            for rec in merged_data_records(b):
                 toks = [x.strip().upper() for x in rec if x.strip()]
                 if len(toks) < 2:
                     continue
@@ -24418,7 +24853,7 @@ class Converter:
                 turns = pair and any(n in turning for n in tied)
                 into = pins_of if turns or b.has("NO ROTATION") else members_of
                 into.setdefault(id(body), []).extend(tied)
-                self._tie_to_rigid.add((id(b), k))
+                self._tie_to_rigid.add((id(b), record_key(toks)))
                 if len(tied) < len(slaves):
                     why = ("not in its TIED NSET" if chosen is not None else
                            f"farther than the position tolerance ({tol_k:.3g}) from the rigid master")
@@ -25882,18 +26317,22 @@ class Converter:
         return self._between_cache[1]
 
     def _midside_records(self, b: Block, layout: str, only: Optional[set] = None,
-                         note: bool = True) -> List[str]:
+                         note: bool = True, held: Optional[Dict[int, Tuple[float, ...]]] = None
+                         ) -> List[str]:
         """Extra data lines that carry a per-node card onto the nodes the converter put
         between two nodes (_between: midside nodes of upgraded beams and shells, ply interface
         nodes; with ``only``, those of its nodes): when the card gives both end nodes a value
         (by id or through a set), the new node gets the linear interpolation, which is what the
         Abaqus element sees between its nodes.  ``layout`` is ``"boundary"`` (node, first
         DOF[, last DOF[, magnitude]] or a named type), ``"dof"`` (node, DOF, value) or
-        ``"field"`` (node, values...).  Appended after the card's own lines, they override
-        what a set gave the new node; a value the card already gives it is not repeated.  A
-        *BOUNDARY on nodes whose *TRANSFORM axes differ (a cylindrical or spherical system
-        along a curved edge) is interpolated in global components (_turned_midside_runs).
-        ``note``: say so in the report (not when planning)."""
+        ``"field"`` (node, values..., a shorter line's missing ones 0).  Appended after the
+        card's own lines, they override what a set gave the new node; a value the card already
+        gives it is not repeated.  A *BOUNDARY on nodes whose *TRANSFORM axes differ (a
+        cylindrical or spherical system along a curved edge) is interpolated in global
+        components (_turned_midside_runs).  ``held`` ("field"): the values in force before the
+        card (a node in none: 0), which an end the card does not give keeps, so that the new
+        node follows a card that gives one end (temperatures over several cards).  ``note``:
+        say so in the report (not when planning)."""
         if not self._midside and not self._edge_nodes and not self._tied_nodes:
             return []
         recs: Dict[int, Dict[int, object]] = {}
@@ -25925,12 +26364,17 @@ class Converter:
         beam_mids = {m for _, _, m in self._midside.values()}
         turn = layout == "boundary" and b.keyword == "BOUNDARY" and bool(self._transformed)
         for a, c, m, s in self._between() + (self._tied_nodes if layout != "boundary" else []):
-            if a not in recs or c not in recs or (only is not None and m not in only):
+            if held is not None and layout == "field" and (a in recs or c in recs) and \
+                    (only is None or m in only):
+                ra, rc = ({0: list(recs[x][0]) if x in recs else list(held.get(x, ()))} for x in (a, c))
+            elif a not in recs or c not in recs or (only is not None and m not in only):
                 continue
-            ra, rc, rm = recs[a], recs[c], recs.get(m, {})
+            else:
+                ra, rc = recs[a], recs[c]
+            rm = recs.get(m, {})
             n_out = len(out)
             if layout == "field":
-                mean = [(1.0 - s) * x + s * y for x, y in zip(ra[0], rc[0])]
+                mean = [(1.0 - s) * x + s * y for x, y in BaseStateRestore.padded(tuple(ra[0]), tuple(rc[0]))]
                 if rm.get(0) != mean:
                     out.append(", ".join([str(m)] + ["%.12g" % x for x in mean]))
                     kinds.add("beam" if m in beam_mids else "edge")
@@ -26092,43 +26536,61 @@ class Converter:
         by_end: Dict[int, List[Tuple[int, int]]] = {}
         for a, c, m in trips:
             by_end.setdefault(a, []).append((c, m))
-        skipped: List[str] = []
+        skipped: Dict[str, List[int]] = {}          # set -> the new nodes it did not take
         for name, ids in self.geom.nsets.items():
             members = set(ids)
             add = [m for n in dedup(ids) for c, m in by_end.get(n, ()) if c in members and m not in members]
             if not add:
                 continue
             if name in counted or name in self.geom.unsorted:
-                skipped.append(name)
+                skipped[name] = dedup(add)
             else:
                 ids.extend(add)
         isint = re.compile(r"[-+]?\d+").fullmatch
+        copies: Dict[str, str] = {}
         for b in blocks:
             if b.keyword == "SURFACE" and b.uparam("TYPE") == "NODE" and b.uparam("NAME") not in kept:
                 listed = {int(r[0]) for r in merged_data_records(b) if r and isint(r[0])}
                 extra = [m for a, c, m in trips if a in listed and c in listed and m not in listed]
-                if extra:
-                    b.data = list(b.data) + [str(m) for m in dedup(extra)]
+                # a line naming a set that kept its nodes (a load counts them): a copy with them,
+                # so that the coupling or contact on the surface has the whole edge
+                data, renamed = [], False
+                for line in b.data:
+                    f = line.split(",")
+                    name = f[0].strip().upper()
+                    if name in skipped:
+                        if name not in copies:
+                            self._reserve_names()
+                            copies[name] = self._fresh_name(f"{name}_EDGE")
+                            self.geom.nsets[copies[name]] = dedup(self.geom.nset(name) + skipped[name])
+                        line, renamed = ", ".join([copies[name]] + [x.strip() for x in f[1:]]), True
+                    data.append(line)
+                if extra or renamed:
+                    b.data = data + [str(m) for m in dedup(extra)]
                     self._register_surface(b)
             elif b.keyword in ("KINEMATIC COUPLING", "DISTRIBUTING COUPLING") and b.keyword in joins:
                 extra = self._midside_records(b, "boundary" if b.keyword.startswith("K") else "field",
                                               only={m for _a, _c, m in trips})
                 if extra:
                     b.data = list(b.data) + extra
+        held = list(skipped)
+        which = f"{', '.join(held[:3])}{', ...' if len(held) > 3 else ''}"
+        copied = f", and a node *SURFACE naming one takes a copy with them ({', '.join(copies.values())})" \
+            if copies else ""
         if skipped and beam:
-            self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
+            self.report.note(f"Node set(s) {which} "
                              f"hold both end nodes of upgraded 2-node beams but a load, constraint "
                              f"or distributing coupling card counts their nodes (or the set is "
                              f"UNSORTED), so the midside nodes were not added (an extra node there "
                              f"would add load or equation terms); *BOUNDARY and temperature lines on "
-                             f"them still reach the midside nodes.", once=True)
+                             f"them still reach the midside nodes{copied}.", once=True)
         elif skipped:
-            self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
+            self.report.note(f"Node set(s) {which} "
                              f"hold both ends of an edge the converter put nodes on (an upgraded "
                              f"shell's midside node, ply interface nodes) but a load or constraint "
                              f"card counts their nodes, so those nodes were not added (an extra node "
                              f"there would add load or equation terms); *BOUNDARY and temperature "
-                             f"lines on them still reach the new nodes.", once=True)
+                             f"lines on them still reach the new nodes{copied}.", once=True)
 
     def _transform_new_nodes(self, blocks: List[Block]) -> None:
         """A node the converter put between two nodes of a *TRANSFORM's node set takes the
@@ -26668,7 +27130,8 @@ class Converter:
         # 2-node beams along an upgraded edge, and other elements left with a hanging midside node
         general = {e for b in blocks if b.keyword == "BEAM GENERAL SECTION"
                    for e in self.geom.elset((b.param("ELSET") or "").strip())}
-        beams, hanging = 0, set()
+        beams = 0
+        hanging: Dict[int, List[Tuple[int, int, int]]] = {}
         ends: Dict[int, List[Tuple[int, int]]] = {}
         for a, c, m in made:
             ends.setdefault(a, []).append((c, m))
@@ -26677,7 +27140,7 @@ class Converter:
             if e in comp or e in self._midside:
                 continue
             members = set(conn)
-            hit = [m for n in conn for c, m in ends.get(n, ()) if c in members]
+            hit = [(n, c, m) for n in conn for c, m in ends.get(n, ()) if c in members]
             if not hit:
                 continue
             up = QUADRATIC_UPGRADE.get(ccx_type(typ))
@@ -26688,8 +27151,15 @@ class Converter:
                 self._elem_types.add(up)
                 beams += 1
             else:
-                hanging.add(e)
+                hanging[e] = hit
         self._extend_edge_sets(blocks, made)
+        if hanging:
+            # an edge whose ends and new node all move with one rigid body stays straight with
+            # it, as the element's edge does (a rigid element's skin on the shell's edge)
+            bodies = [set(tie + pin) for tie, pin in (self._rigid_body_members(b) for b in blocks
+                                                      if b.keyword == "RIGID BODY")]
+            hanging = {e: hit for e, hit in hanging.items()
+                       if not all(any({n, c, m} <= s for s in bodies) for n, c, m in hit)}
         span = f"node {made[0][2]}" if len(made) == 1 else \
             f"nodes {made[0][2]}-{made[-1][2]}" if made else "no new node"
         if hanging:
@@ -28948,7 +29418,7 @@ class Converter:
                 for rec in merged_data_records(b):
                     if rec and rec[0]:
                         covered.update(self._resolve_nodes(rec[0]))
-                covered.update(int(ln.split(",")[0]) for ln in self._midside_records(b, "field") +
+                covered.update(int(ln.split(",")[0]) for ln in self._midside_records(b, "field", held={}) +
                                self._qmem_records(b, "field"))
         self._temp_ic_covered = covered if any_temp_ic else None     # _complete_temperature_ic
         if any_temp_ic and self.geom.nodes and not set(self.geom.nodes) <= covered:
@@ -29020,7 +29490,7 @@ class Converter:
             recs = [[x.strip() for x in r] for r in merged_data_records(b)] if b.keyword in (
                 "SOLID SECTION", "BEAM SECTION", "BEAM GENERAL SECTION", "CLOAD") else []
             if (b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION") and
-                    (b.uparam("TEMPERATURE") or "GRADIENT") != "GRADIENT") or \
+                    not (b.uparam("TEMPERATURE") or "GRADIENT").startswith("GRAD")) or \
                     (b.keyword == "BEAM SECTION" and b.uparam("TEMPERATURE") == "VALUES"):
                 self._point_temps.update(self.geom.elset(b.param("ELSET") or ""))
             if b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION"):

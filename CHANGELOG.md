@@ -24,6 +24,19 @@ physics.
   zero static perturbation one as 1.0 and adds it to its total time: the later steps'
   `TIME=TOTAL TIME` amplitudes are now shifted by it (were read 1.0 late, or warned as unknown),
   and such a modal dynamic step gets the `INC=` its increments need.
+* **Shell sections: material axes and temperatures** — a shell, membrane or continuum shell
+  off the x-y plane counted as having the global axes, so an orthotropic `*EXPANSION` there got
+  no NLGEOM warning (ccx 2.23 drops its turned shear: half the stretch), and a zero-shear
+  `TYPE=ANISO` one went out as `ORTHO`; they now take their elements' own axes. `*SHELL
+  SECTION, TEMPERATURE=n` and `*BEAM SECTION, TEMPERATURE=VALUES` were dropped with a note, and
+  ccx read the second point's temperature as a gradient (a uniformly heated plate bent); their
+  temperature lines are now written as ccx's temperature and gradients — exact where the
+  values vary linearly through the thickness or across a RECT section, warned otherwise. A
+  midside node the converter adds between nodes given temperatures on two cards got none
+  (a bar moved 0.068 where it stays put); it now follows the temperatures in force. A
+  `*SURFACE` with a rigid element line and a line the ply split divides lost a ply line; rigid
+  skins on an S4R edge written as S8R drew a false "hanging midside node"; and a coupling on a
+  node set that a load also names missed the S8R midside nodes (the surface takes a copy now).
 * **Eigenvalue and modal steps ccx gets wrong with knots** — a `*MODAL DYNAMIC` step
   segfaulted ccx on a rotational BC of a shell/beam node and stopped on a moment there, and a
   `*CLOAD` on such a node moved the model wrongly in `*MODAL DYNAMIC` and `*STEADY STATE

@@ -3097,6 +3097,54 @@ def test_aniso_expansion_kept_when_turned():
     assert ply_card("0.1, 3, PLY, 0.\n0.1, 3, PLY, 90.\n") == "*EXPANSION, TYPE=ORTHO"
 
 
+INCLINED = "*Node\n1, 0., 0., 0.\n2, 0.70710678, -0.70710678, 0.\n3, 0.70710678, -0.70710678, 1.\n4, 0., 0., 1.\n"
+FLAT = "*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+
+
+def sheet_expansion(nodes, element="*Element, type=S4, elset=P\n1, 1, 2, 3, 4\n",
+                    section="*Shell Section, elset=P, material=M\n0.01\n", expansion=ORTHO_EXPANSION):
+    """(body, report) of a heated sheet of material M (isotropic *ELASTIC) in an NLGEOM step."""
+    body, _, rep = convert_str(nodes + element + "*Nset, nset=ALL\n" + ", ".join(
+        str(n) for n in range(1, 9 if "SC8R" in element else 5)) + "\n" + section +
+        "*Material, name=M\n*Elastic\n1000., 0.\n" + expansion + TEMPS_IC + NLGEOM_STEP + HEATED +
+        "*End Step\n")
+    return body, rep
+
+
+def test_shell_material_axes_are_the_shells_own():
+    # Abaqus' (and ccx's expanded shell's) material direction 1 on a shell without an
+    # orientation is global X projected onto it: on a shell off the x-y plane an orthotropic
+    # thermal strain has shear in global axes, which ccx 2.23 drops under NLGEOM (code review 3:
+    # the inclined strip stretched half as much along direction 1, unwarned)
+    warned = "Material M: *EXPANSION, TYPE=ORTHO in material axes"
+    assert warned in sheet_expansion(INCLINED)[1].text()
+    assert warned not in sheet_expansion(FLAT)[1].text()
+    assert warned not in sheet_expansion(FLAT, "*Element, type=S4, elset=P\n1, 1, 4, 3, 2\n")[1].text()
+    # a zero-shear ANISO one stays ANISO there (ccx then stops loudly), goes out ORTHO on the flat one
+    assert expansion_card(sheet_expansion(INCLINED, expansion=ANISO_EXPANSION)[0], "M")[0] == \
+        "*EXPANSION, TYPE=ANISO"
+    assert expansion_card(sheet_expansion(FLAT, expansion=ANISO_EXPANSION)[0], "M")[0] == \
+        "*EXPANSION, TYPE=ORTHO"
+    # membranes and continuum shells alike; a ply angle turns about the shell's normal
+    membrane = ("*Element, type=M3D4, elset=P\n1, 1, 2, 3, 4\n",
+                "*Membrane Section, elset=P, material=M\n0.01\n")
+    assert warned in sheet_expansion(INCLINED, *membrane)[1].text()
+    assert warned not in sheet_expansion(FLAT, *membrane)[1].text()
+    thick = "".join(f"{k + 4}, {x + 0.007071068:.9f}, {y + 0.007071068:.9f}, {z}\n" for k, (x, y, z) in
+                    enumerate([(0., 0., 0.), (0.70710678, -0.70710678, 0.), (0.70710678, -0.70710678, 1.),
+                               (0., 0., 1.)], 1))
+    continuum = ("*Element, type=SC8R, elset=P\n1, 1, 2, 3, 4, 5, 6, 7, 8\n",
+                 "*Shell Section, elset=P, material=M\n0.01\n")
+    assert warned in sheet_expansion(INCLINED + thick, *continuum)[1].text()
+    flat_thick = "5, 0., 0., 0.01\n6, 1., 0., 0.01\n7, 1., 1., 0.01\n8, 0., 1., 0.01\n"
+    assert warned not in sheet_expansion(FLAT + flat_thick, *continuum)[1].text()
+    # elements of one section in two planes have no common axes: shear whenever they differ
+    folded = INCLINED + "5, -0.70710678, -0.70710678, 0.\n6, -0.70710678, -0.70710678, 1.\n"
+    two = "*Element, type=S4, elset=P\n1, 1, 2, 3, 4\n2, 5, 1, 4, 6\n"
+    assert warned in sheet_expansion(folded, two)[1].text()
+    assert warned not in sheet_expansion(folded, two, expansion="*Expansion, type=ORTHO\n1e-3, 1e-3, 1e-3\n")[1].text()
+
+
 def test_aniso_expansion_with_shear_kept():
     # a shear coefficient in any row, data that are no coefficients, or USER: left as ANISO
     for exp in (SHEARED_EXPANSION,
@@ -6992,6 +7040,208 @@ def test_circ_beam_midside_node_and_couplings_whatever_else_the_deck_has():
     assert "\n101, " not in body.split("*DISTRIBUTING COUPLING")[-1].split("*")[0]
 
 
+POINT_PLATE = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0.5, 0., 0.
+6, 1., 0.5, 0.
+7, 0.5, 1., 0.
+8, 0., 0.5, 0.
+20, 2., 0., 0.
+21, 2., 1., 0.
+30, 1., 0., 1.
+31, 2., 0., 1.
+32, 2., 1., 1.
+33, 1., 1., 1.
+*Element, type=S8R, elset=E
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Element, type=C3D8, elset=SOL
+9, 2, 20, 21, 3, 30, 31, 32, 33
+*Nset, nset=PLATE
+1, 2, 3, 4, 5, 6, 7, 8
+*Nset, nset=MIX
+1, 2, 3, 4, 5, 6, 7, 8, 20, 21
+*Material, name=M
+*Elastic
+1000., 0.
+*Expansion
+1e-3
+*Solid Section, elset=SOL, material=M
+{sec}*Initial Conditions, type=TEMPERATURE
+{ic}
+*Step
+*Static
+*Boundary
+1, 1, 3
+*Temperature
+{temp}
+*End Step
+"""
+
+
+def test_section_temperature_points_written_as_gradients():
+    # *SHELL SECTION, TEMPERATURE=n: a line gives the temperatures at n points through each
+    # layer, which ccx would read as (temperature, gradient): a uniformly heated plate bent
+    # (code review 3).  Written as ccx's form: the mean and gradient where linear, exact
+    def run(sec, temp, ic="PLATE, 0."):
+        body, conv, rep = convert_str(POINT_PLATE.format(sec=sec, ic=ic, temp=temp))
+        return _card_at(_step(body, 1), "*TEMPERATURE"), conv, rep
+
+    three = "*Shell Section, elset=E, material=M, temperature=3\n0.1\n"
+    lines, conv, rep = run(three, "PLATE, 10., 10., 10.")
+    assert lines == ["PLATE, 10."] and not conv.reduced_physics
+    assert "*SHELL SECTION, TEMPERATURE=n: the temperature lines on its nodes" in rep.text()
+    lines, conv, _ = run(three, "PLATE, 0., 50., 100.", ic="PLATE, 0., 0., 0.")
+    assert lines == ["PLATE, 50., 1000."] and not conv.reduced_physics
+    # not linear: the profile with the same mean and first moment (section forces), reduced
+    lines, conv, rep = run(three, "PLATE, 0., 0., 100.")
+    assert lines == ["PLATE, 25., 1000."]
+    assert "temperatures at section points (TEMPERATURE=n / VALUES) not exact as ccx's temperature " \
+           "and gradients" in conv.reduced_physics
+    # an OFFSET: the temperature at the reference surface, which ccx reads otherwise (probed)
+    lines, conv, _ = run("*Shell Section, elset=E, material=M, temperature=2, offset=SPOS\n0.1\n",
+                         "PLATE, 0., 100.")
+    assert lines == ["PLATE, 100., 1000."] and conv.reduced_physics
+    # composite layers: n points per layer, shared at the interfaces; one per layer for n = 1
+    plies = "0.05, 3, M, 0.\n0.05, 3, M, 90.\n"
+    lines, conv, _ = run("*Shell Section, elset=E, composite, temperature=2\n" + plies, "PLATE, 0., 50., 100.")
+    assert lines == ["PLATE, 50., 1000."] and not conv.reduced_physics
+    lines, conv, _ = run("*Shell Section, elset=E, composite, temperature=1\n" + plies, "PLATE, 0., 100.")
+    assert lines == ["PLATE, 50., 1500."] and conv.reduced_physics
+    # a set with other nodes: those keep the line, the shell's get theirs; continuation lines
+    lines, conv, _ = run(three, "MIX, 10., 20., 30.")
+    assert lines == ["MIX_T, 10., 20., 30.", "MIX_T~1, 20., 200."]
+    assert conv.geom.nset("MIX_T") == [20, 21] and conv.geom.nset("MIX_T~1") == list(range(1, 9))
+    lines, _, _ = run("*Shell Section, elset=E, material=M, temperature=9\n0.1\n",
+                      "PLATE, 1., 2., 3., 4., 5., 6., 7.\n8., 9.")
+    assert lines == ["PLATE, 5., 80."]
+    # axisymmetric shells (ccx's reading of their gradient is not probed): equal values only
+    sax = ("*Node, nset=ALLN\n1, 1., 0.\n2, 1., 1.\n*Element, type=SAX1, elset=E\n1, 1, 2\n*Material, "
+           "name=M\n*Elastic\n1000., 0.\n*Expansion\n1e-3\n*Shell Section, elset=E, material=M, "
+           "temperature=3\n0.1\n*Initial Conditions, type=TEMPERATURE\nALLN, 0.\n*Step\n*Static\n"
+           "*Temperature\nALLN, {}\n*End Step\n")
+    for temp, want, reduced in (("10., 10., 10.", "ALLN, 10.", False), ("0., 10., 20.", "ALLN, 10.", True)):
+        body, conv, _ = convert_str(sax.format(temp))
+        assert _card_at(_step(body, 1), "*TEMPERATURE") == [want]
+        assert any("not exact as ccx's" in r for r in conv.reduced_physics) == reduced
+
+
+def test_beam_section_temperature_values_written_as_gradients():
+    # *BEAM SECTION, TEMPERATURE=VALUES: the values at the section's temperature points
+    def run(section, temp, typ="B32", ic="ALLN, 0."):
+        conn = "1, 1, 3" if typ == "B31" else "1, 1, 2, 3"
+        body, conv, rep = convert_str(
+            f"*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n*Element, type={typ}, elset=B\n{conn}\n"
+            f"*Nset, nset=ALLN\n1, 2, 3\n*Beam Section, elset=B, material=M, temperature=VALUES, "
+            f"section={section}\n0., 0., -1.\n*Material, name=M\n*Elastic\n1000., 0.\n*Expansion\n1e-3\n"
+            f"*Initial Conditions, type=TEMPERATURE\n{ic}\n*Step\n*Static\n*Boundary\n1, 1, 6\n"
+            f"*Temperature\n{temp}\n*End Step\n")
+        return _card_at(_step(body, 1), "*TEMPERATURE"), conv, rep
+
+    rect = "RECT\n0.2, 0.1"
+    # RECT corners in space (-1 -2, +1 -2, +1 +2, -1 +2): mean, gradient along 2, along 1
+    lines, conv, _ = run(rect, "ALLN, 0., 0., 100., 100.")
+    assert lines == ["ALLN, 50., 1000., 0."] and not conv.reduced_physics
+    lines, conv, _ = run(rect, "ALLN, 0., 100., 0., 100.")       # twisted: the same forces
+    assert lines == ["ALLN, 50., 0., 0."] and conv.reduced_physics
+    # in a plane: bottom, centre, top
+    lines, conv, _ = run(rect, "ALLN, 0., 50., 100.", typ="B22")
+    assert lines == ["ALLN, 50., 1000."] and not conv.reduced_physics
+    # equal values on any section; other differences: their mean, warned
+    lines, conv, _ = run("CIRC\n0.05", "ALLN, 10., 10., 10., 10.")
+    assert lines == ["ALLN, 10."] and not conv.reduced_physics
+    lines, conv, rep = run("CIRC\n0.05", "ALLN, 0., 10., 20., 10.")
+    assert lines == ["ALLN, 10."] and conv.reduced_physics
+    # a B31 ignores the gradients it gets (ccx 2.23, probed)
+    _, conv, rep = run(rect, "ALLN, 0., 0., 100., 100.", typ="B31")
+    assert "temperature gradient on B31 / B31R beams (ccx ignores it)" in conv.reduced_physics
+
+
+def test_midside_temperatures_follow_every_card():
+    # a midside node the converter adds between nodes given temperatures on two cards gets the
+    # interpolation of the values in force (code review 3: it got none, the bar moved 0.0678)
+    nodes = "*Nset, nset=ALLN\n1, 2, 3\n"
+    body, conv, _ = convert_str(CIRC_BEAM + nodes + "*Initial Conditions, type=temperature\n1, 100.\n"
+                                "*Initial Conditions, type=temperature\n2, 100.\n3, 100.\n")
+    assert [_card_at(c, "") for c in body.split("*INITIAL CONDITIONS")[1:3]] == \
+        [["1, 100.", "4, 50"], ["2, 100.", "3, 100.", "4, 100", "5, 100"]]
+    assert "ABQ2CCX_ALL_NODES" not in body                      # (every node has one now)
+    ic = CIRC_BEAM + nodes + "*Amplitude, name=A\n0., 0., 1., 1.\n*Initial Conditions, type=temperature\nALLN, 20.\n"
+    body, conv, _ = convert_str(ic + "*Step\n*Static\n*Temperature\n1, 100.\n*Temperature\n2, 100.\n*End Step\n")
+    assert _step(body, 1).count("*TEMPERATURE\n") == 2 and "\n4, 60\n" in _step(body, 1) and \
+        "\n2, 100.\n4, 100\n5, 60\n" in _step(body, 1)
+    # an end on another amplitude, or kept from an earlier step under an amplitude: warned
+    lost = "temperatures of nodes the converter added between nodes given on cards with other amplitudes"
+    assert lost not in conv.reduced_physics
+    for steps in ("*Step\n*Static\n*Temperature, amplitude=A\n1, 100.\n*Temperature\n2, 100.\n*End Step\n",
+                  "*Step\n*Static\n*Temperature\n1, 100.\n*End Step\n*Step\n*Static\n*Temperature, "
+                  "amplitude=A\n2, 50.\n*End Step\n"):
+        assert lost in convert_str(ic + steps)[1].reduced_physics
+    assert lost not in convert_str(ic + "*Step\n*Static\n*Temperature, amplitude=A\n1, 100.\n*Temperature, "
+                                   "amplitude=A\n2, 100.\n3, 100.\n*End Step\n")[1].reduced_physics
+    # OP=NEW starts from the initial temperatures
+    body, _, _ = convert_str(ic + "*Step\n*Static\n*Temperature\nALLN, 100.\n*End Step\n*Step\n*Static\n"
+                             "*Temperature, op=NEW\n1, 50.\n*End Step\n")
+    assert "\n1, 50.\n4, 35\n" in _step(body, 2)
+
+
+def test_rigid_surface_lines_survive_the_ply_split():
+    # _plan_rigid's surface lines are keyed by the record's text: the ply split turns an
+    # earlier line into two (code review 3: the ply line was lost, 'RIG, SPOS' kept raw)
+    nodes = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+             "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, 2., 0., 0.\n10, 2., 1., 0.\n11, 2., 0., 1.\n"
+             "12, 2., 1., 1.\n20, 0., 0., 3.\n21, 1., 0., 3.\n22, 1., 1., 3.\n23, 0., 1., 3.\n99, 0.5, 0.5, 4.\n")
+    body, conv, _ = convert_str(
+        nodes + "*Element, type=SC8R, elset=SC\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*Element, type=C3D8, elset=SOL\n"
+        "2, 2, 9, 10, 3, 6, 11, 12, 7\n*Element, type=R3D4, elset=RIG\n3, 20, 21, 22, 23\n"
+        "*Elset, elset=MIX\n1, 2\n*Nset, nset=BOT\n1, 2, 3, 4, 9, 10\n*Material, name=M\n*Elastic\n"
+        "1000., 0.3\n*Shell Section, elset=SC, composite\n0.5, 3, M, 0.\n0.5, 3, M, 90.\n"
+        "*Solid Section, elset=SOL, material=M\n*Rigid Body, ref node=99, elset=RIG\n"
+        "*Surface, name=S\nMIX, S2\nRIG, SPOS\n*Step\n*Static\n*Boundary\nBOT, 1, 3\n99, 1, 6\n*End Step\n")
+    lines = _card_at(body, "*SURFACE, NAME=S")
+    assert lines[:2] == ["MIX_S2, S2", "MIX_S2_PLIES, S2"] and len(lines) == 3
+    assert lines[2].startswith("ABQ2CCX_RS") and "RIG, SPOS" not in body
+
+
+S4R_EDGE = ("*Node\n" + "".join(f"{1 + i + 5 * j}, {10. * i}, {10. * j}, 0.\n" for j in range(3) for i in range(5)) +
+            "*Element, type=S4R, elset=PLATE\n" + "".join(
+                f"{1 + i + 4 * j}, {1 + i + 5 * j}, {2 + i + 5 * j}, {7 + i + 5 * j}, {6 + i + 5 * j}\n"
+                for j in range(2) for i in range(4)) +
+            "*Material, name=STEEL\n*Elastic\n210000., 0.3\n*Shell Section, elset=PLATE, material=STEEL\n0.2\n")
+
+
+def test_rigid_skins_on_an_upgraded_edge_are_not_hanging():
+    # R3D4 sharing the S4R plate's edge: their skins keep that edge, but both ends and the
+    # new midside node move with the rigid body, so the edge stays straight with them
+    # (code review 3: a false 'hanging midside node' and reduced physics under --approximate)
+    deck = (S4R_EDGE + "*Node\n100, 50., 0., 0.\n101, 50., 10., 0.\n102, 50., 20., 0.\n999, 50., 10., 0.\n"
+            "*Element, type=R3D4, elset=RIG\n101, 5, 100, 101, 10\n102, 10, 101, 102, 15\n"
+            "*Nset, nset=FIX\n1, 6, 11\n*Rigid Body, ref node=999, elset=RIG\n"
+            "*Step\n*Static\n*Boundary\nFIX, 1, 6\n*Cload\n999, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert "hanging midside node" not in " ".join(conv.reduced_physics) and "not conforming" not in rep.text()
+    mids = {m for a, c, m, _s in conv._edge_nodes if {a, c} in ({5, 10}, {10, 15})}
+    body_set = next(v for k, v in conv.geom.nsets.items() if k.startswith("ABQ2CCX_RBN"))
+    assert len(mids) == 2 and mids <= set(body_set)
+
+
+def test_counted_coupling_set_gets_a_copy_with_the_edge_nodes():
+    # a node *SURFACE of a coupling names a set a *CLOAD also names: the set keeps its nodes,
+    # the surface gets a copy with the upgraded edge's midside nodes (code review 3: the
+    # coupling held the corners only)
+    deck = (S4R_EDGE + "*Node\n500, 45., 10., 0.\n*Nset, nset=LEFT\n1, 6, 11\n*Nset, nset=RIGHT\n5, 10, 15\n"
+            "*Surface, name=RS, type=NODE\nRIGHT\n*Coupling, ref node=500, surface=RS, constraint name=C1\n"
+            "*Kinematic\n*Step\n*Static\n*Boundary\nLEFT, 1, 6\n*Cload\nRIGHT, 1, 0.\n500, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert conv.geom.nset("RIGHT") == [5, 10, 15]
+    assert _card_at(body, "*SURFACE, NAME=RS") == ["RIGHT_EDGE"]
+    mids = {m for a, c, m, _s in conv._edge_nodes if {a, c} in ({5, 10}, {10, 15})}
+    assert len(mids) == 2 and set(conv.geom.nset("RIGHT_EDGE")) == {5, 10, 15} | mids
+    assert "a node *SURFACE naming one takes a copy with them (RIGHT_EDGE)" in rep.text()
+
+
 PIPE_BEAM = CIRC_BEAM.replace("section=CIRC\n0.05", "section=PIPE\n0.05, 0.01")
 B32_PIPE_BEAM = """*Node
 1, 0., 0., 0.
@@ -9130,7 +9380,7 @@ def test_delayed_converted_loads_shell_gradients_and_unloaded_buckle_steps():
     lost = "temperature gradient on S4 / S4R shells (ccx ignores it)"
     for typ, sect, ic, t, want in (("S4", "", "0.", "0., 100.", True), ("S4", "", "0., 100.", "0.", True),
                                    ("S4R", "", "0.", "0., 100.", True), ("S4", "", "0., 100.", "50., 100.", False),
-                                   ("S4", "", "0.", "100.", False), ("S4", ", temperature=5", "0.", "0., 100.", False)):
+                                   ("S4", "", "0.", "100.", False), ("S4", ", temperature=5", "0.", "0., 100.", True)):
         _, conv, rep = convert_str(plate.format(corners, typ, "1, 1, 2, 3, 4", 4, sect, ic, t))
         assert (lost in conv.reduced_physics) == want, (typ, sect, ic, t)
     mids = "5, 0.5, 0., 0.\n6, 1., 0.5, 0.\n7, 0.5, 1., 0.\n8, 0., 0.5, 0.\n"
