@@ -503,7 +503,7 @@ def test_step_model_states():
 
 
 def test_step_model_handle_step_facts():
-    # general steps (handle_step's six procedures, no PERTURBATION), the NLGEOM in force in
+    # general steps (no linear perturbation step), the NLGEOM in force in
     # Abaqus and the one handle_step writes on the *STEP cards: an explicit NLGEOM=NO stays
     # off, a perturbation step's NLGEOM over a linear base state is dropped; with a deformation
     # plasticity material NLGEOM=NO is dropped (the explicit step gets NLGEOM), so the steps
@@ -513,7 +513,7 @@ def test_step_model_handle_step_facts():
 *STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*STATIC\n*END STEP
 *STEP\n*BUCKLE\n2\n*CLOAD\n1, 1, 1.\n*END STEP\n*STEP\n*BUCKLE\n2\n*TEMPERATURE\n1, 10.\n*END STEP
 *STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM\n*STATIC\n*END STEP\n*STEP\n*STATIC\n*END STEP""")
-    assert [s.general for s in m] == [True, False, True, False, False, False, True, True]
+    assert [not s.perturbation for s in m] == [True, False, True, False, False, False, True, True]
     assert [s.general_before for s in m] == [False] + [True] * 7
     assert [s.nlgeom for s in m] == [False] * 6 + [True] * 2
     assert [s.nlgeom_written for s in m] == [False] + [None] * 5 + [True, None]
@@ -523,6 +523,22 @@ def test_step_model_handle_step_facts():
     assert [s.nlgeom_written for s in dp] == [True, None, True, None, None, True, True, None]
     assert [s.ccx_nlgeom for s in dp] == [True, False, True, False, False, True, True, True]
     assert [s.buckle_loaded for s in m] == [False] * 3 + [True] + [False] * 4
+
+
+def test_general_step_is_any_but_a_linear_perturbation_step():
+    # Abaqus: "all other procedures can be used only in general analysis steps", whose end is the
+    # base state of the perturbation steps after them.  handle_step (_general_step_seen: the
+    # *BUCKLE step's PERTURBATION, the base state's preload) and _plan_base_restore (the steps
+    # that get the base state again) read it alike: a step with a procedure ccx lacks (*GEOSTATIC,
+    # *SOILS) or none counts; ccx stops there (*NO ANALYSIS), so no step after it runs
+    _, m = _step_model("""*STEP\n*GEOSTATIC\n*END STEP\n*STEP\n*BUCKLE\n2\n*END STEP
+*STEP\n*CLOAD\n1, 1, 1.\n*END STEP\n*STEP\n*FREQUENCY\n2\n*END STEP""")
+    assert [s.general_before for s in m] == [False, True, True, True]
+    assert m.pert == {2, 4}
+    body, conv, _ = convert_str(HEX_MODEL + """*STEP\n*GEOSTATIC\n*END STEP\n*STEP\n*BUCKLE\n2
+*CLOAD\n7, 3, -1.\n*END STEP\n""")
+    assert "*STEP, PERTURBATION\n*BUCKLE" in body and conv._buckle_preloaded == {2: True}
+    assert "*NO ANALYSIS" in body
 
 
 def test_step_model_motion_facts():

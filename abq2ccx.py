@@ -4639,9 +4639,10 @@ class Step:
                                   # *STEP, PERTURBATION, else the first PROC_KW card after its *STEP
                                   # card (with ", RIKS"; a card between steps counts for the step
                                   # before it), "" if none
-    # a general step, handle_step's rule (_plan_base_restore's is "not in _pert_idx",
-    # _plan_modal_starts' "general in ccx"):
-    general: bool                 # proc in StepModel.GENERAL_PROCS and no *STEP, PERTURBATION
+    # a general step is one that is no linear perturbation step (Abaqus: "all other procedures
+    # can be used only in general analysis steps"; the base state is the last one's end): handle_step
+    # and _plan_base_restore.  (_plan_modal_starts asks ccx's question instead: which steps leave
+    # ccx holding a deformed model, a static perturbation step among them.)
     general_before: bool          # a general step before it (handle_step's _general_step_seen)
     buckle_loaded: bool           # a *BUCKLE step with a load other than *TEMPERATURE (handle_step's)
     lc2: frozenset                # in a step with a *BUCKLE card: the ids of its *BOUNDARY, LOAD CASE=2
@@ -4681,10 +4682,6 @@ class StepModel:
     ``nl_before``, ``pert`` and the Converter views of it: _pert_idx, _nl_any, _mechanical,
     ...), which no rewrite changes (test_step_model_is_current).  Model data may
     still change after it (*RIGID BODY parameters; the section cards a handler writes)."""
-
-    # the procedures of a general step (Step.general)
-    GENERAL_PROCS = ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
-                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO")
 
     @staticmethod
     def _writes_nlgeom(given: Optional[bool], explicit: bool, pert: bool, base: bool,
@@ -4833,7 +4830,6 @@ class StepModel:
                 lc2, repeats = frozenset(id(b) for b in two), all(key(b) in ones for b in two)
             else:
                 lc2, repeats = frozenset(), False
-            general = proc in self.GENERAL_PROCS and not pert_param
             motion_explicit = motion_proc == "DYNAMIC" and motion_card.has("EXPLICIT")
             period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
             steps.append(Step(
@@ -4843,7 +4839,7 @@ class StepModel:
                 nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
                 star_proc=star_proc[id(head)],
-                general=general, general_before=seen,
+                general_before=seen,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
@@ -4852,7 +4848,7 @@ class StepModel:
                 if motion_proc else "(no procedure)", motion_explicit=motion_explicit,
                 period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp))
             t = None if t is None or advance is None else t + advance
-            seen = seen or general
+            seen = seen or not pert
             loose = []
         self.steps: Tuple[Step, ...] = tuple(steps)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
@@ -11497,7 +11493,7 @@ class Converter:
             params["PERTURBATION"] = None
         if proc in ("FREQUENCY", "BUCKLE") and "PERTURBATION" in params:
             self._perturbation_after_buckle(proc, params)
-        if cur.general:
+        if not cur.perturbation:
             # its temperatures, loads and prescribed motion: the base state of the steps after
             # (_frequency_perturbation)
             self._base_heated = self._base_heated or proc in TEMPERATURE_DOF_PROCS or \
@@ -32619,9 +32615,11 @@ class Converter:
         state it starts from): CONTINUE=YES continues only the modal dynamic or static
         perturbation step right before.  ccx starts one from rest right after a *FREQUENCY or
         *BUCKLE step, else from what it holds: the end state of the step before, after
-        steady-state dynamics the last general step's (probed).  A general step leaves the
-        model deformed where it is loaded (step_load_audit), a modal dynamic step moving where
-        it has loads that act there or started so.  Right after a general step, the loads ccx
+        steady-state dynamics the last general step's (probed).  "General" is ccx's here, what
+        ccx runs as a general step (a static perturbation step too), not Abaqus' (handle_step,
+        _plan_base_restore: no linear perturbation step).  A general step leaves the model
+        deformed where it is loaded (step_load_audit), a modal dynamic step moving where it has
+        loads that act there or started so.  Right after a general step, the loads ccx
         holds stay on in the modal step (``_modal_held``, no OP=NEW): they hold the model in
         that step's state, which a static step's results then carry as a constant offset,
         where without them it would vibrate about the undeformed one."""
