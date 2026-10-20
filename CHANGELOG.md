@@ -13,6 +13,14 @@ physics.
   end. A `*STATIC` without a data line read the next card as one: a card with parameters gave a
   false "unknown time period" warning, and a later step's `TIME=TOTAL TIME` load came out 1.5x.
   Its period is now 1, Abaqus' default.
+* **Beams in general 3-D directions** — ccx 2.23 makes rotational BCs and moments on a beam
+  node mean-rotation MPCs about the global axes, exact only about the section's own axes: a
+  cantilever turned in space was 6 % to 4.5x off under a tip force, 2x under a tip moment, its
+  frequencies 10-65 % low. Such a node now gets a `*TRANSFORM` along its section axes, its BCs
+  and loads in its components: the axis-aligned answer to 1e-7. Where that has no exact form
+  (BCs about other global axes, cards that tie DOFs, a `*DYNAMIC` step) it gets a knot beam
+  (frame-invariant; the section is rigid there). Under NLGEOM, moments about several section
+  axes are warned; a deck with an explicit step is reduced physics.
 * **`*DLOAD` BX / BY / BZ on shells** — Abaqus applies them as a body force per unit volume;
   ccx 2.23 applied them on its shells as a pressure on the shell's face, so a plate under BX
   bent out of its plane, without a warning. They are now `GRAV` of B / density along the axis,

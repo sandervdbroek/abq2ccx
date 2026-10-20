@@ -4348,6 +4348,59 @@ def rotated_instance_constraints_deck():
     return deck + "*END STEP\n", rots
 
 
+def turned_cantilever_deck(typ="B31", ne=4, proc="STATIC", knot=False):
+    """Clamped RECT 0.2 x 0.3 cantilevers of length 1 (E 1000, nu 0.3): twin 0 along z with
+    n1 = x, twin 1 the same turned by R, 40 deg about (1, 2, 3), 5 to the side — once with a tip
+    force (0.3, -0.2, 0.5), once with a tip moment (0.1, 0.2, 0.15), turned by R on twin 1.
+    ``proc`` FREQUENCY: one unloaded pair, density 1, eight modes.  ``knot``: one pair loaded by
+    both, an *EQUATION between two free nodes (cards that tie DOFs: the converter gives the
+    turned nodes knot beams) and a force-free dummy B31 at the unturned twin's root and tip,
+    which ccx makes knots too.  Returns the deck, R and {case: (twin 0, twin 1 tip)}."""
+    e = _unit((1.0, 2.0, 3.0))
+    rot = lambda v: _rotate(v, e, math.radians(40.0))           # noqa: E731
+    per = 2 if typ.startswith("B32") else 1
+    nn = ne * per + 1
+    cases = {"force+moment": (0, 1)} if knot else {"modes": (0, 1)} if proc == "FREQUENCY" else \
+        {"force": (0, 1), "moment": (2, 3)}
+    nodes, elems, secs, tips = ["*NODE"], [], [], {}
+    for case, pair in cases.items():
+        for m in pair:
+            r = rot if m % 2 else (lambda v: tuple(v))
+            nodes += [f"{1000 * m + i + 1}, " + ", ".join(f"{x + 5 * m:.15g}" for x in r((0.0, 0.0, i / (nn - 1))))
+                      for i in range(nn)]
+            elems += [f"*ELEMENT, TYPE={typ}, ELSET=E{m}"] + \
+                [f"{1000 * m + k + 1}, " + ", ".join(str(1000 * m + per * k + j + 1) for j in range(per + 1))
+                 for k in range(ne)]
+            secs += [f"*BEAM SECTION, ELSET=E{m}, MATERIAL=M, SECTION=RECT", "0.2, 0.3",
+                     ", ".join(f"{x:.15g}" for x in r((1.0, 0.0, 0.0)))]
+        tips[case] = tuple(1000 * m + nn for m in pair)
+    ms = [m for pair in cases.values() for m in pair]
+    deck = nodes + elems + ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3"] + \
+        (["*DENSITY", "1."] if proc == "FREQUENCY" else []) + secs + \
+        ["*NSET, NSET=ROOTS", ", ".join(str(1000 * m + 1) for m in ms),
+         "*NSET, NSET=TIPS", ", ".join(str(1000 * m + nn) for m in ms)]
+    if knot:
+        # (a knot's axial stiffness follows its force-free beams' E and size — a soft thin dummy is
+        # 1e-5 of the tip motion apart — so the dummy is like the converter's knot beams: the
+        # deck's E, about 1 % of the model's size, along (1, 1, 1))
+        deck += ["*NODE", "9001, 0.0935, 0.0935, 0.0935", "9002, 0.0935, 0.0935, 1.0935", "9101, 9., 9., 9.",
+                 "9102, 9., 9., 10.", "*ELEMENT, TYPE=B31, ELSET=DUMMY", "9001, 1, 9001", f"9002, {nn}, 9002",
+                 "*MATERIAL, NAME=DM", "*ELASTIC", "1000., 0.", "*DENSITY", "0.",
+                 "*BEAM SECTION, ELSET=DUMMY, MATERIAL=DM, SECTION=RECT", "0.08, 0.08", "1., -1., 0.",
+                 "*EQUATION", "2", "9101, 1, 1., 9102, 1, -1."]
+    deck += ["*STEP", "*FREQUENCY" if proc == "FREQUENCY" else "*STATIC"] + (["8"] if proc == "FREQUENCY" else []) + \
+        ["*BOUNDARY", "ROOTS, ENCASTRE"]
+    if proc != "FREQUENCY":
+        deck.append("*CLOAD")
+        for case, pair in cases.items():
+            for m in pair:
+                r = rot if m % 2 else (lambda v: tuple(v))
+                loads = [(1, (0.3, -0.2, 0.5))] * ("force" in case) + [(4, (0.1, 0.2, 0.15))] * ("moment" in case)
+                deck += [f"{1000 * m + nn}, {d + k}, {x:.12g}" for d, v in loads for k, x in enumerate(r(v))]
+        deck += ["*NODE PRINT, NSET=TIPS", "U"]
+    return "\n".join(deck + ["*END STEP"]) + "\n", rot, tips
+
+
 def dashpot1_ground_deck():
     """Free point masses (1 each) on dashpots c = 10 in a *DYNAMIC, NLGEOM step of 2 s, each
     pushed by 1 along its dashpot and by 1 across it: DASHPOT1s on node 1's DOF 1 of an
@@ -11144,6 +11197,53 @@ def main():
               f"node (max |u| {scale:.3g}; {err:.1e} apart)")
     else:
         print("FAIL  connector_distributing_ref: no displacements")
+    failures += 0 if ok else 1
+
+    # beams in a general 3-D direction: ccx 2.23 makes rotational BCs and moments on a beam node
+    # mean-rotation MPCs about the global axes, exact only about the section's own axes (the
+    # turned twin was 6-92 % off under the tip force, 2x under the moment, frequencies 10 % low);
+    # now a *TRANSFORM along the section axes, or a knot beam where none fits: R u of the
+    # unturned twin's, which bends under the moment as beam theory says (M L^2 / 2 E I)
+    for typ, ne in (("B31", 4), ("B32R", 2)):
+        deck, rot, tips = turned_cantilever_deck(typ, ne)
+        u = review_run(deck, f"turned_cantilever_{typ}", dat_displacements)
+        ok = bool(u) and all(n in u for pair in tips.values() for n in pair)
+        if ok:
+            errs = {c: max(abs(x - y) for x, y in zip(u[b], rot(u[a]))) / max(abs(x) for x in u[a])
+                    for c, (a, b) in tips.items()}
+            um, theory = u[tips["moment"][0]], (0.2 / (2e3 * 2e-4), -0.1 / (2e3 * 4.5e-4), 0.0)
+            off = max(abs(x - y) for x, y in zip(um, theory)) / theory[0]
+            ok = max(errs.values()) < 1e-6 and (typ != "B31" or off < 1e-4) and \
+                max(abs(x) for x in u[tips["force"][0]]) > 0.1
+            print(f"{'PASS' if ok else 'FAIL'}  turned_cantilever_{typ} ({ne} {typ}, RECT 0.2 x 0.3, clamped, "
+                  f"turned 40 deg about (1, 2, 3)): the turned tip moves R u of the unturned one's under a tip "
+                  f"force ({errs['force']:.1e} apart) and a tip moment ({errs['moment']:.1e}); under the moment "
+                  f"the unturned tip moves {', '.join(f'{x:.5f}' for x in um)} (beam theory "
+                  f"{', '.join(f'{x:.5f}' for x in theory)}, {off:.1e} off)")
+        failures += 0 if ok else 1
+    deck, rot, tips = turned_cantilever_deck("B32R", 4, "FREQUENCY")
+    f = review_run(deck, "turned_cantilever_modes", lambda p: dat_eigen_table(p, "E I G E N V A L U E   O U T P U T"))
+    ok = bool(f) and len(f) >= 8
+    if ok:
+        f = sorted(f)[:8]
+        split = max(abs(f[2 * i + 1] / f[2 * i] - 1) for i in range(4))
+        eb = 1.8751 ** 2 / (2 * math.pi) * math.sqrt(1e3 * 2e-4 / 0.06)       # Euler-Bernoulli f1
+        ok = split < 1e-6 and abs(f[0] / eb - 1) < 0.05
+        print(f"{'PASS' if ok else 'FAIL'}  turned_cantilever_modes (4 B32R, the twins in one *FREQUENCY step): "
+              f"each of the first four frequencies twice, {split:.1e} apart (f1 {f[0]:.5f}, Euler-Bernoulli "
+              f"{eb:.5f})")
+    failures += 0 if ok else 1
+    deck, rot, tips = turned_cantilever_deck("B31", 4, knot=True)
+    u = review_run(deck, "turned_cantilever_knots", dat_displacements)
+    a, b = tips["force+moment"]
+    ok = bool(u) and a in u and b in u
+    if ok:
+        err = max(abs(x - y) for x, y in zip(u[b], rot(u[a]))) / max(abs(x) for x in u[a])
+        ok = err < 1e-5 and max(abs(x) for x in u[a]) > 0.1
+        print(f"{'PASS' if ok else 'FAIL'}  turned_cantilever_knots (4 B31 under a tip force and moment, an "
+              f"*EQUATION in the deck: knot beams at the turned root and tip, the unturned ones knots by a "
+              f"force-free dummy beam): the turned tip moves R u of the unturned one's ({err:.1e} apart; "
+              f"max |u| {max(abs(x) for x in u[a]):.4f})")
     failures += 0 if ok else 1
 
     # --- indented keyword lines and abbreviations, read as Abaqus reads them: a free cube

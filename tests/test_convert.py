@@ -12144,6 +12144,92 @@ def test_transformed_moments_carry_on_over_steps_on_a_knot():
     assert "from another node set or number) with an amplitude" in rep.text()
 
 
+# a B31 cantilever along (1, 2, 2) / 3, n1 = (2, -2, 1) / 3: n2 = t x n1 = (2, 1, -2) / 3
+TURNED = ("*Node\n1, 0., 0., 0.\n2, 1., 2., 2.\n3, 2., 4., 4.\n*Element, type=B31, elset=B\n1, 1, 2\n2, 2, 3\n"
+          "*Beam Section, elset=B, material=M, section=RECT\n0.2, 0.3\n2., -2., 1.\n*Material, name=M\n"
+          "*Elastic\n1000., 0.3\n*Nset, nset=TIP\n3\n*Step{}\n*Static\n*Boundary\n1, ENCASTRE\n"
+          "*Cload\n3, 1, 1.\n{}*Node Print, nset=TIP\nU\n*End Step\n")
+TURNED_AXES = ((2 / 3, -2 / 3, 1 / 3), (2 / 3, 1 / 3, -2 / 3), (1 / 3, 2 / 3, 2 / 3))
+
+
+def test_beam_in_a_general_direction_gets_a_transform_along_its_section():
+    # ccx 2.23 makes rotational BCs / moments on a plain beam node mean-rotation MPCs about
+    # the global axes, exact only about the section's own axes (probed: a turned cantilever
+    # 6-92 % off, a tip moment 2x); about them (a *TRANSFORM, the cards in its components)
+    # the axis-aligned answer to 1e-7 (validate_with_ccx.py turned_cantilever)
+    body, conv, rep = convert_str(TURNED.format("", "3, 4, 2.\n"))
+    assert set(conv._sect_axes) == {1, 3} and not conv._knots
+    assert all(_close(conv._sect_axes[1][k], TURNED_AXES[k], 1e-12) for k in range(3))
+    tr = [l for l in body.splitlines() if l.startswith("*TRANSFORM")]
+    assert len(tr) == 1 and body.split(tr[0] + "\n")[1].split("\n")[0] == \
+        "0.666666666666667, -0.666666666666667, 0.333333333333333, 0.666666666666667, 0.333333333333333, " \
+        "-0.666666666666667"
+    assert [l for l in _bc_lines(body) if l.startswith("1,")] == ["1,1,3", "1,4,6"]
+    want = {(3, 1 + k): TURNED_AXES[k][0] for k in range(3)}
+    want.update({(3, 4 + k): 2. * TURNED_AXES[k][0] for k in range(3)})
+    assert _close(_cloads(body)[0], want, 1e-10)
+    assert "*NODE PRINT, NSET=TIP, GLOBAL=YES" in body
+    assert "got a rectangular *TRANSFORM along their section axes" in rep.text()
+    assert rep.n_warnings == 0 and conv.reduced_physics == []
+    # along z with n1 = x: exact as it is
+    along = TURNED.replace("1., 2., 2.", "0., 0., 3.").replace("2., 4., 4.", "0., 0., 6.").replace(
+        "2., -2., 1.", "1., 0., 0.")
+    body, conv, _ = convert_str(along.format("", "3, 4, 2.\n"))
+    assert not conv._sect_axes and "*TRANSFORM" not in body
+    # the section turned about z: the clamp (z a section axis, all three held) and a moment about
+    # z are exact; one about x is not
+    twisted = along.replace("1., 0., 0.", "0.866025403784, 0.5, 0.")
+    body, conv, _ = convert_str(twisted.format("", "3, 6, 2.\n"))
+    assert not conv._sect_axes
+    body, conv, _ = convert_str(twisted.format("", "3, 4, 2.\n"))
+    assert set(conv._sect_axes) == {3}
+    # a planar frame: the planar constraint holds rotations 4-5, moments about z = n1
+    planar = TURNED.replace("B31", "B21").replace("1., 2., 2.", "1., 2.").replace("2., 4., 4.", "2., 4.").replace(
+        "\n2., -2., 1.", "")
+    body, conv, _ = convert_str(planar.format("", "3, 6, 2.\n"))
+    assert not conv._sect_axes and "*TRANSFORM" not in body
+    # a moment on a node whose rotations its step holds is a reaction there: as it is
+    body, conv, _ = convert_str(twisted.format("", "1, 4, 2.\n"))
+    assert not conv._sect_axes
+    # a beam line load becomes nodal forces, at a transformed node in its components
+    body, conv, _ = convert_str(TURNED.format("", "3, 4, 2.\n*Dload\nB, PX, 1.\n"))
+    got = _cloads(body)[0]
+    assert _close([got[(3, 1 + k)] for k in range(3)], [2.5 * TURNED_AXES[k][0] for k in range(3)], 1e-10)
+    assert abs(got[(2, 1)] - 3.) < 1e-10 and (2, 2) not in got
+
+
+def test_beam_in_a_general_direction_knot_beam_where_no_transform_fits():
+    # no exact *TRANSFORM form: a knot beam, on which ccx applies the BCs / moments about the
+    # global axes, the same in any frame (probed 1e-7; it holds the section rigid)
+    # a BC on a global axis that is no section axis
+    body, conv, rep = convert_str(TURNED.format("", "*Boundary\n3, 4, 4\n"))
+    assert set(conv._sect_axes) == {1} and set(conv._knots) == {3}
+    assert "got a force-free knot beam" in rep.text() and "the local axes held are not a set" in rep.text()
+    # cards that tie DOFs
+    eq = TURNED.replace("*Step", "*Node\n7, 9., 9., 9.\n8, 9., 9., 10.\n*Equation\n2\n7, 1, 1., 8, 1, -1.\n*Step", 1)
+    body, conv, rep = convert_str(eq.format("", "3, 4, 2.\n"))
+    assert not conv._sect_axes and set(conv._knots) == {1, 3} and "the deck has *EQUATION cards" in rep.text()
+    # ... with a moment there and a *BUCKLE step, where a knot's moment preload stiffens otherwise
+    _, _, rep = convert_str((eq + "*Step, perturbation\n*Buckle\n2\n*Cload\n3, 3, -1.\n*End Step\n").format("", "3, 4, 2.\n"))
+    assert "*BUCKLE with moments on 1 knot beam node(s)" in rep.text()
+    # a *DYNAMIC step: a clamp held at zero throughout turns nothing (no finite-rotation flag)
+    dyn = TURNED.replace("*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Density\n1.\n") + \
+        "*Step\n*Dynamic\n0.01, 0.1\n*End Step\n"
+    body, conv, rep = convert_str(dyn.format("", ""))
+    assert not conv._sect_axes and set(conv._knots) == {1} and conv._still_knots == {1}
+    assert "the deck has a *DYNAMIC step" in rep.text() and conv.reduced_physics == []
+    # an explicit step: no exact form, warned
+    body, conv, rep = convert_str(dyn.replace("*Dynamic\n", "*Dynamic, explicit\n").format("", "3, 4, 2.\n"))
+    assert not conv._sect_axes and not conv._knots
+    assert conv.reduced_physics == ["rotational BCs / moments on beam nodes in general 3-D directions "
+                                    "(ccx's mean rotation about the global axes)"]
+    # NLGEOM with moments about several section axes: warned
+    body, conv, rep = convert_str(TURNED.format(", nlgeom", "3, 4, 2.\n"))
+    assert set(conv._sect_axes) == {1, 3} and "about several section axes at once" in rep.text()
+    body, conv, rep = convert_str(TURNED.format(", nlgeom", ""))
+    assert set(conv._sect_axes) == {1} and rep.n_warnings == 0
+
+
 def test_transformed_rotations_around_a_perturbation_step():
     # a linear perturbation step's moments are its own (ccx removes the earlier *CLOADs at a
     # *BUCKLE step): no carried components there, which would add the base moments to the

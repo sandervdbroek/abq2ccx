@@ -6752,6 +6752,10 @@ class Converter:
         self._rot_mode: Dict[int, str] = {}
         self._rot_lines: Dict[Tuple[int, int], Union[List[str], str]] = {}
         self._untr: set = set()                     # nodes out of their *TRANSFORM (_plan_transformed_corners)
+        # beam nodes given a *TRANSFORM along their section axes (_plan_beam_section_axes): node ->
+        # (n1, n2, beam axis); they are in _untr too (their cards in local components)
+        self._sect_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}
+        self._still_knots: set = set()             # ... and their knot beams held at zero throughout
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         # *DISTRIBUTION orientations (see _plan_distributions)
         self._dist_cards: Dict[str, Block] = {}    # NAME -> *DISTRIBUTION, "" too (_plan_deck_facts)
@@ -15065,6 +15069,297 @@ class Converter:
         out.update((k, v) for k, v in loads.items() if isinstance(v, list))
         return out
 
+    # a beam section axis within this angle (rad) of a global axis is along it: ccx's
+    # mean-rotation error is about twice the angle (_plan_beam_section_axes)
+    _AXIS_TOL = 1e-6
+
+    def _plan_beam_section_axes(self, blocks: List[Block]) -> None:
+        """Rotational BCs and moments on beam nodes in general 3-D directions.  ccx 2.23 makes
+        each one on a beam node that is no knot a mean-rotation MPC (gen3dboun / gen3dforc;
+        a knot in *DYNAMIC steps) about the node's global axes, measured from the section's
+        four corner nodes as the mean of their own angles about it: exact about the section's
+        own axes (n1, n2, the beam axis), but about an axis between them each corner's angle
+        picks up the rotations about the others (a section turned theta about the beam axis:
+        a moment about x reads tan 2 theta of the rotation about y).  Probed on a cantilever
+        turned 40 deg about (1, 2, 3) against the same one along z: a tip force 6-17 % off on
+        B31 (1-4 elements), 92 % on B32R, a tip moment 2x, eigenfrequencies 10 % and a
+        buckling load 3 % low.  Exact as they are (_section_axes_exact): moments and nonzero
+        rotations about section axes, rotations held about section axes, all three held at
+        zero where a global axis is a section axis, two held at zero whose free axis is one
+        (planar frames: 4e-8).
+
+        Exact otherwise: a rectangular *TRANSFORM along the node's section axes as ccx computes
+        them (_beam_section_frame), its BCs and loads in its local components (_untr_lines with
+        the axes turned back; converted nodal forces in _flush_nodal_loads; *NODE PRINT with
+        GLOBAL=YES): the axis-aligned beam's answer to 1e-7 (B31, B32, B32R; RECT, CIRC, PIPE,
+        BOX, offsets; static, *FREQUENCY, *BUCKLE; NLGEOM for clamps, forces and moments about
+        one section axis — about several, with finite rotations, 1e-4 to 2 % off: warned).
+        Where that has no exact form (BCs on global axes that are no section axes, amplitudes
+        that would mix, something else that reads the node's DOFs) and in a deck with a
+        *DYNAMIC step (where a moment on a transformed beam node stops ccx: 'gen3dforc:
+        singular system'), the node gets a knot beam instead: ccx applies them to the knot's
+        rotation node about the global axes, the same in any frame (probed: 1e-7, also
+        NLGEOM), with the section rigid at the node (0.6-9 % stiffer than the mean rotation on
+        4-1 element cantilevers).  A deck with an explicit step, whose solver stops on knot
+        beams, is warned.  Left alone: knots, nodes with a *TRANSFORM
+        (_plan_transformed_rotations), reference nodes, decks whose mechanical steps are all
+        *DYNAMIC ones.  Runs after the planners that add knot beams or fill _untr."""
+        self._sect_axes, self._still_knots = {}, set()
+        if getattr(self.opt, "solid_dof", False) or not self._mechanical:
+            return
+        if all(st.proc in ("DYNAMIC", "HEAT TRANSFER") for st in self.steps):
+            return
+        beams_at: Dict[int, List[int]] = {}
+        for e, (typ, conn) in self.geom.elements.items():
+            if ccx_type(typ) in ("B31", "B31R", "B32", "B32R"):
+                for m in conn:
+                    beams_at.setdefault(m, []).append(e)
+        own = set(beams_at) - set(self._transformed) - set(self._knots) - set(self._rb_rot) - \
+            self._ref_nodes - self._kinematic_refs(blocks)
+        if not own:
+            return
+        cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
+        step = 0
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword in ("BOUNDARY", "CLOAD") and id(b) not in self.steps.lc2:
+                cards.append((b, step, self._rot_items(b, own)))
+        used = sorted({n for _, _, items in cards for n in items})
+        if not used:
+            return
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks=blocks)
+        sections = self._knot_sections(blocks)
+        at = self._elements_at(set(used))
+        frames: Dict[int, Tuple[Vec, Vec, Vec]] = {}
+        unsure: List[int] = []
+        for n in used:
+            knot = self._ccx_knot(n, sections, at)
+            frame = None if knot is True or self._has_normal else self._beam_section_frame(n, beams_at[n])
+            if knot is True or (frame is not None and self._section_axes_exact(n, frame, cards, acts)):
+                continue
+            if knot is False and frame is not None:
+                frames[n] = frame
+            elif not all(self._along_axis(vsub(self.geom.nodes[c[-1]], self.geom.nodes[c[0]]))
+                         for c in (self.geom.elements[e][1] for e in beams_at[n])):
+                unsure.append(n)
+        if unsure:
+            self.report.warn(f"Rotational BCs or moments on {len(unsure)} beam node(s) off the "
+                             f"global axes (e.g. node {unsure[0]}) whose section axes the converter "
+                             f"cannot tell from ccx's (*NORMAL cards, other elements at the node, or "
+                             f"directions near ccx's 20 deg knot limit): where ccx makes such a node "
+                             f"no knot it applies them through mean-rotation MPCs about the global "
+                             f"axes, exact only about the section's own axes (probed: a cantilever "
+                             f"turned in space 6-92 % off) — verify.", once=True)
+        if not frames:
+            return
+        if self._explicit_deck:
+            self.report.warn(f"Rotational BCs or moments on {len(frames)} beam node(s) in general "
+                             f"3-D directions (e.g. node {min(frames)}): ccx 2.23 applies them "
+                             f"through mean-rotation MPCs about the global axes, exact only about the "
+                             f"section's own axes (probed: a cantilever turned 40 deg about (1, 2, 3) "
+                             f"6-92 % off), and no exact form fits a deck with an explicit step "
+                             f"(its solver stops on the knot beams that would carry them) — verify.",
+                             once=True)
+            self._reduces("rotational BCs / moments on beam nodes in general 3-D directions "
+                          "(ccx's mean rotation about the global axes)")
+            return
+        why = self._section_axes_blockers(blocks)
+        tcards = [(b, s, self._rot_items(b, set(frames), span=(1, 6))) for b, s, _ in cards]
+        kind = {id(b): b.keyword for b, _, _ in tcards}
+        knots: Dict[int, str] = {}
+        several: List[int] = []
+        for n, frame in frames.items():
+            got: Union[str, Dict[Tuple[int, int], List[str]]]
+            if self._dynamic_deck:
+                got = ("the deck has a *DYNAMIC step, where ccx 2.23 makes the node a knot itself and "
+                       "a *TRANSFORM there is not exact (probed: a clamped B32R 1e-3 off in a "
+                       "*DYNAMIC step after a static one; a moment stops ccx, 'gen3dforc: singular "
+                       "system of equations')")
+            elif why or any(e not in beams_at[n] and not ccx_type(self.geom.elements[e][0]).startswith("MASS")
+                            for e in at.get(n, ())):
+                got = why or "other elements at the node read its DOFs"
+            else:
+                back = tuple(tuple(frame[j][k] for j in range(3)) for k in range(3))
+                got = self._untr_lines(n, back, tcards, acts, set(), at, True)
+            if isinstance(got, str):
+                knots[n] = got
+                continue
+            self._sect_axes[n] = frame
+            self._rot_mode[n] = "sect"
+            self._untr.add(n)
+            self._rot_lines.update(got)
+            self._rot_lines_to_pieces(list(got))
+            if self._nl_any and len(self._turned_rotations(got, kind)) > 1:
+                several.append(n)
+        if self._sect_axes:
+            self.report.note(f"{len(self._sect_axes)} beam node(s) in general 3-D directions with "
+                             f"rotational BCs or moments (e.g. node {min(self._sect_axes)}) got a "
+                             f"rectangular *TRANSFORM along their section axes (n1, n2, beam axis), "
+                             f"their BCs and loads written in its components: ccx 2.23 applies "
+                             f"rotational BCs and moments on a beam node through mean-rotation MPCs "
+                             f"about the node's axes, exact only about the section's own (probed: a "
+                             f"cantilever turned 40 deg about (1, 2, 3) 6-92 % off under a tip force, "
+                             f"2x under a tip moment, eigenfrequencies 10 % low; with the *TRANSFORM "
+                             f"the axis-aligned answer to 1e-7). Exact.", once=True)
+        if several:
+            self.report.warn(f"NLGEOM: moments or nonzero rotations about several section axes at "
+                             f"once on {len(several)} beam node(s) in general 3-D directions (e.g. "
+                             f"node {several[0]}): ccx 2.23's mean-rotation MPCs about the section "
+                             f"axes are not frame-invariant under finite rotations about several "
+                             f"axes (probed: 1e-4 of the axis-aligned beam's displacement at 0.05 "
+                             f"rad, 2 % at 0.5 rad) — verify.", once=True)
+        if knots:
+            self._add_knot_beams(list(knots), blocks)
+            released = any(b.keyword == "BOUNDARY" and id(b) in acts for b, _, _ in cards)
+            self._still_knots = {n for n in knots if not released and all(
+                self._zero_hold(b, items[n]) if b.keyword == "BOUNDARY" else
+                all(v == 0.0 for _, v in items[n]) for b, _, items in cards if n in items)}
+            n0 = min(knots)
+            self.report.note(f"{len(knots)} beam node(s) in general 3-D directions with rotational "
+                             f"BCs or moments (e.g. node {n0}) got a force-free knot beam (a B31 to a "
+                             f"new free node, elset/material {KNOT_SET}, no density): ccx 2.23 "
+                             f"applies rotational BCs and moments on a beam node that is no knot "
+                             f"through mean-rotation MPCs about the global axes, exact only about the "
+                             f"section's own axes (probed: a cantilever turned 40 deg about (1, 2, 3) "
+                             f"6-92 % off), and on a knot through its rotation node, the same in any "
+                             f"frame (probed: 1e-7). A *TRANSFORM along the section axes would keep "
+                             f"ccx's mean rotation, but not here: {knots[n0]}. The knot holds the "
+                             f"section rigid at the node (probed: 0.6-9 % stiffer than the mean "
+                             f"rotation on cantilevers of 4-1 elements).", once=True)
+            loaded = [n for n in knots if any(b.keyword == "CLOAD" and any(v != 0.0 for _, v in items[n])
+                                              for b, _, items in cards if n in items)]
+            if loaded and "BUCKLE" in self.steps.procs:
+                self.report.warn(f"*BUCKLE with moments on {len(loaded)} knot beam node(s) of beams in "
+                                 f"general 3-D directions (e.g. node {loaded[0]}): ccx 2.23 stiffens a "
+                                 f"moment preload on a knot otherwise than through its mean-rotation "
+                                 f"MPCs (probed: a cantilever's buckling factors 3.5x those of the "
+                                 f"axis-aligned one under a tip-moment preload) — verify.", once=True)
+
+    @classmethod
+    def _along_axis(cls, v: Vec) -> bool:
+        """Whether ``v`` lies within _AXIS_TOL of a global axis."""
+        n = vnorm(v)
+        return n > 0 and 1.0 - max(abs(x) for x in v) / n < 0.5 * cls._AXIS_TOL ** 2
+
+    def _beam_section_frame(self, n: int, beams: Sequence[int]) -> Optional[Tuple[Vec, Vec, Vec]]:
+        """The section axes n1, n2 and the beam axis t that ccx 2.23 gives node ``n`` of
+        ``beams``, which it expands as one (gen3dnor): per beam its tangent at the node (a
+        3-node beam's from its quadratic interpolation) and n2 = t x n1 (n1 of its section),
+        as unit vectors; the node's t and n2 their normalised sums, n2 made normal to t, and
+        n1 = n2 x t.  None where a beam's n1 is unknown or along its tangent."""
+        pts = self.geom.nodes
+        ts: Vec = (0.0, 0.0, 0.0)
+        ns: Vec = (0.0, 0.0, 0.0)
+        for e in beams:
+            conn = self.geom.elements[e][1]
+            x = [pts[m] for m in conn]
+            if len(conn) == 2:
+                t = vsub(x[1], x[0])
+            else:
+                xi = (-1.0, 0.0, 1.0)[conn.index(n)]
+                t = vadd(vadd(vscale(x[0], xi - 0.5), vscale(x[1], -2.0 * xi)), vscale(x[2], xi + 0.5))
+            n1 = self._beam_n1.get(e)
+            if n1 is None or not vnorm(t):
+                return None
+            t = vunit(t)
+            n2 = vcross(t, n1)
+            if vnorm(n2) <= 1e-10 * vnorm(n1):
+                return None
+            ts, ns = vadd(ts, t), vadd(ns, vunit(n2))
+        if not vnorm(ts):
+            return None
+        t = vunit(ts)
+        n2 = vsub(ns, vscale(t, vdot(ns, t)))
+        if vnorm(n2) <= 1e-10:
+            return None
+        n2 = vunit(n2)
+        return vcross(n2, t), n2, t
+
+    def _section_axes_exact(self, n: int, frame: Tuple[Vec, Vec, Vec],
+                            cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]],
+                            acts: set) -> bool:
+        """Whether ccx's mean-rotation MPCs about the global axes are exact on beam node ``n``
+        with section axes ``frame`` (_plan_beam_section_axes): its nonzero rotations are about
+        global axes along section axes, and so are its moments, but for those on rotations
+        held in their step (reactions there); each state of its rotational BCs holds rotations
+        about such axes only, all three (one being such: the MPCs then hold the same
+        rotations), or two whose free axis is such."""
+        along = {max(range(3), key=lambda j: abs(v[j])) + 4 for v in frame if self._along_axis(v)}
+        if len(along) == 3:
+            return True
+        held_at: Dict[int, set] = {}            # step -> the rotations held at its end
+        for _, s, st, _ in self._rot_bc_walk(n, cards, acts):
+            if isinstance(st, str) or any(v != 0.0 and d not in along for d, (v, _, _) in st.items()):
+                return False
+            held = held_at[s] = set(st)
+            if not (held <= along or (along and held == {4, 5, 6}) or
+                    (len(held) == 2 and {4, 5, 6} - held <= along)):
+                return False
+        # (a step that names no rotation of the node keeps the last state, unless an OP=NEW
+        # BC card may have released it)
+        released = any(b.keyword == "BOUNDARY" and id(b) in acts for b, _, _ in cards)
+        for b, s, items in cards:
+            if b.keyword != "CLOAD":
+                continue
+            before = [k for k in held_at if k <= s]
+            held = held_at[max(before)] if before and (max(before) == s or not released) else set()
+            if any(v != 0.0 and d not in along and d not in held for d, v in items.get(n, ())):
+                return False
+        return True
+
+    def _section_axes_blockers(self, blocks: List[Block]) -> str:
+        """Why no beam node of this deck can take a *TRANSFORM along its section axes
+        (_plan_beam_section_axes), or "": cards that tie node DOFs or read them in local axes
+        (_UNTR_BLOCKERS, connectors, initial velocities, follower loads), a planar model's
+        constraint (given in global DOFs), output in local axes (*NODE FILE / OUTPUT,
+        GLOBAL=NO) or printed with transformed nodes (*NODE PRINT keeps local axes there)."""
+        for b in blocks:
+            k = b.keyword
+            if k in self._UNTR_BLOCKERS or k.startswith("CONNECTOR") or \
+                    (k == "INITIAL CONDITIONS" and "VELOCITY" in (b.uparam("TYPE") or "")) or \
+                    (k == "CLOAD" and b.has("FOLLOWER")):
+                return f"the deck has *{k} cards"
+            if k in ("NODE FILE", "NODE OUTPUT") and b.uparam("GLOBAL") == "NO":
+                return f"a *{k} asks for output in local axes"
+            if k in ("NODE PRINT", "NODE OUTPUT") and self._transformed:
+                nset = (b.param("NSET") or "").strip()
+                if not nset or set(self._resolve_nodes(nset)) & set(self._transformed):
+                    return "its *NODE PRINT output shares a node set with nodes of a *TRANSFORM"
+        return "a planar model's constraint is in global DOFs" if self._planar_bc else ""
+
+    @staticmethod
+    def _turned_rotations(got: Dict[Tuple[int, int], List[str]], kind: Dict[int, str]) -> set:
+        """The local rotational DOFs (4-6) that the lines ``got`` (card, node -> lines;
+        ``kind``: card -> keyword) load or move by a nonzero value."""
+        out = set()
+        for (src, _), lines in got.items():
+            for ln in lines:
+                f = [x.strip() for x in ln.split(",")]
+                try:
+                    if kind.get(src) == "CLOAD" and len(f) >= 3:
+                        ds, v = [int(f[1])], pf(f[2])
+                    elif len(f) >= 4:
+                        ds, v = list(range(int(f[1]), int(f[2]) + 1)), pf(f[3])
+                    else:
+                        continue
+                except ValueError:
+                    continue
+                out.update(d for d in ds if d >= 4 and v != 0.0)
+        return out
+
+    def _section_transform_cards(self) -> List[str]:
+        """The rectangular *TRANSFORM cards of _plan_beam_section_axes (point a on local 1 =
+        n1, b on local 2 = n2: local 3 is the beam axis), one per set of axes."""
+        groups: "OrderedDict[str, List[int]]" = OrderedDict()
+        for n, (e1, e2, _t) in self._sect_axes.items():
+            groups.setdefault(", ".join(_fmt_unit(x) for x in e1 + e2), []).append(n)
+        out = ["** abq2ccx: beam nodes in general 3-D directions: *TRANSFORM along their section "
+               "axes (ccx's mean rotation is exact about them)"] if groups else []
+        for data, nodes in groups.items():
+            out += self._rect_transform(nodes, data)
+        return out
+
     def _rot_items(self, b: Block, nodes: set, whole: bool = False,
                    span: Tuple[int, int] = (4, 6)) -> Dict[int, List[Tuple[int, float]]]:
         """(DOF, value) per node of ``nodes`` that the *BOUNDARY or *CLOAD ``b`` gives on DOFs
@@ -15448,7 +15743,9 @@ class Converter:
                 turned.update(n for n, its in self._rot_items(b, own).items()
                               if any(v != 0.0 for _, v in its))
         sections, at = self._knot_sections(blocks), self._elements_at(own)
-        knots = set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}
+        # (knot beams of _plan_beam_section_axes whose rotations stay held at zero turn nothing)
+        knots = (set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}) - \
+            self._still_knots
         if not turned and not knots:
             return
         parts = [f"non-zero rotational BCs or moments on {len(turned)} shell/beam node(s) (e.g. "
@@ -15636,6 +15933,21 @@ class Converter:
             for nd, v in forces.items():
                 sums[nd] = sums.get(nd, 0.0) + v
                 amps[nd] = amp
+        for n, axes in self._sect_axes.items():
+            # a node with a *TRANSFORM along its section axes (_plan_beam_section_axes): the
+            # forces (moments) in its local components
+            for o in (0, 3):
+                got = [(n, o + k) for k in (1, 2, 3) if (n, o + k) in sums]
+                if got:
+                    v = tuple(sums.get((n, o + k), 0.0) for k in (1, 2, 3))
+                    amp = amps[got[0]]
+                    if any(amps[nd] != amp for nd in got):
+                        self.report.warn(f"Converted nodal loads on node {n} (whose *TRANSFORM "
+                                         f"follows its beam section) have different amplitudes "
+                                         f"on its DOFs, which its local components share: written "
+                                         f"with the first one's — verify.", once=True)
+                    for k in (1, 2, 3):
+                        sums[(n, o + k)], amps[(n, o + k)] = vdot(v, axes[k - 1]), amp
         for nd, v in sums.items():
             target[nd] = ("%.12g" % v if v else "0", amps[nd])
         held = {} if self.emit.cload_new else self.emit.nodal_emitted
@@ -16333,6 +16645,11 @@ class Converter:
             if out2d and kw == "NODE FILE":
                 params["OUTPUT"] = "2D"
                 out2d = False
+            if kw == "NODE PRINT" and self._sect_axes and (params.get("GLOBAL") or "").upper() != "YES" \
+                    and any(n in self._sect_axes for n in self._resolve_nodes(params.get("NSET") or "")):
+                # a node with a *TRANSFORM along its beam section (_plan_beam_section_axes):
+                # Abaqus prints it in global axes, ccx's *NODE PRINT in local ones by default
+                params["GLOBAL"] = "YES"
             if i == 0:
                 if self.emit.out_ctl_step != self.emit.no:
                     self.emit.out_ctl_step = self.emit.no
@@ -21624,6 +21941,7 @@ class Converter:
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes
         self._plan_shell_rotation_pairs(blocks)     # after both: their 'keep' / 'untr' nodes
+        self._plan_beam_section_axes(blocks)        # after them (_untr); may add knot beams
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
         self._plan_rigid_contact_increment(blocks)
@@ -21639,6 +21957,7 @@ class Converter:
         out.extend(self.emit_geometry())
         mesh = len(out)                         # (the post-passes leave its cards unread)
         out.extend(self._knot_section())
+        out.extend(self._section_transform_cards())
         out.extend(self._slab_cards())
         out.extend(self._ply_cards())
         out.extend(self._qmem_cards())
