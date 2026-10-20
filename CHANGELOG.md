@@ -6,6 +6,19 @@ physics.
 
 ## Unreleased
 
+## 1.4.0 (October 2026)
+
+Steps as ccx 2.23 reads them: `OP=NEW` on loads and boundary conditions; buckling and frequency
+steps with their preloads, prescribed displacements, base-state temperatures and contact; modal
+and static perturbation steps, and the general steps after them. Rigid bodies and kinematic
+couplings as linear equations wherever ccx would turn them with the finite rotation, and
+couplings' `ORIENTATION`, `INFLUENCE RADIUS` and several reference nodes. Output requests ccx
+2.23 stops or crashes on kept out; `*INCLUDE` read as text, blank fields and blank-free parameter
+names read as Abaqus reads them; a `--run` judge that counts a step that solved nothing as
+unsolved, and a warning where ccx's `*BUCKLE` misses the lowest factors; and the fixes of a
+second whole-file code review. Corpus on ccx 2.23: 232 decks gated, 188 solving their own
+physics.
+
 * **Member BCs of a coupling along an `ORIENTATION=`** — where a kinematic coupling ties only
   some local translations, the converter judged its members' BCs by the global DOF numbers.
   A BC the coupling does not hold was taken off as implied (0.1-0.2 of max |u| off), and ccx
