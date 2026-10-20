@@ -3942,9 +3942,9 @@ class Converter:
         # kinematic couplings whose transformed reference node carries its rotation on a ROT
         # NODE of a *RIGID BODY instead (_plan_kinematic_rot_nodes): id(*COUPLING) -> ROT NODE
         self._kin_rb: Dict[int, Optional[int]] = {}
-        # ... and those of plain 3-D members in a deck with a *DYNAMIC step, written without
-        # ccx's *KINEMATIC (_kin_form; ROT NODE None where all are left out); id(*COUPLING /
-        # *KINEMATIC COUPLING)
+        # ... and those of plain 3-D members in a deck with a *DYNAMIC step (or linear rigid
+        # equations), written without ccx's *KINEMATIC (_kin_form; ROT NODE None where all are
+        # left out); id(*COUPLING / *KINEMATIC COUPLING)
         self._kin_dyn: set = set()
         # deck BCs / moments on DOFs 4-6 of a transformed shell/beam node or kinematic
         # reference node (_plan_transformed_rotations): node -> "keep" / "global" / "refuse",
@@ -4085,9 +4085,11 @@ class Converter:
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
         self._conn_rot: set = set()                # rotation nodes made for connector rotations
         self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_deck_facts)
-        # a *DYNAMIC step and no NLGEOM: rigid constraints become linear *EQUATIONs
-        # (_plan_deck_facts, _rigid_body_lines); a linear *DYNAMIC step before an NLGEOM one
-        self._linear_rigid = self._dyn_before_nl = False
+        # no NLGEOM, a step ccx runs through its nonlinear solver (``_solver_why``: the first
+        # one, in words): rigid constraints become linear *EQUATIONs (_plan_deck_facts,
+        # _rigid_body_lines); such a step before an NLGEOM one
+        self._linear_rigid = self._dyn_before_nl = self._dynamic_deck = False
+        self._solver_why = ""
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
         # such card, what each step appends for the ones it keeps, and the amplitudes only
@@ -14534,29 +14536,50 @@ class Converter:
         adds or replaces such cards.
 
         Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
-        linear *EQUATIONs (``_linear_rigid``) in a deck with a *DYNAMIC step and no NLGEOM: see
-        _rigid_body_lines.  ``_dyn_before_nl``: a geometrically linear implicit *DYNAMIC step
-        runs before the first NLGEOM step, where ccx turns the RIGID MPCs those decks keep."""
+        linear *EQUATIONs (``_linear_rigid``) in a deck without NLGEOM with a step ccx runs
+        through its nonlinear solver, where it turns their RIGID MPCs with the finite rotation
+        (_rigid_body_lines): an implicit *DYNAMIC or a (un)coupled temperature-displacement
+        step, or a *STATIC (a perturbation one too) or *VISCO step of a model with a material
+        ccx iterates (a kept *PLASTIC, *CREEP, *HYPERELASTIC, *HYPERFOAM, a mechanical *USER
+        MATERIAL; used or not) or a *CONTACT PAIR other than TIED (probed on 2.23; a *VISCO
+        step of elastic materials, gaps, nonlinear springs and knots stay linear).
+        ``_dyn_before_nl``: such a step runs before the first NLGEOM step, where ccx turns the
+        RIGID MPCs those decks keep."""
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        iterated = next((b.keyword for b in blocks if
+                         (b.keyword == "PLASTIC" and self._plastic_kept(b)) or
+                         (b.keyword in ("CREEP", "HYPERELASTIC", "HYPERFOAM") and
+                          not b.has("TEST DATA INPUT")) or
+                         (b.keyword == "USER MATERIAL" and b.uparam("TYPE") != "THERMAL") or
+                         (b.keyword == "CONTACT PAIR" and not b.has("TIED"))), None)
         self._pert_idx = self._perturbation_steps(blocks)
         on = self._nlgeom_steps(blocks)
-        steps: List[bool] = []                   # per general step: it runs NLGEOM
-        dyn: List[bool] = []                     # ... it is an implicit *DYNAMIC step
+        steps: List[bool] = []                   # per step: it runs NLGEOM
+        solver: List[str] = []                   # ... why ccx runs it through its nonlinear solver
         for s, group in enumerate(step_groups(blocks)[1], 1):
-            if s in self._pert_idx:      # linear about the base state, and no effect on the
-                continue                 # general steps after it, whatever its NLGEOM (Abaqus)
-            steps.append(any(id(b) in on for b in group if b.keyword == "STEP"))
-            dyn.append(False)
+            # a linear perturbation step runs linear about the base state, and no effect on the
+            # general steps after it, whatever its NLGEOM (Abaqus); its *STATIC is a general one
+            # in ccx (handle_step)
+            steps.append(s not in self._pert_idx and
+                         any(id(b) in on for b in group if b.keyword == "STEP"))
+            solver.append("")
             for b in group[1:]:
                 if b.keyword == "DYNAMIC" and b.has("EXPLICIT"):
                     steps[-1] = True           # the converter runs explicit steps with NLGEOM
-                elif b.keyword == "DYNAMIC":
-                    dyn[-1] = True
+                elif b.keyword in ("DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
+                                   "UNCOUPLED TEMPERATURE-DISPLACEMENT"):
+                    solver[-1] = solver[-1] or f"a *{b.keyword} step"
+                elif iterated and b.keyword in ("STATIC", "VISCO"):
+                    solver[-1] = solver[-1] or f"a *{b.keyword} step with a *{iterated}" + \
+                        ("" if iterated in ("CONTACT PAIR", "USER MATERIAL") else " material")
+        general = [nl for s, nl in enumerate(steps, 1) if s not in self._pert_idx]
         # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
-        self._nl_any, self._nl_all = any(steps), bool(steps) and steps[0]
-        self._linear_rigid = not self._nl_any and any(b.keyword == "DYNAMIC" for b in blocks)
+        self._nl_any, self._nl_all = any(steps), bool(general) and general[0]
+        self._linear_rigid = not self._nl_any and any(solver)
         first_nl = steps.index(True) if self._nl_any else 0
-        self._dyn_before_nl = any(d for d in dyn[:first_nl])
+        self._dyn_before_nl = any(solver[:first_nl])
+        self._solver_why = next((s for s in solver if s), "")
+        self._dynamic_deck = any(b.keyword == "DYNAMIC" for b in blocks)
         self._explicit_deck = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         self._mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
         self._kinematic_ids = {id(b) for b, c in zip(blocks, blocks[1:])
@@ -18746,15 +18769,15 @@ class Converter:
         self._plan_rot_axes(self._rb_rot)              # the connector rows use them
         self._plan_connector_rows(blocks)
         self._plan_coupled_bcs(blocks)
-        # ccx's RIGID MPCs in a geometrically linear *DYNAMIC step: a *RIGID BODY kept there is
-        # warned where it is written (_rigid_body_lines)
+        # ccx's RIGID MPCs in a geometrically linear step of its nonlinear solver: a *RIGID BODY
+        # kept there is warned where it is written (_rigid_body_lines)
         emits = {c["emit"] for c in self._rigid_constraints(blocks)} \
             if self._dyn_before_nl or self._linear_rigid else set()
         if self._dyn_before_nl and emits - {"eq"}:
             self._warn_finite_rigid()
         elif self._linear_rigid and "kin" in emits:
-            self._warn_finite_rigid("a kinematic coupling of shell, beam or 2-D nodes has a line "
-                                    "without linear equations (a *TRANSFORM, or rotations only)")
+            self._warn_finite_rigid("a kinematic coupling has a line without linear equations "
+                                    "(a *TRANSFORM, or rotations only)")
         self._plan_velocity_bcs(blocks)       # after _plan_coupled_bcs: reads its card rewrites
         if self._explicit_deck and any(
                 any(m in self._plane_only for m in members)
@@ -19598,14 +19621,14 @@ class Converter:
         solve (their MPCs chain, which keeps the flag; probed).  So in a deck with a *DYNAMIC
         step every coupling whose members are plain 3-D nodes is written without ccx's
         *KINEMATIC, as _kin_form says (``_kin_dyn``; every coupling on the reference node, or
-        none, sharing its ROT NODE).  Without NLGEOM so is one on knotted shell/beam or 2-D
-        members whose every line becomes linear equations: ccx would turn its RIGID MPCs with
-        the finite rotation (_rigid_body_lines).  Returns the last node id."""
+        none, sharing its ROT NODE).  In a deck of linear rigid equations (_linear_rigid) so
+        is any coupling whose every line becomes them: ccx would turn its RIGID MPCs with the
+        finite rotation (_rigid_body_lines).  Returns the last node id."""
         structural = set(self._shell_nodes) | set(self._beam_nodes)
         for e, (typ, conn) in self.geom.elements.items():
             if e not in self._qmem and ccx_type(typ).startswith("M3D"):
                 structural.update(conn)
-        dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
+        dynamic = self._dynamic_deck
         cands: "OrderedDict[int, List[Tuple[int, bool]]]" = OrderedDict()  # ref -> (id, tied)
         convertible: set = set()             # couplings of all translations, 3-D members
         # ref -> (id, its members are plain, it constrains anything: a ROT NODE is needed)
@@ -19619,10 +19642,11 @@ class Converter:
             if not groups:                     # a card handle_coupling comments out
                 continue
             members = [n for ns, _ in groups for n in ns]
-            if dynamic:
+            if dynamic or self._linear_rigid:
                 frame = self._coupling_frame(b)
                 plain = bool(members) and (
-                    not any(n in structural or n in self._plane_only for n in members) or
+                    (dynamic and not any(n in structural or n in self._plane_only
+                                         for n in members)) or
                     (self._linear_rigid and all(self._kin_form(ref, ns, ds, frame) == "eq"
                                                 for ns, ds in groups)))
                 dyn.setdefault(ref, []).append((id(b), plain, plain and any(
@@ -21241,18 +21265,18 @@ class Converter:
 
     def _kin_form(self, ref: int, members: Sequence[int], dofs: set,
                   frame: Union[None, str, Tuple[Vec, Vec, Vec]] = None) -> str:
-        """How a kinematic coupling of plain 3-D members in a deck with a *DYNAMIC step is
-        written (``_kin_dyn``, see _plan_kinematic_rot_nodes), with the reference node's
-        rotation on DOFs 1-3 of its ROT NODE: 'eq' — linear *EQUATIONs (_kin_rows), the
-        coupling Abaqus solves without NLGEOM (exact; in a *DYNAMIC step ccx turns a
-        *RIGID BODY's RIGID MPCs with the finite rotation even without NLGEOM: 7 % off at
-        0.36 rad, probed); 'rb' — under NLGEOM, a coupling of all translations as the *RIGID
-        BODY it is in ccx (the same RIGID MPCs; exact, probed); under NLGEOM a coupling of
-        some translations has neither ('drop'; --approximate: 'eq', linear equations being
-        exact for small rotations only: 7 % off at 0.36 rad), nor has a coupling of no
-        translation ('none').  Linear equations need terms ccx reads (_rigid_eq_refused), and
-        for some translations the axes of the coupling's ORIENTATION (``frame``,
-        _coupling_frame)."""
+        """How a kinematic coupling of plain 3-D members in a deck with a *DYNAMIC step (or
+        linear rigid equations) is written (``_kin_dyn``, see _plan_kinematic_rot_nodes), with
+        the reference node's rotation on DOFs 1-3 of its ROT NODE: 'eq' — linear *EQUATIONs
+        (_kin_rows), the coupling Abaqus solves without NLGEOM (exact; in a step of its
+        nonlinear solver ccx turns a *RIGID BODY's RIGID MPCs with the finite rotation even
+        without NLGEOM: 7 % off at 0.36 rad, probed); 'rb' — under NLGEOM, a coupling of all
+        translations as the *RIGID BODY it is in ccx (the same RIGID MPCs; exact, probed);
+        under NLGEOM a coupling of some translations has neither ('drop'; --approximate: 'eq',
+        linear equations being exact for small rotations only: 7 % off at 0.36 rad), nor has a
+        coupling of no translation ('none').  Linear equations need terms ccx reads
+        (_rigid_eq_refused), and for some translations the axes of the coupling's ORIENTATION
+        (``frame``, _coupling_frame)."""
         trans = dofs & {1, 2, 3}
         if not trans:
             return "none"
@@ -21390,15 +21414,19 @@ class Converter:
     def _rigid_body_lines(self, card: List[str], ref: Optional[int], rot: Optional[int],
                           members: Sequence[int]) -> Tuple[List[str], bool]:
         """A ccx *RIGID BODY (``card``: it and the *NSET it names) of ``members`` on ``ref``
-        with ROT NODE ``rot`` — or, in a deck with a *DYNAMIC step and no NLGEOM (explicit
-        steps run with it), the linear *EQUATIONs u(m) = u(ref) + theta x (x_m - x_ref) on
-        each translation (_kin_rows).  Abaqus linearizes rigid bodies, kinematic couplings and
-        *MPC BEAM there ('If rigid bodies are used in a geometrically linear Abaqus/Standard
-        analysis ... the rigid body constraints are linearized'), but ccx turns their RIGID
-        MPCs with the finite rotation in a *DYNAMIC step (probed: a solid cantilever under a
-        tip moment 0.5 % stiffer at 0.01 rad, 9 % at 0.1 rad, the stress at the body 38 % off;
-        linear equations exact).  A body whose equations ccx would not read right keeps the
-        card (_rigid_eq_refused), warned.  Also returns whether the equations were written."""
+        with ROT NODE ``rot`` — or, in a deck without NLGEOM (explicit steps run with it) with a
+        step ccx runs through its nonlinear solver (_linear_rigid: a *DYNAMIC step, a plastic
+        material, a contact pair, ...), the linear *EQUATIONs u(m) = u(ref) + theta x (x_m -
+        x_ref) on each translation (_kin_rows).  Abaqus linearizes rigid bodies, kinematic
+        couplings and *MPC BEAM there ('If rigid bodies are used in a geometrically linear
+        Abaqus/Standard analysis ... the rigid body constraints are linearized'), but ccx turns
+        their RIGID MPCs with the finite rotation in such a step (probed: a solid cantilever
+        under a tip moment in a *DYNAMIC step 0.5 % stiffer at 0.01 rad, 9 % at 0.1 rad, the
+        stress at the body 38 % off; a prescribed tip turn of 0.36 rad 7 % off in a *DYNAMIC,
+        *COUPLED or *UNCOUPLED TEMPERATURE-DISPLACEMENT step and in a *STATIC step with a
+        plastic, creeping, hyperelastic or user material or a contact pair; linear equations
+        exact).  A body whose equations ccx would not read right keeps the card
+        (_rigid_eq_refused), warned.  Also returns whether the equations were written."""
         members = [n for n in dedup(members) if n not in (ref, rot) and n in self.geom.nodes]
         if not self._linear_rigid or ref not in self.geom.nodes or rot not in self.geom.nodes:
             return card, False
@@ -21415,38 +21443,41 @@ class Converter:
             "ccx ignores DOFs 4-6 of the REF NODE"
 
     def _warn_finite_rigid(self, why: Optional[str] = None) -> None:
-        """A rigid constraint left to ccx's RIGID MPCs in a geometrically linear *DYNAMIC step,
-        where ccx turns them with the finite rotation and Abaqus linearizes them: in a deck of
-        linear rigid equations because ``why`` (_rigid_eq_refused), or (``why`` None) in one
-        whose *DYNAMIC step runs before an NLGEOM step (_dyn_before_nl)."""
+        """A rigid constraint left to ccx's RIGID MPCs in a geometrically linear step ccx runs
+        through its nonlinear solver (``_solver_why``), where it turns them with the finite
+        rotation and Abaqus linearizes them: in a deck of linear rigid equations because
+        ``why`` (_rigid_eq_refused), or (``why`` None) in one where such a step runs before an
+        NLGEOM step (_dyn_before_nl)."""
         if why:
-            msg = (f"Rigid constraint (*RIGID BODY, kinematic coupling or *MPC BEAM) in a deck with a "
-                   f"*DYNAMIC step and no NLGEOM written as ccx's *RIGID BODY / *KINEMATIC, not as "
-                   f"the linear *EQUATIONs of the other ones: {why}. ")
+            msg = (f"Rigid constraint (*RIGID BODY, kinematic coupling or *MPC BEAM) in a deck without "
+                   f"NLGEOM that has {self._solver_why} written as ccx's *RIGID BODY / *KINEMATIC, not "
+                   f"as the linear *EQUATIONs of the other ones: {why}. ")
         else:
-            msg = ("Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM) in a deck whose "
-                   "*DYNAMIC step runs without NLGEOM before an NLGEOM step: written as ccx's RIGID "
-                   "MPCs (exact under NLGEOM), which ccx also turns with the finite rotation in the "
-                   "linear *DYNAMIC step. ")
+            msg = (f"Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM) in a deck where "
+                   f"{self._solver_why} runs without NLGEOM before an NLGEOM step: written as ccx's "
+                   f"RIGID MPCs (exact under NLGEOM), which ccx also turns with the finite rotation "
+                   f"in that step (it runs it through its nonlinear solver). ")
         self.report.warn(msg + "Abaqus linearizes rigid constraints in a geometrically linear step "
                          "(probed: a tip rotation of 0.01 rad 0.5 % off, 0.1 rad 9 %).", once=True)
-        self._reduces("rigid constraint turned with the finite rotation in a linear *DYNAMIC step")
+        self._reduces("rigid constraint turned with the finite rotation in a geometrically linear step")
 
     def _note_linear_rigid(self) -> None:
-        self.report.note("Rigid constraints (*RIGID BODY, *MPC BEAM, kinematic couplings) in a deck "
-                         "with a *DYNAMIC step and no NLGEOM -> the linear *EQUATIONs Abaqus "
-                         "solves there (it linearizes rigid constraints in a geometrically linear "
-                         "analysis): u(node) = u(ref) + theta x d on each translation, theta on "
-                         "DOFs 1-3 of the ROT NODE (where the reference node's rotational BCs, "
-                         "moments and equation terms go). ccx turns its own RIGID MPCs with the "
-                         "finite rotation in a *DYNAMIC step even without NLGEOM (probed: 9 % "
-                         "off at 0.1 rad); knotted shell/beam members keep their rotation ties.",
-                         once=True)
+        why = self._solver_why
+        self.report.note(f"Rigid constraints (*RIGID BODY, *MPC BEAM, kinematic couplings) in a deck "
+                         f"without NLGEOM that has {why} -> the linear *EQUATIONs Abaqus solves "
+                         f"there (it linearizes rigid constraints in a geometrically linear "
+                         f"analysis): u(node) = u(ref) + theta x d on each translation, theta on "
+                         f"DOFs 1-3 of the ROT NODE (where the reference node's rotational BCs, "
+                         f"moments and equation terms go). ccx runs {why} through its nonlinear "
+                         f"solver, where it turns its own RIGID MPCs with the finite rotation even "
+                         f"without NLGEOM (probed: 9 % off at 0.1 rad); knotted shell/beam members "
+                         f"keep their rotation ties.", once=True)
 
     def _kin_dynamic_cards(self, b: Block, plan: dict,
                            groups: Sequence[Tuple[Sequence[int], set]]) -> List[str]:
-        """A kinematic coupling in a deck with a *DYNAMIC step, of plain 3-D members (or, without
-        NLGEOM, any: _plan_kinematic_rot_nodes): each (members, DOFs) group as _kin_form says —
+        """A kinematic coupling in a deck with a *DYNAMIC step, of plain 3-D members (or, in a
+        deck of linear rigid equations, any: _plan_kinematic_rot_nodes): each (members, DOFs)
+        group as _kin_form says —
         a *RIGID BODY with the reference node's ROT NODE, linear *EQUATIONs to the reference
         node and that ROT NODE (the rotations of knotted shell/beam members tied to it), or
         left out (the card commented out when nothing is left)."""
@@ -21490,7 +21521,8 @@ class Converter:
             if self._linear_rigid:
                 self._warn_finite_rigid(local)
         out += self._linear_rigid_lines(ref, rot, rows) + ties
-        if self._linear_rigid and any(n in self._expanded for ns, _ in groups for n in ns):
+        if self._linear_rigid and (not self._dynamic_deck or
+                                   any(n in self._expanded for ns, _ in groups for n in ns)):
             self._note_linear_rigid()        # (ccx's coupling would solve: its MPCs chain)
         elif out:
             self.report.note("Kinematic coupling in a deck with a *DYNAMIC step: ccx 2.23 solves no "
@@ -22176,7 +22208,8 @@ class Converter:
         impose and that stay (_plan_coupled_bcs): one warning per constraint kind, DOF type and
         reason, with what ccx does with it and what Abaqus does instead.  Where the constraint
         is linear *EQUATIONs (emit 'eq': only a *RIGID BODY's stay) ccx solves with the BC kept,
-        _settle_dependents reordering them, a model Abaqus does not solve: reduced physics."""
+        _settle_dependents reordering them, a model Abaqus does not solve: reduced physics; so
+        is a rotation's BC kept against the converter's rotation tie in any form."""
         what = {"kin": "a kinematic coupling", "rb": "a *RIGID BODY",
                 "mpc": "an *MPC BEAM (a *RIGID BODY in ccx)"}
         groups: "OrderedDict[Tuple[str, str, bool, str], List[Tuple[int, int, int]]]" = OrderedDict()
@@ -22228,6 +22261,8 @@ class Converter:
             self.report.warn("Possible overconstraint: " + where + effect + fix, once=True)
             if emit == "eq":
                 self._reduces("*BOUNDARY on *RIGID BODY nodes kept as written")
+            elif not trans:                   # (a translation stops ccx)
+                self._reduces("*BOUNDARY on rotations a rigid constraint ties kept as written")
 
     # ======================================================================
     # Planar models: ccx runs 2-D beams and trusses as 3-D elements

@@ -7748,8 +7748,8 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
         else:                    # the rigid element's skin nodes (and its own nodes) follow it
             assert len(_equation_terms(body)) == 24 and all(
                 row[1][0] == 9 and {t[0] for t in row[2:]} <= {rot} for row in _equation_terms(body))
-        assert "Rigid constraints (*RIGID BODY, *MPC BEAM, kinematic couplings) in a deck with a " \
-               "*DYNAMIC step and no NLGEOM" in rep.text()
+        assert "Rigid constraints (*RIGID BODY, *MPC BEAM, kinematic couplings) in a deck " \
+               "without NLGEOM that has a *DYNAMIC step" in rep.text()
         assert rep.n_warnings == 0 and not conv.reduced_physics
         # unchanged: under NLGEOM (explicit steps run with it) and without a *DYNAMIC step
         for deck in (rp + card + step.format(", nlgeom"),
@@ -7774,7 +7774,7 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
     body, conv, rep = convert_str(rp + tr.replace("TOPN", "RP") + cards[0] + step.format(""))
     assert "*RIGID BODY" in body and not _equation_terms(body)
     assert "not as the linear *EQUATIONs of the other ones: its reference node has a *TRANSFORM" in rep.text()
-    assert conv.reduced_physics == ["rigid constraint turned with the finite rotation in a linear *DYNAMIC step"]
+    assert conv.reduced_physics == ["rigid constraint turned with the finite rotation in a geometrically linear step"]
     # knotted shell members: their translations and (TIE, coupled rotations) rotations follow
     sdyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 6\n4, 1, 6\n*Boundary\nREF, 3, 3, 0.1\n*End Step\n"
     coupling = "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n"
@@ -7889,7 +7889,7 @@ def test_rigid_constraints_ccx_turns_in_a_linear_dynamic_step_are_reduced():
     # step runs before an NLGEOM step keeps them (exact under NLGEOM) — reduced physics
     rb = TOP9 + "*Rigid Body, ref node=RP, tie nset=TOPN\n"
     nl = "*Step, nlgeom\n*Static\n0.1, 1.\n*Cload\nRP, 5, 1.\n*End Step\n"
-    what = ["rigid constraint turned with the finite rotation in a linear *DYNAMIC step"]
+    what = ["rigid constraint turned with the finite rotation in a geometrically linear step"]
     for card in ("*Rigid Body, ref node=RP, tie nset=TOPN\n", "*MPC\nBEAM, TOPN, 9\n", TOP9_KIN):
         body, conv, rep = convert_str(TOP9 + card + TOP9_DYN.format("") + nl)
         assert "*DYNAMIC step runs without NLGEOM before an NLGEOM step" in rep.text()
@@ -7907,6 +7907,74 @@ def test_rigid_constraints_ccx_turns_in_a_linear_dynamic_step_are_reduced():
     body, conv, rep = convert_str(shell)
     assert "*KINEMATIC" in body and "has a line without linear equations" in rep.text()
     assert what[0] in conv.reduced_physics
+
+
+def test_rotation_bcs_against_rigid_rotation_ties_are_reduced():
+    # a *BOUNDARY on a shell rotation a rigid constraint ties, kept: the body follows the
+    # first node's BC (the tie turned round), or the coupling leaves the rotation untied —
+    # unlike in Abaqus, so reduced physics (a translation stops ccx, which shows)
+    step = "*Step\n*Static\n*Boundary\n1, 1, 6\n4, 1, 6\n{}*Cload\nREF, 3, 1.\n*End Step\n"
+    coupling = "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n*Kinematic\n"
+    for card, bc, effect in (("*Rigid Body, ref node=REF, tie nset=R\n", "5, 4, 4, 0.1\n6, 4, 4, 0.2\n",
+                              "the body then follows that rotation"),
+                             (coupling, "5, 4, 4, 0.1\n", "keeps the BC and is not tied")):
+        body, conv, rep = convert_str(S4 + card + step.format(bc))
+        assert "Possible overconstraint" in rep.text() and effect in rep.text()
+        assert conv.reduced_physics == ["*BOUNDARY on rotations a rigid constraint ties kept as written"]
+    # one node's BC moves to the reference node, as Abaqus does: no clash
+    body, conv, rep = convert_str(S4 + "*Rigid Body, ref node=REF, tie nset=R\n" + step.format("5, 4, 4, 0.1\n"))
+    assert "Possible overconstraint" not in rep.text() and not conv.reduced_physics
+
+
+def test_rigid_constraints_in_steps_ccx_runs_nonlinear():
+    # ccx turns its RIGID MPCs with the finite rotation in every step without NLGEOM it runs
+    # through its nonlinear solver (7 % off at 0.36 rad, probed; validate_with_ccx.py
+    # rigid_nonlinear_*): a (un)coupled temperature-displacement step, and a *STATIC or *VISCO
+    # step of a model with a plastic, creeping, hyperelastic or user material (used or not)
+    # or a contact pair.  There too every rigid constraint is the linear equations
+    step = ("*Step{}\n{}*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\nRP, 2, 6\n"
+            "*Boundary\nRP, 1, 1, 0.1\n*End Step\n")
+    eqs = _equation_terms(convert_str(KIN9 + step.format("", "*Dynamic\n0.01, 1.\n"))[0])
+    mat = "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+    unused = "*Material, name=P\n"
+    pair = ("*Surface, name=SA\nEALL, S1\n*Surface, name=SB\nEALL, S2\n*Surface Interaction, "
+            "name=SI\n*Contact Pair, interaction=SI{}\nSA, SB\n")
+    rp = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+    for model, proc, eq in (
+            ("*Plastic\n100., 0.\n", "*Static\n", True),
+            (unused + "*Elastic\n1., 0.\n*Plastic\n1., 0.\n", "*Static\n", True),
+            ("*Creep\n1e-10, 1., 0.\n", "*Visco, cetol=1e-3\n0.1, 1.\n", True),
+            (unused + "*Hyperelastic, neo hooke\n192., 0.001\n", "*Static\n", True),
+            (unused + "*User Material, constants=2\n1000., 0.3\n", "*Static\n", True),
+            (pair.format(""), "*Static\n", True),
+            ("", "*Coupled Temperature-displacement\n0.1, 1.\n", True),
+            # (a static perturbation step is a general one in ccx: 7 % off too)
+            ("*Plastic\n100., 0.\n", "*Static\n", "pert"),
+            # ... not linear static, *VISCO of elastic materials, a TIED pair (a *TIE), a
+            # *PLASTIC the converter comments out, a thermal user material, a frequency step
+            ("", "*Static\n", False), ("", "*Visco, cetol=1e-3\n0.1, 1.\n", False),
+            (pair.format(", tied"), "*Static\n", False), ("*Plastic, hardening=user\n", "*Static\n", False),
+            (unused + "*User Material, constants=1, type=thermal\n1.\n", "*Static\n", False),
+            ("*Plastic\n100., 0.\n", "*Frequency\n3\n", False)):
+        for card in ("*Rigid Body, ref node=RP, tie nset=TOPN\n", "*MPC\nBEAM, TOPN, 9\n", None):
+            deck = (KIN9.replace(HEX, HEX + mat + model) if card is None else rp + mat + model + card) \
+                + step.format(", perturbation" if eq == "pert" else "", proc)
+            body, conv, rep = convert_str(deck)
+            live = "\n".join(_live(body))
+            if eq:
+                assert _equation_terms(body) == eqs and "*RIGID BODY" not in live, (model, proc, card)
+                assert "*KINEMATIC" not in live and "ccx runs a *" in rep.text()
+                assert rep.n_warnings == 0 and not conv.reduced_physics
+            else:
+                assert not _equation_terms(body) and ("*RIGID BODY" in live or "*KINEMATIC" in live)
+    # such a step before an NLGEOM step keeps ccx's RIGID MPCs (exact under NLGEOM): reduced
+    nl = "*Step, nlgeom\n*Static\n0.1, 1.\n*Cload\nRP, 5, 1.\n*End Step\n"
+    body, conv, rep = convert_str(rp + mat + "*Plastic\n100., 0.\n*Rigid Body, ref node=RP, tie nset=TOPN\n"
+                                  + step.format("", "*Static\n") + nl)
+    assert "*RIGID BODY" in body and not _equation_terms(body)
+    assert "in a deck where a *STATIC step with a *PLASTIC material runs without NLGEOM before an " \
+           "NLGEOM step" in rep.text()
+    assert conv.reduced_physics == ["rigid constraint turned with the finite rotation in a geometrically linear step"]
 
 
 def test_equation_terms_on_rigid_body_reference_rotations_move_to_the_rot_node():

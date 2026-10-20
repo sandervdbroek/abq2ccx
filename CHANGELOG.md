@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Rigid constraints in the other steps ccx runs nonlinear** — ccx 2.23 also turns the RIGID
+  MPCs of `*RIGID BODY` and kinematic couplings with the finite rotation without NLGEOM in a
+  coupled temperature-displacement step and in a `*STATIC` (a perturbation one too) or `*VISCO`
+  step of a model with a plastic, creeping, hyperelastic or user material (used or not) or a
+  contact pair: a 0.36 rad tip turn was 7 % off the linear answer. There too they are now the
+  linear `*EQUATION`s Abaqus solves (exact), as in a linear `*DYNAMIC` step. A kept BC on a
+  rotation that a rigid constraint ties is now flagged as reduced physics.
 * **An `*EQUATION` held by BCs in some steps only** — where a step's BCs hold every DOF of an
   equation (both tied DOFs held in a `*FREQUENCY` step, say), ccx stopped ("`*ERROR in
   cascade`": a BC on the equation's dependent DOF), while Abaqus solves it. The BC on that DOF

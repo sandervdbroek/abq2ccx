@@ -2339,6 +2339,56 @@ def rigid_dynamic_deck(member="solid", proc="dynamic", before=""):
             + "*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
 
 
+RIGID_CUBES = ("*NODE, NSET=CUBES\n" + "".join(
+    f"{k + i}, {5 + (i % 4 in (1, 2))}., {float(i % 4 > 1)}, {z0 + i // 4}.\n"
+    for k, z0 in ((201, 0), (301, 1)) for i in range(8)) +
+    "*ELEMENT, TYPE=C3D8, ELSET=EC\n201, 201, 202, 203, 204, 205, 206, 207, 208\n"
+    "301, 301, 302, 303, 304, 305, 306, 307, 308\n*SOLID SECTION, ELSET=EC, MATERIAL=M\n"
+    "*ELSET, ELSET=EA\n201\n*ELSET, ELSET=EB\n301\n*SURFACE, NAME=SA\nEA, S2\n*SURFACE, NAME=SB\n"
+    "EB, S1\n*SURFACE INTERACTION, NAME=SI\n*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR\n1e4\n"
+    "*CONTACT PAIR, INTERACTION=SI\nSB, SA\n")
+
+
+def rigid_nonlinear_deck(case, ref=False):
+    """The rigid_dynamic_deck members driven the same way over a slow step without NLGEOM that
+    ccx runs through its nonlinear solver: 'plastic', the column past yield (60, hardening to 90
+    at 0.2) in a *STATIC step of fixed increments; 'kinematic', the same with its top face
+    kinematically coupled; 'contact', the elastic column beside a *CONTACT PAIR of two held
+    cubes; 'coupled', the column of C3D8T heated by 10 (alpha 1e-3) in a *COUPLED
+    TEMPERATURE-DISPLACEMENT step; 'shell' / 'planar', the S4 / CPS4 strip of a material with a
+    *PLASTIC it never reaches.  ``ref``: the same step and model with the members' DOFs
+    prescribed to the linear rigid motion (shell, planar: in a linear *STATIC step, as ccx's
+    own knots under prescribed rotations diverge in its nonlinear solver)."""
+    member = case if case in ("shell", "planar") else "solid"
+    deck = rigid_dynamic_deck(member, "static" if ref else "dynamic")
+    if ref and member != "solid":
+        return deck
+    if member != "solid":
+        deck = deck.replace("*ELASTIC\n1000., 0.3\n", "*ELASTIC\n1000., 0.3\n*PLASTIC\n1e6, 0.\n")
+    elif case in ("plastic", "kinematic"):
+        deck = deck.replace("*ELASTIC\n1000., 0.3\n", "*ELASTIC\n1000., 0.3\n*PLASTIC\n60., 0.\n90., 0.2\n")
+    elif case == "contact":
+        deck = deck.replace("*NSET, NSET=NALL", RIGID_CUBES + "*NSET, NSET=NALL").replace(
+            "FIX, 1, 3\n", "FIX, 1, 3\nCUBES, 1, 3\n")
+    elif case == "coupled":
+        deck = deck.replace("*DENSITY\n1e-3\n", "*DENSITY\n1e-3\n*CONDUCTIVITY\n1.\n*SPECIFIC HEAT\n1.\n"
+                            "*EXPANSION\n1e-3\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0.\n").replace(
+            "FIX, 1, 3\n", "FIX, 1, 3\nNALL, 11, 11, 10.\n")
+        if not ref:
+            deck = deck.replace("TYPE=C3D8,", "TYPE=C3D8T,")
+    if case == "kinematic" and not ref:
+        deck = deck.replace("*RIGID BODY, REF NODE=100, TIE NSET=TIP\n", "*SURFACE, TYPE=NODE, NAME=ST\n"
+                            "TIP\n*COUPLING, CONSTRAINT NAME=C1, REF NODE=100, SURFACE=ST\n*KINEMATIC\n")
+    proc = {"coupled": "*COUPLED TEMPERATURE-DISPLACEMENT\n0.1, 1.\n", "plastic": "*STATIC, DIRECT\n0.1, 1.\n",
+            "kinematic": "*STATIC, DIRECT\n0.1, 1.\n"}.get(case, "*STATIC\n0.1, 1.\n")
+    if case in ("plastic", "kinematic"):
+        deck = deck.replace("*NODE PRINT, NSET=NALL\nU\n", "*NODE PRINT, NSET=NALL\nU\n*EL PRINT, ELSET=EALL\nPEEQ\n")
+    return (deck.replace("*AMPLITUDE, NAME=R, DEFINITION=SMOOTH STEP\n0., 0., 1., 1.\n", "")
+            .replace("*BOUNDARY, AMPLITUDE=R\n", "*BOUNDARY\n")
+            .replace("*STEP, INC=1000\n*DYNAMIC\n0.01, 1.\n", "*STEP, INC=1000\n" + proc)
+            .replace("*STEP\n*STATIC\n", "*STEP, INC=1000\n" + proc))
+
+
 def energy_steps_deck(first=None, second="dynamic"):
     """CUBE8 (E 1000, nu 0) held at its bottom and its top face in x and y: one degree of
     freedom, the top face's z, with stiffness E A / L = 1000 and the top face's consistent mass
@@ -5941,6 +5991,42 @@ def main():
                   f"{moved:.2f} of it (ccx's *RIGID BODY turns with the finite rotation there)")
         elif u:
             print(f"FAIL  {tag}: the static reference did not solve ({status})")
+        failures += 0 if ok else 1
+    # ... and in the other steps without NLGEOM that ccx runs through its nonlinear solver,
+    # where it turns them the same way (1.7-7 % off): a plastic material, a contact pair, a
+    # coupled temperature-displacement step; against the linear rigid motion prescribed in the
+    # same step and model
+    def both(dat):
+        disp = dat_displacements(dat)
+        return (disp, dat_el_scalar(dat, "equivalent plastic strain")) if disp else None
+    for case in ("plastic", "kinematic", "contact", "coupled", "shell", "planar"):
+        tag = f"rigid_nonlinear_{case}"
+        u, peeq = review_run(rigid_nonlinear_deck(case), tag, both) or ({}, {})
+        ref, _ = review_run(rigid_nonlinear_deck(case, True), tag + "_ref", both) or ({}, {})
+        free = RIGID_DYNAMIC[case if case in ("shell", "planar") else "solid"][3]
+        ok = bool(u) and bool(ref) and all(n in ref for n in free)
+        if ok:
+            scale = max(math.hypot(*v) for v in ref.values())
+            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
+            moved = min(math.hypot(*u.get(n, (0.0,) * 3)) for n in free) / scale
+            yielded = max(peeq.values(), default=0.0)
+            ok = err < 1e-3 and moved > 0.1 and (yielded > 1e-3 or case not in ("plastic", "kinematic"))
+            what = {"plastic": "a *RIGID BODY on a plastic column (PEEQ up to {:.3f}), fixed increments",
+                    "kinematic": "a kinematic coupling on a plastic column (PEEQ up to {:.3f}), fixed "
+                                 "increments",
+                    "contact": "a *RIGID BODY on a column beside a *CONTACT PAIR",
+                    "coupled": "a *RIGID BODY on a heated C3D8T column, *COUPLED TEMPERATURE-DISPLACEMENT",
+                    "shell": "a *RIGID BODY on S4 members, a *PLASTIC not reached",
+                    "planar": "a *RIGID BODY on CPS4 members, a *PLASTIC not reached"}[case].format(yielded)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}; driven by a node that moves and turns "
+                  f"over a slow step without NLGEOM): {len(ref)} node displacements vs the "
+                  f"linear rigid motion prescribed in "
+                  f"{'a linear static' if case in ('shell', 'planar') else 'the same'} step, max "
+                  f"difference {err:.1e} of max "
+                  f"|u|; the free nodes moved {moved:.2f} of it (ccx's *RIGID BODY turns with the "
+                  f"finite rotation there)")
+        elif u:
+            print(f"FAIL  {tag}: the reference did not solve")
         failures += 0 if ok else 1
     # an implicit *DYNAMIC or transient coupled step after a static step, which ccx 2.23 stopped
     # on ("energy output requests, if any, must be specified in the first step"; abq2ccx now
