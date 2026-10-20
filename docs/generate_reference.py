@@ -363,7 +363,10 @@ TRANSLATED = {
         "analytical surface that is not meshed comments the body out.",
     "*PRE-TENSION SECTION": "`NODE` / `ELEMENT` set → its node / element number (Abaqus' set "
         "holds one; ccx 2.23 stops on a set name), also instance-qualified at the assembly "
-        "level; any other set is warned and left for ccx to stop on.",
+        "level; any other set is warned and left for ccx to stop on. A truss or beam cut "
+        "(`ELEMENT`) → `*EQUATION`s: the element ends at a copy of its last node, displaced from "
+        "it by the pre-tension node's DOF 1 along the normal, with its rotations (ccx deletes the "
+        "element instead, and stops on a truss or quadratic beam).",
     "*ROTARY INERTIA": "ccx 2.23 has no `ROTARYI` element: on a rigid body with a `*MASS`, the "
         "body's summed rotary inertia becomes six point masses on its principal axes around the "
         "body node with the largest mass, a negative `*MASS` there that takes their mass back, "

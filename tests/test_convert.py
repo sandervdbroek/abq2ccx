@@ -833,7 +833,8 @@ def test_rotated_instance_pretension_normal_reads_blank_fields_by_position():
             "*Element, type=T3D2, elset=E\n1, 1, 2\n2, 2, 3\n"
             "*Pre-tension Section, element=1, node=10\n{}\n*Solid Section, elset=E, material=M\n1.\n")
     body, _, _ = _as_with_zeros(lambda n: _instanced(part.format(n)), "1., , ", "1., 0., 0.")
-    assert "\n0, 1, 0\n" in body.split("*PRE-TENSION SECTION")[1][:80]
+    # the truss cut's equations (_plan_pretension_cuts) take the turned normal (0, 1, 0)
+    assert "\n11, 2, 1, 2, 2, -1, 10, 1, -1\n" in body and "\n11, 1, 1, 2, 1, -1\n" in body
 
 
 def test_rotated_instance_beam_n1_reads_blank_fields_by_position():
@@ -3323,8 +3324,102 @@ def test_pretension_node_and_element_sets_resolved():
              "*Pre-tension Section, element=I1.CUTEL, node=I1.PT\n*Pre-tension Section, {i2}\n"
              "*End Assembly\n*Material, name=M\n*Elastic\n210000., 0.\n")
     for i2 in ("element=I2.1, node=PT2", "element=I2.CUTEL, node=I2.99", "element=3, node=I2.PT"):
-        body, _, _ = convert_str(beams.format(i2=i2))
-        assert "*PRE-TENSION SECTION, ELEMENT=1, NODE=99\n*PRE-TENSION SECTION, ELEMENT=3, NODE=198\n" in body
+        body, _, rep = convert_str(beams.format(i2=i2))
+        # (the beam cuts become equations: test_pretension_truss_and_beam_cuts_as_equations)
+        assert "-> the cut element 1 ends at node 199, the copy of node 2: u(199) = u(2) + n u(99, 1)" in body
+        assert "-> the cut element 3 ends at node 200, the copy of node 101: u(200) = u(101) + n u(198, 1)" in body
+        assert "[WARNING] *PRE-TENSION" not in rep.text()
+
+
+PT_BOLT = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n99, 1., 0., 0.\n"
+           "*Element, type={typ}, elset=BOLT\n1, 1, 2\n2, 2, 3\n{more}"
+           "*Nset, nset=PT\n99\n{section}*Pre-tension Section, element=1, node=PT\n{normal}"
+           "*Material, name=M\n*Elastic\n210000., 0.\n*Step\n*Static\n*Boundary\n1, 1, 6\n3, 1, 6\n"
+           "*Cload\nPT, 1, 1000.\n*End Step\n")
+PT_RECT = "*Beam Section, elset=BOLT, material=M, section=RECT\n1., 1.\n0., 0., 1.\n"
+
+
+def test_pretension_truss_and_beam_cuts_as_equations():
+    # Abaqus puts a truss / beam cut at the element's last node and keeps the element; ccx 2.23
+    # deletes the element, ties its ends along the normal only (closure F (L - l) / E A, no
+    # shear or moment across) and stops on a truss or B32 ('not a linear beam element'):
+    # the element ends at a copy of that node, u(copy) = u(node) + n u(PT, 1), rotations tied
+    # (validate_with_ccx.py pretension_cut_*)
+    body, conv, rep = convert_str(PT_BOLT.format(typ="B31", more="", section=PT_RECT, normal=""))
+    lines = body.splitlines()
+    assert "*PRE-TENSION SECTION" not in [ln.split(",")[0] for ln in lines]
+    assert "100, 1, 0, 0" in lines and "1, 1, 100" in lines and "2, 2, 3" in lines
+    eqs = body.split("u(100) = u(2) + n u(99, 1)\n")[1].split("*MATERIAL")[0]
+    assert eqs.split("*EQUATION\n")[1:] == ["3\n100, 1, 1, 2, 1, -1, 99, 1, -1\n", "2\n100, 2, 1, 2, 2, -1\n",
+                                            "2\n100, 3, 1, 2, 3, -1\n", "2\n100, 4, 1., 2, 4, -1.\n",
+                                            "2\n100, 5, 1., 2, 5, -1.\n", "2\n100, 6, 1., 2, 6, -1.\n"]
+    assert set(conv._knots) == {100, 2}                     # their rotations are real DOFs
+    assert "*PRE-TENSION SECTION of a truss or beam cut (ELEMENT=) -> *EQUATIONs" in rep.text()
+    assert not conv.reduced_physics
+    # a truss: translations only, no knot beams; a given normal (made unit) over the default one
+    body, conv, _ = convert_str(PT_BOLT.format(typ="T3D2", more="", normal="2., 0., 0.\n",
+                                               section="*Solid Section, elset=BOLT, material=M\n1.\n"))
+    eqs = body.split("u(100) = u(2) + n u(99, 1)\n")[1].split("*MATERIAL")[0]
+    assert eqs.count("*EQUATION") == 3 and "100, 1, 1, 2, 1, -1, 99, 1, -1" in eqs and not conv._knots
+    # a *NORMAL line of the cut element at that node names the copy
+    body, _, _ = convert_str(PT_BOLT.format(typ="B31", more="*Normal\n1, 2, 0., 1., 0.\n2, 2, 0., 1., 0.\n",
+                                            section=PT_RECT, normal=""))
+    assert "\n1, 100, 0., 1., 0.\n2, 2, 0., 1., 0.\n" in body
+
+
+def test_pretension_beam_cut_node_that_trusses_share():
+    # ccx 2.23 gives a node rotations by its lowest-numbered beam / truss element: once the cut
+    # element leaves a node that a truss shares, the node has none, so the cut element's end
+    # turns freely there (its copy still a knot); exact unless the deck acts on that rotation
+    deck = PT_BOLT.format(typ="B31", more="*Element, type=T3D2, elset=TR\n5, 2, 3\n", normal="",
+                          section=PT_RECT + "*Solid Section, elset=TR, material=M\n1.\n")
+    deck = deck.replace("element=1, node=PT", "element=2, node=PT")       # cut node 3: truss 5 only
+    body, conv, rep = convert_str(deck)
+    assert "u(100) = u(3) + n u(99, 1)" in body and "100, 4, 1., 3, 4, -1." not in body
+    assert set(conv._knots) == {100}
+    assert "only trusses share its cut node 3, the first numbered 5" in rep.text()
+    assert conv.reduced_physics == ["rotation of a beam's pre-tension cut node not tied"]    # 3, 1, 6
+    body, conv, rep = convert_str(deck.replace("3, 1, 6\n", "3, 1, 3\n"))
+    assert "(exact: the deck holds or loads no rotation there)" in rep.text() and not conv.reduced_physics
+
+
+def test_pretension_cut_copy_takes_temperatures_and_u1_ties():
+    # the copy takes the node's temperatures (the cut element sees them at its end)
+    deck = PT_BOLT.format(typ="B31", more="", section=PT_RECT, normal="").replace(
+        "*Cload", "*Temperature\n1, 10.\n2, 20.\n3, 30.\n*Cload")
+    body, _, _ = convert_str(deck)
+    assert "\n2, 20.\n3, 30.\n100, 20\n" in body
+    # U1 beams (a *BEAM GENERAL SECTION) have rotations of their own: plain ties, no knot beams
+    gen = "*Beam General Section, elset=BOLT, section=GENERAL\n1., 0.083, 0., 0.083, 0.14\n0., 0., 1.\n210000., 105000.\n"
+    body, conv, _ = convert_str(PT_BOLT.format(typ="B31", more="", section=gen, normal=""))
+    assert "*ELEMENT, TYPE=U1\n1, 1, 100\n" in body and not conv._knots
+    assert "\n100, 4, 1, 2, 4, -1\n" in body and "\n100, 6, 1, 2, 6, -1\n" in body
+
+
+def test_coupling_ref_node_forms_at_the_assembly_level():
+    # ccx needs REF NODE= as a node number (a set name stops it): an instance set, an instance
+    # node, an assembly set, CAE's assembly reference point (numbered 1, like the instance's
+    # first node), REFNODE=, a legacy *KINEMATIC COUPLING and a *RIGID BODY all name the node
+    # by its number (validate_with_ccx.py coupling_ref_node_forms)
+    deck = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n100, 0.5, 0.5, 1.5\n*Element, type=C3D8, elset=BODY\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=RP\n100\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+            "*Surface, name=TOPS, type=NODE\nTOPN\n*Solid Section, elset=BODY, material=M\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I1, part=P\n5., 0., 0.\n*End Instance\n{asm}*End Assembly\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n")
+    kin = "*Coupling, constraint name=C, {p}={ref}, surface=I1.TOPS\n*Kinematic\n"
+    for asm, want in ((kin.format(p="ref node", ref="I1.RP"), "*COUPLING, CONSTRAINT NAME=C, REF NODE=100,"),
+                      (kin.format(p="ref node", ref="I1.100"), "*COUPLING, CONSTRAINT NAME=C, REF NODE=100,"),
+                      (kin.format(p="refnode", ref="A.I1.RP"), "*COUPLING, CONSTRAINT NAME=C, REF NODE=100,"),
+                      ("*Nset, nset=RPA, instance=I1\n100\n" + kin.format(p="ref node", ref="RPA"),
+                       "*COUPLING, CONSTRAINT NAME=C, REF NODE=100,"),
+                      ("*Node\n1, 5.5, 0.5, 1.5\n*Nset, nset=RPX\n1\n" + kin.format(p="ref node", ref="RPX"),
+                       "*COUPLING, CONSTRAINT NAME=C, REF NODE=1,"),
+                      ("*Kinematic Coupling, ref node=I1.RP\nI1.TOPN, 1, 3\n", "REF NODE=100, SURFACE=ABQ2CCX_KC1_1"),
+                      ("*Rigid Body, ref node=I1.100, tie nset=I1.TOPN\n", "*RIGID BODY, REF NODE=100, NSET=I1_TOPN")):
+        body, _, rep = convert_str(deck.format(asm=asm))
+        assert want in body, asm
+        assert "[WARNING]" not in rep.text(), asm
 
 
 def test_surface_interaction_thickness_line_dropped():

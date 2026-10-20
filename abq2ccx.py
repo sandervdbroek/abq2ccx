@@ -3981,6 +3981,9 @@ class Converter:
         self._twins: "OrderedDict[int, int]" = OrderedDict()
         self._twins_out: set = set()
         self._gen_ties: set = set()                # the rotation ties the converter writes
+        # id(*PRE-TENSION SECTION of a truss / beam cut) -> {elem, node (its last node), copy
+        # (that node's copy, the element's end now), pt (pre-tension node), normal, line}
+        self._pt_cuts: Dict[int, dict] = {}
         # explicit dynamics with circular-section beams (_plan_circ_explicit_increment): the
         # smallest min(element length, d / sqrt(2)) / wave speed and its element, and the
         # beams it could not size
@@ -13807,7 +13810,24 @@ class Converter:
         node set of exactly that node, and ELEMENT= (a truss or beam cut) as an element number
         or a one-element set (Keywords Reference); ccx 2.23 reads only a number there and stops
         on a set name ('*ERROR reading *PRE-TENSION SECTION', probed).  A one-member set is
-        written as its number; any other set is left for ccx to stop on, as Abaqus would."""
+        written as its number; any other set is left for ccx to stop on, as Abaqus would.  A
+        truss or beam cut becomes *EQUATIONs (_plan_pretension_cuts)."""
+        cut = self._pt_cuts.get(id(b))
+        if cut:
+            rows = self._pretension_rows(cut)
+            self.report.note("*PRE-TENSION SECTION of a truss or beam cut (ELEMENT=) -> *EQUATIONs: "
+                             "Abaqus puts the cut at the element's last node and keeps the "
+                             "element; ccx 2.23 deletes the element, ties its end nodes along the "
+                             "normal only (its compliance lost, no shear, moment or torque across) "
+                             "and stops on any but a linear beam. The element's end is a copy of "
+                             "that node, displaced from it by the pre-tension node's DOF 1 along "
+                             "the normal, with the node's rotations (knot beams on a beam).",
+                             once=True)
+            return ([f"** abq2ccx: {cut['line']} -> the cut element {cut['elem']} ends at node "
+                     f"{cut['copy']}, the copy of node {cut['node']}: u({cut['copy']}) = "
+                     f"u({cut['node']}) + n u({cut['pt']}, 1)"]
+                    + self._twin_lines(rows) + self._equation_lines(rows)
+                    + self._pretension_rotation_ties(cut))
         params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
         for key, what, members in (("NODE", "node", self.geom.nset),
                                    ("ELEMENT", "element", self.geom.elset)):
@@ -13826,6 +13846,155 @@ class Converter:
                                     else f"no {what} set (or an empty one)")
                                  + "; left as it is: ccx stops on the set name.", once=True)
         return [emit_keyword(b.keyword, params)] + list(b.data)
+
+    def _plan_pretension_cuts(self, blocks: List[Block]) -> None:
+        """A *PRE-TENSION SECTION that cuts a truss or beam (ELEMENT=): Abaqus puts the section
+        at the element's last node, normal to it (default: from the element's first node to
+        its last), and keeps the element (Analysis User's Guide, "Prescribed assembly loads");
+        ccx 2.23 deletes the element and ties its end nodes along the normal only, so the cut
+        loses the element's compliance (the closure of a held bolt is F (L - l) / E A, not
+        F L / E A) and carries no shear, moment or torque, and it stops on any other element
+        than a linear beam ('element ... is not a linear beam element'; probed).  So the
+        element ends at a copy of its last node instead, u(copy) = u(node) + n u(pre-tension
+        node, 1) (handle_pretension_section), with the node's rotations on a beam: probed
+        exact — the closure F L / E A, and a cantilever cut whose adjustment is held deflects
+        as the uncut beam.  The copy takes the node's temperatures, field values and
+        *TRANSFORM (_tied_nodes), not its BCs or sets; before the beam upgrades, which then
+        treat it as the element's end node."""
+        if not self._mechanical:
+            return
+        done: set = set()
+        for b in blocks:
+            if b.keyword == "STEP":                 # (model data)
+                break
+            if b.keyword != "PRE-TENSION SECTION" or (b.param("SURFACE") or "").strip():
+                continue
+            elems = dedup(self._resolve_elements((b.param("ELEMENT") or "").strip()))
+            pts = dedup(self._resolve_nodes((b.param("NODE") or "").strip()))
+            if len(elems) != 1 or len(pts) != 1 or elems[0] in done or \
+                    elems[0] not in self.geom.elements or pts[0] not in self.geom.nodes:
+                continue                            # (handle_pretension_section warns)
+            e, pt = elems[0], pts[0]
+            typ, conn = self.geom.elements[e]
+            if ccx_type(typ) not in BEAM_TYPES or len(conn) < 2 or \
+                    any(n not in self.geom.nodes for n in conn):
+                continue
+            try:
+                n = tuple(fields_at(b.data[0].split(","), 3)) if b.data else (0.0, 0.0, 0.0)
+            except ValueError:
+                continue
+            if not any(n):
+                n = vsub(self.geom.nodes[conn[-1]], self.geom.nodes[conn[0]])
+            if vnorm(n) == 0.0:
+                continue
+            node, copy = conn[-1], max(self.geom.nodes) + 1
+            self.geom.add_node(copy, self.geom.nodes[node])
+            self.geom.elements[e] = (typ, list(conn[:-1]) + [copy])
+            self._tied_nodes.append((node, node, copy, 0.0))
+            if node in self._node_normals:
+                self._node_normals[copy] = self._node_normals[node]
+            done.add(e)
+            self._pt_cuts[id(b)] = {"elem": e, "node": node, "copy": copy, "pt": pt,
+                                    "normal": vunit(n), "line": emit_keyword(b.keyword, b.params),
+                                    "beam": not ccx_type(typ).startswith(("T2D", "T3D"))}
+
+    def _plan_pretension_knots(self, blocks: List[Block]) -> None:
+        """Rotations across a beam's pre-tension cut (_plan_pretension_cuts): ccx ignores DOFs
+        4-6 of a plain beam node in an *EQUATION, so the copy and the node get knot beams and
+        their rotations are tied (handle_pretension_section) — on U1 beams, whose nodes have
+        rotations of their own, the ties alone (probed exact).  ccx 2.23 gives a node rotations
+        by its lowest-numbered beam / truss / shell element (probed: a truss numbered below the
+        beam, or below the knot beam, stops ccx on a rotational BC or *EQUATION term there), so
+        a node that only trusses share besides the cut keeps none: the cut element's end then
+        turns freely (the copy still a knot, which B32R ends need under an *EQUATION: probed
+        37 % off without)."""
+        knots: List[int] = []
+        for b in blocks:
+            cut = self._pt_cuts.get(id(b))
+            if not cut or not cut["beam"] or cut["elem"] in self._u1:
+                continue
+            node, e = cut["node"], cut["elem"]
+            first = min((x for x, (t, c) in self.geom.elements.items() if node in c and
+                         (ccx_type(t) in BEAM_TYPES or ccx_type(t) in SHELL_TYPES)), default=None)
+            if first is None or not ccx_type(self.geom.elements[first][0]).startswith(("T2D", "T3D")):
+                knots += [cut["copy"], node]
+                continue
+            cut["free"] = True
+            knots.append(cut["copy"])
+            acted = self._rotations_acted_on(blocks, node)
+            self.report.warn(f"*PRE-TENSION SECTION, ELEMENT={e}: besides the cut element only "
+                             f"trusses share its cut node {node}, the first numbered {first}, and "
+                             f"ccx 2.23 then gives the node no rotations (its lowest-numbered beam or "
+                             f"truss decides; probed), so the cut element's end rotation is not tied "
+                             f"to it" + (" — the deck's rotational BC or moment on the node is lost."
+                                         if acted else " (exact: the deck holds or loads no rotation "
+                                                       "there)."))
+            if acted:
+                self._reduces("rotation of a beam's pre-tension cut node not tied")
+        self._add_knot_beams(knots, blocks)
+
+    def _rotations_acted_on(self, blocks: List[Block], node: int) -> bool:
+        """Whether a *BOUNDARY or *CLOAD of the deck acts on a rotation (DOF 4-6) of ``node``."""
+        isint = re.compile(r"[-+]?\d+").fullmatch
+        for b in blocks:
+            if b.keyword not in ("BOUNDARY", "CLOAD"):
+                continue
+            for rec in merged_data_records(b):
+                f = trimmed_fields(rec)
+                if len(f) < 2 or not f[0] or node not in self._resolve_nodes(f[0]):
+                    continue
+                if isint(f[1]):
+                    d2 = int(f[2]) if b.keyword == "BOUNDARY" and len(f) > 2 and isint(f[2]) else int(f[1])
+                    spans = [(min(int(f[1]), d2), max(int(f[1]), d2))]
+                else:
+                    spans = (self._named_bc_dofs(f[1], True) or []) if b.keyword == "BOUNDARY" else []
+                if any(lo <= 6 and hi >= 4 for lo, hi in spans):
+                    return True
+        return False
+
+    def _pretension_rotation_ties(self, cut: dict) -> List[str]:
+        """rotation(copy) = rotation(node) across a beam's pre-tension cut: knot ties
+        (_rotation_ties), or plain equations between U1 nodes; none where the node has no
+        rotations in ccx (_plan_pretension_knots)."""
+        if not cut["beam"] or cut.get("free"):
+            return []
+        if cut["copy"] in self._transformed or cut["node"] in self._transformed:
+            self.report.warn(f"*PRE-TENSION SECTION, ELEMENT={cut['elem']}: its cut node {cut['node']} "
+                             f"has a *TRANSFORM, and ccx 2.23 takes no rotational *EQUATION term "
+                             f"there (probed: 'SPC in node ... in transformed coordinates cannot be "
+                             f"converted in MPC'), so the cut element's end rotation is not tied to "
+                             f"the node — it turns freely.")
+            self._reduces("rotation of a beam's pre-tension cut node with a *TRANSFORM not tied")
+            return []
+        if cut["elem"] in self._u1:
+            return self._equation_lines([[(cut["copy"], k, 1.0), (cut["node"], k, -1.0)] for k in (4, 5, 6)])
+        self.report.note("A beam's pre-tension cut: ccx's knots make the beam sections at the cut "
+                         "rigid, so with a Poisson's ratio the elements beside it bend a little "
+                         "stiffer, and a section that is not square twists stiffer (probed at the "
+                         "tip of a bolt of 10 elements: 0.7 % / 2.8 %; of 2: 3.6 % / 19 %).",
+                         once=True)
+        return self._rotation_ties([cut["copy"]], cut["node"], 0)
+
+    def _plan_pretension_twins(self) -> None:
+        """The twins that the equations of the truss / beam pre-tension cuts use on a node with
+        a *TRANSFORM (_pretension_rows)."""
+        for cut in self._pt_cuts.values():
+            self._pretension_rows(cut, plan=True)
+
+    def _pretension_rows(self, cut: dict, plan: bool = False) -> List[List[Tuple[int, int, float]]]:
+        """The *EQUATION rows of a truss / beam pre-tension cut (_plan_pretension_cuts):
+        f . (u(copy) - u(node)) - (f . n) u(pre-tension node, 1) = 0 along the copy's axes f
+        (its *TRANSFORM's, or the global ones), in the DOFs ccx reads (_dir_terms; ``plan``
+        makes the twins); the copy's DOF is eliminated."""
+        a, b, n = cut["copy"], cut["node"], cut["normal"]
+        fa = self._mpc_frame(a)
+        frame = fa if isinstance(fa, tuple) else ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        rows = []
+        for f in frame:
+            c = vdot(f, n)
+            rows.append(self._dir_terms(a, f, plan) + self._dir_terms(b, vscale(f, -1.0), plan)
+                        + ([(cut["pt"], 1, -c)] if abs(c) > 1e-12 else []))
+        return self._ccx_dependent_order(rows, fa) if isinstance(fa, tuple) else rows
 
     def _coupling_as_rigid_body(self, plan: dict) -> List[str]:
         """A kinematic coupling of all translations as the equivalent *RIGID BODY — the same
@@ -14377,7 +14546,20 @@ class Converter:
         explicit normal its midside node gets their normalised mean — otherwise ccx would
         derive that node's normal from the section's n1 instead and twist the element
         wherever the two disagree.  The same holds for the edges of upgraded shells (ccx
-        would average the element normals at the new node)."""
+        would average the element normals at the new node).  A line for a pre-tension cut
+        element at its last node names that node's copy, the element's end now
+        (_plan_pretension_cuts)."""
+        moved = {(c["elem"], c["node"]): c["copy"] for c in self._pt_cuts.values()}
+        if moved:
+            data = []
+            for ln in b.data:
+                f = [x.strip() for x in ln.split(",")]
+                try:
+                    key = (pint(f[0]), pint(f[1])) if len(f) >= 2 else None
+                except ValueError:
+                    key = None
+                data.append(", ".join([f[0], str(moved[key])] + f[2:]) if key in moved else ln)
+            b = Block(b.keyword, OrderedDict(b.params), data)
         out = self.passthrough(b)
         if not self._midside and not self._quad_edges:
             return out
@@ -14636,8 +14818,10 @@ class Converter:
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
         self._find_planar_elements()            # before the beam upgrades below retype them
+        self._plan_pretension_cuts(blocks)      # before the beam upgrades and _prescan
         self._upgrade_section_beams(blocks)
         self._plan_u1_beams(blocks)
+        self._plan_pretension_knots(blocks)     # after U1 (its beams need none); not planar
         self._plan_quadratic_shells(blocks)     # composite S3 / S4 / S4R -> S6 / S8R
         self._plan_ply_split(blocks)            # composite SC6R / SC8R -> one solid per ply
         self._plan_quadratic_membranes(blocks)  # M3D6 / M3D8 / M3D8R -> the converter's own solids
@@ -19157,6 +19341,7 @@ class Converter:
                     self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
                 body["rot"] = self._rb_rot[ref]
         self._plan_rigid_couplings(blocks)
+        self._plan_pretension_twins()               # after _transformed
         self._plan_rot_axes(self._rb_rot)              # the connector rows use them
         self._plan_connector_rows(blocks)
         self._plan_coupled_bcs(blocks)
@@ -23250,8 +23435,8 @@ class Converter:
         """Nodes whose DOF 3 a ccx constraint may drive: the dependent term of an *EQUATION,
         *MPC nodes, *RIGID BODY members, coupling reference and member nodes, *TIE slaves.
         A *BOUNDARY on a dependent DOF stops ccx ('dependent side of a MPC and a SPC'), and
-        their out-of-plane motion follows the constraint."""
-        held: set = set()
+        their out-of-plane motion follows the constraint (also a pre-tension cut's node copy)."""
+        held: set = {cut["copy"] for cut in self._pt_cuts.values()}
         for b in blocks:
             kw = b.keyword
             if kw == "EQUATION":

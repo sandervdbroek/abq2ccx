@@ -61,7 +61,10 @@ shell and membrane spheres and a cylinder against the pressure force on the refe
 and thin-wall theory, a bare
 *KINEMATIC (all DOFs) against *RIGID BODY, an assembly with a turned instance against
 the same model written flat, bolts whose pre-tension node (or beam cut) a one-member set
-names against F L / E A (the card that names them by number), and rigid tools:
+names against F L / E A (the card that names them by number), truss, beam and U1 bolts cut
+by a pre-tension section (loaded, then held while the joint is pulled) against the bolt and
+member in parallel, a cut cantilever against the uncut one, a coupling's REF NODE= forms at
+the assembly level against the model written flat, and rigid tools:
 a rigid flat punch (rigid elements, and
 the same face as an analytical surface) against the penalty contact law and a punch given
 the motion node by node, also turned under NLGEOM, a block tied to a turning rigid plate, a
@@ -506,6 +509,81 @@ def pretension_beam_deck(element="CUTEL", node="PT"):
                       "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.", "*STEP", "*STATIC", "*BOUNDARY",
                       "1, 1, 6", "3, 1, 6", "*CLOAD", "99, 1, 1000.", "*NODE PRINT, NSET=PT", "U",
                       "*END STEP"]) + "\n"
+
+
+def pretension_cut_deck(bolt="B31", cut=1, member="spring"):
+    """A bolt of two elements along x (length 1 each, area 1, E 210000; node 1 held) beside a
+    clamped member from node 1 to its end node 3 (a SPRINGA of stiffness 210000, or a T3D2 of
+    area 2: the same), the bolt cut by a *PRE-TENSION SECTION, ELEMENT=``cut``, NODE=99.
+    ``bolt``: "B31" (RECT 1 x 1), "U1" (a *BEAM GENERAL SECTION: ccx's U1) or "T3D2".  Step 1
+    loads node 99 by 1000; step 2 holds it (*BOUNDARY, FIXED) and pulls node 3 by 3000."""
+    beam = bolt != "T3D2"
+    lines = ["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 2., 0., 0.", "99, 5., 5., 0.",
+             f"*ELEMENT, TYPE={'B31' if beam else 'T3D2'}, ELSET=BOLT", "1, 1, 2", "2, 2, 3",
+             f"*ELEMENT, TYPE={'SPRINGA' if member == 'spring' else 'T3D2'}, ELSET=MEMBER", "3, 1, 3",
+             "*NSET, NSET=PT", "99", "*NSET, NSET=WATCH", "3, 99", "*ELSET, ELSET=CUT", str(cut)]
+    lines += {"B31": ["*BEAM SECTION, ELSET=BOLT, MATERIAL=M, SECTION=RECT", "1., 1.", "0., 0., 1."],
+              "U1": ["*BEAM GENERAL SECTION, ELSET=BOLT, SECTION=GENERAL",
+                     "1., 0.0833333333, 0., 0.0833333333, 0.1406", "0., 0., 1.", "210000., 105000."],
+              "T3D2": ["*SOLID SECTION, ELSET=BOLT, MATERIAL=M", "1."]}[bolt]
+    lines += ["*SPRING, ELSET=MEMBER", "", "210000."] if member == "spring" else \
+        ["*SOLID SECTION, ELSET=MEMBER, MATERIAL=M", "2."]
+    lines += [f"*PRE-TENSION SECTION, ELEMENT={cut}, NODE=PT", "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0."]
+    held = ["1, 1, 6", "3, 2, 3"] + (["3, 4, 6"] if member == "spring" and beam else []) + \
+        ([] if beam else ["2, 2, 3"])
+    out = ["*NODE PRINT, NSET=WATCH", "U", "*EL PRINT, ELSET=CUT", "S"]
+    return "\n".join(lines + ["*STEP", "*STATIC", "*BOUNDARY"] + held + ["*CLOAD", "PT, 1, 1000."] + out
+                     + ["*END STEP", "*STEP", "*STATIC", "*BOUNDARY, FIXED", "PT, 1, 1", "*CLOAD",
+                        "3, 1, 3000."] + out + ["*END STEP"]) + "\n"
+
+
+def pretension_bending_deck(cut=True):
+    """A cantilever of two B31 along x (RECT 0.1 x 0.1, E 210000, nu 0; node 1 clamped) with an
+    arm at its tip (node 3 to node 4 along y), the tip loaded across, out of plane and in
+    torsion; with ``cut`` the first element is the cut of a *PRE-TENSION SECTION whose
+    adjustment (node 99) is held at 0.  (A square section with nu = 0: ccx's knots, which make
+    the sections at the cut rigid, then change nothing.)"""
+    return "\n".join(["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 2., 0., 0.", "4, 2., 0.2, 0.",
+                      "99, 5., 5., 0.", "*ELEMENT, TYPE=B31, ELSET=BOLT", "1, 1, 2", "2, 2, 3", "3, 3, 4",
+                      "*NSET, NSET=TIP", "3, 4", "*BEAM SECTION, ELSET=BOLT, MATERIAL=M, SECTION=RECT",
+                      "0.1, 0.1", "0., 0., 1."]
+                     + (["*PRE-TENSION SECTION, ELEMENT=1, NODE=99"] if cut else [])
+                     + ["*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.", "*STEP", "*STATIC", "*BOUNDARY",
+                        "1, 1, 6"] + (["99, 1, 1, 0."] if cut else [])
+                     + ["*CLOAD", "3, 2, 0.01", "3, 3, 0.005", "3, 4, 0.003", "*NODE PRINT, NSET=TIP", "U",
+                        "*END STEP"]) + "\n"
+
+
+def coupling_ref_deck(form):
+    """A C3D8 cube (E 1000, nu 0.3), bottom held, whose top is coupled to reference node 100
+    (rotations held) pulled along x by 1.  ``form`` "flat" / "flat_dist": the model written flat
+    (*KINEMATIC / *DISTRIBUTING, REF NODE=100); else a part in an instance moved by 5 along x,
+    the assembly-level coupling naming its reference node as the instance set (I1.RP), the
+    instance node (I1.100), an assembly set of it (RPA), an assembly node numbered 1 as the
+    instance's first node is (RPX: Abaqus/CAE's reference point), REF NODE= without the blank,
+    a legacy *KINEMATIC COUPLING (I1.RP), or a *DISTRIBUTING one (I1.100)."""
+    part = ["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 1., 1., 0.", "4, 0., 1., 0.", "5, 0., 0., 1.",
+            "6, 1., 0., 1.", "7, 1., 1., 1.", "8, 0., 1., 1.", "100, 0.5, 0.5, 1.5",
+            "*ELEMENT, TYPE=C3D8, ELSET=BODY", "1, 1, 2, 3, 4, 5, 6, 7, 8", "*NSET, NSET=RP", "100",
+            "*NSET, NSET=BOT", "1, 2, 3, 4", "*NSET, NSET=TOPN", "5, 6, 7, 8", "*ELSET, ELSET=TOPE", "1",
+            "*SURFACE, NAME=TOPS, TYPE=NODE", "TOPN", "*SURFACE, NAME=TOPF", "TOPE, S2",
+            "*SOLID SECTION, ELSET=BODY, MATERIAL=M"]
+    flat = form.startswith("flat")
+    q, rp = ("", "RP") if flat else ("I1.", {"asm_set": "RPA", "asm_point": "RPX"}.get(form, "I1.RP"))
+    dist = form in ("flat_dist", "dist_node")
+    ref = {"node": "I1.100", "dist_node": "I1.100", "asm_set": "RPA", "asm_point": "1"}.get(
+        form, "RP" if flat else "I1.RP")
+    card = ([f"*KINEMATIC COUPLING, REF NODE={ref}", f"{q}TOPN, 1, 3"] if form == "legacy" else
+            [f"*COUPLING, CONSTRAINT NAME=C, {'REFNODE' if form == 'refnode' else 'REF NODE'}={ref}, "
+             f"SURFACE={q}{'TOPF' if dist else 'TOPS'}", "*DISTRIBUTING" if dist else "*KINEMATIC"])
+    asm = {"asm_set": ["*NSET, NSET=RPA, INSTANCE=I1", "100"],
+           "asm_point": ["*NODE", "1, 5.5, 0.5, 1.5", "*NSET, NSET=RPX", "1"]}.get(form, [])
+    model = part + card if flat else (["*PART, NAME=P"] + part + ["*END PART", "*ASSEMBLY, NAME=A",
+                                      "*INSTANCE, NAME=I1, PART=P", "5., 0., 0.", "*END INSTANCE"]
+                                      + asm + card + ["*END ASSEMBLY"])
+    return "\n".join(model + ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*STEP", "*STATIC",
+                               "*BOUNDARY", f"{q}BOT, 1, 3"] + ([] if dist else [f"{rp}, 4, 6"])
+                      + ["*CLOAD", f"{rp}, 1, 1.", f"*NODE PRINT, NSET={q}TOPN", "U", "*END STEP"]) + "\n"
 
 
 # --- rigid tools: Abaqus decks built here, so that each variant differs only in the tool ----
@@ -5056,11 +5134,102 @@ def main():
     got = pretension_closures(pretension_beam_deck(), "pretension_element_set", (99,))
     ref = pretension_closures(pretension_beam_deck("1", "99"), "pretension_element_set_ref", (99,))
     if got and ref:
-        ok = abs(got[0] / ref[0] - 1) < 1e-9
+        ok = abs(got[0] / ref[0] - 1) < 1e-9 and abs(got[0] / want - 1) < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  pretension_element_set (a B31 bolt whose *PRE-TENSION SECTION "
               f"names its cut element and node by one-member sets): closure {got[0]:.7g} vs {ref[0]:.7g} "
-              f"with ELEMENT=1, NODE=99 (the set names stop ccx)")
+              f"with ELEMENT=1, NODE=99 and F L / E A = {want:.7g} (the set names stop ccx; ccx's own "
+              f"cut drops the cut element: F L / 2 E A)")
     failures += 0 if got and ref and ok else 1
+    # --- a truss / beam cut (ELEMENT=): Abaqus puts the cut at the element's last node and keeps
+    # the element; ccx 2.23 deletes it (no compliance, only the axial force across) and stops on
+    # a truss or U1.  Bolt and member in parallel: closure F / kb + F / km, then held while P
+    # pulls: the bolt takes kb P / (kb + km) of it
+    kb, km, f, p = 210000.0 / 2.0, 210000.0, 1000.0, 3000.0
+    want = [(f / kb + f / km, -f / km, f), (f / kb + f / km, -f / km + p / (kb + km), f + kb * p / (kb + km))]
+    for tag, kw, what in (("pretension_cut_beam", {}, "a B31 bolt"),
+                          ("pretension_cut_truss", {"bolt": "T3D2", "cut": 2}, "a T3D2 bolt cut at its end"),
+                          ("pretension_cut_u1", {"bolt": "U1"}, "a *BEAM GENERAL SECTION bolt (U1)"),
+                          ("pretension_cut_truss_node", {"cut": 2, "member": "truss"},
+                           "a B31 bolt cut at the node only the T3D2 member shares")):
+        src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(pretension_cut_deck(**kw))
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        got = {}
+        for _, title, _s, time, rows in (A.dat_blocks(os.path.join(d, "job.dat")) if status == "solved" else []):
+            if title.startswith("displacements"):
+                u = {int(r[0]): r[1] for r in rows}
+                got.setdefault(time, [None, None, None])[:2] = [u.get(99), u.get(3)]
+            elif title.startswith("stresses") and rows:
+                got.setdefault(time, [None, None, None])[2] = sum(r[2] for r in rows) / len(rows)
+        shutil.rmtree(d, ignore_errors=True)
+        steps = [got[t] for t in sorted(got)]
+        if len(steps) != 2 or any(x is None for st in steps for x in st):
+            print(f"FAIL  {tag}: no closure, end displacement or cut element stress in both steps ({status})")
+            print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+            failures += 1
+            continue
+        err = max(abs(g / w - 1) for st, ws in zip(steps, want) for g, w in zip(st, ws))
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what} beside a clamped member, cut by a *PRE-TENSION "
+              f"SECTION, ELEMENT=; loaded, then held while the joint is pulled): closure "
+              f"{steps[0][0]:.7g}, end {steps[0][1]:.7g} / {steps[1][1]:.7g}, cut element stress "
+              f"{steps[0][2]:.6g} / {steps[1][2]:.6g} vs F / kb + F / km, bolt and member in parallel "
+              f"({err:.1e} apart; ccx's own cut: closure 33 % low, or ccx stopped)")
+        failures += 0 if ok else 1
+    tips = []
+    for tag, cut in (("pretension_cut_bending", True), ("pretension_cut_bending_uncut", False)):
+        src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(pretension_bending_deck(cut))
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        tips.append(u[3] + u[4] if 3 in u and 4 in u else None)
+        shutil.rmtree(d, ignore_errors=True)
+    if None in tips or not max(abs(x) for x in tips[1]):
+        print(f"FAIL  pretension_cut_bending: no tip displacement ({tips})")
+        failures += 1
+    else:
+        big = max(abs(x) for x in tips[1])
+        err = max(abs(a - b) for a, b in zip(*tips)) / big
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  pretension_cut_bending (a B31 cantilever cut by a *PRE-TENSION "
+              f"SECTION, the adjustment held, the tip loaded across, out of plane and in torsion): tip "
+              f"{', '.join(f'{x:.7g}' for x in tips[0][:3])}, its arm's end {tips[0][5]:.7g} along z vs "
+              f"the uncut beam {err:.1e} of max |u| apart "
+              f"(ccx's own cut: no moment across, the tip ran off to 1e10)")
+        failures += 0 if ok else 1
+    # --- a coupling's REF NODE= at the assembly level: an instance set, an instance node, an
+    # assembly set, CAE's assembly reference point (numbered 1, like the instance's first
+    # node), REFNODE=, a legacy *KINEMATIC COUPLING and a distributing coupling, each against
+    # the model written flat (ccx needs a node number there and stops on a set name)
+    tops = {}
+    for form in ("flat", "flat_dist", "set", "node", "asm_set", "asm_point", "refnode", "legacy", "dist_node"):
+        src, inp = os.path.join(tmp, f"cref_{form}_src.inp"), os.path.join(tmp, f"cref_{form}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(coupling_ref_deck(form))
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        tops[form] = [u[n] for n in sorted(u)] if len(u) == 4 else None
+        shutil.rmtree(d, ignore_errors=True)
+    bad = [f for f, t in tops.items() if t is None or not max(abs(x) for r in t for x in r)]
+    if bad:
+        print(f"FAIL  coupling_ref_node_forms: the top did not move or ccx did not solve ({', '.join(bad)})")
+        failures += 1
+    else:
+        err = max(abs(a - b) for f, t in tops.items() if not f.startswith("flat")
+                  for ra, rb in zip(t, tops["flat_dist" if f.startswith("dist") else "flat"])
+                  for a, b in zip(ra, rb)) / max(abs(x) for r in tops["flat"] for x in r)
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  coupling_ref_node_forms (a cube's top coupled to a reference node "
+              f"named at the assembly level as I1.RP, I1.100, an assembly set, CAE's reference point 1, "
+              f"by REFNODE=, by a legacy *KINEMATIC COUPLING and a distributing coupling): the top's "
+              f"displacements {err:.1e} of max |u| from the model written flat (top u1 "
+              f"{tops['flat'][0][0]:.6g}, distributing {tops['flat_dist'][0][0]:.6g})")
+        failures += 0 if ok else 1
     # --- Johnson-Cook damage initiation: ccx's indicator, the model unchanged -------
     # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which
     # it deletes an element, out of reach so that it only reports): in uniaxial tension the

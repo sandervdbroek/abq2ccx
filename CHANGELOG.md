@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Pre-tension of a truss or beam cut** — ccx 2.23 deletes the element a `*PRE-TENSION
+  SECTION, ELEMENT=` names and ties its end nodes along the normal only: the closure of a held
+  bolt missed the element's own length (33 % low for a bolt of two elements), no shear, moment
+  or torque crossed the cut, and ccx stopped on trusses, quadratic and circular-section beams.
+  Abaqus puts the cut at the element's last node and keeps the element. The element now ends
+  at a copy of that node, displaced from it by the pre-tension node's DOF 1 along the normal,
+  with the node's rotations.
 * **Static perturbation values on what the base state loads** — Abaqus reads a `*STEP,
   PERTURBATION` `*STATIC` step's load and BC values as changes of the base state's; ccx 2.23
   took a value on a node DOF, face or body load that the base state also loads as its new
