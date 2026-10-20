@@ -21082,8 +21082,7 @@ class Converter:
                         self._dist_tables.add(dists[field].param("TABLE").strip().upper())
         self._reserve_names()
         nodes = self.geom.nodes
-        next_n = max(nodes, default=0)
-        next_e = max(list(els) + list(self._conn) + list(self._carriers), default=0)
+        next_n, next_e = self._next_ids()
         iface: Dict[Tuple[int, int, float], int] = {}    # (low end, high end, fraction) -> node
         made: List[Tuple[int, int, int, float]] = []
         users: Dict[Tuple[int, int], set] = {}           # stack edge -> its elements' fractions
