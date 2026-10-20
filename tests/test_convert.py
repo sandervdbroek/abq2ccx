@@ -72,6 +72,9 @@ HEX = """*NODE
 1, 1,2,3,4,5,6,7,8
 """
 
+HEX_MODEL = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n")
+
 
 def reparse(body):
     """Parse the *emitted* CalculiX deck back into a geometry registry, so checks
@@ -573,6 +576,27 @@ def test_instance_rotation_order():
     assert "1, 10, 1, 0" not in body           # the wrong rotate-then-translate result
 
 
+def test_assembly_surfaces_resolve_instance_members():
+    # an assembly-level *SURFACE names instance elements and sets (Instance.id, Instance.set)
+    # and assembly sets; they resolve to the flat numbering of the instances
+    part = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n*Shell Section, elset=E, material=M\n0.1\n*End Part\n")
+    deck = (part + "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
+            "*Instance, name=I2, part=P\n0., 0., 5.\n0., 0., 0., 1., 0., 0., 90.\n*End Instance\n"
+            "*Elset, elset=ES, instance=I2\n1\n*Surface, name=SURF\nES, SPOS\nI1.E, SNEG\n"
+            "*Surface, type=NODE, name=SN\nI2.3\n*Nset, nset=FIX, instance=I1\n1, 2\n*End Assembly\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Step\n*Static\n*Boundary\nFIX, 1, 6\nI2.1, 1, 6\nI2.2, 1, 6\n*Dsload\nSURF, P, 2.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*SURFACE, NAME=SURF\nES, SPOS\nI1_E, SNEG\n" in body, body
+    assert "*SURFACE, TYPE=NODE, NAME=SN\n7\n" in body and conv.geom.elset("ES") == [2]
+    # instance I2 is translated, then turned 90 degrees about x; a *NODE normal turns with it
+    assert "\n5, 0, -5, 0\n6, 1, -5, 0\n7, 1, -5, 1\n8, 0, -5, 1\n" in body
+    body, conv, rep = convert_str(deck.replace("3, 1., 1., 0.\n", "3, 1., 1., 0., 0., 0., 1.\n"))
+    assert "\n1, 3, 0, 0, 1\n2, 7, 0, -1, 0\n" in body.split("*NORMAL")[1], body
+    assert conv.reduced_physics == []
+
+
 def test_shell_general_section():
     deck = ("*NODE\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
             "*ELEMENT, TYPE=S4, ELSET=SH\n1,1,2,3,4\n"
@@ -603,6 +627,32 @@ def test_rigid_element_without_body_becomes_a_skin():
     assert any("belong to no *RIGID BODY" in m for _, m in rep.entries)
 
 
+def test_rigid_element_surfaces_mixed_edges_and_links():
+    # a surface record on rigid and deformable elements: the rigid ones' skin faces, the others
+    # as they are; an edge of rigid elements or an RB3D2 link has no face in ccx (left out);
+    # Abaqus/Standard ignores a *RIGID BODY data line (rigid-element thickness)
+    deck = ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n11, 0.,0.,1.\n12, 1.,0.,1.\n"
+            "13, 1.,1.,1.\n14, 0.,1.,1.\n15, 2.,0.,1.\n16, 2.,1.,1.\n20, 3.,0.,1.\n21, 3.,1.,1.\n"
+            "9, 0.5,0.5,2.\n*ELEMENT, TYPE=S4, ELSET=SH\n1, 1, 2, 3, 4\n"
+            "*ELEMENT, TYPE=R3D4, ELSET=PLATE\n2, 11, 12, 13, 14\n3, 12, 15, 16, 13\n"
+            "*ELEMENT, TYPE=RB3D2, ELSET=LINKS\n4, 15, 20\n*ELSET, ELSET=MIX\n1, 2\n"
+            "*SHELL SECTION, ELSET=SH, MATERIAL=M\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*RIGID BODY, REF NODE=9, ELSET=PLATE\n0.05\n*RIGID BODY, REF NODE=21, ELSET=LINKS\n"
+            "*SURFACE, NAME=MIXED\nMIX, SPOS\n*SURFACE, NAME=EDGE\nPLATE, E1\n*SURFACE, NAME=LS\nLINKS, SPOS\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n21, 1, 6\n1, 1, 6\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    g = reparse(body)
+    lines = body.split("*SURFACE, NAME=MIXED\n")[1].split("*")[0].splitlines()
+    assert [ln.split(", ")[1] for ln in lines] == ["S2", "SPOS"], lines
+    assert g.elset(lines[0].split(",")[0]) == [2] and g.elements[2][0] == "C3D8"
+    assert g.elset(lines[1].split(",")[0]) == [1]
+    assert "*SURFACE, NAME=EDGE\n*SURFACE, NAME=LS\n*" in body
+    assert "face 'E1' of rigid elements (an edge) has no ccx counterpart" in rep.text()
+    assert "A *SURFACE names RB3D2 rigid links" in rep.text()
+    assert "*RIGID BODY data line (rigid-element thickness / area) dropped" in rep.text()
+    assert sorted(g.nset(re.search(r"REF NODE=21, NSET=(\S+),", body).group(1))) == [15, 20]
+
+
 def test_name_length_limit():
     # ccx 2.22's real set-name limit is 80 chars (verified: 80 resolves correctly, >80 stops
     # with 'set name too long').  Flattened names must stay <= 80 but are NOT needlessly
@@ -621,6 +671,18 @@ def test_name_length_limit():
     assert "INSTANCE_NUMBER_ONE_A_VERY_LONG_NODE_SET_NAME_INDEED" in names
     # the pathological 78-char part name got prefixed past 80 -> truncated to exactly 80
     assert any(len(n) == 80 for n in names), names
+
+
+def test_flattened_set_names_made_unique():
+    # instance-prefixed set names cut to ccx's 80 characters may collide: the later one gets
+    # a ~1 suffix, and every reference follows it
+    long = "S" * 79
+    deck = ("*PART, NAME=P\n" + HEX + f"*NSET, NSET={long}A\n1\n*NSET, NSET={long}B\n2\n*END PART\n"
+            "*ASSEMBLY, NAME=ASM\n*INSTANCE, NAME=I, PART=P\n*END INSTANCE\n*END ASSEMBLY\n")
+    body, conv, rep = convert_str(deck)
+    names = re.findall(r"\*NSET, NSET=(\S+)\n(\d+)\n", body)
+    assert ("I_" + long[:78], "1") in names and ("I_" + long[:76] + "~1", "2") in names, names
+    assert "names collide within CalculiX's 80-character name limit" in rep.text()
 
 
 def test_parameter_with_internal_comment():
@@ -873,6 +935,57 @@ def test_ncopy_multiple_translates_once():
     _, conv, _ = convert_str("*NODE, NSET=A\n1, 1., 2., 0.\n*NCOPY, OLD SET=A, CHANGE NUMBER=10, "
                              "REFLECT=LINE\n0., , 0., 1., 0., \n")
     assert conv.geom.nodes[11] == (1.0, -2.0, 0.0)
+
+
+def test_ncopy_reflect_point_and_mirror():
+    # REFLECT=POINT mirrors the old nodes in a point, REFLECT=MIRROR in the plane through a, b
+    # (first line) and c (second line) (Abaqus 2017 Keywords *NCOPY)
+    deck = ("*NODE, NSET=A\n1, 1., 2., 3.\n2, 0., 1., 0.\n"
+            "*NCOPY, OLD SET=A, CHANGE NUMBER=10, REFLECT=POINT, NEW SET=B\n1., 1., 1.\n"
+            "*NCOPY, OLD SET=A, CHANGE NUMBER=20, REFLECT=MIRROR\n0., 0., 0., 1., 0., 0.\n0., 1., 1.\n")
+    body, conv, rep = convert_str(deck)
+    assert "\n11, 1, 0, -1\n12, 2, 1, 2\n21, 1, 3, 2\n22, 0, 0, 1\n" in body, body
+    assert "*NSET, NSET=B\n11, 12" in body and conv.reduced_physics == []
+    # three points on a line span no plane: no copies, with a warning
+    body, conv, rep = convert_str(deck.replace("0., 1., 1.\n", "2., 0., 0.\n"))
+    assert "*NCOPY REFLECT=MIRROR could not be applied" in rep.text()
+    assert 21 not in conv.geom.nodes and "\n21, " not in body
+    # an empty OLD SET copies nothing
+    _, conv, rep = convert_str("*NODE\n1, 0., 0., 0.\n*NCOPY, OLD SET=NONE, CHANGE NUMBER=10, SHIFT\n1., 0., 0.\n")
+    assert "*NCOPY OLD SET=NONE is empty or undefined" in rep.text() and sorted(conv.geom.nodes) == [1]
+
+
+def test_ngen_parabola_through_midside_point():
+    # LINE=P: a parabola through the end nodes and the midside point (Abaqus 2017 Keywords
+    # *NGEN), given by node (field 4) or coordinates (fields 5-7); nodes evenly in its parameter
+    deck = ("*NODE\n1, 0., 0., 0.\n5, 4., 0., 0.\n100, 2., 1., 0.\n11, 0., 1., 0.\n15, 4., 1., 0.\n"
+            "*NGEN, LINE=P, NSET=P1\n1, 5, 1, 100\n*NGEN, LINE=P, NSET=P2\n11, 15, 1, , 2., 3., 0.\n")
+    body, conv, rep = convert_str(deck)
+    assert "\n2, 1, 0.75, 0\n3, 2, 1, 0\n4, 3, 0.75, 0\n" in body, body
+    assert "\n12, 1, 2.5, 0\n13, 2, 3, 0\n14, 3, 2.5, 0\n" in body
+    assert "nodes spaced evenly in the parabola parameter" in rep.text() and conv.reduced_physics == []
+    # a midside node the deck does not define: the line is not generated
+    _, conv, rep = convert_str(deck.replace("1, 5, 1, 100", "1, 5, 1, 99"))
+    assert "*NGEN LINE=P: the midside node is missing" in rep.text() and 3 not in conv.geom.nodes
+
+
+def test_nfill_bias_and_unsupported_options():
+    ends = "*NODE\n1, 0., 0., 0.\n101, 4., 0., 0.\n*NSET, NSET=A\n1\n*NSET, NSET=B\n101\n"
+    # BIAS < 1 puts the nodes toward the first set: intervals in ratio 1/BIAS = 2
+    _, conv, rep = convert_str(ends + "*NFILL, BIAS=0.5\nA, B, 2, 50\n")
+    assert abs(conv.geom.nodes[51][0] - 4.0 / 3.0) < 1e-12
+    # a non-positive BIAS is uniform spacing, with a warning
+    _, conv, rep = convert_str(ends + "*NFILL, BIAS=-2.\nA, B, 2, 50\n")
+    assert conv.geom.nodes[51] == (2.0, 0.0, 0.0) and "*NFILL BIAS must be positive" in rep.text()
+    # SINGULAR and TWO STEP are filled linearly: reduced physics
+    _, conv, rep = convert_str(ends + "*NFILL, SINGULAR=1\nA, B, 2, 50\n")
+    assert conv.geom.nodes[51] == (2.0, 0.0, 0.0)
+    assert conv.reduced_physics == ["*NFILL, SINGULAR (fill approximated)"]
+    # sets more than twice as long as each other cannot be paired; an empty set fills nothing
+    _, conv, rep = convert_str(ends.replace("101\n", "101\n*NSET, NSET=C\n1, 101, 102\n*NODE\n102, 5., 0., 0.\n")
+                               + "*NFILL\nA, C, 2, 50\n*NFILL\nA, EMPTY, 2, 50\n")
+    assert "differ in length by more than 2x" in rep.text() and "*NFILL node set is empty" in rep.text()
+    assert 51 not in conv.geom.nodes
 
 
 def test_mesh_generation_skips_unreadable_records():
@@ -1670,6 +1783,31 @@ def test_periodic_amplitude_sampled_over_the_step_time():
     assert "** *AMPLITUDE, NAME=SINE" in body.upper() and "could not be sampled" in rep.text()
 
 
+def test_amplitude_modulated_sampled_and_forms_ccx_lacks():
+    # MODULATED: a = A0 + A sin(w1 (t - t0)) sin(w2 (t - t0)) after t0, A0 before (Abaqus
+    # 2017 Keywords *AMPLITUDE: A0, A, t0, w1, w2), sampled over the step time
+    deck = (HEX_MODEL + "*Amplitude, name=MOD, definition=MODULATED\n1., 2., 0.2, 10., 3.\n"
+            "*Step\n*Static\n0.25, 1.\n*Cload, amplitude=MOD\n7, 3, -1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    amp = body.split("*AMPLITUDE, NAME=MOD\n")[1].split("*")[0]
+    vals = [float(x) for x in amp.replace("\n", ",").split(",") if x.strip()]
+    pts = list(zip(vals[0::2], vals[1::2]))
+    assert pts[0] == (0.0, 1.0) and pts[-1][0] == 1.0 and (0.2, 1.0) in pts and len(pts) > 100
+    for t, a in pts:
+        want = 1.0 if t <= 0.2 else 1.0 + 2.0 * math.sin(10.0 * (t - 0.2)) * math.sin(3.0 * (t - 0.2))
+        assert abs(a - want) < 1e-7, (t, a, want)       # (9 digits of t)
+    assert "*AMPLITUDE DEFINITION=MODULATED sampled into" in rep.text() and conv.reduced_physics == []
+    # forms ccx cannot take are commented out with the reason: SOLUTION DEPENDENT, an EQUALLY
+    # SPACED one without FIXED INTERVAL, an analytic one scaled in time
+    for form, data, why in (("SOLUTION DEPENDENT", "0.1, 1., 10.", "has no ccx equivalent"),
+                            ("EQUALLY SPACED", "0., 1., 2.", "could not be expanded"),
+                            ("MODULATED, scalex=2.", "1., 2., 0.2, 10., 3.", "could not be sampled")):
+        body, conv, rep = convert_str(deck.replace("definition=MODULATED\n1., 2., 0.2, 10., 3.\n",
+                                                   f"definition={form}\n{data}\n"))
+        assert "** *AMPLITUDE, NAME=MOD" in body and "\n*AMPLITUDE" not in body
+        assert f"*AMPLITUDE DEFINITION={form.split(',')[0]} {why}" in rep.text()
+
+
 def test_dload_unsupported_body_load_dropped():
     # ccx supports only GRAV and CENTRIF body loads; ROTA/CORIO/CENT/ROTDYNF are rejected
     # outright by ccx, so they must be dropped (warned) rather than emitted — keeping the
@@ -2373,6 +2511,24 @@ def test_circ_beam_explicit_increment_left_alone_or_warned():
     assert "could not size a cap for ELSET=BEAM (material M has no isotropic" in rep.text()
 
 
+def test_max_normal_stiffness_of_anisotropic_elasticity():
+    # the largest of C11, C22, C33 (explicit dynamics' wave speed): for isotropic engineering
+    # constants E (1 - nu) / ((1 + nu) (1 - 2 nu)); the ORTHOTROPIC / ANISOTROPIC D1111, D2222,
+    # D3333; LAMINA (plane stress) max(E1, E2) / (1 - nu12 nu21)
+    e, nu = 200.0, 0.3
+    got = A.max_normal_stiffness("ENGINEERING CONSTANTS", [e, e, e, nu, nu, nu, 77., 77., 77.])
+    assert abs(got / (e * (1 - nu) / ((1 + nu) * (1 - 2 * nu))) - 1.0) < 1e-12
+    got = A.max_normal_stiffness("ENGINEERING CONSTANTS", [10., 200., 5., 0.02, 0.3, 0.25, 4., 4., 2.])
+    assert 200.0 < got < 210.0
+    assert A.max_normal_stiffness("ORTHOTROPIC", [100., 30., 80., 20., 25., 90., 10., 10., 10.]) == 100.0
+    assert A.max_normal_stiffness("ANISOTROPIC", [10., 3., 20., 2., 2., 30.] + [1.] * 15) == 30.0
+    got = A.max_normal_stiffness("LAMINA", [100., 10., 0.3, 5., 5., 5.])
+    assert abs(got - 100.0 / (1 - 0.3 * 0.3 * 10.0 / 100.0)) < 1e-12
+    for typ, v in (("ISOTROPIC", [200., 0.3]), ("ORTHOTROPIC", [1.]), ("LAMINA", [0., 1., 0.3]),
+                   ("ENGINEERING CONSTANTS", [0., 1., 1., 0.3, 0.3, 0.3])):
+        assert A.max_normal_stiffness(typ, v) is None, typ
+
+
 def test_beam_circ_explicit_example():
     # the deck validate_with_ccx.py checks against beam theory: 6 elements 40 long, d = 20,
     # steel, so the cap is 0.177 * 20 / sqrt(2) / 6.001e6 (ccx alone would pick 8.3e-7)
@@ -2560,6 +2716,19 @@ def test_u1_general_section_exact_torsion():
     assert conv.reduced_physics == [] and "[APPROX]" not in rep.text()
 
 
+def test_u1_material_copy_keeps_the_damping():
+    # in space U1's torsion needs a material copy with its own Poisson's ratio; the copy keeps
+    # the material's density and *DAMPING
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B33, elset=B\n1, 1, 2\n"
+            "*Beam Section, elset=B, material=M, section=HEX\n2., .2\n0., 0., 1.\n"
+            "*Material, name=M\n*Elastic\n3e6, 0.3\n*Density\n7800.\n*Damping, alpha=0.2, beta=1e-4\n"
+            "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n2, 4, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    copy = body.split("*MATERIAL, NAME=ABQ2CCX_U1_M\n")[1].split("*BEAM SECTION")[0]
+    assert copy.startswith("*ELASTIC\n3000000., 0.4498") and "*DENSITY\n7800.\n*DAMPING, ALPHA=0.2, BETA=1e-4\n" in copy
+    assert "*BEAM SECTION, ELSET=B, MATERIAL=ABQ2CCX_U1_M, SECTION=GENERAL\n" in body and conv.reduced_physics == []
+
+
 def test_u1_in_space_needs_approximate_for_open_sections():
     deck = U1_PLANAR.replace("B21", "B31").replace("0., 0., -1.", "0., 0., 1.") + U1_STEP
     body, conv, rep = convert_str(deck)
@@ -2665,6 +2834,35 @@ def test_u1_refusals_keep_todays_section_handling():
     # with --approximate the I profile falls back to the RECT there
     body, _, rep = convert_str(cases["NLGEOM"], approximate=True)
     assert "SECTION=RECT" in body and "U1 beam, which carries the profile, cannot be used" in rep.text()
+
+
+def test_u1_refused_where_the_deck_acts_on_beam_nodes_or_breaks_its_form():
+    # what this conversion cannot write onto U1 nodes, or what the beams' geometry rules out:
+    # the I-beam keeps today's handling (not a ccx profile), with the reason
+    beam4 = "*Node\n4, 3., 0., 0.\n*Element, type=B31, elset=B3\n3, 3, 4\n*Beam Section, elset=B3, " \
+            "material=STEEL, section=I\n0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008\n0., 0., -1.\n"
+    cases = {
+        "an *EQUATION ties beam nodes": U1_PLANAR + "*Equation\n2\n3, 2, 1., 2, 2, -1.\n",
+        "a *TRANSFORM acts on beam nodes":
+            U1_PLANAR + "*Nset, nset=T\n2\n*Transform, nset=T\n1., 1., 0., -1., 1., 0.\n",
+        "a nonlinear *SPRING": U1_PLANAR + "*Element, type=SPRING1, elset=SP\n9, 3\n*Spring, elset=SP, nonlinear\n"
+                               "2\n0., 0.\n1., 1.\n",
+        "normals redefine the beams' n2 axes": U1_PLANAR + "*Normal\n1, 1, 0., 1., 0.\n",
+        "the 2-D beams' nodes are not in one plane z = const": U1_PLANAR.replace("3, 2., 0.\n", "3, 2., 0., 0.5\n"),
+        "2-D and 3-D beams are mixed": U1_PLANAR + beam4,
+        "names no element (set 'NOPE')": U1_PLANAR + beam4.split("*Beam")[0].split("*Element")[0] +
+                                          "*Beam" + beam4.split("*Beam")[1].replace("B3", "NOPE"),
+        "element 2 under *BEAM SECTION, SECTION=I is a B22": U1_PLANAR.replace(
+            "2, 2, 3\n", "*Element, type=B22, elset=B\n2, 2, 3, 4\n*Node\n4, 1.5, 0.\n"),
+    }
+    for why, deck in cases.items():
+        body, _, rep = convert_str(deck + U1_STEP)
+        assert "TYPE=U1" not in body and "not run as ccx's U1 beam element either: " in rep.text(), why
+        assert why in rep.text(), (why, rep.text())
+    # an *EQUATION on other nodes leaves the beams U1
+    body, _, _ = convert_str(U1_PLANAR + "*Node\n50, 5., 5.\n51, 6., 5.\n*Element, type=SPRING2, elset=SP\n"
+                             "9, 50, 51\n*Spring, elset=SP\n1, 1\n1.\n*Equation\n2\n50, 1, 1., 51, 2, -1.\n" + U1_STEP)
+    assert "*ELEMENT, TYPE=U1" in body
 
 
 def test_u1_kept_out_beside_deformation_plasticity():
@@ -3218,6 +3416,25 @@ def test_composite_symmetric_and_base_rotation():
     assert body[i:].splitlines()[2] == "3, 135."                          # 45 + 90
 
 
+def test_composite_shell_upgrade_midside_normals_and_hanging_neighbours():
+    # a composite S4 becomes an S8R; a midside node takes the mean of its corners' *NODE
+    # normals; a solid sharing the upgraded edge keeps no node there: reduced physics
+    deck = ("*NODE\n1, 0.,0.,0., 0., -0.6, 0.8\n2, 1.,0.,0., 0., -0.6, 0.8\n3, 1.,1.,0., 0., 0.6, 0.8\n"
+            "4, 0.,1.,0., 0., 0.6, 0.8\n5, 2.,0.,0.\n6, 2.,1.,0.\n7, 1.,0.,-1.\n8, 2.,0.,-1.\n9, 2.,1.,-1.\n"
+            "10, 1.,1.,-1.\n*ELEMENT, TYPE=S4, ELSET=SH\n1, 1, 2, 3, 4\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=BLK\n2, 7, 8, 9, 10, 2, 5, 6, 3\n"
+            "*SHELL SECTION, ELSET=SH, COMPOSITE\n0.05, 3, M, 0.\n0.05, 3, M, 90.\n"
+            "*SOLID SECTION, ELSET=BLK, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n")
+    body, conv, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=S8R\n1, 1, 2, 3, 4, 11, 12, 13, 14\n" in body
+    assert "\n11, 0.5, 0, 0\n12, 1, 0.5, 0\n13, 0.5, 1, 0\n14, 0, 0.5, 0\n" in body
+    assert "1, 11, 0, -0.6, 0.8\n1, 12, 0, 0, 1\n1, 13, 0, 0.6, 0.8\n1, 14, 0, 0, 1\n" in body
+    assert "*ELEMENT, TYPE=C3D8\n2, 7, 8, 9, 10, 2, 5, 6, 3\n" in body
+    assert "1 element(s) (e.g. 2, C3D8) share an edge with the upgraded shells" in rep.text()
+    assert conv.reduced_physics == ["element S4 -> S8R (ccx runs composite shells on S8R / S6 only)",
+                                    "elements left with a hanging midside node of an upgraded shell"]
+
+
 def test_shell_edge_faces_map_to_s3_s6():
     body, _, _ = convert_str(S4 + "*Surface, name=SS\n1, E1\n2, E4\n")
     assert "1, S3\n2, S6" in body
@@ -3307,6 +3524,22 @@ def test_equation_card_with_several_set_equations():
             in body), body
 
 
+def test_equation_node_sets_unsorted_mixed_sizes_or_empty():
+    # Abaqus applies an *EQUATION of node sets node by node, in each set's sorted order unless
+    # it is UNSORTED; a one-node set joins every equation; sets of different sizes cannot pair
+    deck = (HEX_MODEL + "*Nset, nset=A\n3, 1, 2\n*Nset, nset=B, unsorted\n7, 5, 6\n*Nset, nset=C\n8\n"
+            "*Equation\n3\nA, 1, 1., B, 1, -1., C, 1, 0.5\n")
+    body, conv, rep = convert_str(deck)
+    rows = [sorted((t[0], t[2]) for t in eq) for eq in _all_equations(body)]
+    assert rows == [[(1, 1.0), (7, -1.0), (8, 0.5)], [(2, 1.0), (5, -1.0), (8, 0.5)],
+                    [(3, 1.0), (6, -1.0), (8, 0.5)]], rows
+    body, conv, rep = convert_str(deck.replace("*Nset, nset=C\n8\n", "*Nset, nset=C\n7, 8\n"))
+    assert "*EQUATION\n3\nA, 1, 1., B, 1, -1., C, 1, 0.5" in body
+    assert "*EQUATION mixes node sets of different sizes" in rep.text()
+    body, conv, rep = convert_str(deck.replace("C, 1, 0.5", "NONE, 1, 0.5"))
+    assert "references set 'NONE' which resolves to no nodes" in rep.text()
+
+
 def test_perturbation_static_before_general_step_warns():
     # ccx runs it as a general step: the next general step gets its loads back
     # (_restore_base_states) but starts from its deformed state
@@ -3353,6 +3586,56 @@ def test_creep_strain_hardening_warns():
     assert "TIME hardening" in rep.text()
     _, _, rep = convert_str("*Material,name=M\n*Creep\n1e-10, 3., 0.\n")
     assert "TIME hardening" not in rep.text()
+
+
+def test_material_and_procedure_options_ccx_lacks():
+    deck = (HEX_MODEL.replace("1000., 0.3\n", "1000., 0.3\n*Density\n1e-6\n*Creep, law=HYPERBOLIC SINE\n"
+                              "1e-3, 0.1, 2., 1e4, 8.314\n")
+            + "*Surface Interaction, name=SI\n*Surface Behavior, no separation\n"
+            "*Restart, write, frequency=5, overlay\n*Step\n*Static, stabilize=2e-4\n*Cload\n7, 3, -1.\n*End Step\n"
+            "*Step\n*Dynamic, adiabatic\n0.1, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    # a creep law ccx has no built-in form of: its user law (creep.f)
+    assert "*CREEP, LAW=USER\n1e-3, 0.1, 2., 1e4, 8.314\n" in body
+    # NO SEPARATION is kept, though ccx ignores it; *RESTART keeps the parameters ccx reads
+    assert "*SURFACE BEHAVIOR, NO SEPARATION\n" in body and "*RESTART, WRITE, FREQUENCY=5\n" in body
+    assert "*STATIC\n" in body and "\n*DYNAMIC\n0.1, 1.\n" in body
+    assert "*STATIC STABILIZE dropped" in rep.text() and "*RESTART parameter OVERLAY dropped" in rep.text()
+    assert conv.reduced_physics == ["*CREEP, LAW=HYPERBOLIC SINE", "*SURFACE BEHAVIOR, NO SEPARATION",
+                                    "adiabatic heating (*DYNAMIC, ADIABATIC)"]
+
+
+def test_step_and_procedure_options_ccx_lacks():
+    deck = (HEX_MODEL + "*Parameter\nx = 1.\n*System\n*Unit System\nSI\n"
+            "*Surface, name=S1\nEALL, S1\n*Surface, name=S2\nEALL, S2\n*Surface, name=SC, combine=UNION\nS1, S2\n"
+            "*Surface, name=AR, type=ANALYTICAL RIGID\n*Surface, name=SP, property=X\nEALL, S3\n"
+            "*Surface Interaction, name=I\n*Surface Behavior, pressure-overclosure=HARD\n"
+            "*Contact Pair, interaction=I, small sliding, type=SURFACE TO SURFACE\nS1, S2\n"
+            "*Step, amplitude=LINEAR, unsymm=YES\n*Static, direct=NO STOP, factor=2.\n0.1, 1.\n"
+            "*Cload\n7, 3, -1.\n*End Step\n"
+            "*Step\n*Dynamic, application=TRANSIENT FIDELITY\n0.01, 0.1\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    live = "\n".join(_live(body)) + "\n"
+    # a bare *SYSTEM, *UNIT SYSTEM and *PARAMETER (already substituted) are dropped
+    assert "*SYSTEM" not in live and "*UNIT SYSTEM" not in live and "*PARAMETER" not in live
+    # *SURFACE: COMBINE and analytical surfaces have no ccx form, PROPERTY is not ccx's
+    assert "** *SURFACE, NAME=SC, COMBINE=UNION\n** S1, S2\n" in body and "** *SURFACE, NAME=AR" in body
+    assert "*SURFACE, NAME=SP\nEALL, S3\n" in live
+    # ccx's surface-to-surface contact has no SMALL SLIDING
+    assert "*CONTACT PAIR, INTERACTION=I, TYPE=SURFACE TO SURFACE\nS1, S2\n" in live
+    # *STEP AMPLITUDE only RAMP / STEP; DIRECT=NO STOP is ccx's DIRECT; HHT for any APPLICATION
+    assert "\n*STEP\n*STATIC, DIRECT\n0.1, 1.\n" in live and "\n*STEP\n*DYNAMIC\n0.01, 0.1\n" in live
+    text = rep.text()
+    for msg in ("Bare *SYSTEM (reset to global coordinates) dropped", "*UNIT SYSTEM is unsupported by ccx",
+                "*SURFACE parameter PROPERTY dropped", "*CONTACT PAIR SMALL SLIDING dropped for SURFACE TO SURFACE",
+                "*STEP AMPLITUDE=LINEAR: ccx accepts only RAMP or STEP", "*STEP parameter UNSYMM dropped",
+                "*STATIC DIRECT=NO STOP -> DIRECT", "*STATIC FACTOR dropped",
+                "*DYNAMIC APPLICATION=TRANSIENT FIDELITY dropped"):
+        assert msg in text, msg
+    assert conv.reduced_physics == []
+    # a *SYSTEM with data: the nodes after it are read as global (reduced physics)
+    _, conv, rep = convert_str("*System\n1., 2., 3.\n*Node\n1, 0., 0., 0.\n")
+    assert conv.reduced_physics == ["*SYSTEM (nodes given in a local frame read as global)"]
 
 
 def test_rigid_body_pin_and_tie_sets_united():
@@ -4328,6 +4611,34 @@ def test_default_output_without_output_requests():
     assert "*EL FILE" not in body and _step(body, 2).endswith("*NODE FILE\nU\n")
 
 
+def test_output_requests_ccx_cannot_take_as_given():
+    step = "*Step\n*Static\n*Cload\n7, 3, -1.\n{}*End Step\n"
+
+    def out(cards):
+        body, conv, rep = convert_str(HEX_MODEL + step.format(cards))
+        return _step(body, 1), rep.text()
+    # print cards without a set print every node / element in Abaqus; ccx needs the set
+    st, text = out("*Node Print, totals=yes\nU\n*El Print, directions=yes\nS\n")
+    assert "*NODE PRINT, TOTALS=yes, NSET=ABQ2CCX_ALL_NODES\nU\n" in st
+    assert "*EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS\nS\n" in st and "DIRECTIONS dropped" in text
+    # a field request without variables: U / S; a history request without: nothing to print
+    st, text = out("*Output, field\n*Node Output\n*Element Output\n"
+                   "*Output, history\n*Element Output, elset=EALL, variable=ALL\n")
+    assert "*NODE FILE\nU\n*EL FILE\nS\n" in st and "*EL PRINT" not in st
+    assert "names no variables (a VARIABLE= selection has no ccx equivalent); dropped" in text
+    # .fil parameters ccx does not read, and variables it has no label for
+    st, text = out("*Node File, global=yes, summary=yes\nU, A, CF\n*El File, position=centroidal\nJCCRT, S\n")
+    assert "*NODE FILE, GLOBAL=yes\nU\n*EL FILE\nS\n" in st
+    for msg in ("Output parameter SUMMARY dropped", "Output POSITION=... dropped",
+                "Output variable JCCRT dropped: no Johnson-Cook", "Output variable A dropped"):
+        assert msg in text, msg
+    # requests on connector elements: ccx has no connector output
+    body, conv, rep = convert_str(HEX_MODEL + "*Node\n9, 1.,0.,0.\n*Element, type=CONN3D2, elset=W\n20, 2, 9\n"
+                                  "*Connector Section, elset=W\nJoin,\n" + step.format(
+                                      "*Output, history\n*Element Output, elset=W\nCTF\n"))
+    assert "*EL PRINT" not in _step(body, 1) and "on connector elements dropped" in rep.text()
+
+
 def test_carried_output_requests_written_again():
     # ccx keeps a step's output cards for later steps, but at that step's frequency or time
     # points and as a step in between left them; Abaqus carries the requests themselves over,
@@ -4986,6 +5297,28 @@ def test_temperature_from_file_without_initial_conditions_warned():
     body, _, _ = convert_str(HOT_CUBE + "*Step\n*Static\n*Temperature, user\n1\n*End Step\n"
                              + HEAT_STEP)
     assert DEFAULT_IC in body
+
+
+def test_initial_conditions_ccx_cannot_take():
+    deck = (HEX_MODEL.replace("*Solid Section", "*Element, type=T3D2, elset=TR\n2, 1, 7\n"
+                              "*Solid Section, elset=TR, material=M\n1.\n*Solid Section")
+            + "*Initial Conditions, type=HARDENING\nEALL, 0.1\n*Initial Conditions, type=STRESS, user\n"
+            "*Initial Conditions, type=STRESS\n1, 1., 2., 3.\nTR, 5.\nNOSUCH, 1.\n")
+    body, conv, rep = convert_str(deck)
+    # a type ccx does not know, and USER (an Abaqus subroutine), are commented out
+    assert "** *INITIAL CONDITIONS, TYPE=HARDENING\n** EALL, 0.1\n" in body
+    assert "** *INITIAL CONDITIONS, TYPE=STRESS, USER\n" in body
+    # one line per integration point of the C3D8; the truss has none in ccx, the unknown
+    # element set none at all
+    assert "*INITIAL CONDITIONS, TYPE=STRESS\n" + "".join(f"1, {k}, 1., 2., 3.\n" for k in range(1, 9)) in body + "\n"
+    assert "\n2, 1, 5." not in body and "'NOSUCH' matches no element or elset" in rep.text()
+    assert conv.reduced_physics == ["*INITIAL CONDITIONS",
+                                    "*INITIAL CONDITIONS, TYPE=STRESS on shells / beams dropped"]
+    # TYPE=SOLUTION records may continue over lines; without one *DEPVAR size each line is a record
+    body, conv, rep = convert_str(HEX_MODEL + "*Initial Conditions, type=SOLUTION\n"
+                                  "1, 1., 2., 3., 4., 5., 6., 7.\n8., 9.\n")
+    assert body.endswith("\n1, 8, 1., 2., 3., 4., 5., 6., 7.") and "'8.' matches no element" in rep.text()
+    assert conv.reduced_physics == ["*INITIAL CONDITIONS, TYPE=SOLUTION records misread"]
 
 
 def test_initial_temperatures_reach_knot_beam_nodes():
@@ -6264,6 +6597,19 @@ def test_dload_op_new_removes_earlier_body_forces():
     body, _, _ = convert_str(deck.format("*Dsload\nSB, P, 2.\n*Dload, op=NEW\nALL, BZ, 1.\n"))
     assert "on a step's first *DLOAD only\n*DLOAD, OP=NEW\n" + ZERO_BODY + "ALL, BX, 0.\nALL, BY, 0.\n" \
            "*DLOAD\nALL, P1, 2.\n*DLOAD, OP=NEW\nALL, BZ, 1.\n" in body
+
+
+def test_dload_op_new_keeps_its_card_when_every_line_is_dropped():
+    # OP=NEW removes the earlier distributed loads even when none of its own lines converts:
+    # the bare card stays; without OP=NEW such a card is commented out
+    two = ("*Step\n*Static\n*Dload\nEALL, P2, 1.\n*End Step\n*Step\n*Static\n*Dload{}\n"
+           "EALL, ROTA, 10., 0., 0., 0., 0., 0., 1.\n*End Step\n")
+    body, conv, rep = convert_str(HEX_MODEL + two.format(", op=NEW"))
+    assert _step(body, 2).startswith("\n*STATIC\n*DLOAD, OP=NEW\n*NODE FILE")
+    assert "every load line was unsupported and dropped, but the bare OP=NEW card is kept" in rep.text()
+    assert "*DLOAD ROTA dropped" in conv.reduced_physics
+    body, conv, rep = convert_str(HEX_MODEL + two.format(""))
+    assert "** *DLOAD\n** EALL, ROTA" in _step(body, 2) and "*DLOAD has no CalculiX-compatible load lines" in rep.text()
 
 
 def test_body_forces_of_perturbation_steps_removed():
@@ -8228,6 +8574,25 @@ def test_connector_beam_weld_and_link():
     assert "Connector LINK in a deck without NLGEOM" in rep.text()
 
 
+def test_rigid_connectors_join_beam_mpc_chains():
+    # a rigid connector (BEAM) between the dependent nodes of two *MPC BEAM chains makes them one
+    # rigid body (the second chain re-rooted at its node); between two nodes of one body it adds
+    # nothing; from a free node to a dependent one, the free node joins that body
+    deck = (B2 + "*Node\n100, 1.5, 0., 0.\n101, 2.5, 0., 0.\n102, 3.5, 0., 0.\n103, 4.5, 0., 0.\n"
+            "*MPC\nBEAM, 100, 2\nBEAM, 102, 101\n*Element, type=CONN3D2, elset=W\n9, {}\n"
+            "*Connector Section, elset=W\nBeam,\n")
+
+    def bodies(conn):
+        body, _, rep = convert_str(deck.format(conn))
+        g = reparse(body)
+        found = re.findall(r"\*RIGID BODY, NSET=(\S+), REF NODE=(\d+)", body)
+        return sorted((int(ref), sorted(g.nset(name))) for name, ref in found), rep.text()
+    assert bodies("100, 102")[0] == [(2, [100, 101, 102])]
+    got, text = bodies("100, 2")
+    assert got == [(2, [100]), (101, [102])] and "already move as one rigid body" in text
+    assert bodies("103, 102")[0] == [(2, [100]), (101, [102, 103])]
+
+
 def test_connector_types_behaviour_and_free_types():
     base = HEX + "*Node\n9, 1.,0.,0.\n*Element, type=CONN3D2, elset=W\n20, 2, 9\n"
     # no constraint and no behaviour: transmits nothing — left out (exact)
@@ -9245,6 +9610,25 @@ def test_coupling_influence_radius():
     # a radius that does not read: the whole surface, warned
     body, _, rep = convert_str(_radius_block(corner, kin.format(s="TOPE", r="X")))
     assert "SURFACE=TOPE\n*KINEMATIC" in body and "INFLUENCE RADIUS=X does not read as a number" in rep.text()
+
+
+def test_distributing_coupling_card_with_an_influence_radius():
+    # under NLGEOM a distributing coupling off its surface's centre stays ccx's card (no
+    # equations); its INFLUENCE RADIUS becomes a surface of the facets Abaqus distributes over
+    dist = "*Coupling, constraint name=C, ref node=100, surface=TOPE, influence radius={r}\n*Distributing\n"
+    nl = "*Step, nlgeom\n*Static\n0.1, 1.\n*Boundary\n1, 1, 3\n*Cload\n100, 3, -1.\n*End Step\n"
+    card = "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE={}\n*DISTRIBUTING\n1, 6\n"
+    # one facet within the radius: ccx's tributary areas are Abaqus' weights
+    body, conv, rep = convert_str(_radius_block((0., 0., 1.2), dist.format(r="0.5"), nl))
+    assert "*SURFACE, NAME=TOPE_RADIUS\n1, S2\n" + card.format("TOPE_RADIUS") in body
+    assert "each cut by the same part" in rep.text() and conv.reduced_physics == []
+    # facets cut by different parts: Abaqus scales their weights, ccx cannot
+    body, conv, rep = convert_str(_radius_block((0.8, 0.9, 1.1), dist.format(r="0.5"), nl))
+    assert "*SURFACE, NAME=TOPE_RADIUS\n1, S2\n2, S2\n3, S2\n4, S2\n" in body
+    assert conv.reduced_physics == ["*COUPLING, *DISTRIBUTING with an INFLUENCE RADIUS"]
+    # a radius over the whole surface is left out
+    body, conv, rep = convert_str(_radius_block((0., 0., 1.2), dist.format(r="9."), nl))
+    assert card.format("TOPE") in body and "_RADIUS" not in body and conv.reduced_physics == []
 
 
 # axes of the orientation: e1 = (0.6, 0.64, 0.48), e2 = (0, 0.6, -0.8), e3 = (-0.8, 0.48, 0.36)
@@ -10870,6 +11254,43 @@ def test_cps4i_outside_the_exact_slab_form_is_reduced_physics():
     assert conv.reduced_physics and "not a parallelogram" in rep.text()
 
 
+def test_cps4i_slab_surface_faces_and_obstacles():
+    # an element surface on the CPS4I edges: the slab's side faces (edge k -> face k + 2), on
+    # which a surface pressure acts as on the edge
+    load = "*Step\n*Static\n*Cload\n6, 2, -1.\n*End Step\n"
+    body, conv, rep = convert_str(PLANE2 + "*Elset, elset=E2\n2\n*Surface, name=RS\nE2, S2\n"
+                                  + load.replace("*End Step", "*Dsload\nRS, P, 3.\n*End Step"))
+    assert "*ELEMENT, TYPE=C3D8I" in body and "*SURFACE, NAME=RS\nE2, S4\n" in body
+    assert "*DLOAD\nE2, P4, 3.\n" in body and conv.reduced_physics == []
+    # anything outside small-strain isotropic elasticity on plain edges keeps the CPS4
+    other = ("*Node\n20, 9., 9.\n21, 10., 9.\n22, 10., 10.\n23, 9., 10.\n*Element, type=CPS4, elset=OTHER\n"
+             "30, 20, 21, 22, 23\n*Solid Section, elset=OTHER, material=STEEL\n0.5,\n")
+    cases = {
+        "the deck has a Riks step": PLANE2 + load.replace("*Static\n", "*Static, riks\n0.1, 1.\n"),
+        "the deck has *TRANSFORM": PLANE2 + "*Nset, nset=T\n6\n*Transform, nset=T\n0.,1.,0.,-1.,0.,0.\n" + load,
+        "their nodes are shared with other elements":
+            PLANE2 + "*Element, type=T2D2, elset=TR\n9, 3, 6\n*Solid Section, elset=TR, material=STEEL\n0.1\n" + load,
+        "their *SOLID SECTION has ORIENTATION":
+            PLANE2.replace("material=STEEL\n0.5,", "material=STEEL, orientation=OR\n0.5,")
+            .replace("*Boundary", "*Orientation, name=OR\n1.,0.,0.,0.,1.,0.\n*Boundary") + load,
+        "material STEEL has a temperature-dependent *ELASTIC":
+            PLANE2.replace("*Elastic\n1000., 0.3", "*Elastic\n1000., 0.3, 0.\n900., 0.3, 100.") + load,
+        "material STEEL has no *ELASTIC": PLANE2.replace("*Elastic\n1000., 0.3\n", "") + load,
+        "a *DLOAD CENTRIF acts on them":
+            PLANE2 + load.replace("*End Step", "*Dload\nB, CENTRIF, 10., 0., 0., 0., 0., 0., 1.\n*End Step"),
+        "a *DSLOAD TRSHR acts on them": PLANE2 + "*Surface, name=RS\nB, S2\n"
+        + load.replace("*End Step", "*Dsload\nRS, TRSHR, 3., 1., 0., 0.\n*End Step"),
+        "element surface RS is not made of their edges S1..S4": PLANE2 + "*Surface, name=RS\nB, SPOS\n" + load,
+        "element set MIX mixes them with other element types":
+            PLANE2.replace("*Solid Section, elset=B, material=STEEL\n0.5,\n", "")
+            + other.replace("elset=OTHER, material", "elset=MIX, material") + "*Elset, elset=MIX\n1, 2, 30\n" + load,
+    }
+    for why, deck in cases.items():
+        body, conv, rep = convert_str(deck)
+        assert "C3D8I" not in body and "element CPS4I -> CPS4 (incompatible modes dropped)" in conv.reduced_physics, why
+        assert f"The exact C3D8I-slab form does not apply here: {why}." in rep.text(), (why, rep.text())
+
+
 def test_reduced_physics_record():
     # a dropped constitutive card, a replaced element formulation and a dropped interaction
     # are reduced physics; exact substitutions, output requests and numerical controls are not
@@ -10968,6 +11389,28 @@ def test_nmap_maps_nodes_and_their_normals():
     assert max(abs(u - v) for u, v in zip(conv.geom.nodes[1], (0., math.sqrt(3.), 1.))) < 1e-12
     _, conv, rep = convert_str(deck.replace("CYLINDRICAL", "TOROIDAL"))
     assert conv.reduced_physics == ["*NMAP, TYPE=TOROIDAL coordinate mapping skipped"]
+
+
+def test_nmap_translation_scale_and_shift():
+    # TRANSLATION moves along a-b by the magnitude, SCALE scales about a, RECTANGULAR with
+    # point a only shifts by a; a node normal turns with ROTATION (Abaqus 2017 Keywords *NMAP)
+    deck = ("*NODE, NSET=A\n1, 1., 2., 3., 0., 0., 1.\n2, 0., 1., 0.\n*NODE\n3, 9., 9., 9.\n*NSET, NSET=B\n2\n"
+            "*NMAP, NSET=A, TYPE=TRANSLATION\n0., 0., 0., 0., 3., 4.\n10.\n"
+            "*NMAP, NSET=B, TYPE=SCALE\n0., 1., 1.\n2., 3., 4.\n"
+            "*NMAP, NSET=B, TYPE=RECTANGULAR\n5., 6., 7.\n"
+            "*NMAP, NSET=A, TYPE=ROTATION\n0., 0., 0., 1., 0., 0.\n0., 0., 0.\n90.\n"
+            "*ELEMENT, TYPE=S3, ELSET=E\n1, 1, 2, 3\n")
+    body, conv, rep = convert_str(deck)
+    # node 1: (1, 2, 3) + (0, 6, 8), turned 90 degrees about x; node 2: (0, 7, 8) scaled
+    # about (0, 1, 1) to (0, 19, 29), shifted to (5, 25, 36) and turned
+    assert "\n1, 1, -11, 8\n2, 5, -36, 25\n3, 9, 9, 9\n" in body, body
+    assert body.endswith("*NORMAL\n1, 1, 0, -1, 0") and conv.reduced_physics == []
+    # a ROTATION or TRANSLATION without an axis, a CYLINDRICAL without point b: skipped
+    for typ, data in (("ROTATION", "0., 0., 0., 0., 0., 0.\n0., 0., 0.\n90.\n"),
+                      ("TRANSLATION", "1., 1., 1., 1., 1., 1.\n5.\n"), ("CYLINDRICAL", "1., 1., 1.\n")):
+        _, conv, rep = convert_str("*NODE, NSET=A\n1, 1., 2., 3.\n" + f"*NMAP, NSET=A, TYPE={typ}\n" + data)
+        assert conv.geom.nodes[1] == (1.0, 2.0, 3.0)
+        assert conv.reduced_physics == [f"*NMAP, TYPE={typ} coordinate mapping skipped (no axis)"]
 
 
 def test_node_normals_become_normal_cards():
@@ -11090,6 +11533,31 @@ def test_section_controls_defaults_change_nothing():
     assert conv.reduced_physics == [], conv.reduced_physics
     body, conv, _ = convert_str(base + "*Section Controls, name=SC\n2.\n")
     assert conv.reduced_physics == ["*SECTION CONTROLS (data-line value 1 = 2.)"]
+
+
+def test_section_controls_that_change_the_formulation_or_nothing():
+    base = (HEX.replace("C3D8,", "C3D8R,") + "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-6\n"
+            "*Solid Section, elset=EALL, material=M, controls=SC\n")
+    explicit = "*Step\n*Dynamic, explicit\n, 0.001\n*End Step\n"
+    damage = base.replace("*Density", "*Damage Initiation, criterion=DUCTILE\n0.1, 0., 0.\n*Density")
+    for deck, why in (
+            # a card no section names, and options that do not apply here: commented out, no change
+            (base + "*Section Controls, name=OTHER, element deletion=YES\n", None),
+            (base + "*Section Controls, name=SC, element deletion=YES, distortion control=YES\n", None),
+            # element deletion with progressive damage, distortion control and the Explicit-only
+            # options in an explicit step, a non-default hourglass, an unreadable scale
+            (damage + "*Section Controls, name=SC, element deletion=YES\n",
+             "ELEMENT DELETION=YES (progressive damage)"),
+            (base + "*Section Controls, name=SC, distortion control=YES, second order accuracy=YES\n"
+             ", , 2.\n" + explicit,
+             "DISTORTION CONTROL=YES; SECOND ORDER ACCURACY=YES (explicit step); data-line value 3 = 2."),
+            (base + "*Section Controls, name=SC, hourglass=ENHANCED\n", "HOURGLASS=ENHANCED on C3D8R"),
+            (base + "*Section Controls, name=SC\nX\n", "data-line value 1 = X")):
+        body, conv, rep = convert_str(deck)
+        assert "** *SECTION CONTROLS" in body and "\n*SECTION CONTROLS" not in body
+        assert conv.reduced_physics == ([f"*SECTION CONTROLS ({why})"] if why else []), (why, conv.reduced_physics)
+    assert "*SECTION CONTROLS OTHER: no section uses it" in convert_str(
+        base + "*Section Controls, name=OTHER\n")[2].text()
 
 
 def test_approximate_reframings_are_reduced_physics():
@@ -11552,6 +12020,24 @@ def test_analytical_segments_exact_or_approximate():
             assert abs(math.hypot(r, p[1] - 2.5) - 1.5) < 1e-9
 
 
+def test_analytical_parabola_segment_meshed_on_the_curve():
+    # a PARAB segment: the parabola through the start, middle and end points (Abaqus 2017
+    # Keywords *SURFACE); --approximate meshes it with facets whose ends lie on it
+    deck = ANALYTIC_2D + ("*SURFACE, TYPE=SEGMENTS, NAME=TOOL\nSTART, 1.5, 1.2\nPARAB, 0.75, 1.1, 0., 1.2\n"
+                          "*RIGID BODY, REF NODE=9, ANALYTICAL SURFACE=TOOL\n"
+                          "*SURFACE INTERACTION, NAME=I\n*CONTACT PAIR, INTERACTION=I\nTOP, TOOL\n")
+    body, conv, rep = convert_str(deck)
+    assert "** *SURFACE, TYPE=SEGMENTS" in body and "--approximate" in rep.text()
+    body, conv, rep = convert_str(deck, approximate=True)
+    g, _ = _emitted(body)
+    (elset, face), = [(f[0].strip(), f[1].strip()) for f in _surface_lines(body, "TOOL")]
+    # (an axisymmetric model's surface is turned +/- 1 degree about y: radius r)
+    pts = {(math.hypot(p[0], p[2]), p[1]) for e in g.elset(elset) for p in _face_points(g, e, face)}
+    assert len(pts) > 4 and {round(r, 9) for r, _ in pts} >= {0.0, 0.75, 1.5}
+    for r, y in pts:
+        assert abs(y - (1.1 + 0.1 * ((r - 0.75) / 0.75) ** 2)) < 1e-9, (r, y)
+
+
 def test_analytical_cylinder_and_revolution_frames():
     base = ("*NODE\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n"
             "8,0.,1.,1.\n9,0.5,0.5,3.\n*ELEMENT, TYPE=C3D8, ELSET=B\n1,1,2,3,4,5,6,7,8\n"
@@ -11625,6 +12111,21 @@ def test_rotary_inertia_on_a_rigid_body_becomes_point_masses():
                                             "*ROTARY INERTIA, ELSET=PI, ORIENTATION=O\n"))
     assert "an orientation without fixed rectangular axes: not converted" in rep.text()
     assert "*ROTARY INERTIA" in conv.reduced_physics
+
+
+def test_rigid_body_rotary_inertia_needs_a_mass_and_a_physical_tensor():
+    # a rigid body's rotary inertia becomes point masses about its *MASS: without one, or with
+    # moments no mass distribution has, it is not converted (reduced physics)
+    base = (HEX + "*NODE\n9, 0.5, 0.5, 2.\n*NSET, NSET=ALLN\n1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*RIGID BODY, REF NODE=9, TIE NSET=ALLN\n{}*ELEMENT, TYPE=ROTARYI, ELSET=PI\n11, 9\n"
+            "*ROTARY INERTIA, ELSET=PI\n{}\n*STEP\n*FREQUENCY\n2\n*END STEP\n")
+    for mass, inertia, why in (("", "1., 1., 1.", "the body has no *MASS to centre it on"),
+                               ("*ELEMENT, TYPE=MASS, ELSET=PM\n10, 9\n*MASS, ELSET=PM\n2.\n", "1., 1., 5.",
+                                "its principal moments break the triangle inequality")):
+        body, conv, rep = convert_str(base.format(mass, inertia))
+        assert f"Rotary inertia on the rigid body of reference node 9 not converted: {why}" in rep.text()
+        assert "*ROTARY INERTIA" in conv.reduced_physics and "*MASS, ELSET=ABQ2CCX_STAR" not in body
 
 
 def test_tie_to_a_rigid_surface_makes_the_slave_nodes_members():
@@ -11828,6 +12329,38 @@ def test_tie_to_a_rigid_surface_follows_abaqus_tolerances():
     body, conv, _ = convert_str(sym.format(""))
     assert {1, 2, 3, 4} <= _body_members(body)
     assert all(abs(conv.geom.nodes[n][2] - 0.9) < 1e-12 for n in (1, 2, 3, 4))
+
+
+def test_tie_of_a_node_surface_to_an_analytical_rigid_surface():
+    # an analytical master: Abaqus' default position tolerance is 5 % of the slave node
+    # spacing for a node-based slave (node to surface); nodes within it join the rigid body
+    # and are moved onto the surface (ADJUST), farther ones are left untied
+    deck = (HEX.replace("7, 1.,1.,1.", "7, 1.,0.9,1.").replace("8, 0.,1.,1.", "8, 0.,0.97,1.")
+            + "*NODE\n9, 0.5, 2., 0.5\n*NSET, NSET=SIDE\n3, 4, 7, 8\n*SURFACE, TYPE=NODE, NAME=SN\nSIDE\n"
+            "*SURFACE, TYPE=CYLINDER, NAME=AS\nSTART, -1., 1.\nLINE, 2., 1.\n"
+            "*RIGID BODY, REF NODE=9, ANALYTICAL SURFACE=AS\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*TIE, NAME=GLUE{}\nSN, AS\n*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n*END STEP\n")
+    body, conv, rep = convert_str(deck.format(""))
+    assert _body_members(body) & {3, 4, 7, 8} == {3, 4, 8} and conv.geom.nodes[8] == (0.0, 1.0, 1.0)
+    assert conv.geom.nodes[7] == (1.0, 0.9, 1.0) and "*TIE, NAME=GLUE" not in "\n".join(_live(body))
+    assert "1 slave node(s) farther than the position tolerance (0.05)" in rep.text()
+    body, conv, rep = convert_str(deck.format(", POSITION TOLERANCE=0.2"))
+    assert _body_members(body) & {3, 4, 7, 8} == {3, 4, 7, 8} and conv.geom.nodes[7] == (1.0, 1.0, 1.0)
+
+
+def test_tie_without_rotation_to_a_rigid_surface_pins_the_slave_nodes():
+    # *TIE, NO ROTATION to a rigid surface: the tied nodes join the body's PIN nodes (their
+    # rotations stay free), together with the deck's own PIN NSET
+    deck = TIED_PLATE.replace("*RIGID BODY, REF NODE=9, ELSET=PLATE\n", "*NODE\n30, 5., 5., 5.\n*NSET, NSET=P\n30\n"
+                              "*RIGID BODY, REF NODE=9, ELSET=PLATE, PIN NSET=P\n")
+    body, conv, rep = convert_str(deck.format("*TIE, NAME=GLUE, NO ROTATION\nTOP, TOOL\n"))
+    g = reparse(body)
+    pins = [sorted(v) for k, v in g.nsets.items() if k.startswith("ABQ2CCX_RBN") and 30 in v]
+    assert pins == [[5, 6, 7, 8, 30]], {k: sorted(v) for k, v in g.nsets.items()}
+    body, conv, rep = convert_str(deck.format("*TIE, NAME=GLUE\nTOP, TOOL\n"))
+    g = reparse(body)
+    assert [sorted(v) for k, v in g.nsets.items() if k.startswith("ABQ2CCX_RBN") and 30 in v] == []
 
 
 def test_unconverted_analytical_surface_comments_only_its_lines():
@@ -12079,6 +12612,39 @@ def test_run_fails_on_a_step_that_solves_nothing():
         assert A.classify_ccx_run(0, step.format(shown), "") == status, (shown, status)
 
 
+def test_nonfinite_ccx_results_found_in_print_rows_and_frd_values():
+    # a NaN / Inf in a value row of a .dat print block or a node's .frd values is a diverged
+    # run; one in ccx's own tables (an eigenvalue output) is not
+    d = tempfile.mkdtemp()
+    job = os.path.join(d, "job")
+    head = b"\n S T E P       1\n\n displacements (vx,vy,vz) for set NALL and time  0.1000000E+01\n\n"
+    row = b"         2  0.100000E+00  0.000000E+00  0.000000E+00\n"
+    frd = (b"    2C                             8                                     1\n"
+           b" -1         1 0.00000E+00 0.00000E+00 0.00000E+00\n"
+           b"  100CL  101 1.00000E+00       8                     0    1           1\n"
+           b" -4  DISP        4    1\n -1         1 1.00000E+00 0.00000E+00 0.00000E+00\n")
+
+    def scan(dat, frd_text):
+        for ext, text in ((".dat", dat), (".frd", frd_text)):
+            with open(job + ext, "wb") as fh:
+                fh.write(text)
+        return A.ccx_nonfinite_result(job)
+    try:
+        assert scan(head + row, frd) is None
+        got = scan(head + row.replace(b"0.100000E+00", b"         nan"), frd)
+        assert got == ("job.dat: displacements (vx,vy,vz) for set NALL and time 0.1000000E+01: "
+                       "2 nan 0.000000E+00 0.000000E+00"), got
+        table = b"\n E I G E N V A L U E   O U T P U T\n\n         1         inf  0.0  0.0  0.0\n"
+        assert scan(head + row + table, frd) is None
+        got = scan(head + row, frd.replace(b"1.00000E+00 0.00000E+00 0.00000E+00\n",
+                                           b"1.00000E+00-1.#IND      0.00000E+00\n"))
+        assert got == "job.frd: DISP at 1.00000E+00: 1 1.00000E+00-1.#IND 0.00000E+00", got
+        got = scan(head + row, frd.replace(b" -1         1 0.0", b" -1         1 NaN"))
+        assert got.startswith("job.frd: node coordinates at the mesh: 1 NaN"), got
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_cli_second_deck_is_the_output_when_new_or_written_by_abq2ccx():
     # "abq2ccx deck.inp out.inp" converts into out.inp where out.inp is new or abq2ccx wrote
     # it (so a rerun overwrites it); two existing Abaqus decks still convert as a batch, and
@@ -12104,6 +12670,51 @@ def test_cli_second_deck_is_the_output_when_new_or_written_by_abq2ccx():
     assert first == ["a.inp", "b.inp", "out.inp", "out.log"], first
     assert b_kept and last == ["a.inp", "a_ccx.inp", "a_ccx.log", "b.inp", "b_ccx.inp",
                                "b_ccx.log", "out.inp", "out.log"], last
+
+
+def test_cli_globs_batches_and_usage_errors():
+    from contextlib import redirect_stderr
+    d = tempfile.mkdtemp()
+    try:
+        for name in ("a.inp", "b.inp"):
+            with open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+                fh.write(HEX_MODEL)
+        out = os.path.join(d, "out")
+        os.mkdir(out)
+        # a pattern the shell left unexpanded (Windows) is globbed; a batch ends with a summary
+        with redirect_stderr(io.StringIO()) as err:
+            code = A.main([os.path.join(d, "*.inp"), "--outdir", out, "--no-log"])
+        assert code == 0 and sorted(os.listdir(out)) == ["a_ccx.inp", "b_ccx.inp"]
+        assert "abq2ccx: converted 2/2 deck(s)\n" in err.getvalue()
+        with redirect_stderr(io.StringIO()) as err:
+            code = A.main([os.path.join(d, "*.nope")])
+        assert code == 1 and "no files match" in err.getvalue() and "nothing to convert" in err.getvalue()
+        # -o names one output: not for a batch (a usage error, exit 2)
+        with redirect_stderr(io.StringIO()) as err:
+            try:
+                A.main([os.path.join(d, "a.inp"), os.path.join(d, "b.inp"), "-o", os.path.join(d, "x.inp")])
+                code = None
+            except SystemExit as exc:
+                code = exc.code
+        assert code == 2 and "-o/--output is only valid with a single input" in err.getvalue()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_convert_text_api_resolves_includes_in_its_base_dir():
+    d = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(d, "mesh.inp"), "w", encoding="utf-8") as fh:
+            fh.write(HEX)
+        res = A.convert_text("*Include, input=mesh.inp\n*Solid Section, elset=EALL, material=M\n"
+                             "*Material, name=M\n*Elastic\n1000., 0.3\n", base_dir=d)
+        assert res.ok and res.text.startswith("**") and res.text.endswith("\n")
+        assert "*ELEMENT, TYPE=C3D8\n1, 1, 2, 3, 4, 5, 6, 7, 8\n" in res.text
+        assert sorted(res.geometry.nodes) == list(range(1, 9)) and "\n".join(res.body) in res.text
+        empty = A.convert_text("** nothing\n", base_dir=d)
+        assert not empty.ok and empty.text == "" and os.listdir(d) == ["mesh.inp"]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 UMAT_CUBE = HEX + """*MATERIAL, NAME={name}
@@ -13972,6 +14583,27 @@ def test_quadratic_membranes_become_solids_held_at_their_nodes():
     body, _, _ = convert_str(tri + "*Membrane Section, elset=SKIN, material=M\n0.01\n")
     g = reparse(body)
     assert g.elements[1][0] == "C3D15" and len(g.elements[1][1]) == 15 and not dangling_refs(g)
+
+
+def test_quadratic_membrane_solids_take_velocity_initial_conditions():
+    # the solids' own nodes held at a membrane node take its initial velocity; in the global
+    # axes where the membrane node has a *TRANSFORM (here local x = global y, local z = z)
+    deck = (QM8_STRIP.replace("*Elastic\n100000., 0.3\n", "*Elastic\n100000., 0.3\n*Density\n1e-3\n")
+            + "*Membrane Section, elset=SKIN, material=M\n0.01\n*Nset, nset=T\n13\n"
+            "*Transform, nset=T\n0., 1., 0., -1., 0., 0.\n"
+            "*Initial Conditions, type=VELOCITY\n3, 1, 2.\n13, 1, 5.\n13, 3, 1.\n"
+            "*Step\n*Dynamic\n0.01, 0.1\n*Boundary\nLEFT, 1, 3\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    lines = body.split("*INITIAL CONDITIONS, TYPE=VELOCITY\n")[1].split("*")[0].splitlines()
+    assert lines[:3] == ["3, 1, 2.", "13, 1, 5.", "13, 3, 1."]
+    got = {}
+    for ln in lines[3:]:
+        n, d, v = ln.split(", ")
+        got.setdefault(conv._qmem_copies[int(n)], set()).add((int(n), int(d), float(v)))
+    copies = {m: n for m, n in conv._qmem_copies.items() if n in (3, 13)}
+    assert got[3] == {(m, 1, 2.0) for m, n in copies.items() if n == 3}
+    assert got[13] == {(m, d, v) for m, n in copies.items() if n == 13 for d, v in ((1, 0.), (2, 5.), (3, 1.))}
+    assert "lines on the nodes of quadratic membranes written as solids were extended" in rep.text()
 
 
 def test_quadratic_membrane_sections_loads_and_output():
