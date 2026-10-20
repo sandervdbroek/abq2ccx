@@ -2814,6 +2814,30 @@ def midside_rotation_deck(twin=False):
     return text + "*NODE PRINT, NSET=FREE\nU\n*END STEP\n"
 
 
+def curved_midside_deck(rot=False, twin=False):
+    """A B31 quarter ring of radius 1 about z (SECTION=CIRC, written as 3-node beams), three
+    elements, clamped at node 1; its last element's ends 3 and 4 with a cylindrical
+    *TRANSFORM about z, moved radially, tangentially and axially (``rot``: node 4 pinned,
+    both turned about those axes instead), as is that element's midside node (interpolated;
+    its axes are 15 deg from both ends'); ``twin``: an identity *TRANSFORM there, the BCs in
+    global components.  Prints nodes 1, 2 and the midside node between them."""
+    pts = [(math.cos(math.radians(30. * i)), math.sin(math.radians(30. * i))) for i in range(4)]
+    vals = {3: (0.01, 0.005, 0.003), 4: (0.02, 0., 0.006)} if not rot else \
+        {3: (0.02, 0.01, 0.006), 4: (0.04, 0., 0.012)}
+    text = ("*NODE\n" + "".join(f"{i + 1}, {x!r}, {y!r}, 0.\n" for i, (x, y) in enumerate(pts)) +
+            "*ELEMENT, TYPE=B31, ELSET=B\n1, 1, 2\n2, 2, 3\n3, 3, 4\n*NSET, NSET=FREE\n1, 2\n"
+            "*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=CIRC\n0.05\n0., 0., 1.\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n2.1e5, 0.3\n*BOUNDARY\n1, 1, 6\n" + ("4, 1, 3\n" if rot else "") +
+            "*NSET, NSET=TR\n3, 4\n" +
+            ("*TRANSFORM, NSET=TR\n1., 0., 0., 0., 1., 0.\n" if twin else
+             "*TRANSFORM, NSET=TR, TYPE=C\n0., 0., 0., 0., 0., 1.\n") + "*STEP\n*STATIC\n*BOUNDARY\n")
+    for n, (r, t, z) in vals.items():
+        x, y = pts[n - 1]
+        g = (r * x - t * y, r * y + t * x, z) if twin else (r, t, z)
+        text += "".join(f"{n}, {d}, {d}, {v:.12g}\n" for d, v in enumerate(g, 4 if rot else 1))
+    return text + "*NODE PRINT, NSET=FREE, GLOBAL=YES\nU\n*END STEP\n"
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
@@ -6647,8 +6671,9 @@ def main():
     # a rotational BC on a transformed knot node in a card the step ramp splits (it was left out),
     # on a shell node ccx makes no knot as one section has OFFSET=0. and the other none (it
     # was written in global components, which ccx read in the local axes), and on an upgraded
-    # beam's midside node (kept in the local axes, where ccx's MPCs clash: 21 % off)
-    for tag, decks, what in (
+    # beam's midside node (kept in the local axes, where ccx's MPCs clash: 21 % off), also on
+    # a curved one (its ends' local values averaged in its own turned axes: 4-8 % off there)
+    for tag, decks, what, *ref in (
             ("ramped_rotation_dynamic", [ramped_rotation_deck("*DYNAMIC", t) for t in (False, True)],
              "a B31 frame's joint with a *TRANSFORM turned about local 1 and 3 by BCs without "
              "AMPLITUDE in two *DYNAMIC steps"),
@@ -6659,16 +6684,21 @@ def main():
              "turned about local 1"),
             ("midside_rotation", [midside_rotation_deck(t) for t in (False, True)],
              "a CIRC B31 cantilever's last element written as a 3-node beam, its ends with a "
-             "*TRANSFORM turned about local 1 and 2, its midside node too")):
+             "*TRANSFORM turned about local 1 and 2, its midside node too"),
+            *((f"midside_curved{'_rotation' if rot else ''}",
+               [curved_midside_deck(rot, t) for t in (False, True)],
+               f"a CIRC B31 quarter ring written as 3-node beams, its last element's ends with a "
+               f"cylindrical *TRANSFORM {'turned about' if rot else 'moved along'} all three local "
+               f"axes, its midside node too", "with an identity *TRANSFORM") for rot in (False, True))):
         runs = [review_run(text, tag + ("" if k == 0 else "_ref"), dat_node_blocks)
                 for k, text in enumerate(decks)]
         ok = all(runs)
         if ok:
             err, moved = same(runs)
             ok = err < 1e-9 * moved and moved > 1e-3
-            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): every displacement table as without "
-                  f"the *TRANSFORM, the BCs on the global DOFs ({err:.1e} apart, free nodes moved "
-                  f"{moved:.3g})")
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): every displacement table as "
+                  f"{ref[0] if ref else 'without the *TRANSFORM'}, the BCs on the global DOFs "
+                  f"({err:.1e} apart, free nodes moved {moved:.3g})")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

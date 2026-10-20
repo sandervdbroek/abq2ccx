@@ -16968,7 +16968,9 @@ class Converter:
         Abaqus element sees between its nodes.  ``layout`` is ``"boundary"`` (node, first
         DOF[, last DOF[, magnitude]] or a named type), ``"dof"`` (node, DOF, value) or
         ``"field"`` (node, values...).  Appended after the card's own lines, they override
-        what a set gave the new node; a value the card already gives it is not repeated."""
+        what a set gave the new node; a value the card already gives it is not repeated.  A
+        *BOUNDARY on nodes whose *TRANSFORM axes differ (a cylindrical or spherical system
+        along a curved edge) is interpolated in global components (_turned_midside_runs)."""
         if not self._midside and not self._edge_nodes and not self._tied_nodes:
             return []
         recs: Dict[int, Dict[int, object]] = {}
@@ -16997,6 +16999,8 @@ class Converter:
         out: List[str] = []
         kinds: set = set()
         beam_mids = {m for _, _, m in self._midside.values()}
+        turn = layout == "boundary" and b.keyword == "BOUNDARY" and bool(self._transformed)
+        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         for a, c, m, s in self._between() + (self._tied_nodes if layout != "boundary" else []):
             if a not in recs or c not in recs or (only is not None and m not in only):
                 continue
@@ -17009,7 +17013,16 @@ class Converter:
                     kinds.add("beam" if m in beam_mids else "edge")
                 continue
             runs: List[List] = []                # [first DOF, last DOF, value] (value None = blank)
+            frames = [self._mpc_frame(n) for n in (a, c, m)] if turn else []    # None: global
+            turned = bool(frames) and not any(isinstance(f, str) for f in frames) and \
+                any(abs(x - y) > 1e-9 for f in frames[:2] for u, w in zip(f or unit, frames[2] or unit)
+                    for x, y in zip(u, w))
+            if turned:
+                runs, exact = self._turned_midside_runs(ra, rc, rm, s, [f or unit for f in frames])
+                kinds.add("turned" if exact else "turned~")
             for d in sorted(set(ra) & set(rc)):
+                if turned and 1 <= d <= 6:
+                    continue
                 va, vc = ra[d], rc[d]
                 v = None if va is None and vc is None else (1.0 - s) * (va or 0.0) + s * (vc or 0.0)
                 if d in rm and rm[d] == v:
@@ -17027,6 +17040,47 @@ class Converter:
             self._note_midside_lines(b.keyword, kinds)
         return out
 
+    def _turned_midside_runs(self, ra: Dict[int, object], rc: Dict[int, object],
+                             rm: Dict[int, object], s: float,
+                             frames: Sequence[Tuple[Vec, Vec, Vec]]) -> Tuple[List[List], bool]:
+        """The *BOUNDARY runs [first DOF, last DOF, value] on DOFs 1-6 (_midside_records) of a
+        node at ``s`` along the segment between end nodes a and c (their DOF -> value maps
+        ``ra``, ``rc``; the node's own ``rm``) whose local axes ``frames`` (a's, c's, the
+        node's) differ: a cylindrical or spherical *TRANSFORM along a curved edge, or ends in
+        different systems.  The vectors the ends prescribe (translations, rotations) are
+        interpolated in global components and written in the node's own axes — on each local
+        DOF perpendicular to every direction the card leaves free at the ends (exact: what
+        the Abaqus element sees there), and on the other DOFs both ends hold, where the ends'
+        free components add an unknown part (approximate).  Also whether all are exact."""
+        runs: List[List] = []
+        exact = True
+        for g0 in (0, 3):
+            held = [j for j in range(3) if g0 + j + 1 in ra and g0 + j + 1 in rc]
+            if not held:
+                continue
+            given = [x for j in held for x in (ra[g0 + j + 1], rc[g0 + j + 1])]
+            vec: Vec = (0.0, 0.0, 0.0)
+            for j in held:
+                vec = vadd(vec, vadd(vscale(frames[0][j], (1.0 - s) * (ra[g0 + j + 1] or 0.0)),
+                                     vscale(frames[1][j], s * (rc[g0 + j + 1] or 0.0))))
+            free = [f[j] for f in frames[:2] for j in range(3) if j not in held]
+            tiny = 1e-12 * max(abs(x or 0.0) for x in given)
+            for k in range(3):
+                fixed = all(abs(vdot(frames[2][k], f)) <= 1e-9 for f in free)
+                if not fixed and k not in held:
+                    continue
+                exact = exact and fixed
+                v = vdot(vec, frames[2][k])
+                v = None if all(x is None for x in given) else 0.0 if abs(v) <= tiny else v
+                d = g0 + k + 1
+                if d in rm and rm[d] == v:
+                    continue
+                if runs and runs[-1][1] == d - 1 and runs[-1][2] == v:
+                    runs[-1][1] = d
+                else:
+                    runs.append([d, d, v])
+        return runs, exact
+
     def _note_midside_lines(self, keyword: str, kinds: Sequence[str] = ("beam",)) -> None:
         if "beam" in kinds:
             self.report.note(f"*{keyword} lines given for both end nodes of an upgraded 2-node beam "
@@ -17036,6 +17090,20 @@ class Converter:
             self.report.note(f"*{keyword} lines given for both ends of an edge the converter put "
                              f"nodes on (a shell midside node, ply interface nodes) were extended "
                              f"to those nodes (values interpolated linearly).", once=True)
+        if "turned" in kinds or "turned~" in kinds:
+            self.report.note("*BOUNDARY lines on both ends of an edge the converter put a node on, "
+                             "where the node's *TRANSFORM axes differ from theirs (a cylindrical or "
+                             "spherical system along a curved edge): the prescribed vectors were "
+                             "interpolated in global components and written in the node's own "
+                             "axes.", once=True)
+        if "turned~" in kinds:
+            self.report.warn("*BOUNDARY lines on both ends of a curved edge the converter put a node "
+                             "on hold only some of their local DOFs: where the ends' free directions "
+                             "reach a local DOF of the node, it gets the interpolated prescribed part "
+                             "alone, without what the free components add there in Abaqus "
+                             "(approximate) — verify.", once=True)
+            self._reduces("BC of a node the converter added on a curved edge approximated "
+                          "(some local DOFs of its ends left free)")
 
     # Cards that read a node set node by node — as state, as an output selection, or as the
     # members of a constraint that must stay complete (couplings, rigid bodies, the nodes of a

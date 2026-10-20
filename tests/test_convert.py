@@ -8281,6 +8281,54 @@ def test_transformed_rotations_on_an_upgraded_beams_midside_node():
     assert _close(mid, {4 + k: 0.01 * (e[0][k] + e[1][k]) for k in range(2)}, 1e-10)
 
 
+def test_midside_node_bcs_on_a_curved_transformed_edge():
+    # a cylindrical (or spherical) *TRANSFORM turns the midside node's axes from its ends':
+    # the vectors the ends prescribe are interpolated in global components and written in the
+    # node's own axes (before: their local values averaged; probed: 4-8 % off, now exact)
+    c = math.sqrt(0.5)
+    arc = _transformed(CIRC_BEAM.replace("1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.",
+                                         f"1, 1., 0., 0.\n2, {c!r}, {c!r}, 0.\n3, 0., 1., 0.") +
+                       "*Boundary\n1, 1, 6\n*Step\n*Static\n*Boundary\n2, 1, 1, 0.01\n2, 2, 2, 0.005\n"
+                       "2, 3, 3, 0.003\n3, 1, 1, 0.02\n3, 2, 2\n3, 3, 3, 0.006\n*End Step\n", "2, 3",
+                       "0., 0., 0., 0., 0., 1.", "C")
+
+    def axes(t):
+        return (math.cos(t), math.sin(t), 0.), (-math.sin(t), math.cos(t), 0.), (0., 0., 1.)
+    ends, em = (axes(math.pi / 4), axes(math.pi / 2)), axes(3 * math.pi / 8)   # nodes 2, 3; 5
+
+    def on_mid(v2, v3):
+        """The local vectors v2 (node 2), v3 (node 3) interpolated, in node 5's axes."""
+        g = [0.5 * sum(v[j] * e[j][k] for v, e in zip((v2, v3), ends) for j in range(3)) for k in range(3)]
+        return [sum(g[i] * em[k][i] for i in range(3)) for k in range(3)]
+
+    def mid(body):
+        return {int(f[1]): float(f[3]) if len(f) > 3 else 0.0
+                for f in (l.split(",") for l in _bc_lines(body)) if f[0] == "5"}
+    body, conv, rep = convert_str(arc)
+    assert conv._midside[2] == (2, 3, 5)
+    w = on_mid((0.01, 0.005, 0.003), (0.02, 0., 0.006))
+    assert _close(mid(body), {k + 1: w[k] for k in range(3)}, 1e-11) and abs(w[1]) > 1e-3
+    assert "interpolated in global components" in rep.text() and "hold only some" not in rep.text()
+    assert not any("curved edge" in r for r in conv.reduced_physics)
+    # the axial DOF alone: the free radial and tangential directions do not reach it (exact)
+    body, conv, rep = convert_str(arc.replace("2, 1, 1, 0.01\n2, 2, 2, 0.005\n", "").replace(
+        "3, 1, 1, 0.02\n3, 2, 2\n", ""))
+    assert mid(body) == {3: 0.0045} and "hold only some" not in rep.text()
+    # the radial DOF alone: the free tangential ones add to it in Abaqus (approximate, warned)
+    body, conv, rep = convert_str(arc.replace("2, 2, 2, 0.005\n2, 3, 3, 0.003\n", "").replace(
+        "3, 2, 2\n3, 3, 3, 0.006\n", ""))
+    assert _close(mid(body), {1: 0.015 * math.cos(math.pi / 8)}, 1e-11)
+    assert "hold only some" in rep.text() and any("curved edge" in r for r in conv.reduced_physics)
+    # rotations: the planner's global form (knots) takes the interpolated global vector
+    body, conv, rep = convert_str(arc.replace("*Boundary\n2, 1, 1, 0.01\n2, 2, 2, 0.005\n2, 3, 3, 0.003\n"
+                                              "3, 1, 1, 0.02\n3, 2, 2\n3, 3, 3, 0.006\n",
+                                              "*Boundary\n2, 4, 6, 0.01\n3, 4, 4, 0.02\n3, 5, 6\n"))
+    assert conv._rot_mode == {2: "global", 3: "global", 5: "global"}
+    g = [0.5 * sum(v[j] * e[j][k] for v, e in zip(((0.01,) * 3, (0.02, 0., 0.)), ends) for j in range(3))
+         for k in range(3)]
+    assert _close(mid(body), {4 + k: g[k] for k in range(3)}, 1e-11)
+
+
 def test_transformed_shell_node_rotations():
     # a shell node that is no knot: ccx's mean-rotation MPCs in the local axes are exact for
     # its BCs (two at most) and one or two moment components (probed): kept

@@ -95,6 +95,11 @@ physics.
   shell edge (S4 → S8R) takes its end nodes' BCs. Its rotations stayed in local components
   where the end nodes' took the global form, which ccx got wrong (21-37 % off). The midside
   node is now converted as its end nodes are.
+* **New midside nodes on curved edges under a cylindrical or spherical `*TRANSFORM`** — the
+  midside node took the average of its end nodes' local BC values, but its local axes differ
+  from theirs (4-8 % off at the node). The prescribed vectors are now averaged in global
+  components and written in the node's own axes. Where the ends hold only some local DOFs
+  and their free directions reach the node's, no exact form exists: warned, reduced physics.
 * **Rotational BCs on `*TRANSFORM` nodes in ramped steps** — where Abaqus ramps a displacement
   BC without AMPLITUDE and ccx would step it (implicit `*DYNAMIC`, `*VISCO`, transient coupled
   steps, `*STEP, AMPLITUDE=STEP`), a rotational BC on a transformed knot or kinematic reference
