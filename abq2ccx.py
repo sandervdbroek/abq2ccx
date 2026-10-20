@@ -16551,6 +16551,8 @@ class Converter:
             return
         own = self._rot_nodes - set(self._rb_rot)
         turned: set = set()
+        # (its own *STEP count, not the step model's cards: a card counts in the step of the
+        # last *STEP before it, so what follows the last step counts in that step)
         step = 0
         for b in blocks:
             if b.keyword == "STEP":
@@ -21008,9 +21010,7 @@ class Converter:
         if not self._mechanical:
             return
         done: set = set()
-        for b in blocks:
-            if b.keyword == "STEP":                 # (model data)
-                break
+        for b in model_data(blocks):
             if b.keyword != "PRE-TENSION SECTION" or (b.param("SURFACE") or "").strip():
                 continue
             elems = dedup(self._resolve_elements((b.param("ELEMENT") or "").strip()))
@@ -29390,7 +29390,7 @@ class Converter:
         self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
                                   and temperature_dependent(b) for b in blocks)
         self._expansion = any(b.keyword == "EXPANSION" for b in blocks)
-        model = itertools.takewhile(lambda b: b.keyword != "STEP", blocks)
+        model = model_data(blocks)
         self._model_stressed = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") not in
                                   ("TEMPERATURE", "FIELD") for b in blocks) or \
             any(desc for b in model if b.keyword == "BOUNDARY"
@@ -29422,7 +29422,9 @@ class Converter:
         # in steps where temperature is a DOF and with USER are commented out
         self._temp_ic_default = False
         if not any_temp_ic and self.geom.nodes:
-            steps = step_groups(blocks)[1]
+            # (a step with temperature DOFs: any procedure card of it in TEMPERATURE_DOF_PROCS,
+            # where Step.temp_dof reads its procedure card; they differ in a step with two)
+            steps = [step.cards for step in self.steps]
             temps = [b for s in steps if not any(x.keyword in TEMPERATURE_DOF_PROCS for x in s)
                      for b in s if b.keyword == "TEMPERATURE" and not b.has("USER")]
             # temperatures ccx cannot take from the deck: with them the default would turn
