@@ -25410,9 +25410,9 @@ class Converter:
                     for k in (1, 2, 3) if k not in used and (ref, k + 3) not in terms]
             held: Optional[set] = None              # (the deck's own BCs on them in every step)
             keys = set(free)
-            for active in bc_steps(blocks, lambda b: [((n, d), 0) for ns, ds, _ in self._bc_records(b)
-                                                      for n in ns for d in ds if (n, d) in keys],
-                                   self._pert_idx, self.steps.lc2):
+            for active in self.steps.states(lambda b: [((n, d), 0) for ns, ds, _ in self._bc_records(b)
+                                                       for n in ns for d in ds if (n, d) in keys],
+                                            restore=self._pert_idx, skip=self.steps.lc2, blocks=blocks):
                 held = set(active) if held is None else held & set(active)
             lines = [f"{n}, {d}, {d}" for n, d in free if (n, d) not in (held or set())]
             if lines:
@@ -25608,9 +25608,9 @@ class Converter:
         keys = {(ref, d) for d in (4, 5, 6)}
         always: Optional[set] = None
         some: set = set()
-        for active in bc_steps(blocks, lambda b: [((n, d), 0) for ns, ds, _ in self._bc_records(b)
-                                                  for n in ns for d in ds if (n, d) in keys],
-                               self._pert_idx, self.steps.lc2):
+        for active in self.steps.states(lambda b: [((n, d), 0) for ns, ds, _ in self._bc_records(b)
+                                                   for n in ns for d in ds if (n, d) in keys],
+                                        restore=self._pert_idx, skip=self.steps.lc2, blocks=blocks):
             always = set(active) if always is None else always & set(active)
             some |= set(active)
         always = always or set()
@@ -30249,9 +30249,9 @@ class Converter:
         keys = {(ref, d) for d in (4, 5, 6)}
         held: Optional[set] = None
         turned = False
-        for active in bc_steps(blocks, lambda c: [((n, d), v) for ns, ds, v in self._bc_records(c)
-                                                  for n in ns for d in ds if (n, d) in keys],
-                               self._pert_idx, self.steps.lc2):
+        for active in self.steps.states(lambda c: [((n, d), v) for ns, ds, v in self._bc_records(c)
+                                                   for n in ns for d in ds if (n, d) in keys],
+                                        restore=self._pert_idx, skip=self.steps.lc2, blocks=blocks):
             zero = {k for k, v in active.items() if v == 0.0}
             turned = turned or len(zero) < len(active)
             held = zero if held is None else held & zero
