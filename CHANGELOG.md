@@ -119,6 +119,8 @@ physics.
   `*DISTRIBUTING`. ccx's card dropped the moments and the reference node's offset; the result
   now matches Abaqus' Verification Guide to 3 digits. A distributing coupling on membrane faces
   is written as equations too. ccx's card was 20 % off there, or transmitted nothing on M3D3.
+  On plane-element edges, the weights now take each section's thickness. They had taken 1 for
+  every edge: 39 % off with sections of thickness 1 and 3.
 * **More `*EQUATION`s held by BCs in some steps** — two more cases no longer stop ccx 2.23
   ('dependent side of a MPC and a SPC'). In the first, each step holds one DOF of the equation
   ("crossed" holds); the BC at zero moves onto the DOF that step leaves free. In the second,

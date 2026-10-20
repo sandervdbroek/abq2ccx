@@ -20620,6 +20620,7 @@ class Converter:
         self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
         self._reset_emission()                  # (handle_step advances the step cursor)
         self._plan_node_classes(blocks)         # after the mesh planners: the final element types
+        self._plan_section_thick(blocks)        # before _plan_rot_nodes: its distributing weights
         self._transformed = self._transform_defs(blocks)
         self._plan_connectors(blocks)           # before _plan_mpcs: rigid ones join its bodies
         self._plan_mpcs(blocks)
@@ -26011,11 +26012,29 @@ class Converter:
         if self._temp_ic_fill or self._temp_ic_default:
             self.geom.nsets.setdefault(ALL_NODES_SET, list(self.geom.nodes))
 
+    def _plan_section_thick(self, blocks: List[Block]) -> None:
+        """The plane elements' section thicknesses (a *SOLID SECTION's first data line; 1 where
+        it is blank), by element: loads as nodal forces need them, and so do the weights of a
+        distributing coupling on plane-element edges (_facet_areas), planned in _plan_rot_nodes
+        — so after the mesh planners (the final element sets) and before that."""
+        self._section_thick = {}
+        for b in blocks:
+            if b.keyword != "SOLID SECTION":
+                continue
+            recs = [[x.strip() for x in r] for r in merged_data_records(b)]
+            try:
+                t = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 1.0
+            except ValueError:
+                t = 1.0
+            for e in self.geom.elset(b.param("ELSET") or ""):
+                self._section_thick[e] = t
+
     def _plan_load_facts(self, blocks: List[Block]) -> None:
-        """What loads as nodal forces need: section thicknesses, beam n1, the deck's *CLOAD DOFs."""
-        # distributed loads that become nodal forces need the plane-section thickness, the
-        # beams' n1 directions and the DOFs the deck's own *CLOADs act on
-        self._section_thick, self._beam_n1, self._deck_cloads = {}, {}, {}
+        """What loads as nodal forces need: beam n1, the deck's *CLOAD DOFs (the plane-section
+        thicknesses: _plan_section_thick)."""
+        # distributed loads that become nodal forces need the beams' n1 directions and the
+        # DOFs the deck's own *CLOADs act on
+        self._beam_n1, self._deck_cloads = {}, {}
         self._has_normal = any(b.keyword == "NORMAL" for b in blocks)
         # Abaqus models are 2-D or 3-D throughout: 2-D beams make every beam planar
         self._planar_beams = any(t.upper().startswith(("B21", "B22", "B23", "PIPE21", "PIPE22"))
@@ -26031,14 +26050,7 @@ class Converter:
                     (b.uparam("TEMPERATURE") or "GRADIENT") != "GRADIENT") or \
                     (b.keyword == "BEAM SECTION" and b.uparam("TEMPERATURE") == "VALUES"):
                 self._point_temps.update(self.geom.elset(b.param("ELSET") or ""))
-            if b.keyword == "SOLID SECTION":
-                try:
-                    t = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 1.0
-                except ValueError:
-                    t = 1.0
-                for e in self.geom.elset(b.param("ELSET") or ""):
-                    self._section_thick[e] = t
-            elif b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION"):
+            if b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION"):
                 # the approximate n1 direction, a data line of its own (beam_n1_line), (0, 0, -1)
                 # when it is left blank
                 n1: Optional[Vec] = None

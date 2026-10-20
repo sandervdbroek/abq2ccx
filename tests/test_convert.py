@@ -10792,6 +10792,27 @@ def test_distributing_coupling_in_a_plane_model():
     assert sorted({n for n, _, _ in rows[0][1:]}) == [4, 5, 6]
 
 
+
+def test_distributing_weights_on_plane_edges_take_the_section_thickness():
+    # a plane element edge's tributary area is its length times the section thickness: the
+    # weights were planned (in _plan_rot_nodes) before the thicknesses were read, so every edge
+    # counted as thickness 1 (probed: 39 % off with sections of thickness 1 and 3).  The node at
+    # the weighted centroid: u_R,x = sum w_n u_n,x, w = 0.5, 1, 2, 3, 1.5 over 8
+    nodes = "".join(f"{1 + i + 5 * j}, {float(i)}, {float(j)}\n" for j in range(3) for i in range(5))
+    els = "".join(f"{1 + i + 4 * j}, {1 + i + 5 * j}, {2 + i + 5 * j}, {7 + i + 5 * j}, {6 + i + 5 * j}\n"
+                  for j in range(2) for i in range(4))
+    deck = ("*Node\n" + nodes + "100, 2.5, 2.\n*Element, type=CPS4, elset=EALL\n" + els +
+            "*Elset, elset=THIN\n1, 2, 5, 6\n*Elset, elset=THICK\n3, 4, 7, 8\n*Elset, elset=ETOP\n5, 6, 7, 8\n"
+            "*Surface, name=TOP\nETOP, S3\n*Coupling, constraint name=C, ref node=100, surface=TOP\n*Distributing\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=THIN, material=M\n1.\n"
+            "*Solid Section, elset=THICK, material=M\n3.\n*Boundary\n1, 1, 2\n2, 1, 2\n3, 1, 2\n4, 1, 2\n5, 1, 2\n"
+            "*Step\n*Static\n*Cload\n100, 1, 1.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    row = [r for r in _equation_terms(body) if r[0][:2] == (100, 1)][0]
+    got = {n: c for n, d, c in row[1:] if d == 1}
+    assert all(abs(got[n] + w / 8.0) < 1e-12 for n, w in zip(range(11, 16), (0.5, 1.0, 2.0, 3.0, 1.5)))
+
+
 def test_truss_below_beams_at_a_node_ends_at_a_copy():
     # ccx 2.23 gives a node its lowest-numbered beam / truss element's expansion: a truss
     # numbered below the beams at a node left it without rotations (the beams' rotation held

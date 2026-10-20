@@ -716,6 +716,23 @@ def shell_truss_deck(typ="S4", plane="xy", d=(0.0, -0.5, -1.0), first=True, spri
                      + ["*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
 
 
+
+def plane_two_thickness_deck(coupling, loads):
+    """A 4 x 2 strip of unit CPS4 (E 1000, nu 0.3) held along y = 0, its left half of thickness 1
+    and its right half 3, with the ``coupling`` cards on its top edges (surface TOP; node set RP:
+    node 100 at (1.3, 3.5)) and the step's ``loads``; every node's displacement printed."""
+    nid = lambda i, j: 1 + i + 5 * j                                             # noqa: E731
+    els = {1 + i + 4 * j: [nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)] for j in range(2) for i in range(4)}
+    return "\n".join(["*NODE, NSET=NALL"] + [f"{nid(i, j)}, {float(i)}, {float(j)}" for j in range(3) for i in range(5)]
+                     + ["*NODE, NSET=RP", "100, 1.3, 3.5", "*ELEMENT, TYPE=CPS4, ELSET=EALL"]
+                     + [f"{e}, " + ", ".join(map(str, c)) for e, c in els.items()]
+                     + ["*ELSET, ELSET=THIN", "1, 2, 5, 6", "*ELSET, ELSET=THICK", "3, 4, 7, 8", "*ELSET, ELSET=ETOP",
+                        "5, 6, 7, 8", "*SURFACE, NAME=TOP", "ETOP, S3"] + list(coupling)
+                     + ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*SOLID SECTION, ELSET=THIN, MATERIAL=M", "1.",
+                        "*SOLID SECTION, ELSET=THICK, MATERIAL=M", "3.", "*BOUNDARY"]
+                     + [f"{nid(i, 0)}, 1, 2" for i in range(5)] + ["*STEP", "*STATIC"] + list(loads)
+                     + ["*NODE PRINT, NSET=NALL", "U", "*NODE PRINT, NSET=RP", "U", "*END STEP"]) + "\n"
+
 # Abaqus 2017 Verification Guide, "Distributing coupling elements", linear DCOUP3D (exdc3lx1):
 # Tables 1-3 (reference node 10's displacements and rotations, coupling node 1's displacements)
 # per step, F = 1 and M = 2 on node 10: x and about z, y and about x, z and about y
@@ -7373,6 +7390,40 @@ def main():
           f"node 1's within {worst:.1e} of Abaqus' tables (3 digits); node 10 {exact:.1e} from the coupling "
           f"nodes' weighted motion ({'; '.join(shown)})")
     failures += 0 if ok else 1
+    # --- *COUPLING + *DISTRIBUTING on plane-element edges of two section thicknesses: the weights
+    # are the edges' tributary lengths times the thickness (planned before the thicknesses were
+    # read, they took 1 for both: 39 % off), vs the force and moment as Abaqus' nodal forces
+    # (in the plane: one rotation, T = sum w r . r; the edge nodes lie on a line)
+    xy2 = {1 + i + 5 * j: (float(i), float(j)) for j in range(3) for i in range(5)}
+    w2 = {n: v / 8.0 for n, v in {11: 0.5, 12: 1.0, 13: 2.0, 14: 3.0, 15: 1.5}.items()}
+    c2 = [sum(w2[n] * xy2[n][k] for n in w2) for k in (0, 1)]
+    r2 = {n: (xy2[n][0] - c2[0], xy2[n][1] - c2[1]) for n in w2}
+    rr2, t2 = (1.3 - c2[0], 3.5 - c2[1]), sum(w2[n] * (r2[n][0] ** 2 + r2[n][1] ** 2) for n in w2)
+    f2, m2 = (0.3, -0.2), 0.4
+    om2 = (m2 + rr2[0] * f2[1] - rr2[1] * f2[0]) / t2
+    spread2 = {n: (w2[n] * (f2[0] - om2 * r2[n][1]), w2[n] * (f2[1] + om2 * r2[n][0])) for n in w2}
+
+    def motion2(u):
+        th = sum(w2[n] * (r2[n][0] * u[n][1] - r2[n][1] * u[n][0]) for n in w2) / t2
+        return [sum(w2[n] * u[n][0] for n in w2) - th * rr2[1], sum(w2[n] * u[n][1] for n in w2) + th * rr2[0]]
+    got, status, out = dist_run("distributing_plane_two_thicknesses", plane_two_thickness_deck(
+        cpl, ["*CLOAD", f"RP, 1, {f2[0]}", f"RP, 2, {f2[1]}", f"RP, 6, {m2}"]))
+    ref, _, _ = dist_run("distributing_plane_two_thicknesses_ref", plane_two_thickness_deck((), ["*CLOAD"] + [
+        f"{n}, {k + 1}, {fn[k]:.12g}" for n, fn in spread2.items() for k in (0, 1)]))
+    if not all(n in got for n in list(xy2) + [100]) or not all(n in ref for n in xy2):
+        print(f"FAIL  distributing_plane_two_thicknesses: no solution ({status})")
+        failures += 1
+    else:
+        big = max(abs(x) for n in xy2 for x in ref[n][:2])
+        ur = motion2(ref)
+        err = ccx_ratio(max(max(abs(a - b) for n in xy2 for a, b in zip(got[n][:2], ref[n][:2])),
+                            max(abs(a - b) for a, b in zip(got[100][:2], ur))), big)
+        ok = err < 1e-5 and big > 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  distributing_plane_two_thicknesses (a CPS4 strip of thickness 1 and 3, "
+              f"its top edges distributing-coupled, a force and a moment on the node): every node {err:.1e} of max "
+              f"|u| ({big:.3g}) from Abaqus' nodal forces with edge length x thickness weights, the node's "
+              f"displacement included (thickness 1 for both: 39 % off)")
+        failures += 0 if ok else 1
     # --- *COUPLING + *DISTRIBUTING on an M3D4 / M3D3 skin on the block's top: equations on the
     # membrane nodes (ccx's card spread the load over the faces its hinge holds: 20 % off on M3D4,
     # nothing on M3D3), vs Abaqus' distribution of the force and moment as nodal forces
