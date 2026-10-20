@@ -594,7 +594,7 @@ def test_step_model_planner_facts():
     # the NLGEOM in force in Abaqus (not by a perturbation step's own; an explicit step's
     # without NLGEOM=NO) and the steps before it, the NLGEOM ccx runs by the *STEP cards
     # handle_step writes (the static perturbation step carries it on, a frequency step does
-    # not); each step's procedure, card by card (damage criteria)
+    # not); each step's procedure (damage criteria)
     blocks, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM, INC=5\n*STATIC, RIKS\n*END STEP""")
@@ -602,12 +602,13 @@ def test_step_model_planner_facts():
     assert [s.ccx_nlgeom for s in m] == [False, False, True, True, True]
     assert [s.star_proc for s in m] == ["DYNAMIC", "FREQUENCY", "DYNAMIC", "PERTURBATION",
                                         "STATIC, RIKS"]
-    # card by card: a procedure between steps counts for the step before it; a perturbation
-    # step's NLGEOM switches nothing on
+    # a procedure card between steps is no step's (Abaqus rejects it, emit_other comments it
+    # out; it counted for the step before it); a perturbation step's NLGEOM switches nothing on
     blocks, m = _step_model("*STEP\n*END STEP\n*STATIC\n*STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n"
-                            "*STEP, NLGEOM\n*STATIC\n*END STEP")
-    assert [s.star_proc for s in m] == ["STATIC", "FREQUENCY", "STATIC"]
+                            "*DYNAMIC, EXPLICIT\n, 1e-4\n*STEP, NLGEOM\n*STATIC\n*END STEP")
+    assert [s.star_proc for s in m] == ["", "FREQUENCY", "STATIC"]
     assert m.nl_before == 2
+    assert m.procs == {"FREQUENCY", "STATIC"} and not m.explicit and not m.dynamic
     assert [(s.proc, s.nlgeom, s.ccx_nlgeom) for s in m] == [
         ("", False, False), ("FREQUENCY", False, False), ("STATIC", True, True)]
 
@@ -13612,6 +13613,12 @@ def test_cards_between_steps_act_in_the_next_one():
     assert "** abq2ccx: *FREQUENCY is step (history) data but appears between steps" in body
     assert "** abq2ccx: *CLOAD is step (history) data but appears after the last step" in body
     assert "*BOUNDARY, *CLOAD between steps 1 and 2: moved into step 2" in rep.text()
+    # it is no step's procedure: an explicit one between two static steps makes no explicit deck
+    # (it did: INC=10000000 and NLGEOM on the step before were not written, but the deck-wide
+    # facts, e.g. the hourglass control of reduced elements, were the explicit ones)
+    body, conv, _ = convert_str(deck.replace("*Frequency\n2\n", "*Dynamic, explicit\n, 0.001\n"))
+    assert "** *DYNAMIC, EXPLICIT" in body and not conv._explicit_deck and not conv._dynamic_deck
+    assert [s.star_proc for s in conv.steps] == ["STATIC", "STATIC"]
 
 
 def test_step_procedure_ends_with_its_step():

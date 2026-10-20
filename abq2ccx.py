@@ -4651,10 +4651,9 @@ class Step:
                                   # and the procedures of PERTURBATION_PROCS are linear there (a static
                                   # perturbation step is a general one in ccx)
     temp_dof: Optional[str]       # the procedure, where it is in TEMPERATURE_DOF_PROCS (handle_step's)
-    star_proc: str                # read card by card (_plan_material_cards): "PERTURBATION" with
-                                  # *STEP, PERTURBATION, else the first PROC_KW card after its *STEP
-                                  # card (with ", RIKS"; a card between steps counts for the step
-                                  # before it), "" if none
+    star_proc: str                # (_plan_material_cards) "PERTURBATION" with *STEP, PERTURBATION,
+                                  # else proc (with ", RIKS"), "" if none.  A procedure card between
+                                  # steps is no step's: Abaqus rejects it, emit_other comments it out
     # a general step is one that is no linear perturbation step (Abaqus: "all other procedures
     # can be used only in general analysis steps"; the base state is the last one's end): handle_step
     # and _plan_base_restore.  (_plan_modal_starts asks ccx's question instead: which steps leave
@@ -4799,15 +4798,6 @@ class StepModel:
         flag = False                            # ccx's NLGEOM switch as a step starts (Step.ccx_nlgeom)
         seen = False                            # Step.general_before
         t = 0.0                                 # Step.t_start
-        # card by card: each *STEP card's procedure (Step.star_proc)
-        star_proc: Dict[int, str] = {}
-        last: Optional[Block] = None
-        for b in blocks:
-            if b.keyword == "STEP":
-                last = b
-                star_proc[id(b)] = "PERTURBATION" if b.has("PERTURBATION") else ""
-            elif last is not None and b.keyword in PROC_KW and not star_proc[id(last)]:
-                star_proc[id(last)] = f"{b.keyword}, RIKS" if b.has("RIKS") else b.keyword
         for is_step, cards in deck_parts(blocks):
             if not is_step:
                 if steps:
@@ -4852,7 +4842,8 @@ class StepModel:
                 pert_param=pert_param, perturbation=pert, nlgeom_card=given, nlgeom=nlgeom,
                 nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
                 temp_dof=kw if kw in TEMPERATURE_DOF_PROCS else None,
-                star_proc=star_proc[id(head)],
+                star_proc="PERTURBATION" if pert_param else
+                proc + (", RIKS" if proc_card.has("RIKS") else "") if proc else "",
                 general_before=seen,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
