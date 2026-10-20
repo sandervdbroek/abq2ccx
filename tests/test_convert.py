@@ -2969,6 +2969,39 @@ def test_initial_solution_continuation_lines():
     assert "8, 1, 9., 10." not in body                                  # no phantom record
 
 
+def test_blank_fields_read_as_zero_by_position():
+    # Abaqus reads a blank field as 0; dropping it moved the later fields up
+    eng = ("*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 10., 0.3, 0.3, 0.3, "
+           "5., 5.,\n5.\n*Solid Section, elset=EALL, material=M, orientation=O\n")
+    for line, system, want in (
+            ("2., , 1., 1., 1., 1., 1., , 1.", "", "1, 0, 0, 0, 1, 0"),       # origin c = (1, 0, 1)
+            ("0., 1., , -1., 0., 0.", "", "0., 1., 0., -1., 0., 0."),           # ccx exited 255
+            (", 1., 0., -1., 0., 0., 0., 0., 0.", "", "0., 1., 0., -1., 0., 0."),
+            ("1., 0., 0., 0., 1.,", "", "1., 0., 0., 0., 1., 0."),              # b3 blank
+            (", , 0., 0., 0., 1.", ", system=cylindrical", "0., 0., 0., 0., 0., 1.")):
+        body, conv, _ = convert_str(HEX + f"*Orientation, name=O{system}\n{line}\n" + eng)
+        head = "*ORIENTATION, NAME=O" + (", SYSTEM=cylindrical" if system else "")
+        assert f"{head}\n{want}\n" in body and "O" in conv._orient_axes, line
+    # no b at all leaves no axes
+    _, conv, _ = convert_str(HEX + "*Orientation, name=O\n1., 0., 0.\n" + eng)
+    assert "O" not in conv._orient_axes
+    # *TRANSFORM: a blank is 0 there too (it was "unreadable": the moment acted about global x)
+    got = []
+    for data in ("0., 1., 0., -1., 0., 0.5", "0., 1., , -1., 0., 0.5"):
+        body, conv, rep = convert_str(_tip("*Cload\n3, 4, 1.\n", data))
+        got.append((conv._transformed[3], body.split("*STEP")[1], rep.n_warnings))
+    assert got[0] == got[1] and got[1][2] == 0
+    # initial stresses, plastic strains and solution variables: szz = 50, not syy
+    deck = HEX + ("*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
+                  "*Initial Conditions, type={}\n1, 100., , 50.\n")
+    for typ in ("stress", "plastic strain"):
+        body, _, _ = convert_str(deck.format(typ))
+        assert "\n1, 1, 100., 0., 50.\n" in body and "1, 1, 100., 50." not in body, typ
+    body, _, _ = convert_str(HEX + "*Material,name=M2\n*Depvar\n10,\n*Initial Conditions, type=solution\n"
+                             "EALL, 1., , 3., 4., 5., 6., 7.\n8., , 10.\n")
+    assert "1, 1, 1., 0., 3., 4., 5., 6., 7., 8., 0., 10." in body
+
+
 def test_keyword_continuation_with_bare_flag():
     body, _, _ = convert_str(HEX + "*Step, name=S1,\nnlgeom\n*Static\n*End Step\n")
     assert "*STEP, NLGEOM" in body
@@ -3931,6 +3964,17 @@ def test_initial_temperature_defaults_uncovered_nodes_to_zero():
     body, _, _ = convert_str(HEX + "*Initial Conditions, type=temperature\nEALL_NODES, 20.\n"
                              .replace("EALL_NODES", "1") + "".join(f"{n}, 20.\n" for n in range(2, 9)))
     assert "ABQ2CCX_ALL_NODES" not in body                           # every node covered
+
+
+def test_initial_temperatures_on_several_cards_fill_once():
+    # CAE writes one card per predefined field: ccx takes a node's last value, so the fill of
+    # the nodes no card lists goes on the first card only (on a later one it set TOP back to 0)
+    body, _, _ = convert_str(HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Nset, nset=SOME\n1, 2\n"
+                             "*Initial Conditions, type=temperature\nTOP, 100.\n"
+                             "*Initial Conditions, type=temperature\nSOME, 50.\n")
+    assert body.count("ABQ2CCX_ALL_NODES, 0.") == 1
+    assert "TYPE=temperature\nABQ2CCX_ALL_NODES, 0.\nTOP, 100.\n*INITIAL CONDITIONS, " \
+           "TYPE=temperature\nSOME, 50." in body
 
 
 HOT_CUBE = HEX + "*Solid Section, elset=EALL, material=M\n,\n*Material, name=M\n*Elastic\n" \
@@ -5978,7 +6022,8 @@ def test_nodal_forces_on_unusable_transforms_are_refused():
             ("C", "0., 0., 0., 0., 0., 3.", "node 5 lies on the axis of its cylindrical *TRANSFORM"),
             ("S", "0., 0., 0., 0., 0., 3.", "node 5 lies on the polar axis of its spherical *TRANSFORM"),
             ("S", "1., 1., 1., 1., 1., 1.", "the spherical *TRANSFORM of node 5 is degenerate"),
-            ("R", "0., 1., 0.", "node 5 has a *TRANSFORM whose data line cannot be read")):
+            ("R", "0., 1., 0.", "the rectangular *TRANSFORM of node 5 is degenerate"),   # b blank: 0
+            ("R", "0., 1., 0., x, 0., 0.", "node 5 has a *TRANSFORM whose data line cannot be read")):
         body, conv, rep = convert_str(_transformed(TRVEC_TOP, "5, 6, 7, 8", data, typ))
         assert _cloads(body) == [{}] and conv.unloaded_steps == [1], (typ, data)
         assert f"*DSLOAD TRVEC on 'TOP' not converted: {why}" in rep.text(), (typ, data)
@@ -10190,6 +10235,47 @@ def test_orientation_without_axes_is_not_given_made_up_directions():
                                   "*Shell Section, elset=PLATE, composite, orientation=O\n" + LAYUP)
     assert "has no axes the converter can form" in rep.text()
     assert any("ply orientation O without axes" in r for r in conv.reduced_physics)
+
+
+S8R_PLATE = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0.5, 0., 0.\n"
+             "6, 1., 0.5, 0.\n7, 0.5, 1., 0.\n8, 0., 0.5, 0.\n*Element, type=S8R, elset=PLATE\n"
+             "1, 1, 2, 3, 4, 5, 6, 7, 8\n" + COMPOSITE_MAT)
+
+
+def test_ply_angle_with_a_fortran_exponent():
+    # 4.5D1 is 45 degrees (float() failed on it, and the field became an orientation name ccx
+    # rejected); INF and NAN are orientation names, not angles
+    deck = S8R_PLATE + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n0.1, 3, CFRP, {}\n"
+    body, _, _ = convert_str(deck.format("4.5D1"))
+    assert body == convert_str(deck.format("45."))[0] and "0.1, , CFRP, ABQ2CCX_OR1" in body
+    # names INF and NAN (read as angles, INF crashed the converter, NAN gave nan axes)
+    deck = S8R_PLATE + "*Orientation, name={0}\n0., 1., 0., -1., 0., 0.\n*Shell Section, " \
+        "elset=PLATE, composite\n0.1, 3, CFRP, 30.\n0.1, 3, CFRP, {0}\n"
+    for name in ("INF", "NAN"):
+        assert convert_str(deck.format(name))[0].replace(name, "OX") == convert_str(deck.format("OX"))[0]
+
+
+def test_plies_on_an_orientation_without_axes_are_not_turned():
+    # Abaqus turns a ply from its section's orientation: one from each element's nodes, on
+    # undefined nodes or without b has no axes here, so the plies are not turned from made-up
+    # ones (they were, from the global axes, and ccx ran); warned, as for connectors
+    sec = "*Shell Section, elset=PLATE, composite, orientation=O\n0.1, 3, CFRP, 30.\n0.1, 3, CFRP, 45.\n"
+    for ori in ("*Orientation, name=O, definition=OFFSET TO NODES\n1, 2\n",
+                "*Orientation, name=O, definition=NODES\n50, 60\n", "*Orientation, name=O\n1., 0., 0.\n"):
+        body, conv, rep = convert_str(S8R_PLATE + ori + sec)
+        assert "ABQ2CCX_OR" not in body and body.splitlines().count("0.1, , CFRP, O") == 2, ori
+        assert "they name it without their angles" in rep.text()
+        assert "ply angles on orientation O without axes" in conv.reduced_physics
+    # the card itself, commented out: a warning where a card that names it stops ccx, plain
+    # sections too (only a NOTE before), a note where none does
+    solid = HEX + COMPOSITE_MAT + "*Solid Section, elset=EALL, material=CFRP, orientation=O\n"
+    for ori in ("*Orientation, name=O, definition=OFFSET TO NODES\n1, 2\n",
+                "*Orientation, name=O, definition=NODES\n50, 60\n"):
+        body, conv, rep = convert_str(solid + ori)
+        assert "The cards that name O stop ccx (nonexistent orientation)." in rep.text()
+        assert "*ORIENTATION O (no axes ccx can take)" in conv.reduced_physics
+        _, conv, rep = convert_str(solid.replace(", orientation=O", "") + ori)
+        assert conv.reduced_physics == [] and "stop ccx" not in rep.text()
 
 
 def test_isotropic_composite_keeps_its_exact_plies():

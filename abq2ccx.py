@@ -1278,6 +1278,14 @@ def trimmed_fields(fields: Sequence[str]) -> List[str]:
     return g
 
 
+def fields_at(rec: Sequence[str], n: int, default: float = 0.0) -> List[float]:
+    """The first ``n`` fields of data record ``rec`` as numbers, read by position: a blank or
+    missing field is ``default`` (Abaqus reads a blank as 0); ValueError if a field is not a
+    number."""
+    f = [x.strip() for x in rec[:n]]
+    return [pf(x) if x else default for x in f] + [default] * (n - len(f))
+
+
 def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
     """The data rows of a material card with ``nvals`` property values per row: the values,
     the temperature, then the DEPENDENCIES= field values, as stripped tokens ("" for a blank
@@ -1388,6 +1396,16 @@ def pf(token: str) -> float:
         return float(token)
     except ValueError:
         return float(token.replace("D", "e").replace("d", "e").replace("E", "e"))
+
+
+def _ply_angle(field: str) -> Optional[float]:
+    """A composite ply line's orientation field as Abaqus reads it: an angle in degrees (a
+    Fortran D exponent too), or None where it names an *ORIENTATION (INF and NAN are names)."""
+    try:
+        v = pf(field)
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
 
 
 def pint(token) -> int:
@@ -3805,6 +3823,7 @@ class Converter:
         self._buckle_preloaded: Dict[int, bool] = {}   # *BUCKLE step -> a general step before it
         self._cyclic_ok: set = set()
         self._temp_ic_fill = False
+        self._temp_ic_filled = False                # the fill line is written (first card)
         self._temp_ic_default = False
         self._temp_ic_covered: Optional[set] = None    # nodes the deck's initial temperatures name
         self._step_temp_dof: Optional[str] = None  # the step's procedure if temperature is a DOF
@@ -6022,10 +6041,8 @@ class Converter:
             for _t, mat, ply in self._section_layers(b):    # a composite's plies, or its material
                 if not mat:
                     continue
-                try:
-                    ori, angle = base, (pf(ply) if ply else 0.0)
-                except ValueError:                  # the ply names its own orientation
-                    ori, angle = ply, 0.0
+                angle = _ply_angle(ply) if ply else 0.0
+                ori, angle = (base, angle) if angle is not None else (ply, 0.0)   # else: a name
                 uses.append((mat.upper(), self._material_axes(oris, ori, angle)))
         return uses
 
@@ -6095,37 +6112,56 @@ class Converter:
         """The ccx ``a, b`` direction points of an Abaqus *ORIENTATION, or None when they
         cannot be formed.  Abaqus measures a and b from the optional origin c (9-value
         line), and DEFINITION=NODES gives node numbers instead of coordinates, by position:
-        a, b and c (0, blank or none: the global origin), each a defined node."""
+        a, b and c (0, blank or none: the global origin), each a defined node.  Coordinates
+        count by position too, a blank or missing one 0, as Abaqus reads them; None where
+        they leave no axes (a rectangular system's a, or a x b, zero; a, b of another one
+        equal: no b given, say)."""
         recs = merged_data_records(b)
-        v = [x for x in recs[0] if x != ""] if recs else []
+        rec = recs[0] if recs else []
         definition = (b.param("DEFINITION") or "COORDINATES").strip().upper()
-        rect = (b.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("RECT")
+        system = (b.param("SYSTEM") or "RECTANGULAR").strip().upper()
+        rect = system.startswith("RECT")
         try:
             if definition.startswith("NODES"):
-                ids = [pint(x) if x else 0 for x in ((recs[0] if recs else []) + ["", "", ""])[:3]]
+                ids = [pint(x) if x else 0 for x in (rec + ["", "", ""])[:3]]
                 if any(i not in self.geom.nodes for i in ids[:2]) or \
                         (ids[2] and ids[2] not in self.geom.nodes):
                     return None
                 a, bb = self.geom.nodes[ids[0]], self.geom.nodes[ids[1]]
                 c = self.geom.nodes[ids[2]] if ids[2] else (0.0, 0.0, 0.0)
             else:
-                nums = [pf(x) for x in v]
-                if len(nums) < 6:
+                if not any(rec):
                     return None
-                a, bb = tuple(nums[0:3]), tuple(nums[3:6])
-                c = tuple(nums[6:9]) if len(nums) >= 9 else (0.0, 0.0, 0.0)
+                nums = fields_at(rec, 9)
+                a, bb, c = tuple(nums[0:3]), tuple(nums[3:6]), tuple(nums[6:9])
+                if rect:
+                    no_axes = not vnorm(vcross(vsub(a, c), vsub(bb, c)))
+                else:
+                    no_axes = system.startswith(("CYL", "SPH")) and a == bb
+                if no_axes:
+                    return None
         except (ValueError, KeyError):
             return None
         if rect and any(c):
             a, bb = vsub(a, c), vsub(bb, c)
         return [*a, *bb]
 
+    def _orientation_out(self, b: Block, why: str) -> List[str]:
+        """*ORIENTATION ``b`` commented out, ``why``: a note where no card names it, or only
+        sections that get their own axes do (_lossless_ori, not _free_readers); else reduced
+        physics (warned), as ccx stops on the cards that name it ("nonexistent orientation")."""
+        name = b.uparam("NAME")
+        if name in self._lossless_ori and name not in self._free_readers:
+            return self._commented(b, why, reduces=False)
+        return self._commented(b, f"{why} The cards that name {name} stop ccx (nonexistent "
+                                  f"orientation).", reduces=f"*ORIENTATION {name} (no axes ccx can take)")
+
     def handle_orientation(self, b: Block) -> List[str]:
         definition = (b.param("DEFINITION") or "COORDINATES").strip().upper()
         if definition.startswith("OFFSET"):
-            return self._commented(b, "*ORIENTATION, DEFINITION=OFFSET TO NODES (axes from each "
-                                      "element's own local nodes) has no ccx equivalent; define "
-                                      "the system by coordinates or a *DISTRIBUTION.", reduces=False)
+            return self._orientation_out(b, "*ORIENTATION, DEFINITION=OFFSET TO NODES (axes from "
+                                            "each element's own local nodes) has no ccx equivalent; "
+                                            "define the system by coordinates or a *DISTRIBUTION.")
         if self._orientation_distribution(b) is not None:
             return self._distribution_orientation(b)
         name = b.uparam("NAME")
@@ -6141,13 +6177,16 @@ class Converter:
             return out + ["1., 0., 0., 0., 1., 0."]
         recs = merged_data_records(b)
         if recs:
-            v = [x for x in recs[0] if x != ""]
+            # by position: Abaqus reads a blank coordinate as 0, and the missing last ones of a, b
             pts = self._orientation_points(b)
+            v = [x or "0." for x in recs[0]]
+            if pts is not None:
+                v += ["0."] * (6 - len(v))
             if definition.startswith("NODES"):
                 if pts is None:
-                    return self._commented(b, "*ORIENTATION, DEFINITION=NODES: the node numbers "
-                                              "could not be resolved to coordinates; define the "
-                                              "system by coordinates.", reduces=False)
+                    return self._orientation_out(b, "*ORIENTATION, DEFINITION=NODES: the node "
+                                                    "numbers could not be resolved to coordinates; "
+                                                    "define the system by coordinates.")
                 v = [_fmt_component(x) for x in pts]
                 self.report.note("*ORIENTATION, DEFINITION=NODES resolved to coordinates (ccx "
                                  "takes points a, b).", once=True)
@@ -6157,7 +6196,7 @@ class Converter:
             elif len(v) > 6:
                 rect = (b.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("RECT")
                 try:            # (only a rectangular system measures a, b from c: _orientation_points)
-                    has_origin = rect and len(v) >= 9 and any(pf(x) != 0.0 for x in v[6:9])
+                    has_origin = rect and any(fields_at(recs[0], 9)[6:9])
                 except ValueError:
                     has_origin = False
                 if pts is not None and has_origin:
@@ -6996,20 +7035,18 @@ class Converter:
             pre: List[str] = []
             plies: List[Tuple[str, str, Optional[str]]] = []
             for thick, mat, ply_ori in self._section_layers(b):    # (SYMMETRIC: mirrored)
+                angle = _ply_angle(ply_ori)                           # Abaqus: numeric ply angle
                 if ply_ori == "":
                     oriname = self._plain_dist_orientation(base, axes[base], 0.0, pre) \
                         if base in axes else (base or None)
+                elif angle is None:                                   # an *ORIENTATION name
+                    oriname = ply_ori
+                    if oriname in axes:
+                        oriname = self._plain_dist_orientation(oriname, axes[oriname], 0.0, pre)
                 else:
-                    try:                                  # Abaqus: numeric ply angle
-                        angle = float(ply_ori)
-                    except ValueError:                    # already an *ORIENTATION name
-                        oriname = ply_ori
-                        if oriname in axes:
-                            oriname = self._plain_dist_orientation(oriname, axes[oriname], 0.0, pre)
-                    else:
-                        # a distribution orientation's own rotation is already in its axes
-                        oriname = self._plain_dist_orientation(base, axes[base], angle, pre) \
-                            if base in axes else self._synth_orientation(base_ori, ply_ori, pre)
+                    # a distribution orientation's own rotation is already in its axes
+                    oriname = self._plain_dist_orientation(base, axes[base], angle, pre) \
+                        if base in axes else self._synth_orientation(base_ori, angle, pre)
                 plies.append((thick, mat, self._dp_axes(mat, oriname)))
             if any(o for _, _, o in plies) and not all(o for _, _, o in plies):
                 # ccx 2.23 gives a ply line without an orientation the previous line's (probed:
@@ -7229,10 +7266,8 @@ class Converter:
             many = split_suffixes(self._quad_from.get(e, self.geom.elements[e][0]))[0] not in ONE_POINT_SHEETS
             toks = []
             for (_thick, _mat, spec), sym in zip(layers, syms):
-                try:
-                    angle, name = (pf(spec), base) if spec else (0.0, base)
-                except ValueError:
-                    angle, name = 0.0, spec
+                angle = _ply_angle(spec) if spec else 0.0
+                angle, name = (angle, base) if angle is not None else (0.0, spec)
                 fr = self._abaqus_frame(e, name, centre) if name else None
                 got = self._ccx_frame(e, name, angle, centre)
                 if (name and fr is None) or got is None:
@@ -7579,15 +7614,23 @@ class Converter:
             out += pre + [emit_keyword("MEMBRANE SECTION", params)] + list(b.data)
         return out
 
-    def _synth_orientation(self, base_name: str, angle: str, pre: List[str]) -> Optional[str]:
+    def _synth_orientation(self, base_name: str, ang: float, pre: List[str]) -> Optional[str]:
+        """The orientation a composite ply turned by ``ang`` degrees from the section's
+        orientation ``base_name`` names: the base itself for no turn, else a synthesized card
+        added to ``pre``.  A base without axes the converter knows (_orient_axes) is named as
+        it is, unturned: there are no axes to turn (warned)."""
         if base_name and base_name.upper() in self._dist_refs:
             # an orientation that names a *DISTRIBUTION reaches here only when its axes could
             # not be resolved (it is commented out): there are no axes to turn
             return base_name.upper()
-        try:
-            ang = float(angle)
-        except ValueError:
-            ang = 0.0
+        if base_name and base_name.upper() not in self._orient_axes:
+            if ang:
+                self.report.warn(f"*SHELL SECTION, COMPOSITE: plies turned from orientation "
+                                 f"'{base_name}', which has no axes the converter can form (undefined, "
+                                 f"OFFSET TO NODES, unresolved nodes, or points that give no axes): "
+                                 f"they name it without their angles.", once=True)
+                self._reduces(f"ply angles on orientation {base_name.upper()} without axes")
+            return base_name.upper()
         base = self.orientations.get(base_name.upper()) if base_name else None
         if base:
             a, bvec, system = base
@@ -10140,13 +10183,17 @@ class Converter:
     @staticmethod
     def _transform_card(b: Block) -> Union[Tuple[str, Vec, Vec], str]:
         """A *TRANSFORM card's (TYPE letter, a, b), or why its data line cannot be read.  Like
-        ccx, only the first letter of TYPE counts."""
+        ccx, only the first letter of TYPE counts; a blank or missing coordinate is 0, as
+        Abaqus and ccx read it."""
         typ = (b.uparam("TYPE") or "R")[0]
+        rec = next((r for r in merged_data_records(b) if any(r)), None)
         try:
-            v = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
-            return typ, (v[0], v[1], v[2]), (v[3], v[4], v[5])
-        except (IndexError, ValueError):
+            v = fields_at(rec, 6) if rec else None
+        except ValueError:
+            v = None
+        if v is None:
             return "has a *TRANSFORM whose data line cannot be read"
+        return typ, (v[0], v[1], v[2]), (v[3], v[4], v[5])
 
     def _transform_defs(self, blocks: List[Block]) -> Dict[int, Union[Tuple[str, Vec, Vec], str]]:
         """Each node with a *TRANSFORM -> its card's (TYPE letter, a, b), or why the local axes
@@ -13719,7 +13766,10 @@ class Converter:
                                       f"remodel or remove.")
         layout = {"TEMPERATURE": "field", "VELOCITY": "dof", "DISPLACEMENT": "dof"}.get(typ)
         midside = self._midside_records(b, layout) + self._qmem_records(b, layout) if layout else []
-        if typ == "TEMPERATURE" and self._temp_ic_fill:
+        if typ == "TEMPERATURE" and self._temp_ic_fill and not self._temp_ic_filled:
+            # on the first card only: ccx takes the last value given to a node, so the fill on
+            # a later card would set the earlier cards' nodes back to 0
+            self._temp_ic_filled = True
             self.report.note(f"*INITIAL CONDITIONS, TYPE=TEMPERATURE: nodes it does not list get "
                              f"0 first ({ALL_NODES_SET}, 0.) — the Abaqus default; ccx stops on a "
                              f"node without an initial temperature.", once=True)
@@ -13748,8 +13798,8 @@ class Converter:
                                    reduces=f"*INITIAL CONDITIONS, TYPE={typ}, SECTION POINTS")
         out: List[str] = [emit_keyword("INITIAL CONDITIONS", b.params)]
         expanded = skipped = 0
-        records = [[x for x in rec if x != ""] for rec in merged_data_records(b)]
-        records = [r for r in records if r]
+        # fields by position: Abaqus reads a blank value as 0
+        records = [r for r in merged_data_records(b) if any(r)]
         if typ == "SOLUTION":
             # one record = label + nsdv values: 7 on the first line, 8 per continuation
             # line; without the count, continuation lines would read as new records
@@ -13767,7 +13817,7 @@ class Converter:
         unrotated: Dict[Tuple[str, str], int] = {}
         general = 0
         for f in records:
-            tok, vals = f[0], f[1:]
+            tok, vals = f[0], [x or "0." for x in f[1:]]
             # a split continuum shell's label names all its ply solids, as its element sets do
             eids = self._ply_ids.get(int(tok), [int(tok)]) if re.fullmatch(r"[-+]?\d+", tok) else \
                 self.geom.elset(tok)
@@ -21691,8 +21741,7 @@ class Converter:
         field 0 as Abaqus reads it (``*ELASTIC`` with E alone: nu = 0); ValueError if a field is
         not a number."""
         rec = next((r for r in merged_data_records(c) if any(x.strip() for x in r)), [])
-        f = [x.strip() for x in rec] + [""] * n
-        return [pf(x) if x else 0.0 for x in f[:n]]
+        return fields_at(rec, n)
 
     def _slab_obstacle(self, blocks: List[Block], cand: Dict[int, str]) -> Optional[str]:
         """Why the CPS4I / CPE4I elements ``cand`` cannot become exact C3D8I slabs, or None.
@@ -23456,7 +23505,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                 for i, ln in enumerate(nb.data):
                     f = ln.split(",")
                     o = f[3].strip() if len(f) > 3 else ""
-                    if o and not re.fullmatch(r"[-+]?(\d+\.?\d*|\.\d+)([EeDd][-+]?\d+)?", o):
+                    if o and _ply_angle(o) is None:
                         f[3] = " " + namer(prefix, o)
                         nb.data[i] = ",".join(f)
             at = beam_n1_line(nb) if rot and b.keyword in ("BEAM SECTION",

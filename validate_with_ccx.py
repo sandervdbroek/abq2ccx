@@ -1674,6 +1674,7 @@ def sphere_membrane(theta, kind="s4r", t=0.01):
 TURNED_AB = ((0.8, 0.6, 0.0), (-0.36, 0.48, 0.8))
 CUBE_CORNERS = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
 IC_STRESS = (100.0, -40.0, 25.0, 30.0, -20.0, 15.0)
+IC_STRESS_BLANK = (100.0, 0.0, 25.0, 30.0, -20.0, 15.0)    # written "100, , 25, ...": syy = 0
 IC_PLASTIC = (0.004, -0.001, -0.003, 0.002, -0.0015, 0.001)        # engineering shear, as Abaqus
 
 
@@ -1792,23 +1793,47 @@ def expansion_forms_errors(dat, expect):
     return worst
 
 
-def ic_cube_deck(kind):
+def ic_cube_deck(kind, vals=None, blank=False):
     """A free unit C3D8 cube (held against rigid motion only) with an initial stress IC_STRESS
     (``kind`` "stress"; E 1000, nu 0.25) or plastic strain IC_PLASTIC ("plastic"; a *Plastic
-    material that stays elastic) given in TURNED_AB's axes, which Abaqus reads them in (2017
-    Keywords *INITIAL CONDITIONS)."""
+    material that stays elastic), or ``vals``, given in TURNED_AB's axes, which Abaqus reads
+    them in (2017 Keywords *INITIAL CONDITIONS).  ``blank``: the zeros of the *Orientation line
+    and the initial values written as blank fields, which Abaqus reads as 0."""
+    num = lambda x: "" if blank and x == 0 else f"{x:g}"     # noqa: E731
     lines = ["*Heading", f"Free cube with an initial {kind} given in a turned *Orientation", "*Node, nset=ALL"]
     lines += [f"{k}, {x}., {y}., {z}." for k, (x, y, z) in enumerate(CUBE_CORNERS, 1)]
     lines += ["*Element, type=C3D8, elset=CUBE", "1, 1, 2, 3, 4, 5, 6, 7, 8",
-              "*Orientation, name=TURNED", ", ".join(f"{x:g}" for x in TURNED_AB[0] + TURNED_AB[1]),
+              "*Orientation, name=TURNED", ", ".join(num(x) for x in TURNED_AB[0] + TURNED_AB[1]),
               "*Material, name=M", "*Elastic", "1000., 0.25"]
     lines += ["*Plastic", "1.e6, 0.", "1.1e6, 1."] if kind == "plastic" else []
-    vals = IC_PLASTIC if kind == "plastic" else IC_STRESS
+    vals = vals or (IC_PLASTIC if kind == "plastic" else IC_STRESS)
     lines += ["*Solid Section, elset=CUBE, material=M, orientation=TURNED",
               f"*Initial Conditions, type={'PLASTIC STRAIN' if kind == 'plastic' else 'STRESS'}",
-              "CUBE, " + ", ".join(f"{x:g}" for x in vals),
+              "CUBE, " + ", ".join(num(x) for x in vals),
               "*Boundary", "1, 1, 3", "2, 2, 3", "4, 3, 3", "*Step", "*Static",
               "*Node Print, nset=ALL", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def ic_temperature_cards_deck():
+    """Two free unit C3D8 cubes (E 1000, alpha 1e-3, held against rigid motion only), A at the
+    origin and B at x = 3, with one *INITIAL CONDITIONS, TYPE=TEMPERATURE card per set, as CAE
+    writes them: A at 100, B's bottom at 0 (its top, on no card, starts at the Abaqus default
+    0); the step heats A to 120 and B to 20, so both expand freely by 20 alpha."""
+    corners = CUBE_CORNERS
+    lines = ["*Heading", "Two free cubes, initial temperatures on two cards", "*Node, nset=ALLN"]
+    lines += [f"{k}, {x}., {y}., {z}." for k, (x, y, z) in enumerate(corners, 1)]
+    lines += [f"{k + 10}, {x + 3}., {y}., {z}." for k, (x, y, z) in enumerate(corners, 1)]
+    lines += ["*Element, type=C3D8, elset=CUBES", "1, 1, 2, 3, 4, 5, 6, 7, 8",
+              "2, 11, 12, 13, 14, 15, 16, 17, 18", "*Nset, nset=A, generate", "1, 8, 1",
+              "*Nset, nset=B, generate", "11, 18, 1", "*Nset, nset=BBOT, generate", "11, 14, 1",
+              "*Material, name=M", "*Elastic", "1000., 0.3", "*Expansion", "1.e-3",
+              "*Solid Section, elset=CUBES, material=M",
+              "*Initial Conditions, type=TEMPERATURE", "A, 100.",
+              "*Initial Conditions, type=TEMPERATURE", "BBOT, 0.",
+              "*Boundary", "1, 1, 3", "2, 2, 3", "4, 3, 3", "11, 1, 3", "12, 2, 3", "14, 3, 3",
+              "*Step", "*Static", "*Temperature", "A, 120.", "B, 20.",
+              "*Node Print, nset=ALLN", "U", "*End Step"]
     return "\n".join(lines) + "\n"
 
 
@@ -2379,7 +2404,7 @@ def perturbation_restore_deck(pert=None):
         ["*STEP", "*STATIC", "*NODE PRINT, NSET=TIPS", "U", "*END STEP"]) + "\n"
 
 
-def pert_frame_deck(case, pert=True, twin=False, n=4):
+def pert_frame_deck(case, pert=True, twin=False, n=4, blank=False):
     """A B31 frame (E 2.1e5, RECT 0.1 x 0.05, ``n`` elements per member): a beam along x from
     node 1 (clamped) to a joint at x = 2 (a ccx knot) and a column up from it, the joint with a
     *TRANSFORM.  "moment" (oblique local axes): a static step turns the joint by moments about
@@ -2388,7 +2413,8 @@ def pert_frame_deck(case, pert=True, twin=False, n=4):
     triples the moment about local 1 (the one about local 2 carries on); ``twin``: without the
     *TRANSFORM, the moments in global components.  "bc" (local axes about z): the first step
     turns local 1 and 3 by 0.01, a *FREQUENCY step holds local 3 at zero, the last step turns
-    local 1 to 0.02 (local 3 stays at 0.01)."""
+    local 1 to 0.02 (local 3 stays at 0.01).  ``blank``: the *TRANSFORM's zeros as blank fields,
+    which Abaqus and ccx read as 0."""
     j = 2 * n + 1                                     # the joint
     lines = (["*NODE"] + [f"{i + 1}, {i / n!r}, 0., 0." for i in range(2 * n + 1)] +
              [f"{j + k}, 2., 0., {k / n!r}" for k in range(1, n + 1)] + ["*ELEMENT, TYPE=B31, ELSET=B"] +
@@ -2399,7 +2425,8 @@ def pert_frame_deck(case, pert=True, twin=False, n=4):
               "7.8e-9", "*BOUNDARY", "1, 1, 6"])
     ab = ((0.6, 0.8, 0.), (-0.8, 0.6, 0.5)) if case == "moment" else ((0., 1., 0.), (-1., 0., 0.))
     if not twin:
-        lines += ["*NSET, NSET=TIP", str(j), "*TRANSFORM, NSET=TIP", ", ".join(map(repr, ab[0] + ab[1]))]
+        lines += ["*NSET, NSET=TIP", str(j), "*TRANSFORM, NSET=TIP",
+                  ", ".join("" if blank and not x else repr(x) for x in ab[0] + ab[1])]
     e3 = _unit(_cross(*ab))
     axes = (_unit(ab[0]), _cross(e3, _unit(ab[0])), e3)
 
@@ -4941,19 +4968,25 @@ def main():
               f"elements, top-face load P4): {len(b)} centre displacements vs STACK DIRECTION=3, max "
               f"difference {err:.1e} of max |u|")
         failures += 0 if ok else 1
+    # ("s4r", "XYD"): the ply angles written with a Fortran exponent, 3.D1, -6.D1, 4.5D1 (one
+    # was read as an orientation name, which ccx rejected)
+    dexp = lambda t: t.replace("PLY, 30.", "PLY, 3.D1").replace("PLY, -60.", "PLY, -6.D1") \
+        .replace("PLY, 45.", "PLY, 4.5D1")                                  # noqa: E731
     for kind in ("s4r", "sc8r", "sc6r"):
-        for plane in ("XY", "XZ"):
-            res = composite_run(composite_inplane_deck(kind, plane), f"composite_inplane_{kind}_{plane}")
+        for plane in ("XY", "XZ") + (("XYD",) if kind == "s4r" else ()):
+            deck = composite_inplane_deck(kind, plane[:2])
+            res = composite_run(dexp(deck) if plane == "XYD" else deck, f"composite_inplane_{kind}_{plane}")
             if res is None:
                 failures += 1
                 continue
-            want = laminate_a_reactions(plane)
+            want = laminate_a_reactions(plane[:2])
             got = res[1]
             scale = max(abs(x) for r in want for x in r)
             err = max(abs(x - y) for r, g in zip(want, got) for x, y in zip(r, g)) / scale \
                 if len(got) == len(want) else math.inf
             ok = err < 1e-4
-            print(f"{'PASS' if ok else 'FAIL'}  composite_inplane_{kind} ([30/-60/45]s, {plane} plane): "
+            print(f"{'PASS' if ok else 'FAIL'}  composite_inplane_{kind} ([30/-60/45]s, {plane[:2]} plane"
+                  f"{', angles 3.D1, -6.D1, 4.5D1' if plane == 'XYD' else ''}): "
                   f"edge reactions of three uniform strains vs classical lamination theory's A11 ... "
                   f"A66, max difference {err:.1e} of the largest")
             failures += 0 if ok else 1
@@ -5122,26 +5155,43 @@ def main():
             return None
         return u
 
-    for kind in ("stress", "plastic"):
+    for kind in ("stress", "plastic", "blank"):
         tag = f"initial_{kind}_turned"
-        u = faithful_run(ic_cube_deck(kind), tag)
+        # "blank": blank fields in the *Orientation line and the stress record (Abaqus: 0)
+        u = faithful_run(ic_cube_deck("stress", IC_STRESS_BLANK, True) if kind == "blank" else
+                         ic_cube_deck(kind), tag)
         if u is None:
             failures += 1
             continue
         h = [[u[k][i] - u[1][i] for k in (2, 4, 5)] for i in range(3)]      # du_i / dx_j
         eps = [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2,
                (h[1][2] + h[2][1]) / 2]
-        if kind == "stress":
-            sg = local_to_global(TURNED_AB, IC_STRESS)
+        if kind != "plastic":
+            sg = local_to_global(TURNED_AB, IC_STRESS_BLANK if kind == "blank" else IC_STRESS)
             want = [-(1.25 * x - (0.25 * sum(sg[:3]) if k < 3 else 0.0)) / 1000.0 for k, x in enumerate(sg)]
         else:
             want = local_to_global(TURNED_AB, IC_PLASTIC[:3] + tuple(x / 2 for x in IC_PLASTIC[3:]))
         err = max(abs(x - y) for x, y in zip(eps, want)) / max(abs(y) for y in want)
         ok = err < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  {tag} (free C3D8 cube, an initial "
-              + ("stress" if kind == "stress" else "plastic strain with engineering shear terms")
-              + f" in a turned rectangular *Orientation): strains {err:.1e} of the largest off "
-              + ("-C^-1 R sigma R^T" if kind == "stress" else "R eps_p R^T, stress-free"))
+              + {"stress": "stress", "plastic": "plastic strain with engineering shear terms",
+                 "blank": "stress with a blank syy"}[kind]
+              + " in a turned rectangular *Orientation" + (" whose a_z is blank" if kind == "blank" else "")
+              + f"): strains {err:.1e} of the largest off "
+              + ("R eps_p R^T, stress-free" if kind == "plastic" else "-C^-1 R sigma R^T"))
+        failures += 0 if ok else 1
+    # one initial-temperature card per set, as CAE writes them: the fill of the nodes no card
+    # lists (Abaqus: 0) came on every card, so B's card set A back to 0 (A then grew 120 alpha)
+    u = faithful_run(ic_temperature_cards_deck(), "initial_temperature_cards")
+    if u is None:
+        failures += 1
+    else:
+        got = [u.get(7, [math.inf] * 3), [a - b for a, b in zip(u.get(17, [math.inf] * 3), u.get(11, [0.0] * 3))]]
+        err = max(abs(x / 0.02 - 1) for v in got for x in v)
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  initial_temperature_cards (two free cubes, initial "
+              f"temperatures on two *INITIAL CONDITIONS cards, heated by 20): corner displacements "
+              f"{got[0][0]:.7g} and {got[1][0]:.7g} vs 20 alpha = 0.02 (max {err:.1e} off)")
         failures += 0 if ok else 1
     text, xy = ic_annulus_deck()
     u = faithful_run(text, "initial_stress_cylindrical")
@@ -5756,6 +5806,19 @@ def main():
         elif all(runs):
             print(f"FAIL  pert_moment_{pert}: {len(runs[0][1])} vs {len(runs[1][1])} displacement tables")
         failures += 0 if ok else 1
+    # a blank field in the *TRANSFORM line (0 for Abaqus and ccx): the axes were "unreadable",
+    # so the moments stayed in local components on the ccx knot, which reads them as global
+    runs = [review_run(pert_frame_deck("moment", False, twin, blank=not twin),
+                       "transform_blank" + ("_twin" if twin else ""), dat_node_blocks) for twin in (False, True)]
+    ok = all(runs) and len(runs[0]) == len(runs[1]) == 2
+    if ok:
+        err, moved = same(runs)
+        ok = err < 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  transform_blank (moments about local 1 and 2 on a B31 "
+              f"frame's joint, a *TRANSFORM line '0.6, 0.8, , -0.8, 0.6, 0.5'): every displacement as "
+              f"with the moments in global components and no *TRANSFORM ({err:.1e} apart, free nodes "
+              f"moved {moved:.3g})")
+    failures += 0 if ok else 1
     # a zero BC without AMPLITUDE in a *DYNAMIC step after a perturbation step that held the DOF
     # (it counted as at rest, so ccx stepped it), and a JOIN connector off a beam node whose
     # rotation only a *FREQUENCY step holds (its rows lost the rotation)

@@ -6,6 +6,22 @@ physics.
 
 ## Unreleased
 
+* **Blank data fields read as 0, in place** — Abaqus reads a blank field as 0; the converter
+  dropped it and read the later fields one place early. An `*ORIENTATION` line
+  `0., 1., , -1., 0., 0.` made ccx exit, others gave other axes. A blank `*TRANSFORM` field left
+  the node's axes unknown, so its moments on a ccx knot acted about the global axes.
+  `*INITIAL CONDITIONS, TYPE=STRESS / PLASTIC STRAIN / SOLUTION`: `1, 100., , 50.` gave syy = 50,
+  and the CAE line `Set-1, , , , , 20` gave SDV 1 = 20 instead of SDV 5.
+* **Initial temperatures on several cards** — the line that gives the nodes no
+  `*INITIAL CONDITIONS, TYPE=TEMPERATURE` card lists their Abaqus default, 0, was written on
+  every card, so each card set the earlier cards' nodes back to 0 (CAE writes one card per
+  field). It now goes on the first card only.
+* **Composite ply angles** — an angle with a Fortran exponent (`4.5D1`) was read as an
+  orientation name, and ccx stopped. A ply on an orientation named INF crashed the converter,
+  one named NAN got `nan` axes. Plies on an orientation whose axes the converter cannot form
+  (OFFSET TO NODES, unresolved nodes) were turned from the global axes without a word; they now
+  name it unturned, with a warning and reduced physics. The commented-out orientation itself is
+  now warned as reduced physics where a card that names it stops ccx (a note before).
 * **`*FREQUENCY` at the base state's temperatures** — Abaqus evaluates a frequency step's
   materials at the base temperatures; ccx 2.23's plain `*FREQUENCY` uses the initial ones
   (probed: a column whose E halves when heated kept its cold frequencies). After linear steps
