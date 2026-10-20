@@ -792,6 +792,37 @@ def test_op_new_on_a_later_boundary_card_only():
     assert "OP=NEW dropped" in third and "*BOUNDARY, OP=NEW\n" not in third
 
 
+def test_op_new_on_a_later_card_of_any_type():
+    # the *BOUNDARY rule above for every card ccx's OP=NEW acts on on a step's first card only
+    # (before: ccx ignored it, unwarned; a *DLOAD's got a bare one first)
+    deck = (HEX + HEX_SEC + "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Step\n*Static\n*Cload\n7, 1, 1.\n"
+            "*Dload\nEALL, P2, 1.\n*Temperature\n7, 10.\n*End Step\n*Step\n*Static\n*Cload\n6, 1, 1.\n"
+            "*Cload, op=NEW\n7, 2, 1.\n*Dload\nEALL, P1, 1.\n*Dload, op=NEW\nEALL, P3, 1.\n"
+            "*Temperature\n6, 5.\n*Temperature, op=NEW\n7, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    two = _step(body, 2)
+    for kw, line in (("CLOAD", "7, 2, 1."), ("DLOAD", "EALL, P3, 1."), ("TEMPERATURE", "7, 1.")):
+        assert f"** abq2ccx: OP=NEW dropped: ccx 2.23 ignores it after a step's first *{kw}, which " \
+               f"has none\n*{kw}\n{line}\n" in two
+        assert f"*{kw}, OP=NEW in step(s) 2 on a later card but not on the step's first" in rep.text()
+    assert "OP=NEW\n" not in two and not conv.reduced_physics
+    heat = (HEX.replace("C3D8", "DC3D8") + "*Material, name=MH\n*Conductivity\n1.\n*Solid Section, "
+            "elset=EALL, material=MH\n*Boundary\n1, 11, 11, 0.\n" +
+            "*Step\n*Heat Transfer, steady state\n1., 1.\n{}*End Step\n" * 2)
+    body, _, rep = convert_str(heat.format("*Cflux\n7, 11, 1.\n*Dflux\n1, S4, 1.\n*Film\n1, F2, 2., 1.\n",
+                                           "*Cflux\n6, 11, 1.\n*Cflux, op=NEW\n7, 11, 2.\n*Dflux\n1, S6, 1.\n"
+                                           "*Dflux, op=NEW\n1, S4, 1.\n*Film\n1, F4, 2., 1.\n*Film, "
+                                           "op=NEW\n1, F2, 0., 1.\n"))
+    assert "OP=NEW" not in body.replace("OP=NEW dropped", "") and body.count("OP=NEW dropped") == 3
+    assert all(f"*{kw}, OP=NEW in step(s) 2 on a later card" in rep.text() for kw in ("CFLUX", "DFLUX", "FILM"))
+    # *DSLOAD, then *DLOAD, OP=NEW is valid Abaqus (other card types): a bare one first stays
+    body, _, rep = convert_str(HEX + HEX_SEC + "*Surface, name=S2\nEALL, S2\n*Boundary\n1, 1, 3\n"
+                               "2, 2, 3\n4, 3, 3\n*Step\n*Static\n*Dload\nEALL, P1, 1.\n*End Step\n"
+                               "*Step\n*Static\n*Dsload\nS2, P, 1.\n*Dload, op=NEW\nEALL, P3, 1.\n*End Step\n")
+    assert "*DLOAD, OP=NEW\n*DLOAD\nEALL, P2, 1.\n*DLOAD, OP=NEW\nEALL, P3, 1.\n" in _step(body, 2)
+    assert "on a later card" not in rep.text()
+
+
 def test_emitted_deck_parse():
     # the post-passes' parse of the converted text: steps by the *STEP lines (one without *END
     # STEP, which the converter's text never has, ends at the next); a card between steps is
@@ -849,6 +880,14 @@ def test_delay_merge_and_total_time_shift_read_the_emitted_deck():
     assert step == ["*STEP", "*STATIC", "0.1, 1.", "** a note", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1",
                     "1, 1, 1.", "** between", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "** inside",
                     "E1, P1, 1.", "E2, P1, 1.", "E3, P2, 2.", "*NODE FILE", "U"]
+    # a later twin without data lines goes, and its first card stays (before: the first card's
+    # keyword line went, so its lines joined the plain card before it)
+    step = ["*STEP", "*STATIC", "*CLOAD", "16, 3, 0.5", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1", "16, 1, 1.",
+            "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "3, P4, 1.",
+            "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "3, P4, 2.", "*END STEP"]
+    A.Converter(A.Report(), Opt())._merge_delay_cards(step)
+    assert step == ["*STEP", "*STATIC", "*CLOAD", "16, 3, 0.5", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1",
+                    "16, 1, 1.", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "3, P4, 1.", "3, P4, 2.", "*END STEP"]
     # _shift_total_time counts ccx's steps by the *STEP lines.  Blocks that keep an unterminated
     # *STEP (a caller that builds them itself) are closed by Converter.convert as read_blocks
     # closes them: step 1 ends before the next *STEP, and the static perturbation step 3
@@ -7612,6 +7651,99 @@ def test_converted_load_sharing_a_deck_cload_dof():
     assert _cloads(body)[0] == {(5, 3): 1.0}
 
 
+def test_converted_loads_on_step_time_amplitudes_hold_their_end_value():
+    # Abaqus and ccx 2.23 hold a load on a step-time amplitude at its end value from the next
+    # step on, plain; ccx starts the amplitude over where the load is written again on it
+    # (_hold_nodal_loads).  A TRVEC of 4 on the top face: -1 on each of its nodes
+    head = (HEX + HEX_SEC + "*Surface, name=TOP\nEALL, S2\n*Amplitude, name=A2\n0., 0., 1., 2.\n"
+            "*Amplitude, name=T, time=total time\n0., 0., 10., 10.\n*Amplitude, name=B, "
+            "value=absolute\n0., 0., 1., 4.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    trvec = "*Dsload{}\nTOP, TRVEC, {}, 0., 0., -1.\n"
+    two = "*Step\n*Static\n{}*End Step\n*Step\n*Static\n0.5, 0.5\n{}*End Step\n"
+    top = {(n, 3): -1.0 for n in (5, 6, 7, 8)}
+    # the deck's *CLOAD, OP=NEW removes them in ccx: given again at A2(1) = 2, plain (before:
+    # on A2, which ccx started over)
+    body, conv, _ = convert_str(head + two.format(trvec.format(", amplitude=A2", "4."),
+                                                  "*Cload, op=NEW\n1, 1, 5.\n"))
+    assert _cloads(body) == [top, {(1, 1): 5.0, **{k: 2.0 * v for k, v in top.items()}}]
+    assert "AMPLITUDE" not in _step(body, 2) and not conv.reduced_physics
+    # given again on its amplitude: written again (before: not, so ccx held 2)
+    body, _, _ = convert_str(head + two.format(*[trvec.format(", amplitude=A2", "4.")] * 2))
+    assert _cloads(body) == [top, top] and "*CLOAD, AMPLITUDE=A2\n5, 3, -1\n" in _step(body, 2)
+    # a TIME=TOTAL TIME amplitude goes on: nothing to write
+    body, _, _ = convert_str(head + two.format(*[trvec.format(", amplitude=T", "4.")] * 2))
+    assert _cloads(body) == [top, {}]
+    # an end value the converter cannot evaluate (VALUE=ABSOLUTE): lost after OP=NEW, warned
+    body, conv, rep = convert_str(head + two.format(trvec.format(", amplitude=B", "1."),
+                                                    "*Cload, op=NEW\n1, 1, 5.\n"))
+    assert _cloads(body)[1] == {(1, 1): 5.0} and conv.reduced_physics
+    assert "Step 2's *CLOAD, OP=NEW also removes in ccx 2.23 the nodal forces converted from " \
+           "loads of earlier steps (*DSLOAD TRVEC on TOP)" in rep.text()
+    # one load on two amplitudes in one step: ccx keeps one per node DOF (before: both on the
+    # first card's), so the second line is left out, warned
+    body, conv, rep = convert_str(head + "*Step\n*Static\n" + trvec.format("", "4.") +
+                                  trvec.format(", amplitude=A2", "4.") + "*End Step\n")
+    assert _cloads(body) == [top] and conv.reduced_physics == ["*DSLOAD TRVEC load dropped"]
+    assert "a line of the same load earlier in the step has another amplitude" in rep.text()
+
+
+def test_body_load_entries_as_ccx_keys_them():
+    # ccx 2.23 keeps one GRAV / CENTRIF entry per element set and direction (or point and
+    # axis), where Abaqus keys the load by set and type
+    deck = HEX + HEX_SEC.replace("*Elastic", "*Density\n1.\n*Elastic") + \
+        "*Amplitude, name=A3\n0., 0., 1., 3.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+    step = "*Step\n*Static\n{}*End Step\n"
+    # given again in another direction: a zero line in the earlier one first (before: the two
+    # added up); none in the same direction, written otherwise, or after OP=NEW
+    body, _, rep = convert_str(deck + step.format("*Dload\nEALL, GRAV, 2., 1., 0., 0.\n") +
+                               step.format("*Dload\nEALL, GRAV, 4., -2., 0., 0.\n"))
+    assert "*DLOAD\nEALL, GRAV, 0., 1., 0., 0.\nEALL, GRAV, 4., -2., 0., 0.\n" in _step(body, 2)
+    assert "a zero line in the earlier direction goes first" in rep.text()
+    for again in ("*Dload\nEALL, GRAV, 4., 2., 0., 0.\n", "*Dload, op=NEW\nEALL, GRAV, 4., -2., 0., 0.\n"):
+        body, _, _ = convert_str(deck + step.format("*Dload\nEALL, GRAV, 2., 1., 0., 0.\n") +
+                                 step.format(again))
+        assert _step(body, 2).count("GRAV") == 1
+    body, _, _ = convert_str(deck + step.format("*Dload\nEALL, CENTRIF, 1., 0., 0., 0., 0., 0., 1.\n") +
+                             step.format("*Dload\nEALL, CENTRIF, 1., 0., 0., 0., 1., 0., 0.\n"))
+    assert "EALL, CENTRIF, 0., 0., 0., 0., 0., 0., 1.\nEALL, CENTRIF, 1., 0., 0., 0., 1., 0., 0.\n" \
+        in _step(body, 2)
+    # two lines of one set and direction on two amplitudes in one step: the later one on a copy
+    # of the set, an entry of its own (before: both summed under the later amplitude); a later
+    # step's line replaces both
+    body, conv, _ = convert_str(deck + step.format("*Dload, amplitude=A3\nEALL, GRAV, 1., 1., 0., 0.\n"
+                                                   "*Dload\nEALL, GRAV, 1., 2., 0., 0.\n") +
+                                step.format("*Dload\nEALL, GRAV, 1., 0., 0., -1.\n"))
+    assert "\n*ELSET, ELSET=ABQ2CCX_EALL_COPY1\nEALL\n*STEP" in body and not conv.reduced_physics
+    assert "*DLOAD, AMPLITUDE=A3\nEALL, GRAV, 1., 1., 0., 0.\n*DLOAD\nABQ2CCX_EALL_COPY1, GRAV, 1., " \
+           "2., 0., 0.\n" in _step(body, 1)
+    assert "*DLOAD\nEALL, GRAV, 0., 1., 0., 0.\nABQ2CCX_EALL_COPY1, GRAV, 0., 2., 0., 0.\nEALL, GRAV, " \
+           "1., 0., 0., -1.\n" in _step(body, 2)
+
+
+def test_heat_load_entries_as_ccx_keys_them():
+    # Abaqus adds what a step's heat loads give a node or face twice, each on its own
+    # amplitude; ccx 2.23 stops on two amplitudes on one *CFLUX / *DFLUX entry (forcadd,
+    # loadadd; one amplitude: it adds) and keeps the later *FILM / *RADIATE line of a face
+    deck = (HEX.replace("C3D8", "DC3D8") + "*Material, name=MH\n*Conductivity\n1.\n*Solid Section, "
+            "elset=EALL, material=MH\n*Nset, nset=TIP\n2, 3, 6, 7\n*Amplitude, name=A1\n0., 1., 1., 1.\n"
+            "*Boundary\n1, 11, 11, 0.\n4, 11, 11, 0.\n5, 11, 11, 0.\n8, 11, 11, 0.\n"
+            "*Step\n*Heat Transfer, steady state\n1., 1.\n{}*End Step\n")
+    for cards, gone, kept in (
+            ("*Cflux\nTIP, 11, 1.\n*Cflux, amplitude=A1\nTIP, 11, 1.\n*Cflux\n2, 11, 1.\n",
+             "TIP, 11, 1.", "*CFLUX\n2, 11, 1.\n"),
+            ("*Dflux\n1, S4, 1.\n*Dflux, amplitude=A1\n1, S4, 1.\n1, S6, 1.\n*Dflux\nEALL, S4, 1.\n",
+             "1, S4, 1.", "*DFLUX, AMPLITUDE=A1\n1, S6, 1.\n"),
+            ("*Film\n1, F4, 2., 1.\n*Film\n1, F4, 8., 3.\n1, F6, 1., 1.\n", "1, F4, 8., 3.",
+             "*FILM\n1, F6, 1., 1.\n")):
+        body, conv, rep = convert_str(deck.format(cards))
+        kw = kept.split("\n")[0].split(",")[0]
+        assert "line(s) left out" in body and f"\n** {gone}\n" in body and kept in body
+        assert conv.reduced_physics and f"{kw} line(s) in step 1 on " in rep.text()
+    # one amplitude: added, as in Abaqus
+    body, conv, _ = convert_str(deck.format("*Cflux\nTIP, 11, 1.\n*Cflux\nTIP, 11, 1.\n"))
+    assert "left out" not in body and not conv.reduced_physics
+
+
 def test_beam_line_loads_become_consistent_nodal_forces():
     beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type={}, elset=B\n{}"
             "*Material, name=M\n*Elastic\n1., 0.3\n*Beam Section, elset=B, material=M, section={}\n"
@@ -8267,10 +8399,14 @@ def test_base_state_after_perturbation_values_and_keys():
     body, _, _ = convert_str(deck.format("*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n",
                                          "*Dload\nEALL, GRAV, 20., 0, 0, -2\n"))
     assert body.split("*STEP")[3].count("GRAV") == 1
-    # OP=NEW on a later card, which ccx ignores: a bare one first (Abaqus: the earlier steps' go)
-    body, _, _ = convert_str(deck.format("*Cload\n7, 1, 1.\n", "*Cload\n6, 1, 1.\n*Cload, op=NEW\n7, 2, 1.\n"))
+    # OP=NEW on a later card, which ccx ignores (invalid in Abaqus): dropped and warned, as in
+    # any step (_plan_late_op_new), so the base state comes back
+    body, _, rep = convert_str(deck.format("*Cload\n7, 1, 1.\n", "*Cload\n6, 1, 1.\n*Cload, op=NEW\n7, 2, 1.\n"))
     assert "*STATIC\n** abq2ccx: the loads, BCs and temperatures of step 1 given again (linear " \
-           "perturbation step(s) 2 in between)\n*CLOAD, OP=NEW\n*CLOAD\n6, 1, 1.\n" in body
+           "perturbation step(s) 2 in between)\n*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n7, 1, 1.\n" \
+           "*CLOAD\n6, 1, 1.\n** abq2ccx: OP=NEW dropped: ccx 2.23 ignores it after a step's first " \
+           "*CLOAD, which has none\n*CLOAD\n7, 2, 1.\n" in body
+    assert "*CLOAD, OP=NEW in step(s) 3 on a later card but not on the step's first" in rep.text()
     # a load the step gives again after a *BUCKLE (which dropped it) ramps from 0 in ccx
     _, conv, rep = convert_str(deck.replace("*Frequency\n3\n", "*Buckle\n2\n*Cload\n7, 3, -1.\n")
                                .format("*Cload\n7, 1, 1.\n", "*Cload\n7, 1, 2.\n"))

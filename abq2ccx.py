@@ -5459,6 +5459,24 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
     return None
 
 
+def held_factor(curve: Optional[AmplitudeCurve], delay: Optional[str],
+                period: Optional[float], at: Optional[float] = None) -> Optional[float]:
+    """The factor a load or BC on amplitude ``curve`` (with its card's TIME DELAY ``delay``)
+    reaches at the end of a step of time ``period``: Abaqus and ccx 2.23 hold a step-time
+    amplitude's there, plain, in the steps after it (ccx starts the amplitude over only where
+    the line is given again on it; probed); a TIME=TOTAL TIME one's at total time ``at``
+    (None: it goes on through the later steps).  None where the converter cannot evaluate
+    it: an amplitude it does not read (USER, ...), VALUE=ABSOLUTE, an unknown period or time
+    (Riks, a linear perturbation step)."""
+    end = at if curve is not None and curve.total else period
+    if curve is None or curve.absolute or end is None:
+        return None
+    try:
+        return curve.value(end - pf(delay or "0"))
+    except ValueError:
+        return None
+
+
 def integrate_history(rate: Callable[[float], float], breaks: Sequence[float], period: float,
                       order: int = 1, x0: float = 0.0, r0: float = 0.0, panel: float = 0.0,
                       rel_tol: float = 1e-4, max_points: int = 1000):
@@ -5597,6 +5615,9 @@ class EmitState:
             OrderedDict()
         self.cl_fresh: set = set()
         self.cl_taken: Dict[tuple, tuple] = {}
+        # the step's *CFLUX / *DFLUX / *FILM / *RADIATE entries (node DOF or element face) ->
+        # the amplitude of its line (Converter._track_heat)
+        self.heat_taken: Dict[tuple, tuple] = {}
         # the converted-load bookkeeping before the current run of perturbation steps:
         # (nodal_loads, nodal_emitted, dl_state, cl_state)
         self.load_base: tuple = (OrderedDict(), {}, {}, OrderedDict())
@@ -5640,6 +5661,7 @@ class EmitState:
         self.nodal_fresh, self.nodal_reset, self.cload_new = set(), set(), False
         self.dl_fresh, self.dl_wiped, self.dl_taken = set(), False, {}
         self.cl_fresh, self.cl_taken = set(), {}
+        self.heat_taken = {}
         if step.perturbation and (self.prev is None or not self.prev.perturbation):
             self.load_base = (self.nodal_loads, dict(self.nodal_emitted), self.dl_state,
                               self.cl_state)
@@ -5861,14 +5883,7 @@ class BaseStateRestore:
             return None
         amp = b.uparam("AMPLITUDE")
         if amp and amp != self.conv.CCX_RAMP:
-            curve = self.amps.get(amp)
-            end = at if amp in self.total_amps else self.period.get(b.step or 1)
-            if curve is None or curve.absolute or end is None:
-                return None
-            try:
-                return curve.value(end - pf(b.param("TIME DELAY") or "0"))
-            except ValueError:
-                return None
+            return held_factor(self.amps.get(amp), b.param("TIME DELAY"), self.period.get(b.step or 1), at)
         return 1.0
 
     def end_value(self, b: Block, rec: List[str], at: Optional[float] = None) -> Optional[float]:
@@ -5925,12 +5940,8 @@ class BaseStateRestore:
                 return tuple(params + [(k, v) for k, v in b.params.items()
                                        if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
             # (model data: from the first step on)
-            end = self.total.get(s) if total else self.period.get(given_in or 1)
-            try:
-                factor = curve.value(end - pf(b.param("TIME DELAY") or "0")) \
-                    if curve and end is not None else None
-            except ValueError:
-                factor = None
+            factor = held_factor(curve, b.param("TIME DELAY"), self.period.get(given_in or 1),
+                                 self.total.get(s))
             if factor is None:
                 self.report.warn((f"*{kw} given again in static perturbation step {s}: the "
                                   f"value TIME=TOTAL TIME amplitude {amp} reached at the end of "
@@ -5992,9 +6003,7 @@ class BaseStateRestore:
         res: List[str] = []
         for kw in self.conv._RESTORED:
             mine = [b for b in own if b.keyword == kw]
-            instead = self._skip_or_bare(kw, s, mine)
-            if instead is not None:
-                res += instead
+            if self._restore_skipped(kw, s):
                 continue
             entries, again = self._load_entries(kw, mine) if kw in self.contrib else \
                 self._line_entries(kw, s, mine, touched)
@@ -6008,19 +6017,14 @@ class BaseStateRestore:
         self._warn_reset(s, regiven, between)
         return res
 
-    def _skip_or_bare(self, kw: str, s: int, mine: List[EmittedCard]) -> Optional[List[str]]:
-        """None where step ``s`` gets the base state's ``kw`` lines, else what it gets instead:
-        nothing where the step's own first card of that type has OP=NEW (ccx acts on it), no
-        BCs where no perturbation step before held a DOF (_restore_pairs), no temperatures in
-        a step that solves them; a bare OP=NEW where a later card has it (ccx ignores it
-        there; Abaqus: the earlier steps' go)."""
-        if self.deck.steps[s - 1].acting(kw) is not None or \
-                (kw == "BOUNDARY" and s not in self.restore_pairs) or \
-                (kw == "TEMPERATURE" and self.procs.get(s) in TEMPERATURE_DOF_PROCS):
-            return []
-        if any(b.uparam("OP") == "NEW" for b in mine):
-            return [emit_keyword(kw, OrderedDict([("OP", "NEW")]))]
-        return None
+    def _restore_skipped(self, kw: str, s: int) -> bool:
+        """Whether step ``s`` gets no base-state ``kw`` lines: where the step's own first card of
+        that type has OP=NEW (ccx acts on it; a later card has none: _plan_late_op_new), no BCs
+        where no perturbation step before held a DOF (_restore_pairs), no temperatures in a
+        step that solves them."""
+        return self.deck.steps[s - 1].acting(kw) is not None or \
+            (kw == "BOUNDARY" and s not in self.restore_pairs) or \
+            (kw == "TEMPERATURE" and self.procs.get(s) in TEMPERATURE_DOF_PROCS)
 
     def _load_entries(self, kw: str, mine: List[EmittedCard], only: Optional[set] = None
                       ) -> Tuple[List[Tuple[Block, List[str]]], bool]:
@@ -6638,8 +6642,8 @@ class Converter:
         self._planar_bc: List[str] = []
         self._b32r_rows: set = set()                # B32R elements whose .dat rows outnumber their points
         self._planar_twist: List[int] = []         # ... the nodes among them with DOFs 4-5 fixed
-        # *BOUNDARY cards whose OP=NEW is dropped: id -> the comment written in its place, if
-        # any (_plan_late_op_new, _plan_op_new_rotations)
+        # *BOUNDARY and load cards whose OP=NEW is dropped: id -> the comment written before
+        # the card, if any (_plan_late_op_new; *BOUNDARY: _plan_op_new_rotations too)
         self._op_new_drop: Dict[int, Optional[str]] = {}
         self._jc_with_rate: set = set()
         # id(material card) -> its material; the materials sections use; id(*DAMAGE
@@ -6871,12 +6875,8 @@ class Converter:
         self._sp_temps: set = set()
         self._sp_temp_dep = False
         self._sp_adds = False
-        # the amplitudes and the general steps' periods (_sp_amplitudes), and per converted
-        # load the factor its amplitude reached at the end of the general step that gave it
-        # (1: none; None: unknown to the converter), for a static perturbation step (_sp_freeze)
+        # the amplitudes (_sp_amplitudes, _plan_deck_facts)
         self._amp_curves: Dict[str, Optional[AmplitudeCurve]] = {}
-        self._step_periods: Dict[int, float] = {}
-        self._nodal_ends: Dict[tuple, Optional[float]] = {}
         self._restore_yields = False                # a material yields or creeps
         self._eigen_since = False                   # ... and a *FREQUENCY step ran in ccx
         self._yield_segv: set = set()               # the steps where ccx then segfaults (_yield_segfaults)
@@ -6894,6 +6894,10 @@ class Converter:
         # the names of the shell sets that carry such a load as GRAV
         self._shell_body: Dict[str, dict] = {}
         self._body_sets: set = set()
+        # copies of element sets for body loads on two amplitudes in a step (_body_copy): (set as
+        # written, n) -> the copy's name; the copy's name -> the set it copies
+        self._body_copies: Dict[Tuple[str, int], str] = {}
+        self._body_copy_of: "OrderedDict[str, str]" = OrderedDict()
         self._mesh_sets = EmittedSets()             # the sets emit_geometry wrote
         # Abaqus surface elements left out of the ccx mesh (_drop_surface_elements): element ->
         # (type, nodes), and the full member list of each element set that had some
@@ -11602,6 +11606,8 @@ class Converter:
                                              False, comment=f"a second procedure in step "
                                              f"{self.emit.no} (Abaqus allows one)"))
                 continue
+            if b.keyword != "BOUNDARY" and self._op_new_drop.get(id(b)):     # (handle_boundary's own)
+                out.append(self._op_new_drop[id(b)])
             if proc == "FREQUENCY" and b.keyword in ("CLOAD", "DLOAD", "DSLOAD"):
                 out.extend(self._commented(b, "Loads of a *FREQUENCY step commented out: Abaqus "
                                               "ignores them (natural frequency extraction), ccx "
@@ -11614,6 +11620,8 @@ class Converter:
         out.extend(self._flush_dloads())
         out.extend(self._flush_cloads())
         out.extend(self._flush_nodal_loads())
+        if self.emit.no not in self._pert_idx:
+            self._hold_nodal_loads()
         self._merge_delay_cards(out)
         out.extend(self._anchored_output(step_block))  # Abaqus' default output, if any
         self._step_temp_dof = None
@@ -13047,6 +13055,8 @@ class Converter:
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         labels = {r[1].strip().upper() for r in merged_data_records(b) if len(r) > 1}
         for k, v in b.params.items():
+            if k == "OP" and id(b) in self._op_new_drop:      # (_plan_late_op_new)
+                continue
             if k in allowed:
                 keep[k] = v
                 continue
@@ -13087,7 +13097,7 @@ class Converter:
                 del self.emit.cl_state[k]
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
-            if k == "OP" and self._sp_adds:
+            if k == "OP" and (self._sp_adds or id(b) in self._op_new_drop):
                 continue
             if k in ("OP", "AMPLITUDE", "TIME DELAY", "LOAD CASE", "SECTOR", "SUBMODEL", "STEP"):
                 keep[k] = v
@@ -13352,10 +13362,11 @@ class Converter:
                 params.pop("OP", None)
         if op_new:
             self._dload_op_new("DLOAD")
-        drop = self._track_dloads("DLOAD", b, lines, params)
-        if drop:
-            body = [ln for ln in body if ln not in drop]
-            side += self._dload_clash([ln for _, ln, _ in lines if ln in drop])
+        kept, zeros = self._track_dloads("DLOAD", b, lines, params)
+        gone = [ln for (_, ln, _), k in zip(lines, kept) if k is None]
+        body = zeros + [k for k in kept if k is not None]
+        if gone:
+            side += self._dload_clash(gone)
         if not body and had_data:
             if op_new:
                 # keep the bare header: OP=NEW validly removes all previous distributed
@@ -13494,10 +13505,11 @@ class Converter:
             keep = self._load_params(b, self._DLOAD_PARAMS)
             if not wipe:
                 keep.pop("OP", None)
-        drop = self._track_dloads("DSLOAD", b, lines, keep)
-        if drop:
-            body = [ln for ln in body if ln not in drop]
-            side += self._dload_clash([ln for _, ln, _ in lines if ln in drop])
+        kept, zeros = self._track_dloads("DSLOAD", b, lines, keep)
+        gone = [ln for (_, ln, _), k in zip(lines, kept) if k is None]
+        body = zeros + [k for k in kept if k is not None]
+        if gone:
+            side += self._dload_clash(gone)
         if body or wipe:
             if op_new:
                 self._dload_op_new("DSLOAD", wipe)
@@ -14235,8 +14247,6 @@ class Converter:
             forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
         amp = self._cload_amp(b)
         key = (card, g[0].upper(), label)
-        if self._sp_adds and not amp:
-            self._sp_freeze(key, forces)
         clash = self._nodal_load_clash(key, forces, amp)
         if clash:
             return self._drop_load_line(b, g, clash)
@@ -14245,7 +14255,7 @@ class Converter:
                              f"forces from the undeformed geometry, which ccx keeps fixed in "
                              f"direction and magnitude — the response differs from Abaqus as the "
                              f"mesh deforms. Verify.", once=True)
-        self._set_nodal_load(key, forces, amp, self._amp_end(b))
+        self._set_nodal_load(key, forces, amp)
         if base.startswith("TR"):
             what, lack = "surface tractions (TRVEC / TRSHR)", "ccx has no such load"
         elif base == "P":
@@ -15843,18 +15853,33 @@ class Converter:
         them.  A node DOF shared with the deck's own *CLOAD is therefore exact only when the
         deck has a single step and the same amplitude and time delay (so the deck's lines given
         again, _flush_cloads, never meet these forces); one shared with another converted load
-        needs the same amplitude and time delay (_cload_amp)."""
+        needs the same amplitude and time delay (_cload_amp), and so does a second line of the
+        same load in a step (Abaqus applies each on its own amplitude); a load of an earlier
+        step left on a step-time amplitude (_hold_nodal_loads) is held at a value the converter
+        does not know."""
         for nd in forces:
             amps = self._deck_cloads.get(nd)
             if amps is not None and (self._n_steps > 1 or amps != {amp}):
                 return (f"its nodal force on node {nd[0]} DOF {nd[1]} would share the entry of the "
                         f"deck's own *CLOAD there (ccx keeps one value and amplitude per node and "
                         f"DOF, and a later step replaces it)")
+        if key in self.emit.nodal_fresh and key in self.emit.nodal_loads and \
+                self.emit.nodal_loads[key][1] != amp:
+            return ("a line of the same load earlier in the step has another amplitude or TIME "
+                    "DELAY: Abaqus applies each line on its own, ccx keeps one amplitude per node "
+                    "and DOF")
         for other, (f2, a2) in self.emit.nodal_loads.items():
-            if other != key and a2 != amp and not f2.keys().isdisjoint(forces):
+            if other == key or f2.keys().isdisjoint(forces):
+                continue
+            if a2 != amp:
                 return (f"it shares nodes with another converted load ({other[2]} on {other[1]}) "
                         f"under a different amplitude or TIME DELAY, and ccx keeps one amplitude "
                         f"per node and DOF")
+            if other not in self.emit.nodal_fresh and self._step_amp(amp):
+                return (f"it shares nodes with another converted load ({other[2]} on {other[1]}) "
+                        f"of an earlier step, which ccx holds at the end value of the step-time "
+                        f"amplitude {amp[0]} (one the converter cannot evaluate), and ccx keeps one "
+                        f"amplitude per node and DOF")
         if self._sp_adds and key in self.emit.nodal_loads and key not in self.emit.nodal_fresh and \
                 self.emit.nodal_loads[key][1] != amp:  # (_set_nodal_load adds it to the base state's)
             return ("it changes the base state's load of that kind there, which has another "
@@ -15870,39 +15895,10 @@ class Converter:
         name = (b.param("AMPLITUDE") or "").strip()
         return (name, (b.param("TIME DELAY") or "").strip()) if name else None
 
-    def _amp_end(self, b: Block) -> Optional[float]:
-        """The factor a load card's amplitude reaches at the end of the current step: 1 without
-        one (ccx's ramp ends there too), None where the converter cannot evaluate it.  Only a
-        static perturbation step after another step needs it (_sp_freeze), so only with
-        perturbation steps (_sp_amplitudes keeps the amplitudes and periods)."""
-        amp = b.uparam("AMPLITUDE")
-        if not amp:
-            return 1.0
-        curve, end = self._amp_curves.get(amp), self._step_periods.get(self.emit.no)
-        if curve is None or curve.total or curve.absolute or end is None:
-            return None
-        try:
-            return curve.value(end - pf(b.param("TIME DELAY") or "0"))
-        except ValueError:
-            return None
-
-    def _sp_freeze(self, key: tuple, forces: Dict[Tuple[int, int], float]) -> None:
-        """A static perturbation step after another step: Abaqus adds its loads to the base
-        state's at their values at the base state's end, and the step's own carry no amplitude
-        (_sp_amplitudes), while ccx keeps one amplitude per node and DOF.  So once a converted
-        load of the step meets a base-state one on an amplitude (its key, or shared nodes),
-        every base-state converted load on an amplitude is given at that end value without
-        it (_nodal_ends; what ccx holds there anyway), so that the step's load adds to it.
-        Those whose end value the converter does not know keep their amplitude (and the
-        step's load on them is dropped: _nodal_load_clash)."""
-        base = [k for k, (_, a) in self.emit.nodal_loads.items() if a and k not in self.emit.nodal_fresh]
-        if not any(k == key or not self.emit.nodal_loads[k][0].keys().isdisjoint(forces) for k in base):
-            return
-        for k in base:
-            end = self._nodal_ends.get(k)
-            if end is not None:
-                self.emit.nodal_loads[k] = ({nd: v * end for nd, v in self.emit.nodal_loads[k][0].items()},
-                                            None)
+    def _step_amp(self, amp: Optional[tuple]) -> bool:
+        """Whether a converted load's amplitude (_cload_amp) runs on step time: ccx starts it over
+        where the load is written again, and holds its end value after its step."""
+        return amp is not None and amp[0].upper() not in self._total_amps
 
     def _op_new_load(self, b: Block) -> bool:
         """Whether a load card's OP=NEW removes the earlier loads.  Not in a static perturbation
@@ -15913,7 +15909,7 @@ class Converter:
         dropped there (the earlier perturbation steps' loads go in _restore_base_states); so is
         a *TEMPERATURE's (Abaqus: "reset to zero" there, the base state's).  A *BOUNDARY,
         OP=NEW does release the base state's BCs in Abaqus, and stays."""
-        if b.uparam("OP") != "NEW":
+        if b.uparam("OP") != "NEW" or id(b) in self._op_new_drop:     # (_plan_late_op_new)
             return False
         if not self._sp_adds:
             return True
@@ -15925,20 +15921,18 @@ class Converter:
         return False
 
     def _set_nodal_load(self, key: tuple, forces: Dict[Tuple[int, int], float],
-                        amp: Optional[tuple], end: Optional[float] = 1.0) -> None:
+                        amp: Optional[tuple]) -> None:
         """Record the nodal forces of a converted load (Abaqus semantics: a key given again in
-        a later step replaces it, twice in one step adds up; no force removes it), and, in a
-        general step, the factor ``end`` its amplitude reaches at the step's end.  In a
+        a later step replaces it, twice in one step adds up; no force removes it).  In a
         static perturbation step after another step (``_sp_adds``) a load is a change of the
-        base state's: it adds to the base state's forces of the same key."""
+        base state's: it adds to the base state's forces of the same key (held at their end
+        values, plain: _hold_nodal_loads)."""
         if key in self.emit.nodal_loads and (key in self.emit.nodal_fresh or self._sp_adds):
             old = self.emit.nodal_loads[key][0]
             for nd, v in forces.items():
                 old[nd] = old.get(nd, 0.0) + v
         elif forces:
             self.emit.nodal_loads[key] = (dict(forces), amp)
-            if self.emit.no not in self._pert_idx:
-                self._nodal_ends[key] = end
         else:
             self.emit.nodal_loads.pop(key, None)
         self.emit.nodal_fresh.add(key)
@@ -15955,12 +15949,9 @@ class Converter:
     # the comment before the generated *CLOAD (_restore_base_states tells them by it)
     _NODAL_FORCES = "** abq2ccx: consistent nodal forces of the distributed loads converted above"
 
-    def _flush_nodal_loads(self) -> List[str]:
-        """The *CLOAD (one per amplitude) that brings ccx's generated nodal forces to the state
-        the step's converted loads define: every node DOF whose force changed, with 0 where a
-        load went away.  Never OP=NEW, which would also remove the deck's own *CLOADs; after
-        the deck's own *CLOAD, OP=NEW (which removes these too) every force is given again."""
-        target: Dict[Tuple[int, int], Tuple[str, Optional[tuple]]] = {}
+    def _nodal_target(self) -> Dict[Tuple[int, int], Tuple[str, Optional[tuple]]]:
+        """The entry per node DOF that the converted loads define in ccx: (their summed force as
+        written, its amplitude; one per node DOF: _nodal_load_clash)."""
         sums: Dict[Tuple[int, int], float] = {}
         amps: Dict[Tuple[int, int], Optional[tuple]] = {}
         for forces, amp in self.emit.nodal_loads.values():
@@ -15982,13 +15973,28 @@ class Converter:
                                          f"with the first one's — verify.", once=True)
                     for k in (1, 2, 3):
                         sums[(n, o + k)], amps[(n, o + k)] = vdot(v, axes[k - 1]), amp
-        for nd, v in sums.items():
-            target[nd] = ("%.12g" % v if v else "0", amps[nd])
+        return {nd: ("%.12g" % v if v else "0", amps[nd]) for nd, v in sums.items()}
+
+    def _flush_nodal_loads(self) -> List[str]:
+        """The *CLOAD (one per amplitude) that brings ccx's generated nodal forces to the state
+        the step's converted loads define: every node DOF whose force changed, with 0 where a
+        load went away, and every one a load of the step gives on a step-time amplitude (ccx
+        starts it over there, as Abaqus applies it; it holds the earlier end value otherwise).
+        Never OP=NEW, which would also remove the deck's own *CLOADs; after the deck's own
+        *CLOAD, OP=NEW (which removes these too) every force is given again, the earlier steps'
+        at their end values (_hold_nodal_loads) — or lost, where the converter does not know
+        that value."""
+        if self.emit.cload_new:
+            self._lose_held_nodal_loads()
+        target = self._nodal_target()
         held = {} if self.emit.cload_new else self.emit.nodal_emitted
+        anew = {n for k in self.emit.nodal_fresh if k in self.emit.nodal_loads and
+                self._step_amp(self.emit.nodal_loads[k][1]) for n, _ in self.emit.nodal_loads[k][0]}
         groups: "OrderedDict[Optional[tuple], List[str]]" = OrderedDict()
         for nd in sorted(set(target) | set(held)):
             new = target.get(nd, ("0", None))
-            if held.get(nd) == new or (nd not in held and new[0] == "0"):
+            if (nd not in held and new[0] == "0") or \
+                    (held.get(nd) == new and not (nd[0] in anew and self._step_amp(new[1]))):
                 continue
             groups.setdefault(new[1], []).append(f"{nd[0]}, {nd[1]}, {new[0]}")
         self.emit.nodal_emitted = {nd: v for nd, v in target.items() if v[0] != "0"}
@@ -16001,6 +16007,50 @@ class Converter:
                        (f", TIME DELAY={amp[1]}" if amp and amp[1] else ""))
             out.extend(data)
         return out
+
+    def _hold_nodal_loads(self) -> None:
+        """The end of a general step: Abaqus and ccx 2.23 hold a load on a step-time amplitude
+        at its end value, plain, from the next step on (held_factor), so the converted loads on
+        one become plain loads of that value, and so does what ccx holds of them
+        (nodal_emitted).  Written again after the deck's *CLOAD, OP=NEW they go out plain, and
+        given again on the amplitude they differ from it (_flush_nodal_loads).  A static
+        perturbation step adds its loads to these (_set_nodal_load).  Those whose end value
+        the converter cannot evaluate keep their amplitude."""
+        frozen = False
+        for k, (forces, amp) in list(self.emit.nodal_loads.items()):
+            end = held_factor(self._amp_curves.get(amp[0].upper()), amp[1], self._step_period) \
+                if self._step_amp(amp) else None
+            if end is None:
+                continue
+            frozen = True
+            ends = {nd: v * end for nd, v in forces.items() if v * end}
+            if ends:
+                self.emit.nodal_loads[k] = (ends, None)
+            else:
+                del self.emit.nodal_loads[k]
+        if frozen:
+            self.emit.nodal_emitted = {nd: v for nd, v in self._nodal_target().items() if v[0] != "0"}
+
+    def _lose_held_nodal_loads(self) -> None:
+        """The deck's *CLOAD, OP=NEW removes the converted nodal forces in ccx: those of earlier
+        steps left on a step-time amplitude (an end value the converter cannot evaluate:
+        _hold_nodal_loads) cannot be given again — on the amplitude ccx would start it over —
+        and are lost, warned."""
+        lost = [k for k, (_, amp) in self.emit.nodal_loads.items()
+                if k not in self.emit.nodal_fresh and self._step_amp(amp)]
+        if not lost:
+            return
+        for k in lost:
+            del self.emit.nodal_loads[k]
+        listed = "; ".join(f"*{k[0]} {k[2]} on {k[1]}" for k in lost[:3]) + ("; ..." if len(lost) > 3 else "")
+        self.report.warn(f"Step {self.emit.no}'s *CLOAD, OP=NEW also removes in ccx 2.23 the nodal "
+                         f"forces converted from loads of earlier steps ({listed}), which Abaqus "
+                         f"keeps at the value their step-time amplitude reached at the end of their "
+                         f"step: the converter cannot evaluate that value, and given again on the "
+                         f"amplitude ccx would start it over, so they are lost from this step on. "
+                         f"Verify.")
+        self._reduces("converted load of an earlier step lost after the deck's *CLOAD, OP=NEW "
+                      "(step-time amplitude)")
 
     def _drop_load_line(self, b: Block, g: Sequence[str], why: str, reduces: bool = True) -> List[str]:
         """Comment out one load data line, with the reason — reduced physics unless ``reduces``
@@ -16062,12 +16112,11 @@ class Converter:
         name = amp[0]
         if not name or name in self._total_amps:
             return line, kept, amp
-        curve, period = self._amp_curves.get(name), self._step_period
-        if curve is None or curve.absolute or period is None:
+        factor = held_factor(self._amp_curves.get(name), dict(kept).get("TIME DELAY"), self._step_period)
+        if factor is None:
             return None
         f = [x.strip() for x in line.split(",")]
         try:
-            factor = curve.value(period - pf(dict(kept).get("TIME DELAY") or "0"))
             if factor != 1.0 and len(f) > 2 and f[2]:
                 f[2] = short_real(pf(f[2]) * factor, 12)
         except ValueError:
@@ -16075,38 +16124,103 @@ class Converter:
         return ", ".join(f), tuple((k, v) for k, v in kept if k not in ("AMPLITUDE", "TIME DELAY")), ("", ())
 
     def _track_dloads(self, origin: str, b: Block, lines: List[Tuple[tuple, str, str]],
-                      params: "OrderedDict[str, Optional[str]]") -> set:
+                      params: "OrderedDict[str, Optional[str]]") -> Tuple[List[Optional[str]], List[str]]:
         """Record the *DLOAD lines emitted for a *DLOAD / *DSLOAD card (``origin``; ``params``:
         the ccx card's), in Abaqus semantics: a step's first line on a key replaces its loads
         of earlier steps, its next ones add to it ("multiple definitions of the same load
         condition in the same step are applied additively", Abaqus 2017, loads), a zero
-        magnitude adds nothing.  Returns the lines left out: those on element faces that an
-        earlier card of the step loads on another amplitude, which ccx 2.23 stops on ('*ERROR
-        in loadadd'; probed, also for two cards with the same AMPLITUDE and TIME DELAY:
-        _merge_delay_cards), Abaqus adds."""
+        magnitude adds nothing.  Returns the lines as written, in order — None for one left
+        out: on element faces that an earlier card of the step loads on another amplitude,
+        which ccx 2.23 stops on ('*ERROR in loadadd'; probed, also for two cards with the same
+        AMPLITUDE and TIME DELAY: _merge_delay_cards), Abaqus adds; a body load there goes on a
+        copy of its set instead (_body_copy) — and the zero lines that go before them
+        (_retire_body_loads)."""
         state = self.emit.dl_state.setdefault(origin, OrderedDict())
         kept = tuple((k, v) for k, v in params.items() if k != "OP")
         case = ((params.get("LOAD CASE") or "1").strip(), (params.get("SECTOR") or "").strip())
         amp = self._load_amp(params)
-        drop: set = set()
+        out: List[Optional[str]] = []
+        zeros: List[str] = []
         for key, line, mag in lines:
             what = (key[-2], key[-1], case)          # (element or set, label, load case)
-            faces = self._dl_faces(what)
+            f = [x.strip() for x in line.split(",")]
+            body = key[-1] in self._BODY_LOADS and len(f) > 1 and f[1].upper() == key[-1]
+            if body:                                 # (+ its direction / axis: bodyadd)
+                what = (f[0], key[-1], case, BaseStateRestore.direction(key[-1], f[3:]))
             if (origin, key) not in self.emit.dl_fresh:
                 self.emit.dl_fresh.add((origin, key))
-                state.pop(key, None)
-            if any(self.emit.dl_taken.get(f, amp) != amp for f in faces):
-                drop.add(line)
-                continue
-            for f in faces:
-                self.emit.dl_taken[f] = amp
+                old = state.pop(key, None)
+                if body and old and self.emit.no not in self._pert_idx and not self.emit.dl_wiped:
+                    zeros += self._retire_body_loads(old, what)
             try:
                 zero = bool(mag) and pf(mag) == 0.0
             except ValueError:
                 zero = False
+            faces = self._dl_faces(what)
+            if any(self.emit.dl_taken.get(x, amp) != amp for x in faces):
+                if not body:
+                    out.append(None)
+                    continue
+                line, what = self._body_copy(f, what, amp)
+                faces = self._dl_faces(what)
+            if not (body and zero):                  # (bodyadd: a zero line never clashes)
+                for x in faces:
+                    self.emit.dl_taken[x] = amp
             if not zero:
                 state.setdefault(key, []).append((line, kept, what, self._load_later(line, kept, amp)))
-        return drop
+            out.append(line)
+        return out, zeros
+
+    def _retire_body_loads(self, old: List[tuple], what: tuple) -> List[str]:
+        """Zero lines for the ccx entries of a body load's lines of earlier steps (``old``:
+        its dl_state entries) other than the one the step's first line of it loads (``what``):
+        Abaqus replaces the load, ccx 2.23 keeps one entry per set and direction or axis
+        (bodyadd), so a line in another direction is a second entry, which adds (probed: GRAV
+        2 along x, then 4 along -x gave the sum).  A zero line replaces the old entry (probed),
+        also where a later line of the step loads it again, which adds to it."""
+        new, seen = self._dl_faces(what), set()
+        out: List[str] = []
+        for line, _, w, _ in old:
+            faces = self._dl_faces(w)
+            if faces == new or faces & seen:
+                continue
+            seen |= faces
+            f = [x.strip() for x in line.split(",")]
+            out.append(", ".join(f[:2] + ["0."] + f[3:]))
+        if out:
+            self.report.note("*DLOAD GRAV / CENTRIF given again in a later step in another "
+                             "direction or about another axis: Abaqus replaces the load, ccx "
+                             "2.23 keeps one entry per element set and direction and would add "
+                             "the two (probed) — a zero line in the earlier direction goes first.",
+                             once=True)
+        return out
+
+    def _body_copy(self, f: List[str], what: tuple, amp: tuple) -> Tuple[str, tuple]:
+        """Body-load line ``f`` (its fields; ``what``: its _dl_faces key) on a copy of its element
+        set that the step loads on no other amplitude in that direction: ccx 2.23's bodyadd
+        keeps one entry per set and direction, where two lines on two amplitudes add up under
+        the later one's amplitude (probed; Abaqus applies each on its own), and a copy of the
+        set is an entry of its own (probed: exact).  convert() defines the copies (an *ELSET
+        naming the set) before the first *STEP.  Returns (the line, its key)."""
+        token, n = f[0], 1
+        while True:
+            name = self._body_copies.get((token.upper(), n))
+            if name is None:
+                if not self._body_copies:
+                    self._reserve_names()
+                name = self._fresh_name(f"ABQ2CCX_{token}_COPY{n}")
+                self._body_copies[(token.upper(), n)] = name
+                self._body_copy_of[name] = token
+            w = (name,) + what[1:]
+            if all(self.emit.dl_taken.get(x, amp) == amp for x in self._dl_faces(w)):
+                self.report.note("*DLOAD GRAV / CENTRIF lines of one element set and direction on "
+                                 "two amplitudes in one step: ccx 2.23 keeps one entry and amplitude "
+                                 "per set and direction (it would add them under the later "
+                                 "amplitude), so the later line goes on a copy of the set "
+                                 "(ABQ2CCX_..._COPY<n>), an entry of its own (probed: exact).",
+                                 once=True)
+                return ", ".join([name] + f[1:]), w
+            n += 1
 
     def _dload_clash(self, lines: List[str]) -> List[str]:
         """The *DLOAD lines _track_dloads left out, commented out (warned, reduced physics)."""
@@ -16125,17 +16239,19 @@ class Converter:
         case) — P and P1..P6 on a shell all on its face 1, a top-face surface's
         (_plan_sheet_pressure) on face 2 (dloads.f); (name, label, load case) on a set the
         converter cannot list, and for a shell body force written as GRAV on a set of its own
-        (_shell_body_lines: bodyadd's entry of that set and axis); none for a body load (GRAV,
-        CENTRIF), keyed by set (bodyadd)."""
+        (_shell_body_lines: bodyadd's entry of that set and axis); for a body load (GRAV,
+        CENTRIF; ``what`` then has its direction / axis: _track_dloads) bodyadd's entry, (set
+        as written, label, load case, the direction or point and axis as ccx compares them:
+        BaseStateRestore.direction)."""
         got = self._dl_memo.get(what)
         if got is not None:
             return got
-        token, label, case = what
+        token, label, case = what[:3]
         name, label = token.strip().upper(), label.strip().upper()
         if name in self._body_sets:
             got = frozenset({(name, label, case)})
         elif label in self._BODY_LOADS or label.startswith("CENTRIF"):
-            got = frozenset()
+            got = frozenset({(name, label, case) + what[3:]})
         else:
             top = next((t for plan in self._sheet_split.values() for t, surf, _, _ in plan
                         if surf.upper() == name), None)
@@ -16378,7 +16494,8 @@ class Converter:
         (``out``: the step's lines) with the same parameters as an earlier one move onto it."""
         deck = EmittedDeck(out)
         first: Dict[Tuple[str, tuple], EmittedCard] = {}
-        moved: Dict[int, List[int]] = {}            # a card's index -> the lines moved onto it
+        moved: Dict[int, List[int]] = {}            # a first card's index -> the lines moved onto it
+        later: List[EmittedCard] = []               # the later cards (their keyword lines go)
         for c in deck.cards:
             amp = self._load_amp(c.params) if c.keyword in ("CLOAD", "DLOAD") else ()
             if not amp or not amp[1]:
@@ -16387,13 +16504,14 @@ class Converter:
                 first[(c.keyword, amp)] = c
                 continue
             moved.setdefault(first[(c.keyword, amp)].index, []).extend(c.rows)
-            moved[c.index] = []                     # (its keyword line goes)
+            later.append(c)
         if not any(moved.values()):
             return
+        for c in later:
+            deck.swap(c.line, [])
         for k, more in moved.items():
             c = deck.cards[k]
-            if not more:
-                deck.swap(c.line, [])
+            if not more:                            # (its twins have no data lines)
                 continue
             lines = [out[j] for j in c.rows + more]
             lines = self._surfaces_last(lines) if c.keyword == "DLOAD" else lines
@@ -21136,7 +21254,7 @@ class Converter:
                                    reduces="temperatures of a *BUCKLE step (thermal buckling load)")
         if b.has("USER"):
             return self._user_load_card(b)
-        if self._sp_adds and b.uparam("OP") == "NEW":
+        if b.uparam("OP") == "NEW" and (self._sp_adds or id(b) in self._op_new_drop):
             self._op_new_load(b)                    # (the base state's temperatures stay)
             b = Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items() if k != "OP"), b.data)
         if b.has("FILE"):
@@ -21152,6 +21270,8 @@ class Converter:
         kept, ccx would run its stock film.f / dflux.f / ... in place of the deck's own."""
         if b.has("USER"):
             return self._user_load_card(b)
+        if id(b) in self._op_new_drop:              # (_plan_late_op_new)
+            b = Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items() if k != "OP"), b.data)
         kept: List[str] = []
         side: List[str] = []
         for ln in b.data:
@@ -21160,9 +21280,68 @@ class Converter:
                 side += self._user_load_line(b, g)
             else:
                 kept.append(ln)
+        kept, gone = self._track_heat(b.keyword, b.params, kept)
+        side += self._heat_clash(b.keyword, gone)
         if not side:
             return self.passthrough(b)
         return ([emit_keyword(b.keyword, b.params)] + kept if kept else []) + side
+
+    def _track_heat(self, kw: str, params: "OrderedDict[str, Optional[str]]", lines: List[str]
+                    ) -> Tuple[List[str], List[str]]:
+        """The data lines of a ccx *CFLUX / *DFLUX / *FILM / *RADIATE card (``params``: its
+        parameters) that ccx 2.23 applies as Abaqus does, and those it would not, left out.
+        Abaqus adds what one step gives a node or face twice ("applied additively", About
+        loads, which the heat fluxes, film and radiation conditions follow), each line on its
+        own amplitude.  ccx keeps one entry per node and DOF (*CFLUX: forcadd) and per element
+        face or body flux (*DFLUX: loadadd), which adds a step's lines on one amplitude and
+        stops on two ('*ERROR in forcadd / loadadd', probed); a *FILM or *RADIATE line on a
+        face the step gave one already replaces it (probed, also on another amplitude).
+        With TIME DELAY, ccx gives each card a copy of its amplitude of its own."""
+        if kw not in ("CFLUX", "DFLUX", "FILM", "RADIATE"):
+            return lines, []
+        amp = tuple((params.get(k) or "").strip().upper() for k in ("AMPLITUDE", "FILM AMPLITUDE")) + \
+            ((object(),) if "TIME DELAY" in params else ())
+        taken = self.emit.heat_taken
+        kept: List[str] = []
+        gone: List[str] = []
+        for ln in lines:
+            g = [x.strip() for x in ln.split(",")]
+            if len(g) < 2 or not g[0] or (kw == "CFLUX" and not re.fullmatch(r"[-+]?\d+", g[1])):
+                kept.append(ln)
+                continue
+            if kw == "CFLUX":
+                ents = {(kw, n, int(g[1])) for n in self._resolve_nodes(g[0])} or {(kw, g[0].upper(), g[1])}
+            else:
+                eids = [int(g[0])] if re.fullmatch(r"[-+]?\d+", g[0]) else self._load_elements(g[0])
+                ents = {(kw, e, g[1].upper()) for e in eids} or {(kw, g[0].upper(), g[1].upper())}
+            if any(x in taken and (kw in ("FILM", "RADIATE") or taken[x] != amp) for x in ents):
+                gone.append(ln)
+                continue
+            for x in ents:
+                taken[x] = amp
+            kept.append(ln)
+        return kept, gone
+
+    def _heat_clash(self, kw: str, lines: List[str]) -> List[str]:
+        """The lines _track_heat left out, commented out (warned, reduced physics)."""
+        if not lines:
+            return []
+        if kw in ("FILM", "RADIATE"):
+            what = "film" if kw == "FILM" else "radiation"
+            why = (f"element faces that an earlier *{kw} line of the step gives a {what} condition: "
+                   f"Abaqus applies both, ccx 2.23 keeps the later one only (probed)")
+        else:
+            what = ""
+            why = (f"{'node DOFs' if kw == 'CFLUX' else 'element faces'} that an earlier *{kw} card "
+                   f"of the step loads on another amplitude: Abaqus adds the two, ccx 2.23 stops on "
+                   f"two amplitudes on one in one step ('*ERROR in "
+                   f"{'forcadd' if kw == 'CFLUX' else 'loadadd'}', probed)")
+        reduces = f"*{kw} on element faces another line of the step gives a {what} condition" \
+            if kw in ("FILM", "RADIATE") else \
+            f"*{kw} on {'node DOFs' if kw == 'CFLUX' else 'element faces'} another card of the step " \
+            f"loads with another amplitude"
+        return self._comment_out(f"*{kw} line(s) in step {self.emit.no} on {why}. Left out — verify.",
+                                 lines, reduces, f"*{kw} line(s) left out: {why}")
 
     # the surface-based heat loads: their element-based ccx card, its face label letter, and
     # the parameters ccx's card reads
@@ -21292,7 +21471,10 @@ class Converter:
             self.report.note(f"*{b.keyword} -> ccx's element-based *{ekw}: each face Sn of the "
                              f"surface gets label {letter}n (ccx numbers solid and plane element "
                              f"faces as Abaqus does).", once=True)
-            out = [emit_keyword(ekw, self._load_params(b, allowed))] + body
+            params = self._load_params(b, allowed)
+            body, gone = self._track_heat(ekw, params, body)
+            side += self._heat_clash(ekw, gone)
+            out = [emit_keyword(ekw, params)] + body
         if not out and not side:
             return [] if not any(x.strip() for x in b.data) else \
                 self._commented(b, f"Could not convert *{b.keyword}; edit manually.")
@@ -22010,6 +22192,11 @@ class Converter:
             out += ["** abq2ccx: kinematic-coupling reference node rotations no coupled DOF "
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc + self._kin_hold_eq
         out.extend(self.emit_other(blocks))
+        if self._body_copy_of:                  # (_body_copy: before the first *STEP)
+            at = next(i for i, ln in enumerate(out) if ln.strip().upper().startswith("*STEP"))
+            out[at:at] = ["** abq2ccx: copies of element sets for body loads of one set on two "
+                          "amplitudes in a step (ccx keeps one amplitude per set and direction)"] + \
+                [x for name, token in self._body_copy_of.items() for x in (f"*ELSET, ELSET={name}", token)]
         deck = EmittedDeck(out, mesh)
         # the post-passes number the emitted steps as the deck's: one *STEP line each, and an
         # *END STEP (close_open_steps); a pass's edits on another step's cards would mislead ccx
@@ -24042,12 +24229,10 @@ class Converter:
         full value; probed).  So such a card's values are scaled by the amplitude's value at
         time 0, and the amplitude goes.  One the converter cannot evaluate (USER, SOLUTION
         DEPENDENT, VALUE=ABSOLUTE, TIME=TOTAL TIME, ...) stays, warned.  (A *BUCKLE step's
-        *TEMPERATURE is commented out anyway: handle_temperature.)  Also keeps the amplitudes
-        and the general steps' periods, for the end values of the base state (_amp_end).  A
-        *BUCKLE step left with no load (none, zero ones, or ones on an amplitude that is 0 at
-        time 0) has no buckling factor: warned (ccx 2.23 prints factors of 1e9 and more there,
-        probed; Abaqus does not document what it does).  One with temperatures only is
-        handle_temperature's."""
+        *TEMPERATURE is commented out anyway: handle_temperature.)  A *BUCKLE step left with no
+        load (none, zero ones, or ones on an amplitude that is 0 at time 0) has no buckling factor:
+        warned (ccx 2.23 prints factors of 1e9 and more there, probed; Abaqus does not document
+        what it does).  One with temperatures only is handle_temperature's."""
         pert = self._perturbation_steps(blocks)
         if not pert:
             return blocks
@@ -24060,12 +24245,7 @@ class Converter:
         unloaded: Dict[bool, List[str]] = {True: [], False: []}    # (an amplitude zeroed a load)
         for s, group in enumerate(step_groups(blocks)[1], 1):
             procs = {b.keyword for b in group[1:] if b.keyword in PROC_KW}
-            if s not in pert:
-                proc_b = next((b for b in group[1:] if b.keyword in PROC_KW), None)
-                if proc_b is None or not proc_b.has("RIKS"):    # (Riks: no time period)
-                    self._step_periods[s] = self._step_timing(proc_b)["period"]
-                continue
-            if procs not in ({"STATIC"}, {"BUCKLE"}):
+            if s not in pert or procs not in ({"STATIC"}, {"BUCKLE"}):
                 continue
             proc = procs.pop()
             zeroed = False
@@ -24199,8 +24379,8 @@ class Converter:
         step gives itself (ccx adds up a load given twice in one step; a BC or temperature
         given again replaces the earlier one), and *BOUNDARY with OP=NEW where a perturbation
         step held a DOF the base state leaves free (_restore_new).  A card type whose first
-        card in the step has OP=NEW is left to it; OP=NEW on a later card, which ccx ignores,
-        gets a bare one first (a *BOUNDARY's is gone: _plan_late_op_new).  A value a step-time
+        card in the step has OP=NEW is left to it (a later card's is gone:
+        _plan_late_op_new).  A value a step-time
         amplitude drove is given at its end value (ccx and Abaqus hold it there; TIME=TOTAL
         TIME amplitudes are kept: _shift_total_time), all on the constant amplitude HOLD_AMP:
         every value is in force from the first increment, as in Abaqus (plain lines ramp from
@@ -32475,30 +32655,45 @@ class Converter:
     # ======================================================================
     # *BOUNDARY, OP=NEW on a later card of a step
     # ======================================================================
+    # the cards whose OP=NEW ccx 2.23 acts on on a step's first card of the type only
+    # (op_new_cards; *DLOAD / *DSLOAD per Abaqus keyword: _dload_op_new_first), and what
+    # Abaqus' removes
+    _OP_NEW_WHAT = OrderedDict([
+        ("BOUNDARY", "boundary conditions"), ("CLOAD", "concentrated loads"),
+        ("DLOAD", "distributed loads"), ("DSLOAD", "distributed loads"),
+        ("TEMPERATURE", "temperatures"), ("CFLUX", "concentrated fluxes"),
+        ("DFLUX", "distributed fluxes"), ("FILM", "film conditions"),
+        ("RADIATE", "radiation conditions")])
+
     def _plan_late_op_new(self, blocks: List[Block]) -> None:
-        """A step whose first *BOUNDARY has no OP=NEW and a later one has: ccx 2.23 ignores it
-        there (op_new_cards), so the earlier steps' BCs stay in force, and Abaqus requires it
-        on every *BOUNDARY card of a step if on any (a *BUCKLE step's LOAD CASE=2 cards aside,
-        which are left out: _plan_load_cases).  The OP=NEW is dropped, so that ccx does not
-        act on it where the cards before it leave no line, and warned."""
+        """A step whose first card of one of these types has no OP=NEW and a later one has:
+        ccx 2.23 ignores it there (op_new_cards; probed on *BOUNDARY, *CLOAD, *TEMPERATURE,
+        *CFLUX, *DFLUX, *FILM), so the earlier steps' BCs or loads of that type stay in force,
+        and Abaqus requires it on every card of the type in a step if on any (a *BUCKLE step's
+        LOAD CASE=2 cards aside, which are left out: _plan_load_cases).  The OP=NEW is dropped
+        (handle_boundary, _op_new_load, _load_params, handle_cload, handle_temperature,
+        handle_flux_film; the comment before the card: handle_step), so that ccx does not act
+        on it where the cards before it leave no line, and warned.  (*DSFLUX / *SFILM /
+        *SRADIATE: _plan_surface_heat.)"""
         cards = [b for b in blocks if id(b) not in self.steps.lc2]
-        acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
-        late: List[int] = []
+        acts = self.steps.acting(tuple(self._OP_NEW_WHAT), skip=self.steps.lc2, blocks=blocks)
+        late: "OrderedDict[str, List[int]]" = OrderedDict()
         for s, group in enumerate(step_groups(cards)[1], 1):
-            bcs = [b for b in group if b.keyword == "BOUNDARY"]
-            new = [b for b in bcs if b.uparam("OP") == "NEW"]
-            if new and not any(id(b) in acts for b in bcs):
-                self._op_new_drop.update((id(b), "** abq2ccx: OP=NEW dropped: ccx 2.23 ignores it "
-                                                 "after a step's first *BOUNDARY, which has none")
-                                         for b in new)
-                late.append(s)
-        if late:
-            self.report.warn(f"*BOUNDARY, OP=NEW in step(s) {', '.join(map(str, late))} on a later "
+            for kw in self._OP_NEW_WHAT:
+                mine = [b for b in group if b.keyword == kw]
+                new = [b for b in mine if b.uparam("OP") == "NEW"]
+                if new and not any(id(b) in acts for b in mine):
+                    self._op_new_drop.update((id(b), f"** abq2ccx: OP=NEW dropped: ccx 2.23 ignores "
+                                                     f"it after a step's first *{kw}, which has none")
+                                             for b in new)
+                    late.setdefault(kw, []).append(s)
+        for kw, steps in late.items():
+            self.report.warn(f"*{kw}, OP=NEW in step(s) {', '.join(map(str, steps))} on a later "
                              f"card but not on the step's first: Abaqus requires it on every "
-                             f"*BOUNDARY card of a step if on any, and ccx 2.23 acts on it on the "
-                             f"first only (probed), so the boundary conditions of the earlier steps "
-                             f"stay in force. Dropped; give every *BOUNDARY card of the step OP=NEW "
-                             f"if they are to be removed.", once=True)
+                             f"*{kw} card of a step if on any, and ccx 2.23 acts on it on the "
+                             f"first only (probed), so the {self._OP_NEW_WHAT[kw]} of the earlier "
+                             f"steps stay in force. Dropped; give every *{kw} card of the step "
+                             f"OP=NEW if they are to be removed.", once=True)
 
     # ======================================================================
     # *BOUNDARY, OP=NEW after rotational BCs on shell/beam nodes

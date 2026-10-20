@@ -6,6 +6,20 @@ physics.
 
 ## Unreleased
 
+* **Load entries ccx keys otherwise than Abaqus** — nodal forces converted from tractions,
+  beam line loads or surface-element pressures on a step-time amplitude are now held at their
+  end value in later steps, as Abaqus and ccx hold them: after the deck's `*CLOAD, OP=NEW` they
+  went out on the amplitude again, which ccx started over, and given again on their amplitude
+  they were not written, so ccx held the old value (2x). `GRAV` / `CENTRIF` given again in
+  another direction added to the old load (ccx keeps one per set and direction): a zero line
+  in the old direction now goes first. Two such lines of one set and direction on two
+  amplitudes in a step went on the later amplitude; the later one now goes on a copy of the
+  set (exact). One converted load on two amplitudes in a step, two `*CFLUX` / `*DFLUX`
+  amplitudes on one node or face (ccx stopped) and a second `*FILM` / `*RADIATE` on one face
+  (ccx kept the later only) are now left out, warned. OP=NEW on a later card of a step
+  (invalid in Abaqus, ignored by ccx) is dropped with a warning for every load card, as for
+  `*BOUNDARY`. A delayed `*CLOAD` / `*DLOAD` card whose twin had no data lines lost its
+  amplitude.
 * **One rule per step question** — the facts the converter reads from a deck's steps follow
   one rule each. A model-only deck (no procedure) with circular-section beams now gets the
   knot beams its rotational BCs need, as a mechanical deck does. A step with a second

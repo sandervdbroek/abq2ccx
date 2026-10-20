@@ -89,7 +89,8 @@ step), a coupling's INFLUENCE
 RADIUS against the coupling on the nodes within it, rotations coupled in an ORIENTATION's
 axes against the model turned into them, and *DLOAD BX / BY / BZ on shells (a strip against
 its C3D8 twin and the GRAV and pressure forms, also over steps; the Scordelis-Lo roof against
-its published deflection).
+its published deflection), and loads ccx keys otherwise than Abaqus (nodal forces on a step-time
+amplitude over steps, gravity per set and direction) against the plain loads Abaqus applies.
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -3931,6 +3932,42 @@ def delayed_traction_deck(pressure=False):
             "3, 3, 3\n4, 1, 1\n4, 3, 3\n*STEP\n*STATIC\n0.5, 2.\n*DSLOAD, AMPLITUDE=B, TIME DELAY=0.25\n"
             f"{load}\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n*STEP\n*STATIC\n*NODE PRINT, NSET=NALL\nU\n"
             "*END STEP\n")
+
+
+def load_entry_deck(case, ref=False):
+    """A unit C3D8 cube (E 1000, nu 0, density 1) held at x = 0, node 7 printed in each step,
+    under loads ccx 2.23 keys otherwise than Abaqus (``case``), or (``ref``) the plain loads
+    Abaqus applies there (Abaqus 2017, loads: a step-time amplitude's end value is held in the
+    later steps, a load given again replaces, two lines of one step add up).  Amplitudes A2
+    (0 to 2) and A3 (0 to 3) over time 1; step 2 has a period of 0.5."""
+    head = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=E\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n*NSET, NSET=FIX\n1, 4, 5, 8\n*NSET, NSET=N7\n7\n"
+            "*SURFACE, NAME=SA, TYPE=ELEMENT\nE, S4\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n"
+            "*DENSITY\n1.\n*SOLID SECTION, ELSET=E, MATERIAL=M\n*AMPLITUDE, NAME=A2\n0., 0., 1., 2.\n"
+            "*AMPLITUDE, NAME=A3\n0., 0., 1., 3.\n*BOUNDARY\nFIX, 1, 3\n")
+    step = "*STEP\n*STATIC\n{}{}*NODE PRINT, NSET=N7\nU\n*END STEP\n"
+    half = "0.5, 0.5\n"
+    steps = {
+        # a traction (nodal forces) on A2, then the deck's *CLOAD, OP=NEW: held at 2
+        "op_new": (("", "*DSLOAD, AMPLITUDE=A2\nSA, TRVEC, 1., 1., 0., 0.\n"),
+                   (half, "*CLOAD, OP=NEW\n7, 2, 0.1\n"),
+                   ("", "*DSLOAD\nSA, TRVEC, 2., 1., 0., 0.\n"),
+                   (half, "*DSLOAD\nSA, TRVEC, 2., 1., 0., 0.\n*CLOAD\n7, 2, 0.1\n")),
+        # the same traction on A3 in both steps: A3 starts over (0.5 x A3(0.5) = 0.75)
+        "again": (("", "*DSLOAD, AMPLITUDE=A3\nSA, TRVEC, 0.5, 0., 1., 0.\n"),
+                  (half, "*DSLOAD, AMPLITUDE=A3\nSA, TRVEC, 0.5, 0., 1., 0.\n"),
+                  ("", "*DSLOAD\nSA, TRVEC, 1.5, 0., 1., 0.\n"),
+                  (half, "*DSLOAD\nSA, TRVEC, 0.75, 0., 1., 0.\n")),
+        # gravity given again the other way: it replaces
+        "turned": (("", "*DLOAD\nE, GRAV, 2., 1., 0., 0.\n"), ("", "*DLOAD\nE, GRAV, 4., -1., 0., 0.\n"),
+                   ("", "*DLOAD\nE, GRAV, 2., 1., 0., 0.\n"),
+                   ("", "*DLOAD, OP=NEW\nE, GRAV, 4., -1., 0., 0.\n")),
+        # two gravity lines of one step on two amplitudes: 3 + 1
+        "two_amplitudes": (("", "*DLOAD, AMPLITUDE=A3\nE, GRAV, 1., 1., 0., 0.\n*DLOAD\n"
+                                "E, GRAV, 1., 1., 0., 0.\n"), None,
+                           ("", "*DLOAD\nE, GRAV, 4., 1., 0., 0.\n"), None)}[case]
+    return head + "".join(step.format(*p) for p in (steps[2:] if ref else steps[:2]) if p)
 
 
 def gradient_base_deck(case, ref=False):
@@ -10363,6 +10400,23 @@ def main():
               f"nothing): the top at {min(top):.7g} to {max(top):.7g} in both steps (-2.5, the "
               f"delayed amplitude's end value; -3 undelayed), as under that pressure ({err:.1e} apart)")
     failures += 0 if ok else 1
+    # loads ccx 2.23 keys otherwise than Abaqus: converted nodal forces on a step-time
+    # amplitude (held at their end value plain; before: given again after OP=NEW on the
+    # amplitude, which ccx started over, 0.000779 for 0.001779, or not written again on it, 0.006
+    # for 0.003), and gravity per set and direction (before: the turned line added to the old
+    # one, -0.001 for -0.002, and two lines on two amplitudes went on the later one, 0.001 for
+    # 0.002); node 7 against the plain loads Abaqus applies
+    for case in ("op_new", "again", "turned", "two_amplitudes"):
+        runs = [review_run(load_entry_deck(case, r), f"load_entries_{case}" + ("_ref" if r else ""),
+                           dat_node_blocks) for r in (False, True)]
+        ok = all(runs) and len(runs[0]) == len(runs[1]) == (1 if case == "two_amplitudes" else 2)
+        if ok:
+            err, moved = same(runs)
+            ok = err < 1e-9 * moved
+            print(f"{'PASS' if ok else 'FAIL'}  load_entries ({case}): node 7 at " + "; ".join(
+                ", ".join(f"{x:.7g}" for x in b[7]) for b in runs[0]) + f" in each step, as under "
+                f"the plain loads Abaqus applies ({err:.1e} apart)")
+        failures += 0 if ok else 1
     # a static perturbation step's gradient over one-value base temperatures (the gradient a
     # change of 0), and the general step after one right after the initial temperatures, which
     # *TEMPERATURE, OP=NEW would leave with its gradient: the converter warned and left the
