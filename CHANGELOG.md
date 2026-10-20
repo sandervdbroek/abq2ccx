@@ -111,6 +111,14 @@ physics.
   position everywhere: a line with a blank first or last member is skipped (it was compacted,
   so `1, , 4` read as 1 to 4), and the planners read a negative or zero increment the way the
   set handler does.
+* **Trusses at shell nodes, and the legacy `*DISTRIBUTING COUPLING`** — ccx 2.23 crashed without a
+  message (exit 255) on some shell nodes a truss shares: its knot there could not turn about the
+  shell normal. Where it ran, it was up to 1e-2 off. Such a truss now ends at a copy of the node,
+  tied to it through a hub node with two knot beams, and matches the truss as a spring (probed).
+  A `*DISTRIBUTING COUPLING` (DCOUP2D / DCOUP3D) now becomes the equations of `*COUPLING` +
+  `*DISTRIBUTING`. ccx's card dropped the moments and the reference node's offset; the result
+  now matches Abaqus' Verification Guide to 3 digits. A distributing coupling on membrane faces
+  is written as equations too. ccx's card was 20 % off there, or transmitted nothing on M3D3.
 * **More `*EQUATION`s held by BCs in some steps** — two more cases no longer stop ccx 2.23
   ('dependent side of a MPC and a SPC'). In the first, each step holds one DOF of the equation
   ("crossed" holds); the BC at zero moves onto the DOF that step leaves free. In the second,

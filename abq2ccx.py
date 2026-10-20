@@ -6413,8 +6413,11 @@ class Converter:
         self._kinematic_ids: set = set()           # id(*COUPLING) followed by *KINEMATIC
         self._distributing_ids: set = set()        # ... by *DISTRIBUTING
         self._dist_plans: Dict[int, dict] = {}     # ... written as *EQUATIONs (_plan_distributing)
+        self._dcoup: Dict[int, List[dict]] = {}    # legacy *DISTRIBUTING COUPLING -> its plans
         self._dist_weighted: set = set()           # node surfaces only those take the weights of
         self._truss_copies: Dict[int, int] = {}    # beam node -> copy its lower trusses end at
+        self._truss_hubs: Dict[int, Tuple[int, int]] = {}  # shell node -> (hub, copy) of its trusses
+        self._truss_hub_bc: List[str] = []         # the hubs' rotations held (_plan_truss_copies)
         self._ref_set_kept: Dict[int, str] = {}    # id(*COUPLING) on several ref nodes -> why one
         self._nearest_facet: set = set()           # ... whose INFLUENCE RADIUS reaches no facet
         self._mem_thinning: Dict[str, Optional[float]] = {}  # membrane material -> its thinning ratio
@@ -7198,6 +7201,7 @@ class Converter:
         "COUPLING": "handle_coupling_card",
         "KINEMATIC": "handle_kinematic",
         "DISTRIBUTING": "handle_distributing",
+        "DISTRIBUTING COUPLING": "handle_distributing_coupling",
         "SURFACE INTERACTION": "handle_surface_interaction",
         "INITIAL CONDITIONS": "handle_initial_conditions",
         "TEMPERATURE": "handle_temperature",
@@ -11262,6 +11266,8 @@ class Converter:
         if self._kin_hold_bc and op_new:
             out += ["** abq2ccx: free reference node rotations held again (OP=NEW removed "
                     "it)"] + self._kin_hold_bc
+        if self._truss_hub_bc and op_new:
+            out += ["** abq2ccx: truss hub rotations held again (OP=NEW removed it)"] + self._truss_hub_bc
         if self._conn_bcs and op_new:
             # bare lines: on a card with FIXED or an amplitude they would take it on too
             out += (["*BOUNDARY"] if any(k != "OP" for k in params) else []) + self._conn_bcs
@@ -18402,6 +18408,32 @@ class Converter:
                              "without them ccx spreads no moment on the reference node (probed).", once=True)
         return out
 
+    def handle_distributing_coupling(self, b: Block) -> List[str]:
+        """Legacy ``*DISTRIBUTING COUPLING`` (DCOUP2D / DCOUP3D elements): written as the
+        *EQUATIONs of Abaqus' distributing constraint where planned (_dcoup_plans; its elements
+        then leave the mesh), else passed through to ccx's card, which ties the reference
+        node's translations to the coupling nodes' weighted mean alone (warned)."""
+        plans = self._dcoup.get(id(b), [])
+        if plans and all("rows" in p for p in plans):
+            return [x for p in plans for x in self._distributing_lines(b, p)]
+        for plan in plans:
+            if "why" in plan:
+                self._warn_dcoup_kept(plan)
+        return self.passthrough(b)
+
+    def _warn_dcoup_kept(self, plan: dict) -> None:
+        """Warn that a legacy *DISTRIBUTING COUPLING stays ccx's card (_dcoup_plans: ``why``),
+        which carries no rotation and no moment from the reference node's offset (probed:
+        Abaqus' Verification Guide DCOUP3D problem, u = (3.9e-3, 0, 0) where Abaqus has
+        (6.67e-3, -1.67e-2, 0))."""
+        ref = plan["ref"]
+        self.report.warn(f"*DISTRIBUTING COUPLING (reference node {ref}) kept as ccx's card, as "
+                         f"{plan['why']}: ccx ties the reference node's translations to the coupling "
+                         f"nodes' weighted mean only, with no rotation and no moment from the node's "
+                         f"offset (probed); Abaqus' element (DOFs 1-6) carries both.", once=True)
+        if plan["matters"]:
+            self._reduces("*DISTRIBUTING COUPLING without rotations or offset moments")
+
     def _plan_distributing(self, blocks: List[Block], next_id: int) -> int:
         """*COUPLING + *DISTRIBUTING as Abaqus' distributing constraint.  ccx 2.23's card only
         spreads the loads on the reference node over the surface (its manual; probed: a BC on
@@ -18415,9 +18447,12 @@ class Converter:
         WEIGHTING METHOD.  The rotation is a shell/beam reference node's own (a knot), else a
         ROT NODE's DOFs 1-3 (ccx ignores DOFs 4-6 of a node without rotations: probed), made
         where the deck acts on it (_distributing_rot_used); beam nodes in the equations become
-        knots (a plain beam node misreads them: probed).  Returns the next free node id."""
+        knots (a plain beam node misreads them: probed).  The legacy *DISTRIBUTING COUPLING is
+        that constraint too (_dcoup_plans).  Returns the next free node id."""
         self._dist_plans = {}
-        if not self._mechanical or not self._distributing_ids:
+        self._dcoup = {}
+        legacy = [b for b in blocks if b.keyword == "DISTRIBUTING COUPLING"]
+        if not self._mechanical or not (self._distributing_ids or legacy):
             return next_id
         expanded: Dict[int, str] = {}           # node -> "beam" / "shell" (ccx expands those) / "axi"
         u1: set = set()
@@ -18435,13 +18470,29 @@ class Converter:
                     expanded.setdefault(n, "axi")
         bcs = {n for n, _ in self._boundary_dofs(blocks)}
         knots: List[int] = []
+        todo: List[dict] = []
         for b, nxt in zip(blocks, blocks[1:]):
             if id(b) not in self._distributing_ids:
                 continue
             plan = self._distributing_plan(b, nxt, blocks, expanded, u1, bcs)
-            if plan is None:
+            if plan is not None:
+                self._dist_plans[id(b)] = plan
+                todo.append(plan)
+        for b in legacy:
+            plans = self._dcoup_plans(b, blocks, expanded, u1, bcs)
+            if not plans:
                 continue
-            self._dist_plans[id(b)] = plan
+            self._dcoup[id(b)] = plans
+            if any("why" in p for p in plans):
+                continue
+            todo += plans
+            gone = {p["legacy"] for p in plans}       # (the elements become the *EQUATIONs)
+            for e in gone:
+                del self.geom.elements[e]
+            for name, ids in self.geom.elsets.items():
+                if any(i in gone for i in ids):
+                    self.geom.elsets[name] = [i for i in ids if i not in gone]
+        for plan in todo:
             if "why" in plan:
                 continue
             ref = plan["ref"]
@@ -18477,19 +18528,10 @@ class Converter:
         if dist.keyword != "DISTRIBUTING" or ref is None or ref not in self.geom.nodes or \
                 surf.upper() not in self.surfaces:
             return None
-        rot_used = self._distributing_rot_used(ref, blocks)
-        plan: dict = {"ref": ref, "line": emit_keyword("COUPLING", b.params),
-                      "matters": ref in bcs or rot_used or
-                      any(ref in conn for _, conn in self.geom.elements.values()),
-                      "method": dist.uparam("WEIGHTING METHOD") or "UNIFORM",
-                      "oriented": bool((b.param("ORIENTATION") or "").strip()),
-                      "loaded": any(ref in self._resolve_nodes(rec[0]) for c in blocks if c.keyword == "CLOAD"
-                                    for rec in merged_data_records(c) if rec and rec[0])}
         weights, why = self._distributing_weights(b, dist, ref)
-        if not why and (not weights or sum(weights.values()) <= 0.0):
-            why = "it couples no node (or weights summing to zero)"
-        elif not why and any(expanded.get(n) == "axi" for n in weights):
-            why = "it couples an axisymmetric surface (Abaqus' weights there not verified)"
+        if not why and any(expanded.get(n) == "axi" for n in weights):
+            why = ("it couples an axisymmetric surface (Abaqus' pages do not say whether the "
+                   "tributary areas there take the radius)")
         listed: set = set()
         for rec in merged_data_records(dist):
             f = [x for x in rec if x != ""]
@@ -18500,12 +18542,85 @@ class Converter:
                 why = why or f"a *DISTRIBUTING line that does not read ({', '.join(f)})"
                 continue
             listed.update(range(min(d1, d2), max(d1, d2) + 1) if f else ())
+        two_d = bool(self.geom.elements) and not self._planar_others
+        return self._distributing_constraint(b, ref, weights, why, listed, two_d, blocks, expanded, u1, bcs,
+                                             line=emit_keyword("COUPLING", b.params),
+                                             method=dist.uparam("WEIGHTING METHOD") or "UNIFORM",
+                                             structural=dist.uparam("COUPLING") == "STRUCTURAL")
+
+    def _dcoup_plans(self, b: Block, blocks: List[Block], expanded: Dict[int, str], u1: set,
+                     bcs: set) -> List[dict]:
+        """The plans of a legacy *DISTRIBUTING COUPLING ``b`` (_plan_distributing), one per
+        DCOUP2D / DCOUP3D element of its ELSET, whose node is the reference node: Abaqus'
+        element is the constraint of *COUPLING + *DISTRIBUTING (Theory Guide 'Distributing
+        coupling constraints': 'used for the distributing coupling elements'; the Verification
+        Guide's DCOUP3D tables follow it to 3 digits, offset moments too), on DOFs 1-6 (DCOUP2D:
+        1, 2, 6), with the data lines' weights normalized.  ccx's card ties the translations to
+        the weighted mean alone (probed: no moment, no moment from the reference node's offset).
+        With "why" where it stays ccx's card."""
+        elems = [e for e in self.geom.elset((b.param("ELSET") or "").strip())
+                 if self.geom.elements.get(e, ("",))[0].upper() in ("DCOUP2D", "DCOUP3D")]
+        weights: "OrderedDict[int, float]" = OrderedDict()
+        why = None if elems else "its ELSET holds no DCOUP2D / DCOUP3D element"
+        for rec in merged_data_records(b):
+            f = [x.strip() for x in rec]
+            if not f or not f[0]:
+                continue
+            try:
+                w = pf(f[1]) if len(f) > 1 and f[1] else 1.0
+            except ValueError:
+                why = why or f"a weight that does not read as a number ({f[1]})"
+                continue
+            for n in self._resolve_nodes(f[0]):
+                weights[n] = weights.get(n, 0.0) + w
+        dset = set(elems)
+        if not why and any(blk.keyword in ("MASS", "ROTARY INERTIA") and
+                           dset & set(self.geom.elset((blk.param("ELSET") or "").strip())) for blk in blocks):
+            why = ("its element carries a *MASS / *ROTARY INERTIA, which Abaqus spreads over the "
+                   "coupling nodes by the weights (not converted)")
+        if not why and any(expanded.get(n) == "axi" for n in weights):
+            why = "it couples axisymmetric nodes (DCOUP2D there: Abaqus' weights are the user's own)"
+        if not why and any(n not in self.geom.nodes for n in weights):
+            why = "it names an undefined node"
+        line = emit_keyword("DISTRIBUTING COUPLING", b.params)
+        plans = []
+        for e in elems:
+            ref = self.geom.elements[e][1][0]
+            if ref not in self.geom.nodes:
+                return []
+            w = OrderedDict((n, v) for n, v in weights.items() if n != ref)
+            plan = self._distributing_constraint(
+                b, ref, w, why or (None if len(w) >= 2 else "it couples fewer than two nodes"), set(),
+                self.geom.elements[e][0].upper() == "DCOUP2D", blocks, expanded, u1, bcs, line=line,
+                method="UNIFORM", structural=False)
+            plan.update(legacy=e)
+            plans.append(plan)
+        return plans
+
+    def _distributing_constraint(self, b: Block, ref: int, weights: "OrderedDict[int, float]",
+                                 why: Optional[str], listed: set, two_d: bool, blocks: List[Block],
+                                 expanded: Dict[int, str], u1: set, bcs: set, line: str, method: str,
+                                 structural: bool) -> dict:
+        """The plan of the distributing constraint on reference node ``ref`` and the coupling
+        nodes ``weights`` (_distributing_plan, _dcoup_plans): its matrices, the translations and
+        rotations it ties (``listed``: the DOFs given, none = all) and where the rotation goes,
+        or with "why" the reason it stays ccx's card."""
+        rot_used = self._distributing_rot_used(ref, blocks)
+        plan: dict = {"ref": ref, "line": line,
+                      "matters": ref in bcs or rot_used or
+                      any(ref in conn for typ, conn in self.geom.elements.values()
+                          if typ.upper() not in ("DCOUP2D", "DCOUP3D")),
+                      "method": method,
+                      "oriented": bool((b.param("ORIENTATION") or "").strip()),
+                      "loaded": any(ref in self._resolve_nodes(rec[0]) for c in blocks if c.keyword == "CLOAD"
+                                    for rec in merged_data_records(c) if rec and rec[0])}
+        if not why and (not weights or sum(weights.values()) <= 0.0):
+            why = "it couples no node (or weights summing to zero)"
         if why:
             return dict(plan, why=why)
         members = list(weights)
         mats, null = distributing_matrices({n: self.geom.nodes[n] for n in members}, weights,
                                            self.geom.nodes[ref])
-        two_d = bool(self.geom.elements) and not self._planar_others
         rot_dofs = (6,) if two_d else (4, 5, 6)
         rots = [d for d in rot_dofs if not listed or d in listed]
         own = ref in u1 or expanded.get(ref) in ("beam", "shell")
@@ -18545,7 +18660,7 @@ class Converter:
                                   "small rotations; rerun with --approximate to write them)")
         plan.update(members=members, mats=mats, rots=rots, axes=axes, two_d=two_d,
                     carrier=None if not rots else "own" if own else "rot",
-                    approx=turns and self._nl_any, structural=dist.uparam("COUPLING") == "STRUCTURAL")
+                    approx=turns and self._nl_any, structural=structural)
         return plan
 
     @staticmethod
@@ -18611,15 +18726,15 @@ class Converter:
     def _facet_areas(self, e: int, face: Optional[str], types: Dict[str, str]
                      ) -> Tuple[List[Tuple[int, float]], Optional[str]]:
         """(node, tributary area) of facet ``face`` of element ``e`` — integral N_i dA over a
-        solid's face or a shell's reference surface, N_i ds times the thickness along a plane
-        element's edge, N_i ds along a shell edge — or why there is none to take."""
+        solid's face or a shell's or membrane's reference surface, N_i ds times the thickness
+        along a plane element's edge, N_i ds along a shell or membrane edge — or why there is
+        none to take.  (*EQUATION terms on membrane nodes are exact: ccx hinges a membrane's
+        expanded nodes to the node, which keeps its DOFs; probed on an M3D4 / M3D3 skin.)"""
         info = self.geom.elements.get(e)
         if info is None:
             return [], f"its surface names element {e}, which is not defined"
         cc, label = ccx_type(info[0]), (face or "").upper()
-        if cc.startswith("M3D"):
-            return [], "it couples membrane faces (ccx's card spreads loads over them; not converted)"
-        if (cc in SHELL_TYPES) and re.fullmatch(r"E[1-4]|S[3-6]", label):
+        if (cc in SHELL_TYPES or cc.startswith("M3D")) and re.fullmatch(r"E[1-4]|S[3-6]", label):
             nodes, _ = self._facet(e, label, types)
             kind, scale = "line", 1.0
         else:
@@ -18651,7 +18766,7 @@ class Converter:
     def _plan_distributing_rows(self) -> None:
         """The *EQUATION rows of the planned distributing couplings, once the ROT NODEs have
         their axes (_plan_rot_axes); the twins of transformed nodes they use are made here."""
-        for plan in self._dist_plans.values():
+        for plan in list(self._dist_plans.values()) + [p for ps in self._dcoup.values() for p in ps]:
             if "why" not in plan:
                 plan["rows"] = self._distributing_rows(plan)
 
@@ -18699,35 +18814,46 @@ class Converter:
         """The *EQUATIONs of a planned distributing coupling (_plan_distributing), with its
         notes and warnings."""
         rows, ref = plan["rows"], plan["ref"]
-        self.report.note("*COUPLING + *DISTRIBUTING -> *EQUATIONs of Abaqus' distributing "
-                         "constraint (Theory Guide): the reference node moves with the weighted mean "
-                         "of the coupling nodes' motion plus the rotation of their weighted "
-                         "least-squares fit, and turns with that rotation (weights: tributary areas "
-                         "as ccx takes them, a node surface's areas, WEIGHTING METHOD). ccx's own "
-                         "card only spreads the node's loads (probed: a BC there moved nothing, the "
-                         "node printed U = 0); loads on the node spread as before.", once=True)
+        if "legacy" in plan:
+            self.report.note("*DISTRIBUTING COUPLING (DCOUP2D / DCOUP3D) -> *EQUATIONs of Abaqus' "
+                             "distributing constraint, which its element is (Theory Guide): the "
+                             "reference node moves with the weighted mean of the coupling nodes' "
+                             "motion plus the rotation of their weighted least-squares fit, and "
+                             "turns with it (DOFs 1-6; DCOUP2D 1, 2, 6). ccx's card ties the "
+                             "translations alone (probed: no moment, none from the node's offset); "
+                             "the element leaves the mesh.", once=True)
+            head = f"** abq2ccx: {plan['line']} (element {plan['legacy']}) -> *EQUATIONs"
+        else:
+            self.report.note("*COUPLING + *DISTRIBUTING -> *EQUATIONs of Abaqus' distributing "
+                             "constraint (Theory Guide): the reference node moves with the weighted mean "
+                             "of the coupling nodes' motion plus the rotation of their weighted "
+                             "least-squares fit, and turns with that rotation (weights: tributary areas "
+                             "as ccx takes them, a node surface's areas, WEIGHTING METHOD). ccx's own "
+                             "card only spreads the node's loads (probed: a BC there moved nothing, the "
+                             "node printed U = 0); loads on the node spread as before.", once=True)
+            head = f"** abq2ccx: {plan['line']} + *DISTRIBUTING -> *EQUATIONs"
         if plan["carrier"] == "rot" and ref in self._rb_rot_synth:
             self.report.note("Rotation of a distributing coupling's reference node carried on a "
                              "ROT NODE's DOFs 1-3, where its rotational BCs, moments and *EQUATION "
                              "terms go (ccx ignores DOFs 4-6 of a node without rotations; probed).",
                              once=True)
         if plan.get("collinear"):
-            self.report.note("*COUPLING, *DISTRIBUTING on collinear coupling nodes: no moment about "
+            self.report.note("Distributing coupling on collinear coupling nodes: no moment about "
                              "their line is transmitted, as in Abaqus.", once=True)
         if plan.get("rot_lost"):
-            self.report.warn(f"*COUPLING, *DISTRIBUTING: the reference node's rotation is not tied to "
-                             f"the surface: {plan['rot_lost']}.", once=True)
+            self.report.warn(f"Distributing coupling: the reference node's rotation is not tied to "
+                             f"the coupling nodes: {plan['rot_lost']}.", once=True)
             self._reduces("distributing coupling rotation not tied")
         if plan["structural"]:
             self.report.warn("*DISTRIBUTING, COUPLING=STRUCTURAL written as the default continuum "
                              "coupling: the coupling nodes' own rotations are not averaged.", once=True)
             self._reduces("*DISTRIBUTING, COUPLING=STRUCTURAL")
         if plan["approx"]:
-            self.report.warn("[APPROX] *COUPLING, *DISTRIBUTING in a deck with NLGEOM written as linear "
+            self.report.warn("[APPROX] Distributing coupling in a deck with NLGEOM written as linear "
                              "*EQUATIONs: exact for small rotations of the surface; Abaqus' constraint "
                              "follows its finite rotation.", once=True)
-        return ([f"** abq2ccx: {plan['line']} + *DISTRIBUTING -> *EQUATIONs (reference node {ref}, "
-                 f"{len(plan['members'])} coupling nodes)"] + self._twin_lines(rows) + self._equation_lines(rows))
+        return ([f"{head} (reference node {ref}, {len(plan['members'])} coupling nodes)"]
+                + self._twin_lines(rows) + self._equation_lines(rows))
 
     def _warn_distributing_kept(self, plan: dict) -> None:
         """Warn that a distributing coupling stays ccx's card (_plan_distributing: ``why``).
@@ -18877,8 +19003,25 @@ class Converter:
         1e-16; the ties without the knot are misread on a plain beam node, 189 % off).  A
         beam's pre-tension cut node counts as a beam node (the cut element ends there in
         Abaqus).  The copy takes the node's temperatures, field values and *TRANSFORM
-        (_tied_nodes), not its BCs or sets; U1 beams keep their own rotations."""
+        (_tied_nodes), not its BCs or sets; U1 beams keep their own rotations.
+
+        A node that shells and trusses share without a beam: ccx 2.23 makes it a knot (two
+        expansions) whose expanded shell nodes lie on the shell normal, and holds the knot's
+        turn about that line by one constraint along the truss's second section axis (t x the
+        default first axis of solidsections.f; gen3dnor).  Where that axis is normal to the
+        shell normal the turn has no stiffness and ccx crashes in spooles (exit 255, no
+        message; probed: holding that rotation cures each case); where it runs, the knot's
+        rigid normal is off (S4 2e-4, S8R 1e-2 of the deflection).  So every truss there ends at
+        a copy C of the node, tied in translations to a hub K, itself tied to the node: K is a
+        knot of two knot beams numbered below C, its rotation held (it carries nothing), and
+        the shell node stays a plain one (probed: = the trusses as axial springs on the node to
+        1e-7, S4 and S8R, also in *FREQUENCY; ccx misreads the ties in some planes of the shell
+        with C straight on the node, with K element-less, a single knot beam or K above C, and
+        clamps the truss's section with the knot beam on C, 1e-3..1.5).  Membranes and plane
+        elements with a truss run exactly (probed)."""
         self._truss_copies = {}
+        self._truss_hubs = {}
+        self._truss_hub_bc = []
         if not self._mechanical:
             return
         at: Dict[int, List[Tuple[int, str]]] = {}
@@ -18890,32 +19033,57 @@ class Converter:
                 at.setdefault(n, []).append((e, kind))
         cut = {c["node"] for c in self._pt_cuts.values() if c["beam"] and c["elem"] not in self._u1}
         knots: List[int] = []
-        moved = 0
+        moved = shelled = 0
         for n, els in at.items():
-            if any(k == "u1" for _, k in els) or not (n in cut or any(k == "beam" for _, k in els)):
+            kinds = {k for _, k in els}
+            if "u1" in kinds or n not in self.geom.nodes:
                 continue
-            first = min((e for e, k in els if k in ("beam", "shell")), default=None)
-            low = [e for e, k in els if k == "truss" and (first is None or e < first)]
-            if not low or n not in self.geom.nodes:
+            if n in cut or "beam" in kinds:
+                first = min((e for e, k in els if k in ("beam", "shell")), default=None)
+                low = [e for e, k in els if k == "truss" and (first is None or e < first)]
+            elif "shell" in kinds:
+                low = [e for e, k in els if k == "truss"]
+            else:
                 continue
-            copy = max(self.geom.nodes) + 1
-            self.geom.add_node(copy, self.geom.nodes[n])
+            if not low:
+                continue
+            beam = n in cut or "beam" in kinds
+            hub = max(self.geom.nodes) + 1
+            copy = hub + (0 if beam else 1)
+            for x in sorted({hub, copy}):
+                self.geom.add_node(x, self.geom.nodes[n])
+                self._tied_nodes.append((n, n, x, 0.0))
             for e in low:
                 typ, conn = self.geom.elements[e]
                 self.geom.elements[e] = (typ, [copy if x == n else x for x in conn])
-            self._tied_nodes.append((n, n, copy, 0.0))
-            self._truss_copies[n] = copy
-            knots.append(n)
-            moved += len(low)
+            if beam:
+                self._truss_copies[n] = copy
+                knots.append(n)
+                moved += len(low)
+            else:
+                self._truss_hubs[n] = (hub, copy)
+                knots.append(hub)
+                shelled += len(low)
         if not knots:
             return
         self._add_knot_beams(knots, blocks)
-        self.report.note(f"{moved} truss(es) numbered below every beam at a node they share with one "
-                         f"end at a copy of the node, tied to it in translations, and the node got a "
-                         f"knot beam: ccx 2.23 gives a node its lowest-numbered beam or truss's "
-                         f"expansion, so the node would have no rotations — ccx stops on a "
-                         f"rotational BC, moment or *EQUATION there and otherwise holds the beams' "
-                         f"rotation there (probed: 93 % stiffer); Abaqus' beam turns there.")
+        hubs = [k for k, _c in self._truss_hubs.values()]
+        self._add_knot_beams(hubs, blocks, along=(1.0, 1.0, -1.0))
+        self._truss_hub_bc = (["*BOUNDARY"] + [f"{k}, 4, 6" for k in hubs]) if hubs else []
+        if moved:
+            self.report.note(f"{moved} truss(es) numbered below every beam at a node they share with one "
+                             f"end at a copy of the node, tied to it in translations, and the node got a "
+                             f"knot beam: ccx 2.23 gives a node its lowest-numbered beam or truss's "
+                             f"expansion, so the node would have no rotations — ccx stops on a "
+                             f"rotational BC, moment or *EQUATION there and otherwise holds the beams' "
+                             f"rotation there (probed: 93 % stiffer); Abaqus' beam turns there.")
+        if shelled:
+            self.report.note(f"{shelled} truss(es) at shell nodes without a beam end at a copy of the "
+                             f"node, tied to it in translations through a hub node with two knot "
+                             f"beams: ccx 2.23 makes such a node a knot whose turn about the shell "
+                             f"normal can lack any stiffness (spooles then crashes without a message; "
+                             f"probed) and whose rigid normal is off where it runs (up to 1e-2). "
+                             f"Exact (probed).")
 
     def _plan_dashpots(self, blocks: List[Block]) -> None:
         """DASHPOT1 elements: a node's DOF d to ground, acting in a fixed direction v even under
@@ -19028,11 +19196,19 @@ class Converter:
         return [emit_keyword("DASHPOT", params)] + list(b.data[1:])
 
     def _truss_copy_cards(self) -> List[str]:
-        """u_copy = u_node for the trusses moved off a beam node (_plan_truss_copies), in the
-        node's DOFs (the copy has its *TRANSFORM)."""
-        rows = [[(c, k, 1.0), (n, k, -1.0)] for n, c in self._truss_copies.items() for k in (1, 2, 3)]
-        return (["** abq2ccx: trusses numbered below the beams at a node end at a tied copy of it "
-                 "(ccx would give the node no rotations)"] + self._equation_lines(rows)) if rows else []
+        """u_copy = u_node for the trusses moved off a beam node, u_hub = u_node and u_copy =
+        u_hub for those moved off a shell node (_plan_truss_copies), in the node's DOFs (the
+        copy and the hub have its *TRANSFORM), and the hubs' rotations held; where a step solves
+        for temperatures, in DOF 11 too (as a *MPC TIE: the trusses' heat flows through)."""
+        dofs = (1, 2, 3, 11) if self._mpc_thermal else (1, 2, 3)
+        rows = [[(c, k, 1.0), (n, k, -1.0)] for n, c in self._truss_copies.items() for k in dofs]
+        hubs = [[(h, k, 1.0), (n, k, -1.0)] for n, (h, _c) in self._truss_hubs.items() for k in dofs] + \
+            [[(c, k, 1.0), (h, k, -1.0)] for h, c in self._truss_hubs.values() for k in dofs]
+        return ((["** abq2ccx: trusses numbered below the beams at a node end at a tied copy of it "
+                  "(ccx would give the node no rotations)"] + self._equation_lines(rows)) if rows else []) + \
+            ((["** abq2ccx: trusses at shell nodes end at a copy tied to the node through a held knot "
+               "hub (ccx's own knot there can be singular)"] + self._equation_lines(hubs) +
+              self._truss_hub_bc) if hubs else [])
 
     def _rotations_acted_on(self, blocks: List[Block], node: int) -> bool:
         """Whether a *BOUNDARY or *CLOAD of the deck acts on a rotation (DOF 4-6) of ``node``."""
@@ -27660,14 +27836,16 @@ class Converter:
                              f"rotations a connector constrains got force-free knot beams too "
                              f"(elset/material {KNOT_SET}), which give them real rotations.")
 
-    def _add_knot_beams(self, nodes: Sequence[int], blocks: List[Block]) -> None:
+    def _add_knot_beams(self, nodes: Sequence[int], blocks: List[Block],
+                        along: Optional[Vec] = None) -> None:
         """Give each of ``nodes`` a force-free *knot beam*: a B31 from the node to a new free
         end node, in elset/material KNOT_SET without density, so it carries no load in any
         procedure.  ccx makes a node that two different beam expansions share a knot — a
         rigid section whose rotations are true DOFs (rotational BCs, moments and MPC terms
         act on its rotation node).  The first call fixes the beams' length, size, modulus
-        and (thermal decks) conductivity; nodes that already have one are skipped."""
-        nodes = [n for n in dedup(nodes) if n in self.geom.nodes and n not in self._knots]
+        and (thermal decks) conductivity; nodes that already have one are skipped — unless
+        ``along`` gives a second one's direction (not along the first's: two expansions)."""
+        nodes = [n for n in dedup(nodes) if n in self.geom.nodes and (along or n not in self._knots)]
         if not nodes:
             return
         if not self._knots:
@@ -27699,7 +27877,7 @@ class Converter:
                         except (IndexError, ValueError):
                             pass
                 self._knot_k = max([k for k in ks if k > 0] or [1.0])
-        d = vunit((1.0, 1.0, 1.0))
+        d = vunit(along or (1.0, 1.0, 1.0))
         nid, eid = self._next_ids()
         elems = []
         for n in nodes:
@@ -27707,7 +27885,7 @@ class Converter:
             eid += 1
             self.geom.add_node(nid, vadd(self.geom.nodes[n], vscale(d, self._knot_ell)))
             self.geom.add_element(eid, "B31", [n, nid])
-            self._knots[n] = nid
+            self._knots.setdefault(n, nid)
             elems.append(eid)
         self.geom.add_to_elset(KNOT_SET, elems)
 
@@ -30342,7 +30520,8 @@ class Converter:
         *MPC nodes, *RIGID BODY members, coupling reference and member nodes, *TIE slaves.
         A *BOUNDARY on a dependent DOF stops ccx ('dependent side of a MPC and a SPC'), and
         their out-of-plane motion follows the constraint (also a pre-tension cut's node copy)."""
-        held: set = {cut["copy"] for cut in self._pt_cuts.values()} | set(self._truss_copies.values())
+        held: set = {cut["copy"] for cut in self._pt_cuts.values()} | set(self._truss_copies.values()) | \
+            {x for pair in self._truss_hubs.values() for x in pair}
         for b in blocks:
             kw = b.keyword
             if kw == "EQUATION":

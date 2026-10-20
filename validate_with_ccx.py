@@ -678,6 +678,71 @@ def truss_below_beams_deck(truss_first, step):
                       "*STEP", "*STATIC"] + list(step) + ["*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
 
 
+
+def shell_truss_deck(typ="S4", plane="xy", d=(0.0, -0.5, -1.0), first=True, spring=False):
+    """A 3 x 2 strip of unit S4 / S8R shells (t 0.05, E 210000, nu 0.3) in the x-y or x-z plane,
+    clamped along x = 0, its tip nodes loaded by 1 across the plane and 0.3 along x, with a
+    T3D2 (area 1e-4) from the inner node at x = 2 to the held node 90 at the offset ``d`` (in-plane
+    x, in-plane y, normal), numbered before (``first``) or after the shells; ``spring``: the truss
+    as an axial SPRINGA of its stiffness EA / L, which ccx does not expand."""
+    quad = typ.startswith("S8")
+    sx = 2 if quad else 1
+    nid = lambda i, j: 1 + i + (3 * sx + 1) * j                                   # noqa: E731
+    put = (lambda u, v, w: (u, v, w)) if plane == "xy" else (lambda u, v, w: (u, w, v))  # noqa: E731
+    xyz = {nid(i, j): put(i / sx, j / sx, 0.0) for j in range(2 * sx + 1) for i in range(3 * sx + 1)
+           if not (quad and i % 2 and j % 2)}
+    els = []
+    for j in range(2):
+        for i in range(3):
+            a, b = sx * i, sx * j
+            c = [nid(a, b), nid(a + sx, b), nid(a + sx, b + sx), nid(a, b + sx)]
+            els.append(c + ([nid(a + 1, b), nid(a + 2, b + 1), nid(a + 1, b + 2), nid(a, b + 1)] if quad else []))
+    n0 = nid(2 * sx, sx)
+    xyz[90] = tuple(p + q for p, q in zip(xyz[n0], put(*d)))
+    t = 1 if first else 10
+    clamp = [n for n, p in xyz.items() if n != 90 and p[0] == 0.0]
+    tip = [n for n, p in xyz.items() if n != 90 and p[0] == 3.0]
+    across = 3 if plane == "xy" else 2
+    return "\n".join(["*NODE, NSET=NALL"] + [f"{n}, {p[0]!r}, {p[1]!r}, {p[2]!r}" for n, p in xyz.items()]
+                     + [f"*ELEMENT, TYPE={typ}, ELSET=SH"] + [f"{e + (2 if first else 1)}, " + ", ".join(map(str, c))
+                                                         for e, c in enumerate(els)]
+                     + [f"*ELEMENT, TYPE={'SPRINGA' if spring else 'T3D2'}, ELSET=TR", f"{t}, {n0}, 90",
+                        "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.3", "*SHELL SECTION, ELSET=SH, MATERIAL=M", "0.05"]
+                     + (["*SPRING, ELSET=TR", "", repr(21.0 / math.dist(xyz[n0], xyz[90]))] if spring
+                        else ["*SOLID SECTION, ELSET=TR, MATERIAL=M", "0.0001"])
+                     + ["*NSET, NSET=CLAMP"] + _ids(clamp) + ["*BOUNDARY", "CLAMP, 1, 6", "90, 1, 3", "*STEP", "*STATIC",
+                                                             "*CLOAD"]
+                     + [f"{n}, {across}, 1." for n in tip] + [f"{n}, 1, 0.3" for n in tip]
+                     + ["*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
+
+
+# Abaqus 2017 Verification Guide, "Distributing coupling elements", linear DCOUP3D (exdc3lx1):
+# Tables 1-3 (reference node 10's displacements and rotations, coupling node 1's displacements)
+# per step, F = 1 and M = 2 on node 10: x and about z, y and about x, z and about y
+DCOUP3D_TABLES = {"u10": [(6.67e-3, -1.67e-2, 0.0), (-2.06e-3, 1.35e-2, -2.67e-2), (0.0, 0.0, 8.50e-2)],
+                  "r10": [(0.0, 0.0, 1.05e-2), (1.33e-2, -1.33e-2, -7.33e-3), (-2.67e-2, 4.50e-2, 0.0)],
+                  "u1": [(1.19e-3, 1.44e-3, 0.0), (2.97e-4, -5.78e-5, 6.67e-3), (0.0, 0.0, -1.83e-2)]}
+DCOUP3D_XYZ = {1: (1.0, 1.0, 0.0), 2: (1.0, 0.0, 0.0), 3: (0.0, 1.5, 0.0)}
+DCOUP3D_REF = (-1.0, 0.5, 0.0)
+
+
+def dcoup3d_deck(step):
+    """The Verification Guide's linear DCOUP3D problem (exdc3lx1) in its step ``step`` (0-2),
+    rebuilt from the text (not the deck itself) and the geometry its tables give back to 3
+    digits: coupling nodes 1-3 (DCOUP3D_XYZ) with weights 1, 2, 3, each on SPRING1s of 100 /
+    200 / 300 in DOFs 1-3 to ground; reference node 10 (DCOUP3D_REF), its DCOUP3D loaded by
+    F = 1 and M = 2."""
+    (fd, md) = ((1, 6), (2, 4), (3, 5))[step]
+    out = ["*NODE, NSET=NALL"] + [f"{n}, {x!r}, {y!r}, {z!r}" for n, (x, y, z) in
+                                  list(DCOUP3D_XYZ.items()) + [(10, DCOUP3D_REF)]]
+    out += ["*ELEMENT, TYPE=DCOUP3D, ELSET=DC", "10, 10"]
+    for d, k in ((1, 100.0), (2, 200.0), (3, 300.0)):
+        out += [f"*ELEMENT, TYPE=SPRING1, ELSET=K{d}"] + [f"{10 * d + n}, {n}" for n in (1, 2, 3)]
+        out += [f"*SPRING, ELSET=K{d}", str(d), repr(k)]
+    out += ["*DISTRIBUTING COUPLING, ELSET=DC", "1, 1.", "2, 2.", "3, 3.", "*STEP", "*STATIC", "*CLOAD",
+            f"10, {fd}, 1.", f"10, {md}, 2.", "*NODE PRINT, NSET=NALL", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
 # --- rigid tools: Abaqus decks built here, so that each variant differs only in the tool ----
 # A rigid flat punch pressed into an elastic block (3-D C3D8, plane-strain CPE4, axisymmetric
 # CAX4) under frictionless HARD contact; the tool is rigid elements (R3D4 / R2D2 / RAX2), an
@@ -7259,6 +7324,90 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  {tag} (a B31 cantilever with a T3D2 at mid-span numbered before the "
               f"beams): tip {', '.join(f'{x:.6g}' for x in lo[3])}, {err:.1e} of max |u| from the truss "
               f"numbered after them (ccx: 93 % stiffer under the tip load, stopped on the moment / BC)")
+        failures += 0 if ok else 1
+    # --- a truss at a shell node without a beam: ccx 2.23 makes the node a knot whose turn about
+    # the shell normal it holds along the truss's section axis only, normal to the shell normal in
+    # the first case, where spooles crashed (exit 255, no message); in the second the knot ran,
+    # 1e-3 off.  The truss ends at a copy tied through a hub of two knot beams to the node; the
+    # reference has the truss as an axial spring of its stiffness, which ccx does not expand
+    for tag, kw, base in (("shell_truss_node_s4", dict(typ="S4", plane="xy", d=(0.0, -0.5, -1.0), first=True),
+                           "crashed in spooles, exit 255"),
+                          ("shell_truss_node_s8r", dict(typ="S8R", plane="xz", d=(1.0, 0.0, 0.0), first=False),
+                           "1e-3 off; a tie straight to the node is misread in this plane")):
+        got, status, out = dist_run(tag, shell_truss_deck(**kw))
+        ref, rstatus, _ = dist_run(tag + "_spring", shell_truss_deck(spring=True, **kw))
+        if not got or not ref or set(ref) - set(got):
+            print(f"FAIL  {tag}: no solution ({status} / {rstatus})")
+            print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+            failures += 1
+            continue
+        big = max(abs(x) for v in ref.values() for x in v)
+        err = max(abs(x - y) for n in ref for x, y in zip(got[n], ref[n])) / big
+        tip = max(got, key=lambda n: abs(got[n][2 if kw["plane"] == "xy" else 1]) if n != 90 else 0.0)
+        ok = err < 1e-6 and big > 0.1
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({kw['typ']} strip in the {kw['plane'][0]}-{kw['plane'][1]} plane, a "
+              f"T3D2 at an inner node): every node {err:.1e} of max |u| ({big:.4g}, tip node {tip}) from the truss "
+              f"as an axial spring (ccx's own knot: {base})")
+        failures += 0 if ok else 1
+    # --- the legacy *DISTRIBUTING COUPLING (DCOUP3D) vs Abaqus' own results: the Verification
+    # Guide's linear problem, whose tables the equations of the distributing constraint give back
+    # to 3 digits, offset moments and rotations included (ccx's card: (3.89e-3, 0, 0) in step 1)
+    motion3, _ = distributing_relations(DCOUP3D_XYZ, {1: 1.0, 2: 2.0, 3: 3.0}, DCOUP3D_REF)
+    worst, exact, shown = 0.0, 0.0, []
+    for step in range(3):
+        got, status, out = dist_run(f"dcoup3d_verification_{step + 1}", dcoup3d_deck(step))
+        if not all(n in got for n in (1, 2, 3, 10)):
+            worst = float("inf")
+            shown.append(f"step {step + 1}: no solution ({status})")
+            continue
+        u_r, th = motion3({n: got[n] for n in (1, 2, 3)})
+        for key, val in (("u10", got[10]), ("r10", th), ("u1", got[1])):
+            tab = DCOUP3D_TABLES[key][step]
+            scale = max(abs(x) for x in tab)
+            worst = max(worst, max(abs(a - b) for a, b in zip(val, tab)) / scale)
+        exact = max(exact, max(abs(a - b) for a, b in zip(got[10], u_r)) / max(abs(x) for x in got[10]))
+        shown.append(f"u10 {', '.join(f'{x:.3g}' for x in got[10])}")
+    ok = worst < 6e-3 and exact < 1e-6
+    print(f"{'PASS' if ok else 'FAIL'}  dcoup3d_verification (Abaqus Verification Guide, linear DCOUP3D, three "
+          f"steps of a force and a moment on the reference node): node 10's displacements and rotations and "
+          f"node 1's within {worst:.1e} of Abaqus' tables (3 digits); node 10 {exact:.1e} from the coupling "
+          f"nodes' weighted motion ({'; '.join(shown)})")
+    failures += 0 if ok else 1
+    # --- *COUPLING + *DISTRIBUTING on an M3D4 / M3D3 skin on the block's top: equations on the
+    # membrane nodes (ccx's card spread the load over the faces its hinge holds: 20 % off on M3D4,
+    # nothing on M3D3), vs Abaqus' distribution of the force and moment as nodal forces
+    _, els, _, topel, _ = distributing_block()
+    for typ in ("M3D4", "M3D3"):
+        tag = f"distributing_membrane_skin_{typ.lower()}"
+        skin = [f"*ELEMENT, TYPE={typ}, ELSET=SKIN"]
+        w_skin = {}
+        for k, e in enumerate(topel):
+            q = els[e][4:8]
+            parts = [q] if typ == "M3D4" else [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]
+            for j, c in enumerate(parts):
+                skin.append(f"{1000 + 2 * k + j}, " + ", ".join(map(str, c)))
+                for n in c:
+                    w_skin[n] = w_skin.get(n, 0.0) + (0.25 if typ == "M3D4" else 1.0 / 6.0)
+        extra = skin + ["*SURFACE, NAME=SKINS", "SKIN, SPOS", "*MEMBRANE SECTION, ELSET=SKIN, MATERIAL=M", "0.05"]
+        motion_s, spread_s = distributing_relations(xyz, w_skin, DIST_REF)
+        got, status, out = dist_run(tag, distributing_deck([cpl[0].replace("SURFACE=TOP", "SURFACE=SKINS"), cpl[1]],
+                                                           loads, extra))
+        ref, _, _ = dist_run(tag + "_ref", distributing_deck((), ["*CLOAD"] + [
+            f"{n}, {k + 1}, {x:.12g}" for n, fn in spread_s(f, m).items() for k, x in enumerate(fn)], extra))
+        if len(got) < len(xyz) + 1 or len(ref) < len(xyz):
+            print(f"FAIL  {tag}: no solution ({status})")
+            print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+            failures += 1
+            continue
+        big = max(abs(x) for n in xyz for x in ref[n])
+        ur = motion_s(ref)[0]
+        err = ccx_ratio(max(max(abs(a - b) for n in xyz for a, b in zip(got[n], ref[n])),
+                            max(abs(a - b) for a, b in zip(got[100], ur))), big)
+        ok = err < 1e-5 and max(abs(x) for x in got[100]) > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a force and a moment on the reference node of an {typ} skin on "
+              f"the block's top): every node {err:.1e} of max |u| ({big:.3g}) from Abaqus' distribution of them as "
+              f"nodal forces, the reference node's displacement included (u3 {got[100][2]:.6g}; ccx's card: "
+              + ("the face 20 % off, the node not moved" if typ == "M3D4" else "transmitted nothing") + ")")
         failures += 0 if ok else 1
     # --- Johnson-Cook damage initiation: ccx's indicator, the model unchanged -------
     # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which

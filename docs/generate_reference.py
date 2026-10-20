@@ -31,7 +31,9 @@ TRANSLATED = {
         "`*NORMAL` line for each shell element there, as Abaqus uses it (ccx would average the "
         "element normals); on beam nodes it is dropped (reduced physics). A truss numbered below the "
         "beams at a node they share ends at a tied copy of the node, which gets a knot beam (ccx would "
-        "give the node no rotations).",
+        "give the node no rotations); a truss at a shell node without a beam ends at a copy tied to "
+        "the node through a hub of two knot beams (ccx's own knot there can be singular: a crash "
+        "without a message).",
     "*NGEN / *NFILL / *NCOPY / *ELGEN / *ELCOPY": "expanded into explicit `*NODE`/`*ELEMENT` "
         "(CalculiX has no mesh-generation cards); an `*NFILL` set holds its bounding nodes too, as in "
         "Abaqus. `*NMAP` maps the coordinates (`RECTANGULAR`, `CYLINDRICAL`, `SPHERICAL`, `ROTATION`, "
@@ -368,16 +370,23 @@ TRANSLATED = {
         "has the node's local axes (ccx's coupling would read them about the global ones). An "
         "element surface on membranes or shells → a node surface of their nodes, which Abaqus "
         "couples (ccx would couple the expanded faces: 1.2 % off on `M3D4`, a crash on `M3D3` "
-        "and on knotted shells); a `*DISTRIBUTING` one on ccx's own membranes is warned (ccx "
-        "spreads it over faces their hinge holds: about 2 % off, nothing on `M3D3`).",
+        "and on knotted shells); a `*DISTRIBUTING` one becomes equations on the membrane nodes "
+        "(ccx's card spreads it over faces their hinge holds: about 2 % off, nothing on `M3D3`).",
     "*COUPLING / *DISTRIBUTING": "Abaqus' distributing constraint as `*EQUATION`s (ccx's card only "
         "spreads the reference node's loads: a BC there moved nothing, the node printed U = 0): the node "
         "moves with the coupling nodes' weighted mean motion plus the rotation of their weighted "
         "least-squares fit, and turns with it (a `ROT NODE`, or a shell/beam node's own rotations); "
         "weights from tributary areas, a node surface's areas, `WEIGHTING METHOD` and an `INFLUENCE "
-        "RADIUS`. Kept as ccx's card (warned) on membrane or axisymmetric faces and under NLGEOM where "
-        "the equations turn, unless `--approximate`; `COUPLING=STRUCTURAL` is written as the default "
-        "coupling (reduced physics).",
+        "RADIUS`. Kept as ccx's card (warned) on axisymmetric faces (Abaqus' pages do not say whether "
+        "their tributary areas take the radius) and under NLGEOM where the equations turn, unless "
+        "`--approximate`; `COUPLING=STRUCTURAL` is written as the default coupling (reduced physics).",
+    "*DISTRIBUTING COUPLING": "the `DCOUP2D` / `DCOUP3D` element is Abaqus' distributing constraint "
+        "(Theory Guide): written as the same `*EQUATION`s, DOFs 1-6 (`DCOUP2D` 1, 2, 6) with the "
+        "moments from the reference node's offset, weights from the data lines; the element leaves "
+        "the mesh (ccx's card ties the translations alone). Kept as ccx's card (warned) with a "
+        "`*MASS` on the element and under NLGEOM where the equations turn, unless `--approximate`. "
+        "Proved by `validate_with_ccx.py` (`dcoup3d_verification`: the Abaqus Verification Guide's "
+        "tables).",
     "*RIGID BODY": "`PIN NSET`/`TIE NSET` → `NSET` (both → their union); `REF NODE` set → node "
         "number; an explicit `ROT NODE` is added and BCs/moments on the reference point's DOFs "
         "4-6 move to its DOFs 1-3 (ccx ignores them on the REF NODE); a reference point with a "

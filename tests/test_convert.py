@@ -4346,16 +4346,21 @@ BOLT_CARDS = "*Distributing Coupling, elset=DC\nTOP, 1.\n*Pre-tension Section, s
 def test_part_level_distributing_coupling_and_pretension_per_instance():
     # each instance gets its own copy: its names, node ids and turned normal (written once, raw,
     # they named the part's sets: ccx stopped, validate_with_ccx.py assembly_bolts)
+    # (the *DISTRIBUTING COUPLING as each instance's *EQUATIONs on its reference node and TOP)
     body, _, _ = convert_str(PART_BOLT.format(part=BOLT_CARDS, i1="", i2=""))
-    assert "*DISTRIBUTING COUPLING, ELSET=I1_DC\nI1_TOP, 1.\n" in body
-    assert "*DISTRIBUTING COUPLING, ELSET=I2_DC\nI2_TOP, 1.\n" in body
+    rows = _equation_terms(body)
+    assert {row[0][:2] for row in rows if row[0][0] in (98, 197)} == {(98, 1), (98, 2), (98, 3), (197, 1), (197, 2), (197, 3)}
+    assert {n for row in rows if row[0][0] == 98 for n, _d, _c in row[1:]} == {9, 10, 11, 12}
+    assert {n for row in rows if row[0][0] == 197 for n, _d, _c in row[1:]} == {108, 109, 110, 111}
+    assert not any(l.startswith("*DISTRIBUTING COUPLING") for l in _live(body)) and "DCOUP3D" not in body
     assert "*PRE-TENSION SECTION, SURFACE=I1_CUT, NODE=99\n0, 0, 1\n" in body
     assert "*PRE-TENSION SECTION, SURFACE=I2_CUT, NODE=198\n0, -1, 0\n" in body
     assert "ELSET=DC\n" not in body and "SURFACE=CUT," not in body
     # inside an *INSTANCE: that instance's (it was left out without a word), and a card the
     # flattener does not write per instance is warned
     body, conv, rep = convert_str(PART_BOLT.format(part="", i1=BOLT_CARDS, i2="*Hourglass Stiffness\n1.\n"))
-    assert "*DISTRIBUTING COUPLING, ELSET=I1_DC\nI1_TOP, 1.\n" in body and "I2_DC\nI2_TOP" not in body
+    heads = {row[0][0] for row in _equation_terms(body)}
+    assert 98 in heads and 197 not in heads and "ELSET=I1_DC (element 3) -> *EQUATIONs" in body
     assert "*PRE-TENSION SECTION, SURFACE=I1_CUT, NODE=99\n" in body and "SURFACE=I2_CUT" not in body
     assert "*HOURGLASS STIFFNESS inside an *INSTANCE left out" in rep.text()
     assert conv.reduced_physics == ["*HOURGLASS STIFFNESS inside an *INSTANCE left out"]
@@ -10755,7 +10760,7 @@ def test_distributing_coupling_as_equations():
     assert "SURFACE=TOPE\n*DISTRIBUTING" in body and not _equation_terms(body)
     assert "kept as ccx's card, as the deck runs NLGEOM" in rep.text() and conv.reduced_physics
     body, conv, rep = convert_str(nl, approximate=True)
-    assert _equation_terms(body) and "[APPROX] *COUPLING, *DISTRIBUTING in a deck with NLGEOM" in rep.text()
+    assert _equation_terms(body) and "[APPROX] Distributing coupling in a deck with NLGEOM" in rep.text()
     # ... where a WEIGHTING METHOD other than UNIFORM is lost: ccx's card ignores it (probed;
     # validate_with_ccx.py distributing_weighting_nlgeom_card), reduced physics
     lost = "*DISTRIBUTING WEIGHTING METHOD ignored by ccx's card"
@@ -10807,6 +10812,80 @@ def test_truss_below_beams_at_a_node_ends_at_a_copy():
     # numbered after the beams: unchanged
     body, conv, _ = convert_str(deck(3))
     assert not conv._truss_copies and "*ELEMENT, TYPE=T3D2\n3, 2, 4\n" in body and 2 not in conv._knots
+
+
+
+def test_truss_at_shell_node_ends_at_a_copy_through_a_hub():
+    # ccx 2.23 makes a node that shells and a truss share a knot whose turn about the shell normal
+    # it holds only along the truss's section axis: normal to the shell normal, spooles crashes
+    # without a message (exit 255); where it runs the knot's rigid normal is off (up to 1e-2).
+    # The truss ends at a copy C tied to a hub K (two knot beams, rotation held, K below C), tied
+    # to the node (validate_with_ccx.py shell_truss_node)
+    def deck(sh="S4", sec="*Shell Section, elset=SH, material=M\n0.05\n", t=1, step="*Static", extra=""):
+        return ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n6, 2., 1., 0.\n"
+                "9, 1., -0.5, -1.\n" + f"*Element, type={sh}, elset=SH\n2, 1, 2, 5, 4\n3, 2, 3, 6, 5\n"
+                f"*Element, type=T3D2, elset=TR\n{t}, 2, 9\n" + sec +
+                "*Solid Section, elset=TR, material=M\n0.0001\n*Material, name=M\n*Elastic\n210000., 0.3\n"
+                f"*Step\n{step}\n*Boundary\n1, 1, 6\n4, 1, 6\n9, 1, 3\n*Cload\n3, 3, 1.\n6, 3, 1.\n*End Step\n" + extra)
+    for t in (1, 9):                                    # either numbering
+        body, conv, rep = convert_str(deck(t=t))
+        hub, copy = conv._truss_hubs[2]
+        assert copy == hub + 1 and not conv._truss_copies
+        assert f"*ELEMENT, TYPE=T3D2\n{t}, {copy}, 9\n" in body and hub in conv._knots
+        knots = [c for e, (typ, c) in conv.geom.elements.items() if e in conv.geom.elset("ABQ2CCX_KNOT")]
+        assert sorted(c[0] for c in knots) == [hub, hub] and 2 not in conv._knots
+        assert [eq for eq in _equation_terms(body) if eq[0][0] in (hub, copy)] == \
+            [[(hub, k, 1.0), (2, k, -1.0)] for k in (1, 2, 3)] + [[(copy, k, 1.0), (hub, k, -1.0)] for k in (1, 2, 3)]
+        assert f"*BOUNDARY\n{hub}, 4, 6\n" in body and "through a hub node with two knot beams" in rep.text()
+        assert not conv.reduced_physics
+    # membranes and plane elements with a truss run exactly in ccx: unchanged
+    body, conv, _ = convert_str(deck("M3D4", "*Membrane Section, elset=SH, material=M\n0.05\n"))
+    assert not conv._truss_hubs and "*ELEMENT, TYPE=T3D2\n1, 2, 9\n" in body
+    # a step solving for temperatures: the ties take DOF 11 too (the truss's heat flows through)
+    th = deck(step="*Coupled Temperature-displacement, steady state\n1., 1.").replace(
+        "*Elastic\n210000., 0.3\n", "*Elastic\n210000., 0.3\n*Conductivity\n50.\n*Expansion\n1e-5\n")
+    body, conv, _ = convert_str(th)
+    hub, copy = conv._truss_hubs[2]
+    assert [(hub, 11, 1.0), (2, 11, -1.0)] in _equation_terms(body) and [(copy, 11, 1.0), (hub, 11, -1.0)] in _equation_terms(body)
+    # a later step's OP=NEW (kept: it releases a BC) removes the hub's hold in ccx: written again
+    body, conv, _ = convert_str(deck(extra="*Step\n*Static\n*Boundary, op=new\n1, 1, 6\n4, 1, 6\n9, 1, 2\n*End Step\n"))
+    hub, _c = conv._truss_hubs[2]
+    assert body.upper().split("*BOUNDARY, OP=NEW")[1].split("*END STEP")[0].count(f"\n{hub}, 4, 6\n") == 1
+
+
+def test_legacy_distributing_coupling_as_equations():
+    # *DISTRIBUTING COUPLING (DCOUP3D): Abaqus' element is the distributing constraint (DOFs
+    # 1-6, moments from the reference node's offset); ccx's card ties the translations alone
+    # (probed: the Verification Guide's DCOUP3D problem 43 % off) -> the *EQUATIONs of
+    # *COUPLING + *DISTRIBUTING, the element out of the mesh (validate_with_ccx.py dcoup3d_*)
+    def deck(el="DCOUP3D", step="*Step\n*Static\n", load="10, 1, 1.\n10, 6, 2.\n", model=""):
+        return ("*Node\n1, 1., 1., 0.\n2, 1., 0., 0.\n3, 0., 1.5, 0.\n10, -1., 0.5, 0.\n"
+                f"*Element, type={el}, elset=DC\n10, 10\n*Element, type=SPRING1, elset=K1\n101, 1\n102, 2\n103, 3\n"
+                "*Spring, elset=K1\n1\n100.\n*Distributing Coupling, elset=DC\n1, 1.\n2, 2.\n3, 3.\n" + model
+                + step + "*Cload\n" + load + "*End Step\n")
+    body, conv, rep = convert_str(deck())
+    rows = _equation_terms(body)
+    heads = [row[0][:2] for row in rows]
+    rot = conv._rb_rot[10]                      # the moment acts: the rotation lives on a ROT NODE
+    assert (10, 1) in heads and (10, 2) in heads and (10, 3) in heads and {(rot, 1), (rot, 2), (rot, 3)} <= set(
+        (n, d) for row in rows for n, d, _c in row[:3])
+    x = dict(((n, d), c) for row in rows if row[0][:2] == (10, 1) for n, d, c in row[1:])
+    # u_R,x = sum w u_x + (theta x r_R)_x: the weights 1/6, 2/6, 3/6 plus the offset's share
+    assert abs(sum(c for (n, d), c in x.items() if d == 1) + 1.0) < 1e-9 and (2, 2) in x
+    assert "DCOUP3D" not in body and not any(l.startswith("*DISTRIBUTING COUPLING") for l in _live(body))
+    assert "the element leaves the mesh" in rep.text() and not conv.reduced_physics
+    # DCOUP2D: DOFs 1, 2, 6
+    body, conv, _ = convert_str(deck("DCOUP2D"))
+    heads = [row[0][:2] for row in _equation_terms(body)]
+    assert (10, 3) not in heads and (10, 1) in heads and len(heads) == 3
+    # kept as ccx's card, warned: a *MASS on the element; NLGEOM with the offset (unless --approximate)
+    body, conv, rep = convert_str(deck(model="*Mass, elset=DC\n10.\n"))
+    assert "*DISTRIBUTING COUPLING, ELSET=DC\n" in body and "DCOUP3D" in body and conv.reduced_physics
+    assert "kept as ccx's card, as its element carries a *MASS" in rep.text()
+    body, conv, rep = convert_str(deck(step="*Step, nlgeom\n*Static\n"))
+    assert "*DISTRIBUTING COUPLING, ELSET=DC\n" in body and "as the deck runs NLGEOM" in rep.text()
+    body, conv, rep = convert_str(deck(step="*Step, nlgeom\n*Static\n"), approximate=True)
+    assert "DCOUP3D" not in body and "[APPROX] Distributing coupling in a deck with NLGEOM" in rep.text()
 
 
 def _ori_z(deg):
@@ -16361,11 +16440,13 @@ def test_kinematic_couplings_on_membrane_and_shell_faces_take_their_nodes():
                              + cpl.replace("surface=MS", "surface=MIX") + LM4_STEP)
     assert "SURFACE=MIX_NODES" in body
     assert _card_at(body, "*SURFACE, NAME=MIX_NODES, TYPE=NODE") == ["1", "2", "5", "4", "101", "102", "103", "104"]
-    # ccx takes a distributing coupling only on an element surface: on ccx's own membranes it
-    # spreads the load over faces its hinge holds (M3D4 about 2 % off, M3D3 nothing): warned
+    # a distributing coupling becomes *EQUATIONs on the membrane nodes (ccx's own card spreads the
+    # load over faces its hinge holds: M3D4 about 2 % off, M3D3 nothing; the equations are exact,
+    # probed), weighted by the membrane faces' tributary areas
     body, conv, rep = convert_str(LM4_SKIN + cpl.replace("*Kinematic", "*Distributing") + LM4_STEP)
-    assert "REF NODE=9, SURFACE=MS\n" in body and "*DISTRIBUTING on membrane faces" in rep.text()
-    assert any("DISTRIBUTING" in r for r in conv.reduced_physics)
+    assert not any(l.startswith(("*COUPLING", "*DISTRIBUTING")) for l in _live(body)) and _equation_terms(body)
+    assert "*DISTRIBUTING on membrane faces" not in rep.text() and not conv.reduced_physics
+    assert {n for row in _equation_terms(body) for n, _d, _c in row} == {9, 1, 2, 5, 4}
 
 
 def test_membrane_section_density_and_poisson():
@@ -16419,8 +16500,9 @@ def test_constraints_on_quadratic_membranes_take_their_own_nodes():
     body, _, _ = convert_str(deck + "*Coupling, constraint name=C, ref node=100, surface=MS\n*Kinematic\n" + QM_STEP)
     assert "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=MS_NODES" in body
     body, _, _ = convert_str(deck + "*Coupling, constraint name=C, ref node=100, surface=MS\n*Distributing\n"
-                             + QM_STEP)       # its surface nodes stay independent: the faces, area-weighted
-    assert "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=MS\n" in body
+                             + QM_STEP)       # *EQUATIONs on the membrane nodes, which keep their DOFs
+    assert not any(l.startswith("*COUPLING") for l in _live(body)) and {n for row in _equation_terms(body) if row[0][0] == 100
+                                        for n, _d, _c in row} == {100, 1, 3, 13, 11, 2, 8, 12, 6}
     body, conv, rep = convert_str(deck + "*Elset, elset=E2\n2\n*Rigid Body, ref node=100, elset=E2\n" + QM_STEP)
     assert _card_at(body, "*NSET, NSET=E2_NODES") == ["3, 5, 15, 13, 4, 10, 14, 8"]
     assert "*RIGID BODY, REF NODE=100, NSET=E2_NODES" in body and not conv.reduced_physics
