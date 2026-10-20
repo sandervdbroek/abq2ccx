@@ -18576,8 +18576,9 @@ class Converter:
         if self._approx:
             self.report.warn(f"[APPROX] Element {what} written as S4: {why}. ccx's S4 (a C3D8I "
                              f"brick) is Abaqus' fully integrated shell, not the deck's S4R; both "
-                             f"converge to the shell solution (S4 within 2.5 % on those plates, "
-                             f"stiffer on coarse meshes of thin shells: 26 % at 8 x 8).")
+                             f"converge to the shell solution (S4 within 2.5 % on those plates; "
+                             f"stiffer on coarse meshes of thin shells: on 8 x 8 elements 26 % in "
+                             f"bending, a buckling load 37 % high).")
         else:
             self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
                              f"S4 (within 2.5 % on those plates), or mesh with S4 or S8R.")
