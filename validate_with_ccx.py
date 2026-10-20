@@ -2058,6 +2058,21 @@ def mesh_generation_ring_deck(generated=True, nr=4, nt=8, a=1.0, b=2.0, h=0.1, p
     return "\n".join(lines) + "\n"
 
 
+def ncopy_pole_deck(f=10.0):
+    """Three T3D2 bars in a row along x (length 1, area 1, E 1000), fixed at x = 0 and pulled
+    along x by ``f`` at x = 3.  The far nodes come from *NCOPY, POLE: node 11 projected from the
+    pole node at x = 0, node 21 from a pole given by its coordinates at x = 1 (Abaqus: each
+    old node midway between the pole and its copy)."""
+    return ("*Heading\nBars in a row whose far nodes *NCOPY, POLE makes\n"
+            "*Node\n100, 0., 0., 0.\n*Node, nset=A\n1, 1., 0., 0.\n"
+            "*Ncopy, old set=A, new set=B, change number=10, pole\n100\n"
+            "*Ncopy, old set=B, new set=C, change number=10, pole\n, 1., 0., 0.\n"
+            "*Element, type=T3D2, elset=BARS\n1, 100, 1\n2, 1, 11\n3, 11, 21\n"
+            "*Solid Section, elset=BARS, material=M\n1.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Nset, nset=ALLN\n100, 1, 11, 21\n*Boundary\n100, 1, 3\nALLN, 2, 3\n"
+            f"*Step\n*Static\n*Cload\n21, 1, {f!r}\n*Node Print, nset=ALLN\nU\n*End Step\n")
+
+
 def ic_annulus_deck(nr=8, nt=18, t=0.1, a=1.0, b=2.0, s0=100.0):
     """A quarter annulus a < r < b of C3D20R (nr x nt elements, thickness t; the planes x = 0 and
     y = 0 held normal, every node in z: plane strain; E 1000, nu 0.3) with a uniform initial
@@ -7057,6 +7072,18 @@ def main():
               f"with the mesh listed ({err:.1e} apart, largest {moved:.4g}); radial displacements "
               f"{lame[0][1]:.5g} and {lame[1][1]:.5g} at r = a, b vs Lame {lame[0][0]:.5g} and "
               f"{lame[1][0]:.5g} ({off:.1%} off)")
+        failures += 0 if ok else 1
+    # *NCOPY, POLE: the pole node number (or the pole's coordinates) was read as a translation
+    u = faithful_run(ncopy_pole_deck(), "ncopy_pole")
+    if u is None:
+        failures += 1
+    else:
+        got = [u.get(n, [math.inf])[0] for n in (1, 11, 21)]
+        err = max(abs(g / w - 1) for g, w in zip(got, (0.01, 0.02, 0.03)))
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  ncopy_pole (three bars in a row pulled at their end, the "
+              f"far nodes by *NCOPY, POLE from a pole node and from a pole point): displacements "
+              f"{got[0]:.6g}, {got[1]:.6g}, {got[2]:.6g} vs F x / E A = 0.01, 0.02, 0.03 ({err:.1e} off)")
         failures += 0 if ok else 1
     text, xy = ic_annulus_deck()
     u = faithful_run(text, "initial_stress_cylindrical")

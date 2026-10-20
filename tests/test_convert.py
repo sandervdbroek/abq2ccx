@@ -955,6 +955,21 @@ def test_ncopy_reflect_point_and_mirror():
     assert "*NCOPY OLD SET=NONE is empty or undefined" in rep.text() and sorted(conv.geom.nodes) == [1]
 
 
+def test_ncopy_pole_projects_from_the_pole():
+    # POLE: each copy lies so that its old node is midway between the pole and it (Abaqus 2017
+    # Keywords *NCOPY): the pole node (field 1), else the pole's coordinates (fields 2-4); the
+    # pole's number was read as a SHIFT translation (validate_with_ccx.py ncopy_pole)
+    deck = ("*NODE, NSET=A\n1, 1., 2., 3.\n2, 0., 1., 0.\n*NODE\n100, 1., 1., 1.\n"
+            "*NCOPY, OLD SET=A, CHANGE NUMBER=10, POLE, NEW SET=B\n100\n"
+            "*NCOPY, OLD SET=B, CHANGE NUMBER=10, POLE\n, 0., 0., 4.\n")
+    body, conv, rep = convert_str(deck)
+    assert "\n11, 1, 3, 5\n12, -1, 1, -1\n21, 2, 6, 6\n22, -2, 2, -6\n" in body, body
+    assert conv.reduced_physics == [] and rep.n_warnings == 0
+    # a pole node the deck does not define (Abaqus stops on it): nothing copied
+    _, conv, rep = convert_str(deck.replace("POLE, NEW SET=B\n100\n", "POLE, NEW SET=B\n99\n"))
+    assert "*NCOPY, POLE: pole node 99 is not defined" in rep.text() and 11 not in conv.geom.nodes
+
+
 def test_ngen_parabola_through_midside_point():
     # LINE=P: a parabola through the end nodes and the midside point (Abaqus 2017 Keywords
     # *NGEN), given by node (field 4) or coordinates (fields 5-7); nodes evenly in its parameter

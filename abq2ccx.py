@@ -2825,7 +2825,7 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
 
 
 def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
-    """``*NCOPY`` -> copy a node set with SHIFT (translate/rotate) or REFLECT."""
+    """``*NCOPY`` -> copy a node set with SHIFT (translate/rotate), REFLECT or POLE."""
     old = block.param("OLD SET")
     new = block.param("NEW SET")
     try:
@@ -2849,13 +2849,28 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     for key in ("REFLECT",):
         if block.has(key):
             reflect = (block.param(key) or "").upper()
+    # POLE: each new node lies so that its old node is midway between the pole and it (Abaqus
+    # 2017 Keywords *NCOPY); the pole is a node (field 1), else given by coordinates (2-4)
+    pole: Optional[Vec] = None
+    if block.has("POLE") and not reflect:
+        g = list(recs[0] if recs else []) + ["", "", "", ""]
+        try:
+            pid = pint(g[0]) if g[0].strip() else None
+            pole = tuple(fields_at(g[1:4], 3)) if pid is None else geom.nodes.get(pid)
+        except ValueError:
+            _skip_unreadable(report, "*NCOPY card")
+            return []
+        if pole is None:
+            report.warn(f"*NCOPY, POLE: pole node {pid} is not defined (Abaqus needs it defined "
+                        f"before the card); nothing copied.", once=True)
+            return []
     # SHIFT: a translation, then an optional rotation line (a, b, angle), fields by position
     shift: Vec = (0.0, 0.0, 0.0)
     turn = None
     try:
-        if recs and not reflect:
+        if recs and not reflect and pole is None:
             shift = tuple(fields_at(recs[0], 3))
-        if len(recs) > 1 and not reflect:
+        if len(recs) > 1 and not reflect and pole is None:
             v = fields_at(recs[1], 7)
             if v[6] and vnorm(vsub(tuple(v[3:6]), tuple(v[:3]))) > 0.0:
                 turn = (tuple(v[:3]), tuple(v[3:6]), v[6])
@@ -2865,10 +2880,6 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     except ValueError:
         _skip_unreadable(report, "*NCOPY card")
         return []
-    if block.has("POLE"):
-        report.warn("*NCOPY, POLE is not supported by the converter; nodes are copied with the "
-                    "SHIFT/REFLECT data only — verify the generated nodes.", once=True)
-        report.reduce("*NCOPY, POLE ignored")
     # REFLECT data: the points' coordinates may sit on one line (LINE: x1..z2) or
     # several (MIRROR: a, b on the first, c on the second) — take them as a flat list of
     # whole points, each line's fields by position (a blank one 0).
@@ -2900,6 +2911,8 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
                                 f"degenerate points); skipped.", once=True)
                     continue
                 newp = np_
+            elif pole is not None:
+                newp = vsub(vscale(orig[nid], 2.0), pole)
             else:
                 newp = cur[nid]
             geom.add_node(new_id, newp)

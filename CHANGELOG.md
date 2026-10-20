@@ -6,6 +6,9 @@ physics.
 
 ## Unreleased
 
+* **`*NCOPY, POLE` projected from its pole** — the pole's node number (or its coordinates)
+  was read as a `SHIFT` translation, so the copies landed elsewhere (reduced physics). Each
+  copy now lies so that its old node is midway between the pole and it, as in Abaqus.
 * **`*STATIC, DIRECT` with contact** — ccx's penalty contact can need a cutback where Abaqus'
   contact converges at the fixed increment, and under `DIRECT` ccx then stops ("solution seems
   to diverge"). In a model with contact pairs the step now gets automatic increments, with the
