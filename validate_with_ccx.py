@@ -7406,8 +7406,9 @@ def main():
             held = abs(u[10][bc - 1] - 0.01) / scale
             free = max(abs(_dot(axes[2 if len(coupled) == 2 else 1], rel[n])) for n in rel) / scale
             ok = tie < 1e-5 and held < 1e-5 and free > 0.01       # (the .dat's 7 digits)
-            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled along {len(coupled)} "
-                  f"axes of an *ORIENTATION, a corner's BC on global {bc}, the DOF ccx's own coupling "
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled along "
+                  f"{'one axis' if len(coupled) == 1 else 'two axes'} of an *ORIENTATION, a corner's BC on "
+                  f"global {bc}, the DOF ccx's own coupling "
                   f"eliminates; a static step): coupling residual {tie:.0e} of max |u|, the BC holds to "
                   f"{held:.0e}; the members moved {free:.2f} of it across the coupled axes (before: ccx "
                   f"stopped)")
