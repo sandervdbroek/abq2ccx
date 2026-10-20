@@ -26082,8 +26082,8 @@ class Converter:
             for k, _ in given[id(b)]:
                 if id(b) not in cards.setdefault(k, []):
                     cards[k].append(id(b))
-        return [dict(st) for st in bc_steps(blocks, lambda b: given[id(b)], self._pert_idx,
-                                            self.steps.lc2)], cards
+        return [dict(st) for st in self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2,
+                                                      blocks=blocks)], cards
 
     def _coupled_steps(self, c: dict, states) -> None:
         """Per step of rigid constraint ``c`` (c["steps"]): its BC state ('st'), the reference
