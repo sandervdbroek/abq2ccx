@@ -10657,6 +10657,22 @@ def test_settle_dependents_follows_ccx_on_a_transformed_node_with_a_bc():
     assert z[0][:2] == (twin, 3) and "Possible overconstraint" not in rep.text()
 
 
+def test_settle_dependents_reads_the_sets_as_ccx_does():
+    # _settle_dependents resolves a card's node set as ccx reads the emitted deck (EmittedSets:
+    # a set written twice is both definitions; it kept its own table, the last definition of a
+    # name the mesh lacks, else the mesh's): here TOPC's second card adds node 7, whose DOF 2
+    # the BC on TOPC then holds, so the equation eliminates node 8's
+    deck = HEX_MODEL + ("*NSET, NSET=TOPC\n6\n*EQUATION\n2\n7, 2, 1., 8, 2, -1.\n*BOUNDARY\nTOPC, 2, 2\n"
+                        "*STEP\n*STATIC\n*CLOAD\n7, 1, 1.\n*END STEP\n")
+    body, conv, _ = convert_str(deck)
+    assert "*EQUATION\n2\n7, 2, 1., 8, 2, -1.\n" in body
+    lines = body.splitlines()
+    at = lines.index("*MATERIAL, NAME=M")
+    lines[at:at] = ["*NSET, NSET=TOPC", "7"]
+    out = "\n".join(conv._settle_dependents(A.EmittedDeck(lines)).render())
+    assert "*EQUATION\n2\n8, 2, -1., 7, 2, 1.\n" in out
+
+
 def test_settle_dependents_writes_no_equation_with_several_local_translations():
     # an *EQUATION none of whose DOFs is free is written reduced by the equations before it
     # where that frees one — not where the reduced equation would hold two local translations

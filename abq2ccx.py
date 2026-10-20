@@ -31120,28 +31120,17 @@ class Converter:
 
         def fields(j: int) -> List[str]:
             return trimmed_fields(out[j].split(","))
-        inline: Dict[str, List[int]] = {}        # node sets / node surfaces the handlers wrote
-        nsurf: Dict[str, List[int]] = {}
+        # the node sets as ccx reads the deck (EmittedSets: a set written twice, the mesh's and a
+        # handler's, is both together); the mesh's sets where the deck's do not read
+        sets = self._mesh_sets.read(deck)
+        nsurf: Dict[str, List[int]] = {}         # the node surfaces the handlers wrote
 
         def nodes_of(tok: str) -> List[int]:
-            if isint(tok):
-                return [int(tok)]
-            return inline.get(tok.upper()) or self.geom.nset(tok)
+            ids = sets.members("NSET", tok)
+            return ids if ids is not None else self.geom.nset(tok)
         for card in cards:
             kw, params = card.keyword, card.params
-            if kw == "NSET" and (params.get("NSET") or "").upper() not in self.geom.nsets:
-                ids: List[int] = []
-                if "GENERATE" in params:
-                    for j in card.rows:
-                        try:
-                            ids += expand_generate(fields(j))
-                        except ValueError:          # a blank or unreadable line: no members
-                            continue
-                else:
-                    for t in (t for j in card.rows for t in fields(j) if t):
-                        ids += nodes_of(t)
-                inline[(params.get("NSET") or "").upper()] = ids
-            elif kw == "SURFACE" and (params.get("TYPE") or "").upper() == "NODE":
+            if kw == "SURFACE" and (params.get("TYPE") or "").upper() == "NODE":
                 nsurf[(params.get("NAME") or "").upper()] = \
                     [n for j in card.rows for n in nodes_of(fields(j)[0])]
 
