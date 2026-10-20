@@ -639,6 +639,10 @@ def element_status(t):
         own += (" — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced "
                 + ("physics" if twin in ("M3D4", "B31") else "physics where its elements are over 3 "
                    "depths wide (1.5 if plastic)") + f"; `--approximate` → `{twin}`")
+    ct = A.ccx_element_type(t, A.Report())
+    if A.plane_locks(t) and t not in A.SLAB_TYPES:
+        own += (" — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced "
+                f"physics with a plastic material; `--approximate` → `{A.PLANE_QUADRATIC_UPGRADE[ct[:3]][1]}`")
     return own
 
 

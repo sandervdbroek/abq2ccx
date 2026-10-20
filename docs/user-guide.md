@@ -88,7 +88,9 @@ a different model without saying so. With it, these reframings are made, each wi
   and `B31R` (the same `C3D8R` hourglass stiffness) → `CPS4`, `CPE4`, `CAX4`, `M3D4`, `B31`;
 * self-contact (one surface, or the same surface twice) → ccx's `S, S` with
   `TYPE=SURFACE TO SURFACE` (within 0.1 % of symmetric pairs on a mild closure, 10–13 % off
-  on a deep one).
+  on a deep one);
+* `CPE4` / `CAX4` of a plastic material (they lock in plastic flow), and flagged plastic
+  `CPE4R` / `CAX4R` → `CPE8R` / `CAX8R` with midside nodes, their linear neighbours too.
 
 ## `--abaqus-umat`
 

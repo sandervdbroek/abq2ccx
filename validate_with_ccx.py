@@ -5404,6 +5404,59 @@ def plane_cantilever_deck(typ, nx, ny, length, depth, thickness=None):
     return "\n".join(lines) + "\n", ref
 
 
+def plastic_strip_deck(n=4):
+    """(deck, plastic moment, end rotation): a plane-strain CPE4 strip 10 deep and 10 long of
+    n x n elements, elastic-perfectly plastic Mises (E 210000, nu 0.3, sigma_y 240), held in x
+    along x = 0 (and in y at mid-depth there), its end x = 10 turned rigidly (u_x = theta (y -
+    5)) to 20 times its first-yield rotation; the end's reactions give the moment, M_p = (2 /
+    sqrt 3) sigma_y h^2 / 4 per unit thickness at collapse."""
+    h, sy, nu = 10.0, 240.0, 0.3
+    mp = 2 / math.sqrt(3) * sy * h * h / 4
+    my = sy / math.sqrt(1 - nu + nu * nu) * h * h / 6
+    theta = 20 * my * h / (210000. / (1 - nu * nu) * h ** 3 / 12)
+    nid = lambda i, j: 1 + i + (n + 1) * j     # noqa: E731
+    nodes = {nid(i, j): (i * h / n, j * h / n) for j in range(n + 1) for i in range(n + 1)}
+    elems = [[nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)] for j in range(n) for i in range(n)]
+    end = [nid(n, j) for j in range(n + 1)]
+    lines = (["*NODE"] + [f"{k}, {x:.12g}, {y:.12g}" for k, (x, y) in nodes.items()]
+             + ["*ELEMENT, TYPE=CPE4, ELSET=S"] + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+             + ["*NSET, NSET=ROOT"] + _ids([nid(0, j) for j in range(n + 1)]) + ["*NSET, NSET=END"] + _ids(end)
+             + ["*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.3", "*PLASTIC", f"{sy:g}, 0.",
+                "*SOLID SECTION, ELSET=S, MATERIAL=M", "*BOUNDARY", "ROOT, 1, 1", f"{nid(0, n // 2)}, 2, 2",
+                "*STEP", "*STATIC", "0.05, 1., 1e-5, 0.05", "*BOUNDARY"]
+             + [f"{k}, 1, 1, {theta * (nodes[k][1] - h / 2):.12g}" for k in end]
+             + ["*NODE PRINT, NSET=END", "U, RF", "*END STEP"])
+    return "\n".join(lines) + "\n", mp, theta
+
+
+def plastic_cylinder_deck(nr=4, frac=0.9):
+    """(deck, Hill's inner displacement): an axisymmetric thick cylinder, a = 10, b = 20, as a
+    CAX4 strip of nr square elements (z held: plane strain), elastic-perfectly plastic Mises
+    with nu 0.4999 (E 210000, sigma_y 240), a pressure of ``frac`` times its limit pressure
+    p_L = 2 k ln(b/a), k = sigma_y / sqrt 3, on the inner face.  Hill's incompressible
+    solution: the plastic zone reaches c with p = 2 k ln(c/a) + k (1 - c^2/b^2), and the
+    displacement is u = k c^2 / (2 G r), G = E / 3."""
+    a, b, sy = 10.0, 20.0, 240.0
+    k = sy / math.sqrt(3)
+    p = frac * 2 * k * math.log(b / a)
+    lo, hi = a, b
+    for _ in range(200):
+        c = (lo + hi) / 2
+        lo, hi = (c, hi) if 2 * k * math.log(c / a) + k * (1 - c * c / b ** 2) < p else (lo, c)
+    h = (b - a) / nr
+    nodes = {1 + i + (nr + 1) * j: (a + i * h, j * h) for j in (0, 1) for i in range(nr + 1)}
+    elems = [[1 + i, 2 + i, nr + 3 + i, nr + 2 + i] for i in range(nr)]
+    lines = (["*NODE"] + [f"{q}, {x:.12g}, {y:.12g}" for q, (x, y) in nodes.items()]
+             + ["*ELEMENT, TYPE=CAX4, ELSET=S"] + [f"{e}, " + ", ".join(map(str, cc)) for e, cc in enumerate(elems, 1)]
+             + ["*NSET, NSET=ALL"] + _ids(list(nodes)) + ["*NSET, NSET=INNER", f"1, {nr + 2}"]
+             + ["*NSET, NSET=OUTER", f"{nr + 1}, {2 * nr + 2}"]
+             + ["*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.4999", "*PLASTIC", f"{sy:g}, 0.",
+                "*SOLID SECTION, ELSET=S, MATERIAL=M", "*BOUNDARY", "ALL, 2, 2",
+                "*STEP, INC=1000", "*STATIC", "0.05, 1., 1e-6, 0.05", "*DLOAD", f"1, P4, {p:.12g}",
+                "*NODE PRINT, NSET=INNER", "U", "*NODE PRINT, NSET=OUTER", "U", "*END STEP"])
+    return "\n".join(lines) + "\n", k * c * c / (2 * 210000. / 3 * a)
+
+
 def stretched_membrane_deck(typ, n=16, t=0.01):
     """(deck, membrane answer): a unit square of n x n ``typ`` membranes (E 210e9, nu 0.3), its
     edges stretched by a strain 1e-3 in both directions in a first NLGEOM step and held, then a
@@ -11304,6 +11357,50 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {app[0]:.5g} written as "
                   f"{twin if written else 'NOT ' + twin} (--approximate), {err:.1%} off theory "
                   f"{ref:.5g}; as written {raw[0] / ref:.3g} times it, "
+                  f"{'flagged' if flagged else 'NOT flagged'} reduced physics")
+        failures += 0 if ok else 1
+
+    # ccx 2.23 integrates CPE4 / CAX4 fully, without the selectively reduced volume terms of
+    # Abaqus' first-order quadrilaterals, so they lock in plastic flow: flagged reduced physics;
+    # --approximate writes CPE8R / CAX8R with a node at the middle of every edge
+    strip, mp, theta = plastic_strip_deck()
+
+    def strip_moment(dat):
+        """[the end's moment from its last reactions (u_x / theta is y - h/2), the largest
+        free y displacement of the end]."""
+        f, u = dat_tables(dat, "forces"), dat_tables(dat, "displacements")
+        if not f or not u:
+            return None
+        uu = {int(r[0]): r[1:] for r in u[-1]}
+        return [abs(sum(r[1] * uu[int(r[0])][0] / theta for r in f[-1] if int(r[0]) in uu)),
+                max(abs(v[1]) for v in uu.values())]
+
+    def cylinder_u(dat):
+        u = dat_displacements(dat)
+        return [u[1][0], u[5][0]] if 1 in u and 5 in u else None
+
+    cyl, hill = plastic_cylinder_deck()
+    for tag, text, ref, read, quad, what in (
+            ("plastic_strip_cpe4", strip, mp, strip_moment, "CPE8R",
+             "a plane-strain CPE4 strip of 4 x 4 elements bent to 20 times its first-yield rotation, "
+             "its end moment / the plastic moment"),
+            ("plastic_cylinder_cax4", cyl, hill, cylinder_u, "CAX8R",
+             "a CAX4 thick cylinder, b = 2a, 4 elements through the wall, nu 0.4999, at 0.9 times its "
+             "limit pressure, its inner displacement / Hill's")):
+        raw = review_run(text, tag, read)
+        _, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
+        app = review_run(text, tag + "_approximate", read, approximate=True)
+        ok = bool(raw and app)
+        if ok:
+            flagged = any(r.startswith("element CPE4 / CAX4") or r.startswith("element CPE4 of") or
+                          r.startswith("element CAX4 of") for r in conv.reduced_physics)
+            with open(os.path.join(tmp, f"{tag}_approximate.inp"), encoding="utf-8") as fh:
+                written = f"*ELEMENT, TYPE={quad}\n" in fh.read()
+            err = abs(app[0] / ref - 1)
+            ok = flagged and written and err < 0.01 and app[1] > 0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {app[0] / ref:.4f} written as "
+                  f"{quad if written else 'NOT ' + quad} (--approximate), the free {'end' if quad == 'CPE8R' else 'outer face'} "
+                  f"moved {app[1]:.3g}; as written {raw[0] / ref:.3g}, "
                   f"{'flagged' if flagged else 'NOT flagged'} reduced physics")
         failures += 0 if ok else 1
 

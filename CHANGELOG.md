@@ -244,6 +244,20 @@ physics.
 * **Output frequency notes** — ccx writes all output of a step at one frequency. When the step's
   requests ask for different ones (a print card's FREQUENCY=100 beside preselected .frd output),
   a note now gives the frequency ccx writes.
+* **Plastic `CPE4` / `CAX4`** — ccx 2.23 integrates them fully, without the selectively
+  reduced volume terms of Abaqus' first-order quadrilaterals, so they lock in plastic flow and
+  reach no limit load (a thick cylinder carried 1.4 times its limit pressure on any mesh; a
+  bent strip 1.6 times its plastic moment on 4 elements through its depth). With a plastic
+  material they are now flagged as reduced physics; `--approximate` writes `CPE8R` / `CAX8R`
+  with a node at the middle of every edge (within 1.3 % of both), and a flagged plastic
+  `CPE4R` / `CAX4R` the same way instead of its locking twin.
+* **Hyperelastic D1 below 1e-10** — ccx 2.23 replaces it by 0.1 / μ0, a Poisson's ratio of
+  0.475, whatever the deck's units: a neo-Hooke steel in Pa ran 9× too stiff in bulk (a
+  cantilever deflected 0.86 of beam theory). Now warned as reduced physics, with the advice to
+  rescale the units.
+* **Notes** on `SECTION=RECT` beams, which ccx twists 1.19 times too stiffly on a square
+  section (1.07 at a side ratio of 10), and on curved linear membranes in a geometrically
+  linear step, whose near-mechanisms show as a node-to-node zigzag.
 * **`*SHELL SECTION, DENSITY=` on conventional shells** — the mass per unit area was dropped
   with a note, so the modes came out up to 1.9× too high. Where mass acts, each material (each
   ply material of a composite) now gets a copy with DENSITY / t more, t the section's

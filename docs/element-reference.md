@@ -50,8 +50,8 @@ Direct CalculiX types: **68**. Total recognised: **175**.
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CAX3` | 3 | direct |
-| `CAX4` | 4 | direct |
-| `CAX4H` | 4 | → `CAX4` (substituted: reduced physics) |
+| `CAX4` | 4 | direct — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CAX8R` |
+| `CAX4H` | 4 | → `CAX4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CAX8R` |
 | `CAX4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CAX4` |
 | `CAX6` | 6 | direct |
 | `CAX6M` | 6 | → `CAX6` (substituted: reduced physics) |
@@ -136,7 +136,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CGAX3` | 3 | → `CAX3` (substituted: reduced physics) |
-| `CGAX4` | 4 | → `CAX4` (substituted: reduced physics) |
+| `CGAX4` | 4 | → `CAX4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CAX8R` |
 | `CGAX4R` | 4 | → `CAX4R` (substituted: reduced physics) — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CAX4` |
 | `CGAX6` | 6 | → `CAX6` (substituted: reduced physics) |
 | `CGAX8` | 8 | → `CAX8` (substituted: reduced physics) |
@@ -147,7 +147,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CPEG3` | 3 | → `CPE3` (substituted: reduced physics) |
-| `CPEG4` | 4 | → `CPE4` (substituted: reduced physics) |
+| `CPEG4` | 4 | → `CPE4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CPE8R` |
 | `CPEG4R` | 4 | → `CPE4R` (substituted: reduced physics) — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CPE4` |
 | `CPEG6` | 6 | → `CPE6` (substituted: reduced physics) |
 | `CPEG6M` | 6 | → `CPE6` (substituted: reduced physics) |
@@ -208,8 +208,8 @@ ccx 2.23 expands every membrane element into a solid on nodes of its own and lea
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CPE3` | 3 | direct |
-| `CPE4` | 4 | direct |
-| `CPE4H` | 4 | → `CPE4` (substituted: reduced physics) |
+| `CPE4` | 4 | direct — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CPE8R` |
+| `CPE4H` | 4 | → `CPE4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CPE8R` |
 | `CPE4I` | 4 | → `C3D8I` slab (exact for small-strain linear elasticity in static steps); otherwise → `CPE4`, reduced physics |
 | `CPE4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CPE4` |
 | `CPE6` | 6 | direct |

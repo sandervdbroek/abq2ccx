@@ -16099,6 +16099,159 @@ def test_flat_c3d8r_bricks_get_a_note():
     assert "times its thickness" not in rep.text()
 
 
+PLASTIC = "*Plastic\n250., 0.\n"
+LOCK_FLAG = ("element CPE4 of a plastic material (ccx 2.23 lacks Abaqus' selectively reduced volume "
+             "terms: it locks in plastic flow)")
+
+
+def test_plastic_cpe4_cax4_flagged_as_locking():
+    # ccx 2.23 integrates CPE4 / CAX4 at 2 x 2 x 2 points (a C3D8 brick) without the selectively
+    # reduced volume terms of Abaqus' first-order quadrilaterals: they lock in plastic flow
+    _, conv, rep = convert_str(_plane_strip("CPE4", 4, 1, 1., 0.1, "", PLASTIC))
+    assert conv.reduced_physics == [LOCK_FLAG]
+    assert "Element CPE4 (4 elements, of a plastic material): Abaqus integrates the volume change" in rep.text()
+    assert "Rerun with --approximate to write them as CPE8R" in rep.text()
+    _, conv, _ = convert_str(_plane_strip("CPE4", 4, 1, 1., 0.1, ""))         # elastic: as Abaqus'
+    assert conv.reduced_physics == []
+    _, conv, rep = convert_str(_plane_strip("CAX4", 4, 1, 1., 0.1, "", PLASTIC, x0=1.))
+    assert conv.reduced_physics == [LOCK_FLAG.replace("CPE4", "CAX4")]
+    # the family by its ccx type (hybrid and generalized plane strain ones too); triangles and
+    # quadratic elements lock in Abaqus alike
+    _, conv, rep = convert_str(_plane_strip("CPE4H", 4, 1, 1., 0.1, "", PLASTIC))
+    assert LOCK_FLAG in conv.reduced_physics and "Element CPE4H (4 elements, of a plastic" in rep.text()
+    tri = _plane_strip("CPE4", 4, 1, 1., 0.1, "", PLASTIC).replace("type=CPE4", "type=CPE3")
+    tri = re.sub(r"^(\d+, \d+, \d+, \d+), \d+$", r"\1", tri, flags=re.M)
+    _, conv, _ = convert_str(tri)
+    assert conv.reduced_physics == []
+
+
+def test_plastic_cpe4_cax4_approximate_quadratic_upgrade():
+    # --approximate: CPE8R / CAX8R with a node at the middle of every edge (suffixes kept), the
+    # linear plane elements joined to them by an edge too; the node sets of both ends of an edge
+    # take its midside node
+    body, conv, rep = convert_str(_plane_strip("CPE4", 4, 1, 1., 0.1, "", PLASTIC), approximate=True)
+    assert "*ELEMENT, TYPE=CPE8R\n" in body and all(t == "CPE8R" for t, _ in conv.geom.elements.values())
+    assert len(conv.geom.nodes) == 10 + 13 and len(conv.geom.elements[1][1]) == 8
+    root = conv.geom.nsets["ROOT"]
+    assert len(root) == 3 and conv.geom.nodes[root[-1]] == (0.0, 0.05, 0.0)
+    assert ("[APPROX] Element CPE4 (4 elements, of a plastic material) written as CPE8R: Abaqus "
+            "integrates the volume change") in rep.text()
+    assert "each has a node at the middle of every edge (nodes 11-23)" in rep.text()
+    assert conv.reduced_physics == ["--approximate: Element CPE4 (4 elements, of a plastic material) "
+                                    "written as CPE8R"]
+    for typ, new in (("CPE4H", "CPE8RH"), ("CAX4T", "CAX8RT"), ("CPEG4", "CPEG8R")):
+        _, conv, _ = convert_str(_plane_strip(typ, 4, 1, 1., 0.1, "", PLASTIC, x0=1.), approximate=True)
+        assert conv.geom.elements[1][0] == new, (typ, conv.geom.elements[1])
+    # elastic neighbours (another section, a triangle below the strip) are upgraded too, so no
+    # midside node hangs; a quadratic neighbour is warned about
+    two = _plane_strip("CPE4", 4, 1, 1., 0.1, "", PLASTIC).replace(
+        "*Solid Section, elset=S, material=M\n",
+        "*Node\n11, 0.625, -0.1\n*Element, type=CPE3, elset=T\n9, 3, 11, 4\n"
+        "*Elset, elset=A\n1, 2\n*Elset, elset=B\n3, 4, 9\n*Material, name=E\n*Elastic\n210000., 0.3\n"
+        "*Solid Section, elset=A, material=M\n*Solid Section, elset=B, material=E\n")
+    _, conv, rep = convert_str(two, approximate=True)
+    els = conv.geom.elements
+    assert [els[e][0] for e in (1, 2, 3, 4, 9)] == ["CPE8R", "CPE8R", "CPE8R", "CPE8R", "CPE6"]
+    assert len(els[9][1]) == 6 and els[9][1][5] == els[3][1][4]          # the shared edge's node
+    assert "3 other plane element(s) joined to them by an edge were upgraded too (CPE4 -> CPE8R, " \
+           "CPE3 -> CPE6)" in rep.text()
+    assert "share an edge with the upgraded" not in rep.text()
+
+
+def test_flagged_plastic_cpe4r_is_upgraded_not_twinned():
+    # a CPE4R flagged for its depth (task 80) whose material is plastic: its twin CPE4 locks in
+    # plastic flow, so --approximate writes CPE8R
+    deck = _plane_strip("CPE4R", 4, 1, 1., 0.1, "0.05\n", PLASTIC)
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert all(t == "CPE8R" for t, _ in conv.geom.elements.values()) and "*ELEMENT, TYPE=CPE4\n" not in body
+    assert "[APPROX] Element CPE4R (4 elements) written as CPE8R: ccx 2.23 expands a CPE4R" in rep.text()
+    assert "so the elements of a plastic material are written as CPE8R" in rep.text()
+    assert "[APPROX] Element CPE4R / CAX4R written as CPE8R, with a node at the middle" not in rep.text()
+    _, conv, _ = convert_str(deck)                                    # as written: unchanged
+    assert {t for t, _ in conv.geom.elements.values()} == {"CPE4R"}
+
+
+HYPER_BAR = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+             "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*Element, type=C3D8, elset=S\n"
+             "1, 1, 2, 3, 4, 5, 6, 7, 8\n*Material, name=RUBBER\n{card}*Solid Section, elset=S, "
+             "material=RUBBER\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n*Step, nlgeom\n*Static\n"
+             "*Cload\n2, 1, 1.\n*End Step\n")
+HYPER_FLAG = ("*HYPERELASTIC compressibility (ccx 2.23 replaces a D1 below 1e-10 by a Poisson's "
+              "ratio of 0.475)")
+
+
+def test_hyperelastic_d1_below_ccx_threshold_flagged():
+    # ccx 2.23 replaces a compressibility coefficient below 1e-10 (an absolute value) by
+    # 0.1^i / mu0: a neo-Hooke steel in Pa (D1 1.1e-11) runs at a Poisson's ratio of 0.475
+    _, conv, rep = convert_str(HYPER_BAR.format(card="*Hyperelastic, neo hooke\n4.04e10, 1.1428571e-11\n"))
+    assert conv.reduced_physics == [HYPER_FLAG]
+    assert ("*HYPERELASTIC of material RUBBER: D1 = 1.14286e-11, a bulk modulus 2 / D1 = 1.75e+11 (a "
+            "Poisson's ratio of 0.3); ccx's is 9.23 times that") in rep.text()
+    assert "Rescale the deck's units (e.g. to MPa and mm)" in rep.text()
+    _, conv, rep = convert_str(HYPER_BAR.format(card="*Hyperelastic, neo hooke\n0.4, 0.\n"))
+    assert conv.reduced_physics == [HYPER_FLAG] and "D1 = 0, an incompressible material" in rep.text()
+    # D1 at the threshold, other models: D1 found by its position
+    for card, flagged in (("*Hyperelastic, neo hooke\n4.04e10, 1e-10\n", False),
+                          ("*Hyperelastic, mooney-rivlin\n0.3, 0.1, 1e-12\n", True),
+                          ("*Hyperelastic, mooney-rivlin\n0.3, 1e-12, 0.01\n", False),
+                          ("*Hyperelastic, polynomial, N=2\n0.3, 0.1, 0., 0., 0., 1e-12, 0.\n", True),
+                          ("*Hyperelastic, polynomial, N=2\n0.3, 0.1, 0., 0., 0., 0.01, 0.\n", False),
+                          ("*Hyperelastic, ogden, N=1\n0.6, 2., 0.\n", True),
+                          ("*Hyperelastic, reduced polynomial, N=2\n0.3, 0.01, 1e-3, 0.\n", False),
+                          ("*Hyperelastic, yeoh\n0.3, -0.01, 0.001, 1e-11, 0., 0.\n", True),
+                          ("*Hyperelastic\n0.3, 0.1, 1e-12\n", True)):          # POLYNOMIAL, N=1
+        _, conv, _ = convert_str(HYPER_BAR.format(card=card))
+        assert (HYPER_FLAG in conv.reduced_physics) == flagged, card
+    # a material no section uses changes nothing
+    unused = HYPER_BAR.format(card="*Elastic\n1000., 0.3\n*Material, name=OTHER\n"
+                                   "*Hyperelastic, neo hooke\n0.4, 0.\n")
+    _, conv, _ = convert_str(unused)
+    assert conv.reduced_physics == []
+
+
+def test_rect_beam_torsion_note():
+    # one brick across a RECT section warps only as y z: ccx's torsion constant is
+    # a^3 b^3 / (3 (a^2 + b^2)), 1.19 J on a square — a note in a 3-D model
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n"
+            "2, 2, 3\n*Material, name=M\n*Elastic\n210000., 0.3\n*Beam Section, elset=B, material=M, "
+            "section=RECT\n0.1, 0.1\n0., 0., -1.\n*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n3, 4, 1.\n"
+            "*End Step\n")
+    _, conv, rep = convert_str(beam)
+    note = "*BEAM SECTION, SECTION=RECT: ccx 2.23 twists its beam (one brick across the section)"
+    assert note in rep.text() and "1.19 times as stiff in torsion on a square section" in rep.text()
+    assert conv.reduced_physics == []
+    _, _, rep = convert_str(beam.replace("section=RECT\n0.1, 0.1", "section=PIPE\n0.1, 0.01"))
+    assert note not in rep.text()
+    planar = beam.replace("type=B31", "type=B21").replace("0., 0., -1.\n", "").replace("3, 4, 1.", "3, 2, 1.")
+    _, _, rep = convert_str(planar)
+    assert note not in rep.text()
+
+
+def test_curved_linear_membranes_in_linear_step_note():
+    # a linear membrane on a curved surface has near-mechanisms in a geometrically linear step
+    # (a faceted ring's alternating radial motion stretches no facet), which ccx resists only by
+    # its expanded brick's own bending stiffness; NLGEOM's membrane tension stiffens them
+    nodes, els = [], []
+    for j in range(2):
+        for i in range(8):
+            th = 2 * math.pi * i / 8
+            nodes.append(f"{1 + i + 8 * j}, {math.cos(th):.12g}, {math.sin(th):.12g}, {0.5 * j}")
+    els = [f"{i + 1}, {i + 1}, {i + 9}, {(i + 1) % 8 + 9}, {(i + 1) % 8 + 1}" for i in range(8)]
+    tube = ("*Node\n" + "\n".join(nodes) + "\n*Element, type=M3D4, elset=S\n" + "\n".join(els)
+            + "\n*Nset, nset=BOT, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n210e9, 0.\n"
+              "*Membrane Section, elset=S, material=M\n0.01\n*Boundary\nBOT, 1, 3\n*Step\n*Static\n"
+              "*Dload\nS, P, 1e5\n*End Step\n")
+    _, conv, rep = convert_str(tube)
+    note = "Membranes (8 linear elements) on a curved surface in a geometrically linear step (step 1)"
+    assert note in rep.text() and conv.reduced_physics == []
+    _, _, rep = convert_str(tube.replace("*Step\n", "*Step, nlgeom\n"))
+    assert "on a curved surface in a geometrically linear step" not in rep.text()
+    flat = _plane_strip("CPS4", 4, 1, 1., 0.1, "0.01\n").replace("type=CPS4", "type=M3D4").replace(
+        "*Solid Section", "*Membrane Section")
+    _, _, rep = convert_str(flat)
+    assert "on a curved surface in a geometrically linear step" not in rep.text()
+
+
 def test_composite_s4r_bc_lines_reach_the_midside_nodes():
     # node-numbered BC values on both ends of an edge are interpolated onto its midside node
     body, _, _ = convert_str(S4R_STRIP + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n"
