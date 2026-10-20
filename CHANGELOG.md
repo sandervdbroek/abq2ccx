@@ -96,6 +96,15 @@ physics.
   global DOF that ccx's own coupling eliminates along a turned axis stopped ccx. Without NLGEOM,
   such a coupling is now written as its linear equations, and ccx holds both the coupling and
   the BC.
+* **Invalid or incomplete source decks** — the report now names what is missing, where ccx
+  used to stop with nothing explained: a section on an element set the deck never defines or
+  that holds no element; elements no section covers; an element set where `*INITIAL
+  CONDITIONS, TYPE=TEMPERATURE` (`VELOCITY`, `DISPLACEMENT`) takes a node set; a field that is
+  not a number in a material, procedure or `*AMPLITUDE` card (a template's `#E`); elements
+  whose repeated nodes leave them no area or volume; a `*PARAMETER` given as a `<name>` no
+  block defines (a template's placeholder), with what is computed from it; `*INCLUDE, FILE=`.
+  An assembly `*NSET` / `*ELSET` whose `INSTANCE=` names no instance kept its labels, which
+  then named another instance's nodes: it is left out (warned).
 * **Cards ccx 2.23 stopped or crashed on, without a warning** — each is now written in a form
   ccx runs, or warned (reduced physics):
   * `*RIGID BODY` with `ELSET` and a `PIN` / `TIE NSET`: one `NSET` of all their nodes (ccx

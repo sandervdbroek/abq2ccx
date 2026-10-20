@@ -71,6 +71,8 @@ HEX = """*NODE
 *ELEMENT, TYPE=C3D8, ELSET=EALL
 1, 1,2,3,4,5,6,7,8
 """
+# a section for HEX's element, where a test needs the deck to be valid Abaqus input
+HEX_SEC = "*Material, name=MHEX\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=MHEX\n"
 
 HEX_MODEL = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
              "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n")
@@ -710,6 +712,18 @@ def test_unresolved_parameter_is_reported():
     _, conv, rep = convert_str(deck)
     assert conv.geom.nodes[1] == (2.0, 0.0, 6.0) and 2 not in conv.geom.nodes
     assert "resolved 2 parameter(s)" in rep.text() and "*PARAMETER: b could not be evaluated" in rep.text()
+
+
+def test_parameter_value_from_outside_the_deck_is_reported():
+    # a <name> token in a definition is a template's placeholder (Abaqus' expressions name
+    # parameters bare): it, and what is computed from it, are reported as one missing value
+    deck = ("*PARAMETER\nwt = <wt>\nod = 0.4\nid = od - 2*wt\narea = id**2\n*NODE\n1, <od>, 0., 0.\n"
+            "*ELEMENT, TYPE=MASS, ELSET=E\n1, 1\n")
+    _, conv, rep = convert_str(deck)
+    assert conv.geom.nodes[1] == (0.4, 0.0, 0.0)
+    assert "*PARAMETER: wt = <wt>: a value no *PARAMETER block defines" in rep.text()
+    assert "it and what is computed from it (id, area) stay unresolved" in rep.text()
+    assert "could not be evaluated" not in rep.text()
 
 
 def test_parameter_values_beyond_the_float_range_are_refused():
@@ -1589,8 +1603,10 @@ def test_shell_and_membrane_pressure_sides():
     def card(typ, face=None):
         load = (f"*Surface,type=element,name=sf\ne, {face}\n*Step\n*Static\n*Dsload\nsf, P, 5.0\n"
                 if face else "*Step\n*Static\n*Dload\ne, P, 5.0\n")
+        sec = "*Shell Section" if typ.startswith("S") else "*Membrane Section"
         deck = (f"*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n*Element,type={typ},elset=e\n"
-                f"1,1,2,3,4\n" + load + "*End Step\n")
+                f"1,1,2,3,4\n*Material, name=M\n*Elastic\n1e6, 0.3\n{sec}, elset=e, material=M\n"
+                f"0.1\n" + load + "*End Step\n")
         body, _, rep = convert_str(deck)
         assert _card_at(body, "*SURFACE, NAME=ABQ2CCX_TOP_E, TYPE=ELEMENT") == ["e, S2"]
         return _card_at(body, "*DLOAD"), rep
@@ -3035,6 +3051,79 @@ def test_undefined_material_warns():
     assert "never defined" not in rep.text()
 
 
+def test_sections_on_undefined_sets_and_elements_without_one_warned():
+    # Abaqus stops on a section whose element set the deck never defines and on elements no
+    # section covers; ccx stops on both ('element set ... has not yet been defined', 'no
+    # material was assigned to element ...'), on the latter only in a deck with a step
+    step = "*Step\n*Static\n*Boundary\nL,1,2\n*End Step\n"
+    _, _, rep = convert_str(Q4.replace("elset=E,material", "elset=F,material") + step)
+    assert "*SOLID SECTION, ELSET=F: the deck never defines that element set" in rep.text()
+    assert "1 element(s) have no section (no section card names a set holding element 1, " \
+           "CPS4)" in rep.text()
+    # a set that exists but holds no element (its elements in an *INCLUDE file not read)
+    _, _, rep = convert_str(Q4.replace("elset=E,material", "elset=F,material") +
+                            "*Element,type=CPS4,elset=F\n" + step)
+    assert "*SOLID SECTION, ELSET=F: that element set holds no element" in rep.text()
+    nosec = Q4.replace("*Solid Section,elset=E,material=M\n1.,\n", "")
+    _, _, rep = convert_str(nosec + step)
+    assert "have no section" in rep.text() and "never defines that element set" not in rep.text()
+    for deck in (Q4 + step, nosec,                 # a mesh-only deck: ccx accepts it
+                 Q4 + "*Node\n9,0,0\n*Element,type=MASS,elset=PM\n9,9\n*Mass,elset=PM\n1.\n" + step):
+        _, _, rep = convert_str(deck)
+        assert "have no section" not in rep.text() and "never defines that" not in rep.text()
+
+
+def test_node_based_initial_conditions_on_an_element_set_warned():
+    # Abaqus takes a node set or node in *INITIAL CONDITIONS, TYPE=TEMPERATURE (VELOCITY, ...):
+    # an element set stops it, and ccx ('node set E has not yet been defined')
+    _, _, rep = convert_str(Q4 + "*Initial Conditions, type=temperature\nE, 20.\n")
+    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE names element set 'E', where Abaqus takes a " \
+           "node set or node" in rep.text()
+    _, _, rep = convert_str(Q4 + "*Initial Conditions, type=temperature\nL, 20.\n1, 20.\n")
+    assert "INITIAL CONDITIONS" not in "".join(m for lv, m in rep.entries if lv == "WARNING")
+
+
+def test_non_numeric_data_of_numeric_cards_warned():
+    # a template's placeholders that were never filled in (#E): Abaqus and ccx stop on them
+    deck = Q4.replace("1000.,0.3", "#E, #NU") + "*Step\n*Static\n#FRAME, 1.\n*End Step\n"
+    _, _, rep = convert_str(deck)
+    assert "Not a number where Abaqus reads numbers only: *ELASTIC '#E', '#NU'; *STATIC " \
+           "'#FRAME'" in rep.text() and "'*ERROR reading *ELASTIC'" in rep.text()
+    # Fortran exponents and blanks are numbers; a Riks step names a node set in its data
+    deck = Q4.replace("1000.,0.3", "1.D3, 0.3") + ("*Step\n*Static, riks\n0.1, 1., , , , L, 1, "
+                                                   "0.5\n*End Step\n")
+    _, _, rep = convert_str(deck)
+    assert "Not a number" not in rep.text()
+
+
+def test_elements_without_an_area_or_volume_warned():
+    # repeated nodes that leave too few corners for an area (plane, shell) or a volume
+    # (solid): Abaqus stops on them, ccx too ('nonpositive jacobian', ...)
+    _, _, rep = convert_str(Q4.replace("1,1,2,3,4", "1,1,2,2,1"))
+    assert "1 element(s) repeat nodes so that too few distinct corners remain for an area or a " \
+           "volume (element 1, CPS4: nodes 1, 2, 2, 1)" in rep.text()
+    _, _, rep = convert_str(HEX.replace("1, 1,2,3,4,5,6,7,8", "1, 1,2,2,1,1,2,2,1"))
+    assert "repeat nodes" in rep.text()
+    # collapsed elements that keep an area or a volume are valid: a triangle, a wedge
+    for deck in (Q4.replace("1,1,2,3,4", "1,1,2,3,3"), HEX.replace("1, 1,2,3,4,5,6,7,8",
+                                                                     "1, 1,2,3,3,5,6,7,7")):
+        _, _, rep = convert_str(deck)
+        assert "repeat nodes" not in rep.text()
+
+
+def test_assembly_set_on_an_undefined_instance_left_out():
+    # a set whose INSTANCE= names no instance (an *INSTANCE card missing): Abaqus stops on it;
+    # its labels are not the nodes of another instance
+    deck = ("*Part, name=P\n*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n*Element,type=CPS4,elset=E\n"
+            "1,1,2,3,4\n*Solid Section,elset=E,material=M\n1.,\n*End Part\n*Assembly, name=A\n"
+            "*Instance, name=P-1, part=P\n*End Instance\n*Nset, nset=BOT, instance=GONE-1\n1, 2\n"
+            "*Nset, nset=TOP, instance=P-1\n3, 4\n*End Assembly\n*Material,name=M\n*Elastic\n"
+            "1000.,0.3\n")
+    _, conv, rep = convert_str(deck)
+    assert "BOT" not in conv.geom.nsets and conv.geom.nsets["TOP"] == [3, 4]
+    assert "*NSET BOT name INSTANCE=GONE-1, which is not an instance of the model" in rep.text()
+
+
 def test_plane_node_rotational_bc_dropped():
     # plane-element nodes have no rotations; ccx 2.23 builds without the fix of CalculiX PR #200
     # crash on a BC there (Abaqus ignores it)
@@ -3809,6 +3898,13 @@ def test_include_inserts_the_file_text():
     _, conv, rep = _convert_files({"main.inp": "*NODE\n1, 0., 0., 0.\n*INCLUDE, INPUT=a.inp\n",
                                    "a.inp": "*INCLUDE, INPUT=main.inp\n2, 1., 0., 0.\n"})
     assert set(conv.geom.nodes) == {1, 2} and "*INCLUDE cycle detected" in rep.text()
+
+
+def test_include_with_file_instead_of_input_is_reported():
+    # *INCLUDE takes INPUT=; Abaqus stops on FILE=, and nothing is read
+    _, conv, rep = convert_str(Q4 + "*INCLUDE, FILE=sections.inp\n")
+    assert "*INCLUDE, FILE=sections.inp: *INCLUDE takes INPUT=" in rep.text()
+    assert conv.reduced_physics == ["an *INCLUDE file could not be read"]
 
 
 def test_include_paths_resolve_from_the_job_directory():
@@ -8245,7 +8341,7 @@ def test_distributed_load_examples():
 
 
 # a surface element on the cube's top face, its normal (right-hand rule) +z: out of the cube
-SKIN = HEX + "*ELEMENT, TYPE=SFM3D4, ELSET=SKIN\n9, 5, 6, 7, 8\n*SURFACE SECTION, ELSET=SKIN\n"
+SKIN = HEX + HEX_SEC + "*ELEMENT, TYPE=SFM3D4, ELSET=SKIN\n9, 5, 6, 7, 8\n*SURFACE SECTION, ELSET=SKIN\n"
 TOP4 = (5, 6, 7, 8)
 
 
@@ -9300,7 +9396,7 @@ def test_connector_rotation_node_of_a_transformed_solid_node_gets_its_axes():
     # a hinge between a solid node with a moment (its rotation then lives on a new rotation
     # node) and a beam end: that node has a *TRANSFORM, so its rotation node gets the same
     # axes — the moment moved there acts in them, as in Abaqus (probed: exact)
-    deck = (HEX + "*Node\n20, 1.,0.,0.\n21, 2.,0.,0.\n*Element, type=B31, elset=B\n2, 20, 21\n"
+    deck = (HEX + HEX_SEC + "*Node\n20, 1.,0.,0.\n21, 2.,0.,0.\n*Element, type=B31, elset=B\n2, 20, 21\n"
             "*Beam Section, elset=B, material=M, section=RECT\n1.,1.\n0.,0.,1.\n"
             "*Material, name=M\n*Elastic\n1000., 0.3\n*Orientation, name=AX\n0., 0., 1., 1., 0., 0.\n"
             "*Element, type=CONN3D2, elset=H\n30, 2, 20\n*Connector Section, elset=H\nHinge,\nAX,\n"
@@ -9329,7 +9425,7 @@ def test_transform_spherical_rigid_example():
 # --- deck BCs, moments and *EQUATION terms on DOFs 4-6 of nodes with a *TRANSFORM -------
 
 # the top face of the cube coupled kinematically (all DOFs) to reference point 9
-KIN9 = HEX + ("*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+KIN9 = HEX + HEX_SEC + ("*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
               "*Surface, type=NODE, name=TOPS\nTOPN\n*Coupling, constraint name=C1, ref node=RP, "
               "surface=TOPS\n*Kinematic\n1, 6\n")
 KIN9_STEP = ("*Step\n*Static\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\nRP, 5, 5\n"
@@ -9980,7 +10076,7 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
     # the ROT NODE, which takes the reference node's rotational BCs
     step = ("*Step{}\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\nRP, 2, 6\n"
             "*Boundary\nRP, 1, 1, 0.1\n*End Step\n")
-    rp = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+    rp = HEX + HEX_SEC + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
     body, _, _ = convert_str(KIN9 + step.format(""))
     eqs = _equation_terms(body)          # the kinematic coupling's (node 5: d = (-0.5, -0.5, -1))
     assert eqs[0] == [(5, 1, 1.), (9, 1, -1.), (10, 2, 1.), (10, 3, -0.5)] and len(eqs) == 12
@@ -10070,7 +10166,7 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
 
 
 # a solid cube clamped at its bottom, its top face TOPN rigidly tied to node 9 (RP) above it
-TOP9 = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
+TOP9 = HEX + HEX_SEC + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n"
 TOP9_DYN = ("*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n{}"
             "*Cload\nRP, 5, 1.\n*End Step\n")
 TOP9_KIN = ("*Surface, type=node, name=TS\nTOPN\n*Coupling, constraint name=C, ref node=RP, "

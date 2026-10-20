@@ -1559,6 +1559,28 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                         f"2024 and later do (Python 3); Abaqus 2023 and older evaluate parameters in "
                         f"Python 2, which floor-divides integers ({a}//{b} = {a // b}). For a deck "
                         f"written for those, use '//' or a float operand.", once=True)
+        # a <name> token in a definition (Abaqus' expressions name parameters bare) is a value
+        # the deck expects from outside — a template's placeholder — and so is what uses it
+        exprs = dict(raw_defs)
+        outside = dedup(nm for nm in bad if re.search(r"<[^<>]+>", exprs[nm]))
+        follow = set(outside)
+        for _ in range(len(bad)):
+            grown = [nm for nm in bad if nm not in follow and
+                     follow & set(re.findall(r"[A-Za-z_]\w*", exprs[nm]))]
+            if not grown:
+                break
+            follow.update(grown)
+        if outside:
+            deps = [nm for nm in dedup(bad) if nm in follow and nm not in outside]
+            given = ", ".join(f"{nm} = {exprs[nm]}" for nm in outside[:3])
+            uses = (f" and what is computed from it ({', '.join(deps[:6])}"
+                    f"{' ...' if len(deps) > 6 else ''})" if deps else "")
+            report.warn(f"*PARAMETER: {given}{' ...' if len(outside) > 3 else ''}: a value no "
+                        f"*PARAMETER block defines (a template's placeholder, filled in outside "
+                        f"the deck?), so {'it' if len(outside) == 1 else 'they'}{uses} stay "
+                        f"unresolved: Abaqus stops on this, and ccx reads the raw text. Give the "
+                        f"value.", once=True)
+            bad = [nm for nm in bad if nm not in follow]
         if bad:
             report.warn(f"*PARAMETER: {', '.join(dedup(bad))} could not be evaluated (the converter "
                         f"reads numbers, quoted strings, arithmetic and math functions, within the "
@@ -1713,7 +1735,13 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                 keyword, params = parse_keyword_line(line, seen)
                 if keyword == "INCLUDE":
                     inc = (params.get("INPUT") or params.get("INP") or "").strip().strip('"')
-                    if not inc:
+                    if not inc and params:
+                        given = ", ".join(f"{k}={v}" if v else k for k, v in params.items())
+                        report.warn(f"*INCLUDE, {given}: *INCLUDE takes INPUT= (Abaqus stops on "
+                                    f"this card too), so no file is read and what it holds is "
+                                    f"missing from the conversion.")
+                        report.reduce("an *INCLUDE file could not be read")
+                    elif not inc:
                         report.warn("*INCLUDE without INPUT= ignored.")
                     else:
                         if "<" in inc:          # a file name given by a *PARAMETER above
@@ -5119,6 +5147,62 @@ class Converter:
             self.report.warn(f"{len(bad)} element(s) name an undefined node (element {bad[0]}: "
                              f"node {n}); Abaqus stops on this, and ccx 2.23 reads the node at the "
                              f"origin. Tractions and line loads on them are not converted.")
+
+    def _warn_degenerate_elements(self) -> None:
+        """Warn on elements whose repeated nodes leave fewer distinct corners than an area
+        (three) or a volume (four) needs, e.g. a CAX4 written 1, 2, 2, 1: Abaqus stops on
+        such an element, and ccx too ('nonpositive jacobian' and the like).  A collapsed
+        element that keeps an area or volume (a quadrilateral as a triangle) is valid."""
+        bad = []
+        for e, (t, conn) in self.geom.elements.items():
+            t = t.upper()
+            if t.startswith(("C3D", "DC3D", "AC3D")):
+                corners, need = {4: 4, 10: 4, 5: 5, 13: 5, 6: 6, 15: 6}.get(len(conn), 8), 4
+            elif t.startswith(PLANE_ELEM_PREFIXES + ("CGAX", "DC2D", "DCAX", "AC2D", "ACAX", "M3D")) \
+                    or (t in SHELL_TYPES and not t.startswith(("SFM", "SAX", "DSAX"))):
+                corners, need = (3 if len(conn) in (3, 6) else 4), 3
+            else:
+                continue
+            if len(conn) >= corners and len(set(conn[:corners])) < need:
+                bad.append(e)
+        if bad:
+            e = min(bad)
+            t, conn = self.geom.elements[e]
+            self.report.warn(f"{len(bad)} element(s) repeat nodes so that too few distinct corners "
+                             f"remain for an area or a volume (element {e}, {t.upper()}: nodes "
+                             f"{', '.join(map(str, conn))}): Abaqus stops on such elements, and ccx "
+                             f"does too ('nonpositive jacobian' or a similar error).", once=True)
+
+    # cards whose data lines Abaqus reads as numbers only
+    _NUMERIC_CARDS = frozenset(("ELASTIC", "PLASTIC", "DENSITY", "EXPANSION", "CONDUCTIVITY",
+                                "SPECIFIC HEAT", "HYPERELASTIC", "HYPERFOAM", "CREEP", "STATIC",
+                                "DYNAMIC", "FREQUENCY", "BUCKLE", "HEAT TRANSFER", "VISCO",
+                                "COUPLED TEMPERATURE-DISPLACEMENT", "AMPLITUDE"))
+
+    def _check_numeric_data(self, blocks: List[Block]) -> None:
+        """Warn on a field that is not a number where Abaqus reads only numbers — typically the
+        placeholder of a template (#E, $E) that the script filling it in never replaced:
+        Abaqus stops on it, and so does ccx ('*ERROR reading *ELASTIC').  An undefined <name>
+        parameter token is apply_parameters' to report."""
+        bad: "OrderedDict[str, List[str]]" = OrderedDict()
+        for b in blocks:
+            if b.keyword not in self._NUMERIC_CARDS or b.has("RIKS"):   # Riks: a node set field
+                continue
+            for ln in b.data:
+                for f in ln.split(","):
+                    t = f.strip()
+                    if not t or "<" in t:
+                        continue
+                    try:
+                        pf(t)
+                    except ValueError:
+                        if t not in bad.setdefault(b.keyword, []):
+                            bad[b.keyword].append(t)
+        if bad:
+            shown = "; ".join(f"*{kw} {', '.join(repr(t) for t in ts[:4])}" for kw, ts in bad.items())
+            self.report.warn(f"Not a number where Abaqus reads numbers only: {shown} (placeholders "
+                             f"of a template never filled in?). Abaqus stops on them, and so does "
+                             f"ccx ('*ERROR reading *{next(iter(bad))}').", once=True)
 
     def _bc_dofs_in_range(self, blocks: List[Block]) -> List[Block]:
         """``blocks`` with the DOFs above 30 left out of every *BOUNDARY line (Abaqus numbers
@@ -9589,6 +9673,11 @@ class Converter:
         if spec.upper() in self.surfaces:
             self.report.warn(f"*{kw} on '{spec}', which is a *SURFACE, not a node set — ccx needs "
                              f"a node set here; define an *NSET with the surface's nodes.", once=True)
+        elif spec.upper() in self.geom.elsets:
+            self.report.warn(f"*{kw} names element set '{spec}', where Abaqus takes a node set or "
+                             f"node (it stops on this too); ccx stops with 'node set "
+                             f"{spec.upper()} has not yet been defined'. Define an *NSET with the "
+                             f"set's nodes.", once=True)
         else:
             self.report.warn(f"*{kw} references node set '{spec}', which the deck never defines "
                              f"(incomplete export?); ccx stops with 'node set {spec.upper()} has not "
@@ -17265,6 +17354,10 @@ class Converter:
                                       f"condition type (ccx knows {', '.join(sorted(ccx_known))}); "
                                       f"remodel or remove.")
         layout = {"TEMPERATURE": "field", "VELOCITY": "dof", "DISPLACEMENT": "dof"}.get(typ)
+        if layout:                              # node-based: a node set or node per record
+            for rec in merged_data_records(b):
+                if rec and rec[0].strip():
+                    self._check_node_target(f"INITIAL CONDITIONS, TYPE={typ}", rec[0].strip())
         midside = self._midside_records(b, layout) + self._qmem_records(b, layout) if layout else []
         if typ == "TEMPERATURE" and self._temp_ic_fill and not self._temp_ic_filled:
             # on the first card only: ccx takes the last value given to a node, so the fill on
@@ -17989,6 +18082,9 @@ class Converter:
         self.build_geometry(blocks)
         blocks = self._split_coupling_refs(blocks)
         self._warn_undefined_element_nodes()
+        self._warn_degenerate_elements()
+        self._check_sections(blocks)            # the deck's own mesh: before any planner retypes it
+        self._check_numeric_data(blocks)
         self._drop_surface_elements(raw, blocks)
         blocks = self._free_face_surfaces(blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
@@ -23383,6 +23479,48 @@ class Converter:
                              f"defined ({known}). ccx stops with 'nonexistent material' (ccx 2.23 "
                              f"segfaults instead when the section is the deck's last card and has "
                              f"a data line).", once=True)
+
+    # Abaqus element types that take their properties from a *... SECTION card (continuum,
+    # shell, membrane, beam, truss, cohesive and gasket elements); rigid, surface, point,
+    # spring, connector and user elements have none
+    _SECTIONED_TYPES = re.compile(r"(C3D|CPS|CPE|CAX|CGAX|CGPE|DC3D|DC2D|DCAX|DCC|AC3D|AC2D|ACAX|"
+                                  r"S\d|SAX|SC\d|STRI|DS\d|M3D|MAX|MGAX|B\d|PIPE|T2D|T3D|ELBOW|"
+                                  r"FRAME|COH|GK)")
+
+    _CCX_SECTIONS = frozenset(("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION",
+                               "MEMBRANE SECTION", "BEAM SECTION", "BEAM GENERAL SECTION"))
+
+    def _check_sections(self, blocks: List[Block]) -> None:
+        """A section on an element set the deck never defines, and elements no section covers,
+        are invalid input: Abaqus stops on both, and so does ccx ('element set ... has not yet
+        been defined'; 'no material was assigned to element ...' once the deck has a step, a
+        mesh-only deck it accepts).  Flag them so the stop is explained."""
+        covered: set = set()
+        for b in blocks:
+            if not (b.keyword.endswith("SECTION") or b.keyword == "RIGID BODY"):
+                continue
+            name = (b.param("ELSET") or "").strip()
+            if not name:
+                continue
+            eids = self._resolve_elements(name)
+            covered.update(eids)
+            if not eids and b.keyword in self._CCX_SECTIONS:
+                what = ("the deck never defines that element set, so the section covers no element "
+                        "(Abaqus stops on it too)" if name.upper() not in self.geom.elsets else
+                        "that element set holds no element (are its elements in a file not read?), "
+                        "so the section covers none")
+                self.report.warn(f"*{b.keyword}, ELSET={name}: {what}; ccx stops with 'element set "
+                                 f"{name.upper()} has not yet been defined'.", once=True)
+        if not any(b.keyword == "STEP" for b in blocks):
+            return
+        bare = [e for e, (t, _c) in self.geom.elements.items()
+                if e not in covered and self._SECTIONED_TYPES.match(t.upper())]
+        if bare:
+            e = min(bare)
+            self.report.warn(f"{len(bare)} element(s) have no section (no section card names a set "
+                             f"holding element {e}, {self.geom.elements[e][0].upper()}): Abaqus "
+                             f"stops on elements without a section too, and ccx stops with 'no "
+                             f"material was assigned to element ...'.", once=True)
 
     def _check_nonpositive_ids(self) -> None:
         """Abaqus requires positive node numbers; a deck numbered from 0 (some mesh
@@ -29379,9 +29517,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     return out, gmax_node, gmax_elem, (node_off, elem_off), entry
 
 
-def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Block]:
+def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
+                          report: Optional[Report] = None) -> List[Block]:
     """Translate assembly-level sets / surfaces / constraints, resolving instance-qualified
-    members (``Instance.id`` / ``Instance.setname``) to the flat global numbering."""
+    members (``Instance.id`` / ``Instance.setname``) to the flat global numbering.  A set
+    whose INSTANCE= names no instance of the model loses its labels (Abaqus stops on it):
+    kept as they are, they would name the nodes or elements of another instance."""
     def resolve(tok: str, entity: str = "node"):
         sr = _split_instance_ref(tok, maps)
         if sr is not None and sr[1]:
@@ -29392,6 +29533,7 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
         return ("raw", tok)
 
     out: List[Block] = []
+    lost: "OrderedDict[str, List[str]]" = OrderedDict()     # instance -> sets on it
     for b in assembly_blocks:
         kw = b.keyword
         if kw in ("NSET", "ELSET"):
@@ -29401,6 +29543,9 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
             off = None
             if inst and inst.upper() in maps:
                 off = maps[inst.upper()][0 if kw == "NSET" else 1]
+            elif inst:
+                lost.setdefault(inst.strip(), []).append(f"*{kw} {name}")
+                continue
             gen = b.has("GENERATE")
             ids: List[int] = []
             names: List[str] = []
@@ -29441,6 +29586,14 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
             out.append(Block("SURFACE", OrderedDict(b.params), data))
         else:
             out.append(b)
+    for inst, sets in lost.items():
+        if report is not None:
+            report.warn(f"{', '.join(sets[:4])}{' ...' if len(sets) > 4 else ''} name INSTANCE="
+                        f"{inst}, which is not an instance of the model (no *INSTANCE defines it, "
+                        f"or its part has no mesh): Abaqus stops on such a set. Its labels are "
+                        f"left out (they would name another instance's nodes or elements), so "
+                        f"ccx stops where a card names the set.",
+                        once=True)
     return out
 
 
@@ -29575,7 +29728,7 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
         maps[inst["name"]] = offs
         report.instances.append(entry)
 
-    out.extend(_emit_assembly_blocks(assembly_blocks, maps, namer))
+    out.extend(_emit_assembly_blocks(assembly_blocks, maps, namer, report))
     out.extend(post)
     _resolve_qualified_refs(out, maps, namer)
     return out
