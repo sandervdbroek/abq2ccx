@@ -6469,6 +6469,8 @@ def test_buckle_factors_nearest_one():
     _, _, rep = convert_str(BUCKLE_CUBE + _deck_step("Buckle\n2", "*Cload\n7, 3, -1.\n") +
                             _deck_step("Buckle\n3", "*Cload\n7, 3, -2.\n"))
     assert rep.text().count("ccx 2.23 returns the buckling factors nearest 1, not the lowest") == 1
+    # and that factors far above 1 drift (probed: 1 % off near 500 on a thin plate, 1e9 on a beam)
+    assert "lose accuracy in proportion to the factor, sooner on slender models" in rep.text()
     # the --run digest warns where they may not be the lowest: one below 1, or all near 1
     warn = A.buckle_factor_warning
     # (a free rigid-body mode shows as factors near 1 too: probed 0.936 to 1.075 and, at a
@@ -6484,6 +6486,9 @@ def test_buckle_factors_nearest_one():
     # tension (negative) factor
     for ok in ([99.89, 99.89, 884.5], [1.199, 10.61], [1.02], [], [-2.0, 4.5]):
         assert warn(ok) is None
+    # nor on large factors: where they drift 1 % depends on the model's slenderness (marcello_gori's
+    # B31 column: 2.16e4 ... 3.34e6, within 1e-6 of a load at half its buckling load)
+    assert warn([21554.8, 85739.3, 191520.2, 3339386.0]) is None
     entry = {"step": 1, "procedure": "BUCKLE", "buckling_factors": [0.98, 1.01], "warning": warn([0.98, 1.01])}
     assert A.format_results_digest([entry]) == [
         "  step 1 *BUCKLE: 2 buckling factors 0.98, 1.01",

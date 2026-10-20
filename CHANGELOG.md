@@ -6,6 +6,12 @@ physics.
 
 ## Unreleased
 
+* **Large `*BUCKLE` factors** — under a unit load the factor is the buckling load itself, and
+  ccx 2.23, which shift-inverts about 1, returns it the less accurately the larger it is and the
+  more slender the model (probed, 1 % off: near 500 on a plate 1000 times as wide as thick, 1e7
+  at 100 times, 1e9 on a beam). The `*BUCKLE` note now says so; a load just below the lowest
+  buckling load keeps the factors exact. No digest warning: where the error reaches 1 % depends
+  on the model too much for one threshold.
 * **Upgraded beams between kinematically coupled nodes** — the midside node the converter adds
   to a B31 under `SECTION=CIRC`, `PIPE` or `BOX` stayed out of a kinematic coupling (or a
   node surface or set) holding both its end nodes, so the beam sagged between them where

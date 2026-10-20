@@ -13038,7 +13038,10 @@ class Converter:
                          "lowest (it shift-inverts about 1): the lowest only while the step's "
                          "load is below the lowest buckling load (probed: a column under twice "
                          "its buckling load gave 4.42, 11.9, ..., not 0.5). Factors far above 1 "
-                         "lose accuracy (1e8: 1.6 %).", once=True)
+                         "lose accuracy in proportion to the factor, sooner on slender models "
+                         "(probed, 1 % off: near 500 on a plate 1000 times as wide as thick, 1e7 "
+                         "at 100 times, 1e9 on a beam); a load just below the lowest buckling "
+                         "load keeps them exact.", once=True)
         return [emit_keyword("BUCKLE", keep)] + data
 
     def handle_heat_transfer(self, b: Block) -> List[str]:
@@ -25925,7 +25928,9 @@ def buckle_factor_warning(factors: Sequence[float]) -> Optional[str]:
     which nothing here can tell).  A free rigid-body mode makes K - KG singular at any shift,
     so it shows as factors near 1 too (probed: the column free to turn about a vertical axis,
     at 1e-4 of its buckling load: 0.997 to 1.003).  Warned: a positive factor below 1, or every
-    factor within 5 % of 1 (the cluster about the shift)."""
+    factor within 5 % of 1 (the cluster about the shift).  Not large factors: their error grows
+    with the factor at a rate the model's slenderness sets (1 % off near 500 on a plate 1000
+    times as wide as thick, near 5e10 on one 10 times), so no threshold fits."""
     low = min((x for x in factors if x > 0), default=None)
     if len(factors) > 1 and all(abs(x - 1) <= 0.05 for x in factors):
         why = "every factor lies within 5 % of 1"
