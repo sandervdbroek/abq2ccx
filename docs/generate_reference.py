@@ -364,8 +364,9 @@ TRANSLATED = {
         "reference point → its `ROT NODE`'s DOFs 1-3 (ccx ignores DOFs 4-6 of the REF NODE); an "
         "equation with a term on DOFs 4-6 of any other node with a `*TRANSFORM` is commented out "
         "(ccx 2.23 misreads such terms). Each equation of a card is resolved on its own.",
-    "*KINEMATIC COUPLING": "node-surface `*COUPLING` + `*KINEMATIC` per DOF range (the reference "
-        "node's DOFs 4-6 then take BCs and moments natively); rotation lines on shell/beam nodes "
+    "*KINEMATIC COUPLING": "node-surface `*COUPLING` + `*KINEMATIC` per set of coupled DOFs, a "
+        "member's lines joined (ccx 2.23 exits on two couplings of one node; the reference node's "
+        "DOFs 4-6 then take BCs and moments natively); rotation lines on shell/beam nodes "
         "become `*EQUATION` ties (see `*COUPLING / *KINEMATIC`), on other nodes they are dropped "
         "(reduced physics).",
     "*COUPLING / *KINEMATIC": "`REF NODE` set → node number; empty `*KINEMATIC` (Abaqus: all "
@@ -380,9 +381,10 @@ TRANSLATED = {
         "`*TRANSFORM` and a rotation the deck uses (rotational BCs other than all three held at "
         "zero, moments, `*EQUATION` terms, connectors) becomes a `*RIGID BODY` whose `ROT NODE` "
         "has the node's local axes (ccx's coupling would read them about the global ones). An "
-        "element surface on membranes or shells → a node surface of their nodes, which Abaqus "
-        "couples (ccx would couple the expanded faces: 1.2 % off on `M3D4`, a crash on `M3D3` "
-        "and on knotted shells); a `*DISTRIBUTING` one becomes equations on the membrane nodes "
+        "element surface on membranes, shells or plane / axisymmetric elements → a node surface of "
+        "their nodes (a plane element's face: its edge's), which Abaqus couples (ccx would couple "
+        "the expanded faces: 1.2 % off on `M3D4`, a crash on `M3D3` and on knotted shells, other "
+        "nodes on plane elements: -56 % on `CPE4`); a `*DISTRIBUTING` one becomes equations on the membrane nodes "
         "(ccx's card spreads it over faces their hinge holds: about 2 % off, nothing on `M3D3`).",
     "*COUPLING / *DISTRIBUTING": "Abaqus' distributing constraint as `*EQUATION`s (ccx's card only "
         "spreads the reference node's loads: a BC there moved nothing, the node printed U = 0): the node "

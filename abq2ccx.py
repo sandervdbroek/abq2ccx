@@ -3493,7 +3493,8 @@ RB_MOVE_INEXACT = {
 
 # Abaqus face -> 1-based local node positions (corners, then midsides) of the continuum
 # families; a lower-order element simply has fewer nodes.  Shells use every node for a face
-# and the corner/midside pair for an edge (see Converter._face_nodes).
+# and the corner/midside pair for an edge (see Converter._facet); plane and axisymmetric
+# elements' faces are edges (PLANE_EDGE_NODES).
 FACE_NODES = {
     "HEX": {1: (1, 2, 3, 4, 9, 10, 11, 12), 2: (5, 8, 7, 6, 16, 15, 14, 13),
             3: (1, 5, 6, 2, 17, 13, 18, 9), 4: (2, 6, 7, 3, 18, 14, 19, 10),
@@ -3503,6 +3504,18 @@ FACE_NODES = {
     "WEDGE": {1: (1, 2, 3, 7, 8, 9), 2: (4, 6, 5, 12, 11, 10), 3: (1, 4, 5, 2, 13, 10, 14, 7),
               4: (2, 5, 6, 3, 14, 11, 15, 8), 5: (3, 6, 4, 1, 15, 12, 13, 9)},
 }
+# Abaqus face Sk of a plane / axisymmetric element, an edge -> 1-based local node positions:
+# corners k and k % nc + 1, then midside nc + k, by corner count nc.
+PLANE_EDGE_NODES = {3: {1: (1, 2, 4), 2: (2, 3, 5), 3: (3, 1, 6)},
+                    4: {1: (1, 2, 5), 2: (2, 3, 6), 3: (3, 4, 7), 4: (4, 1, 8)}}
+
+
+def plane_edge(conn: Sequence[int], k: int) -> List[int]:
+    """The nodes of edge ``k`` (face Sk) of a plane / axisymmetric element of nodes ``conn``
+    (3, 4, 6 or 8), corners first (PLANE_EDGE_NODES); [] where it has no such edge."""
+    n = len(conn)
+    edges = PLANE_EDGE_NODES[3 if n in (3, 6) else 4] if n in (3, 4, 6, 8) else {}
+    return [conn[p - 1] for p in edges.get(k, ()) if p <= n]
 
 # Abaqus planar (2-D) beams and trusses.  ccx has no planar beam: B21 "is internally replaced
 # by a B31 element and is treated as such", T2D2 likewise by a T3D2 (manual 6.2.31, 6.2.34),
@@ -11169,7 +11182,7 @@ class Converter:
                     continue
                 planar = typ.upper().startswith(PLANAR_SOLID_PREFIXES)
                 if planar:
-                    ids = self._face_node_ids(e, face)
+                    ids = self._face_nodes(e, face, types)
                     ok = len(ids) in (2, 3)
                 else:
                     ids, corners = self._facet(e, face, types)
@@ -14005,14 +14018,12 @@ class Converter:
                 else:
                     out.append((list(conn), "area", 1.0, False, False, None, sense))
             elif cc.startswith(PLANE_ELEM_PREFIXES):
-                nc = 3 if n in (3, 6) else 4
-                if not m or int(m.group(1)) > nc or n not in (nc, 2 * nc):
+                edge = plane_edge(conn, int(m.group(1))) if m else []
+                if not edge:
                     return [], f"face '{face}' is not an edge of the {typ} element {e}"
-                k = int(m.group(1))
-                pos = [k, k % nc + 1] + ([nc + k] if n == 2 * nc else [])
                 axi = cc.startswith("CAX")
-                out.append(([conn[p - 1] for p in pos], "line",
-                             1.0 if axi else self._section_thick.get(e, 1.0), axi, True, None, None))
+                out.append((edge, "line", 1.0 if axi else self._section_thick.get(e, 1.0), axi, True,
+                            None, None))
             elif cc.startswith("C3D"):
                 fam = {4: "TET", 10: "TET", 6: "WEDGE", 15: "WEDGE", 8: "HEX", 20: "HEX"}.get(n)
                 if not fam or not m or int(m.group(1)) not in FACE_NODES[fam]:
@@ -18463,9 +18474,12 @@ class Converter:
     def handle_coupling(self, b: Block) -> List[str]:
         """Abaqus standalone ``*KINEMATIC COUPLING, REF NODE=r`` (data: node/nset, first DOF,
         last DOF — one line per member).  The lines become node surfaces with ccx
-        ``*COUPLING`` + ``*KINEMATIC`` per DOF range (ccx couples translations; the reference
-        node's rotations still drive them, and unlike *RIGID BODY its DOFs 4-6 take BCs and
-        moments); rotation ranges on knotted shell/beam members become *EQUATION ties to
+        ``*COUPLING`` + ``*KINEMATIC``, one per set of coupled DOFs with a *KINEMATIC line per
+        run of them (ccx couples translations; the reference node's rotations still drive
+        them, and unlike *RIGID BODY its DOFs 4-6 take BCs and moments): ccx 2.23 exits 255 on
+        two couplings of one node, and two of other nodes on one reference node do not turn as
+        one body (probed), so a member's lines are joined (per node where sets with other DOFs
+        share one); rotation ranges on knotted shell/beam members become *EQUATION ties to
         those DOFs.  (The newer *COUPLING/*KINEMATIC/*DISTRIBUTING are native ccx keywords.)
         A card with a DOF field that does not read is commented out (_coupling_groups)."""
         ref = self._ref_node(b)
@@ -18480,9 +18494,22 @@ class Converter:
         plan = self._coupling_plan.get(id(b)) or {}
         if plan.get("kind") == "kdyn":
             return self._kin_dynamic_cards(b, plan, plan["groups"])
-        groups: "OrderedDict[Tuple[int, int], List[str]]" = OrderedDict()
+        own: "OrderedDict[str, set]" = OrderedDict()            # member -> the DOFs it couples
+        across: set = set()                                     # ... on a line over DOFs 3 and 4
         for tok, dofs in recs:
-            groups.setdefault((min(dofs), max(dofs)), []).append(tok)
+            own.setdefault(tok, set()).update(dofs)
+            across.update([tok] if {3, 4} <= dofs else [])
+        held: Dict[int, set] = {}
+        if any(held.setdefault(n, ds) != ds for tok, ds in own.items() for n in self._resolve_nodes(tok)):
+            per_node: "OrderedDict[str, set]" = OrderedDict()
+            for tok, ds in own.items():
+                for n in self._resolve_nodes(tok):
+                    per_node.setdefault(str(n), set()).update(ds)
+                    across.update([str(n)] if tok in across else [])
+            own = per_node
+        groups: "OrderedDict[Tuple[Tuple[int, int], ...], List[str]]" = OrderedDict()
+        for tok, ds in own.items():
+            groups.setdefault(tuple(sorted(ds)), []).append(tok)
         if plan.get("kind") == "unsupported":
             self._warn_rigid_unsupported()
         self._synth_counter += 1
@@ -18494,37 +18521,44 @@ class Converter:
         top = 2 if id(b) in self._planar_kin else 3     # 2-D members: no DOF 3 (see handle_kinematic)
         # ccx carries the coupling's rotation on DOFs 4-6 of the reference node once a
         # translational group couples it, so knotted shell/beam members can tie theirs
-        coupled = any(lo <= 3 for lo, _ in groups)
+        coupled = any(d <= 3 for ds in groups for d in ds)
         along: List[Tuple[List[int], Sequence[int]]] = []     # (with an ORIENTATION: tied at the end)
-        for gi, ((lo, hi), ms) in enumerate(groups.items(), 1):
+        for gi, (ds, ms) in enumerate(groups.items(), 1):
             nodes = [n for m in ms for n in self._resolve_nodes(m)]
-            if hi > 3 and coupled:
-                if frame is None:
-                    ties += self._rotation_ties(nodes, ref, 0, range(max(lo, 4), hi + 1))
-                else:
-                    along.append((nodes, range(max(lo, 4), hi + 1)))
-            if hi > 3 and any(n in self._rot_nodes and n not in self._knots for n in nodes):
-                self.report.warn("*KINEMATIC COUPLING DOFs above 3 clamped: ccx *KINEMATIC couples "
-                                 "translations only, so the rotations of the coupled shell/beam "
-                                 "nodes are free.", once=True)
-            if lo > 3:
-                if not any(n in self._knots for n in nodes) or not coupled:
-                    self.report.warn("*KINEMATIC COUPLING line couples only rotational DOFs "
-                                     "(4..6); ccx couples translations only — line dropped, "
-                                     "rotations are NOT coupled.", once=True)
-                    self._reduces("*KINEMATIC COUPLING rotation-only line dropped")
-                continue
-            if top == 2 and hi > 2:
-                self._note_planar_kinematic()
-                if lo > 2:
+            lines: List[str] = []
+            # the runs of its DOFs, the translations' and rotations' apart as the lines give them
+            whole = any(m in across for m in ms)
+            for lo, hi in [r for lo, hi in dof_runs(ds) for r in
+                           ([(lo, hi)] if whole or not lo <= 3 < hi else [(lo, 3), (4, hi)])]:
+                if hi > 3 and coupled:
+                    if frame is None:
+                        ties += self._rotation_ties(nodes, ref, 0, range(max(lo, 4), hi + 1))
+                    else:
+                        along.append((nodes, range(max(lo, 4), hi + 1)))
+                if hi > 3 and any(n in self._rot_nodes and n not in self._knots for n in nodes):
+                    self.report.warn("*KINEMATIC COUPLING DOFs above 3 clamped: ccx *KINEMATIC couples "
+                                     "translations only, so the rotations of the coupled shell/beam "
+                                     "nodes are free.", once=True)
+                if lo > 3:
+                    if not any(n in self._knots for n in nodes) or not coupled:
+                        self.report.warn("*KINEMATIC COUPLING line couples only rotational DOFs "
+                                         "(4..6); ccx couples translations only — line dropped, "
+                                         "rotations are NOT coupled.", once=True)
+                        self._reduces("*KINEMATIC COUPLING rotation-only line dropped")
                     continue
-            out += [f"*SURFACE, TYPE=NODE, NAME={tag}_{gi}"] + list(ms)
-            out += [f"*COUPLING, CONSTRAINT NAME={tag}_{gi}, REF NODE={ref}, SURFACE={tag}_{gi}"
-                    + (f", ORIENTATION={ori}" if ori else ""), "*KINEMATIC", f"{lo}, {min(hi, top)}"]
+                if top == 2 and hi > 2:
+                    self._note_planar_kinematic()
+                    if lo > 2:
+                        continue
+                lines.append(f"{lo}, {min(hi, top)}")
+            if lines:
+                out += [f"*SURFACE, TYPE=NODE, NAME={tag}_{gi}"] + list(ms)
+                out += [f"*COUPLING, CONSTRAINT NAME={tag}_{gi}, REF NODE={ref}, SURFACE={tag}_{gi}"
+                        + (f", ORIENTATION={ori}" if ori else ""), "*KINEMATIC"] + lines
         ties += self._rotation_ties_per_member(along, ref, 0, frame)
         if out:
-            self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per DOF "
-                             "range.", once=True)
+            self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per set of "
+                             "coupled DOFs (ccx 2.23 stops on two couplings of one node).", once=True)
         return (out + ties) or self._commented(b, "*KINEMATIC COUPLING couples no translational "
                                                   "DOF; dropped.")
 
@@ -18801,17 +18835,21 @@ class Converter:
         reproduces the skin sharing the block's nodes exactly; SPOS faces were 0.1-6 % off.
         With ``shells`` (a kinematic coupling, which acts on the surface's nodes, also those of
         other elements' faces) conventional shells count too: ccx 2.23 crashes (SIGBUS)
-        coupling the faces of shells the converter knotted for it (_plan_rigid_couplings).  A
-        tie's surface on membranes and other elements stays as it is, warned.  Nodes of
-        ``exclude`` stay out (a tie's master-face nodes, a coupling's reference node: ccx
-        would tie them to themselves and loop in its cascade, "zero coefficient on the
-        dependent side"); with none left the name is "" (nothing to tie)."""
+        coupling the faces of shells the converter knotted for it (_plan_rigid_couplings); and
+        so do plane and axisymmetric elements, whose faces are edges (_facet): ccx 2.23 couples
+        other nodes of the solids it expands them to, for every face label (probed on CPE4 /
+        CAX4: -56 % / -22 %; the edges' nodes are exact).  A tie's surface on membranes and
+        other elements stays as it is, warned.  Nodes of ``exclude`` stay out (a tie's
+        master-face nodes, a coupling's reference node: ccx would tie them to themselves and
+        loop in its cascade, "zero coefficient on the dependent side"); with none left the
+        name is "" (nothing to tie)."""
         sd = self.surfaces.get(surf.upper())
         if sd is None or sd[0].startswith("NODE"):
             return None, []
         eids = self._surface_elements(surf)
         mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
-                or (shells and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS)]
+                or (shells and (ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
+                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))]
         if not mine:
             return None, []
         if len(mine) < len(eids) and not shells:
@@ -18830,7 +18868,12 @@ class Converter:
         self._reserve_names()
         name = self._fresh_name(f"{surf}_NODES")
         self._mem_surfaces[key] = name
-        if any(not self.geom.elements[e][0].upper().startswith("M3D") and e not in self._qmem for e in mine):
+        if any(self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES) for e in mine):
+            self.report.note(f"{what} surface {surf} on plane / axisymmetric elements -> node "
+                             f"surface {name} of their edges' nodes, which Abaqus couples (ccx 2.23 "
+                             f"couples other nodes of the solids it expands them to, for every face "
+                             f"label; probed).", once=True)
+        elif any(not self.geom.elements[e][0].upper().startswith("M3D") and e not in self._qmem for e in mine):
             self.report.note(f"{what} surface {surf} on shells -> node surface {name} of their "
                              f"nodes, which Abaqus couples (ccx 2.23 crashes coupling the faces of "
                              f"the shells it knots; probed).", once=True)
@@ -19545,6 +19588,13 @@ class Converter:
             return self._distributing_lines(b, dplan)
         if dplan is not None:
             self._warn_distributing_kept(dplan)
+        if dplan is not None and any(self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)
+                                     for e in self._surface_elements((b.param("SURFACE") or "").strip())):
+            self.report.warn("*COUPLING, *DISTRIBUTING kept as ccx's card on plane / axisymmetric element "
+                             "faces: ccx 2.23 spreads the loads over other nodes of the solids it expands "
+                             "those elements to, for every face label (probed on CPE4 and CAX4 edges; one "
+                             "label made ccx hang).", once=True)
+            self._reduces("*COUPLING, *DISTRIBUTING card on plane / axisymmetric element faces")
         params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
         ref = (b.param("REF NODE") or "").strip()
         # (not _one_node: Abaqus takes several reference nodes here, one coupling each —
@@ -22180,7 +22230,6 @@ class Converter:
     _CONTINUUM_FACES = {**{n: FACE_NODES["TET"] for n in (4, 10)},
                         **{n: FACE_NODES["WEDGE"] for n in (6, 15)},
                         **{n: FACE_NODES["HEX"] for n in (8, 20)}}
-    _PLANE_FACES = {3: {1: (1, 2), 2: (2, 3), 3: (3, 1)}, 4: {1: (1, 2), 2: (2, 3), 3: (3, 4), 4: (4, 1)}}
 
     def _continuum_faces(self, e: int) -> Optional[Dict[int, frozenset]]:
         """Face label -> corner nodes of continuum element ``e`` (3-D solids, plane and
@@ -22194,8 +22243,8 @@ class Converter:
             return {k: frozenset(conn[p - 1] for p in pos if p <= nc)
                     for k, pos in self._CONTINUUM_FACES[n].items()}
         if cc.startswith(PLANE_ELEM_PREFIXES) and n in (3, 4, 6, 8):
-            return {k: frozenset(conn[p - 1] for p in pos)
-                    for k, pos in self._PLANE_FACES[4 if n in (4, 8) else 3].items()}
+            return {k: frozenset(conn[p - 1] for p in pos[:2])
+                    for k, pos in PLANE_EDGE_NODES[4 if n in (4, 8) else 3].items()}
         return None
 
     def _free_face_surfaces(self, blocks: List[Block]) -> List[Block]:
@@ -23667,7 +23716,7 @@ class Converter:
                 if node_based:
                     slaves = dedup([n for tok, _ in sfaces for n in self._resolve_nodes(tok)])
                 else:
-                    slaves = dedup([n for e, f in slave_faces for n in self._face_node_ids(e, f)])
+                    slaves = dedup([n for e, f in slave_faces for n in self._face_nodes(e, f, {})])
                 slaves = [n for n in slaves if n not in taken and n in self.geom.nodes]
                 if tol <= 1e-10:
                     if pair:
@@ -23838,24 +23887,10 @@ class Converter:
             vcross(vsub(p[2], p[0]), vsub(p[3], p[1]))
         return vunit(nrm) if vnorm(nrm) > 0 else (0.0, 0.0, 0.0)
 
-    def _face_node_ids(self, e: int, face: Optional[str]) -> List[int]:
-        """The nodes of face ``face`` of element ``e``: an edge Sk of a plane / axisymmetric
-        element (with its midside node), else as _face_nodes."""
-        typ, conn = self.geom.elements[e]
-        m = re.fullmatch(r"S([1-4])", (face or "").upper())
-        if m and typ.upper().startswith(PLANAR_SOLID_PREFIXES) and len(conn) in (3, 4, 6, 8):
-            nc = 3 if len(conn) in (3, 6) else 4
-            k = int(m.group(1))
-            if k > nc:
-                return []
-            ids = [conn[k - 1], conn[k % nc]]
-            return ids + ([conn[nc + k - 1]] if len(conn) == 2 * nc else [])
-        return self._face_nodes(e, face, {})
-
     def _face_points(self, e: int, face: Optional[str]) -> List[Vec]:
         """The corner points of face ``face`` of element ``e`` (an edge: its two end nodes)."""
         typ = self.geom.elements[e][0]
-        ids = self._face_node_ids(e, face)
+        ids = self._face_nodes(e, face, {})
         m = re.fullmatch(r"S([1-4])", (face or "").upper())
         if m and typ.upper().startswith(PLANAR_SOLID_PREFIXES):
             ids = ids[:2]
@@ -31679,8 +31714,9 @@ class Converter:
 
     def _facet(self, eid: int, face: Optional[str], types: Dict[str, str]) -> Tuple[List[int], int]:
         """The nodes of facet ``face`` of element ``eid``, corners first, and how many corners
-        it has: 2 on a shell edge, 3 or 4 on a face, 0 where the face is not known (the whole
-        element's nodes)."""
+        it has: 2 on a shell edge or a plane / axisymmetric element's face (an edge; none
+        where the element has no such edge), 3 or 4 on a face, 0 where the face is not known
+        (the whole element's nodes)."""
         info = self.geom.elements.get(eid)
         if not info:
             return [], 0
@@ -31697,6 +31733,9 @@ class Converter:
             k = int(m.group(1)) - (2 if f.startswith("S") else 0)
             pos = [k, k % nc + 1] + ([nc + k] if n >= 2 * nc else [])
             return [conn[p - 1] for p in pos if p <= n], 2
+        if typ.upper().startswith(PLANAR_SOLID_PREFIXES) and n in (3, 4, 6, 8) and re.fullmatch(r"S[1-4]", f):
+            edge = plane_edge(conn, int(f[1]))
+            return edge, 2 if edge else 0
         fam = {4: "TET", 10: "TET", 6: "WEDGE", 15: "WEDGE", 8: "HEX", 20: "HEX"}.get(n)
         m = re.fullmatch(r"S(\d)", f)
         if cc.startswith("C3D") and fam and m and int(m.group(1)) in FACE_NODES[fam]:

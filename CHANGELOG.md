@@ -69,6 +69,15 @@ physics.
   `*SPECIFIC HEAT 0` in place of its own (a copy where it is shared). They conducted, and the
   heated cube's far face was at 20.9 instead of 42.6. `*HYPERFOAM, N=1, DEPENDENCIES=0` gets the
   exact N=2 form.
+* **Couplings on plane and axisymmetric element edges** — a kinematic coupling on an element
+  surface of CPS / CPE / CAX elements coupled every node of the elements, not the edge's
+  (interior nodes rigid: 52-56 % off), with false "ccx stops" warnings and, under
+  `--approximate`, a legitimate BC dropped. ccx 2.23's own coupling on such faces couples
+  other nodes for every face label (CPE4 -56 %, CAX4 -22 %). The edge's nodes are now coupled,
+  through a node surface where ccx's card stays: exact. ccx's `*DISTRIBUTING` card on such
+  faces (kept on axisymmetric ones) is warned as reduced physics. A legacy `*KINEMATIC
+  COUPLING` with one node set on two DOF ranges (`RIGHT, 1, 2` / `RIGHT, 3`) became two
+  couplings of the same nodes, and ccx exited 255: one coupling per set of coupled DOFs now.
 * **Static perturbation steps: base + perturbation** — two lines of one load in such a step
   each got the base value added, so ccx counted it twice. It now goes on the first line only.
   Base-state loads, BCs and temperatures on a `TIME=TOTAL TIME` amplitude kept rising through

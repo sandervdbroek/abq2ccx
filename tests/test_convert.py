@@ -4843,7 +4843,7 @@ def test_rotated_instance_turns_part_dofs():
     # 90 degrees about x: part y is global z, part z global -y
     assert "*SPRING, ELSET=I_SPR\n3\n1000.\n" in body
     assert "*EQUATION\n3\n5, 3, 1., 11, 1, 1., 11, 3, -1.\n2\n2, 1, 1., 4, 2, 1.\n" in body
-    assert "*KINEMATIC\n1, 1\n" in body and "*KINEMATIC\n3, 3\n" in body
+    assert "*KINEMATIC\n1, 1\n3, 3\n" in body and body.count("*KINEMATIC") == 1   # (one coupling)
     # the SPRING2's DOFs 1 (along x) and 3 (along -y) turn with opposite senses: in the axes
     assert "*ORIENTATION, NAME=I_ABQ2CCX_AXES, SYSTEM=RECTANGULAR\n1., 0., 0., 0., 0., 1.\n" in body
     assert "*SPRING, ELSET=I_SP2, ORIENTATION=I_ABQ2CCX_AXES\n1, 3\n" in body
@@ -11952,6 +11952,144 @@ def test_distributing_weights_on_plane_edges_take_the_section_thickness():
     row = [r for r in _equation_terms(body) if r[0][:2] == (100, 1)][0]
     got = {n: c for n, d, c in row[1:] if d == 1}
     assert all(abs(got[n] + w / 8.0) < 1e-12 for n, w in zip(range(11, 16), (0.5, 1.0, 2.0, 3.0, 1.5)))
+
+
+def test_no_planner_reads_a_fact_only_a_later_planner_writes():
+    # Converter._convert runs its planners in order: one that reads, through any method it calls,
+    # an attribute only a later planner writes sees __init__'s default (code review 3: the
+    # distributing weights read _section_thick before _plan_load_facts set it, thickness 1 on
+    # every edge).  A static check of the source: self attributes read, and written (assigned,
+    # item-stored, mutated), by each planner and the methods it calls
+    import ast
+    with open(A.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Converter")
+    methods = {f.name: f for f in cls.body if isinstance(f, ast.FunctionDef)}
+    mutators = {"add", "update", "append", "extend", "setdefault", "pop", "popitem", "discard",
+                "clear", "remove", "insert"}
+
+    def attr(node):
+        while isinstance(node, (ast.Attribute, ast.Subscript)):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+                return node.attr
+            node = node.value
+        return None
+
+    def own(f):
+        reads, writes, calls = set(), set(), set()
+        for n in ast.walk(f):
+            targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else \
+                [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+            writes.update(attr(e) for t in targets for e in (t.elts if isinstance(t, ast.Tuple) else [t]))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                if isinstance(n.func.value, ast.Name) and n.func.value.id == "self":
+                    calls.add(n.func.attr)
+                elif n.func.attr in mutators:
+                    writes.add(attr(n.func.value))
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self" \
+                    and isinstance(n.ctx, ast.Load):
+                reads.add(n.attr)
+        return reads, writes - {None}, calls
+
+    direct = {name: own(f) for name, f in methods.items()}
+
+    def reach(name):
+        seen, todo, reads, writes = {name}, [name], set(), set()
+        while todo:
+            r, w, c = direct[todo.pop()]
+            reads |= r
+            writes |= w
+            todo += [m for m in c if m in direct and m not in seen]
+            seen.update(c)
+        return reads, writes
+    calls = sorted((n.lineno, -n.col_offset, n.func.attr) for n in ast.walk(methods["_convert"])
+                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and
+                   isinstance(n.func.value, ast.Name) and n.func.value.id == "self" and n.func.attr in methods)
+    order = list(dict.fromkeys(m for _, _, m in calls))        # (an inner call runs first)
+    seen = [reach(m) for m in order]
+    writers = {}
+    for i, (_, w) in enumerate(seen):
+        for a in w:
+            writers.setdefault(a, []).append(i)
+    found = {(order[i], a) for i, (r, w) in enumerate(seen) for a in r - w
+             if len(writers.get(a, ())) == 1 and writers[a][0] > i}
+    known = {("_sp_amplitudes", "_freq_contact"),         # (the step periods it reads do not change)
+             ("_plan_ply_split", "_dists"),               # (only a distribution named INF / NAN)
+             ("_plan_transformed_rotations", "_untr")}    # (_plan_transformed_corners re-pieces them)
+    # (_rotation_users calls _coupling_groups without live=True, the only branch reading them)
+    known |= {("_plan_pretension_cuts", a) for a in ("_kin_dyn", "_kin_eq_refs", "_kin_twist_eq",
+                                                      "_linear_rigid", "_plane_only")}
+    assert len(order) > 100 and not found - known, sorted(found - known)
+
+
+def _plane_edge_deck(typ, nodes, elements, surface, extra="", step="*Static\n"):
+    return (f"*Node\n{nodes}100, 1., 3.\n*Element, type={typ}, elset=E\n{elements}"
+            f"*Surface, name=TOP\n{surface}\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n"
+            f"*Solid Section, elset=E, material=M\n1.\n*Coupling, constraint name=C, ref node=100, "
+            f"surface=TOP\n*Kinematic\n{extra}*Step\n{step}*Boundary\n1, 1, 2\n2, 1, 2\n3, 1, 2\n"
+            f"*Cload\n100, 1, 1.\n*End Step\n")
+
+
+_GRID_NODES = "".join(f"{1 + i + 3 * j}, {float(i)}, {float(j)}\n" for j in range(3) for i in range(3))
+_GRID_CPE4 = "1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n3, 4, 5, 8, 7\n4, 5, 6, 9, 8\n"
+
+
+def test_kinematic_coupling_on_plane_element_edges_takes_the_edge_nodes():
+    # an element-based surface on plane / axisymmetric elements is made of their edges: a
+    # kinematic coupling on it couples the edges' nodes.  Its faces were taken as the whole
+    # elements (code review 3: interior nodes made rigid, -56 % / -52 %), and ccx 2.23's own
+    # coupling on such faces couples other nodes for every face label (CPE4 -56 %, CAX4 -22 %):
+    # a node surface of the edges' nodes is exact (validate_with_ccx.py plane_edge_*)
+    body, conv, rep = convert_str(_plane_edge_deck("CPE4", _GRID_NODES, _GRID_CPE4, "3, S3\n4, S3"))
+    assert conv._surface_member_nodes("TOP") == [8, 7, 9]
+    i = body.index("*SURFACE, NAME=TOP_NODES, TYPE=NODE\n")
+    assert body[i:].split("\n")[1:4] == ["8", "7", "9"] and "SURFACE=TOP_NODES" in body
+    assert "plane / axisymmetric elements -> node surface TOP_NODES" in rep.text()
+    # the planned form of a *DYNAMIC deck couples the same nodes
+    _, conv, _ = convert_str(_plane_edge_deck("CPE4", _GRID_NODES, _GRID_CPE4, "3, S3\n4, S3",
+                                              step="*Dynamic\n0.01, 0.05\n"))
+    assert [p["members"] for p in conv._coupling_plan.values()] == [[8, 7, 9]]
+    # midside nodes, axisymmetric edges, and a triangle's face it does not have
+    nodes = "1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n5, .5, 0.\n6, 1., .5\n7, .5, 1.\n8, 0., .5\n"
+    _, conv, _ = convert_str(_plane_edge_deck("CPS8", nodes, "1, 1, 2, 3, 4, 5, 6, 7, 8\n", "1, S3"))
+    assert conv._surface_member_nodes("TOP") == [3, 4, 7]
+    _, conv, _ = convert_str(_plane_edge_deck("CAX4", nodes.replace("0., ", "1., "), "1, 1, 2, 3, 4\n", "1, S2"))
+    assert conv._surface_member_nodes("TOP") == [2, 3]
+    assert conv._face_nodes(1, "S2", {}) == [2, 3] and conv._facet(1, "S2", {}) == ([2, 3], 2)
+    _, conv, _ = convert_str(_plane_edge_deck("CPS3", nodes, "1, 1, 2, 3\n", "1, S3"))
+    assert conv._facet(1, "S3", {}) == ([3, 1], 2) and conv._facet(1, "S4", {}) == ([], 0)
+
+
+def test_bc_off_a_plane_edge_coupling_is_no_overconstraint():
+    # a BC on a node of the coupled elements off the coupled edge: no false 'Possible
+    # overconstraint ... ccx stops' (ccx runs), and --approximate kept it
+    deck = _plane_edge_deck("CPE4", _GRID_NODES, _GRID_CPE4, "3, S3\n4, S3").replace(
+        "3, 1, 2\n*Cload", "3, 1, 2\n4, 1, 1\n*Cload")
+    for approx in (False, True):
+        body, conv, rep = convert_str(deck, approximate=approx)
+        assert "Possible overconstraint" not in rep.text() and "\n4, 1, 1\n" in body
+        assert not other_reduced(conv)
+
+
+def test_legacy_kinematic_coupling_lines_of_one_set_are_one_coupling():
+    # *KINEMATIC COUPLING lines of one node set on two DOF ranges became two *COUPLING cards on
+    # the same nodes, and ccx 2.23 exits 255; two couplings of other nodes on one reference
+    # node do not turn as one body (probed).  One coupling per set of coupled DOFs: exact
+    nodes = "".join(f"{n}, {x}, {y}, {z}\n" for n, (x, y, z) in enumerate(
+        [(i, j, k) for k in (0., 1.) for j in (0., 1.) for i in (0., 1., 2.)], 1))
+    head = ("*Node\n" + nodes + "100, 2.5, .5, .5\n*Element, type=C3D8, elset=E\n1, 1, 2, 5, 4, 7, 8, 11, 10\n"
+            "2, 2, 3, 6, 5, 8, 9, 12, 11\n*Nset, nset=RIGHT\n3, 6, 9, 12\n*Nset, nset=R3\n3, 6, 9\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=E, material=M\n")
+    tail = "*Boundary\n1, 1, 3\n4, 1, 3\n7, 1, 3\n10, 1, 3\n*Step\n*Static\n*Cload\n100, 2, 1.\n*End Step\n"
+    for lines, members in (("RIGHT, 1, 2\nRIGHT, 3\n", ["RIGHT"]), ("RIGHT, 1, 1\nRIGHT, 2, 3\n", ["RIGHT"]),
+                           ("R3, 1, 3\n12, 1, 2\n12, 3\n", ["R3", "12"]),
+                           ("RIGHT, 1, 2\n12, 3\n", ["3", "6", "9"])):
+        body, _, _ = convert_str(head + "*Kinematic Coupling, ref node=100\n" + lines + tail)
+        assert body.count("*COUPLING") == 1 + (lines.startswith("RIGHT, 1, 2\n1")), lines
+        i = body.index("*SURFACE, TYPE=NODE, NAME=ABQ2CCX_KC1_1\n")
+        got = body[i:].split("\n")[1:]
+        assert got[:len(members) + 2] == members + ["*COUPLING, CONSTRAINT NAME=ABQ2CCX_KC1_1, REF NODE=100, "
+                                                    "SURFACE=ABQ2CCX_KC1_1", "*KINEMATIC"], lines
 
 
 def test_truss_below_beams_at_a_node_ends_at_a_copy():

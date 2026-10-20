@@ -755,6 +755,48 @@ def plane_two_thickness_deck(coupling, loads):
                      + [f"{nid(i, 0)}, 1, 2" for i in range(5)] + ["*STEP", "*STATIC"] + list(loads)
                      + ["*NODE PRINT, NSET=NALL", "U", "*NODE PRINT, NSET=RP", "U", "*END STEP"]) + "\n"
 
+def plane_edge_coupling_deck(kind, nodes=False, proc="static"):
+    """A kinematic coupling of one element edge of a 2-D model (E 1000, nu 0.3) to node 9.
+    ``kind`` "cpe4": a 2 x 1 CPE4 strip held at x = 0, its right edge (element 2's S2) pulled
+    along x by node 9; "plastic": the same with a *PLASTIC law (ccx runs the step nonlinear: the
+    converter's equations); "cax4": a 1 x 2 CAX4 column on z = 0, its top edge (element 2's S3)
+    pulled up.  ``nodes``: the edge as a node surface (the twin); ``proc``: "static" or
+    "dynamic"; every node's displacement printed."""
+    if kind == "cax4":
+        xy = [(1., 0.), (2., 0.), (1., 1.), (2., 1.), (1., 2.), (2., 2.)]
+        mesh = ["*ELEMENT, TYPE=CAX4, ELSET=E", "1, 1, 2, 4, 3", "2, 3, 4, 6, 5"]
+        edge, face, held, load = "5, 6", "2, S3", ["1, 1, 2", "2, 2, 2"], "9, 2, 10."
+        ref = "9, 1.5, 2.5"
+    else:
+        xy = [(0., 0.), (1., 0.), (2., 0.), (0., 1.), (1., 1.), (2., 1.)]
+        mesh = ["*ELEMENT, TYPE=CPE4, ELSET=E", "1, 1, 2, 5, 4", "2, 2, 3, 6, 5"]
+        edge, face, held, load = "3, 6", "2, S2", ["1, 1, 2", "4, 1, 2"], "9, 1, 1."
+        ref = "9, 2.5, 0.5"
+    surf = ["*NSET, NSET=EDGE", edge, "*SURFACE, NAME=EDGE, TYPE=NODE", "EDGE"] if nodes else \
+        ["*SURFACE, NAME=EDGE", face]
+    return "\n".join(["*NODE, NSET=NALL"] + [f"{n}, {x}, {y}" for n, (x, y) in enumerate(xy, 1)] + [ref] + mesh
+                     + surf + ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*DENSITY", "1e-3"]
+                     + (["*PLASTIC", "1e6, 0."] if kind == "plastic" else [])
+                     + ["*SOLID SECTION, ELSET=E, MATERIAL=M", "1.", "*COUPLING, CONSTRAINT NAME=C, REF NODE=9, "
+                        "SURFACE=EDGE", "*KINEMATIC", "1, 2", "*BOUNDARY"] + held + ["*STEP"]
+                     + (["*DYNAMIC", "0.01, 0.05"] if proc == "dynamic" else ["*STATIC"])
+                     + ["*CLOAD", load, "*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
+
+
+def legacy_coupling_deck(lines):
+    """A 2 x 1 x 1 bar of two unit C3D8 (E 1000, nu 0.3) held at x = 0, its end x = 2 (node set
+    RIGHT, R3 its nodes 3, 6, 9) coupled to node 100 by a *KINEMATIC COUPLING of member
+    ``lines``, which carries a force along y and z; every node's displacement printed."""
+    xyz = [(x, y, z) for z in (0., 1.) for y in (0., 1.) for x in (0., 1., 2.)]
+    return "\n".join(["*NODE, NSET=NALL"] + [f"{n}, {x}, {y}, {z}" for n, (x, y, z) in enumerate(xyz, 1)]
+                     + ["100, 2.5, 0.5, 0.5", "*ELEMENT, TYPE=C3D8, ELSET=E", "1, 1, 2, 5, 4, 7, 8, 11, 10",
+                        "2, 2, 3, 6, 5, 8, 9, 12, 11", "*NSET, NSET=LEFT", "1, 4, 7, 10", "*NSET, NSET=RIGHT",
+                        "3, 6, 9, 12", "*NSET, NSET=R3", "3, 6, 9", "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3",
+                        "*SOLID SECTION, ELSET=E, MATERIAL=M", "*KINEMATIC COUPLING, REF NODE=100"] + list(lines)
+                     + ["*BOUNDARY", "LEFT, 1, 3", "*STEP", "*STATIC", "*CLOAD", "100, 2, 1.", "100, 3, 0.5",
+                        "*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
+
+
 # Abaqus 2017 Verification Guide, "Distributing coupling elements", linear DCOUP3D (exdc3lx1):
 # Tables 1-3 (reference node 10's displacements and rotations, coupling node 1's displacements)
 # per step, F = 1 and M = 2 on node 10: x and about z, y and about x, z and about y
@@ -12517,6 +12559,45 @@ def main():
                   f"by 0.01 ({'R(theta) r - r' if nl else 'theta x r'}; corner 2 at "
                   f"({', '.join(f'{x:.6g}' for x in got[2])}))")
         failures += 0 if ok else 1
+
+    # a kinematic coupling on a plane / axisymmetric element's edge: Abaqus couples the edge's
+    # nodes; the converter coupled the whole element (-56 % / -52 %), and ccx's own coupling on
+    # such faces couples other nodes for every face label (CPE4 -56 %, CAX4 -22 %): vs the edge
+    # as a node surface, in ccx's card, the converter's equations and its *DYNAMIC form
+    for kind, proc in (("cpe4", "static"), ("plastic", "static"), ("cax4", "static"), ("cax4", "dynamic")):
+        tag = f"plane_edge_kinematic_{kind}_{proc}"
+        got, want = (review_run(plane_edge_coupling_deck(kind, twin, proc), tag + ("_twin" if twin else ""),
+                                dat_displacements) for twin in (False, True))
+        ok = bool(got and want) and set(got) == set(want) == set(range(1, 10)) - {7, 8}
+        if ok:
+            scale = max(abs(x) for v in want.values() for x in v)
+            err = ccx_ratio(max(abs(a - b) for n in want for a, b in zip(got[n], want[n])), scale)
+            ok = err < 1e-9 and scale > 1e-4
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a {kind.replace('plastic', 'plastic CPE4').upper()} "
+                  f"model, one element edge coupled to the loaded reference node): every node "
+                  f"{err:.1e} of max |u| ({scale:.4g}) from the edge as a node surface (before: the "
+                  f"element's nodes, or ccx's face, 22-56 % off)")
+        elif got and want:
+            print(f"FAIL  {tag}: other nodes printed ({sorted(got)} / {sorted(want)})")
+        failures += 0 if ok else 1
+    # a legacy *KINEMATIC COUPLING with one node set on two DOF ranges (ccx exited 255 on the two
+    # couplings of one set), and a node two sets give other ranges, vs the set on DOFs 1-3
+    legacy = {}
+    for name, lines in (("one_range", ["RIGHT, 1, 3"]), ("two_ranges", ["RIGHT, 1, 2", "RIGHT, 3"]),
+                        ("node_ranges", ["R3, 1, 3", "12, 1, 2", "RIGHT, 3"])):
+        legacy[name] = review_run(legacy_coupling_deck(lines), f"legacy_kinematic_coupling_{name}",
+                                  dat_displacements)
+    if all(legacy.values()):
+        want = legacy["one_range"]
+        scale = max(abs(x) for v in want.values() for x in v)
+        err = ccx_ratio(max(abs(a - b) for u in legacy.values() for n in want
+                            for a, b in zip(u.get(n, (math.inf,) * 3), want[n])), scale)
+        ok = err < 1e-9 and scale > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  legacy_kinematic_coupling_ranges (a bar's end coupled by "
+              f"*KINEMATIC COUPLING lines RIGHT, 1, 2 + RIGHT, 3, and by a set and one node on other "
+              f"ranges): every node {err:.1e} of max |u| ({scale:.4g}) from RIGHT, 1, 3 (before: ccx "
+              f"exited 255)")
+    failures += 0 if all(legacy.values()) and ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
