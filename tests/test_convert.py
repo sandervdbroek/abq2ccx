@@ -8712,6 +8712,27 @@ def test_base_state_restore_reads_the_sets_as_written():
         == A.EmittedSets().read(A.EmittedDeck(lines)).members("NSET", "Twice")
 
 
+def test_base_state_restore_reads_each_steps_facts_from_its_step():
+    # the restore's procedure and time of each emitted step are its Step's (emit.written maps
+    # it): ccx's procedure, none at a step ccx stops at (a Riks step without --approximate:
+    # *NO ANALYSIS written), Abaqus' period and total time (no perturbation step adds any)
+    deck = HEX + ("*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
+                  "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Step\n*Static\n0.5, 2.\n*Cload\n"
+                  "7, 1, 1.\n*End Step\n*Step\n*Frequency\n3\n*End Step\n*Step\n*Modal Dynamic\n0.1, 0.5\n"
+                  "*End Step\n*Step\n*Static\n*End Step\n*Step\n*Static, riks\n0.1, 1.\n*End Step\n")
+    seen, run = [], A.BaseStateRestore.run
+    A.BaseStateRestore.run = lambda self: seen.append(self) or run(self)
+    try:
+        convert_str(deck)
+    finally:
+        A.BaseStateRestore.run = run
+    r = seen[0]
+    assert [st.proc.keyword for st in r.deck.steps][-1] == "NO ANALYSIS"
+    assert r.procs == {1: "STATIC", 2: "FREQUENCY", 3: "MODAL DYNAMIC", 4: "STATIC"}
+    assert r.period == {1: 2.0, 2: None, 3: 0.5, 4: 1.0, 5: None}
+    assert r.total == {1: 2.0, 2: 2.0, 3: 2.0, 4: 3.0, 5: None}
+
+
 def test_base_state_after_perturbation_values_and_keys():
     deck = HEX + ("*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
                   "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Nset, nset=TOP\n5, 6, 7, 8\n"

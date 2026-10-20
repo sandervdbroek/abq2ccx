@@ -6007,8 +6007,9 @@ class BaseStateRestore:
     linear perturbation steps (_restore_from) gets the base state's loads, BCs and
     temperatures again right after its procedure card, and a static perturbation step after
     another step (_sp_add, _sp_temps) its lines as changes of the base state's.  The
-    planners' facts come from the converter, the targets' sets and surfaces from an
-    EmittedSets, everything else from the deck as written."""
+    planners' facts come from the converter, each step's procedure and time from its Step,
+    the targets' sets and surfaces from an EmittedSets, everything else from the deck as
+    written."""
 
     def __init__(self, conv: "Converter", deck: EmittedDeck, mesh_sets: EmittedSets) -> None:
         self.conv, self.report, self.deck, self.mesh_sets = conv, conv.report, deck, mesh_sets
@@ -6035,7 +6036,7 @@ class BaseStateRestore:
         # general step up to it (no perturbation step adds any; None: unknown)
         self.period: Dict[int, Optional[float]] = {}
         self.total: Dict[int, Optional[float]] = {}
-        self.procs: Dict[int, str] = {}
+        self.procs: Dict[int, str] = {}             # step -> its procedure in ccx (Step.proc)
         self.by_step: Dict[int, List[EmittedCard]] = {}     # step (0: model data) -> its _RESTORED cards
         self.anchor: Dict[int, EmittedCard] = {}    # step -> the card its restore follows
         # the base state, step by step (_advance; a perturbation step's cards do not change it)
@@ -6100,14 +6101,15 @@ class BaseStateRestore:
                     self.total_amps.add(b.uparam("NAME"))
             if b.keyword in self.conv._RESTORED and b.step >= 0:
                 self.by_step.setdefault(b.step, []).append(b)
-        # each step's procedure as written; its time from its Step (emitted step s is
-        # written[s].no's: one *STEP line each); its *STEP params: self.written
+        # each step's procedure and time from its Step (emitted step s is written[s].no's: one
+        # *STEP line each): ccx's procedure (Step.proc), none where ccx stops (its *NO ANALYSIS);
+        # its *STEP params: self.written
         for st in deck.steps:
             s = st.number
             self.anchor[s] = st.proc or st.head
-            if st.proc is not None:
-                self.procs[s] = st.proc.keyword
             step = self.conv.steps.steps[self.written[s].no - 1]
+            if step.proc and s not in self.conv.emit.stopped:
+                self.procs[s] = step.proc
             self.period[s] = step.period
             self.total[s] = None if step.t_start is None or step.advance is None else \
                 step.t_start + step.advance
