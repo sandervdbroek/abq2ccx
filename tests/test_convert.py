@@ -1758,6 +1758,34 @@ def test_surface_interaction_hard_behavior_synthesized():
     assert "HARD" not in txt[i_full:]                       # FULL keeps only its LINEAR card
 
 
+def test_static_direct_with_contact_gets_automatic_increments():
+    # ccx's penalty contact can need a cutback where Abaqus' converges at a fixed increment,
+    # and under DIRECT ccx then stops (lcharleux_indentation_berko, at the start of
+    # unloading): with a contact pair the step gets automatic increments, the fixed one as the
+    # initial and the maximum increment, and its time-based output TIME POINTS
+    blocks = (HEX + "9, 0.,0.,1.\n10, 1.,0.,1.\n11, 1.,1.,1.\n12, 0.,1.,1.\n13, 0.,0.,2.\n"
+              "14, 1.,0.,2.\n15, 1.,1.,2.\n16, 0.,1.,2.\n*Element, type=C3D8, elset=EALL\n"
+              "2, 9,10,11,12,13,14,15,16\n*Material, name=M\n*Elastic\n1., 0.3\n"
+              "*Solid Section, elset=EALL, material=M\n*Surface, name=TOP\n1, S2\n"
+              "*Surface, name=BOT\n2, S1\n*Surface Interaction, name=SI\n{}\n"
+              "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+              "*Step, nlgeom\n*Static, direct{}\n0.1, 2.\n*Boundary\n13, 3, 3, -0.1\n"
+              "*Output, field, number interval=4\n*Node Output\nU\n*End Step\n")
+    pair = "*Contact Pair, interaction=SI\nBOT, TOP"
+    body, _, rep = convert_str(blocks.format(pair, ""))
+    assert "*STATIC\n0.1, 2., 2e-05, 0.1\n" in _step(body, 1)
+    assert "*NODE FILE, TIME POINTS=ABQ2CCX_TP1\nU\n" in _step(body, 1)
+    assert "automatic increments" in rep.text()
+    body, _, _ = convert_str(blocks.format(pair, "=NO STOP"))
+    assert "*STATIC\n0.1, 2., 2e-05, 0.1\n" in _step(body, 1)
+    # no contact, or only a tied pair: DIRECT stays, and its output a FREQUENCY
+    for other in ("", "*Contact Pair, interaction=SI, tied\nBOT, TOP"):
+        body, _, rep = convert_str(blocks.format(other, ""))
+        assert "*STATIC, DIRECT\n0.1, 2.\n" in _step(body, 1)
+        assert "*NODE FILE, FREQUENCY=5\nU\n" in _step(body, 1)
+        assert "automatic increments" not in rep.text()
+
+
 def test_lamina_to_engineering_constants():
     deck = "*Material, name=cfrp\n*Elastic, type=LAMINA\n140000., 10000., 0.3, 5000., 5000., 3800.\n"
     body, _, rep = convert_str(deck)

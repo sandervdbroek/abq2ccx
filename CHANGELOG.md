@@ -6,6 +6,12 @@ physics.
 
 ## Unreleased
 
+* **`*STATIC, DIRECT` with contact** — ccx's penalty contact can need a cutback where Abaqus'
+  contact converges at the fixed increment, and under `DIRECT` ccx then stops ("solution seems
+  to diverge"). In a model with contact pairs the step now gets automatic increments, with the
+  fixed increment as the initial and the maximum one: the deck's increments wherever ccx
+  converges. The corpus' Berkovich indentation deck now solves (in about 300 s, the corpus
+  gate's limit).
 * **`*DSFLUX`, `*SFILM` and `*SRADIATE`** — surface heat flux, film and radiation were
   commented out as having no ccx equivalent. They are now written as ccx's element-based
   `*DFLUX` / `*FILM` / `*RADIATE` on the surface's faces (`Sn` → `Sn` / `Fn` / `Rn`). They

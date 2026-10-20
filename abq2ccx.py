@@ -14412,10 +14412,10 @@ class Converter:
                     cards.append(twin)
         return cards
 
-    @staticmethod
-    def _step_timing(proc: Optional[Block]) -> dict:
+    def _step_timing(self, proc: Optional[Block]) -> dict:
         """How ccx increments a step: kind 'untimed' (no time increments), 'explicit',
-        'fixed' (DIRECT, *MODAL DYNAMIC: every increment the data line's first value) or
+        'fixed' (DIRECT as ccx gets it, see _direct_freed; *MODAL DYNAMIC: every increment
+        the data line's first value) or
         'auto' (ccx picks the increments); its period, fixed increment and (explicit)
         maximum increment."""
         t = {"kind": "auto", "proc": proc.keyword if proc else None, "period": 1.0,
@@ -14434,7 +14434,8 @@ class Converter:
                 return None
             return v if math.isfinite(v) and v > 0 else None
         t["period"] = num(1) or 1.0
-        direct = proc.has("DIRECT") or proc.has("DIRECT USER CONTROL")
+        direct = (proc.has("DIRECT") or proc.has("DIRECT USER CONTROL")) and \
+            not self._direct_freed(proc)
         if proc.keyword == "DYNAMIC" and proc.has("EXPLICIT"):
             t.update(kind="explicit", dt=num(0) if direct else None, dtmax=num(3))
         elif proc.keyword == "MODAL DYNAMIC" or direct:
@@ -16864,6 +16865,17 @@ class Converter:
                                  f"instability may not converge.", once=True)
             else:
                 self.report.note(f"*STATIC parameter {k} dropped (not a ccx parameter).", once=True)
+        data = list(b.data)
+        freed = self._direct_freed(b)
+        if freed:
+            del params["DIRECT"]
+            data = freed
+            self.report.note("*STATIC, DIRECT in a model with contact pairs -> automatic increments, "
+                             "the fixed increment as the initial and the maximum one: ccx's penalty "
+                             "contact can need a cutback where Abaqus' contact converges at the "
+                             "fixed increment, and under DIRECT ccx then stops ('solution seems to "
+                             "diverge'). Where ccx converges, the increments are the deck's.",
+                             once=True)
         if "RIKS" in params:
             if self._approx:
                 del params["RIKS"]
@@ -16877,7 +16889,29 @@ class Converter:
                                         "at this step. Rerun with --approximate to accept the "
                                         "plain-*STATIC reframing.",
                                      "*STATIC, RIKS step (ccx has no arc-length solver)")
-        return [emit_keyword("STATIC", params)] + list(b.data)
+        return [emit_keyword("STATIC", params)] + data
+
+    def _direct_freed(self, proc: Optional[Block]) -> Optional[List[str]]:
+        """The data line handle_static writes for a ``*STATIC, DIRECT`` step of a model with
+        contact pairs ccx gets (_freq_contact): automatic increments with the deck's fixed
+        increment as the initial and the maximum one, and Abaqus' default minimum; None where
+        DIRECT stays (no contact, Riks, no fixed increment up to the period).  ccx's penalty
+        contact can need a cutback where Abaqus' converges at the fixed increment
+        (lcharleux_indentation_berko: one, at the start of unloading), and under DIRECT ccx
+        then stops.  Where ccx converges, the increments are the deck's."""
+        if proc is None or proc.keyword != "STATIC" or not proc.has("DIRECT") or \
+                proc.has("RIKS") or not self._freq_contact:
+            return None
+        vals = [x.strip() for x in next((r for r in merged_data_records(proc) if any(x for x in r)), [])]
+        try:
+            dt = pf(vals[0])
+            period = pf(vals[1]) if len(vals) > 1 and vals[1] else 1.0
+        except (IndexError, ValueError):
+            return None
+        if not (math.isfinite(dt) and math.isfinite(period) and 0 < dt <= period):
+            return None
+        return [f"{vals[0]}, {vals[1] if len(vals) > 1 and vals[1] else '1.'}, "
+                f"{fmt_num(min(dt, 1e-5 * period))}, {vals[0]}"]
 
     def handle_complex_frequency(self, b: Block) -> List[str]:
         """``*COMPLEX FREQUENCY``: Abaqus projects the damping operators (dashpots, Rayleigh
