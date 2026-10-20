@@ -19,7 +19,7 @@ references). Each entry carries one of three expectations:
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
   conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
-  Three flags keep such a deck out of the headline count of faithful solves (189):
+  Three flags keep such a deck out of the headline count of faithful solves (188):
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
@@ -31,10 +31,11 @@ references). Each entry carries one of three expectations:
     Euler-Bernoulli U1), a section control,
     an interaction (general contact) or an imperfection - so ccx solves a different
     problem (``Converter.reduced_physics``; test_corpus.py checks the flag matches);
-  - ``solver_differs='<why>'`` (1): the conversion keeps the deck's physics, but ccx's
+  - ``solver_differs='<why>'`` (2): the conversion keeps the deck's physics, but ccx's
     solution is not the deck's - the deck relies on solver behaviour ccx 2.23 lacks (a body
     that only contact holds, which drifts away before the contact closes: ccx has no
-    contact stabilization). Found in the results, not in the conversion.
+    contact stabilization; a *BUCKLE step loaded far above its buckling load, whose lowest
+    factors ccx's shifted eigensolver does not return). Found in the results, not in the conversion.
   All three kinds are kept as conversion checks.
 * ``parse_only=True`` (221) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
@@ -976,6 +977,11 @@ CORPUS = [
          exercises='C3D8R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/smrg-uob/PeriodicBoundaryCondition/master/examples/Cube_PBC_UAT.inp'),
     dict(name='weili101_ex4_job_buckling_ssff_0', expect_solve=True, license='MIT',
+         solver_differs="ccx 2.23's *BUCKLE returns the factors nearest 1, not the lowest (it "
+                        "shift-inverts about 1): the deck's edge push of -10 is about 1240 times "
+                        "its lowest buckling load, so ccx gives ten factors at 0.977-1.023, not "
+                        "the lowest, about 8.1e-4 (probed: the push scaled to -3.6e-4, with the "
+                        "plate's free translation along its edges held, gives 22.38, 45.81, ...)",
          exercises='S4R — parts/instances/assembly; *Buckle',
          url='https://raw.githubusercontent.com/weili101/Deep_Plates/main/FE%20Models%20%28Abaqus%20Input%20Files%29/Ex4-Job-Buckling-SSFF-0.inp'),
     # expect_solve history: solved while EQUALLY SPACED amplitudes were mis-emitted as raw
@@ -2823,7 +2829,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/8.%20Modal%20Analysis/4.%20Mode%20Participation%20Factor%20and%20Effective%20Mass/DOF.inp'),
     dict(name='marcello_gori_harmonic_analysis', expect_solve=False, license='MIT',
          exercises='S4, B31 — parts/instances/assembly; *Frequency',
-         note="ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile, and ccx 2.23's U1 beam, which carries it, cannot share a deck with the S4 shells (--approximate runs it as the RECT of equal area and strong-axis inertia)",
+         note="ccx limitation: *BEAM SECTION, SECTION=I has no ccx profile, and ccx 2.23's U1 beam, which carries it, cannot share a deck with the S4 shells (--approximate runs it as the RECT of equal area and strong-axis inertia, and then solves without the *FREQUENCY step's prestress: ccx's steady-state dynamics refuses perturbation eigenmodes)",
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/12.%20Project.%20Two-Story%20Building/Harmonic_Analysis.inp'),
     dict(name='marcello_gori_job_1_3', expect_solve=False, license='MIT',
          exercises='C3D8, C3D6 — parts/instances/assembly',

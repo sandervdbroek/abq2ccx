@@ -191,7 +191,7 @@ Each entry has its URL, license, what it exercises, and:
 | `parse_only=True` | a mesh-only deck (no `*STEP`); ccx must accept it |
 | `source_unloaded=True` | it solves, but the source deck loads nothing (an empty `*STEP`); kept as a conversion check, out of the headline count |
 | `reduced_physics='<what>'` | it solves, but the conversion drops or replaces part of the Abaqus model (a constitutive behaviour, an element formulation, a section control, an interaction, a load, the geometry), so not its own problem; kept as a conversion check, out of the headline count |
-| `solver_differs='<why>'` | the conversion keeps the deck's physics, but ccx's solution is not the deck's: the deck relies on solver behaviour ccx 2.23 lacks (a part that only contact holds drifts away before the contact closes); found in the results; out of the headline count |
+| `solver_differs='<why>'` | the conversion keeps the deck's physics, but ccx's solution is not the deck's: the deck relies on solver behaviour ccx 2.23 lacks (a part that only contact holds drifts away before the contact closes; a `*BUCKLE` step loaded far above its lowest buckling load, whose lowest factors ccx does not return); found in the results; out of the headline count |
 | `note` | why a deck does not solve, or what a gated one depends on |
 | `reference=dict(...)` | its published answer: the quantity and where ccx writes it (`read`), the NAFEMS `target`, Abaqus' result for the deck's mesh (`abaqus`), a tolerance (`tol`), the `source` page; `ccx` and `why` where ccx answers differently for a reason traced to ccx |
 
@@ -225,9 +225,10 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1052 decks convert with no dangling
-reference. 232 are gated `expect_solve`: **189 solve the deck's own physics**; 14 are
-`source_unloaded`, one is `solver_differs` (a snap-fit insert that only contact holds drifts
-out of its buckle) and 31 (3 of them also unloaded) are `reduced_physics` — concrete damaged
+reference. 232 are gated `expect_solve`: **188 solve the deck's own physics**; 14 are
+`source_unloaded`, two are `solver_differs` (a snap-fit insert that only contact holds drifts
+out of its buckle; a plate pushed about 1240 times past its buckling load, whose lowest factors
+ccx's `*BUCKLE` does not return) and 31 (3 of them also unloaded) are `reduced_physics` — concrete damaged
 plasticity (2), UHARD / VUHARD hardening (2), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as

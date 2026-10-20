@@ -195,8 +195,9 @@ temperature–displacement steps, cohesive and acoustic models, Abaqus general c
 incomplete source decks (50). Another 31 solve only a model with reduced physics — the
 conversion had to drop or replace part of it (concrete damaged plasticity, user hardening,
 Chaboche back-stresses, field-dependent properties, hybrid / modified / thin-shell elements,
-Euler–Bernoulli `U1` beams for Timoshenko ones, general contact, an imperfection), and one converges to a solution that is not the deck's (a
-body that only contact holds drifts away before the contact closes) — all kept out of the
+Euler–Bernoulli `U1` beams for Timoshenko ones, general contact, an imperfection), and two converge to solutions that are not the deck's (a
+body that only contact holds drifts away before the contact closes; a buckling deck loaded far above
+its buckling load, whose lowest factors ccx's `*BUCKLE` does not return) — all kept out of the
 count of faithful solves. The
 [testing page](testing.md#3-corpus--corpus-and-teststest_corpuspy) breaks them down. Fixing a first error often only exposes a second, fundamental one, so the
 converter translates or clearly flags each incompatibility rather than forcing a deck to run.
