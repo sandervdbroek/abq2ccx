@@ -1411,6 +1411,8 @@ def parse_keyword_line(line: str, seen: Optional[Dict[str, "OrderedDict[str, obj
 
 def _split_commas(line: str) -> List[str]:
     """Split on commas, honouring double quotes (used by *INCLUDE file names)."""
+    if '"' not in line:
+        return line.split(",")
     out, cur, q = [], [], False
     for ch in line:
         if ch == '"':
@@ -1456,6 +1458,8 @@ _PARAM_BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operato
                  ast.Mod: operator.mod, ast.Pow: _param_pow}
 _PARAM_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 _PARAM_TOKEN_RE = re.compile(r"<([A-Za-z_]\w*)>")
+_PARAM_REF_RE = re.compile(r"<([^<>]+)>")
+_PARAMETER_CARD_RE = re.compile(r"\*parameter\s*(,|$)", re.I)
 
 
 def _safe_eval_param(expr: str, names: Dict[str, object],
@@ -1523,25 +1527,28 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
     Converter._undefined_parameter_data)."""
     raw_defs: List[Tuple[str, str]] = []
     kept: List[str] = []
-    in_param = False
-    for line in lines:
-        s = line.strip()
+    n, done = len(lines), 0         # lines before this one are kept (or read as definitions)
+    # (only a line with a '*' can be a keyword line: the others are kept a run at a time)
+    for k in [k for k, line in enumerate(lines) if "*" in line]:
+        if k < done:
+            continue
+        s = lines[k].strip()
         # exactly *PARAMETER — not *PARAMETER TABLE / *PARAMETER DEPENDENCE / ..., which
         # are different cards whose data must not be swallowed as definitions
-        if re.match(r"\*parameter\s*(,|$)", s, re.I):
-            in_param = True
+        if not (s.startswith("*") and _PARAMETER_CARD_RE.match(s)):
             continue
-        if in_param:
-            if s.startswith("**"):          # a comment inside the block does NOT end it
-                continue
-            if s.startswith("*"):           # the next real keyword ends the block
-                in_param = False            # fall through to keep this line
-            else:
-                if s and "=" in s:
-                    name, expr = s.split("=", 1)
-                    raw_defs.append((name.strip(), expr.strip()))
-                continue                    # drop parameter-definition lines
-        kept.append(line)
+        kept.extend(lines[done:k])
+        j = k + 1
+        while j < n:                        # drop parameter-definition lines
+            s = lines[j].strip()
+            if s.startswith("*") and not s.startswith("**"):
+                break                       # the next real keyword ends the block (kept)
+            if not s.startswith("**") and s and "=" in s:   # (a comment does NOT end it)
+                name, expr = s.split("=", 1)
+                raw_defs.append((name.strip(), expr.strip()))
+            j += 1
+        done = j
+    kept.extend(lines[done:])
 
     if raw_defs:                            # resolve, iterating to handle forward references
         user_names = {nm for nm, _ in raw_defs}
@@ -1613,7 +1620,7 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
     undefined: List[str] = []
     cards: List[str] = []                   # the cards with one in their model data
     head = ""                               # the last keyword line
-    for ln in out:
+    for ln in out if any(map(operator.contains, out, itertools.repeat("<"))) else ():
         s = ln.strip()
         if s.startswith("**"):
             continue
@@ -1639,7 +1646,9 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
 
 def _substitute_params(line: str, params: Dict[str, object]) -> str:
     """``line`` with each ``<name>`` token of a known parameter replaced by its value."""
-    return re.sub(r"<([^<>]+)>", lambda m: str(params.get(m.group(1), m.group(0))), line)
+    if "<" not in line:
+        return line
+    return _PARAM_REF_RE.sub(lambda m: str(params.get(m.group(1), m.group(0))), line)
 
 
 def join_keyword_continuations(lines: List[str]) -> List[str]:
@@ -1675,27 +1684,33 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
         return bool(toks) and all(t in bare_flags for t in toks)
 
     out: List[str] = []
-    i, n = 0, len(lines)
-    while i < n:
-        line = lines[i]
+    n = len(lines)
+    done = 0                    # lines before this one are in out (or merged into a keyword)
+    # (only a line with a '*' can be a keyword line: the others are copied a run at a time)
+    for k in [k for k, line in enumerate(lines) if "*" in line]:
+        if k < done:
+            continue
+        line = lines[k]
         s = line.strip()
-        if s.startswith("*") and not s.startswith("**"):
-            acc = line.rstrip()
-            while acc.endswith(","):
-                j = i + 1                            # skip blank / comment lines
-                while j < n and (not lines[j].strip() or lines[j].strip().startswith("**")):
-                    j += 1
-                if j >= n:
-                    break
-                nxt = lines[j].strip()
-                if nxt.startswith("*") or not is_params(nxt):   # next keyword or a data line
-                    break
-                acc = acc + " " + nxt
-                i = j
-            out.append(acc)
-        else:
-            out.append(line)
-        i += 1
+        if not s.startswith("*") or s.startswith("**"):
+            continue
+        out.extend(lines[done:k])
+        i = k
+        acc = line.rstrip()
+        while acc.endswith(","):
+            j = i + 1                            # skip blank / comment lines
+            while j < n and (not lines[j].strip() or lines[j].strip().startswith("**")):
+                j += 1
+            if j >= n:
+                break
+            nxt = lines[j].strip()
+            if nxt.startswith("*") or not is_params(nxt):   # next keyword or a data line
+                break
+            acc = acc + " " + nxt
+            i = j
+        out.append(acc)
+        done = i + 1
+    out.extend(lines[done:])
     return out
 
 
@@ -1749,11 +1764,16 @@ def read_blocks(path: str, report: Report) -> List[Block]:
         here = os.path.dirname(fpath)
         stack.append(realpath)
         try:
-            for line in join_keyword_continuations(lines):
+            joined = join_keyword_continuations(lines)
+            done = 0                    # lines before this one are in raw_lines (or read here)
+            # (only a line with a '*' can be a keyword line: the others go a run at a time)
+            for at in [at for at, line in enumerate(joined) if "*" in line]:
+                line = joined[at]
                 s = line.strip()
                 if not s.startswith("*") or s.startswith("**"):
-                    raw_lines.append(line)
                     continue
+                raw_lines.extend(joined[done:at])
+                done = at + 1
                 keyword, params = parse_keyword_line(line, seen)
                 if keyword == "INCLUDE":
                     inc = (params.get("INPUT") or params.get("INP") or "").strip().strip('"')
@@ -1788,6 +1808,7 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                     toks[k] = f'{toks[k].partition("=")[0]}="{full}"'
                     line = ",".join(toks)
                 raw_lines.append(line)
+            raw_lines.extend(joined[done:])
         finally:
             stack.pop()
 
@@ -1801,12 +1822,25 @@ def read_blocks(path: str, report: Report) -> List[Block]:
     # face of the model (Keywords Reference *SURFACE), kept as the data line "" for
     # Converter._free_face_surfaces (any other blank line is skipped)
     blank: Optional[Block] = None
-    for raw in raw_lines:
-        line = raw.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            if current is not None and current.keyword == "SURFACE" and not current.data:
-                blank = current
+
+    def data_lines(run: List[str]) -> None:
+        """Lines without a '*' (data or blank), a run at a time: the bulk of a deck."""
+        nonlocal blank
+        vals = [x for x in map(str.strip, run) if x]
+        if vals:
+            blank = None
+            (orphans if current is None else current.data).extend(vals)
+        elif run and current is not None and current.keyword == "SURFACE" and not current.data:
+            blank = current
+    done = 0
+    for at in [at for at, raw in enumerate(raw_lines) if "*" in raw]:
+        data_lines(raw_lines[done:at])
+        done = at + 1
+        raw = raw_lines[at]
+        stripped = raw.strip()
+        if stripped[0] != "*":                  # data line
+            blank = None
+            (orphans if current is None else current.data).append(stripped)
             continue
         if stripped.startswith("**"):          # comment line
             continue
@@ -1814,7 +1848,7 @@ def read_blocks(path: str, report: Report) -> List[Block]:
             blank.data.append("")
         blank = None
         if stripped.startswith("*"):           # keyword line
-            keyword, params = parse_keyword_line(line, seen)
+            keyword, params = parse_keyword_line(raw.rstrip(), seen)
             current = Block(keyword=keyword, params=params)
             blocks.append(current)
             src = params.get("INPUT")
@@ -1842,6 +1876,7 @@ def read_blocks(path: str, report: Report) -> List[Block]:
             orphans.append(stripped)
         else:
             current.data.append(stripped)
+    data_lines(raw_lines[done:])
     if blank is not None and not blank.data:
         blank.data.append("")
     if orphans:
@@ -1896,7 +1931,13 @@ def merged_data_records(block: Block) -> List[List[str]]:
     node count (``_register_elements``), and material/constraint data lines are passed
     through verbatim, so nothing here needs continuation merging.  Interior blank fields
     are preserved (they are positional placeholders)."""
-    return [trimmed_fields(line.split(",")) for line in block.data]
+    out = []
+    for line in block.data:                 # (trimmed_fields inlined: the hottest reader)
+        g = list(map(str.strip, line.split(",")))
+        while g and g[-1] == "":
+            g.pop()
+        out.append(g)
+    return out
 
 
 def trimmed_fields(fields: Sequence[str]) -> List[str]:
@@ -2092,6 +2133,9 @@ def pint(token) -> int:
     return int(pf(token))
 
 
+_INT_TOKEN = re.compile(r"[-+]?\d+").fullmatch     # an integer field (re.fullmatch, compiled once)
+
+
 def dof_number(token: str) -> Optional[int]:
     """A load or BC line's DOF field as handle_cload and ccx read it: an integer, so ``+6``
     and ``06`` are DOF 6; None for anything else (a named BC type, a blank)."""
@@ -2148,9 +2192,9 @@ def emit_keyword(keyword: str, params: "OrderedDict[str, Optional[str]]") -> str
 def reflow(values: Sequence, per_line: int = MAX_ENTRIES_PER_LINE) -> List[str]:
     """Group already-formatted tokens into comma-separated lines."""
     toks = [v if isinstance(v, str) else fmt_num(v) for v in values]
-    lines = []
-    for i in range(0, len(toks), per_line):
-        lines.append(", ".join(toks[i:i + per_line]))
+    if 0 < len(toks) <= per_line:
+        return [", ".join(toks)]
+    lines = [", ".join(toks[i:i + per_line]) for i in range(0, len(toks), per_line)]
     return lines or [""]
 
 
@@ -2188,14 +2232,16 @@ def compress_ids(ids: Sequence[int]) -> List[str]:
     ids = list(ids)
     if len(ids) >= 3:
         inc = ids[1] - ids[0]
-        if inc != 0 and all(b - a == inc for a, b in zip(ids, ids[1:])):
+        if inc != 0 and all(map(operator.eq, map(operator.sub, ids[1:], ids), itertools.repeat(inc))):
             # CalculiX's GENERATE wants first <= last with a positive increment; a set's
             # membership is order-independent, so emit a *descending* run as its
             # equivalent ascending range rather than the invalid "5, 1, -1".
             if inc > 0:
                 return ["GENERATE", f"{ids[0]}, {ids[-1]}, {inc}"]
             return ["GENERATE", f"{ids[-1]}, {ids[0]}, {-inc}"]
-    return reflow([str(i) for i in ids])
+    toks = list(map(str, ids))              # (reflow, of tokens that are all text)
+    return [", ".join(toks[i:i + MAX_ENTRIES_PER_LINE])
+            for i in range(0, len(toks), MAX_ENTRIES_PER_LINE)] or [""]
 
 
 # ---------------------------------------------------------------------------
@@ -3229,12 +3275,7 @@ _T = TypeVar("_T")
 
 
 def dedup(seq: Sequence[_T]) -> List[_T]:
-    seen, out = set(), []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+    return list(dict.fromkeys(seq))         # (the first of equal items, in order)
 
 
 def fmt_coord(x: float) -> str:
@@ -3245,6 +3286,13 @@ def fmt_coord(x: float) -> str:
     if abs(x) < 1e-12:
         x = 0.0
     return "%.12g" % x
+
+
+def node_line(nid: int, x: float, y: float, z: float) -> str:
+    """A *NODE data line ``nid, x, y, z``, each coordinate as fmt_coord writes it."""
+    x, y, z = float(x), float(y), float(z)
+    return "%s, %.12g, %.12g, %.12g" % (nid, 0.0 if abs(x) < 1e-12 else x, 0.0 if abs(y) < 1e-12 else y,
+                                        0.0 if abs(z) < 1e-12 else z)
 
 
 # ---------------------------------------------------------------------------
@@ -3797,8 +3845,8 @@ def quad_extent(p: Sequence[Vec]) -> Tuple[float, float]:
 def brick_flatness(p: Sequence[Vec]) -> Optional[float]:
     """A hexahedron's middle size over its smallest (from its mid-lines): 1 for a cube, 10 for a
     tile ten times as wide as thick; None for a degenerate one."""
-    size = sorted(math.sqrt(sum((p[a][x] + p[b][x] + p[c][x] + p[d][x] - p[e][x] - p[f][x] - p[g][x]
-                                 - p[h][x]) ** 2 for x in range(3)))
+    size = sorted(math.sqrt(sum([(p[a][x] + p[b][x] + p[c][x] + p[d][x] - p[e][x] - p[f][x] - p[g][x]
+                                  - p[h][x]) ** 2 for x in range(3)]))
                   for a, b, c, d, e, f, g, h in ((1, 2, 5, 6, 0, 3, 4, 7), (2, 3, 6, 7, 0, 1, 4, 5),
                                                  (4, 5, 6, 7, 0, 1, 2, 3)))
     return size[1] / size[0] if size[0] > 0 else None
@@ -3834,13 +3882,20 @@ def max_normal_stiffness(typ: str, v: Sequence[float]) -> Optional[float]:
     return k if math.isfinite(k) and k > 0 else None
 
 
+_COURANT_KINDS: Dict[str, Tuple[str, Optional[float]]] = {}     # ccx type -> (its brick, factor)
+
+
 def courant_length(ctype: str, pts: Sequence[Vec], section: dict) -> Optional[float]:
     """h * f of ccx's explicit increment estimate (COURANT_FACTOR) for an element of ccx
     type ``ctype`` with node coordinates ``pts``; ``section``: 't' (shell, membrane or
     plane thickness), 'area' (truss), 'rect' (a, b), 'circ' (diameter).  None for
     elements ccx does not size (springs, masses...) or that cannot be measured."""
-    brick = next((b for p, b in COURANT_BRICK if ctype.startswith(p)), ctype)
-    f = next((v for p, v in COURANT_FACTOR if brick.startswith(p)), None)
+    kind = _COURANT_KINDS.get(ctype)
+    if kind is None:
+        brick = next((b for p, b in COURANT_BRICK if ctype.startswith(p)), ctype)
+        kind = _COURANT_KINDS[ctype] = (brick, next((v for p, v in COURANT_FACTOR
+                                                     if brick.startswith(p)), None))
+    brick, f = kind
     if f is None or not pts:
         return None
     if ctype.startswith("C3D"):
@@ -3857,7 +3912,7 @@ def courant_length(ctype: str, pts: Sequence[Vec], section: dict) -> Optional[fl
             c = pts[:8]
             sg = ((-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
                   (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1))
-            jac = [tuple(sum(sg[n][d] * c[n][x] for n in range(8)) / 8.0 for x in range(3))
+            jac = [tuple(sum([sg[n][d] * c[n][x] for n in range(8)]) / 8.0 for x in range(3))
                    for d in range(3)]
             vol = 8.0 * abs(vdot(jac[0], vcross(jac[1], jac[2])))
             areas = [(1.0, _face_area([c[i] for i in fc])) for fc in HEX_FACES]
@@ -4355,7 +4410,7 @@ def ccx_integration_points(typ: str, xyz: Sequence[Vec]) -> Optional[List[Vec]]:
         return None
     if len(xyz) != n:
         return None
-    return [tuple(sum(w * p[k] for w, p in zip(N, xyz)) for k in range(3)) for N in weights]
+    return [tuple(sum([w * p[k] for w, p in zip(N, xyz)]) for k in range(3)) for N in weights]
 
 
 def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: bool = False
@@ -4375,8 +4430,8 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
     forces = [[0.0, 0.0, 0.0] for _ in range(n)]
     for a, b, w in rule:
         N, da, db = _shape(kind, n, a, b)
-        p = tuple(sum(N[i] * xyz[i][k] for i in range(n)) for k in range(3))
-        ga = tuple(sum(da[i] * xyz[i][k] for i in range(n)) for k in range(3))
+        p = tuple(sum([N[i] * xyz[i][k] for i in range(n)]) for k in range(3))
+        ga = tuple(sum([da[i] * xyz[i][k] for i in range(n)]) for k in range(3))
         if kind == "line":
             jac = vnorm(ga)
             tangent: Optional[Vec] = vunit(ga)
@@ -4384,7 +4439,7 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
             if axisymmetric:
                 jac *= 2.0 * math.pi * p[0]
         else:
-            gb = tuple(sum(db[i] * xyz[i][k] for i in range(n)) for k in range(3))
+            gb = tuple(sum([db[i] * xyz[i][k] for i in range(n)]) for k in range(3))
             cross = vcross(ga, gb)
             jac = vnorm(cross)
             normal, tangent = vunit(cross), None
@@ -6820,10 +6875,14 @@ class Converter:
             if b.keyword == "ORIENTATION" and b.uparam("DEFINITION").startswith("NODES"):
                 self._register_orientation(b)
 
+    def _types_where(self, test: Callable[[str], bool]) -> set:
+        """The element types of the mesh (as it spells them) that pass ``test``."""
+        return {t for t in {t for t, _c in self.geom.elements.values()} if test(t)}
+
     def _warn_undefined_element_nodes(self) -> None:
         """Warn on elements that name an undefined node (Abaqus stops on them)."""
         nodes = self.geom.nodes
-        bad = [e for e, (_t, conn) in self.geom.elements.items() if any(k not in nodes for k in conn)]
+        bad = [e for e, (_t, conn) in self.geom.elements.items() if not all(map(nodes.__contains__, conn))]
         if bad:
             n = next(k for k in self.geom.elements[bad[0]][1] if k not in nodes)
             self.report.warn(f"{len(bad)} element(s) name an undefined node (element {bad[0]}: "
@@ -6836,15 +6895,22 @@ class Converter:
         such an element, and ccx too ('nonpositive jacobian' and the like).  A collapsed
         element that keeps an area or volume (a quadrilateral as a triangle) is valid."""
         bad = []
+        kinds: Dict[Tuple[str, int], Optional[Tuple[int, int]]] = {}   # (type, nodes) -> (corners, need)
         for e, (t, conn) in self.geom.elements.items():
-            t = t.upper()
-            if t.startswith(("C3D", "DC3D", "AC3D")):
-                corners, need = {4: 4, 10: 4, 5: 5, 13: 5, 6: 6, 15: 6}.get(len(conn), 8), 4
-            elif t.startswith(PLANE_ELEM_PREFIXES + ("CGAX", "DC2D", "DCAX", "AC2D", "ACAX", "M3D")) \
-                    or (t in SHELL_TYPES and not t.startswith(("SFM", "SAX", "DSAX"))):
-                corners, need = (3 if len(conn) in (3, 6) else 4), 3
-            else:
+            kind = kinds.get((t, len(conn)), 0)
+            if kind == 0:
+                u = t.upper()
+                if u.startswith(("C3D", "DC3D", "AC3D")):
+                    kind = {4: 4, 10: 4, 5: 5, 13: 5, 6: 6, 15: 6}.get(len(conn), 8), 4
+                elif u.startswith(PLANE_ELEM_PREFIXES + ("CGAX", "DC2D", "DCAX", "AC2D", "ACAX", "M3D")) \
+                        or (u in SHELL_TYPES and not u.startswith(("SFM", "SAX", "DSAX"))):
+                    kind = (3 if len(conn) in (3, 6) else 4), 3
+                else:
+                    kind = None
+                kinds[(t, len(conn))] = kind
+            if kind is None:
                 continue
+            corners, need = kind
             if len(conn) >= corners and len(set(conn[:corners])) < need:
                 bad.append(e)
         if bad:
@@ -6962,13 +7028,29 @@ class Converter:
 
     def _register_nodes(self, b: Block) -> None:
         ids = []
-        for rec in merged_data_records(b):
-            f = trimmed_fields(rec)
+        nodes = self.geom.nodes
+        recs = merged_data_records(b)           # (trimmed already)
+        if recs and set(map(len, recs)) == {4}:
+            try:                                # the usual card in bulk: label, x, y, z on every
+                vals = list(map(float, itertools.chain.from_iterable(recs)))   # line, no node
+                nids = list(map(int, vals[0::4]))                             # given twice
+            except (ValueError, OverflowError):
+                nids = None                     # (else line by line, below)
+            if nids is not None and len(set(nids)) == len(nids) and nodes.keys().isdisjoint(nids):
+                nodes.update(zip(nids, zip(vals[1::4], vals[2::4], vals[3::4])))
+                ids, recs = nids, []
+        for f in recs:
             if not f:
                 continue
             try:                            # fields by position; a blank one is 0, as in Abaqus
                 nid = int(float(f[0]))
-                coords = [pf(x) if x else 0.0 for x in (f[1:4] + ["", "", ""])[:3]]
+                if len(f) >= 4 and f[1] and f[2] and f[3]:
+                    try:                    # (pf, its Fortran-exponent retry only where needed)
+                        coords = (float(f[1]), float(f[2]), float(f[3]))
+                    except ValueError:
+                        coords = (pf(f[1]), pf(f[2]), pf(f[3]))
+                else:
+                    coords = [pf(x) if x else 0.0 for x in (f[1:4] + ["", "", ""])[:3]]
             except ValueError:              # one malformed line should not abort the file
                 self.report.warn("Skipped a *NODE record with non-numeric data; verify the deck.", once=True)
                 continue
@@ -6979,10 +7061,10 @@ class Converter:
                         self._node_normals[nid] = vunit(nrm)
                 except ValueError:
                     pass
-            if nid in self.geom.nodes:
+            if nid in nodes:
                 self.report.warn("Duplicate node id(s) in the input; the last definition is kept "
                                  "(Abaqus behaviour) — check for an upstream renumbering error.", once=True)
-            self.geom.add_node(nid, (coords[0], coords[1], coords[2]))
+            nodes[nid] = (coords[0], coords[1], coords[2])      # (Geometry.add_node)
             ids.append(nid)
         if b.param("NSET"):
             self.geom.add_to_nset(b.param("NSET"), ids)
@@ -6993,21 +7075,32 @@ class Converter:
             self._register_connectors(b, typ)
             return
         nn = element_node_count(typ)
-        toks: List[str] = []
-        for line in b.data:
-            toks.extend(t.strip() for t in line.split(","))
-        toks = [t for t in toks if t != ""]
+        # (one split of the lines joined: the same fields as line by line)
+        toks = [t for t in map(str.strip, ",".join(b.data).split(",")) if t != ""]
         if nn is None:
             recs = merged_data_records(b)
             nn = len([x for x in recs[0] if x != ""]) - 1 if recs else 0
             self.report.warn(f"Unknown element type {typ}: inferred {nn} nodes/element. "
                              f"Verify CalculiX supports it.", once=True)
         ids = []
-        i = 0
-        while nn > 0 and i + 1 + nn <= len(toks):
+        elements, conns = self.geom.elements, self._conn
+        step = 1 + nn
+        starts = range(0, len(toks) - nn, step) if nn > 0 else range(0)    # every whole element
+        end = len(starts) * step                # where the reading stops
+        if nn > 0:
+            try:                                # the usual card in bulk: integer labels, no
+                vals = list(map(int, toks))     # element given twice (else one by one, below)
+            except ValueError:
+                vals = None
+            eids = vals[:end:step] if vals is not None else None
+            if eids is not None and len(set(eids)) == len(eids) and \
+                    elements.keys().isdisjoint(eids) and conns.keys().isdisjoint(eids):
+                elements.update(zip(eids, [(typ, vals[i + 1:i + step]) for i in starts]))
+                ids, starts = eids, range(0)
+        for i in starts:
             try:
                 eid = int(toks[i])
-                conn = [int(x) for x in toks[i + 1:i + 1 + nn]]
+                conn = list(map(int, toks[i + 1:i + step]))
             except ValueError:
                 # non-numeric connectivity — e.g. an assembly-level connector/MPC element
                 # using instance-qualified node names (PART-1-1.1).  ccx needs resolved
@@ -7016,17 +7109,15 @@ class Converter:
                                  f"(instance-qualified or named node); element skipped — "
                                  f"verify it is a connector/MPC with no ccx equivalent.", once=True)
                 self._reduces(f"*ELEMENT, TYPE={typ} elements with named nodes skipped")
-                i += 1 + nn
                 continue
-            if eid in self.geom.elements or eid in self._conn:
+            if eid in elements or eid in conns:
                 self.report.warn("Duplicate element id(s) in the input; the last definition is kept "
                                  "(Abaqus behaviour) — check for an upstream renumbering error.", once=True)
-                self._conn.pop(eid, None)
-            self.geom.add_element(eid, typ, conn)
+                conns.pop(eid, None)
+            elements[eid] = (typ, conn)             # (Geometry.add_element)
             ids.append(eid)
-            i += 1 + nn
-        if nn > 0 and i != len(toks):
-            self.report.warn(f"*ELEMENT TYPE={typ}: {len(toks) - i} trailing token(s) "
+        if nn > 0 and end != len(toks):
+            self.report.warn(f"*ELEMENT TYPE={typ}: {len(toks) - end} trailing token(s) "
                              f"not parsed; check connectivity.", once=True)
         self._elem_types.add(typ)
         if b.param("ELSET"):
@@ -7093,7 +7184,7 @@ class Converter:
                                      else "a blank first or last member")
             else:
                 for tok in f:
-                    if re.fullmatch(r"[-+]?\d+", tok):
+                    if _INT_TOKEN(tok):
                         ids.append(int(tok))
                     else:
                         nested = self.geom.nset(tok) if kind == "N" else self.geom.elset(tok)
@@ -7157,8 +7248,7 @@ class Converter:
     def emit_geometry(self) -> List[str]:
         out: List[str] = []
         out.append("*NODE")
-        for nid, (x, y, z) in self.geom.nodes.items():
-            out.append(f"{nid}, {fmt_coord(x)}, {fmt_coord(y)}, {fmt_coord(z)}")
+        out.extend([node_line(nid, x, y, z) for nid, (x, y, z) in self.geom.nodes.items()])
 
         by_type: "OrderedDict[str, List[Tuple[int, List[int]]]]" = OrderedDict()
         for eid, (typ, conn) in self.geom.elements.items():
@@ -7183,7 +7273,10 @@ class Converter:
                 self._reduces(loss)
             out.append(f"*ELEMENT, TYPE={out_typ}")
             for eid, conn in items:
-                out.extend(reflow([str(eid)] + [str(c) for c in conn], MAX_ENTRIES_PER_LINE))
+                if len(conn) < MAX_ENTRIES_PER_LINE:        # (reflow: one line)
+                    out.append(", ".join([str(eid), *map(str, conn)]))
+                else:
+                    out.extend(reflow([str(eid)] + [str(c) for c in conn], MAX_ENTRIES_PER_LINE))
 
         self._mesh_sets = EmittedSets()         # the sets as written (BaseStateRestore)
         for name, ids in self.geom.nsets.items():
@@ -7196,9 +7289,9 @@ class Converter:
                   record: Optional[EmittedSets] = None) -> None:
         pool = self.geom.nodes if kw == "NSET" else self.geom.elements
         raw = dedup(ids)
-        if kw == "ELSET" and self._conn:
-            raw = [i for i in raw if i not in self._conn]      # constraints, not elements
-        ids = [i for i in raw if i in pool]
+        if kw == "ELSET" and self._conn:                        # constraints, not elements
+            raw = list(itertools.filterfalse(self._conn.__contains__, raw))
+        ids = list(filter(pool.__contains__, raw))
         dropped = len(raw) - len(ids)
         if dropped:
             self.report.warn(f"*{kw} {name}: {dropped} member(s) reference undefined "
@@ -7710,6 +7803,7 @@ class Converter:
         cards: List[str] = []
         for b in blocks:
             if b.keyword not in CCX_KEYWORDS or b.keyword in _NO_MODEL_DATA_CARDS or \
+                    not any(map(operator.contains, b.data, itertools.repeat("<"))) or \
                     not any("<" in ln and _PARAM_TOKEN_RE.search(ln) for ln in b.data):
                 continue
             mat = self._card_material.get(id(b)) if b.keyword in MATERIAL_OPTION_CARDS else None
@@ -15860,12 +15954,14 @@ class Converter:
         frd3d = any(c.startswith(CCX_FRD_3D_TRIGGER) for c in types.values())
         solid_nodes: set = set()
         flat_nodes: set = set()
+        solid = {t for t, c in types.items() if c.startswith(CCX_SOLID_PREFIXES)}
+        expanded = {t for t, c in types.items() if c.startswith(CCX_EXPANDED_PREFIXES)}
         for e, (typ, conn) in self.geom.elements.items():
             if e in self._qmem:
                 solid_nodes.update(self._qmem[e][1])    # the membrane's nodes are in no element
-            elif e in self._u1 or types[typ].startswith(CCX_SOLID_PREFIXES):
+            elif e in self._u1 or typ in solid:
                 solid_nodes.update(conn)            # (ccx writes U1's own nodes to the .frd)
-            elif types[typ].startswith(CCX_EXPANDED_PREFIXES):
+            elif typ in expanded:
                 flat_nodes.update(conn)
         self._out_yields = self._yielding_materials(blocks)
         pairs = [b for b in blocks if b.keyword == "CONTACT PAIR" and not b.has("TIED") and
@@ -19239,10 +19335,13 @@ class Converter:
         if not self._mechanical:
             return
         at: Dict[int, List[Tuple[int, str]]] = {}
+        kinds: Dict[str, Optional[str]] = {}        # type -> its kind (but U1)
         for e, (typ, conn) in self.geom.elements.items():
-            cc = ccx_type(typ)
-            kind = "u1" if e in self._u1 else "truss" if cc.startswith(("T2D", "T3D")) else \
-                "beam" if cc in BEAM_TYPES else "shell" if cc in SHELL_TYPES else None
+            if typ not in kinds:
+                cc = ccx_type(typ)
+                kinds[typ] = "truss" if cc.startswith(("T2D", "T3D")) else \
+                    "beam" if cc in BEAM_TYPES else "shell" if cc in SHELL_TYPES else None
+            kind = "u1" if e in self._u1 else kinds[typ]
             for n in conn if kind else ():
                 at.setdefault(n, []).append((e, kind))
         cut = {c["node"] for c in self._pt_cuts.values() if c["beam"] and c["elem"] not in self._u1}
@@ -19991,6 +20090,7 @@ class Converter:
         tensor = typ in ("STRESS", "PLASTIC STRAIN")
         unrotated: Dict[Tuple[str, str], int] = {}
         general = 0
+        ctypes: Dict[str, str] = {}
         for f in records:
             tok, vals = f[0], [x or "0." for x in f[1:]]
             # a split continuum shell's label names all its ply solids, as its element sets do
@@ -20006,7 +20106,10 @@ class Converter:
                 v = None
             for eid in eids:
                 info = self.geom.elements.get(eid)
-                ctype = ccx_element_type(info[0], self.report) if info else ""
+                # (per type: a later call only repeats the once-only notes of the first)
+                if info and info[0] not in ctypes:
+                    ctypes[info[0]] = ccx_element_type(info[0], self.report)
+                ctype = ctypes[info[0]] if info else ""
                 n = ELEMENT_IP_COUNT.get(ctype)
                 if not n:
                     skipped += 1
@@ -21006,15 +21109,15 @@ class Converter:
             return field[:len(field) - len(field.lstrip())] + done[-1][2]
 
         for i, ln in enumerate(out):
-            if ln.startswith("**"):
-                continue
-            if ln.startswith("*"):
+            if ln[:1] == "*":
+                if ln.startswith("**"):
+                    continue
                 kw = "*" + ln[1:].split(",")[0].strip().upper()
                 if LONG_FIELD.search(ln):
                     head, *params = ln.split(",")
                     out[i] = ",".join([head] + [p.split("=", 1)[0] + "=" + short(p.split("=", 1)[1])
                                                 if "=" in p else p for p in params])
-            elif kw != "*HEADING" and LONG_FIELD.search(ln):
+            elif kw != "*HEADING" and len(ln) > 20 and LONG_FIELD.search(ln):
                 out[i] = ",".join(short(f) for f in ln.split(","))
         if done:
             self.report.note(f"{len(done)} number(s) longer than the 20 characters a ccx 2.23 field "
@@ -21135,8 +21238,8 @@ class Converter:
         Elements that also carry rebar layers (stiffness), or mass (*SURFACE SECTION,
         DENSITY=) in a deck where mass acts, stay in the mesh — ccx then stops on them — unless
         --approximate drops them anyway."""
-        found = OrderedDict((e, v) for e, v in self.geom.elements.items()
-                            if v[0].upper() in SURFACE_ELEMENTS)
+        want = self._types_where(lambda t: t.upper() in SURFACE_ELEMENTS)
+        found = OrderedDict((e, v) for e, v in self.geom.elements.items() if v[0] in want)
         if not found:
             return
         kinds = ", ".join(sorted({v[0].upper() for v in found.values()}))
@@ -21225,8 +21328,9 @@ class Converter:
         surface of revolution and a FILLET RADIUS make flat facets an approximation, done
         only under --approximate ([APPROX], ANALYTIC_FACET_DEG per facet).  The *RIGID BODY
         cards of all of these become TIE NSET bodies of every node involved."""
+        want = self._types_where(lambda t: t.upper() in RIGID_ELEMENTS)
         rigid = OrderedDict((e, (t.upper(), list(c))) for e, (t, c) in self.geom.elements.items()
-                            if t.upper() in RIGID_ELEMENTS)
+                            if t in want)
         analytic = [b for b in blocks if b.keyword == "SURFACE" and
                     b.uparam("TYPE") in ANALYTIC_SURFACES]
         if not rigid and not analytic:
@@ -21821,22 +21925,27 @@ class Converter:
                 nw = max(1, min(cap, 2000, math.ceil((hi - lo) / h - 1e-9) if h else 1))
                 at = lambda i, j: vadd(origin, vadd(vadd(vscale(e1, pts[i][0]), vscale(e2, pts[i][1])),  # noqa: E731
                                                     vscale(e3, lo + (hi - lo) * j / nw)))
+
+                def corner(i: int, j: int) -> int:      # (the point worked out for a new node only)
+                    return grid[(i, j)] if (i, j) in grid else node_at((i, j), at(i, j))
                 for i in range(len(pts) - 1):
                     sv = (pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
                     if sv == (0.0, 0.0):
                         continue
                     want = vadd(vscale(e1, -sv[1]), vscale(e2, sv[0]))      # n = e3 x s
                     for j in range(nw):
-                        quads.append(([node_at((i, j), at(i, j)), node_at((i + 1, j), at(i + 1, j)),
-                                       node_at((i + 1, j + 1), at(i + 1, j + 1)),
-                                       node_at((i, j + 1), at(i, j + 1))], want))
+                        quads.append(([corner(i, j), corner(i + 1, j), corner(i + 1, j + 1),
+                                       corner(i, j + 1)], want))
             else:
                 tol = 1e-12 * max(1.0, max(abs(x) for q in pts for x in q))
 
                 def rev(i: int, k: int) -> int:
                     r, z = pts[i]
                     if abs(r) <= tol:
-                        return node_at((i, -1), vadd(origin, vscale(e3, z)))
+                        return grid[(i, -1)] if (i, -1) in grid else \
+                            node_at((i, -1), vadd(origin, vscale(e3, z)))
+                    if (i, k % nc) in grid:             # (the point worked out for a new node only)
+                        return grid[(i, k % nc)]
                     ph = 2.0 * math.pi * (k % nc) / nc
                     return node_at((i, k % nc), vadd(origin, vadd(vscale(e3, z), vadd(
                         vscale(e1, r * math.cos(ph)), vscale(e2, r * math.sin(ph))))))
@@ -22309,8 +22418,9 @@ class Converter:
         would take a whole-circumference inertia is not established — so its ROTARYI is
         dropped where inertia does nothing (no dynamic or frequency step), else only under
         --approximate."""
+        want = self._types_where(lambda t: t.upper() == "ROTARYI")
         rot_elems = OrderedDict((e, c[0]) for e, (t, c) in self.geom.elements.items()
-                                if t.upper() == "ROTARYI" and c)
+                                if t in want and c)
         if not rot_elems:
             return
         mass_at: Dict[int, float] = {}
@@ -25456,7 +25566,8 @@ class Converter:
         physics).  An element without a membrane section, a thickness or a normal stays as
         it is, warned."""
         els = self.geom.elements
-        mem = {e for e, (typ, _c) in els.items() if typ.upper().startswith("M3D")}
+        want = self._types_where(lambda t: t.upper().startswith("M3D"))
+        mem = {e for e, (typ, _c) in els.items() if typ in want}
         if not mem:
             return
         self._mem_mass_acts = self.steps.mass_acts
@@ -26232,23 +26343,30 @@ class Converter:
         self._beam_nodes = set()
         self._pore_nodes = set()
         self._rot_nodes = set()             # (made again by _plan_rigid_couplings, knot beams too)
+        kinds: Dict[str, Tuple[bool, bool, bool, bool, bool, bool]] = {}    # (per type, below)
         for typ, conn in self.geom.elements.values():
             if typ not in emitted:
-                emitted[typ] = ccx_type(typ)
+                emitted[typ] = cc = ccx_type(typ)
                 pore[typ] = "P" in split_suffixes(typ)[1]
-            cc = emitted[typ]
-            is_plane = cc.startswith(PLANE_ELEM_PREFIXES)
-            translational = is_plane or cc.startswith(("T2D", "T3D"))
-            for n in conn:
-                plane[n] = plane.get(n, True) and is_plane
-                no_rot[n] = no_rot.get(n, True) and translational
-            if cc in SHELL_TYPES:
+                is_plane = cc.startswith(PLANE_ELEM_PREFIXES)
+                translational = is_plane or cc.startswith(("T2D", "T3D"))
+                kinds[typ] = (is_plane, translational, cc in SHELL_TYPES, cc in BEAM_TYPES,
+                              cc in SHELL_TYPES or (cc in BEAM_TYPES and not translational), pore[typ])
+            is_plane, translational, shell, beam, rotating, porous = kinds[typ]
+            # (a node is plane while all its elements are: the order the nodes come in kept)
+            for flags, yes in ((plane, is_plane), (no_rot, translational)):
+                if yes:
+                    for n in conn:
+                        flags.setdefault(n, True)
+                else:
+                    flags.update(dict.fromkeys(conn, False))
+            if shell:
                 self._shell_nodes.update(conn)
-            elif cc in BEAM_TYPES:
+            elif beam:
                 self._beam_nodes.update(conn)
-            if cc in SHELL_TYPES or (cc in BEAM_TYPES and not translational):
+            if rotating:
                 self._rot_nodes.update(conn)
-            if pore[typ]:
+            if porous:
                 self._pore_nodes.update(conn)
         # the reference node of a surface-based fluid cavity carries the cavity pressure on
         # its DOF 8; ccx has no fluid cavity (the card is commented out)
@@ -26499,7 +26617,8 @@ class Converter:
             self.geom.elsets.setdefault(ALL_ELEMENTS_SET, list(self.geom.elements))
         self._point_temps = set()
         for b in blocks:
-            recs = [[x.strip() for x in r] for r in merged_data_records(b)]
+            recs = [[x.strip() for x in r] for r in merged_data_records(b)] if b.keyword in (
+                "SOLID SECTION", "BEAM SECTION", "BEAM GENERAL SECTION", "CLOAD") else []
             if (b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION") and
                     (b.uparam("TEMPERATURE") or "GRADIENT") != "GRADIENT") or \
                     (b.keyword == "BEAM SECTION" and b.uparam("TEMPERATURE") == "VALUES"):
@@ -26688,14 +26807,19 @@ class Converter:
         kinds: Dict[str, str] = {}
         self._expanded = set()                 # nodes of elements ccx expands to 3-D
         rotn: set = set()                      # shell/beam nodes: rotations of their own
+        flags: Dict[str, Tuple[bool, bool]] = {}    # type -> (ccx expands it, has rotations)
         for e, (typ, conn) in self.geom.elements.items():
             if typ not in kinds:
                 kinds[typ] = ccx_type(typ)
-            cc = kinds[typ]
-            if e not in self._qmem and (cc in SHELL_TYPES or cc in BEAM_TYPES or
-                                        cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES)):
+            if typ not in flags:
+                cc = kinds[typ]
+                flags[typ] = (cc in SHELL_TYPES or cc in BEAM_TYPES or
+                              cc.startswith(("M3D",) + PLANE_ELEM_PREFIXES),
+                              cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))))
+            expanded, rotating = flags[typ]
+            if e not in self._qmem and expanded:
                 self._expanded.update(conn)
-            if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
+            if rotating:
                 rotn.update(conn)
         self._mpc_refused = {}
         parent: "OrderedDict[int, int]" = OrderedDict()     # BEAM: dependent -> independent
@@ -27238,8 +27362,9 @@ class Converter:
         is any coupling whose every line becomes them: ccx would turn its RIGID MPCs with the
         finite rotation (_rigid_body_lines).  Returns the last node id."""
         structural = set(self._shell_nodes) | set(self._beam_nodes)
-        for e, (typ, conn) in self.geom.elements.items():
-            if e not in self._qmem and ccx_type(typ).startswith("M3D"):
+        m3d = {t for t in {t for t, _c in self.geom.elements.values()} if ccx_type(t).startswith("M3D")}
+        for e, (typ, conn) in self.geom.elements.items() if m3d else ():
+            if typ in m3d and e not in self._qmem:
                 structural.update(conn)
         dynamic = self._dynamic_deck
         self._kin_eq_refs = self._oriented_stops(blocks)
@@ -28172,11 +28297,15 @@ class Converter:
         follows the reference node's own rotation."""
         self._rot_nodes = set()
         structural = self._shell_nodes | self._beam_nodes      # + membranes (no rotations)
+        kinds: Dict[str, int] = {}      # type -> 1 with rotations, 2 a membrane, 0 neither
         for e, (typ, conn) in self.geom.elements.items():
-            cc = ccx_type(typ)
-            if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(("T2D", "T3D"))):
+            if typ not in kinds:
+                cc = ccx_type(typ)
+                kinds[typ] = 1 if cc in SHELL_TYPES or (cc in BEAM_TYPES and not cc.startswith(
+                    ("T2D", "T3D"))) else 2 if cc.startswith("M3D") else 0
+            if kinds[typ] == 1:
                 self._rot_nodes.update(conn)
-            elif cc.startswith("M3D") and e not in self._qmem:      # (solids: plain nodes)
+            elif kinds[typ] == 2 and e not in self._qmem:           # (solids: plain nodes)
                 structural.update(conn)
         self._coupling_plan = {}
         knots: List[int] = []
@@ -28559,9 +28688,15 @@ class Converter:
         # (node, dof) -> its BC is implied in every step one governs it; and its constraint
         verdict: "OrderedDict[Tuple[int, int], bool]" = OrderedDict()
         owner: Dict[Tuple[int, int], dict] = {}
+        in_force = set().union(*states)         # the (node, DOF)s some step keeps a BC on
+        bc_nodes = {m for m, _ in in_force}
         for c in cons:
             for m, ds in list(c["trans"].items()) + list(c["rots"].items()):
+                if m not in bc_nodes:
+                    continue
                 for d in sorted(ds):
+                    if (m, d) not in in_force:
+                        continue
                     steps = [s for s, st in enumerate(states) if (m, d) in st]
                     if steps:                   # a BC no step keeps in force cannot clash
                         ok = all(self._bc_implied(c, m, d, s) for s in steps)
@@ -28713,19 +28848,23 @@ class Converter:
                 for ns, ds in lines:
                     oriented = frame is not None and not rb and not self._kin_all_translations(ns, ds)
                     written = {d for d in ds if d <= top}
+                    # (the same for every node of the line; the eliminated ones worked out once)
+                    t_add = {1, 2, 3} if rb else set() if oriented else written
+                    a_add, r_add = ds & {1, 2, 3}, ds & {4, 5, 6}
+                    e_add: Optional[set] = None
                     for n in ns:
                         if n not in members:
                             continue
                         if oriented:
-                            along.setdefault(n, set()).update(ds & {1, 2, 3})
-                        trans.setdefault(n, set()).update({1, 2, 3} if rb else set() if oriented
-                                                          else written)
-                        elim.setdefault(n, set()).update(
-                            {1, 2, 3} if rb else self._ccx_coupled_translations(frame, written)
-                            if oriented else written)
+                            along.setdefault(n, set()).update(a_add)
+                        trans.setdefault(n, set()).update(t_add)
+                        if e_add is None:
+                            e_add = {1, 2, 3} if rb else self._ccx_coupled_translations(frame, written) \
+                                if oriented else written
+                        elim.setdefault(n, set()).update(e_add)
                         if tie_ok and n in self._knots and n in self._rot_nodes and \
                                 n not in self._transformed:
-                            rots.setdefault(n, set()).update(ds & {4, 5, 6})
+                            rots.setdefault(n, set()).update(r_add)
                 across: Dict[int, set] = {}
                 stops: Dict[int, set] = {}
                 for n, ds in along.items():
@@ -28795,15 +28934,19 @@ class Converter:
         where identical member BCs on DOF d hold them (_move_geometry_ok) from an unturned
         start.  c["axes"]: the body's rotation axes (2-D: z only)."""
         axes = (3,) if c["planar"] else (1, 2, 3)
-        on: "OrderedDict[int, List[int]]" = OrderedDict()
-        for m, ds in list(c["trans"].items()) + list(c["rots"].items()):
-            for d in sorted(ds):
-                on.setdefault(d, []).append(m)
+        items = list(c["trans"].items()) + list(c["rots"].items())
+        # DOF -> the members coupled on it, in order ('S' is read by DOF only)
+        on = OrderedDict((d, [m for m, ds in items if d in ds])
+                         for d in sorted(set().union(*(ds for _, ds in items))))
         c["axes"], c["steps"] = axes, []
         z0 = {k: True for k in range(1, 7)}
         for s, st in enumerate(states):
             ref = {k: self._ref_bc(c, st, k) for k in range(1, 7)}
-            members = OrderedDict((d, [m for m in ms if (m, d) in st]) for d, ms in on.items())
+            held_on: Dict[int, set] = {}            # DOF -> the nodes with a BC on it
+            for m, d in st:
+                held_on.setdefault(d, set()).add(m)
+            members = OrderedDict((d, [m for m in ms if m in held_on[d]] if d in held_on else [])
+                                  for d, ms in on.items())
             c["steps"].append(dict(st=st, ref=ref, S={d: ms for d, ms in members.items() if ms},
                                    z0=dict(z0)))
             end = {k: bool(ref[k]) and ref[k][1] == 0.0 and
@@ -28980,7 +29123,10 @@ class Converter:
         _active_dof_lines.  Returns the (node, DOF) pairs it took over; c["why"][dof] says
         why the others stay."""
         groups: "OrderedDict[int, List[int]]" = OrderedDict()
+        mine = {m for (m, _), o in owner.items() if o is c}
         for m, ds in list(c["trans"].items()) + list(c["rots"].items()):
+            if m not in mine:
+                continue
             for d in sorted(ds):
                 if owner.get((m, d)) is c:     # a BC some step keeps in force (_plan_coupled_bcs)
                     groups.setdefault(d, []).append(m)
@@ -29974,13 +30120,15 @@ class Converter:
                     except ValueError:
                         v = None
                     z = v == 0.0
+                    span, va = range(min(d1, d2), max(d1, d2) + 1), (v, amp)
                     for n in nodes_of(f[0]):
-                        for d in range(min(d1, d2), max(d1, d2) + 1):
-                            spc.add((n, d))
-                            entries.append(((n, d), z))
-                            values.append(((n, d), (v, amp)))
-                            bc_first.setdefault((n, d), ci)
-                            writes.setdefault((n, d), set()).add(j)
+                        for d in span:
+                            k = (n, d)
+                            spc.add(k)
+                            entries.append((k, z))
+                            values.append((k, va))
+                            bc_first.setdefault(k, ci)
+                            writes.setdefault(k, set()).add(j)
             elif kw == "TRANSFORM":
                 ns = nodes_of((params.get("NSET") or "").strip())
                 transformed.update(ns)
@@ -30691,8 +30839,9 @@ class Converter:
         material (its own plane stress, w free) is NOT this: 0.06 % off on rectangles, 3 % on
         skewed meshes.  The exact form needs small-strain linear elasticity; any other use of
         the elements keeps CPS4 / CPE4 and counts as reduced physics (_slab_obstacle)."""
+        want = self._types_where(lambda t: t.upper() in SLAB_TYPES)
         cand = OrderedDict((e, SLAB_TYPES[t.upper()]) for e, (t, _c) in self.geom.elements.items()
-                           if t.upper() in SLAB_TYPES)
+                           if t in want)
         if not cand:
             return
         kinds = ", ".join(sorted({self.geom.elements[e][0].upper() for e in cand}))
@@ -30868,13 +31017,16 @@ class Converter:
         self._planar_elems = {}
         others: set = set()
         skins = set(self.geom.elsets.get(RIGID_SET, []))   # rigid elements' skins (_plan_rigid)
+        kinds: Dict[str, Tuple[Optional[str], bool]] = {}   # type -> (planar type, a companion)
         for eid, (typ, _conn) in self.geom.elements.items():
             if eid in skins:
                 continue
-            base = planar_line_type(typ)
+            if typ not in kinds:
+                kinds[typ] = (planar_line_type(typ), typ.upper().startswith(PLANAR_COMPANION_PREFIXES))
+            base, companion = kinds[typ]
             if base:
                 self._planar_elems[eid] = base
-            elif not typ.upper().startswith(PLANAR_COMPANION_PREFIXES) and eid not in self._slabs:
+            elif not companion and eid not in self._slabs:
                 others.add(typ.upper())             # (a C3D8I slab is a CPS4I / CPE4I)
         self._planar_others = sorted(others)
 
@@ -32560,19 +32712,21 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     T, rot = _instance_transform(inst, report)
 
     ndata = []
+    normals = geo_conv._node_normals
     for nid, (x, y, z) in geo.nodes.items():
-        p = vadd((x, y, z), T)
+        p = (x + T[0], y + T[1], z + T[2])             # (vadd)
         if rot:
             p = rotate_about_axis(p, rot[0], rot[1], rot[2])
         gid = nid + node_off
-        ndata.append(f"{gid}, {fmt_coord(p[0])}, {fmt_coord(p[1])}, {fmt_coord(p[2])}")
-        nrm = geo_conv._node_normals.get(nid)          # a shell normal turns with the instance
+        ndata.append(node_line(gid, p[0], p[1], p[2]))
+        nrm = normals.get(nid)                          # a shell normal turns with the instance
         if nrm:
             if rot:
                 nrm = vsub(rotate_about_axis(nrm, rot[0], rot[1], rot[2]),
                            rotate_about_axis((0.0, 0.0, 0.0), rot[0], rot[1], rot[2]))
             ndata[-1] += ", " + ", ".join(_fmt_component(c) for c in nrm)
-        gmax_node = max(gmax_node, gid)
+        if gid > gmax_node:
+            gmax_node = gid
     out.append(mkblock("NODE", [("NSET", namer(inst["name"]))], ndata))
 
     by_type: "OrderedDict[str, List[Tuple[int, List[int]]]]" = OrderedDict()
@@ -32582,8 +32736,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         edata = []
         for eid, conn in items:
             gid = eid + elem_off
-            edata.extend(reflow([str(gid)] + [str(c + node_off) for c in conn], MAX_ENTRIES_PER_LINE))
-            gmax_elem = max(gmax_elem, gid)
+            if len(conn) < MAX_ENTRIES_PER_LINE:            # (reflow: one line)
+                edata.append(", ".join([str(gid)] + [str(c + node_off) for c in conn]))
+            else:
+                edata.extend(reflow([str(gid)] + [str(c + node_off) for c in conn], MAX_ENTRIES_PER_LINE))
+            if gid > gmax_elem:
+                gmax_elem = gid
         out.append(mkblock("ELEMENT", [("TYPE", typ), ("ELSET", namer(inst["name"], "ALL"))], edata))
     conns: "OrderedDict[str, List[str]]" = OrderedDict()      # part-level connector elements
     for eid, (typ, a, c) in geo_conv._conn.items():
@@ -32885,7 +33043,9 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
             continue
         rewritten, changed = [], False
         for line in blk.data:
-            fields = [_resolve_field(p.strip(), maps, entity, namer) for p in line.split(",")]
+            fields = list(map(str.strip, line.split(",")))
+            if "." in line:                     # (a field without a dot stays as it is)
+                fields = [_resolve_field(p, maps, entity, namer) for p in fields]
             joined = ", ".join(fields)
             changed = changed or joined != line
             rewritten.append(joined)
