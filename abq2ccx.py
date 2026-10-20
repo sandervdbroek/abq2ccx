@@ -18377,8 +18377,8 @@ class Converter:
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc
         out.extend(self.emit_other(blocks))
         deck = self._settle_dependents(EmittedDeck(out, mesh))
-        out = self._restore_base_states(deck.render())
-        out = self._buckle_displacements(out)   # after the BCs the restore gives back
+        deck = self._restore_base_states(deck)
+        out = self._buckle_displacements(deck.render())   # after the BCs the restore gives back
         out = self._modal_own_loads(out)        # after the loads the restore gives back
         out = self._clear_body_forces(out)      # after every pass that writes *DLOAD, OP=NEW
         out = self._keep_body_loads(out)        # after the restore, which gives body loads too
@@ -20165,7 +20165,7 @@ class Converter:
             res.append(raw)
         return res
 
-    def _restore_base_states(self, out: List[str]) -> List[str]:
+    def _restore_base_states(self, deck: EmittedDeck) -> EmittedDeck:
         """Start each general step after Abaqus linear perturbation steps (_plan_base_restore)
         from the base state: the loads, BCs and temperatures in force at the end of the last
         general step.  Abaqus continues from that state (a static perturbation step, a general
@@ -20188,70 +20188,49 @@ class Converter:
         step (``_sp_add``) has its own lines on what the base state loads given as the sum of
         the two (``added``)."""
         if not self._restore_from and not self._sp_add and not self._sp_temps:
-            return out
-        # the emitted cards: (card, step (0: model data, -1: between steps), its last line)
-        cards: List[list] = []
-        keep = set(self._RESTORED) | {"NSET", "ELSET", "AMPLITUDE", "SURFACE", "INITIAL CONDITIONS"} | \
-            PROC_KW
-        rows: Dict[int, List[int]] = {}             # id(card) -> the lines of its data
-        generated: set = set()                      # the converted loads' nodal-force *CLOADs
-        step, in_step, gen = 0, False, False
-        for i, raw in enumerate(out):
-            s = raw.strip()
-            gen = gen or s.startswith(self._NODAL_FORCES)
-            if not s or s.startswith("**"):
-                continue
-            if s.startswith("*"):
-                kw, params = parse_keyword_line(s)
-                if kw == "STEP":
-                    step, in_step = step + 1, True
-                cards.append([Block(kw, params), step if in_step else (0 if not step else -1), i])
-                gen = gen and kw == "CLOAD"
-                if gen:
-                    generated.add(id(cards[-1][0]))
-                if kw == "END STEP":
-                    in_step = False
-            elif cards:
-                cards[-1][2] = i
-                if cards[-1][0].keyword in keep:
-                    cards[-1][0].data.append(s)
-                    rows.setdefault(id(cards[-1][0]), []).append(i)
-        if step != self._step_idx:
+            return deck
+        # the converted loads' nodal-force *CLOADs: the run of them after the comment so saying
+        generated: set = set()
+        gen = any(t.startswith(self._NODAL_FORCES) for t in deck.notes)
+        for b in deck.cards:
+            gen = gen and b.keyword == "CLOAD"
+            if gen:
+                generated.add(id(b))
+            gen = gen or any(t.startswith(self._NODAL_FORCES) for t in b.notes)
+        if len(deck.steps) != self._step_idx:
             self.report.warn("The converted deck's steps do not match the deck's: the base state is "
                              "not given again after its linear perturbation steps, whose loads and "
                              "BC changes ccx carries on.", once=True)
             self._reduces("loads / BCs of linear perturbation steps carried on")
-            return out
-        recs: Dict[int, List[List[str]]] = {}       # id(card) -> its data records
+            return deck
         sets: Dict[Tuple[str, str], List[Block]] = {}
         surfs: Dict[str, Block] = {}
         amps: Dict[str, Optional[AmplitudeCurve]] = {}
         period: Dict[int, Optional[float]] = {}
         procs: Dict[int, str] = {}
         heads: Dict[int, Block] = {}                # each step's *STEP card
-        by_step: Dict[int, List[Block]] = {}
-        anchor: Dict[int, int] = {}                 # step -> the line its restore follows
-        steps: Dict[int, int] = {}                  # id(card) -> its step
-        for b, s, last in cards:
-            kw = b.keyword
-            recs[id(b)], steps[id(b)] = merged_data_records(b), s
+        by_step: Dict[int, List[EmittedCard]] = {}  # step (0: model data) -> its _RESTORED cards
+        anchor: Dict[int, EmittedCard] = {}         # step -> the card its restore follows
+        for b in deck.cards:
+            kw, s = b.keyword, b.step
             if kw in ("NSET", "ELSET"):
                 sets.setdefault((kw, b.uparam(kw)), []).append(b)
             elif kw == "SURFACE" and (b.uparam("TYPE") or "ELEMENT") == "ELEMENT":
                 surfs[b.uparam("NAME")] = b
             elif kw == "AMPLITUDE" and b.param("NAME"):
                 amps[b.uparam("NAME")] = amplitude_curve(b)
-            elif kw == "STEP":
-                anchor[s], heads[s] = last, b
-            elif kw in PROC_KW and s > 0 and s not in procs:
-                procs[s], anchor[s] = kw, last
-                rec = (recs[id(b)] or [[]])[0]
+            if kw in self._RESTORED and s >= 0:
+                by_step.setdefault(s, []).append(b)
+        for st in deck.steps:
+            s = st.number
+            heads[s], anchor[s] = st.head, st.proc or st.head
+            if st.proc is not None:
+                procs[s] = st.proc.keyword
+                rec = (st.proc.records() or [[]])[0]
                 try:
                     period[s] = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
                 except ValueError:
                     period[s] = None
-            if kw in self._RESTORED and s >= 0:
-                by_step.setdefault(s, []).append(b)
         memo: Dict[Tuple[str, str], Optional[List[int]]] = {}
 
         def members(kind: str, token: str) -> Optional[List[int]]:
@@ -20267,7 +20246,7 @@ class Converter:
         def set_ids(kind: str, defs: List[Block]) -> Optional[List[int]]:
             ids: List[int] = []
             for b in defs:
-                for rec in recs[id(b)]:
+                for rec in b.records():
                     f = [x for x in rec if x]
                     if b.has("GENERATE"):
                         try:
@@ -20285,9 +20264,9 @@ class Converter:
         def faces(token: str) -> Optional[List[Tuple[int, str]]]:
             """The (element, face) pairs of an element-face *SURFACE (None: not one)."""
             b = surfs.get(token.upper())
-            if b is None or any(len(rec) < 2 for rec in recs[id(b)]):
+            if b is None or any(len(rec) < 2 for rec in b.records()):
                 return None
-            pairs = [(members("ELSET", rec[0]), rec[1].upper()) for rec in recs[id(b)]]
+            pairs = [(members("ELSET", rec[0]), rec[1].upper()) for rec in b.records()]
             return None if any(es is None for es, _ in pairs) else [(e, f) for es, f in pairs for e in es]
 
         def direction(label: str, fields: List[str]) -> tuple:
@@ -20330,7 +20309,7 @@ class Converter:
             ``s``: its end value on the constant amplitude, or as it is on a TIME=TOTAL TIME
             amplitude (and a FIXED / USER card's line, and a BC on a node with a *TRANSFORM,
             where ccx allows one amplitude per node)."""
-            kw, given_in = b.keyword, steps[id(b)]
+            kw, given_in = b.keyword, b.step
             params = [(k, v) for k, v in b.params.items() if k not in ("OP", "AMPLITUDE", "TIME DELAY")]
             amp = b.uparam("AMPLITUDE")
             factor: Optional[float] = 1.0
@@ -20397,7 +20376,7 @@ class Converter:
                 return None
             amp = b.uparam("AMPLITUDE")
             if amp and amp != self.CCX_RAMP:
-                curve, end = amps.get(amp), period.get(steps[id(b)] or 1)
+                curve, end = amps.get(amp), period.get(b.step or 1)
                 if curve is None or curve.total or curve.absolute or end is None:
                     return None
                 try:
@@ -20437,11 +20416,9 @@ class Converter:
                 return None
             return None if ns is None else [(n, d) for n in ns for d in range(d1, d2 + 1)]
 
-        swap: Dict[int, List[str]] = {}             # a data line -> the lines written for it
         summed: List[int] = []
         held: List[int] = []                        # the steps given *BOUNDARY, FIXED
         inexact: Dict[str, List[str]] = {}          # why -> where
-        ends = {id(b): last for b, _, last in cards}    # a card -> its last line
 
         def base_temperatures(s: int) -> Tuple[Dict[int, Optional[Tuple[float, ...]]],
                                                 Optional[Tuple[float, ...]]]:
@@ -20452,7 +20429,7 @@ class Converter:
             heat transfer step solved)."""
             unknown: Tuple[Dict[int, Optional[Tuple[float, ...]]], Optional[Tuple[float, ...]]] = \
                 ({}, None)
-            ics = [b for b, k, _ in cards if k == 0 and b.keyword == "INITIAL CONDITIONS" and
+            ics = [b for b in deck.model if b.keyword == "INITIAL CONDITIONS" and
                    b.uparam("TYPE") == "TEMPERATURE"]
             if any(procs.get(k) in TEMPERATURE_DOF_PROCS or any(
                     b.keyword == "TEMPERATURE" and (b.has("FILE") or b.has("USER"))
@@ -20460,7 +20437,7 @@ class Converter:
                     any(b.has("FILE") or b.has("USER") or b.has("INPUT") for b in ics):
                 return unknown
             got: Dict[int, Optional[Tuple[float, ...]]] = {}
-            for b, rec in [(b, rec) for b in ics for rec in recs[id(b)] if rec and rec[0]] + \
+            for b, rec in [(b, rec) for b in ics for rec in b.records() if rec and rec[0]] + \
                     lines["TEMPERATURE"]:
                 ns = members("NSET", rec[0])
                 if ns is None:
@@ -20487,7 +20464,7 @@ class Converter:
                 for b, rec, ks in contrib[kw]:
                     v = end_value(b, rec)
                     for k in ks:
-                        if owner[kw].get(k) == steps[id(b)]:    # (two lines of a step add up)
+                        if owner[kw].get(k) == b.step:    # (two lines of a step add up)
                             old = base[kw].get(k, 0.0)
                             base[kw][k] = None if old is None or v is None else old + v
             for b, rec in lines["BOUNDARY"]:
@@ -20507,7 +20484,7 @@ class Converter:
             fixed: List[Tuple[int, int]] = []
             first_bc = next((b for b in mine if b.keyword == "BOUNDARY"), None)
             if deformed and first_bc is not None and first_bc.uparam("OP") == "NEW":
-                given = {k for b in mine if b.keyword == "BOUNDARY" for rec in recs[id(b)]
+                given = {k for b in mine if b.keyword == "BOUNDARY" for rec in b.records()
                          if rec and rec[0] for k in bc_keys(rec) or []}
                 if any(k not in given for k in base["BOUNDARY"]):
                     inexact.setdefault("releases DOFs the base state holds (*BOUNDARY, OP=NEW; "
@@ -20515,16 +20492,16 @@ class Converter:
                                        "them too)", []).append(str(s))
             for b in mine:
                 kw, j = b.keyword, self._VALUE_FIELD[b.keyword]
-                lines_of = rows.get(id(b), [])
+                lines_of = b.rows
                 if kw == "TEMPERATURE" and (b.has("FILE") or b.has("USER")) and \
                         (hot(rest) or any(hot(x) for x in temps.values())):
                     inexact.setdefault("changes what the base state loads by a value the "
                                        "converter cannot add to the base one (an amplitude, "
                                        "FIXED or USER on either line; ccx replaces it)",
                                        []).append(f"{s} (*TEMPERATURE)")
-                if len(lines_of) != len(recs[id(b)]):
+                if len(lines_of) != len(b.records()):
                     continue
-                for i, rec in zip(lines_of, recs[id(b)]):
+                for i, rec in zip(lines_of, b.records()):
                     if not rec or not rec[0]:
                         continue
                     ks = bc_keys(rec) if kw == "BOUNDARY" else members("NSET", rec[0]) \
@@ -20598,13 +20575,13 @@ class Converter:
                             got += [", ".join([str(n)] + r[1:]) for n in part_ks]
                         else:
                             got += [", ".join(x) for _, x in part(b, r, part_ks, "ABQ2CCX_SUM_")]
-                    swap[i] = got           # (a surface's faces on surfaces, a set's one by one)
+                    deck.swap(i, got)       # (a surface's faces on surfaces, a set's one by one)
                     fixed.extend(fix_ks)
                     if on and s not in summed:
                         summed.append(s)
             if fixed:
-                at = ends[id([b for b in mine if b.keyword == "BOUNDARY"][-1])]
-                insert.setdefault(at, []).extend(
+                deck.insert_after(
+                    [b for b in mine if b.keyword == "BOUNDARY"][-1],
                     ["** abq2ccx: held at their base-state values (zero perturbations of DOFs the "
                      "base state leaves free)", "*BOUNDARY, FIXED"] +
                     [f"{n}, {d}, {d}" for n, d in fixed])
@@ -20619,7 +20596,7 @@ class Converter:
             res: List[str] = []
             for kw in self._RESTORED:
                 mine = [b for b in own if b.keyword == kw]
-                if (mine and mine[0].uparam("OP") == "NEW") or \
+                if deck.steps[s - 1].acting(kw) is not None or \
                         (kw == "BOUNDARY" and s not in self._restore_pairs) or \
                         (kw == "TEMPERATURE" and procs.get(s) in TEMPERATURE_DOF_PROCS):
                     continue
@@ -20628,10 +20605,10 @@ class Converter:
                     continue
                 entries: List[Tuple[Block, List[str]]] = []
                 if kw in contrib:
-                    given = {k for b in mine for rec in recs[id(b)] if rec and rec[0]
+                    given = {k for b in mine for rec in b.records() if rec and rec[0]
                              for k in keys(kw, rec)}
                     for b, rec, ks in contrib[kw]:
-                        live = [k for k in ks if owner[kw].get(k) == steps[id(b)]]
+                        live = [k for k in ks if owner[kw].get(k) == b.step]
                         left = [k for k in live if k not in given]
                         if len(left) == len(ks):
                             entries.append((b, rec))
@@ -20650,7 +20627,7 @@ class Converter:
                         entries = entries[first:] if first is not None else []
                     if kw == "TEMPERATURE" and mine:
                         base = {n for b, rec in entries for n in members("NSET", rec[0]) or []}
-                        if any(n in base for b in mine for rec in recs[id(b)] if rec
+                        if any(n in base for b in mine for rec in b.records() if rec
                                for n in members("NSET", rec[0]) or []):
                             regiven.add(kw)
                     if not entries and kw not in touched:
@@ -20691,33 +20668,31 @@ class Converter:
         lines: Dict[str, List[Tuple[Block, List[str]]]] = {"BOUNDARY": [], "TEMPERATURE": []}
         contrib: Dict[str, List[Tuple[Block, List[str], List[tuple]]]] = {"CLOAD": [], "DLOAD": []}
         owner: Dict[str, Dict[tuple, int]] = {"CLOAD": {}, "DLOAD": {}}
-        insert: Dict[int, List[str]] = {}
         done: List[int] = []
-        for s in range(step + 1):
+        for s in range(len(deck.steps) + 1):
             if s in self._restore_from and s in anchor:
                 got = restore(s)
                 if got:
                     last = self._restore_from[s]
-                    insert[anchor[s]] = [f"** abq2ccx: the loads, BCs and temperatures "
-                                         f"{'of step %d' % last if last else 'before the first step'} "
-                                         f"given again (linear perturbation step(s) "
-                                         f"{', '.join(map(str, range(last + 1, s)))} in between)"] + got
+                    deck.insert_after(anchor[s], [
+                        f"** abq2ccx: the loads, BCs and temperatures "
+                        f"{'of step %d' % last if last else 'before the first step'} "
+                        f"given again (linear perturbation step(s) "
+                        f"{', '.join(map(str, range(last + 1, s)))} in between)"] + got)
                     done.append(s)
             if s in self._sp_add or s in self._sp_temps:
                 added(s)
             if s in self._pert_idx:                 # (a static perturbation step: given it above)
                 continue
-            first: set = set()
+            st = deck.steps[s - 1] if s else None   # (model data: no state to remove yet)
             for b in by_step.get(s, []):
                 kw = b.keyword
-                if kw not in first:
-                    first.add(kw)
-                    if b.uparam("OP") == "NEW":     # ccx: OP on a step's first card only
-                        if kw in lines:
-                            lines[kw] = []
-                        else:
-                            contrib[kw], owner[kw] = [], {}
-                for rec in recs[id(b)]:
+                if st is not None and b is st.acting(kw):
+                    if kw in lines:
+                        lines[kw] = []
+                    else:
+                        contrib[kw], owner[kw] = [], {}
+                for rec in b.records():
                     if not rec or not rec[0]:
                         continue
                     if kw in lines:
@@ -20728,7 +20703,7 @@ class Converter:
                         for k in ks:
                             owner[kw][k] = s
             for kw in contrib:                      # forget what later steps replaced
-                contrib[kw] = [e for e in contrib[kw] if any(owner[kw].get(k) == steps[id(e[0])]
+                contrib[kw] = [e for e in contrib[kw] if any(owner[kw].get(k) == e[0].step
                                                              for k in e[2])]
         for why, where in inexact.items():
             self.report.warn(f"Static perturbation step{'s' if len(where) > 1 else ''} "
@@ -20749,8 +20724,8 @@ class Converter:
                              f"free holds it at its base-state value in Abaqus, so it is written as "
                              f"*BOUNDARY, FIXED, which ccx 2.23 holds at the value of the step before: "
                              f"the base state's (probed).", once=True)
-        if not insert and not swap:
-            return out
+        if not deck.changed:
+            return deck
         at_once = f", in force at once (amplitude {hold})" if used_hold[0] else ""
         general = [s for s in done if s not in self._pert_idx]
         if general:
@@ -20773,17 +20748,14 @@ class Converter:
                              f"steps). The loads, boundary conditions and temperatures of the base "
                              f"state are given again at the start of "
                              f"{'those steps' if len(static) > 1 else 'it'}{at_once}.", once=True)
-        res: List[str] = []
-        for i, raw in enumerate(out):
-            res.extend(swap.get(i, [raw]))
-            res.extend(insert.get(i, []))
         if used_hold[0] or model_cards:
-            k = next(j for j, raw in enumerate(res) if raw.strip().upper().startswith("*STEP")
-                     and parse_keyword_line(raw.strip())[0] == "STEP")
-            res[k:k] = ["** abq2ccx: for the state given again after linear perturbation steps"] + \
+            head = next(st.head for st in deck.steps
+                        if deck.lines[st.head.line].strip().upper().startswith("*STEP"))
+            deck.insert_before(head, [
+                "** abq2ccx: for the state given again after linear perturbation steps"] +
                 ([f"*AMPLITUDE, NAME={hold}"] + amplitude_lines([(0.0, 1.0), (1.0, 1.0)])
-                 if used_hold[0] else []) + model_cards
-        return res
+                 if used_hold[0] else []) + model_cards)
+        return deck.edited()
 
     def _buckle_displacements(self, out: List[str]) -> List[str]:
         """ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for its prescribed
