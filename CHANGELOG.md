@@ -6,6 +6,19 @@ physics.
 
 ## Unreleased
 
+* **`*SHELL SECTION, DENSITY=` on conventional shells** — the mass per unit area was dropped
+  with a note, so the modes came out up to 1.9× too high. Where mass acts, each material (each
+  ply material of a composite) now gets a copy with DENSITY / t more, t the section's
+  thickness, as continuum shells and membranes already did. The copy gives the added mass
+  some rotary inertia, which Abaqus' section mass lacks (noted; small for thin shells). A
+  varying thickness drops it with a warning. Copy names are cut to ccx's 80 characters.
+* **Materials that neither conduct nor store heat in thermal steps** — ccx 2.23 gives every
+  element temperature DOFs there. It stopped with no message (exit 255, a singular matrix) on
+  a beam whose material had no `*CONDUCTIVITY` in a steady-state step, or also `*DENSITY 0` in
+  a transient one. Where `*DENSITY` or `*SPECIFIC HEAT` is missing, it takes the value of the
+  element it assembled before (probed). Such section materials, and the one made for a
+  `*BEAM GENERAL SECTION`, now get `*CONDUCTIVITY 1e-30` (and `*SPECIFIC HEAT 0` where they have
+  none): they carry and store no heat, as Abaqus' elements without temperature DOFs.
 * **`*NGEN` arcs and skipped lines; GENERATE lines by position** — when a `LINE=C` arc's end
   nodes lie at unequal distances from its centre, Abaqus moves them radially onto one circle.
   Both now move onto their mean distance, with a warning (Abaqus' documentation does not give

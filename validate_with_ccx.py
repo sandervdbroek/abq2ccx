@@ -3641,6 +3641,56 @@ def coupled_made_mass_deck(kind, twin=False):
     return "\n".join(lines) + "\n"
 
 
+def shell_mass_deck(kind, proc="grav", twin=False):
+    """A 2 x 1 plate of conventional shells 0.1 thick (4 x 2 elements), clamped at x = 0:
+    ``kind`` "s4" (S4, *SHELL SECTION, MATERIAL=A, density 2) or "composite" (S4R, which the
+    converter writes as S8R, plies of A and B (density 4) 0.05 thick each, 0 / 90 degrees);
+    the section DENSITY=0.5, a mass per unit area added to the materials'.  ``proc`` "grav":
+    *STATIC under GRAV 1 in -z, the reactions' total and the tip (node 10) printed; "freq":
+    *FREQUENCY, 3 modes.  ``twin``: no DENSITY=, the materials' densities 0.5 / 0.1 more."""
+    nx, ny, t = 4, 2, 0.1
+    nid = lambda i, j: 1 + i + (nx + 1) * j                                   # noqa: E731
+    lines = ["*Heading", f"A {kind} plate of conventional shells with a section mass", "*Node"]
+    lines += [f"{nid(i, j)}, {2.0 * i / nx:.12g}, {1.0 * j / ny:.12g}, 0." for j in range(ny + 1) for i in range(nx + 1)]
+    lines.append(f"*Element, type={'S4' if kind == 's4' else 'S4R'}, elset=PLATE")
+    lines += [f"{1 + i + nx * j}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+              for j in range(ny) for i in range(nx)]
+    lines += ["*Nset, nset=LEFT"] + _ids([nid(0, j) for j in range(ny + 1)])
+    lines += ["*Nset, nset=TIP", str(nid(nx, ny // 2))]
+    add = 0.5 / t if twin else 0.0
+    lines += ["*Material, name=A", "*Elastic", "100000., 0.3", "*Density", f"{2.0 + add:.12g}"]
+    if kind == "composite":
+        lines += ["*Material, name=B", "*Elastic", "50000., 0.3", "*Density", f"{4.0 + add:.12g}",
+                  f"*Shell Section, elset=PLATE, composite{'' if twin else ', density=0.5'}",
+                  "0.05, 3, A, 0.", "0.05, 3, B, 90."]
+    else:
+        lines += [f"*Shell Section, elset=PLATE, material=A{'' if twin else ', density=0.5'}", f"{t:g}, 5"]
+    lines += ["*Boundary", "LEFT, 1, 6", "*Step"]
+    lines += ["*Static", "*Dload", "PLATE, GRAV, 1., 0., 0., -1.", "*Node print, nset=LEFT, totals=yes",
+              "RF", "*Node print, nset=TIP", "U"] if proc == "grav" else ["*Frequency", "3"]
+    return "\n".join(lines + ["*End Step"]) + "\n"
+
+
+def heatless_beam_deck(kind, twin=False):
+    """coupled_made_mass_deck's "bgs" deck (a C3D8T cube heated in a coupled temperature-
+    displacement step beside a B31 cantilever, its tip loaded on a ramp over 10 increments)
+    with a beam whose material neither conducts nor stores heat, on which ccx 2.23 stopped
+    (exit 255, 'matrix found to be singular' in spooles.out): ``kind`` "transient" a *BEAM
+    SECTION material with *DENSITY 0, "steady" the same with *DENSITY 0.02 in a steady-state
+    step, "general" a *BEAM GENERAL SECTION, DENSITY=0. in a transient step.  ``twin``: the
+    *BEAM SECTION material with *CONDUCTIVITY 1 and *SPECIFIC HEAT 1 (the beam shares no node
+    with the cube, so its heat goes nowhere)."""
+    text = coupled_made_mass_deck("bgs", twin=kind != "general" or twin)
+    rho = "0.02" if kind == "steady" else "0."
+    bm = "*Material, name=BM\n*Elastic\n1000., 0.25\n*Density\n"
+    text = text.replace(bm + "0.02\n", bm + rho + "\n" + ("*Conductivity\n1.\n*Specific Heat\n1.\n" if twin else ""))
+    if kind == "general" and not twin:
+        text = text.replace("density=0.02", "density=0.")
+    if kind == "steady":
+        text = text.replace("*Coupled Temperature-displacement\n", "*Coupled Temperature-displacement, steady state\n")
+    return text
+
+
 ROTATED_INSTANCES = {"I0": None, "I1": ((0., 3., 0.), (1., 3., 0.), 90.),
                      "I2": ((0., 0., 6.), (1., 2., 9.), 40.)}
 
@@ -9271,6 +9321,64 @@ def main():
                   f"TEMPERATURE-DISPLACEMENT step, {what} ramped over 10 increments): every increment "
                   f"as with {ref} ({err:.1e} of the end displacement {end:.4g} apart) and t times "
                   f"the end displacement ({lin:.1e})")
+        failures += 0 if ok else 1
+
+    # *SHELL SECTION, DENSITY= on conventional shells (it was dropped: the plates weighed 0.2 /
+    # 0.3 instead of 0.7 / 0.8 per area, their frequencies 1.9x / 1.6x too high): the reactions take the weight but the load on the
+    # clamped edge, which ccx's RF leaves out (S4: 1/8; S8R: W/24, its corners' consistent loads
+    # -1/12, its midsides' 1/3), the tip moves as the twin's with the mass in its materials,
+    # and the frequencies are the twin's
+    for kind, rho_t, share in (("s4", 0.2, 7.0 / 8.0), ("composite", 0.3, 23.0 / 24.0)):
+        tag = f"shell_area_mass_{kind}"
+        read = lambda dat: (dat_totals(dat), dat_displacements(dat))     # noqa: E731
+        res = [review_run(shell_mass_deck(kind, "grav", twin), tag + ("_ref" if twin else ""), read)
+               for twin in (False, True)]
+        ok = all(res)
+        if ok:
+            want = share * (rho_t + 0.5) * 2.0
+            (got, tip), (_ref, tip_ref) = [((r[0] or [(0.0, 0.0, 0.0)])[-1][2], r[1].get(10, [0.0] * 3)[2])
+                                          for r in res]
+            ok = abs(got / want - 1) < 1e-6 and abs(ccx_ratio(tip, tip_ref) - 1) < 1e-6 and tip < -1e-4
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({kind} plate 2 x 1 x 0.1, material mass {rho_t:g} "
+                  f"per area, section DENSITY=0.5, clamped, gravity): reactions {got:.7g} vs {share:.4g} of "
+                  f"the weight {want:.7g} ({abs(got / want - 1):.1e} apart), tip moved {tip:.6g} as with the "
+                  f"mass in the materials ({tip_ref:.6g})")
+        failures += 0 if ok else 1
+        freqs = [review_run(shell_mass_deck(kind, "freq", twin), f"{tag}_freq{'_ref' if twin else ''}",
+                            lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+                 for twin in (False, True)]
+        ok = all(f and len(f) >= 3 for f in freqs)
+        if ok:
+            err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(freqs[0][:3], freqs[1][:3]))
+            ok = err < 1e-6 and min(freqs[0][:3]) > 0.0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag}_freq (the {kind} plate, *FREQUENCY): first "
+                  f"frequencies {', '.join(f'{x:.6g}' for x in freqs[0][:3])} vs "
+                  f"{', '.join(f'{x:.6g}' for x in freqs[1][:3])} with the section mass in the "
+                  f"materials ({err:.1e} apart)")
+        failures += 0 if ok else 1
+
+    # a beam whose material neither conducts nor stores heat in a coupled temperature-
+    # displacement step: ccx 2.23 gives it temperature DOFs and stopped on a singular matrix
+    # (exit 255); with *CONDUCTIVITY 1e-30 and *SPECIFIC HEAT 0 every increment is the
+    # conducting twin's and t times the end displacement
+    for kind, what in (("transient", "a *BEAM SECTION material with *DENSITY 0"),
+                       ("steady", "a *BEAM SECTION material with *DENSITY 0.02, a steady-state step"),
+                       ("general", "a *BEAM GENERAL SECTION, DENSITY=0.")):
+        tag = f"heatless_beam_{kind}"
+        runs = [review_run(heatless_beam_deck(kind, twin), tag + ("_ref" if twin else ""),
+                           lambda dat: [v for _t, rows in dat_history(dat, "displacements", "PROBE") for v in rows])
+                for twin in (False, True)]
+        ok = all(r and len(r) == 10 for r in runs)
+        if ok:
+            end = max(abs(x) for x in runs[1][-1])
+            err = ccx_ratio(max(abs(x - y) for a, b in zip(*runs) for x, y in zip(a, b)), end)
+            lin = ccx_ratio(max(abs(x - (k + 1) / 10 * y) for k, a in enumerate(runs[0])
+                                for x, y in zip(a, runs[0][-1])), end)
+            ok = err < 1e-6 and lin < 1e-6 and end > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (C3D8T cube heated in a *COUPLED TEMPERATURE-"
+                  f"DISPLACEMENT step beside a B31 cantilever of {what}, tip load ramped over 10 "
+                  f"increments): solved, every increment as with a conducting beam material ({err:.1e} "
+                  f"of the end displacement {end:.4g} apart) and t times the end displacement ({lin:.1e})")
         failures += 0 if ok else 1
     # a part's equation, partial kinematic couplings and SPRING1 / SPRING2 in rotated instances:
     # Abaqus turns them with the instance, so each one's displacements are R u(unturned

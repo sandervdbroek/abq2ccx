@@ -14234,6 +14234,133 @@ def test_continuum_shell_section_density_becomes_material_mass():
         assert "*SHELL SECTION, DENSITY= on continuum shells (added mass per area)" in conv.reduced_physics
 
 
+SHELL_PLATE = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+*Element, type=S4, elset=PLATE
+1, 1, 2, 3, 4
+*Material, name=M
+*Elastic
+1000., 0.3
+*Density
+2.
+*Material, name=N
+*Elastic
+500., 0.2
+*Density
+1.
+"""
+SHELL_FREQ = "*Boundary\n1, 1, 6\n2, 1, 6\n*Step\n*Frequency\n3\n*End Step\n"
+
+
+def test_conventional_shell_section_density_becomes_material_mass():
+    # *SHELL SECTION, DENSITY= on conventional shells, a mass per unit area added to the
+    # materials' (it was dropped with a note): where mass acts each material gets a copy with
+    # DENSITY / t more, t the section's thickness, a composite's the sum of its plies
+    plain = "*Shell Section, elset=PLATE, material=M, density=0.5\n0.1, 5\n"
+    body, conv, rep = convert_str(SHELL_PLATE + plain + SHELL_FREQ)
+    assert "*SHELL SECTION, ELSET=PLATE, MATERIAL=M_SHELL_MASS\n0.1\n" in body
+    assert "*MATERIAL, NAME=M_SHELL_MASS\n*ELASTIC\n1000., 0.3\n*DENSITY\n7.\n" in body     # 2 + 0.5 / 0.1
+    assert "-> material M_SHELL_MASS, a copy of M" in rep.text() and "the thickness 0.1 from the section" in rep.text()
+    assert "rotary inertia Abaqus' section mass lacks" in rep.text() and not conv.reduced_physics
+    assert "DENSITY dropped" not in rep.text() and "DENSITY=" not in body
+    # a composite's ply materials, T = 0.2 (also mirrored: SYMMETRIC lists half of it)
+    plies = "*Shell Section, elset=PLATE, composite, density=0.3\n0.05, 3, M, 0.\n0.1, 3, N, 90.\n0.05, 3, M, 0.\n"
+    half = "*Shell Section, elset=PLATE, composite, symmetric, density=0.3\n0.05, 3, M, 0.\n0.05, 3, N, 90.\n"
+    for sec in (plies, half):
+        body, conv, rep = convert_str(SHELL_PLATE + sec + SHELL_FREQ)
+        assert "*MATERIAL, NAME=M_SHELL_MASS\n*ELASTIC\n1000., 0.3\n*DENSITY\n3.5\n" in body       # 2 + 0.3 / 0.2
+        assert "*MATERIAL, NAME=N_SHELL_MASS\n*ELASTIC\n500., 0.2\n*DENSITY\n2.5\n" in body
+        plylines = _card_at(body, "*SHELL SECTION, ELSET=PLATE, COMPOSITE")
+        mats = [x.split(",")[2].strip() for x in plylines]
+        assert mats in (["M_SHELL_MASS", "N_SHELL_MASS", "M_SHELL_MASS"],
+                        ["M_SHELL_MASS", "N_SHELL_MASS", "N_SHELL_MASS", "M_SHELL_MASS"]), mats
+        assert "materials M_SHELL_MASS, N_SHELL_MASS, copies of M, N" in rep.text()
+    # gravity makes mass act too, also on a *SHELL GENERAL SECTION of a material
+    grav = "*Boundary\n1, 1, 6\n2, 1, 6\n*Step\n*Static\n*Dload\nPLATE, GRAV, 10., 0., 0., -1.\n*End Step\n"
+    body, _, _ = convert_str(SHELL_PLATE + plain.replace("Shell Section", "Shell General Section") + grav)
+    assert "*SHELL SECTION, ELSET=PLATE, MATERIAL=M_SHELL_MASS\n0.1\n" in body
+    # no step or load uses mass: dropped, noted; DENSITY=0 changes nothing: dropped silently
+    body, conv, rep = convert_str(SHELL_PLATE + plain + grav.replace("PLATE, GRAV, 10., 0., 0., -1.", "3, 3, 1.")
+                                  .replace("*Dload", "*Cload"))
+    assert "SHELL_MASS" not in body and "DENSITY=" not in body and not conv.reduced_physics
+    assert "*SHELL SECTION, DENSITY= dropped: ccx has no section mass, and no step" in rep.text()
+    body, conv, rep = convert_str(SHELL_PLATE + plain.replace("0.5", "0.") + SHELL_FREQ)
+    assert "SHELL_MASS" not in body and "DENSITY" not in rep.text().replace("*DENSITY", "")
+    # a thickness that varies, or a copy that would change a heat capacity: dropped, warned
+    nodal = plain.replace("density=0.5", "density=0.5, nodal thickness") + "*Nodal Thickness\n1, 0.1\n2, 0.1\n" \
+                                                                            "3, 0.2\n4, 0.1\n"
+    heat = SHELL_PLATE.replace("*Density\n2.\n", "*Density\n2.\n*Conductivity\n1.\n*Specific Heat\n1.\n")
+    heat_step = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n1, 11, 11, 20.\n*End Step\n"
+    for deck, why in ((SHELL_PLATE + nodal + SHELL_FREQ, "its thickness varies over the shell"),
+                      (heat + plain + SHELL_FREQ + heat_step, "would change its heat capacity")):
+        body, conv, rep = convert_str(deck)
+        assert "SHELL_MASS" not in body and "DENSITY=" not in body and why in rep.text(), why
+        assert conv.reduced_physics == ["*SHELL SECTION, DENSITY= (added mass per area)"], why
+
+
+def test_section_mass_copy_names_within_ccx_limit():
+    # ccx stops on a material name over 80 characters ("material name too long", probed): the
+    # copies' names are cut there (_fresh_name), a second copy of one material marked ~1
+    long = "M" * 75
+    deck = SHELL_PLATE.replace("name=M\n", f"name={long}\n").replace("*Element, type=S4, elset=PLATE\n1, 1, 2, 3, 4",
+                                                                       "*Element, type=S4, elset=PLATE\n1, 1, 2, 3, 4\n"
+                                                                       "*Elset, elset=A\n1\n*Elset, elset=B\n1")
+    secs = (f"*Shell Section, elset=A, material={long}, density=0.5\n0.1\n"
+            f"*Shell Section, elset=B, material={long}, density=0.5\n0.2\n")
+    body, _, _ = convert_str(deck + secs + SHELL_FREQ)
+    first, second = (long + "_SHELL_MASS")[:80], (long + "_SHELL_MASS")[:78] + "~1"
+    assert f"*MATERIAL, NAME={first}\n*ELASTIC\n1000., 0.3\n*DENSITY\n7.\n" in body
+    assert f"*MATERIAL, NAME={second}\n*ELASTIC\n1000., 0.3\n*DENSITY\n4.5\n" in body
+    assert f"ELSET=A, MATERIAL={first}\n" in body and f"ELSET=B, MATERIAL={second}\n" in body
+
+
+def test_heatless_section_materials_in_thermal_decks():
+    # ccx 2.23 gives every element temperature DOFs in a thermal step and stops on a singular
+    # matrix (exit 255, no message) where a material neither conducts nor stores heat — a
+    # steady-state step, or *DENSITY 0 —, and takes another element's density or specific heat
+    # where they are missing: a section material without *CONDUCTIVITY gets 1e-30 (and a
+    # specific heat 0), as Abaqus' elements without temperature DOFs carry and store no heat
+    deck = (HEX.replace("TYPE=C3D8,", "TYPE=C3D8T,") + "*Node\n20, 3., 0., 0.\n21, 4., 0., 0.\n"
+            "*Element, type=B31, elset=BEAM\n11, 20, 21\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n"
+            "0.001\n*Conductivity\n1.\n*Specific Heat\n1.\n*Solid Section, elset=EALL, material=M\n"
+            "*Material, name=BM\n*Elastic\n1000., 0.25\n*Density\n0.\n"
+            "*Beam Section, elset=BEAM, material=BM, section=RECT\n0.1, 0.1\n0., 1., 0.\n"
+            "*Initial Conditions, type=temperature\n1, 20.\n")
+    step = ("*Step\n*Coupled Temperature-displacement, steady state\n1., 1.\n*Boundary\n1, 1, 3\n20, 1, 6\n"
+            "1, 11, 11, 100.\n*End Step\n")
+    body, conv, rep = convert_str(deck + step)
+    bm = body.split("*MATERIAL, NAME=BM\n")[1].split("*BEAM SECTION")[0]
+    assert bm == "*ELASTIC\n1000., 0.25\n*DENSITY\n0.\n*CONDUCTIVITY\n1e-30\n*SPECIFIC HEAT\n0.\n"
+    assert body.count("*CONDUCTIVITY") == 2 and "Material BM without *CONDUCTIVITY" in rep.text()
+    assert not conv.reduced_physics
+    # a specific heat of its own stays (only the conductivity is added); a material without a
+    # section, or a deck without a thermal step: nothing added
+    body, _, _ = convert_str(deck.replace("*Density\n0.\n", "*Density\n0.\n*Specific Heat\n5.\n") + step)
+    assert "*SPECIFIC HEAT\n5.\n*CONDUCTIVITY\n1e-30\n" in body and body.count("*SPECIFIC HEAT") == 2
+    body, _, rep = convert_str(deck.replace("material=BM, section", "material=M, section") + step)
+    assert body.count("*CONDUCTIVITY") == 1 and "without *CONDUCTIVITY" not in rep.text()
+    body, _, rep = convert_str(deck + step.replace("*Coupled Temperature-displacement, steady state", "*Static")
+                               .replace("1, 11, 11, 100.\n", ""))
+    assert body.count("*CONDUCTIVITY") == 1 and "without *CONDUCTIVITY" not in rep.text()
+    # the material the converter makes for a *BEAM GENERAL SECTION too
+    general = deck.replace("*Beam Section, elset=BEAM, material=BM, section=RECT\n0.1, 0.1\n0., 1., 0.\n",
+                           "*Beam General Section, elset=BEAM, section=RECT, density=0.\n0.1, 0.1\n0., 1., 0.\n"
+                           "1000., 400.\n")
+    body, _, _ = convert_str(general + step)
+    made = body.split("*MATERIAL, NAME=ABQ2CCX_RECT_MATERIAL\n")[1].split("*BEAM SECTION")[0]
+    assert made.endswith("*DENSITY\n0.\n*CONDUCTIVITY\n1e-30\n*SPECIFIC HEAT\n0.\n"), made
+    # a section mass copy carries them (a specific heat 0 changes no heat capacity)
+    shell = SHELL_PLATE + "*Shell Section, elset=PLATE, material=M, density=0.5\n0.1\n"
+    body, conv, _ = convert_str(shell + SHELL_FREQ + "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n"
+                                                     "1, 11, 11, 20.\n*End Step\n")
+    copy = body.split("*MATERIAL, NAME=M_SHELL_MASS\n")[1].split("*MATERIAL")[0]
+    assert copy == "*ELASTIC\n1000., 0.3\n*CONDUCTIVITY\n1e-30\n*SPECIFIC HEAT\n0.\n*DENSITY\n7.\n", copy
+    assert not conv.reduced_physics
+
+
 def test_mass_acts_as_two_step_model_aggregates():
     # where mass acts: its inertia in a step of INERTIA_PROCS (the masses _plan_coupled_inertia
     # scales, U1's mass matrix), its weight too under a mass-proportional *DLOAD (a section's

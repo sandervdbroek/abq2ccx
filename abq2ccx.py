@@ -868,8 +868,8 @@ MULTIWORD_PARAMS = (
     "NO THICKNESS", "NODAL THICKNESS", "NUMBER INTERVAL", "OLD SET", "OUTPUT ALL",
     "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "RAMP INITIAL STRESS",
     "REDUCED POLYNOMIAL", "REF NODE", "RELATIVE TO ABSOLUTE", "ROT NODE", "SCALE FACTOR",
-    "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHIFT NODES",
-    "SHOCK SMOOTHING", "SMALL SLIDING", "SPH FORMULATION", "SPH SMOOTHING LENGTH",
+    "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHELL THICKNESS",
+    "SHIFT NODES", "SHOCK SMOOTHING", "SMALL SLIDING", "SPH FORMULATION", "SPH SMOOTHING LENGTH",
     "SPH TENSILE INSTABILITY CONTROL", "STACK DIRECTION", "STEADY STATE", "TEST DATA INPUT",
     "THERMAL NETWORK", "TIE NSET", "TIED NSET", "TIME DELAY", "TIME INTERVAL", "TIME POINTS",
     "TIME RESET", "TOTAL FORCE", "TOTAL TIME AT START", "TWO STEP", "VAN DER WAALS",
@@ -9202,18 +9202,20 @@ class Converter:
             self._reduces("composite ply angle on a cylindrical distribution orientation dropped")
         return oname
 
-    def _fresh_name(self, base: str) -> str:
-        """A set / orientation / distribution name used nowhere else in the deck, within
-        ccx's 80-character limit, and one ccx cannot read as a number."""
+    def _fresh_name(self, base: str, taken: Optional[set] = None) -> str:
+        """A set / orientation / distribution name used nowhere else in the deck (or, given
+        ``taken``, not in it: a material's), within ccx's 80-character limit, and one ccx
+        cannot read as a number."""
+        used = self._used_names if taken is None else taken
         base = base.upper()
         if _fortran_real_like(base):
             base = "ABQ2CCX_" + base
         cand, i = base[:CCX_NAME_LIMIT], 1
-        while cand in self._used_names:
+        while cand in used:
             sfx = f"~{i}"
             cand = base[:CCX_NAME_LIMIT - len(sfx)] + sfx
             i += 1
-        self._used_names.add(cand)
+        used.add(cand)
         return cand
 
     # *SECTION CONTROLS options that Abaqus/Standard ignores (Abaqus 2017 Keywords Guide: they
@@ -9510,6 +9512,8 @@ class Converter:
             zero = b.param("ZERO")
             out += [emit_keyword("EXPANSION", OrderedDict([("ZERO", zero)]) if zero else OrderedDict()),
                     short_real(alpha, 12)]
+        if self.steps.procs & CCX_THERMAL_PROCS:     # no heat carried or stored (_plan_heatless_materials)
+            out += ["*CONDUCTIVITY", "1e-30", "*SPECIFIC HEAT", "0."]
         keep = OrderedDict([("ELSET", b.param("ELSET")), ("MATERIAL", name), ("SECTION", sec)])
         self._note_dropped_params(b, ("ELSET", "SECTION", "DENSITY", "ZERO"))
         data = [b.data[0]] + ([b.data[n1_at]] if n1_at is not None else [])
@@ -19357,6 +19361,7 @@ class Converter:
         self._warn_degenerate_elements()
         self._check_sections(blocks)            # the deck's own mesh: before any planner retypes it
         self._check_numeric_data(blocks)
+        self._plan_heatless_materials(blocks)   # before the planners that copy materials
         self._drop_surface_elements(raw, blocks)
         blocks = self._free_face_surfaces(blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
@@ -19956,6 +19961,42 @@ class Converter:
             self.report.warn("Rigid elements / analytical surfaces in a deck with a thermal step: "
                              "their ccx skins conduct no heat and store none (Abaqus' rigid "
                              "elements carry temperatures only in some cases) — verify.", once=True)
+
+    def _plan_heatless_materials(self, blocks: List[Block]) -> None:
+        """In a thermal step (CCX_THERMAL_PROCS) ccx 2.23 gives every element temperature DOFs,
+        an expanded beam's or shell's nodes too, and stops on a singular matrix (exit 255, no
+        message; 'matrix found to be singular' in spooles.out) where its nodes get neither
+        conductivity nor heat capacity: its material has no *CONDUCTIVITY, and the step is a
+        steady-state one or the material's *DENSITY is 0.  Where temperatures are defined, a
+        material without *DENSITY or *SPECIFIC HEAT takes the value of the element ccx
+        assembled before (probed on 2.23: a B31 beside a C3D8T cube, coupled steps), which
+        hides the stop or gives the elements another material's heat capacity.  Abaqus'
+        elements without temperature DOFs need no thermal properties.  So a section material
+        without *CONDUCTIVITY (not a user material, whose subroutine may conduct) gets
+        *CONDUCTIVITY 1e-30 and, without one, *SPECIFIC HEAT 0, as the rigid skins' material:
+        its elements carry and store no heat."""
+        if not self.steps.procs & CCX_THERMAL_PROCS:
+            return
+        used = {m.upper() for b in blocks if b.keyword.endswith("SECTION")
+                for _t, m, _o in self._section_layers(b, strict=True) if m}
+        names = []
+        for name, group in self._material_options(blocks).items():
+            kws = {c.keyword for c in group}
+            if name not in used or "CONDUCTIVITY" in kws or "USER MATERIAL" in kws:
+                continue
+            cards = [Block("CONDUCTIVITY", OrderedDict(), ["1e-30"])]
+            if "SPECIFIC HEAT" not in kws:
+                cards.append(Block("SPECIFIC HEAT", OrderedDict(), ["0."]))
+            at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
+            blocks[at:at] = cards
+            names.append(name)
+        if names:
+            self.report.note(f"Material{'s' if len(names) > 1 else ''} {', '.join(names)} without "
+                             f"*CONDUCTIVITY: *CONDUCTIVITY 1e-30 (and *SPECIFIC HEAT 0 where none) "
+                             f"added, so that the elements carry and store no heat. ccx gives every "
+                             f"element temperature DOFs in this deck's thermal steps and stops on a "
+                             f"singular matrix where nothing conducts or stores heat (Abaqus' elements "
+                             f"without temperature DOFs need no thermal properties).", once=True)
 
     def _rigid_set_name(self, base: str) -> str:
         i = 1
@@ -23100,14 +23141,14 @@ class Converter:
     def _mass_copy_obstacle(self, blocks: List[Block], opts: Dict[str, List[Block]], mat: str) -> str:
         """Why material ``mat`` (upper case; ``opts``: _material_options) cannot be copied with
         more *DENSITY for a section mass (_material_mass_copy), or "": it is undefined, its
-        density does not read, or the copy would change a heat capacity (a specific heat in a
-        deck with temperature steps) or a user material's name."""
+        density does not read, or the copy would change a heat capacity (a specific heat other
+        than 0 in a deck with temperature steps) or a user material's name."""
         group = opts.get(mat)
         if not group:
             return f"material {mat} is not defined"
         if any(c.keyword == "USER MATERIAL" for c in group):
             return f"material {mat} is a user material"
-        if any(c.keyword == "SPECIFIC HEAT" for c in group) and \
+        if any(c.keyword == "SPECIFIC HEAT" and not self._zero_values(c) for c in group) and \
                 any(b.keyword in CCX_THERMAL_PROCS for b in blocks):
             return f"a copy of material {mat} would change its heat capacity in the temperature steps"
         try:
@@ -23115,6 +23156,15 @@ class Converter:
         except ValueError:
             return f"the *DENSITY of material {mat} does not read as numbers"
         return ""
+
+    @staticmethod
+    def _zero_values(c: Block) -> bool:
+        """Whether every row of material card ``c`` gives 0 (its first field; the others are
+        temperatures and field variables)."""
+        try:
+            return all(pf(r[0]) == 0.0 for r in merged_data_records(c) if r and r[0].strip())
+        except ValueError:
+            return False
 
     @staticmethod
     def _density_rows(group: List[Block]) -> List[List]:
@@ -23128,16 +23178,12 @@ class Converter:
                             copies: Dict[Tuple[str, float], str]) -> str:
         """The name of a copy of material ``mat`` (upper case; not _mass_copy_obstacle) whose
         *DENSITY rows hold ``add`` more, for a section's mass per unit area that ccx has no card
-        for: {mat}_{tag}, inserted into ``blocks`` after the material, once per material and
-        value (``copies``), its name not in ``taken``."""
+        for: {mat}_{tag} (_fresh_name: cut to ccx's 80 characters, not in ``taken``), inserted
+        into ``blocks`` after the material, once per material and value (``copies``)."""
         if (mat, add) in copies:
             return copies[(mat, add)]
         group = opts[mat]
-        name, k = f"{mat}_{tag}", 1
-        while name in taken:
-            k += 1
-            name = f"{mat}_{tag}_{k}"
-        taken.add(name)
+        name = self._fresh_name(f"{mat}_{tag}", taken)
         clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
                  for c in group if c is group[0] or (c.keyword in MATERIAL_OPTION_CARDS and
                                                      c.keyword != "DENSITY")]
@@ -23160,7 +23206,8 @@ class Converter:
         of each of its materials whose *DENSITY holds DENSITY / t more (_material_mass_copy).
         The solids fill the thickness, so the mass per area, inertia and gravity load are
         Abaqus'.  Otherwise DENSITY= is dropped: warned where mass acts, else noted.  An unsplit
-        composite section is commented out whole (handle_shell_section)."""
+        composite section is commented out whole (handle_shell_section).  Conventional shells
+        (_plan_conventional_shell_density) get the same copy, t from the section."""
         acts = self.steps.mass_acts
         P = self.geom.nodes
         opts: Dict[str, List[Block]] = {}
@@ -23188,6 +23235,13 @@ class Converter:
                 continue
             plan = self._ply_sections.get(id(b))
             elset = (b.param("ELSET") or "").strip()
+            if plan is None and elset and not self._continuum_shell_elset(elset) and \
+                    (b.has("MATERIAL") or b.has("COMPOSITE")):
+                if not opts:
+                    opts = self._material_options(blocks)
+                    taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+                self._plan_conventional_shell_density(b, blocks, opts, taken, copies)
+                continue
             if plan is None and (b.has("COMPOSITE") or not b.param("MATERIAL") or not elset or
                                  not self._continuum_shell_elset(elset)):
                 continue
@@ -23243,6 +23297,78 @@ class Converter:
                              f"{', '.join(names)}, {'copies' if many else 'a copy'} of {', '.join(mats)} "
                              f"whose *DENSITY holds DENSITY / thickness more, the thickness {t:.6g} from "
                              f"the mesh (ccx runs them as solids, which have no section mass).", once=True)
+
+    def _plan_conventional_shell_density(self, b: Block, blocks: List[Block], opts: Dict[str, List[Block]],
+                                         taken: set, copies: Dict[Tuple[str, float], str]) -> None:
+        """DENSITY= of shell section ``b`` on conventional shells (_plan_shell_density): ccx
+        expands them into solids through the thickness, which have no section mass.  Where mass
+        acts, each of its materials (a composite's ply materials) gets a copy whose *DENSITY
+        holds DENSITY / t more, t the section's thickness (a composite's: its plies' sum):
+        Abaqus' mass per area, inertia and gravity load.  The copy spreads the mass through the
+        thickness, where Abaqus' section mass has no rotary inertia (Abaqus 2017 Analysis
+        guide, "Using a shell section integrated during the analysis"): D t^2 / 12 per area
+        more, which lowers a bending frequency by about 1.6 (t / wavelength)^2 times the
+        added share of the mass.  Not where the thickness varies (NODAL THICKNESS, SHELL
+        THICKNESS=) or does not read, or _mass_copy_obstacle: dropped, warned."""
+        elset = (b.param("ELSET") or "").strip()
+        dens = b.params.pop("DENSITY")
+        try:
+            rho_a: Optional[float] = pf(dens or "")
+        except ValueError:
+            rho_a = None
+        if rho_a == 0.0:
+            return
+        if not self.steps.mass_acts:
+            self.report.note("*SHELL SECTION, DENSITY= dropped: ccx has no section mass, and no step or "
+                             "load of this deck uses mass.", once=True)
+            return
+        layers = self._section_layers(b, strict=True)
+        mats = dedup([m.upper() for _t, m, _o in layers])
+        t: Optional[float] = None
+        why = ""
+        if rho_a is None:
+            why = "it does not read as a number"
+        elif b.has("NODAL THICKNESS") or b.has("SHELL THICKNESS"):
+            why = "its thickness varies over the shell (NODAL THICKNESS / SHELL THICKNESS=), and a material " \
+                  "has one density"
+        else:
+            try:
+                if b.has("COMPOSITE"):
+                    t = sum(pf(x) for x, _m, _o in layers) if layers else None
+                else:
+                    recs = merged_data_records(b)
+                    f = [x for x in recs[0] if x != ""] if recs else []
+                    t = pf(f[0]) if f else None
+            except ValueError:
+                t = None
+            if t is None or t <= 0.0:
+                why = "its thickness does not read as a positive number"
+            else:
+                why = next((w for w in (self._mass_copy_obstacle(blocks, opts, m) for m in mats) if w), "")
+        if why:
+            self.report.warn(f"*{b.keyword}, ELSET={elset}, DENSITY={dens} (a mass per unit area added to "
+                             f"the material's) dropped: {why}. ccx has no section mass, so the shells "
+                             f"lack it in this deck's dynamic or frequency steps or mass loads.", once=True)
+            self._reduces("*SHELL SECTION, DENSITY= (added mass per area)")
+            return
+        names = {m: self._material_mass_copy(blocks, opts, m, (rho_a or 0.0) / (t or 1.0), "SHELL_MASS",
+                                             taken, copies) for m in mats}
+        if b.has("COMPOSITE"):
+            for i, ln in enumerate(b.data):          # a ply line: thickness, points, material, ...
+                f = ln.split(",")
+                if len(f) > 2 and f[2].strip().upper() in names:
+                    f[2] = " " + names[f[2].strip().upper()]
+                    b.data[i] = ",".join(f)
+        else:
+            b.params["MATERIAL"] = names[mats[0]]
+        many = len(names) > 1
+        self.report.note(f"*{b.keyword}, ELSET={elset}, DENSITY= (a mass per unit area added to the "
+                         f"material's) -> material{'s' if many else ''} {', '.join(names.values())}, "
+                         f"{'copies' if many else 'a copy'} of {', '.join(mats)} whose *DENSITY holds "
+                         f"DENSITY / thickness more, the thickness {t:.6g} from the section (ccx has no "
+                         f"section mass). The copy spreads the mass through the thickness, which gives "
+                         f"it the rotary inertia Abaqus' section mass lacks: bending frequencies about "
+                         f"1.6 (thickness / wavelength)^2 times its share of the mass lower.", once=True)
 
     def _plan_quadratic_membranes(self, blocks: List[Block]) -> None:
         """Quadratic membranes -> one-element-thick solids the converter expands itself.
