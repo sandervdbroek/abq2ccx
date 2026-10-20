@@ -1395,6 +1395,24 @@ def test_rigid_body_reference_node_of_its_own_body_gets_a_free_node():
     assert not conv._free_refs and "*RIGID BODY reference node(s) 8 also belong to the body" in rep.text()
 
 
+def test_buckle_load_case_two_on_a_free_reference_node():
+    # _plan_free_ref_nodes gives the reference node's *BOUNDARY cards to the new free node as
+    # new cards, after the step model is read: a *BUCKLE step's LOAD CASE=2 card among them is
+    # still left out (the step model is read again after it)
+    deck = (HEX + HEX_SEC + "*Nset, nset=BODY\n1, 2, 3, 4, 5, 6, 7, 8\n*Rigid Body, ref node=8, "
+            "pin nset=BODY\n*Boundary\n8, 1, 6\n*Step\n*Static\n*Cload\n8, 3, -1.\n*End Step\n"
+            "*Step\n*Buckle\n2\n*Boundary\n8, 1, 6\n*Boundary, load case=2\n8, 1, 6\n*Cload\n"
+            "8, 3, -1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert dict(conv._free_refs) == {8: 9}
+    buckle = body.split("*BUCKLE")[1]
+    assert "LOAD CASE=2 (buckling-mode BCs) left out" in buckle and \
+        sum(ln.startswith("*BOUNDARY") for ln in buckle.splitlines()) == 1
+    assert "repeat LOAD CASE=1 cards" in rep.text() and "LOAD CASE dropped" not in rep.text()
+    assert all(id(b) in conv.steps.lc2 for b in conv.steps.steps[1].cards
+               if b.keyword == "BOUNDARY" and b.uparam("LOAD CASE") == "2")
+
+
 def test_assembly_instance_set_three_level_ref():
     # Some exporters qualify a member with the assembly name as well (Assembly.Instance.set).
     # Flattening must strip the outer assembly level and resolve to the renamed instance set.

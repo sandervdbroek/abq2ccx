@@ -4359,8 +4359,9 @@ class Step:
 
 
 class StepModel:
-    """The deck's steps, read once from its cards (Converter._plan_deck_facts, before the
-    planners) and not changed afterwards: ``model``, the cards before the first *STEP;
+    """The deck's steps, read from its cards (Converter._plan_deck_facts, before the
+    planners; again where _plan_free_ref_nodes rewrites *BOUNDARY / *CLOAD cards, which
+    ``lc2`` names by id): ``model``, the cards before the first *STEP;
     ``steps``, as emit_other writes them (deck_parts: an unterminated *STEP runs on to the
     next *END STEP); ``after``, the cards after the last step.  (Later planners add model data
     the model does not hold: *TRANSFORM copies, material and section twins.)"""
@@ -25391,6 +25392,9 @@ class Converter:
                              if n in stand]
             if data != b.data or params is not b.params:
                 blocks[i] = Block(b.keyword, params, data)
+        # the step model again: these *BOUNDARY / *CLOAD cards are new Blocks (a *BUCKLE step's
+        # LOAD CASE=2 ones are left out by id, StepModel.lc2)
+        self.steps = StepModel(blocks)
         pairs = ", ".join(f"{x} -> {n}" for x, n in list(stand.items())[:3])
         self.report.note(f"*RIGID BODY reference node(s) that belong to the body's own elements "
                          f"(node -> new reference node: {pairs}{', ...' if len(stand) > 3 else ''}): "
