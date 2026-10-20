@@ -18379,8 +18379,8 @@ class Converter:
         deck = self._settle_dependents(EmittedDeck(out, mesh))
         deck = self._restore_base_states(deck)
         deck = self._buckle_displacements(deck)  # after the BCs the restore gives back
-        out = self._modal_own_loads(deck.render())   # after the loads the restore gives back
-        out = self._clear_body_forces(out)      # after every pass that writes *DLOAD, OP=NEW
+        deck = self._modal_own_loads(deck)      # after the loads the restore gives back
+        out = self._clear_body_forces(deck.render())   # after every pass that writes *DLOAD, OP=NEW
         out = self._keep_body_loads(out)        # after the restore, which gives body loads too
         self._audit_loads(blocks, out)
         out = self._shift_total_time(out)       # after every pass that writes load cards
@@ -20105,7 +20105,7 @@ class Converter:
     _RESETS = dict.fromkeys(("CLOAD", "DLOAD", "TEMPERATURE"),
                             ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"))
 
-    def _modal_own_loads(self, out: List[str]) -> List[str]:
+    def _modal_own_loads(self, deck: EmittedDeck) -> EmittedDeck:
         """Give each *MODAL DYNAMIC step its own loads only, as Abaqus does in a linear
         perturbation step.  ccx 2.23 applies every *CLOAD and *DLOAD (pressures, GRAV, CENTRIF)
         it holds from earlier steps in a modal dynamic step, on top of the step's own (probed);
@@ -20117,53 +20117,37 @@ class Converter:
         which runs first: the loads it gives back count)."""
         held = {"CLOAD": False, "DLOAD": False}     # ccx holds such loads from earlier steps
         insert: Dict[int, List[str]] = {}           # line -> the cards written before it
-        step: Optional[dict] = None
-        card, n = "", 0
-        for i, raw in enumerate(out):
-            s = raw.strip()
-            if not s or s.startswith("**"):
+        for st in deck.steps:
+            if st.end is None:                      # (cut by a *STEP inside it: left as it is)
                 continue
-            if not s.startswith("*"):
-                if step is not None and card in held:
-                    step["data"].add(card)
-                elif step is not None and card == step["proc"]:
-                    step["at"] = i + 1              # (after the procedure's data lines)
-                continue
-            card, params = parse_keyword_line(s)
-            if card == "STEP":
-                n += 1
-                step = {"proc": None, "at": None, "first": {}, "data": set()}
-            elif step is None:
-                continue
-            elif card in PROC_KW and step["proc"] is None:
-                step["proc"], step["at"] = card, i + 1
-            elif card in held and card not in step["first"]:
-                step["first"][card] = (i, (params.get("OP") or "").strip().upper() == "NEW")
-            elif card == "END STEP":
-                if step["proc"] == "MODAL DYNAMIC" and n not in self._modal_held:
-                    for kw in held:
-                        first = step["first"].get(kw)
-                        if held[kw] and not (first and first[1]):
-                            at = min(step["at"], first[0]) if first else step["at"]
-                            insert.setdefault(at, ["** abq2ccx: a modal dynamic step's loads are "
-                                                   "its own (ccx 2.23 would apply the earlier "
-                                                   "steps' here too)"]).append(f"*{kw}, OP=NEW")
-                            step["first"][kw] = (at, True)
+            at = None                               # after the procedure's data lines (and
+            if st.proc is not None:                 # those of a later card of its type)
+                for c in st.cards:
+                    if c.keyword == st.proc.keyword and (c is st.proc or c.rows):
+                        at = c.last + 1
+            first = {kw: (st.first(kw).line, st.acting(kw) is not None)
+                     for kw in held if st.first(kw) is not None}
+            if st.proc is not None and st.proc.keyword == "MODAL DYNAMIC" and \
+                    st.number not in self._modal_held:
                 for kw in held:
-                    first = step["first"].get(kw)
-                    held[kw] = kw in step["data"] or (held[kw] and not (first and first[1]))
-                step = None
+                    if held[kw] and not (kw in first and first[kw][1]):
+                        here = min(at, first[kw][0]) if kw in first else at
+                        insert.setdefault(here, ["** abq2ccx: a modal dynamic step's loads are its "
+                                                 "own (ccx 2.23 would apply the earlier steps' "
+                                                 "here too)"]).append(f"*{kw}, OP=NEW")
+                        first[kw] = (here, True)
+            for kw in held:
+                given = any(c.rows for c in st.cards if c.keyword == kw)
+                held[kw] = given or (held[kw] and not (kw in first and first[kw][1]))
         if not insert:
-            return out
+            return deck
         self.report.note("*MODAL DYNAMIC: *CLOAD / *DLOAD, OP=NEW written at the start of the step: "
                          "Abaqus applies only the loads a linear perturbation step gives itself, ccx "
                          "2.23 the earlier steps' too (probed). A general step after it gets them "
                          "back.", once=True)
-        res: List[str] = []
-        for i, raw in enumerate(out):
-            res.extend(insert.get(i, []))
-            res.append(raw)
-        return res
+        for i, lines in insert.items():
+            deck.insert_at(i, lines)
+        return deck.edited()
 
     def _restore_base_states(self, deck: EmittedDeck) -> EmittedDeck:
         """Start each general step after Abaqus linear perturbation steps (_plan_base_restore)
