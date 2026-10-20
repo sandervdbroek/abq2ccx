@@ -3638,8 +3638,9 @@ def test_step_and_procedure_options_ccx_lacks():
     assert "*SURFACE, NAME=SP\nEALL, S3\n" in live
     # ccx's surface-to-surface contact has no SMALL SLIDING
     assert "*CONTACT PAIR, INTERACTION=I, TYPE=SURFACE TO SURFACE\nS1, S2\n" in live
-    # *STEP AMPLITUDE only RAMP / STEP; DIRECT=NO STOP is ccx's DIRECT; HHT for any APPLICATION
-    assert "\n*STEP\n*STATIC, DIRECT\n0.1, 1.\n" in live and "\n*STEP\n*DYNAMIC\n0.01, 0.1\n" in live
+    # *STEP AMPLITUDE only RAMP / STEP; DIRECT=NO STOP is ccx's DIRECT, which in a model with
+    # contact pairs becomes automatic increments capped at the fixed one; HHT for any APPLICATION
+    assert "\n*STEP\n*STATIC\n0.1, 1., 1e-05, 0.1\n" in live and "\n*STEP\n*DYNAMIC\n0.01, 0.1\n" in live
     text = rep.text()
     for msg in ("Bare *SYSTEM (reset to global coordinates) dropped", "*UNIT SYSTEM is unsupported by ccx",
                 "*SURFACE parameter PROPERTY dropped", "*CONTACT PAIR SMALL SLIDING dropped for SURFACE TO SURFACE",
