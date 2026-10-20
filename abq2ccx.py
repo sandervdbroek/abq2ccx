@@ -18382,9 +18382,8 @@ class Converter:
         deck = self._modal_own_loads(deck)      # after the loads the restore gives back
         deck = self._clear_body_forces(deck)    # after every pass that writes *DLOAD, OP=NEW
         deck = self._keep_body_loads(deck)      # after the restore, which gives body loads too
-        out = deck.render()
-        self._audit_loads(blocks, out)
-        out = self._shift_total_time(out)       # after every pass that writes load cards
+        self._audit_loads(blocks, deck)
+        out = self._shift_total_time(deck.render())     # after every pass that writes load cards
         out = self._short_fields(out)           # last: every card is written
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
@@ -21073,13 +21072,13 @@ class Converter:
                          f"{'s' if len(cleared) > 1 else ''} {', '.join(cleared)}).", once=True)
         return deck.edited()
 
-    def _audit_loads(self, blocks: List[Block], out: List[str]) -> None:
+    def _audit_loads(self, blocks: List[Block], deck: EmittedDeck) -> None:
         """Guard against a hollow solve: a step the Abaqus deck loads but whose every load
         was commented out (or became a stock ccx user subroutine) would still run — to a
         zero response.  Fills ``unloaded_steps`` (1-based) and ``source_unloaded`` (the deck
         itself applies no load in any step and has no eigenvalue step)."""
         src = step_load_audit(blocks, user_loads=True, abaqus=True)
-        dst = step_load_audit(blocks_from_lines(out), user_loads=False)
+        dst = step_load_audit(deck.blocks(), user_loads=False)
         self.source_unloaded = bool(src) and all(s == [] for s in src)
         self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1)
                                if s and d == [] and i not in self._stopped_steps]
