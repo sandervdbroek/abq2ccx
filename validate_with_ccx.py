@@ -4287,6 +4287,48 @@ def main():
             f"step {k} {v:+.6e} (expected {r:+.6e})" for k, v, r in zip((1, len(ux)), got, ref)))
         failures += 0 if ok else 1
 
+    # --- face loads of different sources from different steps --------------------------------
+    # Abaqus adds two loads on one face that another surface, element set or card gives;
+    # ccx 2.23 keeps one value per face, which a later step's line replaces, so the converter
+    # gives the earlier load again there.  The bar above (nu = 0): a pressure p on its tip face
+    # gives tip ux = -3 p / E; body forces b_j on its cubes, sum b_j (j - 0.5) / E.  Converted
+    # before: -6e-3 / 0 for the tip (the later step's line alone), 1.7e-2 for the chain
+    surfs = "*Surface, name=TIPA\n3, S4\n*Surface, name=TIPB\n3, S4\n*Elset, elset=E23\n2, 3\n" \
+            "*Amplitude, name=T, time=total time\n0., 1., 10., 1.\n"
+    tip_ux = lambda p: -3.0 * p / 1000.0
+    bx_ux = lambda *b: sum(bj * (j + 0.5) for j, bj in enumerate(b)) / 1000.0
+    freq_step = "*Step\n*Frequency\n2\n*End Step\n"        # (ccx prints its two modes too)
+    for how, deck, ref in (
+            ("*DLOAD, then *DSLOAD on the tip face", step.format("", "*Dload\n3, P4, 1.\n") +
+             step.format("", "*Dsload\nTIPA, P, 2.\n"), [tip_ux(1.0), tip_ux(3.0)]),
+            ("two surfaces, then the second removed", step.format("", "*Dsload\nTIPA, P, 1.\n") +
+             step.format("", "*Dsload\nTIPB, P, 2.\n") + step.format("", "*Dsload\nTIPB, P, 0.\n"),
+             [tip_ux(1.0), tip_ux(3.0), tip_ux(1.0)]),
+            ("a total-time amplitude on both", step.format("", "*Dsload, amplitude=T\nTIPA, P, 1.\n") +
+             step.format("", "*Dsload, amplitude=T\nTIPB, P, 2.\n"), [tip_ux(1.0), tip_ux(3.0)]),
+            ("after a frequency step", step.format("", "*Dsload\nTIPA, P, 1.\n") + freq_step +
+             step.format("", "*Dsload\nTIPB, P, 2.\n"), [tip_ux(1.0), None, None, tip_ux(3.0)]),
+            ("body forces given again in a chain", step.format("", "*Dload\nALL, BX, 3.\nE23, BX, 1.\n") +
+             step.format("", "*Dload\nE1, BX, 2.\n"), [bx_ux(3.0, 4.0, 4.0), bx_ux(5.0, 4.0, 4.0)])):
+        src = os.path.join(tmp, "face_overlap_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(bar + surfs + deck)
+        inp = os.path.join(tmp, "face_overlap.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        ux = [u[0] for u in dat_displacement_history(os.path.join(d, "job.dat"), 16)] \
+            if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if len(ux) != len(ref):
+            print(f"FAIL  face_load_overlap ({how}): no tip displacement in each step ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        ok = all(abs(v - r) <= 1e-5 * abs(r) for v, r in zip(ux, ref) if r is not None)
+        print(f"{'PASS' if ok else 'FAIL'}  face_load_overlap ({how}): tip ux " + ", ".join(
+            f"{v:+.6e} (expected {r:+.6e})" for v, r in zip(ux, ref) if r is not None))
+        failures += 0 if ok else 1
+
     # --- isotropic *Elastic beside an orthotropic / anisotropic *Expansion -----------------
     # ccx 2.23 uses a wrong stiffness for this combination in linear steps once the deck has
     # temperatures (a free heated cube shrinks), so the converter writes such *Elastic cards

@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Face loads of different sources across steps** — Abaqus adds a later step's `*DLOAD` /
+  `*DSLOAD` to an earlier one on the same faces when it comes from another surface, element set
+  or card; ccx 2.23 keeps one value per face and the later line replaced it (a tip pressure of
+  1, then 2 from another surface: ccx 2, Abaqus 3). The earlier load is now given again in that
+  step (also `BX` / `BY` / `BZ`). On another amplitude or a step-time one this is impossible
+  (ccx stops, or the amplitude starts over), so it is warned (reduced physics). `*DSLOAD,
+  IMAGINARY` → `LOAD CASE=2`, as on `*DLOAD` (it acted in phase).
 * **Element output in steps ccx 2.23 runs linearly** — `*EL FILE SDV` segfaulted ccx in a
   `*VISCO` step of an elastic material and in a Riks step under `--approximate`; both are
   dropped there now, as in a linear `*STATIC` step. A `*FREQUENCY` or `*BUCKLE` step makes ccx
