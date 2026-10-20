@@ -27416,10 +27416,12 @@ class Converter:
         eq_dofs = {(n, d) for _, terms in eqs for n, d, _ in terms}
         steps: List[Dict[Tuple[int, int], Tuple[Optional[float], str]]] = []   # each step's BCs
         held: Optional[set] = None                                               # on those
-        for active in bc_steps(bc_cards, lambda b: given[id(b)], self._pert_idx):
+        # the emitted cards, with the deck's perturbation steps' restore that _restore_base_states
+        # writes next (also where that pass finds the steps miscounted and writes none)
+        for active in self.steps.states(lambda b: given[id(b)], blocks=bc_cards):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
-        for active in bc_steps(bc_cards, lambda b: valued[id(b)], self._pert_idx):
+        for active in self.steps.states(lambda b: valued[id(b)], blocks=bc_cards):
             steps.append({k: va for k, va in active.items() if k in eq_dofs})
         held = held or set()
         released: Dict[Tuple[int, int], Tuple[int, int]] = {}    # DOF -> itself, or where its BC went
