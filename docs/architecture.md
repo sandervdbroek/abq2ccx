@@ -101,6 +101,12 @@ and flattening write into it; `emit_geometry()` reads from it.
 **`Report`** — collects `[NOTE]`/`[WARNING]` entries (`once=True` de-duplicates),
 and renders the header comment block / log.
 
+**`Converter`** — keeps `convert()`, the dispatch, the reporting helpers and the deck facts,
+and inherits one class per concern: `_Mesh`, `_Rigid`, `_Materials`, `_Axes`, `_Dofs`,
+`_Constraints`, `_Loads`, `_Output`, `_PostPasses`. A new method goes with the state it
+writes, else with its callers; `test_attribute_owners` fails where two of these classes write
+one attribute (`__init__` aside) unless its allow list says why.
+
 ## Why two passes
 
 Geometry (`*NODE`, `*ELEMENT`, `*NSET`, `*ELSET`, and the mesh-generation cards) is
