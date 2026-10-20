@@ -6,6 +6,12 @@ physics.
 
 ## Unreleased
 
+* **`*EL PRINT ELKE` where ccx 2.23 segfaults** — ccx crashes computing element kinetic
+  energies in a `*BUCKLE` step and in a `*STATIC` or `*VISCO` step it runs linearly (probed).
+  The converter now drops `ELKE` there, with a note: such a step has no kinetic energy. ccx
+  carries `*EL PRINT` into later steps, so the cards are written again without `ELKE` in such a
+  step, and with it in the next step where it runs. `*CONTACT PRINT CELS` (contact energy) in a
+  later step now also gets `ENER` in step 1, so ccx no longer stops on it in a nonlinear run.
 * **Rigid constraints in the other steps ccx runs nonlinear** — ccx 2.23 also turns the RIGID
   MPCs of `*RIGID BODY` and kinematic couplings with the finite rotation without NLGEOM in a
   coupled temperature-displacement step and in a `*STATIC` (a perturbation one too) or `*VISCO`

@@ -3883,7 +3883,8 @@ def test_energy_requested_from_the_first_step():
                        ("*Static\n*Output, field\n*Element Output\nS, ENER\n",
                         "step 2's *EL FILE ENER request"),
                        ("*Static\n*Output, history\n*Element Output, elset=EALL\nELSE\n",
-                        "step 2's *EL PRINT ELSE request")):
+                        "step 2's *EL PRINT ELSE request"),
+                       ("*Static\n*Contact Print\nCELS\n", "step 2's *CONTACT PRINT CELS request")):
         body, _, rep = convert_str(HEX + STEEL + "*Step, nlgeom\n*Static\n" + load + "*End Step\n"
                                    "*Step, nlgeom\n" + step2 + "*End Step\n")
         assert _step(body, 1).endswith("*EL FILE\nS, E, ENER\n") and why in rep.text(), why
@@ -3979,6 +3980,65 @@ def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
     assert _step(body, 1).endswith("*EL FILE\nS, SDV\n") and _step(body, 2).endswith("*EL FILE\n")
     assert "Empty *EL FILE added to step 2: Abaqus writes no element field output there, and " \
            "ccx would carry an earlier step's *EL FILE SDV into a *FREQUENCY step" in rep.text()
+
+
+def test_elke_kept_off_el_print_where_ccx_segfaults():
+    # ccx 2.23 segfaults computing *EL PRINT ELKE (element kinetic energy) in a *BUCKLE step and
+    # in a *STATIC or *VISCO step it runs linearly (probed, with or without *DENSITY): dropped
+    # there, the card's other labels kept (a card of ELKE alone left without labels)
+    load, pr = "*Cload\n8, 3, 1.\n", "*El Print, elset=EALL\n{}\n"
+    static = "*Step{}\n*Static\n" + load + "{}*End Step\n"
+    buckle = "*Step\n*Buckle\n2\n" + load + "{}*End Step\n"
+    dyn = "*Step\n*Dynamic\n0.01, 1.\n{}*End Step\n"
+    creep = STEEL.replace("*Density", "*Creep, law=TIME\n1.e-20, 3., 0.\n*Density")
+    for model, steps, k, card, kind in (
+            (STEEL, static.format("", pr.format("S, ELKE")), 1, "*EL PRINT, ELSET=EALL\nS\n",
+             "a linear *STATIC step (no NLGEOM, no plastic, creeping, hyperelastic or user "
+             "material, no dynamic, heat transfer or coupled step before)"),
+            (STEEL, "*Step\n*Visco\n0.1, 1.\n" + load + pr.format("ELKE") + "*End Step\n", 1,
+             "*EL PRINT, ELSET=EALL\n*NODE FILE", "a linear *VISCO step"),
+            (STEEL, "*Step\n*Frequency\n3\n*End Step\n" + static.format("", pr.format("ELKE")), 2,
+             "*EL PRINT, ELSET=EALL\n*NODE FILE", "a linear *STATIC step"),
+            (STEEL, static.format(", nlgeom", "") + buckle.format(pr.format("ELKE")), 2,
+             "*EL PRINT, ELSET=EALL\n*NODE FILE", "a *BUCKLE step")):
+        body, _, rep = convert_str(HEX + model + steps)
+        assert card in _step(body, k) and "ELKE" not in body, (steps, _step(body, k))
+        assert f"*EL PRINT ELKE dropped from step {k}, {kind}" in rep.text(), steps
+        assert "ENER added" not in rep.text(), steps        # no energy request is left
+    # it runs where ccx iterates: under NLGEOM (also carried on), with a material ccx iterates,
+    # after an implicit or explicit dynamic step, and in a dynamic or *FREQUENCY step
+    plastic = STEEL.replace("*Density", "*Plastic\n250., 0.\n*Density")
+    elke = static.format("", pr.format("ELKE"))
+    for model, steps in ((STEEL, static.format(", nlgeom", pr.format("ELKE"))),
+                         (STEEL, static.format(", nlgeom", "") + elke), (plastic, elke),
+                         (creep, "*Step\n*Visco\n0.1, 1.\n" + load + pr.format("ELKE") + "*End Step\n"),
+                         (STEEL, dyn.format("") + elke),
+                         (STEEL, "*Step\n*Dynamic, explicit\n, 1.e-5\n*End Step\n" + elke),
+                         (STEEL, dyn.format(pr.format("ELKE"))),
+                         (STEEL, "*Step\n*Frequency\n3\n" + pr.format("ELKE") + "*End Step\n")):
+        body, _, rep = convert_str(HEX + model + steps)
+        assert re.search(r"\*EL PRINT, ELSET=EALL[^\n]*\nELKE\n", body.split("*STEP")[-1]), steps
+        assert "ELKE dropped" not in rep.text(), steps
+    # ccx carries a step's *EL PRINT cards into the next steps that give none, as Abaqus does:
+    # into a *BUCKLE step they are written again without ELKE (here a card without labels,
+    # which clears them), and the next step that runs ELKE gets Abaqus' cards back
+    body, _, rep = convert_str(HEX + STEEL + static.format(", nlgeom", pr.format("ELKE")) +
+                               buckle.format("") + static.format("", ""))
+    assert _step(body, 2).endswith("*EL PRINT, ELSET=EALL\n") and "ELKE" not in _step(body, 2)
+    assert _step(body, 3).endswith("*EL PRINT, ELSET=EALL\nELKE\n"), _step(body, 3)
+    assert "Step 1's *EL PRINT cards written again in step 2 without ELKE (as one without labels, " \
+           "which clears them): ccx would carry ELKE into a *BUCKLE step" in rep.text()
+    assert "Step 1's *EL PRINT cards written again in step 3: Abaqus carries them into it, ELKE " \
+           "included; ccx would carry step 2's, written without ELKE." in rep.text()
+    # the other labels stay; a dynamic step after a linear static one gets ELKE back
+    body, _, rep = convert_str(HEX + STEEL + static.format("", pr.format("ELKE, ELSE")) +
+                               dyn.format(""))
+    assert "*EL PRINT, ELSET=EALL\nELSE\n" in _step(body, 1)
+    assert _step(body, 2).endswith("*EL PRINT, ELSET=EALL\nELKE, ELSE\n"), _step(body, 2)
+    # a later step's own cards, and a step whose carried cards hold no ELKE, are left alone
+    body, _, rep = convert_str(HEX + STEEL + static.format("", pr.format("ELKE")) +
+                               buckle.format("") + dyn.format(pr.format("S")))
+    assert _step(body, 2).count("*EL PRINT") == 0 and _step(body, 3).count("*EL PRINT") == 1
 
 
 def test_courant_length_matches_ccx_223():

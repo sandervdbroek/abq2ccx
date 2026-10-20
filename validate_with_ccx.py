@@ -71,7 +71,8 @@ run its own routines, and (--abaqus-umat) through ccx's Abaqus-UMAT interfaces, 
 example UMAT gives E eps and E ln(1 + eps); the results digest of --run against the
 beam, buckling and statics references above; *EL FILE requests ccx stopped or crashed on
 (ENER beside U1 beams, SDV where ccx has no nodal state variables) against beam theory, 100 / E
-and the same decks without them; and decks a code review found converted wrongly:
+and the same decks without them; *EL PRINT ELKE in a linear static and a *BUCKLE step against
+u0 cos 100 t and the same deck without it; and decks a code review found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
 a part's pre-tension section and distributing coupling in turned instances, and a static step
@@ -2409,6 +2410,23 @@ def energy_steps_deck(first=None, second="dynamic"):
             ("*STEP\n*FREQUENCY\n1\n*END STEP\n" if first == "frequency" else "") +
             "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 0.25\n*END STEP\n" + last +
             "*OUTPUT, HISTORY, FREQUENCY=1\n*NODE OUTPUT, NSET=TOP\nU\n*END STEP\n")
+
+
+def elke_steps_deck(case, elke=True):
+    """*EL PRINT ELKE (element kinetic energy) where ccx 2.23 segfaulted computing it (the
+    converter's _el_print_stops).  'dynamic': energy_steps_deck's one-DOF cube pulled to
+    u0 = 1e-3 in a static step requesting history ELKE and ELSE and the top's U, then let go for
+    one period in an implicit *DYNAMIC step that carries them: kinetic energy 5e-4 sin^2 100 t,
+    internal energy 5e-4 cos^2 100 t.  'buckle': buckle_gravity_deck's column with ELKE and
+    ELSE printed in its *BUCKLE step (``elke``: False leaves them out), then pulled sideways."""
+    if case == "buckle":
+        deck = buckle_gravity_deck(preload="", static=True)
+        return deck.replace("TIP, 3, -1.e5\n", "TIP, 3, -1.e5\n" + ("*EL PRINT, ELSET=EALL\nELKE, "
+                                                                   "ELSE\n" if elke else ""), 1)
+    return (CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*DENSITY\n0.3\n*BOUNDARY\nBOT, 1, 3\n"
+            "TOP, 1, 2\n*STEP\n*STATIC\n*CLOAD\nTOP, 3, 0.25\n*OUTPUT, HISTORY, FREQUENCY=1\n*NODE "
+            "OUTPUT, NSET=TOP\nU\n*ELEMENT OUTPUT, ELSET=EALL\nELKE, ELSE\n*END STEP\n*STEP, INC=1000\n"
+            "*DYNAMIC, DIRECT\n2.51327412287E-4, 0.0628318530718\n*CLOAD, OP=NEW\n*END STEP\n")
 
 
 def el_file_stops_deck(case, sdv=True):
@@ -6107,6 +6125,53 @@ def main():
         elif all(runs):
             print(f"FAIL  el_file_{case}_sdv: tables or frequencies missing")
         failures += 0 if ok else 1
+    # *EL PRINT ELKE, which ccx 2.23 segfaulted on in a linear static and a *BUCKLE step (abq2ccx
+    # now drops it there, and writes the cards ccx would carry on without it again where it
+    # runs): the one-DOF cube's energies against u0 cos 100 t, the column's buckling factors
+    # and sideways pull against the same deck without ELKE
+
+    def energy_tables(dat):
+        return {title: [(t, rows[0][-1]) for _, tt, _s, t, rows in A.dat_blocks(dat)
+                        if tt.startswith(title) and rows]      # the element's energy, node 5's z
+                for title in ("kinetic energy", "internal energy", "displacements")}
+    res = review_run(elke_steps_deck("dynamic"), "elke_static_then_dynamic", energy_tables)
+    if res:
+        kin = [(t, e) for t, e in res["kinetic energy"] if t > 1.0]
+        internal = dict(res["internal energy"])
+        ok = bool(kin) and 1.0 in internal and not any(t <= 1.0 for t, _e in res["kinetic energy"])
+        if ok:
+            err = max(abs(e / 5e-4 - math.sin(100.0 * (t - 1.0)) ** 2) for t, e in kin)
+            swing = max(abs(u / 1e-3 - math.cos(100.0 * (t - 1.0)))
+                        for t, u in res["displacements"] if t > 1.0)
+            ok = len(kin) >= 20 and err < 1e-2 and swing < 1e-2 and abs(internal[1.0] / 5e-4 - 1) < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  elke_static_then_dynamic (the one-DOF cube pulled to "
+                  f"1e-3 in a static step requesting ELKE and ELSE, then let go in an implicit *DYNAMIC "
+                  f"step carrying them): static internal energy {internal[1.0]:.7g} vs k u0^2 / 2 = 5e-4, "
+                  f"{len(kin)} kinetic energies within {err:.1e} x 5e-4 of 5e-4 sin^2 100 t, the top "
+                  f"within {swing:.1e} x u0 of u0 cos 100 t (before: ccx segfaulted in the static step)")
+        else:
+            print("FAIL  elke_static_then_dynamic: kinetic energy missing from the dynamic step, or "
+                  "printed in the static one")
+    failures += 0 if res and ok else 1
+
+    def buckle_tables(dat):
+        return (dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T"),
+                dat_displacements(dat), dat_tables(dat, "internal energy"))
+    runs = [review_run(elke_steps_deck("buckle", elke), "elke_buckle" + ("" if elke else "_ref"),
+                       buckle_tables) for elke in (True, False)]
+    ok = all(runs) and len(runs[0][0]) == 2
+    if ok:
+        (factors, u, energies), (ref_factors, ref_u, _) = runs
+        tip = [n for n in u if n in ref_u]
+        ok = (factors == ref_factors and factors[0] > 1.0 and bool(energies) and len(tip) == 1
+              and u[tip[0]] == ref_u[tip[0]] and u[tip[0]][0] > 0.0)
+        print(f"{'PASS' if ok else 'FAIL'}  elke_buckle (a column's *BUCKLE step printing ELKE and "
+              f"ELSE, then a sideways pull): buckling factors {factors[0]:.7g}, {factors[1]:.7g} and "
+              f"the pulled tip at {u[tip[0]][0]:.4g} as without ELKE, {len(energies)} ELSE tables "
+              f"(before: ccx segfaulted in the *BUCKLE step)")
+    elif all(runs):
+        print("FAIL  elke_buckle: buckling factors missing")
+    failures += 0 if ok else 1
     # a SYMMETRIC layup's thickness in a tie to a rigid plate (counted half, ccx got the tie)
     strips = [review_run(tied_strip_deck(sym), "rigid_tie_symmetric_layup" + ("" if sym else "_ref"),
                          dat_displacements) for sym in (True, False)]

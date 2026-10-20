@@ -798,6 +798,9 @@ def gen_output():
              "where ccx skips it but segfaults on one carried over from an earlier step. The "
              "converter drops them and says so; `*EL PRINT` writes them (no `SDV` in "
              "`*FREQUENCY`/`*BUCKLE`).\n",
+             "## `*EL PRINT ELKE` where ccx 2.23 segfaults\n",
+             "In a `*BUCKLE` step and in a `*STATIC` or `*VISCO` step ccx runs linearly, which "
+             "have no kinetic energy: dropped, also from the cards ccx would carry into them.\n",
              "## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)\n",
              "Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the "
              "output database*, table 1) as the whole-model ccx cards it becomes. Abaqus also "

@@ -36,6 +36,10 @@ ccx 2.23 computes element energies from the first step that needs them on — an
 
 `ENER` and `SDV` in a model with `U1` beams (ccx stops: 'only coded for fields with 6 entries'); `SDV` of a model with state variables in a linear `*STATIC` or a `*STEADY STATE DYNAMICS` step (ccx segfaults), and in `*FREQUENCY` and `*BUCKLE`, where ccx skips it but segfaults on one carried over from an earlier step. The converter drops them and says so; `*EL PRINT` writes them (no `SDV` in `*FREQUENCY`/`*BUCKLE`).
 
+## `*EL PRINT ELKE` where ccx 2.23 segfaults
+
+In a `*BUCKLE` step and in a `*STATIC` or `*VISCO` step ccx runs linearly, which have no kinetic energy: dropped, also from the cards ccx would carry into them.
+
 ## Preselected field output (`*OUTPUT, FIELD, VARIABLE=PRESELECT`)
 
 Abaqus' preselected field output per procedure (Analysis User's Guide, *Output to the output database*, table 1) as the whole-model ccx cards it becomes. Abaqus also writes it for a step without any output database request (`*OUTPUT`) when none carries over from an earlier step (requests carry over to later steps; between perturbation steps only from the step before), so the converter adds it there; `*NODE PRINT`/`*EL PRINT`/`*NODE FILE`/`*EL FILE` are .dat/.fil requests and do not replace it. Carried-over requests are written again in such a step, at their own frequency and with its procedure's variables, as ccx would keep the earlier step's frequency. `PEEQ` only where a material yields or creeps (ccx warns on it otherwise); `VARIABLE=ALL` adds `ENER`. The frequency is the `*OUTPUT` card's, else Abaqus' default: every increment, every 10 in `*DYNAMIC`/`*MODAL DYNAMIC`, 20 intervals in explicit dynamics (there a `FREQUENCY` from ccx's stable increment, as ccx ignores `*TIME POINTS`). Abaqus' preselected history output, whole-model energies, has no ccx counterpart and is dropped.

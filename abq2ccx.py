@@ -2761,7 +2761,10 @@ ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
 # they request.  In a nonlinear calculation ccx stops when that starts after the first step
 # (Converter._energy_from_step_one).
 CCX_ENERGY_LABELS = {"EL FILE": ("ENER",), "EL PRINT": ("ENER", "ELSE", "ELKE"),
-                     "CONTACT FILE": ("CELS",)}
+                     "CONTACT FILE": ("CELS",), "CONTACT PRINT": ("CELS",)}
+# The procedures after which ccx 2.23 iterates every later step, as under NLGEOM (probed: a
+# *STATIC step after them is a nonlinear one), for Converter._el_print_stops.
+CCX_NONLINEAR_AFTER_PROCS = {"DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT"}
 # The procedures in which ccx 2.23 has no nodal state variables (arpack.c, arpackbu.c and
 # steadystate.c never allocate them, nor does linstatic.c, which runs a linear *STATIC step),
 # so that *EL FILE SDV segfaults it in a model with state variables (Converter._el_file_stops),
@@ -11426,6 +11429,7 @@ class Converter:
             self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
             self.geom.nsets[self._qmem_hidden] = hidden
         groups = step_groups(blocks)[1]
+        self._el_print_stops(blocks, steps, groups)
         self._energy_from_step_one(steps, [g[0] for g in groups])
         self._el_file_stops(blocks, steps, groups)
         for k, timing, reqs in steps:
@@ -11509,6 +11513,11 @@ class Converter:
                     r = self._output_request(src, ctx, timing, quiet)
                     r["anchor"] = x
                     reqs.append(r)
+                elif x.keyword == "CONTACT PRINT":
+                    # passed through as it stands; its CELS makes ccx compute energies
+                    # (_energy_from_step_one)
+                    timing.setdefault("contact_print", []).extend(
+                        v.strip().upper() for rec in merged_data_records(x) for v in rec if v.strip())
             if odb and not add:
                 carried[pert] = own
             else:
@@ -11625,6 +11634,8 @@ class Converter:
             why = [f"step {k}, {timing['energy']},"] if timing.get("energy") else []
             why += [f"step {k}'s *{r['cc']} {lab} request" for r in reqs if r["live"]
                     for lab in r["labels"] if lab[:4] in CCX_ENERGY_LABELS.get(r["cc"], ())]
+            why += [f"step {k}'s *CONTACT PRINT {lab} request" for lab in timing.get("contact_print", ())
+                    if lab[:4] in CCX_ENERGY_LABELS["CONTACT PRINT"]]
             if why:
                 break
         else:
@@ -11660,6 +11671,71 @@ class Converter:
                 "notes": [], "warnings": [], "frd": cc.endswith("FILE"), "frd_sets": [],
                 "covered": [], "set": None, "ctl": None, "default": True, "live": True,
                 "anchor": anchor}
+
+    def _el_print_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
+                        groups: List[List[Block]]) -> None:
+        """Keep *EL PRINT ELKE (element kinetic energy) out of the steps where ccx 2.23
+        segfaults computing it (probed, with or without *DENSITY, also under TOTALS=ONLY): a
+        *BUCKLE step, and a *STATIC or *VISCO step (or one without a ccx procedure) that ccx
+        runs linearly — no NLGEOM in it or an earlier step, no material ccx iterates (a kept
+        *PLASTIC, *CREEP, CCX_ITERATED_MATERIALS) and no earlier step after which ccx iterates
+        every step (CCX_NONLINEAR_AFTER_PROCS).  Such a step has no kinetic energy.  Contact
+        makes ccx iterate too, but the converter cannot tell whether ccx keeps a contact pair,
+        so ELKE goes there as well.  It runs in every other step (ccx itself deactivates it in
+        a *FREQUENCY step, with a warning).
+
+        ccx keeps a step's *EL PRINT cards in the next steps that give none, as Abaqus does: a
+        step of the first kind without one gets the carried cards again without ELKE (one
+        without labels if none is left, which clears them), and the next step without one
+        where ELKE runs gets the cards Abaqus carries into it again."""
+        if len(groups) < len(steps):
+            return
+        iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
+        nonlinear, on = False, self._nlgeom_steps(blocks)
+        # the *EL PRINT cards [(params, labels)] Abaqus and ccx carry into a step, and the steps
+        # that gave them
+        abq: list = []
+        held: list = []
+        abq_k = held_k = 0
+        for (k, timing, reqs), group in zip(steps, groups):
+            nonlinear = nonlinear or id(group[0]) in on
+            proc = timing["proc"]
+            stops = proc == "BUCKLE" or (proc in (None, "STATIC", "VISCO") and
+                                         not (nonlinear or iterated))
+            kind = ("a *BUCKLE step" if proc == "BUCKLE" else
+                    f"a linear {'*' + proc if proc else 'static'} step (no NLGEOM, no plastic, "
+                    f"creeping, hyperelastic or user material, no dynamic, heat transfer or coupled "
+                    f"step before)")
+            own = [r for r in reqs if r["live"] and r["cc"] == "EL PRINT"]
+            add: List[dict] = []
+            if own:
+                abq, abq_k = [(r["params"], list(r["labels"])) for r in own], k
+                for r in own if stops else []:
+                    if any(lab[:4] == "ELKE" for lab in r["labels"]):
+                        r["labels"] = [lab for lab in r["labels"] if lab[:4] != "ELKE"]
+                        r["notes"].append(
+                            f"*EL PRINT ELKE dropped from step {k}, {kind}: ccx 2.23 segfaults "
+                            f"computing element kinetic energies there, and the step has none.")
+                held, held_k = [(r["params"], list(r["labels"])) for r in own], k
+            elif stops and any(lab[:4] == "ELKE" for _p, labels in held for lab in labels):
+                cards = [(p, [lab for lab in labels if lab[:4] != "ELKE"]) for p, labels in held]
+                add = [self._added_el_file(OrderedDict(p), labels, group[0], "EL PRINT")
+                       for p, labels in [c for c in cards if c[1]] or cards[:1]]
+                add[0]["notes"].append(
+                    f"Step {held_k}'s *EL PRINT cards written again in step {k} without ELKE"
+                    f"{'' if add[0]['labels'] else ' (as one without labels, which clears them)'}: "
+                    f"ccx would carry ELKE into {kind}, where ccx 2.23 segfaults computing element "
+                    f"kinetic energies.")
+            elif not stops and proc != "FREQUENCY" and held != abq:
+                add = [self._added_el_file(OrderedDict(p), list(labels), group[0], "EL PRINT")
+                       for p, labels in abq]
+                add[0]["notes"].append(
+                    f"Step {abq_k}'s *EL PRINT cards written again in step {k}: Abaqus carries them "
+                    f"into it, ELKE included; ccx would carry step {held_k}'s, written without ELKE.")
+            if add:
+                reqs.extend(add)
+                held, held_k = [(r["params"], list(r["labels"])) for r in add], k
+            nonlinear = nonlinear or proc in CCX_NONLINEAR_AFTER_PROCS
 
     def _el_file_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
                        groups: List[List[Block]]) -> None:
