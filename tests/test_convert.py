@@ -7871,6 +7871,139 @@ def test_general_step_after_perturbation_gets_the_base_state():
     assert "starts it from that step's displacements" in rep.text() and conv.reduced_physics
 
 
+CHAIN = (HEX + "*Nset, nset=BOT\n1, 2, 3, 4\n*Nset, nset=TOP\n5, 6, 7, 8\n*Material, name=M\n"
+         "*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
+         "*Boundary\nBOT, 1, 3\n*Step\n*Static\n*Cload\nTOP, 3, -1.\n{}*End Step\n")
+FREQ_BC = "*Step\n*Frequency\n3\n*Boundary\nTOP, 1, 2\n*End Step\n"
+FREQ3 = "*Step\n*Frequency\n3\n*End Step\n"
+BUCK2 = "*Step\n*Buckle\n2\n*Cload\nTOP, 3, -1.\n*End Step\n"
+CHAIN_MODAL = "*Step\n*Modal Dynamic\n0.01, 0.05\n*Cload\n7, 3, 0.001\n*End Step\n"
+RESTORED = ("** abq2ccx: the BCs of the base state given again at 0 (Abaqus does not carry a linear "
+            "perturbation step's BCs into the next one)\n")
+
+
+def test_perturbation_step_bcs_do_not_carry_into_the_next_one():
+    # Abaqus: "Boundary conditions do not propagate between linear perturbation steps"; ccx 2.23
+    # keeps a *FREQUENCY / *BUCKLE step's own BCs and its OP=NEW in the next such step (probed:
+    # 4.04e6 for 6.29e5).  So that step gets the base state's BCs again after its procedure
+    # card, at 0, with OP=NEW where the step before held a DOF the base state leaves free
+    body, conv, rep = convert_str(CHAIN.format("") + FREQ_BC + FREQ3)
+    assert body.split("*STEP")[3].startswith("\n*FREQUENCY\n3\n" + RESTORED + "*BOUNDARY, OP=NEW\nBOT, 1, 3\n")
+    assert "Step 3 follows a linear perturbation step with its own boundary conditions" in rep.text()
+    assert not conv.reduced_physics
+    # a *BUCKLE step: the base state's prescribed values at 0 too (ccx would take one as part
+    # of its buckling load); after a *BUCKLE step with its own BC, a *FREQUENCY step likewise
+    third = convert_str(CHAIN.format("*Boundary\n5, 1, 1, 0.01\n") + FREQ_BC + BUCK2)[0].split("*STEP")[3]
+    assert third.startswith(", PERTURBATION\n*BUCKLE\n2\n" + RESTORED + "*BOUNDARY, OP=NEW\nBOT, 1, 3\n"
+                            "5, 1, 1\n*CLOAD\n"), third
+    third = convert_str(CHAIN.format("") + BUCK2.replace("*Cload", "*Boundary\nTOP, 1, 2\n*Cload") +
+                        FREQ3)[0].split("*STEP")[3]
+    assert third.startswith("\n*FREQUENCY\n3\n" + RESTORED + "*BOUNDARY, OP=NEW\nBOT, 1, 3\n"), third
+    # an OP=NEW that held fewer DOFs: the base state's lines alone give them back
+    third = convert_str(CHAIN.format("") + FREQ3.replace("3\n", "3\n*Boundary, op=NEW\n1, 1, 3\n") +
+                        FREQ3)[0].split("*STEP")[3]
+    assert third.startswith("\n*FREQUENCY\n3\n" + RESTORED + "*BOUNDARY\nBOT, 1, 3\n"), third
+    # nothing where the step before gave no BCs, or the step's own OP=NEW removes them
+    assert "given again" not in convert_str(CHAIN.format("") + FREQ3 + BUCK2)[0]
+    assert "given again" not in convert_str(CHAIN.format("") + FREQ_BC + FREQ3.replace(
+        "3\n", "3\n*Boundary, op=NEW\nBOT, 1, 3\n"))[0]
+    # the general step after them: OP=NEW only where ccx still holds a DOF a perturbation step gave
+    fourth = convert_str(CHAIN.format("") + FREQ_BC + FREQ3 + "*Step\n*Static\n*End Step\n")[0].split("*STEP")[4]
+    assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nTOP, 3, -1." in fourth and "*BOUNDARY, OP=NEW" not in fourth
+
+
+def test_modal_step_keeps_the_bcs_of_the_modes_it_reads():
+    # A modal dynamic step reads the modes of the last *FREQUENCY step, with that step's BCs
+    # (Abaqus); ccx 2.23 stops on fewer there (its .eig file), holds more, and refuses OP=NEW or
+    # a new BC in the step (probed).  A *BUCKLE step between the two keeps the *FREQUENCY step's
+    # BCs (warned, reduced physics); after a second *FREQUENCY step the modes have the base
+    # state's BCs, and so does the modal step
+    body, conv, rep = convert_str(CHAIN.format("") + FREQ_BC + BUCK2 + CHAIN_MODAL)
+    assert "given again" not in body
+    assert "*BUCKLE step(s) 3 (step 2's) keep the boundary conditions of the *FREQUENCY step" in rep.text()
+    assert conv.reduced_physics == ["*BUCKLE step with the boundary conditions of a *FREQUENCY step (kept "
+                                    "for the modal step that reads its modes)"]
+    body, conv, rep = convert_str(CHAIN.format("") + FREQ_BC + FREQ3 + CHAIN_MODAL)
+    assert RESTORED in body.split("*STEP")[3] and "given again" not in body.split("*STEP")[4]
+    assert not conv.reduced_physics
+    # a *BUCKLE step's own BC, or a static perturbation step's restore, between them: warned
+    _, conv, rep = convert_str(CHAIN.format("") + FREQ3 + BUCK2.replace("*Cload", "*Boundary\n5, 1, 2\n*Cload")
+                               + CHAIN_MODAL)
+    assert "Modal or steady-state dynamics step(s) 4 (more than step 2's) start with other" in rep.text()
+    _, conv, rep = convert_str(CHAIN.format("") + FREQ_BC + "*Step, perturbation\n*Static\n*Cload\n"
+                               "TOP, 1, 0.001\n*End Step\n" + CHAIN_MODAL)
+    assert "step(s) 4 (fewer than step 2's)" in rep.text()
+    assert "modal step with other boundary conditions than its modes' (ccx stops on fewer, holds more)" \
+        in conv.reduced_physics
+
+
+def test_perturbation_step_after_a_buckle_step():
+    # ccx 2.23 takes the state a *BUCKLE or modal dynamic step left (its load case's response,
+    # its end) as the base state of a *STEP, PERTURBATION step after it (probed: a B32R column
+    # 20 % / 16 % low), Abaqus the last general step's: warned, reduced physics.  A step
+    # without PERTURBATION is unaffected (probed)
+    _, conv, rep = convert_str(CHAIN.format("") + BUCK2 + BUCK2)
+    assert "*STEP, PERTURBATION *BUCKLE step after the *BUCKLE step 2: Abaqus takes the last general " \
+           "step's state" in rep.text()
+    assert conv.reduced_physics == ["*BUCKLE step after a *BUCKLE / *MODAL DYNAMIC step (ccx takes that "
+                                    "step's state as its base state)"]
+    _, conv, rep = convert_str(CHAIN.format("") + BUCK2 + FREQ3)
+    assert "after the *BUCKLE" not in rep.text() and not conv.reduced_physics
+    # before any general step PERTURBATION adds nothing else there (the initial state): dropped
+    deck = CHAIN.format("").split("*Step")[0] + BUCK2.replace("*Step", "*Step, perturbation") * 2
+    body, conv, rep = convert_str(deck)
+    assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == [", PERTURBATION", ""]
+    assert "PERTURBATION dropped. No general step precedes it" in rep.text() and not conv.reduced_physics
+
+
+FIXED_CUBE = (HEX + "*Nset, nset=X0\n1, 4, 5, 8\n*Nset, nset=Y0\n1, 2, 5, 6\n*Nset, nset=Z0\n1, 2, 3, 4\n"
+              "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+              "*Boundary\nX0, 1, 1\nY0, 2, 2\nZ0, 3, 3\n*Step\n*Static\n{}*End Step\n{}"
+              "*Step\n*Static\n{}*Cload\n6, 2, 0.5\n*End Step\n")
+
+
+def test_fixed_bc_after_a_buckle_step_holds_the_base_state():
+    # ccx 2.23's *BOUNDARY, FIXED holds a DOF at the value the step before left: after a
+    # *BUCKLE, modal dynamic or static perturbation step that step's state (probed: u1 0.0285
+    # for 0.00285), Abaqus at its base-state value.  Where the base state prescribes it, a
+    # FIXED line is written as that value (a step's own, and one the restore gives again)
+    buck = "*Step\n*Buckle\n1\n*Cload\n7, 1, 5.\n6, 3, 3.\n*End Step\n"
+    body, conv, rep = convert_str(FIXED_CUBE.format("*Boundary\n7, 1, 1, 0.01\n", buck,
+                                                    "*Boundary, fixed\n7, 1, 1\n"))
+    assert "*BOUNDARY, FIXED\n** 7, 1, 1\n** abq2ccx: held at their base-state values (ccx 2.23's FIXED " \
+           "holds the state the perturbation step left)\n*BOUNDARY, AMPLITUDE=ABQ2CCX_HOLD\n" \
+           "7, 1, 1, 0.01\n" in body.split("*STEP")[3]
+    assert "*BOUNDARY, FIXED in step(s) 3 after a *BUCKLE" in rep.text() and not conv.reduced_physics
+    given = FIXED_CUBE.replace("*Step\n*Static\n{}*End Step\n", "*Step\n*Static\n{}*End Step\n*Step\n*Static\n"
+                               "*Boundary, op=NEW\nX0, 1, 1\nY0, 2, 2\nZ0, 3, 3\n*Boundary, fixed\n7, 1, 1\n"
+                               "*End Step\n", 1)
+    body, conv, rep = convert_str(given.format("*Boundary\n7, 1, 1, 0.01\n", buck, ""))
+    assert "given again (linear perturbation step(s) 3 in between)\n*BOUNDARY, AMPLITUDE=ABQ2CCX_HOLD\n" \
+           "7, 1, 1, 0.01\n" in body.split("*STEP")[4]
+    assert "FIXED" not in body.split("*STEP")[4] and not conv.reduced_physics
+    # a DOF the base state leaves free: its value is unknown to the converter (warned)
+    body, conv, rep = convert_str(FIXED_CUBE.format("*Cload\n7, 1, 0.5\n", buck, "*Boundary, fixed\n7, 1, 1\n"))
+    assert "*BOUNDARY, FIXED\n7, 1, 1\n" in body and "only where the base state prescribes it" in rep.text()
+    assert conv.reduced_physics == ["*BOUNDARY, FIXED after a *BUCKLE / *MODAL DYNAMIC / static perturbation "
+                                    "step (ccx holds that step's state)"]
+    # after a *FREQUENCY step ccx holds the base state: left as it is
+    body, conv, rep = convert_str(FIXED_CUBE.format("*Boundary\n7, 1, 1, 0.01\n", FREQ3,
+                                                    "*Boundary, fixed\n7, 1, 1\n"))
+    assert "*BOUNDARY, FIXED\n7, 1, 1\n" in body and "FIXED in step" not in rep.text()
+
+
+def test_frequency_step_writes_no_converted_loads():
+    # ccx ignores a *FREQUENCY step's loads, and its own are commented out; so are the base
+    # state's converted nodal forces after a *BUCKLE step, which ccx dropped (they came back as
+    # a *CLOAD there)
+    deck = CHAIN.replace("*Cload\nTOP, 3, -1.\n{}", "*Dsload\nTOPS, TRVEC, 1., 0., 0., -1.\n").replace(
+        "*Boundary\nBOT", "*Surface, name=TOPS, type=ELEMENT\nEALL, S2\n*Boundary\nBOT")
+    steps = convert_str(deck + BUCK2.replace("TOP, 3", "TOP, 1") + FREQ3 +
+                        "*Step\n*Static\n*End Step\n")[0].split("*STEP")
+    assert "*CLOAD\n5, 3, -0.25\n" in steps[1] and "*CLOAD" not in steps[3]
+    assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 3, -0.25\n" in steps[4]
+
+
 def test_base_state_restore_reads_the_sets_as_written():
     # the restore resolves a target's sets as the converted deck writes them (EmittedSets):
     # the mesh's as _emit_set recorded them, so their lines stay unread (undefined members

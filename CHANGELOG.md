@@ -6,6 +6,16 @@ physics.
 
 ## Unreleased
 
+* **BCs and base states across linear perturbation steps** — a `*FREQUENCY` or `*BUCKLE`
+  step's own BCs (or its OP=NEW) stayed in force in the next one in ccx, silently (frequencies
+  2.5x too high). That step now gets the base state's BCs again. A `*BUCKLE` step between a
+  `*FREQUENCY` step and the modal step reading its modes keeps that step's BCs, which ccx
+  needs there (warned). A modal step starting with other BCs is warned about (ccx stops on
+  fewer, holds more). A `*STEP, PERTURBATION` step after a `*BUCKLE` or `*MODAL DYNAMIC` step
+  started from that step's state (16-20 % low): before any general step PERTURBATION is
+  dropped (exact), else warned. `*BOUNDARY, FIXED` after such a step or a static perturbation
+  step held that step's state; it is now the base-state value where the base state prescribes
+  the DOF, else warned. A `*FREQUENCY` step no longer gets converted nodal forces as a `*CLOAD`.
 * **Faster conversion** — reading a deck, registering and writing its mesh, and the planners'
   passes over every element are faster, and Python's cyclic garbage collector, which found
   next to nothing to collect, is off while a deck converts: about 40 % less CPU time over the

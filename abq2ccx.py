@@ -5639,6 +5639,11 @@ class EmitState:
                 self.cl_state = OrderedDict()
                 if step.proc != "FREQUENCY":
                     self.dl_state = {}
+            elif step.proc == "FREQUENCY":
+                # ccx ignores a *FREQUENCY step's loads (handle_step comments them out), so its
+                # converted nodal forces start empty too and none is written (each later step
+                # starts from load_base, or from none)
+                self.nodal_loads, self.nodal_emitted = OrderedDict(), {}
         elif restore:                               # (copies, as above: the base stays)
             loads, emitted, dl, cl = self.load_base
             self.nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in loads.items())
@@ -5666,6 +5671,7 @@ class BaseStateRestore:
         self.restore_from = conv._restore_from      # step -> the last general step before it
         self.restore_procs = conv._restore_procs    # ... -> the perturbation procedures between
         self.restore_new, self.restore_pairs = conv._restore_new, conv._restore_pairs
+        self.restore_bcs = conv._restore_bcs        # perturbation step -> None / its *FREQUENCY
         self.pert = conv._pert_idx
         self.sp_add, self.sp_temps, self.sp_temp_dep = conv._sp_add, conv._sp_temps, conv._sp_temp_dep
         self.modal_held, self.yields, self.yield_segv = \
@@ -5687,11 +5693,16 @@ class BaseStateRestore:
         self.lines: Dict[str, List[Tuple[Block, List[str]]]] = {"BOUNDARY": [], "TEMPERATURE": []}
         self.contrib: Dict[str, List[Tuple[Block, List[str], List[tuple]]]] = {"CLOAD": [], "DLOAD": []}
         self.owner: Dict[str, Dict[tuple, int]] = {"CLOAD": {}, "DLOAD": {}}
+        # the values its BCs hold (node, DOF) -> at the end of their step (None: unknown; a
+        # FIXED line's: at the start of its step)
+        self.bc_end: Dict[Tuple[int, int], Optional[float]] = {}
         # what it writes
         self.hold = conv.HOLD_AMP
         self.used_hold = False
         self.model_cards: List[str] = []            # surfaces the restore cards need
         self.done: List[int] = []                   # the steps given the base state again
+        self.bcs_done: List[int] = []               # ... its BCs alone (restore_bcs)
+        self.fixed: Dict[int, bool] = {}            # step -> its FIXED lines' values all known
         # the static perturbation steps (_add_base)
         self.summed: List[int] = []
         self.held: List[int] = []                   # the steps given *BOUNDARY, FIXED
@@ -5703,11 +5714,15 @@ class BaseStateRestore:
         for s in range(len(self.deck.steps) + 1):
             if s in self.restore_from and s in self.anchor:
                 self._give_again(s)
+                self._fixed_own(s)
+            elif s in self.restore_bcs and s in self.anchor:
+                self._give_bcs(s)
             if s in self.sp_add or s in self.sp_temps:
                 self._add_base(s)
             if s not in self.pert:                  # (a static perturbation step: given it above)
                 self._advance(s)
         self._report_added()
+        self._report_fixed()
         if not self.deck.changed:
             return self.deck
         self._note()
@@ -5988,6 +6003,8 @@ class BaseStateRestore:
             # later zero line may override it)
             first = next((j for j, (b, rec) in enumerate(entries) if self.valued(b, rec)), None)
             entries = entries[first:] if first is not None else []
+        if kw == "BOUNDARY" and self.moved(s):
+            entries = self._fixed_values(s, entries)
         again = False
         if kw == "TEMPERATURE" and mine:
             base = {n for b, rec in entries for n in self.sets.members("NSET", rec[0]) or []}
@@ -6050,17 +6067,117 @@ class BaseStateRestore:
             if self.yields:
                 self.conv._reduces("loads given again after a perturbation step ramp from 0")
 
+    def moved(self, s: int) -> bool:
+        """Whether ccx 2.23 starts step ``s`` from another state than the base state: after a
+        perturbation step other than *FREQUENCY, whose end state it holds (a *BUCKLE load
+        case's, a modal dynamic or static perturbation step's; probed), and *BOUNDARY, FIXED
+        holds a DOF there, where Abaqus holds its base-state value."""
+        return s in self.restore_from and not self.restore_procs[s] <= {"FREQUENCY"}
+
+    def _fixed_at(self, rec: List[str]) -> Optional[List[Tuple[Tuple[int, int], float]]]:
+        """The base-state values of the DOFs a FIXED line holds (None: one is unknown, as a DOF
+        the base state leaves free)."""
+        keys = self.bc_keys(rec)
+        if keys is None or any(self.bc_end.get(k) is None for k in keys):
+            return None
+        return [(k, self.bc_end[k]) for k in keys]
+
+    def _fixed_values(self, s: int, entries: List[Tuple[Block, List[str]]]
+                      ) -> List[Tuple[Block, List[str]]]:
+        """The base state's FIXED lines among ``entries`` given again in step ``s``
+        (moved()): per DOF at its base-state value where all are known, as is else."""
+        res: List[Tuple[Block, List[str]]] = []
+        plain = EmittedCard("BOUNDARY", OrderedDict(), -1, 0, -1)
+        for b, rec in entries:
+            got = self._fixed_at(rec) if b.has("FIXED") else None
+            if b.has("FIXED"):
+                self.fixed[s] = self.fixed.get(s, True) and got is not None
+            res += [(b, rec)] if got is None else \
+                [(plain, [str(n), str(d), str(d), short_real(v, 12)]) for (n, d), v in got]
+        return res
+
+    def _fixed_own(self, s: int) -> None:
+        """General step ``s``'s own *BOUNDARY, FIXED lines where moved(): written as the base-
+        state values the DOFs hold, where the converter knows them all (the base state
+        prescribes them), on the constant amplitude: in force at once, as FIXED holds them."""
+        if s in self.pert or not self.moved(s):
+            return
+        plain = EmittedCard("BOUNDARY", OrderedDict(), -1, 0, -1)
+        for b in self.by_step.get(s, []):
+            if b.keyword != "BOUNDARY" or not b.has("FIXED"):
+                continue
+            recs = b.records()
+            got = [self._fixed_at(rec) for rec in recs if rec and rec[0]] \
+                if len(b.rows) == len(recs) else [None]
+            vals = [x for g in got if g is not None for x in g]
+            self.fixed[s] = self.fixed.get(s, True) and None not in got
+            if None in got:
+                continue
+            runs: List[list] = []
+            for (n, d), v in vals:
+                params, text = self.regiven_line(plain, [str(n), str(d), str(d), short_real(v, 12)], s)
+                if runs and runs[-1][0] == params:
+                    runs[-1][1].append(text)
+                else:
+                    runs.append([params, [text]])
+            for i in b.rows:
+                self.deck.swap(i, ["** " + self.deck.lines[i].strip()])
+            self.deck.insert_after(b, ["** abq2ccx: held at their base-state values (ccx 2.23's "
+                                       "FIXED holds the state the perturbation step left)"] +
+                                   [x for params, texts in runs
+                                    for x in [emit_keyword("BOUNDARY", OrderedDict(params))] + texts])
+
+    # -- a frequency, buckling or modal step after perturbation steps ------------------------
+    def _give_bcs(self, s: int) -> None:
+        """*FREQUENCY / *BUCKLE step ``s`` (restore_bcs) given the base state's BCs right after
+        its procedure card (a *BUCKLE step before a modal step: with those the *FREQUENCY step
+        whose modes that step reads gave itself: _plan_base_restore), all at 0.  A
+        perturbation step's BC values change the base state's, and these change none (ccx:
+        *BUCKLE would take a nonzero value as part of its load; *FREQUENCY zeroes them)."""
+        if s not in self.restore_pairs:
+            return
+        f = self.restore_bcs[s]
+        entries = [] if f is not None and self.deck.steps[f - 1].acting("BOUNDARY") is not None \
+            else list(self.lines["BOUNDARY"])
+        if f is not None:
+            entries += [(b, rec) for b in self.by_step.get(f, []) if b.keyword == "BOUNDARY"
+                        for rec in b.records() if rec and rec[0]]
+        runs: List[list] = []
+        for b, rec in entries:
+            if len(rec) < 2:
+                continue
+            params = tuple((k, v) for k, v in b.params.items() if k == "MASS FLOW")
+            text = ", ".join(rec[:3] if len(rec) > 2 and rec[2] else rec[:2])
+            if runs and runs[-1][0] == params:
+                runs[-1][1].append(text)
+            else:
+                runs.append([params, [text]])
+        if s in self.restore_new:
+            runs = runs or [[(), []]]
+            runs[0][0] = (("OP", "NEW"),) + runs[0][0]
+        if not runs:
+            return
+        whose = f"of step {f} (whose modes a modal step reads)" if f else "of the base state"
+        lines = [x for params, texts in runs
+                 for x in [emit_keyword("BOUNDARY", OrderedDict(params))] + texts]
+        self.deck.insert_after(self.anchor[s], [
+            f"** abq2ccx: the BCs {whose} given again at 0 (Abaqus does not carry a linear "
+            f"perturbation step's BCs into the next one)"] + lines)
+        self.bcs_done.append(s)
+
     # -- the base state, step by step ---------------------------------------------------------
     def _advance(self, s: int) -> None:
         """The base state after general step ``s`` (0: the model data): its cards' lines
         added, after what its first card's OP=NEW removes (EmittedStep.acting; the cards
         between steps are in no step: left out); what later lines replaced forgotten."""
         st = self.deck.steps[s - 1] if s else None  # (model data: no state to remove yet)
+        start = dict(self.bc_end)                   # (what a FIXED line holds)
         for b in self.by_step.get(s, []):
             kw = b.keyword
             if st is not None and b is st.acting(kw):
                 if kw in self.lines:
                     self.lines[kw] = []
+                    self.bc_end = {} if kw == "BOUNDARY" else self.bc_end
                 else:
                     self.contrib[kw], self.owner[kw] = [], {}
             for rec in b.records():
@@ -6068,6 +6185,10 @@ class BaseStateRestore:
                     continue
                 if kw in self.lines:
                     self.lines[kw].append((b, rec))
+                    if kw == "BOUNDARY":
+                        v = None if b.has("FIXED") else self.end_value(b, rec)
+                        for k in self.bc_keys(rec) or []:
+                            self.bc_end[k] = start.get(k) if b.has("FIXED") else v
                 else:
                     ks = self.load_keys(kw, rec)
                     self.contrib[kw].append((b, rec, ks))
@@ -6139,7 +6260,7 @@ class BaseStateRestore:
                 and id(b) not in self.generated]
         temps, rest = self.base_temperatures(s) if any(b.keyword == "TEMPERATURE" for b in mine) \
             else ({}, ())
-        fixable = s not in self.restore_from or self.restore_procs[s] <= {"FREQUENCY"}
+        fixable = not self.moved(s)
         fixed: List[Tuple[int, int]] = []
         first_bc = next((b for b in mine if b.keyword == "BOUNDARY"), None)
         if deformed and first_bc is not None and first_bc.uparam("OP") == "NEW":
@@ -6275,6 +6396,28 @@ class BaseStateRestore:
                              f"written as *BOUNDARY, FIXED, which ccx 2.23 holds at the value of the "
                              f"step before: the base state's (probed).", once=True)
 
+    def _report_fixed(self) -> None:
+        """The note or warning on the *BOUNDARY, FIXED lines after a perturbation step whose end
+        state ccx holds (moved(): _fixed_values, _fixed_own)."""
+        known = [str(s) for s, ok in self.fixed.items() if ok]
+        unknown = [str(s) for s, ok in self.fixed.items() if not ok]
+        why = ("Abaqus holds the DOFs at their base-state values (the end of the last general "
+               "step), ccx 2.23 at those the perturbation step left (probed: u1 0.0285 after a "
+               "*BUCKLE load case where Abaqus holds 0.00285)")
+        if known:
+            self.report.note(f"*BOUNDARY, FIXED in step(s) {', '.join(known)} after a *BUCKLE, "
+                             f"*MODAL DYNAMIC or static perturbation step: {why}, so it is "
+                             f"written as the base-state values, which the base state "
+                             f"prescribes.", once=True)
+        if unknown:
+            self.report.warn(f"*BOUNDARY, FIXED in step(s) {', '.join(unknown)} after a *BUCKLE, "
+                             f"*MODAL DYNAMIC or static perturbation step: {why}; the converter "
+                             f"knows a base-state value only where the base state prescribes it. "
+                             f"Run that perturbation step after the general steps, or give the "
+                             f"values.", once=True)
+            self.conv._reduces("*BOUNDARY, FIXED after a *BUCKLE / *MODAL DYNAMIC / static "
+                               "perturbation step (ccx holds that step's state)")
+
     def _note(self) -> None:
         """The note on the steps given the base state again."""
         at_once = f", in force at once (amplitude {self.hold})" if self.used_hold else ""
@@ -6299,6 +6442,15 @@ class BaseStateRestore:
                              f"steps). The loads, boundary conditions and temperatures of the base "
                              f"state are given again at the start of "
                              f"{'those steps' if len(static) > 1 else 'it'}{at_once}.", once=True)
+        if self.bcs_done:
+            many = len(self.bcs_done) > 1
+            self.report.note(f"Step{'s' if many else ''} {', '.join(map(str, self.bcs_done))} "
+                             f"follow{'' if many else 's'} "
+                             f"a linear perturbation step with its own boundary conditions: Abaqus "
+                             f"does not carry them into the next perturbation step, ccx 2.23 does "
+                             f"(probed: a *FREQUENCY step's BC held in the next one, 4.04e6 for "
+                             f"6.29e5). The base state's boundary conditions are given again there, "
+                             f"at 0.", once=True)
 
     def _write_model_cards(self) -> None:
         """The HOLD_AMP amplitude and the surfaces part() made, before the first *STEP."""
@@ -6591,6 +6743,9 @@ class Converter:
         self._restore_new: set = set()              # ... whose *BOUNDARY part needs OP=NEW
         self._restore_pairs: Dict[int, set] = {}    # ... -> the base state's (node, DOF) BCs
         self._restore_procs: Dict[int, set] = {}    # ... -> the perturbation procedures before
+        # the *FREQUENCY / *BUCKLE steps given BCs again (their part of _restore_new and
+        # _restore_pairs) -> None (the base state's) or the *FREQUENCY step whose BCs
+        self._restore_bcs: Dict[int, Optional[int]] = {}
         # the static perturbation steps after another step, whose loads and BC values change
         # the base state's (_restore_base_states adds them up), and the current step is one;
         # ``_sp_temps``: the static perturbation steps with temperatures (the first one too),
@@ -10987,6 +11142,37 @@ class Converter:
                           "drops it)")
         return False
 
+    def _perturbation_after_buckle(self, proc: str, params: "OrderedDict[str, Optional[str]]") -> None:
+        """A *STEP, PERTURBATION *FREQUENCY / *BUCKLE step after a *BUCKLE or *MODAL DYNAMIC
+        step (only *FREQUENCY steps in between): ccx 2.23 takes the state that step left (a
+        buckling load case's response, the modal step's end) as its base state, where Abaqus
+        takes the last general step's (probed: a B32R column after a lateral buckling load
+        case, frequencies 20 % and buckling factors 16 % low; a step without PERTURBATION is
+        unaffected).  Before any general step PERTURBATION adds nothing else there (ccx's
+        *BUCKLE leaves initial stresses and contact out either way; _frequency_perturbation
+        keeps it on a *FREQUENCY step for its contact only), so it is dropped; else warned."""
+        src = None
+        for step in self.steps.steps[:self.emit.no - 1]:
+            src = step.no if step.proc in ("BUCKLE", "MODAL DYNAMIC") else \
+                src if step.proc == "FREQUENCY" else None
+        if src is None:
+            return
+        what = f"*STEP, PERTURBATION *{proc} step after the *{self.steps.steps[src - 1].proc} step {src}"
+        why = ("ccx 2.23 takes the state that step left (a buckling load case's response, a modal "
+               "step's end) as its base state (probed: a B32R column after a lateral buckling load "
+               "case, frequencies 20 % and buckling factors 16 % low)")
+        if not self._general_step_seen and not (proc == "FREQUENCY" and self._freq_contact):
+            del params["PERTURBATION"]
+            self.report.note(f"{what}: PERTURBATION dropped. No general step precedes it, so its "
+                             f"base state is the initial one, to which PERTURBATION adds nothing "
+                             f"here, while {why}.", once=True)
+            return
+        self.report.warn(f"{what}: Abaqus takes the last general step's state as its base state, "
+                         f"while {why}. Run the *{self.steps.steps[src - 1].proc} step after the "
+                         f"other perturbation steps.", once=True)
+        self._reduces(f"*{proc} step after a *BUCKLE / *MODAL DYNAMIC step (ccx takes that step's "
+                      f"state as its base state)")
+
     def _yield_segfaults(self, proc: Optional[str], nlgeom: bool) -> None:
         """Warn about the steps where ccx 2.23 segfaults on a plastic or creeping material
         (_restore_yields), which no form of the deck avoids (probed on both builds with a
@@ -11160,6 +11346,8 @@ class Converter:
         if proc == "FREQUENCY" and not step_block.has("PERTURBATION") and \
                 self._frequency_perturbation(False):
             params["PERTURBATION"] = None
+        if proc in ("FREQUENCY", "BUCKLE") and "PERTURBATION" in params:
+            self._perturbation_after_buckle(proc, params)
         if cur.general:
             # its temperatures, loads and prescribed motion: the base state of the steps after
             # (_frequency_perturbation)
@@ -23152,7 +23340,7 @@ class Converter:
         0 where the perturbation step removed them).  A static perturbation step after another
         step (``_sp_add``) has its own lines on what the base state loads given as the sum of
         the two (BaseStateRestore._add_base)."""
-        if not self._restore_from and not self._sp_add and not self._sp_temps:
+        if not self._restore_from and not self._restore_bcs and not self._sp_add and not self._sp_temps:
             return deck
         return BaseStateRestore(self, deck, self._mesh_sets).run()
 
@@ -31410,15 +31598,29 @@ class Converter:
         data), ``_restore_procs`` (-> the perturbation steps' procedures in between) and,
         unless the step's own first *BOUNDARY has OP=NEW (which removes the base state's BCs
         in Abaqus too), ``_restore_pairs`` (step -> the (node, DOF) pairs the base state's
-        *BOUNDARY holds).  That *BOUNDARY needs OP=NEW where a perturbation step
-        held a pair that neither the base state nor the step itself holds (``_restore_new``):
-        a BC on a free DOF lasts in ccx until OP=NEW.  OP=NEW counts where ccx acts on it
-        (op_new_cards): a later card's goes (_plan_late_op_new).  ``_sp_add``: the static
+        *BOUNDARY holds).  That *BOUNDARY needs OP=NEW where ccx still holds a pair a
+        perturbation step gave that neither the base state nor the step itself holds
+        (``_restore_new``): a BC on a free DOF lasts in ccx until OP=NEW.  OP=NEW counts where
+        ccx acts on it (op_new_cards): a later card's goes (_plan_late_op_new).  ``_sp_add``: the static
         perturbation steps after another step, whose load and BC values _restore_base_states
         adds to the base state's; ``_sp_temps``: those with temperatures, the first step's too
-        (from the initial ones); ``_sp_temp_dep``: an *ELASTIC, *EXPANSION, ... depends on them."""
+        (from the initial ones); ``_sp_temp_dep``: an *ELASTIC, *EXPANSION, ... depends on them.
+
+        Abaqus does not carry a perturbation step's BCs into the next one either ("Boundary
+        conditions do not propagate between linear perturbation steps"), ccx 2.23 does (probed:
+        a *FREQUENCY step's BC in the next *FREQUENCY step, 4.04e6 for 6.29e5; its OP=NEW too).
+        So a *FREQUENCY or *BUCKLE step that would start with another perturbation step's BCs
+        gets the base state's again (``_restore_bcs`` -> None), their pairs and OP=NEW as
+        above, from what ccx holds: the base state's BCs (unless an OP=NEW removed them) and
+        the own ones of the perturbation steps since the last step given them again.  A modal
+        or steady-state dynamics step reads the modes of the last *FREQUENCY step, with its BCs
+        (Abaqus), and ccx 2.23 needs those BCs in force there: it stops on fewer ('other
+        boundary conditions than in the input deck which created the .eig file'), holds more,
+        and refuses OP=NEW or a new one in the step ('new SPCs are not allowed'; probed).  So
+        the *BUCKLE steps between the two get that *FREQUENCY step's BCs (-> that step; warned),
+        and a modal step that starts with other BCs is warned about."""
         self._restore_from, self._restore_new, self._restore_pairs = {}, set(), {}
-        self._restore_procs, self._sp_add = {}, set()
+        self._restore_procs, self._sp_add, self._restore_bcs = {}, set(), {}
         self._sp_temps, self._sp_temp_dep = set(), False
         if not self._pert_idx:
             return
@@ -31440,32 +31642,87 @@ class Converter:
         folds = self.steps.states(lambda b: [(k, True) for k in given[id(b)]], skip=self.steps.lc2,
                                   model=True, blocks=deck)
         state = set(next(folds))
-        last, since, held = 0, set(), set()     # the perturbation procedures since, what they hold
+        last, since = 0, set()                  # the perturbation procedures since
+        # the BCs ccx holds: (the base state's kept, the perturbation steps whose own are on
+        # top), and what it held at the end of each perturbation step since
+        held: Tuple[bool, tuple] = (True, ())
+        at_end: Dict[int, Tuple[bool, tuple]] = {}
+        own: Dict[int, set] = {}
+        freq = 0                                # the last *FREQUENCY step
+        modes = {"MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
+        procs_of = [{b.keyword for b in g[1:] if b.keyword in PROC_KW} for g in groups]
+        kept: List[str] = []                    # *BUCKLE steps given a *FREQUENCY step's BCs
+        off: List[str] = []                     # modal steps with other BCs than their modes'
+
+        def pairs_of(h: Tuple[bool, tuple]) -> set:
+            return (state if h[0] else set()).union(*(own[k] for k in h[1]))
+
+        def modes_next(s: int) -> bool:         # a modal step next, only *BUCKLE steps between
+            k = s + 1
+            while k in self._pert_idx and procs_of[k - 1] == {"BUCKLE"}:
+                k += 1
+            return k in self._pert_idx and bool(procs_of[k - 1] & modes)
+
         for (s, group), end in zip(enumerate(groups, 1), folds):
             cards = [b for b in group[1:] if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2]
-            pairs = {k for b in cards for k in given[id(b)]}
+            pairs = own[s] = {k for b in cards for k in given[id(b)]}
             new = any(id(b) in acts for b in cards)
-            procs = {b.keyword for b in group[1:] if b.keyword in PROC_KW}
+            procs = procs_of[s - 1]
             if s in self._pert_idx:
                 # a static perturbation step (a general step in ccx) gets the base state again
                 # too: its loads and BCs are its own, the earlier perturbation steps' go
-                if since and procs == {"STATIC"}:
-                    self._restore_from[s], self._restore_procs[s] = last, set(since)
+                target: Tuple[bool, tuple] = (True, ())
+                if freq in at_end and (procs & modes or (procs == {"BUCKLE"} and modes_next(s))):
+                    target = at_end[freq]
+                if procs & modes:
+                    if freq in at_end and pairs_of(held) != pairs_of(target):
+                        off.append(f"{s} ({'fewer' if pairs_of(target) - pairs_of(held) else 'more'} "
+                                   f"than step {freq}'s)")
+                elif since and (procs == {"STATIC"} or (procs & {"FREQUENCY", "BUCKLE"} and
+                                                        held != target and not new)):
+                    if procs == {"STATIC"}:
+                        self._restore_from[s], self._restore_procs[s] = last, set(since)
+                    else:
+                        self._restore_bcs[s] = freq if target != (True, ()) else None
                     if not new:
-                        self._restore_pairs[s] = set(state)
-                        if held - state - pairs:
+                        self._restore_pairs[s] = pairs_of(target)
+                        if pairs_of(held) - pairs_of(target) - pairs:
                             self._restore_new.add(s)
+                    held = target
+                if procs == {"BUCKLE"} and not new and pairs_of(target) != state:
+                    kept.append(f"{s} (step {freq}'s)")
+                held = (False, (s,)) if new else (held[0], held[1] + (s,)) if cards else held
+                at_end[s] = held
+                freq = s if "FREQUENCY" in procs else freq
                 since |= procs or {""}
-                held |= pairs
                 continue
             if since:
                 self._restore_from[s], self._restore_procs[s] = last, since
                 if not new:
                     self._restore_pairs[s] = set(state)
-                    if held - state - pairs:
+                    if pairs_of(held) - state - pairs:
                         self._restore_new.add(s)
             state = set(end)                    # (pairs if new else state | pairs)
-            last, since, held = s, set(), set()
+            last, since, held, at_end = s, set(), (True, ()), {}
+        if kept:
+            self.report.warn(f"*BUCKLE step(s) {', '.join(kept)} keep the boundary conditions of the "
+                             f"*FREQUENCY step whose modes a modal or steady-state dynamics step after "
+                             f"them reads: Abaqus applies the base state's there (BCs do not "
+                             f"propagate between linear perturbation steps), but ccx 2.23 needs the "
+                             f"modes' BCs in force in that modal step and refuses OP=NEW or a new BC "
+                             f"there (probed). Run the *BUCKLE step(s) before that *FREQUENCY step.",
+                             once=True)
+            self._reduces("*BUCKLE step with the boundary conditions of a *FREQUENCY step (kept for "
+                          "the modal step that reads its modes)")
+        if off:
+            self.report.warn(f"Modal or steady-state dynamics step(s) {', '.join(off)} start with "
+                             f"other boundary conditions than the *FREQUENCY step whose modes they "
+                             f"read: Abaqus uses that step's, ccx 2.23 stops on fewer ('other boundary "
+                             f"conditions than in the input deck which created the .eig file'), holds "
+                             f"more, and refuses OP=NEW or a new BC in the step (probed). Give the "
+                             f"steps between them no boundary conditions of their own.", once=True)
+            self._reduces("modal step with other boundary conditions than its modes' (ccx stops "
+                          "on fewer, holds more)")
 
     # what loads a ccx modal dynamic step (step_load_audit's descriptions; temperatures and
     # initial stresses do not act there, probed)

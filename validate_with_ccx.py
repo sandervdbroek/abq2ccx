@@ -83,7 +83,9 @@ time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank 
 a part's pre-tension section and distributing coupling in turned instances, and a static step
 after a linear perturbation step (the state before it again; also a transformed beam joint's
 rotations and moments, a zero BC ramped in a *DYNAMIC step and a JOIN off a beam node, against
-the same decks without the perturbation step's BC or the *TRANSFORM), a coupling's INFLUENCE
+the same decks without the perturbation step's BC or the *TRANSFORM; and perturbation steps or
+*BOUNDARY, FIXED after one with its own BCs or a *BUCKLE step, against the decks without that
+step), a coupling's INFLUENCE
 RADIUS against the coupling on the nodes within it, and rotations coupled in an ORIENTATION's
 axes against the model turned into them.
 
@@ -3241,6 +3243,68 @@ def perturbation_restore_deck(pert=None):
          "27, 2, 2, 0.1", "*TEMPERATURE", "TE, 100.", "*END STEP"] +
         (steps[pert] + ["*END STEP"] if pert else []) +
         ["*STEP", "*STATIC", "*NODE PRINT, NSET=TIPS", "U", "*END STEP"]) + "\n"
+
+
+def pert_chain_deck(case, twin=False):
+    """A unit C3D8 cube (E 1000, nu 0.3, rho 1e-3) held at its bottom, its top pushed down in a
+    static step, then linear perturbation steps; ``twin``: without the first of them, which
+    Abaqus does not carry into the next one.  "freq_freq" / "freq_buckle": a *FREQUENCY step
+    holding the top sideways, then a *FREQUENCY / *BUCKLE step; "buckle_freq": a *BUCKLE step
+    holds a top corner sideways, then a *FREQUENCY step; "opnew_freq": a *FREQUENCY step with
+    OP=NEW holding fewer DOFs, then a *FREQUENCY step; "modal": a *FREQUENCY step holding the
+    top sideways, then a *FREQUENCY step, a static perturbation step and a *MODAL DYNAMIC step
+    reading the second one's modes."""
+    freq_bc = "*STEP\n*FREQUENCY\n3\n*BOUNDARY\nTOP, 1, 2\n*END STEP\n"
+    first = {"freq_freq": freq_bc, "freq_buckle": freq_bc, "modal": freq_bc,
+             "buckle_freq": "*STEP\n*BUCKLE\n2\n*BOUNDARY\n5, 1, 2\n*CLOAD\nTOP, 3, -1.\n*END STEP\n",
+             "opnew_freq": "*STEP\n*FREQUENCY\n3\n*BOUNDARY, OP=NEW\nBOT, 3, 3\n1, 1, 2\n2, 2, 2\n"
+                           "*END STEP\n"}[case]
+    then = {"freq_buckle": "*STEP\n*BUCKLE\n2\n*CLOAD\nTOP, 3, -1.\n*END STEP\n",
+            "modal": "*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n*CLOAD\n"
+                     "TOP, 1, 0.001\n*END STEP\n*STEP\n*MODAL DYNAMIC\n0.01, 0.05\n*CLOAD\n7, 3, 0.001\n"
+                     "*NODE PRINT, NSET=TOP\nU\n*END STEP\n"}.get(case, "*STEP\n*FREQUENCY\n3\n*END STEP\n")
+    return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=BOT\n1, 2, 3, 4\n*NSET, NSET=TOP\n5, 6, 7, 8\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            "1000., 0.3\n*DENSITY\n1e-3\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*BOUNDARY\nBOT, 1, 3\n"
+            "*STEP\n*STATIC\n*CLOAD\nTOP, 3, -1.\n*END STEP\n" + ("" if twin else first) + then)
+
+
+def pert_fixed_deck(case, twin=False):
+    """A unit C3D8 cube (E 1000, nu 0.3) on symmetry BCs, its corner node 7 held at u1 = 0.01 in
+    a static step that also loads node 6, then a *BUCKLE step loading both (left out in the
+    ``twin``), whose load case's response ccx 2.23 holds afterwards.  "own": the next static
+    step holds node 7 with *BOUNDARY, FIXED (Abaqus: at its base-state 0.01); "given": a second
+    static step before the *BUCKLE one holds it so after OP=NEW, which the last one carries on."""
+    pr = "*NODE PRINT, NSET=X1\nU\n"
+    if case == "own":
+        steps = ["*STEP\n*STATIC\n*BOUNDARY\n7, 1, 1, 0.01\n*CLOAD\n6, 3, 0.5\n" + pr + "*END STEP\n",
+                 "*STEP\n*STATIC\n*BOUNDARY, FIXED\n7, 1, 1\n*CLOAD\n6, 2, 0.5\n" + pr + "*END STEP\n"]
+    else:
+        steps = ["*STEP\n*STATIC\n*BOUNDARY\n7, 1, 1, 0.01\n" + pr + "*END STEP\n*STEP\n*STATIC\n"
+                 "*BOUNDARY, OP=NEW\nX0, 1, 1\nY0, 2, 2\nZ0, 3, 3\n*BOUNDARY, FIXED\n7, 1, 1\n*CLOAD\n"
+                 "6, 3, 0.5\n" + pr + "*END STEP\n",
+                 "*STEP\n*STATIC\n*CLOAD\n6, 2, 0.5\n" + pr + "*END STEP\n"]
+    buckle = "" if twin else "*STEP\n*BUCKLE\n1\n*CLOAD\n7, 1, 5.\n6, 3, 3.\n*END STEP\n"
+    return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=X0\n1, 4, 5, 8\n*NSET, NSET=Y0\n1, 2, 5, 6\n*NSET, NSET=Z0\n1, 2, 3, 4\n"
+            "*NSET, NSET=X1\n2, 3, 6, 7\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1000., 0.3\n*BOUNDARY\nX0, 1, 1\nY0, 2, 2\nZ0, 3, 3\n" + steps[0] + buckle + steps[1])
+
+
+def buckle_chain_deck(twin=False):
+    """A B32R cantilever column (10 elements, length 1, RECT 0.1 x 0.1, E 2e5; buckling load
+    about 4.1) with no general step: a *STEP, PERTURBATION *BUCKLE step loading its tip
+    sideways (left out in the ``twin``), whose load case's response ccx 2.23 then takes as the
+    base state of a *STEP, PERTURBATION step, then one pushing it down."""
+    nodes = "\n".join(f"{i + 1}, 0., 0., {i * 0.05:g}" for i in range(21))
+    elems = "\n".join(f"{i + 1}, {2 * i + 1}, {2 * i + 2}, {2 * i + 3}" for i in range(10))
+    return (f"*NODE\n{nodes}\n*ELEMENT, TYPE=B32R, ELSET=B\n{elems}\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            "2e5, 0.3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n"
+            "*BOUNDARY\n1, 1, 6\n" +
+            ("" if twin else "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n21, 1, 1.\n*END STEP\n") +
+            "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n21, 3, -1.\n*END STEP\n")
 
 
 def pert_frame_deck(case, pert=True, twin=False, n=4, blank=False):
@@ -9331,6 +9395,90 @@ def main():
                   f"displacements are the first step's ({err:.1e} apart; each cube's corner moved "
                   f"at least {moved:.3g} in a free DOF)")
         failures += 0 if ok else 1
+    # a linear perturbation step after one with its own BCs (ccx 2.23 kept them on, Abaqus
+    # applies the base state's), against the deck without that step
+    freq_t, buck_t = "E I G E N V A L U E   O U T P U T", "B U C K L I N G   F A C T O R   O U T P U T"
+
+    def eigen_tables(dat, title):
+        """Every eigenvalue (cycles/time) or buckling factor table of a .dat file, in order."""
+        return [[r[3] if len(r) == 5 else r[1] for r in rows if len(r) in (2, 5)]
+                for rows in dat_tables(dat, title)]
+
+    for case, what in (("freq_freq", "a *FREQUENCY step holding the top sideways, then a *FREQUENCY step"),
+                       ("freq_buckle", "a *FREQUENCY step holding the top sideways, then a *BUCKLE step"),
+                       ("buckle_freq", "a *BUCKLE step holding a top corner sideways, then a *FREQUENCY step"),
+                       ("opnew_freq", "a *FREQUENCY step with OP=NEW holding fewer DOFs, then a "
+                                      "*FREQUENCY step")):
+        first, last = (buck_t if case == "buckle_freq" else freq_t), (buck_t if case == "freq_buckle" else freq_t)
+
+        def read(dat, first=first, last=last):
+            a, b = eigen_tables(dat, first), eigen_tables(dat, last)
+            return (a[0] if a else [], b[-1]) if b else None
+        runs = [review_run(pert_chain_deck(case, twin), f"pert_chain_{case}" + ("_ref" if twin else ""), read)
+                for twin in (False, True)]
+        ok = all(runs)
+        if ok:
+            got, want = runs[0][1], runs[1][1]
+            err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(got, want)) if len(got) == len(want) and \
+                got else math.inf
+            # (solve evidence: positive values, and the first step's BC changed its own: it acted there)
+            acted = abs(ccx_ratio(runs[0][0][0], got[0]) - 1) if first == last and runs[0][0] else None
+            ok = err < 1e-6 and min(want) > 0.0 and (acted is None or acted > 0.01)
+            print(f"{'PASS' if ok else 'FAIL'}  pert_chain_{case} (a C3D8 cube pushed down, {what}): the "
+                  f"last step's {'buckling factors' if last == buck_t else 'frequencies'} "
+                  f"{', '.join('%.7g' % x for x in got)} vs {', '.join('%.7g' % x for x in want)} without "
+                  f"the step before ({err:.1e} apart)" +
+                  (f"; that step's own {runs[0][0][0]:.7g} ({acted:.0%} off: its BCs acted there)"
+                   if acted is not None else ""))
+        failures += 0 if ok else 1
+    # ... and a modal dynamic step reading the modes of a *FREQUENCY step after such a step, after
+    # a static perturbation step (ccx stopped on its .eig file)
+    runs = [review_run(pert_chain_deck("modal", twin), "pert_chain_modal" + ("_ref" if twin else ""),
+                       dat_node_blocks) for twin in (False, True)]
+    ok = all(runs)
+    if ok:
+        got, want = runs[0][-1], runs[1][-1]
+        err = max(abs(a - b) for n, v in want.items() for a, b in zip(got.get(n, [math.inf] * 3), v))
+        moved = max(abs(x) for v in want.values() for x in v)
+        ok = len(runs[0]) == len(runs[1]) and err <= 1e-9 * moved and moved > 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  pert_chain_modal (the cube: a *FREQUENCY step holding the top "
+              f"sideways, a *FREQUENCY step, a static perturbation step and a *MODAL DYNAMIC step reading "
+              f"the second one's modes): the modal step's last displacements {err:.1e} from the deck "
+              f"without the first *FREQUENCY step (the top moves up to {moved:.3g})")
+    failures += 0 if ok else 1
+    # *BOUNDARY, FIXED after a *BUCKLE step (ccx 2.23 held the buckling load case's response),
+    # against the deck without that step
+    for case, what in (("own", "the next static step holds node 7 with *BOUNDARY, FIXED"),
+                       ("given", "a static step before it holds node 7 with *BOUNDARY, FIXED after "
+                                 "OP=NEW, the next one carries that on")):
+        runs = [review_run(pert_fixed_deck(case, twin), f"pert_fixed_{case}" + ("_ref" if twin else ""),
+                           dat_displacements) for twin in (False, True)]
+        ok = all(runs)
+        if ok:
+            got, want = runs[0].get(7, [math.inf] * 3), runs[1].get(7, [math.nan] * 3)
+            err = max(abs(a - b) for a, b in zip(got, want))
+            ok = err < 1e-12 and abs(got[0] - 0.01) < 1e-12 and min(abs(got[1]), abs(got[2])) > 1e-4
+            print(f"{'PASS' if ok else 'FAIL'}  pert_fixed_{case} (a C3D8 cube, node 7 held at u1 0.01, "
+                  f"a *BUCKLE step loading it, then {what}): node 7 at ({', '.join('%.7g' % x for x in got)}),"
+                  f" {err:.1e} from the deck without the *BUCKLE step (u1 held at 0.01; it moves in "
+                  f"its free y and z)")
+        failures += 0 if ok else 1
+    # a *STEP, PERTURBATION *BUCKLE step after another and no general step (ccx 2.23 took the
+    # first one's load case response as its base state): PERTURBATION dropped
+    runs = [review_run(buckle_chain_deck(twin), "buckle_chain" + ("_ref" if twin else ""),
+                       lambda dat: eigen_tables(dat, buck_t)) for twin in (False, True)]
+    ok = all(runs)
+    if ok:
+        got, want = runs[0][-1], runs[1][-1]
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(got, want)) if len(got) == len(want) else math.inf
+        acted = abs(ccx_ratio(runs[0][0][0], got[0]) - 1)
+        ok = err < 1e-6 and min(want) > 0.0 and acted > 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_chain (a B32R column, no general step: a *STEP, "
+              f"PERTURBATION *BUCKLE step loading its tip sideways, then one pushing it down): the last "
+              f"step's buckling factors {', '.join('%.7g' % x for x in got)} vs "
+              f"{', '.join('%.7g' % x for x in want)} without the first ({err:.1e} apart; the first's "
+              f"{runs[0][0][0]:.7g})")
+    failures += 0 if ok else 1
     # the planners' BC and moment states after a linear perturbation step: the base state again
     def same(runs, k=None):
         """The largest difference between the NODE PRINT blocks of two runs (block ``k`` only,
