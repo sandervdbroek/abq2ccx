@@ -28724,8 +28724,10 @@ class Converter:
                     and n not in self._knots}
 
         # the steps whose OP=NEW ccx acts on (op_new_cards); handle_boundary repeats the
-        # planar constraint after it
-        acts = op_new_cards(blocks, skip=self.steps.lc2)
+        # planar constraint after it.  (Its own pair state, not StepModel.states: what follows
+        # the last step joins the model data without OP=NEW, OP=NEW clears at a step's start,
+        # and a restored step takes _restore_pairs and _restore_new's OP=NEW instead.)
+        acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
         new = [any(id(b) in acts for b in c) for c in steps]
         given = [set().union(*map(self._boundary_pairs, c)) | (planar if nw else set())
                  for c, nw in zip(steps, new)]
