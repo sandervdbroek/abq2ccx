@@ -4216,20 +4216,8 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
 
 def blocks_from_lines(lines: Sequence[str]) -> List[Block]:
     """The keyword cards of flat deck text (no *INCLUDE, *PARAMETER or keyword continuation
-    lines) — the converter's own output.  Mesh data lines are skipped."""
-    blocks: List[Block] = []
-    cur: Optional[Block] = None
-    for raw in lines:
-        s = raw.strip()
-        if not s or s.startswith("**"):
-            continue
-        if s.startswith("*"):
-            kw, params = parse_keyword_line(s)
-            cur = Block(kw, params)
-            blocks.append(cur)
-        elif cur is not None and cur.keyword not in GEOM_KW:
-            cur.data.append(s)
-    return blocks
+    lines) — the converter's own output.  Mesh data lines are skipped (EmittedDeck.blocks)."""
+    return EmittedDeck(lines).blocks()
 
 
 # ---------------------------------------------------------------------------
@@ -4458,6 +4446,234 @@ class StepModel:
 
     def __len__(self) -> int:
         return len(self.steps)
+
+
+# ---------------------------------------------------------------------------
+# The emitted deck: the converted text as the post-passes read and edit it
+# ---------------------------------------------------------------------------
+
+
+class EmittedCard(Block):
+    """A keyword card of an emitted deck (EmittedDeck) and where it stands in the text:
+    ``data``, its data lines (stripped); ``rows``, their indices; ``last``, the index of its
+    last one (its keyword line without one); ``notes``, the comment lines after its keyword
+    line up to the next card's (stripped).  A card of the deck's mesh part (``opaque``) reads
+    its data lines when they are first asked for."""
+
+    def __init__(self, keyword: str, params: "OrderedDict[str, Optional[str]]", line: int,
+                 step: int, index: int) -> None:
+        self.keyword, self.params = keyword, params
+        self.line = line                # the index of its keyword line
+        self.step = step                # 0: before the first *STEP; k: in the k-th *STEP
+                                        # (counted by the *STEP lines); -1: between steps
+        self.index = index              # its place in EmittedDeck.cards
+        self.opaque = False
+        self.notes: List[str] = []
+        self._data: List[str] = []
+        self._rows: List[int] = []
+        self._last = line
+        self._span: Optional[Tuple[Sequence[str], int]] = None     # an opaque card's lines
+        self._recs: Optional[List[List[str]]] = None
+
+    def _read(self) -> None:
+        if self._span is not None:
+            lines, end = self._span
+            self._span = None
+            for i in range(self.line + 1, end):
+                s = lines[i].strip()
+                if s and not s.startswith("**"):
+                    self._data.append(s)
+                    self._rows.append(i)
+                    self._last = i
+
+    @property
+    def data(self) -> List[str]:
+        self._read()
+        return self._data
+
+    @property
+    def rows(self) -> List[int]:
+        self._read()
+        return self._rows
+
+    @property
+    def last(self) -> int:
+        self._read()
+        return self._last
+
+    def records(self) -> List[List[str]]:
+        """merged_data_records of the card, read once."""
+        if self._recs is None:
+            self._recs = merged_data_records(self)
+        return self._recs
+
+    def op_new(self) -> bool:
+        return self.uparam("OP") == "NEW"
+
+
+class EmittedStep:
+    """A step of an emitted deck: its cards from its *STEP card (``head``, as written: the
+    PERTURBATION ccx reads) through its *END STEP (``end``).  A *STEP inside an open step (a
+    source *STEP without *END STEP, which emit_other writes inside the open one) cuts that
+    step (``end`` None) and opens a ``nested`` one: each pass says how it takes that."""
+
+    # ccx 2.23 keeps one OP=NEW flag for *DLOAD and *DSLOAD (the conversion writes *DLOAD only)
+    _SHARED_OP_NEW = {"DLOAD": ("DLOAD", "DSLOAD"), "DSLOAD": ("DLOAD", "DSLOAD")}
+
+    def __init__(self, number: int, head: EmittedCard, nested: bool) -> None:
+        self.number = number            # 1-based, by the *STEP lines
+        self.head = head
+        self.nested = nested
+        self.cards: List[EmittedCard] = [head]
+        self.end: Optional[EmittedCard] = None
+        self.proc: Optional[EmittedCard] = None     # its first procedure card (PROC_KW)
+        self._acting: Dict[str, Optional[EmittedCard]] = {}
+
+    def first(self, kw: str) -> Optional[EmittedCard]:
+        """The step's first ``kw`` card."""
+        return next((c for c in self.cards if c.keyword == kw), None)
+
+    def acting(self, kw: str) -> Optional[EmittedCard]:
+        """The card whose OP=NEW ccx 2.23 acts on for the step's ``kw`` cards: the step's
+        first card of that type when it has OP=NEW (op_new_cards; one for *DLOAD and
+        *DSLOAD), else None."""
+        if kw not in self._acting:
+            kws = self._SHARED_OP_NEW.get(kw, (kw,))
+            c = next((c for c in self.cards if c.keyword in kws), None)
+            self._acting[kw] = c if c is not None and c.op_new() else None
+        return self._acting[kw]
+
+    def next_card(self, card: EmittedCard) -> Optional[EmittedCard]:
+        """The step's card after ``card`` (None after its last)."""
+        k = card.index - self.head.index + 1
+        return self.cards[k] if k < len(self.cards) else None
+
+    @property
+    def perturbation(self) -> bool:
+        return self.head.has("PERTURBATION")
+
+
+class EmittedDeck:
+    """Flat deck text, the converter's own output, parsed once for the passes that read and
+    edit it (Converter.convert): a line is stripped; a blank or ``**`` line is a comment, a
+    ``*`` line a card's keyword line (parse_keyword_line), any other a data line of the card
+    before it (none before the first card).  The text has no *INCLUDE, *PARAMETER or keyword
+    continuation lines.  The cards whose keyword line is one of the first ``opaque_upto``
+    lines (the mesh, emit_geometry) read their data lines only when asked.  ``steps``: by
+    the *STEP lines (EmittedStep).
+
+    Edits are recorded against this parse (by line, so nothing moves) and applied by
+    render(); edited() parses the result again, so a pass that edits hands the next one a
+    new parse."""
+
+    def __init__(self, lines: Sequence[str], opaque_upto: int = 0) -> None:
+        self.lines = lines
+        self.opaque_upto = opaque_upto
+        self.cards: List[EmittedCard] = []
+        self.steps: List[EmittedStep] = []
+        self.notes: List[str] = []              # the comment lines before the first card
+        self._insert: Dict[int, List[str]] = {}     # line -> the lines written before it
+        self._swap: Dict[int, List[str]] = {}       # line -> the lines written for it
+        cur: Optional[EmittedCard] = None
+        step: Optional[EmittedStep] = None
+        lazy = False            # in an opaque card: its comments and the next keyword line only
+        for i, raw in enumerate(lines):
+            if lazy and raw[:1] != "*" and not raw[:1].isspace():
+                continue
+            s = raw.strip()
+            if not s or s.startswith("**"):
+                if s:
+                    (cur.notes if cur is not None else self.notes).append(s)
+                continue
+            if not s.startswith("*"):
+                if cur is not None and not lazy:
+                    cur._data.append(s)
+                    cur._rows.append(i)
+                    cur._last = i
+                continue
+            if lazy:
+                cur._span = (lines, i)
+            kw, params = parse_keyword_line(s)
+            n = len(self.steps)
+            if kw == "STEP":
+                cur = EmittedCard(kw, params, i, n + 1, len(self.cards))
+                step = EmittedStep(n + 1, cur, step is not None)
+                self.steps.append(step)
+            else:
+                cur = EmittedCard(kw, params, i, step.number if step else (-1 if n else 0),
+                                  len(self.cards))
+                if step is not None:
+                    step.cards.append(cur)
+                    if kw == "END STEP":
+                        step.end, step = cur, None
+                    elif kw in PROC_KW and step.proc is None:
+                        step.proc = cur
+            self.cards.append(cur)
+            cur.opaque = lazy = i < opaque_upto
+        if lazy:
+            cur._span = (lines, len(lines))
+
+    @property
+    def model(self) -> List[EmittedCard]:
+        """The cards before the first *STEP."""
+        return [c for c in self.cards if c.step == 0]
+
+    @property
+    def between(self) -> List[EmittedCard]:
+        """The cards between an *END STEP and the next *STEP (model data there)."""
+        return [c for c in self.cards if c.step == -1]
+
+    def blocks(self) -> List[Block]:
+        """The cards as Blocks, the mesh cards' (GEOM_KW) without their data lines."""
+        return [Block(c.keyword, c.params, [] if c.keyword in GEOM_KW else list(c.data))
+                for c in self.cards]
+
+    # edits
+    def insert_at(self, i: int, lines: Sequence[str]) -> None:
+        """``lines`` right before line ``i`` (after the lines given there before)."""
+        self._insert.setdefault(i, []).extend(lines)
+
+    def insert_before(self, card: EmittedCard, lines: Sequence[str]) -> None:
+        """``lines`` right before ``card``'s keyword line (after the comment lines before it)."""
+        self.insert_at(card.line, lines)
+
+    def insert_after(self, card: EmittedCard, lines: Sequence[str]) -> None:
+        """``lines`` right after ``card``'s last data line (before the comment lines after it)."""
+        self.insert_at(card.last + 1, lines)
+
+    def swap(self, i: int, lines: Sequence[str]) -> None:
+        """Line ``i`` written as ``lines`` (none: dropped)."""
+        self._swap[i] = list(lines)
+
+    def set_keyword(self, card: EmittedCard, params: "OrderedDict[str, Optional[str]]") -> None:
+        """``card``'s keyword line written again with ``params``."""
+        self.swap(card.line, [emit_keyword(card.keyword, params)])
+
+    @property
+    def changed(self) -> bool:
+        return bool(self._insert or self._swap)
+
+    def render(self) -> List[str]:
+        """The text with the edits."""
+        if not self.changed:
+            return list(self.lines)
+        res: List[str] = []
+        for i, raw in enumerate(self.lines):
+            if i in self._insert:
+                res += self._insert[i]
+            if i in self._swap:
+                res += self._swap[i]
+            else:
+                res.append(raw)
+        return res + self._insert.get(len(self.lines), [])
+
+    def edited(self) -> "EmittedDeck":
+        """This deck if nothing was edited, else a parse of render()."""
+        if not self.changed:
+            return self
+        upto = self.opaque_upto if min(list(self._insert) + list(self._swap)) >= \
+            self.opaque_upto else 0
+        return EmittedDeck(self.render(), upto)
 
 
 # ---------------------------------------------------------------------------

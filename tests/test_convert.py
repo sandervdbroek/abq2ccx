@@ -535,6 +535,52 @@ def test_op_new_on_a_later_boundary_card_only():
     assert "OP=NEW dropped" in third and "*BOUNDARY, OP=NEW\n" not in third
 
 
+def test_emitted_deck_parse():
+    # the post-passes' parse of the converted text: steps by the *STEP lines, where a *STEP
+    # inside an open step (a source *STEP without *END STEP) cuts it; a card between steps is
+    # in none (step -1); OP=NEW acts on a step's first card of its type only (*DLOAD and
+    # *DSLOAD share one); the mesh cards read their data lines when asked; edits go by line
+    text = ("** head\n*NODE\n1, 0., 0., 0.\n** mesh note\n  2, 1., 0., 0.\n*NSET, NSET=A\n1, 2\n"
+            "*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n0.1, 1.\n** after\n*CLOAD\n1, 1, 1.\n"
+            "*CLOAD, OP=NEW\n2, 1, 1.\n*STEP, PERTURBATION\n*BUCKLE\n2\n*DSLOAD\nS, P, 1.\n"
+            "*DLOAD, OP=NEW\nE, P1, 1.\n*END STEP\n*Boundary, op=NEW\n2, 1, 1\n*STEP\n*STATIC\n"
+            "*DLOAD, OP=NEW\nE, BX, 1.\n*END STEP").splitlines()
+    deck = A.EmittedDeck(text, opaque_upto=6)
+    assert [(c.keyword, c.step) for c in deck.cards] == [
+        ("NODE", 0), ("NSET", 0), ("BOUNDARY", 0), ("STEP", 1), ("STATIC", 1), ("CLOAD", 1),
+        ("CLOAD", 1), ("STEP", 2), ("BUCKLE", 2), ("DSLOAD", 2), ("DLOAD", 2), ("END STEP", 2),
+        ("BOUNDARY", -1), ("STEP", 3), ("STATIC", 3), ("DLOAD", 3), ("END STEP", 3)]
+    one, two, three = deck.steps
+    assert one.end is None and not one.nested and two.nested and two.end is deck.cards[11]
+    assert [c.keyword for c in one.cards] == ["STEP", "STATIC", "CLOAD", "CLOAD"]
+    assert two.perturbation and not three.perturbation and two.proc.keyword == "BUCKLE"
+    assert [c.data for c in deck.between] == [["2, 1, 1"]] and deck.between[0].op_new()
+    assert one.first("CLOAD").data == ["1, 1, 1."] and one.acting("CLOAD") is None
+    assert two.acting("DLOAD") is None and three.acting("DLOAD") is three.first("DLOAD")
+    assert one.next_card(one.proc) is one.first("CLOAD") and two.next_card(two.end) is None
+    assert deck.notes == ["** head"] and one.proc.notes == ["** after"]
+    assert one.proc.last == 11 and one.proc.records() == [["0.1", "1."]]
+    node, nset = deck.cards[:2]
+    assert node.opaque and nset.opaque and not deck.cards[2].opaque
+    assert node.notes == ["** mesh note"] and node._span is not None
+    assert node.rows == [2, 4] and node.data[1] == "2, 1., 0., 0." and node._span is None
+    assert nset.last == 6 and nset.records() == [["1", "2"]]
+    # the Block view (blocks_from_lines) leaves the mesh cards' data out
+    blocks = A.blocks_from_lines(text)
+    assert [(b.keyword, b.data) for b in blocks[:3]] == [("NODE", []), ("NSET", []),
+                                                         ("BOUNDARY", ["1, 1, 3"])]
+    # edits: before a keyword line, after a card's last data line, a line written again
+    assert deck.edited() is deck
+    deck.insert_after(one.proc, ["*CLOAD, OP=NEW"])
+    deck.insert_before(three.end, ["** zero", "*DLOAD", "E, GRAV, 0., 0., 0., -1."])
+    deck.set_keyword(two.head, A.OrderedDict())
+    new = deck.edited()
+    assert new.lines[10:14] == ["*STATIC", "0.1, 1.", "*CLOAD, OP=NEW", "** after"]
+    assert new.lines[18] == "*STEP" and new.lines[-5:-1] == text[-2:-1] + [
+        "** zero", "*DLOAD", "E, GRAV, 0., 0., 0., -1."]
+    assert new.opaque_upto == 6 and new.steps[0].acting("CLOAD").line == 12
+
+
 def test_rotation_tie_on_a_member_bc_makes_the_body_dependent():
     # a member rotation under a BC cannot be the tie's dependent term.  On a *RIGID BODY the BC
     # moves to the ROT NODE, as Abaqus moves it (the tie keeps the member dependent); where it
