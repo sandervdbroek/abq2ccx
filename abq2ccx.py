@@ -853,10 +853,9 @@ def canonical_keyword(keyword: str) -> str:
                  OUTPUT_ONLY_KEYWORDS | set(NUMERICAL_KEYWORDS) | MATERIAL_OPTION_CARDS |
                  U1_NONLINEAR_CARDS | HISTORY_ONLY_KW | TEMPERATURE_DOF_PROCS |
                  set(Converter._HANDLERS) | set(Converter._U1_OPTIONS) |
-                 Converter._PERTURBATION_PROCS | Converter._THERMAL_PROCEDURES |
-                 Converter._OTHER_PROCEDURES |
+                 Converter._PERTURBATION_PROCS | Converter._OTHER_PROCEDURES |
                  {"PARAMETER", "BEAM SECTION OFFSET", "FLUID CAVITY", "REBAR LAYER",
-                  "SUBSPACE DYNAMIC", "ELEMENT OPERATOR"})
+                  "SUBSPACE DYNAMIC", "ELEMENT OPERATOR", "COUPLED THERMAL-ELECTRICAL-STRUCTURAL"})
         for k in known:
             _KEYWORD_BY_COMPACT.setdefault(k.replace(" ", ""), k)
     if " " in keyword:
@@ -2457,12 +2456,22 @@ def fmt_coord(x: float) -> str:
 # Geometry keywords are consumed into the registry and emitted once, canonically.
 GEOM_KW = {"NODE", "ELEMENT", "NSET", "ELSET", "NGEN", "NFILL", "NCOPY", "NMAP", "ELGEN", "ELCOPY"}
 
-# Procedure keywords that may appear inside a *STEP.
+# The procedure keywords of ccx 2.23 (all in CCX_KEYWORDS): the procedure a step has in the
+# converted deck.  An Abaqus procedure ccx lacks (*GEOSTATIC, *SOILS, *DYNAMIC TEMPERATURE-
+# DISPLACEMENT, ...) is commented out, so its step has none there.  The other procedure sets
+# each answer their own question, some Abaqus' (TEMPERATURE_DOF_PROCS, PERTURBATION_PROCS),
+# some ccx's (CCX_THERMAL_PROCS, NO_NODAL_SDV_PROCS): their contents differ on purpose.
 PROC_KW = {"STATIC", "FREQUENCY", "BUCKLE", "DYNAMIC", "MODAL DYNAMIC", "HEAT TRANSFER",
            "VISCO", "STEADY STATE DYNAMICS", "COUPLED TEMPERATURE-DISPLACEMENT",
            "COMPLEX FREQUENCY", "ELECTROMAGNETICS", "CFD", "GREEN", "SUBSTRUCTURE GENERATE",
            "UNCOUPLED TEMPERATURE-DISPLACEMENT", "CRACK PROPAGATION", "HCF", "SENSITIVITY",
            "FEASIBLE DIRECTION", "NO ANALYSIS"}
+
+# The procedures in which ccx 2.23 solves for temperature (DOF 11): where a step's heat
+# capacity, conductivity or temperature DOF matters in the converted deck.  (Abaqus' coupled
+# thermal-electrical and explicit temperature-displacement steps are commented out.)
+CCX_THERMAL_PROCS = {"HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                     "UNCOUPLED TEMPERATURE-DISPLACEMENT"}
 
 # Procedures in which temperature is a degree of freedom (11): Abaqus does not allow a
 # predefined temperature field (*TEMPERATURE) in their steps — *BOUNDARY prescribes DOF 11
@@ -15319,8 +15328,7 @@ class Converter:
                 if v > 0:
                     (moduli if b.keyword == "ELASTIC" else dens).append(v)
         e_ref, rho_ref = max(moduli or [1.0]), max(dens or [1.0])
-        thermal = any(b.keyword in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
-                                    "UNCOUPLED TEMPERATURE-DISPLACEMENT") for b in blocks)
+        thermal = any(b.keyword in CCX_THERMAL_PROCS for b in blocks)
         if self._explicit_deck:
             rho = 1e-9 * rho_ref
             self._skin_material = (rho * (1e-3 * math.sqrt(e_ref / rho_ref)) ** 2, rho, thermal)
@@ -18455,9 +18463,6 @@ class Converter:
                     [per.get(e, default)] * len(conn)
         return thick, section
 
-    _THERMAL_PROCEDURES = {"HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
-                           "COUPLED THERMAL-ELECTRICAL", "COUPLED THERMAL-ELECTRICAL-STRUCTURAL"}
-
     def _plan_membrane_density(self, blocks: List[Block], thick: "OrderedDict[int, List[Optional[float]]]",
                                section: Dict[int, Block], opts: Dict[str, List[Block]]) -> None:
         """*MEMBRANE SECTION, DENSITY= is a mass per unit area the membrane carries besides its
@@ -18470,7 +18475,7 @@ class Converter:
         which warns."""
         if not self._mem_mass_acts:
             return
-        thermal = any(b.keyword in self._THERMAL_PROCEDURES for b in blocks)
+        thermal = any(b.keyword in CCX_THERMAL_PROCS for b in blocks)
         taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
         copies: Dict[Tuple[str, float], str] = {}
         for b in list(blocks):
@@ -19741,8 +19746,7 @@ class Converter:
         # a TIE also ties the temperature (DOF 11) where a step has one; a heat-transfer-only
         # deck has no displacements to tie
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
-        self._mpc_thermal = any(k in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
-                                      "UNCOUPLED TEMPERATURE-DISPLACEMENT") for k in procs)
+        self._mpc_thermal = any(k in CCX_THERMAL_PROCS for k in procs)
         kinds: Dict[str, str] = {}
         self._expanded = set()                 # nodes of elements ccx expands to 3-D
         rotn: set = set()                      # shell/beam nodes: rotations of their own
@@ -21050,8 +21054,7 @@ class Converter:
                         pass
             self._knot_e = max([m for m in moduli if m > 0] or [1.0])
             # a thermal step needs a conductivity on every element (ccx stops without one)
-            if any(b.keyword in ("HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
-                                 "UNCOUPLED TEMPERATURE-DISPLACEMENT") for b in blocks):
+            if any(b.keyword in CCX_THERMAL_PROCS for b in blocks):
                 ks = []
                 for b in blocks:
                     if b.keyword == "CONDUCTIVITY":

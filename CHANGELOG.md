@@ -6,6 +6,9 @@ physics.
 
 ## Unreleased
 
+* **Membrane `DENSITY=` in a deck with a `*COUPLED THERMAL-ELECTRICAL` step** — the section mass
+  was left out (warned) to keep the heat capacity of a step that ccx does not run (the step is
+  commented out); it is now carried by the material copy, as in other decks.
 * **`*BOUNDARY` line with a last DOF that is not a number** (`TOP, 3, X, 0.01`) — passed through
   as before, on which ccx stops; it is now warned, and no planner reads it as a BC on DOF 3
   (three of seven did).

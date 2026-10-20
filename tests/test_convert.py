@@ -12696,6 +12696,23 @@ def test_boundary_line_with_a_non_numeric_last_dof():
     assert conv._bc_records(card) == [([5, 6, 7, 8], [], 0.01)]
     assert conv._rate_lines(card)[0][1] == []
 
+
+def test_membrane_mass_copy_and_the_ccx_thermal_steps():
+    # a membrane's section DENSITY becomes a material copy unless ccx runs a step in which the
+    # copy's heat capacity acts (CCX_THERMAL_PROCS); Abaqus' thermal-electrical step is not one
+    # there (commented out: ccx has no such procedure)
+    deck = ("*Node\n21, 0., 3., 0.\n22, 1., 3., 0.\n23, 1., 4., 0.\n24, 0., 4., 0.\n"
+            "*Element, type=M3D4, elset=SKIN\n9, 21, 22, 23, 24\n*Nset, nset=LEFT\n21, 24\n"
+            "*Material, name=M\n*Elastic\n100000., 0.3\n*Density\n0.\n*Conductivity\n1.\n"
+            "*Specific Heat\n1.\n*Electrical Conductivity\n1.\n"
+            "*Membrane Section, elset=SKIN, material=M, density=2.\n0.01\n"
+            "*Step\n*Dynamic\n0.1, 1.\n*Boundary\nLEFT, 1, 3\n*End Step\n"
+            "*Step\n*{proc}\n0.1, 1.\n*End Step\n")
+    body, _, _ = convert_str(deck.format(proc="Coupled Thermal-Electrical"))
+    assert "*MATERIAL, NAME=M_MEMBRANE_MASS" in body
+    body, _, rep = convert_str(deck.format(proc="Heat Transfer"))
+    assert "M_MEMBRANE_MASS" not in body
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
