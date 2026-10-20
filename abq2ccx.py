@@ -13305,21 +13305,16 @@ class Converter:
         before that first card (``out``: the step's lines so far)."""
         if not self._dl_wiped:
             return
-        for i, raw in enumerate(out):
-            s = raw.strip()
-            if not s.startswith("*") or s.startswith("**"):
-                continue
-            kw, params = parse_keyword_line(s)
-            if kw != "DLOAD":
-                continue
-            if (params.get("OP") or "").strip().upper() != "NEW":
-                out[i:i] = ["** abq2ccx: the step's later *DLOAD, OP=NEW, here: ccx 2.23 acts on "
-                            "it on a step's first *DLOAD only", "*DLOAD, OP=NEW"]
-                self.report.note("*DLOAD / *DSLOAD, OP=NEW after another distributed-load card of "
-                                 "the step: ccx 2.23 acts on OP=NEW on a step's first *DLOAD / "
-                                 "*DSLOAD only (one flag for both), so a bare *DLOAD, OP=NEW is "
-                                 "written before that card.", once=True)
-            return
+        # (the first *DLOAD of the lines, also past a *STEP inside the step: EmittedStep)
+        first = next((c for c in EmittedDeck(out).cards if c.keyword == "DLOAD"), None)
+        if first is not None and not first.op_new():
+            out[first.line:first.line] = ["** abq2ccx: the step's later *DLOAD, OP=NEW, here: ccx "
+                                          "2.23 acts on it on a step's first *DLOAD only",
+                                          "*DLOAD, OP=NEW"]
+            self.report.note("*DLOAD / *DSLOAD, OP=NEW after another distributed-load card of "
+                             "the step: ccx 2.23 acts on OP=NEW on a step's first *DLOAD / "
+                             "*DSLOAD only (one flag for both), so a bare *DLOAD, OP=NEW is "
+                             "written before that card.", once=True)
 
     def _lost_loads(self, what: str, lost: List[Tuple[str, Optional[tuple]]], wiped: bool) -> None:
         """Warn of the loads of earlier steps that _loads_again could not give again (``lost``:
