@@ -288,3 +288,17 @@ ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has no la
 | `SFMGAX2` | 3 | left out of the mesh; its loads → consistent nodal forces |
 
 Abaqus surface elements have no stiffness ("membrane elements with zero thickness") and ccx has none, so they leave the mesh: element sets keep their other members, and the `TRVEC`, `TRSHR` and `P` loads they carry (element-based, or `*DSLOAD` on their `SPOS`/`SNEG` side) become consistent nodal forces on their nodes — the 3-D ones as faces (corners, then midside nodes), the axisymmetric ones as edges (end, middle, end; over the full circle). Abaqus signs: an element-based `P` acts along the element normal (right-hand rule over the nodes; axisymmetric: node 1 → 2 turned counterclockwise), a surface `P` against the surface normal. Elements that carry `*REBAR LAYER`s, or mass (`*SURFACE SECTION, DENSITY=`) in a dynamic or frequency step or under gravity, stay — ccx then stops on them — unless `--approximate`.
+
+## families ccx has none of
+
+Read with their node counts and written as they are, so ccx 2.23 stops on them ("unknown element type"); the report names the family.
+
+| Family | Abaqus types, e.g. |
+| --- | --- |
+| piezoelectric | `CPS4E`, `CAX8RE`, `C3D8E`, `C3D20RE` |
+| coupled thermal-electrical | `DC2D4E`, `DC3D8E` |
+| coupled thermal-electrical-structural | `Q3D8`, `Q3D8R`, `Q3D20` |
+| infinite | `CINPS4`, `CINAX4`, `CIN3D8`, `CIN3D12R` |
+| acoustic infinite | `ACIN2D2`, `ACIN3D3`, `ACIN3D4` |
+| acoustic | `AC2D4`, `AC3D4`, `AC3D8`, `AC3D20` |
+| joint | `JOINTC` |

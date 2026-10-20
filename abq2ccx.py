@@ -240,6 +240,28 @@ CCX_ELEMENTS = {
 # Element families with no geometric CalculiX equivalent at all.
 UNSUPPORTED_ELEM_PREFIXES = ("COH", "GK", "GKPS", "GKAX", "CONN", "ROTARYI")
 
+# Abaqus element families ccx 2.23 has no element for, nor the converter a stand-in: written
+# as they are, so ccx stops ("... is an unknown element type"), and named in the report.
+# (pattern, family, examples); the group is the node count (JOINTC: 2).
+LACKING_ELEMENTS = (
+    (r"C(?:PS|PE|AX|3D)(\d+)R?E", "piezoelectric", "CPS4E, CAX8RE, C3D8E, C3D20RE"),
+    (r"DC(?:1D|2D|3D|AX)(\d+)E", "coupled thermal-electrical", "DC2D4E, DC3D8E"),
+    (r"Q3D(\d+)R?H?", "coupled thermal-electrical-structural", "Q3D8, Q3D8R, Q3D20"),
+    (r"CIN(?:PS|PE|AX|3D)(\d+)R?", "infinite", "CINPS4, CINAX4, CIN3D8, CIN3D12R"),
+    (r"ACIN(?:2D|3D|AX)(\d+)", "acoustic infinite", "ACIN2D2, ACIN3D3, ACIN3D4"),
+    (r"AC(?:1D|2D|3D|AX)(\d+)", "acoustic", "AC2D4, AC3D4, AC3D8, AC3D20"),
+    (r"JOINTC()", "joint", "JOINTC"),
+)
+
+
+def lacking_element(typ: str) -> Optional[Tuple[str, int]]:
+    """(family, node count) of an Abaqus element type in LACKING_ELEMENTS, else None."""
+    for pat, what, _ in LACKING_ELEMENTS:
+        m = re.fullmatch(pat, typ.upper())
+        if m:
+            return what, int(m.group(1) or 2)
+    return None
+
 # Integration points per (emitted ccx) element type — empirically probed against ccx 2.22
 # by counting *EL PRINT stress rows on single-element decks.  NOTE the 2D counts are the
 # counts of the internally EXPANDED 3D elements (ccx expands plane/axisym to bricks and
@@ -270,7 +292,8 @@ def element_node_count(typ: str) -> Optional[int]:
             return ELEMENT_NNODES[base]
         if base in ELEMENT_TYPE_MAP:
             return ELEMENT_NNODES.get(ELEMENT_TYPE_MAP[base])
-    return None
+    lacking = lacking_element(typ)
+    return lacking[1] if lacking else None
 
 
 def split_suffixes(typ: str) -> Tuple[str, str]:
@@ -359,6 +382,12 @@ def ccx_element_type(typ: str, report: "Report") -> str:
         report.warn(f"Element {typ} (cohesive/gasket/connector/rotary-inertia) has NO CalculiX "
                     f"equivalent; emitted unchanged. Remodel with contact, *SPRING/*GAP, *MPC or "
                     f"*MASS — the deck will not run until this is addressed.", once=True)
+        return typ
+    lacking = lacking_element(typ)
+    if lacking:
+        report.warn(f"Element {typ} is an Abaqus {lacking[0]} element: ccx 2.23 has none, and the "
+                    f"converter no stand-in, so it is emitted unchanged and ccx stops ('*ERROR "
+                    f"reading *ELEMENT: {typ} is an unknown element type').", once=True)
         return typ
     report.warn(f"Element {typ} is unknown to this converter; emitted unchanged — confirm your "
                 f"ccx version supports it.", once=True)
@@ -4941,6 +4970,8 @@ class Converter:
         # (type, nodes), and the full member list of each element set that had some
         self._carriers: "OrderedDict[int, Tuple[str, List[int]]]" = OrderedDict()
         self._carrier_sets: Dict[str, List[int]] = {}
+        # why the deck's *DSFLUX / *SFILM / *SRADIATE stay commented (_plan_surface_heat)
+        self._surface_heat_why: Dict[str, str] = {}
         # connector elements (see _plan_connectors): element -> (type, node a, node b), None
         # for a grounded node.  They are constraints in ccx, never emitted as elements.
         self._conn: "OrderedDict[int, Tuple[str, Optional[int], Optional[int]]]" = OrderedDict()
@@ -5467,6 +5498,9 @@ class Converter:
         "DFLUX": "handle_flux_film",
         "CFLUX": "handle_flux_film",
         "RADIATE": "handle_flux_film",
+        "DSFLUX": "handle_surface_heat",
+        "SFILM": "handle_surface_heat",
+        "SRADIATE": "handle_surface_heat",
         "NORMAL": "handle_normal",
         "NODAL THICKNESS": "handle_nodal_thickness",
         "EQUATION": "handle_equation",
@@ -17241,6 +17275,140 @@ class Converter:
             return self.passthrough(b)
         return ([emit_keyword(b.keyword, b.params)] + kept if kept else []) + side
 
+    # the surface-based heat loads: their element-based ccx card, its face label letter, and
+    # the parameters ccx's card reads
+    _SURFACE_HEAT = {"DSFLUX": ("DFLUX", "S", ("OP", "AMPLITUDE")),
+                     "SFILM": ("FILM", "F", ("OP", "AMPLITUDE", "FILM AMPLITUDE")),
+                     "SRADIATE": ("RADIATE", "R", ("OP", "AMPLITUDE"))}
+
+    def _plan_surface_heat(self, blocks: List[Block]) -> None:
+        """Why the *DSFLUX / *SFILM / *SRADIATE cards of the deck cannot be written as ccx's
+        element-based *DFLUX / *FILM / *RADIATE (handle_surface_heat), per keyword: where the
+        deck has both forms and an OP=NEW (Abaqus' removes the earlier loads of its own card
+        only, ccx's those of both), an OP=NEW in a step with several cards of the pair (ccx acts
+        on the first card's only), or element faces that a surface card and another surface or
+        an element-based card both load (Abaqus applies both, ccx keeps one value per face)."""
+        self._surface_heat_why = {}
+        steps = [s.cards for s in self.steps.steps]
+        for skw, (ekw, letter, _) in self._SURFACE_HEAT.items():
+            cards = [b for b in blocks if b.keyword in (skw, ekw)]
+            if not any(b.keyword == skw for b in cards):
+                continue
+            op_new = any(b.uparam("OP") == "NEW" for b in cards)
+            if op_new and len({b.keyword for b in cards}) == 2:
+                self._surface_heat_why[skw] = (f"the deck also has *{ekw} cards and an OP=NEW: "
+                                               f"Abaqus' OP=NEW removes the earlier loads of its "
+                                               f"own card only, ccx's those of both")
+                continue
+            if op_new and any(sum(b.keyword in (skw, ekw) for b in g) > 1 for g in steps):
+                self._surface_heat_why[skw] = (f"a step has several *{skw} / *{ekw} cards and an "
+                                               f"OP=NEW, which ccx acts on on a step's first card "
+                                               f"only")
+                continue
+            src: Dict[Tuple[int, str], set] = {}
+            for b in cards:
+                for rec in merged_data_records(b):
+                    g = [x.strip() for x in rec]
+                    if len(g) < 2 or not g[0]:
+                        continue
+                    if b.keyword == ekw:
+                        m = re.fullmatch(letter + r"([1-6])(NU)?", g[1].upper())
+                        for e in self._load_elements(g[0]) if m else []:
+                            src.setdefault((e, m.group(1)), set()).add(("element", g[0].upper()))
+                        continue
+                    sd = self.surfaces.get(g[0].upper())
+                    for token, face in sd[1] if sd and not sd[0].startswith("NODE") else []:
+                        if face and re.fullmatch(r"S[1-6]", face):
+                            for e in self._load_elements(token):
+                                src.setdefault((e, face[1]), set()).add(("surface", g[0].upper()))
+            if any(len(s) > 1 and any(k == "surface" for k, _ in s) for s in src.values()):
+                self._surface_heat_why[skw] = (f"element faces it loads are also loaded by another "
+                                               f"surface or a *{ekw} card: Abaqus applies both, ccx "
+                                               f"keeps one value per face")
+
+    def handle_surface_heat(self, b: Block) -> List[str]:
+        """``*DSFLUX`` / ``*SFILM`` / ``*SRADIATE`` (surface-based flux, film and radiation):
+        ccx's element-based ``*DFLUX`` / ``*FILM`` / ``*RADIATE`` on the faces of the surface's
+        elements — face ``Sn`` becomes label ``Sn`` / ``Fn`` / ``Rn`` (ccx numbers solid and
+        plane element faces as Abaqus does; validate_with_ccx.py surface_heat_loads), the
+        magnitude fields as they are, a blank one 0 (Abaqus).  Where the deck's cards would not
+        act the same in ccx (_plan_surface_heat) the card is commented out, as are lines on
+        another face (a shell's SPOS / SNEG), a node-based surface, faces of rigid or surface
+        elements, a *FILM PROPERTY table, AVG cavity radiation, and user-subroutine labels."""
+        ekw, letter, allowed = self._SURFACE_HEAT[b.keyword]
+        why = self._surface_heat_why.get(b.keyword)
+        if why:
+            return self._commented(b, f"*{b.keyword} not converted to ccx's *{ekw}: {why}. "
+                                      f"Commented out, so ccx solves the model without it.")
+        if b.has("USER"):
+            return self._user_load_card(b)
+        body: List[str] = []
+        side: List[str] = []
+        rigid = set(self.geom.elsets.get(RIGID_SET, []))
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            if not any(g):
+                continue
+            if len(g) < 2 or not g[1]:
+                side += self._drop_load_line(b, g, "it has no load type label")
+                continue
+            if _is_user_load(b, g):
+                side += self._user_load_line(b, g)
+                continue
+            label = g[1].upper()
+            if label != letter:
+                side += self._drop_load_line(b, g, f"the label {label} has no ccx counterpart" +
+                                             (" (approximate cavity radiation)" if label == "AVG"
+                                              else ""))
+                continue
+            n_val = 1 if ekw == "DFLUX" else 2
+            values = [x or "0." for x in g[2:2 + n_val]]
+            values += ["0."] * (n_val - len(values))
+            try:
+                for x in values:
+                    pf(x)
+            except ValueError:
+                side += self._drop_load_line(b, g, "a value is not a number (a *FILM PROPERTY "
+                                                   "table: ccx's *FILM takes a film coefficient)")
+                continue
+            sd = self.surfaces.get(g[0].upper())
+            if not sd or sd[0].startswith("NODE"):
+                side += self._drop_load_line(b, g, f"surface '{g[0]}' is not defined in the deck" if
+                                             not sd else f"'{g[0]}' is a node-based surface (the "
+                                                         f"load needs element faces)")
+                continue
+            lines: List[str] = []
+            bad = None
+            for token, face in sd[1]:
+                eids = self._load_elements(token)
+                types = {ccx_type(self.geom.elements[e][0]) for e in eids if e in self.geom.elements}
+                if not face or not re.fullmatch(r"S[1-6]", face):
+                    bad = f"face '{face or '?'}' of '{token}' is not a solid or plane element face"
+                elif any(e in self._carriers or e in rigid for e in eids):
+                    bad = f"'{token}' holds surface or rigid elements, which carry no heat in ccx"
+                elif any(e in self._slabs for e in eids):
+                    bad = f"'{token}' holds CPS4I / CPE4I elements, which ccx runs as C3D8I slabs"
+                elif any(t in SHELL_TYPES or t in BEAM_TYPES or t.startswith("M3D") for t in types):
+                    bad = f"'{token}' holds shell, membrane or beam elements"
+                else:
+                    lines.append(", ".join([token, letter + face[1]] + values))
+                    continue
+                break
+            if bad:
+                side += self._drop_load_line(b, g, bad)
+                continue
+            body += lines
+        out: List[str] = []
+        if body or b.uparam("OP") == "NEW":           # (an empty OP=NEW card removes them all)
+            self.report.note(f"*{b.keyword} -> ccx's element-based *{ekw}: each face Sn of the "
+                             f"surface gets label {letter}n (ccx numbers solid and plane element "
+                             f"faces as Abaqus does).", once=True)
+            out = [emit_keyword(ekw, self._load_params(b, allowed))] + body
+        if not out and not side:
+            return [] if not any(x.strip() for x in b.data) else \
+                self._commented(b, f"Could not convert *{b.keyword}; edit manually.")
+        return out + side
+
     def _default_temperature_ic(self) -> List[str]:
         """Initial temperatures for a deck that applies ``*TEMPERATURE`` without any: Abaqus
         starts every node at 0, and ccx reads a *TEMPERATURE card only after thermal
@@ -17695,6 +17863,8 @@ class Converter:
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
         self._prescan(blocks)
+        self._plan_member_mass_tets(blocks)     # after _prescan: its *MPC BEAM bodies
+        self._plan_surface_heat(blocks)
         self._plan_amplitude_spans(blocks)
         self._plan_load_cases(blocks)
         self._plan_rigid_planar_holds()             # after _prescan: the bodies' ROT NODEs
@@ -19146,28 +19316,7 @@ class Converter:
                 self.geom.add_element(eid, "C3D4", conn)
                 tets.append(eid)
             self.geom.add_to_elset(RIGID_SET, tets)
-            # the body takes the star's nodes: a new TIE NSET with its tie members and them
-            # (the deck's own sets are left as they are)
-            params = OrderedDict()
-            old: List[int] = []
-            tset = None
-            for k, v in body.params.items():
-                if k == "TIE NSET" and v and v.strip().upper() in self._rigid_own_sets:
-                    tset = v.strip().upper()           # the converter's own: extend it
-                    params[k] = v
-                elif k == "TIE NSET" and v:
-                    old += self.geom.nset(v)
-                elif k == "ELSET" and v:
-                    old += [n for e in self.geom.elset(v) if e in self.geom.elements
-                            for n in self.geom.elements[e][1]]
-                else:
-                    params[k] = v
-            if tset is None:
-                tset = self._rigid_set_name("ABQ2CCX_RBN")
-                self._rigid_own_sets.add(tset)
-                params["TIE NSET"] = tset
-            self.geom.nsets[tset] = dedup(self.geom.nsets.get(tset, []) + old + star_nodes)
-            body.params = params
+            self._add_rigid_members(body, star_nodes)
             done.update(e for _, e in items)
             self.report.note(f"Rotary inertia of the rigid body of reference node {ref} -> six point "
                              f"masses on its principal axes around node {centre} (the body node with "
@@ -19183,6 +19332,92 @@ class Converter:
         for name, ids in self.geom.elsets.items():
             if any(i in done for i in ids):
                 self.geom.elsets[name] = [i for i in ids if i not in done]
+
+    def _add_rigid_members(self, body: Block, nodes: List[int]) -> None:
+        """Make ``nodes`` TIE members of deck *RIGID BODY ``body``: a new TIE NSET with its tie
+        members and them (the deck's own sets are left as they are)."""
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        old: List[int] = []
+        tset = None
+        for k, v in body.params.items():
+            if k == "TIE NSET" and v and v.strip().upper() in self._rigid_own_sets:
+                tset = v.strip().upper()           # the converter's own: extend it
+                params[k] = v
+            elif k == "TIE NSET" and v:
+                old += self.geom.nset(v)
+            elif k == "ELSET" and v:
+                old += [n for e in self.geom.elset(v) if e in self.geom.elements
+                        for n in self.geom.elements[e][1]]
+            else:
+                params[k] = v
+        if tset is None:
+            tset = self._rigid_set_name("ABQ2CCX_RBN")
+            self._rigid_own_sets.add(tset)
+            params["TIE NSET"] = tset
+        self.geom.nsets[tset] = dedup(self.geom.nsets.get(tset, []) + old + nodes)
+        body.params = params
+
+    def _plan_member_mass_tets(self, blocks: List[Block]) -> None:
+        """ccx 2.23's *FREQUENCY stops ('add_bo_st: coefficient should be 0') on a *MASS at a
+        member node of a rigid body (a *RIGID BODY, the body of *MPC BEAM lines) that belongs
+        to no other element (probed; a *DYNAMIC step runs it).  Each such node gets a
+        zero-density tetrahedron (elset ABQ2CCX_RIGID, the skins' material) with three new
+        nodes the body also carries: it moves rigidly with the body, so it strains nothing and
+        the solution is the deck's (probed: the frequencies of a spring-held body equal those
+        with the node also in a spring inside the body; NAFEMS FV4's equal those of its *MPC
+        BEAM lines as linear equations to 5 digits).  Not in an axisymmetric model, as for the
+        rotary-inertia stars."""
+        if not any(b.keyword == "FREQUENCY" for b in blocks) or \
+                any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values()):
+            return
+        kinds: Dict[int, set] = {}
+        for _e, (t, conn) in self.geom.elements.items():
+            for n in conn:
+                kinds.setdefault(n, set()).add(t.upper())
+        bare = {n for n, ts in kinds.items() if ts == {"MASS"}}
+        if not bare:
+            return
+        bodies: List[Tuple[Optional[Block], dict, List[int]]] = []
+        for b in blocks:
+            if b.keyword == "RIGID BODY" and not b.param("ANALYTICAL SURFACE"):
+                tie, pin = self._rigid_body_members(b)
+                ref = self._ref_node(b)
+                bodies.append((b, {}, [n for n in tie + pin if n != ref]))
+        for group in self._mpc_bodies.values():
+            for body in group:
+                bodies.append((None, body, [n for n in body["members"]
+                                            if n not in (body["ref"], body.get("rot"))]))
+        nid, eid = self._next_ids()
+        h = 1e-3 * self._model_span()
+        done: List[int] = []
+        for card, body, members in bodies:
+            new: List[int] = []
+            for n in [m for m in dedup(members) if m in bare and m not in done]:
+                c = self.geom.nodes[n]
+                conn = [n]
+                for axis in ((h, 0.0, 0.0), (0.0, h, 0.0), (0.0, 0.0, h)):
+                    nid += 1
+                    self.geom.add_node(nid, vadd(c, axis))
+                    conn.append(nid)
+                eid += 1
+                self.geom.add_element(eid, "C3D4", conn)        # positive volume h^3 / 6
+                self.geom.add_to_elset(RIGID_SET, [eid])
+                new += conn[1:]
+                done.append(n)
+            if not new:
+                continue
+            if card is not None:
+                self._add_rigid_members(card, new)
+            else:
+                body["members"] = list(body["members"]) + new
+        if done:
+            self._plan_skin_material(blocks)
+            self.report.note(f"*MASS on {len(done)} rigid-body member node(s) in no other element "
+                             f"(e.g. node {done[0]}): each got a force-free, massless tetrahedron "
+                             f"(elset {RIGID_SET}) of three new nodes the body carries — ccx 2.23's "
+                             f"*FREQUENCY stops on such a mass ('add_bo_st: coefficient should be "
+                             f"0'); the tetrahedron moves rigidly with the body, so the solution is "
+                             f"the same.", once=True)
 
     def _rotary_axes(self, card: Block) -> Optional[List[Vec]]:
         """The axes (rows) a *ROTARY INERTIA's values refer to: global, or a rectangular

@@ -419,6 +419,12 @@ TRANSLATED = {
     "*FILM / *DFLUX / *CFLUX / *RADIATE": "passed through, except loads from an Abaqus user "
         "subroutine (`USER`, a `...NU` label): commented, naming ccx's `film.f` / `dflux.f` / "
         "`cflux.f` / `radiate.f` (kept, ccx would run its stock subroutine instead).",
+    "*DSFLUX / *SFILM / *SRADIATE": "→ ccx's element-based `*DFLUX` / `*FILM` / `*RADIATE`: face "
+        "`Sn` of the surface's solid or plane elements → label `Sn` / `Fn` / `Rn`, a blank value 0 "
+        "(`validate_with_ccx.py surface_heat_loads_*`). Commented out where ccx would act "
+        "differently: an `OP=NEW` with both card forms in the deck (Abaqus removes its own form "
+        "only) or in a step with several cards, faces another card also loads (Abaqus adds them), "
+        "shell faces, a `*FILM PROPERTY` table, `AVG` cavity radiation, `...NU` labels.",
     "*CONTACT PAIR": "missing `TYPE` → `NODE TO SURFACE` (the Abaqus/Standard default; the note "
         "suggests `SURFACE TO SURFACE` if ccx struggles to converge); `TIED` → `*TIE` (on a rigid "
         "master: its slave nodes join the rigid body; on membranes their nodes, see `*TIE`); "
@@ -763,6 +769,12 @@ def gen_elements():
                          "exact for `B23`/`B33` in statics; the shear-flexible ones lose their shear "
                          "deformation, and its mass matrix differs from Abaqus' cubic beams' (reduced "
                          "physics). In a 2-D model DOFs 3–5 are held at every `U1` node.\n")
+    parts.append("## families ccx has none of\n")
+    parts.append("Read with their node counts and written as they are, so ccx 2.23 stops on them "
+                 "(\"unknown element type\"); the report names the family.\n")
+    parts.append(md_table(["Family", "Abaqus types, e.g."],
+                          [(what, ", ".join(f"`{t}`" for t in ex.split(", ")))
+                           for _, what, ex in A.LACKING_ELEMENTS]) + "\n")
     return "\n".join(parts)
 
 

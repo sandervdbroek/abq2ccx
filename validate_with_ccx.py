@@ -3702,6 +3702,76 @@ def frequency_preload_deck(nlgeom=False, pert=False, preload="grav"):
                              "*END STEP"]) + "\n"
 
 
+def surface_heat_deck(kind, out="film", op_new=False):
+    """A bar of four unit elements (DC3D8 along x; DC2D4 of thickness 1 along x; DCAX4 along
+    z at radii 1-2: ``kind``), conductivity 2, in steady heat transfer: *DSFLUX of 100 into
+    the bar's first end (face S6 / edge S4 / edge S1) and, at its other end (S4 / S2 / S3),
+    *SFILM to 20 with h = 10 (``out`` "film") or *SRADIATE to 20 with emissivity 0.5
+    ("radiate"); the sides are insulated, so the temperature is linear along the bar with
+    slope -50.  ``op_new``: a second step whose empty *DSFLUX, OP=NEW and *SFILM / *SRADIATE,
+    OP=NEW remove both, with the first end held at 100: the bar at 100 throughout."""
+    lines = ["*HEADING", f"Bar, *DSFLUX in, *S{'FILM' if out == 'film' else 'RADIATE'} out",
+             "*NODE, NSET=ALLN"]
+    nid = {}
+    for k in range(1 if kind != "dc3d8" else 2):
+        for j in range(2):
+            for i in range(5):
+                nid[(i, j, k)] = 1 + i + 5 * j + 10 * k
+                xyz = (1.0 + j, float(i), 0.0) if kind == "dcax4" else (float(i), float(j), float(k))
+                lines.append(f"{nid[(i, j, k)]}, " + ", ".join(str(x) for x in xyz))
+    if kind == "dc3d8":
+        lines.append("*ELEMENT, TYPE=DC3D8, ELSET=BAR")
+        lines += [f"{i + 1}, {nid[(i, 0, 0)]}, {nid[(i + 1, 0, 0)]}, {nid[(i + 1, 1, 0)]}, "
+                  f"{nid[(i, 1, 0)]}, {nid[(i, 0, 1)]}, {nid[(i + 1, 0, 1)]}, {nid[(i + 1, 1, 1)]}, "
+                  f"{nid[(i, 1, 1)]}" for i in range(4)]
+        faces = ("S6", "S4")
+    elif kind == "dc2d4":
+        lines.append("*ELEMENT, TYPE=DC2D4, ELSET=BAR")
+        lines += [f"{i + 1}, {nid[(i, 0, 0)]}, {nid[(i + 1, 0, 0)]}, {nid[(i + 1, 1, 0)]}, "
+                  f"{nid[(i, 1, 0)]}" for i in range(4)]
+        faces = ("S4", "S2")
+    else:                                   # counterclockwise in (r, z): S1 at z_i, S3 at z_i+1
+        lines.append("*ELEMENT, TYPE=DCAX4, ELSET=BAR")
+        lines += [f"{i + 1}, {nid[(i, 0, 0)]}, {nid[(i, 1, 0)]}, {nid[(i + 1, 1, 0)]}, "
+                  f"{nid[(i + 1, 0, 0)]}" for i in range(4)]
+        faces = ("S1", "S3")
+    lines += ["*ELSET, ELSET=FIRST", "1", "*ELSET, ELSET=LAST", "4",
+              "*NSET, NSET=START", ", ".join(str(n) for (i, _, _), n in nid.items() if i == 0),
+              "*SURFACE, NAME=HOT", f"FIRST, {faces[0]}", "*SURFACE, NAME=COLD", f"LAST, {faces[1]}",
+              "*SOLID SECTION, ELSET=BAR, MATERIAL=M", "1.", "*MATERIAL, NAME=M",
+              "*CONDUCTIVITY", "2."]
+    card = "SFILM" if out == "film" else "SRADIATE"
+    if out == "radiate":
+        lines += ["*PHYSICAL CONSTANTS, ABSOLUTE ZERO=-273.15, STEFAN BOLTZMANN=5.67E-8"]
+    lines += ["*STEP", "*HEAT TRANSFER, STEADY STATE", "1., 1.", "*DSFLUX", "HOT, S, 100.",
+              f"*{card}", "COLD, F, 20., 10." if out == "film" else "COLD, R, 20., 0.5",
+              "*NODE PRINT, NSET=ALLN", "NT", "*END STEP"]
+    if op_new:
+        lines += ["*STEP", "*HEAT TRANSFER, STEADY STATE", "1., 1.", "*DSFLUX, OP=NEW",
+                  f"*{card}, OP=NEW", "*BOUNDARY", "START, 11, 11, 100.", "*NODE PRINT, NSET=ALLN",
+                  "NT", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def member_mass_frequency_deck(mpc):
+    """A rigid body held by an x spring (k 1000) and a y spring (4000) from its reference node
+    1, which BCs keep from moving otherwise; its only mass, 2.5, sits on member node 4, which
+    is in no other element (ccx 2.23's *FREQUENCY stopped on it: 'add_bo_st'): the body as a
+    *RIGID BODY, or with ``mpc`` as an *MPC BEAM line.  Modes sqrt(k / m) / (2 pi)."""
+    lines = ["*HEADING", "Spring-held rigid body, its mass on a member node in no other element",
+             "*NODE", "1, 0., 0., 0.", "4, 1., 1., 0.", "11, -1., 0., 0.", "12, 0., -1., 0.",
+             "*ELEMENT, TYPE=SPRINGA, ELSET=SX", "101, 1, 11", "*SPRING, ELSET=SX", "", "1000.",
+             "*ELEMENT, TYPE=SPRINGA, ELSET=SY", "102, 1, 12", "*SPRING, ELSET=SY", "", "4000.",
+             "*ELEMENT, TYPE=MASS, ELSET=M4", "201, 4", "*MASS, ELSET=M4", "2.5"]
+    if mpc:
+        lines += ["*MPC", "BEAM, 4, 1"]
+    else:
+        lines += ["*NSET, NSET=B", "4", "*RIGID BODY, REF NODE=1, TIE NSET=B"]
+    lines += ["*BOUNDARY", "11, 1, 3", "12, 1, 3", "1, 3, 6", "*STEP", "*FREQUENCY", "1",
+              "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
 def frequency_heated_deck(heat=True, t0=20.0, hyper=False):
     """buckle_gravity_deck's column with E 210e9 at 20 and 105e9 at 120 (rows), at the initial
     temperature ``t0``; ``heat``: a static step raising it to 120 (no load, no expansion: no
@@ -9055,6 +9125,47 @@ def main():
         failures += 0 if ok else 1
     for d in r20_dirs:
         shutil.rmtree(d, ignore_errors=True)
+
+    # surface-based heat loads as ccx's element-based cards (they were commented out): a bar
+    # heated by *DSFLUX at one end and cooled by *SFILM / *SRADIATE at the other, on DC3D8, on
+    # DC2D4 and on DCAX4 (whose edge numbering ccx must read as Abaqus does): linear along the
+    # bar, exactly; then empty OP=NEW cards remove both (the bar at its held 100 throughout)
+    def temps(dat):
+        blocks = [{int(r[0]): r[1] for r in rows if len(r) == 2} for rows in dat_tables(dat, "temperatures")]
+        return blocks if blocks and all(blocks) else None
+    for kind in ("dc3d8", "dc2d4", "dcax4"):
+        for out in ("film", "radiate"):
+            tag = f"surface_heat_loads_{kind}_{out}"
+            steps = review_run(surface_heat_deck(kind, out, op_new=True), tag, temps)
+            if not steps or len(steps) != 2:
+                failures += 1
+                continue
+            t, t2 = steps
+            cold = 30.0 if out == "film" else \
+                ((20.0 + 273.15) ** 4 + 100.0 / (0.5 * 5.67e-8)) ** 0.25 - 273.15
+            want = {n: cold + 50.0 * (4 - (n - 1) % 5) for n in t}
+            err = max(abs(t[n] - want[n]) for n in t) / 200.0
+            err2 = max(abs(v - 100.0) for v in t2.values()) / 100.0
+            ok = len(t) == (20 if kind == "dc3d8" else 10) and err2 < 1e-6 and \
+                err < (1e-6 if out == "film" else 1e-5)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (*DSFLUX 100 in at one end, *S"
+                  f"{'FILM' if out == 'film' else 'RADIATE'} out at the other, k = 2): T = "
+                  f"{max(t.values()):.6g} .. {min(t.values()):.6g} ({cold + 200:.6g} .. {cold:.6g}; "
+                  f"{err:.1e} of the span off); after both cards' OP=NEW, held at 100: "
+                  f"{min(t2.values()):.7g} .. {max(t2.values()):.7g}")
+            failures += 0 if ok else 1
+    # a *MASS on a rigid-body member node in no other element (ccx's *FREQUENCY stopped on it)
+    for mpc in (False, True):
+        tag = f"member_mass_frequency_{'mpc_beam' if mpc else 'rigid_body'}"
+        f = review_run(member_mass_frequency_deck(mpc), tag,
+                       lambda dat: dat_eigen_table(dat, "E I G E N V A L U E"))
+        want = math.sqrt(1000.0 / 2.5) / (2 * math.pi)
+        ok = bool(f) and abs(f[0] / want - 1) < 1e-6
+        if f:
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a spring-held {'*MPC BEAM' if mpc else '*RIGID BODY'}"
+                  f" body, its mass on a member node in no other element): f = {f[0]:.7g} "
+                  f"(sqrt(k/m)/2pi = {want:.7g})")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

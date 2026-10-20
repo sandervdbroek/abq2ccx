@@ -14543,6 +14543,88 @@ def test_orientation_without_axes_ccx_could_take():
         body, conv, _ = convert_str(HEX + eng + ori + sec)
         assert "\n*ORIENTATION" not in body
         assert "*ORIENTATION OR1 (no axes ccx can take)" in conv.reduced_physics
+def test_surface_heat_loads_become_element_based_cards():
+    # *DSFLUX / *SFILM / *SRADIATE (ccx has none) -> ccx's *DFLUX / *FILM / *RADIATE on the
+    # surface's element faces, Sn -> Sn / Fn / Rn, a blank value 0 (they were commented out
+    # as having no ccx counterpart; validate_with_ccx.py surface_heat_loads_*)
+    base = (HEX.replace("C3D8", "DC3D8") + "*SURFACE, NAME=TOP\nEALL, S2\n*SURFACE, NAME=SIDE\n"
+            "EALL, S4\n*NSET, NSET=N1\n1\n*SURFACE, NAME=NODES, TYPE=NODE\nN1\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*CONDUCTIVITY\n2.\n"
+            "*PHYSICAL CONSTANTS, ABSOLUTE ZERO=-273.15, STEFAN BOLTZMANN=5.67E-8\n"
+            "*AMPLITUDE, NAME=A1\n0., 0., 1., 1.\n*AMPLITUDE, NAME=A2\n0., 1., 1., 2.\n"
+            "*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n")
+    body, conv, rep = convert_str(base + "*DSFLUX, AMPLITUDE=A1\nTOP, S, 100.\n*SFILM, FILM "
+                                         "AMPLITUDE=A2\nSIDE, F, , 10.\n*SRADIATE\nTOP, R, 20., 0.5\n"
+                                         "*END STEP\n")
+    assert "*DFLUX, AMPLITUDE=A1\nEALL, S2, 100.\n" in body
+    assert "*FILM, FILM AMPLITUDE=A2\nEALL, F4, 0., 10.\n" in body
+    assert "*RADIATE\nEALL, R2, 20., 0.5\n" in body
+    assert "*DSFLUX" not in body and "*SFILM" not in body and conv.reduced_physics == []
+    # an empty OP=NEW card removes them all: written as the empty ccx card
+    body, conv, rep = convert_str(base + "*SFILM\nSIDE, F, 20., 10.\n*END STEP\n*STEP\n*HEAT TRANSFER, "
+                                         "STEADY STATE\n1., 1.\n*SFILM, OP=NEW\n*END STEP\n")
+    assert "*FILM\nEALL, F4, 20., 10.\n" in body and "*FILM, OP=NEW\n" in body
+    # lines ccx has no form for are commented: a user subroutine, a node-based surface, a
+    # *FILM PROPERTY table, AVG cavity radiation
+    body, conv, rep = convert_str(base + "*DSFLUX\nTOP, SNU, 1.\nNODES, S, 1.\n*SFILM\nSIDE, F, 20., "
+                                         "FP\n*SRADIATE\nTOP, AVG, , 0.5\n*END STEP\n")
+    assert not re.search(r"^\*(DFLUX|FILM|RADIATE)\b", body, re.M)
+    assert "** TOP, SNU, 1." in body and "is a node-based surface" in rep.text()
+    assert "a *FILM PROPERTY table" in rep.text() and "(approximate cavity radiation)" in rep.text()
+    # where ccx would act otherwise the card stays commented: faces an element-based *DFLUX
+    # also loads (Abaqus applies both, ccx keeps one value), an OP=NEW beside *DFLUX cards
+    # (Abaqus' removes its own form only)
+    for loads, why in (("*DFLUX\nEALL, S2, 5.\n*DSFLUX\nTOP, S, 100.\n", "also loaded by another"),
+                       ("*DFLUX\nEALL, BF, 5.\n*END STEP\n*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n"
+                        "*DSFLUX, OP=NEW\nTOP, S, 100.\n", "Abaqus' OP=NEW removes")):
+        body, conv, rep = convert_str(base + loads + "*END STEP\n")
+        assert "** TOP, S, 100." in body and why in rep.text(), rep.text()
+        assert "*DSFLUX" in conv.reduced_physics
+
+
+def test_mass_on_a_rigid_member_node_in_no_other_element_gets_a_tetrahedron():
+    # ccx 2.23's *FREQUENCY stops ('add_bo_st') on a *MASS at a rigid-body member node in no
+    # other element: the node gets a massless tetrahedron of three new nodes the body carries
+    # (validate_with_ccx.py member_mass_frequency_*; NAFEMS FV4 now solves)
+    def deck(body, proc="*FREQUENCY\n1", spring=""):
+        return ("*NODE\n1, 0., 0., 0.\n4, 1., 1., 0.\n11, -1., 0., 0.\n"
+                "*ELEMENT, TYPE=SPRINGA, ELSET=SX\n101, 1, 11\n" + spring + "*SPRING, ELSET=SX\n\n"
+                "1000.\n*ELEMENT, TYPE=MASS, ELSET=M4\n201, 4\n*MASS, ELSET=M4\n2.5\n" + body +
+                "*BOUNDARY\n11, 1, 3\n1, 2, 6\n*STEP\n" + proc + "\n*END STEP\n")
+    for body in ("*NSET, NSET=B\n4\n*RIGID BODY, REF NODE=1, TIE NSET=B\n", "*MPC\nBEAM, 4, 1\n"):
+        out, conv, rep = convert_str(deck(body))
+        g = reparse(out)
+        tets = [e for e in g.elset(A.RIGID_SET) if g.elements[e][0] == "C3D4"]
+        assert len(tets) == 1 and g.elements[tets[0]][1][0] == 4, out
+        m = re.search(r"\*RIGID BODY, (?:REF NODE=1, )?NSET=([^,\s]+)", out)
+        assert m and set(g.elements[tets[0]][1]) <= set(g.nset(m.group(1))), out
+        assert f"*SOLID SECTION, ELSET={A.RIGID_SET}" in out and "*DENSITY\n0." in out
+        assert "massless tetrahedron" in rep.text() and conv.reduced_physics == []
+        if "TIE NSET=B" in body:
+            assert g.nset("B") == [4]                        # the deck's own set as it was
+    # not without a *FREQUENCY step, nor where the node is in another element
+    for d in (deck("*MPC\nBEAM, 4, 1\n", proc="*STATIC"),
+              deck("*MPC\nBEAM, 4, 1\n", spring="102, 4, 1\n")):
+        out, _, _ = convert_str(d)
+        assert "C3D4" not in out, out
+
+
+def test_element_families_ccx_lacks_are_named_and_read_with_their_node_count():
+    # piezoelectric, infinite, acoustic, thermal-electrical and joint elements: ccx 2.23 has
+    # none, so they stay as written; the report says so (it said "unknown to this converter",
+    # node count inferred from the first line)
+    nodes = "".join(f"{n}, {n % 3}., {n // 3 % 3}., {n // 9}.\n" for n in range(1, 21))
+    deck = ("*NODE\n" + nodes + "*ELEMENT, TYPE=C3D20E, ELSET=P\n1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "
+            "11, 12, 13, 14, 15,\n16, 17, 18, 19, 20\n*ELEMENT, TYPE=CINAX4, ELSET=I\n2, 1, 2, 3, 4\n"
+            "*ELEMENT, TYPE=AC3D4, ELSET=AC\n3, 1, 2, 3, 4\n*ELEMENT, TYPE=DC3D8E, ELSET=E\n"
+            "4, 1, 2, 3, 4, 5, 6, 7, 8\n*ELEMENT, TYPE=JOINTC, ELSET=J\n5, 1, 2\n")
+    out, _, rep = convert_str(deck)
+    text = rep.text()
+    for typ, what in (("C3D20E", "piezoelectric"), ("CINAX4", "infinite"), ("AC3D4", "acoustic"),
+                      ("DC3D8E", "coupled thermal-electrical"), ("JOINTC", "joint")):
+        assert f"Element {typ} is an Abaqus {what} element: ccx 2.23 has none" in text, text
+    assert "unknown to this converter" not in text and "inferred" not in text
+    assert len(reparse(out).elements[1][1]) == 20
 
 
 # --- code review 2, R22 / R23: report and CLI fixes -----------------------------------------

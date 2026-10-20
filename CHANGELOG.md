@@ -6,6 +6,19 @@ physics.
 
 ## Unreleased
 
+* **`*DSFLUX`, `*SFILM` and `*SRADIATE`** — surface heat flux, film and radiation were
+  commented out as having no ccx equivalent. They are now written as ccx's element-based
+  `*DFLUX` / `*FILM` / `*RADIATE` on the surface's faces (`Sn` → `Sn` / `Fn` / `Rn`). They
+  stay commented where ccx would act differently: an `OP=NEW` mixed with the element-based
+  cards, faces another card also loads, shell faces, `*FILM PROPERTY` tables, cavity
+  radiation.
+* **`*MASS` on a rigid-body node in no other element** — ccx 2.23's `*FREQUENCY` stopped
+  ("add_bo_st: coefficient should be 0"), e.g. on point masses carried by `*MPC BEAM`. Such a
+  node now gets a massless tetrahedron that moves with the body, which changes nothing else.
+* **Element types ccx lacks** — piezoelectric, thermal-electrical, infinite, acoustic and
+  `JOINTC` elements were reported as "unknown to this converter", their node count guessed
+  from the first line. The report now names the family, and connectivity is read with the
+  right node count.
 * **Follower tractions under NLGEOM** — a `TRVEC` normal to flat continuum faces, with
   `FOLLOWER=YES` and `CONSTANT RESULTANT=NO` (the defaults), now becomes a ccx face pressure
   instead of needing `--approximate`. Abaqus applies a follower traction's normal part along the
