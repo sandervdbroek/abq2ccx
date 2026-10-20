@@ -3128,6 +3128,22 @@ def lc2_column_deck(n=20):
             f"*BOUNDARY, OP=NEW, LOAD CASE=2\n1, 1, 6\n{top}, 1, 1\n*CLOAD\n{top}, 3, -1.\n*END STEP\n")
 
 
+def pert_procs_deck(twin=False):
+    """A C3D8 cube (E 1000, nu 0.3) on rollers whose top moves up at 0.01 per time (*BOUNDARY,
+    TYPE=VELOCITY) in a static step, then a *FREQUENCY and a *RESPONSE SPECTRUM step (linear
+    perturbation steps), then a static step pulling a top corner sideways on a TIME=TOTAL TIME
+    amplitude while the top moves on.  ``twin``: without the two perturbation steps."""
+    pert = "" if twin else "*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*RESPONSE SPECTRUM\n*END STEP\n"
+    return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=TOP\n5, 6, 7, 8\n*NSET, NSET=ALL\n1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*DENSITY\n1e-3\n*AMPLITUDE, NAME=TT, TIME=TOTAL TIME\n0., 0., 3., 1.\n"
+            "*BOUNDARY\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+            "*STEP\n*STATIC\n0.5, 1.\n*BOUNDARY, TYPE=VELOCITY\nTOP, 3, 3, 0.01\n*END STEP\n" + pert +
+            "*STEP\n*STATIC\n0.5, 1.\n*CLOAD, AMPLITUDE=TT\n7, 1, 1.\n*NODE PRINT, NSET=ALL\nU\n*END STEP\n")
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -9318,6 +9334,22 @@ def main():
               f"the second was 2.21e6)")
     elif fac:
         print(f"FAIL  lc2_column: {len(fac)} factors")
+    failures += 0 if ok else 1
+
+    # a *RESPONSE SPECTRUM step (a linear perturbation step, which ccx has no procedure for)
+    # counted as a general step of unknown time by the velocity-BC plan: the top's velocity BC
+    # carried into the last step was dropped there (it stayed at 0.01)
+    runs = [review_run(pert_procs_deck(twin), "pert_procs" + ("_ref" if twin else ""), dat_node_blocks)
+            for twin in (False, True)]
+    ok = all(runs)
+    if ok:
+        err, moved = same(runs, -1)
+        top, side = runs[0][-1].get(7, [0.0, 0.0, math.nan])[2], runs[0][-1].get(7, [0.0])[0]
+        ok = err < 1e-9 * moved and abs(top / 0.02 - 1) < 1e-6 and abs(side) > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  pert_procs (a C3D8 cube's top moving at 0.01 per time "
+              f"over a *FREQUENCY and a *RESPONSE SPECTRUM step): the last step as without them "
+              f"({err:.1e} apart; the loaded corner moved {side:.4g} sideways), the top at {top:.7g} "
+              f"vs 0.02")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

@@ -1325,7 +1325,7 @@ def canonical_keyword(keyword: str) -> str:
                  set(PASS_WITH_NOTE) | OUTPUT_ONLY_KEYWORDS | set(NUMERICAL_KEYWORDS) | MATERIAL_OPTION_CARDS |
                  U1_NONLINEAR_CARDS | HISTORY_ONLY_KW | TEMPERATURE_DOF_PROCS |
                  set(Converter._HANDLERS) | set(Converter._U1_OPTIONS) |
-                 Converter._PERTURBATION_PROCS | Converter._OTHER_PROCEDURES |
+                 PERTURBATION_PROCS | Converter._OTHER_PROCEDURES |
                  {"PARAMETER", "BEAM SECTION OFFSET", "FLUID CAVITY", "REBAR LAYER",
                   "EULERIAN SECTION", "SUBSPACE DYNAMIC", "ELEMENT OPERATOR",
                   "COUPLED THERMAL-ELECTRICAL-STRUCTURAL"})
@@ -3598,10 +3598,13 @@ PRESELECT_CONTACT = {
     "DYNAMIC": ("CSTRESS, CDISP", ("CDIS", "CSTR")), "EXPLICIT": ("CSTRESS", ("CSTR",)),
     "COUPLED TEMPERATURE-DISPLACEMENT": ("CSTRESS, CDISP", ("CDIS", "CSTR")),
 }
-# Abaqus' linear perturbation procedures: output requests carry over only between
-# consecutive perturbation steps, and those of general steps skip them.
+# Abaqus' linear perturbation procedures (Analysis User's Guide, "General and perturbation
+# procedures"; *STATIC is one under *STEP, PERTURBATION): the step's response leaves the base
+# state untouched, its loads and BCs act in it only, and output requests carry over only
+# between consecutive perturbation steps (perturbation_step, Step.perturbation)
 PERTURBATION_PROCS = {"FREQUENCY", "BUCKLE", "COMPLEX FREQUENCY", "MODAL DYNAMIC",
-                      "STEADY STATE DYNAMICS", "SUBSTRUCTURE GENERATE", "GREEN"}
+                      "STEADY STATE DYNAMICS", "RANDOM RESPONSE", "RESPONSE SPECTRUM",
+                      "SUBSTRUCTURE GENERATE", "MATRIX GENERATE"}
 
 # ccx sizes an explicit increment per element (calcstabletimeincvol.f) as critom * h * f /
 # (2 c) times a safety factor 0.8 / 1.3: c the material's largest wave speed, h the
@@ -3883,8 +3886,9 @@ CONN_UNCONSTRAINED = {"CARTESIAN", "AXIAL", "PROJECTION CARTESIAN", "CARDAN", "E
 
 # Eigenvalue extractions solve without any load.
 LOAD_FREE_PROCEDURES = {"FREQUENCY", "COMPLEX FREQUENCY"}
-# Linear-perturbation procedures: only the loads given in the step itself act, and they do
-# not carry over to later steps.
+# The ccx procedures whose step starts without the loads ccx holds (handle_step; probed):
+# only the loads given in the step itself act there, and they do not carry over to later
+# steps (Abaqus' rule is any linear perturbation step's: perturbation_step).
 PERTURBATION_PROCEDURES = {"BUCKLE", "MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
 # History cards that load the model -> the field (0-based) whose non-zero value makes a
 # data line a load.  *BOUNDARY loads only through a prescribed non-zero value (field 3), a
@@ -3981,8 +3985,8 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
     ``user_loads``: whether a magnitude that comes from a user subroutine (USER, ...NU
     labels) counts.  It does in an Abaqus deck; in a ccx deck the stock ccx subroutine
     would run in place of the deck's own, so it does not.  ``abaqus``: the deck is read as
-    Abaqus reads it, where an eigenvalue extraction is always a linear-perturbation step
-    (its cards do not carry over); ccx carries them on."""
+    Abaqus reads it, where every linear perturbation step (perturbation_step), an eigenvalue
+    extraction too, counts its own loads only; ccx carries a *FREQUENCY step's on."""
     state: Dict[str, Dict[tuple, str]] = {}
     initial: Dict[str, List[str]] = {"VELOCITY": [], "STRESS": []}
     acts = op_new_cards(blocks, tuple(LOAD_CARD_FIELD))
@@ -4027,7 +4031,7 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
         if step is None:
             continue
         proc = next((x.keyword for x in step if x.keyword in PROC_KW), None)
-        perturb = proc in PERTURBATION_PROCEDURES or (abaqus and proc in LOAD_FREE_PROCEDURES) or \
+        perturb = perturbation_step(step) if abaqus else proc in PERTURBATION_PROCEDURES or \
             (step[0].has("PERTURBATION") and proc not in LOAD_FREE_PROCEDURES)
         active = {} if perturb else state
         explicit = any(x.keyword == "DYNAMIC" and x.has("EXPLICIT") for x in step)
@@ -4323,6 +4327,14 @@ def bc_steps(cards: Sequence[Block], entries: Callable[[Block], Sequence[Tuple[o
         yield active
 
 
+def perturbation_step(cards: Sequence[Block]) -> bool:
+    """A step's cards (its *STEP first) make an Abaqus linear perturbation step: *STEP,
+    PERTURBATION, or a procedure in PERTURBATION_PROCS (any card: a step has one procedure).
+    The one rule (Step.perturbation); ccx's own reading of a converted deck differs (handle_step,
+    step_load_audit's)."""
+    return cards[0].has("PERTURBATION") or any(b.keyword in PERTURBATION_PROCS for b in cards[1:])
+
+
 def _nlgeom_given(b: Block) -> Optional[bool]:
     """NLGEOM= on *STEP ``b``: True for NLGEOM / NLGEOM=YES, False for NLGEOM=NO, None if absent."""
     return (b.param("NLGEOM") or "YES").strip().upper() != "NO" if b.has("NLGEOM") else None
@@ -4341,18 +4353,15 @@ class Step:
     between: Tuple[Block, ...]    # the cards after the step before it, up to its *STEP
     star_steps: int               # its *STEP cards: more than one where an unterminated *STEP ran on
     closed: bool                  # its own *END STEP ends it (False: it ran on, or the deck ended)
-    proc: str                     # the first PROC_KW card's keyword, "" if none (handle_step's)
+    proc: str                     # the first PROC_KW card's keyword, "" if none (handle_step's): ccx's
+                                  # procedure (one ccx lacks, e.g. *RANDOM RESPONSE, is commented out)
     proc_card: Optional[Block]
     motion_proc: str              # the first PROC_KW or Converter._MOTION_PROCS card's (_step_motion's)
     explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT (handle_step's)
     amplitude: str                # *STEP, AMPLITUDE= as written ("" if none)
     pert_param: bool              # *STEP, PERTURBATION as written
-    # a linear perturbation step, three rules (step_load_audit keeps a fourth):
-    perturbation: bool            # PERTURBATION, or any card in Converter._PERTURBATION_PROCS: _pert_idx
-    perturbation_motion: bool     # PERTURBATION, or motion_proc in Converter._PERTURBATION_PROCS:
-                                  # _step_motion
-    perturbation_output: bool     # PERTURBATION, or proc in PERTURBATION_PROCS: the output carry-over
-                                  # (_step_output_requests)
+    perturbation: bool            # an Abaqus linear perturbation step (perturbation_step): _pert_idx,
+                                  # _step_motion, the output carry-over, step_load_audit's Abaqus reading
     nlgeom_card: Optional[bool]   # NLGEOM= on its *STEP card (_nlgeom_given)
     # NLGEOM, two rules:
     nlgeom_on: bool               # it switches NLGEOM on (_plan_deck_facts' _nl_steps): not a
@@ -4395,7 +4404,7 @@ class StepModel:
                                 b.keyword in Converter._MOTION_PROCS), "")
             explicit = proc == "DYNAMIC" and proc_card.has("EXPLICIT")
             pert_param = head.has("PERTURBATION")
-            pert = pert_param or any(b.keyword in Converter._PERTURBATION_PROCS for b in inner)
+            pert = perturbation_step(cards)
             given = _nlgeom_given(head)
             if not pert:
                 nlgeom = nlgeom or (explicit if given is None else given)
@@ -4414,8 +4423,7 @@ class StepModel:
                 star_steps=n, closed=n == 1 and cards[-1].keyword == "END STEP",
                 proc=proc, proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
                 amplitude=head.uparam("AMPLITUDE"), pert_param=pert_param, perturbation=pert,
-                perturbation_motion=pert_param or motion_proc in Converter._PERTURBATION_PROCS,
-                perturbation_output=pert_param or proc in PERTURBATION_PROCS, nlgeom_card=given,
+                nlgeom_card=given,
                 nlgeom_on=(not pert and any(b.keyword == "STEP" and _nlgeom_given(b) for b in cards))
                 or any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
                 nlgeom=nlgeom,
@@ -4451,6 +4459,13 @@ class StepModel:
         self.dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
         self.explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         self.mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
+
+    def step_of(self, card: Block) -> Step:
+        """The step ``card`` belongs to (one of its cards from its *STEP through its *END STEP)."""
+        no = self.card_step[id(card)]
+        if no < 1:
+            raise KeyError(f"*{card.keyword} is not in a step")
+        return self.steps[no - 1]
 
     def __iter__(self) -> Iterator[Step]:
         return iter(self.steps)
@@ -9489,6 +9504,9 @@ class Converter:
                         params[k] = v
                 elif proc == "BUCKLE":
                     params[k] = v
+                elif proc is None:
+                    self.report.note("*STEP, PERTURBATION dropped on a step without a ccx procedure "
+                                     "(ccx reads it only on *FREQUENCY / *BUCKLE).", once=True)
                 elif proc != "STATIC":
                     self.report.note(f"*STEP, PERTURBATION dropped on a *{proc} step (ccx reads it only "
                                      f"on *FREQUENCY / *BUCKLE; it runs *{proc} as a linear "
@@ -10091,10 +10109,6 @@ class Converter:
 
     # -- velocity / acceleration boundary conditions -------------------------------
     _RATE_TYPES = ("VELOCITY", "ACCELERATION")
-    # linear perturbation procedures: the base state does not move, BCs only constrain
-    _PERTURBATION_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC",
-                           "COMPLEX FREQUENCY", "RANDOM RESPONSE", "RESPONSE SPECTRUM",
-                           "SUBSTRUCTURE GENERATE", "MATRIX GENERATE"}
     # procedures that move nodes over a time period given as the 2nd field of their data line
     _MOTION_PROCS = {"STATIC", "DYNAMIC", "VISCO", "COUPLED TEMPERATURE-DISPLACEMENT",
                      "UNCOUPLED TEMPERATURE-DISPLACEMENT", "SOILS", "GEOSTATIC"}
@@ -10158,7 +10172,7 @@ class Converter:
                        x.keyword in self._MOTION_PROCS), None)
         proc = proc_b.keyword if proc_b is not None else ""
         explicit = proc == "DYNAMIC" and proc_b.has("EXPLICIT")
-        perturbation = step_b.has("PERTURBATION") or proc in self._PERTURBATION_PROCS
+        perturbation = self.steps.step_of(step_b).perturbation
         period = None
         advance: Optional[float] = 0.0 if perturbation else None
         if (proc in self._MOTION_PROCS or proc == "HEAT TRANSFER") and not proc_b.has("RIKS") \
@@ -13931,7 +13945,7 @@ class Converter:
             if timing["kind"] == "explicit":
                 timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
                 timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
-            pert = timing["proc"] in PERTURBATION_PROCS or group[0].has("PERTURBATION")
+            pert = self.steps.step_of(group[0]).perturbation
             timing["pert"] = pert
             # ccx computes element energies in every implicit dynamic and transient (un)coupled
             # temperature-displacement step (_energy_from_step_one)
@@ -28319,7 +28333,7 @@ class Converter:
                 state, general = None, False
             elif proc == "STEADY STATE DYNAMICS":
                 state, general = base, False
-            elif proc in self._PERTURBATION_PROCS or proc == "HEAT TRANSFER":
+            elif proc in PERTURBATION_PROCS or proc == "HEAT TRANSFER":
                 general = False
             else:                                   # (a static perturbation step: general in ccx)
                 state = base = s if loads or (s in self._pert_idx and base is not None) else None

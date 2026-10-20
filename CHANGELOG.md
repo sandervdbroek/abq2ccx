@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **One definition of a linear perturbation step** — the planners used three sets of
+  perturbation procedures. Abaqus' list is now used everywhere: `*FREQUENCY`, `*BUCKLE`,
+  `*COMPLEX FREQUENCY`, `*MODAL DYNAMIC`, `*STEADY STATE DYNAMICS`, `*RANDOM RESPONSE`,
+  `*RESPONSE SPECTRUM`, `*SUBSTRUCTURE GENERATE`, `*MATRIX GENERATE`, or `*STEP, PERTURBATION`.
+  A velocity BC carried over a `*RESPONSE SPECTRUM`, `*RANDOM RESPONSE` or `*MATRIX GENERATE`
+  step was dropped after it (the step counted as a general one of unknown time). Its output
+  requests and loads now follow the perturbation rules too.
 * **`*BOUNDARY, LOAD CASE=2` cards no longer count as BCs** — the converter leaves a `*BUCKLE`
   step's buckling-mode BCs out (ccx has one set of BCs per step), but seven of its planners still
   counted them. Where they hold more than the LOAD CASE=1 cards, an OP=NEW that removes a BC was

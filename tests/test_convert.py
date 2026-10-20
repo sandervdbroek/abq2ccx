@@ -427,23 +427,21 @@ def test_step_model_general_and_perturbation_steps():
                                    "MODAL DYNAMIC", "STATIC"]
     assert all(s.proc_card is s.cards[1] and s.closed and s.star_steps == 1 for s in m)
     assert m.pert == {2, 3, 5, 6} and [s.pert_param for s in m] == [False, False, True] + [False] * 4
-    assert [s.perturbation for s in m] == [s.perturbation_motion for s in m] == \
-        [s.perturbation_output for s in m] == [False, True, True, False, True, True, False]
+    assert [s.perturbation for s in m] == [False, True, True, False, True, True, False]
     assert [s.nlgeom_card for s in m] == [None, True, None, True, None, False, False]
     assert [s.nlgeom_on for s in m] == list(m.nl_steps) == [False] * 3 + [True] + [False] * 3
     assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
     assert (m.nl_any, m.nl_all, m.n_star_steps) == (True, False, 7)
     assert [s.amplitude for s in m] == ["", "", "", "STEP", "", "", ""]
     assert m.model == tuple(blocks[:1]) and all(s.between == () for s in m) and m.after == ()
-    # the three perturbation rules differ on procedures some sets lack (handle_step finds no
-    # procedure in a *RANDOM RESPONSE step); the temperature-DOF procedure is any card's
+    # one perturbation rule (Abaqus' procedures; handle_step finds no ccx procedure in a *RANDOM
+    # RESPONSE step); the temperature-DOF procedure is any card's
     _, m = _step_model("*STEP\n*RANDOM RESPONSE\n*END STEP\n*STEP\n*GREEN\n*END STEP\n"
                   "*STEP\n*GEOSTATIC\n*END STEP\n*STEP\n*COUPLED THERMAL-ELECTRICAL\n*END STEP")
     assert [(s.proc, s.motion_proc, s.temp_dof) for s in m] == [
         ("", "", None), ("GREEN", "GREEN", None), ("", "GEOSTATIC", None),
         ("", "", "COUPLED THERMAL-ELECTRICAL")]
-    assert [(s.perturbation, s.perturbation_motion, s.perturbation_output) for s in m] == [
-        (True, False, False), (False, False, True), (False, False, False), (False, False, False)]
+    assert [s.perturbation for s in m] == [True, False, False, False]
     # the converter's attributes are the model's
     _, conv, _ = convert_str(HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n"
                              "*Elastic\n1000., 0.3\n*Boundary\n1, 1, 3\n*Step, nlgeom\n*Static\n"
@@ -460,7 +458,7 @@ def test_step_model_unterminated_step():
 *STEP\n*FREQUENCY\n*END STEP\n*CLOAD\n2, 1, 1.\n*STEP\n*STATIC\n*END STEP\n*STEP\n*STATIC""")
     one, two, three = m.steps
     assert (len(one.cards), one.star_steps, one.closed, one.ccx_no) == (6, 2, False, 1)
-    assert (one.proc, one.perturbation, one.perturbation_motion) == ("STATIC", True, False)
+    assert (one.proc, one.perturbation) == ("STATIC", True)
     assert (one.nlgeom_card, one.nlgeom_on, one.nlgeom) == (True, False, False)
     assert two.between == tuple(blocks[7:8]) and (two.ccx_no, two.closed) == (3, True)
     assert (three.ccx_no, three.star_steps, three.closed) == (4, 1, False)
@@ -11723,6 +11721,35 @@ def test_buckle_load_case_two_cards_are_no_bcs():
             "*BOUNDARY, LOAD CASE=2\n1, 1, 6\n5, 4, 4\n*CLOAD\n5, 3, -1.\n*END STEP\n")
     body, conv, _ = convert_str(deck)
     assert conv._knots == {} and "ABQ2CCX_KNOT" not in body, body
+
+
+def test_one_perturbation_step_rule():
+    # every linear perturbation procedure of Abaqus makes a perturbation step, for every
+    # planner: _pert_idx, the step's motion (velocity BCs, total time), the output carry-over
+    # and the load audit's Abaqus reading
+    assert A.PERTURBATION_PROCS == {"FREQUENCY", "BUCKLE", "COMPLEX FREQUENCY", "MODAL DYNAMIC",
+                                    "STEADY STATE DYNAMICS", "RANDOM RESPONSE", "RESPONSE SPECTRUM",
+                                    "SUBSTRUCTURE GENERATE", "MATRIX GENERATE"}
+    assert not hasattr(A.Converter, "_PERTURBATION_PROCS")
+    deck = (HEX + "*NSET, NSET=TOP\n5, 6, 7, 8\n*Solid Section, elset=EALL, material=M\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n"
+            "*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+            "*Step\n*Static\n0.5, 1.\n*Boundary, type=velocity\nTOP, 3, 3, 0.01\n*Cload\n7, 1, 1.\n"
+            "*End Step\n*Step\n*Response Spectrum\n*End Step\n"
+            "*Step\n*Static\n0.5, 1.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert conv._pert_idx == {2} and [s.perturbation for s in conv.steps] == [False, True, False]
+    # the top's velocity BC goes on in step 3, from 0.01 (it stopped: the response spectrum
+    # step was one of unknown time)
+    assert "*AMPLITUDE, NAME=ABQ2CCX_VEL2\n0, 0.01, 1, 0.02\n*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL2\n" \
+        "TOP, 3, 3, 1." in _step(body, 3), body
+    assert "not converted" not in body
+    # its loads are its own in Abaqus (the audit's Abaqus reading); ccx's reading carries them
+    blocks = A.blocks_from_lines(deck.replace("*Response Spectrum\n", "*Response Spectrum\n*Cload\n"
+                                              "6, 2, 1.\n").splitlines())
+    first = ["*BOUNDARY: prescribed value on TOP", "*CLOAD on 7"]
+    assert A.step_load_audit(blocks, True, abaqus=True) == [first, ["*CLOAD on 6"], first]
+    assert A.step_load_audit(blocks, True)[2] == first + ["*CLOAD on 6"]
 
 
 def _normal_rows(body):
