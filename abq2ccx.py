@@ -11871,11 +11871,13 @@ class Converter:
                     for n in nodes for d in dofs if (n, d) in query]
         cards = model + [b for g in groups for b in g]
         given = {id(b): entries(b) for b in cards if b.keyword == "BOUNDARY"}
-        held = next(bc_steps(model, lambda b: given[id(b)]))        # the model data's
+        # (what follows the last step left out)
+        folds = self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2, model=True,
+                                  blocks=cards)
+        held = next(folds)                                          # the model data's
         out: Dict[int, Tuple[set, set]] = {}
         nlgeom = False
-        for s, (group, end) in enumerate(zip(groups, bc_steps(cards, lambda b: given[id(b)],
-                                                                self._pert_idx, self.steps.lc2)), 1):
+        for s, (group, end) in enumerate(zip(groups, folds), 1):
             info = self._step_motion(group, nlgeom)
             nlgeom = info["nlgeom"]
             if s in need:
