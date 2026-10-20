@@ -1526,9 +1526,9 @@ def folded_strip_deck(turned, procs=("*STATIC", "*DYNAMIC")):
     """An S4 strip 2 long folded 90 deg along its middle line (ccx knots the nodes on the fold),
     clamped at x = 0; the fold's end node 8 moved 0.005 per step in y and 0.01 in z, one step per
     procedure in ``procs``.  ``turned``: node 8 with a rectangular *TRANSFORM turned 90 deg
-    about z (local 1 = y), its BCs in those axes.  (Both BCs move in every step: with a zero
-    y BC the twin's *DYNAMIC step ramps one BC of the knot and not the other, and the Windows
-    ccx 2.23 then crashes at the step's start, every run.)"""
+    about z (local 1 = y), its BCs in those axes.  Both write the node set TR, so the converted
+    decks differ only by the *TRANSFORM: ccx 2.23 crashes at random at the *DYNAMIC step's start
+    (tempload), and the Windows build crashed on every run of the twin without TR."""
     pts = [(float(i), y, z) for i in range(3) for y, z in ((-0.5, 0.0), (0.0, 0.0), (0.0, 0.5))]
     els = [f"{2 * i + j + 1}, {3 * i + j + 1}, {3 * i + j + 4}, {3 * i + j + 5}, {3 * i + j + 2}"
            for i in range(2) for j in range(2)]
@@ -1537,8 +1537,8 @@ def folded_strip_deck(turned, procs=("*STATIC", "*DYNAMIC")):
                                                      "*Material, name=M", "*Elastic", "1000., 0.3",
                                                      "*Density", "1e-3", "*Boundary", "1, 1, 6", "2, 1, 6",
                                                      "3, 1, 6"]
-    if turned:
-        lines += ["*Nset, nset=TR", "8", "*Transform, nset=TR, type=R", "0., 1., 0., -1., 0., 0."]
+    lines += ["*Nset, nset=TR", "8"] + (["*Transform, nset=TR, type=R", "0., 1., 0., -1., 0., 0."]
+                                        if turned else [])
     for k, proc in enumerate(procs, 1):
         lines += ["*Step", proc] + (["0.05, 1."] if proc.upper() == "*DYNAMIC" else []) + ["*Boundary"]
         lines += [f"8, {1 if turned else 2}, {1 if turned else 2}, {0.005 * k!r}", f"8, 3, 3, {0.01 * k!r}"]
