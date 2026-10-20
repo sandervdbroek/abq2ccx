@@ -6927,6 +6927,10 @@ def test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes():
     _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, 1, 4\n*Step\n*Heat Transfer\n1., 1.\n"
                              "*End Step\n")
     assert not conv._knots
+    # a deck without procedures is mechanical (_mechanical), as everywhere else: its model data
+    # get the knots a mechanical step needs (a model-only deck, included in one)
+    _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, 1, 4\n3, 2, 4\n")
+    assert conv._mechanical and list(conv._knots) == [1, 3]
     # ccx's explicit solver stops on the density-free knot beams: warned instead
     _, conv, rep = convert_str(CIRC_BEAM + "*Density\n7.85e-9\n*Boundary\n1, 1, 4\n3, 2, 4\n"
                                "*Step\n*Dynamic, explicit\n, 0.001\n*Cload\n2, 2, -1.\n*End Step\n")

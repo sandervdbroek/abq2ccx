@@ -4877,8 +4877,8 @@ class StepModel:
         self.mass_acts = bool(self.inertia or self.mass_loads)
         self.dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
         self.explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
-        # not heat transfer alone: _mechanical (a deck without procedures counts; for
-        # _plan_circ_rotation_knots, which reads procs, it does not)
+        # not heat transfer alone: _mechanical (a deck without procedures counts: its model
+        # data serve a mechanical analysis, as a model-only deck included in one)
         self.mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
         # a step solves for temperatures, where a TIE ties DOF 11 too (_mpc_thermal)
         self.mpc_thermal = any(k in CCX_THERMAL_PROCS for k in procs)
@@ -32373,7 +32373,7 @@ class Converter:
         node ccx makes a knot anyway (a frame joint) gets one too, harmlessly.  Left alone:
         full zero clamps (exact as they are), 3-node elements' middle nodes (the tied nodes
         are unused there), nodes with a *TRANSFORM (_plan_transformed_rotations) or
-        that are rigid-body/coupling reference nodes, heat-transfer-only decks; a deck with
+        that are rigid-body/coupling reference nodes, decks that are not _mechanical; a deck with
         an explicit dynamic step is only warned (the explicit solver stops on the density-
         free knot beams: '*ERROR in calcstabletimeincvol').  Runs after
         _plan_planar_constraint, whose DOF 4-5 lines count in every step."""
@@ -32381,7 +32381,7 @@ class Converter:
             return
         ends = {n for e in self._circ_beam_elements(blocks)
                 for c in [self.geom.elements[e][1]] if len(c) == 3 for n in (c[0], c[2])}
-        if not ends or self.steps.procs <= {"HEAT TRANSFER"}:   # (a deck without procedures too)
+        if not ends or not self._mechanical:
             return
         twist = set(self._planar_twist) & ends
         moves: set = set()                               # nodes given a nonzero rotation
