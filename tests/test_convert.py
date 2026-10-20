@@ -409,10 +409,10 @@ def _step_model(text):
 def test_step_model_of_model_data_only():
     # a deck without steps: all of it is model data, and it counts as mechanical
     blocks, m = _step_model("*NODE\n1, 0., 0., 0.\n*BOUNDARY\n1, 1, 3\n")
-    assert m.model == tuple(blocks) and m.steps == () and m.after == () and len(m) == 0
+    assert m.steps == () and len(m) == 0
     assert m.pert == frozenset() and m.nl_steps == ()
     assert (m.nl_any, m.nl_all, m.dynamic, m.explicit, m.mechanical) == (False, False, False, False, True)
-    assert set(m.card_step.values()) == {0} and m.op_new["BOUNDARY"] == frozenset()
+    assert m.acting(blocks=blocks) == frozenset()
     assert not A.StepModel(A.blocks_from_lines(["*STEP", "*HEAT TRANSFER", "*END STEP"])).mechanical
 
 
@@ -434,7 +434,7 @@ def test_step_model_general_and_perturbation_steps():
     assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
     assert (m.nl_any, m.nl_all, len(m)) == (True, False, 7)
     assert [s.amplitude for s in m] == ["", "", "", "STEP", "", "", ""]
-    assert m.model == tuple(blocks[:1]) and all(s.between == () for s in m) and m.after == ()
+    assert all(s.between == () for s in m)
     # one perturbation rule (Abaqus' procedures; handle_step finds no ccx procedure in a *RANDOM
     # RESPONSE step); the temperature-DOF procedure is any card's
     _, m = _step_model("*STEP\n*RANDOM RESPONSE\n*END STEP\n*STEP\n*GREEN\n*END STEP\n"
@@ -465,25 +465,27 @@ def test_step_model_states():
 
     def run(**kw):
         calls.clear()
-        return [sorted(a) for a in m.states(nodes, **kw)]
+        return [sorted(a) for a in m.states(nodes, **{"blocks": blocks, **kw})]
     assert run() == [[1, 2], [4], [1, 2, 3, 5]] and calls == [1, 2, 3, 4, 5, 6]   # in deck order
     assert [sorted(a) for a in A.bc_steps(blocks, nodes, {2})] == run()
     assert run(restore=False) == [[1, 2], [4], [4, 5]]
     assert run(model=True) == [[1], [1, 2], [4], [1, 2, 3, 5]]
-    assert [sorted(a) for a in A.StepModel(blocks[:2]).states(nodes, model=True)] == [[1], [1]]
+    assert [sorted(a) for a in A.StepModel(blocks[:2]).states(nodes, model=True, blocks=blocks[:2])] == \
+        [[1], [1]]
     # skip: the cards are left out, and the step's next *BOUNDARY acts on OP=NEW instead
     two, new = blocks[8], A.Block("BOUNDARY", A.OrderedDict(OP="NEW"), ["7, 1, 1"])
     blocks.insert(9, new)
     m = A.StepModel(blocks)
-    assert m.acting() == {id(two)} and m.acting(skip={id(two)}) == {id(new)}
+    assert m.acting(blocks=blocks) == {id(two)}
+    assert m.acting(skip={id(two)}, blocks=blocks) == {id(new)}
     assert run(skip={id(two)}) == [[1, 2], [7], [1, 2, 3, 5]]
     # blocks: the deck as it is now, cards a planner rewrote after the model was read (new
-    # Blocks) folded and acting in place of the model's
+    # Blocks) folded and acting in place of those the model was read from
     cur = list(blocks)
     cur[8] = A.Block("BOUNDARY", A.OrderedDict(OP="NEW"), ["4, 1, 1"])
     cur[13] = A.Block("BOUNDARY", A.OrderedDict(), ["8, 1, 1"])
     assert run(blocks=cur) == [[1, 2], [4, 7], [1, 2, 3, 8]] and run()[2] == [1, 2, 3, 5]
-    assert m.acting(blocks=cur) == {id(cur[8])} and m.acting() == {id(two)}
+    assert m.acting(blocks=cur) == {id(cur[8])} and m.acting(blocks=blocks) == {id(two)}
     # a caller's *STEP before the open step's *END STEP (bc_steps over a ccx deck; the
     # converter closes the open step: close_open_steps) starts that step again (its cards go)
     blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1
@@ -603,9 +605,13 @@ def test_step_model_op_new_cards():
     blocks, m = _step_model("""*STEP\n*STATIC\n*BOUNDARY\n1, 1, 1\n*BOUNDARY, OP=NEW\n2, 1, 1
 *CLOAD, OP=NEW\n1, 2, 1.\n*DLOAD, OP=NEW\nE, GRAV, 1., 0., 0., -1.\n*DSLOAD, OP=NEW\nS, P, 1.
 *END STEP\n*STEP\n*STATIC\n*BOUNDARY, OP=NEW\n*CLOAD\n1, 2, 2.\n*CLOAD, OP=NEW\n1, 1, 1.\n*END STEP""")
-    at = {k: {i for i, b in enumerate(blocks) if id(b) in v} for k, v in m.op_new.items() if v}
+    acts = m.acting(tuple(A.LOAD_CARD_FIELD), blocks=blocks)
+    at = {}
+    for i, b in enumerate(blocks):
+        if id(b) in acts:
+            at.setdefault(b.keyword, set()).add(i)
     assert at == {"BOUNDARY": {10}, "CLOAD": {4}, "DLOAD": {5}, "DSLOAD": {6}}
-    assert m.op_new["BOUNDARY"] == A.op_new_cards(blocks)
+    assert m.acting(blocks=blocks) == A.op_new_cards(blocks) == {id(blocks[10])}
 
 
 def _same_cards(a, b):
@@ -629,7 +635,7 @@ def test_step_model_is_current():
     # _plan_deck_facts, which the planners before _read_steps read, has its deck aggregates;
     # the coupling id sets are the deck's.  Checked on decks that every planner rewriting
     # cards rewrites (H1-H10 of the restructure review), step cards too
-    card_level = {"model", "steps", "after", "card_step", "lc2", "op_new"}
+    card_level = {"steps", "lc2"}
     planners = ("_split_coupling_refs", "_plan_heatless_materials", "_free_face_surfaces",
                 "_remap_ply_faces", "_plan_quadratic_membranes", "_plan_shell_density",
                 "_transform_new_nodes", "_plan_free_ref_nodes")
@@ -642,11 +648,12 @@ def test_step_model_is_current():
         def run(self, blocks, *args, **kw):
             before = cards(blocks)
             got = real(self, blocks, *args, **kw)
-            after = cards(got if isinstance(got, list) else blocks)
+            deck = got if isinstance(got, list) else blocks
+            after = cards(deck)
             if after != before:
                 kept = set(before)
-                steps = A.StepModel(got if isinstance(got, list) else blocks).card_step
-                rewrote.add((name, any(c not in kept and steps[c[0]] > 0 for c in after)))
+                in_step = {id(b) for is_step, part in A.deck_parts(deck) if is_step for b in part}
+                rewrote.add((name, any(c not in kept and c[0] in in_step for c in after)))
             return got
         return run
 
@@ -12851,7 +12858,7 @@ def test_buckle_load_case_two_cards_are_no_bcs():
     # bc_steps and op_new_cards skip them, as if absent
     blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*BUCKLE\n2\n*BOUNDARY, OP=NEW, LOAD CASE=2
 2, 1, 1\n*BOUNDARY, LOAD CASE=1\n3, 1, 1\n*END STEP""")
-    assert m.lc2 == {id(blocks[3])} and m.op_new["BOUNDARY"] == frozenset()
+    assert m.lc2 == {id(blocks[3])}
     assert A.op_new_cards(blocks) == {id(blocks[3])} and A.op_new_cards(blocks, skip=m.lc2) == set()
     entries = lambda b: [(ln.split(",")[0], 0) for ln in b.data]  # noqa: E731
     assert [set(st) for st in A.bc_steps(blocks, entries)] == [{"2", "3"}]

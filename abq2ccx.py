@@ -4539,7 +4539,7 @@ def bc_steps(cards: Sequence[Block], entries: Callable[[Block], Sequence[Tuple[o
     a deck without steps yields the model data's.  ``skip``: ids of cards the conversion
     leaves out (StepModel.lc2), as if absent.  Later cards may update a yielded dict: copy
     what is kept.  (StepModel.states over ``cards``.)"""
-    return StepModel(cards).states(entries, restore=restore, skip=skip)
+    return StepModel(cards).states(entries, restore=restore, skip=skip, blocks=cards)
 
 
 def perturbation_step(cards: Sequence[Block]) -> bool:
@@ -4636,7 +4636,8 @@ class StepModel:
     planner that replaces or edits a card inside a step; after it no planner or handler
     replaces, inserts, removes or edits a step card (it records a plan applied at emission
     instead: _vel_cards, _bc_lines, _op_new_drop), so the model's cards, ids (``lc2``,
-    ``op_new``, ``card_step``, ``nl_heads``) and Step fields hold for every later reader.
+    ``nl_heads``) and Step fields hold for every later reader.  The model keeps no card list
+    of the deck: a walker folds its own deck (``states``, ``acting``).
     _plan_deck_facts reads an early model for the planners before that point.  They read only
     its deck aggregates (``procs``, ``inertia``, ``mass_loads``, ``mass_acts``, ``nl_heads``,
     ``explicit_without_nlgeom``, ``pert`` and the Converter views of it: _pert_idx, _nl_steps,
@@ -4724,11 +4725,8 @@ class StepModel:
         return period, advance, defaults, ccx
 
     def __init__(self, blocks: Sequence[Block]) -> None:
-        model: List[Block] = []
         steps: List[Step] = []
         loose: List[Block] = []                 # the cards since the last step
-        # id(card) -> its step's no; 0: model data, -1: between or after the steps
-        self.card_step: Dict[int, int] = {}
         nlgeom = False                          # NLGEOM in force (Step.nlgeom)
         seen = base = base_dp = False           # Step.general_before, base_nlgeom, base_nlgeom_dp
         nl_motion, t = False, 0.0               # Step.nlgeom_motion, t_start
@@ -4757,8 +4755,8 @@ class StepModel:
         heads: set = set()
         for is_step, cards in deck_parts(blocks):
             if not is_step:
-                (loose if steps else model).extend(cards)
-                self.card_step.update((id(b), -1 if steps else 0) for b in cards)
+                if steps:
+                    loose.extend(cards)
                 continue
             head, inner = cards[0], cards[1:]
             proc_card = next((b for b in inner if b.keyword in PROC_KW), None)
@@ -4815,11 +4813,8 @@ class StepModel:
                 seen = True
                 base = base or self._writes_nlgeom(given, explicit, pert, base, False)
                 base_dp = base_dp or self._writes_nlgeom(given, explicit, pert, base_dp, True)
-            self.card_step.update((id(b), len(steps)) for b in cards)
             loose = []
-        self.model: Tuple[Block, ...] = tuple(model)
         self.steps: Tuple[Step, ...] = tuple(steps)
-        self.after: Tuple[Block, ...] = tuple(loose)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
         self.nl_heads = frozenset(heads)
         # the *BOUNDARY, LOAD CASE=2 cards of *BUCKLE steps: buckling-mode BCs, which ccx cannot
@@ -4827,12 +4822,6 @@ class StepModel:
         # _plan_load_cases).  No walker of the deck's BCs counts them: they are not there
         # (bc_steps' and op_new_cards' skip)
         self.lc2 = frozenset(i for s in steps for i in s.lc2)
-        # keyword -> the ids of its cards whose OP=NEW ccx acts on (op_new_cards over the deck
-        # as converted, without the lc2 cards)
-        acts = op_new_cards(blocks, tuple(LOAD_CARD_FIELD), skip=self.lc2)
-        self.op_new: Dict[str, frozenset] = {
-            k: frozenset(id(b) for b in blocks if b.keyword == k and id(b) in acts)
-            for k in LOAD_CARD_FIELD}
         # deck-wide (the Converter's views: _nl_steps, _nl_any, ...)
         self.nl_steps = tuple(s.nlgeom_on for s in steps)
         general = [s.nlgeom_on for s in steps if not s.perturbation]
@@ -4892,13 +4881,6 @@ class StepModel:
             if reach > 0.0:
                 self.amp_span = (longest, reach)
 
-    def step_of(self, card: Block) -> Step:
-        """The step ``card`` belongs to (one of its cards from its *STEP through its *END STEP)."""
-        no = self.card_step[id(card)]
-        if no < 1:
-            raise KeyError(f"*{card.keyword} is not in a step")
-        return self.steps[no - 1]
-
     def __iter__(self) -> Iterator[Step]:
         return iter(self.steps)
 
@@ -4921,24 +4903,18 @@ class StepModel:
                 (loose if steps else model).extend(cards)
         return model, steps, loose
 
-    def _cards(self) -> List[Block]:
-        return list(self.model) + [b for s in self.steps for b in s.between + s.cards] + \
-            list(self.after)
-
     def acting(self, keywords: Tuple[str, ...] = ("BOUNDARY",),
-               skip: Union[set, frozenset] = frozenset(),
-               blocks: Optional[Sequence[Block]] = None) -> frozenset:
+               skip: Union[set, frozenset] = frozenset(), *,
+               blocks: Sequence[Block]) -> frozenset:
         """ids of the ``keywords`` cards whose OP=NEW ccx acts on (op_new_cards), of the deck
-        as it is now (``blocks``, see states; None: the model's cards), the cards of ``skip``
-        left out (``lc2``)."""
-        return frozenset(op_new_cards(self._cards() if blocks is None else blocks,
-                                      tuple(keywords), skip))
+        as it is now (``blocks``, see states), the cards of ``skip`` left out (``lc2``)."""
+        return frozenset(op_new_cards(blocks, tuple(keywords), skip))
 
     def states(self, entries: Callable[[Block], Sequence[Tuple[object, object]]],
                keywords: Tuple[str, ...] = ("BOUNDARY",),
                restore: Union[bool, set, frozenset, Sequence[int]] = True,
-               skip: Union[set, frozenset] = frozenset(),
-               model: bool = False, blocks: Optional[Sequence[Block]] = None) -> Iterator[dict]:
+               skip: Union[set, frozenset] = frozenset(), model: bool = False, *,
+               blocks: Sequence[Block]) -> Iterator[dict]:
         """The entries of the ``keywords`` cards in force in each step, {key: value} from
         ``entries(card)``, the card's (key, value) pairs (asked once per card, in deck order,
         as the iteration reaches it), as ccx 2.23 applies *BOUNDARY: model data first, a step
@@ -4946,12 +4922,11 @@ class StepModel:
         replaces the earlier one, and an OP=NEW ccx acts on (``acting``) removes what is in
         force.  One dict per step, at its *END STEP (the deck's end, where a caller's cards end
         without one); a deck without steps yields the model data's.  Later cards may update a
-        yielded dict: copy what is kept.  ``blocks``: the deck as it is now, whose cards are folded
-        (None: the model's own).  The converter's model is read after the last planner that
-        rewrites a step card (Converter._read_steps), and no later one replaces, inserts or
-        removes a card, so for its walkers, which run after that point and pass their deck,
-        the two are the same cards; none adds or removes a *STEP or *END STEP.  Where the
-        walkers' rules differ today (DESIGN 1b) a parameter names each:
+        yielded dict: copy what is kept.  ``blocks``: the deck as it is now, whose cards are
+        folded: the model's steps, as the converter's model is read after the last planner that
+        rewrites a step card (Converter._read_steps) and its walkers run after that point; none
+        adds or removes a *STEP or *END STEP.  Where the walkers' rules differ today (DESIGN 1b)
+        a parameter names each:
 
         * ``restore``: the steps (1-based) after which the next one starts from what the last
           other step left: True, the linear perturbation steps (``pert``), which
@@ -4963,11 +4938,8 @@ class StepModel:
         not the converter's, close_open_steps) starts that step again from where it started,
         its cards gone, as step_load_audit counts it."""
         restore = self.pert if restore is True else restore or ()
-        acts = self.acting(keywords, skip, blocks)
-        if blocks is None:
-            data, steps, after = self.model, [(s.between, s.cards) for s in self.steps], self.after
-        else:
-            data, steps, after = self._parts(blocks)
+        acts = self.acting(keywords, skip, blocks=blocks)
+        data, steps, after = self._parts(blocks)
 
         def fold(cards: Sequence[Block], active: dict) -> dict:
             for b in cards:
@@ -14144,7 +14116,7 @@ class Converter:
                              f"evaluates the transform elsewhere; on the knot they are written in "
                              f"global components (exact). A knot holds the beam section rigid at "
                              f"the node, as beam theory does.", once=True)
-        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks=blocks)
         glob = {n for n, m in self._rot_mode.items() if m == "global"}
         sources: Dict[int, Dict[int, List[Tuple[str, int, float]]]] = {}    # card -> node -> moments
         for b, _, _ in cards:
@@ -14277,7 +14249,7 @@ class Converter:
             return
         at = self._elements_at(set(used))
         sections = self._knot_sections(blocks)
-        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks=blocks)
         ident: Tuple[Vec, Vec, Vec] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         done: List[int] = []
         hit: List[int] = []
@@ -14470,7 +14442,7 @@ class Converter:
                 local_out.update(self._resolve_nodes(nset) if nset else used)
         at = self._elements_at(set(used))
         sections = self._knot_sections(blocks)
-        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks=blocks)
         done: Dict[bool, List[int]] = {False: [], True: []}        # knot -> nodes
         hit: Dict[bool, List[Tuple[int, str]]] = {False: [], True: []}
         for n in used:
