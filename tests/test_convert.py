@@ -3463,7 +3463,8 @@ def test_unresolved_parameter_tokens_and_orphan_data_lines_warned_once():
                             "** <z> in a comment\n")
     warns = [m for lv, m in rep.entries if lv == "WARNING"]
     assert [m for m in warns if "<x>" in m] == [
-        "*PARAMETER: <x>, <y> used but not defined, so ccx reads the raw token — verify."]
+        "*PARAMETER: <x>, <y> used but not defined, so ccx reads the raw token in the data of "
+        "*NODE — verify."]
     assert [m for m in warns if "before any keyword" in m] == [
         "Data line before any keyword ignored: '1, 2' (and 2 more)."]
     # a *PARAMETER, TABLE= dependent is not evaluated: its token is reported, not kept silently
@@ -6401,10 +6402,11 @@ def test_general_step_after_perturbation_gets_the_base_state():
     # without a perturbation step nothing changes
     body, _, rep = convert_str(PERT.replace("*Step\n*Frequency\n3\n{}*End Step\n", "").format(""))
     assert "HOLD" not in body and "perturbation" not in rep.text()
-    # nor where the emitted steps do not match the deck's (a *STEP without *END STEP): warned
+    # a *STEP without *END STEP is closed when read, so the steps still match the deck's
     body, conv, rep = convert_str(PERT.replace("*Temperature\nALL, 100.\n*End Step\n",
                                                "*Temperature\nALL, 100.\n").format("", ""))
-    assert "HOLD" not in body and "steps do not match" in rep.text() and conv.reduced_physics
+    assert "HOLD" in body and "steps do not match" not in rep.text() and not conv.reduced_physics
+    assert "*STEP without *END STEP (Abaqus requires one): step(s) 1 closed" in rep.text()
     # Abaqus keeps NLGEOM on; ccx 2.23 forgets it after a *FREQUENCY step (probed: the next
     # static step ran linear), so it is written there (the *FREQUENCY step after NLGEOM gets
     # PERTURBATION: test_frequency_prestress_follows_the_base_steps_nlgeom)
@@ -7655,11 +7657,11 @@ def test_temperature_in_a_buckle_step_commented_out():
     # a static step's temperatures stay
     body, conv, _ = convert_str(BUCKLE_CUBE + _deck_step("Static", temp))
     assert "\n*TEMPERATURE\nALL, 100.\n" in body and not conv.reduced_physics
-    # the audit's wording follows its own step count (a *STEP before *END STEP replaces the
-    # open step): the step it flags is the static one
+    # a *STEP without *END STEP is closed when read: the step the audit flags is the static one
     _, conv, rep = convert_str(BUCKLE_CUBE + "*Step\n*Buckle\n2\n*Cload\n7, 3, -1.\n" +
                                _deck_step("Static", "*Dsload\nSURFX, P, 1.\n"))
-    assert conv.unloaded_steps == [1] and "no load at all, to a zero response" in rep.text()
+    assert conv.unloaded_steps == [2] and "Step 2 is loaded" in rep.text() and \
+        "no load at all, to a zero response" in rep.text()
 
 
 def test_dload_without_element_set_loads_the_whole_model():
@@ -14471,6 +14473,214 @@ def test_orientation_without_axes_ccx_could_take():
         body, conv, _ = convert_str(HEX + eng + ori + sec)
         assert "\n*ORIENTATION" not in body
         assert "*ORIENTATION OR1 (no axes ccx can take)" in conv.reduced_physics
+
+
+# --- code review 2, R22 / R23: report and CLI fixes -----------------------------------------
+REVIEW2_CUBE = (HEX + "*Nset, nset=BOT\n1, 2, 3, 4\n*Nset, nset=TOP\n5, 6, 7, 8\n*Nset, nset=ALL, "
+                "generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n"
+                "*Expansion\n1e-5\n*Solid Section, elset=EALL, material=M\n")
+
+
+def test_dependencies_zero_is_a_plain_table():
+    # DEPENDENCIES=0 names no field variable: no "rows could not be parsed", no reduced physics
+    # (the *PLASTIC case was a regression), the rows as they are, the parameter dropped
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=T3D2, elset=E\n1, 1, 2\n"
+            "*Solid Section, elset=E, material=M\n1.\n*Material, name=M\n*Elastic, dependencies=0\n"
+            "1000., 0.3\n*Density, dependencies=0\n7.8e-9\n*Plastic, dependencies=0\n10., 0.\n"
+            "20., 1.\n*Friction, dependencies=0\n0.2\n*Boundary\n1, 1, 3\n2, 2, 3\n*Step\n*Static\n"
+            "*Cload\n2, 1, 5.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "could not be parsed" not in rep.text() and "DEPENDENCIES" not in rep.text()
+    assert not conv.reduced_physics and "DEPENDENCIES" not in body
+    assert "*ELASTIC\n1000., 0.3\n*DENSITY\n7.8e-9\n*PLASTIC\n10., 0.\n20., 1.\n" in body
+
+
+def test_load_audit_counts_results_file_loads():
+    # a SUBMODEL *BOUNDARY (no value field) and a *TEMPERATURE, FILE= (no data lines) load the
+    # deck: no "applies no load" note, and source_unloaded stays False
+    for model, step in (("*Submodel\nALL\n", "*Boundary, submodel, step=1\nALL, 1, 3\n"),
+                        ("*Initial Conditions, type=TEMPERATURE\nALL, 0.\n",
+                         "*Boundary\nBOT, 1, 3\n*Temperature, file=thermal, bstep=1, binc=1\n")):
+        _, conv, rep = convert_str(REVIEW2_CUBE + model + "*Step\n*Static\n" + step + "*End Step\n")
+        assert "applies no load" not in rep.text() and not conv.source_unloaded, rep.text()
+    # a SUBMODEL *DSLOAD the conversion drops leaves the step unloaded: said so
+    _, conv, rep = convert_str(REVIEW2_CUBE + "*Submodel, type=SURFACE\nALL\n*Step\n*Static\n*Boundary\n"
+                               "BOT, 1, 3\n*Dsload, submodel, step=1\nS\n*End Step\n")
+    assert conv.unloaded_steps == [1] and "(*DSLOAD, SUBMODEL on S (driven from a results file))" \
+        in rep.text()
+
+
+def test_rate_constraint_note_only_for_converted_lines():
+    # a nonzero velocity BC in a *FREQUENCY step is commented out: no "converted" note beside it
+    _, conv, rep = convert_str(REVIEW2_CUBE + "*Boundary\nBOT, 1, 3\n*Step\n*Frequency\n5\n"
+                               "*Boundary, type=VELOCITY\nTOP, 3, 3, 2.\n*End Step\n")
+    assert "only a zero value on readable DOFs can be converted" in rep.text()
+    assert "zero-valued, so converted" not in rep.text()
+    _, _, rep = convert_str(REVIEW2_CUBE + "*Boundary\nBOT, 1, 3\n*Step\n*Frequency\n5\n"
+                            "*Boundary, type=VELOCITY\nTOP, 3, 3, 0.\n*End Step\n")
+    assert "zero-valued, so converted" in rep.text()
+
+
+def test_riks_step_cards_read_into_the_velocity_bc_state():
+    # the Riks step's OP=NEW removes step 1's velocity BC: step 3 carries none
+    deck = (REVIEW2_CUBE + "*Boundary\nBOT, 1, 3\n*Step\n*Static\n0.1, 1.\n*Boundary, type=VELOCITY\n"
+            "TOP, 3, 3, 0.01\n*End Step\n*Step\n*Static, riks\n0.1, 1.\n*Boundary, op=NEW\nBOT, 1, 3\n"
+            "*Cload\nTOP, 3, 1.\n*End Step\n*Step\n*Static\n0.1, 1.\n*Cload\nTOP, 3, 2.\n*End Step\n")
+    _, conv, rep = convert_str(deck)
+    assert "displacement at the start of the step is unknown" not in rep.text()
+    assert conv.reduced_physics == ["*STATIC, RIKS step (ccx has no arc-length solver)"]
+
+
+REVIEW2_RIGID = (HEX + "*Node\n11, 0., 0., 1.5\n12, 1., 0., 1.5\n13, 1., 1., 1.5\n14, 0., 1., 1.5\n"
+                 "100, 0.5, 0.5, 1.5\n*Element, type=R3D4, elset=R\n2, 11, 12, 13, 14\n*Elset, elset=BOTH\n"
+                 "1, 2\n*Material, name=M\n*Elastic\n1000.,0.3\n*Solid Section, elset=EALL, material=M\n"
+                 "*Rigid Body, ref node=100, elset=R\n*Boundary\n1,1,3\n2,2,3\n3,3\n4,1\n4,3\n100, 1, 6\n"
+                 "*Step\n*Static\n{}*Cload\n7, 3, 1.\n*End Step\n")
+
+
+def test_rigid_pressure_not_converted_is_reported():
+    # each pressure on rigid elements the conversion cannot write is a warned, commented-out
+    # load line and reduced physics (an unreadable magnitude was dropped without a word)
+    for load, card, why in (
+            ("*Dload\nR, P, 1.0x\n", "DLOAD", "its magnitude '1.0x' is not a number"),
+            ("*Surface, name=RS\nR,\n*Dsload\nRS, P, 1.\n", "DSLOAD",
+             "a pressure on rigid elements needs a one-sided surface (SPOS or SNEG) of them"),
+            ("*Surface, name=RS\nBOTH, SPOS\n*Dsload\nRS, P, 1.\n", "DSLOAD",
+             "its element set BOTH mixes rigid elements with others")):
+        body, conv, rep = convert_str(REVIEW2_RIGID.format(load))
+        name = "R" if card == "DLOAD" else "RS"
+        assert f"*{card} P on '{name}' not converted: {why}" in rep.text(), rep.text()
+        assert conv.reduced_physics == [f"*{card} P load dropped"] and rep.n_commented == 1
+        assert body.count(f"\n** {name}, P, 1.") == 1
+
+
+def test_tied_contact_pair_counts_a_shell_slaves_thickness_on_a_rigid_master():
+    # S4 mid-surface 0.15 below a rigid plate, thickness 0.2: its top face is 0.05 away, within
+    # ADJUST=0.1, so its nodes join the plate's body, moved to touch it (as the M3D4 twin), in
+    # translation only (a *TIE ties the rotations too); NO THICKNESS measures from the
+    # mid-surface: left to ccx's tie
+    deck = ("*Node\n1,0.,0.,0.85\n2,1.,0.,0.85\n3,1.,1.,0.85\n4,0.,1.,0.85\n*Element, type=S4, "
+            "elset=SH\n1, 1, 2, 3, 4\n*Surface, name=TOP\nSH, SPOS\n*Shell Section, elset=SH, "
+            "material=M\n0.2\n*Material, name=M\n*Elastic\n100., 0.3\n*Node\n11, 0.,0.,1.\n"
+            "12, 1.,0.,1.\n13, 1.,1.,1.\n14, 0.,1.,1.\n9, 0.5,0.5,2.\n*Element, type=R3D4, "
+            "elset=PLATE\n2, 11, 14, 13, 12\n*Surface, name=TOOL\nPLATE, SPOS\n*Rigid Body, ref "
+            "node=9, elset=PLATE\n*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, "
+            "tied, adjust=0.1{}\nTOP, TOOL\n*Step\n*Static\n*Boundary\n9, 1, 6\n*End Step\n")
+    body, conv, _ = convert_str(deck.format(""))
+    assert abs(conv.geom.nodes[1][2] - 0.9) < 1e-12 and "\n*TIE" not in body
+    assert "*EQUATION" not in body and "*EQUATION" in convert_str(deck.replace(
+        "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied, adjust=0.1{}\n",
+        "*Tie, name=T, position tolerance=0.1\n"))[0]
+    body, conv, _ = convert_str(deck.format(", no thickness"))
+    assert conv.geom.nodes[1][2] == 0.85 and "\n*TIE" in body
+
+
+def test_unterminated_step_closed_and_warned_once():
+    deck = ("*Node, nset=ALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=T3D2, elset=E\n1, 1, 2\n"
+            "*Solid Section, elset=E, material=M\n1.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Boundary\n1, 1, 3\n2, 2, 3\n*Step\n*Static\n*Cload\n2, 1, 5.\n*Step\n*Static\n"
+            "*Cload, op=NEW\n*End Step\n*Step\n*Static\n*Cload\n2, 1, 1.\n")
+    body, conv, rep = convert_str(deck)
+    warns = [m for lv, m in rep.entries if lv == "WARNING"]
+    assert warns == ["*STEP without *END STEP (Abaqus requires one): step(s) 1, 3 closed before "
+                     "the next *STEP or at the end of the deck."], warns
+    assert body.count("\n*STEP") == body.count("\n*END STEP") == 3
+    assert body.index("2, 1, 5.") < body.index("*END STEP") < body.index("*CLOAD, OP=NEW")
+    assert "applies no load" not in rep.text() and not conv.source_unloaded
+
+
+def test_keyword_reference_lists_only_cards_emitted_unchanged():
+    sys.path.insert(0, os.path.join(ROOT, "docs"))
+    try:
+        import generate_reference as G
+    finally:
+        sys.path.remove(os.path.join(ROOT, "docs"))
+    text = G.gen_keywords()
+    unchanged = text.split("## Supported — emitted unchanged\n")[1].split("\n## ")[0]
+    for kw in ("CYCLIC HARDENING", "NODAL THICKNESS", "NORMAL", "MOHR COULOMB HARDENING"):
+        assert f"`*{kw}`" not in unchanged and f"*{kw}" in text, kw
+    for kw in set(A.Converter._HANDLERS) & set(A.CCX_KEYWORDS):
+        assert f"`*{kw}`" not in unchanged, kw
+
+
+def test_parameter_integer_division_noted():
+    # Abaqus 2023 and older (Python 2) floor-divide two integers: 10/4 is 2 there
+    body, _, rep = convert_str("*Parameter\nn = 10/4\nm = 8/4\nk = 10./4\n*Node\n1, <n>, <m>, <k>\n")
+    assert "1, 2.5, 2, 2.5" in body
+    assert "'/' divides two integers in n (10/4 = 2.5): the converter divides as Abaqus 2024 and " \
+           "later do (Python 3); Abaqus 2023 and older evaluate parameters in Python 2, which " \
+           "floor-divides integers (10//4 = 2)." in rep.text()
+    _, _, rep = convert_str("*Parameter\nm = 8/4\nk = 10./4\nj = 10//4\n*Node\n1, <m>, <k>, <j>\n")
+    assert "divides two integers" not in rep.text()
+
+
+def test_undefined_parameter_in_model_data_is_reduced_physics():
+    deck = ("*Node, nset=ALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=T3D2, elset=E\n1, 1, 2\n"
+            "*Solid Section, elset=E, material=M\n1.\n*Material, name=M\n*Elastic\n{}, 0.3\n"
+            "*Boundary\n1, 1, 3\n2, 2, 3\n*Step\n*Static\n*Cload\n2, 1, 5.\n*Node Print, nset={}\nU\n"
+            "*End Step\n")
+    _, conv, rep = convert_str(deck.format("<E>", "ALL"))
+    assert "<E> used but not defined, so ccx reads the raw token in the data of *ELASTIC" in rep.text()
+    assert conv.reduced_physics == ["*ELASTIC data with an unresolved *PARAMETER"]
+    # an output request's set name: nothing physical is lost
+    _, conv, rep = convert_str(deck.format("1000.", "<NS>"))
+    assert "<NS> used but not defined, so ccx reads the raw token — verify." in rep.text()
+    assert not conv.reduced_physics
+    # a lost node line
+    _, conv, _ = convert_str("*Node\n1, <x>, 0., 0.\n")
+    assert conv.reduced_physics == ["*NODE data with an unresolved *PARAMETER"]
+    # a material no section uses changes nothing
+    _, conv, rep = convert_str(deck.format("1000.", "ALL") + "*Material, name=UNUSED\n*Elastic\n<E>, 0.3\n")
+    assert "in the data of *ELASTIC" in rep.text() and not conv.reduced_physics
+
+
+def test_interval_output_in_a_linear_step_noted_at_the_step_end():
+    # ccx 2.23 solves a linear *STATIC step in one increment: TIME POINTS output at its end only
+    deck = (REVIEW2_CUBE + "*Boundary\nBOT, 1, 3\n*Step{}\n*Static\n0.1, 1.\n*Cload\n7, 3, 1.\n"
+            "*Output, field, number interval=4\n*Node Output\nU\n*End Step\n")
+    _, _, rep = convert_str(deck.format(""))
+    assert "that ccx 2.23 runs linearly" in rep.text() and "writes the output at the step end " \
+        "only" in rep.text() and "cutting increments to reach them" not in rep.text()
+    _, _, rep = convert_str(deck.format(", nlgeom"))
+    assert "runs linearly" not in rep.text() and "cutting increments to reach them" in rep.text()
+
+
+def test_run_needs_an_inp_output_name():
+    # ccx reads <job>.inp: with -o deck, --run would solve deck.inp (maybe the Abaqus deck)
+    from contextlib import redirect_stderr
+    d = tempfile.mkdtemp()
+    try:
+        deck = os.path.join(d, "deck.inp")
+        with open(deck, "w", encoding="utf-8") as fh:
+            fh.write(HEX + "*STEP\n*STATIC\n*END STEP\n")
+        with redirect_stderr(io.StringIO()) as err:
+            try:
+                code = A.main([deck, "-o", os.path.join(d, "deck"), "--run", "--quiet"])
+            except SystemExit as exc:
+                code = exc.code
+        assert code == 2 and "--run needs an -o/--output name ending in .inp" in err.getvalue()
+        with redirect_stderr(io.StringIO()) as err:
+            run = A.run_ccx(os.path.join(d, "deck"), None, True)
+        assert run["status"] is None and run["ccx"] is None and "not running ccx" in err.getvalue()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_ccx_override_looked_up_on_path():
+    from contextlib import redirect_stderr
+    d, path = tempfile.mkdtemp(), os.environ.get("PATH", "")
+    try:
+        exe = _fake_ccx(d, b" Job finished\n")
+        os.environ["PATH"] = d + os.pathsep + path
+        found, _ = A.find_ccx(os.path.basename(exe))
+        assert found and os.path.samefile(found, exe), found
+        with redirect_stderr(io.StringIO()) as err:
+            run = A.run_ccx(os.path.join(d, "deck.inp"), "no_such_ccx_2_23", True)
+        assert run["ccx"] is None and "--ccx no_such_ccx_2_23 is neither an executable file nor " \
+            "a command on PATH" in err.getvalue()
+    finally:
+        os.environ["PATH"] = path
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

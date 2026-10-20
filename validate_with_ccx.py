@@ -4977,46 +4977,60 @@ def main():
     # which ccx reads as tensor components once halved), and one held in x whose E and nu
     # depend on temperature, read between the given rows (without the added rows ccx is
     # 0.6 % / 1.4 % off there).
-    inp = os.path.join(tmp, "thermal.inp")
-    convert(os.path.join(EXAMPLES, "thermal_expansion_cubes.inp"), inp)
-    d, status, out = run_ccx(ccx, env, inp)
-    dat = os.path.join(d, "job.dat")
-    a1, a2, a3, dt = 1e-5, 2e-5, 4e-5, 90.0
-    a12, a13, a23 = 1.2e-5, -0.8e-5, 0.6e-5                          # engineering, as given
-    c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
-    e_hot, nu_hot = 1900.0, 0.245                                    # E, nu at T = 90
-    expect = {1: [(a1 * c * c + a2 * s * s) * dt, (a1 * s * s + a2 * c * c) * dt, a3 * dt,
-                  (a1 - a2) * s * c * dt, 0.0, 0.0],
-              11: [a1 * dt, a2 * dt, a3 * dt, 0.0, 0.0, 0.0],
-              21: [0.0, (a2 + nu_hot * a1) * dt, (a3 + nu_hot * a1) * dt, 0.0, 0.0, 0.0],
-              31: [a1 * dt, a2 * dt, a3 * dt, a12 * dt / 2, a13 * dt / 2, a23 * dt / 2]}
-    errs = []
-    for base, ref in expect.items():
-        # homogeneous strain from the corner displacements (nodes at unit offsets x, y, z)
-        u = [dat_displacement(dat, base + k) if status == "solved" else None for k in (0, 1, 3, 4)]
-        if any(v is None for v in u):
-            errs = None
-            break
-        h = [[u[j + 1][i] - u[0][i] for j in range(3)] for i in range(3)]      # du_i / dx_j
-        eps = [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2,
-               (h[1][2] + h[2][1]) / 2]
-        errs.append(max(abs(x - y) for x, y in zip(eps, ref)) / max(abs(y) for y in ref))
-    sig = dat_el_stress(dat, 3) if status == "solved" else None
-    if errs is None or sig is None:
-        print(f"FAIL  thermal_expansion_cubes: no displacements / stresses ({status})")
-        print("\n".join(l for l in out.splitlines() if "ERROR" in l))
-        failures += 1
-    else:
-        sxx_ref = -e_hot * a1 * dt
-        errs.append(abs(sig[0] - sxx_ref) / abs(sxx_ref))
-        ok = max(errs) < 1e-3
-        print(f"{'PASS' if ok else 'FAIL'}  thermal_expansion_cubes (isotropic *Elastic + ORTHO/ANISO "
-              f"*Expansion): free strains {errs[0] * 100:.4f}% / {errs[1] * 100:.4f}% off alpha dT, "
-              f"ANISO with shear terms {errs[3] * 100:.4f}% off (alpha_ij dT / 2 for i /= j); "
-              f"held cube at T = 90: strains {errs[2] * 100:.4f}% off, sigma_xx = {sig[0]:+.5f} "
-              f"(analytic {sxx_ref:+.5f})")
-        failures += 0 if ok else 1
-    shutil.rmtree(d, ignore_errors=True)
+    # The same cubes with DEPENDENCIES=0 on every *Elastic and *Expansion: a plain table (it
+    # was read as unparsable, and the ANISO shear coefficients were not halved).
+    with open(os.path.join(EXAMPLES, "thermal_expansion_cubes.inp"), encoding="utf-8") as fh:
+        cubes = fh.read()
+    for tag, text in (("thermal_expansion_cubes", None),
+                      ("thermal_expansion_cubes_dependencies0",
+                       cubes.replace("*Elastic\n", "*Elastic, dependencies=0\n")
+                       .replace("*Expansion, type=", "*Expansion, dependencies=0, type="))):
+        inp = os.path.join(tmp, f"{tag}.inp")
+        if text is None:
+            convert(os.path.join(EXAMPLES, "thermal_expansion_cubes.inp"), inp)
+        else:
+            src = os.path.join(tmp, f"{tag}_src.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        a1, a2, a3, dt = 1e-5, 2e-5, 4e-5, 90.0
+        a12, a13, a23 = 1.2e-5, -0.8e-5, 0.6e-5                          # engineering, as given
+        c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+        e_hot, nu_hot = 1900.0, 0.245                                    # E, nu at T = 90
+        expect = {1: [(a1 * c * c + a2 * s * s) * dt, (a1 * s * s + a2 * c * c) * dt, a3 * dt,
+                      (a1 - a2) * s * c * dt, 0.0, 0.0],
+                  11: [a1 * dt, a2 * dt, a3 * dt, 0.0, 0.0, 0.0],
+                  21: [0.0, (a2 + nu_hot * a1) * dt, (a3 + nu_hot * a1) * dt, 0.0, 0.0, 0.0],
+                  31: [a1 * dt, a2 * dt, a3 * dt, a12 * dt / 2, a13 * dt / 2, a23 * dt / 2]}
+        errs = []
+        for base, ref in expect.items():
+            # homogeneous strain from the corner displacements (nodes at unit offsets x, y, z)
+            u = [dat_displacement(dat, base + k) if status == "solved" else None for k in (0, 1, 3, 4)]
+            if any(v is None for v in u):
+                errs = None
+                break
+            h = [[u[j + 1][i] - u[0][i] for j in range(3)] for i in range(3)]      # du_i / dx_j
+            eps = [h[0][0], h[1][1], h[2][2], (h[0][1] + h[1][0]) / 2, (h[0][2] + h[2][0]) / 2,
+                   (h[1][2] + h[2][1]) / 2]
+            errs.append(max(abs(x - y) for x, y in zip(eps, ref)) / max(abs(y) for y in ref))
+        sig = dat_el_stress(dat, 3) if status == "solved" else None
+        if errs is None or sig is None:
+            print(f"FAIL  {tag}: no displacements / stresses ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+        else:
+            sxx_ref = -e_hot * a1 * dt
+            errs.append(abs(sig[0] - sxx_ref) / abs(sxx_ref))
+            ok = max(errs) < 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (isotropic *Elastic + ORTHO/ANISO *Expansion"
+                  f"{', all DEPENDENCIES=0' if text else ''}): free strains {errs[0] * 100:.4f}% / {errs[1] * 100:.4f}% off alpha dT, "
+                  f"ANISO with shear terms {errs[3] * 100:.4f}% off (alpha_ij dT / 2 for i /= j); "
+                  f"held cube at T = 90: strains {errs[2] * 100:.4f}% off, sigma_xx = {sig[0]:+.5f} "
+                  f"(analytic {sxx_ref:+.5f})")
+            failures += 0 if ok else 1
+        shutil.rmtree(d, ignore_errors=True)
 
     # --- orthotropic / anisotropic *Elastic forms beside an ANISO *Expansion -----------------
     # Beside a TYPE=ANISO expansion, ccx 2.23 also misreads an orthotropic or engineering-
@@ -7817,6 +7831,41 @@ def main():
               f"deflection {got:.7g} vs {want:.7g} with all four plies listed ({err:.1e} apart; taken "
               f"half as thick, its tie was left to ccx: 3.3x)")
     failures += 0 if all(strips) and ok else 1
+    # the same strip on a tied *CONTACT PAIR (ADJUST=0.1): its half thickness counts too, and a
+    # tied pair ties translations only (Abaqus 2017 "Defining tied contact in Abaqus/Standard"),
+    # so it bends like the strip with those nodes held in translation (left to ccx's tie of its
+    # expanded faces, as before: 1.8x)
+    tie_line = "*TIE, NAME=T, POSITION TOLERANCE=0.1, ADJUST=NO\nSLAVE, MASTER"
+    pair_strips = [review_run(text, tag, dat_displacements) for text, tag in (
+        (tied_strip_deck(False).replace(tie_line, "*SURFACE INTERACTION, NAME=SI\n*CONTACT PAIR, "
+                                                  "INTERACTION=SI, TIED, ADJUST=0.1\nSLAVE, MASTER"),
+         "rigid_tied_pair_shell"),
+        (tied_strip_deck(False).replace(tie_line, "").replace(
+            "*BOUNDARY\n100, 1, 6\n", "*BOUNDARY\n100, 1, 6\n11, 1, 3\n12, 1, 3\n21, 1, 3\n22, 1, 3\n"),
+         "rigid_tied_pair_shell_ref"))]
+    ok = False
+    if all(pair_strips):
+        got, want = (r.get(15, [0.0, 0.0, math.nan])[2] for r in pair_strips)
+        err = abs(got / want - 1)
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_tied_pair_shell (the strip tied to the clamped rigid "
+              f"plate by a *CONTACT PAIR, TIED, ADJUST=0.1): tip deflection {got:.7g} vs {want:.7g} "
+              f"with the tied nodes held in translation ({err:.1e} apart; left to ccx's tie: 1.8x)")
+    failures += 0 if ok else 1
+    # a *STEP without *END STEP is closed before the next *STEP (it was written nested in the
+    # next step, where ccx stops): a cube (E 1000, nu 0) pulled by 100, then by 200 (OP=NEW)
+    blocks = review_run(CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n" + CUBE8_HELD +
+                        "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 25.\n*NODE PRINT, NSET=TOP\nU\n*STEP\n*STATIC\n"
+                        "*CLOAD, OP=NEW\nTOP, 3, 50.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n",
+                        "unterminated_step", dat_node_blocks)
+    ok = False
+    if blocks:
+        uz = [b.get(7, [0.0, 0.0, math.nan])[2] for b in blocks]
+        ok = len(uz) == 2 and all(abs(u / w - 1) < 1e-9 for u, w in zip(uz, (0.1, 0.2)))
+        print(f"{'PASS' if ok else 'FAIL'}  unterminated_step (a cube pulled by 100 in a *STEP without "
+              f"*END STEP, then by 200 with OP=NEW): top displacement {', '.join(f'{u:.7g}' for u in uz)} "
+              f"vs 0.1, 0.2 (before: the first step written inside the second, where ccx stops)")
+    failures += 0 if ok else 1
     # --approximate's Poisson clamp beside a blank nu (that row became "E, 0.475")
     u = review_run(blank_nu_cube_deck(), "approximate_blank_nu", dat_displacements, approximate=True)
     if u:

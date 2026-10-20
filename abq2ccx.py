@@ -1404,15 +1404,19 @@ _PARAM_BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operato
                  ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
                  ast.Mod: operator.mod, ast.Pow: _param_pow}
 _PARAM_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_PARAM_TOKEN_RE = re.compile(r"<([A-Za-z_]\w*)>")
 
 
-def _safe_eval_param(expr: str, names: Dict[str, object]) -> object:
+def _safe_eval_param(expr: str, names: Dict[str, object],
+                     int_divs: Optional[List[Tuple[int, int]]] = None) -> object:
     """Evaluate an arithmetic ``*PARAMETER`` expression with NO attribute, subscript,
     or builtin access — so, unlike ``eval``, it cannot be coerced into running code.
     ``names`` supplies values for bare identifiers (user parameters and the math
     constants); ``_PARAM_EVAL_FUNCS`` supplies functions reachable only as ``f(...)``.
     Raises ``ValueError`` on anything outside the arithmetic grammar, and on an integer
-    beyond the float range or a string over 100000 characters (an FE value is neither)."""
+    beyond the float range or a string over 100000 characters (an FE value is neither).
+    ``int_divs`` collects the integer operands of each ``/`` whose quotient is not whole
+    (true division here, floor division in Python 2)."""
     def checked(v: object) -> object:
         if (isinstance(v, int) and v.bit_length() > 1024) or (isinstance(v, str)
                                                                 and len(v) > 100000):
@@ -1436,6 +1440,9 @@ def _safe_eval_param(expr: str, names: Dict[str, object]) -> object:
             raise ValueError(f"unknown name {node.id!r}")
         if isinstance(node, ast.BinOp) and type(node.op) in _PARAM_BINOPS:
             a, b = ev(node.left), ev(node.right)
+            if int_divs is not None and isinstance(node.op, ast.Div) and type(a) is int and \
+                    type(b) is int and b and a % b:
+                int_divs.append((a, b))
             if isinstance(node.op, ast.Mult) and isinstance(a, str) != isinstance(b, str):
                 text, n = (a, b) if isinstance(a, str) else (b, a)
                 if isinstance(n, int) and len(text) * n > 100000:
@@ -1452,13 +1459,17 @@ def _safe_eval_param(expr: str, names: Dict[str, object]) -> object:
     return ev(ast.parse(expr, mode="eval"))
 
 
-def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]) -> List[str]:
+def apply_parameters(lines: List[str], report: Report, params: Dict[str, object],
+                     card: str = "") -> List[str]:
     """Resolve Abaqus ``*PARAMETER`` input: collect ``name = expr`` definitions, drop
     the ``*PARAMETER`` blocks (ccx has no such card), and substitute every ``<name>``
     token with its value.  Without this, parametric coordinates like ``<l>`` reach the
     float parser and crash.  ``lines`` is the deck with its *INCLUDE files expanded
     (read_blocks), so a parameter defined in any file is visible in all of them;
-    ``params`` collects the values (an INPUT= data file is substituted with them)."""
+    ``params`` collects the values (an INPUT= data file is substituted with them, its
+    lines the data of keyword ``card``).  A ``<name>`` no parameter defines is warned
+    about, naming the ccx cards whose model data hold one (reduced physics:
+    Converter._undefined_parameter_data)."""
     raw_defs: List[Tuple[str, str]] = []
     kept: List[str] = []
     in_param = False
@@ -1484,6 +1495,7 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
     if raw_defs:                            # resolve, iterating to handle forward references
         user_names = {nm for nm, _ in raw_defs}
         unresolved: set = set()
+        floored: List[Tuple[str, Tuple[int, int]]] = []     # names whose / divides two ints
         for _ in range(len(raw_defs) + 1):
             progressed = False
             # math constants are visible, but a user parameter of the same name
@@ -1493,8 +1505,10 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
             for name, expr in raw_defs:
                 if name in params and not isinstance(params[name], str):
                     continue
+                divs: List[Tuple[int, int]] = []
                 try:
-                    val = _safe_eval_param(expr, ns)
+                    val = _safe_eval_param(expr, ns, divs)
+                    floored += [(name, divs[0])] if divs else []
                     params[name] = val
                     ns[name] = val          # visible to later defs resolved in this same pass
                     progressed = True
@@ -1508,6 +1522,14 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
         bad = [nm for nm, _ in raw_defs if nm in unresolved]
         report.note(f"*PARAMETER: resolved {len(raw_defs) - len(bad)} parameter(s) and substituted "
                     "<name> tokens (ccx has no *PARAMETER).", once=True)
+        if floored:
+            nm, (a, b) = floored[0]
+            more = len({n for n, _ in floored}) - 1
+            report.note(f"*PARAMETER: '/' divides two integers in {nm} ({a}/{b} = {a / b:g})"
+                        + (f" and {more} more" if more else "") + f": the converter divides as Abaqus "
+                        f"2024 and later do (Python 3); Abaqus 2023 and older evaluate parameters in "
+                        f"Python 2, which floor-divides integers ({a}//{b} = {a // b}). For a deck "
+                        f"written for those, use '//' or a float operand.", once=True)
         if bad:
             report.warn(f"*PARAMETER: {', '.join(dedup(bad))} could not be evaluated (the converter "
                         f"reads numbers, quoted strings, arithmetic and math functions, within the "
@@ -1515,11 +1537,30 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                         f"expression is substituted as written — verify.", once=True)
 
     out = [_substitute_params(ln, params) for ln in kept] if params else lines
-    undefined = dedup(m.group(0) for ln in out if "<" in ln and not ln.lstrip().startswith("**")
-                      for m in re.finditer(r"<([A-Za-z_]\w*)>", ln) if m.group(1) not in params)
+    undefined: List[str] = []
+    cards: List[str] = []                   # the cards with one in their model data
+    head = ""                               # the last keyword line
+    for ln in out:
+        s = ln.strip()
+        if s.startswith("**"):
+            continue
+        if s.startswith("*"):
+            head = s
+        if "<" not in s:
+            continue
+        toks = [m.group(0) for m in _PARAM_TOKEN_RE.finditer(s) if m.group(1) not in params]
+        undefined += toks
+        if toks and not s.startswith("*"):
+            kw = parse_keyword_line(head)[0] if head else card
+            if kw in CCX_KEYWORDS and kw not in _NO_MODEL_DATA_CARDS:
+                cards.append(f"*{kw}")
+    undefined = dedup(undefined)
     if undefined:
+        cards = dedup(cards)
         report.warn(f"*PARAMETER: {', '.join(undefined[:5])}{' ...' if len(undefined) > 5 else ''}"
-                    f" used but not defined, so ccx reads the raw token — verify.", once=True)
+                    f" used but not defined, so ccx reads the raw token"
+                    + (f" in the data of {', '.join(cards)}" if cards else "") + " — verify.",
+                    once=True)
     return out
 
 
@@ -1697,7 +1738,7 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                 src_path = src if os.path.isabs(src) else os.path.join(job_dir, src)
                 try:
                     with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
-                        ext = apply_parameters(fh.read().splitlines(), report, values)
+                        ext = apply_parameters(fh.read().splitlines(), report, values, keyword)
                 except OSError:
                     report.warn(f"*{keyword}, INPUT={src}: data file not found next to the deck; "
                                 f"the card has no data lines (copy the file alongside and "
@@ -1723,7 +1764,22 @@ def read_blocks(path: str, report: Report) -> List[Block]:
     for k, hits in seen.get("ambiguous", {}).items():
         report.warn(f"{k}: an ambiguous abbreviation ({', '.join(hits[:5])}"
                     f"{', ...' if len(hits) > 5 else ''}), which Abaqus rejects; read as written.")
-    return blocks
+    # a *STEP without *END STEP is closed before the next *STEP or at the end of the deck,
+    # so that every step walker counts the same steps
+    closed: List[Block] = []
+    open_step, where = False, []
+    for b in blocks + [Block("STEP", OrderedDict())]:
+        if b.keyword == "STEP" and open_step:
+            closed.append(Block("END STEP", OrderedDict()))
+            where.append(len([x for x in closed if x.keyword == "STEP"]))
+        if b.keyword in ("STEP", "END STEP"):
+            open_step = b.keyword == "STEP"
+        closed.append(b)
+    if where:
+        report.warn(f"*STEP without *END STEP (Abaqus requires one): step(s) "
+                    f"{', '.join(map(str, where))} closed before the next *STEP or at the end of "
+                    f"the deck.")
+    return closed[:-1]
 
 
 def numeric_fields(line: str) -> List[str]:
@@ -1777,6 +1833,17 @@ def fields_at(rec: Sequence[str], n: int, default: float = 0.0) -> List[float]:
     number."""
     f = [x.strip() for x in rec[:n]]
     return [pf(x) if x else default for x in f] + [default] * (n - len(f))
+
+
+def has_field_dependence(block: Block) -> bool:
+    """Whether a material card's DEPENDENCIES= names field variables (an unreadable value
+    counts): DEPENDENCIES=0 is a plain table."""
+    if not block.has("DEPENDENCIES"):
+        return False
+    try:
+        return int(float(block.param("DEPENDENCIES") or "0")) != 0
+    except ValueError:
+        return True
 
 
 def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
@@ -3419,6 +3486,9 @@ CCX_SOLID_PREFIXES = ("C3D", "DC3D", "F3D")
 FRD_2D_EXACT_LABELS = {"U", "V", "RF", "PU"}
 OUTPUT_CARDS = {"NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "NODE OUTPUT", "ELEMENT OUTPUT",
                 "CONTACT OUTPUT", "CONTACT FILE", "CONTACT PRINT"}
+# ccx cards whose data lines are no model data: output requests, headings, numerical controls
+_NO_MODEL_DATA_CARDS = OUTPUT_CARDS | {"OUTPUT", "FACE PRINT", "SECTION PRINT", "TIME POINTS",
+                                       "SUBSTRUCTURE MATRIX OUTPUT", "HEADING", "CONTROLS"}
 # Procedures without time increments: an output frequency means nothing there.
 UNTIMED_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY", "GREEN",
                  "SUBSTRUCTURE GENERATE", "SENSITIVITY", "FEASIBLE DIRECTION", "NO ANALYSIS"}
@@ -3784,6 +3854,12 @@ def _load_entries(b: Block, user_loads: bool, explicit: bool = False
         return [((kw, tuple(b.params.items())), f"*{kw}")]
     held = explicit and kw == "BOUNDARY" and not (b.param("AMPLITUDE") or "").strip() and \
         (b.param("TYPE") or "DISPLACEMENT").strip().upper() == "DISPLACEMENT"
+    # values read from a results file: a SUBMODEL card's lines have no value field, and a
+    # *TEMPERATURE, FILE= needs no data lines
+    driven = "SUBMODEL" if b.has("SUBMODEL") else \
+        "FILE=" if kw == "TEMPERATURE" and b.has("FILE") else ""
+    if driven and not any(any(x.strip() for x in r) for r in merged_data_records(b)):
+        return [((kw, driven), f"*{kw}, {driven} (driven from a results file)")]
     for rec in merged_data_records(b):
         f = [x.strip() for x in rec]
         if not f or not any(f):
@@ -3800,7 +3876,9 @@ def _load_entries(b: Block, user_loads: bool, explicit: bool = False
         else:
             keys = [(kw, f[0].upper(), label)]
         desc: Optional[str] = None
-        if held:
+        if driven:
+            desc = f"*{kw}, {driven} on {target} (driven from a results file)"
+        elif held:
             pass
         elif _is_user_load(b, f):
             if user_loads:
@@ -5494,6 +5572,7 @@ class Converter:
         params = b.params
         if b.has("DEPENDENCIES"):
             params = OrderedDict((k, v) for k, v in b.params.items() if k != "DEPENDENCIES")
+        if has_field_dependence(b):
             self.report.warn(f"*{kw}, DEPENDENCIES=...: ccx has no field-variable dependence and "
                              f"reads the field columns as further rows; parameter dropped — the "
                              f"property differs from Abaqus'.", once=True)
@@ -5530,9 +5609,10 @@ class Converter:
         return ["** abq2ccx: " + (msg if comment is None else comment)] + ["** " + x for x in lines]
 
     # -- model-data handlers ------------------------------------------------
-    def _collapse_dependencies(self, b: Block, nvals: int) -> Optional[List[str]]:
+    def _collapse_dependencies(self, b: Block, nvals: Optional[int]) -> Optional[List[str]]:
         """Data lines of a ``DEPENDENCIES=n`` material card reduced to a single field-
-        variable state, or None if the card has no dependencies / cannot be parsed.
+        variable state, the lines unchanged for DEPENDENCIES=0 (a plain table), or None if
+        the rows cannot be parsed (or ``nvals`` is unknown).
 
         ccx has no field variables: it ignores DEPENDENCIES and reads the field columns as
         further temperature rows, so effectively only the first row counts.  Abaqus with no
@@ -5546,7 +5626,9 @@ class Converter:
             ndep = int(float(b.param("DEPENDENCIES") or "0"))
         except ValueError:
             return None
-        if ndep <= 0:
+        if ndep == 0:
+            return list(b.data)
+        if ndep < 0 or not nvals:
             return None
         width = nvals + 1 + ndep
         recs = material_rows(b, nvals)
@@ -5766,6 +5848,22 @@ class Converter:
             self._reduces("*PLASTIC field-variable dependence")
         return [emit_keyword("PLASTIC", params)] + (data if data is not None else list(b.data))
 
+    def _undefined_parameter_data(self, blocks: List[Block]) -> None:
+        """Reduced physics where model data keep a ``<name>`` token no *PARAMETER resolves
+        (apply_parameters warned: undefined, or not evaluable): a node line lost, a constant ccx
+        cannot read.  Not for an output request, nor for an option of a material no section
+        uses (_commented's rule)."""
+        cards: List[str] = []
+        for b in blocks:
+            if b.keyword not in CCX_KEYWORDS or b.keyword in _NO_MODEL_DATA_CARDS or \
+                    not any("<" in ln and _PARAM_TOKEN_RE.search(ln) for ln in b.data):
+                continue
+            mat = self._card_material.get(id(b)) if b.keyword in MATERIAL_OPTION_CARDS else None
+            if mat is None or mat.upper() in self._used_materials:
+                cards.append(f"*{b.keyword}")
+        if cards:
+            self._reduces(f"{', '.join(dedup(cards))} data with an unresolved *PARAMETER")
+
     def _plan_material_cards(self, blocks: List[Block]) -> None:
         """Which material each material card belongs to (``_card_material``), the materials
         a section or composite ply uses (``_used_materials``), and what handle_damage_
@@ -5868,7 +5966,7 @@ class Converter:
         temperature dependence) a melting temperature one above the transition one is
         written instead."""
         recs = [r for r in merged_data_records(b) if any(r)]
-        if b.has("DEPENDENCIES") or len(recs) != 1 or len(recs[0]) > 8:
+        if has_field_dependence(b) or len(recs) != 1 or len(recs[0]) > 8:
             return None
         toks = (recs[0] + [""] * 8)[:8]
         try:
@@ -6136,7 +6234,7 @@ class Converter:
                                       "coefficients from *UNIAXIAL/*BIAXIAL/... TEST DATA; ccx needs "
                                       "the coefficients themselves — fit them and re-add the card.")
         params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
-        if b.has("DEPENDENCIES"):
+        if has_field_dependence(b):
             self.report.warn("*HYPERELASTIC, DEPENDENCIES: ccx has no field-variable dependence and "
                              "reads the field columns as data; the coefficients differ from "
                              "Abaqus'.", once=True)
@@ -6258,7 +6356,7 @@ class Converter:
         data = list(b.data)
         if b.has("DEPENDENCIES"):
             nvals = {"ISO": 2, "ORTHO": 9, "ENGINEERING CONSTANTS": 9, "ANISO": 21}.get(cc)
-            collapsed = self._collapse_dependencies(b, nvals) if nvals else None
+            collapsed = self._collapse_dependencies(b, nvals)
             if collapsed is None:
                 self.report.warn("*ELASTIC, DEPENDENCIES=...: rows could not be parsed; passed "
                                  "through — ccx ignores field-variable dependence and in effect "
@@ -9862,8 +9960,9 @@ class Converter:
             else:
                 entries.append((None, f"{spec}, {named}" if named else
                                 f"{spec}, {dofs[0]}, {dofs[-1]}"))
-        self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION {why}: zero-valued, so "
-                         f"converted to the zero displacement BC it amounts to.", once=True)
+        if any(e[0] != "#" for e in entries):
+            self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION {why}: zero-valued, so "
+                             f"converted to the zero displacement BC it amounts to.", once=True)
         return self._bc_pieces(b, entries)
 
     def _plan_velocity_bcs(self, blocks: List[Block]) -> None:
@@ -9964,6 +10063,18 @@ class Converter:
                 for b in cards:
                     if self._bc_type(b) in self._RATE_TYPES:
                         self._vel_cards[id(b)] = self._rate_constraint_card(b, why)
+                if not info["perturbation"]:
+                    # its cards still replace the BCs in force (OP=NEW removes them all); a DOF
+                    # they name ends the step at a value the converter does not follow
+                    if any(id(b) in acts for b in cards):
+                        for st in state.values():
+                            st[2] = None
+                    unknown = dict(q="DISPLACEMENT", mode="UNKNOWN", mag=0.0, curve=None)
+                    for b in cards:
+                        for spec, dofs, _, _, _ in self._rate_lines(b):
+                            for k in ((n, d) for n in self._resolve_nodes(spec) for d in dofs):
+                                if k in state:
+                                    state[k][2] = unknown
                 if not info["perturbation"] and info["proc"] != "HEAT TRANSFER":
                     for st in state.values():          # nodes moved, by unknown amounts
                         st[0] = st[1] = None
@@ -11032,15 +11143,18 @@ class Converter:
                     continue
                 faces, why = self._surface_faces(surf, carriers_only=True)
                 side += self._to_nodal_forces(b, "DSLOAD", g, faces, why)
+            dropped = False
             for token, face in sd[1]:
                 if self._only_carriers(token):
                     continue
-                rigid = self._rigid_pressure(token, face, mag, False, surf) if self._skins else None
+                rigid = self._rigid_pressure(token, face, mag, False) if self._skins else None
                 if rigid is not None:
                     for ln, key, m2 in rigid[0]:
                         body.append(ln)
                         lines.append(((surf,) + key, ln, m2))
-                    side += rigid[1]
+                    if rigid[1] and not dropped:      # the line once, whichever face failed
+                        side += self._drop_load_line(b, g, rigid[1])
+                        dropped = True
                     continue
                 sign = 1.0
                 family = self._sheet_family(token) if face in ("SPOS", "SNEG") else None
@@ -11116,7 +11230,8 @@ class Converter:
         if not rid:
             return None
         if label == "P" and len(rid) == len(eids):
-            return self._rigid_pressure(g[0], None, g[2] if len(g) > 2 else "", True, g[0])
+            lines, why = self._rigid_pressure(g[0], None, g[2] if len(g) > 2 else "", True)
+            return lines, self._drop_load_line(b, g, why) if why else []
         if label in ("GRAV", "CENTRIF", "CENT") and len(rid) < len(eids):
             return None                         # the rest of the set carries it; skins: no mass
         if label in ("GRAV", "CENTRIF", "CENT"):
@@ -11125,31 +11240,29 @@ class Converter:
         return [], self._drop_load_line(b, g, f"a {label} load on rigid elements (here their "
                                               f"skins) is not converted")
 
-    def _rigid_pressure(self, token: str, face: Optional[str], mag: str, element_based: bool,
-                        name: str):
+    def _rigid_pressure(self, token: str, face: Optional[str], mag: str, element_based: bool):
         """*DLOAD lines (ccx face pressure Pk on the skins' contact faces) for a pressure on the
-        rigid elements of ``token``: (lines, commented lines), or None when it names none.  Abaqus:
-        an element-based P on a rigid element pushes along its positive normal, a surface P
-        against the surface's normal (into its SPOS / SNEG face); ccx's Pk pushes against face
-        k's outward normal — so a surface P keeps its sign on its side's skin face, an element
-        P is minus a pressure on the SPOS skin's face (plus one on an SNEG-only skin)."""
+        rigid elements of ``token``: (lines, why the pressure is not converted, else None), or
+        None when it names none.  Abaqus: an element-based P on a rigid element pushes along
+        its positive normal, a surface P against the surface's normal (into its SPOS / SNEG
+        face); ccx's Pk pushes against face k's outward normal — so a surface P keeps its sign
+        on its side's skin face, an element P is minus a pressure on the SPOS skin's face (plus
+        one on an SNEG-only skin)."""
         eids = self._load_elements(token)
         rid = [e for e in eids if (e, "P") in self._skins or (e, "N") in self._skins]
         if not rid:
             return None
         if len(rid) < len(eids):
-            self.report.warn(f"Pressure on '{name}': its element set mixes rigid elements with "
-                             f"others; not converted — split the set.", once=True)
-            return [], [f"** abq2ccx: pressure on {name} not converted (rigid and other elements mixed)"]
+            return [], (f"its element set {token} mixes rigid elements with others, whose "
+                        f"pressures are converted differently — split the set")
         try:
             p = pf(mag) if mag != "" else 0.0
         except ValueError:
-            return [], [f"** abq2ccx: pressure on {name} not converted (magnitude '{mag}')"]
+            return [], f"its magnitude '{mag}' is not a number"
         side = {"SPOS": "P", "SNEG": "N"}.get((face or "").upper())
         if not element_based and side is None:
-            self.report.warn(f"*DSLOAD on '{name}': a pressure needs a one-sided surface (SPOS or "
-                             f"SNEG) of the rigid elements; not converted.", once=True)
-            return [], [f"** abq2ccx: pressure on {name} not converted (no SPOS / SNEG side)"]
+            return [], ("a pressure on rigid elements needs a one-sided surface (SPOS or SNEG) of "
+                        "them")
         out = []
         for e in rid:
             if element_based:
@@ -11167,7 +11280,7 @@ class Converter:
                          "faces (an element-based P pushes along the element normal, a surface P "
                          "into the surface, as in Abaqus; on R2D2 / RB2D2, which have no section "
                          "thickness, per unit depth: divided by the plane skins' depth).", once=True)
-        return out, []
+        return out, None
 
     # -- distributed loads as nodal forces, and *DLOAD bookkeeping -------------------
     def _load_elements(self, token: str) -> List[int]:
@@ -13307,8 +13420,11 @@ class Converter:
         self._contact_force_stops(steps, groups)
         self._el_file_stops(blocks, steps, groups)
         self._dynamic_energy_offsets(steps)
-        for k, timing, reqs in steps:
-            self._out_ctl[k] = self._step_output_control(k, timing, reqs)
+        # the steps ccx solves in one increment: linear, and no contact pair (ccx iterates any)
+        linear = self._ccx_linear_steps(blocks, steps, groups) \
+            if len(groups) == len(steps) and not self._out_contact["pairs"] else [False] * len(steps)
+        for (k, timing, reqs), lin in zip(steps, linear):
+            self._out_ctl[k] = self._step_output_control(k, timing, reqs, lin)
             for r in reqs:
                 # the cards are written where their anchor stands: the output card itself, the
                 # *OUTPUT of a preselected request, or the *STEP of Abaqus' default output
@@ -14207,12 +14323,14 @@ class Converter:
                 return ("F", 10), True
         return ("F", 1), True
 
-    def _step_output_control(self, k: int, timing: dict, reqs: List[dict]) -> Optional[Tuple[str, str]]:
+    def _step_output_control(self, k: int, timing: dict, reqs: List[dict],
+                             linear: bool = False) -> Optional[Tuple[str, str]]:
         """The one output control ccx can give step ``k`` (as FREQUENCY= or TIME POINTS=):
         its .frd requests' (or, without any, its .dat requests'); the .dat requests' when
         the .frd's cannot be given.  None when the step has no time increments or nothing
         can be given.  Notes go to the step's first request.  A request without a control
-        of its own (_energy_from_step_one's card) has no say."""
+        of its own (_energy_from_step_one's card) has no say.  ``linear``: ccx solves the
+        step in one increment (probed on 2.23), so output at times of it comes at its end."""
         live = [r for r in reqs if r["live"] and r["ctl"]]
         if not live or timing["kind"] == "untimed":
             return None
@@ -14222,7 +14340,7 @@ class Converter:
         msgs = live[0]["notes"]
         spacing = None
         for group in groups:
-            ctl = self._group_control(timing, group, msgs)
+            ctl = self._group_control(timing, group, msgs, linear)
             if ctl[0] == "NONE":
                 spacing = ctl[1] if spacing is None else spacing
                 continue
@@ -14249,7 +14367,8 @@ class Converter:
                 f"increment.")
         return None
 
-    def _group_control(self, timing: dict, group: List[dict], msgs: List[str]) -> Tuple[str, object]:
+    def _group_control(self, timing: dict, group: List[dict], msgs: List[str],
+                       linear: bool = False) -> Tuple[str, object]:
         """The ccx control for the requests ``group`` of a step (see _step_output_control):
         (parameter, value), or ('NONE', spacing) if ccx cannot give output every
         ``spacing`` of step time there."""
@@ -14265,10 +14384,15 @@ class Converter:
                             f"for this procedure (ccx's is every increment).")
             return ("FREQUENCY", str(math.gcd(*freqs)))
         times = self._control_times(timed, timing["period"])
+        if linear:
+            msgs.append(f"Output at times of a step (*OUTPUT NUMBER INTERVAL / TIME INTERVAL / "
+                        f"TIME POINTS) that ccx 2.23 runs linearly ({self._LINEAR_STEP_WHY}): ccx "
+                        f"solves it in one increment and writes the output at the step end only, "
+                        f"where Abaqus also writes the frames before it.")
         if timing["kind"] == "auto":
             if len(set(timed)) == 1 and timed[0][0] == "P" and timed[0][1] in self._out_user_tp:
                 return ("TIME POINTS", self._out_user_tp[timed[0][1]].param("NAME").strip())
-            return ("TIME POINTS", self._time_points_card(times, timing["period"]))
+            return ("TIME POINTS", self._time_points_card(times, timing["period"], linear))
         if times[0] == "U":
             spacing = times[1]
         else:
@@ -14339,8 +14463,13 @@ class Converter:
                                  f"its output times are left out.", once=True)
         return [t for t in out if t > 0]
 
-    def _time_points_card(self, times: tuple, period: float) -> str:
-        """A *TIME POINTS card (emitted before the first *STEP) for ``times``; its name."""
+    def _time_points_card(self, times: tuple, period: float, linear: bool = False) -> str:
+        """A *TIME POINTS card (emitted before the first *STEP) for ``times``; its name
+        (``linear``: for a step ccx solves in one increment, see _group_control)."""
+        if not linear:
+            self.report.note("*OUTPUT NUMBER INTERVAL / TIME INTERVAL -> *TIME POINTS (ccx writes "
+                             "the output at those times of the step, cutting increments to reach "
+                             "them, as Abaqus' TIME MARKS=YES).", once=True)
         key = (times[0], round(times[1], 12) if times[0] == "U" else times[1], round(period, 12))
         if key in self._out_tp_names:
             return self._out_tp_names[key]
@@ -14359,9 +14488,6 @@ class Converter:
             # characters in repr, and ccx reads 20
             self._out_tp_cards += ([f"*TIME POINTS, NAME={name}"]
                                    + reflow(list(dict.fromkeys(short_real(t, 12) for t in times[1])), 8))
-        self.report.note("*OUTPUT NUMBER INTERVAL / TIME INTERVAL -> *TIME POINTS (ccx writes "
-                         "the output at those times of the step, cutting increments to reach "
-                         "them, as Abaqus' TIME MARKS=YES).", once=True)
         return name
 
     def handle_mpc(self, b: Block) -> List[str]:
@@ -18423,12 +18549,12 @@ class Converter:
                          pins_of: Dict[int, List[int]]) -> None:
         """*TIE lines, and *CONTACT PAIR, TIED lines, whose master is a rigid surface (rigid
         elements' skins or a meshed analytical surface): the slave nodes they tie become
-        members of the master's rigid body (TIE, or PIN with NO ROTATION) and the line is
-        dropped.  A node tied to a rigid surface moves rigidly with it, so that is the tie,
-        exact also where ccx's tie MPCs, chained onto the body's nonlinear MPCs, follow an
-        NLGEOM rotation only linearly (probed on 2.23: 1.3 % off at 0.05 rad; exact in linear
-        steps and NLGEOM translation) or stop explicit dynamics ('linear and nonlinear MPC's
-        depend on each other').
+        members of the master's rigid body (TIE, or PIN with NO ROTATION; PIN for a tied
+        pair on shell or beam nodes, as it ties translations only) and the line is dropped.  A node tied to a rigid
+        surface moves rigidly with it, so that is the tie, exact also where ccx's tie MPCs,
+        chained onto the body's nonlinear MPCs, follow an NLGEOM rotation only linearly
+        (probed on 2.23: 1.3 % off at 0.05 rad; exact in linear steps and NLGEOM translation)
+        or stop explicit dynamics ('linear and nonlinear MPC's depend on each other').
 
         The slave nodes a *TIE ties are Abaqus' (Analysis User's Guide, "Mesh tie
         constraints"): the nodes of TIED NSET, else those within the position tolerance of
@@ -18452,13 +18578,15 @@ class Converter:
                  if ts and all(t is not None and t > 0.0 for t in ts)} if mem else {}
         taken = {n for r in blocks if r.keyword == "RIGID BODY"
                  for part in self._rigid_body_members(r) for n in part}
+        turning = {n for e, (_t, conn) in self.geom.elements.items()
+                   if e in shells or self._is_beam(e) for n in conn}    # nodes with rotations
         for b in blocks:
             pair = b.keyword == "CONTACT PAIR" and b.has("TIED")
             if not (b.keyword == "TIE" or pair) or b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE"):
                 continue
             label = f"{'*CONTACT PAIR, TIED' if pair else '*TIE'} {b.param('NAME') or ''}".rstrip()
             if pair:
-                adjust, no_thick, tied_set, form = True, True, None, ""
+                adjust, no_thick, tied_set, form = True, b.has("NO THICKNESS"), None, ""
                 try:
                     tol = pf((b.param("ADJUST") or "0").strip())
                 except ValueError:
@@ -18525,10 +18653,9 @@ class Converter:
                     tol_k = tol
                 # half thickness of a slave shell node on its side towards the master
                 half: Dict[int, Tuple[float, float, Vec]] = {}
-                if not no_thick or pair:
+                if not no_thick:
                     for e, f in slave_faces:
-                        if (e in shells and not no_thick) or \
-                                (e in mem_t and pair and not b.has("NO THICKNESS")):
+                        if e in shells or (e in mem_t and pair):
                             t_e, off = shells[e] if e in shells else (mem_t[e], 0.0)
                             nrm = self._shell_normal(e)
                             for n in self.geom.elements[e][1]:
@@ -18574,7 +18701,12 @@ class Converter:
                 if not tied:
                     continue
                 taken.update(tied)
-                (pins_of if b.has("NO ROTATION") else members_of).setdefault(id(body), []).extend(tied)
+                # a tied contact pair ties translations only (Abaqus 2017 "Defining tied contact
+                # in Abaqus/Standard"): PIN where a tied node has rotations; a *TIE ties them
+                # too unless NO ROTATION
+                turns = pair and any(n in turning for n in tied)
+                into = pins_of if turns or b.has("NO ROTATION") else members_of
+                into.setdefault(id(body), []).extend(tied)
                 self._tie_to_rigid.add((id(b), k))
                 if len(tied) < len(slaves):
                     why = ("not in its TIED NSET" if chosen is not None else
@@ -19270,10 +19402,9 @@ class Converter:
                     cards[-1][0].data.append(s)
                     rows.setdefault(id(cards[-1][0]), []).append(i)
         if step != self._step_idx:
-            self.report.warn("The converted deck's steps do not match the deck's (a *STEP without "
-                             "*END STEP?): the base state is not given again after its linear "
-                             "perturbation steps, whose loads and BC changes ccx carries on.",
-                             once=True)
+            self.report.warn("The converted deck's steps do not match the deck's: the base state is "
+                             "not given again after its linear perturbation steps, whose loads and "
+                             "BC changes ccx carries on.", once=True)
             self._reduces("loads / BCs of linear perturbation steps carried on")
             return out
         recs: Dict[int, List[List[str]]] = {}       # id(card) -> its data records
@@ -22681,6 +22812,7 @@ class Converter:
         if self._temp_ic_fill or self._temp_ic_default:
             self.geom.nsets.setdefault(ALL_NODES_SET, list(self.geom.nodes))
         self._plan_material_cards(blocks)
+        self._undefined_parameter_data(blocks)
         self._plan_deformation_plasticity(blocks)   # before the expansion check: NLGEOM in ccx
         self._plan_expansion_as_ortho(blocks)
         self._plan_elastic_expansion(blocks)
@@ -26438,7 +26570,7 @@ class Converter:
             for c in groups.get(mat, [None])[1:]:
                 if c.keyword not in ("ELASTIC", "DENSITY"):
                     return f"material {mat} has *{c.keyword}"
-                if c.has("DEPENDENCIES") or (c.keyword == "ELASTIC" and (c.param("TYPE") or "ISO")
+                if has_field_dependence(c) or (c.keyword == "ELASTIC" and (c.param("TYPE") or "ISO")
                                              .strip().upper()[:3] != "ISO"):
                     return f"material {mat} has a {c.keyword.lower()} that is not constant and isotropic"
                 rows = [[x for x in r if x != ""] for r in merged_data_records(c)]
@@ -28945,13 +29077,15 @@ def _ccx_env(exe: str) -> Dict[str, str]:
 
 
 def find_ccx(override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, str]]:
-    """Locate a CalculiX executable: --ccx/$CCX override, PATH, then known install spots
-    (FreeCAD, PrePoMax and bConverged on Windows; FreeCAD's macOS bundle, whose dylibs need
-    the ../lib fallback path, Homebrew and MacPorts elsewhere).  On Windows a ccx of a conda
-    environment, found or given, runs with the environment's folders on PATH, as `conda
-    activate` sets them."""
+    """Locate a CalculiX executable: --ccx/$CCX override (a file, else a command on PATH),
+    PATH, then known install spots (FreeCAD, PrePoMax and bConverged on Windows; FreeCAD's
+    macOS bundle, whose dylibs need the ../lib fallback path, Homebrew and MacPorts
+    elsewhere).  On Windows a ccx of a conda environment, found or given, runs with the
+    environment's folders on PATH, as `conda activate` sets them."""
     for cand in ([override] if override else []) + \
                 ([os.environ["CCX"]] if not override and os.environ.get("CCX") else []):
+        if not os.path.isfile(cand):
+            cand = shutil.which(cand) or cand   # a command name: looked up on PATH
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return os.path.abspath(cand), _ccx_env(cand)   # --run starts it in the output folder
         return None, {}
@@ -29701,11 +29835,20 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     which is also printed unless ``quiet`` or not ``digest``.  Warns once per executable when
     its version is not one the converter targets."""
     run: dict = {"code": 1, "ccx": None, "ccx_version": None, "status": None, "results": None}
+    if not out_path.endswith(".inp"):           # ccx reads <job>.inp: another file
+        sys.stderr.write(f"abq2ccx: not running ccx on {out_path}: ccx reads only a deck named "
+                         f"<job>.inp.\n")
+        return run
     exe, extra_env = find_ccx(override)
+    given = override or os.environ.get("CCX")
+    if not exe and given:
+        sys.stderr.write(f"abq2ccx: {'--ccx' if override else '$CCX'} {given} is neither an "
+                         f"executable file nor a command on PATH.\n")
+        return run
     if not exe:
-        sys.stderr.write("abq2ccx: no CalculiX executable found (searched --ccx/$CCX, PATH, "
-                         "FreeCAD, PrePoMax and bConverged installs, Homebrew/MacPorts); "
-                         "install ccx or pass --ccx PATH.\n")
+        sys.stderr.write("abq2ccx: no CalculiX executable found (searched PATH, FreeCAD, "
+                         "PrePoMax and bConverged installs, Homebrew/MacPorts); install ccx or "
+                         "pass --ccx PATH.\n")
         return run
     env = dict(os.environ)
     env.update(extra_env)
@@ -29940,6 +30083,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     if args.output and len(inputs) > 1:
         ap.error("-o/--output is only valid with a single input; use --outdir for batches")
+    if args.run and args.output and not args.output.endswith(".inp"):
+        ap.error("--run needs an -o/--output name ending in .inp (ccx reads <job>.inp)")
 
     codes = [_convert_one(p, args) for p in inputs]
     if len(inputs) > 1 and not args.quiet and not args.json_out:

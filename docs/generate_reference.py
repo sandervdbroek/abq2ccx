@@ -11,6 +11,7 @@ docs/output-reference.md
 """
 
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -429,6 +430,12 @@ TRANSLATED = {
         "none); `HARDENING=USER` and `DATATYPE=PARAMETERS` commented (ccx would silently skip "
         "them; reduced physics: ccx 2.23 has no user hardening, and its tabulated hardening cannot "
         "reproduce Chaboche back-stresses); `DEPENDENCIES` collapsed.",
+    "*CYCLIC HARDENING": "kept in tabular form after a kept `*PLASTIC, HARDENING=COMBINED` of its "
+        "material; the `PARAMETERS` form (Q_inf, b) is commented out (reduced physics), and so is "
+        "a card without that `*PLASTIC` (an error in ccx).",
+    "*NODAL THICKNESS / *NORMAL": "kept; a midside node the converter adds between two nodes "
+        "that both have a value (an upgraded beam or shell) gets their interpolation (a normal: "
+        "the normalised mean).",
     "*DAMAGE INITIATION": "ccx 2.23 evaluates `RICE TRACEY` and `JOHNSON COOK` only. `JOHNSON "
         "COOK` (d1-d5, melting and transition temperature, reference strain rate, as in Abaqus) "
         "is kept with the second data line ccx wants, the damage at which it deletes the element, "
@@ -438,7 +445,8 @@ TRANSLATED = {
         "plastic, all steps nonlinear `*STATIC`/`*DYNAMIC`, one card. Any other card is "
         "commented: exact without a `*DAMAGE EVOLUTION` (only the criterion output is lost), "
         "warned with one (the evolution is dropped anyway).",
-    "*ELASTIC / *DENSITY / *SPECIFIC HEAT / *CONDUCTIVITY / *EXPANSION / *MOHR COULOMB": "`TYPE` "
+    "*ELASTIC / *DENSITY / *SPECIFIC HEAT / *CONDUCTIVITY / *EXPANSION / *MOHR COULOMB / "
+    "*MOHR COULOMB HARDENING": "`TYPE` "
         "token translated (`ORTHOTROPIC`→`ORTHO`, `ANISOTROPIC`→`ANISO`, same constant order); an "
         "isotropic `*ELASTIC` line with E alone gets ν = 0 (Abaqus' value for the blank field; ccx "
         "stops on the line); a cohesive `TYPE=TRACTION` in a material no section uses is "
@@ -755,21 +763,9 @@ def gen_elements():
 
 
 def gen_keywords():
-    handled = {"NODE", "ELEMENT", "NSET", "ELSET", "NGEN", "NFILL", "NCOPY", "NMAP", "ELGEN",
-               "ELCOPY", "ELASTIC", "ORIENTATION", "DISTRIBUTION", "SOLID SECTION", "SHELL SECTION",
-               "MEMBRANE SECTION",
-               "BEAM SECTION", "STEP", "END STEP", "BOUNDARY", "DLOAD", "DSLOAD", "TIE", "MPC",
-               "CREEP", "AMPLITUDE", "RESTART", "SURFACE", "OUTPUT", "NODE OUTPUT", "ELEMENT OUTPUT",
-               "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "STATIC", "DYNAMIC", "FREQUENCY",
-               "COMPLEX FREQUENCY",
-               "BUCKLE", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT", "MASS", "EQUATION",
-               "COUPLING", "KINEMATIC", "DISTRIBUTING", "RIGID BODY", "PRE-TENSION SECTION",
-               "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
-               "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
-               "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
-               "CONTACT OUTPUT", "CONTACT FILE", "CONTACT PRINT", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
-               "CONNECTOR SECTION", "TRANSFORM", "DAMAGE INITIATION", "USER MATERIAL",
-               "DEFORMATION PLASTICITY"}
+    # cards a handler, the step writer or a translated row changes: not "emitted unchanged"
+    handled = set(A.Converter._HANDLERS) | set(A.Converter._U1_OPTIONS) | set(A.GEOM_KW) | \
+        {"END STEP"} | {m for k in TRANSLATED for m in re.findall(r"\*([A-Z0-9][A-Z0-9 -]*[A-Z0-9])", k)}
     supported = sorted(k for k in A.CCX_KEYWORDS
                        if k not in handled and k not in A.PASS_WITH_NOTE and k not in A.SEMANTIC_TRAP)
     parts = [AUTOGEN, "# Keyword reference\n",

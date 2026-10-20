@@ -6,6 +6,30 @@ physics.
 
 ## Unreleased
 
+* **Tied contact pairs on a rigid surface** — a `*CONTACT PAIR, TIED` measured a shell slave's
+  distance from its mid-surface, so a shell within `ADJUST` of the rigid master by its face was
+  left to ccx's tie of its expanded faces (a cantilever strip 1.8× too soft); its half thickness
+  now counts, as in Abaqus, unless `NO THICKNESS`. The tied nodes join the body in translation
+  only (`PIN`), since a tied pair does not tie rotations.
+* **A `*STEP` without `*END STEP`** was written inside the next step, where ccx stops, and the
+  load audit and other step walkers counted the steps differently. It is now closed before the
+  next `*STEP` (or at the end of the deck), with a warning.
+* **`DEPENDENCIES=0`** (a plain table) gave "rows could not be parsed" and reduced physics on
+  `*ELASTIC`, `*DENSITY`, `*PLASTIC` and other material cards, and left an anisotropic
+  `*EXPANSION`'s shear coefficients unhalved. It is now read as a table without field variables.
+* **Report fixes** — a deck loaded only by `*BOUNDARY, SUBMODEL` or `*TEMPERATURE, FILE=` no
+  longer gets "applies no load"; a pressure on rigid elements that cannot be converted is a
+  warned, commented-out line and reduced physics (an unreadable magnitude was dropped without a
+  word); a `<name>` token no `*PARAMETER` resolves is reduced physics where it stays in model
+  data; a velocity BC removed by a Riks step no longer gets a false warning in the next step; the
+  velocity BC note no longer says a commented-out line was converted; output at times of a step
+  ccx runs linearly is noted as written at the step end only (ccx solves it in one increment);
+  `/` between two integers in `*PARAMETER` is noted (Abaqus 2023 and older floor-divide). The
+  keyword reference no longer lists `*CYCLIC HARDENING`, `*NODAL THICKNESS` and `*NORMAL` as
+  emitted unchanged, and lists `*MOHR COULOMB HARDENING`.
+* **`--run`** — with an `-o` name not ending in `.inp` it ran ccx on `<name>.inp`, which can be
+  the Abaqus deck; that is now a usage error. `--ccx NAME` / `CCX=NAME` is also looked up on
+  PATH.
 * **Contact forces in eigenvalue and modal steps** — ccx 2.23 segfaults on `*CONTACT PRINT`
   `CF`, `CFN` and `CFS` in `*FREQUENCY` (without PERTURBATION), `*BUCKLE`, `*MODAL DYNAMIC` and
   `*STEADY STATE DYNAMICS` steps, whatever the material, also when an earlier step's card
