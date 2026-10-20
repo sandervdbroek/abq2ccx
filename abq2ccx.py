@@ -43,6 +43,7 @@ import argparse
 import ast
 import bisect
 import functools
+import gc
 import glob
 import itertools
 import json
@@ -20896,6 +20897,19 @@ class Converter:
 
     # ======================================================================
     def convert(self, blocks: List[Block]) -> List[str]:
+        """The ccx deck of Abaqus ``blocks`` (_convert).  Python's cyclic garbage collector is
+        off meanwhile: a conversion makes next to no cyclic garbage (a few hundred objects on a
+        deck of 300 000 nodes), and the collector's passes over the millions of objects a big
+        model keeps alive took up to half the conversion time."""
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            return self._convert(blocks)
+        finally:
+            if enabled:
+                gc.enable()
+
+    def _convert(self, blocks: List[Block]) -> List[str]:
         blocks = self._bc_dofs_in_range(self._cartesian_nodes(blocks))
         raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):

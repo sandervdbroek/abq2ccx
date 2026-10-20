@@ -7,8 +7,10 @@ physics.
 ## Unreleased
 
 * **Faster conversion** — reading a deck, registering and writing its mesh, and the planners'
-  passes over every element take about 30 % less CPU time over the corpus's 1052 decks; the
-  converted decks are the same, byte for byte.
+  passes over every element are faster, and Python's cyclic garbage collector, which found
+  next to nothing to collect, is off while a deck converts: about 40 % less CPU time over the
+  corpus's 1052 decks, up to half on the largest. The converted decks are the same, byte for
+  byte.
 * **Free coupling twists held in every form** — the hold on the ROT NODE now also covers
   `*DYNAMIC` and linear-rigid decks (ccx stopped converging or exited 255, without a warning),
   a `*TRANSFORM` on the reference node (solved 1e12 off, silently), `*KINEMATIC COUPLING` cards,
