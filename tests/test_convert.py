@@ -467,6 +467,54 @@ def test_step_model_unterminated_step():
     assert m.model + one.cards + two.between + two.cards + three.cards == tuple(blocks)
 
 
+def test_step_model_states():
+    # StepModel.states is bc_steps' fold on the model's steps (a card between steps acts in the
+    # next one), restoring after its perturbation steps; the walkers' other rules are parameters
+    blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1\n*END STEP
+*BOUNDARY\n3, 1, 1\n*STEP\n*FREQUENCY\n*BOUNDARY, OP=NEW\n4, 1, 1\n*END STEP
+*STEP\n*STATIC\n*BOUNDARY\n5, 1, 1\n*END STEP\n*BOUNDARY\n6, 1, 1""")
+    calls = []
+
+    def nodes(b):
+        calls.append(int(b.data[0].split(",")[0]))
+        return [(int(ln.split(",")[0]), True) for ln in b.data]
+
+    def run(**kw):
+        calls.clear()
+        return [sorted(a) for a in m.states(nodes, **kw)]
+    assert run() == [[1, 2], [4], [1, 2, 3, 5]] and calls == [1, 2, 3, 4, 5, 6]   # in deck order
+    assert [sorted(a) for a in A.bc_steps(blocks, nodes, {2})] == run()
+    assert run(restore=False) == [[1, 2], [4], [4, 5]]
+    assert run(model=True) == [[1], [1, 2], [4], [1, 2, 3, 5]]
+    assert [sorted(a) for a in A.StepModel(blocks[:2]).states(nodes, model=True)] == [[1], [1]]
+    # skip: the cards are left out, and the step's next *BOUNDARY acts on OP=NEW instead
+    two, new = blocks[8], A.Block("BOUNDARY", A.OrderedDict(OP="NEW"), ["7, 1, 1"])
+    blocks.insert(9, new)
+    m = A.StepModel(blocks)
+    assert m.acting() == {id(two)} and m.acting(skip={id(two)}) == {id(new)}
+    assert run(skip={id(two)}) == [[1, 2], [7], [1, 2, 3, 5]]
+    # blocks: the deck as it is now, cards a planner rewrote after the model was read (new
+    # Blocks) folded and acting in place of the model's
+    cur = list(blocks)
+    cur[8] = A.Block("BOUNDARY", A.OrderedDict(OP="NEW"), ["4, 1, 1"])
+    cur[13] = A.Block("BOUNDARY", A.OrderedDict(), ["8, 1, 1"])
+    assert run(blocks=cur) == [[1, 2], [4, 7], [1, 2, 3, 8]] and run()[2] == [1, 2, 3, 5]
+    assert m.acting(blocks=cur) == {id(cur[8])} and m.acting() == {id(two)}
+    # an unterminated *STEP: "replace" starts the open step again at the next *STEP (its cards
+    # go), "join" keeps one step, OP=NEW on any acting card clearing at its start
+    blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1
+*STEP\n*STATIC\n*BOUNDARY, OP=NEW\n3, 1, 1\n*END STEP""")
+    assert (run(), run(nested="join")) == ([[3]], [[2, 3]])
+    blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1
+*STEP\n*STATIC\n*BOUNDARY\n3, 1, 1""")
+    assert (run(), run(nested="join")) == ([[1, 3]], [[1, 2, 3]])
+    try:
+        run(nested="other")
+        assert False
+    except ValueError:
+        pass
+
+
 def test_step_model_explicit_steps():
     # the converter runs an explicit step with NLGEOM: handle_step writes it where NLGEOM= is
     # not given, while any explicit card switches it on for _plan_deck_facts

@@ -4304,33 +4304,8 @@ def bc_steps(cards: Sequence[Block], entries: Callable[[Block], Sequence[Tuple[o
     a *STEP before *END STEP replaces the open one, as in step_load_audit and step_groups;
     a deck without steps yields the model data's.  ``skip``: ids of cards the conversion
     leaves out (StepModel.lc2), as if absent.  Later cards may update a yielded dict: copy
-    what is kept."""
-    acts = op_new_cards(cards, skip=skip)
-    active: dict = {}
-    base = start = active             # what the last step not in ``restore`` left; the open
-    step = 0                          # step's start
-    in_step = stepped = False
-    for b in cards:
-        if b.keyword == "STEP":
-            if in_step:
-                active = dict(start)
-            else:
-                step += 1
-                if step - 1 not in restore:
-                    base = dict(active)
-                start = dict(active)
-            in_step = stepped = True
-        elif b.keyword == "END STEP" and in_step:
-            yield active
-            in_step = False
-            if step in restore:
-                active = dict(base)
-        elif b.keyword == "BOUNDARY" and id(b) not in skip:
-            if id(b) in acts:
-                active = {}
-            active.update(entries(b))
-    if in_step or not stepped:
-        yield active
+    what is kept.  (StepModel.states over ``cards``.)"""
+    return StepModel(cards).states(entries, restore=restore, skip=skip)
 
 
 def perturbation_step(cards: Sequence[Block]) -> bool:
@@ -4487,6 +4462,104 @@ class StepModel:
 
     def __len__(self) -> int:
         return len(self.steps)
+
+    @staticmethod
+    def _parts(blocks: Sequence[Block]) -> Tuple[List[Block], List[Tuple[List[Block], List[Block]]],
+                                                 List[Block]]:
+        """(``model``, each step's (``between``, ``cards``), ``after``) of ``blocks``, split as
+        the model splits its deck (deck_parts)."""
+        model: List[Block] = []
+        steps: List[Tuple[List[Block], List[Block]]] = []
+        loose: List[Block] = []
+        for is_step, cards in deck_parts(blocks):
+            if is_step:
+                steps.append((loose, cards))
+                loose = []
+            else:
+                (loose if steps else model).extend(cards)
+        return model, steps, loose
+
+    def _cards(self) -> List[Block]:
+        return list(self.model) + [b for s in self.steps for b in s.between + s.cards] + \
+            list(self.after)
+
+    def acting(self, keywords: Tuple[str, ...] = ("BOUNDARY",),
+               skip: Union[set, frozenset] = frozenset(),
+               blocks: Optional[Sequence[Block]] = None) -> frozenset:
+        """ids of the ``keywords`` cards whose OP=NEW ccx acts on (op_new_cards), of the deck
+        as it is now (``blocks``, see states; None: the model's cards), the cards of ``skip``
+        left out (``lc2``)."""
+        return frozenset(op_new_cards(self._cards() if blocks is None else blocks,
+                                      tuple(keywords), skip))
+
+    def states(self, entries: Callable[[Block], Sequence[Tuple[object, object]]],
+               keywords: Tuple[str, ...] = ("BOUNDARY",),
+               restore: Union[bool, set, frozenset, Sequence[int]] = True,
+               skip: Union[set, frozenset] = frozenset(), nested: str = "replace",
+               model: bool = False, blocks: Optional[Sequence[Block]] = None) -> Iterator[dict]:
+        """The entries of the ``keywords`` cards in force in each step, {key: value} from
+        ``entries(card)``, the card's (key, value) pairs (asked once per card, in deck order,
+        as the iteration reaches it), as ccx 2.23 applies *BOUNDARY: model data first, a step
+        keeps what is in force before it (cards between steps too), a later value on a key
+        replaces the earlier one, and an OP=NEW ccx acts on (``acting``) removes what is in
+        force.  One dict per step, at its *END STEP (an unterminated last step's: at the deck's
+        end); a deck without steps yields the model data's.  Later cards may update a yielded
+        dict: copy what is kept.  ``blocks``: the deck as it is now, whose cards are folded
+        (None: the model's own); planners after _plan_deck_facts replace and add cards
+        (_plan_free_ref_nodes rewrites *BOUNDARY and *CLOAD cards, in steps too), so the
+        converter's walkers pass theirs; none adds or removes a *STEP or *END STEP.  Where the
+        walkers' rules differ today (DESIGN 1b) a parameter names each:
+
+        * ``restore``: the steps (1-based) after which the next one starts from what the last
+          other step left: True, the linear perturbation steps (``pert``), which
+          _restore_base_states makes ccx undo; or a set of numbers; () or False: none;
+        * ``skip``: ids of cards left out, also where OP=NEW acts (``lc2``);
+        * ``nested``: an unterminated *STEP's later *STEP: "replace", the open step starts
+          again from where it started, its cards gone (bc_steps); "join", the cards stay one
+          step as emitted (step_groups), and OP=NEW on any of its acting cards clears at the
+          step's start;
+        * ``model``: yield the model data's state first (a copy)."""
+        if nested not in ("replace", "join"):
+            raise ValueError(f"StepModel.states: nested={nested!r}")
+        restore = self.pert if restore is True else restore or ()
+        acts = self.acting(keywords, skip, blocks)
+        if blocks is None:
+            data, steps, after = self.model, [(s.between, s.cards) for s in self.steps], self.after
+        else:
+            data, steps, after = self._parts(blocks)
+
+        def fold(cards: Sequence[Block], active: dict, wipe: bool = True) -> dict:
+            for b in cards:
+                if b.keyword in keywords and id(b) not in skip:
+                    if wipe and id(b) in acts:
+                        active = {}
+                    active.update(entries(b))
+            return active
+        active: dict = {}
+        base = active                     # what the last step not in ``restore`` left
+        active = fold(data, active)
+        if model:
+            yield dict(active)
+        join = nested == "join"
+        for no, (loose, cards) in enumerate(steps, 1):
+            active = fold(loose, active)
+            if no - 1 not in restore:
+                base = dict(active)
+            start = dict(active)
+            if join and any(id(b) in acts for b in cards):
+                active = {}
+            for b in cards[1:]:
+                if b.keyword == "STEP":
+                    if not join:
+                        active = dict(start)
+                else:
+                    active = fold((b,), active, not join)
+            yield active
+            if cards[-1].keyword == "END STEP" and no in restore:
+                active = dict(base)
+        fold(after, active)
+        if not steps:
+            yield active
 
 
 # ---------------------------------------------------------------------------
