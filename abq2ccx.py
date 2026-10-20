@@ -18358,6 +18358,7 @@ class Converter:
                 out.extend(b.data)
                 break
         out.extend(self.emit_geometry())
+        mesh = len(out)                         # (the post-passes leave its cards unread)
         out.extend(self._knot_section())
         out.extend(self._slab_cards())
         out.extend(self._ply_cards())
@@ -18375,8 +18376,8 @@ class Converter:
             out += ["** abq2ccx: kinematic-coupling reference node rotations no coupled DOF "
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc
         out.extend(self.emit_other(blocks))
-        out = self._settle_dependents(out)
-        out = self._restore_base_states(out)
+        deck = self._settle_dependents(EmittedDeck(out, mesh))
+        out = self._restore_base_states(deck.render())
         out = self._buckle_displacements(out)   # after the BCs the restore gives back
         out = self._modal_own_loads(out)        # after the loads the restore gives back
         out = self._clear_body_forces(out)      # after every pass that writes *DLOAD, OP=NEW
@@ -26953,7 +26954,7 @@ class Converter:
         return self.geom.elset(token)
 
     # -- dependent DOFs of the converted deck ------------------------------------
-    def _settle_dependents(self, out: List[str]) -> List[str]:
+    def _settle_dependents(self, deck: EmittedDeck) -> EmittedDeck:
         """Choose the eliminated (first) term of every *EQUATION of the converted deck.
 
         ccx eliminates an equation's first DOF and stops when that DOF also has a *BOUNDARY
@@ -26975,7 +26976,7 @@ class Converter:
         some steps only, by BCs on all its DOFs; probed on 2.23).  Otherwise it stays as it
         is, with a warning, except the converter's own rotation ties, which are dropped (the
         *BOUNDARY then governs that rotation)."""
-        cards = self._emitted_cards(out)
+        cards, out = deck.cards, deck.lines
         isint = re.compile(r"[-+]?\d+").fullmatch
 
         def fields(j: int) -> List[str]:
@@ -26987,9 +26988,10 @@ class Converter:
             if isint(tok):
                 return [int(tok)]
             return inline.get(tok.upper()) or self.geom.nset(tok)
-        for kw, params, _, data in cards:
+        for card in cards:
+            kw, params = card.keyword, card.params
             if kw == "NSET" and (params.get("NSET") or "").upper() not in self.geom.nsets:
-                toks = [t for j in data for t in fields(j) if t]
+                toks = [t for j in card.rows for t in fields(j) if t]
                 ids: List[int] = []
                 if "GENERATE" in params:
                     for a, c, inc in zip(toks[0::3], toks[1::3], toks[2::3]):
@@ -27000,7 +27002,7 @@ class Converter:
                 inline[(params.get("NSET") or "").upper()] = ids
             elif kw == "SURFACE" and (params.get("TYPE") or "").upper() == "NODE":
                 nsurf[(params.get("NAME") or "").upper()] = \
-                    [n for j in data for n in nodes_of(fields(j)[0])]
+                    [n for j in card.rows for n in nodes_of(fields(j)[0])]
 
         def surface_nodes(name: str) -> List[int]:
             return nsurf.get(name.upper()) or self._surface_member_nodes(name)
@@ -27016,13 +27018,14 @@ class Converter:
         # — ccx picks around it or carries it over — but no *EQUATION can eliminate them)
         busy: Dict[Tuple[int, int], str] = {}
         taken_too: set = set()
-        for ci, (kw, params, _, data) in enumerate(cards):
+        for ci, card in enumerate(cards):
+            kw, params = card.keyword, card.params
             if kw in ("STEP", "END STEP"):
                 bc_cards.append(Block(kw, params))
             elif kw == "BOUNDARY":
                 bc_cards.append(Block(kw, params))
                 entries = given[id(bc_cards[-1])] = []
-                for j in data:
+                for j in card.rows:
                     f = fields(j)
                     if len(f) < 2 or not isint(f[1]):
                         continue
@@ -27042,7 +27045,7 @@ class Converter:
                 ns = nodes_of((params.get("NSET") or "").strip())
                 transformed.update(ns)
                 try:
-                    v = [pf(x) for j in data for x in fields(j) if x]
+                    v = [pf(x) for j in card.rows for x in fields(j) if x]
                     tc: Optional[Tuple[str, Vec, Vec]] = (
                         "C" if (params.get("TYPE") or "").strip().upper().startswith("C") else "R",
                         (v[0], v[1], v[2]), (v[3], v[4], v[5]))
@@ -27059,18 +27062,18 @@ class Converter:
                     if str(m) not in (ref, rot):
                         busy.update({(m, d): "*RIGID BODY" for d in (1, 2, 3)})
             elif kw == "COUPLING" and ci + 1 < len(cards) and \
-                    cards[ci + 1][0] in ("KINEMATIC", "DISTRIBUTING"):
+                    cards[ci + 1].keyword in ("KINEMATIC", "DISTRIBUTING"):
                 ref = (params.get("REF NODE") or "").strip()
                 nxt = cards[ci + 1]
                 dofs: set = set()
-                for j in nxt[3]:
+                for j in nxt.rows:
                     f = fields(j)
                     if f and isint(f[0]):
                         d2 = int(f[1]) if len(f) > 1 and isint(f[1]) else int(f[0])
                         dofs.update(range(int(f[0]), d2 + 1))
                 if not isint(ref) or not dofs:
                     continue
-                if nxt[0] == "DISTRIBUTING":
+                if nxt.keyword == "DISTRIBUTING":
                     taken_too.update((int(ref), d) for d in dofs)
                     continue
                 taken_too.update((int(ref), d) for d in (4, 5, 6))    # the coupling rotation
@@ -27081,7 +27084,7 @@ class Converter:
                     if m != int(ref):
                         busy.update({(m, d): "*KINEMATIC coupling" for d in elim})
             elif kw == "MPC":
-                for j in data:
+                for j in card.rows:
                     f = fields(j)
                     nodes = [int(t) for t in f[1:] if isint(t)]
                     typ = f[0].upper() if f else ""
@@ -27089,7 +27092,7 @@ class Converter:
                         else nodes[:1] if typ == "BEAM" else nodes
                     taken_too.update((n, d) for n in nodes for d in (1, 2, 3))
             elif kw == "TIE":
-                for j in data:
+                for j in card.rows:
                     f = fields(j)
                     if f:
                         taken_too.update((n, d) for n in surface_nodes(f[0]) or nodes_of(f[0])
@@ -27103,9 +27106,9 @@ class Converter:
                              f"CalculiX will stop with '*ERROR in cascade ... dependent side of a "
                              f"MPC and a SPC'. Remove the BC or the constraint on that DOF.",
                              once=True)
-        eqs = self._emitted_equations(out, cards)
+        eqs = self._emitted_equations(deck)
         if not eqs:
-            return out
+            return deck
         # the local axes of the transformed nodes (ccx reads any TYPE but C as rectangular)
         taxes: Dict[int, Tuple[Vec, Vec, Vec]] = {}
         for n, tc in tcard.items():
@@ -27349,36 +27352,20 @@ class Converter:
                              f"of a MPC and a SPC'): each step that held such a DOF holds the "
                              f"equation's other DOFs at zero too, so the equation holds it there, "
                              f"and the steps that free them keep the equation — as in Abaqus.")
-        return self._with_equations(out, cards, eqs, final, swap)
+        return self._with_equations(deck, eqs, final, swap)
 
     @staticmethod
-    def _emitted_cards(out: List[str]) -> List[Tuple[str, "OrderedDict[str, Optional[str]]", int,
-                                                     List[int]]]:
-        """The keyword cards of the converted deck ``out``: (keyword, parameters, index of its
-        line, indices of its data lines); comment lines skipped."""
-        cards: List[Tuple[str, "OrderedDict[str, Optional[str]]", int, List[int]]] = []
-        for j, line in enumerate(out):
-            if line.lstrip().startswith("**"):
-                continue
-            if line.lstrip().startswith("*"):
-                kw, params = parse_keyword_line(line)
-                cards.append((kw, params, j, []))
-            elif cards and line.strip():
-                cards[-1][3].append(j)
-        return cards
-
-    @staticmethod
-    def _emitted_equations(out: List[str], cards: List[tuple]
-                           ) -> List[Tuple[int, List[Tuple[int, int, str]]]]:
-        """The equations of the converted deck's *EQUATION cards (_emitted_cards ``cards``):
-        (card index, [(node, DOF, coefficient text), ...]); a card that names a set or does not
-        read is left out (it stays as written)."""
+    def _emitted_equations(deck: EmittedDeck) -> List[Tuple[int, List[Tuple[int, int, str]]]]:
+        """The equations of the converted deck's *EQUATION cards: (card index in
+        ``deck.cards``, [(node, DOF, coefficient text), ...]); a card that names a set or does
+        not read is left out (it stays as written)."""
         isint = re.compile(r"[-+]?\d+").fullmatch
         eqs: List[Tuple[int, List[Tuple[int, int, str]]]] = []
-        for ci, (kw, params, _, data) in enumerate(cards):
-            if kw != "EQUATION" or params:
+        for ci, card in enumerate(deck.cards):
+            if card.keyword != "EQUATION" or card.params:
                 continue
-            toks = [t for j in data for t in (x.strip() for x in out[j].split(",")) if t]
+            toks = [t for j in card.rows for t in (x.strip() for x in deck.lines[j].split(","))
+                    if t]
             parsed: List[List[Tuple[int, int, str]]] = []
             pos = 0
             try:
@@ -27447,14 +27434,12 @@ class Converter:
         return assign
 
     @staticmethod
-    def _with_equations(out: List[str], cards: List[tuple],
-                        eqs: List[Tuple[int, List[Tuple[int, int, str]]]],
+    def _with_equations(deck: EmittedDeck, eqs: List[Tuple[int, List[Tuple[int, int, str]]]],
                         final: List[Optional[List[Tuple[int, int, str]]]],
-                        swap: Optional[Dict[int, List[str]]] = None) -> List[str]:
-        """``out`` with each *EQUATION card whose equations changed written again from
+                        swap: Optional[Dict[int, List[str]]] = None) -> EmittedDeck:
+        """``deck`` with each *EQUATION card whose equations changed written again from
         ``final`` (the terms of each equation of ``eqs``; None: dropped); a card left without
-        an equation goes.  ``swap``: other lines of ``out`` written as the given lines."""
-        swap = swap or {}
+        an equation goes.  ``swap``: other lines of the deck written as the given lines."""
         new_cards: Dict[int, List[str]] = {}
         by_card: "OrderedDict[int, List[int]]" = OrderedDict()
         for e, (ci, _) in enumerate(eqs):
@@ -27469,26 +27454,17 @@ class Converter:
                     continue
                 lines += equation_rows(terms)
             new_cards[ci] = lines
-        if not new_cards and not swap:
-            return out
-        drop_lines: set = set()
-        insert: Dict[int, List[str]] = {}
         for ci, lines in new_cards.items():
-            _, _, j, data = cards[ci]
-            drop_lines.update(data)
+            card = deck.cards[ci]
+            for j in card.rows:
+                deck.swap(j, [])
             if lines:
-                insert[data[0]] = lines
+                deck.swap(card.rows[0], lines)
             else:
-                drop_lines.add(j)              # every equation of the card dropped
-        res: List[str] = []
-        for j, line in enumerate(out):
-            if j in insert:
-                res += insert[j]
-            if j in swap:
-                res += swap[j]
-            elif j not in drop_lines:
-                res.append(line)
-        return res
+                deck.swap(card.line, [])        # every equation of the card dropped
+        for j, lines in (swap or {}).items():
+            deck.swap(j, lines)
+        return deck.edited()
 
     def _warn_coupled_clashes(self) -> None:
         """The *BOUNDARY on rigid-constraint member DOFs that the reference node's BCs do not
