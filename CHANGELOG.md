@@ -223,6 +223,9 @@ physics.
 * **Two rotational BCs on a shell node with a `*TRANSFORM`** — where neither held axis nor the
   free one is the shell normal, ccx 2.23 also holds the free rotation's in-plane part (a second
   mean-rotation MPC; probed: 30 % off on a cylindrical panel). Now warned, reduced physics.
+* **12 significant digits** — the constants of `*ELASTIC, TYPE=LAMINA`, rows interpolated at
+  field variable 0 (`DEPENDENCIES=`), the `--approximate` I-beam's `RECT` and the `*FRICTION`
+  coefficient were written to 6 (up to 5e-6 off); they now get 12, as every other real.
 
 ## 1.4.0 (October 2026)
 

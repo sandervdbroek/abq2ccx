@@ -1298,7 +1298,8 @@ def canonical_keyword(keyword: str) -> str:
                  set(Converter._HANDLERS) | set(Converter._U1_OPTIONS) |
                  Converter._PERTURBATION_PROCS | Converter._OTHER_PROCEDURES |
                  {"PARAMETER", "BEAM SECTION OFFSET", "FLUID CAVITY", "REBAR LAYER",
-                  "SUBSPACE DYNAMIC", "ELEMENT OPERATOR", "COUPLED THERMAL-ELECTRICAL-STRUCTURAL"})
+                  "EULERIAN SECTION", "SUBSPACE DYNAMIC", "ELEMENT OPERATOR",
+                  "COUPLED THERMAL-ELECTRICAL-STRUCTURAL"})
         for k in known:
             _KEYWORD_BY_COMPACT.setdefault(k.replace(" ", ""), k)
     if " " in keyword:
@@ -4560,6 +4561,8 @@ class Converter:
         # equations), written without ccx's *KINEMATIC (_kin_form; ROT NODE None where all are
         # left out); id(*COUPLING / *KINEMATIC COUPLING)
         self._kin_dyn: set = set()
+        # the surfaces only such *COUPLING cards read: name -> those cards (_plan_kdyn_surfaces)
+        self._kdyn_surfaces: Dict[str, List[Block]] = {}
         # deck BCs / moments on DOFs 4-6 of a transformed shell/beam node or kinematic
         # reference node (_plan_transformed_rotations): node -> "keep" / "global" / "refuse",
         # and per (id(card), node) the lines that replace them (or why they are left out)
@@ -5445,8 +5448,9 @@ class Converter:
                 try:
                     for t, (vals, traw, fl) in zip(temps, rows):
                         if fl == lo:
-                            out_rows.append(([f"{num(a) + w * (num(c) - num(a)):.6g}" if (a or c)
-                                              else "" for a, c in zip(vals, at_hi[t])], traw))
+                            out_rows.append(([short_real(num(a) + w * (num(c) - num(a)), 12)
+                                              if (a or c) else "" for a, c in zip(vals, at_hi[t])],
+                                             traw))
                 except ValueError:
                     return None
                 desc = (f"field variable 1 = 0, interpolated between its rows at {lo[0]:g} and "
@@ -6170,9 +6174,9 @@ class Converter:
                 return None
             E1, E2, nu12, G12, G13, G23 = v[:6]
             nu23 = max(0.0, min(0.495, E2 / (2.0 * G23) - 1.0)) if G23 > 0 else nu12
-            rows.append(f"{E1:.6g}, {E2:.6g}, {E2:.6g}, {nu12:.6g}, {nu12:.6g}, "
-                        f"{nu23:.6g}, {G12:.6g}, {G13:.6g}")
-            rows.append(f"{G23:.6g}" + (f", {v[6]:.6g}" if len(v) > 6 else ""))
+            rows.append(", ".join(short_real(x, 12)
+                                  for x in (E1, E2, E2, nu12, nu12, nu23, G12, G13)))
+            rows.append(", ".join(short_real(x, 12) for x in [G23] + v[6:7]))
         if not rows:
             return None
         params: "OrderedDict[str, Optional[str]]" = OrderedDict(
@@ -7703,7 +7707,7 @@ class Converter:
         self.report.warn(f"[APPROX] *BEAM SECTION SECTION=I replaced by the RECT with equal area "
                          f"and equal strong-axis inertia; weak-axis bending, torsion and shear "
                          f"response DIFFER{u1}. Verify.", once=True)
-        out = [emit_keyword("BEAM SECTION", keep), f"{b_r:.6g}, {h_r:.6g}"]
+        out = [emit_keyword("BEAM SECTION", keep), f"{short_real(b_r, 12)}, {short_real(h_r, 12)}"]
         if len(recs) > 1 and any(recs[1]):         # keep the direction-cosine line, by position
             out.append(", ".join(x or "0." for x in recs[1]))
         return out
@@ -15053,7 +15057,7 @@ class Converter:
                              f"decay and anisotropy are not modelled) and Abaqus' later fields would "
                              f"be read as ccx's stick slope.", once=True)
             self._reduces("*FRICTION table reduced to one coefficient")
-        return ["*FRICTION", f"{mu:g},"]
+        return ["*FRICTION", f"{short_real(mu, 12)},"]
 
     def handle_rigid_body(self, b: Block) -> List[str]:
         """``*RIGID BODY``: Abaqus uses ``PIN NSET``/``TIE NSET`` for the node set that
@@ -16849,6 +16853,9 @@ class Converter:
         if b.has("COMBINE"):
             return self._commented(b, "*SURFACE, COMBINE (a surface built from other surfaces) has "
                                       "no ccx equivalent; list the element faces / nodes directly.", reduces=False)
+        kdyn = self._kdyn_surfaces.get(name)
+        if kdyn and all(self._kdyn_written(c) for c in kdyn):
+            return []                   # nothing in the converted deck reads it
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("NAME", "TYPE"):
@@ -21962,6 +21969,7 @@ class Converter:
                     self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
                 body["rot"] = self._rb_rot[ref]
         self._plan_rigid_couplings(blocks)
+        self._plan_kdyn_surfaces(blocks)            # after the coupling plans
         self._plan_pretension_twins()               # after _transformed
         self._plan_rot_axes(self._rb_rot)              # the connector rows use them
         self._plan_distributing_rows()             # after the ROT NODEs' axes
@@ -24750,6 +24758,41 @@ class Converter:
                          f"without NLGEOM (probed: 9 % off at 0.1 rad); knotted shell/beam members "
                          f"keep their rotation ties.", once=True)
 
+    def _kin_dyn_members(self, ref: int, rot: Optional[int], nodes: Sequence[int]) -> List[int]:
+        """The members _kin_dynamic_cards couples: ``nodes`` the deck defines, without the
+        reference node and its ROT NODE."""
+        return [n for n in dedup(nodes) if n not in (ref, rot) and n in self.geom.nodes]
+
+    def _kdyn_written(self, b: Block) -> bool:
+        """Whether _kin_dynamic_cards writes the ``kdyn`` *COUPLING ``b`` (equations or a *RIGID
+        BODY of its nodes, without ccx's *COUPLING) rather than commenting it out."""
+        plan = self._coupling_plan[id(b)]
+        nodes = self._kin_dyn_members(plan["ref"], plan["rot"], plan["members"])
+        return bool(nodes) and self._kin_form(plan["ref"], nodes, plan["dofs"],
+                                              self._coupling_frame(b)) in ("eq", "rb")
+
+    def _plan_kdyn_surfaces(self, blocks: List[Block]) -> None:
+        """The surfaces that no card but ``kdyn`` *COUPLINGs (_kin_dynamic_cards) names, by a
+        parameter or a data field: ``_kdyn_surfaces``, which handle_surface leaves out where
+        those couplings are written (_kdyn_written)."""
+        kdyn = {id(b) for b in blocks if b.keyword == "COUPLING"
+                and (self._coupling_plan.get(id(b)) or {}).get("kind") == "kdyn"}
+        names: Dict[str, List[Block]] = {}
+        for b in blocks:
+            if id(b) in kdyn:
+                names.setdefault(b.uparam("SURFACE"), []).append(b)
+        names.pop("", None)
+        for b in blocks:
+            if not names:
+                break
+            if id(b) in kdyn or b.keyword in GEOM_KW or \
+                    (b.keyword == "SURFACE" and b.uparam("NAME") in names):
+                continue
+            for x in [v for v in b.params.values() if v] + [x for ln in b.data
+                                                            for x in ln.split(",")]:
+                names.pop(x.strip().upper(), None)
+        self._kdyn_surfaces = names
+
     def _kin_dynamic_cards(self, b: Block, plan: dict,
                            groups: Sequence[Tuple[Sequence[int], set]]) -> List[str]:
         """A kinematic coupling in a deck with a *DYNAMIC step, of plain 3-D members (or, in a
@@ -24772,7 +24815,7 @@ class Converter:
                              f"{undefined[0]}): left out of the coupling (Abaqus rejects such a "
                              f"deck).", once=True)
         for nodes, dofs in groups:
-            nodes = [n for n in dedup(nodes) if n not in (ref, rot) and n in self.geom.nodes]
+            nodes = self._kin_dyn_members(ref, rot, nodes)
             form = self._kin_form(ref, nodes, dofs, frame)
             forms.add(form)
             if form in ("rb", "drop"):

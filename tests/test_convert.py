@@ -958,7 +958,7 @@ def test_ibeam_rect_approximation_reads_the_profile_by_position():
             "*Material, name=M\n*Elastic\n1., 0.3\n").format
     body, _, _ = _as_with_zeros(deck, ", 0.3, 0.1, 0.1, 0.02, 0.02, 0.01",
                                 "0., 0.3, 0.1, 0.1, 0.02, 0.02, 0.01", approximate=True)
-    assert "SECTION=RECT\n0.0160348, 0.411604\n0., 0., -1.\n" in body
+    assert "SECTION=RECT\n0.016034814024, 0.411604399658\n0., 0., -1.\n" in body
 
 
 def test_ibeam_rect_approximation_keeps_the_n1_line_by_position():
@@ -967,7 +967,7 @@ def test_ibeam_rect_approximation_keeps_the_n1_line_by_position():
             "*Beam Section, elset=E, material=M, section=I\n0., 0.3, 0.1, 0.1, 0.02, 0.02, 0.01\n{}\n"
             "*Material, name=M\n*Elastic\n1., 0.3\n").format
     body, _, _ = _as_with_zeros(deck, "0., , -1.", "0., 0., -1.", approximate=True)
-    assert "SECTION=RECT\n0.0160348, 0.411604\n0., 0., -1.\n" in body
+    assert "SECTION=RECT\n0.016034814024, 0.411604399658\n0., 0., -1.\n" in body
 
 
 def test_rotated_instance_distribution_axes_read_blank_fields_by_position():
@@ -1676,7 +1676,7 @@ def test_lamina_to_engineering_constants():
                                "140e3, 10e3, , 5e3, 5e3, 3.5e3, 20., 0.\n"
                                "130e3, 9e3, 0.3, 4.5e3, 4.5e3, 3.2e3, 20., 1.\n")
     assert _card_at(body, "*ELASTIC, TYPE=ENGINEERING CONSTANTS") == [
-        "140000, 10000, 10000, 0, 0, 0.428571, 5000, 5000", "3500, 20"]
+        "140000., 10000., 10000., 0., 0., 0.428571428571, 5000., 5000.", "3500., 20."]
     assert "DEPENDENCIES=1: ccx has no field-variable dependence; collapsed" in rep.text()
 
 
@@ -3011,7 +3011,7 @@ def test_field_dependencies_collapsed():
     # ccx ignores DEPENDENCIES and in effect uses the first row; collapse to field = 0
     body, _, rep = convert_str("*Material,name=M\n*Elastic,dependencies=1\n"
                                "21000.,0.3,0.,-1.\n210000.,0.3,0.,1.\n")
-    assert "*ELASTIC\n115500, 0.3, 0." in body and "DEPENDENCIES=1" in rep.text()
+    assert "*ELASTIC\n115500., 0.3, 0." in body and "DEPENDENCIES=1" in rep.text()
     body, _, _ = convert_str("*Material,name=M\n*Plastic, dependencies=1\n100.,0.,,0.\n"
                              "200.,0.1,,0.\n150.,0.,,1.\n250.,0.1,,1.\n")
     assert "*PLASTIC\n100., 0.\n200., 0.1" in body and "150." not in body
@@ -3064,6 +3064,9 @@ def test_friction_keeps_only_mu():
     assert "*FRICTION\n0.2," in body and "SLIP TOLERANCE" not in body.split("*FRICTION")[1]
     body, _, rep = convert_str(si + "*Friction, rough\n")
     assert not any(l.startswith("*FRICTION") for l in _live(body)) and "FRICTIONLESS" in rep.text()
+    # mu to 12 significant digits, as every other real the converter writes
+    body, _, _ = convert_str(si + "*Friction\n0.123456789012345\n")
+    assert "*FRICTION\n0.123456789012," in body
 
 
 def test_contact_pair_tied_becomes_tie():
@@ -8788,6 +8791,23 @@ def test_kinematic_coupling_in_a_dynamic_deck_on_undefined_nodes_and_unreadable_
         assert not _equation_terms(body) and not conv._kin_dyn and "5,1,1" in _bc_lines(body)
 
 
+def test_kinematic_coupling_in_a_dynamic_deck_leaves_its_surface_out():
+    # written as equations or a *RIGID BODY, without ccx's *COUPLING, the coupling reads its
+    # surface no more: a surface no other card names is left out, an element surface too
+    step = KIN_DYN_STEP.format("")
+    for deck in (KIN9 + step, KIN9 + KIN_DYN_STEP.format(", nlgeom"),
+                 KIN9.replace("type=NODE, name=TOPS\nTOPN", "name=TOPS\n1, S2") + step):
+        body, conv, _ = convert_str(deck)
+        assert conv._kin_dyn and "*COUPLING" not in body and "TOPS" not in body
+    # kept where the coupling is commented out (its card names the surface) ...
+    some = KIN9.replace("*Kinematic\n1, 6\n", "*Kinematic\n1, 2\n")
+    body, _, _ = convert_str(some + KIN_DYN_STEP.format(", nlgeom"))
+    assert "** *COUPLING" in body and "*SURFACE, TYPE=NODE, NAME=TOPS\nTOPN\n" in body
+    # ... or another card names it
+    body, _, _ = convert_str(KIN9 + "*Surface, name=TOPE\n1, S2\n*Tie, name=T\nTOPS, TOPE\n" + step)
+    assert "*COUPLING" not in body and "*SURFACE, TYPE=NODE, NAME=TOPS\nTOPN\n" in body
+
+
 def test_connector_on_the_members_of_a_coupling_left_out_of_a_dynamic_deck():
     # a coupling that a *DYNAMIC deck comments out (some translations under NLGEOM) eliminates
     # nothing, so a connector on its members is written (it was refused for a rigid-body member)
@@ -13163,6 +13183,10 @@ def test_deformation_plasticity_in_small_strain_steps_is_reduced_physics():
     assert _steps(body) == ["*STEP, NLGEOM=NO"] and not conv.reduced_physics
     assert "** *MATERIAL, NAME=SPARE" in body and "** *DENSITY" in body and "*ELASTIC" in body.splitlines()
     assert "material SPARE: no card uses it" in rep.text() and rep.n_commented == 3
+    # an *EULERIAN SECTION names it, also spelled without blanks
+    body, _, rep = convert_str(HEX + ISO_STEEL + spare + DP_SECTION + "*EulerianSection, elset=EALL\n"
+                               "SPARE\n*Step, nlgeom=NO\n" + static)
+    assert "no card uses it" not in rep.text() and "** *EULERIAN SECTION, ELSET=EALL" in body
     # the NLGEOM thermal-expansion checks see ccx's NLGEOM
     dp = ("*Element, type=C3D8, elset=DP\n2, 1, 2, 3, 4, 5, 6, 7, 8\n" + DEFORMATION_STEEL
           + "*Solid Section, elset=DP, material=STEEL\n")
