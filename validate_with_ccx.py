@@ -5105,8 +5105,10 @@ def modal_knot_deck(kind, proc):
     or (``kind`` "column") a B32R column 1 long, RECT 0.1 x 0.1, clamped at its foot; a
     *FREQUENCY step for 6 modes that prints them, then (``proc``) a *MODAL DYNAMIC step 0.01
     long in increments of 1e-4 under a unit *CLOAD on a constant amplitude, or ("ssd") a
-    *STEADY STATE DYNAMICS step 10 - 1000 Hz under a unit *CLOAD, on a tip node (11 along z,
-    the column's 21 along x).  ccx 2.23 segfaulted on those rotational BCs in the *MODAL
+    *STEADY STATE DYNAMICS step 100 - 600 Hz under a unit *CLOAD, on a tip node (11 along z,
+    the column's 21 along x).  (The strip's first two eigenfrequencies are 95.2 and 625.3 Hz:
+    ccx evaluates the undamped response at every eigenfrequency in the range, which is
+    infinite, and the CI ccx builds print NaN there.)  ccx 2.23 segfaulted on those rotational BCs in the *MODAL
     DYNAMIC step and moved the model wrongly under that force in both steps."""
     if kind == "column":
         lines = ["*HEADING", "B32R column, modal steps", "*NODE"] + \
@@ -5127,7 +5129,7 @@ def modal_knot_deck(kind, proc):
     lines += ["*NSET, NSET=OUT", str(node), "*AMPLITUDE, NAME=ONE", "0., 1., 1., 1.",
               "*STEP", "*FREQUENCY", "6", "*NODE PRINT, NSET=OUT", "U", "*END STEP", "*STEP"]
     lines += ["*MODAL DYNAMIC", "1e-4, 0.01", "*CLOAD, AMPLITUDE=ONE"] if proc == "modal" else \
-        ["*STEADY STATE DYNAMICS", "10., 1000., 5", "*CLOAD"]
+        ["*STEADY STATE DYNAMICS", "100., 600., 5", "*CLOAD"]
     lines += [f"{node}, {dof}, 1.", "*NODE PRINT, NSET=OUT", "U", "*END STEP"]
     return "\n".join(lines) + "\n"
 
@@ -12853,7 +12855,7 @@ def main():
                   f"clamped, a unit *CLOAD on node {node} in a *{'STEADY STATE DYNAMICS' if proc == 'ssd' else 'MODAL DYNAMIC'}"
                   f" step): {len(res)} {'frequencies' if proc == 'ssd' else 'increments'}, largest u "
                   f"{scale:.6g}, {err:.1e} of it off ccx's own 6 modes superposed (the knot-free deck "
-                  f"{'moved 1e-5 of it' if proc == 'ssd' else 'segfaulted'})")
+                  f"{'moved 2e-9 of it' if proc == 'ssd' else 'segfaulted'})")
         failures += 0 if res and ok else 1
     # a rigid body whose shell members are knots, with a member node carrying only a *MASS,
     # *FREQUENCY after a step ccx runs through its nonlinear solver: warned (ccx carries the
