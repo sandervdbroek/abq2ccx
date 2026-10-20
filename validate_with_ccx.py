@@ -3365,14 +3365,15 @@ def pert_fixed_deck(case, twin=False):
 
 
 def buckle_chain_deck(twin=False):
-    """A B32R cantilever column (10 elements, length 1, RECT 0.1 x 0.1, E 2e5; buckling load
-    about 4.1) with no general step: a *STEP, PERTURBATION *BUCKLE step loading its tip
+    """A B32R cantilever column (10 elements, length 1, RECT 0.1 x 0.08, E 2e5; buckling loads
+    about 2.1 and 3.3) with no general step: a *STEP, PERTURBATION *BUCKLE step loading its tip
     sideways (left out in the ``twin``), whose load case's response ccx 2.23 then takes as the
-    base state of a *STEP, PERTURBATION step, then one pushing it down."""
+    base state of a *STEP, PERTURBATION step, then one pushing it down.  (Not square: the
+    repeated pair of a square column converged only to 3e-6 - 5e-6 on CI's x86_64 builds.)"""
     nodes = "\n".join(f"{i + 1}, 0., 0., {i * 0.05:g}" for i in range(21))
     elems = "\n".join(f"{i + 1}, {2 * i + 1}, {2 * i + 2}, {2 * i + 3}" for i in range(10))
     return (f"*NODE\n{nodes}\n*ELEMENT, TYPE=B32R, ELSET=B\n{elems}\n*MATERIAL, NAME=M\n*ELASTIC\n"
-            "2e5, 0.3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n"
+            "2e5, 0.3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n0.1, 0.08\n1., 0., 0.\n"
             "*BOUNDARY\n1, 1, 6\n" +
             ("" if twin else "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n21, 1, 1.\n*END STEP\n") +
             "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n21, 3, -1.\n*END STEP\n")
