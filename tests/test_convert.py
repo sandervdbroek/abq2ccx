@@ -2998,6 +2998,84 @@ def test_input_data_file_inlined():
     assert set(conv.geom.nodes) == {1, 2} and "INPUT" not in body.upper()
 
 
+def _convert_files(files, deck="main.inp"):
+    """Convert ``deck`` from a directory holding ``files`` (name -> text)."""
+    d = tempfile.mkdtemp()
+    try:
+        for name, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        return convert(os.path.join(d, deck))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_include_inserts_the_file_text():
+    # Abaqus inserts an *INCLUDE file's text at the *INCLUDE line: a file of data lines
+    # continues the card above it, as does a data line after the *INCLUDE
+    _, conv, rep = _convert_files({
+        "main.inp": "*NODE, NSET=ALL\n*INCLUDE, INPUT=nodes.inp\n3, 2., 0., 0.\n"
+                    "*ELEMENT, TYPE=T3D2, ELSET=E\n*INCLUDE, INPUT=elems.inp\n",
+        "nodes.inp": "1, 0., 0., 0.\n2, 1., 0., 0.\n", "elems.inp": "1, 1, 2\n2, 2, 3\n"})
+    assert set(conv.geom.nodes) == {1, 2, 3} and set(conv.geom.elements) == {1, 2}
+    assert not rep.entries and not conv.reduced_physics
+    # a *PARAMETER in an included file holds in the including file
+    body, conv, rep = _convert_files({
+        "main.inp": "*INCLUDE, INPUT=params.inp\n*NODE\n1, 0., 0., 0.\n2, <len>, 0., 0.\n"
+                    "*ELEMENT, TYPE=T3D2, ELSET=E\n1, 1, 2\n*SOLID SECTION, ELSET=E, MATERIAL=M\n"
+                    "<area>\n", "params.inp": "*PARAMETER\nlen = 2.0\narea = 0.5\n"})
+    assert conv.geom.nodes[2][0] == 2.0 and "MATERIAL=M\n0.5" in body and "<" not in body
+    assert "*PARAMETER: resolved 2 parameter(s)" in rep.text()
+    # a file included twice (two parts sharing a mesh) is not a cycle; one that includes
+    # itself is
+    _, conv, rep = _convert_files({
+        "main.inp": "*PART, NAME=A\n*INCLUDE, INPUT=mesh.inp\n*END PART\n*PART, NAME=B\n"
+                    "*INCLUDE, INPUT=mesh.inp\n*END PART\n*ASSEMBLY, NAME=ASM\n"
+                    "*INSTANCE, NAME=A1, PART=A\n*END INSTANCE\n*INSTANCE, NAME=B1, PART=B\n"
+                    "0., 2., 0.\n*END INSTANCE\n*END ASSEMBLY\n",
+        "mesh.inp": "*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*ELEMENT, TYPE=T3D2, ELSET=BAR\n"
+                    "1, 1, 2\n"})
+    assert len(conv.geom.nodes) == 4 and len(conv.geom.elements) == 2
+    assert "cycle" not in rep.text() and "no mesh" not in rep.text()
+    _, conv, rep = _convert_files({"main.inp": "*NODE\n1, 0., 0., 0.\n*INCLUDE, INPUT=a.inp\n",
+                                   "a.inp": "*INCLUDE, INPUT=main.inp\n2, 1., 0., 0.\n"})
+    assert set(conv.geom.nodes) == {1, 2} and "*INCLUDE cycle detected" in rep.text()
+
+
+def test_include_paths_resolve_from_the_job_directory():
+    # Abaqus resolves a relative INPUT= name against the job directory; the including
+    # file's directory is the fallback, for *INCLUDE and for a data card's INPUT= alike
+    _, conv, rep = _convert_files({
+        "main.inp": "*INCLUDE, INPUT=model/mesh.inp\n*INCLUDE, INPUT=model/more.inp\n",
+        "model/mesh.inp": "*INCLUDE, INPUT=model/nodes.inp\n*ELEMENT, TYPE=T3D2, ELSET=E\n"
+                          "1, 1, 2\n",
+        "model/nodes.inp": "*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n",
+        "model/more.inp": "*INCLUDE, INPUT=node3.inp\n*ELEMENT, TYPE=T3D2, ELSET=E, INPUT=el.inp\n",
+        "model/node3.inp": "*NODE\n3, 2., 0., 0.\n", "model/el.inp": "2, 2, 3\n"})
+    assert set(conv.geom.nodes) == {1, 2, 3} and set(conv.geom.elements) == {1, 2}
+    assert "INPUT=model/el.inp: data lines inlined" in rep.text() and not conv.reduced_physics
+    # a file name given by a *PARAMETER
+    _, conv, rep = _convert_files({"main.inp": "*PARAMETER\nmesh = 'm.inp'\n"
+                                               "*INCLUDE, INPUT=<mesh>\n",
+                                   "m.inp": "*NODE\n1, 0., 0., 0.\n"})
+    assert set(conv.geom.nodes) == {1} and "Could not read" not in rep.text()
+
+
+def test_unresolved_parameter_tokens_and_orphan_data_lines_warned_once():
+    _, _, rep = convert_str("1, 2\n3, 4\n5, 6\n*NODE\n1, <x>, 0., 0.\n2, <x>, <y>, 0.\n"
+                            "** <z> in a comment\n")
+    warns = [m for lv, m in rep.entries if lv == "WARNING"]
+    assert [m for m in warns if "<x>" in m] == [
+        "*PARAMETER: <x>, <y> used but not defined, so ccx reads the raw token — verify."]
+    assert [m for m in warns if "before any keyword" in m] == [
+        "Data line before any keyword ignored: '1, 2' (and 2 more)."]
+    # a *PARAMETER, TABLE= dependent is not evaluated: its token is reported, not kept silently
+    _, _, rep = convert_str("*PARAMETER\naa = 1.5\n*PARAMETER, TABLE=sect, DEPENDENT=(bb), "
+                            "INDEPENDENT=(aa)\n*NODE\n1, <aa>, <bb>, 0.\n")
+    assert "<bb> used but not defined" in rep.text() and "<aa>" not in rep.text()
+
+
 def test_parameter_table_not_swallowed():
     body, _, rep = convert_str("*Parameter Table, type=T1\n1, 2\n*Node\n1,0,0,0\n")
     assert "*PARAMETER TABLE" in rep.text() and "1, 0, 0, 0" in body

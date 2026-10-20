@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **`*INCLUDE` inserts the file's text** — as in Abaqus, an included file now continues the
+  input where its `*INCLUDE` stands; each file was parsed on its own. So a file of data lines
+  (`*NODE` / `*INCLUDE, INPUT=nodes.inp`) no longer loses them all, a `*PARAMETER` from an
+  included file now holds in the including file (the raw `<name>` was written), and a file
+  included twice (two parts sharing a mesh file) is no longer skipped as an include cycle.
+  A relative `INPUT=` name resolves against the job directory first, then the including
+  file's. A `<name>` no `*PARAMETER` defines is warned, and data lines before the first
+  keyword get one warning, not one each.
 * **Two output intervals in one step** — time-based output controls of one step that share no
   spacing (`*OUTPUT, FIELD, TIME INTERVAL=0.3` beside `TIME INTERVAL=0.2`, `NUMBER INTERVAL=20`
   beside `TIME INTERVAL=0.03`, `TIME POINTS` beside an interval) stopped the converter with a

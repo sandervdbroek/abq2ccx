@@ -986,8 +986,9 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
     """Resolve Abaqus ``*PARAMETER`` input: collect ``name = expr`` definitions, drop
     the ``*PARAMETER`` blocks (ccx has no such card), and substitute every ``<name>``
     token with its value.  Without this, parametric coordinates like ``<l>`` reach the
-    float parser and crash.  ``params`` is shared across *INCLUDE so parameters defined
-    in a master deck are visible in included files."""
+    float parser and crash.  ``lines`` is the deck with its *INCLUDE files expanded
+    (read_blocks), so a parameter defined in any file is visible in all of them;
+    ``params`` collects the values (an INPUT= data file is substituted with them)."""
     raw_defs: List[Tuple[str, str]] = []
     kept: List[str] = []
     in_param = False
@@ -1043,13 +1044,18 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                         f"float range), so the "
                         f"expression is substituted as written — verify.", once=True)
 
-    if not params:
-        return lines
+    out = [_substitute_params(ln, params) for ln in kept] if params else lines
+    undefined = dedup(m.group(0) for ln in out if "<" in ln and not ln.lstrip().startswith("**")
+                      for m in re.finditer(r"<([A-Za-z_]\w*)>", ln) if m.group(1) not in params)
+    if undefined:
+        report.warn(f"*PARAMETER: {', '.join(undefined[:5])}{' ...' if len(undefined) > 5 else ''}"
+                    f" used but not defined, so ccx reads the raw token — verify.", once=True)
+    return out
 
-    def sub(line: str) -> str:
-        return re.sub(r"<([^<>]+)>", lambda m: str(params.get(m.group(1), m.group(0))), line)
 
-    return [sub(ln) for ln in kept]
+def _substitute_params(line: str, params: Dict[str, object]) -> str:
+    """``line`` with each ``<name>`` token of a known parameter replaced by its value."""
+    return re.sub(r"<([^<>]+)>", lambda m: str(params.get(m.group(1), m.group(0))), line)
 
 
 def join_keyword_continuations(lines: List[str]) -> List[str]:
@@ -1109,31 +1115,96 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
     return out
 
 
-def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
-                _params: Optional[Dict[str, object]] = None) -> List[Block]:
-    """Read a file into Blocks, following ``*INCLUDE`` recursively."""
-    if _seen is None:
-        _seen = set()
-    if _params is None:
-        _params = {}
-    realpath = os.path.realpath(path)
-    if realpath in _seen:
-        report.warn(f"*INCLUDE cycle detected for {path}; skipped.")
-        return []
-    _seen.add(realpath)
+_MAX_INCLUDE_READS = 10000   # files read per deck: bounds a file included many times over
 
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            raw_lines = fh.read().splitlines()
-    except OSError as exc:
-        report.warn(f"Could not read {path}: {exc}")
-        report.reduce("an *INCLUDE file could not be read")
-        return []
 
-    raw_lines = apply_parameters(raw_lines, report, _params)
-    raw_lines = join_keyword_continuations(raw_lines)
+def _input_path(name: str, job_dir: str, here: str) -> str:
+    """The file an INPUT= name points at.  Abaqus resolves a relative name against the job
+    directory; the directory of the file that holds the card (``here``) is the fallback for
+    decks written for it.  The job-directory path when the file is in neither."""
+    if os.path.isabs(name):
+        return name
+    paths = dedup([os.path.join(job_dir, name), os.path.join(here, name)])
+    for p in paths:
+        try:
+            with open(p, "rb"):
+                return p
+        except OSError:
+            pass
+    return paths[0]
+
+
+def read_blocks(path: str, report: Report) -> List[Block]:
+    """Read a file into Blocks.  Abaqus inserts an ``*INCLUDE`` file's text at the
+    *INCLUDE line (a file of data lines continues the card above it), so the files are
+    expanded first; ``*PARAMETER`` is then resolved over the whole text, and it is parsed."""
+    job_dir = os.path.dirname(path)
+    raw_lines: List[str] = []
+    stack: List[str] = []   # the files being read: only a file that includes itself is a
+    reads = [0]             # cycle, not one included twice (two parts sharing a mesh file)
+
+    def expand(fpath: str) -> None:
+        realpath = os.path.realpath(fpath)
+        if realpath in stack:
+            report.warn(f"*INCLUDE cycle detected for {fpath}; skipped.")
+            return
+        reads[0] += 1
+        if reads[0] > _MAX_INCLUDE_READS:
+            report.warn(f"*INCLUDE: more than {_MAX_INCLUDE_READS} files read; the rest are "
+                        f"skipped.", once=True)
+            report.reduce("an *INCLUDE file could not be read")
+            return
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError as exc:
+            report.warn(f"Could not read {fpath}: {exc}")
+            report.reduce("an *INCLUDE file could not be read")
+            return
+        here = os.path.dirname(fpath)
+        stack.append(realpath)
+        try:
+            for line in join_keyword_continuations(lines):
+                s = line.strip()
+                if not s.startswith("*") or s.startswith("**"):
+                    raw_lines.append(line)
+                    continue
+                keyword, params = parse_keyword_line(line)
+                if keyword == "INCLUDE":
+                    inc = (params.get("INPUT") or params.get("INP") or "").strip().strip('"')
+                    if not inc:
+                        report.warn("*INCLUDE without INPUT= ignored.")
+                    else:
+                        if "<" in inc:          # a file name given by a *PARAMETER above
+                            known: Dict[str, object] = {}
+                            apply_parameters(raw_lines, Report(), known)
+                            inc = _substitute_params(inc, known)
+                        expand(_input_path(inc, job_dir, here))
+                    continue
+                src = (params.get("INPUT") or "").strip().strip('"')
+                if src and "<" not in src and _input_path(src, job_dir, here) != os.path.join(
+                        job_dir, src):
+                    # a data card's INPUT= file found only next to this included file: name
+                    # it from the job directory, where the parse below reads it
+                    toks = _split_commas(line)
+                    k = max(i for i, t in enumerate(toks)
+                            if i and "=" in t and _param_name(t.partition("=")[0]) == "INPUT")
+                    try:
+                        full = os.path.relpath(os.path.join(here, src), job_dir or os.curdir)
+                    except ValueError:          # on another drive (Windows)
+                        full = os.path.abspath(os.path.join(here, src))
+                    toks[k] = f'{toks[k].partition("=")[0]}="{full}"'
+                    line = ",".join(toks)
+                raw_lines.append(line)
+        finally:
+            stack.pop()
+
+    expand(path)
+    values: Dict[str, object] = {}
+    raw_lines = apply_parameters(raw_lines, report, values)
     blocks: List[Block] = []
     current: Optional[Block] = None
+    orphans: List[str] = []
     for raw in raw_lines:
         line = raw.rstrip()
         stripped = line.strip()
@@ -1143,16 +1214,6 @@ def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
             continue
         if stripped.startswith("*"):           # keyword line
             keyword, params = parse_keyword_line(line)
-            if keyword == "INCLUDE":
-                inc = params.get("INPUT") or params.get("INP")
-                if inc:
-                    inc = inc.strip().strip('"')
-                    inc_path = inc if os.path.isabs(inc) else os.path.join(os.path.dirname(path), inc)
-                    blocks.extend(read_blocks(inc_path, report, _seen, _params))
-                else:
-                    report.warn("*INCLUDE without INPUT= ignored.")
-                current = None
-                continue
             current = Block(keyword=keyword, params=params)
             blocks.append(current)
             src = params.get("INPUT")
@@ -1161,10 +1222,10 @@ def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
                 # card's data lines from that file; ccx has no such parameter, so inline it
                 # here — dropped, the card would silently be empty.
                 src = src.strip().strip('"')
-                src_path = src if os.path.isabs(src) else os.path.join(os.path.dirname(path), src)
+                src_path = src if os.path.isabs(src) else os.path.join(job_dir, src)
                 try:
                     with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
-                        ext = apply_parameters(fh.read().splitlines(), report, _params)
+                        ext = apply_parameters(fh.read().splitlines(), report, values)
                 except OSError:
                     report.warn(f"*{keyword}, INPUT={src}: data file not found next to the deck; "
                                 f"the card has no data lines (copy the file alongside and "
@@ -1176,11 +1237,13 @@ def read_blocks(path: str, report: Report, _seen: Optional[set] = None,
                     report.note(f"*{keyword}, INPUT={src}: data lines inlined from the file "
                                 f"(ccx has no INPUT= on data cards).", once=True)
                 del params["INPUT"]
-        else:                                   # data line
-            if current is None:
-                report.warn(f"Data line before any keyword ignored: {stripped!r}")
-                continue
+        elif current is None:                   # data line
+            orphans.append(stripped)
+        else:
             current.data.append(stripped)
+    if orphans:
+        report.warn(f"Data line before any keyword ignored: {orphans[0]!r}"
+                    + (f" (and {len(orphans) - 1} more)." if len(orphans) > 1 else ""))
     return blocks
 
 

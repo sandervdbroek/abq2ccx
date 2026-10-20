@@ -2605,6 +2605,31 @@ def compact_params_deck():
                              "*NODE PRINT, NSET=OUT", "U", "*END STEP"]) + "\n"
 
 
+def include_files_deck():
+    """Two T3D2 bars (E 1000, nu 0), parts A and B that *INCLUDE one mesh file; it *INCLUDEs a
+    file of node data lines by a job-relative path, and the length 2, the area 0.5 and the
+    tip loads 5 and 10 are *PARAMETERs from another included file.  The tips stretch
+    F L / (E A) = 0.02 and 0.04.  Returns (deck, {file under the job directory: text})."""
+    files = {"incl/params.inp": "*PARAMETER\nlen = 2.0\narea = 0.5\nforce = 5.0\n"
+                                "force2 = 2 * force\n",
+             "incl/bar.inp": "*NODE\n*INCLUDE, INPUT=incl/nodes.inp\n"
+                             "*ELEMENT, TYPE=T3D2, ELSET=BAR\n1, 1, 2\n*NSET, NSET=FIX\n1\n"
+                             "*NSET, NSET=TIP\n2\n"
+                             "*SOLID SECTION, ELSET=BAR, MATERIAL=M\n<area>\n",
+             "incl/nodes.inp": "1, 0., 0., 0.\n2, <len>, 0., 0.\n"}
+    deck = "\n".join(
+        ["*HEADING", "*INCLUDE, INPUT=incl/params.inp", "*PART, NAME=A",
+         "*INCLUDE, INPUT=incl/bar.inp", "*END PART", "*PART, NAME=B",
+         "*INCLUDE, INPUT=incl/bar.inp", "*END PART",
+         "*ASSEMBLY, NAME=ASM", "*INSTANCE, NAME=A1, PART=A", "*END INSTANCE",
+         "*INSTANCE, NAME=B1, PART=B", "0., 1., 0.", "*END INSTANCE", "*END ASSEMBLY",
+         "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*BOUNDARY", "ASM.A1.FIX, 1, 3",
+         "ASM.A1.TIP, 2, 3", "ASM.B1.FIX, 1, 3", "ASM.B1.TIP, 2, 3", "*STEP", "*STATIC", "*CLOAD",
+         "ASM.A1.TIP, 1, <force>", "ASM.B1.TIP, 1, <force2>", "*NODE PRINT, NSET=ASM.A1.TIP", "U",
+         "*NODE PRINT, NSET=ASM.B1.TIP", "U", "*END STEP"]) + "\n"
+    return deck, files
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -5823,6 +5848,25 @@ def main():
               f"tied to the lower across a 0.05 gap, pulled through a *COUPLING; ELEMENTSHIFT=, "
               f"POSITIONTOLERANCE=, REFNODE= without blanks): the reference node rose {top:.7g} "
               f"(2.05e-3), the lower cube's top {mid:.7g} (1e-3)")
+    failures += 0 if ok else 1
+
+    # *INCLUDE expands as text: a file of data lines lost its nodes, an included *PARAMETER
+    # was not applied, a file included twice was skipped as a cycle, and a nested job-relative
+    # path was not found
+    deck, files = include_files_deck()
+    for name, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(tmp, name)), exist_ok=True)
+        with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    u = review_run(deck, "include_files", dat_displacements)
+    ok = bool(u)
+    if ok:
+        a, b = u.get(2, [math.nan] * 3)[0], u.get(4, [math.nan] * 3)[0]
+        ok = abs(a / 0.02 - 1) < 1e-6 and abs(b / 0.04 - 1) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  include_files (two T3D2 bars, parts that *INCLUDE one "
+              f"mesh file, its nodes a file of data lines included by a job-relative path, length, "
+              f"area and loads *PARAMETERs from an included file): the tips moved {a:.7g} (0.02) "
+              f"and {b:.7g} (0.04)")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
