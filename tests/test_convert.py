@@ -403,6 +403,9 @@ def test_bc_steps_follow_op_new():
                                                              {(1, 1): True}]
     assert [len(g) for g in A.step_groups(deck)[1]] == [8, 4]
     assert A.step_load_audit(deck, True) == [None, ["*CLOAD on 4"]]
+    # model_data: the cards before the first *STEP, step_groups' first part (all, without steps)
+    assert A.model_data(deck) == A.step_groups(deck)[0] == deck[:1]
+    assert A.model_data(deck[:1]) == A.step_groups(deck[:1])[0] == deck[:1]
 
 
 def _step_model(text):
