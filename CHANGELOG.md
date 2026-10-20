@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Upgraded beams between kinematically coupled nodes** — the midside node the converter adds
+  to a B31 under `SECTION=CIRC`, `PIPE` or `BOX` stayed out of a kinematic coupling (or a
+  node surface or set) holding both its end nodes, so the beam sagged between them where
+  Abaqus' linear beam moves rigidly (probed: 5.4 % of the motion under gravity, with the
+  translations coupled). It now joins, as it joins a `*RIGID BODY`; a distributing coupling
+  keeps its nodes (it would load mid-span). The midside node now also joins node-based
+  surfaces and `*SUBMODEL` sets, as a shell's new edge nodes do, and stays out of `UNSORTED`
+  sets.
 * **Membrane `DENSITY=` in a deck with a `*COUPLED THERMAL-ELECTRICAL` step** — the section mass
   was left out (warned) to keep the heat capacity of a step that ccx does not run (the step is
   commented out); it is now carried by the material copy, as in other decks.

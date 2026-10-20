@@ -3042,6 +3042,24 @@ def curved_midside_deck(rot=False, twin=False):
     return text + "*NODE PRINT, NSET=FREE, GLOBAL=YES\nU\n*END STEP\n"
 
 
+def coupled_beam_deck(kind="kin"):
+    """A B31 beam, SECTION=CIRC radius 0.01 (written as a 3-node beam with a new midside node),
+    1 long, both ends kinematically coupled to a reference point RP (node 101), which a SPRING1
+    of 1e4 holds in z (its other DOFs held); gravity.  Abaqus moves a linear beam between two
+    coupled nodes rigidly, so every node of it moves u_z = -W / k.  ``kind``: "kin" — a
+    *KINEMATIC COUPLING of translations, "native" — *COUPLING, *KINEMATIC on a node surface."""
+    coupling = ("*KINEMATIC COUPLING, REF NODE=RP\nENDS, 1, 3\n" if kind == "kin" else
+                "*SURFACE, NAME=SENDS, TYPE=NODE\nENDS\n"
+                "*COUPLING, CONSTRAINT NAME=C1, REF NODE=101, SURFACE=SENDS\n*KINEMATIC\n")
+    return ("*NODE\n101, 1.7, 0., 0.5\n1, 1.2, 0., 0.\n2, 2.2, 0., 0.\n"
+            "*ELEMENT, TYPE=B31, ELSET=HANG\n11, 1, 2\n*ELEMENT, TYPE=SPRING1, ELSET=SPR\n20, 101\n"
+            "*SPRING, ELSET=SPR\n3\n1.e4\n*NSET, NSET=ENDS\n1, 2\n*NSET, NSET=RP\n101\n"
+            "*NSET, NSET=NALL\n101, 1, 2\n*MATERIAL, NAME=STEEL\n*ELASTIC\n2.1e11, 0.3\n"
+            "*DENSITY\n7800.\n*BEAM SECTION, ELSET=HANG, MATERIAL=STEEL, SECTION=CIRC\n0.01\n"
+            "0., 0., -1.\n" + coupling + "*BOUNDARY\nRP, 1, 2\nRP, 4, 6\n*STEP\n*STATIC\n*DLOAD\n"
+            "HANG, GRAV, 9.81, 0., 0., -1.\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
@@ -7155,6 +7173,22 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): every displacement table as "
                   f"{ref[0] if ref else 'without the *TRANSFORM'}, the BCs on the global DOFs "
                   f"({err:.1e} apart, free nodes moved {moved:.3g})")
+        failures += 0 if ok else 1
+
+    # a CIRC B31 between two kinematically coupled nodes: its new midside node joins the
+    # coupling (left out, it sagged 5.4 % of the beam's motion below its ends)
+    for kind in ("kin", "native"):
+        u = review_run(coupled_beam_deck(kind), f"coupled_beam_{kind}", dat_displacements)
+        ok = bool(u)
+        if ok:
+            # ccx's circle: the 20-node brick through 8 points of it, area (2 + 8 (sqrt 2 - 1) / 3) r^2
+            want = -7800. * 9.81 * (2. + 8. * (math.sqrt(2.) - 1.) / 3.) * 0.01 ** 2 / 1.e4
+            err = max(abs(v[2] / want - 1) for v in u.values())
+            ok = len(u) == 4 and err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  coupled_beam_{kind} (a CIRC B31 written as a 3-node "
+                  f"beam, both ends in a {'*KINEMATIC COUPLING' if kind == 'kin' else '*COUPLING, *KINEMATIC'} "
+                  f"held by a spring, gravity): its {len(u)} nodes moved u_z = -W/k = {want:.6e} "
+                  f"({err:.1e} apart)")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

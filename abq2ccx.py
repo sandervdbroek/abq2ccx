@@ -17348,8 +17348,8 @@ class Converter:
 
     # Cards that read a node set as per-node state or as an output selection: a midside node
     # between two members belongs to the set too (a *BOUNDARY on every node of a beam must
-    # still fix the whole beam).  Any other use (loads, *EQUATION, *MPC, couplings, node
-    # surfaces) counts the set's nodes, so an extra node would change it.
+    # still fix the whole beam).  _EDGE_SET_CARDS adds the constraints that must stay
+    # complete; loads, *EQUATION and *MPC count the set's nodes.
     _MIDSIDE_SET_CARDS = {"BOUNDARY", "INITIAL CONDITIONS", "TEMPERATURE", "NODE PRINT",
                           "NODE FILE", "NODE OUTPUT", "RIGID BODY", "TRANSFORM"}
 
@@ -17363,7 +17363,8 @@ class Converter:
         midpoint of its end nodes (new ids above the highest node; flattened coordinates are
         already global, so the instance transform is included), in ccx's end, middle, end
         order (probed on 2.23: end, end, middle stops with a nonpositive jacobian).  Element
-        ids and element sets are unchanged; node sets follow ``_MIDSIDE_SET_CARDS``."""
+        ids and element sets are unchanged; node sets, node surfaces and coupling lines take
+        the midside node as _extend_edge_sets says."""
         table: Dict[int, str] = {}                     # element -> its section (PIPE/BOX first)
         for b in blocks:
             sec = b.uparam("SECTION") \
@@ -17409,33 +17410,7 @@ class Converter:
                          f"beam is closer to beam theory than the linear one, so results can differ "
                          f"slightly from Abaqus.", once=True)
         self._reduces(f"element {', '.join(kinds)} (SECTION={label} needs a 3-node beam in ccx)")
-        names = set(self.geom.nsets)
-        counted: set = set()                    # node sets some other card counts node by node
-        for b in blocks:
-            if b.keyword in GEOM_KW or b.keyword in ELEM_REF_KW or b.keyword == "HEADING" or \
-                    b.keyword in self._MIDSIDE_SET_CARDS:
-                continue
-            toks = {v.strip().upper() for k, v in b.params.items() if v and k in REF_PARAMS}
-            for line in b.data:
-                toks.update(t.strip().upper() for t in line.split(","))
-            counted |= toks & names
-        by_end: Dict[int, List[Tuple[int, int]]] = {}
-        for a, c, m in self._midside.values():
-            by_end.setdefault(a, []).append((c, m))
-        skipped: List[str] = []
-        for name, ids in self.geom.nsets.items():
-            members = set(ids)
-            add = [m for n in dedup(ids) for c, m in by_end.get(n, ()) if c in members]
-            if add and name in counted:
-                skipped.append(name)
-            elif add:
-                ids.extend(add)
-        if skipped:
-            self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
-                             f"hold both end nodes of upgraded 2-node beams but a load, constraint or "
-                             f"surface card uses them, so the midside nodes were not added (an extra "
-                             f"node there would add load or equation terms); *BOUNDARY and "
-                             f"temperature lines on them still reach the midside nodes.", once=True)
+        self._extend_edge_sets(blocks, list(self._midside.values()), beam=True)
 
     def _note_quadratic_beams(self, blocks: List[Block]) -> None:
         """Records the B32R (QUADRATIC_BEAM) elements under a RECT or CIRC section, whose *EL
@@ -17625,23 +17600,35 @@ class Converter:
     # Cards that read a node set node by node — as state, as an output selection, or as the
     # members of a constraint that must stay complete (couplings, rigid bodies, the nodes of a
     # node-based surface for a tie or contact): a node the converter puts between two of the
-    # set's nodes (_between) joins it.  Loads, *EQUATION and *MPC count the set's nodes.
+    # set's nodes (_between) joins it.  Loads, *EQUATION and *MPC count the set's nodes.  A
+    # kinematic coupling or rigid body of both ends moves the segment between them rigidly in
+    # Abaqus (a linear element interpolates its ends), so the node joins it, or the upgraded
+    # beam's midside node sags (probed: 5 % of the motion under gravity).  A distributing
+    # coupling weights its nodes: a shell edge's new node lies on the coupled edge and joins,
+    # an upgraded beam's lies inside the beam, which Abaqus does not load there — it stays out.
     _EDGE_SET_CARDS = _MIDSIDE_SET_CARDS | {"KINEMATIC COUPLING", "DISTRIBUTING COUPLING",
                                             "SUBMODEL", "NODAL THICKNESS"}
 
-    def _extend_edge_sets(self, blocks: List[Block], trips: Sequence[Tuple[int, int, int]]) -> None:
+    def _extend_edge_sets(self, blocks: List[Block], trips: Sequence[Tuple[int, int, int]],
+                          beam: bool = False) -> None:
         """Add each new node of ``trips`` (end a, end c, node) to the node sets that hold both
         of its ends, unless a card that counts the set's nodes uses the set (an extra node
         would add load or equation terms; *BOUNDARY and temperature lines still reach the node
-        through _midside_records), and to the node-based *SURFACE and *KINEMATIC / *DISTRIBUTING
-        COUPLING lines that give both ends by number."""
+        through _midside_records) or it is UNSORTED (paired by position), and to the node-based
+        *SURFACE and *KINEMATIC / *DISTRIBUTING COUPLING lines that give both ends by number
+        (_EDGE_SET_CARDS).  ``beam``: the midside nodes of upgraded 2-node beams, which a
+        distributing coupling (its card, or the node surface of a *COUPLING, *DISTRIBUTING)
+        does not take."""
         if not trips:
             return
         names = set(self.geom.nsets)
+        joins = self._EDGE_SET_CARDS - ({"DISTRIBUTING COUPLING"} if beam else set())
+        kept = {(b.param("SURFACE") or "").strip().upper() for b in blocks
+                if id(b) in self._distributing_ids} if beam else set()
         counted: set = set()
         for b in blocks:
-            if b.keyword in GEOM_KW or b.keyword in ELEM_REF_KW or b.keyword in ("HEADING", "SURFACE") \
-                    or b.keyword in self._EDGE_SET_CARDS:
+            if b.keyword in GEOM_KW or b.keyword in ELEM_REF_KW or b.keyword == "HEADING" or \
+                    b.keyword in joins or (b.keyword == "SURFACE" and b.uparam("NAME") not in kept):
                 continue
             toks = {v.strip().upper() for k, v in b.params.items() if v and k in REF_PARAMS}
             for line in b.data:
@@ -17662,18 +17649,25 @@ class Converter:
                 ids.extend(add)
         isint = re.compile(r"[-+]?\d+").fullmatch
         for b in blocks:
-            if b.keyword == "SURFACE" and b.uparam("TYPE") == "NODE":
+            if b.keyword == "SURFACE" and b.uparam("TYPE") == "NODE" and b.uparam("NAME") not in kept:
                 listed = {int(r[0]) for r in merged_data_records(b) if r and isint(r[0])}
                 extra = [m for a, c, m in trips if a in listed and c in listed and m not in listed]
                 if extra:
                     b.data = list(b.data) + [str(m) for m in dedup(extra)]
                     self._register_surface(b)
-            elif b.keyword in ("KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
+            elif b.keyword in ("KINEMATIC COUPLING", "DISTRIBUTING COUPLING") and b.keyword in joins:
                 extra = self._midside_records(b, "boundary" if b.keyword.startswith("K") else "field",
                                               only={m for _a, _c, m in trips})
                 if extra:
                     b.data = list(b.data) + extra
-        if skipped:
+        if skipped and beam:
+            self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
+                             f"hold both end nodes of upgraded 2-node beams but a load, constraint "
+                             f"or distributing coupling card counts their nodes (or the set is "
+                             f"UNSORTED), so the midside nodes were not added (an extra node there "
+                             f"would add load or equation terms); *BOUNDARY and temperature lines on "
+                             f"them still reach the midside nodes.", once=True)
+        elif skipped:
             self.report.note(f"Node set(s) {', '.join(skipped[:3])}{', ...' if len(skipped) > 3 else ''} "
                              f"hold both ends of an edge the converter put nodes on (an upgraded "
                              f"shell's midside node, ply interface nodes) but a load or constraint "

@@ -4464,16 +4464,34 @@ def test_circ_beam_midside_node_gets_sets_bcs_and_fields():
 
 
 def test_circ_beam_midside_node_and_couplings_whatever_else_the_deck_has():
-    # a coupling on both beam ends keeps them alone (_MIDSIDE_SET_CARDS); the midside node
-    # used to join it as soon as a composite shell elsewhere was upgraded (_extend_edge_sets)
+    # a kinematic coupling of both beam ends takes the midside node (Abaqus' linear beam
+    # between them moves rigidly; _EDGE_SET_CARDS), whatever else the deck has (a composite
+    # shell upgraded elsewhere used to be the only way in)
     shell = ("*Node\n201, 5., 5., 0.\n202, 6., 5., 0.\n203, 6., 6., 0.\n204, 5., 6., 0.\n"
              "*Element, type=S4R, elset=PLATE\n201, 201, 202, 203, 204\n"
              "*Shell Section, elset=PLATE, composite\n0.1, 3, M, , 0.\n0.1, 3, M, , 90.\n")
     cpl = "*Node\n100, 0.5, 1., 0.\n*Kinematic Coupling, ref node=100\n1, 1, 6\n2, 1, 6\n"
     for deck in (CIRC_BEAM + cpl, CIRC_BEAM + shell + cpl):
-        body, _, rep = convert_str(deck)
-        assert _card_at(body, "*SURFACE, TYPE=NODE, NAME=ABQ2CCX_KC1_1") == ["1", "2"]
-        assert "*KINEMATIC COUPLING lines given" not in rep.text()
+        body, conv, rep = convert_str(deck)
+        assert _card_at(body, "*SURFACE, TYPE=NODE, NAME=ABQ2CCX_KC1_1") == ["1", "2", str(conv._midside[1][2])]
+        assert "*KINEMATIC COUPLING lines given for both end nodes of an upgraded 2-node beam" in rep.text()
+    # a set or node surface of a *COUPLING, *KINEMATIC takes it; a distributing coupling's
+    # (legacy card or *COUPLING, *DISTRIBUTING) keeps its nodes: its weights would put load at
+    # mid-span, which Abaqus' beam does not get there
+    ends = "*Node\n100, 0.5, 1., 0.\n*Nset, nset=ENDS\n1, 2\n"
+    native = ends + ("*Surface, name=S, type=NODE\nENDS\n*Surface, name=T, type=NODE\n1\n2\n"
+                     "*Coupling, constraint name=C, ref node=100, surface={s}\n*{kind}\n")
+    body, conv, _ = convert_str(CIRC_BEAM + native.format(s="S", kind="Kinematic"))
+    assert conv.geom.nset("ENDS") == [1, 2, 101]
+    body, conv, _ = convert_str(CIRC_BEAM + native.format(s="T", kind="Kinematic"))
+    assert _card_at(body, "*SURFACE, NAME=T, TYPE=NODE") == ["1", "2", "101"]
+    body, conv, rep = convert_str(CIRC_BEAM + native.format(s="S", kind="Distributing"))
+    assert conv.geom.nset("ENDS") == [1, 2] and "ENDS hold both end nodes of upgraded 2-node beams" in rep.text()
+    body, conv, _ = convert_str(CIRC_BEAM + native.format(s="T", kind="Distributing"))
+    assert _card_at(body, "*SURFACE, NAME=T, TYPE=NODE") == ["1", "2"]
+    body, conv, _ = convert_str(CIRC_BEAM + ends + "*Distributing Coupling, elset=DC, ref node=100\n"
+                                "1, 1.\n2, 1.\n")
+    assert "\n101, " not in body.split("*DISTRIBUTING COUPLING")[-1].split("*")[0]
 
 
 PIPE_BEAM = CIRC_BEAM.replace("section=CIRC\n0.05", "section=PIPE\n0.05, 0.01")
