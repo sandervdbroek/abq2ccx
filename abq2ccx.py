@@ -9075,12 +9075,8 @@ class Converter:
         amplitude that jumps, a *MODEL CHANGE, unbalanced initial stresses); ccx's alpha is
         kept.  (An initial contact overclosure is no such start: ccx closes it at the first
         increment exactly, with either alpha.)"""
-        coupled: List[Tuple[int, List[Block]]] = []    # (step number, its cards)
-        for i, g in enumerate(step_groups(blocks)[1], 1):
-            proc = next((x for x in g[1:] if x.keyword in PROC_KW), None)
-            if proc is not None and proc.keyword == "COUPLED TEMPERATURE-DISPLACEMENT" and \
-                    not proc.has("STEADY STATE"):
-                coupled.append((i, g))
+        coupled = [(s.no, s.cards) for s in self.steps          # (step number, its cards)
+                   if s.proc == "COUPLED TEMPERATURE-DISPLACEMENT" and not s.proc_card.has("STEADY STATE")]
         if not coupled:
             return
         heavy, unread = False, []
@@ -9148,10 +9144,14 @@ class Converter:
                          f"its predictor then extrapolates with velocities that mean nothing without "
                          f"mass: a strongly nonlinear step may need smaller increments than *STATIC "
                          f"would.", once=True)
+        # a load's OP=NEW, as a BC's below, is the one ccx acts on (op_new_cards: a step's first
+        # card of its type; Abaqus requires it on every card of the type if on any, so the two
+        # read a valid deck alike; *DLOAD and *DSLOAD are two types: _dload_op_new_first)
+        acts = self.steps.acting(("CLOAD", "DLOAD", "DSLOAD"), blocks=blocks)
         jumps = {n for n, g in coupled
                  if g[0].uparam("AMPLITUDE") != "RAMP" and any(
                      b.keyword in ("CLOAD", "DLOAD", "DSLOAD") and
-                     (not b.param("AMPLITUDE") or b.uparam("OP") == "NEW")
+                     (not b.param("AMPLITUDE") or id(b) in acts)
                      for b in g)}
         # so does a mechanical BC that a *BOUNDARY, OP=NEW releases: its reaction drops at the
         # step start (probed: a bar whose top BC carried its load overshoots the same way when

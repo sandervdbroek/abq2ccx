@@ -13880,6 +13880,12 @@ def test_coupled_inertia_load_jump_warned():
                                 ("*STEP", "*CLOAD, AMPLITUDE=A\n8, 3, 1.\n", False),
                                 ("*STEP, AMPLITUDE=RAMP", "*CLOAD\n8, 3, 1.\n", False),
                                 ("*STEP", "*CLOAD, OP=NEW, AMPLITUDE=A\n", True),
+                                # OP=NEW as ccx acts on it, as for BCs: on the step's first card of
+                                # the type (Abaqus wants it on all or none; ccx ignores a later one)
+                                ("*STEP", "*DLOAD, AMPLITUDE=A\nEALL, P2, 1.\n*CLOAD, OP=NEW, "
+                                          "AMPLITUDE=A\n8, 3, 1.\n", True),
+                                ("*STEP", "*CLOAD, AMPLITUDE=A\n8, 3, 1.\n*CLOAD, OP=NEW, "
+                                          "AMPLITUDE=A\n7, 3, 1.\n", False),
                                 ("*STEP", "*BOUNDARY\nTOP, 11, 11, 100.\n*DFLUX\nEALL, BF, 1.\n", False)):
         body, conv, rep = convert_str(COUPLED_HEX + f"{step}\n*COUPLED TEMPERATURE-DISPLACEMENT\n"
                                                     f"0.1, 1.\n{loads}*END STEP\n")
