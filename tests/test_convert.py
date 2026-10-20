@@ -6929,11 +6929,11 @@ def test_frequency_base_contact():
 
 def test_frequency_base_overclosure():
     # Abaqus resolves an initial overclosure as an interference fit, with stresses, in the first
-    # general increment, unless ADJUST moves the slave nodes onto the master strain-free; ccx
-    # 2.23 too (node-to-surface ADJUST at any value; surface-to-surface ADJUST leaves part of
-    # it), so its PERTURBATION adds that prestress after linear steps (probed: a column top
-    # overclosing a fixed plate by 2e-4, 28.80 Hz vs 29.80 Hz touching): a stressed base state.
-    # A first-step PERTURBATION resolves none (probed: the same at either depth)
+    # general increment, unless ADJUST moves the slave nodes onto the master strain-free (any
+    # value: every overclosed node; a node set: those in it); ccx 2.23 too, in either
+    # formulation, so its PERTURBATION adds that prestress after linear steps (probed: a column
+    # top overclosing a fixed plate by 2e-4, 28.80 Hz vs 29.80 Hz touching): a stressed base
+    # state. A first-step PERTURBATION resolves none (probed: the same at either depth)
     def deck(z0, pair="", extra=""):
         block = "".join(f"{11 + i}, {x}, {y}, {z0 + z}\n" for i, (x, y, z) in enumerate(
             [(-.5, -.5, 0), (1.5, -.5, 0), (1.5, 1.5, 0), (-.5, 1.5, 0),
@@ -6950,14 +6950,18 @@ def test_frequency_base_overclosure():
         body, conv, rep = convert_str(model + pre + _deck_step("Frequency\n3", "", head))
         return [s.split("\n")[0] for s in body.split("*STEP")[1:]], conv.reduced_physics, rep.text()
 
-    for model in (deck(0.99), deck(0.99, ", type=surface to surface, adjust=0."),
+    for model in (deck(0.99), deck(0.99, ", adjust=PART", "*Nset, nset=PART\n5, 6\n"),
                   deck(1.01, extra="*Clearance, slave=SA, master=SB, value=-0.01\n")):
         got, red, rep = heads(model)
         assert got == ["", ""] and red == lost and "overclosure resolved as an interference fit" in rep
+        assert "--approximate writes PERTURBATION" in rep
         got, red, rep = heads(model, head=", perturbation")
         assert got == ["", ", PERTURBATION"] and red and "kept for the base state's contact" in rep
-    # touching, open, adjusted (node-to-surface), a clearance set: unstressed
+    # touching, open, adjusted (either formulation, every overclosed node), a clearance set:
+    # unstressed
     for model in (deck(1.), deck(1.01), deck(0.99, ", adjust=0."),
+                  deck(0.99, ", type=surface to surface, adjust=0."),
+                  deck(0.99, ", type=surface to surface, adjust=TOPN", "*Nset, nset=TOPN\n5, 6, 7, 8\n"),
                   deck(0.99, extra="*Clearance, slave=SA, master=SB, value=0.\n")):
         got, red, rep = heads(model)
         assert got == ["", ", PERTURBATION"] and not red and "(no loads, no overclosure)" in rep
@@ -6973,6 +6977,89 @@ def test_frequency_base_overclosure():
              "SA, SB\n*BOUNDARY\n1, 1, 2\n2, 2, 2\n11, 1, 2\n12, 1, 2\n13, 1, 2\n14, 1, 2\n")
     assert heads(plane.format(0.99, 1.99))[:2] == (["", ""], lost)
     assert heads(plane.format(1.01, 2.01))[:2] == (["", ", PERTURBATION"], [])
+    # --approximate: PERTURBATION where only the overclosure stresses the base (much closer to
+    # Abaqus than the plain step: 28.80 Hz, 29.80 touching, 20.95 plain); a load keeps it plain
+    body, conv, rep = convert_str(deck(0.99) + _deck_step("Static") + _deck_step("Frequency\n3"),
+                                  approximate=True)
+    assert [x.split("\n")[0] for x in body.split("*STEP")[1:]] == ["", ", PERTURBATION"]
+    assert "[APPROX] *STEP, PERTURBATION written on a *FREQUENCY step" in rep.text()
+    assert len(conv.reduced_physics) == 1 and conv.reduced_physics[0].startswith("--approximate:")
+    body, conv, rep = convert_str(deck(0.99) + _deck_step("Static", "*Cload\n7, 3, -1.\n") +
+                                  _deck_step("Frequency\n3"), approximate=True)
+    assert [x.split("\n")[0] for x in body.split("*STEP")[1:]] == ["", ""]
+    assert conv.reduced_physics == lost and "--approximate writes" not in rep.text()
+
+
+def test_frequency_base_overclosure_shell_rigid_masters():
+    # an overclosure against a shell master: its SPOS / SNEG face at half the thickness and
+    # OFFSET from the nodes where Abaqus counts the thickness (every formulation but finite-
+    # sliding node-to-surface, unless NO THICKNESS), a double-sided one the slab between; a
+    # slave shell's face alike; a rigid master's skin faces (a double-sided one not checked)
+    def plate(z, typ="S4R", sec="*Shell Section, elset=PL, material=M{}\n0.1\n", off="", a=-.5, b=1.5):
+        nodes = "".join(f"{11 + i}, {x}, {y}, {z}\n" for i, (x, y) in enumerate(
+            [(a, a), (b, a), (b, b), (a, b)]))
+        return (BUCKLE_CUBE.replace("*ELEMENT, TYPE=C3D8, ELSET=EALL\n", nodes + f"*ELEMENT, TYPE={typ}, "
+                                    "ELSET=PL\n2, 11, 12, 13, 14\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n")
+                .replace("*Boundary\n", "*Boundary\n11, 1, 6\n12, 1, 6\n13, 1, 6\n14, 1, 6\n")
+                + sec.format(off))
+
+    def stressed(model, face="SNEG", pair="", slave="ROT, S2", master="PL"):
+        body, conv, _ = convert_str(
+            model + f"*Surface, name=SA\n{slave}\n*Surface, name=SB\n{master}{', ' + face if face else ''}\n"
+            f"*Surface Interaction, name=SI\n*Contact Pair, interaction=SI{pair}\nSA, SB\n" +
+            _deck_step("Static") + _deck_step("Frequency\n3"))
+        return body.split("*STEP")[-1].split("\n")[0] == ""
+
+    s2s = ", type=surface to surface"
+    assert stressed(plate(1.04), pair=s2s) and stressed(plate(1.04), pair=", small sliding")
+    assert not stressed(plate(1.04)) and stressed(plate(0.99))     # finite sliding: no thickness
+    assert not stressed(plate(1.04), pair=s2s + ", no thickness")
+    assert stressed(plate(1.06, off=", offset=SPOS"), pair=s2s)
+    assert not stressed(plate(1.01, off=", offset=SNEG"), pair=s2s)
+    assert stressed(plate(1.04), "", s2s) and not stressed(plate(1.06), "", s2s)
+    # a shell slave below the cube's bottom face (z = 0), its SPOS face up
+    inner = {"a": .2, "b": .8}
+    assert stressed(plate(-0.03, **inner), "S1", s2s, "PL, SPOS", "ROT")
+    assert not stressed(plate(-0.03, **inner), "S1", "", "PL, SPOS", "ROT")
+    assert not stressed(plate(-0.06, **inner), "S1", s2s, "PL, SPOS", "ROT")
+    # a rigid R3D4 plate: overclosed below the cube's top, not above; double-sided: unchecked
+    rig = "*Node\n99, 0.5, 0.5, 2.\n*Rigid Body, ref node=99, elset=PL\n*Boundary\n99, 1, 6\n"
+    assert stressed(plate(0.99, "R3D4", rig)) and not stressed(plate(1.01, "R3D4", rig))
+    assert not stressed(plate(0.99, "R3D4", rig), "")
+
+
+def test_hyperfoam_n1_written_as_n2():
+    # ccx 2.23 gives an N=1 *HYPERFOAM (the default) no stiffness: it stops without a message in
+    # a static or buckling step, frequencies of 0 (probed on two builds); N=2 with mu1 halved in
+    # both terms is the same energy, which ccx solves (closed form, beam frequency, buckling)
+    deck = (HEX + "*Material, name=F\n{}*Density\n100.\n*Solid Section, elset=EALL, material=F\n"
+            "*Boundary\n1, 1, 3\n")
+    step = lambda p: f"*Step\n*{p}\n*End Step\n"           # noqa: E731
+
+    def conv(card, proc="Frequency\n2"):
+        body, c, rep = convert_str(deck.format(card) + step(proc))
+        return body[body.index("*HYPERFOAM"):].split("*DENSITY")[0].strip().split("\n"), \
+            c.reduced_physics, rep.text()
+
+    got, red, rep = conv("*Hyperfoam\n2.e6, 2., 0.1\n")
+    assert got == ["*HYPERFOAM, N=2", "1000000., 2., 1000000., 2., 0.1, 0.1"] and not red
+    assert "*HYPERFOAM, N=1 -> N=2 with mu1 halved" in rep and "STATIC / *VISCO" not in rep
+    got, red, rep = conv("*Hyperfoam, n=1\n2.e6, 2., 0.1, 20.\n1.e6, 2., 0.2, 120.\n")
+    assert got[1:] == ["1000000., 2., 1000000., 2., 0.1, 0.1, 20.",
+                       "500000., 2., 500000., 2., 0.2, 0.2, 120."] and not red
+    # a static step converged on one element only in the probes (any N): warned
+    got, red, rep = conv("*Hyperfoam\n2.e6, 2., 0.1\n", "Static")
+    assert got[0] == "*HYPERFOAM, N=2" and "ccx 2.23 converged there on one element only" in rep
+    assert not red
+    # N >= 2 with unequal exponents: the tangent is off (eigenvalue steps 9-14 % low)
+    got, red, rep = conv("*Hyperfoam, n=2\n1.5e6, 2., 0.5e6, 4., 0.1, 0.1\n")
+    assert got == ["*HYPERFOAM, N=2", "1.5e6, 2., 0.5e6, 4., 0.1, 0.1"] and "unequal exponents" in rep
+    assert red == ["*HYPERFOAM tangent with unequal exponents (eigenvalue steps)"]
+    assert not conv("*Hyperfoam, n=2\n1.e6, 2., 1.e6, 2., 0.1, 0.1\n")[1]
+    assert not conv("*Hyperfoam, n=2\n1.5e6, 2., 0.5e6, 4., 0.1, 0.1\n", "Static")[1]
+    # an N=1 card the converter cannot rewrite stays, warned
+    got, red, rep = conv("*Hyperfoam\nmu, 2., 0.1\n")
+    assert got == ["*HYPERFOAM", "mu, 2., 0.1"] and red == ["*HYPERFOAM, N=1 (no stiffness in ccx 2.23)"]
 
 
 def test_buckle_contact_left_out():

@@ -3947,6 +3947,7 @@ class Converter:
         self._initial_stresses = False
         self._freq_contact = False                  # contact (plain *FREQUENCY / *BUCKLE drop it)
         self._overclosed = False                    # one of them starts overclosed
+        self._deck_procs: set = set()               # the deck's procedure keywords (_prescan)
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
         self._general_step_seen = False
@@ -4776,6 +4777,7 @@ class Converter:
         "USER MATERIAL": "handle_user_material",
         "CYCLIC HARDENING": "handle_cyclic_hardening",
         "HYPERELASTIC": "handle_hyperelastic",
+        "HYPERFOAM": "handle_hyperfoam",
         "DENSITY": "handle_dependent_material",
         "SPECIFIC HEAT": "handle_dependent_material",
         "MASS": "handle_mass",
@@ -5515,6 +5517,70 @@ class Converter:
             self.report.note("*HYPERELASTIC without a model keyword -> POLYNOMIAL (the Abaqus "
                              "default; ccx requires it explicitly).", once=True)
         return [emit_keyword("HYPERELASTIC", params)] + list(b.data)
+
+    def handle_hyperfoam(self, b: Block) -> List[str]:
+        """``*HYPERFOAM``.  ccx 2.23 gives an N=1 one (the default) no stiffness: it stops
+        without a message (exit 255, spooles "matrix found to be singular") in a static or
+        buckling step, and a frequency step returns eigenvalues of 0 or 1 (probed on two
+        builds, whatever the values).  N=1 is written as N=2 with mu1 halved in both terms,
+        the same strain energy, which ccx solves: the closed-form uniaxial stress and lateral
+        stretch at a stretch of 0.8 to 6 digits, a column's beam frequency (0.2551 Hz vs
+        0.2554) and buckling load (22.53 vs 22.62).  With N >= 2 and unequal exponents its
+        stresses are right but its tangent is not: the column's frequency and buckling load
+        9 % and 14 % low (warned in eigenvalue steps).  A *STATIC or *VISCO step converged
+        on one element only (warned)."""
+        mat = self._card_material.get(id(b))
+        used = mat is None or mat.upper() in self._used_materials
+        try:
+            n = max(1, int(float(b.param("N") or "1")))
+        except ValueError:
+            n = 0
+        rows = material_rows(b, 3 * n) if n and not b.has("TEST DATA INPUT") else None
+        out = self.passthrough(b)
+        if n == 1:
+            new: List[str] = []
+            ok = rows is not None and not b.has("DEPENDENCIES")
+            for r in rows if ok else []:
+                try:
+                    half = fmt_num(pf(r[0]) / 2.0)
+                except ValueError:
+                    ok = False
+                    break
+                new.append(", ".join([half, r[1], half, r[1], r[2], r[2]] + ([r[3]] if r[3] else [])))
+            if ok and new:
+                params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+                params["N"] = "2"
+                self.report.note("*HYPERFOAM, N=1 -> N=2 with mu1 halved in both terms (the same "
+                                 "strain energy): ccx 2.23 gives an N=1 hyperfoam no stiffness "
+                                 "(probed: it stops without a message in a static or buckling "
+                                 "step, frequencies of 0); the N=2 form matches the closed form.",
+                                 once=True)
+                out = [emit_keyword("HYPERFOAM", params)] + new
+            elif used:
+                self.report.warn("*HYPERFOAM, N=1 kept as written (TEST DATA INPUT, DEPENDENCIES, or "
+                                 "rows that do not read as numbers): ccx 2.23 gives it no stiffness, "
+                                 "stopping without a message in a static or buckling step (probed).",
+                                 once=True)
+                self._reduces("*HYPERFOAM, N=1 (no stiffness in ccx 2.23)")
+        elif rows and used and self._deck_procs & {"FREQUENCY", "BUCKLE"}:
+            for r in rows:
+                try:
+                    alphas = [pf(r[2 * i + 1]) for i in range(n)]
+                except ValueError:
+                    continue
+                if max(alphas) - min(alphas) > 1e-9 * max(abs(a) for a in alphas):
+                    self.report.warn("*HYPERFOAM with unequal exponents alpha_i in a deck with "
+                                     "*FREQUENCY / *BUCKLE steps: ccx 2.23's tangent of such a "
+                                     "hyperfoam is off, its stresses are right (probed: a column's "
+                                     "frequency and buckling load 9 % and 14 % low).", once=True)
+                    self._reduces("*HYPERFOAM tangent with unequal exponents (eigenvalue steps)")
+                    break
+        if used and self._deck_procs & {"STATIC", "VISCO"}:
+            self.report.warn("*HYPERFOAM in a *STATIC / *VISCO step: ccx 2.23 converged there on one "
+                             "element only (probed on two builds: 'increment size smaller than "
+                             "minimum' on a 2 x 2 bar at 0.1 % strain, under a force or prescribed "
+                             "motion, where *HYPERELASTIC converges); expect it to stop.", once=True)
+        return out
 
     # --approximate: a Poisson's ratio of 0.5 or more, which ccx rejects, becomes this
     _NU_CLAMP = 0.475
@@ -7901,15 +7967,23 @@ class Converter:
 
     def _contact_overclosed(self, blocks: List[Block], lines: List[Tuple[Block, str, str]]) -> bool:
         """Whether a contact pair line ccx gets ((card, slave, master)) starts overclosed: a
-        *CLEARANCE with a negative value, or a slave node behind a continuum face or edge of
-        the master (its sub-triangles / segments through the midside nodes, facing away from
-        its element; not one of that element's nodes) by more than 1e-6 of the model's span
-        and less than the face's size.
+        *CLEARANCE with a negative value, or a slave node behind a face or edge of the master
+        (its sub-triangles / segments through the midside nodes; not one of the master
+        element's nodes) by more than 1e-6 of the model's span and less than the face's size.
         Abaqus resolves an overclosure as an interference fit, with stresses, in the first
         increment ("Modeling contact interference fits in Abaqus/Standard"), unless ADJUST
-        moves the slave nodes onto the master strain-free — as ccx 2.23 does on a node-to-
-        surface pair, at any ADJUST value (probed; on a surface-to-surface pair it leaves part
-        of the overclosure).  Shell, rigid and surface-element masters are not checked."""
+        moves the slave nodes onto the master strain-free: at any value every overclosed one,
+        with a node set those in it.  ccx 2.23 does the same in either formulation (probed:
+        no stress, as with the nodes moved in the deck; the nodes outside a set stay
+        overclosed; a surface-to-surface frequency after it, 29.03 Hz vs 29.80 touching, is
+        that formulation's spread at a zero gap: a shorter column touching gives 29.03 too).
+        A continuum face faces away from its element; a rigid surface is its skins' faces
+        (_plan_rigid: a double-sided one is skipped); a shell or membrane face is its SPOS /
+        SNEG side, at half the thickness and OFFSET from the nodes where Abaqus counts the
+        thickness — every formulation but finite-sliding node-to-surface, unless NO THICKNESS
+        ("Assigning surface properties for contact pairs in Abaqus/Standard"); a double-sided
+        one is the slab between them.  A slave shell's or membrane's face is offset alike.
+        Surface elements are not in ccx's mesh (_drop_surface_elements): not checked."""
         cleared = set()
         for b in blocks:
             if b.keyword == "CLEARANCE":
@@ -7926,61 +8000,132 @@ class Converter:
         tol = 1e-6 * self._model_span()
         nodes = self.geom.nodes
         types: Dict[str, str] = {}
+        shells = self._shell_thicknesses(blocks)
+        mem = {e for e, (typ, _c) in self.geom.elements.items() if typ.upper().startswith("M3D")}
+        for e, ts in (self._membrane_thicknesses(blocks, mem)[0].items() if mem else ()):
+            if ts and all(t is not None and t > 0.0 for t in ts):
+                shells[e] = (max(ts), 0.0)
+        side_of = {sk: (e, side) for (e, side), (sk, _f) in self._skins.items()}
+        axisym = any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values())
+
+        def tri_parts(p: List[Vec]) -> List[Tuple[Vec, ...]]:
+            nc = 3 if len(p) in (3, 6) else 4
+            c, m = p[:nc], p[nc:2 * nc]
+            return [(c[0], c[i], c[i + 1]) for i in range(1, nc - 1)] if len(m) < nc else \
+                [(c[k], m[k], m[k - 1]) for k in range(nc)] + [(m[0], m[i], m[i + 1]) for i in range(1, nc - 1)]
+
         for b, slave, master in lines:
-            n2s = (b.param("TYPE") or "").replace(" ", "").upper() != "SURFACETOSURFACE"
-            sd = self.surfaces.get(master)
-            if (b.has("ADJUST") and n2s) or (slave, master) in cleared or not sd or \
-                    sd[0].startswith("NODE"):
+            if (slave, master) in cleared:
                 continue
-            facets: List[Tuple[Tuple[Vec, ...], Vec, float]] = []   # (points, outward normal, size)
+            adjust = (b.param("ADJUST") or "").strip()
+            moved: set = set()
+            if adjust:
+                try:
+                    pf(adjust)
+                    continue                    # every overclosed slave node moves
+                except ValueError:
+                    moved = set(self.geom.nset(adjust))
+            thick = ((b.param("TYPE") or "").replace(" ", "").upper() == "SURFACETOSURFACE" or
+                     b.has("SMALL SLIDING")) and not b.has("NO THICKNESS")
+            # (points, outward normal, face size, deepest overclosure counted)
+            facets: List[Tuple[Tuple[Vec, ...], Vec, float, float]] = []
             on_master: set = set()
-            for tok, face in sd[1]:
-                for e in self._resolve_elements(tok):
-                    typ, conn = self.geom.elements.get(e, ("", []))
-                    planar = typ.upper().startswith(PLANAR_SOLID_PREFIXES)
-                    if planar:
-                        ids = self._face_node_ids(e, face)
-                        ok = len(ids) in (2, 3)
-                    else:
-                        ids, corners = self._facet(e, face, types)
-                        ok = typ and types[typ].startswith("C3D") and corners in (3, 4)
-                    if not ok or any(n not in nodes for n in list(ids) + list(conn)):
-                        continue
-                    on_master.update(conn)          # the master body's own nodes
-                    mid = vscale(functools.reduce(vadd, (nodes[n] for n in conn)), 1.0 / len(conn))
-                    p = [nodes[n] for n in ids]
-                    if planar:
-                        parts = [(p[0], p[2]), (p[2], p[1])] if len(p) == 3 else [(p[0], p[1])]
-                        size = vnorm(vsub(p[1], p[0]))
-                    else:
-                        nc = 3 if len(p) in (3, 6) else 4
-                        c, m = p[:nc], p[nc:]
-                        parts = [(c[0], c[i], c[i + 1]) for i in range(1, nc - 1)] if not m else \
-                            [(c[k], m[k], m[k - 1]) for k in range(nc)] + \
-                            [(m[0], m[i], m[i + 1]) for i in range(1, nc - 1)]
-                        size = max(vnorm(vsub(c[(i + 1) % nc], c[i])) for i in range(nc))
-                    for q in parts:
-                        nrm = vunit(vcross(vsub(q[1], q[0]), (0.0, 0.0, 1.0)) if planar else
-                                    vcross(vsub(q[1], q[0]), vsub(q[2], q[0])))
-                        cen = vscale(functools.reduce(vadd, q), 1.0 / len(q))
-                        if vdot(nrm, vsub(cen, mid)) < 0:
+            rigid = self._rigid_faces.get(master)
+            if rigid is not None:
+                sides: Dict[int, set] = {}
+                for sk, _f in rigid:
+                    if sk in side_of:
+                        sides.setdefault(side_of[sk][0], set()).add(side_of[sk][1])
+                entries = [(sk, f) for sk, f in rigid if len(sides.get(side_of.get(sk, (None,))[0], ())) < 2]
+            else:
+                sd = self.surfaces.get(master)
+                if not sd or sd[0].startswith("NODE"):
+                    continue
+                entries = [(e, face) for tok, face in sd[1] for e in self._resolve_elements(tok)]
+            for e, face in entries:
+                typ, conn = self.geom.elements.get(e, ("", []))
+                if not typ or any(n not in nodes for n in conn):
+                    continue
+                if typ not in types:
+                    types[typ] = ccx_type(typ)
+                lab = (face or "").upper()
+                if types[typ] in SHELL_TYPES or types[typ].startswith("M3D"):
+                    if lab not in ("SPOS", "SNEG", "") or len(conn) not in (3, 4, 6, 8, 9):
+                        continue                # an edge
+                    on_master.update(conn)
+                    t, off = shells.get(e, (0.0, 0.0)) if thick else (0.0, 0.0)
+                    if not lab and t <= 0.0:
+                        continue                # double-sided without thickness: no inside
+                    p = [nodes[n] for n in conn]
+                    n_e = self._shell_normal(e)
+                    size = max(vnorm(vsub(p[(i + 1) % (3 if len(p) in (3, 6) else 4)], p[i]))
+                               for i in range(3 if len(p) in (3, 6) else 4))
+                    for q in tri_parts(p):
+                        nrm = vunit(vcross(vsub(q[1], q[0]), vsub(q[2], q[0])))
+                        if vdot(nrm, n_e) < 0:
                             nrm = vscale(nrm, -1.0)
-                        facets.append((q, nrm, size))
+                        for sg, h in ((1.0, (0.5 - off) * t), (-1.0, -(0.5 + off) * t)):
+                            if lab == ("SNEG" if sg > 0 else "SPOS"):
+                                continue
+                            facets.append((tuple(vadd(x, vscale(nrm, h)) for x in q), vscale(nrm, sg),
+                                           size, t if not lab else size))
+                    continue
+                planar = typ.upper().startswith(PLANAR_SOLID_PREFIXES)
+                if planar:
+                    ids = self._face_node_ids(e, face)
+                    ok = len(ids) in (2, 3)
+                else:
+                    ids, corners = self._facet(e, face, types)
+                    ok = types[typ].startswith("C3D") and corners in (3, 4)
+                if not ok or any(n not in nodes for n in ids):
+                    continue
+                on_master.update(conn)          # the master body's own nodes
+                mid = vscale(functools.reduce(vadd, (nodes[n] for n in conn)), 1.0 / len(conn))
+                p = [nodes[n] for n in ids]
+                if planar:
+                    parts = [(p[0], p[2]), (p[2], p[1])] if len(p) == 3 else [(p[0], p[1])]
+                    size = vnorm(vsub(p[1], p[0]))
+                else:
+                    nc = 3 if len(p) in (3, 6) else 4
+                    parts = tri_parts(p)
+                    size = max(vnorm(vsub(p[(i + 1) % nc], p[i])) for i in range(nc))
+                for q in parts:
+                    nrm = vunit(vcross(vsub(q[1], q[0]), (0.0, 0.0, 1.0)) if planar else
+                                vcross(vsub(q[1], q[0]), vsub(q[2], q[0])))
+                    cen = vscale(functools.reduce(vadd, q), 1.0 / len(q))
+                    if vdot(nrm, vsub(cen, mid)) < 0:
+                        nrm = vscale(nrm, -1.0)
+                    facets.append((q, nrm, size, size))
             if not facets:
                 continue
-            cell = max(max(f[2] for f in facets), 1e-12)
+            # a slave shell / membrane face: half its thickness and OFFSET from the nodes
+            half: Dict[int, Tuple[float, float, Vec]] = {}
+            ssd = self.surfaces.get(slave)
+            if thick and ssd and not ssd[0].startswith("NODE"):
+                for tok, _f in ssd[1]:
+                    for e in self._resolve_elements(tok):
+                        if e in shells:
+                            t_e, off_e = shells[e]
+                            for n in self.geom.elements[e][1]:
+                                if n not in half or t_e > half[n][0]:
+                                    half[n] = (t_e, off_e, self._shell_normal(e))
+            reach = max([f[3] for f in facets] + [(0.5 + abs(v[1])) * v[0] for v in half.values()])
+            cell = max(max(f[2] for f in facets), reach, 1e-12)
             grid: Dict[Tuple[int, ...], List[int]] = {}
-            for i, (q, _, size) in enumerate(facets):
-                lo = [int(math.floor((min(x[a] for x in q) - size) / cell)) for a in range(3)]
-                hi = [int(math.floor((max(x[a] for x in q) + size) / cell)) for a in range(3)]
+            for i, (q, _, size, _d) in enumerate(facets):
+                lo = [int(math.floor((min(x[a] for x in q) - reach) / cell)) for a in range(3)]
+                hi = [int(math.floor((max(x[a] for x in q) + reach) / cell)) for a in range(3)]
                 for key in itertools.product(*(range(lo[a], hi[a] + 1) for a in range(3))):
                     grid.setdefault(key, []).append(i)
+            lift = math.cos(math.radians(1.0)) if axisym and rigid is not None else 1.0
             for n in self._surface_member_nodes(slave):
-                if n in on_master or n not in nodes:
+                if n in on_master or n in moved or n not in nodes:
                     continue
                 x = nodes[n]
+                if lift != 1.0:                 # an axisymmetric skin lies at r cos(1 degree)
+                    x = (x[0] * lift, x[1], x[2])
                 for i in grid.get(tuple(int(math.floor(x[a] / cell)) for a in range(3)), ()):
-                    q, nrm, size = facets[i]
+                    q, nrm, size, depth = facets[i]
                     if len(q) == 3:
                         near = closest_on_triangle(x, *q)
                     else:
@@ -7989,7 +8134,11 @@ class Converter:
                         near = vadd(q[0], vscale(d, t))
                     v = vsub(x, near)
                     s = vdot(v, nrm)
-                    if -size < s < -tol and vdot(v, v) - s * s <= (1e-3 * size) ** 2:
+                    if n in half:
+                        t_s, off_s, n_s = half[n]
+                        c = vdot(n_s, nrm)
+                        s -= (0.5 - off_s if c < 0 else 0.5 + off_s) * t_s * abs(c)
+                    if -depth < s < -tol and vdot(v, v) - vdot(v, nrm) ** 2 <= (1e-3 * size) ** 2:
                         return True
         return False
 
@@ -8010,7 +8159,9 @@ class Converter:
         general step, with stresses, as Abaqus does, not in a first-step PERTURBATION).
         ccx's modal / steady-state dynamics and complex frequency steps refuse an .eig file
         written by a perturbation frequency step ('created with perturbation info'; probed):
-        PERTURBATION is left out on the frequency step they read (_freq_read)."""
+        PERTURBATION is left out on the frequency step they read (_freq_read).  Where only an
+        overclosure stresses a linear base, --approximate writes PERTURBATION: much closer to
+        Abaqus than the plain step (probed: 28.80 Hz, 29.80 touching, 20.95 plain)."""
         read = self._step_idx in self._freq_read
         contact = self._freq_contact
         left = "the deck's PERTURBATION dropped" if given else "left out"
@@ -8100,6 +8251,17 @@ class Converter:
                                  "PERTURBATION would add (probed: a column touching a fixed plate, "
                                  "29.80 Hz vs 20.95 Hz).", once=True)
             return True
+        # only an overclosure stresses the base: PERTURBATION is much closer (--approximate)
+        fit_only = contact and self._overclosed and not self._base_stressed and \
+            not (self._expansion and self._base_heated)
+        if fit_only and not given and self._approx:
+            self.report.warn("[APPROX] *STEP, PERTURBATION written on a *FREQUENCY step after "
+                             "general steps without NLGEOM that resolve an initial overclosure as "
+                             "an interference fit: it keeps the base state's contact status, which "
+                             "ccx's plain *FREQUENCY drops, and adds the fit's stress stiffness, "
+                             "which Abaqus leaves out (probed: a column top 2e-4 into a fixed plate, "
+                             "28.80 Hz, 29.80 touching, 20.95 plain).", once=True)
+            return True
         if given:
             self.report.warn("*FREQUENCY step with PERTURBATION after general steps without "
                              "NLGEOM: ccx 2.23 includes the preload's stress stiffness there, "
@@ -8117,6 +8279,8 @@ class Converter:
             self._reduces("*FREQUENCY step at the initial temperatures (Abaqus: the base "
                           "state's)")
         if contact:
+            hint = " Where only an overclosure stresses it, --approximate writes PERTURBATION " \
+                "(much closer)." if fit_only else ""
             self.report.warn("*FREQUENCY step with contact pairs after general steps without "
                              "NLGEOM that stress the model (loads, prescribed motion, an "
                              "overclosure resolved as an interference fit): Abaqus keeps the "
@@ -8124,8 +8288,7 @@ class Converter:
                              "contact out altogether (probed: a column pressed against a fixed "
                              "plate, 20.95 Hz vs 30.14 Hz with PERTURBATION); its PERTURBATION "
                              "would add the base state's stress stiffness and deformed geometry, "
-                             "which Abaqus leaves out here.",
-                             once=True)
+                             "which Abaqus leaves out here." + hint, once=True)
             self._reduces("contact left out of a *FREQUENCY step (ccx's plain *FREQUENCY "
                           "drops it)")
         return False
@@ -21340,6 +21503,7 @@ class Converter:
         self._freq_contact = bool(lines)
         self._overclosed = bool(lines) and any(b.keyword == "FREQUENCY" for b in blocks) and \
             self._contact_overclosed(blocks, lines)
+        self._deck_procs = {b.keyword for b in blocks if b.keyword in PROC_KW}
         self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
                                   and temperature_dependent(b) for b in blocks)
         self._expansion = any(b.keyword == "EXPANSION" for b in blocks)

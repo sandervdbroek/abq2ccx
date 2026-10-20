@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **`*HYPERFOAM`, N=1** — ccx 2.23 gives an N=1 hyperfoam (the default) no stiffness: it
+  stopped without a message in static and buckling steps and returned frequencies of 0. It is
+  now written as N=2 with mu1 halved in both terms (the same energy), which ccx solves (closed
+  form, beam frequency and buckling load). Warned: unequal exponents (N >= 2) in eigenvalue
+  steps, where ccx's tangent puts frequencies and buckling loads 9-14 % low (reduced physics),
+  and static or `*VISCO` steps, which ccx 2.23 did not converge beyond one element.
+* **Overclosed contact before a `*FREQUENCY` step** — overclosures against shell faces
+  (thickness and `OFFSET`, where Abaqus counts them), from slave shells and against rigid
+  surfaces are now detected. Under `--approximate`, a `*FREQUENCY` step after a linear base
+  that only an overclosure stresses gets `PERTURBATION` ([APPROX]: much closer to Abaqus than
+  the plain step, which drops contact).
 * **Rotated instances** — a part's `*EQUATION`, kinematic couplings of some DOFs and SPRING1 /
   SPRING2 kept the part's DOF numbers in a turned `*INSTANCE`, so they acted along the wrong
   directions. Abaqus turns them with the instance. Each equation term now becomes terms on the
@@ -175,10 +186,11 @@ physics.
   touching blocks kept its free factors): now warned (reduced physics). An initial
   overclosure stresses the base state (Abaqus resolves it as an interference fit in the first
   general step; probed alike in ccx): a `*FREQUENCY` step after it no longer gets
-  `PERTURBATION` as an unstressed one. Exceptions: node-to-surface `ADJUST`, which moves the
-  nodes strain-free, and a `*CLEARANCE` that sets a gap. Temperature-dependent
-  `*HYPERELASTIC` / `*HYPERFOAM` coefficients now count as heated materials there, as `*ELASTIC`
-  rows do. Contact pairs on unconverted analytical surfaces no longer count as contact.
+  `PERTURBATION` as an unstressed one. Exceptions: `ADJUST`, which moves the nodes
+  strain-free (a node set: its nodes), and a `*CLEARANCE` that sets a gap.
+  Temperature-dependent `*HYPERELASTIC` / `*HYPERFOAM` coefficients now count as heated
+  materials there, as `*ELASTIC` rows do. Contact pairs on unconverted analytical surfaces no
+  longer count as contact.
 * **Static perturbation temperatures, amplitudes and zero BCs** — in a `*STEP, PERTURBATION`
   `*STATIC` step a `*TEMPERATURE` is a change of the base state's temperatures (the initial
   ones before any general step), and an amplitude counts at its value at time 0 (Abaqus); ccx
