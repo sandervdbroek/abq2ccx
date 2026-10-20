@@ -6,6 +6,22 @@ physics.
 
 ## Unreleased
 
+* **Cards ccx 2.23 stopped or crashed on, without a warning** — each is now written in a form
+  ccx runs, or warned (reduced physics):
+  * `*RIGID BODY` with `ELSET` and a `PIN` / `TIE NSET`: one `NSET` of all their nodes (ccx
+    takes one or the other).
+  * `*COUPLING`, `*KINEMATIC` of some translations, such as `3, 3`: a rotation of the reference
+    node that no coupled DOF uses crashed ccx (no message). It is held at zero, which is exact.
+  * `*VISCO` without `CETOL` (fixed increments in Abaqus): `DIRECT, CETOL=1.E30`.
+  * An element `*SURFACE` line without a face label: the exterior faces of its continuum
+    elements, as in Abaqus. On shells and beams the line is left out (warned).
+  * `*SOLID SECTION, COMPOSITE`: plies of one material in the same directions become a plain
+    solid section. Other layups are commented out (warned); ccx stopped on them.
+  * `*BOUNDARY` on DOF 10 or 12–30: dropped like DOFs 7–9 (warned where an element has it).
+  * An `*ORIENTATION` without axes (`1., 0., 0.`), or `OFFSET TO NODES`: written as the global
+    axes where only direction-free sections use it. Otherwise it is commented out (warned).
+  * `*ELASTIC, TYPE=SHEAR` and `*FRICTION, USER` are commented out (warned). The user
+    friction's first property had been written as mu.
 * **Indented keyword lines** — Abaqus reads `  *NODE` as `*NODE`; the converter read a keyword
   `*NODE` with no CalculiX equivalent, so an indented `*INSTANCE` left a deck without its mesh.
 * **Abbreviations** — Abaqus reads any unambiguous abbreviation of a keyword, parameter or

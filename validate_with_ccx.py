@@ -3843,6 +3843,76 @@ def long_numbers_deck():
          "*NODE PRINT, NSET=TIP", "U", "*END STEP"]) + "\n"
 
 
+R20_CUBE = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*Element, type=C3D8, elset=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Nset, nset=BOT
+1, 2, 3, 4
+*Nset, nset=TOP
+5, 6, 7, 8
+"""
+# the cube held against rigid motion only: node 1 fixed, 2 in y and z, 3 in z, 4 in x and z
+R20_HOLD = "1, 1, 3\n2, 2, 3\n3, 3\n4, 1\n4, 3\n"
+R20_ELASTIC = "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
+
+
+def ccx_rejects_deck(kind):
+    """Decks of cards ccx 2.23 stopped or crashed on as the converter wrote them (code review
+    2, R20).  rigid: a *RIGID BODY with ELSET and TIE NSET; kinematic: a face coupled on DOF 3
+    alone, then a step with *BOUNDARY, OP=NEW; visco: *VISCO without CETOL; faces: a pressure
+    on a *SURFACE line without a face label (two stacked cubes); dofs (dofs_ref): BCs on DOFs
+    1-30 (1-3); plies: a *SOLID SECTION, COMPOSITE of two equal orthotropic plies on a turned
+    orientation; ori_degenerate / ori_offset: an isotropic section on an orientation without
+    axes."""
+    if kind == "rigid":
+        return (R20_CUBE + "*Node\n9, 0., 0., 2.\n10, 1., 0., 2.\n11, 1., 1., 2.\n12, 0., 1., 2.\n"
+                "13, 0., 0., 3.\n14, 1., 0., 3.\n15, 1., 1., 3.\n16, 0., 1., 3.\n100, 0.5, 0.5, 4.\n"
+                "*Element, type=C3D8, elset=E2\n2, 9, 10, 11, 12, 13, 14, 15, 16\n*Nset, nset=E2N\n"
+                "9, 10, 11, 12, 13, 14, 15, 16\n" + R20_ELASTIC +
+                "*Solid Section, elset=E2, material=M\n*Rigid Body, ref node=100, elset=E2, tie nset=TOP\n"
+                "*Boundary\nBOT, 1, 3\n*Step\n*Static\n*Cload\n100, 3, 10.\n*Node Print, nset=TOP\nU\n"
+                "*Node Print, nset=E2N\nU\n*End Step\n")
+    if kind == "kinematic":
+        return (R20_CUBE + "*Node\n100, 0.5, 0.5, 1.\n*Nset, nset=RP\n100\n*Surface, type=NODE, "
+                "name=TS\nTOP\n" + R20_ELASTIC + "*Coupling, ref node=100, surface=TS, constraint "
+                "name=C\n*Kinematic\n3, 3\n*Boundary\n" + R20_HOLD + "*Step\n*Static\n*Cload\n"
+                "100, 3, 1.\n*Node Print\nU\n*End Step\n*Step\n*Static\n*Boundary, op=NEW\n" + R20_HOLD +
+                "*Cload\n100, 3, 2.\n*Node Print\nU\n*End Step\n")
+    if kind == "visco":
+        return (R20_CUBE + "*Material, name=M\n*Elastic\n210000., 0.3\n*Creep, law=TIME\n1e-6, 1., 0.\n"
+                "*Solid Section, elset=EALL, material=M\n*Boundary\n" + R20_HOLD +
+                "*Step, amplitude=STEP\n*Visco\n0.1, 1.\n*Cload\nTOP, 3, 100.\n*Node Print, nset=TOP\nU\n"
+                "*End Step\n")
+    if kind == "faces":
+        return (R20_CUBE + "*Node\n9, 0., 0., 2.\n10, 1., 0., 2.\n11, 1., 1., 2.\n12, 0., 1., 2.\n"
+                "*Element, type=C3D8, elset=EALL\n2, 5, 6, 7, 8, 9, 10, 11, 12\n*Surface, name=OUT\n"
+                "EALL\n" + R20_ELASTIC + "*Boundary\n" + R20_HOLD +
+                "*Step\n*Static\n*Dsload\nOUT, P, 10.\n*Node Print, nset=ALLN\nU\n*End Step\n"
+                ).replace("*Surface", "*Nset, nset=ALLN, generate\n1, 12, 1\n*Surface")
+    if kind in ("dofs", "dofs_ref"):
+        return (R20_CUBE + R20_ELASTIC + "*Boundary\nBOT, 1, " + ("30" if kind == "dofs" else "3") +
+                "\n*Step\n*Static\n*Cload\n7, 3, 1.\n*Node Print, nset=TOP\nU\n*End Step\n")
+    if kind == "plies":
+        return (R20_CUBE + "*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 50., 0., "
+                "0., 0., 5., 5.,\n5.\n*Orientation, name=OR1\n1., 0., 0., 0., 0., 1.\n*Solid Section, "
+                "elset=EALL, composite, orientation=OR1, stack direction=3\n0.5, 2, M, OR1\n0.5, 2, M, OR1\n"
+                "*Boundary\n" + R20_HOLD +
+                "*Step\n*Static\n*Cload\nTOP, 3, 0.25\n*Node Print, nset=TOP\nU\n*End Step\n")
+    ori = ("*Orientation, name=OR1\n1., 0., 0.\n" if kind == "ori_degenerate" else
+           "*Orientation, name=OR1, definition=OFFSET TO NODES\n1, 2\n")
+    return (R20_CUBE + ori + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, "
+            "material=M, orientation=OR1\n*Boundary\n" + R20_HOLD + "*Step\n*Static\n*Cload\nTOP, 3, "
+            "2.5\n*El Print, elset=EALL\nS\n*Node Print, nset=TOP\nU\n*End Step\n")
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -8533,6 +8603,123 @@ def main():
               f"cube heated 20 -> 120 strains alpha dT, u = 1e-3 x ({err:.1e} apart, corner u_x "
               f"{u[7][0]:.6e})")
     failures += 0 if ok else 1
+
+    # --- cards ccx 2.23 stopped or crashed on as they were written (code review 2, R20) ---
+    def r20_run(tag, kind):
+        """The .dat path of ccx_rejects_deck(kind) converted and solved, with no reduced
+        physics (the directory is removed at the end of the block), or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(ccx_rejects_deck(kind))
+        _rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        r20_dirs.append(d)
+        if status != "solved" or conv.reduced_physics:
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if status != "solved" else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return os.path.join(d, "job.dat")
+
+    r20_dirs = []
+    dat = r20_run("r20_rigid_elset_tie", "rigid")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        want = 10. * 1.3 * 0.4 / (1000. * 0.7)          # uniaxial strain: sigma (1+nu)(1-2nu) / E (1-nu)
+        err = max(abs(u[n][2] / want - 1) for n in range(5, 17))
+        side = max(abs(x) for n in range(5, 17) for x in u[n][:2])
+        ok = len(u) == 12 and err < 1e-6 and side < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  r20_rigid_elset_tie (*RIGID BODY, ELSET=E2, TIE NSET=TOP "
+              f"on a clamped C3D8, ccx stopped: 'either NSET or ELSET'): the TOP and E2 nodes moved "
+              f"u_z = {u.get(16, [0, 0, 0])[2]:.7g} vs uniaxial strain {want:.7g} ({err:.1e} apart)")
+    failures += 0 if ok else 1
+
+    dat = r20_run("r20_kinematic_dof3", "kinematic")
+    ok = dat is not None
+    if ok:
+        steps = [b for b in dat_node_blocks(dat)]
+        err = 0.0
+        for f, blk in zip((1.0, 2.0), steps):
+            want = {n: (-0.3e-3 * f * x, -0.3e-3 * f * y, 1e-3 * f * z) for n, (x, y, z) in
+                    {1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 1, 0), 4: (0, 1, 0), 5: (0, 0, 1), 6: (1, 0, 1),
+                     7: (1, 1, 1), 8: (0, 1, 1)}.items()}
+            err = max([err] + [abs(blk[n][i] - want[n][i]) / 1e-3 for n in want for i in range(3)])
+        ok = len(steps) == 2 and err < 1e-6 and abs(steps[1][100][2] - 2e-3) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  r20_kinematic_dof3 (*COUPLING, *KINEMATIC '3, 3' of a "
+              f"C3D8 top face, ccx exited 255; then a step with *BOUNDARY, OP=NEW): uniaxial stress "
+              f"u = (-nu x, -nu y, z) F / E A in both steps ({err:.1e} of F / E A off), reference "
+              f"node u_z = {steps[1][100][2] if len(steps) > 1 else math.nan:.6g} in step 2")
+    failures += 0 if ok else 1
+
+    dat = r20_run("r20_visco_fixed_increments", "visco")
+    ok = dat is not None
+    if ok:
+        frames = [(t, {int(r[0]): r[1:] for r in rows}) for _, title, _, t, rows in A.dat_blocks(dat)
+                  if title.startswith("displacements")]
+        err = max([abs(u[7][2] / (400. / 210000. + 1e-6 * 400. * t) - 1) for t, u in frames] or [math.inf])
+        times = [round(t, 9) for t, _ in frames]
+        ok = times == [round(0.1 * k, 9) for k in range(1, 11)] and err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  r20_visco_fixed_increments (*VISCO without CETOL, creep "
+              f"rate A q, ccx stopped: 'no strictly positive value for CETOL'): {len(frames)} fixed "
+              f"increments of 0.1 as Abaqus takes them, u_z = sigma / E + A sigma t at each "
+              f"({err:.1e} apart)")
+    failures += 0 if ok else 1
+
+    dat = r20_run("r20_surface_free_faces", "faces")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        eps = -10. * 0.4 / 1000.                            # hydrostatic: -p (1 - 2 nu) / E
+        xyz = {1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 1, 0), 4: (0, 1, 0)}
+        xyz.update({n + 4 * k: (x, y, z + k) for k in (1, 2) for n, (x, y, z) in list(xyz.items())[:4]})
+        err = max(abs(u[n][i] - eps * xyz[n][i]) / abs(eps) for n in xyz for i in range(3))
+        ok = len(u) == 12 and err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  r20_surface_free_faces (pressure on a *SURFACE line "
+              f"without a face label on two stacked C3D8, ccx stopped on it): the exterior faces, "
+              f"hydrostatic u = -p (1 - 2 nu) x / E ({err:.1e} of it off)")
+    failures += 0 if ok else 1
+
+    runs = [r20_run("r20_boundary_dofs" + t, k) for t, k in (("", "dofs"), ("_ref", "dofs_ref"))]
+    ok = all(runs)
+    if ok:
+        got, ref = dat_displacements(runs[0]), dat_displacements(runs[1])
+        err = max(abs(a - b) for n in ref for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        moved = max(abs(x) for v in ref.values() for x in v)
+        ok = len(got) == 4 and err < 1e-12 and moved > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  r20_boundary_dofs (*BOUNDARY BOT, 1, 30 on a C3D8, ccx "
+              f"stopped: 'unknown DOF: 10'): as BOT, 1, 3 ({err:.1e} apart, top moved {moved:.3g})")
+    failures += 0 if ok else 1
+
+    dat = r20_run("r20_solid_composite_plies", "plies")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        uz = [u[n][2] for n in (5, 6, 7, 8)]                # local 2 along global z: 1 / E2
+        ok = len(u) == 4 and max(abs(x / 0.1 - 1) for x in uz) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  r20_solid_composite_plies (*SOLID SECTION, COMPOSITE of two "
+              f"equal orthotropic plies on an orientation turned 90 deg about x, ccx stopped: "
+              f"'nonexistent material'): u_z = {uz[0]:.7g} vs sigma / E2 = 0.1 (1 / E3 = 0.02)")
+    failures += 0 if ok else 1
+
+    for kind, what in (("ori_degenerate", "'1., 0., 0.' (no b): stresses NaN"),
+                       ("ori_offset", "DEFINITION=OFFSET TO NODES: commented out, ccx stopped")):
+        dat = r20_run(f"r20_{kind}", kind)
+        ok = dat is not None
+        if ok:
+            # (ccx writes the orientation's name after each stress row)
+            rows = [[float(x) for x in ln.split()[2:8]] for ln in open(dat, encoding="utf-8")
+                    if re.match(r"\s+1\s+\d\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+OR1", ln)]
+            s = [sum(r[k] for r in rows) / len(rows) for k in range(6)] if len(rows) == 8 else [math.nan] * 6
+            uz = dat_displacements(dat).get(7, [0, 0, math.nan])[2]
+            ok = abs(s[2] / 10. - 1) < 1e-6 and max(abs(x) for x in s[:2] + s[3:]) < 1e-9 and \
+                abs(uz / 1e-2 - 1) < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  r20_{kind} (isotropic C3D8 on an *ORIENTATION "
+                  f"{what}): written as the global axes, S33 = {s[2]:.7g} vs 10, u_z = {uz:.7g} "
+                  f"vs 0.01")
+        failures += 0 if ok else 1
+    for d in r20_dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
