@@ -89,8 +89,12 @@ step), a coupling's INFLUENCE
 RADIUS against the coupling on the nodes within it, rotations coupled in an ORIENTATION's
 axes against the model turned into them, and *DLOAD BX / BY / BZ on shells (a strip against
 its C3D8 twin and the GRAV and pressure forms, also over steps; the Scordelis-Lo roof against
-its published deflection), and loads ccx keys otherwise than Abaqus (nodal forces on a step-time
-amplitude over steps, gravity per set and direction) against the plain loads Abaqus applies.
+its published deflection), loads ccx keys otherwise than Abaqus (nodal forces on a step-time
+amplitude over steps, gravity per set and direction) against the plain loads Abaqus applies,
+and rigid-body reference nodes: a shell REF NODE with a *TRANSFORM in a dynamic step against
+the deck without it, the reaction at a REF NODE on an element outside the body against a free
+one, a BEAM connector driven at node b against a hand-written *RIGID BODY, and an initial spin
+against the rigid rotation.
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -3638,6 +3642,83 @@ def lc2_planar_deck(lc2=True, n=10):
             "*BOUNDARY, OP=NEW, LOAD CASE=1\n1, 1, 2\n1, 6, 6\n" +
             ("*BOUNDARY, OP=NEW, LOAD CASE=2\n1, ENCASTRE\n" if lc2 else "") +
             f"*CLOAD\n{n + 1}, 2, -1.\n*END STEP\n")
+
+
+# a unit cube of C3D8 (E 1000, nu 0.3), its bottom held, for the rigid reference node checks
+RIGID_REF_CUBE = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+                  "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=E\n"
+                  "1, 1, 2, 3, 4, 5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n*MATERIAL, NAME=M\n*ELASTIC\n"
+                  "1000., 0.3\n*DENSITY\n1e-3\n*SOLID SECTION, ELSET=E, MATERIAL=M\n")
+
+
+def free_ref_transform_deck(transform=True):
+    """Two S4 shells (E 1000, t 0.1, density 1e-3), the first clamped on its left edge, the
+    second a *RIGID BODY, PIN NSET=BODY whose REF NODE is its shell node 2 (in BODY); one
+    *DYNAMIC step with an initial velocity 0.1 along x, a load 1 along z and DOF 6 held at the
+    reference node.  ``transform``: node 2 has a *TRANSFORM turned 90 degrees about z, which
+    leaves DOFs 3 and 6 (the only ones named) and the initial velocity (global in Abaqus) as
+    they are — the same model as without it."""
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 2., 0., 0.\n"
+            "6, 2., 1., 0.\n*ELEMENT, TYPE=S4, ELSET=SH\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*NSET, NSET=RPS\n2\n"
+            "*NSET, NSET=BODY\n2, 3, 5, 6\n*NSET, NSET=OUT\n3, 5, 6\n*NSET, NSET=CL\n1, 4\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1e-3\n*SHELL SECTION, ELSET=SH, "
+            "MATERIAL=M\n0.1\n*RIGID BODY, REF NODE=RPS, PIN NSET=BODY\n" +
+            ("*TRANSFORM, NSET=RPS\n0., 1., 0., -1., 0., 0.\n" if transform else "") +
+            "*INITIAL CONDITIONS, TYPE=VELOCITY\nRPS, 1, 0.1\n*STEP\n*DYNAMIC\n0.01, 0.1\n*BOUNDARY\n"
+            "CL, 1, 6\nRPS, 6, 6\n*CLOAD\nRPS, 3, 1.\n*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
+
+
+def rigid_ref_rf_deck(case):
+    """RIGID_REF_CUBE pushed down 0.01 by the BC on a rigid body's reference node over its top
+    face, RF printed at the reference node (set PR) and in total at the bottom (set BOT):
+    "cap", an R3D4 on the top face, REF NODE its node 8; "cap_free", the same with a free REF
+    NODE 9 at node 8's place; "mesh", TIE NSET of top nodes 5-7, REF NODE the cube's node 8;
+    "nset", TIE NSET of all four, a free REF NODE 9 at node 8's place."""
+    body = {"cap": "*ELEMENT, TYPE=R3D4, ELSET=RIG\n2, 5, 6, 7, 8\n*RIGID BODY, REF NODE=8, ELSET=RIG\n",
+            "cap_free": "*ELEMENT, TYPE=R3D4, ELSET=RIG\n2, 5, 6, 7, 8\n*RIGID BODY, REF NODE=9, ELSET=RIG\n",
+            "mesh": "*NSET, NSET=T\n5, 6, 7\n*RIGID BODY, REF NODE=8, TIE NSET=T\n",
+            "nset": "*NSET, NSET=T\n5, 6, 7, 8\n*RIGID BODY, REF NODE=9, TIE NSET=T\n"}[case]
+    ref = 8 if case in ("cap", "mesh") else 9
+    return (RIGID_REF_CUBE + "*NODE\n9, 0., 1., 1.\n" + body + f"*NSET, NSET=PR\n{ref}\n*STEP\n*STATIC\n"
+            f"*BOUNDARY\nBOT, 1, 3\n{ref}, 1, 2\n{ref}, 4, 6\n{ref}, 3, 3, -0.01\n*NODE PRINT, NSET=PR, "
+            "TOTALS=YES\nRF\n*NODE PRINT, NSET=BOT, TOTALS=ONLY\nRF\n*END STEP\n")
+
+
+def connector_beam_bc_deck(form, proc="dynamic"):
+    """Two C3D8 cubes along x (E 1000, nu 0.3), their left face held, and node 200 off their
+    right end driven by BCs on all six DOFs (u = (0.05, 0.02, 0), a rotation 0.1 about z) that
+    reach the bar's node 9 through a rigid link: "conn_ab", a BEAM connector from node 9 (a) to
+    node 200 (b); "conn_ba", the connector the other way; "rigid", a hand-written *RIGID BODY
+    on node 200 with node 9 in its TIE NSET.  ``proc``: "dynamic" (0.1), "static", or "inert"
+    (static, the material with a *PLASTIC that never yields: the linear rigid equations)."""
+    link = {"conn_ab": "*ELEMENT, TYPE=CONN3D2, ELSET=CE\n900, 9, 200\n*CONNECTOR SECTION, ELSET=CE\nBEAM,\n",
+            "conn_ba": "*ELEMENT, TYPE=CONN3D2, ELSET=CE\n900, 200, 9\n*CONNECTOR SECTION, ELSET=CE\nBEAM,\n",
+            "rigid": "*NSET, NSET=B\n9\n*RIGID BODY, REF NODE=200, TIE NSET=B\n"}[form]
+    step = {"dynamic": "*DYNAMIC\n0.01, 0.1\n"}.get(proc, "*STATIC\n1., 1.\n")
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+            "6, 2., 1., 0.\n7, 0., 0., 1.\n8, 1., 0., 1.\n9, 2., 0., 1.\n10, 0., 1., 1.\n11, 1., 1., 1.\n"
+            "12, 2., 1., 1.\n200, 3., 0.5, 0.5\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1, 2, 5, 4, 7, 8, 11, 10\n"
+            "2, 2, 3, 6, 5, 8, 9, 12, 11\n*NSET, NSET=LEFT\n1, 4, 7, 10\n*NSET, NSET=OUT\n9, 12\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1e-3\n" +
+            ("*PLASTIC\n1e9, 0.\n2e9, 1.\n" if proc == "inert" else "") +
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n" + link + "*BOUNDARY\nLEFT, 1, 3\n*STEP\n" + step +
+            "*BOUNDARY\n200, 1, 1, 0.05\n200, 2, 2, 0.02\n200, 3, 5, 0.\n200, 6, 6, 0.1\n"
+            "*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
+
+
+def rigid_spin_deck(nlgeom=False, transform=False, w=(0.6, 0.0, 0.8)):
+    """A free unit cube of C3D8, all its nodes the TIE NSET of a *RIGID BODY whose REF NODE 100
+    is its centre, spun by an initial angular velocity ``w`` (|w| = 1) on DOFs 4-6 of node
+    100; one *DYNAMIC step of time 0.01.  The cube's inertia is the same about every axis
+    through its centre, so it turns about ``w`` at the constant rate.  ``transform``: node 100
+    has a *TRANSFORM (Abaqus reads initial velocities in global axes regardless)."""
+    lines = "".join(f"100, {k + 4}, {x}\n" for k, x in enumerate(w) if x)
+    return (RIGID_REF_CUBE + "*NODE\n100, 0.5, 0.5, 0.5\n*NSET, NSET=ALLC, GENERATE\n1, 8, 1\n"
+            "*RIGID BODY, REF NODE=100, TIE NSET=ALLC\n" +
+            ("*NSET, NSET=R\n100\n*TRANSFORM, NSET=R\n0.8, 0.6, 0., -0.6, 0.8, 0.\n" if transform else "") +
+            "*INITIAL CONDITIONS, TYPE=VELOCITY\n" + lines +
+            f"*STEP{', NLGEOM' if nlgeom else ''}\n*DYNAMIC\n0.001, 0.01\n*NODE PRINT, NSET=ALLC\nU\n"
+            "*END STEP\n")
 
 
 def after_pert_model(plastic=False):
@@ -12345,6 +12426,97 @@ def main():
                   f"tip ux per step {', '.join(f'{x:.6g}' for x in ux)} vs {', '.join(f'{x:g}' for x in want)}"
                   + (f"; uz {p_uz:.6g} vs the pressure's 0.02404" if name == "amplitude" and p_uz else ""))
             failures += 0 if ok else 1
+
+    # --- rigid-body reference nodes (task 115) -------------------------------------------
+    # a shell REF NODE with a *TRANSFORM in its PIN NSET, *DYNAMIC: the free reference node
+    # takes the *TRANSFORM, the shell node's rotation is tied to the ROT NODE (in its axes).
+    # With the axes kept on the shell node its drilling rotation stayed free and massless, and
+    # ccx stopped ('increment size smaller than minimum'); against the deck without the
+    # *TRANSFORM, which names only DOFs it leaves as they are
+    runs = [review_run(free_ref_transform_deck(tr), "free_ref_transform_dynamic" + ("" if tr else "_ref"),
+                       dat_node_blocks) for tr in (True, False)]
+    ok = all(runs) and len(runs[0]) == len(runs[1])
+    if ok:
+        err, moved = same(runs)
+        ok = err < 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  free_ref_transform_dynamic (S4 body, REF NODE its shell node "
+              f"2 with a *TRANSFORM, *DYNAMIC): body nodes as without the *TRANSFORM ({err:.1e} apart; "
+              f"largest |u| {moved:.6g}; before: ccx stopped)")
+    elif all(runs):
+        print(f"FAIL  free_ref_transform_dynamic: {len(runs[0])}, {len(runs[1])} printed blocks")
+    failures += 0 if ok else 1
+
+    # RF at a REF NODE on an element outside the body (an R3D4's node, the deformable cube's):
+    # the body's reaction, as at a free REF NODE (the NSET twin) and the bottom's total, where
+    # ccx printed the node's element forces (-3.37 for 13.46)
+    twin = review_run(rigid_ref_rf_deck("nset"), "rigid_ref_rf_nset", dat_totals)
+    for case, ref_case in (("cap", "cap_free"), ("mesh", None)):
+        got = review_run(rigid_ref_rf_deck(case), f"rigid_ref_rf_{case}", dat_totals)
+        ref = review_run(rigid_ref_rf_deck(ref_case), f"rigid_ref_rf_{ref_case}", dat_totals) \
+            if ref_case else twin
+        ok = bool(got and ref and twin) and len(got) == len(ref) == 2
+        if ok:
+            rf, base, want = got[0][2], got[1][2], ref[0][2]
+            err = max(abs(ccx_ratio(rf, want) - 1), abs(ccx_ratio(-rf, base) - 1),
+                      abs(ccx_ratio(want, twin[0][2]) - 1))
+            ok = err < 1e-9 and abs(base) > 1.0
+            print(f"{'PASS' if ok else 'FAIL'}  rigid_ref_rf_{case} (cube pushed 0.01 by the BC on the REF "
+                  f"NODE, {'node 8 of an R3D4 cap' if case == 'cap' else 'its node 8, TIE NSET 5-7'}): RF "
+                  f"{rf:.7g} vs {want:.7g} at a free REF NODE, the NSET twin's {twin[0][2]:.7g} and the "
+                  f"bottom's total {base:.7g} ({err:.1e} apart)")
+        failures += 0 if ok else 1
+
+    # a BEAM connector whose node b carries the BCs: the body is rooted there.  R2's member rule
+    # took node b's translations off as an *MPC BEAM dependent's (ccx exit 255; the RIGID MPC
+    # form stopped too: 'dependent side of a MPC and a SPC'); against the hand-written *RIGID
+    # BODY on node b and the linear rigid motion of node 9, (0.1, -0.08, 0)
+    for proc in ("dynamic", "inert", "static"):
+        runs = [review_run(connector_beam_bc_deck(form, proc), f"connector_beam_bc_{form}_{proc}",
+                           dat_displacements) for form in ("conn_ab", "conn_ba", "rigid")]
+        ok = all(runs)
+        if ok:
+            u = [r.get(9, [math.nan] * 3) for r in runs]
+            far = [r.get(12, [math.nan] * 3) for r in runs]
+            err = max(abs(a - b) for i in (0, 1) for pair in ((u[i], u[2]), (far[i], far[2]))
+                      for a, b in zip(*pair))
+            lin = max(abs(a - b) for a, b in zip(u[0], (0.1, -0.08, 0.0)))
+            ok = err < 1e-9 and lin < 1e-9 and abs(far[0][0]) > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  connector_beam_bc_on_b ({proc}; BEAM 9 -> 200, node 200 "
+                  f"driven): node 9 at ({', '.join(f'{x:.7g}' for x in u[0])}) as with the connector "
+                  f"reversed and the hand-written *RIGID BODY ({err:.1e} apart; linear rigid motion "
+                  f"(0.1, -0.08, 0), {lin:.1e} off), bar node 12 at ux {far[0][0]:.6g}")
+        failures += 0 if ok else 1
+
+    # an initial angular velocity on a rigid body's REF NODE: on its ROT NODE's DOFs 1-3 (ccx
+    # wrote DOF 6 of node 100 into DOF 2 of the next node, so the body spun about y or stood);
+    # the corners against the rigid rotation about w = (0.6, 0, 0.8) by 0.01: theta x r
+    # linear, R(theta) r - r under NLGEOM (also with a *TRANSFORM on the REF NODE)
+    w = (0.6, 0.0, 0.8)
+    for nl, tr in ((False, False), (True, False), (True, True)):
+        tag = "rigid_initial_spin" + ("_nlgeom" if nl else "") + ("_transform" if tr else "")
+        got = review_run(rigid_spin_deck(nl, tr, w), tag, dat_displacements)
+        ok = bool(got) and all(n in got for n in range(1, 9))
+        if ok:
+            t = 0.01
+            worst = 0.0
+            for n, x in enumerate(((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+                                   (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)), start=1):
+                r = [c - 0.5 for c in x]
+                wr = [w[1] * r[2] - w[2] * r[1], w[2] * r[0] - w[0] * r[2], w[0] * r[1] - w[1] * r[0]]
+                if nl:            # Rodrigues: r cos + (w x r) sin + w (w . r)(1 - cos), |w| = 1
+                    wd = sum(a * b for a, b in zip(w, r))
+                    want = [r[k] * math.cos(t) + wr[k] * math.sin(t) + w[k] * wd * (1 - math.cos(t)) - r[k]
+                            for k in range(3)]
+                else:
+                    want = [c * t for c in wr]
+                worst = max(worst, max(abs(a - b) for a, b in zip(got[n], want)))
+            tol = 1e-4 if nl else 1e-9
+            ok = worst < tol * 0.005
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (free rigid cube, REF NODE 100 at its centre, "
+                  f"initial angular velocity (0.6, 0, 0.8)): corners {worst:.1e} off the rigid rotation "
+                  f"by 0.01 ({'R(theta) r - r' if nl else 'theta x r'}; corner 2 at "
+                  f"({', '.join(f'{x:.6g}' for x in got[2])}))")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

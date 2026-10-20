@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **Rigid-body reference nodes** — a shell `REF NODE` with a `*TRANSFORM` in its own body kept
+  the axes after the free reference node took its place, so its drilling rotation stayed free in
+  a `*DYNAMIC` step and ccx stopped; the free node now takes the `*TRANSFORM`, and the shell
+  node's rotation is tied to the body. A `REF NODE` on an element outside the body (a rigid
+  element's node, the deformable mesh, a spring) printed that element's forces as its reaction
+  force; it now gets a free reference node too. A BEAM / WELD connector whose node b carries
+  the BCs lost them (ccx exit 255): its rigid body is now rooted at the node with the most BCs,
+  and the other node's BCs follow the `*RIGID BODY` rules, not the `*MPC BEAM` ones. An initial
+  angular velocity on a rigid body's reference node landed on another node's DOFs (the body
+  stood or spun about another axis); it now goes to the ROT NODE, and initial rotation values
+  ccx cannot take elsewhere are dropped with a warning.
 * **Nodes whose rotation two features use** — a distributing coupling whose reference node
   another coupling also uses (two parts joined at one reference point) tied no rotation, so
   ccx solved a mechanism (1e13) without a warning. Its rotation rows now go on a ROT NODE the

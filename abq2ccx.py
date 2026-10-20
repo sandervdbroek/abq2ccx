@@ -6838,8 +6838,8 @@ class Converter:
         self._bc_subsets: Dict[Tuple[int, ...], str] = {}  # remaining nodes of a split line -> set
         # id(*BOUNDARY) -> reference node -> DOF -> value: rigid-body member BCs moved there
         self._bc_add: Dict[int, "OrderedDict[int, Dict[int, float]]"] = {}
-        # (node, dof, ref, why inexact, the body is linear *EQUATIONs)
-        self._rb_moved: List[Tuple[int, int, int, frozenset, bool]] = []
+        # (node, dof, ref, why inexact, the body is linear *EQUATIONs, a body of connectors)
+        self._rb_moved: List[Tuple[int, int, int, frozenset, bool, bool]] = []
         # (kind, emit, node, dof, ref, why) left in place; why: '' or, on a *RIGID BODY,
         # 'differ', 'conflict', 'kind' or 'approx:<reasons>' (see _plan_rigid_body_move)
         self._coupled_clash: List[Tuple[str, str, int, int, int, str]] = []
@@ -21355,6 +21355,10 @@ class Converter:
                              f"node without an initial temperature.", once=True)
             return [emit_keyword("INITIAL CONDITIONS", b.params), f"{ALL_NODES_SET}, 0."] + \
                 list(b.data) + midside
+        if layout == "dof":
+            turned = self._ic_rotation_lines(b, typ, midside)
+            if turned is not None:
+                return turned
         if typ not in ("STRESS", "PLASTIC STRAIN", "SOLUTION"):
             return self.passthrough(b) + midside
         if b.has("GEOSTATIC"):
@@ -21451,6 +21455,58 @@ class Converter:
         if len(out) == 1:
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} had no expandable records.")
         return out
+
+    def _ic_rotation_lines(self, b: Block, typ: str, extra: List[str]) -> Optional[List[str]]:
+        """*INITIAL CONDITIONS, TYPE=VELOCITY / DISPLACEMENT ``b`` (and the ``extra`` lines the
+        converter adds to it) with the lines on DOFs 4-6 rewritten, or None when it has none.
+        ccx 2.23 takes no such value at a node: it ignores it on a shell/beam node, a knot too,
+        and writes it into another node's DOFs in a model without rotations (DOF 6 of node n
+        into DOF 2 of the next one; probed).  It carries a rigid body's rotation, and that of
+        the converter's other rotation nodes, on DOFs 1-3 of its ROT NODE (_rb_rot), and reads
+        initial values there in global axes, as Abaqus does at any node ('in the global
+        directions, regardless of the use of the TRANSFORM option', Keywords Reference; ccx
+        probed) — so a value on such a node goes to that DOF of its ROT NODE (probed: the body
+        spins about that axis).  The original node of a free reference node (_free_refs, a
+        member now) leaves its value to the new one; any other node's is dropped, warned where
+        the node has rotations in Abaqus."""
+        lines = [", ".join(trimmed_fields(r)) for r in merged_data_records(b) if any(r)] + list(extra)
+        out: List[str] = []
+        moved: List[int] = []
+        lost: List[int] = []
+        hit = False
+        for ln in lines:
+            g = [x.strip() for x in ln.split(",")]
+            if len(g) < 2 or not g[0] or not re.fullmatch(r"[-+]?\d+", g[1]) or not 4 <= int(g[1]) <= 6:
+                out.append(ln)
+                continue
+            hit = True
+            k = int(g[1]) - 3
+            for n in self._resolve_nodes(g[0]):
+                if n in self._rb_rot:
+                    out.append(", ".join([str(self._rb_rot[n]), str(k)] + g[2:]))
+                    moved.append(n)
+                elif n not in self._free_refs:
+                    lost.append(n)
+        if not hit:
+            return None
+        if moved:
+            self.report.note(f"*INITIAL CONDITIONS, TYPE={typ} on DOFs 4-6 of a rigid body's reference "
+                             f"point moved to DOFs 1-3 of its ROT NODE, which carries the body's "
+                             f"rotation (both read in global axes).", once=True)
+        spun = [n for n in dedup(lost) if n in self._rot_nodes or n in self._ref_nodes]
+        if lost:
+            (self.report.warn if spun else self.report.note)(
+                f"*INITIAL CONDITIONS, TYPE={typ} on DOFs 4-6 of {len(set(lost))} node(s) "
+                f"(e.g. node {(spun or lost)[0]}) dropped: ccx 2.23 takes no initial rotation value "
+                f"at a node (it ignores it on a shell/beam node or knot, and writes it into another "
+                f"node's DOFs in a model without rotations; probed)"
+                + (" — the rotation starts at rest." if spun else
+                   " — the node has no rotations (Abaqus ignores the value too)."), once=True)
+            if spun:
+                self._reduces(f"*INITIAL CONDITIONS, TYPE={typ} on rotations dropped")
+        return [emit_keyword("INITIAL CONDITIONS", b.params)] + out if out else \
+            self._commented(b, f"*INITIAL CONDITIONS, TYPE={typ}: every line is on DOFs 4-6 of nodes "
+                               f"ccx gives no initial rotation (see the report).", reduces=False)
 
     def handle_temperature(self, b: Block) -> List[str]:
         """``*TEMPERATURE`` passes through; the midside nodes of upgraded 2-node beams get the
@@ -28395,9 +28451,22 @@ class Converter:
         groups: "OrderedDict[int, List[int]]" = OrderedDict()
         for dep in parent:                     # deck order, so a body's first member is its
             groups.setdefault(root(dep), []).append(dep)        # first line
+        # a body of rigid connectors alone ("conn"): a connector is an element, so Abaqus
+        # applies a BC on either of its nodes (it eliminates none, unlike *MPC BEAM), and the
+        # body, the same about any of its nodes, is rooted at the one with the most BC'd DOFs
+        # (the others' BCs are then most likely implied: _plan_coupled_bcs)
+        secs = {sec for _a, _c, sec in self._conn_beam}
+        held: Dict[int, int] = {}
+        for n, _d in self._conn_bc_dofs:
+            held[n] = held.get(n, 0) + 1
         for ref, members in groups.items():
-            self._mpc_bodies.setdefault(anchor[members[0]], []).append(
-                {"ref": ref, "members": members, "rot": None})
+            body = {"ref": ref, "members": members, "rot": None}
+            if all(anchor[m] in secs for m in members):
+                body["conn"] = True
+                new = max([ref] + members, key=lambda n: held.get(n, 0))
+                if new != ref:
+                    body["ref"], body["members"] = new, [ref] + [m for m in members if m != new]
+            self._mpc_bodies.setdefault(anchor[members[0]], []).append(body)
 
     def _link_mode(self, pairs: Sequence[Tuple[int, int]], what: str) -> Tuple[str, object]:
         """How a constant-distance constraint between node pairs (dependent, independent) —
@@ -29634,22 +29703,26 @@ class Converter:
     _REF_POINT_CARDS = ("BOUNDARY", "CLOAD", "NODE PRINT", "NODE FILE", "NODE OUTPUT", "TRANSFORM")
 
     def _plan_free_ref_nodes(self, blocks: List[Block]) -> None:
-        """A *RIGID BODY whose REF NODE is one of its own nodes (in its NSET, or a node of
-        its ELSET's elements) gets a new free node at the same place as its REF NODE in ccx.
-        ccx 2.23 prints the reaction force at a reference node that belongs to an element as
-        the forces of that node's own elements alone (resultsforc.c adds the body's MPC
-        forces back onto every node of an element) — about 1e-15 for a rigid set of
-        elements, although the body is loaded and the rest of the solution is right; at a
-        free reference node it is the body's reaction.  Probed: a block pushed through
-        node-to-surface contact gives RF -10.6, the supports' total, at a free reference
-        node and 1e-15 at one of the block's nodes (NSET and ELSET form; NLGEOM and linear,
-        where the body is written as linear equations).
+        """A *RIGID BODY whose REF NODE belongs to an element gets a new free node at the same
+        place as its REF NODE in ccx.  ccx 2.23 prints the reaction force at a reference node
+        that belongs to an element as the forces of that node's own elements alone
+        (resultsforc.c adds the body's MPC forces back onto every node of an element) — about
+        1e-15 for a rigid set of elements, although the body is loaded and the rest of the
+        solution is right; at a free reference node it is the body's reaction.  Probed: a
+        block pushed through node-to-surface contact gives RF -10.6, the supports' total, at a
+        free reference node and 1e-15 at one of the block's nodes (NSET and ELSET form; NLGEOM
+        and linear, where the body is written as linear equations); a reference node on the
+        deformable mesh, on a rigid element's skin, a spring, dashpot or truss gets those
+        elements' forces alone too, one with a MASS element the body's (probed).  So: a body
+        member of any element (cf7249b), or a node of any element but a MASS.
 
-        The original node stays a member of the body, where it moves exactly like the new
+        The original node stays a member of the body, or joins its TIE members (Abaqus moves
+        the reference node with the body in all its DOFs), where it moves exactly like the new
         node (the same place, the same rigid motion).  The new node takes its place wherever
         the deck names it as the body's reference point — its *BOUNDARY, *CLOAD and *NODE
-        OUTPUT / PRINT / FILE, and the REF NODE of every rigid body on it — and gets its
-        *TRANSFORM (the axes those are given in), initial velocity and displacement besides
+        OUTPUT / PRINT / FILE, the REF NODE of every rigid body on it and its *TRANSFORM (the
+        axes those are given in; the original node keeps none, so its rotation is tied to the
+        ROT NODE, which carries them) — and gets its initial velocity and displacement besides
         it.  A node set that only one kind of those cards names is redefined, so the output
         keeps the deck's set name; another one is copied.  A shell/beam node in a PIN NSET
         joins the TIE members: its rotations are the body's in Abaqus.  A node that another
@@ -29657,25 +29730,37 @@ class Converter:
         body's members) keeps its role, with a warning: as a member it would be the
         dependent of two constraints.  The cards it rewrites are new Blocks, in steps too: it
         is the last planner that rewrites a step card (_read_steps reads the model after it)."""
-        attached ={n for _t, conn in self.geom.elements.values() for n in conn}
+        attached = {n for _t, conn in self.geom.elements.values() for n in conn}
+        stiff = {n for t, conn in self.geom.elements.values() if t.upper() not in ("MASS", "ROTARYI")
+                 for n in conn}
         refs: Dict[int, int] = {}                  # id(*RIGID BODY) -> its REF NODE
-        own: set = set()
+        members: Dict[int, set] = {}               # REF NODE -> the members of its bodies
         for b in blocks:
-            ref = self._ref_node(b) if b.keyword == "RIGID BODY" else None
-            if ref is None:
+            ref = self._ref_node(b) if b.keyword == "RIGID BODY" and \
+                not b.param("ANALYTICAL SURFACE") else None      # (unmeshed: commented out)
+            if ref is None or ref not in self.geom.nodes:
                 continue
             refs[id(b)] = ref
-            if ref in attached and ref in self.geom.nodes and ref in sum(self._rigid_body_members(b), []):
-                own.add(ref)
+            members.setdefault(ref, set()).update(*self._rigid_body_members(b))
+        own = {r for r, ms in members.items() if r in stiff or (r in ms and r in attached)}
         if not own:
             return
+        outside = {r for r in own if r not in members[r]}       # joins the TIE members
         busy = own & self._constraint_nodes(blocks, {i for i, r in refs.items() if r in own})
-        if busy:
-            self.report.warn(f"*RIGID BODY reference node(s) {', '.join(map(str, sorted(busy)))} "
+        if busy - outside:
+            self.report.warn(f"*RIGID BODY reference node(s) {', '.join(map(str, sorted(busy - outside)))} "
                              f"also belong to the body, and another constraint (*EQUATION, *MPC, "
                              f"coupling, *TIE, connector or rigid body) uses them too: left as they "
                              f"are, so ccx prints their reaction force as zero (ccx 2.23 shows only "
                              f"the forces of the node's own elements at a reference node that "
+                             f"belongs to an element). The solution itself is not affected.",
+                             once=True)
+        if busy & outside:
+            self.report.warn(f"*RIGID BODY reference node(s) {', '.join(map(str, sorted(busy & outside)))} "
+                             f"belong to an element outside the body, and another constraint "
+                             f"(*EQUATION, *MPC, coupling, *TIE, connector or rigid body) uses them "
+                             f"too: left as they are, so ccx prints their reaction force as that "
+                             f"element's forces alone (ccx 2.23 does so at a reference node that "
                              f"belongs to an element). The solution itself is not affected.",
                              once=True)
         types = {t: ccx_type(t) for t in {t for t, _c in self.geom.elements.values()}}
@@ -29691,24 +29776,32 @@ class Converter:
         stand = self._free_refs
         if not stand:
             return
+        # (plane rigid bodies, held in their plane at the reference node: _plan_rigid_planar_holds)
+        self._rigid_planar_refs = [stand.get(n, n) for n in self._rigid_planar_refs]
         self._reserve_names()
         joined: List[int] = []
+        entered: List[int] = []
         for i, b in enumerate(blocks):
             x = refs.get(id(b)) if b.keyword == "RIGID BODY" else None
             if x not in stand:
                 continue
             params = OrderedDict((k, str(stand[x]) if k == "REF NODE" else v) for k, v in b.params.items())
-            if x in turns and x in self._rigid_body_members(b)[1]:
+            if x in outside:
+                if x not in entered:            # (the first body on it: a member of one only)
+                    entered.append(x)
+                    self._join_tie(params, x)
+            elif x in turns and x in self._rigid_body_members(b)[1]:
                 joined.append(x)
                 self._pin_to_tie(params, x)
             blocks[i] = Block(b.keyword, params, list(b.data))
         # the node sets the reference-point cards name that hold such a node — with the new
-        # node in the original's place, or beside it for a *TRANSFORM, whose axes the original
-        # node keeps as a member, and for output of a set with other nodes too — and the names
-        # every other card uses (the mesh aside)
+        # node in the original's place (a *TRANSFORM too: the original node, a member now, keeps
+        # no axes, so its rotation can be tied to the ROT NODE, which carries them), or beside
+        # it for output of a set with other nodes too — and the names every other card uses
+        # (the mesh aside)
         def beside_of(b: Block, s: str) -> bool:
-            return b.keyword == "TRANSFORM" or (b.keyword not in ("BOUNDARY", "CLOAD") and any(
-                n not in stand for n in self.geom.nset(s)))
+            return b.keyword not in ("BOUNDARY", "CLOAD", "TRANSFORM") and any(
+                n not in stand for n in self.geom.nset(s))
         named: Dict[str, set] = {}
         other: set = set()
         for b in blocks:
@@ -29761,15 +29854,28 @@ class Converter:
                              if n in stand]
             if data != b.data or params is not b.params:
                 blocks[i] = Block(b.keyword, params, data)
-        pairs =", ".join(f"{x} -> {n}" for x, n in list(stand.items())[:3])
-        self.report.note(f"*RIGID BODY reference node(s) that belong to the body's own elements "
-                         f"(node -> new reference node: {pairs}{', ...' if len(stand) > 3 else ''}): "
-                         f"ccx 2.23 prints the reaction force there as the forces of the node's own "
-                         f"elements alone — zero for a rigid body. Each such body gets a free "
-                         f"reference node at the same place; the original node stays a member, the "
-                         f"BCs, concentrated loads and nodal output on the reference node go to the "
-                         f"new one (its reaction force is the body's, probed), which also gets its "
-                         f"*TRANSFORM and initial velocity. Exact.", once=True)
+        inner = [(x, n) for x, n in stand.items() if x not in outside]
+        if inner:
+            pairs = ", ".join(f"{x} -> {n}" for x, n in inner[:3])
+            self.report.note(f"*RIGID BODY reference node(s) that belong to the body's own elements "
+                             f"(node -> new reference node: {pairs}{', ...' if len(inner) > 3 else ''}): "
+                             f"ccx 2.23 prints the reaction force there as the forces of the node's own "
+                             f"elements alone — zero for a rigid body. Each such body gets a free "
+                             f"reference node at the same place; the original node stays a member, the "
+                             f"BCs, concentrated loads and nodal output on the reference node go to the "
+                             f"new one (its reaction force is the body's, probed), which also gets its "
+                             f"*TRANSFORM and initial velocity. Exact.", once=True)
+        if entered:
+            pairs = ", ".join(f"{x} -> {stand[x]}" for x in entered[:3])
+            self.report.note(f"*RIGID BODY reference node(s) on elements outside the body (a rigid "
+                             f"element's, the deformable mesh, a spring; node -> new reference node: "
+                             f"{pairs}{', ...' if len(entered) > 3 else ''}): ccx 2.23 prints the "
+                             f"reaction force there as those elements' forces alone. Each such body "
+                             f"gets a free reference node at the same place, which takes the BCs, "
+                             f"concentrated loads, nodal output and *TRANSFORM of the reference node "
+                             f"(its reaction force is the body's, probed), and the original node joins "
+                             f"the TIE members, as Abaqus moves the reference node with the body. "
+                             f"Exact.", once=True)
         if joined:
             self.report.note(f"*RIGID BODY: shell/beam reference node(s) "
                              f"{', '.join(map(str, joined[:3]))}{', ...' if len(joined) > 3 else ''} "
@@ -29786,6 +29892,11 @@ class Converter:
             params["PIN NSET"] = name
         else:
             del params["PIN NSET"]
+        self._join_tie(params, x)
+
+    def _join_tie(self, params: "OrderedDict[str, Optional[str]]", x: int) -> None:
+        """Add node ``x`` to the TIE NSET of *RIGID BODY parameters ``params`` (a copy of the
+        set, which other cards may use as it is; a new set if it has none)."""
         tie = params.get("TIE NSET")
         name = self._fresh_name(f"{tie}_TIE" if tie else "ABQ2CCX_RB_TIE")
         self.geom.nsets[name] = (self.geom.nset(tie) if tie else []) + [x]
@@ -30232,15 +30343,16 @@ class Converter:
         body makes it dependent).  An imposed BC on a tied rotation stays, and
         _settle_dependents drops the tie (the BC governs it).  A *RIGID BODY's other member
         BCs go where Abaqus/Standard puts them, onto the reference node
-        (_plan_rigid_body_move).  The rest is warned (_warn_coupled_clashes), or dropped where
-        Abaqus drops it — a kinematic coupling and an MPC eliminate the constrained DOFs of
-        their nodes, so Abaqus/Standard does not apply a BC there: by default where the
-        constraint is written as linear *EQUATIONs (emit 'eq', _rigid_constraints; ccx would
-        reorder them and keep the BC), else with --approximate.  A BC on a global translation
-        that a coupling's ORIENTATION axes only touch ('across') stays, warned: the coupling
-        does not hold that DOF, and which one Abaqus eliminates is not documented.  Rigid
-        constraints: *RIGID BODY, kinematic couplings and the rigid bodies of *MPC BEAM lines
-        (_plan_mpcs)."""
+        (_plan_rigid_body_move); so do those of a body of rigid connectors (exact only: a
+        connector is an element, whose nodes' BCs Abaqus applies as they are).  The rest is
+        warned (_warn_coupled_clashes), or dropped where Abaqus drops it — a kinematic coupling
+        and an MPC eliminate the constrained DOFs of their nodes, so Abaqus/Standard does not
+        apply a BC there: by default where the constraint is written as linear *EQUATIONs (emit
+        'eq', _rigid_constraints; ccx would reorder them and keep the BC), else with
+        --approximate.  A BC on a global translation that a coupling's ORIENTATION axes only
+        touch ('across') stays, warned: the coupling does not hold that DOF, and which one
+        Abaqus eliminates is not documented.  Rigid constraints: *RIGID BODY, kinematic
+        couplings and the rigid bodies of *MPC BEAM lines and rigid connectors (_plan_mpcs)."""
         cons = self._rigid_constraints(blocks)
         if not cons:
             return
@@ -30267,7 +30379,7 @@ class Converter:
                         owner.setdefault((m, d), c)
         moved: set = set()
         for c in cons:
-            if c["kind"] == "rb":
+            if c["kind"] in ("rb", "conn"):
                 moved |= self._plan_rigid_body_move(c, cards, verdict, owner)
         implied, planar3, approx, abaqus = [], 0, [], []
         eq_only = True                   # every implied BC is on a constraint of linear equations
@@ -30277,14 +30389,15 @@ class Converter:
             c = owner[(m, d)]
             # (a BC across the coupled axes of an ORIENTATION: Abaqus' handling is not known)
             across = d in c.get("across", {}).get(m, ())
-            loose = not ok and not across and c["kind"] != "rb" and (self._approx or c["emit"] == "eq")
+            loose = not ok and not across and c["kind"] not in ("rb", "conn") and \
+                (self._approx or c["emit"] == "eq")
             if not ok and not loose:
                 # a *RIGID BODY's tied rotation that _plan_rigid_body_move left: _settle_dependents
                 # reorders the tie so the body follows the member's BC, as Abaqus moves it to
                 # the reference node — warned where the BCs differ or contradict its own
                 why = ("across-stop" if d in c["stops"].get(m, ()) else "across") if across else \
                     c.get("why", {}).get(d, "")
-                if not (d > 3 and c["kind"] == "rb" and not why):
+                if not (d > 3 and c["kind"] in ("rb", "conn") and not why):
                     self._coupled_clash.append((c["kind"], c["emit"], m, d, c["ref"], why))
                     self._clash_dofs.add((m, d))
                 continue
@@ -30343,11 +30456,12 @@ class Converter:
     def _rigid_constraints(self, blocks: List[Block]) -> List[dict]:
         """The rigid constraints as the converter emits them: per constraint its Abaqus kind
         ('rb' = *RIGID BODY, 'kin' = a kinematic coupling, 'mpc' = the rigid body of *MPC BEAM
-        lines), how ccx gets it ('emit': 'rb' = a *RIGID BODY, 'kin' = a *KINEMATIC
-        coupling, 'eq' = linear *EQUATIONs: _rigid_body_lines, _kin_form; a coupling with lines
-        of both gets one entry each), reference node, explicit ROT NODE (a ccx-style deck),
-        whether all members are 2-D nodes, and per member the translations ccx makes dependent
-        ('trans') and the rotations the converter ties ('rots').  A coupling of some
+        lines, 'conn' = one of rigid connectors alone), how ccx gets it ('emit': 'rb' = a
+        *RIGID BODY, 'kin' = a *KINEMATIC coupling, 'eq' = linear *EQUATIONs: _rigid_body_lines,
+        _kin_form; a coupling with lines of both gets one entry each), reference node, explicit
+        ROT NODE (a ccx-style deck), whether all members are 2-D nodes, and per member the
+        translations ccx makes dependent ('trans') and the rotations the converter ties
+        ('rots').  A coupling of some
         translations along an ORIENTATION's axes: 'trans' the global ones it holds or touches
         (_coupled_span), 'across' per member those it only touches — never imposed by the
         reference node's BCs — with 'stops' those of them ccx eliminates (its own coupling,
@@ -30441,8 +30555,9 @@ class Converter:
                     rots = {n: ds for n, ds in rots.items() if len(ds) in (0, 3)}   # per DOF
                 out.append(dict(kind=kind, emit=emit, ref=ref, rot=rot, planar=planar,
                                 trans=trans, rots=rots, across=across, stops=stops, elim=elim))
-        # the rigid bodies of *MPC BEAM lines, emitted as *RIGID BODY with a ROT NODE: the
-        # dependent nodes follow the independent one in displacement and rotation
+        # the rigid bodies of *MPC BEAM lines and rigid connectors ('conn': rigid connectors
+        # alone, whose member BCs are a *RIGID BODY's), emitted as *RIGID BODY with a ROT NODE:
+        # the dependent nodes follow the independent one in displacement and rotation
         for bodies in self._mpc_bodies.values():
             for body in bodies:
                 ref = body["ref"]
@@ -30450,7 +30565,8 @@ class Converter:
                 if not members:
                     continue
                 tie_ok = self._tie_rotations and ref not in self._transformed
-                out.append(dict(kind="mpc", emit=body_emit(ref, body["rot"], body["members"]),
+                out.append(dict(kind="conn" if body.get("conn") else "mpc",
+                                emit=body_emit(ref, body["rot"], body["members"]),
                                 ref=ref, rot=None,
                                 planar=all(n in self._plane_only for n in members),
                                 trans={n: {1, 2, 3} for n in members},
@@ -30515,7 +30631,7 @@ class Converter:
             end = {k: bool(ref[k]) and ref[k][1] == 0.0 and
                    (ref[k][3] == "disp" or (ref[k][3] == "rate" and z0[k])) for k in range(1, 7)}
             held = []                              # DOFs whose identical member BCs act together
-            for d in ((1, 2) if c["planar"] else (1, 2, 3)) if c["kind"] == "rb" else ():
+            for d in ((1, 2) if c["planar"] else (1, 2, 3)) if c["kind"] in ("rb", "conn") else ():
                 es = [st[(m, d)] for m in members.get(d, ())]
                 if es and all(self._same_bc(e, es[0], False) for e in es):
                     held.append(d)
@@ -30719,8 +30835,8 @@ class Converter:
             if bad or not any(o[1] in ("move", "approx") for o in res[d]):
                 why[d] = min(bad, key=("differ", "conflict", "kind").index) if bad else ""
                 continue
-            if inexact and not self._approx:
-                why[d] = "approx:" + ",".join(sorted(inexact))
+            if inexact and (not self._approx or c["kind"] == "conn"):   # (Abaqus moves no
+                why[d] = "approx:" + ",".join(sorted(inexact))          # connector BC)
                 continue
             for s, _state, _, need in res[d]:
                 step = c["steps"][s]
@@ -30734,7 +30850,8 @@ class Converter:
                     self._bc_drop.setdefault(card, set()).add((m, d))
                 taken.add((m, d))
                 if not verdict[(m, d)]:
-                    self._rb_moved.append((m, d, c["ref"], frozenset(inexact), c["emit"] == "eq"))
+                    self._rb_moved.append((m, d, c["ref"], frozenset(inexact), c["emit"] == "eq",
+                                           c["kind"] == "conn"))
         return taken
 
     def _rb_step_outcome(self, c: dict, d: int, s: int) -> Tuple[str, set, Dict[int, float]]:
@@ -30780,10 +30897,21 @@ class Converter:
 
     def _note_rigid_body_moves(self) -> None:
         """Report the *RIGID BODY member BCs _plan_rigid_body_move put on reference nodes."""
-        exact = [x for x in self._rb_moved if not x[3]]
+        exact = [x for x in self._rb_moved if not x[3] and not x[5]]
         loose = [x for x in self._rb_moved if x[3]]
+        conn = [x for x in self._rb_moved if x[5]]
+        if conn:
+            m, d, ref = conn[0][:3]
+            self.report.note(f"*BOUNDARY on {len(conn)} DOF(s) of {len({x[0] for x in conn})} node(s) "
+                             f"of a body of rigid connectors (BEAM / WELD) moved to its reference "
+                             f"node, translations with zero rotations about the other axes (e.g. node "
+                             f"{m} DOF {d} -> reference node {ref}): ccx cannot keep a BC on a node "
+                             f"the body drives, and the BC'd nodes hold that DOF of the body and its "
+                             f"rotations about the other axes anyway (identical BCs, nodes not on one "
+                             f"line seen along the DOF, body not turned before the step) — the same "
+                             f"constraint as Abaqus' BCs on the connector's nodes. Exact.", once=True)
         if exact:
-            m, d, ref, _, _ = exact[0]
+            m, d, ref = exact[0][:3]
             self.report.note(f"*BOUNDARY on {len(exact)} DOF(s) of {len({x[0] for x in exact})} "
                              f"*RIGID BODY node(s) moved to the reference node, translations with zero "
                              f"rotations about the other axes (e.g. node {m} DOF {d} -> reference node "
@@ -30795,7 +30923,7 @@ class Converter:
                              "other axes anyway (identical BCs, nodes not on one line seen along "
                              "the DOF, body not turned before the step). Exact.", once=True)
         if loose:
-            m, d, ref, _, _ = loose[0]
+            m, d, ref = loose[0][:3]
             reasons = set().union(*[x[3] for x in loose])
             self.report.warn(f"[APPROX] *BOUNDARY on {len(loose)} DOF(s) of "
                              f"{len({x[0] for x in loose})} *RIGID BODY node(s) moved to the "
@@ -32170,7 +32298,8 @@ class Converter:
         _settle_dependents reordering them, a model Abaqus does not solve: reduced physics; so
         is a rotation's BC kept against the converter's rotation tie in any form."""
         what = {"kin": "a kinematic coupling", "rb": "a *RIGID BODY",
-                "mpc": "an *MPC BEAM (a *RIGID BODY in ccx)"}
+                "mpc": "an *MPC BEAM (a *RIGID BODY in ccx)",
+                "conn": "rigid connectors (BEAM / WELD; a *RIGID BODY in ccx)"}
         groups: "OrderedDict[Tuple[str, str, bool, str], List[Tuple[int, int, int]]]" = OrderedDict()
         for kind, emit, m, d, ref, why in self._coupled_clash:
             groups.setdefault((kind, emit, d <= 3, why), []).append((m, d, ref))
@@ -32209,7 +32338,12 @@ class Converter:
                           "Abaqus. ")
             move = ("Abaqus/Standard moves identical BCs on rigid-body nodes to the reference node, "
                     "adding zero rotations about the other axes")
-            if kind != "rb":
+            if kind == "conn":
+                fix = ("A connector is an element, and Abaqus applies the BCs on its nodes as they "
+                       "are; the converter moves them onto the body's reference node only where "
+                       "that is the same constraint: put the BCs on one node of the connected "
+                       "nodes, or verify.")
+            elif kind != "rb":
                 fix = ("Abaqus/Standard eliminates the constrained DOFs at these nodes and does not "
                        "apply a BC there, so the node follows the constraint: take the node out of "
                        "the BC (or the constraint), or rerun with --approximate to drop such BCs as "

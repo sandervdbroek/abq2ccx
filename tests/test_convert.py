@@ -1776,7 +1776,7 @@ def test_rigid_body_reference_node_of_its_own_body_gets_a_free_node():
     assert "9, 3, 3, 0.1" in lines and "9, 1, 2." in lines and "REF, 1, 2." in lines
     out = next(l for l in lines if l.startswith("*NODE PRINT") and "ALL" not in l).split("NSET=")[1]
     tr = next(l for l in lines if l.startswith("*TRANSFORM")).split("NSET=")[1]
-    assert geom.nset(out) == [9] and sorted(geom.nset(tr)) == [8, 9]
+    assert geom.nset(out) == [9] and geom.nset(tr) == [9]       # (node 8, a member, keeps no axes)
     assert sorted(geom.nset("ALL")) == list(range(1, 10))     # output of a set beside node 8
     assert "8 -> 9" in rep.text() and rep.n_warnings == 0
     # a shell reference node in the PIN NSET joins the TIE members (its rotations are the body's)
@@ -1790,6 +1790,127 @@ def test_rigid_body_reference_node_of_its_own_body_gets_a_free_node():
                                         "ref node=8, pin nset=BODY\n*Equation\n2\n8, 1, 1., 9, 1, -1.\n"
                                         "*Node\n9, 2., 0., 0.\n")
     assert not conv._free_refs and "*RIGID BODY reference node(s) 8 also belong to the body" in rep.text()
+
+
+def test_free_reference_node_takes_the_transform_of_a_shell_reference_node():
+    # a shell REF NODE with a *TRANSFORM in its PIN NSET, *DYNAMIC: the original node keeps no
+    # axes, so its rotation is tied to the ROT NODE (in the ROT NODE's axes); with the axes
+    # kept, its drilling rotation stayed free and massless and ccx stopped ('increment size
+    # smaller than minimum'; validate_with_ccx.py free_ref_transform_dynamic)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 2., 0., 0.\n"
+            "6, 2., 1., 0.\n*Element, type=S4, elset=SH\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*Nset, nset=RPS\n2\n"
+            "*Nset, nset=BODY\n2, 3, 5, 6\n*Nset, nset=CL\n1, 4\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Density\n1e-3\n*Shell Section, elset=SH, material=M\n0.1\n*Rigid Body, ref node=RPS, "
+            "pin nset=BODY\n*Transform, nset=RPS\n0., 1., 0., -1., 0., 0.\n*Step\n*Dynamic\n0.01, 0.1\n"
+            "*Boundary\nCL, 1, 6\nRPS, 6, 6\n*Cload\nRPS, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    geom, lines = reparse(body), body.splitlines()
+    assert dict(conv._free_refs) == {2: 7}
+    tr = next(l for l in lines if l.startswith("*TRANSFORM") and "TYPE=R" not in l).split("NSET=")[1]
+    assert geom.nset(tr) == [7] and "not tied on a node with a *TRANSFORM" not in rep.text()
+    rot = conv._rb_rot[7]
+    assert f"2, 4, 1., {rot}, 2, 1." in lines and f"2, 6, 1., {rot}, 3, -1." in lines
+    assert "coupled rotation not tied on a *TRANSFORM node" not in conv.reduced_physics
+
+
+def test_reference_node_on_an_element_outside_the_body_gets_a_free_node():
+    # ccx prints the reaction force at a REF NODE of any element but a MASS (a rigid element's
+    # skin, the deformable mesh, a spring) as those elements' forces alone (probed: -2.5 or
+    # -3.4 where the body's -10 / -13.5 is right; validate_with_ccx.py rigid_ref_rf_outside):
+    # it gets a free reference node too, and joins the body's TIE members
+    cap = (HEX + HEX_SEC + "*Element, type=R3D4, elset=RIG\n2, 5, 6, 7, 8\n*Rigid Body, ref node=8, "
+           "elset=RIG\n*Nset, nset=BOT\n1, 2, 3, 4\n*Step\n*Static\n*Boundary\nBOT, 1, 3\n8, 1, 6\n"
+           "8, 3, 3, -0.01\n*Node Print, nset=PR\nRF\n*End Step\n*Nset, nset=PR\n8\n")
+    body, conv, rep = convert_str(cap)
+    new = conv._free_refs[8]
+    geom, lines = reparse(body), body.splitlines()
+    rb = next(l for l in lines if l.startswith("*RIGID BODY"))
+    assert f"REF NODE={new}," in rb and 8 in geom.nset(rb.split("NSET=")[1].split(",")[0])
+    assert f"{new}, 3, 3, -0.01" in lines and geom.nset("PR") == [new]
+    assert "on elements outside the body" in rep.text() and rep.n_warnings == 0
+    # on the deformable mesh, outside the TIE NSET
+    mesh = (HEX + HEX_SEC + "*Nset, nset=T\n5, 6, 7\n*Rigid Body, ref node=8, tie nset=T\n"
+            "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n8, 1, 6\n")
+    body, conv, rep = convert_str(mesh)
+    rb = next(l for l in body.splitlines() if l.startswith("*RIGID BODY"))
+    assert dict(conv._free_refs) == {8: 9} and "REF NODE=9" in rb
+    assert sorted(reparse(body).nset(rb.split("NSET=")[1].split(",")[0])) == [5, 6, 7, 8]
+    # a MASS element leaves the reaction force right: no free node; a spring does not
+    point = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 1., 0.\n9, 0.5, 0.5, 0.\n*Nset, nset=B\n1, 2, 3\n"
+             "*Element, type=T3D2, elset=TR\n1, 1, 2\n2, 2, 3\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Solid Section, elset=TR, material=M\n0.01\n*Rigid Body, ref node=9, tie nset=B\n"
+             "*Element, type=MASS, elset=MS\n5, 9\n*Mass, elset=MS\n1.\n")
+    _, conv, _ = convert_str(point)
+    assert not conv._free_refs
+    _, conv, _ = convert_str(point + "*Element, type=SPRING1, elset=SP\n6, 9\n*Spring, elset=SP\n3\n100.\n")
+    assert dict(conv._free_refs) == {9: 10}
+    # a plane rigid body (R2D2) on its own node: the new node is held in the plane
+    plane = ("*Node\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*Element, type=CPS4, elset=E\n1, 1, 2, 3, 4\n"
+             "*Element, type=R2D2, elset=RIG\n2, 3, 4\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Solid Section, elset=E, material=M\n1.\n*Rigid Body, ref node=4, elset=RIG\n")
+    body, conv, _ = convert_str(plane)
+    new = conv._free_refs[4]
+    assert conv._rigid_planar_refs == [new] and f"{new}, 3, 3" in body.splitlines()
+    assert "4, 3, 3" not in body.splitlines()
+
+
+def test_rigid_connector_body_is_rooted_at_the_node_with_bcs():
+    # a BEAM / WELD connector is an element: Abaqus applies the BCs on either node.  The body
+    # of rigid connectors is rooted at the node with the most BC'd DOFs; the BC of the other
+    # node is implied there (exact) — not taken off as an *MPC BEAM dependent's (which left
+    # the motion out: ccx exit 255; validate_with_ccx.py connector_beam_bc_on_b)
+    deck = (HEX + HEX_SEC + "*Node\n200, 2., 0.5, 0.5\n*Element, type=CONN3D2, elset=CE\n900, 6, 200\n"
+            "*Connector Section, elset=CE\nBEAM,\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n"
+            "*Step\n*Dynamic\n0.01, 0.1\n*Boundary\n200, 1, 1, 0.05\n200, 2, 5, 0.\n200, 6, 6, 0.1\n"
+            "*End Step\n")
+    body, conv, rep = convert_str(deck)
+    [body_] = [x for bodies in conv._mpc_bodies.values() for x in bodies]
+    assert body_["ref"] == 200 and body_["members"] == [6] and body_.get("conn")
+    assert "taken off" not in rep.text() and conv.reduced_physics == []
+    assert "200, 1, 1, 0.05" in body.splitlines()
+    # node 6 held in z too: implied by node 200's BCs, dropped
+    body, conv, rep = convert_str(deck.replace("200, 6, 6, 0.1\n", "200, 6, 6, 0.1\n6, 3, 3\n"))
+    assert "*BOUNDARY taken off 1 DOF(s)" in rep.text() and "\n6, 3, 3" not in body
+    assert conv.reduced_physics == []
+    # node 200 (a beam's end) held in z and its rotations, node 6 in x and y: moved to node 200
+    # (the same constraint: the body cannot turn), as a *RIGID BODY member's
+    held = deck.replace("200, 1, 1, 0.05\n200, 2, 5, 0.\n200, 6, 6, 0.1\n", "200, 3, 6\n6, 1, 2\n"
+                        "*Cload\n202, 1, 1.\n").replace("*Step\n*Dynamic\n0.01, 0.1\n", (
+        "*Node\n202, 3., 0.5, 0.5\n*Element, type=B31, elset=BM\n950, 200, 202\n*Beam Section, "
+        "elset=BM, material=MHEX, section=RECT\n0.1, 0.1\n0., 0., 1.\n*Step\n*Static\n"))
+    body, conv, rep = convert_str(held)
+    assert "of a body of rigid connectors (BEAM / WELD) moved to its reference node" in rep.text()
+    assert "200, 1, 2" in body.splitlines() and "\n6, 1, 2" not in body
+    # a second connector node with another BC on the same DOF: kept, warned in a connector's terms
+    chain = deck.replace("900, 6, 200\n", "900, 6, 200\n901, 200, 201\n").replace(
+        "*Node\n200, 2., 0.5, 0.5\n", "*Node\n200, 2., 0.5, 0.5\n201, 3., 0.5, 0.5\n").replace(
+        "200, 6, 6, 0.1\n", "200, 6, 6, 0.1\n6, 1, 1\n201, 1, 1, 0.2\n")
+    _, conv, rep = convert_str(chain)
+    assert "through rigid connectors (BEAM / WELD; a *RIGID BODY in ccx)" in rep.text()
+    assert "A connector is an element, and Abaqus applies the BCs on its nodes" in rep.text()
+
+
+def test_initial_rotational_velocity_of_a_rigid_body_goes_to_its_rot_node():
+    # ccx takes no initial value on DOFs 4-6 of a node (it wrote DOF 6 of node 100 into DOF 2 of
+    # the next node); a rigid body's rotation is on its ROT NODE's DOFs 1-3, in global axes as
+    # Abaqus reads it (validate_with_ccx.py rigid_initial_spin)
+    deck = (HEX + HEX_SEC + "*Node\n100, 0.5, 0.5, 0.5\n*Nset, nset=ALLC\n1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Rigid Body, ref node=100, tie nset=ALLC\n*Initial Conditions, type=velocity\n100, 6, 1.\n"
+            "100, 1, 0.5\n*Step\n*Dynamic\n0.001, 0.01\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    ic = body.split("*INITIAL CONDITIONS, TYPE=velocity\n")[1].split("*")[0].splitlines()
+    assert ic == [f"{conv._rb_rot[100]}, 3, 1.", "100, 1, 0.5"] and conv.reduced_physics == []
+    # a solid node has no rotations (a note); a shell node's rotation would start at rest (warned)
+    _, conv, rep = convert_str(deck.replace("100, 6, 1.\n", "100, 6, 1.\n1, 5, 2.\n"))
+    assert "on DOFs 4-6 of 1 node(s) (e.g. node 1) dropped" in rep.text() and conv.reduced_physics == []
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=S\n"
+             "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Shell Section, "
+             "elset=S, material=M\n0.1\n*Initial Conditions, type=velocity\n3, 6, 1.\n*Step\n*Dynamic\n"
+             "0.001, 0.01\n*End Step\n")
+    body, conv, rep = convert_str(shell)
+    assert "*INITIAL CONDITIONS" not in body.replace("** ", "") or "3, 6, 1." not in \
+        [l for l in body.splitlines() if not l.startswith("**")]
+    assert "*INITIAL CONDITIONS, TYPE=VELOCITY on rotations dropped" in conv.reduced_physics
 
 
 def test_buckle_load_case_two_on_a_free_reference_node():
@@ -8514,6 +8635,7 @@ def test_base_state_restore_reads_the_sets_as_written():
                   "*Nset, nset=NONE\n100\n*Nset, nset=P\n5\n*Nset, nset=T\n6\n"
                   "*Surface, name=S, type=ELEMENT\nEALL, S2\n"
                   "*Rigid Body, ref node=7, pin nset=P, tie nset=T\n") + PERT[len(HEX):]
+    # (REF NODE 7, a node of the mesh, joins the TIE members as T_TIE; _plan_free_ref_nodes)
     seen, run = [], A.BaseStateRestore.run
     A.BaseStateRestore.run = lambda self: seen.append(self) or run(self)
     try:
@@ -8522,14 +8644,14 @@ def test_base_state_restore_reads_the_sets_as_written():
         A.BaseStateRestore.run = run
     r = seen[0]
     assert "*NSET, NSET=DESC, GENERATE\n2, 8, 2\n" in body and "NSET=NONE" not in body
-    assert "*NSET, NSET=ABQ2CCX_RB1\nP, T\n" in body and "*DLOAD\nEALL, P2, 1.\n" in body
+    assert "*NSET, NSET=ABQ2CCX_RB1\nP, T_TIE\n" in body and "*DLOAD\nEALL, P2, 1.\n" in body
     assert all(c._span is not None for c in r.deck.cards if c.keyword == "NSET" and c.opaque)
     text = A.EmittedSets().read(A.EmittedDeck(r.deck.lines))   # every card read
     assert set(r.sets.defs) == set(text.defs) and set(r.sets.surfaces) == set(text.surfaces) == {"S"}
     for key in text.defs:
         assert r.sets.members(*key) == text.members(*key), key
-    assert r.sets.members("NSET", "GAP") == list(range(1, 10)) and r.sets.members("NSET", "NONE") is None
-    assert r.sets.members("NSET", "ABQ2CCX_RB1") == [5, 6] and r.sets.faces("S") == text.faces("S")
+    assert r.sets.members("NSET", "GAP") == list(range(1, 11)) and r.sets.members("NSET", "NONE") is None
+    assert r.sets.members("NSET", "ABQ2CCX_RB1") == [5, 6, 7] and r.sets.faces("S") == text.faces("S")
     # a set written twice is both definitions, the mesh's first
     mesh = A.EmittedSets()
     mesh.record("*NSET, NSET=Twice", [3, 1])
@@ -12076,13 +12198,15 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
                                          [(4, 1, 1.), (9, 1, -1.), (10, 3, 0.5)],
                                          [(4, 2, 1.), (9, 2, -1.), (10, 3, -0.5)]]
         assert "*COUPLING" not in body and rep.n_warnings == 0 and not conv.reduced_physics
-    # a beam reference node: the ROT NODE follows its rotations
+    # a beam reference node (outside the body): a free reference node takes its place
+    # (_plan_free_ref_nodes), node 9 joins the TIE members, its rotations tied to the ROT NODE
     beam = ("*Node\n10, 0.5, 0.5, 3.\n*Element, type=B31, elset=B\n2, 9, 10\n*Beam Section, elset=B, "
             "material=M, section=RECT\n1., 1.\n1., 0., 0.\n*Material, name=M\n*Elastic\n1000., 0.3\n")
     body, conv, _ = convert_str(rp + beam + cards[0] + step.format(""))
     eqs = _equation_terms(body)
-    rot = {t[0] for row in eqs[:12] for t in row[2:]}.pop()
-    assert len(eqs) == 15 and eqs[12:] == [[(rot, k, 1.), (9, k + 3, -1.)] for k in (1, 2, 3)]
+    new, rot = conv._free_refs[9], conv._rb_rot[conv._free_refs[9]]
+    assert len(eqs) == 18 and eqs[12:15] == [[(9, k, 1.), (new, k, -1.)] for k in (1, 2, 3)]
+    assert eqs[15:] == [[(9, k + 3, 1.), (rot, k, -1.)] for k in (1, 2, 3)]
     assert "*RIGID BODY" not in "\n".join(_live(body))
 
 
@@ -18214,7 +18338,8 @@ def test_mass_on_a_rigid_member_node_in_no_other_element_gets_a_tetrahedron():
         g = reparse(out)
         tets = [e for e in g.elset(A.RIGID_SET) if g.elements[e][0] == "C3D4"]
         assert len(tets) == 1 and g.elements[tets[0]][1][0] == 4, out
-        m = re.search(r"\*RIGID BODY, (?:REF NODE=1, )?NSET=([^,\s]+)", out)
+        m = re.search(r"\*RIGID BODY, (?:REF NODE=\d+, )?NSET=([^,\s]+)", out)   # (node 1, on
+        # the spring, gives way to a free reference node in the *RIGID BODY: _plan_free_ref_nodes)
         assert m and set(g.elements[tets[0]][1]) <= set(g.nset(m.group(1))), out
         assert f"*SOLID SECTION, ELSET={A.RIGID_SET}" in out and "*DENSITY\n0." in out
         assert "massless tetrahedron" in rep.text() and conv.reduced_physics == []
