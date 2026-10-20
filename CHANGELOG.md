@@ -6,6 +6,16 @@ physics.
 
 ## Unreleased
 
+* **Mesh generation with blank fields** — `*ELGEN`, `*NGEN` and `*NFILL` dropped blank
+  (default) fields and read the rest one place early: `*ELGEN` line `1, 4, , , 3, 10, 10` gave 40
+  wrong elements instead of 12, and an `*NGEN` arc with a blank increment generated nothing.
+  Fields are now read by position with Abaqus' defaults. `*NGEN` also takes the extra point
+  from its coordinates (fields 5–7, in the `SYSTEM=` frame) when no node is given, and the arc
+  normal from fields 8–10 (5–7 were read as the normal). `*NFILL` takes the default increment
+  1 (the line was skipped) and puts a bounding node without coordinates at the origin, as
+  Abaqus does. `*NCOPY, MULTIPLE` with a rotation now translates once, then turns each copy
+  (copy k was translated k times). A `*NSET` / `*ELSET, GENERATE` line that is not numbers is
+  now warned and reduced physics (the set came out empty without a word).
 * **Distributing couplings move their reference node** — ccx 2.23's `*COUPLING` + `*DISTRIBUTING`
   only spreads the reference node's loads over the surface: a BC on the node moved nothing, the
   node printed U = 0 and a beam on it hung free; a card without DOF lines (Abaqus: all DOFs)

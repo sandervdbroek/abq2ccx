@@ -1998,6 +1998,55 @@ def ic_temperature_cards_deck():
     return "\n".join(lines) + "\n"
 
 
+def mesh_generation_ring_deck(generated=True, nr=4, nt=8, a=1.0, b=2.0, h=0.1, p=1.0):
+    """A quarter annulus a < r < b of C3D8 (nr x nt elements, thickness h; the planes x = 0 and
+    y = 0 held normal, every node in z: plane strain; E 1000, nu 0.3) under an internal pressure
+    p.  ``generated``: the mesh comes from Abaqus' generation cards with blank (default) fields
+    -- the bottom arcs by *NGEN, LINE=C about a centre given by coordinates (fields 5-7; the
+    outer one backwards, its normal in 8-10), the radial lines by *NFILL with the default
+    increment, the top face by *NCOPY, MULTIPLE (translated once, then turned nt + 1 times
+    from a seed line at -90 / nt degrees) and the elements by *ELGEN with blank increments.
+    Otherwise every node and element is listed, at the same places."""
+    def bot(k, r):
+        return 1 + 10 * k + r
+
+    def top(k, r):
+        return 1001 + 10 * k + r
+
+    def xy(k, r, th0=0.0):
+        rad, th = a + (b - a) * r / nr, math.radians(90.0 * k / nt + th0)
+        return rad * math.cos(th), rad * math.sin(th)
+    lines = ["*Heading", "Quarter annulus under internal pressure, plane strain"]
+    if generated:
+        dth = 90.0 / nt
+        lines += ["*Node", f"{bot(0, 0)}, {a}, 0., 0.", f"{bot(nt, 0)}, 0., {a}, 0.",
+                  f"{bot(0, nr)}, {b}, 0., 0.", f"{bot(nt, nr)}, 0., {b}, 0.",
+                  "*Ngen, line=C, nset=INNER", f"{bot(0, 0)}, {bot(nt, 0)}, 10, , 0., 0., 0.",
+                  "*Ngen, line=C, nset=OUTER", f"{bot(nt, nr)}, {bot(0, nr)}, -10, , 0., 0., 0., 0., 0., -1.",
+                  "*Nfill, nset=BOT", f"INNER, OUTER, {nr}", "*Node, nset=SEED"]
+        lines += [f"{991 + r}, {xy(0, r, -dth)[0]!r}, {xy(0, r, -dth)[1]!r}, 0." for r in range(nr + 1)]
+        lines += [f"*Ncopy, old set=SEED, new set=TOP, change number=10, shift, multiple={nt + 1}",
+                  f"0., 0., {h}", f"0., 0., 0., 0., 0., 1., {dth!r}", "*Element, type=C3D8, elset=RING",
+                  f"1, {bot(0, 0)}, {bot(0, 1)}, {bot(1, 1)}, {bot(1, 0)}, {top(0, 0)}, {top(0, 1)}, "
+                  f"{top(1, 1)}, {top(1, 0)}", "*Elgen, elset=RING", f"1, {nr}, , , {nt}, 10, 10"]
+    else:
+        for name, nid, z in (("BOT", bot, 0.0), ("TOP", top, h)):
+            lines += [f"*Node, nset={name}"] + [f"{nid(k, r)}, {xy(k, r)[0]!r}, {xy(k, r)[1]!r}, {z}"
+                                                for k in range(nt + 1) for r in range(nr + 1)]
+        lines += ["*Element, type=C3D8, elset=RING"] + [
+            f"{bot(k, r)}, {bot(k, r)}, {bot(k, r + 1)}, {bot(k + 1, r + 1)}, {bot(k + 1, r)}, "
+            f"{top(k, r)}, {top(k, r + 1)}, {top(k + 1, r + 1)}, {top(k + 1, r)}"
+            for k in range(nt) for r in range(nr)]
+    lines += ["*Nset, nset=MESH", "BOT, TOP",
+              "*Nset, nset=Y0", ", ".join(str(f(0, r)) for f in (bot, top) for r in range(nr + 1)),
+              "*Nset, nset=X0", ", ".join(str(f(nt, r)) for f in (bot, top) for r in range(nr + 1)),
+              "*Elset, elset=INNER, generate", f"1, {bot(nt - 1, 0)}, 10",
+              "*Solid Section, elset=RING, material=M", "*Material, name=M", "*Elastic", "1000., 0.3",
+              "*Boundary", "MESH, 3, 3", "Y0, 2, 2", "X0, 1, 1", "*Step", "*Static",
+              "*Dload", f"INNER, P6, {p}", "*Node Print, nset=MESH", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
 def ic_annulus_deck(nr=8, nt=18, t=0.1, a=1.0, b=2.0, s0=100.0):
     """A quarter annulus a < r < b of C3D20R (nr x nt elements, thickness t; the planes x = 0 and
     y = 0 held normal, every node in z: plane strain; E 1000, nu 0.3) with a uniform initial
@@ -6364,6 +6413,28 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  initial_temperature_cards (two free cubes, initial "
               f"temperatures on two *INITIAL CONDITIONS cards, heated by 20): corner displacements "
               f"{got[0][0]:.7g} and {got[1][0]:.7g} vs 20 alpha = 0.02 (max {err:.1e} off)")
+        failures += 0 if ok else 1
+    # mesh-generation cards read by position, with Abaqus' defaults: the arcs about a centre
+    # given by coordinates and the fill with the default increment were skipped, *ELGEN's blank
+    # increments shifted its fields (40 elements) and *NCOPY, MULTIPLE translated every copy
+    runs = [faithful_run(mesh_generation_ring_deck(gen), "mesh_generation_fields" + ("" if gen else "_twin"))
+            for gen in (True, False)]
+    if None in runs:
+        failures += 1
+    else:
+        u, t = runs
+        moved = max(abs(x) for v in t.values() for x in v)
+        err = max(abs(x - y) for n in t for x, y in zip(u.get(n, [math.inf] * 3), t[n])) / moved
+        lame = [(1.3 / 3000.0 * (0.4 * r + 4.0 / r), sum(u.get(n, [math.inf] * 2)[:2]) / math.sqrt(2.0))
+                for n, r in ((41, 1.0), (45, 2.0))]
+        off = max(abs(got / want - 1) for want, got in lame)
+        ok = err < 1e-9 and moved > 1e-3 and off < 0.02
+        print(f"{'PASS' if ok else 'FAIL'}  mesh_generation_fields (a quarter annulus under internal "
+              f"pressure, its mesh by *NGEN arcs about a centre by coordinates, *NFILL with the default "
+              f"increment, *NCOPY, MULTIPLE and *ELGEN with blank increments): every displacement as "
+              f"with the mesh listed ({err:.1e} apart, largest {moved:.4g}); radial displacements "
+              f"{lame[0][1]:.5g} and {lame[1][1]:.5g} at r = a, b vs Lame {lame[0][0]:.5g} and "
+              f"{lame[1][0]:.5g} ({off:.1%} off)")
         failures += 0 if ok else 1
     text, xy = ic_annulus_deck()
     u = faithful_run(text, "initial_stress_cylindrical")

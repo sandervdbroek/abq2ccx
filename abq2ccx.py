@@ -1404,13 +1404,10 @@ class Geometry:
 
 
 def expand_generate(fields: List[str]) -> List[int]:
-    """``start, end[, inc]`` -> explicit list of ids.  A malformed (non-integer) field
-    yields an empty list rather than aborting the whole conversion — matching the
-    "one bad line should not kill the file" handling of *NODE/*ELEMENT."""
-    try:
-        nums = [int(float(f)) for f in fields if f != ""]
-    except ValueError:
-        return []
+    """``start, end[, inc]`` -> explicit list of ids.  ValueError for a malformed
+    (non-integer) field: the caller reports the line and goes on, as *NODE / *ELEMENT skip
+    one bad line rather than abort the file."""
+    nums = [int(float(f)) for f in fields if f != ""]
     if len(nums) == 2:
         start, end, inc = nums[0], nums[1], 1
     elif len(nums) >= 3:
@@ -2108,23 +2105,43 @@ def _skip_unreadable(report: Report, what: str) -> None:
     report.reduce(f"{what} with non-numeric data skipped")
 
 
+def system_point(v: Sequence[float], system: str) -> Vec:
+    """Cartesian coordinates of a point given in an Abaqus coordinate system (*NODE, *NGEN
+    SYSTEM=, first letter): R Cartesian; C R, theta, Z; S R, theta, phi, with theta about Z
+    from X and phi up from the X-Y plane, both in degrees (Abaqus "Node definition")."""
+    if system == "C":
+        th = math.radians(v[1])
+        return v[0] * math.cos(th), v[0] * math.sin(th), v[2]
+    if system == "S":
+        th, ph = math.radians(v[1]), math.radians(v[2])
+        return (v[0] * math.cos(ph) * math.cos(th), v[0] * math.cos(ph) * math.sin(th),
+                v[0] * math.sin(ph))
+    return v[0], v[1], v[2]
+
+
 def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NGEN`` -> nodes between two existing end nodes, on a straight line (default),
-    a circular arc about a centre node (LINE=C) or a parabola through a midside node
-    (LINE=P); the extra node is the 4th data field, an arc normal fields 5-7.  Nodes are
-    spaced evenly in arc angle / curve parameter."""
+    a circular arc about a centre (LINE=C) or a parabola through a midside point (LINE=P).
+    Fields by position (Abaqus 2017 Keywords *NGEN): the end nodes, the increment (blank: 1),
+    the extra point's node (4) or, without one, its coordinates (5-7, in the SYSTEM= frame, a
+    blank one 0: "the node number will take precedence over the coordinates"), and an arc's
+    normal (8-10).  Nodes are spaced evenly in arc angle / curve parameter."""
     kind = (block.param("LINE") or "S").strip().upper()[:1]
+    system = (block.param("SYSTEM") or "R").strip().upper()[:1]
     created: List[int] = []
     for rec in merged_data_records(block):
-        f = [x for x in rec if x != ""]
-        if len(f) < 2:
-            if f:
-                report.warn("*NGEN record needs two end nodes; skipped.", once=True)
+        if not rec:
+            continue
+        g = rec + [""] * 9
+        if not g[0] or not g[1]:
+            report.warn("*NGEN record needs two end nodes; skipped.", once=True)
             continue
         try:
-            n1, n2 = pint(f[0]), pint(f[1])
-            inc = pint(f[2]) if len(f) > 2 and f[2] else 1
-            nx = pint(f[3]) if kind in ("C", "P") and len(f) > 3 else 0
+            n1, n2 = pint(g[0]), pint(g[1])
+            inc = pint(g[2]) if g[2] else 1
+            nx = pint(g[3]) if g[3] else None
+            point = system_point(fields_at(g[4:7], 3), system)
+            normal = tuple(fields_at(g[7:10], 3))
         except ValueError:
             _skip_unreadable(report, "*NGEN record")
             continue
@@ -2134,13 +2151,7 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
         p1, p2 = geom.nodes[n1], geom.nodes[n2]
         extra = None
         if kind in ("C", "P"):
-            extra = geom.nodes.get(nx)
-        normal = None
-        if len(f) >= 7:
-            try:
-                normal = (pf(f[4]), pf(f[5]), pf(f[6]))
-            except ValueError:
-                normal = None
+            extra = geom.nodes.get(nx) if nx is not None else point
         curve = _ngen_curve(kind, p1, p2, extra, normal)
         if curve is None:
             report.warn(f"*NGEN LINE={kind}: the {'centre' if kind == 'C' else 'midside'} node "
@@ -2195,14 +2206,16 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
         return (1.0 - r ** j) / (1.0 - r ** nint)
 
     for rec in merged_data_records(block):
-        f = [x for x in rec if x != ""]
-        if len(f) < 4:
-            report.warn("*NFILL record needs set1,set2,nintervals,ninc; skipped.")
+        if not rec:
+            continue
+        f = rec + [""]                  # by position: set1, set2, intervals, increment (blank: 1)
+        if len(rec) < 3 or not all(rec[:3]):
+            report.warn("*NFILL record needs set1,set2,nintervals[,ninc]; skipped.")
             continue
         s1, s2 = (geom.nset(s) if s.upper() in geom.unsorted else sorted(set(geom.nset(s)))
                   for s in f[:2])
         try:
-            nint, ninc = pint(f[2]), pint(f[3])
+            nint, ninc = pint(f[2]), pint(f[3]) if f[3] else 1
         except ValueError:
             _skip_unreadable(report, "*NFILL record")
             continue
@@ -2222,11 +2235,11 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
                         "ignored, as Abaqus does (Abaqus 'Node definition': 'the extra nodes in "
                         "the longer set are ignored').", once=True)
         for a, b in zip(s1, s2):
-            pa, pb = geom.nodes.get(a), geom.nodes.get(b)
-            if pa is None or pb is None:
-                report.warn(f"*NFILL between nodes {a} and {b}: node {b if pa else a} is not "
-                            f"defined; no nodes generated between them.", once=True)
-                continue
+            if a not in geom.nodes or b not in geom.nodes:
+                report.note("*NFILL: a bounding node without coordinates is taken at the origin, "
+                            "as Abaqus does ('Node definition': nodes not yet given coordinates "
+                            "are at (0., 0., 0.)).", once=True)
+            pa, pb = (geom.nodes.get(n, (0.0, 0.0, 0.0)) for n in (a, b))
             created += [a, b]
             for j in range(1, nint):
                 nid = a + j * ninc
@@ -2261,44 +2274,46 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     for key in ("REFLECT",):
         if block.has(key):
             reflect = (block.param(key) or "").upper()
-    # SHIFT: a translation, then an optional rotation line, applied once per copy
+    # SHIFT: a translation, then an optional rotation line (a, b, angle), fields by position
     shift: Vec = (0.0, 0.0, 0.0)
     turn = None
     try:
-        v = [pf(x) for x in recs[0] if x != ""] if recs and not reflect else []
-        if len(v) >= 3:
-            shift = (v[0], v[1], v[2])
-        v = [pf(x) for x in recs[1] if x != ""] if len(recs) > 1 and not reflect else []
-        if len(v) >= 7:
-            turn = ((v[0], v[1], v[2]), (v[3], v[4], v[5]), v[6])
+        if recs and not reflect:
+            shift = tuple(fields_at(recs[0], 3))
+        if len(recs) > 1 and not reflect:
+            v = fields_at(recs[1], 7)
+            if v[6] and vnorm(vsub(tuple(v[3:6]), tuple(v[:3]))) > 0.0:
+                turn = (tuple(v[:3]), tuple(v[3:6]), v[6])
+            elif v[6]:
+                report.warn("*NCOPY rotation axis a-b has zero length (Abaqus stops on it); the "
+                            "copies are not rotated.", once=True)
     except ValueError:
         _skip_unreadable(report, "*NCOPY card")
         return []
-
-    def transform_shift(p: Vec) -> Vec:
-        out = vadd(p, shift)
-        if turn is not None:
-            out = rotate_about_axis(out, *turn)
-        return out
     if block.has("POLE"):
         report.warn("*NCOPY, POLE is not supported by the converter; nodes are copied with the "
                     "SHIFT/REFLECT data only — verify the generated nodes.", once=True)
         report.reduce("*NCOPY, POLE ignored")
     # REFLECT data: the points' coordinates may sit on one line (LINE: x1..z2) or
-    # several (MIRROR: a, b on the first, c on the second) — take them as a flat list.
+    # several (MIRROR: a, b on the first, c on the second) — take them as a flat list of
+    # whole points, each line's fields by position (a blank one 0).
     pts: List[Vec] = []
     if reflect:
         try:
-            vals = [pf(x) for r in recs for x in r if x != ""]
+            vals = [x for r in recs for x in fields_at(r, -(-len(r) // 3) * 3)]
         except ValueError:
             vals = []
         pts = [(vals[i], vals[i + 1], vals[i + 2]) for i in range(0, len(vals) - 2, 3)]
 
+    # Abaqus "Node definition": "the translation is applied once before the rotation", which
+    # MULTIPLE applies m times; a translation alone shifts copy m by m translations
     orig = {nid: geom.nodes[nid] for nid in src if nid in geom.nodes}
-    cur = orig
+    cur = {nid: vadd(p, shift) for nid, p in orig.items()} if turn is not None else orig
     for m in range(1, multiple + 1):
-        if not reflect:                             # copy m: one more shift of copy m - 1
-            cur = {nid: transform_shift(p) for nid, p in cur.items()}
+        if not reflect and turn is not None:        # copy m: copy m - 1 turned once more
+            cur = {nid: rotate_about_axis(p, *turn) for nid, p in cur.items()}
+        elif not reflect:                           # copy m: copy m - 1 shifted once more
+            cur = {nid: vadd(p, shift) for nid, p in cur.items()}
         for nid in src:
             if nid not in orig:
                 continue
@@ -2425,23 +2440,19 @@ def expand_nmap(block: Block, geom: Geometry, normals: Dict[int, Vec], report: R
 
 
 def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
-    """``*ELGEN`` -> generate elements from a master element via up to 3 triples."""
+    """``*ELGEN`` -> generate elements from a master element: a row, rows of it and layers of
+    rows (Abaqus 2017 Keywords *ELGEN).  Fields by position: the master, then per direction
+    the number of elements (rows, layers) including the master one, the node-number increment
+    and the element-number increment; a blank one is 1, as Abaqus defaults them."""
     elset = block.param("ELSET")
     created: List[int] = []
     for rec in merged_data_records(block):
-        f = [x for x in rec if x != ""]
-        if not f:
+        if not rec:
             continue
+        g = rec + [""] * 9
         try:
-            master = pint(f[0])
-            triples = []
-            rest = f[1:]
-            for i in range(0, len(rest), 3):
-                grp = rest[i:i + 3]
-                n = pint(grp[0])
-                ninc = pint(grp[1]) if len(grp) > 1 and grp[1] else 1
-                einc = pint(grp[2]) if len(grp) > 2 and grp[2] else 1
-                triples.append((n, ninc, einc))
+            master = pint(g[0])
+            triples = [tuple(pint(x) if x else 1 for x in g[1 + 3 * d:4 + 3 * d]) for d in range(3)]
         except ValueError:
             _skip_unreadable(report, "*ELGEN record")
             continue
@@ -2449,11 +2460,8 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
             report.warn(f"*ELGEN master element {master} not defined; skipped.")
             continue
         typ, conn = geom.elements[master]
-        # nested loops over up to three generation directions
+        # nested loops over the three generation directions
         ranges = [range(t[0]) for t in triples]
-        while len(ranges) < 3:
-            ranges.append(range(1))
-            triples.append((1, 0, 0))
         for k in ranges[2]:
             for j in ranges[1]:
                 for i in ranges[0]:
@@ -4389,13 +4397,7 @@ class Converter:
                 out.append(b)
                 continue
             def cartesian(v: List[str]) -> Tuple[float, float, float]:
-                r, th = pf(v[0]) if v[0] else 0.0, math.radians(pf(v[1])) if v[1] else 0.0
-                c = pf(v[2]) if v[2] else 0.0
-                if system == "C":
-                    return r * math.cos(th), r * math.sin(th), c
-                ph = math.radians(c)
-                return (r * math.cos(ph) * math.cos(th), r * math.cos(ph) * math.sin(th),
-                        r * math.sin(ph))
+                return system_point(fields_at(v, 3), system)
 
             data = []
             for rec in merged_data_records(b):
@@ -4547,7 +4549,10 @@ class Converter:
             if not f:
                 continue
             if gen:
-                ids.extend(expand_generate(f))
+                try:
+                    ids.extend(expand_generate(f))
+                except ValueError:
+                    _skip_unreadable(self.report, f"*{b.keyword}, GENERATE line (set {name})")
             else:
                 for tok in f:
                     if re.fullmatch(r"[-+]?\d+", tok):
@@ -26361,7 +26366,11 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer) -> List[Blo
                 if not f:
                     continue
                 if gen:
-                    base = expand_generate(f)
+                    try:
+                        base = expand_generate(f)
+                    except ValueError:              # left for _register_set to report
+                        out.append(mkblock(kw, [(kw, name.upper()), ("GENERATE", None)], [", ".join(f)]))
+                        continue
                     ids.extend(x + (off or 0) for x in base)
                 else:
                     for tok in f:

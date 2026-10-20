@@ -702,6 +702,79 @@ def test_generate_malformed_token_no_crash():
     assert list(conv.geom.elset("GOOD")) == [1, 2, 3]
 
 
+def test_unreadable_generate_line_warned_and_reduced():
+    # code review 2, R10: the set came out empty without a word, and a *BOUNDARY on it named
+    # an undefined set (ccx stops); also through an assembly-level set of an instance
+    for deck, kw in (("*NODE\n1,0,0,0\n2,1,0,0\n*NSET, NSET=FIX, GENERATE\n1, 2, 1x\n"
+                      "*BOUNDARY\nFIX, 1, 3\n", "*NSET"),
+                     ("*NODE\n1,0,0,0\n*ELEMENT, TYPE=MASS, ELSET=E\n1,1\n"
+                      "*ELSET, ELSET=FIX, GENERATE\n1, x, 1\n", "*ELSET"),
+                     ("*Part, name=P\n*Node\n1,0,0,0\n2,1,0,0\n*End Part\n*Assembly, name=A\n"
+                      "*Instance, name=I, part=P\n*End Instance\n*Nset, nset=FIX, instance=I, generate\n"
+                      "1, 2, 1x\n*End Assembly\n", "*NSET")):
+        _, conv, rep = convert_str(deck)
+        assert f"Skipped a {kw}, GENERATE line (set FIX) with non-numeric data" in rep.text(), rep.text()
+        assert f"{kw}, GENERATE line (set FIX) with non-numeric data skipped" in conv.reduced_physics
+
+
+def test_mesh_generation_fields_by_position():
+    # code review 2, R10: blank fields are positional, with Abaqus' defaults (2017 Keywords)
+    grid = "".join(f"{i + 10 * j + 1}, {i}., {j}., 0.\n" for j in range(4) for i in range(5))
+    # *ELGEN: blank row increments are 1; 4 per row, 3 rows 10 apart (was 40 elements)
+    _, conv, _ = convert_str(f"*NODE\n{grid}*ELEMENT, TYPE=CPS4, ELSET=E\n1, 1, 2, 12, 11\n"
+                             f"*ELGEN, ELSET=E\n1, 4, , , 3, 10, 10\n")
+    g = conv.geom
+    assert sorted(g.elements) == [1, 2, 3, 4, 11, 12, 13, 14, 21, 22, 23, 24]
+    assert g.elements[24][1] == [24, 25, 35, 34] and sorted(set(g.elset("E"))) == sorted(g.elements)
+    ends = "*NODE\n1, 1., 0., 0.\n11, 0., 1., 0.\n100, 0., 0., 0.\n"
+
+    def arc(card):
+        _, conv, _ = convert_str(ends + card)
+        return {n: tuple(round(c, 9) + 0.0 for c in conv.geom.nodes[n]) for n in (4, 6)}
+
+    def at(deg):
+        return (round(math.cos(math.radians(deg)), 9) + 0.0, round(math.sin(math.radians(deg)), 9) + 0.0, 0.0)
+    quarter = {4: at(27.0), 6: at(45.0)}
+    # *NGEN: a blank increment is 1 (field 4 was read as the increment: no nodes) ...
+    assert arc("*NGEN, LINE=C\n1, 11, , 100\n") == quarter
+    # ... the centre by its coordinates (fields 5-7), also in SYSTEM=C (r, theta, z)
+    assert arc("*NGEN, LINE=C\n1, 11, 1, , 0., 0., 0.\n") == quarter
+    _, conv, _ = convert_str(f"*NODE\n1, 2., 1., 0.\n11, 1., 2., 0.\n*NGEN, LINE=C, SYSTEM=C\n"
+                             f"1, 11, 1, , {math.sqrt(2.0)!r}, 45., 0.\n")
+    assert abs(conv.geom.nodes[6][0] - 1.0 - math.sqrt(0.5)) < 1e-12 and conv.geom.nodes[6][2] == 0.0
+    # ... the node takes precedence over the coordinates, and the normal is fields 8-10:
+    # about -z the arc from x to y is 270 degrees (fields 5-7 were read as the normal)
+    assert arc("*NGEN, LINE=C\n1, 11, 1, 100, 5., 5., 5.\n") == quarter
+    assert arc("*NGEN, LINE=C\n1, 11, 1, 100, 0., 0., 0., 0., 0., -1.\n") == {4: at(-81.0), 6: at(-135.0)}
+    # *NFILL: a blank increment is 1 (was skipped); a bounding node without coordinates
+    # yet is at the origin (Abaqus "Node definition"; was skipped)
+    _, conv, rep = convert_str(ends + "101, 1., 0., 1.\n*NSET, NSET=A\n1\n*NSET, NSET=B\n101\n"
+                               "*NFILL\nA, B, 4\n")
+    assert [conv.geom.nodes[n] for n in (2, 3, 4)] == [(1.0, 0.0, 0.25), (1.0, 0.0, 0.5), (1.0, 0.0, 0.75)]
+    _, conv, rep = convert_str(ends + "*NSET, NSET=A\n1\n*NSET, NSET=B\n105\n*NFILL\nA, B, 4, 25\n"
+                               "*NODE\n105, 5., 5., 5.\n")
+    assert conv.geom.nodes[51] == (0.5, 0.0, 0.0) and conv.geom.nodes[105] == (5.0, 5.0, 5.0)
+    assert "taken at the origin" in rep.text()
+
+
+def test_ncopy_multiple_translates_once():
+    # code review 2, R10: Abaqus "Node definition": "the translation is applied once before
+    # the rotation", which MULTIPLE applies m times; copy k was translated k times
+    deck = ("*NODE, NSET=A\n1, 1., 0., 0.\n*NCOPY, OLD SET=A, CHANGE NUMBER=10, SHIFT, MULTIPLE=3\n"
+            "1., , \n0., 0., 0., 0., 0., 1., 90.\n")
+    _, conv, _ = convert_str(deck)
+    got = [tuple(round(c, 9) + 0.0 for c in conv.geom.nodes[n]) for n in (11, 21, 31)]
+    assert got == [(0.0, 2.0, 0.0), (-2.0, 0.0, 0.0), (0.0, -2.0, 0.0)], got
+    # a translation alone: copy m is m translations away, as before
+    _, conv, _ = convert_str("*NODE, NSET=A\n1, 1., 0., 0.\n*NCOPY, OLD SET=A, CHANGE NUMBER=10, "
+                             "SHIFT, MULTIPLE=2\n0., 1., 0.\n")
+    assert conv.geom.nodes[21] == (1.0, 2.0, 0.0)
+    # REFLECT points by position: a blank coordinate is 0
+    _, conv, _ = convert_str("*NODE, NSET=A\n1, 1., 2., 0.\n*NCOPY, OLD SET=A, CHANGE NUMBER=10, "
+                             "REFLECT=LINE\n0., , 0., 1., 0., \n")
+    assert conv.geom.nodes[11] == (1.0, -2.0, 0.0)
+
+
 def test_mesh_generation_skips_unreadable_records():
     # a non-numeric field (here an undefined <parameter>) in a mesh-generation card skips that
     # record or card with a warning, as on *NODE, instead of aborting the conversion
@@ -13476,7 +13549,7 @@ def test_unreadable_generation_and_load_records_warned():
     _, _, rep = convert_str(deck)
     text = rep.text()
     assert "*NGEN record needs two end nodes" in text
-    assert "*NFILL between nodes 5 and 15: node 15 is not defined" in text
+    assert "*NFILL: a bounding node without coordinates is taken at the origin" in text
     assert "*NSET without NSET=" in text and "connector element 7 names no node" in text
     deck = (HEX + "*Surface, name=S\nEALL, S2\n*Solid Section, elset=EALL, material=M\n*Material, "
             "name=M\n*Elastic\n1000., 0.3\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Dsload\nS\nS, P, 1.\n"
