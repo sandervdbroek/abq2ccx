@@ -13838,6 +13838,33 @@ def test_mass_acts_as_two_step_model_aggregates():
     assert "*MATERIAL, NAME=M_SHELL_MASS" in body and "no step or load of this deck" not in rep.text()
 
 
+def test_buckle_step_holds_no_nonzero_bc_by_set_or_node_lines():
+    # _buckle_displacements keys BCs on the target text (no set expansion): a node line and a
+    # set line on one DOF are two keys.  It still leaves no nonzero BC in force in a *STEP,
+    # PERTURBATION *BUCKLE step: every key last given a nonzero value is given again at 0 (a
+    # key a later line zeroed only adds a zero line)
+    model = (HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Nset, nset=T7\n7\n*Solid Section, elset=EALL, "
+             "material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n")
+    sets = {"TOP": [5, 6, 7, 8], "T7": [7]}
+    for one, two in (("TOP, 3, 3, -0.01", "7, 3, 3, 0."), ("7, 3, 3, -0.01", "TOP, 3, 3, 0."),
+                     ("T7, 3, 3, -0.01", "7, 3, 3, 0."), ("7, 3, 3, 0.", "T7, 3, 3, -0.01")):
+        body, conv, _ = convert_str(model + f"*Step\n*Static\n*Boundary\n{one}\n{two}\n*Cload\n6, 1, 1.\n"
+                                    "*End Step\n*Step, perturbation\n*Buckle\n2\n*Boundary\nT7, 3, 3, 0.\n"
+                                    "*Cload\n6, 3, -1.\n*End Step\n")
+        held: dict = {}                     # node -> its DOF 3 value in force (no OP=NEW here)
+        card = ""
+        for ln in body[body.index("\n*STEP\n"):body.rindex("*END STEP")].splitlines():
+            if ln.startswith("*") and not ln.startswith("**"):
+                card = ln.split(",")[0]
+            elif card == "*BOUNDARY" and ln and not ln.startswith("**"):
+                f = [x.strip() for x in ln.split(",")]
+                for n in ([int(f[0])] if f[0].isdigit() else sets[f[0]]):
+                    held[n] = float(f[3]) if len(f) > 3 and f[3] else 0.0
+        assert 7 in held and set(held.values()) == {0.0}, (one, two, held)
+        assert not [r for r in conv.reduced_physics if "BUCKLE" in r]
+
+
 def test_composite_shell_plies_on_a_cylinder_follow_the_hoop():
     # a cylindrical orientation's axis 1 is radial — the shell normal on a cylinder — so ccx
     # would project nothing; Abaqus projects axis 2 (the hoop direction), axis 1 being the
