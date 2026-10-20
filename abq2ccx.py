@@ -9492,9 +9492,9 @@ class Converter:
                                           f"material or direction"
                                           + (f"; the split into one brick per layer was left out: {why}"
                                              if why else "")
-                                          + f", so its elements have no section in ccx (which stops: "
-                                            f"'no material was assigned'). Model each layer with its "
-                                            f"own elements and section.",
+                                          + ", so its elements have no section in ccx (which stops: "
+                                            "'no material was assigned'). Model each layer with its "
+                                            "own elements and section.",
                                        reduces="*SOLID SECTION, COMPOSITE")
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
@@ -23741,9 +23741,9 @@ class Converter:
         the same where the strain varies at most linearly through a layer of an undistorted
         element (C3D8, 3 or more section points; C3D8R, 1 point), else the bending through the
         stack differs (by about 1 / N^2 with N one-point layers)."""
-        b = p["block"]
         types = {self.geom.elements[e][0].upper() for e in p["elems"]}
-        same = all(n >= 3 for n in p["npts"]) if types == {"C3D8"} else             all(n == 1 for n in p["npts"]) if types == {"C3D8R"} else False
+        same = (all(n >= 3 for n in p["npts"]) if types == {"C3D8"} else
+                all(n == 1 for n in p["npts"]) if types == {"C3D8R"} else False)
         where = f"*SOLID SECTION, COMPOSITE, ELSET={p['elset']}"
         text = (f"{where}: {len(p['elems'])} element(s) written as one brick per layer "
                 f"({len(p['elems']) * len(p['plies'])} bricks, each the element's own type) with "
