@@ -18547,14 +18547,18 @@ class Converter:
 
     def _plan_s4r_shells(self) -> None:
         """The S4R shells left after the composite upgrade (_plan_quadratic_shells).  ccx 2.23
-        expands an S4R into one C3D8R brick through the thickness (gen3delem.f), integrated
-        at a single point on the mid-surface, where bending strains vanish: its bending, out
-        of plane and in plane, is resisted only by the brick's hourglass stiffness, not by
-        the section.  Probed on a simply supported square plate (16 x 16 elements): at a/t =
-        100 it deflects 1/50 of the plate solution under pressure, vibrates 7x and buckles
-        97x higher; at a/t = 10 it deflects 3.7x too much — closing in only slowly with the
-        mesh — while membrane stretching is right.  So: reduced physics, or under
-        --approximate S4 (ccx's C3D8I expansion: within 2.5 % on the same 16 x 16 plates)."""
+        expands an S4R into one C3D8R brick through the thickness (gen3delem.f: 'C3D8R L'),
+        integrated at a single point on the mid-surface, where bending strains vanish: its
+        bending, out of plane and in plane, is an hourglass mode of the brick.  ccx adds
+        hourglass stiffness to every C3D8R, the expanded shell's too (e_c3d.f: hgstiffness;
+        resultsmech.f: hgforce, about 1.34x stiffer, in steps it solves nonlinear), and that is
+        all that resists the bending — it follows the brick's size, not the section's E t^3
+        (a coarse strip deflects 10x, not 1000x, more at a tenth of the thickness).  Probed on
+        a simply supported square plate (16 x 16 elements): at a/t = 100 it deflects 1/50 of
+        the plate solution under pressure, vibrates 7x and buckles 97x higher; at a/t = 10 it
+        deflects 3.7x too much — closing in only slowly with the mesh — while membrane
+        stretching is right.  So: reduced physics, or under --approximate S4 (ccx's C3D8I
+        expansion: within 2.5 % on the same 16 x 16 plates)."""
         hits: Dict[str, int] = {}
         for e, (typ, conn) in self.geom.elements.items():
             if ccx_type(typ) != "S4R":
@@ -18568,11 +18572,11 @@ class Converter:
             return
         what = f"{'/'.join(sorted(hits))} ({sum(hits.values())} elements)"
         why = ("ccx 2.23 expands an S4R into one C3D8R brick integrated at a single point on the "
-               "mid-surface, so its bending (out of plane and in plane) is resisted only by "
-               "hourglass control, not by the section — far too stiff on thin shells, too soft "
-               "on thick ones (probed on a simply supported plate, 16 x 16 elements: at a/t = 100 "
-               "1/50 of the plate deflection, 7x the frequency, 97x the buckling load; at a/t = "
-               "10 3.7x the deflection); membrane stretching is right")
+               "mid-surface, so its bending (out of plane and in plane) is resisted only by the "
+               "hourglass stiffness ccx adds to that brick, not by the section — far too stiff "
+               "on thin shells, too soft on thick ones (probed on a simply supported plate, 16 x "
+               "16 elements: at a/t = 100 1/50 of the plate deflection, 7x the frequency, 97x the "
+               "buckling load; at a/t = 10 3.7x the deflection); membrane stretching is right")
         if self._approx:
             self.report.warn(f"[APPROX] Element {what} written as S4: {why}. ccx's S4 (a C3D8I "
                              f"brick) is Abaqus' fully integrated shell, not the deck's S4R; both "
@@ -18582,7 +18586,8 @@ class Converter:
         else:
             self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
                              f"S4 (within 2.5 % on those plates), or mesh with S4 or S8R.")
-            self._reduces("element S4R (ccx 2.23 bends it through hourglass control only)")
+            self._reduces("element S4R (ccx 2.23 bends it only through its C3D8R's hourglass "
+                          "stiffness)")
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads

@@ -7654,9 +7654,10 @@ def main():
         print("FAIL  buckle_factors_near_one: a run gave no results")
     failures += 0 if ok else 1
 
-    # ccx 2.23 expands an S4R into one C3D8R brick integrated on its mid-surface, so only
-    # hourglass control resists its bending: the deck's S4R are flagged reduced physics, and
-    # --approximate writes S4, within 3 % of the plate solution in each step
+    # ccx 2.23 expands an S4R into one C3D8R brick integrated on its mid-surface, so only the
+    # hourglass stiffness ccx adds to that brick resists its bending: the deck's S4R are
+    # flagged reduced physics, and --approximate writes S4, within 3 % of the plate solution in
+    # each step
     def centre_w(dat):
         return [abs(u[2]) for u in dat_displacements(dat).values()]
 

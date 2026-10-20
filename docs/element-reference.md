@@ -257,8 +257,8 @@ ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so eac
 | `S3` | 3 | direct; under a composite section → `S6` with midside nodes (reduced physics) |
 | `S3R` | 3 | → `S3` (exact); under a composite section → `S6` with midside nodes (reduced physics) |
 | `S4` | 4 | direct; under a composite section → `S8R` with midside nodes (reduced physics) |
-| `S4R` | 4 | direct — bends through hourglass control only in ccx 2.23 (reduced physics; `--approximate` → `S4`); under a composite section → `S8R` with midside nodes (reduced physics) |
-| `S4R5` | 4 | → `S4R` (substituted: reduced physics) — bends through hourglass control only in ccx 2.23 (reduced physics; `--approximate` → `S4`); under a composite section → `S8R` with midside nodes (reduced physics) |
+| `S4R` | 4 | direct — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`); under a composite section → `S8R` with midside nodes (reduced physics) |
+| `S4R5` | 4 | → `S4R` (substituted: reduced physics) — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`); under a composite section → `S8R` with midside nodes (reduced physics) |
 | `S6` | 6 | direct |
 | `S8` | 8 | direct |
 | `S8R` | 8 | direct |
@@ -270,7 +270,7 @@ ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so eac
 | `STRI65` | 6 | → `S6` (substituted: reduced physics) |
 | `US3` | 3 | direct |
 
-ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has no layered solid section. Linear composite shells become `S6`/`S8R` with a node at the middle of every edge, shared with the linear shells and 2-node beams joined to them by an edge, which are upgraded too. Composite continuum shells become one solid per ply, stacked from the bottom face (`STACK DIRECTION`), each its share of the thickness with its material and ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both are validated against classical lamination theory and Pagano's 3-D solution (`validate_with_ccx.py composite_plate_*`). ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single point on the mid-surface, so only hourglass control resists its bending (a simply supported plate, a/t 100: deflection 1/50, buckling load 97×); `--approximate` writes `S4`, within 2.5 % there (`validate_with_ccx.py s4r_plate_*`).
+ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has no layered solid section. Linear composite shells become `S6`/`S8R` with a node at the middle of every edge, shared with the linear shells and 2-node beams joined to them by an edge, which are upgraded too. Composite continuum shells become one solid per ply, stacked from the bottom face (`STACK DIRECTION`), each its share of the thickness with its material and ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both are validated against classical lamination theory and Pagano's 3-D solution (`validate_with_ccx.py composite_plate_*`). ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single point on the mid-surface, so only the hourglass stiffness ccx adds to that brick resists its bending, not the section (a simply supported plate, a/t 100: deflection 1/50, buckling load 97×); `--approximate` writes `S4`, within 2.5 % there (`validate_with_ccx.py s4r_plate_*`).
 
 ## surface (load carrier)
 

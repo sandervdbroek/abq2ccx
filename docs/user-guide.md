@@ -81,7 +81,7 @@ a different model without saying so. With it, these reframings are made, each wi
   bodies) → written in its linear form;
 * an `*MPC LINK` → ccx's distance MPC in a deck whose first step is linear and a later one
   NLGEOM;
-* `S4R` shells (ccx 2.23 bends them through hourglass control only) → `S4`.
+* `S4R` shells (ccx 2.23 bends them only through their `C3D8R`'s hourglass stiffness) → `S4`.
 
 ## `--abaqus-umat`
 

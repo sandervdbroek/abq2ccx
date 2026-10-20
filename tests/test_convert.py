@@ -51,7 +51,7 @@ def convert_str(text, **overrides):
         os.unlink(path)
 
 
-S4R_FLAG = "element S4R (ccx 2.23 bends it through hourglass control only)"
+S4R_FLAG = "element S4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"
 
 
 def other_reduced(conv):
@@ -11471,10 +11471,11 @@ def test_composite_s4r_becomes_s8r_with_shared_midside_nodes():
     assert "*ELSET, ELSET=PLATE\n1, 2" in body
 
 
-def test_plain_s4r_bends_through_hourglass_control_only():
-    # ccx 2.23 expands an S4R into one C3D8R brick integrated on its mid-surface, so only
-    # hourglass control resists its bending (probed: an a/t = 100 plate 50x / 7x / 97x too
-    # stiff in statics / frequency / buckling): reduced physics; --approximate writes S4
+def test_plain_s4r_bends_only_through_hourglass_stiffness():
+    # ccx 2.23 expands an S4R into one C3D8R brick integrated on its mid-surface, so only the
+    # hourglass stiffness ccx adds to that brick resists its bending (probed: an a/t = 100
+    # plate 50x / 7x / 97x too stiff in statics / frequency / buckling): reduced physics;
+    # --approximate writes S4
     deck = (S4R_STRIP + "*Shell Section, elset=PLATE, material=CFRP\n0.1\n*Step\n*Buckle\n2\n"
             "*Boundary\nCLAMP, ENCASTRE\n*Cload\nTIP, 1, -1.\n*End Step\n")
     body, conv, rep = convert_str(deck)
