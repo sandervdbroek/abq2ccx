@@ -7503,13 +7503,36 @@ def test_equation_held_by_bcs_in_some_steps():
                                       "7, 2, 2\n*Cload\n5, 1, 1.\n"))
     assert _equations(body) == ["6,2,-1.,7,2,1."] and "no BC on node 6 DOF 2 here" in body
     assert body.count("\n7, 2, 2\n") == 2
-    # each DOF held alone in a step, or held at a nonzero value: no DOF can go (warned)
-    for steps in ((static.format("*Boundary\n7, 2, 2\n*Cload\n5, 1, 1.\n"),
-                   static.format("*Boundary, op=NEW\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n6, 2, 2\n"
-                                 "*Cload\n5, 1, 1.\n")),
-                  (freq.format("*Boundary\n7, 2, 2, 0.1\n6, 2, 2, 0.1\n"), static.format(load))):
-        body, _, rep = conv(*steps)
-        assert "no BC on node" not in body and "node 7 DOF 2 is on the dependent side" in rep
+    # each DOF held alone in a step ('crossed', at zero): the dependent DOF's BC moves onto the
+    # other, which its step leaves free (the same constraint there; probed: validate
+    # equation_crossed)
+    body, _, rep = conv(static.format("*Boundary\n7, 2, 2\n*Cload\n5, 1, 1.\n"),
+                        static.format("*Boundary, op=NEW\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n6, 2, 2\n"
+                                      "*Cload\n5, 1, 1.\n"))
+    assert "*BOUNDARY\n** abq2ccx: the BC on node 7 DOF 2 given to node 6 DOF 2: the *EQUATION " \
+           "holds it at zero from there\n6, 2, 2\n*CLOAD" in body and "overconstraint" not in rep
+    assert _equations(body) == ["7,2,1.,6,2,-1."]
+    # held at nonzero values the equation satisfies (on one amplitude): the BC goes
+    body, _, rep = conv(freq.format("*Boundary\n7, 2, 2, 0.1\n6, 2, 2, 0.1\n"), static.format(load))
+    assert "no BC on node 7 DOF 2 here" in body and "\n6, 2, 2, 0.1\n" in body and "overconstraint" not in rep
+    # crossed with one of them held at a nonzero value: the zero one's BC moves
+    two = static.format("*Boundary, op=NEW\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n6, 2, 2{}\n"
+                        "*Cload\n5, 1, 1.\n")
+    body, _, rep = conv(static.format("*Boundary\n7, 2, 2, 0.1\n*Cload\n5, 1, 1.\n"), two.format(""))
+    assert "\n7, 2, 2, 0.1\n" in body and "the BC on node 6 DOF 2 given to node 7 DOF 2: the " \
+           "*EQUATION holds it at zero from there\n7, 2, 2\n*CLOAD" in body
+    assert _equations(body) == ["6,2,-1.,7,2,1."] and "overconstraint" not in rep
+    # crossed at nonzero values, values it does not satisfy, or on two amplitudes: no DOF can
+    # go (warned)
+    amp = head.replace("*Equation", "*Amplitude, name=A2\n0., 0., 1., 2.\n*Equation")
+    for h, steps in ((head, (static.format("*Boundary\n7, 2, 2, 0.1\n*Cload\n5, 1, 1.\n"),
+                             two.format(", 0.2"))),
+                     (head, (freq.format("*Boundary\n7, 2, 2, 0.1\n6, 2, 2, 0.2\n"), static.format(load))),
+                     (amp, (static.format("*Boundary\n7, 2, 2, 0.1\n*Boundary, amplitude=A2\n"
+                                          "6, 2, 2, 0.1\n"),))):
+        body, _, rep = convert_str(h + "".join(steps))
+        assert "no BC on node" not in body and "given to node" not in body
+        assert "node 7 DOF 2 is on the dependent side" in rep.text()
 
 
 BUCKLE_CUBE = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Elset, elset=ROT\n1\n*Material, name=M\n"

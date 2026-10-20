@@ -6,6 +6,11 @@ physics.
 
 ## Unreleased
 
+* **More `*EQUATION`s held by BCs in some steps** — two more cases no longer stop ccx 2.23
+  ('dependent side of a MPC and a SPC'). In the first, each step holds one DOF of the equation
+  ("crossed" holds); the BC at zero moves onto the DOF that step leaves free. In the second,
+  the DOFs are held at nonzero values the equation satisfies, on one amplitude; the BC on the
+  eliminated DOF goes. Both are exact (probed).
 * **Where mass acts** — four planners asked it with two rules and two procedure lists. The
   StepModel now holds both: inertia (a dynamic or eigenvalue step) and weight (a GRAV,
   CENTRIF, ... load too). `*DYNAMIC TEMPERATURE-DISPLACEMENT` counts as inertia now, so a

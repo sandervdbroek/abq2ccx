@@ -3160,6 +3160,30 @@ def between_steps_deck(twin=False):
             "*STEP\n*STATIC\n" + (move if twin else "") + "*BOUNDARY\n6, 2, 2, 0.005\n*END STEP\n")
 
 
+def equation_steps_deck(case):
+    """A C3D8 cube (E 1000, nu 0.3) clamped at z = 0, with *EQUATION u2(7) = u2(6) between two top
+    corners, in two static steps.  ``case`` "crossed": step 1 holds u2(7) at 0 alone, step 2 (OP=NEW)
+    u2(6) alone, a corner pulled along x; "crossed_ref": both held in both steps, no equation;
+    "nonzero": step 1 holds both at 0.1, step 2 frees them and pulls the tied DOFs along y;
+    "nonzero_r1" / "nonzero_r2": step 1 without the equation / step 2 alone."""
+    head = ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=ALL\n1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n")
+    eq = "" if case in ("crossed_ref", "nonzero_r1") else "*EQUATION\n2\n7, 2, 1., 6, 2, -1.\n"
+    pr, new = "*NODE PRINT, NSET=ALL\nU\n", "*BOUNDARY, OP=NEW\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+    if case.startswith("crossed"):
+        both = case == "crossed_ref"
+        return (head + eq + "*STEP\n*STATIC\n*BOUNDARY\n7, 2, 2\n" + ("6, 2, 2\n" if both else "") +
+                "*CLOAD\n7, 1, 1.\n" + pr + "*END STEP\n*STEP\n*STATIC\n" + new + "6, 2, 2\n" +
+                ("7, 2, 2\n" if both else "") + "*CLOAD\n7, 1, 2.\n" + pr + "*END STEP\n")
+    one = "*STEP\n*STATIC\n*BOUNDARY\n7, 2, 2, 0.1\n6, 2, 2, 0.1\n*CLOAD\n7, 1, 1.\n" + pr + "*END STEP\n"
+    two = "*STEP\n*STATIC\n" + ("" if case == "nonzero_r2" else new) + "*CLOAD\n" + \
+        ("7, 1, 1.\n" if case == "nonzero_r2" else "") + "7, 2, 10.\n" + pr + "*END STEP\n"
+    return head + eq + ("" if case == "nonzero_r2" else one) + ("" if case == "nonzero_r1" else two)
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -9382,6 +9406,25 @@ def main():
               f"({err:.1e} apart; the loaded corner moved {side:.4g})")
     elif all(runs):
         print(f"FAIL  between_steps: {len(runs[0])} and {len(runs[1])} printed blocks")
+    failures += 0 if ok else 1
+
+    # an *EQUATION whose DOFs other steps hold ("crossed"), or held at nonzero values it
+    # satisfies (ccx stopped: a BC on its dependent DOF, '*ERROR in cascade')
+    runs = {c: review_run(equation_steps_deck(c), "equation_" + c, dat_node_blocks)
+            for c in ("crossed", "crossed_ref", "nonzero", "nonzero_r1", "nonzero_r2")}
+    ok = all(runs.values()) and len(runs["crossed"]) == len(runs["nonzero"]) == 2
+    if ok:
+        e1, moved = same([runs["crossed"], runs["crossed_ref"]])
+        e2, _ = same([runs["nonzero"][:1], runs["nonzero_r1"]])
+        e3, _ = same([runs["nonzero"][1:], runs["nonzero_r2"]])
+        tie = abs(runs["nonzero"][1].get(7, [0.0, math.inf])[1] - runs["nonzero"][1].get(6, [0.0, math.nan])[1])
+        ok = max(e1, e2, e3, tie) < 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  equation_crossed / _nonzero (*EQUATION u2(7) = u2(6) on a "
+              f"cube, held by BCs on one DOF per step, or on both at 0.1): solved as without the "
+              f"equation where the BCs hold it ({e1:.1e}, {e2:.1e} apart) and as the tied step alone "
+              f"({e3:.1e} apart; tied DOFs {tie:.1e} apart; moved {moved:.3g})")
+    elif all(runs.values()):
+        print(f"FAIL  equation_crossed / _nonzero: {len(runs['crossed'])}, {len(runs['nonzero'])} tables")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

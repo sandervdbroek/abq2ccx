@@ -26991,6 +26991,9 @@ class Converter:
         spc: set = set()
         bc_cards: List[Block] = []              # *STEP, *END STEP and *BOUNDARY, for bc_steps
         given: Dict[int, List[Tuple[Tuple[int, int], bool]]] = {}   # a *BOUNDARY's entries
+        # ... and their values: (value, the card's amplitude), value None where not a plain
+        # displacement (FIXED, unreadable)
+        valued: Dict[int, List[Tuple[Tuple[int, int], Tuple[Optional[float], str]]]] = {}
         writes: Dict[Tuple[int, int], set] = {}                     # (node, DOF) -> its BC lines
         transformed: set = set()
         tcard: Dict[int, Optional[Tuple[str, Vec, Vec]]] = {}   # node -> its (last) *TRANSFORM
@@ -27007,6 +27010,8 @@ class Converter:
             elif kw == "BOUNDARY":
                 bc_cards.append(Block(kw, params))
                 entries = given[id(bc_cards[-1])] = []
+                values = valued[id(bc_cards[-1])] = []
+                amp = (params.get("AMPLITUDE") or "").strip().upper()
                 for j in card.rows:
                     f = fields(j)
                     if len(f) < 2 or not isint(f[1]):
@@ -27014,13 +27019,16 @@ class Converter:
                     d1 = int(f[1])
                     d2 = int(f[2]) if len(f) > 2 and isint(f[2]) else d1
                     try:
-                        z = "FIXED" not in params and (len(f) < 4 or pf(f[3]) == 0.0)
+                        v: Optional[float] = None if "FIXED" in params else \
+                            pf(f[3]) if len(f) > 3 and f[3] else 0.0
                     except ValueError:
-                        z = False
+                        v = None
+                    z = v == 0.0
                     for n in nodes_of(f[0]):
                         for d in range(min(d1, d2), max(d1, d2) + 1):
                             spc.add((n, d))
                             entries.append(((n, d), z))
+                            values.append(((n, d), (v, amp)))
                             bc_first.setdefault((n, d), ci)
                             writes.setdefault((n, d), set()).add(j)
             elif kw == "TRANSFORM":
@@ -27165,24 +27173,43 @@ class Converter:
         # held at zero by a BC in every step (a linear perturbation step's BCs end with it:
         # _restore_base_states frees them in the next general step)
         eq_dofs = {(n, d) for _, terms in eqs for n, d, _ in terms}
-        steps: List[Dict[Tuple[int, int], bool]] = []         # each step's BCs on those
-        held: Optional[set] = None
+        steps: List[Dict[Tuple[int, int], Tuple[Optional[float], str]]] = []   # each step's BCs
+        held: Optional[set] = None                                               # on those
         for active in bc_steps(bc_cards, lambda b: given[id(b)], self._pert_idx):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
-            steps.append({k: z for k, z in active.items() if k in eq_dofs})
+        for active in bc_steps(bc_cards, lambda b: valued[id(b)], self._pert_idx):
+            steps.append({k: va for k, va in active.items() if k in eq_dofs})
         held = held or set()
-        released: set = set()
+        released: Dict[Tuple[int, int], Tuple[int, int]] = {}    # DOF -> itself, or where its BC went
 
-        def releasable(k: Tuple[int, int], res: Dict[Tuple[int, int], float]) -> bool:
-            """Whether ``k``'s BCs can go so that the equation ``res`` eliminates it: every
-            step that holds it holds it at zero, with the equation's other DOFs (then the
-            equation holds it there)."""
+        def release_to(k: Tuple[int, int], res: Dict[Tuple[int, int], float], move: bool = True
+                       ) -> Optional[Tuple[int, int]]:
+            """Where ``k``'s BCs can go so that the equation ``res`` eliminates it, or None:
+            ``k`` itself (they go) where every step that holds it holds all the equation's
+            DOFs at values it satisfies (the nonzero ones on one amplitude: at every time),
+            so the equation holds it there; with ``move``, a DOF ``j`` of it (they hold ``j``
+            instead, at zero) where every such step holds them all at zero but ``j``, which
+            some leave free ('crossed' holds): the equation and the others' zeros make k = 0
+            and j = 0 the same constraint there."""
             if k not in spc or k[0] in transformed or k in busy or k in taken_too or \
                     k in released or k in accepted:
-                return False
+                return None
             hit = [a for a in steps if k in a]
-            return bool(hit) and all(a[k] and all(a.get(q) for q in res if q != k) for a in hit)
+            if not hit or any(a[k][0] is None for a in hit):
+                return None
+            if all(all(q in a and a[q][0] is not None for q in res) and
+                   len({a[q][1] for q in res if a[q][0]}) <= 1 and
+                   abs(sum(c * a[q][0] for q, c in res.items())) <=
+                   1e-9 * sum(abs(c * a[q][0]) for q, c in res.items()) for a in hit):
+                return k
+            free = {q for a in hit for q in res if q != k and q not in a}
+            if not move or len(free) != 1 or any(a[k][0] != 0.0 for a in hit):
+                return None
+            j = free.pop()
+            if j in busy or j in taken_too or j in accepted or j in released or j[0] in transformed:
+                return None
+            return j if all(a[q][0] == 0.0 for a in hit for q in res if q != k and q in a) else None
         # Accept the equations in deck order, each reduced by the ones accepted before it
         # (their eliminated DOFs substituted): one that reduces to 0 = 0 — a duplicate, or
         # one closing a loop of ties — holds whenever the others do and is dropped; ccx
@@ -27249,9 +27276,10 @@ class Converter:
             alt = None if several else \
                 next((k for k in (res or {}) if k not in taken and k not in accepted and
                       ccx_pick(k, res) is not None), None)
+            # (a DOF whose BCs can just go first, then one whose BCs move)
             rel = None if alt is not None or res is None else \
-                next((k for k in order + [q for q in res if q not in dofs]
-                      if abs(res.get(k, 0.0)) > tol and releasable(k, res) and
+                next((k for move in (False, True) for k in order + [q for q in res if q not in dofs]
+                      if abs(res.get(k, 0.0)) > tol and release_to(k, res, move) is not None and
                       (dofs.count(k) == 1 and abs(coef[k]) > tol if k in dofs else not several)),
                      None)
             if alt is not None:
@@ -27266,9 +27294,11 @@ class Converter:
                 rewritten += 1
             elif rel is not None:
                 # every DOF of it has a BC, but the steps that hold ``rel`` hold the others at
-                # zero too: its BCs go and the equation holds it there instead (the same
-                # state); the steps that free it keep the tie
-                released.add(rel)
+                # values the equation satisfies (or at zero but one, which holds ``rel``'s BC
+                # instead): its BCs go and the equation holds it there (the same state); the
+                # steps that free it keep the tie
+                released[rel] = release_to(rel, res)
+                taken.add(released[rel])
                 src = coef if rel in dofs else res
                 accepted[rel] = {q: -c / src[rel] for q, c in src.items() if q != rel}
                 if rel in dofs:
@@ -27312,7 +27342,8 @@ class Converter:
                              f"another constraint. CalculiX will stop with '*ERROR in cascade ... "
                              f"dependent side of a MPC and a SPC' (or '... two different MPC's'). "
                              f"Remove the BC or the constraint on that DOF.", once=True)
-        # the released DOFs' *BOUNDARY lines, written again without them
+        # the released DOFs' *BOUNDARY lines, written again without them (a moved one's on the
+        # DOF that holds it instead)
         swap: Dict[int, List[str]] = {}
         for j in sorted({j for k in released for j in writes[k]}):
             f = fields(j)
@@ -27321,19 +27352,30 @@ class Converter:
             tail = "".join(", " + x for x in f[3:])
             gone = sorted(k for k in released if j in writes[k])
             swap[j] = [f"** abq2ccx: no BC on node {n} DOF {d} here: the *EQUATION holds it "
-                       f"(its other DOFs are held)" for n, d in gone[:3]]
+                       f"(its other DOFs are held)" if released[(n, d)] == (n, d) else
+                       f"** abq2ccx: the BC on node {n} DOF {d} given to node {released[(n, d)][0]} "
+                       f"DOF {released[(n, d)][1]}: the *EQUATION holds it at zero from there"
+                       for n, d in gone[:3]]
             for n in dict.fromkeys(nodes_of(f[0])):
                 keep = [d for d in range(min(d1, d2), max(d1, d2) + 1) if (n, d) not in gone]
                 for a, b in zip([d for d in keep if d - 1 not in keep],
                                 [d for d in keep if d + 1 not in keep]):
                     swap[j].append(f"{n}, {a}, {b}{tail}")
+            swap[j] += [f"{m}, {e}, {e}{tail}" for k in gone for m, e in [released[k]] if (m, e) != k]
+        if any(k != to for k, to in released.items()):
+            self.report.note("*EQUATION whose DOFs are held in different steps: a DOF's *BOUNDARY "
+                             "(at zero) moved onto the equation's DOF the step leaves free, the "
+                             "others held at zero there: the same constraint, and the equation's "
+                             "DOF stays free of BCs (ccx stops on a DOF that is both: '*ERROR in "
+                             "cascade ... dependent side of a MPC and a SPC').", once=True)
         if released:                # (a card left without a line stays: ccx 2.23 takes it)
             self.report.note(f"*EQUATION: the *BOUNDARY on {len(released)} DOF(s) dropped that "
                              f"are on an equation every DOF of which has a BC in some step (ccx "
                              f"stops on a DOF that is both: '*ERROR in cascade ... dependent side "
                              f"of a MPC and a SPC'): each step that held such a DOF holds the "
-                             f"equation's other DOFs at zero too, so the equation holds it there, "
-                             f"and the steps that free them keep the equation — as in Abaqus.")
+                             f"equation's other DOFs at values it satisfies (or at zero but one, "
+                             f"which is held at zero instead), so the equation holds it there, and "
+                             f"the steps that free them keep the equation — as in Abaqus.")
         return self._with_equations(deck, eqs, final, swap)
 
     @staticmethod
