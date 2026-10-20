@@ -3624,6 +3624,21 @@ def circ_override_deck(override=True):
             "11, 4, 6, 0.\n*CLOAD\n21, 2, -100.\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
 
 
+def lc2_planar_deck(lc2=True, n=10):
+    """A B21 column (L 4, a 0.1 x 0.1 RECT, E 2.1e11) along y, its foot clamped in the plane
+    (DOFs 1, 2, 6) by the *BUCKLE step's LOAD CASE=1 card, its top loaded by -1 along y.
+    ``lc2``: a LOAD CASE=2 card (buckling-mode BCs) clamps the foot with ENCASTRE (the same DOFs
+    in a 2-D model); else none."""
+    nodes = "".join(f"{i + 1}, 0., {4.0 * i / n}\n" for i in range(n + 1))
+    els = "".join(f"{i + 1}, {i + 1}, {i + 2}\n" for i in range(n))
+    return ("*NODE\n" + nodes + "*ELEMENT, TYPE=B21, ELSET=COL\n" + els +
+            "*BEAM SECTION, ELSET=COL, MATERIAL=STEEL, SECTION=RECT\n0.1, 0.1\n0., 0., -1.\n"
+            "*MATERIAL, NAME=STEEL\n*ELASTIC\n2.1e11, 0.3\n*STEP\n*BUCKLE\n2\n"
+            "*BOUNDARY, OP=NEW, LOAD CASE=1\n1, 1, 2\n1, 6, 6\n" +
+            ("*BOUNDARY, OP=NEW, LOAD CASE=2\n1, ENCASTRE\n" if lc2 else "") +
+            f"*CLOAD\n{n + 1}, 2, -1.\n*END STEP\n")
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -11858,6 +11873,25 @@ def main():
               f"({err:.1e} apart; tip {moved:.7g}; with the knot beam it was 3.1e-4 apart)")
     elif all(runs):
         print(f"FAIL  circ_override: {len(runs[0])}, {len(runs[1])} printed blocks")
+    failures += 0 if ok else 1
+
+    # a *BUCKLE step's LOAD CASE=2 card (left out: ccx has one set of BCs per step) counted as
+    # holding the B21 column foot's twist, so the planar constraint held none: ccx buckled the
+    # free twist (factors 0.96, 1.04)
+    title = "B U C K L I N G   F A C T O R   O U T P U T"
+    runs = [review_run(lc2_planar_deck(c), "lc2_planar" + ("" if c else "_ref"),
+                       lambda dat: dat_eigen_table(dat, title)) for c in (True, False)]
+    ok = all(runs) and len(runs[0]) == len(runs[1]) == 2
+    if ok:
+        ref = math.pi ** 2 * 2.1e11 * 0.1 ** 4 / 12 / (4 * 4.0 ** 2)      # cantilever: pi^2 E I / (4 L^2)
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(*runs))
+        ok = err < 1e-9 and abs(runs[0][0] / ref - 1) < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  lc2_planar (B21 column, *BUCKLE, LOAD CASE=1 clamping the "
+              f"foot in the plane, LOAD CASE=2 with ENCASTRE): factors {runs[0][0]:.6g}, "
+              f"{runs[0][1]:.6g}, as without the LOAD CASE=2 card ({err:.1e} apart), the "
+              f"cantilever's {ref:.6g} (before: 0.96, the twist free)")
+    elif all(runs):
+        print(f"FAIL  lc2_planar: {len(runs[0])}, {len(runs[1])} factors")
     failures += 0 if ok else 1
 
 

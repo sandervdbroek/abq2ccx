@@ -15756,7 +15756,8 @@ class Converter:
         for b in blocks:
             if b.keyword == "STEP":
                 step += 1
-            elif b.keyword in ("BOUNDARY", "CLOAD") and step <= steps[-1]:
+            elif b.keyword in ("BOUNDARY", "CLOAD") and step <= steps[-1] and \
+                    id(b) not in self.steps.lc2:
                 turned.update(n for n, its in self._rot_items(b, own).items()
                               if any(v != 0.0 for _, v in its))
         sections, at = self._knot_sections(blocks), self._elements_at(own)
@@ -20469,10 +20470,11 @@ class Converter:
               self._truss_hub_bc) if hubs else [])
 
     def _rotations_acted_on(self, blocks: List[Block], node: int) -> bool:
-        """Whether a *BOUNDARY or *CLOAD of the deck acts on a rotation (DOF 4-6) of ``node``."""
+        """Whether a *BOUNDARY or *CLOAD of the deck acts on a rotation (DOF 4-6) of ``node``
+        (a *BUCKLE step's LOAD CASE=2 card, which the conversion leaves out, does not)."""
         isint = re.compile(r"[-+]?\d+").fullmatch
         for b in blocks:
-            if b.keyword not in ("BOUNDARY", "CLOAD"):
+            if b.keyword not in ("BOUNDARY", "CLOAD") or id(b) in self.steps.lc2:
                 continue
             for rec in merged_data_records(b):
                 f = trimmed_fields(rec)
@@ -26757,8 +26759,9 @@ class Converter:
         # at a held membrane node another element shares, the membranes' share is missing
         shared = {n for e in self._qmem for n in els[e][1]} & \
             {n for e, (_t, c) in els.items() if e not in self._qmem for n in c}
-        held = {n for b in blocks if b.keyword == "BOUNDARY" for r in merged_data_records(b)
-                if r and r[0].strip() for n in self._resolve_nodes(r[0].strip())}
+        held = {n for b in blocks if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2
+                for r in merged_data_records(b) if r and r[0].strip()
+                for n in self._resolve_nodes(r[0].strip())}
         if shared & held:
             self.report.warn(f"{len(shared & held)} node(s) held by a *BOUNDARY belong to quadratic "
                              f"membranes written as solids and to other elements: ccx's RF there "
@@ -28522,11 +28525,12 @@ class Converter:
 
     def _rotation_used(self, n: int, blocks: List[Block]) -> bool:
         """Whether the deck uses the rotation of node ``n`` in a way that depends on its axes: a
-        *BOUNDARY on DOFs 4-6 other than all three held at zero (the same in any axes), a
-        *CLOAD or an *EQUATION term there, a connector constraining it, or the rigid body of
-        *MPC BEAM lines on it."""
+        *BOUNDARY on DOFs 4-6 other than all three held at zero (the same in any axes; not a
+        *BUCKLE step's LOAD CASE=2 card, which the conversion leaves out), a *CLOAD or an
+        *EQUATION term there, a connector constraining it, or the rigid body of *MPC BEAM lines
+        on it."""
         for b in blocks:
-            if b.keyword == "BOUNDARY":
+            if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2:
                 fixed = (b.param("TYPE") or "DISPLACEMENT").strip().upper() != "DISPLACEMENT" or \
                     b.has("FIXED") or b.has("USER")
                 got: Dict[int, float] = {}
@@ -29677,8 +29681,9 @@ class Converter:
         return [x for k in (1, 2, 3) for x in ("*EQUATION", "2", f"{rot}, {k}, 1., {ref}, {k + 3}, -1.")]
 
     def _boundary_dofs(self, blocks: List[Block]) -> set:
-        """(node, dof) pairs a *BOUNDARY constrains in any step."""
-        return {(n, d) for b in blocks if b.keyword == "BOUNDARY"
+        """(node, dof) pairs a *BOUNDARY constrains in any step (but a *BUCKLE step's LOAD
+        CASE=2 cards, which the conversion leaves out: StepModel.lc2)."""
+        return {(n, d) for b in blocks if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2
                 for nodes, dofs, _ in self._bc_records(b) for n in nodes for d in dofs}
 
     def _bc_records(self, b: Block, rot: Optional[bool] = None,
@@ -32275,10 +32280,11 @@ class Converter:
             yield nodes, set(dofs), moving or mag != 0.0     # NaN (a *PARAMETER name): moves
 
     def _bc_dofs_by_node(self, blocks: List[Block]) -> Dict[int, set]:
-        """Every DOF some *BOUNDARY (model data or any step) prescribes, per node."""
+        """Every DOF some *BOUNDARY (model data or any step; no LOAD CASE=2 card of a *BUCKLE
+        step: StepModel.lc2) prescribes, per node."""
         dofs: Dict[int, set] = {}
         for b in blocks:
-            if b.keyword != "BOUNDARY":
+            if b.keyword != "BOUNDARY" or id(b) in self.steps.lc2:
                 continue
             for nodes, ds, _moves in self._boundary_records(b):
                 for n in nodes:

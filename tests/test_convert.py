@@ -13568,6 +13568,21 @@ def test_buckle_load_case_two_cards_are_no_bcs():
             "*BOUNDARY, LOAD CASE=2\n1, 1, 6\n5, 4, 4\n*CLOAD\n5, 3, -1.\n*END STEP\n")
     body, conv, _ = convert_str(deck)
     assert conv._knots == {} and "ABQ2CCX_KNOT" not in body, body
+    # nor do the step-insensitive unions (_boundary_dofs, _bc_dofs_by_node, ...): a B21 column
+    # whose LOAD CASE=2 card alone holds the foot's twist gets the planar constraint's hold
+    # there (ccx buckled the free twist: factors 0.96, 1.04; validate: lc2_planar)
+    nodes = "".join(f"{i + 1}, 0., {i}.\n" for i in range(5))
+    planar = ("*NODE\n" + nodes + "*ELEMENT, TYPE=B21, ELSET=COL\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n"
+              "*BEAM SECTION, ELSET=COL, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n0., 0., -1.\n"
+              "*MATERIAL, NAME=M\n*ELASTIC\n2.1e11, 0.3\n*STEP\n*BUCKLE\n2\n"
+              "*BOUNDARY, OP=NEW, LOAD CASE=1\n1, 1, 2\n1, 6, 6\n*BOUNDARY, OP=NEW, LOAD CASE=2\n"
+              "1, ENCASTRE\n*CLOAD\n5, 2, -1.\n*END STEP\n")
+    body, conv, _ = convert_str(planar)
+    assert "ABQ2CCX_PLANAR, 3, 3\n1, 4, 5\n" in body
+    blocks = A.blocks_from_lines(planar.splitlines())
+    conv.steps = A.StepModel(blocks)
+    assert conv._boundary_dofs(blocks) == {(1, 1), (1, 2), (1, 6)}
+    assert conv._bc_dofs_by_node(blocks) == {1: {1, 2, 6}}
 
 
 def test_one_perturbation_step_rule():
