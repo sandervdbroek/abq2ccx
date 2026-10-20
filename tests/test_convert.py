@@ -11691,6 +11691,40 @@ def test_buckle_load_case_two_cards():
     assert conv.reduced_physics == ["*BUCKLE buckling-mode BCs (*BOUNDARY, LOAD CASE=2)"]
 
 
+def test_buckle_load_case_two_cards_are_no_bcs():
+    # the LOAD CASE=2 cards are left out, so no planner counts them as BCs (StepModel.lc2):
+    # bc_steps and op_new_cards skip them, as if absent
+    blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*BUCKLE\n2\n*BOUNDARY, OP=NEW, LOAD CASE=2
+2, 1, 1\n*BOUNDARY, LOAD CASE=1\n3, 1, 1\n*END STEP""")
+    assert m.lc2 == {id(blocks[3])} and m.op_new["BOUNDARY"] == frozenset()
+    assert A.op_new_cards(blocks) == {id(blocks[3])} and A.op_new_cards(blocks, skip=m.lc2) == set()
+    entries = lambda b: [(ln.split(",")[0], 0) for ln in b.data]  # noqa: E731
+    assert [set(st) for st in A.bc_steps(blocks, entries)] == [{"2", "3"}]
+    assert [set(st) for st in A.bc_steps(blocks, entries, skip=m.lc2)] == [{"1", "3"}]
+    # a column held at its top in step 1, whose *BUCKLE step's LOAD CASE=1 clamps the foot only
+    # (OP=NEW) and LOAD CASE=2 holds the top too: the OP=NEW stays (it removes the top's BC,
+    # and the foot's rotations get a knot beam: _plan_op_new_rotations), not dropped as if the
+    # step re-specified every BC in force
+    nodes = "".join(f"{i + 1}, 0., 0., {i}.\n" for i in range(5))
+    beam = ("*NODE\n" + nodes + "*ELEMENT, TYPE=B31, ELSET=COL\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n"
+            "*BEAM SECTION, ELSET=COL, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n2.1e11, 0.3\n")
+    deck = (beam + "*BOUNDARY\n1, 1, 6\n5, 1, 1\n*STEP\n*STATIC\n*CLOAD\n5, 3, -1.\n*END STEP\n"
+            "*STEP, PERTURBATION\n*BUCKLE\n2\n*BOUNDARY, OP=NEW, LOAD CASE=1\n1, 1, 6\n"
+            "*BOUNDARY, OP=NEW, LOAD CASE=2\n1, 1, 6\n5, 1, 1\n*CLOAD\n5, 3, -1.\n*END STEP\n")
+    body, conv, _ = convert_str(deck)
+    assert "*BOUNDARY, OP=NEW\n1, 1, 6" in _step(body, 2) and "OP=NEW dropped" not in body, body
+    assert set(conv._knots) == {1}
+    assert conv.reduced_physics == ["*BUCKLE buckling-mode BCs (*BOUNDARY, LOAD CASE=2)"]
+    # a circular-section beam whose LOAD CASE=2 card alone holds an end node's twist: no knot
+    circ = beam.replace("SECTION=RECT\n0.1, 0.1", "SECTION=CIRC\n0.05").replace("B31", "B32") \
+        .replace("1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5", "1, 1, 2, 3\n2, 3, 4, 5")
+    deck = (circ + "*STEP\n*BUCKLE\n2\n*BOUNDARY, LOAD CASE=1\n1, 1, 6\n"
+            "*BOUNDARY, LOAD CASE=2\n1, 1, 6\n5, 4, 4\n*CLOAD\n5, 3, -1.\n*END STEP\n")
+    body, conv, _ = convert_str(deck)
+    assert conv._knots == {} and "ABQ2CCX_KNOT" not in body, body
+
+
 def _normal_rows(body):
     return [[float(x) for x in ln.split(",")] for ln in _card(body, "*NORMAL")]
 

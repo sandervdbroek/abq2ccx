@@ -3113,6 +3113,21 @@ def equation_held_deck(steps="both"):
             ("" if steps == "static" else freq) + ("" if steps == "freq" else static))
 
 
+def lc2_column_deck(n=20):
+    """A B31 column along z (length 4, ``n`` elements, RECT 0.1 x 0.1, E 2.1e11) clamped at its
+    foot and held in x at its top: a static step loading it, then a *STEP, PERTURBATION
+    *BUCKLE step whose LOAD CASE=1 BCs (OP=NEW) clamp the foot only and whose LOAD CASE=2 BCs
+    hold the top in x too, under a unit axial load."""
+    top = n + 1
+    return ("*NODE\n" + "".join(f"{i + 1}, 0., 0., {4.0 * i / n!r}\n" for i in range(n + 1)) +
+            "*ELEMENT, TYPE=B31, ELSET=COL\n" + "".join(f"{i + 1}, {i + 1}, {i + 2}\n" for i in range(n)) +
+            "*BEAM SECTION, ELSET=COL, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n"
+            f"*MATERIAL, NAME=M\n*ELASTIC\n2.1e11, 0.3\n*BOUNDARY\n1, 1, 6\n{top}, 1, 1\n"
+            f"*STEP\n*STATIC\n*CLOAD\n{top}, 3, -1.\n*END STEP\n"
+            "*STEP, PERTURBATION\n*BUCKLE\n2\n*BOUNDARY, OP=NEW, LOAD CASE=1\n1, 1, 6\n"
+            f"*BOUNDARY, OP=NEW, LOAD CASE=2\n1, 1, 6\n{top}, 1, 1\n*CLOAD\n{top}, 3, -1.\n*END STEP\n")
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -9286,6 +9301,24 @@ def main():
                   f" body, its mass on a member node in no other element): f = {f[0]:.7g} "
                   f"(sqrt(k/m)/2pi = {want:.7g})")
         failures += 0 if ok else 1
+    # --- one rule per step question (the walkers of the deck's steps agree) ----------
+    # a *BUCKLE step's LOAD CASE=2 BCs, left out (ccx has one set of BCs per step: the modes
+    # get the LOAD CASE=1 ones, warned), counted as BCs by the planners: the OP=NEW of
+    # LOAD CASE=1 went, as if the step re-specified the BCs in force, so ccx kept the top's
+    fac = review_run(lc2_column_deck(), "lc2_column",
+                     lambda dat: dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T"))
+    ok = bool(fac) and len(fac) == 2
+    if ok:
+        ref = math.pi ** 2 * 2.1e11 * 0.1 ** 4 / 12 / (4 * 4.0 ** 2)      # cantilever: pi^2 E I / (4 L^2)
+        err = max(abs(f / ref - 1) for f in fac)
+        ok = err < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  lc2_column (B31 column, *BUCKLE with LOAD CASE=1 "
+              f"clamping the foot, LOAD CASE=2 also holding the top): factors {fac[0]:.6g}, "
+              f"{fac[1]:.6g} vs the cantilever's {ref:.6g} ({err:.1e} apart; held at the top "
+              f"the second was 2.21e6)")
+    elif fac:
+        print(f"FAIL  lc2_column: {len(fac)} factors")
+    failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

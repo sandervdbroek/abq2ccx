@@ -6,6 +6,11 @@ physics.
 
 ## Unreleased
 
+* **`*BOUNDARY, LOAD CASE=2` cards no longer count as BCs** — the converter leaves a `*BUCKLE`
+  step's buckling-mode BCs out (ccx has one set of BCs per step), but seven of its planners still
+  counted them. Where they hold more than the LOAD CASE=1 cards, an OP=NEW that removes a BC was
+  dropped as if the step re-specified every BC, and knot beams were added for BCs ccx never gets.
+  ccx now gets the LOAD CASE=1 BCs, as the warning says.
 * **`*NCOPY, POLE` projected from its pole** — the pole's node number (or its coordinates)
   was read as a `SHIFT` translation, so the copies landed elsewhere (reduced physics). Each
   copy now lies so that its old node is midway between the pole and it, as in Abaqus.
