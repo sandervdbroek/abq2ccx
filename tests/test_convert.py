@@ -765,6 +765,112 @@ def test_instance_space_separated_transform():
     assert {10.0, 11.0} <= xs           # both part nodes translated by (10,0,0)
 
 
+ORTHO = ("*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 10., 0.3, 0.3, 0.3, "
+         "5., 5.,\n5.\n")
+
+
+def _instanced(part, rotation="0., 0., 0., 0., 0., 1., 90.", translation="0., 0., 0.", tail=ORTHO):
+    """``part`` as *Part P in one instance I, turned 90 degrees about z unless told otherwise."""
+    return ("*Part, name=P\n" + part + "*End Part\n*Assembly, name=A\n*Instance, name=I, part=P\n"
+            f"{translation}\n{rotation}\n*End Instance\n*End Assembly\n" + tail)
+
+
+def _as_with_zeros(make, blank, zeros, **overrides):
+    """``make(blank)`` converts exactly as ``make(zeros)`` (Abaqus reads a blank field as 0);
+    returns that conversion."""
+    got = [convert_str(make(x), **overrides) for x in (blank, zeros)]
+    assert got[0][0] == got[1][0], blank
+    return got[1]
+
+
+def test_instance_transform_lines_read_blank_fields_by_position():
+    # a blank translation or rotation field was dropped: the instance stayed at z = 0 / unturned
+    part = "*Node\n1, 1., 0., 0.\n*Element, type=MASS, elset=E\n1, 1\n"
+    _, conv, _ = _as_with_zeros(lambda r: _instanced(part, r, "0., , 5.", ""),
+                                "0., 0., 0., , , 1., 90.", "0., 0., 0., 0., 0., 1., 90.")
+    assert _close(conv.geom.nodes[1], (0.0, 1.0, 5.0))
+    _, conv, _ = _as_with_zeros(lambda t: _instanced(part, "", t, ""), "1., 2.", "1., 2., 0.")
+    assert _close(conv.geom.nodes[1], (2.0, 2.0, 0.0))
+
+
+def test_rotated_instance_orientation_reads_blank_fields_by_position():
+    # "1., , , , 1.," stayed unturned in an instance turned 90 degrees about z
+    sec = "*Solid Section, elset=EALL, material=M, orientation=O\n"
+    for system, blank, zeros, want in (
+            ("", "1., , , , 1., ", "1., 0., 0., 0., 1., 0.", "0, 1, 0, -1, 0, 0"),
+            ("", "2., , 1., 2., 1., 1., 1., , 1.", "2., 0., 1., 2., 1., 1., 1., 0., 1.",
+             "0, 1, 0, -1, 1, 0"),                                       # a - c, b - c
+            (", system=cylindrical", ", , 0., 0., 0., 1.", "0., 0., 0., 0., 0., 1.", "0, 5, 0, 0, 5, 1")):
+        body, _, _ = _as_with_zeros(
+            lambda o: _instanced(HEX + f"*Orientation, name=O{system}\n{o}\n" + sec,
+                                 translation="5., 0., 0."), blank, zeros)
+        assert f"\n{want}\n" in body.split("*ORIENTATION, NAME=I_O")[1][:80], blank
+
+
+def test_rotated_instance_transform_reads_blank_fields_by_position():
+    part = HEX + "*Nset, nset=TOPN\n5, 6, 7, 8\n*Transform, nset=TOPN{}\n{}\n*Solid Section, elset=EALL, material=M\n"
+    _, conv, _ = _as_with_zeros(lambda t: _instanced(part.format("", t)),
+                                "1., , , , 1., ", "1., 0., 0., 0., 1., 0.")
+    assert set(conv._transformed.values()) == {("R", (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0))}
+    body, _, _ = _as_with_zeros(lambda t: _instanced(part.format(", type=C", t), translation="5., 0., 0."),
+                                "1., , , , , 1.", "1., 0., 0., 0., 0., 1.")
+    assert "\n0, 6, 0, 0, 5, 1\n" in body                  # axis points move like nodes
+
+
+def test_rotated_instance_pretension_normal_reads_blank_fields_by_position():
+    part = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n10, 1., 0., 0.\n"
+            "*Element, type=T3D2, elset=E\n1, 1, 2\n2, 2, 3\n"
+            "*Pre-tension Section, element=1, node=10\n{}\n*Solid Section, elset=E, material=M\n1.\n")
+    body, _, _ = _as_with_zeros(lambda n: _instanced(part.format(n)), "1., , ", "1., 0., 0.")
+    assert "\n0, 1, 0\n" in body.split("*PRE-TENSION SECTION")[1][:80]
+
+
+def test_rotated_instance_beam_n1_reads_blank_fields_by_position():
+    part = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=E\n1, 1, 2\n"
+            "*Beam Section, elset=E, material=M, section=RECT\n0.1, 0.2\n{}\n")
+    body, _, _ = _as_with_zeros(lambda n: _instanced(part.format(n), "0., 0., 0., 1., 0., 0., 90.",
+                                                     tail="*Material, name=M\n*Elastic\n1., 0.3\n"),
+                                "0., , -1.", "0., 0., -1.")
+    assert "SECTION=RECT\n0.1, 0.2\n0, 1, 0\n" in body          # n1 = -z turned about x: y
+
+
+def test_ibeam_rect_approximation_reads_the_profile_by_position():
+    # a blank l (the profile origin) moved h into l: the I-section was commented out
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=E\n1, 1, 2\n"
+            "*Beam Section, elset=E, material=M, section=I\n{}\n0., 0., -1.\n"
+            "*Material, name=M\n*Elastic\n1., 0.3\n").format
+    body, _, _ = _as_with_zeros(deck, ", 0.3, 0.1, 0.1, 0.02, 0.02, 0.01",
+                                "0., 0.3, 0.1, 0.1, 0.02, 0.02, 0.01", approximate=True)
+    assert "SECTION=RECT\n0.0160348, 0.411604\n0., 0., -1.\n" in body
+
+
+def test_ibeam_rect_approximation_keeps_the_n1_line_by_position():
+    # "0., , -1." was written "0., -1.": n1 = -y instead of -z
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=E\n1, 1, 2\n"
+            "*Beam Section, elset=E, material=M, section=I\n0., 0.3, 0.1, 0.1, 0.02, 0.02, 0.01\n{}\n"
+            "*Material, name=M\n*Elastic\n1., 0.3\n").format
+    body, _, _ = _as_with_zeros(deck, "0., , -1.", "0., 0., -1.", approximate=True)
+    assert "SECTION=RECT\n0.0160348, 0.411604\n0., 0., -1.\n" in body
+
+
+def test_rotated_instance_distribution_axes_read_blank_fields_by_position():
+    part = (HEX + "*Distribution table, name=T\ncoord3D, coord3D\n*Distribution, name=D, "
+            "location=element, table=T\n, 1., 0., 0., 0., 1., 0.\n{}\n*Orientation, name=O\nD\n"
+            "*Solid Section, elset=EALL, material=M, orientation=O\n")
+    body, _, _ = _as_with_zeros(lambda d: _instanced(part.format(d)), "1, 1., , , , 1., ",
+                                "1, 1., 0., 0., 0., 1., 0.")
+    assert "\n1, 0, 1, 0, -1, 0, 0\n" in body
+
+
+def test_rotated_instance_normal_reads_blank_fields_by_position():
+    part = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n*Normal\n{}\n*Shell Section, elset=E, material=M\n0.1\n")
+    body, _, _ = _as_with_zeros(lambda n: _instanced(part.format(n), "0., 0., 0., 1., 0., 0., 90.",
+                                                     tail="*Material, name=M\n*Elastic\n1., 0.3\n"),
+                                "1, 1, , , 1.", "1, 1, 0., 0., 1.")
+    assert "*NORMAL\n1, 1, 0, -1, 0\n" in body                   # z turned about x: -y
+
+
 def test_instance_qualified_set_param_resolved():
     # Output requests reference sets through a PARAMETER (elset=/nset=), not a data line.
     # An instance-qualified value (I.body / I.corner) must flatten to the renamed global

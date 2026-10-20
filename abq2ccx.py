@@ -6915,12 +6915,10 @@ class Converter:
         if not recs:
             return None
         try:
-            v = [pf(x) for x in recs[0] if x != ""]
+            v = fields_at(recs[0], 7)                # by position, a blank one 0
         except ValueError:
             return None
-        if len(v) < 7:
-            return None
-        _l, h, b1, b2, t1, t2, t3 = v[:7]
+        _l, h, b1, b2, t1, t2, t3 = v
         hw = h - t1 - t2
         if min(h, b1, b2, t1, t2, t3) <= 0 or hw <= 0:
             return None
@@ -6943,10 +6941,8 @@ class Converter:
                          f"and equal strong-axis inertia; weak-axis bending, torsion and shear "
                          f"response DIFFER{u1}. Verify.", once=True)
         out = [emit_keyword("BEAM SECTION", keep), f"{b_r:.6g}, {h_r:.6g}"]
-        if len(recs) > 1:                          # keep the direction-cosine line
-            second = [x for x in recs[1] if x != ""]
-            if second:
-                out.append(", ".join(second))
+        if len(recs) > 1 and any(recs[1]):         # keep the direction-cosine line, by position
+            out.append(", ".join(x or "0." for x in recs[1]))
         return out
 
     def handle_shell_section(self, b: Block) -> List[str]:
@@ -23544,9 +23540,9 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
             if kw == "MPC":
                 f = f[:1] + [node(x) if x else x for x in f[1:]]
             elif kw == "NORMAL":
-                if len(f) >= 5:
+                if len(f) >= 3:                      # components by position, a blank one 0
                     try:
-                        v = rotv((pf(f[2]), pf(f[3]), pf(f[4])))
+                        v = rotv(tuple(fields_at(f[2:], 3)))
                         f[2:5] = [_fmt_component(x) for x in v]
                     except ValueError:
                         pass
@@ -23557,8 +23553,8 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
             data.append(", ".join(f))
     elif kw == "PRE-TENSION SECTION" and b.data:
         try:                                         # the normal (optional) turns with the part
-            v = [pf(x) for x in b.data[0].split(",") if x.strip()]
-            data = [", ".join(_fmt_component(x) for x in rotv((v[0], v[1], v[2])))] if len(v) >= 3 \
+            v = fields_at(b.data[0].split(","), 3)   # by position, a blank component 0
+            data = [", ".join(_fmt_component(x) for x in rotv(tuple(v)))] if any(v) \
                 else list(b.data[:1])
         except ValueError:
             data = list(b.data[:1])
@@ -23566,8 +23562,8 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
     elif kw == "TRANSFORM" and b.data:
         move = rotv if (b.param("TYPE") or "R").strip().upper().startswith("R") else rotp
         try:
-            v = [pf(x) for x in b.data[0].split(",") if x.strip()]
-            if len(v) >= 6:
+            v = fields_at(b.data[0].split(","), 6)   # by position, as _transform_card reads it
+            if any(v):
                 a, c = move((v[0], v[1], v[2])), move((v[3], v[4], v[5]))
                 data = [", ".join(_fmt_component(x) for x in (*a, *c))] + list(b.data[1:])
             else:
@@ -23581,18 +23577,22 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
 
 def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple[Vec, Vec, float]]]:
     """Parse an *INSTANCE positioning block: a translation line and an optional rotation
-    line (point a, point b, angle).  Returns (translation, rotation-or-None)."""
+    line (point a, point b, angle).  Returns (translation, rotation-or-None).  The fields
+    count by position, a blank or missing one 0, unless the line is space-separated."""
+    def fields(ln: str) -> List[str]:
+        rec = trimmed_fields(ln.split(","))
+        return numeric_fields(ln) if any(len(x.split()) > 1 for x in rec) else rec
+
     T: Vec = (0.0, 0.0, 0.0)
     rot = None
     dl = [ln for ln in inst["data"] if ln.strip()]
     try:
         if dl:
-            v = [pf(x) for x in numeric_fields(dl[0])]
-            if len(v) >= 3:
-                T = (v[0], v[1], v[2])
+            T = tuple(fields_at(fields(dl[0]), 3))
         if len(dl) > 1:
-            v = [pf(x) for x in numeric_fields(dl[1])]
-            if len(v) >= 7:
+            rec = fields(dl[1])
+            if len(rec) >= 7:
+                v = fields_at(rec, 7)
                 rot = ((v[0], v[1], v[2]), (v[3], v[4], v[5]), v[6])
     except ValueError:
         report.warn(f"*INSTANCE {inst['name']}: could not fully parse the transform "
@@ -23712,11 +23712,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             at = beam_n1_line(nb) if rot and b.keyword in ("BEAM SECTION",
                                                             "BEAM GENERAL SECTION") else None
             if at is not None and at < len(nb.data):
-                # the beam's n1 direction (its own data line) turns with the part
+                # the beam's n1 direction (its own data line) turns with the part; its
+                # fields count by position, a blank one 0
                 try:
-                    v = [pf(x) for x in nb.data[at].split(",") if x.strip()]
-                    if len(v) >= 3:
-                        nb.data[at] = ", ".join(_fmt_component(x) for x in rotv((v[0], v[1], v[2])))
+                    v = fields_at(nb.data[at].split(","), 3)
+                    if any(v):
+                        nb.data[at] = ", ".join(_fmt_component(x) for x in rotv(tuple(v)))
                 except ValueError:
                     pass
             if rot and b.keyword == "ROTARY INERTIA" and not b.param("ORIENTATION") and nb.data:
@@ -23751,11 +23752,14 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                 # rectangular axes are direction points measured from the origin (or from
                 # c on a 9-value line): they only rotate.  Cylindrical a, b are points on
                 # the axis: they move with the part like nodes.
+                # The coordinates count by position, a blank one 0 (as _orientation_points
+                # reads them); a 9-field line has c.
                 move = rotv if system.startswith("RECT") else rotp
+                rec = trimmed_fields(nb.data[0].split(","))
                 try:
-                    v = [pf(x) for x in nb.data[0].split(",") if x.strip()]
-                    if len(v) >= 6 and (rot or move is rotp):
-                        pts = [move(tuple(v[i:i + 3])) for i in range(0, len(v) - 2, 3)]
+                    v = fields_at(rec, 9 if len(rec) > 6 else 6)
+                    if any(v) and (rot or move is rotp):
+                        pts = [move(tuple(v[i:i + 3])) for i in range(0, len(v), 3)]
                         nb.data[0] = ", ".join(_fmt_component(x) for p in pts for x in p)
                 except ValueError:
                     pass
@@ -23763,7 +23767,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         elif b.keyword == "DISTRIBUTION":
             name = b.uparam("NAME")
             move = dist_move[name] if name in dist_move else (rotv if rot else None)
-            out.append(_remap_distribution(b, prefix, namer, elem_off, move))
+            out.append(_remap_distribution(b, prefix, namer, elem_off, move, name in dist_move))
         elif b.keyword == "CONNECTOR SECTION":
             nb = _remap_named(b, prefix, ("ELSET",), namer)
             if len(nb.data) > 1:                    # local orientations of nodes a and b
@@ -23977,10 +23981,13 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     return out
 
 
-def _remap_distribution(b: Block, prefix: str, namer, elem_off: int, move) -> Block:
+def _remap_distribution(b: Block, prefix: str, namer, elem_off: int, move,
+                        axes: bool = False) -> Block:
     """One instance's copy of a part-level *DISTRIBUTION: its name prefixed like the
     instance's other names, element labels offset, element-set labels prefixed, and the
-    a, b[, c] points of every line moved with the instance by ``move`` (None: unchanged)."""
+    a, b[, c] points of every line moved with the instance by ``move`` (None: unchanged).
+    ``axes``: it gives an *ORIENTATION's axes, whose coordinates count by position (a blank
+    one 0)."""
     p: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
     if p.get("NAME"):
         p["NAME"] = namer(prefix, p["NAME"].strip())
@@ -23995,7 +24002,10 @@ def _remap_distribution(b: Block, prefix: str, namer, elem_off: int, move) -> Bl
             label = namer(prefix, label)
         if move is not None:
             try:
-                v = [pf(x) for x in vals if x != ""]
+                if axes:
+                    v = fields_at(vals, 9 if len(vals) > 6 else 6) if any(vals) else []
+                else:
+                    v = [pf(x) for x in vals if x != ""]
             except ValueError:
                 v = []
             if len(v) in (6, 9):

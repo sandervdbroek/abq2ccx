@@ -2420,12 +2420,65 @@ def blank_nu_cube_deck():
             CUBE8_HELD + "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 47.5\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
-def assembly_bolts_deck():
+def instance_blank_cube_deck(form="orientation", blank=True):
+    """An orthotropic C3D8 unit cube (E1 100, E2 = E3 10, nu 0.3, G 5) in an instance moved by
+    (5, 0, 0) and turned 90 degrees about z.  Its material axes are the part's (an *ORIENTATION,
+    or for ``form`` "distribution" a *DISTRIBUTION's element line), so axis 2 lies along global
+    -x; a *TRANSFORM with the same axes on the face at global x = -1, pulled by 1 in local 2,
+    and rollers (in local DOF 1 on its transformed nodes).  ``blank``: the instance lines, the
+    axes and the *TRANSFORM written with blank fields for their zeros.  Uniaxial stress 1 along
+    x: strains 1 / E2 = 0.1 along x, -nu12 / E1 = -0.003 along y, -nu23 / E2 = -0.03 along z."""
+    axes = "1., , , , 1.," if blank else "1., 0., 0., 0., 1., 0."
+    if form == "distribution":
+        ori = ["*Distribution Table, name=T", "coord3D, coord3D",
+               "*Distribution, name=D, location=ELEMENT, table=T", ", 1., 0., 0., 0., 1., 0.",
+               "1, " + axes, "*Orientation, name=O", "D"]
+    else:
+        ori = ["*Orientation, name=O", axes]
+    return "\n".join(
+        ["*Part, name=P", "*Node"] + [f"{k + 1}, {x}., {y}., {z}." for k, (x, y, z) in enumerate(
+            ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)))] +
+        ["*Element, type=C3D8, elset=CUBE", "1, 1, 2, 3, 4, 5, 6, 7, 8",
+         "*Nset, nset=ALLN", "1, 2, 3, 4, 5, 6, 7, 8", "*Nset, nset=XFIX", "1, 2, 5, 6",
+         "*Nset, nset=YFIX", "1, 5", "*Nset, nset=YFIXT", "4, 8", "*Nset, nset=ZFIX", "1, 2, 3, 4",
+         "*Nset, nset=PULL", "3, 4, 7, 8", "*Transform, nset=PULL", axes] + ori +
+        ["*Solid Section, elset=CUBE, material=M, orientation=O", "*End Part",
+         "*Assembly, name=A", "*Instance, name=I, part=P",
+         "5., , ," if blank else "5., 0., 0.",
+         ", , , , , 1., 90." if blank else "0., 0., 0., 0., 0., 1., 90.",
+         "*End Instance", "*End Assembly", "*Material, name=M", "*Elastic, type=ENGINEERING CONSTANTS",
+         "100., 10., 10., 0.3, 0.3, 0.3, 5., 5.,", "5.", "*Boundary", "I.XFIX, 1, 1", "I.YFIX, 2, 2",
+         "I.YFIXT, 1, 1", "I.ZFIX, 3, 3", "*Step", "*Static", "*Cload", "I.PULL, 2, 0.25",
+         "*Node Print, nset=I.ALLN, global=yes", "U", "*End Step"]) + "\n"
+
+
+def instance_beam_n1_deck(blank=True, n=10):
+    """A cantilever of ``n`` B31 along the part's x (length 10, RECT 0.1 along n1 by 0.2, E 1e5,
+    nu 0.3), n1 = -z, in an instance turned 90 degrees about x, so n1 lies along global y.  The
+    tip pulled by 1e-3 along global z bends it about y: F L^3 / (3 E I), I = 0.1 x 0.2^3 / 12
+    (with n1 left unturned, a quarter of I).  ``blank``: n1 and the rotation line written with
+    blank fields for their zeros."""
+    return "\n".join(
+        ["*Part, name=P", "*Node"] + [f"{i + 1}, {10.0 * i / n}, 0., 0." for i in range(n + 1)] +
+        ["*Element, type=B31, elset=BEAM"] + [f"{i + 1}, {i + 1}, {i + 2}" for i in range(n)] +
+        ["*Nset, nset=ROOT", "1", "*Nset, nset=TIP", str(n + 1),
+         "*Beam Section, elset=BEAM, material=M, section=RECT", "0.1, 0.2",
+         "0., , -1." if blank else "0., 0., -1.", "*End Part", "*Assembly, name=A",
+         "*Instance, name=I, part=P", "0., 0., 0.",
+         "0., 0., 0., 1., , , 90." if blank else "0., 0., 0., 1., 0., 0., 90.",
+         "*End Instance", "*End Assembly", "*Material, name=M", "*Elastic", "1e5, 0.3",
+         "*Boundary", "I.ROOT, 1, 6", "*Step", "*Static", "*Cload", "I.TIP, 3, 1e-3",
+         "*Node Print, nset=I.TIP", "U", "*End Step"]) + "\n"
+
+
+def assembly_bolts_deck(blank=False):
     """Two instances, the second turned 90 degrees about x (its z axis along -y), of a part
     with a bolt (two C3D8 along z, length 2, both ends held) with a *PRE-TENSION SECTION at
     mid-length (node 99, loaded by 1000) and a unit block held at its bottom whose top a
     *DISTRIBUTING COUPLING (DCOUP3D node 98) loads by 100 along the part's -z.  E 210000,
-    nu 0: the bolt's cut closes 1000 x 2 / E, the block shortens 100 / E."""
+    nu 0: the bolt's cut closes 1000 x 2 / E, the block shortens 100 / E.  ``blank``: the
+    pre-tension normal and the second instance's lines written with blank fields for their
+    zeros."""
     part = ["*PART, NAME=P", "*NODE"]
     part += [f"{1 + i + 2 * j + 4 * k}, {float(i)}, {float(j)}, {float(k)}"
              for k in range(3) for j in range(2) for i in range(2)]
@@ -2439,10 +2492,12 @@ def assembly_bolts_deck():
              "*NSET, NSET=TOPF", "25, 26, 27, 28", "*NSET, NSET=PT", "99", "*NSET, NSET=RP", "98",
              "*SURFACE, NAME=CUT", "LOW, S2", "*SOLID SECTION, ELSET=BOLT, MATERIAL=M",
              "*SOLID SECTION, ELSET=BLK, MATERIAL=M", "*PRE-TENSION SECTION, SURFACE=CUT, NODE=99",
-             "0., 0., 1.", "*DISTRIBUTING COUPLING, ELSET=DC", "TOPF, 1.", "*END PART"]
+             ", , 1." if blank else "0., 0., 1.", "*DISTRIBUTING COUPLING, ELSET=DC", "TOPF, 1.",
+             "*END PART"]
     asm = ["*ASSEMBLY, NAME=A", "*INSTANCE, NAME=I1, PART=P", "*END INSTANCE",
-           "*INSTANCE, NAME=I2, PART=P", "0., 5., 0.", "0., 5., 0., 1., 5., 0., 90.", "*END INSTANCE",
-           "*END ASSEMBLY", "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0."]
+           "*INSTANCE, NAME=I2, PART=P"] + \
+        ([", 5.", ", 5., , 1., 5., , 90."] if blank else ["0., 5., 0.", "0., 5., 0., 1., 5., 0., 90."]) + \
+        ["*END INSTANCE", "*END ASSEMBLY", "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0."]
     step = ["*STEP", "*STATIC", "*BOUNDARY", "I1.ENDS, 1, 3", "I2.ENDS, 1, 3", "I1.BOT, 1, 3",
             "I2.BOT, 1, 3", "*CLOAD", "I1.PT, 1, 1000.", "I2.PT, 1, 1000.", "I1.RP, 3, -100.",
             "I2.RP, 2, 100.", "*NODE PRINT, NSET=I1.PT", "U", "*NODE PRINT, NSET=I2.PT", "U",
@@ -5876,21 +5931,60 @@ def main():
               f"-4.75e-4)")
     failures += 0 if u and ok else 1
     # part-level *PRE-TENSION SECTION / *DISTRIBUTING COUPLING in two instances (written once
-    # with the part's names, they stopped ccx); instance 2's node ids are 99 higher
-    u = review_run(assembly_bolts_deck(), "assembly_bolts", dat_displacements)
-    if u:
-        closed = [u.get(n, [math.inf])[0] for n in (99, 198)]
-        short = [-u.get(n, [0.0, 0.0, math.inf])[2] for n in (25, 26, 27, 28)] + \
-                [u.get(n, [0.0, math.inf])[1] for n in (124, 125, 126, 127)]
-        want_c, want_s = 1000.0 * 2.0 / 210000.0, 100.0 / 210000.0
-        err = max([abs(x / want_c - 1) for x in closed] + [abs(x / want_s - 1) for x in short])
-        ok = err < 1e-6
-        print(f"{'PASS' if ok else 'FAIL'}  assembly_bolts (two instances, one turned 90 deg, of a "
-              f"part with a *PRE-TENSION SECTION and a *DISTRIBUTING COUPLING): pre-tension closure "
-              f"{closed[0]:.7g}, {closed[1]:.7g} vs F L / E A {want_c:.7g}, coupled block tops "
-              f"shortened {min(short):.7g} to {max(short):.7g} vs F / E A {want_s:.7g} "
-              f"(max {err:.1e} off)")
-    failures += 0 if u and ok else 1
+    # with the part's names, they stopped ccx); instance 2's node ids are 99 higher.  With
+    # blank fields (0) in the normal and instance 2's lines (the normal stayed unturned)
+    for blank in (False, True):
+        tag = "assembly_bolts" + ("_blank" if blank else "")
+        u = review_run(assembly_bolts_deck(blank), tag, dat_displacements)
+        if u:
+            closed = [u.get(n, [math.inf])[0] for n in (99, 198)]
+            short = [-u.get(n, [0.0, 0.0, math.inf])[2] for n in (25, 26, 27, 28)] + \
+                    [u.get(n, [0.0, math.inf])[1] for n in (124, 125, 126, 127)]
+            want_c, want_s = 1000.0 * 2.0 / 210000.0, 100.0 / 210000.0
+            err = max([abs(x / want_c - 1) for x in closed] + [abs(x / want_s - 1) for x in short])
+            ok = err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (two instances, one turned 90 deg, of a part "
+                  f"with a *PRE-TENSION SECTION and a *DISTRIBUTING COUPLING"
+                  f"{'; the normal and instance lines with blank fields' if blank else ''}): "
+                  f"pre-tension closure {closed[0]:.7g}, {closed[1]:.7g} vs F L / E A {want_c:.7g}, "
+                  f"coupled block tops shortened {min(short):.7g} to {max(short):.7g} vs F / E A "
+                  f"{want_s:.7g} (max {err:.1e} off)")
+        failures += 0 if u and ok else 1
+    # an orthotropic cube in a moved and turned instance, blank fields (0) in the instance lines,
+    # the material axes and a *TRANSFORM (the flattener dropped them and left the axes unturned)
+    for form in ("orientation", "distribution"):
+        runs = [review_run(instance_blank_cube_deck(form, blank), f"instance_blank_{form}" +
+                           ("" if blank else "_zeros"), dat_displacements) for blank in (True, False)]
+        ok = all(runs)
+        if ok:
+            pos = [(-y, x + 5.0, z) for x, y, z in ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+                                                     (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))]
+            want = {k + 1: (0.1 * gx, -0.003 * (gy - 5.0), -0.03 * gz) for k, (gx, gy, gz) in enumerate(pos)}
+            err = max(abs(a - b) for nd, w in want.items()
+                      for a, b in zip(runs[0].get(nd, [math.inf] * 3), w)) / 0.1
+            twin = max(abs(a - b) for nd in want
+                       for a, b in zip(runs[0].get(nd, [math.inf] * 3), runs[1].get(nd, [math.nan] * 3)))
+            ok = err < 1e-6 and twin < 1e-12
+            print(f"{'PASS' if ok else 'FAIL'}  instance_blank_{form} (orthotropic cube in an instance "
+                  f"moved and turned 90 deg about z, its {form} axes, a *TRANSFORM and the instance "
+                  f"lines with blank fields, pulled along x in local 2): strains 0.1, -0.003, -0.03 "
+                  f"(axis 2 along x) at all 8 nodes, {err:.1e} of max |u| off, {twin:.1e} from the deck "
+                  f"with zeros")
+        failures += 0 if ok else 1
+    runs = [review_run(instance_beam_n1_deck(blank), "instance_blank_beam_n1" + ("" if blank else "_zeros"),
+                       dat_displacements) for blank in (True, False)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs[0].get(11, [math.inf] * 3), runs[1].get(11, [math.nan] * 3)
+        want = 1e-3 * 10.0 ** 3 / (3.0 * 1e5 * 0.1 * 0.2 ** 3 / 12.0)
+        err = abs(got[2] / want - 1)
+        twin = max(abs(a - b) for a, b in zip(got, ref))
+        ok = err < 1e-2 and twin < 1e-12 and abs(got[1]) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  instance_blank_beam_n1 (B31 cantilever, RECT 0.1 x 0.2, in an "
+              f"instance turned 90 deg about its axis, n1 and the rotation line with blank fields): tip "
+              f"deflection {got[2]:.7g} vs F L^3 / 3 E I {want:.7g} ({err:.1e} off; n1 unturned: 4x), "
+              f"{twin:.1e} from the deck with zeros")
+    failures += 0 if ok else 1
     # a static step after a linear perturbation step (ccx 2.23 carried the perturbation step's
     # loads and BCs on, and dropped or zeroed the earlier ones): the first step's state again
     ref = review_run(perturbation_restore_deck(), "perturbation_restore_ref", dat_displacements)

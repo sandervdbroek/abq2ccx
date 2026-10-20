@@ -24,6 +24,12 @@ physics.
   the node's axes unknown, so its moments on a ccx knot acted about the global axes.
   `*INITIAL CONDITIONS, TYPE=STRESS / PLASTIC STRAIN / SOLUTION`: `1, 100., , 50.` gave syy = 50,
   and the CAE line `Set-1, , , , , 20` gave SDV 1 = 20 instead of SDV 5.
+* **Blank fields in moved or turned instances** — the assembly flattener dropped them too: a
+  part's `*ORIENTATION` (or orientation `*DISTRIBUTION`) line `1., , , , 1.,`, a `*TRANSFORM`,
+  a `*NORMAL`, a `*PRE-TENSION SECTION` normal and a beam's n1 line stayed in the part's axes,
+  and a blank in the instance's own translation or rotation line left the part unmoved or
+  unturned. `--approximate`'s RECT for an I-beam wrote n1 `0., , -1.` as `0., -1.` and
+  commented out a profile with a blank first field.
 * **Initial temperatures on several cards** — the line that gives the nodes no
   `*INITIAL CONDITIONS, TYPE=TEMPERATURE` card lists their Abaqus default, 0, was written on
   every card, so each card set the earlier cards' nodes back to 0 (CAE writes one card per
