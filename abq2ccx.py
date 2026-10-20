@@ -4617,20 +4617,22 @@ class Step:
     proc_card: Optional[Block]
     motion_proc: str              # the first PROC_KW or Converter._MOTION_PROCS card's (motion fields)
     explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT (handle_step's)
-    amplitude: str                # *STEP, AMPLITUDE= as written ("" if none)
     pert_param: bool              # *STEP, PERTURBATION as written
     perturbation: bool            # an Abaqus linear perturbation step (perturbation_step): _pert_idx,
                                   # the motion fields, the output carry-over, step_load_audit's Abaqus reading
     nlgeom_card: Optional[bool]   # NLGEOM= on its *STEP card (_nlgeom_given)
-    # NLGEOM, by several rules (also base_nlgeom, nlgeom_motion and the deck's nl_heads):
+    # NLGEOM, by several rules (also nlgeom_motion and the deck's nl_heads):
     nlgeom_on: bool               # it switches NLGEOM on (the Converter's _nl_steps): not a
                                   # perturbation step and NLGEOM on its *STEP card, or a *DYNAMIC,
                                   # EXPLICIT card in it
-    nlgeom: bool                  # in force while it runs: on once a step not in _pert_idx has NLGEOM,
-                                  # or is explicit without NLGEOM=; a perturbation step keeps the one
-                                  # before it (EmitState.nlgeom, by the *STEP cards as written, also
-                                  # counts an explicit step whose NLGEOM=NO a deformation plasticity
-                                  # material drops)
+    nlgeom: bool                  # Abaqus: NLGEOM in force while it runs.  On once a step that is no
+                                  # linear perturbation step has NLGEOM on its *STEP card, or is
+                                  # explicit without NLGEOM= (Abaqus/Explicit's default): "once the
+                                  # NLGEOM option has been switched on, it will be active during all
+                                  # subsequent steps" (*STEP), a later NLGEOM=NO too.  A perturbation
+                                  # step runs about its base state's, its own NLGEOM aside
+    nlgeom_written: Optional[bool]    # NLGEOM on the *STEP card handle_step writes (StepModel.
+                                  # _writes_nlgeom): None for none, False for NLGEOM=NO
     nlgeom_output: bool           # in force in ccx by the *STEP cards handle_step writes (the output
                                   # planners' _ccx_linear_steps): on once a step's *STEP card is in
                                   # nl_heads, or it is explicit without NLGEOM=NO
@@ -4645,10 +4647,6 @@ class Step:
     # _plan_modal_starts' "general in ccx"):
     general: bool                 # proc in StepModel.GENERAL_PROCS and no *STEP, PERTURBATION
     general_before: bool          # a general step before it (handle_step's _general_step_seen)
-    base_nlgeom: bool             # NLGEOM in force in its base state (handle_step's _base_nlgeom): on
-                                  # once a general step's *STEP card has it as handle_step writes it
-    base_nlgeom_dp: bool          # the same with a deformation plasticity material (_dp_nlgeom), whose
-                                  # NLGEOM=NO handle_step drops: an explicit step with it gets NLGEOM
     buckle_loaded: bool           # a *BUCKLE step with a load other than *TEMPERATURE (handle_step's)
     lc2: frozenset                # in a step with a *BUCKLE card: the ids of its *BOUNDARY, LOAD CASE=2
                                   # cards, which the conversion leaves out (StepModel.lc2)
@@ -4697,16 +4695,29 @@ class StepModel:
 
     @staticmethod
     def _writes_nlgeom(given: Optional[bool], explicit: bool, pert: bool, base: bool,
-                       dp: bool) -> bool:
-        """NLGEOM on the *STEP card handle_step writes, from ``given`` (Step.nlgeom_card): the
-        deck's, dropped where it is NLGEOM=NO with a deformation plasticity material (``dp``)
-        or NLGEOM on a perturbation step whose base state is linear (``base``: Step.base_nlgeom),
-        and added on an explicit step without it."""
-        if given is None:
-            return explicit
-        if given:
-            return explicit or not (pert and not base)
-        return dp and explicit
+                       dp: bool, again: bool) -> Optional[bool]:
+        """NLGEOM on the *STEP card handle_step writes (Step.nlgeom_written: None for none,
+        False for NLGEOM=NO), from ``given`` (Step.nlgeom_card) and ``base``, NLGEOM in force in
+        Abaqus before the step (Step.nlgeom of the step before): the deck's, but
+        * NLGEOM=NO is dropped with a deformation plasticity material (``dp``), with which
+          ccx would misread the law (_plan_deformation_plasticity);
+        * NLGEOM=NO on a general step after NLGEOM was switched on becomes NLGEOM: Abaqus keeps
+          it on, ccx would run the step linear (probed: a cantilever's tip 8.13 against 5.05);
+        * NLGEOM on a perturbation step whose base state is linear is dropped: Abaqus runs the
+          step linear about it, ccx a static perturbation step (a general one there) nonlinear;
+        * NLGEOM is added on an explicit step without it (Abaqus/Explicit's default), and on a
+          step that gets the base state again after linear perturbation steps
+          (Converter._restore_from) where an earlier general step's card has it (``again``):
+          ccx forgets it after a *FREQUENCY or *BUCKLE step."""
+        if given is False and dp:
+            given = None
+        elif given is False and base and not pert:
+            given = True
+        elif given and pert and not base:
+            given = None
+        if given is None and (explicit or again):
+            return True
+        return given
 
     @staticmethod
     def _motion(head: Block, card: Optional[Block], perturbation: bool
@@ -4771,11 +4782,16 @@ class StepModel:
                                                  card.has("STEADY STATE")) else "STEP"
         return period, advance, defaults, ccx
 
-    def __init__(self, blocks: Sequence[Block]) -> None:
+    def __init__(self, blocks: Sequence[Block], dp: bool = False) -> None:
+        """``dp``: the deck has a deformation plasticity material ccx reads (Converter._dp_nlgeom),
+        which bears on the *STEP cards handle_step writes (Step.nlgeom_written)."""
         steps: List[Step] = []
         loose: List[Block] = []                 # the cards since the last step
-        nlgeom = False                          # NLGEOM in force (Step.nlgeom)
-        seen = base = base_dp = False           # Step.general_before, base_nlgeom, base_nlgeom_dp
+        nlgeom = False                          # NLGEOM in force in Abaqus (Step.nlgeom)
+        # NLGEOM on a general step's *STEP card as handle_step writes it, and a linear
+        # perturbation step since the last general step (Converter._restore_from)
+        written = since = False
+        seen = False                            # Step.general_before
         nl_motion, t = False, 0.0               # Step.nlgeom_motion, t_start
         nl_output = nl_dp = False               # Step.nlgeom_output, nlgeom_dp
         # card by card: each *STEP card's procedure (Step.star_proc), and whether a *DYNAMIC,
@@ -4815,8 +4831,15 @@ class StepModel:
             pert_param = head.has("PERTURBATION")
             pert = perturbation_step(cards)
             given = _nlgeom_given(head)
+            # (the steps _plan_base_restore gives the base state again: a general step after
+            # perturbation steps, and a static perturbation step after another)
+            again = written and since and (not pert or {
+                b.keyword for b in inner if b.keyword in PROC_KW} == {"STATIC"})
+            nl_written = self._writes_nlgeom(given, explicit, pert, nlgeom, dp, again)
             if not pert:
                 nlgeom = nlgeom or (explicit if given is None else given)
+                written = written or bool(nl_written)
+            since = pert
             bcs = [b for b in cards if b.keyword == "BOUNDARY"]
             two = [b for b in bcs if (b.param("LOAD CASE") or "1").strip() == "2"]
             if two and any(b.keyword == "BUCKLE" for b in cards):
@@ -4837,15 +4860,13 @@ class StepModel:
             steps.append(Step(
                 no=len(steps) + 1, cards=tuple(cards), between=tuple(loose), proc=proc,
                 proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
-                amplitude=head.uparam("AMPLITUDE"), pert_param=pert_param, perturbation=pert,
-                nlgeom_card=given,
+                pert_param=pert_param, perturbation=pert, nlgeom_card=given,
                 nlgeom_on=(not pert and bool(given)) or
                 any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
-                nlgeom=nlgeom,
+                nlgeom=nlgeom, nlgeom_written=nl_written,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
                 star_proc=star_proc[id(head)],
                 nlgeom_output=nl_output, nlgeom_dp=nl_dp, general=general, general_before=seen,
-                base_nlgeom=base, base_nlgeom_dp=base_dp,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
@@ -4855,11 +4876,7 @@ class StepModel:
                 period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp,
                 nlgeom_motion=nl_motion))
             t = None if t is None or advance is None else t + advance
-            # NLGEOM stays on once a general step has it (Abaqus): the base state of the later steps
-            if general:
-                seen = True
-                base = base or self._writes_nlgeom(given, explicit, pert, base, False)
-                base_dp = base_dp or self._writes_nlgeom(given, explicit, pert, base_dp, True)
+            seen = seen or general
             loose = []
         self.steps: Tuple[Step, ...] = tuple(steps)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
@@ -5559,9 +5576,6 @@ class EmitState:
         self.no = 0
         self.prev: Optional[Step] = None
         self.written: Dict[int, WrittenStep] = {}   # step -> its *STEP card as written
-        # NLGEOM on the *STEP cards written so far, the linear perturbation steps' not counted
-        # (write_step; _loads_nlgeom)
-        self.nlgeom = False
         # distributed loads emitted as consistent nodal forces (see _flush_nodal_loads):
         # (card, target, label) -> ({(node, DOF): force}, amplitude: _cload_amp), in Abaqus semantics
         self.nodal_loads: "OrderedDict[tuple, Tuple[Dict[Tuple[int, int], float], Optional[tuple]]]" = \
@@ -5609,12 +5623,8 @@ class EmitState:
         return self.step
 
     def write_step(self, params: "OrderedDict[str, Optional[str]]") -> str:
-        """The current step's *STEP card with ``params``, recorded as written.  NLGEOM stays on
-        for all later steps once a general step has switched it on (Abaqus; a linear
-        perturbation step has no effect on the later ones: Converter._nl_steps)."""
-        nl = params.get("NLGEOM", "")
-        self.nlgeom = self.nlgeom or (not self.step.perturbation and "NLGEOM" in params and
-                                      (nl or "YES").strip().upper() != "NO")
+        """The current step's *STEP card with ``params``, recorded as written (its NLGEOM is
+        Step.nlgeom_written)."""
         self.written[self.no] = WrittenStep(self.no, OrderedDict(params))
         return emit_keyword("STEP", params)
 
@@ -6518,10 +6528,8 @@ class Converter:
         self._overclosed = False                    # one of them starts overclosed
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
-        # the step being emitted: a general step before it, NLGEOM in its base state (handle_step:
-        # Step.general_before, base_nlgeom)
+        # the step being emitted: a general step before it (handle_step: Step.general_before)
         self._general_step_seen = False
-        self._base_nlgeom = False
         self._base_heated = False                   # temperatures set or solved in a general step
         self._base_stressed = False                 # a load, prescribed motion or initial state
         self._step_proc: Optional[str] = None      # the procedure of the step being emitted (None
@@ -6629,7 +6637,7 @@ class Converter:
         self._orient_axes: set = set()             # orientations whose axes are known (_register_orientation)
         self._mat_symmetry: Dict[str, Optional[str]] = {}  # material -> None / "ortho" / "aniso"
         self._frame_bound_mats: set = set()        # *DEFORMATION PLASTICITY ones (_dp_axes)
-        self._dp_nlgeom = False                    # one stays: ccx runs NLGEOM (_plan_deformation_plasticity)
+        self._dp_nlgeom = False                    # one stays: ccx runs NLGEOM (_plan_dp_materials)
         self._dp_unused: Dict[int, str] = {}       # cards of an unused one -> why commented out
         self._ic_ori: Dict[int, Tuple[str, str]] = {}  # element -> its section, orientation (_plan_ic_axes)
         self._ic_shell: Dict[int, tuple] = {}      # continuum shell / ply solid -> how its axes form (ditto)
@@ -8799,27 +8807,18 @@ class Converter:
                          once=True)
         return lines
 
-    def _plan_deformation_plasticity(self, blocks: List[Block]) -> None:
-        """How the deck's *DEFORMATION PLASTICITY materials run in ccx 2.23, which switches
-        nonlinear geometry on for the whole model when it reads such a material, even one no
-        section uses, and computes the law in the logarithmic strain ln V and the Cauchy
-        stress (probed on homogeneously deformed C3D8 cubes: uniaxial strain and stress,
-        simple and pure shear, turned; a total law, as Abaqus').  Abaqus runs it with the
-        small strain in a step without NLGEOM (2017 Theory and Materials guides, "Deformation
-        plasticity": meant for small-displacement analysis), so such a step is reduced
-        physics: a bar in tension strains 0.39 % more than Abaqus' law at sigma0 and 12 % more
-        at 2 sigma0 (alpha 0.5, n 5).  An explicit NLGEOM=NO is dropped (_dp_nlgeom,
-        handle_step): with it ccx turns nonlinear geometry off but still reads the small strain
-        as a Green-Lagrange one and returns a second Piola-Kirchhoff stress (32 % more strain
-        at 2 sigma0, a pressure under pure shear strain), so both spellings of Abaqus'
-        small-strain step run the same law.  A material that no section, composite ply or
-        other card names is commented out (_dp_unused): it changes nothing in Abaqus."""
+    def _plan_dp_materials(self, blocks: List[Block]) -> None:
+        """The deck's *DEFORMATION PLASTICITY materials that ccx reads (``_dp_nlgeom``: one is
+        used, so ccx 2.23 runs every step under NLGEOM, _plan_deformation_plasticity) and those
+        no section, composite ply or other card names (``_dp_unused``: their cards -> why they
+        are commented out).  Before _read_steps: the *STEP cards handle_step writes depend on
+        it (StepModel(dp=))."""
         opts = self._material_options(blocks)
         dps = [m for m, cards in opts.items()
                if any(c.keyword == "DEFORMATION PLASTICITY" for c in cards[1:])]
         if not dps:
             return
-        named = set(self._used_materials)
+        named = {m for m, _ in self._material_uses(blocks)}
         for b in blocks:
             if b.keyword != "MATERIAL" and b.param("MATERIAL"):
                 named.add(b.uparam("MATERIAL"))
@@ -8834,8 +8833,28 @@ class Converter:
                    f"in Abaqus, but ccx 2.23 would switch nonlinear geometry on for the whole model "
                    f"on reading it; commented out.")
             self._dp_unused.update((id(c), why) for c in opts[m])
+
+    def _plan_deformation_plasticity(self, blocks: List[Block]) -> None:
+        """How the deck's *DEFORMATION PLASTICITY materials run in ccx 2.23, which switches
+        nonlinear geometry on for the whole model when it reads such a material, even one no
+        section uses, and computes the law in the logarithmic strain ln V and the Cauchy
+        stress (probed on homogeneously deformed C3D8 cubes: uniaxial strain and stress,
+        simple and pure shear, turned; a total law, as Abaqus').  Abaqus runs it with the
+        small strain in a step without NLGEOM (2017 Theory and Materials guides, "Deformation
+        plasticity": meant for small-displacement analysis), so such a step is reduced
+        physics: a bar in tension strains 0.39 % more than Abaqus' law at sigma0 and 12 % more
+        at 2 sigma0 (alpha 0.5, n 5).  An explicit NLGEOM=NO is dropped (_dp_nlgeom,
+        handle_step): with it ccx turns nonlinear geometry off but still reads the small strain
+        as a Green-Lagrange one and returns a second Piola-Kirchhoff stress (32 % more strain
+        at 2 sigma0, a pressure under pure shear strain), so both spellings of Abaqus'
+        small-strain step run the same law.  A material that no section, composite ply or
+        other card names is commented out (_dp_unused, _plan_dp_materials): it changes
+        nothing in Abaqus."""
         if not self._dp_nlgeom:
             return
+        opts = self._material_options(blocks)
+        dps = [m for m, cards in opts.items()
+               if any(c.keyword == "DEFORMATION PLASTICITY" for c in cards[1:])]
         small = explicit_no = False
         for step in self.steps:
             explicit_no = explicit_no or step.nlgeom_card is False
@@ -8845,7 +8864,8 @@ class Converter:
                 small = True
         if not small:
             return
-        names = ", ".join((opts[m][0].param("NAME") or "").strip() for m in dps if m in named)
+        names = ", ".join((opts[m][0].param("NAME") or "").strip() for m in dps
+                          if id(opts[m][0]) not in self._dp_unused)
         self.report.warn(f"*DEFORMATION PLASTICITY ({names}) in a small-strain step: ccx 2.23 switches "
                          f"nonlinear geometry on for the whole model when it reads the law and "
                          f"computes it in the logarithmic strain and the Cauchy stress, while Abaqus "
@@ -11090,7 +11110,7 @@ class Converter:
                 return given
             return False
         temps = self._base_heated and self._tdep_material
-        if self._base_nlgeom:
+        if self.emit.step.nlgeom:             # (Abaqus' NLGEOM in force in the base state)
             if read:
                 self.report.warn("*FREQUENCY step after an NLGEOM general step, whose eigenmodes a "
                                  "modal / steady-state dynamics step reads: Abaqus includes the "
@@ -11257,7 +11277,6 @@ class Converter:
         self._step_proc = proc
         explicit = cur.explicit
         self._general_step_seen = cur.general_before            # (_frequency_perturbation)
-        self._base_nlgeom = cur.base_nlgeom_dp if self._dp_nlgeom else cur.base_nlgeom
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in step_block.params.items():
             if k == "NAME":
@@ -11320,17 +11339,31 @@ class Converter:
                     self.report.warn(f"*STEP AMPLITUDE={v}: ccx accepts only RAMP or STEP here; "
                                      f"dropped.", once=True)
                 continue
-            if k == "NLGEOM" and self._dp_nlgeom and (v or "YES").strip().upper() == "NO":
-                continue        # ccx misreads its *DEFORMATION PLASTICITY then (_plan_deformation_plasticity)
-            if k == "NLGEOM" and self.emit.no in self._pert_idx and not self._base_nlgeom and \
-                    (v or "YES").strip().upper() != "NO":
-                self.report.note("*STEP, NLGEOM dropped on a linear perturbation step whose base "
-                                 "state is linear: Abaqus runs the step linear about it, and the "
-                                 "later steps without NLGEOM (ccx ignores it on *FREQUENCY and "
-                                 "*BUCKLE, probed, but would run a static perturbation step, a "
-                                 "general step in ccx, nonlinear).", once=True)
+            if k == "NLGEOM":
+                # the card's NLGEOM as StepModel._writes_nlgeom has it (an NLGEOM it adds goes
+                # after the other parameters, below; so does one in place of the NLGEOM=NO a
+                # deformation plasticity material drops, with which ccx misreads the law:
+                # _plan_deformation_plasticity)
+                written = cur.nlgeom_written
+                if written is None or (written != cur.nlgeom_card and self._dp_nlgeom):
+                    if cur.nlgeom_card:
+                        self.report.note("*STEP, NLGEOM dropped on a linear perturbation step "
+                                         "whose base state is linear: Abaqus runs the step linear "
+                                         "about it, and the later steps without NLGEOM (ccx ignores "
+                                         "it on *FREQUENCY and *BUCKLE, probed, but would run a "
+                                         "static perturbation step, a general step in ccx, "
+                                         "nonlinear).", once=True)
+                elif written != cur.nlgeom_card:
+                    params[k] = None
+                    self.report.note("*STEP, NLGEOM=NO after an NLGEOM step written as NLGEOM: once "
+                                     "a step has switched NLGEOM on, Abaqus keeps it on in all later "
+                                     "steps (*STEP), ccx 2.23 would run the step geometrically "
+                                     "linear (probed: a cantilever's tip 8.13 against 5.05).",
+                                     once=True)
+                else:
+                    params[k] = v
                 continue
-            if k in ("NLGEOM", "INC", "INCF", "THERMAL NETWORK", "SHOCK SMOOTHING"):
+            if k in ("INC", "INCF", "THERMAL NETWORK", "SHOCK SMOOTHING"):
                 params[k] = v
                 continue
             self.report.note(f"*STEP parameter {k} dropped (not a ccx *STEP parameter).", once=True)
@@ -11346,7 +11379,7 @@ class Converter:
                 self.report.note("Explicit *STEP: INC=10000000 set (Abaqus/Explicit has no "
                                  "increment limit and ignores INC=; ccx stops at 100 increments "
                                  "by default).", once=True)
-            if "NLGEOM" not in params:
+            if "NLGEOM" not in params and cur.nlgeom_written:
                 params["NLGEOM"] = None
                 self.report.note("Explicit *STEP: NLGEOM added (Abaqus/Explicit includes geometric "
                                  "nonlinearity by default; ccx does not).", once=True)
@@ -11399,7 +11432,7 @@ class Converter:
                 ("TEMPERATURE", "CFLUX", "DFLUX", "DSFLUX", "FILM", "SFILM", "RADIATE", "SRADIATE")
                 for _, desc in _load_entries(b, user_loads=True))
         if self.emit.no in self._restore_from:
-            if self.emit.nlgeom and "NLGEOM" not in params:
+            if cur.nlgeom_written and "NLGEOM" not in params:
                 params["NLGEOM"] = None
                 self.report.note("*STEP, NLGEOM written on a general step after a linear "
                                  "perturbation step: Abaqus keeps NLGEOM on once a step has "
@@ -12888,12 +12921,14 @@ class Converter:
         return "2"
 
     def _loads_nlgeom(self) -> bool:
-        """Whether NLGEOM bears on the current step's own loads: in a general step under
-        NLGEOM, and in a linear perturbation step about an NLGEOM base state, whose loads
-        Abaqus applies on the base state's deformed geometry with the load stiffness of
-        follower loads (Abaqus 2017, linear perturbation and eigenvalue buckling).  (A
-        *FREQUENCY step's loads, which Abaqus ignores, are commented out: handle_step.)"""
-        return self.emit.nlgeom
+        """Whether NLGEOM bears on the current step's own loads in Abaqus (Step.nlgeom): in a
+        general step under NLGEOM, and in a linear perturbation step about an NLGEOM base state,
+        whose loads Abaqus applies on the base state's deformed geometry with the load
+        stiffness of follower loads (Abaqus 2017, linear perturbation and eigenvalue buckling).
+        The Abaqus question: whether Abaqus' FOLLOWER, CONSTANT RESULTANT, ... change the load
+        (ccx runs a general step under NLGEOM where Abaqus does, handle_step).  (A *FREQUENCY
+        step's loads, which Abaqus ignores, are commented out: handle_step.)"""
+        return self.emit.step is not None and self.emit.step.nlgeom
 
     def _load_params(self, b: Block, allowed: Sequence[str]) -> "OrderedDict[str, Optional[str]]":
         """Parameters ccx's distributed-load cards read; Abaqus-only ones are dropped —
@@ -21465,6 +21500,7 @@ class Converter:
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
         self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
+        self._plan_dp_materials(blocks)         # before the step model: NLGEOM in ccx
         self._read_steps(blocks)                # after the last planner that rewrites a step card
         self._reset_emission()                  # (handle_step advances the step cursor)
         self._plan_node_classes(blocks)         # after the mesh planners: the final element types
@@ -21493,7 +21529,7 @@ class Converter:
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
         self._plan_material_cards(blocks)
         self._undefined_parameter_data(blocks)
-        self._plan_deformation_plasticity(blocks)   # before the expansion check: NLGEOM in ccx
+        self._plan_deformation_plasticity(blocks)
         self._plan_expansion_as_ortho(blocks)
         self._plan_elastic_expansion(blocks)
         self._check_nlgeom_expansion(blocks)
@@ -21727,8 +21763,10 @@ class Converter:
         replaces, inserts, removes or edits one: a planner that needs a different card records
         a plan applied at emission instead (_vel_cards, _bc_lines, _op_new_drop).  The early
         model of _plan_deck_facts serves the planners before this point, which read only its
-        deck aggregates (StepModel); a unit test checks that they are this model's."""
-        self.steps = StepModel(blocks)
+        deck aggregates (StepModel); a unit test checks that they are this model's.  The
+        *STEP cards handle_step writes depend on a deformation plasticity material ccx reads
+        (_plan_dp_materials)."""
+        self.steps = StepModel(blocks, dp=self._dp_nlgeom)
 
     def _plan_solver_facts(self, blocks: List[Block]) -> None:
         """Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as

@@ -422,7 +422,8 @@ def test_step_model_of_model_data_only():
 
 def test_step_model_general_and_perturbation_steps():
     # a perturbation step's NLGEOM switches nothing on; it runs at its base state's, and
-    # NLGEOM stays on over the later general steps (NLGEOM=NO too)
+    # NLGEOM stays on over the later general steps (NLGEOM=NO too, which handle_step writes as
+    # NLGEOM); a perturbation step's NLGEOM over a linear base state is dropped
     blocks, m = _step_model("""*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n*END STEP
 *STEP, NLGEOM\n*FREQUENCY\n3\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n*END STEP
 *STEP, NLGEOM=YES, AMPLITUDE=step\n*STATIC\n*END STEP\n*STEP\n*BUCKLE\n2\n*END STEP
@@ -436,8 +437,8 @@ def test_step_model_general_and_perturbation_steps():
     assert [s.nlgeom_card for s in m] == [None, True, None, True, None, False, False]
     assert [s.nlgeom_on for s in m] == list(m.nl_steps) == [False] * 3 + [True] + [False] * 3
     assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
+    assert [s.nlgeom_written for s in m] == [None, None, None, True, None, False, True]
     assert (m.nl_any, m.nl_all, len(m)) == (True, False, 7)
-    assert [s.amplitude for s in m] == ["", "", "", "STEP", "", "", ""]
     assert all(s.between == () for s in m)
     # one perturbation rule (Abaqus' procedures; handle_step finds no ccx procedure in a *RANDOM
     # RESPONSE step); the temperature-DOF procedure is any card's
@@ -501,19 +502,23 @@ def test_step_model_states():
 
 
 def test_step_model_handle_step_facts():
-    # general steps (handle_step's six procedures, no PERTURBATION) and the NLGEOM of the base
-    # state they leave, as handle_step writes the *STEP cards: NLGEOM=NO stays off (with a
-    # deformation plasticity material it is dropped, and the explicit step gets NLGEOM), a
-    # perturbation step's NLGEOM over a linear base state is dropped; *BUCKLE steps loaded by
-    # more than temperatures
-    _, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
+    # general steps (handle_step's six procedures, no PERTURBATION), the NLGEOM in force in
+    # Abaqus and the one handle_step writes on the *STEP cards: an explicit NLGEOM=NO stays
+    # off, a perturbation step's NLGEOM over a linear base state is dropped; with a deformation
+    # plasticity material NLGEOM=NO is dropped (the explicit step gets NLGEOM), so the steps
+    # after the perturbation steps get NLGEOM again (_restore_from: ccx forgets it after a
+    # *FREQUENCY or *BUCKLE step); *BUCKLE steps loaded by more than temperatures
+    blocks, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*STATIC\n*END STEP
 *STEP\n*BUCKLE\n2\n*CLOAD\n1, 1, 1.\n*END STEP\n*STEP\n*BUCKLE\n2\n*TEMPERATURE\n1, 10.\n*END STEP
 *STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM\n*STATIC\n*END STEP\n*STEP\n*STATIC\n*END STEP""")
     assert [s.general for s in m] == [True, False, True, False, False, False, True, True]
     assert [s.general_before for s in m] == [False] + [True] * 7
-    assert [s.base_nlgeom for s in m] == [False] * 7 + [True]
-    assert [s.base_nlgeom_dp for s in m] == [False] + [True] * 7
+    assert [s.nlgeom for s in m] == [False] * 6 + [True] * 2
+    assert [s.nlgeom_written for s in m] == [False] + [None] * 5 + [True, None]
+    dp = A.StepModel(blocks, dp=True)
+    assert [s.nlgeom for s in dp] == [s.nlgeom for s in m]
+    assert [s.nlgeom_written for s in dp] == [True, None, True, None, None, True, True, None]
     assert [s.buckle_loaded for s in m] == [False] * 3 + [True] + [False] * 4
 
 
@@ -667,8 +672,8 @@ def test_step_model_is_current():
 
     def emit(self, blocks):
         now, early = vars(self.steps), vars(self.early_steps)
-        assert _same_cards(vars(A.StepModel(blocks)), now), \
-            [k for k, v in vars(A.StepModel(blocks)).items() if not _same_cards(v, now[k])]
+        assert _same_cards(vars(A.StepModel(blocks, dp=self._dp_nlgeom)), now), \
+            [k for k, v in vars(A.StepModel(blocks, dp=self._dp_nlgeom)).items() if not _same_cards(v, now[k])]
         assert {k: v for k, v in early.items() if k not in card_level} == \
             {k: v for k, v in now.items() if k not in card_level}
         assert now.keys() - card_level >= {"procs", "inertia", "mass_loads", "nl_heads", "pert"}
@@ -8877,6 +8882,26 @@ def test_frequency_base_temperatures():
     assert A.temperature_dependent(blk("HYPERFOAM", {"N": "2"}, ["1., 2., 3., 4., .1, .1, 0.",
                                                                  "1., 2., 3., 4., .1, .1, 100."]))
     assert not A.temperature_dependent(blk("HYPERELASTIC", {"MARLOW": None}, ["1.", "2."]))
+
+
+def test_nlgeom_no_after_an_nlgeom_step_is_written_nlgeom():
+    # "Once the NLGEOM option has been switched on, it will be active during all subsequent
+    # steps" (Abaqus 2017, *STEP): ccx would run a general step with NLGEOM=NO linear
+    # (validate_with_ccx.py nlgeom_no_after_nlgeom), so it is written NLGEOM there; a
+    # perturbation step keeps its NLGEOM=NO (ccx ignores it on *FREQUENCY), the general step
+    # after it gets NLGEOM again (ccx forgets it there), and a first step's NLGEOM=NO stays
+    def heads(body):
+        return [s.split("\n")[0] for s in body.split("*STEP")[1:]]
+
+    load = "*Cload\n7, 3, -1.\n"
+    no = _deck_step("Static", load, ", nlgeom=NO")
+    body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", load, ", nlgeom") + no +
+                                  _deck_step("Frequency\n2", head=", nlgeom=NO") + no)
+    assert heads(body) == [", NLGEOM", ", NLGEOM", ", NLGEOM=NO, PERTURBATION", ", NLGEOM"]
+    assert rep.text().count("*STEP, NLGEOM=NO after an NLGEOM step written as NLGEOM") == 1
+    assert [s.nlgeom for s in conv.steps] == [True] * 4 and not conv.reduced_physics
+    body, _, rep = convert_str(BUCKLE_CUBE + no + _deck_step("Static", load))
+    assert heads(body) == [", NLGEOM=NO", ""] and "written as NLGEOM" not in rep.text()
 
 
 def test_nlgeom_on_a_perturbation_step_stays_in_it():

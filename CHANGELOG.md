@@ -585,6 +585,10 @@ physics.
   below 1 on many intervals; a distributing coupling in a deck without nodes; a `*PARAMETER`
   nested too deep for Python's parser. A `*PARAMETER` string format over 100000 characters
   wide, and `round(x, -n)` with a huge n, could exhaust the memory: refused / bounded.
+* **`*STEP, NLGEOM=NO` after an NLGEOM step** — Abaqus keeps NLGEOM on once a step has
+  switched it on; ccx ran such a step geometrically linear (a cantilever's tip 8.13 against
+  5.05, without a message; with plasticity ccx segfaulted). It is now written `NLGEOM`, with
+  a note.
 
 ## 1.4.0 (October 2026)
 

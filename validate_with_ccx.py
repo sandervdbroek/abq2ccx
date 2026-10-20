@@ -3416,6 +3416,22 @@ def after_pert_deck(case, twin=False):
             "*NODE OUTPUT\nU\n*ELEMENT OUTPUT\nS\n" + out)
 
 
+def nlgeom_no_deck(twin=False):
+    """A cantilever of four C3D8I (E 1000, nu 0, 2 x 1 x 1 each) along x, clamped at x = 0, tip
+    nodes 17-20: an NLGEOM static step loading the tip in z, then a *STEP, NLGEOM=NO static
+    step loading it twice as hard (ccx ran it linear: tip 8.13, where NLGEOM gives 5.05).
+    ``twin``: the second step with NLGEOM, the answer Abaqus gives (NLGEOM stays on)."""
+    nodes = "".join(f"{4 * i + k + 1}, {2.0 * i}, {y}., {z}.\n"
+                    for i in range(5) for k, (y, z) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
+    elems = "".join(f"{i + 1}, " + ", ".join(str(4 * i + n) for n in (1, 5, 6, 2, 4, 8, 7, 3)) + "\n"
+                    for i in range(4))
+    step = "*STATIC\n0.1, 1.\n*CLOAD\nTIP, 3, {}\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n"
+    return (f"*NODE\n{nodes}*ELEMENT, TYPE=C3D8I, ELSET=EALL\n{elems}*NSET, NSET=FIX\n1, 2, 3, 4\n"
+            "*NSET, NSET=TIP\n17, 18, 19, 20\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*BOUNDARY\nFIX, 1, 3\n*STEP, NLGEOM\n" +
+            step.format("0.5") + ("*STEP, NLGEOM\n" if twin else "*STEP, NLGEOM=NO\n") + step.format("1."))
+
+
 def equation_held_deck(steps="both"):
     """Two C3D8 cubes (E 210000, nu 0.3, rho 7.8e-9) in a row, clamped at x = 0, with
     *EQUATION u2(12) = u2(9) between two far corners: a *FREQUENCY step whose BCs hold both
@@ -9804,6 +9820,18 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {err:.1e} apart, the top moved "
                   f"{moved:.4g} (before: {was})")
         failures += 0 if ok else 1
+    # a *STEP, NLGEOM=NO after an NLGEOM step: Abaqus keeps NLGEOM on ("it will be active during
+    # all subsequent steps", *STEP), ccx ran the step linear (written NLGEOM since)
+    runs = [review_run(nlgeom_no_deck(twin), "nlgeom_no_after_nlgeom" + ("_ref" if twin else ""),
+                       dat_node_blocks) for twin in (False, True)]
+    ok = all(runs)
+    if ok:
+        err, moved = same(runs, -1)             # (the last increment's tip)
+        ok = err < 1e-7 * moved and 4.0 < moved < 6.0
+        print(f"{'PASS' if ok else 'FAIL'}  nlgeom_no_after_nlgeom (a C3D8I cantilever, an NLGEOM "
+              f"static step, then a *STEP, NLGEOM=NO one loading it twice as hard): the tip as with "
+              f"NLGEOM in the second step, {moved:.4g} ({err:.1e} apart; before: 8.13, linear)")
+    failures += 0 if ok else 1
     # an *EQUATION whose every DOF a *FREQUENCY step holds (ccx stopped: a BC on its dependent
     # DOF; before that the converter dropped it, untying the static step after)
     runs = [review_run(equation_held_deck(s), "equation_held" + ("" if s == "both" else "_" + s),
