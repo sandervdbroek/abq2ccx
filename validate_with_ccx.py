@@ -288,6 +288,19 @@ def dat_node_blocks(dat_path, title="displacements"):
     return blocks
 
 
+def dat_solve_mode_blocks(dat_path):
+    """The displacement *NODE PRINT blocks of a ccx .dat file as {node: values}, in order, split
+    into the solves' and the eigenmodes' (those after an EIGENVALUE NUMBER heading in their
+    step)."""
+    solves, modes, eigen_step = [], [], None
+    for step, title, _, _, rows in A.dat_blocks(dat_path):
+        if title.startswith("E I G E N V A L U E    N U M B E R"):
+            eigen_step = step
+        elif title == "displacements":
+            (modes if step == eigen_step else solves).append({int(r[0]): r[1:] for r in rows})
+    return solves, modes
+
+
 def frame2d(nodes, elems, fixed, loads, udl=()):
     """A plane Euler-Bernoulli frame by the direct stiffness method, with consistent loads
     (the exact nodal solution of beam theory).  ``nodes`` {id: (x, y)}; ``elems`` [(a, b, E,
@@ -4348,7 +4361,7 @@ def frequency_heated_deck(heat=True, t0=20.0, hyper=False):
 def hyperfoam_deck(case, foam=True):
     """*HYPERFOAM (no N: N=1) mu1 2e6, alpha1 2, nu1 0.1, or (``foam`` False) *ELASTIC at its
     small-strain moduli (E 2 mu (1 + nu) = 4.4e6, nu 0.1): ``case`` "frequency" or "buckle"
-    buckle_gravity_deck's column (4 modes; 2 factors under 1 down at TIP); "cube" a unit C3D8
+    buckle_gravity_deck's column (4 modes; 2 factors under 0.01 down at TIP); "cube" a unit C3D8
     cube stretched to 0.8 along x (NLGEOM), its x = 0 face held in x, its sides free."""
     mat = "*HYPERFOAM\n2.e6, 2., 0.1\n" if foam else "*ELASTIC\n4.4e6, 0.1\n"
     if case == "cube":
@@ -4358,7 +4371,7 @@ def hyperfoam_deck(case, foam=True):
                 "*SOLID SECTION, ELSET=E, MATERIAL=FOAM\n*BOUNDARY\nX0, 1, 1\n1, 2, 3\n4, 3, 3\n"
                 "2, 3, 3\n*STEP, NLGEOM\n*STATIC\n0.1, 1.\n*BOUNDARY\nX1, 1, 1, -0.2\n"
                 "*NODE PRINT, NSET=X1, TOTALS=YES\nRF\n*NODE PRINT, NSET=X1\nU\n*END STEP\n")
-    deck = buckle_gravity_deck("", buckle=case == "buckle", load=1.0)
+    deck = buckle_gravity_deck("", buckle=case == "buckle", load=0.01)
     deck = deck.replace("*ELASTIC\n210.e9, 0.3\n", mat)
     return deck + ("*STEP\n*FREQUENCY\n4\n*END STEP\n" if case == "frequency" else "")
 
@@ -9292,27 +9305,41 @@ def main():
               f"the frequency step ({err:.1e} apart, free nodes moved {moved:.3g})")
     failures += 0 if ok else 1
     # moments on it: a perturbation step's are its own (the base moments were added to its
-    # load), and the next general step's are the base state's (the buckle's came back)
+    # load), and the next general step's are the base state's (the buckle's came back).  The
+    # solves' displacements agree to round-off; the buckling modes only as far as ccx's
+    # eigensolver converges them (3.8e-9 on x86_64), like the factors, and either sign
+
+    def mode_gap(got, ref):
+        """The largest difference between two eigenmodes' printed displacements, ``got`` of
+        either sign, over the largest |u| of ``ref``."""
+        return ccx_ratio(min(max(abs(sg * a - b) for n, v in ref.items()
+                                 for a, b in zip(got.get(n, [math.inf] * 3), v)) for sg in (1, -1)),
+                         max(abs(x) for v in ref.values() for x in v))
     for pert, what in (("buckle", "*BUCKLE"), ("static", "*STEP, PERTURBATION *STATIC")):
         runs = [review_run(pert_frame_deck("moment", pert, twin), f"pert_moment_{pert}" +
                            ("_twin" if twin else ""),
                            lambda dat: (dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T"),
-                                        dat_node_blocks(dat)))
+                                        dat_solve_mode_blocks(dat)))
                 for twin in (False, True)]
-        ok = all(runs) and len(runs[0][1]) == len(runs[1][1]) >= 2
+        nev = 2 if pert == "buckle" else 0
+        ok = all(runs) and len(runs[0][1][0]) == len(runs[1][1][0]) >= 2 and \
+            len(runs[0][1][1]) == len(runs[1][1][1]) == nev
         if ok:
-            err, moved = same([r[1] for r in runs])
+            err, moved = same([r[1][0] for r in runs])
+            gap = max((mode_gap(g, r) for g, r in zip(runs[0][1][1], runs[1][1][1])), default=0.0)
             lam = [r[0] for r in runs]
-            ok = err < 1e-9 * moved and moved > 1e-3 and (pert == "static" or (
+            ok = err < 1e-9 * moved and moved > 1e-3 and gap < 1e-6 and (pert == "static" or (
                 len(lam[0]) == len(lam[1]) == 2 and
                 max(abs(ccx_ratio(a, b) - 1) for a, b in zip(*lam)) < 1e-6))
             print(f"{'PASS' if ok else 'FAIL'}  pert_moment_{pert} (moments about local 1 and 2 on a "
                   f"B31 frame's joint with an oblique *TRANSFORM, one about local 3 in a {what} step, "
                   f"then the first tripled): every displacement as with the moments in global "
                   f"components and no *TRANSFORM ({err:.1e} apart, free nodes moved {moved:.3g})"
-                  + (f", buckling factors {lam[0][0]:.7g} vs {lam[1][0]:.7g}" if pert == "buckle" else ""))
+                  + (f", buckling modes {gap:.1e} apart, factors {lam[0][0]:.7g} vs {lam[1][0]:.7g}"
+                     if pert == "buckle" else ""))
         elif all(runs):
-            print(f"FAIL  pert_moment_{pert}: {len(runs[0][1])} vs {len(runs[1][1])} displacement tables")
+            print(f"FAIL  pert_moment_{pert}: {[len(b) for b in runs[0][1]]} vs {[len(b) for b in runs[1][1]]} "
+                  f"displacement tables (solves, modes)")
         failures += 0 if ok else 1
     # a blank field in the *TRANSFORM line (0 for Abaqus and ccx): the axes were "unreadable",
     # so the moments stayed in local components on the ccx knot, which reads them as global
@@ -9987,7 +10014,8 @@ def main():
     # ccx 2.23 gives an N=1 *HYPERFOAM no stiffness (it stops, or frequencies of 0): the
     # converter writes it as N=2 with mu1 halved, which ccx solves: the column's frequencies
     # and buckling factors as with *ELASTIC at the small-strain moduli, and the cube's
-    # nominal stress and lateral stretch the closed form's
+    # nominal stress and lateral stretch the closed form's.  The buckle load is 0.01: from 0.3
+    # to 10, ccx's foam factor scatters about a Neo-Hooke one's, by 4e-3 to 1.2e-2 by build
     hf = {(c, f): review_run(hyperfoam_deck(c, f), f"hyperfoam_{c}{'' if f else '_elastic'}",
                              lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"
                                                          if c == "frequency" else
@@ -10004,11 +10032,11 @@ def main():
         want = 2 * 2e6 / (2 * 0.8) * (0.8 ** 2 - lat ** 2)
         side = cube[1].get(3, [0.0, 0.0])[1]
         err2 = max(abs(cube[0][0] / want - 1), abs(side / (lat - 1) - 1))
-        ok = err < 1e-6 and err_b < 2e-3 and err2 < 1e-5 and len(hf[("frequency", True)]) == 4
+        ok = err < 1e-6 and err_b < 1e-5 and err2 < 1e-5 and len(hf[("frequency", True)]) == 4
         print(f"{'PASS' if ok else 'FAIL'}  hyperfoam_n1 (*HYPERFOAM, N=1 mu 2e6, alpha 2, nu 0.1, "
               f"written as N=2): the column's f1 {hf[('frequency', True)][0]:.7g}, buckling factor "
-              f"{hf[('buckle', True)][0]:.7g}, as with *ELASTIC E 4.4e6, nu 0.1 ({err:.1e} / "
-              f"{err_b:.1e} apart: the buckle step's stresses are the foam's); "
+              f"{hf[('buckle', True)][0]:.7g} under 0.01, as with *ELASTIC E 4.4e6, nu 0.1 ({err:.1e} / "
+              f"{err_b:.1e} apart); "
               f"the cube stretched to 0.8: RF {cube[0][0]:.7g} vs {want:.7g}, its free side "
               f"{side:.6g} vs {lat - 1:.6g} ({err2:.1e} apart)")
     failures += 0 if ok else 1
