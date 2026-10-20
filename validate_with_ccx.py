@@ -3144,6 +3144,22 @@ def pert_procs_deck(twin=False):
             "*STEP\n*STATIC\n0.5, 1.\n*CLOAD, AMPLITUDE=TT\n7, 1, 1.\n*NODE PRINT, NSET=ALL\nU\n*END STEP\n")
 
 
+def between_steps_deck(twin=False):
+    """A C3D8 cube (E 1000, nu 0.3) on rollers, its top corner pushed up in a static step; then,
+    between that step and the next static one (``twin``: inside it, after its procedure card),
+    a *BOUNDARY, OP=NEW giving the rollers alone, a *CLOAD pulling a top corner sideways and a
+    *NODE PRINT; the next step also pushes that corner along y."""
+    move = ("*BOUNDARY, OP=NEW\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n*CLOAD\n6, 1, 1.\n"
+            "*NODE PRINT, NSET=ALL\nU\n")
+    return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=ALL\n1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*BOUNDARY\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n7, 3, 3, 0.01\n*END STEP\n" + ("" if twin else move) +
+            "*STEP\n*STATIC\n" + (move if twin else "") + "*BOUNDARY\n6, 2, 2, 0.005\n*END STEP\n")
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -9350,6 +9366,22 @@ def main():
               f"over a *FREQUENCY and a *RESPONSE SPECTRUM step): the last step as without them "
               f"({err:.1e} apart; the loaded corner moved {side:.4g} sideways), the top at {top:.7g} "
               f"vs 0.02")
+    failures += 0 if ok else 1
+
+    # cards between two steps act in the next one (ccx reads them so): the *CLOAD and *NODE
+    # PRINT there were commented out
+    runs = [review_run(between_steps_deck(twin), "between_steps" + ("_ref" if twin else ""),
+                       dat_node_blocks) for twin in (False, True)]
+    ok = all(runs) and len(runs[0]) == len(runs[1]) == 1
+    if ok:
+        err, moved = same(runs, -1)
+        side = runs[0][-1].get(6, [0.0])[0]
+        ok = err < 1e-12 + 1e-9 * moved and side > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  between_steps (a C3D8 cube: *BOUNDARY, OP=NEW, *CLOAD and "
+              f"*NODE PRINT between two static steps): solved as with them in the second step "
+              f"({err:.1e} apart; the loaded corner moved {side:.4g})")
+    elif all(runs):
+        print(f"FAIL  between_steps: {len(runs[0])} and {len(runs[1])} printed blocks")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

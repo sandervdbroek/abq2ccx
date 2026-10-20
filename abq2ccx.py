@@ -5783,8 +5783,9 @@ class Converter:
                 out.extend(self.handle_step(cards))
             elif b.keyword in ("HEADING", "END STEP") or b.keyword in GEOM_KW:
                 continue
-            elif b.keyword in HISTORY_ONLY_KW:
-                where = "before the first *STEP" if self._step_idx == 0 else "between steps"
+            elif b.keyword in HISTORY_ONLY_KW:       # (_move_between_cards moved the others)
+                where = "before the first *STEP" if self._step_idx == 0 else \
+                    "after the last step" if self._step_idx == len(self.steps) else "between steps"
                 out.extend(self._commented(
                     b, f"*{b.keyword} is step (history) data but appears {where}: Abaqus rejects "
                        f"that, ccx stops with '*{b.keyword} should only be used within a STEP', "
@@ -18311,6 +18312,7 @@ class Converter:
         raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
+        blocks = self._move_between_cards(blocks)     # before anything splits the deck into steps
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         blocks = self._plan_self_contact(blocks)      # before anything reads contact pairs
@@ -18409,6 +18411,49 @@ class Converter:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
                              + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
                              "own solution (see the warnings above).")
+        return out
+
+    def _move_between_cards(self, blocks: List[Block]) -> List[Block]:
+        """Step data after a step's *END STEP and before the next *STEP (loads, BCs, output
+        requests, ...): ccx 2.23 applies it in the next step, as if given there first (probed:
+        a *BOUNDARY, OP=NEW there removes the BCs in force, a *CLOAD loads the next step), so
+        it is moved into that step, after its procedure card, where every planner reads it
+        so; warned.  A procedure card stays (emit_other comments it out), and so does what
+        follows the last step."""
+        steps = [i for i, b in enumerate(blocks) if b.keyword == "STEP"]
+        if len(steps) < 2:
+            return blocks
+        move: Dict[int, List[Block]] = {}         # index of a *STEP in out -> the cards moved into it
+        out: List[Block] = []
+        loose: List[Block] = []
+        seen = 0                                  # the *STEP cards so far
+        after = False                             # after a step's *END STEP, before a *STEP
+        for b in blocks:
+            if b.keyword == "STEP":
+                seen += 1
+                if loose:
+                    move[len(out)] = loose
+                    self.report.warn(f"{', '.join(dedup('*' + x.keyword for x in loose))} between "
+                                     f"steps {seen - 1} and {seen}: moved into step {seen}, where ccx "
+                                     f"2.23 applies such cards (probed). Give them in the step they "
+                                     f"belong to.", once=True)
+                loose, after = [], False
+            elif b.keyword == "END STEP":
+                after = seen < len(steps)
+            elif after and (b.keyword in LOAD_CARD_FIELD or
+                            (b.keyword in HISTORY_ONLY_KW and b.keyword not in PROC_KW)):
+                loose.append(b)
+                continue
+            out.append(b)
+        if not move:
+            return blocks
+        procs = PROC_KW | Converter._MOTION_PROCS | PERTURBATION_PROCS
+        for at in sorted(move, reverse=True):     # (the later ones first: the indices stay)
+            j = at + 1
+            while j < len(out) and out[j].keyword not in ("STEP", "END STEP") and out[j].keyword not in procs:
+                j += 1
+            j = j + 1 if j < len(out) and out[j].keyword in procs else at + 1
+            out[j:j] = move[at]
         return out
 
     def _short_fields(self, out: List[str]) -> List[str]:

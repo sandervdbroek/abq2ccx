@@ -11773,6 +11773,28 @@ def test_velocity_bcs_through_a_step_without_time_period():
     assert conv._vel_tail == {} and "ABQ2CCX_VEL2" not in body
 
 
+def test_cards_between_steps_act_in_the_next_one():
+    # step data between two steps acts in the next step (ccx 2.23 applies it so, probed): it is
+    # moved into that step, after its procedure card, for every planner (one rule); a
+    # procedure card stays where it is, commented out, and so does what follows the last step
+    deck = (HEX + "*NSET, NSET=TOP\n5, 6, 7, 8\n*Solid Section, elset=EALL, material=M\n*Material, "
+            "name=M\n*Elastic\n1000., 0.3\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+            "*Step\n*Static\n0.5, 1.\n*Boundary\n7, 3, 3, 0.01\n*End Step\n"
+            "*Boundary, op=NEW\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n*Cload\n6, 1, 1.\n"
+            "*Boundary, type=velocity\nTOP, 3, 3, 0.01\n*Frequency\n2\n"
+            "*Step\n*Static\n0.5, 1.\n*Boundary\n6, 2, 2, 0.005\n*End Step\n*Cload\n5, 1, 1.\n")
+    body, conv, rep = convert_str(deck)
+    two = _step(body, 2)
+    assert two.startswith("\n*STATIC\n0.5, 1.\n*BOUNDARY, OP=NEW\n1, 1, 3\n"), two
+    # (the velocity BC goes on from where step 1 left node 7; the others were free there)
+    assert "*CLOAD\n6, 1, 1.\n" in two and "*BOUNDARY, AMPLITUDE=ABQ2CCX_VEL1\n7, 3, 3, 1." in two
+    assert "outside a step" not in body
+    assert [len(s.between) for s in conv.steps] == [0, 1] and conv.steps.steps[1].between[0].keyword == "FREQUENCY"
+    assert "** abq2ccx: *FREQUENCY is step (history) data but appears between steps" in body
+    assert "** abq2ccx: *CLOAD is step (history) data but appears after the last step" in body
+    assert "*BOUNDARY, *CLOAD between steps 1 and 2: moved into step 2" in rep.text()
+
+
 def _normal_rows(body):
     return [[float(x) for x in ln.split(",")] for ln in _card(body, "*NORMAL")]
 
