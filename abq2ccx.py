@@ -10649,7 +10649,7 @@ class Converter:
             else:
                 self.report.note(f"*CLOAD parameter {k} dropped (not read by ccx).", once=True)
         out = [emit_keyword("CLOAD", keep)]
-        moved = False
+        moved: List[int] = []       # reference nodes whose moments go to their ROT NODE
         hit: List[int] = []         # transformed nodes whose moments _plan_transformed_rotations rewrites
         marks: List[Tuple[int, List[str]]] = []     # where each data line's lines start, its fields
         for ln in b.data:
@@ -10671,7 +10671,7 @@ class Converter:
                 continue
             elif len(refs) != len(nodes):
                 out.append(ln)                       # the other nodes keep the moment
-            moved = moved or bool(refs)
+            moved += refs
             try:                                     # a zero moment: the same in any axes
                 zero = pf(f[2]) == 0.0
             except (IndexError, ValueError):
@@ -10696,7 +10696,7 @@ class Converter:
             out.extend(got if isinstance(got, list) else self._rot_refused(b, n, got))
         if moved:
             self.report.note("Moments on a *RIGID BODY reference point moved to DOFs 1-3 of its "
-                             "ROT NODE (" + self._rot_node_why(refs) + ").", once=True)
+                             "ROT NODE (" + self._rot_node_why(moved) + ").", once=True)
         return out
 
     # the parameters of a ccx *DLOAD card, which *DLOAD and *DSLOAD both become
@@ -14407,7 +14407,6 @@ class Converter:
         of n — one local term each — with n's local DOF eliminated (listed first, in an order
         ccx takes), so the twin's DOFs stay free for the constraints that use them."""
         ax = self._eq_frame(n)
-        assert isinstance(ax, tuple)
         twin = self._twins[n]
         rows = [[(n, j + 1, 1.0)] + [(twin, k + 1, -ax[j][k]) for k in range(3)
                                      if abs(ax[j][k]) > 1e-12] for j in range(3)]
