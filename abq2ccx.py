@@ -18378,8 +18378,8 @@ class Converter:
         out.extend(self.emit_other(blocks))
         deck = self._settle_dependents(EmittedDeck(out, mesh))
         deck = self._restore_base_states(deck)
-        out = self._buckle_displacements(deck.render())   # after the BCs the restore gives back
-        out = self._modal_own_loads(out)        # after the loads the restore gives back
+        deck = self._buckle_displacements(deck)  # after the BCs the restore gives back
+        out = self._modal_own_loads(deck.render())   # after the loads the restore gives back
         out = self._clear_body_forces(out)      # after every pass that writes *DLOAD, OP=NEW
         out = self._keep_body_loads(out)        # after the restore, which gives body loads too
         self._audit_loads(blocks, out)
@@ -20757,7 +20757,7 @@ class Converter:
                  if used_hold[0] else []) + model_cards)
         return deck.edited()
 
-    def _buckle_displacements(self, out: List[str]) -> List[str]:
+    def _buckle_displacements(self, deck: EmittedDeck) -> EmittedDeck:
         """ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for its prescribed
         displacements: the free nodes stay put and only the prescribed ones move, by every
         nonzero value in force (the step's own and those held on from earlier steps alike), so
@@ -20775,37 +20775,26 @@ class Converter:
           (probed; handle_step warns), PERTURBATION is dropped; after one, ccx has no form
           that keeps the preload: warned (--approximate, in the last step: PERTURBATION
           dropped, so the preload's stresses are left out)."""
+        # per *STEP line, what it holds (a *STEP inside an open step leaves that one unfinished);
+        # BCs keyed by the target as written and DOFs 1-6; OP=NEW between steps is ignored
         steps: List[dict] = []
         state: Dict[Tuple[str, int], Tuple[str, bool]] = {}    # (TARGET, DOF) -> (target, nonzero)
-        insert: Dict[int, List[str]] = {}
         cur: Optional[dict] = None
-        card: Optional[str] = None
-        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
-        for i, raw in enumerate(out):
-            s = raw.strip()
-            if not s or s.startswith("**"):
+        for c in deck.cards:
+            if c.keyword == "STEP":
+                cur = {"step": deck.steps[c.step - 1], "held": dict(state), "own": set(),
+                       "valued": False, "zeroed": False}
+                steps.append(cur)
                 continue
-            if s.startswith("*"):
-                card, params = parse_keyword_line(s)
-                if card == "STEP":
-                    cur = {"line": i, "params": params, "proc": None, "at": None, "held": dict(state),
-                           "own": set(), "valued": False, "bcs": 0}
-                    steps.append(cur)
-                    continue
-                if cur is None:
-                    continue
-                if cur["proc"] is not None and cur["at"] is None:
-                    cur["at"] = i                   # the first card after the procedure's
-                if card in PROC_KW and cur["proc"] is None:
-                    cur["proc"] = card
-                elif card == "BOUNDARY":
-                    if not cur["bcs"] and (params.get("OP") or "").upper() == "NEW":
-                        state.clear()
-                        cur["held"] = {}
-                    cur["bcs"] += 1
-                elif card == "END STEP":
+            if cur is not None:
+                st = cur["step"]
+                if c is st.acting("BOUNDARY"):
+                    state.clear()
+                    cur["held"] = {}
+                elif c.keyword == "END STEP":
                     held = {k: t for k, (t, v) in cur["held"].items() if v and k not in cur["own"]}
-                    if cur["proc"] == "BUCKLE" and "PERTURBATION" in cur["params"] and held:
+                    if st.proc is not None and st.proc.keyword == "BUCKLE" and st.perturbation and \
+                            held:
                         dofs: "OrderedDict[str, List[int]]" = OrderedDict()
                         for (_, d), t in held.items():
                             dofs.setdefault(t, []).append(d)
@@ -20818,44 +20807,46 @@ class Converter:
                                 if j + 1 == len(ds) or ds[j + 1] != d + 1:
                                     lines.append(f"{t}, {start}, {d}, 0.")
                                     start = ds[j + 1] if j + 1 < len(ds) else d
-                        insert[cur["at"]] = ["** abq2ccx: boundary conditions held on from earlier "
-                                             "steps, at 0: no load in a perturbation step",
-                                             "*BOUNDARY"] + lines
+                        deck.insert_before(st.next_card(st.proc), [
+                            "** abq2ccx: boundary conditions held on from earlier steps, at 0: no "
+                            "load in a perturbation step", "*BOUNDARY"] + lines)
+                        cur["zeroed"] = True
                     cur = None
+            if c.keyword != "BOUNDARY":
                 continue
-            if card != "BOUNDARY":
-                continue
-            rec = [x.strip() for x in s.split(",")]
-            try:
-                first = int(rec[1])
-                last = int(rec[2]) if len(rec) > 2 and rec[2] else first
-            except (IndexError, ValueError):
-                continue
-            try:
-                valued = any(k in params for k in ("FIXED", "USER", "SUBMODEL")) or \
-                    (len(rec) > 3 and bool(rec[3]) and pf(rec[3]) != 0.0)
-            except ValueError:
-                valued = True
-            for d in range(max(first, 1), min(last, 6) + 1):
-                state[(rec[0].upper(), d)] = (rec[0], valued)
-                if cur is not None:
-                    cur["own"].add((rec[0].upper(), d))
-                    cur["valued"] = cur["valued"] or valued
+            for s in c.data:
+                rec = [x.strip() for x in s.split(",")]
+                try:
+                    first = int(rec[1])
+                    last = int(rec[2]) if len(rec) > 2 and rec[2] else first
+                except (IndexError, ValueError):
+                    continue
+                try:
+                    valued = any(k in c.params for k in ("FIXED", "USER", "SUBMODEL")) or \
+                        (len(rec) > 3 and bool(rec[3]) and pf(rec[3]) != 0.0)
+                except ValueError:
+                    valued = True
+                for d in range(max(first, 1), min(last, 6) + 1):
+                    state[(rec[0].upper(), d)] = (rec[0], valued)
+                    if cur is not None:
+                        cur["own"].add((rec[0].upper(), d))
+                        cur["valued"] = cur["valued"] or valued
         same = len(steps) == self._step_idx           # (the deck's steps, numbered alike)
-        for n, st in enumerate(steps, 1):
-            if st["proc"] != "BUCKLE" or "PERTURBATION" not in st["params"]:
+        for n, info in enumerate(steps, 1):
+            st = info["step"]
+            if st.proc is None or st.proc.keyword != "BUCKLE" or not st.perturbation:
                 continue
-            if st["at"] in insert:
+            if info["zeroed"]:
                 self.report.note("*BUCKLE step with PERTURBATION: the nonzero boundary conditions "
                                  "held on from earlier steps are given again at 0 there. They are no "
                                  "load in an Abaqus perturbation step, while ccx 2.23 takes every "
                                  "nonzero value in force as part of the buckling load (probed).",
                                  once=True)
-            if not st["valued"]:
+            if not info["valued"]:
                 continue
+            params = OrderedDict((k, v) for k, v in st.head.params.items() if k != "PERTURBATION")
             if same and not self._buckle_preloaded.get(n, True):
-                st["params"].pop("PERTURBATION")
-                out[st["line"]] = emit_keyword("STEP", st["params"])
+                deck.set_keyword(st.head, params)
                 self.report.note("*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed "
                                  "displacement loads and no general step precedes (the same "
                                  "unloaded model): ccx 2.23 does not solve a perturbation buckling "
@@ -20863,8 +20854,7 @@ class Converter:
                                  "(probed: factor 2.39 for 40.9); its plain *BUCKLE does.", once=True)
                 continue
             if same and self._approx and n == len(steps):
-                st["params"].pop("PERTURBATION")
-                out[st["line"]] = emit_keyword("STEP", st["params"])
+                deck.set_keyword(st.head, params)
                 self.report.warn(f"[APPROX] *BUCKLE step {n} buckles without its preload: a "
                                  f"prescribed displacement loads it after a general step, and ccx "
                                  f"2.23 solves for that only without PERTURBATION (with it only "
@@ -20883,9 +20873,7 @@ class Converter:
                                 if same and n == len(steps) else "."))
             self._reduces(f"*BUCKLE step {n} loaded by a prescribed displacement after a preload "
                           f"(ccx does not solve for it)")
-        for i in sorted(insert, reverse=True):
-            out[i:i] = insert[i]
-        return out
+        return deck.edited()
 
     def _shift_total_time(self, out: List[str]) -> List[str]:
         """ccx 2.23 counts the time of a *MODAL DYNAMIC step, and of a static perturbation step
