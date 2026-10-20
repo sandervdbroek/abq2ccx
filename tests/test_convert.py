@@ -3304,12 +3304,20 @@ def test_eigen_data_line_layouts():
     assert "*FREQUENCY\n8, 0., 60." in body                       # count capped by the mesh size
 
 
-def test_dsload_follower_warns_under_nlgeom():
+def test_dload_follower_options_warn_under_nlgeom_where_abaqus_reads_them():
+    # Abaqus reads FOLLOWER for TRVEC / EDLD only and CONSTANT RESULTANT for tractions and edge
+    # loads (Keywords manual): on a pressure they change nothing; on an edge load under NLGEOM
+    # ccx's follower load per current area differs
     deck = HEX + "*Surface,name=SF\nEALL, S2\n*Step{}\n*Static\n*Dsload, follower=no\nSF, P, 1.\n*End Step\n"
-    _, _, rep = convert_str(deck.format(", nlgeom"))
-    assert "FOLLOWER=NO dropped" in rep.text()
-    _, _, rep = convert_str(deck.format(""))
-    assert "FOLLOWER=NO dropped" not in rep.text()
+    _, conv, rep = convert_str(deck.format(", nlgeom"))
+    assert "FOLLOWER=NO dropped" not in rep.text() and not conv.reduced_physics
+    assert "parameter FOLLOWER dropped (not read by ccx)" in rep.text()
+    deck = HEX + "*Step{}\n*Static\n*Dload, constant resultant=yes\nEALL, EDNOR1, 1.\n*End Step\n"
+    _, conv, rep = convert_str(deck.format(", nlgeom"))
+    assert "CONSTANT RESULTANT=YES dropped" in rep.text()
+    assert conv.reduced_physics == ["*DLOAD CONSTANT RESULTANT=YES under NLGEOM"]
+    _, conv, rep = convert_str(deck.format(""))
+    assert "CONSTANT RESULTANT=YES dropped" not in rep.text() and not conv.reduced_physics
 
 
 def test_creep_strain_hardening_warns():
@@ -5965,18 +5973,80 @@ def test_traction_on_plane_and_axisymmetric_edges():
 
 def test_traction_under_nlgeom_converts_only_when_exact():
     deck = (HEX + "*Surface, name=TOP\nEALL, S2\n*Step, nlgeom\n*Static\n*Dsload{}\n"
-            "TOP, TRVEC, 4., 0., 0., -1.\n*End Step\n")
+            "TOP, TRVEC, 4., {}\n*End Step\n")
     exact = [{(n, 3): -1.0 for n in (5, 6, 7, 8)}]
-    body, conv, rep = convert_str(deck.format(""))                     # FOLLOWER=YES default
+    body, conv, rep = convert_str(deck.format("", "1., 0., 0."))       # FOLLOWER=YES default
     assert _cloads(body) == [{}] and conv.unloaded_steps == [1]
     assert "rotates with the surface (FOLLOWER=YES, the Abaqus default)" in rep.text()
     assert "Step 1 is loaded in the Abaqus deck (*DSLOAD TRVEC on TOP)" in rep.text()
-    body, conv, rep = convert_str(deck.format(", follower=no"))        # per current area
+    body, conv, rep = convert_str(deck.format(", follower=no", "0., 0., -1."))   # per current area
     assert _cloads(body) == [{}] and "CONSTANT RESULTANT=NO, the Abaqus default" in rep.text()
-    body, conv, rep = convert_str(deck.format(", follower=no, constant resultant=yes"))
+    body, conv, rep = convert_str(deck.format(", follower=no, constant resultant=yes", "0., 0., -1."))
     assert _cloads(body) == exact and not conv.unloaded_steps and "[APPROX]" not in rep.text()
-    body, conv, rep = convert_str(deck.format(""), approximate=True)
-    assert _cloads(body) == exact and "[APPROX] *DSLOAD TRVEC" in rep.text()
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(deck.format("", "0., 0., -2."), approximate=True)
+    assert "*DLOAD\nEALL, P2, 4." in body                       # a follower normal: a pressure
+    body, conv, rep = convert_str(deck.format("", "1., 0., 0."), approximate=True)
+    assert _cloads(body) == [{(n, 1): 1.0 for n in (5, 6, 7, 8)}] and "[APPROX] *DSLOAD TRVEC" in rep.text()
+
+
+def test_follower_traction_normal_to_its_faces_becomes_a_pressure():
+    # under NLGEOM Abaqus applies a follower traction's normal part along the current normal,
+    # per unit current area (FOLLOWER=YES, CONSTANT RESULTANT=NO, the defaults): ccx's NLGEOM
+    # pressure (validate_with_ccx.py follower_traction_turning)
+    deck = (HEX + "*Surface, name=TOP\nEALL, S2\n*Surface, name=TB\nEALL, S1\nEALL, S2\n"
+            "*Step, nlgeom\n*Static\n{}*End Step\n")
+    for own, line in (("*Dsload\nTOP, TRVEC, 4., 0., 0., -3.\n", "EALL, P2, 4."),   # into the face
+                      ("*Dsload\nTOP, TRVEC, 4., 0., 0., 1.\n", "EALL, P2, -4."),   # out of it
+                      ("*Dsload\nTOP, TRVEC, -4., 0., 0., 1.\n", "EALL, P2, 4."),
+                      ("*Dload\nEALL, TRVEC2, 4., 0., 0., -1.\n", "EALL, P2, 4."),
+                      ("*Dload\nEALL, TRVEC1, 2.5, 0., 0., 1.\n", "EALL, P1, 2.5")):
+        body, conv, rep = convert_str(deck.format(own))
+        assert "*DLOAD\n" + line + "\n" in body and _cloads(body) == [{}], own
+        assert not conv.reduced_physics and not conv.unloaded_steps
+        assert "normal to its flat faces -> ccx face pressure" in rep.text()
+    # out of one face and into the other, along a face, on a warped face: not a pressure
+    for own in ("*Dsload\nTB, TRVEC, 4., 0., 0., -1.\n", "*Dsload\nTOP, TRVEC, 4., 0., 1., -1.\n",
+                "*Dsload, constant resultant=yes\nTOP, TRVEC, 4., 0., 0., -1.\n"):
+        body, conv, rep = convert_str(deck.format(own))
+        assert "*DLOAD" not in body and conv.unloaded_steps == [1], own
+    body, conv, _ = convert_str(deck.replace("7, 1.,1.,1.", "7, 1.,1.,1.1").format(
+        "*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n"))
+    assert "*DLOAD" not in body and conv.unloaded_steps == [1]
+    # a plane-strain edge (outward +x; the z component is dropped in 2-D)
+    plane = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n*Element, type=CPE4, elset=E\n"
+             "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1., 0.3\n*Solid Section, elset=E, "
+             "material=M\n*Surface, name=R\nE, S2\n*Step, nlgeom\n*Static\n*Dsload\n"
+             "R, TRVEC, 3., 1., 0., 7.\n*End Step\n")
+    body, conv, _ = convert_str(plane)
+    assert "*DLOAD\nE, P2, -3.\n" in body and not conv.reduced_physics
+    # in a small-strain step the nodal forces are exact and stay
+    body, _, _ = convert_str(deck.replace(", nlgeom", "").format("*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n"))
+    assert "*DLOAD" not in body and _cloads(body) == [{(n, 3): -1.0 for n in (5, 6, 7, 8)}]
+
+
+def test_follower_traction_as_a_pressure_across_steps():
+    base = HEX + "*Surface, name=TOP\nEALL, S2\n"
+    # nodal forces of a small-strain step go when an NLGEOM step gives the traction again
+    body, conv, _ = convert_str(base + "*Step\n*Static\n*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n*End Step\n"
+                                "*Step, nlgeom\n*Static\n*Dsload\nTOP, TRVEC, 5., 0., 0., -1.\n*End Step\n")
+    assert _cloads(body) == [{(n, 3): -1.0 for n in (5, 6, 7, 8)}, {(n, 3): 0.0 for n in (5, 6, 7, 8)}]
+    assert "*DLOAD\nEALL, P2, 5.\n" in body
+    # a traction that replaces it as nodal forces zeroes the pressure — but leaves the deck's P
+    body, conv, rep = convert_str(base + "*Step, nlgeom\n*Static\n*Dsload\nTOP, P, 1.\n"
+                                  "TOP, TRVEC, 4., 0., 0., -1.\n*End Step\n*Step\n*Static\n"
+                                  "*Dsload, follower=no, constant resultant=yes\nTOP, TRVEC, 5., 0., 0., -1.\n"
+                                  "*End Step\n")
+    s1, s2 = body.split("*END STEP")[:2]
+    assert "*DLOAD\nEALL, P2, 1.\nEALL, P2, 4.\n" in s1
+    assert "*DLOAD\nEALL, P2, 0.\n" in s2 and "EALL, P2, 1." in s2   # ccx: one value per face
+    assert _cloads(body) == [{}, {(n, 3): -1.25 for n in (5, 6, 7, 8)}]
+    assert not conv.reduced_physics and "dropped: under NLGEOM" not in rep.text()
+    # a P given again alone: the traction's pressure stays beside it (Abaqus adds the two)
+    body, _, _ = convert_str(base + "*Step, nlgeom\n*Static\n*Dsload\nTOP, P, 1.\nTOP, TRVEC, 4., 0., 0., -1.\n"
+                             "*End Step\n*Step\n*Static\n*Dsload\nTOP, P, 2.\n*End Step\n")
+    s2 = body.split("*END STEP")[1]
+    assert "EALL, P2, 2.\n" in s2 and "EALL, P2, 4.\n" in s2
 
 
 def test_converted_loads_across_steps_never_use_op_new():
@@ -7456,7 +7526,7 @@ def test_nlgeom_load_options_in_perturbation_steps():
     # NLGEOM base state keeps them: Abaqus loads it on the deformed base geometry, with the
     # load stiffness of follower loads (eigenvalue buckling)
     deck = HEX + "*Surface, name=TOP\nEALL, S2\n" + _deck_step("Static", "*Cload\n7, 1, 1.\n", ", nlgeom")
-    own = "*Cload, follower\n6, 1, 1.\n*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n"
+    own = "*Cload, follower\n6, 1, 1.\n*Dsload\nTOP, TRVEC, 4., 1., 0., 0.\n"
     body, conv, rep = convert_str(deck + _deck_step("Frequency\n2", own))
     assert not conv.reduced_physics and "under NLGEOM" not in rep.text() and "FOLLOWER" not in rep.text()
     assert "Loads of a *FREQUENCY step commented out: Abaqus ignores them" in rep.text()

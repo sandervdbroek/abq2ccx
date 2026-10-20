@@ -64,8 +64,9 @@ a different model without saying so. With it, these reframings are made, each wi
   centroid, or Abaqus computes J numerically) → `U1` all the same (bending exact);
   `SECTION=I` where `U1` cannot run (a deck with shells, NLGEOM, plasticity, …) → the
   rectangle with the same area and strong-axis inertia;
-* surface tractions under NLGEOM that follow the surface or act per current area, and beam
-  line loads under NLGEOM → fixed nodal forces;
+* surface tractions under NLGEOM that follow the surface or act per current area (but a
+  follower `TRVEC` normal to flat faces, a pressure), and beam line loads under NLGEOM →
+  fixed nodal forces;
 * surface elements that carry mass or rebar → left out of the mesh;
 * curved analytical rigid surfaces (`CIRCL` and `PARAB` profiles, `TYPE=REVOLUTION`,
   `FILLET RADIUS`) → flat facets about the slave faces' size (the warning gives their chord

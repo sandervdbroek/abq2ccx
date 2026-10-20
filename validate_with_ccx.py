@@ -2306,6 +2306,37 @@ def dat_totals(dat_path):
     return out
 
 
+def follower_turning_deck(form, steps=6, step_deg=15.0):
+    """A unit cube (C3D8, ``form`` "3d": *DSLOAD TRVEC on its face x = 1) or square (CPE4,
+    "2d": element-based *DLOAD TRVEC2 on its edge x = 1) whose face x = 0 is turned about z in
+    ``steps`` NLGEOM steps while a unit traction pushes into the far face: a follower load,
+    so the reaction turns with the body, (cos, sin) of the angle times the current area."""
+    two = form == "2d"
+    xy = [(0., 0.), (1., 0.), (1., 1.), (0., 1.)]
+    xyz = [p + (0.,) for p in xy] + ([] if two else [p + (1.,) for p in xy])
+    left = (1, 4) if two else (1, 4, 5, 8)
+    out = ["*NODE"] + [f"{i + 1}, " + ", ".join(repr(c) for c in (x[:2] if two else x))
+                       for i, x in enumerate(xyz)]
+    out += [f"*ELEMENT, TYPE={'CPE4' if two else 'C3D8'}, ELSET=EALL",
+            ", ".join(str(i) for i in range(1, len(xyz) + 1)).join(["1, ", ""]),
+            "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*SOLID SECTION, ELSET=EALL, MATERIAL=M"]
+    out += ["1."] if two else ["*SURFACE, NAME=FAR", "EALL, S4"]
+    out += ["*NSET, NSET=LEFT", ", ".join(map(str, left))]
+    for k in range(1, steps + 1):
+        th = math.radians(k * step_deg)
+        out += ["*STEP, NLGEOM", "*STATIC", "1., 1.", "*BOUNDARY"]
+        for n in left:
+            x, y = xyz[n - 1][0], xyz[n - 1][1]
+            out += [f"{n}, 1, 1, {(math.cos(th) - 1) * x - math.sin(th) * y + 0.0!r}",
+                    f"{n}, 2, 2, {math.sin(th) * x + (math.cos(th) - 1) * y!r}"]
+        out += [] if two else ["1, 3, 3, 0.", "4, 3, 3, 0."]
+        if k == 1:
+            out += ["*DLOAD", "EALL, TRVEC2, 1., -1., 0., 0."] if two else \
+                   ["*DSLOAD", "FAR, TRVEC, 1., -1., 0., 0."]
+        out += ["*NODE PRINT, NSET=LEFT, TOTALS=ONLY", "RF", "*NODE PRINT", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 # --- decks for the checks of fixes found in the 19 Oct 2026 code review ------------------------
 
 CUBE8 = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
@@ -5150,6 +5181,35 @@ def main():
               f"{abs(u[axis] - ref) / abs(ref) * 100:.1f}% diff)")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+
+    # A follower traction normal to its faces under NLGEOM is a ccx pressure (Abaqus applies
+    # its normal part along the current normal per unit current area, as ccx's NLGEOM pressure
+    # acts): a cube / square turned 90 degrees about z by its held face, a unit traction
+    # pushing into the far face — the reaction turns with it, p A (cos, sin) of the angle
+    # (fixed nodal forces would keep it at (1, 0)); the far corner moves with the rotation.
+    for form, how in (("3d", "C3D8 face, *DSLOAD TRVEC"), ("2d", "CPE4 edge, *DLOAD TRVEC2")):
+        src, inp = os.path.join(tmp, "follower_src.inp"), os.path.join(tmp, "follower.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(follower_turning_deck(form))
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        rf = [rows[0] for _, rows in dat_history(os.path.join(d, "job.dat"), "total force", "LEFT")]
+        u = dat_displacements(os.path.join(d, "job.dat")).get(3)
+        shutil.rmtree(d, ignore_errors=True)
+        if status != "solved" or len(rf) != 6 or u is None:
+            print(f"FAIL  follower_traction_turning ({how}): {status}, {len(rf)} reactions")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            failures += 1
+            continue
+        err = max(math.hypot(f[0] - math.cos(math.radians(15 * k)), f[1] - math.sin(math.radians(15 * k)))
+                  for k, f in enumerate(rf, 1))
+        moved = math.hypot(u[0] + 2.0, u[1])               # corner (1, 1) turned to (-1, 1)
+        ok = err < 2e-3 and moved < 1e-2 and not conv.reduced_physics and "*CLOAD" not in \
+            open(inp, encoding="utf-8").read()
+        print(f"{'PASS' if ok else 'FAIL'}  follower_traction_turning ({how}): reaction at 90 deg "
+              f"({rf[-1][0]:+.5f}, {rf[-1][1]:+.5f}) (follower (0, 1); dead (1, 0)), largest miss "
+              f"over the 6 steps {err:.1e}; far corner u = ({u[0]:+.4f}, {u[1]:+.4f}) (turned: (-2, 0))")
+        failures += 0 if ok else 1
 
     # An axisymmetric surface traction (radial TRVEC on CAX8): Lame's open-ended cylinder.
     inp = os.path.join(tmp, "cylinder.inp")

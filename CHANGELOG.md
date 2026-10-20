@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **Follower tractions under NLGEOM** — a `TRVEC` normal to flat continuum faces, with
+  `FOLLOWER=YES` and `CONSTANT RESULTANT=NO` (the defaults), now becomes a ccx face pressure
+  instead of needing `--approximate`. Abaqus applies a follower traction's normal part along the
+  current normal per unit current area, as ccx's NLGEOM pressure acts (probed: a cube turned
+  90° by its held face, a stretched one). Shear parts, `FOLLOWER=NO` and `CONSTANT
+  RESULTANT=YES` have no ccx load and still need `--approximate`. That includes the 16 corpus
+  decks, which load an end face in shear. `FOLLOWER=NO` / `CONSTANT RESULTANT=YES` on a pressure
+  card is no longer warned as reduced physics, since Abaqus reads them for tractions and edge
+  loads only.
 * **Tied contact pairs on a rigid surface** — a `*CONTACT PAIR, TIED` measured a shell slave's
   distance from its mid-surface, so a shell within `ADJUST` of the rigid master by its face was
   left to ccx's tie of its expanded faces (a cantilever strip 1.8× too soft); its half thickness

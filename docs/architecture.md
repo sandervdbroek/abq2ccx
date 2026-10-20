@@ -151,7 +151,10 @@ At the end of every step `_flush_nodal_loads` writes one `*CLOAD` per amplitude 
 node DOFs whose total changed (0 where a load went away) — never `OP=NEW`, which in ccx
 would also remove the deck's own concentrated loads. `_nodal_load_inexact` decides whether
 nodal forces are exact (small strain; NLGEOM `TRVEC` with `FOLLOWER=NO, CONSTANT
-RESULTANT=YES`); otherwise the line stays commented unless `--approximate`.
+RESULTANT=YES`); otherwise the line stays commented unless `--approximate` — except an NLGEOM
+follower `TRVEC` normal to flat continuum faces, which `_follower_pressure` turns into a P
+line for the pressure path (keyed apart from the deck's P; `_retire_follower` zeroes it when a
+later step replaces the traction otherwise).
 `_dl_state` / `_flush_dloads` do the same bookkeeping for the `*DLOAD` lines that come from
 `*DLOAD` and from `*DSLOAD`, whose `OP=NEW` scopes differ in Abaqus but not in ccx.
 

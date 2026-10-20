@@ -109,6 +109,7 @@ setting up its system: ccx 2.23 ends a step that sets up none with "Job finished
 | `thermal_no_initial_temperature` | `*Temperature` without initial temperatures | α T, α T L | ≤ 5e-6 |
 | `cook_membrane_traction` | `*DSLOAD TRVEC` on `CPS8` edges | published 23.96 | 0.12 % |
 | `cylinder_traction_cax` | radial `TRVEC` on a thick `CAX8` cylinder | Lamé | 0.02 % |
+| `follower_traction_turning` | an NLGEOM `TRVEC` into the far face of a `C3D8` cube / `CPE4` square turned 90° by its held face | the reaction turns with the body, p A (cos, sin) | 1e-3 |
 | `traction_transformed_face`, Cook's membrane with a `*TRANSFORM` | tractions on transformed nodes | the same models without the transform | round-off |
 | `dload_blank_fields` | `GRAV` and `CENTRIF` lines with blank fields (also without an element set): a clamped column, a spinning quarter disc | statics (the base carries the weight along z); the plane-stress rotating disc | round-off; ≤ 0.34 % |
 | `transform_spherical_rigid` | a spherical `*TRANSFORM`; a transformed rigid-body reference point | the model in global components | exact |

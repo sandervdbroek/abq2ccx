@@ -10836,8 +10836,12 @@ class Converter:
     def _load_params(self, b: Block, allowed: Sequence[str]) -> "OrderedDict[str, Optional[str]]":
         """Parameters ccx's distributed-load cards read; Abaqus-only ones are dropped —
         with a WARNING where they change the load under NLGEOM (ccx pressures always
-        follow the deformed surface with their current area; _loads_nlgeom)."""
+        follow the deformed surface with their current area; _loads_nlgeom).  Abaqus reads
+        FOLLOWER for TRVEC and EDLD only, CONSTANT RESULTANT for tractions and edge loads
+        (Abaqus 2017 Keywords manual): of these only edge loads reach ccx's card, the
+        tractions go their own way (_follower_pressure, _to_nodal_forces)."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        labels = {r[1].strip().upper() for r in merged_data_records(b) if len(r) > 1}
         for k, v in b.params.items():
             if k in allowed:
                 keep[k] = v
@@ -10848,7 +10852,8 @@ class Converter:
                     keep["LOAD CASE"] = part
                 continue
             vu = (v or "YES").strip().upper()
-            changes = (k == "FOLLOWER" and vu == "NO") or (k == "CONSTANT RESULTANT" and vu == "YES")
+            changes = (k == "FOLLOWER" and vu == "NO" and any(x.startswith("EDLD") for x in labels)) or \
+                (k == "CONSTANT RESULTANT" and vu == "YES" and any(x.startswith("ED") for x in labels))
             if k == "TOTAL FORCE":
                 self.report.warn(f"*{b.keyword}, TOTAL FORCE dropped: Abaqus spreads the magnitude as "
                                  f"a total force over the surface, ccx reads it as a pressure.",
@@ -10989,13 +10994,23 @@ class Converter:
                     lines.append((key, ln, mag))
                 side += rigid[1]
                 continue
+            tag: tuple = ()                     # a traction as a pressure: keyed apart from a P
             m = re.fullmatch(r"(TRVEC|TRSHR)([1-6]?)", label)
             if m:
-                eids = self._load_elements(g[0])
-                faces, why = self._load_faces(eids, m.group(2), shell_reference=not m.group(2)) \
-                    if eids else ([], f"element set '{g[0]}' is empty or undefined")
-                side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
-                continue
+                p = self._follower_pressure(b, g, [(g[0], m.group(2))]) \
+                    if m.group(1) == "TRVEC" and m.group(2) and g[0] else None
+                if p is None:
+                    for key, ln, mag in self._retire_follower("DLOAD", label, g[0].upper()):
+                        body.append(ln)
+                        lines.append((key, ln, mag))
+                    eids = self._load_elements(g[0])
+                    faces, why = self._load_faces(eids, m.group(2), shell_reference=not m.group(2)) \
+                        if eids else ([], f"element set '{g[0]}' is empty or undefined")
+                    side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
+                    continue
+                tag = self._as_pressure(b, "DLOAD", g)
+                label = "P" + m.group(2)
+                g = [g[0], label, p]
             if re.fullmatch(r"P[XYZ12]", label):
                 eids = self._load_elements(g[0])
                 beams = [e for e in eids if self._is_beam(e)]
@@ -11068,13 +11083,13 @@ class Converter:
             if split is not None:                     # both faces of the expanded element
                 for ln, key, mag in split:
                     body.append(ln)
-                    lines.append((key, ln, mag))
+                    lines.append((tag + key, ln, mag))
                 continue
             if self._mass_scale and label in ("GRAV", "CENTRIF") and len(g) > 2 and g[2]:
                 # the masses it acts on are divided by the scale (_plan_coupled_inertia)
                 g = g[:2] + ["%.12g" % (pf(g[2]) * self._mass_scale)] + g[3:]
             body.append(", ".join(g))
-            lines.append(((g[0].upper(), label), body[-1], g[2] if len(g) > 2 else ""))
+            lines.append((tag + (g[0].upper(), label), body[-1], g[2] if len(g) > 2 else ""))
         had_data = any(x != "" for rec in merged_data_records(b) for x in rec)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         if body or op_new:
@@ -11128,10 +11143,21 @@ class Converter:
             if _is_user_load(b, g):
                 side += self._user_load_line(b, g)
                 continue
+            tag: tuple = ()                     # a traction as a pressure: keyed apart from a P
             if label in ("TRVEC", "TRSHR"):
-                faces, why = self._surface_faces(surf)
-                side += self._to_nodal_forces(b, "DSLOAD", g, faces, why)
-                continue
+                sd = self.surfaces.get(surf)
+                p = self._follower_pressure(b, g, sd[1]) if label == "TRVEC" and sd and \
+                    all(re.fullmatch(r"S[1-6]", face or "") for _, face in sd[1]) else None
+                if p is None:
+                    for key, ln, m2 in self._retire_follower("DSLOAD", label, surf):
+                        body.append(ln)
+                        lines.append((key, ln, m2))
+                    faces, why = self._surface_faces(surf)
+                    side += self._to_nodal_forces(b, "DSLOAD", g, faces, why)
+                    continue
+                tag = self._as_pressure(b, "DSLOAD", g)
+                label, mag = "P", p
+                g = [g[0], label, p]
             if not re.fullmatch(r"P[1-6]?", label):
                 side += self._drop_load_line(b, g, f"the load type {label} has no ccx equivalent (ccx "
                                                    f"surface loads are pressures)")
@@ -11159,7 +11185,7 @@ class Converter:
                 if rigid is not None:
                     for ln, key, m2 in rigid[0]:
                         body.append(ln)
-                        lines.append(((surf,) + key, ln, m2))
+                        lines.append((tag + (surf,) + key, ln, m2))
                     if rigid[1] and not dropped:      # the line once, whichever face failed
                         side += self._drop_load_line(b, g, rigid[1])
                         dropped = True
@@ -11183,7 +11209,7 @@ class Converter:
                     if split is not None:             # both faces of the expanded element
                         for ln, key, m2 in split:
                             body.append(ln)
-                            lines.append(((surf,) + key, ln, m2))
+                            lines.append((tag + (surf,) + key, ln, m2))
                         continue
                 else:
                     self.report.warn(f"*DSLOAD on '{surf}': face '{face or '?'}' has no ccx Px "
@@ -11195,7 +11221,7 @@ class Converter:
                 if mag != "":
                     line += f", {self._signed(mag, sign)}"
                 body.append(line)
-                lines.append(((surf, token.upper(), pl), line, mag))   # (a load is its surface's)
+                lines.append((tag + (surf, token.upper(), pl), line, mag))   # (a load is its surface's)
         if body:
             self.report.note("*DSLOAD surface pressure converted to *DLOAD with Px face labels "
                              "(solid faces match Abaqus).", once=True)
@@ -11572,6 +11598,86 @@ class Converter:
             return ("under NLGEOM the traction acts per unit current area (CONSTANT RESULTANT=NO, "
                     "the Abaqus default)")
         return None
+
+    def _follower_pressure(self, b: Block, g: List[str], pairs: Sequence[Tuple[str, str]]
+                           ) -> Optional[str]:
+        """The magnitude of the Abaqus pressure P (as this card reads P on these faces) that is
+        traction line ``g`` (TRVEC) under NLGEOM, or None.  Abaqus applies a follower traction's
+        part along the reference normal along the current normal, per unit current area
+        (FOLLOWER=YES, CONSTANT RESULTANT=NO, the defaults; Abaqus 2017, "Distributed loads"),
+        as ccx's NLGEOM pressure acts (probed on 2.23: a cube turned 90 degrees, a stretched
+        one): so a traction normal to flat continuum faces / edges, pointing out of all of them
+        or into all of them, is that pressure (Abaqus' P pushes against the outward normal).
+        ``pairs``: (element / set, face — S1..S6 or 1..6).  Not on shells and membranes, whose
+        pressure needs the faces planned before the steps (_plan_sheet_pressure)."""
+        if not self._loads_nlgeom() or b.param("ORIENTATION") or \
+                (b.param("FOLLOWER") or "YES").strip().upper() == "NO" or \
+                (b.param("CONSTANT RESULTANT") or "NO").strip().upper() == "YES":
+            return None
+        try:
+            d = tuple(pf(x) if x else 0.0 for x in (g[3:6] + ["", "", ""])[:3])
+            mag = g[2] if len(g) > 2 else ""
+            pf(mag or "0")
+        except ValueError:
+            return None
+        signs = set()
+        for token, face in pairs:
+            eids = self._load_elements(token)
+            if not eids:
+                return None
+            for e in eids:
+                info = self.geom.elements.get(e)
+                cc = ccx_type(info[0]) if info else ""
+                if e in self._carriers or not cc.startswith(("C3D",) + PLANE_ELEM_PREFIXES):
+                    return None
+                got, why = self._load_faces([e], (face or "").upper(), shell_reference=False)
+                if why:
+                    return None
+                nodes, kind, _, axi, planar = got[0][:5]
+                xyz = [self.geom.nodes[n] for n in nodes]
+                t = vunit((d[0], d[1], 0.0) if planar else d)
+                if vnorm(t) == 0.0:
+                    return None
+                normals: List[Vec] = []
+                consistent_nodal_forces(kind, xyz, lambda p, n, tg: normals.append(n) or (0.0, 0.0, 0.0),
+                                        axi)
+                conn = info[1]                  # outward: away from the element's centroid
+                mid = tuple(sum(self.geom.nodes[k][i] for k in conn) / len(conn) for i in range(3))
+                fmid = tuple(sum(x[i] for x in xyz) / len(xyz) for i in range(3))
+                out = 1.0 if vdot(normals[0], vsub(fmid, mid)) > 0.0 else -1.0
+                for n in normals:
+                    c = vdot(t, n)
+                    if vnorm(vsub(t, vscale(n, c))) > 1e-6:
+                        return None             # a part along the face, or a curved face
+                    signs.add(c * out > 0.0)
+        if len(signs) != 1:
+            return None
+        return self._signed(mag, -1.0) if signs.pop() else mag
+
+    def _as_pressure(self, b: Block, card: str, g: List[str]) -> tuple:
+        """Traction line ``g`` goes as a pressure (_follower_pressure): its nodal forces of an
+        earlier step go (given again, Abaqus replaces them).  Returns the prefix that keys its
+        *DLOAD lines apart from a P on the same faces, which Abaqus applies besides it."""
+        label, name = g[1].upper(), g[0].upper()
+        key = (card, name, label)
+        if key in self._nodal_loads and key not in self._nodal_fresh:
+            self._set_nodal_load(key, {}, None)
+        self.report.note(f"*{b.keyword} {label} under NLGEOM normal to its flat faces -> ccx face "
+                         f"pressure: Abaqus applies a follower traction's normal part along the "
+                         f"current normal per unit current area (FOLLOWER=YES, CONSTANT RESULTANT=NO, "
+                         f"the defaults), as ccx's NLGEOM pressure acts (probed on 2.23).", once=True)
+        return (label, name)
+
+    def _retire_follower(self, origin: str, tag: str, name: str) -> List[Tuple[tuple, str, str]]:
+        """(key, line, magnitude) of zero-magnitude *DLOAD lines on the faces where an earlier
+        step's traction ``tag`` on set / surface ``name`` became a pressure (_follower_pressure):
+        given again in Abaqus, the traction replaces that load, which ccx keeps until a line
+        zeroes it."""
+        out = []
+        for key, (line, _, _, _) in self._dl_state.get(origin, {}).items():
+            if key[:2] == (tag, name) and (origin, key) not in self._dl_fresh:
+                out.append((key, ", ".join(x.strip() for x in line.split(",")[:2]) + ", 0.", "0."))
+        return out
 
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
                          why: Optional[str]) -> List[str]:
