@@ -6,6 +6,21 @@ physics.
 
 ## Unreleased
 
+* **Distributing couplings move their reference node** — ccx 2.23's `*COUPLING` + `*DISTRIBUTING`
+  only spreads the reference node's loads over the surface: a BC on the node moved nothing, the
+  node printed U = 0 and a beam on it hung free; a card without DOF lines (Abaqus: all DOFs)
+  spread no moment either. Abaqus moves the node with the coupling nodes' weighted mean motion
+  and turns it with their weighted least-squares rotation. The coupling is now written as
+  `*EQUATION`s of that constraint, on node surfaces too (ccx stopped), with Abaqus' weights:
+  tributary areas, a node surface's areas, `WEIGHTING METHOD` (ignored before) and an `INFLUENCE
+  RADIUS` (each facet's areas scaled by the part of it within). Under NLGEOM, where the
+  equations would turn with the surface, the coupling stays ccx's card unless `--approximate`,
+  warned.
+* **A truss numbered below the beams at a node** — ccx 2.23 gives a node its lowest-numbered
+  beam or truss element's expansion, so such a node had no rotations: ccx held the beams'
+  rotation there (a cantilever 93 % stiffer) and stopped on a rotational BC, moment or equation
+  there. The truss now ends at a tied copy of the node, which gets a knot beam; a beam's
+  pre-tension cut node that only trusses share keeps its rotation tie the same way.
 * **`S4R` shells** — ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single
   point on the mid-surface, so its bending is resisted only by the hourglass stiffness ccx adds
   to that brick, not by the section, in every step: a simply supported plate of a/t 100
@@ -61,9 +76,7 @@ physics.
   cards and connector elements without nodes.
 * **Distributing coupling with an `INFLUENCE RADIUS`** — ccx 2.23 ignores the radius, so the
   coupling spread over the whole surface (reduced physics). It is now written on the facets
-  with a node within the radius, or on the nearest facet where it holds none. That is exact
-  where the radius cuts those facets alike, as around a centred reference node. Where it cuts
-  them by different parts, a warning stays: Abaqus scales each facet's weights by that part.
+  with a node within the radius, or on the nearest facet where it holds none.
 * **Contact pairs that are commented out** — a `*CONTACT PAIR` on an analytical surface the
   converter does not mesh no longer counts as a step ccx runs nonlinearly, so the deck's rigid
   constraints stay ccx's own. Either form is exact; only the notes change.

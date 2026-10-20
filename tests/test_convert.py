@@ -3432,18 +3432,17 @@ def test_pretension_truss_and_beam_cuts_as_equations():
 
 def test_pretension_beam_cut_node_that_trusses_share():
     # ccx 2.23 gives a node rotations by its lowest-numbered beam / truss element: once the cut
-    # element leaves a node that a truss shares, the node has none, so the cut element's end
-    # turns freely there (its copy still a knot); exact unless the deck acts on that rotation
+    # element leaves a node that a truss shares, the node had none and the cut element's end
+    # turned freely; the truss now ends at a tied copy of the node, which becomes a knot, so the
+    # rotations are tied across the cut (_plan_truss_copies)
     deck = PT_BOLT.format(typ="B31", more="*Element, type=T3D2, elset=TR\n5, 2, 3\n", normal="",
                           section=PT_RECT + "*Solid Section, elset=TR, material=M\n1.\n")
     deck = deck.replace("element=1, node=PT", "element=2, node=PT")       # cut node 3: truss 5 only
     body, conv, rep = convert_str(deck)
-    assert "u(100) = u(3) + n u(99, 1)" in body and "100, 4, 1., 3, 4, -1." not in body
-    assert set(conv._knots) == {100}
-    assert "only trusses share its cut node 3, the first numbered 5" in rep.text()
-    assert conv.reduced_physics == ["rotation of a beam's pre-tension cut node not tied"]    # 3, 1, 6
-    body, conv, rep = convert_str(deck.replace("3, 1, 6\n", "3, 1, 3\n"))
-    assert "(exact: the deck holds or loads no rotation there)" in rep.text() and not conv.reduced_physics
+    assert "u(100) = u(3) + n u(99, 1)" in body and "100, 4, 1., 3, 4, -1." in body
+    assert conv._truss_copies == {3: 101} and "*ELEMENT, TYPE=T3D2\n5, 2, 101\n" in body
+    assert [eq for eq in _equation_terms(body) if eq[0][0] == 101] == [[(101, k, 1.0), (3, k, -1.0)] for k in (1, 2, 3)]
+    assert set(conv._knots) == {3, 100} and not conv.reduced_physics
 
 
 def test_pretension_cut_copy_takes_temperatures_and_u1_ties():
@@ -8425,21 +8424,21 @@ def test_coupling_influence_radius():
         dyn, conv, _ = convert_str(_radius_block(ref, kin.format(s="TOPE", r=r), KIN_DYN_STEP.format("")
                                                  .replace("RP", "100")))
         assert sorted({row[0][0] for row in _equation_terms(dyn)}) == kept
-    # a distributing coupling: on the facets with a node within the radius (none: the nearest),
-    # whose tributary areas Abaqus scales by the part of each within it (ccx weights them by area,
-    # probed): exact where it cuts them alike, warned where not
+    # a distributing coupling: *EQUATIONs over the facets with a node within the radius (none: the
+    # nearest), each facet's tributary areas scaled by the part of it within (validate_with_ccx
+    # distributing_*); a node surface: its nodes within the radius
     dist = "*Coupling, constraint name=C, ref node=100, surface=TOPE, influence radius={r}\n*Distributing\n"
-    for ref, facets, alike in ((corner, [1], True), ((1., 1., 1.3), [1, 2, 3, 4], True),
-                               ((0.5, 0.5, 1.9), [1], True), ((0.8, 0.9, 1.1), [1, 2, 3, 4], False)):
-        body, conv, rep = convert_str(_radius_block(ref, dist.format(r="0.5")))
-        head = "*SURFACE, NAME=TOPE_RADIUS\n"
-        assert body.split(head)[1].split("*")[0].split() == [x for e in facets for x in (f"{e},", "S2")]
-        assert "SURFACE=TOPE_RADIUS\n*DISTRIBUTING" in body and "INFLUENCE" not in "\n".join(_live(body))
-        assert bool(conv.reduced_physics) != alike and ("cuts its facets by different parts" in rep.text()) != alike
+    for ref, r, kept in ((corner, "0.5", [10, 11, 13, 14]), ((1., 1., 1.3), "0.5", list(range(10, 19))),
+                         ((0.5, 0.5, 1.9), "0.5", [10, 11, 13, 14]), ((0.8, 0.9, 1.1), "0.5", list(range(10, 19))),
+                         (corner, "9.", list(range(10, 19)))):
+        body, conv, rep = convert_str(_radius_block(ref, dist.format(r=r)))
+        rows = _equation_terms(body)
+        assert [row[0][:2] for row in rows] == [(100, 1), (100, 2), (100, 3)]
+        assert sorted({t[0] for row in rows for t in row[1:]}) == kept
+        assert "*DISTRIBUTING" not in "\n".join(_live(body)) and "INFLUENCE" not in "\n".join(_live(body))
+        assert not conv.reduced_physics and rep.n_warnings == 0
     body, conv, rep = convert_str(_radius_block(corner, dist.format(r="0.5").replace("TOPE", "TOPS")))
-    assert "SURFACE=TOPS\n*DISTRIBUTING" in body and conv.reduced_physics       # (a node surface)
-    body, conv, rep = convert_str(_radius_block(corner, dist.format(r="9.")))
-    assert "INFLUENCE" not in "\n".join(_live(body)) and not conv.reduced_physics and rep.n_warnings == 0
+    assert _equation_terms(body) == [[(100, k, 1.0), (10, k, -1.0)] for k in (1, 2, 3)] and not conv.reduced_physics
     # a radius that does not read: the whole surface, warned
     body, _, rep = convert_str(_radius_block(corner, kin.format(s="TOPE", r="X")))
     assert "SURFACE=TOPE\n*KINEMATIC" in body and "INFLUENCE RADIUS=X does not read as a number" in rep.text()
@@ -8536,8 +8535,111 @@ def test_coupling_on_several_reference_nodes():
     # a distributing coupling: one per reference node, also on the whole surface
     body, conv, rep = convert_str(_radius_block(corner, two + "*Coupling, constraint name=C, ref node=RS, "
                                                 "surface=TOPE\n*Distributing\n"))
-    assert "REF NODE=100, SURFACE=TOPE\n*DISTRIBUTING" in body and "REF NODE=101, SURFACE=TOPE\n*DISTRIBUTING" in body
+    rows = _equation_terms(body)
+    assert [row[0][:2] for row in rows] == [(100, 1), (100, 2), (100, 3), (101, 1), (101, 2), (101, 3)]
+    assert all(sorted({t[0] for row in rows if row[0][0] == n for t in row[1:]}) == list(range(10, 19))
+               for n in (100, 101))
     assert not conv.reduced_physics
+
+def test_distributing_coupling_as_equations():
+    # ccx 2.23's *DISTRIBUTING only spreads the reference node's loads (a BC there moved nothing,
+    # it printed U = 0): Abaqus' constraint as *EQUATIONs, the node's DOFs first (validate_with_ccx
+    # distributing_*).  _radius_block's top face: tributary areas 1/4 (corners), 1/2, 1
+    dist = "*Coupling, constraint name=C, ref node=100, surface={s}\n*Distributing{p}\n{d}"
+    above = (1., 1., 1.5)                                # over the face's centroid
+    w = {n: 0.25 * (1 if n in (10, 12, 16, 18) else 4 if n == 14 else 2) / 4.0 for n in range(10, 19)}
+    body, conv, rep = convert_str(_radius_block(above, dist.format(s="TOPE", p="", d="")))
+    rows = _equation_terms(body)
+    assert [row[0][:2] for row in rows] == [(100, 1), (100, 2), (100, 3)] and 100 not in conv._rb_rot
+    assert "*DISTRIBUTING" not in "\n".join(_live(body)) and "*COUPLING" not in "\n".join(_live(body))
+    for k, row in enumerate(rows, 1):              # the translation rows: sum over the nodes of A_n = I
+        for d in (1, 2, 3):
+            assert abs(sum(c for n, dd, c in row[1:] if dd == d) + (d == k)) < 1e-9
+    assert sorted((n, round(-c, 12)) for n, d, c in rows[2][1:]) == sorted((n, round(v, 12)) for n, v in w.items())
+    assert "-> *EQUATIONs of Abaqus' distributing constraint" in rep.text() and not conv.reduced_physics
+    # a BC on the reference node: a coupling node's DOF is eliminated instead; a turn prescribed
+    # there goes to a ROT NODE, tied to the face's least-squares rotation
+    step = "*Step\n*Static\n*Boundary\n1, 1, 3\n100, 3, 3, 0.01\n100, 4, 4, 0.005\n*End Step\n"
+    body, conv, rep = convert_str(_radius_block((1.3, 0.8, 1.5), dist.format(s="TOPE", p="", d=""), step))
+    rot = conv._rb_rot[100]
+    rows = _equation_terms(body)
+    heads = [r[0][:2] for r in rows]
+    assert {(100, 1), (100, 2), (rot, 2), (rot, 3)} <= set(heads) and (100, 3) not in heads and (rot, 1) not in heads
+    assert {(100, 3), (rot, 1)} <= {t[:2] for r in rows for t in r[1:]} and len(rows) == 6
+    assert f"\n{rot}, 1, 1, 0.005\n" in body and "\n100, 3, 3, 0.01\n" in body
+    assert "carried on a ROT NODE" in rep.text() and not conv.reduced_physics
+    # DOFs 1-3 only: no rotation, no ROT NODE, also with that BC; a node surface with weights and
+    # WEIGHTING METHOD=LINEAR (1 - distance / the furthest node's), no warning that they are lost
+    body, conv, _ = convert_str(_radius_block((1.3, 0.8, 1.5), dist.format(s="TOPE", p="", d="1, 3\n"), step))
+    assert len(_equation_terms(body)) == 3 and 100 not in conv._rb_rot
+    over = (7 / 6, 7 / 6, 1.5)                           # over the weighted centroid of 10, 14, 18
+    body, conv, rep = convert_str(_radius_block(over, "*Surface, type=node, name=TW\n10, 2.\n14, 1.\n18, 3.\n"
+                                                + dist.format(s="TW", p="", d="")))
+    got = {n: -c for n, d, c in _equation_terms(body)[2][1:] if d == 3}
+    assert all(abs(got[n] - v) < 1e-9 for n, v in ((10, 1 / 3), (14, 1 / 6), (18, 1 / 2)))
+    assert "weights other than 1 dropped" not in rep.text() and not conv.reduced_physics
+    body, conv, rep = convert_str(_radius_block(above, dist.format(s="TOPS", p=", weighting method=LINEAR", d="")))
+    lin = {n: 1 - math.dist(((n - 10) % 3, (n - 10) // 3, 1.), above) / 1.5 for n in range(10, 19)}
+    got = {n: -c for n, d, c in _equation_terms(body)[2][1:] if d == 3}
+    assert all(abs(got.get(n, 0.0) - v / sum(lin.values())) < 1e-9 for n, v in lin.items()) and 10 not in got
+    # a beam on the reference node: a knot, its own rotations tied (DOFs 4-6)
+    beam = ("*Node\n101, 1., 1., 3.\n*Element, type=B31, elset=BM\n50, 100, 101\n"
+            "*Beam Section, elset=BM, material=M, section=RECT\n0.3, 0.3\n1., 0., 0.\n")
+    body, conv, _ = convert_str(_radius_block((1.3, 0.8, 1.5), beam + dist.format(s="TOPE", p="", d="")))
+    assert 100 in conv._knots and 100 not in conv._rb_rot
+    assert [r[0][:2] for r in _equation_terms(body)] == [(100, k) for k in range(1, 7)]
+    # COUPLING=STRUCTURAL: the continuum coupling, warned; NLGEOM with a turn in the rows: kept as
+    # ccx's card without --approximate (warned), the equations with it
+    body, conv, rep = convert_str(_radius_block(above, dist.format(s="TOPE", p=", coupling=STRUCTURAL", d="")))
+    assert _equation_terms(body) and "COUPLING=STRUCTURAL written as the default" in rep.text() and conv.reduced_physics
+    nl = _radius_block((1.3, 0.8, 1.5), dist.format(s="TOPE", p="", d=""), step.replace("*Step", "*Step, nlgeom"))
+    body, conv, rep = convert_str(nl)
+    assert "SURFACE=TOPE\n*DISTRIBUTING" in body and not _equation_terms(body)
+    assert "kept as ccx's card, as the deck runs NLGEOM" in rep.text() and conv.reduced_physics
+    body, conv, rep = convert_str(nl, approximate=True)
+    assert _equation_terms(body) and "[APPROX] *COUPLING, *DISTRIBUTING in a deck with NLGEOM" in rep.text()
+    # the reference node at the centroid and no rotation acted on: exact under NLGEOM too
+    body, conv, rep = convert_str(_radius_block((1., 1., 1.), dist.format(s="TOPE", p="", d=""),
+                                                "*Step, nlgeom\n*Static\n*Boundary\n1, 1, 3\n100, 3, 3, 0.01\n*End Step\n"))
+    assert len(_equation_terms(body)) == 3 and not conv.reduced_physics
+
+
+def test_distributing_coupling_in_a_plane_model():
+    # a 2-D model: translations 1-2 and the rotation 6 only; edge weights are lengths x thickness
+    deck = ("*Node\n1, 0., 0.\n2, 1., 0.\n3, 2., 0.\n4, 0., 1.\n5, 1., 1.\n6, 2., 1.\n100, 0.8, 1.6\n"
+            "*Element, type=CPS4, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Solid Section, elset=E, material=M\n0.5\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Surface, name=T\nE, S3\n"
+            "*Coupling, constraint name=C, ref node=100, surface=T\n*Distributing\n"
+            "*Step\n*Static\n*Boundary\n1, 1, 2\n2, 2, 2\n3, 2, 2\n*Cload\n100, 6, 0.25\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    rot = conv._rb_rot[100]
+    rows = _equation_terms(body)
+    assert [r[0][:2] for r in rows] == [(100, 1), (100, 2), (rot, 3)]
+    assert all(d in (1, 2) for r in rows for n, d, _ in r[1:]) and f"\n{rot}, 3, 0.25\n" in body
+    assert sorted({n for n, _, _ in rows[0][1:]}) == [4, 5, 6]
+
+
+def test_truss_below_beams_at_a_node_ends_at_a_copy():
+    # ccx 2.23 gives a node its lowest-numbered beam / truss element's expansion: a truss
+    # numbered below the beams at a node left it without rotations (the beams' rotation held
+    # there, 93 % stiffer; a rotational BC, moment or *EQUATION stopped ccx): the truss ends at a
+    # copy of the node tied to it in translations, and the node gets a knot beam
+    # (validate_with_ccx.py truss_below_beams_*)
+    def deck(t, typ="B31", sec="*Beam Section, elset=BM, material=M, section=RECT\n0.1, 0.1\n0., 0., 1.\n"):
+        return ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 1., -1., 0.5\n"
+                f"*Element, type=T3D2, elset=TR\n{t}, 2, 4\n*Element, type={typ}, elset=BM\n"
+                + ("2, 1, 2\n3, 2, 3\n" if t == 1 else "1, 1, 2\n2, 2, 3\n") + sec
+                + "*Solid Section, elset=TR, material=M\n0.001\n*Material, name=M\n*Elastic\n210000., 0.3\n"
+                "*Step\n*Static\n*Boundary\n1, 1, 6\n4, 1, 3\n2, 4, 6\n*Cload\n3, 2, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck(1))
+    copy = conv._truss_copies[2]
+    assert "*ELEMENT, TYPE=T3D2\n1, " + str(copy) + ", 4\n" in body and 2 in conv._knots
+    assert [eq for eq in _equation_terms(body) if eq[0][0] == copy] == [[(copy, k, 1.0), (2, k, -1.0)] for k in (1, 2, 3)]
+    assert "\n2, 4, 6\n" in body and "end at a copy of the node" in rep.text() and not conv.reduced_physics
+    # numbered after the beams: unchanged
+    body, conv, _ = convert_str(deck(3))
+    assert not conv._truss_copies and "*ELEMENT, TYPE=T3D2\n3, 2, 4\n" in body and 2 not in conv._knots
+
 
 def _ori_z(deg):
     c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))

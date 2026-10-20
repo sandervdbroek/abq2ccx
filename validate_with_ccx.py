@@ -588,6 +588,84 @@ def coupling_ref_deck(form):
                       + ["*CLOAD", f"{rp}, 1, 1.", f"*NODE PRINT, NSET={q}TOPN", "U", "*END STEP"]) + "\n"
 
 
+# --- distributing couplings: a C3D8 block of 3 x 2 x 2 unit cubes (E 1000, nu 0.3), its bottom
+# held, its top face (z = 2) coupled to reference node 100 at (1.3, 0.8, 2.5), off the face's
+# centroid (1.5, 1, 2) ----------------------------------------------------------------------
+DIST_REF = (1.3, 0.8, 2.5)
+
+
+def distributing_block():
+    """({node: xyz}, {element: nodes}, top nodes, top elements, bottom nodes) of the block."""
+    nid = lambda i, j, k: 1 + i + 4 * (j + 3 * k)                                # noqa: E731
+    xyz = {nid(i, j, k): (float(i), float(j), float(k)) for k in range(3) for j in range(3) for i in range(4)}
+    els = {1 + i + 3 * j + 6 * k: [nid(i, j, k), nid(i + 1, j, k), nid(i + 1, j + 1, k), nid(i, j + 1, k),
+                                   nid(i, j, k + 1), nid(i + 1, j, k + 1), nid(i + 1, j + 1, k + 1), nid(i, j + 1, k + 1)]
+           for k in range(2) for j in range(2) for i in range(3)}
+    return (xyz, els, [n for n, p in xyz.items() if p[2] == 2.0], [e for e in els if e > 6],
+            [n for n, p in xyz.items() if p[2] == 0.0])
+
+
+def distributing_deck(coupling, step, extra=()):
+    """The block with the ``coupling`` cards (surface TOP: the top faces; node set RP: node 100),
+    the ``extra`` model cards and the ``step``'s cards; every node's displacement printed."""
+    xyz, els, top, topel, bot = distributing_block()
+    return "\n".join(["*NODE, NSET=NALL"] + [f"{n}, {p[0]}, {p[1]}, {p[2]}" for n, p in xyz.items()]
+                     + ["*NODE, NSET=RP", "100, " + ", ".join(map(str, DIST_REF)), "*ELEMENT, TYPE=C3D8, ELSET=EALL"]
+                     + [f"{e}, " + ", ".join(map(str, c)) for e, c in els.items()]
+                     + ["*ELSET, ELSET=ETOP"] + _ids(topel) + ["*NSET, NSET=TOPN"] + _ids(top)
+                     + ["*NSET, NSET=BOT"] + _ids(bot) + ["*SURFACE, NAME=TOP", "ETOP, S2"] + list(extra)
+                     + list(coupling) + ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3",
+                                         "*SOLID SECTION, ELSET=EALL, MATERIAL=M", "*BOUNDARY", "BOT, 1, 3",
+                                         "*STEP", "*STATIC"] + list(step)
+                     + ["*NODE PRINT, NSET=NALL", "U", "*NODE PRINT, NSET=RP", "U", "*END STEP"]) + "\n"
+
+
+def distributing_relations(xyz, weights, ref):
+    """Abaqus' distributing coupling (Theory Guide, 'Distributing coupling constraints'), written
+    out here independently of the converter: with normalized weights w_n, centroid c, r_n = x_n - c,
+    r_R = ref - c and T = sum w_n ((r_n . r_n) I - r_n r_n), returns (motion, forces):
+    motion(u) = (u_R, theta) of the coupling nodes' displacements u — theta = T^-1 sum w_n r_n x
+    u_n, u_R = sum w_n u_n + theta x r_R — and forces(f, m) = {n: F_n}, the distribution of a force
+    f and moment m on the reference node, F_n = w_n (f + (T^-1 (m + r_R x f)) x r_n)."""
+    total = sum(weights.values())
+    w = {n: v / total for n, v in weights.items()}
+    c = [sum(w[n] * xyz[n][k] for n in w) for k in range(3)]
+    r = {n: [xyz[n][k] - c[k] for k in range(3)] for n in w}
+    rr = [ref[k] - c[k] for k in range(3)]
+    t = [[sum(w[n] * ((sum(x * x for x in r[n]) if i == j else 0.0) - r[n][i] * r[n][j]) for n in w)
+          for j in range(3)] for i in range(3)]
+    det = (t[0][0] * (t[1][1] * t[2][2] - t[1][2] * t[2][1]) - t[0][1] * (t[1][0] * t[2][2] - t[1][2] * t[2][0])
+           + t[0][2] * (t[1][0] * t[2][1] - t[1][1] * t[2][0]))
+    inv = [[(t[(j + 1) % 3][(i + 1) % 3] * t[(j + 2) % 3][(i + 2) % 3]
+             - t[(j + 1) % 3][(i + 2) % 3] * t[(j + 2) % 3][(i + 1) % 3]) / det for j in range(3)] for i in range(3)]
+    cross = lambda a, b: [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]  # noqa: E731
+    tinv = lambda v: [sum(inv[i][k] * v[k] for k in range(3)) for i in range(3)]                       # noqa: E731
+
+    def motion(u):
+        s = [sum(w[n] * cross(r[n], u[n])[k] for n in w) for k in range(3)]
+        theta = tinv(s)
+        tr = cross(theta, rr)
+        return [sum(w[n] * u[n][k] for n in w) + tr[k] for k in range(3)], theta
+
+    def forces(f, m):
+        a = tinv([m[k] + cross(rr, f)[k] for k in range(3)])
+        return {n: [w[n] * (f[k] + cross(a, r[n])[k]) for k in range(3)] for n in w}
+    return motion, forces
+
+
+def truss_below_beams_deck(truss_first, step):
+    """A B31 cantilever 1-2-3 along x (unit elements, 0.1 x 0.1, E 210000, nu 0.3), clamped at
+    node 1, with a T3D2 from node 2 to the held node 4; the truss is element 1 (numbered below
+    the beams) or 3 (after them)."""
+    t, ba, bb = (1, 2, 3) if truss_first else (3, 1, 2)
+    return "\n".join(["*NODE, NSET=NALL", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 2., 0., 0.", "4, 1., -1., 0.5",
+                      "*ELEMENT, TYPE=T3D2, ELSET=TR", f"{t}, 2, 4", "*ELEMENT, TYPE=B31, ELSET=BM",
+                      f"{ba}, 1, 2", f"{bb}, 2, 3", "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.3",
+                      "*BEAM SECTION, ELSET=BM, MATERIAL=M, SECTION=RECT", "0.1, 0.1", "0., 0., 1.",
+                      "*SOLID SECTION, ELSET=TR, MATERIAL=M", "0.001", "*BOUNDARY", "1, 1, 6", "4, 1, 3",
+                      "*STEP", "*STATIC"] + list(step) + ["*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
+
+
 # --- rigid tools: Abaqus decks built here, so that each variant differs only in the tool ----
 # A rigid flat punch pressed into an elastic block (3-D C3D8, plane-strain CPE4, axisymmetric
 # CAX4) under frictionless HARD contact; the tool is rigid elements (R3D4 / R2D2 / RAX2), an
@@ -5618,6 +5696,125 @@ def main():
               f"displacements {err:.1e} of max |u| from the model written flat (top u1 "
               f"{tops['flat'][0][0]:.6g}, distributing {tops['flat_dist'][0][0]:.6g})")
         failures += 0 if ok else 1
+    # --- *COUPLING + *DISTRIBUTING: Abaqus moves the reference node with the coupling nodes'
+    # weighted mean motion and turns it with their weighted least-squares rotation (and spreads
+    # its loads by the same relations, distributing_relations); ccx's own card only spreads the
+    # loads: a BC on the node moved nothing, the node printed U = 0, a beam on it hung free
+
+    def dist_run(tag, text):
+        src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+        return u, status, out
+    xyz, _, top, _, _ = distributing_block()
+    area = {n: 0.25 * (2 if 0 < xyz[n][0] < 3 else 1) * (2 if xyz[n][1] == 1 else 1) for n in top}
+    motion, spread = distributing_relations(xyz, area, DIST_REF)
+    cpl = ["*COUPLING, CONSTRAINT NAME=C, REF NODE=RP, SURFACE=TOP", "*DISTRIBUTING"]
+    # (a) the reference node's motion prescribed (u3 = 0.01, a turn of 0.005 about x)
+    u, status, out = dist_run("distributing_rp_motion", distributing_deck(cpl, ["*BOUNDARY", "RP, 3, 3, 0.01",
+                                                                               "RP, 4, 4, 0.005"]))
+    face = max((abs(x) for n in top for x in u.get(n, ())), default=0.0)
+    if len(u) < len(xyz) + 1 or face < 1e-3:
+        print(f"FAIL  distributing_rp_motion: the coupled face did not move ({status}, max |u| {face:.3g})")
+        failures += 1
+    else:
+        ur, th = motion(u)
+        err = max(abs(ur[2] - 0.01) / 0.01, abs(th[0] - 0.005) / 0.005,
+                  max(abs(a - b) for a, b in zip(u[100], ur)) / face)
+        ok = err < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  distributing_rp_motion (a block's top face coupled to a reference "
+              f"node off its centroid, which is moved 0.01 along z and turned 0.005 about x): the face's "
+              f"weighted mean motion and least-squares rotation give u3 {ur[2]:.7g}, rotation {th[0]:.7g}, "
+              f"the node's own displacement {err:.1e} apart (the face moved {face:.3g}; ccx's card: not at all)")
+        failures += 0 if ok else 1
+    # (b) a force and a moment on it, vs Abaqus' distribution of them as nodal forces on the
+    # block without the coupling; also on a node surface with weights and WEIGHTING METHOD=LINEAR
+    f, m = (0.3, -0.2, 0.5), (0.4, 0.1, -0.3)
+    loads = ["*CLOAD"] + [f"RP, {k + 1}, {f[k]}" for k in range(3)] + [f"RP, {k + 4}, {m[k]}" for k in range(3)]
+    far = max(math.dist(xyz[n], DIST_REF) for n in top)
+    weights = {n: 1.0 + 0.1 * (n % 3) for n in top}
+    for tag, card, w, extra in (
+            ("distributing_rp_loads", cpl, area, ()),
+            ("distributing_node_surface_weights", [cpl[0].replace("TOP", "TOPW"), "*DISTRIBUTING, WEIGHTING METHOD=LINEAR"],
+             {n: weights[n] * (1.0 - math.dist(xyz[n], DIST_REF) / far) for n in top},
+             ["*SURFACE, NAME=TOPW, TYPE=NODE"] + [f"{n}, {weights[n]}" for n in top])):
+        motion_w, spread_w = distributing_relations(xyz, w, DIST_REF)
+        got, status, out = dist_run(tag, distributing_deck(card, loads, extra))
+        ref, _, _ = dist_run(tag + "_ref", distributing_deck((), ["*CLOAD"] + [
+            f"{n}, {k + 1}, {x:.12g}" for n, fn in spread_w(f, m).items() for k, x in enumerate(fn)], extra))
+        if len(got) < len(xyz) + 1 or len(ref) < len(xyz):
+            print(f"FAIL  {tag}: no solution ({status})")
+            print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+            failures += 1
+            continue
+        big = max(abs(x) for n in xyz for x in ref[n])
+        ur = motion_w(ref)[0]
+        err = max(max(abs(a - b) for n in xyz for a, b in zip(got[n], ref[n])),
+                  max(abs(a - b) for a, b in zip(got[100], ur))) / big
+        ok = err < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a force and a moment on the reference node of a block's top "
+              + ("face" if tag == "distributing_rp_loads" else "nodes as a node surface with weights, WEIGHTING "
+                 "METHOD=LINEAR") + f"): every node {err:.1e} of max |u| ({big:.3g}) from Abaqus' distribution of "
+              f"them as nodal forces, the reference node's displacement included (u3 {got[100][2]:.6g}; ccx's "
+              + ("card: 0" if tag == "distributing_rp_loads" else "card: stopped on the node surface") + ")")
+        failures += 0 if ok else 1
+    # (c) a B31 cantilever from the reference node (a beam on a solid), its tip loaded: the
+    # block takes f and the moment arm x f at the node (the beam is statically determinate), and
+    # the tip moves with the face's motion plus the beam's own deflection (its root clamped)
+    tip = (1.3, 2.8, 3.5)
+    arm = [tip[k] - DIST_REF[k] for k in range(3)]
+    mom = (arm[1] * f[2] - arm[2] * f[1], arm[2] * f[0] - arm[0] * f[2], arm[0] * f[1] - arm[1] * f[0])
+    beam = ["*NODE, NSET=TIP", "101, " + ", ".join(map(str, tip)), "*ELEMENT, TYPE=B31, ELSET=BM", "50, 100, 101",
+            "*BEAM SECTION, ELSET=BM, MATERIAL=MB, SECTION=RECT", "0.3, 0.3", "1., 0., 0.",
+            "*MATERIAL, NAME=MB", "*ELASTIC", "1000., 0."]    # (nu 0: ccx's knot at the root is exact)
+    tip_load = ["*CLOAD"] + [f"101, {k + 1}, {f[k]}" for k in range(3)] + ["*NODE PRINT, NSET=TIP", "U"]
+    runs = [dist_run("distributing_beam_rp", distributing_deck(cpl, tip_load, beam)),
+            dist_run("distributing_beam_rp_loads", distributing_deck(cpl, ["*CLOAD"] + [
+                f"RP, {k + 1}, {f[k]}" for k in range(3)] + [f"RP, {k + 4}, {mom[k]:.12g}" for k in range(3)])),
+            dist_run("distributing_beam_rp_root", distributing_deck((), ["*BOUNDARY", "RP, 1, 6"] + tip_load, beam))]
+    if any(len(r[0]) < len(xyz) + 1 for r in runs[:2]) or 101 not in runs[0][0] or 101 not in runs[2][0]:
+        print(f"FAIL  distributing_beam_rp: no solution ({', '.join(r[1] for r in runs)})")
+        failures += 1
+    else:
+        a, b, c = (r[0] for r in runs)
+        big = max(abs(x) for n in xyz for x in b[n])
+        ur, th = motion(a)
+        want = [ur[k] + (th[1] * arm[2] - th[2] * arm[1], th[2] * arm[0] - th[0] * arm[2],
+                         th[0] * arm[1] - th[1] * arm[0])[k] + c[101][k] for k in range(3)]
+        err = max(abs(a[n][k] - b[n][k]) for n in list(xyz) + [100] for k in range(3)) / big
+        err_tip = max(abs(x - y) for x, y in zip(a[101], want)) / max(abs(x) for x in want)
+        ok = err < 1e-5 and err_tip < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  distributing_beam_rp (a B31 cantilever from the reference node, its "
+              f"tip loaded): the block and the node {err:.1e} of max |u| from the same force and its moment on "
+              f"the node; the tip {', '.join(f'{x:.6g}' for x in a[101])} vs the face's motion and rotation plus "
+              f"the root-clamped beam's deflection {err_tip:.1e} apart (ccx's card: the beam hung free)")
+        failures += 0 if ok else 1
+    # --- a truss numbered below the beams at a node they share: ccx 2.23 gives a node its
+    # lowest-numbered beam / truss element's expansion, so the node had no rotations — it held the
+    # beams' rotation there (93 % off under a tip load) and stopped on a rotational BC or moment;
+    # Abaqus' answer does not depend on the numbering
+    for tag, step in (("truss_below_beams_tip_load", ["*CLOAD", "3, 2, 1.", "3, 3, 0.5"]),
+                      ("truss_below_beams_moment", ["*CLOAD", "2, 6, 0.3", "2, 5, 0.2", "3, 3, 0.5"]),
+                      ("truss_below_beams_rotation_bc", ["*BOUNDARY", "2, 4, 6", "*CLOAD", "3, 2, 1."])):
+        pair = [dist_run(tag + ("" if first else "_after"), truss_below_beams_deck(first, step))
+                for first in (True, False)]
+        lo, hi = (r[0] for r in pair)
+        if 3 not in lo or 3 not in hi or not max(abs(x) for x in hi[3]):
+            print(f"FAIL  {tag}: no solution ({pair[0][1]} / {pair[1][1]})")
+            print("      " + " / ".join(l.strip() for l in pair[0][2].splitlines() if "ERROR" in l)[:200])
+            failures += 1
+            continue
+        big = max(abs(x) for v in hi.values() for x in v)
+        err = max(abs(x - y) for n in hi for x, y in zip(lo[n], hi[n])) / big
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a B31 cantilever with a T3D2 at mid-span numbered before the "
+              f"beams): tip {', '.join(f'{x:.6g}' for x in lo[3])}, {err:.1e} of max |u| from the truss "
+              f"numbered after them (ccx: 93 % stiffer under the tip load, stopped on the moment / BC)")
+        failures += 0 if ok else 1
     # --- Johnson-Cook damage initiation: ccx's indicator, the model unchanged -------
     # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which
     # it deletes an element, out of reach so that it only reports): in uniaxial tension the
@@ -6728,7 +6925,8 @@ def main():
     # a distributing coupling's INFLUENCE RADIUS that cuts the four facets around the centre node
     # by the same part (0.3), or reaches no facet: Abaqus distributes a force and moment on the
     # node over those facets (the nearest one), its tributary-area weights scaled alike; against
-    # ccx's distributing coupling on those facets (before: over the whole face)
+    # ccx's distributing coupling on those facets, of DOFs 1-6 (without data lines ccx spreads no
+    # moment, Abaqus couples all DOFs) (before: over the whole face)
     for case, x0, radius, facets in (("centre", (2., 2., 1.5), "0.8", (6, 7, 10, 11)),
                                      ("nearest_facet", (0.5, 0.5, 1.5), "0.2", (1,))):
         dist = lambda t: t.replace("*KINEMATIC", "*DISTRIBUTING").replace(  # noqa: E731
@@ -6736,8 +6934,8 @@ def main():
             "*CLOAD\n100, 3, -10.\n100, 4, 2.\n")
         deck = dist(influence_radius_deck("element", ref=x0, radius=radius))
         ref = run_ref(deck.replace("*SURFACE, NAME=ST\nEALL, S2\n", "*SURFACE, NAME=ST\n" + "".join(
-            f"{e}, S2\n" for e in facets)).replace(f", INFLUENCE RADIUS={radius}", ""),
-            f"distributing_influence_radius_{case}")
+            f"{e}, S2\n" for e in facets)).replace(f", INFLUENCE RADIUS={radius}", "").replace(
+            "*DISTRIBUTING\n", "*DISTRIBUTING\n1, 6\n"), f"distributing_influence_radius_{case}")
         tag = f"distributing_influence_radius_{case}"
         u = review_run(deck, tag, dat_displacements)
         ok = bool(u) and set(ref) == set(range(1, 51))
