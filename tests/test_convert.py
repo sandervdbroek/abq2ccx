@@ -563,6 +563,28 @@ def test_step_model_motion_facts():
     assert [s.nlgeom_motion for s in m] == [False] * 5 + [True] * 3
 
 
+def test_step_model_planner_facts():
+    # the *STEP cards that switch NLGEOM on (not a perturbation step's), the NLGEOM in force by
+    # the output planners' rule (an explicit step without NLGEOM=NO too) and by the deformation
+    # plasticity check's (*STEP cards only); each *STEP card's procedure (damage criteria)
+    blocks, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
+*STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
+*STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM, INC=5\n*STATIC, RIKS\n*END STEP""")
+    assert m.nl_heads == {id(blocks[12])} and m.explicit_without_nlgeom
+    assert [s.nlgeom_output for s in m] == [False, False, True, True, True]
+    assert [s.nlgeom_dp for s in m] == [False] * 4 + [True]
+    assert [s.star_procs for s in m] == [("DYNAMIC",), ("FREQUENCY",), ("DYNAMIC",),
+                                         ("PERTURBATION",), ("STATIC, RIKS",)]
+    # card by card: a procedure between steps counts for the *STEP before it; the *STEP card an
+    # unterminated perturbation step runs into switches NLGEOM on, its own does not
+    blocks, m = _step_model("*STEP\n*END STEP\n*STATIC\n*STEP, NLGEOM\n*FREQUENCY\n2\n"
+                            "*STEP, NLGEOM\n*STATIC\n*END STEP")
+    assert [s.star_procs for s in m] == [("STATIC",), ("FREQUENCY", "STATIC")]
+    assert m.nl_heads == {id(blocks[5])} and not m.explicit_without_nlgeom
+    assert [(s.proc, s.nlgeom_dp, s.nlgeom_output) for s in m] == [("", False, False),
+                                                                  ("FREQUENCY", False, False)]
+
+
 def test_step_model_explicit_steps():
     # the converter runs an explicit step with NLGEOM: handle_step writes it where NLGEOM= is
     # not given, while any explicit card switches it on for _plan_deck_facts

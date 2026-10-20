@@ -4344,7 +4344,7 @@ class Step:
     perturbation: bool            # an Abaqus linear perturbation step (perturbation_step): _pert_idx,
                                   # the motion fields, the output carry-over, step_load_audit's Abaqus reading
     nlgeom_card: Optional[bool]   # NLGEOM= on its *STEP card (_nlgeom_given)
-    # NLGEOM, by several rules (also base_nlgeom, nlgeom_motion):
+    # NLGEOM, by several rules (also base_nlgeom, nlgeom_motion and the deck's nl_heads):
     nlgeom_on: bool               # it switches NLGEOM on (_plan_deck_facts' _nl_steps): not a
                                   # perturbation step and NLGEOM on one of its *STEP cards, or a
                                   # *DYNAMIC, EXPLICIT card in it
@@ -4352,7 +4352,16 @@ class Step:
                                   # not in _pert_idx has NLGEOM, or is explicit without NLGEOM= (where a
                                   # deformation plasticity material drops NLGEOM=NO, an explicit step
                                   # with it counts too); a perturbation step keeps the one before it
+    nlgeom_output: bool           # in force in ccx by the *STEP cards handle_step writes (the output
+                                  # planners' _ccx_linear_steps): on once a step's *STEP card is in
+                                  # nl_heads, or it is explicit without NLGEOM=NO
+    nlgeom_dp: bool               # on once a step's *STEP card is in nl_heads, explicit steps not
+                                  # counted (_plan_deformation_plasticity)
     temp_dof: Optional[str]       # its first TEMPERATURE_DOF_PROCS card's keyword (handle_step's)
+    star_procs: Tuple[str, ...]   # per *STEP card of it, read card by card (_plan_material_cards):
+                                  # "PERTURBATION" with *STEP, PERTURBATION, else the first PROC_KW
+                                  # card after it (with ", RIKS"; a card between steps counts for the
+                                  # *STEP before it), "" if none
     # a general step, handle_step's rule (_plan_base_restore's is "not in _pert_idx",
     # _plan_modal_starts' "general in ccx"):
     general: bool                 # proc in StepModel.GENERAL_PROCS and no *STEP, PERTURBATION
@@ -4481,6 +4490,29 @@ class StepModel:
         nlgeom = False                          # NLGEOM in force (Step.nlgeom)
         seen = base = base_dp = False           # Step.general_before, base_nlgeom, base_nlgeom_dp
         nl_motion, t = False, 0.0               # Step.nlgeom_motion, t_start
+        nl_output = nl_dp = False               # Step.nlgeom_output, nlgeom_dp
+        # card by card: each *STEP card's procedure (Step.star_procs), and whether a *DYNAMIC,
+        # EXPLICIT follows a *STEP card without NLGEOM= (explicit_without_nlgeom)
+        star_proc: Dict[int, str] = {}
+        last: Optional[Block] = None
+        self.explicit_without_nlgeom = False
+        for b in blocks:
+            if b.keyword == "STEP":
+                last = b
+                star_proc[id(b)] = "PERTURBATION" if b.has("PERTURBATION") else ""
+            elif last is not None:
+                if b.keyword in PROC_KW and not star_proc[id(last)]:
+                    star_proc[id(last)] = f"{b.keyword}, RIKS" if b.has("RIKS") else b.keyword
+                if b.keyword == "DYNAMIC" and b.has("EXPLICIT") and not last.has("NLGEOM"):
+                    self.explicit_without_nlgeom = True
+        # the ids of the *STEP cards that switch NLGEOM on (NLGEOM, NLGEOM=YES; Abaqus keeps it on
+        # for the later steps) but a perturbation step's own: it runs linear about its base state,
+        # and "linear perturbation steps have no effect on subsequent general analysis steps"
+        # (Abaqus 2017); handle_step drops it where the base state is linear (ccx would run a
+        # static perturbation step, a general one in ccx, under it).  (The *STEP card an
+        # unterminated step runs into counts.)  Read by _check_nlgeom_expansion, _u1_plans,
+        # _note_quadratic_beams, _slab_obstacle and (on a model of its own) _plan_user_materials.
+        heads: set = set()
         for is_step, cards in deck_parts(blocks):
             if not is_step:
                 (loose if steps else model).extend(cards)
@@ -4509,6 +4541,10 @@ class StepModel:
                 lc2, repeats = frozenset(), False
             n = sum(1 for b in cards if b.keyword == "STEP")
             general = proc in self.GENERAL_PROCS and not pert_param
+            heads.update(id(b) for b in cards if b.keyword == "STEP" and _nlgeom_given(b) and
+                         not (b is head and pert))
+            nl_dp = nl_dp or id(head) in heads
+            nl_output = nl_output or id(head) in heads or (explicit and given is not False)
             motion_explicit = motion_proc == "DYNAMIC" and motion_card.has("EXPLICIT")
             period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
             nl_motion = nl_motion or (not pert and bool(given)) or motion_explicit
@@ -4522,7 +4558,8 @@ class StepModel:
                 or any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
                 nlgeom=nlgeom,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
-                general=general, general_before=seen, base_nlgeom=base, base_nlgeom_dp=base_dp,
+                star_procs=tuple(star_proc[id(b)] for b in cards if b.keyword == "STEP"),
+                nlgeom_output=nl_output, nlgeom_dp=nl_dp, general=general, general_before=seen, base_nlgeom=base, base_nlgeom_dp=base_dp,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
@@ -4544,6 +4581,7 @@ class StepModel:
         self.steps: Tuple[Step, ...] = tuple(steps)
         self.after: Tuple[Block, ...] = tuple(loose)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
+        self.nl_heads = frozenset(heads)
         # the *STEP cards, _prescan's _n_steps (handle_step, _nodal_load_clash); len(steps)
         # counts the steps as emitted
         self.n_star_steps = star
@@ -7222,7 +7260,6 @@ class Converter:
         materials: List[str] = []
         plastic: set = set()
         cards: List[Tuple[Block, Optional[str], bool]] = []
-        steps: List[str] = []               # each step's procedure ("" for none)
         mat: Optional[str] = None
         for i, b in enumerate(blocks):
             kw = b.keyword
@@ -7234,11 +7271,7 @@ class Converter:
                 mat = None
             if mat is not None:
                 self._card_material[id(b)] = mat
-            if kw == "STEP":
-                steps.append("PERTURBATION" if b.has("PERTURBATION") else "")
-            elif kw in PROC_KW and steps and not steps[-1]:
-                steps[-1] = f"{kw}, RIKS" if b.has("RIKS") else kw
-            elif kw == "PLASTIC" and mat is not None and self._plastic_kept(b):
+            if kw == "PLASTIC" and mat is not None and self._plastic_kept(b):
                 plastic.add(mat.upper())
             elif kw == "DAMAGE INITIATION":
                 evolution = False
@@ -7248,6 +7281,7 @@ class Converter:
                     elif nb.keyword != "DAMAGE STABILIZATION":
                         break
                 cards.append((b, mat, evolution))
+        steps = [p for step in self.steps for p in step.star_procs]     # per *STEP card
         bad = next(((n, p) for n, p in enumerate(steps, 1) if p not in ("STATIC", "DYNAMIC")), None)
         last = materials[-1] if materials else None
         kept = False
@@ -7378,7 +7412,9 @@ class Converter:
         if not mech:
             return blocks
         abaqus = self._abaqus_umat and not self._umat_explicit
-        nl = abaqus and bool(self._nlgeom_steps(blocks))
+        # (a model of the blocks as given: the deck's is built after the renaming and
+        # _plan_self_contact, which replace cards)
+        nl = abaqus and bool(StepModel(blocks).nl_heads)
         prefix = "ABAQUSNL" if nl else "ABAQUS"
         taken = {b.uparam("NAME") for b in blocks if b.keyword == "MATERIAL"}
         ren: Dict[str, str] = {}
@@ -8050,18 +8086,12 @@ class Converter:
             self._dp_unused.update((id(c), why) for c in opts[m])
         if not self._dp_nlgeom:
             return
-        nl = small = explicit_no = False
-        on = self._nlgeom_steps(blocks)
-        for cards in step_groups(blocks)[1]:
-            step = cards[0]
-            given = (step.param("NLGEOM") or "YES").strip().upper() if step.has("NLGEOM") else None
-            nl = nl or id(step) in on                     # once on, on for every later step (Abaqus)
-            explicit_no = explicit_no or given == "NO"
-            proc = next((c for c in cards if c.keyword in PROC_KW), None)
-            if proc is not None and proc.keyword in ("STATIC", "DYNAMIC", "VISCO",
-                                                      "COUPLED TEMPERATURE-DISPLACEMENT",
-                                                      "UNCOUPLED TEMPERATURE-DISPLACEMENT") \
-                    and not proc.has("EXPLICIT") and (not nl or step.has("PERTURBATION")):
+        small = explicit_no = False
+        for step in self.steps:
+            explicit_no = explicit_no or step.nlgeom_card is False
+            if step.proc in ("STATIC", "DYNAMIC", "VISCO", "COUPLED TEMPERATURE-DISPLACEMENT",
+                             "UNCOUPLED TEMPERATURE-DISPLACEMENT") \
+                    and not step.proc_card.has("EXPLICIT") and (not step.nlgeom_dp or step.pert_param):
                 small = True
         if not small:
             return
@@ -8102,14 +8132,8 @@ class Converter:
         October 2026, after 2.23.  Decks without temperatures have no thermal strain.  A
         *DEFORMATION PLASTICITY material runs every step under NLGEOM in ccx
         (_plan_deformation_plasticity)."""
-        nlgeom, step, on = self._dp_nlgeom, None, self._nlgeom_steps(blocks)
-        for b in blocks:
-            if b.keyword == "STEP":
-                step = b
-                nlgeom = nlgeom or id(b) in on
-            elif b.keyword == "DYNAMIC" and b.has("EXPLICIT") and step is not None and \
-                    not step.has("NLGEOM"):
-                nlgeom = True                   # handle_step switches NLGEOM on there
+        # (handle_step switches NLGEOM on in an explicit step without NLGEOM=)
+        nlgeom = self._dp_nlgeom or bool(self.steps.nl_heads) or self.steps.explicit_without_nlgeom
         keys = {b.keyword for b in blocks}
         changes = bool(keys & {"TEMPERATURE", "COUPLED TEMPERATURE-DISPLACEMENT",
                                "UNCOUPLED TEMPERATURE-DISPLACEMENT"})
@@ -11097,17 +11121,6 @@ class Converter:
         deck's model once _plan_deck_facts has built it, before that (_sp_amplitudes,
         _plan_user_materials) one of ``blocks``."""
         return set((self.steps if self.steps is not None else StepModel(blocks)).pert)
-
-    def _nlgeom_steps(self, blocks: List[Block]) -> set:
-        """The ids of the *STEP cards that switch NLGEOM on (NLGEOM, NLGEOM=YES; Abaqus keeps it
-        on for the later steps).  A linear perturbation step's does not count: it runs linear
-        about its base state, and "linear perturbation steps have no effect on subsequent
-        general analysis steps" (Abaqus 2017); handle_step drops it where the base state is
-        linear (ccx would run a static perturbation step, a general one in ccx, under it)."""
-        pert = self._perturbation_steps(blocks)
-        heads = {id(g[0]) for s, g in enumerate(step_groups(blocks)[1], 1) if s in pert}
-        return {id(b) for b in blocks if b.keyword == "STEP" and id(b) not in heads and
-                b.has("NLGEOM") and (b.param("NLGEOM") or "YES").strip().upper() != "NO"}
 
     @staticmethod
     def _bc_history(bc: dict, period: float, t0: Optional[float], u_start: Optional[float],
@@ -14784,7 +14797,7 @@ class Converter:
         self._el_file_stops(blocks, steps, groups)
         self._dynamic_energy_offsets(steps)
         # the steps ccx solves in one increment: linear, and no contact pair (ccx iterates any)
-        linear = self._ccx_linear_steps(blocks, steps, groups) \
+        linear = self._ccx_linear_steps(blocks, steps) \
             if len(groups) == len(steps) and not self._out_contact["pairs"] else [False] * len(steps)
         for (k, timing, reqs), lin in zip(steps, linear):
             self._out_ctl[k] = self._step_output_control(k, timing, reqs, lin)
@@ -14812,15 +14825,13 @@ class Converter:
         # its preselected variables, "DEFAULT" for the preselected default
         carried: Dict[bool, Optional[list]] = {False: None, True: None}
         prev_pert = False
-        for k, group in enumerate(step_groups(blocks)[1], 1):
-            inner = group[1:]
-            proc = next((x for x in inner if x.keyword in PROC_KW), None)
+        for step, group in zip(self.steps, step_groups(blocks)[1]):
+            k, inner, proc = step.no, group[1:], step.proc_card
             timing = self._step_timing(proc)
             if timing["kind"] == "explicit":
                 timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
                 timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
-            pert = self.steps.step_of(group[0]).perturbation
-            timing["pert"] = pert
+            pert = timing["pert"] = step.perturbation
             # ccx computes element energies in every implicit dynamic and transient (un)coupled
             # temperature-displacement step (_energy_from_step_one)
             if proc is not None and (
@@ -15031,28 +15042,25 @@ class Converter:
                         "dynamic, heat transfer or coupled step before, or since a *FREQUENCY or "
                         "*BUCKLE step")
 
-    def _ccx_linear_steps(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
-                          groups: List[List[Block]]) -> List[bool]:
+    def _ccx_linear_steps(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]]
+                          ) -> List[bool]:
         """Per step, whether ccx 2.23 runs it linearly (linstatic.c: no kinetic energies, no
         nodal state variables): a *STATIC or *VISCO step, or one without a ccx procedure —
         Riks too, commented out or (--approximate) a plain *STATIC —, with no NLGEOM in it or
-        an earlier step (_nlgeom_steps, or an explicit step's, which handle_step adds unless
-        NLGEOM=NO; handle_step writes it again after a *FREQUENCY or *BUCKLE step, where ccx
-        forgets it), no material ccx iterates (a kept *PLASTIC, *CREEP,
+        an earlier step (Step.nlgeom_output: StepModel.nl_heads, or an explicit step's, which
+        handle_step adds unless NLGEOM=NO; handle_step writes it again after a *FREQUENCY or
+        *BUCKLE step, where ccx forgets it), no material ccx iterates (a kept *PLASTIC, *CREEP,
         CCX_ITERATED_MATERIALS) and no step after which ccx iterates every step
         (CCX_NONLINEAR_AFTER_PROCS) since the last *FREQUENCY or *BUCKLE step, after which ccx
         runs a *STATIC step linearly again (probed, also after an explicit step without
         NLGEOM).  Contact makes ccx iterate too, but the converter cannot tell whether ccx
         keeps a contact pair, so a contact model counts as linear."""
         iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
-        on = self._nlgeom_steps(blocks)
         linear: List[bool] = []
-        nlgeom = after = False
-        for (_k, timing, _reqs), group in zip(steps, groups):
-            nlgeom = nlgeom or id(group[0]) in on or timing["kind"] == "explicit" and \
-                (group[0].param("NLGEOM") or "YES").strip().upper() != "NO"
+        after = False
+        for (_k, timing, _reqs), step in zip(steps, self.steps):
             linear.append(timing["proc"] in (None, "STATIC", "VISCO") and
-                          not (nlgeom or after or iterated))
+                          not (step.nlgeom_output or after or iterated))
             if timing["proc"] in CCX_NONLINEAR_AFTER_PROCS:
                 after = True
             elif timing["proc"] in ("FREQUENCY", "BUCKLE"):
@@ -15074,7 +15082,7 @@ class Converter:
         them, but with ELKE deactivated by a *FREQUENCY step."""
         if len(groups) < len(steps):
             return
-        linear = self._ccx_linear_steps(blocks, steps, groups)
+        linear = self._ccx_linear_steps(blocks, steps)
         # the *EL PRINT cards [(params, labels)] Abaqus and ccx carry into a step, and the steps
         # that gave them; the *FREQUENCY step that deactivated ELKE in ccx's
         abq: list = []
@@ -15155,7 +15163,7 @@ class Converter:
         ended: Dict[str, int] = {}          # Abaqus carries into general steps); -> the step
         # whose bare card ended them in ccx
         for (k, timing, reqs), group, linear in zip(steps, groups,
-                                                    self._ccx_linear_steps(blocks, steps, groups)):
+                                                    self._ccx_linear_steps(blocks, steps)):
             sdv = state and (linear or timing["proc"] in NO_NODAL_SDV_PROCS)
             where = (f"a linear {'*' + timing['proc'] if timing['proc'] else 'static'} step "
                      f"({self._LINEAR_STEP_WHY})" if linear else f"a *{timing['proc']} step")
@@ -21542,7 +21550,7 @@ class Converter:
                 self._b32r_rows.update(e for e in self.geom.elset((b.param("ELSET") or "").strip())
                                        if e in b32r)
         held = set(self.geom.nsets.get(PLANAR_NODES_SET, ()))
-        if self._nlgeom_steps(blocks) and \
+        if self.steps.nl_heads and \
                 any(not set(self.geom.elements[e][1]) <= held for e in b32r):
             self.report.note(f"3-node beams run as ccx's {QUADRATIC_BEAM} in an NLGEOM step: where "
                              f"DOF 3 is not held (a 3-D model), ccx 2.23 can stop converging on "
@@ -23347,7 +23355,7 @@ class Converter:
         nodes = {n for e in member for n in self.geom.elements[e][1]}
         if set(self._node_normals) & nodes or "NORMAL" in kws:
             return [], "normals redefine the beams' n2 axes, which is not converted for U1"
-        on = self._nlgeom_steps(blocks)
+        on = self.steps.nl_heads
         for b in blocks:
             if b.keyword == "TRANSFORM" and \
                     set(self._resolve_nodes((b.param("NSET") or "").strip())) & nodes:
@@ -27922,7 +27930,7 @@ class Converter:
         The slab form is exact for small-strain linear elasticity (_plan_incompatible_slabs);
         anything else on the elements (or the deck being out of its scope) keeps the plain
         CPS4 / CPE4 substitution."""
-        if self._nlgeom_steps(blocks):
+        if self.steps.nl_heads:
             return "a step runs NLGEOM"
         for b in blocks:
             if b.keyword in self._OTHER_PROCEDURES:
@@ -28700,20 +28708,19 @@ class Converter:
         that step's state, which a static step's results then carry as a constant offset,
         where without them it would vibrate about the undeformed one."""
         self._modal_moving, self._modal_held = {}, set()
-        groups = step_groups(blocks)[1]
-        procs = [next((b.keyword for b in g[1:] if b.keyword in PROC_KW), "") for g in groups]
+        procs = [step.proc for step in self.steps]
         if "MODAL DYNAMIC" not in procs:
             return
         audit = step_load_audit(blocks, user_loads=True, abaqus=True)
         state = base = None                     # the step whose end state ccx holds, if not rest
         general = False                         # the step before is a general one in ccx
-        for s, (group, proc) in enumerate(zip(groups, procs), 1):
+        for step in self.steps:
+            s, proc = step.no, step.proc
             loads = (audit[s - 1] if s <= len(audit) else None) or []
             if proc == "MODAL DYNAMIC":
                 prev = procs[s - 2] if s > 1 else ""
-                card = next(b for b in group[1:] if b.keyword == proc)
-                if state is not None and not (card.uparam("CONTINUE") == "YES" and (
-                        prev == proc or (prev == "STATIC" and s - 1 in self._pert_idx))):
+                if state is not None and not (step.proc_card.uparam("CONTINUE") == "YES" and (
+                        prev == proc or (prev == "STATIC" and self.steps.steps[s - 2].perturbation))):
                     self._modal_moving[s] = state
                     if general:
                         self._modal_held.add(s)
@@ -28726,7 +28733,7 @@ class Converter:
             elif proc in PERTURBATION_PROCS or proc == "HEAT TRANSFER":
                 general = False
             else:                                   # (a static perturbation step: general in ccx)
-                state = base = s if loads or (s in self._pert_idx and base is not None) else None
+                state = base = s if loads or (step.perturbation and base is not None) else None
                 general = True
 
     def _plan_op_new_rotations(self, blocks: List[Block]) -> None:
@@ -28758,11 +28765,10 @@ class Converter:
             if self._planar_bc else set()
         state = set(planar)                        # (node, DOF) pairs in effect
         steps: List[List[Block]] = []               # each step's *BOUNDARY cards ...
-        procs: List[str] = []                       # ... and procedure
+        procs = [step.proc for step in self.steps]  # ... and procedure
         for step, cards in deck_parts(blocks):
             if step:
                 steps.append([b for b in cards if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2])
-                procs.append(next((b.keyword for b in cards if b.keyword in PROC_KW), ""))
             elif cards[0].keyword == "BOUNDARY":
                 state |= self._boundary_pairs(cards[0])
 
