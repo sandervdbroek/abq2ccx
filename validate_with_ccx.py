@@ -2857,6 +2857,66 @@ def equation_held_deck(steps="both"):
             ("" if steps == "static" else freq) + ("" if steps == "freq" else static))
 
 
+def after_pert_model(plastic=False):
+    """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
+    text = after_pert_deck("modal", not plastic)
+    return text[:text.index("*STEP")]
+
+
+def plastic_contact_deck(case, twin=False):
+    """after_pert_deck's plastic column (elastic throughout; ``twin``: no *PLASTIC) with a unit
+    block pressed on its top (a prescribed displacement) through a *CONTACT PAIR: a static step
+    with Abaqus' preselected output (its contact output too) and a *CONTACT PRINT, *FREQUENCY,
+    then a *MODAL DYNAMIC step asking for U only ("modal": ccx would carry the contact output
+    into it) or a *STEADY STATE DYNAMICS step with contact output of its own ("ssd").  (The
+    frequency step leaves the base state's contact status out, reduced physics alike in both
+    materials.)"""
+    block = "".join(f"{21 + 4 * k}, 0., 0., {4 + k}.\n{22 + 4 * k}, 1., 0., {4 + k}.\n"
+                    f"{23 + 4 * k}, 1., 1., {4 + k}.\n{24 + 4 * k}, 0., 1., {4 + k}.\n" for k in range(2))
+    deck = (after_pert_model(not twin) + f"*NODE\n{block}*ELEMENT, TYPE=C3D8, ELSET=BLK\n"
+            "5, 21, 22, 23, 24, 25, 26, 27, 28\n*SOLID SECTION, ELSET=BLK, MATERIAL=M\n"
+            "*NSET, NSET=BTOP\n25, 26, 27, 28\n*ELSET, ELSET=E4\n4\n*SURFACE, NAME=COLTOP\nE4, S2\n"
+            "*SURFACE, NAME=BLKBOT\nBLK, S1\n*SURFACE INTERACTION, NAME=INT\n*SURFACE BEHAVIOR, "
+            "PRESSURE-OVERCLOSURE=LINEAR\n1e5\n*CONTACT PAIR, INTERACTION=INT\nBLKBOT, COLTOP\n"
+            "*BOUNDARY\nBTOP, 1, 2\n*STEP\n*STATIC\n*BOUNDARY\nBTOP, 3, 3, -0.01\n*CONTACT PRINT\nCSTRESS\n"
+            "*END STEP\n*STEP\n*FREQUENCY, STORAGE=YES\n4\n*END STEP\n")
+    out = "*OUTPUT, FIELD\n*NODE OUTPUT\nU\n"
+    if case == "modal":
+        return deck + f"*STEP\n*MODAL DYNAMIC\n0.01, 0.1\n*CLOAD\n19, 2, 1.\n{out}" \
+                      "*NODE PRINT, NSET=TOP\nU\n*END STEP\n"
+    return deck + (f"*STEP\n*STEADY STATE DYNAMICS\n1., 5., 3\n*CLOAD\n19, 2, 1.\n{out}*CONTACT OUTPUT\n"
+                   "CSTRESS, CDISP\n*CONTACT PRINT\nCSTRESS\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def modal_amplitude_deck(total, twin=False):
+    """after_pert_deck's column (elastic) with a tip load on sin(2 pi t), an analytic *AMPLITUDE
+    (DEFINITION=PERIODIC), in a *FREQUENCY and a 2.0 *MODAL DYNAMIC step; ``total``: on TIME=
+    TOTAL TIME after a 0.25 static step, so the modal dynamic step reads it from 0.25 to 2.25.
+    ``twin``: the curve as a TABULAR amplitude of 3001 points up to 3."""
+    tt = ", TIME=TOTAL TIME" if total else ""
+    if twin:
+        amp = f"*AMPLITUDE, NAME=P{tt}\n" + "".join(
+            f"{0.001 * k:.9g}, {math.sin(2 * math.pi * 0.001 * k):.12g}\n" for k in range(3001))
+    else:
+        amp = f"*AMPLITUDE, NAME=P, DEFINITION=PERIODIC{tt}\n1, {2 * math.pi!r}, 0., 0.\n0., 1.\n"
+    load = "*CLOAD, AMPLITUDE=P\n19, 2, 0.1\n"
+    static = f"*STEP\n*STATIC\n0.25, 0.25\n{load}*END STEP\n" if total else ""
+    return (after_pert_model() + amp + static + "*STEP\n*FREQUENCY, STORAGE=YES\n4\n*END STEP\n"
+            f"*STEP, INC=1000\n*MODAL DYNAMIC\n0.01, 2.\n{load}*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def frequency_loads_deck(loads=True):
+    """after_pert_deck's column (elastic): an NLGEOM static step pushing its top sideways, a
+    *FREQUENCY step with a traction on the top face (*DSLOAD TRVEC) and a *CLOAD, FOLLOWER of
+    its own (``loads``), which Abaqus ignores, then a static step pulling the top the other
+    way: as without them."""
+    own = "*DSLOAD\nTOPS, TRVEC, 5., 0., 0., 1.\n*CLOAD, FOLLOWER\n10, 3, 3.\n" if loads else ""
+    return (after_pert_model() + "*ELSET, ELSET=E4\n4\n*SURFACE, NAME=TOPS\nE4, S2\n*STEP, NLGEOM\n"
+            "*STATIC\n0.5, 1.\n*CLOAD\n19, 1, 1.\n*END STEP\n"
+            f"*STEP\n*FREQUENCY\n4\n{own}*END STEP\n"
+            "*STEP\n*STATIC\n0.5, 1.\n*CLOAD\n19, 2, 2.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
 def modal_own_loads_deck(base=True):
     """A unit C3D8 cube (E 1000, nu 0, rho 1e-3) held statically at three corners: a static
     step loads it (``base``: a *CLOAD, a face pressure, gravity and a traction, which becomes
@@ -6760,6 +6820,44 @@ def main():
     elif all(runs):
         print(f"FAIL  equation_held: {len(runs[0][0])} frequencies, {len(runs[0][1])} tables")
     failures += 0 if ok else 1
+    # contact output in modal / steady-state dynamics of a plastic model (ccx 2.23 segfaulted:
+    # dropped), an analytic amplitude in a *MODAL DYNAMIC step (tabulated over the general
+    # steps' time only), and a *FREQUENCY step's own loads after NLGEOM (Abaqus ignores them;
+    # a traction was dropped as reduced physics, now converted: harmless)
+    eig = "E I G E N V A L U E   O U T P U T"
+    for tag, decks, last, what, was in (
+            ("plastic_contact_modal_output", [plastic_contact_deck("modal", t) for t in (False, True)],
+             False, "the plastic column with a block pressed on it, *FREQUENCY and a *MODAL DYNAMIC "
+             "step into which ccx would carry the contact output: its motion as with an elastic "
+             "material", "ccx segfaulted"),
+            ("plastic_contact_ssd_output", [plastic_contact_deck("ssd", t) for t in (False, True)],
+             False, "the same with a *STEADY STATE DYNAMICS step writing contact output: its "
+             "response as with an elastic material", "ccx segfaulted"),
+            ("modal_analytic_amplitude", [modal_amplitude_deck(False, t) for t in (False, True)],
+             False, "the column's top loaded on sin(2 pi t), DEFINITION=PERIODIC, in a 2.0 *MODAL "
+             "DYNAMIC step after *FREQUENCY: as with the curve tabulated finely", "not tabulated: "
+             "ccx stopped"),
+            ("modal_total_time_amplitude", [modal_amplitude_deck(True, t) for t in (False, True)],
+             False, "the same on TIME=TOTAL TIME after a 0.25 static step", "1.1 of the motion apart: "
+             "the table ended at 0.25"),
+            ("frequency_own_loads_nlgeom", [frequency_loads_deck(t) for t in (True, False)],
+             True, "the column pushed sideways under NLGEOM, a *FREQUENCY step with a traction and a "
+             "*CLOAD, FOLLOWER of its own, then pulled: frequencies and the last step's end as "
+             "without them", "the traction dropped as reduced physics")):
+        runs = [review_run(text, tag + ("_ref" if k else ""),
+                           lambda dat: (dat_node_blocks(dat), dat_eigen_table(dat, eig)))
+                for k, text in enumerate(decks)]
+        ok = all(runs) and all(r[0] for r in runs)
+        if ok:
+            err, moved = same([r[0] for r in runs], -1 if last else None)
+            lam = max((abs(a / b - 1) for a, b in zip(runs[0][1], runs[1][1])), default=math.inf)
+            ok = err < 1e-6 * moved and moved > 1e-3 and lam < 1e-9 and \
+                len(runs[0][1]) == len(runs[1][1]) == 4
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {err:.1e} apart, the top moved "
+                  f"{moved:.4g}, frequencies {lam:.0e} apart (before: {was})")
+        elif all(runs):
+            print(f"FAIL  {tag}: no displacement table")
+        failures += 0 if ok else 1
     # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
     # it too): the response to its own loads alone
     runs = [review_run(modal_own_loads_deck(b), "modal_own_loads" + ("" if b else "_ref"),

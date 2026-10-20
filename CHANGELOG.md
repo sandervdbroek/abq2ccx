@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **Analytic amplitudes in `*MODAL DYNAMIC` steps** — a `PERIODIC`, `MODULATED` or `DECAY`
+  amplitude was tabulated over the general steps' time only: a modal dynamic step read it past
+  the table's end (constant there), and a deck with no general step lost it (ccx stopped). The
+  table now covers each modal dynamic step's time period too.
+* **More ccx 2.23 segfaults with a plastic or creeping material** — contact output (CDIS, CSTR,
+  CELS) in modal and steady-state dynamics steps, own or carried in, is now left out there with
+  a warning; a `*COMPLEX FREQUENCY` step is warned (reduced physics). `*FREQUENCY` steps after
+  an NLGEOM step no longer report their FOLLOWER options and tractions as reduced physics:
+  Abaqus ignores their loads.
 * **Pre-tension of a truss or beam cut** — ccx 2.23 deletes the element a `*PRE-TENSION
   SECTION, ELEMENT=` names and ties its end nodes along the normal only: the closure of a held
   bolt missed the element's own length (33 % low for a bolt of two elements), no shear, moment

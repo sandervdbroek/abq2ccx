@@ -4067,6 +4067,7 @@ class Converter:
         self._restore_yields = False                # a material yields or creeps
         self._eigen_since = False                   # ... and a *FREQUENCY step ran in ccx
         self._yield_segv: set = set()               # the steps where ccx then segfaults (_yield_segfaults)
+        self._cprint_cut: Dict[int, dict] = {}      # *CONTACT PRINT -> its labels left (_el_file_stops)
         # *MODAL DYNAMIC steps ccx starts from a deformed or moving model -> the step whose
         # end state that is, and those of them that keep the earlier loads (_plan_modal_starts)
         self._modal_moving: Dict[int, int] = {}
@@ -4670,6 +4671,11 @@ class Converter:
         with guidance.  This is the table-driven heart of 'support as many as
         possible, convert/flag the rest'."""
         kw = b.keyword
+        if id(b) in self._cprint_cut:       # in a modal or steady-state dynamics step (_el_file_stops)
+            r = self._cprint_cut[id(b)]
+            for w in r["warnings"]:
+                self.report.warn(w, once=True)
+            return [emit_keyword(kw, b.params)] + ([", ".join(r["labels"])] if r["labels"] else [])
         if kw == "FILTER" and not self._has_sensitivity:
             # Abaqus *FILTER is an output filter (anti-aliasing / HALT on a limit); ccx's
             # *FILTER smooths sensitivities and is an error outside a *SENSITIVITY run
@@ -7825,21 +7831,24 @@ class Converter:
     def _yield_segfaults(self, proc: Optional[str], nlgeom: bool) -> None:
         """Warn about the steps where ccx 2.23 segfaults on a plastic or creeping material
         (_restore_yields), which no form of the deck avoids (probed on both builds with a
-        plastic and a creeping C3D8 column): a *BUCKLE step, with any output, and a *STATIC or
-        *VISCO step without NLGEOM after a *FREQUENCY step, at its start, also with a modal or
-        steady-state dynamics step in between.  A *DYNAMIC, NLGEOM or coupled temperature-
-        displacement step runs there, and a *DYNAMIC step in between clears it.  (Element
-        output segfaults the modal and steady-state dynamics steps: _el_file_stops drops it.)
-        Abaqus ignores plasticity and creep in a linear perturbation step."""
+        plastic and a creeping C3D8 column): a *BUCKLE or *COMPLEX FREQUENCY step (the latter
+        written with CORIOLIS), with any output, and a *STATIC or *VISCO step without NLGEOM
+        after a *FREQUENCY step, at its start, also with a modal or steady-state dynamics step
+        in between.  A *DYNAMIC, NLGEOM or coupled temperature-displacement step runs there,
+        and a *DYNAMIC step in between clears it.  (Element and contact output segfaults the
+        modal and steady-state dynamics steps: _el_file_stops drops it.)  Abaqus ignores
+        plasticity and creep in a linear perturbation step.  ``proc`` None: a step whose
+        procedure card is commented out (ccx repeats the previous one there, probed)."""
         if not self._restore_yields:
             return
         k = self._step_idx
-        if proc == "BUCKLE":
-            self.report.warn(f"*BUCKLE step {k} in a model with a plastic or creeping material: "
+        if proc in ("BUCKLE", "COMPLEX FREQUENCY"):
+            self.report.warn(f"*{proc} step {k} in a model with a plastic or creeping material: "
                              f"ccx 2.23 segfaults in it, with any output (probed); Abaqus ignores "
-                             f"plasticity and creep in a linear perturbation step and buckles "
-                             f"with the base state's elastic stiffness.", once=True)
-            self._reduces("*BUCKLE step with a plastic or creeping material (ccx 2.23 segfaults)")
+                             f"plasticity and creep in a linear perturbation step and "
+                             f"{'buckles' if proc == 'BUCKLE' else 'extracts the modes'} with the "
+                             f"base state's elastic stiffness.", once=True)
+            self._reduces(f"*{proc} step with a plastic or creeping material (ccx 2.23 segfaults)")
             self._yield_segv.add(k)
         elif proc in ("STATIC", "VISCO") and not nlgeom and self._eigen_since:
             self.report.warn(f"Step {k} (*{proc}, no NLGEOM) after a *FREQUENCY step in a model "
@@ -8023,7 +8032,8 @@ class Converter:
         # a linear perturbation step has no effect on the later ones: _plan_deck_facts)
         self._step_nlgeom = self._step_nlgeom or (self._step_idx not in self._pert_idx and
             "NLGEOM" in params and (nl or "YES").strip().upper() != "NO")
-        self._yield_segfaults(proc, self._dp_nlgeom or (
+        riks = proc_block is not None and proc_block.has("RIKS") and not self._approx
+        self._yield_segfaults(None if riks else proc, self._dp_nlgeom or (     # (handle_static)
             "NLGEOM" in params and (nl or "YES").strip().upper() != "NO"))
         out = [emit_keyword("STEP", params)]
         self._nodal_fresh, self._nodal_reset, self._cload_new = set(), set(), False
@@ -9437,10 +9447,24 @@ class Converter:
                          f"part in ccx's steady-state dynamics.", once=True)
         return "2"
 
+    def _loads_nlgeom(self) -> bool:
+        """Whether NLGEOM bears on the current step's own loads: in a general step under
+        NLGEOM, and in a linear perturbation step about an NLGEOM base state, whose loads
+        Abaqus applies on the base state's deformed geometry with the load stiffness of
+        follower loads (Abaqus 2017, linear perturbation and eigenvalue buckling); not in a
+        *FREQUENCY or *COMPLEX FREQUENCY step, which ignores applied loads."""
+        return self._step_nlgeom and self._step_proc not in LOAD_FREE_PROCEDURES
+
+    def _no_nlgeom_effect(self) -> str:
+        """Why a load option that acts only under NLGEOM changes nothing in this step."""
+        if self._step_proc in LOAD_FREE_PROCEDURES:
+            return f"no effect: Abaqus ignores the loads of a *{self._step_proc} step"
+        return "no effect without NLGEOM"
+
     def _load_params(self, b: Block, allowed: Sequence[str]) -> "OrderedDict[str, Optional[str]]":
         """Parameters ccx's distributed-load cards read; Abaqus-only ones are dropped —
         with a WARNING where they change the load under NLGEOM (ccx pressures always
-        follow the deformed surface with their current area)."""
+        follow the deformed surface with their current area; _loads_nlgeom)."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in allowed:
@@ -9458,7 +9482,7 @@ class Converter:
                                  f"a total force over the surface, ccx reads it as a pressure.",
                                  once=True)
                 self._reduces(f"*{b.keyword}, TOTAL FORCE")
-            elif changes and self._step_nlgeom:
+            elif changes and self._loads_nlgeom():
                 self.report.warn(f"*{b.keyword} {k}={vu} dropped: under NLGEOM ccx pressure loads "
                                  f"always follow the deformed surface and scale with its current "
                                  f"area, so this load differs from Abaqus as the mesh deforms.",
@@ -9466,7 +9490,7 @@ class Converter:
                 self._reduces(f"*{b.keyword} {k}={vu} under NLGEOM")
             else:
                 self.report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx"
-                                 f"{'; no effect without NLGEOM' if changes else ''}).", once=True)
+                                 f"{'; ' + self._no_nlgeom_effect() if changes else ''}).", once=True)
         return keep
 
     def handle_cload(self, b: Block) -> List[str]:
@@ -9494,11 +9518,12 @@ class Converter:
                                  f"components now act along the global axes — verify.", once=True)
                 self._reduces("*CLOAD, ORIENTATION (local load directions)")
             elif k == "FOLLOWER" and (v or "YES").strip().upper() == "YES":
-                (self.report.warn if self._step_nlgeom else self.report.note)(
+                nl = self._loads_nlgeom()
+                (self.report.warn if nl else self.report.note)(
                     "*CLOAD, FOLLOWER=YES dropped: ccx concentrated loads keep their direction"
-                    + (" — under NLGEOM this load no longer rotates with the node." if
-                       self._step_nlgeom else " (no effect without NLGEOM)."), once=True)
-                if self._step_nlgeom:
+                    + (" — under NLGEOM this load no longer rotates with the node." if nl else
+                       f" ({self._no_nlgeom_effect()})."), once=True)
+                if nl:
                     self._reduces("*CLOAD, FOLLOWER=YES under NLGEOM")
             else:
                 self.report.note(f"*CLOAD parameter {k} dropped (not read by ccx).", once=True)
@@ -10126,8 +10151,8 @@ class Converter:
         """Why nodal forces from the undeformed geometry would not reproduce the Abaqus load
         in this step, or None when they do: always in a small-strain step; under NLGEOM only
         for a traction that keeps its direction (FOLLOWER=NO) and its resultant (CONSTANT
-        RESULTANT=YES) — ccx keeps a *CLOAD fixed in direction and magnitude."""
-        if not self._step_nlgeom:
+        RESULTANT=YES) — ccx keeps a *CLOAD fixed in direction and magnitude (_loads_nlgeom)."""
+        if not self._loads_nlgeom():
             return None
         if base in ("P1", "P2"):
             return "under NLGEOM a beam line load in the local directions rotates with the beam"
@@ -11797,8 +11822,9 @@ class Converter:
           *STEADY STATE DYNAMICS, and *FREQUENCY / *BUCKLE, where ccx skips an SDV request of
           the step's own ('does not make sense') but not one carried over from an earlier
           step.  In a linear static step no material changes the state variables;
-        * element output and RF in a *MODAL DYNAMIC or *STEADY STATE DYNAMICS step of a model
-          with a plastic or creeping material (_modal_result_stops).
+        * element and contact output and RF in a *MODAL DYNAMIC or *STEADY STATE DYNAMICS step
+          of a model with a plastic or creeping material (_modal_result_stops; a passed-through
+          *CONTACT PRINT is cut in passthrough).
 
         ccx keeps an *EL FILE in the next steps that give none, so a step of the second kind
         without an *EL FILE gets an empty one where ccx would carry SDV into it: Abaqus writes
@@ -11819,10 +11845,16 @@ class Converter:
             sdv = state and (linear or timing["proc"] in NO_NODAL_SDV_PROCS)
             where = ("a linear *STATIC step (no NLGEOM, no plastic, creeping, hyperelastic or "
                      "user material)" if linear else f"a *{timing['proc']} step")
+            # a *CONTACT PRINT is passed through: the same record, for passthrough to cut
+            prints = [dict(self._added_el_file(OrderedDict(), [x.strip() for rec in
+                                                              merged_data_records(b) for x in rec
+                                                              if x.strip()], b, "CONTACT PRINT"),
+                           b=b, default=False) for b in group if b.keyword == "CONTACT PRINT"]
             if self._out_yields and timing["proc"] in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS"):
-                self._modal_result_stops(k, timing["proc"], reqs, carried, group[0])
+                self._modal_result_stops(k, timing["proc"], reqs, carried, group[0], prints)
+                self._cprint_cut.update((id(r["b"]), r) for r in prints if r["warnings"])
             for cc in self._MODAL_STOPS:
-                carried[cc] = [r for r in reqs if r["live"] and r["cc"] == cc] or \
+                carried[cc] = [r for r in reqs + prints if r["live"] and r["cc"] == cc] or \
                     carried.get(cc, [])
             files = [r for r in reqs if r["live"] and r["cc"] == "EL FILE"]
             if sdv and not files and any(lab[:3] == "SDV" for lab in held):
@@ -11859,22 +11891,26 @@ class Converter:
                 held = [lab for r in files for lab in r["labels"]]
 
     # what ccx 2.23 segfaults on in a modal or steady-state dynamics step of a model with a
-    # plastic or creeping material (probed on both builds; U, V, PU run): every element
-    # output label (S, E, PEEQ, ENER, ...) and RF, which it computes from the elements
-    _MODAL_STOPS = {"EL FILE": None, "EL PRINT": None, "NODE FILE": ("RF",), "NODE PRINT": ("RF",)}
+    # plastic or creeping material (probed on both builds; U, V, PU, RFL, contact PCON and
+    # CNUM run): every element output label (S, E, PEEQ, ENER, ...), RF, which it computes
+    # from the elements, and the contact labels CDIS, CSTR, CELS (by their first 4 letters)
+    _MODAL_STOPS = {"EL FILE": None, "EL PRINT": None, "NODE FILE": ("RF",), "NODE PRINT": ("RF",),
+                    "CONTACT FILE": ("CDIS", "CSTR", "CELS"),
+                    "CONTACT PRINT": ("CDIS", "CSTR", "CELS")}
 
     def _modal_result_stops(self, k: int, proc: str, reqs: List[dict],
-                            carried: Dict[str, List[dict]], anchor: Block) -> None:
+                            carried: Dict[str, List[dict]], anchor: Block,
+                            passed: Sequence[dict] = ()) -> None:
         """Step ``k``'s output that ccx cannot compute left out (_MODAL_STOPS, _el_file_stops):
-        its own cards lose those labels (a card left with none is written bare), and a bare
-        card is added where ccx would carry them in from an earlier step (a bare card ends
-        the earlier selections, probed)."""
-        why = (f"ccx 2.23 segfaults computing element results in a *{proc} step of a model "
-               f"with a plastic or creeping material (probed)")
+        its own cards (``passed``: passed-through ones) lose those labels (a card left with
+        none is written bare), and a bare card is added to ``reqs`` where ccx would carry them
+        in from an earlier step (a bare card ends the earlier selections, probed)."""
+        why = (f"ccx 2.23 segfaults computing element or contact results in a *{proc} step of "
+               f"a model with a plastic or creeping material (probed)")
         for cc, only in self._MODAL_STOPS.items():
-            own = [r for r in reqs if r["live"] and r["cc"] == cc]
+            own = [r for r in list(reqs) + list(passed) if r["live"] and r["cc"] == cc]
             for r in own:
-                gone = [lab for lab in r["labels"] if only is None or lab in only]
+                gone = [lab for lab in r["labels"] if only is None or lab[:4].upper() in only]
                 if not gone:
                     continue
                 r["labels"] = [lab for lab in r["labels"] if lab not in gone]
@@ -11888,11 +11924,12 @@ class Converter:
                     f"creep are ignored in a linear perturbation step).")
             held = carried.get(cc, [])
             key = "ELSET" if cc.startswith("EL") else "NSET"
-            if own or not any(only is None or lab in only for r in held for lab in r["labels"]):
+            if own or not any(only is None or lab[:4].upper() in only
+                              for r in held for lab in r["labels"]):
                 continue
             params = OrderedDict([(key, held[0]["params"][key])]
                                  if held[0]["params"].get(key) else [])
-            if cc.endswith("PRINT") and not params:
+            if cc in ("NODE PRINT", "EL PRINT") and not params:
                 continue
             r = self._added_el_file(params, [], anchor, cc)
             r["bare"] = True
@@ -13278,20 +13315,30 @@ class Converter:
         return [emit_keyword("AMPLITUDE", keep)] + scaled(list(b.data))
 
     def _plan_amplitude_spans(self, blocks: List[Block]) -> None:
-        """The longest step time and the total time of the deck's steps, over which
-        _sample_amplitude tabulates an analytic amplitude (None if a step's time period is
-        unknown)."""
+        """The longest step time and the latest total time at which the deck's steps read an
+        amplitude, over which _sample_amplitude tabulates an analytic amplitude (None if a
+        step's time period is unknown).  A *MODAL DYNAMIC step reads it over its own time
+        period as well, from the general steps' total time before it (_shift_total_time
+        takes out what ccx adds to it), though Abaqus adds no perturbation step's time."""
         self._amp_span = None
-        longest = total = 0.0
+        longest = total = reach = 0.0
         nlgeom = False
         for group in step_groups(blocks)[1]:
             info = self._step_motion(group, nlgeom)
             nlgeom = info["nlgeom"]
             if info["advance"] is None:
                 return
-            longest, total = max(longest, info["advance"]), total + info["advance"]
-        if total > 0.0:
-            self._amp_span = (longest, total)
+            period = 0.0
+            for b in (b for b in group[1:] if b.keyword == "MODAL DYNAMIC"):
+                rec = (merged_data_records(b) or [[]])[0]
+                try:
+                    period = max(pf(rec[1]), 0.0) if len(rec) > 1 and rec[1] else 0.0
+                except ValueError:
+                    pass
+            longest, total = max(longest, info["advance"], period), total + info["advance"]
+            reach = max(reach, total + period)
+        if reach > 0.0:
+            self._amp_span = (longest, reach)
 
     def _sample_amplitude(self, b: Block) -> Optional[List[str]]:
         """``*AMPLITUDE, DEFINITION=PERIODIC / MODULATED / DECAY`` (amplitude_curve) as

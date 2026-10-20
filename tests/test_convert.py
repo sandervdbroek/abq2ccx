@@ -6309,6 +6309,91 @@ def test_frequency_read_by_dynamics_per_step():
         assert [i for i, s in enumerate(got) if "STORAGE=YES" in s] == read
 
 
+def test_analytic_amplitudes_over_modal_dynamic_steps():
+    # a *MODAL DYNAMIC step reads an amplitude over its own time period, a TIME=TOTAL TIME one
+    # from the general steps' total time on (validate_with_ccx.py modal_analytic_amplitude): the
+    # sampled table covers that too (it ended with the general steps; none: not sampled at all)
+    amp = "*Amplitude, name=P, definition=PERIODIC{}\n1, 6.283185, 0., 0.\n0., 1.\n"
+    load = "*Cload, amplitude=P\n7, 2, 0.1\n"
+    freq, md = _deck_step("Frequency, storage=yes\n2"), _deck_step("Modal Dynamic\n0.01, 2.", load)
+    st = _deck_step("Static\n0.5, 1.", load)
+    for head, steps, end in (("", freq + md, "step time 0 to 2"), ("", st + freq + md, "step time 0 to 2"),
+                             (", time=total time", st + freq + md, "total time 0 to 3"),
+                             (", time=total time", st + freq + md + st, "total time 0 to 3")):
+        body, _, rep = convert_str(HEX + amp.format(head) + steps)
+        assert f"sampled into {200 * int(end[-1]) + 1} time/amplitude points over its {end} " in rep.text()
+        assert "*AMPLITUDE, NAME=P" in body and "** *AMPLITUDE" not in body
+
+
+def test_nlgeom_load_options_in_perturbation_steps():
+    # Abaqus ignores the loads of a *FREQUENCY step (Abaqus 2017, natural frequency extraction),
+    # so after an NLGEOM step a FOLLOWER option and a traction's undeformed nodal forces change
+    # nothing there (code review 2, slice 2 S4: warned as reduced physics, the traction dropped).
+    # Another perturbation step about an NLGEOM base state keeps them: Abaqus loads it on the
+    # deformed base geometry, with the load stiffness of follower loads (eigenvalue buckling)
+    deck = HEX + "*Surface, name=TOP\nEALL, S2\n" + _deck_step("Static", "*Cload\n7, 1, 1.\n", ", nlgeom")
+    own = "*Cload, follower\n6, 1, 1.\n*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n"
+    body, conv, rep = convert_str(deck + _deck_step("Frequency\n2", own))
+    assert not conv.reduced_physics and "under NLGEOM" not in rep.text()
+    assert "*CLOAD, FOLLOWER=YES dropped: ccx concentrated loads keep their direction (no effect: " \
+           "Abaqus ignores the loads of a *FREQUENCY step)." in rep.text()
+    assert _cloads(body)[1] == {(6, 1): 1.0, **{(n, 3): -1.0 for n in (5, 6, 7, 8)}}
+    for proc, head in (("Buckle\n2", ""), ("Static", ", perturbation")):
+        body, conv, rep = convert_str(deck + _deck_step(proc, own, head))
+        assert conv.reduced_physics[-2:] == ["*CLOAD, FOLLOWER=YES under NLGEOM", "*DSLOAD TRVEC load dropped"]
+        assert _cloads(body)[1] == {(6, 1): 1.0}
+    # a FOLLOWER=NO pressure in a frequency step after NLGEOM: a note
+    _, conv, rep = convert_str(deck + _deck_step("Frequency\n2", "*Dsload, follower=no\nTOP, P, 1.\n"))
+    assert "*DSLOAD parameter FOLLOWER dropped (not read by ccx; no effect: Abaqus ignores the loads " \
+           "of a *FREQUENCY step)." in rep.text() and not conv.reduced_physics
+
+
+def test_plastic_material_where_ccx_segfaults_other_procedures():
+    # more of what ccx 2.23 segfaults on with a plastic or creeping material (probed): any
+    # *COMPLEX FREQUENCY step (written with CORIOLIS), and contact output (CDIS, CSTR, CELS) in
+    # modal and steady-state dynamics, own or carried in (a bare card ends that; validate_with_ccx.py
+    # plastic_contact_modal_output).  A *STATIC, RIKS step without --approximate has its procedure
+    # commented out, so ccx repeats the previous one there and does not segfault (probed)
+    pl = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+          "*Plastic\n10., 0.\n20., 0.1\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
+          "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    load = "*Cload\n7, 1, 1.\n"
+    st, freq = _deck_step("Static", load), _deck_step("Frequency, storage=yes\n2")
+    _, conv, rep = convert_str(pl + st + freq + _deck_step("Complex Frequency\n2"))
+    assert "*COMPLEX FREQUENCY step 3 in a model with a plastic or creeping material: ccx 2.23 " \
+           "segfaults in it" in rep.text()
+    assert conv.reduced_physics == ["*COMPLEX FREQUENCY step with a plastic or creeping material "
+                                    "(ccx 2.23 segfaults)"]
+    riks = _deck_step("Static, riks\n0.1, 1.", load)
+    _, conv, rep = convert_str(pl + st + freq + riks)
+    assert "segfaults" not in rep.text() and not conv.reduced_physics
+    _, conv, rep = convert_str(pl + st + freq + riks, approximate=True)
+    assert "Step 3 (*STATIC, no NLGEOM) after a *FREQUENCY step" in rep.text()
+    # contact: a block on the cube; Abaqus' preselected contact output and a *CONTACT PRINT of
+    # step 1 carried into a modal dynamics step, own ones in a steady-state dynamics step
+    blk = ("*Node\n11, 0., 0., 1.\n12, 1., 0., 1.\n13, 1., 1., 1.\n14, 0., 1., 1.\n15, 0., 0., 2.\n"
+           "16, 1., 0., 2.\n17, 1., 1., 2.\n18, 0., 1., 2.\n*Element, type=C3D8, elset=BLK\n"
+           "2, 11, 12, 13, 14, 15, 16, 17, 18\n*Solid Section, elset=BLK, material=M\n"
+           "*Surface, name=TOP\nEALL, S2\n*Surface, name=BOT\nBLK, S1\n*Surface Interaction, name=I\n"
+           "*Contact Pair, interaction=I\nBOT, TOP\n*Boundary\n15, 1, 3\n16, 1, 3\n17, 1, 3\n18, 1, 3\n")
+    st = _deck_step("Static", load + "*Contact Print\nCSTRESS, CDISP\n")
+    body, conv, rep = convert_str(pl + blk + st + freq + _deck_step("Modal Dynamic\n0.1, 0.5", load))
+    assert body.split("*STEP")[3].endswith("*EL FILE\n*CONTACT FILE\n*CONTACT PRINT\n*END STEP")
+    assert "Empty *CONTACT FILE added to step 3" in rep.text()
+    assert conv.reduced_physics == ["base state of a *FREQUENCY step that modal / steady-state "
+                                    "dynamics read"]       # (its contact status; not the output)
+    assert "Empty *CONTACT PRINT added to step 3" in rep.text()
+    ssd = _deck_step("Steady State Dynamics\n10., 100., 2", load + "*Output, field\n*Node Output\nU\n"
+                     "*Contact Output\nCSTRESS, CDISP\n*Contact Print\nCSTRESS, CFN\n")
+    body, _, rep = convert_str(pl + blk + st + freq + ssd)
+    assert "*CONTACT FILE\n*CONTACT PRINT\nCFN\n" in body.split("*STEP")[3]
+    assert "*CONTACT FILE CSTR, CDIS dropped from step 3: ccx 2.23 segfaults computing element or " \
+           "contact results" in rep.text() and "*CONTACT PRINT CSTRESS dropped from step 3" in rep.text()
+    # an elastic model keeps them
+    body, _, rep = convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + blk + st + freq + ssd)
+    assert "*CONTACT PRINT\nCSTRESS, CFN\n" in body and "segfaults" not in rep.text()
+
+
 def test_buckle_perturbation_prescribed_displacements():
     # ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for prescribed displacements:
     # only those nodes move, by every nonzero BC value in force (probed: 2.389 for 40.87)
