@@ -3360,6 +3360,11 @@ ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
 # with a warning.  Abaqus' CFT is ccx's CF; CFN1, ... are components of CFN, ...
 CCX_CONTACT_PRINT_LABELS = {"CDIS", "CSTR", "CELS", "CNUM"}
 CCX_CONTACT_SURFACE_LABELS = ("CF", "CFN", "CFS")
+# The procedures in which ccx 2.23 segfaults on those, of the step's own *CONTACT PRINT or one
+# carried in, whatever the material (probed, face-to-face pair): *BUCKLE, *MODAL DYNAMIC,
+# *STEADY STATE DYNAMICS and a plain *FREQUENCY, which has no contact; one with PERTURBATION
+# prints them (Converter._contact_force_stops).
+CCX_CONTACT_FORCE_STOPS = {"FREQUENCY", "BUCKLE", "MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
 # The output labels that make ccx compute element energies, per card (probed on 2.23); an
 # implicit *DYNAMIC and a transient (un)coupled temperature-displacement step do so whatever
 # they request.  In a nonlinear calculation ccx stops when that starts after the first step
@@ -13299,7 +13304,9 @@ class Converter:
         groups = step_groups(blocks)[1]
         self._el_print_stops(blocks, steps, groups)
         self._energy_from_step_one(steps, [g[0] for g in groups])
+        self._contact_force_stops(steps, groups)
         self._el_file_stops(blocks, steps, groups)
+        self._dynamic_energy_offsets(steps)
         for k, timing, reqs in steps:
             self._out_ctl[k] = self._step_output_control(k, timing, reqs)
             for r in reqs:
@@ -13543,19 +13550,21 @@ class Converter:
         """Per step, whether ccx 2.23 runs it linearly (linstatic.c: no kinetic energies, no
         nodal state variables): a *STATIC or *VISCO step, or one without a ccx procedure —
         Riks too, commented out or (--approximate) a plain *STATIC —, with no NLGEOM in it or
-        an earlier step (_nlgeom_steps; handle_step writes it again after a *FREQUENCY or
-        *BUCKLE step, where ccx forgets it), no material ccx iterates (a kept *PLASTIC,
-        *CREEP, CCX_ITERATED_MATERIALS) and no step after which ccx iterates every step
+        an earlier step (_nlgeom_steps, or an explicit step's, which handle_step adds unless
+        NLGEOM=NO; handle_step writes it again after a *FREQUENCY or *BUCKLE step, where ccx
+        forgets it), no material ccx iterates (a kept *PLASTIC, *CREEP,
+        CCX_ITERATED_MATERIALS) and no step after which ccx iterates every step
         (CCX_NONLINEAR_AFTER_PROCS) since the last *FREQUENCY or *BUCKLE step, after which ccx
-        runs a *STATIC step linearly again (probed).  Contact makes ccx iterate too, but the
-        converter cannot tell whether ccx keeps a contact pair, so a contact model counts as
-        linear."""
+        runs a *STATIC step linearly again (probed, also after an explicit step without
+        NLGEOM).  Contact makes ccx iterate too, but the converter cannot tell whether ccx
+        keeps a contact pair, so a contact model counts as linear."""
         iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
         on = self._nlgeom_steps(blocks)
         linear: List[bool] = []
         nlgeom = after = False
         for (_k, timing, _reqs), group in zip(steps, groups):
-            nlgeom = nlgeom or id(group[0]) in on
+            nlgeom = nlgeom or id(group[0]) in on or timing["kind"] == "explicit" and \
+                (group[0].param("NLGEOM") or "YES").strip().upper() != "NO"
             linear.append(timing["proc"] in (None, "STATIC", "VISCO") and
                           not (nlgeom or after or iterated))
             if timing["proc"] in CCX_NONLINEAR_AFTER_PROCS:
@@ -13703,6 +13712,91 @@ class Converter:
                         f"(.dat) runs.")
             if files:
                 held = [lab for r in files for lab in r["labels"]]
+
+    def _contact_force_stops(self, steps: List[Tuple[int, dict, List[dict]]],
+                             groups: List[List[Block]]) -> None:
+        """Keep *CONTACT PRINT CF / CFN / CFS (_contact_print_card's cards per contact pair) out
+        of the steps where ccx 2.23 segfaults on them (CCX_CONTACT_FORCE_STOPS): a card of the
+        step's own loses them (written bare when nothing is left), and where ccx would carry
+        them in from an earlier step the step gets a card that ends them (probed): a bare one
+        after a general step, whose print requests Abaqus does not carry into these linear
+        perturbation steps, else the earlier step's other variables again.  The next general
+        step without cards of its own gets those of the general step Abaqus carries into it
+        again, which ccx would not.  Every *FREQUENCY step counts: handle_step decides its
+        PERTURBATION later (_frequency_perturbation)."""
+        if len(groups) < len(steps):
+            return
+        held: List[dict] = []       # the *CONTACT PRINT requests ccx carries into a step
+        gen: List[dict] = []        # those of the last general step that gave its own
+        held_k = gen_k = ended = 0  # ended: the step whose cards ended them in ccx
+        held_pert = False
+        for (k, timing, reqs), group in zip(steps, groups):
+            proc = timing["proc"]
+            own = [r for r in reqs if r["live"] and r["cc"] == "CONTACT PRINT"]
+            if proc in CCX_CONTACT_FORCE_STOPS:
+                why = (f"ccx 2.23 segfaults computing contact forces in a *{proc} step"
+                       f"{' without PERTURBATION (no contact there)' if proc == 'FREQUENCY' else ''}, "
+                       f"whatever the material (probed"
+                       f"{'; left out of every *FREQUENCY step' if proc == 'FREQUENCY' else ''})")
+                for r in own:
+                    gone = dedup([lab for _p, labels in r.get("surface", ()) for lab in labels])
+                    if gone:
+                        r["surface"], r["bare"] = [], r.get("bare") or not r["labels"]
+                        r["warnings"].append(f"*CONTACT PRINT {', '.join(gone)} dropped from step "
+                                             f"{k}: {why}.")
+                        ended = k
+                gone = dedup([lab for r in held for _p, labels in r.get("surface", ())
+                              for lab in labels])
+                if not own and gone:
+                    labels = dedup([lab for r in held for lab in r["labels"]]) if held_pert else []
+                    own = [dict(self._added_el_file(OrderedDict(), labels, group[0], "CONTACT PRINT"),
+                                surface=[], bare=not labels)]
+                    own[0]["notes"].append(
+                        (f"Step {held_k}'s *CONTACT PRINT written again in step {k} without "
+                         f"{', '.join(gone)}" if labels else f"Empty *CONTACT PRINT added to step {k}") +
+                        f": ccx would carry step {held_k}'s {', '.join(gone)} into it, and {why}" +
+                        ("" if held_pert else "; Abaqus prints no general step's requests in a "
+                                              "linear perturbation step") + ".")
+                    reqs.extend(own)
+                    ended = k
+            elif not (own or timing["pert"]) and ended:
+                own = [dict(self._added_el_file(OrderedDict(r["params"]), list(r["labels"]), group[0],
+                                                "CONTACT PRINT"), surface=list(r.get("surface", ())))
+                       for r in gen if r["labels"] or r.get("surface")]
+                if own:
+                    own[0]["notes"].append(f"Step {gen_k}'s *CONTACT PRINT cards written again in "
+                                           f"step {k}: Abaqus carries them into it, ccx would not "
+                                           f"after step {ended}'s.")
+                    reqs.extend(own)
+            if own:
+                held, held_k, held_pert = own, k, timing["pert"]
+                if not timing["pert"]:
+                    gen, gen_k, ended = own, k, 0
+
+    def _dynamic_energy_offsets(self, steps: List[Tuple[int, dict, List[dict]]]) -> None:
+        """A note on the first element energy request (ELSE, ENER) of a *DYNAMIC step after the
+        first step or of a later step, the step's own or an *EL PRINT / *EL FILE ccx carries
+        in: ccx 2.23 adds the strain energy the model holds at the start of such a step,
+        implicit or explicit, to the element energies once more, and keeps it in the later
+        steps (probed on a held one-DOF cube: 5e-4 reads 1e-3 from the first increment on,
+        1.5e-3 after a second *DYNAMIC step; after a *FREQUENCY step the last eigenmode's)."""
+        held: Dict[str, List[dict]] = {}
+        dyn = 0
+        for k, timing, reqs in steps:
+            for cc in ("EL PRINT", "EL FILE"):
+                held[cc] = [r for r in reqs if r["live"] and r["cc"] == cc] or held.get(cc, [])
+            dyn = dyn or (k if k > 1 and timing["proc"] == "DYNAMIC" else 0)
+            hit = next(((r, lab) for rs in held.values() for r in rs for lab in r["labels"]
+                        if lab[:4] in ("ELSE", "ENER")), None) if dyn else None
+            if hit:
+                hit[0]["notes"].append(
+                    f"*{hit[0]['cc']} {hit[1]} in step {k}: ccx 2.23 adds the strain energy the model "
+                    f"holds at the start of each *DYNAMIC step after the first step (step {dyn} on) "
+                    f"to the element energies once more, and keeps it in the later steps (probed: a "
+                    f"held preload's 5e-4 reads 1e-3, 1.5e-3 after a second *DYNAMIC step; after a "
+                    f"*FREQUENCY step the last eigenmode's) — ccx's bookkeeping; Abaqus' has no such "
+                    f"offset.")
+                return
 
     # what ccx 2.23 segfaults on in a modal or steady-state dynamics step of a model with a
     # plastic or creeping material (probed on both builds; U, V, PU, RFL, contact PCON and

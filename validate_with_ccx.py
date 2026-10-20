@@ -2757,7 +2757,9 @@ def el_file_stops_deck(case, sdv=True):
     output, into which ccx carried SDV; 'plastic', of a plastic material (yield 250, never
     reached), then a *FREQUENCY step without element output; 'visco' and 'riks', of the
     *DEPVAR material in a *VISCO and a Riks step (--approximate: a linear *STATIC); 'dynamic',
-    of it in a static step after a *DYNAMIC step under the same load (ccx iterates it)."""
+    of it in a static step after a *DYNAMIC step under the same load (ccx iterates it);
+    'explicit', after an explicit *DYNAMIC and a *FREQUENCY step (the explicit step's NLGEOM
+    carries on: ccx iterates it; Abaqus would not mix them in one deck)."""
     field = "*OUTPUT, FIELD\n*ELEMENT OUTPUT\nS{}\n*NODE OUTPUT\nU\n".format(", SDV" if sdv else "")
     history = "*OUTPUT, HISTORY\n*NODE OUTPUT, NSET={}\nU\n"
     if case == "u1":
@@ -2774,6 +2776,9 @@ def el_file_stops_deck(case, sdv=True):
              + field + history.format("TOP") + "*END STEP\n")
     if case == "dynamic":
         steps = "*STEP\n*DYNAMIC\n1.E-6, 1.E-5\n*CLOAD\nTOP, 3, 25.\n*END STEP\n" + steps
+    if case == "explicit":
+        steps = ("*STEP\n*DYNAMIC, EXPLICIT\n, 1.E-5\n*CLOAD\nTOP, 3, 25.\n*END STEP\n*STEP\n"
+                 "*FREQUENCY\n3\n*END STEP\n" + steps)
     if case in ("carried", "plastic"):
         steps += "*STEP\n*FREQUENCY\n3\n*END STEP\n"
     if case == "carried":
@@ -3080,6 +3085,27 @@ def plastic_contact_deck(case, twin=False):
                       "*NODE PRINT, NSET=TOP\nU\n*END STEP\n"
     return deck + (f"*STEP\n*STEADY STATE DYNAMICS\n1., 5., 3\n*CLOAD\n19, 2, 1.\n{out}*CONTACT OUTPUT\n"
                    "CSTRESS, CDISP\n*CONTACT PRINT\nCSTRESS\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def contact_force_deck(case, cards=True):
+    """plastic_contact_deck's block on the column through a face-to-face pair, the block's total
+    reaction printed in the static step, and (``cards``) *CONTACT PRINT CFN there too, which ccx
+    2.23 segfaulted on in the steps after, whatever the material: "modal", the plastic column,
+    the static step's CFN carried into the *FREQUENCY step, and CFN in the *MODAL DYNAMIC step;
+    "ssd", the elastic one, CFN in the *FREQUENCY step and CFS in the *STEADY STATE DYNAMICS
+    step, then a static step pressing the block by 0.02, which Abaqus carries the static step's
+    cards into."""
+    cp = "*CONTACT PRINT, SLAVE=BLKBOT, MASTER=COLTOP\n{}\n"
+    d = plastic_contact_deck(case, case == "ssd").replace(
+        "*CONTACT PAIR, INTERACTION=INT\n", "*CONTACT PAIR, INTERACTION=INT, TYPE=SURFACE TO SURFACE\n")
+    d = d.replace("CSTRESS\n*END STEP\n*STEP\n*FREQUENCY, STORAGE=YES\n4\n",
+                  "CSTRESS\n*NODE PRINT, NSET=BTOP, TOTALS=YES\nRF\n" + cp.format("CFN") * cards +
+                  "*END STEP\n*STEP\n*FREQUENCY, STORAGE=YES\n4\n" +
+                  cp.format("CFN") * (cards and case == "ssd"))
+    j = d.rindex("*END STEP")
+    d = d[:j] + cp.format("CFN" if case == "modal" else "CFS") * cards + d[j:]
+    return d + ("*STEP\n*STATIC\n*BOUNDARY\nBTOP, 3, 3, -0.02\n*NODE PRINT, NSET=BTOP, TOTALS=YES\n"
+                "RF\n*END STEP\n" if case == "ssd" else "")
 
 
 def modal_amplitude_deck(total, twin=False):
@@ -7636,14 +7662,16 @@ def main():
                                ("riks", "in a Riks step (--approximate: a linear *STATIC)",
                                 "ccx segfaulted"),
                                ("dynamic", "in a static step after a *DYNAMIC step, which ccx "
-                                "iterates", "SDV dropped")):
+                                "iterates", "SDV dropped"),
+                               ("explicit", "in a static step after an explicit *DYNAMIC and a "
+                                "*FREQUENCY step, NLGEOM carried on", "SDV dropped")):
         res = review_run(el_file_stops_deck(case), f"el_file_{case}_sdv", top_and_sdv,
                          approximate=case == "riks")
         if res:
             top, frd_sdv = res
             got = [top.get(n, [0.0, 0.0, math.nan])[2] for n in (5, 6, 7, 8)]
-            ok = max(abs(u * 210000.0 / 100.0 - 1.0) for u in got) < 1e-6 and \
-                (frd_sdv > 0) == (case == "dynamic")
+            ok = max(abs(u * 210000.0 / 100.0 - 1.0) for u in got) < \
+                (1e-3 if case == "explicit" else 1e-6) and (frd_sdv > 0) == (case in ("dynamic", "explicit"))
             print(f"{'PASS' if ok else 'FAIL'}  el_file_{case}_sdv (a cube of an elastic material with "
                   f"*DEPVAR pulled {what}, S and SDV requested): top at "
                   f"{', '.join(f'{u:.7g}' for u in got)} vs 100 / E = {100.0 / 210000.0:.7g}, "
@@ -8086,6 +8114,37 @@ def main():
               f"{'*STATIC, RIKS' if proc == 'Static' else '*COMPLEX FREQUENCY'}): ccx ran step 1 "
               f"({'the top moved ' + format(moved, '.4g') if proc == 'Static' else str(len(freqs)) + ' frequencies'})"
               f" and stopped at step 2, exit code {r.returncode} (before: {before})")
+        failures += 0 if ok else 1
+    # *CONTACT PRINT CF / CFN / CFS in the *FREQUENCY, modal and steady-state dynamics steps
+    # (ccx 2.23 segfaulted, any material: left out there): the static step's CFN against the
+    # block's reaction, the rest as without the cards
+    for case, what in (("modal", "plastic column, CFN in the static step, carried into "
+                                 "*FREQUENCY, and in a *MODAL DYNAMIC step"),
+                       ("ssd", "elastic column, CFN in the static and the *FREQUENCY step, CFS in "
+                               "a *STEADY STATE DYNAMICS step, then pressed by 0.02")):
+        tag = f"contact_forces_{case}"
+        runs = [review_run(contact_force_deck(case, c), tag + ("" if c else "_ref"), lambda dat: (
+            dat_node_blocks(dat), dat_eigen_table(dat, eig), dat_tables(dat, "statistics"),
+            dat_history(dat, "total force", "BTOP"))) for c in (True, False)]
+        n = 1 if case == "modal" else 2     # the static steps' tables (the first and the last
+        # reaction totals: ccx also prints the carried RF of each eigenmode)
+        ok = all(runs) and all(r[0] and len(r[3]) >= n for r in runs) and len(runs[0][2]) == n
+        if ok:
+            err, moved = same([r[0] for r in runs])
+            lam = max((abs(a / b - 1) for a, b in zip(runs[0][1], runs[1][1])), default=math.inf)
+            rfs = runs[0][3][:1] + runs[0][3][-1:] * (n - 1)
+            pairs = [(t[0][2], tot[1][0][2]) for t, tot in zip(runs[0][2], rfs)]
+            cfn, rf = pairs[-1]
+            f_err = max(abs(c / -r - 1) for c, r in pairs)
+            ok = err < 1e-9 * moved and moved > 1e-3 and lam < 1e-9 and f_err < 1e-6 and \
+                len(runs[0][1]) == len(runs[1][1]) == 4
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): total normal contact force "
+                  f"{cfn:.7g} vs the block's reaction {-rf:.7g} at the end ({n} static step(s), "
+                  f"{f_err:.1e} apart), the rest "
+                  f"{err:.1e} apart from the run without the cards (the top moved {moved:.4g}), "
+                  f"frequencies {lam:.0e} apart (before: ccx segfaulted)")
+        elif all(runs):
+            print(f"FAIL  {tag}: {len(runs[0][2])} contact force tables, not {n}")
         failures += 0 if ok else 1
     # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
     # it too): the response to its own loads alone

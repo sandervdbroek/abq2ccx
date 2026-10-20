@@ -6,6 +6,18 @@ physics.
 
 ## Unreleased
 
+* **Contact forces in eigenvalue and modal steps** — ccx 2.23 segfaults on `*CONTACT PRINT`
+  `CF`, `CFN` and `CFS` in `*FREQUENCY` (without PERTURBATION), `*BUCKLE`, `*MODAL DYNAMIC` and
+  `*STEADY STATE DYNAMICS` steps, whatever the material, also when an earlier step's card
+  carries them in. They are left out of those steps now (of every `*FREQUENCY` step), with a
+  warning; an empty card ends a carried one, and the next general step gets the
+  cards Abaqus carries into it again.
+* **Explicit dynamics before a `*FREQUENCY` step** — the converter writes NLGEOM on an explicit
+  step and again on the general steps after a `*FREQUENCY` or `*BUCKLE` step, so ccx iterates
+  them: `*EL PRINT ELKE` and `*EL FILE SDV` are kept there now (they were dropped).
+* **Element energies after a `*DYNAMIC` step** — ccx 2.23 adds the strain energy the model
+  holds when a `*DYNAMIC` step after the first step starts to ELSE and ENER once more, and
+  keeps it in later steps. A note says so where a deck asks for them there.
 * **`WEIGHTING METHOD` on a distributing coupling kept as ccx's card** — ccx 2.23 accepts the
   parameter but ignores it, weighting by tributary area alone (probed). The equation form
   applies `LINEAR`, `QUADRATIC` and `CUBIC`. Where the card stays ccx's, as under NLGEOM without

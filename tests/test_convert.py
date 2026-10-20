@@ -3862,6 +3862,58 @@ def test_contact_print_checked_against_ccx_labels():
     assert "*CONTACT PRINT with FREQUENCY=0 dropped" in rep.text()
 
 
+def test_contact_forces_left_out_where_ccx_segfaults():
+    # ccx 2.23 segfaults on *CONTACT PRINT CF / CFN / CFS in a *FREQUENCY (without PERTURBATION),
+    # *BUCKLE, *MODAL DYNAMIC or *STEADY STATE DYNAMICS step, own or carried in, whatever the
+    # material (probed): a card of the step's own loses them (bare when nothing is left)
+    model = _contact(", type=surface to surface") + STEEL
+    static = "*Step\n*Static\n*Cload\n8, 3, 1.\n{}*End Step\n"
+    freq = "*Step\n*Frequency\n3\n{}*End Step\n"
+    cp = "*Contact Print\n{}\n"
+    for steps, k, proc in (
+            (static.format("") + freq.format(cp.format("CFN, CSTRESS")), 2, "FREQUENCY"),
+            (static.format("") + "*Step\n*Buckle\n2\n*Cload\n8, 3, 1.\n" + cp.format("CFN, CSTRESS") +
+             "*End Step\n", 2, "BUCKLE"),
+            (freq.format("") + "*Step\n*Modal Dynamic\n0.01, 0.1\n*Cload\n8, 1, 1.\n" +
+             cp.format("CFS, CSTRESS") + "*End Step\n", 2, "MODAL DYNAMIC"),
+            (freq.format("") + "*Step\n*Steady State Dynamics\n1., 5., 3\n*Cload\n8, 1, 1.\n" +
+             cp.format("CFT, CSTRESS") + "*End Step\n", 2, "STEADY STATE DYNAMICS")):
+        body, _, rep = convert_str(model + steps)
+        assert re.search(r"\*CONTACT PRINT[^\n]*\nCSTR\n", _step(body, k)) and \
+            "SLAVE=" not in body, steps
+        assert f"dropped from step {k}: ccx 2.23 segfaults computing contact forces in a *{proc} " \
+               f"step" in rep.text(), steps
+    body, _, rep = convert_str(model + static.format("") + freq.format(cp.format("CFN")))
+    assert _step(body, 2).count("*CONTACT PRINT") == 1 and \
+        re.search(r"\*CONTACT PRINT\n(\*|$)", _step(body, 2))
+    # carried in from a general step, whose print requests Abaqus does not carry into a linear
+    # perturbation step: an empty card ends them; from a perturbation step, its other variables
+    # are written again
+    body, _, rep = convert_str(model + static.format(cp.format("CFN, CSTRESS")) + freq.format(""))
+    assert "*CONTACT PRINT, SLAVE=A, MASTER=B\nCFN\n" in _step(body, 1)
+    assert _step(body, 2).count("*CONTACT PRINT") == 1 and \
+        re.search(r"\*CONTACT PRINT\n(\*|$)", _step(body, 2))
+    assert "Empty *CONTACT PRINT added to step 2: ccx would carry step 1's CFN into it" in rep.text()
+    # the next general step gets the cards Abaqus carries into it again
+    body, _, rep = convert_str(model + static.format(cp.format("CFN, CSTRESS")) +
+                               freq.format(cp.format("CFN")) + static.format("") + static.format(""))
+    assert _step(body, 3).endswith("*CONTACT PRINT\nCSTR\n*CONTACT PRINT, SLAVE=A, MASTER=B\nCFN\n")
+    assert "*CONTACT PRINT" not in _step(body, 4)
+    assert "Step 1's *CONTACT PRINT cards written again in step 3: Abaqus carries them into it, " \
+           "ccx would not after step 2's." in rep.text()
+    body, _, rep = convert_str(model + static.format("").replace("*Step", "*Step, perturbation") +
+                               static.format(cp.format("CFN, CSTRESS")).replace(
+                                   "*Step", "*Step, perturbation") + freq.format(""))
+    assert "*CONTACT PRINT\nCSTR\n" in _step(body, 3) and "SLAVE=" not in _step(body, 3)
+    assert "Step 2's *CONTACT PRINT written again in step 3 without CFN" in rep.text()
+    # general steps print them, own or carried
+    body, _, rep = convert_str(model + static.format(cp.format("CFN")) + static.format("") +
+                               "*Step\n*Dynamic\n0.01, 0.1\n" + cp.format("CFS") + "*End Step\n")
+    assert "SLAVE=A" in _step(body, 1) and "*CONTACT PRINT" not in _step(body, 2)
+    assert "*CONTACT PRINT, SLAVE=A, MASTER=B, FREQUENCY=10\nCFS\n" in _step(body, 3)
+    assert "contact forces" not in rep.text()
+
+
 def test_contact_output_requests_ccx_cannot_write():
     # ccx writes contact output only for *CONTACT PAIR contact (a model without one gets an
     # empty block), and 2.23 aborts on it in a model with axisymmetric elements once the .frd
@@ -4420,6 +4472,7 @@ def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
     freq = "*Step\n*Frequency\n3\n{}*End Step\n"
     ssd = "*Step\n*Steady State Dynamics\n100., 2000., 3\n" + load + "{}*End Step\n"
     dyn = "*Step\n*Dynamic\n1.e-5, 1.e-4\n*End Step\n"
+    expl = "*Step\n*Dynamic, explicit\n, 1.e-5\n*End Step\n"     # NLGEOM added (also after it)
     for steps, k, why in (
             (static.format("", out), 1, "from a linear *STATIC step (no NLGEOM, no plastic, "
                                         "creeping, hyperelastic or user material, no dynamic, heat "
@@ -4429,6 +4482,8 @@ def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
                                         "runs."),
             ("*Step\n*Visco\n0.1, 1.\n" + load + out + "*End Step\n", 1, "from a linear *VISCO step"),
             (dyn + freq.format("") + static.format("", out), 3, "from a linear *STATIC step"),
+            (expl.replace("*Step", "*Step, nlgeom=NO") + freq.format("") + static.format("", out), 3,
+             "from a linear *STATIC step"),
             (freq.format(out), 1, "from a *FREQUENCY step: ccx 2.23 writes no state variables "
                                   "there (it skips SDV requested in the step"),
             (freq.format("") + ssd.format(out), 2, "from a *STEADY STATE DYNAMICS step: ccx 2.23 "
@@ -4454,6 +4509,7 @@ def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
                          (depvar, static.format(", nlgeom", "") + freq.format("") + static.format("", out)),
                          (depvar, dyn + static.format("", out)),
                          (depvar, dyn + freq.format("") + dyn + static.format("", out)),
+                         (depvar, expl + freq.format("") + static.format("", out)),
                          (depvar, "*Step\n*Static, riks\n0.1, 1., , , 1.\n" + load + "*End Step\n"
                           + dyn + static.format("", out)),
                          (plastic, static.format("", out)), (hyper, static.format("", out)),
@@ -4510,6 +4566,8 @@ def test_elke_kept_off_el_print_where_ccx_segfaults():
                          (STEEL, "*Step\n*Frequency\n3\n*End Step\n" + dyn.format("") + elke),
                          (STEEL, static.format(", nlgeom", "") + buckle.format("") + elke),
                          (STEEL, "*Step\n*Dynamic, explicit\n, 1.e-5\n*End Step\n" + elke),
+                         (STEEL, "*Step\n*Dynamic, explicit\n, 1.e-5\n*End Step\n*Step\n*Frequency\n"
+                          "3\n*End Step\n" + elke),
                          (STEEL, dyn.format(pr.format("ELKE"))),
                          (STEEL, "*Step\n*Frequency\n3\n" + pr.format("ELKE") + "*End Step\n")):
         body, _, rep = convert_str(HEX + model + steps)
@@ -4556,6 +4614,28 @@ def test_elke_kept_off_el_print_where_ccx_segfaults():
         body, _, rep = convert_str(HEX + STEEL + steps)
         assert _step(body, 3).count("*EL PRINT") == int("ELKE" in steps.split("*Frequency")[1]), steps
         assert "ccx deactivates ELKE" not in rep.text(), steps
+
+
+def test_dynamic_step_energy_offset_noted():
+    # ccx 2.23 adds the strain energy the model holds at the start of each *DYNAMIC step after
+    # the first step to the element energies once more (probed): a note on the deck's first
+    # ELSE / ENER request from there on, own or carried in by ccx
+    load, pr = "*Cload\n8, 3, 1.\n", "*El Print, elset=EALL\n{}\n"
+    static = "*Step\n*Static\n" + load + "{}*End Step\n"
+    dyn = "*Step\n*Dynamic\n0.01, 0.1\n{}*End Step\n"
+    note = "ccx 2.23 adds the strain energy the model holds at the start of each *DYNAMIC step"
+    for steps, what in ((static.format(pr.format("ELSE")) + dyn.format(""), "*EL PRINT ELSE in step 2"),
+                        (static.format("") + dyn.format("*Output, field\n*Element Output\nENER\n"),
+                         "*EL FILE ENER in step 2"),
+                        (dyn.format("") + dyn.format("") + static.format(pr.format("ENER")),
+                         "*EL PRINT ENER in step 3")):
+        _, _, rep = convert_str(HEX + STEEL + steps)
+        assert f"{what}: {note} after the first step (step 2 on)" in rep.text(), steps
+    for steps in (static.format(pr.format("ELSE")) + static.format(""),
+                  dyn.format(pr.format("ELSE")) + static.format(""),
+                  static.format("") + dyn.format(pr.format("S"))):
+        _, _, rep = convert_str(HEX + STEEL + steps)
+        assert note not in rep.text(), steps
 
 
 def test_courant_length_matches_ccx_223():
