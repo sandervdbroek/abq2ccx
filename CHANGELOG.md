@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **Rotated instances** — a part's `*EQUATION`, kinematic couplings of some DOFs and SPRING1 /
+  SPRING2 kept the part's DOF numbers in a turned `*INSTANCE`, so they acted along the wrong
+  directions. Abaqus turns them with the instance. Each equation term now becomes terms on the
+  global DOFs. A coupling or spring takes the global DOFs its turned axes lie along, or else the
+  instance's axes as `ORIENTATION=`.
+* **Section options in parts** — `*TRANSVERSE SHEAR STIFFNESS`, `*SECTION POINTS`, `*HOURGLASS
+  STIFFNESS` and a part section's other options went out once, apart from their section. They
+  were judged without it, e.g. reduced physics after a beam written as U1, where a flat deck
+  gets a note. They now go with each instance's copy of the section.
 * **Static perturbation and `*BUCKLE` leftovers** — a static perturbation step's traction or
   other load written as nodal forces, on what a base-state load on an amplitude loads, was
   dropped (warned); it is now added to the base forces at the amplitude's end value, without

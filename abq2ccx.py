@@ -26502,9 +26502,10 @@ def _emit_part_global_data(parts) -> List[Block]:
     per instance) and not the per-instance section cards."""
     out: List[Block] = []
     for pblocks in parts.values():
+        options = _section_option_ids(pblocks)          # (written with their section)
         for b in pblocks:
             if b.keyword in GEOM_KW or b.keyword in PART_PER_INSTANCE or \
-                    b.keyword in PART_CONSTRAINT_KW:
+                    b.keyword in PART_CONSTRAINT_KW or id(b) in options:
                 continue
             out.append(b)
     return out
@@ -26616,6 +26617,242 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
     else:
         data = list(b.data)
     return Block(kw, p, data)
+
+
+# Section sub-options: cards that belong to the section card they follow, so a part's go out
+# with each instance's copy of that section (emitted once, among the global data, they would
+# follow no section: e.g. a *TRANSVERSE SHEAR STIFFNESS after a beam written as U1).
+SECTION_OPTION_KW = {"CENTROID", "SHEAR CENTER", "TRANSVERSE SHEAR STIFFNESS", "SECTION POINTS",
+                     "HOURGLASS STIFFNESS", "REBAR LAYER", "BEAM ADDED INERTIA",
+                     "BEAM FLUID INERTIA", "BEAM SECTION OFFSET"}
+INSTANCE_SECTION_KW = ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
+                       "BEAM GENERAL SECTION", "MEMBRANE SECTION", "COHESIVE SECTION",
+                       "GASKET SECTION", "SURFACE SECTION")
+# the name (before the instance prefix) of the *ORIENTATION of a rotated instance's axes
+AXES_ORIENTATION = "ABQ2CCX_AXES"
+
+
+def _section_option_ids(blocks: Sequence[Block]) -> set:
+    """The ids of the section sub-options in ``blocks``: SECTION_OPTION_KW cards right after
+    a section card or another such option."""
+    out: set = set()
+    chain = False
+    for b in blocks:
+        if b.keyword in SECTION_OPTION_KW:
+            if chain:
+                out.add(id(b))
+        else:
+            chain = b.keyword in INSTANCE_SECTION_KW
+    return out
+
+
+def _instance_axes(rotv) -> Tuple[Vec, Vec, Vec]:
+    """R e_1, R e_2, R e_3 for an instance's rotation ``rotv``, with components within 1e-12
+    of 0 or +-1 (rounding noise of cos 90 deg) made exact."""
+    def snap(x: float) -> float:
+        r = float(round(x))
+        return r if abs(x - r) < 1e-12 else x
+    return tuple(tuple(snap(c) for c in rotv(e))
+                 for e in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
+
+
+def _turned_dof(axes: Tuple[Vec, Vec, Vec], d: int) -> Optional[Tuple[int, float]]:
+    """(global DOF, sense) along which part DOF ``d`` of an instance with axes ``axes`` acts:
+    ``d`` itself above 6, None where the turned axis lies along no global one."""
+    if not 1 <= d <= 6:
+        return d, 1.0
+    v = axes[(d - 1) % 3]
+    k = max(range(3), key=lambda i: abs(v[i]))
+    return (k + 1 + (3 if d > 3 else 0), v[k]) if abs(v[k]) == 1.0 else None
+
+
+def _turn_equation(b: Block, axes: Tuple[Vec, Vec, Vec],
+                   local: Callable[[str], Optional[bool]]) -> Tuple[Block, Optional[str]]:
+    """Part-level *EQUATION ``b`` of an instance with axes ``axes`` (R e_j) in global DOFs: a
+    term (n, j, c) on DOFs 1-6 becomes the terms (n, k, c R_kj) (zero ones dropped, equal ones
+    summed), the largest of the first term's first, except on a node whose DOFs are in the
+    axes of a part-level *TRANSFORM (``local``), which turned with the instance.  (``b``,
+    None) where no term changes; (``b``, why) where the card cannot be turned."""
+    eqs = Converter._equation_terms(b)
+    data: List[str] = []
+    changed = False
+    for eq in eqs:
+        terms: "OrderedDict[tuple, list]" = OrderedDict()      # key -> [member, DOF, value, text]
+        lead: List[tuple] = []                                  # the first term's keys
+        for i, (tok, dof, coef) in enumerate(eq):
+            try:
+                d = pint(dof)
+            except ValueError:
+                d = 0
+            try:
+                c: Optional[float] = pf(coef)
+            except ValueError:
+                c = None
+            loc = local(tok) if 1 <= d <= 6 else True
+            if loc is None:
+                return b, f"node set {tok} has nodes with and without a part-level *TRANSFORM"
+            if loc:
+                parts = [(dof, c, coef)]
+            elif c is None:
+                return b, f"coefficient {coef} does not read as a number"
+            else:
+                v = axes[(d - 1) % 3]
+                parts = [(str(k + 1 + (3 if d > 3 else 0)), c * v[k],
+                          coef if v[k] == 1.0 else (coef[1:] if coef.startswith("-") else
+                                                    "-" + coef.lstrip("+")) if v[k] == -1.0 else None)
+                         for k in range(3) if v[k] != 0.0]
+                changed = changed or [(dd, text) for dd, _, text in parts] != [(dof, coef)]
+            for dd, val, text in parts:
+                key = (tok.upper(), dd) if val is not None else (i, dd)
+                if key in terms:
+                    terms[key][2] += val
+                    terms[key][3] = None
+                else:
+                    terms[key] = [tok, dd, val, text]
+                if i == 0:
+                    lead.append(key)
+        top = max([abs(t[2]) for t in terms.values() if t[2] is not None] or [0.0])
+        first = max(lead, key=lambda k: abs(terms[k][2] or 0.0))
+        rows = [terms[first]] + [t for k, t in terms.items() if k != first]
+        rows = [t for t in rows if t[2] is None or abs(t[2]) > 1e-12 * top]
+        data += equation_rows([(t[0], t[1], t[3] if t[3] is not None else short_real(t[2], 12))
+                               for t in rows])
+    if not changed:
+        return b, None
+    return Block(b.keyword, OrderedDict(b.params), data), None
+
+
+def _turn_dof_lines(b: Block, axes: Tuple[Vec, Vec, Vec], lead: int) -> Optional[Block]:
+    """Coupling card ``b`` of an instance with axes ``axes`` with its DOF ranges in global DOFs
+    (*KINEMATIC COUPLING lines 'member, first DOF, last DOF': ``lead`` 1; *KINEMATIC lines
+    'first DOF, last DOF': ``lead`` 0): unchanged where the rotation maps the coupled
+    translations and rotations onto themselves (none or all of each), else along the turned
+    axes.  ``b`` itself where no range changes or a DOF field does not read (the card's
+    handler reports that), None where a turned axis lies along no global one."""
+    data: List[str] = []
+    changed = False
+    for r in merged_data_records(b):
+        f = [x for x in r if x != ""]
+        if not f:
+            continue
+        try:
+            if lead:
+                d1 = pint(f[1]) if len(f) > 1 else 1
+                d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
+            else:
+                d1 = pint(f[0])
+                d2 = pint(f[1]) if len(f) > 1 else d1
+        except ValueError:
+            return b
+        dofs = set(range(min(d1, d2), max(d1, d2) + 1))
+        if all(len(dofs & g) in (0, 3) for g in ({1, 2, 3}, {4, 5, 6})):
+            new = dofs
+        else:
+            img = [_turned_dof(axes, d) for d in dofs]
+            if None in img:
+                return None
+            new = {k for k, _ in img}
+        changed = changed or new != dofs
+        data += [", ".join(f[:lead] + [str(lo), str(hi)]) for lo, hi in dof_runs(sorted(new))]
+    return Block(b.keyword, OrderedDict(b.params), data) if changed else b
+
+
+def _turn_spring_dofs(b: Block, axes: Tuple[Vec, Vec, Vec]) -> Optional[Block]:
+    """*SPRING ``b`` of SPRING1 / SPRING2 elements of an instance with axes ``axes``, with the
+    DOFs of its first data line in global DOFs: ``b`` itself where none changes or one does
+    not read, None where a turned axis lies along no global one or the senses differ (a
+    linear spring's force only changes sign with all its DOFs; a nonlinear one's curve not)."""
+    toks = [x for x in trimmed_fields(b.data[0].split(",")) if x] if b.data else []
+    try:
+        ds = [pint(x) for x in toks]
+    except ValueError:
+        return b
+    img = [_turned_dof(axes, d) for d in ds]
+    if not ds or None in img:
+        return None if ds else b
+    if len({s for _, s in img}) > 1 or (b.has("NONLINEAR") and img[0][1] < 0):
+        return None
+    if [k for k, _ in img] == ds:
+        return b
+    return Block(b.keyword, OrderedDict(b.params),
+                 [", ".join(str(k) for k, _ in img)] + list(b.data[1:]))
+
+
+def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec],
+                        report: Report, name: str) -> Tuple[Dict[int, Block], bool]:
+    """The part cards of rotated instance ``name`` whose DOF numbers mean the part's axes,
+    in global DOFs (Abaqus, 'Assembly definition': 'Equations will also be translated and
+    rotated according to the positioning data for an instance'; constraints too): {id(card):
+    its turned copy}, and whether one names the instance's axes, ORIENTATION=AXES_ORIENTATION
+    (a coupling of some DOFs or a SPRING1 / SPRING2 whose turned axes lie along no global
+    one: ccx couples / springs those DOFs in the orientation's axes, as Abaqus does; probed
+    for the springs)."""
+    local: set = set()                 # nodes whose DOFs are in a part *TRANSFORM's axes
+    for b in blocks:
+        if b.keyword == "TRANSFORM":
+            local.update(geo.nset((b.param("NSET") or "").strip()))
+
+    def is_local(tok: str) -> Optional[bool]:
+        nodes = [pint(tok)] if re.fullmatch(r"[-+]?\d+", tok) else geo.nset(tok)
+        hits = {n in local for n in nodes}
+        return None if len(hits) > 1 else hits == {True}
+
+    def oriented(b: Block) -> Block:
+        p = OrderedDict(b.params)
+        p["ORIENTATION"] = AXES_ORIENTATION
+        return Block(b.keyword, p, list(b.data))
+
+    out: Dict[int, Block] = {}
+    what: List[str] = []
+    for i, b in enumerate(blocks):
+        kw, nxt = b.keyword, blocks[i + 1] if i + 1 < len(blocks) else None
+        if kw == "EQUATION":
+            nb, why = _turn_equation(b, axes, is_local)
+            if why:
+                report.warn(f"*INSTANCE {name} is rotated, but a part-level *EQUATION could not be "
+                            f"turned with it ({why}): it acts on the part's DOF numbers in the "
+                            f"global axes.", once=True)
+                report.reduce(f"part-level *EQUATION of rotated *INSTANCE {name} not turned")
+            elif nb is not b:
+                out[id(b)] = nb
+                what.append("*EQUATION terms")
+        elif kw == "KINEMATIC COUPLING" and not b.param("ORIENTATION"):
+            nb = _turn_dof_lines(b, axes, 1)
+            if nb is not b:
+                out[id(b)] = nb or oriented(b)
+                what.append("couplings of some DOFs")
+        elif kw == "COUPLING" and not b.param("ORIENTATION") and nxt is not None and \
+                nxt.keyword == "KINEMATIC":
+            nk = _turn_dof_lines(nxt, axes, 0)
+            if nk is None:
+                out[id(b)] = oriented(b)
+            elif nk is not nxt:
+                out[id(nxt)] = nk
+            if nk is not nxt:
+                what.append("couplings of some DOFs")
+        elif kw == "SPRING" and not b.param("ORIENTATION") and any(
+                (geo.elements.get(e) or ("",))[0].upper() in ("SPRING1", "SPRING2")
+                for e in geo.elset((b.param("ELSET") or "").strip())):
+            nb = _turn_spring_dofs(b, axes)
+            if nb is None and b.data and any(pint(x) > 3 for x in
+                                             trimmed_fields(b.data[0].split(",")) if x):
+                report.warn(f"*INSTANCE {name} is rotated, but the rotational DOFs of its "
+                            f"SPRING1 / SPRING2 elements (*SPRING, ELSET={b.param('ELSET')}) "
+                            f"have no global form: they act about the global axes.", once=True)
+                report.reduce(f"rotational springs of rotated *INSTANCE {name} not turned")
+            elif nb is not b:
+                out[id(b)] = nb or oriented(b)
+                what.append("SPRING1 / SPRING2 elements")
+    if what:
+        kinds = [k for k in ("*EQUATION terms", "couplings of some DOFs", "SPRING1 / SPRING2 elements")
+                 if k in what]
+        report.note(f"*INSTANCE {name} is rotated: the DOFs of its part's "
+                    f"{', '.join(kinds[:-1]) + ' and ' if len(kinds) > 1 else ''}{kinds[-1]} are "
+                    f"turned with it, as in Abaqus — an equation term (node, DOF j, c) becomes the "
+                    f"terms (node, k, c R_kj); a coupling's or spring's DOFs become the global ones "
+                    f"the turned axes lie along, else the instance's axes are its ORIENTATION= "
+                    f"(validate_with_ccx.py rotated_instance_dofs).", once=True)
+    return out, any(nb.param("ORIENTATION") == AXES_ORIENTATION for nb in out.values())
 
 
 def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple[Vec, Vec, float]]]:
@@ -26737,8 +26974,21 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         if ref in dists:
             rect = (b.param("SYSTEM") or "RECTANGULAR").upper().startswith("RECT")
             dist_move[ref] = (rotv if rot else None) if rect else (rotp if rot or any(T) else None)
+    # (a part's and an instance's own cards are apart: neither's option follows the other's section)
+    sub_options = _section_option_ids(parts.get(inst["part"], [])) | _section_option_ids(inst["extra"])
+    turned: Dict[int, Block] = {}
+    if rot:
+        axes = _instance_axes(rotv)
+        turned, oriented = _turn_instance_dofs(inst_blocks, geo, axes, report, prefix)
+        if oriented:
+            out.append(mkblock("ORIENTATION", [("NAME", namer(prefix, AXES_ORIENTATION)),
+                                               ("SYSTEM", "RECTANGULAR")],
+                               [", ".join(_fmt_unit(x) for x in (*axes[0], *axes[1]))]))
     for b in inst_blocks:
-        if b.keyword in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
+        b = turned.get(id(b), b)
+        if id(b) in sub_options:
+            out.append(Block(b.keyword, OrderedDict(b.params), list(b.data)))
+        elif b.keyword in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
                          "BEAM GENERAL SECTION", "MEMBRANE SECTION", "COHESIVE SECTION",
                          "GASKET SECTION", "SURFACE SECTION", "SPRING",
                          "DASHPOT", "MASS", "ROTARY INERTIA", "GAP"):
@@ -26826,8 +27076,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                 renamed[b.param("NAME").strip().upper()] = out[-1].param("NAME")
         elif b.keyword in PART_CONSTRAINT_KW:
             out.append(_remap_part_constraint(b, prefix, namer, node_off, elem_off, rotv, rotp))
-    for kw in dedup([b.keyword for b in inst["extra"]
-                     if b.keyword not in GEOM_KW | PART_PER_INSTANCE | PART_CONSTRAINT_KW]):
+    for kw in dedup([b.keyword for b in inst["extra"] if id(b) not in sub_options and
+                     b.keyword not in GEOM_KW | PART_PER_INSTANCE | PART_CONSTRAINT_KW]):
         report.warn(f"*{kw} inside an *INSTANCE left out: only an instance's mesh, sets, surfaces, "
                     f"sections, orientations, distributions and constraints are written per "
                     f"instance — verify.", once=True)

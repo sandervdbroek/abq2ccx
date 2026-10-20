@@ -3426,6 +3426,104 @@ def test_part_level_distributing_coupling_and_pretension_per_instance():
     assert conv.reduced_physics == ["*HOURGLASS STIFFNESS inside an *INSTANCE left out"]
 
 
+ROT_PART = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+            "6, 2., 1., 0.\n7, 0., 0., 1.\n8, 1., 0., 1.\n9, 2., 0., 1.\n10, 0., 1., 1.\n11, 1., 1., 1.\n"
+            "12, 2., 1., 1.\n100, 2.5, 0.5, 0.5\n*Element, type=C3D8, elset=EALL\n"
+            "1, 1, 2, 5, 4, 7, 8, 11, 10\n2, 2, 3, 6, 5, 8, 9, 12, 11\n*Nset, nset=TIP\n3, 6, 9, 12\n"
+            "*Solid Section, elset=EALL, material=M\n*Element, type=SPRING1, elset=SPR\n50, 12\n"
+            "*Spring, elset=SPR\n2\n1000.\n*Element, type=SPRING2, elset=SP2\n51, 1, 12\n"
+            "*Spring, elset=SP2{nl}\n{sp2}\n1000.\n*Nset, nset=TR\n2\n*Transform, nset=TR\n0., 1., 0., -1., 0., 0.\n"
+            "*Equation\n3\n5, 2, 1., 11, 1, 1., 11, 2, -1.\n2\n2, 1, 1., 4, 3, -1.\n{coupling}")
+ROT_TAIL = "*Material, name=M\n*Elastic\n1000., 0.3\n"
+
+
+def test_rotated_instance_turns_part_dofs():
+    # Abaqus turns a part's equations and constraints with the instance ('Equations will also
+    # be translated and rotated according to the positioning data'); they kept the part's DOF
+    # numbers (validate_with_ccx.py rotated_instance_dofs)
+    part = ROT_PART.format(nl="", sp2="1, 3", coupling="*Kinematic Coupling, ref node=100\nTIP, 1, 2\n")
+    body, conv, rep = convert_str(_instanced(part, "0., 0., 0., 1., 0., 0., 90.", tail=ROT_TAIL))
+    # 90 degrees about x: part y is global z, part z global -y
+    assert "*SPRING, ELSET=I_SPR\n3\n1000.\n" in body
+    assert "*EQUATION\n3\n5, 3, 1., 11, 1, 1., 11, 3, -1.\n2\n2, 1, 1., 4, 2, 1.\n" in body
+    assert "*KINEMATIC\n1, 1\n" in body and "*KINEMATIC\n3, 3\n" in body
+    # the SPRING2's DOFs 1 (along x) and 3 (along -y) turn with opposite senses: in the axes
+    assert "*ORIENTATION, NAME=I_ABQ2CCX_AXES, SYSTEM=RECTANGULAR\n1., 0., 0., 0., 0., 1.\n" in body
+    assert "*SPRING, ELSET=I_SP2, ORIENTATION=I_ABQ2CCX_AXES\n1, 3\n" in body
+    assert "SPRING1 / SPRING2 elements are turned with it" in rep.text() and conv.reduced_physics == []
+    # a general rotation (30 degrees about z): an equation term (n, j, c) is the terms
+    # (n, k, c R_kj), the largest of the first one's first; node 2's term is in the axes of its
+    # *TRANSFORM, which turns with the instance; the coupling and springs take the axes
+    part = ROT_PART.format(nl="", sp2="2, 2", coupling="*Surface, type=node, name=ST\nTIP\n*Coupling, "
+                           "constraint name=C, ref node=100, surface=ST\n*Kinematic\n2, 2\n")
+    body, conv, rep = convert_str(_instanced(part, "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
+    assert ("*EQUATION\n4\n5, 2, 0.866025403784, 5, 1, -0.5, 11, 1, 1.36602540378, "
+            "11, 2, -0.366025403784\n2\n2, 1, 1., 4, 3, -1.\n") in body
+    assert "*ORIENTATION, NAME=I_ABQ2CCX_AXES, SYSTEM=RECTANGULAR\n0.866025403784439, 0.5, 0., " \
+           "-0.5, 0.866025403784439, 0.\n" in body
+    assert "*SPRING, ELSET=I_SPR, ORIENTATION=I_ABQ2CCX_AXES\n2\n" in body
+    assert "*COUPLING, CONSTRAINT NAME=I_C, REF NODE=100, SURFACE=I_ST, ORIENTATION=I_ABQ2CCX_AXES\n" \
+           "*KINEMATIC\n2, 2\n" in body
+    assert conv.reduced_physics == []
+    # an unturned instance keeps the cards as they are, and blank rotation fields read as 0
+    body, _, rep = convert_str(_instanced(part, "0., 0., 0., 0., 0., 1., 0.", tail=ROT_TAIL))
+    assert "*EQUATION\n3\n5, 2, 1., 11, 1, 1., 11, 2, -1.\n" in body and "ABQ2CCX_AXES" not in body
+    _as_with_zeros(lambda r: _instanced(part, r, tail=ROT_TAIL), "0., 0., 0., , , 1., 30.",
+                   "0., 0., 0., 0., 0., 1., 30.")
+
+
+def test_rotated_instance_dofs_without_a_global_form():
+    # a nonlinear SPRING2 along -y (its curve would flip): in the instance's axes; a rotational
+    # spring along a turned axis: warned (ccx's oriented springs are probed for translations);
+    # a set term on nodes with and without a *TRANSFORM: warned, the equation left as it is
+    part = ROT_PART.format(nl=", nonlinear", sp2="3, 3", coupling="") \
+        .replace("1000.\n*Nset, nset=TR", "-1., -0.1\n1., 0.1\n*Nset, nset=TR")
+    body, conv, _ = convert_str(_instanced(part, "0., 0., 0., 1., 0., 0., 90.", tail=ROT_TAIL))
+    assert "*SPRING, ELSET=I_SP2, NONLINEAR, ORIENTATION=I_ABQ2CCX_AXES\n3, 3\n" in body
+    assert conv.reduced_physics == []
+    part = ROT_PART.format(nl="", sp2="5, 5", coupling="").replace(
+        "2\n2, 1, 1., 4, 3, -1.\n", "2\nMIX, 1, 1., 4, 3, -1.\n*Nset, nset=MIX\n2, 3\n")
+    body, conv, rep = convert_str(_instanced(part, "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
+    assert "*SPRING, ELSET=I_SP2\n5, 5\n" in body
+    assert "the rotational DOFs of its SPRING1 / SPRING2 elements (*SPRING, ELSET=SP2) have no " \
+           "global form" in rep.text()
+    assert "node set MIX has nodes with and without a part-level *TRANSFORM" in rep.text()
+    assert "\n5, 2, 1., 11, 1, 1., 11, 2, -1.\n" in body
+    assert conv.reduced_physics == ["rotational springs of rotated *INSTANCE I not turned",
+                                    "part-level *EQUATION of rotated *INSTANCE I not turned"]
+
+
+def test_part_section_options_follow_their_section():
+    # a section's sub-options went out once, among the global data, after no section: a
+    # *TRANSVERSE SHEAR STIFFNESS of a beam written as U1 was then "no CalculiX equivalent"
+    # and reduced physics, while the same deck written flat gets a note
+    mesh = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n"
+            "*Beam General Section, elset=B, section=GENERAL\n1., 0.1, 0., 0.1, 0.05\n0., 1., 0.\n"
+            "2000., 800.\n*Transverse Shear Stiffness\n100., 200.\n")
+    step = "*Step\n*Static\n*Cload\n{}2, 2, 1.\n*End Step\n"
+    _, flat, _ = convert_str(mesh + "*Boundary\n1, 1, 6\n" + step.format(""), approximate=True)
+    deck = ("*Part, name=P\n" + mesh + "*End Part\n*Assembly, name=A\n*Instance, name=I1, part=P\n"
+            "*End Instance\n*Instance, name=I2, part=P\n0., 0., 5.\n*End Instance\n*End Assembly\n"
+            "*Boundary\nI1.1, 1, 6\nI2.1, 1, 6\n" + step.format("I1."))
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert conv.reduced_physics == flat.reduced_physics
+    assert "has no CalculiX equivalent" not in rep.text()
+    lines = body.splitlines()
+    for name in ("I1_B", "I2_B"):
+        at = next(i for i, ln in enumerate(lines) if ln.startswith(f"*BEAM SECTION, ELSET={name}, "))
+        assert next(ln for ln in lines[at + 1:] if ln.startswith("*")).startswith(
+            "** abq2ccx: *TRANSVERSE SHEAR STIFFNESS after a beam section written as U1")
+    # an independent instance's own section takes its own (it was left out)
+    deck = ("*Part, name=Q\n*End Part\n*Assembly, name=A\n*Instance, name=J, part=Q\n" + HEX +
+            "*Solid Section, elset=EALL, material=M\n*Hourglass Stiffness\n1.\n*End Instance\n"
+            "*End Assembly\n*Material, name=M\n*Elastic\n1000., 0.3\n")
+    body, conv, rep = convert_str(deck)
+    assert "*HOURGLASS STIFFNESS inside an *INSTANCE left out" not in rep.text()
+    lines = body.splitlines()
+    at = lines.index("*SOLID SECTION, ELSET=J_EALL, MATERIAL=M")
+    assert "*HOURGLASS STIFFNESS" in next(ln for ln in lines[at + 1:] if ln.startswith("*"))
+
+
 def test_pretension_node_and_element_sets_resolved():
     # Abaqus takes NODE= as a node number or a set of exactly that node, ELEMENT= (a truss or
     # beam cut) likewise; ccx 2.23 stops on a set name there ('*ERROR reading *PRE-TENSION

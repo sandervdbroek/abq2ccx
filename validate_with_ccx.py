@@ -3449,6 +3449,58 @@ def coupled_made_mass_deck(kind, twin=False):
     return "\n".join(lines) + "\n"
 
 
+ROTATED_INSTANCES = {"I0": None, "I1": ((0., 3., 0.), (1., 3., 0.), 90.),
+                     "I2": ((0., 0., 6.), (1., 2., 9.), 40.)}
+
+
+def rotated_instance_dofs_deck():
+    """A part, a C3D8 bar 3 x 1 x 1 held at x = 0, with DOF-numbered data in its own axes: an
+    *EQUATION u3(10) - 0.5 u2(11) + 0.3 u1(12) = 0 (node 11 with a *TRANSFORM, so its term is
+    in the local axes), a legacy *KINEMATIC COUPLING of DOFs 2-3 of face x = 1 to node 101, a
+    *COUPLING, *KINEMATIC of DOF 2 of face x = 3 to node 100, a SPRING1 on DOF 2 of node 9 and
+    a SPRING2 between DOF 1 of node 10 and DOF 3 of node 12.  Instanced three times
+    (ROTATED_INSTANCES: point a, point b, angle): I0 as it is, I1 turned 90 degrees about x
+    (each part axis along a global one) and I2 40 degrees about (1, 2, 3).  The reference
+    nodes' six DOFs are prescribed and two nodes loaded, in each instance turned with it: R u0,
+    R theta0, R F0 in global components, so every instance's displacements are R u(I0).
+    Returns the deck and {instance: R}."""
+    rots = {}
+    for name, rot in ROTATED_INSTANCES.items():
+        rots[name] = (lambda v: tuple(v)) if rot is None else (
+            lambda v, e=_unit([y - x for x, y in zip(rot[0], rot[1])]), p=math.radians(rot[2]):
+            _rotate(v, e, p))
+    nodes = [f"{4 * i + c + 1}, {i}., {y}., {z}." for i in range(4)
+             for c, (y, z) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1)))]
+    part = ("*PART, NAME=P\n*NODE\n" + "\n".join(nodes) + "\n100, 3.5, 0.5, 0.5\n101, 1., 0.5, 1.5\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=EALL\n" +
+            "".join(f"{i + 1}, " + ", ".join(str(4 * i + k) for k in range(1, 9)) + "\n" for i in range(3)) +
+            "*ELEMENT, TYPE=SPRING1, ELSET=S1\n20, 9\n*ELEMENT, TYPE=SPRING2, ELSET=S2\n21, 10, 12\n"
+            "*NSET, NSET=BASE\n1, 2, 3, 4\n*NSET, NSET=MID\n5, 6, 7, 8\n*NSET, NSET=TIP\n13, 14, 15, 16\n"
+            "*NSET, NSET=TR\n11\n*NSET, NSET=BODY, GENERATE\n1, 16, 1\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*SPRING, ELSET=S1\n2\n50.\n*SPRING, ELSET=S2\n1, 3\n80.\n"
+            "*TRANSFORM, NSET=TR\n0.6, 0.8, 0., -0.8, 0.6, 0.\n*EQUATION\n3\n10, 3, 1., 11, 2, -0.5, 12, 1, 0.3\n"
+            "*KINEMATIC COUPLING, REF NODE=101\nMID, 2, 3\n*SURFACE, TYPE=NODE, NAME=STIP\nTIP\n"
+            "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=STIP\n*KINEMATIC\n2, 2\n*END PART\n")
+    asm = "*ASSEMBLY, NAME=A\n"
+    for name, rot in ROTATED_INSTANCES.items():
+        asm += f"*INSTANCE, NAME={name}, PART=P\n"
+        if rot is not None:
+            asm += (", ".join(f"{x:g}" for x in rot[0]) + "\n" +
+                    ", ".join(f"{x:g}" for x in (*rot[0], *rot[1], rot[2])) + "\n")
+        asm += "*END INSTANCE\n"
+    asm += "*END ASSEMBLY\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+    prescribed = {100: ((0.05, 0.1, -0.04), (0.02, -0.01, 0.03)), 101: ((0., 0.05, 0.02), (0.01, 0., -0.02))}
+    loads = {14: (0.5, 0., 0.3), 6: (0.4, 0., 0.)}
+    bc, cl, out = ["*BOUNDARY"], ["*CLOAD"], []
+    for name, r in rots.items():
+        bc.append(f"{name}.BASE, 1, 3")
+        for n, (u, t) in prescribed.items():
+            bc += [f"{name}.{n}, {k + 1}, {k + 1}, {x:.12g}" for k, x in enumerate((*r(u), *r(t)))]
+        cl += [f"{name}.{n}, {k + 1}, {x:.12g}" for n, f in loads.items() for k, x in enumerate(r(f))]
+        out += [f"*NODE PRINT, NSET={name}.BODY, GLOBAL=YES", "U"]
+    return part + asm + "*STEP\n*STATIC\n" + "\n".join(bc + cl + out) + "\n*END STEP\n", rots
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
@@ -8330,6 +8382,31 @@ def main():
                   f"as with {ref} ({err:.1e} of the end displacement {end:.4g} apart) and t times "
                   f"the end displacement ({lin:.1e})")
         failures += 0 if ok else 1
+    # a part's equation, partial kinematic couplings and SPRING1 / SPRING2 in rotated instances:
+    # Abaqus turns them with the instance, so each one's displacements are R u(unturned
+    # instance). They kept the part's DOF numbers: 101 % / 42 % of max |u| off.
+    deck, rots = rotated_instance_dofs_deck()
+
+    def instance_tables(dat):
+        return {s: {int(r[0]): r[1:] for r in rows} for _, title, s, _, rows in A.dat_blocks(dat)
+                if title.startswith("displacements")}
+    tabs = review_run(deck, "rotated_instance_dofs", instance_tables)
+    ok = bool(tabs)
+    if ok:
+        base = tabs.get("I0_BODY", {})
+        scale = max((abs(x) for v in base.values() for x in v), default=0.0)
+        errs = {}
+        for name in ("I1", "I2"):
+            got = tabs.get(f"{name}_BODY", {})
+            errs[name] = max(abs(a - c) for n0, n in zip(sorted(base), sorted(got))
+                             for a, c in zip(got[n], rots[name](base[n0]))) \
+                if len(got) == len(base) == 16 else math.inf
+        ok = scale > 1e-2 and max(errs.values()) < 1e-6 * scale
+        print(f"{'PASS' if ok else 'FAIL'}  rotated_instance_dofs (a part's *EQUATION, partial kinematic "
+              f"couplings and SPRING1 / SPRING2 in instances turned 90 degrees about x and 40 about "
+              f"(1, 2, 3)): their 16 nodes move R u of the unturned instance's (max |u| {scale:.3g}; "
+              f"{errs['I1']:.1e} / {errs['I2']:.1e} apart)")
+    failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
