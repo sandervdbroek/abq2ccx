@@ -11752,6 +11752,27 @@ def test_one_perturbation_step_rule():
     assert A.step_load_audit(blocks, True)[2] == first + ["*CLOAD on 6"]
 
 
+def test_velocity_bcs_through_a_step_without_time_period():
+    # a heat transfer step is no step of moving nodes for the velocity-BC plan, but its BCs
+    # replace those in force (test_riks_step_cards_read_into_the_velocity_bc_state): its
+    # OP=NEW removes the top's velocity BC, which the last step then does not continue
+    deck = (HEX + "*NSET, NSET=TOP\n5, 6, 7, 8\n*Solid Section, elset=EALL, material=M\n*Material, "
+            "name=M\n*Elastic\n1000., 0.3\n*Conductivity\n1.\n*Specific Heat\n1.\n*Density\n1.\n"
+            "*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+            "*Step\n*Static\n0.5, 1.\n*Boundary, type=velocity\nTOP, 3, 3, 0.01\n*End Step\n"
+            "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary, op=NEW\n1, 1, 3\n2, 2, 3\n"
+            "3, 3, 3\n4, 1, 1\n4, 3, 3\n1, 11, 11, 20.\n*End Step\n"
+            "*Step\n*Static\n0.5, 1.\n*Cload\n7, 1, 1.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert conv._vel_tail == {} and "ABQ2CCX_VEL2" not in body, body
+    # without OP=NEW it goes on (from 0.01: a heat transfer step moves no node)
+    body, conv, _ = convert_str(deck.replace("*Boundary, op=NEW", "*Boundary"))
+    assert "*AMPLITUDE, NAME=ABQ2CCX_VEL2\n0, 0.01, 1, 0.02\n" in _step(body, 3) and set(conv._vel_tail) == {3}
+    # a displacement BC the step gives the top replaces the velocity BC
+    body, conv, _ = convert_str(deck.replace("*Boundary, op=NEW", "*Boundary\nTOP, 3, 3, 0.01\n*Boundary"))
+    assert conv._vel_tail == {} and "ABQ2CCX_VEL2" not in body
+
+
 def _normal_rows(body):
     return [[float(x) for x in ln.split(",")] for ln in _card(body, "*NORMAL")]
 
