@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Distributing coupling with an `INFLUENCE RADIUS`** — ccx 2.23 ignores the radius, so the
+  coupling spread over the whole surface (reduced physics). It is now written on the facets
+  with a node within the radius, or on the nearest facet where it holds none. That is exact
+  where the radius cuts those facets alike, as around a centred reference node. Where it cuts
+  them by different parts, a warning stays: Abaqus scales each facet's weights by that part.
+* **Contact pairs that are commented out** — a `*CONTACT PAIR` on an analytical surface the
+  converter does not mesh no longer counts as a step ccx runs nonlinearly, so the deck's rigid
+  constraints stay ccx's own. Either form is exact; only the notes change.
 * **Large `*BUCKLE` factors** — under a unit load the factor is the buckling load itself, and
   ccx 2.23, which shift-inverts about 1, returns it the less accurately the larger it is and the
   more slender the model (probed, 1 % off: near 500 on a plate 1000 times as wide as thick, 1e7

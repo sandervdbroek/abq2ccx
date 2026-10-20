@@ -4599,9 +4599,10 @@ def main():
                 + ", ".join(repr(float(v)) for v in list(a) + list(b)) + "\n")
         return head.replace("*Step", card + "*Step", 1) + "*Cload\n" + "\n".join(keep) + "\n*" + rest
 
-    def same_as(label, text, twin):
+    def same_as(label, text, twin, turn=None, tol=1e-6):
         """Run ``text`` and ``twin`` (the same model in global components) and compare every
-        printed displacement; 1 on failure."""
+        printed displacement (the twin's turned by ``turn``: a rotated twin's back into the
+        model's axes); 1 on failure."""
         u, bad = [], ""
         for i, t in enumerate((text, twin)):
             src, inp = os.path.join(tmp, f"ct{i}_src.inp"), os.path.join(tmp, f"ct{i}.inp")
@@ -4616,11 +4617,14 @@ def main():
         if not u[0] or u[0].keys() != u[1].keys():
             print(f"FAIL  {label}: no displacements to compare ({bad or 'different nodes printed'})")
             return 1
+        if turn:
+            u[1] = {n: turn(v) for n, v in u[1].items()}
         scale = max(abs(x) for v in u[1].values() for x in v)
         err = max(abs(p - q) for n in u[1] for p, q in zip(u[0][n], u[1][n])) / scale
-        ok = err <= 1e-6
-        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes differs from the model "
-              f"without the *TRANSFORM by {err:.1e} of max |u| ({scale:.4g})")
+        ok = err <= tol
+        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes differs from the "
+              f"{'rigidly rotated ' if turn else ''}model without the *TRANSFORM by {err:.1e} of "
+              f"max |u| ({scale:.4g})")
         return 0 if ok else 1
     untransformed = lambda t: re.sub(r"(?mi)^\*Transform.*\n.*\n", "", t)  # noqa: E731
     plate = open(os.path.join(EXAMPLES, "connector_transform_plate.inp"), encoding="utf-8").read()
@@ -4705,6 +4709,31 @@ def main():
                         "with local moments)", rot_deck, twin)
     nl = lambda t: t.replace("*Step\n*Static\n", "*Step, nlgeom=YES, inc=200\n*Static\n0.05, 1., 1e-6, 0.05\n")  # noqa: E731
     failures += same_as("transform_rotations, NLGEOM", nl(rot_deck), nl(twin))
+    # Rotational BCs and a moment on plain S4 nodes with a *TRANSFORM, kept in the local axes
+    # (ccx's mean-rotation MPCs read them there), in steps ccx runs through its nonlinear
+    # solver, where it makes no knot (only in a dynamic step): they must match the rigidly
+    # rotated model whose global axes are those local axes.  (Both steps are 12-18 % off the
+    # linear step's answer, as the model without a *TRANSFORM is too.)
+    strip_axes = local_axes("R", (1., 1., 0.3), (-1., 1., 0.), (0., 0., 0.))
+
+    def transformed_strip(turned, mat="", step="*Step"):
+        xyz = {1: (0., 0., 0.), 2: (1., 0., 0.), 3: (1., 1., 0.), 4: (0., 1., 0.), 5: (2., 0., 0.),
+               6: (2., 1., 0.)}
+        if turned:
+            xyz = {n: tuple(_dot(e, x) for e in strip_axes) for n, x in xyz.items()}
+        return ("*Node, nset=ALLN\n" + "".join(f"{n}, {x[0]!r}, {x[1]!r}, {x[2]!r}\n" for n, x in xyz.items())
+                + "*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*Shell Section, elset=E, "
+                "material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n" + mat
+                + ("" if turned else "*Nset, nset=TR\n5, 6\n*Transform, nset=TR, type=R\n1., 1., 0.3, -1., 1., 0.\n")
+                + "*Boundary\n1, 1, 6\n4, 1, 6\n" + step + "\n*Static\n*Boundary\n5, 4, 5\n*Cload\n6, 4, 0.1\n"
+                "*Node Print, nset=ALLN, global=yes\nU\n*End Step\n")
+    back = lambda v: tuple(sum(strip_axes[k][i] * v[k] for k in range(3)) for i in range(3))  # noqa: E731
+    plastic = "*Plastic\n1e6, 0.\n"
+    failures += same_as("transform_shell_rotations (local rotation BCs and moment on S4 nodes), a "
+                        "*STATIC step with a *PLASTIC never reached", transformed_strip(False, plastic),
+                        transformed_strip(True, plastic), back)
+    failures += same_as("transform_shell_rotations, NLGEOM", transformed_strip(False, step="*Step, nlgeom"),
+                        transformed_strip(True, step="*Step, nlgeom"), back, 1e-4)
 
     # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs ----------
     # A column pulled through a rigid reference point: the velocity ramps in by a SMOOTH
@@ -6463,6 +6492,37 @@ def main():
             elif u:
                 print(f"FAIL  {tag}: the reference did not solve")
             failures += 0 if ok else 1
+    # a distributing coupling's INFLUENCE RADIUS that cuts the four facets around the centre node
+    # by the same part (0.3), or reaches no facet: Abaqus distributes a force and moment on the
+    # node over those facets (the nearest one), its tributary-area weights scaled alike; against
+    # ccx's distributing coupling on those facets (before: over the whole face)
+    for case, x0, radius, facets in (("centre", (2., 2., 1.5), "0.8", (6, 7, 10, 11)),
+                                     ("nearest_facet", (0.5, 0.5, 1.5), "0.2", (1,))):
+        dist = lambda t: t.replace("*KINEMATIC", "*DISTRIBUTING").replace(  # noqa: E731
+            "*BOUNDARY, AMPLITUDE=R\n100, 1, 2\n100, 3, 3, -0.1\n100, 4, 4, 0.05\n100, 5, 6\n",
+            "*CLOAD\n100, 3, -10.\n100, 4, 2.\n")
+        deck = dist(influence_radius_deck("element", ref=x0, radius=radius))
+        ref = run_ref(deck.replace("*SURFACE, NAME=ST\nEALL, S2\n", "*SURFACE, NAME=ST\n" + "".join(
+            f"{e}, S2\n" for e in facets)).replace(f", INFLUENCE RADIUS={radius}", ""),
+            f"distributing_influence_radius_{case}")
+        tag = f"distributing_influence_radius_{case}"
+        u = review_run(deck, tag, dat_displacements)
+        ok = bool(u) and set(ref) == set(range(1, 51))
+        if ok:
+            scale = max(math.hypot(*v) for v in ref.values())
+            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
+            corners = min(math.hypot(*u[n]) for n in (26, 30, 46, 50)) / scale
+            ok = err < 1e-9 and scale > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face distributing-coupled to a "
+                  f"node with an INFLUENCE RADIUS that " + ("cuts the four facets around the centre "
+                                                            "alike" if case == "centre" else
+                                                            "reaches no facet") +
+                  f", a force and moment on the node): 50 node displacements vs ccx's "
+                  f"distributing coupling on {len(facets)} facet(s), max difference {err:.1e} of max "
+                  f"|u| ({scale:.3g}; the face's corners moved {corners:.2f} of it)")
+        elif u:
+            print(f"FAIL  {tag}: the reference did not solve")
+        failures += 0 if ok else 1
     # rigid constraints in a linear *DYNAMIC step (ccx turns its RIGID MPCs with the finite
     # rotation there: 3-7 % off), against the linear rigid motion prescribed in a *STATIC step;
     # 'transformed': members with a *TRANSFORM (their rows in local axes; a *RIGID BODY was 7 %

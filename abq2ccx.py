@@ -4161,8 +4161,9 @@ class Converter:
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
         self._conn_rot: set = set()                # rotation nodes made for connector rotations
         self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_deck_facts)
+        self._nl_steps: List[bool] = []            # per step: it runs NLGEOM (_plan_deck_facts)
         # no NLGEOM, a step ccx runs through its nonlinear solver (``_solver_why``: the first
-        # one, in words): rigid constraints become linear *EQUATIONs (_plan_deck_facts,
+        # one, in words): rigid constraints become linear *EQUATIONs (_plan_solver_facts,
         # _rigid_body_lines); such a step before an NLGEOM one
         self._linear_rigid = self._dyn_before_nl = self._dynamic_deck = False
         self._solver_why = ""
@@ -10767,7 +10768,10 @@ class Converter:
           all three held at zero as they are (exact; also in *DYNAMIC steps);
         * in a deck with a *DYNAMIC step ccx makes a shell/beam node with rotational BCs or
           moments a knot itself, giving its rotation node the transform evaluated elsewhere
-          (a local BC 0.7-380 % off, shells 28-90 %).
+          (a local BC 0.7-380 % off, shells 28-90 %).  Only there (gen3dboun / gen3dforc: a
+          dynamic step, which ccx always runs nonlinear): its other nonlinear steps (NLGEOM, a
+          *PLASTIC, a coupled step) keep the mean-rotation MPCs, the transformed ones as exact
+          as on the rigidly rotated model (probed).
 
         So a beam node keeps its lines where ccx makes it no knot and one local rotation
         carries all its BCs and moments (no *DYNAMIC step); otherwise it gets a knot beam
@@ -14019,6 +14023,29 @@ class Converter:
                 return [f"*SURFACE, NAME={params['SURFACE']}, TYPE=NODE"] + \
                     [str(n) for n in nodes if n != ref], []                 # ccx: one per line
         elif id(b) in self._distributing_ids and not inside:
+            facets = self._radius_facets(b) if card else []
+            if facets:
+                # ccx weights an element surface's nodes by tributary area, as Abaqus does
+                # (probed); Abaqus scales each facet's by its participation factor
+                self._reserve_names()
+                params["SURFACE"] = self._fresh_name(f"{surf}_RADIUS")
+                pre = self.handle_surface(mkblock("SURFACE", [("NAME", params["SURFACE"])],
+                                                  [f"{e}, {face}" if face else str(e) for e, face, _ in facets]))
+                parts = [p for _, _, p in facets]
+                if max(parts) - min(parts) <= 1e-9:
+                    self.report.note("*COUPLING, *DISTRIBUTING with an INFLUENCE RADIUS: written on "
+                                     "the facets Abaqus distributes over (a node within the radius; "
+                                     "none: the nearest facet), each cut by the same part, so ccx's "
+                                     "tributary-area weights are Abaqus' (ccx 2.23 does not read the "
+                                     "parameter).", once=True)
+                else:
+                    self.report.warn(f"*COUPLING, *DISTRIBUTING with an INFLUENCE RADIUS that cuts its "
+                                     f"facets by different parts: written on the facets with a node "
+                                     f"within it, which ccx weights by their whole tributary areas; "
+                                     f"Abaqus scales each facet's by the part within the radius "
+                                     f"({min(parts):.2f}-{max(parts):.2f} here).", once=True)
+                    self._reduces("*COUPLING, *DISTRIBUTING with an INFLUENCE RADIUS")
+                return pre, []
             self.report.warn("*COUPLING, *DISTRIBUTING with an INFLUENCE RADIUS that leaves part of "
                              "its surface out: Abaqus distributes over the nodes within it, weighted "
                              "by the part of each facet within it; ccx 2.23 does not read the "
@@ -15041,6 +15068,7 @@ class Converter:
         self.model_labels = self._next_ids()
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
+        self._plan_solver_facts(blocks)         # after _plan_rigid: its unmeshed analytical surfaces
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._plan_pretension_cuts(blocks)      # before the beam upgrades and _prescan
         self._upgrade_section_beams(blocks)
@@ -15128,52 +15156,22 @@ class Converter:
         explicit dynamics, whether one is not heat transfer alone (a deck without steps
         counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
         the *TIE names, the linear perturbation steps and which steps run NLGEOM.  No planner
-        adds or replaces such cards (_split_coupling_refs adds its copies' ids).
-
-        Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
-        linear *EQUATIONs (``_linear_rigid``) in a deck without NLGEOM with a step ccx runs
-        through its nonlinear solver, where it turns their RIGID MPCs with the finite rotation
-        (_rigid_body_lines): an implicit *DYNAMIC or a (un)coupled temperature-displacement
-        step, or a *STATIC (a perturbation one too) or *VISCO step of a model with a material
-        ccx iterates (a kept *PLASTIC, *CREEP, *HYPERELASTIC, *HYPERFOAM, a mechanical *USER
-        MATERIAL; used or not) or a *CONTACT PAIR other than TIED (probed on 2.23; a *VISCO
-        step of elastic materials, gaps, nonlinear springs and knots stay linear).
-        ``_dyn_before_nl``: such a step runs before the first NLGEOM step, where ccx turns the
-        RIGID MPCs those decks keep."""
+        adds or replaces such cards (_split_coupling_refs adds its copies' ids)."""
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
-        iterated = next((b.keyword for b in blocks if
-                         (b.keyword == "PLASTIC" and self._plastic_kept(b)) or
-                         (b.keyword in ("CREEP", "HYPERELASTIC", "HYPERFOAM") and
-                          not b.has("TEST DATA INPUT")) or
-                         (b.keyword == "USER MATERIAL" and b.uparam("TYPE") != "THERMAL") or
-                         (b.keyword == "CONTACT PAIR" and not b.has("TIED"))), None)
         self._pert_idx = self._perturbation_steps(blocks)
         on = self._nlgeom_steps(blocks)
         steps: List[bool] = []                   # per step: it runs NLGEOM
-        solver: List[str] = []                   # ... why ccx runs it through its nonlinear solver
         for s, group in enumerate(step_groups(blocks)[1], 1):
             # a linear perturbation step runs linear about the base state, and no effect on the
             # general steps after it, whatever its NLGEOM (Abaqus); its *STATIC is a general one
-            # in ccx (handle_step)
-            steps.append(s not in self._pert_idx and
-                         any(id(b) in on for b in group if b.keyword == "STEP"))
-            solver.append("")
-            for b in group[1:]:
-                if b.keyword == "DYNAMIC" and b.has("EXPLICIT"):
-                    steps[-1] = True           # the converter runs explicit steps with NLGEOM
-                elif b.keyword in ("DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
-                                   "UNCOUPLED TEMPERATURE-DISPLACEMENT"):
-                    solver[-1] = solver[-1] or f"a *{b.keyword} step"
-                elif iterated and b.keyword in ("STATIC", "VISCO"):
-                    solver[-1] = solver[-1] or f"a *{b.keyword} step with a *{iterated}" + \
-                        ("" if iterated in ("CONTACT PAIR", "USER MATERIAL") else " material")
+            # in ccx (handle_step).  The converter runs explicit steps with NLGEOM.
+            steps.append((s not in self._pert_idx and
+                          any(id(b) in on for b in group if b.keyword == "STEP")) or
+                         any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in group[1:]))
         general = [nl for s, nl in enumerate(steps, 1) if s not in self._pert_idx]
         # NLGEOM stays on for all later steps once a step has switched it on (Abaqus)
+        self._nl_steps = steps
         self._nl_any, self._nl_all = any(steps), bool(general) and general[0]
-        self._linear_rigid = not self._nl_any and any(solver)
-        first_nl = steps.index(True) if self._nl_any else 0
-        self._dyn_before_nl = any(solver[:first_nl])
-        self._solver_why = next((s for s in solver if s), "")
         self._dynamic_deck = any(b.keyword == "DYNAMIC" for b in blocks)
         self._explicit_deck = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         self._mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
@@ -15182,6 +15180,44 @@ class Converter:
         self._distributing_ids = {id(b) for b, c in zip(blocks, blocks[1:])
                                   if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
         self._tie_names = {b.uparam("NAME") for b in blocks if b.keyword == "TIE"}
+
+    def _plan_solver_facts(self, blocks: List[Block]) -> None:
+        """Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
+        linear *EQUATIONs (``_linear_rigid``) in a deck without NLGEOM with a step ccx runs
+        through its nonlinear solver, where it turns their RIGID MPCs with the finite rotation
+        (_rigid_body_lines): an implicit *DYNAMIC or a (un)coupled temperature-displacement
+        step, or a *STATIC (a perturbation one too) or *VISCO step of a model with a material
+        ccx iterates (a kept *PLASTIC, *CREEP, *HYPERELASTIC, *HYPERFOAM, a mechanical *USER
+        MATERIAL; used or not) or a *CONTACT PAIR other than TIED (probed on 2.23; a *VISCO
+        step of elastic materials, gaps, nonlinear springs and knots stay linear) with a line
+        written (_pair_lines comments out those on an analytical surface _plan_rigid did not
+        mesh: runs after it).  ``_dyn_before_nl``: such a step runs before the first NLGEOM
+        step, where ccx turns the RIGID MPCs those decks keep."""
+        def written(b: Block) -> bool:
+            return any(not any(t.strip().upper() in self._analytic_skipped for t in ln.split(",")[:2])
+                       for ln in b.data if ln.strip())
+        iterated = next((b.keyword for b in blocks if
+                         (b.keyword == "PLASTIC" and self._plastic_kept(b)) or
+                         (b.keyword in ("CREEP", "HYPERELASTIC", "HYPERFOAM") and
+                          not b.has("TEST DATA INPUT")) or
+                         (b.keyword == "USER MATERIAL" and b.uparam("TYPE") != "THERMAL") or
+                         (b.keyword == "CONTACT PAIR" and not b.has("TIED") and written(b))), None)
+        solver: List[str] = []                   # per step: why ccx runs it through its nonlinear solver
+        for group in step_groups(blocks)[1]:
+            solver.append("")
+            for b in group[1:]:
+                if b.keyword == "DYNAMIC" and b.has("EXPLICIT"):
+                    continue
+                if b.keyword in ("DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
+                                 "UNCOUPLED TEMPERATURE-DISPLACEMENT"):
+                    solver[-1] = solver[-1] or f"a *{b.keyword} step"
+                elif iterated and b.keyword in ("STATIC", "VISCO"):
+                    solver[-1] = solver[-1] or f"a *{b.keyword} step with a *{iterated}" + \
+                        ("" if iterated in ("CONTACT PAIR", "USER MATERIAL") else " material")
+        self._linear_rigid = not self._nl_any and any(solver)
+        first_nl = self._nl_steps.index(True) if self._nl_any else 0
+        self._dyn_before_nl = any(solver[:first_nl])
+        self._solver_why = next((s for s in solver if s), "")
 
     # procedures and *DLOAD labels in which an element's mass acts
     _INERTIA_PROCEDURES = {"DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
@@ -22497,6 +22533,42 @@ class Converter:
                 least = min(d for d, _ in near) + 1e-9 * self._model_span()
                 kept = {n for d, facet in near if d <= least for n in facet}
         return [n for n in nodes if n in kept], all(inside(n) for n in nodes)
+
+    def _radius_facets(self, b: Block) -> List[Tuple[int, Optional[str], float]]:
+        """(element, face, participation factor) of the facets of *COUPLING ``b``'s element
+        surface over which Abaqus distributes with its INFLUENCE RADIUS r (Analysis User's
+        Guide, 'Coupling constraints': the facet's tributary nodal areas times (r - r_min) /
+        (r_max - r_min), its nodes' least and largest distances from the reference node; 1
+        with all within, 0 with none): those with a node within r; none such: the nearest
+        facet(s), as _coupling_nodes (factor 0).  Empty for a node surface, a radius that does
+        not read or an undefined reference node."""
+        sd = self.surfaces.get((b.param("SURFACE") or "").strip().upper())
+        r = self._influence_radius(b)
+        ref = self._ref_node(b)
+        x0 = self.geom.nodes.get(ref) if ref is not None else None
+        if r is None or x0 is None or not sd or sd[0].startswith("NODE"):
+            return []
+        out: List[Tuple[int, Optional[str], float]] = []
+        near: List[Tuple[float, int, Optional[str]]] = []
+        types: Dict[str, str] = {}
+        for token, face in sd[1]:
+            for e in self._resolve_elements(token):
+                facet, corners = self._facet(e, face, types)
+                pts = [self.geom.nodes.get(n) for n in facet]
+                if not pts or any(p is None for p in pts):
+                    continue                    # (ccx stops on the undefined node)
+                d = [math.dist(p, x0) for p in pts]
+                lo, hi = min(d), max(d)
+                if lo < r * (1.0 - 1e-9):
+                    out.append((e, face, 1.0 if hi <= r * (1.0 + 1e-9) else (r - lo) / (hi - lo)))
+                else:
+                    dist = self._facet_distance(x0, facet, corners)
+                    if dist is not None:
+                        near.append((dist, e, face))
+        if not out and near:
+            least = min(d for d, _, _ in near) + 1e-9 * self._model_span()
+            out = [(e, face, 0.0) for d, e, face in near if d <= least]
+        return out
 
     def _radius_holds_none(self, b: Block, nodes: Sequence[int]) -> bool:
         """Whether the INFLUENCE RADIUS of *COUPLING ``b`` leaves no node of its surface but

@@ -8060,12 +8060,19 @@ def test_coupling_influence_radius():
         dyn, conv, _ = convert_str(_radius_block(ref, kin.format(s="TOPE", r=r), KIN_DYN_STEP.format("")
                                                  .replace("RP", "100")))
         assert sorted({row[0][0] for row in _equation_terms(dyn)}) == kept
-    # a distributing coupling keeps its surface: warned where the radius leaves nodes out (Abaqus
-    # also weights them by the part of each facet within it)
+    # a distributing coupling: on the facets with a node within the radius (none: the nearest),
+    # whose tributary areas Abaqus scales by the part of each within it (ccx weights them by area,
+    # probed): exact where it cuts them alike, warned where not
     dist = "*Coupling, constraint name=C, ref node=100, surface=TOPE, influence radius={r}\n*Distributing\n"
-    body, conv, rep = convert_str(_radius_block(corner, dist.format(r="0.5")))
-    assert "SURFACE=TOPE\n*DISTRIBUTING" in body and "INFLUENCE" not in "\n".join(_live(body))
-    assert "*DISTRIBUTING with an INFLUENCE RADIUS" in rep.text() and conv.reduced_physics
+    for ref, facets, alike in ((corner, [1], True), ((1., 1., 1.3), [1, 2, 3, 4], True),
+                               ((0.5, 0.5, 1.9), [1], True), ((0.8, 0.9, 1.1), [1, 2, 3, 4], False)):
+        body, conv, rep = convert_str(_radius_block(ref, dist.format(r="0.5")))
+        head = "*SURFACE, NAME=TOPE_RADIUS\n"
+        assert body.split(head)[1].split("*")[0].split() == [x for e in facets for x in (f"{e},", "S2")]
+        assert "SURFACE=TOPE_RADIUS\n*DISTRIBUTING" in body and "INFLUENCE" not in "\n".join(_live(body))
+        assert bool(conv.reduced_physics) != alike and ("cuts its facets by different parts" in rep.text()) != alike
+    body, conv, rep = convert_str(_radius_block(corner, dist.format(r="0.5").replace("TOPE", "TOPS")))
+    assert "SURFACE=TOPS\n*DISTRIBUTING" in body and conv.reduced_physics       # (a node surface)
     body, conv, rep = convert_str(_radius_block(corner, dist.format(r="9.")))
     assert "INFLUENCE" not in "\n".join(_live(body)) and not conv.reduced_physics and rep.n_warnings == 0
     # a radius that does not read: the whole surface, warned
@@ -8453,6 +8460,9 @@ def test_rigid_constraints_in_steps_ccx_runs_nonlinear():
             # *PLASTIC the converter comments out, a thermal user material, a frequency step
             ("", "*Static\n", False), ("", "*Visco, cetol=1e-3\n0.1, 1.\n", False),
             (pair.format(", tied"), "*Static\n", False), ("*Plastic, hardening=user\n", "*Static\n", False),
+            # (a pair on an analytical surface the converter cannot mesh: commented out)
+            (pair.format("").replace("SA, SB\n", "SA, AS\n") + "*Surface, type=CYLINDER, name=AS\n"
+             "START, 0., 0.\nLINE, 1., 0.\n", "*Static\n", False),
             (unused + "*User Material, constants=1, type=thermal\n1.\n", "*Static\n", False),
             ("*Plastic\n100., 0.\n", "*Frequency\n3\n", False)):
         for card in ("*Rigid Body, ref node=RP, tie nset=TOPN\n", "*MPC\nBEAM, TOPN, 9\n", None):
@@ -8776,6 +8786,12 @@ def test_transformed_shell_node_rotations():
     body, conv, rep = convert_str(shell)
     assert conv._rot_mode == {5: "keep", 6: "keep"} and not conv._knots
     assert "5,4,5" in _bc_lines(body) and _cloads(body) == [{(6, 4): 0.1}]
+    # ... also in the other steps ccx runs nonlinear, where it makes no knot (gen3dboun: only
+    # in a dynamic step): exact against the rigidly rotated model there (validate_with_ccx)
+    for deck in (shell.replace("*Step\n", "*Step, nlgeom\n"),
+                 shell.replace("*Elastic\n1000.,0.3\n", "*Elastic\n1000.,0.3\n*Plastic\n1e6, 0.\n")):
+        body, conv, rep = convert_str(deck)
+        assert conv._rot_mode == {5: "keep", 6: "keep"} and "5,4,5" in _bc_lines(body)
     # in a deck with a *DYNAMIC step ccx makes the node a knot itself (probed: 28-90 % off)
     body, conv, rep = convert_str(shell.replace("*Static", "*Dynamic\n0.1, 1."))
     assert conv._rot_mode[5] == "refuse" and "a *DYNAMIC step ccx makes the shell node a knot" in rep.text()
