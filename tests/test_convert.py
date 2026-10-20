@@ -2633,6 +2633,8 @@ B2 = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,0,0\n4,2,0,0\n*Element,type=B31,elset=B\n1,1
 S4 = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n100,2.5,0.5,0\n"
       "*Element,type=S4,elset=E\n1,1,2,3,4\n2,2,5,6,3\n*Nset,nset=R\n5,6\n*Nset,nset=REF\n100\n"
       "*Shell Section,elset=E,material=M\n0.1\n*Material,name=M\n*Elastic\n1000.,0.3\n")
+# reduced physics of shell/beam rotations in a step ccx runs nonlinear without NLGEOM
+FINITE_ROT = "shell/beam rotations turned with the finite rotation in a geometrically linear step"
 
 
 def _live(body):
@@ -8990,7 +8992,8 @@ def test_kinematic_coupling_rotations_along_its_orientation():
         body, conv, rep = convert_str(deck)
         tgt, base = target or (conv._rb_rot[100], 1)          # the ROT NODE's DOFs 1-3 in a dynamic deck
         rows = ties(body)
-        assert len(rows) == 4 and not conv.reduced_physics, rows
+        # (the dynamic deck's knots turn with the finite rotation: _warn_finite_rotations)
+        assert len(rows) == 4 and conv.reduced_physics == ([] if target else [FINITE_ROT]), rows
         assert len({row[0][:2] for row in rows}) == 4 and all(row[0][2] == 1. for row in rows)
         assert {n for row in rows for n, _, _ in row} <= {5, 6, tgt}
         # the member turns with the reference node about e1 and e2, freely about e3
@@ -9286,7 +9289,8 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
                            [(5, 2, 1.), (100, 2, -1.), (101, 3, 0.5)],
                            [(5, 3, 1.), (100, 3, -1.), (101, 1, 0.5), (101, 2, -0.5)]]
         assert len(eqs) == (12 if ties else 6) and (not ties or [(5, 4, 1.), (101, 1, -1.)] in eqs)
-        assert rep.n_warnings == 0 and not conv.reduced_physics
+        # (the knots turn with the finite rotation: _warn_finite_rotations)
+        assert rep.n_warnings == 2 * ties and conv.reduced_physics == ([FINITE_ROT] if ties else [])
     # 2-D members: DOFs 1-2 only (ccx holds DOF 3 itself), turning about z
     qdyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n2, 1, 2\n3, 1, 2\n*Boundary\n9, 1, 1, 0.1\n*End Step\n"
     for card in ("*Rigid Body, ref node=9, tie nset=L\n",
@@ -9474,6 +9478,45 @@ def test_rigid_constraints_in_steps_ccx_runs_nonlinear():
     assert conv.reduced_physics == ["rigid constraint turned with the finite rotation in a geometrically linear step"]
 
 
+def test_shell_beam_rotations_in_steps_ccx_runs_nonlinear_warned():
+    # in such a step ccx turns the mean-rotation MPCs of a shell/beam node's rotational BCs and
+    # moments, and its knots' RIGID MPCs, with the finite rotation (probed against the linear
+    # step: ~theta^2 of max |u|; a frame joint 1.1 % at 0.009 rad; validate_with_ccx.py
+    # finite_rotation_*); held rotations are exact.  No linear form: warned, reduced
+    plastic = "*Plastic\n1e6, 0.\n"
+    clamp = "*Boundary\n1, 1, 6\n4, 1, 6\n"
+    strip = S4.replace("*Elastic\n1000.,0.3\n", "*Elastic\n1000.,0.3\n{}") + clamp
+    for mat, step, loads, why in (
+            (plastic, "*Step\n*Static\n", "*Boundary\n5, 4, 4, 0.01\n", "rotational BCs or moments on 1"),
+            (plastic, "*Step\n*Static\n", "*Cload\n5, 5, 0.1\n6, 5, 0.1\n", "on 2 shell/beam node(s) (e.g. node 5)"),
+            ("*Density\n1e-6\n", "*Step\n*Dynamic\n0.1, 1.\n", "*Cload\n6, 4, 0.1\n", "in a *DYNAMIC step"),
+            # ... before an NLGEOM step, the card in the first one (or the model)
+            (plastic, "*Step\n*Static\n*Cload\n6, 4, 0.1\n*End Step\n*Step, nlgeom\n*Static\n", "", None),
+            (plastic + "*Boundary\n5, 5, 5, 0.01\n", "*Step\n*Static\n", "", None)):
+        body, conv, rep = convert_str(strip.format(mat) + step + loads + "*End Step\n")
+        assert conv.reduced_physics == [FINITE_ROT], (mat, step, loads)
+        assert "ccx runs that step through its nonlinear solver and turns these rotation constraints" \
+               " with the finite rotation" in rep.text() and (why or "") in rep.text()
+    # not: held rotations, an elastic *STATIC step, NLGEOM, a card in the NLGEOM step only,
+    # a straight beam line (no knot) under forces
+    for mat, step, loads in ((plastic, "*Step\n*Static\n", "*Boundary\n5, 4, 6\n6, 5, 5, 0.\n"),
+                             ("", "*Step\n*Static\n", "*Cload\n6, 4, 0.1\n"),
+                             (plastic, "*Step, nlgeom\n*Static\n", "*Cload\n6, 4, 0.1\n"),
+                             (plastic, "*Step\n*Static\n*Cload\n6, 3, 0.1\n*End Step\n*Step, nlgeom\n"
+                              "*Static\n", "*Cload\n6, 4, 0.1\n")):
+        body, conv, rep = convert_str(strip.format(mat) + step + loads + "*End Step\n")
+        assert not conv.reduced_physics and rep.n_warnings == 0, (mat, step, loads)
+    line = TIP3.replace("*Nset, nset=TIP\n3\n*Transform, nset=TIP\n{}\n", "").replace(
+        "*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n" + plastic)
+    body, conv, rep = convert_str(line.format("*Cload\n3, 3, 0.1\n"))
+    assert not conv.reduced_physics and rep.n_warnings == 0
+    # a frame joint, which ccx makes a knot, under forces alone
+    frame = line.replace("3, 2., 0., 0.\n", "3, 2., 0., 0.\n4, 2., 1., 0.\n").replace(
+        "2, 2, 3\n", "2, 2, 3\n3, 3, 4\n").format("*Cload\n4, 3, 0.1\n")
+    body, conv, rep = convert_str(frame)
+    assert conv.reduced_physics == [FINITE_ROT] and "1 knot(s) (e.g. node 3;" in rep.text()
+
+
 def test_equation_terms_on_rigid_body_reference_rotations_move_to_the_rot_node():
     # ccx carries a *RIGID BODY's rotation on DOFs 1-3 of its ROT NODE and ignores DOFs 4-6
     # of the REF NODE: an *EQUATION term there acted as a fixed zero (probed: 100 % off), or
@@ -9656,7 +9699,8 @@ def test_transformed_rotations_on_a_card_the_step_ramp_splits():
     dyn = _tip("*Boundary\n3, 6, 6, 0.01\n3, 4, 5\n2, 2, 2\n", about_z).replace(
         "*Static", "*Dynamic\n0.1, 1.")
     body, conv, _ = convert_str(dyn)
-    assert 3 in conv._knots and conv._rot_mode[3] == "global" and not conv.reduced_physics
+    # (its prescribed rotation turns the knot with the finite rotation: _warn_finite_rotations)
+    assert 3 in conv._knots and conv._rot_mode[3] == "global" and conv.reduced_physics == [FINITE_ROT]
     assert f"{RAMP}\n3, 4, 4\n3, 5, 5\n3, 6, 6, 0.01\n*BOUNDARY\n2, 2, 2\n" in _step(body, 1)
     # a velocity BC's pieces: left out once, for the velocity BC's reason
     body, _, _ = convert_str(dyn.replace("*Boundary\n3, 6, 6, 0.01\n3, 4, 5\n2, 2, 2\n",

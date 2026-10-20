@@ -5418,6 +5418,54 @@ def main():
     failures += same_as("transform_shell_rotations, NLGEOM", transformed_strip(False, step="*Step, nlgeom"),
                         transformed_strip(True, step="*Step, nlgeom"), back, 1e-4)
 
+    # --- shell/beam rotations in a step ccx runs nonlinear without NLGEOM -----------------
+    # ccx turns the mean-rotation MPCs of rotational BCs and moments, and its knots' RIGID
+    # MPCs, with the finite rotation there; abq2ccx warns (reduced physics, no linear form).
+    # Each deck with a *PLASTIC never reached against its elastic twin (a linear step): the
+    # drift the warning quotes (about theta^2 of max |u|; a knot 0.4-1 % at 0.01 rad), none
+    # for held rotations
+    def finite_drift(label, deck, lo, hi, moved):
+        u, flagged = [], []
+        for i, t in enumerate((deck, deck.replace(plastic, ""))):
+            src, inp = os.path.join(tmp, f"fr{i}_src.inp"), os.path.join(tmp, f"fr{i}.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(t)
+            _, conv = convert(src, inp)
+            flagged.append(bool(conv.reduced_physics))
+            d, status, _ = run_ccx(ccx, env, inp)
+            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            shutil.rmtree(d, ignore_errors=True)
+        if not u[0] or u[0].keys() != u[1].keys():
+            print(f"FAIL  {label}: no displacements to compare")
+            return 1
+        scale = max(math.hypot(*v) for v in u[1].values())
+        err = max(math.dist(u[0][n], u[1][n]) for n in u[1]) / scale
+        ok = lo <= err <= hi and scale >= moved and flagged == [lo > 0, False]
+        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes {err:.2e} of max |u| "
+              f"({scale:.4g}) off the elastic twin's linear step (expected {lo:g}-{hi:g}); "
+              f"{'warned as' if flagged[0] else 'not'} reduced physics")
+        return 0 if ok else 1
+    strip = ("*Node, nset=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 2., 0., "
+             "0.\n6, 2., 1., 0.\n*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*Shell "
+             "Section, elset=E, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n" + plastic +
+             "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n{}*Node Print, nset=ALLN\nU\n*End Step\n")
+    failures += finite_drift("finite_rotation_shell_bc (S4 strip, its free edge turned 0.1 rad by a "
+                             "*BOUNDARY, a *STATIC step with a *PLASTIC never reached)",
+                             strip.format("*Boundary\n5, 5, 5, 0.1\n6, 5, 5, 0.1\n"), 1e-3, 2e-2, 0.09)
+    failures += finite_drift("finite_rotation_shell_moment (the strip turned 0.1 rad by edge moments)",
+                             strip.format("*Cload\n5, 5, 0.002243\n6, 5, 0.002243\n"), 1e-3, 2e-2, 0.09)
+    failures += finite_drift("finite_rotation_shell_held (the strip's edge rotations held at zero, "
+                             "edge forces)", strip.format("*Boundary\n5, 4, 6\n6, 4, 6\n*Cload\n5, 3, "
+                                                          "0.001\n6, 3, 0.001\n"), 0.0, 1e-9, 0.01)
+    failures += finite_drift(
+        "finite_rotation_frame_joint (B31 L frame, which ccx knots at its joint, an out-of-plane tip "
+        "force turning the joint 0.009 rad)",
+        "*Node, nset=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 2., 1., 0.\n5, 2., 2., 0.\n"
+        "*Element, type=B31, elset=E\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n*Beam Section, elset=E, "
+        "material=M, section=RECT\n0.2, 0.1\n0., 0., -1.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+        + plastic + "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n5, 3, 4.56306e-05\n*Node Print, "
+        "nset=ALLN\nU\n*End Step\n", 4e-3, 3e-2, 0.019)
+
     # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs ----------
     # A column pulled through a rigid reference point: the velocity ramps in by a SMOOTH
     # STEP (the corpus' davidmorin pattern) and stays in force in a second step, where a ccx

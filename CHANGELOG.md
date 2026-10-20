@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Shell and beam rotations in steps ccx runs nonlinearly** — without NLGEOM, ccx 2.23 still
+  runs a step with a plastic, creeping, hyperelastic or user material, a contact pair, or a
+  `*DYNAMIC` or coupled procedure through its nonlinear solver. There it turns its shell/beam
+  rotation constraints with the finite rotation, where Abaqus keeps rotations linear. These
+  constraints are the mean-rotation MPCs of non-zero rotational BCs and moments, and the knots
+  (frame joints, folded shell edges, knot beams). The results drift by about theta^2 of max |u|
+  (1 % at 0.1 rad), and by 0.4-1 % at a knot turning 0.01 rad. Held rotations are exact. ccx has
+  no linear form, so such a deck is now warned and flagged as reduced physics.
 * **Cards ccx 2.23 stopped or crashed on, without a warning** — each is now written in a form
   ccx runs, or warned (reduced physics):
   * `*RIGID BODY` with `ELSET` and a `PIN` / `TIE NSET`: one `NSET` of all their nodes (ccx

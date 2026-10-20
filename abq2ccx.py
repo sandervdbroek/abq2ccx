@@ -4742,6 +4742,7 @@ class Converter:
         # _rigid_body_lines); such a step before an NLGEOM one
         self._linear_rigid = self._dyn_before_nl = self._dynamic_deck = False
         self._solver_why = ""
+        self._solver_steps: List[str] = []         # per step: that why, or "" (_plan_solver_facts)
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
         # such card, what each step appends for the ones it keeps, the amplitudes only they
@@ -12179,6 +12180,51 @@ class Converter:
                 verdict = None
         return verdict
 
+    def _warn_finite_rotations(self, blocks: List[Block]) -> None:
+        """Warn (reduced physics) where ccx turns shell/beam rotations with the finite rotation
+        in a geometrically linear step: a step before the first NLGEOM one that ccx runs
+        through its nonlinear solver (_plan_solver_facts), where a shell/beam node carries a
+        non-zero rotational BC or moment from a card of that step or an earlier one (ccx's
+        mean-rotation MPCs; knots in a *DYNAMIC step), or a model with knots (frame joints and
+        folded shell edges ccx makes itself, _ccx_knot; the converter's knot beams), whose
+        RIGID MPCs turn too.  Abaqus keeps rotations linear there.  Probed on 2.23 against the
+        linear *STATIC step: S4 / B31 / B32, a prescribed rotation of theta rad theta^2 / 3 to
+        theta^2 of max |u|, a moment theta^2; a B31 frame joint turning 0.009 rad 1.1 %, a knot
+        beam on a cantilever turning 0.01 rad 0.35 %; rotations held at zero exact.  No ccx
+        form keeps them linear (a shell/beam node's rotation is a DOF only through those MPCs)."""
+        first = self._nl_steps.index(True) if self._nl_any else len(self._solver_steps)
+        steps = [s for s in range(1, first + 1) if self._solver_steps[s - 1]]
+        if not steps or not self._mechanical:
+            return
+        own = self._rot_nodes - set(self._rb_rot)
+        turned: set = set()
+        step = 0
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword in ("BOUNDARY", "CLOAD") and step <= steps[-1]:
+                turned.update(n for n, its in self._rot_items(b, own).items()
+                              if any(v != 0.0 for _, v in its))
+        sections, at = self._knot_sections(blocks), self._elements_at(own)
+        knots = set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}
+        if not turned and not knots:
+            return
+        parts = [f"non-zero rotational BCs or moments on {len(turned)} shell/beam node(s) (e.g. "
+                 f"node {min(turned)}), applied through mean-rotation MPCs"] if turned else []
+        if knots:
+            parts.append(f"{len(knots)} knot(s) (e.g. node {min(knots)}; frame joints, folded shell "
+                         f"edges, knot beams)")
+        self.report.warn(f"Shell/beam rotations in {self._solver_steps[steps[0] - 1]} without NLGEOM: "
+                         f"{' and '.join(parts)}. ccx runs that step through its nonlinear solver "
+                         f"and turns these rotation constraints with the finite rotation, where "
+                         f"Abaqus keeps rotations linear (probed on 2.23 against the linear step: "
+                         f"about theta^2 of max |u| for a prescribed rotation or moment of theta "
+                         f"rad, 1e-4 at 0.01 rad, 1 % at 0.1 rad; 0.4-1 % at a knot turning 0.01 "
+                         f"rad; rotations held at zero exact). No ccx form keeps them linear: verify "
+                         f"that the rotations stay small.", once=True)
+        self._reduces("shell/beam rotations turned with the finite rotation in a geometrically "
+                      "linear step")
+
     def _rot_refused(self, b: Block, n: int, why: Optional[str]) -> List[str]:
         """Comment lines (and a warning) for node ``n``'s rotational BCs / moments in card
         ``b`` that have no exact form (see _plan_transformed_rotations)."""
@@ -17177,6 +17223,7 @@ class Converter:
         self._plan_modal_starts(blocks)
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
+        self._warn_finite_rotations(blocks)         # after every planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
         self._plan_rigid_contact_increment(blocks)
         self._complete_temperature_ic()         # after every planner that adds knot nodes
@@ -17364,6 +17411,7 @@ class Converter:
                 elif iterated and b.keyword in ("STATIC", "VISCO"):
                     solver[-1] = solver[-1] or f"a *{b.keyword} step with a *{iterated}" + \
                         ("" if iterated in ("CONTACT PAIR", "USER MATERIAL") else " material")
+        self._solver_steps = solver
         self._linear_rigid = not self._nl_any and any(solver)
         first_nl = self._nl_steps.index(True) if self._nl_any else 0
         self._dyn_before_nl = any(solver[:first_nl])
