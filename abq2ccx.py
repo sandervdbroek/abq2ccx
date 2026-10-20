@@ -28492,7 +28492,9 @@ class Converter:
                             moves.add(n)
             return out
 
-        for st in bc_steps(blocks, rotations, self._pert_idx, self.steps.lc2):  # the BCs each step solves with
+        # the BCs each step solves with (``moves`` grows as the fold reaches each card: the
+        # moves up to the step's end)
+        for st in self.steps.states(rotations, skip=self.steps.lc2, blocks=blocks):
             active: Dict[int, set] = {}                  # node -> rotations a BC holds
             for n, d in st:
                 active.setdefault(n, set()).add(d)
