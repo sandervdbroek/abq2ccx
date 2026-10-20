@@ -6088,6 +6088,12 @@ class Converter:
                             continue
                         if j == 0 or b.keyword == "MASS":
                             heavy = heavy or (v != 0.0 and b.keyword != "SPECIFIC HEAT")
+            elif b.keyword == "BEAM GENERAL SECTION" and b.param("DENSITY") and id(b) not in self._u1_cards \
+                    and (b.param("SECTION") or "GENERAL").strip().upper() in GENERAL_EXPANDED:
+                try:                            # the material _general_as_beam_section makes
+                    heavy = pf(b.param("DENSITY") or "") != 0.0 or heavy
+                except ValueError:
+                    unread.append(f"*BEAM GENERAL SECTION, DENSITY={b.param('DENSITY')}")
             elif b.keyword == "DLOAD":
                 for rec in merged_data_records(b):
                     g = [x.strip() for x in rec]
@@ -6096,6 +6102,7 @@ class Converter:
                             pf(g[2])
                         except ValueError:
                             unread.append(f"the {g[1].upper()} magnitude '{g[2]}'")
+        heavy = heavy or any(m != 0.0 for _name, m in self._star_masses)    # _rigid_model_cards
         if not heavy:
             return                      # nothing to move (ccx stops without a density there)
         steps = ", ".join(str(n) for n, _ in coupled)
@@ -7066,8 +7073,9 @@ class Converter:
         out = [f"** abq2ccx: *BEAM GENERAL SECTION, SECTION={sec} -> ccx's beam section with "
                f"material {name} (E, nu = {'0 in a 2-D model' if self._planar_beams else 'E / 2G - 1'})",
                f"*MATERIAL, NAME={name}", "*ELASTIC", f"{short_real(e_mod, 12)}, {short_real(nu, 12)}"]
-        if b.param("DENSITY"):
-            out += ["*DENSITY", b.param("DENSITY")]
+        rho = b.param("DENSITY")
+        if rho:                                    # scaled as the deck's (_plan_coupled_inertia)
+            out += ["*DENSITY", "%.12g" % (pf(rho) / self._mass_scale) if self._mass_scale else rho]
         if alpha:
             zero = b.param("ZERO")
             out += [emit_keyword("EXPANSION", OrderedDict([("ZERO", zero)]) if zero else OrderedDict()),
@@ -7164,7 +7172,7 @@ class Converter:
                              "(they run as C3D6/C3D8I solids; thickness comes from the mesh).",
                              once=True)
             gone = [k for k in b.params if k not in ("ELSET", "MATERIAL", "ORIENTATION",
-                                                     "STACK DIRECTION", "DENSITY")]
+                                                     "STACK DIRECTION")]    # DENSITY: _plan_shell_density
             if gone:
                 self.report.note(f"*SHELL SECTION {', '.join(gone)} dropped with the continuum-shell "
                                  f"formulation (the solids take their thickness from the mesh and "
@@ -15964,6 +15972,7 @@ class Converter:
         self._plan_s4r_shells()                 # the S4R left (--approximate: S4)
         self._plan_ply_split(blocks)            # composite SC6R / SC8R -> one solid per ply
         self._plan_quadratic_membranes(blocks)  # M3D6 / M3D8 / M3D8R -> the converter's own solids
+        self._plan_shell_density(blocks)        # after the ply split: its stacks and ply materials
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
         self._prescan(blocks)
@@ -16154,6 +16163,13 @@ class Converter:
     _INERTIA_PROCEDURES = {"DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
                            "COMPLEX FREQUENCY"}
     _MASS_LOADS = {"GRAV", "CENTRIF", "CENT", "ROTA", "CORIO", "ROTDYNF"}
+
+    def _mass_acts(self, blocks: List[Block]) -> bool:
+        """Whether an element's mass acts somewhere in the deck: a step of _INERTIA_PROCEDURES
+        or a *DLOAD of _MASS_LOADS."""
+        return any(b.keyword in self._INERTIA_PROCEDURES for b in blocks) or any(
+            len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS
+            for b in blocks if b.keyword == "DLOAD" for r in merged_data_records(b))
 
     def _drop_surface_elements(self, raw: List[Block], blocks: List[Block]) -> None:
         """Leave Abaqus surface elements (SURFACE_ELEMENTS) out of the ccx mesh — ccx has no
@@ -17461,7 +17477,7 @@ class Converter:
                 out += ["*CONDUCTIVITY", "1e-30", "*SPECIFIC HEAT", "0."]
             out += [f"*SOLID SECTION, ELSET={RIGID_SET}, MATERIAL={RIGID_SET}"]
         for name, m in self._star_masses:          # ccx reads 20 characters of a field
-            out += [f"*MASS, ELSET={name}", short_real(m, 12)]
+            out += [f"*MASS, ELSET={name}", short_real(m / (self._mass_scale or 1.0), 12)]
         return out
 
     # -- the base state after linear perturbation steps ----------------------------------
@@ -19795,48 +19811,175 @@ class Converter:
         which warns."""
         if not self._mem_mass_acts:
             return
-        thermal = any(b.keyword in CCX_THERMAL_PROCS for b in blocks)
         taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
         copies: Dict[Tuple[str, float], str] = {}
         for b in list(blocks):
             if b.keyword != "MEMBRANE SECTION" or not b.param("DENSITY"):
                 continue
             mat = b.uparam("MATERIAL")
-            group = opts.get(mat)
             ts = {t for e, sec in section.items() if sec is b for t in thick[e]}
             try:
                 rho_a = pf(b.param("DENSITY") or "")
-                dens = [[pf(r[0])] + [x.strip() for x in r[1:]] for c in group or [] if c.keyword == "DENSITY"
-                        for r in merged_data_records(c) if r and r[0].strip()]
             except ValueError:
                 continue
-            if not group or len(ts) != 1 or None in ts or min(t or 0.0 for t in ts) <= 0.0 or any(
-                    c.keyword == "USER MATERIAL" or (thermal and c.keyword == "SPECIFIC HEAT") for c in group):
+            if len(ts) != 1 or None in ts or min(t or 0.0 for t in ts) <= 0.0 or \
+                    self._mass_copy_obstacle(blocks, opts, mat):
                 continue
             add = rho_a / float(ts.pop() or 1.0)
-            if (mat, add) not in copies:
-                name, k = f"{mat}_MEMBRANE_MASS", 1
-                while name in taken:
-                    k += 1
-                    name = f"{mat}_MEMBRANE_MASS_{k}"
-                taken.add(name)
-                clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
-                         for c in group if c is group[0] or (c.keyword in MATERIAL_OPTION_CARDS and
-                                                             c.keyword != "DENSITY")]
-                clone[0].params["NAME"] = name
-                d = next((c for c in group if c.keyword == "DENSITY"), None)
-                clone.append(Block("DENSITY", OrderedDict(d.params) if d else OrderedDict(),
-                                   [", ".join([short_real(r[0] + add, 12)] + r[1:]) for r in dens] or
-                                   [short_real(add, 12)]))
-                at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
-                blocks[at:at] = clone
-                copies[(mat, add)] = name
-                self._mem_thinning[name] = self._mem_thinning.get(mat)
-                self.report.note(f"*MEMBRANE SECTION, DENSITY= (a mass per unit area added to the "
-                                 f"material's) -> material {name}, a copy of {mat} whose *DENSITY "
-                                 f"holds DENSITY / thickness more (ccx has no section mass).", once=True)
-            b.params["MATERIAL"] = copies[(mat, add)]
+            name = self._material_mass_copy(blocks, opts, mat, add, "MEMBRANE_MASS", taken, copies)
+            self._mem_thinning[name] = self._mem_thinning.get(mat)
+            self.report.note(f"*MEMBRANE SECTION, DENSITY= (a mass per unit area added to the "
+                             f"material's) -> material {name}, a copy of {mat} whose *DENSITY "
+                             f"holds DENSITY / thickness more (ccx has no section mass).", once=True)
+            b.params["MATERIAL"] = name
             del b.params["DENSITY"]
+
+    def _mass_copy_obstacle(self, blocks: List[Block], opts: Dict[str, List[Block]], mat: str) -> str:
+        """Why material ``mat`` (upper case; ``opts``: _material_options) cannot be copied with
+        more *DENSITY for a section mass (_material_mass_copy), or "": it is undefined, its
+        density does not read, or the copy would change a heat capacity (a specific heat in a
+        deck with temperature steps) or a user material's name."""
+        group = opts.get(mat)
+        if not group:
+            return f"material {mat} is not defined"
+        if any(c.keyword == "USER MATERIAL" for c in group):
+            return f"material {mat} is a user material"
+        if any(c.keyword == "SPECIFIC HEAT" for c in group) and \
+                any(b.keyword in CCX_THERMAL_PROCS for b in blocks):
+            return f"a copy of material {mat} would change its heat capacity in the temperature steps"
+        try:
+            self._density_rows(group)
+        except ValueError:
+            return f"the *DENSITY of material {mat} does not read as numbers"
+        return ""
+
+    @staticmethod
+    def _density_rows(group: List[Block]) -> List[List]:
+        """The rows of a material's *DENSITY cards (``group``: its card and options), the
+        density as a number; ValueError where it does not read."""
+        return [[pf(r[0])] + [x.strip() for x in r[1:]] for c in group if c.keyword == "DENSITY"
+                for r in merged_data_records(c) if r and r[0].strip()]
+
+    def _material_mass_copy(self, blocks: List[Block], opts: Dict[str, List[Block]], mat: str,
+                            add: float, tag: str, taken: set,
+                            copies: Dict[Tuple[str, float], str]) -> str:
+        """The name of a copy of material ``mat`` (upper case; not _mass_copy_obstacle) whose
+        *DENSITY rows hold ``add`` more, for a section's mass per unit area that ccx has no card
+        for: {mat}_{tag}, inserted into ``blocks`` after the material, once per material and
+        value (``copies``), its name not in ``taken``."""
+        if (mat, add) in copies:
+            return copies[(mat, add)]
+        group = opts[mat]
+        name, k = f"{mat}_{tag}", 1
+        while name in taken:
+            k += 1
+            name = f"{mat}_{tag}_{k}"
+        taken.add(name)
+        clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
+                 for c in group if c is group[0] or (c.keyword in MATERIAL_OPTION_CARDS and
+                                                     c.keyword != "DENSITY")]
+        clone[0].params["NAME"] = name
+        d = next((c for c in group if c.keyword == "DENSITY"), None)
+        clone.append(Block("DENSITY", OrderedDict(d.params) if d else OrderedDict(),
+                           [", ".join([short_real(r[0] + add, 12)] + r[1:]) for r in self._density_rows(group)]
+                           or [short_real(add, 12)]))
+        at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
+        blocks[at:at] = clone
+        copies[(mat, add)] = name
+        return name
+
+    def _plan_shell_density(self, blocks: List[Block]) -> None:
+        """*SHELL SECTION, DENSITY= on continuum shells (SC6R / SC8R), a mass per unit area of
+        the shell added to its materials' (Abaqus 2017 Keywords): ccx runs these elements as
+        solids (a composite as one solid per ply, _plan_ply_split), which have no section mass.
+        In a deck where mass acts, a section whose elements all have one thickness t (the
+        mesh's: the stack edges along the mid-surface normal, equal within 0.1 %) gets a copy
+        of each of its materials whose *DENSITY holds DENSITY / t more (_material_mass_copy).
+        The solids fill the thickness, so the mass per area, inertia and gravity load are
+        Abaqus'.  Otherwise DENSITY= is dropped: warned where mass acts, else noted.  An unsplit
+        composite section is commented out whole (handle_shell_section)."""
+        acts = self._mass_acts(blocks)
+        P = self.geom.nodes
+        opts: Dict[str, List[Block]] = {}
+        taken: set = set()
+        copies: Dict[Tuple[str, float], str] = {}
+
+        def thickness(bottom: Sequence[int], top: Sequence[int]) -> Optional[float]:
+            if any(n not in P for n in list(bottom) + list(top)):
+                return None
+            n, _c = self._stack_geometry(bottom, top)
+            t = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bottom, top)) / len(bottom)
+            return t if t > 0.0 else None
+
+        def stacked(b: Block, conn: List[int]) -> Tuple[List[int], List[int]]:
+            """The bottom and top face of a continuum shell of section ``b`` (_plan_ply_split)."""
+            if len(conn) == 6 or any(n not in P for n in conn):
+                return conn[:len(conn) // 2], conn[len(conn) // 2:]
+            stack = self._stack_direction(b)
+            axis = self._stack_axis(b, conn) if stack == "ORIENTATION" else None
+            pc = [conn[q - 1] for q in self._stack_order(conn, stack, axis)]
+            return pc[:4], pc[4:]
+
+        for b in list(blocks):
+            if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION") or not b.has("DENSITY"):
+                continue
+            plan = self._ply_sections.get(id(b))
+            elset = (b.param("ELSET") or "").strip()
+            if plan is None and (b.has("COMPOSITE") or not b.param("MATERIAL") or not elset or
+                                 not self._continuum_shell_elset(elset)):
+                continue
+            dens = b.params.pop("DENSITY")
+            try:
+                rho_a: Optional[float] = pf(dens or "")
+            except ValueError:
+                rho_a = None
+            if rho_a == 0.0:
+                continue
+            if not acts:
+                self.report.note("*SHELL SECTION, DENSITY= on continuum shells dropped: ccx runs them as "
+                                 "solids, which have no section mass, and no step or load of this deck "
+                                 "uses mass.", once=True)
+                continue
+            if plan is not None:
+                ts = [thickness(bot, top) for _order, bot, top in (plan["stack_of"][e] for e in plan["elems"])]
+                mats = dedup([g["mat"].upper() for g in plan["groups"]])
+            else:
+                ts = [thickness(*stacked(b, list(self.geom.elements[e][1]))) if
+                      len(self.geom.elements[e][1]) in (6, 8) else None for e in self._existing(elset)]
+                mats = [b.uparam("MATERIAL")]
+            if rho_a is None:
+                why = "it does not read as a number"
+            elif not ts or None in ts:
+                why = "an element's thickness cannot be measured (an undefined node, or a degenerate element)"
+            elif max(ts) - min(ts) > 1e-3 * max(ts):
+                why = (f"its elements' thicknesses differ ({min(ts):.4g} to {max(ts):.4g}), and a "
+                       f"material has one density")
+            else:
+                if not opts:
+                    opts = self._material_options(blocks)
+                    taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+                why = next((w for w in (self._mass_copy_obstacle(blocks, opts, m) for m in mats) if w), "")
+            if why:
+                self.report.warn(f"*{b.keyword}, ELSET={elset}, DENSITY={dens} (a mass per unit area "
+                                 f"added to the material's) on continuum shells dropped: {why}. ccx runs "
+                                 f"them as solids, which have no section mass, so they lack it in this "
+                                 f"deck's dynamic or frequency steps or mass loads.", once=True)
+                self._reduces("*SHELL SECTION, DENSITY= on continuum shells (added mass per area)")
+                continue
+            t = sum(x or 0.0 for x in ts) / len(ts)
+            names = [self._material_mass_copy(blocks, opts, m, (rho_a or 0.0) / t, "SHELL_MASS", taken, copies)
+                     for m in mats]
+            if plan is not None:
+                for g in plan["groups"]:
+                    g["mat"] = names[mats.index(g["mat"].upper())]
+            else:
+                b.params["MATERIAL"] = names[0]
+            many = len(names) > 1
+            self.report.note(f"*{b.keyword}, ELSET={elset}, DENSITY= on continuum shells (a mass per "
+                             f"unit area added to the material's) -> material{'s' if many else ''} "
+                             f"{', '.join(names)}, {'copies' if many else 'a copy'} of {', '.join(mats)} "
+                             f"whose *DENSITY holds DENSITY / thickness more, the thickness {t:.6g} from "
+                             f"the mesh (ccx runs them as solids, which have no section mass).", once=True)
 
     def _plan_quadratic_membranes(self, blocks: List[Block]) -> None:
         """Quadratic membranes -> one-element-thick solids the converter expands itself.
@@ -19874,9 +20017,7 @@ class Converter:
         mem = {e for e, (typ, _c) in els.items() if typ.upper().startswith("M3D")}
         if not mem:
             return
-        self._mem_mass_acts = any(b.keyword in self._INERTIA_PROCEDURES for b in blocks) or any(
-            len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS
-            for b in blocks if b.keyword == "DLOAD" for r in merged_data_records(b))
+        self._mem_mass_acts = self._mass_acts(blocks)
         opts = self._material_options(blocks)
         for b in blocks:
             if b.keyword == "MEMBRANE SECTION":

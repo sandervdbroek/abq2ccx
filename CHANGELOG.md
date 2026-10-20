@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **`*SHELL SECTION, DENSITY=` on continuum shells** — the mass per unit area was dropped
+  (silently on a plain section), so the modes came out about 2× too high. Where mass acts,
+  each material now gets a copy with DENSITY / t more, t the mesh's thickness, as membranes
+  already did; plies too. Where the thickness varies the parameter is dropped with a warning.
+* **Mass scaling in transient coupled temperature-displacement steps** — the material made
+  from `*BEAM GENERAL SECTION, DENSITY=` and the point masses that carry a rigid body's
+  `*ROTARY INERTIA` kept their full mass (the stars a net negative mass at the body's node).
+  They are now scaled like the deck's own masses.
 * **Mesh generation with blank fields** — `*ELGEN`, `*NGEN` and `*NFILL` dropped blank
   (default) fields and read the rest one place early: `*ELGEN` line `1, 4, , , 3, 10, 10` gave 40
   wrong elements instead of 12, and an `*NGEN` arc with a blank increment generated nothing.

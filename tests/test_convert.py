@@ -10464,6 +10464,32 @@ def test_coupled_inertia_example():
     assert "(step 2): a mechanical load without AMPLITUDE" in rep.text()
     assert not dangling_refs(reparse(body))
 
+
+def test_coupled_inertia_scales_the_converter_made_masses():
+    # the masses the converter makes go out scaled as the deck's: the material of a *BEAM
+    # GENERAL SECTION, DENSITY= and the point masses that carry a rigid body's rotary inertia
+    # (they kept their inertia, the stars a net negative mass at the body's node)
+    beam = ("*NODE\n20, 3., 0., 0.\n21, 4., 0., 0.\n*ELEMENT, TYPE=B31, ELSET=EB\n11, 20, 21\n"
+            "*BEAM GENERAL SECTION, ELSET=EB, SECTION=RECT, DENSITY=7.8e-9\n0.1, 0.1\n0., 1., 0.\n"
+            "210000., 80769.\n")
+    body, conv, rep = convert_str(COUPLED_HEX + beam + COUPLED_STEP)
+    assert conv._mass_scale == 1e30
+    assert _card_at(body.split("*MATERIAL, NAME=ABQ2CCX_RECT_MATERIAL")[1], "*DENSITY") == ["7.8e-39"]
+    stars = ("*NODE\n100, 0.5, 0.5, 2.\n*ELEMENT, TYPE=MASS, ELSET=EM\n30, 100\n"
+             "*ELEMENT, TYPE=ROTARYI, ELSET=ER\n31, 100\n*NSET, NSET=RP\n100\n"
+             "*RIGID BODY, REF NODE=RP, TIE NSET=TOP\n*MASS, ELSET=EM\n0.01\n*ROTARY INERTIA, ELSET=ER\n1., 2., 3.\n")
+    body, conv, _ = convert_str(COUPLED_HEX + stars + COUPLED_STEP)
+    star = [float(m) for m in re.findall(r"\*MASS, ELSET=ABQ2CCX_STAR\d+\n(\S+)\n", body)]
+    assert conv._mass_scale == 1e30 and len(star) == 5
+    assert max(abs(m) for m in star) < 1e-32 and abs(sum(star)) < 1e-42 and min(star) == -5e-33
+    # a section density alone makes the deck's mass; one that does not read stops the scaling
+    light = COUPLED_HEX.replace("*DENSITY\n7.8e-9, 20.\n7.7e-9, 520.\n", "*DENSITY\n0.\n").replace(
+        "*MASS, ELSET=PM\n0.002\n", "*MASS, ELSET=PM\n0.\n")
+    assert convert_str(light + COUPLED_STEP)[1]._mass_scale is None
+    assert convert_str(light + beam + COUPLED_STEP)[1]._mass_scale == 1e30
+    _, conv, rep = convert_str(COUPLED_HEX + beam.replace("DENSITY=7.8e-9", "DENSITY=RHO") + COUPLED_STEP)
+    assert conv._mass_scale is None and "cannot read *BEAM GENERAL SECTION, DENSITY=RHO" in rep.text()
+
 # --- rigid elements and analytical rigid surfaces ---------------------------------------
 
 RIGID_PLATE = """*NODE
@@ -11922,6 +11948,51 @@ def test_continuum_shell_layer_angle_distribution():
     assert first[0] == 1 and abs(first[1] - c10) < 1e-8 and abs(first[2] - s10) < 1e-8
     assert len(lines) == 2 and lines[1].startswith("2, 0.642787")      # cos 50
     assert "*DISTRIBUTION, NAME=ANG" not in body and "of composite layer angles" in rep.text()
+
+
+def test_continuum_shell_section_density_becomes_material_mass():
+    # *SHELL SECTION, DENSITY= is a mass per unit area added to the materials' (Abaqus 2017
+    # Keywords); ccx runs continuum shells as solids, which have no section mass, so where
+    # mass acts each material gets a copy with DENSITY / t more, t the mesh's thickness (it
+    # was dropped: on plies with a note about stiffness, on a plain section without a word)
+    strip = SC8R_STRIP.replace(COMPOSITE_MAT, COMPOSITE_MAT + "*Density\n1.5e-9\n*Material, name=M\n"
+                               "*Elastic\n1000., 0.3\n*Density\n1.5e-9\n")
+    plain = "*Shell Section, elset=PLATE, material=M, density=6e-10\n0.3\n"
+    plies = "*Shell Section, elset=PLATE, composite, density=6e-10\n" + LAYUP
+    freq = "*Boundary\nCLAMP, ENCASTRE\n*Step\n*Frequency\n3\n*End Step\n"
+    for sec, mat, cards in ((plain, "M", ["*SOLID SECTION, ELSET=PLATE, MATERIAL=M_SHELL_MASS"]),
+                            (plies, "CFRP", ["*SOLID SECTION, ELSET=PLATE_PLY1, MATERIAL=CFRP_SHELL_MASS, ",
+                                             "*SOLID SECTION, ELSET=PLATE_PLY2, MATERIAL=CFRP_SHELL_MASS, "])):
+        body, conv, rep = convert_str(strip + sec + freq)
+        copy = body.split(f"*MATERIAL, NAME={mat}_SHELL_MASS\n")[1].split("*MATERIAL")[0]
+        assert _card_at(copy, "*DENSITY") == ["3.5e-09"] and "*ELASTIC" in copy     # 1.5e-9 + 6e-10 / 0.3
+        assert all(c in body for c in cards) and f"MATERIAL={mat}\n" not in body and "DENSITY=" not in body
+        assert f"-> material {mat}_SHELL_MASS, a copy of {mat}" in rep.text() and "the thickness 0.3 " in rep.text()
+        assert "take their stiffness" not in rep.text() and not any("DENSITY" in r for r in conv.reduced_physics)
+    # gravity makes mass act too; two sections of one material and thickness share one copy
+    two = strip.replace("*Nset, nset=CLAMP", "*Elset, elset=E1\n1\n*Elset, elset=E2\n2\n*Nset, nset=CLAMP")
+    secs = plain.replace("elset=PLATE", "elset=E1") + plain.replace("elset=PLATE", "elset=E2")
+    body, _, _ = convert_str(two + secs + "*Boundary\nCLAMP, ENCASTRE\n*Step\n*Static\n*Dload\n"
+                                          "PLATE, GRAV, 9810., 0., 0., -1.\n*End Step\n")
+    assert body.count("*MATERIAL, NAME=M_SHELL_MASS") == 1 and body.count("MATERIAL=M_SHELL_MASS") == 2
+    # no step or load uses mass: dropped, noted
+    body, conv, rep = convert_str(strip + plain + "*Boundary\nCLAMP, ENCASTRE\n*Step\n*Static\n*Cload\n"
+                                                  "3, 3, 1.\n*End Step\n")
+    assert "SHELL_MASS" not in body and "DENSITY=" not in body and conv.reduced_physics == ["element SC8R -> C3D8I"]
+    assert "DENSITY= on continuum shells dropped: ccx runs them as solids" in rep.text()
+    # elements of different thicknesses, or a copy that would change a heat capacity: dropped,
+    # warned (reduced physics)
+    thick = strip.replace("13, 2., 0., 0.3", "13, 2., 0., 0.4").replace("16, 2., 1., 0.3", "16, 2., 1., 0.4")
+    heat = strip.replace("*Density\n1.5e-9\n*Material", "*Density\n1.5e-9\n*Conductivity\n1.\n*Specific Heat\n"
+                                                         "1.\n*Material").replace(
+        "*Elastic\n1000., 0.3\n*Density\n1.5e-9\n", "*Elastic\n1000., 0.3\n*Density\n1.5e-9\n*Conductivity\n1.\n"
+                                                    "*Specific Heat\n1.\n")
+    heat_step = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\nCLAMP, 11, 11, 20.\n*End Step\n"
+    for deck, why in ((thick + plain + freq, "thicknesses differ (0.3 to 0.3496)"),
+                      (heat + plain + freq + heat_step, "would change its heat capacity")):
+        body, conv, rep = convert_str(deck)
+        assert "SHELL_MASS" not in body and "DENSITY=" not in body and why in rep.text(), why
+        assert "*SHELL SECTION, DENSITY= on continuum shells (added mass per area)" in conv.reduced_physics
 
 
 def test_composite_shell_plies_on_a_cylinder_follow_the_hoop():
