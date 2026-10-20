@@ -27764,12 +27764,7 @@ class Converter:
                              f"{self._circ_explicit_issue}. Set the maximum increment (4th field "
                              f"of the *DYNAMIC data line) to at most 0.12 d / c (d: section "
                              f"diameter, c: the material's dilatational wave speed).", once=True)
-        try:
-            alpha = min(max(pf(params.get("ALPHA") or "-0.05"), -1.0 / 3.0), 0.0)
-        except ValueError:
-            alpha = -0.05
-        critom = 1.96 / math.sqrt(1.0 - alpha * (1.0 + alpha * (2.0 + alpha)))
-        caps = self._explicit_caps(critom)
+        caps = self._explicit_caps(self._critom(Block("DYNAMIC", params)))    # the converted ALPHA
         if not caps:
             return data
         top = min(c for c, _, _ in caps)
