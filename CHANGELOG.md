@@ -16,7 +16,9 @@ physics.
   back to 0 no longer gets a knot beam (it stiffened the beam slightly; the zero clamp is exact).
   A `*BUCKLE` step's `LOAD CASE=2` cards, which ccx cannot have, no longer count as BCs
   anywhere: a 2-D column whose twist only such a card held buckled about the free twist
-  (factors near 1, without a warning).
+  (factors near 1, without a warning). `LOAD CASE=2` cards that repeat the `LOAD CASE=1` lines
+  but not their missing OP=NEW (the modes then lose the base state's BCs) are now warned as
+  reduced physics, not noted as exact.
 * **Static perturbation steps: base + perturbation** — two lines of one load in such a step
   each got the base value added, so ccx counted it twice. It now goes on the first line only.
   Base-state loads, BCs and temperatures on a `TIME=TOTAL TIME` amplitude kept rising through

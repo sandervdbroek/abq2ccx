@@ -13585,6 +13585,35 @@ def test_buckle_load_case_two_cards_are_no_bcs():
     assert conv._bc_dofs_by_node(blocks) == {1: {1, 2, 6}}
 
 
+def test_buckle_load_case_two_repeats_by_its_bcs():
+    # LOAD CASE=2 repeats LOAD CASE=1 (left out, exact) where the buckling modes hold in Abaqus
+    # what the step holds in ccx: the LOAD CASE=2 lines alone (OP=NEW required: "all boundary
+    # conditions to be imposed during eigenvalue extraction must be specified"), against the
+    # LOAD CASE=1 lines on the base state's unless the step's first card has OP=NEW
+    def repeats(model, one, two):
+        _, m = _step_model(model + "*STEP\n*BUCKLE\n2\n*BOUNDARY" + one + "\n*BOUNDARY, OP=NEW, LOAD CASE=2\n"
+                           + two + "*CLOAD\n5, 3, -1.\n*END STEP")
+        return m.steps[-1].lc2_repeats
+    base = "*BOUNDARY\n5, 1, 1\n"
+    assert repeats(base, ", OP=NEW\n1, 1, 6", "1, 1, 6\n")
+    assert repeats("", "\n1, 1, 6", "1, 1, 6\n")                  # (nothing in force before)
+    assert not repeats(base, "\n1, 1, 6", "1, 1, 6\n")            # (the modes lose node 5's)
+    assert not repeats(base, ", OP=NEW\n1, 1, 6\n5, 1, 1", "1, 1, 6\n")   # (fewer in the modes)
+    assert repeats(base, ", OP=NEW\n1, 1, 6\n5, 1, 1", "5, 1, 1\n*BOUNDARY, OP=NEW, LOAD CASE=2\n1, 1, 6\n")
+    # a perturbation step's BCs are no base state's
+    pert = "*STEP\n*FREQUENCY\n2\n*BOUNDARY\n5, 1, 1\n*END STEP\n"
+    assert repeats(pert, "\n1, 1, 6", "1, 1, 6\n") and not repeats(pert.replace("FREQUENCY\n2", "STATIC"),
+                                                                    "\n1, 1, 6", "1, 1, 6\n")
+    nodes = "".join(f"{i + 1}, 0., 0., {i}.\n" for i in range(5))
+    beam = ("*NODE\n" + nodes + "*ELEMENT, TYPE=B31, ELSET=COL\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n"
+            "*BEAM SECTION, ELSET=COL, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n2.1e11, 0.3\n*BOUNDARY\n5, 1, 2\n")
+    _, conv, rep = convert_str(beam + "*STEP\n*BUCKLE\n2\n*BOUNDARY\n1, 1, 6\n*BOUNDARY, OP=NEW, LOAD CASE=2\n"
+                               "1, 1, 6\n*CLOAD\n5, 3, -1.\n*END STEP\n")
+    assert "that differ from the LOAD CASE=1 ones" in rep.text() and "Exact." not in rep.text()
+    assert conv.reduced_physics == ["*BUCKLE buckling-mode BCs (*BOUNDARY, LOAD CASE=2)"]
+
+
 def test_one_perturbation_step_rule():
     # every linear perturbation procedure of Abaqus makes a perturbation step, for every
     # planner: _pert_idx, the step's motion (velocity BCs, total time), the output carry-over

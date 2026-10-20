@@ -4662,7 +4662,9 @@ class Step:
     buckle_loaded: bool           # a *BUCKLE step with a load other than *TEMPERATURE (handle_step's)
     lc2: frozenset                # in a step with a *BUCKLE card: the ids of its *BOUNDARY, LOAD CASE=2
                                   # cards, which the conversion leaves out (StepModel.lc2)
-    lc2_repeats: bool             # each repeats a LOAD CASE=1 card of the step (the Abaqus/CAE default)
+    lc2_repeats: bool             # they hold what the step's LOAD CASE=1 cards hold in ccx (the Abaqus/
+                                  # CAE default): the same lines, and both or neither with OP=NEW (or
+                                  # no BC in force before the step)
     # how its nodes move, by motion_proc's card (_plan_velocity_bcs, _plan_default_amplitudes,
     # _dofs_at_rest, the deck's amp_span):
     motion_label: str             # motion_proc, with ", RIKS"; "(no procedure)" if none
@@ -4798,10 +4800,12 @@ class StepModel:
         flag = False                            # ccx's NLGEOM switch as a step starts (Step.ccx_nlgeom)
         seen = False                            # Step.general_before
         t = 0.0                                 # Step.t_start
+        based = False                           # a BC line before the step, outside perturbation steps
         for is_step, cards in deck_parts(blocks):
             if not is_step:
                 if steps:
                     loose.extend(cards)
+                based = based or any(b.keyword == "BOUNDARY" and merged_data_records(b) for b in cards)
                 continue
             head, inner = cards[0], cards[1:]
             procedure = step_procedure(cards)
@@ -4828,11 +4832,21 @@ class StepModel:
                 flag = False                    # (ccx forgets it there, probed)
             bcs = [b for b in cards if b.keyword == "BOUNDARY"]
             two = [b for b in bcs if (b.param("LOAD CASE") or "1").strip() == "2"]
-            if two and any(b.keyword == "BUCKLE" for b in cards):
-                key = lambda b: tuple(", ".join(x.strip().upper() for x in r) for r in
-                                      merged_data_records(b) if any(x.strip() for x in r))
-                ones = [key(b) for b in bcs if (b.param("LOAD CASE") or "1").strip() != "2"]
-                lc2, repeats = frozenset(id(b) for b in two), all(key(b) in ones for b in two)
+            if two and kw == "BUCKLE":
+                # Abaqus' buckling modes hold the LOAD CASE=2 lines alone ("all boundary conditions
+                # to be imposed during eigenvalue extraction must be specified", with OP=NEW), ccx
+                # the step's other lines, on the base state's unless the first has OP=NEW
+                ones = [b for b in bcs if (b.param("LOAD CASE") or "1").strip() != "2"]
+
+                def lines(cs: List[Block]) -> set:
+                    return {(tuple((k, v) for k, v in b.params.items() if k not in ("OP", "LOAD CASE")),
+                             ", ".join(x.strip().upper() for x in r))
+                            for b in cs for r in merged_data_records(b) if any(x.strip() for x in r)}
+
+                def new(cs: List[Block]) -> bool:
+                    return bool(cs) and cs[0].uparam("OP") == "NEW"
+                lc2 = frozenset(id(b) for b in two)
+                repeats = lines(two) == lines(ones) and (new(two) == new(ones) or not based)
             else:
                 lc2, repeats = frozenset(), False
             period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
@@ -4854,6 +4868,8 @@ class StepModel:
                 period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp))
             t = None if t is None or advance is None else t + advance
             seen = seen or not pert
+            based = based or not pert and any(b.keyword == "BOUNDARY" and id(b) not in lc2 and
+                                              merged_data_records(b) for b in cards)
             loose = []
         self.steps: Tuple[Step, ...] = tuple(steps)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
@@ -27665,12 +27681,14 @@ class Converter:
         Guide: "ignored in all procedures except BUCKLE"): LOAD CASE=1 (the default) holds the
         base state under the applied loads, LOAD CASE=2 the buckling modes.  ccx has one set of
         BCs per step (and stops on the parameter outside steady-state dynamics), so the
-        parameter goes.  Abaqus/CAE writes every buckling BC twice, once per load case: a
-        LOAD CASE=2 card that repeats a LOAD CASE=1 card of the step is left out (exact; probed
-        on 2.23: a second *BOUNDARY, OP=NEW in a step keeps the first one's BCs).  Buckling-
-        mode BCs that differ from the base state's cannot be had in ccx: the modes then get the
-        base state's BCs (reduced physics).  The cards are the step model's (StepModel.lc2:
-        in a step without *BUCKLE Abaqus ignores LOAD CASE, and both cards apply)."""
+        parameter goes.  Abaqus/CAE writes every buckling BC twice, once per load case: LOAD
+        CASE=2 cards that hold what the step's LOAD CASE=1 cards hold in ccx (Step.lc2_repeats:
+        the same lines, and OP=NEW on both or neither where BCs are in force before the step)
+        are left out (exact; probed on 2.23: a second *BOUNDARY, OP=NEW in a step keeps the
+        first one's BCs).  Buckling-mode BCs that differ cannot be had in ccx: the modes then
+        get the LOAD CASE=1 BCs (reduced physics).  The cards are the step model's
+        (StepModel.lc2: in a step without *BUCKLE Abaqus ignores LOAD CASE, and both cards
+        apply)."""
         for step in self.steps:
             if not step.lc2:
                 continue
