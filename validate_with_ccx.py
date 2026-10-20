@@ -3466,6 +3466,54 @@ def include_files_deck():
     return deck, files
 
 
+def s4r_plate_deck(step, n=16, t=0.01):
+    """(deck, Kirchhoff answer): a 1 x 1 simply supported square plate of n x n S4R shells, a/t
+    = 1 / t (E 210e9, nu 0.3, rho 7800; w held on every edge, u on x = 0, v on y = 0).
+    "static": pressure 1e3, the centre's deflection (Navier: 0.00406235 q a^4 / D);
+    "freq": the lowest frequency (pi sqrt(D / (rho t)) / a^2); "buckle": the x = 1 edge pushed
+    with half the buckling load 4 pi^2 D / a (consistent nodal forces), factor 2."""
+    nodes, elems = sheet_mesh("S4R", n, n)
+    D = 210e9 * t ** 3 / (12 * (1 - 0.09))
+    ids = lambda pred: [k for k, (x, y) in nodes.items() if pred(x, y)]     # noqa: E731
+    edge = ids(lambda x, y: min(x, y) < 1e-9 or max(x, y) > 1 - 1e-9)
+    mid = ids(lambda x, y: abs(x - 0.5) < 1e-9 and abs(y - 0.5) < 1e-9)
+    lines = (["*NODE"] + [f"{k}, {x:.12g}, {y:.12g}, 0." for k, (x, y) in nodes.items()]
+             + ["*ELEMENT, TYPE=S4R, ELSET=PLATE"] + [f"{e}, " + ", ".join(map(str, c))
+                                                      for e, c in enumerate(elems, 1)]
+             + ["*NSET, NSET=EDGE"] + _ids(edge) + ["*NSET, NSET=LEFT"] + _ids(ids(lambda x, y: x < 1e-9))
+             + ["*NSET, NSET=BOT"] + _ids(ids(lambda x, y: y < 1e-9)) + ["*NSET, NSET=MID"] + _ids(mid)
+             + ["*MATERIAL, NAME=STEEL", "*ELASTIC", "210e9, 0.3", "*DENSITY", "7800.",
+                "*SHELL SECTION, ELSET=PLATE, MATERIAL=STEEL", f"{t:.12g}",
+                "*BOUNDARY", "EDGE, 3, 3", "LEFT, 1, 1", "BOT, 2, 2", "*STEP"])
+    if step == "static":
+        lines += ["*STATIC", "*DLOAD", "PLATE, P, 1000.", "*NODE PRINT, NSET=MID", "U"]
+        ref = 0.00406235 * 1000. / D
+    elif step == "freq":
+        lines += ["*FREQUENCY", "2"]
+        ref = math.pi * math.sqrt(D / (7800. * t))
+    else:
+        push = 2 * math.pi ** 2 * D
+        lines += ["*BUCKLE", "2", "*CLOAD"] + [
+            f"{k}, 1, {-push / n * (0.5 if min(y, 1 - y) < 1e-9 else 1.0):.12g}"
+            for k, (x, y) in nodes.items() if x > 1 - 1e-9]
+        ref = 2.0
+    return "\n".join(lines + ["*END STEP"]) + "\n", ref
+
+
+def long_numbers_deck():
+    """A unit C3D8 cube (nu 0) held on x = 0 and pulled on x = 1, its modulus and nodal forces
+    written longer than the 20 characters ccx 2.23 reads of a field: E 1.0000000000000000000e-03
+    (ccx read 1.0), each of the 4 forces -5.148903517857142e-05 ('*ERROR reading *CLOAD').  The
+    loaded face moves 4 F / E = -0.2059561407142857."""
+    return "\n".join(
+        ["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 1., 1., 0.", "4, 0., 1., 0.", "5, 0., 0., 1.",
+         "6, 1., 0., 1.", "7, 1., 1., 1.", "8, 0., 1., 1.", "*ELEMENT, TYPE=C3D8, ELSET=EALL",
+         "1, 1, 2, 3, 4, 5, 6, 7, 8", "*NSET, NSET=FIX", "1, 4, 5, 8", "*NSET, NSET=TIP", "2, 3, 6, 7", "*MATERIAL, NAME=M",
+         "*ELASTIC", "1.0000000000000000000e-03, 0.", "*SOLID SECTION, ELSET=EALL, MATERIAL=M",
+         "*BOUNDARY", "FIX, 1, 3", "*STEP", "*STATIC", "*CLOAD", "TIP, 1, -5.148903517857142e-05",
+         "*NODE PRINT, NSET=TIP", "U", "*END STEP"]) + "\n"
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -7604,6 +7652,45 @@ def main():
               f"{'not' if not warned[0] else 'also'} at the low load")
     else:
         print("FAIL  buckle_factors_near_one: a run gave no results")
+    failures += 0 if ok else 1
+
+    # ccx 2.23 expands an S4R into one C3D8R brick integrated on its mid-surface, so only
+    # hourglass control resists its bending: the deck's S4R are flagged reduced physics, and
+    # --approximate writes S4, within 3 % of the plate solution in each step
+    def centre_w(dat):
+        return [abs(u[2]) for u in dat_displacements(dat).values()]
+
+    for step, what, read in (
+            ("static", "centre deflection under pressure", centre_w),
+            ("freq", "lowest frequency", lambda d: dat_eigen_table(d, "E I G E N V A L U E   O U T P U T")),
+            ("buckle", "buckling factor at half the buckling load", factors)):
+        tag = f"s4r_plate_{step}"
+        text, ref = s4r_plate_deck(step)
+        raw = review_run(text, tag, read)
+        _, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
+        s4 = review_run(text, tag + "_approximate", read, approximate=True)
+        ok = bool(raw and s4)
+        if ok:
+            flagged = any(r.startswith("element S4R") for r in conv.reduced_physics)
+            err = abs(s4[0] / ref - 1)
+            ok = flagged and err < 0.03 and s4[0] > 0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a simply supported S4R plate, a/t = 100, 16 x 16, "
+                  f"its {what}): {s4[0]:.5g} written as S4 (--approximate), {err:.1%} off the plate "
+                  f"solution {ref:.5g}; as S4R {raw[0] / ref:.3g} times it, "
+                  f"{'flagged' if flagged else 'NOT flagged'} reduced physics")
+        failures += 0 if ok else 1
+
+    # numbers over the 20 characters ccx 2.23 reads of a field: it stopped on the *CLOAD
+    # (-5.148903517857142e-05) and read the modulus 1.0000000000000000000e-03 as 1
+    u = review_run(long_numbers_deck(), "long_numbers", dat_displacements)
+    ok = bool(u)
+    if ok:
+        got = [v[0] for v in u.values()]
+        ok = len(got) == 4 and max(abs(g / -0.2059561407142857 - 1) for g in got) < 2e-6
+        print(f"{'PASS' if ok else 'FAIL'}  long_numbers (a C3D8 cube pulled by four nodal forces, "
+              f"the modulus and forces written in 23 and 22 characters): the loaded face moved "
+              f"{', '.join(f'{g:.7g}' for g in got)} (4 F / E = -0.2059561; ccx 2.23 as written: "
+              f"'*ERROR reading *CLOAD', and E read as 1)")
     failures += 0 if ok else 1
 
     # parameter names without blanks (REFNODE=, POSITIONTOLERANCE=, ...): ccx rejected the

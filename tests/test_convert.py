@@ -51,6 +51,14 @@ def convert_str(text, **overrides):
         os.unlink(path)
 
 
+S4R_FLAG = "element S4R (ccx 2.23 bends it through hourglass control only)"
+
+
+def other_reduced(conv):
+    """conv.reduced_physics without the flag every plain S4R deck carries (_plan_s4r_shells)."""
+    return [r for r in conv.reduced_physics if r != S4R_FLAG]
+
+
 HEX = """*NODE
 1, 0.,0.,0.
 2, 1.,0.,0.
@@ -567,6 +575,30 @@ def test_fortran_d_exponent():
     deck = "*NODE\n1, 0.0d0, 1.5D2, -2.5d-1\n*ELEMENT, TYPE=MASS, ELSET=E\n1, 1\n"
     _, conv, _ = convert_str(deck)
     assert conv.geom.nodes[1] == (0.0, 150.0, -0.25)
+
+
+def test_numbers_over_20_characters_are_shortened():
+    # ccx 2.23 reads a field's first 20 characters: -5.148903517857142e-05 stops it ('*ERROR
+    # reading *CLOAD'), 1.0000000000000000000e3 reads as 1.  Real numbers over 20 characters
+    # (blanks removed) — the deck's text or a *PARAMETER value's repr — get 12 digits;
+    # integers, labels and *HEADING text stay
+    deck = ("*Heading\nrun 2.500000000000000000000e-1 of LONG_LABEL_WITH_MORE_THAN_20\n" + HEX +
+            "*Nset, nset=LONG_LABEL_WITH_MORE_THAN_20\n2, 3, 6, 7\n*Parameter\nd = -0.1*0.07\n"
+            "*Material, name=M\n*Elastic\n1.0000000000000000000e3, 0.3\n"
+            "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n"
+            "*Step\n*Dynamic, alpha=-0.0500000000000000027756\n0.1, 1.\n*Cload\n"
+            "LONG_LABEL_WITH_MORE_THAN_20, 1, -5.148903517857142e-05\n*Boundary\n"
+            "2, 2, 2, <d>\n3, 2, 2, -0.00036375799066797954\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    lines = body.splitlines()
+    assert "run 2.500000000000000000000e-1 of LONG_LABEL_WITH_MORE_THAN_20" in lines
+    assert "1000., 0.3" in lines and "*DYNAMIC, ALPHA=-0.05" in lines
+    assert "LONG_LABEL_WITH_MORE_THAN_20, 1, -5.14890351786e-05" in lines
+    assert "2, 2, 2, -0.007" in lines and "3, 2, 2, -0.000363757990668" in lines
+    assert "5 number(s) longer than the 20 characters a ccx 2.23 field holds written to 12 " \
+           "significant digits (e.g. *ELASTIC 1.0000000000000000000e3 -> 1000.)" in rep.text()
+    assert not any(len(f.strip()) > 20 and A.LONG_REAL.match(f.strip()) for ln in lines[2:]
+                   for f in re.split(r"[,=]", ln))
 
 
 def test_keyword_line_continuation():
@@ -11439,6 +11471,31 @@ def test_composite_s4r_becomes_s8r_with_shared_midside_nodes():
     assert "*ELSET, ELSET=PLATE\n1, 2" in body
 
 
+def test_plain_s4r_bends_through_hourglass_control_only():
+    # ccx 2.23 expands an S4R into one C3D8R brick integrated on its mid-surface, so only
+    # hourglass control resists its bending (probed: an a/t = 100 plate 50x / 7x / 97x too
+    # stiff in statics / frequency / buckling): reduced physics; --approximate writes S4
+    deck = (S4R_STRIP + "*Shell Section, elset=PLATE, material=CFRP\n0.1\n*Step\n*Buckle\n2\n"
+            "*Boundary\nCLAMP, ENCASTRE\n*Cload\nTIP, 1, -1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=S4R\n" in body and conv.reduced_physics == [S4R_FLAG]
+    assert "Element S4R (2 elements): ccx 2.23 expands an S4R into one C3D8R brick" in rep.text()
+    assert "Rerun with --approximate to write them as S4" in rep.text()
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert "*ELEMENT, TYPE=S4\n" in body and "TYPE=S4R" not in body
+    assert conv.geom.elements[1] == ("S4", [1, 2, 5, 4])
+    assert "[APPROX] Element S4R (2 elements) written as S4: ccx 2.23 expands" in rep.text()
+    assert conv.reduced_physics == ["--approximate: Element S4R (2 elements) written as S4"]
+    # S4R5 runs as ccx's S4R too; the coupled S4RT stays coupled (S4T, ccx's S4)
+    body, _, rep = convert_str(deck.replace("type=S4R", "type=S4R5"), approximate=True)
+    assert "*ELEMENT, TYPE=S4\n" in body and "Element S4R5 (2 elements) written as S4" in rep.text()
+    body, conv, rep = convert_str(deck.replace("type=S4R", "type=S4RT"), approximate=True)
+    assert "*ELEMENT, TYPE=S4\n" in body and conv.geom.elements[1][0] == "S4T"
+    # a composite S4R runs as S8R: no S4R is left to warn about
+    body, conv, rep = convert_str(deck.replace("material=CFRP\n0.1", "composite\n0.1, 3, CFRP, 0."))
+    assert "TYPE=S8R" in body and "hourglass" not in rep.text() and S4R_FLAG not in conv.reduced_physics
+
+
 def test_composite_s4r_bc_lines_reach_the_midside_nodes():
     # node-numbered BC values on both ends of an edge are interpolated onto its midside node
     body, _, _ = convert_str(S4R_STRIP + "*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n"
@@ -11820,7 +11877,7 @@ def test_cylindrical_orientation_on_a_plain_shell_cylinder():
     want = (-math.sin(t) * math.cos(r), math.cos(t) * math.cos(r), math.sin(r))
     assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_AXES1")[:3], want)) < 1e-6
     assert "*ELSET, ELSET=CYL_AX1" in body and "*ELSET, ELSET=CYL_AX2" in body
-    assert "the rotation applied" in rep.text() and not conv.reduced_physics
+    assert "the rotation applied" in rep.text() and not other_reduced(conv)
     # the same as a cylindrical *DISTRIBUTION (one line scaled): the rotation is kept too
     deck = deck.replace("*Orientation, name=CYLO, system=CYLINDRICAL\n0., 0., 0., 0., 0., 1.\n",
                         "*Distribution, name=D, location=ELEMENT, table=T\n, 0., 0., 0., 0., 0., 1.\n"
@@ -11828,7 +11885,7 @@ def test_cylindrical_orientation_on_a_plain_shell_cylinder():
                         "*Orientation, name=CYLO, system=CYLINDRICAL\nD\n")
     body, conv, rep = convert_str(deck)
     assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_AXES1")[:3], want)) < 1e-6
-    assert "*DISTRIBUTION" not in body and "was dropped" not in rep.text() and not conv.reduced_physics
+    assert "*DISTRIBUTION" not in body and "was dropped" not in rep.text() and not other_reduced(conv)
 
 
 def test_distribution_orientation_on_a_plain_shell_gets_abaqus_axes():
@@ -11940,9 +11997,9 @@ def test_cylindrical_orientation_turning_across_an_element_is_warned():
             "*Shell Section, elset=DISK, material=CFRP, orientation=C\n0.1\n")
     body, conv, rep = convert_str(deck)
     assert re.search(r"turns the material directions by up to 2[23] degrees across an element", rep.text())
-    assert conv.reduced_physics and "ABQ2CCX_AXES" not in body    # ccx's own radial agrees at the centre
+    assert other_reduced(conv) and "ABQ2CCX_AXES" not in body    # ccx's own radial agrees at the centre
     _, conv, rep = convert_str(deck.replace("type=S4,", "type=S4R,"))
-    assert "across an element" not in rep.text() and not conv.reduced_physics
+    assert "across an element" not in rep.text() and not other_reduced(conv)
     # without the rotation line Abaqus turns about axis 1, radial in the disk, and projects
     # axis 2: the hoop direction (normal -z here), element group by element group
     body, _, rep = convert_str(deck.replace("3, 0.\n", ""))
@@ -11950,7 +12007,7 @@ def test_cylindrical_orientation_turning_across_an_element_is_warned():
         ["-0.382683432, 0.923879533, 0, 0.923879533, 0.382683432, 0"]
     assert "orientation C: it has no rotation line" in rep.text()
     _, conv, rep = convert_str(deck.replace("material=CFRP", "material=ISO") + "*Material, name=ISO\n*Elastic\n1., 0.3\n")
-    assert "across an element" not in rep.text() and not conv.reduced_physics
+    assert "across an element" not in rep.text() and not other_reduced(conv)
 
 
 def test_material_symmetry_classes():
@@ -12249,11 +12306,11 @@ def test_spherical_orientation_on_a_plain_shell_sphere():
     assert max(abs(x - y) for x, y in zip(_orientation_values(body, "ABQ2CCX_AXES1")[:3], (-s, c, 0.0))) < 1e-9
     assert _orientation_values(body, "ABQ2CCX_AXES1")[5] > 0.7            # direction 2 up the meridian
     assert "*ELSET, ELSET=CAP_AX1" in body and "*ORIENTATION, NAME=SPH, SYSTEM=RECTANGULAR" in body
-    assert "no element reads it" in rep.text() and not conv.reduced_physics
+    assert "no element reads it" in rep.text() and not other_reduced(conv)
     # membranes alike (ccx takes their axes unprojected: a = direction 1, b = normal x it)
     body, conv, _ = convert_str(deck.replace("type=S4R", "type=M3D4").replace("*Shell Section", "*Membrane Section"))
     assert _orientation_values(body, "ABQ2CCX_AXES1")[:3] == _orientation_values(convert_str(deck)[0], "ABQ2CCX_AXES1")[:3]
-    assert "*MEMBRANE SECTION, ELSET=CAP_AX1, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body and not conv.reduced_physics
+    assert "*MEMBRANE SECTION, ELSET=CAP_AX1, MATERIAL=CFRP, ORIENTATION=ABQ2CCX_AXES1" in body and not other_reduced(conv)
     # turned 90 degrees about axis 1, Abaqus projects axis 3: the meridian towards the pole
     body, _, _ = convert_str(deck.replace("0., 0., 1.\n*Shell", "0., 0., 1.\n1, 90.\n*Shell"))
     want = (-math.cos(math.radians(45.0)) * c, -math.cos(math.radians(45.0)) * s, math.sin(math.radians(45.0)))
@@ -12263,7 +12320,7 @@ def test_spherical_orientation_on_a_plain_shell_sphere():
         "*Element, type=C3D8, elset=BLOCK\n9, 101, 102, 104, 103, 105, 106, 108, 107\n"
     _, conv, rep = convert_str(deck + block + "*Solid Section, elset=BLOCK, material=CFRP, orientation=SPH\n")
     assert "SYSTEM=SPHERICAL is unsupported by ccx" in rep.text()
-    assert "*ORIENTATION, SYSTEM=SPHERICAL written rectangular" in conv.reduced_physics
+    assert "*ORIENTATION, SYSTEM=SPHERICAL written rectangular" in other_reduced(conv)
 
 
 def test_spherical_orientation_on_continuum_shells():
@@ -12298,13 +12355,13 @@ def test_isotropic_sections_lose_nothing_on_a_spherical_orientation():
     head = "*ORIENTATION, NAME=SPH, SYSTEM=RECTANGULAR"
     body, conv, rep = convert_str(block + ISO_STEEL + SPH_ORIENTATION + solid)
     assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and "ORIENTATION=SPH" in body
-    assert not conv.reduced_physics and "written as the global axes" in rep.text()
+    assert not other_reduced(conv) and "written as the global axes" in rep.text()
     # ccx's *DEFORMATION PLASTICITY depends on the axes (CalculiX issue #160): its section reads none;
     # initial stresses, which Abaqus reads in the orientation's axes, are written in global ones
     for extra in ("", "*Initial Conditions, type=STRESS\n9, 1., 0., 0., 0., 0., 0.\n"):
         for mat in (DEFORMATION_STEEL, ISO_STEEL):
             body, conv, _ = convert_str(block + mat + SPH_ORIENTATION + solid + extra)
-            assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
+            assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not other_reduced(conv)
             assert ("ORIENTATION=SPH" in body) == (mat == ISO_STEEL)
     # an orthotropic section and a spring use the axes: reduced physics, the card as before
     for deck in (block + COMPOSITE_MAT + SPH_ORIENTATION + solid.replace("STEEL", "CFRP"),
@@ -12312,7 +12369,7 @@ def test_isotropic_sections_lose_nothing_on_a_spherical_orientation():
                  "*Spring, elset=SP, orientation=SPH\n\n10.\n"):
         body, conv, _ = convert_str(deck)
         assert _card(body, head) == ["0., 0., 0., 0., 0., 1."]
-        assert conv.reduced_physics == ["*ORIENTATION, SYSTEM=SPHERICAL written rectangular"]
+        assert other_reduced(conv) == ["*ORIENTATION, SYSTEM=SPHERICAL written rectangular"]
     # isotropic shells, membranes and continuum shells (stacked along the orientation, as in
     # Abaqus' LE3 hemisphere) alike, also beside orthotropic shells with their own directions
     cap = "*Node\n" + "".join(ln + "\n" for ln in SPHERE_PATCH_NODES.splitlines()[:6]) + \
@@ -12321,20 +12378,20 @@ def test_isotropic_sections_lose_nothing_on_a_spherical_orientation():
     for deck in (cap + ISO_STEEL + SPH_ORIENTATION + shell,
                  cap.replace("S4R", "M3D4") + ISO_STEEL + SPH_ORIENTATION + shell.replace("Shell", "Membrane")):
         body, conv, _ = convert_str(deck)
-        assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
+        assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not other_reduced(conv)
     body, conv, rep = convert_str(cap + COMPOSITE_MAT + SPH_ORIENTATION + shell.replace("STEEL", "CFRP")
                                   + block + ISO_STEEL + solid)
-    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not conv.reduced_physics
+    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and not other_reduced(conv)
     assert "element by element" in rep.text() and "no direction dependence" in rep.text()
     sc = ("*Node\n" + SPHERE_PATCH_NODES + "*Element, type=SC8R, elset=CAP\n1, 1, 4, 5, 2, 11, 14, 15, 12\n"
           "2, 2, 5, 6, 3, 12, 15, 16, 13\n" + ISO_STEEL + SPH_ORIENTATION
           + "*Shell Section, elset=CAP, material=STEEL, orientation=SPH, stack direction=ORIENTATION\n0.02\n")
     body, conv, _ = convert_str(sc)
     assert "*SOLID SECTION, ELSET=CAP, MATERIAL=STEEL, ORIENTATION=SPH" in body
-    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and conv.reduced_physics == ["element SC8R -> C3D8I"]
+    assert _card(body, head) == ["1., 0., 0., 0., 1., 0."] and other_reduced(conv) == ["element SC8R -> C3D8I"]
     # a card no section uses loses nothing either
     _, conv, rep = convert_str(block + ISO_STEEL + SPH_ORIENTATION + solid.replace(", orientation=SPH", ""))
-    assert not conv.reduced_physics and "no card uses it" in rep.text()
+    assert not other_reduced(conv) and "no card uses it" in rep.text()
 
 
 def test_isotropic_sections_lose_nothing_by_a_dropped_cylindrical_rotation():
@@ -12365,16 +12422,16 @@ def test_deformation_plasticity_sections_name_no_orientation():
     sec = "*Solid Section, elset=EALL, material=STEEL, orientation=OR\n"
     body, conv, rep = convert_str(HEX + DEFORMATION_STEEL + TURNED_ORIENTATION + sec)
     assert "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL" in body.splitlines()
-    assert not conv.reduced_physics and "CalculiX issue #160" in rep.text() and "in global axes" in rep.text()
+    assert not other_reduced(conv) and "CalculiX issue #160" in rep.text() and "in global axes" in rep.text()
     quad = "*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type={}, elset=PLATE\n1, 1, 2, 3, 4\n"
     for kw, typ in (("Shell", "S4R"), ("Membrane", "M3D4")):
         body, conv, _ = convert_str(quad.format(typ) + DEFORMATION_STEEL + TURNED_ORIENTATION
                                     + f"*{kw} Section, elset=PLATE, material=STEEL, orientation=OR\n0.1\n")
         assert f"*{kw.upper()} SECTION, ELSET=PLATE, MATERIAL=STEEL" in body.splitlines()
-        assert not conv.reduced_physics
+        assert not other_reduced(conv)
     body, conv, _ = convert_str(HEX.replace("C3D8", "SC8R") + DEFORMATION_STEEL + TURNED_ORIENTATION
                                 + "*Shell Section, elset=EALL, material=STEEL, orientation=OR\n1.\n")
-    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL" in body.splitlines() and DP_FLAG not in conv.reduced_physics
+    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL" in body.splitlines() and DP_FLAG not in other_reduced(conv)
     # a ply of it names the global axes, as ccx would give it the previous ply's orientation
     s8r = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0.5, 0., 0.\n6, 1., 0.5, 0.\n"
            "7, 0.5, 1., 0.\n8, 0., 0.5, 0.\n*Element, type=S8R, elset=PLATE\n1, 1, 2, 3, 4, 5, 6, 7, 8\n")
@@ -12384,7 +12441,7 @@ def test_deformation_plasticity_sections_name_no_orientation():
                                       "0.1, 3, STEEL, 30.\n0.1, 3, CFRP, 30.\n")
         plies = [ln for ln in body.splitlines() if ln.startswith("0.1, , ")]
         assert len(plies) == 2 and plies[0] == "0.1, , STEEL, ABQ2CCX_OR0" and not plies[1].endswith("OR0")
-        assert DP_FLAG not in conv.reduced_physics
+        assert DP_FLAG not in other_reduced(conv)
     body, conv, _ = convert_str(HEX.replace("C3D8", "SC8R") + DEFORMATION_STEEL + COMPOSITE_MAT
                                 + "*Shell Section, elset=EALL, composite\n0.5, 3, STEEL, 0.\n0.5, 3, CFRP, 90.\n")
     solids = [ln for ln in body.splitlines() if ln.startswith("*SOLID SECTION")]
@@ -12393,7 +12450,7 @@ def test_deformation_plasticity_sections_name_no_orientation():
     body, conv, _ = convert_str(HEX + DEFORMATION_STEEL + "*Expansion, type=ORTHO\n1e-5, 2e-5, 3e-5\n"
                                 + TURNED_ORIENTATION + sec)
     assert "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL, ORIENTATION=OR" in body.splitlines()
-    assert DP_FLAG in conv.reduced_physics
+    assert DP_FLAG in other_reduced(conv)
 
 
 DP_SMALL = "*DEFORMATION PLASTICITY in a small-strain step (ccx 2.23 runs it under NLGEOM)"
@@ -12774,13 +12831,13 @@ def test_spherical_orientation_turning_across_an_element_is_warned():
     _, conv, rep = convert_str(_sphere_shells(3, quad="S4"))
     assert re.search(r"its spherical orientation turns the material directions by up to 1[0-9] degrees "
                      r"across an element;", rep.text())
-    assert conv.reduced_physics and "spherical orientation at element centres" in conv.reduced_physics[0]
+    assert other_reduced(conv) and "spherical orientation at element centres" in other_reduced(conv)[0]
     # 7.5-degree ones: under 4 degrees, no element corner on the poles counting
     _, conv, rep = convert_str(_sphere_shells(12, quad="S4"))
-    assert "across an element" not in rep.text() and not conv.reduced_physics
+    assert "across an element" not in rep.text() and not other_reduced(conv)
     # S3 and S4R take the directions at their one integration point, the centre, as ccx does
     _, conv, rep = convert_str(_sphere_shells(3, "3, 25."))
-    assert "across an element" not in rep.text() and not conv.reduced_physics
+    assert "across an element" not in rep.text() and not other_reduced(conv)
     # a flat membrane projects onto its own plane: turned about axis 3, the radial axis 1 Abaqus
     # projects tilts across each facet of 7.5 degrees by some 12 degrees
     _, conv, rep = convert_str(_sphere_shells(12, "3, 25.", "M3D4", "M3D3", "*Membrane Section"))

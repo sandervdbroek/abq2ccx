@@ -80,7 +80,8 @@ a different model without saying so. With it, these reframings are made, each wi
 * a connector under NLGEOM whose linear form is not exact (a hinge between two moving
   bodies) → written in its linear form;
 * an `*MPC LINK` → ccx's distance MPC in a deck whose first step is linear and a later one
-  NLGEOM.
+  NLGEOM;
+* `S4R` shells (ccx 2.23 bends them through hourglass control only) → `S4`.
 
 ## `--abaqus-umat`
 

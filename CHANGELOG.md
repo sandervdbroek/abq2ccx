@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **`S4R` shells** — ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single
+  point on the mid-surface, so only its hourglass control resists bending, in every step: a
+  simply supported plate of a/t 100 deflected 1/50 of the plate solution, vibrated 7× and
+  buckled 97× higher; at a/t 10 it deflected 3.7×. A plain `S4R` is now reduced physics, with a
+  warning; `--approximate` writes it as `S4` (within 2.5 % on those plates).
+* **Numbers longer than 20 characters** — ccx 2.23 reads only a field's first 20 characters, so
+  a longer number in the deck (or a `*PARAMETER` value) stopped it (`-5.148903517857142e-05`:
+  "*ERROR reading *CLOAD") or was read as another number (`2.500000000000000000e-1` as 2.5).
+  Such numbers are now written to 12 significant digits, with a note.
 * **Steps ccx cannot run: Riks and complex frequency** — a `*STATIC, RIKS` step without
   `--approximate` had only its procedure commented out, and ccx repeated the previous step's
   procedure (after a static step a load-controlled `*STATIC`) without a word; a `*COMPLEX

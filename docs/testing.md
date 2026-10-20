@@ -174,6 +174,8 @@ setting up its system: ccx 2.23 ends a step that sets up none with "Job finished
 | `buckle_displacement` (generated) | a `C3D20R` column pushed down at its top in a `*STEP, PERTURBATION` `*BUCKLE` step; the same push as a static preload before a buckling step loaded at mid-height | the top tied and given the static reaction as a force; Euler | 2.4e-7; Euler 0.4 % (ccx 2.23 as written: 2.389 for 40.87, only the top moved) |
 | `buckle_displacement_approximate` (generated) | `--approximate`: the column pushed down in a static step and again in a `*STEP, PERTURBATION` `*BUCKLE` step | the push without the preload | 1e-6 (with `PERTURBATION`: 2.389) |
 | `buckle_factors_near_one` (generated) | the `buckle_gravity_preload` column at about 10 times its buckling load | the factors of its spectrum (from a run at a low load) nearest 1; the `--run` digest's warning | 1e-5 (ccx returns those, not the lowest) |
+| `s4r_plate_static`, `_freq`, `_buckle` (generated) | a simply supported `S4R` plate, a/t 100, 16 × 16: pressure, frequency, a push at half the buckling load; flagged reduced physics, `--approximate` writes `S4` | Kirchhoff plate (Navier; π√(D/ρt)/a²; 4π²D/a²) | 2.5 % as `S4` (as `S4R`: 0.020×, 7.0×, 97×) |
+| `long_numbers` (generated) | a `C3D8` cube, its modulus and nodal forces written in 23 and 22 characters | 4F/E | 6 digits (ccx 2.23 as written: "*ERROR reading *CLOAD"; the modulus read as 1) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved; a node moves | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`

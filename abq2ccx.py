@@ -1480,6 +1480,12 @@ def short_real(x: float, digits: int = 9) -> str:
     return s if any(c in s for c in ".eEnN") else s + "."
 
 
+# Converter._short_fields: a line with a comma-separated piece over 20 characters, and the
+# text of a real number (a Fortran D exponent too)
+LONG_FIELD = re.compile(r"[^,]{21,}")
+LONG_REAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eEdD][+-]?\d+)?$")
+
+
 def fmt_num(value) -> str:
     """Format a float compactly but losslessly enough for FE input."""
     if isinstance(value, str):
@@ -15514,6 +15520,7 @@ class Converter:
         self._plan_u1_beams(blocks)
         self._plan_pretension_knots(blocks)     # after U1 (its beams need none); not planar
         self._plan_quadratic_shells(blocks)     # composite S3 / S4 / S4R -> S6 / S8R
+        self._plan_s4r_shells()                 # the S4R left (--approximate: S4)
         self._plan_ply_split(blocks)            # composite SC6R / SC8R -> one solid per ply
         self._plan_quadratic_membranes(blocks)  # M3D6 / M3D8 / M3D8R -> the converter's own solids
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
@@ -15570,10 +15577,50 @@ class Converter:
         out = self._keep_body_loads(out)        # after the restore, which gives body loads too
         self._audit_loads(blocks, out)
         out = self._shift_total_time(out)       # after every pass that writes load cards
+        out = self._short_fields(out)           # last: every card is written
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
                              + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
                              "own solution (see the warnings above).")
+        return out
+
+    def _short_fields(self, out: List[str]) -> List[str]:
+        """The converted deck with every real number longer than 20 characters (blanks
+        removed, as ccx reads a field) rewritten to 12 significant digits (short_real): ccx
+        2.23 reads only a field's first 20 characters, so such a number — a deck's own text
+        passed through, or a repr the converter wrote — stops ccx where the cut leaves an
+        unreadable exponent ('*ERROR reading *CLOAD' on -5.148903517857142e-05) and is
+        silently another number where it leaves a readable one (2.500000000000000000e-1 is
+        read as 2.5; probed on *CLOAD, *ELASTIC, *NODE).  Data fields and keyword parameter
+        values; integers, labels and *HEADING text stay as they are."""
+        done: List[Tuple[str, str, str]] = []           # (card, old text, new text)
+        kw = ""
+
+        def short(field: str) -> str:
+            text = "".join(field.split())
+            if len(text) <= 20 or not LONG_REAL.match(text) or text.lstrip("+-").isdigit():
+                return field
+            v = pf(text)
+            if not math.isfinite(v):
+                return field
+            done.append((kw, text, short_real(v, 12)))
+            return field[:len(field) - len(field.lstrip())] + done[-1][2]
+
+        for i, ln in enumerate(out):
+            if ln.startswith("**"):
+                continue
+            if ln.startswith("*"):
+                kw = "*" + ln[1:].split(",")[0].strip().upper()
+                if LONG_FIELD.search(ln):
+                    head, *params = ln.split(",")
+                    out[i] = ",".join([head] + [p.split("=", 1)[0] + "=" + short(p.split("=", 1)[1])
+                                                if "=" in p else p for p in params])
+            elif kw != "*HEADING" and LONG_FIELD.search(ln):
+                out[i] = ",".join(short(f) for f in ln.split(","))
+        if done:
+            self.report.note(f"{len(done)} number(s) longer than the 20 characters a ccx 2.23 field "
+                             f"holds written to 12 significant digits (e.g. {done[0][0]} "
+                             f"{done[0][1]} -> {done[0][2]}).")
         return out
 
     def _plan_surface_behavior(self, blocks: List[Block]) -> None:
@@ -18497,6 +18544,44 @@ class Converter:
                              "nodes where its node set did not take them (a load counts the set, or "
                              "the node is held by an *EQUATION): their BCs and ties are in its local "
                              "DOFs too.", once=True)
+
+    def _plan_s4r_shells(self) -> None:
+        """The S4R shells left after the composite upgrade (_plan_quadratic_shells).  ccx 2.23
+        expands an S4R into one C3D8R brick through the thickness (gen3delem.f), integrated
+        at a single point on the mid-surface, where bending strains vanish: its bending, out
+        of plane and in plane, is resisted only by the brick's hourglass stiffness, not by
+        the section.  Probed on a simply supported square plate (16 x 16 elements): at a/t =
+        100 it deflects 1/50 of the plate solution under pressure, vibrates 7x and buckles
+        97x higher; at a/t = 10 it deflects 3.7x too much — closing in only slowly with the
+        mesh — while membrane stretching is right.  So: reduced physics, or under
+        --approximate S4 (ccx's C3D8I expansion: within 2.5 % on the same 16 x 16 plates)."""
+        hits: Dict[str, int] = {}
+        for e, (typ, conn) in self.geom.elements.items():
+            if ccx_type(typ) != "S4R":
+                continue
+            hits[typ.upper()] = hits.get(typ.upper(), 0) + 1
+            if self._approx:            # S4RT stays coupled temperature-displacement: S4T
+                new = "S4" + split_suffixes(typ)[1]
+                self.geom.elements[e] = (new, conn)
+                self._elem_types.add(new)
+        if not hits:
+            return
+        what = f"{'/'.join(sorted(hits))} ({sum(hits.values())} elements)"
+        why = ("ccx 2.23 expands an S4R into one C3D8R brick integrated at a single point on the "
+               "mid-surface, so its bending (out of plane and in plane) is resisted only by "
+               "hourglass control, not by the section — far too stiff on thin shells, too soft "
+               "on thick ones (probed on a simply supported plate, 16 x 16 elements: at a/t = 100 "
+               "1/50 of the plate deflection, 7x the frequency, 97x the buckling load; at a/t = "
+               "10 3.7x the deflection); membrane stretching is right")
+        if self._approx:
+            self.report.warn(f"[APPROX] Element {what} written as S4: {why}. ccx's S4 (a C3D8I "
+                             f"brick) is Abaqus' fully integrated shell, not the deck's S4R; both "
+                             f"converge to the shell solution (S4 within 2.5 % on those plates, "
+                             f"stiffer on coarse meshes of thin shells: 26 % at 8 x 8).")
+        else:
+            self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
+                             f"S4 (within 2.5 % on those plates), or mesh with S4 or S8R.")
+            self._reduces("element S4R (ccx 2.23 bends it through hourglass control only)")
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads
@@ -27196,7 +27281,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="opt-in: reframe constructs ccx cannot run as approximately equivalent "
                          "ones it can (Riks->static, nu>=0.5 clamped, I-beam in space->U1 or RECT, "
                          "NLGEOM follower tractions->fixed nodal forces, surface elements with "
-                         "rebar or mass->left out), each with a loud [APPROX] warning")
+                         "rebar or mass->left out, S4R->S4), each with a loud [APPROX] warning")
     ap.add_argument("--abaqus-umat", action="store_true",
                     help="opt-in: write *USER MATERIAL materials for ccx's Abaqus-UMAT interface "
                          "(ABAQUS<name>, ABAQUSNL<name> under NLGEOM), for a ccx rebuilt with the "

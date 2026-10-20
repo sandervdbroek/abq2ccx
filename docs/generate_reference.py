@@ -586,6 +586,8 @@ def element_status(t):
         own = "direct" if t in A.CCX_ELEMENTS else (
             f"→ `{A.ccx_element_type(t, A.Report())}` (exact)" if t in A.EXACT_SUBSTITUTIONS else
             f"→ `{A.ccx_element_type(t, A.Report())}` (substituted: reduced physics)")
+        if A.ccx_element_type(t, A.Report()) == "S4R":
+            own += " — bends through hourglass control only in ccx 2.23 (reduced physics; `--approximate` → `S4`)"
         return f"{own}; under a composite section → `{up}` with midside nodes (reduced physics)"
     if t in A.EXACT_SUBSTITUTIONS:
         return f"→ `{A.ccx_element_type(t, A.Report())}` (exact)"
@@ -652,7 +654,12 @@ def gen_elements():
                          "(`STACK DIRECTION`), each its share of the thickness with its material and "
                          "ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both "
                          "are validated against classical lamination theory and Pagano's 3-D "
-                         "solution (`validate_with_ccx.py composite_plate_*`).\n")
+                         "solution (`validate_with_ccx.py composite_plate_*`). ccx 2.23 expands an "
+                         "`S4R` into one `C3D8R` brick integrated at a single point on the "
+                         "mid-surface, so only hourglass control resists its bending (a simply "
+                         "supported plate, a/t 100: deflection 1/50, buckling load 97×); "
+                         "`--approximate` writes `S4`, within 2.5 % there "
+                         "(`validate_with_ccx.py s4r_plate_*`).\n")
         if cat == "membrane":
             parts.append("ccx 2.23 expands every membrane element into a solid on nodes of its own "
                          "and leaves the mid-thickness node of a quadratic element's corners free "
