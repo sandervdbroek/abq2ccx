@@ -2280,7 +2280,7 @@ RIGID_DYNAMIC = {"solid": ((0.5, 0.5, 2.), (0.4, 0., 0.), (0.3, 0., 0.2), (5, 6,
 RIGID_MESH = {"mpc": "solid", "transformed": "solid", "pin": "shell"}     # the others' own
 
 
-def rigid_dynamic_deck(member="solid", proc="dynamic"):
+def rigid_dynamic_deck(member="solid", proc="dynamic", before=""):
     """Members moved rigidly by node 100, which moves and turns over a slow step: the top face
     of a column of two C3D8 (``member`` 'solid': a *RIGID BODY; 'mpc': *MPC BEAM lines;
     'transformed': a *RIGID BODY on nodes with an oblique *TRANSFORM), or the tip edge of a
@@ -2289,7 +2289,7 @@ def rigid_dynamic_deck(member="solid", proc="dynamic"):
     the Abaqus deck, a linear *DYNAMIC step; 'static': the same mesh in a *STATIC step with
     the members' DOFs prescribed to the linear rigid motion u = u_100 + theta x d (shell
     rotations: theta), the answer of Abaqus' linearized rigid body (RIGID_DYNAMIC: the motion
-    and the free nodes)."""
+    and the free nodes).  ``before``: steps before the dynamic one."""
     x0, t0, th, _ = RIGID_DYNAMIC[RIGID_MESH.get(member, member)]
     if member in ("solid", "mpc", "transformed"):
         nodes = {1: (0., 0., 0.), 2: (1., 0., 0.), 3: (1., 1., 0.), 4: (0., 1., 0.), 5: (0., 0., 1.),
@@ -2325,7 +2325,7 @@ def rigid_dynamic_deck(member="solid", proc="dynamic"):
             deck += "*TRANSFORM, NSET=TIP\n0.6, 0., 0.8, 0., 1., 0.\n"
         drive = "".join(f"100, {j + 1}, {j + 1}, {t0[j]}\n" for j in range(len(dofs)))
         drive += "".join(f"100, {k}, {k}, {th[k - 4]}\n" for k in ((6,) if member == "planar" else (4, 5, 6)))
-        return (deck + "*STEP, INC=1000\n*DYNAMIC\n0.01, 1.\n*BOUNDARY\n" + fixed
+        return (deck + before + "*STEP, INC=1000\n*DYNAMIC\n0.01, 1.\n*BOUNDARY\n" + fixed
                 + "*BOUNDARY, AMPLITUDE=R\n" + drive + "*NODE PRINT, NSET=NALL"
                 + (", GLOBAL=YES" if member == "transformed" else "") + "\nU\n*END STEP\n")
     bcs = ""
@@ -2606,6 +2606,41 @@ def pert_join_deck(held="21, 4, 6"):
             "JOIN,\n*BOUNDARY\n20, 1, 6\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n"
             f"*STEP\n*FREQUENCY\n3\n*BOUNDARY\n{held}\n*END STEP\n"
             "*STEP\n*STATIC\n*CLOAD\n7, 3, 1.\n*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
+
+
+def after_pert_deck(case, twin=False):
+    """A column of four unit C3D8 (E 1000, nu 0.3) held at its base, top nodes 17-20, for the
+    steps after a linear perturbation step.  "nlgeom": a small shear in a static step, a *STEP,
+    NLGEOM, PERTURBATION *FREQUENCY step, then a large tip shear (NLGEOM would give a quarter
+    of the linear deflection); "modal" / "ssd": with *PLASTIC (yield 1e3: elastic throughout),
+    a static step, *FREQUENCY and a *MODAL DYNAMIC step with Abaqus' preselected output (a
+    *STEADY STATE DYNAMICS step with element output of its own); "total": a tip load on a
+    TIME=TOTAL TIME amplitude (its value the total time) in two static steps around
+    *FREQUENCY and a 0.5 *MODAL DYNAMIC step.  ``twin``: the answer Abaqus gives — without
+    the perturbation steps ("nlgeom", "total"), the material elastic ("modal", "ssd")."""
+    nodes = "".join(f"{1 + 4 * k}, 0., 0., {k}.\n{2 + 4 * k}, 1., 0., {k}.\n{3 + 4 * k}, 1., 1., {k}.\n"
+                    f"{4 + 4 * k}, 0., 1., {k}.\n" for k in range(5))
+    elems = "".join(f"{k + 1}, " + ", ".join(str(n + 4 * k) for n in range(1, 9)) + "\n" for k in range(4))
+    plastic = "*PLASTIC\n1000., 0.\n1100., 0.1\n" if case in ("modal", "ssd") and not twin else ""
+    deck = (f"*NODE\n{nodes}*ELEMENT, TYPE=C3D8, ELSET=EALL\n{elems}*NSET, NSET=BOT\n1, 2, 3, 4\n"
+            f"*NSET, NSET=TOP\n17, 18, 19, 20\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n{plastic}"
+            f"*DENSITY\n1e-3\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*BOUNDARY\nBOT, 1, 3\n")
+    out = "*NODE PRINT, NSET=TOP\nU\n*END STEP\n"
+    if case == "nlgeom":
+        freq = "" if twin else "*STEP, NLGEOM, PERTURBATION\n*FREQUENCY\n2\n*END STEP\n"
+        return (deck + "*STEP\n*STATIC\n*CLOAD\nTOP, 2, 0.1\n" + out + freq +
+                "*STEP\n*STATIC\n0.05, 1.\n*CLOAD, OP=NEW\nTOP, 2, 20.\n" + out)
+    if case == "total":
+        load = "*STEP\n*STATIC\n0.5, 1.\n*CLOAD, AMPLITUDE=TT\n19, 2, 0.1\n" + out
+        pert = "" if twin else ("*STEP\n*FREQUENCY, STORAGE=YES\n2\n*END STEP\n*STEP\n*MODAL DYNAMIC\n"
+                                "0.1, 0.5\n*END STEP\n")
+        return deck + "*AMPLITUDE, NAME=TT, TIME=TOTAL TIME\n0., 0., 10., 10.\n" + load + pert + load
+    deck += ("*STEP\n*STATIC\n*CLOAD\nTOP, 2, 0.1\n*END STEP\n*STEP\n*FREQUENCY, STORAGE=YES\n4\n"
+             "*END STEP\n*STEP\n")
+    if case == "modal":
+        return deck + "*MODAL DYNAMIC\n0.01, 0.1\n*CLOAD\n19, 2, 1.\n" + out
+    return (deck + "*STEADY STATE DYNAMICS\n1., 5., 3\n*CLOAD\n19, 2, 1.\n*OUTPUT, FIELD\n"
+            "*NODE OUTPUT\nU\n*ELEMENT OUTPUT\nS\n" + out)
 
 
 def modal_own_loads_deck(base=True):
@@ -5802,9 +5837,13 @@ def main():
     # rotation there: 3-7 % off), against the linear rigid motion prescribed in a *STATIC step;
     # 'transformed': members with a *TRANSFORM (their rows in local axes; a *RIGID BODY was 7 %
     # off), 'pin': PIN members on shell nodes (no knot beams: no RIGID MPC needs them)
-    for member in ("solid", "mpc", "shell", "planar", "transformed", "pin"):
-        tag = f"rigid_dynamic_{member}"
-        u = review_run(rigid_dynamic_deck(member), tag, dat_displacements)
+    # 'after_nlgeom_frequency': a *STEP, NLGEOM *FREQUENCY step before it, whose NLGEOM Abaqus
+    # keeps in that step (the converter made the dynamic step NLGEOM and kept the *RIGID BODY)
+    nlfreq = "*STEP, NLGEOM, PERTURBATION\n*FREQUENCY\n2\n*BOUNDARY\nFIX, 1, 3\n*END STEP\n"
+    for member, before in [(m, "") for m in ("solid", "mpc", "shell", "planar", "transformed", "pin")] + \
+            [("solid", nlfreq)]:
+        tag = f"rigid_dynamic_{member}" + ("_after_nlgeom_frequency" if before else "")
+        u = review_run(rigid_dynamic_deck(member, before=before), tag, dat_displacements)
         src = os.path.join(tmp, f"{tag}_ref.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(rigid_dynamic_deck(member, "static"))
@@ -5822,7 +5861,8 @@ def main():
                     "solid", "pin": "a *RIGID BODY, PIN NSET on shell"}.get(member, f"a *RIGID BODY on {member}")
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what} members driven by a node that moves "
                   f"and turns over a slow linear "
-                  f"dynamic step): {len(ref)} node displacements vs the linear rigid motion prescribed "
+                  f"dynamic step{' after a *STEP, NLGEOM *FREQUENCY step' if before else ''}): "
+                  f"{len(ref)} node displacements vs the linear rigid motion prescribed "
                   f"in a static step, max difference {err:.1e} of max |u|; the free nodes moved "
                   f"{moved:.2f} of it (ccx's *RIGID BODY turns with the finite rotation there)")
         elif u:
@@ -6085,6 +6125,31 @@ def main():
             ok = err < 1e-9 * moved and moved > 1e-3
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): every displacement table "
                   f"{err:.1e} apart, nodes moved {moved:.3g}")
+        failures += 0 if ok else 1
+    # the steps after a linear perturbation step: NLGEOM written on it (Abaqus keeps it there;
+    # the converter switched it on for the next step), a plastic material in modal / steady-state
+    # dynamics (ccx 2.23 segfaulted on their element output and RF; dropped), and a TIME=TOTAL
+    # TIME amplitude after a modal dynamic step (ccx counts its time: read 0.5 late)
+    for tag, case, what, was in (
+            ("pert_nlgeom_static", "nlgeom", "a C3D8 column sheared, a *STEP, NLGEOM, PERTURBATION "
+             "*FREQUENCY step, then sheared hard: the last step as without the frequency step "
+             "(linear)", "NLGEOM, a quarter of it"),
+            ("plastic_modal_output", "modal", "a plastic C3D8 column below yield, *FREQUENCY and a "
+             "*MODAL DYNAMIC step with Abaqus' preselected output: its motion as with an elastic "
+             "material", "ccx segfaulted"),
+            ("plastic_ssd_output", "ssd", "the same with a *STEADY STATE DYNAMICS step writing "
+             "stresses: its response as with an elastic material", "ccx segfaulted"),
+            ("modal_total_time", "total", "a C3D8 column loaded on a TIME=TOTAL TIME amplitude in two "
+             "static steps around *FREQUENCY and a 0.5 *MODAL DYNAMIC step: the last step as "
+             "without the perturbation steps (total time 2)", "read at 2.5")):
+        runs = [review_run(after_pert_deck(case, twin), tag + ("_ref" if twin else ""), dat_node_blocks)
+                for twin in (False, True)]
+        ok = all(runs)
+        if ok:
+            err, moved = same(runs, None if case in ("modal", "ssd") else -1)
+            ok = err < 1e-7 * moved and moved > (1.0 if case == "nlgeom" else 1e-5)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {err:.1e} apart, the top moved "
+                  f"{moved:.4g} (before: {was})")
         failures += 0 if ok else 1
     # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
     # it too): the response to its own loads alone

@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **General steps after linear perturbation steps** — NLGEOM written on a perturbation step
+  switched NLGEOM on for the general steps after it (ccx then ran them nonlinear), kept ccx's
+  nonlinear `*RIGID BODY` in a `*DYNAMIC` deck (7 % off) and gave an Abaqus UMAT the
+  large-strain interface; Abaqus keeps it in that step, and the converter drops it there
+  where the base state is linear.
+  ccx 2.23 counts a `*MODAL DYNAMIC` step's time in the total time, so a later step read a
+  `TIME=TOTAL TIME` amplitude late (at 2.5 for 2.0); such steps now use a copy shifted by that
+  time. With a plastic or creeping material ccx segfaults in a `*BUCKLE` step, and in a
+  `*STATIC` or `*VISCO` step without NLGEOM after `*FREQUENCY`: now warned (reduced physics).
+  It also segfaulted on the element output and RF of modal and steady-state dynamics steps,
+  which are now left out there, with a warning.
 * **Coupling `INFLUENCE RADIUS=`** — ccx 2.23 ignores the parameter and coupled the whole
   surface. Abaqus couples the nodes of a node surface within the radius of the reference node,
   and every node of each element face with a node within it. A kinematic coupling now gets a

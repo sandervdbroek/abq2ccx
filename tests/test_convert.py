@@ -5813,6 +5813,123 @@ def test_frequency_base_temperatures():
     assert A.temperature_dependent(blk("DENSITY", {}, ["1., 20.", "2., 100."]))
 
 
+def test_nlgeom_on_a_perturbation_step_stays_in_it():
+    # "Linear perturbation steps have no effect on subsequent general analysis steps" (Abaqus
+    # 2017): NLGEOM written on one does not switch it on for the general steps after it, nor
+    # make a *DYNAMIC deck's rigid constraints nonlinear (validate_with_ccx.py
+    # pert_nlgeom_static / _rigid); on a linear base state it goes (ccx ignores it on
+    # *FREQUENCY, probed, but runs a static perturbation step, a general one in ccx, under it)
+    def heads(body):
+        return [s.split("\n")[0] for s in body.split("*STEP")[1:]]
+
+    nl = _deck_step("Frequency\n3", head=", nlgeom, perturbation")
+    load = "*Cload\n7, 3, -1.\n"
+    body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", load) + nl + _deck_step("Static", load))
+    assert heads(body) == ["", "", ""] and "forgets it" not in rep.text()
+    assert "*STEP, NLGEOM dropped on a linear perturbation step" in rep.text()
+    assert not conv._nl_any and not conv.reduced_physics
+    pst = _deck_step("Static", "*Cload\n7, 1, 1.\n", ", nlgeom, perturbation")
+    assert heads(convert_str(BUCKLE_CUBE + _deck_step("Static", load) + pst)[0]) == ["", ""]
+    # a general step's NLGEOM still carries on past the perturbation step (kept on it)
+    body, _, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", load, ", nlgeom") + nl + _deck_step("Static", load))
+    assert heads(body) == [", NLGEOM", ", NLGEOM, PERTURBATION", ", NLGEOM"] and "forgets it" in rep.text()
+    # the planners read it alike: an Abaqus UMAT keeps the small-strain interface
+    umat = UMAT_CUBE.format(name="Mat", step="") + _deck_step("Frequency\n2", head=", nlgeom")
+    body, _, _ = convert_str(umat, abaqus_umat=True)
+    assert "*MATERIAL, NAME=ABAQUSMat\n" in body
+    step = ("*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\nRP, 2, 6\n"
+            "*Boundary\nRP, 1, 1, 0.1\n*End Step\n")
+    rp = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n" + \
+        "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, elset=EALL, " \
+        "material=M\n*Rigid Body, ref node=RP, tie nset=TOPN\n"
+    body, conv, _ = convert_str(rp + _deck_step("Frequency\n2", "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n"
+                                                "4, 1, 3\n", ", nlgeom") + step)
+    assert "*RIGID BODY" not in "\n".join(_live(body)) and len(_equation_terms(body)) == 12
+    assert "NLGEOM" not in heads(body)[1]
+    # *EL FILE SDV in the linear static step after it (ccx segfaults there: _el_file_stops)
+    sdv = BUCKLE_CUBE.replace("*Density", "*Depvar\n2\n*Density")
+    body, _, _ = convert_str(sdv + _deck_step("Static", load) + nl + _deck_step(
+        "Static", load + "*Output, field\n*Element Output\nS, SDV\n"))
+    assert body.split("*STEP")[3].endswith("*EL FILE\nS\n*END STEP")
+
+
+def test_plastic_material_where_ccx_segfaults():
+    # ccx 2.23 segfaults on a plastic or creeping material (probed on both builds): in a
+    # *BUCKLE step, in a *STATIC / *VISCO step without NLGEOM after a *FREQUENCY step (warned,
+    # reduced physics; the moot ramp warning goes), and computing element results (any element
+    # output, RF) in modal and steady-state dynamics steps, which are dropped there — also
+    # where ccx would carry them in from an earlier step (a bare card ends that)
+    pl = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+          "*Plastic\n10., 0.\n20., 0.1\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
+          "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    load = "*Cload\n7, 1, 1.\n"
+    st, freq = _deck_step("Static", load), _deck_step("Frequency, storage=yes\n2")
+    _, conv, rep = convert_str(pl + st + freq + st)
+    assert "Step 3 (*STATIC, no NLGEOM) after a *FREQUENCY step in a model with a plastic" in rep.text()
+    assert conv.reduced_physics == ["*STATIC step after a *FREQUENCY step with a plastic or creeping "
+                                    "material (ccx 2.23 segfaults)"]
+    _, conv, rep = convert_str(pl + st + freq + _deck_step("Static", "*Cload\n7, 2, 1.\n"))
+    assert "ccx ramps them from 0" not in rep.text() and len(conv.reduced_physics) == 1
+    for runs in (_deck_step("Static", load, ", nlgeom") + freq + st,      # NLGEOM written again
+                 st + freq + _deck_step("Dynamic\n0.01, 0.1", load) + st):
+        assert "segfaults" not in convert_str(pl + runs)[2].text()
+    assert "segfaults" not in convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + st + freq
+                                          + st)[2].text()
+    creep = pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "*Creep, law=time\n1e-12, 1., 0.\n")
+    visco = _deck_step("Visco, cetol=1e-3\n0.1, 1.", load)
+    assert "Step 3 (*VISCO, no NLGEOM)" in convert_str(creep + visco + freq + visco)[2].text()
+    _, conv, rep = convert_str(pl + st + _deck_step("Buckle\n1", "*Cload\n7, 3, -1.\n"))
+    assert "*BUCKLE step 2 in a model with a plastic" in rep.text() and conv.reduced_physics
+    # modal dynamics: the preselected RF and element output it carries over (Abaqus) go
+    body, conv, rep = convert_str(pl + st + freq + _deck_step("Modal Dynamic\n0.1, 0.5", load))
+    assert body.split("*STEP")[3].endswith("*NODE FILE, FREQUENCY=10\nU, V\n*EL FILE\n*END STEP")
+    assert "*EL FILE S, E dropped from step 3: ccx 2.23 segfaults" in rep.text()
+    assert "*NODE FILE RF dropped from step 3" in rep.text() and not conv.reduced_physics
+    # steady-state dynamics with output of its own: ccx's carried *EL FILE and *NODE PRINT RF
+    ssd = _deck_step("Steady State Dynamics\n10., 100., 2", load + "*Output, field\n*Node Output\nU\n")
+    body, _, rep = convert_str(pl + st.replace("*End", "*Node print, nset=ALL\nU, RF\n*End") + freq + ssd)
+    assert body.split("*STEP")[3].endswith("*NODE FILE\nU\n*EL FILE\n*NODE PRINT, NSET=ALL\n*END STEP")
+    assert "Empty *NODE PRINT added to step 3" in rep.text() and "Empty *EL FILE added" in rep.text()
+    # an elastic model keeps them
+    body, _, rep = convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + st + freq + ssd)
+    assert "*EL FILE\n" not in body.split("*STEP")[3] and "segfaults" not in rep.text()
+
+
+def test_total_time_amplitudes_after_a_modal_dynamic_step():
+    # ccx 2.23 counts a *MODAL DYNAMIC step's time (and a static perturbation step's, a
+    # general step in ccx) in the total time, Abaqus no perturbation step's (probed: 2.5 for
+    # Abaqus' 2.0; validate_with_ccx.py modal_total_time): the later steps' cards use a copy of
+    # a TIME=TOTAL TIME amplitude shifted by that time, the base state given again too
+    deck = (BUCKLE_CUBE + "*Amplitude, name=TT, time=total time, shiftx=0.25\n0., 0., 10., 10.\n"
+            "*Amplitude, name=A\n0., 0., 1., 1.\n")
+    tt = "*Cload, amplitude=TT\n7, 1, 1.\n"
+    st, freq = _deck_step("Static\n0.5, 1.", tt), _deck_step("Frequency, storage=yes\n2")
+    md = _deck_step("Modal Dynamic\n0.1, 0.5", tt)
+    body, conv, rep = convert_str(deck + st + freq + md + md.replace("Dynamic", "Dynamic, continue=yes")
+                                  + _deck_step("Static", "*Cload, amplitude=A\n8, 1, 1.\n"))
+    steps = body.split("*STEP")
+    assert "*AMPLITUDE, NAME=TT, TIME=total time, SHIFTX=0.25\n0., 0., 10., 10.\n" \
+           "** abq2ccx: TT shifted by 0.5 for step(s) 4: ccx counts the perturbation steps' time in " \
+           "the total time, Abaqus does not\n*AMPLITUDE, NAME=TT_SHIFT, TIME=total time, SHIFTX=0.75\n" \
+           "0., 0., 10., 10.\n** abq2ccx: TT shifted by 1 for step(s) 5: ccx counts the perturbation " \
+           "steps' time in the total time, Abaqus does not\n*AMPLITUDE, NAME=TT_SHIFT~1, TIME=total " \
+           "time, SHIFTX=1.25\n0., 0., 10., 10.\n" in steps[0]
+    assert "AMPLITUDE=TT\n" in steps[1] and "AMPLITUDE=TT\n" in steps[3]
+    assert "AMPLITUDE=TT_SHIFT\n" in steps[4]
+    assert "*CLOAD, OP=NEW, AMPLITUDE=TT_SHIFT~1\n7, 1, 1." in steps[5] and "AMPLITUDE=A\n" in steps[5]
+    assert "written again as TT_SHIFT with SHIFTX=0.75" in rep.text() and not conv.reduced_physics
+    # *FREQUENCY, *BUCKLE and steady-state dynamics add no time in ccx: nothing to shift
+    body, _, rep = convert_str(deck + st + freq + _deck_step("Static", tt))
+    assert "_SHIFT" not in body and "TIME=TOTAL TIME) written again" not in rep.text()
+    # a static perturbation step's time counts in ccx (already reduced physics)
+    body, _, _ = convert_str(deck + st + _deck_step("Static\n0.5, 0.7", "*Cload\n7, 2, 1.\n",
+                                                    ", perturbation") + st)
+    assert "*AMPLITUDE, NAME=TT_SHIFT, TIME=total time, SHIFTX=0.95\n" in body
+    # an unknown period: warned
+    _, conv, rep = convert_str(deck + st + freq + md.replace("0.1, 0.5", "0.1") + _deck_step("Static", tt))
+    assert "of unknown time period" in rep.text() and conv.reduced_physics
+
+
 def test_buckle_perturbation_prescribed_displacements():
     # ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for prescribed displacements:
     # only those nodes move, by every nonzero BC value in force (probed: 2.389 for 40.87)
