@@ -226,6 +226,20 @@ physics.
   deflected 1/50 of the plate solution, vibrated 7× and buckled 97× higher; at a/t 10 it
   deflected 3.7×. A plain `S4R` is now reduced physics, with a warning; `--approximate` writes
   it as `S4` (within 2.5 % on those plates).
+* **One-point plane, membrane and beam elements** — ccx 2.23 expands `CPS4R`, `CPE4R`, `CAX4R`,
+  `M3D4R` and its own `B31R` into one `C3D8R` brick too, and the hourglass stiffness it adds to
+  that brick, all that resists the element's bending, grows with the square of the element's
+  size over the brick's depth: the plane thickness; 1 in the deck's length unit for plane
+  strain (a `CPE4R` cantilever deflected 1.02× beam theory in m, 0.06× in mm); the 2° sector,
+  0.035 r, for axisymmetry. Where the median ratio exceeds 3 (1.5 with a plastic material, as
+  that stiffness does not yield: a limit load +24 % on 4 elements through the depth), and on
+  every `M3D4R` (a stretched membrane under pressure: 0.16 of its deflection) and `B31R` (0.6–7×
+  beam theory), they are now reduced physics with a warning; `--approximate` writes `CPS4`,
+  `CPE4`, `CAX4`, `M3D4`, `B31`. A note where most `C3D8R` bricks are over 3 times as wide as
+  thick, which bend too stiffly in ccx.
+* **`--approximate` writes a coarse `S4R` as `S8R`** — where an element is more than 6
+  thicknesses wide, with midside nodes as on composite shells: `S4` locks there (8 × 8 elements,
+  a/t 100: 26 % in bending, a buckling load 37 % high), `S8R` is within 2 %.
 * **Numbers longer than 20 characters** — ccx 2.23 reads only a field's first 20 characters, so
   a longer number in the deck (or a `*PARAMETER` value) stopped it (`-5.148903517857142e-05`:
   "*ERROR reading *CLOAD") or was read as another number (`2.500000000000000000e-1` as 2.5).

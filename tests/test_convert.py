@@ -13739,19 +13739,122 @@ def test_plain_s4r_bends_only_through_hourglass_stiffness():
     assert "*ELEMENT, TYPE=S4R\n" in body and conv.reduced_physics == [S4R_FLAG]
     assert "Element S4R (2 elements): ccx 2.23 expands an S4R into one C3D8R brick" in rep.text()
     assert "Rerun with --approximate to write them as S4" in rep.text()
-    body, conv, rep = convert_str(deck, approximate=True)
+    # --approximate: S4 where an element is at most 6 thicknesses wide (here 5)
+    thick = deck.replace("material=CFRP\n0.1", "material=CFRP\n0.2")
+    body, conv, rep = convert_str(thick, approximate=True)
     assert "*ELEMENT, TYPE=S4\n" in body and "TYPE=S4R" not in body
     assert conv.geom.elements[1] == ("S4", [1, 2, 5, 4])
     assert "[APPROX] Element S4R (2 elements) written as S4: ccx 2.23 expands" in rep.text()
     assert conv.reduced_physics == ["--approximate: Element S4R (2 elements) written as S4"]
     # S4R5 runs as ccx's S4R too; the coupled S4RT stays coupled (S4T, ccx's S4)
-    body, _, rep = convert_str(deck.replace("type=S4R", "type=S4R5"), approximate=True)
+    body, _, rep = convert_str(thick.replace("type=S4R", "type=S4R5"), approximate=True)
     assert "*ELEMENT, TYPE=S4\n" in body and "Element S4R5 (2 elements) written as S4" in rep.text()
-    body, conv, rep = convert_str(deck.replace("type=S4R", "type=S4RT"), approximate=True)
+    body, conv, rep = convert_str(thick.replace("type=S4R", "type=S4RT"), approximate=True)
     assert "*ELEMENT, TYPE=S4\n" in body and conv.geom.elements[1][0] == "S4T"
+    # and S8R, as the composite upgrade writes it, where one is wider (10 thicknesses): S4 locks
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert conv.geom.elements[1] == ("S8R", [1, 2, 5, 4, 7, 8, 9, 10])
+    assert "*ELEMENT, TYPE=S8R\n" in body and "TYPE=S4" not in body
+    assert "[APPROX] Element S4R (2 elements) written as S8R: ccx 2.23 expands" in rep.text()
+    assert "The S8R have a node at the middle of every edge (nodes 7-13)" in rep.text()
+    assert conv.reduced_physics == ["--approximate: Element S4R (2 elements) written as S8R"]
+    assert _card_at(body, "*NSET, NSET=CLAMP") == ["1, 4, 10"]        # the clamped edge's midside node
     # a composite S4R runs as S8R: no S4R is left to warn about
     body, conv, rep = convert_str(deck.replace("material=CFRP\n0.1", "composite\n0.1, 3, CFRP, 0."))
     assert "TYPE=S8R" in body and "hourglass" not in rep.text() and S4R_FLAG not in conv.reduced_physics
+
+
+def _plane_strip(typ, nx, ny, L, b, section, extra="", x0=0.):
+    """A plane cantilever L x b (from x = x0) of nx x ny elements of ``typ``, clamped at its
+    first column of nodes, a tip load."""
+    nid = lambda i, j: j * (nx + 1) + i + 1                                     # noqa: E731
+    nodes = [f"{nid(i, j)}, {x0 + i * L / nx:.12g}, {j * b / ny:.12g}" for j in range(ny + 1)
+             for i in range(nx + 1)]
+    els = [f"{j * nx + i + 1}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+           for j in range(ny) for i in range(nx)]
+    return ("*Node\n" + "\n".join(nodes) + f"\n*Element, type={typ}, elset=S\n" + "\n".join(els)
+            + f"\n*Nset, nset=ROOT\n{', '.join(str(nid(0, j)) for j in range(ny + 1))}\n"
+            f"*Material, name=M\n*Elastic\n210000., 0.3\n{extra}*Solid Section, elset=S, material=M\n"
+            f"{section}*Boundary\nROOT, 1, 2\n*Step\n*Static\n*Cload\n{nid(nx, ny)}, 2, 1.\n*End Step\n")
+
+
+def test_one_point_plane_elements_flagged_by_their_depth():
+    # ccx 2.23 expands CPS4R / CPE4R / CAX4R into one C3D8R brick whose hourglass stiffness,
+    # all that resists the element's bending, grows with (in-plane size / brick depth)^2:
+    # flagged when the median ratio exceeds 3 (1.5 with a plastic material)
+    flag = "element CPS4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness, which its depth inflates)"
+    thin = _plane_strip("CPS4R", 4, 1, 1., 0.1, "0.01\n")              # 0.1 deep, 0.01 thick
+    _, conv, rep = convert_str(thin)
+    assert conv.reduced_physics == [flag]
+    assert "Element CPS4R (4 elements): ccx 2.23 expands a CPS4R into one C3D8R brick" in rep.text()
+    assert "the median ratio of the shorter in-plane size to it is 10 here" in rep.text()
+    _, conv, _ = convert_str(_plane_strip("CPS4R", 4, 1, 1., 0.1, "0.1\n"))
+    assert conv.reduced_physics == []
+    # plane strain: the default thickness 1 in the deck's own length unit
+    _, conv, rep = convert_str(_plane_strip("CPE4R", 4, 1, 1000., 100., ""))
+    assert conv.reduced_physics == [flag.replace("CPS4R", "CPE4R")]
+    assert "1 by default in the deck's length unit" in rep.text()
+    _, conv, _ = convert_str(_plane_strip("CPE4R", 4, 1, 1., 0.1, ""))
+    assert conv.reduced_physics == []
+    # ratio 2: an elastic material keeps the element, a plastic one does not
+    _, conv, _ = convert_str(_plane_strip("CPE4R", 4, 1, 1., 0.1, "0.05\n"))
+    assert conv.reduced_physics == []
+    _, conv, rep = convert_str(_plane_strip("CPE4R", 4, 1, 1., 0.1, "0.05\n", "*Plastic\n250., 0.\n"))
+    assert flag.replace("CPS4R", "CPE4R") in conv.reduced_physics
+    assert "is 2 here, with a plastic material" in rep.text()
+    # axisymmetric: the 2-degree sector, 0.035 r deep — a coarse disc, not a thin-walled tube
+    disc = _plane_strip("CAX4R", 4, 1, 1., 0.25, "")
+    _, conv, rep = convert_str(disc)
+    assert conv.reduced_physics == [flag.replace("CPS4R", "CAX4R")]
+    _, conv, _ = convert_str(_plane_strip("CAX4R", 1, 10, 0.05, 1., "", x0=1.))
+    assert conv.reduced_physics == []
+    # --approximate: the fully integrated twin, suffixes kept
+    body, conv, rep = convert_str(thin, approximate=True)
+    assert "*ELEMENT, TYPE=CPS4\n" in body and conv.geom.elements[1][0] == "CPS4"
+    assert "[APPROX] Element CPS4R (4 elements) written as CPS4: ccx 2.23 expands" in rep.text()
+    assert conv.reduced_physics == ["--approximate: Element CPS4R (4 elements) written as CPS4"]
+    for typ, new in (("CPE4RH", "CPE4H"), ("CPEG4R", "CPEG4"), ("CPE4RT", "CPE4T")):
+        _, conv, rep = convert_str(_plane_strip(typ, 4, 1, 1000., 100., ""), approximate=True)
+        assert conv.geom.elements[1][0] == new and f"Element {typ} (4 elements) written as CPE4" in rep.text()
+    _, conv, rep = convert_str(disc.replace("CAX4R", "CAX4RT"), approximate=True)
+    assert conv.geom.elements[1][0] == "CAX4T" and "locks in plastic flow too" in rep.text()
+
+
+def test_one_point_membranes_and_b31r_are_always_flagged():
+    # M3D4R: the brick's hourglass stiffness is a bending stiffness a membrane lacks; B31R
+    # (ccx's own element, not Abaqus') bends and twists only through it
+    mem = (S4R_STRIP.replace("type=S4R", "type=M3D4R") + "*Membrane Section, elset=PLATE, material=CFRP\n"
+           "0.1\n*Step\n*Static\n*Boundary\nCLAMP, 1, 3\n*Cload\nTIP, 1, 1.\n*End Step\n")
+    _, conv, rep = convert_str(mem)
+    assert conv.reduced_physics == ["element M3D4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"]
+    assert "Element M3D4R (2 elements): ccx 2.23 expands an M3D4R into one C3D8R brick" in rep.text()
+    body, conv, rep = convert_str(mem, approximate=True)
+    assert "*ELEMENT, TYPE=M3D4\n" in body and "written as M3D4: " in rep.text()
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=B31R, elset=B\n1, 1, 2\n"
+            "2, 2, 3\n*Material, name=M\n*Elastic\n210000., 0.3\n*Beam Section, elset=B, material=M, "
+            "section=RECT\n0.1, 0.1\n0., 0., -1.\n*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n3, 2, 1.\n"
+            "*End Step\n")
+    _, conv, rep = convert_str(beam)
+    assert conv.reduced_physics == ["element B31R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"]
+    assert "(B31R is ccx's own element; Abaqus has none)" in rep.text()
+    body, conv, rep = convert_str(beam, approximate=True)
+    assert "*ELEMENT, TYPE=B31\n" in body and conv.geom.elements[2] == ("B31", [2, 3])
+    assert conv.reduced_physics == ["--approximate: Element B31R (2 elements) written as B31"]
+
+
+def test_flat_c3d8r_bricks_get_a_note():
+    # ccx's hourglass stiffness grows with a brick's (width / thickness)^2: a note (no
+    # reframing) where most C3D8R bricks are flat; none for cubes
+    def deck(h):
+        return ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n" + "".join(
+            f"{k}, {x}, {y}, {h}\n" for k, x, y in ((5, 0., 0.), (6, 1., 0.), (7, 1., 1.), (8, 0., 1.)))
+            + "*Element, type=C3D8R, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*Material, name=M\n"
+            "*Elastic\n210000., 0.3\n*Solid Section, elset=E, material=M\n")
+    _, conv, rep = convert_str(deck(0.1))
+    assert "C3D8R (1 elements; a brick's width is a median 10 times its thickness)" in rep.text()
+    assert conv.reduced_physics == []
+    _, _, rep = convert_str(deck(1.))
+    assert "times its thickness" not in rep.text()
 
 
 def test_composite_s4r_bc_lines_reach_the_midside_nodes():

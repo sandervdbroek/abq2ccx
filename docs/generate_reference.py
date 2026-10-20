@@ -599,6 +599,16 @@ def element_category(t):
 
 
 def element_status(t):
+    own = _element_status(t)
+    twin = A.ONE_POINT_TWIN.get(A.ccx_element_type(t, A.Report()))
+    if twin and t not in A.SURFACE_ELEMENTS:
+        own += (" — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced "
+                + ("physics" if twin in ("M3D4", "B31") else "physics where its elements are over 3 "
+                   "depths wide (1.5 if plastic)") + f"; `--approximate` → `{twin}`")
+    return own
+
+
+def _element_status(t):
     if t in A.SURFACE_ELEMENTS:
         return "left out of the mesh; its loads → consistent nodal forces"
     if t in A.SLAB_TYPES:
@@ -617,7 +627,7 @@ def element_status(t):
             f"→ `{A.ccx_element_type(t, A.Report())}` (substituted: reduced physics)")
         if A.ccx_element_type(t, A.Report()) == "S4R":
             own += (" — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced "
-                    "physics; `--approximate` → `S4`)")
+                    "physics; `--approximate` → `S4`, `S8R` where coarse)")
         return f"{own}; under a composite section → `{up}` with midside nodes (reduced physics)"
     if t in A.EXACT_SUBSTITUTIONS:
         return f"→ `{A.ccx_element_type(t, A.Report())}` (exact)"
@@ -689,8 +699,10 @@ def gen_elements():
                          "mid-surface, so only the hourglass stiffness ccx adds to that brick "
                          "resists its bending, not the section (a simply "
                          "supported plate, a/t 100: deflection 1/50, buckling load 97×); "
-                         "`--approximate` writes `S4`, within 2.5 % there "
-                         "(`validate_with_ccx.py s4r_plate_*`).\n")
+                         "`--approximate` writes `S4`, within 2.5 % there, and `S8R` (midside "
+                         f"nodes as above) where an element is over {A.S4_MAX_WIDTH:g} thicknesses "
+                         "wide, as `S4` locks there (`validate_with_ccx.py s4r_plate_*`, "
+                         "`s4r_coarse_plate_*`).\n")
         if cat == "membrane":
             parts.append("ccx 2.23 expands every membrane element into a solid on nodes of its own "
                          "and leaves the mid-thickness node of a quadratic element's corners free "
@@ -699,7 +711,10 @@ def gen_elements():
                          "membrane node by `*EQUATION` (bottom + top = 2 × node), per corner node a "
                          "mid-thickness node equal to it, per `C3D20R` one equation that holds its "
                          "zero-energy hourglass; loads, faces and sets stay the membrane's "
-                         "(`validate_with_ccx.py quad_membrane_*`).\n")
+                         "(`validate_with_ccx.py quad_membrane_*`). `M3D4R` is one `C3D8R` brick, "
+                         "whose hourglass stiffness acts as a bending stiffness a membrane lacks (a "
+                         "stretched membrane under pressure, a/t 100: 0.16 of its deflection; "
+                         "`one_point_m3d4r`).\n")
         if cat == "plane stress":
             parts.append("ccx has no incompatible-mode plane element. `CPS4I` and `CPE4I` (the "
                          "latter on parallelograms: Abaqus adds a fifth, volumetric mode that acts "
@@ -717,7 +732,12 @@ def gen_elements():
                          "linear elasticity in static steps (`NLGEOM`, other materials, contact, "
                          "couplings, `*FREQUENCY` / `*BUCKLE`, whose mass and geometric stiffness are "
                          "not compared ...) the element runs as `CPS4`/`CPE4`, which locks in "
-                         "bending, and counts as reduced physics.\n")
+                         "bending, and counts as reduced physics. `CPS4R`, `CPE4R` and `CAX4R` are "
+                         "one `C3D8R` brick each, whose hourglass stiffness grows with the square of "
+                         "the element's size over the brick's depth (the plane thickness; a "
+                         "plane-strain one 1 in the deck's length unit; 0.035 r axisymmetric): "
+                         "beyond 3 they bend stiffer than `CPS4` (`one_point_cps4r`, "
+                         "`one_point_cpe4r`).\n")
         if cat == "rigid":
             parts.append("ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so "
                          "each rigid element becomes a force-free solid *skin* that its rigid body "
@@ -740,7 +760,9 @@ def gen_elements():
                          "quadratic beams (`B22`, `B32`, `PIPE22`, `PIPE32`). ccx's `B32` integrates at "
                          "3 × 3 × 3 and locks on coarse meshes (a cantilever's tip deflection under an "
                          "end load: 0.77 of beam theory on one element, 0.95 on two; exact on any "
-                         f"number of `{A.QUADRATIC_BEAM}`).\n")
+                         f"number of `{A.QUADRATIC_BEAM}`). ccx's own `B31R` (Abaqus has none) "
+                         "is one `C3D8R` brick that bends and twists only through its hourglass "
+                         "stiffness (`one_point_b31r`).\n")
             pairs = ", ".join(f"`{a}` → `{b}`" for a, b in A.QUADRATIC_UPGRADE.items())
             parts.append("Under a `*BEAM SECTION, SECTION=CIRC`, `PIPE`, `BOX` or `THICK PIPE` (emitted "
                          f"as `PIPE`), 2-node beams whose emitted type is {pairs} become 3-node beams: "

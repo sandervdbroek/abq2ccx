@@ -82,7 +82,10 @@ a different model without saying so. With it, these reframings are made, each wi
   bodies) → written in its linear form;
 * an `*MPC LINK` → ccx's distance MPC in a deck whose first step is linear and a later one
   NLGEOM;
-* `S4R` shells (ccx 2.23 bends them only through their `C3D8R`'s hourglass stiffness) → `S4`.
+* `S4R` shells (ccx 2.23 bends them only through their `C3D8R`'s hourglass stiffness) → `S4`,
+  or `S8R` with midside nodes where an element is more than 6 thicknesses wide;
+* flagged `CPS4R`, `CPE4R`, `CAX4R` (elements much larger than their brick's depth), `M3D4R`
+  and `B31R` (the same `C3D8R` hourglass stiffness) → `CPS4`, `CPE4`, `CAX4`, `M3D4`, `B31`.
 
 ## `--abaqus-umat`
 

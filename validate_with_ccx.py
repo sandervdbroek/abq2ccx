@@ -98,6 +98,7 @@ Exits 0 if every available check passes (or ccx is not installed — then it ski
 a clear message), 1 if a check fails.  Requires CalculiX; install it or FreeCAD.
 """
 
+import itertools
 import math
 import os
 import re
@@ -4085,6 +4086,63 @@ def s4r_plate_deck(step, n=16, t=0.01):
             for k, (x, y) in nodes.items() if x > 1 - 1e-9]
         ref = 2.0
     return "\n".join(lines + ["*END STEP"]) + "\n", ref
+
+
+def plane_cantilever_deck(typ, nx, ny, length, depth, thickness=None):
+    """(deck, Timoshenko tip deflection): a plane cantilever length x depth of nx x ny ``typ``
+    elements (E 210000, nu 0.3; plane thickness ``thickness``, Abaqus' 1 when None), its root
+    held, a unit load across its tip spread over the tip nodes; the tip nodes' mean deflection
+    is read."""
+    nid = lambda i, j: 1 + i + (nx + 1) * j     # noqa: E731
+    nodes = {nid(i, j): (i * length / nx, j * depth / ny) for j in range(ny + 1) for i in range(nx + 1)}
+    elems = [[nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)] for j in range(ny) for i in range(nx)]
+    tip = [nid(nx, j) for j in range(ny + 1)]
+    t = thickness or 1.0
+    e_mod = 210000. / (1 - 0.09) if typ.startswith("CPE") else 210000.
+    ref = length ** 3 / (3 * e_mod * t * depth ** 3 / 12) + length / (5 / 6 * 210000. / 2.6 * depth * t)
+    lines = (["*NODE"] + [f"{k}, {x:.12g}, {y:.12g}" for k, (x, y) in nodes.items()]
+             + [f"*ELEMENT, TYPE={typ}, ELSET=S"] + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+             + ["*NSET, NSET=ROOT"] + _ids([nid(0, j) for j in range(ny + 1)]) + ["*NSET, NSET=TIP"] + _ids(tip)
+             + ["*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.3", "*SOLID SECTION, ELSET=S, MATERIAL=M"]
+             + ([f"{thickness:.12g}"] if thickness else [])
+             + ["*BOUNDARY", "ROOT, 1, 2", "*STEP", "*STATIC", "*CLOAD"]
+             + [f"{k}, 2, {1.0 / len(tip):.12g}" for k in tip] + ["*NODE PRINT, NSET=TIP", "U", "*END STEP"])
+    return "\n".join(lines) + "\n", ref
+
+
+def stretched_membrane_deck(typ, n=16, t=0.01):
+    """(deck, membrane answer): a unit square of n x n ``typ`` membranes (E 210e9, nu 0.3), its
+    edges stretched by a strain 1e-3 in both directions in a first NLGEOM step and held, then a
+    pressure q in a second: the centre deflects 0.07367 q / N, N = E t 1e-3 / (1 - nu) (the
+    membrane's Poisson equation), about 1e-3 here."""
+    nodes, elems = sheet_mesh(typ, n, n)
+    tension = 210e9 * t * 1e-3 / 0.7
+    q = 1e-3 * tension / 0.07367
+    edge = [k for k, (x, y) in nodes.items() if min(x, y) < 1e-9 or max(x, y) > 1 - 1e-9]
+    mid = [k for k, (x, y) in nodes.items() if abs(x - 0.5) < 1e-9 and abs(y - 0.5) < 1e-9]
+    lines = (["*NODE"] + [f"{k}, {x:.12g}, {y:.12g}, 0." for k, (x, y) in nodes.items()]
+             + [f"*ELEMENT, TYPE={typ}, ELSET=S"] + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+             + ["*NSET, NSET=MID"] + _ids(mid)
+             + ["*MATERIAL, NAME=M", "*ELASTIC", "210e9, 0.3", "*MEMBRANE SECTION, ELSET=S, MATERIAL=M", f"{t:.12g}",
+                "*BOUNDARY"])
+    for k in edge:
+        x, y = nodes[k]
+        lines += [f"{k}, 1, 1, {1e-3 * (x - 0.5):.12g}", f"{k}, 2, 2, {1e-3 * (y - 0.5):.12g}", f"{k}, 3, 3"]
+    lines += ["*STEP, NLGEOM", "*STATIC", "0.5, 1.", "*END STEP", "*STEP, NLGEOM", "*STATIC", "0.25, 1.",
+              "*DLOAD", f"S, P, {q:.12g}", "*NODE PRINT, NSET=MID", "U", "*END STEP"]
+    return "\n".join(lines) + "\n", 0.07367 * q / tension
+
+
+def beam_cantilever_deck(typ, n=10, a=0.1):
+    """(deck, Timoshenko tip deflection): a unit cantilever of n ``typ`` beams, a x a RECT section
+    (E 210000, nu 0.3), clamped, a unit tip load across it."""
+    lines = (["*NODE"] + [f"{i + 1}, {i / n:.12g}, 0., 0." for i in range(n + 1)]
+             + [f"*ELEMENT, TYPE={typ}, ELSET=B"] + [f"{i + 1}, {i + 1}, {i + 2}" for i in range(n)]
+             + ["*NSET, NSET=TIP", str(n + 1), "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.3",
+                "*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT", f"{a:.12g}, {a:.12g}", "0., 0., -1.",
+                "*BOUNDARY", "1, 1, 6", "*STEP", "*STATIC", "*CLOAD", f"{n + 1}, 2, 1.",
+                "*NODE PRINT, NSET=TIP", "U", "*END STEP"])
+    return "\n".join(lines) + "\n", 1 / (3 * 210000. * a ** 4 / 12) + 1 / (5 / 6 * 210000. / 2.6 * a * a)
 
 
 def long_numbers_deck():
@@ -8959,23 +9017,64 @@ def main():
     def centre_w(dat):
         return [abs(u[2]) for u in dat_displacements(dat).values()]
 
-    for step, what, read in (
+    # (S4 where an element is at most 6 thicknesses wide, S8R through the composite upgrade
+    # where it is wider: S4 locks there)
+    for (step, what, read), (n, twin, kind) in itertools.product((
             ("static", "centre deflection under pressure", centre_w),
             ("freq", "lowest frequency", lambda d: dat_eigen_table(d, "E I G E N V A L U E   O U T P U T")),
-            ("buckle", "buckling factor at half the buckling load", factors)):
-        tag = f"s4r_plate_{step}"
-        text, ref = s4r_plate_deck(step)
+            ("buckle", "buckling factor at half the buckling load", factors)),
+            ((20, "S4", "plate"), (4, "S8R", "coarse_plate"))):
+        tag = f"s4r_{kind}_{step}"
+        text, ref = s4r_plate_deck(step, n=n)
         raw = review_run(text, tag, read)
         _, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
-        s4 = review_run(text, tag + "_approximate", read, approximate=True)
-        ok = bool(raw and s4)
+        app = review_run(text, tag + "_approximate", read, approximate=True)
+        ok = bool(raw and app)
         if ok:
             flagged = any(r.startswith("element S4R") for r in conv.reduced_physics)
-            err = abs(s4[0] / ref - 1)
-            ok = flagged and err < 0.03 and s4[0] > 0
-            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a simply supported S4R plate, a/t = 100, 16 x 16, "
-                  f"its {what}): {s4[0]:.5g} written as S4 (--approximate), {err:.1%} off the plate "
-                  f"solution {ref:.5g}; as S4R {raw[0] / ref:.3g} times it, "
+            with open(os.path.join(tmp, f"{tag}_approximate.inp"), encoding="utf-8") as fh:
+                written = f"*ELEMENT, TYPE={twin}\n" in fh.read()
+            err = abs(app[0] / ref - 1)
+            ok = flagged and written and err < 0.03 and app[0] > 0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a simply supported S4R plate, a/t = 100, {n} x {n}, "
+                  f"its {what}): {app[0]:.5g} written as {twin if written else 'NOT ' + twin} "
+                  f"(--approximate), {err:.1%} off the plate solution {ref:.5g}; as S4R "
+                  f"{raw[0] / ref:.3g} times it, {'flagged' if flagged else 'NOT flagged'} reduced physics")
+        failures += 0 if ok else 1
+
+    # CPS4R / CPE4R / M3D4R / B31R are expanded into one C3D8R brick too, its hourglass stiffness
+    # following the brick, not the section: flagged where that is far off (a plane element much
+    # larger than its depth — a plane-strain one: than 1 in the deck's length unit —, any
+    # membrane, ccx's B31R); --approximate writes the fully integrated element, within 4 % here
+    def tip_v(dat):
+        u = dat_displacements(dat)
+        return [sum(v[1] for v in u.values()) / len(u)] if u else None
+
+    def centre_w2(dat):
+        return [abs(u[2]) for u in dat_displacements(dat).values()]
+
+    for tag, (text, ref), twin, read, what in (
+            ("one_point_cps4r", plane_cantilever_deck("CPS4R", 40, 8, 1., 0.1, 0.001), "CPS4", tip_v,
+             "a CPS4R cantilever 1 x 0.1 of 40 x 8 elements, 0.001 thick, its tip deflection"),
+            ("one_point_cpe4r", plane_cantilever_deck("CPE4R", 40, 8, 1000., 100.), "CPE4", tip_v,
+             "a CPE4R cantilever 1000 x 100 (mm) of 40 x 8 elements, its tip deflection"),
+            ("one_point_m3d4r", stretched_membrane_deck("M3D4R"), "M3D4", centre_w2,
+             "a stretched M3D4R membrane, 16 x 16, a/t = 100, its centre deflection under pressure"),
+            ("one_point_b31r", beam_cantilever_deck("B31R"), "B31", tip_v,
+             "a B31R cantilever of 10 elements, L/a = 10, its tip deflection")):
+        raw = review_run(text, tag, read)
+        _, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
+        app = review_run(text, tag + "_approximate", read, approximate=True)
+        ok = bool(raw and app)
+        if ok:
+            flagged = any(r.startswith("element " + twin) for r in conv.reduced_physics)
+            with open(os.path.join(tmp, f"{tag}_approximate.inp"), encoding="utf-8") as fh:
+                written = f"*ELEMENT, TYPE={twin}\n" in fh.read()
+            err = abs(app[0] / ref - 1)
+            ok = flagged and written and err < 0.04 and app[0] > 0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {app[0]:.5g} written as "
+                  f"{twin if written else 'NOT ' + twin} (--approximate), {err:.1%} off theory "
+                  f"{ref:.5g}; as written {raw[0] / ref:.3g} times it, "
                   f"{'flagged' if flagged else 'NOT flagged'} reduced physics")
         failures += 0 if ok else 1
 

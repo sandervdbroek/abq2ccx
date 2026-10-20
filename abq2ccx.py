@@ -408,6 +408,16 @@ SHEET_SHELLS = {"S3", "S4", "S4R", "S6", "S8", "S8R"}   # the shells ccx expands
 # SECTION', probed on S3, S4, S4R, S8): emitted linear shell -> the quadratic shell its
 # composite section runs on, with a node at the middle of every edge (_plan_quadratic_shells)
 COMPOSITE_SHELL_UPGRADE = {"S3": "S6", "S4": "S8R", "S4R": "S8R"}
+# --approximate writes an S4R more than this many thicknesses wide (the square root of its
+# area) as S8R, else as S4 (Converter._plan_s4r_shells)
+S4_MAX_WIDTH = 6.0
+# Elements ccx 2.23 also expands into one C3D8R brick integrated at a single point
+# (gen3delem.f; the S4R is _plan_s4r_shells') -> the fully integrated element --approximate
+# writes them as (Converter._plan_one_point_bricks)
+ONE_POINT_TWIN = {"CPS4R": "CPS4", "CPE4R": "CPE4", "CAX4R": "CAX4", "M3D4R": "M3D4", "B31R": "B31"}
+# the median ratio of a plane / axisymmetric one's shorter in-plane size to its brick's depth
+# above which it is flagged: elastic materials, plastic ones
+ONE_POINT_DEPTH_RATIO = (3.0, 1.5)
 # Continuum shells under a composite section: one ccx solid per ply (_plan_ply_split); the
 # default limit on the solids that adds (--max-ply-elements)
 PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
@@ -3643,6 +3653,27 @@ def _face_area(p: Sequence[Vec]) -> float:
     if len(p) == 3:
         return 0.5 * vnorm(vcross(vsub(p[1], p[0]), vsub(p[2], p[0])))
     return 0.5 * vnorm(vcross(vsub(p[2], p[0]), vsub(p[3], p[1])))
+
+
+def quad_extent(p: Sequence[Vec]) -> Tuple[float, float]:
+    """(area, shorter size) of a quadrilateral from its one-point Jacobian: its mid-lines (edge
+    4-1 to edge 2-3, edge 1-2 to edge 3-4) span the area, and the shorter size is the area over
+    the longer mid-line (a rectangle's shorter side)."""
+    g1 = vscale(vsub(vadd(p[1], p[2]), vadd(p[0], p[3])), 0.5)
+    g2 = vscale(vsub(vadd(p[2], p[3]), vadd(p[0], p[1])), 0.5)
+    area = vnorm(vcross(g1, g2))
+    longer = max(vnorm(g1), vnorm(g2))
+    return area, (area / longer if longer > 0 else 0.0)
+
+
+def brick_flatness(p: Sequence[Vec]) -> Optional[float]:
+    """A hexahedron's middle size over its smallest (from its mid-lines): 1 for a cube, 10 for a
+    tile ten times as wide as thick; None for a degenerate one."""
+    size = sorted(math.sqrt(sum((p[a][x] + p[b][x] + p[c][x] + p[d][x] - p[e][x] - p[f][x] - p[g][x]
+                                 - p[h][x]) ** 2 for x in range(3)))
+                  for a, b, c, d, e, f, g, h in ((1, 2, 5, 6, 0, 3, 4, 7), (2, 3, 6, 7, 0, 1, 4, 5),
+                                                 (4, 5, 6, 7, 0, 1, 2, 3)))
+    return size[1] / size[0] if size[0] > 0 else None
 
 
 def _tet_volume(a: Vec, b: Vec, c: Vec, d: Vec) -> float:
@@ -19234,7 +19265,8 @@ class Converter:
         self._plan_truss_copies(blocks)         # after U1 and the pre-tension cuts
         self._plan_pretension_knots(blocks)     # after U1 (its beams need none); not planar
         self._plan_quadratic_shells(blocks)     # composite S3 / S4 / S4R -> S6 / S8R
-        self._plan_s4r_shells()                 # the S4R left (--approximate: S4)
+        self._plan_s4r_shells(blocks)           # the S4R left (--approximate: S4 / S8R)
+        self._plan_one_point_bricks(blocks)     # CPS4R, CPE4R, CAX4R, M3D4R, B31R; flat C3D8R
         self._plan_ply_split(blocks)            # composite SC6R / SC8R -> one solid per ply
         self._plan_quadratic_membranes(blocks)  # M3D6 / M3D8 / M3D8R -> the converter's own solids
         self._plan_shell_density(blocks)        # after the ply split: its stacks and ply materials
@@ -21878,49 +21910,265 @@ class Converter:
                              "the node is held by an *EQUATION): their BCs and ties are in its local "
                              "DOFs too.", once=True)
 
-    def _plan_s4r_shells(self) -> None:
+    def _plan_s4r_shells(self, blocks: List[Block]) -> None:
         """The S4R shells left after the composite upgrade (_plan_quadratic_shells).  ccx 2.23
         expands an S4R into one C3D8R brick through the thickness (gen3delem.f: 'C3D8R L'),
         integrated at a single point on the mid-surface, where bending strains vanish: its
         bending, out of plane and in plane, is an hourglass mode of the brick.  ccx adds
-        hourglass stiffness to every C3D8R, the expanded shell's too (e_c3d.f: hgstiffness;
-        resultsmech.f: hgforce, about 1.34x stiffer, in steps it solves nonlinear), and that is
-        all that resists the bending — it follows the brick's size, not the section's E t^3
-        (a coarse strip deflects 10x, not 1000x, more at a tenth of the thickness).  Probed on
-        a simply supported square plate (16 x 16 elements): at a/t = 100 it deflects 1/50 of
-        the plate solution under pressure, vibrates 7x and buckles 97x higher; at a/t = 10 it
-        deflects 3.7x too much — closing in only slowly with the mesh — while membrane
-        stretching is right.  So: reduced physics, or under --approximate S4 (ccx's C3D8I
-        expansion: within 2.5 % on the same 16 x 16 plates)."""
-        hits: Dict[str, int] = {}
-        for e, (typ, conn) in self.geom.elements.items():
-            if ccx_type(typ) != "S4R":
-                continue
-            hits[typ.upper()] = hits.get(typ.upper(), 0) + 1
-            if self._approx:            # S4RT stays coupled temperature-displacement: S4T
-                new = "S4" + split_suffixes(typ)[1]
-                self.geom.elements[e] = (new, conn)
-                self._elem_types.add(new)
-        if not hits:
+        hourglass stiffness to every C3D8R, the expanded shell's too (e_c3d.f: hgstiffness,
+        scaled with the material's first elastic constant: E for an isotropic *ELASTIC, C1111
+        — 1.35 E at nu 0.3 — for a plastic or anisotropic one), and that is all that resists
+        the bending — it follows the brick's size, not the section's E t^3 (a coarse strip
+        deflects 10x, not 1000x, more at a tenth of the thickness).  Probed on a simply
+        supported square plate (16 x 16 elements): at a/t = 100 it deflects 1/50 of the plate
+        solution under pressure, vibrates 7x and buckles 97x higher; at a/t = 10 it deflects
+        3.7x too much — closing in only slowly with the mesh — while membrane stretching is
+        right.  So: reduced physics, or under --approximate S4 (ccx's C3D8I expansion: within
+        2.5 % on the same plates, whose elements are 6.25 thicknesses wide) — and S8R, through
+        the composite upgrade (_upgrade_linear_shells, its linear neighbours too), where an
+        element is wider than S4_MAX_WIDTH thicknesses: S4 locks there (8 x 8 elements, a/t =
+        100: 26 % in bending, a buckling load 37 % high; 7 % / 15 % off at 8.3 / 10
+        thicknesses), S8R is within 2 % from 4 x 4 elements at a/t 100 (8 x 8 at 1000), and
+        within 1.3 % on a Scordelis-Lo roof of 4 x 4 elements per quarter (S4 46 %)."""
+        s4r = [e for e, (typ, _c) in self.geom.elements.items() if ccx_type(typ) == "S4R"]
+        if not s4r:
             return
-        what = f"{'/'.join(sorted(hits))} ({sum(hits.values())} elements)"
+        hits: Dict[str, int] = {}
+        for e in s4r:
+            typ = self.geom.elements[e][0].upper()
+            hits[typ] = hits.get(typ, 0) + 1
+        what = f"{'/'.join(sorted(hits))} ({len(s4r)} elements)"
         why = ("ccx 2.23 expands an S4R into one C3D8R brick integrated at a single point on the "
                "mid-surface, so its bending (out of plane and in plane) is resisted only by the "
                "hourglass stiffness ccx adds to that brick, not by the section — far too stiff "
                "on thin shells, too soft on thick ones (probed on a simply supported plate, 16 x "
                "16 elements: at a/t = 100 1/50 of the plate deflection, 7x the frequency, 97x the "
                "buckling load; at a/t = 10 3.7x the deflection); membrane stretching is right")
-        if self._approx:
-            self.report.warn(f"[APPROX] Element {what} written as S4: {why}. ccx's S4 (a C3D8I "
-                             f"brick) is Abaqus' fully integrated shell, not the deck's S4R; both "
-                             f"converge to the shell solution (S4 within 2.5 % on those plates; "
-                             f"stiffer on coarse meshes of thin shells: on 8 x 8 elements 26 % in "
-                             f"bending, a buckling load 37 % high).")
-        else:
+        if not self._approx:
             self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
-                             f"S4 (within 2.5 % on those plates), or mesh with S4 or S8R.")
+                             f"S4 (within 2.5 % on those plates), or as S8R where an element is "
+                             f"more than {S4_MAX_WIDTH:g} thicknesses wide, or mesh with S4 or S8R.")
             self._reduces("element S4R (ccx 2.23 bends it only through its C3D8R's hourglass "
                           "stiffness)")
+            return
+        thick = self._section_thickness(blocks, ("SHELL SECTION", "SHELL GENERAL SECTION"))
+        corners = self._linear_shell_corners()
+        seeds = []
+        for e in s4r:
+            t = thick.get(e, (None, ""))[0]
+            if not t or len(corners.get(e, ())) != 4:
+                continue
+            area = quad_extent([self.geom.nodes[n] for n in corners[e]])[0]
+            if math.sqrt(area) > S4_MAX_WIDTH * t:
+                seeds.append(e)
+        up: set = set()
+        if seeds:
+            up, kinds, span, beams = self._upgrade_linear_shells(blocks, corners, seeds)
+        n_s4 = 0
+        for e in s4r:
+            if e in up:
+                continue
+            typ, conn = self.geom.elements[e]
+            new = "S4" + split_suffixes(typ)[1]     # S4RT stays coupled temperature-displacement
+            self.geom.elements[e] = (new, conn)
+            self._elem_types.add(new)
+            n_s4 += 1
+        parts = [f"S8R ({len(s4r) - n_s4}) and S4 ({n_s4})"] if up and n_s4 else \
+            ["S8R" if up else "S4"]
+        added = ""
+        if up:
+            others = sorted(k for k in kinds if k.split(" ->")[0] not in hits)
+            added = (f" The S8R have a node at the middle of every edge ({span})"
+                     + (f"; {sum(kinds[k] for k in others)} other linear shell(s) joined to them by "
+                        f"an edge were upgraded too ({', '.join(others)}), so no midside node hangs"
+                        if others else "")
+                     + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams "
+                        f"through its midside node" if beams else "")
+                     + ". BCs, temperatures and initial conditions on both ends of an edge reach its "
+                       "midside node, and so do the node sets of BCs, couplings, ties and output.")
+        self.report.warn(f"[APPROX] Element {what} written as {parts[0]}: {why}. ccx's "
+                         f"S4 (a C3D8I brick) and S8R are Abaqus' fully integrated and quadratic "
+                         f"shells, not the deck's S4R; S4 is within 2.5 % on elements up to about "
+                         f"{S4_MAX_WIDTH:g} thicknesses wide, and a wider one is written as S8R, as "
+                         f"S4 locks there (8 x 8 elements at a/t = 100: 26 % in bending, a buckling "
+                         f"load 37 % high; S8R within 1 %)."
+                         + added)
+
+    def _section_thickness(self, blocks: List[Block], keywords: Tuple[str, ...]
+                           ) -> Dict[int, Tuple[Optional[float], str]]:
+        """Element -> (its section's thickness: the first field of the first data line of its
+        card among ``keywords``, None when that is no positive number or the section is
+        COMPOSITE or takes its thickness from the nodes; the section's MATERIAL, upper case)."""
+        out: Dict[int, Tuple[Optional[float], str]] = {}
+        for b in blocks:
+            if b.keyword not in keywords:
+                continue
+            rec = next((r for r in merged_data_records(b) if any(x.strip() for x in r)), [])
+            try:
+                t: Optional[float] = pf(rec[0]) if rec and rec[0].strip() else None
+            except ValueError:
+                t = None
+            if b.has("COMPOSITE") or b.has("NODAL THICKNESS") or \
+                    (t is not None and not (math.isfinite(t) and t > 0)):
+                t = None
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                out[e] = (t, b.uparam("MATERIAL"))
+        return out
+
+    def _plan_one_point_bricks(self, blocks: List[Block]) -> None:
+        """The other elements ccx 2.23 expands into one C3D8R brick integrated at a single point
+        (gen3delem.f: CPS4R / CPE4R / CAX4R 'C3D8R S' / 'E' / 'A', M3D4R 'C3D8R L', B31R
+        'C3D8R B'; the S4R is _plan_s4r_shells').  As for the S4R, only the hourglass stiffness
+        ccx adds to every C3D8R (e_c3d.f: hgstiffness) resists the brick's hourglass modes, the
+        element's bending among them, and it follows the brick: it grows with the square of
+        the element's in-plane size over the depth ccx gives the brick — the plane thickness;
+        the plane-strain one, 1 by default in the deck's own length unit; the 2-degree sector
+        of an axisymmetric element, 0.035 r — and scales with the material's first elastic
+        constant (E for an isotropic *ELASTIC, C1111 for a plastic or anisotropic one).
+        Probed on 2.23 (cantilevers, plates, cylinders; ratio R = shorter in-plane size /
+        depth):
+        * CPS4R / CPE4R / CAX4R are ccx's reduced elements up to R ~ 1 (soft on one element
+          through a bending depth, converging); at R ~ 3 as stiff as the fully integrated
+          twin, beyond it stiffer: a cantilever of 2 elements through its depth deflects 0.27
+          of beam theory at R 10 (CPS4 0.88), 0.01 at R 100 — and a CPE4R cantilever in mm
+          (depth 1) 0.06, the same in m 1.02.  The hourglass stiffness does not yield: plastic
+          reactions overshoot from R ~ 1.5 (a limit load +10 / +24 / +55 % on 8 / 4 / 2
+          elements through the depth; 6x / 19x at R ~ 100).  So flagged when the median R of
+          a type's elements exceeds ONE_POINT_DEPTH_RATIO (3, or 1.5 with a plastic material).
+        * M3D4R always: in plane like a thin CPS4R, and out of plane the hourglass stiffness is
+          a bending stiffness a membrane lacks (a stretched membrane under pressure, 16 x 16
+          elements, a/t 100: 0.16 of the deflection; M3D4 0.96).
+        * B31R (ccx's own element; Abaqus has no B31R) always: its bending, buckling,
+          vibration and twist follow the element's length over its section (a cantilever of
+          L/a 10: 0.61 / 2.8 / 7.4 times beam theory on 4 / 10 / 40 elements; B31 within 2 %).
+        Flagged ones are reduced physics, or under --approximate the fully integrated twin
+        (ONE_POINT_TWIN): independent of the depth; CPS4 / CPE4 / CAX4 / M3D4 lock in bending
+        (0.70 / 0.90 / 0.97 of beam theory on 2 / 4 / 8 elements through the depth), and CPE4 /
+        CAX4, without Abaqus' selectively reduced volume terms, in plastic flow (a limit load
+        27 % high on 8, 2.5x on 2 elements through the depth).  Native C3D8R: a note where most
+        bricks are flat (_note_flat_bricks)."""
+        groups: "OrderedDict[str, List[int]]" = OrderedDict()
+        flat: List[float] = []
+        nodes = self.geom.nodes
+        for e, (typ, conn) in self.geom.elements.items():
+            ct = ccx_type(typ)
+            if ct in ONE_POINT_TWIN:
+                groups.setdefault(ct, []).append(e)
+            elif ct == "C3D8R" and len(conn) == 8 and all(n in nodes for n in conn):
+                r = brick_flatness([nodes[n] for n in conn])
+                if r:
+                    flat.append(r)
+        self._note_flat_bricks(flat)
+        if not groups:
+            return
+        sec = self._section_thickness(blocks, ("SOLID SECTION",))
+        plastic = {m for m, opts in self._material_options(blocks).items()
+                   if any(c.keyword == "PLASTIC" for c in opts[1:])}
+        for ct, els in groups.items():
+            ratio, plast = None, False
+            if ct in ("CPS4R", "CPE4R", "CAX4R"):
+                rs = []
+                for e in els:
+                    conn = self.geom.elements[e][1]
+                    if len(conn) < 4 or any(n not in nodes for n in conn[:4]):
+                        continue
+                    pts = [nodes[n] for n in conn[:4]]
+                    t, mat = sec.get(e, (None, ""))
+                    plast = plast or mat in plastic
+                    # ccx turns an axisymmetric element 1 degree to either side; a plane one
+                    # without a thickness is Abaqus' 1 thick
+                    d = 0.5 * abs(sum(p[0] for p in pts)) * math.sin(math.radians(1.0)) \
+                        if ct == "CAX4R" else (t or 1.0)
+                    rs.append(quad_extent(pts)[1] / d if d > 0 else math.inf)
+                if not rs:
+                    continue
+                ratio = sorted(rs)[len(rs) // 2]
+                if ratio <= ONE_POINT_DEPTH_RATIO[1 if plast else 0]:
+                    continue
+            self._one_point_flag(ct, els, ratio, plast)
+
+    def _one_point_flag(self, ct: str, els: List[int], ratio: Optional[float], plast: bool) -> None:
+        """Warn about the elements ``els`` of ccx type ``ct`` (_plan_one_point_bricks) and flag
+        them reduced physics, or under --approximate write them as their fully integrated twin."""
+        twin = ONE_POINT_TWIN[ct]
+        kinds = sorted({self.geom.elements[e][0].upper() for e in els})
+        what = f"{'/'.join(kinds)} ({len(els)} elements)"
+        brick = (f"ccx 2.23 expands {'a' if ct[0] != 'M' else 'an'} {ct} into one C3D8R brick "
+                 f"integrated at a single point, so the element's hourglass modes, its bending "
+                 f"among them, are resisted only by the hourglass stiffness ccx adds to that brick")
+        if ct == "B31R":
+            why = (f"{brick} (B31R is ccx's own element; Abaqus has none), which follows the "
+                   f"element's length over its section, not its E I or G J: a square cantilever "
+                   f"of L/a 10 deflects 0.61 / 2.8 / 7.4 times beam theory on 4 / 10 / 40 "
+                   f"elements, of L/a 100 0.04 times on 10; its buckling loads, frequencies and "
+                   f"twist are off alike")
+            fix = "B31 (within 2 % of beam theory in bending, buckling and vibration from 4 elements)"
+        elif ct == "M3D4R":
+            why = (f"{brick}, which follows the brick's size over its thickness, not the membrane: "
+                   f"in plane it bends far too stiffly, and out of plane it acts as a bending "
+                   f"stiffness a membrane lacks (probed: a stretched square membrane under "
+                   f"pressure, 16 x 16 elements, a/t 100, deflects 0.16 of the membrane solution; "
+                   f"a strip bent in its plane, 10 x 2 elements, 0.26 of beam theory)")
+            fix = ("M3D4, the fully integrated membrane (within 4 % on that membrane; it locks in "
+                   "in-plane bending: 0.71 / 0.90 / 0.97 of a strip's deflection on 2 / 4 / 8 "
+                   "elements across)")
+        else:
+            depth = {"CPS4R": "the plane-stress thickness",
+                     "CPE4R": "the plane-strain thickness, 1 by default in the deck's length unit",
+                     "CAX4R": "the 2-degree sector ccx models, 0.035 r"}[ct]
+            why = (f"{brick}, which grows with the square of the element's in-plane size over the "
+                   f"brick's depth ({depth}; the median ratio of the shorter in-plane size to it is "
+                   f"{ratio:.3g} here{', with a plastic material' if plast else ''}): above 3 the "
+                   f"elements bend stiffer than the fully integrated {twin} (a cantilever of 2 "
+                   f"elements through its depth deflects 0.27 of beam theory at a ratio of 10, "
+                   f"{twin} 0.88), and in plastic flow, as that stiffness does not yield, the "
+                   f"reactions overshoot from about 1.5 (a limit load +24 % with 4 elements through "
+                   f"the depth, +55 % with 2)")
+            fix = (f"{twin}, the fully integrated element (independent of the depth; it locks in "
+                   f"bending: 0.70 / 0.90 / 0.97 of beam theory on 2 / 4 / 8 elements through a "
+                   f"cantilever's depth"
+                   + ("" if ct == "CPS4R" else "; without Abaqus' selectively reduced volume terms "
+                      "it locks in plastic flow too: a limit load 27 % high on 8 elements through "
+                      "the depth, 2.5x on 2") + ")")
+        if self._approx:
+            for e in els:
+                typ, conn = self.geom.elements[e]
+                base, sfx = split_suffixes(typ)
+                new = re.sub(r"R$", "", base.upper()) + sfx         # CPEG4R -> CPEG4, CAX4RT -> CAX4T
+                if ccx_type(new) != twin:
+                    new = twin
+                self.geom.elements[e] = (new, conn)
+                self._elem_types.add(new)
+            self.report.warn(f"[APPROX] Element {what} written as {twin}: {why}. ccx's {fix}.")
+        else:
+            self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
+                             f"{fix}.")
+            self._reduces(f"element {ct} (ccx 2.23 bends it only through its C3D8R's hourglass "
+                          f"stiffness" + (", which its depth inflates)" if ratio else ")"))
+
+    def _note_flat_bricks(self, flat: List[float]) -> None:
+        """A note when most of the deck's C3D8R bricks (``flat``: each one's middle size over its
+        smallest, brick_flatness) are more than 3 times as wide as thick: ccx's hourglass
+        stiffness grows with that ratio squared (as for the expanded elements,
+        _plan_one_point_bricks), so flat bricks bend too stiffly.  Probed on 2.23: a cantilever
+        strip of one layer of bricks 10x as wide as thick deflects 0.08 of beam theory, 0.26 /
+        0.43 / 0.56 with 2 / 3 / 4 layers (C3D8I 0.96-0.99); cubes are hourglass-soft on one
+        layer (2.8x) and within 6 / 2.5 % on 3 / 4 layers.  The same in linear and nonlinear
+        steps; a plastic or anisotropic material raises it by C1111 / E (1.35 at nu 0.3)."""
+        if not flat:
+            return
+        med = sorted(flat)[len(flat) // 2]
+        if med <= 3.0:
+            return
+        self.report.note(f"C3D8R ({len(flat)} elements; a brick's width is a median {med:.3g} times "
+                         f"its thickness): ccx 2.23 resists a C3D8R's hourglass modes, its bending "
+                         f"among them, only by the hourglass stiffness it adds, which grows with "
+                         f"the square of that ratio, so flat bricks bend too stiffly where they "
+                         f"carry bending (probed: a strip of one layer of bricks 10 times as wide "
+                         f"as thick deflects 0.08 of beam theory, 0.56 with 4 layers; C3D8I 0.96). "
+                         f"ccx scales it with E for an isotropic *ELASTIC and with C1111 = E (1 - nu) "
+                         f"/ ((1 + nu) (1 - 2 nu)) for a plastic or anisotropic material (1.35 E at "
+                         f"nu = 0.3).", once=True)
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads
@@ -21934,22 +22182,49 @@ class Converter:
         joined along the whole edge.  The new nodes join the node sets that hold both ends of
         their edge (_extend_edge_sets), and BCs, temperatures and initial conditions on both
         ends reach them (_midside_records)."""
-        els = self.geom.elements
-        corners: Dict[int, List[int]] = {}           # linear shell -> its corner nodes
-        for e, (typ, conn) in els.items():
-            n = {"S3": 3, "S4": 4, "S4R": 4}.get(ccx_type(typ))
-            if not n or len(conn) != n or any(x not in self.geom.nodes for x in conn):
-                continue
-            # a quadrilateral collapsed on one edge is a triangle (ccx stops on a collapsed
-            # S8R: '*ERROR in gen3dnor', probed)
-            ring = [x for k, x in enumerate(conn) if x != conn[k - 1]] if n == 4 else list(conn)
-            if len(ring) >= 3 and len(set(ring)) == len(ring):
-                corners[e] = ring
+        corners = self._linear_shell_corners()
         seeds = [e for b in blocks
                  if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION") and b.has("COMPOSITE")
                  for e in self.geom.elset((b.param("ELSET") or "").strip()) if e in corners]
         if not seeds:
             return
+        comp, kinds, span, beams = self._upgrade_linear_shells(blocks, corners, seeds)
+        extra = len(comp) - len(set(seeds))
+        self.report.warn(
+            f"Composite shells: {len(comp)} element(s) emitted as quadratic shells "
+            f"({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a node at the middle "
+            f"of every edge ({span}); ccx 2.23 runs *SHELL SECTION, COMPOSITE only on S8R and S6. "
+            f"The facets, layup, thicknesses, orientations, element ids and sets are kept"
+            + (f"; {extra} other linear shell(s) joined to them by an edge were upgraded too, so no "
+               f"midside node hangs" if extra else "")
+            + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through its "
+               f"midside node" if beams else "")
+            + ". BCs, temperatures and initial conditions on both ends of an edge reach its midside "
+              "node, and so do the node sets of BCs, couplings, ties and output. The quadratic "
+              "shell is more accurate than the linear one on the same mesh, so results differ "
+              "slightly from Abaqus'.", once=True)
+        self._reduces(f"element {', '.join(kinds)} (ccx runs composite shells on S8R / S6 only)")
+
+    def _linear_shell_corners(self) -> Dict[int, List[int]]:
+        """Linear shell as emitted (S3, S4, S4R) -> its corner nodes; a quadrilateral collapsed
+        on one edge is a triangle (ccx stops on a collapsed S8R: '*ERROR in gen3dnor', probed)."""
+        corners: Dict[int, List[int]] = {}
+        for e, (typ, conn) in self.geom.elements.items():
+            n = {"S3": 3, "S4": 4, "S4R": 4}.get(ccx_type(typ))
+            if not n or len(conn) != n or any(x not in self.geom.nodes for x in conn):
+                continue
+            ring = [x for k, x in enumerate(conn) if x != conn[k - 1]] if n == 4 else list(conn)
+            if len(ring) >= 3 and len(set(ring)) == len(ring):
+                corners[e] = ring
+        return corners
+
+    def _upgrade_linear_shells(self, blocks: List[Block], corners: Dict[int, List[int]],
+                               seeds: List[int]) -> Tuple[set, "OrderedDict[str, int]", str, int]:
+        """The linear shells ``seeds`` and every linear shell joined to them through an edge ->
+        S8R / S6 with a node at the middle of every edge (_plan_quadratic_shells; coarse S4R
+        under --approximate, _plan_s4r_shells): (the upgraded elements, 'S4R -> S8R'-like kind
+        -> count, the new nodes' span, the 2-node beams along an upgraded edge made 3-node)."""
+        els = self.geom.elements
 
         def edges(e: int) -> List[Tuple[int, int]]:
             ring = corners[e]
@@ -22022,21 +22297,6 @@ class Converter:
         self._extend_edge_sets(blocks, made)
         span = f"node {made[0][2]}" if len(made) == 1 else \
             f"nodes {made[0][2]}-{made[-1][2]}" if made else "no new node"
-        extra = len(comp) - len(set(seeds))
-        self.report.warn(
-            f"Composite shells: {len(comp)} element(s) emitted as quadratic shells "
-            f"({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a node at the middle "
-            f"of every edge ({span}); ccx 2.23 runs *SHELL SECTION, COMPOSITE only on S8R and S6. "
-            f"The facets, layup, thicknesses, orientations, element ids and sets are kept"
-            + (f"; {extra} other linear shell(s) joined to them by an edge were upgraded too, so no "
-               f"midside node hangs" if extra else "")
-            + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through its "
-               f"midside node" if beams else "")
-            + ". BCs, temperatures and initial conditions on both ends of an edge reach its midside "
-              "node, and so do the node sets of BCs, couplings, ties and output. The quadratic "
-              "shell is more accurate than the linear one on the same mesh, so results differ "
-              "slightly from Abaqus'.", once=True)
-        self._reduces(f"element {', '.join(kinds)} (ccx runs composite shells on S8R / S6 only)")
         if hanging:
             self.report.warn(f"{len(hanging)} element(s) (e.g. {sorted(hanging)[0]}, "
                              f"{els[sorted(hanging)[0]][0]}) share an edge with the upgraded "
@@ -22044,6 +22304,7 @@ class Converter:
                              f"theirs: the mesh is not conforming there — verify, or tie them.",
                              once=True)
             self._reduces("elements left with a hanging midside node of an upgraded shell")
+        return comp, kinds, span, beams
 
     def _layup(self, b: Block) -> Optional[List[dict]]:
         """The layers of a composite *SHELL SECTION, bottom first (SYMMETRIC mirrored): each
@@ -31474,7 +31735,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="opt-in: reframe constructs ccx cannot run as approximately equivalent "
                          "ones it can (Riks->static, nu>=0.5 clamped, I-beam in space->U1 or RECT, "
                          "NLGEOM follower tractions->fixed nodal forces, surface elements with "
-                         "rebar or mass->left out, S4R->S4), each with a loud [APPROX] warning")
+                         "rebar or mass->left out, S4R->S4 / S8R, CPS4R / CPE4R / CAX4R / M3D4R / "
+                         "B31R->their fully integrated twins), each with a loud [APPROX] warning")
     ap.add_argument("--abaqus-umat", action="store_true",
                     help="opt-in: write *USER MATERIAL materials for ccx's Abaqus-UMAT interface "
                          "(ABAQUS<name>, ABAQUSNL<name> under NLGEOM), for a ccx rebuilt with the "

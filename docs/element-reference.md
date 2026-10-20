@@ -52,7 +52,7 @@ Direct CalculiX types: **68**. Total recognised: **175**.
 | `CAX3` | 3 | direct |
 | `CAX4` | 4 | direct |
 | `CAX4H` | 4 | → `CAX4` (substituted: reduced physics) |
-| `CAX4R` | 4 | direct |
+| `CAX4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CAX4` |
 | `CAX6` | 6 | direct |
 | `CAX6M` | 6 | → `CAX6` (substituted: reduced physics) |
 | `CAX8` | 8 | direct |
@@ -69,7 +69,7 @@ Direct CalculiX types: **68**. Total recognised: **175**.
 | `B23` | 2 | → `B31` (substituted: reduced physics) |
 | `B31` | 2 | direct |
 | `B31H` | 2 | → `B31` (substituted: reduced physics) |
-| `B31R` | 2 | direct |
+| `B31R` | 2 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics; `--approximate` → `B31` |
 | `B32` | 3 | → `B32R` (exact) |
 | `B32H` | 3 | → `B32R` (substituted: reduced physics) |
 | `B32R` | 3 | direct |
@@ -84,7 +84,7 @@ Direct CalculiX types: **68**. Total recognised: **175**.
 | `T3D2` | 2 | direct |
 | `T3D3` | 3 | direct |
 
-Every 3-node beam runs as ccx's `B32R`, the 20-node brick integrated at 2 × 2 × 2 points: 2 along the beam, as Abaqus integrates its quadratic beams (`B22`, `B32`, `PIPE22`, `PIPE32`). ccx's `B32` integrates at 3 × 3 × 3 and locks on coarse meshes (a cantilever's tip deflection under an end load: 0.77 of beam theory on one element, 0.95 on two; exact on any number of `B32R`).
+Every 3-node beam runs as ccx's `B32R`, the 20-node brick integrated at 2 × 2 × 2 points: 2 along the beam, as Abaqus integrates its quadratic beams (`B22`, `B32`, `PIPE22`, `PIPE32`). ccx's `B32` integrates at 3 × 3 × 3 and locks on coarse meshes (a cantilever's tip deflection under an end load: 0.77 of beam theory on one element, 0.95 on two; exact on any number of `B32R`). ccx's own `B31R` (Abaqus has none) is one `C3D8R` brick that bends and twists only through its hourglass stiffness (`one_point_b31r`).
 
 Under a `*BEAM SECTION, SECTION=CIRC`, `PIPE`, `BOX` or `THICK PIPE` (emitted as `PIPE`), 2-node beams whose emitted type is `B21` → `B32R`, `B31` → `B32R`, `B31R` → `B32R` become 3-node beams: ccx 2.23 rejects linear beams with a circular section and runs `PIPE` and `BOX` sections only on `B32R`. Each element gets a new midside node at the midpoint of its end nodes (ccx's order is end, middle, end); element ids and sets are kept, and BCs, temperatures and initial conditions given for both end nodes also reach the midside node. The 3-node beam is a different element than Abaqus' 2-node one, so such a deck counts as reduced physics.
 
@@ -137,7 +137,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | --- | --- | --- |
 | `CGAX3` | 3 | → `CAX3` (substituted: reduced physics) |
 | `CGAX4` | 4 | → `CAX4` (substituted: reduced physics) |
-| `CGAX4R` | 4 | → `CAX4R` (substituted: reduced physics) |
+| `CGAX4R` | 4 | → `CAX4R` (substituted: reduced physics) — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CAX4` |
 | `CGAX6` | 6 | → `CAX6` (substituted: reduced physics) |
 | `CGAX8` | 8 | → `CAX8` (substituted: reduced physics) |
 | `CGAX8R` | 8 | → `CAX8R` (substituted: reduced physics) |
@@ -148,7 +148,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | --- | --- | --- |
 | `CPEG3` | 3 | → `CPE3` (substituted: reduced physics) |
 | `CPEG4` | 4 | → `CPE4` (substituted: reduced physics) |
-| `CPEG4R` | 4 | → `CPE4R` (substituted: reduced physics) |
+| `CPEG4R` | 4 | → `CPE4R` (substituted: reduced physics) — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CPE4` |
 | `CPEG6` | 6 | → `CPE6` (substituted: reduced physics) |
 | `CPEG6M` | 6 | → `CPE6` (substituted: reduced physics) |
 | `CPEG8` | 8 | → `CPE8` (substituted: reduced physics) |
@@ -173,14 +173,14 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | --- | --- | --- |
 | `M3D3` | 3 | direct |
 | `M3D4` | 4 | direct |
-| `M3D4R` | 4 | direct |
+| `M3D4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics; `--approximate` → `M3D4` |
 | `M3D6` | 6 | → `C3D15` on nodes of its own, held at the membrane's nodes (exact) |
 | `M3D8` | 8 | → `C3D20` on nodes of its own, held at the membrane's nodes (exact) |
 | `M3D8R` | 8 | → `C3D20R` on nodes of its own, held at the membrane's nodes (exact) |
 | `M3D9` | 9 | → `C3D20` on nodes of its own, held at the membrane's nodes without its centre node (reduced physics) |
 | `M3D9R` | 9 | → `C3D20R` on nodes of its own, held at the membrane's nodes without its centre node (reduced physics) |
 
-ccx 2.23 expands every membrane element into a solid on nodes of its own and leaves the mid-thickness node of a quadratic element's corners free (`M3D8R` singular, `M3D6` and `M3D8` too soft). The converter writes those solids itself: per element and node a bottom and a top node held at the membrane node by `*EQUATION` (bottom + top = 2 × node), per corner node a mid-thickness node equal to it, per `C3D20R` one equation that holds its zero-energy hourglass; loads, faces and sets stay the membrane's (`validate_with_ccx.py quad_membrane_*`).
+ccx 2.23 expands every membrane element into a solid on nodes of its own and leaves the mid-thickness node of a quadratic element's corners free (`M3D8R` singular, `M3D6` and `M3D8` too soft). The converter writes those solids itself: per element and node a bottom and a top node held at the membrane node by `*EQUATION` (bottom + top = 2 × node), per corner node a mid-thickness node equal to it, per `C3D20R` one equation that holds its zero-energy hourglass; loads, faces and sets stay the membrane's (`validate_with_ccx.py quad_membrane_*`). `M3D4R` is one `C3D8R` brick, whose hourglass stiffness acts as a bending stiffness a membrane lacks (a stretched membrane under pressure, a/t 100: 0.16 of its deflection; `one_point_m3d4r`).
 
 ## other
 
@@ -211,7 +211,7 @@ ccx 2.23 expands every membrane element into a solid on nodes of its own and lea
 | `CPE4` | 4 | direct |
 | `CPE4H` | 4 | → `CPE4` (substituted: reduced physics) |
 | `CPE4I` | 4 | → `C3D8I` slab (exact for small-strain linear elasticity in static steps); otherwise → `CPE4`, reduced physics |
-| `CPE4R` | 4 | direct |
+| `CPE4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CPE4` |
 | `CPE6` | 6 | direct |
 | `CPE6M` | 6 | → `CPE6` (substituted: reduced physics) |
 | `CPE8` | 8 | direct |
@@ -225,13 +225,13 @@ ccx 2.23 expands every membrane element into a solid on nodes of its own and lea
 | `CPS3` | 3 | direct |
 | `CPS4` | 4 | direct |
 | `CPS4I` | 4 | → `C3D8I` slab (exact for small-strain linear elasticity in static steps); otherwise → `CPS4`, reduced physics |
-| `CPS4R` | 4 | direct |
+| `CPS4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CPS4` |
 | `CPS6` | 6 | direct |
 | `CPS6M` | 6 | → `CPS6` (substituted: reduced physics) |
 | `CPS8` | 8 | direct |
 | `CPS8R` | 8 | direct |
 
-ccx has no incompatible-mode plane element. `CPS4I` and `CPE4I` (the latter on parallelograms: Abaqus adds a fifth, volumetric mode that acts only on distorted elements) become one-element-thick `C3D8I` slabs: the 2-D nodes are the bottom face (ids, BCs and loads kept), new top nodes one section thickness above follow their in-plane DOFs by `*EQUATION`, and DOF 3 of every slab node is held (node set `ABQ2CCX_SLAB`, repeated after `*BOUNDARY, OP=NEW`), so the slab deforms in plane strain and the C3D8I's modes are those of Abaqus' four-mode element. `CPS4I` gets the plane-stress stiffness as an `ORTHO` material with no coupling to the thickness direction, so S33 = 0. Probed on 2.23 against a 2-D implementation of the incompatible-mode element (rectangular and skewed meshes): equal to 1e-7; `validate_with_ccx.py cps4i_slab` checks pure bending against beam theory. Outside small-strain linear elasticity in static steps (`NLGEOM`, other materials, contact, couplings, `*FREQUENCY` / `*BUCKLE`, whose mass and geometric stiffness are not compared ...) the element runs as `CPS4`/`CPE4`, which locks in bending, and counts as reduced physics.
+ccx has no incompatible-mode plane element. `CPS4I` and `CPE4I` (the latter on parallelograms: Abaqus adds a fifth, volumetric mode that acts only on distorted elements) become one-element-thick `C3D8I` slabs: the 2-D nodes are the bottom face (ids, BCs and loads kept), new top nodes one section thickness above follow their in-plane DOFs by `*EQUATION`, and DOF 3 of every slab node is held (node set `ABQ2CCX_SLAB`, repeated after `*BOUNDARY, OP=NEW`), so the slab deforms in plane strain and the C3D8I's modes are those of Abaqus' four-mode element. `CPS4I` gets the plane-stress stiffness as an `ORTHO` material with no coupling to the thickness direction, so S33 = 0. Probed on 2.23 against a 2-D implementation of the incompatible-mode element (rectangular and skewed meshes): equal to 1e-7; `validate_with_ccx.py cps4i_slab` checks pure bending against beam theory. Outside small-strain linear elasticity in static steps (`NLGEOM`, other materials, contact, couplings, `*FREQUENCY` / `*BUCKLE`, whose mass and geometric stiffness are not compared ...) the element runs as `CPS4`/`CPE4`, which locks in bending, and counts as reduced physics. `CPS4R`, `CPE4R` and `CAX4R` are one `C3D8R` brick each, whose hourglass stiffness grows with the square of the element's size over the brick's depth (the plane thickness; a plane-strain one 1 in the deck's length unit; 0.035 r axisymmetric): beyond 3 they bend stiffer than `CPS4` (`one_point_cps4r`, `one_point_cpe4r`).
 
 ## rigid
 
@@ -257,8 +257,8 @@ ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so eac
 | `S3` | 3 | direct; under a composite section → `S6` with midside nodes (reduced physics) |
 | `S3R` | 3 | → `S3` (exact); under a composite section → `S6` with midside nodes (reduced physics) |
 | `S4` | 4 | direct; under a composite section → `S8R` with midside nodes (reduced physics) |
-| `S4R` | 4 | direct — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`); under a composite section → `S8R` with midside nodes (reduced physics) |
-| `S4R5` | 4 | → `S4R` (substituted: reduced physics) — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`); under a composite section → `S8R` with midside nodes (reduced physics) |
+| `S4R` | 4 | direct — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`, `S8R` where coarse); under a composite section → `S8R` with midside nodes (reduced physics) |
+| `S4R5` | 4 | → `S4R` (substituted: reduced physics) — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`, `S8R` where coarse); under a composite section → `S8R` with midside nodes (reduced physics) |
 | `S6` | 6 | direct |
 | `S8` | 8 | direct |
 | `S8R` | 8 | direct |
@@ -270,7 +270,7 @@ ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so eac
 | `STRI65` | 6 | → `S6` (substituted: reduced physics) |
 | `US3` | 3 | direct |
 
-ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has no layered solid section. Linear composite shells become `S6`/`S8R` with a node at the middle of every edge, shared with the linear shells and 2-node beams joined to them by an edge, which are upgraded too. Composite continuum shells become one solid per ply, stacked from the bottom face (`STACK DIRECTION`), each its share of the thickness with its material and ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both are validated against classical lamination theory and Pagano's 3-D solution (`validate_with_ccx.py composite_plate_*`). ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single point on the mid-surface, so only the hourglass stiffness ccx adds to that brick resists its bending, not the section (a simply supported plate, a/t 100: deflection 1/50, buckling load 97×); `--approximate` writes `S4`, within 2.5 % there (`validate_with_ccx.py s4r_plate_*`).
+ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has no layered solid section. Linear composite shells become `S6`/`S8R` with a node at the middle of every edge, shared with the linear shells and 2-node beams joined to them by an edge, which are upgraded too. Composite continuum shells become one solid per ply, stacked from the bottom face (`STACK DIRECTION`), each its share of the thickness with its material and ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both are validated against classical lamination theory and Pagano's 3-D solution (`validate_with_ccx.py composite_plate_*`). ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single point on the mid-surface, so only the hourglass stiffness ccx adds to that brick resists its bending, not the section (a simply supported plate, a/t 100: deflection 1/50, buckling load 97×); `--approximate` writes `S4`, within 2.5 % there, and `S8R` (midside nodes as above) where an element is over 6 thicknesses wide, as `S4` locks there (`validate_with_ccx.py s4r_plate_*`, `s4r_coarse_plate_*`).
 
 ## surface (load carrier)
 
