@@ -5981,7 +5981,7 @@ class Converter:
         self.surfaces: Dict[str, Tuple[str, List[Tuple[str, Optional[str]]]]] = {}
         self._elem_types: set = set()
         self._synth_cache: Dict[Tuple[str, float], str] = {}
-        # deck-wide facts filled in by _prescan (defaults keep handlers usable standalone)
+        # deck-wide facts filled in by the planners (defaults keep handlers usable standalone)
         self._plane_only: set = set()
         self._no_rot: set = set()                      # ... and of trusses: no rotations at all
         self._shell_nodes: set = set()
@@ -6002,7 +6002,7 @@ class Converter:
         self._initial_stresses = False
         self._freq_contact = False                  # contact (plain *FREQUENCY / *BUCKLE drop it)
         self._overclosed = False                    # one of them starts overclosed
-        self._deck_procs: set = set()               # the deck's procedure keywords (_prescan)
+        self._deck_procs: set = set()               # the deck's procedures (_plan_base_state_facts)
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
         # the step being emitted: a general step before it, NLGEOM in its base state (handle_step:
@@ -6229,7 +6229,7 @@ class Converter:
         self._slab_eq: List[str] = []
         self._slab_bc: List[str] = []
         self._node_normals: Dict[int, Vec] = {}    # *NODE fields 5-7: the node's shell normal
-        self._param_values: set = set()            # parameter values in the deck (_prescan)
+        self._param_values: set = set()            # the deck's parameter values (_plan_material_facts)
         self._sc_types: Dict[str, set] = {}        # *SECTION CONTROLS name -> its Abaqus types
         self._sc_damage = False
         self._sc_hyper: set = set()
@@ -18841,8 +18841,8 @@ class Converter:
     def _complete_temperature_ic(self) -> None:
         """Once a deck has initial temperatures ccx needs one in every node ("no initial
         temperature defined in node"), also at the free ends of the knot beams planned after
-        _prescan (_plan_circ_rotation_knots, _plan_op_new_rotations): those get the Abaqus
-        default 0 with the other nodes the deck's initial conditions leave out."""
+        _plan_initial_temperatures (_plan_circ_rotation_knots, _plan_op_new_rotations): those
+        get the Abaqus default 0 with the other nodes the deck's initial conditions leave out."""
         cov = self._temp_ic_covered
         if cov is not None and not self._temp_ic_fill and not set(self.geom.nodes) <= cov:
             self._temp_ic_fill = True
@@ -19259,7 +19259,7 @@ class Converter:
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
         self._plan_solver_facts(blocks)         # after _plan_rigid: its unmeshed analytical surfaces
         self._find_planar_elements()            # before the beam upgrades below retype them
-        self._plan_pretension_cuts(blocks)      # before the beam upgrades and _prescan
+        self._plan_pretension_cuts(blocks)      # before the beam upgrades and _plan_pretension_twins
         self._upgrade_section_beams(blocks)
         self._plan_u1_beams(blocks)
         self._plan_truss_copies(blocks)         # after U1 and the pre-tension cuts
@@ -19273,13 +19273,45 @@ class Converter:
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
         self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
-        self._prescan(blocks)
-        self._plan_member_mass_tets(blocks)     # after _prescan: its *MPC BEAM bodies
+        self._reset_emission()                  # (handle_step advances the step cursor)
+        self._plan_node_classes(blocks)         # after the mesh planners: the final element types
+        self._transformed = self._transform_defs(blocks)
+        self._plan_connectors(blocks)           # before _plan_mpcs: rigid ones join its bodies
+        self._plan_mpcs(blocks)
+        self._plan_equation_twins(blocks)
+        self._plan_ref_nodes(blocks)            # after _plan_mpcs: its bodies' reference nodes
+        self._plan_rot_nodes(blocks)            # after _plan_ref_nodes, and the *MPC BEAM bodies
+        self._plan_rigid_couplings(blocks)
+        self._plan_kdyn_surfaces(blocks)        # after the coupling plans
+        self._plan_pretension_twins()           # after _transformed
+        self._plan_rot_axes(self._rb_rot)       # the connector rows use them
+        self._plan_distributing_rows()          # after the ROT NODEs' axes
+        self._plan_rigid_twins(blocks)          # after the ROT NODE axes
+        self._plan_connector_rows(blocks)
+        self._plan_coupled_bcs(blocks)
+        self._warn_rigid_mpc_steps(blocks)      # after the constraint plans (_rigid_constraints)
+        self._plan_velocity_bcs(blocks)         # after _plan_coupled_bcs: reads its card rewrites
+        self._warn_explicit_plane_rigid(blocks)     # after the constraint plans, _plan_ref_nodes
+        self._check_transforms()
+        self._plan_default_amplitudes(blocks)   # reads the ROT NODE axes (_plan_rot_axes)
+        self._plan_material_facts(blocks)       # after the mesh planners: the final element types
+        self._plan_base_state_facts(blocks)     # after _plan_rigid: the analytical surfaces left
+        self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
+        self._plan_material_cards(blocks)
+        self._undefined_parameter_data(blocks)
+        self._plan_deformation_plasticity(blocks)   # before the expansion check: NLGEOM in ccx
+        self._plan_expansion_as_ortho(blocks)
+        self._plan_elastic_expansion(blocks)
+        self._check_nlgeom_expansion(blocks)
+        self._plan_coupled_inertia(blocks)
+        self._plan_load_facts(blocks)           # after the mesh planners: the final element types
+        self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
+        self._plan_member_mass_tets(blocks)     # after _plan_rot_nodes: the *MPC BEAM bodies
         self._plan_surface_heat(blocks)
         self._plan_load_cases(blocks)
-        self._plan_rigid_planar_holds()             # after _prescan: the bodies' ROT NODEs
-        self._plan_kinematic_holds(blocks)          # after _prescan: the coupling plans
-        self._warn_coupled_clashes()                # BCs on coupled DOFs left (_prescan)
+        self._plan_rigid_planar_holds()             # after _plan_rot_nodes: the bodies' ROT NODEs
+        self._plan_kinematic_holds(blocks)          # after _plan_rigid_couplings: its plans
+        self._warn_coupled_clashes()                # BCs on coupled DOFs left (_plan_coupled_bcs)
         self._plan_material_symmetry(blocks)
         self._plan_distributions(blocks)
         self._plan_shell_axes(blocks)           # after the distributions: their axes
@@ -23898,10 +23930,14 @@ class Converter:
                 rho = 0.0
         return {"cards": out, "elements": eids, "mass": rho * p.area, "planar": planar}
 
-    def _prescan(self, blocks: List[Block]) -> None:
-        """Deck-wide facts that individual card handlers need: which nodes can carry
-        rotations, which sets *EL PRINT / *NODE PRINT must default to, *DEPVAR sizes,
-        whether field variables are ever set, and the step count."""
+    def _reset_emission(self) -> None:
+        """The emission's step cursor and NLGEOM, and its count of dropped rotational BCs."""
+        self._step_idx = 0
+        self._step_nlgeom = False
+        self._n_inactive_rot = self._n_inactive_rot_truss = 0
+
+    def _plan_node_classes(self, blocks: List[Block]) -> None:
+        """Shell, beam, pore, rotation, plane-only and rotation-free nodes; fluid cavities' nodes."""
         emitted: Dict[str, str] = {}
         pore: Dict[str, bool] = {}
         plane: Dict[int, bool] = {}
@@ -23940,13 +23976,14 @@ class Converter:
         # CPS4I / CPE4I elements are plane elements to Abaqus)
         slab = {n for e in self._slabs for n in self.geom.elements[e][1]}
         self._plane_only = {n for n, p in plane.items() if p or n in slab}
+        # ... and with truss nodes: the nodes without rotational DOFs, where Abaqus ignores a
+        # rotational BC (_active_dof_lines); the reference nodes leave both (_plan_ref_nodes)
+        self._no_rot = {n for n, p in no_rot.items() if p}
+
+    def _plan_ref_nodes(self, blocks: List[Block]) -> None:
+        """Reference nodes of rigid bodies, couplings and *MPC BEAM bodies: they carry rotations."""
         # reference/rotation nodes of rigid bodies and couplings carry real rotations (the
-        # independent node of *MPC BEAM lines too: it becomes a *RIGID BODY's REF NODE);
-        # rigid connectors join the *MPC BEAM bodies
-        self._transformed = self._transform_defs(blocks)
-        self._plan_connectors(blocks)
-        self._plan_mpcs(blocks)
-        self._plan_equation_twins(blocks)
+        # independent node of *MPC BEAM lines too: it becomes a *RIGID BODY's REF NODE)
         mpc_refs = [body["ref"] for bodies in self._mpc_bodies.values() for body in bodies]
         self._plane_only.difference_update(mpc_refs)
         self._ref_nodes = set(mpc_refs)
@@ -23955,9 +23992,10 @@ class Converter:
                 refs = {self._ref_node(b), self._rot_node(b)} - {None}
                 self._plane_only.difference_update(refs)
                 self._ref_nodes.update(refs)
-        # ... and with truss nodes: the nodes without rotational DOFs, where Abaqus ignores a
-        # rotational BC (_active_dof_lines)
-        self._no_rot = {n for n, p in no_rot.items() if p} - self._ref_nodes
+        self._no_rot = self._no_rot - self._ref_nodes
+
+    def _plan_rot_nodes(self, blocks: List[Block]) -> None:
+        """ROT NODEs of rigid bodies, kinematic couplings, *MPC BEAM bodies; distributing couplings."""
         # ccx carries a *RIGID BODY's rotations on DOFs 1-3 of its ROT NODE and silently
         # ignores BCs/moments on DOFs 4-6 of the REF NODE (verified on 2.23: a moment there
         # does nothing).  Give every rigid body an explicit rotation node so the
@@ -23987,14 +24025,9 @@ class Converter:
                     self.geom.add_node(next_id, self.geom.nodes[ref])
                     self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
                 body["rot"] = self._rb_rot[ref]
-        self._plan_rigid_couplings(blocks)
-        self._plan_kdyn_surfaces(blocks)            # after the coupling plans
-        self._plan_pretension_twins()               # after _transformed
-        self._plan_rot_axes(self._rb_rot)              # the connector rows use them
-        self._plan_distributing_rows()             # after the ROT NODEs' axes
-        self._plan_rigid_twins(blocks)                 # after the ROT NODE axes
-        self._plan_connector_rows(blocks)
-        self._plan_coupled_bcs(blocks)
+
+    def _warn_rigid_mpc_steps(self, blocks: List[Block]) -> None:
+        """Warn of rigid constraints ccx turns with the finite rotation in a linear step."""
         # ccx's RIGID MPCs in a geometrically linear step of its nonlinear solver: a *RIGID BODY
         # kept there is warned where it is written (_rigid_body_lines)
         emits = {c["emit"] for c in self._rigid_constraints(blocks)} \
@@ -24005,7 +24038,9 @@ class Converter:
             self._warn_finite_rigid("a kinematic coupling has a line without linear equations "
                                     "(rotations only of nodes without rotations, or a *TRANSFORM "
                                     "with undefined axes or on a 2-D node)")
-        self._plan_velocity_bcs(blocks)       # after _plan_coupled_bcs: reads its card rewrites
+
+    def _warn_explicit_plane_rigid(self, blocks: List[Block]) -> None:
+        """Warn of rigid constraints on plane-element nodes: ccx's explicit solver stops on them."""
         if self._explicit_deck and any(n in self._plane_only for c in self._rigid_constraints(blocks)
                                        for n in c["elim"]):
             self.report.warn("Rigid constraint (*RIGID BODY, kinematic coupling or *MPC BEAM) on "
@@ -24013,9 +24048,9 @@ class Converter:
                              "dynamic step: ccx's explicit solver stops on it ('linear and nonlinear "
                              "MPC's depend on each other' — its 2-D expansion is built from linear "
                              "MPCs; probed on 2.23); only implicit steps can run it.", once=True)
-        self._check_transforms()
-        self._plan_default_amplitudes(blocks)  # reads the ROT NODE axes (_plan_rot_axes)
-        self._n_inactive_rot = self._n_inactive_rot_truss = 0
+
+    def _plan_material_facts(self, blocks: List[Block]) -> None:
+        """*DEPVAR sizes, field variables, parameter values, section controls, hardening facts."""
         self._depvar_counts = set()
         for b in blocks:
             if b.keyword == "DEPVAR":
@@ -24047,8 +24082,25 @@ class Converter:
                 if b.uparam("MATERIAL") in hyper:
                     self._sc_hyper.add(name)
         self._sc_damage = any(b.keyword in ("DAMAGE EVOLUTION", "DAMAGE INITIATION") for b in blocks)
-        self._step_idx = 0
-        self._step_nlgeom = False
+        # *CYCLIC HARDENING is read by ccx only after a *PLASTIC, HARDENING=COMBINED of the
+        # same material (one the converter does not comment out); Johnson-Cook *PLASTIC cards
+        # whose material also has a *RATE DEPENDENT card
+        self._cyclic_ok, self._jc_with_rate = set(), set()
+        for group in self._material_groups(blocks):
+            combined, jc_block = False, None
+            for b in group[1:]:
+                if b.keyword == "PLASTIC":
+                    combined = (b.uparam("HARDENING") == "COMBINED" and
+                                not b.uparam("DATATYPE").startswith("PARAM"))
+                    if b.uparam("HARDENING").replace(" ", "") == "JOHNSONCOOK":
+                        jc_block = b
+                elif b.keyword == "CYCLIC HARDENING" and combined:
+                    self._cyclic_ok.add(id(b))
+                elif b.keyword == "RATE DEPENDENT" and jc_block is not None:
+                    self._jc_with_rate.add(id(jc_block))
+
+    def _plan_base_state_facts(self, blocks: List[Block]) -> None:
+        """The deck's procedures, sensitivity cards, and what a perturbation's base state holds."""
         self._has_sensitivity = any(b.keyword in ("SENSITIVITY", "FEASIBLE DIRECTION") for b in blocks)
         # what a perturbation step's base state holds (_frequency_perturbation; a first
         # *BUCKLE step: handle_step)
@@ -24077,22 +24129,9 @@ class Converter:
                                   ("TEMPERATURE", "FIELD") for b in blocks) or \
             any(desc for b in model if b.keyword == "BOUNDARY"
                 for _, desc in _load_entries(b, user_loads=True))
-        # *CYCLIC HARDENING is read by ccx only after a *PLASTIC, HARDENING=COMBINED of the
-        # same material (one the converter does not comment out); Johnson-Cook *PLASTIC cards
-        # whose material also has a *RATE DEPENDENT card
-        self._cyclic_ok, self._jc_with_rate = set(), set()
-        for group in self._material_groups(blocks):
-            combined, jc_block = False, None
-            for b in group[1:]:
-                if b.keyword == "PLASTIC":
-                    combined = (b.uparam("HARDENING") == "COMBINED" and
-                                not b.uparam("DATATYPE").startswith("PARAM"))
-                    if b.uparam("HARDENING").replace(" ", "") == "JOHNSONCOOK":
-                        jc_block = b
-                elif b.keyword == "CYCLIC HARDENING" and combined:
-                    self._cyclic_ok.add(id(b))
-                elif b.keyword == "RATE DEPENDENT" and jc_block is not None:
-                    self._jc_with_rate.add(id(jc_block))
+
+    def _plan_initial_temperatures(self, blocks: List[Block]) -> None:
+        """Where ccx needs the Abaqus default initial temperature (0) added."""
         # Abaqus gives nodes without an initial temperature 0; ccx stops ("no initial
         # temperature defined in node ...") once any are missing
         self._temp_ic_fill = False
@@ -24139,13 +24178,9 @@ class Converter:
                 self._temp_ic_default = "transient"
         if self._temp_ic_fill or self._temp_ic_default:
             self.geom.nsets.setdefault(ALL_NODES_SET, list(self.geom.nodes))
-        self._plan_material_cards(blocks)
-        self._undefined_parameter_data(blocks)
-        self._plan_deformation_plasticity(blocks)   # before the expansion check: NLGEOM in ccx
-        self._plan_expansion_as_ortho(blocks)
-        self._plan_elastic_expansion(blocks)
-        self._check_nlgeom_expansion(blocks)
-        self._plan_coupled_inertia(blocks)
+
+    def _plan_load_facts(self, blocks: List[Block]) -> None:
+        """What loads as nodal forces need: section thicknesses, beam n1, the deck's *CLOAD DOFs."""
         # distributed loads that become nodal forces need the plane-section thickness, the
         # beams' n1 directions and the DOFs the deck's own *CLOADs act on
         self._section_thick, self._beam_n1, self._deck_cloads = {}, {}, {}
@@ -24189,6 +24224,9 @@ class Converter:
                     if len(r) > 1 and re.fullmatch(r"[-+]?\d+", r[1]):
                         for n in self._resolve_nodes(r[0]):
                             self._deck_cloads.setdefault((n, int(r[1])), set()).add(amp)
+
+    def _plan_print_sets(self, blocks: List[Block]) -> None:
+        """Whole-model sets for *EL PRINT / *NODE PRINT cards that name none."""
         # Abaqus prints the whole model when *EL PRINT / *NODE PRINT has no set; ccx
         # silently prints nothing — give those cards an explicit whole-model set
         if any(b.keyword == "EL PRINT" and not b.param("ELSET") for b in blocks) and self.geom.elements:

@@ -44,7 +44,8 @@ Converter._plan_ply_split()   composite SC6R / SC8R -> one C3D6 / C3D8I per ply:
                               interpolated (_midside_records)
         │
         ▼
-Converter._prescan()   deck-wide facts the handlers need: node kinds, the *TRANSFORM of each
+Converter._plan_node_classes() and the planners after it, to _plan_print_sets():
+                       deck-wide facts the handlers need: node kinds, the *TRANSFORM of each
                        node (_transform_defs), the connector plan (_plan_connectors), rigid
                        bodies and their ROT NODEs (also for kinematic couplings whose
                        transformed reference node needs one, _plan_kinematic_rot_nodes),
@@ -136,7 +137,7 @@ Forces on a node with a `*TRANSFORM` are first given in its local axes (`_to_loc
 a `*CLOAD` there in those axes; a node whose axes are unknown makes the line stay commented.
 `handle_transform` writes a spherical `*TRANSFORM`, which ccx does not have, as a rectangular
 one per node with its spherical axes (`_transform_axes`), and gives a `*RIGID BODY` ROT NODE
-its reference node's axes; `_check_transforms` (end of `_prescan`) plans those and warns about
+its reference node's axes; `_check_transforms` plans those and warns about
 two cards with different data on a node and 2-D nodes whose local 3-axis leaves Z.
 Rotations of transformed nodes: a kinematic coupling whose transformed reference node's
 rotation the deck uses becomes a `*RIGID BODY` with a ROT NODE of its own
@@ -229,7 +230,7 @@ members' translations of a `*RIGID BODY` or `*KINEMATIC` coupling — and stops 
 also has a `*BOUNDARY` or is eliminated twice. Abaqus resolves such overconstraints itself,
 so the converter does it in three places, each exact:
 
-* `_plan_mpcs()` (in `_prescan`) resolves every Abaqus `*MPC` line to node pairs, decides
+* `_plan_mpcs()` resolves every Abaqus `*MPC` line to node pairs, decides
   how each type is written (`handle_mpc()` then emits it line by line) and groups the `BEAM`
   lines into rigid bodies by their independent node (union-find over chained lines). The
   bodies get ROT NODEs and, on shell/beam nodes, knot beams like any `*RIGID BODY`.
@@ -254,7 +255,7 @@ so the converter does it in three places, each exact:
   held at zero in every step, eliminates connector-only rotations, turns one-DOF rows into
   `*BOUNDARY` lines (repeated after any `OP=NEW`) and keeps under `NLGEOM` only the rows
   that stay exact there; `handle_connector_section()` writes them.
-* `_plan_coupled_bcs()` (in `_prescan`) finds BCs on rigid-constraint members that the
+* `_plan_coupled_bcs()` finds BCs on rigid-constraint members that the
   reference node's own BCs impose anyway (the same value, no rotation about the other axes
   while the BC is in force, `bc_steps()`) and takes them off the card; a `*RIGID BODY`'s
   other member BCs move to its reference node where Abaqus/Standard puts them
@@ -288,7 +289,7 @@ members (`_tie_to_rigid`), and `_rewrite_rigid_bodies` gives every touched `*RIG
 knot, coupled-BC and output planners read the full body. `_plan_rotary_stars` replaces
 `ROTARYI` elements by `inertia_star()` point masses; `_plan_skin_material` sizes the skin
 material, which `_rigid_model_cards()` writes after the deck's materials, just before the
-first `*STEP`. After `_prescan` (which adds the ROT NODEs) `_plan_rigid_planar_holds()`
+first `*STEP`. After `_plan_rot_nodes()` (which adds the ROT NODEs) `_plan_rigid_planar_holds()`
 writes the model-data BCs that keep plane and axisymmetric bodies in their plane;
 `handle_boundary` repeats them after `OP=NEW`. In assemblies, `_place_analytic` gives a
 part's analytical surface its instance's frame. `_plan_rigid_contact_increment` (after
@@ -305,7 +306,7 @@ displacement BC whose amplitude is the time integral of the prescribed history.
 periodic, modulated, decay) into a function of time; `integrate_history()` integrates a rate
 once or twice exactly (Gauss-Legendre panels between the breakpoints) and samples it densely
 enough that ccx's straight lines between the points stay within 1e-4 of the step's travel.
-`_plan_velocity_bcs()` (in `_prescan`, after `_plan_coupled_bcs()`, whose rewrite of a card
+`_plan_velocity_bcs()` (after `_plan_coupled_bcs()`, whose rewrite of a card
 it reads through `_rate_lines()`) follows every DOF such a BC touches through the steps —
 its displacement and velocity at each step start, the BC in force (`op_new_cards()`, and
 re-specification as in Abaqus) — and plans:
