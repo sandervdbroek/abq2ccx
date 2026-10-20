@@ -22271,7 +22271,7 @@ class Converter:
             if b.keyword == "TRANSFORM" and \
                     set(self._resolve_nodes((b.param("NSET") or "").strip())) & nodes:
                 return [], "a *TRANSFORM acts on beam nodes, which is not converted for U1"
-            if b.keyword == "EQUATION" and self._u1_equation_nodes(b) & nodes:
+            if b.keyword == "EQUATION" and any(set(ns) & nodes for ns, _ in self._equation_dofs(b)):
                 return [], "an *EQUATION ties beam nodes, which is not converted for U1"
             if b.keyword in ("SPRING", "DASHPOT") and b.has("NONLINEAR"):
                 return [], f"a nonlinear *{b.keyword} (ccx would iterate, with U1's wrong nodal forces)"
@@ -22315,25 +22315,6 @@ class Converter:
                 return [], plan
             plans.append((b, plan))
         return plans, None
-
-    def _u1_equation_nodes(self, b: Block) -> set:
-        """The nodes the terms of *EQUATION card ``b`` name."""
-        out: set = set()
-        left = 0
-        for rec in merged_data_records(b):
-            f = [x.strip() for x in rec if x.strip() != ""]
-            if not f:
-                continue
-            if left <= 0:
-                try:
-                    left = int(float(f[0]))
-                except ValueError:
-                    left = 0
-                continue
-            for k in range(0, len(f) - 2, 3):
-                out.update(self._resolve_nodes(f[k]))
-                left -= 1
-        return out
 
     def _u1_load_obstacle(self, blocks: List[Block], member: Dict[int, Block]) -> Optional[str]:
         """Why a load on the U1 candidates ``member`` keeps them from being U1, or None: they
