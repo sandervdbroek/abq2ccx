@@ -108,6 +108,17 @@ physics.
   its base-state value: written as `*BOUNDARY, FIXED` where ccx then holds that value (right
   after the general step or `*FREQUENCY` steps; translations of nodes without `*TRANSFORM`),
   warned elsewhere. Temperatures there with temperature-dependent materials are warned.
+* **New midside nodes of `*TRANSFORM` edges in ramped steps** — where Abaqus ramps a BC
+  without AMPLITUDE and ccx would step it (`*DYNAMIC` after an earlier step, say), the midside
+  node's lines were stepped and flagged as reduced physics: its own BCs before the step went
+  unseen (2e-3 off at a free node). They now ramp with its end nodes'.
+* **Velocity and acceleration BCs on new midside nodes of curved edges** — under a cylindrical
+  or spherical `*TRANSFORM` they are now interpolated in global components, as displacements
+  are since 1.4.0 (3.5e-4 off at the node before), and no second, approximated line reaches
+  that node.
+* **Two rotational BCs on a shell node with a `*TRANSFORM`** — where neither held axis nor the
+  free one is the shell normal, ccx 2.23 also holds the free rotation's in-plane part (a second
+  mean-rotation MPC; probed: 30 % off on a cylindrical panel). Now warned, reduced physics.
 
 ## 1.4.0 (October 2026)
 

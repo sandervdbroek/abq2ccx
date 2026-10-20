@@ -4192,11 +4192,12 @@ class Converter:
         self._solver_why = ""
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
-        # such card, what each step appends for the ones it keeps, and the amplitudes only
-        # they use
+        # such card, what each step appends for the ones it keeps, the amplitudes only they
+        # use, and the pieces that carry their own midside lines
         self._vel_cards: Dict[int, List[object]] = {}
         self._vel_tail: Dict[int, List[object]] = {}
         self._vel_only_amps: set = set()
+        self._vel_mids: set = set()
         self._vel_amp_count = 0
         # displacement *BOUNDARY cards without AMPLITUDE that Abaqus applies otherwise than
         # ccx would (see _plan_default_amplitudes): what replaces each, and the steps that
@@ -8360,8 +8361,9 @@ class Converter:
         said = self._op_new_drop.get(src)
         out = [said] if said and b.uparam("OP") == "NEW" else []   # (the first piece has the OP)
         out.append(emit_keyword("BOUNDARY", params))
-        # (the pieces of a card _plan_default_amplitudes splits carry their midside lines)
-        midside = [] if src in self._amp_cards else \
+        # (the pieces of a card _plan_default_amplitudes splits carry their midside lines, as
+        # do most of _plan_velocity_bcs's)
+        midside = [] if src in self._amp_cards or id(b) in self._vel_mids else \
             [ln.split(",") for ln in self._midside_records(b, "boundary")]
         # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
         recs = self._bc_card_records(b)
@@ -8835,6 +8837,13 @@ class Converter:
             self._piece_src.update((id(p), id(src)) for p in blocks)
         return out
 
+    def _mid_pieces(self, pieces: List[object]) -> List[object]:
+        """``pieces`` (_bc_pieces) of _plan_velocity_bcs, whose midside lines it wrote itself
+        (midside), recorded in _vel_mids - all but a FIXED one's, which handle_boundary
+        extends (_midside_records)."""
+        self._vel_mids.update(id(p) for p in pieces if isinstance(p, Block) and not p.has("FIXED"))
+        return pieces
+
     def _rate_line_comment(self, what: str, why: str, reduces: bool = True) -> Tuple[str, str]:
         """A rate BC line that is not converted: warned, and the comment line in its place."""
         self.report.warn(why, once=True)
@@ -8889,6 +8898,7 @@ class Converter:
         self._vel_cards = {}
         self._vel_tail = {}
         self._vel_only_amps = set()
+        self._vel_mids = set()
         self._piece_src = {}             # (_plan_default_amplitudes, which runs next, adds to it)
         rate_cards = [b for b in blocks if b.keyword == "BOUNDARY" and self._bc_type(b) in self._RATE_TYPES]
         if not rate_cards:
@@ -9122,45 +9132,62 @@ class Converter:
                                          "such a node; check its other BCs.", once=True)
                         self._reduces("velocity / acceleration BC on a *TRANSFORM node")
 
-            def mean_entry(ea: tuple, ec: tuple, m: int, d: int, shapes: Dict[tuple, str],
-                           amp_lines: List[str], frac: float = 0.5) -> Optional[Tuple[object, str]]:
-                """The line that moves node m, at s along the segment between two end nodes,
-                with the interpolated motion of the ends (entries ``ea``/``ec`` of a driven
-                map), or None (a velocity and an acceleration end)."""
-                if ea[4] == ec[4]:                 # one amplitude (or none): mean of the values
-                    return (ea[4], f"{m}, {d}, {d}, {(1.0 - frac) * pf(ea[5]) + frac * pf(ec[5]):.12g}")
-                orders = {e[0]["q"] for e in (ea, ec) if e[4] is not None}
+            def mean_entry(terms: List[Tuple[float, tuple]], m: int, d: int, shapes: Dict[tuple, str],
+                           amp_lines: List[str]) -> Optional[Tuple[object, str]]:
+                """The line that moves DOF d of node m by the sum of weight x motion over
+                ``terms`` (weight, entry of a driven map), or None (a velocity and an
+                acceleration among them)."""
+                if len({e[4] for _, e in terms}) <= 1:      # one amplitude (or none): the values
+                    sig = terms[0][1][4] if terms else None
+                    return (sig, f"{m}, {d}, {d}, {sum(w * pf(e[5]) for w, e in terms):.12g}")
+                orders = {e[0]["q"] for _, e in terms if e[4] is not None}
                 if len(orders) > 1:
                     return None
                 order = 2 if orders == {"ACCELERATION"} else 1
-                rates = [(self._bc_history(e[0], T, t0, None, e[3]) if e[4] is not None else None)
-                         or ((lambda t: 0.0), [], 0.0) for e in (ea, ec)]
+                rates = [(w, (self._bc_history(e[0], T, t0, None, e[3]) if e[4] is not None else None)
+                          or ((lambda t: 0.0), [], 0.0)) for w, e in terms]
                 pts, _, _, _ = integrate_history(
-                    lambda t: (1.0 - frac) * rates[0][0](t) + frac * rates[1][0](t), list(rates[0][1]) +
-                    list(rates[1][1]), T, order, (1.0 - frac) * ea[1] + frac * ec[1],
-                    (1.0 - frac) * (ea[2] or 0.0) + frac * (ec[2] or 0.0),
-                    min([h[2] for h in rates if h[2] > 0.0], default=0.0), max_points=max_points)
-                key = ("midside", m, d, ea[4], ec[4], ea[5], ec[5])
+                    lambda t: sum(w * h[0](t) for w, h in rates), [x for _, h in rates for x in h[1]],
+                    T, order, sum(w * e[1] for w, e in terms), sum(w * (e[2] or 0.0) for w, e in terms),
+                    min([h[2] for _, h in rates if h[2] > 0.0], default=0.0), max_points=max_points)
+                key = ("midside", m, d) + tuple((w, e[4], e[5]) for w, e in terms)
                 if key not in shapes:
                     shapes[key], text_ = self._rate_amplitude(pts, "ACCELERATION" if order == 2 else "VELOCITY")
                     amp_lines += text_
                 return (shapes[key], f"{m}, {d}, {d}, 1.")
 
             def midside(driven: dict, shapes: Dict[tuple, str], amp_lines: List[str],
-                        entries: list, done: set) -> None:
+                        entries: list, done: set, skip: Union[set, dict] = frozenset()) -> None:
                 """A node the converter put between two end nodes these lines drive (an
                 upgraded beam's or shell's midside node, a ply interface node) moves with the
                 interpolated motion of the ends, which is what the Abaqus element sees between
                 them (handle_boundary interpolates only within one *BOUNDARY block, and the end
-                nodes may get different amplitudes)."""
+                nodes may get different amplitudes) - where their *TRANSFORM axes differ (a
+                curved edge), in global components, written in the node's own axes
+                (_turned_midside_weights, as _midside_records does).  Not on the node's DOFs in
+                ``driven`` or ``skip``."""
+                kinds: set = set()
                 for a, c, m, frac in self._between():
-                    for d in range(1, 7):
-                        ea, ec = driven.get((a, d)), driven.get((c, d))
-                        if ea and ec and (m, d) not in driven:
-                            e = mean_entry(ea, ec, m, d, shapes, amp_lines, frac)
-                            if e is not None:
-                                entries.append(e)
-                                done.add((m, d))
+                    frames = self._turned_frames(a, c, m)
+                    if frames is None:
+                        rows = [(d, [(1.0 - frac, (a, d)), (frac, (c, d))], True) for d in range(1, 7)
+                                if (a, d) in driven and (c, d) in driven]
+                    else:
+                        rows = [(d, [(w, ((a, c)[e], k)) for e, k, w in terms if abs(w) > 1e-12], fixed)
+                                for d, terms, fixed in self._turned_midside_weights(
+                                    {d for d in range(1, 7) if (a, d) in driven},
+                                    {d for d in range(1, 7) if (c, d) in driven}, frac, frames)]
+                    for d, terms, fixed in rows:
+                        if (m, d) in driven or (m, d) in skip:
+                            continue
+                        e = mean_entry([(w, driven[k]) for w, k in terms], m, d, shapes, amp_lines)
+                        if e is not None:
+                            entries.append(e)
+                            done.add((m, d))
+                            if frames is not None:
+                                kinds.add("turned" if fixed else "turned~")
+                if kinds:
+                    self._note_midside_lines("BOUNDARY", kinds)
 
             redefined: set = set()
             shapes: Dict[tuple, str] = {}
@@ -9227,7 +9254,7 @@ class Converter:
                         redefined.add(k)
                 if rate:
                     midside(driven, shapes, amp_lines, entries, mid_done)
-                    self._vel_cards[id(b)] = self._bc_pieces(b, entries, amp_lines)
+                    self._vel_cards[id(b)] = self._mid_pieces(self._bc_pieces(b, entries, amp_lines))
                 for spec, dofs, _, _, _ in self._rate_lines(b):   # a later card replaces a BC
                     for n in self._resolve_nodes(spec):
                         for d in dofs:
@@ -9246,18 +9273,13 @@ class Converter:
                 convert(state[keys[0]][2], keys, shapes, tail_amps, tail, tail_driven)
             midside(tail_driven, shapes, tail_amps, tail, mid_done)
             step_driven.update(tail_driven)
-            for a, c, m, frac in self._between():  # end nodes driven by different cards
-                for d in range(1, 7):
-                    ea, ec = step_driven.get((a, d)), step_driven.get((c, d))
-                    if ea and ec and (m, d) not in mid_done and (m, d) not in step_driven:
-                        e = mean_entry(ea, ec, m, d, shapes, tail_amps, frac)
-                        if e is not None:
-                            tail.append(e)
+            # end nodes driven by different cards
+            midside(step_driven, shapes, tail_amps, tail, set(), mid_done)
             tail = [e for e in tail if e[0] not in (None, "FIXED")]   # ccx holds those already
             if tail:
-                self._vel_tail[s] = self._bc_pieces(
+                self._vel_tail[s] = self._mid_pieces(self._bc_pieces(
                     None, tail, ["** abq2ccx: *BOUNDARY, TYPE=VELOCITY/ACCELERATION of an earlier "
-                                 "step, still in force: its motion continues"] + tail_amps)
+                                 "step, still in force: its motion continues"] + tail_amps))
             # warn where finite rotations about several axes are integrated component-wise:
             # a node turned about more than one axis in this step, or about another axis
             # than the one it turned about before (the manual's own example of velocity BCs)
@@ -9392,7 +9414,8 @@ class Converter:
                 lines = self._amp_lines(b, mid_ends)
                 todo.append((s, kind, info["proc"], b, lines))
                 for ln in lines:
-                    query.update((n, d) for n in ln["ends"] for d in ln["dofs"] if 1 <= d <= 6)
+                    query.update((n, d) for n in ln["ends"] + ln["nodes"] for d in ln["dofs"]
+                                 if 1 <= d <= 6)
         if not todo:
             return
         rest = self._dofs_at_rest(model, groups, query, {t[0] for t in todo})
@@ -9513,15 +9536,22 @@ class Converter:
         time curve: not), and in Abaqus/Explicit a new displacement without AMPLITUDE (a
         zero velocity) - or puts it there with a new zero displacement.  And the pairs with
         a BC in force when it starts (ccx matches a BC re-specified there to the old one).
-        After a linear perturbation step the BCs are the last general step's again (bc_steps)."""
+        After a linear perturbation step the BCs are the last general step's again (bc_steps).
+        A node the converter put between two nodes has the lines a displacement card gives it
+        (_midside_records)."""
         at_zero = set(query)
+        mids = {m for _a, _c, m, _s in self._between()}
+        mids = mids if any(n in mids for n, _ in query) else set()
 
         def entries(b: Block) -> list:
             """(pair, (kind, value, amplitude?, card)) of a *BOUNDARY's pairs in ``query``."""
             kind = "fixed" if b.has("FIXED") else "other" if b.has("USER") or b.has("SUBMODEL") \
                 else {"DISPLACEMENT": "disp", "VELOCITY": "vel"}.get(self._bc_type(b), "other")
             amp = bool((b.param("AMPLITUDE") or "").strip())
-            return [((n, d), (kind, mag, amp, id(b))) for nodes, dofs, mag in self._bc_records(b)
+            recs = self._bc_records(b)
+            if mids and self._bc_type(b) not in self._RATE_TYPES:
+                recs += self._bc_records(b, lines=self._midside_records(b, "boundary", note=False))
+            return [((n, d), (kind, mag, amp, id(b))) for nodes, dofs, mag in recs
                     for n in nodes for d in dofs if (n, d) in query]
         cards = model + [b for g in groups for b in g]
         given = {id(b): entries(b) for b in cards if b.keyword == "BOUNDARY"}
@@ -10810,7 +10840,8 @@ class Converter:
           local axis (gen3dboun / gen3dforc use the transformation): exact for one local
           rotation per node; with several, usermpc can pick a dependent twice ('zero
           coefficient on the dependent side'; 1.5-156 % off on a beam) — not on a shell,
-          whose rotational BCs make two such MPCs at most;
+          whose rotational BCs make two such MPCs at most (but where two hold rotations about
+          axes off the normal, ccx holds both in-plane rotations: _shell_rotation_pairs);
         * on a knot (a frame joint, a converter knot beam) and on a kinematic reference node
           they act on a rotation node ccx makes without the transform, about the GLOBAL axes
           (34-291 % off): written in global components there — a moment line by line, held
@@ -10906,6 +10937,8 @@ class Converter:
                                   "which this node is (its elements' normals differ by 15-25 deg, "
                                   "or the deck has *NORMAL definitions)")
             self._rot_mode[n] = mode
+        self._shell_rotation_pairs(blocks, cards, [n for n, m in self._rot_mode.items()
+                                                   if m == "keep" and n not in beam_nodes], at)
         if knot_beams:
             self._add_knot_beams(knot_beams, blocks)
             self.report.note(f"{len(knot_beams)} beam node(s) with a *TRANSFORM and rotational BCs "
@@ -10942,6 +10975,54 @@ class Converter:
                              "local axes — a moment line by line, held rotations as their global "
                              "values.", once=True)
 
+    def _shell_rotation_pairs(self, blocks: List[Block], cards: list, nodes: List[int],
+                              at: Dict[int, List[int]]) -> None:
+        """Warn where ccx 2.23 holds a rotation of a shell node with a *TRANSFORM that the deck
+        leaves free: on a node that is no knot (``nodes``, kept in the local axes) a step's BCs
+        hold two of its local rotations, neither about the shell normal (ccx drops one within
+        2.6 deg of it as the drilling rotation), and the free third axis is off the normal.
+        gen3dboun then adds a second mean-rotation MPC about n x e1 (e1: the first one's
+        axis in the shell plane), holding both in-plane rotations, so the in-plane part of the
+        free axis is held too (probed: a cylindrical panel 30 % off; rotated about z, a strip
+        whose tip holds rotations about x and y twists 165x less).  The normal is ccx's: a
+        *NODE normal, else the mean of the shell elements' at the node."""
+        if not nodes or self._has_normal:
+            return
+        mine = {id(b): items for b, _, items in cards}
+        held = [{k for k in step if k[0] in nodes}
+                for step in bc_steps([b for b in blocks if b.keyword in ("STEP", "END STEP") or
+                                      (b.keyword == "BOUNDARY" and id(b) in mine)],
+                                     lambda b: [((n, d), 1) for n, its in mine[id(b)].items() for d, _ in its])]
+        hit = []
+        for n in nodes:
+            axes = self._local_axes(n)
+            nrm = self._node_normals.get(n)
+            if nrm is None:
+                ns = [v for e in at.get(n, ()) if ccx_type(self.geom.elements[e][0]) in SHELL_TYPES
+                      for v in [self._shell_normal(e)] if vnorm(v)]
+                tot: Vec = (0.0, 0.0, 0.0)
+                for v in ns:
+                    tot = vadd(tot, v if vdot(v, ns[0]) >= 0.0 else vscale(v, -1.0))
+                nrm = vunit(tot) if vnorm(tot) else None
+            if nrm is None or isinstance(axes, str):
+                continue
+            for step in held:
+                ds = sorted(d for m, d in step if m == n)
+                free = [d for d in (4, 5, 6) if d not in ds]
+                if len(ds) == 2 and all(abs(vdot(axes[d - 4], nrm)) <= 0.999 for d in ds) and \
+                        abs(vdot(axes[free[0] - 4], nrm)) < 0.999:
+                    hit.append(n)
+                    break
+        if hit:
+            self.report.warn(f"Rotational BCs on {len(hit)} shell node(s) with a *TRANSFORM (e.g. node "
+                             f"{hit[0]}) hold two local rotations about axes off the shell normal, "
+                             f"leaving the third, also off the normal, free: ccx 2.23 then holds both "
+                             f"rotations in the shell plane (a second mean-rotation MPC), so the "
+                             f"in-plane part of the free rotation is held too (probed: 30 % off on a "
+                             f"cylindrical panel). Abaqus leaves it free.", once=True)
+            self._reduces("shell rotation the deck leaves free held by ccx (two rotational BCs off the "
+                          "normal on a node with a *TRANSFORM)")
+
     def _rot_items(self, b: Block, nodes: set,
                    whole: bool = False) -> Dict[int, List[Tuple[int, float]]]:
         """(DOF, value) per node of ``nodes`` that the *BOUNDARY or *CLOAD ``b`` gives on DOFs
@@ -10974,8 +11055,10 @@ class Converter:
                             out.setdefault(n, []).append((d, num(f[2] if len(f) > 2 else "")))
             return out
         recs = self._bc_card_records(b)
-        if self._piece_src.get(id(b)) not in self._amp_cards:     # (those pieces carry theirs)
-            recs = list(recs) + [ln.split(",") for ln in self._midside_records(b, "boundary")]
+        if self._piece_src.get(id(b)) not in self._amp_cards and id(b) not in self._vel_mids:
+            # (those pieces carry theirs; a rate card's are _plan_velocity_bcs's to note)
+            recs = list(recs) + [ln.split(",") for ln in self._midside_records(
+                b, "boundary", note=self._bc_type(b) not in self._RATE_TYPES)]
         for rec in recs:
             g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
@@ -18037,7 +18120,8 @@ class Converter:
             self._between_cache = (key, out)
         return self._between_cache[1]
 
-    def _midside_records(self, b: Block, layout: str, only: Optional[set] = None) -> List[str]:
+    def _midside_records(self, b: Block, layout: str, only: Optional[set] = None,
+                         note: bool = True) -> List[str]:
         """Extra data lines that carry a per-node card onto the nodes the converter put
         between two nodes (_between: midside nodes of upgraded beams and shells, ply interface
         nodes; with ``only``, those of its nodes): when the card gives both end nodes a value
@@ -18047,7 +18131,8 @@ class Converter:
         ``"field"`` (node, values...).  Appended after the card's own lines, they override
         what a set gave the new node; a value the card already gives it is not repeated.  A
         *BOUNDARY on nodes whose *TRANSFORM axes differ (a cylindrical or spherical system
-        along a curved edge) is interpolated in global components (_turned_midside_runs)."""
+        along a curved edge) is interpolated in global components (_turned_midside_runs).
+        ``note``: say so in the report (not when planning)."""
         if not self._midside and not self._edge_nodes and not self._tied_nodes:
             return []
         recs: Dict[int, Dict[int, object]] = {}
@@ -18078,7 +18163,6 @@ class Converter:
         kinds: set = set()
         beam_mids = {m for _, _, m in self._midside.values()}
         turn = layout == "boundary" and b.keyword == "BOUNDARY" and bool(self._transformed)
-        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         for a, c, m, s in self._between() + (self._tied_nodes if layout != "boundary" else []):
             if a not in recs or c not in recs or (only is not None and m not in only):
                 continue
@@ -18091,12 +18175,10 @@ class Converter:
                     kinds.add("beam" if m in beam_mids else "edge")
                 continue
             runs: List[List] = []                # [first DOF, last DOF, value] (value None = blank)
-            frames = [self._mpc_frame(n) for n in (a, c, m)] if turn else []    # None: global
-            turned = bool(frames) and not any(isinstance(f, str) for f in frames) and \
-                any(abs(x - y) > 1e-9 for f in frames[:2] for u, w in zip(f or unit, frames[2] or unit)
-                    for x, y in zip(u, w))
+            frames = self._turned_frames(a, c, m) if turn else None
+            turned = frames is not None
             if turned:
-                runs, exact = self._turned_midside_runs(ra, rc, rm, s, [f or unit for f in frames])
+                runs, exact = self._turned_midside_runs(ra, rc, rm, s, frames)
                 kinds.add("turned" if exact else "turned~")
             for d in sorted(set(ra) & set(rc)):
                 if turned and 1 <= d <= 6:
@@ -18114,7 +18196,7 @@ class Converter:
                 out.append(", ".join(head + ([] if v is None else ["%.12g" % v])))
             if len(out) > n_out:
                 kinds.add("beam" if m in beam_mids else "edge")
-        if out:
+        if out and note:
             self._note_midside_lines(b.keyword, kinds)
         return out
 
@@ -18132,32 +18214,58 @@ class Converter:
         free components add an unknown part (approximate).  Also whether all are exact."""
         runs: List[List] = []
         exact = True
+        for d, terms, fixed in self._turned_midside_weights(ra, rc, s, frames):
+            exact = exact and fixed
+            given = [(ra, rc)[e][k] for e, k, _ in terms]
+            tiny = 1e-12 * max(abs(x or 0.0) for x in given)
+            v = sum(w * ((ra, rc)[e][k] or 0.0) for e, k, w in terms)
+            v = None if all(x is None for x in given) else 0.0 if abs(v) <= tiny else v
+            if d in rm and rm[d] == v:
+                continue
+            if runs and runs[-1][1] == d - 1 and runs[-1][2] == v:
+                runs[-1][1] = d
+            else:
+                runs.append([d, d, v])
+        return runs, exact
+
+    def _turned_frames(self, a: int, c: int, m: int) -> Optional[List[Tuple[Vec, Vec, Vec]]]:
+        """The local axes (_mpc_frame; the global ones on a node without a *TRANSFORM) of end
+        nodes a and c and of the node m the converter put between them, where they differ (a
+        cylindrical or spherical *TRANSFORM along a curved edge, or ends in different
+        systems); else None."""
+        if not self._transformed:
+            return None
+        frames = [self._mpc_frame(n) for n in (a, c, m)]
+        if any(isinstance(f, str) for f in frames):
+            return None
+        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        frames = [f or unit for f in frames]
+        if all(abs(x - y) <= 1e-9 for f in frames[:2] for u, w in zip(f, frames[2]) for x, y in zip(u, w)):
+            return None
+        return frames
+
+    @staticmethod
+    def _turned_midside_weights(ga: Union[set, dict], gc: Union[set, dict], s: float,
+                                frames: Sequence[Tuple[Vec, Vec, Vec]]) -> List[tuple]:
+        """For a node at ``s`` between end nodes a and c whose local axes ``frames`` (a's, c's,
+        the node's: _turned_frames) differ, where a card gives a the DOFs ``ga`` and c ``gc``:
+        (DOF, terms, exact) per DOF of the node that gets a line (_turned_midside_runs), its
+        value the sum of weight x the value the card gives end e (0: a, 1: c) on DOF k over
+        its terms (e, k, weight) - the ends' vectors interpolated in global components,
+        projected on the node's axis."""
+        out = []
         for g0 in (0, 3):
-            held = [j for j in range(3) if g0 + j + 1 in ra and g0 + j + 1 in rc]
+            held = [j for j in range(3) if g0 + j + 1 in ga and g0 + j + 1 in gc]
             if not held:
                 continue
-            given = [x for j in held for x in (ra[g0 + j + 1], rc[g0 + j + 1])]
-            vec: Vec = (0.0, 0.0, 0.0)
-            for j in held:
-                vec = vadd(vec, vadd(vscale(frames[0][j], (1.0 - s) * (ra[g0 + j + 1] or 0.0)),
-                                     vscale(frames[1][j], s * (rc[g0 + j + 1] or 0.0))))
             free = [f[j] for f in frames[:2] for j in range(3) if j not in held]
-            tiny = 1e-12 * max(abs(x or 0.0) for x in given)
             for k in range(3):
                 fixed = all(abs(vdot(frames[2][k], f)) <= 1e-9 for f in free)
-                if not fixed and k not in held:
-                    continue
-                exact = exact and fixed
-                v = vdot(vec, frames[2][k])
-                v = None if all(x is None for x in given) else 0.0 if abs(v) <= tiny else v
-                d = g0 + k + 1
-                if d in rm and rm[d] == v:
-                    continue
-                if runs and runs[-1][1] == d - 1 and runs[-1][2] == v:
-                    runs[-1][1] = d
-                else:
-                    runs.append([d, d, v])
-        return runs, exact
+                if fixed or k in held:
+                    out.append((g0 + k + 1, [(e, g0 + j + 1, (s if e else 1.0 - s) *
+                                              vdot(frames[e][j], frames[2][k]))
+                                             for j in held for e in (0, 1)], fixed))
+        return out
 
     def _note_midside_lines(self, keyword: str, kinds: Sequence[str] = ("beam",)) -> None:
         if "beam" in kinds:
@@ -21809,13 +21917,15 @@ class Converter:
         return {(n, d) for b in blocks if b.keyword == "BOUNDARY"
                 for nodes, dofs, _ in self._bc_records(b) for n in nodes for d in dofs}
 
-    def _bc_records(self, b: Block, rot: Optional[bool] = None) -> List[Tuple[List[int], List[int], float]]:
+    def _bc_records(self, b: Block, rot: Optional[bool] = None,
+                    lines: Optional[List[str]] = None) -> List[Tuple[List[int], List[int], float]]:
         """(nodes, DOFs, magnitude) per data line of a *BOUNDARY card, as handle_boundary
         emits it: a named type (ENCASTRE, XSYMM, ...) has magnitude 0 and includes the
         rotations where handle_boundary does (``rot`` overrides that), an unreadable
-        magnitude is NaN (equal to nothing)."""
+        magnitude is NaN (equal to nothing).  ``lines``: these data lines instead of the
+        card's."""
         out = []
-        for rec in merged_data_records(b):
+        for rec in merged_data_records(b) if lines is None else [ln.split(",") for ln in lines]:
             g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
                 continue

@@ -3122,6 +3122,56 @@ def coupled_beam_deck(kind="kin"):
             "HANG, GRAV, 9.81, 0., 0., -1.\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
 
 
+def transformed_beam_end(twin=False):
+    """A straight B31 cantilever along y at x = 1 (SECTION=CIRC, written as 3-node beams;
+    nodes 1-4, 0.5 apart, set ALLN), clamped at node 1, its last element's ends 3 and 4 with
+    a cylindrical *TRANSFORM about z (their axes and their midside node's differ); ``twin``:
+    without the *TRANSFORM.  Also how a node's (radial, tangential, axial) BC values read
+    in the deck's axes."""
+    def axes(n, v):
+        if not twin:
+            return v
+        y = 0.5 * (n - 1)
+        c, s = 1. / math.hypot(1., y), y / math.hypot(1., y)
+        return (v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2])
+    return ("*NODE\n" + "".join(f"{i + 1}, 1., {0.5 * i!r}, 0.\n" for i in range(4)) +
+            "*ELEMENT, TYPE=B31, ELSET=B\n1, 1, 2\n2, 2, 3\n3, 3, 4\n*NSET, NSET=ALLN, GENERATE\n"
+            "1, 4, 1\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=CIRC\n0.05\n0., 0., 1.\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n2.1e5, 0.3\n*DENSITY\n7.8e-9\n*BOUNDARY\n1, 1, 6\n" +
+            ("" if twin else "*NSET, NSET=TR\n3, 4\n*TRANSFORM, NSET=TR, TYPE=C\n0., 0., 0., 0., 0., 1.\n")), axes
+
+
+def ramped_midside_deck(step, twin=False):
+    """transformed_beam_end's ends 3 and 4 moved along all three local axes by BCs without
+    AMPLITUDE in two steps where Abaqus ramps them and ccx would step them (``step``:
+    "*DYNAMIC", or an NLGEOM "*STATIC" under *STEP, AMPLITUDE=STEP), the second with new
+    values, as is their midside node (interpolated); ``twin``: without the *TRANSFORM, the BCs
+    in global components.  Prints every node (the set takes the midside nodes) in every
+    increment."""
+    text, axes = transformed_beam_end(twin)
+    head = ("*STEP\n*DYNAMIC\n0.05, 1., 1e-5, 0.05\n" if step == "*DYNAMIC" else
+            "*STEP, NLGEOM, AMPLITUDE=STEP\n*STATIC\n0.25, 1., 1e-5, 0.25\n")
+    for vals in ({3: (0.01, 0.005, 0.003), 4: (0.02, 0., 0.006)},
+                 {3: (0.021, 0.012, 0.005), 4: (0.035, 0.004, 0.015)}):
+        text += head + "*BOUNDARY\n" + "".join(f"{n}, {d}, {d}, {v:.12g}\n" for n, loc in vals.items()
+                                               for d, v in enumerate(axes(n, loc), 1))
+        text += "*NODE PRINT, NSET=ALLN, GLOBAL=YES\nU\n*END STEP\n"
+    return text
+
+
+def midside_velocity_deck(typ, twin=False):
+    """transformed_beam_end's ends 3 and 4 moved along all three local axes by a *BOUNDARY,
+    TYPE=``typ`` (VELOCITY or ACCELERATION) in a *DYNAMIC step, node 4's tangential rate
+    zero, as is their midside node (the interpolated motion); ``twin``: without the
+    *TRANSFORM, the rates in global components.  Prints every node."""
+    text, axes = transformed_beam_end(twin)
+    vals = {3: (0.01, 0.005, 0.003), 4: (0.02, 0., 0.006)}
+    return (text + f"*STEP\n*DYNAMIC\n0.05, 1., 1e-5, 0.05\n*BOUNDARY, TYPE={typ}\n" +
+            "".join(f"{n}, {d}, {d}, {v:.12g}\n" for n, loc in vals.items()
+                    for d, v in enumerate(axes(n, loc), 1)) +
+            "*NODE PRINT, NSET=ALLN, GLOBAL=YES\nU\n*END STEP\n")
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
@@ -7542,6 +7592,29 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): every displacement table as "
                   f"{ref[0] if ref else 'without the *TRANSFORM'}, the BCs on the global DOFs "
                   f"({err:.1e} apart, free nodes moved {moved:.3g})")
+        failures += 0 if ok else 1
+    # ... in a step that ramps it (its lines were stepped: its own BCs before the step were not
+    # seen; free node 2 2.0e-3 off in *DYNAMIC, 12 tables for 8), and moved by velocity or
+    # acceleration BCs (interpolated in its turned axes: 3.5e-4 off there, 7.7e-5 at node 2)
+    for tag, decks, what in (
+            *((f"ramped_midside_{step[1:].lower()}", [ramped_midside_deck(step, t) for t in (False, True)],
+               f"moved along local 1-3 by BCs without AMPLITUDE in two "
+               f"{'*DYNAMIC' if step == '*DYNAMIC' else '*STEP, AMPLITUDE=STEP NLGEOM *STATIC'} steps")
+              for step in ("*DYNAMIC", "*STATIC")),
+            *((f"midside_{typ.lower()}", [midside_velocity_deck(typ, t) for t in (False, True)],
+               f"moved along local 1-3 by a *BOUNDARY, TYPE={typ} in a *DYNAMIC step")
+              for typ in ("VELOCITY", "ACCELERATION"))):
+        runs = [review_run(text, tag + ("_ref" if k else ""), dat_node_blocks)
+                for k, text in enumerate(decks)]
+        ok = all(runs)
+        if ok:
+            err, top = same(runs)
+            free = max(abs(x) for blk in runs[1] for x in blk.get(2, [0.0]))
+            ok = err < 1e-9 * top and free > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a straight CIRC B31 cantilever's last "
+                  f"element written as a 3-node beam, its ends and midside node with a cylindrical "
+                  f"*TRANSFORM, {what}): every displacement table as without the *TRANSFORM "
+                  f"({err:.1e} apart, free node 2 moved {free:.3g})")
         failures += 0 if ok else 1
 
     # a CIRC B31 between two kinematically coupled nodes: its new midside node joins the

@@ -9007,6 +9007,48 @@ def test_midside_node_bcs_on_a_curved_transformed_edge():
     g = [0.5 * sum(v[j] * e[j][k] for v, e in zip(((0.01,) * 3, (0.02, 0., 0.)), ends) for j in range(3))
          for k in range(3)]
     assert _close(mid(body), {4 + k: g[k] for k in range(3)}, 1e-11)
+    # velocities too: the ends' motions interpolated in global components (before: their local
+    # rates averaged, and the card's pieces got approximated midside lines besides; probed:
+    # 3.5e-4 off at the midside node, now exact)
+    vel = arc.replace("*Static\n*Boundary\n", "*Dynamic\n0.1, 1.\n*Boundary, type=VELOCITY\n")
+
+    def moved(body):
+        """Node 5's motion at the step end per DOF (value x amplitude end), one line each."""
+        out, amp = {}, None
+        for l in _live(body):
+            if l.startswith("*"):
+                amp = re.search(r"AMPLITUDE=(\w+)", l) if l.startswith("*BOUNDARY") else None
+            elif amp is not None and l.startswith("5,"):
+                f = l.split(",")
+                assert int(f[1]) not in out
+                out[int(f[1])] = float(f[3]) * _amplitude(body, amp.group(1))[-1][1]
+        return out
+    body, conv, rep = convert_str(vel)
+    assert _close(moved(body), {k + 1: w[k] for k in range(3)}, 1e-11)
+    assert "interpolated in global components" in rep.text() and "hold only some" not in rep.text()
+    assert not any("curved edge" in r for r in conv.reduced_physics)
+    body, conv, rep = convert_str(vel.replace("2, 2, 2, 0.005\n2, 3, 3, 0.003\n", "").replace(
+        "3, 2, 2\n3, 3, 3, 0.006\n", ""))
+    assert _close(moved(body), {1: 0.015 * math.cos(math.pi / 8)}, 1e-11)
+    assert "hold only some" in rep.text() and any("curved edge" in r for r in conv.reduced_physics)
+
+
+def test_transformed_midside_node_bcs_ramp_by_their_own_state():
+    # in a step whose BCs Abaqus ramps and ccx would step, a transformed node's lines ramp
+    # where each of their DOFs had a BC before the step (ccx ramps it from that BC's value);
+    # a midside node's own lines decide that for it (before: its ends', which never counted,
+    # so its lines were stepped, warned as reduced physics; probed: 2.0e-3 off at a free node)
+    step = "*Step\n*Dynamic\n0.1, 1.\n*Boundary\n2, 1, 1, {}\n2, 2, 2, 0.005\n3, 1, 1, {}\n3, 2, 2\n*End Step\n"
+    deck = _transformed(CIRC_BEAM + "*Boundary\n1, 1, 6\n" + step.format(0.01, 0.02) + step.format(0.03, 0.05),
+                        "2, 3", "1., 1., 0., -1., 1., 0.")
+    body, conv, rep = convert_str(deck)
+    assert (f"*BOUNDARY, AMPLITUDE={A.Converter.CCX_RAMP}\n2, 1, 1, 0.03\n2, 2, 2, 0.005\n3, 1, 1, 0.05\n"
+            f"3, 2, 2\n5, 1, 1, 0.04\n5, 2, 2, 0.0025\n") in body.split("*STEP")[2]
+    assert not any("stepped where Abaqus ramps" in r for r in conv.reduced_physics)
+    # DOF 2 without a BC before the step: ccx would ramp it from 0, so the lines still step
+    body, conv, rep = convert_str(deck.replace("2, 2, 2, 0.005\n3, 1, 1, 0.02\n3, 2, 2\n", "3, 1, 1, 0.02\n"))
+    assert "*BOUNDARY\n2, 1, 1, 0.03\n2, 2, 2, 0.005\n3, 1, 1, 0.05\n3, 2, 2\n5, 1, 1, 0.04\n" in body
+    assert any("stepped where Abaqus ramps" in r for r in conv.reduced_physics)
 
 
 def test_transformed_shell_node_rotations():
@@ -9026,6 +9068,37 @@ def test_transformed_shell_node_rotations():
     # in a deck with a *DYNAMIC step ccx makes the node a knot itself (probed: 28-90 % off)
     body, conv, rep = convert_str(shell.replace("*Static", "*Dynamic\n0.1, 1."))
     assert conv._rot_mode[5] == "refuse" and "a *DYNAMIC step ccx makes the shell node a knot" in rep.text()
+
+
+def test_transformed_shell_rotation_pairs_off_the_normal():
+    # two held local rotations about axes off the shell normal, the free third off it too:
+    # ccx holds both rotations in the shell plane (a second mean-rotation MPC about n x e1,
+    # here z), so the free one's in-plane part is held as well (probed: a cylindrical panel
+    # 30 % off): warned, reduced physics
+    pts = [(math.cos(math.radians(a)), math.sin(math.radians(a)), z) for z in (0., 0.5) for a in (0., 30., 60.)]
+
+    def panel(bc, normals=False):
+        """Two S4 on a cylinder about z (corners 4, 6: normals 15 deg off radial), clamped at
+        z = 0, the top edge with a cylindrical *TRANSFORM and the BCs ``bc``."""
+        return _transformed("*Node\n" + "".join(f"{i + 1}, {x!r}, {y!r}, {z}" + (f", {x!r}, {y!r}, 0." if normals else "")
+                                                + "\n" for i, (x, y, z) in enumerate(pts)) +
+                            "*Element, type=S4, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Shell Section, elset=E, "
+                            "material=M\n0.02\n*Material, name=M\n*Elastic\n1000., 0.3\n*Boundary\n1, 1, 6\n2, 1, 6\n"
+                            f"3, 1, 6\n*Step\n*Static\n*Boundary\n{bc}*Cload\n5, 1, 0.1\n*End Step\n",
+                            "4, 5, 6", "0., 0., 0., 0., 0., 1.", "C")
+    held = "held by ccx (two rotational BCs off the normal"
+    for bc, warned in (("4, 3, 5\n6, 3, 5\n", True),     # radial, tangential: the axial one free
+                       ("4, 5, 6\n6, 5, 6\n", True),     # tangential, axial: the radial one free
+                       ("4, 3, 6\n6, 3, 6\n", False),    # all three
+                       ("4, 5, 5\n6, 5, 5\n", False)):   # one
+        body, conv, rep = convert_str(panel(bc))
+        assert conv._rot_mode[4] == conv._rot_mode[6] == "keep"
+        assert any(held in r for r in conv.reduced_physics) == warned, bc
+        assert ("hold two local rotations about axes off the shell normal" in rep.text()) == warned
+    # radial *NODE normals (as the NAFEMS LE2 deck gives them): the radial rotation is the
+    # drilling one, which ccx drops, holding the tangential one alone (probed): exact
+    body, conv, rep = convert_str(panel("4, 3, 5\n6, 3, 5\n", normals=True))
+    assert not any(held in r for r in conv.reduced_physics)
 
 
 def _knot_of(deck, n):
