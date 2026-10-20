@@ -8,7 +8,9 @@ physics.
 
 * **One rule per step question** — the facts the converter reads from a deck's steps follow
   one rule each. A model-only deck (no procedure) with circular-section beams now gets the
-  knot beams its rotational BCs need, as a mechanical deck does.
+  knot beams its rotational BCs need, as a mechanical deck does. A step with a second
+  procedure card (Abaqus allows one, right after `*STEP`) is converted as its first one, the
+  other card commented out and warned: ccx ran the later card.
 * **Static perturbation steps: base + perturbation** — two lines of one load in such a step
   each got the base value added, so ccx counted it twice. It now goes on the first line only.
   Base-state loads, BCs and temperatures on a `TIME=TOTAL TIME` amplitude kept rising through

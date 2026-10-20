@@ -561,8 +561,33 @@ def test_step_model_motion_facts():
         ("RAMP", "RAMP", "RAMP"), ("STEP", "RAMP", "RAMP"), ("STEP", "RAMP", "RAMP"),
         ("STEP", "STEP", "FIXED"), ("STEP", "RAMP", "RAMP")]
     assert [s.ccx_amp for s in m] == ["RAMP", "STEP", "STEP", "RAMP", "RAMP", "STEP", "STEP", "RAMP"]
-    assert [s.motion_explicit for s in m] == [False] * 6 + [True, False]
+    assert [s.explicit for s in m] == [False] * 6 + [True, False]
     assert [s.nlgeom for s in m] == [False] * 5 + [True] * 3     # (also the motion rule's)
+
+
+def test_one_procedure_card_per_step():
+    # Abaqus: "Only one procedure is allowed per step", right after *STEP.  A step's procedure is
+    # its first procedure card, ccx's or one ccx lacks (step_procedure): every Step fact reads it
+    # (the motion fields took a *SOILS / *GEOSTATIC card before a *DYNAMIC, EXPLICIT one, while
+    # handle_step ran the explicit step), and handle_step comments out the other one
+    _, m = _step_model("""*STEP\n*SOILS\n0.1, 1.\n*DYNAMIC, EXPLICIT\n, 1e-3\n*END STEP
+*STEP\n*STATIC\n*FREQUENCY\n2\n*END STEP\n*STEP\n*HEAT TRANSFER\n1., 1.\n*STATIC\n*END STEP""")
+    assert [s.procedure.keyword for s in m] == ["SOILS", "STATIC", "HEAT TRANSFER"]
+    assert [s.proc for s in m] == ["", "STATIC", "HEAT TRANSFER"]
+    assert [s.motion_proc for s in m] == ["SOILS", "STATIC", "HEAT TRANSFER"]
+    assert [s.explicit for s in m] == [False] * 3 and m.pert == frozenset()
+    assert [s.temp_dof for s in m] == [None, None, "HEAT TRANSFER"] and m.inertia == frozenset()
+    assert m.procs == {"STATIC", "HEAT TRANSFER"} and not m.explicit
+    body, conv, rep = convert_str(HEX_MODEL + """*STEP\n*STATIC\n*FREQUENCY\n2\n*CLOAD\n7, 3, 1.
+*END STEP\n""")
+    assert "*STATIC\n** abq2ccx: a second procedure in step 1 (Abaqus allows one)\n** *FREQUENCY\n" \
+        "** 2\n*CLOAD" in body and "Abaqus allows only one procedure per step" in rep.text()
+    assert not conv._pert_idx and not other_reduced(conv)
+    # an explicit card after a *SOILS one: a *SOILS step, at which ccx stops
+    body, conv, rep = convert_str(HEX_MODEL + """*STEP\n*SOILS\n0.1, 1.\n*DYNAMIC, EXPLICIT\n, 1e-3
+*BOUNDARY\n7, 3, 3, 0.1\n*END STEP\n""")
+    assert "*NO ANALYSIS" in body and "\n*DYNAMIC" not in body and "\n** *DYNAMIC, EXPLICIT" in body
+    assert "INC=" not in body and "*DYNAMIC after its procedure *SOILS" in rep.text()
 
 
 def test_step_model_planner_facts():

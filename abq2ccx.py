@@ -3392,6 +3392,11 @@ ABAQUS_ONLY_PROCS = {
     "ANNEAL": "annealing (stresses and plastic strains reset to zero)",
     "SUBSPACE DYNAMIC": "subspace-based dynamic analysis",
 }
+# Every procedure keyword, ccx's (PROC_KW) or one it lacks: a step's procedure is its first such
+# card (step_procedure).  Abaqus allows "only one procedure ... per step", right after *STEP
+# (Analysis User's Guide, procedures overview); handle_step comments out any other.
+STEP_PROCS = frozenset(PROC_KW) | frozenset(ABAQUS_ONLY_PROCS)
+
 # The material cards with which ccx 2.23 segfaults at a *NO ANALYSIS step (Converter.
 # _no_analysis_segfaults): *NO ANALYSIS sends the step to the linear solver, whose stress pass
 # fails on such a material (probed on both builds, also under NLGEOM; not with *HYPERELASTIC,
@@ -4588,12 +4593,20 @@ def bc_steps(cards: Sequence[Block], entries: Callable[[Block], Sequence[Tuple[o
     return StepModel(cards).states(entries, restore=restore, skip=skip, blocks=cards)
 
 
+def step_procedure(cards: Sequence[Block]) -> Optional[Block]:
+    """A step's procedure card (``cards``: the step's, its *STEP first): its first STEP_PROCS
+    card (Step.procedure).  Abaqus allows one procedure per step, right after *STEP, and
+    handle_step comments out any later one."""
+    return next((b for b in cards[1:] if b.keyword in STEP_PROCS), None)
+
+
 def perturbation_step(cards: Sequence[Block]) -> bool:
     """A step's cards (its *STEP first) make an Abaqus linear perturbation step: *STEP,
-    PERTURBATION, or a procedure in PERTURBATION_PROCS (any card: a step has one procedure).
-    The one rule (Step.perturbation); ccx's own reading of a converted deck differs (handle_step,
+    PERTURBATION, or a procedure (step_procedure) in PERTURBATION_PROCS.  The one rule
+    (Step.perturbation); ccx's own reading of a converted deck differs (handle_step,
     step_load_audit's)."""
-    return cards[0].has("PERTURBATION") or any(b.keyword in PERTURBATION_PROCS for b in cards[1:])
+    proc = step_procedure(cards)
+    return cards[0].has("PERTURBATION") or (proc is not None and proc.keyword in PERTURBATION_PROCS)
 
 
 def _nlgeom_given(b: Block) -> Optional[bool]:
@@ -4611,11 +4624,14 @@ class Step:
                                   # comments its other cards out)
     cards: Tuple[Block, ...]      # its *STEP through its *END STEP (deck_parts)
     between: Tuple[Block, ...]    # the cards after the step before it, up to its *STEP
-    proc: str                     # the first PROC_KW card's keyword, "" if none (handle_step's): ccx's
-                                  # procedure (one ccx lacks, e.g. *RANDOM RESPONSE, is commented out)
-    proc_card: Optional[Block]
-    motion_proc: str              # the first PROC_KW or Converter._MOTION_PROCS card's (motion fields)
-    explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT (handle_step's)
+    procedure: Optional[Block]    # its procedure card (step_procedure): the first of STEP_PROCS, ccx's
+                                  # or one ccx lacks (handle_step comments out any other)
+    proc: str                     # proc_card's keyword, "" if none: ccx's procedure (handle_step stops
+                                  # ccx at a step without one: _no_procedure)
+    proc_card: Optional[Block]    # the procedure card, where ccx has the procedure (PROC_KW)
+    motion_proc: str              # the procedure, where it is in PROC_KW or Converter._MOTION_PROCS
+                                  # (motion fields; *SOILS, *GEOSTATIC too)
+    explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT (handle_step's; the motion fields')
     pert_param: bool              # *STEP, PERTURBATION as written
     perturbation: bool            # an Abaqus linear perturbation step (perturbation_step): _pert_idx,
                                   # the motion fields, the output carry-over, step_load_audit's Abaqus reading
@@ -4634,7 +4650,7 @@ class Step:
                                   # card has NLGEOM=NO or a *FREQUENCY or *BUCKLE step has run (probed),
                                   # and the procedures of PERTURBATION_PROCS are linear there (a static
                                   # perturbation step is a general one in ccx)
-    temp_dof: Optional[str]       # its first TEMPERATURE_DOF_PROCS card's keyword (handle_step's)
+    temp_dof: Optional[str]       # the procedure, where it is in TEMPERATURE_DOF_PROCS (handle_step's)
     star_proc: str                # read card by card (_plan_material_cards): "PERTURBATION" with
                                   # *STEP, PERTURBATION, else the first PROC_KW card after its *STEP
                                   # card (with ", RIKS"; a card between steps counts for the step
@@ -4651,7 +4667,6 @@ class Step:
     # how its nodes move, by motion_proc's card (_plan_velocity_bcs, _plan_default_amplitudes,
     # _dofs_at_rest, the deck's amp_span):
     motion_label: str             # motion_proc, with ", RIKS"; "(no procedure)" if none
-    motion_explicit: bool         # that card is a *DYNAMIC, EXPLICIT
     period: Optional[float]       # the time period over which its nodes move (None for Riks, heat
                                   # transfer, a linear perturbation, ...)
     advance: Optional[float]      # the time it adds to the total time (0 for a perturbation step,
@@ -4799,10 +4814,11 @@ class StepModel:
                     loose.extend(cards)
                 continue
             head, inner = cards[0], cards[1:]
-            proc_card = next((b for b in inner if b.keyword in PROC_KW), None)
+            procedure = step_procedure(cards)
+            kw = procedure.keyword if procedure is not None else ""
+            proc_card = procedure if kw in PROC_KW else None
             proc = proc_card.keyword if proc_card is not None else ""
-            motion_card = next((b for b in inner if b.keyword in PROC_KW or
-                                b.keyword in Converter._MOTION_PROCS), None)
+            motion_card = procedure if kw in PROC_KW or kw in Converter._MOTION_PROCS else None
             motion_proc = motion_card.keyword if motion_card is not None else ""
             explicit = proc == "DYNAMIC" and proc_card.has("EXPLICIT")
             pert_param = head.has("PERTURBATION")
@@ -4810,8 +4826,7 @@ class StepModel:
             given = _nlgeom_given(head)
             # (the steps _plan_base_restore gives the base state again: a general step after
             # perturbation steps, and a static perturbation step after another)
-            again = written and since and (not pert or {
-                b.keyword for b in inner if b.keyword in PROC_KW} == {"STATIC"})
+            again = written and since and (not pert or proc == "STATIC")
             nl_written = self._writes_nlgeom(given, explicit, pert, nlgeom, dp, again)
             if not pert:
                 nlgeom = nlgeom or (explicit if given is None else given)
@@ -4830,14 +4845,13 @@ class StepModel:
                 lc2, repeats = frozenset(id(b) for b in two), all(key(b) in ones for b in two)
             else:
                 lc2, repeats = frozenset(), False
-            motion_explicit = motion_proc == "DYNAMIC" and motion_card.has("EXPLICIT")
             period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
             steps.append(Step(
-                no=len(steps) + 1, cards=tuple(cards), between=tuple(loose), proc=proc,
-                proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
+                no=len(steps) + 1, cards=tuple(cards), between=tuple(loose), procedure=procedure,
+                proc=proc, proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
                 pert_param=pert_param, perturbation=pert, nlgeom_card=given, nlgeom=nlgeom,
                 nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
-                temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
+                temp_dof=kw if kw in TEMPERATURE_DOF_PROCS else None,
                 star_proc=star_proc[id(head)],
                 general_before=seen,
                 buckle_loaded=proc == "BUCKLE" and any(
@@ -4845,7 +4859,7 @@ class StepModel:
                     for _, desc in _load_entries(b, user_loads=True)),
                 lc2=lc2, lc2_repeats=repeats,
                 motion_label=(motion_proc + (", RIKS" if motion_card.has("RIKS") else ""))
-                if motion_proc else "(no procedure)", motion_explicit=motion_explicit,
+                if motion_proc else "(no procedure)",
                 period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp))
             t = None if t is None or advance is None else t + advance
             seen = seen or not pert
@@ -4864,19 +4878,20 @@ class StepModel:
         self.nl_any = any(s.nlgeom for s in steps)
         self.nl_all = bool(general) and general[0]
         self.nl_before = next((s.no - 1 for s in steps if s.nlgeom), len(steps))
-        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
-        self.procs = frozenset(procs)                       # the deck's procedures
+        procs = [s.proc for s in steps if s.proc]
+        self.procs = frozenset(procs)                       # the deck's (ccx) procedures
         # where an element's mass acts, two questions: its inertia, in the steps of INERTIA_PROCS
         # (_plan_coupled_inertia: whether the masses can go; _plan_u1_beams: U1's mass matrix),
         # and its weight too, under a mass-proportional *DLOAD (mass_acts: whether a section's
         # DENSITY= must stay, _plan_shell_density, _plan_quadratic_membranes; surface elements)
-        self.inertia = frozenset(b.keyword for s in steps for b in s.cards if b.keyword in INERTIA_PROCS)
+        self.inertia = frozenset(s.procedure.keyword for s in steps if s.procedure is not None
+                                 and s.procedure.keyword in INERTIA_PROCS)
         self.mass_loads = frozenset(r[1].strip().upper() for s in steps for b in s.cards
                                     if b.keyword == "DLOAD" for r in merged_data_records(b)
                                     if len(r) > 1 and r[1].strip().upper() in MASS_LOADS)
         self.mass_acts = bool(self.inertia or self.mass_loads)
-        self.dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
-        self.explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        self.dynamic = "DYNAMIC" in self.procs
+        self.explicit = any(s.explicit for s in steps)
         # not heat transfer alone: _mechanical (a deck without procedures counts: its model
         # data serve a mechanical analysis, as a model-only deck included in one)
         self.mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
@@ -11348,6 +11363,16 @@ class Converter:
         self._step_proc = proc
         explicit = cur.explicit
         self._general_step_seen = cur.general_before            # (_frequency_perturbation)
+        # a procedure card after the step's own (Step.procedure): Abaqus rejects the deck,
+        # ccx would run the later one; commented out (in the card loop)
+        extra = [b for b in inner if b.keyword in STEP_PROCS and b is not cur.procedure]
+        two = (f"Step {self.emit.no}: {', '.join('*' + b.keyword for b in extra)} after its "
+               f"procedure *{cur.procedure.keyword}: Abaqus allows only one procedure per step, "
+               f"right after *STEP, and rejects the deck. The step is converted as a "
+               f"*{cur.procedure.keyword} step, the other procedure card"
+               f"{'s are' if len(extra) > 1 else ' is'} commented out.") if extra else ""
+        if extra:
+            self.report.warn(two, once=True)
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in step_block.params.items():
             if k == "NAME":
@@ -11539,7 +11564,7 @@ class Converter:
             # builds, probed); an empty one ends it
             self._stopped_steps.add(self.emit.no)
             if proc is None:
-                proc_block = next((b for b in inner if b.keyword in ABAQUS_ONLY_PROCS), None)
+                proc_block = cur.procedure                  # (one ccx lacks, or none)
             cards = [b for b in inner if b is not proc_block and b.keyword != "END STEP" and
                      b.keyword not in GEOM_KW]
             self.report.n_commented += len(cards)
@@ -11564,6 +11589,11 @@ class Converter:
         self._sp_adds = self.emit.no in self._sp_add     # (_op_new_load, _set_nodal_load)
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
+                continue
+            if any(b is x for x in extra):
+                out.extend(self._comment_out(two, [emit_keyword(b.keyword, b.params)] + list(b.data),
+                                             False, comment=f"a second procedure in step "
+                                             f"{self.emit.no} (Abaqus allows one)"))
                 continue
             if proc == "FREQUENCY" and b.keyword in ("CLOAD", "DLOAD", "DSLOAD"):
                 out.extend(self._commented(b, "Loads of a *FREQUENCY step commented out: Abaqus "
@@ -12330,7 +12360,7 @@ class Converter:
                     # *BOUNDARY: "In an Abaqus/Standard dynamic ... procedure, amplitude curves
                     # specified for ... TYPE=VELOCITY will be smoothed automatically"
                     off = t0 if c.total else 0.0
-                    frac = c.smooth if c.smooth is not None else 0.0 if step.motion_explicit else 0.25
+                    frac = c.smooth if c.smooth is not None else 0.0 if step.explicit else 0.25
                     if frac > 0.0 and any(off < x < off + T for x in c.corners):
                         self.report.warn(f"*BOUNDARY, TYPE=VELOCITY with a TABULAR amplitude in a "
                                          f"dynamic step: Abaqus replaces the curve around each of "
@@ -12493,7 +12523,7 @@ class Converter:
                         # it, which ends where a STEP does
                         mode = "UNKNOWN" if mag is None or b.has("USER") or b.has("SUBMODEL") else \
                             "FIXED" if b.has("FIXED") else ("AMP" if curve else "UNKNOWN") if amp \
-                            else "FIXED" if step.motion_explicit else "STEP"
+                            else "FIXED" if step.explicit else "STEP"
                         bc = dict(q="DISPLACEMENT", mode=mode, mag=mag or 0.0, curve=curve)
                     else:
                         bad = mag is None or b.has("USER") or not dofs or \
@@ -12678,7 +12708,7 @@ class Converter:
         query: set = set()
         for step, group in zip(self.steps, groups):
             s = step.no
-            if step.motion_explicit:
+            if step.explicit:
                 kind = "hold"
             elif step.motion_label in self._RAMP_PROCS and step.ccx_amp == "STEP" and \
                     step.period is not None:
@@ -12856,7 +12886,7 @@ class Converter:
                 if kind == "disp" and src not in mine:
                     if amp and mag != 0.0:
                         at_zero.discard(k)
-                elif kind == "disp" and step.motion_explicit and not amp:
+                elif kind == "disp" and step.explicit and not amp:
                     continue
                 elif kind == "disp" and mag == 0.0:
                     at_zero.add(k)
@@ -22026,12 +22056,12 @@ class Converter:
             out.append(b)
         if not move:
             return blocks
-        procs = PROC_KW | Converter._MOTION_PROCS | PERTURBATION_PROCS
         for at in sorted(move, reverse=True):     # (the later ones first: the indices stay)
-            j = at + 1
-            while j < len(out) and out[j].keyword not in ("STEP", "END STEP") and out[j].keyword not in procs:
+            j = at + 1                            # (after the step's procedure: step_procedure)
+            while j < len(out) and out[j].keyword not in ("STEP", "END STEP") and \
+                    out[j].keyword not in STEP_PROCS:
                 j += 1
-            j = j + 1 if j < len(out) and out[j].keyword in procs else at + 1
+            j = j + 1 if j < len(out) and out[j].keyword in STEP_PROCS else at + 1
             out[j:j] = move[at]
         return out
 
