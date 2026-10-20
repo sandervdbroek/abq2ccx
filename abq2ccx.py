@@ -4748,6 +4748,13 @@ def step_groups(blocks: Sequence[Block]) -> Tuple[List[Block], List[List[Block]]
     return model, groups
 
 
+def model_data(blocks: Sequence[Block]) -> List[Block]:
+    """The cards before the first *STEP (step_groups' first part): the model data, of the deck
+    as it is now.  (The step model keeps no model data: planners after it still move and add
+    such cards, _order_material_cards; its steps' cards are final, StepModel.)"""
+    return list(itertools.takewhile(lambda b: b.keyword != "STEP", blocks))
+
+
 def op_new_cards(cards: Sequence[Block], keywords: Tuple[str, ...] = ("BOUNDARY",),
                  skip: Union[set, frozenset] = frozenset()) -> set:
     """ids of the ``keywords`` cards whose OP=NEW ccx 2.23 acts on: a step's first card of
@@ -12821,8 +12828,7 @@ class Converter:
                         v_init[(n, val[0])] = val[1]
         # per tracked DOF: [displacement, velocity, BC in force] (None: unknown / free)
         state = {k: [0.0, v_init.get(k, 0.0), None] for k in tracked}
-        model, groups = step_groups(blocks)
-        model = [b for b in model if b.keyword == "BOUNDARY"]
+        model = [b for b in model_data(blocks) if b.keyword == "BOUNDARY"]
         stats = {"dev": 0.0, "n": 0}
         max_points = 1000
 
@@ -12841,14 +12847,14 @@ class Converter:
         # (its own state, not StepModel.states: it follows the motion too; OP=NEW clears at a
         # step's start)
         acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
-        for step, group in zip(self.steps, groups):
+        for step in self.steps:
             # the step number, the time period over which its nodes move and the total time at
             # its start (None: unknown; no period where they do not move: a linear perturbation
             # step, a heat transfer step, ...)
             s, t0 = step.no, step.t_start
             T = None if step.perturbation or step.motion_proc not in self._MOTION_PROCS else step.period
             dynamic = step.motion_proc == "DYNAMIC"
-            cards = [x for x in group[1:] if x.keyword == "BOUNDARY" and id(x) not in self.steps.lc2]
+            cards = [x for x in step.cards[1:] if x.keyword == "BOUNDARY" and id(x) not in self.steps.lc2]
             if T is None:
                 why = ("in a linear perturbation step (the base state does not move; only the "
                        "constraint applies)" if step.perturbation else
@@ -13289,12 +13295,11 @@ class Converter:
         A zero line on DOFs still at zero when the step starts (_dofs_at_rest) means the
         same either way and stays as it is."""
         self._amp_cards, self._ramp_steps = {}, set()
-        model, groups = step_groups(blocks)
-        model = [b for b in model if b.keyword == "BOUNDARY"]
+        model = [b for b in model_data(blocks) if b.keyword == "BOUNDARY"]
         mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
         todo: List[Tuple[int, str, str, Block, List[dict]]] = []   # step, kind, procedure, card, lines
         query: set = set()
-        for step, group in zip(self.steps, groups):
+        for step in self.steps:
             s = step.no
             if step.explicit:
                 kind = "hold"
@@ -13303,7 +13308,7 @@ class Converter:
                 kind = "ramp"
             else:
                 continue
-            for b in group[1:]:
+            for b in step.cards[1:]:
                 if b.keyword != "BOUNDARY" or self._bc_type(b) != "DISPLACEMENT" or \
                         (b.param("AMPLITUDE") or "").strip() or \
                         any(b.has(k) for k in ("FIXED", "USER", "SUBMODEL")):
@@ -13315,7 +13320,7 @@ class Converter:
                                  if 1 <= d <= 6)
         if not todo:
             return
-        rest = self._dofs_at_rest(model, groups, query, {t[0] for t in todo})
+        rest = self._dofs_at_rest(model, query, {t[0] for t in todo})
         seen: Dict[str, str] = {}                    # what was done (class -> a procedure)
         for s in sorted({t[0] for t in todo}):
             items = [t for t in todo if t[0] == s]
@@ -13396,11 +13401,11 @@ class Converter:
         an explicit step ignores the value of).  Else the rotation is left out of the card
         (free in that step), warned, with reduced physics.  The card's other DOFs keep FIXED;
         its pieces go to _amp_cards (handle_boundary)."""
-        model, groups = step_groups(blocks)
+        model = model_data(blocks)
         mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
         todo: List[Tuple[int, Block, List[dict]]] = []
         query: set = set()
-        for s, group in enumerate([model] + groups):
+        for s, group in enumerate([model] + [step.cards for step in self.steps]):
             for b in group:
                 if b.keyword != "BOUNDARY" or not b.has("FIXED") or b.has("USER") or \
                         b.has("SUBMODEL") or self._bc_type(b) != "DISPLACEMENT" or \
@@ -13414,18 +13419,17 @@ class Converter:
                     query |= rots
         if not todo:
             return
-        rest = self._dofs_at_rest(model, groups, query, {s for s, _, _ in todo if s})
+        rest = self._dofs_at_rest(model, query, {s for s, _, _ in todo if s})
         curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
                   if b.keyword == "AMPLITUDE" and b.param("NAME")}
         totals = {b.uparam("NAME") for b in blocks if b.keyword == "AMPLITUDE" and
                   b.uparam("TIME").replace(" ", "") == "TOTALTIME"}
-        step_of = {id(b): s for s, group in enumerate(groups, 1) for b in group}
+        step_of = {id(b): step for step in self.steps for b in step.cards}
         planned: Dict[int, Dict[Tuple[int, int], Optional[float]]] = {}    # card -> its values
 
         def entries(b: Block) -> list:
             """(pair, (value or None, card id)) of a *BOUNDARY's pairs in ``query``."""
-            s = step_of.get(id(b))
-            step = self.steps.steps[s - 1] if s else None
+            step = step_of.get(id(b))
             amp = (b.param("AMPLITUDE") or "").strip().upper()
             factor: Optional[float] = 1.0
             if b.has("FIXED") or b.has("USER") or b.has("SUBMODEL") or \
@@ -13438,11 +13442,11 @@ class Converter:
                     for nodes, dofs, mag in self._bc_records(b) for n in nodes for d in dofs
                     if (n, d) in query]
         folds = self.steps.states(entries, skip=self.steps.lc2, model=True, blocks=[*model, *(
-            b for g in groups for b in g)])
+            b for step in self.steps for b in step.cards)])
         start = [dict(next(folds))]                 # what holds each pair when step s + 1 starts
-        for s, _ in enumerate(groups, 1):
+        for step in self.steps:
             end = dict(next(folds))
-            start.append(start[-1] if s in self._pert_idx else end)     # (the base state again)
+            start.append(start[-1] if step.no in self._pert_idx else end)   # (the base state again)
         lost: List[str] = []
         for s, b, lines in todo:
             at_rest = rest[s][0] if s else query
@@ -13529,8 +13533,7 @@ class Converter:
             out.append(ln)
         return out
 
-    def _dofs_at_rest(self, model: List[Block], groups: List[List[Block]], query: set,
-                      need: set) -> Dict[int, Tuple[set, set]]:
+    def _dofs_at_rest(self, model: List[Block], query: set, need: set) -> Dict[int, Tuple[set, set]]:
         """For each step in ``need`` (1-based), the (node, DOF) pairs of ``query`` still at
         zero when it starts, by the deck's BCs as Abaqus applies them: everything starts at
         zero and stays there through a perturbation or heat-transfer step; any other step
@@ -13556,15 +13559,15 @@ class Converter:
                 recs += self._bc_records(b, lines=self._midside_records(b, "boundary", note=False))
             return [((n, d), (kind, mag, amp, id(b))) for nodes, dofs, mag in recs
                     for n in nodes for d in dofs if (n, d) in query]
-        cards = model + [b for g in groups for b in g]
+        cards = model + [b for step in self.steps for b in step.cards]
         given = {id(b): entries(b) for b in cards if b.keyword == "BOUNDARY"}
         # (what follows the last step left out)
         folds = self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2, model=True,
                                   blocks=cards)
         held = next(folds)                                          # the model data's
         out: Dict[int, Tuple[set, set]] = {}
-        for s, (group, end) in enumerate(zip(groups, folds), 1):
-            step = self.steps.steps[s - 1]
+        for step, end in zip(self.steps, folds):
+            s = step.no
             if s in need:
                 out[s] = (set(at_zero), set(held))
             end = dict(end)
@@ -13572,7 +13575,7 @@ class Converter:
                 held = end
             if step.perturbation or step.motion_label == "HEAT TRANSFER":
                 continue
-            mine = {id(x) for x in group}
+            mine = {id(x) for x in step.cards}
             for k in query:
                 kind, mag, amp, src = end.get(k, ("free", 0.0, False, None))
                 if kind == "fixed" or (kind == "vel" and mag == 0.0):
@@ -17655,15 +17658,14 @@ class Converter:
         if hidden:
             self._qmem_hidden = self._fresh_name("ABQ2CCX_MEMBRANE_NODES")
             self.geom.nsets[self._qmem_hidden] = hidden
-        groups = step_groups(blocks)[1]
-        self._el_print_stops(blocks, steps, groups)
-        self._energy_from_step_one(steps, [g[0] for g in groups])
-        self._contact_force_stops(steps, groups)
-        self._el_file_stops(blocks, steps, groups)
+        self._el_print_stops(blocks, steps)
+        self._energy_from_step_one(steps)
+        self._contact_force_stops(steps)
+        self._el_file_stops(blocks, steps)
         self._dynamic_energy_offsets(steps)
         # the steps ccx solves in one increment: linear, and no contact pair (ccx iterates any)
-        linear = self._ccx_linear_steps(blocks, steps) \
-            if len(groups) == len(steps) and not self._out_contact["pairs"] else [False] * len(steps)
+        linear = self._ccx_linear_steps(blocks, steps) if not self._out_contact["pairs"] \
+            else [False] * len(steps)
         for (k, timing, reqs), lin in zip(steps, linear):
             self._out_ctl[k] = self._step_output_control(k, timing, reqs, lin)
             for r in reqs:
@@ -17690,8 +17692,8 @@ class Converter:
         # its preselected variables, "DEFAULT" for the preselected default
         carried: Dict[bool, Optional[list]] = {False: None, True: None}
         prev_pert = False
-        for step, group in zip(self.steps, step_groups(blocks)[1]):
-            k, inner, proc = step.no, group[1:], step.proc_card
+        for step in self.steps:
+            k, inner, proc = step.no, step.cards[1:], step.proc_card
             timing = self._step_timing(step)
             if timing["kind"] == "explicit":
                 timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
@@ -17753,7 +17755,7 @@ class Converter:
                 # its cards too, but at the previous step's frequency (or time points)
                 # and as a step in between left them, so they are written again
                 held = carried[pert] if (not pert or prev_pert) else None
-                reqs += self._carried_requests(group[0], held, timing, quiet, k)
+                reqs += self._carried_requests(step.cards[0], held, timing, quiet, k)
                 carried[pert] = (held if held is not None else [("DEFAULT", None)]) + own
             prev_pert = pert
             steps.append((k, timing, reqs))
@@ -17833,8 +17835,7 @@ class Converter:
         visible = solid_nodes | (flat_nodes if two_d else set())
         return visible
 
-    def _energy_from_step_one(self, steps: List[Tuple[int, dict, List[dict]]],
-                              anchors: List[Block]) -> None:
+    def _energy_from_step_one(self, steps: List[Tuple[int, dict, List[dict]]]) -> None:
         """ccx 2.23 computes element energies from the first step that needs them on: an
         implicit *DYNAMIC or transient (un)coupled temperature-displacement step, whatever it
         requests (dynamics.f: "for implicit dynamic calculations the energy balance is always
@@ -17863,8 +17864,9 @@ class Converter:
                 break
         else:
             return
-        if k == 1 or len(anchors) < len(steps):
+        if k == 1:
             return
+        anchors = [step.cards[0] for step in self.steps]
         card = self._added_el_file
         files = [r for r in steps[0][2] if r["live"] and r["cc"] == "EL FILE"]
         again = ""
@@ -17921,8 +17923,7 @@ class Converter:
         return [timing["proc"] in (None, "STATIC", "VISCO") and not w
                 for (_k, timing, _reqs), w in zip(steps, why)]
 
-    def _el_print_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
-                        groups: List[List[Block]]) -> None:
+    def _el_print_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]]) -> None:
         """Keep *EL PRINT ELKE (element kinetic energy) out of the steps where ccx 2.23
         segfaults computing it (probed, with or without *DENSITY, also under TOTALS=ONLY): a
         *BUCKLE step, and a step ccx runs linearly (_ccx_linear_steps), which has no kinetic
@@ -17934,15 +17935,13 @@ class Converter:
         without labels if none is left, which clears them), and the next step without one
         where ELKE runs gets the cards Abaqus carries into it again — also where ccx carries
         them, but with ELKE deactivated by a *FREQUENCY step."""
-        if len(groups) < len(steps):
-            return
         linear = self._ccx_linear_steps(blocks, steps)
         # the *EL PRINT cards [(params, labels)] Abaqus and ccx carry into a step, and the steps
         # that gave them; the *FREQUENCY step that deactivated ELKE in ccx's
         abq: list = []
         held: list = []
         abq_k = held_k = off_k = 0
-        for (k, timing, reqs), group, lin in zip(steps, groups, linear):
+        for (k, timing, reqs), step, lin in zip(steps, self.steps, linear):
             proc = timing["proc"]
             stops = proc == "BUCKLE" or lin
             kind = ("a *BUCKLE step" if proc == "BUCKLE" else
@@ -17961,7 +17960,7 @@ class Converter:
                 held, held_k = [(r["params"], list(r["labels"])) for r in own], k
             elif stops and any(lab[:4] == "ELKE" for _p, labels in held for lab in labels):
                 cards = [(p, [lab for lab in labels if lab[:4] != "ELKE"]) for p, labels in held]
-                add = [self._added_el_file(OrderedDict(p), labels, group[0], "EL PRINT")
+                add = [self._added_el_file(OrderedDict(p), labels, step.cards[0], "EL PRINT")
                        for p, labels in [c for c in cards if c[1]] or cards[:1]]
                 add[0]["notes"].append(
                     f"Step {held_k}'s *EL PRINT cards written again in step {k} without ELKE"
@@ -17969,7 +17968,7 @@ class Converter:
                     f"ccx would carry ELKE into {kind}, where ccx 2.23 segfaults computing element "
                     f"kinetic energies.")
             elif not stops and proc != "FREQUENCY" and (held != abq or off_k and elke):
-                add = [self._added_el_file(OrderedDict(p), list(labels), group[0], "EL PRINT")
+                add = [self._added_el_file(OrderedDict(p), list(labels), step.cards[0], "EL PRINT")
                        for p, labels in abq]
                 add[0]["notes"].append(
                     f"Step {abq_k}'s *EL PRINT cards written again in step {k}: Abaqus carries them "
@@ -17985,8 +17984,7 @@ class Converter:
             if proc == "FREQUENCY" and any(lab[:4] == "ELKE" for _p, labels in held for lab in labels):
                 off_k = k
 
-    def _el_file_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
-                       groups: List[List[Block]]) -> None:
+    def _el_file_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]]) -> None:
         """Keep the *EL FILE labels out that stop or crash ccx 2.23 writing the .frd (probed):
 
         * ENER and SDV in a model with U1 beams (_plan_u1_beams), in any step: ccx extrapolates
@@ -18011,28 +18009,26 @@ class Converter:
         (_prints_again), after the cards these checks end."""
         u1 = bool(self._u1)
         state = self._out_yields or any(n > 0 for n in self._depvar_counts)
-        if len(groups) < len(steps):
-            return
         held: List[str] = []                # the *EL FILE labels ccx carries into a step
         carried: Dict[str, List[dict]] = {}     # output card -> the requests ccx carries
         gen: Dict[str, Tuple[int, List[dict]]] = {}     # print card -> (step, the requests
         # Abaqus carries into general steps); -> (step, its requests) of the perturbation
         # step whose cards ccx would carry into the next general step
         ended: Dict[str, Tuple[int, List[dict]]] = {}
-        for (k, timing, reqs), group, linear in zip(steps, groups,
-                                                    self._ccx_linear_steps(blocks, steps)):
+        for (k, timing, reqs), step, linear in zip(steps, self.steps,
+                                                   self._ccx_linear_steps(blocks, steps)):
             sdv = state and (linear or timing["proc"] in NO_NODAL_SDV_PROCS)
             where = (f"a linear {'*' + timing['proc'] if timing['proc'] else 'static'} step "
                      f"({self._LINEAR_STEP_WHY})" if linear else f"a *{timing['proc']} step")
             if self._out_yields and timing["proc"] in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS"):
-                self._modal_result_stops(k, timing["proc"], reqs, carried, group[0])
-            self._prints_again(k, timing["pert"], reqs, gen, ended, group[0])
+                self._modal_result_stops(k, timing["proc"], reqs, carried, step.cards[0])
+            self._prints_again(k, timing["pert"], reqs, gen, ended, step.cards[0])
             for cc in self._MODAL_STOPS:
                 carried[cc] = [r for r in reqs if r["live"] and r["cc"] == cc] or \
                     carried.get(cc, [])
             files = [r for r in reqs if r["live"] and r["cc"] == "EL FILE"]
             if sdv and not files and any(lab[:3] == "SDV" for lab in held):
-                files = [self._added_el_file(OrderedDict(), [], group[0])]
+                files = [self._added_el_file(OrderedDict(), [], step.cards[0])]
                 files[0]["notes"].append(
                     f"Empty *EL FILE added to step {k}: Abaqus writes no element field output "
                     f"there, and ccx would carry an earlier step's *EL FILE SDV into {where}, "
@@ -18064,8 +18060,7 @@ class Converter:
             if files:
                 held = [lab for r in files for lab in r["labels"]]
 
-    def _contact_force_stops(self, steps: List[Tuple[int, dict, List[dict]]],
-                             groups: List[List[Block]]) -> None:
+    def _contact_force_stops(self, steps: List[Tuple[int, dict, List[dict]]]) -> None:
         """Keep *CONTACT PRINT CF / CFN / CFS (_contact_print_card's cards per contact pair) out
         of the steps where ccx 2.23 segfaults on them (CCX_CONTACT_FORCE_STOPS): a card of the
         step's own loses them (written bare when nothing is left), and where ccx would carry
@@ -18075,13 +18070,11 @@ class Converter:
         step without cards of its own gets those of the general step Abaqus carries into it
         again, which ccx would not.  Every *FREQUENCY step counts: handle_step decides its
         PERTURBATION later (_frequency_perturbation)."""
-        if len(groups) < len(steps):
-            return
         held: List[dict] = []       # the *CONTACT PRINT requests ccx carries into a step
         gen: List[dict] = []        # those of the last general step that gave its own
         held_k = gen_k = ended = 0  # ended: the step whose cards ended them in ccx
         held_pert = False
-        for (k, timing, reqs), group in zip(steps, groups):
+        for (k, timing, reqs), step in zip(steps, self.steps):
             proc = timing["proc"]
             own = [r for r in reqs if r["live"] and r["cc"] == "CONTACT PRINT"]
             if proc in CCX_CONTACT_FORCE_STOPS:
@@ -18100,7 +18093,7 @@ class Converter:
                               for lab in labels])
                 if not own and gone:
                     labels = dedup([lab for r in held for lab in r["labels"]]) if held_pert else []
-                    own = [dict(self._added_el_file(OrderedDict(), labels, group[0], "CONTACT PRINT"),
+                    own = [dict(self._added_el_file(OrderedDict(), labels, step.cards[0], "CONTACT PRINT"),
                                 surface=[], bare=not labels)]
                     own[0]["notes"].append(
                         (f"Step {held_k}'s *CONTACT PRINT written again in step {k} without "
@@ -18111,7 +18104,7 @@ class Converter:
                     reqs.extend(own)
                     ended = k
             elif not (own or timing["pert"]) and ended:
-                own = [dict(self._added_el_file(OrderedDict(r["params"]), list(r["labels"]), group[0],
+                own = [dict(self._added_el_file(OrderedDict(r["params"]), list(r["labels"]), step.cards[0],
                                                 "CONTACT PRINT"), surface=list(r.get("surface", ())))
                        for r in gen if r["labels"] or r.get("surface")]
                 if own:
@@ -34581,18 +34574,17 @@ class Converter:
         handle_flux_film; the comment before the card: handle_step), so that ccx does not act
         on it where the cards before it leave no line, and warned.  (*DSFLUX / *SFILM /
         *SRADIATE: _plan_surface_heat.)"""
-        cards = [b for b in blocks if id(b) not in self.steps.lc2]
         acts = self.steps.acting(tuple(self._OP_NEW_WHAT), skip=self.steps.lc2, blocks=blocks)
         late: "OrderedDict[str, List[int]]" = OrderedDict()
-        for s, group in enumerate(step_groups(cards)[1], 1):
+        for step in self.steps:
             for kw in self._OP_NEW_WHAT:
-                mine = [b for b in group if b.keyword == kw]
+                mine = [b for b in step.cards if b.keyword == kw and id(b) not in self.steps.lc2]
                 new = [b for b in mine if b.uparam("OP") == "NEW"]
                 if new and not any(id(b) in acts for b in mine):
                     self._op_new_drop.update((id(b), f"** abq2ccx: OP=NEW dropped: ccx 2.23 ignores "
                                                      f"it after a step's first *{kw}, which has none")
                                              for b in new)
-                    late.setdefault(kw, []).append(s)
+                    late.setdefault(kw, []).append(step.no)
         for kw, steps in late.items():
             self.report.warn(f"*{kw}, OP=NEW in step(s) {', '.join(map(str, steps))} on a later "
                              f"card but not on the step's first: Abaqus requires it on every "
@@ -34638,16 +34630,19 @@ class Converter:
         if not self._pert_idx:
             return
         self._restore_yields = self._yielding_materials(blocks)
-        model, groups = step_groups(blocks)
-        static = {s for s in self._pert_idx if
-                  {b.keyword for b in groups[s - 1][1:] if b.keyword in PROC_KW} == {"STATIC"}}
+        model = model_data(blocks)
+        # each step's procedures: those of every procedure card in it (PROC_KW), not Step.proc,
+        # its first one's (handle_step comments out the others): they differ in a step with two
+        procs_of = [{b.keyword for b in step.cards[1:] if b.keyword in PROC_KW} for step in self.steps]
+        static = {s for s in self._pert_idx if procs_of[s - 1] == {"STATIC"}}
         self._sp_add = {s for s in static if s > 1}
         # (the first step's too: its base state has the initial temperatures)
-        self._sp_temps = {s for s in static if any(b.keyword == "TEMPERATURE" for b in groups[s - 1])}
+        self._sp_temps = {s for s in static
+                          if any(b.keyword == "TEMPERATURE" for b in self.steps.steps[s - 1].cards)}
         self._sp_temp_dep = any(b.keyword in ("ELASTIC", "HYPERELASTIC", "HYPERFOAM", "EXPANSION") and
                                 temperature_dependent(b) for b in model)
         acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
-        deck = model + [b for g in groups for b in g]
+        deck = model + [b for step in self.steps for b in step.cards]
         given = {id(b): self._boundary_pairs(b) for b in deck
                  if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2}
         # the pairs in force as a step starts: the model data's, then the last general step's
@@ -34663,7 +34658,6 @@ class Converter:
         own: Dict[int, set] = {}
         freq = 0                                # the last *FREQUENCY step
         modes = {"MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
-        procs_of = [{b.keyword for b in g[1:] if b.keyword in PROC_KW} for g in groups]
         kept: List[str] = []                    # *BUCKLE steps given a *FREQUENCY step's BCs
         off: List[str] = []                     # modal steps with other BCs than their modes'
 
@@ -34676,8 +34670,9 @@ class Converter:
                 k += 1
             return k in self._pert_idx and bool(procs_of[k - 1] & modes)
 
-        for (s, group), end in zip(enumerate(groups, 1), folds):
-            cards = [b for b in group[1:] if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2]
+        for step, end in zip(self.steps, folds):
+            s = step.no
+            cards = [b for b in step.cards[1:] if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2]
             pairs = own[s] = {k for b in cards for k in given[id(b)]}
             new = any(id(b) in acts for b in cards)
             procs = procs_of[s - 1]
@@ -34873,13 +34868,15 @@ class Converter:
         planar = self._boundary_dofs([mkblock("BOUNDARY", data=self._planar_bc[1:])]) \
             if self._planar_bc else set()
         state = set(planar)                        # (node, DOF) pairs in effect
-        steps: List[List[Block]] = []               # each step's *BOUNDARY cards ...
-        procs = [step.proc for step in self.steps]  # ... and procedure
-        for step, cards in deck_parts(blocks):
-            if step:
-                steps.append([b for b in cards if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2])
-            elif cards[0].keyword == "BOUNDARY":
-                state |= self._boundary_pairs(cards[0])
+        # each step's *BOUNDARY cards and procedure; those outside the steps hold from the start
+        # (what follows the last step too: see below)
+        steps = [[b for b in step.cards if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2]
+                 for step in self.steps]
+        procs = [step.proc for step in self.steps]
+        inside = {id(b) for step in self.steps for b in step.cards}
+        for b in blocks:
+            if b.keyword == "BOUNDARY" and id(b) not in inside:
+                state |= self._boundary_pairs(b)
 
         def rotations(pairs: set) -> set:
             return {n for n, d in pairs if 4 <= d <= 6 and n in self._rot_nodes
