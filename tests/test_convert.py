@@ -12617,6 +12617,26 @@ def test_material_ends_at_a_gasket_or_connector_behavior():
     assert conv._all_wave_speeds(blocks) == {"STEEL": c}
     assert [g[0].uparam("NAME") for g in conv._material_groups(blocks)] == ["STEEL"]
 
+
+def test_ref_node_set_of_several_nodes_warned_on_kinematic_coupling():
+    # Abaqus requires a *KINEMATIC COUPLING / *RIGID BODY REF NODE set to hold one node; the
+    # legacy *KINEMATIC COUPLING took the first of several without a word
+    deck = HEX + ("*NODE\n9, 0.5, 0.5, 2.\n10, 0.5, 0.5, 3.\n*NSET, NSET=RP\n9, 10\n"
+                  "*NSET, NSET=TOP\n5, 6, 7, 8\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+                  "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n"
+                  "*KINEMATIC COUPLING, REF NODE=RP\nTOP, 1, 3\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n"
+                  "3, 1, 3\n4, 1, 3\n*STEP\n*STATIC\n*CLOAD\n9, 3, 1.\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    assert "REF NODE=9," in body
+    assert "*KINEMATIC COUPLING REF NODE=RP names a set of 2 nodes, where Abaqus requires one; " \
+        "the first (9) is used" in rep.text()
+    body, conv, rep = convert_str(deck.replace("*NSET, NSET=RP\n9, 10", "*NSET, NSET=RP\n9"))
+    assert "*KINEMATIC COUPLING REF NODE=RP resolved to node 9" in rep.text()
+    rb = deck.replace("*KINEMATIC COUPLING, REF NODE=RP\nTOP, 1, 3", "*RIGID BODY, REF NODE=RP, TIE NSET=TOP")
+    body, conv, rep = convert_str(rb)
+    assert "*RIGID BODY REF NODE=RP names a set of 2 nodes, where Abaqus requires one; the first (9)" \
+        in rep.text() and "REF NODE=9" in body
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

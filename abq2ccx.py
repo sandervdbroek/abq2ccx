@@ -12823,6 +12823,7 @@ class Converter:
         if ref is None or not recs:
             return self._commented(b, "*KINEMATIC COUPLING could not be converted (no REF NODE or "
                                       "no members); edit manually.", reduces=False)
+        self._one_node("*KINEMATIC COUPLING", "REF NODE", b.param("REF NODE") or "")
         if any(dofs is None for _, dofs in recs):
             return self._commented(b, "*KINEMATIC COUPLING DOF fields could not be parsed; edit "
                                       "manually.", reduces=False)
@@ -13518,23 +13519,9 @@ class Converter:
                               "rigidly with REF NODE); the") + " rotations of TIE (and ELSET) "
                              "shell/beam nodes are tied to the body, those of PIN nodes stay free, "
                              "as in Abaqus.", once=True)
-        # ccx requires REF NODE / ROT NODE to be node NUMBERS; CAE writes reference-point
-        # set names (_PickedSet47) — resolve single-node sets, exactly as for *COUPLING.
         for key in ("REF NODE", "ROT NODE"):
-            ref = (keep.get(key) or "").strip()
-            if ref and not re.fullmatch(r"[-+]?\d+", ref):
-                nodes = self.geom.nset(ref)
-                if len(nodes) == 1:
-                    keep[key] = str(nodes[0])
-                    self.report.note(f"*RIGID BODY {key}={ref} resolved to node {nodes[0]} "
-                                     f"(ccx needs a node number).", once=True)
-                elif nodes:
-                    keep[key] = str(nodes[0])
-                    self.report.warn(f"*RIGID BODY {key}={ref} names a set with {len(nodes)} nodes; "
-                                     f"the first ({nodes[0]}) is used — verify.", once=True)
-                else:
-                    self.report.warn(f"*RIGID BODY {key}={ref} could not be resolved to a node id; "
-                                     f"ccx will reject a set name here.", once=True)
+            if keep.get(key):
+                keep[key] = self._one_node("*RIGID BODY", key, keep[key])
         ref_ids = self._resolve_nodes((keep.get("REF NODE") or "").strip())
         ref = ref_ids[0] if ref_ids else None
         own = ref in self._knots and ref in self._rot_nodes    # a shell/beam reference node
@@ -13766,6 +13753,8 @@ class Converter:
         part of each facet within it)."""
         params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
         ref = (b.param("REF NODE") or "").strip()
+        # (not _one_node: Abaqus takes several reference nodes here, one coupling each —
+        # Keywords *COUPLING — where *RIGID BODY and *KINEMATIC COUPLING require one)
         if ref and not re.fullmatch(r"[-+]?\d+", ref):
             nodes = dedup(self.geom.nset(ref))
             if len(nodes) == 1:
@@ -21887,6 +21876,30 @@ class Converter:
     def _first_node(self, token: str) -> Optional[int]:
         nodes = self._resolve_nodes(token.strip()) if token.strip() else []
         return nodes[0] if nodes else None
+
+    def _one_node(self, card: str, key: str, value: str) -> str:
+        """The node number to write for parameter ``key`` (REF NODE, ROT NODE) of a *RIGID BODY
+        or *KINEMATIC COUPLING, which ccx needs as a number: CAE writes reference-point set
+        names (_PickedSet47), resolved to their node.  Abaqus requires such a set to hold
+        exactly one node (Keywords *RIGID BODY, *KINEMATIC COUPLING); of a larger set the
+        first node is taken (_ref_node), warned, and a name that resolves to no node is left
+        for ccx to reject, warned.  (A *COUPLING's REF NODE set may hold several reference
+        nodes: handle_coupling_card.)"""
+        value = value.strip()
+        if not value or re.fullmatch(r"[-+]?\d+", value):
+            return value
+        nodes = self.geom.nset(value)
+        if len(nodes) == 1:
+            self.report.note(f"{card} {key}={value} resolved to node {nodes[0]} (ccx needs a node "
+                             f"number).", once=True)
+        elif nodes:
+            self.report.warn(f"{card} {key}={value} names a set of {len(nodes)} nodes, where Abaqus "
+                             f"requires one; the first ({nodes[0]}) is used — verify.", once=True)
+        else:
+            self.report.warn(f"{card} {key}={value} could not be resolved to a node id; ccx will "
+                             f"reject a set name here.", once=True)
+            return value
+        return str(nodes[0])
 
     def _ref_node(self, b: Block) -> Optional[int]:
         """The reference node of a *RIGID BODY, *COUPLING or *KINEMATIC COUPLING (REF NODE=;

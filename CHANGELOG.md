@@ -6,6 +6,8 @@ physics.
 
 ## Unreleased
 
+* **`*KINEMATIC COUPLING, REF NODE=<set>` of several nodes** — Abaqus requires the set to hold one
+  node; the converter took the first without a word. It is now warned, as on `*RIGID BODY`.
 * **Analytic amplitudes in `*MODAL DYNAMIC` steps** — a `PERIODIC`, `MODULATED` or `DECAY`
   amplitude was tabulated over the general steps' time only: a modal dynamic step read it past
   the table's end (constant there), and a deck with no general step lost it (ccx stopped). The
