@@ -2075,6 +2075,8 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
     for rec in merged_data_records(block):
         f = [x for x in rec if x != ""]
         if len(f) < 2:
+            if f:
+                report.warn("*NGEN record needs two end nodes; skipped.", once=True)
             continue
         try:
             n1, n2 = pint(f[0]), pint(f[1])
@@ -2179,6 +2181,8 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
         for a, b in zip(s1, s2):
             pa, pb = geom.nodes.get(a), geom.nodes.get(b)
             if pa is None or pb is None:
+                report.warn(f"*NFILL between nodes {a} and {b}: node {b if pa else a} is not "
+                            f"defined; no nodes generated between them.", once=True)
                 continue
             created += [a, b]
             for j in range(1, nint):
@@ -4443,6 +4447,8 @@ class Converter:
                 self._reduces("connector element with an unresolvable node skipped")
                 continue
             if ends[0] is None and ends[1] is None:
+                self.report.warn(f"*ELEMENT TYPE={typ}: connector element {eid} names no node "
+                                 f"(Abaqus needs at least one); left out.", once=True)
                 continue
             if eid in self._conn or eid in self.geom.elements:
                 self.report.warn("Duplicate element id(s) in the input; the last definition is kept "
@@ -4456,6 +4462,9 @@ class Converter:
     def _register_set(self, b: Block, kind: str) -> None:
         name = b.param("NSET") if kind == "N" else b.param("ELSET")
         if not name:
+            card = "*NSET" if kind == "N" else "*ELSET"
+            self.report.warn(f"{card} without {card[1:]}= (Abaqus stops on it): its members are "
+                             f"left out.", once=True)
             return
         gen = b.has("GENERATE")
         ids: List[int] = []
@@ -6875,10 +6884,18 @@ class Converter:
             return []
         return self.passthrough(b)
 
+    def _note_dropped_params(self, b: Block, used: Sequence[str]) -> None:
+        """A NOTE for each parameter of ``b`` outside ``used``, which the cards written for
+        ``b`` leave out."""
+        for k in b.params:
+            if k not in used:
+                self.report.note(f"*{b.keyword} parameter {k} dropped.", once=True)
+
     def handle_beam_section(self, b: Block) -> List[str]:
         sec = (b.param("SECTION") or "").upper()
         self._u1_last = id(b) in self._u1_cards
         if self._u1_last:
+            self._note_dropped_params(b, ("ELSET", "MATERIAL", "SECTION"))
             return self._u1_cards[id(b)]
         # ccx 2.22 beam profiles: RECT, CIRC (ellipse), PIPE, BOX.  Anything else is a
         # hard "unknown section" error, so comment it out with the escape hatches.
@@ -6935,6 +6952,7 @@ class Converter:
         commented out with the reason."""
         self._u1_last = id(b) in self._u1_cards
         if self._u1_last:
+            self._note_dropped_params(b, ("ELSET", "SECTION", "DENSITY"))
             return self._u1_cards[id(b)]
         sec = (b.param("SECTION") or "GENERAL").strip().upper()
         if sec in GENERAL_EXPANDED:
@@ -6988,6 +7006,7 @@ class Converter:
             out += [emit_keyword("EXPANSION", OrderedDict([("ZERO", zero)]) if zero else OrderedDict()),
                     short_real(alpha, 12)]
         keep = OrderedDict([("ELSET", b.param("ELSET")), ("MATERIAL", name), ("SECTION", sec)])
+        self._note_dropped_params(b, ("ELSET", "SECTION", "DENSITY", "ZERO"))
         data = [b.data[0]] + ([b.data[n1_at]] if n1_at is not None else [])
         self.report.note("*BEAM GENERAL SECTION with a RECT, CIRC, PIPE or BOX profile -> ccx's "
                          "*BEAM SECTION of the same profile with a material made from its E and G "
@@ -7037,6 +7056,7 @@ class Converter:
         for k, val in b.params.items():
             if k in ("ELSET", "MATERIAL", "ORIENTATION", "OFFSET1", "OFFSET2"):
                 keep[k] = val
+        self._note_dropped_params(b, list(keep) + ["SECTION"])
         keep["SECTION"] = "RECT"
         u1 = f" (ccx's U1 beam, which carries the profile, cannot be used: {self._u1_refused})" \
             if self._u1_refused else ""
@@ -7076,6 +7096,12 @@ class Converter:
             self.report.note("*SHELL SECTION on continuum shells (SC6R/SC8R) -> *SOLID SECTION "
                              "(they run as C3D6/C3D8I solids; thickness comes from the mesh).",
                              once=True)
+            gone = [k for k in b.params if k not in ("ELSET", "MATERIAL", "ORIENTATION",
+                                                     "STACK DIRECTION", "DENSITY")]
+            if gone:
+                self.report.note(f"*SHELL SECTION {', '.join(gone)} dropped with the continuum-shell "
+                                 f"formulation (the solids take their thickness from the mesh and "
+                                 f"their stiffness from the material).", once=True)
             rows = self._exact_axes.get(id(b))
             if rows is not None:
                 return self._continuum_axes_cards(b, rows, keep_s)
@@ -7211,8 +7237,13 @@ class Converter:
         plies: List[Tuple[str, str, str]] = []
         for rec in merged_data_records(b):
             g = trimmed_fields(rec)
-            if len(g) >= 3 and g[0]:
+            if len(g) >= 3 and g[0] and g[2]:
                 plies.append((g[0], g[2], (g[3] if len(g) > 3 else "").upper()))
+            elif g:
+                self.report.warn(f"*{b.keyword}, COMPOSITE, ELSET={b.param('ELSET') or ''}: ply line "
+                                 f"'{', '.join(g)}' has no {'material' if g[0] else 'thickness'} "
+                                 f"(Abaqus needs a positive thickness and a material on every "
+                                 f"layer); left out of the layup.", once=True)
         return plies + plies[::-1] if b.has("SYMMETRIC") else plies
 
     def _shell_geometry(self, e: int) -> Optional[Tuple[Vec, Vec, List[Vec]]]:
@@ -9916,6 +9947,8 @@ class Converter:
         for rec in merged_data_records(b):
             g = [x.strip() for x in rec]
             if len([x for x in g if x]) < 2:
+                if any(g):
+                    side += self._drop_load_line(b, g, "it has no load type label", reduces=False)
                 continue
             # read in place: a blank field is zero (Abaqus), not the next field's value
             surf, label = g[0].upper(), g[1].upper()
@@ -11314,7 +11347,8 @@ class Converter:
         is False (a line Abaqus would not apply either)."""
         text = ", ".join(g).rstrip(", ")          # blank fields kept in place (they are zeros)
         label = g[1].upper() if len(g) > 1 else ""
-        msg = f"*{b.keyword} {label} on '{g[0]}' not converted: {why}. Commented out."
+        card = f"*{b.keyword} {label}" if label else f"*{b.keyword}"
+        msg = f"{card} on '{g[0]}' not converted: {why}. Commented out."
         return self._comment_out(msg, [text], reduces and f"*{b.keyword} {label} load dropped")
 
     def _user_load_line(self, b: Block, g: Sequence[str]) -> List[str]:
@@ -12574,12 +12608,16 @@ class Converter:
             try:
                 vals = [pf(x) for x in rec if x != ""]
             except ValueError:
-                continue
-            if b.has("GENERATE") and len(vals) >= 3 and vals[2] > 0:
+                vals = None
+            if vals and b.has("GENERATE") and len(vals) >= 3 and vals[2] > 0:
                 n = min(int((vals[1] - vals[0]) / vals[2] + 1e-9), 100000)
                 out += [vals[0] + i * vals[2] for i in range(n + 1)] + [vals[1]]
-            elif not b.has("GENERATE"):
+            elif vals is not None and not b.has("GENERATE"):
                 out += vals
+            elif any(rec):
+                self.report.warn(f"*TIME POINTS {name}: line '{', '.join(rec)}' does not read as "
+                                 f"{'start, end, increment' if b.has('GENERATE') else 'times'}; "
+                                 f"its output times are left out.", once=True)
         return [t for t in out if t > 0]
 
     def _time_points_card(self, times: tuple, period: float) -> str:
@@ -13115,7 +13153,7 @@ class Converter:
                                      "the mode shapes, so their amplitudes differ (frequencies do "
                                      "not).", once=True)
             elif k == "EIGENSOLVER":
-                continue
+                self._note_eigensolver(b, v)
             else:
                 self.report.note(f"*FREQUENCY parameter {k} dropped (Abaqus-only).", once=True)
         if self._step_idx in self._freq_read and "STORAGE" not in keep:
@@ -13144,6 +13182,12 @@ class Converter:
                                  f"frequency range) -> {f[0]} requested (ccx needs a count).", once=True)
         return [emit_keyword("FREQUENCY", keep)] + data
 
+    def _note_eigensolver(self, b: Block, v: Optional[str]) -> None:
+        """EIGENSOLVER= of a *FREQUENCY / *BUCKLE card, which ccx has no choice of."""
+        self.report.note(f"*{b.keyword} EIGENSOLVER={(v or '').strip().upper()} dropped: ccx has one "
+                         f"eigensolver (ARPACK's Lanczos method), for the same eigenproblem.",
+                         once=True)
+
     def handle_buckle(self, b: Block) -> List[str]:
         """``*BUCKLE``: ccx data line = number of factors, accuracy, Lanczos vectors, max
         iterations.  Abaqus' subspace layout (n, max eigenvalue, vectors, iterations)
@@ -13155,7 +13199,9 @@ class Converter:
         for k, v in b.params.items():
             if k == "SOLVER":
                 keep[k] = v
-            elif k != "EIGENSOLVER":
+            elif k == "EIGENSOLVER":
+                self._note_eigensolver(b, v)
+            else:
                 self.report.note(f"*BUCKLE parameter {k} dropped (Abaqus-only).", once=True)
         data = list(b.data)
         if data:
@@ -14899,6 +14945,9 @@ class Converter:
             for rec in merged_data_records(b):
                 f = [x for x in rec if x != ""]
                 if len(f) < 2:
+                    if f:
+                        self.report.warn(f"*CONTACT PAIR, TIED line '{f[0]}' names one surface (a "
+                                         f"tie needs a slave and a master); left out.", once=True)
                     continue
                 self._synth_counter += 1
                 params: "OrderedDict[str, Optional[str]]" = OrderedDict(
@@ -25323,6 +25372,21 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
                 "exactly like the same model written flat).", once=True)
     namer = make_namer(report)
     parts, instances, assembly_blocks, pre, post = _partition_assembly(blocks)
+    used = {inst["part"] for inst in instances}
+    idle = [name for name, pblocks in parts.items() if name not in used and any(
+        b.keyword in GEOM_KW or b.keyword in PART_PER_INSTANCE or b.keyword in PART_CONSTRAINT_KW
+        for b in pblocks)]
+    if idle:
+        # a part enters the model only through an *INSTANCE of it (2017 "Assembly definition")
+        shown = ", ".join(idle[:5]) + (f" and {len(idle) - 5} more" if len(idle) > 5 else "")
+        if instances:
+            report.note(f"*PART {shown}: no *INSTANCE names it, so its mesh, sets, sections and "
+                        f"constraints are not in the model; left out.", once=True)
+        else:
+            report.warn(f"*PART {shown} without any *INSTANCE (Abaqus needs *ASSEMBLY and *INSTANCE "
+                        f"wherever *PART is used, and a part enters the model only as an instance): "
+                        f"its mesh, sets, sections and constraints are left out, so the ccx deck has "
+                        f"none of them.", once=True)
 
     out: List[Block] = list(pre)
     out.extend(_emit_part_global_data(parts))

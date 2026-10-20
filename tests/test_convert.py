@@ -12837,6 +12837,88 @@ def test_membrane_mass_copy_and_the_ccx_thermal_steps():
     body, _, rep = convert_str(deck.format(proc="Heat Transfer"))
     assert "M_MEMBRANE_MASS" not in body
 
+
+
+def test_composite_ply_line_without_thickness_or_material_warned():
+    # Abaqus needs a positive thickness and a material on every layer; such a line was left out
+    # of the written layup without a word
+    deck = S8R_PLATE + ("*Shell Section, elset=PLATE, composite\n0.1, 3, CFRP, 0.\n, 3, CFRP, 45.\n"
+                        "0.1, 3, , 90.\n")
+    body, conv, rep = convert_str(deck)
+    assert _card_at(body, "*SHELL SECTION") == ["0.1, , CFRP"]
+    assert "ply line ', 3, CFRP, 45.' has no thickness" in rep.text()
+    assert "ply line '0.1, 3, , 90.' has no material" in rep.text()
+    assert conv.reduced_physics == []
+
+
+def test_part_without_instance_reported():
+    part = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=T3D2, elset=E\n1, 1, 2\n"
+            "*Solid Section, elset=E, material=M\n1.\n*End Part\n*Material, name=M\n*Elastic\n1., 0.\n")
+    # no assembly at all (an *INCLUDE fragment): Abaqus needs one; nothing is converted
+    body, conv, rep = convert_str(part)
+    assert "*ELEMENT" not in body and conv.reduced_physics == []
+    assert "[WARNING] *PART P without any *INSTANCE" in rep.text()
+    # a second part no instance names: a note
+    deck = part.replace("*End Part\n", "*End Part\n*Part, name=Q\n*Node\n1, 0., 0., 0.\n*End Part\n"
+                        "*Assembly, name=A\n*Instance, name=I, part=P\n*End Instance\n*End Assembly\n")
+    body, _, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=T3D2" in body
+    assert "[NOTE] *PART Q: no *INSTANCE names it" in rep.text() and "*PART P" not in rep.text()
+
+
+def test_continuum_shell_section_parameters_dropped_noted():
+    deck = SC8R_STRIP + "*Shell Section, elset=PLATE, material=CFRP, offset=SPOS, poisson=0.5\n0.3\n"
+    _, _, rep = convert_str(deck)
+    assert "*SHELL SECTION OFFSET, POISSON dropped with the continuum-shell formulation" in rep.text()
+    _, _, rep = convert_str(deck.replace(", offset=SPOS, poisson=0.5", ", stack direction=3"))
+    assert "dropped with the continuum-shell" not in rep.text()
+
+
+def test_eigensolver_dropped_noted():
+    deck = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Density\n1e-6\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+            "*Step\n*Frequency, eigensolver=lanczos\n3\n*End Step\n"
+            "*Step\n*Buckle, eigensolver=subspace\n2\n*Cload\n7, 3, -1.\n*End Step\n")
+    _, _, rep = convert_str(deck)
+    assert "*FREQUENCY EIGENSOLVER=LANCZOS dropped" in rep.text()
+    assert "*BUCKLE EIGENSOLVER=SUBSPACE dropped" in rep.text()
+
+
+def test_beam_section_parameters_dropped_on_converted_sections():
+    # the U1 section, the expanded general section and the --approximate I-beam rewrite their
+    # cards; the parameters they leave out were dropped without the note the plain path gives
+    _, _, rep = convert_str((U1_PLANAR + U1_STEP).replace("section=I", "section=I, temperature=GRADIENTS"))
+    assert "*BEAM SECTION parameter TEMPERATURE dropped." in rep.text()
+    gen = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=B\n1, 1, 2\n"
+           "*Beam General Section, elset=B, section=CIRC, poisson=0.3\n0.1\n\n2e11, 8e10\n"
+           "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n2, 2, -1.\n*End Step\n")
+    _, _, rep = convert_str(gen)
+    assert "*BEAM GENERAL SECTION parameter POISSON dropped." in rep.text()
+    ibeam = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=B31,elset=E\n1,1,2\n"
+             "*Beam Section, elset=E, material=m, section=I, poisson=0.3\n"
+             "0.1, 0.2, 0.1, 0.1, 0.01, 0.01, 0.008\n0.,0.,1.\n")
+    _, _, rep = convert_str(ibeam, approximate=True)
+    assert "*BEAM SECTION parameter POISSON dropped." in rep.text()
+
+
+def test_unreadable_generation_and_load_records_warned():
+    # records Abaqus would reject, which were skipped without a word
+    deck = ("*Node\n1, 0., 0., 0.\n5, 4., 0., 0.\n11, 0., 1., 0.\n*Ngen\n1\n1, 5\n"
+            "*Nset, nset=A\n1, 5\n*Nset, nset=B\n11, 15\n*Nfill\nA, B, 2, 5\n*Nset\n1\n"
+            "*Element, type=CONN3D2, elset=C\n7, , \n")
+    _, _, rep = convert_str(deck)
+    text = rep.text()
+    assert "*NGEN record needs two end nodes" in text
+    assert "*NFILL between nodes 5 and 15: node 15 is not defined" in text
+    assert "*NSET without NSET=" in text and "connector element 7 names no node" in text
+    deck = (HEX + "*Surface, name=S\nEALL, S2\n*Solid Section, elset=EALL, material=M\n*Material, "
+            "name=M\n*Elastic\n1000., 0.3\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Dsload\nS\nS, P, 1.\n"
+            "*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*DSLOAD on 'S' not converted: it has no load type label" in rep.text()
+    assert "** S" in body and conv.reduced_physics == []
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

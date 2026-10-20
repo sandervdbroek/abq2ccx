@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Input left out without a word** — the report now says where the conversion leaves input
+  out: a `*PART` that no `*INSTANCE` names (a note; a warning in a deck without any instance,
+  which came out empty: about 100 corpus decks, mostly include fragments); a composite ply line
+  without a thickness or a material (a warning; one without a material is no longer written);
+  the section parameters the continuum-shell, U1, expanded general-beam and `--approximate`
+  I-beam cards do not carry; `EIGENSOLVER=`; and, warned, `*NGEN`, `*NFILL`, `*TIME POINTS`,
+  `*DSLOAD` and tied `*CONTACT PAIR` lines Abaqus would reject, nameless `*NSET` / `*ELSET`
+  cards and connector elements without nodes.
 * **Distributing coupling with an `INFLUENCE RADIUS`** — ccx 2.23 ignores the radius, so the
   coupling spread over the whole surface (reduced physics). It is now written on the facets
   with a node within the radius, or on the nearest facet where it holds none. That is exact
