@@ -28492,14 +28492,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             out.append(mkblock("ORIENTATION", [("NAME", namer(prefix, AXES_ORIENTATION)),
                                                ("SYSTEM", "RECTANGULAR")],
                                [", ".join(_fmt_unit(x) for x in (*axes[0], *axes[1]))]))
+    sections = PART_PER_INSTANCE - {"ORIENTATION", "DISTRIBUTION", "CONNECTOR SECTION", "SURFACE"}
     for b in inst_blocks:
         b = turned.get(id(b), b)
         if id(b) in sub_options:
             out.append(Block(b.keyword, OrderedDict(b.params), list(b.data)))
-        elif b.keyword in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
-                         "BEAM GENERAL SECTION", "MEMBRANE SECTION", "COHESIVE SECTION",
-                         "GASKET SECTION", "SURFACE SECTION", "SPRING",
-                         "DASHPOT", "MASS", "ROTARY INERTIA", "GAP"):
+        elif b.keyword in sections:
             nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION", "MEMBRANE THICKNESS"), namer)
             if b.has("COMPOSITE"):
                 # a ply line (thickness, points, material, angle or orientation, ply name)
