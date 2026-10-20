@@ -1274,7 +1274,7 @@ def test_rigid_body_reference_node_of_its_own_body_gets_a_free_node():
     # node's own elements' forces alone (probed: 1e-15 instead of the body's -10.6): the body
     # gets a free reference node at the same place, which takes the BCs, loads and output on
     # the reference point, its *TRANSFORM and initial velocity; node 8 stays a member
-    deck = (HEX + "*Nset, nset=BODY\n1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=REF\n8\n*Nset, nset=ALL\n"
+    deck = (HEX + HEX_SEC + "*Nset, nset=BODY\n1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=REF\n8\n*Nset, nset=ALL\n"
             "1, 2, 3, 4, 5, 6, 7, 8\n*Rigid Body, ref node=REF, pin nset=BODY\n*Transform, nset=REF\n"
             "0.8, 0.6, 0., -0.6, 0.8, 0.\n*Initial Conditions, type=velocity\nREF, 1, 2.\n*Boundary\n"
             "REF, 1, 3\n*Step\n*Static\n*Boundary\n8, 3, 3, 0.1\n*Node Print, nset=REF\nRF\n"
@@ -9119,7 +9119,7 @@ def test_connector_between_differently_transformed_nodes_uses_a_twin():
     # translation per equation: exact (probed), linear and under NLGEOM (commented out before)
     deck = JOIN9 + "*Nset, nset=T2\n2\n*Transform, nset=T2\n1., 2., 0.5, -1., 0.3, 1.\n"
     for steps in (STEP, "*Step, nlgeom=YES\n*Static\n*End Step\n"):
-        body, conv, rep = convert_str(deck + steps)
+        body, conv, rep = convert_str(deck + HEX_SEC + steps)
         twin, eqs = conv._twins[2], _equation_terms(body)
         assert len(eqs) == 6 and not _ccx_expansion_repeats(body) and "** *CONNECTOR" not in body
         assert sum(1 for eq in eqs if {n for n, _, _ in eq} == {2, twin}) == 3
@@ -10435,16 +10435,16 @@ def test_equation_terms_on_one_dof_are_summed():
     # it is the same equation, exact.  A sum that cancels drops out; other terms keep their text.
     eqs = ("*Equation\n3\n2, 1, 1., 1, 1, -0.4, 1, 1, -0.6\n"
            "*Equation\n5\n2, 2, 1., 1, 2, -1., 3, 1, 0.25, 3, 1, -0.25\n4, 3, 2.\n")
-    body, conv, rep = convert_str(HEX + eqs + STEP)
+    body, conv, rep = convert_str(HEX + HEX_SEC + eqs + STEP)
     assert _equation_terms(body) == [[(2, 1, 1.), (1, 1, -1.)], [(2, 2, 1.), (1, 2, -1.), (4, 3, 2.)]]
     assert "2, 2, 1., 1, 2, -1., 4, 3, 2." in body
     assert "*EQUATION terms on the same node and DOF summed into one" in rep.text()
     assert not conv._twins and rep.n_warnings == 0
     # an equation whose terms all cancel is 0 = 0
-    body, _, _ = convert_str(HEX + "*Equation\n2\n2, 1, 1., 2, 1, -1.\n" + STEP)
+    body, _, _ = convert_str(HEX + HEX_SEC + "*Equation\n2\n2, 1, 1., 2, 1, -1.\n" + STEP)
     assert not _equation_terms(body) and "*EQUATION left out: its terms cancel (0 = 0)" in body
     # an equation without repeats is written as it is
-    body, _, rep = convert_str(HEX + "*Equation\n2\n2, 1, 1., 1, 1, -0.5\n" + STEP)
+    body, _, rep = convert_str(HEX + HEX_SEC + "*Equation\n2\n2, 1, 1., 1, 1, -0.5\n" + STEP)
     assert "*EQUATION\n2\n2, 1, 1., 1, 1, -0.5" in body and "summed" not in rep.text()
 
 
@@ -10454,7 +10454,7 @@ def test_equation_local_translations_sharing_a_global_dof_use_a_twin():
     # node 9's cylindrical axes) repeat global DOFs, which ccx 2.23 mis-assembles (probed:
     # 108-130 % of max |u| off).  They go through node 9's twin, in global components (exact).
     terms = ", ".join(f"9, {j + 1}, {-CYL9_AXES[j][0]!r}" for j in range(3))
-    body, conv, rep = convert_str(CYL9 + f"*Equation\n4\n1, 1, 1., {terms}\n" + STEP)
+    body, conv, rep = convert_str(CYL9 + HEX_SEC + f"*Equation\n4\n1, 1, 1., {terms}\n" + STEP)
     twin = conv._twins[9]
     eqs = _equation_terms(body)
     assert [(1, 1, 1.), (twin, 1, -1.)] in [[(n, d, round(c, 12)) for n, d, c in eq] for eq in eqs]
@@ -10462,7 +10462,7 @@ def test_equation_local_translations_sharing_a_global_dof_use_a_twin():
     assert sum(1 for eq in eqs if {n for n, _, _ in eq} == {9, twin}) == 3
     assert "written on the node's twin, in global components" in rep.text() and rep.n_warnings == 0
     # local axes that share no global component (local 1 = y, 2 = -x): written as they are
-    body, conv, rep = convert_str(_transformed(HEX + "*Node\n9, 2., 0., 0.\n*Equation\n3\n"
+    body, conv, rep = convert_str(_transformed(HEX + HEX_SEC + "*Node\n9, 2., 0., 0.\n*Equation\n3\n"
                                                "1, 1, 1., 9, 1, 0.5, 9, 2, 0.5\n" + STEP, "9", YX))
     assert not conv._twins and _equation_terms(body) == [[(1, 1, 1.), (9, 1, .5), (9, 2, .5)]]
 
