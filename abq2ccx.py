@@ -28551,7 +28551,7 @@ class Converter:
         which are left out: _plan_load_cases).  The OP=NEW is dropped, so that ccx does not
         act on it where the cards before it leave no line, and warned."""
         cards = [b for b in blocks if id(b) not in self.steps.lc2]
-        acts = op_new_cards(cards)
+        acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
         late: List[int] = []
         for s, group in enumerate(step_groups(cards)[1], 1):
             bcs = [b for b in group if b.keyword == "BOUNDARY"]
