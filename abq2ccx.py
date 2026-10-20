@@ -5591,19 +5591,21 @@ class Converter:
                 reduces = False
                 msg += f" No section uses material {mat}, so this changes nothing."
         return self._comment_out(msg, [emit_keyword(b.keyword, b.params)] + list(b.data),
-                                 reduces if reduces is not True else f"*{b.keyword}",
-                                 warn=reduces is not False)
+                                 reduces, warn=reduces is not False)
 
     def _comment_out(self, msg: str, lines: Sequence[str], reduces: Union[bool, str],
                      comment: Optional[str] = None, warn: bool = True) -> List[str]:
         """Card text ``lines`` as comment lines under '** abq2ccx: ' + ``comment`` (else
         ``msg``), with ``msg`` reported as a warning (a note unless ``warn``) and, unless
-        ``reduces`` is False, ``reduces`` recorded as reduced physics.  One commented card."""
+        ``reduces`` is False, ``reduces`` recorded as reduced physics (True: the card's
+        keyword, else ``msg``).  One commented card."""
         self.report.n_commented += 1
         if warn:
             self.report.warn(msg, once=True)
         else:
             self.report.note(msg, once=True)
+        if reduces is True:
+            reduces = lines[0].partition(",")[0] if lines and lines[0].startswith("*") else msg
         if reduces is not False:
             self._reduces(reduces)
         return ["** abq2ccx: " + (msg if comment is None else comment)] + ["** " + x for x in lines]

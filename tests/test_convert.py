@@ -14683,6 +14683,14 @@ def test_ccx_override_looked_up_on_path():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_comment_out_reduces_true_names_the_card():
+    # reduces=True records the commented card's keyword (or the message), never True itself
+    conv = A.Converter(A.Report(), Opt())
+    conv._comment_out("gone", ["*CLOAD, OP=NEW", "1, 1, 1."], True)
+    conv._comment_out("no card", [], True)
+    conv._comment_out("kept", ["*CLOAD"], False)
+    assert conv.reduced_physics == ["*CLOAD", "no card"]
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
