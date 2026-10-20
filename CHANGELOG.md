@@ -76,9 +76,17 @@ physics.
   `*DSLOAD` to an earlier one on the same faces when it comes from another surface, element set
   or card; ccx 2.23 keeps one value per face and the later line replaced it (a tip pressure of
   1, then 2 from another surface: ccx 2, Abaqus 3). The earlier load is now given again in that
-  step (also `BX` / `BY` / `BZ`). On another amplitude or a step-time one this is impossible
-  (ccx stops, or the amplitude starts over), so it is warned (reduced physics). `*DSLOAD,
-  IMAGINARY` → `LOAD CASE=2`, as on `*DLOAD` (it acted in phase).
+  step (also `BX` / `BY` / `BZ`). On another amplitude than the later line's this is
+  impossible (ccx stops), so it is warned (reduced physics). `*DSLOAD, IMAGINARY` →
+  `LOAD CASE=2`, as on `*DLOAD` (it acted in phase).
+* **Concentrated loads of different sources across steps; load amplitudes** — the same for
+  `*CLOAD`: a node loaded through a node set and later by its number (or another set) carries
+  both in Abaqus, ccx kept the later line (-2 for -3); the earlier line is now given again. A
+  load on a step-time amplitude given again (also after another card's `OP=NEW`) gets the value
+  it ended with and no amplitude: ccx started it over, or stopped on two amplitudes on one face.
+  Load cards of one step with the same `AMPLITUDE` and `TIME DELAY` become one; a line on a face
+  or node DOF that an earlier card of the step loads on another amplitude is left out, warned
+  (ccx stopped on both).
 * **Element output in steps ccx 2.23 runs linearly** — `*EL FILE SDV` segfaulted ccx in a
   `*VISCO` step of an elastic material and in a Riks step under `--approximate`; both are
   dropped there now, as in a linear `*STATIC` step. A `*FREQUENCY` or `*BUCKLE` step makes ccx

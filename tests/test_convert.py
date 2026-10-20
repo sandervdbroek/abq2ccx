@@ -5805,6 +5805,8 @@ def test_body_forces_of_perturbation_steps_removed():
 
 REGIVEN = ("** abq2ccx: distributed loads of earlier steps on element faces loaded above, given again "
            "(Abaqus adds them up; ccx would replace them)\n")
+CL_REGIVEN = ("** abq2ccx: concentrated loads of earlier steps on node DOFs loaded above, given again "
+              "(Abaqus adds them up; ccx would replace them)\n")
 # BAR3's tip face as two surfaces, the top faces of its first two elements and of the last two
 TIPS = ("*Surface, name=TIPA\n3, S4\n*Surface, name=TIPB\n3, S4\n*Surface, name=TOP12\nE1, S2\n"
         "2, S2\n*Surface, name=TOP23\nE23, S2\n*Amplitude, name=T, time=total time\n0., 1., 10., 1.\n")
@@ -5870,6 +5872,87 @@ def test_face_loads_of_other_sources_add_up_across_steps():
                                          "*Step\n*Frequency\n3\n*End Step\n", 1)
                              .format("*Dsload\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 2.\n"))
     assert "*STATIC\n*DLOAD\n3, P4, 2.\n" + REGIVEN + "*DLOAD\n3, P4, 1.\n" in _step(body, 3)
+
+
+def test_concentrated_loads_of_other_sources_add_up_across_steps():
+    # Abaqus tells concentrated loads apart by the node or node set as written and the DOF: a
+    # node loaded through a set in one step and by its number (or through another set) in a
+    # later one carries both ("the loads will be added", Abaqus 2017, loads).  ccx 2.23 keeps
+    # one value per node DOF, which a later step's line replaces (forcadd; probed: -2 for -3),
+    # so the earlier line is given again, with every line of its source
+    deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, elset=EALL, material=M\n"
+            "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Nset, nset=TOP\n5, 6, 7, 8\n*Nset, nset=T2\n7, 8\n"
+            "*Amplitude, name=A\n0., 0., 1., 2.\n*Amplitude, name=T, time=total time\n0., 0., 10., 10.\n")
+    two = deck + "*Step\n*Static\n{}*End Step\n*Step\n*Static\n{}*End Step\n"
+    body, conv, rep = convert_str(two.format("*Cload\nTOP, 3, -1.\nTOP, 3, -1.\n", "*Cload\n7, 3, -2.\n"))
+    assert "*CLOAD\n7, 3, -2.\n" + CL_REGIVEN + "*CLOAD\nTOP, 3, -1.\nTOP, 3, -1.\n" in _step(body, 2)
+    assert "ccx 2.23 keeps one value per node and DOF" in rep.text() and not conv.reduced_physics
+    # the same source again replaces it (names in any case); another DOF is another load
+    for cards in (("*Cload\nTOP, 3, -1.\n", "*Cload\ntop, 3, -2.\n"),
+                  ("*Cload\nTOP, 3, -1.\n", "*Cload\n7, 2, -2.\n"),
+                  ("*Cload\nTOP, 3, -1.\n", "*Cload, op=NEW\n7, 3, -2.\n")):
+        assert CL_REGIVEN not in convert_str(two.format(*cards))[0]
+    # a line given again loads its other nodes again, so the loads on those follow; a zero
+    # removes the node's own load, the set's stays
+    body, _, _ = convert_str(two.format("*Cload\nTOP, 3, -1.\nT2, 3, -5.\n", "*Cload\n5, 3, -2.\n"))
+    assert CL_REGIVEN + "*CLOAD\nTOP, 3, -1.\nT2, 3, -5.\n" in _step(body, 2)
+    body, _, _ = convert_str(two.format("*Cload\nTOP, 3, -1.\n", "*Cload\n7, 3, -2.\n") +
+                             "*Step\n*Static\n*Cload\n7, 3, 0.\n*End Step\n")
+    assert "*CLOAD\n7, 3, 0.\n" + CL_REGIVEN + "*CLOAD\nTOP, 3, -1.\n" in _step(body, 3)
+    # on a total-time amplitude both go on; a step-time one is held at its end value (A(1) = 2)
+    # and given again so, plain; on another amplitude than the step's line it cannot be (ccx
+    # stops on two amplitudes on a node DOF in one step): lost there
+    body, conv, _ = convert_str(two.format("*Cload, amplitude=T\nTOP, 3, -1.\n", "*Cload, amplitude=T\n7, 3, -2.\n"))
+    assert CL_REGIVEN + "*CLOAD, AMPLITUDE=T\nTOP, 3, -1.\n" in body and not conv.reduced_physics
+    body, conv, rep = convert_str(two.format("*Cload, amplitude=A\nTOP, 3, -1.\n", "*Cload\n7, 3, -2.\n"))
+    assert CL_REGIVEN + "*CLOAD\nTOP, 3, -2.\n" in body and "written at the value it ended with" in rep.text()
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(two.format("*Cload\nTOP, 3, -1.\n", "*Cload, amplitude=T\n7, 3, -2.\n"))
+    assert CL_REGIVEN not in body and "lost on those node DOFs" in rep.text() and conv.reduced_physics
+    # a static perturbation step's line gets the base value added (_restore_base_states)
+    body, _, _ = convert_str(two.replace("*Step\n*Static\n{}*End Step\n", "*Step, perturbation\n*Static\n"
+                                         "{}*End Step\n", 2).replace("*Step, perturbation", "*Step", 1)
+                             .format("*Cload\nTOP, 3, -1.\n", "*Cload\n7, 3, -2.\n"))
+    assert "*CLOAD\n7, 3, -3.\n*" in _step(body, 2) and CL_REGIVEN not in body
+
+
+def test_load_amplitudes_ccx_cannot_hold_on_one_face_or_node():
+    # ccx 2.23 stops on two amplitudes on one face or node DOF in one step (loadadd, forcadd;
+    # probed), also on two cards with the same AMPLITUDE and TIME DELAY, each of which gets a
+    # copy of the amplitude of its own; Abaqus adds the loads.  Such cards become one, a line
+    # on another amplitude is left out (warned)
+    one = BAR3 + TIPS + "*Step\n*Static\n{}*End Step\n"
+    body, conv, rep = convert_str(one.format("*Dload, amplitude=A, time delay=0.1\n3, P4, 1.\n*Cload\n"
+                                             "16, 1, 1.\n*Dsload, amplitude=A, time delay=0.1\nTIPA, P, 2.\n"
+                                             "*Cload, amplitude=A, time delay=0.1\n16, 2, 1.\n"
+                                             "*Cload, amplitude=A, time delay=0.1\n16, 2, 2.\n"))
+    assert "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1\n3, P4, 1.\n3, P4, 2.\n*CLOAD\n16, 1, 1.\n" \
+           "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1\n16, 2, 1.\n16, 2, 2.\n*" in _step(body, 1)
+    assert "merged into one" in rep.text() and not conv.reduced_physics
+    body, conv, rep = convert_str(one.format("*Dload, amplitude=A\n3, P4, 1.\n*Dsload\nTIPA, P, 2.\n"
+                                             "*Cload\n16, 1, 1.\n15, 1, 1.\n*Cload, amplitude=A\n16, 1, 2.\n"))
+    assert "*DLOAD, AMPLITUDE=A\n3, P4, 1.\n** abq2ccx: line(s) left out" in body and "** 3, P4, 2.\n" in body
+    assert "*CLOAD, AMPLITUDE=A\n** abq2ccx: line(s) left out" in body and "** 16, 1, 2.\n" in body
+    assert "ccx 2.23 stops on two amplitudes on one face in one step" in rep.text() and conv.reduced_physics
+    # a step-time load given again after a ccx *DLOAD, OP=NEW (the other card's) holds its end
+    # value, plain (given on its amplitude it started over); on a face the step loads on
+    # another amplitude it cannot come back (ccx stopped there)
+    two = BAR3 + TIPS + "*Amplitude, name=R\n0., 0., 1., 2.\n*Amplitude, name=V, value=absolute\n" \
+        "0., 0., 1., 5.\n*Step\n*Static\n{}*End Step\n*Step\n*Static\n{}*End Step\n"
+    body, conv, _ = convert_str(two.format("*Dload, amplitude=R\n1, P2, 1.\n*Dsload\nTIPA, P, 3.\n",
+                                           "*Dsload, op=NEW\nTIPB, P, 2.\n"))
+    assert "removed them)\n*DLOAD\n1, P2, 2.\n*" in _step(body, 2)
+    body, conv, rep = convert_str(two.format("*Dload\n3, P4, 1.\n*Dsload\nTIPA, P, 3.\n",
+                                             "*Dsload, op=NEW, amplitude=A\nTIPB, P, 2.\n"))
+    assert "removed them)" not in body and "cannot be given again after it" in rep.text()
+    assert "distributed load of an earlier step lost after another card's OP=NEW (amplitudes)" in \
+        conv.reduced_physics
+    # on faces the step loads plain: the step-time load given again at its end value; one whose
+    # end value the converter does not know (VALUE=ABSOLUTE) is lost there
+    body, _, _ = convert_str(two.format("*Dsload, amplitude=R\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 2.\n"))
+    assert REGIVEN + "*DLOAD\n3, P4, 2.\n" in _step(body, 2)
+    _, _, rep = convert_str(two.format("*Dsload, amplitude=V\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 2.\n"))
+    assert "whose end value the converter cannot evaluate" in rep.text()
 
 
 def test_dsload_imaginary_part_is_load_case_two():
@@ -5960,16 +6043,21 @@ def test_base_state_after_perturbation_values_and_keys():
     body, _, _ = convert_str(deck.format("*Cload, amplitude=A\n7, 1, 1.\n*Cload, amplitude=T\n7, 2, 1.\n",
                                          ""))
     assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n7, 1, 2.\n*CLOAD, AMPLITUDE=T\n7, 2, 1.\n" in body
-    # the step's own loads are left out: a set's other nodes are given one by one, a face
-    # load on an element of a set it loads goes; a body load is one per set and direction.
-    # The face load is another load than the step's own in Abaqus, which adds the two: it
-    # follows the step's own (_flush_dloads)
+    # the step's own loads are left out; a body load is one per set and direction.  The face
+    # load and the node set's load are other loads than the step's own in Abaqus, which adds
+    # the two: they follow the step's own (_flush_dloads, _flush_cloads)
     body, _, _ = convert_str(deck.format("*Cload\nTOP, 3, -1.\n*Dload\nEALL, P2, 1.\n"
                                          "EALL, GRAV, 9.81, 0., 0., -1.\n",
                                          "*Cload\n7, 3, -2.\n*Dload\n1, P2, 2.\n"))
-    assert ("*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 3, -1.\n6, 3, -1.\n8, 3, -1.\n"
+    assert ("perturbation step(s) 2 in between)\n"
             "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nEALL, GRAV, 9.81, 0., 0., -1.\n"
-            "*CLOAD\n7, 3, -2.\n*DLOAD\n1, P2, 2.\n" + REGIVEN + "*DLOAD\nEALL, P2, 1.\n") in body
+            "*CLOAD\n7, 3, -2.\n*DLOAD\n1, P2, 2.\n" + REGIVEN + "*DLOAD\nEALL, P2, 1.\n" +
+            CL_REGIVEN + "*CLOAD\nTOP, 3, -1.\n") in body
+    # where the set's load cannot follow (another amplitude: lost on node 7, warned) its other
+    # nodes are given one by one
+    body, conv, _ = convert_str(deck.format("*Cload\nTOP, 3, -1.\n", "*Cload, amplitude=T\n7, 3, -2.\n"))
+    assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 3, -1.\n6, 3, -1.\n8, 3, -1.\n*CLOAD, " \
+           "AMPLITUDE=T\n7, 3, -2.\n" in body and conv.reduced_physics
     # a gravity along the same direction, written otherwise, replaces it
     body, _, _ = convert_str(deck.format("*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n",
                                          "*Dload\nEALL, GRAV, 20., 0, 0, -2\n"))

@@ -4180,15 +4180,26 @@ class Converter:
         self._has_normal = False
         self._planar_beams = False                  # the deck's beams are 2-D (B21, B22, ...)
         # *DLOAD lines emitted per source card ("DLOAD" / "DSLOAD"): key -> (line, card
-        # parameters, what it loads: _dl_faces, its amplitude in a later step: _track_dloads),
-        # so a ccx *DLOAD, OP=NEW does not remove the other card's loads, nor a later line on
-        # the same element faces replace them (_flush_dloads)
+        # parameters, what it loads: _dl_faces, the line in a later step: _load_later), so a
+        # ccx *DLOAD, OP=NEW does not remove the other card's loads, nor a later line on the
+        # same element faces replace them (_flush_dloads)
         self._dl_state: Dict[str, "OrderedDict[tuple, Tuple[str, tuple, tuple, Optional[tuple]]]"] = {}
         self._dl_fresh: set = set()                 # (card, key) given in the current step
         self._dl_wiped = False                      # a ccx *DLOAD, OP=NEW in the current step
-        self._dl_given: List[Tuple[tuple, tuple]] = []   # (what, amplitude) of the step's lines
+        self._dl_taken: Dict[tuple, tuple] = {}     # face -> the amplitude of the step's lines on it
         self._dl_memo: Dict[tuple, frozenset] = {}  # (_dl_faces)
+        # the deck's *CLOAD lines as emitted, per source (node or node set as written, DOF,
+        # load case) -> [(line, card parameters, the (node, DOF, load case) it loads, the line
+        # in a later step: _load_later)], so a later step's line on the same node DOFs does not
+        # replace them (_flush_cloads); the sources given in the current step, and its node
+        # DOFs' amplitudes
+        self._cl_state: "OrderedDict[tuple, List[Tuple[str, tuple, frozenset, Optional[tuple]]]]" = \
+            OrderedDict()
+        self._cl_fresh: set = set()
+        self._cl_taken: Dict[tuple, tuple] = {}
         self._total_amps: set = set()               # the TIME=TOTAL TIME amplitudes' names
+        self._amp_curves: Dict[str, Optional[AmplitudeCurve]] = {}   # name -> its curve
+        self._step_period: Optional[float] = 1.0    # the current step's (None: not known)
         # Abaqus' linear perturbation steps (1-based), and the general steps after them that
         # start from the base state again (_plan_base_restore, _restore_base_states)
         self._pert_idx: set = set()
@@ -4218,8 +4229,8 @@ class Converter:
         self._modal_moving: Dict[int, int] = {}
         self._modal_held: set = set()
         # the converted-load bookkeeping before the current run of perturbation steps:
-        # (_nodal_loads, _nodal_emitted, _dl_state)
-        self._load_base: tuple = (OrderedDict(), {}, {})
+        # (_nodal_loads, _nodal_emitted, _dl_state, _cl_state)
+        self._load_base: tuple = (OrderedDict(), {}, {}, OrderedDict())
         # pressures on shells / membranes split between the faces of ccx's expanded element
         # (_plan_sheet_pressure): load token -> [(face-1 target, top-face surface, weight of
         # face 1, weight of face 2)], and the *ELSET / *SURFACE cards those names need
@@ -8352,7 +8363,16 @@ class Converter:
                 ["** abq2ccx: the step's other cards, which ccx does not reach:"] +
                 ["** " + x for x in rest] if rest else []) + ["*END STEP"]
         self._nodal_fresh, self._nodal_reset, self._cload_new = set(), set(), False
-        self._dl_fresh, self._dl_wiped, self._dl_given = set(), False, []
+        self._dl_fresh, self._dl_wiped, self._dl_taken = set(), False, {}
+        self._cl_fresh, self._cl_taken = set(), {}
+        # the step's time period, where a step-time amplitude ends (_load_later)
+        rec = (merged_data_records(proc_block) or [[]])[0] if proc_block is not None else []
+        try:
+            self._step_period = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
+        except ValueError:
+            self._step_period = None
+        if self._step_idx in self._pert_idx or (proc_block is not None and proc_block.has("RIKS")):
+            self._step_period = None
         self._step_temp_dof = next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS),
                                    None)
         self._buckle_loaded = proc == "BUCKLE" and any(
@@ -8364,13 +8384,16 @@ class Converter:
         pert = self._step_idx in self._pert_idx
         self._sp_adds = self._step_idx in self._sp_add     # (_op_new_load, _set_nodal_load)
         if pert and self._step_idx - 1 not in self._pert_idx:
-            self._load_base = (self._nodal_loads, dict(self._nodal_emitted), self._dl_state)
+            self._load_base = (self._nodal_loads, dict(self._nodal_emitted), self._dl_state,
+                               self._cl_state)
         if pert:
             # (a *MODAL DYNAMIC step that keeps the loads ccx holds goes on from them)
             held = self._step_idx in self._modal_held
-            start = (self._nodal_loads, self._dl_state) if held else (self._load_base[0], self._load_base[2])
+            start = (self._nodal_loads, self._dl_state, self._cl_state) if held else \
+                (self._load_base[0], self._load_base[2], self._load_base[3])
             self._nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in start[0].items())
             self._dl_state = {o: OrderedDict(st) for o, st in start[1].items()}
+            self._cl_state = OrderedDict((k, list(v)) for k, v in start[2].items())
             if self._step_idx in self._restore_from:    # (a static one after perturbation steps)
                 self._nodal_emitted = dict(self._load_base[1])
             if "PERTURBATION" in params or proc in ("BUCKLE", "STEADY STATE DYNAMICS") or \
@@ -8379,10 +8402,12 @@ class Converter:
                 # *DLOADs too; probed), a *MODAL DYNAMIC step both through the OP=NEW cards
                 # _modal_own_loads gives it: its loads are its own, given in full
                 self._nodal_loads, self._nodal_emitted = OrderedDict(), {}
+                self._cl_state = OrderedDict()
                 if proc != "FREQUENCY":
                     self._dl_state = {}
         elif self._step_idx in self._restore_from:
             self._nodal_loads, self._dl_state = self._load_base[0], self._load_base[2]
+            self._cl_state = self._load_base[3]
             self._nodal_emitted = dict(self._load_base[1])
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
@@ -8397,7 +8422,9 @@ class Converter:
         out.extend(self._boundary_pieces(self._vel_tail.get(self._step_idx, [])))
         self._dload_op_new_first(out)
         out.extend(self._flush_dloads())
+        out.extend(self._flush_cloads())
         out.extend(self._flush_nodal_loads())
+        self._merge_delay_cards(out)
         out.extend(self._anchored_output(step_block))  # Abaqus' default output, if any
         self._step_temp_dof = None
         out.append("*END STEP")
@@ -9870,6 +9897,8 @@ class Converter:
             return self._user_load_card(b)
         if self._op_new_load(b):
             self._cload_new = True        # it also removes the converted nodal forces (ccx)
+            for k in [k for k in self._cl_state if k not in self._cl_fresh]:
+                del self._cl_state[k]
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "OP" and self._sp_adds:
@@ -9898,8 +9927,10 @@ class Converter:
         out = [emit_keyword("CLOAD", keep)]
         moved = False
         hit: List[int] = []         # transformed nodes whose moments _plan_transformed_rotations rewrites
+        marks: List[Tuple[int, List[str]]] = []     # where each data line's lines start, its fields
         for ln in b.data:
             f = [x.strip() for x in ln.split(",")]
+            marks.append((len(out), f))
             self._check_node_target("CLOAD", f[0] if f else "")
             if not (len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and 4 <= int(f[1]) <= 6):
                 out.append(ln)
@@ -9925,6 +9956,17 @@ class Converter:
                 out.append(", ".join([str(self._rb_rot[n]), str(int(f[1]) - 3)] + f[2:]))
                 if not zero:
                     self._warn_rot_frame(n)
+        drop = self._track_cloads(out, marks, keep)
+        if drop:
+            gone = [out[i] for i in sorted(drop)]
+            out = [ln for i, ln in enumerate(out) if i not in drop] + self._comment_out(
+                f"*CLOAD line(s) in step {self._step_idx} on node DOFs that an earlier *CLOAD card of "
+                f"the step loads on another amplitude: Abaqus adds the two, ccx 2.23 stops on two "
+                f"amplitudes on one node DOF in one step ('*ERROR in forcadd', probed). Left out, also "
+                f"for the steps after it — verify.", gone,
+                "*CLOAD on node DOFs another card of the step loads with another amplitude",
+                "line(s) left out: an earlier card of the step loads these node DOFs on another "
+                "amplitude (ccx 2.23 stops on that)")
         for n in hit:
             got = self._rot_lines.get((id(b), n))
             out.extend(got if isinstance(got, list) else self._rot_refused(b, n, got))
@@ -10064,7 +10106,10 @@ class Converter:
                 params.pop("OP", None)
         if op_new:
             self._dload_op_new("DLOAD")
-        self._track_dloads("DLOAD", b, lines, params)
+        drop = self._track_dloads("DLOAD", b, lines, params)
+        if drop:
+            body = [ln for ln in body if ln not in drop]
+            side += self._dload_clash([ln for _, ln, _ in lines if ln in drop])
         if not body and had_data:
             if op_new:
                 # keep the bare header: OP=NEW validly removes all previous distributed
@@ -10185,12 +10230,16 @@ class Converter:
             keep = self._load_params(b, self._DLOAD_PARAMS)
             if not wipe:
                 keep.pop("OP", None)
+        drop = self._track_dloads("DSLOAD", b, lines, keep)
+        if drop:
+            body = [ln for ln in body if ln not in drop]
+            side += self._dload_clash([ln for _, ln, _ in lines if ln in drop])
+        if body or wipe:
             if op_new:
                 self._dload_op_new("DSLOAD", wipe)
             out = [emit_keyword("DLOAD", keep)] + self._surfaces_last(body)
         elif op_new:
             self._dload_op_new("DSLOAD", False)
-        self._track_dloads("DSLOAD", b, lines, keep)
         if not out and not side:
             if not any(x.strip() for x in b.data):
                 return []                 # nothing to apply and (OP=NEW) nothing left to remove
@@ -11453,8 +11502,9 @@ class Converter:
         """Why ``forces`` cannot join the generated *CLOAD, or None.  ccx keeps one value and one
         amplitude per node and DOF: values given in one step add up, a later step replaces
         them.  A node DOF shared with the deck's own *CLOAD is therefore exact only when the
-        deck has a single step and the same amplitude; one shared with another converted load
-        needs the same amplitude."""
+        deck has a single step and the same amplitude (so the deck's lines given again,
+        _flush_cloads, never meet these forces); one shared with another converted load needs
+        the same amplitude."""
         for nd in forces:
             amps = self._deck_cloads.get(nd)
             if amps is not None and (self._n_steps > 1 or amps != {amp}):
@@ -11618,24 +11668,62 @@ class Converter:
                                   f"stock {sub} in place of the deck's own. Commented out: port the "
                                   f"subroutine to ccx's {sub} and restore the card.")
 
+    @staticmethod
+    def _load_amp(params: "OrderedDict[str, Optional[str]]") -> tuple:
+        """What ccx 2.23 compares where one step loads a face or node DOF twice (loadadd,
+        forcadd): the amplitude of the ccx card (``params``) — with TIME DELAY a copy of its
+        own per card (cloads.f, dloads.f), which the step's cards of the same parameters share
+        once _merge_delay_cards has put their lines on one."""
+        name = (params.get("AMPLITUDE") or "").strip().upper()
+        if "TIME DELAY" not in params:
+            return name, ()
+        return name, tuple((k, (v or "").strip().upper()) for k, v in params.items() if k != "OP")
+
+    def _load_later(self, line: str, kept: tuple, amp: tuple) -> Optional[Tuple[str, tuple, tuple]]:
+        """A load line of the current step as it is in later steps: (line, card parameters,
+        amplitude: _load_amp).  On no amplitude or a TIME=TOTAL TIME one as given; on a
+        step-time amplitude at its value at the end of the step, plain: Abaqus and ccx 2.23
+        hold it there, and ccx starts it over where it is given again on the amplitude, while
+        given plain it stays constant, after *CLOAD / *DLOAD, OP=NEW too (probed).  None where
+        the converter cannot evaluate that value (a VALUE=ABSOLUTE or USER amplitude, an
+        unknown step period)."""
+        name = amp[0]
+        if not name or name in self._total_amps:
+            return line, kept, amp
+        curve, period = self._amp_curves.get(name), self._step_period
+        if curve is None or curve.absolute or period is None:
+            return None
+        f = [x.strip() for x in line.split(",")]
+        try:
+            factor = curve.value(period - pf(dict(kept).get("TIME DELAY") or "0"))
+            if factor != 1.0 and len(f) > 2 and f[2]:
+                f[2] = short_real(pf(f[2]) * factor, 12)
+        except ValueError:
+            return None
+        return ", ".join(f), tuple((k, v) for k, v in kept if k not in ("AMPLITUDE", "TIME DELAY")), ("", ())
+
     def _track_dloads(self, origin: str, b: Block, lines: List[Tuple[tuple, str, str]],
-                      params: "OrderedDict[str, Optional[str]]") -> None:
+                      params: "OrderedDict[str, Optional[str]]") -> set:
         """Record the *DLOAD lines emitted for a *DLOAD / *DSLOAD card (``origin``; ``params``:
-        the ccx card's), in Abaqus semantics: a zero magnitude removes the load."""
+        the ccx card's), in Abaqus semantics: a zero magnitude removes the load.  Returns the
+        lines left out: those on element faces that an earlier card of the step loads on
+        another amplitude, which ccx 2.23 stops on ('*ERROR in loadadd'; probed, also for two
+        cards with the same AMPLITUDE and TIME DELAY: _merge_delay_cards), Abaqus adds."""
         state = self._dl_state.setdefault(origin, OrderedDict())
         kept = tuple((k, v) for k, v in params.items() if k != "OP")
         case = ((params.get("LOAD CASE") or "1").strip(), (params.get("SECTOR") or "").strip())
-        # what ccx compares where one step gives a face two loads (loadadd): their amplitude,
-        # a copy of its own on each card with TIME DELAY (dloads.f).  In a later step a load
-        # on a step-time amplitude holds its end value, and starts that amplitude over where
-        # it is given again (probed): None, it cannot be given again (_dl_overlaps)
-        name = (params.get("AMPLITUDE") or "").strip().upper()
-        amp = (name, id(b) if "TIME DELAY" in params else 0)
-        later = amp if not name or name in self._total_amps else None
+        amp = self._load_amp(params)
+        drop: set = set()
         for key, line, mag in lines:
             what = (key[-2], key[-1], case)          # (element or set, label, load case)
+            faces = self._dl_faces(what)
             self._dl_fresh.add((origin, key))
-            self._dl_given.append((what, amp))
+            if any(self._dl_taken.get(f, amp) != amp for f in faces):
+                drop.add(line)
+                state.pop(key, None)
+                continue
+            for f in faces:
+                self._dl_taken[f] = amp
             try:
                 zero = bool(mag) and pf(mag) == 0.0
             except ValueError:
@@ -11643,7 +11731,19 @@ class Converter:
             if zero:
                 state.pop(key, None)
             else:
-                state[key] = (line, kept, what, later)
+                state[key] = (line, kept, what, self._load_later(line, kept, amp))
+        return drop
+
+    def _dload_clash(self, lines: List[str]) -> List[str]:
+        """The *DLOAD lines _track_dloads left out, commented out (warned, reduced physics)."""
+        return self._comment_out(
+            f"*DLOAD / *DSLOAD line(s) in step {self._step_idx} on element faces that an earlier "
+            f"distributed-load card of the step loads on another amplitude: Abaqus adds the two, "
+            f"ccx 2.23 stops on two amplitudes on one face in one step ('*ERROR in loadadd', "
+            f"probed). Left out, also for the steps after it — verify.", lines,
+            "distributed load on faces another card of the step loads with another amplitude",
+            "line(s) left out: an earlier card of the step loads these faces on another amplitude "
+            "(ccx 2.23 stops on that)")
 
     def _dl_faces(self, what: tuple) -> frozenset:
         """What ccx 2.23 keys the loads of a *DLOAD line by (``what``: its element or set, label
@@ -11671,56 +11771,37 @@ class Converter:
         self._dl_memo[what] = got
         return got
 
-    def _dl_overlaps(self) -> List[Tuple[str, tuple]]:
-        """The (card, key) of the distributed loads of earlier steps (_dl_state) that this
-        step's lines take off element faces in ccx: Abaqus adds the loads of two sources on a
-        face (another surface or element set, *DLOAD and *DSLOAD), ccx 2.23 keeps one value
-        per face, which a later step's line replaces, while the lines of one step add up
-        (loadadd; probed: a pressure of 1 on a top face, then 2 on the same faces from
-        another surface, gave 2 where Abaqus gives 3).  Such a load is given again in the
-        step; that gives its other faces again too, so the loads on those follow.  Not one on
-        another amplitude than a line of the step on the same face, which ccx stops on in one
-        step ('*ERROR in loadadd'), nor one on a step-time amplitude, which would start over
-        (_track_dloads): it is lost there (warned).  None in a static perturbation step after
-        another step (``_sp_adds``): its lines get the base state's value on their faces added
-        (_restore_base_states)."""
-        if not self._dl_given or self._sp_adds:
-            return []
-        taken: Dict[tuple, set] = {}                # face -> the amplitudes the step gives it
-        for what, amp in self._dl_given:
-            for f in self._dl_faces(what):
-                taken.setdefault(f, set()).add(amp)
-        left = [(o, k, line, what, amp) for o, st in self._dl_state.items()
-                for k, (line, _, what, amp) in st.items() if (o, k) not in self._dl_fresh]
-        again, lost = set(), []
+    @staticmethod
+    def _loads_again(left: List[Tuple[object, frozenset, Optional[tuple]]], taken: Dict[tuple, tuple],
+                     every: bool) -> Tuple[List[object], List[object]]:
+        """Which loads of earlier steps (``left``: (item, the faces or node DOFs it loads, its
+        line in this step: _load_later), in order) the step gives again, and which are lost.
+        ccx 2.23 keeps one value per face / node DOF, which a step's first line there replaces
+        and its next lines add to (loadadd, forcadd), so a load that Abaqus keeps on what the
+        step loads (``taken``: face or node DOF -> the amplitude of the step's lines; those
+        given again join it) is given again, which loads its other faces again too: the
+        loads on those follow; ``every`` load after a ccx OP=NEW, which removed them all.  Not
+        one on another amplitude than the step's lines there, which ccx stops on ('*ERROR in
+        loadadd / forcadd'; probed), nor one whose value the converter does not know (None):
+        lost."""
+        again, lost = set(), set()
         grew = True
         while grew:
             grew = False
-            for item in list(left):
-                o, k, line, what, amp = item
-                faces = self._dl_faces(what)
+            for i, (_, faces, later) in enumerate(left):
+                if i in again or i in lost:
+                    continue
                 hit = taken.keys() & faces
-                if not hit:
+                if not hit and not every:
                     continue
-                left.remove(item)
-                if amp is None or any(a != amp for f in hit for a in taken[f]):
-                    lost.append(line)
+                if later is None or any(taken[f] != later[2] for f in hit):
+                    lost.add(i)
                     continue
-                again.add((o, k))
+                again.add(i)
                 for f in faces:
-                    taken.setdefault(f, set()).add(amp)
+                    taken.setdefault(f, later[2])
                 grew = True
-        if lost:
-            self.report.warn(f"Step {self._step_idx} loads element faces that a distributed load of "
-                             f"an earlier step still loads, on another amplitude or a step-time one "
-                             f"({'; '.join(lost[:3])}{'; ...' if len(lost) > 3 else ''}): Abaqus adds "
-                             f"the two, ccx 2.23 keeps one value per face, which the later step's line "
-                             f"replaces; given again in the step, the earlier load would stop ccx (two "
-                             f"amplitudes on one face) or start its step-time amplitude over, so it is "
-                             f"lost on those faces. Verify.")
-            self._reduces("distributed load of an earlier step replaced where a later step loads "
-                          "its faces (amplitudes)")
-        return [(o, k) for o, st in self._dl_state.items() for k in st if (o, k) in again]
+        return [left[i][0] for i in sorted(again)], [left[i][0] for i in sorted(lost)]
 
     def _dload_op_new(self, origin: str, wipes: bool = True) -> None:
         """OP=NEW on a *DLOAD / *DSLOAD: Abaqus removes that card's loads of earlier steps.  An
@@ -11755,16 +11836,58 @@ class Converter:
                                  "written before that card.", once=True)
             return
 
+    def _lost_loads(self, what: str, lost: List[Tuple[str, Optional[tuple]]], wiped: bool) -> None:
+        """Warn of the loads of earlier steps that _loads_again could not give again (``lost``:
+        (line, its line in this step)): ``what`` the step's lines load, ``wiped``: after a
+        ccx *DLOAD, OP=NEW."""
+        lines = [ln for ln, _ in lost]
+        why = []
+        if any(later is not None for _, later in lost):
+            why.append(f"another amplitude than the step's lines on those {what} (ccx stops on two "
+                       f"amplitudes on one in one step)")
+        if any(later is None for _, later in lost):
+            why.append("a step-time amplitude whose end value the converter cannot evaluate (given "
+                       "again on it, ccx starts it over)")
+        listed = "; ".join(lines[:3]) + ("; ..." if len(lines) > 3 else "")
+        if wiped:
+            self.report.warn(f"Step {self._step_idx}'s *DLOAD, OP=NEW removes every earlier distributed "
+                             f"load in ccx 2.23, Abaqus only the same card's: the other card's ({listed}) "
+                             f"cannot be given again after it, on {' or '.join(why)}, so they are lost "
+                             f"from this step on. Verify.")
+            self._reduces("distributed load of an earlier step lost after another card's OP=NEW "
+                          "(amplitudes)")
+            return
+        nodal = what == "node DOFs"
+        load = "concentrated load" if nodal else "distributed load"
+        self.report.warn(f"Step {self._step_idx} loads {what if nodal else 'element faces'} that a "
+                         f"{load} of an earlier step still loads ({listed}): Abaqus adds the two, ccx "
+                         f"2.23 keeps one value per {'node and DOF' if nodal else 'face'}, which the "
+                         f"later step's line replaces, and the earlier load cannot be given again in "
+                         f"the step, on {' or '.join(why)}, so it is lost on those {what}. Verify.")
+        self._reduces(f"{load} of an earlier step replaced where a later step loads its "
+                      f"{what if nodal else 'faces'} (amplitudes)")
+
     def _flush_dloads(self) -> List[str]:
         """The distributed loads of earlier steps that Abaqus keeps and ccx would not, given
-        again at the end of the step: after a ccx *DLOAD, OP=NEW in it all but those
-        redefined here (the other card's), else those on element faces the step loads
-        (_dl_overlaps)."""
-        again = [(o, k) for o, st in self._dl_state.items() for k in st
-                 if (o, k) not in self._dl_fresh] if self._dl_wiped else self._dl_overlaps()
+        again at the end of the step (_loads_again): after a ccx *DLOAD, OP=NEW in it all but
+        those redefined here (the other card's), else those on element faces the step loads —
+        Abaqus adds the loads of two sources on a face (another surface or element set, *DLOAD
+        and *DSLOAD), ccx 2.23 keeps one value per face, which a later step's line replaces
+        (probed: a pressure of 1 on a top face, then 2 on the same faces from another surface,
+        gave 2 where Abaqus gives 3).  None of those in a static perturbation step after
+        another step (``_sp_adds``): its lines get the base state's value on their faces added
+        (_restore_base_states)."""
+        if not self._dl_wiped and (not self._dl_taken or self._sp_adds):
+            return []
+        left = [((o, k), self._dl_faces(what), later) for o, st in self._dl_state.items()
+                for k, (_, _, what, later) in st.items() if (o, k) not in self._dl_fresh]
+        again, lost = self._loads_again(left, self._dl_taken, self._dl_wiped)
+        if lost:
+            self._lost_loads("faces", [(self._dl_state[o][k][0], self._dl_state[o][k][3])
+                                               for o, k in lost], self._dl_wiped)
         groups: "OrderedDict[tuple, List[str]]" = OrderedDict()
         for o, k in again:
-            line, params = self._dl_state[o][k][:2]
+            line, params, _ = self._dl_state[o][k][3]
             groups.setdefault(params, []).append(line)
         out: List[str] = []
         if groups and self._dl_wiped:
@@ -11784,7 +11907,145 @@ class Converter:
         for params, data in groups.items():
             out.append(emit_keyword("DLOAD", OrderedDict(params)))
             out.extend(self._surfaces_last(data))
+        self._held_again(self._dl_state[o][k][1] != self._dl_state[o][k][3][1] for o, k in again)
         return out
+
+    def _held_again(self, flags: Iterator[bool]) -> None:
+        """Note a load on a step-time amplitude given again at the value it ended with (_load_later)."""
+        if any(flags):
+            self.report.note("A load of an earlier step on a step-time amplitude, given again in a "
+                             "later step (see above), is written at the value it ended with and no "
+                             "amplitude: Abaqus and ccx 2.23 hold it there, while given again on "
+                             "the amplitude ccx would start it over (probed).", once=True)
+
+    def _track_cloads(self, out: List[str], marks: List[Tuple[int, List[str]]],
+                      params: "OrderedDict[str, Optional[str]]") -> set:
+        """Record the lines of a deck *CLOAD card (``out``: as emitted; ``marks``: where each
+        data line's emitted lines start, and its fields; ``params``: the ccx card's) per
+        source: Abaqus tells concentrated loads apart by the node or node set as written and
+        the DOF, so a later step's line on the same source replaces its loads, while one on
+        a node of another source adds to them ("the loads will be added", Abaqus 2017, loads;
+        _flush_cloads); a zero magnitude removes the load.  Returns the indices in ``out`` of
+        the lines left out: those on node DOFs that an earlier card of the step loads on
+        another amplitude, which ccx 2.23 stops on ('*ERROR in forcadd'; probed, also for two
+        cards with the same AMPLITUDE and TIME DELAY: _merge_delay_cards), Abaqus adds."""
+        kept = tuple((k, v) for k, v in params.items() if k != "OP")
+        case = ((params.get("LOAD CASE") or "1").strip(), (params.get("SECTOR") or "").strip())
+        amp = self._load_amp(params)
+        drop: set = set()
+        for j, (at, f) in enumerate(marks):
+            if len(f) < 2 or not f[0] or not re.fullmatch(r"[-+]?\d+", f[1]):
+                continue
+            token = str(int(f[0])) if re.fullmatch(r"[-+]?\d+", f[0]) else f[0].upper()
+            key = (token, int(f[1]), case)
+            if key not in self._cl_fresh:              # (a later step's line replaces them)
+                self._cl_fresh.add(key)
+                self._cl_state.pop(key, None)
+            for i in range(at, marks[j + 1][0] if j + 1 < len(marks) else len(out)):
+                g = [x.strip() for x in out[i].split(",")]
+                if len(g) < 2 or not re.fullmatch(r"[-+]?\d+", g[1]):
+                    continue
+                nodes = self._resolve_nodes(g[0])
+                nds = frozenset((n, int(g[1]), case) for n in nodes) if nodes else \
+                    frozenset({(g[0].upper(), int(g[1]), case)})
+                if any(self._cl_taken.get(nd, amp) != amp for nd in nds):
+                    drop.add(i)
+                    continue
+                for nd in nds:
+                    self._cl_taken[nd] = amp
+                try:
+                    zero = len(g) < 3 or not g[2] or pf(g[2]) == 0.0
+                except ValueError:
+                    zero = False
+                if not zero:
+                    self._cl_state.setdefault(key, []).append(
+                        (out[i], kept, nds, self._load_later(out[i], kept, amp)))
+        return drop
+
+    def _flush_cloads(self) -> List[str]:
+        """The deck's concentrated loads of earlier steps on node DOFs the step's *CLOAD lines
+        load, from another source (a node set or node number), given again at the end of the
+        step (_loads_again): Abaqus adds them up, ccx 2.23 keeps one value per node and DOF,
+        which a later step's line replaces (probed: 1 on a node set, then 2 on one of its
+        nodes gave that node 2, Abaqus 3).  None in a static perturbation step after another
+        step (``_sp_adds``): its lines get the base state's value added (_restore_base_states).
+        The converted loads' nodal forces share no node DOF with them (_nodal_load_clash)."""
+        if not self._cl_taken or self._sp_adds:
+            return []
+        left = [((k, i), nds, later) for k, entries in self._cl_state.items() if k not in self._cl_fresh
+                for i, (_, _, nds, later) in enumerate(entries)]
+        again, lost = self._loads_again(left, self._cl_taken, False)
+        if lost:
+            self._lost_loads("node DOFs", [(self._cl_state[k][i][0], self._cl_state[k][i][3])
+                                           for k, i in lost], False)
+        if not again:
+            return []
+        groups: "OrderedDict[tuple, List[str]]" = OrderedDict()
+        for k, i in again:
+            line, params, _ = self._cl_state[k][i][3]
+            groups.setdefault(params, []).append(line)
+        self.report.note("*CLOAD on node DOFs that a concentrated load of an earlier step (another "
+                         "node set or node number) still loads: Abaqus adds the two, ccx 2.23 keeps "
+                         "one value per node and DOF, which a later step's line replaces (the lines "
+                         "of one step add up; probed) — the earlier load is given again in that "
+                         "step.", once=True)
+        self._held_again(self._cl_state[k][i][1] != self._cl_state[k][i][3][1] for k, i in again)
+        out = ["** abq2ccx: concentrated loads of earlier steps on node DOFs loaded above, given "
+               "again (Abaqus adds them up; ccx would replace them)"]
+        for params, data in groups.items():
+            out.append(emit_keyword("CLOAD", OrderedDict(params)))
+            out.extend(data)
+        return out
+
+    def _merge_delay_cards(self, out: List[str]) -> None:
+        """ccx 2.23 gives each *CLOAD / *DLOAD card with TIME DELAY a copy of its amplitude of
+        its own (cloads.f, dloads.f), and stops where a step loads a node DOF or face from two
+        of them ('*ERROR in forcadd / loadadd', probed: the same AMPLITUDE and TIME DELAY on two
+        cards), where Abaqus adds the loads.  So the data lines of the step's later cards
+        (``out``: the step) with the same parameters as an earlier one move onto it."""
+        cards: List[Tuple[int, str, tuple, List[int]]] = []     # (line, keyword, params, data lines)
+        for i, raw in enumerate(out):
+            s = raw.strip()
+            if not s or s.startswith("**"):
+                continue
+            if s.startswith("*"):
+                kw, params = parse_keyword_line(s)
+                cards.append((i, kw, self._load_amp(params) if kw in ("CLOAD", "DLOAD") else (), []))
+            elif cards:
+                cards[-1][3].append(i)
+        first: Dict[Tuple[str, tuple], Tuple[int, str, tuple, List[int]]] = {}
+        moved: Dict[int, List[int]] = {}            # a card's header -> the lines moved onto it
+        for card in cards:
+            i, kw, amp, data = card
+            if not amp or not amp[1]:
+                continue
+            if (kw, amp) not in first:
+                first[(kw, amp)] = card
+                continue
+            moved.setdefault(first[(kw, amp)][0], []).extend(data)
+            moved[i] = []                           # (its header goes)
+        if not any(moved.values()):
+            return
+        gone = {j for i, more in moved.items() for j in ([i] if not more else []) + more}
+        at = {}                                     # the first card's last line -> its data
+        for i, more in moved.items():
+            if more:
+                card = next(c for c in cards if c[0] == i)
+                lines = [out[j] for j in card[3] + more]
+                at[card[3][-1] if card[3] else i] = (card[3], self._surfaces_last(lines)
+                                                     if card[1] == "DLOAD" else lines)
+                gone.update(card[3])
+        res: List[str] = []
+        for j, raw in enumerate(out):
+            if j not in gone:
+                res.append(raw)
+            if j in at:
+                res.extend(at[j][1])
+        out[:] = res
+        self.report.note("*CLOAD / *DLOAD cards of a step with the same AMPLITUDE and TIME DELAY "
+                         "merged into one: ccx 2.23 gives each such card a copy of the amplitude of "
+                         "its own and stops where one face or node DOF is loaded from two of them "
+                         "(probed).", once=True)
 
     def handle_output(self, b: Block) -> List[str]:
         """An output card -> the ccx cards _plan_output chose for it (the notes on its
@@ -16137,13 +16398,15 @@ class Converter:
         """Facts about the whole deck that planners and handlers read: whether a step runs
         explicit dynamics, whether one is not heat transfer alone (a deck without steps
         counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
-        the *TIE names, the linear perturbation steps, which steps run NLGEOM and the TIME=TOTAL
-        TIME amplitudes.  No planner adds or replaces such cards (_split_coupling_refs adds its
+        the *TIE names, the linear perturbation steps, which steps run NLGEOM, the TIME=TOTAL
+        TIME amplitudes and the amplitudes' curves.  No planner adds or replaces such cards (_split_coupling_refs adds its
         copies' ids)."""
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
         self._pert_idx = self._perturbation_steps(blocks)
         self._total_amps = {b.uparam("NAME") for b in blocks if b.keyword == "AMPLITUDE" and
                             (b.param("TIME") or "").upper().replace(" ", "") == "TOTALTIME"}
+        self._amp_curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
+                            if b.keyword == "AMPLITUDE" and b.param("NAME")}
         on = self._nlgeom_steps(blocks)
         steps: List[bool] = []                   # per step: it runs NLGEOM
         for s, group in enumerate(step_groups(blocks)[1], 1):

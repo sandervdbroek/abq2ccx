@@ -4704,6 +4704,57 @@ def main():
             f"{v:+.6e} (expected {r:+.6e})" for v, r in zip(ux, ref) if r is not None))
         failures += 0 if ok else 1
 
+    # --- concentrated and distributed loads of other sources, amplitudes ---------------------
+    # Abaqus adds a node's *CLOAD through one node set to one through another set or its
+    # number in a later step; ccx 2.23 keeps one value per node DOF, which the later line
+    # replaces, so the earlier line is given again.  A load on a step-time amplitude holds its
+    # end value in later steps: given again at that value, plain (also after a ccx *DLOAD,
+    # OP=NEW, which the other card's loads come back after); two cards of one step with the
+    # same AMPLITUDE and TIME DELAY become one (ccx stops on two copies of one amplitude).
+    # The bar above (nu = 0): an axial force F on each tip node gives tip ux = 12 F / E, a tip
+    # pressure p -3 p / E.  Converted before: 2.4e-2, 1.2e-2, 2.4e-2 for 3.6e-2 (the later
+    # line alone), and ccx stopped on two amplitudes on one face ('*ERROR in loadadd') in the
+    # last two.
+    tips ="*Nset, nset=TIPF\n13, 14, 15, 16\n*Nset, nset=TIPG\n13, 14, 15, 16\n*Surface, name=TIPA\n" \
+           "3, S4\n*Surface, name=TIPB\n3, S4\n*Amplitude, name=R\n0., 0., 1., 2.\n"
+    tip_f = lambda f: 12.0 * f / 1000.0
+    tip_p = lambda p: -3.0 * p / 1000.0
+    by_number = "".join(f"{n}, 1, 2.\n" for n in (13, 14, 15, 16))
+    delayed = "*{}, amplitude=A, time delay=0.\n{}\n"
+    for how, deck, ref in (
+            ("a node set, then its nodes by number", step.format("", "*Cload\nTIPF, 1, 1.\n") +
+             step.format("", "*Cload\n" + by_number), [tip_f(1.0), tip_f(3.0)]),
+            ("a step-time amplitude, then another node set", step.format("", "*Cload, amplitude=R\n"
+             "TIPF, 1, 1.\n") + step.format("", "*Cload\nTIPG, 1, 1.\n"), [tip_f(2.0), tip_f(3.0)]),
+            ("nodes by number after a frequency step", step.format("", "*Cload\nTIPF, 1, 1.\n") +
+             "*Step\n*Frequency\n2\n*End Step\n" + step.format("", "*Cload\n" + by_number),
+             [tip_f(1.0), None, None, tip_f(3.0)]),
+            ("a step-time pressure, then another surface, then OP=NEW", step.format("", "*Dload, "
+             "amplitude=R\n3, P4, 1.\n") + step.format("", "*Dsload\nTIPA, P, 0.5\n") +
+             step.format("", "*Dsload, op=NEW\nTIPB, P, 1.\n"), [tip_p(2.0), tip_p(2.5), tip_p(3.0)]),
+            ("one step's cards with the same amplitude and time delay", step.format("", "".join(
+                delayed.format(*c) for c in (("Dload", "3, P4, 1."), ("Dsload", "TIPA, P, 2."),
+                                             ("Cload", "TIPF, 1, 1."), ("Cload", "TIPG, 1, 1.")))),
+             [tip_p(3.0) + tip_f(2.0)])):
+        src = os.path.join(tmp, "load_overlap_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(bar + tips + deck)
+        inp = os.path.join(tmp, "load_overlap.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        ux = [u[0] for u in dat_displacement_history(os.path.join(d, "job.dat"), 16)] \
+            if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if len(ux) != len(ref):
+            print(f"FAIL  load_overlap ({how}): no tip displacement in each step ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l))
+            failures += 1
+            continue
+        ok = all(abs(v - r) <= 1e-5 * abs(r) for v, r in zip(ux, ref) if r is not None)
+        print(f"{'PASS' if ok else 'FAIL'}  load_overlap ({how}): tip ux " + ", ".join(
+            f"{v:+.6e} (expected {r:+.6e})" for v, r in zip(ux, ref) if r is not None))
+        failures += 0 if ok else 1
+
     # --- isotropic *Elastic beside an orthotropic / anisotropic *Expansion -----------------
     # ccx 2.23 uses a wrong stiffness for this combination in linear steps once the deck has
     # temperatures (a free heated cube shrinks), so the converter writes such *Elastic cards
