@@ -4517,7 +4517,7 @@ class Step:
                                   # the motion fields, the output carry-over, step_load_audit's Abaqus reading
     nlgeom_card: Optional[bool]   # NLGEOM= on its *STEP card (_nlgeom_given)
     # NLGEOM, by several rules (also base_nlgeom, nlgeom_motion and the deck's nl_heads):
-    nlgeom_on: bool               # it switches NLGEOM on (_plan_deck_facts' _nl_steps): not a
+    nlgeom_on: bool               # it switches NLGEOM on (the Converter's _nl_steps): not a
                                   # perturbation step and NLGEOM on one of its *STEP cards, or a
                                   # *DYNAMIC, EXPLICIT card in it
     nlgeom: bool                  # in force while it runs: on once a step not in _pert_idx has NLGEOM,
@@ -4567,12 +4567,21 @@ class Step:
 
 
 class StepModel:
-    """The deck's steps, read from its cards (Converter._plan_deck_facts, before the
-    planners; again where _plan_free_ref_nodes rewrites *BOUNDARY / *CLOAD cards, which
-    ``lc2`` names by id): ``model``, the cards before the first *STEP;
+    """The deck's steps, read from its cards: ``model``, the cards before the first *STEP;
     ``steps``, as emit_other writes them (deck_parts: an unterminated *STEP runs on to the
-    next *END STEP); ``after``, the cards after the last step.  (Later planners add model data
-    the model does not hold: *TRANSFORM copies, material and section twins.)"""
+    next *END STEP); ``after``, the cards after the last step.
+
+    The rule: a fact is read from cards only after the last planner that rewrites those
+    cards.  Converter._read_steps reads the model right after _plan_free_ref_nodes, the last
+    planner that replaces or edits a card inside a step; after it no planner or handler
+    replaces, inserts, removes or edits a step card (it records a plan applied at emission
+    instead: _vel_cards, _bc_lines, _op_new_drop), so the model's cards, ids (``lc2``,
+    ``op_new``, ``card_step``, ``nl_heads``) and Step fields hold for every later reader.
+    _plan_deck_facts reads an early model for the planners before that point.  They read only
+    its deck aggregates (``procs``, ``inertia``, ``mass_loads``, ``mass_acts``, ``nl_heads``,
+    ``explicit_without_nlgeom``, ``pert`` and the Converter views of it: _pert_idx, _nl_steps,
+    _mechanical, ...), which no rewrite changes (test_step_model_is_current).  Model data may
+    still change after it (*RIGID BODY parameters; the section cards a handler writes)."""
 
     # the procedures of a general step (Step.general)
     GENERAL_PROCS = ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
@@ -4771,7 +4780,7 @@ class StepModel:
         self.op_new: Dict[str, frozenset] = {
             k: frozenset(id(b) for b in blocks if b.keyword == k and id(b) in acts)
             for k in LOAD_CARD_FIELD}
-        # deck-wide (_plan_deck_facts)
+        # deck-wide (the Converter's views: _nl_steps, _nl_any, ...)
         self.nl_steps = tuple(s.nlgeom_on for s in steps)
         general = [s.nlgeom_on for s in steps if not s.perturbation]
         self.nl_any = any(self.nl_steps)
@@ -4885,9 +4894,10 @@ class StepModel:
         force.  One dict per step, at its *END STEP (an unterminated last step's: at the deck's
         end); a deck without steps yields the model data's.  Later cards may update a yielded
         dict: copy what is kept.  ``blocks``: the deck as it is now, whose cards are folded
-        (None: the model's own); planners after _plan_deck_facts replace and add cards
-        (_plan_free_ref_nodes rewrites *BOUNDARY and *CLOAD cards, in steps too), so the
-        converter's walkers pass theirs; none adds or removes a *STEP or *END STEP.  Where the
+        (None: the model's own).  The converter's model is read after the last planner that
+        rewrites a step card (Converter._read_steps), and no later one replaces, inserts or
+        removes a card, so for its walkers, which run after that point and pass their deck,
+        the two are the same cards; none adds or removes a *STEP or *END STEP.  Where the
         walkers' rules differ today (DESIGN 1b) a parameter names each:
 
         * ``restore``: the steps (1-based) after which the next one starts from what the last
@@ -5476,11 +5486,12 @@ class WrittenStep:
 
 
 class EmitState:
-    """What the emission has written so far (Converter.emit, made again by _prescan): the
-    step being written, the *STEP cards written, the converted loads and what ccx holds of
-    them, the output control in force, and the card before.  The deck's own facts are the
+    """What the emission has written so far (Converter.emit, made again by _reset_emission):
+    the step being written, the *STEP cards written, the converted loads and what ccx holds
+    of them, the output control in force, and the card before.  The deck's own facts are the
     StepModel's; these follow from the cards the handlers wrote, in the order they wrote
-    them."""
+    them.  A record changes only through its methods: a post-pass that rewrites a *STEP line
+    calls rewrite_step."""
 
     def __init__(self) -> None:
         # the step cursor: the step being written (after its *END STEP, until the next *STEP:
@@ -5543,13 +5554,18 @@ class EmitState:
     def write_step(self, params: "OrderedDict[str, Optional[str]]") -> str:
         """The current step's *STEP card with ``params``, recorded as written.  NLGEOM stays on
         for all later steps once a general step has switched it on (Abaqus; a linear
-        perturbation step has no effect on the later ones: _plan_deck_facts)."""
+        perturbation step has no effect on the later ones: Converter._nl_steps)."""
         nl = params.get("NLGEOM", "")
         self.nlgeom = self.nlgeom or (not self.step.perturbation and "NLGEOM" in params and
                                       (nl or "YES").strip().upper() != "NO")
         self.star_lines += 1
         self.written[self.no] = WrittenStep(self.no, self.star_lines, OrderedDict(params))
         return emit_keyword("STEP", params)
+
+    def rewrite_step(self, no: int, params: "OrderedDict[str, Optional[str]]") -> None:
+        """A post-pass writes step ``no``'s *STEP card again with ``params`` (_buckle_displacements
+        drops PERTURBATION): its record follows, as written."""
+        self.written[no].params = OrderedDict(params)
 
     def begin_step(self, restore: bool, held: bool) -> None:
         """The current step's cards come next (handle_step, after its *STEP card; not in a step
@@ -6317,16 +6333,13 @@ class Converter:
         self._n_inactive_rot_truss = 0
         self._depvar_counts: set = set()
         self._fields_set = False
-        self.steps: Optional[StepModel] = None     # the deck's steps (_plan_deck_facts)
-        self._n_steps = 0
+        self.steps: Optional[StepModel] = None     # the deck's steps (_plan_deck_facts, _read_steps)
         self.emit = EmitState()                     # what the emission has written so far
         self._synth_counter = 0
         self._has_sensitivity = False
-        self._freq_read: set = set()                # *FREQUENCY steps a later step reads modes of
         self._initial_stresses = False
         self._freq_contact = False                  # contact (plain *FREQUENCY / *BUCKLE drop it)
         self._overclosed = False                    # one of them starts overclosed
-        self._deck_procs: set = set()               # the deck's procedures (_plan_base_state_facts)
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
         # the step being emitted: a general step before it, NLGEOM in its base state (handle_step:
@@ -6410,8 +6423,9 @@ class Converter:
         self._qmem_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}   # membrane node -> *TRANSFORM axes
         self._mem_thick: Dict[int, float] = {}     # membrane element -> its largest thickness
         self._mem_surfaces: Dict[tuple, str] = {}  # element surface on membranes -> node surface
-        self._kinematic_ids: set = set()           # id(*COUPLING) followed by *KINEMATIC
-        self._distributing_ids: set = set()        # ... by *DISTRIBUTING
+        # id(*COUPLING) followed by *KINEMATIC, ... by *DISTRIBUTING (_split_coupling_refs)
+        self._kinematic_ids: set = set()
+        self._distributing_ids: set = set()
         self._dist_plans: Dict[int, dict] = {}     # ... written as *EQUATIONs (_plan_distributing)
         self._dcoup: Dict[int, List[dict]] = {}    # legacy *DISTRIBUTING COUPLING -> its plans
         self._dist_weighted: set = set()           # node surfaces only those take the weights of
@@ -6421,7 +6435,6 @@ class Converter:
         self._ref_set_kept: Dict[int, str] = {}    # id(*COUPLING) on several ref nodes -> why one
         self._nearest_facet: set = set()           # ... whose INFLUENCE RADIUS reaches no facet
         self._mem_thinning: Dict[str, Optional[float]] = {}  # membrane material -> its thinning ratio
-        self._explicit_deck = False                # a *DYNAMIC, EXPLICIT step
         self._tie_names: set = set()               # the deck's *TIE names (handle_tie adds cards)
         self._qmem_hidden: Optional[str] = None     # node set of their nodes, for output
         self._qmem_dists: set = set()              # thickness distributions taken into them
@@ -6501,8 +6514,6 @@ class Converter:
         self._mpc_bodies: Dict[int, List[dict]] = {}
         # (id(card), line) -> [(why, node pair)] for the line's pairs that are commented out
         self._mpc_refused: Dict[Tuple[int, int], List[Tuple[str, Tuple[int, int]]]] = {}
-        self._mpc_thermal = False                  # a step solves for temperatures
-        self._mechanical = True                    # a step is not heat transfer alone
         # node with a *TRANSFORM -> its twin: a new node without one that follows it (u_twin =
         # u_node), through which a constraint uses the node's global displacement (_dir_terms);
         # the twins whose equations are written
@@ -6523,7 +6534,6 @@ class Converter:
         self._out_ctl: Dict[int, Tuple[str, str]] = {}  # step -> output control (FREQUENCY= ...)
         self._out_contact = {"abaqus": False, "pairs": 0, "nts": False, "flat": False, "axi": False}
         self._courant: Optional[Tuple[float, int]] = None   # (min h f / c, element), _courant_min
-        self._amp_span: Optional[Tuple[float, float]] = None    # (StepModel.amp_span)
         self._si_missing_behavior: set = set()        # (_plan_surface_behavior)
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
@@ -6568,9 +6578,8 @@ class Converter:
         self._total_amps: set = set()               # the TIME=TOTAL TIME amplitudes' names
         self._amp_curves: Dict[str, Optional[AmplitudeCurve]] = {}   # name -> its curve
         self._step_period: Optional[float] = 1.0    # the current step's (None: not known)
-        # Abaqus' linear perturbation steps (1-based), and the general steps after them that
-        # start from the base state again (_plan_base_restore, _restore_base_states)
-        self._pert_idx: set = set()
+        # the general steps after Abaqus' linear perturbation steps (_pert_idx) that start from
+        # the base state again (_plan_base_restore, _restore_base_states)
         self._restore_from: Dict[int, int] = {}     # step -> the last general step before it
         self._restore_new: set = set()              # ... whose *BOUNDARY part needs OP=NEW
         self._restore_pairs: Dict[int, set] = {}    # ... -> the base state's (node, DOF) BCs
@@ -6623,12 +6632,10 @@ class Converter:
         self._conn_bc_dofs: set = set()            # (node, DOF) with a BC in any step
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
         self._conn_rot: set = set()                # rotation nodes made for connector rotations
-        self._nl_any = self._nl_all = False        # a step / every step runs NLGEOM (_plan_deck_facts)
-        self._nl_steps: List[bool] = []            # per step: it runs NLGEOM (_plan_deck_facts)
         # no NLGEOM, a step ccx runs through its nonlinear solver (``_solver_why``: the first
         # one, in words): rigid constraints become linear *EQUATIONs (_plan_solver_facts,
         # _rigid_body_lines); such a step before an NLGEOM one
-        self._linear_rigid = self._dyn_before_nl = self._dynamic_deck = False
+        self._linear_rigid = self._dyn_before_nl = False
         self._solver_why = ""
         self._solver_steps: List[str] = []         # per step: that why, or "" (_plan_solver_facts)
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
@@ -6696,6 +6703,77 @@ class Converter:
         if self.opt.solid_dof:
             return False
         return any(t in SHELL_TYPES or t in BEAM_TYPES for t in self._elem_types)
+
+    # the step model's deck-wide facts, read-only, by the names the planners and handlers read
+    # them: ``self.steps``' (before _read_steps the early model's, whose aggregates are the
+    # same), or before _plan_deck_facts a deck's without steps (a handler run on its own)
+    @property
+    def _steps_now(self) -> StepModel:
+        return self.steps if self.steps is not None else StepModel(())
+
+    @property
+    def _pert_idx(self) -> frozenset:
+        """Abaqus' linear perturbation steps (1-based)."""
+        return self._steps_now.pert
+
+    @property
+    def _n_steps(self) -> int:
+        """The deck's *STEP cards."""
+        return self._steps_now.n_star_steps
+
+    @property
+    def _freq_read(self) -> frozenset:
+        """The *FREQUENCY steps a later step reads the modes of."""
+        return self._steps_now.freq_read
+
+    @property
+    def _amp_span(self) -> Optional[Tuple[float, float]]:
+        """The longest step time and the latest total time the steps read amplitudes at."""
+        return self._steps_now.amp_span
+
+    @property
+    def _mpc_thermal(self) -> bool:
+        """A step solves for temperatures."""
+        return self._steps_now.mpc_thermal
+
+    @property
+    def _nl_steps(self) -> List[bool]:
+        """Per step: it switches NLGEOM on.  A linear perturbation step runs linear about the
+        base state, and no effect on the general steps after it, whatever its NLGEOM (Abaqus);
+        its *STATIC is a general one in ccx (handle_step).  The converter runs explicit steps
+        with NLGEOM.  NLGEOM stays on for all later steps once a step has switched it on
+        (Abaqus)."""
+        return list(self._steps_now.nl_steps)
+
+    @property
+    def _nl_any(self) -> bool:
+        """A step runs NLGEOM."""
+        return self._steps_now.nl_any
+
+    @property
+    def _nl_all(self) -> bool:
+        """Every step runs NLGEOM."""
+        return self._steps_now.nl_all
+
+    @property
+    def _dynamic_deck(self) -> bool:
+        """A *DYNAMIC step."""
+        return self._steps_now.dynamic
+
+    @property
+    def _explicit_deck(self) -> bool:
+        """A *DYNAMIC, EXPLICIT step."""
+        return self._steps_now.explicit
+
+    @property
+    def _mechanical(self) -> bool:
+        """A step is not heat transfer alone (a deck without steps counts)."""
+        return self._steps_now.mechanical
+
+    @property
+    def _deck_procs(self) -> frozenset:
+        """The deck's procedures."""
+        return self._steps_now.procs
 
     # ======================================================================
     # Pass A -- build geometry
@@ -18200,7 +18278,8 @@ class Converter:
         reference node then follows the whole surface).  A kinematic one is not split without
         a radius, or where two reference nodes would couple one node — Abaqus/Standard allows
         no node in two kinematic couplings: handle_coupling_card keeps its first reference
-        node (``_ref_set_kept``)."""
+        node (``_ref_set_kept``).  The ids of the returned deck's *COUPLING cards a *KINEMATIC
+        or *DISTRIBUTING follows: ``_kinematic_ids``, ``_distributing_ids``."""
         out: List[Block] = []
         i = 0
         while i < len(blocks):
@@ -18237,15 +18316,19 @@ class Converter:
                     self._nearest_facet -= {id(c) for c in copies}     # (the copies are dropped)
                     out.append(b)
                     continue
-            ids = self._kinematic_ids if nxt.keyword == "KINEMATIC" else self._distributing_ids
             for c in copies:
-                ids.add(id(c))
                 out += [c, Block(nxt.keyword, OrderedDict(nxt.params), list(nxt.data))]
             i += 1                                  # (``nxt`` copied)
             self.report.note(f"*COUPLING REF NODE={ref} names {len(refs)} nodes: one coupling per "
                              f"reference node, as in Abaqus (CONSTRAINT NAME=<name>_<node>), of the "
                              f"surface nodes within its INFLUENCE RADIUS"
                              + ("" if radius else " (none: the whole surface)") + ".", once=True)
+        # the *COUPLING cards a *KINEMATIC / *DISTRIBUTING follows, read from the deck as split:
+        # no later planner adds or replaces such a card
+        self._kinematic_ids = {id(b) for b, c in zip(out, out[1:])
+                               if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
+        self._distributing_ids = {id(b) for b, c in zip(out, out[1:])
+                                  if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
         return out
 
     def handle_coupling_card(self, b: Block) -> List[str]:
@@ -20618,6 +20701,7 @@ class Converter:
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
         self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
+        self._read_steps(blocks)                # after the last planner that rewrites a step card
         self._reset_emission()                  # (handle_step advances the step cursor)
         self._plan_node_classes(blocks)         # after the mesh planners: the final element types
         self._plan_section_thick(blocks)        # before _plan_rot_nodes: its distributing weights
@@ -20822,19 +20906,15 @@ class Converter:
                 self._si_missing_behavior.discard(cur_si)
 
     def _plan_deck_facts(self, blocks: List[Block]) -> None:
-        """Facts about the whole deck that planners and handlers read: whether a step runs
-        explicit dynamics, whether one is not heat transfer alone (a deck without steps
-        counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
-        the *TIE names, the linear perturbation steps, which steps run NLGEOM, the TIME=TOTAL
-        TIME amplitudes and the amplitudes' curves, the *DISTRIBUTION cards by name, and the
-        step model's deck-wide facts.  No planner adds or replaces such cards (_split_coupling_refs
-        adds its copies' ids)."""
+        """Facts about the whole deck that planners and handlers read: the *TIE names, the
+        TIME=TOTAL TIME amplitudes and the amplitudes' curves, the *DISTRIBUTION cards by name,
+        the VALUE=ABSOLUTE amplitudes of magnitude 1, and the early step model, for the
+        planners before _read_steps.  The cards these read are final here: no later planner
+        adds or replaces a *TIE, *AMPLITUDE or *DISTRIBUTION card, or changes an AMPLITUDE=
+        (_sp_amplitudes, before, keeps the same curves for itself).  The early model's step
+        cards are not (the planners up to _plan_free_ref_nodes rewrite some), but its deck
+        aggregates are, and the planners before _read_steps read only those (StepModel)."""
         self.steps = StepModel(blocks)
-        self._pert_idx = self.steps.pert
-        self._n_steps = self.steps.n_star_steps
-        self._freq_read = set(self.steps.freq_read)
-        self._amp_span = self.steps.amp_span
-        self._mpc_thermal = self.steps.mpc_thermal
         # NAME -> its *DISTRIBUTION card ("" for one without a name), as the planners look them
         # up (_plan_distributions leaves the "" one out of _dists)
         self._dist_cards = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
@@ -20842,20 +20922,6 @@ class Converter:
                             b.uparam("TIME").replace(" ", "") == "TOTALTIME"}
         self._amp_curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
                             if b.keyword == "AMPLITUDE" and b.param("NAME")}
-        # per step: it switches NLGEOM on.  A linear perturbation step runs linear about the
-        # base state, and no effect on the general steps after it, whatever its NLGEOM
-        # (Abaqus); its *STATIC is a general one in ccx (handle_step).  The converter runs
-        # explicit steps with NLGEOM.  NLGEOM stays on for all later steps once a step has
-        # switched it on (Abaqus).
-        self._nl_steps = list(self.steps.nl_steps)
-        self._nl_any, self._nl_all = self.steps.nl_any, self.steps.nl_all
-        self._dynamic_deck = self.steps.dynamic
-        self._explicit_deck = self.steps.explicit
-        self._mechanical = self.steps.mechanical
-        self._kinematic_ids = {id(b) for b, c in zip(blocks, blocks[1:])
-                               if b.keyword == "COUPLING" and c.keyword == "KINEMATIC"}
-        self._distributing_ids = {id(b) for b, c in zip(blocks, blocks[1:])
-                                  if b.keyword == "COUPLING" and c.keyword == "DISTRIBUTING"}
         self._tie_names = {b.uparam("NAME") for b in blocks if b.keyword == "TIE"}
         # the VALUE=ABSOLUTE amplitudes only load / BC cards name (AMPLITUDE=), with magnitude 1
         # on every line: ccx's magnitude x amplitude is then the amplitude, as Abaqus applies it
@@ -20879,6 +20945,17 @@ class Converter:
                     absolute.discard((v or "").strip().upper())
             absolute -= {x.upper() for f in recs for x in f}
         self._unit_abs_amps = absolute
+
+    def _read_steps(self, blocks: List[Block]) -> None:
+        """The step model (``self.steps``), read from the deck's cards as final.  The rule: a
+        fact is read from cards only after the last planner that rewrites those cards.
+        _plan_free_ref_nodes is the last planner that replaces or edits a card inside a step
+        (convert calls this right after it, every time); after it no planner or handler
+        replaces, inserts, removes or edits one: a planner that needs a different card records
+        a plan applied at emission instead (_vel_cards, _bc_lines, _op_new_drop).  The early
+        model of _plan_deck_facts serves the planners before this point, which read only its
+        deck aggregates (StepModel); a unit test checks that they are this model's."""
+        self.steps = StepModel(blocks)
 
     def _plan_solver_facts(self, blocks: List[Block]) -> None:
         """Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
@@ -22877,6 +22954,7 @@ class Converter:
             params = OrderedDict((k, v) for k, v in st.head.params.items() if k != "PERTURBATION")
             if same and not self._buckle_preloaded.get(n, True):
                 deck.set_keyword(st.head, params)
+                self.emit.rewrite_step(n, params)
                 self.report.note("*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed "
                                  "displacement loads and no general step precedes (the same "
                                  "unloaded model): ccx 2.23 does not solve a perturbation buckling "
@@ -22885,6 +22963,7 @@ class Converter:
                 continue
             if same and self._approx and n == len(steps):
                 deck.set_keyword(st.head, params)
+                self.emit.rewrite_step(n, params)
                 self.report.warn(f"[APPROX] *BUCKLE step {n} buckles without its preload: a "
                                  f"prescribed displacement loads it after a general step, and ccx "
                                  f"2.23 solves for that only without PERTURBATION (with it only "
@@ -25931,8 +26010,8 @@ class Converter:
                     self._jc_with_rate.add(id(jc_block))
 
     def _plan_base_state_facts(self, blocks: List[Block]) -> None:
-        """The deck's procedures, sensitivity cards, and what a perturbation's base state holds;
-        the contact pairs ccx gets (also warned on shells: _sheet_contact_thickness)."""
+        """The deck's sensitivity cards, and what a perturbation's base state holds; the
+        contact pairs ccx gets (also warned on shells: _sheet_contact_thickness)."""
         self._has_sensitivity = any(b.keyword in ("SENSITIVITY", "FEASIBLE DIRECTION") for b in blocks)
         # what a perturbation step's base state holds (_frequency_perturbation; a first
         # *BUCKLE step: handle_step)
@@ -25952,7 +26031,6 @@ class Converter:
         self._overclosed = bool(lines) and any(b.keyword == "FREQUENCY" for b in blocks) and \
             self._contact_overclosed(blocks, lines)
         self._sheet_contact_thickness(blocks, lines)
-        self._deck_procs = {b.keyword for b in blocks if b.keyword in PROC_KW}
         self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
                                   and temperature_dependent(b) for b in blocks)
         self._expansion = any(b.keyword == "EXPANSION" for b in blocks)
@@ -27515,8 +27593,9 @@ class Converter:
         joins the TIE members: its rotations are the body's in Abaqus.  A node that another
         constraint uses too (*EQUATION, *MPC, a coupling, *TIE, a connector, another rigid
         body's members) keeps its role, with a warning: as a member it would be the
-        dependent of two constraints."""
-        attached = {n for _t, conn in self.geom.elements.values() for n in conn}
+        dependent of two constraints.  The cards it rewrites are new Blocks, in steps too: it
+        is the last planner that rewrites a step card (_read_steps reads the model after it)."""
+        attached ={n for _t, conn in self.geom.elements.values() for n in conn}
         refs: Dict[int, int] = {}                  # id(*RIGID BODY) -> its REF NODE
         own: set = set()
         for b in blocks:
@@ -27620,10 +27699,7 @@ class Converter:
                              if n in stand]
             if data != b.data or params is not b.params:
                 blocks[i] = Block(b.keyword, params, data)
-        # the step model again: these *BOUNDARY / *CLOAD cards are new Blocks (a *BUCKLE step's
-        # LOAD CASE=2 ones are left out by id, StepModel.lc2)
-        self.steps = StepModel(blocks)
-        pairs = ", ".join(f"{x} -> {n}" for x, n in list(stand.items())[:3])
+        pairs =", ".join(f"{x} -> {n}" for x, n in list(stand.items())[:3])
         self.report.note(f"*RIGID BODY reference node(s) that belong to the body's own elements "
                          f"(node -> new reference node: {pairs}{', ...' if len(stand) > 3 else ''}): "
                          f"ccx 2.23 prints the reaction force there as the forces of the node's own "

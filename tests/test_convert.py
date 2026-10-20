@@ -10,6 +10,7 @@ load/section reference resolves) plus a handful of conversion-specific
 expectations.
 """
 
+import dataclasses
 import io
 import math
 import os
@@ -635,6 +636,94 @@ def test_step_model_op_new_cards():
     at = {k: {i for i, b in enumerate(blocks) if id(b) in v} for k, v in m.op_new.items() if v}
     assert at == {"BOUNDARY": {10}, "CLOAD": {4}, "DLOAD": {5}, "DSLOAD": {6}}
     assert m.op_new["BOUNDARY"] == A.op_new_cards(blocks)
+
+
+def _same_cards(a, b):
+    """``a`` and ``b`` are equal, their cards (Blocks) the same objects, at any depth."""
+    if isinstance(a, A.Block) or isinstance(b, A.Block):
+        return a is b
+    if dataclasses.is_dataclass(a) and not isinstance(a, type):
+        return type(a) is type(b) and all(_same_cards(getattr(a, f.name), getattr(b, f.name))
+                                          for f in dataclasses.fields(a))
+    if isinstance(a, (tuple, list)):
+        return type(a) is type(b) and len(a) == len(b) and all(map(_same_cards, a, b))
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_same_cards(a[k], b[k]) for k in a)
+    return a == b
+
+
+def test_step_model_is_current():
+    # the rule (StepModel, _read_steps): a fact is read from cards only after the last planner
+    # that rewrites those cards.  At emission the converter's step model is the one of the
+    # deck emit_other writes, field by field (cards by identity); the early model of
+    # _plan_deck_facts, which the planners before _read_steps read, has its deck aggregates;
+    # the coupling id sets are the deck's.  Checked on decks that every planner rewriting
+    # cards rewrites (H1-H10 of the restructure review), step cards too
+    card_level = {"model", "steps", "after", "card_step", "lc2", "op_new"}
+    planners = ("_split_coupling_refs", "_plan_heatless_materials", "_free_face_surfaces",
+                "_remap_ply_faces", "_plan_quadratic_membranes", "_plan_shell_density",
+                "_transform_new_nodes", "_plan_free_ref_nodes")
+    rewrote, emitted = set(), []
+
+    def cards(blocks):
+        return [(id(b), b.keyword, tuple(b.params.items()), tuple(b.data)) for b in blocks]
+
+    def watch(name, real):
+        def run(self, blocks, *args, **kw):
+            before = cards(blocks)
+            got = real(self, blocks, *args, **kw)
+            after = cards(got if isinstance(got, list) else blocks)
+            if after != before:
+                kept = set(before)
+                steps = A.StepModel(got if isinstance(got, list) else blocks).card_step
+                rewrote.add((name, any(c not in kept and steps[c[0]] > 0 for c in after)))
+            return got
+        return run
+
+    def facts(self, blocks):
+        real["_plan_deck_facts"](self, blocks)
+        self.early_steps = self.steps
+
+    def emit(self, blocks):
+        now, early = vars(self.steps), vars(self.early_steps)
+        assert _same_cards(vars(A.StepModel(blocks)), now), \
+            [k for k, v in vars(A.StepModel(blocks)).items() if not _same_cards(v, now[k])]
+        assert {k: v for k, v in early.items() if k not in card_level} == \
+            {k: v for k, v in now.items() if k not in card_level}
+        assert now.keys() - card_level >= {"procs", "inertia", "mass_loads", "nl_heads", "pert"}
+        for ids, kw in ((self._kinematic_ids, "KINEMATIC"), (self._distributing_ids, "DISTRIBUTING")):
+            assert ids == {id(b) for b, c in zip(blocks, blocks[1:])
+                           if b.keyword == "COUPLING" and c.keyword == kw}
+        emitted.append(self)
+        return real["emit_other"](self, blocks)
+
+    real = {k: getattr(A.Converter, k) for k in planners + ("_plan_deck_facts", "emit_other")}
+    try:
+        for k in planners:
+            setattr(A.Converter, k, watch(k, real[k]))
+        A.Converter._plan_deck_facts, A.Converter.emit_other = facts, emit
+        for test in (test_buckle_load_case_two_on_a_free_reference_node,     # H10, step cards
+                     test_continuum_shell_plies_split_with_shared_interface_nodes,  # H7, step cards
+                     test_quadratic_membrane_sections_loads_and_output,     # H8
+                     test_conventional_shell_section_density_becomes_material_mass,  # H8
+                     test_heatless_section_materials_in_thermal_decks,      # H2
+                     test_coupling_on_several_reference_nodes,              # H1
+                     test_new_nodes_take_the_transform_of_their_edge,       # H9
+                     test_element_surface_without_face_label_is_the_exterior_faces):     # H3
+            test()
+    finally:
+        for k, v in real.items():
+            setattr(A.Converter, k, v)
+    assert {k for k, _ in rewrote} == set(planners) and len(emitted) > 20
+    assert {k for k, in_step in rewrote if in_step} == {"_remap_ply_faces", "_plan_free_ref_nodes"}
+    # a post-pass that rewrites a *STEP line updates EmitState's record (_buckle_displacements
+    # drops PERTURBATION from a *BUCKLE step that a prescribed displacement loads)
+    buckle = _deck_step("Buckle\n2", "*Boundary\n7, 3, 3, -0.01\n", ", perturbation")
+    for steps, kw in ((buckle, {}), (_deck_step("Static", "*Cload\n6, 1, 1.\n") + buckle,
+                                     {"approximate": True})):
+        body, conv, _ = convert_str(BUCKLE_CUBE + steps, **kw)
+        last = conv.emit.written[len(conv.steps)]
+        assert "PERTURBATION" not in body and "PERTURBATION" not in last.params
 
 
 def test_op_new_on_a_later_boundary_card_only():
