@@ -11795,6 +11795,19 @@ def test_cards_between_steps_act_in_the_next_one():
     assert "*BOUNDARY, *CLOAD between steps 1 and 2: moved into step 2" in rep.text()
 
 
+def test_step_procedure_ends_with_its_step():
+    # the procedure of the step being emitted is no card's after its *END STEP: a *BOUNDARY,
+    # IMAGINARY after the last (steady-state dynamics) step is not its imaginary part
+    deck = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Density\n1e-3\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
+            "*Step\n*Frequency\n4\n*End Step\n*Step\n*Steady State Dynamics\n1., 10., 2\n"
+            "*Cload, imaginary\n7, 3, 1.\n*End Step\n*Boundary, imaginary\n7, 2, 2, 0.1\n")
+    body, conv, rep = convert_str(deck)
+    tail = body[body.rindex("*END STEP"):]
+    assert "*CLOAD, LOAD CASE=2" in _step(body, 2) and "LOAD CASE" not in tail, tail
+    assert "*BOUNDARY, IMAGINARY dropped" in rep.text() and conv._step_proc is None
+
+
 def _normal_rows(body):
     return [[float(x) for x in ln.split(",")] for ln in _card(body, "*NORMAL")]
 

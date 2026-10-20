@@ -4960,7 +4960,8 @@ class Converter:
         self._base_nlgeom = False                   # NLGEOM in a general step so far
         self._base_heated = False                   # temperatures set or solved in a general step
         self._base_stressed = False                 # a load, prescribed motion or initial state
-        self._step_proc: Optional[str] = None      # the procedure of the step being emitted
+        self._step_proc: Optional[str] = None      # the procedure of the step being emitted (None
+                                                   # outside a step)
         self._buckle_loaded = False                 # a *BUCKLE step loaded by more than temperatures
         self._buckle_preloaded: Dict[int, bool] = {}   # *BUCKLE step -> a general step before it
         self._cyclic_ok: set = set()
@@ -5781,6 +5782,7 @@ class Converter:
                 out.extend(self._out_tp_cards)          # ccx: *TIME POINTS before any *STEP
                 self._out_tp_cards = []
                 out.extend(self.handle_step(cards))
+                self._step_proc = None                  # (no step's after its *END STEP)
             elif b.keyword in ("HEADING", "END STEP") or b.keyword in GEOM_KW:
                 continue
             elif b.keyword in HISTORY_ONLY_KW:       # (_move_between_cards moved the others)

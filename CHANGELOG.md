@@ -9,7 +9,8 @@ physics.
 * **Cards between two steps act in the next step** — ccx 2.23 applies a `*BOUNDARY` or `*CLOAD`
   written after a step's `*END STEP` in the next step (probed), but the planners read such cards
   five different ways, and loads or output requests there were commented out. They are now
-  moved into the next step, after its procedure card, with a warning.
+  moved into the next step, after its procedure card, with a warning. A card after the last
+  step no longer reads that step's procedure (a `*BOUNDARY, IMAGINARY` there got `LOAD CASE=2`).
 * **One definition of a linear perturbation step** — the planners used three sets of
   perturbation procedures. Abaqus' list is now used everywhere: `*FREQUENCY`, `*BUCKLE`,
   `*COMPLEX FREQUENCY`, `*MODAL DYNAMIC`, `*STEADY STATE DYNAMICS`, `*RANDOM RESPONSE`,
