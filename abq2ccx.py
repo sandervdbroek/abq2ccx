@@ -19290,9 +19290,8 @@ class Converter:
     # the procedures after which ccx 2.23 has dropped what a card gave before (probed; a
     # *STEP, PERTURBATION does it for *CLOAD and *TEMPERATURE too; *MODAL DYNAMIC: the
     # loads, through _modal_own_loads' OP=NEW, unless it keeps them)
-    _RESETS = {"CLOAD": ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"),
-               "DLOAD": ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"),
-               "TEMPERATURE": ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC")}
+    _RESETS = dict.fromkeys(("CLOAD", "DLOAD", "TEMPERATURE"),
+                            ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"))
 
     def _modal_own_loads(self, out: List[str]) -> List[str]:
         """Give each *MODAL DYNAMIC step its own loads only, as Abaqus does in a linear
