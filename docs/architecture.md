@@ -130,8 +130,9 @@ loads (`*DLOAD PX/PY/PZ/P1/P2`) become **consistent nodal forces**. `_load_faces
 `_beam_lines` resolve the faces, edges or beams (corner nodes first, the plane-section
 thickness or the axisymmetric flag, beam n1); `consistent_nodal_forces()` integrates the
 shape functions by Gauss quadrature over each one in its undeformed geometry; and
-`_to_nodal_forces` records the result per (card, target, label) in `_nodal_loads`, in
-Abaqus semantics (a later step replaces a load, `OP=NEW` drops the card's earlier ones).
+`_to_nodal_forces` records the result per (card, target, label) in `emit.nodal_loads`
+(`EmitState`, what the emission has written so far), in Abaqus semantics (a later step
+replaces a load, `OP=NEW` drops the card's earlier ones).
 Forces on a node with a `*TRANSFORM` are first given in its local axes (`_to_local_axes`,
 `_local_axes`; `_transform_defs` reads the cards into `_transformed`), since ccx and Abaqus read
 a `*CLOAD` there in those axes; a node whose axes are unknown makes the line stay commented.
@@ -156,7 +157,7 @@ RESULTANT=YES`); otherwise the line stays commented unless `--approximate` — e
 follower `TRVEC` normal to flat continuum faces, which `_follower_pressure` turns into a P
 line for the pressure path (keyed apart from the deck's P; `_retire_follower` zeroes it when a
 later step replaces the traction otherwise).
-`_dl_state` / `_flush_dloads` do the same bookkeeping for the `*DLOAD` lines that come from
+`emit.dl_state` / `_flush_dloads` do the same bookkeeping for the `*DLOAD` lines that come from
 `*DLOAD` and from `*DSLOAD`, whose `OP=NEW` scopes differ in Abaqus but not in ccx.
 
 Abaqus **surface elements** (`SURFACE_ELEMENTS`: `SFM3D*`, `SFMAX*`, `SFMGAX*`) have no
