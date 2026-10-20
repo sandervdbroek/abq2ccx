@@ -1,0 +1,151 @@
+*Heading
+abq2ccx validation: the reaction force at a *RIGID BODY reference node that is one of the
+body's own nodes.  ccx 2.23 prints the reaction at such a node as its own elements' forces
+alone (about 1e-15 for a rigid body); abq2ccx gives the body a free reference node at the
+same place, which carries the BCs and output requests the deck gives the node.
+Three unit cubes (C3D8, E = 1000), each held at its bottom face, with a rigid unit cube on
+top, pushed down 0.01 through a frictionless node-to-surface HARD contact (NLGEOM):
+ A: *Rigid Body, PIN NSET = the rigid cube's nodes, REF NODE = its top corner node 18;
+ B: *Rigid Body, ELSET = the rigid cube, REF NODE = its top corner node 118;
+ R: *Rigid Body, PIN NSET = the rigid cube's nodes, REF NODE = free node 299 (the control).
+The reference node's RF3 must balance the supports' total, and A, B and R must agree.
+**
+*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+11, 0., 0., 1.
+12, 1., 0., 1.
+13, 1., 1., 1.
+14, 0., 1., 1.
+15, 0., 0., 2.
+16, 1., 0., 2.
+17, 1., 1., 2.
+18, 0., 1., 2.
+101, 3., 0., 0.
+102, 4., 0., 0.
+103, 4., 1., 0.
+104, 3., 1., 0.
+105, 3., 0., 1.
+106, 4., 0., 1.
+107, 4., 1., 1.
+108, 3., 1., 1.
+111, 3., 0., 1.
+112, 4., 0., 1.
+113, 4., 1., 1.
+114, 3., 1., 1.
+115, 3., 0., 2.
+116, 4., 0., 2.
+117, 4., 1., 2.
+118, 3., 1., 2.
+201, 6., 0., 0.
+202, 7., 0., 0.
+203, 7., 1., 0.
+204, 6., 1., 0.
+205, 6., 0., 1.
+206, 7., 0., 1.
+207, 7., 1., 1.
+208, 6., 1., 1.
+211, 6., 0., 1.
+212, 7., 0., 1.
+213, 7., 1., 1.
+214, 6., 1., 1.
+215, 6., 0., 2.
+216, 7., 0., 2.
+217, 7., 1., 2.
+218, 6., 1., 2.
+299, 6., 1., 2.
+*Element, type=C3D8, elset=BASE_A
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Element, type=C3D8, elset=CUBE_A
+2, 11, 12, 13, 14, 15, 16, 17, 18
+*Element, type=C3D8, elset=BASE_B
+101, 101, 102, 103, 104, 105, 106, 107, 108
+*Element, type=C3D8, elset=CUBE_B
+102, 111, 112, 113, 114, 115, 116, 117, 118
+*Element, type=C3D8, elset=BASE_R
+201, 201, 202, 203, 204, 205, 206, 207, 208
+*Element, type=C3D8, elset=CUBE_R
+202, 211, 212, 213, 214, 215, 216, 217, 218
+*Nset, nset=BOTTOM_A
+1, 2, 3, 4
+*Nset, nset=BOTTOM_B
+101, 102, 103, 104
+*Nset, nset=BOTTOM_R
+201, 202, 203, 204
+*Nset, nset=RIGID_A
+11, 12, 13, 14, 15, 16, 17, 18
+*Nset, nset=RIGID_R
+211, 212, 213, 214, 215, 216, 217, 218
+*Nset, nset=REF_A
+18
+*Nset, nset=REF_B
+118
+*Nset, nset=REF_R
+299
+*Solid Section, elset=BASE_A, material=SOFT
+*Solid Section, elset=CUBE_A, material=SOFT
+*Solid Section, elset=BASE_B, material=SOFT
+*Solid Section, elset=CUBE_B, material=SOFT
+*Solid Section, elset=BASE_R, material=SOFT
+*Solid Section, elset=CUBE_R, material=SOFT
+*Material, name=SOFT
+*Elastic
+1000., 0.3
+*Rigid Body, ref node=REF_A, pin nset=RIGID_A
+*Rigid Body, ref node=REF_B, elset=CUBE_B
+*Rigid Body, ref node=REF_R, pin nset=RIGID_R
+*Surface, type=ELEMENT, name=TOP_A
+BASE_A, S2
+*Surface, type=ELEMENT, name=UNDER_A
+CUBE_A, S1
+*Surface, type=ELEMENT, name=TOP_B
+BASE_B, S2
+*Surface, type=ELEMENT, name=UNDER_B
+CUBE_B, S1
+*Surface, type=ELEMENT, name=TOP_R
+BASE_R, S2
+*Surface, type=ELEMENT, name=UNDER_R
+CUBE_R, S1
+*Surface Interaction, name=FRICTIONLESS
+*Surface Behavior, pressure-overclosure=HARD
+*Contact Pair, interaction=FRICTIONLESS, type=NODE TO SURFACE
+TOP_A, UNDER_A
+TOP_B, UNDER_B
+TOP_R, UNDER_R
+*Boundary
+BOTTOM_A, 1, 3
+BOTTOM_B, 1, 3
+BOTTOM_R, 1, 3
+REF_A, 1, 2
+REF_A, 4, 6
+REF_B, 1, 2
+REF_B, 4, 6
+REF_R, 1, 2
+REF_R, 4, 6
+*Step, nlgeom=YES
+*Static
+0.25, 1.
+*Boundary
+REF_A, 3, 3, -0.01
+REF_B, 3, 3, -0.01
+REF_R, 3, 3, -0.01
+*Output, history
+*Node Output, nset=REF_A
+RF3
+*Node Output, nset=REF_B
+RF3
+*Node Output, nset=REF_R
+RF3
+*Node Print, nset=BOTTOM_A, totals=only
+RF
+*Node Print, nset=BOTTOM_B, totals=only
+RF
+*Node Print, nset=BOTTOM_R, totals=only
+RF
+*End Step

@@ -4726,6 +4726,9 @@ class Converter:
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
         self._rb_rot_synth: Dict[int, int] = {}    # ... where the converter created the ROT NODE
+        # a rigid body's REF NODE that is one of its own nodes -> the free node that is the
+        # body's REF NODE in ccx (see _plan_free_ref_nodes)
+        self._free_refs: "OrderedDict[int, int]" = OrderedDict()
         # 2-node beams upgraded to 3-node beams (_upgrade_section_beams): element -> (end node,
         # end node, midside node)
         self._midside: "OrderedDict[int, Tuple[int, int, int]]" = OrderedDict()
@@ -18007,6 +18010,7 @@ class Converter:
         self._plan_shell_density(blocks)        # after the ply split: its stacks and ply materials
         self._transform_new_nodes(blocks)       # after every planner that adds such nodes
         self._check_nonpositive_ids()
+        self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
         self._prescan(blocks)
         self._plan_member_mass_tets(blocks)     # after _prescan: its *MPC BEAM bodies
         self._plan_surface_heat(blocks)
@@ -24672,6 +24676,208 @@ class Converter:
                 self._mpc_twin(twin[0])          # made now, under the id its rows name
             it["bcs"], it["eqs"] = bcs, eqs
             it["local"] = reduced or any(is_local(k) for k in bcs)
+
+    # -- *RIGID BODY reference nodes that are nodes of the body ---------------------
+    # The cards that name a rigid body's reference node as the body's reference point: its
+    # BCs, concentrated loads and nodal output, and the *TRANSFORM they are given in.
+    _REF_POINT_CARDS = ("BOUNDARY", "CLOAD", "NODE PRINT", "NODE FILE", "NODE OUTPUT", "TRANSFORM")
+
+    def _plan_free_ref_nodes(self, blocks: List[Block]) -> None:
+        """A *RIGID BODY whose REF NODE is one of its own nodes (in its NSET, or a node of
+        its ELSET's elements) gets a new free node at the same place as its REF NODE in ccx.
+        ccx 2.23 prints the reaction force at a reference node that belongs to an element as
+        the forces of that node's own elements alone (resultsforc.c adds the body's MPC
+        forces back onto every node of an element) — about 1e-15 for a rigid set of
+        elements, although the body is loaded and the rest of the solution is right; at a
+        free reference node it is the body's reaction.  Probed: a block pushed through
+        node-to-surface contact gives RF -10.6, the supports' total, at a free reference
+        node and 1e-15 at one of the block's nodes (NSET and ELSET form; NLGEOM and linear,
+        where the body is written as linear equations).
+
+        The original node stays a member of the body, where it moves exactly like the new
+        node (the same place, the same rigid motion).  The new node takes its place wherever
+        the deck names it as the body's reference point — its *BOUNDARY, *CLOAD and *NODE
+        OUTPUT / PRINT / FILE, and the REF NODE of every rigid body on it — and gets its
+        *TRANSFORM (the axes those are given in), initial velocity and displacement besides
+        it.  A node set that only one kind of those cards names is redefined, so the output
+        keeps the deck's set name; another one is copied.  A shell/beam node in a PIN NSET
+        joins the TIE members: its rotations are the body's in Abaqus.  A node that another
+        constraint uses too (*EQUATION, *MPC, a coupling, *TIE, a connector, another rigid
+        body's members) keeps its role, with a warning: as a member it would be the
+        dependent of two constraints."""
+        attached = {n for _t, conn in self.geom.elements.values() for n in conn}
+        refs: Dict[int, int] = {}                  # id(*RIGID BODY) -> its REF NODE
+        own: set = set()
+        for b in blocks:
+            ref = self._ref_node(b) if b.keyword == "RIGID BODY" else None
+            if ref is None:
+                continue
+            refs[id(b)] = ref
+            if ref in attached and ref in self.geom.nodes and ref in sum(self._rigid_body_members(b), []):
+                own.add(ref)
+        if not own:
+            return
+        busy = own & self._constraint_nodes(blocks, {i for i, r in refs.items() if r in own})
+        if busy:
+            self.report.warn(f"*RIGID BODY reference node(s) {', '.join(map(str, sorted(busy)))} "
+                             f"also belong to the body, and another constraint (*EQUATION, *MPC, "
+                             f"coupling, *TIE, connector or rigid body) uses them too: left as they "
+                             f"are, so ccx prints their reaction force as zero (ccx 2.23 shows only "
+                             f"the forces of the node's own elements at a reference node that "
+                             f"belongs to an element). The solution itself is not affected.",
+                             once=True)
+        types = {t: ccx_type(t) for t in {t for t, _c in self.geom.elements.values()}}
+        turns = {n for t, conn in self.geom.elements.values()
+                 if types[t] in SHELL_TYPES or (types[t] in BEAM_TYPES and
+                                                not types[t].startswith(("T2D", "T3D")))
+                 for n in conn}
+        nid = max(self.geom.nodes)
+        for x in sorted(own - busy):
+            nid += 1
+            self.geom.add_node(nid, self.geom.nodes[x])
+            self._free_refs[x] = nid
+        stand = self._free_refs
+        if not stand:
+            return
+        self._reserve_names()
+        joined: List[int] = []
+        for i, b in enumerate(blocks):
+            x = refs.get(id(b)) if b.keyword == "RIGID BODY" else None
+            if x not in stand:
+                continue
+            params = OrderedDict((k, str(stand[x]) if k == "REF NODE" else v) for k, v in b.params.items())
+            if x in turns and x in self._rigid_body_members(b)[1]:
+                joined.append(x)
+                self._pin_to_tie(params, x)
+            blocks[i] = Block(b.keyword, params, list(b.data))
+        # the node sets the reference-point cards name that hold such a node — with the new
+        # node in the original's place, or beside it for a *TRANSFORM, whose axes the original
+        # node keeps as a member, and for output of a set with other nodes too — and the names
+        # every other card uses (the mesh aside)
+        def beside_of(b: Block, s: str) -> bool:
+            return b.keyword == "TRANSFORM" or (b.keyword not in ("BOUNDARY", "CLOAD") and any(
+                n not in stand for n in self.geom.nset(s)))
+        named: Dict[str, set] = {}
+        other: set = set()
+        for b in blocks:
+            if b.keyword in GEOM_KW:
+                continue
+            if b.keyword in self._REF_POINT_CARDS:
+                for t in self._ref_point_specs(b):
+                    if not re.fullmatch(r"[-+]?\d+", t) and any(n in stand for n in self.geom.nset(t)):
+                        named.setdefault(t.upper(), set()).add(beside_of(b, t))
+                continue
+            other.update(v.strip().upper() for v in b.params.values() if v)
+            other.update(t.strip().upper() for ln in b.data for t in ln.split(","))
+        copies: Dict[Tuple[str, bool], str] = {}
+        for s, ways in sorted(named.items()):
+            old = self.geom.nset(s)
+            for beside in sorted(ways):
+                ids = dedup(old + [stand[n] for n in old if n in stand] if beside else
+                            [stand.get(n, n) for n in old])
+                if s in other or len(ways) > 1:
+                    copies[(s, beside)] = self._fresh_name(f"{s}_REF")
+                    self.geom.nsets[copies[(s, beside)]] = ids
+                else:
+                    self.geom.nsets[s] = ids
+
+        def spec(tok: str, beside: bool = False) -> str:
+            t = tok.strip()
+            if re.fullmatch(r"[-+]?\d+", t):
+                return str(stand.get(int(t), t))
+            return copies.get((t.upper(), beside), t)
+
+        for i, b in enumerate(blocks):
+            data, params = list(b.data), b.params
+            if b.keyword in ("BOUNDARY", "CLOAD"):
+                data = []
+                for ln in b.data:
+                    f = ln.split(",")
+                    data.append(ln if spec(f[0]) == f[0].strip() else ",".join([spec(f[0])] + f[1:]))
+            elif b.keyword in self._REF_POINT_CARDS:
+                nset = (b.param("NSET") or "").strip()
+                new = spec(nset, beside_of(b, nset)) if nset else nset
+                if new != nset:
+                    params = OrderedDict((k, new if k == "NSET" else v) for k, v in b.params.items())
+            elif b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") in ("VELOCITY", "DISPLACEMENT"):
+                data = []
+                for ln in b.data:          # node or set, DOF, value: the new node moves with it
+                    data.append(ln)
+                    f = ln.split(",")
+                    data += [",".join([str(stand[n])] + f[1:])
+                             for n in dedup(self._resolve_nodes(f[0].strip()) if f[0].strip() else [])
+                             if n in stand]
+            if data != b.data or params is not b.params:
+                blocks[i] = Block(b.keyword, params, data)
+        pairs = ", ".join(f"{x} -> {n}" for x, n in list(stand.items())[:3])
+        self.report.note(f"*RIGID BODY reference node(s) that belong to the body's own elements "
+                         f"(node -> new reference node: {pairs}{', ...' if len(stand) > 3 else ''}): "
+                         f"ccx 2.23 prints the reaction force there as the forces of the node's own "
+                         f"elements alone — zero for a rigid body. Each such body gets a free "
+                         f"reference node at the same place; the original node stays a member, the "
+                         f"BCs, concentrated loads and nodal output on the reference node go to the "
+                         f"new one (its reaction force is the body's, probed), which also gets its "
+                         f"*TRANSFORM and initial velocity. Exact.", once=True)
+        if joined:
+            self.report.note(f"*RIGID BODY: shell/beam reference node(s) "
+                             f"{', '.join(map(str, joined[:3]))}{', ...' if len(joined) > 3 else ''} "
+                             f"in the PIN NSET joined the TIE members (their rotations are the "
+                             f"body's in Abaqus, where they are the reference node).", once=True)
+
+    def _pin_to_tie(self, params: "OrderedDict[str, Optional[str]]", x: int) -> None:
+        """Move node ``x`` from the PIN NSET of *RIGID BODY parameters ``params`` to its TIE
+        NSET (copies of the sets, which other cards may use as they are)."""
+        rest = [n for n in self.geom.nset(params["PIN NSET"]) if n != x]
+        if rest:
+            name = self._fresh_name(f"{params['PIN NSET']}_PIN")
+            self.geom.nsets[name] = rest
+            params["PIN NSET"] = name
+        else:
+            del params["PIN NSET"]
+        tie = params.get("TIE NSET")
+        name = self._fresh_name(f"{tie}_TIE" if tie else "ABQ2CCX_RB_TIE")
+        self.geom.nsets[name] = (self.geom.nset(tie) if tie else []) + [x]
+        params["TIE NSET"] = name
+
+    @staticmethod
+    def _ref_point_specs(b: Block) -> List[str]:
+        """The node specs (node ids or node set names) a reference-point card names."""
+        if b.keyword in ("BOUNDARY", "CLOAD"):
+            return [ln.split(",")[0].strip() for ln in b.data if ln.split(",")[0].strip()]
+        return [(b.param("NSET") or "").strip()] if (b.param("NSET") or "").strip() else []
+
+    def _constraint_nodes(self, blocks: List[Block], skip: set) -> set:
+        """The nodes a constraint names, other than the *RIGID BODY cards ``skip`` (ids):
+        *EQUATION and *MPC terms, couplings (reference node and members), *TIE and tied
+        *CONTACT PAIR surfaces, rigid bodies' reference, rotation and member nodes, and
+        connector ends."""
+        nodes: set = set()
+        for b in blocks:
+            kw = b.keyword
+            if kw in ("RIGID BODY", "COUPLING", "KINEMATIC COUPLING", "DISTRIBUTING COUPLING"):
+                if id(b) in skip:
+                    continue
+                for k in ("REF NODE", "ROT NODE"):
+                    nodes.update(self._resolve_nodes(b.param(k).strip())[:1] if b.param(k) else [])
+                if b.param("SURFACE"):
+                    nodes.update(self._surface_member_nodes(b.param("SURFACE").strip()))
+                if kw == "RIGID BODY":
+                    nodes.update(sum(self._rigid_body_members(b), []))
+                elif kw != "COUPLING":
+                    if kw == "DISTRIBUTING COUPLING" and b.param("ELSET"):
+                        nodes.update(n for e in self.geom.elset(b.param("ELSET").strip())
+                                     for n in self.geom.elements.get(e, ("", []))[1])
+                    nodes.update(n for r in merged_data_records(b) if r and r[0].strip()
+                                 for n in self._resolve_nodes(r[0].strip()))
+            elif kw == "MPC":
+                nodes.update(n for f in self._mpc_fields(b) for t in f[1:] for n in self._mpc_nodes(t))
+            elif kw == "EQUATION":
+                nodes.update(n for ns, _ in self._equation_dofs(b) for n in ns)
+            elif kw == "TIE" or (kw == "CONTACT PAIR" and b.has("TIED")):
+                nodes.update(n for r in merged_data_records(b) for t in r if t.strip()
+                             for n in self._surface_member_nodes(t.strip()))
+        nodes.update(n for _t, a, c in self._conn.values() for n in (a, c) if n is not None)
+        return nodes
 
     # -- rigid couplings on shell / beam nodes ---------------------------------
     def _plan_rigid_couplings(self, blocks: List[Block]) -> None:

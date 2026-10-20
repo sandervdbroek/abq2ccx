@@ -343,6 +343,11 @@ physics.
   29-40 % of max |u| off without a message (where ccx's own substitution does not merge them:
   the other node's axes keep a global one), and under NLGEOM or explicit dynamics the connector
   was commented out. Such a node now goes through its twin (exact, linear, NLGEOM and explicit).
+* **Reaction force at a rigid body's own node** — ccx 2.23 prints the reaction at a `*RIGID
+  BODY` reference node that is one of the body's nodes as zero (its own elements' forces
+  alone), e.g. at an indenter whose reference node is a node of its mesh. Such a body now gets
+  a free reference node at the same place, which takes the reference point's BCs, loads and
+  output.
 
 ## 1.4.0 (October 2026)
 

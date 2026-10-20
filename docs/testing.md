@@ -91,6 +91,7 @@ setting up its system: ccx 2.23 ends a step that sets up none with "Job finished
 | `beam_output_requests` | output at `B32` nodes in the `.frd` (at `*TIME POINTS`) and the `.dat` | beam theory | ≤ 1.3 % |
 | `coupling_shell_plate` | a rigid coupling on `S8R` nodes (knot beams) | the same plate in `C3D20R` under `*RIGID BODY` | 1e-5 of \|u\| |
 | `coupling_bc_bars` | BCs on coupled nodes taken off (also NLGEOM) | the same constraints as BCs and `*EQUATION`s | round-off |
+| `rigid_ref_member_contact` | rigid cubes pushed onto blocks through contact, the `REF NODE` one of the cube's nodes (`PIN NSET`, `ELSET`) or free; NLGEOM and linear | the supports' total | exact (before: about 1e-15 at a cube node) |
 | `rigid_body_bc_bars` | BCs on `*RIGID BODY` nodes moved to the reference node (also NLGEOM) | the BCs written on the reference node | round-off |
 | `equation_overconstraint` | an `*EQUATION` on a BC'd DOF, a duplicate, a loop of ties | ccx rejects the deck as written | solves, ties held |
 | `mpc_beam_lever` | `*MPC BEAM` lever, linear and NLGEOM | statics; a 10⁴× stiffer beam lever | 0.04 %; ≤ 4e-5 |

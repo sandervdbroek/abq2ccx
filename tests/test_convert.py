@@ -1246,10 +1246,47 @@ def test_rigid_body_refnode_instance_qualified():
     body, _, _ = convert_str(deck)
     rb = [l for l in body.splitlines() if "RIGID BODY" in l.upper()][0]
     # the flattened single-node set I_REF is further resolved to its node NUMBER
-    # (ccx requires REF NODE to be a node id, not a set name)
-    assert "REF NODE=1" in rb.upper() and "I_BODY" in rb.upper()
+    # (ccx requires REF NODE to be a node id, not a set name) — node 1, which is a node of
+    # the body's own element, so ccx's REF NODE is a free node at its place (node 5,
+    # _plan_free_ref_nodes)
+    assert "REF NODE=5" in rb.upper() and "I_BODY" in rb.upper()
+    assert "5, 0, 0, 0" in body.splitlines()
     assert "I.REF" not in rb.upper() and "I.BODY" not in rb.upper()
     assert any("NSET=I_REF" in l.upper() for l in body.splitlines())
+
+
+def test_rigid_body_reference_node_of_its_own_body_gets_a_free_node():
+    # ccx 2.23 prints the reaction force at a REF NODE that belongs to an element as that
+    # node's own elements' forces alone (probed: 1e-15 instead of the body's -10.6): the body
+    # gets a free reference node at the same place, which takes the BCs, loads and output on
+    # the reference point, its *TRANSFORM and initial velocity; node 8 stays a member
+    deck = (HEX + "*Nset, nset=BODY\n1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=REF\n8\n*Nset, nset=ALL\n"
+            "1, 2, 3, 4, 5, 6, 7, 8\n*Rigid Body, ref node=REF, pin nset=BODY\n*Transform, nset=REF\n"
+            "0.8, 0.6, 0., -0.6, 0.8, 0.\n*Initial Conditions, type=velocity\nREF, 1, 2.\n*Boundary\n"
+            "REF, 1, 3\n*Step\n*Static\n*Boundary\n8, 3, 3, 0.1\n*Node Print, nset=REF\nRF\n"
+            "*Node Print, nset=ALL\nU\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert dict(conv._free_refs) == {8: 9} and conv.geom.nodes[9] == conv.geom.nodes[8]
+    geom, lines = reparse(body), body.splitlines()
+    rb = next(l for l in lines if l.startswith("*RIGID BODY"))
+    assert "REF NODE=9" in rb and 8 in geom.nset("BODY")
+    assert "9, 3, 3, 0.1" in lines and "9, 1, 2." in lines and "REF, 1, 2." in lines
+    out = next(l for l in lines if l.startswith("*NODE PRINT") and "ALL" not in l).split("NSET=")[1]
+    tr = next(l for l in lines if l.startswith("*TRANSFORM")).split("NSET=")[1]
+    assert geom.nset(out) == [9] and sorted(geom.nset(tr)) == [8, 9]
+    assert sorted(geom.nset("ALL")) == list(range(1, 10))     # output of a set beside node 8
+    assert "8 -> 9" in rep.text() and rep.n_warnings == 0
+    # a shell reference node in the PIN NSET joins the TIE members (its rotations are the body's)
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, "
+             "elset=P\n1, 1, 2, 3, 4\n*Nset, nset=PN\n1, 2, 3, 4\n*Rigid Body, ref node=1, pin nset=PN\n")
+    body, conv, rep = convert_str(shell)
+    rb = next(l for l in body.splitlines() if l.startswith("*RIGID BODY"))
+    assert "REF NODE=5" in rb and "joined the TIE members" in rep.text()
+    # a node another constraint uses too keeps its role (warned)
+    body, conv, rep = convert_str(HEX + "*Nset, nset=BODY\n1, 2, 3, 4, 5, 6, 7, 8\n*Rigid Body, "
+                                        "ref node=8, pin nset=BODY\n*Equation\n2\n8, 1, 1., 9, 1, -1.\n"
+                                        "*Node\n9, 2., 0., 0.\n")
+    assert not conv._free_refs and "*RIGID BODY reference node(s) 8 also belong to the body" in rep.text()
 
 
 def test_assembly_instance_set_three_level_ref():

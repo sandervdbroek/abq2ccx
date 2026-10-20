@@ -5642,6 +5642,30 @@ def main():
                         split_terms(nl_tie), nl_tie)
     failures += same_as("equation_tie, NLGEOM x10, in the local axes of a cylindrical *TRANSFORM",
                         local_terms(nl_tie, *cyl), nl_tie)
+    # A *RIGID BODY whose REF NODE is one of its own nodes: ccx 2.23 prints the reaction force
+    # there as that node's own elements' forces alone (abq2ccx before: 1e-15), so the body gets
+    # a free reference node at the same place.  examples/rigid_ref_member_contact.inp pushes
+    # three rigid cubes onto elastic blocks through contact, the REF NODE a cube node (PIN NSET
+    # and ELSET form) or a free node: each reference node's RF3 must be its supports' total.
+    for nl_rr in (True, False):
+        src = open(os.path.join(EXAMPLES, "rigid_ref_member_contact.inp"), encoding="utf-8").read()
+        src_path, inp = os.path.join(tmp, "rr_src.inp"), os.path.join(tmp, "rr.inp")
+        with open(src_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(src if nl_rr else src.replace("*Step, nlgeom=YES", "*Step"))
+        convert(src_path, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        rf = {s: rows[-1][3] for _, t, s, _, rows in A.dat_blocks(dat) if t == "forces" and rows}
+        tot = dat_totals(dat)[-3:] if status == "solved" else []
+        got = [rf.get(f"REF_{k}") for k in "ABR"]
+        ok = len(tot) == 3 and None not in got and all(
+            abs(g + t[2]) <= 1e-6 * abs(t[2]) and abs(t[2]) > 1.0 for g, t in zip(got, tot))
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_ref_member_contact ({'NLGEOM' if nl_rr else 'linear'}, "
+              f"{status}): RF3 at the reference nodes (cube node, ELSET cube node, free node) = "
+              f"{', '.join('-' if g is None else f'{g:.6g}' for g in got)}; supports "
+              f"{', '.join(f'{t[2]:.6g}' for t in tot)}")
+        failures += 0 if ok else 1
+        shutil.rmtree(d, ignore_errors=True)
     # Rotational BCs and moments on DOFs 4-6 of nodes with a *TRANSFORM, which ccx 2.23 applies
     # about the global axes on a kinematic reference point and a knot (and as clashing mean-
     # rotation MPCs on a plain beam node): the reference point's coupling becomes a *RIGID BODY
