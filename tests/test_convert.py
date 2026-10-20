@@ -5825,7 +5825,7 @@ def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
     for steps, k, why in (
             (static.format("", out), 1, "from a linear *STATIC step (no NLGEOM, no plastic, "
                                         "creeping, hyperelastic or user material, no dynamic, heat "
-                                        "transfer or coupled step before, or since a *FREQUENCY or "
+                                        "transfer or (un)coupled step before, or since a *FREQUENCY or "
                                         "*BUCKLE step): ccx 2.23 has no nodal state variables there "
                                         "and segfaults writing SDV to the .frd; *EL PRINT SDV (.dat) "
                                         "runs."),
@@ -5887,7 +5887,7 @@ def test_elke_kept_off_el_print_where_ccx_segfaults():
     for model, steps, k, card, kind in (
             (STEEL, static.format("", pr.format("S, ELKE")), 1, "*EL PRINT, ELSET=EALL\nS\n",
              "a linear *STATIC step (no NLGEOM, no plastic, creeping, hyperelastic or user "
-             "material, no dynamic, heat transfer or coupled step before, or since a *FREQUENCY or "
+             "material, no dynamic, heat transfer or (un)coupled step before, or since a *FREQUENCY or "
              "*BUCKLE step)"),
             (STEEL, dyn.format("") + "*Step\n*Frequency\n3\n*End Step\n" +
              static.format("", pr.format("ELKE")), 3, "*EL PRINT, ELSET=EALL, FREQUENCY=1\n*NODE "
@@ -11724,6 +11724,44 @@ def test_linear_rigid_notes_name_what_is_written():
             fh.write(body)
         held = A._deck_steps(os.path.join(d, "job.inp"))["steps"][0]["held"]
     assert f"{rot},1,3" in _bc_lines(body) and rot not in held and held[1] == {1, 2, 3}
+
+
+def test_one_fact_for_the_steps_ccx_iterates():
+    # _ccx_iterated_steps, the one rule of _plan_solver_facts (linear rigid equations),
+    # _warn_finite_rotations and _ccx_linear_steps (output): a *STATIC step after a heat
+    # transfer or (un)coupled step iterates until a *FREQUENCY step, an explicit step too (ccx
+    # turns its RIGID MPCs: validate_with_ccx.py rigid_nonlinear_heat, rigid_explicit_nlgeom_no)
+    rb = TOP9 + "*Rigid Body, ref node=RP, tie nset=TOPN\n"
+    fix = "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+    st = _deck_step("Static", fix + "*Cload\nRP, 5, 1.\n*El Print\nELKE\n")
+    deck = (rb + st + _deck_step("Heat Transfer, steady state\n1., 1.") + st +
+            _deck_step("Frequency\n2", fix) + st +
+            _deck_step("Uncoupled Temperature-Displacement, steady state\n1., 1.", fix) + st +
+            _deck_step("Dynamic, explicit\n, 1e-4", fix, ", nlgeom=NO"))
+    body, conv, rep = convert_str(deck)
+    assert conv._solver_steps == [
+        "", "", "a *STATIC step after a *HEAT TRANSFER step", "", "",
+        "a *UNCOUPLED TEMPERATURE-DISPLACEMENT step",
+        "a *STATIC step after a *UNCOUPLED TEMPERATURE-DISPLACEMENT step", "an explicit *DYNAMIC step"]
+    assert conv._linear_rigid and "*RIGID BODY" not in "\n".join(_live(body))
+    # the output planners' linear steps: ELKE is dropped in the linear ones only (code review
+    # 3, B40b: also after the uncoupled step)
+    keeps = ["ELKE" in part for part in body.split("*STEP")[1:]]
+    assert [keeps[k] for k in (0, 2, 4, 6)] == [False, True, False, True]
+    # one heat transfer step before: the rigid body is linear, where ccx's RIGID MPC was 7 % off
+    body, conv, rep = convert_str(rb + _deck_step("Heat Transfer, steady state\n1., 1.") + st)
+    assert conv._linear_rigid and "*STATIC step after a *HEAT TRANSFER step -> the linear" in rep.text()
+    assert not convert_str(rb + st + st)[1]._linear_rigid
+    # a deformation plasticity material ccx reads (it runs every step under NLGEOM), not one
+    # it does not (commented out)
+    dp = (HEX + DEFORMATION_STEEL + "*Solid Section, elset=EALL, material=STEEL\n*Node\n9, 0.5, 0.5, 2.\n"
+          "*Nset, nset=RP\n9\n*Nset, nset=TOPN\n5, 6, 7, 8\n*Rigid Body, ref node=RP, tie nset=TOPN\n")
+    _, conv, _ = convert_str(dp + st)
+    assert conv._solver_steps == ["a *STATIC step with a *DEFORMATION PLASTICITY material"]
+    assert conv._linear_rigid and [s.ccx_nlgeom for s in conv.steps] == [True]
+    spare = dp.replace("material=STEEL", "material=MHEX") + HEX_SEC.split("*Solid")[0]
+    _, conv, rep = convert_str(spare + st)
+    assert conv._solver_steps == [""] and "no card uses it" in rep.text()
 
 
 def test_rigid_constraints_ccx_turns_in_a_linear_dynamic_step_are_reduced():

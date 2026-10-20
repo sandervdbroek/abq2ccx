@@ -3748,16 +3748,15 @@ CCX_CONTACT_FORCE_STOPS = {"FREQUENCY", "BUCKLE", "MODAL DYNAMIC", "STEADY STATE
 CCX_ENERGY_LABELS = {"EL FILE": ("ENER",), "EL PRINT": ("ENER", "ELSE", "ELKE"),
                      "CONTACT FILE": ("CELS",), "CONTACT PRINT": ("CELS",)}
 # The procedures after which ccx 2.23 iterates the later steps, as under NLGEOM, up to a
-# *FREQUENCY or *BUCKLE step (probed: a *STATIC step after them is a nonlinear one), for
-# Converter._ccx_linear_steps.
-CCX_NONLINEAR_AFTER_PROCS = {"DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT"}
+# *FREQUENCY or *BUCKLE step (probed: a *STATIC step after them is a nonlinear one; after an
+# uncoupled one "Newton-Raphson iterative procedure is active"), for
+# Converter._ccx_iterated_steps.
+CCX_NONLINEAR_AFTER_PROCS = {"DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                             "UNCOUPLED TEMPERATURE-DISPLACEMENT"}
 # The procedures in which ccx 2.23 has no nodal state variables (arpack.c, arpackbu.c and
 # steadystate.c never allocate them, nor does linstatic.c, which runs a linear *STATIC step),
-# so that *EL FILE SDV segfaults it in a model with state variables (Converter._el_file_stops),
-# and the material cards with which ccx iterates every *STATIC step besides a kept *PLASTIC
-# and *CREEP (probed on 2.23).
+# so that *EL FILE SDV segfaults it in a model with state variables (Converter._el_file_stops).
 NO_NODAL_SDV_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS"}
-CCX_ITERATED_MATERIALS = {"USER MATERIAL", "HYPERELASTIC", "HYPERFOAM", "DEFORMATION PLASTICITY"}
 # Contact output (*CONTACT FILE CDIS/CSTR) ccx 2.23 cannot write, probed on a block pressed
 # onto another (plane strain/stress, axisymmetric and 3-D solid elements of every order and
 # shape, a shell and a membrane plate; static, NLGEOM, *VISCO, implicit and explicit
@@ -16575,32 +16574,22 @@ class Converter:
 
     # what makes ccx 2.23 run a step linearly (_ccx_linear_steps), for the notes
     _LINEAR_STEP_WHY = ("no NLGEOM, no plastic, creeping, hyperelastic or user material, no "
-                        "dynamic, heat transfer or coupled step before, or since a *FREQUENCY or "
-                        "*BUCKLE step")
+                        "dynamic, heat transfer or (un)coupled step before, or since a *FREQUENCY "
+                        "or *BUCKLE step")
 
     def _ccx_linear_steps(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]]
                           ) -> List[bool]:
         """Per step, whether ccx 2.23 runs it linearly (linstatic.c: no kinetic energies, no
-        nodal state variables): a *STATIC or *VISCO step, or one without a ccx procedure —
-        Riks too, commented out or (--approximate) a plain *STATIC —, that ccx does not run
-        under NLGEOM (Step.ccx_nlgeom: the ccx question, by the *STEP cards handle_step writes),
-        with no material ccx iterates (a kept *PLASTIC, *CREEP, CCX_ITERATED_MATERIALS) and no
-        step after which ccx iterates every step
-        (CCX_NONLINEAR_AFTER_PROCS) since the last *FREQUENCY or *BUCKLE step, after which ccx
-        runs a *STATIC step linearly again (probed, also after an explicit step without
-        NLGEOM).  Contact makes ccx iterate too, but the converter cannot tell whether ccx
-        keeps a contact pair, so a contact model counts as linear."""
-        iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
-        linear: List[bool] = []
-        after = False
-        for (_k, timing, _reqs), step in zip(steps, self.steps):
-            linear.append(timing["proc"] in (None, "STATIC", "VISCO") and
-                          not (step.ccx_nlgeom or after or iterated))
-            if timing["proc"] in CCX_NONLINEAR_AFTER_PROCS:
-                after = True
-            elif timing["proc"] in ("FREQUENCY", "BUCKLE"):
-                after = False
-        return linear
+        nodal state variables): a *STATIC (Riks too, commented out or --approximate's plain
+        *STATIC) or *VISCO step that ccx does not run through its nonlinear solver
+        (_ccx_iterated_steps: NLGEOM in ccx, a material ccx iterates, an earlier dynamic, heat
+        transfer or (un)coupled step since the last *FREQUENCY or *BUCKLE step), or one
+        without a ccx procedure, at which ccx stops (it runs none of its cards).  Contact makes
+        ccx iterate too, but the converter cannot tell whether ccx keeps a contact pair, so a
+        contact model counts as linear."""
+        why = self._ccx_iterated_steps(blocks, contact=False)
+        return [timing["proc"] in (None, "STATIC", "VISCO") and not w
+                for (_k, timing, _reqs), w in zip(steps, why)]
 
     def _el_print_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
                         groups: List[List[Block]]) -> None:
@@ -21464,7 +21453,6 @@ class Converter:
         self.model_labels = self._next_ids()
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
-        self._plan_solver_facts(blocks)         # after _plan_rigid: its unmeshed analytical surfaces
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._plan_pretension_cuts(blocks)      # before the beam upgrades and _plan_pretension_twins
         self._upgrade_section_beams(blocks)
@@ -21482,6 +21470,7 @@ class Converter:
         self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
         self._plan_dp_materials(blocks)         # before the step model: NLGEOM in ccx
         self._read_steps(blocks)                # after the last planner that rewrites a step card
+        self._plan_solver_facts(blocks)         # after the step model and _plan_rigid
         self._reset_emission()                  # (handle_step advances the step cursor)
         self._plan_node_classes(blocks)         # after the mesh planners: the final element types
         self._plan_section_thick(blocks)        # before _plan_rot_nodes: its distributing weights
@@ -21748,18 +21737,29 @@ class Converter:
         (_plan_dp_materials)."""
         self.steps = StepModel(blocks, dp=self._dp_nlgeom)
 
-    def _plan_solver_facts(self, blocks: List[Block]) -> None:
-        """Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
-        linear *EQUATIONs (``_linear_rigid``) in a deck without NLGEOM with a step ccx runs
-        through its nonlinear solver, where it turns their RIGID MPCs with the finite rotation
-        (_rigid_body_lines): an implicit *DYNAMIC or a (un)coupled temperature-displacement
-        step, or a *STATIC (a perturbation one too) or *VISCO step of a model with a material
-        ccx iterates (a kept *PLASTIC, *CREEP, *HYPERELASTIC, *HYPERFOAM, a mechanical *USER
-        MATERIAL; used or not) or a *CONTACT PAIR other than TIED (probed on 2.23; a *VISCO
-        step of elastic materials, gaps, nonlinear springs and knots stay linear) with a line
-        written (_pair_lines comments out those on an analytical surface _plan_rigid did not
-        mesh: runs after it).  ``_dyn_before_nl``: such a step runs before the first NLGEOM
-        step, where ccx turns the RIGID MPCs those decks keep."""
+    def _ccx_iterated_steps(self, blocks: List[Block], contact: bool = True) -> List[str]:
+        """Per step, why ccx 2.23 runs it through its nonlinear solver (nonlingeo: it iterates,
+        and turns RIGID MPCs and shell/beam rotation constraints with the finite rotation), or
+        "" where it runs the step linearly, or no mechanics: the one ccx fact of
+        _plan_solver_facts (rigid constraints), _warn_finite_rotations and _ccx_linear_steps
+        (output; Step.ccx_nlgeom in it is _yield_segfaults').  Probed on 2.23, a mechanical
+        step ccx runs:
+        * under NLGEOM (Step.ccx_nlgeom: by the *STEP cards handle_step writes, and every step
+          with a deformation plasticity material ccx reads);
+        * an implicit *DYNAMIC or a (un)coupled temperature-displacement step; an explicit
+          *DYNAMIC step, NLGEOM=NO too (a rigid body turned 0.5 rad moves finitely turned);
+        * a *STATIC (a static perturbation one too) or *VISCO step of a model with a material
+          ccx iterates (a kept *PLASTIC, *CREEP, *HYPERELASTIC, *HYPERFOAM, a mechanical *USER
+          MATERIAL; used or not) or (``contact``) a *CONTACT PAIR other than TIED with a line
+          written (_pair_lines comments out those on an analytical surface _plan_rigid did not
+          mesh: runs after it); a *VISCO step of elastic materials, gaps, nonlinear springs and
+          knots stay linear;
+        * a *STATIC or *VISCO step after a step of CCX_NONLINEAR_AFTER_PROCS (dynamic, heat
+          transfer, (un)coupled), up to a *FREQUENCY or *BUCKLE step, after which ccx runs a
+          *STATIC step linearly again.
+        ``contact`` False: the output planners, for which a contact model counts as linear
+        (where a pair ends up empty, ccx may not keep it: ELKE and SDV would segfault a linear
+        step, so they err on that side)."""
         def written(b: Block) -> bool:
             return any(not any(t.strip().upper() in self._analytic_skipped for t in ln.split(",")[:2])
                        for ln in b.data if ln.strip())
@@ -21768,19 +21768,42 @@ class Converter:
                          (b.keyword in ("CREEP", "HYPERELASTIC", "HYPERFOAM") and
                           not b.has("TEST DATA INPUT")) or
                          (b.keyword == "USER MATERIAL" and b.uparam("TYPE") != "THERMAL") or
-                         (b.keyword == "CONTACT PAIR" and not b.has("TIED") and written(b))), None)
-        solver: List[str] = []                   # per step: why ccx runs it through its nonlinear solver
-        for group in step_groups(blocks)[1]:
-            solver.append("")
-            for b in group[1:]:
-                if b.keyword == "DYNAMIC" and b.has("EXPLICIT"):
-                    continue
-                if b.keyword in ("DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
-                                 "UNCOUPLED TEMPERATURE-DISPLACEMENT"):
-                    solver[-1] = solver[-1] or f"a *{b.keyword} step"
-                elif iterated and b.keyword in ("STATIC", "VISCO"):
-                    solver[-1] = solver[-1] or f"a *{b.keyword} step with a *{iterated}" + \
-                        ("" if iterated in ("CONTACT PAIR", "USER MATERIAL") else " material")
+                         (contact and b.keyword == "CONTACT PAIR" and not b.has("TIED") and
+                          written(b))), None)
+        why: List[str] = []
+        after = ""                  # a CCX_NONLINEAR_AFTER_PROCS step since the last eigen step
+        for step in self.steps:
+            proc = step.proc
+            if proc not in ("STATIC", "VISCO", "DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
+                            "UNCOUPLED TEMPERATURE-DISPLACEMENT"):
+                why.append("")
+            elif proc == "DYNAMIC" and step.explicit:
+                why.append("an explicit *DYNAMIC step")
+            elif proc not in ("STATIC", "VISCO"):
+                why.append(f"a *{proc} step")
+            elif iterated:
+                why.append(f"a *{proc} step with a *{iterated}" +
+                           ("" if iterated in ("CONTACT PAIR", "USER MATERIAL") else " material"))
+            elif step.ccx_nlgeom:
+                why.append(f"a *{proc} step with a *DEFORMATION PLASTICITY material" if self._dp_nlgeom
+                           else f"a *{proc} step under NLGEOM")
+            else:
+                why.append(f"a *{proc} step after a *{after} step" if after else "")
+            if proc in CCX_NONLINEAR_AFTER_PROCS:
+                after = proc
+            elif proc in ("FREQUENCY", "BUCKLE"):
+                after = ""
+        return why
+
+    def _plan_solver_facts(self, blocks: List[Block]) -> None:
+        """Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
+        linear *EQUATIONs (``_linear_rigid``) in a deck without NLGEOM (Abaqus' small
+        displacements) with a step ccx runs through its nonlinear solver (``_solver_steps``,
+        _ccx_iterated_steps), where it turns their RIGID MPCs with the finite rotation
+        (_rigid_body_lines).  ``_dyn_before_nl``: such a step runs before the first NLGEOM
+        step, where ccx turns the RIGID MPCs those decks keep.  After _read_steps (the NLGEOM
+        ccx runs) and _plan_rigid (its unmeshed analytical surfaces)."""
+        solver = self._ccx_iterated_steps(blocks)
         self._solver_steps = solver
         self._linear_rigid = not self._nl_any and any(solver)
         self._dyn_before_nl = self._nl_any and any(solver[:self._nl_before])

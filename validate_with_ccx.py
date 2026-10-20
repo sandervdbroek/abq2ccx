@@ -2929,8 +2929,9 @@ def rigid_nonlinear_deck(case, ref=False):
     at 0.2) in a *STATIC step of fixed increments; 'kinematic', the same with its top face
     kinematically coupled; 'contact', the elastic column beside a *CONTACT PAIR of two held
     cubes; 'coupled', the column of C3D8T heated by 10 (alpha 1e-3) in a *COUPLED
-    TEMPERATURE-DISPLACEMENT step; 'shell' / 'planar', the S4 / CPS4 strip of a material with a
-    *PLASTIC it never reaches.  ``ref``: the same step and model with the members' DOFs
+    TEMPERATURE-DISPLACEMENT step; 'heat', the elastic column of C3D8T in a *STATIC step after a
+    *HEAT TRANSFER step (ccx iterates it: the RIGID MPC was 7 % off); 'shell' / 'planar', the
+    S4 / CPS4 strip of a material with a *PLASTIC it never reaches.  ``ref``: the same step and model with the members' DOFs
     prescribed to the linear rigid motion (shell, planar: in a linear *STATIC step, as ccx's
     own knots under prescribed rotations diverge in its nonlinear solver)."""
     member = case if case in ("shell", "planar") else "solid"
@@ -2950,6 +2951,11 @@ def rigid_nonlinear_deck(case, ref=False):
             "FIX, 1, 3\n", "FIX, 1, 3\nNALL, 11, 11, 10.\n")
         if not ref:
             deck = deck.replace("TYPE=C3D8,", "TYPE=C3D8T,")
+    elif case == "heat":
+        deck = deck.replace("*DENSITY\n1e-3\n", "*DENSITY\n1e-3\n*CONDUCTIVITY\n1.\n*SPECIFIC HEAT\n1.\n"
+                            "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0.\n").replace(
+            "TYPE=C3D8,", "TYPE=C3D8T,").replace("*STEP", "*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n"
+                                                 "*BOUNDARY\nFIX, 11, 11, 0.\n*END STEP\n*STEP", 1)
     if case == "kinematic" and not ref:
         deck = deck.replace("*RIGID BODY, REF NODE=100, TIE NSET=TIP\n", "*SURFACE, TYPE=NODE, NAME=ST\n"
                             "TIP\n*COUPLING, CONSTRAINT NAME=C1, REF NODE=100, SURFACE=ST\n*KINEMATIC\n")
@@ -2961,6 +2967,22 @@ def rigid_nonlinear_deck(case, ref=False):
             .replace("*BOUNDARY, AMPLITUDE=R\n", "*BOUNDARY\n")
             .replace("*STEP, INC=1000\n*DYNAMIC\n0.01, 1.\n", "*STEP, INC=1000\n" + proc)
             .replace("*STEP\n*STATIC\n", "*STEP, INC=1000\n" + proc))
+
+
+RIGID_EXPLICIT_CUBE = {i + 1: (x, y, z) for i, (x, y, z) in enumerate(
+    (x, y, z) for z in (-0.5, 0.5) for x, y in ((-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)))}
+
+
+def rigid_explicit_deck():
+    """A unit C3D8 cube (density 1) as a *RIGID BODY about its centre node 9, turned 0.5 rad
+    about z by a velocity BC (2.5 rad/s over 0.2 s) in a *DYNAMIC, EXPLICIT step with
+    NLGEOM=NO: Abaqus/Explicit's linear rigid motion u = theta x r."""
+    nodes = "".join(f"{n}, {x}, {y}, {z}\n" for n, (x, y, z) in RIGID_EXPLICIT_CUBE.items())
+    return (f"*NODE\n{nodes}9, 0., 0., 0.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*NSET, NSET=ALL, GENERATE\n1, 8, 1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1.\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*RIGID BODY, REF NODE=9, ELSET=EALL\n*BOUNDARY\n"
+            "9, 1, 5\n*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 0.2\n*BOUNDARY, TYPE=VELOCITY\n9, 6, 6, 2.5\n"
+            "*NODE PRINT, NSET=ALL\nU\n*END STEP\n")
 
 
 TRANSFORM_AXES = ((0.6, 0., 0.8), (0., 1., 0.), (-0.8, 0., 0.6))    # *TRANSFORM 0.6, 0., 0.8, 0., 1., 0.
@@ -9195,12 +9217,12 @@ def main():
         failures += 0 if ok else 1
     # ... and in the other steps without NLGEOM that ccx runs through its nonlinear solver,
     # where it turns them the same way (1.7-7 % off): a plastic material, a contact pair, a
-    # coupled temperature-displacement step; against the linear rigid motion prescribed in the
-    # same step and model
+    # coupled temperature-displacement step, a static step after a heat transfer step; against
+    # the linear rigid motion prescribed in the same step and model
     def both(dat):
         disp = dat_displacements(dat)
         return (disp, dat_el_scalar(dat, "equivalent plastic strain")) if disp else None
-    for case in ("plastic", "kinematic", "contact", "coupled", "shell", "planar"):
+    for case in ("plastic", "kinematic", "contact", "coupled", "heat", "shell", "planar"):
         tag = f"rigid_nonlinear_{case}"
         u, peeq = review_run(rigid_nonlinear_deck(case), tag, both) or ({}, {})
         ref, _ = review_run(rigid_nonlinear_deck(case, True), tag + "_ref", both) or ({}, {})
@@ -9217,6 +9239,7 @@ def main():
                                  "increments",
                     "contact": "a *RIGID BODY on a column beside a *CONTACT PAIR",
                     "coupled": "a *RIGID BODY on a heated C3D8T column, *COUPLED TEMPERATURE-DISPLACEMENT",
+                    "heat": "a *RIGID BODY on a C3D8T column, a *STATIC step after a *HEAT TRANSFER step",
                     "shell": "a *RIGID BODY on S4 members, a *PLASTIC not reached",
                     "planar": "a *RIGID BODY on CPS4 members, a *PLASTIC not reached"}[case].format(yielded)
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}; driven by a node that moves and turns "
@@ -9229,6 +9252,19 @@ def main():
         elif u:
             print(f"FAIL  {tag}: the reference did not solve")
         failures += 0 if ok else 1
+    # ... and in an explicit step with NLGEOM=NO (Abaqus/Explicit runs it geometrically linear;
+    # ccx turned the RIGID MPC finitely: a corner at (0.3008, -0.1788))
+    u = review_run(rigid_explicit_deck(), "rigid_explicit_nlgeom_no", dat_displacements)
+    ok = bool(u) and len(u) == 8
+    if ok:
+        th = 0.5
+        err = max(math.dist(u[n], (-th * y, th * x, 0.0)) for n, (x, y, _z) in RIGID_EXPLICIT_CUBE.items())
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_explicit_nlgeom_no (a C3D8 cube as a *RIGID BODY turned "
+              f"0.5 rad about its centre by a velocity BC in a *DYNAMIC, EXPLICIT step with NLGEOM=NO): "
+              f"its 8 nodes at the linear rigid motion theta x r, max difference {err:.1e} (before: "
+              f"0.087, the finite rotation)")
+    failures += 0 if ok else 1
     # ... the forms that kept ccx's RIGID MPCs there, now equations too: a transformed
     # reference node and a coupling of some translations of transformed nodes (twins of the
     # nodes, _dir_terms), a rotation-only line beside a translation line (rotation ties)

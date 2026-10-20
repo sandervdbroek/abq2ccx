@@ -592,6 +592,17 @@ physics.
 * **No false "ccx segfaults" after an NLGEOM step** — a plastic or creeping model's `*STATIC`
   step after a `*FREQUENCY` step was warned as segfaulting, and flagged reduced physics, also
   where NLGEOM carries on into it in ccx from an earlier step, which ccx solves.
+* **Rigid constraints in more steps ccx iterates** — without NLGEOM, ccx turns its RIGID MPCs
+  with the finite rotation also in a `*STATIC` step after a heat transfer, dynamic or
+  (un)coupled step, with a `*DEFORMATION PLASTICITY` material, and in an explicit step with
+  `NLGEOM=NO` (7 % off at 0.3 rad after a heat transfer step, 25 % at 0.5 rad in an explicit
+  one, without a warning). Rigid bodies and couplings are now the linear `*EQUATION`s Abaqus
+  solves there (exact). One rule now says which steps ccx iterates; after an `*UNCOUPLED
+  TEMPERATURE-DISPLACEMENT` step it also keeps `*EL PRINT ELKE`, which was dropped as for a
+  linear step.
+* **Explicit steps with `NLGEOM=NO`** are geometrically linear in Abaqus/Explicit and in ccx
+  (probed), and no longer count as NLGEOM steps: links, couplings and twists get their linear
+  forms there.
 
 ## 1.4.0 (October 2026)
 
