@@ -4363,7 +4363,7 @@ def hyperfoam_deck(case, foam=True):
     return deck + ("*STEP\n*FREQUENCY\n4\n*END STEP\n" if case == "frequency" else "")
 
 
-def frequency_contact_deck(case, n=2, m=20, gap=0.0, pair="", head="", master="solid"):
+def frequency_contact_deck(case, n=2, m=20, gap=0.0, pair="", head="", master="solid", stresses=False):
     """buckle_gravity_deck's column with a fixed C3D8 plate resting on its top face (a
     frictionless *CONTACT PAIR, Abaqus' default HARD contact), and a plain *FREQUENCY step for
     4 modes: ``case`` "first" (the first step), "after" (after a static step that loads
@@ -4372,7 +4372,8 @@ def frequency_contact_deck(case, n=2, m=20, gap=0.0, pair="", head="", master="s
     plate that far above the top (negative: overclosed), the static step then printing TIP's
     U; ``pair``: more *CONTACT PAIR parameters; ``head``: more *STEP parameters of the
     frequency step; ``master`` "shell": the plate an S4 one 0.01 thick, ``gap`` from its SNEG
-    face; "rigid": an R3D4 one on a fixed reference node."""
+    face; "rigid": an R3D4 one on a fixed reference node; ``stresses``: the static step also
+    printing BASE's total reaction and the column's stresses."""
     deck = buckle_gravity_deck("", buckle=False, n=n, m=m)
     lines = ["*ELSET, ELSET=ETOP", ", ".join(map(str, range((m - 1) * n * n + 1, m * n * n + 1)))]
     if case in ("first", "after"):
@@ -4403,7 +4404,9 @@ def frequency_contact_deck(case, n=2, m=20, gap=0.0, pair="", head="", master="s
     elif case == "held":
         lines += ["*NSET, NSET=TOPN, ELSET=ETOP", "*BOUNDARY", "TOPN, 3, 3"]
     if case == "after":
-        lines += ["*STEP", "*STATIC"] + (["*NODE PRINT, NSET=TIP", "U"] if gap else []) + ["*END STEP"]
+        lines += ["*STEP", "*STATIC"] + (["*NODE PRINT, NSET=TIP", "U"] if gap else []) + \
+            (["*NODE PRINT, NSET=BASE, TOTALS=ONLY", "RF", "*EL PRINT, ELSET=EALL", "S"] if stresses else []) + \
+            ["*END STEP"]
     return deck + "\n".join(lines + ["*STEP" + head, "*FREQUENCY", "4", "*END STEP"]) + "\n"
 
 
@@ -9931,21 +9934,36 @@ def main():
               f"--approximate): PERTURBATION {approx[0][0]:.7g} ({err:.1e} from the deck's), "
               f"touching {touch[0]:.7g}, plain {free[0]:.7g}; TIP pressed down {approx[1][2]:.3g}")
     failures += 0 if ok else 1
-    # surface-to-surface ADJUST moves the slave nodes strain-free in ccx 2.23 too: PERTURBATION
-    # as touching (that formulation's frequency spreads by a few % at a zero gap, and between
-    # ccx builds: conda-forge's 2.23 gives touching 39.24 and ADJUST 3.6 % below it, FreeCAD's
-    # 37.54 and 2.0 % above); the strain-free part is TIP at rest in the static step
+    # surface-to-surface ADJUST moves the slave nodes strain-free in ccx 2.23 too: the static
+    # step leaves no reaction or stress, where the same pair without ADJUST presses TIP down,
+    # and PERTURBATION brings the contact in.  Not compared with touching: that formulation's
+    # zero-gap frequency differs by 4 % between ccx builds, as much as the prestress moves it
     s2s = ", TYPE=SURFACE TO SURFACE"
-    adj_s = review_run(frequency_contact_deck("after", gap=-5e-4, pair=s2s + ", ADJUST=0."),
-                       "frequency_base_overclosed_s2s_adjusted", eig)
-    touch_s = review_run(frequency_contact_deck("after", pair=s2s), "frequency_base_touching_s2s", eig)
-    ok = bool(adj_s and touch_s and free and adj_s[0] and touch_s[0])
+
+    def static_state(dat):
+        """(frequencies, (TIP's u, BASE's total reaction, the column's largest |stress|) as the
+        static step printed them last), or None."""
+        last = {t: rows for step, t, _, _, rows in A.dat_blocks(dat) if step == 1 and rows}
+        if not all(t in last for t in ("displacements", "total force", "stresses")):
+            return None
+        return (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"),
+                (last["displacements"][0][1:], last["total force"][0],
+                 max(abs(x) for r in last["stresses"] for x in r[2:])))
+    adj_s, over_s = [review_run(frequency_contact_deck("after", gap=-5e-4, pair=s2s + p, stresses=True),
+                                "frequency_base_overclosed_s2s" + tag, static_state)
+                     for p, tag in ((", ADJUST=0.", "_adjusted"), ("", ""))]
+    ok = bool(adj_s and over_s and free and adj_s[0] and over_s[0])
     if ok:
-        err = abs(ccx_ratio(adj_s[0][0], touch_s[0][0]) - 1)
-        ok = err < 0.06 and adj_s[0][0] > 1.4 * free[0] and abs(adj_s[1][2]) < 1e-9
+        (u, rf, s), (u0, rf0, s0) = adj_s[1], over_s[1]
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(over_s[0], free))
+        left = max(ccx_ratio(max(map(abs, u)), abs(u0[2])), ccx_ratio(max(map(abs, rf)), abs(rf0[2])),
+                   ccx_ratio(s, s0))
+        ok = err < 1e-9 and u0[2] < -1e-5 and left < 1e-6 and adj_s[0][0] > 1.2 * free[0]
         print(f"{'PASS' if ok else 'FAIL'}  frequency_base_overclosure_s2s_adjust (as above, a "
-              f"surface-to-surface pair, ADJUST=0.): {adj_s[0][0]:.7g}, {err:.1%} from touching "
-              f"{touch_s[0][0]:.7g}, free {free[0]:.7g}; TIP {adj_s[1][2]:.2g} in the static step")
+              f"surface-to-surface pair): without ADJUST the static step presses TIP down "
+              f"{u0[2]:.3g} (base reaction {rf0[2]:.4g}, stress up to {s0:.3g}), plain {over_s[0][0]:.7g} "
+              f"as without the plate ({err:.1e} apart); ADJUST=0. leaves {left:.1e} of TIP's u, the "
+              f"reaction and the stress, PERTURBATION {adj_s[0][0]:.7g} (free {free[0]:.7g})")
     failures += 0 if ok else 1
     # an overclosure against a shell master's face (half its thickness below its nodes, as
     # Abaqus' surface-to-surface contact counts it) or a rigid one's: the plain step, as
