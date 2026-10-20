@@ -6,6 +6,21 @@ physics.
 
 ## Unreleased
 
+* **Steps ccx cannot run: Riks and complex frequency** — a `*STATIC, RIKS` step without
+  `--approximate` had only its procedure commented out, and ccx repeated the previous step's
+  procedure (after a static step a load-controlled `*STATIC`) without a word; a `*COMPLEX
+  FREQUENCY` step, whose damped modes ccx does not compute (it takes only `CORIOLIS` or
+  `FLUTTER`), stopped ccx at input. Both now get `*NO ANALYSIS`, where ccx stops after the
+  steps before it, with the step's other cards as comments (warned, reduced physics).
+* **`*MODAL DYNAMIC` increments** — ccx stopped such a step at 100 increments (or its `INC=`),
+  where Abaqus runs every increment of the step's period: `INC=` is now written.
+* **A `*FREQUENCY` step's own loads** — Abaqus ignores them; ccx carried them into the next
+  general step and took them off over it (its first increment 7.5 % of the motion off under
+  NLGEOM). They are now commented out.
+* **Print cards after modal and steady-state dynamics** — the empty `*NODE PRINT`, `*EL PRINT`
+  or `*CONTACT PRINT` written in such a step of a plastic model (ccx 2.23 segfaults on what it
+  would carry there) also ended the request for the later general steps, which Abaqus prints:
+  the next general step now gets the cards again.
 * **Face loads of different sources across steps** — Abaqus adds a later step's `*DLOAD` /
   `*DSLOAD` to an earlier one on the same faces when it comes from another surface, element set
   or card; ccx 2.23 keeps one value per face and the later line replaced it (a tip pressure of
@@ -73,9 +88,8 @@ physics.
   table now covers each modal dynamic step's time period too.
 * **More ccx 2.23 segfaults with a plastic or creeping material** — contact output (CDIS, CSTR,
   CELS) in modal and steady-state dynamics steps, own or carried in, is now left out there with
-  a warning; a `*COMPLEX FREQUENCY` step is warned (reduced physics). `*FREQUENCY` steps after
-  an NLGEOM step no longer report their FOLLOWER options and tractions as reduced physics:
-  Abaqus ignores their loads.
+  a warning. `*FREQUENCY` steps after an NLGEOM step no longer report their FOLLOWER options
+  and tractions as reduced physics: Abaqus ignores their loads.
 * **Pre-tension of a truss or beam cut** — ccx 2.23 deletes the element a `*PRE-TENSION
   SECTION, ELEMENT=` names and ties its end nodes along the normal only: the closure of a held
   bolt missed the element's own length (33 % low for a bolt of two elements), no shear, moment

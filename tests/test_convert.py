@@ -2012,17 +2012,48 @@ def test_initial_stress_geostatic_commented():
 
 def test_approximate_riks_and_default_off():
     # ccx has no Riks solver and would silently run a passed-through *STATIC, RIKS as a
-    # load-controlled static step, so by default the procedure is commented out (ccx then
-    # stops at that step); --approximate reframes it as plain *STATIC.
+    # load-controlled static step, so by default the procedure is commented out and *NO
+    # ANALYSIS written: ccx stops at that step (without a procedure card it would repeat the
+    # previous step's, probed); --approximate reframes it as plain *STATIC.
     deck = ("*Node\n1,0,0,0\n2,1,0,0\n*Element,type=T3D2,elset=E\n1,1,2\n"
             "*Step\n*Static, RIKS\n0.01,1.,1e-5,0.1\n*End Step\n")
-    body, _, rep = convert_str(deck)
+    body, conv, rep = convert_str(deck)
     live = [l for l in body.splitlines() if not l.startswith("**")]
-    assert not any(l.upper().startswith("*STATIC") for l in live)
+    assert not any(l.upper().startswith("*STATIC") for l in live) and "*NO ANALYSIS" in live
     assert "** *STATIC, RIKS" in body and "--approximate" in rep.text()
+    assert conv.reduced_physics == ["*STATIC, RIKS step (ccx has no arc-length solver)"]
     body, _, rep = convert_str(deck, approximate=True)
     lines = [l for l in body.splitlines() if l.upper().startswith("*STATIC")]
     assert lines == ["*STATIC"] and "[APPROX]" in rep.text()
+
+
+def test_riks_and_complex_frequency_steps_stop_ccx():
+    # *NO ANALYSIS in place of the commented-out procedure: ccx stops at the step (without a
+    # procedure card it would repeat the previous step's, probed); the step's other cards stay
+    # as comments, and after a first step an empty *EL FILE ends the carried one, on which ccx
+    # 2.23 crashes there (rc 11, probed).  ccx 2.23's *COMPLEX FREQUENCY needs CORIOLIS or
+    # FLUTTER (no damping): Abaqus' damped complex modes have no counterpart
+    model = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    st = _deck_step("Static", "*Cload\n7, 1, 1.\n")
+    riks = _deck_step("Static, riks\n0.1, 1.", "*Cload\n7, 1, 2.\n*Node Print, nset=ALL\nU\n")
+    body, conv, rep = convert_str(model + st + riks)
+    second = body.split("*STEP")[2]
+    assert second.endswith("** *STATIC, RIKS\n** 0.1, 1.\n*NO ANALYSIS\n** abq2ccx: an empty *EL FILE: "
+                           "ccx 2.23 crashes on an earlier step's here\n*EL FILE\n** abq2ccx: the step's "
+                           "other cards, which ccx does not reach:\n** *CLOAD\n** 7, 1, 2.\n"
+                           "** *NODE PRINT, NSET=ALL\n** U\n*END STEP"), second
+    assert conv.reduced_physics == ["*STATIC, RIKS step (ccx has no arc-length solver)"]
+    assert not conv.unloaded_steps and "ccx stops at this step" in rep.text()
+    body, _, _ = convert_str(model + riks)
+    assert "*NO ANALYSIS\n** abq2ccx: the step's other cards" in body and "*EL FILE\n" not in body
+    cf = _deck_step("Complex Frequency, friction damping=NO\n2")
+    body, conv, rep = convert_str(model + _deck_step("Frequency\n4") + cf)
+    assert body.split("*STEP")[2].endswith("** *COMPLEX FREQUENCY, FRICTION DAMPING=NO\n** 2\n"
+                                           "*NO ANALYSIS\n** abq2ccx: an empty *EL FILE: ccx 2.23 "
+                                           "crashes on an earlier step's here\n*EL FILE\n*END STEP")
+    assert conv.reduced_physics == ["*COMPLEX FREQUENCY step (no ccx counterpart)"]
+    assert "computes Coriolis (CORIOLIS) or flutter (FLUTTER) modes only" in rep.text()
 
 
 def test_explicit_dynamics_native():
@@ -4099,13 +4130,14 @@ def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
         assert re.search(r"\*EL FILE[^\n]*\nS\n", _step(body, k)) and "SDV" not in _step(body, k), \
             _step(body, k)
         assert f"*EL FILE SDV dropped {why}" in rep.text(), steps
-    # a Riks step without NLGEOM is a plain linear *STATIC under --approximate (and commented out,
-    # so ccx stops there, without it)
+    # a Riks step without NLGEOM is a plain linear *STATIC under --approximate (without it ccx
+    # stops there, *NO ANALYSIS: the step's cards are comments)
     riks = "*Step\n*Static, riks\n0.1, 1., , , 1.\n" + load + out + "*End Step\n"
-    for approximate in (True, False):
-        body, _, rep = convert_str(HEX + depvar + bc + riks, approximate=approximate)
-        assert "SDV" not in _step(body, 1) and "*EL FILE SDV dropped from a linear *STATIC step" \
-            in rep.text(), approximate
+    body, _, rep = convert_str(HEX + depvar + bc + riks, approximate=True)
+    assert "SDV" not in _step(body, 1) and "*EL FILE SDV dropped from a linear *STATIC step" in rep.text()
+    body, _, rep = convert_str(HEX + depvar + bc + riks)
+    assert "*NO ANALYSIS\n" in _step(body, 1) and \
+        all(ln.startswith("**") for ln in _step(body, 1).splitlines() if "SDV" in ln)
     # a step ccx iterates (NLGEOM, also carried on; a plastic or hyperelastic material), a
     # model without state variables and a *MODAL DYNAMIC step keep it
     plastic = STEEL.replace("*Density", "*Plastic\n250., 0.\n*Density")
@@ -5653,7 +5685,7 @@ def test_body_forces_of_perturbation_steps_removed():
     deck = (BAR3 + "*Step\n*Static\n*Dload\nALL, GRAV, 2., -1., 0., 0.\n*End Step\n{}"
             "*Step\n*Static\n*End Step\n")
     for pert in ("*Step, perturbation\n*Static\n*Dload\nALL, BX, 3.\n*End Step\n",
-                 "*Step\n*Frequency\n3\n*Dload\nALL, BX, 3.\n*End Step\n"):
+                 "*Step\n*Buckle\n3\n*Dload\nALL, BX, 3.\n*End Step\n"):
         body, _, _ = convert_str(deck.format(pert))
         assert "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nALL, GRAV, 2., -1., 0., 0.\n" + ZERO_BODY + \
                "ALL, BX, 0.\n" in body.split("*STEP")[3]
@@ -5762,20 +5794,26 @@ def test_general_step_after_perturbation_gets_the_base_state():
     # step 3, its BC held node 6) and zeroes prescribed BC values.  So step 3 starts with the
     # base state given again, at once (the constant amplitude), without the load it gives
     # itself (ccx adds up a load given twice in one step), and with OP=NEW on the *BOUNDARY
-    # where the perturbation step held a DOF the base state leaves free
+    # where the perturbation step held a DOF the base state leaves free.  (The *FREQUENCY step's
+    # *CLOAD is commented out, Abaqus ignores it: ccx keeps step 1's; a *BUCKLE step's, which
+    # ccx carries on, goes with a bare OP=NEW card)
     body, conv, rep = convert_str(PERT.format("*Cload\n7, 2, 1.\n*Boundary\n6, 1, 1, 0.5\n",
                                               "*Cload\n7, 1, 2.\n"))
     steps = body.split("*STEP")
     assert steps[0].endswith("*AMPLITUDE, NAME=ABQ2CCX_HOLD\n0, 1, 1, 1\n")
     assert "HOLD" not in steps[1] + steps[2] and "OP=NEW" not in steps[2]
+    assert "** *CLOAD\n** 7, 2, 1.\n*BOUNDARY\n6, 1, 1, 0.5\n" in steps[2]
     assert steps[3].startswith("\n*STATIC\n** abq2ccx: the loads, BCs and temperatures of step 1 "
                                "given again (linear perturbation step(s) 2 in between)\n"
                                "*BOUNDARY, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
-                               "8, 2, 2, 0.1\n*CLOAD, OP=NEW\n*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n"
+                               "8, 2, 2, 0.1\n*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n"
                                "1, P2, 1.\n*TEMPERATURE, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nALL, 100.\n"
                                "*CLOAD\n7, 1, 2.\n"), steps[3]
     assert "Step 3 follows a linear perturbation step" in rep.text()
     assert not conv.reduced_physics and not conv.unloaded_steps
+    third = convert_str(PERT.replace("*Frequency\n3\n", "*Buckle\n2\n").format(
+        "*Cload\n7, 2, 1.\n", "*Cload\n7, 1, 2.\n"))[0].split("*STEP")[3]
+    assert "8, 2, 2, 0.1\n*CLOAD, OP=NEW\n*DLOAD, OP=NEW" in third and third.count("*CLOAD") == 2
     # a changed value needs no OP=NEW; nor does a *FREQUENCY step without cards, after which
     # ccx 2.23 still has zeroed the prescribed values (from the first nonzero line on)
     third = convert_str(PERT.format("*Boundary\n8, 2, 2, 0.3\n", ""))[0].split("*STEP")[3]
@@ -5863,7 +5901,7 @@ def test_perturbation_step_nodal_forces_do_not_carry_over():
     # starts from: step 3 re-gives its own traction (the same as step 2's), or none
     deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
             "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Surface, name=S2\nEALL, S2\n"
-            "*Step\n*Static\n*Dsload\nS2, TRVEC, 1., 1., 0., 0.\n*End Step\n*Step\n*Frequency\n3\n"
+            "*Step\n*Static\n*Dsload\nS2, TRVEC, 1., 1., 0., 0.\n*End Step\n*Step\n*Buckle\n3\n"
             "*Dsload\nS2, TRVEC, 2., 1., 0., 0.\n*End Step\n*Step\n*Static\n{}*End Step\n")
     body, _, _ = convert_str(deck.format("*Dsload\nS2, TRVEC, 2., 1., 0., 0.\n"))
     assert _cloads(body)[2] == {(n, 1): 0.5 for n in (5, 6, 7, 8)}
@@ -5871,10 +5909,11 @@ def test_perturbation_step_nodal_forces_do_not_carry_over():
     body, _, _ = convert_str(deck.format(""))
     assert _cloads(body)[2] == {(n, 1): 0.25 for n in (5, 6, 7, 8)}
     assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 1, 0.25" in body
-    # ccx holds step 2's forces until the restore, and a *BUCKLE step drops the earlier ones:
-    # its own are given in full (they were left out as unchanged, and it buckled under none)
-    buckle = deck.replace("*Step\n*Static\n{}*End Step\n", "*Step\n*Buckle\n2\n*Dsload\n"
-                          "S2, TRVEC, 1., 1., 0., 0.\n*End Step\n*Step\n*Static\n*End Step\n")
+    # a *BUCKLE step drops the earlier forces: its own are given in full (they were left out
+    # as unchanged, and it buckled under none), also after a *FREQUENCY step
+    buckle = deck.replace("*Buckle\n3\n", "*Frequency\n3\n").replace(
+        "*Step\n*Static\n{}*End Step\n", "*Step\n*Buckle\n2\n*Dsload\nS2, TRVEC, 1., 1., 0., 0.\n"
+        "*End Step\n*Step\n*Static\n*End Step\n")
     assert _cloads(convert_str(buckle)[0])[2:] == [{(n, 1): 0.25 for n in (5, 6, 7, 8)}] * 2
     buckle = buckle.replace("*Step\n*Frequency\n3\n*Dsload\nS2, TRVEC, 2., 1., 0., 0.\n*End Step\n", "")
     assert _cloads(convert_str(buckle)[0])[1] == {(n, 1): 0.25 for n in (5, 6, 7, 8)}
@@ -6659,48 +6698,77 @@ def test_analytic_amplitudes_over_modal_dynamic_steps():
         assert "*AMPLITUDE, NAME=P" in body and "** *AMPLITUDE" not in body
 
 
+def test_modal_dynamic_step_increments():
+    # Abaqus runs every increment of a *MODAL DYNAMIC step (INC has no effect there, Keywords
+    # *STEP); ccx stops at INC= (default 100), running ceil(period / increment) increments
+    # (probed): INC= written where more are needed (validate_with_ccx.py modal_increments)
+    freq = _deck_step("Frequency, storage=yes\n2")
+    for head, line, want in (("", "1e-4, 0.03", "*STEP, INC=300"), ("", "0.001, 0.1001", "*STEP, INC=101"),
+                             ("", "1e-4, 0.01", "*STEP"), (", inc=50", "0.001, 0.08", "*STEP, INC=80"),
+                             (", inc=1000", "1e-4, 0.03", "*STEP, INC=1000")):
+        body, _, rep = convert_str(BUCKLE_CUBE + freq + _deck_step(f"Modal Dynamic\n{line}",
+                                                                   "*Cload\n7, 3, 1.\n", head))
+        assert "*STEP" + body.split("*STEP")[2].split("\n")[0] == want, (line, head)
+        assert ("ccx stops at INC= (default 100)" in rep.text()) == (want[-4:] not in ("STEP", "1000"))
+
+
+def test_frequency_step_loads_commented_out():
+    # Abaqus ignores the loads of a *FREQUENCY step; ccx 2.23 carries them into the next general
+    # step and takes them off over it, which shifts its mid-step results (probed;
+    # validate_with_ccx.py frequency_own_cload): commented out, and the base state needs no
+    # restore for them
+    deck = (BUCKLE_CUBE + _deck_step("Static", "*Cload\n7, 3, -1.\n") +
+            _deck_step("Frequency\n2", "*Cload\n7, 1, 5.\n*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n") +
+            _deck_step("Static", "*Cload\n7, 3, -2.\n"))
+    body, conv, rep = convert_str(deck)
+    steps = body.split("*STEP")
+    assert "** *CLOAD\n** 7, 1, 5.\n** abq2ccx: Loads of a *FREQUENCY step" in steps[2]
+    assert "** *DLOAD\n** EALL, GRAV, 9.81, 0., 0., -1.\n" in steps[2] and _cloads(body)[1] == {}
+    assert "given again" not in steps[3] and _cloads(body)[2] == {(7, 3): -2.0}
+    assert not conv.reduced_physics and not conv.unloaded_steps
+
+
 def test_nlgeom_load_options_in_perturbation_steps():
-    # Abaqus ignores the loads of a *FREQUENCY step (Abaqus 2017, natural frequency extraction),
-    # so after an NLGEOM step a FOLLOWER option and a traction's undeformed nodal forces change
-    # nothing there (code review 2, slice 2 S4: warned as reduced physics, the traction dropped).
-    # Another perturbation step about an NLGEOM base state keeps them: Abaqus loads it on the
-    # deformed base geometry, with the load stiffness of follower loads (eigenvalue buckling)
+    # Abaqus ignores the loads of a *FREQUENCY step (Abaqus 2017, natural frequency extraction):
+    # they are commented out, so after an NLGEOM step a FOLLOWER option and a traction's
+    # undeformed nodal forces change nothing there (code review 2, slice 2 S4: warned as reduced
+    # physics, the traction dropped), and ccx does not take them off over the next general step
+    # (validate_with_ccx.py frequency_own_loads_nlgeom).  Another perturbation step about an
+    # NLGEOM base state keeps them: Abaqus loads it on the deformed base geometry, with the
+    # load stiffness of follower loads (eigenvalue buckling)
     deck = HEX + "*Surface, name=TOP\nEALL, S2\n" + _deck_step("Static", "*Cload\n7, 1, 1.\n", ", nlgeom")
     own = "*Cload, follower\n6, 1, 1.\n*Dsload\nTOP, TRVEC, 4., 0., 0., -1.\n"
     body, conv, rep = convert_str(deck + _deck_step("Frequency\n2", own))
-    assert not conv.reduced_physics and "under NLGEOM" not in rep.text()
-    assert "*CLOAD, FOLLOWER=YES dropped: ccx concentrated loads keep their direction (no effect: " \
-           "Abaqus ignores the loads of a *FREQUENCY step)." in rep.text()
-    assert _cloads(body)[1] == {(6, 1): 1.0, **{(n, 3): -1.0 for n in (5, 6, 7, 8)}}
+    assert not conv.reduced_physics and "under NLGEOM" not in rep.text() and "FOLLOWER" not in rep.text()
+    assert "Loads of a *FREQUENCY step commented out: Abaqus ignores them" in rep.text()
+    assert _cloads(body)[1] == {} and "** *CLOAD, FOLLOWER\n** 6, 1, 1.\n" in body
     for proc, head in (("Buckle\n2", ""), ("Static", ", perturbation")):
         body, conv, rep = convert_str(deck + _deck_step(proc, own, head))
         assert conv.reduced_physics[-2:] == ["*CLOAD, FOLLOWER=YES under NLGEOM", "*DSLOAD TRVEC load dropped"]
         assert _cloads(body)[1] == {(6, 1): 1.0}
-    # a FOLLOWER=NO pressure in a frequency step after NLGEOM: a note
-    _, conv, rep = convert_str(deck + _deck_step("Frequency\n2", "*Dsload, follower=no\nTOP, P, 1.\n"))
-    assert "*DSLOAD parameter FOLLOWER dropped (not read by ccx; no effect: Abaqus ignores the loads " \
-           "of a *FREQUENCY step)." in rep.text() and not conv.reduced_physics
+    # a FOLLOWER=NO pressure in a frequency step after NLGEOM: commented out too
+    body, conv, rep = convert_str(deck + _deck_step("Frequency\n2", "*Dsload, follower=no\nTOP, P, 1.\n"))
+    assert "** *DSLOAD, FOLLOWER=no\n** TOP, P, 1.\n" in body and not conv.reduced_physics
 
 
 def test_plastic_material_where_ccx_segfaults_other_procedures():
-    # more of what ccx 2.23 segfaults on with a plastic or creeping material (probed): any
-    # *COMPLEX FREQUENCY step (written with CORIOLIS), and contact output (CDIS, CSTR, CELS) in
-    # modal and steady-state dynamics, own or carried in (a bare card ends that; validate_with_ccx.py
-    # plastic_contact_modal_output).  A *STATIC, RIKS step without --approximate has its procedure
-    # commented out, so ccx repeats the previous one there and does not segfault (probed)
+    # more of what ccx 2.23 segfaults on with a plastic or creeping material (probed): contact
+    # output (CDIS, CSTR, CELS) in modal and steady-state dynamics, own or carried in (a bare
+    # card ends that; validate_with_ccx.py plastic_contact_modal_output).  ccx stops at a
+    # *COMPLEX FREQUENCY step (it would segfault in one written with CORIOLIS) and at a *STATIC,
+    # RIKS step without --approximate (*NO ANALYSIS): no segfault warning there
     pl = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
           "*Plastic\n10., 0.\n20., 0.1\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
           "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
     load = "*Cload\n7, 1, 1.\n"
     st, freq = _deck_step("Static", load), _deck_step("Frequency, storage=yes\n2")
     _, conv, rep = convert_str(pl + st + freq + _deck_step("Complex Frequency\n2"))
-    assert "*COMPLEX FREQUENCY step 3 in a model with a plastic or creeping material: ccx 2.23 " \
-           "segfaults in it" in rep.text()
-    assert conv.reduced_physics == ["*COMPLEX FREQUENCY step with a plastic or creeping material "
-                                    "(ccx 2.23 segfaults)"]
+    assert "segfaults" not in rep.text()
+    assert conv.reduced_physics == ["*COMPLEX FREQUENCY step (no ccx counterpart)"]
     riks = _deck_step("Static, riks\n0.1, 1.", load)
     _, conv, rep = convert_str(pl + st + freq + riks)
-    assert "segfaults" not in rep.text() and not conv.reduced_physics
+    assert "segfaults" not in rep.text()
+    assert conv.reduced_physics == ["*STATIC, RIKS step (ccx has no arc-length solver)"]
     _, conv, rep = convert_str(pl + st + freq + riks, approximate=True)
     assert "Step 3 (*STATIC, no NLGEOM) after a *FREQUENCY step" in rep.text()
     # contact: a block on the cube; Abaqus' preselected contact output and a *CONTACT PRINT of
@@ -6726,6 +6794,40 @@ def test_plastic_material_where_ccx_segfaults_other_procedures():
     # an elastic model keeps them (CFN goes: ccx prints it for face-to-face pairs only)
     body, _, rep = convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + blk + st + freq + ssd)
     assert "*CONTACT PRINT\nCSTR\n" in body and "segfaults computing" not in rep.text()
+    # the general step after the modal dynamics step gets step 1's *CONTACT PRINT again: the
+    # bare one ended it in ccx, Abaqus carries it into the later general steps
+    body, _, rep = convert_str(pl + blk + st + freq + _deck_step("Modal Dynamic\n0.1, 0.5", load) +
+                               _deck_step("Static", load))
+    assert body.split("*STEP")[4].endswith("*CONTACT PRINT\nCSTR, CDIS\n*END STEP")
+
+
+def test_print_cards_ended_in_modal_steps_written_again():
+    # a bare *NODE PRINT / *EL PRINT in a modal dynamics step of a plastic model (ccx 2.23 would
+    # segfault on RF or element output there) ends the cards ccx carries: the next general step
+    # without such cards gets those of the general step Abaqus carries them from (Output to the
+    # data and results files: a general step's requests apply to the later general steps;
+    # validate_with_ccx.py modal_bare_prints_carried)
+    pl = (HEX + "*Nset, nset=TIP\n7\n*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n10., 0.\n"
+          "20., 0.1\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
+          "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    load = "*Cload\n7, 1, 1.\n"
+    prints = "*Node Print, nset=TIP\nU, RF\n*El Print, elset=EALL\nS\n"
+    st, freq = _deck_step("Static", load + prints, ", nlgeom"), _deck_step("Frequency, storage=yes\n2")
+    md, last = _deck_step("Modal Dynamic\n0.1, 0.5", load), _deck_step("Static", load)
+    body, _, rep = convert_str(pl + st + freq + md + last)
+    steps = body.split("*STEP")
+    assert steps[3].endswith("*EL PRINT, ELSET=EALL\n*NODE PRINT, NSET=TIP\n*END STEP\n"), steps[3]
+    assert steps[4].endswith("*NODE PRINT, NSET=TIP\nU, RF\n*EL PRINT, ELSET=EALL\nS\n*END STEP"), steps[4]
+    assert "Step 1's *NODE PRINT cards written again in step 4: Abaqus carries them into it, ccx " \
+           "would not after the empty *NODE PRINT of step 3." in rep.text()
+    # once only; a general step with cards of its own, and an elastic model, need none
+    body, _, _ = convert_str(pl + st + freq + md + last + last)
+    assert body.count("*NODE PRINT, NSET=TIP\nU, RF\n") == 2
+    own = _deck_step("Static", load + "*Node Print, nset=TIP\nU\n")
+    fourth = convert_str(pl + st + freq + md + own)[0].split("*STEP")[4]
+    assert fourth.count("*NODE PRINT") == 1 and "*EL PRINT, ELSET=EALL\nS\n" in fourth
+    body, _, _ = convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + st + freq + md + last)
+    assert body.count("*NODE PRINT") == 1
 
 
 def test_buckle_perturbation_prescribed_displacements():
@@ -9532,7 +9634,8 @@ def test_default_amplitude_ramps_displacement_bcs_where_ccx_steps_them():
         st = _without_output("*STEP" + _step(body, 1))
         assert st.startswith(head), (step, proc, st)
         assert (f"{RAMP}\nTOP, 3, 3, 0.1\n" in st) == ramped, (step, proc, st)
-        assert "*CLOAD\n5, 1, 1.\n" in st, (step, proc)                # loads: the step's default
+        assert ("*CLOAD\n5, 1, 1.\n" in st) == (proc != "*Frequency"), (step, proc)  # loads: the
+        # step's default (a *FREQUENCY step's are commented out: Abaqus ignores them)
         assert ("'always a RAMP function'" in rep.text()) == ramped
     # an amplitude, FIXED, a velocity or the temperature: as given
     for card in ("*Boundary, amplitude=A\nTOP, 3, 3, 0.1\n", "*Boundary, fixed\nTOP, 3, 3\n",

@@ -2950,6 +2950,37 @@ def frequency_loads_deck(loads=True):
             "*STEP\n*STATIC\n0.5, 1.\n*CLOAD\n19, 2, 2.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
 
 
+def frequency_cload_deck(loads=True):
+    """after_pert_deck's column (elastic): an NLGEOM static step pushing its top sideways, a
+    *FREQUENCY step with a *CLOAD and gravity of its own (``loads``), which Abaqus ignores, then
+    a static step pulling the top the other way in two increments (NLGEOM: a linear one runs in
+    one): as without them."""
+    own = "*CLOAD\n10, 3, 3.\n*DLOAD\nEALL, GRAV, 9.81, 0., 0., -1.\n" if loads else ""
+    return (after_pert_model() + "*STEP, NLGEOM\n*STATIC\n*CLOAD\n19, 1, 1.\n*END STEP\n"
+            f"*STEP\n*FREQUENCY\n4\n{own}*END STEP\n"
+            "*STEP\n*STATIC\n0.5, 1.\n*CLOAD\n19, 2, 2.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def modal_increments_deck(inc=""):
+    """after_pert_deck's column (elastic): *FREQUENCY, then a *MODAL DYNAMIC step of 300
+    increments (0.001 over 0.3) loading its top, ``inc`` on its *STEP card."""
+    return (after_pert_model() + "*STEP\n*FREQUENCY, STORAGE=YES\n4\n*END STEP\n"
+            f"*STEP{inc}\n*MODAL DYNAMIC\n0.001, 0.3\n*CLOAD\n19, 2, 1.\n*NODE PRINT, NSET=TOP\nU\n"
+            "*END STEP\n")
+
+
+def modal_bare_prints_deck(twin=False):
+    """after_pert_deck's plastic column (elastic throughout): an NLGEOM static step printing the
+    top's U and RF, *FREQUENCY, a *MODAL DYNAMIC step (where ccx 2.23 would segfault on RF: a
+    bare *NODE PRINT ends it), then a static step without print cards, into which Abaqus
+    carries the first step's; ``twin``: that step gives them itself."""
+    out = "*NODE PRINT, NSET=TOP\nU, RF\n"
+    return (after_pert_model(True) + f"*STEP, NLGEOM\n*STATIC\n*CLOAD\nTOP, 2, 0.1\n{out}*END STEP\n"
+            "*STEP\n*FREQUENCY, STORAGE=YES\n4\n*END STEP\n*STEP\n*MODAL DYNAMIC\n0.01, 0.1\n"
+            "*CLOAD\n19, 2, 1.\n*END STEP\n*STEP\n*STATIC\n0.5, 1.\n*CLOAD\nTOP, 2, 0.2\n"
+            f"{out if twin else ''}*END STEP\n")
+
+
 def modal_own_loads_deck(base=True):
     """A unit C3D8 cube (E 1000, nu 0, rho 1e-3) held statically at three corners: a static
     step loads it (``base``: a *CLOAD, a face pressure, gravity and a traction, which becomes
@@ -7167,8 +7198,10 @@ def main():
     failures += 0 if ok else 1
     # contact output in modal / steady-state dynamics of a plastic model (ccx 2.23 segfaulted:
     # dropped), an analytic amplitude in a *MODAL DYNAMIC step (tabulated over the general
-    # steps' time only), and a *FREQUENCY step's own loads after NLGEOM (Abaqus ignores them;
-    # a traction was dropped as reduced physics, now converted: harmless)
+    # steps' time only), a *FREQUENCY step's own loads after NLGEOM (Abaqus ignores them; a
+    # traction was dropped as reduced physics, then converted, and ccx took them off over the
+    # next step: commented out), a *MODAL DYNAMIC step's increments (ccx stopped at 100) and the
+    # print cards a bare one in a modal step ended in ccx (written again in the next general step)
     eig = "E I G E N V A L U E   O U T P U T"
     for tag, decks, last, what, was in (
             ("plastic_contact_modal_output", [plastic_contact_deck("modal", t) for t in (False, True)],
@@ -7186,9 +7219,21 @@ def main():
              False, "the same on TIME=TOTAL TIME after a 0.25 static step", "1.1 of the motion apart: "
              "the table ended at 0.25"),
             ("frequency_own_loads_nlgeom", [frequency_loads_deck(t) for t in (True, False)],
-             True, "the column pushed sideways under NLGEOM, a *FREQUENCY step with a traction and a "
-             "*CLOAD, FOLLOWER of its own, then pulled: frequencies and the last step's end as "
-             "without them", "the traction dropped as reduced physics")):
+             False, "the column pushed sideways under NLGEOM, a *FREQUENCY step with a traction and a "
+             "*CLOAD, FOLLOWER of its own, then pulled: frequencies and every increment of the last "
+             "step as without them", "the traction dropped as reduced physics; the loads converted, "
+             "ccx took them off over the last step: its first increment 0.013 apart"),
+            ("frequency_own_cload", [frequency_cload_deck(t) for t in (True, False)], False,
+             "the column pushed sideways under NLGEOM, a *FREQUENCY step with a *CLOAD and gravity "
+             "of its own, then pulled in two increments: frequencies and every increment as "
+             "without them", "the first increment 0.013 apart, the top moved 0.17"),
+            ("modal_increments", [modal_increments_deck(t) for t in ("", ", INC=1000")], False,
+             "a *MODAL DYNAMIC step of 300 increments, no INC=: every increment as with INC=1000",
+             "ccx stopped at 100 increments"),
+            ("modal_bare_prints_carried", [modal_bare_prints_deck(t) for t in (False, True)], True,
+             "the plastic column: an NLGEOM static step printing U and RF, *FREQUENCY, *MODAL DYNAMIC "
+             "(a bare *NODE PRINT there), then a static step without print cards: its end printed "
+             "as with them", "nothing printed in the last step")):
         runs = [review_run(text, tag + ("_ref" if k else ""),
                            lambda dat: (dat_node_blocks(dat), dat_eigen_table(dat, eig)))
                 for k, text in enumerate(decks)]
@@ -7202,6 +7247,38 @@ def main():
                   f"{moved:.4g}, frequencies {lam:.0e} apart (before: {was})")
         elif all(runs):
             print(f"FAIL  {tag}: no displacement table")
+        failures += 0 if ok else 1
+    # a *STATIC, RIKS step (no --approximate) and a *COMPLEX FREQUENCY step: *NO ANALYSIS, so
+    # ccx stops there after the steps before it, without a crash (an *EL FILE carried into the
+    # step crashed ccx 2.23: an empty one ends it)
+    for tag, steps, proc, before in (
+            ("riks_stops", "*STEP\n*STATIC\n*CLOAD\n19, 2, 1.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n"
+             "*STEP\n*STATIC, RIKS\n0.1, 1.\n*CLOAD\n19, 2, 2.\n*END STEP\n", "Static",
+             "ccx ran the Riks step as a load-controlled *STATIC"),
+            ("complex_frequency_stops", "*STEP\n*FREQUENCY\n4\n*END STEP\n*STEP\n*COMPLEX FREQUENCY\n"
+             "2\n*END STEP\n", "Frequency", "ccx stopped at input")):
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(after_pert_model() + steps)
+        convert(src, inp)
+        d = tempfile.mkdtemp(prefix="ccxval_")
+        shutil.copy(inp, os.path.join(d, "job.inp"))
+        r = subprocess.run([ccx, "job"], cwd=d, env={**os.environ, **env}, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=600)
+        dat = os.path.join(d, "job.dat")
+        blocks = dat_node_blocks(dat)            # (one: step 1's, no second static solve)
+        moved = max((abs(x) for blk in blocks for v in blk.values() for x in v), default=0.0)
+        freqs = dat_eigen_table(dat, eig) if os.path.exists(dat) else []
+        shutil.rmtree(d, ignore_errors=True)
+        ok = (r.returncode == 0 and "*ERROR" not in r.stdout and "No analysis was selected" in r.stdout
+              and r.stdout.count(" analysis was selected") == 2 and
+              r.stdout.count(f"{proc} analysis was selected") == 1 and
+              (moved > 1e-3 and len(blocks) == 1 if proc == "Static"
+               else len(freqs) == 4 and min(freqs) > 0.0))
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (the column, a *{proc.upper()} step, then "
+              f"{'*STATIC, RIKS' if proc == 'Static' else '*COMPLEX FREQUENCY'}): ccx ran step 1 "
+              f"({'the top moved ' + format(moved, '.4g') if proc == 'Static' else str(len(freqs)) + ' frequencies'})"
+              f" and stopped at step 2, exit code {r.returncode} (before: {before})")
         failures += 0 if ok else 1
     # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
     # it too): the response to its own loads alone

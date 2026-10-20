@@ -4096,6 +4096,7 @@ class Converter:
         # load audit (see _audit_loads): steps loaded in the deck but not after conversion
         self.unloaded_steps: List[int] = []
         self.source_unloaded = False
+        self._stopped_steps: set = set()       # the steps ccx stops at (_no_analysis)
         # CPS4I / CPE4I written as C3D8I slabs (see _plan_incompatible_slabs): element -> its
         # plane problem ("stress" / "strain"), (2-D node, thickness) -> its top node, the
         # *SOLID SECTION cards they use -> (kind, material written for them), and the model
@@ -4697,6 +4698,7 @@ class Converter:
         "NODAL THICKNESS": "handle_nodal_thickness",
         "EQUATION": "handle_equation",
         "STATIC": "handle_static",
+        "COMPLEX FREQUENCY": "handle_complex_frequency",
         "DYNAMIC": "handle_dynamic",
         "FREQUENCY": "handle_frequency",
         "BUCKLE": "handle_buckle",
@@ -8056,23 +8058,22 @@ class Converter:
     def _yield_segfaults(self, proc: Optional[str], nlgeom: bool) -> None:
         """Warn about the steps where ccx 2.23 segfaults on a plastic or creeping material
         (_restore_yields), which no form of the deck avoids (probed on both builds with a
-        plastic and a creeping C3D8 column): a *BUCKLE or *COMPLEX FREQUENCY step (the latter
-        written with CORIOLIS), with any output, and a *STATIC or *VISCO step without NLGEOM
-        after a *FREQUENCY step, at its start, also with a modal or steady-state dynamics step
-        in between.  A *DYNAMIC, NLGEOM or coupled temperature-displacement step runs there,
-        and a *DYNAMIC step in between clears it.  (Element and contact output segfaults the
-        modal and steady-state dynamics steps: _el_file_stops drops it.)  Abaqus ignores
-        plasticity and creep in a linear perturbation step.  ``proc`` None: a step whose
-        procedure card is commented out (ccx repeats the previous one there, probed)."""
+        plastic and a creeping C3D8 column): a *BUCKLE step (and a *COMPLEX FREQUENCY, CORIOLIS
+        one, which the converter does not write), with any output, and a *STATIC or *VISCO
+        step without NLGEOM after a *FREQUENCY step, at its start, also with a modal or
+        steady-state dynamics step in between.  A *DYNAMIC, NLGEOM or coupled temperature-
+        displacement step runs there, and a *DYNAMIC step in between clears it.  (Element and
+        contact output segfaults the modal and steady-state dynamics steps: _el_file_stops
+        drops it.)  Abaqus ignores plasticity and creep in a linear perturbation step.
+        ``proc`` None: a step ccx stops at (_no_analysis)."""
         if not self._restore_yields:
             return
         k = self._step_idx
-        if proc in ("BUCKLE", "COMPLEX FREQUENCY"):
+        if proc == "BUCKLE":
             self.report.warn(f"*{proc} step {k} in a model with a plastic or creeping material: "
                              f"ccx 2.23 segfaults in it, with any output (probed); Abaqus ignores "
-                             f"plasticity and creep in a linear perturbation step and "
-                             f"{'buckles' if proc == 'BUCKLE' else 'extracts the modes'} with the "
-                             f"base state's elastic stiffness.", once=True)
+                             f"plasticity and creep in a linear perturbation step and buckles with "
+                             f"the base state's elastic stiffness.", once=True)
             self._reduces(f"*{proc} step with a plastic or creeping material (ccx 2.23 segfaults)")
             self._yield_segv.add(k)
         elif proc in ("STATIC", "VISCO") and not nlgeom and self._eigen_since:
@@ -8185,6 +8186,8 @@ class Converter:
                 params["NLGEOM"] = None
                 self.report.note("Explicit *STEP: NLGEOM added (Abaqus/Explicit includes geometric "
                                  "nonlinearity by default; ccx does not).", once=True)
+        if proc == "MODAL DYNAMIC":
+            self._modal_increments(proc_block, params)
         if proc == "DYNAMIC" and proc_block is not None and "AMPLITUDE" not in params and \
                 not explicit and (proc_block.param("APPLICATION") or "").upper().startswith("QUASI"):
             params["AMPLITUDE"] = "RAMP"
@@ -8265,10 +8268,25 @@ class Converter:
         # a linear perturbation step has no effect on the later ones: _plan_deck_facts)
         self._step_nlgeom = self._step_nlgeom or (self._step_idx not in self._pert_idx and
             "NLGEOM" in params and (nl or "YES").strip().upper() != "NO")
-        riks = proc_block is not None and proc_block.has("RIKS") and not self._approx
-        self._yield_segfaults(None if riks else proc, self._dp_nlgeom or (     # (handle_static)
+        stops = proc == "COMPLEX FREQUENCY" or \
+            (proc_block is not None and proc_block.has("RIKS") and not self._approx)
+        self._yield_segfaults(None if stops else proc, self._dp_nlgeom or (     # (_no_analysis)
             "NLGEOM" in params and (nl or "YES").strip().upper() != "NO"))
         out = [emit_keyword("STEP", params)]
+        if stops:
+            # ccx reaches none of the step's other cards: they stay as comments.  An *EL FILE
+            # it carries in from an earlier step makes ccx 2.23 crash there (rc 11, both
+            # builds, probed); an empty one ends it
+            self._stopped_steps.add(self._step_idx)
+            cards = [b for b in inner if b is not proc_block and b.keyword != "END STEP" and
+                     b.keyword not in GEOM_KW]
+            self.report.n_commented += len(cards)
+            rest = [x for b in cards for x in [emit_keyword(b.keyword, b.params)] + b.data]
+            return out + self.translate_one(proc_block) + (
+                ["** abq2ccx: an empty *EL FILE: ccx 2.23 crashes on an earlier step's here",
+                 "*EL FILE"] if self._step_idx > 1 else []) + (
+                ["** abq2ccx: the step's other cards, which ccx does not reach:"] +
+                ["** " + x for x in rest] if rest else []) + ["*END STEP"]
         self._nodal_fresh, self._nodal_reset, self._cload_new = set(), set(), False
         self._dl_fresh, self._dl_wiped, self._dl_given = set(), False, []
         self._step_temp_dof = next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS),
@@ -8305,6 +8323,12 @@ class Converter:
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
+            if proc == "FREQUENCY" and b.keyword in ("CLOAD", "DLOAD", "DSLOAD"):
+                out.extend(self._commented(b, "Loads of a *FREQUENCY step commented out: Abaqus "
+                                              "ignores them (natural frequency extraction), ccx "
+                                              "would carry them into the next general step and "
+                                              "take them off over it (probed).", reduces=False))
+                continue
             out.extend(self.translate_one(b))
         out.extend(self._boundary_pieces(self._vel_tail.get(self._step_idx, [])))
         self._dload_op_new_first(out)
@@ -8314,6 +8338,28 @@ class Converter:
         self._step_temp_dof = None
         out.append("*END STEP")
         return out
+
+    def _modal_increments(self, b: Block, params: "OrderedDict[str, Optional[str]]") -> None:
+        """INC= on a *MODAL DYNAMIC step that takes more increments (its time period over its
+        time increment) than the step's INC= or ccx's default 100 allow: Abaqus runs them all
+        (INC "has no effect" where it cannot increment automatically, Keywords *STEP), ccx
+        stops at INC= ("max. # of increments reached").  ccx runs ceil(period / increment)
+        increments, the last one in full (probed)."""
+        rec = (merged_data_records(b) or [[]])[0]
+        try:
+            dt, period = pf(rec[0]), pf(rec[1])
+            cap = int(float(params.get("INC") or 100))
+        except (IndexError, ValueError):
+            return
+        if dt <= 0.0 or period <= 0.0:
+            return
+        need = math.ceil(period / dt * (1.0 - 1e-9))
+        if need > cap:
+            params["INC"] = str(need)
+            self.report.note(f"*MODAL DYNAMIC: *STEP INC={need} written (time period / time "
+                             f"increment): Abaqus runs every increment of a modal dynamic step "
+                             f"(INC has no effect there), ccx stops at INC= (default 100).",
+                             once=True)
 
     def _boundary_pieces(self, pieces: Sequence[object]) -> List[str]:
         """Emit planned output: text lines as they are, *BOUNDARY blocks through
@@ -9715,15 +9761,9 @@ class Converter:
         """Whether NLGEOM bears on the current step's own loads: in a general step under
         NLGEOM, and in a linear perturbation step about an NLGEOM base state, whose loads
         Abaqus applies on the base state's deformed geometry with the load stiffness of
-        follower loads (Abaqus 2017, linear perturbation and eigenvalue buckling); not in a
-        *FREQUENCY or *COMPLEX FREQUENCY step, which ignores applied loads."""
-        return self._step_nlgeom and self._step_proc not in LOAD_FREE_PROCEDURES
-
-    def _no_nlgeom_effect(self) -> str:
-        """Why a load option that acts only under NLGEOM changes nothing in this step."""
-        if self._step_proc in LOAD_FREE_PROCEDURES:
-            return f"no effect: Abaqus ignores the loads of a *{self._step_proc} step"
-        return "no effect without NLGEOM"
+        follower loads (Abaqus 2017, linear perturbation and eigenvalue buckling).  (A
+        *FREQUENCY step's loads, which Abaqus ignores, are commented out: handle_step.)"""
+        return self._step_nlgeom
 
     def _load_params(self, b: Block, allowed: Sequence[str]) -> "OrderedDict[str, Optional[str]]":
         """Parameters ccx's distributed-load cards read; Abaqus-only ones are dropped —
@@ -9754,7 +9794,7 @@ class Converter:
                 self._reduces(f"*{b.keyword} {k}={vu} under NLGEOM")
             else:
                 self.report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx"
-                                 f"{'; ' + self._no_nlgeom_effect() if changes else ''}).", once=True)
+                                 f"{'; no effect without NLGEOM' if changes else ''}).", once=True)
         return keep
 
     def handle_cload(self, b: Block) -> List[str]:
@@ -9786,7 +9826,7 @@ class Converter:
                 (self.report.warn if nl else self.report.note)(
                     "*CLOAD, FOLLOWER=YES dropped: ccx concentrated loads keep their direction"
                     + (" — under NLGEOM this load no longer rotates with the node." if nl else
-                       f" ({self._no_nlgeom_effect()})."), once=True)
+                       " (no effect without NLGEOM)."), once=True)
                 if nl:
                     self._reduces("*CLOAD, FOLLOWER=YES under NLGEOM")
             else:
@@ -12353,6 +12393,9 @@ class Converter:
             return
         held: List[str] = []                # the *EL FILE labels ccx carries into a step
         carried: Dict[str, List[dict]] = {}     # output card -> the requests ccx carries
+        gen: Dict[str, Tuple[int, List[dict]]] = {}     # print card -> (step, the requests
+        ended: Dict[str, int] = {}          # Abaqus carries into general steps); -> the step
+        # whose bare card ended them in ccx
         for (k, timing, reqs), group, linear in zip(steps, groups,
                                                     self._ccx_linear_steps(blocks, steps, groups)):
             sdv = state and (linear or timing["proc"] in NO_NODAL_SDV_PROCS)
@@ -12360,6 +12403,7 @@ class Converter:
                      f"({self._LINEAR_STEP_WHY})" if linear else f"a *{timing['proc']} step")
             if self._out_yields and timing["proc"] in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS"):
                 self._modal_result_stops(k, timing["proc"], reqs, carried, group[0])
+            self._prints_again(k, timing["pert"], reqs, gen, ended, group[0])
             for cc in self._MODAL_STOPS:
                 carried[cc] = [r for r in reqs if r["live"] and r["cc"] == cc] or \
                     carried.get(cc, [])
@@ -12442,6 +12486,36 @@ class Converter:
             r["notes"].append(f"Empty *{cc} added to step {k}: Abaqus writes no such output "
                               f"there, and ccx would carry an earlier step's *{cc} into it: {why}.")
             reqs.append(r)
+
+    def _prints_again(self, k: int, pert: bool, reqs: List[dict],
+                      gen: Dict[str, Tuple[int, List[dict]]], ended: Dict[str, int],
+                      anchor: Block) -> None:
+        """ccx keeps a step's print cards (.dat) in the next steps that give none, Abaqus a
+        general step's print requests in the later general steps only (Output to the data and
+        results files: those of a linear perturbation step in the consecutive perturbation
+        steps).  A step whose print cards of a type are all bare (_modal_result_stops) ends
+        those requests in ccx, so the next general step without such cards gets the cards of
+        the general step Abaqus carries them from (``gen``) again; ``ended``: the bare
+        card's step, per type."""
+        for cc in ("NODE PRINT", "EL PRINT", "CONTACT PRINT"):
+            own = [r for r in reqs if r["live"] and r["cc"] == cc]
+            if own and pert and all(r.get("bare") for r in own):
+                ended[cc] = k
+            elif own:
+                ended.pop(cc, None)
+                if not pert:
+                    gen[cc] = (k, own)
+            elif not pert and cc in ended and cc in gen:
+                j, cards = gen[cc]
+                add = [dict(self._added_el_file(OrderedDict(r["params"]), list(r["labels"]), anchor, cc),
+                            surface=list(r.get("surface", ())))       # (_contact_print_card)
+                       for r in cards if r["labels"] or r.get("surface")]
+                if add:
+                    add[0]["notes"].append(
+                        f"Step {j}'s *{cc} cards written again in step {k}: Abaqus carries them into "
+                        f"it, ccx would not after the empty *{cc} of step {ended[cc]}.")
+                    reqs.extend(add)
+                del ended[cc]
 
     def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
         """One output card of a step: where it goes, its labels and the output control it
@@ -14683,9 +14757,9 @@ class Converter:
     def handle_static(self, b: Block) -> List[str]:
         """``*STATIC, RIKS``: ccx has no arc-length solver, and passed through it would
         silently run a load-controlled *STATIC (it only warns 'parameter not recognized').
-        By default the procedure card is therefore commented out, so ccx stops at this
-        step; under --approximate the step becomes a plain *STATIC (the first data fields
-        carry over as increments)."""
+        By default the procedure card is therefore commented out and ccx stops at this step
+        (_no_analysis); Abaqus allows no step after a Riks step.  Under --approximate the
+        step becomes a plain *STATIC (the first data fields carry over as increments)."""
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "DIRECT":
@@ -14708,12 +14782,36 @@ class Converter:
                                  "arc-length solver; snap-through/post-buckling paths may not "
                                  "converge or may differ). Verify.", once=True)
                 return [emit_keyword("STATIC", params)] + list(b.data)
-            return self._commented(b, "*STATIC, RIKS: ccx has no Riks arc-length solver. Passed "
-                                      "through, ccx would silently run a load-controlled *STATIC "
-                                      "instead, so the procedure is commented out and ccx stops at "
-                                      "this step. Rerun with --approximate to accept the plain-"
-                                      "*STATIC reframing.", reduces=False)
+            return self._no_analysis(b, "*STATIC, RIKS: ccx has no Riks arc-length solver. Passed "
+                                        "through, ccx would silently run a load-controlled *STATIC "
+                                        "instead, so the procedure is commented out and ccx stops "
+                                        "at this step. Rerun with --approximate to accept the "
+                                        "plain-*STATIC reframing.",
+                                     "*STATIC, RIKS step (ccx has no arc-length solver)")
         return [emit_keyword("STATIC", params)] + list(b.data)
+
+    def handle_complex_frequency(self, b: Block) -> List[str]:
+        """``*COMPLEX FREQUENCY``: Abaqus projects the damping operators (dashpots, Rayleigh
+        damping), friction's unsymmetric stiffness and Coriolis loads onto the modes of the
+        *FREQUENCY step before it.  ccx 2.23's card needs CORIOLIS (a rotating structure) or
+        FLUTTER and stops without either; with CORIOLIS and no rotation it returns the
+        undamped modes, dashpot damping left out (probed).  So the step stops ccx
+        (_no_analysis)."""
+        return self._no_analysis(b, "*COMPLEX FREQUENCY: Abaqus' complex eigenvalue extraction "
+                                    "(damping and friction projected onto the modes) has no ccx "
+                                    "counterpart: ccx 2.23's *COMPLEX FREQUENCY computes Coriolis "
+                                    "(CORIOLIS) or flutter (FLUTTER) modes only, without damping, "
+                                    "and stops without either. Commented out: ccx stops at this "
+                                    "step.", "*COMPLEX FREQUENCY step (no ccx counterpart)")
+
+    def _no_analysis(self, b: Block, msg: str, reduces: str) -> List[str]:
+        """Procedure card ``b`` commented out, with ``msg`` warned and ``reduces`` recorded, and
+        *NO ANALYSIS written in its place: ccx 2.23 then stops at this step, after the steps
+        before it ("No analysis was selected", without "Job finished"; probed on both builds).
+        A step without a procedure card would repeat the previous step's procedure (probed:
+        a load-controlled *STATIC after a static step)."""
+        return self._comment_out(msg, [emit_keyword(b.keyword, b.params)] + list(b.data),
+                                 reduces) + ["*NO ANALYSIS"]
 
     def handle_dynamic(self, b: Block) -> List[str]:
         """``*DYNAMIC``: ccx runs implicit (HHT-alpha) and explicit (``EXPLICIT``, central
@@ -17989,7 +18087,8 @@ class Converter:
         src = step_load_audit(blocks, user_loads=True, abaqus=True)
         dst = step_load_audit(blocks_from_lines(out), user_loads=False)
         self.source_unloaded = bool(src) and all(s == [] for s in src)
-        self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1) if s and d == []]
+        self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1)
+                               if s and d == [] and i not in self._stopped_steps]
         procs: List[Optional[str]] = []             # each step's procedure, counted as there:
         cur: Optional[List[str]] = None             # a *STEP before *END STEP replaces the open one
         for b in list(blocks) + [Block("END STEP", OrderedDict())]:

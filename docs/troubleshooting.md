@@ -46,10 +46,10 @@ not run in a stock ccx: convert with `--abaqus-umat` and run a ccx built with th
 must first be ported to a UMAT. A material named `ABQ2CCX_…` was renamed so that ccx stops
 here rather than run one of its own routines.
 
-**`*ERROR reading *COMPLEX FREQUENCY: either parameter CORIOLIS or parameter FLUTTER is
-required`.** ccx's complex eigenvalue step covers only Coriolis forces and flutter; Abaqus'
-damped one (dashpots, damping) has no ccx counterpart. Use `*MODAL DYNAMIC` or `*STEADY
-STATE DYNAMICS` with the damping instead.
+**ccx stops at a `*COMPLEX FREQUENCY` step** ("No analysis was selected"). ccx's complex
+eigenvalue step covers only Coriolis forces and flutter, without damping; Abaqus' damped one
+(dashpots, damping) has no ccx counterpart, so the converter writes `*NO ANALYSIS` there. Use
+`*MODAL DYNAMIC` or `*STEADY STATE DYNAMICS` with the damping instead.
 
 **Composite shells.** ccx runs `*SHELL SECTION, COMPOSITE` only on `S6` and `S8R`: the
 converter upgrades composite linear shells to them and writes composite continuum shells
@@ -154,7 +154,8 @@ converter comments `*TEMPERATURE` out there.
   reconvert rather than the amplitudes. After a velocity jump, the driven node's own velocity
   output oscillates for a while; the motion is unaffected.
 * **A Riks step does not run.** ccx has no arc-length method and would run it as plain
-  static, so the converter comments it out; `--approximate` accepts the plain static step.
+  static, so the converter writes `*NO ANALYSIS` there: ccx stops after the steps before it.
+  `--approximate` accepts the plain static step.
 * **Linear perturbation steps.** ccx carries a perturbation step's loads and BC changes into
   later steps, so a general step after one starts with the last general step's loads, BCs and
   temperatures given again (`ABQ2CCX_HOLD`). A perturbation `*STATIC` becomes a general linear

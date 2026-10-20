@@ -152,14 +152,18 @@ TRANSLATED = {
         "stresses and before modal / steady-state dynamics, which refuse perturbation "
         "eigenmodes (Abaqus includes the preload's stress stiffness only after `NLGEOM`; warned "
         "where not exact); "
-        "explicit steps get `INC=10000000` + `NLGEOM`; a step whose displacement BCs get ccx's "
+        "explicit steps get `INC=10000000` + `NLGEOM`, a `*MODAL DYNAMIC` step `INC=` where its "
+        "period / increment exceeds its `INC` or 100 (Abaqus ignores `INC` there); a step whose displacement BCs get ccx's "
         "step ramp (see `*BOUNDARY`) gets `AMPLITUDE=STEP`, ccx's default there; a general step "
         "after linear perturbation steps starts with the last general step's loads, BCs, "
         "temperatures and `NLGEOM` given again (ccx carries a perturbation step's on); a "
         "`*MODAL DYNAMIC` step's loads are its own (`*CLOAD` / `*DLOAD, OP=NEW` first where "
         "earlier steps gave such loads, which ccx 2.23 applies there too); `*END STEP` ensured.",
-    "*STATIC": "`RIKS` commented by default (ccx would silently run it as plain static; "
-        "`--approximate` reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
+    "*STATIC": "`RIKS` commented out by default, with `*NO ANALYSIS` in its place: ccx stops at "
+        "that step (it would silently run it as plain static; reduced physics; `--approximate` "
+        "reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
+    "*COMPLEX FREQUENCY": "commented out, with `*NO ANALYSIS` in its place: ccx stops at that step "
+        "(ccx's card computes Coriolis or flutter modes only, without damping; reduced physics).",
     "*DYNAMIC": "implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; "
         "`APPLICATION=QUASI-STATIC/MODERATE DISSIPATION` → `ALPHA=-0.3333` (and `*STEP "
         "AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped. An "
@@ -170,7 +174,8 @@ TRANSLATED = {
         "contact formula with the slave nodes' masses, times 0.8. A fixed `DIRECT` increment "
         "above a cap is warned.",
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
-        "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes).",
+        "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes). "
+        "The step's `*CLOAD` / `*DLOAD` / `*DSLOAD` are commented out: Abaqus ignores them.",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
         "accuracy/vectors/iterations. A `*BUCKLE` step, or the step after a `*STEP, PERTURBATION` "
         "one, that would hold no body load once an earlier step held one gets a zero `GRAV` line "
@@ -736,6 +741,7 @@ def gen_keywords():
                "BEAM SECTION", "STEP", "END STEP", "BOUNDARY", "DLOAD", "DSLOAD", "TIE", "MPC",
                "CREEP", "AMPLITUDE", "RESTART", "SURFACE", "OUTPUT", "NODE OUTPUT", "ELEMENT OUTPUT",
                "NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "STATIC", "DYNAMIC", "FREQUENCY",
+               "COMPLEX FREQUENCY",
                "BUCKLE", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT", "MASS", "EQUATION",
                "COUPLING", "KINEMATIC", "RIGID BODY", "PRE-TENSION SECTION",
                "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
