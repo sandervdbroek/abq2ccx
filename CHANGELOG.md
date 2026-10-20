@@ -6,6 +6,18 @@ physics.
 
 ## Unreleased
 
+* **Nodes whose rotation two features use** — a distributing coupling whose reference node
+  another coupling also uses (two parts joined at one reference point) tied no rotation, so
+  ccx solved a mechanism (1e13) without a warning. Its rotation rows now go on a ROT NODE the
+  couplings share, or on a kinematic coupling's reference node's own DOFs 4-6. A `*RIGID BODY`
+  and a kinematic `*COUPLING` on one REF NODE turned separately; the body's ROT NODE now
+  follows the node. `*COUPLING, ORIENTATION=` with `*DISTRIBUTING` of some rotations stopped
+  ccx; the rotations no row ties are now held (exact). A pre-tension cut of a beam's last
+  element clamped the cut end (5.2x stiffer) or stopped ccx at a kinematic coupling's
+  reference node; the end now turns freely, or with the node through a knot of its own
+  where something else uses the node's rotation (U1 beams: held at zero, warned). Equations
+  whose eliminated DOFs appear in each other could reach ccx with a pivot that vanished; ccx
+  then printed warnings without end.
 * **Load entries ccx keys otherwise than Abaqus** — nodal forces converted from tractions,
   beam line loads or surface-element pressures on a step-time amplitude are now held at their
   end value in later steps, as Abaqus and ccx hold them: after the deck's `*CLOAD, OP=NEW` they

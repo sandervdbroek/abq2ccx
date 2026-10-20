@@ -4608,6 +4608,133 @@ def connector_distributing_deck(form):
     return d + "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n"
 
 
+def _cube_mesh(first, x0, elset, axes=None):
+    """A unit cube at ``x0`` (its corners turned by ``axes``, rows the turned x, y, z, about
+    the origin) in 2 x 2 x 2 C3D8, nodes numbered from ``first`` (i + 3 j + 9 k), elements from
+    ``first`` in ELSET ``elset``: (node lines, element lines, {(i, j, k): node})."""
+    ids, nodes, elems = {}, [], []
+    for k in range(3):
+        for j in range(3):
+            for i in range(3):
+                ids[(i, j, k)] = first + i + 3 * j + 9 * k
+                p = (x0[0] + 0.5 * i, x0[1] + 0.5 * j, x0[2] + 0.5 * k)
+                if axes:
+                    p = tuple(sum(axes[r][c] * p[c] for c in range(3)) for r in range(3))
+                nodes.append(f"{ids[(i, j, k)]}, " + ", ".join(repr(round(c, 15)) for c in p))
+    elems.append(f"*ELEMENT, TYPE=C3D8, ELSET={elset}")
+    for e, (i, j, k) in enumerate(((i, j, k) for k in range(2) for j in range(2) for i in range(2)), first):
+        elems.append(f"{e}, " + ", ".join(str(ids[(i + a, j + b, k + z)])
+                                          for z in (0, 1) for a, b in ((0, 0), (1, 0), (1, 1), (0, 1))))
+    return nodes, elems, ids
+
+
+def joined_cubes_deck(form):
+    """Cube A on 0 <= x <= 1, clamped at x = 0, and cube B on 2 <= x <= 3 (C3D8, E 1000,
+    nu 0.3), joined at reference node 9 at (1.5, 0.5, 0.5): A's x = 1 face by a *KINEMATIC
+    (``form`` "kd") or *DISTRIBUTING ("dd") coupling, B's x = 2 face by a *DISTRIBUTING one; B's
+    far face pulled across in y and z and twisted about x.  "kd_twin" / "dd_twin": B's coupling
+    on reference node 19 at the same place, tied to 9 by *EQUATIONs in DOFs 1-6 (the two parts
+    joined at one reference node, the node split in two and merged again).  Abaqus: the same."""
+    na, ea, ia = _cube_mesh(101, (0.0, 0.0, 0.0), "EA")
+    nb, eb, ib = _cube_mesh(201, (2.0, 0.0, 0.0), "EB")
+    ref_b = 19 if form.endswith("twin") else 9
+    lines = (["*NODE"] + na + nb + ["9, 1.5, 0.5, 0.5"] + (["19, 1.5, 0.5, 0.5"] if ref_b == 19 else [])
+             + ea + eb + ["*NSET, NSET=FIX", ", ".join(str(v) for (i, j, k), v in ia.items() if i == 0),
+                          "*NSET, NSET=AF", ", ".join(str(v) for (i, j, k), v in ia.items() if i == 2),
+                          "*NSET, NSET=BF", ", ".join(str(v) for (i, j, k), v in ib.items() if i == 0),
+                          "*NSET, NSET=FAR", ", ".join(str(v) for (i, j, k), v in ib.items() if i == 2),
+                          "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3",
+                          "*SOLID SECTION, ELSET=EA, MATERIAL=M", "*SOLID SECTION, ELSET=EB, MATERIAL=M",
+                          "*SURFACE, NAME=SA, TYPE=NODE", "AF", "*SURFACE, NAME=SB, TYPE=NODE", "BF",
+                          "*COUPLING, CONSTRAINT NAME=CA, REF NODE=9, SURFACE=SA",
+                          "*KINEMATIC" if form.startswith("k") else "*DISTRIBUTING",
+                          f"*COUPLING, CONSTRAINT NAME=CB, REF NODE={ref_b}, SURFACE=SB", "*DISTRIBUTING"])
+    if ref_b == 19:
+        lines += ["*EQUATION"] + [f"2\n9, {k}, 1., 19, {k}, -1." for k in range(1, 7)]
+    lines += ["*BOUNDARY", "FIX, 1, 3", "*STEP", "*STATIC", "*CLOAD", "FAR, 2, 0.02", "FAR, 3, 0.01",
+              f"{ib[(2, 0, 0)]}, 3, 0.05", f"{ib[(2, 2, 2)]}, 3, -0.05", "*NODE PRINT, NSET=FAR", "U",
+              "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def rigid_kinematic_ref_deck(twin):
+    """Cube A on 0 <= x <= 1, clamped at x = 0, its x = 1 face kinematic-coupled to reference
+    node 9 at (1.5, 0.5, 0.5); cube B on 2 <= x <= 3, its x = 2 face's nodes the TIE NSET of a
+    *RIGID BODY on the same REF NODE (C3D8, E 1000, nu 0.3); B's far face pulled across and
+    twisted.  ``twin``: a *PLASTIC whose yield stress the model never reaches, with which the
+    converter writes both constraints as the linear *EQUATIONs Abaqus solves without NLGEOM
+    (one ROT NODE): the same solution."""
+    na, ea, ia = _cube_mesh(101, (0.0, 0.0, 0.0), "EA")
+    nb, eb, ib = _cube_mesh(201, (2.0, 0.0, 0.0), "EB")
+    lines = (["*NODE"] + na + nb + ["9, 1.5, 0.5, 0.5"] + ea + eb
+             + ["*NSET, NSET=FIX", ", ".join(str(v) for (i, j, k), v in ia.items() if i == 0),
+                "*NSET, NSET=AF", ", ".join(str(v) for (i, j, k), v in ia.items() if i == 2),
+                "*NSET, NSET=BF", ", ".join(str(v) for (i, j, k), v in ib.items() if i == 0),
+                "*NSET, NSET=FAR", ", ".join(str(v) for (i, j, k), v in ib.items() if i == 2),
+                "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3"] + (["*PLASTIC", "1.e9, 0."] if twin else [])
+             + ["*SOLID SECTION, ELSET=EA, MATERIAL=M", "*SOLID SECTION, ELSET=EB, MATERIAL=M",
+                "*SURFACE, NAME=SA, TYPE=NODE", "AF", "*COUPLING, CONSTRAINT NAME=CA, REF NODE=9, SURFACE=SA",
+                "*KINEMATIC", "*RIGID BODY, REF NODE=9, TIE NSET=BF", "*BOUNDARY", "FIX, 1, 3", "*STEP",
+                "*STATIC", "*CLOAD", "FAR, 2, 0.02", "FAR, 3, 0.01", f"{ib[(2, 0, 0)]}, 3, 0.05",
+                f"{ib[(2, 2, 2)]}, 3, -0.05", "*NODE PRINT, NSET=FAR", "U", "*END STEP"])
+    return "\n".join(lines) + "\n"
+
+
+def distributing_oriented_deck(turned):
+    """A C3D8 cube (E 1000, nu 0.3) clamped at z = 0, its top nodes distributing-coupled to
+    reference node 9 at (0.5, 0.5, 1.5) along *ORIENTATION ORI (1 = (0.6, 0.8, 0)) with the DOF
+    lines 1, 4 (the rotations about local 2 and 3 released); a force (0.3, -0.2, 0.5) and the
+    moment 0.4 about local 1 at node 9.  ``turned``: the model turned so that local 1 is x,
+    the coupling without ORIENTATION, the loads turned with it (1, 4: about x).  Abaqus: the
+    turned solution."""
+    c1, c2, c3 = (0.6, 0.8, 0.0), (-0.8, 0.6, 0.0), (0.0, 0.0, 1.0)
+    axes = (c1, c2, c3) if turned else None
+    nodes, elems, ids = _cube_mesh(101, (0.0, 0.0, 0.0), "CUBE", axes)
+    ref = (0.5, 0.5, 1.5)
+    f, m = (0.3, -0.2, 0.5), tuple(0.4 * c for c in c1)
+    if turned:
+        ref, f, m = (tuple(sum(a[k] * v[k] for k in range(3)) for a in axes) for v in (ref, f, m))
+    lines = (["*NODE"] + nodes + ["9, " + ", ".join(repr(round(c, 15)) for c in ref)] + elems
+             + ["*NSET, NSET=BASE", ", ".join(str(v) for (i, j, k), v in ids.items() if k == 0),
+                "*NSET, NSET=TOP", ", ".join(str(v) for (i, j, k), v in ids.items() if k == 2),
+                "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*SOLID SECTION, ELSET=CUBE, MATERIAL=M",
+                "*SURFACE, NAME=TS, TYPE=NODE", "TOP"]
+             + ([] if turned else ["*ORIENTATION, NAME=ORI", "0.6, 0.8, 0., -0.8, 0.6, 0."])
+             + ["*COUPLING, CONSTRAINT NAME=CD, REF NODE=9, SURFACE=TS" + ("" if turned else ", ORIENTATION=ORI"),
+                "*DISTRIBUTING", "1, 4", "*BOUNDARY", "BASE, 1, 3", "*STEP", "*STATIC", "*CLOAD"]
+             + [f"9, {k + 1}, {v!r}" for k, v in enumerate(f + m) if abs(v) > 1e-15]
+             + ["*NODE PRINT, NSET=TOP", "U", "*END STEP"])
+    return "\n".join(lines) + "\n"
+
+
+def pretension_end_deck(cut=True, end="free"):
+    """A cantilever of two B31 along x (RECT 0.1 x 0.1, E 210000, nu 0; node 1 clamped), the tip
+    node 3 pulled along x and loaded across and out of plane; with ``cut`` its last element is
+    the cut of a *PRE-TENSION SECTION (adjustment, node 99, held at 0), which leaves node 3
+    without a beam.  ``end`` "free": those loads alone; "moment": a moment about y and a torque
+    at node 3 too (the node's rotation used); "coupled": node 3 the reference node of a
+    *KINEMATIC coupling to the near face of a C3D8 cube (E 210000, nu 0.3), loaded at its far
+    face too.  (A square section with nu = 0: the knots, which make the sections rigid, then
+    change nothing.)"""
+    lines = ["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 2., 0., 0.", "99, 5., 5., 0.",
+             "*ELEMENT, TYPE=B31, ELSET=BOLT", "1, 1, 2", "2, 2, 3", "*NSET, NSET=TIP", "3",
+             "*BEAM SECTION, ELSET=BOLT, MATERIAL=M, SECTION=RECT", "0.1, 0.1", "0., 0., 1."]
+    if end == "coupled":
+        nodes, elems, ids = _cube_mesh(101, (2.0, -0.5, -0.5), "CUBE")
+        lines = (lines[:5] + nodes + lines[5:8] + elems
+                 + ["*NSET, NSET=NEAR", ", ".join(str(v) for (i, j, k), v in ids.items() if i == 0),
+                    "*NSET, NSET=FAR", ", ".join(str(v) for (i, j, k), v in ids.items() if i == 2),
+                    "*NSET, NSET=TIP", "3, " + ", ".join(str(v) for (i, j, k), v in ids.items() if i == 2)]
+                 + lines[10:] + ["*MATERIAL, NAME=M2", "*ELASTIC", "210000., 0.3",
+                                 "*SOLID SECTION, ELSET=CUBE, MATERIAL=M2", "*SURFACE, NAME=NS, TYPE=NODE",
+                                 "NEAR", "*COUPLING, CONSTRAINT NAME=C, REF NODE=3, SURFACE=NS", "*KINEMATIC"])
+    lines += (["*PRE-TENSION SECTION, ELEMENT=2, NODE=99"] if cut else []) + [
+        "*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.", "*STEP", "*STATIC", "*BOUNDARY", "1, 1, 6"]
+    lines += (["99, 1, 1, 0."] if cut else []) + ["*CLOAD", "3, 1, 1.", "3, 2, 0.01", "3, 3, 0.005"]
+    lines += {"free": [], "moment": ["3, 4, 0.003", "3, 5, -0.004"], "coupled": ["FAR, 2, 0.002"]}[end]
+    return "\n".join(lines + ["*NODE PRINT, NSET=TIP", "U", "*END STEP"]) + "\n"
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
@@ -11280,6 +11407,79 @@ def main():
     else:
         print("FAIL  connector_distributing_ref: no displacements")
     failures += 0 if ok else 1
+
+    # two parts joined at one reference node, a distributing coupling to one of them: it wrote no
+    # rotation rows, as nothing else 'acted on' the node's rotation, so no moment passed (a
+    # mechanism, 1e13, rc 0); against the node split in two and tied in DOFs 1-6
+    for form, what in (("dd", "two *DISTRIBUTING"), ("kd", "a *KINEMATIC and a *DISTRIBUTING")):
+        tabs = [review_run(joined_cubes_deck(f), "distributing_shared_ref_" + f, dat_displacements)
+                for f in (form, form + "_twin")]
+        ok = all(tabs) and len(tabs[0]) == len(tabs[1]) == 9
+        if ok:
+            scale = max(abs(x) for v in tabs[1].values() for x in v)
+            err = max(abs(a - b) for n in tabs[1] for a, b in zip(tabs[0][n], tabs[1][n]))
+            ok = 1e-3 < scale < 10.0 and err < 1e-6 * scale
+            print(f"{'PASS' if ok else 'FAIL'}  distributing_shared_ref_{form} (two cubes joined at one "
+                  f"reference node by {what} coupling, the far one bent and twisted): its far face as "
+                  f"with the node split in two and tied in DOFs 1-6 (max |u| {scale:.4g}; {err:.1e} apart)")
+        else:
+            print(f"FAIL  distributing_shared_ref_{form}: no displacements")
+        failures += 0 if ok else 1
+
+    # a *RIGID BODY and a kinematic coupling on one REF NODE: ccx turns the coupling with the
+    # node's DOFs 4-6, the body with its ROT NODE, so the coupling's members did not turn
+    # (relative error 1.04); against both written as linear equations on one ROT NODE
+    tabs = [review_run(rigid_kinematic_ref_deck(t), "rigid_kinematic_same_ref" + ("_twin" if t else ""),
+                       dat_displacements) for t in (False, True)]
+    ok = all(tabs) and len(tabs[0]) == len(tabs[1]) == 9
+    if ok:
+        scale = max(abs(x) for v in tabs[1].values() for x in v)
+        err = max(abs(a - b) for n in tabs[1] for a, b in zip(tabs[0][n], tabs[1][n]))
+        ok = 1e-3 < scale < 10.0 and err < 1e-6 * scale
+        print(f"{'PASS' if ok else 'FAIL'}  rigid_kinematic_same_ref (a cube's face kinematic-coupled to "
+              f"the REF NODE of a *RIGID BODY of a second cube's face, that one bent and twisted): its far "
+              f"face as with both constraints the linear equations Abaqus solves (max |u| {scale:.4g}; "
+              f"{err:.1e} apart)")
+    else:
+        print("FAIL  rigid_kinematic_same_ref: no displacements")
+    failures += 0 if ok else 1
+
+    # *COUPLING, ORIENTATION= + *DISTRIBUTING 1, 4: the local rotation row coupled two ROT NODE
+    # DOFs whose other combination had no stiffness (ccx exit 255); against the turned model
+    tabs = [review_run(distributing_oriented_deck(t), "distributing_oriented_partial" + ("_turned" if t else ""),
+                       dat_displacements) for t in (False, True)]
+    ok = all(tabs) and len(tabs[0]) == len(tabs[1]) == 9
+    if ok:
+        axes = ((0.6, 0.8, 0.0), (-0.8, 0.6, 0.0), (0.0, 0.0, 1.0))
+        scale = max(abs(x) for v in tabs[1].values() for x in v)
+        err = max(abs(_dot(tabs[0][n], a) - tabs[1][n][k]) for n in tabs[1] for k, a in enumerate(axes))
+        ok = 1e-3 < scale < 10.0 and err < 1e-6 * scale
+        print(f"{'PASS' if ok else 'FAIL'}  distributing_oriented_partial (a cube's top distributing-coupled "
+              f"along an ORIENTATION 53 degrees about z, DOF lines 1, 4; a force and a moment about local 1): "
+              f"the top as in the model turned onto that axis (max |u| {scale:.4g}; {err:.1e} apart)")
+    else:
+        print("FAIL  distributing_oriented_partial: no displacements")
+    failures += 0 if ok else 1
+
+    # a pre-tension cut of a beam's last element: the node kept a lone knot beam, no knot, and
+    # the rotation ties clamped the cut element's end (5.2x stiffer; a kinematic coupling's
+    # reference node stopped ccx in gen3dmpc); against the uncut cantilever
+    for end, what in (("free", "loaded at its free tip"), ("moment", "with a moment and a torque at its tip"),
+                      ("coupled", "its tip kinematic-coupled to a loaded cube")):
+        tabs = [review_run(pretension_end_deck(c, end), f"pretension_cut_last_{end}" + ("" if c else "_uncut"),
+                           dat_displacements) for c in (True, False)]
+        ok = all(tabs) and len(tabs[0]) == len(tabs[1]) == (1 if end != "coupled" else 10)
+        if ok:
+            scale = max(abs(x) for v in tabs[1].values() for x in v)
+            err = max(abs(a - b) for n in tabs[1] for a, b in zip(tabs[0][n], tabs[1][n]))
+            ok = 1e-4 < scale < 10.0 and err < 1e-6 * scale
+            print(f"{'PASS' if ok else 'FAIL'}  pretension_cut_last_{end} (a B31 cantilever whose last "
+                  f"element is the cut of a *PRE-TENSION SECTION, the adjustment held, {what}): tip "
+                  f"{', '.join(f'{x:.7g}' for x in tabs[0][3])} vs the uncut beam ({err:.1e} of max "
+                  f"|u| {scale:.4g} apart)")
+        else:
+            print(f"FAIL  pretension_cut_last_{end}: no displacements")
+        failures += 0 if ok else 1
 
     # beams in a general 3-D direction: ccx 2.23 makes rotational BCs and moments on a beam node
     # mean-rotation MPCs about the global axes, exact only about the section's own axes (the

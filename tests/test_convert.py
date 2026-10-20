@@ -5118,6 +5118,112 @@ def test_pretension_cut_copy_takes_temperatures_and_u1_ties():
     assert "\n100, 4, 1, 2, 4, -1\n" in body and "\n100, 6, 1, 2, 6, -1\n" in body
 
 
+def test_pretension_cut_of_a_beams_last_element():
+    # the cut node keeps no beam: with one knot beam ccx made it no knot, and the rotation ties
+    # clamped the cut element's end (a cantilever 5.2x stiffer; a kinematic coupling's
+    # reference node stopped ccx in gen3dmpc; code review 3 B09).  Nothing else uses the node's
+    # rotation: no knots, no ties; something does: a knot of the node's own (two knot beams)
+    # (validate_with_ccx.py pretension_cut_last_element)
+    deck = PT_BOLT.format(typ="B31", more="", section=PT_RECT, normal="").replace(
+        "element=1, node=PT", "element=2, node=PT").replace("3, 1, 6\n", "3, 2, 2\n")
+    body, conv, rep = convert_str(deck)
+    assert "u(100) = u(3) + n u(99, 1)" in body and "2, 2, 100" in body
+    assert not conv._knots and not [eq for eq in _equation_terms(body) if eq[0][1] > 3]
+    assert "the cut element's end turns freely there" in rep.text() and not conv.reduced_physics
+    # a moment (or a rotational BC, a coupling, ...) on the node: two knot beams there, ties
+    body, conv, rep = convert_str(deck.replace("PT, 1, 1000.\n", "PT, 1, 1000.\n3, 6, 1.\n"))
+    assert set(conv._knots) == {3, 100} and "100, 6, 1., 3, 6, -1." in body
+    assert sum(1 for t, c in conv.geom.elements.values() if t == "B31" and c[0] == 3) == 2
+    assert not conv.reduced_physics
+    coupled = deck.replace("*Material", "*Node\n11, 2., -0.5, -0.5\n12, 2., 0.5, -0.5\n13, 2., 0.5, 0.5\n"
+                           "14, 2., -0.5, 0.5\n15, 3., -0.5, -0.5\n16, 3., 0.5, -0.5\n17, 3., 0.5, 0.5\n"
+                           "18, 3., -0.5, 0.5\n*Element, type=C3D8, elset=CUBE\n7, 11, 15, 16, 12, 14, 18, 17, 13\n"
+                           "*Solid Section, elset=CUBE, material=M\n*Surface, name=FACE\nCUBE, S1\n"
+                           "*Coupling, constraint name=C, ref node=3, surface=FACE\n*Kinematic\n*Material", 1)
+    body, conv, rep = convert_str(coupled)
+    assert "*RIGID BODY" in body and set(conv._knots) >= {3, 100} and not conv.reduced_physics
+    # U1 beams take no knot beam (ccx stops in gen3delem): the ties hold the end, warned
+    gen = "*Beam General Section, elset=BOLT, section=GENERAL\n1., 0.083, 0., 0.083, 0.14\n0., 0., 1.\n210000., 105000.\n"
+    u1 = deck.replace(PT_RECT, gen)
+    body, conv, rep = convert_str(u1)
+    held = "rotation of a U1 beam's pre-tension cut end held at zero"
+    assert "*ELEMENT, TYPE=U1\n1, 1, 2\n2, 2, 100\n" in body and "100, 4, 1, 3, 4, -1" not in body
+    assert held not in conv.reduced_physics
+    body, conv, rep = convert_str(u1.replace("PT, 1, 1000.\n", "PT, 1, 1000.\n3, 6, 1.\n"))
+    assert "\n100, 4, 1, 3, 4, -1\n" in body and not conv._knots and held in conv.reduced_physics
+
+
+TWO_CUBES = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n6, 1., 0., 1.\n"
+             "7, 1., 1., 1.\n8, 0., 1., 1.\n11, 2., 0., 0.\n12, 3., 0., 0.\n13, 3., 1., 0.\n14, 2., 1., 0.\n"
+             "15, 2., 0., 1.\n16, 3., 0., 1.\n17, 3., 1., 1.\n18, 2., 1., 1.\n100, 1.5, 0.5, 0.5\n"
+             "*Element, type=C3D8, elset=EA\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*Element, type=C3D8, elset=EB\n"
+             "2, 11, 12, 13, 14, 15, 16, 17, 18\n*Surface, name=SA\nEA, S4\n*Surface, name=SB\nEB, S6\n"
+             "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EA, material=M\n"
+             "*Solid Section, elset=EB, material=M\n"
+             "*Coupling, ref node=100, surface=SA, constraint name=CA\n*{a}\n"
+             "*Coupling, ref node=100, surface=SB, constraint name=CB\n*Distributing\n"
+             "*Step\n*Static\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n*Cload\n12, 2, 0.25\n*End Step\n")
+
+
+def test_distributing_coupling_on_a_shared_reference_node():
+    # two couplings on one reference node (two parts joined at it): the distributing one wrote no
+    # rotation rows, as nothing else 'acted on' the node's rotation, so no moment passed and ccx
+    # solved a mechanism (1e13, rc 0; code review 3 B26a); now another coupling uses it
+    # (_rotation_users) (validate_with_ccx.py distributing_shared_ref)
+    body, conv, rep = convert_str(TWO_CUBES.format(a="Distributing"))
+    rot = conv._rb_rot[100]
+    plans = list(conv._dist_plans.values())
+    assert [p["carrier"] for p in plans] == ["rot", "rot"] and all(p["rots"] == [4, 5, 6] for p in plans)
+    assert sum(1 for eq in _equation_terms(body) if any(n == rot for n, _d, _c in eq)) == 6
+    assert not conv.reduced_physics
+    # a kinematic coupling on it: ccx carries the node's rotation on its DOFs 4-6, where the
+    # distributing rows go (no ROT NODE)
+    body, conv, rep = convert_str(TWO_CUBES.format(a="Kinematic"))
+    (plan,) = conv._dist_plans.values()
+    assert plan["carrier"] == "kin" and 100 not in conv._rb_rot
+    assert {d for eq in _equation_terms(body) for n, d, _c in eq if n == 100} == {1, 2, 3, 4, 5, 6}
+    assert "rotation rows are on the node's own DOFs 4-6" in rep.text() and not conv.reduced_physics
+
+
+def test_rigid_body_and_kinematic_coupling_on_one_reference_node():
+    # ccx's kinematic coupling turns its reference node's DOFs 4-6, a *RIGID BODY its ROT NODE:
+    # on one REF NODE the coupling's members translated but did not turn (code review 3 B26b).
+    # The ROT NODE follows the node's DOFs 4-6; BCs stay there (validate_with_ccx.py
+    # rigid_kinematic_same_ref)
+    deck = TWO_CUBES.replace("*Coupling, ref node=100, surface=SB, constraint name=CB\n*Distributing\n",
+                             "*Nset, nset=RB\n12, 13, 16, 17\n*Rigid Body, ref node=100, tie nset=RB\n").format(a="Kinematic")
+    deck = deck.replace("*Cload\n12, 2, 0.25\n", "100, 1, 3\n100, 6, 6, 0.01\n")
+    body, conv, rep = convert_str(deck)
+    rot = conv._rb_rot_synth[100]
+    assert 100 in conv._rb_follow and 100 not in conv._rb_rot
+    assert [[(rot, k, 1.0), (100, k + 3, -1.0)] for k in (1, 2, 3)] == \
+        [eq for eq in _equation_terms(body) if eq[0][0] == rot]
+    assert "\n100, 6, 6, 0.01\n" in body and "follows the reference node's DOFs 4-6" in rep.text()
+    assert not conv.reduced_physics
+
+
+def test_oriented_distributing_coupling_of_some_rotations_holds_the_others():
+    # *COUPLING, ORIENTATION= + *DISTRIBUTING 1, 4: the local rotation row couples two ROT NODE
+    # DOFs, whose orthogonal combination had no stiffness: ccx exited 255 (code review 3 B07).
+    # It is held (validate_with_ccx.py distributing_oriented_partial)
+    deck = (HEX + "*Node\n100, 0.5, 0.5, 1.5\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=EALL, material=M\n*Surface, name=TOP\nEALL, S2\n"
+            "*Orientation, name=ORI\n0.6, 0.8, 0., -0.8, 0.6, 0.\n"
+            "*Coupling, constraint name=C, ref node=100, surface=TOP, orientation=ORI\n*Distributing\n1, 4\n"
+            "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*Step\n*Static\n*Cload\n100, 4, 0.6\n100, 5, 0.8\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    rot = conv._rb_rot[100]
+    (plan,) = conv._dist_plans.values()
+    assert plan["holds"] == 1 and [(rot, 1, 1.0), (rot, 2, -0.75)] in _equation_terms(body)
+    assert "rotations of its ROT NODE that no row ties" in rep.text() and not conv.reduced_physics
+    # a BC on one of those DOFs: no hold (the BC and the row fix both); without ORIENTATION the
+    # row uses one DOF only: none either
+    body, conv, _ = convert_str(deck.replace("*Cload\n", "*Boundary\n100, 4, 4\n*Cload\n"))
+    assert "holds" not in next(iter(conv._dist_plans.values()))
+    body, conv, _ = convert_str(deck.replace(", orientation=ORI", ""))
+    assert "holds" not in next(iter(conv._dist_plans.values()))
+
+
 def test_coupling_ref_node_forms_at_the_assembly_level():
     # ccx needs REF NODE= as a node number (a set name stops it): an instance set, an instance
     # node, an assembly set, CAE's assembly reference point (numbered 1, like the instance's
