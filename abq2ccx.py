@@ -11873,6 +11873,7 @@ class _Mesh:
                        "MPC", "TIE", "CONTACT PAIR", "CONTACT", "EMBEDDED ELEMENT")
     _U1_PROCEDURES = {"STATIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
     _U1_LOADS = {"PX", "PY", "PZ", "P1", "P2", "GRAV"}
+    _U1_OPTIONS = ("CENTROID", "SHEAR CENTER", "TRANSVERSE SHEAR STIFFNESS", "SECTION POINTS")
 
     @staticmethod
     def _u1_section(b: Block) -> Optional[str]:
@@ -19575,45 +19576,6 @@ class _Dofs:
             return None
         return frames
 
-    def _kin_rows(self, ref: int, rot: int, members: Sequence[int],
-                  dofs: set, plan: bool = False) -> List[List[Tuple[int, int, float]]]:
-        """The linear *EQUATIONs of a kinematic coupling (_kin_form 'eq') or rigid body
-        (_rigid_body_lines): for each member m and coupled translation j, u_j(m) - u_j(ref) -
-        (theta x d)_j = 0, d = x_m - x_ref, theta the rotation on DOFs 1-3 of ``rot`` — ccx's
-        RIGID MPC at the initial geometry.  A 2-D member has no DOF 3 (ccx holds it itself).
-        A member with a *TRANSFORM (_rigid_eq_refused) has its rows along its local axes e,
-        e . u(m) - e . u(ref) - (d x e) . theta = 0, where ccx reads its one local term (as
-        _tie_rows), in an order in which ccx finds a dependent for each; one with some
-        translations coupled, its terms of e_j . u(m), as a transformed reference node's and a
-        ROT NODE with axes (_rot_axes) theirs, in the DOFs ccx reads (_dir_terms: local terms,
-        or the twin's, made when ``plan``)."""
-        x0 = self.geom.nodes[ref]
-        rows: List[List[Tuple[int, int, float]]] = []
-
-        def terms(n: int, v: Vec, tol: float) -> List[Tuple[int, int, float]]:
-            if n in self._transformed or n in self._rot_axes:
-                return self._dir_terms(n, v, plan)
-            return [(n, k + 1, v[k]) for k in range(3) if abs(v[k]) > tol]
-        for m in members:
-            d = vsub(self.geom.nodes[m], x0)
-            tol = 1e-12 * max(vnorm(d), 1.0)
-            plane = m in self._plane_only
-            ax = self._mpc_frame(m)
-            if isinstance(ax, tuple) and dofs >= ({1, 2} if plane else {1, 2, 3}):
-                own = []
-                for i in range(2 if plane else 3):
-                    e, c = ax[i], vcross(d, ax[i])
-                    own.append([(m, i + 1, 1.0)] + terms(ref, vscale(e, -1.0), 1e-12) +
-                               terms(rot, vscale(c, -1.0), tol))
-                rows += self._ccx_dependent_order(own, ax)
-                continue
-            for j in sorted(dofs & ({1, 2} if plane else {1, 2, 3})):
-                e = tuple(float(k == j - 1) for k in range(3))
-                c = vcross(d, e)                   # (theta x d)_j = c . theta
-                rows.append(terms(m, e, 0.0) + terms(ref, vscale(e, -1.0), 0.0) +
-                            terms(rot, vscale(c, -1.0), tol))
-        return rows
-
 
 class _Constraints:
     """Converter's rigid bodies, couplings, *MPC, connectors, *EQUATION, knot beams, node classes,
@@ -24454,6 +24416,45 @@ class _Constraints:
         return self._linear_rigid and ref in self.geom.nodes and rot in self.geom.nodes and \
             self._rigid_eq_refused(ref, [n for n in members if n in self.geom.nodes and
                                          n not in (ref, rot)], rot=rot) is None
+
+    def _kin_rows(self, ref: int, rot: int, members: Sequence[int],
+                  dofs: set, plan: bool = False) -> List[List[Tuple[int, int, float]]]:
+        """The linear *EQUATIONs of a kinematic coupling (_kin_form 'eq') or rigid body
+        (_rigid_body_lines): for each member m and coupled translation j, u_j(m) - u_j(ref) -
+        (theta x d)_j = 0, d = x_m - x_ref, theta the rotation on DOFs 1-3 of ``rot`` — ccx's
+        RIGID MPC at the initial geometry.  A 2-D member has no DOF 3 (ccx holds it itself).
+        A member with a *TRANSFORM (_rigid_eq_refused) has its rows along its local axes e,
+        e . u(m) - e . u(ref) - (d x e) . theta = 0, where ccx reads its one local term (as
+        _tie_rows), in an order in which ccx finds a dependent for each; one with some
+        translations coupled, its terms of e_j . u(m), as a transformed reference node's and a
+        ROT NODE with axes (_rot_axes) theirs, in the DOFs ccx reads (_dir_terms: local terms,
+        or the twin's, made when ``plan``)."""
+        x0 = self.geom.nodes[ref]
+        rows: List[List[Tuple[int, int, float]]] = []
+
+        def terms(n: int, v: Vec, tol: float) -> List[Tuple[int, int, float]]:
+            if n in self._transformed or n in self._rot_axes:
+                return self._dir_terms(n, v, plan)
+            return [(n, k + 1, v[k]) for k in range(3) if abs(v[k]) > tol]
+        for m in members:
+            d = vsub(self.geom.nodes[m], x0)
+            tol = 1e-12 * max(vnorm(d), 1.0)
+            plane = m in self._plane_only
+            ax = self._mpc_frame(m)
+            if isinstance(ax, tuple) and dofs >= ({1, 2} if plane else {1, 2, 3}):
+                own = []
+                for i in range(2 if plane else 3):
+                    e, c = ax[i], vcross(d, ax[i])
+                    own.append([(m, i + 1, 1.0)] + terms(ref, vscale(e, -1.0), 1e-12) +
+                               terms(rot, vscale(c, -1.0), tol))
+                rows += self._ccx_dependent_order(own, ax)
+                continue
+            for j in sorted(dofs & ({1, 2} if plane else {1, 2, 3})):
+                e = tuple(float(k == j - 1) for k in range(3))
+                c = vcross(d, e)                   # (theta x d)_j = c . theta
+                rows.append(terms(m, e, 0.0) + terms(ref, vscale(e, -1.0), 0.0) +
+                            terms(rot, vscale(c, -1.0), tol))
+        return rows
 
     def _plan_rigid_twins(self, blocks: List[Block]) -> None:
         """Make the twins (_mpc_twin) the linear equations of rigid constraints use — of a
@@ -30630,6 +30631,11 @@ class _Loads:
     # ccx 2.23 keeps one body load per set as written and direction, not per element (probed:
     # GRAV on a set, then on its element in a later step, adds up; a face load is replaced)
     _BODY_LOADS = ("GRAV", "CENTRIF", "NEWTON")
+    # the procedures after which ccx 2.23 has dropped what a card gave before (probed; a
+    # *STEP, PERTURBATION does it for *CLOAD and *TEMPERATURE too; *MODAL DYNAMIC: the
+    # loads, through _modal_own_loads' OP=NEW, unless it keeps them)
+    _RESETS = dict.fromkeys(("CLOAD", "DLOAD", "TEMPERATURE"),
+                            ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"))
 
     def _reset_emission(self) -> None:
         """The emission's state (EmitState: step cursor, the step's facts, load bookkeeping), and
@@ -33056,16 +33062,6 @@ class _PostPasses:
                              f"{done[0][1]} -> {done[0][2]}).")
         return out
 
-    # -- the base state after linear perturbation steps ----------------------------------
-    HOLD_AMP = "ABQ2CCX_HOLD"
-    _RESTORED = ("BOUNDARY", "CLOAD", "DLOAD", "TEMPERATURE")
-
-    # the procedures after which ccx 2.23 has dropped what a card gave before (probed; a
-    # *STEP, PERTURBATION does it for *CLOAD and *TEMPERATURE too; *MODAL DYNAMIC: the
-    # loads, through _modal_own_loads' OP=NEW, unless it keeps them)
-    _RESETS = dict.fromkeys(("CLOAD", "DLOAD", "TEMPERATURE"),
-                            ("BUCKLE", "STEADY STATE DYNAMICS", "MODAL DYNAMIC"))
-
     def _modal_own_loads(self, deck: EmittedDeck) -> EmittedDeck:
         """Give each *MODAL DYNAMIC step its own loads only, as Abaqus does in a linear
         perturbation step.  ccx 2.23 applies every *CLOAD and *DLOAD (pressures, GRAV, CENTRIF)
@@ -35259,6 +35255,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         return (max(self.geom.nodes, default=0),
                 max(list(self.geom.elements) + list(self._carriers) + list(self._conn), default=0))
 
+    # -- the base state after linear perturbation steps ----------------------------------
+    HOLD_AMP = "ABQ2CCX_HOLD"
+    _RESTORED = ("BOUNDARY", "CLOAD", "DLOAD", "TEMPERATURE")
     # the first value field of a data line (*TEMPERATURE: the temperature, then a shell's
     # gradients)
     _VALUE_FIELD = {"BOUNDARY": 3, "CLOAD": 2, "DLOAD": 2, "TEMPERATURE": 1}
@@ -35363,8 +35362,6 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         """Every set, surface and orientation name of the deck, which _fresh_name then avoids."""
         self._used_names |= set(self.geom.elsets) | set(self.geom.nsets) | set(self.surfaces) | \
             set(self.orientations)
-
-    _U1_OPTIONS = ("CENTROID", "SHEAR CENTER", "TRANSVERSE SHEAR STIFFNESS", "SECTION POINTS")
 
     def _plan_base_state_facts(self, blocks: List[Block]) -> None:
         """The deck's sensitivity cards, and what a perturbation's base state holds; the
