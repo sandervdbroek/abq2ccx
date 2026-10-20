@@ -4559,14 +4559,11 @@ class Step:
     """One step of the deck as the converter reads it from its cards (StepModel).  Where
     the converter has two rules for one fact today, each rule has a field of its own, which
     names the code that reads it."""
-    no: int                       # 1-based in deck_parts' grouping: EmitState.no, _pert_idx
-    ccx_no: int                   # its *STEP line among the emitted ones (ccx's count): 1 + the *STEP
-                                  # cards before it, as an unterminated step's later *STEP is written
-                                  # inside it (a step ccx stops in comments it out)
+    no: int                       # 1-based in deck_parts' grouping: EmitState.no, _pert_idx, and
+                                  # its *STEP line among the emitted ones (a step ccx stops in
+                                  # comments its other cards out)
     cards: Tuple[Block, ...]      # its *STEP through its *END STEP (deck_parts)
     between: Tuple[Block, ...]    # the cards after the step before it, up to its *STEP
-    star_steps: int               # its *STEP cards: more than one where an unterminated *STEP ran on
-    closed: bool                  # its own *END STEP ends it (False: it ran on, or the deck ended)
     proc: str                     # the first PROC_KW card's keyword, "" if none (handle_step's): ccx's
                                   # procedure (one ccx lacks, e.g. *RANDOM RESPONSE, is commented out)
     proc_card: Optional[Block]
@@ -4579,8 +4576,8 @@ class Step:
     nlgeom_card: Optional[bool]   # NLGEOM= on its *STEP card (_nlgeom_given)
     # NLGEOM, by several rules (also base_nlgeom, nlgeom_motion and the deck's nl_heads):
     nlgeom_on: bool               # it switches NLGEOM on (the Converter's _nl_steps): not a
-                                  # perturbation step and NLGEOM on one of its *STEP cards, or a
-                                  # *DYNAMIC, EXPLICIT card in it
+                                  # perturbation step and NLGEOM on its *STEP card, or a *DYNAMIC,
+                                  # EXPLICIT card in it
     nlgeom: bool                  # in force while it runs: on once a step not in _pert_idx has NLGEOM,
                                   # or is explicit without NLGEOM=; a perturbation step keeps the one
                                   # before it (EmitState.nlgeom, by the *STEP cards as written, also
@@ -4592,10 +4589,10 @@ class Step:
     nlgeom_dp: bool               # on once a step's *STEP card is in nl_heads, explicit steps not
                                   # counted (_plan_deformation_plasticity)
     temp_dof: Optional[str]       # its first TEMPERATURE_DOF_PROCS card's keyword (handle_step's)
-    star_procs: Tuple[str, ...]   # per *STEP card of it, read card by card (_plan_material_cards):
-                                  # "PERTURBATION" with *STEP, PERTURBATION, else the first PROC_KW
-                                  # card after it (with ", RIKS"; a card between steps counts for the
-                                  # *STEP before it), "" if none
+    star_proc: str                # read card by card (_plan_material_cards): "PERTURBATION" with
+                                  # *STEP, PERTURBATION, else the first PROC_KW card after its *STEP
+                                  # card (with ", RIKS"; a card between steps counts for the step
+                                  # before it), "" if none
     # a general step, handle_step's rule (_plan_base_restore's is "not in _pert_idx",
     # _plan_modal_starts' "general in ccx"):
     general: bool                 # proc in StepModel.GENERAL_PROCS and no *STEP, PERTURBATION
@@ -4628,9 +4625,10 @@ class Step:
 
 
 class StepModel:
-    """The deck's steps, read from its cards: ``model``, the cards before the first *STEP;
-    ``steps``, as emit_other writes them (deck_parts: an unterminated *STEP runs on to the
-    next *END STEP); ``after``, the cards after the last step.
+    """The deck's steps, read from its cards: ``steps``, as emit_other writes them (deck_parts;
+    the converter's decks have one *STEP card per step: close_open_steps).  A caller's cards
+    with a *STEP before the open step's *END STEP (bc_steps over a ccx deck) are one step,
+    run on to the next *END STEP.
 
     The rule: a fact is read from cards only after the last planner that rewrites those
     cards.  Converter._read_steps reads the model right after _plan_free_ref_nodes, the last
@@ -4730,12 +4728,11 @@ class StepModel:
         loose: List[Block] = []                 # the cards since the last step
         # id(card) -> its step's no; 0: model data, -1: between or after the steps
         self.card_step: Dict[int, int] = {}
-        star = 0                                # the *STEP cards so far
         nlgeom = False                          # NLGEOM in force (Step.nlgeom)
         seen = base = base_dp = False           # Step.general_before, base_nlgeom, base_nlgeom_dp
         nl_motion, t = False, 0.0               # Step.nlgeom_motion, t_start
         nl_output = nl_dp = False               # Step.nlgeom_output, nlgeom_dp
-        # card by card: each *STEP card's procedure (Step.star_procs), and whether a *DYNAMIC,
+        # card by card: each *STEP card's procedure (Step.star_proc), and whether a *DYNAMIC,
         # EXPLICIT follows a *STEP card without NLGEOM= (explicit_without_nlgeom)
         star_proc: Dict[int, str] = {}
         last: Optional[Block] = None
@@ -4753,9 +4750,9 @@ class StepModel:
         # for the later steps) but a perturbation step's own: it runs linear about its base state,
         # and "linear perturbation steps have no effect on subsequent general analysis steps"
         # (Abaqus 2017); handle_step drops it where the base state is linear (ccx would run a
-        # static perturbation step, a general one in ccx, under it).  (The *STEP card an
-        # unterminated step runs into counts.)  Read by _check_nlgeom_expansion, _u1_plans,
-        # _note_quadratic_beams, _slab_obstacle and (on a model of its own) _plan_user_materials.
+        # static perturbation step, a general one in ccx, under it).  Read by
+        # _check_nlgeom_expansion, _u1_plans, _note_quadratic_beams, _slab_obstacle and (on a
+        # model of its own) _plan_user_materials.
         heads: set = set()
         for is_step, cards in deck_parts(blocks):
             if not is_step:
@@ -4783,26 +4780,24 @@ class StepModel:
                 lc2, repeats = frozenset(id(b) for b in two), all(key(b) in ones for b in two)
             else:
                 lc2, repeats = frozenset(), False
-            n = sum(1 for b in cards if b.keyword == "STEP")
             general = proc in self.GENERAL_PROCS and not pert_param
-            heads.update(id(b) for b in cards if b.keyword == "STEP" and _nlgeom_given(b) and
-                         not (b is head and pert))
+            if given and not pert:
+                heads.add(id(head))
             nl_dp = nl_dp or id(head) in heads
             nl_output = nl_output or id(head) in heads or (explicit and given is not False)
             motion_explicit = motion_proc == "DYNAMIC" and motion_card.has("EXPLICIT")
             period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
             nl_motion = nl_motion or (not pert and bool(given)) or motion_explicit
             steps.append(Step(
-                no=len(steps) + 1, ccx_no=star + 1, cards=tuple(cards), between=tuple(loose),
-                star_steps=n, closed=n == 1 and cards[-1].keyword == "END STEP",
-                proc=proc, proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
+                no=len(steps) + 1, cards=tuple(cards), between=tuple(loose), proc=proc,
+                proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
                 amplitude=head.uparam("AMPLITUDE"), pert_param=pert_param, perturbation=pert,
                 nlgeom_card=given,
-                nlgeom_on=(not pert and any(b.keyword == "STEP" and _nlgeom_given(b) for b in cards))
-                or any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
+                nlgeom_on=(not pert and bool(given)) or
+                any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
                 nlgeom=nlgeom,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
-                star_procs=tuple(star_proc[id(b)] for b in cards if b.keyword == "STEP"),
+                star_proc=star_proc[id(head)],
                 nlgeom_output=nl_output, nlgeom_dp=nl_dp, general=general, general_before=seen,
                 base_nlgeom=base, base_nlgeom_dp=base_dp,
                 buckle_loaded=proc == "BUCKLE" and any(
@@ -4820,16 +4815,12 @@ class StepModel:
                 base = base or self._writes_nlgeom(given, explicit, pert, base, False)
                 base_dp = base_dp or self._writes_nlgeom(given, explicit, pert, base_dp, True)
             self.card_step.update((id(b), len(steps)) for b in cards)
-            star += n
             loose = []
         self.model: Tuple[Block, ...] = tuple(model)
         self.steps: Tuple[Step, ...] = tuple(steps)
         self.after: Tuple[Block, ...] = tuple(loose)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
         self.nl_heads = frozenset(heads)
-        # the *STEP cards (_n_steps: _nodal_load_clash; handle_step); len(steps) counts the steps
-        # as emitted
-        self.n_star_steps = star
         # the *BOUNDARY, LOAD CASE=2 cards of *BUCKLE steps: buckling-mode BCs, which ccx cannot
         # have (one set of BCs per step), so the conversion leaves them out (handle_boundary,
         # _plan_load_cases).  No walker of the deck's BCs counts them: they are not there
@@ -4945,16 +4936,16 @@ class StepModel:
     def states(self, entries: Callable[[Block], Sequence[Tuple[object, object]]],
                keywords: Tuple[str, ...] = ("BOUNDARY",),
                restore: Union[bool, set, frozenset, Sequence[int]] = True,
-               skip: Union[set, frozenset] = frozenset(), nested: str = "replace",
+               skip: Union[set, frozenset] = frozenset(),
                model: bool = False, blocks: Optional[Sequence[Block]] = None) -> Iterator[dict]:
         """The entries of the ``keywords`` cards in force in each step, {key: value} from
         ``entries(card)``, the card's (key, value) pairs (asked once per card, in deck order,
         as the iteration reaches it), as ccx 2.23 applies *BOUNDARY: model data first, a step
         keeps what is in force before it (cards between steps too), a later value on a key
         replaces the earlier one, and an OP=NEW ccx acts on (``acting``) removes what is in
-        force.  One dict per step, at its *END STEP (an unterminated last step's: at the deck's
-        end); a deck without steps yields the model data's.  Later cards may update a yielded
-        dict: copy what is kept.  ``blocks``: the deck as it is now, whose cards are folded
+        force.  One dict per step, at its *END STEP (the deck's end, where a caller's cards end
+        without one); a deck without steps yields the model data's.  Later cards may update a
+        yielded dict: copy what is kept.  ``blocks``: the deck as it is now, whose cards are folded
         (None: the model's own).  The converter's model is read after the last planner that
         rewrites a step card (Converter._read_steps), and no later one replaces, inserts or
         removes a card, so for its walkers, which run after that point and pass their deck,
@@ -4965,13 +4956,11 @@ class StepModel:
           other step left: True, the linear perturbation steps (``pert``), which
           _restore_base_states makes ccx undo; or a set of numbers; () or False: none;
         * ``skip``: ids of cards left out, also where OP=NEW acts (``lc2``);
-        * ``nested``: an unterminated *STEP's later *STEP: "replace", the open step starts
-          again from where it started, its cards gone (bc_steps); "join", the cards stay one
-          step as emitted (step_groups), and OP=NEW on any of its acting cards clears at the
-          step's start;
-        * ``model``: yield the model data's state first (a copy)."""
-        if nested not in ("replace", "join"):
-            raise ValueError(f"StepModel.states: nested={nested!r}")
+        * ``model``: yield the model data's state first (a copy).
+
+        A *STEP before the open step's *END STEP (a caller's cards: bc_steps over a ccx deck;
+        not the converter's, close_open_steps) starts that step again from where it started,
+        its cards gone, as step_load_audit counts it."""
         restore = self.pert if restore is True else restore or ()
         acts = self.acting(keywords, skip, blocks)
         if blocks is None:
@@ -4979,10 +4968,10 @@ class StepModel:
         else:
             data, steps, after = self._parts(blocks)
 
-        def fold(cards: Sequence[Block], active: dict, wipe: bool = True) -> dict:
+        def fold(cards: Sequence[Block], active: dict) -> dict:
             for b in cards:
                 if b.keyword in keywords and id(b) not in skip:
-                    if wipe and id(b) in acts:
+                    if id(b) in acts:
                         active = {}
                     active.update(entries(b))
             return active
@@ -4991,20 +4980,13 @@ class StepModel:
         active = fold(data, active)
         if model:
             yield dict(active)
-        join = nested == "join"
         for no, (loose, cards) in enumerate(steps, 1):
             active = fold(loose, active)
             if no - 1 not in restore:
                 base = dict(active)
             start = dict(active)
-            if join and any(id(b) in acts for b in cards):
-                active = {}
             for b in cards[1:]:
-                if b.keyword == "STEP":
-                    if not join:
-                        active = dict(start)
-                else:
-                    active = fold((b,), active, not join)
+                active = dict(start) if b.keyword == "STEP" else fold((b,), active)
             yield active
             if cards[-1].keyword == "END STEP" and no in restore:
                 active = dict(base)
@@ -6784,8 +6766,8 @@ class Converter:
 
     @property
     def _n_steps(self) -> int:
-        """The deck's *STEP cards."""
-        return self._steps_now.n_star_steps
+        """The deck's steps."""
+        return len(self._steps_now)
 
     @property
     def _freq_read(self) -> frozenset:
@@ -7869,7 +7851,7 @@ class Converter:
                     elif nb.keyword != "DAMAGE STABILIZATION":
                         break
                 cards.append((b, mat, evolution))
-        steps = [p for step in self.steps for p in step.star_procs]     # per *STEP card
+        steps = [step.star_proc for step in self.steps]
         bad = next(((n, p) for n, p in enumerate(steps, 1) if p not in ("STATIC", "DYNAMIC")), None)
         last = materials[-1] if materials else None
         kept = False
@@ -11099,10 +11081,8 @@ class Converter:
                     self.report.note(f"*STEP, PERTURBATION dropped on a *{proc} step (ccx reads it only "
                                      f"on *FREQUENCY / *BUCKLE; it runs *{proc} as a linear "
                                      f"procedure anyway).", once=True)
-                elif self.steps.n_star_steps > len(self.steps) or \
-                        any(not s.perturbation for s in self.steps.steps[cur.no:]):
-                    # (a later general step; an unterminated *STEP anywhere in the deck counts
-                    # as one: its *STEP cards outnumber the steps)
+                elif any(not s.perturbation for s in self.steps.steps[cur.no:]):
+                    # (a later general step)
                     self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
                                      "general step, so the next general step starts from its deformed "
                                      "state (its loads and boundary conditions are given back there) "
@@ -14833,9 +14813,8 @@ class Converter:
         the cards in ``acts``, op_new_cards) removes the earlier ones, and after a linear
         perturbation step (``self._pert_idx``) the state starts again from the last general
         step's, which _restore_base_states gives ccx again (as bc_steps)."""
-        # (not StepModel.states: it needs the state after each card; it counts the steps per
-        # *STEP card, as ``cards`` does, an unterminated *STEP's later one as a step against
-        # _pert_idx's count)
+        # (not StepModel.states: it needs the state after each card; ``cards`` counts the steps
+        # by their *STEP cards, one per step)
         pert = self._pert_idx
         state: Dict[int, Tuple[float, Optional[str], int]] = {}
         base, cur = state, 0                    # the last general step's state; the step
@@ -31483,9 +31462,9 @@ class Converter:
         given = {id(b): self._boundary_pairs(b) for b in deck
                  if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2}
         # the pairs in force as a step starts: the model data's, then the last general step's
-        # (what follows the last step left out; an unterminated *STEP's cards stay in its step)
+        # (what follows the last step left out)
         folds = self.steps.states(lambda b: [(k, True) for k in given[id(b)]], skip=self.steps.lc2,
-                                  nested="join", model=True, blocks=deck)
+                                  model=True, blocks=deck)
         state = set(next(folds))
         last, since, held = 0, set(), set()     # the perturbation procedures since, what they hold
         for (s, group), end in zip(enumerate(groups, 1), folds):

@@ -410,7 +410,7 @@ def test_step_model_of_model_data_only():
     # a deck without steps: all of it is model data, and it counts as mechanical
     blocks, m = _step_model("*NODE\n1, 0., 0., 0.\n*BOUNDARY\n1, 1, 3\n")
     assert m.model == tuple(blocks) and m.steps == () and m.after == () and len(m) == 0
-    assert m.pert == frozenset() and m.n_star_steps == 0 and m.nl_steps == ()
+    assert m.pert == frozenset() and m.nl_steps == ()
     assert (m.nl_any, m.nl_all, m.dynamic, m.explicit, m.mechanical) == (False, False, False, False, True)
     assert set(m.card_step.values()) == {0} and m.op_new["BOUNDARY"] == frozenset()
     assert not A.StepModel(A.blocks_from_lines(["*STEP", "*HEAT TRANSFER", "*END STEP"])).mechanical
@@ -423,16 +423,16 @@ def test_step_model_general_and_perturbation_steps():
 *STEP, NLGEOM\n*FREQUENCY\n3\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n*END STEP
 *STEP, NLGEOM=YES, AMPLITUDE=step\n*STATIC\n*END STEP\n*STEP\n*BUCKLE\n2\n*END STEP
 *STEP, NLGEOM=NO\n*MODAL DYNAMIC\n0.1, 1.\n*END STEP\n*STEP, NLGEOM=NO\n*STATIC\n*END STEP""")
-    assert [s.no for s in m] == [s.ccx_no for s in m] == list(range(1, 8))
+    assert [s.no for s in m] == list(range(1, 8))
     assert [s.proc for s in m] == ["STATIC", "FREQUENCY", "STATIC", "STATIC", "BUCKLE",
                                    "MODAL DYNAMIC", "STATIC"]
-    assert all(s.proc_card is s.cards[1] and s.closed and s.star_steps == 1 for s in m)
+    assert all(s.proc_card is s.cards[1] for s in m)
     assert m.pert == {2, 3, 5, 6} and [s.pert_param for s in m] == [False, False, True] + [False] * 4
     assert [s.perturbation for s in m] == [False, True, True, False, True, True, False]
     assert [s.nlgeom_card for s in m] == [None, True, None, True, None, False, False]
     assert [s.nlgeom_on for s in m] == list(m.nl_steps) == [False] * 3 + [True] + [False] * 3
     assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
-    assert (m.nl_any, m.nl_all, m.n_star_steps) == (True, False, 7)
+    assert (m.nl_any, m.nl_all, len(m)) == (True, False, 7)
     assert [s.amplitude for s in m] == ["", "", "", "STEP", "", "", ""]
     assert m.model == tuple(blocks[:1]) and all(s.between == () for s in m) and m.after == ()
     # one perturbation rule (Abaqus' procedures; handle_step finds no ccx procedure in a *RANDOM
@@ -448,24 +448,7 @@ def test_step_model_general_and_perturbation_steps():
                              "*Elastic\n1000., 0.3\n*Boundary\n1, 1, 3\n*Step, nlgeom\n*Static\n"
                              "*End Step\n*Step\n*Frequency\n2\n*End Step\n")
     assert conv._pert_idx is conv.steps.pert == {2} and conv._nl_steps == [True, False]
-    assert conv._perturbation_steps([]) == {2} and conv._n_steps == conv.steps.n_star_steps == 2
-
-
-def test_step_model_unterminated_step():
-    # an unterminated *STEP runs on to the next *END STEP, as emitted: one step of two *STEP
-    # cards, whose second ccx counts as a step of its own; its *FREQUENCY makes it a
-    # perturbation step (any card), its procedure is the first one's
-    blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP, NLGEOM\n*STATIC\n*CLOAD\n2, 2, 1.
-*STEP\n*FREQUENCY\n*END STEP\n*CLOAD\n2, 1, 1.\n*STEP\n*STATIC\n*END STEP\n*STEP\n*STATIC""")
-    one, two, three = m.steps
-    assert (len(one.cards), one.star_steps, one.closed, one.ccx_no) == (6, 2, False, 1)
-    assert (one.proc, one.perturbation) == ("STATIC", True)
-    assert (one.nlgeom_card, one.nlgeom_on, one.nlgeom) == (True, False, False)
-    assert two.between == tuple(blocks[7:8]) and (two.ccx_no, two.closed) == (3, True)
-    assert (three.ccx_no, three.star_steps, three.closed) == (4, 1, False)
-    assert m.n_star_steps == 4 and len(m) == 3 and m.pert == {1}
-    assert [m.card_step[id(b)] for b in blocks] == [0] + [1] * 6 + [-1] + [2] * 3 + [3] * 2
-    assert m.model + one.cards + two.between + two.cards + three.cards == tuple(blocks)
+    assert conv._perturbation_steps([]) == {2} and conv._n_steps == len(conv.steps) == 2
 
 
 def test_step_model_states():
@@ -501,19 +484,14 @@ def test_step_model_states():
     cur[13] = A.Block("BOUNDARY", A.OrderedDict(), ["8, 1, 1"])
     assert run(blocks=cur) == [[1, 2], [4, 7], [1, 2, 3, 8]] and run()[2] == [1, 2, 3, 5]
     assert m.acting(blocks=cur) == {id(cur[8])} and m.acting() == {id(two)}
-    # an unterminated *STEP: "replace" starts the open step again at the next *STEP (its cards
-    # go), "join" keeps one step, OP=NEW on any acting card clearing at its start
+    # a caller's *STEP before the open step's *END STEP (bc_steps over a ccx deck; the
+    # converter closes the open step: close_open_steps) starts that step again (its cards go)
     blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1
 *STEP\n*STATIC\n*BOUNDARY, OP=NEW\n3, 1, 1\n*END STEP""")
-    assert (run(), run(nested="join")) == ([[3]], [[2, 3]])
+    assert run() == [[3]] and len(m) == 1
     blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1
 *STEP\n*STATIC\n*BOUNDARY\n3, 1, 1""")
-    assert (run(), run(nested="join")) == ([[1, 3]], [[1, 2, 3]])
-    try:
-        run(nested="other")
-        assert False
-    except ValueError:
-        pass
+    assert run() == [[1, 3]]
 
 
 def test_step_model_handle_step_facts():
@@ -531,14 +509,6 @@ def test_step_model_handle_step_facts():
     assert [s.base_nlgeom for s in m] == [False] * 7 + [True]
     assert [s.base_nlgeom_dp for s in m] == [False] + [True] * 7
     assert [s.buckle_loaded for s in m] == [False] * 3 + [True] + [False] * 4
-    # a general step with a perturbation card (an unterminated *STEP ran into one) is a
-    # perturbation step too: its NLGEOM is dropped over a linear base, unless it is explicit
-    for proc, on in (("*STATIC", False), ("*DYNAMIC, EXPLICIT\n, 1e-4", True)):
-        _, m = _step_model(f"*STEP, NLGEOM\n{proc}\n*STEP\n*FREQUENCY\n2\n*END STEP\n"
-                           "*STEP\n*STATIC\n*END STEP")
-        one, two = m.steps
-        assert (one.general, one.perturbation, two.general_before) == (True, True, True)
-        assert (two.base_nlgeom, two.base_nlgeom_dp) == (on, on)
 
 
 def test_step_model_motion_facts():
@@ -568,23 +538,23 @@ def test_step_model_motion_facts():
 def test_step_model_planner_facts():
     # the *STEP cards that switch NLGEOM on (not a perturbation step's), the NLGEOM in force by
     # the output planners' rule (an explicit step without NLGEOM=NO too) and by the deformation
-    # plasticity check's (*STEP cards only); each *STEP card's procedure (damage criteria)
+    # plasticity check's (*STEP cards only); each step's procedure, card by card (damage criteria)
     blocks, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM, INC=5\n*STATIC, RIKS\n*END STEP""")
     assert m.nl_heads == {id(blocks[12])} and m.explicit_without_nlgeom
     assert [s.nlgeom_output for s in m] == [False, False, True, True, True]
     assert [s.nlgeom_dp for s in m] == [False] * 4 + [True]
-    assert [s.star_procs for s in m] == [("DYNAMIC",), ("FREQUENCY",), ("DYNAMIC",),
-                                         ("PERTURBATION",), ("STATIC, RIKS",)]
-    # card by card: a procedure between steps counts for the *STEP before it; the *STEP card an
-    # unterminated perturbation step runs into switches NLGEOM on, its own does not
-    blocks, m = _step_model("*STEP\n*END STEP\n*STATIC\n*STEP, NLGEOM\n*FREQUENCY\n2\n"
+    assert [s.star_proc for s in m] == ["DYNAMIC", "FREQUENCY", "DYNAMIC", "PERTURBATION",
+                                        "STATIC, RIKS"]
+    # card by card: a procedure between steps counts for the step before it; a perturbation
+    # step's NLGEOM switches nothing on
+    blocks, m = _step_model("*STEP\n*END STEP\n*STATIC\n*STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n"
                             "*STEP, NLGEOM\n*STATIC\n*END STEP")
-    assert [s.star_procs for s in m] == [("STATIC",), ("FREQUENCY", "STATIC")]
-    assert m.nl_heads == {id(blocks[5])} and not m.explicit_without_nlgeom
-    assert [(s.proc, s.nlgeom_dp, s.nlgeom_output) for s in m] == [("", False, False),
-                                                                  ("FREQUENCY", False, False)]
+    assert [s.star_proc for s in m] == ["STATIC", "FREQUENCY", "STATIC"]
+    assert m.nl_heads == {id(blocks[6])} and not m.explicit_without_nlgeom
+    assert [(s.proc, s.nlgeom_dp, s.nlgeom_output) for s in m] == [
+        ("", False, False), ("FREQUENCY", False, False), ("STATIC", True, True)]
 
 
 def test_step_model_deck_facts():
