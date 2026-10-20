@@ -6,6 +6,9 @@ physics.
 
 ## Unreleased
 
+* **`*BOUNDARY` line with a last DOF that is not a number** (`TOP, 3, X, 0.01`) — passed through
+  as before, on which ccx stops; it is now warned, and no planner reads it as a BC on DOF 3
+  (three of seven did).
 * **`*ROTARY INERTIA` on a turned `*ORIENTATION`** — an orientation with an additional rotation
   line was refused (the rigid body's rotary inertia not converted, reduced physics). Its turned
   axes are the inertia axes, as for connectors and coupling orientations, and are now used.

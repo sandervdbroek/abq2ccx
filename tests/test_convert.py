@@ -12679,6 +12679,23 @@ def test_tie_tolerance_rules_shared():
     edges = [0.1, 0.2, 0.3000000000000001]
     assert A.pair_tie_tolerance(edges) == 0.025 * (sum(edges) / 3) and A.pair_tie_tolerance([]) == 0.0
 
+
+def test_boundary_line_with_a_non_numeric_last_dof():
+    # one reading for every *BOUNDARY parser: a last DOF that is not an integer names no DOF
+    # (ccx 2.23 stops on the line, as Abaqus reads an integer there); passed through, warned
+    assert A.bc_dof_range(["1", "3"]) == (3, 3) and A.bc_dof_range(["1", "3", "", "0.5"]) == (3, 3)
+    assert A.bc_dof_range(["1", "3", "1"]) == (1, 3) and A.bc_dof_range(["1", "ENCASTRE"]) is None
+    assert A.bc_dof_range(["1", "3", "X", "0.01"]) is None and A.bc_dof_range(["1", "1", "3."]) is None
+    deck = HEX + ("*NSET, NSET=TOP\n5, 6, 7, 8\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+                  "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n"
+                  "4, 1, 3\n*STEP\n*STATIC\n*BOUNDARY\nTOP, 3, X, 0.01\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    assert "\nTOP, 3, X, 0.01\n" in body
+    assert "*BOUNDARY line 'TOP, 3, X, 0.01': its last DOF is not a number" in rep.text()
+    card = [b for b in A.blocks_from_lines(deck.splitlines()) if b.keyword == "BOUNDARY"][-1]
+    assert conv._bc_records(card) == [([5, 6, 7, 8], [], 0.01)]
+    assert conv._rate_lines(card)[0][1] == []
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

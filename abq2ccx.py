@@ -1278,6 +1278,21 @@ def trimmed_fields(fields: Sequence[str]) -> List[str]:
     return g
 
 
+def bc_dof_range(g: Sequence[str]) -> Optional[Tuple[int, int]]:
+    """(lowest, highest) DOF of a *BOUNDARY data line with a numeric first DOF (``g``: its
+    trimmed fields, node first): a blank or missing last DOF is the first.  None where the
+    first DOF is not a number (a named type, say) or the last DOF is not: Abaqus reads an
+    integer there and ccx 2.23 stops on such a line ("*ERROR reading *BOUNDARY"; probed), so
+    it constrains nothing a planner counts (handle_boundary passes it through, warned)."""
+    isint = re.compile(r"[-+]?\d+").fullmatch
+    if len(g) < 2 or not isint(g[1]):
+        return None
+    last = g[2] if len(g) > 2 and g[2] != "" else g[1]
+    if not isint(last):
+        return None
+    return min(int(g[1]), int(last)), max(int(g[1]), int(last))
+
+
 def fields_at(rec: Sequence[str], n: int, default: float = 0.0) -> List[float]:
     """The first ``n`` fields of data record ``rec`` as numbers, read by position: a blank or
     missing field is ``default`` (Abaqus reads a blank as 0); ValueError if a field is not a
@@ -4237,14 +4252,12 @@ class Converter:
             data, before = [], len(cut)
             for rec in merged_data_records(b):
                 f = [x.strip() for x in rec]
-                if len(f) > 1 and re.fullmatch(r"[-+]?\d+", f[1]):
-                    d1 = int(f[1])
-                    d2 = int(f[2]) if len(f) > 2 and re.fullmatch(r"[-+]?\d+", f[2]) else d1
-                    if max(d1, d2) > 30:
-                        cut.append(", ".join(f))
-                        if min(d1, d2) > 30:
-                            continue
-                        f = [f[0], str(min(d1, d2)), "30"] + f[3:]
+                rng = bc_dof_range(f)
+                if rng and rng[1] > 30:
+                    cut.append(", ".join(f))
+                    if rng[0] > 30:
+                        continue
+                    f = [f[0], str(rng[0]), "30"] + f[3:]
                 data.append(", ".join(f))
             out.append(Block(b.keyword, b.params, data) if len(cut) > before else b)
         if cut:
@@ -8188,8 +8201,12 @@ class Converter:
                 # node, first-dof, last-dof[, magnitude]; blank last-dof means = first
                 dof2 = rest[1] if rest[1] != "" else rest[0]
                 kept = None
-                if re.fullmatch(r"[-+]?\d+", rest[0]) and re.fullmatch(r"[-+]?\d+", dof2):
+                if bc_dof_range(g):
                     kept = self._known_dof_lines(spec, int(rest[0]), int(dof2), rest[2:])
+                elif re.fullmatch(r"[-+]?\d+", rest[0]):
+                    self.report.warn(f"*BOUNDARY line '{', '.join(g)}': its last DOF is not a number "
+                                     f"(Abaqus reads an integer there); passed through — ccx stops "
+                                     f"on it.", once=True)
                 inactive |= kept == []
                 out.extend(kept if kept is not None else [", ".join([spec, rest[0], dof2] + rest[2:])])
             elif len(rest) == 1 and re.fullmatch(r"[-+]?\d+", rest[0]):
@@ -8439,9 +8456,8 @@ class Converter:
                 continue
             text = ", ".join(g)
             if re.fullmatch(r"[-+]?\d+", g[1]):
-                d1 = int(g[1])
-                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
-                out.append((g[0], list(range(min(d1, d2), max(d1, d2) + 1)),
+                rng = bc_dof_range(g)
+                out.append((g[0], list(range(rng[0], rng[1] + 1)) if rng else [],
                             g[3] if len(g) > 3 else "", None, text))
             elif g[1]:
                 dofs = [d for a, c in (self._named_bc_dofs(g[1], self._named_bc_rot(g[0])) or [])
@@ -9282,10 +9298,9 @@ class Converter:
                     ln["named"] = rest[0]
                     ln["dofs"] = [d for a, c in runs for d in range(a, c + 1)]
             elif rest and re.fullmatch(r"[-+]?\d+", rest[0]):
-                last = rest[1] if len(rest) > 1 and rest[1] != "" else rest[0]
-                if re.fullmatch(r"[-+]?\d+", last):
-                    d1, d2 = int(rest[0]), int(last)
-                    ln["dofs"] = list(range(min(d1, d2), max(d1, d2) + 1))
+                rng = bc_dof_range(g)
+                if rng:
+                    ln["dofs"] = list(range(rng[0], rng[1] + 1))
                     ln["value"] = rest[2] if len(rest) > 2 else ""
                     try:
                         ln["num"] = pf(ln["value"]) if ln["value"] else 0.0
@@ -10770,9 +10785,8 @@ class Converter:
             if len(g) < 2 or not g[0]:
                 continue
             if re.fullmatch(r"[-+]?\d+", g[1]):
-                d1 = int(g[1])
-                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
-                ranges, value = [(min(d1, d2), max(d1, d2))], num(g[3] if len(g) > 3 else "")
+                rng = bc_dof_range(g)
+                ranges, value = [rng] if rng else [], num(g[3] if len(g) > 3 else "")
             else:
                 ranges, value = self._named_bc_dofs(g[1], self._named_bc_rot(g[0])) or [], 0.0
             for n in self._resolve_nodes(g[0]):
@@ -17479,10 +17493,11 @@ class Converter:
                 elif layout == "dof":
                     vals[int(g[1])] = pf(g[2]) if len(g) > 2 and g[2] else 0.0
                 elif re.fullmatch(r"[-+]?\d+", g[1]):
-                    d1 = int(g[1])
-                    d2 = int(g[2]) if len(g) > 2 and g[2] else d1
+                    rng = bc_dof_range(g)
+                    if rng is None:
+                        continue
                     mag = pf(g[3]) if len(g) > 3 and g[3] else None
-                    vals.update((d, mag) for d in range(min(d1, d2), max(d1, d2) + 1))
+                    vals.update((d, mag) for d in range(rng[0], rng[1] + 1))
                 else:
                     for d1, d2 in self._named_bc_dofs(g[1]) or []:
                         vals.update((d, None) for d in range(d1, d2 + 1))
@@ -21210,9 +21225,8 @@ class Converter:
             if len(g) < 2 or not g[0]:
                 continue
             if re.fullmatch(r"[-+]?\d+", g[1]):
-                d1 = int(g[1])
-                d2 = int(g[2]) if len(g) > 2 and re.fullmatch(r"[-+]?\d+", g[2]) else d1
-                dofs = list(range(min(d1, d2), max(d1, d2) + 1))
+                rng = bc_dof_range(g)
+                dofs = list(range(rng[0], rng[1] + 1)) if rng else []
                 try:
                     mag = pf(g[3]) if len(g) > 3 and g[3] else 0.0
                 except ValueError:
@@ -21824,12 +21838,11 @@ class Converter:
                 continue
             spec, rest = g[0], g[1:]
             if re.fullmatch(r"[-+]?\d+", rest[0]):
-                last = rest[1] if len(rest) > 1 and rest[1] != "" else rest[0]
-                if not re.fullmatch(r"[-+]?\d+", last):
+                rng = bc_dof_range(g)
+                if rng is None:
                     out.append(g)
                     continue
-                d1, d2 = int(rest[0]), int(last)
-                dofs, extra = list(range(min(d1, d2), max(d1, d2) + 1)), rest[2:]
+                dofs, extra = list(range(rng[0], rng[1] + 1)), rest[2:]
             else:
                 named = self._named_bc_dofs(rest[0], self._named_bc_rot(spec))
                 if named is None:
