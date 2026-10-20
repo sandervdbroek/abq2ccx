@@ -9180,10 +9180,10 @@ def main():
     failures += 0 if ok else 1
     # a *STEP without *END STEP is closed before the next *STEP (it was written nested in the
     # next step, where ccx stops): a cube (E 1000, nu 0) pulled by 100, then by 200 (OP=NEW)
-    blocks = review_run(CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n" + CUBE8_HELD +
-                        "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 25.\n*NODE PRINT, NSET=TOP\nU\n*STEP\n*STATIC\n"
-                        "*CLOAD, OP=NEW\nTOP, 3, 50.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n",
-                        "unterminated_step", dat_node_blocks)
+    unterminated = (CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n" + CUBE8_HELD +
+                    "*STEP\n*STATIC\n*CLOAD\nTOP, 3, 25.\n*NODE PRINT, NSET=TOP\nU\n*STEP\n*STATIC\n"
+                    "*CLOAD, OP=NEW\nTOP, 3, 50.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+    blocks = review_run(unterminated, "unterminated_step", dat_node_blocks)
     ok = False
     if blocks:
         uz = [b.get(7, [0.0, 0.0, math.nan])[2] for b in blocks]
@@ -9191,6 +9191,27 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  unterminated_step (a cube pulled by 100 in a *STEP without "
               f"*END STEP, then by 200 with OP=NEW): top displacement {', '.join(f'{u:.7g}' for u in uz)} "
               f"vs 0.1, 0.2 (before: the first step written inside the second, where ccx stops)")
+    failures += 0 if ok else 1
+    # ... and its blocks passed to Converter.convert as they are (a caller that builds them
+    # itself), which closes the step as read_blocks does
+    src, inp = (os.path.join(tmp, f"unterminated_step_blocks{x}.inp") for x in ("_src", ""))
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(unterminated)
+    raw = A.read_blocks(src, A.Report())
+    del raw[next(k for k, b in enumerate(raw) if b.keyword == "END STEP")]     # (read_blocks')
+    rep = A.Report()
+    body = A.Converter(rep, type("O", (), {"solid_dof": False})()).convert(raw)
+    with open(inp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(rep.header_comment_lines() + body) + "\n")
+    d, status, out = run_ccx(ccx, env, inp)
+    blocks = dat_node_blocks(os.path.join(d, "job.dat")) if status == "solved" else None
+    shutil.rmtree(d, ignore_errors=True)
+    uz = [b.get(7, [0.0, 0.0, math.nan])[2] for b in blocks or ()]
+    ok = len(uz) == 2 and all(abs(u / w - 1) < 1e-9 for u, w in zip(uz, (0.1, 0.2)))
+    print(f"{'PASS' if ok else 'FAIL'}  unterminated_step_blocks (the same deck's blocks, its *STEP "
+          f"left open, passed to Converter.convert): top displacement "
+          f"{', '.join(f'{u:.7g}' for u in uz) or status} vs 0.1, 0.2 (before: the first step "
+          f"written inside the second, where ccx stops)")
     failures += 0 if ok else 1
     # --approximate's Poisson clamp beside a blank nu (that row became "E, 0.475")
     u = review_run(blank_nu_cube_deck(), "approximate_blank_nu", dat_displacements, approximate=True)
