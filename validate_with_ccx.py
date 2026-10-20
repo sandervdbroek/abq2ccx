@@ -2421,8 +2421,8 @@ def elke_steps_deck(case, elke=True):
     ELSE printed in its *BUCKLE step (``elke``: False leaves them out), then pulled sideways."""
     if case == "buckle":
         deck = buckle_gravity_deck(preload="", static=True)
-        return deck.replace("TIP, 3, -1.e5\n", "TIP, 3, -1.e5\n" + ("*EL PRINT, ELSET=EALL\nELKE, "
-                                                                   "ELSE\n" if elke else ""), 1)
+        end = deck.index("*END STEP\n", deck.index("*BUCKLE\n"))     # the *BUCKLE step's end
+        return deck[:end] + ("*EL PRINT, ELSET=EALL\nELKE, ELSE\n" if elke else "") + deck[end:]
     return (CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*DENSITY\n0.3\n*BOUNDARY\nBOT, 1, 3\n"
             "TOP, 1, 2\n*STEP\n*STATIC\n*CLOAD\nTOP, 3, 0.25\n*OUTPUT, HISTORY, FREQUENCY=1\n*NODE "
             "OUTPUT, NSET=TOP\nU\n*ELEMENT OUTPUT, ELSET=EALL\nELKE, ELSE\n*END STEP\n*STEP, INC=1000\n"
