@@ -3001,6 +3001,35 @@ def static_pert_adds_deck(between="", ref=False):
     return text + between + "*STEP, PERTURBATION\n*STATIC\n" + cards.format(", OP=NEW", 0.5, 0.5, 500., 0.5, 0.02)
 
 
+def static_pert_temps_deck(case, between="", ref=None):
+    """modal_own_loads_deck's cube, unloaded, with expansion 1e-3 and initial temperatures 20:
+    a static step heats nodes 5 and 6 to 100 and loads node 6, ``between`` (steps), then a
+    *STEP, PERTURBATION *STATIC step.  ``case`` "temps": that step heats every node by 10 and
+    loads node 6 by 1, both on an amplitude of 0.5 at time 0 (1 at its end), and node 7 by 0.5,
+    and so does a first step before the static one (its base state: the initial one); "hold":
+    it holds node 6's y, which the base state leaves free (a zero BC), and loads node 7.  The
+    perturbation steps print U.  ``ref``: one static step with the sums, Abaqus' base state plus
+    its perturbation ("first": of the first step; "hold": node 6's y held at ``ref``, its
+    base-state value; "base": the base state)."""
+    text = modal_own_loads_deck(False).replace("*NSET, NSET=N7\n7\n", "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n"
+                                               "*NSET, NSET=N56\n5, 6\n").replace(
+        "*DENSITY", "*EXPANSION\n1.E-3\n*DENSITY")
+    text = text[:text.index("*STEP")] + "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 20.\n" \
+        "*AMPLITUDE, NAME=UP\n0., 0.5, 1., 1.\n"
+    out = "*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
+    base = "*TEMPERATURE\nN56, 100.\n*CLOAD\n6, 2, 1.\n"
+    if ref is not None:
+        cards = {"temps": "*TEMPERATURE\nNALL, 25.\nN56, 105.\n*CLOAD\n6, 2, 1.5\n7, 1, 0.5\n",
+                 "first": "*TEMPERATURE\nNALL, 25.\n*CLOAD\n6, 2, 0.5\n7, 1, 0.5\n",
+                 "hold": f"{base}*CLOAD\n7, 1, 0.5\n*BOUNDARY\n6, 2, 2, {ref!r}\n", "base": base}[case]
+        return text + "*STEP\n*STATIC\n" + cards + out
+    pert = "*STEP, PERTURBATION\n*STATIC\n"
+    if case == "temps":
+        own = "*TEMPERATURE, AMPLITUDE=UP\nNALL, 10.\n*CLOAD, AMPLITUDE=UP\n6, 2, 1.\n*CLOAD\n7, 1, 0.5\n"
+        return text + pert + own + out + "*STEP\n*STATIC\n" + base + "*END STEP\n" + between + pert + own + out
+    return text + "*STEP\n*STATIC\n" + base + "*END STEP\n" + between + pert + \
+        "*BOUNDARY\n6, 2, 2\n*CLOAD\n7, 1, 0.5\n" + out
+
 def ramped_rotation_deck(step, twin=False):
     """pert_frame_deck("bc") without its *FREQUENCY step: the frame's joint 9 (a ccx knot, its
     *TRANSFORM about z: local 1 = y) turned about local 1 and 3 by 0.01, then about local 1 to
@@ -7135,6 +7164,36 @@ def main():
                   f"then a *STEP, PERTURBATION *STATIC step changing each of them): its displacements "
                   f"are the ones of a static step with the sums ({err:.1e} apart, nodes moved {moved:.3g})")
         failures += 0 if ok else 1
+    # a static perturbation step's temperatures change the base state's (from the initial ones
+    # before any general step), an amplitude counts at its value at time 0, and a zero BC on a
+    # DOF the base state leaves free holds its base-state value: ccx 2.23 read the temperatures
+    # as the new ones, applied the amplitude's end value and held the DOF at 0
+    first = review_run(static_pert_temps_deck("first", ref=True), "static_pert_first_ref", dat_node_blocks)
+    for case in ("temps", "hold"):
+        held = None
+        if case == "hold":
+            got = review_run(static_pert_temps_deck("base", ref=True), "static_pert_hold_base", dat_node_blocks)
+            held = got[-1][6][1] if got else None
+        ref = review_run(static_pert_temps_deck(case, ref=held), f"static_pert_{case}_ref", dat_node_blocks) \
+            if case == "temps" or held else None
+        for tag, between in (("", ""), ("_freq", freq)):
+            got = review_run(static_pert_temps_deck(case, between), f"static_pert_{case}{tag}", dat_node_blocks)
+            ok = bool(got and ref and first)
+            if ok:
+                err, moved = same([got, ref], -1)
+                if case == "temps":         # (and the first step, from the initial temperatures)
+                    err = max(err, same([got[:1], first], -1)[0])
+                ok = err < 1e-9 * moved and moved > 1e-3 and (case == "temps" or abs(held) > 1e-3)
+                print(f"{'PASS' if ok else 'FAIL'}  static_pert_{case}{tag} (a heated, loaded cube, "
+                      f"{'then *FREQUENCY, ' if between else ''}then a *STEP, PERTURBATION *STATIC step "
+                      + ("heating it and loading it, partly on an amplitude, as one before the static "
+                         "step does: their displacements are those of static steps with the base "
+                         "state's (initial) temperatures and loads plus the step's, at the amplitude's "
+                         "time-0 value" if case == "temps" else
+                         f"holding a DOF the base state leaves free (at {held:.4g}) and loading another "
+                         f"node: its displacements are those of a static step with that DOF prescribed "
+                         f"at its base value") + f" ({err:.1e} apart, nodes moved {moved:.3g})")
+            failures += 0 if ok else 1
     # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
     # aborted after the step that held no body load (the converter writes a zero GRAV there)
     def factors(dat):

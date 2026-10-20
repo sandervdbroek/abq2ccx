@@ -92,6 +92,15 @@ physics.
   nodes strain-free, and a `*CLEARANCE` that sets a gap. Temperature-dependent
   `*HYPERELASTIC` / `*HYPERFOAM` coefficients now count as heated materials there, as `*ELASTIC`
   rows do. Contact pairs on unconverted analytical surfaces no longer count as contact.
+* **Static perturbation temperatures, amplitudes and zero BCs** — in a `*STEP, PERTURBATION`
+  `*STATIC` step a `*TEMPERATURE` is a change of the base state's temperatures (the initial
+  ones before any general step), and an amplitude counts at its value at time 0 (Abaqus); ccx
+  2.23 read the temperature as the new one and applied the amplitude's end value. The base
+  temperature is now added, and values on an amplitude are scaled by its time-0 value; one the
+  converter cannot evaluate there is warned. A zero BC on a DOF the base state leaves free holds
+  its base-state value: written as `*BOUNDARY, FIXED` where ccx then holds that value (right
+  after the general step or `*FREQUENCY` steps; translations of nodes without `*TRANSFORM`),
+  warned elsewhere. Temperatures there with temperature-dependent materials are warned.
 
 ## 1.4.0 (October 2026)
 

@@ -5877,7 +5877,7 @@ def test_static_perturbation_values_change_the_base_state():
     # value on what the base state loads as its new value (probed).  So the base value is added
     # to such a line, right after the general step and after other perturbation steps alike
     model = MODAL.split("*Step")[0] + "*Nset, nset=N56\n5, 6\n*Nset, nset=N567\n5, 6, 7\n" \
-        "*Amplitude, name=A\n0., 0., 1., 1.\n"
+        "*Amplitude, name=A, time=total time\n0., 0., 1., 1.\n"
     g = ("*Step\n*Static\n*Cload\nN56, 2, 1.\n*Dload\n1, P2, 1.\nEALL, GRAV, 9.81, 0., 0., -1.\n"
          "*Boundary\n7, 1, 1, 0.01\n7, 2, 2\n*End Step\n")
     sp = ("*Step, perturbation\n*Static\n*Cload\nN567, 2, 0.5\n*Dload\n1, P2, 0.5\nEALL, GRAV, 1., 0., "
@@ -5889,7 +5889,8 @@ def test_static_perturbation_values_change_the_base_state():
         assert "\n*DLOAD\n1, P2, 1.5\nEALL, GRAV, 10.81, 0., 0., -1.\nEALL, GRAV, 2., 1., 0., 0.\n" in last
         assert "\n*BOUNDARY\n7, 1, 1, 0.03\n7, 2, 2, 0.02\n" in last
         assert "N56" not in last                     # (no base line given again under it)
-        assert f"Static perturbation step {2 + bool(between)}: Abaqus reads a load or BC value" in rep.text()
+        assert f"Static perturbation step {2 + bool(between)}: Abaqus reads a load, BC or temperature " \
+            "value" in rep.text()
         assert conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
     # OP=NEW on a load card removes nothing there (the base state's loads stay, no perturbation
     # step's carry over), so it goes; on *BOUNDARY it releases the base state's BCs and stays
@@ -5909,10 +5910,10 @@ def test_static_perturbation_values_change_the_base_state():
                              "*End Step\n")
     cl = _cloads(body)
     assert cl[0] and _close(cl[1], {k: 1.5 * v for k, v in cl[0].items()})
-    # what cannot be given so is warned about: a released base BC (its reaction goes in ccx), a BC
-    # on a DOF the base state leaves free, a value on an amplitude
+    # what cannot be given so is warned about: a released base BC (its reaction goes in ccx), a
+    # nonzero BC on a DOF the base state leaves free, a value on an amplitude it cannot evaluate
     for own, why in (("*Boundary, op=new\n1, 1, 3\n2, 2, 3\n4, 3, 3\n", "releases DOFs the base state holds"),
-                     ("*Boundary\n6, 2, 2\n", "prescribes DOFs the base state leaves free"),
+                     ("*Boundary\n6, 2, 2, 0.1\n", "prescribes DOFs the base state leaves free"),
                      ("*Cload, amplitude=A\n6, 2, 0.5\n", "by a value the converter cannot add")):
         _, conv, rep = convert_str(model + g + "*Step, perturbation\n*Static\n" + own + "*End Step\n")
         assert "[WARNING] Static perturbation step 2 " in rep.text() and why in rep.text(), why
@@ -5921,6 +5922,66 @@ def test_static_perturbation_values_change_the_base_state():
     _, _, rep = convert_str(model + "*Step, perturbation\n*Static\n*Cload\n6, 2, 1.\n*End Step\n" * 2)
     assert "*STEP PERTURBATION dropped on a static step before any general step" in rep.text()
     assert "final perturbation" not in rep.text() and "Static perturbation step 2:" not in rep.text()
+
+
+def test_static_perturbation_temperatures_amplitudes_and_free_dofs():
+    # a static perturbation step's temperatures change the base state's too (Abaqus: its load
+    # magnitudes include "predefined temperatures"; from the initial ones where no general step
+    # gave any), ccx 2.23 reads them as the new ones (probed): the base value is added
+    model = MODAL.split("*Step")[0].replace("*Density", "*Expansion\n1e-3\n*Density") + \
+        "*Nset, nset=N56\n5, 6\n*Nset, nset=ALL, generate\n1, 8, 1\n*Initial Conditions, " \
+        "type=temperature\nALL, 20.\n*Amplitude, name=UP\n0., 0.2, 1., 1.\n"
+    g = "*Step\n*Static\n*Temperature\nN56, 100.\n*Cload\n6, 2, 1.\n*End Step\n"
+    freq = "*Step\n*Frequency\n3\n*End Step\n"
+
+    def sp(cards):
+        return "*Step, perturbation\n*Static\n" + cards + "*End Step\n"
+    for between in ("", freq):
+        body, conv, rep = convert_str(model + g + between + sp("*Temperature\nALL, 10.\n"))
+        assert "\n*TEMPERATURE\n1, 30.\n2, 30.\n3, 30.\n4, 30.\n7, 30.\n8, 30.\n5, 110.\n6, 110.\n" \
+            in body.split("*STEP")[-1]
+        assert "Abaqus reads a load, BC or temperature value" in rep.text()
+        assert conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
+    body, conv, rep = convert_str(model + sp("*Temperature\nALL, 10.\n"))
+    assert "\n*TEMPERATURE\nALL, 30.\n" in body.split("*STEP")[1] and not conv.reduced_physics
+    # OP=NEW there removes the step's own temperatures only ("reset to zero": the base state's)
+    body, _, rep = convert_str(model + g + sp("*Temperature, op=new\nN56, 10.\n"))
+    assert "\n*TEMPERATURE\nN56, 110.\n" in body.split("*STEP")[2]
+    assert "*TEMPERATURE, OP=NEW dropped in a static perturbation step" in rep.text()
+    # an amplitude counts at its value at time 0 there (Abaqus), not at the step's end (ccx)
+    body, conv, rep = convert_str(model + g + sp("*Temperature, amplitude=UP\nN56, 10.\n*Cload, "
+                                                 "amplitude=UP\n6, 2, 0.5\n7, 1, 1.\n"))
+    assert "\n*TEMPERATURE\nN56, 102.\n*CLOAD\n6, 2, 1.1\n7, 1, 0.2\n" in body.split("*STEP")[2]
+    assert "(*CLOAD on UP: x0.2)" in rep.text() and len(conv.reduced_physics) == 1
+    body, _, _ = convert_str(model + sp("*Boundary, amplitude=UP\n7, 1, 1, 0.1\n"))
+    assert "\n*BOUNDARY\n7, 1, 1, 0.02\n" in body.split("*STEP")[1]
+    # a zero BC on a DOF the base state leaves free holds its base-state value: FIXED, which ccx
+    # holds at the end of the step before - the base state's after the general step or a
+    # *FREQUENCY step
+    for between in ("", freq):
+        body, conv, rep = convert_str(model + g + between + sp("*Boundary\n6, 2, 2\n7, 1, 2, 0.\n"
+                                                               "*Cload\n7, 1, 0.5\n"))
+        assert "*BOUNDARY\n** abq2ccx: held at their base-state values (zero perturbations of DOFs the " \
+            "base state leaves free)\n*BOUNDARY, FIXED\n6, 2, 2\n7, 1, 1\n7, 2, 2\n*CLOAD\n7, 1, 0.5\n" \
+            in body.split("*STEP")[-1]
+        assert "written as *BOUNDARY, FIXED" in rep.text() and len(conv.reduced_physics) == 1
+    # warned: after another static perturbation step (ccx holds that one's end), a nonzero
+    # value, a node with a *TRANSFORM (ccx reads the global component), temperature-dependent
+    # materials (Abaqus keeps the base state's properties)
+    tr = model.replace("*Material", "*Nset, nset=N7\n7\n*Transform, nset=N7\n1., 1., 0., -1., 1., 0.\n"
+                                    "*Material")
+    td = model.replace("*Expansion\n1e-3\n", "*Expansion\n1e-3, 0.\n2e-3, 200.\n")
+    for deck, why in ((model + g + sp("*Cload\n7, 1, 1.\n") + sp("*Boundary\n6, 2, 2\n"), "leaves free"),
+                      (model + g + sp("*Boundary\n6, 2, 2, 0.1\n"), "leaves free"),
+                      (tr + g + sp("*Boundary\n7, 1, 1\n"), "leaves free"),
+                      (td + g + sp("*Temperature\nALL, 10.\n"), "temperature-dependent material")):
+        body, conv, rep = convert_str(deck)
+        assert "FIXED" not in body and why in rep.text(), why
+        assert "static perturbation step not the base state plus its perturbation" in conv.reduced_physics
+    # an amplitude the converter cannot evaluate at time 0 stays, warned
+    _, conv, rep = convert_str(model.replace("name=UP", "name=UP, time=total time") +
+                               sp("*Cload, amplitude=UP\n6, 2, 1.\n"))
+    assert "which the converter cannot evaluate" in rep.text() and conv.reduced_physics
 
 
 def test_modal_dynamic_step_started_moving_is_flagged():
