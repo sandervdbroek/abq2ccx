@@ -395,6 +395,106 @@ def test_bc_steps_follow_op_new():
     assert A.step_load_audit(deck, True) == [None, ["*CLOAD on 4"]]
 
 
+def _step_model(text):
+    blocks = A.blocks_from_lines(text.splitlines())
+    return blocks, A.StepModel(blocks)
+
+
+def test_step_model_of_model_data_only():
+    # a deck without steps: all of it is model data, and it counts as mechanical
+    blocks, m = _step_model("*NODE\n1, 0., 0., 0.\n*BOUNDARY\n1, 1, 3\n")
+    assert m.model == tuple(blocks) and m.steps == () and m.after == () and len(m) == 0
+    assert m.pert == frozenset() and m.n_star_steps == 0 and m.nl_steps == ()
+    assert (m.nl_any, m.nl_all, m.dynamic, m.explicit, m.mechanical) == (False, False, False, False, True)
+    assert set(m.card_step.values()) == {0} and m.op_new["BOUNDARY"] == frozenset()
+    assert not A.StepModel(A.blocks_from_lines(["*STEP", "*HEAT TRANSFER", "*END STEP"])).mechanical
+
+
+def test_step_model_general_and_perturbation_steps():
+    # a perturbation step's NLGEOM switches nothing on; it runs at its base state's, and
+    # NLGEOM stays on over the later general steps (NLGEOM=NO too)
+    blocks, m = _step_model("""*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n*END STEP
+*STEP, NLGEOM\n*FREQUENCY\n3\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n*END STEP
+*STEP, NLGEOM=YES, AMPLITUDE=step\n*STATIC\n*END STEP\n*STEP\n*BUCKLE\n2\n*END STEP
+*STEP, NLGEOM=NO\n*MODAL DYNAMIC\n0.1, 1.\n*END STEP\n*STEP, NLGEOM=NO\n*STATIC\n*END STEP""")
+    assert [s.no for s in m] == [s.ccx_no for s in m] == list(range(1, 8))
+    assert [s.proc for s in m] == ["STATIC", "FREQUENCY", "STATIC", "STATIC", "BUCKLE",
+                                   "MODAL DYNAMIC", "STATIC"]
+    assert all(s.proc_card is s.cards[1] and s.closed and s.star_steps == 1 for s in m)
+    assert m.pert == {2, 3, 5, 6} and [s.pert_param for s in m] == [False, False, True] + [False] * 4
+    assert [s.perturbation for s in m] == [s.perturbation_motion for s in m] == \
+        [s.perturbation_output for s in m] == [False, True, True, False, True, True, False]
+    assert [s.nlgeom_card for s in m] == [None, True, None, True, None, False, False]
+    assert [s.nlgeom_on for s in m] == list(m.nl_steps) == [False] * 3 + [True] + [False] * 3
+    assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
+    assert (m.nl_any, m.nl_all, m.n_star_steps) == (True, False, 7)
+    assert [s.amplitude for s in m] == ["", "", "", "STEP", "", "", ""]
+    assert m.model == tuple(blocks[:1]) and all(s.between == () for s in m) and m.after == ()
+    # the three perturbation rules differ on procedures some sets lack (handle_step finds no
+    # procedure in a *RANDOM RESPONSE step); the temperature-DOF procedure is any card's
+    _, m = _step_model("*STEP\n*RANDOM RESPONSE\n*END STEP\n*STEP\n*GREEN\n*END STEP\n"
+                  "*STEP\n*GEOSTATIC\n*END STEP\n*STEP\n*COUPLED THERMAL-ELECTRICAL\n*END STEP")
+    assert [(s.proc, s.motion_proc, s.temp_dof) for s in m] == [
+        ("", "", None), ("GREEN", "GREEN", None), ("", "GEOSTATIC", None),
+        ("", "", "COUPLED THERMAL-ELECTRICAL")]
+    assert [(s.perturbation, s.perturbation_motion, s.perturbation_output) for s in m] == [
+        (True, False, False), (False, False, True), (False, False, False), (False, False, False)]
+    # the converter's attributes are the model's
+    _, conv, _ = convert_str(HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n"
+                             "*Elastic\n1000., 0.3\n*Boundary\n1, 1, 3\n*Step, nlgeom\n*Static\n"
+                             "*End Step\n*Step\n*Frequency\n2\n*End Step\n")
+    assert conv._pert_idx is conv.steps.pert == {2} and conv._nl_steps == [True, False]
+    assert conv._perturbation_steps([]) == {2} and conv._n_steps == conv.steps.n_star_steps == 2
+
+
+def test_step_model_unterminated_step():
+    # an unterminated *STEP runs on to the next *END STEP, as emitted: one step of two *STEP
+    # cards, whose second ccx counts as a step of its own; its *FREQUENCY makes it a
+    # perturbation step (any card), its procedure is the first one's
+    blocks, m = _step_model("""*BOUNDARY\n1, 1, 1\n*STEP, NLGEOM\n*STATIC\n*CLOAD\n2, 2, 1.
+*STEP\n*FREQUENCY\n*END STEP\n*CLOAD\n2, 1, 1.\n*STEP\n*STATIC\n*END STEP\n*STEP\n*STATIC""")
+    one, two, three = m.steps
+    assert (len(one.cards), one.star_steps, one.closed, one.ccx_no) == (6, 2, False, 1)
+    assert (one.proc, one.perturbation, one.perturbation_motion) == ("STATIC", True, False)
+    assert (one.nlgeom_card, one.nlgeom_on, one.nlgeom) == (True, False, False)
+    assert two.between == tuple(blocks[7:8]) and (two.ccx_no, two.closed) == (3, True)
+    assert (three.ccx_no, three.star_steps, three.closed) == (4, 1, False)
+    assert m.n_star_steps == 4 and len(m) == 3 and m.pert == {1}
+    assert [m.card_step[id(b)] for b in blocks] == [0] + [1] * 6 + [-1] + [2] * 3 + [3] * 2
+    assert m.model + one.cards + two.between + two.cards + three.cards == tuple(blocks)
+
+
+def test_step_model_explicit_steps():
+    # the converter runs an explicit step with NLGEOM: handle_step writes it where NLGEOM= is
+    # not given, while any explicit card switches it on for _plan_deck_facts
+    _, m = _step_model("*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP\n"
+                  "*STEP\n*DYNAMIC\n0.1, 1.\n*END STEP\n*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP")
+    assert [(s.explicit, s.nlgeom_on, s.nlgeom) for s in m] == [
+        (True, True, False), (False, False, False), (True, True, True)]
+    assert (m.explicit, m.dynamic, m.nl_any, m.nl_all) == (True, True, True, True)
+
+
+def test_step_model_buckle_load_case_two():
+    # LOAD CASE=2 *BOUNDARY cards count only in a step with *BUCKLE; they repeat the LOAD
+    # CASE=1 cards (Abaqus/CAE) or not
+    blocks, m = _step_model("""*STEP\n*BUCKLE\n2\n*BOUNDARY\n1, 1, 3\n*BOUNDARY, LOAD CASE=2\n1, 1, 3
+*END STEP\n*STEP\n*BUCKLE\n2\n*BOUNDARY\n1, 1, 3\n*BOUNDARY, LOAD CASE=2\n1, 1, 1\n*END STEP
+*STEP\n*STATIC\n*BOUNDARY, LOAD CASE=2\n1, 1, 1\n*END STEP""")
+    assert [s.lc2 for s in m] == [{id(blocks[3])}, {id(blocks[8])}, frozenset()]
+    assert [s.lc2_repeats for s in m] == [True, False, False]
+
+
+def test_step_model_op_new_cards():
+    # ccx acts on OP=NEW on a step's first card of a keyword only (op_new_cards); *DLOAD and
+    # *DSLOAD are counted apart
+    blocks, m = _step_model("""*STEP\n*STATIC\n*BOUNDARY\n1, 1, 1\n*BOUNDARY, OP=NEW\n2, 1, 1
+*CLOAD, OP=NEW\n1, 2, 1.\n*DLOAD, OP=NEW\nE, GRAV, 1., 0., 0., -1.\n*DSLOAD, OP=NEW\nS, P, 1.
+*END STEP\n*STEP\n*STATIC\n*BOUNDARY, OP=NEW\n*CLOAD\n1, 2, 2.\n*CLOAD, OP=NEW\n1, 1, 1.\n*END STEP""")
+    at = {k: {i for i, b in enumerate(blocks) if id(b) in v} for k, v in m.op_new.items() if v}
+    assert at == {"BOUNDARY": {10}, "CLOAD": {4}, "DLOAD": {5}, "DSLOAD": {6}}
+    assert m.op_new["BOUNDARY"] == A.op_new_cards(blocks)
+
+
 def test_op_new_on_a_later_boundary_card_only():
     # ccx 2.23 ignores OP=NEW after a step's first *BOUNDARY (probed: TOP keeps step 1's
     # u3 = 0.01 in step 2), and Abaqus requires it on every *BOUNDARY of the step if on any
