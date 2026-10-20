@@ -14,20 +14,21 @@ conversion. (CalculiX-native decks are deliberately excluded.) Files are NOT com
 Abaqus 2017 documentation (``abaqus2017_*``). Every deck converts cleanly (zero dangling
 references). Each entry carries one of three expectations:
 
-* ``expect_solve=True`` (232) - an analysis step runs to completion in CalculiX 2.23:
+* ``expect_solve=True`` (235) - an analysis step runs to completion in CalculiX 2.23:
   ccx exits 0, prints "Job finished" with no *ERROR and no crash/abort, executes at
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
   conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
-  Three flags keep such a deck out of the headline count of faithful solves (180):
+  Three flags keep such a deck out of the headline count of faithful solves (182):
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
-  - ``reduced_physics='<what>'`` (44, 7 of them also source_unloaded, 1 also solver_differs): the conversion
+  - ``reduced_physics='<what>'`` (45, 7 of them also source_unloaded, 1 also solver_differs): the conversion
     drops or replaces part of the Abaqus model - a constitutive behaviour (concrete
     damaged plasticity, user hardening, Chaboche back-stresses, field-dependent
     elasticity), an element formulation (hybrid, modified or thin-shell elements run as
-    ccx's plain ones, S4R shells that ccx bends only through hourglass stiffness,
+    ccx's plain ones, S4R shells that ccx bends only through hourglass stiffness, CPS4R
+    elements much wider than thick, whose hourglass stiffness their depth inflates,
     linear circular-section beams as 3-node ones, Timoshenko beams as ccx's
     Euler-Bernoulli U1), a section control,
     an interaction (general contact) or an imperfection - so ccx solves a different
@@ -41,7 +42,7 @@ references). Each entry carries one of three expectations:
 * ``parse_only=True`` (221) - mesh-only decks with no *STEP (FE-library test meshes,
   CAE part exports): there is nothing to solve, so ccx is only checked to ACCEPT the
   converted deck (same clean-exit rules, no step required).
-* neither (599) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
+* neither (596) - decks that use features ccx cannot run - UMAT/VUMAT user materials,
   *USER ELEMENT (UEL), Riks, piezoelectric/acoustic coupling, joint elements, NLGEOM
   follower tractions, other user subroutines - or are CAE part fragments / incomplete
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
@@ -561,6 +562,12 @@ CORPUS = [
          reduced_physics='its SECTION=CIRC B31 beams run as 3-node B32R (ccx 2.23 stops on linear circular-section beams): a different element', license='MIT',
          exercises='B31 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/igrega348/lattices/main/examples/lattice_data/E11128.inp'),
+    dict(name='illinois_cse_zappullabasictemplate', expect_solve=True, license='see source repo',
+         exercises='DC2D4 — parts/instances/assembly; *Parameter; transient heat transfer; mesh-gen; *DSFLUX',
+         note="a template whose *PARAMETER values are all set in the deck: a slab cooled through its wall by a "
+              "*DSFLUX (-> *DFLUX); after 5 s the wall is at 1106.6, the semi-infinite-slab answer "
+              "T0 - 2 q sqrt(alpha t / pi) / k being 1105.5",
+         url='https://raw.githubusercontent.com/illinois-cse/abaqus-sp17/master/Lecture8/ZappullaBasicTemplate.inp'),
     dict(name='jain_shobhit_job_beamhex', expect_solve=True, license='GPL-3.0',
          exercises='C3D20R — parts/instances/assembly; *Frequency',
          url='https://raw.githubusercontent.com/jain-shobhit/SSMTool/master/ext/YetAnotherFEcode/examples/Meshes/Beam3D/Job-BeamHex.inp'),
@@ -938,6 +945,7 @@ CORPUS = [
          exercises='CPE4H — parts/instances/assembly',
          url='https://raw.githubusercontent.com/bolaji1/Sample-Abaqus-files-FEA-based-numerical-evaluation-of-auxetic-response-for-reentrant-metamaterials/main/unnamed-711/unnamed-711.inp'),
     dict(name='cyoahs_test_opt_2d_model_50_job', expect_solve=True, license='see source repo',
+         reduced_physics='CPS4R elements 5 times as wide as their plane-stress thickness: ccx 2.23 expands each into one C3D8R brick, and only its hourglass stiffness, which that thin depth inflates, resists their bending',
          exercises='CPS4R',
          url='https://raw.githubusercontent.com/cyoahs/TopOptAbaqus/master/data/TEST-OPT-2D-MODEL-50-JOB.inp'),
     dict(name='davidmorinntnu_example_uhard_v1', expect_solve=True,
@@ -1996,14 +2004,22 @@ CORPUS = [
               "singular') at 168 h of 1000, as in test 1(a); target: creep strains 0.1321 and "
               '-0.1318 at 1000 h',
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/ncr5ar8x.inp'),
-    dict(name='abaqus2017_nfv4x32x', expect_solve=False,
+    dict(name='abaqus2017_nfv4x32x', expect_solve=True,
          license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
-         exercises='NAFEMS FV4 cantilever with off-centre point masses, B32 CIRC: *MASS, *MPC BEAM, '
-                   '*FREQUENCY',
-         note="ccx limitation: a *FREQUENCY step stops ('add_bo_st: coefficient should be 0') when "
-              '*MASS elements sit on *RIGID BODY members - here the point masses the *MPC BEAM '
-              'offsets carry (reproduced on two point masses on a spring-held rigid body written '
-              'for ccx); target 1.723, 1.727, 7.413, 9.972, 18.155, 26.957 Hz',
+         exercises='NAFEMS FV4 cantilever with off-centre point masses, B32 CIRC: *MASS on *MPC BEAM '
+                   'members in no other element (massless tetrahedra), *FREQUENCY',
+         reference=dict(
+             quantity='eigenfrequencies of modes 1-6, Hz',
+             read=('freq', (1, 2, 3, 4, 5, 6)),
+             target=[1.723, 1.727, 7.413, 9.972, 18.155, 26.957],
+             abaqus=[1.722, 1.726, 7.412, 9.955, 18.174, 27.053], tol=0.005,
+             ccx=[1.7689, 1.7700, 7.3989, 10.428, 20.018, 32.551],
+             why="ccx runs each of the deck's three B32 as one 20-node brick (B32R): on so coarse a "
+                 "mesh its higher modes are stiff, 2.7 % on modes 1-2 and up to 20 % on mode 6; the "
+                 "same cantilever on 30 B32 in ccx gives 1.7321, 1.7339, 7.3517, 10.021, 18.213, "
+                 "27.044 Hz, within 0.8 % of Abaqus' (the *MPC BEAM lines written as linear "
+                 "equations or stiff massless arms give the 3-element values to 5 digits)",
+             source='https://abaqus-docs.mit.edu/2017/English/SIMACAEBMKRefMap/simabmk-c-fv4.htm'),
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nfv4x32x.inp'),
     dict(name='abaqus2017_nnl5x22x', expect_solve=False,
          license='Abaqus 2017 documentation (Dassault Systemes): fetched on demand, not redistributed',
@@ -2016,11 +2032,17 @@ CORPUS = [
          url='https://abaqus-docs.mit.edu/2017/English/SIMAINPRefResources/nnl5x22x.inp'),
     dict(name='asurovi_45_vcct', expect_solve=False, license='see source repo',
          exercises='CPE4I — parts/instances/assembly; *Orientation; contact',
-         note='VCCT debonding: the bonded start (*INITIAL CONDITIONS, TYPE=CONTACT) has no ccx equivalent, and the remaining contact pair - node-to-surface, the Abaqus default - does not converge in ccx (it runs as face-to-face contact, without the bond)',
+         note="VCCT debonding: the bonded part of the interface (*INITIAL CONDITIONS, TYPE=CONTACT; "
+              "*DEBOND) has no ccx equivalent; without it each arm hangs from its load point and the "
+              "node-to-surface contact pair holds nothing in opening, so ccx stops ('increment size "
+              "smaller than minimum' or 'too many iterations needed')",
          url='https://raw.githubusercontent.com/asurovi/Composite_Delmination_Undergrad_Thesis/main/vcct/45_VCCT.inp'),
     dict(name='asurovi_vcct2400', expect_solve=False, license='see source repo',
          exercises='CPE4I — parts/instances/assembly; *Orientation; contact',
-         note='VCCT debonding: the bonded start (*INITIAL CONDITIONS, TYPE=CONTACT) has no ccx equivalent, and the remaining contact pair - node-to-surface, the Abaqus default - does not converge in ccx (it runs as face-to-face contact, without the bond)',
+         note="VCCT debonding: the bonded part of the interface (*INITIAL CONDITIONS, TYPE=CONTACT; "
+              "*DEBOND) has no ccx equivalent; without it each arm hangs from its load point and the "
+              "node-to-surface contact pair holds nothing in opening, so ccx stops ('increment size "
+              "smaller than minimum' or 'too many iterations needed')",
          url='https://raw.githubusercontent.com/asurovi/Composite_Delmination_Undergrad_Thesis/main/mesh_analysis/VCCT2400.inp'),
     dict(name='mo_hanxuan_beamdeflec_quadpse_larged_load800', expect_solve=False, license='MIT',
          exercises='CPS6 — parts/instances/assembly',
@@ -2112,7 +2134,10 @@ CORPUS = [
          url='https://raw.githubusercontent.com/abuganza/NN_aniso_UMAT/main/UMAT/expansion_S111S1_xys.inp'),
     dict(name='abuganza_shear_s111s1_goh', expect_solve=False, license='GPL-3.0',
          exercises='C3D8 — parts/instances/assembly; *Orientation',
-         note='ccx 2.23: *ERROR in calinput: no elastic constants',
+         note="ccx limitation: *ANISOTROPIC HYPERELASTIC, HOLZAPFEL (Gasser-Ogden-Holzapfel) has no "
+              "ccx form - with its kappa = 1/3 it is an exponential law in the first invariant, which "
+              "ccx's polynomial forms cannot write, and ccx's ELASTIC_FIBER material has no fibre "
+              "dispersion - so it is commented out and ccx stops ('no elastic constants')",
          url='https://raw.githubusercontent.com/abuganza/NN_aniso_UMAT/main/UMAT/shear_S111S1_GOH.inp'),
     dict(name='abuganza_square_expander', expect_solve=False, license='GPL-3.0',
          exercises='C3D8 — parts/instances/assembly; UMAT; *Tie',
@@ -2120,7 +2145,10 @@ CORPUS = [
          url='https://raw.githubusercontent.com/abuganza/NN_aniso_UMAT/main/UMAT/square_expander.inp'),
     dict(name='abuganza_torsion_s111s1_goh', expect_solve=False, license='GPL-3.0',
          exercises='C3D8 — parts/instances/assembly; *Orientation',
-         note='ccx 2.23: *ERROR in calinput: no elastic constants',
+         note="ccx limitation: *ANISOTROPIC HYPERELASTIC, HOLZAPFEL (Gasser-Ogden-Holzapfel) has no "
+              "ccx form - with its kappa = 1/3 it is an exponential law in the first invariant, which "
+              "ccx's polynomial forms cannot write, and ccx's ELASTIC_FIBER material has no fibre "
+              "dispersion - so it is commented out and ccx stops ('no elastic constants')",
          url='https://raw.githubusercontent.com/abuganza/NN_aniso_UMAT/main/UMAT/torsion_S111S1_GOH.inp'),
     dict(name='abuganza_uniaxial_s111s1_xys', expect_solve=False, license='GPL-3.0',
          exercises='C3D8 — parts/instances/assembly; UMAT',
@@ -2156,55 +2184,94 @@ CORPUS = [
          url='https://raw.githubusercontent.com/AnargyrosKarakalas/UMAT_3D/master/Coupled_Analysis.inp'),
     dict(name='ashenoneme_10', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/1/10/10.inp'),
     dict(name='ashenoneme_100', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/1/100/100.inp'),
     dict(name='ashenoneme_100_2', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/3/100/100.inp'),
     dict(name='ashenoneme_10_2', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/3/10/10.inp'),
     dict(name='ashenoneme_1_2', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/3/1/1.inp'),
     dict(name='ashenoneme_20', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/2/20/20.inp'),
     dict(name='ashenoneme_20_2', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/3/20/20.inp'),
     dict(name='ashenoneme_30', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/1/30/30.inp'),
     dict(name='ashenoneme_30_2', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/3/30/30.inp'),
     dict(name='ashenoneme_l2c_10', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/2/10/10.inp'),
     dict(name='ashenoneme_l2c_20', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/1/20/20.inp'),
     dict(name='ashenoneme_l2c_30', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='ccx does not converge on this analysis',
+         note="ccx limitation: ccx 2.23's C3D8R stops part-way through the cyclic shear (perfectly "
+              "plastic steel; 'increment size smaller than minimum' or 'too many cutbacks', the "
+              "residual flip-flopping at any increment size); the same mesh as C3D8I runs the whole "
+              "cycle, and the couplings written as plain BCs change nothing",
          url='https://raw.githubusercontent.com/AshenOneme/MultiDampGen/main/GenerationProcess/2/30/30.inp'),
     dict(name='asurovi_30_vcct', expect_solve=False, license='see source repo',
          exercises='CPE4I — parts/instances/assembly; *Orientation; contact',
-         note='VCCT debonding: the bonded start (*INITIAL CONDITIONS, TYPE=CONTACT) has no ccx equivalent, and the remaining contact pair - node-to-surface, the Abaqus default - does not converge in ccx (it runs as face-to-face contact, without the bond)',
+         note="VCCT debonding: the bonded part of the interface (*INITIAL CONDITIONS, TYPE=CONTACT; "
+              "*DEBOND) has no ccx equivalent; without it each arm hangs from its load point and the "
+              "node-to-surface contact pair holds nothing in opening, so ccx stops ('increment size "
+              "smaller than minimum' or 'too many iterations needed')",
          url='https://raw.githubusercontent.com/asurovi/Composite_Delmination_Undergrad_Thesis/main/vcct/30_VCCT.inp'),
     dict(name='asurovi_element2400', expect_solve=False, license='see source repo',
          exercises='COH2D4, CPE4I — parts/instances/assembly; *Orientation; cohesive; *Tie',
@@ -2306,9 +2373,8 @@ CORPUS = [
          exercises='B21 -> U1 (SECTION=I) — mesh-gen',
          reduced_physics='B21 -> U1: an Euler-Bernoulli beam (ccx has no I profile; its U1 beam carries the section exactly, without shear deformation)',
          url='https://raw.githubusercontent.com/burakbayramli/books/master/Introduction_to_Finite_Element_Analysis_Using_MATLAB_Khennane/List_of_Abaqus_files/Frame_Problem_keyword.inp'),
-    dict(name='burakbayramli_lshapeheat', expect_solve=False, license='see source repo',
-         exercises='DC2D3, DC2D4 — parts/instances/assembly; thermal',
-         note='ccx limitation: Abaqus user subroutine',
+    dict(name='burakbayramli_lshapeheat', expect_solve=True, license='see source repo',
+         exercises='DC2D3, DC2D4 — parts/instances/assembly; thermal; *DSFLUX, *SFILM (-> *DFLUX, *FILM)',
          url='https://raw.githubusercontent.com/burakbayramli/books/master/Fundamental_Finite_Element_Analysis_and_Applications_Bhatti/AbaqusUse/HeatFlow/LShapeHeat.inp'),
     dict(name='burakbayramli_voided2dplate', expect_solve=False, license='see source repo',
          exercises='CPS3 — parts/instances/assembly',
@@ -2344,15 +2410,15 @@ CORPUS = [
          url='https://raw.githubusercontent.com/CMMAi/ABAQUS_UMAT/master/Ch3/UPLATE.inp'),
     dict(name='collinsjesurobo_expansion', expect_solve=False, license='see source repo',
          exercises='PIPE31H — *Parameter; contact; mesh-gen',
-         note='source deck relies on externally-supplied <parameter> values',
+         note="incomplete source: a template: its *PARAMETER wt = <wt> (the pipe's wall thickness) is filled in outside the deck, so wt and what is computed from it stay unresolved and ccx stops on them ('*ERROR reading *BEAM SECTION')",
          url='https://raw.githubusercontent.com/CollinsJesurobo/Parametric-Design-Approach-of-Pipeline-Thermal-Expansion-/main/Expansion.inp'),
     dict(name='collinsjesurobo_fea', expect_solve=False, license='see source repo',
          exercises='PIPE31H — *Parameter; contact; mesh-gen',
-         note='source deck relies on externally-supplied <parameter> values',
+         note="incomplete source: a template: its *PARAMETER wt = <wt> (the pipe's wall thickness) is filled in outside the deck, so wt and what is computed from it stay unresolved and ccx stops on them ('*ERROR reading *BEAM SECTION')",
          url='https://raw.githubusercontent.com/CollinsJesurobo/Pipeline---Stress-Based-Analysis-and-Postprocessing/main/FEA.inp'),
     dict(name='cossan_working_group_beam', expect_solve=False, license='see source repo',
          exercises='B31 — parts/instances/assembly',
-         note='source deck relies on externally-supplied <parameter> values',
+         note="ccx limitation: *BEAM GENERAL SECTION (SECTION=GENERAL) in space: ccx 2.23's U1 beam, which carries it, takes torsion as G (I11 + I22), 2.05 times the section's G J here, and no Poisson's ratio ccx accepts makes it G J, so the beams are not run as U1 and ccx stops on beams without a section ('first thickness ... is zero'; --approximate runs them as U1). The deck has no *PARAMETER",
          url='https://raw.githubusercontent.com/cossan-working-group/OpenCossan/master/COSSANXengine/examples/Models/FiniteElements/ABAQUS/beam3point_bending/beam.inp'),
     dict(name='davidmorinntnu_example_umat', expect_solve=False, license='MIT',
          exercises='C3D8R — parts/instances/assembly; *Orientation; UMAT',
@@ -2398,7 +2464,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_USDFLD/example_VUSDFLD_V2.inp'),
     dict(name='dheller1_hex', expect_solve=False, license='none stated',
          exercises='S4R — parts/instances/assembly',
-         note='source/ccx: *ERROR reading *BOUNDARY: node set _PICKEDSET808',
+         note="incomplete source: an export without its sets and sections: the BCs' node sets (_PickedSet808, _PickedSet809, Set-1) and the pressure's surface Surf-1 are never defined, and no section covers the S4R shells",
          url='https://raw.githubusercontent.com/dheller1/inp2feap/master/example/hex.inp'),
     dict(name='duojiaojiang_compression_11', expect_solve=False, license='LGPL',
          exercises='C3D8R — parts/instances/assembly; *Orientation; UMAT; explicit',
@@ -2446,7 +2512,8 @@ CORPUS = [
          url='https://raw.githubusercontent.com/eivindhugaas/Abaverify_Example/master/tests/test_C3D8R_MaxStress_MatrixDir.inp'),
     dict(name='eoin_cube_explicit_vumat', expect_solve=False, license='none stated',
          exercises='C3D8 — parts/instances/assembly; UMAT; explicit',
-         note='ccx limitation / source: *ERROR reading *EQUATION. Card image:',
+         note="ccx limitation: VUMAT (ccx has no VUMAT interface): the cube's section uses the user "
+              "material, and ccx stops ('*ERROR in umat: no user material subroutine')",
          url='https://raw.githubusercontent.com/EoinMcEvoy/Neo-Hooke-VUMAT/master/cube_explicit.inp'),
     dict(name='ericstewart36_bending_actuator', expect_solve=False, license='see source repo',
          exercises='— — *Parameter; *User Element; thermal',
@@ -2482,43 +2549,43 @@ CORPUS = [
          url='https://raw.githubusercontent.com/faisal-bhuiyan/Physics-based-composite-progressive-failure/main/input-files/140ElementsModel.inp'),
     dict(name='frodal_axisymmetric_explicit', expect_solve=False, license='GPL-3.0',
          exercises='CAX4R — parts/instances/assembly; explicit',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/AxisymmetricTest/Axisymmetric-Explicit.inp'),
     dict(name='frodal_axisymmetric_implicit', expect_solve=False, license='GPL-3.0',
          exercises='CAX4R — parts/instances/assembly',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/AxisymmetricTest/Axisymmetric-Implicit.inp'),
     dict(name='frodal_planestrain_explicit', expect_solve=False, license='GPL-3.0',
          exercises='CPE4R — parts/instances/assembly; explicit',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/PlaneStrainTest/PlaneStrain-Explicit.inp'),
     dict(name='frodal_planestrain_implicit', expect_solve=False, license='GPL-3.0',
          exercises='CPE4R — parts/instances/assembly',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/PlaneStrainTest/PlaneStrain-Implicit.inp'),
     dict(name='frodal_polycrystaltension_explicit', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/PolycrystalTest/PolycrystalTension-Explicit.inp'),
     dict(name='frodal_polycrystaltension_implicit', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/PolycrystalTest/PolycrystalTension-Implicit.inp'),
     dict(name='frodal_simpleshear_explicit', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/SimpleShearTest/SimpleShear-Explicit.inp'),
     dict(name='frodal_simpleshear_implicit', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/SimpleShearTest/SimpleShear-Implicit.inp'),
     dict(name='frodal_uniaxialtension_explicit', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/UniaxialTensionTest/UniaxialTension-Explicit.inp'),
     dict(name='frodal_uniaxialtension_implicit', expect_solve=False, license='GPL-3.0',
          exercises='C3D8R — parts/instances/assembly',
-         note='incomplete source: a section references an undefined material',
+         note="incomplete source: its material is in an *INCLUDE file, material.inp, that is not in the corpus, so the section names a material the deck never defines ('nonexistent material')",
          url='https://raw.githubusercontent.com/frodal/SCMM-hypo/master/Tests/Abaqus/UniaxialTensionTest/UniaxialTension-Implicit.inp'),
     dict(name='gibboncode_example_tri_2', expect_solve=False, license='custom (see repo)',
          exercises='STRI3 — parts/instances/assembly',
@@ -2599,10 +2666,6 @@ CORPUS = [
          exercises='CPS4R — parts/instances/assembly',
          note="ccx limitation: ductile damage with a *DAMAGE EVOLUTION and element deletion (fracture); the DUCTILE criterion has no ccx form and the evolution none either (both commented), and the undamaged model stops in step 1 ('too many cutbacks')",
          url='https://raw.githubusercontent.com/ijwolden/Master_Thesis/main/abaqus_inp_files/size_effect_app/2x2.inp'),
-    dict(name='illinois_cse_zappullabasictemplate', expect_solve=False, license='see source repo',
-         exercises='— — parts/instances/assembly; *Parameter; thermal; mesh-gen',
-         note='source deck relies on externally-supplied <parameter> values',
-         url='https://raw.githubusercontent.com/illinois-cse/abaqus-sp17/master/Lecture8/ZappullaBasicTemplate.inp'),
     dict(name='instituteofmechanics_elementtest', expect_solve=False, license='GPL-3.0',
          exercises='C3D8T — parts/instances/assembly; UMAT; thermal',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
@@ -2743,7 +2806,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/jianyingwu/pfczm-abaqus/master/bending_umat.inp'),
     dict(name='jpsferreira_cube_umat', expect_solve=False, license='GPL-3.0',
          exercises='C3D8 — *Parameter',
-         note='source/ccx: *ERROR in calinput: no material was assigned',
+         note='invalid source: its *INCLUDE cards give FILE= (sec_ud.inp, bcs_uni.inp), where Abaqus takes INPUT=, and the files are not in the corpus: the section (of a user material, by its constants and SDV output) and the BCs are missing, so ccx stops on its element without a material',
          url='https://raw.githubusercontent.com/jpsferreira/UMAT-ABAQUS/master/test_in_abaqus/cube_umat.inp'),
     dict(name='juliafem_cantilever_beam', expect_solve=False, license='MIT',
          exercises='C3D8, C3D20R — *Frequency',
@@ -2767,11 +2830,12 @@ CORPUS = [
          url='https://raw.githubusercontent.com/JuliaFEM/AbaqusReader.jl/master/test/test_real_world/tensile_test.inp'),
     dict(name='juliafem_thermal_conduction', expect_solve=False, license='MIT',
          exercises='DC3D8 — heat transfer',
-         note='source/ccx: *ERROR in e_c3d_th: nonpositive jacobian',
+         note="invalid source (an AbaqusReader.jl parser fixture): its DC3D8 elements repeat nodes (1, 2, 2, 1, 1, 2, 2, 1), so they have no volume (Abaqus stops too); ccx stops ('nonpositive jacobian')",
          url='https://raw.githubusercontent.com/JuliaFEM/AbaqusReader.jl/master/test/test_real_world/thermal_conduction.inp'),
     dict(name='krande_uuea', expect_solve=False, license='GPL-3.0',
          exercises='CAX4P — parts/instances/assembly',
-         note='source/ccx: *ERROR reading *ELEMENT:',
+         note='ccx limitation: CAX4P pore-pressure / soils analysis (*GEOSTATIC, *SOILS) not '
+              'supported by ccx',
          url='https://raw.githubusercontent.com/Krande/adapy/main/files/fem_files/abaqus/UUea.inp'),
     dict(name='kranthibalusu_eletest', expect_solve=False, license='see source repo',
          exercises='CPS4, U1 — *User Element',
@@ -2790,8 +2854,10 @@ CORPUS = [
          note='incomplete source: an abapy template — #E, #NU, #SY and #FRAME are placeholders the abapy script fills in, so ccx stops on them',
          url='https://raw.githubusercontent.com/lcharleux/abapy/master/doc/example_code/tutorial/indentation_axi_target.inp'),
     dict(name='lcharleux_indentation_berko', expect_solve=False, license='GPL-2.0',
-         exercises='C3D8, C3D6 — parts/instances/assembly; contact',
-         note='ccx 2.23: *ERROR: solution seems to diverge; please try',
+         exercises='C3D8, C3D6 — parts/instances/assembly; contact; *STATIC, DIRECT with contact',
+         note="solves on ccx 2.23 since its *STATIC, DIRECT steps get automatic increments (ccx's "
+              "contact needs one cutback at the start of unloading; under DIRECT it stopped: "
+              "'solution seems to diverge'), but takes about 300 s of CPU, the gate's limit",
          url='https://raw.githubusercontent.com/lcharleux/abapy/master/doc/example_code/indentation/workdir/indentation_berko.inp'),
     dict(name='leonghien_cts_2d', expect_solve=False, license='see source repo',
          exercises='CPE8T — parts/instances/assembly; UMAT; thermal',
@@ -2831,7 +2897,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/lucassalmon83860-bit/thesis-benchmark-cases/main/Benchmarks/Fuel_pellet_quarter/fuel_pellet_quarter_CZM.inp'),
     dict(name='luoxueling_qc_2', expect_solve=False, license='MIT',
          exercises='CPS3 — parts/instances/assembly',
-         note='source/ccx: *ERROR in calinput: no material was assigned',
+         note="invalid source: no section covers its elements and it defines no material, which Abaqus stops on too; ccx stops ('no material was assigned')",
          url='https://raw.githubusercontent.com/LuoXueling/FiniteElementMethodAndQuasicontinuumFracture/main/src/source/QC-2.inp'),
     dict(name='mahsascript_crack_propagation', expect_solve=False, license='custom (see repo)',
          exercises='C3D8R — parts/instances/assembly; *Orientation',
@@ -2972,7 +3038,8 @@ CORPUS = [
          url='https://raw.githubusercontent.com/michael-schw/Abaqus-UMAT-Cpp-Subroutine/main/umat.inp'),
     dict(name='mid2supaero_5h_abaqus', expect_solve=False, license='see source repo',
          exercises='C3D8R, C3D8E — parts/instances/assembly; *Orientation; *Tie',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
+         note='ccx limitation: piezoelectric elements (C3D8E, *PIEZOELECTRIC, *DIELECTRIC): ccx has '
+              "none and stops reading *ELEMENT",
          url='https://raw.githubusercontent.com/mid2SUPAERO/PZT-OpenNastran-Pioli/master/5H_abaqus.inp'),
     dict(name='migueljgoliveira_abaqus_shell4', expect_solve=False, license='see source repo',
          exercises='S4 — *Parameter; *Orientation; UMAT',
@@ -3332,15 +3399,15 @@ CORPUS = [
          url='https://raw.githubusercontent.com/nsundar/SFEM_in_Abaqus/master/Examples_2D/PlateHole.inp'),
     dict(name='numerically_stable_mesh2d_linear1', expect_solve=False, license='see source repo',
          exercises='CPS3 — parts/instances/assembly',
-         note='source/ccx: *ERROR in calinput: no material was assigned',
+         note="invalid source: a material, but no section on its elements, which Abaqus stops on too; ccx stops ('no material was assigned')",
          url='https://raw.githubusercontent.com/Numerically-Stable/read_mesh_abaqus/main/mesh2D_linear1.inp'),
     dict(name='numerically_stable_mesh2d_quadratic1', expect_solve=False, license='see source repo',
          exercises='CPS6M — parts/instances/assembly',
-         note='source/ccx: *ERROR in calinput: no material was assigned',
+         note="invalid source: a material, but no section on its elements, which Abaqus stops on too; ccx stops ('no material was assigned')",
          url='https://raw.githubusercontent.com/Numerically-Stable/read_mesh_abaqus/main/mesh2D_quadratic1.inp'),
     dict(name='numerically_stable_mesh3d_linear1', expect_solve=False, license='see source repo',
          exercises='C3D4 — parts/instances/assembly',
-         note='source/ccx: *ERROR in calinput: no material was assigned',
+         note="invalid source: a material, but no section on its elements, which Abaqus stops on too; ccx stops ('no material was assigned')",
          url='https://raw.githubusercontent.com/Numerically-Stable/read_mesh_abaqus/main/mesh3D_linear1.inp'),
     dict(name='oyvindwpetersen_frame_structure', expect_solve=False, license='GPL-3.0',
          exercises='B31 — parts/instances/assembly; *Frequency',
@@ -3544,11 +3611,13 @@ CORPUS = [
          url='https://raw.githubusercontent.com/qll007/20220425-abaqusVumat/master/Benchmarks/Element-Torus/Torus_VH.inp'),
     dict(name='quylavan_fuse', expect_solve=False, license='see source repo',
          exercises='DC3D8E — parts/instances/assembly; thermal',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
+         note='ccx limitation: coupled thermal-electrical analysis (DC3D8E, *COUPLED '
+              'THERMAL-ELECTRICAL, Joule heating): ccx has none and stops reading *ELEMENT',
          url='https://raw.githubusercontent.com/QuyLaVan/AbaqusThermal/master/Thermal_electric/Fuse.inp'),
     dict(name='quylavan_thermal_electric_structure', expect_solve=False, license='see source repo',
          exercises='Q3D8R — parts/instances/assembly; thermal',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
+         note='ccx limitation: coupled thermal-electrical-structural elements (Q3D8R, Joule '
+              'heating): ccx has none and stops reading *ELEMENT',
          url='https://raw.githubusercontent.com/QuyLaVan/AbaqusThermal/master/Thermal_Stress/Thermal_electric_structure.inp'),
     dict(name='ra_na_mesh0', expect_solve=False, license='see source repo',
          exercises='U1003 — *User Element',
@@ -3996,7 +4065,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/sunwhale/pyfem/main/examples/mechanical/1element/hex20_crystal/hex20.inp'),
     dict(name='sunwhale_engine_hex20', expect_solve=False, license='Apache-2.0',
          exercises='C3D20 — parts/instances/assembly',
-         note='ccx 2.23: *ERROR in calinput: no material was assigned',
+         note="invalid source: it defines materials (GRAIN, Steel) but no section on its elements, which Abaqus stops on too; ccx stops ('no material was assigned')",
          url='https://raw.githubusercontent.com/sunwhale/pyfem/main/examples/mechanical/engine/engine_hex20.inp'),
     dict(name='sunwhale_mechanical_phase_engine_model_1', expect_solve=False, license='Apache-2.0',
          exercises='C3D8 — parts/instances/assembly',
@@ -4004,7 +4073,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/sunwhale/pyfem/main/examples/mechanical_phase/engine/Model-1.inp'),
     dict(name='sunwhale_specimen', expect_solve=False, license='Apache-2.0',
          exercises='CPS4 — parts/instances/assembly',
-         note='ccx 2.23: *ERROR reading *BOUNDARY: node set _PICKEDSET5',
+         note='incomplete source: the *BOUNDARY names node set _PickedSet5, which the deck never defines',
          url='https://raw.githubusercontent.com/sunwhale/pyfem/main/examples/mechanical/specimen/specimen.inp'),
     dict(name='tarletongroup_job_1', expect_solve=False, license='see source repo',
          exercises='C3D8 — parts/instances/assembly; UMAT',
@@ -4200,7 +4269,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/theysy/mml_subroutine_public/main/MML_U2/SHELL_TCT_IM.inp'),
     dict(name='torkian_tennis_surfcav', expect_solve=False, license='see source repo',
          exercises='T3D2, R3D4, S4R — explicit; contact',
-         note='incomplete source: a *SURFACE references an element set the deck never defines',
+         note="incomplete source: the ball's nodes and S4R elements are INPUT= files (tennis_ef1.inp, tennis_ef2.inp) that are not in the corpus, so its element set SPHERE holds no element and ccx stops at the *SURFACE on it",
          url='https://raw.githubusercontent.com/torkian/slurm-abaqus/master/tennis_surfcav.inp'),
     dict(name='tubakabura_plate_builtin', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; UMAT; explicit',
@@ -4326,7 +4395,7 @@ CORPUS = [
          url='https://raw.githubusercontent.com/XJTU-Zhou-group/ABAQUS_UMAT_316ss_Zr4/main/Zr4testCWSR_es.inp'),
     dict(name='xzhang66_job_wxinf2', expect_solve=False, license='MIT',
          exercises='CAX4, CINAX4 — parts/instances/assembly',
-         note='ccx 2.23: *ERROR reading *ELEMENT:',
+         note='ccx limitation: infinite elements (CINAX4): ccx has none and stops reading *ELEMENT',
          url='https://raw.githubusercontent.com/xzhang66/FEM-Book/main/Examples/Example-4-4/Job-wxInf2.inp'),
     dict(name='yozoyugen_bullet_impact', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
@@ -4338,27 +4407,51 @@ CORPUS = [
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.0/input/bullet-impact-glmsh.inp'),
     dict(name='yozoyugen_car_crash_n22k', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note="runs past the corpus' 300 s limit on ccx 2.23 (explicit / long transient)",
+         note="runs past the corpus' 300 s limit on ccx 2.23 (0.2 s of explicit dynamics at ccx's "
+              "stable increment for the true mass: abq2ccx leaves out Abaqus' *FIXED MASS SCALING, "
+              "FACTOR=60, a numerical control); and the car front reaches the pillar only through Abaqus general "
+              "contact (*CONTACT, ALL EXTERIOR), which has no ccx form, so even a finished run "
+              "would not be the deck's physics",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.2/input/car-crash-N22k.inp'),
     dict(name='yozoyugen_car_crash_n2k', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note="runs past the corpus' 300 s limit on ccx 2.23 (explicit / long transient)",
+         note="runs past the corpus' 300 s limit on ccx 2.23 (0.2 s of explicit dynamics at ccx's "
+              "stable increment for the true mass: abq2ccx leaves out Abaqus' *FIXED MASS SCALING, "
+              "FACTOR=100, a numerical control); and the car front reaches the pillar only through Abaqus general "
+              "contact (*CONTACT, ALL EXTERIOR), which has no ccx form, so even a finished run "
+              "would not be the deck's physics",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.2/input/car-crash-N2k.inp'),
     dict(name='yozoyugen_car_crash_n6k', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note="runs past the corpus' 300 s limit on ccx 2.23 (explicit / long transient)",
+         note="runs past the corpus' 300 s limit on ccx 2.23 (0.2 s of explicit dynamics at ccx's "
+              "stable increment for the true mass: abq2ccx leaves out Abaqus' *FIXED MASS SCALING, "
+              "FACTOR=60, a numerical control); and the car front reaches the pillar only through Abaqus general "
+              "contact (*CONTACT, ALL EXTERIOR), which has no ccx form, so even a finished run "
+              "would not be the deck's physics",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.2/input/car-crash-N6k.inp'),
     dict(name='yozoyugen_car_wall_n22k', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note="runs past the corpus' 300 s limit on ccx 2.23 (explicit / long transient)",
+         note="runs past the corpus' 300 s limit on ccx 2.23 (0.2 s of explicit dynamics at ccx's "
+              "stable increment for the true mass: abq2ccx leaves out Abaqus' *FIXED MASS SCALING, "
+              "FACTOR=60, a numerical control); and the car front reaches the wall only through Abaqus general "
+              "contact (*CONTACT, ALL EXTERIOR), which has no ccx form, so even a finished run "
+              "would not be the deck's physics",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.2/input/car-wall-N22k.inp'),
     dict(name='yozoyugen_car_wall_n2k', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note="runs past the corpus' 300 s limit on ccx 2.23 (explicit / long transient)",
+         note="runs past the corpus' 300 s limit on ccx 2.23 (0.2 s of explicit dynamics at ccx's "
+              "stable increment for the true mass: abq2ccx leaves out Abaqus' *FIXED MASS SCALING, "
+              "FACTOR=100, a numerical control); and the car front reaches the wall only through Abaqus general "
+              "contact (*CONTACT, ALL EXTERIOR), which has no ccx form, so even a finished run "
+              "would not be the deck's physics",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.2/input/car-wall-N2k.inp'),
     dict(name='yozoyugen_carx2_crash_n43k', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note="runs past the corpus' 300 s limit on ccx 2.23 (explicit / long transient)",
+         note="runs past the corpus' 300 s limit on ccx 2.23 (0.3 s of explicit dynamics at ccx's "
+              "stable increment for the true mass: abq2ccx leaves out Abaqus' *FIXED MASS SCALING, "
+              "FACTOR=60, a numerical control); and the two car fronts reach each other only through Abaqus general "
+              "contact (*CONTACT, ALL EXTERIOR), which has no ccx form, so even a finished run "
+              "would not be the deck's physics",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.2/input/carx2-crash-N43k.inp'),
     dict(name='yozoyugen_charpy_test', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
@@ -4374,11 +4467,15 @@ CORPUS = [
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.1/input/Charpy-test-v0.0.1.inp'),
     dict(name='yozoyugen_crash_tube_80_350_solid', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note='solves on ccx 2.23 but takes ~263 s (too slow for the corpus gate)',
+         note="solves on ccx 2.23 but takes about 280 s of CPU (60 % of the step in 168 s), too slow for the corpus gate; and the plate crushes the tube only through Abaqus general contact "
+              "(*CONTACT, ALL EXTERIOR), which has no ccx form, so a finished run is not the deck's "
+              "physics (the plate passes through the tube)",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.1/input/crash-tube-80-350-solid.inp'),
     dict(name='yozoyugen_crash_tube_80_350_solid_glmsh', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',
-         note="runs past the corpus' 300 s limit on ccx 2.23 (explicit / long transient)",
+         note="runs past the corpus' 300 s limit on ccx 2.23 (25 % of the step in 200 s of CPU); and the plate crushes the tube only through Abaqus general contact "
+              "(*CONTACT, ALL EXTERIOR), which has no ccx form, so a finished run is not the deck's "
+              "physics (the plate passes through the tube)",
          url='https://raw.githubusercontent.com/yozoyugen/HAKAI-fem/main/HAKAI-v0.0.1/input/crash-tube-80-350-solid-glmsh.inp'),
     dict(name='yozoyugen_metal_cutting', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; explicit',

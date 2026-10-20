@@ -236,29 +236,30 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1052 decks convert with no dangling
-reference. 232 are gated `expect_solve`: **180 solve the deck's own physics**; 14 are
+reference. 235 are gated `expect_solve`: **182 solve the deck's own physics**; 14 are
 `source_unloaded`, two are `solver_differs` (a snap-fit insert that only contact holds drifts
 out of its buckle; a plate pushed about 1240 times past its buckling load, whose lowest factors
-ccx's `*BUCKLE` does not return) and 44 (7 of them also unloaded, 1 also `solver_differs`) are `reduced_physics` — concrete damaged
+ccx's `*BUCKLE` does not return) and 45 (7 of them also unloaded, 1 also `solver_differs`) are `reduced_physics` — concrete damaged
 plasticity (2), UHARD / VUHARD hardening (2), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
 `B32R` (3), I-section `B21` beams run as ccx's Euler–Bernoulli `U1` (3), general contact (2), a
 dropped `*IMPERFECTION` (1), planar beams whose eigenmodes include twist (1), plain `S4R` shells, which ccx bends only
-through hourglass stiffness (13). 221 mesh-only
-decks are accepted. The other 599 stop first on, or (the last row) run without, what they need:
+through hourglass stiffness (13), `CPS4R` elements five times as wide as their thickness, whose
+hourglass stiffness that thin depth inflates (1). 221 mesh-only
+decks are accepted. The other 596 stop first on, or (the last row) run without, what they need:
 
 | Decks | First blocker |
 | ---: | --- |
-| 353 | a user material (UMAT/VUMAT) |
+| 354 | a user material (UMAT/VUMAT) |
 | 66 | a user element (UEL) |
-| 50 | an incomplete or invalid source deck (undefined sets or materials, external parameters, CAE fragments) |
+| 47 | an incomplete or invalid source deck (undefined sets or materials, a template's values, missing *INCLUDE files, CAE fragments) |
 | 34 | an explicit coupled temperature–displacement step (28), or `*MATRIX GENERATE` (6) |
-| 27 | no convergence or divergence (19), or more than the gate's 300 s (8) |
+| 27 | no convergence or divergence (18), or more than the gate's 300 s (9) |
 | 16 | NLGEOM follower tractions (they convert with `--approximate`) |
-| 19 | other ccx errors, one or a few decks each |
-| 22 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure models) |
-| 12 | Abaqus general contact (7), an XFEM crack (1), Hashin damage of composite plies (2) or the only path of the load, kinematic couplings of some translations in an explicit NLGEOM step (2): ccx has none of them, and the converted deck runs without it — not the deck's physics, so not gated |
+| 15 | other ccx errors, one or a few decks each |
+| 24 | an element type, beam section, user subroutine or physics ccx lacks (piezoelectric, thermal-electrical and infinite elements; I and general beam sections where ccx's `U1` beam cannot carry them; cohesive, acoustic, pore-pressure, Holzapfel fibre models) |
+| 13 | Abaqus general contact (8), an XFEM crack (1), Hashin damage of composite plies (2) or the only path of the load, kinematic couplings of some translations in an explicit NLGEOM step (2): ccx has none of them, and the converted deck runs without it — not the deck's physics, so not gated |
 
 Every one of them was checked to fail no worse than the original, unconverted deck. Fixing
 a first error often only exposes a second, fundamental one behind it, so the converter aims
@@ -269,7 +270,7 @@ cost.
 
 30 decks are Abaqus' own benchmark decks: NAFEMS tests of the Abaqus 2017 Benchmarks Manual,
 from the documentation mirror at abaqus-docs.mit.edu (Dassault Systèmes' decks, fetched on
-demand and not redistributed). The 25 that run carry a `reference`, as does the corpus's copy
+demand and not redistributed). The 26 that run carry a `reference`, as does the corpus's copy
 of Abaqus' LE1 `CPS3` deck: a quantity, where ccx writes it (a `.frd` nodal stress or
 temperature, `.dat` eigenfrequencies, integration-point stresses or displacements), the
 NAFEMS target and Abaqus' published result for the deck's own mesh. `test_corpus_references`
@@ -303,7 +304,7 @@ On ccx 2.23, 20 match Abaqus:
 | NL2 | `CAX8R`, plasticity | σrr, σθθ at 8 Gauss radii, 80 and 160 MPa | ≤ 0.35 % off | the targets, but 95.8 for σθθ at r = 124.2 under 80 MPa | 98.5 there |
 | NL6 | `B22`, NLGEOM | ux/L, uy/L after both load steps | −0.4503, 0.7242; −1.5818, 0.4231 | −0.447, 0.723; −1.577, 0.427 | −0.440, 0.719; −1.577, 0.421 |
 
-Six differ for a reason traced to ccx:
+Seven differ for a reason traced to ccx:
 
 | Test | Element | ccx | Abaqus | Why |
 | --- | --- | --- | --- | --- |
@@ -313,11 +314,11 @@ Six differ for a reason traced to ccx:
 | FV52 | `C3D8I` | 44.18 … 205.15 | 44.092 … 200.13 | Abaqus lumps first-order masses (Theory Guide, "Implicit dynamic analysis") and condenses the incompatible modes, which ccx keeps as DOFs with a consistent mass: a separate solution gives 44.12 … 156.5 Abaqus' way, 44.18 … 157.9 ccx's |
 | FV12 | `S8R` | mode 9: 7.653 | 7.559 | ccx's `S8R` is a one-layer `C3D20R` solid: modes 4–8 within 0.26 %, mode 9 a coarse-mesh error (ccx: 7.375 at 8 × 8) |
 | FV2 | `B22` | 11.34, 18.06, 45.90, 59.30 | 11.34, 17.68, 45.69, 57.75 | ccx's beam is a 3-D brick whose clamped or knotted end section cannot contract with Poisson's ratio (0.3): modes 2 and 10, whose arms the crossing clamps, come out 2–3 % stiff on 4 elements an arm (one such arm: 18.08, 59.63 Hz; with ν = 0 17.72, 58.45) |
+| FV4 | `B32` | 1.769, 1.770, 7.399, 10.43, 20.02, 32.55 | 1.722, 1.726, 7.412, 9.955, 18.17, 27.05 | ccx's beam is one 20-node brick per element: on the deck's three, modes 1–2 come out 2.7 % and mode 6 20 % stiff; on 30 elements ccx is within 0.8 % of Abaqus |
 
-The other five do not run in ccx 2.23: creep tests 1(a), 2(a) and 5(a) stop on a singular
+The other four do not run in ccx 2.23: creep tests 1(a), 2(a) and 5(a) stop on a singular
 matrix once an increment's creep strain is about 20 times the elastic one (Abaqus takes
-increments of about 100 h; ccx is exact until it stops); FV4 stops in its `*FREQUENCY` step
-("add_bo_st") because `*MASS` elements sit on `*RIGID BODY` members; NL5 stops at about 90°
+increments of about 100 h; ccx is exact until it stops); NL5 stops at about 90°
 of end rotation ("increment size smaller than minimum") on 8 or 32 elements, as `B32` or
 `B32R`. These decks also found converter faults, fixed with them: `*NFILL` sets without their
 bounding nodes, one `*EQUATION` card with several set equations, 2-D and axisymmetric

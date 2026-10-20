@@ -192,8 +192,8 @@ for any non-trivial deck. The converter classifies every keyword — translated,
 organisational, or commented with guidance — and the [keyword reference](keyword-reference.md)
 gives the full split.
 
-Of the 1052 corpus decks, 599 do not solve; most need what stock ccx does not have: user
-materials (353 decks), user elements (66), and other user subroutines, Riks, explicit coupled
+Of the 1052 corpus decks, 596 do not solve; most need what stock ccx does not have: user
+materials (354 decks), user elements (66), and other user subroutines, Riks, explicit coupled
 temperature–displacement steps, cohesive and acoustic models, Abaqus general contact. Others are
 incomplete source decks (50). Another 31 solve only a model with reduced physics — the
 conversion had to drop or replace part of it (concrete damaged plasticity, user hardening,
