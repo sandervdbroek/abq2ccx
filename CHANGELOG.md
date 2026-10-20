@@ -12,7 +12,8 @@ physics.
   procedure card (Abaqus allows one, right after `*STEP`) is converted as its first one, the
   other card commented out and warned: ccx ran the later card. A procedure card between steps
   (commented out) no longer counts for the step before it or for the deck: an explicit one made
-  the whole deck explicit.
+  the whole deck explicit. A circular-section beam node whose rotation a step's later line sets
+  back to 0 no longer gets a knot beam (it stiffened the beam slightly; the zero clamp is exact).
 * **Static perturbation steps: base + perturbation** — two lines of one load in such a step
   each got the base value added, so ccx counted it twice. It now goes on the first line only.
   Base-state loads, BCs and temperatures on a `TIME=TOTAL TIME` amplitude kept rising through

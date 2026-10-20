@@ -3611,6 +3611,19 @@ def equation_steps_deck(case):
     return head + eq + ("" if case == "nonzero_r2" else one) + ("" if case == "nonzero_r1" else two)
 
 
+def circ_override_deck(override=True):
+    """A cantilever of 20 B31 circular-section beams (L 1000, r 10, E 210000), clamped at x = 0,
+    its mid node held in rotation (DOFs 4-6 at 0) and its tip loaded by 100 along -y.
+    ``override``: the step first gives the mid node's rotations 0.001, which its next line
+    replaces by 0 (the BC ccx solves with is the zero one)."""
+    return ("*NODE\n1, 0., 0., 0.\n21, 1000., 0., 0.\n*NGEN, NSET=ALL\n1, 21, 1\n"
+            "*ELEMENT, TYPE=B31, ELSET=BEAM\n1, 1, 2\n*ELGEN, ELSET=BEAM\n1, 20, 1, 1\n"
+            "*NSET, NSET=TIP\n21\n*BEAM SECTION, ELSET=BEAM, MATERIAL=STEEL, SECTION=CIRC\n10.\n"
+            "0., 0., -1.\n*MATERIAL, NAME=STEEL\n*ELASTIC\n210000., 0.3\n*BOUNDARY\n1, ENCASTRE\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n" + ("11, 4, 6, 0.001\n" if override else "") +
+            "11, 4, 6, 0.\n*CLOAD\n21, 2, -100.\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -11828,6 +11841,24 @@ def main():
               f"sub/mesh.inp): the pulled face moves {u.get(2, [math.nan])[0]:.7g} (4 / 1000; "
               f"{dev:.1e} apart)")
     failures += 0 if u and ok else 1
+
+
+    # --- step-rule leftovers (task 103) ----------------------------------------------------
+    # a circular-section beam node whose rotations a step gives 0.001 and its next line 0: held
+    # at 0 (the value in force), a full zero clamp, exact without a knot beam (one was added:
+    # every node given a nonzero rotation by any card read so far counted as moving)
+    runs = [review_run(circ_override_deck(ov), "circ_override" + ("" if ov else "_ref"),
+                       dat_node_blocks) for ov in (True, False)]
+    ok = all(runs) and len(runs[0]) == len(runs[1]) == 1
+    if ok:
+        err, moved = same(runs)
+        ok = err < 1e-12 * moved and moved > 1.0
+        print(f"{'PASS' if ok else 'FAIL'}  circ_override (B31 CIRC cantilever, the mid node's "
+              f"rotations given 0.001, then 0 in the same step): solved as with the zero line alone "
+              f"({err:.1e} apart; tip {moved:.7g}; with the knot beam it was 3.1e-4 apart)")
+    elif all(runs):
+        print(f"FAIL  circ_override: {len(runs[0])}, {len(runs[1])} printed blocks")
+    failures += 0 if ok else 1
 
 
     # --- *DLOAD BX / BY / BZ on shells: a body force per unit volume in Abaqus, a pressure on

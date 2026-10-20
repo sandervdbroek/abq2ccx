@@ -6953,6 +6953,17 @@ def test_circ_beam_rotation_knots_follow_steps_and_skip_unsafe_nodes():
     _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, 1, 4\n*Step\n*Heat Transfer\n1., 1.\n"
                              "*End Step\n")
     assert not conv._knots
+    # a rotation counts as prescribed nonzero by the value in force in the step: a later line
+    # on the DOF replaces an earlier one (a full zero clamp, exact without a knot), in that step
+    # only (a step that keeps the 0.001 needs it)
+    deck = CIRC_BEAM + "*Boundary\n1, ENCASTRE\n*Step\n*Static\n*Boundary\n3, 4, 6, 0.001\n3, 4, 6, 0.\n" \
+        "3, 1, 3\n*Cload\n2, 2, -1.\n*End Step\n"
+    _, conv, _ = convert_str(deck)
+    assert not conv._knots
+    _, conv, _ = convert_str(deck.replace("3, 4, 6, 0.001\n3, 4, 6, 0.\n", "3, 4, 6, 0.\n3, 4, 6, 0.001\n"))
+    assert list(conv._knots) == [3]
+    _, conv, _ = convert_str(deck + "*Step\n*Static\n*Boundary\n3, 6, 6, 0.002\n*End Step\n")
+    assert list(conv._knots) == [3]
     # a deck without procedures is mechanical (_mechanical), as everywhere else: its model data
     # get the knots a mechanical step needs (a model-only deck, included in one)
     _, conv, _ = convert_str(CIRC_BEAM + "*Boundary\n1, 1, 4\n3, 2, 4\n")

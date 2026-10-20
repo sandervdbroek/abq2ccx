@@ -32405,28 +32405,25 @@ class Converter:
         if not ends or not self._mechanical:
             return
         twist = set(self._planar_twist) & ends
-        moves: set = set()                               # nodes given a nonzero rotation
         need: List[int] = []
 
         def rotations(b: Block) -> List[Tuple[Tuple[int, int], bool]]:
-            out = []
-            for nodes, ds, moving in self._boundary_records(b):
-                for n in (nodes if ds & {4, 5, 6} else []):
-                    if n in ends:
-                        out += [((n, d), True) for d in sorted(ds & {4, 5, 6})]
-                        if moving:
-                            moves.add(n)
-            return out
+            # (node, DOF) -> whether the line prescribes a value other than 0
+            return [((n, d), moving) for nodes, ds, moving in self._boundary_records(b)
+                    if ds & {4, 5, 6} for n in nodes if n in ends for d in sorted(ds & {4, 5, 6})]
 
-        # the BCs each step solves with (``moves`` grows as the fold reaches each card: the
-        # moves up to the step's end)
+        # the BCs each step solves with, at the values in force there (a later line on a DOF
+        # replaces an earlier one, also in the step)
         for st in self.steps.states(rotations, skip=self.steps.lc2, blocks=blocks):
             active: Dict[int, set] = {}                  # node -> rotations a BC holds
-            for n, d in st:
+            moving: set = set()                          # ... at a value other than 0
+            for (n, d), mv in st.items():
                 active.setdefault(n, set()).add(d)
+                if mv:
+                    moving.add(n)
             for n in sorted((set(active) | twist) & ends):
                 rot = active.get(n, set()) | ({4, 5} if n in twist else set())
-                if rot and (rot != {4, 5, 6} or n in moves):
+                if rot and (rot != {4, 5, 6} or n in moving):
                     need.append(n)
         turned = {n for b in blocks if b.keyword == "TRANSFORM"
                   for n in self._resolve_nodes((b.param("NSET") or "").strip())}
