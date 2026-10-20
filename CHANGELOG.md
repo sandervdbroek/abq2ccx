@@ -12,8 +12,19 @@ physics.
   rotation constraints with the finite rotation, where Abaqus keeps rotations linear. These
   constraints are the mean-rotation MPCs of non-zero rotational BCs and moments, and the knots
   (frame joints, folded shell edges, knot beams). The results drift by about theta^2 of max |u|
-  (1 % at 0.1 rad), and by 0.4-1 % at a knot turning 0.01 rad. Held rotations are exact. ccx has
-  no linear form, so such a deck is now warned and flagged as reduced physics.
+  (1 % at 0.1 rad), and by 0.4-1 % at a beam knot turning 0.01 rad. Held rotations are exact.
+  ccx has no linear form, so such a deck is now warned and flagged as reduced physics.
+* **Rigid constraints that still kept ccx's finite rotations** — in a deck written as linear
+  rigid equations (a step ccx runs nonlinearly without NLGEOM), three forms kept ccx's own
+  constraint, which turns with the finite rotation (2-8 % off, reduced physics). These were a
+  reference node with a `*TRANSFORM`, a coupling of some translations of transformed nodes, and
+  a `*KINEMATIC COUPLING` with a rotation-only line on shell/beam nodes. They are now exact
+  equations: the transformed nodes' terms go through twin nodes, and the rotation-only line
+  becomes rotation ties.
+* **Coupling along an `ORIENTATION` with a member BC that stopped ccx** — a member BC on the
+  global DOF that ccx's own coupling eliminates along a turned axis stopped ccx. Without NLGEOM,
+  such a coupling is now written as its linear equations, and ccx holds both the coupling and
+  the BC.
 * **Cards ccx 2.23 stopped or crashed on, without a warning** — each is now written in a form
   ccx runs, or warned (reduced physics):
   * `*RIGID BODY` with `ELSET` and a `PIN` / `TIE NSET`: one `NSET` of all their nodes (ccx

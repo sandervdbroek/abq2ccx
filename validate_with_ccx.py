@@ -2648,6 +2648,40 @@ def rigid_nonlinear_deck(case, ref=False):
             .replace("*STEP\n*STATIC\n", "*STEP, INC=1000\n" + proc))
 
 
+TRANSFORM_AXES = ((0.6, 0., 0.8), (0., 1., 0.), (-0.8, 0., 0.6))    # *TRANSFORM 0.6, 0., 0.8, 0., 1., 0.
+
+
+def rigid_transformed_deck(case, twin=False):
+    """rigid_dynamic_deck members driven over a *STATIC step of a material with a *PLASTIC it
+    never reaches (ccx's nonlinear solver: abq2ccx writes linear rigid equations): 'ref', the
+    column's *RIGID BODY on a reference node with an oblique *TRANSFORM (TRANSFORM_AXES), its
+    motion given in those axes; 'some', the column's top face, with that *TRANSFORM, coupled
+    in DOFs 1-2 only; 'rotation_line', the S4 strip's tip edge in a *KINEMATIC COUPLING of a
+    line of DOFs 1-3 and one of 4-6.  ``twin``: the same model without the *TRANSFORM (the
+    motion in global components), or with one line of DOFs 1-6."""
+    member = {"ref": "solid", "some": "transformed", "rotation_line": "shell"}[case]
+    deck = rigid_dynamic_deck(member).replace(
+        "*ELASTIC\n1000., 0.3\n", "*ELASTIC\n1000., 0.3\n*PLASTIC\n1e6, 0.\n").replace(
+        "*STEP, INC=1000\n*DYNAMIC\n0.01, 1.\n", "*STEP, INC=1000\n*STATIC\n0.1, 1.\n")
+    body = "*RIGID BODY, REF NODE=100, TIE NSET=TIP\n"
+    if case == "some":
+        deck = deck.replace(body, "*SURFACE, TYPE=NODE, NAME=ST\nTIP\n*COUPLING, CONSTRAINT NAME=C, "
+                            "REF NODE=100, SURFACE=ST\n*KINEMATIC\n1, 2\n")
+        return deck.replace("*TRANSFORM, NSET=TIP\n0.6, 0., 0.8, 0., 1., 0.\n", "") if twin else deck
+    if case == "rotation_line":
+        return deck.replace(body, "*KINEMATIC COUPLING, REF NODE=100\n" +
+                            ("TIP, 1, 6\n" if twin else "TIP, 1, 3\nTIP, 4, 6\n"))
+    if twin:
+        return deck
+    _, t0, th, _ = RIGID_DYNAMIC["solid"]
+    for base, g in ((0, t0), (3, th)):
+        for k in range(3):
+            loc = sum(TRANSFORM_AXES[k][i] * g[i] for i in range(3))
+            deck = deck.replace(f"100, {base + k + 1}, {base + k + 1}, {g[k]}\n",
+                                f"100, {base + k + 1}, {base + k + 1}, {loc:.12g}\n")
+    return deck.replace(body, body + "*NSET, NSET=RP\n100\n*TRANSFORM, NSET=RP\n0.6, 0., 0.8, 0., 1., 0.\n")
+
+
 def energy_steps_deck(first=None, second="dynamic"):
     """CUBE8 (E 1000, nu 0) held at its bottom and its top face in x and y: one degree of
     freedom, the top face's z, with stiffness E A / L = 1000 and the top face's consistent mass
@@ -7318,6 +7352,33 @@ def main():
                    f"the BC holds to {held:.0e} (before: taken off, 0.1-0.2 of max |u| off)") +
                   f"; the members moved {free:.2f} of it across the coupled axis")
         failures += 0 if ok else 1
+    # ... and a member's BC on the global DOF ccx's coupling eliminates (ccx stopped): the
+    # coupling's linear equations, about z (one axis) and an oblique ORIENTATION (two axes)
+    for tag, deg, dofs, frame, bc in (("one_axis", 60., "1, 1", None, 2),
+                                      ("two_axes", 60., "1, 2", ROT_FRAME, 2)):
+        tag = f"coupling_orientation_member_bc_stop_{tag}"
+        deck = oriented_coupling_deck(deg, dofs=dofs, bcs=[f"10, {bc}, {bc}, 0.01"])
+        if frame:
+            deck = re.sub(r"\*ORIENTATION, NAME=OR1\n.*\n", "*ORIENTATION, NAME=OR1\n" + ", ".join(
+                f"{x:g}" for x in frame[0] + frame[1]) + "\n", deck)
+        c, s_ = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+        axes = frame or ((c, s_, 0.), (-s_, c, 0.), (0., 0., 1.))
+        coupled = [axes[j] for j in range(int(dofs[0]) - 1, int(dofs[-1]))]
+        u = review_run(deck, tag, dat_displacements)
+        ok = bool(u) and {100, *range(10, 19)} <= set(u)
+        if ok:
+            scale = max(math.hypot(*v) for v in u.values())
+            rel = {n: [u[n][k] - u[100][k] for k in range(3)] for n in range(10, 19)}
+            tie = max(abs(_dot(e, rel[n])) for n in rel for e in coupled) / scale
+            held = abs(u[10][bc - 1] - 0.01) / scale
+            free = max(abs(_dot(axes[2 if len(coupled) == 2 else 1], rel[n])) for n in rel) / scale
+            ok = tie < 1e-5 and held < 1e-5 and free > 0.01       # (the .dat's 7 digits)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled along {len(coupled)} "
+                  f"axes of an *ORIENTATION, a corner's BC on global {bc}, the DOF ccx's own coupling "
+                  f"eliminates; a static step): coupling residual {tie:.0e} of max |u|, the BC holds to "
+                  f"{held:.0e}; the members moved {free:.2f} of it across the coupled axes (before: ccx "
+                  f"stopped)")
+        failures += 0 if ok else 1
     # *COUPLING REF NODE= a node set of two nodes, each coupled to the nodes within its own
     # INFLUENCE RADIUS (the converter coupled the first only), against two couplings of one
     # reference node each in a static step
@@ -7466,6 +7527,30 @@ def main():
                   f"finite rotation there)")
         elif u:
             print(f"FAIL  {tag}: the reference did not solve")
+        failures += 0 if ok else 1
+    # ... the forms that kept ccx's RIGID MPCs there, now equations too: a transformed
+    # reference node and a coupling of some translations of transformed nodes (twins of the
+    # nodes, _dir_terms), a rotation-only line beside a translation line (rotation ties)
+    for case, what in (("ref", "a *RIGID BODY on a reference node with an oblique *TRANSFORM, its "
+                               "motion given in its axes, vs the motion in global components"),
+                       ("some", "a coupling of DOFs 1-2 of nodes with an oblique *TRANSFORM, vs the "
+                                "nodes without it"),
+                       ("rotation_line", "a *KINEMATIC COUPLING of a shell edge in lines of DOFs 1-3 "
+                                         "and 4-6, vs one line of 1-6")):
+        tag = f"rigid_nonlinear_{case}"
+        u = review_run(rigid_transformed_deck(case), tag, dat_displacements)
+        ref = review_run(rigid_transformed_deck(case, True), tag + "_twin", dat_displacements)
+        free = RIGID_DYNAMIC["shell" if case == "rotation_line" else "solid"][3]
+        ok = bool(u) and bool(ref) and all(n in ref for n in free)
+        if ok:
+            scale = max(math.hypot(*v) for v in ref.values())
+            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
+            moved = min(math.hypot(*ref[n]) for n in free) / scale
+            ok = err < 1e-9 and moved > 0.1
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}; a *STATIC step with a *PLASTIC never "
+                  f"reached, driven by a node that moves and turns): {len(ref)} node displacements, "
+                  f"max difference {err:.1e} of max |u|; the free nodes moved {moved:.2f} of it "
+                  f"(before: ccx's own constraint, turned with the finite rotation, 2-8 % off)")
         failures += 0 if ok else 1
     # an implicit *DYNAMIC or transient coupled step after a static step, which ccx 2.23 stopped
     # on ("energy output requests, if any, must be specified in the first step"; abq2ccx now

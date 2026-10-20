@@ -9191,9 +9191,10 @@ def test_kinematic_coupling_member_bcs_along_its_orientation():
             # local 1 = global y: a BC on y the reference node's imposes, on x unrelated
             (90, "10, 2, 2, 0.02\n10, 1, 1, 0.005\n", stat, None),
             (90, "10, 2, 2, 0.02\n10, 1, 1, 0.005\n", dyn, None),
-            # turned 60 degrees: the coupling holds neither x nor y; ccx eliminates y
+            # turned 60 degrees: the coupling holds neither x nor y; ccx eliminates y, so a BC
+            # on y stopped it: the coupling's linear equations instead (_oriented_stops)
             (60, "10, 1, 1, 0.01\n", stat, "ccx holds both"),
-            (60, "10, 2, 2, 0.02\n", stat, "ccx stops"),
+            (60, "10, 2, 2, 0.02\n", stat, "ccx holds both"),
             (30, "10, 1, 1, 0.01\n", dyn, "ccx holds both")):
         deck = _radius_block((1., 1., 1.5), _ori_z(deg) + cpl.format(d="1, 1"), step.format(bc=bc))
         body, conv, rep = convert_str(deck)
@@ -9204,7 +9205,13 @@ def test_kinematic_coupling_member_bcs_along_its_orientation():
             assert bc.strip().replace(" ", "") in bcs, bcs
         text = rep.text()
         assert ("partly cover" in text) == bool(warn) and (not warn or warn in text)
-        assert "Abaqus/Standard eliminates the constrained DOFs" not in text
+        assert "Abaqus/Standard eliminates the constrained DOFs" not in text and \
+            "eliminates, per coupled axis" not in text      # (the warning that ccx stops)
+        stop = deg == 60 and bc.startswith("10, 2")
+        assert ("*KINEMATIC" in "\n".join(_live(body))) == (step == stat and not stop)
+        if stop:
+            assert len(_equation_terms(body)) == 9 and conv._kin_eq_refs == {100} and \
+                not conv.reduced_physics and "10,2,2,0.02" in bcs
         approx, _, _ = convert_str(deck, approximate=True)
         assert _bc_lines(approx) == bcs           # (Abaqus' handling of these is not known)
     # local 1 and 2 turned about z: the coupling holds x and y, as without the orientation
@@ -9266,12 +9273,16 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
         assert eqs[0] == [(5, 1, 1.), (9, 1, -0.8), (9, 2, -0.6), (rot, 1, -0.6), (rot, 2, 0.8),
                           (rot, 3, -0.1)]
         assert rep.n_warnings == 0 and not conv.reduced_physics
-    # a transformed reference node keeps the *RIGID BODY (several local terms of one node in
-    # an equation, which ccx 2.23 mis-assembles), warned as reduced physics
+    # a transformed reference node (its ROT NODE takes its axes): their terms go on twins
+    # (_dir_terms; several local terms of one node in an equation ccx 2.23 mis-assembles).
+    # It kept the *RIGID BODY, reduced (validate_with_ccx.py rigid_nonlinear_transformed_ref)
     body, conv, rep = convert_str(rp + tr.replace("TOPN", "RP") + cards[0] + step.format(""))
-    assert "*RIGID BODY" in body and not _equation_terms(body)
-    assert "not as the linear *EQUATIONs of the other ones: its reference node has a *TRANSFORM" in rep.text()
-    assert conv.reduced_physics == ["rigid constraint turned with the finite rotation in a geometrically linear step"]
+    rot = conv._rb_rot[9]
+    eqs = _equation_terms(body)
+    assert "*RIGID BODY" not in "\n".join(_live(body)) and conv._twins == {9: rot + 1, rot: rot + 2}
+    assert len(eqs) == 18 and eqs[6] == [(5, 1, 1.), (rot + 1, 1, -1.), (rot + 2, 2, 1.), (rot + 2, 3, -0.5)]
+    assert sorted(eqs[0]) == [(9, 1, 1.), (rot + 1, 1, -0.8), (rot + 1, 2, -0.6)]     # u_twin = u_9
+    assert not conv.reduced_physics
     # knotted shell members: their translations and (TIE, coupled rotations) rotations follow
     sdyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 6\n4, 1, 6\n*Boundary\nREF, 3, 3, 0.1\n*End Step\n"
     coupling = "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n"
@@ -9396,15 +9407,19 @@ def test_rigid_constraints_ccx_turns_in_a_linear_dynamic_step_are_reduced():
                  rb + TOP9_DYN.format("").replace("*Dynamic\n", "*Dynamic, explicit\n") + nl,
                  rb + TOP9_DYN.format("").replace("*Dynamic\n0.01, 1.", "*Static") + nl):
         assert not convert_str(deck)[1].reduced_physics
-    # a native kinematic coupling of shell nodes with a line ccx cannot have as equations
-    # (some translations of transformed nodes) keeps ccx's *KINEMATIC: reduced too
+    # a native kinematic coupling of some translations of transformed shell nodes: equations
+    # on the members' twins (it kept ccx's *KINEMATIC, reduced; validate_with_ccx.py
+    # rigid_nonlinear_transformed_some)
     shell = (S4 + "*Transform, nset=R\n0.8, 0.6, 0., -0.6, 0.8, 0.\n*Surface, type=node, "
              "name=RS\nR\n*Coupling, constraint name=C, ref node=REF, surface=RS\n*Kinematic\n"
              "1, 2\n*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 6\n4, 1, 6\n*Cload\n"
              "REF, 2, 1.\n*End Step\n")
     body, conv, rep = convert_str(shell)
-    assert "*KINEMATIC" in body and "has a line without linear equations" in rep.text()
-    assert what[0] in conv.reduced_physics
+    eqs = _equation_terms(body)
+    assert "*KINEMATIC" not in "\n".join(_live(body)) and conv._twins == {5: 102, 6: 103}
+    assert [(5, 1, 1.), (102, 1, -0.8), (102, 2, -0.6)] in eqs and \
+        [(102, 1, 1.), (100, 1, -1.), (101, 3, -0.5)] in eqs and len(eqs) == 10
+    assert not conv.reduced_physics and "has a line without linear equations" not in rep.text()
 
 
 def test_rotation_bcs_against_rigid_rotation_ties_are_reduced():
@@ -9515,6 +9530,27 @@ def test_shell_beam_rotations_in_steps_ccx_runs_nonlinear_warned():
         "2, 2, 3\n", "2, 2, 3\n3, 3, 4\n").format("*Cload\n4, 3, 0.1\n")
     body, conv, rep = convert_str(frame)
     assert conv.reduced_physics == [FINITE_ROT] and "1 knot(s) (e.g. node 3;" in rep.text()
+
+
+def test_kinematic_coupling_rotation_line_in_a_linear_rigid_deck():
+    # a *KINEMATIC COUPLING with a line of rotations only beside its translation line, on
+    # shell nodes, in a deck of linear rigid equations: equations plus rotation ties, the same
+    # as one line of all six DOFs (it kept ccx's *KINEMATIC COUPLING, which turns with the finite
+    # rotation: reduced; validate_with_ccx.py rigid_nonlinear_rotation_line).  Rotations only
+    # of nodes without rotations still keep it
+    step = "*Step\n*Static\n*Boundary\n1, 1, 6\n4, 1, 6\n*Boundary\nREF, 3, 3, 0.1\n*End Step\n"
+    plastic = S4.replace("*Elastic\n1000.,0.3\n", "*Elastic\n1000.,0.3\n*Plastic\n1e6, 0.\n")
+    two, conv, rep = convert_str(plastic + "*Kinematic Coupling, ref node=REF\nR, 1, 3\nR, 4, 6\n" + step)
+    one, _, _ = convert_str(plastic + "*Kinematic Coupling, ref node=REF\nR, 1, 6\n" + step)
+    assert _equation_terms(two) == _equation_terms(one) and len(_equation_terms(two)) == 12
+    assert "*KINEMATIC" not in "\n".join(_live(two)) and [(5, 4, 1.), (101, 1, -1.)] in _equation_terms(two)
+    assert conv.reduced_physics == [FINITE_ROT] and "has a line without linear equations" not in rep.text()
+    solid = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=TOPN\n5, 6, 7, 8\n*Solid Section, elset=EALL, " \
+        "material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1e6, 0.\n*Kinematic Coupling, " \
+        "ref node=9\nTOPN, 1, 3\nTOPN, 4, 6\n*Step\n*Static\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n" \
+        "4, 1, 3\n9, 1, 1, 0.1\n*End Step\n"
+    body, conv, rep = convert_str(solid)
+    assert "*KINEMATIC" in "\n".join(_live(body)) and "has a line without linear equations" in rep.text()
 
 
 def test_equation_terms_on_rigid_body_reference_rotations_move_to_the_rot_node():
