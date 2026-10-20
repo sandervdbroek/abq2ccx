@@ -508,6 +508,11 @@ TRANSLATED = {
         "Dropped too where the ccx model has no contact pair (general contact, a tied pair → "
         "`*TIE`), and where ccx 2.23 aborts on it: a model with axisymmetric elements whose "
         "`.frd` also gets `S`, unless every pair is `SURFACE TO SURFACE`.",
+    "*CONTACT PRINT": "variables checked against ccx's list: `CSTRESS`/`CDISP` as `CSTR`/`CDIS`, "
+        "`CFN`/`CFS`/`CFT` (→ `CF`) on one card per face-to-face pair the card covers, with its "
+        "`SLAVE`/`MASTER` (ccx stops without them, segfaults on a node-to-surface pair); other "
+        "variables and `NSET`/`SUMMARY`/`TOTALS` dropped; its `FREQUENCY` joins the step's output "
+        "control. Dropped where the ccx model has no contact pair.",
     "Step data outside a *STEP": "`*CLOAD`, `*DLOAD`, output and procedure cards before the first "
         "step (or between steps) are commented — Abaqus rejects them, and ccx 2.23 segfaults when "
         "such a card ends the deck with a data line.",
@@ -733,7 +738,7 @@ def gen_keywords():
                "CONTACT PAIR", "SURFACE INTERACTION", "FRICTION", "PLASTIC", "DENSITY",
                "SPECIFIC HEAT", "CONDUCTIVITY", "EXPANSION", "MOHR COULOMB",
                "MOHR COULOMB HARDENING", "HYPERELASTIC", "DEPVAR", "INITIAL CONDITIONS", "CLOAD",
-               "CONTACT OUTPUT", "CONTACT FILE", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
+               "CONTACT OUTPUT", "CONTACT FILE", "CONTACT PRINT", "TEMPERATURE", "FILM", "DFLUX", "CFLUX", "RADIATE",
                "CONNECTOR SECTION", "TRANSFORM", "DAMAGE INITIATION", "USER MATERIAL",
                "DEFORMATION PLASTICITY"}
     supported = sorted(k for k in A.CCX_KEYWORDS

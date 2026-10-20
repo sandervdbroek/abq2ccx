@@ -6,6 +6,19 @@ physics.
 
 ## Unreleased
 
+* **Element output in steps ccx 2.23 runs linearly** — `*EL FILE SDV` segfaulted ccx in a
+  `*VISCO` step of an elastic material and in a Riks step under `--approximate`; both are
+  dropped there now, as in a linear `*STATIC` step. A `*FREQUENCY` or `*BUCKLE` step makes ccx
+  run the next `*STATIC` step linearly even after a `*DYNAMIC`, heat transfer or coupled step,
+  where `*EL PRINT ELKE` and `*EL FILE SDV` segfaulted it; they are dropped there too. Without
+  such a step in between, SDV is now kept in a static step after those steps (it was dropped).
+* **`*EL PRINT ELKE` after a `*FREQUENCY` step** — ccx turns ELKE off for every later step;
+  the first later step that carries the request now gets its cards written again.
+* **`*CONTACT PRINT`** — passed through before; now its variables are checked against ccx
+  2.23's. `CFN`, `CFS` and `CFT` (ccx's `CF`) get one card per face-to-face contact pair with
+  its `SLAVE` and `MASTER` (ccx stopped without them and segfaults on a node-to-surface pair).
+  Other Abaqus variables and `NSET`, `SUMMARY`, `TOTALS` are dropped with a note; `FREQUENCY`
+  joins the step's output control; without a ccx contact pair the card is dropped.
 * **Input left out without a word** — the report now says where the conversion leaves input
   out: a `*PART` that no `*INSTANCE` names (a note; a warning in a deck without any instance,
   which came out empty: about 100 corpus decks, mostly include fragments); a composite ply line

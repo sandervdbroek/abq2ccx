@@ -3489,6 +3489,41 @@ def test_contact_output_maps_to_ccx_labels():
     assert "*CONTACT FILE" not in body
 
 
+def test_contact_print_checked_against_ccx_labels():
+    # ccx 2.23's *CONTACT PRINT prints CDIS, CSTR, CELS and CNUM (first four characters), and CF /
+    # CFN / CFS for the face-to-face pair SLAVE and MASTER name: without them it stops, on a
+    # node-to-surface pair it segfaults; it skips other labels with a warning (probed)
+    f2f = _contact(", type=surface to surface")
+    step = "*Step\n*Static\n{}*End Step\n"
+    body, _, rep = convert_str(f2f + step.format("*Contact Print\nCSTRESS, CPRESS, CDISP, CAREA\n"))
+    assert "*CONTACT PRINT\nCSTR, CDIS\n" in body
+    assert "Contact print variable CPRESS dropped" in rep.text() and "CAREA dropped" in rep.text()
+    # whole-surface forces: one card per face-to-face pair the card covers (Abaqus: every pair
+    # without SLAVE / MASTER), components and CFT folded onto ccx's labels
+    two = f2f.replace("A, B\n", "A, B\n*Contact pair, interaction=SI, type=surface to surface\nB, A\n")
+    body, _, rep = convert_str(two + step.format("*Contact Print\nCFN, CFT1, CSTRESS\n"))
+    assert "*CONTACT PRINT\nCSTR\n*CONTACT PRINT, SLAVE=A, MASTER=B\nCFN, CF\n*CONTACT PRINT, " \
+           "SLAVE=B, MASTER=A\nCFN, CF\n" in body, body
+    assert "Contact print variable CFT1 -> CF" in rep.text()
+    body, _, rep = convert_str(two + step.format("*Contact Print, slave=B, nset=EALL, summary=NO\nCFS\n"))
+    assert "*CONTACT PRINT, SLAVE=B, MASTER=A\nCFS\n" in body and "SLAVE=A" not in body
+    assert "*CONTACT PRINT parameter NSET dropped" in rep.text()
+    # none for a node-to-surface pair (the converter's default type), nor without a pair
+    body, _, rep = convert_str(_contact() + step.format("*Contact Print\nCFN, CDISP\n"))
+    assert "*CONTACT PRINT\nCDIS\n" in body and "SLAVE=" not in body
+    assert "*CONTACT PRINT CFN left out for node-to-surface contact pairs" in rep.text()
+    body, _, rep = convert_str(f2f + step.format("*Contact Print, slave=B, master=A\nCFN\n"))
+    assert "*CONTACT PRINT" not in body and "no ccx contact pair of these surfaces" in rep.text()
+    body, _, rep = convert_str(HEX + step.format("*Contact Print\nCSTRESS\n"))
+    assert "*CONTACT PRINT" not in body
+    assert "*CONTACT PRINT dropped: the ccx model has no contact pair" in rep.text()
+    # no variables: Abaqus' default (pressure, shear, opening, slip); its FREQUENCY is the step's
+    body, _, rep = convert_str(f2f + "*Step\n*Static\n0.1, 1.\n*Contact Print, frequency=0\nCSTRESS\n"
+                               "*Contact Print\n*End Step\n")
+    assert body.count("*CONTACT PRINT") == 1 and "*CONTACT PRINT\nCDIS, CSTR\n" in body
+    assert "*CONTACT PRINT with FREQUENCY=0 dropped" in rep.text()
+
+
 def test_contact_output_requests_ccx_cannot_write():
     # ccx writes contact output only for *CONTACT PAIR contact (a model without one gets an
     # empty block), and 2.23 aborts on it in a model with axisymmetric elements once the .frd
@@ -3980,9 +4015,10 @@ def test_energy_requested_from_the_first_step():
                        ("*Static\n*Output, history\n*Element Output, elset=EALL\nELSE\n",
                         "step 2's *EL PRINT ELSE request"),
                        ("*Static\n*Contact Print\nCELS\n", "step 2's *CONTACT PRINT CELS request")):
-        body, _, rep = convert_str(HEX + STEEL + "*Step, nlgeom\n*Static\n" + load + "*End Step\n"
-                                   "*Step, nlgeom\n" + step2 + "*End Step\n")
-        assert _step(body, 1).endswith("*EL FILE\nS, E, ENER\n") and why in rep.text(), why
+        body, _, rep = convert_str((_contact() if "Contact" in step2 else HEX) + STEEL +
+                                   "*Step, nlgeom\n*Static\n" + load + "*End Step\n*Step, nlgeom\n"
+                                   + step2 + "*End Step\n")
+        assert "*EL FILE\nS, E, ENER\n" in _step(body, 1) and why in rep.text(), why
     # nothing where step 1 already computes them, or no later step needs them: a steady-state
     # coupled step, an explicit step, energies requested in step 1
     for steps in ("*Step\n*Static\n" + load + "*End Step\n*Step\n*Coupled Temperature-"
@@ -4045,24 +4081,42 @@ def test_sdv_kept_off_el_file_where_ccx_has_no_nodal_state_variables():
     static = "*Step{}\n*Static\n" + load + "{}*End Step\n"
     freq = "*Step\n*Frequency\n3\n{}*End Step\n"
     ssd = "*Step\n*Steady State Dynamics\n100., 2000., 3\n" + load + "{}*End Step\n"
+    dyn = "*Step\n*Dynamic\n1.e-5, 1.e-4\n*End Step\n"
     for steps, k, why in (
             (static.format("", out), 1, "from a linear *STATIC step (no NLGEOM, no plastic, "
-                                        "creeping, hyperelastic or user material): ccx 2.23 has no "
-                                        "nodal state variables there and segfaults writing SDV to "
-                                        "the .frd; *EL PRINT SDV (.dat) runs."),
+                                        "creeping, hyperelastic or user material, no dynamic, heat "
+                                        "transfer or coupled step before, or since a *FREQUENCY or "
+                                        "*BUCKLE step): ccx 2.23 has no nodal state variables there "
+                                        "and segfaults writing SDV to the .frd; *EL PRINT SDV (.dat) "
+                                        "runs."),
+            ("*Step\n*Visco\n0.1, 1.\n" + load + out + "*End Step\n", 1, "from a linear *VISCO step"),
+            (dyn + freq.format("") + static.format("", out), 3, "from a linear *STATIC step"),
             (freq.format(out), 1, "from a *FREQUENCY step: ccx 2.23 writes no state variables "
                                   "there (it skips SDV requested in the step"),
             (freq.format("") + ssd.format(out), 2, "from a *STEADY STATE DYNAMICS step: ccx 2.23 "
                                                     "has no nodal state variables there")):
         body, _, rep = convert_str(HEX + depvar + bc + steps)
-        assert "*EL FILE\nS\n" in _step(body, k) and "SDV" not in _step(body, k), _step(body, k)
+        assert re.search(r"\*EL FILE[^\n]*\nS\n", _step(body, k)) and "SDV" not in _step(body, k), \
+            _step(body, k)
         assert f"*EL FILE SDV dropped {why}" in rep.text(), steps
+    # a Riks step without NLGEOM is a plain linear *STATIC under --approximate (and commented out,
+    # so ccx stops there, without it)
+    riks = "*Step\n*Static, riks\n0.1, 1., , , 1.\n" + load + out + "*End Step\n"
+    for approximate in (True, False):
+        body, _, rep = convert_str(HEX + depvar + bc + riks, approximate=approximate)
+        assert "SDV" not in _step(body, 1) and "*EL FILE SDV dropped from a linear *STATIC step" \
+            in rep.text(), approximate
     # a step ccx iterates (NLGEOM, also carried on; a plastic or hyperelastic material), a
     # model without state variables and a *MODAL DYNAMIC step keep it
     plastic = STEEL.replace("*Density", "*Plastic\n250., 0.\n*Density")
     hyper = depvar.replace("*Elastic\n210000., 0.3", "*Hyperelastic, neo hooke\n80000., 1.e-5")
     for model, steps in ((depvar, static.format(", nlgeom", out)),
                          (depvar, static.format(", nlgeom", "") + static.format("", out)),
+                         (depvar, static.format(", nlgeom", "") + freq.format("") + static.format("", out)),
+                         (depvar, dyn + static.format("", out)),
+                         (depvar, dyn + freq.format("") + dyn + static.format("", out)),
+                         (depvar, "*Step\n*Static, riks\n0.1, 1., , , 1.\n" + load + "*End Step\n"
+                          + dyn + static.format("", out)),
                          (plastic, static.format("", out)), (hyper, static.format("", out)),
                          (STEEL, static.format("", out)),
                          (depvar, freq.format("") + "*Step\n*Modal Dynamic\n1.e-5, 1.e-4\n" + load
@@ -4089,7 +4143,13 @@ def test_elke_kept_off_el_print_where_ccx_segfaults():
     for model, steps, k, card, kind in (
             (STEEL, static.format("", pr.format("S, ELKE")), 1, "*EL PRINT, ELSET=EALL\nS\n",
              "a linear *STATIC step (no NLGEOM, no plastic, creeping, hyperelastic or user "
-             "material, no dynamic, heat transfer or coupled step before)"),
+             "material, no dynamic, heat transfer or coupled step before, or since a *FREQUENCY or "
+             "*BUCKLE step)"),
+            (STEEL, dyn.format("") + "*Step\n*Frequency\n3\n*End Step\n" +
+             static.format("", pr.format("ELKE")), 3, "*EL PRINT, ELSET=EALL, FREQUENCY=1\n*NODE "
+             "FILE", "a linear *STATIC step"),
+            (STEEL, dyn.format("") + buckle.format("") + static.format("", pr.format("ELKE")), 3,
+             "*EL PRINT, ELSET=EALL, FREQUENCY=1\n*NODE FILE", "a linear *STATIC step"),
             (STEEL, "*Step\n*Visco\n0.1, 1.\n" + load + pr.format("ELKE") + "*End Step\n", 1,
              "*EL PRINT, ELSET=EALL\n*NODE FILE", "a linear *VISCO step"),
             (STEEL, "*Step\n*Frequency\n3\n*End Step\n" + static.format("", pr.format("ELKE")), 2,
@@ -4108,6 +4168,8 @@ def test_elke_kept_off_el_print_where_ccx_segfaults():
                          (STEEL, static.format(", nlgeom", "") + elke), (plastic, elke),
                          (creep, "*Step\n*Visco\n0.1, 1.\n" + load + pr.format("ELKE") + "*End Step\n"),
                          (STEEL, dyn.format("") + elke),
+                         (STEEL, "*Step\n*Frequency\n3\n*End Step\n" + dyn.format("") + elke),
+                         (STEEL, static.format(", nlgeom", "") + buckle.format("") + elke),
                          (STEEL, "*Step\n*Dynamic, explicit\n, 1.e-5\n*End Step\n" + elke),
                          (STEEL, dyn.format(pr.format("ELKE"))),
                          (STEEL, "*Step\n*Frequency\n3\n" + pr.format("ELKE") + "*End Step\n")):
@@ -4134,6 +4196,27 @@ def test_elke_kept_off_el_print_where_ccx_segfaults():
     body, _, rep = convert_str(HEX + STEEL + static.format("", pr.format("ELKE")) +
                                buckle.format("") + dyn.format(pr.format("S")))
     assert _step(body, 2).count("*EL PRINT") == 0 and _step(body, 3).count("*EL PRINT") == 1
+    # ccx deactivates ELKE in a *FREQUENCY step for every later step until it is requested again
+    # (probed): the first later step without cards of its own where ELKE runs gets them again,
+    # once; a step with its own cards, or after a *FREQUENCY step without ELKE, needs none
+    freq = "*Step\n*Frequency\n3\n{}*End Step\n"
+    for steps, k in ((dyn.format(pr.format("ELKE, ELSE")) + freq.format("") + dyn.format("") +
+                      dyn.format(""), 3),
+                     (freq.format(pr.format("ELKE")) + "*Step\n*Modal Dynamic\n1.e-5, 1.e-4\n*End "
+                      "Step\n", 2),
+                     (dyn.format(pr.format("ELKE")) + freq.format("") + freq.format("") +
+                      dyn.format(""), 4)):
+        body, _, rep = convert_str(HEX + STEEL + steps)
+        assert re.search(r"\*EL PRINT, ELSET=EALL[^\n]*\nELKE", _step(body, k)), (steps, _step(body, k))
+        assert sum("*EL PRINT" in _step(body, j) for j in range(2, body.count("*STEP") + 1)) == 1, steps
+        assert f"cards written again in step {k}: Abaqus carries them into it, ELKE included; " \
+               f"ccx deactivates ELKE in the *FREQUENCY step {k - 1} for every later step until " \
+               f"it is requested again." in rep.text(), steps
+    for steps in (dyn.format(pr.format("ELKE")) + freq.format("") + dyn.format(pr.format("ELKE")),
+                  dyn.format(pr.format("ELKE")) + freq.format(pr.format("S")) + dyn.format("")):
+        body, _, rep = convert_str(HEX + STEEL + steps)
+        assert _step(body, 3).count("*EL PRINT") == int("ELKE" in steps.split("*Frequency")[1]), steps
+        assert "ccx deactivates ELKE" not in rep.text(), steps
 
 
 def test_courant_length_matches_ccx_223():
@@ -6489,12 +6572,12 @@ def test_plastic_material_where_ccx_segfaults_other_procedures():
     ssd = _deck_step("Steady State Dynamics\n10., 100., 2", load + "*Output, field\n*Node Output\nU\n"
                      "*Contact Output\nCSTRESS, CDISP\n*Contact Print\nCSTRESS, CFN\n")
     body, _, rep = convert_str(pl + blk + st + freq + ssd)
-    assert "*CONTACT FILE\n*CONTACT PRINT\nCFN\n" in body.split("*STEP")[3]
+    assert "*CONTACT FILE\n*CONTACT PRINT\n*EL FILE\n" in body.split("*STEP")[3]
     assert "*CONTACT FILE CSTR, CDIS dropped from step 3: ccx 2.23 segfaults computing element or " \
-           "contact results" in rep.text() and "*CONTACT PRINT CSTRESS dropped from step 3" in rep.text()
-    # an elastic model keeps them
+           "contact results" in rep.text() and "*CONTACT PRINT CSTR dropped from step 3" in rep.text()
+    # an elastic model keeps them (CFN goes: ccx prints it for face-to-face pairs only)
     body, _, rep = convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + blk + st + freq + ssd)
-    assert "*CONTACT PRINT\nCSTRESS, CFN\n" in body and "segfaults" not in rep.text()
+    assert "*CONTACT PRINT\nCSTR\n" in body and "segfaults computing" not in rep.text()
 
 
 def test_buckle_perturbation_prescribed_displacements():

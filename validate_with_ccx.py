@@ -75,7 +75,9 @@ example UMAT gives E eps and E ln(1 + eps); the results digest of --run against 
 beam, buckling and statics references above; *EL FILE requests ccx stopped or crashed on
 (ENER beside U1 beams, SDV where ccx has no nodal state variables) against beam theory, 100 / E
 and the same decks without them; *EL PRINT ELKE in a linear static and a *BUCKLE step against
-u0 cos 100 t and the same deck without it; and decks a code review found converted wrongly:
+u0 cos 100 t and the same deck without it, and after a *FREQUENCY step against A cos 100 t and
+u0; *CONTACT PRINT CFN for every pair against a rigid punch's reaction; and decks a code review
+found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
 a part's pre-tension section and distributing coupling in turned instances, and a static step
@@ -2558,6 +2560,31 @@ def elke_steps_deck(case, elke=True):
             "*DYNAMIC, DIRECT\n2.51327412287E-4, 0.0628318530718\n*CLOAD, OP=NEW\n*END STEP\n")
 
 
+def elke_frequency_deck(last="dynamic"):
+    """energy_steps_deck's one-DOF cube (k 1000, m 0.1, omega 100) loaded by 4 x 0.25 in an
+    implicit *DYNAMIC step of half a period that requests history ELKE and the top's U (it swings
+    to 2 u0 = 2e-3 and stops), then a *FREQUENCY step (100 / 2 pi Hz), then ``last``: 'dynamic',
+    let go for half a period in a *DYNAMIC step that carries the requests (2e-3 cos 100 t,
+    kinetic energy 2e-3 sin^2 100 t); 'static', a *STATIC step under the load with its own
+    *EL PRINT ELKE (u0 = 1e-3), which ccx runs linearly after the *FREQUENCY step."""
+    half = "*DYNAMIC, DIRECT\n2.51327412287E-4, 0.0314159265359\n"
+    end = ("*STEP, INC=1000\n" + half + "*CLOAD, OP=NEW\n*END STEP\n" if last == "dynamic" else
+           "*STEP\n*STATIC\n*EL PRINT, ELSET=EALL\nELKE\n*END STEP\n")
+    return (CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*DENSITY\n0.3\n*BOUNDARY\nBOT, 1, 3\n"
+            "TOP, 1, 2\n*STEP, INC=1000\n" + half + "*CLOAD\nTOP, 3, 0.25\n*OUTPUT, HISTORY, "
+            "FREQUENCY=1\n*NODE OUTPUT, NSET=TOP\nU\n*ELEMENT OUTPUT, ELSET=EALL\nELKE\n*END STEP\n"
+            "*STEP\n*FREQUENCY\n1\n*END STEP\n" + end)
+
+
+def contact_print_deck():
+    """rigid_punch_deck's block pressed by 0.01 with Abaqus' *CONTACT PRINT CFN (and CPRESS, which
+    ccx has not) for every contact pair: ccx needs the pair named and prints the total normal
+    force on the slave surface, which the punch's reference node holds."""
+    deck = rigid_punch_deck(tool="elements", d=0.01)
+    i = deck.rindex("*END STEP")
+    return deck[:i] + "*CONTACT PRINT\nCFN, CPRESS\n" + deck[i:]
+
+
 def el_file_stops_deck(case, sdv=True):
     """Decks with *EL FILE output that stopped or crashed ccx 2.23 before (the converter's
     _el_file_stops).  'u1': a B31 cantilever (length 1000, A 1000, I11 4e5 about n1 = z, ten
@@ -2567,7 +2594,9 @@ def el_file_stops_deck(case, sdv=True):
     100 / E: 'depvar', of an elastic material with *DEPVAR, in a linear static step; 'carried',
     the same under NLGEOM, then a *FREQUENCY and a *STEADY STATE DYNAMICS step without element
     output, into which ccx carried SDV; 'plastic', of a plastic material (yield 250, never
-    reached), then a *FREQUENCY step without element output."""
+    reached), then a *FREQUENCY step without element output; 'visco' and 'riks', of the
+    *DEPVAR material in a *VISCO and a Riks step (--approximate: a linear *STATIC); 'dynamic',
+    of it in a static step after a *DYNAMIC step under the same load (ccx iterates it)."""
     field = "*OUTPUT, FIELD\n*ELEMENT OUTPUT\nS{}\n*NODE OUTPUT\nU\n".format(", SDV" if sdv else "")
     history = "*OUTPUT, HISTORY\n*NODE OUTPUT, NSET={}\nU\n"
     if case == "u1":
@@ -2578,9 +2607,13 @@ def el_file_stops_deck(case, sdv=True):
                 "*CLOAD\nTIP, 2, 100.\n*OUTPUT, FIELD, VARIABLE=ALL\n" + history.format("TIP") +
                 "*END STEP\n")
     law = "*PLASTIC\n250., 0.\n" if case == "plastic" else "*DEPVAR\n2\n*USER DEFINED FIELD\n"
-    steps = (f"*STEP{', NLGEOM' if case == 'carried' else ''}\n*STATIC\n*CLOAD\nTOP, 3, 25.\n"
+    proc = {"visco": "*VISCO, CETOL=1.E-3\n0.1, 1.\n", "riks": "*STATIC, RIKS\n0.1, 1., , , 1.\n"
+            }.get(case, "*STATIC\n")
+    steps = (f"*STEP{', NLGEOM' if case == 'carried' else ''}\n{proc}*CLOAD\nTOP, 3, 25.\n"
              + field + history.format("TOP") + "*END STEP\n")
-    if case != "depvar":
+    if case == "dynamic":
+        steps = "*STEP\n*DYNAMIC\n1.E-6, 1.E-5\n*CLOAD\nTOP, 3, 25.\n*END STEP\n" + steps
+    if case in ("carried", "plastic"):
         steps += "*STEP\n*FREQUENCY\n3\n*END STEP\n"
     if case == "carried":
         steps += ("*STEP\n*STEADY STATE DYNAMICS\n1.E5, 3.E5, 3\n*CLOAD\nTOP, 3, 25.\n*OUTPUT, "
@@ -6636,15 +6669,27 @@ def main():
               f"SECTION as U1, *OUTPUT, FIELD, VARIABLE=ALL): tip deflection {got:.7g} vs P L^3 / 3 E I "
               f"= {want:.7g} (before: ccx stopped writing ENER)")
     failures += 0 if tip and ok else 1
-    top = review_run(el_file_stops_deck("depvar"), "el_file_depvar_sdv", dat_displacements)
-    if top:
-        got = [top.get(n, [0.0, 0.0, math.nan])[2] for n in (5, 6, 7, 8)]
-        ok = max(abs(u * 210000.0 / 100.0 - 1.0) for u in got) < 1e-6
-        print(f"{'PASS' if ok else 'FAIL'}  el_file_depvar_sdv (a cube of an elastic material with "
-              f"*DEPVAR pulled in a linear static step, S and SDV requested): top at "
-              f"{', '.join(f'{u:.7g}' for u in got)} vs 100 / E = {100.0 / 210000.0:.7g} (before: ccx "
-              f"segfaulted)")
-    failures += 0 if top and ok else 1
+    def top_and_sdv(dat):
+        with open(os.path.join(os.path.dirname(dat), "job.frd"), errors="replace") as fh:
+            return dat_displacements(dat), fh.read().count(" -4  SDV")
+    for case, what, before in (("depvar", "in a linear static step", "ccx segfaulted"),
+                               ("visco", "in a *VISCO step, which ccx runs linearly", "ccx segfaulted"),
+                               ("riks", "in a Riks step (--approximate: a linear *STATIC)",
+                                "ccx segfaulted"),
+                               ("dynamic", "in a static step after a *DYNAMIC step, which ccx "
+                                "iterates", "SDV dropped")):
+        res = review_run(el_file_stops_deck(case), f"el_file_{case}_sdv", top_and_sdv,
+                         approximate=case == "riks")
+        if res:
+            top, frd_sdv = res
+            got = [top.get(n, [0.0, 0.0, math.nan])[2] for n in (5, 6, 7, 8)]
+            ok = max(abs(u * 210000.0 / 100.0 - 1.0) for u in got) < 1e-6 and \
+                (frd_sdv > 0) == (case == "dynamic")
+            print(f"{'PASS' if ok else 'FAIL'}  el_file_{case}_sdv (a cube of an elastic material with "
+                  f"*DEPVAR pulled {what}, S and SDV requested): top at "
+                  f"{', '.join(f'{u:.7g}' for u in got)} vs 100 / E = {100.0 / 210000.0:.7g}, "
+                  f"{frd_sdv} SDV block(s) in the .frd (before: {before})")
+        failures += 0 if res and ok else 1
 
     def disp_tables(dat):
         return ([(time, rows) for _, title, _s, time, rows in A.dat_blocks(dat)
@@ -6719,6 +6764,59 @@ def main():
               f"(before: ccx segfaulted in the *BUCKLE step)")
     elif all(runs):
         print("FAIL  elke_buckle: buckling factors missing")
+    failures += 0 if ok else 1
+    # ELKE after a *FREQUENCY step, which deactivates it in ccx for every later step (abq2ccx now
+    # writes the cards again in the dynamic step after it), and a *STATIC step after a *DYNAMIC and
+    # a *FREQUENCY step, which ccx runs linearly again (it segfaulted on ELKE there): the one-DOF
+    # cube's swing, kinetic energy, frequency and static deflection
+    half = math.pi / 100.0
+    for last in ("dynamic", "static"):
+        tag = f"elke_after_frequency_{last}"
+        res = review_run(elke_frequency_deck(last), tag, lambda dat: (
+            energy_tables(dat), dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")))
+        ok = False
+        if res:
+            tables, freqs = res
+            kin, disp = tables["kinetic energy"], tables["displacements"]
+            ferr = abs(freqs[0] * 2.0 * math.pi / 100.0 - 1.0) if freqs else math.inf
+            amp = next((u for t, u in reversed(disp) if t <= half * 1.0001), math.nan)
+            later = [(t, e) for t, e in kin if half * 1.0001 < t <= 2.0001 * half]
+            first = [(t, e) for t, e in kin if t <= half * 1.0001]
+            if last == "dynamic":
+                err = max((abs(e - 500.0 * amp ** 2 * math.sin(100.0 * (t - half)) ** 2) / (500.0 * amp ** 2)
+                           for t, e in later), default=math.inf)
+                swing = max((abs(u / amp - math.cos(100.0 * (t - half))) for t, u in disp
+                             if half * 1.0001 < t <= 2.0001 * half), default=math.inf)
+                ok = (len(later) >= 20 and bool(first) and err < 1e-2 and swing < 1e-2 and ferr < 1e-6
+                      and abs(amp / 2e-3 - 1.0) < 1e-2)
+                print(f"{'PASS' if ok else 'FAIL'}  {tag} (the one-DOF cube swung to {amp:.6g} in a "
+                      f"*DYNAMIC step printing ELKE, then a *FREQUENCY step, then let go in a *DYNAMIC "
+                      f"step carrying the request): f1 {freqs[0] if freqs else math.nan:.7g} vs 100 / 2 pi "
+                      f"({ferr:.1e} apart), {len(later)} kinetic energies within {err:.1e} of "
+                      f"k A^2 / 2 sin^2 100 t, the top within {swing:.1e} x A of A cos 100 t (before: "
+                      f"no kinetic energy after the *FREQUENCY step)")
+            else:
+                top = disp[-1][1] if disp else math.nan
+                ok = (bool(first) and not later and ferr < 1e-6 and abs(top / 1e-3 - 1.0) < 1e-6
+                      and abs(amp / 2e-3 - 1.0) < 1e-2)
+                print(f"{'PASS' if ok else 'FAIL'}  {tag} (the one-DOF cube swung to {amp:.6g} in a "
+                      f"*DYNAMIC step, then a *FREQUENCY and a *STATIC step under the load printing "
+                      f"ELKE): f1 {freqs[0] if freqs else math.nan:.7g} vs 100 / 2 pi ({ferr:.1e} apart), "
+                      f"the top at {top:.7g} vs u0 = 1e-3 (before: ccx segfaulted in the static step)")
+        failures += 0 if ok else 1
+    # Abaqus *CONTACT PRINT CFN for every contact pair (ccx stopped: 'no existing contact pair
+    # defined'): the rigid punch's total normal contact force against its reference node's force
+    res = review_run(contact_print_deck(), "contact_print_cfn", lambda dat: (
+        dat_tables(dat, "statistics"), dat_history(dat, "forces", "REF")))
+    ok = False
+    if res:
+        stats, rf = res
+        cfn = stats[-1][0][2] if stats and stats[-1] else math.nan
+        ref = rf[-1][1][0][2] if rf and rf[-1][1] else math.nan
+        ok = abs(ref) > 0.0 and abs(cfn / ref - 1.0) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  contact_print_cfn (a rigid flat punch pressed by 0.01, "
+              f"*CONTACT PRINT CFN, CPRESS for every pair): total normal contact force {cfn:.7g} vs "
+              f"the punch's reference-node force {ref:.7g} (before: ccx stopped reading the card)")
     failures += 0 if ok else 1
     # a SYMMETRIC layup's thickness in a tie to a rigid plate (counted half, ccx got the tie)
     strips = [review_run(tied_strip_deck(sym), "rigid_tie_symmetric_layup" + ("" if sym else "_ref"),

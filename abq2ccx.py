@@ -2822,14 +2822,23 @@ CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", 
 # CONTACT_OUTPUT_ISSUES.
 CCX_CONTACT_FILE_LABELS = {"CDIS", "CSTR", "CELS", "PCON"}
 ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
+# *CONTACT PRINT (probed on 2.23): CDIS, CSTR, CELS and CNUM for every contact element (the
+# first four characters compared: CDISP and CSTRESS too), and the whole-surface CF, CFN and CFS
+# (total force, its normal and shear parts, each with its moments, centre and contact area)
+# of the face-to-face pair its SLAVE and MASTER name — without them ccx stops ('no existing
+# contact pair defined'), on a node-to-surface pair it segfaults.  It skips an unknown label
+# with a warning.  Abaqus' CFT is ccx's CF; CFN1, ... are components of CFN, ...
+CCX_CONTACT_PRINT_LABELS = {"CDIS", "CSTR", "CELS", "CNUM"}
+CCX_CONTACT_SURFACE_LABELS = ("CF", "CFN", "CFS")
 # The output labels that make ccx compute element energies, per card (probed on 2.23); an
 # implicit *DYNAMIC and a transient (un)coupled temperature-displacement step do so whatever
 # they request.  In a nonlinear calculation ccx stops when that starts after the first step
 # (Converter._energy_from_step_one).
 CCX_ENERGY_LABELS = {"EL FILE": ("ENER",), "EL PRINT": ("ENER", "ELSE", "ELKE"),
                      "CONTACT FILE": ("CELS",), "CONTACT PRINT": ("CELS",)}
-# The procedures after which ccx 2.23 iterates every later step, as under NLGEOM (probed: a
-# *STATIC step after them is a nonlinear one), for Converter._el_print_stops.
+# The procedures after which ccx 2.23 iterates the later steps, as under NLGEOM, up to a
+# *FREQUENCY or *BUCKLE step (probed: a *STATIC step after them is a nonlinear one), for
+# Converter._ccx_linear_steps.
 CCX_NONLINEAR_AFTER_PROCS = {"DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT"}
 # The procedures in which ccx 2.23 has no nodal state variables (arpack.c, arpackbu.c and
 # steadystate.c never allocate them, nor does linstatic.c, which runs a linear *STATIC step),
@@ -2874,7 +2883,7 @@ CCX_EXPANDED_PREFIXES = ("B", "T2D", "T3D", "S3", "S4", "S6", "S8", "M3D", "CPS"
 CCX_SOLID_PREFIXES = ("C3D", "DC3D", "F3D")
 FRD_2D_EXACT_LABELS = {"U", "V", "RF", "PU"}
 OUTPUT_CARDS = {"NODE FILE", "EL FILE", "NODE PRINT", "EL PRINT", "NODE OUTPUT", "ELEMENT OUTPUT",
-                "CONTACT OUTPUT", "CONTACT FILE"}
+                "CONTACT OUTPUT", "CONTACT FILE", "CONTACT PRINT"}
 # Procedures without time increments: an output frequency means nothing there.
 UNTIMED_PROCS = {"FREQUENCY", "BUCKLE", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY", "GREEN",
                  "SUBSTRUCTURE GENERATE", "SENSITIVITY", "FEASIBLE DIRECTION", "NO ANALYSIS"}
@@ -4134,7 +4143,6 @@ class Converter:
         self._restore_yields = False                # a material yields or creeps
         self._eigen_since = False                   # ... and a *FREQUENCY step ran in ccx
         self._yield_segv: set = set()               # the steps where ccx then segfaults (_yield_segfaults)
-        self._cprint_cut: Dict[int, dict] = {}      # *CONTACT PRINT -> its labels left (_el_file_stops)
         # *MODAL DYNAMIC steps ccx starts from a deformed or moving model -> the step whose
         # end state that is, and those of them that keep the earlier loads (_plan_modal_starts)
         self._modal_moving: Dict[int, int] = {}
@@ -4742,11 +4750,6 @@ class Converter:
         with guidance.  This is the table-driven heart of 'support as many as
         possible, convert/flag the rest'."""
         kw = b.keyword
-        if id(b) in self._cprint_cut:       # in a modal or steady-state dynamics step (_el_file_stops)
-            r = self._cprint_cut[id(b)]
-            for w in r["warnings"]:
-                self.report.warn(w, once=True)
-            return [emit_keyword(kw, b.params)] + ([", ".join(r["labels"])] if r["labels"] else [])
         if kw == "FILTER" and not self._has_sensitivity:
             # Abaqus *FILTER is an output filter (anti-aliasing / HALT on a limit); ccx's
             # *FILTER smooths sensitivities and is an error outside a *SENSITIVITY run
@@ -11450,6 +11453,8 @@ class Converter:
         p = self._out_plan[id(b)]
         if p["cc"] == "CONTACT FILE":
             self._contact_card(p.get("src", b), self.report)
+        elif p["cc"] == "CONTACT PRINT":
+            self._contact_print_card(p.get("src", b), self.report)
         elif p["cc"]:
             self._output_card(p.get("src", b), p["cc"], self.report)
         return self._anchored_output(b, p)
@@ -11636,6 +11641,71 @@ class Converter:
             labels = ["CDIS", "CSTR"]
         return keep, dedup(labels)
 
+    def _contact_print_card(self, b: Block, report: "Report"):
+        """``*CONTACT PRINT`` against ccx's labels (CCX_CONTACT_PRINT_LABELS): (parameters,
+        the labels printed for every contact element — None when nothing of the card is left —,
+        [(parameters, labels)] for its whole-surface labels: one card per face-to-face ccx
+        contact pair it covers).  Abaqus prints CPRESS, CSHEAR, COPEN and CSLIP for a card
+        without variables (ccx's CSTR and CDIS), and whole-surface variables for every contact
+        pair when the card names no surface (for those of its SLAVE or MASTER when it names
+        one); SLAVE, MASTER and NSET select no contact elements in ccx."""
+        for k, v in b.params.items():
+            if k not in ("FREQ", "FREQUENCY", "TIME POINTS", "SLAVE", "MASTER"):
+                report.note(f"*CONTACT PRINT parameter {k} dropped (ccx prints every contact "
+                            f"element, without column totals or summary).", once=True)
+        node: List[str] = []
+        whole: List[str] = []
+        given = [x.strip().upper() for rec in merged_data_records(b) for x in rec if x.strip()]
+        for v in given:
+            m = re.fullmatch(r"(CF[NST])[123]", v)
+            lab = m.group(1) if m else v
+            lab = "CF" if lab == "CFT" else lab
+            if lab != v:
+                report.note(f"Contact print variable {v} -> {lab} (ccx's whole-surface "
+                            f"{'total force' if lab == 'CF' else lab}, all components).", once=True)
+            if lab in CCX_CONTACT_SURFACE_LABELS:
+                whole.append(lab)
+            elif ccx_label_ok(lab, CCX_CONTACT_PRINT_LABELS):
+                node.append(lab[:4])
+            else:
+                report.note(f"Contact print variable {v} dropped (ccx 2.23 prints CSTR — pressure "
+                            f"and shear —, CDIS — opening and slip —, CELS and CNUM, and per contact "
+                            f"pair CF, CFN and CFS with their moments, centre and contact area).",
+                            once=True)
+        if not given:
+            node = ["CDIS", "CSTR"]
+            report.note("*CONTACT PRINT without variables -> CDIS, CSTR (Abaqus prints CPRESS, "
+                        "CSHEAR, COPEN and CSLIP).", once=True)
+        if node and (b.has("SLAVE") or b.has("MASTER")):
+            report.note(f"*CONTACT PRINT {', '.join(dedup(node))}: ccx prints every contact "
+                        f"element (Abaqus those of the SLAVE / MASTER named).", once=True)
+        cards: List[tuple] = []
+        if whole:
+            slave, master = b.uparam("SLAVE"), b.uparam("MASTER")
+            pairs = [p for p in self._out_contact["pair_list"]
+                     if slave in ("", p[0].upper()) and master in ("", p[1].upper())]
+            for s, m, face in pairs:
+                if face:
+                    cards.append((OrderedDict([("SLAVE", s), ("MASTER", m)]), dedup(whole)))
+            what = f"*CONTACT PRINT {', '.join(dedup(whole))}"
+            if not pairs:
+                report.note(f"{what} dropped: no ccx contact pair "
+                            f"{'of these surfaces ' if slave or master else ''}(ccx stops: 'no "
+                            f"existing contact pair defined').", once=True)
+            elif len(cards) < len(pairs):
+                report.note(f"{what} left out for node-to-surface contact pairs: ccx 2.23 prints "
+                            f"them for face-to-face pairs only and segfaults on the others.", once=True)
+            if cards and not (slave and master):
+                report.note(f"{what} -> one card per face-to-face contact pair, with its SLAVE and "
+                            f"MASTER (ccx prints them for the pair named; Abaqus for every pair the "
+                            f"card covers).", once=True)
+        if not node and not cards:
+            if given:
+                report.note("*CONTACT PRINT: none of its variables can be printed by ccx; card "
+                            "dropped.", once=True)
+            return OrderedDict(), None, []
+        return OrderedDict(), dedup(node), cards
+
     def _emit_output_cards(self, cards: List[tuple], out2d: bool = False) -> List[str]:
         """Write ``cards`` [(keyword, params, labels)].  The first output card of a step
         carries the step's output control when ccx would otherwise keep another one (ccx
@@ -11710,7 +11780,12 @@ class Converter:
             # elements whose expanded nodes only a 3-D .frd (a beam or shell model) holds
             "flat": not frd3d and any(c.startswith(PLANE_ELEM_PREFIXES + ("M3D",))
                                       for c in types.values()),
-            "axi": any(c.startswith("CAX") for c in types.values())}
+            "axi": any(c.startswith("CAX") for c in types.values()),
+            # (slave, master, face-to-face) of each ccx contact pair, for *CONTACT PRINT
+            "pair_list": [(f[0].strip(), f[1].strip(),
+                           (b.param("TYPE") or "").upper().replace(" ", "") == "SURFACETOSURFACE")
+                          for b in pairs for f in merged_data_records(b) if len(f) > 1 and
+                          not {f[0].strip().upper(), f[1].strip().upper()} & set(self._analytic_skipped)]}
         steps = self._step_output_requests(blocks, quiet)
         self._contact_requests_checked(steps)
         self._join_frd_sets(steps)
@@ -11807,11 +11882,6 @@ class Converter:
                     r = self._output_request(src, ctx, timing, quiet)
                     r["anchor"] = x
                     reqs.append(r)
-                elif x.keyword == "CONTACT PRINT":
-                    # passed through as it stands; its CELS makes ccx compute energies
-                    # (_energy_from_step_one)
-                    timing.setdefault("contact_print", []).extend(
-                        v.strip().upper() for rec in merged_data_records(x) for v in rec if v.strip())
             if odb and not add:
                 carried[pert] = own
             else:
@@ -11928,8 +11998,6 @@ class Converter:
             why = [f"step {k}, {timing['energy']},"] if timing.get("energy") else []
             why += [f"step {k}'s *{r['cc']} {lab} request" for r in reqs if r["live"]
                     for lab in r["labels"] if lab[:4] in CCX_ENERGY_LABELS.get(r["cc"], ())]
-            why += [f"step {k}'s *CONTACT PRINT {lab} request" for lab in timing.get("contact_print", ())
-                    if lab[:4] in CCX_ENERGY_LABELS["CONTACT PRINT"]]
             if why:
                 break
         else:
@@ -11966,40 +12034,64 @@ class Converter:
                 "covered": [], "set": None, "ctl": None, "default": True, "live": True,
                 "anchor": anchor}
 
+    # what makes ccx 2.23 run a step linearly (_ccx_linear_steps), for the notes
+    _LINEAR_STEP_WHY = ("no NLGEOM, no plastic, creeping, hyperelastic or user material, no "
+                        "dynamic, heat transfer or coupled step before, or since a *FREQUENCY or "
+                        "*BUCKLE step")
+
+    def _ccx_linear_steps(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
+                          groups: List[List[Block]]) -> List[bool]:
+        """Per step, whether ccx 2.23 runs it linearly (linstatic.c: no kinetic energies, no
+        nodal state variables): a *STATIC or *VISCO step, or one without a ccx procedure —
+        Riks too, commented out or (--approximate) a plain *STATIC —, with no NLGEOM in it or
+        an earlier step (_nlgeom_steps; handle_step writes it again after a *FREQUENCY or
+        *BUCKLE step, where ccx forgets it), no material ccx iterates (a kept *PLASTIC,
+        *CREEP, CCX_ITERATED_MATERIALS) and no step after which ccx iterates every step
+        (CCX_NONLINEAR_AFTER_PROCS) since the last *FREQUENCY or *BUCKLE step, after which ccx
+        runs a *STATIC step linearly again (probed).  Contact makes ccx iterate too, but the
+        converter cannot tell whether ccx keeps a contact pair, so a contact model counts as
+        linear."""
+        iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
+        on = self._nlgeom_steps(blocks)
+        linear: List[bool] = []
+        nlgeom = after = False
+        for (_k, timing, _reqs), group in zip(steps, groups):
+            nlgeom = nlgeom or id(group[0]) in on
+            linear.append(timing["proc"] in (None, "STATIC", "VISCO") and
+                          not (nlgeom or after or iterated))
+            if timing["proc"] in CCX_NONLINEAR_AFTER_PROCS:
+                after = True
+            elif timing["proc"] in ("FREQUENCY", "BUCKLE"):
+                after = False
+        return linear
+
     def _el_print_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
                         groups: List[List[Block]]) -> None:
         """Keep *EL PRINT ELKE (element kinetic energy) out of the steps where ccx 2.23
         segfaults computing it (probed, with or without *DENSITY, also under TOTALS=ONLY): a
-        *BUCKLE step, and a *STATIC or *VISCO step (or one without a ccx procedure) that ccx
-        runs linearly — no NLGEOM in it or an earlier step, no material ccx iterates (a kept
-        *PLASTIC, *CREEP, CCX_ITERATED_MATERIALS) and no earlier step after which ccx iterates
-        every step (CCX_NONLINEAR_AFTER_PROCS).  Such a step has no kinetic energy.  Contact
-        makes ccx iterate too, but the converter cannot tell whether ccx keeps a contact pair,
-        so ELKE goes there as well.  It runs in every other step (ccx itself deactivates it in
-        a *FREQUENCY step, with a warning).
+        *BUCKLE step, and a step ccx runs linearly (_ccx_linear_steps), which has no kinetic
+        energy.  It runs in every other step; in a *FREQUENCY step ccx deactivates it, with a
+        warning, for that and every later step until it is requested again (probed).
 
         ccx keeps a step's *EL PRINT cards in the next steps that give none, as Abaqus does: a
         step of the first kind without one gets the carried cards again without ELKE (one
         without labels if none is left, which clears them), and the next step without one
-        where ELKE runs gets the cards Abaqus carries into it again."""
+        where ELKE runs gets the cards Abaqus carries into it again — also where ccx carries
+        them, but with ELKE deactivated by a *FREQUENCY step."""
         if len(groups) < len(steps):
             return
-        iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
-        nonlinear, on = False, self._nlgeom_steps(blocks)
+        linear = self._ccx_linear_steps(blocks, steps, groups)
         # the *EL PRINT cards [(params, labels)] Abaqus and ccx carry into a step, and the steps
-        # that gave them
+        # that gave them; the *FREQUENCY step that deactivated ELKE in ccx's
         abq: list = []
         held: list = []
-        abq_k = held_k = 0
-        for (k, timing, reqs), group in zip(steps, groups):
-            nonlinear = nonlinear or id(group[0]) in on
+        abq_k = held_k = off_k = 0
+        for (k, timing, reqs), group, lin in zip(steps, groups, linear):
             proc = timing["proc"]
-            stops = proc == "BUCKLE" or (proc in (None, "STATIC", "VISCO") and
-                                         not (nonlinear or iterated))
+            stops = proc == "BUCKLE" or lin
             kind = ("a *BUCKLE step" if proc == "BUCKLE" else
-                    f"a linear {'*' + proc if proc else 'static'} step (no NLGEOM, no plastic, "
-                    f"creeping, hyperelastic or user material, no dynamic, heat transfer or coupled "
-                    f"step before)")
+                    f"a linear {'*' + proc if proc else 'static'} step ({self._LINEAR_STEP_WHY})")
+            elke = any(lab[:4] == "ELKE" for _p, labels in abq for lab in labels)
             own = [r for r in reqs if r["live"] and r["cc"] == "EL PRINT"]
             add: List[dict] = []
             if own:
@@ -12020,16 +12112,22 @@ class Converter:
                     f"{'' if add[0]['labels'] else ' (as one without labels, which clears them)'}: "
                     f"ccx would carry ELKE into {kind}, where ccx 2.23 segfaults computing element "
                     f"kinetic energies.")
-            elif not stops and proc != "FREQUENCY" and held != abq:
+            elif not stops and proc != "FREQUENCY" and (held != abq or off_k and elke):
                 add = [self._added_el_file(OrderedDict(p), list(labels), group[0], "EL PRINT")
                        for p, labels in abq]
                 add[0]["notes"].append(
                     f"Step {abq_k}'s *EL PRINT cards written again in step {k}: Abaqus carries them "
-                    f"into it, ELKE included; ccx would carry step {held_k}'s, written without ELKE.")
+                    f"into it, ELKE included; " + (
+                        f"ccx deactivates ELKE in the *FREQUENCY step {off_k} for every later step "
+                        f"until it is requested again." if off_k else
+                        f"ccx would carry step {held_k}'s, written without ELKE."))
             if add:
                 reqs.extend(add)
                 held, held_k = [(r["params"], list(r["labels"])) for r in add], k
-            nonlinear = nonlinear or proc in CCX_NONLINEAR_AFTER_PROCS
+            if own or add:
+                off_k = 0
+            if proc == "FREQUENCY" and any(lab[:4] == "ELKE" for _p, labels in held for lab in labels):
+                off_k = k
 
     def _el_file_stops(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]],
                        groups: List[List[Block]]) -> None:
@@ -12042,14 +12140,13 @@ class Converter:
           which U1 is never in); *EL PRINT writes them;
         * SDV in a model with state variables (*DEPVAR, a plastic or creeping material) in a
           step ccx runs without nodal state variables (NO_NODAL_SDV_PROCS), where it
-          segfaults: a linear *STATIC step — no NLGEOM from this or an earlier step, no RIKS,
-          and no material ccx iterates (a kept *PLASTIC, *CREEP, CCX_ITERATED_MATERIALS) —,
-          *STEADY STATE DYNAMICS, and *FREQUENCY / *BUCKLE, where ccx skips an SDV request of
-          the step's own ('does not make sense') but not one carried over from an earlier
-          step.  In a linear static step no material changes the state variables;
+          segfaults: a step ccx runs linearly (_ccx_linear_steps; also *VISCO and
+          --approximate's Riks *STATIC, probed), *STEADY STATE DYNAMICS, and *FREQUENCY /
+          *BUCKLE, where ccx skips an SDV request of the step's own ('does not make sense') but
+          not one carried over from an earlier step.  In a linear step no material changes the
+          state variables;
         * element and contact output and RF in a *MODAL DYNAMIC or *STEADY STATE DYNAMICS step
-          of a model with a plastic or creeping material (_modal_result_stops; a passed-through
-          *CONTACT PRINT is cut in passthrough).
+          of a model with a plastic or creeping material (_modal_result_stops).
 
         ccx keeps an *EL FILE in the next steps that give none, so a step of the second kind
         without an *EL FILE gets an empty one where ccx would carry SDV into it: Abaqus writes
@@ -12058,28 +12155,17 @@ class Converter:
         state = self._out_yields or any(n > 0 for n in self._depvar_counts)
         if not (u1 or state) or len(groups) < len(steps):
             return
-        iterated = self._out_yields or any(b.keyword in CCX_ITERATED_MATERIALS for b in blocks)
-        nlgeom = False
         held: List[str] = []                # the *EL FILE labels ccx carries into a step
         carried: Dict[str, List[dict]] = {}     # output card -> the requests ccx carries
-        on = self._nlgeom_steps(blocks)
-        for (k, timing, reqs), group in zip(steps, groups):
-            nlgeom = nlgeom or any(id(b) in on for b in group if b.keyword == "STEP")
-            proc = next((x for x in group[1:] if x.keyword in PROC_KW), None)
-            linear = timing["proc"] == "STATIC" and not (nlgeom or iterated or proc.has("RIKS"))
+        for (k, timing, reqs), group, linear in zip(steps, groups,
+                                                    self._ccx_linear_steps(blocks, steps, groups)):
             sdv = state and (linear or timing["proc"] in NO_NODAL_SDV_PROCS)
-            where = ("a linear *STATIC step (no NLGEOM, no plastic, creeping, hyperelastic or "
-                     "user material)" if linear else f"a *{timing['proc']} step")
-            # a *CONTACT PRINT is passed through: the same record, for passthrough to cut
-            prints = [dict(self._added_el_file(OrderedDict(), [x.strip() for rec in
-                                                              merged_data_records(b) for x in rec
-                                                              if x.strip()], b, "CONTACT PRINT"),
-                           b=b, default=False) for b in group if b.keyword == "CONTACT PRINT"]
+            where = (f"a linear {'*' + timing['proc'] if timing['proc'] else 'static'} step "
+                     f"({self._LINEAR_STEP_WHY})" if linear else f"a *{timing['proc']} step")
             if self._out_yields and timing["proc"] in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS"):
-                self._modal_result_stops(k, timing["proc"], reqs, carried, group[0], prints)
-                self._cprint_cut.update((id(r["b"]), r) for r in prints if r["warnings"])
+                self._modal_result_stops(k, timing["proc"], reqs, carried, group[0])
             for cc in self._MODAL_STOPS:
-                carried[cc] = [r for r in reqs + prints if r["live"] and r["cc"] == cc] or \
+                carried[cc] = [r for r in reqs if r["live"] and r["cc"] == cc] or \
                     carried.get(cc, [])
             files = [r for r in reqs if r["live"] and r["cc"] == "EL FILE"]
             if sdv and not files and any(lab[:3] == "SDV" for lab in held):
@@ -12124,16 +12210,15 @@ class Converter:
                     "CONTACT PRINT": ("CDIS", "CSTR", "CELS")}
 
     def _modal_result_stops(self, k: int, proc: str, reqs: List[dict],
-                            carried: Dict[str, List[dict]], anchor: Block,
-                            passed: Sequence[dict] = ()) -> None:
+                            carried: Dict[str, List[dict]], anchor: Block) -> None:
         """Step ``k``'s output that ccx cannot compute left out (_MODAL_STOPS, _el_file_stops):
-        its own cards (``passed``: passed-through ones) lose those labels (a card left with
-        none is written bare), and a bare card is added to ``reqs`` where ccx would carry them
-        in from an earlier step (a bare card ends the earlier selections, probed)."""
+        its own cards lose those labels (a card left with none is written bare), and a bare
+        card is added to ``reqs`` where ccx would carry them in from an earlier step (a bare
+        card ends the earlier selections, probed)."""
         why = (f"ccx 2.23 segfaults computing element or contact results in a *{proc} step of "
                f"a model with a plastic or creeping material (probed)")
         for cc, only in self._MODAL_STOPS.items():
-            own = [r for r in list(reqs) + list(passed) if r["live"] and r["cc"] == cc]
+            own = [r for r in reqs if r["live"] and r["cc"] == cc]
             for r in own:
                 gone = [lab for lab in r["labels"] if only is None or lab[:4].upper() in only]
                 if not gone:
@@ -12168,20 +12253,24 @@ class Converter:
         sub = b.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
         ctx = ctx if sub else None
         cc = self._output_route(b, ctx)
+        surface: List[tuple] = []
         if cc == "CONTACT FILE":
             params, labels = self._contact_card(b, quiet)
+        elif cc == "CONTACT PRINT":
+            params, labels, surface = self._contact_print_card(b, quiet)
         else:
             params, labels = self._output_card(b, cc, quiet)
         ctl, default = self._requested_control(b, ctx, timing)
         r = {"b": b, "cc": cc, "params": params, "labels": labels, "notes": [], "warnings": [],
              "frd": cc in ("NODE FILE", "EL FILE", "CONTACT FILE"), "frd_sets": [], "covered": [],
              "set": (params.get("NSET") or "").strip().upper() or None if cc == "NODE FILE" else None,
-             "ctl": ctl, "default": default, "live": labels is not None and ctl[0] != "OFF"}
+             "ctl": ctl, "default": default, "live": labels is not None and ctl[0] != "OFF",
+             "surface": surface}
         if labels is not None and ctl[0] == "OFF":
             r["notes"].append(f"*{b.keyword} with {ctl[1]}=0 dropped (output suppressed)." if ctx is None
                               else f"*OUTPUT with {ctl[1]}=0: Abaqus writes none of its requests; "
                                    f"*{b.keyword} dropped.")
-        if r["live"] and cc == "CONTACT FILE" and not self._out_contact["pairs"]:
+        if r["live"] and cc in ("CONTACT FILE", "CONTACT PRINT") and not self._out_contact["pairs"]:
             r["live"] = False               # see _contact_requests_checked
             r["notes"].append(f"*{b.keyword} dropped: {CONTACT_OUTPUT_ISSUES['nopair']}.")
         if r["live"] and cc in ("NODE PRINT", "EL PRINT") and sub:
@@ -12373,6 +12462,9 @@ class Converter:
         lacks those nodes as well."""
         if not r["live"]:
             return []
+        if r["cc"] == "CONTACT PRINT":      # and its whole-surface cards (_contact_print_card)
+            return [(r["cc"], r["params"], r["labels"])] * bool(r["labels"] or r.get("bare")) + \
+                [(r["cc"], p, labels) for p, labels in r.get("surface", ())]
         if r["cc"] != "NODE FILE" or r.get("bare"):
             return [(r["cc"], r["params"], r["labels"])]
         cards: List[tuple] = []
