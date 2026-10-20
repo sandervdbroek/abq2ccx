@@ -413,6 +413,9 @@ def ccx_type(typ: str) -> str:
 
 SHELL_TYPES = {t for t in ELEMENT_NNODES if (t[0] == "S" and not t.startswith("SPRING")) or t.startswith("DS")}
 BEAM_TYPES = {t for t in ELEMENT_NNODES if t[0] == "B" or t.startswith(("T2D", "T3D", "PIPE"))}
+# beams in space, whose element line may end with one more node, the n1 direction from their
+# first node (Abaqus 2017 "Beam element cross-section orientation")
+ORIENTATION_NODE_BEAMS = {t for t in BEAM_TYPES if t.startswith(("B3", "PIPE3"))}
 COMPOSITE_SHELL_OK = {"S6", "S8R"}  # CalculiX restricts composite shells to these
 SHEET_SHELLS = {"S3", "S4", "S4R", "S6", "S8", "S8R"}   # the shells ccx expands (not SC6R / SC8R)
 # ccx 2.23 stops on *SHELL SECTION, COMPOSITE on any other shell ('*ERROR reading *SHELL
@@ -661,14 +664,15 @@ def arbitrary_section(recs: List[List[str]]) -> Union[BeamSection, str]:
 
 def beam_n1_line(b: "Block") -> Optional[int]:
     """The index in ``b.data`` of the n1 line of a *BEAM SECTION / *BEAM GENERAL SECTION card,
-    or None when it has none.  Blank data lines are not kept, so a blank (default) n1 line is
-    not in ``b.data`` and the lines are counted: the geometry (an ARBITRARY profile's segment
-    lines, a TAPER section's two lines; a MESHED section starts with n1), the n1 line, then a
-    general section's line of E, G, ...  (A general section with temperature-dependent moduli
-    has several such lines: it reads as having none.)"""
+    or None when it has none.  The lines are counted: the geometry (an ARBITRARY profile's
+    segment lines, a TAPER section's two lines; a MESHED section starts with n1), the n1 line,
+    then a general section's line of E, G, ...  A *BEAM SECTION keeps a blank n1 line before
+    its integration-point line (read_blocks: the line "", the default n1); a general section's
+    blank n1 line is not kept, so it reads as having none.  (A general section with
+    temperature-dependent moduli has several E, G lines: it reads as having none.)"""
     sec = (b.param("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION" else "")
            ).strip().upper()
-    data = [ln for ln in b.data if ln.strip()]
+    data = b.data if b.keyword == "BEAM SECTION" else [ln for ln in b.data if ln.strip()]
     geo = 1
     if sec == "ARBITRARY":
         try:
@@ -682,6 +686,16 @@ def beam_n1_line(b: "Block") -> Optional[int]:
     if b.keyword == "BEAM GENERAL SECTION" and sec != "NONLINEAR GENERAL":
         return geo if len(data) == geo + 2 else None
     return geo if len(data) > geo else None
+
+
+def beam_section_n1(b: "Block") -> Tuple[float, float, float]:
+    """The approximate n1 direction of a *BEAM SECTION / *BEAM GENERAL SECTION card: its n1
+    line (beam_n1_line) read by position, a blank or left-out field 0 (``0., 1.`` is (0, 1,
+    0)); (0, 0, -1), the Abaqus default, without one or where it is blank or zero.
+    ValueError where a field is not a number."""
+    at = beam_n1_line(b)
+    v = tuple(fields_at(b.data[at].split(","), 3)) if at is not None else (0.0, 0.0, 0.0)
+    return v if any(v) else (0.0, 0.0, -1.0)
 
 
 def beam_section_properties(section: str, recs: List[List[str]]) -> Union[BeamSection, str]:
@@ -1595,36 +1609,44 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
         done = j
     kept.extend(lines[done:])
 
-    if raw_defs:                            # resolve, iterating to handle forward references
+    if raw_defs:
+        # Abaqus evaluates the definitions in order ("Parametric modeling": x = 2, y = x + 3,
+        # x = 4 gives x = 4, y = 5), so a name defined again takes its last value; a definition
+        # that names one defined further down is tried again after the pass (Abaqus stops on
+        # it), until no more resolve
         user_names = {nm for nm, _ in raw_defs}
-        unresolved: set = set()
+        last = {nm: i for i, (nm, _) in enumerate(raw_defs)}
         floored: List[Tuple[str, Tuple[int, int]]] = []     # names whose / divides two ints
+        # math constants are visible, but a user parameter of the same name (e.g. a deck
+        # that defines ``pi``) always wins — never shadowed.
+        ns: Dict[str, object] = {k: v for k, v in _PARAM_EVAL_CONSTS.items() if k not in user_names}
+        ns.update({k: v for k, v in params.items() if not isinstance(v, str)})
+        todo = list(range(len(raw_defs)))
         for _ in range(len(raw_defs) + 1):
-            progressed = False
-            # math constants are visible, but a user parameter of the same name
-            # (e.g. a deck that defines ``pi``) always wins — never shadowed.
-            ns: Dict[str, object] = {k: v for k, v in _PARAM_EVAL_CONSTS.items() if k not in user_names}
-            ns.update({k: v for k, v in params.items() if not isinstance(v, str)})
-            for name, expr in raw_defs:
-                if name in params and not isinstance(params[name], str):
-                    continue
+            progressed, left = False, []
+            for i in todo:
+                name, expr = raw_defs[i]
                 divs: List[Tuple[int, int]] = []
                 try:
                     val = _safe_eval_param(expr, ns, divs)
-                    floored += [(name, divs[0])] if divs else []
-                    params[name] = val
-                    ns[name] = val          # visible to later defs resolved in this same pass
-                    progressed = True
-                    unresolved.discard(name)
                 except (ValueError, ArithmeticError, TypeError, SyntaxError, RecursionError,
                         MemoryError):   # (ast.parse: "-" * 6000 + "1" overflows its stack)
-                    # unresolved (maybe a forward reference)
-                    params.setdefault(name, expr)
-                    unresolved.add(name)
-            if not progressed:
+                    if i == last[name]:     # unresolved (maybe a forward reference)
+                        left.append(i)
+                    continue
+                floored += [(name, divs[0])] if divs else []
+                ns[name] = val              # visible to the definitions after it
+                if i == last[name]:
+                    params[name] = val
+                    progressed = True
+            todo = left
+            if not progressed or not todo:
                 break
-        bad = [nm for nm, _ in raw_defs if nm in unresolved]
-        report.note(f"*PARAMETER: resolved {len(raw_defs) - len(bad)} parameter(s) and substituted "
+        unresolved = {raw_defs[i][0] for i in todo}
+        for nm in unresolved:
+            params[nm] = dict(raw_defs)[nm]     # substituted as written
+        bad = sorted(unresolved, key=last.get)
+        report.note(f"*PARAMETER: resolved {len(last) - len(bad)} parameter(s) and substituted "
                     "<name> tokens (ccx has no *PARAMETER).", once=True)
         if floored:
             nm, (a, b) = floored[0]
@@ -1711,23 +1733,26 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
     CalculiX (and ``parse_keyword_line``) expect all parameters on one physical line,
     so we merge them.  Only a line that starts with ``*`` (a keyword, not a ``**``
     comment) initiates a merge, and only a following line that *looks like parameters*
-    is consumed: it must contain ``=`` (``KEY=VALUE``) or be one of the bare parameter
-    flags below.  This is what distinguishes a continuation from a genuine data record
-    — so a stray trailing comma on a ``*NODE,`` / ``*ELEMENT, TYPE=C3D8,`` header does
-    NOT swallow the first data line (which would silently drop a node/element).
-    Comment / blank lines between the keyword and its continuation are skipped (Abaqus
-    allows them)."""
+    is consumed: it must contain ``=`` (``KEY=VALUE``) or name only parameters of the
+    keyword (ABAQUS_PARAMS, spelled in full; the flags below for a keyword it lacks).
+    This is what distinguishes a continuation from a genuine data record — so a stray
+    trailing comma on a ``*NODE,`` / ``*ELEMENT, TYPE=C3D8,`` header does NOT swallow
+    the first data line (which would silently drop a node/element).  Comment / blank
+    lines between the keyword and its continuation are skipped (Abaqus allows them)."""
     bare_flags = {"GENERATE", "GEN", "SHIFT", "UNSORTED", "REFLECT", "INTERNAL", "ROUGH",
                   "NLGEOM", "PERTURBATION", "PERT", "EXPLICIT", "DIRECT", "RIKS",
                   "STEADY STATE", "SMALL SLIDING", "TIED", "COMPOSITE", "SYMMETRIC",
                   "NEO HOOKE", "MOONEY-RIVLIN", "POLYNOMIAL", "REDUCED POLYNOMIAL", "OGDEN",
                   "YEOH", "ARRUDA-BOYCE"}
 
-    def is_params(text: str) -> bool:
+    def is_params(text: str, keyword: str) -> bool:
         if "=" in text:
             return True
         toks = [_param_name(t) for t in text.split(",") if t.strip()]
-        return bool(toks) and all(t in bare_flags for t in toks)
+        table = ABAQUS_PARAMS.get(keyword)
+        names = bare_flags if table is None else \
+            {n.replace(" ", "") for n in table} | {n.replace(" ", "") for n in bare_flags}
+        return bool(toks) and all(t.replace(" ", "") in names for t in toks)
 
     out: List[str] = []
     n = len(lines)
@@ -1743,6 +1768,8 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
         out.extend(lines[done:k])
         i = k
         acc = line.rstrip()
+        keyword = " ".join(s.split(",")[0].lstrip("*").split()).upper() if acc.endswith(",") else ""
+        keyword = canonical_keyword(KEYWORD_ALIASES.get(keyword, keyword))
         while acc.endswith(","):
             j = i + 1                            # skip blank / comment lines
             while j < n and (not lines[j].strip() or lines[j].strip().startswith("**")):
@@ -1750,7 +1777,7 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
             if j >= n:
                 break
             nxt = lines[j].strip()
-            if nxt.startswith("*") or not is_params(nxt):   # next keyword or a data line
+            if nxt.startswith("*") or not is_params(nxt, keyword):   # next keyword or a data line
                 break
             acc = acc + " " + nxt
             i = j
@@ -1867,9 +1894,10 @@ def read_blocks(path: str, report: Report) -> List[Block]:
     orphans: List[str] = []
     # a *SURFACE whose only data line is blank: Abaqus/Explicit's surface of every exterior
     # face of the model (Keywords Reference *SURFACE), kept as the data line "" for
-    # Converter._free_face_surfaces; and a *SPRING's / *DASHPOT's blank first line, its DOF line
-    # (blank for SPRINGA / DASHPOTA), kept as "" for handle_spring / handle_dashpot (any other
-    # blank line is skipped)
+    # Converter._free_face_surfaces; a *SPRING's / *DASHPOT's blank first line, its DOF line
+    # (blank for SPRINGA / DASHPOTA), kept as "" for handle_spring / handle_dashpot; and a
+    # *BEAM SECTION's blank line between data lines, its default n1 line before the
+    # integration-point line (beam_n1_line; any other blank line is skipped)
     blank: Optional[Block] = None
 
     def data_lines(run: List[str]) -> None:
@@ -1881,6 +1909,10 @@ def read_blocks(path: str, report: Report) -> List[Block]:
             if current is not None and current.keyword in ("SPRING", "DASHPOT") and \
                     not current.data and not run[0].strip():
                 vals.insert(0, "")
+            elif current is not None and current.keyword == "BEAM SECTION" and len(vals) < len(run):
+                s = [x.strip() for x in run]
+                last = max(i for i, x in enumerate(s) if x)
+                vals = s[0 if current.data else s.index(vals[0]):last + 1]
             (orphans if current is None else current.data).extend(vals)
         elif run and current is not None and current.keyword == "SURFACE" and not current.data:
             blank = current
@@ -2160,6 +2192,9 @@ class Geometry:
         self.nsets: Dict[str, List[int]] = {}
         self.elsets: Dict[str, List[int]] = {}
         self.unsorted: set = set()          # node sets declared UNSORTED (keep listing order)
+        # a beam in space -> the extra node on its element line, which gives its n1 direction
+        # (Converter._onode_n1); not in its connectivity
+        self.onodes: Dict[int, int] = {}
 
     # -- nodes / elements ---------------------------------------------------
     def add_node(self, nid: int, xyz: Tuple[float, float, float]) -> None:
@@ -2167,6 +2202,8 @@ class Geometry:
 
     def add_element(self, eid: int, typ: str, conn: List[int]) -> None:
         self.elements[eid] = (typ, conn)
+        if self.onodes:
+            self.onodes.pop(eid, None)
 
     # -- sets ---------------------------------------------------------------
     def add_to_nset(self, name: str, ids: Sequence[int]) -> None:
@@ -3348,6 +3385,7 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
             report.warn(f"*ELGEN master element {master} not defined; skipped.")
             continue
         typ, conn = geom.elements[master]
+        onode = geom.onodes.get(master)             # (a beam's n1 node is generated too)
         # nested loops over the three generation directions
         ranges = [range(t[0]) for t in triples]
         for k in ranges[2]:
@@ -3360,14 +3398,32 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
                     else:
                         new_conn = [c + noff for c in conn]
                     geom.add_element(eid, typ, new_conn)
+                    if onode is not None:
+                        geom.onodes[eid] = onode + noff
                     created.append(eid)
     if elset:
         geom.add_to_elset(elset, created)
     return created
 
 
+# *ELCOPY, REFLECT: the node order of a copied continuum element, by (dimension, node count),
+# reversed about its first node as Abaqus documents it for a quadrilateral (1, 2, 3, 4 ->
+# 1, 4, 3, 2: "Element definition", copying elements), each midside node following its edge
+ELCOPY_REFLECT_ORDER = {
+    (2, 3): (0, 2, 1), (2, 4): (0, 3, 2, 1), (2, 6): (0, 2, 1, 5, 4, 3),
+    (2, 8): (0, 3, 2, 1, 7, 6, 5, 4),
+    (3, 4): (0, 2, 1, 3), (3, 10): (0, 2, 1, 3, 6, 5, 4, 7, 9, 8),
+    (3, 6): (0, 2, 1, 3, 5, 4), (3, 15): (0, 2, 1, 3, 5, 4, 8, 7, 6, 11, 10, 9, 12, 14, 13),
+    (3, 8): (0, 3, 2, 1, 4, 7, 6, 5),
+    (3, 20): (0, 3, 2, 1, 4, 7, 6, 5, 11, 10, 9, 8, 15, 14, 13, 12, 16, 19, 18, 17)}
+CONTINUUM_2D_PREFIXES = ("CPS", "CPE", "CAX", "CGAX", "CGPE", "DC2D", "DCAX", "AC2D", "ACAX")
+CONTINUUM_3D_PREFIXES = ("C3D", "DC3D", "AC3D")
+
+
 def expand_elcopy(block: Block, geom: Geometry, report: Report) -> List[int]:
-    """``*ELCOPY`` -> copy an element set with element- and node-number shifts."""
+    """``*ELCOPY`` -> copy an element set with element- and node-number shifts; with REFLECT
+    the copies' node order reversed (ELCOPY_REFLECT_ORDER), which a copy mirrored by *NCOPY,
+    REFLECT needs (else it is inside out)."""
     try:
         eshift = pint(block.param("ELEMENT SHIFT") or 0)
         nshift = pint(block.param("SHIFT NODES") or 0)
@@ -3379,16 +3435,45 @@ def expand_elcopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     if not old:
         report.warn("*ELCOPY without OLD SET ignored.")
         return []
+    reflect = block.has("REFLECT")
     created: List[int] = []
+    kept: Dict[str, bool] = {}                  # type -> a continuum element (else not one)
+    flipped = 0
     for eid in list(geom.elset(old)):
         if eid not in geom.elements:
             continue
         typ, conn = geom.elements[eid]
+        conn = [c + nshift for c in conn]
+        if reflect:
+            dim = 3 if typ.upper().startswith(CONTINUUM_3D_PREFIXES) else \
+                2 if typ.upper().startswith(CONTINUUM_2D_PREFIXES) else 0
+            order = ELCOPY_REFLECT_ORDER.get((dim, len(conn)))
+            if order:
+                conn = [conn[k] for k in order]
+                flipped += 1
+            else:
+                kept[typ] = bool(dim)
         new_id = eid + eshift
-        geom.add_element(new_id, typ, [c + nshift for c in conn])
+        geom.add_element(new_id, typ, conn)
+        if eid in geom.onodes:                      # a beam's n1 node
+            geom.onodes[new_id] = geom.onodes[eid] + nshift
         created.append(new_id)
         if new:
             geom.add_to_elset(new, [new_id])
+    if flipped:
+        report.note("*ELCOPY, REFLECT: the copies' node order reversed about their first node "
+                    "(1, 2, 3, 4 -> 1, 4, 3, 2, as Abaqus documents it; 1, 4, 3, 2, 5, 8, 7, 6 for "
+                    "a brick, the midside nodes following their edges).", once=True)
+    solid = [t for t, c in kept.items() if c]
+    if solid:
+        report.warn(f"*ELCOPY, REFLECT on {', '.join(solid)} elements: the converter reverses "
+                    f"the node order of 3- to 20-node continuum elements only, so these copies "
+                    f"keep theirs, and a mirrored one is inside out (ccx stops on it).", once=True)
+        report.reduce(f"*ELCOPY, REFLECT not applied to {', '.join(solid)} elements")
+    if len(solid) < len(kept):
+        report.note(f"*ELCOPY, REFLECT on {', '.join(t for t, c in kept.items() if not c)} "
+                    f"elements: Abaqus reverses continuum elements only; these copies keep their "
+                    f"node order.", once=True)
     return created
 
 
@@ -5503,6 +5588,13 @@ class AmplitudeCurve:
     smooth: Optional[float] = None
 
 
+def amplitude_values(lines: Sequence[str]) -> List[float]:
+    """The values of *AMPLITUDE data lines in order, by position: a blank field is 0 (Abaqus
+    and ccx read it so: ``0., , 1., 1.`` is the points (0, 0), (1, 1)), a line's trailing
+    commas add none.  ValueError where one is not a number."""
+    return [pf(x) if x else 0.0 for ln in lines for x in trimmed_fields(ln.split(","))]
+
+
 def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
     """The time function of an Abaqus *AMPLITUDE - TABULAR, EQUALLY SPACED, SMOOTH STEP,
     PERIODIC, MODULATED or DECAY - or None for the other definitions (USER, SOLUTION
@@ -5519,7 +5611,7 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
         return pf(v) if v not in (None, "") else default
     try:
         sx, sy, dx, dy = num("SCALEX", 1.0), num("SCALEY", 1.0), num("SHIFTX", 0.0), num("SHIFTY", 0.0)
-        vals = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+        vals = amplitude_values(b.data)
         fixed, begin = num("FIXED INTERVAL", 0.0), num("BEGIN", 0.0)
     except ValueError:
         return None
@@ -5561,22 +5653,18 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
     if (sx, sy, dx, dy) != (1.0, 1.0, 0.0, 0.0):
         return None                 # scaling/shifting of the analytic forms: not modelled
     if definition == "PERIODIC":
-        # by lines: N, omega, t0, A0 (A0 may be left out or blank: 0), then the A_k, B_k
+        # by lines: N, omega, t0, A0 (t0 and A0 may be left out or blank: 0), then the A_k, B_k
         # pairs (Abaqus 2017 Keywords *AMPLITUDE); a blank field reads 0, a line's trailing
         # comma adds no entry
-        recs = [list(rec) for rec in merged_data_records(b)]
-        for rec in recs:
-            while rec and not rec[-1].strip():
-                rec.pop()
         try:
-            head = [pf(x) if x.strip() else 0.0 for x in (recs[0] if recs else [])]
-            ab = [pf(x) if x.strip() else 0.0 for rec in recs[1:] for x in rec]
+            head = amplitude_values(b.data[:1])
+            ab = amplitude_values(b.data[1:])
         except ValueError:
             return None
-        if len(head) < 3:
+        if len(head) < 2:
             return None
         n = int(head[0])
-        w, t0, a0 = head[1], head[2], head[3] if len(head) > 3 else 0.0
+        w, t0, a0 = (head + [0.0, 0.0])[1:4]
         ab = ab[:2 * n]
         if n < 0 or len(ab) < 2 * n:
             return None
@@ -7478,32 +7566,55 @@ class Converter:
             self._register_connectors(b, typ)
             return
         nn = element_node_count(typ)
-        # (one split of the lines joined: the same fields as line by line)
-        toks = [t for t in map(str.strip, ",".join(b.data).split(",")) if t != ""]
+        rows = [r for r in ([t for t in map(str.strip, ln.split(",")) if t != ""] for ln in b.data) if r]
         if nn is None:
-            recs = merged_data_records(b)
-            nn = len([x for x in recs[0] if x != ""]) - 1 if recs else 0
+            nn = len(rows[0]) - 1 if rows else 0
             self.report.warn(f"Unknown element type {typ}: inferred {nn} nodes/element. "
                              f"Verify CalculiX supports it.", once=True)
         ids = []
-        elements, conns = self.geom.elements, self._conn
+        elements, conns, onodes = self.geom.elements, self._conn, self.geom.onodes
         step = 1 + nn
-        starts = range(0, len(toks) - nn, step) if nn > 0 else range(0)    # every whole element
-        end = len(starts) * step                # where the reading stops
-        if nn > 0:
-            try:                                # the usual card in bulk: integer labels, no
-                vals = list(map(int, toks))     # element given twice (else one by one, below)
-            except ValueError:
+        recs: List[List[str]] = []
+        extra: List[Optional[str]] = []         # per record: a beam's extra node
+        unread = 0
+        if nn > 0 and all(len(r) == step for r in rows):
+            toks = [t for r in rows for t in r]
+            try:                                # the usual card in bulk: one element a line,
+                vals = list(map(int, toks))     # integer labels, no element given twice (else
+            except ValueError:                  # one by one, below)
                 vals = None
-            eids = vals[:end:step] if vals is not None else None
+            eids = vals[::step] if vals is not None else None
             if eids is not None and len(set(eids)) == len(eids) and \
                     elements.keys().isdisjoint(eids) and conns.keys().isdisjoint(eids):
-                elements.update(zip(eids, [(typ, vals[i + 1:i + step]) for i in starts]))
-                ids, starts = eids, range(0)
-        for i in starts:
+                elements.update(zip(eids, [(typ, vals[i + 1:i + step])
+                                           for i in range(0, len(vals), step)]))
+                ids = eids
+            else:
+                recs, extra = rows, [None] * len(rows)
+        elif nn > 0:
+            # element records ("Element definition"): a line, continued on the next while the
+            # element is not complete; a spatial beam's one node more is its n1 direction
+            # (onodes), several whole elements on a line are read as such
+            cur: List[str] = []
+            for r in rows:
+                cur.extend(r)
+                if len(cur) < step:
+                    continue
+                if len(cur) == step + 1 and typ in ORIENTATION_NODE_BEAMS:
+                    recs.append(cur[:step])
+                    extra.append(cur[step])
+                else:
+                    whole = len(cur) // step if len(cur) % step == 0 else 1
+                    recs += [cur[k * step:(k + 1) * step] for k in range(whole)]
+                    extra += [None] * whole
+                    unread += len(cur) - whole * step
+                cur = []
+            unread += len(cur)
+        for rec, o in zip(recs, extra):
             try:
-                eid = int(toks[i])
-                conn = list(map(int, toks[i + 1:i + step]))
+                eid = int(rec[0])
+                conn = list(map(int, rec[1:]))
+                onode = int(o) if o is not None else None
             except ValueError:
                 # non-numeric connectivity — e.g. an assembly-level connector/MPC element
                 # using instance-qualified node names (PART-1-1.1).  ccx needs resolved
@@ -7518,10 +7629,19 @@ class Converter:
                                  "(Abaqus behaviour) — check for an upstream renumbering error.", once=True)
                 conns.pop(eid, None)
             elements[eid] = (typ, conn)             # (Geometry.add_element)
+            if onode is not None:
+                onodes[eid] = onode
+            else:
+                onodes.pop(eid, None)
             ids.append(eid)
-        if nn > 0 and end != len(toks):
-            self.report.warn(f"*ELEMENT TYPE={typ}: {len(toks) - end} trailing token(s) "
-                             f"not parsed; check connectivity.", once=True)
+        if unread:
+            self.report.warn(f"*ELEMENT TYPE={typ}: {unread} trailing token(s) not parsed; check "
+                             f"connectivity.", once=True)
+        if any(o is not None for o in extra):
+            self.report.note(f"*ELEMENT, TYPE={typ}: the node after a beam's nodes on its line gives "
+                             f"its n1 direction (from its first node; Abaqus takes it over the "
+                             f"section's n1). ccx has no such node: the beams are written without it, "
+                             f"their *BEAM SECTION once per n1 direction.", once=True)
         self._elem_types.add(typ)
         if b.param("ELSET"):
             self.geom.add_to_elset(b.param("ELSET"), ids)
@@ -10352,6 +10472,12 @@ class Converter:
         # local 2, walls t1..t4 at +1, +2, -1, -2) data lines read the same in both codes
         # (ccx manual 7.3 and Fig. 82; the wall order probed on 2.23), so they pass through.
         data = list(b.data)
+        at = beam_n1_line(b)
+        if at is not None and not data[at].strip():
+            # a blank n1 line, the default: ccx 2.23 skips a blank line and takes the next one
+            # (the integration points) for n1 (probed; it reads blank fields as 0)
+            data[at] = "0., 0., -1."
+        data = [ln for ln in data if ln.strip()]
         if sec == "CIRC":
             # Abaqus gives the radius; ccx reads the two section DIAMETERS (an ellipse's axis
             # lengths; a lone value is used for both).  Passed through, the radius made the
@@ -10382,7 +10508,41 @@ class Converter:
                              "moment), 1.17 / 1.13 / 1.07 times at a side ratio of 2 / 4 / 10 "
                              "(probed on B32R, any mesh); no section data corrects it (scaling G "
                              "alone needs a Poisson's ratio above 0.5).", once=True)
-        return [emit_keyword("BEAM SECTION", keep)] + data
+        return self._n1_sections(b, keep, data)
+
+    def _n1_sections(self, b: Block, keep: "OrderedDict[str, Optional[str]]",
+                     data: List[str]) -> List[str]:
+        """The ccx *BEAM SECTION of section card ``b`` (``keep``: its parameters, ``data``: its
+        lines), once per n1 direction where beams of it have their own (_onode_n1): ccx takes
+        n1 from the section only.  Each card then goes on an element set of its own, with the
+        n1 Abaqus gives its beams (for a straight beam its component normal to the axis, the
+        same frame), the beams without their own the section's line."""
+        elset = (keep.get("ELSET") or "").strip()
+        own = {e: v for e in self.geom.elset(elset) for v in [self._onode_n1(e)] if v is not None}
+        if not own:
+            return [emit_keyword("BEAM SECTION", keep)] + data
+        groups: "OrderedDict[Optional[Tuple[float, ...]], List[int]]" = OrderedDict()
+        for e in self.geom.elset(elset):
+            v = own.get(e)
+            if v is not None:
+                conn = self.geom.elements[e][1]
+                if len(conn) == 2 and conn[-1] in self.geom.nodes:
+                    t = vsub(self.geom.nodes[conn[-1]], self.geom.nodes[conn[0]])
+                    n2 = vcross(t, v)
+                    if vnorm(n2) > 1e-9 * vnorm(t) * vnorm(v):
+                        v = vcross(vunit(n2), vunit(t))
+                v = tuple(round(x, 12) + 0.0 for x in vunit(v))
+            groups.setdefault(v, []).append(e)
+        out: List[str] = []
+        for v, members in groups.items():
+            params = OrderedDict(keep)
+            if len(groups) > 1:
+                params["ELSET"] = self._fresh_name("ABQ2CCX_N1")
+                sb = set_block("ELSET", params["ELSET"], members)
+                out += [emit_keyword("ELSET", sb.params)] + sb.data
+            line = data[1:2] if v is None else [", ".join(_fmt_component(x) for x in v)]
+            out += [emit_keyword("BEAM SECTION", params)] + data[:1] + line + data[2:]
+        return out
 
     def handle_beam_general_section(self, b: Block) -> List[str]:
         """``*BEAM GENERAL SECTION``: ccx has no such card.  A RECT, CIRC, PIPE or BOX profile
@@ -10509,7 +10669,7 @@ class Converter:
         out = [emit_keyword("BEAM SECTION", keep), f"{short_real(b_r, 12)}, {short_real(h_r, 12)}"]
         if len(recs) > 1 and any(recs[1]):         # keep the direction-cosine line, by position
             out.append(", ".join(x or "0." for x in recs[1]))
-        return out
+        return self._n1_sections(b, keep, out[1:])
 
     def handle_shell_section(self, b: Block) -> List[str]:
         elset = b.param("ELSET")
@@ -19369,7 +19529,7 @@ class Converter:
             if scale == [1.0, 1.0]:
                 return lines
             try:
-                vals = [pf(x) for ln in lines for x in ln.split(",") if x.strip()]
+                vals = amplitude_values(lines)
             except ValueError:
                 self.report.warn("*AMPLITUDE SCALEX/SCALEY could not be applied (non-numeric "
                                  "data); amplitude left unscaled — verify.", once=True)
@@ -19391,7 +19551,7 @@ class Converter:
             # pairs, so expand to explicit points at BEGIN + i*FIXED INTERVAL.
             if fixed:
                 try:
-                    vals = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
+                    vals = amplitude_values(b.data)
                 except ValueError:
                     vals = []
                 if vals:
@@ -19471,9 +19631,7 @@ class Converter:
         tabular time/amplitude pairs ccx can use.  Returns None if the data is unparsable."""
         pts: List[Tuple[float, float]] = []
         try:
-            vals: List[float] = []
-            for rec in merged_data_records(b):
-                vals.extend(pf(x) for x in rec if x != "")
+            vals = amplitude_values(b.data)
             for i in range(0, len(vals) - 1, 2):
                 pts.append((vals[i], vals[i + 1]))
         except ValueError:
@@ -19511,7 +19669,7 @@ class Converter:
                                    reduces="*FRICTION, USER (frictionless in ccx)")
         for k in b.params:
             if k not in ("DEPENDENCIES",):
-                level = self.report.warn if k in ("EXPONENTIAL DECAY", "ANISOTROPIC",
+                level = self.report.warn if k in ("EXPONENTIAL DECAY", "ANISOTROPIC BEHAVIOR",
                                                   "TAUMAX") else self.report.note
                 level(f"*FRICTION parameter {k} dropped (ccx's *FRICTION takes only mu and a "
                       f"stick slope).", once=True)
@@ -21788,21 +21946,26 @@ class Converter:
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} is not a ccx initial-"
                                       f"condition type (ccx knows {', '.join(sorted(ccx_known))}); "
                                       f"remodel or remove.")
+        if typ == "TEMPERATURE" and b.has("FILE"):
+            # ccx ignores FILE= / STEP= / INC= on this card without a message (probed), and
+            # the data lines (an element set and a node set) are no temperatures
+            out = self._commented(b, "*INITIAL CONDITIONS, TYPE=TEMPERATURE, FILE=: Abaqus reads "
+                                     "these initial temperatures from the results file of an "
+                                     "earlier analysis, which ccx cannot, so the nodes start at 0 "
+                                     "(or at another card's value). Give them as data lines.",
+                                  reduces="*INITIAL CONDITIONS, TYPE=TEMPERATURE, FILE= (Abaqus "
+                                          "results file)")
+            return out + self._temperature_ic_fill(OrderedDict([("TYPE", "TEMPERATURE")]))
         layout = {"TEMPERATURE": "field", "VELOCITY": "dof", "DISPLACEMENT": "dof"}.get(typ)
         if layout:                              # node-based: a node set or node per record
             for rec in merged_data_records(b):
                 if rec and rec[0].strip():
                     self._check_node_target(f"INITIAL CONDITIONS, TYPE={typ}", rec[0].strip())
         midside = self._midside_records(b, layout) + self._qmem_records(b, layout) if layout else []
-        if typ == "TEMPERATURE" and self._temp_ic_fill and not self._temp_ic_filled:
-            # on the first card only: ccx takes the last value given to a node, so the fill on
-            # a later card would set the earlier cards' nodes back to 0
-            self._temp_ic_filled = True
-            self.report.note(f"*INITIAL CONDITIONS, TYPE=TEMPERATURE: nodes it does not list get "
-                             f"0 first ({ALL_NODES_SET}, 0.) — the Abaqus default; ccx stops on a "
-                             f"node without an initial temperature.", once=True)
-            return [emit_keyword("INITIAL CONDITIONS", b.params), f"{ALL_NODES_SET}, 0."] + \
-                list(b.data) + midside
+        if typ == "TEMPERATURE":
+            fill = self._temperature_ic_fill(b.params)
+            if fill:
+                return fill + list(b.data) + midside
         if layout == "dof":
             turned = self._ic_rotation_lines(b, typ, midside)
             if turned is not None:
@@ -21903,6 +22066,20 @@ class Converter:
         if len(out) == 1:
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} had no expandable records.")
         return out
+
+    def _temperature_ic_fill(self, params: "OrderedDict[str, Optional[str]]") -> List[str]:
+        """On the first *INITIAL CONDITIONS, TYPE=TEMPERATURE card (keyword ``params``) where
+        some nodes have no initial temperature: the card's keyword line and its line giving
+        every node 0 first, the Abaqus default (ccx stops on a node without one); else []."""
+        if not self._temp_ic_fill or self._temp_ic_filled:
+            return []
+        # on the first card only: ccx takes the last value given to a node, so the fill on
+        # a later card would set the earlier cards' nodes back to 0
+        self._temp_ic_filled = True
+        self.report.note(f"*INITIAL CONDITIONS, TYPE=TEMPERATURE: nodes it does not list get "
+                         f"0 first ({ALL_NODES_SET}, 0.) — the Abaqus default; ccx stops on a "
+                         f"node without an initial temperature.", once=True)
+        return [emit_keyword("INITIAL CONDITIONS", params), f"{ALL_NODES_SET}, 0."]
 
     def _ic_rotation_lines(self, b: Block, typ: str, extra: List[str]) -> Optional[List[str]]:
         """*INITIAL CONDITIONS, TYPE=VELOCITY / DISPLACEMENT ``b`` (and the ``extra`` lines the
@@ -28439,10 +28616,9 @@ class Converter:
         alpha, ia, ib = (0.0, p.i22 if p.i22 > 0 else p.i11, p.i11) if planar else principal_section(p)
         c, s = math.cos(alpha), math.sin(alpha)
         given: Vec = (0.0, 0.0, -1.0)
-        n1_at = beam_n1_line(b)
-        if not planar and n1_at is not None and len([x for x in recs[n1_at] if x]) >= 3:
+        if not planar:
             try:
-                given = tuple(pf(x) if x else 0.0 for x in recs[n1_at][:3])
+                given = beam_section_n1(b)
             except ValueError:
                 return f"{label}: its n1 direction does not read as numbers"
         dirs: "OrderedDict[Tuple[float, ...], Tuple[Vec, List[int]]]" = OrderedDict()
@@ -28457,8 +28633,9 @@ class Converter:
                 return f"element {e} has zero length"
             lmin = min(lmin, length)
             t = vscale(t, 1.0 / length)
-            n2 = vcross(t, given)
-            if vnorm(n2) < 1e-6 * max(vnorm(given), 1e-300):
+            g = (not planar and self._onode_n1(e)) or given
+            n2 = vcross(t, g)
+            if vnorm(n2) < 1e-6 * max(vnorm(g), 1e-300):
                 return f"{label}: n1 is parallel to the axis of element {e}"
             n2 = vunit(n2)
             n1 = vcross(n2, t)
@@ -28739,6 +28916,8 @@ class Converter:
         for b in blocks:
             if b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "TEMPERATURE":
                 any_temp_ic = True
+                if b.has("FILE"):               # (commented out: its nodes start at 0)
+                    continue
                 for rec in merged_data_records(b):
                     if rec and rec[0]:
                         covered.update(self._resolve_nodes(rec[0]))
@@ -28819,27 +28998,44 @@ class Converter:
                 self._point_temps.update(self.geom.elset(b.param("ELSET") or ""))
             if b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION"):
                 # the approximate n1 direction, a data line of its own (beam_n1_line), (0, 0, -1)
-                # when it is left blank
+                # when it is left blank; a beam's own node for it takes precedence (_onode_n1)
                 n1: Optional[Vec] = None
                 sec = (b.param("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION"
                                               else "")).strip().upper()
                 if sec in ("RECT", "CIRC", "PIPE", "BOX", "THICK PIPE", "I", "L", "HEX", "TRAPEZOID",
                            "ELLIPSE", "GENERAL", "ARBITRARY"):
-                    n1 = (0.0, 0.0, -1.0)
-                    at = beam_n1_line(b)
-                    if at is not None and len([x for x in recs[at] if x]) >= 3:
-                        try:
-                            n1 = tuple(pf(x) for x in [x for x in recs[at] if x][:3])
-                        except ValueError:
-                            n1 = None
+                    try:
+                        n1 = beam_section_n1(b)
+                    except ValueError:
+                        n1 = None
                 for e in self.geom.elset(b.param("ELSET") or ""):
-                    self._beam_n1[e] = n1
+                    self._beam_n1[e] = self._onode_n1(e) or n1
             elif b.keyword == "CLOAD":
                 amp = self._cload_amp(b)
                 for r in recs:
                     if len(r) > 1 and re.fullmatch(r"[-+]?\d+", r[1]):
                         for n in self._resolve_nodes(r[0]):
                             self._deck_cloads.setdefault((n, int(r[1])), set()).add(amp)
+
+    def _onode_n1(self, e: int) -> Optional[Vec]:
+        """The approximate n1 direction of beam ``e`` from the node after its nodes on its
+        element line (Geometry.onodes): from its first node to that node, which Abaqus takes
+        over the section's n1 (2017 "Beam element cross-section orientation"); None without
+        one.  An undefined node, or one on the first node, is warned (Abaqus stops on it) and
+        gives None: the section's n1."""
+        o = self.geom.onodes.get(e)
+        if o is None or e not in self.geom.elements:
+            return None
+        first = self.geom.elements[e][1][0]
+        v = vsub(self.geom.nodes[o], self.geom.nodes[first]) \
+            if o in self.geom.nodes and first in self.geom.nodes else (0.0, 0.0, 0.0)
+        if not any(v):
+            why = "not defined" if o not in self.geom.nodes else "on its first node"
+            self.report.warn(f"Beam {e}: the node after its nodes on its element line ({o}), which "
+                             f"gives its n1 direction, is {why} (Abaqus stops on it); the section's "
+                             f"n1 is used.", once=True)
+            return None
+        return v
 
     def _plan_print_sets(self, blocks: List[Block]) -> None:
         """Whole-model sets for *EL PRINT / *NODE PRINT cards that name none."""
@@ -34718,6 +34914,12 @@ PART_CONSTRAINT_KW = {"EQUATION", "MPC", "RIGID BODY", "NODAL THICKNESS", "TRANS
 ELEM_REF_KW = {"DLOAD", "ELSET", "DSLOAD", "DFLUX", "DFILM", "FILM", "RADIATE",
                "SOLID SECTION", "SHELL SECTION", "BEAM SECTION", "BEAM GENERAL SECTION",
                "MEMBRANE SECTION", "EL PRINT", "EL FILE", "ELEMENT OUTPUT", "DISTRIBUTION"}
+# ... and the *INITIAL CONDITIONS types whose data lines start with an element or element set
+# (Abaqus 2017 Keywords *INITIAL CONDITIONS; the others name nodes); *MODEL CHANGE names
+# elements unless TYPE=CONTACT PAIR (surfaces)
+ELEM_IC_TYPES = {"DAMAGE INITIATION", "ENRICHMENT", "HARDENING", "INITIAL GAP", "PLASTIC STRAIN",
+                 "SOLUTION", "SPECIFIC ENERGY", "SPUD EMBEDMENT", "SPUD PRELOAD", "STRESS",
+                 "VOLUME FRACTION"}
 
 # Parameters whose VALUE names a node set / element set / surface / node (e.g.
 # ``*EL PRINT, ELSET=Part-1.body`` or ``*RIGID BODY, REF NODE=Part-1.ref``).  An
@@ -34783,6 +34985,7 @@ def make_namer(report: Report):
     unique string, so a definition and every reference stay in sync."""
     memo: Dict[str, str] = {}
     used: set = set()
+    reserved: set = set()
 
     def namer(*parts) -> str:
         base = "_".join(str(p) for p in parts).upper()
@@ -34797,8 +35000,14 @@ def make_namer(report: Report):
                 if cand not in used:
                     break
                 i += 1
-            report.warn(f"Flattened set/surface names collide within CalculiX's {CCX_NAME_LIMIT}-"
-                        f"character name limit and were uniquified; verify set references.", once=True)
+            if base in reserved:
+                report.note(f"The flattened name {base} (an instance's mesh or one of its sets or "
+                            f"surfaces) is also the name of an assembly-level set or surface, which "
+                            f"keeps it: the instance's is {cand}.")
+            else:
+                report.warn(f"Flattened set/surface names collide within CalculiX's {CCX_NAME_LIMIT}-"
+                            f"character name limit and were uniquified; verify set references.",
+                            once=True)
         elif len(base) > CCX_NAME_LIMIT:
             report.note(f"A flattened set/surface name exceeded {CCX_NAME_LIMIT} characters and was "
                         f"truncated (ccx rejects longer names).", once=True)
@@ -34812,6 +35021,7 @@ def make_namer(report: Report):
         over ccx's limit."""
         n = raw.upper()
         used.add(n)
+        reserved.add(n)
         if len(n) > CCX_NAME_LIMIT:
             report.warn(f"An assembly-level set/surface name exceeds CalculiX's "
                         f"{CCX_NAME_LIMIT}-character limit and will be rejected by ccx "
@@ -35372,6 +35582,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         edata = []
         for eid, conn in items:
             gid = eid + elem_off
+            if eid in geo.onodes:                           # a beam's n1 node, read again
+                conn = conn + [geo.onodes[eid]]
             if len(conn) < MAX_ENTRIES_PER_LINE:            # (reflow: one line)
                 edata.append(", ".join([str(gid)] + [str(c + node_off) for c in conn]))
             else:
@@ -35665,7 +35877,9 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
         elif blk.keyword == "SURFACE":            # members follow the surface's TYPE
             entity = "node" if (blk.param("TYPE") or "ELEMENT").upper().startswith("NODE") else "elem"
         else:
-            entity = "elem" if blk.keyword in ELEM_REF_KW else "node"
+            entity = "elem" if blk.keyword in ELEM_REF_KW or (
+                blk.keyword == "INITIAL CONDITIONS" and blk.uparam("TYPE") in ELEM_IC_TYPES) or (
+                blk.keyword == "MODEL CHANGE") else "node"
         # (a) parameters that name a set/surface.  Only dotted values whose prefix is a
         #     known instance are touched, so a definition's own name (LOADED, I2_BODY) and
         #     unrelated params (MATERIAL=, NAME=) are left untouched.
@@ -35751,6 +35965,14 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
 
     out: List[Block] = list(pre)
     out.extend(_emit_part_global_data(parts))
+    # the assembly's own set and surface names are kept as written (_emit_assembly_blocks):
+    # reserved before the instances are named, so that a flattened <instance> or
+    # <instance>_<set> name spelling one is made unique instead of merging with it
+    for b in assembly_blocks:
+        own = b.param("NAME") if b.keyword == "SURFACE" else b.param("NSET") if b.keyword in (
+            "NSET", "NODE") else b.param("ELSET") if b.keyword in ("ELSET", "ELEMENT") else None
+        if own:
+            namer.reserve(own)
 
     # Assembly-level *NODE/*ELEMENT (CAE reference points etc.) keep their original ids and
     # are emitted BEFORE the instances; the instances are then numbered above them so an

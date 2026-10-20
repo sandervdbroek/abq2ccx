@@ -19554,6 +19554,176 @@ def test_beam_moments_ccx_cannot_run_warned():
     _, _, rep = convert_str(STOP_BEAM + stat + buckle)          # nothing after it: runs
     assert "around a *BUCKLE step" not in rep.text()
 
+BEAM_N1 = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+{nodes}*Element, type=B31, elset=EB
+1, 1, 2{o1}
+2, 2, 3{o2}
+*Material, name=M
+*Elastic
+2.1e5, 0.3
+*Beam Section, elset=EB, material=M, section=RECT
+0.1, 0.3
+{n1}*Boundary
+1, 1, 6
+*Step
+*Static
+*Dload
+EB, P1, 1.
+*End Step
+"""
+
+
+def test_beam_section_n1_line_read_by_position():
+    # a blank n1 line (Abaqus: the default) keeps its place before the integration-point
+    # line, which was read as n1 (and is by ccx, which skips a blank line): written out
+    body, conv, _ = convert_str(BEAM_N1.format(nodes="", o1="", o2="", n1="\n5, 5\n"))
+    assert "0.1, 0.3\n0., 0., -1.\n5, 5\n" in body and conv._beam_n1[1] == (0.0, 0.0, -1.0)
+    # a blank or left-out field is 0: n1 along y, so P1 loads along y (it went along -z)
+    for n1 in ("0., 1.", ", 1., 0.", "0., 1., "):
+        body, conv, _ = convert_str(BEAM_N1.format(nodes="", o1="", o2="", n1=n1 + "\n"))
+        assert conv._beam_n1[1] == (0.0, 1.0, 0.0) and "\n3, 2, 0.5\n" in body
+    # the U1 beam of a general section (n1 written as (0, 0, -1) before)
+    gen = BEAM_N1.replace("*Material, name=M\n*Elastic\n2.1e5, 0.3\n", "").replace(
+        "*Beam Section, elset=EB, material=M, section=RECT\n0.1, 0.3\n",
+        "*Beam General Section, elset=EB, section=GENERAL\n0.01, 1e-5, 0., 4e-5, 6e-5\n").replace(
+        "*Dload\nEB, P1, 1.\n", "*Cload\n3, 2, 1.\n")
+    body, _, _ = convert_str(gen.format(nodes="", o1="", o2="", n1="0., 1.\n2.1e5, 8.1e4\n"))
+    assert re.search(r"SECTION=GENERAL\n[^\n]+\n0\., 1\., 0\.\n", body)
+
+
+def test_beam_element_line_extra_node_gives_n1():
+    # Abaqus' extra node on a beam's element line: n1 from its first node (over the section's
+    # n1); it shifted every later element (element 100 = 2, 2)
+    nodes = "100, 0., 5., 0.\n101, 1., 0., 5.\n"
+    body, conv, rep = convert_str(BEAM_N1.format(nodes=nodes, o1=", 100", o2=", 101", n1=""))
+    assert conv.geom.elements[1][1] == [1, 2] and conv.geom.elements[2][1] == [2, 3]
+    assert "\n2, 2, 3\n" in body and "100, 2, 2" not in body and "not parsed" not in rep.text()
+    assert conv._beam_n1 == {1: (0.0, 5.0, 0.0), 2: (0.0, 0.0, 5.0)}
+    # one section per n1 direction, on element sets of their own
+    assert "*ELSET, ELSET=ABQ2CCX_N1\n1\n*BEAM SECTION, ELSET=ABQ2CCX_N1, MATERIAL=M, " \
+           "SECTION=RECT\n0.1, 0.3\n0, 1, 0\n" in body
+    assert "*BEAM SECTION, ELSET=ABQ2CCX_N1~1, MATERIAL=M, SECTION=RECT\n0.1, 0.3\n0, 0, 1\n" in body
+    # one extra node for all: one section, its n1 normal to the beam axis
+    body, conv, _ = convert_str(BEAM_N1.format(nodes="100, 0., 5., 5.\n", o1=", 100", o2=", 100",
+                                               n1=""))
+    assert "ABQ2CCX_N1" not in body and "0.1, 0.3\n0, 0.707106781, 0.707106781\n" in body
+    # *ELGEN generates the node too; an undefined one is warned and the section's n1 kept
+    body, conv, rep = convert_str(BEAM_N1.format(nodes=nodes, o1=", 100", o2=", 999", n1="")
+                                  .replace("*Material", "*Elgen, elset=EB\n1, 1, 1, 10\n*Material"))
+    assert conv.geom.onodes == {1: 100, 2: 999} and conv._beam_n1[2] == (0.0, 0.0, -1.0)
+    assert "(999), which gives its n1 direction, is not defined" in rep.text()
+
+
+def test_instance_qualified_element_labels_take_the_element_offset():
+    part = ("*Part, name=P\n*Node\n" + "".join(f"{i}, {x}., {y}., {z}.\n" for i, (x, y, z) in enumerate(
+        [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1),
+         (2, 0, 0), (2, 1, 0), (2, 0, 1), (2, 1, 1)], 1)) +
+        "*Element, type=C3D8, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 2, 9, 10, 3, 6, 11, 12, 7\n"
+        "*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, elset=E, material=M\n*End Part\n"
+        "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n*Node\n1, 5., 5., 5.\n"
+        "*End Assembly\n")
+    # the assembly node shifts I1's node labels by 1, its element labels by 0
+    body, _, _ = convert_str(part + "*Initial Conditions, type=STRESS\nI1.1, 0., 0., 10., 0., 0., 0.\n"
+                             "*Step\n*Static\n*End Step\n")
+    assert "\n1, 1, 0., 0., 10., 0., 0., 0.\n" in body and "\n2, 1, 0., 0., 10." not in body
+    body, _, _ = convert_str(part + "*Step\n*Static\n*Model Change, type=ELEMENT, remove\nI1.1\n"
+                             "*End Step\n")
+    assert "*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n1\n" in body
+
+
+def test_assembly_set_named_like_a_flattened_name_stays_apart():
+    # an assembly set PLATE (the fixed face) and the instance PLATE's whole-mesh set PLATE
+    # merged into one: the BC held every node
+    body, _, rep = convert_str(
+        "*Part, name=P\n" + HEX.replace("*ELEMENT, TYPE=C3D8, ELSET=EALL", "*Element, type=C3D8, elset=E") +
+        "*Nset, nset=TIP\n2, 3, 6, 7\n*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, elset=E, "
+        "material=M\n*End Part\n*Assembly, name=A\n*Instance, name=PLATE, part=P\n*End Instance\n"
+        "*Nset, nset=PLATE, instance=PLATE\n1, 4, 5, 8\n*Nset, nset=PLATE_TIP\n1\n*End Assembly\n"
+        "*Step\n*Static\n*Boundary\nPLATE, 1, 3\n*Cload\nPLATE.TIP, 1, 1.\n*End Step\n")
+    assert "*NSET, NSET=PLATE\n1, 4, 5, 8\n" in body and "*NSET, NSET=PLATE~1, GENERATE\n1, 8, 1\n" in body
+    assert "*NSET, NSET=PLATE_TIP~1\n2, 3, 6, 7\n" in body and "\nPLATE_TIP~1, 1, 1.\n" in body
+    assert "is also the name of an assembly-level set or surface" in rep.text()
+
+
+def test_redefined_parameter_takes_its_last_value():
+    # Abaqus evaluates the definitions in order: x = 2, y = x + 3, x = 4 gives x = 4, y = 5
+    deck = "*Parameter\nx = 2.\ny = x + 3.\nx = 4.\n*Node\n1, <x>, <y>, 0.\n"
+    _, conv, rep = convert_str(deck)
+    assert conv.geom.nodes[1][:2] == (4.0, 5.0) and "resolved 2 parameter(s)" in rep.text()
+    _, conv, _ = convert_str("*Parameter\nload = 1.\n*Parameter\nload = 5.\n*Node\n1, <load>, 0., 0.\n")
+    assert conv.geom.nodes[1][0] == 5.0
+    # a forward reference still resolves, to the last value
+    _, conv, _ = convert_str("*Parameter\na = b * 2\nb = 1.\nb = 3.\n*Node\n1, <a>, <b>, 0.\n")
+    assert conv.geom.nodes[1][:2] == (6.0, 3.0)
+
+
+def test_amplitude_data_read_by_position():
+    model = HEX_MODEL + "*Amplitude, name=A{p}\n{data}\n*Step, nlgeom\n*Static\n0.5, 1.\n" \
+        "*Cload, amplitude=A\n8, 3, 1.\n*End Step\n"
+    # a blank field is 0 (Abaqus and ccx): SCALEY made the single point (0, 2), a constant
+    body, _, _ = convert_str(model.format(p=", scaley=2.", data="0., , 1., 1."))
+    assert "*AMPLITUDE, NAME=A\n0, 0, 1, 2\n" in body
+    body, _, _ = convert_str(model.format(p=", definition=EQUALLY SPACED, fixed interval=0.5",
+                                          data="0., , 1."))
+    assert "*AMPLITUDE, NAME=A\n0, 0\n0.5, 0\n1, 1\n" in body
+    # PERIODIC with t0 and A0 left blank: sampled (it was commented out)
+    body, conv, _ = convert_str(model.format(p=", definition=PERIODIC", data="1, 6.283185, ,\n0., 1."))
+    assert "sample the curve" not in body and "*AMPLITUDE, NAME=A\n0, 0, " in body
+    # the factor held after the step: the amplitude's end value 0 (it held 2)
+    curve = A.amplitude_curve(A.Block("AMPLITUDE", A.OrderedDict(), ["0., 0., 1., , 2., 2."]))
+    assert curve.value(1.0) == 0.0 and curve.value(1.5) == 1.0
+
+
+def test_initial_temperatures_from_a_results_file_warned():
+    # ccx ignores FILE= on this card without a message: commented out, the nodes start at 0
+    body, conv, _ = convert_str(HEX_MODEL + "*Expansion\n1e-3\n*Nset, nset=TOP\n5, 6, 7, 8\n"
+                                "*Initial Conditions, type=TEMPERATURE, file=heat, step=1, inc=10\n"
+                                "*Step\n*Static\n*Temperature\nTOP, 20.\n*End Step\n")
+    assert "** *INITIAL CONDITIONS, TYPE=TEMPERATURE, FILE=heat" in body
+    assert "\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nABQ2CCX_ALL_NODES, 0.\n" in body
+    assert any("FILE= (Abaqus results file)" in r for r in conv.reduced_physics)
+
+
+def test_elcopy_reflect_reverses_the_copies():
+    # mirrored about x = 0 by *NCOPY, the copy is inside out unless REFLECT reverses its nodes
+    body, conv, rep = convert_str(HEX + "*Nset, nset=N, generate\n1, 8, 1\n*Ncopy, old set=N, "
+                                  "change number=100, reflect=mirror\n0., 0., 0., 0., 1., 0., 0., 0., 1.\n"
+                                  "*Elcopy, old set=EALL, element shift=100, shift nodes=100, new set=E2, "
+                                  "reflect\n")
+    assert conv.geom.elements[101][1] == [101, 104, 103, 102, 105, 108, 107, 106]
+    assert "node order reversed about their first node" in rep.text()
+    quad = "*Node\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*Element, type=CPS8R, elset=Q\n" \
+        "1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+    _, conv, rep = convert_str(quad + "*Elcopy, old set=Q, element shift=10, shift nodes=10, reflect\n")
+    assert conv.geom.elements[11][1] == [11, 14, 13, 12, 18, 17, 16, 15]
+    # Abaqus reverses continuum elements only
+    _, conv, rep = convert_str(quad.replace("CPS8R", "S8R") +
+                               "*Elcopy, old set=Q, element shift=10, shift nodes=10, reflect\n")
+    assert conv.geom.elements[11][1] == list(range(11, 19)) and "continuum elements only" in rep.text()
+
+
+def test_keyword_continuation_takes_the_keyword_flags():
+    # bare flags of the keyword on a continuation line (they became data lines)
+    body, conv, rep = convert_str(HEX_MODEL + "*Step, nlgeom\n*Static,\nSTABILIZE\n0.25, 1.\n"
+                                  "*Boundary, op=NEW,\nFIXED\n1, 1, 3\n*End Step\n")
+    assert "*STATIC\n0.25, 1.\n" in body and "*STATIC STABILIZE dropped" in rep.text()
+    assert "*BOUNDARY, OP=NEW, FIXED\n" in body and "node set 'FIXED'" not in rep.text()
+    # a set name on its own is still a data line
+    _, conv, _ = convert_str(HEX + "*Elset, elset=S,\nEALL\n")
+    assert conv.geom.elsets["S"] == [1]
+
+
+def test_friction_anisotropic_behavior_reduced():
+    # ANISOTROPIC is read as ANISOTROPIC BEHAVIOR (the 2017 name): dropped with a warning
+    _, conv, rep = convert_str(HEX_MODEL + "*Surface Interaction, name=SI\n*Friction, anisotropic\n"
+                               "0.1, 0.2\n")
+    assert any("*FRICTION, ANISOTROPIC BEHAVIOR" == r for r in conv.reduced_physics)
+    assert "[WARNING] *FRICTION parameter ANISOTROPIC BEHAVIOR dropped" in rep.text()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

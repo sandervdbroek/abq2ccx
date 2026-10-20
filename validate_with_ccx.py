@@ -3764,6 +3764,63 @@ def rigid_spin_deck(nlgeom=False, transform=False, w=(0.6, 0.0, 0.8)):
             "*END STEP\n")
 
 
+
+def beam_n1_deck(n1, load="*CLOAD\n5, 2, 1.\n", extra=("", "", ""), nodes="", sections=None):
+    """A B31 cantilever along x of four elements (length 2, nodes 1-5), RECT 0.1 x 0.3 (E
+    2.1e5), clamped at node 1 and loaded by ``load``; the tip printed.  ``n1``: the section's
+    lines after the geometry line (its n1 line, an integration-point line); ``extra``: what
+    follows each of elements 1-3 on its line (an orientation node), ``nodes`` more nodes;
+    ``sections``: (element set, n1 line) per section in place of the one of ``n1``."""
+    ext = list(extra) + [""] * (4 - len(extra))
+    els = "".join(f"{k}, {k}, {k + 1}{ext[k - 1]}\n" for k in range(1, 5))
+    secs = "".join(f"*ELSET, ELSET={name}\n{ids}\n*BEAM SECTION, ELSET={name}, MATERIAL=M, SECTION=RECT\n"
+                   f"0.1, 0.3\n{line}\n" for name, ids, line in sections) if sections else \
+        f"*BEAM SECTION, ELSET=EB, MATERIAL=M, SECTION=RECT\n0.1, 0.3\n{n1}"
+    return ("*NODE\n" + "".join(f"{k}, {0.5 * (k - 1)}, 0., 0.\n" for k in range(1, 6)) + nodes +
+            f"*ELEMENT, TYPE=B31, ELSET=EB\n{els}*NSET, NSET=TIP\n5\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            f"210000., 0.3\n{secs}*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n{load}*NODE PRINT, NSET=TIP\nU\n"
+            "*END STEP\n")
+
+
+def amplitude_blank_deck(definition, data):
+    """A C3D8 unit cube held at its bottom, its top pulled along z by 1 on amplitude A of
+    ``definition`` (a parameter string) and ``data``, in an NLGEOM static step of four fixed
+    increments (ccx writes every increment); the top printed."""
+    return (RIGID_REF_CUBE + f"*NSET, NSET=TOP\n5, 6, 7, 8\n*AMPLITUDE, NAME=A{definition}\n{data}\n"
+            "*BOUNDARY\nBOT, 1, 3\n*STEP, NLGEOM\n*STATIC, DIRECT\n0.25, 1.\n*CLOAD, AMPLITUDE=A\n"
+            "TOP, 3, 1.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def amplitude_held_deck(data):
+    """amplitude_blank_deck's cube on TABULAR amplitude ``data`` in a static step of time 1,
+    then a *FREQUENCY step and a static step of its own: the load is given again there at the
+    factor the amplitude reached at the end of the first (the base state Abaqus continues
+    from); the top printed in the last step."""
+    return (RIGID_REF_CUBE + f"*NSET, NSET=TOP\n5, 6, 7, 8\n*AMPLITUDE, NAME=A\n{data}\n*BOUNDARY\n"
+            "BOT, 1, 3\n*STEP, NLGEOM\n*STATIC\n0.25, 1., 1e-5, 0.25\n*CLOAD, AMPLITUDE=A\nTOP, 3, 1.\n"
+            "*END STEP\n*STEP\n*FREQUENCY\n2\n*END STEP\n*STEP, NLGEOM\n*STATIC\n0.5, 1., 1e-5, 0.5\n"
+            "*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+
+
+def elcopy_reflect_deck(written=False):
+    """A C3D8 unit cube (nodes 1-8, x 0 to 1) and its mirror image about x = 0 (*NCOPY,
+    REFLECT=MIRROR: nodes 101-108) made by *ELCOPY, REFLECT; each held at x = 0 (in x, and
+    one node fully) and pulled outwards at its far face, the mirror's along -x.  ``written``:
+    the copy written out with the node order Abaqus documents for REFLECT (1, 4, 3, 2 of a
+    face) in place of the two cards."""
+    copy = ("*NODE\n" + "".join(f"{100 + k}, {-x}., {y}., {z}.\n" for k, (x, y, z) in
+                                enumerate(CUBE_CORNERS, 1)) +
+            "*ELEMENT, TYPE=C3D8, ELSET=E2\n101, 101, 104, 103, 102, 105, 108, 107, 106\n") if written else \
+        ("*NSET, NSET=ALLN, GENERATE\n1, 8, 1\n*NCOPY, OLD SET=ALLN, CHANGE NUMBER=100, REFLECT=MIRROR\n"
+         "0., 0., 0., 0., 1., 0., 0., 0., 1.\n*ELCOPY, OLD SET=E, ELEMENT SHIFT=100, SHIFT NODES=100, "
+         "NEW SET=E2, REFLECT\n")
+    return (RIGID_REF_CUBE.replace("*MATERIAL", copy + "*MATERIAL") +
+            "*SOLID SECTION, ELSET=E2, MATERIAL=M\n*NSET, NSET=OUT\n2, 3, 6, 7, 102, 103, 106, 107\n"
+            "*NSET, NSET=X0\n1, 4, 5, 8, 101, 104, 105, 108\n*BOUNDARY\nX0, 1, 1\n1, 1, 3\n101, 1, 3\n"
+            "4, 3, 3\n104, 3, 3\n*STEP\n*STATIC\n*CLOAD\n2, 1, 1.\n3, 1, 1.\n6, 1, 1.\n7, 1, 1.\n102, 1, -1.\n"
+            "103, 1, -1.\n106, 1, -1.\n107, 1, -1.\n*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -13006,6 +13063,103 @@ def main():
                   f"{kind[5:].upper()} beside a plain one; ccx stopped in gen3dnor): the twin with it "
                   f"written as a triangle ({err:.1e} apart, max |u| {scale:.4g})")
         failures += 0 if ok else 1
+
+    # --- input side (task 119) -----------------------------------------------------------
+    # a blank *BEAM SECTION n1 line before the integration-point line (Abaqus: the default):
+    # read without it, the line 5, 5 was n1 (as ccx reads it: it skips a blank line), the
+    # section turned 90 deg (0.498); against the explicit (0, 0, -1) and P L^3 / 3 E I
+    runs = [review_run(beam_n1_deck(n1), f"beam_n1_{tag}", dat_displacements)
+            for tag, n1 in (("blank", "\n5, 5\n"), ("explicit", "0., 0., -1.\n5, 5\n"))]
+    ok = all(runs)
+    if ok:
+        got, ref = runs[0][5][1], runs[1][5][1]
+        theory = 8.0 / (3 * 210000.0 * 0.1 * 0.3 ** 3 / 12)
+        ok = abs(got - ref) <= 1e-9 * abs(ref) and abs(got / theory - 1) < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  beam_n1_blank_line (B31 cantilever, RECT 0.1 x 0.3, a blank n1 "
+              f"line, then 5, 5): tip uy {got:.6g} as with 0., 0., -1. ({ref:.6g}); P L^3 / 3 E I "
+              f"{theory:.6g} (before: 0.498)")
+    failures += 0 if ok else 1
+
+    # an n1 line with a blank or left-out field (0): read as no n1, so the *DLOAD P1 went along
+    # -z (the default n1) instead of y; against the full line
+    load = "*DLOAD\nEB, P1, 1.\n"
+    runs = [review_run(beam_n1_deck(n1, load), f"beam_n1_field_{k}", dat_displacements)
+            for k, n1 in enumerate(("0., 1.\n", ", 1., 0.\n", "0., 1., 0.\n"))]
+    ok = all(runs)
+    if ok:
+        tips = [r[5] for r in runs]
+        err = max(abs(a - b) for t in tips[:2] for a, b in zip(t, tips[2]))
+        ok = err <= 1e-9 * abs(tips[2][1]) and abs(tips[2][1]) > 0.1 and abs(tips[2][2]) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  beam_n1_blank_field (n1 0., 1. and , 1., 0.; P1 load 1): tip "
+              f"({', '.join(f'{x:.6g}' for x in tips[0])}) as with 0., 1., 0. ({err:.1e} apart; "
+              f"before: along -z)")
+    failures += 0 if ok else 1
+
+    # Abaqus' extra node on a beam's element line, its n1 direction from the first node (over
+    # the section's): the element lines shifted (ccx stopped); against one section per n1
+    load = "*CLOAD\n5, 2, 1.\n5, 3, 1.\n"
+    nodes = "100, 0., 5., 0.\n101, 0.5, 0., 5.\n"
+    runs = [review_run(beam_n1_deck("", load, (", 100", ", 101", ", 100"), nodes), "beam_onode",
+                       dat_displacements),
+            review_run(beam_n1_deck("", load, sections=(("S1", "1, 3", "0., 1., 0."), ("S2", "2", "0., 0., 1."),
+                                                        ("S3", "4", "0., 0., -1."))), "beam_onode_ref",
+                       dat_displacements)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs[0][5], runs[1][5]
+        err = max(abs(a - b) for a, b in zip(got, ref))
+        ok = err <= 1e-9 * max(map(abs, ref)) and min(abs(ref[1]), abs(ref[2])) > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  beam_orientation_node (B31 cantilever, elements 1-3 with an "
+              f"extra node: n1 y, z, y): tip ({', '.join(f'{x:.7g}' for x in got)}) as with a section "
+              f"per n1 ({err:.1e} apart; before: ccx stopped)")
+    failures += 0 if ok else 1
+
+    # *AMPLITUDE data with a blank field (0): read without it, SCALEY made the single point
+    # (0, 2), EQUALLY SPACED moved its values, PERIODIC with t0 and A0 blank was not sampled;
+    # against the zeros written out, over the step's increments
+    for tag, (deck, twin) in (("scaley", ((", SCALEY=2.", "0., , 1., 1."), ("", "0., 0., 1., 2."))),
+                              ("equally_spaced", ((", DEFINITION=EQUALLY SPACED, FIXED INTERVAL=0.5", "0., , 1."),
+                                                  ("", "0., 0., 0.5, 0., 1., 1."))),
+                              ("periodic", ((", DEFINITION=PERIODIC", "1, 6.283185, ,\n0., 1."),
+                                            (", DEFINITION=PERIODIC", "1, 6.283185, 0., 0.\n0., 1.")))):
+        runs = [review_run(amplitude_blank_deck(*d), f"amplitude_blank_{tag}{k}", dat_node_blocks)
+                for k, d in (("", deck), ("_ref", twin))]
+        ok = all(runs)
+        if ok:
+            err, moved = same(runs)
+            ok = err <= 1e-9 * moved and moved > 1e-4 and len(runs[0]) == 4
+            print(f"{'PASS' if ok else 'FAIL'}  amplitude_blank_{tag} (C3D8 cube pulled on the amplitude, "
+                  f"{deck[1].splitlines()[0]}): {len(runs[0])} increments as with the zeros written out "
+                  f"({err:.1e} apart; largest |u| {moved:.6g})")
+        failures += 0 if ok else 1
+    # ... and the factor the load is given again at after a *FREQUENCY step: the amplitude's
+    # end value 0.5 (it held 1)
+    runs = [review_run(amplitude_held_deck(d), f"amplitude_held{k}", dat_node_blocks)
+            for k, d in (("", "0., 0., 0.5, , 1., 0.5"), ("_ref", "0., 0., 0.5, 0., 1., 0.5"))]
+    ok = all(runs)
+    if ok:
+        err, moved = same(runs)
+        ok = err <= 1e-9 * moved and moved > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  amplitude_blank_held (0., 0., 0.5, , 1., 0.5, then *FREQUENCY "
+              f"and a static step): the top as with 0 written out ({err:.1e} apart; |u| {moved:.6g})")
+    failures += 0 if ok else 1
+
+    # *ELCOPY, REFLECT after *NCOPY, REFLECT=MIRROR: the copy's node order reversed (ccx stopped
+    # on the inside-out copy: 'nonpositive jacobian'); against the copy written out, and the
+    # mirror image of the cube's displacements
+    runs = [review_run(elcopy_reflect_deck(w), "elcopy_reflect" + ("_ref" if w else ""), dat_displacements)
+            for w in (False, True)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs
+        err = max(abs(a - b) for n, v in ref.items() for a, b in zip(got.get(n, [math.inf] * 3), v))
+        mirror = max(abs(got[100 + n][0] + got[n][0]) + abs(got[100 + n][1] - got[n][1]) +
+                     abs(got[100 + n][2] - got[n][2]) for n in (2, 3, 6, 7))
+        ok = err <= 1e-9 * abs(got[2][0]) and mirror <= 1e-9 * abs(got[2][0]) and got[2][0] > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  elcopy_reflect (a C3D8 cube and its *ELCOPY, REFLECT mirror, "
+              f"pulled apart): the copy as written out ({err:.1e} apart) and mirroring the cube "
+              f"({mirror:.1e}; ux {got[2][0]:.6g}; before: ccx stopped)")
+    failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
