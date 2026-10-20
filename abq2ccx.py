@@ -15388,46 +15388,36 @@ class Converter:
         its own (cloads.f, dloads.f), and stops where a step loads a node DOF or face from two
         of them ('*ERROR in forcadd / loadadd', probed: the same AMPLITUDE and TIME DELAY on two
         cards), where Abaqus adds the loads.  So the data lines of the step's later cards
-        (``out``: the step) with the same parameters as an earlier one move onto it."""
-        cards: List[Tuple[int, str, tuple, List[int]]] = []     # (line, keyword, params, data lines)
-        for i, raw in enumerate(out):
-            s = raw.strip()
-            if not s or s.startswith("**"):
-                continue
-            if s.startswith("*"):
-                kw, params = parse_keyword_line(s)
-                cards.append((i, kw, self._load_amp(params) if kw in ("CLOAD", "DLOAD") else (), []))
-            elif cards:
-                cards[-1][3].append(i)
-        first: Dict[Tuple[str, tuple], Tuple[int, str, tuple, List[int]]] = {}
-        moved: Dict[int, List[int]] = {}            # a card's header -> the lines moved onto it
-        for card in cards:
-            i, kw, amp, data = card
+        (``out``: the step's lines) with the same parameters as an earlier one move onto it."""
+        # (the cards of the lines, also past a *STEP inside the step: EmittedStep)
+        deck = EmittedDeck(out)
+        first: Dict[Tuple[str, tuple], EmittedCard] = {}
+        moved: Dict[int, List[int]] = {}            # a card's index -> the lines moved onto it
+        for c in deck.cards:
+            amp = self._load_amp(c.params) if c.keyword in ("CLOAD", "DLOAD") else ()
             if not amp or not amp[1]:
                 continue
-            if (kw, amp) not in first:
-                first[(kw, amp)] = card
+            if (c.keyword, amp) not in first:
+                first[(c.keyword, amp)] = c
                 continue
-            moved.setdefault(first[(kw, amp)][0], []).extend(data)
-            moved[i] = []                           # (its header goes)
+            moved.setdefault(first[(c.keyword, amp)].index, []).extend(c.rows)
+            moved[c.index] = []                     # (its keyword line goes)
         if not any(moved.values()):
             return
-        gone = {j for i, more in moved.items() for j in ([i] if not more else []) + more}
-        at = {}                                     # the first card's last line -> its data
-        for i, more in moved.items():
-            if more:
-                card = next(c for c in cards if c[0] == i)
-                lines = [out[j] for j in card[3] + more]
-                at[card[3][-1] if card[3] else i] = (card[3], self._surfaces_last(lines)
-                                                     if card[1] == "DLOAD" else lines)
-                gone.update(card[3])
-        res: List[str] = []
-        for j, raw in enumerate(out):
-            if j not in gone:
-                res.append(raw)
-            if j in at:
-                res.extend(at[j][1])
-        out[:] = res
+        for k, more in moved.items():
+            c = deck.cards[k]
+            if not more:
+                deck.swap(c.line, [])
+                continue
+            lines = [out[j] for j in c.rows + more]
+            lines = self._surfaces_last(lines) if c.keyword == "DLOAD" else lines
+            for j in c.rows[:-1] + more:
+                deck.swap(j, [])
+            if c.rows:
+                deck.swap(c.rows[-1], lines)        # (all of them at its last data line)
+            else:
+                deck.insert_after(c, lines)
+        out[:] = deck.render()
         self.report.note("*CLOAD / *DLOAD cards of a step with the same AMPLITUDE and TIME DELAY "
                          "merged into one: ccx 2.23 gives each such card a copy of the amplitude of "
                          "its own and stops where one face or node DOF is loaded from two of them "
@@ -20801,8 +20791,8 @@ class Converter:
         deck = self._keep_body_loads(deck)      # after the restore, which gives body loads too
         deck = self._no_analysis_segfaults(deck)
         self._audit_loads(blocks, deck)
-        out = self._shift_total_time(deck.render())     # after every pass that writes load cards
-        out = self._short_fields(out)           # last: every card is written
+        deck = self._shift_total_time(deck)     # after every pass that writes load cards
+        out = self._short_fields(deck.render())     # last: every card is written
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
                              + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
@@ -22984,55 +22974,62 @@ class Converter:
                           f"(ccx does not solve for it)")
         return deck.edited()
 
-    def _shift_total_time(self, out: List[str]) -> List[str]:
+    def _shift_total_time(self, deck: EmittedDeck) -> EmittedDeck:
         """ccx 2.23 counts the time of a *MODAL DYNAMIC step, and of a static perturbation step
         (a general step in ccx), in the total time; Abaqus never adds a linear perturbation
         step's time to it (probed: total time 2.5 after a 0.5 modal dynamic step where Abaqus
         reads 2.0; *FREQUENCY, *BUCKLE and steady-state dynamics add none).  So the cards of a
         later step that use a TIME=TOTAL TIME amplitude get a copy of it shifted by the time
-        ccx added (SHIFTX), one per shift; where that time is unknown, a warning."""
+        ccx added (SHIFTX), one per shift; where that time is unknown, a warning.  ccx's steps
+        are the deck's *STEP lines (deck.steps), each that of the step EmitState wrote it for
+        (one each where emit.matches(deck); an unterminated *STEP that ran on inside a step is
+        that step's)."""
         if not self._pert_idx:
-            return out
-        amps: Dict[str, int] = {}               # TIME=TOTAL TIME *AMPLITUDE -> its card's line
-        added: Dict[int, Optional[float]] = {}  # step -> the time ccx alone adds (None: unknown)
-        cards: List[Tuple[int, int, str, "OrderedDict[str, Optional[str]]"]] = []
-        step = 0
-        for i, raw in enumerate(out):
-            s = raw.strip()
-            if not s.startswith("*") or s.startswith("**"):
-                continue
-            kw, params = parse_keyword_line(s)
-            cards.append((i, step, kw, params))
-            if kw == "AMPLITUDE":
-                self._used_names.add((params.get("NAME") or "").strip().upper())
-                if (params.get("TIME") or "").upper().replace(" ", "") == "TOTALTIME":
-                    amps[(params.get("NAME") or "").strip().upper()] = i
-            elif kw == "STEP":
-                step += 1
-            elif step in self._pert_idx and kw in ("MODAL DYNAMIC", "STATIC"):
-                rec = next((ln.split(",") for ln in out[i + 1:]
-                            if ln.strip() and not ln.strip().startswith("**")), [])
+            return deck
+        # the deck's step of each emitted one, by its *STEP line's number
+        src = {w.ccx_no + j: w.no for w in self.emit.written.values() for j in range(w.stars)}
+        amps: Dict[str, EmittedCard] = {}       # TIME=TOTAL TIME *AMPLITUDE -> its card
+        added: Dict[int, Optional[float]] = {}  # emitted step -> the time ccx alone adds (None: unknown)
+        # each card's emitted step.  This pass's own rules: a card between steps or after the
+        # last counts with the step before it, and every *MODAL DYNAMIC / *STATIC card of a
+        # step gives its time (the last one decides), read from the card's first data line or,
+        # without one, from the next card's keyword line
+        at: List[int] = []
+        n = 0
+        for c in deck.cards:
+            n = c.step if c.step >= 0 else n
+            at.append(n)
+            if c.keyword == "AMPLITUDE":
+                self._used_names.add(c.uparam("NAME"))
+                if (c.params.get("TIME") or "").upper().replace(" ", "") == "TOTALTIME":
+                    amps[c.uparam("NAME")] = c
+            elif src.get(n) in self._pert_idx and c.keyword in ("MODAL DYNAMIC", "STATIC"):
+                nxt = c.index + 1
+                line = c.data[0] if c.data else (
+                    deck.lines[deck.cards[nxt].line] if nxt < len(deck.cards) else "")
+                rec = line.split(",") if line else []
                 try:
-                    added[step] = pf(rec[1]) if len(rec) > 1 and rec[1].strip() else \
-                        (1.0 if kw == "STATIC" else None)
+                    added[n] = pf(rec[1]) if len(rec) > 1 and rec[1].strip() else \
+                        (1.0 if c.keyword == "STATIC" else None)
                 except ValueError:
-                    added[step] = None
+                    added[n] = None
         if not amps or not any(v != 0.0 for v in added.values()):
-            return out
-        offset: Dict[int, Optional[float]] = {}         # step -> the time ccx added before it
+            return deck
+        offset: Dict[int, Optional[float]] = {}         # emitted step -> the time ccx added before it
         total: Optional[float] = 0.0
-        for k in range(step + 1):
+        for k in range(len(deck.steps) + 1):
             offset[k] = total
             total = None if total is None or added.get(k, 0.0) is None else \
                 total + added.get(k, 0.0)
         copies: "OrderedDict[Tuple[str, float], str]" = OrderedDict()
         users: Dict[str, List[int]] = {}
-        for i, s, kw, params in cards:
-            shift = offset[s]
-            keys = [k for k, v in params.items() if k.endswith("AMPLITUDE") and
+        for c, n in zip(deck.cards, at):
+            shift = offset[n]
+            keys = [k for k, v in c.params.items() if k.endswith("AMPLITUDE") and
                     (v or "").strip().upper() in amps]
-            if not keys or shift == 0.0 or kw in ("AMPLITUDE", "STEP"):
+            if not keys or shift == 0.0 or c.keyword in ("AMPLITUDE", "STEP"):
                 continue
+            s = src.get(n, n)
             if shift is None:
                 self.report.warn(f"Step {s} uses a TIME=TOTAL TIME amplitude after a *MODAL "
                                  f"DYNAMIC or static perturbation step of unknown time period: "
@@ -23040,38 +23037,34 @@ class Converter:
                                  f"not, so ccx reads the amplitude late.", once=True)
                 self._reduces("TIME=TOTAL TIME amplitude read late after a perturbation step")
                 continue
+            params = OrderedDict(c.params)
             for k in keys:
                 name = params[k].strip().upper()
                 if (name, shift) not in copies:
                     copies[(name, shift)] = self._fresh_name(f"{name}_SHIFT")
                 params[k] = copies[(name, shift)]
                 users.setdefault(copies[(name, shift)], []).append(s)
-            out[i] = emit_keyword(kw, params)
-        insert: Dict[int, List[str]] = {}
+            deck.set_keyword(c, params)
         for (name, shift), copy in copies.items():
-            i = amps[name]
-            _kw, params = parse_keyword_line(out[i].strip())
-            j = next((c[0] for c in cards if c[0] > i), len(out))
+            amp = amps[name]
+            j = deck.cards[amp.index + 1].line if amp.index + 1 < len(deck.cards) else len(deck.lines)
+            params = OrderedDict(amp.params)
             try:
                 x = pf(params.get("SHIFTX") or "0") + shift
             except ValueError:
                 x = shift
             params["NAME"], params["SHIFTX"] = copy, short_real(x, 12)
             steps = ", ".join(map(str, sorted(set(users[copy]))))
-            insert.setdefault(j, []).extend(
-                [f"** abq2ccx: {name} shifted by {shift:.12g} for step(s) {steps}: ccx "
-                 f"counts the perturbation steps' time in the total time, Abaqus does not",
-                 emit_keyword("AMPLITUDE", params)] + out[i + 1:j])
+            # (before the next card's keyword line: its data and the comments after them too)
+            deck.insert_at(j, [f"** abq2ccx: {name} shifted by {shift:.12g} for step(s) {steps}: ccx "
+                               f"counts the perturbation steps' time in the total time, Abaqus does not",
+                               emit_keyword("AMPLITUDE", params)] + list(deck.lines[amp.line + 1:j]))
             self.report.note(f"*AMPLITUDE {name} (TIME=TOTAL TIME) written again as {copy} with "
                              f"SHIFTX={short_real(x, 12)} for step(s) {steps}: ccx 2.23 counts the "
                              f"time of a *MODAL DYNAMIC step (and of a static perturbation step, a "
                              f"general step in ccx) in the total time, Abaqus does not (probed: "
                              f"2.5 after a 0.5 modal dynamic step where Abaqus reads 2.0).")
-        res: List[str] = []
-        for i, line in enumerate(out):
-            res += insert.get(i, [])
-            res.append(line)
-        return res + insert.get(len(out), [])
+        return deck.edited()
 
     def _keep_body_loads(self, deck: EmittedDeck) -> EmittedDeck:
         """ccx 2.23 aborts (SIGABRT: it frees its body-load table twice) at the end of a step

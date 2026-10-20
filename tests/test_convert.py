@@ -807,6 +807,49 @@ def test_emitted_deck_parse():
     assert new.opaque_upto == 6 and new.steps[0].acting("CLOAD").line == 12
 
 
+def test_delay_merge_and_total_time_shift_read_the_emitted_deck():
+    # _merge_delay_cards reads a step's lines as an EmittedDeck: a card's data lines past the
+    # comments among them, a card without data lines, the cards past a *STEP inside the step
+    step = ["*STEP", "*STATIC", "0.1, 1.", "** a note", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1",
+            "** between", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "E1, P1, 1.", "** inside",
+            "E2, P1, 1.", "*STEP", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1", "1, 1, 1.",
+            "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "E3, P2, 2.", "*NODE FILE", "U"]
+    A.Converter(A.Report(), Opt())._merge_delay_cards(step)
+    assert step == ["*STEP", "*STATIC", "0.1, 1.", "** a note", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1",
+                    "1, 1, 1.", "** between", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "** inside",
+                    "E1, P1, 1.", "E2, P1, 1.", "E3, P2, 2.", "*STEP", "*NODE FILE", "U"]
+    # _shift_total_time counts ccx's steps by the *STEP lines and numbers them by the steps
+    # EmitState wrote: blocks that keep an unterminated *STEP (read_blocks closes it) write
+    # step 1 as two, and the static perturbation step 2 (period 1: its *STATIC has no data
+    # line) is the third
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(BUCKLE_CUBE + "*Amplitude, name=TT, time=total time\n0., 0., 10., 10.\n"
+                 "*Step\n*Static\n0.5, 1.\n*Step\n*Static\n0.3, 0.3\n*End Step\n*Step, perturbation\n"
+                 "*Static\n*Cload\n7, 2, 1.\n*End Step\n*Step\n*Static\n0.5, 1.\n*Cload, amplitude=TT\n"
+                 "7, 1, 1.\n*End Step\n")
+    rep = A.Report()
+    blocks = A.read_blocks(path, rep)
+    os.unlink(path)
+    del blocks[[k for k, b in enumerate(blocks) if b.keyword == "STEP"][1] - 1]   # (its *END STEP)
+    conv = A.Converter(rep, Opt())
+    body = "\n".join(conv.convert(blocks))
+    assert "*AMPLITUDE, NAME=TT_SHIFT, TIME=total time, SHIFTX=1.\n" in body
+    assert "TT_SHIFT with SHIFTX=1. for step(s) 3:" in rep.text() and body.count("\n*STEP") == 4
+    # ... on the emitted text: comments between cards, after a card without data lines, and an
+    # amplitude's data and the comments after them in its copy
+    text = ["*AMPLITUDE, NAME=T2, TIME=TOTAL TIME", "0., 0., 10., 10.", "** after T2", "*STEP",
+            "*STATIC", "0.5, 1.", "*STEP", "*STATIC", "0.3, 0.3", "*END STEP", "*STEP", "*STATIC",
+            "** between", "*CLOAD", "7, 2, 1.", "*END STEP", "*STEP", "*STATIC", "0.5, 1.",
+            "*CLOAD, AMPLITUDE=T2", "7, 1, 1.", "*END STEP"]
+    new = conv._shift_total_time(A.EmittedDeck(text))
+    assert new.lines[:8] == text[:3] + [
+        "** abq2ccx: T2 shifted by 1 for step(s) 3: ccx counts the perturbation steps' time in the "
+        "total time, Abaqus does not", "*AMPLITUDE, NAME=T2_SHIFT, TIME=TOTAL TIME, SHIFTX=1.",
+        "0., 0., 10., 10.", "** after T2", "*STEP"]
+    assert new.lines[8:] == text[4:19] + ["*CLOAD, AMPLITUDE=T2_SHIFT"] + text[20:]
+
+
 def test_rotation_tie_on_a_member_bc_makes_the_body_dependent():
     # a member rotation under a BC cannot be the tie's dependent term.  On a *RIGID BODY the BC
     # moves to the ROT NODE, as Abaqus moves it (the tie keeps the member dependent); where it
