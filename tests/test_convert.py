@@ -540,6 +540,29 @@ def test_step_model_handle_step_facts():
         assert (two.base_nlgeom, two.base_nlgeom_dp) == (on, on)
 
 
+def test_step_model_motion_facts():
+    # how a step's nodes move: its time period (none in a perturbation, heat transfer or Riks
+    # step), the time it adds to the total time and the total time at its start, the Abaqus
+    # default amplitudes of displacement, velocity and acceleration BCs and ccx's; the
+    # procedure may be one ccx lacks (*GEOSTATIC)
+    _, m = _step_model("""*STEP\n*STATIC\n0.1, 2.\n*END STEP\n*STEP, AMPLITUDE=STEP\n*DYNAMIC\n0.01, 0.5
+*END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 3.\n*END STEP
+*STEP\n*STATIC, RIKS\n*END STEP\n*STEP, NLGEOM\n*GEOSTATIC\n*END STEP
+*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP\n*STEP\n*DYNAMIC, APPLICATION=QUASI-STATIC\n0.1, 1.\n*END STEP""")
+    assert [s.motion_label for s in m] == ["STATIC", "DYNAMIC", "FREQUENCY", "HEAT TRANSFER",
+                                           "STATIC, RIKS", "GEOSTATIC", "DYNAMIC", "DYNAMIC"]
+    assert [s.period for s in m] == [2.0, 0.5, None, None, None, 1.0, 1e-4, 1.0]
+    assert [s.advance for s in m] == [2.0, 0.5, 0.0, 3.0, None, 1.0, 1e-4, 1.0]
+    assert [s.t_start for s in m] == [0.0, 2.0, 2.5, 2.5, 5.5, None, None, None]
+    assert [tuple(s.defaults[q] for q in ("VELOCITY", "ACCELERATION", "DISPLACEMENT")) for s in m] == [
+        ("STEP", "RAMP", "RAMP"), ("STEP", "STEP", "RAMP"), ("RAMP", "RAMP", "RAMP"),
+        ("RAMP", "RAMP", "RAMP"), ("STEP", "RAMP", "RAMP"), ("STEP", "RAMP", "RAMP"),
+        ("STEP", "STEP", "FIXED"), ("STEP", "RAMP", "RAMP")]
+    assert [s.ccx_amp for s in m] == ["RAMP", "STEP", "STEP", "RAMP", "RAMP", "STEP", "STEP", "RAMP"]
+    assert [s.motion_explicit for s in m] == [False] * 6 + [True, False]
+    assert [s.nlgeom_motion for s in m] == [False] * 5 + [True] * 3
+
+
 def test_step_model_explicit_steps():
     # the converter runs an explicit step with NLGEOM: handle_step writes it where NLGEOM= is
     # not given, while any explicit card switches it on for _plan_deck_facts

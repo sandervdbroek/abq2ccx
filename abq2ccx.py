@@ -4337,14 +4337,14 @@ class Step:
     proc: str                     # the first PROC_KW card's keyword, "" if none (handle_step's): ccx's
                                   # procedure (one ccx lacks, e.g. *RANDOM RESPONSE, is commented out)
     proc_card: Optional[Block]
-    motion_proc: str              # the first PROC_KW or Converter._MOTION_PROCS card's (_step_motion's)
+    motion_proc: str              # the first PROC_KW or Converter._MOTION_PROCS card's (the motion fields')
     explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT (handle_step's)
     amplitude: str                # *STEP, AMPLITUDE= as written ("" if none)
     pert_param: bool              # *STEP, PERTURBATION as written
     perturbation: bool            # an Abaqus linear perturbation step (perturbation_step): _pert_idx,
-                                  # _step_motion, the output carry-over, step_load_audit's Abaqus reading
+                                  # the motion fields, the output carry-over, step_load_audit's Abaqus reading
     nlgeom_card: Optional[bool]   # NLGEOM= on its *STEP card (_nlgeom_given)
-    # NLGEOM, two rules:
+    # NLGEOM, by several rules (also base_nlgeom, nlgeom_motion):
     nlgeom_on: bool               # it switches NLGEOM on (_plan_deck_facts' _nl_steps): not a
                                   # perturbation step and NLGEOM on one of its *STEP cards, or a
                                   # *DYNAMIC, EXPLICIT card in it
@@ -4365,6 +4365,22 @@ class Step:
     lc2: frozenset                # in a step with a *BUCKLE card: the ids of its *BOUNDARY, LOAD CASE=2
                                   # cards, which the conversion leaves out (StepModel.lc2)
     lc2_repeats: bool             # each repeats a LOAD CASE=1 card of the step (the Abaqus/CAE default)
+    # how its nodes move, by motion_proc's card (_plan_velocity_bcs, _plan_default_amplitudes,
+    # _dofs_at_rest, _plan_amplitude_spans):
+    motion_label: str             # motion_proc, with ", RIKS"; "(no procedure)" if none
+    motion_explicit: bool         # that card is a *DYNAMIC, EXPLICIT
+    period: Optional[float]       # the time period over which its nodes move (None for Riks, heat
+                                  # transfer, a linear perturbation, ...)
+    advance: Optional[float]      # the time it adds to the total time (0 for a perturbation step,
+                                  # None when unknown)
+    t_start: Optional[float]      # the total time at its start: the earlier steps' advance (None once
+                                  # one is unknown)
+    defaults: Dict[str, str]      # the Abaqus default amplitude of its DISPLACEMENT, VELOCITY and
+                                  # ACCELERATION BCs (not to be changed)
+    ccx_amp: str                  # the one ccx gives a load or BC without AMPLITUDE in the converted step
+    nlgeom_motion: bool           # NLGEOM in force by the motion rule (_plan_velocity_bcs): on once a step
+                                  # not a perturbation one has NLGEOM on its *STEP card or is
+                                  # motion_explicit
 
 
 class StepModel:
@@ -4392,6 +4408,69 @@ class StepModel:
             return explicit or not (pert and not base)
         return dp and explicit
 
+    @staticmethod
+    def _motion(head: Block, card: Optional[Block], perturbation: bool
+                ) -> Tuple[Optional[float], Optional[float], Dict[str, str], str]:
+        """(period, advance, defaults, ccx_amp) of a step (Step) whose *STEP card is ``head``
+        and whose motion_proc card is ``card``."""
+        proc = card.keyword if card is not None else ""
+        explicit = proc == "DYNAMIC" and card.has("EXPLICIT")
+        period = None
+        advance: Optional[float] = 0.0 if perturbation else None
+        if (proc in Converter._MOTION_PROCS or proc == "HEAT TRANSFER") and not card.has("RIKS") \
+                and not perturbation:
+            rec = (merged_data_records(card) or [[]])[0]
+            try:
+                advance = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0     # Abaqus default 1
+            except ValueError:
+                advance = None
+            if advance is not None and not advance > 0.0:
+                advance = None
+            if proc != "HEAT TRANSFER":
+                period = advance
+        # the default amplitude of loads and BCs (Abaqus manual, "Defining an analysis",
+        # Table 1): STEP in Abaqus/Explicit and in transient procedures, RAMP in static and
+        # steady-state ones; *STEP AMPLITUDE overrides it in Abaqus/Standard
+        quasi = proc == "DYNAMIC" and \
+            card.uparam("APPLICATION").startswith("QUASI")
+        default = head.uparam("AMPLITUDE")
+        if explicit:
+            default = "STEP"
+        elif default not in ("RAMP", "STEP"):
+            if proc == "DYNAMIC":
+                transient = not quasi
+            elif proc.endswith("TEMPERATURE-DISPLACEMENT"):
+                transient = not card.has("STEADY STATE")
+            elif proc == "SOILS":
+                transient = card.has("CONSOLIDATION")
+            else:
+                transient = proc == "VISCO"            # the table's "quasi-static": STEP too
+            default = "STEP" if transient else "RAMP"
+        # *BOUNDARY, AMPLITUDE: "when displacement or rotation components in a static step or
+        # in a dynamic step with APPLICATION=QUASI-STATIC are given with TYPE=VELOCITY, ...
+        # the default is always a STEP function"; with TYPE=DISPLACEMENT it "is always a RAMP
+        # function" in Abaqus/Standard, while Abaqus/Explicit "does not admit jumps in
+        # displacement": it ignores the value and enforces a zero velocity (FIXED: the DOF
+        # stays where the step finds it)
+        static = proc in ("STATIC", "GEOSTATIC")
+        defaults = {"VELOCITY": "STEP" if static or quasi else default, "ACCELERATION": default,
+                    "DISPLACEMENT": "FIXED" if explicit else "RAMP"}
+        # ccx 2.23 (tempload.f; probed): RAMP from the value at the end of the previous step
+        # in *STATIC and steady-state heat transfer / (un)coupled steps, STEP in any other
+        # (dynamics, *VISCO, transient), unless the *STEP card handle_step writes has
+        # AMPLITUDE= (explicit steps get none; quasi-static dynamics gets RAMP)
+        written = head.uparam("AMPLITUDE")
+        if quasi and written not in ("RAMP", "STEP"):
+            written = "RAMP"
+        if explicit:
+            ccx = "STEP"
+        elif written in ("RAMP", "STEP"):
+            ccx = written
+        else:
+            ccx = "RAMP" if proc == "STATIC" or (proc in TEMPERATURE_DOF_PROCS and
+                                                 card.has("STEADY STATE")) else "STEP"
+        return period, advance, defaults, ccx
+
     def __init__(self, blocks: Sequence[Block]) -> None:
         model: List[Block] = []
         steps: List[Step] = []
@@ -4401,6 +4480,7 @@ class StepModel:
         star = 0                                # the *STEP cards so far
         nlgeom = False                          # NLGEOM in force (Step.nlgeom)
         seen = base = base_dp = False           # Step.general_before, base_nlgeom, base_nlgeom_dp
+        nl_motion, t = False, 0.0               # Step.nlgeom_motion, t_start
         for is_step, cards in deck_parts(blocks):
             if not is_step:
                 (loose if steps else model).extend(cards)
@@ -4409,8 +4489,9 @@ class StepModel:
             head, inner = cards[0], cards[1:]
             proc_card = next((b for b in inner if b.keyword in PROC_KW), None)
             proc = proc_card.keyword if proc_card is not None else ""
-            motion_proc = next((b.keyword for b in inner if b.keyword in PROC_KW or
-                                b.keyword in Converter._MOTION_PROCS), "")
+            motion_card = next((b for b in inner if b.keyword in PROC_KW or
+                                b.keyword in Converter._MOTION_PROCS), None)
+            motion_proc = motion_card.keyword if motion_card is not None else ""
             explicit = proc == "DYNAMIC" and proc_card.has("EXPLICIT")
             pert_param = head.has("PERTURBATION")
             pert = perturbation_step(cards)
@@ -4428,6 +4509,9 @@ class StepModel:
                 lc2, repeats = frozenset(), False
             n = sum(1 for b in cards if b.keyword == "STEP")
             general = proc in self.GENERAL_PROCS and not pert_param
+            motion_explicit = motion_proc == "DYNAMIC" and motion_card.has("EXPLICIT")
+            period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
+            nl_motion = nl_motion or (not pert and bool(given)) or motion_explicit
             steps.append(Step(
                 no=len(steps) + 1, ccx_no=star + 1, cards=tuple(cards), between=tuple(loose),
                 star_steps=n, closed=n == 1 and cards[-1].keyword == "END STEP",
@@ -4442,7 +4526,12 @@ class StepModel:
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
-                lc2=lc2, lc2_repeats=repeats))
+                lc2=lc2, lc2_repeats=repeats,
+                motion_label=(motion_proc + (", RIKS" if motion_card.has("RIKS") else ""))
+                if motion_proc else "(no procedure)", motion_explicit=motion_explicit,
+                period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp,
+                nlgeom_motion=nl_motion))
+            t = None if t is None or advance is None else t + advance
             # NLGEOM stays on once a general step has it (Abaqus): the base state of the later steps
             if general:
                 seen = True
@@ -5213,7 +5302,7 @@ class BaseStateRestore:
             if b.keyword in self.conv._RESTORED and b.step >= 0:
                 self.by_step.setdefault(b.step, []).append(b)
         # each step's procedure, period and *STEP as written: the planners know the first two
-        # (StepModel's Step.proc, _step_motion's period); the PERTURBATION ccx reads is the one
+        # (StepModel's Step.proc, Step.period); the PERTURBATION ccx reads is the one
         # handle_step writes (Step.pert_param is the source deck's), which nothing records yet
         for st in deck.steps:
             s = st.number
@@ -11020,80 +11109,6 @@ class Converter:
         return {id(b) for b in blocks if b.keyword == "STEP" and id(b) not in heads and
                 b.has("NLGEOM") and (b.param("NLGEOM") or "YES").strip().upper() != "NO"}
 
-    def _step_motion(self, group: List[Block], nlgeom: bool) -> dict:
-        """What the velocity-BC and default-amplitude plans need to know of a step: the time
-        period over which its nodes move (None for Riks, heat transfer, a linear
-        perturbation, ...), the time it adds to the total time (0 for a perturbation step,
-        None when unknown), the Abaqus default amplitude of its displacement, velocity and
-        acceleration BCs, the one ccx gives a load or BC without AMPLITUDE in the converted
-        step (``ccx``), and whether it is dynamic / explicit / under NLGEOM."""
-        step_b = group[0]
-        proc_b = next((x for x in group[1:] if x.keyword in PROC_KW or
-                       x.keyword in self._MOTION_PROCS), None)
-        proc = proc_b.keyword if proc_b is not None else ""
-        explicit = proc == "DYNAMIC" and proc_b.has("EXPLICIT")
-        perturbation = self.steps.step_of(step_b).perturbation
-        period = None
-        advance: Optional[float] = 0.0 if perturbation else None
-        if (proc in self._MOTION_PROCS or proc == "HEAT TRANSFER") and not proc_b.has("RIKS") \
-                and not perturbation:
-            rec = (merged_data_records(proc_b) or [[]])[0]
-            try:
-                advance = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0     # Abaqus default 1
-            except ValueError:
-                advance = None
-            if advance is not None and not advance > 0.0:
-                advance = None
-            if proc != "HEAT TRANSFER":
-                period = advance
-        # the default amplitude of loads and BCs (Abaqus manual, "Defining an analysis",
-        # Table 1): STEP in Abaqus/Explicit and in transient procedures, RAMP in static and
-        # steady-state ones; *STEP AMPLITUDE overrides it in Abaqus/Standard
-        quasi = proc == "DYNAMIC" and \
-            proc_b.uparam("APPLICATION").startswith("QUASI")
-        default = step_b.uparam("AMPLITUDE")
-        if explicit:
-            default = "STEP"
-        elif default not in ("RAMP", "STEP"):
-            if proc == "DYNAMIC":
-                transient = not quasi
-            elif proc.endswith("TEMPERATURE-DISPLACEMENT"):
-                transient = not proc_b.has("STEADY STATE")
-            elif proc == "SOILS":
-                transient = proc_b.has("CONSOLIDATION")
-            else:
-                transient = proc == "VISCO"            # the table's "quasi-static": STEP too
-            default = "STEP" if transient else "RAMP"
-        # *BOUNDARY, AMPLITUDE: "when displacement or rotation components in a static step or
-        # in a dynamic step with APPLICATION=QUASI-STATIC are given with TYPE=VELOCITY, ...
-        # the default is always a STEP function"; with TYPE=DISPLACEMENT it "is always a RAMP
-        # function" in Abaqus/Standard, while Abaqus/Explicit "does not admit jumps in
-        # displacement": it ignores the value and enforces a zero velocity (FIXED: the DOF
-        # stays where the step finds it)
-        static = proc in ("STATIC", "GEOSTATIC")
-        defaults = {"VELOCITY": "STEP" if static or quasi else default, "ACCELERATION": default,
-                    "DISPLACEMENT": "FIXED" if explicit else "RAMP"}
-        # ccx 2.23 (tempload.f; probed): RAMP from the value at the end of the previous step
-        # in *STATIC and steady-state heat transfer / (un)coupled steps, STEP in any other
-        # (dynamics, *VISCO, transient), unless the *STEP card handle_step writes has
-        # AMPLITUDE= (explicit steps get none; quasi-static dynamics gets RAMP)
-        written = step_b.uparam("AMPLITUDE")
-        if quasi and written not in ("RAMP", "STEP"):
-            written = "RAMP"
-        if explicit:
-            ccx = "STEP"
-        elif written in ("RAMP", "STEP"):
-            ccx = written
-        else:
-            ccx = "RAMP" if proc == "STATIC" or (proc in TEMPERATURE_DOF_PROCS and
-                                                 proc_b.has("STEADY STATE")) else "STEP"
-        if step_b.has("NLGEOM") and not perturbation:     # (_nlgeom_steps)
-            nlgeom = nlgeom or (step_b.param("NLGEOM") or "YES").strip().upper() != "NO"
-        return dict(period=period, advance=advance, defaults=defaults, ccx=ccx,
-                    dynamic=proc == "DYNAMIC", explicit=explicit, perturbation=perturbation,
-                    nlgeom=nlgeom or explicit,
-                    proc=(proc + (", RIKS" if proc_b.has("RIKS") else "")) if proc else "(no procedure)")
-
     @staticmethod
     def _bc_history(bc: dict, period: float, t0: Optional[float], u_start: Optional[float],
                     prev: float):
@@ -11224,7 +11239,7 @@ class Converter:
         amplitude (integrate_history keeps that within 1e-4 of the step's travel; a
         constant or piecewise-constant rate is exact).  The rate is the magnitude times the
         amplitude (VALUE=ABSOLUTE: the amplitude alone; TIME=TOTAL TIME on total time) or,
-        without AMPLITUDE, the Abaqus default (_step_motion): a velocity is held over a
+        without AMPLITUDE, the Abaqus default (Step.defaults): a velocity is held over a
         static or quasi-static step (STEP); anything else follows the step's default
         amplitude, where a RAMP starts from the value at the end of the previous step (a
         velocity in a dynamic step: from the DOF's velocity).  A rate BC a later step keeps
@@ -11296,24 +11311,22 @@ class Converter:
                 for k in ((n, d) for n in self._resolve_nodes(spec) for d in dofs):
                     if k in state:
                         state[k][2] = bc
-        t0: Optional[float] = 0.0                # total time at the step start (None: unknown)
-        nlgeom = False
         # (its own state, not StepModel.states: it follows the motion too; OP=NEW clears at a
         # step's start)
         acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
-        for s, group in enumerate(groups, 1):
-            info = self._step_motion(group, nlgeom)
-            nlgeom = info["nlgeom"]
-            T = info["period"]
+        for step, group in zip(self.steps, groups):
+            # the step number, its time period and the total time at its start (None: unknown)
+            s, T, t0 = step.no, step.period, step.t_start
+            dynamic = step.motion_proc == "DYNAMIC"
             cards = [x for x in group[1:] if x.keyword == "BOUNDARY" and id(x) not in self.steps.lc2]
             if T is None:
                 why = ("in a linear perturbation step (the base state does not move; only the "
-                       "constraint applies)" if info["perturbation"] else
-                       f"in a {info['proc']} step (no time period over which to integrate it)")
+                       "constraint applies)" if step.perturbation else
+                       f"in a {step.motion_label} step (no time period over which to integrate it)")
                 for b in cards:
                     if self._bc_type(b) in self._RATE_TYPES:
                         self._vel_cards[id(b)] = self._rate_constraint_card(b, why)
-                if not info["perturbation"]:
+                if not step.perturbation:
                     # its cards still replace the BCs in force (OP=NEW removes them all); a DOF
                     # they name ends the step at a value the converter does not follow
                     if any(id(b) in acts for b in cards):
@@ -11325,10 +11338,9 @@ class Converter:
                             for k in ((n, d) for n in self._resolve_nodes(spec) for d in dofs):
                                 if k in state:
                                     state[k][2] = unknown
-                if not info["perturbation"] and info["proc"] != "HEAT TRANSFER":
+                if not step.perturbation and step.motion_label != "HEAT TRANSFER":
                     for st in state.values():          # nodes moved, by unknown amounts
                         st[0] = st[1] = None
-                t0 = None if t0 is None or info["advance"] is None else t0 + info["advance"]
                 continue
             start = {k: (st[0], st[1]) for k, st in state.items()}
             prev_bc = {k: st[2] for k, st in state.items()}
@@ -11366,7 +11378,7 @@ class Converter:
                 if bc["mode"] != "RAMP":
                     return 0.0
                 u_s, v_s = start.get(k, (None, None))
-                if info["dynamic"] and bc["q"] == "VELOCITY":
+                if dynamic and bc["q"] == "VELOCITY":
                     if v_s is not None:
                         return v_s
                     if u_s is not None:          # (else the BC cannot be converted anyway)
@@ -11402,11 +11414,11 @@ class Converter:
                                                  f"a sampled displacement amplitude."))
                     return
                 c = bc.get("curve")
-                if bc["mode"] == "AMP" and q == "VELOCITY" and info["dynamic"]:
+                if bc["mode"] == "AMP" and q == "VELOCITY" and dynamic:
                     # *BOUNDARY: "In an Abaqus/Standard dynamic ... procedure, amplitude curves
                     # specified for ... TYPE=VELOCITY will be smoothed automatically"
                     off = t0 if c.total else 0.0
-                    frac = c.smooth if c.smooth is not None else 0.0 if info["explicit"] else 0.25
+                    frac = c.smooth if c.smooth is not None else 0.0 if step.motion_explicit else 0.25
                     if frac > 0.0 and any(off < x < off + T for x in c.corners):
                         self.report.warn(f"*BOUNDARY, TYPE=VELOCITY with a TABULAR amplitude in a "
                                          f"dynamic step: Abaqus replaces the curve around each of "
@@ -11471,7 +11483,7 @@ class Converter:
                         amp_lines += text_
                     entries += [(shapes[key], ln) for ln in self._rate_bc_lines(spec, dofs, members, value)]
                     driven.update((k, (bc, u_s, v_s, prev, shapes[key], value)) for k in members)
-                    if info["dynamic"] and order == 1:
+                    if dynamic and order == 1:
                         f0 = self._bc_history(bc, T, t0, None, prev)[0](0.0)
                         if abs(f0 - (start.get(members[0], (0.0, 0.0))[1] or 0.0)) > 1e-12 * abs(f0):
                             self.report.note("*BOUNDARY, TYPE=VELOCITY with a jump in velocity at the "
@@ -11569,7 +11581,7 @@ class Converter:
                         # it, which ends where a STEP does
                         mode = "UNKNOWN" if mag is None or b.has("USER") or b.has("SUBMODEL") else \
                             "FIXED" if b.has("FIXED") else ("AMP" if curve else "UNKNOWN") if amp \
-                            else "FIXED" if info["explicit"] else "STEP"
+                            else "FIXED" if step.motion_explicit else "STEP"
                         bc = dict(q="DISPLACEMENT", mode=mode, mag=mag or 0.0, curve=curve)
                     else:
                         bad = mag is None or b.has("USER") or not dofs or \
@@ -11583,20 +11595,20 @@ class Converter:
                         elif named:
                             mode, mag = "STEP", 0.0
                         else:
-                            mode = ("AMP" if curve else "UNKNOWN") if amp else info["defaults"][q]
+                            mode = ("AMP" if curve else "UNKNOWN") if amp else step.defaults[q]
                         bc = dict(q=q, mode=mode, mag=mag or 0.0, curve=curve, amp=amp or None,
                                   spec=spec, dofs=dofs, named=named, text=text)
                         if mode == "RAMP" and (mag or any(prev_rate(k, bc) for k in keys)):
                             self.report.note(f"*BOUNDARY, TYPE={q} without AMPLITUDE in a "
-                                             f"{info['proc']} step whose default amplitude is RAMP "
+                                             f"{step.motion_label} step whose default amplitude is RAMP "
                                              f"(*STEP AMPLITUDE, or the procedure's default): the "
                                              f"{q.lower()} ramps over the step to the given one from "
                                              f"its value at the end of the previous step (0 at "
                                              f"first; a velocity in a dynamic step: from the DOF's "
                                              f"velocity), as in Abaqus.", once=True)
-                        if q == "ACCELERATION" and not info["dynamic"] and not bad and \
+                        if q == "ACCELERATION" and not dynamic and not bad and \
                                 (mag or curve is not None):
-                            self.report.warn(f"*BOUNDARY, TYPE=ACCELERATION in a {info['proc']} step: "
+                            self.report.warn(f"*BOUNDARY, TYPE=ACCELERATION in a {step.motion_label} step: "
                                              f"the Abaqus manual says acceleration histories should "
                                              f"not be used in static steps. Converted to the motion "
                                              f"the acceleration integrates to from the velocity at "
@@ -11639,7 +11651,7 @@ class Converter:
             # warn where finite rotations about several axes are integrated component-wise:
             # a node turned about more than one axis in this step, or about another axis
             # than the one it turned about before (the manual's own example of velocity BCs)
-            if nlgeom:
+            if step.nlgeom_motion:
                 axes: Dict[int, set] = {}
                 for k, st in state.items():
                     bc = st[2]
@@ -11677,7 +11689,7 @@ class Converter:
                     # only a dynamic step leaves a velocity a later ACCELERATION BC can
                     # start from (a static step has none, unless nothing moved)
                     st[1] = (bc["end"] if bc["q"] == "VELOCITY" else res[2] if res else None) \
-                        if info["dynamic"] else (0.0 if still else None)
+                        if dynamic else (0.0 if still else None)
             forms: Dict[int, dict] = {}
             for st in state.values():
                 bc = st[2]
@@ -11688,7 +11700,6 @@ class Converter:
                     forms[id(bc)] = dict(bc, mode="HOLD", hold=bc["end"]) if bc["end"] is not None \
                         else dict(bc, mode="UNKNOWN")
                 st[2] = forms[id(bc)]
-            t0 = None if t0 is None else t0 + T
         for b in rate_cards:                       # *BOUNDARY between steps: no step to act in
             if id(b) not in self._vel_cards:
                 self._vel_cards[id(b)] = self._rate_constraint_card(b, "outside a step")
@@ -11751,14 +11762,12 @@ class Converter:
         mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
         todo: List[Tuple[int, str, str, Block, List[dict]]] = []   # step, kind, procedure, card, lines
         query: set = set()
-        nlgeom = False
-        for s, group in enumerate(groups, 1):
-            info = self._step_motion(group, nlgeom)
-            nlgeom = info["nlgeom"]
-            if info["explicit"]:
+        for step, group in zip(self.steps, groups):
+            s = step.no
+            if step.motion_explicit:
                 kind = "hold"
-            elif info["proc"] in self._RAMP_PROCS and info["ccx"] == "STEP" and \
-                    info["period"] is not None:
+            elif step.motion_label in self._RAMP_PROCS and step.ccx_amp == "STEP" and \
+                    step.period is not None:
                 kind = "ramp"
             else:
                 continue
@@ -11768,7 +11777,7 @@ class Converter:
                         any(b.has(k) for k in ("FIXED", "USER", "SUBMODEL")):
                     continue
                 lines = self._amp_lines(b, mid_ends)
-                todo.append((s, kind, info["proc"], b, lines))
+                todo.append((s, kind, step.motion_label, b, lines))
                 for ln in lines:
                     query.update((n, d) for n in ln["ends"] + ln["nodes"] for d in ln["dofs"]
                                  if 1 <= d <= 6)
@@ -11916,16 +11925,14 @@ class Converter:
                                   blocks=cards)
         held = next(folds)                                          # the model data's
         out: Dict[int, Tuple[set, set]] = {}
-        nlgeom = False
         for s, (group, end) in enumerate(zip(groups, folds), 1):
-            info = self._step_motion(group, nlgeom)
-            nlgeom = info["nlgeom"]
+            step = self.steps.steps[s - 1]
             if s in need:
                 out[s] = (set(at_zero), set(held))
             end = dict(end)
             if s not in self._pert_idx:
                 held = end
-            if info["perturbation"] or info["proc"] == "HEAT TRANSFER":
+            if step.perturbation or step.motion_label == "HEAT TRANSFER":
                 continue
             mine = {id(x) for x in group}
             for k in query:
@@ -11935,7 +11942,7 @@ class Converter:
                 if kind == "disp" and src not in mine:
                     if amp and mag != 0.0:
                         at_zero.discard(k)
-                elif kind == "disp" and info["explicit"] and not amp:
+                elif kind == "disp" and step.motion_explicit and not amp:
                     continue
                 elif kind == "disp" and mag == 0.0:
                     at_zero.add(k)
@@ -16807,11 +16814,8 @@ class Converter:
         takes out what ccx adds to it), though Abaqus adds no perturbation step's time."""
         self._amp_span = None
         longest = total = reach = 0.0
-        nlgeom = False
-        for group in step_groups(blocks)[1]:
-            info = self._step_motion(group, nlgeom)
-            nlgeom = info["nlgeom"]
-            if info["advance"] is None:
+        for step, group in zip(self.steps, step_groups(blocks)[1]):
+            if step.advance is None:
                 return
             period = 0.0
             for b in (b for b in group[1:] if b.keyword == "MODAL DYNAMIC"):
@@ -16820,7 +16824,7 @@ class Converter:
                     period = max(pf(rec[1]), 0.0) if len(rec) > 1 and rec[1] else 0.0
                 except ValueError:
                     pass
-            longest, total = max(longest, info["advance"], period), total + info["advance"]
+            longest, total = max(longest, step.advance, period), total + step.advance
             reach = max(reach, total + period)
         if reach > 0.0:
             self._amp_span = (longest, reach)
