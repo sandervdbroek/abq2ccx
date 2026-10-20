@@ -3814,9 +3814,9 @@ class Converter:
         self._step_nlgeom = False
         self._synth_counter = 0
         self._has_sensitivity = False
-        self._freq_storage = False
+        self._freq_read: set = set()                # *FREQUENCY steps a later step reads modes of
         self._initial_stresses = False
-        self._plain_freq_exact = True
+        self._freq_contact = False                  # a contact pair (ccx's plain *FREQUENCY drops it)
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
         self._general_step_seen = False
@@ -7669,32 +7669,56 @@ class Converter:
         return name
 
     # -- step / load / bc handlers -----------------------------------------
-    # what a base state holds beside the preload's stresses and deformation, which ccx 2.23's
-    # plain *FREQUENCY leaves out and Abaqus keeps after a step without NLGEOM: the contact
-    # status, the material's tangent or damaged moduli, removed elements (_prescan); the base
-    # temperatures of temperature-dependent materials: _base_heated, _tdep_material (ccx has
-    # no field variables, so its PERTURBATION brings no *FIELD in)
-    _BASE_STATE_CARDS = {"CONTACT PAIR", "CONTACT", "GAP",
-                         "USER DEFINED FIELD", "HYPERELASTIC", "HYPERFOAM", "HYPOELASTIC",
-                         "USER MATERIAL", "DAMAGE INITIATION", "CONCRETE DAMAGED PLASTICITY",
-                         "CONCRETE", "BRITTLE CRACKING", "MODEL CHANGE"}
+    # ccx 2.23's plain *FREQUENCY keeps the removed elements of a *MODEL CHANGE, the gap status,
+    # a nonlinear spring's tangent and a hyperelastic material's base tangent (without stress
+    # stiffness, as Abaqus after a step without NLGEOM; a user material takes the same path);
+    # it loses the base temperatures (_base_heated, _tdep_material) and leaves contact pairs
+    # out altogether, even surfaces that touch at the start (_freq_contact; all probed).
+    # Damage, concrete, brittle cracking, hypoelasticity, field variables, general contact and
+    # connector behaviour have no ccx counterpart (commented out or kept as an indicator), so
+    # PERTURBATION brings none in.
 
     def _frequency_perturbation(self, given: bool) -> bool:
         """Whether a *FREQUENCY step gets *STEP, PERTURBATION (``given``: the deck's).  Abaqus
         extracts frequencies about the base state with the preload's initial stress and load
         stiffness only if the base state includes nonlinear geometry (NLGEOM in an earlier
         general step), and never with initial stresses in a first step (Abaqus manual,
-        "Natural frequency extraction").  ccx 2.23 includes the base state (stresses, deformed
-        geometry, temperatures, contact) only with PERTURBATION, whatever the base step's
-        NLGEOM, and its plain *FREQUENCY is the unloaded model at its initial temperatures
-        (probed: a column under 0.37 of its buckling load, 16.87 Hz vs 20.95 Hz; the frequency
-        step's own *TEMPERATURE is ignored).  Abaqus evaluates the materials at the base
-        temperatures either way, so after linear steps that only heat the model PERTURBATION
-        is exact (probed: E halved by heating, 14.81 Hz).  ccx's modal / steady-state dynamics
-        and complex frequency steps refuse an .eig file written by a perturbation frequency
-        step ('created with perturbation info'; probed): PERTURBATION is left out there."""
+        "Natural frequency extraction"); it keeps the base state's contact status and
+        temperatures either way ("General and linear perturbation procedures").  ccx 2.23
+        includes the base state (stresses, deformed geometry, temperatures, contact) only with
+        PERTURBATION, whatever the base step's NLGEOM, and its plain *FREQUENCY has no contact
+        and the initial temperatures (probed: a column under 0.37 of its buckling load, 16.87 Hz
+        vs 20.95 Hz; touching a fixed plate, 29.80 Hz vs 20.95 Hz; the frequency step's own
+        *TEMPERATURE is ignored).  Where the base state holds no stress (temperatures without
+        expansion, no loads) PERTURBATION is exact (probed: E halved by heating, 14.81 Hz).
+        ccx's modal / steady-state dynamics and complex frequency steps refuse an .eig file
+        written by a perturbation frequency step ('created with perturbation info'; probed):
+        PERTURBATION is left out on the frequency step they read (_freq_read)."""
+        read = self._step_idx in self._freq_read
+        contact = self._freq_contact
+        left = "the deck's PERTURBATION dropped" if given else "left out"
         if not self._general_step_seen:
-            if given and self._freq_storage:
+            if contact and not read and not self._initial_stresses:
+                if not given:
+                    self.report.note("*STEP, PERTURBATION written on a first *FREQUENCY step with "
+                                     "contact pairs: Abaqus extracts its frequencies with the initial "
+                                     "contact status, ccx 2.23's plain *FREQUENCY leaves contact out "
+                                     "altogether, its PERTURBATION brings it in (probed: a column "
+                                     "touching a fixed plate, 30.37 Hz vs 20.95 Hz).", once=True)
+                return True
+            if contact:
+                self.report.warn("*FREQUENCY step with contact pairs and no general step before it: "
+                                 "Abaqus extracts its frequencies with the initial contact status, "
+                                 "ccx 2.23 only with PERTURBATION (its plain *FREQUENCY leaves "
+                                 "contact out altogether), which " +
+                                 ("the modal / steady-state dynamics step that reads its eigenmodes "
+                                  "refuses ('created with perturbation info')" if read else
+                                  "would also bring in the initial stresses, which Abaqus leaves "
+                                  "out there") + f"; {left}.", once=True)
+                self._reduces("contact left out of a *FREQUENCY step (ccx's plain *FREQUENCY "
+                              "drops it)")
+                return False
+            if given and read:
                 self.report.note("*STEP, PERTURBATION dropped on the first *FREQUENCY step "
                                  "(no preload before it, so nothing changes; ccx's modal / "
                                  "steady-state dynamics step refuses perturbation "
@@ -7708,14 +7732,14 @@ class Converter:
                 return given
             return False
         temps = self._base_heated and self._tdep_material
-        left = "the deck's PERTURBATION dropped" if given else "left out"
         if self._base_nlgeom:
-            if self._freq_storage:
+            if read:
                 self.report.warn("*FREQUENCY step after an NLGEOM general step, whose eigenmodes a "
                                  "modal / steady-state dynamics step reads: Abaqus includes the "
                                  "preload's stress stiffness" + (" and evaluates the materials at "
-                                 "the base temperatures" if temps else "") + ", ccx 2.23 only with "
-                                 "PERTURBATION, which that step then refuses ('created with "
+                                 "the base temperatures" if temps else "") + (" and keeps the base "
+                                 "state's contact status" if contact else "") + ", ccx 2.23 only "
+                                 "with PERTURBATION, which that step then refuses ('created with "
                                  f"perturbation info'); {left}.", once=True)
                 self._reduces("prestress of a *FREQUENCY step that modal / steady-state dynamics read")
                 return False
@@ -7725,48 +7749,64 @@ class Converter:
                                  "ccx 2.23 only with PERTURBATION (probed: a column under 0.37 of its "
                                  "buckling load, 16.87 Hz vs 20.95 Hz without).", once=True)
             return True
-        if self._plain_freq_exact and not temps:
+        if not (contact or temps):
             if given:
                 self.report.note("*STEP, PERTURBATION dropped on a *FREQUENCY step after general "
                                  "steps without NLGEOM: Abaqus then leaves the preload's stress "
                                  "stiffness out, ccx 2.23's PERTURBATION would include it (probed); "
                                  "nothing else in the deck's base state needs it.", once=True)
             return False
-        if not given and (not self._plain_freq_exact or self._base_stressed or self._expansion):
-            if temps:
-                self.report.warn("*FREQUENCY step after general steps without NLGEOM that heat a "
-                                 "temperature-dependent material: Abaqus evaluates the materials at "
-                                 "the base temperatures, ccx 2.23's plain *FREQUENCY at the initial "
-                                 "ones (probed); its PERTURBATION would add the base state's stress "
-                                 "stiffness and deformed geometry, which Abaqus leaves out here.",
-                                 once=True)
-                self._reduces("*FREQUENCY step at the initial temperatures (Abaqus: the base "
-                              "state's)")
-            return False
-        if self._freq_storage:
+        lost = " and ".join(w for w, on in (("contact status", contact), ("temperatures", temps))
+                            if on)
+        if read:
             self.report.warn("*FREQUENCY step after general steps without NLGEOM, whose eigenmodes "
-                             "a modal / steady-state dynamics step reads: Abaqus keeps the base "
-                             "state's " + ("temperatures" if self._plain_freq_exact else
-                                           "contact, temperatures and material state") +
-                             ", ccx 2.23 only with PERTURBATION, which that step then refuses "
-                             f"('created with perturbation info'); {left}.", once=True)
+                             f"a modal / steady-state dynamics step reads: Abaqus keeps the base "
+                             f"state's {lost}, ccx 2.23 only with PERTURBATION, which that step "
+                             f"then refuses ('created with perturbation info'); {left}.", once=True)
             self._reduces("base state of a *FREQUENCY step that modal / steady-state dynamics read")
             return False
-        if self._plain_freq_exact and not (self._base_stressed or self._expansion):
-            if not given:
+        if not (self._base_stressed or (self._expansion and self._base_heated)):
+            if not given and temps:
                 self.report.note("*STEP, PERTURBATION written on a *FREQUENCY step after general "
                                  "steps without NLGEOM that only heat the model: Abaqus evaluates "
                                  "the materials at the base temperatures, ccx 2.23 only with "
                                  "PERTURBATION, and the base state holds no stress it would add "
                                  "(probed: E halved by heating, 14.81 Hz vs 20.95 Hz).", once=True)
+            if not given and contact:
+                self.report.note("*STEP, PERTURBATION written on a *FREQUENCY step with contact "
+                                 "pairs after general steps without NLGEOM that leave the model "
+                                 "unstressed: Abaqus keeps the base state's contact status, ccx "
+                                 "2.23's plain *FREQUENCY leaves contact out altogether, and the "
+                                 "base state holds no stress its PERTURBATION would add (probed: "
+                                 "a column touching a fixed plate, 29.80 Hz vs 20.95 Hz).", once=True)
             return True
-        self.report.warn("*FREQUENCY step with PERTURBATION after general steps without "
-                         "NLGEOM: ccx 2.23 includes the preload's stress stiffness there, "
-                         "which Abaqus leaves out; PERTURBATION is kept for the rest of the "
-                         "base state (contact, temperatures, material state), which ccx's "
-                         "plain step would lose.", once=True)
-        self._reduces("*FREQUENCY step after a linear preload: ccx adds its stress stiffness")
-        return True
+        if given:
+            self.report.warn("*FREQUENCY step with PERTURBATION after general steps without "
+                             "NLGEOM: ccx 2.23 includes the preload's stress stiffness there, "
+                             "which Abaqus leaves out; PERTURBATION is kept for the base state's "
+                             f"{lost}, which ccx's plain step would lose.", once=True)
+            self._reduces("*FREQUENCY step after a linear preload: ccx adds its stress stiffness")
+            return True
+        if temps:
+            self.report.warn("*FREQUENCY step after general steps without NLGEOM that heat a "
+                             "temperature-dependent material: Abaqus evaluates the materials at "
+                             "the base temperatures, ccx 2.23's plain *FREQUENCY at the initial "
+                             "ones (probed); its PERTURBATION would add the base state's stress "
+                             "stiffness and deformed geometry, which Abaqus leaves out here.",
+                             once=True)
+            self._reduces("*FREQUENCY step at the initial temperatures (Abaqus: the base "
+                          "state's)")
+        if contact:
+            self.report.warn("*FREQUENCY step with contact pairs after loaded general steps "
+                             "without NLGEOM: Abaqus keeps the base state's contact status, ccx "
+                             "2.23's plain *FREQUENCY leaves contact out altogether (probed: a "
+                             "column pressed against a fixed plate, 20.95 Hz vs 30.14 Hz with "
+                             "PERTURBATION); its PERTURBATION would add the base state's stress "
+                             "stiffness and deformed geometry, which Abaqus leaves out here.",
+                             once=True)
+            self._reduces("contact left out of a *FREQUENCY step (ccx's plain *FREQUENCY "
+                          "drops it)")
+        return False
 
     def _yield_segfaults(self, proc: Optional[str], nlgeom: bool) -> None:
         """Warn about the steps where ccx 2.23 segfaults on a plastic or creeping material
@@ -12727,7 +12767,7 @@ class Converter:
                 continue
             else:
                 self.report.note(f"*FREQUENCY parameter {k} dropped (Abaqus-only).", once=True)
-        if self._freq_storage and "STORAGE" not in keep:
+        if self._step_idx in self._freq_read and "STORAGE" not in keep:
             keep["STORAGE"] = "YES"
             self.report.note("*FREQUENCY: STORAGE=YES added — a later modal / steady-state "
                              "dynamics step reads the eigenmodes from the .eig file ccx writes "
@@ -18762,17 +18802,24 @@ class Converter:
         self._step_idx = 0
         self._step_nlgeom = False
         self._has_sensitivity = any(b.keyword in ("SENSITIVITY", "FEASIBLE DIRECTION") for b in blocks)
-        # a *FREQUENCY step must store its eigenmodes (STORAGE=YES) for a later modal or
-        # steady-state dynamics step to read them ("cannot open eigenvalue file")
-        self._freq_storage = any(b.keyword in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS",
-                                               "COMPLEX FREQUENCY") for b in blocks)
+        # the *FREQUENCY steps whose eigenmodes a later modal / steady-state dynamics or complex
+        # frequency step reads (the last one before it, as in Abaqus): they must store them
+        # (STORAGE=YES, or ccx stops: 'cannot open eigenvalue file'), and those steps refuse
+        # eigenmodes of a perturbation step (_frequency_perturbation)
+        self._freq_read = set()
+        last_freq = None
+        for idx, group in enumerate(step_groups(blocks)[1], 1):
+            proc = next((b.keyword for b in group[1:] if b.keyword in PROC_KW), None)
+            if proc == "FREQUENCY":
+                last_freq = idx
+            elif last_freq and proc in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS",
+                                        "COMPLEX FREQUENCY"):
+                self._freq_read.add(last_freq)
         # what a perturbation step's base state holds (_frequency_perturbation; a first
         # *BUCKLE step: handle_step)
         self._initial_stresses = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "STRESS"
                                      for b in blocks)
-        self._plain_freq_exact = not any(
-            (b.keyword in self._BASE_STATE_CARDS and not (b.keyword == "CONTACT PAIR" and b.has("TIED")))
-            or (b.keyword in ("SPRING", "CONNECTOR ELASTICITY") and b.has("NONLINEAR")) for b in blocks)
+        self._freq_contact = any(b.keyword == "CONTACT PAIR" and not b.has("TIED") for b in blocks)
         self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY") and temperature_dependent(b)
                                   for b in blocks)
         self._expansion = any(b.keyword == "EXPANSION" for b in blocks)

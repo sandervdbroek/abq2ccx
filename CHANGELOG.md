@@ -65,6 +65,18 @@ physics.
   no longer kept for temperatures of temperature-independent materials, or for `*FIELD`.
   Before a modal or steady-state dynamics step, which refuses perturbation eigenmodes, the
   deck's own `PERTURBATION` is dropped (warned, reduced physics): ccx stopped there.
+* **`*FREQUENCY` with contact** — ccx 2.23's plain `*FREQUENCY` leaves contact pairs out
+  altogether, even surfaces that touch at the start (probed: a column resting against a fixed
+  plate kept its free frequencies); Abaqus keeps the base state's contact status. As the first
+  step, or after linear steps that leave the model unstressed, the converter now writes
+  `*STEP, PERTURBATION`, which is exact there; after a preload it warns (reduced physics). After
+  linear steps, a deck's `PERTURBATION`, which adds the preload's stress stiffness Abaqus leaves
+  out, is now dropped for hyperelastic materials, gaps, nonlinear springs and `*MODEL CHANGE`
+  (ccx's plain step keeps their base state; probed), user materials, and damage or concrete,
+  which ccx does not have.
+* **Eigenmodes read per `*FREQUENCY` step** — `STORAGE=YES`, and dropping `PERTURBATION`
+  before a modal or steady-state dynamics or complex frequency step, now apply only to the
+  frequency step that step reads (the last one before it); the others keep their prestress.
 * **Rotational BCs on new midside nodes with a `*TRANSFORM`** — the midside node the
   converter adds to an upgraded beam (B31 under `SECTION=CIRC`, `PIPE`, `BOX`) or composite
   shell edge (S4 → S8R) takes its end nodes' BCs. Its rotations stayed in local components

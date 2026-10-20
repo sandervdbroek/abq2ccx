@@ -6024,6 +6024,84 @@ def test_total_time_amplitudes_after_a_modal_dynamic_step():
     assert "of unknown time period" in rep.text() and conv.reduced_physics
 
 
+def test_frequency_base_contact():
+    # ccx 2.23's plain *FREQUENCY leaves contact pairs out altogether, even surfaces touching
+    # at the start; its PERTURBATION brings the base state's contact status in, which Abaqus
+    # keeps (probed: a column touching a fixed plate, 20.95 Hz plain, 29.80 Hz with
+    # PERTURBATION after an unloaded step, 30.37 Hz as a first step): exact where the base
+    # state holds no stress PERTURBATION would add
+    pair = ("*Surface, name=SA\nROT, S1\n*Surface, name=SB\nROT, S2\n*Surface Interaction, name=SI\n"
+            "*Contact Pair, interaction=SI\nSA, SB\n")
+    cont, cold = BUCKLE_CUBE + pair, BUCKLE_CUBE.replace("*Expansion\n1e-3\n", "") + pair
+    load, heat, modal = "*Cload\n7, 3, -1.\n", "*Temperature\nALL, 50.\n", _deck_step("Modal Dynamic\n0.1, 1.")
+    lost = ["contact left out of a *FREQUENCY step (ccx's plain *FREQUENCY drops it)"]
+
+    def heads(model, pre, head="", after=""):
+        body, conv, rep = convert_str(model + pre + _deck_step("Frequency\n3", "", head) + after)
+        return [s.split("\n")[0] for s in body.split("*STEP")[1:]], conv.reduced_physics, rep.text()
+
+    # a first step: the initial contact status
+    got, red, rep = heads(cont, "")
+    assert got == [", PERTURBATION"] and not red and "first *FREQUENCY step with contact pairs" in rep
+    # ... which ccx's PERTURBATION cannot bring in alone with initial stresses, nor for a modal
+    # dynamics step, which refuses perturbation eigenmodes
+    stress = cont + "*Initial Conditions, type=stress\nEALL, 0., 0., -1., 0., 0., 0.\n"
+    for model, after in ((stress, ""), (cont, modal)):
+        for head in ("", ", perturbation"):
+            got, red, rep = heads(model, "", head, after)
+            assert got[0] == "" and red == lost and "Abaqus extracts its frequencies with the initial" in rep
+    # linear general steps that leave the model unstressed (heating without expansion)
+    for model, cards in ((cont, ""), (cold, heat)):
+        got, red, rep = heads(model, _deck_step("Static", cards))
+        assert got == ["", ", PERTURBATION"] and not red and "leave the model unstressed" in rep
+    # a load, or heating with expansion: no form is exact, the deck's kept
+    for cards in (load, heat):
+        got, red, rep = heads(cont, _deck_step("Static", cards))
+        assert got == ["", ""] and red == lost and "pressed against a fixed plate" in rep
+        got, red, rep = heads(cont, _deck_step("Static", cards), ", perturbation")
+        assert got == ["", ", PERTURBATION"] and "kept for the base state's contact status" in rep
+    # a modal dynamics step reads the eigenmodes
+    got, red, rep = heads(cont, _deck_step("Static"), after=modal)
+    assert got == ["", "", ""] and "Abaqus keeps the base state's contact status" in rep
+    assert red == ["base state of a *FREQUENCY step that modal / steady-state dynamics read"]
+    # a tied pair is a *TIE, which the plain step keeps
+    tied = BUCKLE_CUBE + pair.replace("interaction=SI\n", "interaction=SI, tied\n")
+    assert heads(tied, "")[0] == [""]
+    assert heads(tied, _deck_step("Static"), ", perturbation")[0] == ["", ""]
+
+
+def test_frequency_base_states_the_plain_step_keeps():
+    # ccx 2.23's plain *FREQUENCY keeps a *MODEL CHANGE's removed elements, a hyperelastic
+    # material's base tangent without stress stiffness (as Abaqus after a step without NLGEOM),
+    # the gap status and a nonlinear spring's tangent (probed); damage and concrete have no
+    # ccx counterpart: after linear steps the deck's PERTURBATION, which adds the stress
+    # stiffness, goes
+    load = "*Cload\n7, 3, -1.\n"
+    hyper = BUCKLE_CUBE.replace("*Elastic\n1000., 0.\n", "*Hyperelastic, neo hooke\n100., 0.001\n")
+    damage = BUCKLE_CUBE.replace("*Density", "*Damage Initiation, criterion=ductile\n0.5, 0.3, 0.\n*Density")
+    for model, cards in ((hyper, load), (damage, load), (BUCKLE_CUBE, load + "*Model Change, remove\nROT\n")):
+        body, conv, rep = convert_str(model + _deck_step("Static", cards) +
+                                      _deck_step("Frequency\n3", "", ", perturbation"))
+        assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == ["", ""]
+        assert "nothing else in the deck's base state needs it" in rep.text()
+
+
+def test_frequency_read_by_dynamics_per_step():
+    # a modal / steady-state dynamics or complex frequency step reads the eigenmodes of the
+    # last *FREQUENCY step before it: only that one stores them and loses PERTURBATION
+    nl = _deck_step("Static", "*Cload\n7, 3, -1.\n", ", nlgeom")
+    fr, modal = _deck_step("Frequency\n3"), _deck_step("Modal Dynamic\n0.1, 1.")
+    cf = _deck_step("Complex Frequency\n3")
+    for steps, want in (((fr, fr, modal), ["", ", PERTURBATION", "", ""]),
+                        ((fr, modal, fr), ["", "", "", ", PERTURBATION"]),
+                        ((fr, cf), ["", "", ""])):
+        body, _, _ = convert_str(BUCKLE_CUBE + nl + "".join(steps))
+        got = body.split("*STEP")[1:]
+        assert [s.split("\n")[0] for s in got[1:]] == want[1:] and got[0].startswith(", NLGEOM")
+        read = [i for i, s in enumerate(steps, 1) if s == fr and steps[i:i + 1] in ((modal,), (cf,))]
+        assert [i for i, s in enumerate(got) if "STORAGE=YES" in s] == read
+
+
 def test_buckle_perturbation_prescribed_displacements():
     # ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for prescribed displacements:
     # only those nodes move, by every nonzero BC value in force (probed: 2.389 for 40.87)

@@ -2869,6 +2869,46 @@ def frequency_heated_deck(heat=True, t0=20.0):
     return deck + "\n".join(lines + ["*STEP", "*FREQUENCY", "4", "*END STEP"]) + "\n"
 
 
+def frequency_contact_deck(case, n=2, m=20):
+    """buckle_gravity_deck's column with a fixed C3D8 plate resting on its top face (a
+    frictionless *CONTACT PAIR, Abaqus' default HARD contact), and a plain *FREQUENCY step for
+    4 modes: ``case`` "first" (the first step), "after" (after a static step that loads
+    nothing); "held" no plate, the top face held vertically instead (the closed frictionless
+    contact Abaqus' frequency step freezes, without a penalty); "free" no plate."""
+    deck = buckle_gravity_deck("", buckle=False, n=n, m=m)
+    lines = ["*ELSET, ELSET=ETOP", ", ".join(map(str, range((m - 1) * n * n + 1, m * n * n + 1)))]
+    if case in ("first", "after"):
+        q = 4
+        pid = lambda i, j, k: 10001 + i + (q + 1) * (j + (q + 1) * k)        # noqa: E731
+        lines += ["*NODE, NSET=PLATE"] + [f"{pid(i, j, k)}, {-0.05 + 0.2 * i / q:.6g}, "
+                                          f"{-0.05 + 0.2 * j / q:.6g}, {2.0 + 0.05 * k:.6g}"
+                                          for k in (0, 1) for j in range(q + 1) for i in range(q + 1)]
+        lines += ["*ELEMENT, TYPE=C3D8, ELSET=PL"] + [
+            f"{1001 + i + q * j}, {pid(i, j, 0)}, {pid(i + 1, j, 0)}, {pid(i + 1, j + 1, 0)}, "
+            f"{pid(i, j + 1, 0)}, {pid(i, j, 1)}, {pid(i + 1, j, 1)}, {pid(i + 1, j + 1, 1)}, "
+            f"{pid(i, j + 1, 1)}" for j in range(q) for i in range(q)]
+        lines += ["*SOLID SECTION, ELSET=PL, MATERIAL=STEEL", "*SURFACE, NAME=CTOP", "ETOP, S2",
+                  "*SURFACE, NAME=PBOT", "PL, S1", "*SURFACE INTERACTION, NAME=SMOOTH",
+                  "*CONTACT PAIR, INTERACTION=SMOOTH", "CTOP, PBOT", "*BOUNDARY", "PLATE, 1, 3"]
+    elif case == "held":
+        lines += ["*NSET, NSET=TOPN, ELSET=ETOP", "*BOUNDARY", "TOPN, 3, 3"]
+    if case == "after":
+        lines += ["*STEP", "*STATIC", "*END STEP"]
+    return deck + "\n".join(lines + ["*STEP", "*FREQUENCY", "4", "*END STEP"]) + "\n"
+
+
+def frequency_read_deck(modal=True):
+    """frequency_preload_deck's column under gravity with NLGEOM, then a plain *FREQUENCY step;
+    ``modal``: then a second *FREQUENCY step and a *MODAL DYNAMIC step (2 % damping) pulling
+    TIP sideways by 1e3, which reads that second step's eigenmodes."""
+    deck = frequency_preload_deck(True, False, "grav")
+    if modal:
+        deck += "\n".join(["*STEP", "*FREQUENCY", "4", "*END STEP", "*STEP", "*MODAL DYNAMIC",
+                           "1.e-3, 2.e-2", "*MODAL DAMPING", "1, 4, 0.02", "*CLOAD", "TIP, 1, 1.e3",
+                           "*NODE PRINT, NSET=TIP", "U", "*END STEP"]) + "\n"
+    return deck
+
+
 def compact_params_deck():
     """Two unit C3D8 cubes 0.05 apart (E 1000, nu 0) held at the bottom on rollers, every
     multi-word parameter name written without blanks: the upper cube an *ELCOPY of the lower
@@ -6303,6 +6343,44 @@ def main():
               f"20 to 120 degrees, heated to 120 in a static step, then a plain *FREQUENCY step): "
               f"{f[0][0]:.7g} vs {f[1][0]:.7g} at an initial 120 (4 modes, max {err:.1e} apart); "
               f"{f[2][0]:.7g} cold, ratio {ratio:.7f} (sqrt(1/2))")
+    failures += 0 if ok else 1
+    # ccx 2.23's plain *FREQUENCY leaves contact out altogether, PERTURBATION brings the base
+    # state's contact status in, as Abaqus keeps it: the converter writes it where the base
+    # state holds no stress (a first step, or after a step that loads nothing)
+    f = [review_run(frequency_contact_deck(case), "frequency_base_contact_" + case,
+                    lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+         for case in ("first", "after", "held", "free")]
+    ok = all(f)
+    if ok:
+        err = max(abs(a / b - 1) for a, b in zip(f[0], f[1]))
+        ok = len(f[0]) == len(f[1]) == 4 and err < 1e-6 and 0.9 * f[2][0] < f[0][0] < f[2][0] and \
+            f[0][0] > 1.4 * f[3][0]
+        print(f"{'PASS' if ok else 'FAIL'}  frequency_base_contact (the column's top face resting on "
+              f"a fixed plate, frictionless contact, a plain *FREQUENCY step): {f[0][0]:.7g} as the "
+              f"first step, {f[1][0]:.7g} after an unloaded static step (max {err:.1e} apart); "
+              f"{f[2][0]:.7g} held vertically (ccx's HARD contact is a penalty), {f[3][0]:.7g} "
+              f"without the plate (ccx's plain step)")
+    failures += 0 if ok else 1
+    # a PERTURBATION *FREQUENCY step whose eigenmodes no modal dynamics step reads keeps the
+    # NLGEOM preload's stress stiffness; the one the *MODAL DYNAMIC step reads goes without
+    title = "E I G E N V A L U E   O U T P U T"
+    tables = lambda dat: [[r[3] if len(r) == 5 else r[1] for r in t if len(r) in (2, 5)]  # noqa: E731
+                          for t in dat_tables(dat, title)]
+    both = review_run(frequency_read_deck(True), "frequency_read_by_modal",
+                      lambda dat: (tables(dat), dat_displacements(dat)))
+    alone = review_run(frequency_read_deck(False), "frequency_read_alone", tables)
+    unloaded = review_run(frequency_preload_deck(False, False, ""), "frequency_read_unloaded", tables)
+    ok = bool(both and alone and unloaded) and len(both[0]) == 2
+    if ok:
+        (pre, plain), tip = both[0], next(iter(both[1].values()), [0.0])
+        err = max(abs(a / b - 1) for a, b in zip(pre, alone[0]))
+        err2 = max(abs(a / b - 1) for a, b in zip(plain, unloaded[0]))
+        ok = err < 1e-9 and err2 < 1e-9 and pre[0] < 0.9 * plain[0] and abs(tip[0]) > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  frequency_read_by_modal (the column under gravity with "
+              f"NLGEOM, two *FREQUENCY steps, a *MODAL DYNAMIC step): the first {pre[0]:.7g} with "
+              f"the prestress, as alone ({err:.1e} apart), the second, which the modal step reads, "
+              f"{plain[0]:.7g} without (ccx's modal step refuses perturbation eigenmodes; "
+              f"{err2:.1e} from unloaded), TIP moves {tip[0]:.4g}")
     failures += 0 if ok else 1
 
     # *BUCKLE loaded by a prescribed displacement: ccx 2.23 does not solve a *STEP, PERTURBATION
