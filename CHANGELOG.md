@@ -15,6 +15,19 @@ physics.
   into later eigenvalue, modal and linear steps (a cantilever tied to a `*RIGID BODY`: 61 kHz
   for 462 Hz); that is now warned, with reduced physics. A `*MASS`-only member of such a body
   no longer gets the massless tetrahedron there, on which ccx exited 255.
+* **Cards ccx stopped on without a warning** — a transient `*HEAT TRANSFER` without DELTMX
+  and a `*VISCO` without CETOL get DIRECT, but their interval output went out as TIME POINTS,
+  which ccx refuses beside DIRECT; it is now FREQUENCY=. An analytic amplitude is sampled
+  over the steps that read it, not commented out because a later step's time is unknown (a
+  Riks step); an amplitude a card uses that is still commented out is warned (ccx stops
+  there). `*BOUNDARY, FIXED` on shell, beam or coupling rotations holds them at the value the
+  step finds them at, where it is known (else left free, warned). A collapsed S4R is written
+  as S3R, Abaqus' own triangle for it (exact; a collapsed S4 under `--approximate`). `*CLOAD`
+  on DOF 0, 11 or above 30 is left out, warned. A displacement BC new on a `*TRANSFORM`
+  node's DOF still at rest ramps as in Abaqus (it was stepped, flagged reduced). Warned where
+  ccx still stops or runs without end: trusses in an explicit step, `*DISTRIBUTING` on a
+  node surface kept as ccx's card, moments on beam nodes in `*DYNAMIC` (exit 255) and around
+  a `*BUCKLE` step (an endless MPC loop).
 * **Rigid-body reference nodes** — a shell `REF NODE` with a `*TRANSFORM` in its own body kept
   the axes after the free reference node took its place, so its drilling rotation stayed free in
   a `*DYNAMIC` step and ccx stopped; the free node now takes the `*TRANSFORM`, and the shell

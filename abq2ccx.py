@@ -4627,6 +4627,20 @@ def step_procedure(cards: Sequence[Block]) -> Optional[Block]:
     return next((b for b in cards[1:] if b.keyword in STEP_PROCS), None)
 
 
+def direct_added(card: Optional[Block]) -> bool:
+    """Whether the procedure card the converter writes for ``card`` has a DIRECT the deck's
+    lacks: a transient *HEAT TRANSFER without DELTMX (handle_heat_transfer) and a *VISCO
+    without CETOL (handle_visco), which Abaqus runs at fixed increments of the initial one.
+    _step_timing reads the procedure as written: ccx stops on TIME POINTS output under
+    DIRECT ('the DIRECT option collides with a TIME POINTS specification', probed)."""
+    if card is None:
+        return False
+    if card.keyword == "HEAT TRANSFER":
+        return not card.has("STEADY STATE") and not card.param("DELTMX") and not card.has("DIRECT")
+    return card.keyword == "VISCO" and not (card.param("CETOL") or "").strip() and \
+        not card.has("DIRECT")
+
+
 def perturbation_step(cards: Sequence[Block]) -> bool:
     """A step's cards (its *STEP first) make an Abaqus linear perturbation step: *STEP,
     PERTURBATION, or a procedure (step_procedure) in PERTURBATION_PROCS.  The one rule
@@ -4951,6 +4965,8 @@ class StepModel:
         # time period as well, from the general steps' total time before it (_shift_total_time
         # takes out what ccx adds to it), though Abaqus adds no perturbation step's time.
         self.amp_span: Optional[Tuple[float, float]] = None
+        # ... over the steps before the first one whose time is unknown (amp_span_of)
+        self._amp_known: Tuple[int, Optional[Tuple[float, float]]] = (0, None)
         longest = total = reach = 0.0
         for s in steps:
             if s.advance is None:
@@ -4964,9 +4980,42 @@ class StepModel:
                     pass
             longest, total = max(longest, s.advance, period), total + s.advance
             reach = max(reach, total + period)
+            self._amp_known = (s.no, (longest, reach) if reach > 0.0 else None)
         else:
             if reach > 0.0:
                 self.amp_span = (longest, reach)
+        # the steps whose cards name each amplitude (AMPLITUDE=, FILM AMPLITUDE=, ...; a card
+        # before the first step: step 1), and
+        # whether the steps of unknown time are Riks steps, where Abaqus applies its loads
+        # proportionally and reads no amplitude (and allows no step after one)
+        self._amp_users: Dict[str, set] = {}
+        no = 1
+        for is_step, cards in deck_parts(blocks):
+            for b in cards:
+                for k, v in b.params.items() if b.keyword != "AMPLITUDE" else ():
+                    if "AMPLITUDE" in k and v and v.strip():
+                        self._amp_users.setdefault(v.strip().upper(), set()).add(no)
+            no += is_step
+        self._riks_tail = all(s.procedure is not None and s.procedure.has("RIKS")
+                              for s in steps[self._amp_known[0]:])
+
+    def amp_named(self, name: str) -> bool:
+        """Whether a card names amplitude ``name`` (AMPLITUDE=, FILM AMPLITUDE=, ...)."""
+        return name.strip().upper() in self._amp_users
+
+    def amp_span_of(self, name: str, total: bool) -> Optional[Tuple[float, float]]:
+        """The span _sample_amplitude tabulates amplitude ``name`` over (``total``: on total
+        time): amp_span, or where a step's time is unknown (a Riks step, ...) the span of the
+        steps before it, if those are all the steps that read it - the ones whose cards name it
+        (a load on a step-time amplitude carried into a later step holds its end value: Abaqus,
+        and ccx at the end of each step), for a TIME=TOTAL TIME one every step but Riks steps.
+        None where a step that reads it has an unknown time."""
+        known, span = self._amp_known
+        if self.amp_span is not None or span is None:
+            return self.amp_span
+        if any(s > known for s in self._amp_users.get(name.strip().upper(), ())):
+            return None
+        return span if not total or self._riks_tail else None
 
     def __iter__(self) -> Iterator[Step]:
         return iter(self.steps)
@@ -7067,6 +7116,10 @@ class Converter:
     def _amp_span(self) -> Optional[Tuple[float, float]]:
         """The longest step time and the latest total time the steps read amplitudes at."""
         return self._steps_now.amp_span
+
+    def _amp_span_of(self, b: Block, total: bool) -> Optional[Tuple[float, float]]:
+        """... at which they read *AMPLITUDE ``b`` (StepModel.amp_span_of)."""
+        return self._steps_now.amp_span_of(b.param("NAME") or "", total)
 
     @property
     def _mpc_thermal(self) -> bool:
@@ -12846,7 +12899,7 @@ class Converter:
             classes = [[[self._default_amp_class(ln, d, kind, rest[s][0]) for d in ln["dofs"]]
                         for ln in lines] for _, kind, _, _, lines in items]
             if items[0][1] == "ramp":
-                self._local_axes_ramps(s, items, classes, rest[s][1], seen)
+                self._local_axes_ramps(s, items, classes, rest[s][1], rest[s][0], seen)
             for (_, kind, proc, b, lines), cls in zip(items, classes):
                 done = {c for cs in cls for c in cs}
                 for c in done - {"keep"}:
@@ -12908,6 +12961,112 @@ class Converter:
                              "node's global component as the local value). Kept as given: ccx "
                              "moves the DOF to that value at once.", once=True)
             self._reduces("explicit-step BC moved where Abaqus/Explicit holds it")
+
+    def _plan_fixed_rotations(self, blocks: List[Block]) -> None:
+        """*BOUNDARY, FIXED lines on rotations FIXED cannot hold in ccx (_holdable False: a
+        shell, beam or coupling node's), on which ccx 2.23 stops ('parameter FIXED cannot be
+        used for rotations', probed).  Abaqus holds the DOF where the step finds it.  Such a
+        rotation is written as that value on a plain line (constant through the step in either
+        ccx default, as the DOF is there already): 0 where it is still at rest (_dofs_at_rest),
+        else the value of the BC in force on it when the step starts, where the converter
+        knows it (a constant one, an amplitude's end value, or a FIXED one planned so; not one
+        an explicit step ignores the value of).  Else the rotation is left out of the card
+        (free in that step), warned, with reduced physics.  The card's other DOFs keep FIXED;
+        its pieces go to _amp_cards (handle_boundary)."""
+        model, groups = step_groups(blocks)
+        mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
+        todo: List[Tuple[int, Block, List[dict]]] = []
+        query: set = set()
+        for s, group in enumerate([model] + groups):
+            for b in group:
+                if b.keyword != "BOUNDARY" or not b.has("FIXED") or b.has("USER") or \
+                        b.has("SUBMODEL") or self._bc_type(b) != "DISPLACEMENT" or \
+                        id(b) in self.steps.lc2 or id(b) in self._amp_cards:
+                    continue
+                lines = self._amp_lines(b, mid_ends)
+                rots = {(n, d) for ln in lines for n in ln["nodes"] for d in ln["dofs"]
+                        if d >= 4 and self._holdable(n, d) is False}
+                if rots:
+                    todo.append((s, b, lines))
+                    query |= rots
+        if not todo:
+            return
+        rest = self._dofs_at_rest(model, groups, query, {s for s, _, _ in todo if s})
+        curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
+                  if b.keyword == "AMPLITUDE" and b.param("NAME")}
+        totals = {b.uparam("NAME") for b in blocks if b.keyword == "AMPLITUDE" and
+                  b.uparam("TIME").replace(" ", "") == "TOTALTIME"}
+        step_of = {id(b): s for s, group in enumerate(groups, 1) for b in group}
+        planned: Dict[int, Dict[Tuple[int, int], Optional[float]]] = {}    # card -> its values
+
+        def entries(b: Block) -> list:
+            """(pair, (value or None, card id)) of a *BOUNDARY's pairs in ``query``."""
+            s = step_of.get(id(b))
+            step = self.steps.steps[s - 1] if s else None
+            amp = (b.param("AMPLITUDE") or "").strip().upper()
+            factor: Optional[float] = 1.0
+            if b.has("FIXED") or b.has("USER") or b.has("SUBMODEL") or \
+                    self._bc_type(b) != "DISPLACEMENT" or (step is not None and step.explicit and not amp):
+                factor = None
+            elif amp:
+                factor = None if amp in totals else \
+                    held_factor(curves.get(amp), b.param("TIME DELAY"), step.period if step else None)
+            return [((n, d), (None if factor is None or mag != mag else mag * factor, id(b)))
+                    for nodes, dofs, mag in self._bc_records(b) for n in nodes for d in dofs
+                    if (n, d) in query]
+        folds = self.steps.states(entries, skip=self.steps.lc2, model=True, blocks=[*model, *(
+            b for g in groups for b in g)])
+        start = [dict(next(folds))]                 # what holds each pair when step s + 1 starts
+        for s, _ in enumerate(groups, 1):
+            end = dict(next(folds))
+            start.append(start[-1] if s in self._pert_idx else end)     # (the base state again)
+        lost: List[str] = []
+        for s, b, lines in todo:
+            at_rest = rest[s][0] if s else query
+            held = start[s - 1] if s else {}        # (model data: everything at rest)
+            mine = planned.setdefault(id(b), {})
+            entries_out: List[Tuple[Optional[str], str]] = []
+            for ln in lines:
+                keep = [d for d in ln["dofs"] if not (d >= 4 and any(
+                    self._holdable(n, d) is False for n in ln["nodes"]))]
+                if not ln["dofs"]:
+                    entries_out.append(("FIXED", ln["text"]))
+                    continue
+                for a, c in dof_runs(keep):
+                    entries_out.append(("FIXED", f"{ln['spec']}, {a}, {c}"))
+                for n in ln["nodes"]:
+                    for d in ln["dofs"]:
+                        if d < 4 or self._holdable(n, d) is not False:
+                            continue
+                        if (n, d) in at_rest:
+                            v: Optional[float] = 0.0
+                        else:
+                            val, src = held.get((n, d), (None, None))
+                            v = planned.get(src, {}).get((n, d)) if val is None and src in planned else val
+                        mine[(n, d)] = v
+                        if v is None:
+                            lost.append(f"node {n} DOF {d} (step {s})")
+                            entries_out.append(("#", f"** abq2ccx: FIXED rotation left out (its value "
+                                                     f"is unknown): {n}, {d}, {d}"))
+                        else:
+                            entries_out.append((None, f"{n}, {d}, {d}, {short_real(v, 12)}"))
+            self._amp_cards[id(b)] = self._bc_pieces(b, entries_out, [
+                "** abq2ccx: *BOUNDARY, FIXED on shell/beam rotations (ccx's FIXED takes no "
+                "rotations): held at their value at the end of the previous step"])
+        self.report.note("*BOUNDARY, FIXED on rotations of shell, beam or coupling nodes: ccx 2.23 "
+                         "stops on FIXED there ('parameter FIXED cannot be used for rotations', "
+                         "probed), so each rotation is held at the value the previous step leaves "
+                         "it at, as Abaqus holds it: 0 where it has not moved, else the value of the "
+                         "BC that holds it.", once=True)
+        if lost:
+            self.report.warn(f"*BOUNDARY, FIXED on rotations of shell, beam or coupling nodes whose "
+                             f"value at the end of the previous step the converter does not know "
+                             f"(moved by loads, or held by a BC it cannot evaluate: "
+                             f"{', '.join(lost[:4])}{', ...' if len(lost) > 4 else ''}): left out of "
+                             f"the card, so they are free in that step - ccx's FIXED takes no "
+                             f"rotations (it stops on them). Give the rotation its value as a BC.",
+                             once=True)
+            self._reduces("*BOUNDARY, FIXED rotations left free (ccx's FIXED takes no rotations)")
 
     def _amp_lines(self, b: Block, mid_ends: Dict[int, Tuple[int, int]]) -> List[dict]:
         """The data lines of displacement *BOUNDARY ``b`` as handle_boundary reads them (after
@@ -13046,13 +13205,15 @@ class Converter:
         return r if r is not None and (r in self._transformed or r in self._rot_axes) else None
 
     def _local_axes_ramps(self, s: int, items: list, classes: list, in_force: set,
-                          seen: Dict[str, str]) -> None:
+                          at_rest: set, seen: Dict[str, str]) -> None:
         """Ramp step ``s``'s displacement lines on nodes with local axes (_local_node) all or
         none.  ccx allows one amplitude for all DOFs of such a node (manual, *AMPLITUDE), and
         it takes their BCs through an auxiliary node, from whose value its step ramp starts a
         BC new on a DOF (bounadd.f, spcmatch.f; probed on 2.23: from 0, not from where the
-        DOF is) - which is right in the first step and on a DOF that had a BC before the step
-        (ccx then ramps from that BC's value).  Where a node has a DOF of neither kind, its
+        DOF is) - which is right in the first step, on a DOF still at zero (``at_rest``: only
+        perturbation or heat transfer steps before, or held at zero), and on a DOF that had a
+        BC before the step (ccx then ramps from that BC's value).  Where a node has a DOF of
+        none of these kinds, its
         lines (and the lines sharing a DOF with them) stay at ccx's default, STEP ("step!");
         else its zero lines ramp too (from zero: no change)."""
         on: Dict[int, List[Tuple[Tuple[int, int], str]]] = {}
@@ -13071,7 +13232,8 @@ class Converter:
                     if ms:
                         shared.append(ms)
         ramped = {m for m, lst in on.items() if any(c == "ramp" for _, c in lst)}
-        bad = {m for m in ramped if s > 1 and any(k not in in_force for k, _ in on[m])}
+        bad = {m for m in ramped if s > 1 and any(k not in in_force and k not in at_rest
+                                                  for k, _ in on[m])}
         grown = True
         while grown:                                 # a node sharing a line DOF with one
             grown = False
@@ -13226,6 +13388,24 @@ class Converter:
             f = [x.strip() for x in ln.split(",")]
             lost = self._lacking_dof(int(f[1]), "CLOAD") \
                 if len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) else None
+            if lost is None and len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and \
+                    not 1 <= int(f[1]) <= 30:
+                self.report.warn(f"*CLOAD on DOF {int(f[1])} left out: Abaqus numbers its DOFs 1-30 "
+                                 f"(it stops on the line too), and ccx stops on it ('nonexistent "
+                                 f"degree of freedom', probed on 2.23).", once=True)
+                lacking.append(ln)
+                continue
+            if lost is None and len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and int(f[1]) == 11:
+                msg = ("*CLOAD on DOF 11 (temperature) left out: ccx's *CLOAD loads DOFs 1-6 only and "
+                       "stops on it ('nonexistent degree of freedom', probed on 2.23). A concentrated "
+                       "heat flux is a *CFLUX in Abaqus and ccx: write it so if the deck means one.")
+                if self._mpc_thermal:
+                    self.report.warn(msg, once=True)
+                    self._reduces("*CLOAD on DOF 11 (temperature)")
+                else:
+                    self.report.note(msg + " No step solves for temperatures.", once=True)
+                lacking.append(ln)
+                continue
             if lost is not None:
                 self._drop_dof_note("CLOAD", int(f[1]), lost)
                 lacking.append(ln)
@@ -15210,6 +15390,78 @@ class Converter:
     # a beam section axis within this angle (rad) of a global axis is along it: ccx's
     # mean-rotation error is about twice the angle (_plan_beam_section_axes)
     _AXIS_TOL = 1e-6
+
+    def _warn_beam_moment_stops(self, blocks: List[Block]) -> None:
+        """Warn of moments ccx 2.23 cannot run on beam nodes that are no knot (mean-rotation
+        MPCs, gen3dforc), probed on a cantilever along a global axis and turned in space:
+        * in an implicit *DYNAMIC step (any value, NLGEOM too) ccx exits 255 without a message;
+          a rotational BC there runs, and so does a knot beam;
+        * around a *BUCKLE step - a moment or nonzero rotational BC on the node in a general
+          step before it and a moment in it or after it (the base state's moments, which the
+          converter gives again in a general step after it: _restore_base_states, count) -
+          ccx can loop without end decascading its MPCs ('*WARNING in cascade: zero coefficient
+          on the dependent side of an equation'), writing output until it is killed (2 GB in
+          45 s: a moment about one axis before and after; some moments about several ran); a
+          knot does not.  Shell nodes do neither."""
+        if not self._mechanical or not (self.steps.dynamic or "BUCKLE" in self.steps.procs):
+            return
+        beams_at: Dict[int, List[int]] = {}
+        for e, (typ, conn) in self.geom.elements.items():
+            if ccx_type(typ) in ("B31", "B31R", "B32", "B32R"):
+                for m in conn:
+                    beams_at.setdefault(m, []).append(e)
+        own = set(beams_at) - set(self._knots) - set(self._rb_rot) - self._ref_nodes - \
+            self._kinematic_refs(blocks)
+        if not own:
+            return
+        moments: Dict[int, set] = {}            # step -> its nodes with a moment
+        turned: Dict[int, set] = {}             # ... with a moment or a nonzero rotation BC
+        step = 0
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword in ("BOUNDARY", "CLOAD") and step and id(b) not in self.steps.lc2:
+                for n, its in self._rot_items(b, own).items():
+                    if b.keyword == "CLOAD":
+                        moments.setdefault(step, set()).add(n)
+                    if b.keyword == "CLOAD" or any(not v == 0.0 for _, v in its):
+                        turned.setdefault(step, set()).add(n)
+        if not moments:
+            return
+        sections = self._knot_sections(blocks)
+        at = self._elements_at({n for ns in moments.values() for n in ns})
+
+        def plain(ns: set) -> List[int]:
+            return sorted(n for n in ns if self._ccx_knot(n, sections, at) is False)
+        steps = self.steps.steps
+        dyn = plain({n for st in steps if st.proc == "DYNAMIC" and not st.explicit
+                     for n in moments.get(st.no, ())})
+        if dyn:
+            self.report.warn(f"Moments on {len(dyn)} beam node(s) (e.g. node {dyn[0]}) in an implicit "
+                             f"*DYNAMIC step: ccx 2.23 exits without a message there (exit 255, "
+                             f"probed: also on a beam along a global axis, and under NLGEOM) when the "
+                             f"node is no knot; a rotational BC runs.", once=True)
+        loop: set = set()
+        for st in steps:
+            if st.proc != "BUCKLE":
+                continue
+            before = [s for s in steps[:st.no - 1] if not s.perturbation]
+            base = {n for s in before for n in turned.get(s.no, ())}
+            later = {n for s in steps[st.no - 1:] for n in moments.get(s.no, ())}
+            if any(not s.perturbation for s in steps[st.no:]):      # (the base state given again)
+                later |= {n for s in before for n in moments.get(s.no, ())}
+            loop |= base & later
+        loop_nodes = plain(loop)
+        if loop_nodes:
+            self.report.warn(f"Moments on {len(loop_nodes)} beam node(s) (e.g. node {loop_nodes[0]}) "
+                             f"around a *BUCKLE step - a moment or rotation on the node before it, "
+                             f"a moment in it or after it (the converter gives the base state's "
+                             f"loads again after it): ccx 2.23 can loop without end decascading "
+                             f"its MPCs there ('*WARNING in cascade: zero coefficient on the "
+                             f"dependent side of an equation'), writing output until it is stopped "
+                             f"(probed: 2 GB in 45 s with a moment about one axis before and after, "
+                             f"also on a beam along a global axis; other moments ran) where the "
+                             f"node is no knot. Run ccx with a file-size limit.", once=True)
 
     def _plan_beam_section_axes(self, blocks: List[Block]) -> None:
         """Rotational BCs and moments on beam nodes in general 3-D directions.  ccx 2.23 makes
@@ -17834,7 +18086,7 @@ class Converter:
 
     def _step_timing(self, proc: Optional[Block]) -> dict:
         """How ccx increments a step: kind 'untimed' (no time increments), 'explicit',
-        'fixed' (DIRECT as ccx gets it, see _direct_freed; *MODAL DYNAMIC: every increment
+        'fixed' (DIRECT as ccx gets it: _direct_freed, direct_added; *MODAL DYNAMIC: every increment
         the data line's first value) or
         'auto' (ccx picks the increments); its period, fixed increment and (explicit)
         maximum increment."""
@@ -17855,7 +18107,7 @@ class Converter:
             return v if math.isfinite(v) and v > 0 else None
         t["period"] = num(1) or 1.0
         direct = (proc.has("DIRECT") or proc.has("DIRECT USER CONTROL")) and \
-            not self._direct_freed(proc)
+            not self._direct_freed(proc) or direct_added(proc)
         if proc.keyword == "DYNAMIC" and proc.has("EXPLICIT"):
             t.update(kind="explicit", dt=num(0) if direct else None, dtmax=num(3))
         elif proc.keyword == "MODAL DYNAMIC" or direct:
@@ -18710,7 +18962,7 @@ class Converter:
                                  f"its full time period).", once=True)
             else:
                 keep[k] = v
-        if not b.has("STEADY STATE") and not b.param("DELTMX") and not b.has("DIRECT"):
+        if direct_added(b):
             keep["DIRECT"] = None
             self.report.note("Transient *HEAT TRANSFER without DELTMX -> DIRECT: Abaqus then takes "
                              "fixed time increments equal to the initial increment, ccx would choose "
@@ -18725,7 +18977,7 @@ class Converter:
         if (b.param("CETOL") or "").strip():
             return self.passthrough(b)
         keep = OrderedDict((k, v) for k, v in b.params.items() if k != "CETOL")
-        keep["DIRECT"] = None
+        keep["DIRECT"] = None                           # (direct_added)
         keep["CETOL"] = "1.E30"
         self.report.note("*VISCO without CETOL -> DIRECT, CETOL=1.E30: Abaqus then takes fixed time "
                          "increments equal to the initial increment; ccx needs a CETOL, and DIRECT "
@@ -19024,33 +19276,43 @@ class Converter:
                                      "time/amplitude pairs.", once=True)
                     return [emit_keyword("AMPLITUDE", keep)] + \
                            pairs_text([(begin + i * fixed, a) for i, a in enumerate(vals)], 1)
-            return self._commented(b, "*AMPLITUDE DEFINITION=EQUALLY SPACED could not be expanded "
-                                      "(missing/invalid FIXED INTERVAL or data); rebuild as TABULAR.", reduces=False)
+            return self._amplitude_out(b, "*AMPLITUDE DEFINITION=EQUALLY SPACED could not be expanded "
+                                          "(missing/invalid FIXED INTERVAL or data); rebuild as TABULAR.")
         elif definition == "USER":
-            return self._commented(b, "*AMPLITUDE, DEFINITION=USER: the amplitude comes from the "
-                                      "Abaqus user subroutine UAMP, which ccx cannot call (its own "
-                                      "is uamplitude.f). Commented out: the loads that use it stop "
-                                      "ccx ('nonexistent amplitude') until the subroutine is ported.", reduces=False)
+            return self._amplitude_out(b, "*AMPLITUDE, DEFINITION=USER: the amplitude comes from the "
+                                          "Abaqus user subroutine UAMP, which ccx cannot call (its own "
+                                          "is uamplitude.f); port the subroutine.")
         elif definition in ("PERIODIC", "MODULATED", "DECAY"):
             sampled = self._sample_amplitude(b)
             if sampled is not None:
                 return [emit_keyword("AMPLITUDE", keep)] + sampled
             # first data line holds series constants, not (t, A) pairs — passing it
             # through would be silent garbage
-            return self._commented(b, f"*AMPLITUDE DEFINITION={definition} could not be sampled "
-                                      f"(unreadable data, SHIFTX/SHIFTY/SCALEX/SCALEY, or no step time "
-                                      f"to sample over); its data is not time/amplitude pairs: "
-                                      f"sample the curve into a TABULAR amplitude manually.",
-                                   reduces=False)
+            return self._amplitude_out(b, f"*AMPLITUDE DEFINITION={definition} could not be sampled "
+                                          f"(unreadable data, SHIFTX/SHIFTY/SCALEX/SCALEY, or no step "
+                                          f"time to sample over: a step that reads it has an unknown "
+                                          f"time period); its data is not time/amplitude pairs: sample "
+                                          f"the curve into a TABULAR amplitude manually.")
         elif definition in ("SOLUTION DEPENDENT", "ACTUATOR"):
-            return self._commented(b, f"*AMPLITUDE DEFINITION={definition} has no ccx equivalent and "
-                                      f"its data is not time/amplitude pairs; sample the curve into a "
-                                      f"TABULAR amplitude manually.", reduces=False)
+            return self._amplitude_out(b, f"*AMPLITUDE DEFINITION={definition} has no ccx equivalent and "
+                                          f"its data is not time/amplitude pairs; sample the curve into a "
+                                          f"TABULAR amplitude manually.")
         elif definition not in ("", "TABULAR"):
             self.report.warn(f"*AMPLITUDE DEFINITION={definition} unsupported by ccx; treated as "
                              f"TABULAR.", once=True)
             self._reduces(f"*AMPLITUDE, DEFINITION={definition} read as TABULAR")
         return [emit_keyword("AMPLITUDE", keep)] + scaled(list(b.data))
+
+    def _amplitude_out(self, b: Block, msg: str) -> List[str]:
+        """*AMPLITUDE ``b`` commented out (handle_amplitude), with ``msg``: a note where no card
+        names it, else a warning with reduced physics, as ccx stops at the first card that names
+        it ('nonexistent amplitude', probed)."""
+        name = (b.param("NAME") or "").strip()
+        if not self._steps_now.amp_named(name):
+            return self._commented(b, msg + " Commented out; no card uses it.", reduces=False)
+        return self._commented(b, msg + " Commented out, so ccx stops at the first card that uses "
+                                        "it ('nonexistent amplitude').",
+                               f"*AMPLITUDE {name} (commented out; ccx stops at its users)")
 
     def _sample_amplitude(self, b: Block) -> Optional[List[str]]:
         """``*AMPLITUDE, DEFINITION=PERIODIC / MODULATED / DECAY`` (amplitude_curve) as
@@ -19061,7 +19323,7 @@ class Converter:
         deviation of the straight lines from the curve.  None if the curve or the span is
         unknown."""
         curve = amplitude_curve(b)
-        span = self._amp_span
+        span = self._amp_span_of(b, curve.total) if curve is not None else None
         if curve is None or span is None or not curve.panel > 0.0:
             return None
         end = span[1] if curve.total else span[0]
@@ -19879,10 +20141,12 @@ class Converter:
                 continue
             listed.update(range(min(d1, d2), max(d1, d2) + 1) if f else ())
         two_d = bool(self.geom.elements) and not self._planar_others
-        return self._distributing_constraint(b, ref, weights, why, listed, two_d, blocks, expanded, u1, facts,
+        plan = self._distributing_constraint(b, ref, weights, why, listed, two_d, blocks, expanded, u1, facts,
                                              line=emit_keyword("COUPLING", b.params),
                                              method=dist.uparam("WEIGHTING METHOD") or "UNIFORM",
                                              structural=dist.uparam("COUPLING") == "STRUCTURAL")
+        plan["nodal"] = self.surfaces[surf.upper()][0].startswith("NODE")   # (_warn_distributing_kept)
+        return plan
 
     def _dcoup_plans(self, b: Block, blocks: List[Block], expanded: Dict[int, str], u1: set,
                      facts: tuple) -> List[dict]:
@@ -20253,6 +20517,11 @@ class Converter:
                             else "."), once=True)
         if plan["matters"]:
             self._reduces("*COUPLING, *DISTRIBUTING reference node not moved with the surface")
+        if plan.get("nodal"):
+            self.report.warn(f"*COUPLING, *DISTRIBUTING (reference node {plan['ref']}) on a node-based "
+                             f"surface kept as ccx's card: ccx 2.23 stops on it ('a nodal surface is "
+                             f"not allowed, please use a facial surface on the *COUPLING card', "
+                             f"probed).", once=True)
         if plan["oriented"] and plan["loaded"]:
             self.report.warn(f"*COUPLING, *DISTRIBUTING (reference node {plan['ref']}) kept as ccx's card "
                              f"with an ORIENTATION: ccx 2.23 then reads the reference node's loads in "
@@ -22414,6 +22683,7 @@ class Converter:
         # beams, skins, slab layers, ...) are numbered above them (ccx_results_digest)
         self.model_labels = self._next_ids()
         self._plan_incompatible_slabs(blocks)   # retypes CPS4I / CPE4I before anything reads types
+        self._plan_collapsed_shells(blocks)     # likewise: collapsed S4 / S4R
         self._plan_rigid(blocks)                # rigid elements / analytical surfaces -> skins
         self._find_planar_elements()            # before the beam upgrades below retype them
         self._plan_pretension_cuts(blocks)      # before the beam upgrades and _plan_pretension_twins
@@ -22453,8 +22723,10 @@ class Converter:
         self._warn_rigid_mpc_steps(blocks)      # after the constraint plans (_rigid_constraints)
         self._plan_velocity_bcs(blocks)         # after _plan_coupled_bcs: reads its card rewrites
         self._warn_explicit_plane_rigid(blocks)     # after the constraint plans, _plan_ref_nodes
+        self._warn_explicit_trusses()           # after the mesh planners: the final element types
         self._check_transforms()
         self._plan_default_amplitudes(blocks)   # reads the ROT NODE axes (_plan_rot_axes)
+        self._plan_fixed_rotations(blocks)      # after it: the cards it leaves
         self._plan_material_facts(blocks)       # after the mesh planners: the final element types
         self._plan_base_state_facts(blocks)     # after _plan_rigid: the analytical surfaces left
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
@@ -22498,6 +22770,7 @@ class Converter:
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes
         self._plan_shell_rotation_pairs(blocks)     # after both: their 'keep' / 'untr' nodes
         self._plan_beam_section_axes(blocks)        # after them (_untr); may add knot beams
+        self._warn_beam_moment_stops(blocks)        # after it: its knot beams
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
         self._plan_rigid_contact_increment(blocks)
@@ -26287,7 +26560,8 @@ class Converter:
 
     def _remap_ply_faces(self, blocks: List[Block], plies_of: Dict[int, List[int]],
                          stack_of: Dict[int, tuple]) -> set:
-        """Faces of split continuum shells -> the faces of their ply solids that carry them
+        """Faces of the composite elements split into plies (continuum shells, solids) -> the
+        faces of their ply solids that carry them
         (stack_face_map: the bottom face on the first ply, the top face on the last, a side
         face on every ply).  *SURFACE lines and element-based face loads (*DLOAD P1-P6,
         TRVEC1-6, TRSHR1-6, HP1-6, *DFLUX S1-S6, *FILM F1-F6, *RADIATE R1-R6) that name them get an
@@ -26372,10 +26646,10 @@ class Converter:
                     moved += 1
         self.geom.elsets.update(new_sets)
         if moved:
-            self.report.note("Faces of split continuum shells (*SURFACE lines, element-based face "
-                             "loads) -> the faces of their ply solids: the bottom face on the "
-                             "first ply, the top face on the last, a side face on every ply.",
-                             once=True)
+            self.report.note("Faces of composite elements split into plies (continuum shells, "
+                             "solids; *SURFACE lines, element-based face loads) -> the faces of "
+                             "their ply solids: the bottom face on the first ply, the top face on "
+                             "the last, a side face on every ply.", once=True)
         return set(new_sets)
 
     def _reserve_names(self) -> None:
@@ -28088,6 +28362,21 @@ class Converter:
                              "dynamic step: ccx's explicit solver stops on it ('linear and nonlinear "
                              "MPC's depend on each other' — its 2-D expansion is built from linear "
                              "MPCs; probed on 2.23); only implicit steps can run it.", once=True)
+
+    def _warn_explicit_trusses(self) -> None:
+        """Warn of truss elements in a deck with an explicit dynamic step: ccx's explicit solver
+        stops on any (probed on 2.23: one T3D2, T3D3 or T2D2, with or without BCs or a
+        *TRANSFORM; implicit steps run it), on the MPCs of its truss expansion.  No exact form
+        is known: an axial spring with lumped masses matches only a linear elastic truss at
+        small strains."""
+        trusses = sorted({ccx_type(t) for t, _ in self.geom.elements.values()} &
+                         {"T2D2", "T3D2", "T3D3"})
+        if self._explicit_deck and trusses:
+            self.report.warn(f"Truss elements ({', '.join(trusses)}) in a deck with an explicit "
+                             f"dynamic step: ccx's explicit solver stops on them ('linear and "
+                             f"nonlinear MPC's depend on each other': the MPCs of its truss "
+                             f"expansion; probed on 2.23); only implicit steps can run them.",
+                             once=True)
 
     def _plan_material_facts(self, blocks: List[Block]) -> None:
         """*DEPVAR sizes, field variables, parameter values, section controls, hardening facts."""
@@ -32648,6 +32937,79 @@ class Converter:
                                              not re.fullmatch(r"S[1-4]", f[1].upper())):
                         return f"element surface {b.param('NAME')} is not made of their edges S1..S4"
         return None
+
+    # S4-family shells collapsed to a triangle -> Abaqus' triangle: (its type, whether Abaqus'
+    # collapsed element is that triangle: S3R is "a degenerated version of S4R that is fully
+    # compatible with S4R", while "element S4 degenerated to a triangle may exhibit overly
+    # stiff response in membrane deformation"; Abaqus 2017 element library, shell elements)
+    _COLLAPSED_SHELLS = {"S4R": ("S3R", True), "S4": ("S3", False), "S4R5": ("S3R", False),
+                         "S4T": ("S3T", False), "S4RT": ("S3RT", False)}
+
+    def _plan_collapsed_shells(self, blocks: List[Block]) -> None:
+        """S4-family shells with two adjacent corner nodes the same (a valid Abaqus element),
+        on which ccx 2.23 stops ('*ERROR in gen3dnor: size of estimated shell normal ... smaller
+        than 1.e-10', probed with and without contact; the same plate as S3 solves): written as
+        the triangle of their three corners, in their order (the same normal), where it is
+        Abaqus' own collapsed element (S4R -> S3R, exact; _COLLAPSED_SHELLS), the others
+        under --approximate (an S4 is stiffer as a collapsed quadrilateral).  Elements whose
+        edges a surface or an edge load names keep their type, warned (a triangle numbers its
+        edges otherwise)."""
+        found: Dict[int, Tuple[str, bool, List[int]]] = {}
+        for e, (typ, conn) in self.geom.elements.items():
+            got = self._COLLAPSED_SHELLS.get(typ.upper())
+            if got is None or len(conn) != 4 or len(set(conn)) == 4:
+                continue
+            ring = [x for k, x in enumerate(conn) if x != conn[k - 1]]
+            if len(ring) == 3 and len(set(ring)) == 3:
+                found[e] = (got[0], got[1], ring)
+        if not found:
+            return
+        edged: set = set()                      # the elements a surface or edge load names an edge of
+        for b in blocks:
+            if b.keyword == "SURFACE" and b.uparam("TYPE") in ("", "ELEMENT"):
+                pat = re.compile(r"E[1-4]")
+            elif b.keyword == "DLOAD":
+                pat = re.compile(r"ED(LD|NOR|SHR|MOM)[1-4]")
+            else:
+                continue
+            for rec in merged_data_records(b):
+                f = [x.strip() for x in rec]
+                if len(f) > 1 and f[0] and pat.fullmatch(f[1].upper()):
+                    edged.update(e for e in self._resolve_elements(f[0]) if e in found)
+        done: "OrderedDict[str, List[int]]" = OrderedDict()
+        kept: List[int] = []
+        for e, (new, exact, ring) in found.items():
+            if e in edged or not (exact or self._approx):
+                kept.append(e)
+                continue
+            old = self.geom.elements[e][0].upper()
+            self.geom.elements[e] = (new, ring)
+            self._elem_types.add(new)
+            done.setdefault(f"{old} -> {new}", []).append(e)
+        why = ("ccx 2.23 stops on a collapsed quadrilateral shell ('*ERROR in gen3dnor: size of "
+               "estimated shell normal ... smaller than 1.e-10', probed)")
+        for kind, es in done.items():
+            if kind.startswith("S4R -> "):
+                self.report.note(f"{len(es)} S4R shell(s) collapsed to a triangle (two corner nodes "
+                                 f"the same, e.g. element {es[0]}) written as S3R, Abaqus' triangle "
+                                 f"that is the degenerated S4R (its element library): {why}. "
+                                 f"Exact.", once=True)
+            else:
+                self.report.warn(f"[APPROX] Collapsed {kind.split(' ')[0]} shells written as "
+                                 f"{kind.split(' ')[-1]} ({len(es)}, e.g. element {es[0]}): {why}. "
+                                 f"Abaqus' collapsed {kind.split(' ')[0]} is not its triangle ('may "
+                                 f"exhibit overly stiff response in membrane deformation', its "
+                                 f"element library).", once=True)
+        if kept:
+            e = kept[0]
+            typ = self.geom.elements[e][0].upper()
+            self.report.warn(f"{len(kept)} shell(s) collapsed to a triangle (two corner nodes the "
+                             f"same, e.g. element {e}, {typ}) left as they are: {why}. "
+                             + ("A surface or an edge load names an edge of them, which a triangle "
+                                "numbers otherwise." if e in edged else
+                                f"Abaqus' collapsed {typ} is not its triangle (stiffer in membrane "
+                                f"deformation); rerun with --approximate to write them as "
+                                f"triangles."), once=True)
 
     def _plan_incompatible_slabs(self, blocks: List[Block]) -> None:
         """CPS4I / CPE4I -> C3D8I, exactly.  ccx 2.23 has no incompatible-mode plane element,

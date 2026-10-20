@@ -5782,6 +5782,83 @@ def wedge_master_deck(contact=True):
             (pair if contact else "") + "*Step\n*Frequency\n6\n*End Step\n")
 
 
+def ccx_stops_deck(kind):
+    """Decks of task 116: cards ccx 2.23 stopped on without a warning, and their twins.
+
+    * heat_direct: a DC3D8 bar 4 long, 0 / 100 at its ends, a transient *HEAT TRANSFER without
+      DELTMX (fixed increments of 1 to 60) with output at 4 intervals: linear at the end;
+    * visco_direct: a C3D8 cube pulled by 1 under a *VISCO without CETOL, output every 0.25;
+    * amp_riks: a cube pulled by 1e-3 on a PERIODIC sin(2 pi t) amplitude in a fixed-increment
+      *STATIC step (NLGEOM: ccx runs a linear one in one increment), then a Riks step (its time
+      unknown);
+    * fixed_rot / fixed_rot_ref, fixed_rest / fixed_rest_ref: a B31 cantilever whose tip
+      rotation a step holds with *BOUNDARY, FIXED (after a step that prescribes it, and in
+      step 1), and the twin with the value written;
+    * tr_freq / tr_first: a *TRANSFORM node's new displacement BC in a *DYNAMIC step after a
+      *FREQUENCY step, and as step 1;
+    * cload_dofs: the cube pulled by 1 on x = 1 with *CLOAD lines on DOFs 0, 11 and 31 too;
+    * coll_s4r / coll_s4r_ref, coll_s4 / coll_s4_ref: a plate of an S4R (S4) and a collapsed
+      one, and the twin with that one written as an S3R (S3)."""
+    cube = ("*NODE, NSET=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*NSET, NSET=TIP\n2, 3, 6, 7\n*SOLID SECTION, ELSET=E, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            "1000., 0.\n{mat}*BOUNDARY\n1, 1, 3\n4, 1\n4, 3\n5, 1, 2\n8, 1\n")
+    pull = "*CLOAD\n2, 1, 0.25\n3, 1, 0.25\n6, 1, 0.25\n7, 1, 0.25\n"
+    if kind == "heat_direct":
+        nodes = "\n".join(f"{1 + 4 * i + j}, {i}., {y}., {z}." for i in range(5)
+                          for j, (y, z) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
+        els = "\n".join(f"{i + 1}, {4 * i + 1}, {4 * i + 5}, {4 * i + 6}, {4 * i + 2}, {4 * i + 4}, "
+                        f"{4 * i + 8}, {4 * i + 7}, {4 * i + 3}" for i in range(4))
+        return (f"*HEADING\nheat direct\n*NODE, NSET=ALLN\n{nodes}\n*ELEMENT, TYPE=DC3D8, ELSET=E\n{els}\n"
+                "*NSET, NSET=COLD, GENERATE\n1, 4\n*NSET, NSET=HOT, GENERATE\n17, 20\n"
+                "*SOLID SECTION, ELSET=E, MATERIAL=M\n*MATERIAL, NAME=M\n*CONDUCTIVITY\n1.\n*DENSITY\n1.\n"
+                "*SPECIFIC HEAT\n1.\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nALLN, 0.\n*STEP, INC=1000\n"
+                "*HEAT TRANSFER\n1., 60.\n*BOUNDARY\nCOLD, 11, 11, 0.\nHOT, 11, 11, 100.\n"
+                "*OUTPUT, HISTORY, NUMBER INTERVAL=4\n*NODE OUTPUT, NSET=ALLN\nNT\n*END STEP\n")
+    if kind == "visco_direct":
+        return ("*HEADING\nvisco direct\n" + cube.format(mat="*CREEP\n1.e-10, 1., 0.\n") +
+                "*STEP\n*VISCO\n0.05, 1.\n" + pull + "*OUTPUT, HISTORY, TIME INTERVAL=0.25\n"
+                "*NODE OUTPUT, NSET=TIP\nU\n*END STEP\n")
+    if kind == "amp_riks":
+        return ("*HEADING\namp riks\n" + cube.format(mat="") + "*AMPLITUDE, NAME=P, DEFINITION=PERIODIC\n"
+                "1, 6.283185307179586, 0., 0.\n0., 1.\n*STEP, NLGEOM\n*STATIC, DIRECT\n0.25, 1.\n" +
+                pull.replace("*CLOAD", "*CLOAD, AMPLITUDE=P").replace("0.25\n", "0.25e-3\n") +
+                "*NODE PRINT, NSET=TIP\nU\n*END STEP\n"
+                "*STEP\n*STATIC, RIKS\n0.1, 1.\n" + pull + "*END STEP\n")
+    if kind.startswith("fixed_"):
+        nodes = "\n".join(f"{i + 1}, {0.25 * i}, 0., 0." for i in range(5))
+        els = "\n".join(f"{i + 1}, {i + 1}, {i + 2}" for i in range(4))
+        head = (f"*HEADING\nfixed rotation\n*NODE, NSET=ALLN\n{nodes}\n*ELEMENT, TYPE=B31, ELSET=B\n{els}\n"
+                "*NSET, NSET=TIP\n5\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n0.05, 0.05\n0., 0., -1.\n"
+                "*MATERIAL, NAME=M\n*ELASTIC\n1.e5, 0.3\n*BOUNDARY\n1, 1, 6\n")
+        hold = "*BOUNDARY, FIXED\nTIP, 6, 6\n" if not kind.endswith("_ref") else \
+            "*BOUNDARY\nTIP, 6, 6, {}\n".format("0." if kind.startswith("fixed_rest") else "0.01")
+        tail = "*CLOAD\nTIP, 2, 1.e-4\n*NODE PRINT, NSET=ALLN\nU\n*END STEP\n"
+        if kind.startswith("fixed_rest"):
+            return head + "*STEP\n*STATIC\n" + hold + tail
+        return head + "*STEP\n*STATIC\n*BOUNDARY\nTIP, 6, 6, 0.01\n*END STEP\n*STEP\n*STATIC\n" + hold + tail
+    if kind.startswith("tr_"):
+        model = ("*HEADING\ntransform ramp\n" + cube.format(mat="*DENSITY\n1e-3\n").replace(
+            "*BOUNDARY\n1, 1, 3\n4, 1\n4, 3\n5, 1, 2\n8, 1\n", "*BOUNDARY\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n")
+            + "*NSET, NSET=N7\n7\n*TRANSFORM, NSET=N7\n1., 1., 0., -1., 1., 0.\n")
+        dyn = ("*STEP\n*DYNAMIC\n0.01, 0.2, 0.01, 0.01\n*BOUNDARY\n7, 1, 1, 0.001\n*NODE PRINT, NSET=N7, "
+               "GLOBAL=YES\nU\n*END STEP\n")
+        return model + ("*STEP\n*FREQUENCY\n2\n*END STEP\n" if kind == "tr_freq" else "") + dyn
+    if kind == "cload_dofs":
+        return ("*HEADING\ncload dofs\n" + cube.format(mat="") + "*STEP\n*STATIC\n" + pull +
+                "7, 0, 1.\n7, 11, 1.\n7, 31, 1.\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
+    if kind.startswith("coll_"):
+        quad = "S4R" if kind.startswith("coll_s4r") else "S4"
+        second = (f"*ELEMENT, TYPE={'S3R' if quad == 'S4R' else 'S3'}, ELSET=PL\n2, 2, 5, 3\n"
+                  if kind.endswith("_ref") else "2, 2, 5, 3, 3\n")
+        return ("*HEADING\ncollapsed shell\n*NODE, NSET=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n"
+                f"4, 0., 1., 0.\n5, 2., 0., 0.\n*ELEMENT, TYPE={quad}, ELSET=PL\n1, 1, 2, 3, 4\n" + second +
+                "*SHELL SECTION, ELSET=PL, MATERIAL=M\n0.01\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+                "*BOUNDARY\n1, 1, 6\n4, 1, 6\n*STEP\n*STATIC\n*CLOAD\n5, 3, 1.e-6\n5, 1, 1.e-3\n"
+                "*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+    raise ValueError(kind)
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -12712,6 +12789,123 @@ def main():
               f"({'ccx exited 255 on the tetrahedron after the *DYNAMIC step' if not tet else 'add_bo_st stops ccx without it'})")
         if status != "solved":
             print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        failures += 0 if ok else 1
+
+    # --- task 116: cards ccx stopped on without a warning ---
+    def t116_run(tag, kind, reduced=(), approximate=False):
+        """The .dat blocks [(step, title, set, time, rows)] of ccx_stops_deck(kind) converted and
+        solved with exactly the ``reduced`` physics, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(ccx_stops_deck(kind))
+        _rep, conv = convert(src, inp, approximate=approximate)
+        d, status, out = run_ccx(ccx, env, inp)
+        blocks = list(A.dat_blocks(os.path.join(d, "job.dat"))) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if blocks is None or sorted(conv.reduced_physics) != sorted(reduced):
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if blocks is None else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return blocks
+
+    def t116_last(blocks, title="displacements"):
+        """{node: values} of the last ``title`` block."""
+        rows = [b[4] for b in blocks if b[1] == title]
+        return {int(r[0]): r[1:] for r in rows[-1]} if rows else {}
+
+    # DIRECT the converter adds (transient heat transfer without DELTMX, *VISCO without CETOL):
+    # output at intervals as FREQUENCY= (TIME POINTS stopped ccx: 'the DIRECT option collides')
+    got = t116_run("t116_heat_direct", "heat_direct")
+    ok = got is not None
+    if ok:
+        times = [b[3] for b in got if b[1] == "temperatures"]
+        temp = t116_last(got, "temperatures")
+        x = {n: (n - 1) // 4 for n in range(1, 21)}
+        err = max(abs(temp[n][0] - 25. * x[n]) for n in x) / 100. if len(temp) == 20 else math.inf
+        ok = times == [15., 30., 45., 60.] and err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  t116_heat_direct (a DC3D8 bar under a transient *HEAT "
+              f"TRANSFER without DELTMX, output at 4 intervals; ccx stopped): printed at t = "
+              f"{', '.join(f'{t:g}' for t in times)}, linear at the end ({err:.1e} off)")
+    failures += 0 if ok else 1
+    got = t116_run("t116_visco_direct", "visco_direct")
+    ok = got is not None
+    if ok:
+        times = [b[3] for b in got if b[1] == "displacements"]
+        u = t116_last(got)
+        err = max(abs(u[n][0] / 1e-3 - 1) for n in (2, 3, 6, 7)) if len(u) == 4 else math.inf
+        ok = times == [0.25, 0.5, 0.75, 1.] and err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  t116_visco_direct (a C3D8 cube pulled by 1 under a *VISCO "
+              f"without CETOL, output every 0.25; ccx stopped): printed at t = "
+              f"{', '.join(f'{t:g}' for t in times)}, u_x = 1 / E ({err:.1e} off; creep 1e-10)")
+    failures += 0 if ok else 1
+    # an analytic amplitude read in step 1 only, a Riks step after it (commented out with a
+    # note: ccx stopped, 'nonexistent amplitude'): sampled over step 1
+    got = t116_run("t116_amp_riks", "amp_riks", ["--approximate: *STATIC, RIKS -> plain *STATIC"],
+                   approximate=True)
+    ok = got is not None
+    if ok:
+        ux = {b[3]: {int(r[0]): r[1] for r in b[4]} for b in got if b[1] == "displacements" and b[0] == 1}
+        want = {t: 1e-6 * math.sin(2 * math.pi * t) for t in (0.25, 0.5, 0.75, 1.)}
+        err = max(abs(ux.get(t, {}).get(n, math.inf) - w) for t, w in want.items()
+                  for n in (2, 3, 6, 7)) / 1e-6
+        ok = err < 1e-5                                 # (NLGEOM at a strain of 1e-6: 2e-6)
+        print(f"{'PASS' if ok else 'FAIL'}  t116_amp_riks (a cube pulled on a PERIODIC sin(2 pi t) "
+              f"amplitude in a fixed-increment *STATIC step before a Riks step; ccx stopped): u_x "
+              f"= F sin(2 pi t) / E at t = 0.25 ... 1 ({err:.1e} off)")
+    failures += 0 if ok else 1
+    # *BOUNDARY, FIXED on a beam rotation (ccx stopped: 'parameter FIXED cannot be used for
+    # rotations'): the value the step finds it at, the twin with that value written
+    for kind, what in (("fixed_rot", "after a step prescribing it 0.01"), ("fixed_rest", "in step 1, at rest")):
+        runs = [t116_run(f"t116_{kind}", kind), t116_run(f"t116_{kind}_ref", kind + "_ref")]
+        ok = all(r is not None for r in runs)
+        if ok:
+            got, want = t116_last(runs[0]), t116_last(runs[1])
+            scale = max(abs(x) for v in want.values() for x in v[:3])
+            err = max(abs(a - b) for n in want for a, b in zip(got.get(n, [math.inf] * 3), want[n][:3]))
+            ok = len(got) == 5 and err <= 1e-12 * scale and scale > 0
+            print(f"{'PASS' if ok else 'FAIL'}  t116_{kind} (a B31 cantilever's tip rotation held "
+                  f"with *BOUNDARY, FIXED {what}, a tip force; ccx stopped): the twin with the value "
+                  f"written ({err:.1e} apart, max |u| {scale:.4g})")
+        failures += 0 if ok else 1
+    # a *TRANSFORM node's new BC after a *FREQUENCY step (stepped, flagged reduced): ramped
+    runs = [t116_run("t116_tr_freq", "tr_freq"), t116_run("t116_tr_first", "tr_first")]
+    ok = all(r is not None for r in runs)
+    if ok:
+        mid = [{b[3]: (b[4][0][1] + b[4][0][2]) / math.sqrt(2.) for b in r if b[1] == "displacements"
+                and b[4]} for r in runs]           # (along the node's local x, (1, 1, 0) / sqrt 2)
+        ok = all(abs(m.get(0.1, math.inf) - 5e-4) < 1e-9 and abs(m.get(0.2, math.inf) - 1e-3) < 1e-9
+                 for m in mid)
+        print(f"{'PASS' if ok else 'FAIL'}  t116_tr_freq (a *TRANSFORM node's new displacement BC "
+              f"in a *DYNAMIC step after a *FREQUENCY step; stepped, flagged reduced): ramped as in "
+              f"step 1, local u_x {mid[0].get(0.1, math.nan):.6g} at t = 0.1, "
+              f"{mid[0].get(0.2, math.nan):.6g} at 0.2")
+    failures += 0 if ok else 1
+    # *CLOAD on DOFs 0, 11, 31 (ccx stopped: 'nonexistent degree of freedom'): left out
+    got = t116_run("t116_cload_dofs", "cload_dofs")
+    ok = got is not None
+    if ok:
+        u = t116_last(got)
+        err = max(abs(u[n][0] / 1e-3 - 1) for n in (2, 3, 6, 7)) if len(u) == 4 else math.inf
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  t116_cload_dofs (a cube pulled by 1, *CLOAD lines on DOFs "
+              f"0, 11, 31 too; ccx stopped): left out, u_x = 1 / E ({err:.1e} off)")
+    failures += 0 if ok else 1
+    # a collapsed S4R / S4 (ccx stopped in gen3dnor): as S3R, exactly; S4 under --approximate
+    S4R_REDUCED = "element S4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"
+    for kind, reduced, approx in (("coll_s4r", [S4R_REDUCED], False),
+                                  ("coll_s4", ["--approximate: Collapsed S4 shells written as S3"], True)):
+        runs = [t116_run(f"t116_{kind}", kind, reduced, approx),
+                t116_run(f"t116_{kind}_ref", kind + "_ref", [S4R_REDUCED] if kind == "coll_s4r" else [])]
+        ok = all(r is not None for r in runs)
+        if ok:
+            got, want = t116_last(runs[0]), t116_last(runs[1])
+            scale = max(abs(x) for v in want.values() for x in v[:3])
+            err = max(abs(a - b) for n in want for a, b in zip(got.get(n, [math.inf] * 3), want[n][:3]))
+            ok = len(got) == 5 and err <= 1e-12 * scale and scale > 0
+            print(f"{'PASS' if ok else 'FAIL'}  t116_{kind} (a plate with a collapsed "
+                  f"{kind[5:].upper()} beside a plain one; ccx stopped in gen3dnor): the twin with it "
+                  f"written as a triangle ({err:.1e} apart, max |u| {scale:.4g})")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

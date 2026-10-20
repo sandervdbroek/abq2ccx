@@ -19245,6 +19245,161 @@ def test_modal_steps_knot_shell_and_beam_nodes_with_rotational_bcs_or_loads():
     assert A.KNOT_SET not in out and "check that step's results" in rep.text(), rep.text()
     assert any("not knots" in r for r in conv.reduced_physics)
 
+# --- task 116: cards ccx stops on without a warning ---
+STOP_BEAM = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+*Element, type=B31, elset=E
+1, 1, 2
+2, 2, 3
+*Beam Section, elset=E, material=M, section=RECT
+0.1, 0.1
+0., 0., -1.
+*Material, name=M
+*Elastic
+1000., 0.3
+*Density
+1e-3
+*Nset, nset=TIP
+3
+*Boundary
+1, 1, 6
+"""
+
+
+def test_direct_the_converter_adds_takes_no_time_points():
+    # a transient *HEAT TRANSFER without DELTMX and a *VISCO without CETOL get DIRECT (Abaqus'
+    # fixed increments): their interval output goes out as FREQUENCY=, where TIME POINTS
+    # stopped ccx ('the DIRECT option collides with a TIME POINTS specification')
+    model = HEX + ("*Material, name=M\n*Elastic\n1000., 0.3\n*Conductivity\n1.\n*Specific heat\n1.\n"
+                   "*Density\n1.\n*Creep\n1.e-10, 3., 0.\n*Solid Section, elset=EALL, material=M\n")
+    body, _, _ = convert_str(model + "*Step\n*Heat transfer\n0.1, 1.\n*Boundary\n1, 11, 11, 10.\n"
+                             "*Output, field, number interval=4\n*Node output\nNT\n*End Step\n")
+    assert "*HEAT TRANSFER, DIRECT\n" in body and "TIME POINTS" not in body
+    assert "*NODE FILE, FREQUENCY=2\n" in body
+    body, _, _ = convert_str(model + "*Step\n*Visco\n0.1, 1.\n*Boundary\n1, 1, 3\n*Cload\n7, 1, 1.\n"
+                             "*Output, field, time interval=0.25\n*Node output\nU\n*End Step\n")
+    assert "*VISCO, DIRECT, CETOL=1.E30\n" in body and "TIME POINTS" not in body
+    assert "*NODE FILE, FREQUENCY=2\n" in body
+
+
+def test_amplitude_sampled_over_the_steps_that_read_it():
+    # a PERIODIC amplitude read in step 1 only is sampled over step 1, though a later Riks step's
+    # time is unknown (it was commented out with a note, and ccx stopped: 'nonexistent amplitude')
+    model = HEX + HEX_SEC + ("*Amplitude, name=P, definition=PERIODIC\n1, 6.2832, 0., 0.\n0., 1.\n"
+                             "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n")
+    dyn = "*Step\n*Dynamic\n0.01, 1.\n*Cload, amplitude=P\n7, 1, 1.\n*End Step\n"
+    body, _, rep = convert_str(model + dyn + "*Step\n*Static, riks\n0.1, 1.\n*Cload\n7, 1, 2.\n*End Step\n")
+    assert "*AMPLITUDE, NAME=P\n" in body and "sampled into 201 time/amplitude points" in rep.text()
+    # read after a step of unknown time: commented out, and as a card uses it, warned with
+    # reduced physics (ccx stops there)
+    body, conv, rep = convert_str(model + "*Step\n*Static\n0.1, 0.\n*End Step\n" + dyn)
+    assert "** *AMPLITUDE, NAME=P, DEFINITION=PERIODIC" in body
+    assert "*AMPLITUDE P (commented out; ccx stops at its users)" in conv.reduced_physics
+    assert any(lv == "WARNING" and "ccx stops at the first card that uses it" in m for lv, m in rep.entries)
+    # one no card uses: a note
+    body, conv, rep = convert_str(HEX + HEX_SEC + "*Amplitude, name=U, definition=USER\n1., 2.\n"
+                                  "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n")
+    assert not conv.reduced_physics and "Commented out; no card uses it." in rep.text()
+
+
+def test_fixed_rotations_held_at_their_values():
+    # ccx stops on *BOUNDARY, FIXED on a rotation: the rotations get the value the step finds
+    # them at (0 at rest, a BC's value), the translations keep FIXED
+    deck = STOP_BEAM + ("*Step\n*Static\n*Boundary\nTIP, 4, 5\nTIP, 6, 6, 0.01\n*End Step\n*Step\n*Static\n"
+                        "*Boundary, fixed\nTIP, 1, 6\n*Cload\nTIP, 2, 0.001\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert "*BOUNDARY, FIXED\nTIP, 1, 3\n*BOUNDARY\n3, 4, 4, 0.\n3, 5, 5, 0.\n3, 6, 6, 0.01\n" in body
+    assert not conv.reduced_physics
+    body, conv, _ = convert_str(STOP_BEAM + "*Step\n*Static\n*Boundary, fixed\nTIP, 5, 6\n*End Step\n")
+    assert "FIXED\n" not in body.replace("*BOUNDARY, FIXED on", "") and "3, 5, 5, 0.\n3, 6, 6, 0.\n" in body
+    # moved by a load: unknown, so free, warned
+    body, conv, _ = convert_str(STOP_BEAM + "*Step\n*Static\n*Cload\nTIP, 6, 0.001\n*End Step\n*Step\n"
+                                "*Static\n*Boundary, fixed\nTIP, ENCASTRE\n*End Step\n")
+    assert "*BOUNDARY, FIXED\nTIP, 1, 3\n** abq2ccx: FIXED rotation left out (its value is unknown): 3, 4, 4" in body
+    assert conv.reduced_physics == ["*BOUNDARY, FIXED rotations left free (ccx's FIXED takes no rotations)"]
+
+
+def test_ccx_stop_warnings_trusses_nodal_distributing():
+    # trusses stop ccx's explicit solver; a distributing coupling on a node surface kept as
+    # ccx's card (NLGEOM) stops ccx ('a nodal surface is not allowed')
+    truss = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=T3D2, elset=E\n1, 1, 2\n"
+             "*Solid Section, elset=E, material=M\n0.01\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Density\n1e-3\n*Step\n*Dynamic, explicit\n, 0.001\n*Boundary\n1, 1, 3\n2, 2, 3\n*Cload\n"
+             "2, 1, 1.\n*End Step\n")
+    _, _, rep = convert_str(truss)
+    assert "Truss elements (T3D2) in a deck with an explicit dynamic step" in rep.text()
+    _, _, rep = convert_str(truss.replace("*Dynamic, explicit\n, 0.001", "*Dynamic\n0.0001, 0.001"))
+    assert "Truss elements" not in rep.text()
+    dist = HEX + HEX_SEC + ("*Node\n100, 1.5, 0.5, 0.5\n*Nset, nset=TIPN\n2, 3, 6, 7\n"
+                            "*Surface, name=CS, type=NODE\nTIPN\n*Coupling, constraint name=C1, ref node=100, "
+                            "surface=CS\n*Distributing\n1, 3\n*Step, nlgeom\n*Static\n*Boundary\n1, 1, 3\n4, 1, 3\n"
+                            "5, 1, 3\n8, 1, 3\n*Cload\n100, 1, 1.\n*End Step\n")
+    body, _, rep = convert_str(dist)
+    assert "*DISTRIBUTING" in body and "on a node-based surface kept as ccx's card: ccx 2.23 stops" in rep.text()
+    body, _, rep = convert_str(dist, approximate=True)
+    assert "*EQUATION" in body and "node-based surface kept" not in rep.text()
+
+
+def test_transformed_node_bc_ramps_after_perturbation_steps():
+    # a new displacement BC on a *TRANSFORM node after only a *FREQUENCY step: still at rest,
+    # so ccx's ramp from zero is Abaqus' ramp (it was stepped, flagged reduced)
+    deck = HEX + HEX_SEC + ("*Nset, nset=N7\n7\n*Transform, nset=N7\n1., 1., 0., -1., 1., 0.\n*Boundary\n"
+                            "1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n*Step\n*Frequency\n2\n*End Step\n*Step\n*Dynamic\n"
+                            "0.01, 0.2\n*Boundary\n7, 1, 1, 0.001\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert "*BOUNDARY, AMPLITUDE=RAMP12357111317\n7, 1, 1, 0.001\n" in body and not conv.reduced_physics
+
+
+def test_cload_on_dofs_0_11_and_above_30_left_out():
+    deck = HEX + HEX_SEC + "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n*Step\n*Static\n*Cload\n7, 1, 1.\n{}*End Step\n"
+    body, conv, rep = convert_str(deck.format("7, 0, 1.\n7, 11, 1.\n7, 31, 1.\n"))
+    assert "*CLOAD\n7, 1, 1.\n" in body and "\n7, 0, 1." not in body and "\n7, 31, 1." not in body
+    assert "** 7, 0, 1.\n** 7, 11, 1.\n** 7, 31, 1." in body and not conv.reduced_physics
+    assert "*CLOAD on DOF 31 left out: Abaqus numbers its DOFs 1-30" in rep.text()
+    # DOF 11 where a step solves temperatures: the load may be a heat flux, lost
+    heat = HEX + ("*Material, name=M\n*Elastic\n1000., 0.3\n*Conductivity\n1.\n*Expansion\n1e-5\n"
+                  "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n*Step\n"
+                  "*Coupled temperature-displacement, steady state\n*Cload\n7, 11, 1.\n*End Step\n")
+    body, conv, _ = convert_str(heat)
+    assert "** 7, 11, 1." in body and "*CLOAD on DOF 11 (temperature)" in conv.reduced_physics
+
+
+def test_collapsed_quad_shells_as_triangles():
+    # ccx stops on a collapsed S4 / S4R ('gen3dnor: size of estimated shell normal'): an S4R is
+    # Abaqus' S3R (its degenerated form), exactly; an S4 only under --approximate
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 2., 0., 0.\n"
+            "*Element, type={t}, elset=PL\n1, 1, 2, 3, 4\n2, 2, 5, 3, 3\n*Shell Section, elset=PL, "
+            "material=M\n0.01\n*Material, name=M\n*Elastic\n1000., 0.3\n*Boundary\n1, 1, 6\n4, 1, 6\n"
+            "*Step\n*Static\n*Cload\n5, 3, 1e-6\n*End Step\n")
+    body, conv, rep = convert_str(deck.format(t="S4R"))
+    assert "*ELEMENT, TYPE=S3\n2, 2, 5, 3\n" in body and other_reduced(conv) == []
+    assert "written as S3R, Abaqus' triangle that is the degenerated S4R" in rep.text()
+    body, conv, rep = convert_str(deck.format(t="S4"))
+    assert "2, 2, 5, 3, 3\n" in body and "rerun with --approximate to write them as triangles" in rep.text()
+    body, conv, rep = convert_str(deck.format(t="S4"), approximate=True)
+    assert "*ELEMENT, TYPE=S3\n2, 2, 5, 3\n" in body
+    assert conv.reduced_physics == ["--approximate: Collapsed S4 shells written as S3"]
+    # an edge load names its edge by the quadrilateral's number: kept, warned
+    body, _, rep = convert_str(deck.format(t="S4R").replace("*Cload\n5, 3, 1e-6\n", "*Dload\n2, EDNOR2, 1.\n"))
+    assert "2, 2, 5, 3, 3\n" in body and "names an edge of them" in rep.text()
+
+
+def test_beam_moments_ccx_cannot_run_warned():
+    # a moment on a beam node that is no knot: ccx exits 255 in an implicit *DYNAMIC step, and
+    # can loop without end around a *BUCKLE step (moment before it and after it)
+    dyn = STOP_BEAM + "*Step\n*Dynamic\n0.001, 0.01\n*Cload\nTIP, 5, 0.01\n*End Step\n"
+    _, _, rep = convert_str(dyn)
+    assert "in an implicit *DYNAMIC step: ccx 2.23 exits without a message" in rep.text()
+    _, _, rep = convert_str(dyn.replace("*Cload\nTIP, 5, 0.01", "*Boundary\nTIP, 5, 5, 0.001"))
+    assert "exits without a message" not in rep.text()
+    stat = "*Step\n*Static\n*Cload\nTIP, 4, 0.01\n*End Step\n"
+    buckle = "*Step\n*Buckle\n2\n*Cload\nTIP, 1, -1.\n*End Step\n"
+    _, _, rep = convert_str(STOP_BEAM + stat + buckle + stat)
+    assert "around a *BUCKLE step" in rep.text() and "can loop without end" in rep.text()
+    _, _, rep = convert_str(STOP_BEAM + stat + buckle)          # nothing after it: runs
+    assert "around a *BUCKLE step" not in rep.text()
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
