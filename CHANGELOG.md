@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **`*DLOAD` BX / BY / BZ on shells** — Abaqus applies them as a body force per unit volume;
+  ccx 2.23 applied them on its shells as a pressure on the shell's face, so a plate under BX
+  bent out of its plane, without a warning. They are now `GRAV` of B / density along the axis,
+  on a set of the shells of their own, or consistent nodal forces (B x thickness per unit area)
+  where the material has no single constant density. A body force and a pressure on one shell
+  under different amplitudes no longer stop ccx. The corpus's Scordelis-Lo roof
+  (barrelvault_s3r_fineirreg) now sags under its own weight instead of lifting.
 * **BCs and base states across linear perturbation steps** — a `*FREQUENCY` or `*BUCKLE`
   step's own BCs (or its OP=NEW) stayed in force in the next one in ccx, silently (frequencies
   2.5x too high). That step now gets the base state's BCs again. A `*BUCKLE` step between a

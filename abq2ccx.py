@@ -6773,6 +6773,10 @@ class Converter:
         self._sheet_split: Dict[str, List[Tuple[str, str, float, float]]] = {}
         self._sheet_cards: List[str] = []
         self._sheet_surfaces: set = set()          # their names
+        # *DLOAD BX / BY / BZ on shells (_plan_shell_body_forces): load token -> its plan, and
+        # the names of the shell sets that carry such a load as GRAV
+        self._shell_body: Dict[str, dict] = {}
+        self._body_sets: set = set()
         self._mesh_sets = EmittedSets()             # the sets emit_geometry wrote
         # Abaqus surface elements left out of the ccx mesh (_drop_surface_elements): element ->
         # (type, nodes), and the full member list of each element set that had some
@@ -13110,6 +13114,16 @@ class Converter:
                 g = [ALL_ELEMENTS_SET] + g[1:]
                 self.report.note(f"*DLOAD line without an element set (Abaqus: the whole model) -> "
                                  f"ELSET {ALL_ELEMENTS_SET}.", once=True)
+            plan = self._shell_body.get(g[0].upper()) if label in ("BX", "BY", "BZ") and g[0] else None
+            if plan:                            # on shells: GRAV or nodal forces, the rest as it is
+                got, notes = self._shell_body_lines(b, g, plan)
+                for key, ln, mag in got:
+                    body.append(ln)
+                    lines.append((key, ln, mag))
+                side += notes
+                if not plan["rest"]:
+                    continue
+                g = [plan["rest"]] + g[1:]
             if self._slabs and re.fullmatch(r"P[1-4]", label) and g[0] and \
                     set(self._load_elements(g[0])) <= set(self._slabs):
                 label = f"P{int(label[1]) + 2}"    # a 2-D edge is a side face of its C3D8I slab
@@ -13523,6 +13537,125 @@ class Converter:
         top = [ln.split(",")[0].strip().upper() in self._sheet_surfaces for ln in lines]
         return [ln for ln, t in zip(lines, top) if not t] + [ln for ln, t in zip(lines, top) if t]
 
+    def _plan_shell_body_forces(self, blocks: List[Block]) -> None:
+        """Abaqus' *DLOAD BX / BY / BZ on a conventional shell is a body force per unit volume
+        (Abaqus 2017 Elements Guide, conventional shells' distributed loads); ccx 2.23 applies
+        such a line on the shells it expands (SHEET_SHELLS) as a pressure on their face 1
+        (probed: a plate under BX bends out of its plane).  So per element set or element such
+        a line names, a plan for handle_dload (_shell_body_lines):
+        - where the shells' ccx materials have one constant density rho (_shell_density), GRAV
+          of B / rho along the axis on a set of those shells of their own (ABQ2CCX_BODY_...;
+          ccx keys a body load by set and direction, so no other load shares its entry) —
+          rho g = B on ccx's expanded solid, which takes its thickness, offset and plies;
+        - else consistent nodal forces of B times the section thickness per unit area
+          (_to_nodal_forces), or why there are none (a thickness that varies or is unknown).
+        Per unit undeformed volume and fixed in direction either way, as ccx applies a solid's
+        BX (probed: a C3D8 stretched 28 % under NLGEOM moves alike under BZ, GRAV and fixed
+        nodal forces).  A set's other elements keep the line, on a set of their own."""
+        tokens: "OrderedDict[str, str]" = OrderedDict()
+        for b in blocks:
+            for rec in merged_data_records(b) if b.keyword == "DLOAD" else []:
+                g = [x.strip() for x in rec]
+                if len(g) > 1 and g[1].upper() in ("BX", "BY", "BZ") and not _is_user_load(b, g):
+                    token = g[0] or (ALL_ELEMENTS_SET if ALL_ELEMENTS_SET in self.geom.elsets else "")
+                    if token:
+                        tokens.setdefault(token.upper(), token)
+        loaded = []
+        for key, token in tokens.items():
+            eids = [e for e in dedup(self._load_elements(token)) if e in self.geom.elements]
+            shells = [e for e in eids if ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS]
+            if shells:
+                loaded.append((key, eids, shells))
+        if not loaded:
+            return
+        section: Dict[int, Block] = {}
+        for b in blocks:
+            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION"):
+                for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                    section.setdefault(e, b)
+        opts = self._material_options(blocks)
+        thick = self._shell_thicknesses(blocks)
+        self._reserve_names()
+        for key, eids, shells in loaded:
+            plan: dict = {"grav": None, "rho": self._shell_density(shells, section, opts),
+                          "shells": shells, "thick": {}, "why": None, "rest": None}
+            if plan["rho"] is not None:
+                plan["grav"] = self._fresh_name(f"ABQ2CCX_BODY_{key}")
+                self.geom.elsets[plan["grav"]] = shells
+                self._body_sets.add(plan["grav"])
+            else:
+                vary = next((e for e in shells if e in section and (section[e].has("NODAL THICKNESS")
+                                                                     or section[e].has("SHELL THICKNESS"))), None)
+                bare = next((e for e in shells if e not in thick), None)
+                if vary is not None:
+                    plan["why"] = (f"the thickness of shell {vary} varies over it (NODAL THICKNESS / "
+                                   f"SHELL THICKNESS=), and its material has no single constant "
+                                   f"density to write the load as GRAV")
+                elif bare is not None:
+                    plan["why"] = f"shell {bare} has no section thickness"
+                else:
+                    plan["thick"] = {e: thick[e][0] for e in shells}
+            if len(shells) < len(eids):
+                plan["rest"] = self._fresh_name(f"ABQ2CCX_BODY_REST_{key}")
+                self.geom.elsets[plan["rest"]] = [e for e in eids if e not in set(shells)]
+            self._shell_body[key] = plan
+
+    def _shell_density(self, shells: Sequence[int], section: Dict[int, Block],
+                       opts: Dict[str, List[Block]]) -> Optional[float]:
+        """The one constant density of the ccx materials of ``shells`` (``section``: element ->
+        its shell section, whose material or plies' materials count, ``opts``:
+        _material_options), or None: a shell without a section or material, a material whose
+        *DENSITY is missing, has more rows than one (temperature or field dependence), does not
+        read or is not positive, or two densities."""
+        found: Optional[float] = None
+        done: set = set()
+        for e in shells:
+            b = section.get(e)
+            if b is None:
+                return None
+            if id(b) in done:
+                continue
+            done.add(id(b))
+            mats = [m.strip().upper() for _t, m, _o in self._section_layers(b, strict=True)]
+            if not mats:
+                return None
+            for m in mats:
+                try:
+                    rows = self._density_rows(opts[m]) if m in opts else []
+                except ValueError:
+                    return None
+                if len(rows) != 1 or rows[0][0] <= 0.0:
+                    return None
+                rho = rows[0][0]
+                if found is not None and abs(rho - found) > 1e-12 * max(rho, found):
+                    return None
+                found = rho
+        return found
+
+    def _shell_body_lines(self, b: Block, g: List[str], plan: dict
+                          ) -> Tuple[List[Tuple[tuple, str, str]], List[str]]:
+        """The shells' share of *DLOAD line ``g`` (BX / BY / BZ on a set _plan_shell_body_forces
+        planned: ``plan``): ([(key, ccx line, magnitude)], comment lines) — a GRAV line on the
+        shells' own set, keyed by that set and the label (_dl_faces: the set's ccx body-load
+        entry), or nodal forces at the end of the step."""
+        label = g[1].upper()
+        if not plan["grav"]:
+            faces = [(list(self.geom.elements[e][1]), "area", plan["thick"][e], False, False, None, None)
+                     for e in plan["shells"]] if not plan["why"] else []
+            return [], self._to_nodal_forces(b, "DLOAD", g, faces, plan["why"])
+        try:
+            mag = pf(g[2]) if len(g) > 2 and g[2] else 0.0
+        except ValueError:
+            return [], self._drop_load_line(b, g, "its magnitude is not a number", reduces=False)
+        g_mag = mag / plan["rho"] * (self._mass_scale or 1.0)    # (ccx's densities: / the scale)
+        axis = {"BX": "1., 0., 0.", "BY": "0., 1., 0.", "BZ": "0., 0., 1."}[label]
+        line = f"{plan['grav']}, GRAV, {fmt_num(float('%.12g' % g_mag))}, {axis}"
+        self.report.note("*DLOAD BX / BY / BZ on shells (Abaqus: a body force per unit volume) -> "
+                         "GRAV of magnitude / density along the axis on a set of the shells "
+                         "(ABQ2CCX_BODY_...): ccx 2.23 applies BX / BY / BZ on a shell as a pressure "
+                         "on its bottom face (probed).", once=True)
+        return [((plan["grav"].upper(), label), line, g[2] if len(g) > 2 else "")], []
+
     @staticmethod
     def _signed(mag: str, sign: float) -> str:
         """``mag`` times ``sign`` (a blank magnitude stays blank)."""
@@ -13644,7 +13777,9 @@ class Converter:
         in this step, or None when they do: always in a small-strain step; under NLGEOM only
         for a traction that keeps its direction (FOLLOWER=NO) and its resultant (CONSTANT
         RESULTANT=YES) — ccx keeps a *CLOAD fixed in direction and magnitude (_loads_nlgeom)."""
-        if not self._loads_nlgeom():
+        if not self._loads_nlgeom() or base in ("BX", "BY", "BZ"):
+            # (a shell body force: per unit undeformed volume and fixed in direction, as ccx
+            # applies a solid's BX: _plan_shell_body_forces)
             return None
         if base in ("P1", "P2"):
             return "under NLGEOM a beam line load in the local directions rotates with the beam"
@@ -13804,8 +13939,8 @@ class Converter:
 
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
                          why: Optional[str]) -> List[str]:
-        """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2) or surface-element
-        pressure (P) data line ``g`` -> consistent nodal forces (consistent_nodal_forces over
+        """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2), shell body force
+        (BX / BY / BZ) or surface-element pressure (P) data line ``g`` -> consistent nodal forces (consistent_nodal_forces over
         ``faces``), registered for the *CLOAD at the end of the step (_flush_nodal_loads).
         Returns the comment lines that take the load's place in the deck.  As the Abaqus
         Analysis User's Guide defines them: TRVEC is the magnitude times the normalized
@@ -13813,7 +13948,8 @@ class Converter:
         every integration point, and normalizes it — a point where the direction is normal to
         the face gets no load.  P acts along the face normal, with each face's sense
         (_load_faces); plane-element edges carry the section thickness, axisymmetric edges the
-        full circle; a 2-D model has no third component."""
+        full circle, shells their thickness (_shell_body_lines); a 2-D model has no third
+        component."""
         label = g[1].upper()
         base = label[:5] if label.startswith("TR") else "HP" if label.startswith("HP") else label
         if why:
@@ -13850,8 +13986,8 @@ class Converter:
                     degenerate.append(1)
                     return (0.0, 0.0, 0.0)
                 return vscale(vunit(s), mag)
-        elif base in ("PX", "PY", "PZ"):
-            axis = {"PX": (1.0, 0.0, 0.0), "PY": (0.0, 1.0, 0.0), "PZ": (0.0, 0.0, 1.0)}[base]
+        elif base in ("PX", "PY", "PZ", "BX", "BY", "BZ"):
+            axis = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}[base[1]]
 
             def load(p, normal, tangent):
                 return vscale(axis, mag)
@@ -13942,6 +14078,10 @@ class Converter:
                           "above it)")
         elif base == "GRAV":
             what, lack = "gravity (GRAV) on U1 beams", "ccx stops on GRAV on U1 elements"
+        elif base in ("BX", "BY", "BZ"):
+            what, lack = ("body forces (BX / BY / BZ) on shells without one constant density (times "
+                          "the section thickness)", "ccx 2.23 applies BX / BY / BZ on a shell as a "
+                          "pressure on its bottom face (probed)")
         else:
             what, lack = ("beam line loads (PX / PY / PZ / P1 / P2)", "ccx has no such load (it "
                           "reads P1 / P2 on a beam as a pressure on the expanded section face)")
@@ -15495,13 +15635,17 @@ class Converter:
         and load case), one value each across steps (loadadd): (element, face label, load
         case) — P and P1..P6 on a shell all on its face 1, a top-face surface's
         (_plan_sheet_pressure) on face 2 (dloads.f); (name, label, load case) on a set the
-        converter cannot list; none for a body load (GRAV, CENTRIF), keyed by set (bodyadd)."""
+        converter cannot list, and for a shell body force written as GRAV on a set of its own
+        (_shell_body_lines: bodyadd's entry of that set and axis); none for a body load (GRAV,
+        CENTRIF), keyed by set (bodyadd)."""
         got = self._dl_memo.get(what)
         if got is not None:
             return got
         token, label, case = what
         name, label = token.strip().upper(), label.strip().upper()
-        if label in self._BODY_LOADS or label.startswith("CENTRIF"):
+        if name in self._body_sets:
+            got = frozenset({(name, label, case)})
+        elif label in self._BODY_LOADS or label.startswith("CENTRIF"):
             got = frozenset()
         else:
             top = next((t for plan in self._sheet_split.values() for t, surf, _, _ in plan
@@ -21136,6 +21280,7 @@ class Converter:
         self._plan_shell_axes(blocks)           # after the distributions: their axes
         self._plan_ic_axes(blocks)
         self._plan_sheet_pressure(blocks)       # after _plan_distributions resets the used names
+        self._plan_shell_body_forces(blocks)    # after the density planners' material copies
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._note_quadratic_beams(blocks)      # after the planar constraint

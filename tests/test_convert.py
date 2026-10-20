@@ -17915,6 +17915,132 @@ def test_dof7_on_a_rejected_element_type_gets_the_ccx_stop_not_the_bc():
     body, conv, _ = convert_str(deck)
     assert "1, 1, 6" in body and "1, 7, 7" not in body and "1, 1, 7" not in body
 
+
+S4_STRIP = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+4, 0., 1., 0.
+5, 1., 1., 0.
+6, 2., 1., 0.
+*Element, type=S4, elset=E
+1, 1, 2, 5, 4
+2, 2, 3, 6, 5
+*Shell Section, elset=E, material=M
+0.1
+*Material, name=M
+*Elastic
+1000., 0.
+{dens}*Nset, nset=FIX
+1, 4
+*Boundary
+FIX, 1, 6
+"""
+BODY_GRAV = "ABQ2CCX_BODY_E, GRAV, "
+
+
+def test_shell_body_forces_become_grav_or_nodal_forces():
+    # Abaqus' BX / BY / BZ on a conventional shell is a body force per unit volume; ccx 2.23
+    # applies it there as a pressure on face 1 (probed: a plate under BX bent out of its
+    # plane).  With one constant density rho: GRAV of B / rho along the axis on a set of the
+    # shells of their own; else consistent nodal forces of B t per area
+    step = "*Step\n*Static\n*Dload\n{}\n*End Step\n"
+    model = S4_STRIP.format(dens="*Density\n7.5\n")
+    body, conv, rep = convert_str(model + step.format("E, BX, 2.\nE, BY, -3."))
+    assert "*ELSET, ELSET=ABQ2CCX_BODY_E\n1, 2\n" in body
+    assert "*DLOAD\n" + BODY_GRAV + "0.266666666667, 1., 0., 0.\n" + BODY_GRAV + "-0.4, 0., 1., 0.\n" in body
+    assert "E, BX" not in body and "E, BY" not in body
+    assert "GRAV of magnitude / density along the axis on a set of the shells" in rep.text()
+    assert not conv.reduced_physics and not conv.unloaded_steps
+    # no density: nodal forces, also under NLGEOM (per unit undeformed volume, fixed in
+    # direction, as ccx applies a solid's BX)
+    for nl in ("", ", nlgeom"):
+        body, conv, rep = convert_str(S4_STRIP.format(dens="") + step.replace("*Step", "*Step" + nl)
+                                      .format("E, BX, 2."))
+        assert "** abq2ccx: E, BX, 2. -> nodal forces on 6 node(s), resultant (0.4, 0, 0)" in body
+        assert "*CLOAD\n" in body and "GRAV" not in body and "ABQ2CCX_BODY" not in body
+        assert "body forces (BX / BY / BZ) on shells without one constant density" in rep.text()
+        assert not conv.reduced_physics and "[APPROX]" not in rep.text()
+    # two densities in the set, or one that depends on temperature: nodal forces too
+    two = model.replace("*Shell Section, elset=E, material=M\n0.1\n",
+                        "*Elset, elset=E1\n1\n*Elset, elset=E2\n2\n*Shell Section, elset=E1, material=M\n0.1\n"
+                        "*Shell Section, elset=E2, material=N\n0.1\n*Material, name=N\n*Elastic\n1000., 0.\n"
+                        "*Density\n3.\n")
+    hot = model.replace("*Density\n7.5\n", "*Density\n7.5, 0.\n7., 100.\n")
+    for deck in (two, hot):
+        body, _, _ = convert_str(deck + step.format("E, BX, 2."))
+        assert "nodal forces on 6 node(s), resultant (0.4, 0, 0)" in body and "GRAV" not in body
+    # the shells' share of a set with membranes: the rest keeps the line on a set of its own
+    mixed = model.replace("2, 2, 3, 6, 5\n", "*Element, type=M3D4, elset=E\n2, 2, 3, 6, 5\n").replace(
+        "*Shell Section, elset=E, material=M\n0.1\n",
+        "*Elset, elset=S\n1\n*Elset, elset=MM\n2\n*Shell Section, elset=S, material=M\n0.1\n"
+        "*Membrane Section, elset=MM, material=M\n0.1\n")
+    body, conv, _ = convert_str(mixed + step.format("E, BX, 2."))
+    assert "*ELSET, ELSET=ABQ2CCX_BODY_E\n1\n" in body and "*ELSET, ELSET=ABQ2CCX_BODY_REST_E\n2\n" in body
+    assert BODY_GRAV + "0.266666666667, 1., 0., 0.\nABQ2CCX_BODY_REST_E, BX, 2.\n" in body
+    # a thickness that varies and no density: neither form, warned
+    nodal = S4_STRIP.format(dens="").replace(
+        "material=M\n0.1\n", "material=M, nodal thickness\n0.1\n*Nodal Thickness\n1, 0.1\n2, 0.1\n3, 0.1\n"
+        "4, 0.1\n5, 0.1\n6, 0.1\n")
+    body, conv, rep = convert_str(nodal + step.format("E, BX, 2."))
+    assert "** E, BX, 2." in body and "the thickness of shell 1 varies over it" in rep.text()
+    assert "*DLOAD BX load dropped" in conv.reduced_physics
+    # with a density it is GRAV: ccx's expanded solid takes the nodal thicknesses
+    body, conv, _ = convert_str(nodal.replace("*Nset", "*Density\n7.5\n*Nset") + step.format("E, BX, 2."))
+    assert BODY_GRAV + "0.266666666667, 1., 0., 0." in body and not conv.reduced_physics
+    # membranes and solids keep theirs (ccx applies them as body forces there)
+    body, _, _ = convert_str(model.replace("type=S4", "type=M3D4").replace("Shell Section", "Membrane Section")
+                             + step.format("E, BX, 2."))
+    assert "*DLOAD\nE, BX, 2.\n" in body and "GRAV" not in body
+
+
+def test_shell_body_force_density_is_the_ccx_materials():
+    # the density GRAV divides by is the ccx material's: a section mass copy holds DENSITY / t
+    # more (a mass, which a body force per volume does not act on), and a transient coupled
+    # step's masses are scaled away while its GRAV magnitudes are scaled up
+    deck = SHELL_PLATE + ("*Shell Section, elset=PLATE, material=M, density=0.5\n0.1, 5\n*Boundary\n"
+                          "1, 1, 6\n2, 1, 6\n*Step\n*Static\n*Dload\nPLATE, BZ, 14.\n*End Step\n"
+                          "*Step\n*Frequency\n3\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert "*MATERIAL, NAME=M_SHELL_MASS\n*ELASTIC\n1000., 0.3\n*DENSITY\n7.\n" in body
+    assert "ABQ2CCX_BODY_PLATE, GRAV, 2., 0., 0., 1.\n" in body and not conv.reduced_physics
+    coupled = S4_STRIP.format(dens="*Density\n7.5\n*Conductivity\n1.\n*Specific Heat\n1.\n") + (
+        "*Initial Conditions, type=temperature\nFIX, 0.\n*Step\n*Coupled Temperature-Displacement\n"
+        "0.1, 1.\n*Dload\nE, BX, 2.\n*Boundary\nFIX, 11, 11, 0.\n*End Step\n")
+    body, _, _ = convert_str(coupled)
+    assert BODY_GRAV + "2.66666666667e+29, 1., 0., 0.\n" in body
+
+
+def test_shell_body_force_entries_across_steps():
+    # GRAV on the shells' own set along +axis, the sign in the magnitude: ccx's entry of that
+    # set and axis (bodyadd) is the Abaqus load's, so a later step's line replaces it, and it
+    # is kept apart from a pressure on the same faces, the deck's own GRAV and the other axes
+    model = S4_STRIP.format(dens="*Density\n1.\n") + "*Surface, name=TOPS\nE, SPOS\n" \
+        "*Amplitude, name=A\n0., 0., 1., 1.\n"
+    two = model + "*Step\n*Static\n{}*End Step\n*Step\n*Static\n{}*End Step\n"
+    body, conv, _ = convert_str(two.format("*Dload\nE, BX, 2.\nE, BY, 2.\n", "*Dload\nE, BX, -2.\n"))
+    assert _step(body, 2).count("GRAV") == 1 and BODY_GRAV + "-2., 1., 0., 0." in _step(body, 2)
+    assert not conv.reduced_physics and "given again" not in _step(body, 2)
+    # *DSLOAD, OP=NEW: ccx's *DLOAD, OP=NEW removes the GRAV too, so it is given again
+    body, _, _ = convert_str(two.format("*Dload\nE, BX, 2.\n*Dsload\nTOPS, P, 0.001\n",
+                                        "*Dsload, op=NEW\nTOPS, P, 0.002\n"))
+    assert "removed them)\n*DLOAD\n" + BODY_GRAV + "2., 1., 0., 0.\n" in _step(body, 2)
+    # *DLOAD, OP=NEW removes it in ccx as in Abaqus: no zero line (_clear_body_forces)
+    body, _, _ = convert_str(two.format("*Dload\nE, BX, 2.\n", "*Dload, op=NEW\nE, P, 0.001\n"))
+    assert ZERO_BODY not in body and "GRAV" not in _step(body, 2)
+    # a body force and a pressure on other amplitudes (ccx stopped on its face 1 holding both)
+    body, conv, _ = convert_str(model + "*Step\n*Static\n*Dload, amplitude=A\nE, BX, 2.\n*Dload\n"
+                                "E, P, 0.01\n*End Step\n")
+    assert "*DLOAD, AMPLITUDE=A\n" + BODY_GRAV + "2., 1., 0., 0.\n*DLOAD\nE, P, 0.005\n" in body
+    assert not conv.reduced_physics
+    # two amplitudes on one entry: ccx would add them under one, so the second is left out
+    body, conv, _ = convert_str(model + "*Step\n*Static\n*Dload, amplitude=A\nE, BX, 2.\n*Dload\n"
+                                "E, BX, 1.\n*End Step\n")
+    assert "** " + BODY_GRAV + "1., 1., 0., 0." in body
+    assert "distributed load on faces another card of the step loads with another amplitude" \
+           in conv.reduced_physics
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

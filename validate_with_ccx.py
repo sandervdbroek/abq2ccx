@@ -86,8 +86,10 @@ rotations and moments, a zero BC ramped in a *DYNAMIC step and a JOIN off a beam
 the same decks without the perturbation step's BC or the *TRANSFORM; and perturbation steps or
 *BOUNDARY, FIXED after one with its own BCs or a *BUCKLE step, against the decks without that
 step), a coupling's INFLUENCE
-RADIUS against the coupling on the nodes within it, and rotations coupled in an ORIENTATION's
-axes against the model turned into them.
+RADIUS against the coupling on the nodes within it, rotations coupled in an ORIENTATION's
+axes against the model turned into them, and *DLOAD BX / BY / BZ on shells (a strip against
+its C3D8 twin and the GRAV and pressure forms, also over steps; the Scordelis-Lo roof against
+its published deflection).
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -3476,6 +3478,75 @@ def between_steps_deck(twin=False):
             "*BOUNDARY\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n"
             "*STEP\n*STATIC\n*BOUNDARY\n7, 3, 3, 0.01\n*END STEP\n" + ("" if twin else move) +
             "*STEP\n*STATIC\n" + (move if twin else "") + "*BOUNDARY\n6, 2, 2, 0.005\n*END STEP\n")
+
+
+def shell_body_plate_deck(typ, steps, rho=7.5):
+    """A 2 x 1 strip, t 0.1, E 1000, nu 0, clamped at x = 0 (its tip: node 3, x = 2): two S4
+    (``typ`` "S4"), one S8R ("S8R") or its C3D8 twin ("C3D8": two bricks 0.1 thick, the tip
+    nodes 3, 6, 9, 12) with ``steps`` (the step cards, each printing the tip's U); the shells'
+    material has the density ``rho`` (None: none), the twin's none.  A surface TOPS (SPOS) and
+    an amplitude A (a ramp) for the steps to use."""
+    dens = "" if rho is None else f"*DENSITY\n{rho}\n"
+    if typ == "C3D8":
+        mesh = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+                "6, 2., 1., 0.\n7, 0., 0., 0.1\n8, 1., 0., 0.1\n9, 2., 0., 0.1\n10, 0., 1., 0.1\n"
+                "11, 1., 1., 0.1\n12, 2., 1., 0.1\n*ELEMENT, TYPE=C3D8, ELSET=E\n"
+                "1, 1, 2, 5, 4, 7, 8, 11, 10\n2, 2, 3, 6, 5, 8, 9, 12, 11\n"
+                "*SOLID SECTION, ELSET=E, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n"
+                "*NSET, NSET=FIX\n1, 4, 7, 10\n*NSET, NSET=TIP\n3, 6, 9, 12\n*BOUNDARY\nFIX, 1, 3\n")
+    else:
+        if typ == "S8R":
+            nodes = "1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., .5, 0.\n5, 2., .5, 0.\n" \
+                    "6, 0., 1., 0.\n7, 1., 1., 0.\n8, 2., 1., 0.\n"
+            els, fix, tip = "1, 1, 3, 8, 6, 2, 5, 7, 4\n", "1, 4, 6", "3, 5, 8"
+        else:
+            nodes = "1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n6, 2., 1., 0.\n"
+            els, fix, tip = "1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n", "1, 4", "3, 6"
+        mesh = (f"*NODE\n{nodes}*ELEMENT, TYPE={typ}, ELSET=E\n{els}*SHELL SECTION, ELSET=E, "
+                f"MATERIAL=M\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n{dens}*NSET, NSET=FIX\n"
+                f"{fix}\n*NSET, NSET=TIP\n{tip}\n*BOUNDARY\nFIX, 1, 6\n")
+    return (mesh + "*SURFACE, NAME=TOPS\nE, SPOS\n*AMPLITUDE, NAME=A\n0., 0., 1., 1.\n" +
+            "".join(f"*STEP\n*STATIC\n{cards}*NODE PRINT, NSET=TIP\nU\n*END STEP\n" for cards in steps))
+
+
+def scordelis_roof_deck(typ, n, rho):
+    """The Scordelis-Lo roof (MacNeal and Harder 1985) in inches, as the corpus deck
+    petrkryslucsd_barrelvault_s3r_fineirreg gives it: R 300, half length 300, t 3, E 3e6,
+    nu 0, a 40 degree half angle, its self-weight as *DLOAD ROOF, BX, -0.20833 (90 psf over
+    3 in) along -x, the vertical.  The quarter on n x n ``typ`` (S4 / S8R) shells: the
+    diaphragm at z = 0 holds u1 and u2, symmetry at z = 300 and along the crown (y = 0).
+    ``rho``: the material's density (None: none).  Returns (deck, the free edge's midspan
+    node), whose published vertical deflection is 0.3024 ft = 3.6288 in."""
+    quad = typ == "S8R"
+    m = 2 * n if quad else n
+    nid = lambda i, j: 1 + i + (m + 1) * j              # i around the arc, j along z
+    lines = ["*NODE"]
+    for j in range(m + 1):
+        for i in range(m + 1):
+            a = math.radians(40.0) * i / m
+            lines.append(f"{nid(i, j)}, {300 * math.cos(a):.12g}, {300 * math.sin(a):.12g}, {300.0 * j / m:.12g}")
+    lines.append(f"*ELEMENT, TYPE={typ}, ELSET=ROOF")
+    k = 0
+    for j in range(n):
+        for i in range(n):
+            k += 1
+            if quad:
+                a, b = 2 * i, 2 * j
+                c = [nid(a, b), nid(a + 2, b), nid(a + 2, b + 2), nid(a, b + 2),
+                     nid(a + 1, b), nid(a + 2, b + 1), nid(a + 1, b + 2), nid(a, b + 1)]
+            else:
+                c = [nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)]
+            lines.append(", ".join(map(str, [k] + c)))
+    sets = {"WALL": [nid(i, 0) for i in range(m + 1)], "SYMM": [nid(i, m) for i in range(m + 1)],
+            "APEX": [nid(0, j) for j in range(m + 1)]}
+    for name, ids in sets.items():
+        lines.append(f"*NSET, NSET={name}")
+        lines += [", ".join(map(str, ids[q:q + 16])) for q in range(0, len(ids), 16)]
+    lines += ["*SHELL SECTION, ELSET=ROOF, MATERIAL=STEEL", "3., 5", "*MATERIAL, NAME=STEEL",
+              "*ELASTIC", "3e+06, 0."] + (["*DENSITY", f"{rho}"] if rho is not None else []) + \
+        ["*BOUNDARY", "APEX, YSYMM", "SYMM, ZSYMM", "WALL, 1, 2", "*STEP", "*STATIC", "*DLOAD",
+         "ROOF, BX, -0.20833", "*NODE PRINT, NSET=SYMM", "U", "*END STEP"]
+    return "\n".join(lines) + "\n", nid(m, m)
 
 
 def equation_steps_deck(case):
@@ -11322,6 +11393,85 @@ def main():
               f"sub/mesh.inp): the pulled face moves {u.get(2, [math.nan])[0]:.7g} (4 / 1000; "
               f"{dev:.1e} apart)")
     failures += 0 if u and ok else 1
+
+
+    # --- *DLOAD BX / BY / BZ on shells: a body force per unit volume in Abaqus, a pressure on
+    # face 1 in ccx 2.23 (the strip's tip moved 48.08 out of its plane under BX), written as GRAV
+    # of B / rho on a set of the shells (rho 7.5) or, without a density, as consistent nodal
+    # forces of B t per area.  The strip under BX against q L^2 / (2 E A) (0.004) and its C3D8
+    # twin; under BY against the deck written with that GRAV; under BZ against the pressure B t
+    twin = review_run(shell_body_plate_deck("C3D8", ["*DLOAD\nE, BX, 2.\n"]), "shell_body_twin",
+                      dat_node_blocks)
+    for typ, rho in (("S4", 7.5), ("S4", None), ("S8R", 7.5)):
+        how = f"{typ}, " + ("GRAV" if rho else "nodal forces")
+        tag = f"shell_body_{typ.lower()}_{'grav' if rho else 'nodal'}"
+        tip = 3
+        for lab, ref_cards in (("BX", None), ("BY", "E, GRAV, {g}, 0., 1., 0."), ("BZ", "E, P, 0.2")):
+            got = review_run(shell_body_plate_deck(typ, [f"*DLOAD\nE, {lab}, 2.\n"], rho),
+                             f"{tag}_{lab.lower()}", dat_node_blocks)
+            if lab == "BX":
+                ref = twin
+                want = [0.004, 0.0, 0.0]
+            else:
+                ref = review_run(shell_body_plate_deck(typ, ["*DLOAD\n" + ref_cards.format(g=2.0 / 7.5) + "\n"], 7.5),
+                                 f"{tag}_{lab.lower()}_ref", dat_node_blocks)
+                want = ref[-1].get(tip) if ref else None
+            ok = bool(got and ref and want)
+            if ok:
+                u = got[-1].get(tip, [math.nan] * 3)
+                scale = max(abs(x) for x in want)
+                err = max(abs(a - b) for a, b in zip(u, want)) / scale
+                twin_err = abs(twin[-1][3][0] / 0.004 - 1) if lab == "BX" else 0.0
+                ok = err < 1e-4 and twin_err < 1e-4 and scale > 1e-3
+                print(f"{'PASS' if ok else 'FAIL'}  {tag}_{lab.lower()} (the strip of {how}, E, {lab}, 2.): tip "
+                      f"({', '.join(f'{x:.6g}' for x in u)}) vs " +
+                      ("q L^2 / 2EA = 0.004 along x and the C3D8 twin's "
+                       f"{twin[-1][3][0]:.6g}" if lab == "BX" else
+                       "the deck with " + ("GRAV 2 / rho along y" if lab == "BY" else "*DLOAD P 0.2") +
+                       f": ({', '.join(f'{x:.6g}' for x in want)})") + f", {err:.1e} apart")
+            failures += 0 if ok else 1
+
+    # the corpus barrel vault's shell: the Scordelis-Lo roof under its self-weight as BX, the
+    # free edge's midspan vertical deflection against the published 0.3024 ft (3.6288 in);
+    # before, ccx lifted the roof (BX as a pressure)
+    for typ, n, rho, tol in (("S8R", 8, 1.0, 0.005), ("S8R", 8, None, 0.005), ("S4", 16, 1.0, 0.01)):
+        text, node = scordelis_roof_deck(typ, n, rho)
+        tag = f"scordelis_lo_{typ.lower()}_{'grav' if rho else 'nodal'}"
+        got = review_run(text, tag, dat_node_blocks)
+        u = -got[-1].get(node, [math.nan])[0] if got else math.nan
+        ok = abs(u / 3.6288 - 1) < tol
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (Scordelis-Lo roof, {n} x {n} {typ}, ROOF, BX, -0.20833 "
+              f"as {'GRAV' if rho else 'nodal forces'}): free-edge midspan deflection {u:.5g} vs the "
+              f"published 3.6288 in ({abs(u / 3.6288 - 1) * 100:.2f}% off, tolerance {tol * 100:g}%)")
+        failures += 0 if ok else 1
+
+    # the strip's body force over steps (tip ux per step: BX 2 is 0.004): a pressure beside it on
+    # another amplitude (ccx stopped, '*ERROR in loadadd': both were face 1 loads), a later
+    # step's BX replacing it, *DLOAD, OP=NEW removing it, *DSLOAD, OP=NEW keeping it (ccx's
+    # *DLOAD, OP=NEW removed it: given again), BY kept beside a new BX, the deck's own GRAV
+    # replaced beside it
+    p_uz = None
+    for name, steps, want, both in (
+            ("amplitude", ["*DLOAD, AMPLITUDE=A\nE, BX, 2.\n*DLOAD\nE, P, 0.001\n"], [0.004], True),
+            ("replaced", ["*DLOAD\nE, BX, 2.\n", "*DLOAD\nE, BX, -2.\n"], [0.004, -0.004], True),
+            ("op_new", ["*DLOAD\nE, BX, 2.\n", "*DLOAD, OP=NEW\nE, P, 0.001\n"], [0.004, 0.0], True),
+            ("dsload_op_new", ["*DLOAD\nE, BX, 2.\n*DSLOAD\nTOPS, P, 0.001\n",
+                               "*DSLOAD, OP=NEW\nTOPS, P, 0.002\n"], [0.004, 0.004], True),
+            ("by_kept", ["*DLOAD\nE, BX, 2.\nE, BY, 2.\n", "*DLOAD\nE, BX, 4.\n"], [0.022, 0.026], True),
+            ("own_grav", ["*DLOAD\nE, BX, 2.\nE, GRAV, 0.2666666666667, 1., 0., 0.\n",
+                          "*DLOAD\nE, GRAV, 0.5333333333333, 1., 0., 0.\n"], [0.008, 0.012], False)):
+        for rho in ((7.5, None) if both else (7.5,)):
+            tag = f"shell_body_steps_{name}_{'grav' if rho else 'nodal'}"
+            got = review_run(shell_body_plate_deck("S4", steps, rho), tag, dat_node_blocks)
+            ux = [blk.get(3, [math.nan])[0] for blk in got] if got else []
+            ok = len(ux) == len(want) and all(abs(a - b) <= 1e-6 + 1e-4 * abs(b) for a, b in zip(ux, want))
+            if ok and name == "amplitude":
+                p_uz = got[-1][3][2]
+                ok = abs(p_uz / 0.02404 - 1) < 1e-3          # the pressure's own (_plan_sheet_pressure)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (S4 strip, {'GRAV' if rho else 'nodal forces'}): "
+                  f"tip ux per step {', '.join(f'{x:.6g}' for x in ux)} vs {', '.join(f'{x:g}' for x in want)}"
+                  + (f"; uz {p_uz:.6g} vs the pressure's 0.02404" if name == "amplitude" and p_uz else ""))
+            failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
