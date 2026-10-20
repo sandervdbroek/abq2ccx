@@ -241,8 +241,11 @@ TRANSLATED = {
         "a `*RIGID BODY` move to its reference node with zero rotations about the other axes, as "
         "Abaqus/Standard moves them, where the BC'd nodes hold the same DOFs; the rest is warned "
         "(`--approximate` drops it on a kinematic coupling or an `*MPC` and makes the `*RIGID "
-        "BODY` move, as Abaqus/Standard does). Rotations of a node with a `*TRANSFORM`: see "
-        "`*TRANSFORM`. `USER` (Abaqus `DISP`) commented, naming ccx's `uboun.f`.",
+        "BODY` move, as Abaqus/Standard does). Two rotations held on a shell node that is no "
+        "knot, about axes off its normal: one rotation line where the free axis lies in the shell "
+        "plane (ccx 2.23 holds both in-plane rotations for two), else warned. Rotations of a node "
+        "with a `*TRANSFORM`: see `*TRANSFORM`. `USER` (Abaqus `DISP`) commented, naming ccx's "
+        "`uboun.f`.",
     "*DLOAD": "pressures and body loads passed through (`Px` faces match Abaqus); `P` on shells "
         "kept and on membranes written `P1` (both push along the element normal in Abaqus and ccx; "
         "ccx stops on `P` on a membrane), split between the faces of ccx's expanded element as for "
@@ -408,7 +411,10 @@ TRANSLATED = {
         "BCs and moments on DOFs 4-6 of a transformed shell/beam node: kept where ccx reads them "
         "in the local axes (one local rotation on a beam node that is no knot, a shell node that is "
         "no knot), else in global components on a knot (beam nodes get a knot beam) where an exact "
-        "form exists, else commented out.",
+        "form exists, else commented out. A corner node of S8 / S8R / S6 shells with translational "
+        "BCs (ccx 2.23 ties them to its middle expanded node only), and a knot's in a deck where a "
+        "`*DYNAMIC` step follows a linear step (ccx does not meet them there), leaves the card, its "
+        "BCs and loads in global components where they have that form; else warned.",
     "*CLOAD": "moments on a rigid-body reference point → its `ROT NODE`; on a knotted shell/beam "
         "node or kinematic reference node with a `*TRANSFORM` → global components (see "
         "`*TRANSFORM`); `ORIENTATION=` (local axes) and `FOLLOWER=YES` dropped with a warning; "

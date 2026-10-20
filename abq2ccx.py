@@ -6481,6 +6481,7 @@ class Converter:
         # and per (id(card), node) the lines that replace them (or why they are left out)
         self._rot_mode: Dict[int, str] = {}
         self._rot_lines: Dict[Tuple[int, int], Union[List[str], str]] = {}
+        self._untr: set = set()                     # nodes out of their *TRANSFORM (_plan_transformed_corners)
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         # *DISTRIBUTION orientations (see _plan_distributions)
         self._dist_cards: Dict[str, Block] = {}    # NAME -> *DISTRIBUTION, "" too (_plan_deck_facts)
@@ -11368,13 +11369,27 @@ class Converter:
         def line(target: str, a: int, b: int) -> str:
             return ", ".join([target, str(a), str(b)] + extra)
         lo, hi = min(d1, d2), max(d1, d2)
+        if self._untr and lo <= 6:
+            nodes = self._resolve_nodes(spec)
+            untr = [n for n in nodes if n in self._untr]
+            if untr:
+                # nodes out of their *TRANSFORM: the card's lines for them come at its end
+                # (_plan_transformed_corners), the other nodes' one by one
+                self.emit.rot_hit += [n for n in untr if n not in self.emit.rot_hit]
+                out = [line(str(n), 7, hi) for n in untr] if hi >= 7 else []
+                for n in nodes:
+                    if n not in self._untr:
+                        kept = self._active_dof_lines(str(n), d1, d2, extra)
+                        out.extend(kept if kept is not None else [line(str(n), lo, hi)])
+                return out
         if hi < 4 or lo > 6:
             return None
         nodes = self._resolve_nodes(spec)
-        planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse")]
+        planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse", "pair")]
         if planned:
-            # rotations of a transformed shell/beam / kinematic reference node: the card's
-            # lines for them come at its end (_plan_transformed_rotations)
+            # rotations of a transformed shell/beam / kinematic reference node, of a shell node
+            # holding two: the card's lines for them come at its end
+            # (_plan_transformed_rotations, _plan_shell_rotation_pairs)
             self.emit.rot_hit += [n for n in planned if n not in self.emit.rot_hit]
             out = [line(spec, lo, 3)] if lo <= 3 else []
             if hi >= 7:
@@ -12534,22 +12549,26 @@ class Converter:
                 self.report.note(f"*CLOAD parameter {k} dropped (not read by ccx).", once=True)
         out = [emit_keyword("CLOAD", keep)]
         moved: List[int] = []       # reference nodes whose moments go to their ROT NODE
-        hit: List[int] = []         # transformed nodes whose moments _plan_transformed_rotations rewrites
+        hit: List[int] = []         # transformed nodes whose loads _plan_transformed_rotations / _corners rewrite
         marks: List[Tuple[int, List[str]]] = []     # where each data line's lines start, its fields
         for ln in b.data:
             f = [x.strip() for x in ln.split(",")]
             marks.append((len(out), f))
             self._check_node_target("CLOAD", f[0] if f else "")
-            if not (len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and 4 <= int(f[1]) <= 6):
+            if not (len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and
+                    (4 <= int(f[1]) <= 6 or (self._untr and 1 <= int(f[1]) <= 3))):
                 out.append(ln)
                 continue
             nodes = self._resolve_nodes(f[0])
-            planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse")]
-            refs = [n for n in nodes if n in self._rb_rot]
+            rot = int(f[1]) >= 4
+            # nodes out of their *TRANSFORM (_plan_transformed_corners), transformed rotations
+            planned = [n for n in nodes if n in self._untr or
+                       (rot and self._rot_mode.get(n) in ("global", "refuse"))]
+            refs = [n for n in nodes if n in self._rb_rot] if rot else []
             if planned:
                 hit += [n for n in planned if n not in hit]
                 out += [", ".join([str(n)] + f[1:]) for n in nodes
-                        if n not in planned and n not in self._rb_rot]
+                        if n not in planned and n not in refs]
             elif not refs:
                 out.append(ln)
                 continue
@@ -13587,11 +13606,26 @@ class Converter:
         a rectangular card per node (nodes with equal axes share one) with that node's
         spherical axes (_transform_axes), fixed at its original position as in Abaqus: BCs,
         loads and *EQUATION terms there keep their meaning.  After the card that last names a
-        *RIGID BODY reference node, its ROT NODE gets the same local axes (_plan_rot_axes)."""
+        *RIGID BODY reference node, its ROT NODE gets the same local axes (_plan_rot_axes).
+        The nodes _plan_transformed_corners takes out of the transform are left out of the
+        card's node set (a new set ABQ2CCX_TRn holds the others)."""
         d = self._transform_card(b)
         nset = (b.param("NSET") or "").strip()
+        params, pre = b.params, []
+        gone = [n for n in dedup(self._resolve_nodes(nset)) if n in self._untr] if self._untr else []
+        if gone:
+            # nodes _plan_transformed_corners takes out (their cards in global components)
+            left = [n for n in dedup(self._resolve_nodes(nset)) if n not in self._untr]
+            pre = [f"** abq2ccx: {len(gone)} node(s) of {nset} taken out of this *TRANSFORM, their "
+                   f"BCs and loads in global components (e.g. node {gone[0]})"]
+            if not left:
+                return pre + ["** " + emit_keyword("TRANSFORM", b.params)] + ["** " + x for x in b.data]
+            self._n_transform_sets += 1
+            name = f"ABQ2CCX_TR{self._n_transform_sets}"
+            pre += [f"*NSET, NSET={name}"] + reflow(left)
+            params = OrderedDict((k, name if k == "NSET" else v) for k, v in b.params.items())
         if isinstance(d, str) or d[0] != "S":
-            out = [emit_keyword("TRANSFORM", b.params)] + list(b.data)
+            out = pre + [emit_keyword("TRANSFORM", params)] + list(b.data)
         else:
             out = ["** abq2ccx: spherical *TRANSFORM (ccx has none) -> a rectangular *TRANSFORM per "
                    "node with the same local axes", "** " + emit_keyword("TRANSFORM", b.params)] + \
@@ -13599,7 +13633,10 @@ class Converter:
             groups: "OrderedDict[str, List[int]]" = OrderedDict()
             off: List[int] = []
             why = ""
+            out = pre + out
             for n in dedup(self._resolve_nodes(nset)):
+                if n in self._untr:
+                    continue
                 axes = self._transform_axes(n, *d)
                 if isinstance(axes, str):
                     off.append(n)
@@ -13727,7 +13764,7 @@ class Converter:
           rotation per node; with several, usermpc can pick a dependent twice ('zero
           coefficient on the dependent side'; 1.5-156 % off on a beam) — not on a shell,
           whose rotational BCs make two such MPCs at most (but where two hold rotations about
-          axes off the normal, ccx holds both in-plane rotations: _shell_rotation_pairs);
+          axes off the normal, ccx holds both in-plane rotations: _plan_shell_rotation_pairs);
         * on a knot (a frame joint, a converter knot beam) and on a kinematic reference node
           they act on a rotation node ccx makes without the transform, about the GLOBAL axes
           (34-291 % off): written in global components there — a moment line by line, held
@@ -13823,8 +13860,6 @@ class Converter:
                                   "which this node is (its elements' normals differ by 15-25 deg, "
                                   "or the deck has *NORMAL definitions)")
             self._rot_mode[n] = mode
-        self._shell_rotation_pairs(blocks, cards, [n for n, m in self._rot_mode.items()
-                                                   if m == "keep" and n not in beam_nodes], at)
         if knot_beams:
             self._add_knot_beams(knot_beams, blocks)
             self.report.note(f"{len(knot_beams)} beam node(s) with a *TRANSFORM and rotational BCs "
@@ -13850,15 +13885,7 @@ class Converter:
                 for b, _, items in cards:
                     if n in items:
                         self._rot_lines[(id(b), n)] = refused[n]
-        # a card _plan_velocity_bcs / _plan_default_amplitudes made pieces of: a node's lines
-        # go with the piece that ramps its rotations (ccx's step ramp is the card's Abaqus
-        # ramp, of each global component from its last value), else the first naming them
-        for (src, n), got in list(self._rot_lines.items()):
-            pieces = [p for p in self._amp_cards.get(src, self._vel_cards.get(src, ()))
-                      if isinstance(p, Block) and self._rot_items(p, {n})]
-            ramp = [p for p in pieces if p.uparam("AMPLITUDE") == self.CCX_RAMP]
-            at = ramp[0] if ramp and isinstance(got, list) else pieces[0] if pieces else None
-            self._rot_lines.update(((id(p), n), got if p is at else []) for p in pieces)
+        self._rot_lines_to_pieces(list(self._rot_lines))
         if any(m == "global" for m in self._rot_mode.values()):
             self.report.note("Rotational BCs / moments on knotted shell/beam nodes and kinematic "
                              "reference nodes with a *TRANSFORM written in global components: ccx "
@@ -13867,73 +13894,447 @@ class Converter:
                              "local axes — a moment line by line, held rotations as their global "
                              "values.", once=True)
 
-    def _shell_rotation_pairs(self, blocks: List[Block], cards: list, nodes: List[int],
-                              at: Dict[int, List[int]]) -> None:
-        """Warn where ccx 2.23 holds a rotation of a shell node with a *TRANSFORM that the deck
-        leaves free: on a node that is no knot (``nodes``, kept in the local axes) a step's BCs
-        hold two of its local rotations, neither about the shell normal (ccx drops one within
-        2.6 deg of it as the drilling rotation), and the free third axis is off the normal.
-        gen3dboun then adds a second mean-rotation MPC about n x e1 (e1: the first one's
-        axis in the shell plane), holding both in-plane rotations, so the in-plane part of the
-        free axis is held too (probed: a cylindrical panel 30 % off; rotated about z, a strip
-        whose tip holds rotations about x and y twists 165x less).  The normal is ccx's: a
-        *NODE normal, else the mean of the shell elements' at the node."""
-        if not nodes or self._has_normal:
-            return
-        mine = {id(b): items for b, _, items in cards}
-        held = [{k for k in step if k[0] in nodes}
-                for step in bc_steps([b for b in blocks if b.keyword in ("STEP", "END STEP") or
-                                      (b.keyword == "BOUNDARY" and id(b) in mine)],
-                                     lambda b: [((n, d), 1) for n, its in mine[id(b)].items() for d, _ in its])]
-        hit = []
-        for n in nodes:
-            axes = self._local_axes(n)
-            nrm = self._node_normals.get(n)
-            if nrm is None:
-                ns = [v for e in at.get(n, ()) if ccx_type(self.geom.elements[e][0]) in SHELL_TYPES
-                      for v in [self._shell_normal(e)] if vnorm(v)]
-                tot: Vec = (0.0, 0.0, 0.0)
-                for v in ns:
-                    tot = vadd(tot, v if vdot(v, ns[0]) >= 0.0 else vscale(v, -1.0))
-                nrm = vunit(tot) if vnorm(tot) else None
-            if nrm is None or isinstance(axes, str):
-                continue
-            for step in held:
-                ds = sorted(d for m, d in step if m == n)
-                free = [d for d in (4, 5, 6) if d not in ds]
-                if len(ds) == 2 and all(abs(vdot(axes[d - 4], nrm)) <= 0.999 for d in ds) and \
-                        abs(vdot(axes[free[0] - 4], nrm)) < 0.999:
-                    hit.append(n)
-                    break
-        if hit:
-            self.report.warn(f"Rotational BCs on {len(hit)} shell node(s) with a *TRANSFORM (e.g. node "
-                             f"{hit[0]}) hold two local rotations about axes off the shell normal, "
-                             f"leaving the third, also off the normal, free: ccx 2.23 then holds both "
-                             f"rotations in the shell plane (a second mean-rotation MPC), so the "
-                             f"in-plane part of the free rotation is held too (probed: 30 % off on a "
-                             f"cylindrical panel). Abaqus leaves it free.", once=True)
-            self._reduces("shell rotation the deck leaves free held by ccx (two rotational BCs off the "
-                          "normal on a node with a *TRANSFORM)")
+    def _rot_lines_to_pieces(self, keys: List[Tuple[int, int]]) -> None:
+        """The _rot_lines of ``keys`` (card, node) on a card _plan_velocity_bcs /
+        _plan_default_amplitudes made pieces of: a node's lines go with the piece that ramps its
+        rotations (DOFs 1-6 of a node out of its *TRANSFORM; ccx's step ramp is the card's
+        Abaqus ramp, of each global component from its last value), else the first naming
+        them."""
+        for src, n in keys:
+            got = self._rot_lines[(src, n)]
+            span = (1, 6) if n in self._untr else (4, 6)
+            pieces = [p for p in self._amp_cards.get(src, self._vel_cards.get(src, ()))
+                      if isinstance(p, Block) and self._rot_items(p, {n}, span=span)]
+            ramp = [p for p in pieces if p.uparam("AMPLITUDE") == self.CCX_RAMP]
+            at = ramp[0] if ramp and isinstance(got, list) else pieces[0] if pieces else None
+            self._rot_lines.update(((id(p), n), got if p is at else []) for p in pieces)
 
-    def _rot_items(self, b: Block, nodes: set,
-                   whole: bool = False) -> Dict[int, List[Tuple[int, float]]]:
+    # a shell node's local coordinates in its element (ccx gen3dnor: coloc6, coloc8)
+    _SHELL_COLOC = {3: ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+                    4: ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)),
+                    6: ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)),
+                    8: ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0),
+                        (0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0))}
+
+    @staticmethod
+    def _shell_shape_derivs(nn: int, xi: float, et: float) -> List[Tuple[float, float]]:
+        """d/dxi, d/deta of the shape functions of a 3-, 4-, 6- or 8-node shell."""
+        if nn == 3:
+            return [(-1.0, -1.0), (1.0, 0.0), (0.0, 1.0)]
+        if nn == 4:
+            return [(-(1 - et) / 4, -(1 - xi) / 4), ((1 - et) / 4, -(1 + xi) / 4),
+                    ((1 + et) / 4, (1 + xi) / 4), (-(1 + et) / 4, (1 - xi) / 4)]
+        if nn == 6:
+            a = 1.0 - xi - et
+            return [(1 - 4 * a, 1 - 4 * a), (4 * xi - 1, 0.0), (0.0, 4 * et - 1),
+                    (4 * (a - xi), -4 * xi), (4 * et, 4 * xi), (-4 * et, 4 * (a - et))]
+        out = [(a * (1 + b * et) * (2 * a * xi + b * et) / 4, b * (1 + a * xi) * (a * xi + 2 * b * et) / 4)
+               for a, b in Converter._SHELL_COLOC[8][:4]]
+        return out + [(-xi * (1 - et), -(1 - xi * xi) / 2), ((1 - et * et) / 2, -et * (1 + xi)),
+                      (-xi * (1 + et), (1 - xi * xi) / 2), (-(1 - et * et) / 2, -et * (1 - xi))]
+
+    def _shell_node_normal(self, e: int, n: int) -> Optional[Vec]:
+        """The unit normal of shell (or membrane) ``e`` of 3, 4, 6 or 8 nodes at its node ``n``
+        as ccx 2.23 computes it (gen3dnor: the cross product of the derivatives there,
+        norshell3 / 4 / 6 / 8)."""
+        conn = self.geom.elements[e][1]
+        if len(conn) not in self._SHELL_COLOC:
+            return None
+        xi, et = self._SHELL_COLOC[len(conn)][conn.index(n)]
+        ds = self._shell_shape_derivs(len(conn), xi, et)
+        pts = [self.geom.nodes[m] for m in conn]
+        v = vcross(tuple(sum(d[0] * p[k] for d, p in zip(ds, pts)) for k in range(3)),
+                   tuple(sum(d[1] * p[k] for d, p in zip(ds, pts)) for k in range(3)))
+        return vunit(v) if vnorm(v) > 0.0 else None
+
+    def _ccx_shell_normal(self, n: int, at: Dict[int, List[int]]) -> Optional[Vec]:
+        """The normal ccx 2.23 gives shell node ``n`` where it is no knot (gen3dnor): its *NODE
+        normal, else the mean of its shell elements' normals at the node (_shell_node_normal)."""
+        if n in self._node_normals:
+            return self._node_normals[n]
+        tot: Vec = (0.0, 0.0, 0.0)
+        for e in at.get(n, ()):
+            v = self._shell_node_normal(e, n) if ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS else None
+            tot = vadd(tot, v) if v else tot
+        return vunit(tot) if vnorm(tot) > 1e-9 else None
+
+    def _plan_shell_rotation_pairs(self, blocks: List[Block]) -> None:
+        """BCs that hold two rotations of a shell node, both off its normal: ccx 2.23 holds the
+        third one too.  At a shell node that is no knot ccx makes each rotational BC a mean-
+        rotation MPC about its axis projected on the shell plane, dropping one within 2.6 deg
+        of the normal (|cos| > 0.999) as the drilling rotation; a second one always adds an MPC
+        about n x e1 (e1: the first one's axis in the plane), so both in-plane rotations are
+        held, at the projection of v1 a1 + v2 a2 (gen3dboun).  That is right where the free
+        axis a3 is the normal; elsewhere the deck leaves the rotation about a3 free, which
+        holds only the in-plane rotation about q = n x a3, at v1 a1.q + v2 a2.q (an S8R strip
+        turned 15 deg, its tip holding the rotations about x and y, twists 165x less; NAFEMS
+        LE2 without its *TRANSFORM is 57 % off).  Where a3 lies in the shell plane both axes
+        project onto q, so ONE of the two lines is that constraint: the one with the larger
+        |a_k . q|, its value v1 a1.q + v2 a2.q over a_k.q (probed: the strip 3e-7 of max |u|
+        from the strip turned back, half a cylindrical panel with ZSYMM 4e-13 from the whole,
+        linear and NLGEOM; the two lines 52-99 % off).  Elsewhere there is no such line:
+        warned (reduced physics).
+
+        The nodes: shell nodes (no beam) that are no knot, without a *TRANSFORM or with one
+        they keep (_plan_transformed_rotations: their local axes), in a deck without *NORMAL
+        definitions; the normal is ccx's (_ccx_shell_normal).  A node's lines are rewritten
+        (_rot_mode 'pair', _rot_lines per card) where each state of its rotational BCs
+        (_rot_bc_walk) is none, that DOF alone or such a pair with it, a pair's nonzero values
+        on the card's amplitude in its step.  Not in a deck with a *DYNAMIC step: ccx makes
+        the node a knot there, which holds the rotations as given, so only its pairs in force
+        before the first *DYNAMIC step are warned."""
+        if getattr(self.opt, "solid_dof", False) or not self._mechanical or self._has_normal:
+            return
+        sheet = {n for typ, conn in self.geom.elements.values() if ccx_type(typ) in SHEET_SHELLS
+                 for n in conn}
+        cand = {n for n in sheet if n not in self._knots and n not in self._rb_rot and
+                (n not in self._transformed or self._rot_mode.get(n) == "keep")}
+        cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
+        step = 0
+        dyn: set = set()                      # the *DYNAMIC steps
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword == "DYNAMIC":
+                dyn.add(step)
+            elif b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2:
+                cards.append((b, step, self._rot_items(b, cand)))
+        used = sorted({n for _, _, items in cards for n in items})
+        if not used:
+            return
+        at = self._elements_at(set(used))
+        sections = self._knot_sections(blocks)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks)
+        ident: Tuple[Vec, Vec, Vec] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        done: List[int] = []
+        hit: List[int] = []
+        for n in used:
+            axes = self._local_axes(n) if n in self._transformed else ident
+            if isinstance(axes, str) or not self._ccx_plain_shell_node(n, sections, at):
+                continue
+            nrm = self._ccx_shell_normal(n, at)
+            if nrm is None:
+                continue
+            bad, lines = self._rot_pair_plan(n, axes, nrm, list(self._rot_bc_walk(n, cards, acts)), dyn)
+            if not bad:
+                continue
+            if lines is None:
+                hit.append(n)
+                continue
+            self._rot_mode[n] = "pair"
+            self._rot_lines.update(lines)
+            self._rot_lines_to_pieces(list(lines))
+            done.append(n)
+        if done:
+            self.report.note(f"Rotational BCs on {len(done)} shell node(s) (e.g. node {done[0]}) "
+                             f"that hold two rotations, the third free axis in the shell plane: "
+                             f"written as one rotation line, about the axis the in-plane rotation "
+                             f"is held about (ccx 2.23 would hold both in-plane rotations for two "
+                             f"lines, and so the free one too; probed). Exact.", once=True)
+        if hit:
+            self.report.warn(f"Rotational BCs on {len(hit)} shell node(s) (e.g. node {hit[0]}) hold "
+                             f"two rotations about axes off the shell normal, leaving the third, also "
+                             f"off the normal, free: ccx 2.23 then holds both rotations in the shell "
+                             f"plane (a second mean-rotation MPC), so the in-plane part of the free "
+                             f"rotation is held too (probed: an S8R strip twists 165x less; a "
+                             f"cylindrical panel 30 % off). Abaqus leaves it free. (One rotation line "
+                             f"is exact only where the free axis lies in the shell plane, in a deck "
+                             f"without a *DYNAMIC step.)", once=True)
+            self._reduces("shell rotation the deck leaves free held by ccx (two rotational BCs off "
+                          "the normal)")
+
+    def _ccx_plain_shell_node(self, n: int, sections: Dict[int, tuple],
+                              at: Dict[int, List[int]]) -> bool:
+        """Whether ccx 2.23 surely makes node ``n`` of shells only no knot (gen3dnor): its
+        shells share one section, and _ccx_knot finds one group — or, with a *NODE normal,
+        which every shell at the node takes (_node_normal_cards), their *NORMAL lines share one
+        direction, whatever the angle between the elements."""
+        if n in self._knots:
+            return False
+        es = [e for e in at.get(n, ()) if e not in self._qmem and
+              not ccx_type(self.geom.elements[e][0]).startswith(("MASS", "SPRING", "DASHPOT"))]
+        if not es or any(ccx_type(self.geom.elements[e][0]) not in SHEET_SHELLS or e not in sections
+                         for e in es) or len({sections[e] for e in es}) > 1:
+            return False
+        if n not in self._node_normals:
+            return self._ccx_knot(n, sections, at) is False
+        nrm, flip = self._node_normals[n], set()
+        for e in es:                            # as _node_normal_cards turns a normal
+            conn = self.geom.elements[e][1]
+            p = [self.geom.nodes[m] for m in conn[:4 if len(conn) in (4, 8, 9) else 3]]
+            flip.add(vdot(nrm, vunit(vcross(vsub(p[1], p[0]), vsub(p[-1], p[0])))) <
+                     math.cos(math.radians(160.0)))
+        return len(flip) == 1
+
+    def _rot_pair_plan(self, n: int, axes: Tuple[Vec, Vec, Vec], nrm: Vec, walk: list,
+                       dyn: set) -> Tuple[bool, Optional[Dict[Tuple[int, int], List[str]]]]:
+        """(whether a state of shell node ``n``'s rotational BCs ``walk`` (_rot_bc_walk, on its
+        ``axes``) that ccx solves holds two rotations off the normal ``nrm`` with the free one
+        off it too, its _rot_lines with one rotation line where that is exact (else None)) —
+        _plan_shell_rotation_pairs; ``dyn``: the *DYNAMIC steps."""
+        last = {s: i for i, (_, s, _, _) in enumerate(walk)}
+        bad: Dict[Tuple[int, ...], bool] = {}     # held pair -> the free axis in the plane
+        for i, (_, s, st, _) in enumerate(walk):
+            # the states ccx solves: each step's last (model data's where step 1 names none),
+            # before the first *DYNAMIC step (ccx makes the node a knot there)
+            if last[s] != i or (s == 0 and 1 in last) or not isinstance(st, dict) or \
+                    len(st) != 2 or (dyn and max(s, 1) >= min(dyn)):
+                continue
+            held = tuple(sorted(st))
+            free = abs(vdot(axes[15 - sum(held) - 4], nrm))
+            if all(abs(vdot(axes[d - 4], nrm)) <= 0.999 for d in held) and free < 0.999:
+                bad[held] = free <= 1e-6
+        if not bad or dyn or not all(bad.values()):
+            return bool(bad), None
+        qs = [vcross(nrm, axes[15 - sum(p) - 4]) for p in bad]
+        ks = [k for k in (4, 5, 6) if all(k in p for p in bad)]
+        k = max(ks, key=lambda d: min(abs(vdot(axes[d - 4], q)) for q in qs), default=None)
+        return True, self._rot_pair_lines(n, k, axes, nrm, walk) if k else None
+
+    def _rot_pair_lines(self, n: int, k: int, axes: Tuple[Vec, Vec, Vec], nrm: Vec, walk: list
+                        ) -> Optional[Dict[Tuple[int, int], List[str]]]:
+        """_rot_lines (card, node) for shell node ``n`` with normal ``nrm`` whose rotational BCs
+        go on DOF ``k`` (_plan_shell_rotation_pairs): each card's state ``walk`` (_rot_bc_walk)
+        as its lines — none, DOF k alone, all three as they are, a pair with k whose free axis
+        lies in the shell plane as one line on k —, or None where a state has no such form
+        (another DOF alone, a pair without k or off the plane, a value that does not read as a
+        number, a nonzero value from an earlier card on another amplitude, which the line would
+        restart)."""
+        out: Dict[Tuple[int, int], List[str]] = {}
+        for b, s, st, amp in walk:
+            if isinstance(st, str):
+                return None
+            vals = {j: e[0] for j, e in st.items()}
+            if any(math.isnan(v) for v in vals.values()) or \
+                    any(v != 0.0 and (a != amp or (a is not None and s0 != s)) for v, a, s0 in st.values()):
+                return None
+            held = tuple(sorted(vals))
+            if len(held) == 2 and k in held:
+                a3 = axes[15 - sum(held) - 4]
+                if abs(vdot(a3, nrm)) > 1e-6:
+                    return None
+                q = vcross(nrm, a3)
+                vals = {k: sum(v * vdot(axes[j - 4], q) for j, v in vals.items()) / vdot(axes[k - 4], q)}
+            elif held not in ((), (k,), (4, 5, 6)):
+                return None
+            scale = max([abs(e[0]) for e in st.values()] + [1e-300])
+            out[(id(b), n)] = [f"{n}, {j}, {j}" + (", " + self._fmt_rot(v, scale) if v != 0.0 else "")
+                               for j, v in sorted(vals.items())]
+        return out
+
+    # cards that read a node's DOFs in its *TRANSFORM axes, or tie its DOFs to others, which
+    # _plan_transformed_corners does not rewrite
+    _UNTR_BLOCKERS = ("EQUATION", "MPC", "COUPLING", "KINEMATIC COUPLING", "RIGID BODY", "TIE",
+                      "DISTRIBUTING COUPLING", "SUBMODEL")
+
+    def _plan_transformed_corners(self, blocks: List[Block]) -> None:
+        """Translational BCs on nodes with a *TRANSFORM that ccx 2.23 does not meet as given.
+        ccx turns such a BC into an MPC in global coordinates (probed):
+
+        * on a corner node of S8 / S8R / S6 shells it ties that MPC to the node's middle
+          expanded node only (gen3dmpc), while without a transform gen3dboun ties all three
+          (u(n1) + u(n3) = 2 u(n), u(n2) = u(n)): the shell section is not held there, and a
+          spurious mode appears (an identity *TRANSFORM on a plate's corner moves its edge
+          midside nodes 5e-3 in-plane against 1e-4; NAFEMS LE2 6.4 % off in displacement).  A
+          midside node, which has no middle expanded node, and S3 / S4 are not affected;
+        * on a knot (a frame joint, a converter knot beam, a shell/beam node with rotational
+          BCs or moments, which ccx knots in a *DYNAMIC step) in a *DYNAMIC step after a
+          geometrically linear step, the BC is not met (a frame joint under an identity
+          *TRANSFORM: a held DOF 7e-5 off, a prescribed one 1e-3 short); exact in the steps
+          before, after an NLGEOM step and in a deck of *DYNAMIC steps only.
+
+        Exact: the node leaves the *TRANSFORM (handle_transform), and its BCs and loads are
+        written in global components (_untr_lines; _rot_mode 'untr', _rot_lines per card):
+        where every state of its BCs holds local axes that span global ones (all three, or an
+        axis-aligned set: local 3 of a transform about z), two rotations of a shell node that
+        is no knot held off its normal as one line where that is exact (_rot_pair_plan), its
+        loads line by line (_load_global_lines).  Not where its local axes reach further:
+        springs, dashpots or other elements that read them, the converter's midside nodes next
+        to it (their BCs follow its local axes), cards that read its DOFs in local axes or tie
+        them (_UNTR_BLOCKERS, initial velocities), output printed in its local axes, a rate,
+        FIXED or USER BC, rotations refused (_plan_transformed_rotations), or no global form:
+        warned (reduced physics)."""
+        self._untr = set()
+        if not self._transformed or getattr(self.opt, "solid_dof", False) or not self._mechanical:
+            return
+        corner, upgraded = set(), set()
+        for e, (typ, conn) in self.geom.elements.items():
+            cc = ccx_type(typ)
+            corner.update(conn[:4] if cc in ("S8", "S8R") and len(conn) >= 8 else
+                          conn[:3] if cc == "S6" and len(conn) >= 6 else ())
+            if e in self._quad_from:
+                upgraded.update(conn)
+        steps = list(self.steps)
+        lin_dyn = any(st.proc == "DYNAMIC" and any(p.proc != "DYNAMIC" and not p.nlgeom for p in steps[:k])
+                      for k, st in enumerate(steps))
+        cand = {n for n in self._transformed if lin_dyn or n in corner}
+        if not cand:
+            return
+        cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
+        step = 0
+        dyn: set = set()
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword == "DYNAMIC":
+                dyn.add(step)
+            elif b.keyword in ("BOUNDARY", "CLOAD") and id(b) not in self.steps.lc2:
+                cards.append((b, step, self._rot_items(b, cand, span=(1, 6))))
+        used = sorted({n for b, _, items in cards if b.keyword == "BOUNDARY"
+                       for n, its in items.items() if any(d <= 3 for d, _ in its)})
+        if not used:
+            return
+        rotated = {n for _, _, items in cards for n, its in items.items() if any(d >= 4 for d, _ in its)}
+        blockers = sorted({b.keyword for b in blocks if b.keyword in self._UNTR_BLOCKERS or
+                           (b.keyword == "INITIAL CONDITIONS" and
+                            "VELOCITY" in (b.uparam("TYPE") or ""))})
+        local_out: set = set()                      # nodes whose output is in their local axes
+        for b in blocks:
+            if (b.keyword == "NODE PRINT" and (b.uparam("GLOBAL") or "NO") != "YES" and
+                    (b.uparam("FREQUENCY") or "1") not in ("0", "0.")) or \
+                    (b.keyword in ("NODE FILE", "NODE OUTPUT") and b.uparam("GLOBAL") == "NO"):
+                nset = (b.param("NSET") or "").strip()
+                local_out.update(self._resolve_nodes(nset) if nset else used)
+        at = self._elements_at(set(used))
+        sections = self._knot_sections(blocks)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks)
+        done: Dict[bool, List[int]] = {False: [], True: []}        # knot -> nodes
+        hit: Dict[bool, List[Tuple[int, str]]] = {False: [], True: []}
+        for n in used:
+            knot = lin_dyn and (n in self._knots or self._ccx_knot(n, sections, at) is True or
+                                n in rotated)
+            if not knot and n not in corner:
+                continue
+            axes = self._local_axes(n)
+            types = [ccx_type(self.geom.elements[e][0]) for e in at.get(n, ())]
+            others = [t for t in types if not t.startswith("MASS") and t not in SHEET_SHELLS and
+                      (not knot or (t not in BEAM_TYPES and not t.startswith("C3D")))]
+            if isinstance(axes, str):
+                why = axes
+            elif others or n in upgraded or \
+                    self._rot_mode.get(n) not in ((None, "keep", "global") if knot else (None, "keep")) or \
+                    not (knot or self._ccx_plain_shell_node(n, sections, at)):
+                why = ("other elements at the node, its rotations refused, or the converter's midside "
+                       "nodes next to it read its local axes")
+            elif blockers:
+                why = f"the deck has {', '.join('*' + k for k in blockers)} cards"
+            elif n in local_out:
+                why = "its output is printed in its local axes"
+            else:
+                got = self._untr_lines(n, axes, cards, acts, dyn, at, knot)
+                if isinstance(got, str):
+                    why = got
+                else:
+                    self._rot_mode[n] = "untr"
+                    self._untr.add(n)
+                    self._rot_lines.update(got)
+                    self._rot_lines_to_pieces(list(got))
+                    done[knot].append(n)
+                    continue
+            hit[knot].append((n, why))
+        if done[False]:
+            self.report.note(f"{len(done[False])} corner node(s) of S8 / S8R / S6 shells with a "
+                             f"*TRANSFORM and translational BCs (e.g. node {done[False][0]}) taken out "
+                             f"of the *TRANSFORM, their BCs and loads written in global components: "
+                             f"ccx 2.23 ties a translational BC on such a node (an MPC in global "
+                             f"coordinates) to its middle expanded node only, not to the shell section "
+                             f"as without a *TRANSFORM (probed). Exact.", once=True)
+        if done[True]:
+            self.report.note(f"{len(done[True])} knot node(s) with a *TRANSFORM and translational BCs "
+                             f"(e.g. node {done[True][0]}) taken out of the *TRANSFORM, their BCs and "
+                             f"loads written in global components: in a *DYNAMIC step after a "
+                             f"geometrically linear step ccx 2.23 does not meet such a BC (an MPC in "
+                             f"global coordinates) on a knot (probed). Exact.", once=True)
+        if hit[False]:
+            self.report.warn(f"Translational BCs on {len(hit[False])} corner node(s) of S8 / S8R / S6 "
+                             f"shells with a *TRANSFORM (e.g. node {hit[False][0][0]}): ccx 2.23 ties "
+                             f"such a BC (an MPC in global coordinates) to the node's middle expanded "
+                             f"node only, not to the shell section as without a *TRANSFORM, so the "
+                             f"section turns there and a spurious mode appears (probed: NAFEMS LE2 "
+                             f"6.4 % off in displacement). Taking the node out of the *TRANSFORM, its "
+                             f"cards in global components, is exact, but not here: {hit[False][0][1]}.",
+                             once=True)
+            self._reduces("translational BC on a transformed S8 / S8R / S6 corner node (ccx holds its "
+                          "middle expanded node only)")
+        if hit[True]:
+            self.report.warn(f"Translational BCs on {len(hit[True])} knot node(s) with a *TRANSFORM "
+                             f"(e.g. node {hit[True][0][0]}) in a deck whose *DYNAMIC step follows a "
+                             f"geometrically linear step: ccx 2.23 does not meet such a BC (an MPC in "
+                             f"global coordinates) on a knot in that *DYNAMIC step (probed: a held DOF "
+                             f"7e-5 off, a prescribed one 1e-3 short). Taking the node out of the "
+                             f"*TRANSFORM, its cards in global components, is exact, but not here: "
+                             f"{hit[True][0][1]}.", once=True)
+            self._reduces("translational BC on a transformed knot in a *DYNAMIC step after a linear "
+                          "step (ccx does not meet it)")
+
+    def _untr_lines(self, n: int, axes: Tuple[Vec, Vec, Vec],
+                    cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]], acts: set,
+                    dyn: set, at: Dict[int, List[int]],
+                    knot: bool) -> Union[Dict[Tuple[int, int], List[str]], str]:
+        """_rot_lines (card, node) for node ``n`` taken out of its *TRANSFORM
+        (_plan_transformed_corners): each *BOUNDARY's state of its local DOFs (_rot_bc_walk) as
+        the global values that hold the same (_global_bc_values; on a shell node that is no
+        ``knot``, two rotations off the normal as one line where exact, _rot_pair_plan), each
+        *CLOAD's lines in global components (_load_global_lines) — or why there are none."""
+        ident: Tuple[Vec, Vec, Vec] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        out: Dict[Tuple[int, int], List[str]] = {}
+        walk = []                           # the rotations' states in global components
+        for b, s, st, amp in self._rot_bc_walk(n, cards, acts):
+            if isinstance(st, str):
+                return st
+            vals = {d: e[0] for d, e in st.items()}
+            if any(math.isnan(v) for v in vals.values()):
+                return "a value does not read as a number (a *PARAMETER?)"
+            if any(v != 0.0 and (a != amp or (a is not None and s0 != s)) for v, a, s0 in st.values()):
+                return ("a BC value holds on from an earlier step with an amplitude, or another "
+                        "amplitude than the card's, which the global values would restart")
+            tr = self._global_bc_lines(n, axes, {d: v for d, v in vals.items() if d <= 3}, 0)
+            rot = self._global_bc_values(axes, {d: v for d, v in vals.items() if d > 3}, 3)
+            if tr is None or rot is None:
+                return "the local axes held are not a set of global ones"
+            out[(id(b), n)] = tr
+            walk.append((b, s, {d: (v, amp, s) for d, v in rot.items()}, amp))
+        nrm = None if knot else self._ccx_shell_normal(n, at)
+        bad, pair = self._rot_pair_plan(n, ident, nrm, walk, dyn) if nrm else (False, None)
+        if bad and pair is None:
+            return ("two of its rotations held about global axes off the shell normal, the free "
+                    "one out of the shell plane")
+        for b, s, st, amp in walk:
+            got = pair[(id(b), n)] if pair else \
+                self._global_bc_lines(n, ident, {d: e[0] for d, e in st.items()}, 3)
+            out[(id(b), n)] += got or []
+        sources: Dict[int, Dict[int, List[Tuple[str, int, float]]]] = {}
+        for b, _, _ in cards:
+            if b.keyword == "CLOAD":
+                for m, src, d, v in self._rot_moments(b, {n}, (1, 6)):
+                    sources.setdefault(id(b), {}).setdefault(m, []).append((src, d, v))
+        loads = self._load_global_lines(n, axes, cards, acts, sources)
+        why = next((v for v in loads.values() if isinstance(v, str)), None)
+        if why:
+            return why
+        out.update((k, v) for k, v in loads.items() if isinstance(v, list))
+        return out
+
+    def _rot_items(self, b: Block, nodes: set, whole: bool = False,
+                   span: Tuple[int, int] = (4, 6)) -> Dict[int, List[Tuple[int, float]]]:
         """(DOF, value) per node of ``nodes`` that the *BOUNDARY or *CLOAD ``b`` gives on DOFs
-        4-6, as handle_boundary / handle_cload emit the card (a named BC type: zero on its
-        rotations, where it has them; a value that does not read as a number: NaN; a
+        4-6 (``span``), as handle_boundary / handle_cload emit the card (a named BC type: zero
+        on its DOFs, where it has them; a value that does not read as a number: NaN; a
         *BOUNDARY's midside lines too, _midside_records): a card _plan_default_amplitudes
         split (unless ``whole``) as its pieces give them on the card's nodes (an explicit
         step's value on a DOF at rest is zero)."""
         out: Dict[int, List[Tuple[int, float]]] = {}
+        first, last = span
         pieces = [] if whole else [p for p in self._amp_cards.get(id(b), ()) if isinstance(p, Block)]
         if pieces:
-            mine = set(self._rot_items(b, nodes, True))
+            mine = set(self._rot_items(b, nodes, True, span))
             for p in pieces:
-                for n, its in self._rot_items(p, mine).items():
+                for n, its in self._rot_items(p, mine, span=span).items():
                     out.setdefault(n, []).extend(its)
             return out
 
         if b.keyword == "CLOAD":
-            for n, _, d, v in self._rot_moments(b, nodes):
+            for n, _, d, v in self._rot_moments(b, nodes, span):
                 out.setdefault(n, []).append((d, v))
             return out
         recs = self._bc_card_records(b)
@@ -13953,18 +14354,19 @@ class Converter:
             for n in self._resolve_nodes(g[0]):
                 if n in nodes:
                     out.setdefault(n, []).extend((d, value) for lo, hi in ranges
-                                                 for d in range(max(lo, 4), min(hi, 6) + 1))
+                                                 for d in range(max(lo, first), min(hi, last) + 1))
         return {n: v for n, v in out.items() if v}
 
-    def _rot_moments(self, b: Block, nodes: set) -> List[Tuple[int, str, int, float]]:
+    def _rot_moments(self, b: Block, nodes: set,
+                     span: Tuple[int, int] = (4, 6)) -> List[Tuple[int, str, int, float]]:
         """(node, source, DOF, value) of the moments the *CLOAD ``b`` gives the nodes of
-        ``nodes`` on DOFs 4-6 (_rot_items), the source as Abaqus tells loads apart
-        (_load_source)."""
+        ``nodes`` on DOFs 4-6 (``span``: forces too, _untr_lines) (_rot_items), the source as
+        Abaqus tells loads apart (_load_source)."""
         out = []
         for ln in b.data:
             f = [x.strip() for x in ln.split(",")]
             d = dof_number(f[1]) if len(f) >= 2 else None
-            if d is not None and 4 <= d <= 6:
+            if d is not None and span[0] <= d <= span[1]:
                 src, v = self._load_source(f[0]), self._rot_value(f[2] if len(f) > 2 else "")
                 out += [(n, src, d, v) for n in self._resolve_nodes(f[0]) if n in nodes]
         return out
@@ -14018,31 +14420,24 @@ class Converter:
 
         After a linear perturbation step (``self._pert_idx``) both start again from the last
         general step's state, which _restore_base_states gives ccx again (as bc_steps)."""
-        # (not StepModel.states: it needs the state after each card; it counts the steps per
-        # *STEP card, as ``cards`` does, an unterminated *STEP's later one as a step against
-        # _pert_idx's count; moments add up within a step)
+        for b, s, got, amp in self._rot_bc_walk(n, cards, acts):
+            self._rot_lines[(id(b), n)] = got if isinstance(got, str) else \
+                self._rot_bc_global(n, axes, got, amp, s)
+        self._rot_lines.update(self._load_global_lines(n, axes, cards, acts, sources))
+
+    def _load_global_lines(self, n: int, axes: Tuple[Vec, Vec, Vec],
+                           cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]], acts: set,
+                           sources: Dict[int, Dict[int, List[Tuple[str, int, float]]]]
+                           ) -> Dict[Tuple[int, int], Union[List[str], str]]:
+        """(card, node) -> the *CLOAD lines of ``cards`` on node ``n``'s local DOFs in global
+        components, or why there are none (see _rot_global_lines; ``sources``: its loads per
+        card, _rot_moments): a step that loads some local DOFs of a kind (moments, or forces of
+        a node out of its *TRANSFORM: _untr_lines) also gives the components of the loads of
+        that kind that earlier steps gave from another source."""
+        # (loads add up within a step)
+        out: Dict[Tuple[int, int], Union[List[str], str]] = {}
         pert = self._pert_idx
-        state: Dict[int, Tuple[float, Optional[str], int]] = {}
-        base, cur = state, 0                    # the last general step's state; the step
-        for b, s, items in cards:
-            if b.keyword != "BOUNDARY":
-                continue
-            if s != cur:
-                state, base, cur = (dict(base), base, s) if cur in pert else (state, dict(state), s)
-            if id(b) in acts:
-                state = {}
-            if n not in items:
-                continue
-            if self._bc_type(b) != "DISPLACEMENT" or b.has("FIXED") or b.has("USER"):
-                self._rot_lines[(id(b), n)] = ("a velocity, acceleration, FIXED or USER boundary "
-                                               "condition on the rotations has no form in global "
-                                               "components")
-                continue
-            amp = b.uparam("AMPLITUDE") or None
-            for d, v in items[n]:
-                state[d] = (v, amp, s)
-            self._rot_lines[(id(b), n)] = self._rot_bc_global(n, axes, state, amp, s)
-        # (value, amplitude, step) per moment source and local DOF (_load_source)
+        # (value, amplitude, step) per load source and local DOF (_load_source)
         moments: Dict[Tuple[str, int], Tuple[float, Optional[str], int]] = {}
         base, cur = moments, 0
         groups: Dict[int, List[Tuple[Block, List[Tuple[str, int, float]]]]] = {}
@@ -14052,7 +14447,8 @@ class Converter:
         verdict: Dict[int, Optional[str]] = {}
 
         def comps(d: int, v: float) -> List[str]:
-            return [f"{n}, {k + 4}, {self._fmt_rot(v * axes[d - 4][k], abs(v))}" for k in range(3)]
+            o = 0 if d <= 3 else 3
+            return [f"{n}, {k + o + 1}, {self._fmt_rot(v * axes[d - o - 1][k], abs(v))}" for k in range(3)]
         for b, s, items in cards:
             if b.keyword != "CLOAD":
                 continue
@@ -14068,8 +14464,9 @@ class Converter:
                 group = groups[s]
                 respec = {(t, d) for _, its in group for t, d, _ in its}
                 own = s in pert and s not in self._modal_held
+                kinds = {d > 3 for _, d in respec}
                 carried = {} if own else \
-                    {k: e for k, e in moments.items() if k not in respec and e[0] != 0.0}
+                    {k: e for k, e in moments.items() if k not in respec and e[0] != 0.0 and (k[1] > 3) in kinds}
                 why = None
                 if len({c.uparam("AMPLITUDE") for c, _ in group}) > 1:
                     why = ("this step loads the rotations with different amplitudes, which share "
@@ -14082,7 +14479,7 @@ class Converter:
                     why = "a value does not read as a number (a *PARAMETER?)"
                 verdict[s] = why
                 if why is None:
-                    tot: Dict[int, float] = {}      # (the sources' sum per local rotation)
+                    tot: Dict[int, float] = {}      # (the sources' sum per local DOF)
                     for (_, j), (v, _, _) in carried.items():
                         tot[j] = tot.get(j, 0.0) + v
                     for j, v in tot.items():
@@ -14093,7 +14490,41 @@ class Converter:
                 prev = moments.get((t, d))
                 moments[(t, d)] = ((prev[0] if prev else 0.0) + v, amp, s)
                 lines += comps(d, v)
-            self._rot_lines[(id(b), n)] = verdict[s] or lines
+            out[(id(b), n)] = verdict[s] or lines
+        return out
+
+    def _rot_bc_walk(self, n: int, cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]],
+                     acts: set) -> Iterator[Tuple[Block, int, Union[str, Dict[int, Tuple[float, Optional[str], int]]],
+                                                  Optional[str]]]:
+        """(card, step, the state of node ``n``'s rotational BCs after it — DOF -> (value,
+        amplitude, step) — or why it has none, the card's amplitude) for each *BOUNDARY of
+        ``cards`` that names them: a BC given in a later step replaces that DOF's, OP=NEW (on
+        the cards in ``acts``, op_new_cards) removes the earlier ones, and after a linear
+        perturbation step (``self._pert_idx``) the state starts again from the last general
+        step's, which _restore_base_states gives ccx again (as bc_steps)."""
+        # (not StepModel.states: it needs the state after each card; it counts the steps per
+        # *STEP card, as ``cards`` does, an unterminated *STEP's later one as a step against
+        # _pert_idx's count)
+        pert = self._pert_idx
+        state: Dict[int, Tuple[float, Optional[str], int]] = {}
+        base, cur = state, 0                    # the last general step's state; the step
+        for b, s, items in cards:
+            if b.keyword != "BOUNDARY":
+                continue
+            if s != cur:
+                state, base, cur = (dict(base), base, s) if cur in pert else (state, dict(state), s)
+            if id(b) in acts:
+                state = {}
+            if n not in items:
+                continue
+            if self._bc_type(b) != "DISPLACEMENT" or b.has("FIXED") or b.has("USER"):
+                yield b, s, ("a velocity, acceleration, FIXED or USER boundary condition on the "
+                             "rotations has no form in global components"), None
+                continue
+            amp = b.uparam("AMPLITUDE") or None
+            for d, v in items[n]:
+                state[d] = (v, amp, s)
+            yield b, s, dict(state), amp
 
     def _rot_bc_global(self, n: int, axes: Tuple[Vec, Vec, Vec],
                        state: Dict[int, Tuple[float, Optional[str], int]], amp: Optional[str],
@@ -14106,16 +14537,35 @@ class Converter:
         if any(v != 0.0 and (a != amp or (a is not None and s0 != s)) for v, a, s0 in state.values()):
             return ("the rotations held have different amplitudes, or one carries an amplitude on "
                     "from an earlier step, which the global values would restart")
+        got = self._global_bc_lines(n, axes, vals, 3)
+        return got if got is not None else ("the local rotation axes held are not a set of global "
+                                            "ones (ccx holds a knot's rotations about the global "
+                                            "axes only)")
+
+    @staticmethod
+    def _global_bc_values(axes: Tuple[Vec, Vec, Vec], vals: Dict[int, float],
+                          base: int) -> Optional[Dict[int, float]]:
+        """The values ``vals`` held on local DOFs ``base`` + 1..3 (translations: base 0,
+        rotations: 3) of a node with local ``axes``, as the global DOFs that hold the same:
+        where the local axes held span global ones (all three, or an axis-aligned set, e.g.
+        local 3 of a transform about z), else None."""
         held = sorted(vals)
-        if held == [4, 5, 6] and not any(vals.values()):
-            return [f"{n}, 4, 6"]
-        support = [k for k in range(3) if any(abs(axes[j - 4][k]) > 1e-9 for j in held)]
+        support = [k for k in range(3) if any(abs(axes[j - base - 1][k]) > 1e-9 for j in held)]
         if len(support) != len(held):
-            return ("the local rotation axes held are not a set of global ones (ccx holds a "
-                    "knot's rotations about the global axes only)")
-        scale = max(abs(v) for v in vals.values()) or 1.0
-        return [f"{n}, {k + 4}, {k + 4}" + (", " + self._fmt_rot(g, scale) if g != 0.0 else "")
-                for k in support for g in [sum(vals[j] * axes[j - 4][k] for j in held)]]
+            return None
+        return {k + base + 1: sum(vals[j] * axes[j - base - 1][k] for j in held) for k in support}
+
+    def _global_bc_lines(self, n: int, axes: Tuple[Vec, Vec, Vec], vals: Dict[int, float],
+                         base: int) -> Optional[List[str]]:
+        """*BOUNDARY lines for _global_bc_values (all three held at zero: one line)."""
+        if len(vals) == 3 and not any(vals.values()):
+            return [f"{n}, {base + 1}, {base + 3}"]
+        got = self._global_bc_values(axes, vals, base)
+        if got is None:
+            return None
+        scale = max([abs(v) for v in vals.values()] + [0.0]) or 1.0
+        return [f"{n}, {k}, {k}" + (", " + self._fmt_rot(g, scale) if g != 0.0 else "")
+                for k, g in sorted(got.items())]
 
     def _knot_sections(self, blocks: List[Block]) -> Dict[int, tuple]:
         """Element -> what ccx's knot test compares of its section (gen3dnor): a shell's
@@ -14160,9 +14610,10 @@ class Converter:
         converter cannot tell).  gen3dnor groups a node's shell and beam elements: an element
         joins the group of the lowest-numbered one when its section (thickness, offset; a
         beam's section) is the same and its direction within 20 deg (0.5 deg with *NORMAL
-        definitions) — a shell's normal, a beam's tangent and second section axis; more than
-        one group makes a knot.  Within 15 deg is one group here, more than 25 deg two; a
-        converter knot beam, trusses or other elements at the node decide it too."""
+        definitions) — a shell's normal at the node (_shell_node_normal, as ccx computes it:
+        within 19.9 deg is one group here, more than 20.1 deg two), a beam's tangent and second
+        section axis (within 15 deg one group, more than 25 deg two); more than one group makes
+        a knot; a converter knot beam, trusses or other elements at the node decide it too."""
         if n in self._knots:
             return True
         shells: List[int] = []
@@ -14186,7 +14637,10 @@ class Converter:
         def direction(e: int) -> Optional[Tuple[Vec, ...]]:
             conn = self.geom.elements[e][1]
             if e in shells:
-                nc = 3 if len(conn) in (3, 6) else 4
+                v = self._shell_node_normal(e, n)
+                if v:
+                    return (v,)
+                nc = 3 if len(conn) in (3, 6) else 4             # (another node count)
                 i = conn.index(n)
                 if i < nc:
                     p = pts[conn[i]]
@@ -14213,9 +14667,10 @@ class Converter:
             if sections[e] != sections[group[0]]:
                 return True
             cos = min(vdot(a, c) for a, c in zip(ref, d))
-            if cos < math.cos(math.radians(25.0)):
+            lo, hi = (19.9, 20.1) if shells else (15.0, 25.0)
+            if cos < math.cos(math.radians(hi)):
                 return True
-            if cos < math.cos(math.radians(15.0)):
+            if cos < math.cos(math.radians(lo)):
                 verdict = None
         return verdict
 
@@ -19896,6 +20351,8 @@ class Converter:
         self._plan_modal_starts(blocks)
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
+        self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes
+        self._plan_shell_rotation_pairs(blocks)     # after both: their 'keep' / 'untr' nodes
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams
         self._plan_circ_explicit_increment(blocks)
         self._plan_rigid_contact_increment(blocks)

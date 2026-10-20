@@ -1393,6 +1393,100 @@ def sheet_cylinder_deck(typ, n=8, t=0.1, p=1.0, nu=0.3):
     return "\n".join(lines) + "\n"
 
 
+def tilted_strip_deck(ang, tip, torque=1.0, nlgeom=False, nx=8, ny=2):
+    """An S8R strip along z (length 1, width 0.2, thickness 0.01; nx x ny cells) whose normal
+    lies in the x-y plane at ``ang`` deg from x, clamped at z = 0; on its tip edge (z = 1) the
+    rotational BCs ``tip`` ((DOF, value), ...) and forces -+``torque`` along the normal at the
+    two tip corners, which twist it about z."""
+    c, s = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+    grid, elems = sheet_mesh("S8R", ny, nx, 0.2, 1.0)
+    nodes = {k: (-s * (y - 0.1), c * (y - 0.1), z) for k, (y, z) in grid.items()}
+    tip_nodes = [k for k, x in nodes.items() if x[2] == 1.0]
+    ends = [min(tip_nodes, key=lambda k: grid[k][0]), max(tip_nodes, key=lambda k: grid[k][0])]
+    lines = ["*Node, nset=ALLN"] + [f"{k}, {x!r}, {y!r}, {z!r}" for k, (x, y, z) in nodes.items()]
+    lines += ["*Element, type=S8R, elset=E"] + [f"{e}, " + ", ".join(map(str, cn)) for e, cn in enumerate(elems, 1)]
+    lines += ["*Nset, nset=ROOT"] + _ids([k for k, x in nodes.items() if x[2] == 0.0])
+    lines += ["*Nset, nset=TIP"] + _ids(tip_nodes)
+    lines += ["*Material, name=M", "*Elastic", "210000., 0.3", "*Shell Section, elset=E, material=M",
+              "0.01", "*Boundary", "ROOT, 1, 6", "*Step" + (", nlgeom" if nlgeom else ""), "*Static",
+              "*Boundary"] + [f"TIP, {d}, {d}, {v!r}" for d, v in tip]
+    lines += ["*Cload"] + [f"{n}, {k + 1}, {sg * torque * v!r}" for n, sg in zip(ends, (-1.0, 1.0))
+                           for k, v in enumerate((c, s)) if abs(v) > 1e-15]
+    lines += ["*Node Print, nset=ALLN", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def corner_transform_plate_deck(local):
+    """A flat S8R plate (2 x 1 in the x-y plane, 4 x 2 cells, thickness 0.05) clamped along
+    x = 0.  Corner A (2, 0) moved 0.01 along z and loaded by a force of 5 and a moment of 0.1
+    about an in-plane axis 30 deg from x; corner B (2, 1) held in x, y and z.  ``local``: A
+    with a rectangular *TRANSFORM turned 30 deg about z (the loads along its local 1), B
+    with one tilted out of the plane, each BC and load in those local axes; else all global."""
+    grid, elems = sheet_mesh("S8R", 4, 2, 2.0, 1.0)
+    a = min(grid, key=lambda k: math.dist(grid[k], (2.0, 0.0)))
+    b = min(grid, key=lambda k: math.dist(grid[k], (2.0, 1.0)))
+    c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+    lines = ["*Node, nset=ALLN"] + [f"{k}, {x!r}, {y!r}, 0." for k, (x, y) in grid.items()]
+    lines += ["*Element, type=S8R, elset=E"] + [f"{e}, " + ", ".join(map(str, cn)) for e, cn in enumerate(elems, 1)]
+    lines += ["*Nset, nset=ROOT"] + _ids([k for k, (x, y) in grid.items() if x == 0.0])
+    lines += ["*Material, name=M", "*Elastic", "210000., 0.3", "*Shell Section, elset=E, material=M", "0.05"]
+    if local:
+        lines += [f"*Nset, nset=TA\n{a}", "*Transform, nset=TA, type=R", f"{c!r}, {s!r}, 0., {-s!r}, {c!r}, 0.",
+                  f"*Nset, nset=TB\n{b}", "*Transform, nset=TB, type=R", "1., 0., 1., 0., 1., 0."]
+    lines += ["*Boundary", "ROOT, ENCASTRE", f"{b}, 1, 3", "*Step", "*Static", "*Boundary", f"{a}, 3, 3, 0.01",
+              "*Cload"] + ([f"{a}, 1, 5.", f"{a}, 4, 0.1"] if local else
+                           [f"{a}, 1, {5 * c!r}", f"{a}, 2, {5 * s!r}", f"{a}, 4, {0.1 * c!r}", f"{a}, 5, {0.1 * s!r}"])
+    lines += ["*Node Print, nset=ALLN, global=yes", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def folded_strip_deck(turned, procs=("*STATIC", "*DYNAMIC")):
+    """An S4 strip 2 long folded 90 deg along its middle line (ccx knots the nodes on the fold),
+    clamped at x = 0; the fold's end node 8 held in y and moved 0.01 per step in z, one step per
+    procedure in ``procs``.  ``turned``: node 8 with a rectangular *TRANSFORM turned 90 deg
+    about z (local 1 = y), its BCs in those axes."""
+    pts = [(float(i), y, z) for i in range(3) for y, z in ((-0.5, 0.0), (0.0, 0.0), (0.0, 0.5))]
+    els = [f"{2 * i + j + 1}, {3 * i + j + 1}, {3 * i + j + 4}, {3 * i + j + 5}, {3 * i + j + 2}"
+           for i in range(2) for j in range(2)]
+    lines = ["*Node, nset=ALLN"] + [f"{k}, {x!r}, {y!r}, {z!r}" for k, (x, y, z) in enumerate(pts, 1)]
+    lines += ["*Element, type=S4, elset=E"] + els + ["*Shell Section, elset=E, material=M", "0.05",
+                                                     "*Material, name=M", "*Elastic", "1000., 0.3",
+                                                     "*Density", "1e-3", "*Boundary", "1, 1, 6", "2, 1, 6",
+                                                     "3, 1, 6"]
+    if turned:
+        lines += ["*Nset, nset=TR", "8", "*Transform, nset=TR, type=R", "0., 1., 0., -1., 0., 0."]
+    for k, proc in enumerate(procs, 1):
+        lines += ["*Step", proc] + (["0.05, 1."] if proc == "*Dynamic" else []) + ["*Boundary"]
+        lines += [f"8, {1 if turned else 2}, {1 if turned else 2}, 0.", f"8, 3, 3, {0.01 * k!r}"]
+        lines += ["*Node Print, nset=ALLN, global=yes", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
+def symmetric_panel_deck(typ, half, p=1.0, nlgeom=False, transform=False):
+    """A cylindrical panel (radius 1 about z, 0..60 deg, shells ``typ`` (S8R / S4) of thickness
+    0.02, 4 x 8 cells over theta and z 0..2), clamped at both ends, under pressure p; ``half``:
+    z 0..1 only (4 x 4 cells, the same node ids), clamped at z = 0 and ZSYMM on z = 1, its
+    plane of symmetry; ``transform``: a cylindrical *TRANSFORM about z on all nodes (ZSYMM and
+    the clamp then read in its axes).  Prints u at the half's nodes in global components."""
+    grid, elems = sheet_mesh(typ, 4, 8, math.pi / 3.0, 2.0)
+    nodes = {k: (math.cos(th), math.sin(th), z) for k, (th, z) in grid.items()}
+    if half:
+        elems = [cn for cn in elems if max(nodes[n][2] for n in cn) <= 1.0 + 1e-12]
+    used = sorted({n for cn in elems for n in cn})
+    lines = ["*Node"] + [f"{k}, {nodes[k][0]!r}, {nodes[k][1]!r}, {nodes[k][2]!r}" for k in used]
+    lines += [f"*Element, type={typ}, elset=E"] + [f"{e}, " + ", ".join(map(str, cn)) for e, cn in enumerate(elems, 1)]
+    lines += ["*Nset, nset=HALF"] + _ids([k for k in used if nodes[k][2] <= 1.0 + 1e-12])
+    lines += ["*Nset, nset=ENDS"] + _ids([k for k in used if nodes[k][2] in (0.0, 2.0)])
+    lines += ["*Nset, nset=SYM"] + _ids([k for k in used if abs(nodes[k][2] - 1.0) < 1e-12])
+    lines += ["*Nset, nset=ALLN"] + _ids(used)
+    lines += ["*Material, name=M", "*Elastic", "210000., 0.3", "*Shell Section, elset=E, material=M", "0.02"]
+    lines += ["*Transform, nset=ALLN, type=C", "0., 0., 0., 0., 0., 1."] if transform else []
+    lines += ["*Boundary", "ENDS, ENCASTRE"] + (["SYM, ZSYMM"] if half else [])
+    lines += ["*Step" + (", nlgeom" if nlgeom else ""), "*Static", "*Dload", f"E, P, {p!r}",
+              "*Node Print, nset=HALF, global=yes", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
 def membrane_skin_deck(typ, tied=True, flip=False, t=0.02):
     """A membrane skin (thickness t, E t = 2000, nu 0.3) on a 2 x 1 x 0.2 C3D8 block (E 1000)
     clamped at its bottom, every node held in z and the skin's end x = 0 like the block's, its
@@ -6125,6 +6219,99 @@ def main():
                         transformed_strip(True, plastic), back)
     failures += same_as("transform_shell_rotations, NLGEOM", transformed_strip(False, step="*Step, nlgeom"),
                         transformed_strip(True, step="*Step, nlgeom"), back, 1e-4)
+
+    # --- two rotational BCs on a shell node, the free axis in the shell plane ---------------
+    # ccx 2.23 holds both in-plane rotations for two rotational BCs on a shell node, so also
+    # the free one where its axis is not the normal; abq2ccx writes one line (the in-plane
+    # rotation about n x free axis).  The S8R strip turned 15 deg about z, its tip holding
+    # the rotations about x and y (0.01 / 0.02 rad, linear and NLGEOM) and twisted about z, must
+    # match the strip along x (where x is the drilling rotation, which ccx drops) turned back;
+    # half a cylindrical panel with ZSYMM on its plane of symmetry must match the whole panel
+    # (S8R and S4).  The two lines were 52-99 % off (probes).
+    def pair_twin(label, text, twin, turn=None, tol=1e-6, moved=0.0):
+        u, notes, flags = [], [], []
+        for i, t in enumerate((text, twin)):
+            src, inp = os.path.join(tmp, f"rp{i}_src.inp"), os.path.join(tmp, f"rp{i}.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(t)
+            rep, conv = convert(src, inp)
+            notes.append("written as one rotation line" in rep.text())
+            flags.append(bool(conv.reduced_physics))
+            d, status, _ = run_ccx(ccx, env, inp)
+            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            shutil.rmtree(d, ignore_errors=True)
+        if not u[0] or u[0].keys() != u[1].keys():
+            print(f"FAIL  {label}: no displacements to compare")
+            return 1
+        if turn:
+            u[1] = {n: turn(v) for n, v in u[1].items()}
+        scale = max(math.hypot(*v) for v in u[1].values())
+        err = ccx_ratio(max(math.dist(u[0][n], u[1][n]) for n in u[1]), scale)
+        ok = err <= tol and scale >= moved and notes[0] and flags == [False, False]
+        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes {err:.1e} of max |u| "
+              f"({scale:.4g}) off the twin; {'one rotation line' if notes[0] else 'NOT rewritten'}")
+        return 0 if ok else 1
+    c15, s15 = math.cos(math.radians(15.0)), math.sin(math.radians(15.0))
+    turn15 = lambda v: (c15 * v[0] - s15 * v[1], s15 * v[0] + c15 * v[1], v[2])  # noqa: E731
+    v4, v5 = 0.01, 0.02
+    back = ((4, c15 * v4 + s15 * v5), (5, -s15 * v4 + c15 * v5))    # the same rotations, turned back
+    failures += pair_twin("shell_rotation_pair_strip (S8R strip turned 15 deg, its tip holding the "
+                          "rotations about x and y, twisted about z)",
+                          tilted_strip_deck(15.0, ((4, v4), (5, v5))), tilted_strip_deck(0.0, back),
+                          turn15, moved=3.0)
+    failures += pair_twin("shell_rotation_pair_strip, NLGEOM, torque /20",
+                          tilted_strip_deck(15.0, ((4, v4), (5, v5)), 0.05, True),
+                          tilted_strip_deck(0.0, back, 0.05, True), turn15, 1e-3, moved=0.05)
+    for typ in ("S8R", "S4"):
+        failures += pair_twin(f"shell_rotation_pair_symmetry ({typ} cylindrical panel: half of it, ZSYMM "
+                              f"on its plane of symmetry)", symmetric_panel_deck(typ, True),
+                              symmetric_panel_deck(typ, False), moved=0.01)
+    failures += pair_twin("shell_rotation_pair_symmetry, S8R, NLGEOM", symmetric_panel_deck("S8R", True, 5.0, True),
+                          symmetric_panel_deck("S8R", False, 5.0, True), tol=1e-4, moved=0.05)
+
+    # --- translational BCs on S8R corner nodes with a *TRANSFORM -----------------------------
+    # ccx 2.23 ties such a BC (an MPC in global coordinates) to the node's middle expanded node
+    # only; abq2ccx takes the node out of the *TRANSFORM, its BCs and loads in global components.
+    # The plate with its loaded and moved corner under a turned *TRANSFORM and its held corner
+    # under a tilted one must match the plate in global components, the half panel with a
+    # cylindrical *TRANSFORM on all nodes the whole panel without (before: 2.1 % / 1.3 % off).
+    def corner_twin(label, text, twin, tol=1e-9, moved=0.0):
+        u, notes = [], []
+        for i, t in enumerate((text, twin)):
+            src, inp = os.path.join(tmp, f"tc{i}_src.inp"), os.path.join(tmp, f"tc{i}.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(t)
+            rep, conv = convert(src, inp)
+            notes.append(("taken out of the *TRANSFORM" in rep.text(), list(conv.reduced_physics)))
+            for _ in range(5):       # ccx 2.23 crashes at random at a *DYNAMIC step's start after
+                d, status, out = run_ccx(ccx, env, inp)     # a *STATIC one (tempload): rerun it
+                if status != "failed" or "*ERROR" in out or "Job finished" in out:
+                    break
+                shutil.rmtree(d, ignore_errors=True)
+            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            shutil.rmtree(d, ignore_errors=True)
+        if not u[0] or u[0].keys() != u[1].keys():
+            print(f"FAIL  {label}: no displacements to compare")
+            return 1
+        scale = max(math.hypot(*v) for v in u[1].values())
+        err = ccx_ratio(max(math.dist(u[0][n], u[1][n]) for n in u[1]), scale)
+        ok = err <= tol and scale >= moved and notes[0][0] and not notes[1][0] and notes[0][1] == notes[1][1]
+        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes {err:.1e} of max |u| "
+              f"({scale:.4g}) off the model without the *TRANSFORM; "
+              f"{'taken out of it' if notes[0][0] else 'NOT taken out'}")
+        return 0 if ok else 1
+    failures += corner_twin("transform_shell_corner_plate (S8R corners: moved and loaded under a "
+                            "turned *TRANSFORM, held under a tilted one)", corner_transform_plate_deck(True),
+                            corner_transform_plate_deck(False), moved=0.01)
+    failures += corner_twin("transform_shell_corner_panel (half a cylindrical S8R panel, a cylindrical "
+                            "*TRANSFORM on all nodes, ZSYMM and the clamp in its axes)",
+                            symmetric_panel_deck("S8R", True, transform=True), symmetric_panel_deck("S8R", False),
+                            moved=0.01)
+    # a knot (an S4 strip's fold) with a transformed BC in a *DYNAMIC step after a *STATIC one,
+    # which ccx did not meet (before: 0.6 % of max |u| off)
+    failures += corner_twin("transform_knot_dynamic (an S4 strip's fold node moved under a turned "
+                            "*TRANSFORM, *STATIC then *DYNAMIC)", folded_strip_deck(True),
+                            folded_strip_deck(False), moved=0.02)
 
     # --- shell/beam rotations in a step ccx runs nonlinear without NLGEOM -----------------
     # ccx turns the mean-rotation MPCs of rotational BCs and moments, and its knots' RIGID

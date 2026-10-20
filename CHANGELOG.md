@@ -6,6 +6,17 @@ physics.
 
 ## Unreleased
 
+* **Two rotational BCs on a shell node** — ccx 2.23 then holds both rotations in the shell
+  plane, so also the third, free one where its axis is not the normal: `ZSYMM` on half a
+  cylindrical panel was 52-63 % off the whole panel. Where the free axis lies in the shell
+  plane, one rotation line is the exact form and is written instead (probed); elsewhere it is
+  warned (reduced physics). The corpus' NAFEMS LE3 hemispheres and barrel vault change.
+* **Translational BCs on transformed S8R / S6 corner nodes** — ccx 2.23 ties such a BC to the
+  middle of the three nodes it expands the node into, so the shell section turns there (NAFEMS
+  LE2 6.4 % off in displacement). Such a node now leaves the `*TRANSFORM`, its BCs and loads
+  written in global components where they have that form; else it is warned (reduced
+  physics). The same for a knot's transformed BCs in a `*DYNAMIC` step after a geometrically
+  linear step, which ccx did not meet.
 * **A kinematic coupling's free twist** — with its members on one line through the reference
   node, the node's rotation about that line moves nothing. ccx 2.23 solved such a linear step
   on roundoff, silently wrong (4× off, probed), and an NLGEOM step stopped converging. The

@@ -11492,9 +11492,10 @@ def test_transformed_shell_node_rotations():
 
 def test_transformed_shell_rotation_pairs_off_the_normal():
     # two held local rotations about axes off the shell normal, the free third off it too:
-    # ccx holds both rotations in the shell plane (a second mean-rotation MPC about n x e1,
-    # here z), so the free one's in-plane part is held as well (probed: a cylindrical panel
-    # 30 % off): warned, reduced physics
+    # ccx holds both rotations in the shell plane (a second mean-rotation MPC about n x e1),
+    # so the free one's in-plane part is held as well (probed: a cylindrical panel 30 % off).
+    # Where the free axis lies in the shell plane (here the axial one) one line is that
+    # constraint (_plan_shell_rotation_pairs); elsewhere warned, reduced physics
     pts = [(math.cos(math.radians(a)), math.sin(math.radians(a)), z) for z in (0., 0.5) for a in (0., 30., 60.)]
 
     def panel(bc, normals=False):
@@ -11507,18 +11508,153 @@ def test_transformed_shell_rotation_pairs_off_the_normal():
                             f"3, 1, 6\n*Step\n*Static\n*Boundary\n{bc}*Cload\n5, 1, 0.1\n*End Step\n",
                             "4, 5, 6", "0., 0., 0., 0., 0., 1.", "C")
     held = "held by ccx (two rotational BCs off the normal"
-    for bc, warned in (("4, 3, 5\n6, 3, 5\n", True),     # radial, tangential: the axial one free
-                       ("4, 5, 6\n6, 5, 6\n", True),     # tangential, axial: the radial one free
+    for bc, warned in (("4, 5, 6\n6, 5, 6\n", True),     # tangential, axial: the radial one free
                        ("4, 3, 6\n6, 3, 6\n", False),    # all three
                        ("4, 5, 5\n6, 5, 5\n", False)):   # one
         body, conv, rep = convert_str(panel(bc))
         assert conv._rot_mode[4] == conv._rot_mode[6] == "keep"
         assert any(held in r for r in conv.reduced_physics) == warned, bc
-        assert ("hold two local rotations about axes off the shell normal" in rep.text()) == warned
+        assert ("hold two rotations about axes off the shell normal" in rep.text()) == warned
+    # radial, tangential: the axial one, in the facets' plane, free -> the tangential line alone
+    # (|a . q| 0.97 against 0.26 for the radial one, q = n x z), at v4 a4.q / a5.q + v5
+    body, conv, rep = convert_str(panel("4, 3, 5, 0.01\n6, 3, 5\n"))
+    assert conv._rot_mode[4] == conv._rot_mode[6] == "pair"
+    assert not any(held in r for r in conv.reduced_physics)
+    step = body[body.index("*STEP"):].splitlines()
+    assert "4, 3, 3, 0.01" in step and "6, 3, 3" in step and "6, 5, 5" in step
+    q = (math.sin(math.radians(15.)), -math.cos(math.radians(15.)), 0.)   # n x z at node 4
+    v = [ln for ln in step if ln.startswith("4, 5, 5, ")]
+    assert len(v) == 1 and abs(float(v[0].split(",")[3]) - 0.01 * (1. + q[0] / q[1])) < 1e-12
+    assert not any(ln.startswith(("4, 4", "6, 4", "4, 3, 5", "6, 3, 5")) for ln in step)
+    assert "free axis in the shell plane: written as one rotation line" in rep.text()
     # radial *NODE normals (as the NAFEMS LE2 deck gives them): the radial rotation is the
     # drilling one, which ccx drops, holding the tangential one alone (probed): exact
     body, conv, rep = convert_str(panel("4, 3, 5\n6, 3, 5\n", normals=True))
     assert not any(held in r for r in conv.reduced_physics)
+
+
+def test_shell_rotation_pairs_without_transform():
+    # two global rotations held on a shell node, both off its normal: ccx 2.23 holds both
+    # in-plane rotations, so the free one too.  Where the free axis lies in the shell plane
+    # (ZSYMM on a cylinder: z) one line is the exact form: the DOF k whose axis has the larger
+    # |a_k . q|, q = n x free axis, at (v1 a1.q + v2 a2.q) / a_k.q; elsewhere warned
+    pts = [(math.cos(math.radians(a)), math.sin(math.radians(a)), z) for z in (0., 1.) for a in (25., 40., 55.)]
+
+    def panel(model="", step="*Boundary\n4, 3, 3\n5, 3, 3\n6, 3, 3\n", steps="", proc="*Static"):
+        """Two S4 facets on a cylinder about z (normals at nodes 4, 5, 6: 32.5, 40, 47.5 deg in
+        the x-y plane; 15 deg apart: no knot), clamped at z = 0."""
+        return ("*Node\n" + "".join(f"{i + 1}, {x!r}, {y!r}, {z}\n" for i, (x, y, z) in enumerate(pts)) +
+                "*Element, type=S4, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Nset, nset=TOP\n4, 5, 6\n*Shell "
+                "Section, elset=E, material=M\n0.02\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1.\n"
+                f"*Boundary\n1, 1, 6\n2, 1, 6\n3, 1, 6\n{model}*Step\n{proc}\n{step}*Cload\n5, 1, 0.1\n"
+                f"*End Step\n{steps}")
+    held = "held by ccx (two rotational BCs off the normal"
+    one = "free axis in the shell plane: written as one rotation line"
+
+    def rot_lines(body):
+        return [ln for ln in body.splitlines() if re.fullmatch(r"[456], [456], [456](, .*)?", ln)
+                or ln.startswith(("TOP, 4", "TOP, 5", "TOP, 6"))]
+    # ZSYMM (z free, in the facets' plane): node 6 on DOF 4 (|x . q| = sin 47.5), 4 and 5 on DOF 5
+    body, conv, rep = convert_str(panel("TOP, ZSYMM\n"))
+    assert rot_lines(body) == ["4, 5, 5", "5, 5, 5", "6, 4, 4"], rot_lines(body)
+    assert {n: conv._rot_mode.get(n) for n in (4, 5, 6)} == {4: "pair", 5: "pair", 6: "pair"}
+    assert one in rep.text() and not conv.reduced_physics
+    # values: theta = v4 x + v5 y + free z -> theta . q, q = n x z, on DOF 5 at node 5 (40 deg)
+    body, conv, rep = convert_str(panel(step="*Boundary\n5, 3, 3\n5, 4, 4, 0.01\n5, 5, 5, 0.02\n"))
+    c, s_ = math.cos(math.radians(40.)), math.sin(math.radians(40.))
+    v = (0.01 * s_ - 0.02 * c) / -c
+    got = [ln for ln in rot_lines(body) if ln.startswith("5, ")]
+    assert len(got) == 1 and got[0].startswith("5, 5, 5, ") and abs(float(got[0].split(",")[3]) - v) < 1e-12
+    # XSYMM: y and z held, x free and off the plane (|x . n| = cos 32.5 .. cos 47.5): warned, as is
+    body, conv, rep = convert_str(panel("TOP, XSYMM\n"))
+    assert rot_lines(body) == ["TOP, 5, 6"] and any(held in r for r in conv.reduced_physics)
+    assert "hold two rotations about axes off the shell normal" in rep.text() and one not in rep.text()
+    # a later step adds the third rotation: three lines there (ccx holds all three), the pair one
+    # line before; a step holding DOF 4 alone, then 4 and 5 -> node 6 (k = 4) one line, the others
+    # (k = 5) would keep DOF 4's line: warned
+    body, conv, rep = convert_str(panel("TOP, ZSYMM\n", steps="*Step\n*Static\n*Boundary\n6, 6, 6\n"
+                                        "*End Step\n"))
+    assert rot_lines(body) == ["4, 5, 5", "5, 5, 5", "6, 4, 4", "6, 4, 4", "6, 5, 5", "6, 6, 6"], rot_lines(body)
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(panel("TOP, 4, 4\n", steps="*Step\n*Static\n*Boundary\nTOP, 5, 5\n"
+                                        "*End Step\n"))
+    assert conv._rot_mode.get(6) == "pair" and 4 not in conv._rot_mode and 5 not in conv._rot_mode
+    assert any(held in r for r in conv.reduced_physics) and one in rep.text()
+    # a nonzero value held on from model data, the step's line on an amplitude: the one line
+    # would restart it -> warned
+    body, conv, rep = convert_str(panel("6, 4, 4, 0.01\n", step="*Boundary, amplitude=A\n6, 5, 5, 0.02\n")
+                                  .replace("*Step", "*Amplitude, name=A\n0., 0., 1., 1.\n*Step", 1))
+    assert 6 not in conv._rot_mode and any(held in r for r in conv.reduced_physics)
+    # *DYNAMIC: ccx makes the nodes knots, which hold the rotations as given -> as they are;
+    # a *STATIC step before it holds the pair through mean-rotation MPCs: warned
+    body, conv, rep = convert_str(panel("TOP, ZSYMM\n", proc="*Dynamic\n0.1, 1."))
+    assert rot_lines(body) == ["TOP, 4, 5"] and not conv.reduced_physics and one not in rep.text()
+    body, conv, rep = convert_str(panel("TOP, ZSYMM\n", steps="*Step\n*Dynamic\n0.1, 1.\n*End Step\n"))
+    assert rot_lines(body) == ["TOP, 4, 5"] and any(held in r for r in conv.reduced_physics)
+
+
+def test_transformed_shell_corner_bcs_leave_the_transform():
+    # a translational BC on an S8R / S6 corner node with a *TRANSFORM: ccx ties it (an MPC in
+    # global coordinates) to the node's middle expanded node only; the node leaves the
+    # *TRANSFORM, its BCs and loads in global components, where they have them
+    c, s_ = math.cos(math.radians(30.)), math.sin(math.radians(30.))
+
+    def plate(extra="", bc_a="5, 3, 3, 0.01\n", typ="S8R"):
+        """S8R plate 2 x 1, corners 1 3 (x = 0), 5 7; node 5 with a *TRANSFORM turned 30 deg
+        about z, node 7 one tilted out of the plane, midside node 6 the same as node 5."""
+        nodes = {1: (0, 0), 2: (1, 0), 3: (2, 0), 4: (2, .5), 5: (2, 1), 6: (1, 1), 7: (0, 1), 8: (0, .5)}
+        conn = "1, 3, 5, 7, 2, 4, 6, 8" if typ == "S8R" else "1, 3, 5, 7"
+        return ("*Node, nset=ALLN\n" + "".join(f"{k}, {x}, {y}, 0.\n" for k, (x, y) in nodes.items()) +
+                f"*Element, type={typ}, elset=E\n1, {conn}\n*Shell Section, elset=E, material=M\n0.05\n"
+                "*Material, name=M\n*Elastic\n210000., 0.3\n*Nset, nset=TA\n4, 5\n*Transform, nset=TA, "
+                f"type=R\n{c!r}, {s_!r}, 0., {-s_!r}, {c!r}, 0.\n*Nset, nset=TB\n3\n*Transform, nset=TB, "
+                f"type=R\n1., 0., 1., 0., 1., 0.\n{extra}*Boundary\n1, 1, 6\n7, 1, 6\n8, 1, 6\n3, 1, 3\n"
+                f"4, 3, 3\n*Step\n*Static\n*Boundary\n{bc_a}*Cload\n5, 1, 5.\n5, 4, 0.1\n4, 1, 2.\n"
+                "*End Step\n")
+    out = "taken out of the *TRANSFORM, their BCs and loads written in global components"
+    held = "translational BC on a transformed S8 / S8R / S6 corner node"
+    body, conv, rep = convert_str(plate())
+    assert conv._untr == {3, 5} and out in rep.text() and not conv.reduced_physics
+    lines = body.splitlines()
+    i = lines.index("*TRANSFORM, NSET=ABQ2CCX_TR1, TYPE=R")       # node 4 (midside) keeps it
+    assert lines[i - 2:i] == ["*NSET, NSET=ABQ2CCX_TR1", "4"] and "*TRANSFORM, NSET=TB, TYPE=R" not in lines
+    assert "** *TRANSFORM, NSET=TB, TYPE=R" in lines
+    step = lines[lines.index("*STEP"):]
+    assert "3, 1, 3" in lines and "4, 3, 3" in lines and "5, 3, 3, 0.01" in step   # local 3 = z
+    assert "4, 1, 2." in step                                                     # midside: local
+    assert all(ln in step for ln in ("5, 2, 2.5", "5, 3, 0.", "5, 5, 0.05", "5, 6, 0."))   # local 1 at 30 deg
+    assert {ln[:16] for ln in step if ln.startswith(("5, 1, ", "5, 4, "))} == {"5, 1, 4.33012701", "5, 4, 0.08660254"}
+    # S4: not affected; a radial BC (no global form), an *EQUATION or local printed output:
+    # warned (reduced physics)
+    body, conv, rep = convert_str(plate(typ="S4"))
+    assert not conv._untr and out not in rep.text() and not conv.reduced_physics
+    for deck in (plate(bc_a="5, 1, 1, 0.01\n"), plate("*Equation\n2\n6, 2, 1., 2, 2, -1.\n"),
+                 plate().replace("*End Step", "*Node Print, nset=TA\nU\n*End Step")):
+        body, conv, rep = convert_str(deck)
+        assert 5 not in conv._untr and any(held in r for r in conv.reduced_physics), deck
+        assert "ties such a BC (an MPC in global coordinates) to the node's middle expanded node" in rep.text()
+    body, conv, rep = convert_str(plate().replace("*End Step", "*Node Print, nset=TA, global=yes\nU\n*End Step"))
+    assert conv._untr == {3, 5} and not conv.reduced_physics
+    # a knot (an S4 fold) with a transformed BC: ccx misses it in a *DYNAMIC step after a
+    # geometrically linear step only -> out of the *TRANSFORM there, not in the other decks
+    pts = [(float(i), y, z) for i in range(3) for y, z in ((-0.5, 0.), (0., 0.), (0., 0.5))]
+    fold = ("*Node\n" + "".join(f"{k}, {x}, {y}, {z}\n" for k, (x, y, z) in enumerate(pts, 1)) +
+            "*Element, type=S4, elset=E\n" + "".join(f"{2 * i + j + 1}, {3 * i + j + 1}, {3 * i + j + 4}, "
+                                                    f"{3 * i + j + 5}, {3 * i + j + 2}\n" for i in range(2) for j in range(2)) +
+            "*Shell Section, elset=E, material=M\n0.05\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n"
+            "1e-3\n*Boundary\n1, 1, 6\n2, 1, 6\n3, 1, 6\n*Nset, nset=TR\n8\n*Transform, nset=TR, type=R\n"
+            "0., 1., 0., -1., 0., 0.\n{}")
+    step = "*Step{}\n{}\n*Boundary\n8, 1, 1, 0.\n8, 3, 3, 0.01\n*End Step\n"
+    knot = "knot node(s) with a *TRANSFORM and translational BCs (e.g. node 8) taken out of the *TRANSFORM"
+    body, conv, rep = convert_str(fold.format(step.format("", "*Static") + step.format("", "*Dynamic\n0.05, 1.")))
+    assert conv._untr == {8} and knot in rep.text() and not any("transformed" in r for r in conv.reduced_physics)
+    lines = body.splitlines()
+    assert lines.count("8, 2, 2") == 2 and lines.count("8, 3, 3, 0.01") == 2 and "8, 1, 1" not in lines
+    assert "*TRANSFORM, NSET=TR, TYPE=R" not in lines and "** *TRANSFORM, NSET=TR, TYPE=R" in lines
+    for steps in (step.format("", "*Dynamic\n0.05, 1.") * 2, step.format(", nlgeom", "*Static") +
+                  step.format("", "*Dynamic\n0.05, 1."), step.format("", "*Static") * 2):
+        body, conv, rep = convert_str(fold.format(steps))
+        assert not conv._untr and knot not in rep.text() and "*TRANSFORM, NSET=TR, TYPE=R" in body.splitlines()
 
 
 def _knot_of(deck, n):
