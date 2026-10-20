@@ -12212,6 +12212,30 @@ def test_loads_on_rigid_elements():
     assert "-> no load: it acts only on rigid elements" in body
 
 
+def test_pressure_on_rigid_elements_needs_a_side_and_a_number():
+    # a surface pressure pushes into its SPOS / SNEG side (that side's skin face), an element-
+    # based one along the element normal; a two-sided surface or an unreadable magnitude is not
+    # converted (the step loses its load); a rigid element without area gets no skin
+    deck = (HEX + "*NODE\n11, 0.,0.,1.\n12, 1.,0.,1.\n13, 1.,1.,1.\n14, 0.,1.,1.\n9, 0.5,0.5,2.\n"
+            "15, 3., 0., 2.\n30, 3., 0., 1.\n31, 4., 0., 1.\n*ELEMENT, TYPE=R3D4, ELSET=PLATE\n2, 11, 14, 13, 12\n"
+            "*ELEMENT, TYPE=R3D3, ELSET=FLAT\n3, 30, 31, 30\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n*SURFACE, NAME=TOOL\nPLATE, SPOS\n"
+            "*SURFACE, NAME=UNDER\nPLATE, SNEG\n*SURFACE, NAME=BOTH\nPLATE\n"
+            "*RIGID BODY, REF NODE=9, ELSET=PLATE\n*RIGID BODY, REF NODE=15, ELSET=FLAT\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n9, 1, 6\n15, 1, 6\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n{}*END STEP\n")
+    for load, line in (("*DSLOAD\nTOOL, P, 2.\n", "2, P2, 2."), ("*DSLOAD\nUNDER, P, 2.\n", "4, P1, 2."),
+                       ("*DLOAD\nPLATE, P, 2.\n", "2, P2, -2.")):
+        body, conv, rep = convert_str(deck.format(load))
+        assert f"*DLOAD\n{line}\n" in _step(body, 1) and conv.reduced_physics == [], load
+    assert "1 rigid element(s) without area (coincident nodes, e.g. 3): no skin" in rep.text()
+    assert sorted(reparse(body).nset(re.search(r"REF NODE=15, NSET=(\S+),", body).group(1))) == [30, 31]
+    for surf, mag, why in (("BOTH", "2.", "needs a one-sided surface (SPOS or SNEG)"),
+                           ("TOOL", "abc", "its magnitude 'abc' is not a number")):
+        body, conv, rep = convert_str(deck.format(f"*DSLOAD\n{surf}, P, {mag}\n"))
+        assert f"*DSLOAD P on '{surf}' not converted: " in body and why in body
+        assert conv.reduced_physics == ["*DSLOAD P load dropped", "step 1: every load lost"]
+
+
 def test_pressure_on_plane_rigid_segments_is_per_unit_depth():
     # an R2D2 has no section thickness: Abaqus' P acts per unit depth, while its skin spans
     # z = -T .. T (T the thickest section, 2 here), so the face pressure is P / (2 T)
