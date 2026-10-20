@@ -5551,6 +5551,18 @@ def main():
         .replace("TIP, 1, 1.\nTIP, 2, -2.\nTIP, 3, 0.5", "TIP, 1, 40.\nTIP, 2, -80.\nTIP, 3, 20.")
     failures += same_as("connector_transform_join, NLGEOM x40 (max |u| 2.8 on a unit block)",
                         nl_join, untransformed(nl_join))
+    # B's face transformed too: A's local terms then repeat global DOFs in ccx's expansion,
+    # which ccx's cascade does not merge where B's axes keep global z, nor under NLGEOM —
+    # abq2ccx writes A's nodes through twins (before: 40 % of max |u| off without a message;
+    # under NLGEOM the JOINs were commented out)
+    b_face = lambda t, typ, data: t.replace(  # noqa: E731
+        "*Boundary\nFIX", "*Nset, nset=BFACE\n101, 104, 107, 110, 113, 116, 119, 122\n125\n"
+                          f"*Transform, nset=BFACE, type={typ}\n{data}\n*Boundary\nFIX", 1)
+    failures += same_as("connector_transform_join with B's face turned about z (twin nodes)",
+                        b_face(join, "R", "0.8, 0.6, 0., -0.6, 0.8, 0."), untransformed(join))
+    failures += same_as("connector_transform_join, NLGEOM x40, with B's face in cylindrical axes "
+                        "(twin nodes)", b_face(nl_join, "C", "0.3, -0.2, -0.4, 1.1, 0.9, 1.6"),
+                        untransformed(nl_join))
     hinge = open(os.path.join(EXAMPLES, "connector_hinge_bodies.inp"), encoding="utf-8").read().replace(
         "*Node Print, nset=OUT", "*Node Print, nset=OUT, global=YES")
     rect, cyl = ("R", (1., 2., 0.5), (-1., 0.3, 1.)), ("C", (0.3, -0.2, -0.4), (1.1, 0.9, 1.6))

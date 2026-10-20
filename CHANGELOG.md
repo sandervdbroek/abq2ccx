@@ -338,6 +338,11 @@ physics.
   node whose axes share a global component (108-130 %), passed through; under NLGEOM ccx did
   not converge. Repeated terms are now summed, and such local terms go through the node's
   untransformed twin, as `*MPC PIN` does since 1.4.0 (exact, also under NLGEOM).
+* **Connectors between two transformed nodes** — where a connector's equation kept several
+  local translations of one node that ccx expands into a repeated DOF, a linear step could be
+  29-40 % of max |u| off without a message (where ccx's own substitution does not merge them:
+  the other node's axes keep a global one), and under NLGEOM or explicit dynamics the connector
+  was commented out. Such a node now goes through its twin (exact, linear, NLGEOM and explicit).
 
 ## 1.4.0 (October 2026)
 

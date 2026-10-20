@@ -8977,18 +8977,37 @@ def test_connector_refused_where_ccx_cannot_take_the_local_axes():
     assert len(_equation_terms(body)) == 3 and "own DOFs 4-6" not in rep.text()
 
 
-def test_connector_between_differently_transformed_nodes_under_nlgeom():
+def test_connector_between_differently_transformed_nodes_uses_a_twin():
     # u_9 = u_2 with both nodes transformed differently keeps several local translations of
-    # node 2 in each equation: exact in a linear step, but ccx 2.23 does not converge on such
-    # an equation under NLGEOM (probed) — commented out there
+    # node 2 in each equation, which ccx expands into repeated global DOFs and 2.23 then
+    # mis-assembles — unless its cascade merges them, which it does not here: node 9's local 3
+    # is global z (its cylinder axis), so that row is substituted into no other (probed: 29 %
+    # of max |u| off, silently).  Node 2 goes through its twin (u_twin = u_2), one local
+    # translation per equation: exact (probed), linear and under NLGEOM (commented out before)
     deck = JOIN9 + "*Nset, nset=T2\n2\n*Transform, nset=T2\n1., 2., 0.5, -1., 0.3, 1.\n"
-    body, _, rep = convert_str(deck)
-    assert len(_equation_terms(body)) == 3 and "different *TRANSFORMs" not in rep.text()
-    body, _, rep = convert_str(deck + "*Step, nlgeom=YES\n*Static\n*End Step\n")
-    assert not _equation_terms(body) and "different *TRANSFORMs" in rep.text()
+    for steps in (STEP, "*Step, nlgeom=YES\n*Static\n*End Step\n"):
+        body, conv, rep = convert_str(deck + steps)
+        twin, eqs = conv._twins[2], _equation_terms(body)
+        assert len(eqs) == 6 and not _ccx_expansion_repeats(body) and "** *CONNECTOR" not in body
+        assert sum(1 for eq in eqs if {n for n, _, _ in eq} == {2, twin}) == 3
+        assert all({n for n, _, _ in eq} == {9, twin} for eq in eqs if eq[0][0] == 9)
+        assert "got a twin node" in rep.text() and rep.n_warnings == 0
     # one transformed node under NLGEOM: one local translation per equation, written
     body, _, rep = convert_str(JOIN9 + "*Step, nlgeom=YES\n*Static\n*End Step\n")
     assert len(_equation_terms(body)) == 3 and "** *CONNECTOR" not in body
+
+
+def test_connector_rows_ccx_merges_keep_their_local_terms_in_linear_steps():
+    # node b (9) with oblique axes, node a (2) turned about z: node 9's three local dependents
+    # name each other's DOFs, so ccx's cascade merges the repeats of node 2's local terms
+    # (probed exact): no twin in a linear step; under NLGEOM ccx does not converge on them
+    deck = (HEX + "*Node\n9, 1.,0.,0.\n*Element, type=CONN3D2, elset=J\n20, 2, 9\n*Connector Section, "
+            "elset=J\nJoin,\n*Nset, nset=T2\n2\n*Transform, nset=T2\n0.8, 0.6, 0., -0.6, 0.8, 0.\n"
+            "*Nset, nset=T9\n9\n*Transform, nset=T9\n1., 2., 0.5, -1., 0.3, 1.\n")
+    body, conv, _ = convert_str(deck + STEP)
+    assert len(_equation_terms(body)) == 3 and not conv._twins
+    body, conv, _ = convert_str(deck + "*Step, nlgeom=YES\n*Static\n*End Step\n")
+    assert len(_equation_terms(body)) == 6 and list(conv._twins) == [2]
 
 
 def test_connector_dependents_on_a_transformed_node_in_an_order_ccx_takes():

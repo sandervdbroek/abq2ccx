@@ -14793,7 +14793,7 @@ class Converter:
                 rows, approx = True, approx or bool(it.get("approx"))
                 local = local or bool(it.get("local"))
                 bcs += [f"{n}, {d}, {d}" for n, d in it["bcs"]]
-                out += self._equation_lines(it["eqs"])
+                out += self._twin_lines(it["eqs"]) + self._equation_lines(it["eqs"])
         if bcs:
             bcs = dedup(bcs)
             out = ["*BOUNDARY"] + bcs + out
@@ -14849,8 +14849,9 @@ class Converter:
     # no global component in common (probed: exact, also under NLGEOM) — and uses the node's
     # twin otherwise (_dir_terms); a deck's own *EQUATION gets its repeated terms summed and
     # the same twins (_ccx_equation_terms).  (Connector rows between two transformed nodes
-    # keep several; the three local dependents of node b then name each other's DOFs, so
-    # ccx's cascade merges the repeats: probed exact.)
+    # keep several in linear steps where the three local dependents of node b name each
+    # other's DOFs, so that ccx's cascade merges the repeats: probed exact; elsewhere, and
+    # under NLGEOM, a node goes through its twin: _plan_connector_rows.)
     @staticmethod
     def _ccx_repeats(ax: Tuple[Vec, Vec, Vec], js: Sequence[int]) -> bool:
         """Whether terms on the distinct local DOFs ``js`` (1-3) of a node with axes ``ax``
@@ -24160,7 +24161,11 @@ class Converter:
           local DOF into a global one by its own rule, which _settle_dependents follows).
           Where the local axes are undefined (a node on its cylinder axis, several cards), or
           a rotation lives on DOFs 4-6 of a transformed shell/beam or kinematic reference node
-          (ccx misreads those, probed), the connector is commented out.
+          (ccx misreads those, probed), the connector is commented out;
+        * where an equation would keep several local translations of one transformed node that
+          ccx expands into a repeated global DOF — which 2.23 mis-assembles unless its cascade
+          merges them (merged), and does not converge on under NLGEOM — a plain node of the
+          connector goes through its twin (u_twin = u_node, _twin_rows) instead.
 
         Under NLGEOM (or explicit dynamics) the linear rows are exact only as boundary
         conditions, as equations among the rotation components of one rotation node (a
@@ -24235,6 +24240,7 @@ class Converter:
         # rotation-node DOFs held in every step: BCs moved there from DOFs 4-6 of its node
         rot_held = {(self._rb_rot[n], d - 3) for n, d in held if 4 <= d <= 6 and n in self._rb_rot}
         skew = lambda d: ((0.0, -d[2], d[1]), (d[2], 0.0, -d[0]), (-d[1], d[0], 0.0))  # noqa: E731
+        twin_of: Dict[int, int] = {}     # node -> its twin, while a connector's rows go through it
 
         def rows_of(it: dict, a_turns: bool) -> List[Dict[Tuple[int, int], float]]:
             a, b, d, dim = it["a"], it["b"], it["d"], it["dim"]
@@ -24276,7 +24282,8 @@ class Converter:
             step dropped (in the axes ccx holds them) — or why it cannot be written.  A term
             on a node without local axes stays as it is (dof() moves a rotation to its
             carrier); on a transformed node global component k becomes sum_j e_j[k] times
-            local DOF j, and a rotation goes to its rotation node's DOFs in that node's axes."""
+            local DOF j (or, on a node in twin_of, global DOF k of its twin), and a rotation
+            goes to its rotation node's DOFs in that node's axes."""
             out: "OrderedDict[Tuple[int, int], float]" = OrderedDict()
             local = False
 
@@ -24290,6 +24297,9 @@ class Converter:
                         add((n, base + j), v * ax[j][k])
             unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
             for (n, d), v in rw.items():
+                if d <= 3 and n in twin_of:
+                    add((twin_of[n], d), v)
+                    continue
                 own = frame(n)
                 if d <= 3:
                     if own is None:
@@ -24393,11 +24403,14 @@ class Converter:
             """Rows with local DOFs reduced (Gauss-Jordan) on the local translations of a
             transformed node first — node b's where it has them — then on the other local DOFs,
             each pivot in one row only: the rows of a JOIN become one per local DOF of the node
-            (projected on its axes), as ccx 2.23 needs under NLGEOM (probed: an *EQUATION with
-            several local translations of one node fails to converge or drifts there; one per
-            equation is exact), and a row left with one DOF holds it.  The eliminated DOF of a
-            row is then one without local axes where the row has one (chosen as for the other
-            connectors, not twice), else its pivot; it is listed first."""
+            (projected on its axes), as ccx 2.23 needs (several local translations of one node
+            in an *EQUATION repeat a global DOF in ccx's expansion, see repeats()), and a row
+            left with one DOF holds it.  The eliminated DOF of a row is then one without local
+            axes where the row has one (chosen as for the other connectors, not twice), else
+            its pivot; it is listed first.  A twin's DOF (twin_of) is not taken for a plain
+            node's pivot: the twin stays free, as for *MPC PIN (probed: explicit dynamics with a
+            BC on the twinned node needs it, 6-21 % of max |u| off otherwise)."""
+            twins = set(twin_of.values())
             rows = [OrderedDict(rw) for rw in rows]
             pivots: List[Optional[Tuple[int, int]]] = [None] * len(rows)
             for i in range(len(rows)):
@@ -24429,7 +24442,8 @@ class Converter:
                 if p is not None and is_local(p) and len(rw) > 1:
                     top = max(abs(v) for v in rw.values())
                     glob = sorted((k for k in rw if not is_local(k) and k not in busy and k not in used
-                                   and not (k[0] in kin and k[1] >= 4) and abs(rw[k]) >= 0.1 * top),
+                                   and not (k[0] in kin and k[1] >= 4) and abs(rw[k]) >= 0.1 * top
+                                   and not (k[0] in twins and plain(*p))),
                                   key=lambda k: (not (plain(*k) and k not in self._conn_bc_dofs),
                                                  -abs(rw[k])))
                     p = glob[0] if glob else p
@@ -24456,27 +24470,71 @@ class Converter:
                         for i, rw in zip(idx, rows_n):
                             out[i] = rw
             return out
-        for it in rows_items:
-            a = it["a"]
-            a_turns = it["rot"] is not None or (a is not None and (carrier(a) is not None or
-                                                                   a in self._rot_nodes))
+
+        def span(n: int, d: int) -> set:
+            """The global DOFs ccx expands local DOF ``d`` (1-3) of node ``n`` into: the
+            components of 1e-5 or more of its local axis (equations.f)."""
+            ax = frame(n)
+            return {g + 1 for g in range(3) if abs(ax[d - 1][g]) >= 1e-5} \
+                if isinstance(ax, tuple) else {d}
+
+        def repeats(eqs: List[List[Tuple[int, int, float]]]) -> List[int]:
+            """The nodes with a *TRANSFORM of their own that keep several local translations in
+            one of ``eqs`` whose expansions share a global DOF, which ccx 2.23 then holds twice
+            (and mis-assembles; local terms whose axes share no global component are exact)."""
+            out: List[int] = []
+            for eq in eqs:
+                for n in dedup([m for m, d, _ in eq if moved((m, d))]):
+                    spans = [span(n, d) for m, d, _ in eq if m == n and d <= 3]
+                    if n not in out and any(p & q for p, q in itertools.combinations(spans, 2)):
+                        out.append(n)
+            return out
+
+        def merged(eqs: List[List[Tuple[int, int, float]]]) -> bool:
+            """Whether ccx's cascade merges the repeated DOFs of each of ``eqs`` that has some:
+            it collects the terms of an equation into which it substitutes another (cascade.c),
+            i.e. one that names the DOF another of them eliminates — as the rows of a JOIN
+            whose local dependents on node b each name the others' DOFs; not a row whose node-b
+            axis lies along a global one (probed: 29-40 % of max |u| off, silently)."""
+            deps: List[Tuple[int, int]] = []
+            taken: Dict[int, set] = {}
+            for eq in eqs:
+                n, d, _ = eq[0]
+                ax = frame(n) if d <= 3 else None
+                if isinstance(ax, tuple):        # ccx's own pick (equations.f)
+                    tk = taken.setdefault(n, set())
+                    g = next((g for g in ((d - 1 + q) % 3 + 1 for q in range(3))
+                              if g not in tk and abs(ax[d - 1][g - 1]) >= 1e-5), 0)
+                    tk.add(g)
+                    deps.append((n, g))
+                else:
+                    deps.append((n, d))
+            for i, eq in enumerate(eqs):
+                others = set(deps[:i] + deps[i + 1:])
+                if repeats([eq]) and not any((m, g) in others for m, d, _ in eq
+                                             for g in (span(m, d) if d <= 3 else {d})
+                                             if (m, g) != deps[i]):
+                    return False
+            return True
+
+        def build(it: dict, a_turns: bool) -> Union[str, Tuple[List[Tuple[int, int]],
+                                                                List[List[Tuple[int, int, float]]],
+                                                                bool]]:
+            """The rows of connector ``it`` as (BCs, *EQUATIONs, whether they hold local DOFs),
+            or why it cannot be written."""
             rows = [native(rw) for rw in rows_of(it, a_turns)]
             why = next((rw for rw in rows if isinstance(rw, str)), None)
             if why is not None:
-                it["route"], it["reason"] = "skip", why if why == self._CONN_OWN_ROTATION else \
-                    self._conn_axes_reason(why)
-                continue
+                return why if why == self._CONN_OWN_ROTATION else self._conn_axes_reason(why)
             rows = [rw for rw in rows if rw]
             if any(k[1] >= 4 and k[0] in self._rot_nodes and carrier(k[0]) is None
                    for rw in rows for k in rw):
                 # a shell/beam node's rotation without a knot (explicit dynamics, where the
                 # converter makes none): ccx would ignore it in an *EQUATION
-                it["route"], it["reason"] = "skip", (
-                    "Connector on the rotation of a shell/beam node in a deck with explicit "
-                    "dynamics: ccx ignores DOFs 4-6 of a plain shell/beam node in an *EQUATION, "
-                    "and its explicit solver stops on the knot that would give the node real "
-                    "rotations; commented out — the connector is missing.")
-                continue
+                return ("Connector on the rotation of a shell/beam node in a deck with explicit "
+                        "dynamics: ccx ignores DOFs 4-6 of a plain shell/beam node in an "
+                        "*EQUATION, and its explicit solver stops on the knot that would give the "
+                        "node real rotations; commented out — the connector is missing.")
             # eliminate connector-only rotations: the rows that fix them say nothing else
             for col in sorted({k for rw in rows for k in rw if k[1] >= 4 and carrier(k[0]) is None}):
                 with_col = [rw for rw in rows if col in rw]
@@ -24528,11 +24586,9 @@ class Converter:
                     # (listed first) unless its coefficient is small
                     free = [k for k in terms if k not in busy and not (k[0] in kin and k[1] >= 4)]
                     if not free:
-                        it["route"], it["reason"] = "skip", (
-                            "Connector constraint whose DOFs are all eliminated by other "
-                            "constraints (rigid-body members, a kinematic coupling's reference "
-                            "rotation); commented out — the connector is missing.")
-                        break
+                        return ("Connector constraint whose DOFs are all eliminated by other "
+                                "constraints (rigid-body members, a kinematic coupling's "
+                                "reference rotation); commented out — the connector is missing.")
                     top = max(abs(terms[k]) for k in free)
                     big = [k for k in free if abs(terms[k]) >= 0.1 * top]
                     # a plain node's translation without a BC first (no ccx MPC touches it)
@@ -24540,23 +24596,47 @@ class Converter:
                         next((k for k in big if plain(*k) and k not in self._conn_bc_dofs), big[0])
                     eqs.append([(first[0], first[1], terms[first])] +
                                [(k[0], k[1], v) for k, v in terms.items() if k != first])
-            if it["route"] != "rows":
-                continue
             if any(k in busy for k in bcs):
-                it["route"], it["reason"] = "skip", (
-                    "Connector that would hold a translation of a rigid-body member at zero "
-                    "(ccx eliminates those, a boundary condition on one stops ccx); commented "
-                    "out — the connector is missing.")
+                return ("Connector that would hold a translation of a rigid-body member at zero "
+                        "(ccx eliminates those, a boundary condition on one stops ccx); "
+                        "commented out — the connector is missing.")
+            return bcs, eqs, reduced
+        for it in rows_items:
+            a = it["a"]
+            a_turns = it["rot"] is not None or (a is not None and (carrier(a) is not None or
+                                                                   a in self._rot_nodes))
+            got = build(it, a_turns)
+            twin: Optional[Tuple[int, int]] = None
+            rep = [] if isinstance(got, str) else repeats(got[1])
+            if rep and (nl or not merged(got[1])):
+                # an equation would hold a global DOF twice: the node's translations go
+                # through its twin instead (u_twin = u_node, _twin_rows) — or, where that node
+                # cannot have one (a reference point, a rigid-body member: ccx's own MPCs
+                # use its DOFs), the other node's, whose local translations then become
+                # the pivots; each equation keeps one local translation (probed: exact,
+                # linear, NLGEOM and explicit, on an uneven orthotropic mesh)
+                ends = [n for n in (it["b"], a) if n is not None and n in self._transformed]
+                for n in [m for m in rep if plain(m, 1)] + \
+                        [m for m in ends if m not in rep and plain(m, 1)]:
+                    twin_of[n] = self._twins.get(n) or max(self.geom.nodes) + 1
+                    alt = build(it, a_turns)
+                    tw = twin_of.pop(n)
+                    if not isinstance(alt, str) and not repeats(alt[1]):
+                        got, twin = alt, (n, tw)
+                        break
+            if isinstance(got, str):
+                it["route"], it["reason"] = "skip", got
                 continue
-            several = [eq for eq in eqs if any(
-                sum(1 for m, d, _ in eq if m == n and moved((m, d))) > 1 for n, _, _ in eq)]
-            if nl and several:
+            bcs, eqs, reduced = got
+            if nl and twin is None and repeats(eqs):
                 it["route"], it["reason"] = "skip", (
                     "Connector under NLGEOM (or explicit dynamics) between nodes with different "
                     "*TRANSFORMs whose constraint keeps several local translations of one node in "
-                    "an *EQUATION: ccx 2.23 does not converge on such an equation under NLGEOM, or "
-                    "drifts (probed; one local translation per equation is exact); commented out "
-                    "— the connector is missing.")
+                    "an *EQUATION, which ccx expands into a repeated global DOF, while neither "
+                    "node can be written through an untransformed twin (a reference point, or a "
+                    "rigid-body member, whose DOFs ccx's own MPCs use): ccx 2.23 mis-assembles "
+                    "such an equation and does not converge on it under NLGEOM (probed); "
+                    "commented out — the connector is missing.")
                 continue
             if nl:
                 def exact(eq: List[Tuple[int, int, float]]) -> bool:
@@ -24588,6 +24668,8 @@ class Converter:
                             "rerun with --approximate to write the linear form (not with "
                             "explicit dynamics, which stops on it).")
                         continue
+            if twin is not None:
+                self._mpc_twin(twin[0])          # made now, under the id its rows name
             it["bcs"], it["eqs"] = bcs, eqs
             it["local"] = reduced or any(is_local(k) for k in bcs)
 

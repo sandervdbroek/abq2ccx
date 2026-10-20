@@ -100,7 +100,7 @@ setting up its system: ccx 2.23 ends a step that sets up none with "Job finished
 | `connector_hinge_beams` | a `HINGE` releases in-plane bending and transmits out-of-plane | beam theory | 0.33 % |
 | `connector_hinge_bodies` | a hinge between two rigid bodies, oblique axis, offset joint | exact solution | 6e-8 |
 | `connector_ground_hinge` | a body hinged to ground turned 138° under NLGEOM | rigid rotation about the axis | 6e-6 |
-| `connector_transform_plate`, `connector_transform_join`, and the hinge examples with a `*TRANSFORM` | connectors on transformed nodes, also NLGEOM | the same models without the transform | exact |
+| `connector_transform_plate`, `connector_transform_join`, and the hinge examples with a `*TRANSFORM` | connectors on transformed nodes, also between two transformed faces (twin nodes) and NLGEOM | the same models without the transform | exact |
 | `mpc_transform` | `*MPC` `PIN`, `TIE` across faces with different transforms (twin nodes), a face pinned to a transformed reference point, a `LINK` to a transformed node; orthotropic, uneven mesh; also NLGEOM | the same model without the transforms | exact |
 | `equation_tie` | a deck's own `*EQUATION`s with terms written twice, or in the local axes of a transformed face (twin nodes); orthotropic, uneven mesh; also NLGEOM | the same equations in global components, each term once | exact (before: 78-130 %, no convergence under NLGEOM) |
 | `op_new_respecify`, `op_new_remove` | clamps across a later step's `*BOUNDARY, OP=NEW` | expected deflections | ≤ 0.7 % |
