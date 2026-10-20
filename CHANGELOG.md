@@ -6,6 +6,16 @@ physics.
 
 ## Unreleased
 
+* **Rotational BCs on `*TRANSFORM` nodes in ramped steps** — where Abaqus ramps a displacement
+  BC without AMPLITUDE and ccx would step it (implicit `*DYNAMIC`, `*VISCO`, transient coupled
+  steps, `*STEP, AMPLITUDE=STEP`), a rotational BC on a transformed knot or kinematic reference
+  node was left out, for a velocity BC's reason. It is now written in global components under
+  ccx's step ramp. In an explicit step, such a BC on rotations at rest takes the zero value
+  Abaqus/Explicit gives it, so one holding all three is kept instead of left out.
+* **Shell `OFFSET` compared as a number** — `OFFSET=0.` beside a section without OFFSET (or
+  `SPOS` beside `0.5`) counted as another section, so the converter predicted a ccx knot that
+  ccx does not make. A rotational BC on such a node with a `*TRANSFORM` was then written in
+  global components, which ccx read in the local axes: the plate turned the other way.
 * **`*INCLUDE` inserts the file's text** — as in Abaqus, an included file now continues the
   input where its `*INCLUDE` stands; each file was parsed on its own. So a file of data lines
   (`*NODE` / `*INCLUDE, INPUT=nodes.inp`) no longer loses them all, a `*PARAMETER` from an

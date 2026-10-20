@@ -7420,6 +7420,45 @@ def test_transformed_rotations_on_a_frame_joint_and_in_dynamic_decks():
     assert conv._rot_mode[3] == "keep" and "3,4,6" in _bc_lines(body)
 
 
+def test_transformed_rotations_on_a_card_the_step_ramp_splits():
+    # where Abaqus ramps a BC that ccx would step, _plan_default_amplitudes makes pieces of the
+    # card: a transformed node's rotations go with the piece that ramps them (ccx's step ramp
+    # takes each global component from its last value), once; before, every piece missed the
+    # card's lines and left the BC out for a velocity BC's reason
+    frame = TIP3.replace("2, 2, 3\n", "2, 2, 3\n3, 3, 4\n").replace(
+        "3, 2., 0., 0.\n", "3, 2., 0., 0.\n4, 2., 0., 1.\n")
+    deck = frame.format("0., 1., 0., -1., 0., 0.5", "*Boundary\n3, 4, 4, 0.01\n")
+    body, conv, rep = convert_str(deck.replace("*Step\n", "*Step, amplitude=STEP\n"))
+    assert f"{RAMP}\n3, 5, 5, 0.01\n" in body and "left out" not in body
+    assert not conv.reduced_physics and rep.n_warnings == 0
+    # a *DYNAMIC step, a transform about z (local 6 = global 6): the held rotations of the
+    # card's plain piece join the ramped one (from zero: no change)
+    about_z = "0.8660254, 0.5, 0., -0.5, 0.8660254, 0."
+    dyn = _tip("*Boundary\n3, 6, 6, 0.01\n3, 4, 5\n2, 2, 2\n", about_z).replace(
+        "*Static", "*Dynamic\n0.1, 1.")
+    body, conv, _ = convert_str(dyn)
+    assert 3 in conv._knots and conv._rot_mode[3] == "global" and not conv.reduced_physics
+    assert f"{RAMP}\n3, 4, 4\n3, 5, 5\n3, 6, 6, 0.01\n*BOUNDARY\n2, 2, 2\n" in _step(body, 1)
+    # a velocity BC's pieces: left out once, for the velocity BC's reason
+    body, _, _ = convert_str(dyn.replace("*Boundary\n3, 6, 6, 0.01\n3, 4, 5\n2, 2, 2\n",
+                                         "*Boundary, type=VELOCITY\n3, 6, 6, 0.5\n"))
+    assert body.count("node 3, DOFs 4-6 of this *BOUNDARY left out") == 1
+    assert "(a velocity, acceleration, FIXED or USER boundary condition on the rotations" in body
+    # Abaqus/Explicit ignores the value of a BC without AMPLITUDE: the DOFs, at rest, are
+    # held at zero, the same in any axes (before: refused for the knot beam an explicit
+    # step stops on)
+    exp = _tip("*Boundary\n3, 4, 6, 0.01\n").replace("*Static", "*Dynamic, explicit\n, 1.")
+    body, conv, _ = convert_str(exp)
+    assert conv._rot_mode[3] == "keep" and "3,4,6" in _bc_lines(body) and "left out" not in body
+    # a late OP=NEW on a split card is dropped from its first piece
+    late = _tip("*Boundary\n3, 6, 6, 0.01\n*End Step\n*Step\n*Dynamic\n0.1, 1.\n*Boundary\n"
+                "1, 1, 3\n*Boundary, op=NEW\n2, 2, 2, 0.01\n", about_z).replace(
+        "*Static", "*Dynamic\n0.1, 1.")
+    two = _step(convert_str(late)[0], 2)
+    assert "OP=NEW dropped: ccx 2.23 ignores it after a step's first *BOUNDARY, which has none\n" \
+        f"{RAMP}\n2, 2, 2, 0.01\n" in two and "OP=NEW" not in two.replace("OP=NEW dropped", "")
+
+
 def test_transformed_shell_node_rotations():
     # a shell node that is no knot: ccx's mean-rotation MPCs in the local axes are exact for
     # its BCs (two at most) and one or two moment components (probed): kept
@@ -7466,6 +7505,22 @@ def test_ccx_knot_prediction():
                      "symmetric\n0.025,3,M,0.\n0.025,3,M,90.\n")
     assert _knot_of(sym, 2) is False
     assert _knot_of(sym.replace("0.025,3,M,90.\n", "0.025,3,M,90.\n0.01,3,M,0.\n"), 2) is True
+    # ccx compares OFFSET as a number: 0. is no OFFSET, SPOS is 0.5 (before: compared as text)
+    two = S4.replace("*Shell Section,elset=E,material=M\n0.1\n", "*Elset,elset=E1\n1\n*Elset,"
+                     "elset=E2\n2\n*Shell Section,elset=E1,material=M{}\n0.1\n*Shell Section,"
+                     "elset=E2,material=M{}\n0.1\n")
+    assert _knot_of(two.format(",offset=0.", ""), 2) is False
+    assert _knot_of(two.format(",offset=SPOS", ",offset=0.5"), 2) is False
+    assert _knot_of(two.format(",offset=0.5", ""), 2) is True
+    assert A.offset_fraction(" sneg") == -0.5 and A.offset_fraction(None) == 0.0
+    assert A.offset_fraction("1.D-1") == 0.1 and A.offset_fraction("<off>") is None
+    # so a rotation BC on such a node with a *TRANSFORM stays in its local axes, where ccx
+    # reads it (ccx 2.23: the global form there turned the plate the other way)
+    plate = _transformed(two.format(",offset=0.", "") + "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n"
+                         "*Static\n*Boundary\n3, 4, 4, 0.01\n*End Step\n", "3",
+                         "0., 1., 0., -1., 0., 0.")
+    body, conv, _ = convert_str(plate)
+    assert conv._rot_mode == {3: "keep"} and "3,4,4,0.01" in _bc_lines(body)
 
 
 # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION ------------------------------------------

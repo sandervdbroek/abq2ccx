@@ -2471,6 +2471,37 @@ def modal_own_loads_deck(base=True):
                  "*END STEP"]) + "\n"
 
 
+def ramped_rotation_deck(step, twin=False):
+    """pert_frame_deck("bc") without its *FREQUENCY step: the frame's joint 9 (a ccx knot, its
+    *TRANSFORM about z: local 1 = y) turned about local 1 and 3 by 0.01, then about local 1 to
+    0.02, by BCs without AMPLITUDE in steps where Abaqus ramps them and ccx would step them
+    (``step``: "*DYNAMIC", or "*STATIC" under *STEP, AMPLITUDE=STEP); ``twin``: without the
+    *TRANSFORM, the BCs on the global DOFs (5, 6)."""
+    text = pert_frame_deck("bc", pert=False).replace(
+        "*STEP\n*STATIC", "*STEP\n*DYNAMIC\n0.01, 1." if step == "*DYNAMIC" else
+        "*STEP, AMPLITUDE=STEP\n*STATIC")
+    if twin:
+        text = re.sub(r"\*NSET, NSET=TIP\n.*\n\*TRANSFORM, NSET=TIP\n.*\n", "", text)
+        text = re.sub(r"(?m)^9, 4, 4,", "9, 5, 5,", text)
+    return text
+
+
+def knot_offset_deck(twin=False):
+    """Two S4 plates side by side (E 1000, nu 0.3, t 0.1), clamped along x = 0, their
+    sections one with OFFSET=0. and one without (the same offset to ccx, which makes their
+    shared node 5 no knot); node 5, with a *TRANSFORM (local 1 = y), turned about local 1 by
+    0.01; ``twin``: without the *TRANSFORM, about global y."""
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+            "6, 2., 1., 0.\n*ELEMENT, TYPE=S4, ELSET=E1\n1, 1, 2, 5, 4\n*ELEMENT, TYPE=S4, "
+            "ELSET=E2\n2, 2, 3, 6, 5\n*SHELL SECTION, ELSET=E1, MATERIAL=M, OFFSET=0.\n0.1\n"
+            "*SHELL SECTION, ELSET=E2, MATERIAL=M\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*NSET, NSET=FREE\n2, 3, 6\n" +
+            ("" if twin else "*NSET, NSET=TR\n5\n*TRANSFORM, NSET=TR\n0., 1., 0., -1., 0., 0.\n") +
+            "*BOUNDARY\n1, 1, 6\n4, 1, 6\n*STEP\n*STATIC\n*BOUNDARY\n" +
+            ("5, 5, 5, 0.01\n" if twin else "5, 4, 4, 0.01\n") +
+            "*NODE PRINT, NSET=FREE\nU\n*END STEP\n")
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded 1e5 down at its top centre (node set TIP) in a *STEP,
@@ -5868,6 +5899,29 @@ def main():
               f"area and loads *PARAMETERs from an included file): the tips moved {a:.7g} (0.02) "
               f"and {b:.7g} (0.04)")
     failures += 0 if ok else 1
+
+    # a rotational BC on a transformed knot node in a card the step ramp splits (it was left out),
+    # and on a shell node ccx makes no knot as one section has OFFSET=0. and the other none (it
+    # was written in global components, which ccx read in the local axes)
+    for tag, decks, what in (
+            ("ramped_rotation_dynamic", [ramped_rotation_deck("*DYNAMIC", t) for t in (False, True)],
+             "a B31 frame's joint with a *TRANSFORM turned about local 1 and 3 by BCs without "
+             "AMPLITUDE in two *DYNAMIC steps"),
+            ("ramped_rotation_static", [ramped_rotation_deck("*STATIC", t) for t in (False, True)],
+             "the same in two *STEP, AMPLITUDE=STEP *STATIC steps"),
+            ("knot_offset", [knot_offset_deck(t) for t in (False, True)],
+             "two S4 plates, one section with OFFSET=0., their shared node with a *TRANSFORM "
+             "turned about local 1")):
+        runs = [review_run(text, tag + ("" if k == 0 else "_ref"), dat_node_blocks)
+                for k, text in enumerate(decks)]
+        ok = all(runs)
+        if ok:
+            err, moved = same(runs)
+            ok = err < 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): every displacement table as without "
+                  f"the *TRANSFORM, the BCs on the global DOFs ({err:.1e} apart, free nodes moved "
+                  f"{moved:.3g})")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

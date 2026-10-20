@@ -1387,6 +1387,19 @@ def dof_number(token: str) -> Optional[int]:
     return int(token) if re.fullmatch(r"[-+]?\d+", token) else None
 
 
+SHELL_OFFSET_LABELS = {"SPOS": 0.5, "SNEG": -0.5}   # the top / bottom face on the nodes
+
+
+def offset_fraction(value: Optional[str]) -> Optional[float]:
+    """A shell section's or rigid body's OFFSET as the fraction of the thickness it is: a
+    label of SHELL_OFFSET_LABELS, a number, 0 when not given; None when it does not read."""
+    label = (value or "").strip().upper() or "0"
+    try:
+        return SHELL_OFFSET_LABELS[label] if label in SHELL_OFFSET_LABELS else pf(label)
+    except ValueError:
+        return None
+
+
 def short_real(x: float, digits: int = 9) -> str:
     """A real for a ccx data field: at most ``digits`` significant digits (ccx 2.23 reads only
     the first 20 characters of a field) and always with a decimal point or exponent."""
@@ -4041,6 +4054,8 @@ class Converter:
         # need ccx's own step ramp
         self._amp_cards: Dict[int, List[object]] = {}
         self._ramp_steps: set = set()
+        # id(*BOUNDARY block of those two planners) -> id(the deck card it comes from) (_bc_pieces)
+        self._piece_src: Dict[int, int] = {}
         # rigid elements and analytical rigid surfaces (see _plan_rigid): each rigid element's
         # skin per contact side ('P' = SPOS, 'N' = SNEG) -> (skin element, ccx face label);
         # the *SURFACE lines that replace a rigid entry, by (id(card), record); the meshed
@@ -6922,11 +6937,11 @@ class Converter:
         reads the same way (probed on 2.23: OFFSET=0.5 puts the expanded shell below its
         nodes, on the negative side of the normal); it stops on the labels."""
         label = (value or "").strip().upper()
-        if label not in ("SPOS", "SNEG"):
+        if label not in SHELL_OFFSET_LABELS:
             return value
         self.report.note("*SHELL SECTION, OFFSET=SPOS / SNEG -> OFFSET=0.5 / -0.5, the same "
                          "offset as a number (ccx stops on the label).", once=True)
-        return "0.5" if label == "SPOS" else "-0.5"
+        return "%g" % SHELL_OFFSET_LABELS[label]
 
     def _shell_section_cards(self, b: Block, elset: Optional[str], base_ori: str,
                              axes: Dict[str, Tuple[str, ...]]) -> List[str]:
@@ -7862,21 +7877,12 @@ class Converter:
             return ["** abq2ccx: *BOUNDARY, LOAD CASE=2 (buckling-mode BCs) left out: ccx has one "
                     "set of BCs per step"]
         if self._bc_type(b) in self._RATE_TYPES and id(b) in self._vel_cards:   # _plan_velocity_bcs
-            pieces = self._vel_cards[id(b)]
-            if id(b) in self._op_new_drop:       # the card's OP=NEW goes with its first block
-                for p in pieces:
-                    if isinstance(p, Block) and p.has("OP"):
-                        self._op_new_drop[id(p)] = self._op_new_drop[id(b)]
-            return self._boundary_pieces(pieces)
+            return self._boundary_pieces(self._vel_cards[id(b)])
         if id(b) in self._amp_cards:                 # _plan_default_amplitudes
-            pieces = self._amp_cards[id(b)]
-            if id(b) in self._op_new_drop:
-                for p in pieces:
-                    if isinstance(p, Block) and p.has("OP"):
-                        self._op_new_drop[id(p)] = self._op_new_drop[id(b)]
-            return self._boundary_pieces(pieces)
+            return self._boundary_pieces(self._amp_cards[id(b)])
         if b.has("USER"):
             return self._user_load_card(b)
+        src = self._piece_src.get(id(b), id(b))     # a piece's plans are its card's
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k == "TYPE":
@@ -7898,14 +7904,14 @@ class Converter:
                 if part:
                     params["LOAD CASE"] = part
                 continue
-            if k == "OP" and id(b) in self._op_new_drop:
+            if k == "OP" and src in self._op_new_drop:
                 continue                # _plan_late_op_new, _plan_op_new_rotations
             params[k] = v
-        said = self._op_new_drop.get(id(b))
-        out = [said] if said and b.uparam("OP") == "NEW" else []
+        said = self._op_new_drop.get(src)
+        out = [said] if said and b.uparam("OP") == "NEW" else []   # (the first piece has the OP)
         out.append(emit_keyword("BOUNDARY", params))
         # (the pieces of a card _plan_default_amplitudes splits carry their midside lines)
-        midside = [] if getattr(b, "_no_midside", False) else \
+        midside = [] if src in self._amp_cards else \
             [ln.split(",") for ln in self._midside_records(b, "boundary")]
         # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
         recs = self._bc_card_records(b)
@@ -8332,31 +8338,37 @@ class Converter:
                     for a, c in dof_runs(sorted(d for m, d in members if m == n))]
         return out
 
-    @staticmethod
-    def _bc_pieces(op: Optional[str], amp_lines: List[str], entries: List[Tuple[object, str]],
-                   notes: List[str]) -> List[object]:
-        """The generated amplitudes, then one *BOUNDARY per run of lines of one kind
-        (line order kept: a later line overrides an earlier one on the same DOF)."""
-        out: List[object] = list(notes) + list(amp_lines)
+    def _bc_pieces(self, src: Optional[Block], entries: List[Tuple[object, str]],
+                   head: Sequence[str] = ()) -> List[object]:
+        """What replaces *BOUNDARY ``src`` (None: lines of no one card): ``head`` (notes, the
+        generated amplitudes), then one *BOUNDARY per run of ``entries`` of one signature
+        (None: plain, "FIXED", else an amplitude; "#": a comment line), in line order - a
+        later line overrides an earlier one on the same DOF - the first with the card's OP.
+        Each records its card in _piece_src."""
+        op = src.param("OP") if src is not None else None
+        out: List[object] = list(head)
+        blocks: List[Block] = []
+        last: object = None                         # the signature of out[-1], a block
         for sig, text in entries:
             if sig == "#":
                 out.append(text)
                 continue
-            if out and isinstance(out[-1], Block) and getattr(out[-1], "_sig", None) == sig:
+            if out and isinstance(out[-1], Block) and last == sig:
                 out[-1].data.append(text)
                 continue
-            params = []
-            if op and not any(isinstance(p, Block) for p in out):
-                params.append(("OP", op))
+            params = [("OP", op)] if op and not blocks else []
             if sig == "FIXED":
                 params.append(("FIXED", None))
             elif sig is not None:
                 params.append(("AMPLITUDE", sig))
-            blk = mkblock("BOUNDARY", params, [text])
-            blk._sig = sig
-            out.append(blk)
-        if op and not any(isinstance(p, Block) for p in out):
-            out.append(mkblock("BOUNDARY", [("OP", op)], []))     # it still removes BCs
+            blocks.append(mkblock("BOUNDARY", params, [text]))
+            out.append(blocks[-1])
+            last = sig
+        if op and not blocks:
+            blocks.append(mkblock("BOUNDARY", [("OP", op)], []))     # it still removes BCs
+            out.append(blocks[-1])
+        if src is not None:
+            self._piece_src.update((id(p), id(src)) for p in blocks)
         return out
 
     def _rate_line_comment(self, what: str, why: str, reduces: bool = True) -> Tuple[str, str]:
@@ -8384,7 +8396,7 @@ class Converter:
                                 f"{spec}, {dofs[0]}, {dofs[-1]}"))
         self.report.note(f"*BOUNDARY, TYPE=VELOCITY/ACCELERATION {why}: zero-valued, so "
                          f"converted to the zero displacement BC it amounts to.", once=True)
-        return self._bc_pieces(b.param("OP"), [], entries, [])
+        return self._bc_pieces(b, entries)
 
     def _plan_velocity_bcs(self, blocks: List[Block]) -> None:
         """*BOUNDARY, TYPE=VELOCITY / ACCELERATION -> displacement BCs: ccx prescribes
@@ -8413,6 +8425,7 @@ class Converter:
         self._vel_cards = {}
         self._vel_tail = {}
         self._vel_only_amps = set()
+        self._piece_src = {}             # (_plan_default_amplitudes, which runs next, adds to it)
         rate_cards = [b for b in blocks if b.keyword == "BOUNDARY" and self._bc_type(b) in self._RATE_TYPES]
         if not rate_cards:
             return
@@ -8750,7 +8763,7 @@ class Converter:
                         redefined.add(k)
                 if rate:
                     midside(driven, shapes, amp_lines, entries, mid_done)
-                    self._vel_cards[id(b)] = self._bc_pieces(b.param("OP"), amp_lines, entries, [])
+                    self._vel_cards[id(b)] = self._bc_pieces(b, entries, amp_lines)
                 for spec, dofs, _, _, _ in self._rate_lines(b):   # a later card replaces a BC
                     for n in self._resolve_nodes(spec):
                         for d in dofs:
@@ -8778,9 +8791,9 @@ class Converter:
                             tail.append(e)
             tail = [e for e in tail if e[0] not in (None, "FIXED")]   # ccx holds those already
             if tail:
-                self._vel_tail[s] = self._bc_pieces(None, tail_amps, tail,
-                                           ["** abq2ccx: *BOUNDARY, TYPE=VELOCITY/ACCELERATION of "
-                                            "an earlier step, still in force: its motion continues"])
+                self._vel_tail[s] = self._bc_pieces(
+                    None, tail, ["** abq2ccx: *BOUNDARY, TYPE=VELOCITY/ACCELERATION of an earlier "
+                                 "step, still in force: its motion continues"] + tail_amps)
             # warn where finite rotations about several axes are integrated component-wise:
             # a node turned about more than one axis in this step, or about another axis
             # than the one it turned about before (the manual's own example of velocity BCs)
@@ -8941,7 +8954,7 @@ class Converter:
                         "** abq2ccx: displacement BC without AMPLITUDE in an explicit step: "
                         "Abaqus/Explicit ignores its value and holds the DOF where it is (zero "
                         "velocity)")
-                self._amp_cards[id(b)] = [note] + self._bc_runs(b.param("OP"), entries)
+                self._amp_cards[id(b)] = self._bc_pieces(b, entries, [note])
                 if "ramp" in done:
                     self._ramp_steps.add(s)
         if "ramp" in seen:
@@ -9182,26 +9195,6 @@ class Converter:
         for a, z, c in runs:
             value = ln["value"] if c in ("keep", "keep!", "step!", "ramp") else ""
             out.append((sig.get(c), ", ".join([ln["spec"], str(a), str(z)] + ([value] if value else []))))
-        return out
-
-    @staticmethod
-    def _bc_runs(op: Optional[str], entries: List[Tuple[Optional[str], str]]) -> List[Block]:
-        """One *BOUNDARY per run of lines of one signature (None: plain, "FIXED", else an
-        amplitude), in line order - a later line overrides an earlier one on the same DOF -
-        the first with the card's OP.  They carry their midside lines (_amp_lines)."""
-        out: List[Block] = []
-        for sig, text in entries:
-            if out and out[-1]._sig == sig:
-                out[-1].data.append(text)
-                continue
-            params = [("OP", op)] if op and not out else []
-            if sig == "FIXED":
-                params.append(("FIXED", None))
-            elif sig is not None:
-                params.append(("AMPLITUDE", sig))
-            blk = mkblock("BOUNDARY", params, [text])
-            blk._sig, blk._no_midside = sig, True
-            out.append(blk)
         return out
 
     def _ssd_part(self, b: Block, k: str, can: bool = True) -> Optional[str]:
@@ -9721,11 +9714,7 @@ class Converter:
         offset: Dict[int, Optional[float]] = {}
         for b in blocks:
             if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION"):
-                o = (b.param("OFFSET") or "0").strip().upper()
-                try:
-                    val: Optional[float] = {"SPOS": 0.5, "SNEG": -0.5}[o] if o in ("SPOS", "SNEG") else pf(o)
-                except ValueError:
-                    val = None
+                val = offset_fraction(b.param("OFFSET"))
                 for e in self.geom.elset((b.param("ELSET") or "").strip()):
                     offset[e] = val
         cards: List[str] = []
@@ -10442,6 +10431,15 @@ class Converter:
                 for b, _, items in cards:
                     if n in items:
                         self._rot_lines[(id(b), n)] = refused[n]
+        # a card _plan_velocity_bcs / _plan_default_amplitudes made pieces of: a node's lines
+        # go with the piece that ramps its rotations (ccx's step ramp is the card's Abaqus
+        # ramp, of each global component from its last value), else the first naming them
+        for (src, n), got in list(self._rot_lines.items()):
+            pieces = [p for p in self._amp_cards.get(src, self._vel_cards.get(src, ()))
+                      if isinstance(p, Block) and self._rot_items(p, {n})]
+            ramp = [p for p in pieces if p.uparam("AMPLITUDE") == self.CCX_RAMP]
+            at = ramp[0] if ramp and isinstance(got, list) else pieces[0] if pieces else None
+            self._rot_lines.update(((id(p), n), got if p is at else []) for p in pieces)
         if any(m == "global" for m in self._rot_mode.values()):
             self.report.note("Rotational BCs / moments on knotted shell/beam nodes and kinematic "
                              "reference nodes with a *TRANSFORM written in global components: ccx "
@@ -10450,11 +10448,21 @@ class Converter:
                              "local axes — a moment line by line, held rotations as their global "
                              "values.", once=True)
 
-    def _rot_items(self, b: Block, nodes: set) -> Dict[int, List[Tuple[int, float]]]:
+    def _rot_items(self, b: Block, nodes: set,
+                   whole: bool = False) -> Dict[int, List[Tuple[int, float]]]:
         """(DOF, value) per node of ``nodes`` that the *BOUNDARY or *CLOAD ``b`` gives on DOFs
         4-6, as handle_boundary / handle_cload emit the card (a named BC type: zero on its
-        rotations, where it has them; a value that does not read as a number: NaN)."""
+        rotations, where it has them; a value that does not read as a number: NaN): a card
+        _plan_default_amplitudes split (unless ``whole``) as its pieces give them on the
+        card's own nodes (an explicit step's value on a DOF at rest is zero)."""
         out: Dict[int, List[Tuple[int, float]]] = {}
+        pieces = [] if whole else [p for p in self._amp_cards.get(id(b), ()) if isinstance(p, Block)]
+        if pieces:
+            mine = set(self._rot_items(b, nodes, True))      # not the midside nodes they add
+            for p in pieces:
+                for n, its in self._rot_items(p, mine).items():
+                    out.setdefault(n, []).extend(its)
+            return out
 
         def num(x: str) -> float:
             try:
@@ -10629,7 +10637,10 @@ class Converter:
                 if b.keyword.startswith("SHELL"):
                     thick = sum(pf(t) for t, _m, _o in self._section_layers(b)) \
                         if b.has("COMPOSITE") else pf(recs[0][0])
-                    key: tuple = ("S", thick, (b.param("OFFSET") or "0").strip().upper())
+                    off = offset_fraction(b.param("OFFSET"))       # ccx compares the numbers
+                    if off is None:
+                        raise ValueError
+                    key: tuple = ("S", thick, off)
                 else:
                     key = ("B", b.uparam("SECTION"),
                            tuple(pf(x) for x in recs[0]))
@@ -14360,12 +14371,7 @@ class Converter:
                     if b.data else 0.0
             except (IndexError, ValueError):
                 thick = 0.0
-            off_s = (b.param("OFFSET") or "0").strip().upper()
-            try:
-                off = {"SPOS": 0.5, "SNEG": -0.5}.get(off_s, None)
-                off = pf(off_s) if off is None else off
-            except ValueError:
-                off = 0.0
+            off = offset_fraction(b.param("OFFSET")) or 0.0
             if b.has("NODAL THICKNESS"):
                 self.report.warn("*RIGID BODY, NODAL THICKNESS: the rigid elements' contact "
                                  "surfaces are offset by the data-line thickness only (the "
@@ -15156,11 +15162,7 @@ class Converter:
                     (pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 0.0)
             except ValueError:
                 continue
-            o = (b.param("OFFSET") or "0").strip().upper()
-            try:
-                off = {"SPOS": 0.5, "SNEG": -0.5}[o] if o in ("SPOS", "SNEG") else pf(o)
-            except ValueError:
-                off = 0.0
+            off = offset_fraction(b.param("OFFSET")) or 0.0
             if t <= 0:
                 continue
             for e in self.geom.elset((b.param("ELSET") or "").strip()):
