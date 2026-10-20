@@ -231,15 +231,16 @@ The tests:
   one mechanism mode besides the six rigid-body modes.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1052 decks convert with no dangling
-reference. 232 are gated `expect_solve`: **188 solve the deck's own physics**; 14 are
+reference. 232 are gated `expect_solve`: **180 solve the deck's own physics**; 14 are
 `source_unloaded`, two are `solver_differs` (a snap-fit insert that only contact holds drifts
 out of its buckle; a plate pushed about 1240 times past its buckling load, whose lowest factors
-ccx's `*BUCKLE` does not return) and 31 (3 of them also unloaded) are `reduced_physics` — concrete damaged
+ccx's `*BUCKLE` does not return) and 44 (7 of them also unloaded, 1 also `solver_differs`) are `reduced_physics` — concrete damaged
 plasticity (2), UHARD / VUHARD hardening (2), field-dependent elasticity set by USDFLD or a
 user field (3), Chaboche back-stresses (3), `HOURGLASS=ENHANCED` (1), `CPE4H` (2),
 `CPS6M`/`CPE6M` (4), `C3D10M`/`C3D10HS` (2), `STRI3` (2), linear circular-section beams run as
 `B32R` (3), I-section `B21` beams run as ccx's Euler–Bernoulli `U1` (3), general contact (2), a
-dropped `*IMPERFECTION` (1), planar beams whose eigenmodes include twist (1). 221 mesh-only
+dropped `*IMPERFECTION` (1), planar beams whose eigenmodes include twist (1), plain `S4R` shells, which ccx bends only
+through hourglass stiffness (13). 221 mesh-only
 decks are accepted. The other 599 stop first on, or (the last row) run without, what they need:
 
 | Decks | First blocker |

@@ -19,15 +19,16 @@ references). Each entry carries one of three expectations:
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
   conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
-  Three flags keep such a deck out of the headline count of faithful solves (188):
+  Three flags keep such a deck out of the headline count of faithful solves (180):
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
-  - ``reduced_physics='<what>'`` (31, 3 of them also source_unloaded): the conversion
+  - ``reduced_physics='<what>'`` (44, 7 of them also source_unloaded, 1 also solver_differs): the conversion
     drops or replaces part of the Abaqus model - a constitutive behaviour (concrete
     damaged plasticity, user hardening, Chaboche back-stresses, field-dependent
     elasticity), an element formulation (hybrid, modified or thin-shell elements run as
-    ccx's plain ones, linear circular-section beams as 3-node ones, Timoshenko beams as ccx's
+    ccx's plain ones, S4R shells that ccx bends only through hourglass stiffness,
+    linear circular-section beams as 3-node ones, Timoshenko beams as ccx's
     Euler-Bernoulli U1), a section control,
     an interaction (general contact) or an imperfection - so ccx solves a different
     problem (``Converter.reduced_physics``; test_corpus.py checks the flag matches);
@@ -438,6 +439,7 @@ CORPUS = [
          note='the source deck applies no load in any step: it solves, to a zero response',
          url='https://raw.githubusercontent.com/burakbayramli/books/master/A_Practical_Guide_to_the_FEM_Okereke/___PBC2DGEN/UDComposite.inp'),
     dict(name='cburstedde_hole_2d_cubit', expect_solve=True, source_unloaded=True, license='GPL-2.0',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly',
          note='the source deck applies no load in any step: it solves, to a zero response',
          url='https://raw.githubusercontent.com/cburstedde/p4est/master/example/steps/hole_2d_cubit.inp'),
@@ -446,6 +448,7 @@ CORPUS = [
          note='the source deck applies no load in any step: it solves, to a zero response',
          url='https://raw.githubusercontent.com/cburstedde/p4est/master/example/steps/hole_3d_cubit.inp'),
     dict(name='chang_liu_0520_h_shape_20steel_shell_20element', expect_solve=True, license='see source repo',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/Chang-Liu-0520/FEM-of-H-shape-steel-using-ABAQUS/master/H-shape%20steel-shell%20element.inp'),
     dict(name='chenyizh0u_c30', expect_solve=True,
@@ -510,16 +513,20 @@ CORPUS = [
          exercises='C3D8R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/V_USDFLD/example_USDFLD_V1.inp'),
     dict(name='dheller1_hochbauplatte', expect_solve=True, license='none stated',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/dheller1/inp2feap/master/example/hochbauplatte.inp'),
     dict(name='dheller1_uprofile', expect_solve=True, license='none stated',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly; rigid coupling on shell nodes (knot beams) whose nodes also carry BCs the reference node imposes (taken off)',
          url='https://raw.githubusercontent.com/dheller1/inp2feap/master/example/uprofile.inp'),
     dict(name='gibboncode_example_quad', expect_solve=True, source_unloaded=True, license='custom (see repo)',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly',
          note='the source deck applies no load in any step: it solves, to a zero response',
          url='https://raw.githubusercontent.com/gibbonCode/GIBBON/master/data/INP/example_QUAD.inp'),
     dict(name='gibboncode_example_quad_2', expect_solve=True, source_unloaded=True, license='custom (see repo)',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly',
          note='the source deck applies no load in any step: it solves, to a zero response',
          url='https://raw.githubusercontent.com/gibbonCode/GIBBON/master/data/INP/example_QUAD_2.inp'),
@@ -584,6 +591,7 @@ CORPUS = [
          exercises='CPE4',
          url='https://raw.githubusercontent.com/JuliaFEM/AbaqusReader.jl/master/test/test_manual_examples/plastic_analysis.inp'),
     dict(name='juliafem_shell_analysis', expect_solve=True, license='MIT',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R',
          url='https://raw.githubusercontent.com/JuliaFEM/AbaqusReader.jl/master/test/test_manual_examples/shell_analysis.inp'),
     dict(name='juliafem_shell_box', expect_solve=True, license='MIT',
@@ -839,12 +847,15 @@ CORPUS = [
          exercises='C3D8 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/TLCFEM/suanPan/master/Example/Misc/Converter/TEST.inp'),
     dict(name='we1_shell_noori_cae', expect_solve=True, license='MIT',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/LallyLabTCD/localBasisAbaqus/master/Lesson%20A%20-%20deformation%20gradient/Abaqus/Worked_Example_1/WE1_Shell_NoOri.inp'),
     dict(name='we1_shell_ori_cae', expect_solve=True, license='MIT',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly; *Orientation',
          url='https://raw.githubusercontent.com/LallyLabTCD/localBasisAbaqus/master/Lesson%20A%20-%20deformation%20gradient/Abaqus/Worked_Example_1/WE1_Shell_Ori.inp'),
     dict(name='we1_shell_ori_largedef_cae', expect_solve=True, license='MIT',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly; *Orientation',
          url='https://raw.githubusercontent.com/LallyLabTCD/localBasisAbaqus/master/Lesson%20A%20-%20deformation%20gradient/Abaqus/Worked_Example_1/WE1_Shell_Ori_largeDef.inp'),
     dict(name='we2_global_cae', expect_solve=True, license='MIT',
@@ -938,6 +949,7 @@ CORPUS = [
          exercises='C3D8R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/davidmorinNTNU/ABAQUS_subroutines/main/UVARM/EXAMPLE_UVARM.inp'),
     dict(name='dealii_2d_test_pave', expect_solve=True, source_unloaded=True, license='Apache-2.0',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly',
          note='the source deck applies no load in any step: it solves, to a zero response',
          url='https://raw.githubusercontent.com/dealii/dealii/master/tests/grid/grids/abaqus/2d/2d_test_pave.inp'),
@@ -971,12 +983,14 @@ CORPUS = [
          exercises='S4 — parts/instances/assembly; NLGEOM; rigid coupling on shell nodes (knot beams)',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/7.%20Non-Linear%20Analysis/3.%20Spring%20Plate/Spring_Plate_NL.inp'),
     dict(name='marcello_gori_u_shaped_bracket', expect_solve=True, license='MIT',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          exercises='S4R — parts/instances/assembly; rigid coupling on shell nodes (knot beams)',
          url='https://raw.githubusercontent.com/marcello-gori/udemy-abaqus-cae-structural-analysis/main/4.%20Linear%20Static%20Structural%20Analysis/1.%20U%20Shaped%20Bracket/U_Shaped_Bracket.inp'),
     dict(name='smrg_uob_cube_pbc_uat', expect_solve=True, license='MIT',
          exercises='C3D8R — parts/instances/assembly',
          url='https://raw.githubusercontent.com/smrg-uob/PeriodicBoundaryCondition/master/examples/Cube_PBC_UAT.inp'),
     dict(name='weili101_ex4_job_buckling_ssff_0', expect_solve=True, license='MIT',
+         reduced_physics='plain S4R shells: ccx 2.23 expands each into one C3D8R brick integrated on its mid-surface, so only the hourglass stiffness ccx adds to that brick resists their bending',
          solver_differs="ccx 2.23's *BUCKLE returns the factors nearest 1, not the lowest (it "
                         "shift-inverts about 1): the deck's edge push of -10 is about 1240 times "
                         "its lowest buckling load, so ccx gives ten factors at 0.977-1.023, not "
