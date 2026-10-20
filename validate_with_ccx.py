@@ -6454,7 +6454,7 @@ def main():
     # under a tilted one must match the plate in global components, the half panel with a
     # cylindrical *TRANSFORM on all nodes the whole panel without (before: 2.1 % / 1.3 % off).
     def corner_twin(label, text, twin, tol=1e-9, moved=0.0):
-        u, notes = [], []
+        u, notes, why = [], [], []
         for i, t in enumerate((text, twin)):
             src, inp = os.path.join(tmp, f"tc{i}_src.inp"), os.path.join(tmp, f"tc{i}.inp")
             with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -6467,9 +6467,12 @@ def main():
                     break
                 shutil.rmtree(d, ignore_errors=True)
             u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            if status != "solved":                  # say how ccx ended (the last lines it printed)
+                tail = [ln.strip() for ln in out.splitlines() if ln.strip()][-3:]
+                why.append(f"{('the deck', 'its twin')[i]} {status}: {' | '.join(tail)}")
             shutil.rmtree(d, ignore_errors=True)
         if not u[0] or u[0].keys() != u[1].keys():
-            print(f"FAIL  {label}: no displacements to compare")
+            print(f"FAIL  {label}: no displacements to compare" + (f" ({'; '.join(why)})" if why else ""))
             return 1
         scale = max(math.hypot(*v) for v in u[1].values())
         err = ccx_ratio(max(math.dist(u[0][n], u[1][n]) for n in u[1]), scale)
