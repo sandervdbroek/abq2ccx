@@ -527,7 +527,7 @@ def test_step_model_handle_step_facts():
 
 def test_general_step_is_any_but_a_linear_perturbation_step():
     # Abaqus: "all other procedures can be used only in general analysis steps", whose end is the
-    # base state of the perturbation steps after them.  handle_step (_general_step_seen: the
+    # base state of the perturbation steps after them.  handle_step (Step.general_before: the
     # *BUCKLE step's PERTURBATION, the base state's preload) and _plan_base_restore (the steps
     # that get the base state again) read it alike: a step with a procedure ccx lacks (*GEOSTATIC,
     # *SOILS) or none counts; ccx stops there (*NO ANALYSIS), so no step after it runs
@@ -537,7 +537,7 @@ def test_general_step_is_any_but_a_linear_perturbation_step():
     assert m.pert == {2, 4}
     body, conv, _ = convert_str(HEX_MODEL + """*STEP\n*GEOSTATIC\n*END STEP\n*STEP\n*BUCKLE\n2
 *CLOAD\n7, 3, -1.\n*END STEP\n""")
-    assert "*STEP, PERTURBATION\n*BUCKLE" in body and conv._buckle_preloaded == {2: True}
+    assert "*STEP, PERTURBATION\n*BUCKLE" in body and [s.general_before for s in conv.steps] == [False, True]
     assert "*NO ANALYSIS" in body
 
 
@@ -14137,7 +14137,7 @@ def test_step_procedure_ends_with_its_step():
     body, conv, rep = convert_str(deck)
     tail = body[body.rindex("*END STEP"):]
     assert "*CLOAD, LOAD CASE=2" in _step(body, 2) and "LOAD CASE" not in tail, tail
-    assert "*BOUNDARY, IMAGINARY dropped" in rep.text() and conv._step_proc is None
+    assert "*BOUNDARY, IMAGINARY dropped" in rep.text() and conv.emit.proc is None
 
 
 def _normal_rows(body):

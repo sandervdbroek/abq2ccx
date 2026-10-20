@@ -4664,7 +4664,7 @@ class Step:
                                   # card has NLGEOM=NO or a *FREQUENCY or *BUCKLE step has run (probed),
                                   # and the procedures of PERTURBATION_PROCS are linear there (a static
                                   # perturbation step is a general one in ccx)
-    temp_dof: Optional[str]       # the procedure, where it is in TEMPERATURE_DOF_PROCS (handle_step's)
+    temp_dof: Optional[str]       # the procedure, where it is in TEMPERATURE_DOF_PROCS (handle_temperature)
     star_proc: str                # (_plan_material_cards) "PERTURBATION" with *STEP, PERTURBATION,
                                   # else proc (with ", RIKS"), "" if none.  A procedure card between
                                   # steps is no step's: Abaqus rejects it, emit_other comments it out
@@ -4672,8 +4672,9 @@ class Step:
     # can be used only in general analysis steps"; the base state is the last one's end): handle_step
     # and _plan_base_restore.  (_plan_modal_starts asks ccx's question instead: which steps leave
     # ccx holding a deformed model, a static perturbation step among them.)
-    general_before: bool          # a general step before it (handle_step's _general_step_seen)
-    buckle_loaded: bool           # a *BUCKLE step with a load other than *TEMPERATURE (handle_step's)
+    general_before: bool          # a general step before it (handle_step, _frequency_perturbation,
+                                  # _perturbation_after_buckle, _buckle_displacements)
+    buckle_loaded: bool           # a *BUCKLE step with a load other than *TEMPERATURE (handle_temperature)
     lc2: frozenset                # in a step with a *BUCKLE card: the ids of its *BOUNDARY, LOAD CASE=2
                                   # cards, which the conversion leaves out (StepModel.lc2)
     lc2_repeats: bool             # they hold what the step's LOAD CASE=1 cards hold in ccx (the Abaqus/
@@ -5590,7 +5591,8 @@ class WrittenStep:
 class EmitState:
     """What the emission has written so far (Converter.emit, made again by _reset_emission):
     the step being written, the *STEP cards written, the converted loads and what ccx holds
-    of them, the output control in force, and the card before.  The deck's own facts are the
+    of them, the output control in force, the card before, and what the steps written leave
+    (a perturbation's base state, the steps ccx stops at).  The deck's own facts are the
     StepModel's; these follow from the cards the handlers wrote, in the order they wrote
     them.  A record changes only through its methods: a post-pass that rewrites a *STEP line
     calls rewrite_step."""
@@ -5602,7 +5604,28 @@ class EmitState:
         self.step: Optional[Step] = None
         self.no = 0
         self.prev: Optional[Step] = None
+        # its procedure (Step.proc, None for none); None outside a step, where step stays the
+        # last one: emit_other clears it after the step's *END STEP (_ssd_part)
+        self.proc: Optional[str] = None
         self.written: Dict[int, WrittenStep] = {}   # step -> its *STEP card as written
+        # the step being written (begin_step; a step ccx stops at keeps the last one's): a static
+        # perturbation step after another step, whose loads add to the base state's (_sp_add:
+        # _op_new_load, _set_nodal_load), and its time period, where a step-time amplitude ends
+        # (_load_later, _hold_nodal_loads; None: not known)
+        self.sp_adds = False
+        self.period: Optional[float] = 1.0
+        # the general steps written so far heat the model (temperatures set or solved) or stress
+        # it (a load or prescribed motion; the model data's: Converter._model_stressed): the base
+        # state of a perturbation step after them (_frequency_perturbation)
+        self.base_heated = False
+        self.base_stressed = False
+        self.stopped: set = set()                   # the steps ccx stops at (_no_analysis)
+        # on a yielding material (_yield_segfaults): a *FREQUENCY step ran in ccx since the last
+        # *DYNAMIC, and the steps where ccx segfaults
+        self.eigen_since = False
+        self.yield_segv: set = set()
+        # what a *DLOAD line's key loads (_dl_faces), for the whole conversion
+        self.dl_memo: Dict[tuple, frozenset] = {}
         # distributed loads emitted as consistent nodal forces (see _flush_nodal_loads):
         # (card, target, label) -> ({(node, DOF): force}, amplitude: _cload_amp), in Abaqus semantics
         self.nodal_loads: "OrderedDict[tuple, Tuple[Dict[Tuple[int, int], float], Optional[tuple]]]" = \
@@ -5650,6 +5673,7 @@ class EmitState:
         """The cursor moves to the next of ``steps`` (handle_step, at its *STEP card)."""
         self.prev, self.step = self.step, steps.steps[self.no]
         self.no += 1
+        self.proc = self.step.proc or None
         return self.step
 
     def write_step(self, params: "OrderedDict[str, Optional[str]]") -> str:
@@ -5663,15 +5687,17 @@ class EmitState:
         drops PERTURBATION): its record follows, as written."""
         self.written[no].params = OrderedDict(params)
 
-    def begin_step(self, restore: bool, held: bool) -> None:
+    def begin_step(self, restore: bool, held: bool, sp_adds: bool, period: Optional[float]) -> None:
         """The current step's cards come next (handle_step, after its *STEP card; not in a step
         ccx stops at): the per-step bookkeeping starts empty, and the converted loads are those
         ccx holds at its start.  A linear perturbation step's loads act in it only (Abaqus): the
         converted loads it starts from are the base state's, taken at the first step of a run of
         them, and so are the next general step's (``restore``: _restore_from), which ccx gets
         back at its start (_restore_base_states); nodal_emitted follows what ccx holds.
-        ``held``: a *MODAL DYNAMIC step that keeps the loads ccx holds (_modal_held)."""
+        ``held``: a *MODAL DYNAMIC step that keeps the loads ccx holds (_modal_held).
+        ``sp_adds``, ``period``: the step's (the fields)."""
         step = self.step
+        self.sp_adds, self.period = sp_adds, period
         self.nodal_fresh, self.nodal_reset, self.cload_new = set(), set(), False
         self.dl_fresh, self.dl_wiped, self.dl_taken = set(), False, {}
         self.cl_fresh, self.cl_taken = set(), {}
@@ -5735,7 +5761,7 @@ class BaseStateRestore:
         self.pert = conv._pert_idx
         self.sp_add, self.sp_temps, self.sp_temp_dep = conv._sp_add, conv._sp_temps, conv._sp_temp_dep
         self.modal_held, self.yields, self.yield_segv = \
-            conv._modal_held, conv._restore_yields, conv._yield_segv
+            conv._modal_held, conv._restore_yields, conv.emit.yield_segv
         self.transformed = conv._transformed
         self.written = conv.emit.written            # each step's *STEP card as written
         # the nodes whose temperature lines give values at section points, not gradients
@@ -6632,14 +6658,9 @@ class Converter:
         self._overclosed = False                    # one of them starts overclosed
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
-        # the step being emitted: a general step before it (handle_step: Step.general_before)
-        self._general_step_seen = False
-        self._base_heated = False                   # temperatures set or solved in a general step
-        self._base_stressed = False                 # a load, prescribed motion or initial state
-        self._step_proc: Optional[str] = None      # the procedure of the step being emitted (None
-                                                   # outside a step)
-        self._buckle_loaded = False                 # a *BUCKLE step loaded by more than temperatures
-        self._buckle_preloaded: Dict[int, bool] = {}   # *BUCKLE step -> a general step before it
+        # the model data stress the model: an initial state (not temperatures or fields) or a
+        # prescribed motion before the first step (with EmitState.base_stressed)
+        self._model_stressed = False
         self._cyclic_ok: set = set()
         self._temp_ic_fill = False
         self._temp_ic_filled = False                # the fill line is written (first card)
@@ -6648,7 +6669,6 @@ class Converter:
         # elements whose section reads a temperature line's values at section points
         # (TEMPERATURE=n shell, TEMPERATURE=VALUES beam sections), not as gradients
         self._point_temps: set = set()
-        self._step_temp_dof: Optional[str] = None  # the step's procedure if temperature is a DOF
         # planar 2-D beams/trusses: element -> its PLANAR_LINE_TYPES type, and the model-data
         # *BOUNDARY lines that keep them in their plane (_plan_planar_constraint)
         self._planar_elems: Dict[int, str] = {}
@@ -6849,7 +6869,6 @@ class Converter:
         # load audit (see _audit_loads): steps loaded in the deck but not after conversion
         self.unloaded_steps: List[int] = []
         self.source_unloaded = False
-        self._stopped_steps: set = set()       # the steps ccx stops at (_no_analysis)
         # CPS4I / CPE4I written as C3D8I slabs (see _plan_incompatible_slabs): element -> its
         # plane problem ("stress" / "strain"), (2-D node, thickness) -> its top node, the
         # *SOLID SECTION cards they use -> (kind, material written for them), and the model
@@ -6871,10 +6890,8 @@ class Converter:
         self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> _cload_amp
         self._has_normal = False
         self._planar_beams = False                  # the deck's beams are 2-D (B21, B22, ...)
-        self._dl_memo: Dict[tuple, frozenset] = {}  # (_dl_faces)
         self._total_amps: set = set()               # the TIME=TOTAL TIME amplitudes' names
         self._amp_curves: Dict[str, Optional[AmplitudeCurve]] = {}   # name -> its curve
-        self._step_period: Optional[float] = 1.0    # the current step's (None: not known)
         # the general steps after Abaqus' linear perturbation steps (_pert_idx) that start from
         # the base state again (_plan_base_restore, _restore_base_states)
         self._restore_from: Dict[int, int] = {}     # step -> the last general step before it
@@ -6885,18 +6902,15 @@ class Converter:
         # _restore_pairs) -> None (the base state's) or the *FREQUENCY step whose BCs
         self._restore_bcs: Dict[int, Optional[int]] = {}
         # the static perturbation steps after another step, whose loads and BC values change
-        # the base state's (_restore_base_states adds them up), and the current step is one;
-        # ``_sp_temps``: the static perturbation steps with temperatures (the first one too),
-        # ``_sp_temp_dep``: a material depends on them
+        # the base state's (_restore_base_states adds them up; the current step is one:
+        # EmitState.sp_adds); ``_sp_temps``: the static perturbation steps with temperatures
+        # (the first one too), ``_sp_temp_dep``: a material depends on them
         self._sp_add: set = set()
         self._sp_temps: set = set()
         self._sp_temp_dep = False
-        self._sp_adds = False
         # the amplitudes (_sp_amplitudes, _plan_deck_facts)
         self._amp_curves: Dict[str, Optional[AmplitudeCurve]] = {}
-        self._restore_yields = False                # a material yields or creeps
-        self._eigen_since = False                   # ... and a *FREQUENCY step ran in ccx
-        self._yield_segv: set = set()               # the steps where ccx then segfaults (_yield_segfaults)
+        self._restore_yields = False                # a material yields or creeps (_yield_segfaults)
         # *MODAL DYNAMIC steps ccx starts from a deformed or moving model -> the step whose
         # end state that is, and those of them that keep the earlier loads (_plan_modal_starts)
         self._modal_moving: Dict[int, int] = {}
@@ -7578,7 +7592,7 @@ class Converter:
                 out.extend(self.emit.out_tp_cards)      # ccx: *TIME POINTS before any *STEP
                 self.emit.out_tp_cards = []
                 out.extend(self.handle_step(cards))
-                self._step_proc = None                  # (no step's after its *END STEP)
+                self.emit.proc = None                   # (no step's after its *END STEP)
             elif b.keyword in ("HEADING", "END STEP") or b.keyword in GEOM_KW:
                 continue
             elif b.keyword in HISTORY_ONLY_KW:       # (_move_between_cards moved the others)
@@ -11043,7 +11057,7 @@ class Converter:
     # ccx 2.23's plain *FREQUENCY keeps the removed elements of a *MODEL CHANGE, the gap status,
     # a nonlinear spring's tangent and a hyperelastic material's base tangent (without stress
     # stiffness, as Abaqus after a step without NLGEOM; a user material takes the same path);
-    # it loses the base temperatures (_base_heated, _tdep_material) and leaves contact pairs
+    # it loses the base temperatures (EmitState.base_heated, _tdep_material) and leaves contact pairs
     # out altogether, even surfaces that touch at the start (_freq_contact; all probed), as its
     # *BUCKLE does in any form (handle_step).
     # Damage, concrete, brittle cracking, hypoelasticity, field variables, general contact and
@@ -11248,7 +11262,7 @@ class Converter:
         read = self.emit.no in self._freq_read
         contact = self._freq_contact
         left = "the deck's PERTURBATION dropped" if given else "left out"
-        if not self._general_step_seen:
+        if not self.emit.step.general_before:
             if contact and not read and not self._initial_stresses:
                 if not given:
                     self.report.note("*STEP, PERTURBATION written on a first *FREQUENCY step with "
@@ -11282,7 +11296,8 @@ class Converter:
             else:
                 return given
             return False
-        temps = self._base_heated and self._tdep_material
+        heated, stressed = self.emit.base_heated, self._model_stressed or self.emit.base_stressed
+        temps = heated and self._tdep_material
         if self.emit.step.nlgeom:             # (Abaqus' NLGEOM in force in the base state)
             if read:
                 self.report.warn("*FREQUENCY step after an NLGEOM general step, whose eigenmodes a "
@@ -11317,8 +11332,7 @@ class Converter:
             self._reduces("base state of a *FREQUENCY step that modal / steady-state dynamics read")
             return False
         # an overclosure is resolved as an interference fit in the first general step (Abaqus)
-        if not (self._base_stressed or (self._expansion and self._base_heated) or
-                (contact and self._overclosed)):
+        if not (stressed or (self._expansion and heated) or (contact and self._overclosed)):
             if not given and temps:
                 self.report.note("*STEP, PERTURBATION written on a *FREQUENCY step after general "
                                  "steps without NLGEOM that only heat the model: Abaqus evaluates "
@@ -11335,8 +11349,7 @@ class Converter:
                                  "29.80 Hz vs 20.95 Hz).", once=True)
             return True
         # only an overclosure stresses the base: PERTURBATION is much closer (--approximate)
-        fit_only = contact and self._overclosed and not self._base_stressed and \
-            not (self._expansion and self._base_heated)
+        fit_only = contact and self._overclosed and not stressed and not (self._expansion and heated)
         if fit_only and not given and self._approx:
             self.report.warn("[APPROX] *STEP, PERTURBATION written on a *FREQUENCY step after "
                              "general steps without NLGEOM that resolve an initial overclosure as "
@@ -11395,7 +11408,7 @@ class Converter:
         why = ("ccx 2.23 takes the state that step left (a buckling load case's response, a modal "
                "step's end) as its base state (probed: a B32R column after a lateral buckling load "
                "case, frequencies 20 % and buckling factors 16 % low)")
-        if not self._general_step_seen and not (proc == "FREQUENCY" and self._freq_contact):
+        if not self.emit.step.general_before and not (proc == "FREQUENCY" and self._freq_contact):
             del params["PERTURBATION"]
             self.report.note(f"{what}: PERTURBATION dropped. No general step precedes it, so its "
                              f"base state is the initial one, to which PERTURBATION adds nothing "
@@ -11429,29 +11442,27 @@ class Converter:
                              f"plasticity and creep in a linear perturbation step and buckles with "
                              f"the base state's elastic stiffness.", once=True)
             self._reduces(f"*{proc} step with a plastic or creeping material (ccx 2.23 segfaults)")
-            self._yield_segv.add(k)
-        elif proc in ("STATIC", "VISCO") and not nlgeom and self._eigen_since:
+            self.emit.yield_segv.add(k)
+        elif proc in ("STATIC", "VISCO") and not nlgeom and self.emit.eigen_since:
             self.report.warn(f"Step {k} (*{proc}, no NLGEOM) after a *FREQUENCY step in a model "
                              f"with a plastic or creeping material: ccx 2.23 segfaults at its "
                              f"start (probed; it runs a *DYNAMIC or NLGEOM step there). Put the "
                              f"*FREQUENCY step after the last general step.", once=True)
             self._reduces(f"*{proc} step after a *FREQUENCY step with a plastic or creeping "
                           f"material (ccx 2.23 segfaults)")
-            self._yield_segv.add(k)
+            self.emit.yield_segv.add(k)
         if proc == "FREQUENCY":
-            self._eigen_since = True
+            self.emit.eigen_since = True
         elif proc == "DYNAMIC":
-            self._eigen_since = False
+            self.emit.eigen_since = False
 
     def handle_step(self, group: List[Block]) -> List[str]:
         step_block = group[0]
         inner = group[1:]
         cur = self.emit.next_step(self.steps)
         proc_block = cur.proc_card
-        proc = cur.proc or None
-        self._step_proc = proc
+        proc = self.emit.proc
         explicit = cur.explicit
-        self._general_step_seen = cur.general_before            # (_frequency_perturbation)
         # a procedure card after the step's own (Step.procedure): Abaqus rejects the deck,
         # ccx would run the later one; commented out (in the card loop)
         extra = [b for b in inner if b.keyword in STEP_PROCS and b is not cur.procedure]
@@ -11496,7 +11507,7 @@ class Converter:
                                      "the perturbation load case after the last general step or remove "
                                      "its loads in the next step (OP=NEW).", once=True)
                     self._reduces("*STEP, PERTURBATION on a static step that is not the last (its loads persist)")
-                elif self._general_step_seen:
+                elif cur.general_before:
                     self.report.warn("*STEP, PERTURBATION on a static step after the last general step "
                                      "dropped: ccx runs it as a general step that continues from the "
                                      "base state, while Abaqus linearizes about that base state and "
@@ -11580,15 +11591,13 @@ class Converter:
             # ccx's default here anyway; it makes ccx define its step ramp, which the
             # displacement BCs of this step use (_plan_default_amplitudes)
             params["AMPLITUDE"] = "STEP"
-        if proc == "BUCKLE" and "PERTURBATION" not in params and self._general_step_seen:
+        if proc == "BUCKLE" and "PERTURBATION" not in params and cur.general_before:
             params["PERTURBATION"] = None
             self.report.note("*STEP, PERTURBATION written on a *BUCKLE step after a general step: "
                              "Abaqus always buckles about the base state, its preload's stresses "
                              "included; ccx 2.23 without PERTURBATION buckles the unloaded structure "
                              "(probed: a column under a gravity preload, 6.11 vs 10.81).", once=True)
-        if proc == "BUCKLE":
-            self._buckle_preloaded[self.emit.no] = self._general_step_seen   # (_buckle_displacements)
-        if proc == "BUCKLE" and not self._general_step_seen and self._initial_stresses:
+        if proc == "BUCKLE" and not cur.general_before and self._initial_stresses:
             self.report.warn("*BUCKLE step with initial stresses and no general step before it: "
                              "Abaqus buckles about them (the initial conditions are its base "
                              "state), ccx 2.23 leaves them out there, with or without PERTURBATION "
@@ -11610,9 +11619,9 @@ class Converter:
         if not cur.perturbation:
             # its temperatures, loads and prescribed motion: the base state of the steps after
             # (_frequency_perturbation)
-            self._base_heated = self._base_heated or proc in TEMPERATURE_DOF_PROCS or \
+            self.emit.base_heated = self.emit.base_heated or proc in TEMPERATURE_DOF_PROCS or \
                 any(b.keyword == "TEMPERATURE" for b in inner)
-            self._base_stressed = self._base_stressed or any(
+            self.emit.base_stressed = self.emit.base_stressed or any(
                 desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword not in
                 ("TEMPERATURE", "CFLUX", "DFLUX", "DSFLUX", "FILM", "SFILM", "RADIATE", "SRADIATE")
                 for _, desc in _load_entries(b, user_loads=True))
@@ -11651,7 +11660,7 @@ class Converter:
             # ccx reaches none of the step's other cards: they stay as comments.  An *EL FILE
             # it carries in from an earlier step makes ccx 2.23 crash there (rc 11, both
             # builds, probed); an empty one ends it
-            self._stopped_steps.add(self.emit.no)
+            self.emit.stopped.add(self.emit.no)
             if proc is None:
                 proc_block = cur.procedure                  # (one ccx lacks, or none)
             cards = [b for b in inner if b is not proc_block and b.keyword != "END STEP" and
@@ -11664,18 +11673,16 @@ class Converter:
                  "*EL FILE"] if self.emit.no > 1 else []) + (
                 ["** abq2ccx: the step's other cards, which ccx does not reach:"] +
                 ["** " + x for x in rest] if rest else []) + ["*END STEP"]
-        self.emit.begin_step(self.emit.no in self._restore_from, self.emit.no in self._modal_held)
         # the step's time period, where a step-time amplitude ends (_load_later)
         rec = (merged_data_records(proc_block) or [[]])[0] if proc_block is not None else []
         try:
-            self._step_period = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
+            period = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
         except ValueError:
-            self._step_period = None
+            period = None
         if self.emit.no in self._pert_idx or (proc_block is not None and proc_block.has("RIKS")):
-            self._step_period = None
-        self._step_temp_dof = cur.temp_dof
-        self._buckle_loaded = cur.buckle_loaded
-        self._sp_adds = self.emit.no in self._sp_add     # (_op_new_load, _set_nodal_load)
+            period = None
+        self.emit.begin_step(self.emit.no in self._restore_from, self.emit.no in self._modal_held,
+                             self.emit.no in self._sp_add, period)
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
@@ -11702,7 +11709,6 @@ class Converter:
             self._hold_nodal_loads()
         self._merge_delay_cards(out)
         out.extend(self._anchored_output(step_block))  # Abaqus' default output, if any
-        self._step_temp_dof = None
         out.append("*END STEP")
         return out
 
@@ -13100,7 +13106,7 @@ class Converter:
         ccx card takes LOAD CASE."""
         if k == "REAL":
             return None
-        if self._step_proc != "STEADY STATE DYNAMICS":
+        if self.emit.proc != "STEADY STATE DYNAMICS":
             self.report.note(f"*{b.keyword}, IMAGINARY dropped (Abaqus reads it only in steady-state "
                              f"dynamics and matrix generation).", once=True)
             return None
@@ -13175,7 +13181,7 @@ class Converter:
                 del self.emit.cl_state[k]
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
-            if k == "OP" and (self._sp_adds or id(b) in self._op_new_drop):
+            if k == "OP" and (self.emit.sp_adds or id(b) in self._op_new_drop):
                 continue
             if k in ("OP", "AMPLITUDE", "TIME DELAY", "LOAD CASE", "SECTOR", "SUBMODEL", "STEP"):
                 keep[k] = v
@@ -13436,7 +13442,7 @@ class Converter:
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         if body or op_new:
             params = self._load_params(b, self._DLOAD_PARAMS)
-            if self._sp_adds:
+            if self.emit.sp_adds:
                 params.pop("OP", None)
         if op_new:
             self._dload_op_new("DLOAD")
@@ -15958,7 +15964,7 @@ class Converter:
                         f"of an earlier step, which ccx holds at the end value of the step-time "
                         f"amplitude {amp[0]} (one the converter cannot evaluate), and ccx keeps one "
                         f"amplitude per node and DOF")
-        if self._sp_adds and key in self.emit.nodal_loads and key not in self.emit.nodal_fresh and \
+        if self.emit.sp_adds and key in self.emit.nodal_loads and key not in self.emit.nodal_fresh and \
                 self.emit.nodal_loads[key][1] != amp:  # (_set_nodal_load adds it to the base state's)
             return ("it changes the base state's load of that kind there, which has another "
                     "amplitude (one whose value at the base state's end the converter cannot "
@@ -15980,7 +15986,7 @@ class Converter:
 
     def _op_new_load(self, b: Block) -> bool:
         """Whether a load card's OP=NEW removes the earlier loads.  Not in a static perturbation
-        step after another step (``_sp_adds``): its loads are its own perturbation of the base
+        step after another step (``EmitState.sp_adds``): its loads are its own perturbation of the base
         state, whose loads stay (Abaqus 2017: perturbation loads "must be defined completely
         within that step", none carries over between perturbation steps, and the base state's
         are no perturbation loads), while ccx would remove the base state's loads; the OP is
@@ -15989,7 +15995,7 @@ class Converter:
         OP=NEW does release the base state's BCs in Abaqus, and stays."""
         if b.uparam("OP") != "NEW" or id(b) in self._op_new_drop:     # (_plan_late_op_new)
             return False
-        if not self._sp_adds:
+        if not self.emit.sp_adds:
             return True
         what = "temperatures" if b.keyword == "TEMPERATURE" else "loads"
         self.report.note(f"*{b.keyword}, OP=NEW dropped in a static perturbation step: Abaqus "
@@ -16002,10 +16008,10 @@ class Converter:
                         amp: Optional[tuple]) -> None:
         """Record the nodal forces of a converted load (Abaqus semantics: a key given again in
         a later step replaces it, twice in one step adds up; no force removes it).  In a
-        static perturbation step after another step (``_sp_adds``) a load is a change of the
+        static perturbation step after another step (``EmitState.sp_adds``) a load is a change of the
         base state's: it adds to the base state's forces of the same key (held at their end
         values, plain: _hold_nodal_loads)."""
-        if key in self.emit.nodal_loads and (key in self.emit.nodal_fresh or self._sp_adds):
+        if key in self.emit.nodal_loads and (key in self.emit.nodal_fresh or self.emit.sp_adds):
             old = self.emit.nodal_loads[key][0]
             for nd, v in forces.items():
                 old[nd] = old.get(nd, 0.0) + v
@@ -16096,7 +16102,7 @@ class Converter:
         the converter cannot evaluate keep their amplitude."""
         frozen = False
         for k, (forces, amp) in list(self.emit.nodal_loads.items()):
-            end = held_factor(self._amp_curves.get(amp[0].upper()), amp[1], self._step_period) \
+            end = held_factor(self._amp_curves.get(amp[0].upper()), amp[1], self.emit.period) \
                 if self._step_amp(amp) else None
             if end is None:
                 continue
@@ -16190,7 +16196,7 @@ class Converter:
         name = amp[0]
         if not name or name in self._total_amps:
             return line, kept, amp
-        factor = held_factor(self._amp_curves.get(name), dict(kept).get("TIME DELAY"), self._step_period)
+        factor = held_factor(self._amp_curves.get(name), dict(kept).get("TIME DELAY"), self.emit.period)
         if factor is None:
             return None
         f = [x.strip() for x in line.split(",")]
@@ -16321,7 +16327,7 @@ class Converter:
         CENTRIF; ``what`` then has its direction / axis: _track_dloads) bodyadd's entry, (set
         as written, label, load case, the direction or point and axis as ccx compares them:
         BaseStateRestore.direction)."""
-        got = self._dl_memo.get(what)
+        got = self.emit.dl_memo.get(what)
         if got is not None:
             return got
         token, label, case = what[:3]
@@ -16340,7 +16346,7 @@ class Converter:
                     ccx_type(self.geom.elements[eids[0]][0]) in SHELL_TYPES:
                 label = "P1"
             got = frozenset((e, label, case) for e in eids) if eids else frozenset({(name, label, case)})
-        self._dl_memo[what] = got
+        self.emit.dl_memo[what] = got
         return got
 
     @staticmethod
@@ -16441,9 +16447,9 @@ class Converter:
         and *DSLOAD), ccx 2.23 keeps one value per face, which a later step's line replaces
         (probed: a pressure of 1 on a top face, then 2 on the same faces from another surface,
         gave 2 where Abaqus gives 3).  None of those in a static perturbation step after
-        another step (``_sp_adds``): its lines get the base state's value on their faces added
+        another step (``EmitState.sp_adds``): its lines get the base state's value on their faces added
         (_restore_base_states)."""
-        if not self.emit.dl_wiped and (not self.emit.dl_taken or self._sp_adds):
+        if not self.emit.dl_wiped and (not self.emit.dl_taken or self.emit.sp_adds):
             return []
         left = [((o, k, i), self._dl_faces(what), later) for o, st in self.emit.dl_state.items()
                 for k, entries in st.items() if (o, k) not in self.emit.dl_fresh
@@ -16535,9 +16541,9 @@ class Converter:
         step (_loads_again): Abaqus adds them up, ccx 2.23 keeps one value per node and DOF,
         which a later step's line replaces (probed: 1 on a node set, then 2 on one of its
         nodes gave that node 2, Abaqus 3).  None in a static perturbation step after another
-        step (``_sp_adds``): its lines get the base state's value added (_restore_base_states).
+        step (``EmitState.sp_adds``): its lines get the base state's value added (_restore_base_states).
         The converted loads' nodal forces share no node DOF with them (_nodal_load_clash)."""
-        if not self.emit.cl_taken or self._sp_adds:
+        if not self.emit.cl_taken or self.emit.sp_adds:
             return []
         left = [((k, i), nds, later) for k, entries in self.emit.cl_state.items()
                 if k not in self.emit.cl_fresh for i, (_, _, nds, later) in enumerate(entries)]
@@ -21518,24 +21524,25 @@ class Converter:
         linear buckling step, and no load it takes there stands in for it: nodal forces give
         other stresses, prescribed displacements (the same stresses in a static step) other
         factors (probed).  So that load is lost."""
-        if self._step_temp_dof:
-            return self._commented(b, f"*TEMPERATURE in a *{self._step_temp_dof} step: temperature "
+        step = self.emit.step                       # (a card of a step: emit_other comments
+        if step.temp_dof:                           # out one between steps, HISTORY_ONLY_KW)
+            return self._commented(b, f"*TEMPERATURE in a *{step.temp_dof} step: temperature "
                                       f"is degree of freedom 11 there, and Abaqus does not allow a "
                                       f"predefined temperature field in such a step (prescribe the "
                                       f"temperature with *BOUNDARY on DOF 11); ccx stops on the "
                                       f"card. Commented out.", reduces=False)
-        if self._step_proc == "BUCKLE":
+        if step.proc == "BUCKLE":
             return self._commented(b, "*TEMPERATURE in a *BUCKLE step: Abaqus scales the change of "
                                       "temperature from the base state with the buckling factor "
                                       "(thermal buckling); ccx 2.23 stops on temperature loading in "
                                       "a linear buckling step, and no load it takes there stands in "
                                       "for it. Commented out: ccx's buckling factors " +
-                                   ("are those of the step's other loads alone." if self._buckle_loaded
+                                   ("are those of the step's other loads alone." if step.buckle_loaded
                                     else "are meaningless, the step has no other load."),
                                    reduces="temperatures of a *BUCKLE step (thermal buckling load)")
         if b.has("USER"):
             return self._user_load_card(b)
-        if b.uparam("OP") == "NEW" and (self._sp_adds or id(b) in self._op_new_drop):
+        if b.uparam("OP") == "NEW" and (self.emit.sp_adds or id(b) in self._op_new_drop):
             self._op_new_load(b)                    # (the base state's temperatures stay)
             b = Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items() if k != "OP"), b.data)
         if b.has("FILE"):
@@ -24820,7 +24827,7 @@ class Converter:
             if not info["valued"]:
                 continue
             params = OrderedDict((k, v) for k, v in st.head.params.items() if k != "PERTURBATION")
-            if not self._buckle_preloaded.get(n, True):
+            if not self.steps.steps[n - 1].general_before:     # (its Step: one *STEP line each)
                 deck.set_keyword(st.head, params)
                 self.emit.rewrite_step(n, params)
                 self.report.note("*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed "
@@ -25068,7 +25075,7 @@ class Converter:
         src = step_load_audit(blocks, user_loads=True, abaqus=True)
         dst = step_load_audit(deck.blocks(), user_loads=False)
         self.source_unloaded = bool(src) and all(s == [] for s in src)
-        run = min(self._stopped_steps, default=len(src) + 1)
+        run = min(self.emit.stopped, default=len(src) + 1)
         self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1)
                                if s and d == [] and i < run]
         procs: List[Optional[str]] = []             # each step's procedure, counted as there:
@@ -27887,8 +27894,8 @@ class Converter:
         return {"cards": out, "elements": eids, "mass": rho * p.area, "planar": planar}
 
     def _reset_emission(self) -> None:
-        """The emission's state (EmitState: step cursor, NLGEOM, load bookkeeping), and its count
-        of dropped rotational BCs."""
+        """The emission's state (EmitState: step cursor, the step's facts, load bookkeeping), and
+        its count of dropped rotational BCs."""
         self.emit = EmitState()
         self._n_inactive_rot = self._n_inactive_rot_truss = 0
 
@@ -28087,9 +28094,8 @@ class Converter:
         self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
                                   and temperature_dependent(b) for b in blocks)
         self._expansion = any(b.keyword == "EXPANSION" for b in blocks)
-        self._base_heated = False
         model = itertools.takewhile(lambda b: b.keyword != "STEP", blocks)
-        self._base_stressed = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") not in
+        self._model_stressed = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") not in
                                   ("TEMPERATURE", "FIELD") for b in blocks) or \
             any(desc for b in model if b.keyword == "BOUNDARY"
                 for _, desc in _load_entries(b, user_loads=True))
