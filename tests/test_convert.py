@@ -5675,6 +5675,58 @@ def test_static_perturbation_step_applies_its_own_loads_only():
     assert "OP=NEW" not in body and "Static perturbation step" not in rep.text()
 
 
+def test_static_perturbation_values_change_the_base_state():
+    # Abaqus reads a static perturbation step's load and BC values as changes of the base
+    # state's ("not the total of the base state load plus the perturbation load"), ccx 2.23 a
+    # value on what the base state loads as its new value (probed).  So the base value is added
+    # to such a line, right after the general step and after other perturbation steps alike
+    model = MODAL.split("*Step")[0] + "*Nset, nset=N56\n5, 6\n*Nset, nset=N567\n5, 6, 7\n" \
+        "*Amplitude, name=A\n0., 0., 1., 1.\n"
+    g = ("*Step\n*Static\n*Cload\nN56, 2, 1.\n*Dload\n1, P2, 1.\nEALL, GRAV, 9.81, 0., 0., -1.\n"
+         "*Boundary\n7, 1, 1, 0.01\n7, 2, 2\n*End Step\n")
+    sp = ("*Step, perturbation\n*Static\n*Cload\nN567, 2, 0.5\n*Dload\n1, P2, 0.5\nEALL, GRAV, 1., 0., "
+          "0., -1.\nEALL, GRAV, 2., 1., 0., 0.\n*Boundary\n7, 1, 2, 0.02\n*End Step\n")
+    for between in ("", "*Step\n*Frequency\n3\n*End Step\n"):
+        body, conv, rep = convert_str(model + g + between + sp)
+        last = body.split("*STEP")[-1]
+        assert "\n*CLOAD\n5, 2, 1.5\n6, 2, 1.5\n7, 2, 0.5\n" in last, last
+        assert "\n*DLOAD\n1, P2, 1.5\nEALL, GRAV, 10.81, 0., 0., -1.\nEALL, GRAV, 2., 1., 0., 0.\n" in last
+        assert "\n*BOUNDARY\n7, 1, 1, 0.03\n7, 2, 2, 0.02\n" in last
+        assert "N56" not in last                     # (no base line given again under it)
+        assert f"Static perturbation step {2 + bool(between)}: Abaqus reads a load or BC value" in rep.text()
+        assert conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
+    # OP=NEW on a load card removes nothing there (the base state's loads stay, no perturbation
+    # step's carry over), so it goes; on *BOUNDARY it releases the base state's BCs and stays
+    g = "*Step\n*Static\n*Cload\n6, 2, 1.\n*Boundary\n7, 1, 1, 0.01\n*End Step\n"
+    sp = ("*Step, perturbation\n*Static\n*Cload, op=new\n6, 2, 0.5\n*Boundary, op=new\n1, 1, 3\n2, 2, 3\n"
+          "4, 3, 3\n7, 1, 1\n*End Step\n")
+    body, conv, rep = convert_str(model + g + sp)
+    assert body.split("*STEP")[2].startswith("\n*STATIC\n*CLOAD\n6, 2, 1.5\n*BOUNDARY, OP=new\n1, 1, 3\n"
+                                             "2, 2, 3\n4, 3, 3\n7, 1, 1, 0.01\n")
+    assert "*CLOAD, OP=NEW dropped in a static perturbation step" in rep.text()
+    assert len(conv.reduced_physics) == 1
+    body, _, _ = convert_str(model + g + "*Step\n*Frequency\n3\n*End Step\n" + sp)
+    assert _cloads(body)[2] == {(6, 2): 1.5}
+    # a converted traction on the same surface adds up too
+    body, _, _ = convert_str(model + "*Step\n*Static\n*Dsload\nS2, TRVEC, 2., 1., 0., 0.\n*End Step\n"
+                             "*Step, perturbation\n*Static\n*Dsload, op=new\nS2, TRVEC, 1., 1., 0., 0.\n"
+                             "*End Step\n")
+    cl = _cloads(body)
+    assert cl[0] and _close(cl[1], {k: 1.5 * v for k, v in cl[0].items()})
+    # what cannot be given so is warned about: a released base BC (its reaction goes in ccx), a BC
+    # on a DOF the base state leaves free, a value on an amplitude
+    for own, why in (("*Boundary, op=new\n1, 1, 3\n2, 2, 3\n4, 3, 3\n", "releases DOFs the base state holds"),
+                     ("*Boundary\n6, 2, 2\n", "prescribes DOFs the base state leaves free"),
+                     ("*Cload, amplitude=A\n6, 2, 0.5\n", "by a value the converter cannot add")):
+        _, conv, rep = convert_str(model + g + "*Step, perturbation\n*Static\n" + own + "*End Step\n")
+        assert "[WARNING] Static perturbation step 2 " in rep.text() and why in rep.text(), why
+        assert "static perturbation step not the base state plus its perturbation" in conv.reduced_physics
+    # before any general step, the note says what the step is (also when one follows it)
+    _, _, rep = convert_str(model + "*Step, perturbation\n*Static\n*Cload\n6, 2, 1.\n*End Step\n" * 2)
+    assert "*STEP PERTURBATION dropped on a static step before any general step" in rep.text()
+    assert "final perturbation" not in rep.text() and "Static perturbation step 2:" not in rep.text()
+
+
 def test_modal_dynamic_step_started_moving_is_flagged():
     # ccx 2.23 starts a *MODAL DYNAMIC step from rest only right after a *FREQUENCY (or *BUCKLE)
     # step, else from the displacements and velocities it holds (probed); Abaqus does not carry

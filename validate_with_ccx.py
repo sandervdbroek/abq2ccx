@@ -2815,6 +2815,21 @@ def static_pert_own_loads_deck(base=True, between=True):
     return text + "*STEP, PERTURBATION\n*STATIC\n*CLOAD\n6, 2, 1.\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
 
 
+def static_pert_adds_deck(between="", ref=False):
+    """modal_own_loads_deck's cube, its static step also prescribing node 7's x (0.01), then
+    ``between`` (steps) and a *STEP, PERTURBATION *STATIC step that changes each of those loads
+    by half (the *CLOAD under OP=NEW, which removes nothing in a perturbation step) and node
+    7's x by 0.02; ``ref``: one static step with the sums.  Abaqus reads a perturbation step's
+    values as changes of the base state's, so base state plus perturbation is that step."""
+    text = modal_own_loads_deck(True).replace("*NSET, NSET=N7\n7\n", "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n")
+    text = text[:text.index("*STEP\n*FREQUENCY")].replace("*END STEP\n", "*BOUNDARY\n7, 1, 1, 0.01\n*END STEP\n")
+    cards = ("*CLOAD{}\n6, 2, {}\n*DLOAD\n1, P2, {}\nEALL, GRAV, {}, 1., 0., 0.\n*DSLOAD\nSIDE, TRVEC, {}, "
+             "0., 0., 1.\n*BOUNDARY\n7, 1, 1, {}\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+    if ref:
+        return text[:text.index("*STEP")] + "*STEP\n*STATIC\n" + cards.format("", 1.5, 1.5, 1500., 1.5, 0.03)
+    return text + between + "*STEP, PERTURBATION\n*STATIC\n" + cards.format(", OP=NEW", 0.5, 0.5, 500., 0.5, 0.02)
+
+
 def ramped_rotation_deck(step, twin=False):
     """pert_frame_deck("bc") without its *FREQUENCY step: the frame's joint 9 (a ccx knot, its
     *TRANSFORM about z: local 1 = y) turned about local 1 and 3 by 0.01, then about local 1 to
@@ -6608,6 +6623,26 @@ def main():
                   f"DYNAMIC step with a *CLOAD and a traction, and a *STEP, PERTURBATION *STATIC step "
                   f"loading another node): its displacements are the ones without the frequency and "
                   f"modal dynamic steps ({err:.1e} apart, nodes moved {moved:.3g})")
+        failures += 0 if ok else 1
+    # the static perturbation step's values on what the base state loads (a *CLOAD, a pressure,
+    # gravity, a traction, a prescribed displacement): ccx 2.23 replaced the base values with
+    # them, the converter adds them up; right after the general step, and after *FREQUENCY
+    # (and a *MODAL DYNAMIC step with loads of its own), where the base state is given again
+    freq = "*STEP\n*FREQUENCY\n10\n*END STEP\n"
+    modal = modal_own_loads_deck(True)
+    modal = modal[modal.index("*STEP\n*MODAL DYNAMIC"):].replace("*NODE PRINT, NSET=N7\nU\n", "")
+    ref = review_run(static_pert_adds_deck(ref=True), "static_pert_adds_ref", dat_node_blocks)
+    for tag, between in (("", ""), ("_freq", freq), ("_modal", freq + modal)):
+        got = review_run(static_pert_adds_deck(between), "static_pert_adds" + tag, dat_node_blocks)
+        ok = bool(got and ref)
+        if ok:
+            err, moved = same([got, ref], -1)
+            ok = err < 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  static_pert_adds{tag} (a cube loaded statically by a "
+                  f"*CLOAD, a pressure, gravity, a traction and a prescribed displacement, "
+                  f"{'then ' + ('*FREQUENCY and *MODAL DYNAMIC' if 'MODAL' in between else '*FREQUENCY') + ', ' if between else ''}"
+                  f"then a *STEP, PERTURBATION *STATIC step changing each of them): its displacements "
+                  f"are the ones of a static step with the sums ({err:.1e} apart, nodes moved {moved:.3g})")
         failures += 0 if ok else 1
     # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
     # aborted after the step that held no body load (the converter writes a zero GRAV there)

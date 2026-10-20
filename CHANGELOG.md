@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Static perturbation values on what the base state loads** — Abaqus reads a `*STEP,
+  PERTURBATION` `*STATIC` step's load and BC values as changes of the base state's; ccx 2.23
+  took a value on a node DOF, face or body load that the base state also loads as its new
+  value (a cube: 0.022 off a response of 0.037). Such lines now get the base value added.
+  `OP=NEW` on a `*CLOAD`, `*DLOAD` or `*DSLOAD` there removes nothing in Abaqus, so it is
+  dropped (ccx removed the base state's loads). A BC on a DOF the base state leaves free, a
+  released base BC and a value on an amplitude cannot be added up: warned (reduced physics).
+
 ## 1.4.0 (October 2026)
 
 Steps as ccx 2.23 reads them: `OP=NEW` on loads and boundary conditions; buckling and frequency
