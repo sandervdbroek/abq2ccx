@@ -7162,6 +7162,130 @@ def test_kinematic_coupling_orientation():
     assert "ORIENTATION=ORI" not in body
 
 
+def _radius_block(ref, card, step="*Step\n*Static\n*Boundary\n1, 1, 3\n*End Step\n"):
+    """A 2 x 2 x 1 block of C3D8 (node 1 + i + 3 j + 9 z at (i, j, z); top face z = 1: nodes
+    10-18), node 100 at ``ref``, element surface TOPE (the top faces), node surface TOPS."""
+    nodes = "".join(f"{1 + i + 3 * j + 9 * z}, {i}., {j}., {z}.\n"
+                    for z in (0, 1) for j in range(3) for i in range(3))
+    elems = "".join(f"{1 + i + 2 * j}, " + ", ".join(str(1 + a + 3 * b + 9 * z) for z in (0, 1) for a, b in
+                                                    ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))) + "\n"
+                    for j in range(2) for i in range(2))
+    return ("*Node\n" + nodes + "100, " + ", ".join(map(str, ref)) + "\n*Element, type=C3D8, elset=EALL\n"
+            + elems + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Density\n1e-3\n*Surface, name=TOPE\nEALL, S2\n*Nset, nset=TOPN, generate\n10, 18, 1\n"
+            "*Surface, type=node, name=TOPS\nTOPN\n" + card + step)
+
+
+def test_coupling_influence_radius():
+    # ccx 2.23 ignores INFLUENCE RADIUS ('parameter not recognized') and couples the whole
+    # surface; Abaqus couples the nodes of a node surface within the radius of the reference
+    # node, and every node of each element-surface facet with a node within it (validate_with_ccx
+    # coupling_influence_radius_*)
+    kin = "*Coupling, constraint name=C, ref node=100, surface={s}, influence radius={r}\n*Kinematic\n"
+    corner = (0., 0., 1.2)                       # 0.2 above node 10; nodes 11 and 13 are 1.02 away
+    for surf, kept in (("TOPE", [10, 11, 13, 14]), ("TOPS", [10])):
+        body, conv, rep = convert_str(_radius_block(corner, kin.format(s=surf, r="0.5")))
+        card = f"*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE={surf}_RADIUS\n*KINEMATIC\n1, 3"
+        head = f"*SURFACE, NAME={surf}_RADIUS, TYPE=NODE\n"
+        assert card in body and sorted(map(int, body.split(head)[1].split("*")[0].split())) == kept
+        assert "INFLUENCE" not in "\n".join(_live(body)) and not conv.reduced_physics
+        assert "*COUPLING, *KINEMATIC with an INFLUENCE RADIUS" in rep.text()
+        # the blank-free spelling alike; in a *DYNAMIC deck the linear equations of the kept
+        # nodes (they coupled every node of the surface)
+        same, _, _ = convert_str(_radius_block(corner, kin.format(s=surf, r="0.5").replace(
+            "influence radius", "influenceradius")))
+        assert same == body
+        dyn, conv, _ = convert_str(_radius_block(corner, kin.format(s=surf, r="0.5"), KIN_DYN_STEP.format("")
+                                                 .replace("RP", "100")))
+        eqs = _equation_terms(dyn)
+        assert sorted({row[0][0] for row in eqs}) == kept and len(eqs) == 3 * len(kept)
+    # every facet has a node within the radius (the centre one): the whole surface, no new card
+    body, _, rep = convert_str(_radius_block((1., 1., 1.5), kin.format(s="TOPE", r="0.6")))
+    assert "SURFACE=TOPE\n*KINEMATIC" in body and "_RADIUS" not in body
+    assert "INFLUENCE RADIUS left out: Abaqus couples every node of the surface" in rep.text()
+    # no node within it: Abaqus takes the facet nearest the reference node (an element surface),
+    # which the converter does not find, or has none (a node surface): commented out, with its
+    # *KINEMATIC, also in a *DYNAMIC deck
+    for surf, why in (("TOPE", "couples the nodes of the facet nearest the reference node"),
+                      ("TOPS", "has none to couple")):
+        for step in ("*Step\n*Static\n*Boundary\n1, 1, 3\n*End Step\n", KIN_DYN_STEP.format("").replace("RP", "100")):
+            body, conv, rep = convert_str(_radius_block(corner, kin.format(s=surf, r="0.1"), step))
+            assert "** *COUPLING, CONSTRAINT NAME=C" in body and "** *KINEMATIC" in body
+            assert "*COUPLING" not in "\n".join(_live(body)) and "*KINEMATIC" not in "\n".join(_live(body))
+            assert why in rep.text() and conv.reduced_physics
+            assert not _equation_terms(body) and 100 not in conv._rb_rot
+    # a distributing coupling keeps its surface: warned where the radius leaves nodes out (Abaqus
+    # also weights them by the part of each facet within it)
+    dist = "*Coupling, constraint name=C, ref node=100, surface=TOPE, influence radius={r}\n*Distributing\n"
+    body, conv, rep = convert_str(_radius_block(corner, dist.format(r="0.5")))
+    assert "SURFACE=TOPE\n*DISTRIBUTING" in body and "INFLUENCE" not in "\n".join(_live(body))
+    assert "*DISTRIBUTING with an INFLUENCE RADIUS" in rep.text() and conv.reduced_physics
+    body, conv, rep = convert_str(_radius_block(corner, dist.format(r="9.")))
+    assert "INFLUENCE" not in "\n".join(_live(body)) and not conv.reduced_physics and rep.n_warnings == 0
+    # a radius that does not read: the whole surface, warned
+    body, _, rep = convert_str(_radius_block(corner, kin.format(s="TOPE", r="X")))
+    assert "SURFACE=TOPE\n*KINEMATIC" in body and "INFLUENCE RADIUS=X does not read as a number" in rep.text()
+
+
+# axes of the orientation: e1 = (0.6, 0.64, 0.48), e2 = (0, 0.6, -0.8), e3 = (-0.8, 0.48, 0.36)
+ORI_MIX = "*Orientation, name=OR1\n0.6, 0.64, 0.48, 0., 0.6, -0.8\n"
+ORI_MIX_AXES = ((0.6, 0.64, 0.48), (0., 0.6, -0.8), (-0.8, 0.48, 0.36))
+
+
+def test_kinematic_coupling_rotations_along_its_orientation():
+    # Abaqus couples rotations 4-6 about the axes of the coupling's ORIENTATION; the ties of
+    # knotted shell members took the global ones (validate_with_ccx.py
+    # kinematic_rotations_orientation_*: 1.6e-2 off the model turned into the local axes)
+    cpl = ("*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS, "
+           "orientation=OR1\n*Kinematic\n{d}\n")
+    legacy = "*Kinematic Coupling, ref node=100, orientation=OR1\nR, {d}\n"
+    stat = "*Step{}\n*Static\n*Boundary\n1, 1, 6\n4, 1, 6\n100, 1, 6\n*End Step\n"
+    dyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 6\n4, 1, 6\n100, 1, 6\n*End Step\n"
+    dense = S4 + "*Density\n1e-8\n"
+    e = ORI_MIX_AXES
+
+    def ties(body):
+        return [row for row in _equation_terms(body) if row[0][1] >= 4]
+    for deck, target in ((S4 + ORI_MIX + cpl.format(d="1, 5") + stat.format(""), (100, 4)),
+                         (S4 + ORI_MIX + legacy.format(d="1, 5") + stat.format(""), (100, 4)),
+                         (dense + ORI_MIX + cpl.format(d="1, 5") + dyn, None)):
+        body, conv, rep = convert_str(deck)
+        tgt, base = target or (conv._rb_rot[100], 1)          # the ROT NODE's DOFs 1-3 in a dynamic deck
+        rows = ties(body)
+        assert len(rows) == 4 and not conv.reduced_physics, rows
+        assert len({row[0][:2] for row in rows}) == 4 and all(row[0][2] == 1. for row in rows)
+        assert {n for row in rows for n, _, _ in row} <= {5, 6, tgt}
+        # the member turns with the reference node about e1 and e2, freely about e3
+        th = (0.05, -0.04, 0.03)
+        for slip, tied in ((e[2], False), (e[0], True), (e[1], True)):
+            val = {(tgt, base + k): th[k] for k in range(3)}
+            val.update({(n, 4 + k): th[k] + 0.01 * slip[k] for n in (5, 6) for k in range(3)})
+            res = max(abs(sum(c * val[(n, d)] for n, d, c in row)) for row in rows)
+            assert (res > 1e-4) == tied, (slip, res)
+    # a *KINEMATIC COUPLING card coupling a member's rotations over two lines: tied once
+    two, _, rep = convert_str(S4 + ORI_MIX + legacy.format(d="1, 4") + "R, 5, 5\n" + stat.format(""))
+    one, _, _ = convert_str(S4 + ORI_MIX + legacy.format(d="1, 5") + stat.format(""))
+    assert ties(two) == ties(one) and len(ties(two)) == 4 and "two rigid constraints" not in rep.text()
+    # all rotations: the orientation changes nothing
+    body, _, _ = convert_str(S4 + ORI_MIX + cpl.format(d="1, 6") + stat.format(""))
+    plain, _, _ = convert_str(S4 + cpl.format(d="1, 6").replace(", orientation=OR1", "") + stat.format(""))
+    assert ties(body) == ties(plain) and len(ties(body)) == 6
+    # a member rotation under a *BOUNDARY: the tie eliminates another DOF
+    body, _, rep = convert_str(S4 + ORI_MIX + cpl.format(d="1, 5") +
+                               stat.format("").replace("100, 1, 6\n", "100, 1, 6\n5, 5, 5\n"))
+    assert len(ties(body)) == 4 and all(row[0][:2] != (5, 5) for row in ties(body))
+    assert "Possible overconstraint" not in rep.text()
+    # axes not known (a cylindrical orientation), or NLGEOM (Abaqus turns the axes with the
+    # reference node): not tied, warned; --approximate ties them about the initial axes
+    cyl = "*Orientation, name=OR1, system=cylindrical\n0., 0., 0., 0., 0., 1.\n"
+    for deck, why in ((S4 + cyl + cpl.format(d="1, 5") + stat.format(""), "whose axes are not known"),
+                      (S4 + ORI_MIX + cpl.format(d="1, 5") + stat.format(", nlgeom"), "in a deck with NLGEOM")):
+        body, conv, rep = convert_str(deck)
+        assert not ties(body) and why in rep.text() and conv.reduced_physics
+    body, conv, rep = convert_str(S4 + ORI_MIX + cpl.format(d="1, 5") + stat.format(", nlgeom"), approximate=True)
+    assert len(ties(body)) == 4 and "[APPROX] Kinematic coupling of some rotations" in rep.text()
+
+
 def test_rigid_constraints_in_a_linear_dynamic_deck():
     # Abaqus linearizes rigid constraints in a geometrically linear analysis, but ccx turns
     # their RIGID MPCs with the finite rotation in a *DYNAMIC step even without NLGEOM (9 %

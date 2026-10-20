@@ -77,7 +77,9 @@ time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank 
 a part's pre-tension section and distributing coupling in turned instances, and a static step
 after a linear perturbation step (the state before it again; also a transformed beam joint's
 rotations and moments, a zero BC ramped in a *DYNAMIC step and a JOIN off a beam node, against
-the same decks without the perturbation step's BC or the *TRANSFORM).
+the same decks without the perturbation step's BC or the *TRANSFORM), a coupling's INFLUENCE
+RADIUS against the coupling on the nodes within it, and rotations coupled in an ORIENTATION's
+axes against the model turned into them.
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -2194,6 +2196,81 @@ def kinematic_dynamic_deck(dofs="1, 3", nlgeom=False, proc="dynamic", member_bc=
                                                  f"{r}, 5, 5\n{r}, 6, 6, 0.2\n" for r in refs) +
             "".join(f"*NODE PRINT, NSET={p}MID\nU\n*NODE PRINT, NSET={p}TOP\nU\n" for p in pre) +
             "*END STEP\n")
+
+
+def influence_radius_deck(surface="element", proc="static", nodes=None):
+    """A 4 x 4 x 1 block of C3D8 held at its bottom (top face z = 1: nodes 26-50 on a grid of 1),
+    its top face coupled (*COUPLING, *KINEMATIC) to node 100 above its centre at (2, 2, 1.5)
+    with INFLUENCE RADIUS=0.8, which holds the centre node 38 only: Abaqus couples that node of
+    the node surface (``surface`` 'node'), and every node of the four element faces around it
+    ('element': INFLUENCE_KEPT).  Node 100 moves -0.1 along z and turns 0.05 about x over a slow
+    ``proc`` step (static or dynamic).  ``nodes``: the coupling on a node surface of these nodes,
+    without the radius (DOFs 1-3 written out: ccx's empty *KINEMATIC couples nothing)."""
+    nid, lines = {}, ["*NODE"]
+    for z in (0, 1):
+        for j in range(5):
+            for i in range(5):
+                nid[(i, j, z)] = len(nid) + 1
+                lines.append(f"{nid[(i, j, z)]}, {i}., {j}., {z}.")
+    lines += ["100, 2., 2., 1.5", "*ELEMENT, TYPE=C3D8, ELSET=EALL"]
+    for j in range(4):
+        for i in range(4):
+            lines.append(f"{1 + i + 4 * j}, " + ", ".join(str(nid[(a, b, z)]) for z in (0, 1) for a, b in
+                                                         ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))))
+    lines += ["*NSET, NSET=BOT, GENERATE", "1, 25, 1", "*NSET, NSET=TOPN, GENERATE", "26, 50, 1",
+              "*NSET, NSET=NALL, GENERATE", "1, 50, 1", "*SOLID SECTION, ELSET=EALL, MATERIAL=M",
+              "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*DENSITY", "1e-3"]
+    if nodes:
+        lines += ["*SURFACE, NAME=ST, TYPE=NODE"] + [str(n) for n in nodes] + [
+                  "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=ST", "*KINEMATIC", "1, 3"]
+    else:
+        lines += ["*SURFACE, NAME=ST", "EALL, S2"] if surface == "element" else \
+            ["*SURFACE, NAME=ST, TYPE=NODE", "TOPN"]
+        lines += ["*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=ST, INFLUENCE RADIUS=0.8",
+                  "*KINEMATIC"]
+    step = {"static": "*STATIC\n0.1, 1.", "dynamic": "*DYNAMIC\n0.01, 1."}[proc]
+    lines += ["*AMPLITUDE, NAME=R", "0., 0., 1., 1.", "*STEP, INC=1000", step, "*BOUNDARY",
+              "BOT, 1, 3", "*BOUNDARY, AMPLITUDE=R", "100, 1, 2", "100, 3, 3, -0.1", "100, 4, 4, 0.05",
+              "100, 5, 6", "*NODE PRINT, NSET=NALL", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+INFLUENCE_KEPT = {"element": (32, 33, 34, 37, 38, 39, 42, 43, 44), "node": (38,)}
+# the axes of a coupling orientation: e1 = (0.6, 0.64, 0.48), e2 = (0, 0.6, -0.8), e3 = e1 x e2
+ROT_FRAME = ((0.6, 0.64, 0.48), (0., 0.6, -0.8), (-0.8, 0.48, 0.36))
+
+
+def coupled_rotations_deck(proc="static", legacy=False, turned=False):
+    """A strip of four S4 (x 0..4, y 0..1) clamped at x = 0, its tip edge (nodes 5, 15)
+    kinematically coupled to node 100 at (4.5, 0.5, 0) in DOFs 1-5 of *ORIENTATION OR1
+    (ROT_FRAME): rotations about its axes 1 and 2 coupled, about 3 free.  Node 100 moves
+    (0.02, 0, 0.1) and turns (0.05, -0.04, 0.03) over a slow ``proc`` step (static or dynamic),
+    a smooth step.
+    ``legacy``: a *KINEMATIC COUPLING card; ``turned``: the model turned into the orientation's
+    axes (x' = R x, R's rows ROT_FRAME), coupled in global DOFs 1-5, which are those axes."""
+    R = ROT_FRAME if turned else ((1., 0., 0.), (0., 1., 0.), (0., 0., 1.))
+
+    def rot(v):
+        return ", ".join(f"{sum(R[i][k] * v[k] for k in range(3)):.15g}" for i in range(3))
+    nodes = {n: (float(i), float(y), 0.) for i in range(5) for n, y in ((1 + i, 0), (11 + i, 1))}
+    lines = ["*NODE"] + [f"{n}, {rot(x)}" for n, x in sorted(nodes.items())] + ["100, " + rot((4.5, 0.5, 0.))]
+    lines += ["*ELEMENT, TYPE=S4, ELSET=EALL"] + [f"{1 + i}, {1 + i}, {2 + i}, {12 + i}, {11 + i}" for i in range(4)]
+    lines += ["*NSET, NSET=NALL", ", ".join(map(str, sorted(nodes))), "*NSET, NSET=TIP", "5, 15",
+              "*SHELL SECTION, ELSET=EALL, MATERIAL=M", "0.1", "*MATERIAL, NAME=M", "*ELASTIC",
+              "1000., 0.3", "*DENSITY", "1e-8"]
+    o = "" if turned else ", ORIENTATION=OR1"
+    if not turned:
+        lines += ["*ORIENTATION, NAME=OR1", "0.6, 0.64, 0.48, 0., 0.6, -0.8"]
+    lines += [f"*KINEMATIC COUPLING, REF NODE=100{o}", "TIP, 1, 5"] if legacy else \
+        ["*SURFACE, TYPE=NODE, NAME=ST", "TIP", f"*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=ST{o}",
+         "*KINEMATIC", "1, 5"]
+    step = {"static": "*STATIC\n0.1, 1.", "dynamic": "*DYNAMIC\n0.01, 1."}[proc]
+    u0, th = rot((0.02, 0., 0.1)).split(", "), rot((0.05, -0.04, 0.03)).split(", ")
+    lines += ["*AMPLITUDE, NAME=R, DEFINITION=SMOOTH STEP", "0., 0., 1., 1.", "*STEP, INC=1000", step,
+              "*BOUNDARY", "1, 1, 6",
+              "11, 1, 6", "*BOUNDARY, AMPLITUDE=R"] + [f"100, {k + 1}, {k + 1}, {u0[k]}" for k in range(3)] + \
+        [f"100, {k + 4}, {k + 4}, {th[k]}" for k in range(3)] + ["*NODE PRINT, NSET=NALL", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
 
 
 # member kind -> (reference node position, its translation, its rotation, free nodes)
@@ -5588,6 +5665,64 @@ def main():
                   f"({why})" + (f", node 9 {held:.2f} along z" if "member_bc" in kw else ""))
         elif u:
             print(f"FAIL  {tag}: the static reference did not solve ({status})")
+        failures += 0 if ok else 1
+    # a coupling's INFLUENCE RADIUS (ccx ignores it: the whole face followed node 100), against
+    # ccx's own coupling on a node surface of the nodes Abaqus couples in a static step; the
+    # face's corners lie outside it and move freely
+    x0, u0, th = (2., 2., 1.5), (0., 0., -0.1), (0.05, 0., 0.)
+    src = os.path.join(tmp, "coupling_influence_radius_ref.inp")
+    for proc in ("static", "dynamic"):
+        for surface in ("element", "node"):
+            tag = f"coupling_influence_radius_{proc}_{surface}"
+            u = review_run(influence_radius_deck(surface, proc), tag, dat_displacements)
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(influence_radius_deck(nodes=INFLUENCE_KEPT[surface]))
+            d, status, out = run_ccx(ccx, env, src)
+            ref = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+            shutil.rmtree(d, ignore_errors=True)
+            ok = bool(u) and set(ref) == set(range(1, 51))
+            if ok:
+                def rigid(n):          # node n (on the top face) moved rigidly with node 100
+                    p = ((n - 26) % 5 - x0[0], (n - 26) // 5 - x0[1], 1. - x0[2])
+                    return [u0[0] + th[1] * p[2] - th[2] * p[1], u0[1] + th[2] * p[0] - th[0] * p[2],
+                            u0[2] + th[0] * p[1] - th[1] * p[0]]
+                scale = max(math.hypot(*v) for v in ref.values())
+                err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
+                held = max(math.dist(u[n], rigid(n)) for n in INFLUENCE_KEPT[surface]) / scale
+                free = min(math.dist(u[n], rigid(n)) for n in (26, 30, 46, 50)) / scale
+                ok = err < 1e-3 and held < 1e-9 and free > 0.1
+                print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top {surface} surface coupled "
+                      f"to a node above its centre within an INFLUENCE RADIUS of 0.8, the node moving "
+                      f"and turning over a slow {proc} step): 50 node displacements vs ccx's coupling "
+                      f"on the {len(INFLUENCE_KEPT[surface])} node(s) Abaqus couples in a static step, "
+                      f"max difference {err:.1e} of max |u|; those follow the node rigidly ({held:.0e}), "
+                      f"the face's corners moved {free:.2f} of max |u| off it (before: the whole face did)")
+            elif u:
+                print(f"FAIL  {tag}: the reference did not solve ({status})")
+            failures += 0 if ok else 1
+    # rotations coupled about the axes of a coupling's ORIENTATION (the knotted shell members'
+    # ties took the global axes), against the model turned into those axes, whose global ties
+    # the converter writes (validated by the shell checks above), in the same step (ccx turns
+    # its knots with the finite rotation in a *DYNAMIC step: 6e-3 off a static one here)
+    refs = {proc: review_run(coupled_rotations_deck(proc, turned=True),
+                             f"coupled_rotations_orientation_{proc}_ref", dat_displacements)
+            for proc in ("static", "dynamic")}
+    for proc, legacy in (("static", False), ("dynamic", False), ("static", True)):
+        tag = f"coupled_rotations_orientation_{proc}" + ("_legacy" if legacy else "")
+        u, ref = review_run(coupled_rotations_deck(proc, legacy), tag, dat_displacements), refs[proc]
+        ok = bool(u) and bool(ref) and set(ref) <= set(u)
+        if ok:
+            back = {n: [sum(ROT_FRAME[k][i] * v[k] for k in range(3)) for i in range(3)] for n, v in ref.items()}
+            scale = max(math.hypot(*v) for v in back.values())
+            err = max(math.dist(u[n], back[n]) for n in back) / scale
+            moved = min(math.hypot(*u[n]) for n in (2, 3, 4, 12, 13, 14)) / scale
+            ok = err < 1e-3 and moved > 0.05
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a shell strip's tip edge coupled in DOFs 1-5 "
+                  f"of an oblique *ORIENTATION" + (", a *KINEMATIC COUPLING card" if legacy else "") +
+                  f", to a node that moves and turns over a slow {proc} step): 10 node displacements "
+                  f"vs the model turned into the orientation's axes, max difference "
+                  f"{err:.1e} of max |u| (ties about the global axes: 1.2e-2 to 1.6e-2); the free nodes "
+                  f"moved {moved:.2f} of it")
         failures += 0 if ok else 1
     # rigid constraints in a linear *DYNAMIC step (ccx turns its RIGID MPCs with the finite
     # rotation there: 3-7 % off), against the linear rigid motion prescribed in a *STATIC step;

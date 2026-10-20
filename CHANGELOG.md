@@ -6,6 +6,18 @@ physics.
 
 ## Unreleased
 
+* **Coupling `INFLUENCE RADIUS=`** — ccx 2.23 ignores the parameter and coupled the whole
+  surface. Abaqus couples the nodes of a node surface within the radius of the reference node,
+  and every node of each element face with a node within it. A kinematic coupling now gets a
+  node surface of those nodes (its linear equations in a `*DYNAMIC` deck cover only them); with
+  none within the radius it is commented out, with a warning. A distributing coupling keeps its
+  surface, warned where the radius leaves nodes out.
+* **Coupled rotations along a coupling `ORIENTATION=`** — the rotations of knotted shell and
+  beam members were tied about the global axes where only some rotations are coupled (1.6 %
+  off a model turned into the orientation's axes). They are now tied about the orientation's
+  axes; an orientation whose axes are not known, or NLGEOM (Abaqus turns the axes with the
+  reference node), leaves them free, with a warning (`--approximate` ties them about the
+  initial axes under NLGEOM).
 * **Blank data fields read as 0, in place** — Abaqus reads a blank field as 0; the converter
   dropped it and read the later fields one place early. An `*ORIENTATION` line
   `0., 1., , -1., 0., 0.` made ccx exit, others gave other axes. A blank `*TRANSFORM` field left
