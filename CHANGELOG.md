@@ -43,6 +43,11 @@ physics.
   no longer kept for temperatures of temperature-independent materials, or for `*FIELD`.
   Before a modal or steady-state dynamics step, which refuses perturbation eigenmodes, the
   deck's own `PERTURBATION` is dropped (warned, reduced physics): ccx stopped there.
+* **Rotational BCs on new midside nodes with a `*TRANSFORM`** — the midside node the
+  converter adds to an upgraded beam (B31 under `SECTION=CIRC`, `PIPE`, `BOX`) or composite
+  shell edge (S4 → S8R) takes its end nodes' BCs. Its rotations stayed in local components
+  where the end nodes' took the global form, which ccx got wrong (21-37 % off). The midside
+  node is now converted as its end nodes are.
 * **Rotational BCs on `*TRANSFORM` nodes in ramped steps** — where Abaqus ramps a displacement
   BC without AMPLITUDE and ccx would step it (implicit `*DYNAMIC`, `*VISCO`, transient coupled
   steps, `*STEP, AMPLITUDE=STEP`), a rotational BC on a transformed knot or kinematic reference

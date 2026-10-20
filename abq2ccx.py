@@ -10558,13 +10558,14 @@ class Converter:
                    whole: bool = False) -> Dict[int, List[Tuple[int, float]]]:
         """(DOF, value) per node of ``nodes`` that the *BOUNDARY or *CLOAD ``b`` gives on DOFs
         4-6, as handle_boundary / handle_cload emit the card (a named BC type: zero on its
-        rotations, where it has them; a value that does not read as a number: NaN): a card
-        _plan_default_amplitudes split (unless ``whole``) as its pieces give them on the
-        card's own nodes (an explicit step's value on a DOF at rest is zero)."""
+        rotations, where it has them; a value that does not read as a number: NaN; a
+        *BOUNDARY's midside lines too, _midside_records): a card _plan_default_amplitudes
+        split (unless ``whole``) as its pieces give them on the card's nodes (an explicit
+        step's value on a DOF at rest is zero)."""
         out: Dict[int, List[Tuple[int, float]]] = {}
         pieces = [] if whole else [p for p in self._amp_cards.get(id(b), ()) if isinstance(p, Block)]
         if pieces:
-            mine = set(self._rot_items(b, nodes, True))      # not the midside nodes they add
+            mine = set(self._rot_items(b, nodes, True))
             for p in pieces:
                 for n, its in self._rot_items(p, mine).items():
                     out.setdefault(n, []).extend(its)
@@ -10584,7 +10585,10 @@ class Converter:
                         if n in nodes:
                             out.setdefault(n, []).append((d, num(f[2] if len(f) > 2 else "")))
             return out
-        for rec in self._bc_card_records(b):
+        recs = self._bc_card_records(b)
+        if self._piece_src.get(id(b)) not in self._amp_cards:     # (those pieces carry theirs)
+            recs = list(recs) + [ln.split(",") for ln in self._midside_records(b, "boundary")]
+        for rec in recs:
             g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
                 continue

@@ -2606,6 +2606,25 @@ def knot_offset_deck(twin=False):
             "*NODE PRINT, NSET=FREE\nU\n*END STEP\n")
 
 
+def midside_rotation_deck(twin=False):
+    """A B31 cantilever along x (SECTION=CIRC, written as 3-node beams with midside nodes
+    6-9), clamped at node 1, pinned at node 5; nodes 4 and 5, with a *TRANSFORM turned 30 deg
+    about z, turned about local 1 by 0.01 and 0.02 and about local 2 by 0.005, as is the
+    midside node 9 between them (interpolated); ``twin``: without the *TRANSFORM, the BCs in
+    global components."""
+    c, s = math.cos(math.radians(30.)), 0.5
+    text = ("*NODE\n" + "".join(f"{i + 1}, {i * 0.5!r}, 0., 0.\n" for i in range(5)) +
+            "*ELEMENT, TYPE=B31, ELSET=B\n" + "".join(f"{i}, {i}, {i + 1}\n" for i in range(1, 5)) +
+            "*NSET, NSET=FREE\n2, 3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=CIRC\n0.05\n"
+            "0., 0., 1.\n*MATERIAL, NAME=M\n*ELASTIC\n2.1e5, 0.3\n*BOUNDARY\n1, 1, 6\n5, 1, 3\n" +
+            ("" if twin else f"*NSET, NSET=TR\n4, 5\n*TRANSFORM, NSET=TR\n{c!r}, {s}, 0., {-s}, {c!r}, 0.\n") +
+            "*STEP\n*STATIC\n*BOUNDARY\n")
+    for n, a in ((4, 0.01), (5, 0.02)):
+        text += (f"{n}, 4, 4, {a * c - 0.005 * s!r}\n{n}, 5, 5, {a * s + 0.005 * c!r}\n" if twin else
+                 f"{n}, 4, 4, {a!r}\n{n}, 5, 5, 0.005\n")
+    return text + "*NODE PRINT, NSET=FREE\nU\n*END STEP\n"
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded 1e5 down at its top centre (node set TIP) in a *STEP,
@@ -6127,8 +6146,9 @@ def main():
     failures += 0 if ok else 1
 
     # a rotational BC on a transformed knot node in a card the step ramp splits (it was left out),
-    # and on a shell node ccx makes no knot as one section has OFFSET=0. and the other none (it
-    # was written in global components, which ccx read in the local axes)
+    # on a shell node ccx makes no knot as one section has OFFSET=0. and the other none (it
+    # was written in global components, which ccx read in the local axes), and on an upgraded
+    # beam's midside node (kept in the local axes, where ccx's MPCs clash: 21 % off)
     for tag, decks, what in (
             ("ramped_rotation_dynamic", [ramped_rotation_deck("*DYNAMIC", t) for t in (False, True)],
              "a B31 frame's joint with a *TRANSFORM turned about local 1 and 3 by BCs without "
@@ -6137,7 +6157,10 @@ def main():
              "the same in two *STEP, AMPLITUDE=STEP *STATIC steps"),
             ("knot_offset", [knot_offset_deck(t) for t in (False, True)],
              "two S4 plates, one section with OFFSET=0., their shared node with a *TRANSFORM "
-             "turned about local 1")):
+             "turned about local 1"),
+            ("midside_rotation", [midside_rotation_deck(t) for t in (False, True)],
+             "a CIRC B31 cantilever's last element written as a 3-node beam, its ends with a "
+             "*TRANSFORM turned about local 1 and 2, its midside node too")):
         runs = [review_run(text, tag + ("" if k == 0 else "_ref"), dat_node_blocks)
                 for k, text in enumerate(decks)]
         ok = all(runs)

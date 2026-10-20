@@ -7677,6 +7677,46 @@ def test_transformed_rotations_on_a_card_the_step_ramp_splits():
         f"{RAMP}\n2, 2, 2, 0.01\n" in two and "OP=NEW" not in two.replace("OP=NEW dropped", "")
 
 
+def test_transformed_rotations_on_an_upgraded_beams_midside_node():
+    # the midside node of an upgraded beam takes its ends' *TRANSFORM and their BC lines,
+    # interpolated (_midside_records), and is planned as they are: before, its local lines
+    # stayed mean-rotation MPCs, which clash for several rotations (probed: 21-30 % off),
+    # while its ends took the global form
+    about_z = "0.8660254, 0.5, 0., -0.5, 0.8660254, 0."
+    e = _axes_rect((0.8660254, 0.5, 0.), (-0.5, 0.8660254, 0.))
+    deck = _transformed(CIRC_BEAM + "*Boundary\n1, 1, 6\n*Step\n*Static\n*Boundary\n2, 4, 5, 0.01\n"
+                        "3, 4, 4, 0.02\n3, 5, 5, 0.01\n*End Step\n", "2, 3", about_z)
+    body, conv, rep = convert_str(deck)
+    assert conv._rot_mode == {2: "global", 3: "global", 5: "global"} and list(conv._knots) == [2, 3, 5]
+    mid = {int(l.split(",")[1]): float(l.split(",")[3]) for l in _bc_lines(body) if l.startswith("5,")}
+    assert _close(mid, {4 + k: 0.015 * e[0][k] + 0.01 * e[1][k] for k in range(2)}, 1e-10)
+    # a card the step ramp splits: the midside node's lines go with the ramped piece, once
+    body, _, _ = convert_str(deck.replace("*Step\n", "*Step, amplitude=STEP\n").replace(
+        "3, 4, 4, 0.02\n", "2, 3, 3\n3, 4, 4, 0.02\n"))
+    one = _step(body, 1)
+    assert f"*BOUNDARY\n2, 3, 3\n{RAMP}\n3, 4, 4, " in one and one.count("\n5, ") == 2
+    assert one.split(RAMP)[2].count("\n5, 4, 4, 0.00799") == 1
+    # one local rotation on a node ccx makes no knot (a PIPE section): kept, ends and midside
+    pipe = deck.replace("section=CIRC\n0.05", "section=PIPE\n0.05, 0.01").replace(
+        "2, 4, 5, 0.01\n3, 4, 4, 0.02\n3, 5, 5, 0.01\n", "2, 4, 4, 0.01\n3, 4, 4, 0.02\n")
+    body, conv, _ = convert_str(pipe)
+    assert conv._rot_mode == {2: "keep", 3: "keep", 5: "keep"} and not conv._knots
+    assert "5,4,4,0.015" in _bc_lines(body)
+    # a composite shell edge's midside node (S4 -> S8R) on a fold, a ccx knot: global too
+    # (before: local, which ccx reads about the global axes there; probed: 37 % off)
+    fold = _transformed("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+                        "5, 1., 0., 1.\n6, 1., 1., 1.\n*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n"
+                        "2, 2, 5, 6, 3\n*Shell Section, elset=E, composite\n0.05, 3, M, 0.\n"
+                        "0.05, 3, M, 90.\n*Material, name=M\n*Elastic\n1000., 0.3\n*Boundary\n"
+                        "1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Boundary\n2, 4, 5, 0.01\n3, 4, 5, 0.01\n"
+                        "*End Step\n", "2, 3", about_z)
+    body, conv, _ = convert_str(fold)
+    m = next(m for a, c, m, _ in conv._between() if {a, c} == {2, 3})
+    assert conv._rot_mode == {2: "global", 3: "global", m: "global"}
+    mid = {int(l.split(",")[1]): float(l.split(",")[3]) for l in _bc_lines(body) if l.startswith(f"{m},")}
+    assert _close(mid, {4 + k: 0.01 * (e[0][k] + e[1][k]) for k in range(2)}, 1e-10)
+
+
 def test_transformed_shell_node_rotations():
     # a shell node that is no knot: ccx's mean-rotation MPCs in the local axes are exact for
     # its BCs (two at most) and one or two moment components (probed): kept
