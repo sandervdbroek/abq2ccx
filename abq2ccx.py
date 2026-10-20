@@ -4018,6 +4018,12 @@ PERTURBATION_PROCS = {"FREQUENCY", "BUCKLE", "COMPLEX FREQUENCY", "MODAL DYNAMIC
 PERIOD_PROCS = {"STATIC", "GEOSTATIC", "DYNAMIC", "VISCO", "HEAT TRANSFER", "SOILS",
                 "COUPLED TEMPERATURE-DISPLACEMENT", "UNCOUPLED TEMPERATURE-DISPLACEMENT",
                 "MODAL DYNAMIC"}
+# How ccx 2.23 reads that field of the procedures it runs in time, as written (ccx_period;
+# probed): (no data line, a blank field, zero); None: ccx stops ("step size is nonpositive",
+# "definition not complete").  A negative one stops it too, but in *VISCO, which runs it
+CCX_PERIODS = {"STATIC": (1.0, 1.0, 1.0), "DYNAMIC": (1.0, None, None), "VISCO": (0.0, 0.0, 0.0),
+               "HEAT TRANSFER": (1.0, 0.0, 0.0), "COUPLED TEMPERATURE-DISPLACEMENT": (1.0, 0.0, 0.0),
+               "UNCOUPLED TEMPERATURE-DISPLACEMENT": (1.0, 0.0, 0.0), "MODAL DYNAMIC": (None, 1.0, 1.0)}
 # The Abaqus procedures in which an element's mass gives inertia (its mass matrix), and the
 # *DLOAD labels of mass-proportional loads (StepModel.inertia, mass_loads, mass_acts).
 # Abaqus/Standard's transient *COUPLED TEMPERATURE-DISPLACEMENT neglects inertia.
@@ -4828,6 +4834,30 @@ def abaqus_period(card: Optional[Block], perturbation: bool) -> Optional[float]:
     return period if period > 0.0 else None
 
 
+def ccx_period(card: Optional[Block]) -> Optional[float]:
+    """The step time ccx 2.23 runs a step over whose procedure card (step_procedure) is ``card``
+    as written (Step.ccx_period): its step-time amplitudes', and what it adds to its total time
+    (probed: the total time after each step is their sum), in a linear perturbation step too
+    (Abaqus adds none: _shift_total_time).  The 2nd field as CCX_PERIODS reads it (a Riks step's
+    as a plain *STATIC's: --approximate); 0 for a procedure without time (*FREQUENCY, *BUCKLE,
+    steady-state dynamics) or one ccx lacks (it stops there); None where ccx stops at the field."""
+    if card is None or card.keyword not in CCX_PERIODS:
+        return 0.0
+    missing, blank, zero = CCX_PERIODS[card.keyword]
+    recs = merged_data_records(card)
+    if not recs:
+        return missing
+    if len(recs[0]) < 2 or not recs[0][1]:
+        return blank
+    try:
+        period = pf(recs[0][1])
+    except ValueError:
+        return None
+    if period == 0.0:
+        return zero
+    return period if period > 0.0 or card.keyword == "VISCO" else None
+
+
 def _nlgeom_given(b: Block) -> Optional[bool]:
     """NLGEOM= on *STEP ``b``: True for NLGEOM / NLGEOM=YES, False for NLGEOM=NO, None if absent."""
     return (b.param("NLGEOM") or "YES").strip().upper() != "NO" if b.has("NLGEOM") else None
@@ -4885,14 +4915,16 @@ class Step:
     lc2_repeats: bool             # they hold what the step's LOAD CASE=1 cards hold in ccx (the Abaqus/
                                   # CAE default): the same lines, and both or neither with OP=NEW (or
                                   # no BC in force before the step)
-    # its time in Abaqus, every reader's (the motion below, the held end of a step-time
-    # amplitude: EmitState.period, BaseStateRestore, the deck's amp_span):
+    # its time, Abaqus' (the motion below, the held end of a step-time amplitude:
+    # EmitState.period, BaseStateRestore, the deck's amp_span) and ccx's:
     period: Optional[float]       # Abaqus' time period, over which the step and its step-time
                                   # amplitudes run (abaqus_period; None: none, or unknown)
     advance: Optional[float]      # the time it adds to Abaqus' total time: period, 0 in a linear
                                   # perturbation step (None when unknown)
     t_start: Optional[float]      # Abaqus' total time at its start: the earlier steps' advance (None
                                   # once one is unknown)
+    ccx_period: Optional[float]   # ccx 2.23's: the time it runs the written step over and adds to its
+                                  # total time (ccx_period; output timing, _shift_total_time)
     # how its nodes move, by motion_proc's card (_plan_velocity_bcs: over period where they move,
     # _plan_default_amplitudes, _dofs_at_rest):
     motion_label: str             # motion_proc, with ", RIKS"; "(no procedure)" if none
@@ -5069,6 +5101,7 @@ class StepModel:
                 star_proc="PERTURBATION" if pert_param else
                 proc + (", RIKS" if proc_card.has("RIKS") else "") if proc else "",
                 general_before=seen, period=period, advance=advance, t_start=t,
+                ccx_period=ccx_period(procedure),
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
@@ -11929,7 +11962,7 @@ class Converter:
                 self.report.note("Explicit *STEP: NLGEOM added (Abaqus/Explicit includes geometric "
                                  "nonlinearity by default; ccx does not).", once=True)
         if proc == "MODAL DYNAMIC":
-            self._modal_increments(proc_block, params)
+            self._modal_increments(proc_block, cur.ccx_period, params)
         if proc == "DYNAMIC" and proc_block is not None and "AMPLITUDE" not in params and \
                 not explicit and proc_block.uparam("APPLICATION").startswith("QUASI"):
             params["AMPLITUDE"] = "RAMP"
@@ -12053,19 +12086,20 @@ class Converter:
         out.append("*END STEP")
         return out
 
-    def _modal_increments(self, b: Block, params: "OrderedDict[str, Optional[str]]") -> None:
+    def _modal_increments(self, b: Block, period: Optional[float],
+                          params: "OrderedDict[str, Optional[str]]") -> None:
         """INC= on a *MODAL DYNAMIC step that takes more increments (its time period over its
         time increment) than the step's INC= or ccx's default 100 allow: Abaqus runs them all
         (INC "has no effect" where it cannot increment automatically, Keywords *STEP), ccx
         stops at INC= ("max. # of increments reached").  ccx runs ceil(period / increment)
-        increments, the last one in full (probed)."""
+        increments, the last one in full (probed); ``period``: the step's Step.ccx_period."""
         rec = (merged_data_records(b) or [[]])[0]
         try:
-            dt, period = pf(rec[0]), pf(rec[1])
+            dt = pf(rec[0])
             cap = int(float(params.get("INC") or 100))
         except (IndexError, ValueError):
             return
-        if dt <= 0.0 or period <= 0.0:
+        if dt <= 0.0 or period is None or period <= 0.0:
             return
         need = math.ceil(period / dt * (1.0 - 1e-9))
         if need > cap:
@@ -17547,7 +17581,7 @@ class Converter:
         prev_pert = False
         for step, group in zip(self.steps, step_groups(blocks)[1]):
             k, inner, proc = step.no, group[1:], step.proc_card
-            timing = self._step_timing(proc)
+            timing = self._step_timing(step)
             if timing["kind"] == "explicit":
                 timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
                 timing["dtmax"] = self._circ_capped_max(proc, timing["dtmax"])
@@ -18362,12 +18396,13 @@ class Converter:
                     cards.append(twin)
         return cards
 
-    def _step_timing(self, proc: Optional[Block]) -> dict:
+    def _step_timing(self, step: Step) -> dict:
         """How ccx increments a step: kind 'untimed' (no time increments), 'explicit',
         'fixed' (DIRECT as ccx gets it: _direct_freed, direct_added; *MODAL DYNAMIC: every increment
         the data line's first value) or
-        'auto' (ccx picks the increments); its period, fixed increment and (explicit)
-        maximum increment."""
+        'auto' (ccx picks the increments); its period (Step.ccx_period; 1 where it runs none,
+        for the output spacing), fixed increment and (explicit) maximum increment."""
+        proc = step.proc_card
         t = {"kind": "auto", "proc": proc.keyword if proc else None, "period": 1.0,
              "dt": None, "dtmax": None}
         if proc is None:
@@ -18383,9 +18418,11 @@ class Converter:
             except (IndexError, ValueError):
                 return None
             return v if math.isfinite(v) and v > 0 else None
-        t["period"] = num(1) or 1.0
+        period = step.ccx_period
+        if period is not None and math.isfinite(period) and period > 0.0:
+            t["period"] = period
         direct = (proc.has("DIRECT") or proc.has("DIRECT USER CONTROL")) and \
-            not self._direct_freed(proc) or direct_added(proc)
+            not self._direct_freed(proc, step.ccx_period) or direct_added(proc)
         if proc.keyword == "DYNAMIC" and proc.has("EXPLICIT"):
             t.update(kind="explicit", dt=num(0) if direct else None, dtmax=num(3))
         elif proc.keyword == "MODAL DYNAMIC" or direct:
@@ -21613,7 +21650,7 @@ class Converter:
             else:
                 self.report.note(f"*STATIC parameter {k} dropped (not a ccx parameter).", once=True)
         data = list(b.data)
-        freed = self._direct_freed(b)
+        freed = self._direct_freed(b, self.emit.step.ccx_period)     # (b: the step's procedure)
         if freed:
             del params["DIRECT"]
             data = freed
@@ -21638,11 +21675,12 @@ class Converter:
                                      "*STATIC, RIKS step (ccx has no arc-length solver)")
         return [emit_keyword("STATIC", params)] + data
 
-    def _direct_freed(self, proc: Optional[Block]) -> Optional[List[str]]:
+    def _direct_freed(self, proc: Optional[Block], period: Optional[float]) -> Optional[List[str]]:
         """The data line handle_static writes for a ``*STATIC, DIRECT`` step of a model with
         contact pairs ccx gets (_freq_contact): automatic increments with the deck's fixed
         increment as the initial and the maximum one, and Abaqus' default minimum; None where
-        DIRECT stays (no contact, Riks, no fixed increment up to the period).  ccx's penalty
+        DIRECT stays (no contact, Riks, no fixed increment up to the period: ``period``, the
+        step's Step.ccx_period).  ccx's penalty
         contact can need a cutback where Abaqus' converges at the fixed increment
         (lcharleux_indentation_berko: one, at the start of unloading), and under DIRECT ccx
         then stops.  Where ccx converges, the increments are the deck's."""
@@ -21652,10 +21690,9 @@ class Converter:
         vals = [x.strip() for x in next((r for r in merged_data_records(proc) if any(x for x in r)), [])]
         try:
             dt = pf(vals[0])
-            period = pf(vals[1]) if len(vals) > 1 and vals[1] else 1.0
         except (IndexError, ValueError):
             return None
-        if not (math.isfinite(dt) and math.isfinite(period) and 0 < dt <= period):
+        if period is None or not (math.isfinite(dt) and math.isfinite(period) and 0 < dt <= period):
             return None
         return [f"{vals[0]}, {vals[1] if len(vals) > 1 and vals[1] else '1.'}, "
                 f"{fmt_num(min(dt, 1e-5 * period))}, {vals[0]}"]
@@ -25510,11 +25547,11 @@ class Converter:
         if not self._pert_idx:
             return deck
         amps: Dict[str, EmittedCard] = {}       # TIME=TOTAL TIME *AMPLITUDE -> its card
-        added: Dict[int, Optional[float]] = {}  # emitted step -> the time ccx alone adds (None: unknown)
-        # each card's emitted step.  This pass's own rules: a card between steps or after the
-        # last counts with the step before it, and every *MODAL DYNAMIC / *STATIC card of a
-        # step gives its time (the last one decides), read from the card's first record (a
-        # *STATIC without one: 1, Abaqus' default period)
+        # emitted step -> the time ccx alone adds: a perturbation step's Step.ccx_period (None:
+        # unknown; emitted step k is Step k: one *STEP line each)
+        added = {n: self.steps.steps[self.emit.written[n].no - 1].ccx_period for n in self._pert_idx}
+        # each card's emitted step.  This pass's own rule: a card between steps or after the
+        # last counts with the step before it
         at: List[int] = []
         n = 0
         for c in deck.cards:
@@ -25524,13 +25561,6 @@ class Converter:
                 self._used_names.add(c.uparam("NAME"))
                 if (c.params.get("TIME") or "").upper().replace(" ", "") == "TOTALTIME":
                     amps[c.uparam("NAME")] = c
-            elif n in self._pert_idx and c.keyword in ("MODAL DYNAMIC", "STATIC"):
-                rec = (c.records() or [[]])[0]
-                try:
-                    added[n] = pf(rec[1]) if len(rec) > 1 and rec[1] else \
-                        (1.0 if c.keyword == "STATIC" else None)
-                except ValueError:
-                    added[n] = None
         if not amps or not any(v != 0.0 for v in added.values()):
             return deck
         offset: Dict[int, Optional[float]] = {}         # emitted step -> the time ccx added before it

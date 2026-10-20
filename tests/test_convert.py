@@ -592,6 +592,30 @@ def test_step_time_period_as_abaqus_reads_it():
     assert not any("every load lost" in r for r in conv.reduced_physics)
 
 
+def test_step_time_ccx_runs():
+    # ccx 2.23's step time (Step.ccx_period), as it reads the written procedure card (probed):
+    # a blank or zero *STATIC / *MODAL DYNAMIC period is 1.0, a blank or zero *VISCO / heat
+    # transfer one 0, *DYNAMIC stops on one (None), and on a negative one but *VISCO's; a
+    # procedure without time adds none.  It is what ccx adds to its total time, a perturbation
+    # step's too: a *MODAL DYNAMIC step of blank period shifts a later TIME=TOTAL TIME amplitude
+    # by 1.0 (was: "unknown time period", warned) and takes INC=500 at an increment of 0.002
+    _, m = _step_model("""*STEP\n*STATIC\n0.1,\n*END STEP\n*STEP\n*STATIC\n0.1, -1.\n*END STEP
+*STEP\n*VISCO\n*END STEP\n*STEP\n*VISCO\n0.1, -2.\n*END STEP\n*STEP\n*HEAT TRANSFER\n0.1, 0.\n*END STEP
+*STEP\n*HEAT TRANSFER, STEADY STATE\n*END STEP\n*STEP\n*DYNAMIC\n0.1, 0.\n*END STEP
+*STEP\n*DYNAMIC\n*END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*MODAL DYNAMIC\n0.1,\n*END STEP
+*STEP\n*MODAL DYNAMIC\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n0.1, 0.\n*END STEP\n*STEP\n*GEOSTATIC\n*END STEP""")
+    assert [s.ccx_period for s in m] == [1.0, None, 0.0, -2.0, 0.0, 1.0, None, 1.0, 0.0, 1.0, None, 1.0, 0.0]
+    deck = HEX_MODEL.replace("1000., 0.3\n", "1000., 0.3\n*Density\n1e-3\n") + """*AMPLITUDE, NAME=TT, TIME=TOTAL TIME\n0., 0., 10., 1.
+*STEP\n*STATIC\n*CLOAD, AMPLITUDE=TT\n6, 2, 10.\n*END STEP\n*STEP\n*FREQUENCY\n4\n*END STEP
+*STEP\n*MODAL DYNAMIC\n0.002,\n*END STEP\n*STEP\n*STATIC\n*CLOAD, AMPLITUDE=TT\n6, 2, 20.\n*END STEP\n"""
+    body, conv, rep = convert_str(deck)
+    assert "*AMPLITUDE, NAME=TT_SHIFT, TIME=TOTAL TIME, SHIFTX=1." in body and \
+        "*CLOAD, AMPLITUDE=TT_SHIFT\n6, 2, 20." in body and "*STEP, INC=500\n*MODAL DYNAMIC" in body
+    assert not other_reduced(conv)
+    # the output timing spaces output over it, 1 where ccx runs none
+    assert [conv._step_timing(s)["period"] for s in m.steps[3:6]] == [1.0, 1.0, 1.0]
+
+
 def test_one_procedure_card_per_step():
     # Abaqus: "Only one procedure is allowed per step", right after *STEP.  A step's procedure is
     # its first procedure card, ccx's or one ccx lacks (step_procedure): every Step fact reads it
@@ -9599,8 +9623,11 @@ def test_total_time_amplitudes_after_a_modal_dynamic_step():
     body, _, _ = convert_str(deck + st + _deck_step("Static\n0.5, 0.7", "*Cload\n7, 2, 1.\n",
                                                     ", perturbation") + st)
     assert "*AMPLITUDE, NAME=TT_SHIFT, TIME=total time, SHIFTX=0.95\n" in body
-    # an unknown period: warned
-    _, conv, rep = convert_str(deck + st + freq + md.replace("0.1, 0.5", "0.1") + _deck_step("Static", tt))
+    # no period field: ccx runs 1.0 (Step.ccx_period, probed); an unknown period (no data line,
+    # where ccx stops): warned
+    body, _, _ = convert_str(deck + st + freq + md.replace("0.1, 0.5", "0.1") + _deck_step("Static", tt))
+    assert "*AMPLITUDE, NAME=TT_SHIFT, TIME=total time, SHIFTX=1.25\n" in body
+    _, conv, rep = convert_str(deck + st + freq + md.replace("\n0.1, 0.5", "") + _deck_step("Static", tt))
     assert "of unknown time period" in rep.text() and conv.reduced_physics
 
 

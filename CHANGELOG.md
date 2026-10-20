@@ -20,7 +20,10 @@ physics.
 * **Step time periods** — a zero time period on `*STATIC` / `*GEOSTATIC`, which Abaqus and ccx
   read as 1.0, was read as 0 where the converter evaluates a step-time amplitude: a load on one
   was given back at its time-0 value after a linear perturbation step ("every load lost"), and
-  velocity BCs of the step were not integrated.
+  velocity BCs of the step were not integrated. ccx reads a blank `*MODAL DYNAMIC` period and a
+  zero static perturbation one as 1.0 and adds it to its total time: the later steps'
+  `TIME=TOTAL TIME` amplitudes are now shifted by it (were read 1.0 late, or warned as unknown),
+  and such a modal dynamic step gets the `INC=` its increments need.
 * **Eigenvalue and modal steps ccx gets wrong with knots** — a `*MODAL DYNAMIC` step
   segfaulted ccx on a rotational BC of a shell/beam node and stopped on a moment there, and a
   `*CLOAD` on such a node moved the model wrongly in `*MODAL DYNAMIC` and `*STEADY STATE

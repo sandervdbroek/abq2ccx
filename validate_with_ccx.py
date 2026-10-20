@@ -3999,7 +3999,13 @@ def step_time_deck(case, ref=False):
     """modal_own_loads_deck's cube, unloaded.  ``case`` "zero": a static step of time period 0
     (Abaqus and ccx 2.23: 1.0) under a traction on an amplitude of 1 at time 1 (0 at 0), a
     *FREQUENCY step, then a static step.  The last step prints U.  ``ref``: one static step
-    under the traction's end value, Abaqus' base state."""
+    under the traction's end value, Abaqus' base state.  "sp_zero": static_pert_sums_deck's
+    "shift" with the perturbation step's *STATIC of time period 0 (ccx 2.23 adds 1.0 to its
+    total time, Abaqus none)."""
+    if case == "sp_zero":
+        text = static_pert_sums_deck("shift", ref=ref)
+        return text if ref else text.replace("*STEP, PERTURBATION\n*STATIC\n",
+                                             "*STEP, PERTURBATION\n*STATIC\n0.1, 0.\n")
     text = modal_own_loads_deck(False).replace("*NSET, NSET=N7\n7\n", "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n")
     text = text[:text.index("*STEP")] + "*AMPLITUDE, NAME=A\n0., 0., 1., 1., 2., 3.\n"
     out = "*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
@@ -10930,18 +10936,23 @@ def main():
             failures += 0 if ok else 1
     # a time period Abaqus and ccx 2.23 read alike (a zero *STATIC one: 1.0), which the converter
     # read otherwise: the traction's amplitude ended at 0, so the step after *FREQUENCY got it
-    # back at 0 ("every load lost")
-    ref = review_run(step_time_deck("zero", ref=True), "step_time_zero_ref", dat_node_blocks)
-    got = review_run(step_time_deck("zero"), "step_time_zero", dat_node_blocks)
-    ok = bool(got and ref)
-    if ok:
-        err, moved = same([got, ref], -1)
-        ok = err < 1e-9 * moved and moved > 1e-3
-        print(f"{'PASS' if ok else 'FAIL'}  step_time_zero (a cube under a traction on an amplitude "
-              f"in a static step of time period 0, which Abaqus reads as 1, then *FREQUENCY and a "
-              f"static step): its displacements are the traction's at the amplitude's value at 1 "
-              f"({err:.1e} apart, nodes moved {moved:.3g})")
-    failures += 0 if ok else 1
+    # back at 0 ("every load lost"); a static perturbation step's (ccx adds it to the total
+    # time): no shift, so the later step read its TIME=TOTAL TIME amplitude 1.0 late
+    what = {"zero": "a cube under a traction on an amplitude in a static step of time period 0, "
+                    "which Abaqus reads as 1, then *FREQUENCY and a static step: its displacements "
+                    "are the traction's at the amplitude's value at 1",
+            "sp_zero": "static_pert_shift with a time period of 0 on the perturbation step: its "
+                       "displacements are those of the last step's load at Abaqus' total time 2"}
+    for case in what:
+        ref = review_run(step_time_deck(case, ref=True), f"step_time_{case}_ref", dat_node_blocks)
+        got = review_run(step_time_deck(case), f"step_time_{case}", dat_node_blocks)
+        ok = bool(got and ref)
+        if ok:
+            err, moved = same([got, ref], -1)
+            ok = err < 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  step_time_{case} ({what[case]}; {err:.1e} apart, "
+                  f"nodes moved {moved:.3g})")
+        failures += 0 if ok else 1
     def factors(dat):
         return dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")
     # a *BUCKLE step's load on an amplitude: Abaqus applies its time-0 value (the step has no
