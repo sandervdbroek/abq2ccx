@@ -7057,6 +7057,40 @@ def test_general_step_after_perturbation_gets_the_base_state():
     assert "starts it from that step's displacements" in rep.text() and conv.reduced_physics
 
 
+def test_base_state_restore_reads_the_sets_as_written():
+    # the restore resolves a target's sets as the converted deck writes them (EmittedSets):
+    # the mesh's as _emit_set recorded them, so their lines stay unread (undefined members
+    # removed, a set left empty not written, a descending run written as GENERATE), the
+    # others from their cards (a *RIGID BODY's union of set names): as a parse of the text
+    deck = HEX + ("*Nset, nset=GAP, generate\n1, 20, 1\n*Nset, nset=DESC\n8, 6, 4, 2\n"
+                  "*Nset, nset=NONE\n100\n*Nset, nset=P\n5\n*Nset, nset=T\n6\n"
+                  "*Surface, name=S, type=ELEMENT\nEALL, S2\n"
+                  "*Rigid Body, ref node=7, pin nset=P, tie nset=T\n") + PERT[len(HEX):]
+    seen, run = [], A.BaseStateRestore.run
+    A.BaseStateRestore.run = lambda self: seen.append(self) or run(self)
+    try:
+        body, _, _ = convert_str(deck.format("", "*Cload\nDESC, 1, 2.\n*Dsload\nS, P, 1.\n"))
+    finally:
+        A.BaseStateRestore.run = run
+    r = seen[0]
+    assert "*NSET, NSET=DESC, GENERATE\n2, 8, 2\n" in body and "NSET=NONE" not in body
+    assert "*NSET, NSET=ABQ2CCX_RB1\nP, T\n" in body and "*DLOAD\nEALL, P2, 1.\n" in body
+    assert all(c._span is not None for c in r.deck.cards if c.keyword == "NSET" and c.opaque)
+    text = A.EmittedSets().read(A.EmittedDeck(r.deck.lines))   # every card read
+    assert set(r.sets.defs) == set(text.defs) and set(r.sets.surfaces) == set(text.surfaces) == {"S"}
+    for key in text.defs:
+        assert r.sets.members(*key) == text.members(*key), key
+    assert r.sets.members("NSET", "GAP") == list(range(1, 10)) and r.sets.members("NSET", "NONE") is None
+    assert r.sets.members("NSET", "ABQ2CCX_RB1") == [5, 6] and r.sets.faces("S") == text.faces("S")
+    # a set written twice is both definitions, the mesh's first
+    mesh = A.EmittedSets()
+    mesh.record("*NSET, NSET=Twice", [3, 1])
+    lines = ["*NODE", "1, 0., 0., 0.", "*NSET, NSET=TWICE", "3, 1", "*NSET, NSET=twice", "2, Q",
+             "*NSET, NSET=Q", "4"]
+    assert mesh.read(A.EmittedDeck(lines, opaque_upto=4)).members("NSET", "twice") == [3, 1, 2, 4] \
+        == A.EmittedSets().read(A.EmittedDeck(lines)).members("NSET", "Twice")
+
+
 def test_base_state_after_perturbation_values_and_keys():
     deck = HEX + ("*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Solid Section, elset=EALL, "
                   "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Nset, nset=TOP\n5, 6, 7, 8\n"

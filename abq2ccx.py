@@ -4717,6 +4717,80 @@ class EmittedDeck:
         return EmittedDeck(self.render(), upto)
 
 
+class EmittedSets:
+    """The node / element sets and element-face surfaces of an emitted deck as written, for
+    a pass that resolves a card's target (BaseStateRestore): a set written twice is its two
+    definitions together, a name in a set's data names another set; a surface is its last
+    *SURFACE, TYPE=ELEMENT.  The mesh's sets are recorded as Converter._emit_set writes them
+    (record), so their lines are not read again; read() adds a deck's other cards."""
+
+    def __init__(self) -> None:
+        # (NSET / ELSET, NAME) -> its definitions: the ids a recorded card gives, or the card
+        self.defs: Dict[Tuple[str, str], List[Union[List[int], EmittedCard]]] = {}
+        self.surfaces: Dict[str, EmittedCard] = {}
+        self._memo: Dict[Tuple[str, str], Optional[List[int]]] = {}
+
+    def record(self, line: str, ids: List[int]) -> None:
+        """A set card as written: its keyword line, and the ids its data lines give."""
+        kw, params = parse_keyword_line(line)
+        self.defs.setdefault((kw, Block(kw, params).uparam(kw)), []).append(ids)
+
+    def read(self, deck: EmittedDeck) -> "EmittedSets":
+        """These sets for ``deck``'s mesh part (the cards it leaves unread), with its other set
+        and surface cards: a new table."""
+        res = EmittedSets()
+        if deck.opaque_upto:
+            res.defs = {k: list(v) for k, v in self.defs.items()}
+        for b in deck.cards:
+            kw = b.keyword
+            if b.opaque:
+                continue
+            if kw in ("NSET", "ELSET"):
+                res.defs.setdefault((kw, b.uparam(kw)), []).append(b)
+            elif kw == "SURFACE" and (b.uparam("TYPE") or "ELEMENT") == "ELEMENT":
+                res.surfaces[b.uparam("NAME")] = b
+        return res
+
+    def members(self, kind: str, token: str) -> Optional[List[int]]:
+        """The ids a node / element token names (None: not a set this deck defines)."""
+        if re.fullmatch(r"[-+]?\d+", token):
+            return [int(token)]
+        key = (kind, token.upper())
+        if key not in self._memo:
+            self._memo[key] = None                  # (a set naming itself)
+            self._memo[key] = self._ids(kind, self.defs[key]) if key in self.defs else None
+        return self._memo[key]
+
+    def _ids(self, kind: str, defs: List[Union[List[int], EmittedCard]]) -> Optional[List[int]]:
+        ids: List[int] = []
+        for b in defs:
+            if isinstance(b, list):
+                ids += b
+                continue
+            for rec in b.records():
+                f = [x for x in rec if x]
+                if b.has("GENERATE"):
+                    try:
+                        ids += range(pint(f[0]), pint(f[1]) + 1, pint(f[2]) if len(f) > 2 else 1)
+                    except (IndexError, ValueError):
+                        return None
+                    continue
+                for x in f:
+                    sub = self.members(kind, x)
+                    if sub is None:
+                        return None
+                    ids += sub
+        return ids
+
+    def faces(self, token: str) -> Optional[List[Tuple[int, str]]]:
+        """The (element, face) pairs of an element-face *SURFACE (None: not one)."""
+        b = self.surfaces.get(token.upper())
+        if b is None or any(len(rec) < 2 for rec in b.records()):
+            return None
+        pairs = [(self.members("ELSET", rec[0]), rec[1].upper()) for rec in b.records()]
+        return None if any(es is None for es, _ in pairs) else [(e, f) for es, f in pairs for e in es]
+
+
 # ---------------------------------------------------------------------------
 # Velocity / acceleration boundary conditions (ccx prescribes displacements only)
 # ---------------------------------------------------------------------------
@@ -4931,6 +5005,655 @@ def integrate_history(rate: Callable[[float], float], breaks: Sequence[float], p
             return pts, starts[-1][1], starts[-1][2], dev
         tol *= 4.0
     raise ValueError("velocity history could not be sampled")      # unreachable in practice
+
+
+# ---------------------------------------------------------------------------
+# The base state after linear perturbation steps (Converter._restore_base_states)
+# ---------------------------------------------------------------------------
+
+
+class BaseStateRestore:
+    """Converter._restore_base_states on an emitted deck (run): each general step after Abaqus
+    linear perturbation steps (_restore_from) gets the base state's loads, BCs and
+    temperatures again right after its procedure card, and a static perturbation step after
+    another step (_sp_add, _sp_temps) its lines as changes of the base state's.  The
+    planners' facts come from the converter, the targets' sets and surfaces from an
+    EmittedSets, everything else from the deck as written."""
+
+    def __init__(self, conv: "Converter", deck: EmittedDeck, mesh_sets: EmittedSets) -> None:
+        self.conv, self.report, self.deck, self.mesh_sets = conv, conv.report, deck, mesh_sets
+        # the planners' facts (read only)
+        self.restore_from = conv._restore_from      # step -> the last general step before it
+        self.restore_procs = conv._restore_procs    # ... -> the perturbation procedures between
+        self.restore_new, self.restore_pairs = conv._restore_new, conv._restore_pairs
+        self.pert = conv._pert_idx
+        self.sp_add, self.sp_temps, self.sp_temp_dep = conv._sp_add, conv._sp_temps, conv._sp_temp_dep
+        self.modal_held, self.yields, self.yield_segv = \
+            conv._modal_held, conv._restore_yields, conv._yield_segv
+        self.transformed = conv._transformed
+        # the deck as written (_index)
+        self.sets = EmittedSets()
+        self.generated: set = set()                 # the converted loads' nodal-force *CLOADs
+        self.amps: Dict[str, Optional[AmplitudeCurve]] = {}
+        self.period: Dict[int, Optional[float]] = {}
+        self.procs: Dict[int, str] = {}
+        self.heads: Dict[int, Block] = {}           # each step's *STEP card
+        self.by_step: Dict[int, List[EmittedCard]] = {}     # step (0: model data) -> its _RESTORED cards
+        self.anchor: Dict[int, EmittedCard] = {}    # step -> the card its restore follows
+        # the base state, step by step (_advance; a perturbation step's cards do not change it)
+        self.lines: Dict[str, List[Tuple[Block, List[str]]]] = {"BOUNDARY": [], "TEMPERATURE": []}
+        self.contrib: Dict[str, List[Tuple[Block, List[str], List[tuple]]]] = {"CLOAD": [], "DLOAD": []}
+        self.owner: Dict[str, Dict[tuple, int]] = {"CLOAD": {}, "DLOAD": {}}
+        # what it writes
+        self.hold = conv.HOLD_AMP
+        self.used_hold = False
+        self.model_cards: List[str] = []            # surfaces the restore cards need
+        self.done: List[int] = []                   # the steps given the base state again
+        # the static perturbation steps (_add_base)
+        self.summed: List[int] = []
+        self.held: List[int] = []                   # the steps given *BOUNDARY, FIXED
+        self.inexact: Dict[str, List[str]] = {}     # why -> where
+
+    def run(self) -> EmittedDeck:
+        """The deck with the restore's edits (``deck`` itself where it makes none)."""
+        if not self._steps_match():
+            return self.deck
+        self._index()
+        for s in range(len(self.deck.steps) + 1):
+            if s in self.restore_from and s in self.anchor:
+                self._give_again(s)
+            if s in self.sp_add or s in self.sp_temps:
+                self._add_base(s)
+            if s not in self.pert:                  # (a static perturbation step: given it above)
+                self._advance(s)
+        self._report_added()
+        if not self.deck.changed:
+            return self.deck
+        self._note()
+        self._write_model_cards()
+        return self.deck.edited()
+
+    def _steps_match(self) -> bool:
+        """Whether the deck's steps as written are those the planners count (not where a
+        *STEP inside an open step cut one: warned)."""
+        if len(self.deck.steps) == self.conv._step_idx:
+            return True
+        self.report.warn("The converted deck's steps do not match the deck's: the base state is "
+                         "not given again after its linear perturbation steps, whose loads and "
+                         "BC changes ccx carries on.", once=True)
+        self.conv._reduces("loads / BCs of linear perturbation steps carried on")
+        return False
+
+    def _index(self) -> None:
+        """What the restore reads of the deck: its sets and surfaces, the generated *CLOADs,
+        the amplitudes, each step's cards, procedure and period, and the HOLD_AMP name."""
+        deck, nodal = self.deck, self.conv._NODAL_FORCES
+        self.sets = self.mesh_sets.read(deck)
+        # the converted loads' nodal-force *CLOADs: the run of them after the comment so saying
+        gen = any(t.startswith(nodal) for t in deck.notes)
+        for b in deck.cards:
+            gen = gen and b.keyword == "CLOAD"
+            if gen:
+                self.generated.add(id(b))
+            gen = gen or any(t.startswith(nodal) for t in b.notes)
+        for b in deck.cards:
+            if b.keyword == "AMPLITUDE" and b.param("NAME"):
+                self.amps[b.uparam("NAME")] = amplitude_curve(b)
+            if b.keyword in self.conv._RESTORED and b.step >= 0:
+                self.by_step.setdefault(b.step, []).append(b)
+        # each step's procedure, period and *STEP as written: the planners know the first two
+        # (StepModel's Step.proc, _step_motion's period); the PERTURBATION ccx reads is the one
+        # handle_step writes (Step.pert_param is the source deck's), which nothing records yet
+        for st in deck.steps:
+            s = st.number
+            self.heads[s], self.anchor[s] = st.head, st.proc or st.head
+            if st.proc is not None:
+                self.procs[s] = st.proc.keyword
+                rec = (st.proc.records() or [[]])[0]
+                try:
+                    self.period[s] = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
+                except ValueError:
+                    self.period[s] = None
+        while self.hold in self.amps:
+            self.hold += "_"
+
+    # -- what a line loads or holds -------------------------------------------------------
+    @staticmethod
+    def direction(label: str, fields: List[str]) -> tuple:
+        """A body load's direction / axis fields as ccx compares them (GRAV's and CENTRIF's
+        axis as unit vectors)."""
+        try:
+            v = [pf(x) if x else 0.0 for x in fields]
+        except ValueError:
+            return tuple(x.upper() for x in fields)
+        j = {"GRAV": 0, "CENTRIF": 3}.get(label)
+        if j is not None and len(v) >= j + 3:
+            n = math.sqrt(sum(x * x for x in v[j:j + 3])) or 1.0
+            v[j:j + 3] = [x / n for x in v[j:j + 3]]
+        return tuple(round(x, 9) + 0.0 for x in v)
+
+    def load_keys(self, kw: str, rec: List[str]) -> List[tuple]:
+        """What a *CLOAD / *DLOAD line loads, as ccx keys it: a node DOF, an element face (on
+        a surface: the surface's faces), a body load per set and direction; an unknown set:
+        its name."""
+        label = rec[1].upper() if len(rec) > 1 else ""
+        if kw == "CLOAD":
+            ns, d = self.sets.members("NSET", rec[0]), dof_number(label)
+            return [(n, d) for n in ns] if ns is not None and d else [(rec[0].upper(), label)]
+        if label in self.conv._BODY_LOADS:
+            return [(rec[0].upper(), label) + self.direction(label, rec[3:])]
+        fs = self.sets.faces(rec[0])
+        if fs is not None:
+            return [("S", e, f, label) for e, f in fs]
+        es = self.sets.members("ELSET", rec[0])
+        return [(e, label) for e in es] if es is not None else [(rec[0].upper(), label)]
+
+    def bc_keys(self, rec: List[str]) -> Optional[List[Tuple[int, int]]]:
+        """The (node, DOF) pairs a BC line holds (None: not known to the converter)."""
+        ns = self.sets.members("NSET", rec[0])
+        try:
+            d1 = pint(rec[1])
+            d2 = pint(rec[2]) if len(rec) > 2 and rec[2] else d1
+        except (IndexError, ValueError):
+            return None
+        return None if ns is None else [(n, d) for n in ns for d in range(d1, d2 + 1)]
+
+    @staticmethod
+    def valued(b: Block, rec: List[str]) -> bool:
+        """Whether a BC line holds a DOF at anything but a fixed zero."""
+        try:
+            return b.has("AMPLITUDE") or b.has("FIXED") or \
+                (len(rec) > 3 and bool(rec[3]) and pf(rec[3]) != 0.0)
+        except ValueError:
+            return True
+
+    # -- the values at the end of a general step --------------------------------------------
+    def end_factor(self, b: Block) -> Optional[float]:
+        """The factor a base-state card's amplitude reaches at the end of its step (None:
+        unknown to the converter, as on a FIXED / USER card or an amplitude it does not read
+        at that time)."""
+        if b.has("FIXED") or b.has("USER"):
+            return None
+        amp = b.uparam("AMPLITUDE")
+        if amp and amp != self.conv.CCX_RAMP:
+            curve, end = self.amps.get(amp), self.period.get(b.step or 1)
+            if curve is None or curve.total or curve.absolute or end is None:
+                return None
+            try:
+                return curve.value(end - pf(b.param("TIME DELAY") or "0"))
+            except ValueError:
+                return None
+        return 1.0
+
+    def end_value(self, b: Block, rec: List[str]) -> Optional[float]:
+        """The value a base-state line holds at the end of its step (None: unknown)."""
+        factor, j = self.end_factor(b), self.conv._VALUE_FIELD[b.keyword]
+        try:
+            return None if factor is None else \
+                (pf(rec[j]) if len(rec) > j and rec[j] else 0.0) * factor
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def temperature(rec: List[str], factor: Optional[float] = 1.0) -> Optional[Tuple[float, ...]]:
+        """A temperature line's values: the temperature, then a shell's or beam's gradients
+        or the values at its section points (a blank field: 0; trailing blank ones dropped),
+        times ``factor`` (None: unknown)."""
+        vals = list(rec[1:])
+        while len(vals) > 1 and not vals[-1]:
+            vals.pop()
+        try:
+            return None if factor is None else tuple(pf(x) * factor if x else 0.0 for x in vals or [""])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _hot(t: Optional[Tuple[float, ...]]) -> bool:
+        """Whether base-state temperatures differ from 0 (or are unknown)."""
+        return t is None or any(t)
+
+    # -- the lines given again ---------------------------------------------------------------
+    def regiven_line(self, b: Block, rec: List[str], s: int) -> Tuple[tuple, str]:
+        """(the card parameters, the data line) of a base-state line given again in step
+        ``s``: its end value on the constant amplitude, or as it is on a TIME=TOTAL TIME
+        amplitude (and a FIXED / USER card's line, and a BC on a node with a *TRANSFORM,
+        where ccx allows one amplitude per node)."""
+        kw, given_in = b.keyword, b.step
+        params = [(k, v) for k, v in b.params.items() if k not in ("OP", "AMPLITUDE", "TIME DELAY")]
+        amp = b.uparam("AMPLITUDE")
+        factor: Optional[float] = 1.0
+        if amp and amp != self.conv.CCX_RAMP:       # (ccx's step ramp ends at the full value)
+            curve = self.amps[amp] if amp in self.amps else None
+            if curve and curve.total:              # it goes on as it is
+                return tuple(params + [(k, v) for k, v in b.params.items()
+                                       if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
+            end = self.period.get(given_in or 1)    # (model data: from the first step on)
+            try:
+                factor = curve.value(end - pf(b.param("TIME DELAY") or "0")) \
+                    if curve and end is not None else None
+            except ValueError:
+                factor = None
+            if factor is None:
+                self.report.warn(f"*{kw} given again in step {s}, after a linear perturbation "
+                                 f"step: the value amplitude {amp} reached at the end of step "
+                                 f"{given_in or 1} is unknown to the converter, so the line "
+                                 f"keeps the amplitude, which ccx evaluates in step {s} again.",
+                                 once=True)
+                self.conv._reduces(f"*{kw} on amplitude {amp} after a perturbation step")
+                return tuple(params + [(k, v) for k, v in b.params.items()
+                                       if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
+        rec = list(rec)
+        if factor != 1.0:
+            j0 = self.conv._VALUE_FIELD[kw]
+            for j in range(j0, len(rec) if kw == "TEMPERATURE" else min(len(rec), j0 + 1)):
+                try:
+                    rec[j] = short_real(pf(rec[j]) * factor, 12) if rec[j] else rec[j]
+                except ValueError:
+                    pass
+        if b.has("FIXED") or b.has("USER") or (kw == "BOUNDARY" and self.transformed and any(
+                n in self.transformed for n in self.sets.members("NSET", rec[0]) or [])):
+            return tuple(params), ", ".join(rec)
+        self.used_hold = True
+        return tuple(params + [("AMPLITUDE", self.hold)]), ", ".join(rec)
+
+    def part(self, b: Block, rec: List[str], left: List[tuple],
+             prefix: str = "ABQ2CCX_BASE_") -> List[Tuple[Block, List[str]]]:
+        """A load line given again on part of what it loads: per node DOF / element face, on
+        a surface of the faces left."""
+        if left[0][0] != "S":
+            return [(b, [str(k[0])] + ([str(k[1])] if b.keyword == "CLOAD" else rec[1:2]) + rec[2:])
+                    for k in left]
+        name = self.conv._fresh_name(f"{prefix}{rec[0]}")
+        self.conv._sheet_surfaces.add(name)         # (_surfaces_last: after the set lines)
+        self.model_cards.extend([f"*SURFACE, NAME={name}, TYPE=ELEMENT"] +
+                                [f"{e}, {f}" for _, e, f, _ in left])
+        return [(b, [name] + rec[1:])]
+
+    # -- a general step after perturbation steps ---------------------------------------------
+    def _give_again(self, s: int) -> None:
+        """Step ``s`` given the base state again, right after its procedure card."""
+        got = self.restore(s)
+        if got:
+            last = self.restore_from[s]
+            self.deck.insert_after(self.anchor[s], [
+                f"** abq2ccx: the loads, BCs and temperatures "
+                f"{'of step %d' % last if last else 'before the first step'} "
+                f"given again (linear perturbation step(s) "
+                f"{', '.join(map(str, range(last + 1, s)))} in between)"] + got)
+            self.done.append(s)
+
+    def restore(self, s: int) -> List[str]:
+        """The cards that give step ``s`` the base state again."""
+        own = self.by_step.get(s, [])
+        between = range(self.restore_from[s] + 1, s)
+        touched = {b.keyword for k in between for b in self.by_step.get(k, [])}
+        regiven: set = set()                        # card types the step gives again itself
+        res: List[str] = []
+        for kw in self.conv._RESTORED:
+            mine = [b for b in own if b.keyword == kw]
+            instead = self._skip_or_bare(kw, s, mine)
+            if instead is not None:
+                res += instead
+                continue
+            entries, again = self._load_entries(kw, mine) if kw in self.contrib else \
+                self._line_entries(kw, s, mine, touched)
+            if again:
+                regiven.add(kw)
+            if not entries and kw not in touched:
+                continue
+            res += self._cards(kw, s, entries)
+        self._warn_reset(s, regiven, between)
+        return res
+
+    def _skip_or_bare(self, kw: str, s: int, mine: List[EmittedCard]) -> Optional[List[str]]:
+        """None where step ``s`` gets the base state's ``kw`` lines, else what it gets instead:
+        nothing where the step's own first card of that type has OP=NEW (ccx acts on it), no
+        BCs where no perturbation step before held a DOF (_restore_pairs), no temperatures in
+        a step that solves them; a bare OP=NEW where a later card has it (ccx ignores it
+        there; Abaqus: the earlier steps' go)."""
+        if self.deck.steps[s - 1].acting(kw) is not None or \
+                (kw == "BOUNDARY" and s not in self.restore_pairs) or \
+                (kw == "TEMPERATURE" and self.procs.get(s) in TEMPERATURE_DOF_PROCS):
+            return []
+        if any(b.uparam("OP") == "NEW" for b in mine):
+            return [emit_keyword(kw, OrderedDict([("OP", "NEW")]))]
+        return None
+
+    def _load_entries(self, kw: str, mine: List[EmittedCard]
+                      ) -> Tuple[List[Tuple[Block, List[str]]], bool]:
+        """The base state's *CLOAD / *DLOAD lines without what the step's own ``mine`` loads
+        (ccx adds up a load given twice in one step; a line loading part of it: that part,
+        part()), and whether ``mine`` gives some again."""
+        entries: List[Tuple[Block, List[str]]] = []
+        again = False
+        given = {k for b in mine for rec in b.records() if rec and rec[0]
+                 for k in self.load_keys(kw, rec)}
+        for b, rec, ks in self.contrib[kw]:
+            live = [k for k in ks if self.owner[kw].get(k) == b.step]
+            left = [k for k in live if k not in given]
+            if len(left) == len(ks):
+                entries.append((b, rec))
+            elif left:
+                entries += self.part(b, rec, left)
+            if len(left) < len(live):
+                again = True
+        return entries, again
+
+    def _line_entries(self, kw: str, s: int, mine: List[EmittedCard], touched: set
+                      ) -> Tuple[List[Tuple[Block, List[str]]], bool]:
+        """The base state's *BOUNDARY / *TEMPERATURE lines (a later one replaces an earlier
+        one), and whether the step's own ``mine`` gives some temperatures again."""
+        entries = list(self.lines[kw])
+        if kw == "BOUNDARY" and s not in self.restore_new and kw not in touched:
+            # only *FREQUENCY's zeroed values to give back: from the first valued line on (a
+            # later zero line may override it)
+            first = next((j for j, (b, rec) in enumerate(entries) if self.valued(b, rec)), None)
+            entries = entries[first:] if first is not None else []
+        again = False
+        if kw == "TEMPERATURE" and mine:
+            base = {n for b, rec in entries for n in self.sets.members("NSET", rec[0]) or []}
+            again = any(n in base for b in mine for rec in b.records() if rec
+                        for n in self.sets.members("NSET", rec[0]) or [])
+        return entries, again
+
+    def _cards(self, kw: str, s: int, entries: List[Tuple[Block, List[str]]]) -> List[str]:
+        """The ``kw`` cards of ``entries`` in step ``s``: one per run of lines with the same
+        parameters, OP=NEW on the first (a *BOUNDARY's only where _restore_new)."""
+        runs: List[list] = []
+        for b, rec in entries:
+            params, text = self.regiven_line(b, rec, s)
+            if runs and runs[-1][0] == params:
+                runs[-1][1].append(text)
+            else:
+                runs.append([params, [text]])
+        if kw != "BOUNDARY" or s in self.restore_new:
+            runs = runs or [[(), []]]
+            runs[0][0] = (("OP", "NEW"),) + runs[0][0]
+        res: List[str] = []
+        for params, texts in runs:
+            res.append(emit_keyword(kw, OrderedDict(params)))
+            res += self.conv._surfaces_last(texts) if kw == "DLOAD" else texts
+        return res
+
+    def _warn_reset(self, s: int, regiven: set, between: range) -> None:
+        """Loads and temperatures step ``s`` gives again after a step that dropped them start
+        from 0 / the initial temperature in ccx, from the base state in Abaqus (a static
+        perturbation step ramps nothing there)."""
+        reset = {kw for kw in regiven for k in between if s not in self.pert
+                 if (self.procs.get(k) in self.conv._RESETS[kw] and
+                     (kw == "TEMPERATURE" or k not in self.modal_held)) or
+                 (kw != "DLOAD" and k in self.heads and self.heads[k].has("PERTURBATION"))}
+        # (moot where ccx segfaults before: _yield_segfaults)
+        if reset and self.procs.get(s) == "STATIC" and not any(k <= s for k in self.yield_segv):
+            what = " and ".join(f"*{kw}" for kw in self.conv._RESTORED if kw in reset)
+            (self.report.warn if self.yields else self.report.note)(
+                f"Step {s} gives again {what} values that the linear perturbation step before "
+                f"it dropped in ccx 2.23: ccx ramps them from 0 (temperatures: from the initial "
+                f"ones) where Abaqus ramps them from the base state's values — the same end "
+                f"values by another path, which matters for a yielding material.", once=True)
+            if self.yields:
+                self.conv._reduces("loads given again after a perturbation step ramp from 0")
+
+    # -- the base state, step by step ---------------------------------------------------------
+    def _advance(self, s: int) -> None:
+        """The base state after general step ``s`` (0: the model data): its cards' lines
+        added, after what its first card's OP=NEW removes (EmittedStep.acting; the cards
+        between steps are in no step: left out); what later lines replaced forgotten."""
+        st = self.deck.steps[s - 1] if s else None  # (model data: no state to remove yet)
+        for b in self.by_step.get(s, []):
+            kw = b.keyword
+            if st is not None and b is st.acting(kw):
+                if kw in self.lines:
+                    self.lines[kw] = []
+                else:
+                    self.contrib[kw], self.owner[kw] = [], {}
+            for rec in b.records():
+                if not rec or not rec[0]:
+                    continue
+                if kw in self.lines:
+                    self.lines[kw].append((b, rec))
+                else:
+                    ks = self.load_keys(kw, rec)
+                    self.contrib[kw].append((b, rec, ks))
+                    for k in ks:
+                        self.owner[kw][k] = s
+        for kw in self.contrib:
+            self.contrib[kw] = [e for e in self.contrib[kw]
+                                if any(self.owner[kw].get(k) == e[0].step for k in e[2])]
+
+    # -- a static perturbation step after another step ---------------------------------------
+    def base_temperatures(self, s: int) -> Tuple[Dict[int, Optional[Tuple[float, ...]]],
+                                                 Optional[Tuple[float, ...]]]:
+        """The base state's temperatures at static perturbation step ``s``: (node -> its
+        values (temperature()), those of the other nodes: none, 0), from the initial
+        conditions and the general steps' *TEMPERATURE lines; None where the converter does
+        not know them (a FILE / USER / INPUT card, an unknown set, temperatures a heat
+        transfer step solved)."""
+        unknown: Tuple[Dict[int, Optional[Tuple[float, ...]]], Optional[Tuple[float, ...]]] = \
+            ({}, None)
+        ics = [b for b in self.deck.model if b.keyword == "INITIAL CONDITIONS" and
+               b.uparam("TYPE") == "TEMPERATURE"]
+        if any(self.procs.get(k) in TEMPERATURE_DOF_PROCS or any(
+                b.keyword == "TEMPERATURE" and (b.has("FILE") or b.has("USER"))
+                for b in self.by_step.get(k, [])) for k in range(1, s) if k not in self.pert) or \
+                any(b.has("FILE") or b.has("USER") or b.has("INPUT") for b in ics):
+            return unknown
+        got: Dict[int, Optional[Tuple[float, ...]]] = {}
+        for b, rec in [(b, rec) for b in ics for rec in b.records() if rec and rec[0]] + \
+                self.lines["TEMPERATURE"]:
+            ns = self.sets.members("NSET", rec[0])
+            if ns is None:
+                return unknown
+            v = self.temperature(rec, self.end_factor(b) if b.keyword == "TEMPERATURE" else 1.0)
+            got.update((n, v) for n in ns)
+        return got, ()
+
+    def _base_values(self) -> Dict[str, Dict[tuple, Optional[float]]]:
+        """What the base state loads and holds, keyed as ccx keys it -> its value at the end
+        of its step (None: unknown; two lines of a step add up)."""
+        base: Dict[str, Dict[tuple, Optional[float]]] = {kw: {} for kw in ("BOUNDARY", "CLOAD", "DLOAD")}
+        for kw in self.contrib:
+            for b, rec, ks in self.contrib[kw]:
+                v = self.end_value(b, rec)
+                for k in ks:
+                    if self.owner[kw].get(k) == b.step:
+                        old = base[kw].get(k, 0.0)
+                        base[kw][k] = None if old is None or v is None else old + v
+        for b, rec in self.lines["BOUNDARY"]:
+            for k in self.bc_keys(rec) or []:
+                base["BOUNDARY"][k] = self.end_value(b, rec)
+        return base
+
+    def _add_base(self, s: int) -> None:
+        """Static perturbation step ``s``: Abaqus reads its load, BC and temperature values as
+        changes of the base state's ("not the total of the base state load plus the
+        perturbation load"; temperatures: the initial ones where no general step gave any),
+        ccx 2.23 a value given on what the base state loads (a node DOF, a face, a body load's
+        set and direction, a node's temperature) as its new value (probed).  Such a line gets
+        the base value added (exact for a linear step), split where it loads part of that
+        only (_add_line).  A zero BC on a DOF the base state leaves free holds its base-state
+        value: *BOUNDARY, FIXED, which ccx holds at the value the step before ends at
+        (``fixed``), the base state's where that is the general step or *FREQUENCY steps
+        follow it (probed; not after a static perturbation, *BUCKLE or *MODAL DYNAMIC step),
+        on the DOFs FIXED can hold (_holdable).  ``inexact``: what cannot be given so."""
+        base = self._base_values()
+        deformed = any(self.contrib.values()) or bool(self.lines["TEMPERATURE"]) or \
+            any(self.valued(b, rec) for b, rec in self.lines["BOUNDARY"])
+        mine = [b for b in self.by_step.get(s, []) if (b.keyword in base or b.keyword == "TEMPERATURE")
+                and id(b) not in self.generated]
+        temps, rest = self.base_temperatures(s) if any(b.keyword == "TEMPERATURE" for b in mine) \
+            else ({}, ())
+        fixable = s not in self.restore_from or self.restore_procs[s] <= {"FREQUENCY"}
+        fixed: List[Tuple[int, int]] = []
+        first_bc = next((b for b in mine if b.keyword == "BOUNDARY"), None)
+        if deformed and first_bc is not None and first_bc.uparam("OP") == "NEW":
+            given = {k for b in mine if b.keyword == "BOUNDARY" for rec in b.records()
+                     if rec and rec[0] for k in self.bc_keys(rec) or []}
+            if any(k not in given for k in base["BOUNDARY"]):
+                self.inexact.setdefault("releases DOFs the base state holds (*BOUNDARY, OP=NEW; "
+                                        "Abaqus keeps their base-state reaction forces, ccx removes "
+                                        "them too)", []).append(str(s))
+        for b in mine:
+            if b.keyword == "TEMPERATURE" and (b.has("FILE") or b.has("USER")) and \
+                    (self._hot(rest) or any(self._hot(x) for x in temps.values())):
+                self.inexact.setdefault("changes what the base state loads by a value the "
+                                        "converter cannot add to the base one (an amplitude, "
+                                        "FIXED or USER on either line; ccx replaces it)",
+                                        []).append(f"{s} (*TEMPERATURE)")
+            if len(b.rows) != len(b.records()):
+                continue
+            for i, rec in zip(b.rows, b.records()):
+                if rec and rec[0]:
+                    fixed += self._add_line(s, b, i, rec, base, temps, rest, deformed, fixable)
+        if fixed:
+            self.deck.insert_after(
+                [b for b in mine if b.keyword == "BOUNDARY"][-1],
+                ["** abq2ccx: held at their base-state values (zero perturbations of DOFs the "
+                 "base state leaves free)", "*BOUNDARY, FIXED"] +
+                [f"{n}, {d}, {d}" for n, d in fixed])
+            self.held.append(s)
+
+    def _add_line(self, s: int, b: EmittedCard, i: int, rec: List[str],
+                  base: Dict[str, Dict[tuple, Optional[float]]],
+                  temps: Dict[int, Optional[Tuple[float, ...]]], rest: Optional[Tuple[float, ...]],
+                  deformed: bool, fixable: bool) -> List[Tuple[int, int]]:
+        """Line ``i`` (``rec``) of static perturbation step ``s``'s card ``b`` written with
+        the base value added (_add_base); returns the DOFs it leaves to *BOUNDARY, FIXED."""
+        kw, j = b.keyword, self.conv._VALUE_FIELD[b.keyword]
+        ks = self.bc_keys(rec) if kw == "BOUNDARY" else self.sets.members("NSET", rec[0]) \
+            if kw == "TEMPERATURE" else self.load_keys(kw, rec)
+        if ks is None:
+            return []
+        try:
+            v = pf(rec[j]) if len(rec) > j and rec[j] else 0.0
+        except ValueError:
+            v = None
+        pv = self.temperature(rec) if kw == "TEMPERATURE" else None
+        if kw == "TEMPERATURE":
+            on = {k: temps.get(k, rest) for k in ks if self._hot(temps.get(k, rest))}
+            if self._hot(pv) and self.sp_temp_dep:
+                self.inexact.setdefault("changes temperatures, which Abaqus leaves out of "
+                                        "the temperature-dependent material properties "
+                                        "(those of the base state), ccx not",
+                                        []).append(f"{s} (*TEMPERATURE {rec[0]})")
+        else:
+            on = {k: base[kw][k] for k in ks if k in base[kw] and base[kw][k] != 0.0}
+        fix_ks: List[Tuple[int, int]] = []
+        if kw == "BOUNDARY" and deformed:
+            free = [k for k in ks if k not in base[kw]]
+            if fixable and v == 0.0 and not b.has("AMPLITUDE") and not b.has("USER"):
+                fix_ks = [k for k in free if self.conv._holdable(*k)]
+            if len(fix_ks) < len(free):
+                self.inexact.setdefault("prescribes DOFs the base state leaves free (Abaqus: "
+                                        "relative to their base-state displacement, which "
+                                        "the converter does not know; ccx: as the total one) "
+                                        "by a nonzero value, or holds one where *BOUNDARY, "
+                                        "FIXED cannot (a rotation, a node with a *TRANSFORM, "
+                                        "a perturbation step other than *FREQUENCY before)",
+                                        []).append(f"{s} (*BOUNDARY {rec[0]})")
+            if b.has("FIXED"):
+                fix_ks = []                         # (ccx holds those already)
+                on = {k: a for k, a in on.items() if not (fixable and self.conv._holdable(*k))}
+        if not on and not fix_ks:
+            return []
+        if on and (b.uparam("AMPLITUDE") not in ("", self.conv.CCX_RAMP) or b.has("FIXED") or
+                   b.has("USER") or None in on.values() or v is None or
+                   (kw == "TEMPERATURE" and (pv is None or any(
+                       len(a) != len(pv) for a in on.values())))):
+            self.inexact.setdefault("changes what the base state loads by a value the "
+                                    "converter cannot add to the base one (an amplitude, "
+                                    "FIXED or USER on either line, temperatures with other "
+                                    "gradients or section points than the base state's; "
+                                    "ccx replaces it)",
+                                    []).append(f"{s} (*{kw} {rec[0]})")
+            if not fix_ks:
+                return []
+            on = {}
+        groups: Dict[object, List[tuple]] = {}
+        for k in ks:
+            if k not in fix_ks:
+                groups.setdefault(on.get(k, () if kw == "TEMPERATURE" else 0.0), []).append(k)
+        got: List[str] = []
+        for a, part_ks in groups.items():
+            r = list(rec) + [""] * (j + 1 - len(rec))
+            if kw == "TEMPERATURE":                 # (each value: gradients, section points)
+                r = r[:j] + [short_real(x + y, 12) for x, y in zip(pv, a or (0.0,) * len(pv))]
+            else:
+                r[j] = short_real(v + a, 12)
+            if kw == "BOUNDARY" and not r[2]:
+                r[2] = r[1]                         # (a BC line's blank last DOF: its first)
+            if len(groups) == 1 and not fix_ks:
+                got.append(", ".join(r))
+            elif kw == "BOUNDARY":
+                got += [", ".join([str(n), str(d), str(d)] + r[3:]) for n, d in part_ks]
+            elif kw == "TEMPERATURE":
+                got += [", ".join([str(n)] + r[1:]) for n in part_ks]
+            else:
+                got += [", ".join(x) for _, x in self.part(b, r, part_ks, "ABQ2CCX_SUM_")]
+        self.deck.swap(i, got)          # (a surface's faces on surfaces, a set's one by one)
+        if on and s not in self.summed:
+            self.summed.append(s)
+        return fix_ks
+
+    # -- the reports and the model cards ------------------------------------------------------
+    def _report_added(self) -> None:
+        """The warnings and notes of the static perturbation steps (_add_base)."""
+        for why, where in self.inexact.items():
+            self.report.warn(f"Static perturbation step{'s' if len(where) > 1 else ''} "
+                             f"{', '.join(where)} {why}, so ccx 2.23 does not solve "
+                             f"{'them' if len(where) > 1 else 'it'} for the base state plus the "
+                             f"perturbation there.", once=True)
+            self.conv._reduces("static perturbation step not the base state plus its perturbation")
+        if self.summed:
+            self.report.note(f"Static perturbation step{'s' if len(self.summed) > 1 else ''} "
+                             f"{', '.join(map(str, self.summed))}: Abaqus reads a load, BC or "
+                             f"temperature value given on what the base state also loads as a change "
+                             f"of the base value (temperatures: of the initial ones where no general "
+                             f"step gave any), ccx 2.23 as its new value (probed), so the base value "
+                             f"is added to it.", once=True)
+        if self.held:
+            self.report.note(f"Static perturbation step{'s' if len(self.held) > 1 else ''} "
+                             f"{', '.join(map(str, self.held))}: a zero BC on a DOF the base state "
+                             f"leaves free holds it at its base-state value in Abaqus, so it is "
+                             f"written as *BOUNDARY, FIXED, which ccx 2.23 holds at the value of the "
+                             f"step before: the base state's (probed).", once=True)
+
+    def _note(self) -> None:
+        """The note on the steps given the base state again."""
+        at_once = f", in force at once (amplitude {self.hold})" if self.used_hold else ""
+        general = [s for s in self.done if s not in self.pert]
+        if general:
+            self.report.note(f"Step{'s' if len(general) > 1 else ''} {', '.join(map(str, general))} "
+                             f"follow{'' if len(general) > 1 else 's'} a linear perturbation step: "
+                             f"Abaqus continues from the last general step's state, while ccx 2.23 "
+                             f"carries a perturbation step's loads and BC changes on, and its own "
+                             f"procedures change that state (probed: *FREQUENCY zeroes prescribed BC "
+                             f"values; *BUCKLE, *STEP, PERTURBATION and steady-state dynamics remove "
+                             f"earlier loads and reset temperatures). The loads, boundary conditions "
+                             f"and temperatures of that state are given again at the start of "
+                             f"{'those steps' if len(general) > 1 else 'it'}{at_once}.", once=True)
+        static = [s for s in self.done if s in self.pert]
+        if static:
+            self.report.note(f"Static perturbation step{'s' if len(static) > 1 else ''} "
+                             f"{', '.join(map(str, static))} after other linear perturbation steps: "
+                             f"Abaqus applies only the loads and BCs such a step gives itself, ccx "
+                             f"2.23 the earlier perturbation steps' too (probed: *MODAL DYNAMIC, "
+                             f"*BUCKLE, *FREQUENCY, steady-state dynamics and static perturbation "
+                             f"steps). The loads, boundary conditions and temperatures of the base "
+                             f"state are given again at the start of "
+                             f"{'those steps' if len(static) > 1 else 'it'}{at_once}.", once=True)
+
+    def _write_model_cards(self) -> None:
+        """The HOLD_AMP amplitude and the surfaces part() made, before the first *STEP."""
+        if not (self.used_hold or self.model_cards):
+            return
+        deck = self.deck
+        head = next(st.head for st in deck.steps
+                    if deck.lines[st.head.line].strip().upper().startswith("*STEP"))
+        deck.insert_before(head, [
+            "** abq2ccx: for the state given again after linear perturbation steps"] +
+            ([f"*AMPLITUDE, NAME={self.hold}"] + amplitude_lines([(0.0, 1.0), (1.0, 1.0)])
+             if self.used_hold else []) + self.model_cards)
 
 
 class Converter:
@@ -5267,6 +5990,7 @@ class Converter:
         self._sheet_split: Dict[str, List[Tuple[str, str, float, float]]] = {}
         self._sheet_cards: List[str] = []
         self._sheet_surfaces: set = set()          # their names
+        self._mesh_sets = EmittedSets()             # the sets emit_geometry wrote
         # Abaqus surface elements left out of the ccx mesh (_drop_surface_elements): element ->
         # (type, nodes), and the full member list of each element set that had some
         self._carriers: "OrderedDict[int, Tuple[str, List[int]]]" = OrderedDict()
@@ -5758,13 +6482,15 @@ class Converter:
             for eid, conn in items:
                 out.extend(reflow([str(eid)] + [str(c) for c in conn], MAX_ENTRIES_PER_LINE))
 
+        self._mesh_sets = EmittedSets()         # the sets as written (BaseStateRestore)
         for name, ids in self.geom.nsets.items():
-            self._emit_set(out, "NSET", name, ids)
+            self._emit_set(out, "NSET", name, ids, self._mesh_sets)
         for name, ids in self.geom.elsets.items():
-            self._emit_set(out, "ELSET", name, ids)
+            self._emit_set(out, "ELSET", name, ids, self._mesh_sets)
         return out
 
-    def _emit_set(self, out: List[str], kw: str, name: str, ids: Sequence[int]) -> None:
+    def _emit_set(self, out: List[str], kw: str, name: str, ids: Sequence[int],
+                  record: Optional[EmittedSets] = None) -> None:
         pool = self.geom.nodes if kw == "NSET" else self.geom.elements
         raw = dedup(ids)
         if kw == "ELSET" and self._conn:
@@ -5782,9 +6508,14 @@ class Converter:
         if lines and lines[0] == "GENERATE":
             out.append(f"*{kw}, {kw}={name}, GENERATE")
             out.extend(lines[1:])
+            if record is not None:
+                a, b, inc = (int(x) for x in lines[1].split(","))
+                record.record(out[-2], list(range(a, b + 1, inc)))
         else:
             out.append(f"*{kw}, {kw}={name}")
             out.extend(lines)
+            if record is not None:
+                record.record(out[-1 - len(lines)], list(ids))
 
     def emit_other(self, blocks: List[Block]) -> List[str]:
         out: List[str] = []
@@ -20236,576 +20967,10 @@ class Converter:
         every value is in force from the first increment, as in Abaqus (plain lines ramp from
         0 where the perturbation step removed them).  A static perturbation step after another
         step (``_sp_add``) has its own lines on what the base state loads given as the sum of
-        the two (``added``)."""
+        the two (BaseStateRestore._add_base)."""
         if not self._restore_from and not self._sp_add and not self._sp_temps:
             return deck
-        # the converted loads' nodal-force *CLOADs: the run of them after the comment so saying
-        generated: set = set()
-        gen = any(t.startswith(self._NODAL_FORCES) for t in deck.notes)
-        for b in deck.cards:
-            gen = gen and b.keyword == "CLOAD"
-            if gen:
-                generated.add(id(b))
-            gen = gen or any(t.startswith(self._NODAL_FORCES) for t in b.notes)
-        if len(deck.steps) != self._step_idx:
-            self.report.warn("The converted deck's steps do not match the deck's: the base state is "
-                             "not given again after its linear perturbation steps, whose loads and "
-                             "BC changes ccx carries on.", once=True)
-            self._reduces("loads / BCs of linear perturbation steps carried on")
-            return deck
-        sets: Dict[Tuple[str, str], List[Block]] = {}
-        surfs: Dict[str, Block] = {}
-        amps: Dict[str, Optional[AmplitudeCurve]] = {}
-        period: Dict[int, Optional[float]] = {}
-        procs: Dict[int, str] = {}
-        heads: Dict[int, Block] = {}                # each step's *STEP card
-        by_step: Dict[int, List[EmittedCard]] = {}  # step (0: model data) -> its _RESTORED cards
-        anchor: Dict[int, EmittedCard] = {}         # step -> the card its restore follows
-        for b in deck.cards:
-            kw, s = b.keyword, b.step
-            if kw in ("NSET", "ELSET"):
-                sets.setdefault((kw, b.uparam(kw)), []).append(b)
-            elif kw == "SURFACE" and (b.uparam("TYPE") or "ELEMENT") == "ELEMENT":
-                surfs[b.uparam("NAME")] = b
-            elif kw == "AMPLITUDE" and b.param("NAME"):
-                amps[b.uparam("NAME")] = amplitude_curve(b)
-            if kw in self._RESTORED and s >= 0:
-                by_step.setdefault(s, []).append(b)
-        for st in deck.steps:
-            s = st.number
-            heads[s], anchor[s] = st.head, st.proc or st.head
-            if st.proc is not None:
-                procs[s] = st.proc.keyword
-                rec = (st.proc.records() or [[]])[0]
-                try:
-                    period[s] = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
-                except ValueError:
-                    period[s] = None
-        memo: Dict[Tuple[str, str], Optional[List[int]]] = {}
-
-        def members(kind: str, token: str) -> Optional[List[int]]:
-            """The ids a node / element token names (None: not a set this deck defines)."""
-            if re.fullmatch(r"[-+]?\d+", token):
-                return [int(token)]
-            key = (kind, token.upper())
-            if key not in memo:
-                memo[key] = None                   # (a set naming itself)
-                memo[key] = set_ids(kind, sets[key]) if key in sets else None
-            return memo[key]
-
-        def set_ids(kind: str, defs: List[Block]) -> Optional[List[int]]:
-            ids: List[int] = []
-            for b in defs:
-                for rec in b.records():
-                    f = [x for x in rec if x]
-                    if b.has("GENERATE"):
-                        try:
-                            ids += range(pint(f[0]), pint(f[1]) + 1, pint(f[2]) if len(f) > 2 else 1)
-                        except (IndexError, ValueError):
-                            return None
-                        continue
-                    for x in f:
-                        sub = members(kind, x)
-                        if sub is None:
-                            return None
-                        ids += sub
-            return ids
-
-        def faces(token: str) -> Optional[List[Tuple[int, str]]]:
-            """The (element, face) pairs of an element-face *SURFACE (None: not one)."""
-            b = surfs.get(token.upper())
-            if b is None or any(len(rec) < 2 for rec in b.records()):
-                return None
-            pairs = [(members("ELSET", rec[0]), rec[1].upper()) for rec in b.records()]
-            return None if any(es is None for es, _ in pairs) else [(e, f) for es, f in pairs for e in es]
-
-        def direction(label: str, fields: List[str]) -> tuple:
-            """A body load's direction / axis fields as ccx compares them (GRAV's and
-            CENTRIF's axis as unit vectors)."""
-            try:
-                v = [pf(x) if x else 0.0 for x in fields]
-            except ValueError:
-                return tuple(x.upper() for x in fields)
-            j = {"GRAV": 0, "CENTRIF": 3}.get(label)
-            if j is not None and len(v) >= j + 3:
-                n = math.sqrt(sum(x * x for x in v[j:j + 3])) or 1.0
-                v[j:j + 3] = [x / n for x in v[j:j + 3]]
-            return tuple(round(x, 9) + 0.0 for x in v)
-
-        def keys(kw: str, rec: List[str]) -> List[tuple]:
-            """What a *CLOAD / *DLOAD line loads, as ccx keys it: a node DOF, an element face
-            (on a surface: the surface's faces), a body load per set and direction; an
-            unknown set: its name."""
-            label = rec[1].upper() if len(rec) > 1 else ""
-            if kw == "CLOAD":
-                ns, d = members("NSET", rec[0]), dof_number(label)
-                return [(n, d) for n in ns] if ns is not None and d else [(rec[0].upper(), label)]
-            if label in self._BODY_LOADS:
-                return [(rec[0].upper(), label) + direction(label, rec[3:])]
-            fs = faces(rec[0])
-            if fs is not None:
-                return [("S", e, f, label) for e, f in fs]
-            es = members("ELSET", rec[0])
-            return [(e, label) for e in es] if es is not None else [(rec[0].upper(), label)]
-
-        hold = self.HOLD_AMP
-        while hold in amps:
-            hold += "_"
-        used_hold = [False]
-        model_cards: List[str] = []                # surfaces the restore cards need
-
-        def line(b: Block, rec: List[str], s: int) -> Tuple[tuple, str]:
-            """(the card parameters, the data line) of a base-state line given again in step
-            ``s``: its end value on the constant amplitude, or as it is on a TIME=TOTAL TIME
-            amplitude (and a FIXED / USER card's line, and a BC on a node with a *TRANSFORM,
-            where ccx allows one amplitude per node)."""
-            kw, given_in = b.keyword, b.step
-            params = [(k, v) for k, v in b.params.items() if k not in ("OP", "AMPLITUDE", "TIME DELAY")]
-            amp = b.uparam("AMPLITUDE")
-            factor: Optional[float] = 1.0
-            if amp and amp != self.CCX_RAMP:        # (ccx's step ramp ends at the full value)
-                curve = amps[amp] if amp in amps else None
-                if curve and curve.total:          # it goes on as it is
-                    return tuple(params + [(k, v) for k, v in b.params.items()
-                                           if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
-                end = period.get(given_in or 1)    # (model data: from the first step on)
-                try:
-                    factor = curve.value(end - pf(b.param("TIME DELAY") or "0")) \
-                        if curve and end is not None else None
-                except ValueError:
-                    factor = None
-                if factor is None:
-                    self.report.warn(f"*{kw} given again in step {s}, after a linear perturbation "
-                                     f"step: the value amplitude {amp} reached at the end of step "
-                                     f"{given_in or 1} is unknown to the converter, so the line "
-                                     f"keeps the amplitude, which ccx evaluates in step {s} again.",
-                                     once=True)
-                    self._reduces(f"*{kw} on amplitude {amp} after a perturbation step")
-                    return tuple(params + [(k, v) for k, v in b.params.items()
-                                           if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
-            rec = list(rec)
-            if factor != 1.0:
-                for j in range(self._VALUE_FIELD[kw], len(rec) if kw == "TEMPERATURE" else
-                               min(len(rec), self._VALUE_FIELD[kw] + 1)):
-                    try:
-                        rec[j] = short_real(pf(rec[j]) * factor, 12) if rec[j] else rec[j]
-                    except ValueError:
-                        pass
-            if b.has("FIXED") or b.has("USER") or (kw == "BOUNDARY" and self._transformed and any(
-                    n in self._transformed for n in members("NSET", rec[0]) or [])):
-                return tuple(params), ", ".join(rec)
-            used_hold[0] = True
-            return tuple(params + [("AMPLITUDE", hold)]), ", ".join(rec)
-
-        def valued(b: Block, rec: List[str]) -> bool:
-            """Whether a BC line holds a DOF at anything but a fixed zero."""
-            try:
-                return b.has("AMPLITUDE") or b.has("FIXED") or \
-                    (len(rec) > 3 and bool(rec[3]) and pf(rec[3]) != 0.0)
-            except ValueError:
-                return True
-
-        def part(b: Block, rec: List[str], left: List[tuple],
-                 prefix: str = "ABQ2CCX_BASE_") -> List[Tuple[Block, List[str]]]:
-            """A load line given again on part of what it loads: per node DOF / element face,
-            on a surface of the faces left."""
-            if left[0][0] != "S":
-                return [(b, [str(k[0])] + ([str(k[1])] if b.keyword == "CLOAD" else rec[1:2]) + rec[2:])
-                        for k in left]
-            name = self._fresh_name(f"{prefix}{rec[0]}")
-            self._sheet_surfaces.add(name)          # (_surfaces_last: after the set lines)
-            model_cards.extend([f"*SURFACE, NAME={name}, TYPE=ELEMENT"] +
-                               [f"{e}, {f}" for _, e, f, _ in left])
-            return [(b, [name] + rec[1:])]
-
-        def end_factor(b: Block) -> Optional[float]:
-            """The factor a base-state card's amplitude reaches at the end of its step (None:
-            unknown to the converter, as on a FIXED / USER card or an amplitude it does not
-            read at that time)."""
-            if b.has("FIXED") or b.has("USER"):
-                return None
-            amp = b.uparam("AMPLITUDE")
-            if amp and amp != self.CCX_RAMP:
-                curve, end = amps.get(amp), period.get(b.step or 1)
-                if curve is None or curve.total or curve.absolute or end is None:
-                    return None
-                try:
-                    return curve.value(end - pf(b.param("TIME DELAY") or "0"))
-                except ValueError:
-                    return None
-            return 1.0
-
-        def end_value(b: Block, rec: List[str]) -> Optional[float]:
-            """The value a base-state line holds at the end of its step (None: unknown)."""
-            factor, j = end_factor(b), self._VALUE_FIELD[b.keyword]
-            try:
-                return None if factor is None else \
-                    (pf(rec[j]) if len(rec) > j and rec[j] else 0.0) * factor
-            except (TypeError, ValueError):
-                return None
-
-        def temperature(rec: List[str], factor: Optional[float] = 1.0) -> Optional[Tuple[float, ...]]:
-            """A temperature line's values: the temperature, then a shell's or beam's
-            gradients or the values at its section points (a blank field: 0; trailing blank
-            ones dropped), times ``factor`` (None: unknown)."""
-            vals = list(rec[1:])
-            while len(vals) > 1 and not vals[-1]:
-                vals.pop()
-            try:
-                return None if factor is None else tuple(pf(x) * factor if x else 0.0 for x in vals or [""])
-            except ValueError:
-                return None
-
-        def bc_keys(rec: List[str]) -> Optional[List[Tuple[int, int]]]:
-            """The (node, DOF) pairs a BC line holds (None: not known to the converter)."""
-            ns = members("NSET", rec[0])
-            try:
-                d1 = pint(rec[1])
-                d2 = pint(rec[2]) if len(rec) > 2 and rec[2] else d1
-            except (IndexError, ValueError):
-                return None
-            return None if ns is None else [(n, d) for n in ns for d in range(d1, d2 + 1)]
-
-        summed: List[int] = []
-        held: List[int] = []                        # the steps given *BOUNDARY, FIXED
-        inexact: Dict[str, List[str]] = {}          # why -> where
-
-        def base_temperatures(s: int) -> Tuple[Dict[int, Optional[Tuple[float, ...]]],
-                                                Optional[Tuple[float, ...]]]:
-            """The base state's temperatures at static perturbation step ``s``: (node -> its
-            values (temperature()), those of the other nodes: none, 0), from the initial
-            conditions and the general steps' *TEMPERATURE lines; None where the converter
-            does not know them (a FILE / USER / INPUT card, an unknown set, temperatures a
-            heat transfer step solved)."""
-            unknown: Tuple[Dict[int, Optional[Tuple[float, ...]]], Optional[Tuple[float, ...]]] = \
-                ({}, None)
-            ics = [b for b in deck.model if b.keyword == "INITIAL CONDITIONS" and
-                   b.uparam("TYPE") == "TEMPERATURE"]
-            if any(procs.get(k) in TEMPERATURE_DOF_PROCS or any(
-                    b.keyword == "TEMPERATURE" and (b.has("FILE") or b.has("USER"))
-                    for b in by_step.get(k, [])) for k in range(1, s) if k not in self._pert_idx) or \
-                    any(b.has("FILE") or b.has("USER") or b.has("INPUT") for b in ics):
-                return unknown
-            got: Dict[int, Optional[Tuple[float, ...]]] = {}
-            for b, rec in [(b, rec) for b in ics for rec in b.records() if rec and rec[0]] + \
-                    lines["TEMPERATURE"]:
-                ns = members("NSET", rec[0])
-                if ns is None:
-                    return unknown
-                v = temperature(rec, end_factor(b) if b.keyword == "TEMPERATURE" else 1.0)
-                got.update((n, v) for n in ns)
-            return got, ()
-
-        def added(s: int) -> None:
-            """Static perturbation step ``s``: Abaqus reads its load, BC and temperature values
-            as changes of the base state's ("not the total of the base state load plus the
-            perturbation load"; temperatures: the initial ones where no general step gave
-            any), ccx 2.23 a value given on what the base state loads (a node DOF, a face, a
-            body load's set and direction, a node's temperature) as its new value (probed).
-            Such a line gets the base value added (exact for a linear step), split where it
-            loads part of that only.  A zero BC on a DOF the base state leaves free holds its
-            base-state value: *BOUNDARY, FIXED, which ccx holds at the value the step before
-            ends at (``fixed``), the base state's where that is the general step or *FREQUENCY
-            steps follow it (probed; not after a static perturbation, *BUCKLE or *MODAL
-            DYNAMIC step), on the DOFs FIXED can hold (_holdable).  ``inexact``: what cannot be
-            given so."""
-            base: Dict[str, Dict[tuple, Optional[float]]] = {kw: {} for kw in ("BOUNDARY", "CLOAD", "DLOAD")}
-            for kw in contrib:
-                for b, rec, ks in contrib[kw]:
-                    v = end_value(b, rec)
-                    for k in ks:
-                        if owner[kw].get(k) == b.step:    # (two lines of a step add up)
-                            old = base[kw].get(k, 0.0)
-                            base[kw][k] = None if old is None or v is None else old + v
-            for b, rec in lines["BOUNDARY"]:
-                for k in bc_keys(rec) or []:
-                    base["BOUNDARY"][k] = end_value(b, rec)
-            deformed = any(contrib.values()) or bool(lines["TEMPERATURE"]) or \
-                any(valued(b, rec) for b, rec in lines["BOUNDARY"])
-            mine = [b for b in by_step.get(s, []) if (b.keyword in base or b.keyword == "TEMPERATURE")
-                    and id(b) not in generated]
-            temps, rest = base_temperatures(s) if any(b.keyword == "TEMPERATURE" for b in mine) \
-                else ({}, ())
-
-            def hot(t: Optional[Tuple[float, ...]]) -> bool:
-                """Whether base-state temperatures differ from 0 (or are unknown)."""
-                return t is None or any(t)
-            fixable = s not in self._restore_from or self._restore_procs[s] <= {"FREQUENCY"}
-            fixed: List[Tuple[int, int]] = []
-            first_bc = next((b for b in mine if b.keyword == "BOUNDARY"), None)
-            if deformed and first_bc is not None and first_bc.uparam("OP") == "NEW":
-                given = {k for b in mine if b.keyword == "BOUNDARY" for rec in b.records()
-                         if rec and rec[0] for k in bc_keys(rec) or []}
-                if any(k not in given for k in base["BOUNDARY"]):
-                    inexact.setdefault("releases DOFs the base state holds (*BOUNDARY, OP=NEW; "
-                                       "Abaqus keeps their base-state reaction forces, ccx removes "
-                                       "them too)", []).append(str(s))
-            for b in mine:
-                kw, j = b.keyword, self._VALUE_FIELD[b.keyword]
-                lines_of = b.rows
-                if kw == "TEMPERATURE" and (b.has("FILE") or b.has("USER")) and \
-                        (hot(rest) or any(hot(x) for x in temps.values())):
-                    inexact.setdefault("changes what the base state loads by a value the "
-                                       "converter cannot add to the base one (an amplitude, "
-                                       "FIXED or USER on either line; ccx replaces it)",
-                                       []).append(f"{s} (*TEMPERATURE)")
-                if len(lines_of) != len(b.records()):
-                    continue
-                for i, rec in zip(lines_of, b.records()):
-                    if not rec or not rec[0]:
-                        continue
-                    ks = bc_keys(rec) if kw == "BOUNDARY" else members("NSET", rec[0]) \
-                        if kw == "TEMPERATURE" else keys(kw, rec)
-                    if ks is None:
-                        continue
-                    try:
-                        v = pf(rec[j]) if len(rec) > j and rec[j] else 0.0
-                    except ValueError:
-                        v = None
-                    pv = temperature(rec) if kw == "TEMPERATURE" else None
-                    if kw == "TEMPERATURE":
-                        on = {k: temps.get(k, rest) for k in ks if hot(temps.get(k, rest))}
-                        if hot(pv) and self._sp_temp_dep:
-                            inexact.setdefault("changes temperatures, which Abaqus leaves out of "
-                                               "the temperature-dependent material properties "
-                                               "(those of the base state), ccx not",
-                                               []).append(f"{s} (*TEMPERATURE {rec[0]})")
-                    else:
-                        on = {k: base[kw][k] for k in ks if k in base[kw] and base[kw][k] != 0.0}
-                    fix_ks: List[Tuple[int, int]] = []
-                    if kw == "BOUNDARY" and deformed:
-                        free = [k for k in ks if k not in base[kw]]
-                        if fixable and v == 0.0 and not b.has("AMPLITUDE") and not b.has("USER"):
-                            fix_ks = [k for k in free if self._holdable(*k)]
-                        if len(fix_ks) < len(free):
-                            inexact.setdefault("prescribes DOFs the base state leaves free (Abaqus: "
-                                               "relative to their base-state displacement, which "
-                                               "the converter does not know; ccx: as the total one) "
-                                               "by a nonzero value, or holds one where *BOUNDARY, "
-                                               "FIXED cannot (a rotation, a node with a *TRANSFORM, "
-                                               "a perturbation step other than *FREQUENCY before)",
-                                               []).append(f"{s} (*BOUNDARY {rec[0]})")
-                        if b.has("FIXED"):
-                            fix_ks = []             # (ccx holds those already)
-                            on = {k: a for k, a in on.items() if not (fixable and self._holdable(*k))}
-                    if not on and not fix_ks:
-                        continue
-                    if on and (b.uparam("AMPLITUDE") not in ("", self.CCX_RAMP) or b.has("FIXED") or
-                               b.has("USER") or None in on.values() or v is None or
-                               (kw == "TEMPERATURE" and (pv is None or any(
-                                   len(a) != len(pv) for a in on.values())))):
-                        inexact.setdefault("changes what the base state loads by a value the "
-                                           "converter cannot add to the base one (an amplitude, "
-                                           "FIXED or USER on either line, temperatures with other "
-                                           "gradients or section points than the base state's; "
-                                           "ccx replaces it)",
-                                           []).append(f"{s} (*{kw} {rec[0]})")
-                        if not fix_ks:
-                            continue
-                        on = {}
-                    groups: Dict[object, List[tuple]] = {}
-                    for k in ks:
-                        if k not in fix_ks:
-                            groups.setdefault(on.get(k, () if kw == "TEMPERATURE" else 0.0), []).append(k)
-                    got: List[str] = []
-                    for a, part_ks in groups.items():
-                        r = list(rec) + [""] * (j + 1 - len(rec))
-                        if kw == "TEMPERATURE":         # (each value: gradients, section points)
-                            r = r[:j] + [short_real(x + y, 12) for x, y in
-                                         zip(pv, a or (0.0,) * len(pv))]
-                        else:
-                            r[j] = short_real(v + a, 12)
-                        if kw == "BOUNDARY" and not r[2]:
-                            r[2] = r[1]             # (a BC line's blank last DOF: its first)
-                        if len(groups) == 1 and not fix_ks:
-                            got.append(", ".join(r))
-                        elif kw == "BOUNDARY":
-                            got += [", ".join([str(n), str(d), str(d)] + r[3:]) for n, d in part_ks]
-                        elif kw == "TEMPERATURE":
-                            got += [", ".join([str(n)] + r[1:]) for n in part_ks]
-                        else:
-                            got += [", ".join(x) for _, x in part(b, r, part_ks, "ABQ2CCX_SUM_")]
-                    deck.swap(i, got)       # (a surface's faces on surfaces, a set's one by one)
-                    fixed.extend(fix_ks)
-                    if on and s not in summed:
-                        summed.append(s)
-            if fixed:
-                deck.insert_after(
-                    [b for b in mine if b.keyword == "BOUNDARY"][-1],
-                    ["** abq2ccx: held at their base-state values (zero perturbations of DOFs the "
-                     "base state leaves free)", "*BOUNDARY, FIXED"] +
-                    [f"{n}, {d}, {d}" for n, d in fixed])
-                held.append(s)
-
-        def restore(s: int) -> List[str]:
-            """The cards that give step ``s`` the base state again."""
-            own = by_step.get(s, [])
-            between = range(self._restore_from[s] + 1, s)
-            touched = {b.keyword for k in between for b in by_step.get(k, [])}
-            regiven: set = set()                    # card types the step gives again itself
-            res: List[str] = []
-            for kw in self._RESTORED:
-                mine = [b for b in own if b.keyword == kw]
-                if deck.steps[s - 1].acting(kw) is not None or \
-                        (kw == "BOUNDARY" and s not in self._restore_pairs) or \
-                        (kw == "TEMPERATURE" and procs.get(s) in TEMPERATURE_DOF_PROCS):
-                    continue
-                if any(b.uparam("OP") == "NEW" for b in mine):    # (Abaqus: the earlier steps' go)
-                    res.append(emit_keyword(kw, OrderedDict([("OP", "NEW")])))
-                    continue
-                entries: List[Tuple[Block, List[str]]] = []
-                if kw in contrib:
-                    given = {k for b in mine for rec in b.records() if rec and rec[0]
-                             for k in keys(kw, rec)}
-                    for b, rec, ks in contrib[kw]:
-                        live = [k for k in ks if owner[kw].get(k) == b.step]
-                        left = [k for k in live if k not in given]
-                        if len(left) == len(ks):
-                            entries.append((b, rec))
-                        elif left:
-                            entries += part(b, rec, left)
-                        if len(left) < len(live):
-                            regiven.add(kw)
-                    if not entries and kw not in touched:
-                        continue
-                else:
-                    entries = list(lines[kw])
-                    if kw == "BOUNDARY" and s not in self._restore_new and kw not in touched:
-                        # only *FREQUENCY's zeroed values to give back: from the first valued
-                        # line on (a later zero line may override it)
-                        first = next((j for j, (b, rec) in enumerate(entries) if valued(b, rec)), None)
-                        entries = entries[first:] if first is not None else []
-                    if kw == "TEMPERATURE" and mine:
-                        base = {n for b, rec in entries for n in members("NSET", rec[0]) or []}
-                        if any(n in base for b in mine for rec in b.records() if rec
-                               for n in members("NSET", rec[0]) or []):
-                            regiven.add(kw)
-                    if not entries and kw not in touched:
-                        continue
-                runs: List[list] = []
-                for b, rec in entries:
-                    params, text = line(b, rec, s)
-                    if runs and runs[-1][0] == params:
-                        runs[-1][1].append(text)
-                    else:
-                        runs.append([params, [text]])
-                if kw != "BOUNDARY" or s in self._restore_new:
-                    runs = runs or [[(), []]]
-                    runs[0][0] = (("OP", "NEW"),) + runs[0][0]
-                for params, texts in runs:
-                    res.append(emit_keyword(kw, OrderedDict(params)))
-                    res += self._surfaces_last(texts) if kw == "DLOAD" else texts
-            # loads and temperatures the step gives again after a step that dropped them start
-            # from 0 / the initial temperature in ccx, from the base state in Abaqus (a static
-            # perturbation step ramps nothing there)
-            reset = {kw for kw in regiven for k in between if s not in self._pert_idx
-                     if (procs.get(k) in self._RESETS[kw] and
-                         (kw == "TEMPERATURE" or k not in self._modal_held)) or
-                     (kw != "DLOAD" and k in heads and heads[k].has("PERTURBATION"))}
-            # (moot where ccx segfaults before: _yield_segfaults)
-            if reset and procs.get(s) == "STATIC" and not any(k <= s for k in self._yield_segv):
-                what = " and ".join(f"*{kw}" for kw in self._RESTORED if kw in reset)
-                (self.report.warn if self._restore_yields else self.report.note)(
-                    f"Step {s} gives again {what} values that the linear perturbation step before "
-                    f"it dropped in ccx 2.23: ccx ramps them from 0 (temperatures: from the initial "
-                    f"ones) where Abaqus ramps them from the base state's values — the same end "
-                    f"values by another path, which matters for a yielding material.", once=True)
-                if self._restore_yields:
-                    self._reduces("loads given again after a perturbation step ramp from 0")
-            return res
-
-        # the base state, step by step (a perturbation step's cards do not change it)
-        lines: Dict[str, List[Tuple[Block, List[str]]]] = {"BOUNDARY": [], "TEMPERATURE": []}
-        contrib: Dict[str, List[Tuple[Block, List[str], List[tuple]]]] = {"CLOAD": [], "DLOAD": []}
-        owner: Dict[str, Dict[tuple, int]] = {"CLOAD": {}, "DLOAD": {}}
-        done: List[int] = []
-        for s in range(len(deck.steps) + 1):
-            if s in self._restore_from and s in anchor:
-                got = restore(s)
-                if got:
-                    last = self._restore_from[s]
-                    deck.insert_after(anchor[s], [
-                        f"** abq2ccx: the loads, BCs and temperatures "
-                        f"{'of step %d' % last if last else 'before the first step'} "
-                        f"given again (linear perturbation step(s) "
-                        f"{', '.join(map(str, range(last + 1, s)))} in between)"] + got)
-                    done.append(s)
-            if s in self._sp_add or s in self._sp_temps:
-                added(s)
-            if s in self._pert_idx:                 # (a static perturbation step: given it above)
-                continue
-            st = deck.steps[s - 1] if s else None   # (model data: no state to remove yet)
-            for b in by_step.get(s, []):
-                kw = b.keyword
-                if st is not None and b is st.acting(kw):
-                    if kw in lines:
-                        lines[kw] = []
-                    else:
-                        contrib[kw], owner[kw] = [], {}
-                for rec in b.records():
-                    if not rec or not rec[0]:
-                        continue
-                    if kw in lines:
-                        lines[kw].append((b, rec))
-                    else:
-                        ks = keys(kw, rec)
-                        contrib[kw].append((b, rec, ks))
-                        for k in ks:
-                            owner[kw][k] = s
-            for kw in contrib:                      # forget what later steps replaced
-                contrib[kw] = [e for e in contrib[kw] if any(owner[kw].get(k) == e[0].step
-                                                             for k in e[2])]
-        for why, where in inexact.items():
-            self.report.warn(f"Static perturbation step{'s' if len(where) > 1 else ''} "
-                             f"{', '.join(where)} {why}, so ccx 2.23 does not solve "
-                             f"{'them' if len(where) > 1 else 'it'} for the base state plus the "
-                             f"perturbation there.", once=True)
-            self._reduces("static perturbation step not the base state plus its perturbation")
-        if summed:
-            self.report.note(f"Static perturbation step{'s' if len(summed) > 1 else ''} "
-                             f"{', '.join(map(str, summed))}: Abaqus reads a load, BC or temperature "
-                             f"value given on what the base state also loads as a change of the base "
-                             f"value (temperatures: of the initial ones where no general step gave "
-                             f"any), ccx 2.23 as its new value (probed), so the base value is added "
-                             f"to it.", once=True)
-        if held:
-            self.report.note(f"Static perturbation step{'s' if len(held) > 1 else ''} "
-                             f"{', '.join(map(str, held))}: a zero BC on a DOF the base state leaves "
-                             f"free holds it at its base-state value in Abaqus, so it is written as "
-                             f"*BOUNDARY, FIXED, which ccx 2.23 holds at the value of the step before: "
-                             f"the base state's (probed).", once=True)
-        if not deck.changed:
-            return deck
-        at_once = f", in force at once (amplitude {hold})" if used_hold[0] else ""
-        general = [s for s in done if s not in self._pert_idx]
-        if general:
-            self.report.note(f"Step{'s' if len(general) > 1 else ''} {', '.join(map(str, general))} "
-                             f"follow{'' if len(general) > 1 else 's'} a linear perturbation step: "
-                             f"Abaqus continues from the last general step's state, while ccx 2.23 "
-                             f"carries a perturbation step's loads and BC changes on, and its own "
-                             f"procedures change that state (probed: *FREQUENCY zeroes prescribed BC "
-                             f"values; *BUCKLE, *STEP, PERTURBATION and steady-state dynamics remove "
-                             f"earlier loads and reset temperatures). The loads, boundary conditions "
-                             f"and temperatures of that state are given again at the start of "
-                             f"{'those steps' if len(general) > 1 else 'it'}{at_once}.", once=True)
-        static = [s for s in done if s in self._pert_idx]
-        if static:
-            self.report.note(f"Static perturbation step{'s' if len(static) > 1 else ''} "
-                             f"{', '.join(map(str, static))} after other linear perturbation steps: "
-                             f"Abaqus applies only the loads and BCs such a step gives itself, ccx "
-                             f"2.23 the earlier perturbation steps' too (probed: *MODAL DYNAMIC, "
-                             f"*BUCKLE, *FREQUENCY, steady-state dynamics and static perturbation "
-                             f"steps). The loads, boundary conditions and temperatures of the base "
-                             f"state are given again at the start of "
-                             f"{'those steps' if len(static) > 1 else 'it'}{at_once}.", once=True)
-        if used_hold[0] or model_cards:
-            head = next(st.head for st in deck.steps
-                        if deck.lines[st.head.line].strip().upper().startswith("*STEP"))
-            deck.insert_before(head, [
-                "** abq2ccx: for the state given again after linear perturbation steps"] +
-                ([f"*AMPLITUDE, NAME={hold}"] + amplitude_lines([(0.0, 1.0), (1.0, 1.0)])
-                 if used_hold[0] else []) + model_cards)
-        return deck.edited()
+        return BaseStateRestore(self, deck, self._mesh_sets).run()
 
     def _buckle_displacements(self, deck: EmittedDeck) -> EmittedDeck:
         """ccx 2.23 does not solve a *STEP, PERTURBATION *BUCKLE step for its prescribed
