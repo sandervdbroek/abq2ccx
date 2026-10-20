@@ -4014,6 +4014,10 @@ PRESELECT_CONTACT = {
 PERTURBATION_PROCS = {"FREQUENCY", "BUCKLE", "COMPLEX FREQUENCY", "MODAL DYNAMIC",
                       "STEADY STATE DYNAMICS", "RANDOM RESPONSE", "RESPONSE SPECTRUM",
                       "SUBSTRUCTURE GENERATE", "MATRIX GENERATE"}
+# The procedures whose data line gives the step's time period, 2nd field (abaqus_period)
+PERIOD_PROCS = {"STATIC", "GEOSTATIC", "DYNAMIC", "VISCO", "HEAT TRANSFER", "SOILS",
+                "COUPLED TEMPERATURE-DISPLACEMENT", "UNCOUPLED TEMPERATURE-DISPLACEMENT",
+                "MODAL DYNAMIC"}
 # The Abaqus procedures in which an element's mass gives inertia (its mass matrix), and the
 # *DLOAD labels of mass-proportional loads (StepModel.inertia, mass_loads, mass_acts).
 # Abaqus/Standard's transient *COUPLED TEMPERATURE-DISPLACEMENT neglects inertia.
@@ -4803,6 +4807,27 @@ def perturbation_step(cards: Sequence[Block]) -> bool:
     return cards[0].has("PERTURBATION") or (proc is not None and proc.keyword in PERTURBATION_PROCS)
 
 
+def abaqus_period(card: Optional[Block], perturbation: bool) -> Optional[float]:
+    """Abaqus' time period of a step whose procedure card (step_procedure) is ``card``
+    (Step.period): its data line's 2nd field, 1.0 where it has none (the default; Abaqus runs
+    a steady-state heat transfer step without a data line) or a zero one in *STATIC and
+    *GEOSTATIC ("If this entry is zero or is not specified, a default value of 1.0 is
+    assumed").  None for a procedure without one, a Riks step ("the concept of time is
+    replaced by arc length"; amplitude references are ignored), a linear perturbation step
+    but *MODAL DYNAMIC, and a value Abaqus documents no reading of (zero elsewhere, negative)."""
+    if card is None or card.keyword not in PERIOD_PROCS or card.has("RIKS") or \
+            (perturbation and card.keyword != "MODAL DYNAMIC"):
+        return None
+    rec = (merged_data_records(card) or [[]])[0]
+    try:
+        period = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
+    except ValueError:
+        return None
+    if period == 0.0 and card.keyword in ("STATIC", "GEOSTATIC"):
+        return 1.0
+    return period if period > 0.0 else None
+
+
 def _nlgeom_given(b: Block) -> Optional[bool]:
     """NLGEOM= on *STEP ``b``: True for NLGEOM / NLGEOM=YES, False for NLGEOM=NO, None if absent."""
     return (b.param("NLGEOM") or "YES").strip().upper() != "NO" if b.has("NLGEOM") else None
@@ -4860,15 +4885,17 @@ class Step:
     lc2_repeats: bool             # they hold what the step's LOAD CASE=1 cards hold in ccx (the Abaqus/
                                   # CAE default): the same lines, and both or neither with OP=NEW (or
                                   # no BC in force before the step)
-    # how its nodes move, by motion_proc's card (_plan_velocity_bcs, _plan_default_amplitudes,
-    # _dofs_at_rest, the deck's amp_span):
+    # its time in Abaqus, every reader's (the motion below, the held end of a step-time
+    # amplitude: EmitState.period, BaseStateRestore, the deck's amp_span):
+    period: Optional[float]       # Abaqus' time period, over which the step and its step-time
+                                  # amplitudes run (abaqus_period; None: none, or unknown)
+    advance: Optional[float]      # the time it adds to Abaqus' total time: period, 0 in a linear
+                                  # perturbation step (None when unknown)
+    t_start: Optional[float]      # Abaqus' total time at its start: the earlier steps' advance (None
+                                  # once one is unknown)
+    # how its nodes move, by motion_proc's card (_plan_velocity_bcs: over period where they move,
+    # _plan_default_amplitudes, _dofs_at_rest):
     motion_label: str             # motion_proc, with ", RIKS"; "(no procedure)" if none
-    period: Optional[float]       # the time period over which its nodes move (None for Riks, heat
-                                  # transfer, a linear perturbation, ...)
-    advance: Optional[float]      # the time it adds to the total time (0 for a perturbation step,
-                                  # None when unknown)
-    t_start: Optional[float]      # the total time at its start: the earlier steps' advance (None once
-                                  # one is unknown)
     defaults: Dict[str, str]      # the Abaqus default amplitude of its DISPLACEMENT, VELOCITY and
                                   # ACCELERATION BCs (not to be changed)
     ccx_amp: str                  # the one ccx gives a load or BC without AMPLITUDE in the converted
@@ -4921,25 +4948,11 @@ class StepModel:
         return given
 
     @staticmethod
-    def _motion(head: Block, card: Optional[Block], perturbation: bool
-                ) -> Tuple[Optional[float], Optional[float], Dict[str, str], str]:
-        """(period, advance, defaults, ccx_amp) of a step (Step) whose *STEP card is ``head``
-        and whose motion_proc card is ``card``."""
+    def _motion(head: Block, card: Optional[Block]) -> Tuple[Dict[str, str], str]:
+        """(defaults, ccx_amp) of a step (Step) whose *STEP card is ``head`` and whose
+        motion_proc card is ``card``."""
         proc = card.keyword if card is not None else ""
         explicit = proc == "DYNAMIC" and card.has("EXPLICIT")
-        period = None
-        advance: Optional[float] = 0.0 if perturbation else None
-        if (proc in Converter._MOTION_PROCS or proc == "HEAT TRANSFER") and not card.has("RIKS") \
-                and not perturbation:
-            rec = (merged_data_records(card) or [[]])[0]
-            try:
-                advance = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0     # Abaqus default 1
-            except ValueError:
-                advance = None
-            if advance is not None and not advance > 0.0:
-                advance = None
-            if proc != "HEAT TRANSFER":
-                period = advance
         # the default amplitude of loads and BCs (Abaqus manual, "Defining an analysis",
         # Table 1): STEP in Abaqus/Explicit and in transient procedures, RAMP in static and
         # steady-state ones; *STEP AMPLITUDE overrides it in Abaqus/Standard
@@ -4981,7 +4994,7 @@ class StepModel:
         else:
             ccx = "RAMP" if proc == "STATIC" or (proc in TEMPERATURE_DOF_PROCS and
                                                  card.has("STEADY STATE")) else "STEP"
-        return period, advance, defaults, ccx
+        return defaults, ccx
 
     def __init__(self, blocks: Sequence[Block], dp: bool = False) -> None:
         """``dp``: the deck has a deformation plasticity material ccx reads (Converter._dp_nlgeom),
@@ -5044,7 +5057,9 @@ class StepModel:
                 repeats = lines(two) == lines(ones) and (new(two) == new(ones) or not based)
             else:
                 lc2, repeats = frozenset(), False
-            period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
+            period = abaqus_period(procedure, pert)
+            advance = 0.0 if pert else period
+            defaults, ccx_amp = self._motion(head, motion_card)
             steps.append(Step(
                 no=len(steps) + 1, cards=tuple(cards), between=tuple(loose), procedure=procedure,
                 proc=proc, proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
@@ -5053,14 +5068,14 @@ class StepModel:
                 temp_dof=kw if kw in TEMPERATURE_DOF_PROCS else None,
                 star_proc="PERTURBATION" if pert_param else
                 proc + (", RIKS" if proc_card.has("RIKS") else "") if proc else "",
-                general_before=seen,
+                general_before=seen, period=period, advance=advance, t_start=t,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
                 lc2=lc2, lc2_repeats=repeats,
                 motion_label=(motion_proc + (", RIKS" if motion_card.has("RIKS") else ""))
                 if motion_proc else "(no procedure)",
-                period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp))
+                defaults=defaults, ccx_amp=ccx_amp))
             t = None if t is None or advance is None else t + advance
             seen = seen or not pert
             based = based or not pert and any(b.keyword == "BOUNDARY" and id(b) not in lc2 and
@@ -5114,25 +5129,18 @@ class StepModel:
         self.freq_read = frozenset(read)
         # the longest step time and the latest total time at which the deck's steps read an
         # amplitude, over which _sample_amplitude tabulates an analytic amplitude (_amp_span;
-        # None if a step's time period is unknown).  A *MODAL DYNAMIC step reads it over its own
-        # time period as well, from the general steps' total time before it (_shift_total_time
-        # takes out what ccx adds to it), though Abaqus adds no perturbation step's time.
+        # None if a step's time period is unknown): each step's period from its start (a *MODAL
+        # DYNAMIC step's too, from the general steps' total time before it: _shift_total_time
+        # takes out what ccx adds to it, though Abaqus adds no perturbation step's time).
         self.amp_span: Optional[Tuple[float, float]] = None
         # ... over the steps before the first one whose time is unknown (amp_span_of)
         self._amp_known: Tuple[int, Optional[Tuple[float, float]]] = (0, None)
-        longest = total = reach = 0.0
+        longest = reach = 0.0
         for s in steps:
-            if s.advance is None:
+            if s.t_start is None or s.advance is None:
                 break
-            period = 0.0
-            for b in (b for b in s.cards[1:] if b.keyword == "MODAL DYNAMIC"):
-                rec = (merged_data_records(b) or [[]])[0]
-                try:
-                    period = max(pf(rec[1]), 0.0) if len(rec) > 1 and rec[1] else 0.0
-                except ValueError:
-                    pass
-            longest, total = max(longest, s.advance, period), total + s.advance
-            reach = max(reach, total + period)
+            period = s.period or 0.0
+            longest, reach = max(longest, period), max(reach, s.t_start + period)
             self._amp_known = (s.no, (longest, reach) if reach > 0.0 else None)
         else:
             if reach > 0.0:
@@ -5828,8 +5836,8 @@ class EmitState:
         self.written: Dict[int, WrittenStep] = {}   # step -> its *STEP card as written
         # the step being written (begin_step; a step ccx stops at keeps the last one's): a static
         # perturbation step after another step, whose loads add to the base state's (_sp_add:
-        # _op_new_load, _set_nodal_load), and its time period, where a step-time amplitude ends
-        # (_load_later, _hold_nodal_loads; None: not known)
+        # _op_new_load, _set_nodal_load), and its time period (Step.period), where a step-time
+        # amplitude ends (_load_later, _hold_nodal_loads; None: none, or not known)
         self.sp_adds = False
         self.period: Optional[float] = 1.0
         # the general steps written so far heat the model (temperatures set or solved) or stress
@@ -5905,7 +5913,7 @@ class EmitState:
         drops PERTURBATION): its record follows, as written."""
         self.written[no].params = OrderedDict(params)
 
-    def begin_step(self, restore: bool, held: bool, sp_adds: bool, period: Optional[float]) -> None:
+    def begin_step(self, restore: bool, held: bool, sp_adds: bool) -> None:
         """The current step's cards come next (handle_step, after its *STEP card; not in a step
         ccx stops at): the per-step bookkeeping starts empty, and the converted loads are those
         ccx holds at its start.  A linear perturbation step's loads act in it only (Abaqus): the
@@ -5913,9 +5921,9 @@ class EmitState:
         them, and so are the next general step's (``restore``: _restore_from), which ccx gets
         back at its start (_restore_base_states); nodal_emitted follows what ccx holds.
         ``held``: a *MODAL DYNAMIC step that keeps the loads ccx holds (_modal_held).
-        ``sp_adds``, ``period``: the step's (the fields)."""
+        ``sp_adds``: the step's (the field)."""
         step = self.step
-        self.sp_adds, self.period = sp_adds, period
+        self.sp_adds, self.period = sp_adds, step.period
         self.nodal_fresh, self.nodal_reset, self.cload_new = set(), set(), False
         self.dl_fresh, self.dl_wiped, self.dl_taken = set(), False, {}
         self.cl_fresh, self.cl_taken = set(), {}
@@ -5990,9 +5998,9 @@ class BaseStateRestore:
         self.generated: set = set()                 # the converted loads' nodal-force *CLOADs
         self.amps: Dict[str, Optional[AmplitudeCurve]] = {}
         self.total_amps: set = set()                # the TIME=TOTAL TIME ones' names
+        # step -> Abaqus' time period (Step.period), and its total time at the end of the last
+        # general step up to it (no perturbation step adds any; None: unknown)
         self.period: Dict[int, Optional[float]] = {}
-        # step -> Abaqus' total time at the end of the last general step up to it (no
-        # perturbation step adds any; None: unknown)
         self.total: Dict[int, Optional[float]] = {}
         self.procs: Dict[int, str] = {}
         self.by_step: Dict[int, List[EmittedCard]] = {}     # step (0: model data) -> its _RESTORED cards
@@ -6059,25 +6067,17 @@ class BaseStateRestore:
                     self.total_amps.add(b.uparam("NAME"))
             if b.keyword in self.conv._RESTORED and b.step >= 0:
                 self.by_step.setdefault(b.step, []).append(b)
-        # each step's procedure and period as written: the planners know them too
-        # (StepModel's Step.proc, Step.period); its *STEP params: self.written
+        # each step's procedure as written; its time from its Step (emitted step s is
+        # written[s].no's: one *STEP line each); its *STEP params: self.written
         for st in deck.steps:
             s = st.number
             self.anchor[s] = st.proc or st.head
             if st.proc is not None:
                 self.procs[s] = st.proc.keyword
-                rec = (st.proc.records() or [[]])[0]
-                try:
-                    self.period[s] = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
-                except ValueError:
-                    self.period[s] = None
-        t: Optional[float] = 0.0                    # (a Riks step's time: its arc length)
-        for st in deck.steps:
-            s = st.number
-            if s not in self.pert:
-                t = None if t is None or self.period.get(s) is None or st.proc.has("RIKS") \
-                    else t + self.period[s]
-            self.total[s] = t
+            step = self.conv.steps.steps[self.written[s].no - 1]
+            self.period[s] = step.period
+            self.total[s] = None if step.t_start is None or step.advance is None else \
+                step.t_start + step.advance
         while self.hold in self.amps:
             self.hold += "_"
 
@@ -12022,16 +12022,8 @@ class Converter:
                  "*EL FILE"] if self.emit.no > 1 else []) + (
                 ["** abq2ccx: the step's other cards, which ccx does not reach:"] +
                 ["** " + x for x in rest] if rest else []) + ["*END STEP"]
-        # the step's time period, where a step-time amplitude ends (_load_later)
-        rec = (merged_data_records(proc_block) or [[]])[0] if proc_block is not None else []
-        try:
-            period = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
-        except ValueError:
-            period = None
-        if self.emit.no in self._pert_idx or (proc_block is not None and proc_block.has("RIKS")):
-            period = None
         self.emit.begin_step(self.emit.no in self._restore_from, self.emit.no in self._modal_held,
-                             self.emit.no in self._sp_add, period)
+                             self.emit.no in self._sp_add)
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
@@ -12705,8 +12697,11 @@ class Converter:
         # step's start)
         acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
         for step, group in zip(self.steps, groups):
-            # the step number, its time period and the total time at its start (None: unknown)
-            s, T, t0 = step.no, step.period, step.t_start
+            # the step number, the time period over which its nodes move and the total time at
+            # its start (None: unknown; no period where they do not move: a linear perturbation
+            # step, a heat transfer step, ...)
+            s, t0 = step.no, step.t_start
+            T = None if step.perturbation or step.motion_proc not in self._MOTION_PROCS else step.period
             dynamic = step.motion_proc == "DYNAMIC"
             cards = [x for x in group[1:] if x.keyword == "BOUNDARY" and id(x) not in self.steps.lc2]
             if T is None:

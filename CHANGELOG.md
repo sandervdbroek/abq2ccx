@@ -17,6 +17,10 @@ physics.
   flattened instance set stays apart; bare flags on a keyword continuation line (`STABILIZE`,
   `FIXED`) are read as flags. `*INITIAL CONDITIONS, TYPE=TEMPERATURE, FILE=` and
   `*FRICTION, ANISOTROPIC` now count as reduced physics.
+* **Step time periods** — a zero time period on `*STATIC` / `*GEOSTATIC`, which Abaqus and ccx
+  read as 1.0, was read as 0 where the converter evaluates a step-time amplitude: a load on one
+  was given back at its time-0 value after a linear perturbation step ("every load lost"), and
+  velocity BCs of the step were not integrated.
 * **Eigenvalue and modal steps ccx gets wrong with knots** — a `*MODAL DYNAMIC` step
   segfaulted ccx on a rotational BC of a shell/beam node and stopped on a moment there, and a
   `*CLOAD` on such a node moved the model wrongly in `*MODAL DYNAMIC` and `*STEADY STATE

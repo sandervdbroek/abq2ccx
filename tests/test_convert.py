@@ -542,8 +542,8 @@ def test_general_step_is_any_but_a_linear_perturbation_step():
 
 
 def test_step_model_motion_facts():
-    # how a step's nodes move: its time period (none in a perturbation, heat transfer or Riks
-    # step), the time it adds to the total time and the total time at its start, the Abaqus
+    # how a step's nodes move: its time period (Abaqus': none in a perturbation or Riks step),
+    # the time it adds to the total time and the total time at its start, the Abaqus
     # default amplitudes of displacement, velocity and acceleration BCs and ccx's; the
     # procedure may be one ccx lacks (*GEOSTATIC)
     _, m = _step_model("""*STEP\n*STATIC\n0.1, 2.\n*END STEP\n*STEP, AMPLITUDE=STEP\n*DYNAMIC\n0.01, 0.5
@@ -553,7 +553,7 @@ def test_step_model_motion_facts():
 *STEP\n*DYNAMIC, APPLICATION=QUASI-STATIC\n0.1, 1.\n*END STEP""")
     assert [s.motion_label for s in m] == ["STATIC", "DYNAMIC", "FREQUENCY", "HEAT TRANSFER",
                                            "STATIC, RIKS", "GEOSTATIC", "DYNAMIC", "DYNAMIC"]
-    assert [s.period for s in m] == [2.0, 0.5, None, None, None, 1.0, 1e-4, 1.0]
+    assert [s.period for s in m] == [2.0, 0.5, None, 3.0, None, 1.0, 1e-4, 1.0]
     assert [s.advance for s in m] == [2.0, 0.5, 0.0, 3.0, None, 1.0, 1e-4, 1.0]
     assert [s.t_start for s in m] == [0.0, 2.0, 2.5, 2.5, 5.5, None, None, None]
     assert [tuple(s.defaults[q] for q in ("VELOCITY", "ACCELERATION", "DISPLACEMENT")) for s in m] == [
@@ -563,6 +563,33 @@ def test_step_model_motion_facts():
     assert [s.ccx_amp for s in m] == ["RAMP", "STEP", "STEP", "RAMP", "RAMP", "STEP", "STEP", "RAMP"]
     assert [s.explicit for s in m] == [False] * 6 + [True, False]
     assert [s.nlgeom for s in m] == [False] * 5 + [True] * 3     # (also the motion rule's)
+
+
+def test_step_time_period_as_abaqus_reads_it():
+    # Abaqus' time period (Step.period), every step-time reader's: the 2nd field, 1.0 without one;
+    # a zero one is 1.0 in *STATIC and *GEOSTATIC (documented), unknown elsewhere, and so is a
+    # negative one; a *MODAL DYNAMIC step has one (no other perturbation step), a Riks step none
+    _, m = _step_model("""*STEP\n*STATIC\n0.1,\n*END STEP\n*STEP\n*STATIC\n0.1, 0.\n*END STEP
+*STEP\n*STATIC\n0.1, -2.\n*END STEP\n*STEP\n*VISCO\n*END STEP\n*STEP\n*VISCO\n0.1, 0.\n*END STEP
+*STEP\n*HEAT TRANSFER\n0.1, 4.\n*END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP
+*STEP\n*MODAL DYNAMIC\n0.1, 0.5\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n0.1, 2.\n*END STEP
+*STEP\n*STATIC, RIKS\n0.1, 1.\n*END STEP""")
+    assert [s.period for s in m] == [1.0, 1.0, None, 1.0, None, 4.0, None, 0.5, None, None]
+    assert [s.advance for s in m] == [1.0, 1.0, None, 1.0, None, 4.0, 0.0, 0.0, 0.0, None]
+    assert [s.t_start for s in m][:3] == [0.0, 1.0, 2.0] and m.steps[3].t_start is None
+    # its readers: a zero-period *STATIC step's load on a step-time amplitude holds the
+    # amplitude's value at time 1.0 (was its value at 0, so the restore after the *FREQUENCY
+    # step gave the converted load back at 0: "every load lost"); the deck's amplitude span
+    # covers the step
+    deck = HEX_MODEL + """*AMPLITUDE, NAME=A\n0., 0., 1., 1., 2., 3.
+*SURFACE, NAME=TOP\nEALL, S2\n*STEP\n*STATIC\n0.1, 0.\n*DSLOAD, AMPLITUDE=A\nTOP, TRVEC, 1., 0., 0., -1.
+*END STEP\n*STEP\n*STATIC\n0.1, 1.\n*END STEP
+*STEP\n*FREQUENCY\n2\n*END STEP\n*STEP\n*STATIC\n0.1, 1.\n*END STEP\n"""
+    body, conv, rep = convert_str(deck)
+    assert [s.period for s in conv.steps] == [1.0, 1.0, None, 1.0] and conv.steps.amp_span == (1.0, 3.0)
+    again = body.split("*STEP")[4]
+    assert "*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 3, -0.25" in again, again
+    assert not any("every load lost" in r for r in conv.reduced_physics)
 
 
 def test_one_procedure_card_per_step():
@@ -19445,9 +19472,12 @@ def test_amplitude_sampled_over_the_steps_that_read_it():
     dyn = "*Step\n*Dynamic\n0.01, 1.\n*Cload, amplitude=P\n7, 1, 1.\n*End Step\n"
     body, _, rep = convert_str(model + dyn + "*Step\n*Static, riks\n0.1, 1.\n*Cload\n7, 1, 2.\n*End Step\n")
     assert "*AMPLITUDE, NAME=P\n" in body and "sampled into 201 time/amplitude points" in rep.text()
-    # read after a step of unknown time: commented out, and as a card uses it, warned with
-    # reduced physics (ccx stops there)
-    body, conv, rep = convert_str(model + "*Step\n*Static\n0.1, 0.\n*End Step\n" + dyn)
+    # read after a step of unknown time (a negative period; a zero *STATIC one is 1.0:
+    # Step.period): commented out, and as a card uses it, warned with reduced physics (ccx
+    # stops there)
+    body, _, _ = convert_str(model + "*Step\n*Static\n0.1, 0.\n*End Step\n" + dyn)
+    assert "*AMPLITUDE, NAME=P\n" in body
+    body, conv, rep = convert_str(model + "*Step\n*Static\n0.1, -1.\n*End Step\n" + dyn)
     assert "** *AMPLITUDE, NAME=P, DEFINITION=PERIODIC" in body
     assert "*AMPLITUDE P (commented out; ccx stops at its users)" in conv.reduced_physics
     assert any(lv == "WARNING" and "ccx stops at the first card that uses it" in m for lv, m in rep.entries)
