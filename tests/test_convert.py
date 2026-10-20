@@ -818,10 +818,10 @@ def test_delay_merge_and_total_time_shift_read_the_emitted_deck():
     assert step == ["*STEP", "*STATIC", "0.1, 1.", "** a note", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1",
                     "1, 1, 1.", "** between", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "** inside",
                     "E1, P1, 1.", "E2, P1, 1.", "E3, P2, 2.", "*STEP", "*NODE FILE", "U"]
-    # _shift_total_time counts ccx's steps by the *STEP lines and numbers them by the steps
-    # EmitState wrote: blocks that keep an unterminated *STEP (read_blocks closes it) write
-    # step 1 as two, and the static perturbation step 2 (period 1: its *STATIC has no data
-    # line) is the third
+    # _shift_total_time counts ccx's steps by the *STEP lines.  Blocks that keep an unterminated
+    # *STEP (a caller that builds them itself) are closed by Converter.convert as read_blocks
+    # closes them: step 1 ends before the next *STEP, and the static perturbation step 3
+    # (period 1: its *STATIC has no data line) shifts step 4's total time
     fd, path = tempfile.mkstemp(suffix=".inp")
     with os.fdopen(fd, "w") as fh:
         fh.write(BUCKLE_CUBE + "*Amplitude, name=TT, time=total time\n0., 0., 10., 10.\n"
@@ -835,19 +835,20 @@ def test_delay_merge_and_total_time_shift_read_the_emitted_deck():
     conv = A.Converter(rep, Opt())
     body = "\n".join(conv.convert(blocks))
     assert "*AMPLITUDE, NAME=TT_SHIFT, TIME=total time, SHIFTX=1.\n" in body
-    assert "TT_SHIFT with SHIFTX=1. for step(s) 3:" in rep.text() and body.count("\n*STEP") == 4
+    assert "TT_SHIFT with SHIFTX=1. for step(s) 4:" in rep.text() and body.count("\n*STEP") == 4
+    assert body.count("\n*END STEP") == 4 and "step(s) 1 closed before the next *STEP" in rep.text()
     # ... on the emitted text: comments between cards, after a card without data lines, and an
     # amplitude's data and the comments after them in its copy
     text = ["*AMPLITUDE, NAME=T2, TIME=TOTAL TIME", "0., 0., 10., 10.", "** after T2", "*STEP",
-            "*STATIC", "0.5, 1.", "*STEP", "*STATIC", "0.3, 0.3", "*END STEP", "*STEP", "*STATIC",
-            "** between", "*CLOAD", "7, 2, 1.", "*END STEP", "*STEP", "*STATIC", "0.5, 1.",
+            "*STATIC", "0.5, 1.", "*END STEP", "*STEP", "*STATIC", "0.3, 0.3", "*END STEP", "*STEP",
+            "*STATIC", "** between", "*CLOAD", "7, 2, 1.", "*END STEP", "*STEP", "*STATIC", "0.5, 1.",
             "*CLOAD, AMPLITUDE=T2", "7, 1, 1.", "*END STEP"]
     new = conv._shift_total_time(A.EmittedDeck(text))
     assert new.lines[:8] == text[:3] + [
-        "** abq2ccx: T2 shifted by 1 for step(s) 3: ccx counts the perturbation steps' time in the "
+        "** abq2ccx: T2 shifted by 1 for step(s) 4: ccx counts the perturbation steps' time in the "
         "total time, Abaqus does not", "*AMPLITUDE, NAME=T2_SHIFT, TIME=TOTAL TIME, SHIFTX=1.",
         "0., 0., 10., 10.", "** after T2", "*STEP"]
-    assert new.lines[8:] == text[4:19] + ["*CLOAD, AMPLITUDE=T2_SHIFT"] + text[20:]
+    assert new.lines[8:] == text[4:20] + ["*CLOAD, AMPLITUDE=T2_SHIFT"] + text[21:]
 
 
 def test_rotation_tie_on_a_member_bc_makes_the_body_dependent():
@@ -17263,6 +17264,22 @@ def test_unterminated_step_closed_and_warned_once():
     assert body.count("\n*STEP") == body.count("\n*END STEP") == 3
     assert body.index("2, 1, 5.") < body.index("*END STEP") < body.index("*CLOAD, OP=NEW")
     assert "applies no load" not in rep.text() and not conv.source_unloaded
+    # Converter.convert closes them the same way for a caller that builds its blocks itself
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(deck)
+    try:
+        blocks = A.read_blocks(path, A.Report())
+    finally:
+        os.unlink(path)
+    ends = [k for k, b in enumerate(blocks) if b.keyword == "END STEP"]
+    del blocks[ends[2]], blocks[ends[0]]            # the two read_blocks added
+    assert [b.keyword for b in blocks].count("END STEP") == 1
+    rep = A.Report()
+    conv = A.Converter(rep, Opt())
+    assert "\n".join(conv.convert(blocks)) == body
+    assert [m for lv, m in rep.entries if lv == "WARNING"] == warns
+    assert len(conv.steps) == len(conv.emit.written) == 3
 
 
 def test_keyword_reference_lists_only_cards_emitted_unchanged():

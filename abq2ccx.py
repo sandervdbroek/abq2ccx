@@ -1896,11 +1896,16 @@ def read_blocks(path: str, report: Report) -> List[Block]:
     for k, hits in seen.get("ambiguous", {}).items():
         report.warn(f"{k}: an ambiguous abbreviation ({', '.join(hits[:5])}"
                     f"{', ...' if len(hits) > 5 else ''}), which Abaqus rejects; read as written.")
-    # a *STEP without *END STEP is closed before the next *STEP or at the end of the deck,
-    # so that every step walker counts the same steps
+    return close_open_steps(blocks, report)
+
+
+def close_open_steps(blocks: Sequence[Block], report: Report) -> List[Block]:
+    """``blocks`` with each *STEP that has no *END STEP closed before the next *STEP or at the
+    end of the deck, with one warning naming them, so that every step walker counts the same
+    steps: read_blocks, and Converter.convert for a caller that builds its blocks itself."""
     closed: List[Block] = []
     open_step, where = False, []
-    for b in blocks + [Block("STEP", OrderedDict())]:
+    for b in list(blocks) + [Block("STEP", OrderedDict())]:
         if b.keyword == "STEP" and open_step:
             closed.append(Block("END STEP", OrderedDict()))
             where.append(len([x for x in closed if x.keyword == "STEP"]))
@@ -20910,6 +20915,7 @@ class Converter:
                 gc.enable()
 
     def _convert(self, blocks: List[Block]) -> List[str]:
+        blocks = close_open_steps(blocks, self.report)     # (read_blocks' decks: none open)
         blocks = self._bc_dofs_in_range(self._cartesian_nodes(blocks))
         raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):

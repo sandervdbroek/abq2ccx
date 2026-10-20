@@ -544,6 +544,9 @@ physics.
   alone), e.g. at an indenter whose reference node is a node of its mesh. Such a body now gets
   a free reference node at the same place, which takes the reference point's BCs, loads and
   output.
+* **`Converter.convert` closes an unterminated `*STEP` as `read_blocks` does** — with the same
+  warning, for a caller that builds its blocks itself. Such blocks were written with the next
+  step inside the open one, where ccx stops. Decks read from a file are unchanged.
 
 ## 1.4.0 (October 2026)
 
