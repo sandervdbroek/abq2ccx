@@ -1193,6 +1193,7 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                         full = os.path.relpath(os.path.join(here, src), job_dir or os.curdir)
                     except ValueError:          # on another drive (Windows)
                         full = os.path.abspath(os.path.join(here, src))
+                    full = full.replace(os.sep, "/")    # the same deck text on every OS
                     toks[k] = f'{toks[k].partition("=")[0]}="{full}"'
                     line = ",".join(toks)
                 raw_lines.append(line)
