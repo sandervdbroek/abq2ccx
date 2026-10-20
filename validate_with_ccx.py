@@ -3188,6 +3188,45 @@ def static_pert_temps_deck(case, between="", ref=None):
     return text + "*STEP\n*STATIC\n" + base + "*END STEP\n" + between + pert + \
         "*BOUNDARY\n6, 2, 2\n*CLOAD\n7, 1, 0.5\n" + out
 
+def static_pert_leftovers_deck(case, between="", ref=False):
+    """A static perturbation step after a general step, then ``between`` (steps).  ``case``
+    "traction": modal_own_loads_deck's cube, its static step loading its top face by a traction
+    on an amplitude (0.5 at the step's end), the perturbation step changing it by 0.3 (written
+    as nodal forces); "gradient": a single S8 plate (thickness 0.1, E 1000, nu 0, expansion
+    1e-3), the static step setting its temperature 50 and gradient 100 through the thickness,
+    the perturbation step changing them by 10 and 20.  The perturbation step prints U.
+    ``ref``: one static step with the sums, Abaqus' base state plus its perturbation."""
+    out = "*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
+    if case == "traction":
+        text = modal_own_loads_deck(False).replace("*NSET, NSET=N7\n7\n", "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n")
+        text = text[:text.index("*STEP")] + "*AMPLITUDE, NAME=HALF\n0., 0., 1., 0.5\n"
+        base, own = "*DSLOAD, AMPLITUDE=HALF\nTOP, TRVEC, 1., 0., 1., 0.\n", "*DSLOAD\nTOP, TRVEC, 0.3, 0., 1., 0.\n"
+        total = "*DSLOAD\nTOP, TRVEC, 0.8, 0., 1., 0.\n"
+    else:
+        text = ("*NODE\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n4, 1., 0.5, 0.\n5, 1., 1., 0.\n"
+                "6, 0.5, 1., 0.\n7, 0., 1., 0.\n8, 0., 0.5, 0.\n*ELEMENT, TYPE=S8, ELSET=EALL\n"
+                "1, 1, 3, 5, 7, 2, 4, 6, 8\n*NSET, NSET=NALL, GENERATE\n1, 8, 1\n*MATERIAL, NAME=M\n"
+                "*ELASTIC\n1000., 0.\n*EXPANSION\n1.E-3\n*DENSITY\n1.E-3\n*SHELL SECTION, ELSET=EALL, "
+                "MATERIAL=M\n0.1\n*BOUNDARY\n1, 1, 3\n3, 2, 3\n7, 3, 3\n"
+                "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0.\n")
+        base, own, total = "*TEMPERATURE\nNALL, 50., 100.\n", "*TEMPERATURE\nNALL, 10., 20.\n", \
+            "*TEMPERATURE\nNALL, 60., 120.\n"
+    if ref:
+        return text + "*STEP\n*STATIC\n" + total + out
+    return text + "*STEP\n*STATIC\n" + base + "*END STEP\n" + between + "*STEP, PERTURBATION\n*STATIC\n" + \
+        own + out
+
+
+def buckle_amplitude_deck(force, amp=True):
+    """buckle_displacement_deck("tied", ``force``): its *STEP, PERTURBATION *BUCKLE step's
+    *CLOAD on an amplitude of 0.25 at time 0 (1 at time 1) if ``amp``."""
+    deck = buckle_displacement_deck("tied", force)
+    if amp:
+        deck = deck.replace("*Step, perturbation", "*Amplitude, name=UP\n0., 0.25, 1., 1.\n*Step, "
+                                                   "perturbation").replace("*Cload\n", "*Cload, amplitude=UP\n")
+    return deck
+
+
 def ramped_rotation_deck(step, twin=False):
     """pert_frame_deck("bc") without its *FREQUENCY step: the frame's joint 9 (a ccx knot, its
     *TRANSFORM about z: local 1 = y) turned about local 1 and 3 by 0.01, then about local 1 to
@@ -7760,11 +7799,49 @@ def main():
                          f"node: its displacements are those of a static step with that DOF prescribed "
                          f"at its base value") + f" ({err:.1e} apart, nodes moved {moved:.3g})")
             failures += 0 if ok else 1
-    # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
-    # aborted after the step that held no body load (the converter writes a zero GRAV there)
+    # a static perturbation step's traction (nodal forces) on what a base-state traction on an
+    # amplitude loads, and its shell temperature gradients over the base state's: the converter
+    # adds them to the base state's (the traction's at its amplitude's end value, without it);
+    # it dropped the traction, warned, and left the gradient line unsummed
+    for case in ("traction", "gradient"):
+        ref = review_run(static_pert_leftovers_deck(case, ref=True), f"static_pert_{case}_ref", dat_node_blocks)
+        for tag, between in (("", ""), ("_freq", freq)):
+            got = review_run(static_pert_leftovers_deck(case, between), f"static_pert_{case}{tag}",
+                             dat_node_blocks)
+            ok = bool(got and ref)
+            if ok:
+                err, moved = same([got, ref], -1)
+                ok = err < 1e-9 * moved and moved > 1e-3
+                print(f"{'PASS' if ok else 'FAIL'}  static_pert_{case}{tag} ("
+                      + ("a cube under a traction on an amplitude (0.5 at the end of its static step)"
+                         if case == "traction" else "an S8 plate heated with a gradient through its "
+                         "thickness") + f", {'then *FREQUENCY, ' if between else ''}then a *STEP, "
+                      f"PERTURBATION *STATIC step changing " + ("the traction" if case == "traction"
+                                                                 else "temperature and gradient") +
+                      f"): its displacements are those of a static step with the sums ({err:.1e} "
+                      f"apart, nodes moved {moved:.3g})")
+            failures += 0 if ok else 1
     def factors(dat):
         return dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")
-
+    # a *BUCKLE step's load on an amplitude: Abaqus applies its time-0 value (the step has no
+    # time period), ccx 2.23 ignores the amplitude there (the full value): the converter scales
+    # the load.  The column tied at its top, pushed by 4e6 on an amplitude of 0.25 at time 0
+    runs = [review_run(buckle_amplitude_deck(f, amp), "buckle_amplitude" + tag, factors)
+            for f, amp, tag in ((-4e6, True, ""), (-1e6, False, "_ref"))]
+    ok = all(runs)
+    if ok:
+        euler = math.pi ** 2 * 210e9 * 0.1 ** 4 / 12 / 2.0 ** 2
+        err = abs(runs[0][0] / runs[1][0] - 1)
+        ok = err < 1e-6 and abs(runs[0][0] * 1e6 / euler - 1) < 0.05
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_amplitude (a C3D20R column's *BUCKLE step loaded "
+              f"by 4e6 on an amplitude of 0.25 at time 0): factor {runs[0][0]:.7g} vs {runs[1][0]:.7g} "
+              f"loaded by 1e6 ({err:.1e} apart; Euler / 1e6 = {euler / 1e6:.4g}; ccx 2.23 as written: "
+              f"the full load, about a quarter of it)")
+    else:
+        print("FAIL  buckle_amplitude: a run gave no results")
+    failures += 0 if ok else 1
+    # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
+    # aborted after the step that held no body load (the converter writes a zero GRAV there)
     lam = [review_run(buckle_gravity_deck(p, pert=pert), "buckle_gravity_" + (p or "none") + tag, factors)
            for p, pert, tag in (("grav", True, ""), ("nodal", True, ""), ("", True, ""),
                                 ("grav", False, "_plain"))]

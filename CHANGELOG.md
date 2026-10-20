@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Static perturbation and `*BUCKLE` leftovers** — a static perturbation step's traction or
+  other load written as nodal forces, on what a base-state load on an amplitude loads, was
+  dropped (warned); it is now added to the base forces at the amplitude's end value, without
+  the amplitude. `*BUCKLE` has no time period either, so Abaqus applies its loads and BCs at
+  their amplitude's time-0 value; ccx 2.23 ignored the amplitude (the full load). They are now
+  scaled by it, and a zero there is warned. Shell temperature gradients in a static
+  perturbation step add to the base state's where it has the same kind of line (warned before);
+  other mixes stay warned.
 * **`*SHELL SECTION, DENSITY=` on continuum shells** — the mass per unit area was dropped
   (silently on a plain section), so the modes came out about 2× too high. Where mass acts,
   each material now gets a copy with DENSITY / t more, t the mesh's thickness, as membranes

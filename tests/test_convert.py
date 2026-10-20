@@ -6214,6 +6214,58 @@ def test_static_perturbation_temperatures_amplitudes_and_free_dofs():
     assert "which the converter cannot evaluate" in rep.text() and conv.reduced_physics
 
 
+
+def test_perturbation_tractions_buckle_amplitudes_and_temperature_gradients():
+    # a static perturbation step's converted traction on what a base load on an amplitude loads:
+    # the base forces at the amplitude's end value plus its own, without the amplitude (ccx keeps
+    # one amplitude per node and DOF); before, dropped
+    model = MODAL.split("*Step")[0] + "*Amplitude, name=HALF\n0., 0., 1., 0.5\n*Amplitude, name=LATE, " \
+        "time=total time\n0., 0., 1., 0.5\n*Amplitude, name=UP\n0., 0.2, 1., 1.\n*Amplitude, " \
+        "name=ZERO\n0., 0., 1., 1.\n*Nset, nset=N56\n5, 6\n*Nset, nset=ALL, generate\n1, 8, 1\n"
+    g = "*Step\n*Static\n*Dsload, amplitude={}\nS2, TRVEC, 1., 0., 1., 0.\n*End Step\n"
+
+    def sp(cards):
+        return "*Step, perturbation\n*Static\n" + cards + "*End Step\n"
+    for own in ("*Dsload\nS2, TRVEC, 0.3, 0., 1., 0.\n", "*Dsload, amplitude=UP\nS2, TRVEC, 1.5, 0., 1., 0.\n",
+                "*Dload\nEALL, TRVEC2, 0.3, 0., 1., 0.\n"):
+        body, conv, rep = convert_str(model + g.format("HALF") + sp(own))
+        assert _close(_cloads(body)[1], {(n, 2): 0.2 for n in (5, 6, 7, 8)}), own   # 0.125 + 0.075
+        assert "AMPLITUDE" not in body.split("*STEP")[2]
+        assert conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
+    body, conv, rep = convert_str(model + g.format("LATE") + sp("*Dsload\nS2, TRVEC, 0.3, 0., 1., 0.\n"))
+    assert "which has another amplitude (one whose value at the base state's end" in rep.text()
+    assert "*DSLOAD TRVEC load dropped" in conv.reduced_physics
+    # a *BUCKLE step's loads and BCs on an amplitude: Abaqus' value at time 0 (ccx 2.23 ignores
+    # the amplitude there: the full value)
+    bk = model + "*Step\n*Buckle\n2\n*Cload, amplitude={}\n7, 3, -1.\n*Boundary, amplitude=UP\n" \
+        "6, 3, 3, -0.01\n*End Step\n"
+    body, conv, rep = convert_str(bk.format("UP"))
+    assert "\n*CLOAD\n7, 3, -0.2\n*BOUNDARY\n6, 3, 3, -0.002\n" in body and not conv.reduced_physics
+    assert "*BUCKLE steps 1 (*CLOAD on UP: x0.2), 1 (*BOUNDARY on UP: x0.2)" in rep.text()
+    body, conv, rep = convert_str(bk.format("ZERO"))
+    assert "\n*CLOAD\n7, 3, 0.\n" in body and "the amplitude is 0 at time 0" in rep.text()
+    body, conv, rep = convert_str(bk.format("LATE"))
+    assert "*CLOAD, AMPLITUDE=LATE" in body and "ccx 2.23 applies the full value" in rep.text()
+    assert conv.reduced_physics == ["amplitude of a *BUCKLE step at its full value (Abaqus: time 0)"]
+    # temperatures with gradients (a shell's, a beam's, section points) add to the base state's
+    # where it has the same kind there; else warned as before
+    for ic, steps, want in (
+            ("0.", "*Step\n*Static\n*Temperature\nALL, 50., 100.\n*End Step\n", "ALL, 60., 120."),
+            ("20., 50.", "", "ALL, 30., 70."),
+            ("0.", "*Step\n*Static\n*Temperature, amplitude=HALF\nN56, 50., 100.\n*End Step\n",
+             "1, 10., 20.\n2, 10., 20.\n3, 10., 20.\n4, 10., 20.\n7, 10., 20.\n8, 10., 20.\n"
+             "5, 35., 70.\n6, 35., 70.")):
+        body, conv, rep = convert_str(model + f"*Initial Conditions, type=temperature\nALL, {ic}\n" +
+                                      steps + sp("*Temperature\nALL, 10., 20.\n"))
+        assert f"\n*TEMPERATURE\n{want}\n" in body.split("*STEP")[-1], body.split("*STEP")[-1]
+        assert "static perturbation step not the base state plus its perturbation" not in conv.reduced_physics
+    for base, own in (("ALL, 50.", "ALL, 10., 20."), ("ALL, 50., 100.", "ALL, 10.")):
+        _, conv, rep = convert_str(model + "*Initial Conditions, type=temperature\nALL, 0.\n*Step\n"
+                                   f"*Static\n*Temperature\n{base}\n*End Step\n" +
+                                   sp(f"*Temperature\n{own}\n"))
+        assert "other gradients or section points than the base state's" in rep.text(), base
+        assert "static perturbation step not the base state plus its perturbation" in conv.reduced_physics
+
 def test_modal_dynamic_step_started_moving_is_flagged():
     # ccx 2.23 starts a *MODAL DYNAMIC step from rest only right after a *FREQUENCY (or *BUCKLE)
     # step, else from the displacements and velocities it holds (probed); Abaqus does not carry

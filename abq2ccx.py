@@ -4204,6 +4204,12 @@ class Converter:
         self._sp_temps: set = set()
         self._sp_temp_dep = False
         self._sp_adds = False
+        # the amplitudes and the general steps' periods (_sp_amplitudes), and per converted
+        # load the factor its amplitude reached at the end of the general step that gave it
+        # (1: none; None: unknown to the converter), for a static perturbation step (_sp_freeze)
+        self._amp_curves: Dict[str, Optional[AmplitudeCurve]] = {}
+        self._step_periods: Dict[int, float] = {}
+        self._nodal_ends: Dict[tuple, Optional[float]] = {}
         self._restore_yields = False                # a material yields or creeps
         self._eigen_since = False                   # ... and a *FREQUENCY step ran in ccx
         self._yield_segv: set = set()               # the steps where ccx then segfaults (_yield_segfaults)
@@ -10654,6 +10660,8 @@ class Converter:
             forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
         amp = b.param("AMPLITUDE")
         key = (card, g[0].upper(), label)
+        if self._sp_adds and not amp:
+            self._sp_freeze(key, forces)
         clash = self._nodal_load_clash(key, forces, amp)
         if clash:
             return self._drop_load_line(b, g, clash)
@@ -10662,7 +10670,7 @@ class Converter:
                              f"forces from the undeformed geometry, which ccx keeps fixed in "
                              f"direction and magnitude — the response differs from Abaqus as the "
                              f"mesh deforms. Verify.", once=True)
-        self._set_nodal_load(key, forces, amp)
+        self._set_nodal_load(key, forces, amp, self._amp_end(b))
         if base.startswith("TR"):
             what, lack = "surface tractions (TRVEC / TRSHR)", "ccx has no such load"
         elif base == "P":
@@ -11460,8 +11468,42 @@ class Converter:
         if self._sp_adds and key in self._nodal_loads and key not in self._nodal_fresh and \
                 self._nodal_loads[key][1] != amp:   # (_set_nodal_load adds it to the base state's)
             return ("it changes the base state's load of that kind there, which has another "
-                    "amplitude, and ccx keeps one amplitude per node and DOF")
+                    "amplitude (one whose value at the base state's end the converter cannot "
+                    "evaluate, or one on this line), and ccx keeps one amplitude per node and DOF")
         return None
+
+    def _amp_end(self, b: Block) -> Optional[float]:
+        """The factor a load card's amplitude reaches at the end of the current step: 1 without
+        one (ccx's ramp ends there too), None where the converter cannot evaluate it.  Only a
+        static perturbation step after another step needs it (_sp_freeze), so only with
+        perturbation steps (_sp_amplitudes keeps the amplitudes and periods)."""
+        amp = b.uparam("AMPLITUDE")
+        if not amp:
+            return 1.0
+        curve, end = self._amp_curves.get(amp), self._step_periods.get(self._step_idx)
+        if curve is None or curve.total or curve.absolute or end is None:
+            return None
+        try:
+            return curve.value(end - pf(b.param("TIME DELAY") or "0"))
+        except ValueError:
+            return None
+
+    def _sp_freeze(self, key: tuple, forces: Dict[Tuple[int, int], float]) -> None:
+        """A static perturbation step after another step: Abaqus adds its loads to the base
+        state's at their values at the base state's end, and the step's own carry no amplitude
+        (_sp_amplitudes), while ccx keeps one amplitude per node and DOF.  So once a converted
+        load of the step meets a base-state one on an amplitude (its key, or shared nodes),
+        every base-state converted load on an amplitude is given at that end value without
+        it (_nodal_ends; what ccx holds there anyway), so that the step's load adds to it.
+        Those whose end value the converter does not know keep their amplitude (and the
+        step's load on them is dropped: _nodal_load_clash)."""
+        base = [k for k, (_, a) in self._nodal_loads.items() if a and k not in self._nodal_fresh]
+        if not any(k == key or not self._nodal_loads[k][0].keys().isdisjoint(forces) for k in base):
+            return
+        for k in base:
+            end = self._nodal_ends.get(k)
+            if end is not None:
+                self._nodal_loads[k] = ({nd: v * end for nd, v in self._nodal_loads[k][0].items()}, None)
 
     def _op_new_load(self, b: Block) -> bool:
         """Whether a load card's OP=NEW removes the earlier loads.  Not in a static perturbation
@@ -11484,9 +11526,10 @@ class Converter:
         return False
 
     def _set_nodal_load(self, key: tuple, forces: Dict[Tuple[int, int], float],
-                        amp: Optional[str]) -> None:
+                        amp: Optional[str], end: Optional[float] = 1.0) -> None:
         """Record the nodal forces of a converted load (Abaqus semantics: a key given again in
-        a later step replaces it, twice in one step adds up; no force removes it).  In a
+        a later step replaces it, twice in one step adds up; no force removes it), and, in a
+        general step, the factor ``end`` its amplitude reaches at the step's end.  In a
         static perturbation step after another step (``_sp_adds``) a load is a change of the
         base state's: it adds to the base state's forces of the same key."""
         if key in self._nodal_loads and (key in self._nodal_fresh or self._sp_adds):
@@ -11495,6 +11538,8 @@ class Converter:
                 old[nd] = old.get(nd, 0.0) + v
         elif forces:
             self._nodal_loads[key] = (dict(forces), amp)
+            if self._step_idx not in self._pert_idx:
+                self._nodal_ends[key] = end
         else:
             self._nodal_loads.pop(key, None)
         self._nodal_fresh.add(key)
@@ -17488,38 +17533,52 @@ class Converter:
     _VALUE_FIELD = {"BOUNDARY": 3, "CLOAD": 2, "DLOAD": 2, "TEMPERATURE": 1}
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
-        """A static perturbation step's loads, BCs and temperatures on an amplitude: "If loads
-        or boundary conditions are specified as functions of time in a linear perturbation
-        analysis that has no time period (for example, in a static perturbation analysis), the
-        amplitude value corresponding to time=0 will be used" (Abaqus 2017; its load magnitudes
-        there include predefined temperatures), where ccx 2.23 applies the value at the step's
-        end (probed).  So such a card's values are scaled by the amplitude's value at time 0,
-        and the amplitude goes.  One the converter cannot evaluate (USER, SOLUTION DEPENDENT,
-        VALUE=ABSOLUTE, TIME=TOTAL TIME, ...) stays, warned."""
+        """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:
+        "If loads or boundary conditions are specified as functions of time in a linear
+        perturbation analysis that has no time period (for example, in a static perturbation
+        analysis), the amplitude value corresponding to time=0 will be used" (Abaqus 2017; its
+        load magnitudes there include predefined temperatures; a buckling step has no time
+        period either: "Amplitude definitions cannot be used" there), where ccx 2.23 applies
+        the value at the step's end in a static step and ignores the amplitude in *BUCKLE (the
+        full value; probed).  So such a card's values are scaled by the amplitude's value at
+        time 0, and the amplitude goes.  One the converter cannot evaluate (USER, SOLUTION
+        DEPENDENT, VALUE=ABSOLUTE, TIME=TOTAL TIME, ...) stays, warned.  (A *BUCKLE step's
+        *TEMPERATURE is commented out anyway: handle_temperature.)  Also keeps the amplitudes
+        and the general steps' periods, for the end values of the base state (_amp_end)."""
         pert = self._perturbation_steps(blocks)
         if not pert:
             return blocks
         fields = dict(self._VALUE_FIELD, DSLOAD=2)
         amps = {b.uparam("NAME"): b for b in blocks if b.keyword == "AMPLITUDE" and b.param("NAME")}
+        self._amp_curves = {name: amplitude_curve(b) for name, b in amps.items()}
         swap: Dict[int, Block] = {}
-        scaled: List[str] = []
-        kept: List[str] = []
+        scaled: Dict[str, List[str]] = {"STATIC": [], "BUCKLE": []}
+        kept: Dict[str, List[str]] = {"STATIC": [], "BUCKLE": []}
+        zero: List[str] = []
         for s, group in enumerate(step_groups(blocks)[1], 1):
-            if s not in pert or {b.keyword for b in group[1:] if b.keyword in PROC_KW} != {"STATIC"}:
+            procs = {b.keyword for b in group[1:] if b.keyword in PROC_KW}
+            if s not in pert:
+                proc_b = next((b for b in group[1:] if b.keyword in PROC_KW), None)
+                if proc_b is None or not proc_b.has("RIKS"):    # (Riks: no time period)
+                    self._step_periods[s] = self._step_timing(proc_b)["period"]
                 continue
+            if procs not in ({"STATIC"}, {"BUCKLE"}):
+                continue
+            proc = procs.pop()
             for b in group[1:]:
                 amp = b.uparam("AMPLITUDE")
                 if not amp or b.keyword not in fields or b.has("USER") or \
-                        (b.keyword == "BOUNDARY" and self._bc_type(b) != "DISPLACEMENT"):
+                        (b.keyword == "BOUNDARY" and self._bc_type(b) != "DISPLACEMENT") or \
+                        (b.keyword == "TEMPERATURE" and proc == "BUCKLE"):
                     continue
-                curve = amplitude_curve(amps[amp]) if amp in amps else None
+                curve = self._amp_curves.get(amp)
                 try:
                     a0 = curve.value(-pf(b.param("TIME DELAY") or "0")) \
                         if curve and not curve.total and not curve.absolute else None
                 except ValueError:
                     a0 = None
                 if a0 is None:
-                    kept.append(f"{s} (*{b.keyword} on {amp})")
+                    kept[proc].append(f"{s} (*{b.keyword} on {amp})")
                     continue
                 j = fields[b.keyword]
                 data = []
@@ -17527,28 +17586,41 @@ class Converter:
                     rec = list(rec)
                     for k in range(j, len(rec) if b.keyword == "TEMPERATURE" else min(len(rec), j + 1)):
                         try:
-                            rec[k] = short_real(pf(rec[k]) * a0, 12) if rec[k] and \
+                            rec[k] = short_real(pf(rec[k]) * a0 + 0.0, 12) if rec[k] and \
                                 not _is_user_load(b, rec) else rec[k]
                         except ValueError:
                             pass
                     data.append(", ".join(rec))
                 swap[id(b)] = Block(b.keyword, OrderedDict(
                     (k, v) for k, v in b.params.items() if k not in ("AMPLITUDE", "TIME DELAY")), data)
-                scaled.append(f"{s} (*{b.keyword} on {amp}: x{a0:g})")
-        if scaled:
-            self.report.note(f"Static perturbation step{'s' if len(scaled) > 1 else ''} "
-                             f"{', '.join(scaled)}: Abaqus applies a load, BC or temperature given "
-                             f"on an amplitude at the amplitude's value at time 0 there (the step "
-                             f"has no time period), ccx 2.23 at its value at the step's end "
-                             f"(probed), so the values are given scaled by it, without the "
-                             f"amplitude.", once=True)
-        if kept:
-            self.report.warn(f"Static perturbation step{'s' if len(kept) > 1 else ''} "
-                             f"{', '.join(kept)}: Abaqus applies the amplitude's value at time 0 "
-                             f"there, which the converter cannot evaluate (USER, SOLUTION DEPENDENT, "
-                             f"VALUE=ABSOLUTE, TIME=TOTAL TIME, ... or undefined); ccx 2.23 applies "
-                             f"its value at the step's end.", once=True)
-            self._reduces("amplitude of a static perturbation step at its end value (Abaqus: time 0)")
+                scaled[proc].append(f"{s} (*{b.keyword} on {amp}: x{a0:g})")
+                if a0 == 0.0 and proc == "BUCKLE":
+                    zero.append(f"{s} (*{b.keyword} on {amp})")
+        ccx = {"STATIC": ("at its value at the step's end", "its value at the step's end"),
+               "BUCKLE": ("not at all (the full value)", "the full value (it ignores the amplitude there)")}
+        what = {"STATIC": "Static perturbation step", "BUCKLE": "*BUCKLE step"}
+        for proc in ("STATIC", "BUCKLE"):
+            if scaled[proc]:
+                self.report.note(f"{what[proc]}{'s' if len(scaled[proc]) > 1 else ''} "
+                                 f"{', '.join(scaled[proc])}: Abaqus applies a load"
+                                 f"{', BC or temperature' if proc == 'STATIC' else ' or BC'} given on "
+                                 f"an amplitude at the amplitude's value at time 0 there (the step "
+                                 f"has no time period), ccx 2.23 {ccx[proc][0]} (probed), so the "
+                                 f"values are given scaled by it, without the amplitude.", once=True)
+            if kept[proc]:
+                self.report.warn(f"{what[proc]}{'s' if len(kept[proc]) > 1 else ''} "
+                                 f"{', '.join(kept[proc])}: Abaqus applies the amplitude's value at "
+                                 f"time 0 there, which the converter cannot evaluate (USER, SOLUTION "
+                                 f"DEPENDENT, VALUE=ABSOLUTE, TIME=TOTAL TIME, ... or undefined); "
+                                 f"ccx 2.23 applies {ccx[proc][1]}.", once=True)
+                self._reduces("amplitude of a static perturbation step at its end value (Abaqus: "
+                              "time 0)" if proc == "STATIC" else
+                              "amplitude of a *BUCKLE step at its full value (Abaqus: time 0)")
+        if zero:
+            self.report.warn(f"*BUCKLE step{'s' if len(zero) > 1 else ''} {', '.join(zero)}: the "
+                             f"amplitude is 0 at time 0, so that card applies no buckling load in "
+                             f"Abaqus (written at 0); a step left without load has no meaningful "
+                             f"buckling factors (ccx 2.23 prints ~1e10).", once=True)
         return [swap.get(id(b), b) for b in blocks] if swap else blocks
 
     # ccx 2.23 keeps one body load per set as written and direction, not per element (probed:
@@ -17846,24 +17918,42 @@ class Converter:
                                [f"{e}, {f}" for _, e, f, _ in left])
             return [(b, [name] + rec[1:])]
 
-        def end_value(b: Block, rec: List[str]) -> Optional[float]:
-            """The value a base-state line holds at the end of its step (None: unknown to the
-            converter, as on a FIXED / USER line or an amplitude it does not read at that time)."""
+        def end_factor(b: Block) -> Optional[float]:
+            """The factor a base-state card's amplitude reaches at the end of its step (None:
+            unknown to the converter, as on a FIXED / USER card or an amplitude it does not
+            read at that time)."""
             if b.has("FIXED") or b.has("USER"):
                 return None
-            amp, factor = b.uparam("AMPLITUDE"), 1.0
+            amp = b.uparam("AMPLITUDE")
             if amp and amp != self.CCX_RAMP:
                 curve, end = amps.get(amp), period.get(steps[id(b)] or 1)
                 if curve is None or curve.total or curve.absolute or end is None:
                     return None
                 try:
-                    factor = curve.value(end - pf(b.param("TIME DELAY") or "0"))
+                    return curve.value(end - pf(b.param("TIME DELAY") or "0"))
                 except ValueError:
                     return None
-            j = self._VALUE_FIELD[b.keyword]
+            return 1.0
+
+        def end_value(b: Block, rec: List[str]) -> Optional[float]:
+            """The value a base-state line holds at the end of its step (None: unknown)."""
+            factor, j = end_factor(b), self._VALUE_FIELD[b.keyword]
             try:
-                return (pf(rec[j]) if len(rec) > j and rec[j] else 0.0) * factor
+                return None if factor is None else \
+                    (pf(rec[j]) if len(rec) > j and rec[j] else 0.0) * factor
             except (TypeError, ValueError):
+                return None
+
+        def temperature(rec: List[str], factor: Optional[float] = 1.0) -> Optional[Tuple[float, ...]]:
+            """A temperature line's values: the temperature, then a shell's or beam's
+            gradients or the values at its section points (a blank field: 0; trailing blank
+            ones dropped), times ``factor`` (None: unknown)."""
+            vals = list(rec[1:])
+            while len(vals) > 1 and not vals[-1]:
+                vals.pop()
+            try:
+                return None if factor is None else tuple(pf(x) * factor if x else 0.0 for x in vals or [""])
+            except ValueError:
                 return None
 
         def bc_keys(rec: List[str]) -> Optional[List[Tuple[int, int]]]:
@@ -17882,12 +17972,15 @@ class Converter:
         inexact: Dict[str, List[str]] = {}          # why -> where
         ends = {id(b): last for b, _, last in cards}    # a card -> its last line
 
-        def base_temperatures(s: int) -> Tuple[Dict[int, Optional[float]], Optional[float]]:
-            """The base state's temperatures at static perturbation step ``s``: (node -> value,
-            the value of the other nodes), from the initial conditions and the general steps'
-            *TEMPERATURE lines; None where the converter does not know it (a FILE / USER /
-            INPUT card, an unknown set, gradients, temperatures a heat transfer step solved)."""
-            unknown: Tuple[Dict[int, Optional[float]], Optional[float]] = ({}, None)
+        def base_temperatures(s: int) -> Tuple[Dict[int, Optional[Tuple[float, ...]]],
+                                                Optional[Tuple[float, ...]]]:
+            """The base state's temperatures at static perturbation step ``s``: (node -> its
+            values (temperature()), those of the other nodes: none, 0), from the initial
+            conditions and the general steps' *TEMPERATURE lines; None where the converter
+            does not know them (a FILE / USER / INPUT card, an unknown set, temperatures a
+            heat transfer step solved)."""
+            unknown: Tuple[Dict[int, Optional[Tuple[float, ...]]], Optional[Tuple[float, ...]]] = \
+                ({}, None)
             ics = [b for b, k, _ in cards if k == 0 and b.keyword == "INITIAL CONDITIONS" and
                    b.uparam("TYPE") == "TEMPERATURE"]
             if any(procs.get(k) in TEMPERATURE_DOF_PROCS or any(
@@ -17895,19 +17988,15 @@ class Converter:
                     for b in by_step.get(k, [])) for k in range(1, s) if k not in self._pert_idx) or \
                     any(b.has("FILE") or b.has("USER") or b.has("INPUT") for b in ics):
                 return unknown
-            got: Dict[int, Optional[float]] = {}
+            got: Dict[int, Optional[Tuple[float, ...]]] = {}
             for b, rec in [(b, rec) for b in ics for rec in recs[id(b)] if rec and rec[0]] + \
                     lines["TEMPERATURE"]:
                 ns = members("NSET", rec[0])
                 if ns is None:
                     return unknown
-                try:
-                    v = None if any(rec[2:]) else end_value(b, rec) if b.keyword == "TEMPERATURE" \
-                        else pf(rec[1]) if len(rec) > 1 and rec[1] else 0.0
-                except ValueError:
-                    v = None
+                v = temperature(rec, end_factor(b) if b.keyword == "TEMPERATURE" else 1.0)
                 got.update((n, v) for n in ns)
-            return got, 0.0
+            return got, ()
 
         def added(s: int) -> None:
             """Static perturbation step ``s``: Abaqus reads its load, BC and temperature values
@@ -17938,7 +18027,11 @@ class Converter:
             mine = [b for b in by_step.get(s, []) if (b.keyword in base or b.keyword == "TEMPERATURE")
                     and id(b) not in generated]
             temps, rest = base_temperatures(s) if any(b.keyword == "TEMPERATURE" for b in mine) \
-                else ({}, 0.0)
+                else ({}, ())
+
+            def hot(t: Optional[Tuple[float, ...]]) -> bool:
+                """Whether base-state temperatures differ from 0 (or are unknown)."""
+                return t is None or any(t)
             fixable = s not in self._restore_from or self._restore_procs[s] <= {"FREQUENCY"}
             fixed: List[Tuple[int, int]] = []
             first_bc = next((b for b in mine if b.keyword == "BOUNDARY"), None)
@@ -17953,7 +18046,7 @@ class Converter:
                 kw, j = b.keyword, self._VALUE_FIELD[b.keyword]
                 lines_of = rows.get(id(b), [])
                 if kw == "TEMPERATURE" and (b.has("FILE") or b.has("USER")) and \
-                        (rest != 0.0 or any(x != 0.0 for x in temps.values())):
+                        (hot(rest) or any(hot(x) for x in temps.values())):
                     inexact.setdefault("changes what the base state loads by a value the "
                                        "converter cannot add to the base one (an amplitude, "
                                        "FIXED or USER on either line; ccx replaces it)",
@@ -17971,9 +18064,10 @@ class Converter:
                         v = pf(rec[j]) if len(rec) > j and rec[j] else 0.0
                     except ValueError:
                         v = None
+                    pv = temperature(rec) if kw == "TEMPERATURE" else None
                     if kw == "TEMPERATURE":
-                        on = {k: temps.get(k, rest) for k in ks if temps.get(k, rest) != 0.0}
-                        if v != 0.0 and self._sp_temp_dep:
+                        on = {k: temps.get(k, rest) for k in ks if hot(temps.get(k, rest))}
+                        if hot(pv) and self._sp_temp_dep:
                             inexact.setdefault("changes temperatures, which Abaqus leaves out of "
                                                "the temperature-dependent material properties "
                                                "(those of the base state), ccx not",
@@ -18000,22 +18094,29 @@ class Converter:
                         continue
                     if on and (b.uparam("AMPLITUDE") not in ("", self.CCX_RAMP) or b.has("FIXED") or
                                b.has("USER") or None in on.values() or v is None or
-                               (kw == "TEMPERATURE" and any(rec[j + 1:]))):
+                               (kw == "TEMPERATURE" and (pv is None or any(
+                                   len(a) != len(pv) for a in on.values())))):
                         inexact.setdefault("changes what the base state loads by a value the "
                                            "converter cannot add to the base one (an amplitude, "
-                                           "FIXED or USER on either line; ccx replaces it)",
+                                           "FIXED or USER on either line, temperatures with other "
+                                           "gradients or section points than the base state's; "
+                                           "ccx replaces it)",
                                            []).append(f"{s} (*{kw} {rec[0]})")
                         if not fix_ks:
                             continue
                         on = {}
-                    groups: Dict[float, List[tuple]] = {}
+                    groups: Dict[object, List[tuple]] = {}
                     for k in ks:
                         if k not in fix_ks:
-                            groups.setdefault(on.get(k, 0.0), []).append(k)
+                            groups.setdefault(on.get(k, () if kw == "TEMPERATURE" else 0.0), []).append(k)
                     got: List[str] = []
                     for a, part_ks in groups.items():
                         r = list(rec) + [""] * (j + 1 - len(rec))
-                        r[j] = short_real(v + a, 12)
+                        if kw == "TEMPERATURE":         # (each value: gradients, section points)
+                            r = r[:j] + [short_real(x + y, 12) for x, y in
+                                         zip(pv, a or (0.0,) * len(pv))]
+                        else:
+                            r[j] = short_real(v + a, 12)
                         if kw == "BOUNDARY" and not r[2]:
                             r[2] = r[1]             # (a BC line's blank last DOF: its first)
                         if len(groups) == 1 and not fix_ks:

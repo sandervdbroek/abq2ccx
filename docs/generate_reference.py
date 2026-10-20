@@ -186,7 +186,8 @@ TRANSLATED = {
         "ccx 2.23 does not solve a `*STEP, PERTURBATION` `*BUCKLE` step for prescribed "
         "displacements (only those nodes move): there nonzero BCs held on from earlier steps are "
         "given again at 0, and a step loaded by its own drops `PERTURBATION` before any general "
-        "step, else is warned (reduced physics).",
+        "step, else is warned (reduced physics). Loads and BCs on an amplitude are scaled by its "
+        "value at time 0, which Abaqus applies there (ccx ignores the amplitude).",
     "*HEAT TRANSFER": "`END=` / `MXDEM` dropped. A transient step without `DELTMX` gets `DIRECT`: "
         "Abaqus then takes fixed increments of the initial increment, ccx its own. A transient step "
         "with temperature DOFs and no initial temperatures starts every node at 0, the Abaqus "
