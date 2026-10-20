@@ -19,16 +19,17 @@ references). Each entry carries one of three expectations:
   least one STEP and writes no NaN/Inf to the .dat print blocks or the .frd - under
   the deck's own loads: no step the deck loads may lose all its loads in the
   conversion (abq2ccx's load audit, ``Converter.unloaded_steps``).
-  Three flags keep such a deck out of the headline count of faithful solves (182):
+  Three flags keep such a deck out of the headline count of faithful solves (177):
   - ``source_unloaded=True`` (14): the source deck applies no load, prescribed
     displacement or initial velocity in any step (and has no eigenvalue step), so it
     solves to a zero response;
-  - ``reduced_physics='<what>'`` (45, 7 of them also source_unloaded, 1 also solver_differs): the conversion
+  - ``reduced_physics='<what>'`` (50, 7 of them also source_unloaded, 1 also solver_differs): the conversion
     drops or replaces part of the Abaqus model - a constitutive behaviour (concrete
     damaged plasticity, user hardening, Chaboche back-stresses, field-dependent
     elasticity), an element formulation (hybrid, modified or thin-shell elements run as
     ccx's plain ones, S4R shells that ccx bends only through hourglass stiffness, CPS4R
     elements much wider than thick, whose hourglass stiffness their depth inflates,
+    plastic CPE4 / CAX4, which lock without Abaqus' selectively reduced volume terms,
     linear circular-section beams as 3-node ones, Timoshenko beams as ccx's
     Euler-Bernoulli U1), a section control,
     an interaction (general contact) or an imperfection - so ccx solves a different
@@ -595,6 +596,7 @@ CORPUS = [
          exercises='C3D8 — *Frequency',
          url='https://raw.githubusercontent.com/JuliaFEM/AbaqusReader.jl/master/test/test_manual_examples/frequency_analysis.inp'),
     dict(name='juliafem_plastic_analysis', expect_solve=True, license='MIT',
+         reduced_physics="plastic CPE4 elements: ccx 2.23 integrates them fully, without the selectively reduced volume terms of Abaqus' first-order quadrilaterals, so they lock in plastic flow",
          exercises='CPE4',
          url='https://raw.githubusercontent.com/JuliaFEM/AbaqusReader.jl/master/test/test_manual_examples/plastic_analysis.inp'),
     dict(name='juliafem_shell_analysis', expect_solve=True, license='MIT',
@@ -1041,15 +1043,19 @@ CORPUS = [
          exercises='S4 — parts/instances/assembly',
          url='https://raw.githubusercontent.com/dithoap/RESSForLab/master/testing/Shell-Biaxial.inp'),
     dict(name='lcharleux_indentation_axi', expect_solve=True, license='GPL-2.0',
+         reduced_physics="plastic CAX4 elements: ccx 2.23 integrates them fully, without the selectively reduced volume terms of Abaqus' first-order quadrilaterals, so they lock in plastic flow",
          exercises='CAX4 — parts/instances/assembly; contact',
          url='https://raw.githubusercontent.com/lcharleux/abapy/master/doc/example_code/indentation/workdir/indentation_axi.inp'),
     dict(name='lcharleux_indentation_axi_2', expect_solve=True, license='GPL-2.0',
+         reduced_physics="plastic CAX4 elements: ccx 2.23 integrates them fully, without the selectively reduced volume terms of Abaqus' first-order quadrilaterals, so they lock in plastic flow",
          exercises='CAX4 — parts/instances/assembly; contact',
          url='https://raw.githubusercontent.com/lcharleux/abapy/master/doc/example_code/tutorial/indentation_axi.inp'),
     dict(name='lcharleux_indentation_axi_3', expect_solve=True, license='GPL-2.0',
+         reduced_physics="plastic CAX4 elements: ccx 2.23 integrates them fully, without the selectively reduced volume terms of Abaqus' first-order quadrilaterals, so they lock in plastic flow",
          exercises='CAX4 — parts/instances/assembly; contact',
          url='https://raw.githubusercontent.com/lcharleux/abapy/master/doc/example_code/tutorial/workdir/indentation_axi.inp'),
     dict(name='lcharleux_indentation_axi_fancier', expect_solve=True, license='GPL-2.0',
+         reduced_physics="plastic CAX4 elements: ccx 2.23 integrates them fully, without the selectively reduced volume terms of Abaqus' first-order quadrilaterals, so they lock in plastic flow",
          exercises='CAX4 — parts/instances/assembly; contact',
          url='https://raw.githubusercontent.com/lcharleux/abapy/master/doc/example_code/tutorial/workdir/indentation_axi_fancier.inp'),
     dict(name='marcello_gori_50_10_10', expect_solve=True, license='MIT',
