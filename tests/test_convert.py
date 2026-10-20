@@ -4521,6 +4521,109 @@ def test_blankless_keywords_recognised():
     assert body.count("*STEP") == 2 and body.count("*END STEP") == 2
 
 
+def test_indented_keyword_lines_are_keyword_lines():
+    # "The first non-blank character of each keyword line must be a star": "  *NODE" is *NODE
+    # (it parsed as a keyword "*NODE", so an indented *INSTANCE left the deck instance-less)
+    kw, params = A.parse_keyword_line("   *NSET, NSET=A")
+    assert (kw, dict(params)) == ("NSET", {"NSET": "A"})
+    assert A.join_keyword_continuations(["  *NSET, NSET=S,", "  GENERATE", "1, 8, 1"]) == \
+        ["  *NSET, NSET=S, GENERATE", "1, 8, 1"]
+    deck = ("*Part, name=P\n  " + HEX.replace("*ELEMENT", "    *ELEMENT") + "*End Part\n"
+            "*Assembly, name=A\n  *Instance, name=I, part=P\n  *End Instance\n*End Assembly\n"
+            "  *Material, name=M\n*Elastic\n1000., 0.3\n")
+    body, _, rep = convert_str(deck)
+    assert "*ELEMENT, TYPE=C3D8\n1, 1, 2, 3, 4, 5, 6, 7, 8" in body and "\n7, 1, 1, 1\n" in body
+    assert "no CalculiX equivalent" not in rep.text() and "without any *INSTANCE" not in rep.text()
+
+
+def test_abbreviations_read_in_full():
+    # Abaqus reads any unambiguous abbreviation of a keyword, parameter or value; a name it
+    # spells (blanks aside) wins over one it begins (Input syntax rules)
+    seen = {}
+    kw, params = A.parse_keyword_line("*INITIAL CONDITION, TYPE=TEMP", seen)
+    assert (kw, dict(params)) == ("INITIAL CONDITIONS", {"TYPE": "TEMPERATURE"})
+    assert dict(A.parse_keyword_line("*OUTPUT, FIELD, VAR=PRESELECT", seen)[1]) == \
+        {"FIELD": None, "VARIABLE": "PRESELECT"}
+    assert dict(A.parse_keyword_line("*EL PRINT, F=2, POS=CENTROID", seen)[1]) == \
+        {"FREQUENCY": "2", "POSITION": "CENTROIDAL"}
+    assert A.parse_keyword_line("*ORIENTATION, NAME=O, SYSTEM=C", seen)[1]["SYSTEM"] == "CYLINDRICAL"
+    # names spelled out stay: *STEP's own INC, a value with its blanks left out, a name
+    assert dict(A.parse_keyword_line("*STEP, INC=100, AMP=R", seen)[1]) == \
+        {"INC": "100", "AMPLITUDE": "RAMP"}
+    assert dict(A.parse_keyword_line("*CLOAD, AMP=R", seen)[1]) == {"AMPLITUDE": "R"}
+    assert A.parse_keyword_line("*CONTACT PAIR, TYPE=SURFACETOSURFACE", seen)[1]["TYPE"] == \
+        "SURFACETOSURFACE"
+    assert "TIME MARKS" in A.parse_keyword_line("*OUTPUT, FIELD, TIMEMARKS=YES", seen)[1]
+    assert seen["read"]["*INITIAL CONDITION"] == "INITIAL CONDITIONS"
+    assert seen["read"]["*OUTPUT, VAR"] == "VARIABLE"
+    # one that begins several names is kept as written
+    assert A.parse_keyword_line("*END", seen)[0] == "END" and "END STEP" in seen["ambiguous"]["*END"]
+    assert A.parse_keyword_line("*SURFACE, NAME=S, TYPE=E", seen)[1]["TYPE"] == "E"
+    # the converter's own ccx text is read as written: ccx spells *ELASTIC, TYPE=ORTHO
+    assert A.parse_keyword_line("*ELASTIC, TYPE=ORTHO")[1]["TYPE"] == "ORTHO"
+    deck = HEX + ("*Nset, nset=ALL, gen\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+                  "*Expan\n1.e-5\n*Solid Section, elset=EALL, material=M\n*Initial Condition, "
+                  "type=Temp\nALL, 20.\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n"
+                  "*Output, field, var=preselect\n*End Step\n*End\n")
+    body, conv, rep = convert_str(deck)
+    text = rep.text()
+    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nALL, 20." in body and "*EXPANSION" in body
+    assert "*NODE FILE\nU, RF" in body and "*EL FILE\nS, E" in body
+    assert "Abbreviations read in full, as Abaqus reads them: *EXPAN -> *EXPANSION; " \
+        "*INITIAL CONDITION -> *INITIAL CONDITIONS; *INITIAL CONDITIONS, TYPE=Temp -> " \
+        "TEMPERATURE; *OUTPUT, VAR -> VARIABLE." in text
+    assert "*END: an ambiguous abbreviation (END ASSEMBLY, END INSTANCE" in text
+
+
+def test_abbreviation_tables_spell_names_as_the_converter_reads_them():
+    # a parameter is read in the table's spelling: one the converter reads with other blanks
+    # (DATATYPE, SCALE STRESS) would be lost to it
+    src = open(A.__file__, encoding="utf-8").read()
+    reads = set(re.findall(r'(?:\.u?param|\.has|params\.get)\(\s*"([A-Z][A-Z0-9 -]*)"', src))
+    reads |= set(A.MULTIWORD_PARAMS)
+    compact = {r.replace(" ", ""): r for r in reads}
+    clash = [(k, p, compact[p.replace(" ", "")]) for k, ps in A.ABAQUS_PARAMS.items() for p in ps
+             if compact.get(p.replace(" ", ""), p) != p]
+    assert not clash, clash
+    assert all(k in A.ABAQUS_KEYWORDS for k in A.ABAQUS_PARAMS)
+
+
+def test_absolute_amplitude_at_unit_magnitudes_is_exact():
+    # VALUE=ABSOLUTE: Abaqus applies the amplitude itself, ccx magnitude x amplitude: the same
+    # where every load / BC on it has magnitude 1 (abaqus2017_nt3xx28f, written VALUE=A)
+    deck = HEX + ("*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, "
+                  "material=M\n*Amplitude, name=AM, value=A\n0., 0., 1., 2.\n*Boundary\n1, 1, 3\n"
+                  "*Step\n*Static\n*Cload, amp=AM\n7, 3, {m}\n*Boundary, amp=AM\n2, 2, 2, {n}\n"
+                  "*End Step\n")
+    _, conv, rep = convert_str(deck.format(m="1.", n="1.0e0"))
+    assert conv.reduced_physics == [] and "is the amplitude itself" in rep.text()
+    for m, n in (("2.", "1."), ("1.", "")):
+        _, conv, _ = convert_str(deck.format(m=m, n=n))
+        assert conv.reduced_physics == ["*AMPLITUDE, VALUE=ABSOLUTE scaled by the load magnitude"]
+
+
+def test_self_contact_pairs_commented_out():
+    # one surface, or the same surface twice: Abaqus self-contact.  ccx 2.23 stops on the
+    # first ("allocont: master surface"); its own 'S, S' runs, but carries half the contact
+    # force of a strip folding onto itself (probed), so the line is commented out
+    deck = HEX + ("*Surface, name=S\nEALL, S2\n*Surface, name=T\nEALL, S1\n*Surface Interaction, "
+                  "name=I\n*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, "
+                  "material=M\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n"
+                  "*Contact File\nCDIS\n*End Step\n")
+    for line in ("S", "S, S", "s, S,"):
+        body, conv, rep = convert_str(deck.replace("*Material", f"*Contact Pair, interaction=I\n"
+                                                                f"{line}\n*Material"))
+        assert "\n*CONTACT PAIR" not in body and f"\n** {line}\n" in body
+        assert f"*CONTACT PAIR I: self-contact of {line[0]} (one surface" in rep.text()
+        assert conv.reduced_physics == ["*CONTACT PAIR self-contact"]
+        assert "*CONTACT FILE" not in body                  # no contact left to write
+    body, conv, rep = convert_str(deck.replace("*Material", "*Contact Pair, interaction=I\nS\n"
+                                                            "T, S\n*Material"))
+    assert "*CONTACT PAIR, INTERACTION=I, TYPE=NODE TO SURFACE\nT, S\n" in body
+    assert "\n** S\n" in body and "*CONTACT FILE" in body
+    assert conv.reduced_physics == ["*CONTACT PAIR self-contact"]
+
+
 def test_blankless_spellings_of_handled_and_tabled_keywords():
     # *ENERGYPRINT is the output request *ENERGY PRINT (a note, no reduced physics), and
     # *ROTARYINERTIA / *SECTIONCONTROLS reach their handlers like the spellings with blanks

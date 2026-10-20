@@ -8512,6 +8512,28 @@ def main():
               f"{errs['I1']:.1e} / {errs['I2']:.1e} apart)")
     failures += 0 if ok else 1
 
+    # --- indented keyword lines and abbreviations, read as Abaqus reads them: a free cube
+    # heated from the initial 20 to 120 strains alpha dT = 1e-3 (the initial temperature lost,
+    # it strained 1.2e-3; the indented mesh lost, nothing solved)
+    nodes = "".join(f"{n + 1}, {x}., {y}., {z}.\n" for n, (x, y, z) in enumerate(
+        ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))))
+    deck = ("  *NODE, NSET=ALL\n" + nodes + "   *ELEMENT, TYPE=C3D8, ELSET=E\n1, 1,2,3,4,5,6,7,8\n"
+            "*SOLID SECT, ELSET=E, MAT=M\n*MATERIAL, NAME=M\n*ELAS, TYPE=ISO\n1000., 0.3\n"
+            "*EXPAN\n1.e-5\n*BOUND\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+            "  *INITIAL CONDITION, TYPE=TEMP\nALL, 20.\n*STEP\n*STATIC\n*TEMPERATURE\nALL, 120.\n"
+            "*NODE PRINT, NSET=ALL, F=1\nU\n*END STEP\n")
+    u = review_run(deck, "abbreviated_indented", dat_displacements)
+    ok = bool(u)
+    if ok:
+        err = max(abs(u[n][i] - 1e-3 * x) for n, x0 in enumerate(nodes.splitlines(), 1)
+                  for i, x in enumerate(float(t) for t in x0.split(",")[1:]))
+        ok = err < 1e-9 and abs(u[7][0] - 1e-3) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  abbreviated_indented (indented *NODE / *ELEMENT / "
+              f"*INITIAL CONDITION, *SOLID SECT, MAT=, *ELAS, TYPE=ISO, *EXPAN, *BOUND, F=1): a free "
+              f"cube heated 20 -> 120 strains alpha dT, u = 1e-3 x ({err:.1e} apart, corner u_x "
+              f"{u[7][0]:.6e})")
+    failures += 0 if ok else 1
+
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
     for name in ("composite_shell", "assembly_two_blocks"):

@@ -6,6 +6,18 @@ physics.
 
 ## Unreleased
 
+* **Indented keyword lines** — Abaqus reads `  *NODE` as `*NODE`; the converter read a keyword
+  `*NODE` with no CalculiX equivalent, so an indented `*INSTANCE` left a deck without its mesh.
+* **Abbreviations** — Abaqus reads any unambiguous abbreviation of a keyword, parameter or
+  value (`*INITIAL CONDITION`, `VAR=PRESELECT`, `F=1`, `TYPE=ISO`, `SYSTEM=C`). The converter
+  knew a few; it now reads them all in full against the Abaqus keyword list and the parameters
+  of the keywords it converts, with a note. An ambiguous one is warned and kept as written.
+  `*AMPLITUDE, VALUE=ABSOLUTE` whose every load / BC has magnitude 1 is exact in ccx (magnitude
+  x amplitude) and is no longer reduced physics.
+* **Self-contact** — a `*CONTACT PAIR` line with one surface, or the same surface twice, passed
+  through, and ccx 2.23 stopped on the first ("allocont: master surface"). ccx's own `S, S`
+  runs, but is not Abaqus' two-way self-contact (probed: half the contact force of a strip
+  folding onto itself), so the line is commented out with a warning (reduced physics).
 * **`*HYPERFOAM`, N=1** — ccx 2.23 gives an N=1 hyperfoam (the default) no stiffness: it
   stopped without a message in static and buckling steps and returned frequencies of 0. It is
   now written as N=2 with mu1 halved in both terms (the same energy), which ccx solves (closed

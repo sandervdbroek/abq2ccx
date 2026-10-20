@@ -215,8 +215,9 @@ regenerate the docs (below).
   `SPECIAL_UNSUPPORTED` (otherwise it gets a generic "no equivalent" comment).
 * **Drop an organisational keyword** → add it to `DROP_KEYWORDS` (or
   `DROP_WARN_KEYWORDS` with a message if it can change the model).
-* **Normalise an abbreviation** → `PARAM_ALIASES` (parameter) or `KEYWORD_ALIASES`
-  (keyword).
+* **Read an abbreviation** → `parse_keyword_line` resolves them against `ABAQUS_KEYWORDS`
+  and, per keyword, `ABAQUS_PARAMS` (a converted keyword's parameters and fixed values); add
+  a keyword's parameters there. `PARAM_ALIASES` / `KEYWORD_ALIASES` cover the rest.
 
 ## Constraints: `*MPC`, rigid bodies and overconstraints
 
