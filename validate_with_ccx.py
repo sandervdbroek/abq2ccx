@@ -5100,6 +5100,67 @@ def member_mass_frequency_deck(mpc):
     return "\n".join(lines) + "\n"
 
 
+def modal_knot_deck(kind, proc):
+    """An S4 strip 0.5 x 0.1 x 0.01 clamped at one end (rotational BCs on its two end nodes),
+    or (``kind`` "column") a B32R column 1 long, RECT 0.1 x 0.1, clamped at its foot; a
+    *FREQUENCY step for 6 modes that prints them, then (``proc``) a *MODAL DYNAMIC step 0.01
+    long in increments of 1e-4 under a unit *CLOAD on a constant amplitude, or ("ssd") a
+    *STEADY STATE DYNAMICS step 10 - 1000 Hz under a unit *CLOAD, on a tip node (11 along z,
+    the column's 21 along x).  ccx 2.23 segfaulted on those rotational BCs in the *MODAL
+    DYNAMIC step and moved the model wrongly under that force in both steps."""
+    if kind == "column":
+        lines = ["*HEADING", "B32R column, modal steps", "*NODE"] + \
+            [f"{i + 1}, 0., 0., {0.05 * i:g}" for i in range(21)] + \
+            ["*ELEMENT, TYPE=B32R, ELSET=B"] + [f"{i + 1}, {2 * i + 1}, {2 * i + 2}, {2 * i + 3}" for i in range(10)] + \
+            ["*MATERIAL, NAME=M", "*ELASTIC", "2e5, 0.3", "*DENSITY", "1e-3",
+             "*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT", "0.1, 0.1", "1., 0., 0.",
+             "*BOUNDARY", "1, 1, 6"]
+        node, dof = 21, 1
+    else:
+        lines = ["*HEADING", "S4 strip, modal steps", "*NODE"] + \
+            [x for i in range(6) for x in (f"{2 * i + 1}, {0.1 * i:g}, 0., 0.", f"{2 * i + 2}, {0.1 * i:g}, 0.1, 0.")] + \
+            ["*ELEMENT, TYPE=S4, ELSET=P"] + [f"{i + 1}, {2 * i + 1}, {2 * i + 3}, {2 * i + 4}, {2 * i + 2}"
+                                              for i in range(5)] + \
+            ["*MATERIAL, NAME=M", "*ELASTIC", "2e5, 0.3", "*DENSITY", "1e-3",
+             "*SHELL SECTION, ELSET=P, MATERIAL=M", "0.01", "*BOUNDARY", "1, 1, 6", "2, 1, 6"]
+        node, dof = 11, 3
+    lines += ["*NSET, NSET=OUT", str(node), "*AMPLITUDE, NAME=ONE", "0., 1., 1., 1.",
+              "*STEP", "*FREQUENCY", "6", "*NODE PRINT, NSET=OUT", "U", "*END STEP", "*STEP"]
+    lines += ["*MODAL DYNAMIC", "1e-4, 0.01", "*CLOAD, AMPLITUDE=ONE"] if proc == "modal" else \
+        ["*STEADY STATE DYNAMICS", "10., 1000., 5", "*CLOAD"]
+    lines += [f"{node}, {dof}, 1.", "*NODE PRINT, NSET=OUT", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def modal_superposition(dat_path, node, dof):
+    """ccx's own answer to a unit load on ``node`` / ``dof`` from the mass-normalised modes
+    its *FREQUENCY step printed (step 1), superposed undamped, beside what its step 2 gives
+    there: [(time, ccx, superposed)] under a constant load in a *MODAL DYNAMIC step, phi^2 /
+    w^2 (1 - cos w t) per mode, or [(frequency, ccx's real part, superposed)] in a *STEADY
+    STATE DYNAMICS step, phi^2 / (w^2 - W^2) per mode, its eigenfrequencies left out."""
+    freqs = dat_eigen_table(dat_path, "E I G E N V A L U E   O U T P U T")
+    modes, resp = [], []
+    for step, title, _, time, rows in A.dat_blocks(dat_path):
+        if title == "displacements":
+            got = {int(r[0]): r[1:] for r in rows}.get(node)
+            if got is not None:
+                (modes if step == 1 else resp).append((time, got[dof - 1]))
+    if not freqs or len(modes) != len(freqs) or not resp:
+        return None
+    om = [2 * math.pi * f for f in freqs]
+    phi2 = [m[1] ** 2 for m in modes]
+    out = []
+    if resp[0][0] is not None and len(resp) > 2 and resp[1][0] == resp[0][0]:   # steady state
+        for t, u in resp[0::2]:
+            w = 2 * math.pi * t
+            if any(abs(o - w) < 1e-6 * o for o in om) or not math.isfinite(u):
+                continue
+            out.append((t, u, sum(p / (o * o - w * w) for p, o in zip(phi2, om))))
+        return out
+    return [(t, u, sum(p / (o * o) * (1 - math.cos(o * t)) for p, o in zip(phi2, om)))
+            for t, u in resp]
+
+
 def frequency_heated_deck(heat=True, t0=20.0, hyper=False):
     """buckle_gravity_deck's column with E 210e9 at 20 and 105e9 at 120 (rows), at the initial
     temperature ``t0``; ``heat``: a static step raising it to 120 (no load, no expansion: no
@@ -12599,6 +12660,59 @@ def main():
               f"ranges): every node {err:.1e} of max |u| ({scale:.4g}) from RIGHT, 1, 3 (before: ccx "
               f"exited 255)")
     failures += 0 if all(legacy.values()) and ok else 1
+
+    # --- eigenvalue and modal steps with knots (code review 3, B08 / B17) ----------
+    # shell/beam nodes with rotational BCs or a *CLOAD in a deck with modal steps get knot
+    # beams: ccx 2.23 segfaulted on those BCs and applied the force wrongly; the response is
+    # checked against ccx's own modes superposed (a C3D8I twin's *MODAL DYNAMIC matches that
+    # superposition to 7 digits)
+    for kind, proc in (("strip", "modal"), ("column", "modal"), ("strip", "ssd")):
+        tag = f"modal_knots_{kind}_{proc}"
+        node, dof = (21, 1) if kind == "column" else (11, 3)
+        res = review_run(modal_knot_deck(kind, proc), tag,
+                         lambda dat: modal_superposition(dat, node, dof))
+        if res:
+            scale = max(abs(w) for _, _, w in res)
+            err = max(abs(u - w) for _, u, w in res) / ccx_ratio(scale, 1.0)
+            ok = len(res) >= (5 if proc == "ssd" else 10) and scale > 0 and err < 1e-4
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'B32R column' if kind == 'column' else 'S4 strip'} "
+                  f"clamped, a unit *CLOAD on node {node} in a *{'STEADY STATE DYNAMICS' if proc == 'ssd' else 'MODAL DYNAMIC'}"
+                  f" step): {len(res)} {'frequencies' if proc == 'ssd' else 'increments'}, largest u "
+                  f"{scale:.6g}, {err:.1e} of it off ccx's own 6 modes superposed (the knot-free deck "
+                  f"{'moved 1e-5 of it' if proc == 'ssd' else 'segfaulted'})")
+        failures += 0 if res and ok else 1
+    # a rigid body whose shell members are knots, with a member node carrying only a *MASS,
+    # *FREQUENCY after a step ccx runs through its nonlinear solver: warned (ccx carries the
+    # members' equations wrongly there), no massless tetrahedron (ccx exited 255 on it); the
+    # same deck with a static first step keeps the tetrahedron (ccx stops without it)
+    for first, tet in (("*DYNAMIC\n0.001, 0.01", False), ("*STATIC", True)):
+        tag = "rigid_knot_mass_" + ("dynamic" if not tet else "static")
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        nodes = [f"{1 + i + 3 * j}, {10. * i:g}, {10. * j:g}, 0." for j in range(2) for i in range(3)]
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(["*HEADING", "rigid body on knotted S4 nodes", "*NODE"] + nodes +
+                               ["900, 25., 5., 0.", "901, 25., 5., 0.", "*ELEMENT, TYPE=S4, ELSET=P",
+                                "1, 1, 2, 5, 4", "2, 2, 3, 6, 5", "*ELEMENT, TYPE=MASS, ELSET=PM", "500, 900",
+                                "*NSET, NSET=LEFT", "1, 4", "*NSET, NSET=RB", "900, 3, 6", "*MATERIAL, NAME=M",
+                                "*ELASTIC", "210000., 0.3", "*DENSITY", "7.8e-9",
+                                "*SHELL SECTION, ELSET=P, MATERIAL=M", "0.2", "*MASS, ELSET=PM", "1e-3",
+                                "*RIGID BODY, REF NODE=901, TIE NSET=RB", "*STEP", first, "*BOUNDARY",
+                                "LEFT, 1, 6", "*CLOAD", "901, 3, 0.01", "*END STEP", "*STEP", "*FREQUENCY",
+                                "3", "*END STEP"]) + "\n")
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        f = dat_eigen_table(os.path.join(d, "job.dat"), "E I G E N V A L U E") if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        has_tet = "C3D4" in open(inp, encoding="utf-8").read()
+        warned = "ccx no longer passes such a DOF on to the knot's shell/beam section" in rep.text()
+        ok = len(f) == 3 and all(x > 0 for x in f) and has_tet == tet and warned != tet
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (*FREQUENCY after {first.splitlines()[0]}, a *MASS-only "
+              f"member): {status}, f = {', '.join(f'{x:.6g}' for x in f)}; tetrahedron "
+              f"{'kept' if has_tet else 'left out'}, {'warned' if warned else 'no warning'} "
+              f"({'ccx exited 255 on the tetrahedron after the *DYNAMIC step' if not tet else 'add_bo_st stops ccx without it'})")
+        if status != "solved":
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

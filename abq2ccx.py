@@ -22492,6 +22492,7 @@ class Converter:
         self._plan_base_restore(blocks)         # after _plan_load_cases (its dropped BCs)
         self._plan_late_op_new(blocks)          # after _plan_load_cases
         self._plan_modal_starts(blocks)
+        self._plan_modal_knots(blocks)          # before _plan_op_new_rotations: its knots stay knots
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes
@@ -22548,6 +22549,7 @@ class Converter:
         deck = self._keep_body_loads(deck)      # after the restore, which gives body loads too
         deck = self._no_analysis_segfaults(deck)
         self._audit_loads(blocks, deck)
+        self._warn_knot_equations(blocks, deck)     # after _settle_dependents: the terms as written
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
         out = self._short_fields(deck.render())     # last: every card is written
         if self.reduced_physics:
@@ -22778,6 +22780,23 @@ class Converter:
         self._linear_rigid = not self._nl_any and any(solver)
         self._dyn_before_nl = self._nl_any and any(solver[:self._nl_before])
         self._solver_why = next((s for s in solver if s), "")
+
+    # the steps ccx 2.23 solves on the eigenmodes of its linear system (_eigen_after_solver)
+    _EIGEN_PROCS = ("FREQUENCY", "BUCKLE", "MODAL DYNAMIC", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY")
+
+    def _eigen_after_solver(self) -> Tuple[int, str, List[int]]:
+        """The first step ccx 2.23 runs through its nonlinear solver (``_solver_steps``, or a
+        *HEAT TRANSFER step, which it runs there too), why, and the eigenvalue and modal steps
+        after it (step numbers): ccx carries an equation on a knot wrongly into those
+        (_warn_knot_equations); (0, "", []) where there are none."""
+        first, why = 0, ""
+        for step, it in zip(self.steps, self._solver_steps):
+            if why and step.proc in self._EIGEN_PROCS:
+                return first, why, [s.no for s in self.steps
+                                    if s.no >= step.no and s.proc in self._EIGEN_PROCS]
+            if not why and (it or step.proc == "HEAT TRANSFER"):
+                first, why = step.no, it or "a *HEAT TRANSFER step"
+        return 0, "", []
 
     def _drop_surface_elements(self, raw: List[Block], blocks: List[Block]) -> None:
         """Leave Abaqus surface elements (SURFACE_ELEMENTS) out of the ccx mesh — ccx has no
@@ -24205,10 +24224,16 @@ class Converter:
         the solution is the deck's (probed: the frequencies of a spring-held body equal those
         with the node also in a spring inside the body; NAFEMS FV4's equal those of its *MPC
         BEAM lines as linear equations to 5 digits).  Not in an axisymmetric model, as for the
-        rotary-inertia stars."""
+        rotary-inertia stars.  Nor in a body with shell/beam members (knots) where every
+        *FREQUENCY step comes after a step ccx runs through its nonlinear solver: there ccx
+        carries the members' equations wrongly (_warn_knot_equations) and exits 255 on the
+        tetrahedron, where without it the *FREQUENCY step runs (probed: *DYNAMIC, NLGEOM, plastic
+        and coupled first steps)."""
         if not any(b.keyword == "FREQUENCY" for b in blocks) or \
                 any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values()):
             return
+        freq = {step.no for step in self.steps if step.proc == "FREQUENCY"}
+        late = bool(freq) and freq <= set(self._eigen_after_solver()[2])
         kinds: Dict[int, set] = {}
         for _e, (t, conn) in self.geom.elements.items():
             for n in conn:
@@ -24229,8 +24254,12 @@ class Converter:
         nid, eid = self._next_ids()
         h = 1e-3 * self._model_span()
         done: List[int] = []
+        left: List[int] = []                    # (knotted bodies whose *FREQUENCY steps come late)
         for card, body, members in bodies:
             new: List[int] = []
+            if late and any(m in self._rot_nodes for m in members):
+                left += [m for m in dedup(members) if m in bare and m not in left]
+                continue
             for n in [m for m in dedup(members) if m in bare and m not in done]:
                 c = self.geom.nodes[n]
                 conn = [n]
@@ -24257,6 +24286,12 @@ class Converter:
                              f"*FREQUENCY stops on such a mass ('add_bo_st: coefficient should be "
                              f"0'); the tetrahedron moves rigidly with the body, so the solution is "
                              f"the same.", once=True)
+        if left:
+            self.report.note(f"*MASS on {len(left)} member node(s) in no other element (e.g. node "
+                             f"{left[0]}) of a rigid body with shell/beam members, every *FREQUENCY "
+                             f"step after a step ccx runs through its nonlinear solver: no massless "
+                             f"tetrahedron there (ccx 2.23 exits 255 on it in such a step; without "
+                             f"it the step runs).", once=True)
 
     def _rotary_axes(self, card: Block) -> Optional[List[Vec]]:
         """The axes (rows) a *ROTARY INERTIA's values refer to: global, or a rectangular
@@ -32223,6 +32258,50 @@ class Converter:
                              f"the steps that free them keep the equation — as in Abaqus.")
         return self._with_equations(deck, eqs, final, swap)
 
+    def _warn_knot_equations(self, blocks: List[Block], deck: EmittedDeck) -> None:
+        """Warn (reduced physics) of eigenvalue and modal steps after a step ccx 2.23 runs
+        through its nonlinear solver (_eigen_after_solver) in a model whose equations or rigid
+        constraints eliminate a DOF of a knot — a node ccx expands into a rigid section: the
+        converter's knot beams, frame joints, folded shell edges (_ccx_knot).  From such a
+        step on, ccx no longer passes the eliminated DOF on to the knot's expanded nodes in
+        the steps it runs linearly: after a mechanical step they act held, after a *HEAT
+        TRANSFER step free (probed: an S4 cantilever 20 x 10 x 0.2 whose two tip nodes are
+        knots tied to a *RIGID BODY, 61 kHz for 462 Hz after a *DYNAMIC, NLGEOM, plastic or
+        coupled step; the tip nodes' z tied by one *EQUATION, 2670 Hz; the same in *BUCKLE,
+        *MODAL DYNAMIC and a linear *STATIC step after the *FREQUENCY step).  The steps
+        before it are exact, and so is the nonlinear step; an equation that eliminates
+        another node's DOF and only names the knot's is exact, and so are SPCs on a knot.
+        ccx takes *EQUATION as model data only (an *EQUATION, REMOVE in the step frees the
+        knot again), so no ccx form keeps the constraint there.  After _settle_dependents:
+        the eliminated terms as written."""
+        first, why, eig = self._eigen_after_solver()
+        if not eig or not self._mechanical:
+            return
+        own = self._rot_nodes - set(self._rb_rot)
+        sections, at = self._knot_sections(blocks), self._elements_at(own)
+        knots = set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}
+        dep = {terms[0][0] for ci, terms in self._emitted_equations(deck) if deck.cards[ci].step <= 0}
+        for c in self._rigid_constraints(blocks):
+            if c["emit"] != "eq":                   # (ccx's RIGID MPCs eliminate the members)
+                dep.update(n for n, ds in c["elim"].items() if ds)
+        hit = sorted(dep & knots)
+        if not hit:
+            return
+        procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in eig)
+        self.report.warn(f"{' / '.join(procs)} step(s) {', '.join(map(str, eig))} after step {first} "
+                         f"({why}, which ccx 2.23 runs through its nonlinear solver), in a model "
+                         f"whose equations or rigid constraints eliminate a DOF of {len(hit)} knot(s) "
+                         f"(e.g. node {hit[0]}; knot beams, frame joints, folded shell edges): from "
+                         f"that step on ccx no longer passes such a DOF on to the knot's shell/beam "
+                         f"section in the steps it runs linearly — held there after a mechanical "
+                         f"step, free after a heat transfer step (probed: a cantilever whose knotted "
+                         f"tip nodes a *RIGID BODY ties, 61 kHz for 462 Hz). Those eigenvalues, modes "
+                         f"and later linear results are not the deck's; the steps before are exact. "
+                         f"No ccx form avoids it (*EQUATION is model data only): run those steps "
+                         f"before step {first}, or in an analysis of their own.", once=True)
+        self._reduces("equations on knots wrong in the eigenvalue / modal / linear steps after a "
+                      "step ccx runs through its nonlinear solver")
+
     @staticmethod
     def _emitted_equations(deck: EmittedDeck) -> List[Tuple[int, List[Tuple[int, int, str]]]]:
         """The equations of the converted deck's *EQUATION cards: (card index in
@@ -33373,6 +33452,66 @@ class Converter:
             else:                                   # (a static perturbation step: general in ccx)
                 state = base = s if loads or (step.perturbation and base is not None) else None
                 general = True
+
+    def _plan_modal_knots(self, blocks: List[Block]) -> None:
+        """ccx 2.23's modal procedures on shell/beam nodes that are not knots (probed on S4
+        strips and a B32R column, against a superposition of ccx's own modes that matches a
+        C3D8I twin's *MODAL DYNAMIC to 7 digits): a *MODAL DYNAMIC step segfaults on such a
+        node's rotational BC (the *FREQUENCY step before it runs), and stops on a moment there
+        ('*ERROR in dyna reading the eigenvectors'); a force on one moves the model wrongly in
+        a *MODAL DYNAMIC or *STEADY STATE DYNAMICS step (1e-5 of the response, off-axis
+        motion; ccx only warns '1-D or 2-D elements may cause problems').  A knot carries them
+        all: each such node gets a force-free knot beam (_add_knot_beams), and the response
+        equals the superposition to 6 digits (forces, BCs, moments about the shell's in-plane
+        axes).  *STEADY STATE DYNAMICS runs rotational BCs exactly; pressures on shells and
+        line loads on beams are right as they are.  The nodes: in a deck with a *MODAL
+        DYNAMIC step those with a rotational BC, with a modal step of either kind those a
+        *CLOAD loads (anywhere: ccx may hold a general step's loads into a modal step,
+        _modal_held).  Not in a deck with an explicit step (the massless knot beams stop ccx's
+        explicit solver) or U1 beams (ccx stops on any B31 there): warned."""
+        procs = {step.proc for step in self.steps}
+        modal = procs & {"MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
+        if not modal:
+            return
+        expanded: set = set()                   # nodes of the shells and beams ccx expands
+        for e, (typ, conn) in self.geom.elements.items():
+            cc = ccx_type(typ)
+            if e not in self._u1 and (cc in SHELL_TYPES or (cc in BEAM_TYPES and
+                                                            not cc.startswith(("T2D", "T3D")))):
+                expanded.update(conn)
+        cand = (expanded & self._rot_nodes) - set(self._knots)
+        need: Dict[int, str] = {}               # node -> what needs its knot
+        for b in blocks:
+            if b.keyword == "BOUNDARY" and "MODAL DYNAMIC" in procs:
+                for n in self._rot_items(b, cand):
+                    need.setdefault(n, "rotational BC")
+            elif b.keyword == "CLOAD":
+                for n, _src, _d, _v in self._rot_moments(b, cand, (1, 6)):
+                    need.setdefault(n, "concentrated load")
+        if not need:
+            return
+        kinds = set(need.values())
+        what = " / ".join(sorted(kinds))
+        steps = " / ".join(f"*{p}" for p in sorted(modal))
+        why = " and ".join(w for k, w in (
+            ("rotational BC", "segfaults in a *MODAL DYNAMIC step on a rotational BC of a shell/beam "
+                              "node that is not a knot"),
+            ("concentrated load", "applies a force on such a node wrongly in a modal step (stops on "
+                                  "a moment)")) if k in kinds)
+        if self._explicit_deck or self._u1:
+            self.report.warn(f"{len(need)} shell/beam node(s) with a {what} (e.g. node {min(need)}) "
+                             f"in a deck with a {steps} step: ccx 2.23 {why} (probed), and the knot "
+                             f"beams that make it a knot "
+                             f"{'stop its explicit solver' if self._explicit_deck else 'stop ccx in a model with U1 beams'}"
+                             f", so none were added: check that step's results.", once=True)
+            self._reduces(f"{steps} step on shell/beam nodes that are not knots")
+            return
+        self._add_knot_beams(sorted(need), blocks)
+        self.report.note(f"{steps}: each of the {len(need)} shell/beam node(s) with a {what} (e.g. "
+                         f"node {min(need)}) got a force-free knot beam (elset/material {KNOT_SET}, "
+                         f"no density) — ccx 2.23 {why} (probed); on a knot the response equals ccx's "
+                         f"own modes superposed. A knot holds a beam section rigid at the node, as beam "
+                         f"theory does.", once=True)
 
     def _plan_op_new_rotations(self, blocks: List[Block]) -> None:
         """ccx 2.23 does not rebuild rotational BCs on shell/beam nodes after a later step's

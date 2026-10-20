@@ -19144,6 +19144,108 @@ def test_shell_body_force_entries_across_steps():
            in conv.reduced_physics
 
 
+
+# --- code review 3, B08 / B17: eigenvalue and modal steps ccx gets wrong with knots ----------
+KNOT_CANTILEVER = ("*NODE\n1, 0., 0., 0.\n2, 10., 0., 0.\n3, 20., 0., 0.\n4, 0., 10., 0.\n"
+                   "5, 10., 10., 0.\n6, 20., 10., 0.\n901, 25., 5., 0.\n"
+                   "*ELEMENT, TYPE=S4, ELSET=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n"
+                   "*NSET, NSET=FIX\n1, 4\n*NSET, NSET=RB\n3, 6\n*MATERIAL, NAME=M\n*ELASTIC\n"
+                   "210000., 0.3\n*DENSITY\n7.8e-9\n{extra}*SHELL SECTION, ELSET=E, MATERIAL=M\n0.2\n"
+                   "{con}*STEP{nl}\n{first}\n*BOUNDARY\nFIX, 1, 6\n*END STEP\n*STEP\n{eig}\n*END STEP\n")
+KNOT_WARN = "ccx no longer passes such a DOF on to the knot's shell/beam section"
+
+
+def test_eigen_steps_after_a_nonlinear_solver_step_warn_of_equations_on_knots():
+    # B08: from a step ccx runs through its nonlinear solver on, ccx no longer passes a DOF an
+    # equation or rigid constraint eliminates on a knot to the knot's section in the steps it
+    # runs linearly (probed: 61 kHz for 462 Hz) - warned, reduced physics
+    rb = "*RIGID BODY, REF NODE=901, TIE NSET=RB\n"
+    for nl, first, extra, eig in (("", "*DYNAMIC\n0.001, 0.01", "", "*FREQUENCY\n3"),
+                                  (", NLGEOM", "*STATIC", "", "*FREQUENCY\n3"),
+                                  ("", "*STATIC", "*PLASTIC\n1000., 0.\n", "*BUCKLE\n2"),
+                                  ("", "*COUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE\n1., 1.",
+                                   "*CONDUCTIVITY\n50.\n*EXPANSION\n1e-5\n", "*FREQUENCY\n3")):
+        out, conv, rep = convert_str(KNOT_CANTILEVER.format(extra=extra, con=rb, nl=nl, first=first, eig=eig))
+        assert KNOT_WARN in rep.text() and "after step 1" in rep.text(), (first, rep.text())
+        assert any("equations on knots" in r for r in conv.reduced_physics)
+    # a user *EQUATION between the two knotted tip nodes (knot beams from a moment there)
+    eq = "*EQUATION\n2\n6, 3, 1., 3, 3, -1.\n"
+    deck = KNOT_CANTILEVER.format(extra="", con=eq + "*ELEMENT, TYPE=B31, ELSET=K\n7, 3, 902\n"
+                                  "8, 6, 903\n*NODE\n902, 20., 0., 1.\n903, 20., 10., 1.\n"
+                                  "*BEAM SECTION, ELSET=K, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n"
+                                  "1., 0., 0.\n", nl=", NLGEOM", first="*STATIC", eig="*FREQUENCY\n3")
+    _, conv, rep = convert_str(deck)
+    assert KNOT_WARN in rep.text(), rep.text()
+    # not with a linear first step, nor where the equation only names the knot's DOF (its
+    # first term an element-less node's), nor without knots
+    for con, first in ((rb, "*STATIC"), ("*NODE\n905, 30., 5., 0.\n*EQUATION\n2\n905, 3, 1., 6, 3, -1.\n",
+                                         "*DYNAMIC\n0.001, 0.01")):
+        _, conv, rep = convert_str(KNOT_CANTILEVER.format(extra="", con=con, nl="", first=first,
+                                                          eig="*FREQUENCY\n3"))
+        assert KNOT_WARN not in rep.text(), rep.text()
+    _, conv, rep = convert_str(KNOT_CANTILEVER.format(extra="", con=eq, nl="", first="*DYNAMIC\n0.001, 0.01",
+                                                      eig="*FREQUENCY\n3"))
+    assert KNOT_WARN not in rep.text(), rep.text()
+
+
+def test_mass_member_tetrahedron_left_out_where_ccx_exits_on_it():
+    # B08: a *MASS-only member of a rigid body with shell members, every *FREQUENCY step after
+    # a step ccx runs through its nonlinear solver: ccx exits 255 on the massless tetrahedron
+    # (b016d02 finished the deck), so none is added; a static first step keeps it
+    deck = KNOT_CANTILEVER.replace("*SHELL SECTION", "*ELEMENT, TYPE=MASS, ELSET=PM\n500, 900\n"
+                                   "*NODE\n900, 25., 5., 0.\n*MASS, ELSET=PM\n1e-3\n*SHELL SECTION")
+    rb = "*NSET, NSET=RB2\n900, 3, 6\n*RIGID BODY, REF NODE=901, TIE NSET=RB2\n"
+    out, conv, rep = convert_str(deck.format(extra="", con=rb, nl="", first="*DYNAMIC\n0.001, 0.01",
+                                             eig="*FREQUENCY\n3"))
+    assert "C3D4" not in out and "no massless tetrahedron there" in rep.text(), rep.text()
+    assert KNOT_WARN in rep.text()
+    out, conv, rep = convert_str(deck.format(extra="", con=rb, nl="", first="*STATIC", eig="*FREQUENCY\n3"))
+    assert "C3D4" in out and "massless tetrahedron" in rep.text() and KNOT_WARN not in rep.text()
+
+
+MODAL_STRIP = ("*NODE\n" + "".join(f"{2 * i + 1}, {0.1 * i:g}, 0., 0.\n{2 * i + 2}, {0.1 * i:g}, 0.1, 0.\n"
+                                   for i in range(6)) +
+               "*ELEMENT, TYPE=S4, ELSET=P\n" + "".join(f"{i + 1}, {2 * i + 1}, {2 * i + 3}, {2 * i + 4}, "
+                                                        f"{2 * i + 2}\n" for i in range(5)) +
+               "*MATERIAL, NAME=M\n*ELASTIC\n2e5, 0.3\n*DENSITY\n1e-3\n*SHELL SECTION, ELSET=P, "
+               "MATERIAL=M\n0.01\n*BOUNDARY\n{bc}\n*STEP\n*FREQUENCY\n2\n*END STEP\n*STEP\n{modal}\n"
+               "*CLOAD\n11, {dof}, 1.\n*END STEP\n")
+
+
+def test_modal_steps_knot_shell_and_beam_nodes_with_rotational_bcs_or_loads():
+    # B17: ccx 2.23 segfaults in a *MODAL DYNAMIC step on a rotational BC of a shell/beam node
+    # that is not a knot, stops on a moment there and applies a force wrongly (also in *STEADY
+    # STATE DYNAMICS): such nodes get a knot beam (validate_with_ccx.py modal_knots_*)
+    md, ssd = "*MODAL DYNAMIC\n0.001, 0.01", "*STEADY STATE DYNAMICS\n10., 1000., 5"
+    out, conv, rep = convert_str(MODAL_STRIP.format(bc="1, 1, 6\n2, 1, 6", modal=md, dof=3))
+    g = reparse(out)
+    knotted = sorted(g.elements[e][1][0] for e in g.elset(A.KNOT_SET))
+    assert knotted == [1, 2, 11], out
+    assert "*MODAL DYNAMIC: each of the 3 shell/beam node(s)" in rep.text() and not conv.reduced_physics
+    # *STEADY STATE DYNAMICS runs the rotational BCs: the loaded node only; a moment too
+    out, _, rep = convert_str(MODAL_STRIP.format(bc="1, 1, 6\n2, 1, 6", modal=ssd, dof=4))
+    g = reparse(out)
+    assert sorted(g.elements[e][1][0] for e in g.elset(A.KNOT_SET)) == [11], out
+    # translations held only, no modal step: nothing
+    out, _, _ = convert_str(MODAL_STRIP.format(bc="1, 1, 3\n2, 1, 3\n3, 3\n4, 3", modal="*STATIC", dof=3))
+    assert A.KNOT_SET not in out
+    # a beam column: the clamped and the loaded node
+    col = ("*NODE\n" + "".join(f"{i + 1}, 0., 0., {0.05 * i:g}\n" for i in range(21)) +
+           "*ELEMENT, TYPE=B32R, ELSET=B\n" + "".join(f"{i + 1}, {2 * i + 1}, {2 * i + 2}, {2 * i + 3}\n"
+                                                     for i in range(10)) +
+           "*MATERIAL, NAME=M\n*ELASTIC\n2e5, 0.3\n*DENSITY\n1e-3\n*BEAM SECTION, ELSET=B, MATERIAL=M, "
+           "SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n*BOUNDARY\n1, 1, 6\n*STEP\n*FREQUENCY\n2\n*END STEP\n"
+           "*STEP\n*MODAL DYNAMIC\n0.001, 0.01\n*CLOAD\n21, 1, 1.\n*END STEP\n")
+    out, _, _ = convert_str(col)
+    g = reparse(out)
+    assert sorted(g.elements[e][1][0] for e in g.elset(A.KNOT_SET)) == [1, 21], out
+    # an explicit step in the deck: the knot beams would stop its solver - warned instead
+    out, conv, rep = convert_str(col.replace("*STEP\n*FREQUENCY", "*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n"
+                                             "*END STEP\n*STEP\n*FREQUENCY"))
+    assert A.KNOT_SET not in out and "check that step's results" in rep.text(), rep.text()
+    assert any("not knots" in r for r in conv.reduced_physics)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

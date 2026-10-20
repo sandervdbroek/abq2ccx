@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **Eigenvalue and modal steps ccx gets wrong with knots** — a `*MODAL DYNAMIC` step
+  segfaulted ccx on a rotational BC of a shell/beam node and stopped on a moment there, and a
+  `*CLOAD` on such a node moved the model wrongly in `*MODAL DYNAMIC` and `*STEADY STATE
+  DYNAMICS` steps (orders of magnitude too small), unwarned. Those nodes now get knot beams:
+  the response equals ccx's own modes superposed. After a step ccx runs through its nonlinear
+  solver, ccx carries an equation or rigid constraint that eliminates a knot's DOF wrongly
+  into later eigenvalue, modal and linear steps (a cantilever tied to a `*RIGID BODY`: 61 kHz
+  for 462 Hz); that is now warned, with reduced physics. A `*MASS`-only member of such a body
+  no longer gets the massless tetrahedron there, on which ccx exited 255.
 * **Rigid-body reference nodes** — a shell `REF NODE` with a `*TRANSFORM` in its own body kept
   the axes after the free reference node took its place, so its drilling rotation stayed free in
   a `*DYNAMIC` step and ccx stopped; the free node now takes the `*TRANSFORM`, and the shell
