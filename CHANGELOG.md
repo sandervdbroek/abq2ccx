@@ -232,6 +232,13 @@ physics.
   (the column: 10.81 for 6.11). `*TEMPERATURE` in a `*BUCKLE` step, which ccx refuses
   ("temperature loading is not allowed in a linear buckling step") and Abaqus scales with the
   factor, is commented out as reduced physics.
+* **`*BUCKLE` factors nearest 1** — ccx 2.23 shift-inverts its buckling solve about 1, so it
+  returns the factors nearest 1, not the lowest: those are the lowest only while the load is
+  below the lowest buckling load (probed: a column at twice its buckling load gave 4.42,
+  11.9, ..., not 0.5). Every `*BUCKLE` step now notes it, and the `--run` digest warns when a
+  factor is below 1 or all lie within 5 % of 1 (also the mark of a free rigid-body mode). `--approximate` drops `PERTURBATION` on a last
+  `*BUCKLE` step that a prescribed displacement loads after a preload: ccx then solves for the
+  displacement, without the preload (warned before, and still without the option).
 
 ## 1.3.0 (October 2026)
 

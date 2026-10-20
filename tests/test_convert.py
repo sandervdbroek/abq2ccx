@@ -5986,6 +5986,17 @@ def test_buckle_perturbation_prescribed_displacements():
     assert conv.reduced_physics == ["*BUCKLE step 2 loaded by a prescribed displacement after a "
                                     "preload (ccx does not solve for it)"]
     assert "*BUCKLE step 2 is loaded by a prescribed displacement on a preloaded model" in rep.text()
+    assert "or rerun with --approximate to buckle it without the preload" in rep.text()
+    # ... --approximate drops PERTURBATION there (the last step): it buckles without the preload
+    body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", cload) + buckle, approximate=True)
+    assert "*STEP\n*BUCKLE\n2\n*BOUNDARY\n7, 3, 3, -0.01\n" in body and "PERTURBATION" not in body
+    assert conv.reduced_physics == ["--approximate: *BUCKLE step 2 buckles without its preload"]
+    # ... not where a step follows (the restore of the base state reads PERTURBATION)
+    body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", cload) + buckle +
+                                  _deck_step("Static", cload), approximate=True)
+    assert body.count("*STEP, PERTURBATION\n*BUCKLE") == 1 and "--approximate" not in rep.text()
+    assert conv.reduced_physics == ["*BUCKLE step 2 loaded by a prescribed displacement after a "
+                                    "preload (ccx does not solve for it)"]
     # initial stresses before it: ccx's *BUCKLE leaves them out there anyway (probed), so the
     # plain step solves the displacement and only they are lost
     ic = "*Initial Conditions, type=stress\nEALL, 1., 0., 0., 0., 0., 0.\n"
@@ -6007,6 +6018,36 @@ def test_buckle_perturbation_prescribed_displacements():
     body, _, _ = convert_str(BUCKLE_CUBE + _deck_step("Static", "*Boundary\n7, 3, 3\n") +
                              _deck_step("Buckle\n2", cload, ", perturbation"))
     assert "held on from earlier" not in body
+
+
+def test_buckle_factors_nearest_one():
+    # ccx 2.23 shift-inverts *BUCKLE about 1: it returns the factors nearest 1, not the lowest
+    # (probed: a column at 10 times its buckling load gave 0.885, 2.38, ..., not 0.1)
+    _, _, rep = convert_str(BUCKLE_CUBE + _deck_step("Buckle\n2", "*Cload\n7, 3, -1.\n") +
+                            _deck_step("Buckle\n3", "*Cload\n7, 3, -2.\n"))
+    assert rep.text().count("ccx 2.23 returns the buckling factors nearest 1, not the lowest") == 1
+    # the --run digest warns where they may not be the lowest: one below 1, or all near 1
+    warn = A.buckle_factor_warning
+    # (a free rigid-body mode shows as factors near 1 too: probed 0.936 to 1.075 and, at a
+    # hundredth of that load, 0.997 to 1.003)
+    assert warn([0.8845, 0.8845, 2.381, 2.381]).startswith("a factor lies below 1 (0.8845): a "
+                                                           "load above a buckling load or a free")
+    assert warn([-3.0, 0.97, 1.2]).startswith("a factor lies below 1 (0.97)")
+    cluster = [0.9771, 0.9836, 0.9925, 1.003, 1.0232]
+    assert warn(cluster).startswith("every factor lies within 5 % of 1")
+    assert warn([1.01, 1.02, 1.04]).startswith("every factor lies within 5 % of 1")
+    assert "returns the factors nearest 1, not the lowest" in warn(cluster)
+    # the lowest first, as ccx gives them where the lowest exceeds 1; one factor near 1; a
+    # tension (negative) factor
+    for ok in ([99.89, 99.89, 884.5], [1.199, 10.61], [1.02], [], [-2.0, 4.5]):
+        assert warn(ok) is None
+    entry = {"step": 1, "procedure": "BUCKLE", "buckling_factors": [0.98, 1.01], "warning": warn([0.98, 1.01])}
+    assert A.format_results_digest([entry]) == [
+        "  step 1 *BUCKLE: 2 buckling factors 0.98, 1.01",
+        "    WARNING: every factor lies within 5 % of 1: a load above a buckling load or a free "
+        "rigid-body mode. ccx 2.23 returns the factors nearest 1, not the lowest, so lower ones "
+        "can be missing: check that the BCs hold the model, and scale the step's load below the "
+        "lowest buckling load."]
 
 
 def test_temperature_in_a_buckle_step_commented_out():

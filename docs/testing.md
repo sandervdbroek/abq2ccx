@@ -168,6 +168,8 @@ setting up its system: ccx 2.23 ends a step that sets up none with "Job finished
 | `frequency_preload` (generated) | the `buckle_gravity_preload` column under gravity in a static step, then a `*FREQUENCY` step: with `NLGEOM` and a plain `*STEP`; without `NLGEOM` and `*STEP, PERTURBATION` | the same written with `PERTURBATION`; the unloaded column | exact (before: 25.02 Hz for 20.74, 20.74 for 25.02) |
 | `buckle_self_weight_then_static` (generated) | the column buckling under its weight and a top load, then a static step pulling its top sideways | the buckle step alone; the static step alone | exact (ccx aborted after the static step) |
 | `buckle_displacement` (generated) | a `C3D20R` column pushed down at its top in a `*STEP, PERTURBATION` `*BUCKLE` step; the same push as a static preload before a buckling step loaded at mid-height | the top tied and given the static reaction as a force; Euler | 2.4e-7; Euler 0.4 % (ccx 2.23 as written: 2.389 for 40.87, only the top moved) |
+| `buckle_displacement_approximate` (generated) | `--approximate`: the column pushed down in a static step and again in a `*STEP, PERTURBATION` `*BUCKLE` step | the push without the preload | 1e-6 (with `PERTURBATION`: 2.389) |
+| `buckle_factors_near_one` (generated) | the `buckle_gravity_preload` column at about 10 times its buckling load | the factors of its spectrum (from a run at a low load) nearest 1; the `--run` digest's warning | 1e-5 (ccx returns those, not the lowest) |
 | `composite_shell`, `assembly_two_blocks` | accepted and solved; a node moves | — | — |
 
 ## 3. Corpus — `corpus/` and `tests/test_corpus.py`

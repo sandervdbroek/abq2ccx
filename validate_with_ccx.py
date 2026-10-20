@@ -2729,10 +2729,10 @@ def midside_rotation_deck(twin=False):
     return text + "*NODE PRINT, NSET=FREE\nU\n*END STEP\n"
 
 
-def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20):
+def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
-    clamped at its base, loaded 1e5 down at its top centre (node set TIP) in a *STEP,
-    PERTURBATION *BUCKLE step.  ``preload`` before it, in a static step: "grav" (gravity
+    clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
+    PERTURBATION *BUCKLE step asking for ``nev`` factors.  ``preload`` before it, in a static step: "grav" (gravity
     9810: its weight 1.54e6), "nodal" (the same as nodal forces, a brick's weight / 8 at each
     of its nodes, which is exact on bricks), "" (none), or "self" (gravity in the *BUCKLE step
     itself, no static step).  ``static``: a static step after it pulling TIP sideways by
@@ -2760,9 +2760,9 @@ def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=
                                          ["*CLOAD"] + [f"{v}, 3, {-f:.12g}" for v, f in share.items()])
         lines += ["*END STEP"]
     if buckle:
-        lines += ["*STEP, PERTURBATION" if pert else "*STEP", "*BUCKLE", "2"] + \
+        lines += ["*STEP, PERTURBATION" if pert else "*STEP", "*BUCKLE", str(nev)] + \
             (grav if preload == "self" else []) + \
-            ["*CLOAD", "TIP, 3, -1.e5", "*END STEP"]
+            ["*CLOAD", f"TIP, 3, {-load:.12g}", "*END STEP"]
     if static:
         lines += ["*STEP", "*STATIC", "*CLOAD", "TIP, 1, 1.e3", "*NODE PRINT, NSET=TIP", "U",
                   "*END STEP"]
@@ -2777,7 +2777,8 @@ def buckle_displacement_deck(case, force=0.0, d=-1e-4, n=2, m=20):
     node, a *STEP, PERTURBATION *BUCKLE step loading that node by ``force``; "preload" the
     static step pushing TOP down, then a *STEP, PERTURBATION *BUCKLE step loaded by 1e5 down
     on the mid-height nodes (MID); "tied_preload" the same with the tie, the preload the
-    force ``force`` (0: none) and the tie's node held in z in the buckle step."""
+    force ``force`` (0: none) and the tie's node held in z in the buckle step; "pushed" the
+    static step pushing TOP down, then a *STEP, PERTURBATION *BUCKLE step pushing it so."""
     h, dz = 0.1 / n / 2, 2.0 / m / 2                 # half steps
     ids = {}
     for k in range(2 * m + 1):
@@ -2820,6 +2821,8 @@ def buckle_displacement_deck(case, force=0.0, d=-1e-4, n=2, m=20):
         lines += buckle + ["*Cload", f"{tops[0]}, 3, {force!r}"]
     elif case == "preload":
         lines += ["*Step", "*Static"] + push + ["*End Step"] + buckle + ring_load
+    elif case == "pushed":
+        lines += ["*Step", "*Static"] + push + ["*End Step"] + buckle + push
     elif case == "tied_preload":
         lines += ["*Step", "*Static"] + (["*Cload", f"{tops[0]}, 3, {force!r}"] if force else []) + \
             ["*End Step"] + buckle + ["*Boundary", f"{tops[0]}, 3, 3, 0."] + ring_load
@@ -6300,6 +6303,45 @@ def main():
               f"(ccx 2.23 as written: 2.389, only the top moved)")
     else:
         print("FAIL  buckle_displacement: a run gave no results")
+    failures += 0 if ok else 1
+    # ... after a preload no ccx form keeps it; --approximate drops PERTURBATION on a last step
+    pushed = review_run(buckle_displacement_deck("pushed"), "buckle_displacement_pushed",
+                        buckle_state, approximate=True)
+    ok = bool(pushed and runs[0])
+    if ok:
+        (lam, s_lam), (own, _) = pushed, runs[0]
+        half = sum(1 for u in s_lam.values() if abs(u[2] / -0.5e-4 - 1) < 0.01)
+        ok = abs(lam[0] / own[0] - 1) < 1e-6 and half >= 1
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_displacement_approximate (the column pushed down "
+              f"in a static step and again in a *STEP, PERTURBATION *BUCKLE step, --approximate): "
+              f"factor {lam[0]:.7g} vs {own[0]:.7g} pushed without the preload; {half} mid-height "
+              f"nodes moved half the push (ccx 2.23 with PERTURBATION: 2.389)")
+    else:
+        print("FAIL  buckle_displacement_approximate: a run gave no results")
+    failures += 0 if ok else 1
+
+    # ccx 2.23's *BUCKLE shift-inverts about 1: it returns the factors nearest 1 (in 1/factor),
+    # not the lowest.  buckle_gravity_deck's column at about 10 times its buckling load shows
+    # the factors of its spectrum (from a run at a load well below it) nearest 1, not the
+    # lowest, and the --run digest warns there
+    low = review_run(buckle_gravity_deck("", pert=False, nev=12), "buckle_factors_low", factors)
+    high = review_run(buckle_gravity_deck("", pert=False, load=1.5e7, nev=4), "buckle_factors_high",
+                      factors)
+    ok = bool(low and high) and len(high) == 4
+    if ok:
+        true = [x / 150. for x in low]           # the spectrum at the high load
+        nearest = sorted(sorted(true, key=lambda x: abs(1 / x - 1))[:len(high)])
+        err = max(abs(a / b - 1) for a, b in zip(high, nearest))
+        warned = [A.buckle_factor_warning(x) for x in (low, high)]
+        ok = err < 1e-5 and min(high) > 5 * true[0] and low == sorted(low) and \
+            warned[1] is not None and warned[0] is None
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_factors_near_one (a column at 150 times a load "
+              f"with factor {low[0]:.5g}): factors {', '.join(f'{x:.5g}' for x in high)}, the "
+              f"spectrum's nearest 1 ({err:.1e} apart), not its lowest {true[0]:.4g}; the digest "
+              f"warns {'there' if warned[1] else 'NOT there'}, "
+              f"{'not' if not warned[0] else 'also'} at the low load")
+    else:
+        print("FAIL  buckle_factors_near_one: a run gave no results")
     failures += 0 if ok else 1
 
     # parameter names without blanks (REFNODE=, POSITIONTOLERANCE=, ...): ccx rejected the

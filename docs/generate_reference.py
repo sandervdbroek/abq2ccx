@@ -853,6 +853,10 @@ def gen_output():
                   "has all the nodes (it lacks reference points and shell and beam nodes)"),
                  ("`frequencies`, `buckling_factors`", "of a `*FREQUENCY` (cycles/time) or `*BUCKLE` "
                   "step"),
+                 ("`warning`", "a `*BUCKLE` step's factors may not be the lowest: one is below 1, or "
+                  "all lie within 5 % of 1 (ccx 2.23 returns those nearest 1, and shows a free "
+                  "rigid-body mode as factors near 1; "
+                  "[compatibility](compatibility.md#steps-dynamics-and-output))"),
              ]) + "\n",
              "A node ccx adds expanding a shell or beam is given `near` the deck's node; the "
              "converter's own nodes and elements (knot beams, skins) are left out; in an assembly "

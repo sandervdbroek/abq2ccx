@@ -66,5 +66,6 @@ After a run that solves, `--run` prints a line or two per step, read from the `.
 | `max_u`, `max_mises` | the largest \|U\| and von Mises stress and their node (`.frd`), or the printed set and node or element (`.dat`) where the `.frd` lacks them |
 | `rf` | per `*BOUNDARY` target, RF summed over the DOFs 1–3 it holds; per set printed with RF, over those any BC holds there. That is what Abaqus' RF sums to: ccx's RF also holds the applied loads. From the `.dat`, else the `.frd` if it has all the nodes (it lacks reference points and shell and beam nodes) |
 | `frequencies`, `buckling_factors` | of a `*FREQUENCY` (cycles/time) or `*BUCKLE` step |
+| `warning` | a `*BUCKLE` step's factors may not be the lowest: one is below 1, or all lie within 5 % of 1 (ccx 2.23 returns those nearest 1, and shows a free rigid-body mode as factors near 1; [compatibility](compatibility.md#steps-dynamics-and-output)) |
 
 A node ccx adds expanding a shell or beam is given `near` the deck's node; the converter's own nodes and elements (knot beams, skins) are left out; in an assembly `[Instance.label]` (`abaqus`) names the node, element or set as Abaqus does, from the report's instance map (`instances` in `--json`). Steady-state dynamics and complex frequency steps are not digested.

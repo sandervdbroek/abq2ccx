@@ -12752,7 +12752,8 @@ class Converter:
         """``*BUCKLE``: ccx data line = number of factors, accuracy, Lanczos vectors, max
         iterations.  Abaqus' subspace layout (n, max eigenvalue, vectors, iterations)
         differs only in field 2; the Lanczos layout (n, min, max, block size, ...) from
-        field 2 on — those fields are blanked so ccx uses its defaults."""
+        field 2 on — those fields are blanked so ccx uses its defaults.  Noted: ccx returns the
+        factors nearest 1, not the lowest (buckle_factor_warning)."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         solver = (b.param("EIGENSOLVER") or "SUBSPACE").strip().upper()
         for k, v in b.params.items():
@@ -12774,6 +12775,11 @@ class Converter:
             while len(f) > 1 and f[-1] == "":
                 f.pop()
             data[0] = ", ".join(f)
+        self.report.note("*BUCKLE: ccx 2.23 returns the buckling factors nearest 1, not the "
+                         "lowest (it shift-inverts about 1): the lowest only while the step's "
+                         "load is below the lowest buckling load (probed: a column under twice "
+                         "its buckling load gave 4.42, 11.9, ..., not 0.5). Factors far above 1 "
+                         "lose accuracy (1e8: 1.6 %).", once=True)
         return [emit_keyword("BUCKLE", keep)] + data
 
     def handle_heat_transfer(self, b: Block) -> List[str]:
@@ -16291,7 +16297,8 @@ class Converter:
         * the step's own nonzero BC values are its buckling load: before any general step,
           where ccx 2.23's *BUCKLE leaves initial stresses out with or without PERTURBATION
           (probed; handle_step warns), PERTURBATION is dropped; after one, ccx has no form
-          that keeps the preload: warned."""
+          that keeps the preload: warned (--approximate, in the last step: PERTURBATION
+          dropped, so the preload's stresses are left out)."""
         steps: List[dict] = []
         state: Dict[Tuple[str, int], Tuple[str, bool]] = {}    # (TARGET, DOF) -> (target, nonzero)
         insert: Dict[int, List[str]] = {}
@@ -16379,6 +16386,15 @@ class Converter:
                                  "step for its prescribed displacements, only those nodes move "
                                  "(probed: factor 2.39 for 40.9); its plain *BUCKLE does.", once=True)
                 continue
+            if same and self._approx and n == len(steps):
+                st["params"].pop("PERTURBATION")
+                out[st["line"]] = emit_keyword("STEP", st["params"])
+                self.report.warn(f"[APPROX] *BUCKLE step {n} buckles without its preload: a "
+                                 f"prescribed displacement loads it after a general step, and ccx "
+                                 f"2.23 solves for that only without PERTURBATION (with it only "
+                                 f"those nodes move, probed: factor 2.39 for 40.9), which leaves "
+                                 f"the preload's stresses out. Verify.")
+                continue
             self.report.warn(f"*BUCKLE step {n} is loaded by a prescribed displacement on a preloaded "
                              f"model (a general step before it): ccx 2.23 does "
                              f"not solve a *STEP, PERTURBATION *BUCKLE step for its prescribed "
@@ -16386,7 +16402,9 @@ class Converter:
                              f"stresses sit in the elements next to them (probed: factor 2.39 for "
                              f"40.9) — and without PERTURBATION it would leave out the preload. "
                              f"Load the buckling step by forces instead (e.g. the displaced nodes "
-                             f"tied by *EQUATION to one node that is given the force).")
+                             f"tied by *EQUATION to one node that is given the force)"
+                             + (", or rerun with --approximate to buckle it without the preload."
+                                if same and n == len(steps) else "."))
             self._reduces(f"*BUCKLE step {n} loaded by a prescribed displacement after a preload "
                           f"(ccx does not solve for it)")
         for i in sorted(insert, reverse=True):
@@ -24980,6 +24998,28 @@ def _digest_step(entry: dict, frd: str, blocks, final, info: Optional[dict], dec
             r["rf"] = v
 
 
+def buckle_factor_warning(factors: Sequence[float]) -> Optional[str]:
+    """The digest's warning on a *BUCKLE step's ``factors``, or None.  ccx 2.23 shift-inverts
+    about 1 (arpackbu.c: sigma = 1, its plausibility loop commented out), so it returns the
+    factors whose reciprocals lie nearest 1: the lowest only while the lowest exceeds 1, and
+    never one below 0.5 while enough others exceed 1 (probed: a column at 10 times its
+    buckling load gave 0.885, 2.38, ..., not 0.1; at twice it 4.42, 11.9, ..., not 0.5 —
+    which nothing here can tell).  A free rigid-body mode makes K - KG singular at any shift,
+    so it shows as factors near 1 too (probed: the column free to turn about a vertical axis,
+    at 1e-4 of its buckling load: 0.997 to 1.003).  Warned: a positive factor below 1, or every
+    factor within 5 % of 1 (the cluster about the shift)."""
+    low = min((x for x in factors if x > 0), default=None)
+    if len(factors) > 1 and all(abs(x - 1) <= 0.05 for x in factors):
+        why = "every factor lies within 5 % of 1"
+    elif low is not None and low < 1:
+        why = f"a factor lies below 1 ({low:.4g})"
+    else:
+        return None
+    return (f"{why}: a load above a buckling load or a free rigid-body mode. ccx 2.23 returns "
+            f"the factors nearest 1, not the lowest, so lower ones can be missing: check that the "
+            f"BCs hold the model, and scale the step's load below the lowest buckling load.")
+
+
 def ccx_results_digest(job: str, instances: Sequence[dict] = (),
                        model: Optional[Tuple[int, int]] = None,
                        expanded: Optional[Dict[int, int]] = None) -> List[dict]:
@@ -24987,7 +25027,8 @@ def ccx_results_digest(job: str, instances: Sequence[dict] = (),
     ``job.frd`` and ``job.dat`` hold, to compare with the Abaqus results:
 
     * a *FREQUENCY step: ``frequencies`` (cycles/time); a *BUCKLE step:
-      ``buckling_factors``; both from the .dat's tables;
+      ``buckling_factors``, and a ``warning`` where they may not be the lowest
+      (buckle_factor_warning); both from the .dat's tables;
     * any other step, at its last increment: ``time`` (the total time, as ccx writes it);
       ``max_u`` and ``max_mises``, the largest |U| and von Mises stress and their node,
       from the .frd, else from the .dat prints (with the ``set``; an ``element`` for a
@@ -25043,6 +25084,9 @@ def ccx_results_digest(job: str, instances: Sequence[dict] = (),
         elif proc == "BUCKLE" or (not proc and buckle):
             if buckle:
                 entry["buckling_factors"] = [r[1] for r in buckle if len(r) == 2]
+                warning = buckle_factor_warning(entry["buckling_factors"])
+                if warning:
+                    entry["warning"] = warning
         elif proc not in ("COMPLEX FREQUENCY", "STEADY STATE DYNAMICS"):
             _digest_step(entry, frd, [b for b in index if b[0] == s], final.get(s, []), info, deck,
                          keep, keep_element)
@@ -25096,6 +25140,8 @@ def format_results_digest(digest: Sequence[dict], sums: int = 3, values: int = 8
                 v = e[key]
                 lines.append(f"{head}: {len(v)} {what} " + ", ".join(g(x) for x in v[:values])
                              + (", ..." if len(v) > values else ""))
+        if "warning" in e:
+            lines.append(f"    WARNING: {e['warning']}")
         if "frequencies" in e or "buckling_factors" in e:
             continue
         parts = [f"{label} {g(e[key]['value'])}" + (where(e[key]) if e[key]["value"] else "")
