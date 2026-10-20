@@ -13817,6 +13817,27 @@ def test_continuum_shell_section_density_becomes_material_mass():
         assert "*SHELL SECTION, DENSITY= on continuum shells (added mass per area)" in conv.reduced_physics
 
 
+def test_mass_acts_as_two_step_model_aggregates():
+    # where mass acts: its inertia in a step of INERTIA_PROCS (the masses _plan_coupled_inertia
+    # scales, U1's mass matrix), its weight too under a mass-proportional *DLOAD (a section's
+    # DENSITY= stays); explicit coupled temperature-displacement steps have inertia
+    _, m = _step_model("*STEP\n*STATIC\n*DLOAD\nE, GRAV, 9.81, 0., 0., -1.\n*END STEP\n"
+                       "*STEP\n*FREQUENCY\n2\n*END STEP\n*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n"
+                       "*END STEP")
+    assert (m.inertia, m.mass_loads, m.mass_acts) == ({"FREQUENCY"}, {"GRAV"}, True)
+    _, m = _step_model("*STEP\n*COUPLED TEMPERATURE-DISPLACEMENT\n*DLOAD\nE, P, 1.\n*END STEP")
+    assert (m.inertia, m.mass_loads, m.mass_acts) == (frozenset(), frozenset(), False)
+    _, m = _step_model("*STEP\n*DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT\n, 1e-3\n*END STEP")
+    assert m.inertia == {"DYNAMIC TEMPERATURE-DISPLACEMENT"} and m.mass_acts
+    # a continuum shell's section mass stays in such a deck (it was dropped: "no step uses mass")
+    strip = SC8R_STRIP.replace(COMPOSITE_MAT, COMPOSITE_MAT + "*Density\n1.5e-9\n*Material, name=M\n"
+                               "*Elastic\n1000., 0.3\n*Density\n1.5e-9\n")
+    body, conv, rep = convert_str(strip + "*Shell Section, elset=PLATE, material=M, density=6e-10\n0.3\n"
+                                  "*Boundary\nCLAMP, ENCASTRE\n*Step\n*Dynamic Temperature-displacement, "
+                                  "explicit\n, 1e-3\n*End Step\n")
+    assert "*MATERIAL, NAME=M_SHELL_MASS" in body and "no step or load of this deck" not in rep.text()
+
+
 def test_composite_shell_plies_on_a_cylinder_follow_the_hoop():
     # a cylindrical orientation's axis 1 is radial — the shell normal on a cylinder — so ccx
     # would project nothing; Abaqus projects axis 2 (the hoop direction), axis 1 being the

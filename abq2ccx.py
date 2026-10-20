@@ -3605,6 +3605,12 @@ PRESELECT_CONTACT = {
 PERTURBATION_PROCS = {"FREQUENCY", "BUCKLE", "COMPLEX FREQUENCY", "MODAL DYNAMIC",
                       "STEADY STATE DYNAMICS", "RANDOM RESPONSE", "RESPONSE SPECTRUM",
                       "SUBSTRUCTURE GENERATE", "MATRIX GENERATE"}
+# The Abaqus procedures in which an element's mass gives inertia (its mass matrix), and the
+# *DLOAD labels of mass-proportional loads (StepModel.inertia, mass_loads, mass_acts).
+# Abaqus/Standard's transient *COUPLED TEMPERATURE-DISPLACEMENT neglects inertia.
+INERTIA_PROCS = {"DYNAMIC", "DYNAMIC TEMPERATURE-DISPLACEMENT", "FREQUENCY", "COMPLEX FREQUENCY",
+                 "MODAL DYNAMIC", "STEADY STATE DYNAMICS", "RANDOM RESPONSE", "RESPONSE SPECTRUM"}
+MASS_LOADS = {"GRAV", "CENTRIF", "CENT", "ROTA", "CORIO", "ROTDYNF"}
 
 # ccx sizes an explicit increment per element (calcstabletimeincvol.f) as critom * h * f /
 # (2 c) times a safety factor 0.8 / 1.3: c the material's largest wave speed, h the
@@ -4456,6 +4462,15 @@ class StepModel:
         self.nl_any = any(self.nl_steps)
         self.nl_all = bool(general) and general[0]          # (NLGEOM stays on once switched on)
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        # where an element's mass acts, two questions: its inertia, in the steps of INERTIA_PROCS
+        # (_plan_coupled_inertia: whether the masses can go; _plan_u1_beams: U1's mass matrix),
+        # and its weight too, under a mass-proportional *DLOAD (mass_acts: whether a section's
+        # DENSITY= must stay, _plan_shell_density, _plan_quadratic_membranes; surface elements)
+        self.inertia = frozenset(b.keyword for s in steps for b in s.cards if b.keyword in INERTIA_PROCS)
+        self.mass_loads = frozenset(r[1].strip().upper() for s in steps for b in s.cards
+                                    if b.keyword == "DLOAD" for r in merged_data_records(b)
+                                    if len(r) > 1 and r[1].strip().upper() in MASS_LOADS)
+        self.mass_acts = bool(self.inertia or self.mass_loads)
         self.dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
         self.explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
         self.mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
@@ -7303,8 +7318,7 @@ class Converter:
         if not heavy:
             return                      # nothing to move (ccx stops without a density there)
         steps = ", ".join(str(n) for n, _ in coupled)
-        needs = sorted({b.keyword for b in blocks if b.keyword in self._INERTIA_PROCEDURES or
-                        b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT"})
+        needs = sorted(self.steps.inertia)          # (the GRAV / CENTRIF magnitudes are scaled)
         if needs or unread:
             why = (f"the deck's {', '.join('*' + k for k in needs)} step(s) need them (ccx has one "
                    f"density per material for all steps)" if needs else
@@ -18601,18 +18615,6 @@ class Converter:
         self._dyn_before_nl = any(solver[:first_nl])
         self._solver_why = next((s for s in solver if s), "")
 
-    # procedures and *DLOAD labels in which an element's mass acts
-    _INERTIA_PROCEDURES = {"DYNAMIC", "FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
-                           "COMPLEX FREQUENCY"}
-    _MASS_LOADS = {"GRAV", "CENTRIF", "CENT", "ROTA", "CORIO", "ROTDYNF"}
-
-    def _mass_acts(self, blocks: List[Block]) -> bool:
-        """Whether an element's mass acts somewhere in the deck: a step of _INERTIA_PROCEDURES
-        or a *DLOAD of _MASS_LOADS."""
-        return any(b.keyword in self._INERTIA_PROCEDURES for b in blocks) or any(
-            len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS
-            for b in blocks if b.keyword == "DLOAD" for r in merged_data_records(b))
-
     def _drop_surface_elements(self, raw: List[Block], blocks: List[Block]) -> None:
         """Leave Abaqus surface elements (SURFACE_ELEMENTS) out of the ccx mesh — ccx has no
         such element.  As pure load carriers they add nothing else: they have no stiffness,
@@ -18635,10 +18637,7 @@ class Converter:
             heavy = any(d and pf(d) != 0.0 for d in dens)
         except ValueError:                        # an unresolved value: assume a mass
             heavy = True
-        acts = sorted({b.keyword for b in blocks if b.keyword in self._INERTIA_PROCEDURES} |
-                      {r[1].strip().upper() for b in blocks if b.keyword == "DLOAD"
-                       for r in merged_data_records(b)
-                       if len(r) > 1 and r[1].strip().upper() in self._MASS_LOADS})
+        acts = sorted(self.steps.inertia | self.steps.mass_loads)          # (StepModel.mass_acts)
         if heavy and acts:
             why.append(f"they carry mass (*SURFACE SECTION, DENSITY=), which acts in this deck "
                        f"({', '.join(acts)})")
@@ -22441,7 +22440,7 @@ class Converter:
         The solids fill the thickness, so the mass per area, inertia and gravity load are
         Abaqus'.  Otherwise DENSITY= is dropped: warned where mass acts, else noted.  An unsplit
         composite section is commented out whole (handle_shell_section)."""
-        acts = self._mass_acts(blocks)
+        acts = self.steps.mass_acts
         P = self.geom.nodes
         opts: Dict[str, List[Block]] = {}
         taken: set = set()
@@ -22560,7 +22559,7 @@ class Converter:
         mem = {e for e, (typ, _c) in els.items() if typ.upper().startswith("M3D")}
         if not mem:
             return
-        self._mem_mass_acts = self._mass_acts(blocks)
+        self._mem_mass_acts = self.steps.mass_acts
         opts = self._material_options(blocks)
         for b in blocks:
             if b.keyword == "MEMBRANE SECTION":
@@ -22953,7 +22952,7 @@ class Converter:
                 typ = self.geom.elements[e][0].upper()
                 kinds[typ] = kinds.get(typ, 0) + 1
             self._u1_cards[id(b)] = plan["cards"]
-        inertia = any(b.keyword in self._INERTIA_PROCEDURES for b in blocks)
+        inertia = bool(self.steps.inertia)          # (its mass matrix: a GRAV load reads none)
         shear = [t for t in kinds if t.rstrip("H") not in U1_EULER_BERNOULLI]
         counts = ", ".join(f"{t}: {n}" for t, n in kinds.items())
         self.report.note(f"{len(self._u1)} beam element(s) ({counts}) under "

@@ -6,6 +6,10 @@ physics.
 
 ## Unreleased
 
+* **Where mass acts** — four planners asked it with two rules and two procedure lists. The
+  StepModel now holds both: inertia (a dynamic or eigenvalue step) and weight (a GRAV,
+  CENTRIF, ... load too). `*DYNAMIC TEMPERATURE-DISPLACEMENT` counts as inertia now, so a
+  section's `DENSITY=` is no longer dropped there as unused.
 * **Cards between two steps act in the next step** — ccx 2.23 applies a `*BOUNDARY` or `*CLOAD`
   written after a step's `*END STEP` in the next step (probed), but the planners read such cards
   five different ways, and loads or output requests there were commented out. They are now
