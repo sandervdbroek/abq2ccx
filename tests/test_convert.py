@@ -7725,6 +7725,26 @@ def test_nlgeom_on_a_perturbation_step_stays_in_it():
     assert body.split("*STEP")[3].endswith("*EL FILE\nS\n*END STEP")
 
 
+def test_nlgeom_readers_leave_a_perturbation_steps_nlgeom_out():
+    # every planner that asks whether a step runs NLGEOM reads one rule (task 34's
+    # _nlgeom_steps: a general step's NLGEOM; handle_step drops it on a perturbation step of
+    # a linear base state): NLGEOM on a perturbation step alone keeps U1 beams, the exact
+    # CPS4I slab form and quiet 3-node beams
+    src = open(os.path.join(EXAMPLES, "beam_u1_general.inp"), encoding="utf-8").read()
+    body, conv, rep = convert_str(src.replace("*STEP\n*FREQUENCY", "*STEP, NLGEOM\n*FREQUENCY"))
+    assert conv._u1 and "U1 cannot" not in rep.text() and "NLGEOM" not in body.split("** ===")[-1]
+    body, conv, rep = convert_str(src.replace("*STEP\n*STATIC", "*STEP, NLGEOM\n*STATIC", 1))
+    assert not conv._u1 and "a step runs NLGEOM, which U1 cannot" in rep.text()
+    deck = PLANE2 + ("*Step\n*Static\n*Cload\n6, 2, -1.\n*End Step\n"
+                     "*Step, nlgeom, perturbation\n*Static\n*Cload\n6, 1, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "C3D8I" in body and "a step runs NLGEOM" not in rep.text()
+    beam = B32_PIPE_BEAM + "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n3, 2, 1.\n*End Step\n"
+    for head, note in (("*Step, nlgeom, perturbation", False), ("*Step, nlgeom", True)):
+        rep = convert_str(beam + head + "\n*Static\n*Cload\n3, 3, 1.\n*End Step\n")[2]
+        assert ("3-node beams run as" in rep.text()) == note, head
+
+
 def test_plastic_material_where_ccx_segfaults():
     # ccx 2.23 segfaults on a plastic or creeping material (probed on both builds): in a
     # *BUCKLE step, in a *STATIC / *VISCO step without NLGEOM after a *FREQUENCY step (warned,
