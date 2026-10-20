@@ -9439,6 +9439,7 @@ class Converter:
             if k == "OP" and src in self._op_new_drop:
                 continue                # _plan_late_op_new, _plan_op_new_rotations
             params[k] = v
+        op_new = (params.get("OP") or "").strip().upper() == "NEW"     # as written
         said = self._op_new_drop.get(src)
         out = [said] if said and b.uparam("OP") == "NEW" else []   # (the first piece has the OP)
         out.append(emit_keyword("BOUNDARY", params))
@@ -9490,7 +9491,7 @@ class Converter:
             got = self._rot_lines.get((id(b), n))
             out.extend(got if isinstance(got, list) else self._rot_refused(b, n, got))
         self._rot_hit = []
-        if inactive and len(out) == head and (params.get("OP") or "").strip().upper() != "NEW":
+        if inactive and len(out) == head and not op_new:
             out = []          # all its lines were on DOFs the nodes do not have: no card left
         if getattr(self, "_n_inactive_rot", 0):
             self.report.note("Rotational DOFs (4-6) prescribed on nodes that only belong to plane-"
@@ -9506,18 +9507,18 @@ class Converter:
                              "no rotations (Abaqus ignores such BCs with a warning), but ccx stops "
                              "('gen3dboun: ... the elements to which this node belongs do not have "
                              "rotational DOFs').", once=True)
-        if self._planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
+        if self._planar_bc and op_new:
             # OP=NEW also removes the model-data planar constraint (verified on 2.23)
             out += ["** abq2ccx: planar constraint re-applied (OP=NEW removed it)"] + self._planar_bc
-        if self._slab_bc and (params.get("OP") or "").strip().upper() == "NEW":
+        if self._slab_bc and op_new:
             out += ["** abq2ccx: slab thickness DOF held again (OP=NEW removed it)"] + self._slab_bc
-        if self._rigid_planar_bc and (params.get("OP") or "").strip().upper() == "NEW":
+        if self._rigid_planar_bc and op_new:
             out += ["** abq2ccx: plane rigid bodies held in their plane again (OP=NEW removed "
                     "it)"] + self._rigid_planar_bc
-        if self._kin_hold_bc and (params.get("OP") or "").strip().upper() == "NEW":
+        if self._kin_hold_bc and op_new:
             out += ["** abq2ccx: free reference node rotations held again (OP=NEW removed "
                     "it)"] + self._kin_hold_bc
-        if self._conn_bcs and (params.get("OP") or "").strip().upper() == "NEW":
+        if self._conn_bcs and op_new:
             # bare lines: on a card with FIXED or an amplitude they would take it on too
             out += (["*BOUNDARY"] if any(k != "OP" for k in params) else []) + self._conn_bcs
             self.report.note("*BOUNDARY, OP=NEW: the boundary conditions that hold converted "
