@@ -313,6 +313,16 @@ def split_suffixes(typ: str) -> Tuple[str, str]:
     return typ, ""
 
 
+def has_temperature_dof(typ: str) -> bool:
+    """Whether Abaqus elements of type ``typ`` have temperature DOFs: heat transfer elements
+    (DC..., DS...; not the DCOUP coupling elements, HEATCAP), coupled temperature-displacement
+    ones (a T suffix after the node count: C3D8T, C3D10T, CPE4RT, CGAX6MT, S4RT, T3D2T, C3D8PT)
+    and user elements (whose *USER ELEMENT may name DOF 11)."""
+    t = typ.upper()
+    return (t.startswith(("DC", "DS")) and not t.startswith("DCOUP")) or t == "HEATCAP" or \
+        re.match(r".*\d[A-Z]*T$|V?U\d+$", t) is not None
+
+
 def keeps_dof8(typ: str) -> bool:
     """Whether elements of Abaqus type ``typ`` carry DOF 8 (pore, fluid or acoustic
     pressure) in the converted deck: acoustic and acoustic-structural interface elements,
@@ -1377,14 +1387,18 @@ def parse_keyword_line(line: str, seen: Optional[Dict[str, "OrderedDict[str, obj
     keyword = canonical_keyword(keyword)
 
     def expand(word: str, names: Sequence[str], label: str, respell: bool = True) -> str:
-        """``word`` in full; spelled as ``names`` spells it (blanks) unless not ``respell``."""
+        """``word`` in full, spelled as ``names`` spells it (blanks: ENGINEERINGCONSTANTS is
+        ENGINEERING CONSTANTS); unless ``respell``, a word that spells it but for case stays
+        as written."""
         full, hits = _abbreviation(word, names)
         if full is not None and full.replace(" ", "") != word.replace(" ", "").upper():
             seen.setdefault("read", OrderedDict())[label] = full
             return full
         if hits:
             seen.setdefault("ambiguous", OrderedDict())[label] = hits
-        return full if full is not None and respell else word
+        if full is not None and (respell or " ".join(word.split()).upper() != full):
+            return full
+        return word
 
     if seen is not None and keyword.replace(" ", "") not in _KEYWORD_BY_COMPACT:
         keyword = expand(keyword, _ABAQUS_KEYWORD_LIST, f"*{keyword}")
@@ -8067,6 +8081,41 @@ class Converter:
         if cards:
             self._reduces(f"{', '.join(dedup(cards))} data with an unresolved *PARAMETER")
 
+    # the options of a *PLASTIC, which follow it (Abaqus 2017 Keywords)
+    _PLASTIC_OPTIONS = {"CYCLIC HARDENING", "RATE DEPENDENT", "POTENTIAL", "ANNEAL TEMPERATURE", "ORNL"}
+
+    def _order_material_cards(self, blocks: List[Block]) -> None:
+        """Each material's *ELASTIC, *PLASTIC (with the options that follow it) and *CREEP
+        cards in that order, where the first of them is.  Abaqus reads a material's options in
+        any order; ccx 2.23 stops on a *PLASTIC or *CREEP before the *ELASTIC and on a *CREEP
+        before the *PLASTIC ('*PLASTIC should be preceded by an *ELASTIC,TYPE=ISO card'; probed:
+        in that order the material solves, *VISCO and *STATIC)."""
+        rank = {"ELASTIC": 0, "PLASTIC": 1, "CREEP": 2}
+        done: List[str] = []
+        for name, group in self._material_options(blocks).items():
+            units: List[Tuple[int, List[Block]]] = []
+            last: Optional[Tuple[int, List[Block]]] = None      # the card before's unit
+            for c in group[1:]:
+                if c.keyword in rank:
+                    last = (rank[c.keyword], [c])
+                    units.append(last)
+                elif c.keyword in self._PLASTIC_OPTIONS and last is not None and last[0] == 1:
+                    last[1].append(c)
+                else:
+                    last = None
+            if [k for k, _u in units] == sorted(k for k, _u in units):
+                continue
+            moved = {id(c) for _k, u in units for c in u}
+            at = next(i for i, x in enumerate(blocks) if x is units[0][1][0])
+            blocks[:] = [x for x in blocks if id(x) not in moved]
+            blocks[at:at] = [c for _k, u in sorted(units, key=lambda t: t[0]) for c in u]
+            done.append(name)
+        if done:
+            self.report.note(f"Material{'s' if len(done) > 1 else ''} {', '.join(done)}: *ELASTIC, "
+                             f"*PLASTIC and *CREEP written in that order, which ccx 2.23 needs (it "
+                             f"stops on the deck's: Abaqus reads a material's options in any order).",
+                             once=True)
+
     def _plan_material_cards(self, blocks: List[Block]) -> None:
         """Which material each material card belongs to (``_card_material``), the materials
         a section or composite ply uses (``_used_materials``), and what handle_damage_
@@ -8084,8 +8133,9 @@ class Converter:
           calcdamage.f leaves the DOFs of nodes that no element holds any more in the system,
           on which the SPOOLES solver fails (a singular matrix: exit 255, no message), and
           with any solver ccx crashes once the last element is deleted;
-        * every *DAMAGE INITIATION card goes to the deck's last *MATERIAL, whichever
-          material it follows, and a later card overwrites an earlier one;
+        * every *DAMAGE INITIATION card goes to the last *MATERIAL ccx reads, whichever
+          material it follows (one the converter writes too: _materials_after_deck), and a
+          later card overwrites an earlier one;
         * ccx stops unless that material is plastic and every step is a nonlinear *STATIC
           or *DYNAMIC step.
         Without a *DAMAGE EVOLUTION Abaqus too only evaluates the criterion (output such as
@@ -8121,6 +8171,7 @@ class Converter:
         steps = [step.star_proc for step in self.steps]
         bad = next(((n, p) for n, p in enumerate(steps, 1) if p not in ("STATIC", "DYNAMIC")), None)
         last = materials[-1] if materials else None
+        after = self._materials_after_deck(blocks) if cards else None
         kept = False
         for b, m, evolution in reversed(cards):    # ccx reads the last card it is given
             crit = b.uparam("CRITERION").replace(" ", "").replace("-", "")
@@ -8133,6 +8184,10 @@ class Converter:
                 why = (f"ccx 2.23 gives every *DAMAGE INITIATION card to the deck's last "
                        f"*MATERIAL ({last}), not to the one it follows (probed), so it cannot "
                        f"evaluate this one")
+            elif after:
+                why = (f"ccx 2.23 gives every *DAMAGE INITIATION card to the last *MATERIAL it "
+                       f"reads (probed), and the converter writes {after} after the deck's "
+                       f"materials, so it cannot evaluate this one")
             elif kept:
                 why = ("ccx 2.23 keeps one *DAMAGE INITIATION card (a later one overwrites it), "
                        "and a later Johnson-Cook card of this material is kept")
@@ -8154,6 +8209,25 @@ class Converter:
                 why, kept = None, True
             self._damage_plan[id(b)] = (m, evolution, why)
         self._jc_damage_kept = kept
+
+    def _materials_after_deck(self, blocks: List[Block]) -> Optional[str]:
+        """The last material the converter writes after the deck's last *MATERIAL, as words
+        (None: none).  Its knot beams' material goes before the deck's; the rigid skins'
+        just before the first *STEP (_rigid_model_cards); a *BEAM GENERAL SECTION's (expanded,
+        or a U1 beam's) and a C3D8I slab's own copy where its section is."""
+        at = max((i for i, b in enumerate(blocks) if b.keyword == "MATERIAL"), default=-1)
+        if self.geom.elsets.get(RIGID_SET) and self._skin_material:
+            return f"material {RIGID_SET} (the rigid skins')"
+        found = None
+        for b in blocks[at + 1:]:
+            if b.keyword == "BEAM GENERAL SECTION" and id(b) not in self._u1_cards and \
+                    (b.param("SECTION") or "GENERAL").strip().upper() in GENERAL_EXPANDED:
+                found = f"a material for *BEAM GENERAL SECTION, ELSET={b.param('ELSET')}"
+            elif any(ln.startswith("*MATERIAL") for ln in self._u1_cards.get(id(b), [])):
+                found = f"a material for the U1 beams of *{b.keyword}, ELSET={b.param('ELSET')}"
+            elif self._slab_sections.get(id(b), ("strain",))[0] != "strain":
+                found = f"material {self._slab_sections[id(b)][1]} (the C3D8I slabs')"
+        return found
 
     @staticmethod
     def _jc_damage_data(b: Block) -> Optional[List[str]]:
@@ -8473,7 +8547,7 @@ class Converter:
         out = self.passthrough(b)
         if n == 1:
             new: List[str] = []
-            ok = rows is not None and not b.has("DEPENDENCIES")
+            ok = rows is not None and not has_field_dependence(b)
             for r in rows if ok else []:
                 try:
                     half = fmt_num(pf(r[0]) / 2.0)
@@ -8482,7 +8556,8 @@ class Converter:
                     break
                 new.append(", ".join([half, r[1], half, r[1], r[2], r[2]] + ([r[3]] if r[3] else [])))
             if ok and new:
-                params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
+                params: "OrderedDict[str, Optional[str]]" = OrderedDict(
+                    (k, v) for k, v in b.params.items() if k != "DEPENDENCIES")    # (0: passthrough)
                 params["N"] = "2"
                 self.report.note("*HYPERFOAM, N=1 -> N=2 with mu1 halved in both terms (the same "
                                  "strain energy): ccx 2.23 gives an N=1 hyperfoam no stiffness "
@@ -22271,6 +22346,7 @@ class Converter:
         self._plan_material_facts(blocks)       # after the mesh planners: the final element types
         self._plan_base_state_facts(blocks)     # after _plan_rigid: the analytical surfaces left
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
+        self._order_material_cards(blocks)      # after the planners that add material cards
         self._plan_material_cards(blocks)
         self._undefined_parameter_data(blocks)
         self._plan_deformation_plasticity(blocks)
@@ -22885,32 +22961,92 @@ class Converter:
         material without *DENSITY or *SPECIFIC HEAT takes the value of the element ccx
         assembled before (probed on 2.23: a B31 beside a C3D8T cube, coupled steps), which
         hides the stop or gives the elements another material's heat capacity.  Abaqus'
-        elements without temperature DOFs need no thermal properties.  So a section material
-        without *CONDUCTIVITY (not a user material, whose subroutine may conduct) gets
-        *CONDUCTIVITY 1e-30 and, without one, *SPECIFIC HEAT 0, as the rigid skins' material:
-        its elements carry and store no heat."""
+        elements without temperature DOFs (has_temperature_dof: the pure displacement ones a
+        coupled step allows beside C3D8T, ...) neither conduct nor store heat, whatever their
+        material says.  So (not for a user material, whose subroutine may conduct):
+        * a material that only such elements use gets *CONDUCTIVITY 1e-30 and *SPECIFIC HEAT 0
+          in place of its own, as the rigid skins' material, and one they share with elements
+          that have temperature DOFs gets a copy for them (their sections renamed).  Probed on
+          a C3D8 cube beside a heated C3D8T cube: the C3D8T cube's own temperatures (42.58 at
+          its far face, t = 0.2), where the C3D8 cube's own *CONDUCTIVITY and *SPECIFIC HEAT
+          gave 20.93;
+        * any other section material without *CONDUCTIVITY gets *CONDUCTIVITY 1e-30 and,
+          without one, *SPECIFIC HEAT 0, so that ccx's system is not singular.
+        A deck without elements of temperature DOFs is written for ccx, which gives every
+        element them: only the second applies.  A section whose elements are of both kinds
+        keeps its material (warned: those without temperature DOFs conduct in ccx)."""
         if not self.steps.procs & CCX_THERMAL_PROCS:
             return
-        used = {m.upper() for b in blocks if b.keyword.endswith("SECTION")
-                for _t, m, _o in self._section_layers(b, strict=True) if m}
-        names = []
-        for name, group in self._material_options(blocks).items():
-            kws = {c.keyword for c in group}
-            if name not in used or "CONDUCTIVITY" in kws or "USER MATERIAL" in kws:
+        els = self.geom.elements
+        has_t = any(has_temperature_dof(t) for t, _c in els.values())
+        kinds: Dict[str, set] = {}             # material -> "T" / "D": the kinds of its sections
+        own: Dict[str, List[Block]] = {}       # material -> its sections without temperature DOFs
+        for b in blocks:
+            if not b.keyword.endswith("SECTION"):
                 continue
-            cards = [Block("CONDUCTIVITY", OrderedDict(), ["1e-30"])]
-            if "SPECIFIC HEAT" not in kws:
-                cards.append(Block("SPECIFIC HEAT", OrderedDict(), ["0."]))
-            at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
-            blocks[at:at] = cards
-            names.append(name)
+            mats = dedup([m.upper() for _t, m, _o in self._section_layers(b, strict=True) if m])
+            ts = {has_temperature_dof(els[e][0]) for e in self.geom.elset(b.param("ELSET") or "")
+                  if e in els} if has_t and mats else set()
+            if ts == {True, False}:
+                self.report.warn(f"*{b.keyword}, ELSET={b.param('ELSET')}: elements with and without "
+                                 f"temperature DOFs share this section, so ccx gives those without them "
+                                 f"its material's conductivity and heat capacity (Abaqus' carry no heat). "
+                                 f"Give them a section of their own.", once=True)
+                self._reduces("pure displacement elements conducting heat (a section shared with "
+                              "elements of temperature DOFs)")
+            for m in mats:
+                kinds.setdefault(m, set()).add("D" if ts == {False} else "T")
+                if ts == {False}:
+                    own.setdefault(m, []).append(b)
+        heat = {"CONDUCTIVITY", "SPECIFIC HEAT"}
+
+        def none() -> List[Block]:
+            return [Block("CONDUCTIVITY", OrderedDict(), ["1e-30"]),
+                    Block("SPECIFIC HEAT", OrderedDict(), ["0."])]
+
+        opts = self._material_options(blocks)
+        taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+        heatless, copies, names = [], [], []
+        for name, group in opts.items():
+            kws = {c.keyword for c in group}
+            if name not in kinds or "USER MATERIAL" in kws:
+                continue
+            if kinds[name] == {"D"}:
+                gone = {id(c) for c in group if c.keyword in heat}
+                at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
+                blocks[at:at] = none()
+                blocks[:] = [x for x in blocks if id(x) not in gone]
+                heatless.append(name)
+                continue
+            if "D" in kinds[name]:
+                copy = self._fresh_name(f"{name}_NO_HEAT", taken)
+                self._material_copy(blocks, group, copy, heat, none())
+                for b in own[name]:
+                    if b.has("COMPOSITE"):
+                        self._rename_ply_materials(b, {name: copy})
+                    else:
+                        b.params["MATERIAL"] = copy
+                copies.append(f"{copy} (of {name})")
+            if "CONDUCTIVITY" not in kws:
+                cards = [Block("CONDUCTIVITY", OrderedDict(), ["1e-30"])]
+                if "SPECIFIC HEAT" not in kws:
+                    cards.append(Block("SPECIFIC HEAT", OrderedDict(), ["0."]))
+                at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
+                blocks[at:at] = cards
+                names.append(name)
+        if heatless or copies:
+            mats = heatless + [f"copy {c}" for c in copies]
+            self.report.note(f"Material{'s' if len(mats) > 1 else ''} {', '.join(mats)} of elements "
+                             f"without temperature DOFs: *CONDUCTIVITY 1e-30 and *SPECIFIC HEAT 0 in "
+                             f"place of the material's own, so that they carry and store no heat, as "
+                             f"in Abaqus (ccx gives every element temperature DOFs in this deck's "
+                             f"thermal steps).", once=True)
         if names:
             self.report.note(f"Material{'s' if len(names) > 1 else ''} {', '.join(names)} without "
                              f"*CONDUCTIVITY: *CONDUCTIVITY 1e-30 (and *SPECIFIC HEAT 0 where none) "
-                             f"added, so that the elements carry and store no heat. ccx gives every "
-                             f"element temperature DOFs in this deck's thermal steps and stops on a "
-                             f"singular matrix where nothing conducts or stores heat (Abaqus' elements "
-                             f"without temperature DOFs need no thermal properties).", once=True)
+                             f"added. ccx gives every element temperature DOFs in this deck's thermal "
+                             f"steps and stops on a singular matrix where nothing conducts or stores "
+                             f"heat.", once=True)
 
     def _rigid_set_name(self, base: str) -> str:
         i = 1
@@ -26685,23 +26821,33 @@ class Converter:
         """The name of a copy of material ``mat`` (upper case; not _mass_copy_obstacle) whose
         *DENSITY rows hold ``add`` more, for a section's mass per unit area that ccx has no card
         for: {mat}_{tag} (_fresh_name: cut to ccx's 80 characters, not in ``taken``), inserted
-        into ``blocks`` after the material, once per material and value (``copies``)."""
+        into ``blocks`` after the material (_material_copy), once per material and value
+        (``copies``)."""
         if (mat, add) in copies:
             return copies[(mat, add)]
         group = opts[mat]
         name = self._fresh_name(f"{mat}_{tag}", taken)
-        clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
-                 for c in group if c is group[0] or (c.keyword in MATERIAL_OPTION_CARDS and
-                                                     c.keyword != "DENSITY")]
-        clone[0].params["NAME"] = name
         d = next((c for c in group if c.keyword == "DENSITY"), None)
-        clone.append(Block("DENSITY", OrderedDict(d.params) if d else OrderedDict(),
-                           [", ".join([short_real(r[0] + add, 12)] + r[1:]) for r in self._density_rows(group)]
-                           or [short_real(add, 12)]))
-        at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
-        blocks[at:at] = clone
+        self._material_copy(blocks, group, name, {"DENSITY"}, [Block(
+            "DENSITY", OrderedDict(d.params) if d else OrderedDict(),
+            [", ".join([short_real(r[0] + add, 12)] + r[1:]) for r in self._density_rows(group)]
+            or [short_real(add, 12)])])
         copies[(mat, add)] = name
         return name
+
+    @staticmethod
+    def _material_copy(blocks: List[Block], group: List[Block], name: str, drop: set,
+                       extra: Sequence[Block]) -> None:
+        """Insert into ``blocks``, after material ``group`` (its card and options,
+        _material_options), a copy of it named ``name``: every card but those ``drop`` names,
+        then ``extra``.  A copy carries every other card: one left out (a *DEFORMATION
+        PLASTICITY, an *ELECTRICAL CONDUCTIVITY) is behaviour the copy's elements lose, and ccx
+        stops where it was their elasticity."""
+        clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
+                 for c in group if c is group[0] or c.keyword not in drop]
+        clone[0].params["NAME"] = name
+        at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
+        blocks[at:at] = clone + list(extra)
 
     def _plan_shell_density(self, blocks: List[Block]) -> None:
         """*SHELL SECTION, DENSITY= on continuum shells (SC6R / SC8R), a mass per unit area of
@@ -26795,6 +26941,7 @@ class Converter:
             if plan is not None:
                 for g in plan["groups"]:
                     g["mat"] = names[mats.index(g["mat"].upper())]
+                self._rename_ply_materials(b, dict(zip(mats, names)))   # (_material_uses reads them)
             else:
                 b.params["MATERIAL"] = names[0]
             many = len(names) > 1
@@ -26860,11 +27007,7 @@ class Converter:
         names = {m: self._material_mass_copy(blocks, opts, m, (rho_a or 0.0) / (t or 1.0), "SHELL_MASS",
                                              taken, copies) for m in mats}
         if b.has("COMPOSITE"):
-            for i, ln in enumerate(b.data):          # a ply line: thickness, points, material, ...
-                f = ln.split(",")
-                if len(f) > 2 and f[2].strip().upper() in names:
-                    f[2] = " " + names[f[2].strip().upper()]
-                    b.data[i] = ",".join(f)
+            self._rename_ply_materials(b, names)
         else:
             b.params["MATERIAL"] = names[mats[0]]
         many = len(names) > 1
@@ -26875,6 +27018,16 @@ class Converter:
                          f"section mass). The copy spreads the mass through the thickness, which gives "
                          f"it the rotary inertia Abaqus' section mass lacks: bending frequencies about "
                          f"1.6 (thickness / wavelength)^2 times its share of the mass lower.", once=True)
+
+    @staticmethod
+    def _rename_ply_materials(b: Block, names: Dict[str, str]) -> None:
+        """The ply lines of composite section ``b`` (thickness, points, material, ...) with
+        each material in ``names`` (upper case) renamed to its value."""
+        for i, ln in enumerate(b.data):
+            f = ln.split(",")
+            if len(f) > 2 and f[2].strip().upper() in names:
+                f[2] = " " + names[f[2].strip().upper()]
+                b.data[i] = ",".join(f)
 
     def _plan_quadratic_membranes(self, blocks: List[Block]) -> None:
         """Quadratic membranes -> one-element-thick solids the converter expands itself.

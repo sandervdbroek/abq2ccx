@@ -1934,6 +1934,46 @@ def test_damage_initiation_johnson_cook_commented_where_ccx_misreads_it():
     assert "0.2, 0., 0., 0., 0., 1000., 20., 1." in live
 
 
+def test_damage_initiation_johnson_cook_and_the_converters_own_materials():
+    # ccx gives the card to the last *MATERIAL it reads, and the converter writes its own after
+    # the deck's: the rigid skins' just before the first *STEP, a *BEAM GENERAL SECTION's where
+    # the section is; ccx then stopped ('no equivalent strain is calculated', s3-B5)
+    def kept(deck):
+        body, _, rep = convert_str(deck)
+        return "*DAMAGE INITIATION, CRITERION=JOHNSON COOK" in body.splitlines(), rep.text()
+    rigid = ("*Node\n20, 0., 0., -0.5\n21, 1., 0., -0.5\n22, 1., 1., -0.5\n23, 0., 1., -0.5\n"
+             "24, 0.5, 0.5, -1.\n*Element, type=R3D4, elset=RIG\n3, 20, 21, 22, 23\n"
+             "*Rigid Body, elset=RIG, ref node=24\n")
+    got, rep = kept(HEX + rigid + JC_MATERIAL + JC_STEP)
+    assert not got and f"the converter writes material {A.RIGID_SET} (the rigid skins') after" in rep
+    beam = "*Node\n30, 3., 0., 0.\n31, 4., 0., 0.\n*Element, type=B31, elset=BEAM\n40, 30, 31\n"
+    general = "*Beam General Section, elset=BEAM, section=RECT\n0.1, 0.1\n0., 1., 0.\n210000., 80000.\n"
+    got, rep = kept(HEX + beam + JC_MATERIAL + general + JC_STEP)
+    assert not got and "a material for *BEAM GENERAL SECTION, ELSET=BEAM after" in rep
+    assert kept(HEX + beam + general + JC_MATERIAL + JC_STEP)[0]          # written before the deck's
+
+
+def test_material_cards_in_the_order_ccx_reads_them():
+    # Abaqus reads a material's options in any order; ccx 2.23 stops on a *CREEP before the
+    # *PLASTIC ('*PLASTIC should be preceded by an *ELASTIC,TYPE=ISO card', xf-B3) and on
+    # either before the *ELASTIC: written *ELASTIC, *PLASTIC (with its options), *CREEP
+    mat = "*Material, name=M\n{}*Solid Section, elset=EALL, material=M\n"
+    e, c = "*Elastic\n1000., 0.3\n", "*Creep, law=TIME\n1e-10, 1., 0.\n"
+    p = "*Plastic, hardening=COMBINED\n10., 0.\n20., 0.1\n*Cyclic Hardening\n10., 0.\n"
+    step = "*Boundary\n1, 1, 3\n*Step\n*Visco\n0.1, 1.\n*Cload\n7, 1, 1.\n*End Step\n"
+
+    def heads(cards):
+        body, _, rep = convert_str(HEX + mat.format(cards) + step)
+        text = body.split("*MATERIAL, NAME=M\n")[1].split("*SOLID SECTION")[0]
+        return [ln.split(",")[0] for ln in text.splitlines() if ln[:1] == "*" != ln[1:2]], rep.text()
+    for cards in (e + c + p, p + e + c, c + "*Density\n1.\n" + p + e):
+        got, rep = heads(cards)
+        assert [h for h in got if h != "*DENSITY"] == ["*ELASTIC", "*PLASTIC", "*CYCLIC HARDENING", "*CREEP"], got
+        assert "Material M: *ELASTIC, *PLASTIC and *CREEP written in that order" in rep
+    got, rep = heads(e + p + c)
+    assert got == ["*ELASTIC", "*PLASTIC", "*CYCLIC HARDENING", "*CREEP"] and "in that order" not in rep
+
+
 def test_elastic_young_modulus_only_gets_zero_poisson():
     # Abaqus reads an omitted Poisson's ratio as 0; ccx stops: 'not enough constants'
     body, _, _ = convert_str("*Material, name=m\n*Elastic\n 3e+07, \n")
@@ -6273,12 +6313,17 @@ def test_abbreviations_read_in_full():
     assert dict(A.parse_keyword_line("*EL PRINT, F=2, POS=CENTROID", seen)[1]) == \
         {"FREQUENCY": "2", "POSITION": "CENTROIDAL"}
     assert A.parse_keyword_line("*ORIENTATION, NAME=O, SYSTEM=C", seen)[1]["SYSTEM"] == "CYLINDRICAL"
-    # names spelled out stay: *STEP's own INC, a value with its blanks left out, a name
+    # names spelled out stay: *STEP's own INC, a name; a value with its blanks left out is
+    # spelled with them, as the readers compare it (s1-B6: ENGINEERINGCONSTANTS, SMOOTHSTEP)
     assert dict(A.parse_keyword_line("*STEP, INC=100, AMP=R", seen)[1]) == \
         {"INC": "100", "AMPLITUDE": "RAMP"}
     assert dict(A.parse_keyword_line("*CLOAD, AMP=R", seen)[1]) == {"AMPLITUDE": "R"}
     assert A.parse_keyword_line("*CONTACT PAIR, TYPE=SURFACETOSURFACE", seen)[1]["TYPE"] == \
-        "SURFACETOSURFACE"
+        "SURFACE TO SURFACE"
+    assert A.parse_keyword_line("*ELASTIC, TYPE=engineeringconstants", seen)[1]["TYPE"] == \
+        "ENGINEERING CONSTANTS"
+    assert A.parse_keyword_line("*ELASTIC, TYPE=Engineering Constants", seen)[1]["TYPE"] == \
+        "Engineering Constants"                         # (as written but for case: kept)
     assert "TIME MARKS" in A.parse_keyword_line("*OUTPUT, FIELD, TIMEMARKS=YES", seen)[1]
     assert seen["read"]["*INITIAL CONDITION"] == "INITIAL CONDITIONS"
     assert seen["read"]["*OUTPUT, VAR"] == "VARIABLE"
@@ -6299,6 +6344,25 @@ def test_abbreviations_read_in_full():
         "*INITIAL CONDITION -> *INITIAL CONDITIONS; *INITIAL CONDITIONS, TYPE=Temp -> " \
         "TEMPERATURE; *OUTPUT, VAR -> VARIABLE." in text
     assert "*END: an ambiguous abbreviation (END ASSEMBLY, END INSTANCE" in text
+
+
+def test_blank_free_values_read_as_their_blank_spelling():
+    # Abaqus ignores blanks on a keyword line; kept as written, TYPE=ENGINEERINGCONSTANTS had
+    # its *ELASTIC commented out (no elasticity: ccx stopped), DEFINITION=SMOOTHSTEP was read
+    # as TABULAR and TYPE=PLASTICSTRAIN commented out (s1-B6, xr-B4)
+    load = "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload{}\n7, 3, 1.\n*End Step\n"
+    ec = (HEX + "*Material, name=M\n*Elastic, type=ENGINEERINGCONSTANTS\n1000., 1000., 1000., 0.3, "
+          "0.3, 0.3, 384.6, 384.6,\n384.6\n*Solid Section, elset=EALL, material=M\n")
+    body, conv, _ = convert_str(ec + load.format(""))
+    assert "*ELASTIC, TYPE=ENGINEERING CONSTANTS\n1000., 1000., 1000., 0.3," in body
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(HEX_MODEL + "*Amplitude, name=A, definition=SMOOTHSTEP\n0., 0., 1., 1.\n"
+                                  + load.format(", amplitude=A"))
+    assert "SMOOTHSTEP" not in rep.text() and not conv.reduced_physics
+    body, conv, rep = convert_str(HEX_MODEL.replace("*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Plastic\n"
+                                                    "10., 0.\n20., 0.1\n")
+                                  + "*Initial Conditions, type=PLASTICSTRAIN\n1, 0.01\n" + load.format(""))
+    assert "not a ccx initial-condition type" not in rep.text() and not conv.reduced_physics
 
 
 def test_abbreviation_tables_spell_names_as_the_converter_reads_them():
@@ -9608,9 +9672,14 @@ def test_hyperfoam_n1_written_as_n2():
     assert red == ["*HYPERFOAM tangent with unequal exponents (eigenvalue steps)"]
     assert not conv("*Hyperfoam, n=2\n1.e6, 2., 1.e6, 2., 0.1, 0.1\n")[1]
     assert not conv("*Hyperfoam, n=2\n1.5e6, 2., 0.5e6, 4., 0.1, 0.1\n", "Static")[1]
-    # an N=1 card the converter cannot rewrite stays, warned
+    # an N=1 card the converter cannot rewrite stays, warned; DEPENDENCIES=0 is a plain table,
+    # rewritten the same (xr-B19: it was kept, warned)
     got, red, rep = conv("*Hyperfoam\nmu, 2., 0.1\n")
     assert got == ["*HYPERFOAM", "mu, 2., 0.1"] and red == ["*HYPERFOAM, N=1 (no stiffness in ccx 2.23)"]
+    got, red, rep = conv("*Hyperfoam, n=1, dependencies=0\n2.e6, 2., 0.1\n")
+    assert got == ["*HYPERFOAM, N=2", "1000000., 2., 1000000., 2., 0.1, 0.1"] and not red
+    got, red, rep = conv("*Hyperfoam, n=1, dependencies=1\n2.e6, 2., 0.1, , 1.\n")
+    assert got[0] == "*HYPERFOAM, N=1" and "*HYPERFOAM, N=1 (no stiffness in ccx 2.23)" in red
     # TEST DATA INPUT: ccx reads no test data, and reads the card as an N=1 one without
     # coefficients (probed: a singular matrix): commented out, as *HYPERELASTIC's
     body, c, rep = convert_str(deck.format("*Hyperfoam, test data input, poisson=0.\n*Uniaxial Test "
@@ -16148,12 +16217,49 @@ def test_section_mass_copy_names_within_ccx_limit():
     assert f"ELSET=A, MATERIAL={first}\n" in body and f"ELSET=B, MATERIAL={second}\n" in body
 
 
+def test_section_mass_copy_carries_every_material_card():
+    # the copy cloned only MATERIAL_OPTION_CARDS: a *DEFORMATION PLASTICITY stayed with the
+    # original, which no section used any more and was commented out, so ccx stopped ('no
+    # elastic constants', s3-B1).  A copy carries every card but *DENSITY (_material_copy)
+    dp = SHELL_PLATE.replace("*Elastic\n1000., 0.3\n", "*Deformation Plasticity\n1000., 0.3, 20., 5., 0.5\n")
+    grav = "*Boundary\n1, 1, 6\n2, 1, 6\n*Step, nlgeom\n*Static\n*Dload\nPLATE, GRAV, 10., 0., 0., -1.\n*End Step\n"
+    body, conv, _ = convert_str(dp + "*Shell Section, elset=PLATE, material=M, density=0.5\n0.1\n" + grav)
+    copy = body.split("*MATERIAL, NAME=M_SHELL_MASS\n")[1].split("*MATERIAL")[0]
+    assert copy == "*DEFORMATION PLASTICITY\n1000., 0.3, 20., 5., 0.5\n*DENSITY\n7.\n", copy
+    assert "\n** *DEFORMATION PLASTICITY\n" in body and not conv.reduced_physics     # (the unused original)
+    # the membranes' copy too
+    mem = dp.replace("type=S4,", "type=M3D4,")
+    body, _, _ = convert_str(mem + "*Membrane Section, elset=PLATE, material=M, density=0.5\n0.1\n" + grav)
+    copy = body.split("*MATERIAL, NAME=M_MEMBRANE_MASS\n")[1].split("*MATERIAL")[0]
+    assert copy.startswith("*DEFORMATION PLASTICITY\n1000., 0.3, 20., 5., 0.5\n*DENSITY\n7."), copy
+
+
+def test_ply_split_mass_copies_name_the_ply_lines():
+    # on continuum shells split into ply solids the copies were only in the split plan, the
+    # section's ply lines naming the originals: _material_uses saw no copy, so the copy's
+    # zero-shear *EXPANSION, TYPE=ANISO on a 45-degree ply went out as ORTHO (ccx 2.23 drops
+    # its turned shear under NLGEOM) while the warning named the original (s3-B2)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 0.1\n"
+            "6, 1., 0., 0.1\n7, 1., 1., 0.1\n8, 0., 1., 0.1\n*Element, type=SC8R, elset=E\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=ALL, generate\n1, 8\n*Material, name=M\n*Elastic\n"
+            "1000., 0.3\n*Expansion, type=ANISO\n1e-3, 2e-3, 3e-3, 0., 0., 0.\n*Density\n1e-6\n"
+            "*Shell Section, elset=E, composite, density=0.001\n0.05, 3, M, 0.\n0.05, 3, M, 45.\n"
+            "*Initial Conditions, type=temperature\nALL, 0.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+            "*Step, nlgeom\n*Static\n1., 1.\n*Temperature\nALL, 10.\n*End Step\n*Step\n*Frequency\n2\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    copy = body.split("*MATERIAL, NAME=M_SHELL_MASS\n")[1].split("*MATERIAL")[0]
+    assert "*EXPANSION, TYPE=ANISO\n" in copy, copy
+    assert "Material M_SHELL_MASS: *EXPANSION, TYPE=ANISO in a deck with NLGEOM steps" in rep.text()
+    assert "Material M: *EXPANSION, TYPE=ANISO in a deck with NLGEOM" not in rep.text()
+
+
 def test_heatless_section_materials_in_thermal_decks():
     # ccx 2.23 gives every element temperature DOFs in a thermal step and stops on a singular
     # matrix (exit 255, no message) where a material neither conducts nor stores heat — a
     # steady-state step, or *DENSITY 0 —, and takes another element's density or specific heat
-    # where they are missing: a section material without *CONDUCTIVITY gets 1e-30 (and a
-    # specific heat 0), as Abaqus' elements without temperature DOFs carry and store no heat
+    # where they are missing.  Abaqus' elements without temperature DOFs (the B31 beside the
+    # C3D8T cube) carry and store no heat: their material gets *CONDUCTIVITY 1e-30 and
+    # *SPECIFIC HEAT 0 in place of its own
     deck = (HEX.replace("TYPE=C3D8,", "TYPE=C3D8T,") + "*Node\n20, 3., 0., 0.\n21, 4., 0., 0.\n"
             "*Element, type=B31, elset=BEAM\n11, 20, 21\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n"
             "0.001\n*Conductivity\n1.\n*Specific Heat\n1.\n*Solid Section, elset=EALL, material=M\n"
@@ -16165,17 +16271,46 @@ def test_heatless_section_materials_in_thermal_decks():
     body, conv, rep = convert_str(deck + step)
     bm = body.split("*MATERIAL, NAME=BM\n")[1].split("*BEAM SECTION")[0]
     assert bm == "*ELASTIC\n1000., 0.25\n*DENSITY\n0.\n*CONDUCTIVITY\n1e-30\n*SPECIFIC HEAT\n0.\n"
-    assert body.count("*CONDUCTIVITY") == 2 and "Material BM without *CONDUCTIVITY" in rep.text()
+    assert body.count("*CONDUCTIVITY") == 2 and "Material BM of elements without temperature DOFs" in rep.text()
     assert not conv.reduced_physics
-    # a specific heat of its own stays (only the conductivity is added); a material without a
-    # section, or a deck without a thermal step: nothing added
-    body, _, _ = convert_str(deck.replace("*Density\n0.\n", "*Density\n0.\n*Specific Heat\n5.\n") + step)
-    assert "*SPECIFIC HEAT\n5.\n*CONDUCTIVITY\n1e-30\n" in body and body.count("*SPECIFIC HEAT") == 2
+    # (which Abaqus elements have temperature DOFs: a T suffix after the node count)
+    assert all(map(A.has_temperature_dof, ("C3D8T", "C3D10T", "CGAX6MT", "S4RT", "T3D2T", "C3D8PT",
+                                           "DC3D8", "DS4", "U1")))
+    assert not any(map(A.has_temperature_dof, ("C3D8", "C3D20RH", "S4R", "B31", "DCOUP3D", "GAPUNIT")))
+    # their own *CONDUCTIVITY and *SPECIFIC HEAT go (s6-B2: they conducted and stored heat)
+    body, _, _ = convert_str(deck.replace("*Density\n0.\n", "*Density\n0.\n*Conductivity, type=ortho\n"
+                                          "2., 2., 2.\n*Specific Heat\n5.\n") + step)
+    bm = body.split("*MATERIAL, NAME=BM\n")[1].split("*BEAM SECTION")[0]
+    assert bm == "*ELASTIC\n1000., 0.25\n*DENSITY\n0.\n*CONDUCTIVITY\n1e-30\n*SPECIFIC HEAT\n0.\n", bm
+    # a material they share with elements of temperature DOFs: a copy for them
     body, _, rep = convert_str(deck.replace("material=BM, section", "material=M, section") + step)
-    assert body.count("*CONDUCTIVITY") == 1 and "without *CONDUCTIVITY" not in rep.text()
+    copy = body.split("*MATERIAL, NAME=M_NO_HEAT\n")[1].split("*SOLID SECTION")[0]
+    assert copy == "*ELASTIC\n1000., 0.3\n*DENSITY\n0.001\n*CONDUCTIVITY\n1e-30\n*SPECIFIC HEAT\n0.\n", copy
+    assert "*BEAM SECTION, ELSET=BEAM, MATERIAL=M_NO_HEAT," in body and "*CONDUCTIVITY\n1.\n" in body
+    assert "copy M_NO_HEAT (of M) of elements without temperature DOFs" in rep.text()
+    # a material without *CONDUCTIVITY on elements of temperature DOFs: 1e-30 added (ccx's
+    # system is not singular), its specific heat kept; nothing without a thermal step
+    body, _, rep = convert_str(deck.replace("*Conductivity\n1.\n", "") + step)
+    m = body.split("*MATERIAL, NAME=M\n")[1].split("*SOLID SECTION")[0]
+    assert m == "*ELASTIC\n1000., 0.3\n*DENSITY\n0.001\n*SPECIFIC HEAT\n1.\n*CONDUCTIVITY\n1e-30\n", m
+    assert "Material M without *CONDUCTIVITY: *CONDUCTIVITY 1e-30" in rep.text()
     body, _, rep = convert_str(deck + step.replace("*Coupled Temperature-displacement, steady state", "*Static")
                                .replace("1, 11, 11, 100.\n", ""))
-    assert body.count("*CONDUCTIVITY") == 1 and "without *CONDUCTIVITY" not in rep.text()
+    assert body.count("*CONDUCTIVITY") == 1 and "temperature DOFs" not in rep.text()
+    # a deck without elements of temperature DOFs is written for ccx (every element has them)
+    plain = deck.replace("TYPE=C3D8T,", "TYPE=C3D8,").replace("*Density\n0.\n", "*Density\n0.\n"
+                                                              "*Conductivity\n3.\n")
+    body, _, rep = convert_str(plain + step)
+    assert "*CONDUCTIVITY\n3.\n" in body and "temperature DOFs" not in rep.text()
+    # a section of elements of both kinds keeps its material: warned
+    mixed = deck.replace("*Beam Section, elset=BEAM, material=BM, section=RECT\n0.1, 0.1\n0., 1., 0.\n", "") \
+        .replace("*Element, type=B31, elset=BEAM\n11, 20, 21\n",
+                 "*Node\n30, 2., 0., 0.\n31, 2., 1., 0.\n32, 2., 0., 1.\n33, 2., 1., 1.\n"
+                 "*Element, type=C3D8, elset=EALL\n12, 2, 30, 31, 3, 6, 32, 33, 7\n")
+    body, conv, rep = convert_str(mixed + step.replace("20, 1, 6\n", ""))
+    assert "elements with and without temperature DOFs share this section" in rep.text()
+    assert conv.reduced_physics == ["pure displacement elements conducting heat (a section shared with "
+                                    "elements of temperature DOFs)"]
     # the material the converter makes for a *BEAM GENERAL SECTION too
     general = deck.replace("*Beam Section, elset=BEAM, material=BM, section=RECT\n0.1, 0.1\n0., 1., 0.\n",
                            "*Beam General Section, elset=BEAM, section=RECT, density=0.\n0.1, 0.1\n0., 1., 0.\n"

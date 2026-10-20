@@ -45,6 +45,19 @@ physics.
   (factors near 1, without a warning). `LOAD CASE=2` cards that repeat the `LOAD CASE=1` lines
   but not their missing OP=NEW (the modes then lose the base state's BCs) are now warned as
   reduced physics, not noted as exact.
+* **Material copies and card order** — a section-mass copy (`*SHELL SECTION` / `*MEMBRANE
+  SECTION, DENSITY=`) lost cards such as `*DEFORMATION PLASTICITY`, so ccx stopped ('no elastic
+  constants'); a copy now has every card but `*DENSITY`. Ply-split continuum shells now name the
+  copy on their ply lines, so its expansion is no longer misjudged. Blank-free values
+  (`TYPE=ENGINEERINGCONSTANTS`, `DEFINITION=SMOOTHSTEP`) are read as spelled with blanks (the
+  `*ELASTIC` was commented out). ccx stops on `*CREEP` or `*PLASTIC` before `*ELASTIC` and on
+  `*CREEP` before `*PLASTIC`: they are now written in that order. A Johnson-Cook `*DAMAGE
+  INITIATION` is commented out where the converter writes a material after the deck's (ccx gives
+  it to the last one and stopped). In thermal steps, elements without temperature DOFs (a C3D8
+  beside C3D8T) now carry and store no heat: their material gets `*CONDUCTIVITY 1e-30` and
+  `*SPECIFIC HEAT 0` in place of its own (a copy where it is shared). They conducted, and the
+  heated cube's far face was at 20.9 instead of 42.6. `*HYPERFOAM, N=1, DEPENDENCIES=0` gets the
+  exact N=2 form.
 * **Static perturbation steps: base + perturbation** — two lines of one load in such a step
   each got the base value added, so ccx counted it twice. It now goes on the first line only.
   Base-state loads, BCs and temperatures on a `TIME=TOTAL TIME` amplitude kept rising through

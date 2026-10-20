@@ -4288,7 +4288,68 @@ def heatless_beam_deck(kind, twin=False):
     return text
 
 
-ROTATED_INSTANCES = {"I0": None, "I1": ((0., 3., 0.), (1., 3., 0.), 90.),
+def material_card_deck(kind, twin=False):
+    """Decks whose material cards ccx stopped on or misread (code review 3, task material-copies):
+    * "dp_mass": shell_mass_deck's S4 plate (gravity) of a *DEFORMATION PLASTICITY material
+      (E 1e5, nu 0.3, yield 1e9: elastic) in an NLGEOM step, its section DENSITY=0.5 (the mass
+      copy lost the card: 'no elastic constants'); ``twin`` the mass in the material;
+    * "ec": CUBE8 held at its bottom, its top pulled by 1 per node, *ELASTIC,
+      TYPE=ENGINEERINGCONSTANTS (commented out: no elasticity); ``twin`` spelled with blanks;
+    * "foam": the same cube pushed down by 1 per node, NLGEOM, *HYPERFOAM, N=1, DEPENDENCIES=0
+      (kept as N=1, which ccx gives no stiffness); ``twin`` without DEPENDENCIES;
+    * "creep": CUBE8 (E 1000), its x = 1 face pulled by 1 per node in a *VISCO step, *CREEP
+      before *PLASTIC (ccx: '*PLASTIC should be preceded by an *ELASTIC,TYPE=ISO card');
+      ``twin`` *PLASTIC first;
+    * "jc": CUBE8 of a plastic material with a Johnson-Cook *DAMAGE INITIATION, its x = 1 face
+      pulled 0.05 under NLGEOM (yield 200: plastic), beside a held R3D4 *RIGID BODY plate whose
+      skins' material ccx read last ('no equivalent strain is calculated'); ``twin`` without
+      the damage card;
+    * "heat": a C3D8T cube heated to 100 at x = 0 (k = rho = c = 1, from 0) in a transient
+      *COUPLED TEMPERATURE-DISPLACEMENT step to t = 0.2, a C3D8 cube on its x = 1 face whose
+      material has *CONDUCTIVITY 1 and *SPECIFIC HEAT 1 (Abaqus: no temperature DOFs, so no
+      heat); ``twin`` the C3D8T cube alone.  The temperature of the shared face (MID) printed."""
+    if kind == "dp_mass":
+        text = shell_mass_deck("s4", "grav", twin).replace("*Step\n", "*Step, nlgeom\n")
+        return text.replace("*Elastic\n100000., 0.3\n", "*Deformation Plasticity\n100000., 0.3, 1e9, 5., 0.5\n")
+    held = "*BOUNDARY\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n5, 1, 1\n8, 1, 1\n"
+    if kind in ("ec", "foam"):
+        card = ("*ELASTIC, TYPE=" + ("ENGINEERING CONSTANTS" if twin else "ENGINEERINGCONSTANTS") +
+                "\n1000., 500., 800., 0.3, 0.2, 0.25, 300., 250.,\n200.\n") if kind == "ec" else \
+            "*HYPERFOAM, N=1" + ("" if twin else ", DEPENDENCIES=0") + "\n200., 8., 0.1\n"
+        step = "*STEP\n*STATIC\n" if kind == "ec" else "*STEP, NLGEOM\n*STATIC\n0.25, 1.\n"
+        return (CUBE8 + "*MATERIAL, NAME=M\n" + card + CUBE8_HELD + step + "*CLOAD\nTOP, 3, "
+                + ("1." if kind == "ec" else "-1.") + "\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+    tip = "*NSET, NSET=TIP\n2, 3, 6, 7\n"
+    if kind == "creep":
+        e, c, p = "*ELASTIC\n1000., 0.3\n", "*CREEP, LAW=TIME\n1e-10, 1., 0.\n", "*PLASTIC\n10., 0.\n20., 0.1\n"
+        return (CUBE8 + tip + "*MATERIAL, NAME=M\n" + e + (p + c if twin else c + p) + held +
+                "*STEP\n*VISCO, CETOL=0.01\n0.1, 1.\n*CLOAD\nTIP, 1, 1.\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
+    if kind == "jc":
+        rigid = ("*NODE\n20, 0., 0., -0.5\n21, 1., 0., -0.5\n22, 1., 1., -0.5\n23, 0., 1., -0.5\n"
+                 "24, 0.5, 0.5, -1.\n*ELEMENT, TYPE=R3D4, ELSET=RIG\n3, 20, 21, 22, 23\n"
+                 "*RIGID BODY, ELSET=RIG, REF NODE=24\n")
+        dmg = "" if twin else "*DAMAGE INITIATION, CRITERION=JOHNSON COOK\n0.1, 0.2, -0.5, 0., 0., 1500., 20., 1.\n"
+        return (CUBE8 + tip + rigid + "*MATERIAL, NAME=M\n*ELASTIC\n200000., 0.3\n*PLASTIC\n200., 0.\n"
+                "400., 0.2\n" + dmg + held + "24, 1, 6\n*STEP, NLGEOM\n*STATIC\n0.1, 1.\n*BOUNDARY\n"
+                "TIP, 1, 1, 0.05\n*NODE PRINT, NSET=TIP, TOTALS=ONLY\nRF\n*EL PRINT, ELSET=EALL\nPEEQ\n*END STEP\n")
+    lines = ["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 1., 1., 0.", "4, 0., 1., 0.", "5, 0., 0., 1.",
+             "6, 1., 0., 1.", "7, 1., 1., 1.", "8, 0., 1., 1."]
+    lines += [] if twin else ["9, 2., 0., 0.", "10, 2., 1., 0.", "11, 2., 0., 1.", "12, 2., 1., 1."]
+    lines += ["*ELEMENT, TYPE=C3D8T, ELSET=A", "1, 1, 2, 3, 4, 5, 6, 7, 8"]
+    lines += [] if twin else ["*ELEMENT, TYPE=C3D8, ELSET=B", "2, 2, 9, 10, 3, 6, 11, 12, 7"]
+    lines += ["*NSET, NSET=HOT", "1, 4, 5, 8", "*NSET, NSET=MID", "2, 3, 6, 7", "*NSET, NSET=ALLN",
+              "1, 2, 3, 4, 5, 6, 7, 8"] + ([] if twin else ["9, 10, 11, 12"])
+    for name in ("MT", "MS"):
+        lines += [f"*MATERIAL, NAME={name}", "*ELASTIC", "1000., 0.3", "*CONDUCTIVITY", "1.", "*DENSITY",
+                  "1.", "*SPECIFIC HEAT", "1."]
+    lines += ["*SOLID SECTION, ELSET=A, MATERIAL=MT"] + ([] if twin else ["*SOLID SECTION, ELSET=B, MATERIAL=MS"])
+    lines += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", "ALLN, 0.", "*STEP", "*COUPLED TEMPERATURE-DISPLACEMENT",
+              "0.05, 0.2", "*BOUNDARY", "1, 1, 3", "4, 1, 3", "5, 1, 3", "8, 1, 3", "HOT, 11, 11, 100.",
+              "*NODE PRINT, NSET=MID", "NT", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+ROTATED_INSTANCES ={"I0": None, "I1": ((0., 3., 0.), (1., 3., 0.), 90.),
                      "I2": ((0., 0., 6.), (1., 2., 9.), 40.)}
 
 
@@ -11215,6 +11276,64 @@ def main():
                   f"increments): solved, every increment as with a conducting beam material ({err:.1e} "
                   f"of the end displacement {end:.4g} apart) and t times the end displacement ({lin:.1e})")
         failures += 0 if ok else 1
+    # material cards ccx stopped on or misread (material_card_deck): each deck solves as its twin
+    read = lambda dat: (dat_totals(dat), dat_displacements(dat))     # noqa: E731
+    res = [review_run(material_card_deck("dp_mass", twin), "material_dp_mass" + ("_ref" if twin else ""), read)
+           for twin in (False, True)]
+    ok = all(res)
+    if ok:
+        want = 7.0 / 8.0 * (0.2 + 0.5) * 2.0                 # shell_area_mass_s4's share of the weight
+        (got, tip), (_ref, tip_ref) = [((r[0] or [(0.0, 0.0, 0.0)])[-1][2], r[1].get(10, [0.0] * 3)[2]) for r in res]
+        ok = abs(got / want - 1) < 1e-4 and abs(ccx_ratio(tip, tip_ref) - 1) < 1e-6 and tip < -1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  material_dp_mass (S4 plate of a *DEFORMATION PLASTICITY "
+              f"material, section DENSITY=0.5, gravity, NLGEOM): reactions {got:.7g} vs {want:.7g} "
+              f"({abs(got / want - 1):.1e} apart), tip moved {tip:.6g} as with the mass in the material "
+              f"({tip_ref:.6g}; the copy lost the card: 'no elastic constants')")
+    failures += 0 if ok else 1
+    for kind, what in (("ec", "*ELASTIC, TYPE=ENGINEERINGCONSTANTS, top pulled (the card was commented "
+                              "out: no elasticity)"),
+                       ("foam", "*HYPERFOAM, N=1, DEPENDENCIES=0, top pushed under NLGEOM (kept as N=1, "
+                                "no stiffness in ccx)"),
+                       ("creep", "*CREEP before *PLASTIC, *VISCO (ccx: '*PLASTIC should be preceded by "
+                                 "an *ELASTIC,TYPE=ISO card')")):
+        tag = f"material_{kind}"
+        res = [review_run(material_card_deck(kind, twin), tag + ("_ref" if twin else ""), dat_displacements)
+               for twin in (False, True)]
+        ok = all(res) and len(res[0]) == len(res[1]) == 4
+        if ok:
+            end = max(abs(x) for v in res[1].values() for x in v)
+            err = ccx_ratio(max(abs(x - y) for n in res[1] for x, y in zip(res[0].get(n, [math.inf] * 3),
+                                                                           res[1][n])), end)
+            ok = err < 1e-6 and end > 1e-4
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a cube, {what}): solved, its loaded face as the "
+                  f"twin's ({err:.1e} of max |u| {end:.4g} apart)")
+        failures += 0 if ok else 1
+    read = lambda dat: (dat_totals(dat), dat_el_scalar(dat, "equivalent plastic strain"))     # noqa: E731
+    res = [review_run(material_card_deck("jc", twin), "material_jc_rigid" + ("_ref" if twin else ""), read)
+           for twin in (False, True)]
+    ok = all(res) and all(r[0] for r in res)
+    if ok:
+        (f, peeq), (f_ref, _p) = [(r[0][-1][0], max(r[1].values(), default=0.0)) for r in res]
+        ok = abs(ccx_ratio(f, f_ref) - 1) < 1e-9 and peeq > 0.01 and f > 200.0
+        print(f"{'PASS' if ok else 'FAIL'}  material_jc_rigid (a plastic cube with a Johnson-Cook "
+              f"*DAMAGE INITIATION beside a *RIGID BODY plate, pulled 0.05, NLGEOM): solved, reaction "
+              f"{f:.7g} as without the card ({f_ref:.7g}), PEEQ {peeq:.4g} (ccx gave the card to the "
+              f"skins' material and stopped: it is commented out)")
+    failures += 0 if ok else 1
+    read = lambda dat: {int(r[0]): r[1:] for r in (dat_tables(dat, "temperatures") or [[]])[-1]}     # noqa: E731
+    res = [review_run(material_card_deck("heat", twin), "material_heatless" + ("_ref" if twin else ""), read)
+           for twin in (False, True)]
+    ok = all(res) and all(len(r) == 4 for r in res)
+    if ok:
+        got, want = [[r[n][0] for n in (2, 3, 6, 7)] for r in res]
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(got, want))
+        ok = err < 1e-6 and min(want) > 1.0
+        print(f"{'PASS' if ok else 'FAIL'}  material_heatless (a C3D8T cube heated in a transient "
+              f"*COUPLED TEMPERATURE-DISPLACEMENT step, a C3D8 cube of a conducting, heat-storing "
+              f"material on its far face): far-face temperature at t = 0.2 {got[0]:.6g} as the "
+              f"C3D8T cube's alone ({want[0]:.6g}, {err:.1e} apart; it was 20.93: the C3D8 cube "
+              f"conducted and stored heat)")
+    failures += 0 if ok else 1
     # a part's equation, partial kinematic couplings and SPRING1 / SPRING2 in rotated instances:
     # Abaqus turns them with the instance, so each one's displacements are R u(unturned
     # instance). They kept the part's DOF numbers: 101 % / 42 % of max |u| off.
