@@ -2366,7 +2366,7 @@ def analytic_profile(b: Block) -> Tuple[Optional[dict], str]:
         fillet = pf(b.param("FILLET RADIUS") or "0")
     except ValueError:
         fillet = 0.0
-    return {"type": typ, "frame": frame, "start": (x, y), "segs": segs, "fillet": fillet}, ""
+    return {"frame": frame, "start": (x, y), "segs": segs, "fillet": fillet}, ""
 
 
 def profile_points(start: Tuple[float, float], segs: Sequence[tuple], max_deg: float,
@@ -7733,7 +7733,7 @@ class Converter:
 
     def handle_solid_section(self, b: Block) -> List[str]:
         if id(b) in self._slab_sections:           # CPS4I / CPE4I as C3D8I slabs
-            kind, mat = self._slab_sections[id(b)]
+            _kind, mat = self._slab_sections[id(b)]
             out = [] if mat in self._slab_written else self._slab_materials.get(mat, [])
             self._slab_written.add(mat)
             return out + [emit_keyword("SOLID SECTION", OrderedDict(
@@ -11533,7 +11533,7 @@ class Converter:
         the approximate n1 of its cross section, which P1 / P2 need."""
         out: list = []
         for e in eids:
-            typ, conn = self.geom.elements[e]
+            conn = self.geom.elements[e][1]
             if any(k not in self.geom.nodes for k in conn):
                 return [], f"beam {e} has an undefined node"
             nodes = [conn[0], conn[-1]] + ([conn[1]] if len(conn) == 3 else [])
@@ -12401,7 +12401,7 @@ class Converter:
         pts = self.geom.nodes
 
         def direction(e: int) -> Optional[Tuple[Vec, ...]]:
-            typ, conn = self.geom.elements[e]
+            conn = self.geom.elements[e][1]
             if e in shells:
                 nc = 3 if len(conn) in (3, 6) else 4
                 i = conn.index(n)
@@ -13531,7 +13531,7 @@ class Converter:
         set per variable and step, as a ccx .frd keeps it — the whole model before a set,
         several sets joined into one."""
         unions: Dict[Tuple[str, ...], str] = {}
-        for k, timing, reqs in steps:
+        for _k, _timing, reqs in steps:
             node_files = [r for r in reqs if r["live"] and r["cc"] == "NODE FILE"]
             want: "OrderedDict[str, List[Optional[str]]]" = OrderedDict()
             for r in node_files:
@@ -18773,7 +18773,7 @@ class Converter:
 
     def _face_points(self, e: int, face: Optional[str]) -> List[Vec]:
         """The corner points of face ``face`` of element ``e`` (an edge: its two end nodes)."""
-        typ, conn = self.geom.elements[e]
+        typ = self.geom.elements[e][0]
         ids = self._face_node_ids(e, face)
         m = re.fullmatch(r"S([1-4])", (face or "").upper())
         if m and typ.upper().startswith(PLANAR_SOLID_PREFIXES):
@@ -21193,7 +21193,7 @@ class Converter:
             for k, ply in enumerate(p["plies"]):
                 groups.setdefault((ply["mat"].upper(), ply["ori"].upper()), []).append(k)
             out = []
-            for (mat_u, ori_u), ks in groups.items():
+            for ks in groups.values():
                 name = self._fresh_name(f"{p['elset']}_PLY{ks[0] + 1}")
                 self.geom.elsets[name] = [plies_of[e][k] for k in ks for e in p["elems"]]
                 out.append(dict(set=name, mat=p["plies"][ks[0]]["mat"], ori=p["plies"][ks[0]]["ori"],
@@ -22527,8 +22527,7 @@ class Converter:
                 rho = pf(density.split(",")[0])
             except ValueError:
                 rho = 0.0
-        return {"cards": out, "elements": eids, "mass": rho * p.area, "planar": planar,
-                "material": name}
+        return {"cards": out, "elements": eids, "mass": rho * p.area, "planar": planar}
 
     def _prescan(self, blocks: List[Block]) -> None:
         """Deck-wide facts that individual card handlers need: which nodes can carry
@@ -24944,7 +24943,7 @@ class Converter:
                 for d in moving:
                     outs[d] = ("approx", outs[d][1] | {"geometry"}, outs[d][2])
             asked: Dict[int, set] = {}                      # reference DOF -> values asked for
-            for d, (state, _, need) in outs.items():
+            for d, (_state, _, need) in outs.items():
                 for k, v in need.items():
                     asked.setdefault(k, set()).add(v)
             for d, out in outs.items():
@@ -24963,7 +24962,7 @@ class Converter:
             if inexact and not self._approx:
                 why[d] = "approx:" + ",".join(sorted(inexact))
                 continue
-            for s, state, _, need in res[d]:
+            for s, _state, _, need in res[d]:
                 step = c["steps"][s]
                 for m in step["S"][d] if need else ():
                     lines = self._bc_add.setdefault(step["st"][(m, d)][0], OrderedDict()) \
@@ -26657,7 +26656,7 @@ class Converter:
             self._slab_sections[id(b)] = (kind, name)
         next_id = max(self.geom.nodes, default=0)
         for e, kind in cand.items():
-            typ, conn = self.geom.elements[e]
+            conn = self.geom.elements[e][1]
             top = []
             for n in conn:
                 key = (n, thick[e])
