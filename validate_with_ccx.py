@@ -90,6 +90,7 @@ axes against the model turned into them.
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
 its system (abq2ccx.classify_ccx_run): a step that sets up none still ends in "Job finished".
+A ratio over a scale from ccx's output (ccx_ratio) fails its check when that scale is 0.
 
     python validate_with_ccx.py
 
@@ -222,6 +223,16 @@ def dat_displacement(dat_path, node):
     """Last displacement (ux, uy, uz) printed for ``node`` by *NODE PRINT in a ccx .dat
     file, or None."""
     return dat_displacements(dat_path).get(node)
+
+
+def ccx_ratio(num, den):
+    """num / den for a scale taken from ccx's output (a twin's largest |u|, a reference run's
+    eigenvalue or reaction).  A zero or non-finite scale, as when a deck's loads were all lost,
+    gives inf, which fails the check, and says so, where num / den would stop the script."""
+    if den and math.isfinite(den):
+        return num / den
+    print(f"      no scale from ccx: {num:.3g} / {den:.3g} counts as inf (did nothing move?)")
+    return math.inf
 
 
 def _dot(a, b):
@@ -4427,7 +4438,7 @@ def main():
             failures += 1
     if all(u.values()):
         us, ur = u["coupling_shell_plate"], u["coupling_solid_plate"]
-        err = max(abs(a - b) for a, b in zip(us, ur)) / max(abs(b) for b in ur)
+        err = ccx_ratio(max(abs(a - b) for a, b in zip(us, ur)), max(abs(b) for b in ur))
         ok = err < 0.005
         print(f"{'PASS' if ok else 'FAIL'}  coupling_shell_plate (rigid coupling on S8R nodes): RP "
               f"displacement ({us[0]:+.4f}, {us[1]:+.4f}, {us[2]:+.4f}) vs the solid *Rigid Body "
@@ -4632,7 +4643,7 @@ def main():
                 failures += 1
                 continue
             scale = max(abs(x) for v in ue.values() for x in v)
-            err = max(abs(a - b) for n in ue for a, b in zip(ud[n], ue[n])) / scale
+            err = ccx_ratio(max(abs(a - b) for n in ue for a, b in zip(ud[n], ue[n])), scale)
             ok = err < 1e-6
             print(f"{'PASS' if ok else 'FAIL'}  {name} ({label}, per-element *DISTRIBUTION "
                   f"orientation): {len(ue)} node displacements vs one *ORIENTATION per element, "
@@ -4665,7 +4676,7 @@ def main():
         return u
 
     def rel(a, b):
-        return abs(a - b) / abs(b)
+        return ccx_ratio(abs(a - b), abs(b))
 
     ei = 1.0e5 * 4.0 / 3.0                                      # E I of the 2 x 2 section
     u = solve("mpc_beam_lever", nodes=(21, 100, 221, 400))
@@ -4787,8 +4798,8 @@ def main():
         conn = {"mpc_pin_tie_joints": joints, "mpc_beam_lever": lever, "mpc_link": link}[name]
         ref, got = solve(name, subs, nodes), solve(name, conn + subs, nodes)
         if ref and got:
-            err = max(abs(a - b) for n in nodes for a, b in zip(ref[n], got[n])) / \
-                max(abs(a) for n in nodes for a in ref[n])
+            err = ccx_ratio(max(abs(a - b) for n in nodes for a, b in zip(ref[n], got[n])),
+                            max(abs(a) for n in nodes for a in ref[n]))
             ok = err < 1e-6
             print(f"{'PASS' if ok else 'FAIL'}  {name} as connectors ({label}): matches the *MPC "
                   f"version to {err:.1e} of |u|")
@@ -4841,9 +4852,10 @@ def main():
         phi = math.atan2(_dot(e1, _cross(p0, p1)), _dot(p0, p1))
         # (ccx converges the rigid-body MPCs to ~1e-5 of |u|; a linearised hinge would be off
         # by the order of |u| at this angle)
-        miss = max(abs(q + a - b - c) for n, x in pts.items()
-                   for q, a, b, c in zip(x3, _rotate([p - q for p, q in zip(x, x3)], e1, phi),
-                                         x, u[n])) / max(abs(c) for n in pts for c in u[n])
+        miss = ccx_ratio(max(abs(q + a - b - c) for n, x in pts.items()
+                             for q, a, b, c in zip(x3, _rotate([p - q for p, q in zip(x, x3)], e1, phi),
+                                                   x, u[n])),
+                         max(abs(c) for n in pts for c in u[n]))
         ok = miss < 1e-4 and max(abs(c) for c in u[3]) < 1e-12 and rel(phi, phi_ref) < 0.005
         print(f"{'PASS' if ok else 'FAIL'}  connector_ground_hinge, NLGEOM (HINGE to ground): body "
               f"turned {math.degrees(phi):.2f} deg about the axis (statics {math.degrees(phi_ref):.2f}),"
@@ -4888,7 +4900,7 @@ def main():
             refs = [("beam tip", beam[1], 2 * pl3_3ei), ("plate tip (prescribed)", plate[1], 2.0)]
         else:                               # step 2: the prop removed, the plate as in step 1
             refs = [("beam tip", beam[1], pl3_3ei), ("plate tip (step 1)", plate[1], plate[0])]
-        diffs = [abs(v - ref) / abs(ref) for _, v, ref in refs]
+        diffs = [ccx_ratio(abs(v - ref), abs(ref)) for _, v, ref in refs]
         ok = diffs[0] < 0.02 and diffs[1] < 1e-4
         print(f"{'PASS' if ok else 'FAIL'}  {name}: step 2 " + ", ".join(
             f"{label} {v:+.4f} (expected {ref:+.4f}, {diff * 100:.2f}% diff)"
@@ -5334,7 +5346,7 @@ def main():
             failures += 1
             continue
         scale = max(abs(x) for v in u[1].values() for x in v)
-        err = max(abs(a - b) for n in u[1] for a, b in zip(u[0][n], u[1][n])) / scale
+        err = ccx_ratio(max(abs(a - b) for n in u[1] for a, b in zip(u[0][n], u[1][n])), scale)
         ok = err <= 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  {name} with *TRANSFORM ({how}): u at {len(u[1])} nodes "
               f"differs from the model without it by {err:.1e} of max |u| ({scale:.4g})")
@@ -5437,7 +5449,7 @@ def main():
         failures += 1
     else:
         scale = max(abs(x) for v in u[1].values() for x in v)
-        err = max(abs(a - b) for n in u[1] for a, b in zip(u[0][n], u[1][n])) / scale
+        err = ccx_ratio(max(abs(a - b) for n in u[1] for a, b in zip(u[0][n], u[1][n])), scale)
         ok = err <= 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  transform_spherical_rigid (spherical *TRANSFORM, rigid body "
               f"with a cylindrical one on its reference point): u at {len(u[1])} nodes differs from "
@@ -5507,7 +5519,7 @@ def main():
         if turn:
             u[1] = {n: turn(v) for n, v in u[1].items()}
         scale = max(abs(x) for v in u[1].values() for x in v)
-        err = max(abs(p - q) for n in u[1] for p, q in zip(u[0][n], u[1][n])) / scale
+        err = ccx_ratio(max(abs(p - q) for n in u[1] for p, q in zip(u[0][n], u[1][n])), scale)
         ok = err <= tol
         print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes differs from the "
               f"{'rigidly rotated ' if turn else ''}model without the *TRANSFORM by {err:.1e} of "
@@ -5643,7 +5655,7 @@ def main():
             print(f"FAIL  {label}: no displacements to compare")
             return 1
         scale = max(math.hypot(*v) for v in u[1].values())
-        err = max(math.dist(u[0][n], u[1][n]) for n in u[1]) / scale
+        err = ccx_ratio(max(math.dist(u[0][n], u[1][n]) for n in u[1]), scale)
         ok = lo <= err <= hi and scale >= moved and flagged == [lo > 0, False]
         print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes {err:.2e} of max |u| "
               f"({scale:.4g}) off the elastic twin's linear step (expected {lo:g}-{hi:g}); "
@@ -5952,8 +5964,8 @@ def main():
                 lam -= (1000.0 * (lam ** 2 - 1) / 2 - t / lam) / (1000.0 * lam + t / lam ** 2)
             return 3.0 * (lam - 1)
         dev_t = max(abs(t - w) for (t, _), w in zip(disp + stress, want + want))
-        dev_u = max(abs(v[n][0] / bar_ux(t) - 1) for t, v in disp for n in (13, 14, 15, 16))
-        dev_s = max(abs(s[0] / t - 1) for t, v in stress for s in v.values())
+        dev_u = max(abs(ccx_ratio(v[n][0], bar_ux(t)) - 1) for t, v in disp for n in (13, 14, 15, 16))
+        dev_s = max(abs(ccx_ratio(s[0], t) - 1) for t, v in stress for s in v.values())
         ok = dev_t < 1e-9 and dev_u < 1e-5 and dev_s < 1e-4
         print(f"{'PASS' if ok else 'FAIL'}  output_two_time_intervals (*OUTPUT every 0.3 and every "
               f"0.2): .frd U and S at t = {', '.join(f'{t:g}' for t, _ in disp)}; tip ux = "
@@ -6126,7 +6138,8 @@ def main():
     nodes = [n for n in range(1, 100) if n in res["kinematic"] and n in res["rigid"]]
     if len(nodes) == 99:
         scale = max(abs(x) for n in nodes for x in res["rigid"][n])
-        err = max(abs(a - b) for n in nodes for a, b in zip(res["kinematic"][n], res["rigid"][n])) / scale
+        err = ccx_ratio(max(abs(a - b) for n in nodes for a, b in zip(res["kinematic"][n], res["rigid"][n])),
+                        scale)
         ok = err < 1e-6 and scale > 1e-3
         print(f"{'PASS' if ok else 'FAIL'}  kinematic_all_dofs (bare *KINEMATIC -> '1, 3'): 99 node "
               f"displacements vs *RIGID BODY, max difference {err:.1e} of max |u| {scale:.4f}")
@@ -6152,7 +6165,7 @@ def main():
     ua, uf = res["assembly_rotated_instances"], res["assembly_rotated_instances_flat"]
     if len(uf) == 40 and set(ua) == set(uf):
         scale = max(abs(x) for v in uf.values() for x in v)
-        err = max(abs(a - b) for n in uf for a, b in zip(ua[n], uf[n])) / scale
+        err = ccx_ratio(max(abs(a - b) for n in uf for a, b in zip(ua[n], uf[n])), scale)
         cerr = max(abs(a - b) for n in uf for a, b in zip(xyz["assembly_rotated_instances"][n],
                                                           xyz["assembly_rotated_instances_flat"][n]))
         ok = err < 1e-6 and cerr < 1e-9
@@ -6181,7 +6194,7 @@ def main():
         shutil.rmtree(d, ignore_errors=True)
         if len(uf) == 40 and set(un) == set(uf):
             scale = max(abs(x) for v in uf.values() for x in v)
-            err = max(abs(a - b) for n in uf for a, b in zip(un[n], uf[n])) / scale
+            err = ccx_ratio(max(abs(a - b) for n in uf for a, b in zip(un[n], uf[n])), scale)
             ok = text != src and err < 1e-6
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (the part's orientation by nodes {line}): "
                   f"displacements max difference {err:.1e} of max |u| from the model written flat")
@@ -6224,7 +6237,7 @@ def main():
     got = pretension_closures(pretension_beam_deck(), "pretension_element_set", (99,))
     ref = pretension_closures(pretension_beam_deck("1", "99"), "pretension_element_set_ref", (99,))
     if got and ref:
-        ok = abs(got[0] / ref[0] - 1) < 1e-9 and abs(got[0] / want - 1) < 1e-6
+        ok = abs(ccx_ratio(got[0], ref[0]) - 1) < 1e-9 and abs(got[0] / want - 1) < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  pretension_element_set (a B31 bolt whose *PRE-TENSION SECTION "
               f"names its cut element and node by one-member sets): closure {got[0]:.7g} vs {ref[0]:.7g} "
               f"with ELEMENT=1, NODE=99 and F L / E A = {want:.7g} (the set names stop ccx; ccx's own "
@@ -6382,8 +6395,8 @@ def main():
             continue
         big = max(abs(x) for n in xyz for x in ref[n])
         ur = motion_w(ref)[0]
-        err = max(max(abs(a - b) for n in xyz for a, b in zip(got[n], ref[n])),
-                  max(abs(a - b) for a, b in zip(got[100], ur))) / big
+        err = ccx_ratio(max(max(abs(a - b) for n in xyz for a, b in zip(got[n], ref[n])),
+                            max(abs(a - b) for a, b in zip(got[100], ur))), big)
         ok = err < 1e-5
         print(f"{'PASS' if ok else 'FAIL'}  {tag} (a force and a moment on the reference node of a block's top "
               + {"distributing_rp_loads": "face", "distributing_node_surface_weights": "nodes as a node surface "
@@ -6410,7 +6423,7 @@ def main():
     ok = bool(u) and set(u) == set(ref) and all(n in u for n in top)
     if ok:
         face = max(abs(x) for n in top for x in ref[n])
-        err = max(abs(a - b) for n in ref for a, b in zip(u[n], ref[n])) / face
+        err = ccx_ratio(max(abs(a - b) for n in ref for a, b in zip(u[n], ref[n])), face)
         lost = "*DISTRIBUTING WEIGHTING METHOD ignored by ccx's card"
         ok = err == 0.0 and face > 1e-4 and lost in red and lost not in red0
         print(f"{'PASS' if ok else 'FAIL'}  distributing_weighting_nlgeom_card (the block's top face, WEIGHTING "
@@ -6442,8 +6455,8 @@ def main():
         ur, th = motion(a)
         want = [ur[k] + (th[1] * arm[2] - th[2] * arm[1], th[2] * arm[0] - th[0] * arm[2],
                          th[0] * arm[1] - th[1] * arm[0])[k] + c[101][k] for k in range(3)]
-        err = max(abs(a[n][k] - b[n][k]) for n in list(xyz) + [100] for k in range(3)) / big
-        err_tip = max(abs(x - y) for x, y in zip(a[101], want)) / max(abs(x) for x in want)
+        err = ccx_ratio(max(abs(a[n][k] - b[n][k]) for n in list(xyz) + [100] for k in range(3)), big)
+        err_tip = ccx_ratio(max(abs(x - y) for x, y in zip(a[101], want)), max(abs(x) for x in want))
         ok = err < 1e-5 and err_tip < 1e-5
         print(f"{'PASS' if ok else 'FAIL'}  distributing_beam_rp (a B31 cantilever from the reference node, its "
               f"tip loaded): the block and the node {err:.1e} of max |u| from the same force and its moment on "
@@ -6497,7 +6510,7 @@ def main():
               f"for elements {sorted(duct)}")
         failures += 1
     else:
-        ratio = duct[2] / peeq[2]
+        ratio = ccx_ratio(duct[2], peeq[2])
         same = peeq == peeq0 and u1 == u0
         ok = abs(ratio * eps_f - 1) < 1e-5 and duct[1] == 0.0 and peeq[1] > 0.0 and same
         print(f"{'PASS' if ok else 'FAIL'}  damage_johnson_cook_cubes (*DAMAGE INITIATION, "
@@ -6547,12 +6560,12 @@ def main():
                 failures += 1
         if all(g["status"] == "solved" and g["ref"] for g in got.values()):
             fa, fb = got["elements"]["ref"][-1][1][0][k], got["analytic"]["ref"][-1][1][0][k]
-            du, scale = rows_diff(got["analytic"]["top"][-1][1], got["elements"]["top"][-1][1])
-            ok = abs(fa / ref - 1) < 1e-5 and abs(fb / ref - 1) < 1e-5 and du <= 1e-6 * scale
+            apart = ccx_ratio(*rows_diff(got["analytic"]["top"][-1][1], got["elements"]["top"][-1][1]))
+            ok = abs(fa / ref - 1) < 1e-5 and abs(fb / ref - 1) < 1e-5 and apart <= 1e-6
             tools = ("R3D4", "CYLINDER") if dim == "3d" else ("R2D2", "SEGMENTS")
             print(f"{'PASS' if ok else 'FAIL'}  rigid_punch ({dim}, face-to-face): reaction {fa:+.6f} "
                   f"({tools[0]} skins), {fb:+.6f} ({tools[1]} analytical surface) vs A d / (L/E' + "
-                  f"1/K) = {ref:+.6f}; block top {du / scale:.1e} apart")
+                  f"1/K) = {ref:+.6f}; block top {apart:.1e} apart")
             failures += 0 if ok else 1
     # axisymmetric (node-to-surface; ccx's face-to-face one is uneven at a punch edge, with a
     # prescribed punch too): RAX2 skins and a SEGMENTS surface against a prescribed CAX4 punch
@@ -6568,8 +6581,8 @@ def main():
         forces = [got[t]["ref"][-1][1][0][1] for t in ("elements", "analytic")]
         sc = errs[0][1]                                  # the block top under the prescribed punch
         ok = sc > 0.5 * dd and all(du <= 1e-6 * sc for du, _ in errs) and \
-            all(abs(f / fp - 1) < 1e-5 for f in forces)
-        apart = max(du / s if s else math.inf for du, s in errs)
+            all(abs(ccx_ratio(f, fp) - 1) < 1e-5 for f in forces)
+        apart = max(ccx_ratio(du, s) for du, s in errs)
         print(f"{'PASS' if ok else 'FAIL'}  rigid_punch (axisymmetric, node-to-surface): RAX2 skins and a "
               f"SEGMENTS surface move the block as the prescribed punch does ({apart:.1e} apart; the "
               f"block top moved {sc / dd:.3f} d); reactions {forces[0]:+.6f}, {forces[1]:+.6f} vs "
@@ -6584,7 +6597,7 @@ def main():
             failures += 1
             continue
         errs = [rows_diff(got[t]["top"][-1][1], got["prescribed"]["top"][-1][1]) for t in ("elements", "analytic")]
-        worst = max(du / sc for du, sc in errs)
+        worst = max(ccx_ratio(du, sc) for du, sc in errs)
         ok = worst < 1e-5
         print(f"{'PASS' if ok else 'FAIL'}  rigid_punch_tilt ({dim}, NLGEOM, turned {th:g} rad): rigid skins and "
               f"the analytical surface vs the punch given the exact motion: block top {worst:.1e} of |u| apart")
@@ -6596,7 +6609,7 @@ def main():
         failures += 1
     else:
         errs = [rows_diff(got[t]["mid"][-1][1], got["prescribed"]["mid"][-1][1]) for t in ("elements", "analytic")]
-        worst = max(du / sc for du, sc in errs)
+        worst = max(ccx_ratio(du, sc) for du, sc in errs)
         ok = worst < 1e-5
         print(f"{'PASS' if ok else 'FAIL'}  rigid_tie (*TIE to a rigid plate turned 0.05 rad, NLGEOM): block "
               f"mid-height {worst:.1e} of |u| from the top given the exact motion (ccx's own tie: 1.3e-2)")
@@ -6647,10 +6660,11 @@ def main():
     else:
         du, sc = rows_diff(r["top"][-1][1], ref_run["top"][-1][1])
         f_s, f_p = r["ref"][-1][1][0][1], sum(row[1] for row in ref_run["tool"][-1][1])
-        ok = sc > 0.5 * dd and du <= 1e-6 * sc and abs(f_s / f_p - 1) < 1e-5
+        apart = ccx_ratio(du, sc)
+        ok = sc > 0.5 * dd and apart <= 1e-6 and abs(ccx_ratio(f_s, f_p) - 1) < 1e-5
         print(f"{'PASS' if ok else 'FAIL'}  rigid_punch_explicit (planar, R2D2 skins): maximum increment "
               f"{cap:g} set by the converter (ccx's own estimate leaves this contact out); block top "
-              f"{du / sc if sc else math.inf:.1e} of |u| from the punch given its motion node by node "
+              f"{apart:.1e} of |u| from the punch given its motion node by node "
               f"at that increment (it moved {sc / dd:.3f} d), reaction {f_s:+.6f} vs {f_p:+.6f}")
         failures += 0 if ok else 1
     # pressure on rigid elements: positive along the element normal; an R2D2 per unit depth
@@ -6791,7 +6805,7 @@ def main():
     if len(stacked) == 2:
         a, b = stacked[3], stacked[1]
         scale = max(abs(x) for v in a.values() for x in v)
-        err = max(abs(x - y) for nd in a for x, y in zip(a[nd], b.get(nd, (math.inf,) * 3))) / scale
+        err = ccx_ratio(max(abs(x - y) for nd in a for x, y in zip(a[nd], b.get(nd, (math.inf,) * 3))), scale)
         ok = set(a) == set(b) and err < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  composite_plate_sc8r (STACK DIRECTION=1 on renumbered "
               f"elements, top-face load P4): {len(b)} centre displacements vs STACK DIRECTION=3, max "
@@ -6854,7 +6868,7 @@ def main():
             continue
         ur[rot] = (u[0] + u[1]) / math.sqrt(2.0)          # the probe node is at 45 degrees
     if len(ur) == 2:
-        err, same = abs(ur[""] / hoop - 1), abs(ur["3, 25."] / ur[""] - 1)
+        err, same = abs(ur[""] / hoop - 1), abs(ccx_ratio(ur["3, 25."], ur[""]) - 1)
         ok = err < 0.01 and same < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  cylinder_hoop (S4, cylindrical *ORIENTATION on a cylinder, "
               f"internal pressure): radial displacement {ur['']:.6g} vs thin-wall theory with the "
@@ -7032,7 +7046,7 @@ def main():
     else:
         u, t = runs
         moved = max(abs(x) for v in t.values() for x in v)
-        err = max(abs(x - y) for n in t for x, y in zip(u.get(n, [math.inf] * 3), t[n])) / moved
+        err = ccx_ratio(max(abs(x - y) for n in t for x, y in zip(u.get(n, [math.inf] * 3), t[n])), moved)
         lame = [(1.3 / 3000.0 * (0.4 * r + 4.0 / r), sum(u.get(n, [math.inf] * 2)[:2]) / math.sqrt(2.0))
                 for n, r in ((41, 1.0), (45, 2.0))]
         off = max(abs(got / want - 1) for want, got in lame)
@@ -7123,7 +7137,8 @@ def main():
             if u is None:
                 failures += 1
                 continue
-            err = max(abs(x - y) for n in ref for x, y in zip(u.get(n, [math.inf] * 3), ref[n])) / scale
+            err = ccx_ratio(max(abs(x - y) for n in ref for x, y in zip(u.get(n, [math.inf] * 3), ref[n])),
+                            scale)
             ok = err < 1e-9
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (four {typ} past yield, a {ori} *Orientation): "
                   f"displacements {err:.1e} of the largest {scale:.4g} off the bar without one")
@@ -7259,7 +7274,7 @@ def main():
             failures += 1
             continue
         got, want = res[0].get(probe, [math.inf])[0], ref[0].get(ref_probe, [math.nan])[0]
-        err = abs(got / want - 1)
+        err = abs(ccx_ratio(got, want) - 1)
         ok = err < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({typ} skin {'tied by a *CONTACT PAIR, TIED' if pair else 'tied'} "
               f"by its {face} face to a block, no position tolerance): end displacement {got:.7g} vs "
@@ -7285,7 +7300,7 @@ def main():
             print(f"FAIL  {tag}: no frequencies ({status})")
             failures += 1
             continue
-        err = max(abs(a / b - 1) for a, b in zip(freqs[0][:3], freqs[1][:3]))
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(freqs[0][:3], freqs[1][:3]))
         ok = err < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({typ} strip, material density 7, thickness 0.01, "
               f"section DENSITY=2): first frequencies {', '.join(f'{x:.6g}' for x in freqs[0][:3])} vs "
@@ -7319,7 +7334,8 @@ def main():
             ref = u
             continue
         scale = max(abs(x) for v in ref.values() for x in v)
-        err = max(abs(x - y) for nd in ref for x, y in zip(ref[nd], u.get(nd, (math.inf,) * 3))) / scale
+        err = ccx_ratio(max(abs(x - y) for nd in ref for x, y in zip(ref[nd], u.get(nd, (math.inf,) * 3))),
+                        scale)
         ok = set(u) == set(ref) and err < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  distribution_panel_{plane}_{tilt:g} (composite S8R, "
               f"*DISTRIBUTION orientation with b {tilt:g} deg out of the plate, {plane} plane): "
@@ -7352,7 +7368,7 @@ def main():
     if all(tips):
         got, want = tips[0].get(11, [0.0, math.inf])[1], tips[1].get(11, [0.0, math.nan])[1]
         off = max(abs(v[2]) for v in tips[0].values())
-        err = abs(got / want - 1)
+        err = abs(ccx_ratio(got, want) - 1)
         ok = err < 1e-4 and off < 1e-9 * abs(want)
         print(f"{'PASS' if ok else 'FAIL'}  planar_coupled_tip (B21 cantilever, its tip coupled by "
               f"*COUPLING, *KINEMATIC to the loaded reference node): tip deflection {got:.7g} vs "
@@ -7380,7 +7396,7 @@ def main():
                           lambda dat: dat_displacement_history(dat, 5))
         ok = bool(hist) and len(hist) == 4
         if ok:
-            got = [h[2] / hist[-1][2] for h in hist]
+            got = [ccx_ratio(h[2], hist[-1][2]) for h in hist]
             ok = max(abs(g - w) for g, w in zip(got, want)) < 1e-5
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a cube pulled through *AMPLITUDE, DEFINITION="
                   f"{definition}, rising from total time 100 to 100.0002): displacement after each "
@@ -7424,11 +7440,13 @@ def main():
         if ok:
             offs = (0, 100) if kw.get("part") else (0,)        # I2's nodes
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n + o, (math.inf,) * 3), ref[n]) for n in ref for o in offs) / scale
-            mid = min(math.hypot(*u.get(n + o, (0.0,) * 3)) for n in (5, 6, 7, 8) for o in offs) / scale
+            err = ccx_ratio(max(math.dist(u.get(n + o, (math.inf,) * 3), ref[n]) for n in ref for o in offs),
+                            scale)
+            mid = ccx_ratio(min(math.hypot(*u.get(n + o, (0.0,) * 3)) for n in (5, 6, 7, 8) for o in offs),
+                            scale)
             # (the member BC: Abaqus does not apply it, and the converter drops it; ccx kept
             # it, holding node 9 at u3 = 0, where it follows the coupling to -0.15)
-            held = abs(u.get(9, (0.0,) * 3)[2]) / scale
+            held = ccx_ratio(abs(u.get(9, (0.0,) * 3)[2]), scale)
             ok = err < 1e-3 and mid > 0.2 and (held > 0.1 or "member_bc" not in kw)
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a column's top face kinematically coupled "
                   f"({kw.get('dofs', '1, 3')}) to a node that moves and turns over a slow "
@@ -7461,9 +7479,9 @@ def main():
                     return [u0[0] + th[1] * p[2] - th[2] * p[1], u0[1] + th[2] * p[0] - th[0] * p[2],
                             u0[2] + th[0] * p[1] - th[1] * p[0]]
                 scale = max(math.hypot(*v) for v in ref.values())
-                err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-                held = max(math.dist(u[n], rigid(n)) for n in INFLUENCE_KEPT[surface]) / scale
-                free = min(math.dist(u[n], rigid(n)) for n in (26, 30, 46, 50)) / scale
+                err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+                held = ccx_ratio(max(math.dist(u[n], rigid(n)) for n in INFLUENCE_KEPT[surface]), scale)
+                free = ccx_ratio(min(math.dist(u[n], rigid(n)) for n in (26, 30, 46, 50)), scale)
                 ok = err < 1e-3 and held < 1e-9 and free > 0.1
                 print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top {surface} surface coupled "
                       f"to a node above its centre within an INFLUENCE RADIUS of 0.8, the node moving "
@@ -7488,8 +7506,8 @@ def main():
         if ok:
             back = {n: [sum(ROT_FRAME[k][i] * v[k] for k in range(3)) for i in range(3)] for n, v in ref.items()}
             scale = max(math.hypot(*v) for v in back.values())
-            err = max(math.dist(u[n], back[n]) for n in back) / scale
-            moved = min(math.hypot(*u[n]) for n in (2, 3, 4, 12, 13, 14)) / scale
+            err = ccx_ratio(max(math.dist(u[n], back[n]) for n in back), scale)
+            moved = ccx_ratio(min(math.hypot(*u[n]) for n in (2, 3, 4, 12, 13, 14)), scale)
             ok = err < 1e-3 and moved > 0.05
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a shell strip's tip edge coupled in DOFs 1-5 "
                   f"of an oblique *ORIENTATION" + (", a *KINEMATIC COUPLING card" if legacy else "") +
@@ -7521,8 +7539,8 @@ def main():
         ok = bool(u) and set(ref) == set(range(1, 19)) | {100}
         if ok:
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-            free = abs(u[18][2]) / scale
+            err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+            free = ccx_ratio(abs(u[18][2]), scale)
             ok = err < (1e-9 if proc == "static" else 1e-3) and free > 0.05
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled along local axis 1 "
                   f"of an *ORIENTATION turned 90 degrees, global y, to a node moving over a slow {proc} "
@@ -7542,9 +7560,9 @@ def main():
             e1, e2 = (c, s_, 0.), (-s_, c, 0.)
             scale = max(math.hypot(*v) for v in u.values())
             rel = {n: [u[n][k] - u[100][k] for k in range(3)] for n in range(10, 19)}
-            tie = max(abs(_dot(e1, rel[n])) for n in rel) / scale
-            held = abs(u[10][1] - u[11][2] if extra else u[10][0] - 0.01) / scale
-            free = max(abs(_dot(e2, rel[n])) for n in rel) / scale
+            tie = ccx_ratio(max(abs(_dot(e1, rel[n])) for n in rel), scale)
+            held = ccx_ratio(abs(u[10][1] - u[11][2] if extra else u[10][0] - 0.01), scale)
+            free = ccx_ratio(max(abs(_dot(e2, rel[n])) for n in rel), scale)
             ok = tie < 1e-5 and held < 1e-5 and free > 0.01       # (the .dat's 7 digits: 2e-7)
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled along local axis 1 of "
                   f"an *ORIENTATION turned {deg:g} degrees about z, to a node moving over a slow {proc} "
@@ -7572,9 +7590,9 @@ def main():
         if ok:
             scale = max(math.hypot(*v) for v in u.values())
             rel = {n: [u[n][k] - u[100][k] for k in range(3)] for n in range(10, 19)}
-            tie = max(abs(_dot(e, rel[n])) for n in rel for e in coupled) / scale
-            held = abs(u[10][bc - 1] - 0.01) / scale
-            free = max(abs(_dot(axes[2 if len(coupled) == 2 else 1], rel[n])) for n in rel) / scale
+            tie = ccx_ratio(max(abs(_dot(e, rel[n])) for n in rel for e in coupled), scale)
+            held = ccx_ratio(abs(u[10][bc - 1] - 0.01), scale)
+            free = ccx_ratio(max(abs(_dot(axes[2 if len(coupled) == 2 else 1], rel[n])) for n in rel), scale)
             ok = tie < 1e-5 and held < 1e-5 and free > 0.01       # (the .dat's 7 digits)
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled along "
                   f"{'one axis' if len(coupled) == 1 else 'two axes'} of an *ORIENTATION, a corner's BC on "
@@ -7593,9 +7611,9 @@ def main():
         ok = bool(u) and set(ref) == set(range(1, 51))
         if ok:
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-            moved = min(math.hypot(*u[n]) for ns in SEVERAL_KEPT.values() for n in ns) / scale
-            free = math.hypot(*u[38]) / scale
+            err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+            moved = ccx_ratio(min(math.hypot(*u[n]) for ns in SEVERAL_KEPT.values() for n in ns), scale)
+            free = ccx_ratio(math.hypot(*u[38]), scale)
             ok = err < (1e-9 if proc == "static" else 1e-3) and moved > 0.3 and free > 0.01
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled to the two reference "
                   f"nodes of a node set with an INFLUENCE RADIUS, each moving and turning its own way "
@@ -7617,8 +7635,8 @@ def main():
             ok = bool(u) and set(ref) == set(range(1, 51))
             if ok:
                 scale = max(math.hypot(*v) for v in ref.values())
-                err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-                moved = min(math.hypot(*u[n]) for n in near) / scale
+                err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+                moved = ccx_ratio(min(math.hypot(*u[n]) for n in near), scale)
                 ok = err < (1e-9 if proc == "static" else 1e-3) and moved > 0.3
                 print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face coupled to a node with an "
                       f"INFLUENCE RADIUS that " + ("cuts the first facet, no node within it" if case ==
@@ -7648,8 +7666,8 @@ def main():
         ok = bool(u) and set(ref) == set(range(1, 51))
         if ok:
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-            corners = min(math.hypot(*u[n]) for n in (26, 30, 46, 50)) / scale
+            err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+            corners = ccx_ratio(min(math.hypot(*u[n]) for n in (26, 30, 46, 50)), scale)
             ok = err < 1e-9 and scale > 1e-3
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a block's top face distributing-coupled to a "
                   f"node with an INFLUENCE RADIUS that " + ("cuts the four facets around the centre "
@@ -7682,8 +7700,8 @@ def main():
         ok = bool(u) and bool(ref) and all(n in ref for n in free)
         if ok:
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-            moved = min(math.hypot(*u.get(n, (0.0,) * 3)) for n in free) / scale
+            err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+            moved = ccx_ratio(min(math.hypot(*u.get(n, (0.0,) * 3)) for n in free), scale)
             ok = err < 1e-3 and moved > 0.1
             what = {"mpc": "*MPC BEAM lines on solid", "transformed": "a *RIGID BODY on transformed "
                     "solid", "pin": "a *RIGID BODY, PIN NSET on shell"}.get(member, f"a *RIGID BODY on {member}")
@@ -7711,8 +7729,8 @@ def main():
         ok = bool(u) and bool(ref) and all(n in ref for n in free)
         if ok:
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-            moved = min(math.hypot(*u.get(n, (0.0,) * 3)) for n in free) / scale
+            err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+            moved = ccx_ratio(min(math.hypot(*u.get(n, (0.0,) * 3)) for n in free), scale)
             yielded = max(peeq.values(), default=0.0)
             ok = err < 1e-3 and moved > 0.1 and (yielded > 1e-3 or case not in ("plastic", "kinematic"))
             what = {"plastic": "a *RIGID BODY on a plastic column (PEEQ up to {:.3f}), fixed increments",
@@ -7748,8 +7766,8 @@ def main():
         ok = bool(u) and bool(ref) and all(n in ref for n in free)
         if ok:
             scale = max(math.hypot(*v) for v in ref.values())
-            err = max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref) / scale
-            moved = min(math.hypot(*ref[n]) for n in free) / scale
+            err = ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in ref), scale)
+            moved = ccx_ratio(min(math.hypot(*ref[n]) for n in free), scale)
             ok = err < 1e-9 and moved > 0.1
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}; a *STATIC step with a *PLASTIC never "
                   f"reached, driven by a node that moves and turns): {len(ref)} node displacements, "
@@ -7914,9 +7932,9 @@ def main():
             later = [(t, e) for t, e in kin if half * 1.0001 < t <= 2.0001 * half]
             first = [(t, e) for t, e in kin if t <= half * 1.0001]
             if last == "dynamic":
-                err = max((abs(e - 500.0 * amp ** 2 * math.sin(100.0 * (t - half)) ** 2) / (500.0 * amp ** 2)
-                           for t, e in later), default=math.inf)
-                swing = max((abs(u / amp - math.cos(100.0 * (t - half))) for t, u in disp
+                err = max((ccx_ratio(abs(e - 500.0 * amp ** 2 * math.sin(100.0 * (t - half)) ** 2),
+                                     500.0 * amp ** 2) for t, e in later), default=math.inf)
+                swing = max((abs(ccx_ratio(u, amp) - math.cos(100.0 * (t - half))) for t, u in disp
                              if half * 1.0001 < t <= 2.0001 * half), default=math.inf)
                 ok = (len(later) >= 20 and bool(first) and err < 1e-2 and swing < 1e-2 and ferr < 1e-6
                       and abs(amp / 2e-3 - 1.0) < 1e-2)
@@ -7944,7 +7962,7 @@ def main():
         stats, rf = res
         cfn = stats[-1][0][2] if stats and stats[-1] else math.nan
         ref = rf[-1][1][0][2] if rf and rf[-1][1] else math.nan
-        ok = abs(ref) > 0.0 and abs(cfn / ref - 1.0) < 1e-6
+        ok = abs(ccx_ratio(cfn, ref) - 1.0) < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  contact_print_cfn (a rigid flat punch pressed by 0.01, "
               f"*CONTACT PRINT CFN, CPRESS for every pair): total normal contact force {cfn:.7g} vs "
               f"the punch's reference-node force {ref:.7g} (before: ccx stopped reading the card)")
@@ -7954,7 +7972,7 @@ def main():
                          dat_displacements) for sym in (True, False)]
     if all(strips):
         got, want = strips[0].get(15, [0.0, 0.0, math.inf])[2], strips[1].get(15, [0.0, 0.0, math.nan])[2]
-        err = abs(got / want - 1)
+        err = abs(ccx_ratio(got, want) - 1)
         ok = err < 1e-9
         print(f"{'PASS' if ok else 'FAIL'}  rigid_tie_symmetric_layup (a composite S4R strip [0/90]s "
               f"tied to a clamped rigid plate under its first element, POSITION TOLERANCE=0.1): tip "
@@ -8122,7 +8140,7 @@ def main():
             lam = [r[0] for r in runs]
             ok = err < 1e-9 * moved and moved > 1e-3 and (pert == "static" or (
                 len(lam[0]) == len(lam[1]) == 2 and
-                max(abs(a / b - 1) for a, b in zip(*lam)) < 1e-6))
+                max(abs(ccx_ratio(a, b) - 1) for a, b in zip(*lam)) < 1e-6))
             print(f"{'PASS' if ok else 'FAIL'}  pert_moment_{pert} (moments about local 1 and 2 on a "
                   f"B31 frame's joint with an oblique *TRANSFORM, one about local 3 in a {what} step, "
                   f"then the first tripled): every displacement as with the moments in global "
@@ -8197,7 +8215,7 @@ def main():
     ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 3 and \
         len(runs[0][1]) == len(runs[2][1]) == 1
     if ok:
-        f_err = max(abs(a / b - 1) for a, b in zip(runs[0][0], runs[1][0]))
+        f_err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(runs[0][0], runs[1][0]))
         err, moved = same([runs[0][1], runs[2][1]])
         u = runs[0][1][0]
         tie = abs(u.get(12, [0.0, math.inf])[1] - u.get(9, [0.0, math.nan])[1])
@@ -8254,7 +8272,7 @@ def main():
         ok = all(runs) and all(r[0] for r in runs)
         if ok:
             err, moved = same([r[0] for r in runs], -1 if last else None)
-            lam = max((abs(a / b - 1) for a, b in zip(runs[0][1], runs[1][1])), default=math.inf)
+            lam = max((abs(ccx_ratio(a, b) - 1) for a, b in zip(runs[0][1], runs[1][1])), default=math.inf)
             ok = err < 1e-6 * moved and moved > 1e-3 and lam < 1e-9 and \
                 len(runs[0][1]) == len(runs[1][1]) == 4
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {err:.1e} apart, the top moved "
@@ -8310,11 +8328,11 @@ def main():
         ok = all(runs) and all(r[0] and len(r[3]) >= n for r in runs) and len(runs[0][2]) == n
         if ok:
             err, moved = same([r[0] for r in runs])
-            lam = max((abs(a / b - 1) for a, b in zip(runs[0][1], runs[1][1])), default=math.inf)
+            lam = max((abs(ccx_ratio(a, b) - 1) for a, b in zip(runs[0][1], runs[1][1])), default=math.inf)
             rfs = runs[0][3][:1] + runs[0][3][-1:] * (n - 1)
             pairs = [(t[0][2], tot[1][0][2]) for t, tot in zip(runs[0][2], rfs)]
             cfn, rf = pairs[-1]
-            f_err = max(abs(c / -r - 1) for c, r in pairs)
+            f_err = max(abs(ccx_ratio(c, -r) - 1) for c, r in pairs)
             ok = err < 1e-9 * moved and moved > 1e-3 and lam < 1e-9 and f_err < 1e-6 and \
                 len(runs[0][1]) == len(runs[1][1]) == 4
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): total normal contact force "
@@ -8440,7 +8458,7 @@ def main():
     ok = all(runs)
     if ok:
         euler = math.pi ** 2 * 210e9 * 0.1 ** 4 / 12 / 2.0 ** 2
-        err = abs(runs[0][0] / runs[1][0] - 1)
+        err = abs(ccx_ratio(runs[0][0], runs[1][0]) - 1)
         ok = err < 1e-6 and abs(runs[0][0] * 1e6 / euler - 1) < 0.05
         print(f"{'PASS' if ok else 'FAIL'}  buckle_amplitude (a C3D20R column's *BUCKLE step loaded "
               f"by 4e6 on an amplitude of 0.25 at time 0): factor {runs[0][0]:.7g} vs {runs[1][0]:.7g} "
@@ -8456,7 +8474,7 @@ def main():
                                 ("grav", False, "_plain"))]
     ok = all(lam)
     if ok:
-        err = max(abs(lam[k][0] / lam[1][0] - 1) for k in (0, 3))
+        err = max(abs(ccx_ratio(lam[k][0], lam[1][0]) - 1) for k in (0, 3))
         ok = err < 1e-6 and lam[0][0] < 0.8 * lam[2][0]
         print(f"{'PASS' if ok else 'FAIL'}  buckle_gravity_preload (a C3D8 column under gravity in "
               f"a static step, then a *STEP, PERTURBATION *BUCKLE step loaded at its top, and the same "
@@ -8471,8 +8489,8 @@ def main():
     ok = bool(lam and both and ref)
     if ok:
         tip = next(iter(ref))
-        err = max(abs(a - b) for a, b in zip(both[1].get(tip, [math.inf] * 3), ref[tip])) / \
-            max(abs(x) for x in ref[tip])
+        err = ccx_ratio(max(abs(a - b) for a, b in zip(both[1].get(tip, [math.inf] * 3), ref[tip])),
+                        max(abs(x) for x in ref[tip]))
         ok = both[0][0] == lam[0] and err < 1e-9
         print(f"{'PASS' if ok else 'FAIL'}  buckle_self_weight_then_static (the column buckling "
               f"under its weight and the top load in a *STEP, PERTURBATION *BUCKLE step, then a "
@@ -8488,7 +8506,7 @@ def main():
                                   (False, True, "grav", "linear_pert"), (False, False, "", "none"))]
     ok = all(f)
     if ok:
-        err = max(abs(f[0][0] / f[1][0] - 1), abs(f[2][0] / f[3][0] - 1))
+        err = max(abs(ccx_ratio(f[0][0], f[1][0]) - 1), abs(ccx_ratio(f[2][0], f[3][0]) - 1))
         ok = err < 1e-9 and f[0][0] < 0.9 * f[3][0]
         print(f"{'PASS' if ok else 'FAIL'}  frequency_preload (the column under gravity in a static "
               f"step, then a *FREQUENCY step): with NLGEOM, a plain *STEP {f[0][0]:.7g} vs "
@@ -8502,8 +8520,8 @@ def main():
          for h, t0, tag in ((True, 20.0, "heated"), (False, 120.0, "hot"), (False, 20.0, "cold"))]
     ok = all(f)
     if ok:
-        err = max(abs(a / b - 1) for a, b in zip(f[0], f[1]))
-        ratio = f[1][0] / f[2][0]
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(f[0], f[1]))
+        ratio = ccx_ratio(f[1][0], f[2][0])
         ok = len(f[0]) == len(f[1]) == 4 and err < 1e-9 and abs(ratio - math.sqrt(0.5)) < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  frequency_base_temperatures (the column, its E halved from "
               f"20 to 120 degrees, heated to 120 in a static step, then a plain *FREQUENCY step): "
@@ -8518,7 +8536,7 @@ def main():
          for case in ("first", "after", "held", "free")]
     ok = all(f)
     if ok:
-        err = max(abs(a / b - 1) for a, b in zip(f[0], f[1]))
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(f[0], f[1]))
         ok = len(f[0]) == len(f[1]) == 4 and err < 1e-6 and 0.9 * f[2][0] < f[0][0] < f[2][0] and \
             f[0][0] > 1.4 * f[3][0]
         print(f"{'PASS' if ok else 'FAIL'}  frequency_base_contact (the column's top face resting on "
@@ -8539,8 +8557,8 @@ def main():
     ok = bool(both and alone and unloaded) and len(both[0]) == 2
     if ok:
         (pre, plain), tip = both[0], next(iter(both[1].values()), [0.0])
-        err = max(abs(a / b - 1) for a, b in zip(pre, alone[0]))
-        err2 = max(abs(a / b - 1) for a, b in zip(plain, unloaded[0]))
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(pre, alone[0]))
+        err2 = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(plain, unloaded[0]))
         ok = err < 1e-9 and err2 < 1e-9 and pre[0] < 0.9 * plain[0] and abs(tip[0]) > 1e-4
         print(f"{'PASS' if ok else 'FAIL'}  frequency_read_by_modal (the column under gravity with "
               f"NLGEOM, two *FREQUENCY steps, a *MODAL DYNAMIC step): the first {pre[0]:.7g} with "
@@ -8555,8 +8573,8 @@ def main():
          for h, t0, tag in ((True, 20.0, "heated"), (False, 120.0, "hot"), (False, 20.0, "cold"))]
     ok = all(f)
     if ok:
-        err = max(abs(a / b - 1) for a, b in zip(f[0], f[1]))
-        ratio = f[2][0] / f[1][0]
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(f[0], f[1]))
+        ratio = ccx_ratio(f[2][0], f[1][0])
         ok = len(f[0]) == len(f[1]) == 4 and err < 1e-6 and ratio > 1.5
         print(f"{'PASS' if ok else 'FAIL'}  frequency_base_hyperelastic (the column, Neo-Hooke, its C10 "
               f"quartered from 20 to 120 degrees, heated to 120 in a static step, then a plain "
@@ -8580,9 +8598,9 @@ def main():
     ok = bool(over and kept and adj and touch and free and over[0] and adj[0] and kept[0])
     if ok:
         uz = [r[1][2] for r in (over, adj)]
-        err = max(abs(a / b - 1) for a, b in zip(over[0], free))
-        err2 = abs(adj[0][0] / touch[0] - 1)
-        pre = kept[0][0] / touch[0] - 1
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(over[0], free))
+        err2 = abs(ccx_ratio(adj[0][0], touch[0]) - 1)
+        pre = ccx_ratio(kept[0][0], touch[0]) - 1
         ok = err < 1e-9 and err2 < 2e-3 and abs(pre) > 0.01 and uz[0] < -1e-5 and abs(uz[1]) < 1e-9
         print(f"{'PASS' if ok else 'FAIL'}  frequency_base_overclosure (the column's top 5e-4 into "
               f"the plate, an unloaded static step, a *FREQUENCY step): plain {over[0][0]:.7g} as "
@@ -8597,7 +8615,7 @@ def main():
                         eig, approximate=True)
     ok = bool(approx and kept and touch and free and approx[0])
     if ok:
-        err = max(abs(a / b - 1) for a, b in zip(approx[0], kept[0]))
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(approx[0], kept[0]))
         ok = err < 1e-9 and approx[0][0] > 1.4 * free[0] and approx[1][2] < -1e-5
         print(f"{'PASS' if ok else 'FAIL'}  frequency_base_overclosure_approx (as above, "
               f"--approximate): PERTURBATION {approx[0][0]:.7g} ({err:.1e} from the deck's), "
@@ -8611,7 +8629,7 @@ def main():
     touch_s = review_run(frequency_contact_deck("after", pair=s2s), "frequency_base_touching_s2s", eig)
     ok = bool(adj_s and touch_s and free and adj_s[0] and touch_s[0])
     if ok:
-        err = abs(adj_s[0][0] / touch_s[0][0] - 1)
+        err = abs(ccx_ratio(adj_s[0][0], touch_s[0][0]) - 1)
         ok = err < 0.03 and adj_s[0][0] > 1.4 * free[0] and abs(adj_s[1][2]) < 1e-9
         print(f"{'PASS' if ok else 'FAIL'}  frequency_base_overclosure_s2s_adjust (as above, a "
               f"surface-to-surface pair, ADJUST=0.): {adj_s[0][0]:.7g}, {err:.1%} from touching "
@@ -8626,7 +8644,7 @@ def main():
            for m in ("shell", "rigid") for h in ("", ", PERTURBATION")}
     ok = all(res.values()) and all(r[0] for r in res.values()) and bool(free)
     if ok:
-        err = max(abs(a / b - 1) for m in ("shell", "rigid") for a, b in zip(res[(m, "")][0], free))
+        err = max(abs(ccx_ratio(a, b) - 1) for m in ("shell", "rigid") for a, b in zip(res[(m, "")][0], free))
         uz = [res[(m, "")][1][2] for m in ("shell", "rigid")]
         pre = [res[(m, ", PERTURBATION")][0][0] for m in ("shell", "rigid")]
         ok = err < 1e-9 and all(-5e-4 < u < -4e-4 for u in uz) and all(f > 1.4 * free[0] for f in pre)
@@ -8649,7 +8667,7 @@ def main():
                       lambda dat: ((dat_totals(dat) or [None])[-1], dat_displacements(dat)))
     ok = all(hf.values()) and bool(cube) and bool(cube[0])
     if ok:
-        err, err_b = [max(abs(a / b - 1) for a, b in zip(hf[(c, True)], hf[(c, False)]))
+        err, err_b = [max(abs(ccx_ratio(a, b) - 1) for a, b in zip(hf[(c, True)], hf[(c, False)]))
                       for c in ("frequency", "buckle")]
         beta = 0.1 / 0.8
         lat = 0.8 ** (-beta / (1 + 2 * beta))
@@ -8673,8 +8691,8 @@ def main():
     ok = all(b.values()) and all(r[0] for r in b.values())       # (factors read)
     if ok:
         tip = {c: b[c][1] for c in ("pushed", "free_pushed")}
-        err = abs(b["first"][0][0] / b["free"][0][0] - 1)
-        err2 = abs(b["pushed"][0][0] / b["free"][0][0] - 1)      # (the push's prestress)
+        err = abs(ccx_ratio(b["first"][0][0], b["free"][0][0]) - 1)
+        err2 = abs(ccx_ratio(b["pushed"][0][0], b["free"][0][0]) - 1)      # (the push's prestress)
         ok = err < 1e-9 and err2 < 1e-3 and b["held"][0][0] > 2.0 * b["free"][0][0] and \
             0 < tip["pushed"][0] < 0.1 * tip["free_pushed"][0]
         print(f"{'PASS' if ok else 'FAIL'}  buckle_contact (the column with blocks touching two sides "
@@ -8702,15 +8720,15 @@ def main():
     ok = bool(reaction) and all(runs)
     if ok:
         (own, s_own), (tied, _), (pre, s_pre), (ref, s_ref), (none, _) = runs
-        euler = math.pi ** 2 * 210e9 * 0.1 ** 4 / 12 / 2.0 ** 2 / -reaction[2]
-        err = max(abs(own[0] / tied[0] - 1), abs(pre[0] / ref[0] - 1))
+        euler = ccx_ratio(math.pi ** 2 * 210e9 * 0.1 ** 4 / 12 / 2.0 ** 2, -reaction[2])
+        err = max(abs(ccx_ratio(own[0], tied[0]) - 1), abs(ccx_ratio(pre[0], ref[0]) - 1))
         # the buckling load's static solution: a node at mid-height moved by half the push (ccx
         # without the fix: only the top did), and the preloaded column's equals the reference's
         half = sum(1 for u in s_own.values() if abs(u[2] / -0.5e-4 - 1) < 0.01)
         scale = max(abs(u[2]) for u in s_ref.values())
-        apart = max(abs(u[2] - s_ref.get(v, [math.inf] * 3)[2]) for v, u in s_pre.items()) / scale
-        ok = err < 1e-5 and half >= 1 and apart < 1e-6 and scale > 0 and \
-            abs(own[0] / euler - 1) < 0.01 and abs(pre[0] / none[0] - 1) > 0.005
+        apart = ccx_ratio(max(abs(u[2] - s_ref.get(v, [math.inf] * 3)[2]) for v, u in s_pre.items()), scale)
+        ok = err < 1e-5 and half >= 1 and apart < 1e-6 and abs(own[0] / euler - 1) < 0.01 and \
+            0.005 < abs(ccx_ratio(pre[0], none[0]) - 1) < math.inf      # (inf: a zero factor without it)
         print(f"{'PASS' if ok else 'FAIL'}  buckle_displacement (a C3D20R column pushed down 1e-4 at "
               f"its top in a *STEP, PERTURBATION *BUCKLE step, and the same push as a static preload "
               f"before a buckling step loaded at mid-height): factor {own[0]:.7g} vs {tied[0]:.7g} "
@@ -8729,7 +8747,7 @@ def main():
     if ok:
         (lam, s_lam), (own, _) = pushed, runs[0]
         half = sum(1 for u in s_lam.values() if abs(u[2] / -0.5e-4 - 1) < 0.01)
-        ok = abs(lam[0] / own[0] - 1) < 1e-6 and half >= 1
+        ok = abs(ccx_ratio(lam[0], own[0]) - 1) < 1e-6 and half >= 1
         print(f"{'PASS' if ok else 'FAIL'}  buckle_displacement_approximate (the column pushed down "
               f"in a static step and again in a *STEP, PERTURBATION *BUCKLE step, --approximate): "
               f"factor {lam[0]:.7g} vs {own[0]:.7g} pushed without the preload; {half} mid-height "
@@ -8748,8 +8766,8 @@ def main():
     ok = bool(low and high) and len(high) == 4
     if ok:
         true = [x / 150. for x in low]           # the spectrum at the high load
-        nearest = sorted(sorted(true, key=lambda x: abs(1 / x - 1))[:len(high)])
-        err = max(abs(a / b - 1) for a, b in zip(high, nearest))
+        nearest = sorted(sorted(true, key=lambda x: abs(ccx_ratio(1, x) - 1))[:len(high)])
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(high, nearest))
         warned = [A.buckle_factor_warning(x) for x in (low, high)]
         ok = err < 1e-5 and min(high) > 5 * true[0] and low == sorted(low) and \
             warned[1] is not None and warned[0] is None
@@ -8928,7 +8946,7 @@ def main():
              for twin in (False, True)]
     ok = all(f and len(f) >= 3 for f in freqs)
     if ok:
-        err = max(abs(a / b - 1) for a, b in zip(freqs[0][:3], freqs[1][:3]))
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(freqs[0][:3], freqs[1][:3]))
         ok = err < 1e-6
         print(f"{'PASS' if ok else 'FAIL'}  cshell_area_mass_freq (the composite plate, *FREQUENCY): "
               f"first frequencies {', '.join(f'{x:.6g}' for x in freqs[0][:3])} vs "
@@ -8953,8 +8971,9 @@ def main():
         ok = all(r and len(r) == 10 for r in runs)
         if ok:
             end = max(abs(x) for x in runs[1][-1])
-            err = max(abs(x - y) for a, b in zip(*runs) for x, y in zip(a, b)) / end
-            lin = max(abs(x - (k + 1) / 10 * y) for k, a in enumerate(runs[0]) for x, y in zip(a, runs[0][-1])) / end
+            err = ccx_ratio(max(abs(x - y) for a, b in zip(*runs) for x, y in zip(a, b)), end)
+            lin = ccx_ratio(max(abs(x - (k + 1) / 10 * y) for k, a in enumerate(runs[0])
+                                for x, y in zip(a, runs[0][-1])), end)
             ok = err < 1e-6 and lin < 1e-6 and end > 1e-3
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (C3D8T cube heated in a transient *COUPLED "
                   f"TEMPERATURE-DISPLACEMENT step, {what} ramped over 10 increments): every increment "
