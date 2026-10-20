@@ -24256,7 +24256,7 @@ class Converter:
         given = {id(b): self._bc_zero_entries(b) for b in blocks
                  if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2}
         held: Optional[set] = None              # (node, DOF) held at zero in every step
-        for active in bc_steps(blocks, lambda b: given[id(b)], self._pert_idx, self.steps.lc2):
+        for active in self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2, blocks=blocks):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
         self._conn_held = held or set()
