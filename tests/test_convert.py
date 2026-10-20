@@ -12601,6 +12601,22 @@ def test_composite_examples_match_the_validation_decks():
             assert fh.read() == text, f"examples/{name}.inp differs from validate_with_ccx.py's deck"
 
 
+
+def test_material_ends_at_a_gasket_or_connector_behavior():
+    # the cards after *GASKET BEHAVIOR / *CONNECTOR BEHAVIOR are that behaviour's, not the
+    # material's before it: every material walker ends a material there (_material_groups)
+    deck = ("*MATERIAL, NAME=STEEL\n*ELASTIC\n210000., 0.3\n*DENSITY\n7.8e-9\n"
+            "*GASKET BEHAVIOR, NAME=G\n*DENSITY\n1e-12\n"
+            "*CONNECTOR BEHAVIOR, NAME=C\n*ELASTIC, TYPE=ORTHOTROPIC\n1e9, 1e9, 1e9, 1e9, 1e9, 1e9, 1e9, 1e9, 1e9\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL\n")
+    blocks = A.blocks_from_lines(deck.splitlines())
+    conv = A.Converter(A.Report(), Opt())
+    conv._approx = False
+    c = math.sqrt(210000. * 0.7 / (1.3 * 0.4 * 7.8e-9))
+    assert conv._wave_speeds(blocks) == {"STEEL": c}
+    assert conv._all_wave_speeds(blocks) == {"STEEL": c}
+    assert [g[0].uparam("NAME") for g in conv._material_groups(blocks)] == ["STEEL"]
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

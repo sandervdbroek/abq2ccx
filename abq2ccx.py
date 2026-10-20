@@ -5018,8 +5018,7 @@ class Converter:
                 mat = (b.param("NAME") or "").strip()
                 materials.append(mat.upper())
                 continue
-            if kw in ("STEP", "NODE", "ELEMENT", "SURFACE INTERACTION", "CONNECTOR BEHAVIOR",
-                      "GASKET BEHAVIOR") or kw.endswith("SECTION"):
+            if self._ends_material(kw):
                 mat = None
             if mat is not None:
                 self._card_material[id(b)] = mat
@@ -5483,16 +5482,27 @@ class Converter:
         self._reduces("*ELASTIC, TYPE=LAMINA (assumed out-of-plane constants)")
         return [emit_keyword("ELASTIC", params)] + rows
 
-    @staticmethod
-    def _material_groups(blocks: List[Block]) -> List[List[Block]]:
+    # The cards that end a material definition: a material's cards run from its *MATERIAL to
+    # the next of these.  The cards after *SURFACE INTERACTION, *CONNECTOR BEHAVIOR or
+    # *GASKET BEHAVIOR are that behaviour's (an *EXPANSION or *CREEP after *GASKET BEHAVIOR is
+    # the gasket's: Analysis User's Guide, "Defining the gasket behavior directly using a
+    # gasket behavior model"), not the material's before it.
+    _MATERIAL_ENDS = {"MATERIAL", "STEP", "NODE", "ELEMENT", "SURFACE INTERACTION",
+                      "CONNECTOR BEHAVIOR", "GASKET BEHAVIOR"}
+
+    @classmethod
+    def _ends_material(cls, keyword: str) -> bool:
+        """Whether a card ``keyword`` ends the material definition before it."""
+        return keyword in cls._MATERIAL_ENDS or keyword.endswith("SECTION")
+
+    @classmethod
+    def _material_groups(cls, blocks: List[Block]) -> List[List[Block]]:
         """Each *MATERIAL with its cards, which run from the *MATERIAL to the next card that
-        cannot belong to it."""
-        ends = {"MATERIAL", "STEP", "NODE", "ELEMENT", "SURFACE INTERACTION", "CONNECTOR BEHAVIOR",
-                "GASKET BEHAVIOR"}
+        cannot belong to it (_ends_material)."""
         groups: List[List[Block]] = []
         group: List[Block] = []
         for b in blocks:
-            if b.keyword in ends or b.keyword.endswith("SECTION"):
+            if cls._ends_material(b.keyword):
                 if group:
                     groups.append(group)
                 group = [b] if b.keyword == "MATERIAL" else []
@@ -5501,6 +5511,11 @@ class Converter:
         if group:
             groups.append(group)
         return groups
+
+    @classmethod
+    def _material_cards(cls, blocks: List[Block]) -> List[Tuple[str, Block]]:
+        """(upper-case material name, card) for each card of each material (_material_groups)."""
+        return [(g[0].uparam("NAME"), b) for g in cls._material_groups(blocks) for b in g[1:]]
 
     def _expansion_card(self, group: List[Block]) -> Tuple[Optional[str], Optional[Block]]:
         """``("ORTHO" | "ANISO", card)`` when a material's (last) *EXPANSION is orthotropic or
@@ -24070,7 +24085,7 @@ class Converter:
             elif kw == "SURFACE INTERACTION":
                 inter, mat = b.uparam("NAME"), None
                 k_of[inter] = None
-            elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
+            elif self._ends_material(kw):
                 mat = inter = None
                 if kw == "SOLID SECTION":
                     for e in self.geom.elset((b.param("ELSET") or "").strip()):
@@ -24152,14 +24167,9 @@ class Converter:
         moduli: Dict[str, List[float]] = {}
         densities: Dict[str, List[float]] = {}
         other: set = set()
-        cur: Optional[str] = None
-        for b in blocks:
+        for cur, b in self._material_cards(blocks):
             kw = b.keyword
-            if kw == "MATERIAL":
-                cur = b.uparam("NAME")
-            elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
-                cur = None
-            elif cur is not None and kw == "ELASTIC":
+            if kw == "ELASTIC":
                 if (b.param("TYPE") or "ISO").strip().upper() not in ("ISO", "ISOTROPIC"):
                     other.add(cur)
                 for rec in merged_data_records(b):
@@ -24172,7 +24182,7 @@ class Converter:
                         nu = self._NU_CLAMP                 # handle_elastic's clamp
                     if e > 0 and -1.0 < nu < 0.5:
                         moduli.setdefault(cur, []).append(e * (1 - nu) / ((1 + nu) * (1 - 2 * nu)))
-            elif cur is not None and kw == "DENSITY":
+            elif kw == "DENSITY":
                 for rec in merged_data_records(b):
                     try:
                         rho = pf(rec[0])
@@ -24190,14 +24200,9 @@ class Converter:
         speeds = dict(self._wave_speeds(blocks))
         stiff: Dict[str, float] = {}
         rho: Dict[str, float] = {}
-        cur: Optional[str] = None
-        for b in blocks:
+        for cur, b in self._material_cards(blocks):
             kw = b.keyword
-            if kw == "MATERIAL":
-                cur = b.uparam("NAME")
-            elif kw in ("STEP", "NODE", "ELEMENT") or kw.endswith("SECTION"):
-                cur = None
-            elif cur is not None and kw == "ELASTIC":
+            if kw == "ELASTIC":
                 typ = (b.param("TYPE") or "ISO").strip().upper()
                 try:
                     vals = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
@@ -24206,7 +24211,7 @@ class Converter:
                 k = max_normal_stiffness(typ, vals)
                 if k:
                     stiff[cur] = k
-            elif cur is not None and kw == "DENSITY":
+            elif kw == "DENSITY":
                 try:
                     r = min(pf(rec[0]) for rec in merged_data_records(b) if rec and rec[0])
                 except ValueError:
