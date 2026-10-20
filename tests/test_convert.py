@@ -5597,21 +5597,70 @@ def test_frequency_prestress_follows_the_base_steps_nlgeom():
     got, red, rep = heads(lin, head=", perturbation")
     assert got == ["", ""] and not red and "dropped on a *FREQUENCY step after general" in rep
     assert heads(lin)[:2] == (["", ""], [])
-    # ... unless the base state holds more that only PERTURBATION brings along (here its
-    # temperatures, which ccx's plain step resets to the initial ones): warned
-    got, red, rep = heads(_deck_step("Static", load + "*Temperature\nALL, 50.\n"), head=", perturbation")
+    # ... unless the base state holds more that only PERTURBATION brings along (here the
+    # temperatures of a temperature-dependent material, which ccx's plain step resets to the
+    # initial ones): warned (test_frequency_base_temperatures)
+    got, red, rep = heads(_deck_step("Static", load + "*Temperature\nALL, 50.\n"), head=", perturbation",
+                          model=BUCKLE_CUBE.replace("*Elastic\n1000., 0.\n", "*Elastic\n1000., 0., 0.\n"
+                                                    "500., 0., 100.\n"))
     assert got == ["", ", PERTURBATION"] and red and "ccx 2.23 includes the preload's stress" in rep
-    # a modal dynamics step reads the eigenmodes: the deck's PERTURBATION kept (ccx then
-    # refuses them, warned as before); none written, the prestress left out
+    # a modal dynamics step reads the eigenmodes, and ccx refuses perturbation ones there
+    # (probed): none written, the deck's dropped, the prestress left out
     got, red, rep = heads(nl, after=modal)
-    assert got == [", NLGEOM", "", ""] and red and "that step then refuses; left out" in rep
+    assert got == [", NLGEOM", "", ""] and red and "('created with perturbation info'); left out" in rep
     got, red, rep = heads(nl, after=modal, head=", perturbation")
-    assert got == [", NLGEOM", ", PERTURBATION", ""] and not red and "refuses these" in rep
+    assert got == [", NLGEOM", "", ""] and "; the deck's PERTURBATION dropped" in rep
+    assert red == ["prestress of a *FREQUENCY step that modal / steady-state dynamics read"]
     # a first step: initial stresses are left out in Abaqus, ccx's PERTURBATION would add them
     stress = BUCKLE_CUBE + "*Initial Conditions, type=stress\nEALL, 0., 0., -1., 0., 0., 0.\n"
     got, red, rep = heads("", head=", perturbation", model=stress)
     assert got == [""] and not red and "Abaqus leaves initial stresses out there" in rep
     assert heads("", head=", perturbation")[:2] == ([", PERTURBATION"], [])
+
+
+def test_frequency_base_temperatures():
+    # Abaqus evaluates a *FREQUENCY step's materials at the base temperatures; ccx 2.23's plain
+    # step at the initial ones (its own *TEMPERATURE ignored), its PERTURBATION at the base
+    # ones, with the base state's stress and deformation (probed: E halved by heating, 20.95 Hz
+    # plain, 14.81 Hz with PERTURBATION, as the hot model; 7.80 Hz under a preload too)
+    tdep = BUCKLE_CUBE.replace("*Elastic\n1000., 0.\n", "*Elastic\n1000., 0., 0.\n500., 0., 100.\n")
+    cold = tdep.replace("*Expansion\n1e-3\n", "")
+    heat, load = "*Temperature\nALL, 100.\n", "*Cload\n7, 3, -1.\n"
+
+    def heads(model, cards, head="", after=""):
+        body, conv, rep = convert_str(model + _deck_step("Static", cards) +
+                                      _deck_step("Frequency\n3", "", head) + after)
+        return [s.split("\n")[0] for s in body.split("*STEP")[1:]], conv.reduced_physics, rep.text()
+
+    # heated only, no expansion: no stress in the base state, PERTURBATION is exact
+    got, red, rep = heads(cold, heat)
+    assert got == ["", ", PERTURBATION"] and not red and "steps without NLGEOM that only heat" in rep
+    assert heads(cold, heat, ", perturbation")[:2] == (["", ", PERTURBATION"], [])
+    # with a preload, expansion or a prescribed displacement no form is exact: the deck's kept
+    for model, cards in ((cold, heat + load), (tdep, heat), (cold, heat + "*Boundary\n7, 3, 3, 0.01\n")):
+        got, red, rep = heads(model, cards)
+        assert got == ["", ""] and "ccx 2.23's plain *FREQUENCY at the initial ones" in rep
+        assert red == ["*FREQUENCY step at the initial temperatures (Abaqus: the base state's)"]
+        got, red, rep = heads(model, cards, ", perturbation")
+        assert got == ["", ", PERTURBATION"] and red and "ccx 2.23 includes the preload's stress" in rep
+    # a temperature-independent material (expansion is no stiffness), no heating, or *FIELD
+    # (ccx has no field variables): plain is exact, the deck's PERTURBATION goes
+    for model, cards in ((BUCKLE_CUBE, heat), (cold, load), (BUCKLE_CUBE, "*Field, variable=1\nALL, 1.\n")):
+        assert heads(model, cards)[0] == ["", ""]
+        got, _, rep = heads(model, cards, ", perturbation")
+        assert got == ["", ""] and "nothing else in the deck's base state needs it" in rep
+    # a modal dynamics step reads the eigenmodes: ccx refuses perturbation ones (probed)
+    for head in ("", ", perturbation"):
+        got, red, rep = heads(cold, heat, head, _deck_step("Modal Dynamic\n0.1, 1."))
+        assert got == ["", "", ""] and "Abaqus keeps the base state's temperatures" in rep
+        assert red == ["base state of a *FREQUENCY step that modal / steady-state dynamics read"]
+    # rows at one temperature (a DEPENDENCIES= table, a two-line row) are no dependence
+    blk = lambda kw, params, data: A.Block(kw, A.OrderedDict(params), data)
+    assert not A.temperature_dependent(blk("ELASTIC", {"DEPENDENCIES": "1"}, ["1., 0., 20., 0.",
+                                                                            "2., 0., 20., 1."]))
+    assert not A.temperature_dependent(blk("ELASTIC", {"TYPE": "ENGINEERING CONSTANTS"},
+                                           ["1., 1., 1., 0., 0., 0., 1., 1.", "1., 20."]))
+    assert A.temperature_dependent(blk("DENSITY", {}, ["1., 20.", "2., 100."]))
 
 
 def test_buckle_perturbation_prescribed_displacements():

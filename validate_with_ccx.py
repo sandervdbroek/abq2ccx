@@ -2609,6 +2609,19 @@ def frequency_preload_deck(nlgeom=False, pert=False, preload="grav"):
                              "*END STEP"]) + "\n"
 
 
+def frequency_heated_deck(heat=True, t0=20.0):
+    """buckle_gravity_deck's column with E 210e9 at 20 and 105e9 at 120 (rows), at the initial
+    temperature ``t0``; ``heat``: a static step raising it to 120 (no load, no expansion: no
+    stress), then a plain *FREQUENCY step for 4 modes."""
+    deck = buckle_gravity_deck("", buckle=False).replace(
+        "*ELASTIC\n210.e9, 0.3\n", "*ELASTIC\n210.e9, 0.3, 20.\n105.e9, 0.3, 120.\n")
+    lines = ["*NSET, NSET=NALL, GENERATE", f"1, {3 * 3 * 21}, 1",
+             "*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {t0:g}"]
+    if heat:
+        lines += ["*STEP", "*STATIC", "*TEMPERATURE", "NALL, 120.", "*END STEP"]
+    return deck + "\n".join(lines + ["*STEP", "*FREQUENCY", "4", "*END STEP"]) + "\n"
+
+
 def compact_params_deck():
     """Two unit C3D8 cubes 0.05 apart (E 1000, nu 0) held at the bottom on rollers, every
     multi-word parameter name written without blanks: the upper cube an *ELCOPY of the lower
@@ -5827,6 +5840,21 @@ def main():
               f"step, then a *FREQUENCY step): with NLGEOM, a plain *STEP {f[0][0]:.7g} vs "
               f"{f[1][0]:.7g} written with PERTURBATION; without NLGEOM, PERTURBATION {f[2][0]:.7g} "
               f"vs {f[3][0]:.7g} unloaded (max {err:.1e} apart)")
+    failures += 0 if ok else 1
+    # Abaqus evaluates a *FREQUENCY step's materials at the base temperatures, ccx 2.23's plain
+    # step at the initial ones: after a step that only heats, the converter writes PERTURBATION
+    f = [review_run(frequency_heated_deck(h, t0), "frequency_base_temperatures_" + tag,
+                    lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+         for h, t0, tag in ((True, 20.0, "heated"), (False, 120.0, "hot"), (False, 20.0, "cold"))]
+    ok = all(f)
+    if ok:
+        err = max(abs(a / b - 1) for a, b in zip(f[0], f[1]))
+        ratio = f[1][0] / f[2][0]
+        ok = len(f[0]) == len(f[1]) == 4 and err < 1e-9 and abs(ratio - math.sqrt(0.5)) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  frequency_base_temperatures (the column, its E halved from "
+              f"20 to 120 degrees, heated to 120 in a static step, then a plain *FREQUENCY step): "
+              f"{f[0][0]:.7g} vs {f[1][0]:.7g} at an initial 120 (4 modes, max {err:.1e} apart); "
+              f"{f[2][0]:.7g} cold, ratio {ratio:.7f} (sqrt(1/2))")
     failures += 0 if ok else 1
 
     # *BUCKLE loaded by a prescribed displacement: ccx 2.23 does not solve a *STEP, PERTURBATION

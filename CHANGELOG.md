@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **`*FREQUENCY` at the base state's temperatures** — Abaqus evaluates a frequency step's
+  materials at the base temperatures; ccx 2.23's plain `*FREQUENCY` uses the initial ones
+  (probed: a column whose E halves when heated kept its cold frequencies). After linear steps
+  that only heat the model, the converter now writes `*STEP, PERTURBATION`, which is exact
+  there. Where the base state also holds a preload, a prescribed displacement or thermal
+  expansion, no ccx form is exact: warned and flagged as reduced physics. `PERTURBATION` is
+  no longer kept for temperatures of temperature-independent materials, or for `*FIELD`.
+  Before a modal or steady-state dynamics step, which refuses perturbation eigenmodes, the
+  deck's own `PERTURBATION` is dropped (warned, reduced physics): ccx stopped there.
 * **Rotational BCs on `*TRANSFORM` nodes in ramped steps** — where Abaqus ramps a displacement
   BC without AMPLITUDE and ccx would step it (implicit `*DYNAMIC`, `*VISCO`, transient coupled
   steps, `*STEP, AMPLITUDE=STEP`), a rotational BC on a transformed knot or kinematic reference
