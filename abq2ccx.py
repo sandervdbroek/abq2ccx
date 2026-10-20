@@ -4470,8 +4470,9 @@ def blocks_from_lines(lines: Sequence[str]) -> List[Block]:
 
 def deck_parts(blocks: Sequence[Block]) -> Iterator[Tuple[bool, List[Block]]]:
     """The deck in order: (True, a step's cards from its *STEP through its *END STEP) and
-    (False, [a card outside the steps]).  A step without *END STEP runs on to the next one
-    (taking in the steps between) or to the end of the deck, as emit_other writes it."""
+    (False, [a card outside the steps]).  A step without *END STEP (a caller's cards; the
+    converter closes every step: close_open_steps) runs on to the next one (taking in the
+    steps between) or to the end of the deck."""
     i, n = 0, len(blocks)
     while i < n:
         if blocks[i].keyword == "STEP":
@@ -5060,17 +5061,15 @@ class EmittedCard(Block):
 
 class EmittedStep:
     """A step of an emitted deck: its cards from its *STEP card (``head``, as written: the
-    PERTURBATION ccx reads) through its *END STEP (``end``).  A *STEP inside an open step (a
-    source *STEP without *END STEP, which emit_other writes inside the open one) cuts that
-    step (``end`` None) and opens a ``nested`` one: each pass says how it takes that."""
+    PERTURBATION ccx reads) through its *END STEP (``end``; None where the text has none
+    before the next *STEP or its end, which the converter's never lacks)."""
 
     # ccx 2.23 keeps one OP=NEW flag for *DLOAD and *DSLOAD (the conversion writes *DLOAD only)
     _SHARED_OP_NEW = {"DLOAD": ("DLOAD", "DSLOAD"), "DSLOAD": ("DLOAD", "DSLOAD")}
 
-    def __init__(self, number: int, head: EmittedCard, nested: bool) -> None:
+    def __init__(self, number: int, head: EmittedCard) -> None:
         self.number = number            # 1-based, by the *STEP lines
         self.head = head
-        self.nested = nested
         self.cards: List[EmittedCard] = [head]
         self.end: Optional[EmittedCard] = None
         self.proc: Optional[EmittedCard] = None     # its first procedure card (PROC_KW)
@@ -5144,7 +5143,7 @@ class EmittedDeck:
             n = len(self.steps)
             if kw == "STEP":
                 cur = EmittedCard(kw, params, i, n + 1, len(self.cards))
-                step = EmittedStep(n + 1, cur, step is not None)
+                step = EmittedStep(n + 1, cur)
                 self.steps.append(step)
             else:
                 cur = EmittedCard(kw, params, i, step.number if step else (-1 if n else 0),
@@ -5521,11 +5520,8 @@ def integrate_history(rate: Callable[[float], float], breaks: Sequence[float], p
 @dataclass
 class WrittenStep:
     """A *STEP card handle_step wrote (EmitState.written)."""
-    no: int                       # the deck's step (Step.no)
-    ccx_no: int                   # its *STEP line among the emitted ones
+    no: int                       # the deck's step (Step.no), its *STEP line among the emitted ones
     params: "OrderedDict[str, Optional[str]]"   # as written (PERTURBATION, NLGEOM, AMPLITUDE, INC, ...)
-    stars: int = 1                # the *STEP lines of the step as written (more: an unterminated
-                                  # *STEP ran on inside it, EmitState.end_step)
 
 
 class EmitState:
@@ -5544,7 +5540,6 @@ class EmitState:
         self.no = 0
         self.prev: Optional[Step] = None
         self.written: Dict[int, WrittenStep] = {}   # step -> its *STEP card as written
-        self.star_lines = 0                         # the *STEP lines written so far
         # NLGEOM on the *STEP cards written so far, the linear perturbation steps' not counted
         # (write_step; _loads_nlgeom)
         self.nlgeom = False
@@ -5601,8 +5596,7 @@ class EmitState:
         nl = params.get("NLGEOM", "")
         self.nlgeom = self.nlgeom or (not self.step.perturbation and "NLGEOM" in params and
                                       (nl or "YES").strip().upper() != "NO")
-        self.star_lines += 1
-        self.written[self.no] = WrittenStep(self.no, self.star_lines, OrderedDict(params))
+        self.written[self.no] = WrittenStep(self.no, OrderedDict(params))
         return emit_keyword("STEP", params)
 
     def rewrite_step(self, no: int, params: "OrderedDict[str, Optional[str]]") -> None:
@@ -5651,25 +5645,6 @@ class EmitState:
             self.dl_state = {o: OrderedDict((k, list(v)) for k, v in st.items()) for o, st in dl.items()}
             self.cl_state = OrderedDict((k, list(v)) for k, v in cl.items())
             self.nodal_emitted = dict(emitted)
-
-    def end_step(self, lines: List[str]) -> List[str]:
-        """The current step's ``lines``, its *STEP through its *END STEP, are written
-        (handle_step): its record counts the *STEP lines among them, as the emitted deck reads
-        them (EmittedDeck); the later steps' *STEP lines are numbered after them."""
-        n = 0
-        for x in lines:
-            s = x.strip()
-            if s.startswith("*") and not s.startswith("**") and parse_keyword_line(s)[0] == "STEP":
-                n += 1
-        w = self.written[self.no]
-        self.star_lines += n - w.stars
-        w.stars = n
-        return lines
-
-    def matches(self, deck: EmittedDeck) -> bool:
-        """Whether ``deck``'s steps (by its *STEP lines) are the written ones: not where an
-        unterminated *STEP ran on inside a step (the post-passes' step guards)."""
-        return len(deck.steps) == len(self.written)
 
 
 # ---------------------------------------------------------------------------
@@ -5724,8 +5699,6 @@ class BaseStateRestore:
 
     def run(self) -> EmittedDeck:
         """The deck with the restore's edits (``deck`` itself where it makes none)."""
-        if not self._steps_match():
-            return self.deck
         self._index()
         for s in range(len(self.deck.steps) + 1):
             if s in self.restore_from and s in self.anchor:
@@ -5740,17 +5713,6 @@ class BaseStateRestore:
         self._note()
         self._write_model_cards()
         return self.deck.edited()
-
-    def _steps_match(self) -> bool:
-        """Whether the deck's steps as written are those the planners count (not where a
-        *STEP inside an open step cut one: warned)."""
-        if self.conv.emit.matches(self.deck):
-            return True
-        self.report.warn("The converted deck's steps do not match the deck's: the base state is "
-                         "not given again after its linear perturbation steps, whose loads and "
-                         "BC changes ccx carries on.", once=True)
-        self.conv._reduces("loads / BCs of linear perturbation steps carried on")
-        return False
 
     def _index(self) -> None:
         """What the restore reads of the deck: its sets and surfaces, the generated *CLOADs,
@@ -11246,12 +11208,12 @@ class Converter:
                      b.keyword not in GEOM_KW]
             self.report.n_commented += len(cards)
             rest = [x for b in cards for x in [emit_keyword(b.keyword, b.params)] + b.data]
-            return self.emit.end_step(out + (self._no_procedure(proc_block) if proc is None else
-                                             self.translate_one(proc_block)) + (
+            return out + (self._no_procedure(proc_block) if proc is None else
+                          self.translate_one(proc_block)) + (
                 ["** abq2ccx: an empty *EL FILE: ccx 2.23 crashes on an earlier step's here",
                  "*EL FILE"] if self.emit.no > 1 else []) + (
                 ["** abq2ccx: the step's other cards, which ccx does not reach:"] +
-                ["** " + x for x in rest] if rest else []) + ["*END STEP"])
+                ["** " + x for x in rest] if rest else []) + ["*END STEP"]
         self.emit.begin_step(self.emit.no in self._restore_from, self.emit.no in self._modal_held)
         # the step's time period, where a step-time amplitude ends (_load_later)
         rec = (merged_data_records(proc_block) or [[]])[0] if proc_block is not None else []
@@ -11283,7 +11245,7 @@ class Converter:
         out.extend(self._anchored_output(step_block))  # Abaqus' default output, if any
         self._step_temp_dof = None
         out.append("*END STEP")
-        return self.emit.end_step(out)
+        return out
 
     def _modal_increments(self, b: Block, params: "OrderedDict[str, Optional[str]]") -> None:
         """INC= on a *MODAL DYNAMIC step that takes more increments (its time period over its
@@ -15410,7 +15372,6 @@ class Converter:
         before that first card (``out``: the step's lines so far)."""
         if not self.emit.dl_wiped:
             return
-        # (the first *DLOAD of the lines, also past a *STEP inside the step: EmittedStep)
         first = next((c for c in EmittedDeck(out).cards if c.keyword == "DLOAD"), None)
         if first is not None and not first.op_new():
             out[first.line:first.line] = ["** abq2ccx: the step's later *DLOAD, OP=NEW, here: ccx "
@@ -15589,7 +15550,6 @@ class Converter:
         of them ('*ERROR in forcadd / loadadd', probed: the same AMPLITUDE and TIME DELAY on two
         cards), where Abaqus adds the loads.  So the data lines of the step's later cards
         (``out``: the step's lines) with the same parameters as an earlier one move onto it."""
-        # (the cards of the lines, also past a *STEP inside the step: EmittedStep)
         deck = EmittedDeck(out)
         first: Dict[Tuple[str, tuple], EmittedCard] = {}
         moved: Dict[int, List[int]] = {}            # a card's index -> the lines moved onto it
@@ -21026,7 +20986,12 @@ class Converter:
             out += ["** abq2ccx: kinematic-coupling reference node rotations no coupled DOF "
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc + self._kin_hold_eq
         out.extend(self.emit_other(blocks))
-        deck = self._settle_dependents(EmittedDeck(out, mesh))
+        deck = EmittedDeck(out, mesh)
+        # the post-passes number the emitted steps as the deck's: one *STEP line each, and an
+        # *END STEP (close_open_steps); a pass's edits on another step's cards would mislead ccx
+        assert len(deck.steps) == len(self.emit.written) and \
+            all(st.end is not None for st in deck.steps), "a step written inside another"
+        deck = self._settle_dependents(deck)
         deck = self._restore_base_states(deck)
         deck = self._buckle_displacements(deck)  # after the BCs the restore gives back
         deck = self._modal_own_loads(deck)      # after the loads the restore gives back
@@ -23131,8 +23096,6 @@ class Converter:
         held = {"CLOAD": False, "DLOAD": False}     # ccx holds such loads from earlier steps
         insert: Dict[int, List[str]] = {}           # line -> the cards written before it
         for st in deck.steps:
-            if st.end is None:                      # (cut by a *STEP inside it: left as it is)
-                continue
             at = None                               # after the procedure's data lines (and
             if st.proc is not None:                 # those of a later card of its type)
                 for c in st.cards:
@@ -23206,8 +23169,8 @@ class Converter:
           (probed; handle_step warns), PERTURBATION is dropped; after one, ccx has no form
           that keeps the preload: warned (--approximate, in the last step: PERTURBATION
           dropped, so the preload's stresses are left out)."""
-        # per *STEP line, what it holds (a *STEP inside an open step leaves that one unfinished);
-        # BCs keyed by the target as written and DOFs 1-6; OP=NEW between steps is ignored
+        # per step, what it holds; BCs keyed by the target as written and DOFs 1-6; OP=NEW
+        # between steps is ignored
         steps: List[dict] = []
         state: Dict[Tuple[str, int], Tuple[str, bool]] = {}    # (TARGET, DOF) -> (target, nonzero)
         cur: Optional[dict] = None
@@ -23262,7 +23225,6 @@ class Converter:
                     if cur is not None:
                         cur["own"].add((rec[0].upper(), d))
                         cur["valued"] = cur["valued"] or valued
-        same = self.emit.matches(deck)                # (the deck's steps, numbered alike)
         for n, info in enumerate(steps, 1):
             st = info["step"]
             if st.proc is None or st.proc.keyword != "BUCKLE" or not st.perturbation:
@@ -23276,7 +23238,7 @@ class Converter:
             if not info["valued"]:
                 continue
             params = OrderedDict((k, v) for k, v in st.head.params.items() if k != "PERTURBATION")
-            if same and not self._buckle_preloaded.get(n, True):
+            if not self._buckle_preloaded.get(n, True):
                 deck.set_keyword(st.head, params)
                 self.emit.rewrite_step(n, params)
                 self.report.note("*STEP, PERTURBATION dropped on a *BUCKLE step that a prescribed "
@@ -23285,7 +23247,7 @@ class Converter:
                                  "step for its prescribed displacements, only those nodes move "
                                  "(probed: factor 2.39 for 40.9); its plain *BUCKLE does.", once=True)
                 continue
-            if same and self._approx and n == len(steps):
+            if self._approx and n == len(steps):
                 deck.set_keyword(st.head, params)
                 self.emit.rewrite_step(n, params)
                 self.report.warn(f"[APPROX] *BUCKLE step {n} buckles without its preload: a "
@@ -23303,7 +23265,7 @@ class Converter:
                              f"Load the buckling step by forces instead (e.g. the displaced nodes "
                              f"tied by *EQUATION to one node that is given the force)"
                              + (", or rerun with --approximate to buckle it without the preload."
-                                if same and n == len(steps) else "."))
+                                if n == len(steps) else "."))
             self._reduces(f"*BUCKLE step {n} loaded by a prescribed displacement after a preload "
                           f"(ccx does not solve for it)")
         return deck.edited()
@@ -23315,13 +23277,9 @@ class Converter:
         reads 2.0; *FREQUENCY, *BUCKLE and steady-state dynamics add none).  So the cards of a
         later step that use a TIME=TOTAL TIME amplitude get a copy of it shifted by the time
         ccx added (SHIFTX), one per shift; where that time is unknown, a warning.  ccx's steps
-        are the deck's *STEP lines (deck.steps), each that of the step EmitState wrote it for
-        (one each where emit.matches(deck); an unterminated *STEP that ran on inside a step is
-        that step's)."""
+        are the deck's *STEP lines (deck.steps), one per step of the deck."""
         if not self._pert_idx:
             return deck
-        # the deck's step of each emitted one, by its *STEP line's number
-        src = {w.ccx_no + j: w.no for w in self.emit.written.values() for j in range(w.stars)}
         amps: Dict[str, EmittedCard] = {}       # TIME=TOTAL TIME *AMPLITUDE -> its card
         added: Dict[int, Optional[float]] = {}  # emitted step -> the time ccx alone adds (None: unknown)
         # each card's emitted step.  This pass's own rules: a card between steps or after the
@@ -23337,7 +23295,7 @@ class Converter:
                 self._used_names.add(c.uparam("NAME"))
                 if (c.params.get("TIME") or "").upper().replace(" ", "") == "TOTALTIME":
                     amps[c.uparam("NAME")] = c
-            elif src.get(n) in self._pert_idx and c.keyword in ("MODAL DYNAMIC", "STATIC"):
+            elif n in self._pert_idx and c.keyword in ("MODAL DYNAMIC", "STATIC"):
                 nxt = c.index + 1
                 line = c.data[0] if c.data else (
                     deck.lines[deck.cards[nxt].line] if nxt < len(deck.cards) else "")
@@ -23363,9 +23321,8 @@ class Converter:
                     (v or "").strip().upper() in amps]
             if not keys or shift == 0.0 or c.keyword in ("AMPLITUDE", "STEP"):
                 continue
-            s = src.get(n, n)
             if shift is None:
-                self.report.warn(f"Step {s} uses a TIME=TOTAL TIME amplitude after a *MODAL "
+                self.report.warn(f"Step {n} uses a TIME=TOTAL TIME amplitude after a *MODAL "
                                  f"DYNAMIC or static perturbation step of unknown time period: "
                                  f"ccx 2.23 counts that step's time in the total time, Abaqus does "
                                  f"not, so ccx reads the amplitude late.", once=True)
@@ -23377,7 +23334,7 @@ class Converter:
                 if (name, shift) not in copies:
                     copies[(name, shift)] = self._fresh_name(f"{name}_SHIFT")
                 params[k] = copies[(name, shift)]
-                users.setdefault(copies[(name, shift)], []).append(s)
+                users.setdefault(copies[(name, shift)], []).append(n)
             deck.set_keyword(c, params)
         for (name, shift), copy in copies.items():
             amp = amps[name]
@@ -23411,8 +23368,7 @@ class Converter:
         displacements, and the job finishes)."""
         holds = seen = dropped = pert = False
         proc = token = None
-        # (*END STEP, the zero line's set, the *STEP lines before it); a *STEP inside an open
-        # step starts the next one, the open one left unfinished
+        # (*END STEP, the zero line's set, its step)
         insert: List[Tuple[EmittedCard, Optional[str], int]] = []
         n = 0
         for c in deck.cards:
@@ -23499,7 +23455,7 @@ class Converter:
                 else:
                     held.pop(k, None)
 
-        for st in deck.steps:                   # (a *STEP inside an open step ends that one)
+        for st in deck.steps:
             given: "OrderedDict[tuple, list]" = OrderedDict()   # (element, label) -> [set, sum]
             for c in st.cards:
                 if c.keyword != "DLOAD":

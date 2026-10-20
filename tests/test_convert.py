@@ -732,8 +732,8 @@ def test_op_new_on_a_later_boundary_card_only():
 
 
 def test_emitted_deck_parse():
-    # the post-passes' parse of the converted text: steps by the *STEP lines, where a *STEP
-    # inside an open step (a source *STEP without *END STEP) cuts it; a card between steps is
+    # the post-passes' parse of the converted text: steps by the *STEP lines (one without *END
+    # STEP, which the converter's text never has, ends at the next); a card between steps is
     # in none (step -1); OP=NEW acts on a step's first card of its type only (*DLOAD and
     # *DSLOAD share one); the mesh cards read their data lines when asked; edits go by line
     text = ("** head\n*NODE\n1, 0., 0., 0.\n** mesh note\n  2, 1., 0., 0.\n*NSET, NSET=A\n1, 2\n"
@@ -747,7 +747,7 @@ def test_emitted_deck_parse():
         ("CLOAD", 1), ("STEP", 2), ("BUCKLE", 2), ("DSLOAD", 2), ("DLOAD", 2), ("END STEP", 2),
         ("BOUNDARY", -1), ("STEP", 3), ("STATIC", 3), ("DLOAD", 3), ("END STEP", 3)]
     one, two, three = deck.steps
-    assert one.end is None and not one.nested and two.nested and two.end is deck.cards[11]
+    assert one.end is None and two.end is deck.cards[11]
     assert [c.keyword for c in one.cards] == ["STEP", "STATIC", "CLOAD", "CLOAD"]
     assert two.perturbation and not three.perturbation and two.proc.keyword == "BUCKLE"
     assert [c.data for c in deck.between] == [["2, 1, 1"]] and deck.between[0].op_new()
@@ -779,15 +779,15 @@ def test_emitted_deck_parse():
 
 def test_delay_merge_and_total_time_shift_read_the_emitted_deck():
     # _merge_delay_cards reads a step's lines as an EmittedDeck: a card's data lines past the
-    # comments among them, a card without data lines, the cards past a *STEP inside the step
+    # comments among them, a card without data lines
     step = ["*STEP", "*STATIC", "0.1, 1.", "** a note", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1",
             "** between", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "E1, P1, 1.", "** inside",
-            "E2, P1, 1.", "*STEP", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1", "1, 1, 1.",
+            "E2, P1, 1.", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1", "1, 1, 1.",
             "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "E3, P2, 2.", "*NODE FILE", "U"]
     A.Converter(A.Report(), Opt())._merge_delay_cards(step)
     assert step == ["*STEP", "*STATIC", "0.1, 1.", "** a note", "*CLOAD, AMPLITUDE=A, TIME DELAY=0.1",
                     "1, 1, 1.", "** between", "*DLOAD, AMPLITUDE=A, TIME DELAY=0.1", "** inside",
-                    "E1, P1, 1.", "E2, P1, 1.", "E3, P2, 2.", "*STEP", "*NODE FILE", "U"]
+                    "E1, P1, 1.", "E2, P1, 1.", "E3, P2, 2.", "*NODE FILE", "U"]
     # _shift_total_time counts ccx's steps by the *STEP lines.  Blocks that keep an unterminated
     # *STEP (a caller that builds them itself) are closed by Converter.convert as read_blocks
     # closes them: step 1 ends before the next *STEP, and the static perturbation step 3
@@ -7767,7 +7767,7 @@ def test_general_step_after_perturbation_gets_the_base_state():
     # a *STEP without *END STEP is closed when read, so the steps still match the deck's
     body, conv, rep = convert_str(PERT.replace("*Temperature\nALL, 100.\n*End Step\n",
                                                "*Temperature\nALL, 100.\n").format("", ""))
-    assert "HOLD" in body and "steps do not match" not in rep.text() and not conv.reduced_physics
+    assert "HOLD" in body and not conv.reduced_physics
     assert "*STEP without *END STEP (Abaqus requires one): step(s) 1 closed" in rep.text()
     # Abaqus keeps NLGEOM on; ccx 2.23 forgets it after a *FREQUENCY step (probed: the next
     # static step ran linear), so it is written there (the *FREQUENCY step after NLGEOM gets
