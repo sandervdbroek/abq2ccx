@@ -13655,10 +13655,17 @@ class Converter:
                        anchor: Block, cc: str = "EL FILE") -> dict:
         """An *EL FILE (or ``cc``) request the converter adds at ``anchor``, with no say in its
         step's output control."""
-        return {"b": mkblock(cc), "cc": cc, "params": params, "labels": labels,
-                "notes": [], "warnings": [], "frd": cc.endswith("FILE"), "frd_sets": [],
-                "covered": [], "set": None, "ctl": None, "default": True, "live": True,
-                "anchor": anchor}
+        return Converter._request(mkblock(cc), cc, params, labels, set=None, ctl=None, default=True,
+                                  live=True, anchor=anchor)
+
+    @staticmethod
+    def _request(b: Block, cc: str, params: "OrderedDict[str, Optional[str]]",
+                 labels: Optional[List[str]], **more) -> dict:
+        """A step's output request (_output_request, _added_el_file): card ``b`` as ccx card
+        ``cc`` with ``params`` and ``labels``, its notes and warnings, and ``more``."""
+        return {"b": b, "cc": cc, "params": params, "labels": labels, "notes": [], "warnings": [],
+                "frd": cc in ("NODE FILE", "EL FILE", "CONTACT FILE"), "frd_sets": [], "covered": [],
+                **more}
 
     # what makes ccx 2.23 run a step linearly (_ccx_linear_steps), for the notes
     _LINEAR_STEP_WHY = ("no NLGEOM, no plastic, creeping, hyperelastic or user material, no "
@@ -14008,11 +14015,9 @@ class Converter:
         else:
             params, labels = self._output_card(b, cc, quiet)
         ctl, default = self._requested_control(b, ctx, timing)
-        r = {"b": b, "cc": cc, "params": params, "labels": labels, "notes": [], "warnings": [],
-             "frd": cc in ("NODE FILE", "EL FILE", "CONTACT FILE"), "frd_sets": [], "covered": [],
-             "set": (params.get("NSET") or "").strip().upper() or None if cc == "NODE FILE" else None,
-             "ctl": ctl, "default": default, "live": labels is not None and ctl[0] != "OFF",
-             "surface": surface}
+        nset = (params.get("NSET") or "").strip().upper() or None if cc == "NODE FILE" else None
+        r = self._request(b, cc, params, labels, set=nset, ctl=ctl, default=default,
+                          live=labels is not None and ctl[0] != "OFF", surface=surface)
         if labels is not None and ctl[0] == "OFF":
             r["notes"].append(f"*{b.keyword} with {ctl[1]}=0 dropped (output suppressed)." if ctx is None
                               else f"*OUTPUT with {ctl[1]}=0: Abaqus writes none of its requests; "
