@@ -7826,7 +7826,8 @@ class Converter:
                                      "the perturbation load case after the last general step.", once=True)
                     self._reduces("*STEP, PERTURBATION on a static step before a general step (its "
                                   "response stays)")
-                elif self._step_idx < self._n_steps:
+                elif self._step_idx < self._n_steps and self._step_idx + 1 not in self._restore_from:
+                    # (a static perturbation step next gets the base state again)
                     self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
                                      "general step, so its loads persist into the following steps "
                                      "(an Abaqus perturbation leaves the base state untouched). Move "
@@ -7834,9 +7835,9 @@ class Converter:
                                      "its loads in the next step (OP=NEW).", once=True)
                     self._reduces("*STEP, PERTURBATION on a static step that is not the last (its loads persist)")
                 elif self._general_step_seen:
-                    self.report.warn("*STEP, PERTURBATION on the last (static) step dropped: ccx runs "
-                                     "it as a general step that continues from the earlier steps' "
-                                     "state, while Abaqus linearizes about that base state and "
+                    self.report.warn("*STEP, PERTURBATION on a static step after the last general step "
+                                     "dropped: ccx runs it as a general step that continues from the "
+                                     "base state, while Abaqus linearizes about that base state and "
                                      "reports the perturbation alone.", once=True)
                     self._reduces("*STEP, PERTURBATION static step after a general step")
                 else:
@@ -7982,6 +7983,8 @@ class Converter:
             start = (self._nodal_loads, self._dl_state) if held else (self._load_base[0], self._load_base[2])
             self._nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in start[0].items())
             self._dl_state = {o: OrderedDict(st) for o, st in start[1].items()}
+            if self._step_idx in self._restore_from:    # (a static one after perturbation steps)
+                self._nodal_emitted = dict(self._load_base[1])
             if "PERTURBATION" in params or proc in ("BUCKLE", "STEADY STATE DYNAMICS") or \
                     (proc == "MODAL DYNAMIC" and not held):
                 # ccx drops the earlier *CLOADs at the start of such a step (*BUCKLE and SSD the
@@ -15907,7 +15910,8 @@ class Converter:
     def _restore_base_states(self, out: List[str]) -> List[str]:
         """Start each general step after Abaqus linear perturbation steps (_plan_base_restore)
         from the base state: the loads, BCs and temperatures in force at the end of the last
-        general step.  Abaqus continues from that state.  ccx 2.23 carries what a
+        general step.  Abaqus continues from that state (a static perturbation step, a general
+        step in ccx, adds only its own loads to it).  ccx 2.23 carries what a
         perturbation step gives on into the next step, and its procedures change what they
         do not give (probed): *FREQUENCY zeroes prescribed BC values; *STEP, PERTURBATION,
         *BUCKLE and *STEADY STATE DYNAMICS remove the earlier *CLOADs, *BUCKLE and steady-state
@@ -16176,8 +16180,9 @@ class Converter:
                     res.append(emit_keyword(kw, OrderedDict(params)))
                     res += self._surfaces_last(texts) if kw == "DLOAD" else texts
             # loads and temperatures the step gives again after a step that dropped them start
-            # from 0 / the initial temperature in ccx, from the base state in Abaqus
-            reset = {kw for kw in regiven for k in between
+            # from 0 / the initial temperature in ccx, from the base state in Abaqus (a static
+            # perturbation step ramps nothing there)
+            reset = {kw for kw in regiven for k in between if s not in self._pert_idx
                      if (procs.get(k) in self._RESETS[kw] and
                          (kw == "TEMPERATURE" or k not in self._modal_held)) or
                      (kw != "DLOAD" and k in heads and heads[k].has("PERTURBATION"))}
@@ -16200,8 +16205,6 @@ class Converter:
         insert: Dict[int, List[str]] = {}
         done: List[int] = []
         for s in range(step + 1):
-            if s in self._pert_idx:
-                continue
             if s in self._restore_from and s in anchor:
                 got = restore(s)
                 if got:
@@ -16211,6 +16214,8 @@ class Converter:
                                          f"given again (linear perturbation step(s) "
                                          f"{', '.join(map(str, range(last + 1, s)))} in between)"] + got
                     done.append(s)
+            if s in self._pert_idx:                 # (a static perturbation step: given it above)
+                continue
             first: set = set()
             for b in by_step.get(s, []):
                 kw = b.keyword
@@ -16236,17 +16241,28 @@ class Converter:
                                                              for k in e[2])]
         if not insert:
             return out
-        self.report.note(f"Step{'s' if len(done) > 1 else ''} {', '.join(map(str, done))} "
-                         f"follow{'' if len(done) > 1 else 's'} a linear perturbation step: "
-                         f"Abaqus continues from the last general step's state, while ccx 2.23 "
-                         f"carries a perturbation step's loads and BC changes on, and its own "
-                         f"procedures change that state (probed: *FREQUENCY zeroes prescribed BC "
-                         f"values; *BUCKLE, *STEP, PERTURBATION and steady-state dynamics remove "
-                         f"earlier loads and reset temperatures). The loads, boundary conditions "
-                         f"and temperatures of that state are given again at the start of "
-                         f"{'those steps' if len(done) > 1 else 'it'}"
-                         + (f", in force at once (amplitude {hold})" if used_hold[0] else "") + ".",
-                         once=True)
+        at_once = f", in force at once (amplitude {hold})" if used_hold[0] else ""
+        general = [s for s in done if s not in self._pert_idx]
+        if general:
+            self.report.note(f"Step{'s' if len(general) > 1 else ''} {', '.join(map(str, general))} "
+                             f"follow{'' if len(general) > 1 else 's'} a linear perturbation step: "
+                             f"Abaqus continues from the last general step's state, while ccx 2.23 "
+                             f"carries a perturbation step's loads and BC changes on, and its own "
+                             f"procedures change that state (probed: *FREQUENCY zeroes prescribed BC "
+                             f"values; *BUCKLE, *STEP, PERTURBATION and steady-state dynamics remove "
+                             f"earlier loads and reset temperatures). The loads, boundary conditions "
+                             f"and temperatures of that state are given again at the start of "
+                             f"{'those steps' if len(general) > 1 else 'it'}{at_once}.", once=True)
+        static = [s for s in done if s in self._pert_idx]
+        if static:
+            self.report.note(f"Static perturbation step{'s' if len(static) > 1 else ''} "
+                             f"{', '.join(map(str, static))} after other linear perturbation steps: "
+                             f"Abaqus applies only the loads and BCs such a step gives itself, ccx "
+                             f"2.23 the earlier perturbation steps' too (probed: *MODAL DYNAMIC, "
+                             f"*BUCKLE, *FREQUENCY, steady-state dynamics and static perturbation "
+                             f"steps). The loads, boundary conditions and temperatures of the base "
+                             f"state are given again at the start of "
+                             f"{'those steps' if len(static) > 1 else 'it'}{at_once}.", once=True)
         res: List[str] = []
         for i, raw in enumerate(out):
             res.append(raw)
@@ -22839,12 +22855,13 @@ class Converter:
     # *BOUNDARY, OP=NEW after rotational BCs on shell/beam nodes
     # ======================================================================
     def _plan_base_restore(self, blocks: List[Block]) -> None:
-        """The general steps that follow a linear perturbation step, which _restore_base_states
-        gives the base state again: ``_restore_from`` (step -> the last general step before
-        it, 0 for the model data), ``_restore_procs`` (-> the perturbation steps' procedures
-        in between) and, unless the step's own first *BOUNDARY has OP=NEW (which removes the
-        base state's BCs in Abaqus too), ``_restore_pairs`` (step -> the (node, DOF) pairs the
-        base state's *BOUNDARY holds).  That *BOUNDARY needs OP=NEW where a perturbation step
+        """The general steps that follow a linear perturbation step, and the static perturbation
+        steps that do (general steps in ccx), which _restore_base_states gives the base state
+        again: ``_restore_from`` (step -> the last general step before it, 0 for the model
+        data), ``_restore_procs`` (-> the perturbation steps' procedures in between) and,
+        unless the step's own first *BOUNDARY has OP=NEW (which removes the base state's BCs
+        in Abaqus too), ``_restore_pairs`` (step -> the (node, DOF) pairs the base state's
+        *BOUNDARY holds).  That *BOUNDARY needs OP=NEW where a perturbation step
         held a pair that neither the base state nor the step itself holds (``_restore_new``):
         a BC on a free DOF lasts in ccx until OP=NEW.  OP=NEW counts where ccx acts on it
         (op_new_cards): a later card's goes (_plan_late_op_new)."""
@@ -22860,11 +22877,20 @@ class Converter:
         for s, group in enumerate(groups, 1):
             cards = [b for b in group[1:] if b.keyword == "BOUNDARY" and id(b) not in self._lc_drop]
             pairs = {k for b in cards for k in self._boundary_pairs(b)}
+            new = any(id(b) in acts for b in cards)
+            procs = {b.keyword for b in group[1:] if b.keyword in PROC_KW}
             if s in self._pert_idx:
-                since |= {b.keyword for b in group[1:] if b.keyword in PROC_KW} or {""}
+                # a static perturbation step (a general step in ccx) gets the base state again
+                # too: its loads and BCs are its own, the earlier perturbation steps' go
+                if since and procs == {"STATIC"}:
+                    self._restore_from[s], self._restore_procs[s] = last, set(since)
+                    if not new:
+                        self._restore_pairs[s] = set(state)
+                        if held - state - pairs:
+                            self._restore_new.add(s)
+                since |= procs or {""}
                 held |= pairs
                 continue
-            new = any(id(b) in acts for b in cards)
             if since:
                 self._restore_from[s], self._restore_procs[s] = last, since
                 if not new:

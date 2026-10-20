@@ -216,6 +216,12 @@ physics.
   into it, is flagged: after a loaded general step (whose loads then stay on, so a static
   deflection stays in its results as an offset) or a moving modal dynamic step without
   `CONTINUE=YES`.
+* **Loads in static perturbation steps** — a `*STEP, PERTURBATION` `*STATIC` step after other
+  perturbation steps now gets the base state's loads, BCs and temperatures again, plus its own,
+  as in Abaqus. ccx 2.23 also applied the loads and BCs of those earlier steps (`*MODAL DYNAMIC`,
+  `*BUCKLE`, `*FREQUENCY`, steady-state dynamics, static perturbation): a cube after a modal
+  dynamic step was 0.024 off a response of 0.027. Two static perturbation steps in a row are
+  therefore no longer flagged as reduced physics.
 * **`*BUCKLE` steps that ccx 2.23 aborted or stopped on** — ccx 2.23 aborts (SIGABRT, the `.dat`
   sometimes empty) at the end of a step that holds no body load once an earlier step held one:
   a `*BUCKLE` step after a gravity or centrifugal preload, or any step after a `*STEP,

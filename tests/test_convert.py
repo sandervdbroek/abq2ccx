@@ -3032,8 +3032,12 @@ def test_perturbation_static_before_general_step_warns():
     _, conv, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n*Step\n*Static\n*End Step\n")
     assert "starts from its deformed state" in rep.text() and conv.reduced_physics
     _, conv, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n*Step, perturbation\n"
-                                     "*Static\n*End Step\n")
+                                     "*Frequency\n3\n*End Step\n")
     assert "loads persist" in rep.text() and conv.reduced_physics
+    # not into a static perturbation step, which gets the base state again
+    _, conv, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n*Step, perturbation\n"
+                                     "*Static\n*End Step\n")
+    assert "loads persist" not in rep.text() and not conv.reduced_physics
     _, _, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*End Step\n")
     assert "loads persist" not in rep.text() and "deformed state" not in rep.text()
 
@@ -5563,6 +5567,41 @@ def test_modal_dynamic_step_applies_its_own_loads_only():
                              "*Step\n*Modal Dynamic\n0.001, 0.003\n*Cload\n7, 2, 1.\n*End Step\n")
     assert "own (ccx 2.23 would apply the earlier steps' here too)\n*DLOAD, OP=NEW\n*CLOAD\n7, 2, 1.\n" \
            in body.split("*STEP")[6]
+
+
+def test_static_perturbation_step_applies_its_own_loads_only():
+    # a *STEP, PERTURBATION *STATIC step is a general step in ccx 2.23, which applies the loads
+    # and BCs of the perturbation steps before it there too (probed after *MODAL DYNAMIC,
+    # *BUCKLE, *FREQUENCY, steady-state dynamics and static perturbation steps); Abaqus only its
+    # own, about the base state.  So it gets the base state again, as a general step after them
+    sp = "*Step, perturbation\n*Static\n*Cload\n6, 2, 1.\n*End Step\n"
+    first = MODAL.replace("*Step\n*Static\n{}*End Step\n", "")
+    body, conv, rep = convert_str(first.format("*Cload\n7, 2, 1.\n*Dsload\nS2, TRVEC, 4., 1., 0., 0.\n") + sp)
+    assert body.split("*STEP")[3].startswith(
+        "\n*STATIC\n** abq2ccx: the loads, BCs and temperatures before the first step given again "
+        "(linear perturbation step(s) 1, 2 in between)\n*CLOAD, OP=NEW\n*CLOAD\n6, 2, 1.\n")
+    assert _cloads(body)[2] == {(6, 2): 1.0}            # (no zeros for the traction's forces)
+    assert "Static perturbation step 3 after other linear perturbation steps" in rep.text()
+    assert not conv.reduced_physics and not conv.unloaded_steps
+    # after a general step: its loads are the base state (warned: ccx reports base + perturbation),
+    # and NLGEOM, which ccx forgets after the frequency step, goes on as in the twin without it
+    body, conv, _ = convert_str(MODAL.replace("*Step\n*Static", "*Step, nlgeom\n*Static", 1).format(
+        "*Cload\n5, 1, 1.\n*Dload\n1, P2, 1.\n", "*Cload\n7, 2, 1.\n") + sp)
+    assert body.split("*STEP")[4].startswith(
+        ", NLGEOM\n*STATIC\n** abq2ccx: the loads, BCs and temperatures of step 1 given again (linear "
+        "perturbation step(s) 2, 3 in between)\n*CLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n5, 1, 1.\n"
+        "*DLOAD, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\n1, P2, 1.\n*CLOAD\n6, 2, 1.\n")
+    assert "*STEP, PERTURBATION static step after a general step" in conv.reduced_physics
+    # after another static perturbation step: its loads and BC go
+    model = MODAL.split("*Step")[0]
+    body, conv, rep = convert_str(model + "*Step, perturbation\n*Static\n*Boundary\n7, 1, 1\n*Cload\n"
+                                          "7, 2, 1.\n*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n*End Step\n" + sp)
+    second = body.split("*STEP")[2]
+    assert "\n*BOUNDARY, OP=NEW" in second and "\n*CLOAD, OP=NEW\n" in second and "\n*DLOAD, OP=NEW\n" in second
+    assert _cloads(body)[1] == {(6, 2): 1.0} and not conv.reduced_physics
+    # right after a general step: nothing to give again
+    body, _, rep = convert_str(model + "*Step\n*Static\n*Cload\n5, 1, 1.\n*End Step\n" + sp)
+    assert "OP=NEW" not in body and "Static perturbation step" not in rep.text()
 
 
 def test_modal_dynamic_step_started_moving_is_flagged():

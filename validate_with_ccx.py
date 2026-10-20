@@ -2665,6 +2665,20 @@ def modal_own_loads_deck(base=True):
                  "*END STEP"]) + "\n"
 
 
+def static_pert_own_loads_deck(base=True, between=True):
+    """modal_own_loads_deck's cube (its static *CLOAD on node 3), without the static step if
+    not ``base``, without the *FREQUENCY and *MODAL DYNAMIC steps if not ``between``, and a
+    last *STEP, PERTURBATION *STATIC step loading node 6.  Abaqus applies only a perturbation
+    step's own loads, about the base state, so its response must not depend on ``between``."""
+    text = modal_own_loads_deck(base).replace("*CLOAD\n6, 2, 1.", "*CLOAD\n3, 1, 1.").replace(
+        "*NODE PRINT, NSET=N7\nU\n", "").replace("*NSET, NSET=N7\n7\n", "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n")
+    if not base:
+        text = text.replace("*STEP\n*STATIC\n*END STEP\n", "")
+    if not between:
+        text = text[:text.index("*STEP\n*FREQUENCY")]
+    return text + "*STEP, PERTURBATION\n*STATIC\n*CLOAD\n6, 2, 1.\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
+
+
 def ramped_rotation_deck(step, twin=False):
     """pert_frame_deck("bc") without its *FREQUENCY step: the frame's joint 9 (a ccx knot, its
     *TRANSFORM about z: local 1 = y) turned about local 1 and 3 by 0.01, then about local 1 to
@@ -6168,6 +6182,22 @@ def main():
     elif all(runs):
         print(f"FAIL  modal_own_loads: {min(len(r) for r in runs)} increments printed, not 3")
     failures += 0 if ok else 1
+    # a static perturbation step after them (ccx 2.23 applied the modal dynamic step's loads
+    # in it too): its own loads, on the base state's
+    for base in (False, True):
+        runs = [review_run(static_pert_own_loads_deck(base, b), "static_pert_own_loads" +
+                           ("_base" if base else "") + ("" if b else "_ref"), dat_node_blocks)
+                for b in (True, False)]
+        ok = all(runs)
+        if ok:
+            err, moved = same(runs, -1)
+            ok = err < 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  static_pert_own_loads{'_base' if base else ''} ("
+                  f"{'a cube loaded statically, then ' if base else 'a cube: '}*FREQUENCY, a *MODAL "
+                  f"DYNAMIC step with a *CLOAD and a traction, and a *STEP, PERTURBATION *STATIC step "
+                  f"loading another node): its displacements are the ones without the frequency and "
+                  f"modal dynamic steps ({err:.1e} apart, nodes moved {moved:.3g})")
+        failures += 0 if ok else 1
     # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
     # aborted after the step that held no body load (the converter writes a zero GRAV there)
     def factors(dat):
