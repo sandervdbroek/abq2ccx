@@ -6,6 +6,25 @@ physics.
 
 ## Unreleased
 
+* **A kinematic coupling's free twist** — with its members on one line through the reference
+  node, the node's rotation about that line moves nothing. ccx 2.23 solved such a linear step
+  on roundoff, silently wrong (4× off, probed), and an NLGEOM step stopped converging. The
+  coupling is now the `*RIGID BODY` it is in ccx, with that rotation held on its ROT NODE by an
+  `*EQUATION`. Exact.
+* **`*SOLID SECTION, COMPOSITE` with different layers** on C3D8 / C3D8R was commented out
+  (ccx has no layered solid section). Each element is now one brick per layer, and `*EQUATION`s
+  keep the stack on one displacement field, as Abaqus' single element. Exact where the layer
+  integration agrees (C3D8 with 3 or more section points per layer, C3D8R with 1); else
+  reduced physics.
+* **`*DLOAD` types ccx lacks** — HP, VP, SP, SBF, PI, PE, edge loads other than EDNOR, a bare
+  `P` on solids: ccx 2.23 stopped on them (crashed on the `P`). They are now commented out,
+  warned. On axisymmetric elements, `BR` / `BZ` (radial / axial) become ccx's `BX` / `BY`;
+  `BZ` used to act out of the plane.
+* **More cards ccx stopped on** — `*BOUNDARY` on DOF 7 or 9 is dropped, warned, also where an
+  element has the DOF. A used `*ELASTIC, TYPE=TRACTION` is commented out: ccx read it as E and
+  ν, and could solve with that. A `*SURFACE` line without a face label on shells or membranes is
+  both faces where only couplings use it. A blank `*SURFACE` data line (Abaqus/Explicit) is the
+  model's exterior continuum faces.
 * **Loads given again in a later step: every line** — a `*DLOAD` / `*DSLOAD` given again where a
   later step loads its faces from another source came back as one line where one step gave it
   two (Abaqus adds them: 1 + 1, then 1 from another surface: ccx 2, Abaqus 3), and not at all

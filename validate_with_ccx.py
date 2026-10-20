@@ -4415,6 +4415,82 @@ def ccx_rejects_deck(kind):
             "2.5\n*El Print, elset=EALL\nS\n*Node Print, nset=TOP\nU\n*End Step\n")
 
 
+def ccx_leftovers_deck(kind):
+    """Decks of the cards task 91 converts (ccx 2.23 stopped on them, or solved them wrong).
+    twist (twist_nl, twist_ref): two stacked cubes, clamped at the bottom, whose top-face
+    diagonal nodes 5 and 7 are coupled (all translations) to a reference node between them,
+    which is loaded: its twist about the diagonal moves no coupled DOF; the reference: the
+    node's force halved onto 5 and 7 and the rigid link's *EQUATION (u7 - u5) . (1, 1, 0) = 0.
+    dload: a pressure on the top face beside an HP1 line ccx lacks; cax_bz / cax_br: a CAX4
+    ring under an axial / radial body force; shell / shell_ref: an S4 strip whose tip element
+    is coupled to a loaded node through a *SURFACE line without a face label / a node
+    surface; blank: two stacked cubes under a pressure on a *SURFACE with a blank data line;
+    comp_shear: a two-layer *SOLID SECTION, COMPOSITE cube (E 1000 and 3000, nu 0) in simple
+    shear; comp_angles: two layers of one orthotropic material at 0 and 90 degrees, pulled
+    along x."""
+    if kind.startswith("twist"):
+        nodes = "".join(f"{n}, {x}., {y}., {z}.\n" for n, (x, y, z) in enumerate(
+            [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1),
+             (0, 0, 2), (1, 0, 2), (1, 1, 2), (0, 1, 2)], 1))
+        deck = ("*Node\n" + nodes + "100, 0.5, 0.5, 1.\n*Element, type=C3D8, elset=EALL\n"
+                "1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 5, 6, 7, 8, 9, 10, 11, 12\n*Nset, nset=MEM\n5, 7\n"
+                "*Nset, nset=OUT\n5, 7, 11\n*Surface, type=NODE, name=MS\nMEM\n" + R20_ELASTIC)
+        load = "100, 1, 1.\n100, 2, 2.\n100, 3, 3.\n"
+        if kind == "twist_ref":
+            deck += "*Equation\n4\n7, 1, 1., 7, 2, 1., 5, 1, -1., 5, 2, -1.\n"
+            load = "".join(f"{n}, {k}, {f / 2}\n" for n in (5, 7) for k, f in ((1, 1.), (2, 2.), (3, 3.)))
+        else:
+            deck += "*Coupling, ref node=100, surface=MS, constraint name=C\n*Kinematic\n1, 3\n"
+        return (deck + "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n" +
+                ("*Step, nlgeom=YES\n*Static\n0.25, 1.\n" if kind == "twist_nl" else "*Step\n*Static\n") +
+                "*Cload\n" + load + "*Node Print, nset=OUT\nU\n*End Step\n")
+    if kind == "dload":
+        return (R20_CUBE + R20_ELASTIC + "*Boundary\n" + R20_HOLD + "*Step\n*Static\n*Dload\n"
+                "EALL, P2, 10.\nEALL, HP1, 10., 2., 0., 0., 1.\n*Node Print, nset=TOP\nU\n*End Step\n")
+    if kind.startswith("cax"):
+        nr = 1 if kind == "cax_bz" else 16
+        nodes = "".join(f"{1 + i + (nr + 1) * j}, {1. + i / nr}, {float(j)}\n"
+                        for j in (0, 1) for i in range(nr + 1))
+        elems = "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + nr + 3}, {i + nr + 2}\n" for i in range(nr))
+        return ("*Node\n" + nodes + "*Element, type=CAX4, elset=EALL\n" + elems +
+                f"*Nset, nset=BOT, generate\n1, {nr + 1}, 1\n*Nset, nset=ALLN, generate\n"
+                f"1, {2 * nr + 2}, 1\n*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, "
+                f"elset=EALL, material=M\n*Boundary\nBOT, 2, 2\n*Step\n*Static\n*Dload\nEALL, "
+                f"{'BZ' if kind == 'cax_bz' else 'BR'}, 1.\n*Node Print, nset=ALLN\nU\n*End Step\n")
+    if kind.startswith("shell"):
+        nodes = "".join(f"{i + 1 + 5 * j}, {float(i)}, {float(j)}, 0.\n" for j in (0, 1) for i in range(5))
+        surf = ("*Surface, type=NODE, name=CS\nTIPN\n" if kind == "shell_ref" else
+                "*Surface, type=ELEMENT, name=CS\nTIP\n")
+        return ("*Node\n" + nodes + "100, 4.5, 0.5, 0.\n*Element, type=S4, elset=EALL\n"
+                "1, 1, 2, 7, 6\n2, 2, 3, 8, 7\n3, 3, 4, 9, 8\n4, 4, 5, 10, 9\n*Elset, elset=TIP\n4\n"
+                "*Nset, nset=TIPN\n4, 5, 9, 10\n*Nset, nset=OUT\n5, 10, 100\n*Nset, nset=CLAMP\n1, 6\n"
+                "*Material, name=M\n*Elastic\n200000., 0.3\n*Shell Section, elset=EALL, material=M\n0.1\n"
+                + surf + "*Coupling, ref node=100, surface=CS, constraint name=C\n*Kinematic\n"
+                "*Boundary\nCLAMP, 1, 6\n*Step\n*Static\n*Cload\n100, 3, 1.\n100, 2, 1.\n"
+                "*Node Print, nset=OUT\nU\n*End Step\n")
+    if kind == "blank":
+        return (R20_CUBE + "*Node\n9, 0., 0., 2.\n10, 1., 0., 2.\n11, 1., 1., 2.\n12, 0., 1., 2.\n"
+                "*Element, type=C3D8, elset=EALL\n2, 5, 6, 7, 8, 9, 10, 11, 12\n*Nset, nset=ALLN, "
+                "generate\n1, 12, 1\n*Surface, name=OUT\n\n" + R20_ELASTIC + "*Boundary\n" + R20_HOLD +
+                "*Step\n*Static\n*Dsload\nOUT, P, 10.\n*Node Print, nset=ALLN\nU\n*End Step\n")
+    # (loads, not prescribed motion: ccx's RF at a held node leaves out the force the
+    # interface nodes' *EQUATIONs carry to it, probed)
+    if kind == "comp_shear":
+        return (R20_CUBE + "*Material, name=SOFT\n*Elastic\n1000., 0.\n*Material, name=STIFF\n"
+                "*Elastic\n3000., 0.\n*Solid Section, elset=EALL, composite\n0.5, 3, SOFT\n"
+                "0.5, 3, STIFF\n*Boundary\nBOT, 1, 3\nTOP, 2, 3\n*Step\n*Static\n*Cload\n"
+                "TOP, 1, 2.5\n*Node Print, nset=TOP\nU\n*End Step\n")
+    # (the forces of the single brick's field u = 0.01 x, sigma 1 / 0.1 in the layers, on the
+    # face x = 1: (0.375 s1 + 0.125 s2) / 2 on each bottom corner, (0.125 s1 + 0.375 s2) / 2 on
+    # each top one)
+    return (R20_CUBE + "*Nset, nset=X0\n1, 4, 5, 8\n*Nset, nset=X1\n2, 3, 6, 7\n*Material, name=M\n"
+            "*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 10., 0., 0., 0., 5., 5.,\n5.\n"
+            "*Orientation, name=OR1\n1., 0., 0., 0., 1., 0.\n3, 0.\n*Solid Section, elset=EALL, "
+            "composite, orientation=OR1\n0.5, 3, M, 0.\n0.5, 3, M, 90.\n*Boundary\nX0, 1, 1\n"
+            "1, 2, 3\n4, 3, 3\n5, 2, 2\n*Step\n*Static\n*Cload\n2, 1, 0.19375\n3, 1, 0.19375\n"
+            "6, 1, 0.08125\n7, 1, 0.08125\n*Node Print, nset=X1\nU\n*End Step\n")
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -9883,6 +9959,125 @@ def main():
                   f"vs 0.01")
         failures += 0 if ok else 1
     for d in r20_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # --- task 91: cards ccx 2.23 stopped on, or solved wrong, as they were written ---
+    def t91_run(tag, kind, reduced=()):
+        """The .dat path of ccx_leftovers_deck(kind) converted and solved with exactly the
+        ``reduced`` physics (the directory is removed at the end of the block), or None (FAIL
+        printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(ccx_leftovers_deck(kind))
+        _rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        t91_dirs.append(d)
+        if status != "solved" or sorted(conv.reduced_physics) != sorted(reduced):
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if status != "solved" else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return os.path.join(d, "job.dat")
+
+    t91_dirs = []
+    # a coupling's free twist about its members' line (it solved on roundoff, 4x off; NLGEOM
+    # stopped converging): held through the ROT NODE, as the rigid link's own equations
+    runs = [t91_run(f"t91_kinematic_{k}", k) for k in ("twist", "twist_ref", "twist_nl")]
+    ok = all(runs)
+    if ok:
+        got, ref, nl = (dat_displacements(r) for r in runs)
+        scale = max(abs(x) for v in ref.values() for x in v)
+        err = max(abs(a - b) for n in ref for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        dnl = max(abs(a - b) for n in ref for a, b in zip(nl.get(n, [math.inf] * 3), ref[n]))
+        ok = len(got) == 3 and scale > 1e-3 and err < 1e-6 * scale and dnl < 0.05 * scale
+        print(f"{'PASS' if ok else 'FAIL'}  t91_kinematic_twist (*KINEMATIC '1, 3' of two nodes on a "
+              f"line through the loaded reference node: its twist about the line moves no coupled "
+              f"DOF): as the members' force halves and rigid-link *EQUATION ({err:.1e} apart, max |u| "
+              f"{scale:.4g}); NLGEOM converges, {dnl / scale:.1%} from the linear")
+    failures += 0 if ok else 1
+
+    dat = t91_run("t91_dload_unknown_type", "dload", ["*DLOAD HP1 load dropped"])
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        err = max(abs(u[n][2] / -1e-2 - 1) for n in (5, 6, 7, 8))   # -p / E; HP1 left out
+        ok = len(u) == 4 and err < 1e-6 and abs(u[7][0] / 3e-3 - 1) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  t91_dload_unknown_type (*DLOAD HP1 beside a P2 on a C3D8, "
+              f"ccx stopped: '*ERROR reading *DLOAD'): the line left out, the pressure's u_z = "
+              f"-p / E ({err:.1e} off), u_x = nu p / E")
+    failures += 0 if ok else 1
+
+    # Abaqus' axial / radial body force on axisymmetric elements (BZ ran out of the plane in
+    # ccx, BR stopped it): BY / BX
+    dat = t91_run("t91_dload_cax_bz", "cax_bz")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        top = [u[n][1] for n in (3, 4)]                    # b h^2 / (2 E), nu = 0
+        ok = max(abs(x / 5e-4 - 1) for x in top) < 1e-6 and max(abs(u[n][0]) for n in u) < 1e-12
+        print(f"{'PASS' if ok else 'FAIL'}  t91_dload_cax_bz (*DLOAD BZ on a CAX4 ring, bottom held "
+              f"axially): the top rises b h^2 / 2E = 5e-4 ({top[0]:.7g}), no radial motion")
+    failures += 0 if ok else 1
+    dat = t91_run("t91_dload_cax_br", "cax_br")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        # nu = 0, free ring 1 <= r <= 2: u = b / E (-r^2 / 3 + 14 r / 9 + 8 / (9 r))
+        err = max(abs(u[1 + i][0] / ((-r * r / 3 + 14 * r / 9 + 8 / (9 * r)) / 1000.) - 1)
+                  for i, r in enumerate(1. + k / 16 for k in range(17)))
+        ok = len(u) == 34 and err < 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  t91_dload_cax_br (*DLOAD BR on 16 CAX4 of a free ring, "
+              f"nu = 0): u_r = b / E (14 r / 9 + 8 / 9r - r^2 / 3) ({err:.1e} off, the mesh's error)")
+    failures += 0 if ok else 1
+
+    runs = [t91_run(f"t91_{k}_faceless", k) for k in ("shell", "shell_ref")]
+    ok = all(runs)
+    if ok:
+        got, ref = (dat_displacements(r) for r in runs)
+        err = max(abs(a - b) for n in ref for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        ok = len(got) == 3 and err < 1e-9 and ref[100][2] > 0.1
+        print(f"{'PASS' if ok else 'FAIL'}  t91_shell_faceless (*COUPLING on a *SURFACE line of S4 "
+              f"elements without a face label, which was left out as reduced physics): as on the "
+              f"node surface of their nodes ({err:.1e} apart, reference node up {ref[100][2]:.4g})")
+    failures += 0 if ok else 1
+
+    dat = t91_run("t91_surface_blank_line", "blank")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        eps = -10. * 0.4 / 1000.                            # hydrostatic: -p (1 - 2 nu) / E
+        xyz = {n + 1 + 4 * k: (x, y, k) for k in (0, 1, 2) for n, (x, y) in enumerate(
+            ((0, 0), (1, 0), (1, 1), (0, 1)))}
+        err = max(abs(u[n][i] - eps * xyz[n][i]) / abs(eps) for n in xyz for i in range(3))
+        ok = len(u) == 12 and err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  t91_surface_blank_line (a pressure on a *SURFACE whose "
+              f"data line is blank, Abaqus/Explicit's model exterior; two stacked C3D8): "
+              f"hydrostatic u = -p (1 - 2 nu) x / E ({err:.1e} of it off)")
+    failures += 0 if ok else 1
+
+    # *SOLID SECTION, COMPOSITE of different layers (commented out: ccx stopped, 'no material
+    # was assigned'): one brick per layer, the stack held on one field as Abaqus' one element
+    dat = t91_run("t91_composite_shear", "comp_shear")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        top = [u[n][0] for n in (5, 6, 7, 8)]          # F h^2 / (sum G_k t_k A); layerwise: 0.0133
+        ok = len(u) == 4 and max(abs(x / 1e-2 - 1) for x in top) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  t91_composite_shear (two-layer composite C3D8, E 1000 / "
+              f"3000, nu 0, sheared by 10 on its top): u_x = F h^2 / (G1 t1 + G2 t2) = 0.01 "
+              f"({top[0]:.7g}; layers free of each other: 0.0133)")
+    failures += 0 if ok else 1
+    dat = t91_run("t91_composite_angles", "comp_angles")
+    ok = dat is not None
+    if ok:
+        u = dat_displacements(dat)
+        ux = [u[n][0] for n in (2, 3, 6, 7)]
+        ok = len(u) == 4 and max(abs(x / 1e-2 - 1) for x in ux) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  t91_composite_angles (a 0 / 90 degree composite C3D8 of "
+              f"one orthotropic material, E1 100, E2 10, the single brick's forces of u = 0.01 x on "
+              f"its face x = 1): u_x = 0.01 there ({max(abs(x / 1e-2 - 1) for x in ux):.1e} off)")
+    failures += 0 if ok else 1
+    for d in t91_dirs:
         shutil.rmtree(d, ignore_errors=True)
 
     # surface-based heat loads as ccx's element-based cards (they were commented out): a bar

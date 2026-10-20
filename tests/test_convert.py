@@ -1724,8 +1724,13 @@ def test_traction_elastic_of_unused_material_commented():
     body, _, rep = convert_str(deck)
     assert "** *ELASTIC, TYPE=TRACTION" in body and "\n*ELASTIC, TYPE=TRACTION" not in body
     assert any(lvl == "NOTE" and "No section uses material GLUE" in m for lvl, m in rep.entries)
-    body, _, _ = convert_str(deck.replace("material=STEEL\n", "material=GLUE\n"))
-    assert "\n*ELASTIC, TYPE=TRACTION" in body          # used: left for the cohesive warning
+    # used: commented out too, as reduced physics (ccx would read the first two stiffnesses as
+    # E and nu, and solve with that material where the second is below 0.5)
+    body, conv, rep = convert_str(deck.replace("material=STEEL\n", "material=GLUE\n")
+                                  .replace("8.5e+11, 8.5e+11, 8.5e+11", "1000., 0.3, 400."))
+    assert "** *ELASTIC, TYPE=TRACTION" in body and "\n*ELASTIC, TYPE=TRACTION" not in body
+    assert "*ELASTIC, TYPE=TRACTION (the cohesive stiffness)" in conv.reduced_physics
+    assert any(lvl == "WARNING" and "no elastic constants" in m for lvl, m in rep.entries)
 
 
 def test_boundary_on_inactive_unknown_dof_dropped():
@@ -1736,8 +1741,16 @@ def test_boundary_on_inactive_unknown_dof_dropped():
     body, _, rep = convert_str(deck)
     assert "TOP, 9, 9" not in body and "TOP, 1, 6\n" in body and "TOP, 8, 8" not in body
     assert any("DOF 9 (electric potential) dropped" in m for _, m in rep.entries)
-    body, _, _ = convert_str(deck.replace("TYPE=C3D8", "TYPE=C3D8E"))
-    assert "TOP, 9, 9, 500." in body
+    # where an element has it too: ccx stops on DOF 7 and 9 in any model (probed on B31 and
+    # C3D8), so the BC is dropped, warned as lost
+    body, conv, rep = convert_str(deck.replace("TYPE=C3D8", "TYPE=C3D8E"))
+    assert "TOP, 9, 9" not in body and "TOP, 1, 6\n" in body
+    assert any(lvl == "WARNING" and "DOF 9 (electric potential) dropped: ccx has no such DOF" in m
+               for lvl, m in rep.entries)
+    assert "*BOUNDARY on DOF 9 (electric potential)" in conv.reduced_physics
+    body, conv, _ = convert_str(deck.replace("TYPE=C3D8", "TYPE=B31OS").replace(
+        "1, 1,2,3,4,5,6,7,8", "1, 1, 2").replace("9, 9, 500.", "7, 7, 0.").replace("1, 9", "1, 7"))
+    assert "TOP, 7, 7" not in body and "*BOUNDARY on DOF 7 (warping)" in conv.reduced_physics
 
 
 def test_boundary_dofs_above_30_left_out():
@@ -1868,12 +1881,13 @@ def test_independent_instance_undefined_part_no_crash():
 
 def test_dsload_unmappable_face_warns():
     # *DSLOAD on a surface whose face is neither S1..S6 nor a shell / membrane side (here
-    # SPOS on a solid) cannot become a ccx Px label; it must warn rather than silently emit
-    # a bare 'P' that ccx rejects.
+    # SPOS on a solid) cannot become a ccx Px label; the line is commented out with a warning
+    # (a bare 'P' crashes ccx 2.23, probed)
     deck = HEX + ("*Elset, elset=e\n1\n*Surface,type=element,name=sf\ne, SPOS\n*Step\n*Static\n"
                   "*Dsload\nsf, P, 5.0\n*End Step\n")
-    _, _, rep = convert_str(deck)
-    assert "px equivalent" in rep.text().lower()
+    body, _, rep = convert_str(deck)
+    assert "no ccx face pressure p1-p6" in rep.text().lower()
+    assert "** sf, P, 5.0" in body and "e, P, 5.0" not in body
 
 
 def test_shell_and_membrane_pressure_sides():
@@ -16433,9 +16447,13 @@ def test_solid_composite_section_of_one_material_is_plain():
     assert "*SOLID SECTION, ELSET=EALL, MATERIAL=M, ORIENTATION=OR1" in body.splitlines()
     assert "0.5, 3" not in body
     assert conv.reduced_physics == []
-    body, conv, rep = convert_str(HEX + mat + sec + "0.5, 3, M, 0.\n0.5, 3, M, 45.\n")
+    # layers in other directions: one brick per layer (test_solid_composite_split_into_plies);
+    # a layer angle without the section's orientation has no axes: commented out, with why
+    body, conv, rep = convert_str(HEX + mat + sec.replace(", orientation=OR1", "")
+                                  + "0.5, 3, M, 0.\n0.5, 3, M, 45.\n")
     assert "\n*SOLID SECTION" not in body and "** 0.5, 3, M, 45." in body
     assert "*SOLID SECTION, COMPOSITE" in conv.reduced_physics and "no layered solid section" in rep.text()
+    assert "needs the section's ORIENTATION" in rep.text()
     iso = mat.replace("*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 10., 0.3, 0.3, 0.3, 5., 5.,\n5.",
                       "*Elastic\n100., 0.3")
     body, conv, _ = convert_str(HEX + iso + sec + "0.5, 3, M, 0.\n0.5, 3, M, 45.\n")
@@ -16821,6 +16839,150 @@ def test_comment_out_reduces_true_names_the_card():
     conv._comment_out("no card", [], True)
     conv._comment_out("kept", ["*CLOAD"], False)
     assert conv.reduced_physics == ["*CLOAD", "no card"]
+
+
+def test_null_space_and_echelon_rows():
+    rows = [A.vcross(r, a) for r in ((-.5, -.5, 0.), (.5, .5, 0.))
+            for a in ((1., 0., 0.), (0., 1., 0.), (0., 0., 1.))]
+    (n,) = A.null_space(rows)                  # two members on a line: the twist about it
+    assert abs(abs(n[0]) - math.sqrt(.5)) < 1e-12 and abs(n[0] - n[1]) < 1e-12 and n[2] == 0.
+    assert A.null_space([]) == [(1., 0., 0.), (0., 1., 0.), (0., 0., 1.)]
+    assert A.null_space(rows + [(0., 0., 1.), (1., -1., 0.)]) == [n]     # (normal to n)
+    assert A.null_space(rows + [(1., 1., 0.)]) == []
+    (p, row), = A.echelon_rows([n])
+    assert p in (0, 1) and abs(row[1 - p] - 1.) < 1e-12 and row[p] == 1. and row[2] == 0.
+    (p1, r1), (p2, r2) = A.echelon_rows([(1., 0., 0.), (0., 0.6, 0.8)])
+    assert (p1, r1, p2) == (0, (1., 0., 0.), 2) and abs(r2[1] - 0.75) < 1e-12 and r2[::2] == (0., 1.)
+
+
+TWIST = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n"
+         "100, 0.5, 0.5, 1.\n*Element, type=C3D8, elset=EALL\n1, 1,2,3,4,5,6,7,8\n*Nset, nset=MEM\n5, 7\n"
+         "*Surface, type=NODE, name=MS\nMEM\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+         "*Solid Section, elset=EALL, material=M\n*Coupling, ref node=100, surface=MS, "
+         "constraint name=C\n*Kinematic\n1, 3\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+         "*Step\n*Static\n*Cload\n100, 1, 1.\n100, 3, 2.\n*End Step\n")
+
+
+def test_kinematic_twist_held_on_a_rot_node():
+    # members 5 and 7 on a line through the reference node: its rotation about (1, 1, 0) moves
+    # no coupled DOF; ccx solved that on roundoff (4x off, probed) and stopped converging under
+    # NLGEOM.  ccx refuses an *EQUATION on the node's DOFs 4-6 (its coupling MPCs make them
+    # dependent), so the coupling becomes the *RIGID BODY it is with a ROT NODE held by one
+    body, conv, rep = convert_str(TWIST)
+    assert "*RIGID BODY, NSET=ABQ2CCX_RB1, REF NODE=100, ROT NODE=101" in body
+    assert "*KINEMATIC" not in body and "\n101, 0.5, 0.5, 1" in body
+    eq = body.split("*EQUATION\n")[1].split("\n*")[0].splitlines()
+    assert eq[0] == "2" and re.fullmatch(r"101, ([12]), 1\., 101, (?!\1)[12], 1\.", eq[1]), eq
+    assert other_reduced(conv) == [] and "twist about it" in rep.text()
+    # the deck's own BC on a rotation of the node: not held, warned
+    body, conv, rep = convert_str(TWIST.replace("4, 1, 3\n", "4, 1, 3\n100, 6, 6\n"))
+    assert "*KINEMATIC" in body and "*RIGID BODY" not in body
+    assert any(lvl == "WARNING" and "its rotation about (0.707107, 0.707107, 0.)" in m and
+               "a *BOUNDARY or *EQUATION term is on its rotations" in m for lvl, m in rep.entries)
+    # a coupling whose free rotation is a global axis keeps task 39's BC hold
+    body, _, _ = convert_str(TWIST.replace("5, 7\n*Surface", "5, 6, 7, 8\n*Surface")
+                             .replace("*Kinematic\n1, 3", "*Kinematic\n3, 3")
+                             .replace("4, 1, 3\n", "4, 1, 3\n100, 1, 2\n"))
+    assert "*KINEMATIC" in body and "*BOUNDARY\n100, 6, 6" in body
+
+
+def test_dload_types_ccx_lacks_commented_out():
+    # ccx 2.23 reads P1-P6, BX / BY / BZ, GRAV, CENTRIF and EDNOR and stops on any other
+    # *DLOAD type (probed: HP1, VP1, SP1, SBF, PI, PE, EDSHR1, BR, ...), crashes on a bare P
+    deck = HEX + HEX_SEC + "*Step\n*Static\n*Dload\nEALL, P2, 1.\nEALL, HP1, 1., 2., 0., 0., 1.\n" \
+        "EALL, SBF, 3.\nEALL, P, 4.\nEALL, BZ, 5.\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    assert "\nEALL, P2, 1." in body and "\nEALL, BZ, 5." in body
+    assert all(f"** EALL, {x}" in body for x in ("HP1, 1.", "SBF, 3.", "P, 4."))
+    assert {"*DLOAD HP1 load dropped", "*DLOAD SBF load dropped", "*DLOAD P load dropped"} <= \
+        set(conv.reduced_physics)
+    assert "(hydrostatic pressure)" in rep.text() and "crashes on a bare P" in rep.text()
+    # on axisymmetric elements BR / BZ are the radial / axial body forces: ccx's BX / BY
+    cax = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n*Element, type=CAX4, elset=E\n"
+           "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, elset=E, "
+           "material=M\n*Step\n*Static\n*Dload\nE, BR, 1.\nE, BZ, 2.\n*End Step\n")
+    body, conv, _ = convert_str(cax)
+    assert "\nE, BX, 1.\nE, BY, 2." in body and conv.reduced_physics == []
+
+
+def test_faceless_shell_surface_line_both_faces_for_couplings():
+    # a shell line without a face label is a double-sided surface: both faces where only
+    # couplings use it (they take its nodes), else commented out as before
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n3,2,0,0\n4,0,1,0\n5,1,1,0\n6,2,1,0\n100, 2.5, 0.5, 0.\n"
+            "*Element, type=S4, elset=ALL\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Elset, elset=P\n2\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, elset=ALL, material=M\n0.1\n"
+            "*Surface, type=ELEMENT, name=CS\nP\n*Coupling, ref node=100, surface=CS, constraint "
+            "name=C\n*Kinematic\n*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Cload\n100, 3, 1.\n"
+            "*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*SURFACE, TYPE=ELEMENT, NAME=CS\nP, SPOS\nP, SNEG" in body and other_reduced(conv) == []
+    tied = deck.replace("*Coupling, ref node=100, surface=CS, constraint name=C\n*Kinematic\n",
+                        "*Tie, name=T\nCS, CS\n")
+    body, conv, rep = convert_str(tied)
+    assert "** P\n" in body and "*SURFACE without face labels on structural elements" in conv.reduced_physics
+
+
+def test_blank_surface_data_line_is_the_model_exterior():
+    # Abaqus/Explicit: 'a blank data line ... the exterior (free) faces of every element in the
+    # model'; read_blocks used to drop it, leaving an empty surface
+    deck = (HEX + "*Node\n9, 0., 0., 2.\n10, 1., 0., 2.\n11, 1., 1., 2.\n12, 0., 1., 2.\n"
+            "*Element, type=C3D8, elset=EALL\n2, 5, 6, 7, 8, 9, 10, 11, 12\n*Surface, name=ALL\n"
+            "\n*Surface, name=S1\nEALL, S1\n\n*Step\n*Static\n*Dsload\nALL, P, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    faces = body.split("*SURFACE, NAME=ALL\n")[1].split("\n*")[0].splitlines()
+    assert sorted(faces) == sorted(["1, S1", "1, S3", "1, S4", "1, S5", "1, S6",
+                                    "2, S2", "2, S3", "2, S4", "2, S5", "2, S6"])
+    assert body.split("*SURFACE, NAME=S1\n")[1].split("\n*")[0] == "EALL, S1"    # a separator
+    assert "documented for Abaqus/Explicit" in rep.text() and conv.reduced_physics == []
+    # shells in the model: left out, warned, reduced physics where a card uses the surface
+    shell = deck.replace("*Surface, name=ALL", "*Element, type=S4, elset=SH\n3, 9, 10, 11, 12\n"
+                         "*Shell Section, elset=SH, material=MHEX\n0.1\n" + HEX_SEC + "*Surface, name=ALL")
+    body, conv, rep = convert_str(shell)
+    assert "1 S4" in rep.text() and \
+        "*SURFACE blank data line: facets of shells, beams and other structural elements left out" \
+        in conv.reduced_physics
+
+
+def test_solid_composite_split_into_plies():
+    # *SOLID SECTION, COMPOSITE of layers in other materials or directions (ccx has no
+    # layered solid section): one brick per layer, its interface nodes held by *EQUATION on
+    # the stack edges (Abaqus' one element: one field through the stack), each layer's axes
+    # the section orientation turned by its angle about the orientation's rotation axis
+    mat = ("*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 10., 0.3, 0.3, 0.3, "
+           "5., 5.,\n5.\n*Material, name=N\n*Elastic\n50., 0.2\n*Orientation, name=OR1\n"
+           "1., 0., 0., 0., 1., 0.\n3, 0.\n")
+    sec = "*Solid Section, elset=EALL, composite, orientation=OR1\n"
+    body, conv, rep = convert_str(HEX + mat + sec + "1., 3, M, 0.\n2., 3, N, 30.\n1., 3, M, 90.\n")
+    assert "*ELEMENT, TYPE=C3D8\n1, 1, 2, 3, 4, 9, 10, 11, 12\n2, 9, 10, 11, 12, 13, 14, 15, 16\n" \
+           "3, 13, 14, 15, 16, 5, 6, 7, 8" in body
+    assert "\n9, 0, 0, 0.25\n" in body and "\n13, 0, 0, 0.75\n" in body
+    assert "9, 1, 1., 1, 1, -0.75, 5, 1, -0.25" in body and "13, 3, 1., 1, 3, -0.25, 5, 3, -0.75" in body
+    assert "*SOLID SECTION, ELSET=EALL_PLY1, MATERIAL=M, ORIENTATION=OR1" in body
+    assert "*SOLID SECTION, ELSET=EALL_PLY2, MATERIAL=N\n" in body        # isotropic: no axes
+    assert "*ORIENTATION, NAME=EALL_PLY3_ORI\n0, 1, 0, -1, 0, 0\n" \
+           "*SOLID SECTION, ELSET=EALL_PLY3, MATERIAL=M, ORIENTATION=EALL_PLY3_ORI" in body
+    assert "*ELSET, ELSET=EALL, GENERATE\n1, 3, 1" in body and conv.reduced_physics == []
+    assert "Abaqus' layer integration and the bricks' agree" in rep.text()
+    # one section point per layer on C3D8: Abaqus integrates each layer at its mid-plane
+    _, conv, rep = convert_str(HEX + mat + sec + "1., 1, M, 0.\n1., , M, 90.\n")
+    assert conv.reduced_physics == ["*SOLID SECTION, COMPOSITE: the layer integration of its ply bricks"]
+    # elements the split does not take, or layer axes it does not know: commented out, with why
+    for typ, plies, why in (("C3D8I", "1., 3, M\n1., 3, N\n", "only C3D8 and C3D8R bricks"),
+                            ("C3D8", "1., 3, M, ANG\n1., 3, M\n", "is not an *ORIENTATION"),
+                            ("C3D8", "1., 3, M\n1., 3, N\n", "")):
+        body, conv, rep = convert_str(HEX.replace("C3D8", typ) + mat + sec + plies)
+        if why:
+            assert "*SOLID SECTION, COMPOSITE" in conv.reduced_physics and why in rep.text(), why
+        else:
+            assert "*SOLID SECTION, ELSET=EALL_PLY2, MATERIAL=N" in body
+
+
+def test_dof7_on_a_rejected_element_type_gets_the_ccx_stop_not_the_bc():
+    # (the element is what ccx stops on; the BC on DOF 7 is dropped either way)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31OS, elset=B\n1, 1, 2\n"
+            "*Boundary\n1, 1, 7\n")
+    body, conv, _ = convert_str(deck)
+    assert "1, 1, 6" in body and "1, 7, 7" not in body and "1, 1, 7" not in body
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
