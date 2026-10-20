@@ -8182,9 +8182,10 @@ class Converter:
                          if d <= 6 and carries(n, d)]
                  for b in blocks if b.keyword == "BOUNDARY"}
         # the BCs in force as a step starts: the model data's, then the last general step's
-        before = set(next(bc_steps(step_groups(blocks)[0], lambda b: given[id(b)])))
-        for s, active in enumerate(bc_steps(blocks, lambda b: given[id(b)], self._pert_idx,
-                                            self.steps.lc2), 1):
+        folds = self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2, model=True,
+                                  blocks=blocks)
+        before = set(next(folds))
+        for s, active in enumerate(folds, 1):
             if s in transient and before - set(active):
                 jumps.add(s)
             if s not in self._pert_idx:
