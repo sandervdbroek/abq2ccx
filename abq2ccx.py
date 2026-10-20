@@ -1003,7 +1003,8 @@ WEAR SURFACE PROPERTIES; WIND;
 """.split(";") if k.strip())
 # The parameters of the Abaqus keywords the converter reads (Keywords Reference 2017): NAME,
 # or NAME=VALUE|VALUE for a value from a fixed set; spelled as the converter reads them
-# (DATATYPE, SCALE STRESS).  A line that starts with a blank continues the one above.
+# (DATATYPE, SCALE STRESS).  A line that starts with a blank continues the one above.  MAIN and
+# SECONDARY are Abaqus 2022's names for MASTER and SLAVE (ROLE_PARAM_ALIASES).
 _ABAQUS_PARAMS_TEXT = """
 ADJUST: NODE SET; SURFACE; ORIENTATION
 AMPLITUDE: NAME; DEFINITION=TABULAR|EQUALLY SPACED|PERIODIC|MODULATED|DECAY|SMOOTH STEP|
@@ -1025,7 +1026,7 @@ CENTROID:
 CFILM: AMPLITUDE; FILM AMPLITUDE; OP=MOD|NEW; REGION TYPE=LAGRANGIAN|SLIDING|EULERIAN; USER
 CFLUX: FILE; AMPLITUDE; INC; OP=MOD|NEW; REGION TYPE=LAGRANGIAN|SLIDING|EULERIAN; STEP
 CHANGE FRICTION: ELSET; INTERACTION; AMPLITUDE; RESET
-CLEARANCE: CPSET; MASTER; SLAVE; TABULAR; VALUE; BOLT; INPUT
+CLEARANCE: CPSET; MASTER; SLAVE; MAIN; SECONDARY; TABULAR; VALUE; BOLT; INPUT
 CLOAD: FILE; CYCLIC MODE; AMPLITUDE; FOLLOWER; INC; LOAD CASE; OP=MOD|NEW; REGION TYPE=LAGRANGIAN|
     SLIDING|EULERIAN; STEP; IMAGINARY; REAL
 COHESIVE SECTION: ELSET; MATERIAL; RESPONSE=TRACTION SEPARATION|CONTINUUM|GASKET; CONTROLS;
@@ -1039,21 +1040,21 @@ CONNECTOR LOAD: AMPLITUDE; LOAD CASE; OP=MOD|NEW; IMAGINARY; REAL
 CONNECTOR MOTION: AMPLITUDE; LOAD CASE; OP=MOD|NEW; FIXED; TYPE=DISPLACEMENT|VELOCITY|ACCELERATION;
     USER; IMAGINARY; REAL
 CONNECTOR SECTION: ELSET; BEHAVIOR; CONTROLS; ELIMINATION=NO|YES
-CONTACT CONTROLS: ABSOLUTE PENETRATION TOLERANCE; RELATIVE PENETRATION TOLERANCE; MASTER;
-    PERTURBATION TANGENT SCALE FACTOR; PRESSURE DEPENDENT PERTURBATION; RESET; SLAVE;
+CONTACT CONTROLS: ABSOLUTE PENETRATION TOLERANCE; RELATIVE PENETRATION TOLERANCE; MASTER; MAIN;
+    PERTURBATION TANGENT SCALE FACTOR; PRESSURE DEPENDENT PERTURBATION; RESET; SLAVE; SECONDARY;
     STABILIZE=USER ADAPTIVE; STIFFNESS SCALE FACTOR=USER ADAPTIVE; TANGENT FRACTION; CPSET;
     FASTLOCALTRK=YES|NO; GLOBTRKINC; SCALE PENALTY; WARP CHECK PERIOD; WARP CUT OFF
 CONTACT DAMPING: DEFINITION=DAMPING COEFFICIENT|CRITICAL DAMPING FRACTION; TANGENT FRACTION
-CONTACT FILE: FREQUENCY; MASTER; NSET; SLAVE
+CONTACT FILE: FREQUENCY; MASTER; MAIN; NSET; SLAVE; SECONDARY
 CONTACT INCLUSIONS: ALL EXTERIOR
 CONTACT OUTPUT: CPSET; NSET; SURFACE; SECOND SURFACE; GENERAL CONTACT; VARIABLE=ALL|PRESELECT;
-    MASTER; SLAVE
+    MASTER; SLAVE; MAIN; SECONDARY
 CONTACT PAIR: INTERACTION; ADJUST; EXTENSION ZONE; GEOMETRIC CORRECTION; HCRIT; MIDFACE NODES=YES|
     NO; MINIMUM DISTANCE=YES|NO; NO THICKNESS; SMALL SLIDING; SMOOTH;
     SLIDING TRANSITION=ELEMENT ORDER SMOOTHING|LINEAR SMOOTHING|QUADRATIC SMOOTHING;
     SUPPLEMENTARY CONSTRAINTS=SELECTIVE|YES|NO; TIED; TRACKING=PATH|STATE; TYPE=NODE TO SURFACE|
     SURFACE TO SURFACE; CPSET; MECHANICAL CONSTRAINT=KINEMATIC|PENALTY; OP=ADD|DELETE; WEIGHT
-CONTACT PRINT: FREQUENCY; MASTER; NSET; SLAVE; SUMMARY=YES|NO; TOTALS=YES|NO
+CONTACT PRINT: FREQUENCY; MASTER; MAIN; NSET; SLAVE; SECONDARY; SUMMARY=YES|NO; TOTALS=YES|NO
 CONTROLS: ANALYSIS=DISCONTINUOUS; PARAMETERS=FIELD|CONSTRAINTS|LINE SEARCH|TIME INCREMENTATION;
     RESET; TYPE=DIRECT CYCLIC|NO CUTBACK SCALING|VCCT LINEAR SCALING; FIELD=CONCENTRATION|
     DISPLACEMENT|ELECTRICAL POTENTIAL|GLOBAL|HYDROSTATIC FLUID PRESSURE|MATERIAL FLOW|
@@ -1301,6 +1302,9 @@ def _abaqus_params(text: str) -> Dict[str, "OrderedDict[str, Tuple[str, ...]]"]:
 
 
 ABAQUS_PARAMS = _abaqus_params(_ABAQUS_PARAMS_TEXT)
+# Abaqus 2022+ renamed the contact roles: MAIN / SECONDARY are read as MASTER / SLAVE, the
+# names the converter (and ccx's *CLEARANCE, *CONTACT PRINT) reads, on the cards that have them
+ROLE_PARAM_ALIASES = {"MAIN": "MASTER", "SECONDARY": "SLAVE"}
 _ABAQUS_KEYWORD_LIST = tuple(sorted(ABAQUS_KEYWORDS))
 
 
@@ -1363,7 +1367,8 @@ def parse_keyword_line(line: str, seen: Optional[Dict[str, "OrderedDict[str, obj
     it: a keyword no Abaqus keyword spells, a parameter of a keyword in ABAQUS_PARAMS, or a
     value from that parameter's fixed set, that begins exactly one of them (*INITIAL CONDITION,
     VAR=PRESELECT, TYPE=ISO).  ``seen["read"]`` collects them (abbreviation -> full name),
-    ``seen["ambiguous"]`` the ones that begin several (-> those), which are kept as written."""
+    ``seen["ambiguous"]`` the ones that begin several (-> those), which are kept as written,
+    ``seen["renamed"]`` the Abaqus 2022+ names MAIN / SECONDARY read as MASTER / SLAVE."""
     tokens = _split_commas(line)
     # "The first non-blank character of each keyword line must be a star": "  *NODE" is *NODE
     keyword = " ".join(tokens[0].strip().lstrip("*").split()).upper()
@@ -1390,9 +1395,16 @@ def parse_keyword_line(line: str, seen: Optional[Dict[str, "OrderedDict[str, obj
         key, eq, val = tok.partition("=")
         name, value = _param_name(key), (val.strip() if eq else None)
         if table and name:
-            name = expand(name, tuple(table), f"*{keyword}, {name}")
+            # the 2017 names first, so an abbreviation of one reads as before the renames
+            old = tuple(n for n in table if n not in ROLE_PARAM_ALIASES)
+            name = expand(name, old if _abbreviation(name, old)[0] else tuple(table),
+                          f"*{keyword}, {name}")
             if table.get(name) and value and not value.startswith('"'):
                 value = expand(value, table[name], f"*{keyword}, {name}={value}", False)
+            if name in ROLE_PARAM_ALIASES and ROLE_PARAM_ALIASES[name] in table:
+                seen.setdefault("renamed", OrderedDict())[f"*{keyword}, {name}"] = \
+                    ROLE_PARAM_ALIASES[name]
+                name = ROLE_PARAM_ALIASES[name]
         params[name] = value
     return keyword, params
 
@@ -1828,6 +1840,12 @@ def read_blocks(path: str, report: Report) -> List[Block]:
     if read:
         report.note("Abbreviations read in full, as Abaqus reads them: " + "; ".join(read[:8]) +
                     (f" and {len(read) - 8} more" if len(read) > 8 else "") + ".")
+    renamed = [f"{k} -> {v}" for k, v in seen.get("renamed", {}).items()]
+    if renamed:
+        report.note("Abaqus 2022+ parameter names read as their earlier ones (MAIN = MASTER, "
+                    "SECONDARY = SLAVE), which the converter and ccx read: " +
+                    "; ".join(renamed[:8]) + (f" and {len(renamed) - 8} more" if len(renamed) > 8
+                                              else "") + ".")
     for k, hits in seen.get("ambiguous", {}).items():
         report.warn(f"{k}: an ambiguous abbreviation ({', '.join(hits[:5])}"
                     f"{', ...' if len(hits) > 5 else ''}), which Abaqus rejects; read as written.")
@@ -6503,8 +6521,10 @@ class Converter:
         self._analytic: Dict[str, Tuple[str, str]] = {}
         self._analytic_skipped: Dict[str, str] = {}
         # *CONTACT PAIR self-contact lines (_plan_self_contact): id(card) -> (the card as
-        # given, its self-contact lines)
+        # given, its self-contact lines); under --approximate id(the card of 'S, S' lines) ->
+        # the card as given
         self._self_contact: Dict[int, Tuple[Block, List[str]]] = {}
+        self._self_approx: Dict[int, Block] = {}
         self._skin_material: Optional[Tuple[float, float, bool]] = None
         self._rigid_planar_refs: List[int] = []
         self._rigid_planar_bc: List[str] = []
@@ -7838,14 +7858,20 @@ class Converter:
         0.2554) and buckling load (22.53 vs 22.62).  With N >= 2 and unequal exponents its
         stresses are right but its tangent is not: the column's frequency and buckling load
         9 % and 14 % low (warned in eigenvalue steps).  A *STATIC or *VISCO step converged
-        on one element only (warned)."""
+        on one element only (warned).  TEST DATA INPUT is commented out, as *HYPERELASTIC's:
+        ccx reads no test data, and ignoring the parameter it reads an N=1 hyperfoam without
+        coefficients (probed: 'parameter not recognized', then a singular matrix)."""
+        if b.has("TEST DATA INPUT"):
+            return self._commented(b, "*HYPERFOAM, TEST DATA INPUT: Abaqus fits the coefficients "
+                                      "from *UNIAXIAL/*BIAXIAL/... TEST DATA; ccx needs the "
+                                      "coefficients themselves — fit them and re-add the card.")
         mat = self._card_material.get(id(b))
         used = mat is None or mat.upper() in self._used_materials
         try:
             n = max(1, int(float(b.param("N") or "1")))
         except ValueError:
             n = 0
-        rows = material_rows(b, 3 * n) if n and not b.has("TEST DATA INPUT") else None
+        rows = material_rows(b, 3 * n) if n else None
         out = self.passthrough(b)
         if n == 1:
             new: List[str] = []
@@ -7867,8 +7893,8 @@ class Converter:
                                  once=True)
                 out = [emit_keyword("HYPERFOAM", params)] + new
             elif used:
-                self.report.warn("*HYPERFOAM, N=1 kept as written (TEST DATA INPUT, DEPENDENCIES, or "
-                                 "rows that do not read as numbers): ccx 2.23 gives it no stiffness, "
+                self.report.warn("*HYPERFOAM, N=1 kept as written (DEPENDENCIES, or rows that do "
+                                 "not read as numbers): ccx 2.23 gives it no stiffness, "
                                  "stopping without a message in a static or buckling step (probed).",
                                  once=True)
                 self._reduces("*HYPERFOAM, N=1 (no stiffness in ccx 2.23)")
@@ -10354,11 +10380,7 @@ class Converter:
         tol = 1e-6 * self._model_span()
         nodes = self.geom.nodes
         types: Dict[str, str] = {}
-        shells = self._shell_thicknesses(blocks)
-        mem = {e for e, (typ, _c) in self.geom.elements.items() if typ.upper().startswith("M3D")}
-        for e, ts in (self._membrane_thicknesses(blocks, mem)[0].items() if mem else ()):
-            if ts and all(t is not None and t > 0.0 for t in ts):
-                shells[e] = (max(ts), 0.0)
+        shells = self._sheet_thicknesses(blocks)
         side_of = {sk: (e, side) for (e, side), (sk, _f) in self._skins.items()}
         axisym = any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values())
 
@@ -15905,7 +15927,11 @@ class Converter:
                 spacing = ctl[1] if spacing is None else spacing
                 continue
             others = [r for g in groups if g is not group for r in g]
-            if any(r["ctl"] != group[0]["ctl"] for r in others):
+            # (a request is served as asked when ccx's frequency is its own, or its group asks
+            # for its control alone)
+            alone = len({r["ctl"] for r in group}) == 1
+            if any(not (ctl[0] == "FREQUENCY" and r["ctl"] == ("F", int(ctl[1])) or
+                        alone and r["ctl"] == group[0]["ctl"]) for r in others):
                 msgs.append("ccx writes all output of a step at one frequency (Abaqus gives each "
                             "request its own): " + ("the .dat (print / history) requests follow "
                                                     "the .frd requests'." if group is frd else
@@ -15939,6 +15965,11 @@ class Converter:
             if timed:
                 msgs.append("ccx writes all output of a step at one frequency: the requests at "
                             "time intervals here follow the ones every so many increments.")
+            if len(set(freqs)) > 1:
+                msgs.append(f"ccx writes all output of a step at one frequency: requests at "
+                            f"FREQUENCY={' / '.join(map(str, sorted(set(freqs))))} -> "
+                            f"FREQUENCY={math.gcd(*freqs)}, which writes each of them at least "
+                            f"as often as asked.")
             if all(r["default"] for r in group) and freqs[0] == 10:
                 msgs.append(f"*{timing['proc']}: output every 10 increments, the Abaqus default "
                             f"for this procedure (ccx's is every increment).")
@@ -19054,17 +19085,31 @@ class Converter:
         own: List[str] = []
         if id(b) in self._self_contact:
             given, lines = self._self_contact[id(b)]
-            msg = (f"*CONTACT PAIR {b.param('INTERACTION') or ''}: self-contact of "
-                   f"{', '.join(dedup(x.split(',')[0].strip() for x in lines))} (one surface, or "
-                   f"the same surface twice) has no exact ccx form: ccx stops on a one-surface "
-                   f"line, and its 'S, S' is not Abaqus' two-way self-contact (probed on 2.23: "
-                   f"half the contact force of a strip folding onto itself); commented out, so "
-                   f"ccx solves the model without that contact.")
+            what = (f"self-contact of {', '.join(dedup(x.split(',')[0].strip() for x in lines))} "
+                    f"(one surface, or the same surface twice)")
+            if b.has("TIED"):
+                msg = (f"*CONTACT PAIR, TIED {b.param('INTERACTION') or ''}: {what} is no Abaqus "
+                       f"input (TIED is not allowed with self-contact: Abaqus stops on it), and "
+                       f"ccx's '*TIE S, S' ties each node to its own faces, looping in its cascade "
+                       f"('zero coefficient on the dependent side', probed on 2.23); left out.")
+                reduces: Union[bool, str] = False
+            else:
+                msg = (f"*CONTACT PAIR {b.param('INTERACTION') or ''}: {what} has no exact ccx "
+                       f"form: ccx stops on a one-surface line, and its 'S, S' is not Abaqus' "
+                       f"two-way self-contact (probed on 2.23: half the contact force of a strip "
+                       f"folding onto itself); commented out, so ccx solves the model without "
+                       f"that contact (rerun with --approximate to write it as 'S, S' with TYPE="
+                       f"SURFACE TO SURFACE, {self._SELF_CONTACT_S2S}).")
+                reduces = "*CONTACT PAIR self-contact"
             if not any(x.strip() for x in b.data):
-                return self._commented(given, msg, "*CONTACT PAIR self-contact")
+                return self._comment_out(msg, [emit_keyword(given.keyword, given.params)] +
+                                         list(given.data), reduces)
             own = self._comment_out(msg + " Its self-contact lines are commented out; the card's "
-                                    "other lines are kept.", lines, "*CONTACT PAIR self-contact",
-                                    comment=msg)
+                                    "other lines are kept.", lines, reduces, comment=msg)
+        if id(b) in self._self_approx:
+            self.report.warn(f"[APPROX] *CONTACT PAIR self-contact written as ccx's 'S, S' with "
+                             f"TYPE=SURFACE TO SURFACE (Abaqus' self-contact is two-way, like "
+                             f"symmetric pairs): {self._SELF_CONTACT_S2S}.", once=True)
         drop = any(i == id(b) for (i, _) in self._tie_to_rigid)
         nb, comments, empty = self._pair_lines(b, "*CONTACT PAIR")
         comments += own
@@ -19081,23 +19126,43 @@ class Converter:
                     "nodes are members of the rigid body of its master surface"] + comments
         return self._contact_pair_lines(nb) + comments
 
+    # ccx's 'S, S' surface-to-surface self-contact against symmetric pairs (Abaqus' self-contact),
+    # measured on 2.23: a C-shaped strip whose arm tip closes a gap 0.2 by 0.05 / 0.2 / 0.4,
+    # 17.59 / 56.70 / 71.34 vs node-to-surface pairs 17.61 / 55.26 / 62.92, surface-to-surface
+    # pairs 17.68 / 57.36 / 79.07 (Abaqus' default is node-to-surface)
+    _SELF_CONTACT_S2S = ("measured on a strip folding onto itself: 0.1 % off symmetric "
+                         "node-to-surface pairs on a mild closure, 13 % above them (10 % below "
+                         "surface-to-surface ones) on a deep one")
+
     def _plan_self_contact(self, blocks: List[Block]) -> List[Block]:
-        """Each *CONTACT PAIR card (not TIED) without its self-contact lines: one surface, or
-        the same surface twice (Abaqus: "contact between a single surface and itself"), which
+        """Each *CONTACT PAIR card without its self-contact lines: one surface, or the same
+        surface twice (Abaqus: "contact between a single surface and itself"), which
         handle_contact_pair comments out.  ccx 2.23 stops on a one-surface line ("allocont:
         master surface"); its own ``S, S`` runs, but is not Abaqus' two-way self-contact
         (probed: node-to-surface on a strip folding onto itself carries half the contact
-        force and pushes the plane model out of its plane)."""
+        force and pushes the plane model out of its plane; surface-to-surface comes close,
+        _SELF_CONTACT_S2S).  Under --approximate a card that is not TIED gets those lines as
+        a card of its own, ``S, S`` with TYPE=SURFACE TO SURFACE ([APPROX], _self_approx).
+        A TIED card's are no Abaqus input (TIED "is not allowed with self-contact"), and ccx
+        loops on their ``*TIE S, S`` (probed)."""
         def name(t: str) -> str:
             t = t.strip()
             return t if t.startswith('"') else t.upper()
         out: List[Block] = []
         for b in blocks:
-            if b.keyword == "CONTACT PAIR" and not b.has("TIED"):
+            if b.keyword == "CONTACT PAIR":
                 keep, own = [], []
                 for ln in b.data:
                     f = [name(x) for x in ln.split(",") if x.strip()]
                     (own if len(f) == 1 or (len(f) > 1 and f[0] == f[1]) else keep).append(ln)
+                if own and self._approx and not b.has("TIED"):
+                    params = OrderedDict((k, v) for k, v in b.params.items() if k != "TYPE")
+                    params["TYPE"] = "SURFACE TO SURFACE"
+                    lines = dedup(f"{s}, {s}" for s in (name(x.split(",")[0]) for x in own))
+                    sb = Block(b.keyword, params, lines)
+                    self._self_approx[id(sb)] = b
+                    out += [Block(b.keyword, b.params, keep)] * bool(keep) + [sb]
+                    continue
                 if own:
                     nb = Block(b.keyword, b.params, keep)
                     self._self_contact[id(nb)] = (b, own)
@@ -19111,10 +19176,7 @@ class Converter:
             adj = (b.param("ADJUST") or "").strip()
             for rec in merged_data_records(b):
                 f = [x for x in rec if x != ""]
-                if len(f) < 2:
-                    if f:
-                        self.report.warn(f"*CONTACT PAIR, TIED line '{f[0]}' names one surface (a "
-                                         f"tie needs a slave and a master); left out.", once=True)
+                if len(f) < 2:              # (one-surface lines: _plan_self_contact)
                     continue
                 self._synth_counter += 1
                 params: "OrderedDict[str, Optional[str]]" = OrderedDict(
@@ -20630,6 +20692,64 @@ class Converter:
                     self.report.note(f"{label}: {len(slaves) - len(tied)} slave node(s) {why} are "
                                      f"left untied, as {'ccx' if pair else 'Abaqus'} leaves them.",
                                      once=True)
+
+    def _sheet_thicknesses(self, blocks: List[Block]) -> Dict[int, Tuple[float, float]]:
+        """Shell and membrane element -> (thickness, OFFSET as a fraction): _shell_thicknesses,
+        and a membrane's largest thickness where every one it has is positive (OFFSET 0)."""
+        out = self._shell_thicknesses(blocks)
+        mem = {e for e, (typ, _c) in self.geom.elements.items() if typ.upper().startswith("M3D")}
+        for e, ts in (self._membrane_thicknesses(blocks, mem)[0].items() if mem else ()):
+            if ts and all(t is not None and t > 0.0 for t in ts):
+                out[e] = (max(ts), 0.0)
+        return out
+
+    def _sheet_contact_thickness(self, blocks: List[Block], lines: List[Tuple[Block, str, str]]
+                                 ) -> None:
+        """Warn of the contact pair lines ccx gets ((card, slave, master)) with a surface on
+        shells or membranes whose thickness Abaqus ignores there: in finite-sliding
+        node-to-surface contact, which "will not account for surface thickness", and in any
+        pair with NO THICKNESS ("Assigning surface properties for contact pairs in
+        Abaqus/Standard"; the deck's formulation, also for _self_approx's card).  ccx expands
+        shells and membranes, so its contact acts on their faces, half the thickness (and
+        OFFSET) off the reference surface Abaqus' acts on (probed on 2.23: a block pushed to
+        0.05 over the midsurface of a plate 0.2 thick carries 38 in node-to-surface contact,
+        50 in surface-to-surface, with or without NO THICKNESS, where Abaqus' node-to-surface
+        contact stays open).  Only faces SPOS / SNEG count: not edges, nor a line without a
+        face label, which ccx's surface leaves out (handle_surface)."""
+        sheets: Optional[Dict[int, Tuple[float, float]]] = None
+        hit: List[str] = []
+        why = set()
+        for b, slave, master in lines:
+            given = self._self_approx.get(id(b), b)
+            if given.has("NO THICKNESS"):
+                reason = "a pair with NO THICKNESS"
+            elif not given.has("SMALL SLIDING") and \
+                    given.uparam("TYPE").replace(" ", "") != "SURFACETOSURFACE":
+                reason = "finite-sliding node-to-surface contact"
+            else:
+                continue
+            if sheets is None:
+                sheets = self._sheet_thicknesses(blocks)
+            for surf in dedup([slave, master]):
+                sd = self.surfaces.get(surf)
+                if surf in hit or not sd or sd[0].startswith("NODE"):
+                    continue
+                if any(sheets.get(e, (0.0, 0.0))[0] > 0.0 for tok, face in sd[1]
+                       if (face or "").upper() in ("SPOS", "SNEG")
+                       for e in self._resolve_elements(tok)):
+                    hit.append(surf)
+                    why.add(reason)
+        if hit:
+            self.report.warn(f"*CONTACT PAIR surface(s) {', '.join(hit[:5])}"
+                             f"{', ...' if len(hit) > 5 else ''} on shells or membranes in "
+                             f"{' and '.join(sorted(why))}, where Abaqus ignores their thickness "
+                             f"(contact on the reference surface): ccx expands shells and "
+                             f"membranes, and its contact acts on their faces, half the thickness "
+                             f"(and OFFSET) away (probed on 2.23: a block 0.05 over the "
+                             f"midsurface of a plate 0.2 thick carries contact force there, none "
+                             f"in Abaqus).", once=True)
+            self._reduces("*CONTACT PAIR on shells or membranes: ccx counts the thickness "
+                          "Abaqus ignores")
 
     def _shell_thicknesses(self, blocks: List[Block]) -> Dict[int, Tuple[float, float]]:
         """Conventional shell element -> (thickness, OFFSET as a fraction: SPOS 0.5, SNEG
@@ -24333,7 +24453,8 @@ class Converter:
                     self._jc_with_rate.add(id(jc_block))
 
     def _plan_base_state_facts(self, blocks: List[Block]) -> None:
-        """The deck's procedures, sensitivity cards, and what a perturbation's base state holds."""
+        """The deck's procedures, sensitivity cards, and what a perturbation's base state holds;
+        the contact pairs ccx gets (also warned on shells: _sheet_contact_thickness)."""
         self._has_sensitivity = any(b.keyword in ("SENSITIVITY", "FEASIBLE DIRECTION") for b in blocks)
         # what a perturbation step's base state holds (_frequency_perturbation; a first
         # *BUCKLE step: handle_step)
@@ -24352,6 +24473,7 @@ class Converter:
         self._freq_contact = bool(lines)
         self._overclosed = bool(lines) and any(b.keyword == "FREQUENCY" for b in blocks) and \
             self._contact_overclosed(blocks, lines)
+        self._sheet_contact_thickness(blocks, lines)
         self._deck_procs = {b.keyword for b in blocks if b.keyword in PROC_KW}
         self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
                                   and temperature_dependent(b) for b in blocks)

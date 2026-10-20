@@ -6,6 +6,22 @@ physics.
 
 ## Unreleased
 
+* **Self-contact, contact roles and contact on shells**:
+  * Under `--approximate`, a self-contact line becomes ccx's `S, S` with TYPE=SURFACE TO
+    SURFACE ([APPROX]). On a strip folding onto itself it came within 0.1 % of symmetric
+    node-to-surface pairs on a mild closure, and between ccx's two pair formulations on a deep one.
+  * A TIED self-contact line (written as `*TIE S, S`) is left out with a warning: Abaqus rejects
+    TIED self-contact, and ccx 2.23 looped on the tie until it was killed.
+  * The Abaqus 2022+ names MAIN and SECONDARY are read as MASTER and SLAVE, so a `*CLEARANCE`
+    or `*CONTACT PRINT` that uses them now reaches ccx (the clearance stopped ccx before).
+  * Shell or membrane surfaces in finite-sliding node-to-surface pairs, or in pairs with NO
+    THICKNESS, are warned (reduced physics): Abaqus ignores their thickness there, but ccx's
+    expanded shells always count it.
+* **`*HYPERFOAM, TEST DATA INPUT`** is commented out with a warning, like `*HYPERELASTIC`'s. ccx
+  reads no test data and stopped on the card's missing coefficients.
+* **Output frequency notes** — ccx writes all output of a step at one frequency. When the step's
+  requests ask for different ones (a print card's FREQUENCY=100 beside preselected .frd output),
+  a note now gives the frequency ccx writes.
 * **`*SHELL SECTION, DENSITY=` on conventional shells** — the mass per unit area was dropped
   with a note, so the modes came out up to 1.9× too high. Where mass acts, each material (each
   ply material of a composite) now gets a copy with DENSITY / t more, t the section's

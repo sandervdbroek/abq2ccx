@@ -2336,6 +2336,65 @@ def dat_totals(dat_path):
     return out
 
 
+def folding_strip_deck(mode, d=0.25):
+    """A C-shaped strip (two arms of 20 C3D8I joined at x = 0, gap 0.2, held in its plane)
+    whose top-arm tip is pushed down ``d``, folding it onto the bottom arm, with Abaqus'
+    default (node-to-surface) contact: ``mode`` "self", one surface S of both inner arm faces
+    and the joint's ('S,', Abaqus' self-contact), or "sym", the symmetric pairs of the two arm
+    faces (Abaqus' self-contact acts "similar to symmetric master-slave contact pairs")."""
+    nx, ys = 20, [0.0, 1.0, 1.2, 2.2]
+    cells = [(i, 0) for i in range(nx)] + [(0, 1)] + [(i, 2) for i in range(nx)]
+    nodes = {}
+
+    def nid(i, j, k):
+        return nodes.setdefault((i, j, k), len(nodes) + 1)
+    conn = [[nid(i, j, 0), nid(i + 1, j, 0), nid(i + 1, j + 1, 0), nid(i, j + 1, 0),
+             nid(i, j, 1), nid(i + 1, j, 1), nid(i + 1, j + 1, 1), nid(i, j + 1, 1)] for i, j in cells]
+    eid = {c: e for e, c in enumerate(cells, 1)}
+
+    def nset(name, ids):
+        ids = sorted(ids)
+        return f"*Nset, nset={name}\n" + "\n".join(", ".join(map(str, ids[i:i + 16]))
+                                                    for i in range(0, len(ids), 16)) + "\n"
+    bot = "".join(f"{eid[(i, 0)]}, S5\n" for i in range(1, nx))
+    top = "".join(f"{eid[(i, 2)]}, S3\n" for i in range(1, nx))
+    surf = (f"*Surface, name=S\n{bot}{eid[(0, 1)]}, S4\n{top}*Contact Pair, interaction=I\nS,\n"
+            if mode == "self" else
+            f"*Surface, name=SA\n{top}*Surface, name=SB\n{bot}*Contact Pair, interaction=I\nSA, SB\n"
+            f"*Contact Pair, interaction=I\nSB, SA\n")
+    return ("*Node\n" + "".join(f"{n}, {0.5 * i}, {ys[j]}, {float(k)}\n"
+                                for (i, j, k), n in sorted(nodes.items(), key=lambda t: t[1])) +
+            "*Element, type=C3D8I, elset=E\n" +
+            "".join(f"{e}, {', '.join(map(str, c))}\n" for e, c in enumerate(conn, 1)) +
+            "*Solid Section, elset=E, material=M\n*Material, name=M\n*Elastic\n1000., 0.\n" +
+            nset("FIX", [n for (i, j, k), n in nodes.items() if j == 0]) +
+            nset("TIP", [n for (i, j, k), n in nodes.items() if i == nx and j in (2, 3)]) +
+            nset("NALL", nodes.values()) +
+            "*Surface Interaction, name=I\n*Surface Behavior, pressure-overclosure=LINEAR\n1.e5\n" +
+            surf + "*Boundary\nFIX, 1, 3\nNALL, 3, 3\n*Step, nlgeom, inc=1000\n*Static\n"
+            f"0.05, 1., 1.e-6, 0.05\n*Boundary\nTIP, 2, 2, {-d}\n"
+            "*Node Print, nset=TIP, totals=only\nRF\n*End Step\n")
+
+
+def clearance_deck(roles):
+    """Two unit cubes (C3D8) 0.01 apart in z, the lower one held at its base, the upper one's top
+    pushed down 0.005, with a surface-to-surface pair (upper base on lower top) and a *CLEARANCE
+    of 0 written with ``roles`` = (slave, master) parameter names, or none (``roles`` None):
+    contact from the start with the clearance, none without (the gap stays open)."""
+    pts = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    nodes = "".join(f"{n}, {x}., {y}., {z}\n" for n, (z, (x, y)) in enumerate(
+        ((z, p) for z in (0., 1., 1.01, 2.01) for p in pts), 1))
+    clr = f"*Clearance, {roles[0]}=UP, {roles[1]}=LOW, value=0.\n" if roles else ""
+    return ("*Node\n" + nodes + "*Element, type=C3D8, elset=E\n1, 1,2,3,4,5,6,7,8\n"
+            "2, 9,10,11,12,13,14,15,16\n*Solid Section, elset=E, material=M\n*Material, name=M\n"
+            "*Elastic\n1000., 0.\n*Nset, nset=BASE\n1, 2, 3, 4\n*Nset, nset=LTOP\n5, 6, 7, 8\n"
+            "*Nset, nset=UTOP\n13, 14, 15, 16\n*Surface, name=LOW\n1, S2\n*Surface, name=UP\n2, S1\n"
+            "*Surface Interaction, name=I\n*Surface Behavior, pressure-overclosure=LINEAR\n1.e4\n"
+            "*Contact Pair, interaction=I, type=SURFACE TO SURFACE\nUP, LOW\n" + clr +
+            "*Boundary\nBASE, 1, 3\nUTOP, 1, 2\n*Step\n*Static\n*Boundary\nUTOP, 3, 3, -0.005\n"
+            "*Node Print, nset=UTOP, totals=only\nRF\n*Node Print, nset=LTOP\nU\n*End Step\n")
+
+
 def follower_turning_deck(form, steps=6, step_deg=15.0):
     """A unit cube (C3D8, ``form`` "3d": *DSLOAD TRVEC on its face x = 1) or square (CPE4,
     "2d": element-based *DLOAD TRVEC2 on its edge x = 1) whose face x = 0 is turned about z in
@@ -9426,6 +9485,53 @@ def main():
               f"*INITIAL CONDITION, *SOLID SECT, MAT=, *ELAS, TYPE=ISO, *EXPAN, *BOUND, F=1): a free "
               f"cube heated 20 -> 120 strains alpha dT, u = 1e-3 x ({err:.1e} apart, corner u_x "
               f"{u[7][0]:.6e})")
+    failures += 0 if ok else 1
+
+    # --- self-contact under --approximate: ccx's 'S, S' with TYPE=SURFACE TO SURFACE, on a strip
+    # folding shut (tip 0.25 down over a gap 0.2), against the symmetric pairs Abaqus' two-way
+    # self-contact acts like (the deck's node-to-surface ones); commented out without
+    # --approximate, only the strip's bending carries (base: commented out either way)
+    def tip_force(dat):
+        h = dat_history(dat, "total force", "TIP")
+        return (h[-1][0], *h[-1][1][0]) if h and h[-1][1] else None
+    runs = {tag: review_run(folding_strip_deck(mode), f"self_contact_{tag}", tip_force, approximate=ap)
+            for tag, mode, ap in (("approx", "self", True), ("pairs", "sym", False),
+                                  ("plain", "self", False))}
+    ok = all(runs.values())
+    if ok:
+        got, want, plain = (runs[k] for k in ("approx", "pairs", "plain"))
+        err = abs(got[2] / want[2] - 1)
+        ok = all(abs(r[0] - 1.0) < 1e-9 for r in runs.values()) and err < 5e-3 and \
+            abs(got[2]) > 100 * abs(plain[2]) and abs(got[3]) < 1e-2 * abs(got[2])
+        print(f"{'PASS' if ok else 'FAIL'}  self_contact_approx (C-shaped C3D8I strip folding onto "
+              f"itself, Abaqus' self-contact line 'S,' under --approximate): tip force {got[2]:.6g} vs "
+              f"{want[2]:.6g} with symmetric node-to-surface pairs ({err:.1e} apart; out of plane "
+              f"{got[3]:.2g}), {plain[2]:.3g} with it commented out (no --approximate)")
+    failures += 0 if ok else 1
+
+    # --- Abaqus 2022+ MAIN / SECONDARY read as MASTER / SLAVE: a *CLEARANCE of 0 between two
+    # cubes 0.01 apart, one pushed 0.005 toward the other, closes the gap from the start (ccx
+    # applies a clearance on its MASTER / SLAVE pair; base: 'parameter not recognized', ccx
+    # stopped).  Closed form: the two cubes (EA/L 1000) and the contact (1e4) in series
+    def clearance_run(dat):
+        tot = dat_totals(dat)
+        u = [r for _, _t, s, _tm, rows in A.dat_blocks(dat) if s == "LTOP" for r in rows]
+        return (tot[-1], u[-4:]) if tot and len(u) >= 4 else None
+    runs = {tag: review_run(clearance_deck(roles), f"clearance_{tag}", clearance_run)
+            for tag, roles in (("main", ("secondary", "main")), ("master", ("slave", "master")),
+                               ("none", None))}
+    ok = all(runs.values())
+    if ok:
+        want = 0.005 / (1 / 1000. + 1 / 1000. + 1 / 1.e4)
+        (f_main, u_main), (f_old, u_old), (f_none, u_none) = (runs[k] for k in ("main", "master", "none"))
+        err = abs(-f_main[2] / want - 1)
+        apart = max(abs(a - b) for x, y in zip(u_main, u_old) for a, b in zip(x, y)) + abs(f_main[2] - f_old[2])
+        ok = err < 1e-6 and apart < 1e-12 and all(abs(r[3] + want / 1000.) < 1e-9 for r in u_main) and \
+            abs(f_none[2]) < 1e-9 and all(abs(r[3]) < 1e-12 for r in u_none)
+        print(f"{'PASS' if ok else 'FAIL'}  clearance_main_secondary (*CLEARANCE, SECONDARY=, MAIN=, "
+              f"VALUE=0 on a surface-to-surface pair of two cubes 0.01 apart, one pushed 0.005): force "
+              f"{-f_main[2]:.7g} = the series closed form {want:.7g} ({err:.1e}), the struck cube's top "
+              f"{u_main[0][3]:.4g}; as SLAVE= / MASTER= ({apart:.1e} apart); without it {f_none[2]:.1e}")
     failures += 0 if ok else 1
 
     # --- cards ccx 2.23 stopped or crashed on as they were written (code review 2, R20) ---

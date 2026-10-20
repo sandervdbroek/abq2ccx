@@ -4871,6 +4871,24 @@ def test_output_frequency_carried_to_the_step():
     assert "*NODE FILE" not in body
 
 
+def test_print_frequency_under_preselected_output_noted():
+    # ccx has one output frequency for all output cards of a step (its manual: "the last value
+    # applies to all"): a print card's FREQUENCY=100 beside Abaqus' preselected .frd output
+    # (every increment) is written every increment, noted (abaqus2017_nnl6x22x)
+    deck = (HEX + "*Nset, nset=TOP\n5, 6, 7, 8\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n*Step, nlgeom\n*Static\n"
+            "0.1, 1.\n*Cload\n7, 3, 1.\n*Node Print, nset=TOP, frequency=100\nU\n{}*End Step\n")
+    body, _, rep = convert_str(deck.format(""))
+    assert "FREQUENCY=100" not in body and "*NODE PRINT, NSET=TOP\nU\n" in body
+    assert "the .dat (print / history) requests follow the .frd requests'" in rep.text()
+    body, _, rep = convert_str(deck.format("*Node File, nset=TOP, frequency=100\nU\n"))
+    assert "requests at FREQUENCY=1 / 100 -> FREQUENCY=1, which writes each" in rep.text()
+    assert "follow the .frd requests'" in rep.text()
+    body, _, rep = convert_str(deck.format("*Output, field, frequency=100\n*Node Output\nU\n"))
+    assert "*NODE PRINT, NSET=TOP, FREQUENCY=100\nU\n*NODE FILE\nU\n" in body
+    assert "at one frequency" not in rep.text()
+
+
 def test_output_intervals_to_time_points_or_frequency():
     # NUMBER INTERVAL / TIME INTERVAL -> *TIME POINTS (before the first *STEP, as ccx needs)
     # where ccx picks the increments; FREQUENCY from the fixed increment under DIRECT, where
@@ -5585,6 +5603,100 @@ def test_self_contact_pairs_commented_out():
     assert "*CONTACT PAIR, INTERACTION=I, TYPE=NODE TO SURFACE\nT, S\n" in body
     assert "\n** S\n" in body and "*CONTACT FILE" in body
     assert conv.reduced_physics == ["*CONTACT PAIR self-contact"]
+
+
+def test_self_contact_approximate_and_tied():
+    # --approximate: the self-contact lines as ccx's 'S, S' with TYPE=SURFACE TO SURFACE, a card
+    # of their own after the card's other lines ([APPROX]; measured on a strip folding onto
+    # itself: validate_with_ccx self_contact_approx)
+    deck = HEX + ("*Surface, name=S\nEALL, S2\n*Surface, name=T\nEALL, S1\n*Surface Interaction, "
+                  "name=I\n*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, "
+                  "material=M\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n"
+                  "*Contact File\nCDIS\n*End Step\n")
+    flag = ("--approximate: *CONTACT PAIR self-contact written as ccx's 'S, S' with TYPE=SURFACE TO "
+            "SURFACE")
+    for line in ("S", "S, S", "s, S,"):
+        body, conv, rep = convert_str(deck.replace("*Material", f"*Contact Pair, interaction=I, "
+                                                                f"type=node to surface\n{line}\n"
+                                                                f"*Material"), approximate=True)
+        assert "*CONTACT PAIR, INTERACTION=I, TYPE=SURFACE TO SURFACE\nS, S\n" in body
+        assert conv.reduced_physics == [flag] and "*CONTACT FILE" in body
+        assert "[APPROX] *CONTACT PAIR self-contact" in rep.text()
+    body, conv, _ = convert_str(deck.replace("*Material", "*Contact Pair, interaction=I\nS\nT, S\n"
+                                                          "S, S\n*Material"), approximate=True)
+    assert ("*CONTACT PAIR, INTERACTION=I, TYPE=NODE TO SURFACE\nT, S\n*CONTACT PAIR, "
+            "INTERACTION=I, TYPE=SURFACE TO SURFACE\nS, S\n*MATERIAL") in body
+    assert conv.reduced_physics == [flag]
+    _, conv, rep = convert_str(deck.replace("*Material", "*Contact Pair, interaction=I\nS\n*Material"))
+    assert "rerun with --approximate to write it as 'S, S'" in rep.text()
+    assert conv.reduced_physics == ["*CONTACT PAIR self-contact"]
+    # TIED self-contact is no Abaqus input ("not allowed with self-contact"), and ccx loops on
+    # '*TIE S, S' (probed): left out, warned, with or without --approximate
+    for approx in (False, True):
+        body, conv, rep = convert_str(deck.replace(
+            "*Material", "*Contact Pair, interaction=I, tied, adjust=0.\nS, S\nT\nT, S\n*Material"),
+            approximate=approx)
+        assert body.count("\n*TIE") == 1 and "\nT, S\n" in body and "\nS, S\n" not in body
+        assert "\n** S, S\n** T\n" in body and conv.reduced_physics == []
+        assert "TIED is not allowed with self-contact" in rep.text()
+    body, conv, rep = convert_str(deck.replace(
+        "*Material", "*Contact Pair, interaction=I, tied, adjust=0.\nS\n*Material"))
+    assert "\n*TIE" not in body and "\n** *CONTACT PAIR, INTERACTION=I, TIED, ADJUST=0.\n** S\n" in body
+    assert conv.reduced_physics == [] and "is no Abaqus input" in rep.text()
+
+
+def test_main_secondary_read_as_master_slave():
+    # Abaqus 2022+ names the contact roles MAIN / SECONDARY: read as MASTER / SLAVE, which the
+    # converter and ccx read (a *CLEARANCE ccx applies, a *CONTACT PRINT's pair); abbreviations
+    # of the 2017 names read as before
+    def params(line):
+        return dict(A.parse_keyword_line(line, {})[1])
+    assert params("*Contact Print, secondary=T, main=S") == {"SLAVE": "T", "MASTER": "S"}
+    assert params("*Clearance, sec=T, mai=S, value=0.") == {"SLAVE": "T", "MASTER": "S", "VALUE": "0."}
+    assert params("*Contact Output, Main=S") == {"MASTER": "S"}
+    assert params("*Contact Controls, secondary=T") == {"SLAVE": "T"}
+    assert params("*Contact File, secondary=T") == {"SLAVE": "T"}
+    assert params("*Contact Print, ma=S") == {"MASTER": "S"}
+    assert params("*Contact Output, second=S") == {"SECOND SURFACE": "S"}
+    assert params("*Tie, name=T, main=S") == {"NAME": "T", "MAIN": "S"}      # no such parameter
+    deck = HEX + ("*Surface, name=S\nEALL, S2\n*Surface, name=T\nEALL, S1\n*Surface Interaction, "
+                  "name=I\n*Contact Pair, interaction=I, type=surface to surface\nT, S\n"
+                  "*Clearance, secondary=T, main=S, value=0.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+                  "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n*Step\n*Static\n"
+                  "*Cload\n7, 3, 1.\n*Contact Print, secondary=T, main=S\nCF\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*CLEARANCE, SLAVE=T, MASTER=S, VALUE=0.\n" in body
+    assert "*CONTACT PRINT, SLAVE=T, MASTER=S\nCF\n" in body
+    assert "Abaqus 2022+ parameter names read as their earlier ones" in rep.text()
+    assert "*CLEARANCE, SECONDARY -> SLAVE" in rep.text() and conv.reduced_physics == []
+
+
+def test_shell_contact_thickness_abaqus_ignores_warned():
+    # Abaqus' finite-sliding node-to-surface contact ignores shell and membrane thickness, and
+    # so does any pair with NO THICKNESS; ccx expands shells and membranes, whose faces it
+    # contacts (probed: a block 0.05 over a 0.2 plate's midsurface carries force in ccx)
+    flag = "*CONTACT PAIR on shells or membranes: ccx counts the thickness Abaqus ignores"
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "11, 0., 0., .2\n12, 1., 0., .2\n13, 1., 1., .2\n14, 0., 1., .2\n"
+            "15, 0., 0., 1.2\n16, 1., 0., 1.2\n17, 1., 1., 1.2\n18, 0., 1., 1.2\n"
+            "*Element, type={el}, elset=PLATE\n1, 1, 2, 3, 4\n*Element, type=C3D8, elset=BLOCK\n"
+            "2, 11, 12, 13, 14, 15, 16, 17, 18\n*Material, name=M\n*Elastic\n1000., 0.\n"
+            "*{sec} Section, elset=PLATE, material=M\n0.2\n*Solid Section, elset=BLOCK, material=M\n"
+            "*Surface, name=PS{node}\n{plate}\n*Surface, name=BS\nBLOCK, S1\n*Surface Interaction, name=I\n"
+            "*Contact Pair, interaction=I{pair}\nBS, PS\n*Boundary\n1, 1, 6\n2, 1, 6\n3, 1, 6\n"
+            "4, 1, 6\n*Step\n*Static\n*Boundary\n15, 1, 3, -0.1\n*End Step\n")
+
+    def flagged(pair="", el="S4", sec="Shell", plate="PLATE, SPOS", node=""):
+        _, conv, rep = convert_str(deck.format(el=el, sec=sec, plate=plate, node=node, pair=pair))
+        return flag in conv.reduced_physics and "where Abaqus ignores their thickness" in rep.text()
+    assert flagged() and flagged(", type=node to surface") and flagged(plate="PLATE, SNEG")
+    assert flagged(", no thickness, type=surface to surface") and not flagged(plate="PLATE, E1")
+    assert flagged(", small sliding, no thickness") and flagged(el="M3D4", sec="Membrane")
+    assert not flagged(", type=surface to surface") and not flagged(", small sliding")
+    assert not flagged(plate="1", node=", type=node")         # node-based: no thickness either
+    _, conv, rep = convert_str(deck.format(el="S4", sec="Shell", plate="PLATE, SPOS", node="",
+                                           pair="").replace("BS, PS", "BS, BS"), approximate=True)
+    assert flag not in conv.reduced_physics                   # a self-contact of the block only
 
 
 def test_blankless_spellings_of_handled_and_tabled_keywords():
@@ -8301,6 +8413,13 @@ def test_hyperfoam_n1_written_as_n2():
     # an N=1 card the converter cannot rewrite stays, warned
     got, red, rep = conv("*Hyperfoam\nmu, 2., 0.1\n")
     assert got == ["*HYPERFOAM", "mu, 2., 0.1"] and red == ["*HYPERFOAM, N=1 (no stiffness in ccx 2.23)"]
+    # TEST DATA INPUT: ccx reads no test data, and reads the card as an N=1 one without
+    # coefficients (probed: a singular matrix): commented out, as *HYPERELASTIC's
+    body, c, rep = convert_str(deck.format("*Hyperfoam, test data input, poisson=0.\n*Uniaxial Test "
+                                           "Data\n-0.1, -0.1\n-0.2, -0.3\n") + step("Static"))
+    assert "\n** *HYPERFOAM, TEST DATA INPUT, POISSON=0.\n" in body and "\n*HYPERFOAM" not in body
+    assert "*HYPERFOAM, TEST DATA INPUT: Abaqus fits the coefficients" in rep.text()
+    assert "N=1 kept as written" not in rep.text() and "*HYPERFOAM" in c.reduced_physics
 
 
 def test_buckle_contact_left_out():
