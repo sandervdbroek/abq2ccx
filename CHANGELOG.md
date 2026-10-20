@@ -6,6 +6,24 @@ physics.
 
 ## Unreleased
 
+* **TIME DELAY kept on loads converted to nodal forces** — the `*CLOAD` written for a
+  traction, beam line load or surface-element pressure carried its amplitude without the
+  delay, so ccx applied the amplitude undelayed. ccx 2.23's `*CLOAD` takes TIME DELAY
+  (probed): it is kept now. A deck `*CLOAD` sharing a node DOF with another delay no longer
+  stops ccx ('forcadd'); such a load is dropped, warned.
+* **Static perturbation gradients over one-value temperatures** — a perturbation step's
+  shell or beam gradient over base temperatures given by one value (or the reverse) was
+  warned and left unsummed. A missing gradient is 0 on GRADIENT sections, as ccx 2.23 reads
+  it too (probed), so the values are summed. The general step after such a step gets the
+  initial temperatures back line by line: ccx's `*TEMPERATURE, OP=NEW` keeps the last
+  gradient (probed).
+* **Shell gradients on S4 / S4R warned** — ccx 2.23 ignores a temperature gradient through
+  the thickness on S4 and S4R (probed; S3, S6, S8 and S8R read it), so their thermal bending
+  was lost silently. A deck that changes one there is now warned, reduced physics.
+* **`*BUCKLE` steps without a load** — a step whose loads are all zero (on an amplitude that
+  is 0 at time 0, zero values, or none) has no buckling factor; ccx 2.23 prints noise of 1e9
+  and more. One warning per step now says so; a zeroed card beside other loads is no longer
+  warned.
 * **Self-contact, contact roles and contact on shells**:
   * Under `--approximate`, a self-contact line becomes ccx's `S, S` with TYPE=SURFACE TO
     SURFACE ([APPROX]). On a strip folding onto itself it came within 0.1 % of symmetric

@@ -5400,12 +5400,12 @@ class EmitState:
         # (write_step; _loads_nlgeom)
         self.nlgeom = False
         # distributed loads emitted as consistent nodal forces (see _flush_nodal_loads):
-        # (card, target, label) -> ({(node, DOF): force}, amplitude), in Abaqus semantics
-        self.nodal_loads: "OrderedDict[tuple, Tuple[Dict[Tuple[int, int], float], Optional[str]]]" = \
+        # (card, target, label) -> ({(node, DOF): force}, amplitude: _cload_amp), in Abaqus semantics
+        self.nodal_loads: "OrderedDict[tuple, Tuple[Dict[Tuple[int, int], float], Optional[tuple]]]" = \
             OrderedDict()
         self.nodal_fresh: set = set()               # keys (re)defined in the current step
         self.nodal_reset: set = set()               # cards with OP=NEW in the current step
-        self.nodal_emitted: Dict[Tuple[int, int], Tuple[str, Optional[str]]] = {}    # in ccx
+        self.nodal_emitted: Dict[Tuple[int, int], Tuple[str, Optional[tuple]]] = {}  # in ccx
         self.cload_new = False                      # the deck's *CLOAD, OP=NEW in this step
         # *DLOAD lines emitted per source card ("DLOAD" / "DSLOAD"): key -> (line, card
         # parameters, what it loads: _dl_faces, the line in a later step: _load_later), so a
@@ -5541,6 +5541,9 @@ class BaseStateRestore:
             conv._modal_held, conv._restore_yields, conv._yield_segv
         self.transformed = conv._transformed
         self.written = conv.emit.written            # each step's *STEP card as written
+        # the nodes whose temperature lines give values at section points, not gradients
+        self.point_nodes = {n for e in conv._point_temps if e in conv.geom.elements
+                            for n in conv.geom.elements[e][1]}
         # the deck as written (_index)
         self.sets = EmittedSets()
         self.generated: set = set()                 # the converted loads' nodal-force *CLOADs
@@ -5716,6 +5719,14 @@ class BaseStateRestore:
             return None
 
     @staticmethod
+    def padded(t: Tuple[float, ...], u: Tuple[float, ...]) -> List[Tuple[float, float]]:
+        """Two temperature lines' values side by side, the shorter one's missing values 0: a
+        GRADIENT section's (the default), where Abaqus reads a blank gradient as 0 and ccx
+        2.23 a one-value line as gradient 0 (probed, after a gradient line too)."""
+        n = max(len(t), len(u))
+        return list(zip(t + (0.0,) * (n - len(t)), u + (0.0,) * (n - len(u))))
+
+    @staticmethod
     def _hot(t: Optional[Tuple[float, ...]]) -> bool:
         """Whether base-state temperatures differ from 0 (or are unknown)."""
         return t is None or any(t)
@@ -5805,6 +5816,8 @@ class BaseStateRestore:
                 continue
             entries, again = self._load_entries(kw, mine) if kw in self.contrib else \
                 self._line_entries(kw, s, mine, touched)
+            if kw == "TEMPERATURE":
+                entries = self._gradients_back(between) + entries
             if again:
                 regiven.add(kw)
             if not entries and kw not in touched:
@@ -5863,6 +5876,23 @@ class BaseStateRestore:
             again = any(n in base for b in mine for rec in b.records() if rec
                         for n in self.sets.members("NSET", rec[0]) or [])
         return entries, again
+
+    def _gradients_back(self, between: range) -> List[Tuple[Block, List[str]]]:
+        """The initial temperatures as *TEMPERATURE lines, where a perturbation step in
+        ``between`` gives a shell or beam gradient: ccx 2.23's *TEMPERATURE, OP=NEW sets the
+        temperatures back to the initial ones but keeps the last gradients given (probed), so
+        they are given again before the base state's lines (a one-value line has gradient 0
+        in ccx, as in Abaqus)."""
+        if not any(any((self.temperature(rec) or (0.0,))[1:]) for k in between
+                   for b in self.by_step.get(k, []) if b.keyword == "TEMPERATURE"
+                   for rec in b.records() if rec and rec[0]):
+            return []
+        ics = [b for b in self.deck.model if b.keyword == "INITIAL CONDITIONS" and
+               b.uparam("TYPE") == "TEMPERATURE"]
+        if any(b.has("FILE") or b.has("USER") or b.has("INPUT") for b in ics):
+            return []
+        plain = EmittedCard("TEMPERATURE", OrderedDict(), -1, 0, -1)
+        return [(plain, rec) for b in ics for rec in b.records() if rec and rec[0]]
 
     def _cards(self, kw: str, s: int, entries: List[Tuple[Block, List[str]]]) -> List[str]:
         """The ``kw`` cards of ``entries`` in step ``s``: one per run of lines with the same
@@ -6066,13 +6096,14 @@ class BaseStateRestore:
             return []
         if on and (b.uparam("AMPLITUDE") not in ("", self.conv.CCX_RAMP) or b.has("FIXED") or
                    b.has("USER") or None in on.values() or v is None or
-                   (kw == "TEMPERATURE" and (pv is None or any(
-                       len(a) != len(pv) for a in on.values())))):
+                   (kw == "TEMPERATURE" and (pv is None or (
+                       any(len(a) != len(pv) for a in on.values()) and
+                       not self.point_nodes.isdisjoint(ks))))):
             self.inexact.setdefault("changes what the base state loads by a value the "
                                     "converter cannot add to the base one (an amplitude, "
-                                    "FIXED or USER on either line, temperatures with other "
-                                    "gradients or section points than the base state's; "
-                                    "ccx replaces it)",
+                                    "FIXED or USER on either line, temperatures at another "
+                                    "number of section points than the base state's; ccx "
+                                    "replaces it)",
                                     []).append(f"{s} (*{kw} {rec[0]})")
             if not fix_ks:
                 return []
@@ -6085,7 +6116,7 @@ class BaseStateRestore:
         for a, part_ks in groups.items():
             r = list(rec) + [""] * (j + 1 - len(rec))
             if kw == "TEMPERATURE":                 # (each value: gradients, section points)
-                r = r[:j] + [short_real(x + y, 12) for x, y in zip(pv, a or (0.0,) * len(pv))]
+                r = r[:j] + [short_real(x + y, 12) for x, y in self.padded(pv, a or ())]
             else:
                 r[j] = short_real(v + a, 12)
             if kw == "BOUNDARY" and not r[2]:
@@ -6216,6 +6247,9 @@ class Converter:
         self._temp_ic_filled = False                # the fill line is written (first card)
         self._temp_ic_default = False
         self._temp_ic_covered: Optional[set] = None    # nodes the deck's initial temperatures name
+        # elements whose section reads a temperature line's values at section points
+        # (TEMPERATURE=n shell, TEMPERATURE=VALUES beam sections), not as gradients
+        self._point_temps: set = set()
         self._step_temp_dof: Optional[str] = None  # the step's procedure if temperature is a DOF
         # planar 2-D beams/trusses: element -> its PLANAR_LINE_TYPES type, and the model-data
         # *BOUNDARY lines that keep them in their plane (_plan_planar_constraint)
@@ -6425,7 +6459,7 @@ class Converter:
         self._sc_hyper: set = set()
         self._section_thick: Dict[int, float] = {}  # plane element -> section thickness
         self._beam_n1: Dict[int, Optional[Vec]] = {}    # beam -> approximate n1 of its section
-        self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> amplitudes
+        self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> _cload_amp
         self._has_normal = False
         self._planar_beams = False                  # the deck's beams are 2-D (B21, B22, ...)
         self._dl_memo: Dict[tuple, frozenset] = {}  # (_dl_faces)
@@ -13260,7 +13294,7 @@ class Converter:
             if why:
                 return self._drop_load_line(b, g, why)
             forces = {k: v for k, v in forces.items() if abs(v) > 1e-12 * big}
-        amp = b.param("AMPLITUDE")
+        amp = self._cload_amp(b)
         key = (card, g[0].upper(), label)
         if self._sp_adds and not amp:
             self._sp_freeze(key, forces)
@@ -14099,13 +14133,13 @@ class Converter:
         return out, None
 
     def _nodal_load_clash(self, key: tuple, forces: Dict[Tuple[int, int], float],
-                          amp: Optional[str]) -> Optional[str]:
+                          amp: Optional[tuple]) -> Optional[str]:
         """Why ``forces`` cannot join the generated *CLOAD, or None.  ccx keeps one value and one
         amplitude per node and DOF: values given in one step add up, a later step replaces
         them.  A node DOF shared with the deck's own *CLOAD is therefore exact only when the
-        deck has a single step and the same amplitude (so the deck's lines given again,
-        _flush_cloads, never meet these forces); one shared with another converted load needs
-        the same amplitude."""
+        deck has a single step and the same amplitude and time delay (so the deck's lines given
+        again, _flush_cloads, never meet these forces); one shared with another converted load
+        needs the same amplitude and time delay (_cload_amp)."""
         for nd in forces:
             amps = self._deck_cloads.get(nd)
             if amps is not None and (self._n_steps > 1 or amps != {amp}):
@@ -14115,13 +14149,22 @@ class Converter:
         for other, (f2, a2) in self.emit.nodal_loads.items():
             if other != key and a2 != amp and not f2.keys().isdisjoint(forces):
                 return (f"it shares nodes with another converted load ({other[2]} on {other[1]}) "
-                        f"under a different amplitude, and ccx keeps one amplitude per node and DOF")
+                        f"under a different amplitude or TIME DELAY, and ccx keeps one amplitude "
+                        f"per node and DOF")
         if self._sp_adds and key in self.emit.nodal_loads and key not in self.emit.nodal_fresh and \
                 self.emit.nodal_loads[key][1] != amp:  # (_set_nodal_load adds it to the base state's)
             return ("it changes the base state's load of that kind there, which has another "
                     "amplitude (one whose value at the base state's end the converter cannot "
                     "evaluate, or one on this line), and ccx keeps one amplitude per node and DOF")
         return None
+
+    @staticmethod
+    def _cload_amp(b: Block) -> Optional[Tuple[str, str]]:
+        """A load card's amplitude as a *CLOAD carries it: (AMPLITUDE, TIME DELAY or ""), None
+        without one.  ccx 2.23's *CLOAD takes TIME DELAY as Abaqus does (probed), so the
+        nodal forces of a delayed load keep it."""
+        name = (b.param("AMPLITUDE") or "").strip()
+        return (name, (b.param("TIME DELAY") or "").strip()) if name else None
 
     def _amp_end(self, b: Block) -> Optional[float]:
         """The factor a load card's amplitude reaches at the end of the current step: 1 without
@@ -14178,7 +14221,7 @@ class Converter:
         return False
 
     def _set_nodal_load(self, key: tuple, forces: Dict[Tuple[int, int], float],
-                        amp: Optional[str], end: Optional[float] = 1.0) -> None:
+                        amp: Optional[tuple], end: Optional[float] = 1.0) -> None:
         """Record the nodal forces of a converted load (Abaqus semantics: a key given again in
         a later step replaces it, twice in one step adds up; no force removes it), and, in a
         general step, the factor ``end`` its amplitude reaches at the step's end.  In a
@@ -14213,9 +14256,9 @@ class Converter:
         the step's converted loads define: every node DOF whose force changed, with 0 where a
         load went away.  Never OP=NEW, which would also remove the deck's own *CLOADs; after
         the deck's own *CLOAD, OP=NEW (which removes these too) every force is given again."""
-        target: Dict[Tuple[int, int], Tuple[str, Optional[str]]] = {}
+        target: Dict[Tuple[int, int], Tuple[str, Optional[tuple]]] = {}
         sums: Dict[Tuple[int, int], float] = {}
-        amps: Dict[Tuple[int, int], Optional[str]] = {}
+        amps: Dict[Tuple[int, int], Optional[tuple]] = {}
         for forces, amp in self.emit.nodal_loads.values():
             for nd, v in forces.items():
                 sums[nd] = sums.get(nd, 0.0) + v
@@ -14223,7 +14266,7 @@ class Converter:
         for nd, v in sums.items():
             target[nd] = ("%.12g" % v if v else "0", amps[nd])
         held = {} if self.emit.cload_new else self.emit.nodal_emitted
-        groups: "OrderedDict[Optional[str], List[str]]" = OrderedDict()
+        groups: "OrderedDict[Optional[tuple], List[str]]" = OrderedDict()
         for nd in sorted(set(target) | set(held)):
             new = target.get(nd, ("0", None))
             if held.get(nd) == new or (nd not in held and new[0] == "0"):
@@ -14235,7 +14278,8 @@ class Converter:
             out.append(self._NODAL_FORCES + " (tractions, beam line loads, pressures on surface "
                        "elements)")
         for amp, data in groups.items():
-            out.append("*CLOAD" + (f", AMPLITUDE={amp}" if amp else ""))
+            out.append("*CLOAD" + (f", AMPLITUDE={amp[0]}" if amp else "") +
+                       (f", TIME DELAY={amp[1]}" if amp and amp[1] else ""))
             out.extend(data)
         return out
 
@@ -18956,6 +19000,43 @@ class Converter:
                 self._commented(b, f"Could not convert *{b.keyword}; edit manually.")
         return out + side
 
+    def _plan_shell_gradients(self, blocks: List[Block]) -> None:
+        """Warn where the deck changes the temperature gradient through the thickness of S4 /
+        S4R shells.  ccx 2.23 reads a shell line's second value as that gradient on S3, S6, S8
+        and S8R, and ignores it on S4 and S4R, which it expands into C3D8I / C3D8R (probed: no
+        thermal bending, in a step and as an initial condition alike); no input reaches the
+        temperatures of the expanded nodes.  A gradient the deck never changes from its
+        initial one strains nothing, in either program."""
+        flat = {n for e, (typ, conn) in self.geom.elements.items()
+                if ccx_type(typ) in ("S4", "S4R") and e not in self._point_temps for n in conn}
+        initial: Dict[int, tuple] = {}
+        changed: set = set()
+        for kw in ("INITIAL CONDITIONS", "TEMPERATURE") if flat else ():
+            for b in blocks:
+                if b.keyword != kw or (kw != "TEMPERATURE" and b.uparam("TYPE") != "TEMPERATURE"):
+                    continue
+                for rec in merged_data_records(b):
+                    rec = [x.strip() for x in rec]
+                    t = BaseStateRestore.temperature(rec) if rec and rec[0] else None
+                    if t is None:
+                        continue
+                    g = tuple(t[1:])
+                    while g and not g[-1]:
+                        g = g[:-1]
+                    for n in self._resolve_nodes(rec[0]):
+                        if n not in flat:
+                            continue
+                        if kw != "TEMPERATURE":
+                            initial[n] = g
+                        elif g != initial.get(n, ()) or (g and b.param("AMPLITUDE")):
+                            changed.add(n)
+        if changed:
+            self.report.warn(f"Temperatures change the gradient through the thickness of S4 / S4R "
+                             f"shells on {len(changed)} node(s), which ccx 2.23 ignores on these "
+                             f"elements (probed: S3, S6, S8 and S8R read it), so their thermal "
+                             f"bending is lost. Mesh those shells with S8R to keep it.")
+            self._reduces("temperature gradient on S4 / S4R shells (ccx ignores it)")
+
     def _default_temperature_ic(self) -> List[str]:
         """Initial temperatures for a deck that applies ``*TEMPERATURE`` without any: Abaqus
         starts every node at 0, and ccx reads a *TEMPERATURE card only after thermal
@@ -19479,6 +19560,7 @@ class Converter:
         self._check_nlgeom_expansion(blocks)
         self._plan_coupled_inertia(blocks)
         self._plan_load_facts(blocks)           # after the mesh planners: the final element types
+        self._plan_shell_gradients(blocks)      # after _plan_load_facts: the temperature points
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_member_mass_tets(blocks)     # after _plan_rot_nodes: the *MPC BEAM bodies
         self._plan_surface_heat(blocks)
@@ -21302,7 +21384,11 @@ class Converter:
         time 0, and the amplitude goes.  One the converter cannot evaluate (USER, SOLUTION
         DEPENDENT, VALUE=ABSOLUTE, TIME=TOTAL TIME, ...) stays, warned.  (A *BUCKLE step's
         *TEMPERATURE is commented out anyway: handle_temperature.)  Also keeps the amplitudes
-        and the general steps' periods, for the end values of the base state (_amp_end)."""
+        and the general steps' periods, for the end values of the base state (_amp_end).  A
+        *BUCKLE step left with no load (none, zero ones, or ones on an amplitude that is 0 at
+        time 0) has no buckling factor: warned (ccx 2.23 prints factors of 1e9 and more there,
+        probed; Abaqus does not document what it does).  One with temperatures only is
+        handle_temperature's."""
         pert = self._perturbation_steps(blocks)
         if not pert:
             return blocks
@@ -21312,7 +21398,7 @@ class Converter:
         swap: Dict[int, Block] = {}
         scaled: Dict[str, List[str]] = {"STATIC": [], "BUCKLE": []}
         kept: Dict[str, List[str]] = {"STATIC": [], "BUCKLE": []}
-        zero: List[str] = []
+        unloaded: Dict[bool, List[str]] = {True: [], False: []}    # (an amplitude zeroed a load)
         for s, group in enumerate(step_groups(blocks)[1], 1):
             procs = {b.keyword for b in group[1:] if b.keyword in PROC_KW}
             if s not in pert:
@@ -21323,6 +21409,7 @@ class Converter:
             if procs not in ({"STATIC"}, {"BUCKLE"}):
                 continue
             proc = procs.pop()
+            zeroed = False
             for b in group[1:]:
                 amp = b.uparam("AMPLITUDE")
                 if not amp or b.keyword not in fields or b.has("USER") or \
@@ -21352,8 +21439,11 @@ class Converter:
                 swap[id(b)] = Block(b.keyword, OrderedDict(
                     (k, v) for k, v in b.params.items() if k not in ("AMPLITUDE", "TIME DELAY")), data)
                 scaled[proc].append(f"{s} (*{b.keyword} on {amp}: x{a0:g})")
-                if a0 == 0.0 and proc == "BUCKLE":
-                    zero.append(f"{s} (*{b.keyword} on {amp})")
+                zeroed = zeroed or a0 == 0.0
+            if proc == "BUCKLE" and not any(
+                    desc for b in group[1:] if b.keyword in LOAD_CARD_FIELD
+                    for _, desc in _load_entries(swap.get(id(b), b), user_loads=True)):
+                unloaded[zeroed].append(str(s))
         ccx = {"STATIC": ("at its value at the step's end", "its value at the step's end"),
                "BUCKLE": ("not at all (the full value)", "the full value (it ignores the amplitude there)")}
         what = {"STATIC": "Static perturbation step", "BUCKLE": "*BUCKLE step"}
@@ -21374,11 +21464,15 @@ class Converter:
                 self._reduces("amplitude of a static perturbation step at its end value (Abaqus: "
                               "time 0)" if proc == "STATIC" else
                               "amplitude of a *BUCKLE step at its full value (Abaqus: time 0)")
-        if zero:
-            self.report.warn(f"*BUCKLE step{'s' if len(zero) > 1 else ''} {', '.join(zero)}: the "
-                             f"amplitude is 0 at time 0, so that card applies no buckling load in "
-                             f"Abaqus (written at 0); a step left without load has no meaningful "
-                             f"buckling factors (ccx 2.23 prints ~1e10).", once=True)
+        for zeroed, where in unloaded.items():
+            if where:
+                what = ("every load is 0 at time 0 of its amplitude, the value Abaqus applies in a "
+                        "buckling step" if zeroed else "no load, or only zero ones")
+                self.report.warn(f"*BUCKLE step{'s' if len(where) > 1 else ''} {', '.join(where)}: "
+                                 f"{what}, so no buckling factor exists. ccx 2.23 prints factors of "
+                                 f"1e9 and more there (noise; probed); Abaqus does not document what "
+                                 f"it does." + (" Take the amplitude off a load that should act at "
+                                                "its full value." if zeroed else ""), once=True)
         return [swap.get(id(b), b) for b in blocks] if swap else blocks
 
     # ccx 2.23 keeps one body load per set as written and direction, not per element (probed:
@@ -24547,8 +24641,13 @@ class Converter:
         if self.geom.elements and any(b.keyword == "DLOAD" and any(
                 len(r) > 1 and not r[0].strip() for r in merged_data_records(b)) for b in blocks):
             self.geom.elsets.setdefault(ALL_ELEMENTS_SET, list(self.geom.elements))
+        self._point_temps = set()
         for b in blocks:
             recs = [[x.strip() for x in r] for r in merged_data_records(b)]
+            if (b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION") and
+                    (b.uparam("TEMPERATURE") or "GRADIENT") != "GRADIENT") or \
+                    (b.keyword == "BEAM SECTION" and b.uparam("TEMPERATURE") == "VALUES"):
+                self._point_temps.update(self.geom.elset(b.param("ELSET") or ""))
             if b.keyword == "SOLID SECTION":
                 try:
                     t = pf(recs[0][0]) if recs and recs[0] and recs[0][0] else 1.0
@@ -24574,7 +24673,7 @@ class Converter:
                 for e in self.geom.elset(b.param("ELSET") or ""):
                     self._beam_n1[e] = n1
             elif b.keyword == "CLOAD":
-                amp = b.param("AMPLITUDE")
+                amp = self._cload_amp(b)
                 for r in recs:
                     if len(r) > 1 and re.fullmatch(r"[-+]?\d+", r[1]):
                         for n in self._resolve_nodes(r[0]):

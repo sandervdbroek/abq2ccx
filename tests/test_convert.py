@@ -7738,13 +7738,13 @@ def test_perturbation_tractions_buckle_amplitudes_and_temperature_gradients():
     body, conv, rep = convert_str(bk.format("UP"))
     assert "\n*CLOAD\n7, 3, -0.2\n*BOUNDARY\n6, 3, 3, -0.002\n" in body and not conv.reduced_physics
     assert "*BUCKLE steps 1 (*CLOAD on UP: x0.2), 1 (*BOUNDARY on UP: x0.2)" in rep.text()
-    body, conv, rep = convert_str(bk.format("ZERO"))
-    assert "\n*CLOAD\n7, 3, 0.\n" in body and "the amplitude is 0 at time 0" in rep.text()
+    body, conv, rep = convert_str(bk.format("ZERO"))      # (the BC still loads it)
+    assert "\n*CLOAD\n7, 3, 0.\n" in body and "no buckling factor exists" not in rep.text()
     body, conv, rep = convert_str(bk.format("LATE"))
     assert "*CLOAD, AMPLITUDE=LATE" in body and "ccx 2.23 applies the full value" in rep.text()
     assert conv.reduced_physics == ["amplitude of a *BUCKLE step at its full value (Abaqus: time 0)"]
-    # temperatures with gradients (a shell's, a beam's, section points) add to the base state's
-    # where it has the same kind there; else warned as before
+    # temperatures with gradients (a shell's, a beam's, section points) add to the base state's,
+    # a missing gradient 0 (GRADIENT sections)
     for ic, steps, want in (
             ("0.", "*Step\n*Static\n*Temperature\nALL, 50., 100.\n*End Step\n", "ALL, 60., 120."),
             ("20., 50.", "", "ALL, 30., 70."),
@@ -7755,12 +7755,68 @@ def test_perturbation_tractions_buckle_amplitudes_and_temperature_gradients():
                                       steps + sp("*Temperature\nALL, 10., 20.\n"))
         assert f"\n*TEMPERATURE\n{want}\n" in body.split("*STEP")[-1], body.split("*STEP")[-1]
         assert "static perturbation step not the base state plus its perturbation" not in conv.reduced_physics
-    for base, own in (("ALL, 50.", "ALL, 10., 20."), ("ALL, 50., 100.", "ALL, 10.")):
-        _, conv, rep = convert_str(model + "*Initial Conditions, type=temperature\nALL, 0.\n*Step\n"
-                                   f"*Static\n*Temperature\n{base}\n*End Step\n" +
-                                   sp(f"*Temperature\n{own}\n"))
-        assert "other gradients or section points than the base state's" in rep.text(), base
-        assert "static perturbation step not the base state plus its perturbation" in conv.reduced_physics
+    for base, own, want in (("ALL, 50.", "ALL, 10., 20.", "ALL, 60., 20."),
+                            ("ALL, 50., 100.", "ALL, 10.", "ALL, 60., 100.")):
+        body, conv, rep = convert_str(model + "*Initial Conditions, type=temperature\nALL, 0.\n*Step\n"
+                                      f"*Static\n*Temperature\n{base}\n*End Step\n" +
+                                      sp(f"*Temperature\n{own}\n"))
+        assert f"\n*TEMPERATURE\n{want}\n" in body.split("*STEP")[-1], base
+        assert "static perturbation step not the base state plus its perturbation" not in conv.reduced_physics
+
+def test_delayed_converted_loads_shell_gradients_and_unloaded_buckle_steps():
+    # a load converted to nodal forces keeps its TIME DELAY, which ccx 2.23's *CLOAD takes
+    # (probed); before, the *CLOAD had the amplitude only, which ccx applied undelayed
+    deck = (HEX_MODEL + "*Amplitude, name=B\n0., 0., 1., 1., 2., 3.\n*Surface, name=TOP\nEALL, S2\n"
+            "*Step\n*Static\n*Dsload, amplitude=B, time delay=0.5\nTOP, TRVEC, 1000., 0., 0., -1.\n{}"
+            "*End Step\n")
+    body, conv, rep = convert_str(deck.format(""))
+    assert "\n*CLOAD, AMPLITUDE=B, TIME DELAY=0.5\n5, 3, -250\n" in body and not conv.reduced_physics
+    # the deck's own *CLOAD with that amplitude and delay shares the card (ccx stops on two such
+    # cards loading a node DOF: 'forcadd'); another delay on the same nodes is dropped
+    body, conv, rep = convert_str(deck.format("*Cload, amplitude=B, time delay=0.5\n7, 3, -100.\n"))
+    assert body.count("TIME DELAY=0.5") == 1 and "7, 3, -100." in body and not conv.reduced_physics
+    body, conv, rep = convert_str(deck.format("*Dload, amplitude=B\nEALL, TRVEC2, 500., 0., 0., -1.\n"))
+    assert "under a different amplitude or TIME DELAY" in rep.text()
+    assert conv.reduced_physics == ["*DLOAD TRVEC2 load dropped"]
+    # ccx 2.23 ignores a shell's temperature gradient on S4 / S4R (probed: S3, S6, S8 and S8R
+    # read it): warned where the deck changes it, not on sections with temperature points
+    corners = "*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+    plate = ("{}*Element, type={}, elset=E\n{}\n*Nset, nset=ALL, generate\n1, {}, 1\n*Material, "
+             "name=M\n*Elastic\n1000., 0.\n*Expansion\n1e-3\n*Shell Section, elset=E, material=M{}\n"
+             "0.1\n*Boundary\n1, 1, 6\n*Initial Conditions, type=temperature\nALL, {}\n*Step\n*Static\n"
+             "*Temperature\nALL, {}\n*End Step\n")
+    lost = "temperature gradient on S4 / S4R shells (ccx ignores it)"
+    for typ, sect, ic, t, want in (("S4", "", "0.", "0., 100.", True), ("S4", "", "0., 100.", "0.", True),
+                                   ("S4R", "", "0.", "0., 100.", True), ("S4", "", "0., 100.", "50., 100.", False),
+                                   ("S4", "", "0.", "100.", False), ("S4", ", temperature=5", "0.", "0., 100.", False)):
+        _, conv, rep = convert_str(plate.format(corners, typ, "1, 1, 2, 3, 4", 4, sect, ic, t))
+        assert (lost in conv.reduced_physics) == want, (typ, sect, ic, t)
+    mids = "5, 0.5, 0., 0.\n6, 1., 0.5, 0.\n7, 0.5, 1., 0.\n8, 0., 0.5, 0.\n"
+    _, conv, rep = convert_str(plate.format(corners + mids, "S8R", "1, 1, 2, 3, 4, 5, 6, 7, 8", 8, "", "0.",
+                                            "0., 100."))
+    assert lost not in conv.reduced_physics
+    # a static perturbation step's gradient over one-value initial temperatures, then a general
+    # step: the gradient is the change of 0 (GRADIENT sections), and the restore gives the
+    # initial temperatures again (ccx's *TEMPERATURE, OP=NEW keeps the last gradient; probed)
+    model = MODAL.split("*Step")[0] + "*Nset, nset=ALL, generate\n1, 8, 1\n"
+    body, conv, rep = convert_str(model + "*Initial Conditions, type=temperature\nALL, 50.\n*Step, "
+                                  "perturbation\n*Static\n*Temperature\nALL, 10., 20.\n*End Step\n"
+                                  "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n")
+    steps = body.split("*STEP")
+    assert "\n*TEMPERATURE\nALL, 60., 20.\n" in steps[1]
+    assert "\n*TEMPERATURE, OP=NEW, AMPLITUDE=ABQ2CCX_HOLD\nALL, 50.\n" in steps[2], steps[2]
+    assert "static perturbation step not the base state plus its perturbation" not in conv.reduced_physics
+    # a *BUCKLE step left without a load (amplitudes 0 at time 0, zero loads, none): no buckling
+    # factor exists (ccx 2.23 prints 1e9 and more; probed); one with another load is fine
+    bk = model + "*Amplitude, name=ZERO\n0., 0., 1., 1.\n*Step\n*Buckle\n2\n{}*End Step\n"
+    for cards, amp in (("*Cload, amplitude=ZERO\n7, 3, -1.\n*Boundary, amplitude=ZERO\n6, 3, 3, -0.01\n", True),
+                       ("*Cload\n7, 3, 0.\n", False), ("", False)):
+        _, conv, rep = convert_str(bk.format(cards))
+        assert "no buckling factor exists" in rep.text() and ("Take the amplitude off" in rep.text()) == amp
+        assert not conv.reduced_physics, cards
+    _, conv, rep = convert_str(bk.format("*Cload, amplitude=ZERO\n7, 3, -1.\n*Cload\n6, 3, -1.\n"))
+    assert "no buckling factor exists" not in rep.text()
+
 
 def test_modal_dynamic_step_started_moving_is_flagged():
     # ccx 2.23 starts a *MODAL DYNAMIC step from rest only right after a *FREQUENCY (or *BUCKLE)

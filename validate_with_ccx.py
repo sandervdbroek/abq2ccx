@@ -3468,14 +3468,77 @@ def static_pert_leftovers_deck(case, between="", ref=False):
         own + out
 
 
-def buckle_amplitude_deck(force, amp=True):
+def buckle_amplitude_deck(force, amp=True, start=0.25):
     """buckle_displacement_deck("tied", ``force``): its *STEP, PERTURBATION *BUCKLE step's
-    *CLOAD on an amplitude of 0.25 at time 0 (1 at time 1) if ``amp``."""
+    *CLOAD on an amplitude of ``start`` at time 0 (1 at time 1) if ``amp``."""
     deck = buckle_displacement_deck("tied", force)
     if amp:
-        deck = deck.replace("*Step, perturbation", "*Amplitude, name=UP\n0., 0.25, 1., 1.\n*Step, "
+        deck = deck.replace("*Step, perturbation", f"*Amplitude, name=UP\n0., {start!r}, 1., 1.\n*Step, "
                                                    "perturbation").replace("*Cload\n", "*Cload, amplitude=UP\n")
     return deck
+
+
+def delayed_traction_deck(pressure=False):
+    """A unit C3D8 cube (E 1000, nu 0) on rollers, its top face pushed down by 1000 on an
+    amplitude (0 at time 0, 1 at 1, 3 at 2) with TIME DELAY 0.25 in a static step of period 2
+    (the end value a(1.75) = 2.5: the top at -2.5), then a static step giving nothing (the load
+    stays at that value): as a traction (TRVEC), which becomes nodal forces, or as a pressure
+    (``pressure``), which ccx takes with its delay."""
+    load = "TOP, P, 1000." if pressure else "TOP, TRVEC, 1000., 0., 0., -1."
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n*NSET, NSET=NALL, GENERATE\n1, 8, 1\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1000., 0.\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*SURFACE, NAME=TOP\n"
+            "EALL, S2\n*AMPLITUDE, NAME=B\n0., 0., 1., 1., 2., 3.\n*BOUNDARY\n1, 1, 3\n2, 2, 3\n"
+            "3, 3, 3\n4, 1, 1\n4, 3, 3\n*STEP\n*STATIC\n0.5, 2.\n*DSLOAD, AMPLITUDE=B, TIME DELAY=0.25\n"
+            f"{load}\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n*STEP\n*STATIC\n*NODE PRINT, NSET=NALL\nU\n"
+            "*END STEP\n")
+
+
+def gradient_base_deck(case, ref=False):
+    """static_pert_leftovers_deck("gradient")'s S8 plate, initial temperature 0, and a *STEP,
+    PERTURBATION *STATIC step changing its temperature by 10 and its gradient through the
+    thickness by 20.  ``case`` "one": after a static step that sets the temperature 50 by a
+    one-value line (gradient 0); "back": right after initial temperatures 50, followed by a
+    static step loading node 5 (the base state again).  The steps print U.  ``ref``: one static
+    step with the sums (60, 20) / the base state's last step."""
+    text = static_pert_leftovers_deck("gradient", ref=True)
+    text = text[:text.index("*STEP")]
+    out = "*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
+    pert = "*STEP, PERTURBATION\n*STATIC\n*TEMPERATURE\nNALL, 10., 20.\n" + out
+    load = "*STEP\n*STATIC\n*CLOAD\n5, 3, 1.E-3\n" + out
+    if case == "one":
+        return text + "*STEP\n*STATIC\n*TEMPERATURE\nNALL, " + ("60., 20." if ref else "50.") + "\n" + \
+            out + ("" if ref else pert)
+    text = text.replace("TEMPERATURE\nNALL, 0.\n", "TEMPERATURE\nNALL, 50.\n")
+    return text + ("" if ref else pert) + load
+
+
+def shell_gradient_deck(etype):
+    """A 2 x 1 plate of two S4 or S8R (``etype``; thickness 0.1, E 1000, nu 0, expansion 1e-3)
+    held statically determinate and heated to 100 with a gradient of 100 through its
+    thickness: free thermal strain and bending, the corner (2, 0) at x 0.2 and z -0.1."""
+    order = 2 if etype == "S8R" else 1
+    ids, nodes = {}, []
+    for j in range(order + 1):
+        for i in range(2 * order + 1):
+            if order == 2 and i % 2 and j % 2:
+                continue
+            ids[(i, j)] = len(ids) + 1
+            nodes.append(f"{ids[(i, j)]}, {i / order}, {j / order}, 0.")
+    els = []
+    for e in range(2):
+        i, n = e * order, order
+        conn = [(i, 0), (i + n, 0), (i + n, n), (i, n)]
+        if order == 2:
+            conn += [(i + 1, 0), (i + 2, 1), (i + 1, 2), (i, 1)]
+        els.append(f"{e + 1}, " + ", ".join(str(ids[p]) for p in conn))
+    return ("*NODE\n" + "\n".join(nodes) + f"\n*ELEMENT, TYPE={etype}, ELSET=EALL\n" + "\n".join(els) +
+            f"\n*NSET, NSET=NALL, GENERATE\n1, {len(nodes)}, 1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n"
+            f"*EXPANSION\n1.E-3\n*SHELL SECTION, ELSET=EALL, MATERIAL=M\n0.1\n*BOUNDARY\n{ids[(0, 0)]}, 1, 3\n"
+            f"{ids[(order, 0)]}, 2, 3\n{ids[(0, order)]}, 3, 3\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\n"
+            f"NALL, 0.\n*STEP\n*STATIC\n*TEMPERATURE\nNALL, 100., 100.\n*NODE PRINT, NSET=NALL\nU\n"
+            f"*END STEP\n"), ids[(2 * order, 0)]
 
 
 def ramped_rotation_deck(step, twin=False):
@@ -8826,6 +8889,76 @@ def main():
               f"the full load, about a quarter of it)")
     else:
         print("FAIL  buckle_amplitude: a run gave no results")
+    failures += 0 if ok else 1
+    # every load of a *BUCKLE step on an amplitude that is 0 at time 0: no buckling load, so no
+    # buckling factor exists; the converter warns (it warned per card, also beside other loads),
+    # and ccx 2.23 prints huge factors (noise)
+    zero = review_run(buckle_amplitude_deck(-4e6, start=0.0), "buckle_amplitude_zero", factors)
+    rep, _ = convert(os.path.join(tmp, "buckle_amplitude_zero_src.inp"),
+                     os.path.join(tmp, "buckle_amplitude_zero_flag.inp"))
+    ok = bool(zero and runs[1])
+    if ok:
+        warned = "no buckling factor exists" in rep.text()
+        ok = warned and zero[0] > 1e6 * runs[1][0]
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_amplitude_zero (the column's *BUCKLE load on an "
+              f"amplitude of 0 at time 0): {'warned' if warned else 'NOT warned'} that no buckling "
+              f"factor exists; ccx prints {zero[0]:.3g} ({zero[0] / runs[1][0]:.2g} times the factor "
+              f"under a load)")
+    failures += 0 if ok else 1
+    # a traction (nodal forces) on an amplitude with TIME DELAY: the generated *CLOAD keeps the
+    # delay; it had the amplitude only, which ccx applied undelayed (the top at -3, not -2.5)
+    runs = [review_run(delayed_traction_deck(p), "delayed_traction" + ("_pressure" if p else ""),
+                       dat_node_blocks) for p in (False, True)]
+    ok = all(runs) and len(runs[0]) == 2
+    if ok:
+        err, moved = same(runs)
+        top = [b[n][2] for b in runs[0] for n in (5, 6, 7, 8)]
+        ok = err < 1e-9 * moved and max(abs(w + 2.5) for w in top) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  delayed_traction (a cube's top face under a traction on "
+              f"an amplitude with TIME DELAY=0.25, a static step of period 2, then one adding "
+              f"nothing): the top at {min(top):.7g} to {max(top):.7g} in both steps (-2.5, the "
+              f"delayed amplitude's end value; -3 undelayed), as under that pressure ({err:.1e} apart)")
+    failures += 0 if ok else 1
+    # a static perturbation step's gradient over one-value base temperatures (the gradient a
+    # change of 0), and the general step after one right after the initial temperatures, which
+    # *TEMPERATURE, OP=NEW would leave with its gradient: the converter warned and left the
+    # line unsummed, and wrote OP=NEW alone
+    for case in ("one", "back"):
+        runs = [review_run(gradient_base_deck(case, r), f"gradient_base_{case}" + ("_ref" if r else ""),
+                           dat_node_blocks) for r in (False, True)]
+        ok = all(runs)
+        if ok:
+            err, moved = same(runs, -1)
+            ok = err < 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  gradient_base_{case} (an S8 plate, "
+                  + ("heated to 50 by a one-value line, then a *STEP, PERTURBATION *STATIC step "
+                     "changing temperature and gradient: its displacements are those of a static step "
+                     "with the sums" if case == "one" else
+                     "initial temperature 50, a *STEP, PERTURBATION *STATIC step changing temperature "
+                     "and gradient, then a loaded static step: its displacements are those of that "
+                     "step without the perturbation step") + f" ({err:.1e} apart, nodes moved {moved:.3g})")
+        failures += 0 if ok else 1
+    # ccx 2.23 reads a shell's temperature gradient on S8R and ignores it on S4 (and S4R; their
+    # C3D8I / C3D8R bricks): the converter flags the S4 deck reduced physics
+    got = {}
+    for etype in ("S8R", "S4"):
+        text, far = shell_gradient_deck(etype)
+        u = review_run(text, f"shell_gradient_{etype}", dat_displacements)
+        _, conv = convert(os.path.join(tmp, f"shell_gradient_{etype}_src.inp"),
+                          os.path.join(tmp, f"shell_gradient_{etype}_flag.inp"))
+        flagged = "temperature gradient on S4 / S4R shells (ccx ignores it)" in conv.reduced_physics
+        got[etype] = (u.get(far) if u else None, flagged)
+    ok = all(v[0] for v in got.values())
+    if ok:
+        (s8, f8), (s4, f4) = got["S8R"], got["S4"]
+        ok = abs(s8[0] - 0.2) < 1e-9 and abs(s8[2] + 0.1) < 1e-9 and not f8 and \
+            abs(s4[0] - 0.2) < 1e-9 and abs(s4[2]) < 1e-9 and f4
+        print(f"{'PASS' if ok else 'FAIL'}  shell_gradient (a 2 x 1 plate heated by 100 with a gradient "
+              f"of 100 through its thickness): corner at x {s8[0]:.7g}, z {s8[2]:.7g} on S8R (0.2, -0.1), "
+              f"{'flagged' if f8 else 'not flagged'}; at x {s4[0]:.7g}, z {s4[2]:.3g} on S4 (ccx ignores "
+              f"the gradient), {'flagged' if f4 else 'NOT flagged'} reduced physics")
+    else:
+        print("FAIL  shell_gradient: a run gave no results")
     failures += 0 if ok else 1
     # gravity before a *BUCKLE step, and a static step after a buckle under gravity: ccx 2.23
     # aborted after the step that held no body load (the converter writes a zero GRAV there)
