@@ -2776,6 +2776,72 @@ def test_riks_and_complex_frequency_steps_stop_ccx():
     assert "computes Coriolis (CORIOLIS) or flutter (FLUTTER) modes only" in rep.text()
 
 
+def test_steps_without_a_ccx_procedure_stop_ccx():
+    # an Abaqus procedure ccx lacks (*GEOSTATIC, *SOILS, *MATRIX GENERATE, ...) left its step
+    # without a procedure, which ccx ran as the previous step's (a *SOILS step's loads in a
+    # load-controlled *STATIC) or stopped at as step 1: *NO ANALYSIS stops it there explicitly
+    model = (HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, "
+             "material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    st = _deck_step("Static", "*Cload\n7, 1, 1.\n")
+    body, conv, rep = convert_str(model + st + _deck_step("Soils, consolidation\n0.1, 1.",
+                                                          "*Cload\n7, 1, 2.\n"))
+    assert body.split("*STEP")[2].endswith(
+        "** *SOILS, CONSOLIDATION\n** 0.1, 1.\n*NO ANALYSIS\n** abq2ccx: an empty *EL FILE: ccx 2.23 "
+        "crashes on an earlier step's here\n*EL FILE\n** abq2ccx: the step's other cards, which ccx "
+        "does not reach:\n** *CLOAD\n** 7, 1, 2.\n*END STEP"), body
+    assert conv.reduced_physics == ["*SOILS step (no ccx counterpart)"] and not conv.unloaded_steps
+    assert "*SOILS: Abaqus' coupled pore fluid diffusion and stress analysis has no ccx " \
+           "counterpart; commented out. Without a procedure ccx would run the step as the previous " \
+           "step's procedure" in rep.text()
+    # as the first step: no *EL FILE; the steps after it are written as before
+    body, conv, _ = convert_str(model + _deck_step("Geostatic", "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n")
+                                + st)
+    first, second = body.split("*STEP")[1:3]
+    assert "** *GEOSTATIC\n*NO ANALYSIS\n** abq2ccx: the step's other cards" in first
+    assert "*EL FILE" not in first and "\n*STATIC\n*CLOAD\n7, 1, 1.\n" in second
+    assert conv.reduced_physics == ["*GEOSTATIC step (no ccx counterpart)"]
+    # ccx reaches no later step: one whose loads Abaqus carries from the stopped step is no
+    # hollow solve
+    _, conv, _ = convert_str(model + _deck_step("Geostatic", "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n")
+                             + _deck_step("Static"))
+    assert conv.unloaded_steps == [] and conv.reduced_physics == ["*GEOSTATIC step (no ccx counterpart)"]
+    for kw in A.ABAQUS_ONLY_PROCS:
+        body, conv, _ = convert_str(model + st + _deck_step(kw.title()))
+        assert f"** *{kw}\n*NO ANALYSIS\n" in body, kw
+        assert conv.reduced_physics == [f"*{kw} step (no ccx counterpart)"], kw
+    # a step without any procedure card stops ccx too
+    body, conv, rep = convert_str(model + st + _deck_step("Cload\n7, 1, 2."))
+    assert "*STEP\n** abq2ccx: Step 2 has no procedure card." in body and "*NO ANALYSIS" in body
+    assert conv.reduced_physics == ["step 2 without a procedure (ccx stops there)"]
+
+
+def test_no_analysis_left_out_where_ccx_segfaults():
+    # ccx 2.23 segfaults at a *NO ANALYSIS step of a model with a plastic, creeping, Mohr-
+    # Coulomb, deformation-plasticity or user material (probed): as the first step the step is
+    # left without a procedure (ccx stops there all the same), a later one ends the deck
+    model = (HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n10., 0.\n20., 0.1\n"
+             "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    st = _deck_step("Static", "*Cload\n7, 1, 1.\n")
+    body, conv, rep = convert_str(model + _deck_step("Geostatic") + st)
+    first, second = body.split("*STEP")[1:3]
+    assert "\n*NO ANALYSIS\n" not in body
+    assert "** abq2ccx: *NO ANALYSIS left out of step 1: ccx 2.23 segfaults at a *NO ANALYSIS step " \
+           "of a model with a *PLASTIC material (probed)." in first and "\n*STATIC\n" in second
+    for later in (_deck_step("Soils, consolidation\n0.1, 1.", "*Cload\n7, 1, 2.\n") + st,
+                  _deck_step("Static, riks\n0.1, 1.", "*Cload\n7, 1, 2.\n")):
+        body, conv, rep = convert_str(model + st + later)
+        live = [ln for ln in body.splitlines() if not ln.startswith("**")]
+        assert live.count("*STEP") == 1 and live[-1] == "*END STEP", body
+        assert "** abq2ccx: The deck ends before step 2, at which ccx would stop" in body
+        assert len(conv.reduced_physics) == 1 and not conv.unloaded_steps
+    # an elastic model keeps it (test_steps_without_a_ccx_procedure_stop_ccx), and so does a
+    # hyperelastic one
+    hyper = model.replace("*Elastic\n1000., 0.3\n*Plastic\n10., 0.\n20., 0.1\n",
+                          "*Hyperelastic, neo hooke\n300., 0.001\n")
+    body, _, _ = convert_str(hyper + st + later)
+    assert "\n*NO ANALYSIS\n" in body and "The deck ends" not in body
+
+
 def test_explicit_dynamics_native():
     # ccx runs *DYNAMIC, EXPLICIT itself: keep it (also under --approximate), drop the
     # Abaqus/Explicit-only controls, and give the step Abaqus/Explicit's defaults (no
@@ -5405,11 +5471,16 @@ def test_elke_kept_off_el_print_where_ccx_segfaults():
         assert f"cards written again in step {k}: Abaqus carries them into it, ELKE included; " \
                f"ccx deactivates ELKE in the *FREQUENCY step {k - 1} for every later step until " \
                f"it is requested again." in rep.text(), steps
+    # (after a *FREQUENCY step with cards of its own Abaqus carries the general step's into the
+    # next general step, ELKE included: _prints_again)
     for steps in (dyn.format(pr.format("ELKE")) + freq.format("") + dyn.format(pr.format("ELKE")),
                   dyn.format(pr.format("ELKE")) + freq.format(pr.format("S")) + dyn.format("")):
         body, _, rep = convert_str(HEX + STEEL + steps)
-        assert _step(body, 3).count("*EL PRINT") == int("ELKE" in steps.split("*Frequency")[1]), steps
+        assert _step(body, 3).count("*EL PRINT") == 1 and \
+            "*EL PRINT, ELSET=EALL\nELKE\n" in _step(body, 3), steps
         assert "ccx deactivates ELKE" not in rep.text(), steps
+    assert "Step 1's *EL PRINT cards written again in step 3: Abaqus carries them into it, ccx " \
+           "would not after the *EL PRINT of step 2, a linear perturbation step" in rep.text()
 
 
 def test_dynamic_step_energy_offset_noted():
@@ -8601,18 +8672,21 @@ def test_plastic_material_where_ccx_segfaults_other_procedures():
     # output (CDIS, CSTR, CELS) in modal and steady-state dynamics, own or carried in (a bare
     # card ends that; validate_with_ccx.py plastic_contact_modal_output).  ccx stops at a
     # *COMPLEX FREQUENCY step (it would segfault in one written with CORIOLIS) and at a *STATIC,
-    # RIKS step without --approximate (*NO ANALYSIS): no segfault warning there
+    # RIKS step without --approximate (*NO ANALYSIS), where it segfaults with this material too:
+    # the deck ends before the step (test_no_analysis_left_out_where_ccx_segfaults)
     pl = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
           "*Plastic\n10., 0.\n20., 0.1\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
           "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
     load = "*Cload\n7, 1, 1.\n"
     st, freq = _deck_step("Static", load), _deck_step("Frequency, storage=yes\n2")
+    ends = "The deck ends before step 3, at which ccx would stop: ccx 2.23 segfaults at a *NO " \
+           "ANALYSIS step of a model with a *PLASTIC material (probed)."
     _, conv, rep = convert_str(pl + st + freq + _deck_step("Complex Frequency\n2"))
-    assert "segfaults" not in rep.text()
+    assert rep.text().count("segfaults") == 1 and ends in rep.text()
     assert conv.reduced_physics == ["*COMPLEX FREQUENCY step (no ccx counterpart)"]
     riks = _deck_step("Static, riks\n0.1, 1.", load)
     _, conv, rep = convert_str(pl + st + freq + riks)
-    assert "segfaults" not in rep.text()
+    assert rep.text().count("segfaults") == 1 and ends in rep.text()
     assert conv.reduced_physics == ["*STATIC, RIKS step (ccx has no arc-length solver)"]
     _, conv, rep = convert_str(pl + st + freq + riks, approximate=True)
     assert "Step 3 (*STATIC, no NLGEOM) after a *FREQUENCY step" in rep.text()
@@ -8673,6 +8747,38 @@ def test_print_cards_ended_in_modal_steps_written_again():
     assert fourth.count("*NODE PRINT") == 1 and "*EL PRINT, ELSET=EALL\nS\n" in fourth
     body, _, _ = convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + st + freq + md + last)
     assert body.count("*NODE PRINT") == 1
+
+
+def test_print_cards_of_perturbation_steps_ended_in_general_steps():
+    # ccx carries a perturbation step's own print cards into the next general step without
+    # cards of that type; Abaqus ends them with the perturbation steps and carries the last
+    # general step's: written again, or an empty card ends them (validate_with_ccx.py
+    # perturbation_prints_ended)
+    model = (HEX + "*Nset, nset=TIP\n7\n*Nset, nset=BOT\n1, 2, 4\n*Material, name=M\n*Elastic\n"
+             "1000., 0.3\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
+             "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n")
+    load = "*Cload\n7, 1, 1.\n"
+    st = _deck_step("Static", load + "*Node Print, nset=BOT\nRF\n*El Print, elset=EALL\nS\n")
+    freq = _deck_step("Frequency\n2", "*Node Print, nset=TIP\nU\n")
+    last = _deck_step("Static", load)
+    body, _, rep = convert_str(model + st + freq + last)
+    assert _step(body, 3).endswith("*NODE PRINT, NSET=BOT\nRF\n"), _step(body, 3)
+    assert _step(body, 3).count("*EL PRINT") == 0       # (ccx carries step 1's, as Abaqus)
+    assert "Step 1's *NODE PRINT cards written again in step 3: Abaqus carries them into it, ccx " \
+           "would not after the *NODE PRINT of step 2, a linear perturbation step, whose requests " \
+           "Abaqus ends with the perturbation steps." in rep.text()
+    # no general step's cards: empty ones, also after consecutive perturbation steps
+    freq2 = _deck_step("Frequency\n2", "*Node Print, nset=TIP\nU\n*El Print, elset=EALL\nS\n")
+    for steps, k in ((freq2 + last, 2), (freq2 + _deck_step("Frequency\n3") + last, 3)):
+        body, _, rep = convert_str(model + steps)
+        assert _step(body, k).endswith("*NODE PRINT, NSET=TIP\n*EL PRINT, ELSET=EALL\n"), _step(body, k)
+        assert f"Empty *NODE PRINT added to step {k}: Abaqus ends the print requests of step 1, a " \
+               f"linear perturbation step, with the perturbation steps" in rep.text()
+    # a general step with cards of its own, and a perturbation step without, need none
+    for steps in (st + freq + _deck_step("Static", load + "*Node Print, nset=TIP\nU\n"),
+                  st + _deck_step("Frequency\n2") + last):
+        body, _, _ = convert_str(model + steps)
+        assert _step(body, 3).count("*NODE PRINT") == int("Node Print" in steps.split("*Frequency")[1])
 
 
 def test_buckle_perturbation_prescribed_displacements():
@@ -11698,9 +11804,12 @@ def test_velocity_bc_default_amplitude_follows_the_abaqus_manual():
                              ("*Step", "*Dynamic", held), ("*Step, amplitude=RAMP", "*Dynamic", ramped),
                              ("*Step", "*Visco", held), ("*Step, amplitude=RAMP", "*Visco", ramped),
                              ("*Step", "*Coupled temperature-displacement", held),
-                             ("*Step", "*Coupled temperature-displacement, steady state", ramped),
-                             ("*Step", "*Soils, consolidation", held), ("*Step", "*Soils", ramped)):
+                             ("*Step", "*Coupled temperature-displacement, steady state", ramped)):
         assert end(step, proc)[0] == want, (step, proc)
+    # a *SOILS step stops ccx (no ccx counterpart): its velocity is not written
+    body, _, _ = convert_str(VEL_HEX + "*Step\n*Soils, consolidation\n0.1, 1.\n*Boundary, "
+                                       "type=VELOCITY\nTOP, 3, 3, 1.\n*End Step\n")
+    assert "*NO ANALYSIS" in body and "ABQ2CCX_VEL" not in body
     # an acceleration follows the step's default: ramped in a quasi-static dynamic step
     acc = "*Boundary, type=ACCELERATION\nTOP, 3, 3, 1.\n"
     pt, text = end("*Step", "*Dynamic, application=QUASI-STATIC", card=acc)

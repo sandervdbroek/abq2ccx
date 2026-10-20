@@ -314,6 +314,19 @@ physics.
   or `*CONTACT PRINT` written in such a step of a plastic model (ccx 2.23 segfaults on what it
   would carry there) also ended the request for the later general steps, which Abaqus prints:
   the next general step now gets the cards again.
+* **Other steps ccx cannot run** — a step of an Abaqus procedure ccx lacks (`*GEOSTATIC`,
+  `*SOILS`, `*MATRIX GENERATE`, `*RANDOM RESPONSE`, `*RESPONSE SPECTRUM`, `*DIRECT CYCLIC`,
+  `*FATIGUE`, `*DYNAMIC TEMPERATURE-DISPLACEMENT`, `*COUPLED THERMAL-ELECTRICAL`, ...) was left
+  without a procedure, and ccx ran it as the previous step's (a `*SOILS` step's loads in a
+  load-controlled `*STATIC`) without a word. Such steps now get `*NO ANALYSIS` too (warned,
+  reduced physics). The load audit skips the steps after one, which ccx never reaches.
+  ccx 2.23 segfaults at `*NO ANALYSIS` in a model with a plastic, creeping, Mohr-Coulomb,
+  deformation-plasticity or user material (also at Riks and complex frequency steps): there a
+  first step is left without a procedure, where ccx stops all the same, and a later one ends the
+  deck, so ccx runs the steps before it and finishes.
+* **Print cards of perturbation steps** — ccx carried a perturbation step's own `*NODE PRINT`,
+  `*EL PRINT` or `*CONTACT PRINT` into the next general step, where Abaqus prints the last
+  general step's requests. That step now gets those cards again, or an empty card ending them.
 * **Face loads of different sources across steps** — Abaqus adds a later step's `*DLOAD` /
   `*DSLOAD` to an earlier one on the same faces when it comes from another surface, element set
   or card; ccx 2.23 keeps one value per face and the later line replaced it (a tip pressure of

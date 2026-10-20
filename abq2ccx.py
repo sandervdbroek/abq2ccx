@@ -3206,15 +3206,48 @@ def fmt_coord(x: float) -> str:
 GEOM_KW = {"NODE", "ELEMENT", "NSET", "ELSET", "NGEN", "NFILL", "NCOPY", "NMAP", "ELGEN", "ELCOPY"}
 
 # The procedure keywords of ccx 2.23 (all in CCX_KEYWORDS): the procedure a step has in the
-# converted deck.  An Abaqus procedure ccx lacks (*GEOSTATIC, *SOILS, *DYNAMIC TEMPERATURE-
-# DISPLACEMENT, ...) is commented out, so its step has none there.  The other procedure sets
-# each answer their own question, some Abaqus' (TEMPERATURE_DOF_PROCS, PERTURBATION_PROCS),
-# some ccx's (CCX_THERMAL_PROCS, NO_NODAL_SDV_PROCS): their contents differ on purpose.
+# converted deck.  An Abaqus procedure ccx lacks (ABAQUS_ONLY_PROCS) is commented out, so its
+# step has none there.  The other procedure sets each answer their own question, some Abaqus'
+# (TEMPERATURE_DOF_PROCS, PERTURBATION_PROCS), some ccx's (CCX_THERMAL_PROCS,
+# NO_NODAL_SDV_PROCS): their contents differ on purpose.
 PROC_KW = {"STATIC", "FREQUENCY", "BUCKLE", "DYNAMIC", "MODAL DYNAMIC", "HEAT TRANSFER",
            "VISCO", "STEADY STATE DYNAMICS", "COUPLED TEMPERATURE-DISPLACEMENT",
            "COMPLEX FREQUENCY", "ELECTROMAGNETICS", "CFD", "GREEN", "SUBSTRUCTURE GENERATE",
            "UNCOUPLED TEMPERATURE-DISPLACEMENT", "CRACK PROPAGATION", "HCF", "SENSITIVITY",
            "FEASIBLE DIRECTION", "NO ANALYSIS"}
+
+# The Abaqus procedures ccx 2.23 has no counterpart for, and what each computes.  A step without
+# a procedure card makes ccx run it as the previous step's procedure (probed: a load-controlled
+# *STATIC after a static step), or stop as step 1, so handle_step stops ccx at such a step
+# (_no_procedure).  *GEOSTATIC is no *STATIC either: it equilibrates the initial geostatic
+# stresses (and pore pressures) with the loads, under UTOL changing them to keep the
+# displacements small, and the converter has neither those stresses nor pore pressure elements.
+ABAQUS_ONLY_PROCS = {
+    "GEOSTATIC": "geostatic stress field (the initial stresses and pore pressures equilibrated "
+                 "with the loads)",
+    "SOILS": "coupled pore fluid diffusion and stress analysis",
+    "MATRIX GENERATE": "matrix generation (the model's global matrices written out)",
+    "RANDOM RESPONSE": "random response analysis",
+    "RESPONSE SPECTRUM": "response spectrum analysis",
+    "DIRECT CYCLIC": "direct cyclic analysis",
+    "FATIGUE": "fatigue crack growth analysis",
+    "DYNAMIC TEMPERATURE-DISPLACEMENT": "explicit coupled temperature-displacement analysis",
+    "COUPLED THERMAL-ELECTRICAL": "coupled thermal-electrical (Joule heating) analysis",
+    "COUPLED THERMAL-ELECTRICAL-STRUCTURAL": "coupled thermal-electrical-structural analysis",
+    "COUPLED THERMAL-ELECTROCHEMICAL": "coupled thermal-electrochemical analysis",
+    "ELECTROMAGNETIC": "electromagnetic (eddy current) analysis",
+    "MAGNETOSTATIC": "magnetostatic analysis",
+    "MASS DIFFUSION": "mass diffusion analysis",
+    "STEADY STATE TRANSPORT": "steady-state transport (rolling) analysis",
+    "ANNEAL": "annealing (stresses and plastic strains reset to zero)",
+    "SUBSPACE DYNAMIC": "subspace-based dynamic analysis",
+}
+# The material cards with which ccx 2.23 segfaults at a *NO ANALYSIS step (Converter.
+# _no_analysis_segfaults): *NO ANALYSIS sends the step to the linear solver, whose stress pass
+# fails on such a material (probed on both builds, also under NLGEOM; not with *HYPERELASTIC,
+# *DEPVAR or contact)
+NO_ANALYSIS_SEGFAULTS = ("PLASTIC", "CREEP", "USER MATERIAL", "MOHR COULOMB",
+                         "DEFORMATION PLASTICITY")
 
 # The procedures in which ccx 2.23 solves for temperature (DOF 11): where a step's heat
 # capacity, conductivity or temperature DOF matters in the converted deck.  (Abaqus' coupled
@@ -10915,7 +10948,7 @@ class Converter:
                                 else ""), once=True)
             self._reduces("*MODAL DYNAMIC step started from a deformed or moving model")
         nl = params.get("NLGEOM", "")
-        stops = proc == "COMPLEX FREQUENCY" or \
+        stops = proc is None or proc == "COMPLEX FREQUENCY" or \
             (proc_block is not None and proc_block.has("RIKS") and not self._approx)
         self._yield_segfaults(None if stops else proc, self._dp_nlgeom or (     # (_no_analysis)
             "NLGEOM" in params and (nl or "YES").strip().upper() != "NO"))
@@ -10925,11 +10958,14 @@ class Converter:
             # it carries in from an earlier step makes ccx 2.23 crash there (rc 11, both
             # builds, probed); an empty one ends it
             self._stopped_steps.add(self.emit.no)
+            if proc is None:
+                proc_block = next((b for b in inner if b.keyword in ABAQUS_ONLY_PROCS), None)
             cards = [b for b in inner if b is not proc_block and b.keyword != "END STEP" and
                      b.keyword not in GEOM_KW]
             self.report.n_commented += len(cards)
             rest = [x for b in cards for x in [emit_keyword(b.keyword, b.params)] + b.data]
-            return self.emit.end_step(out + self.translate_one(proc_block) + (
+            return self.emit.end_step(out + (self._no_procedure(proc_block) if proc is None else
+                                             self.translate_one(proc_block)) + (
                 ["** abq2ccx: an empty *EL FILE: ccx 2.23 crashes on an earlier step's here",
                  "*EL FILE"] if self.emit.no > 1 else []) + (
                 ["** abq2ccx: the step's other cards, which ccx does not reach:"] +
@@ -15401,16 +15437,19 @@ class Converter:
 
         ccx keeps an *EL FILE in the next steps that give none, so a step of the second kind
         without an *EL FILE gets an empty one where ccx would carry SDV into it: Abaqus writes
-        no element field output there (its requests are written in every step, _plan_output)."""
+        no element field output there (its requests are written in every step, _plan_output).
+        The print cards of every model are carried as Abaqus carries them here too
+        (_prints_again), after the cards these checks end."""
         u1 = bool(self._u1)
         state = self._out_yields or any(n > 0 for n in self._depvar_counts)
-        if not (u1 or state) or len(groups) < len(steps):
+        if len(groups) < len(steps):
             return
         held: List[str] = []                # the *EL FILE labels ccx carries into a step
         carried: Dict[str, List[dict]] = {}     # output card -> the requests ccx carries
         gen: Dict[str, Tuple[int, List[dict]]] = {}     # print card -> (step, the requests
-        ended: Dict[str, int] = {}          # Abaqus carries into general steps); -> the step
-        # whose bare card ended them in ccx
+        # Abaqus carries into general steps); -> (step, its requests) of the perturbation
+        # step whose cards ccx would carry into the next general step
+        ended: Dict[str, Tuple[int, List[dict]]] = {}
         for (k, timing, reqs), group, linear in zip(steps, groups,
                                                     self._ccx_linear_steps(blocks, steps)):
             sdv = state and (linear or timing["proc"] in NO_NODAL_SDV_PROCS)
@@ -15588,34 +15627,49 @@ class Converter:
             reqs.append(r)
 
     def _prints_again(self, k: int, pert: bool, reqs: List[dict],
-                      gen: Dict[str, Tuple[int, List[dict]]], ended: Dict[str, int],
-                      anchor: Block) -> None:
+                      gen: Dict[str, Tuple[int, List[dict]]],
+                      ended: Dict[str, Tuple[int, List[dict]]], anchor: Block) -> None:
         """ccx keeps a step's print cards (.dat) in the next steps that give none, Abaqus a
         general step's print requests in the later general steps only (Output to the data and
         results files: those of a linear perturbation step in the consecutive perturbation
-        steps).  A step whose print cards of a type are all bare (_modal_result_stops) ends
-        those requests in ccx, so the next general step without such cards gets the cards of
-        the general step Abaqus carries them from (``gen``) again; ``ended``: the bare
-        card's step, per type."""
+        steps).  So the next general step without print cards of a type after a perturbation
+        step that gave its own (``ended``, per type) gets the cards of the general step Abaqus
+        carries them from (``gen``) again, or, where there are none, an empty card that ends
+        the perturbation step's in ccx (probed).  Bare cards (_modal_result_stops) end them
+        already."""
         for cc in ("NODE PRINT", "EL PRINT", "CONTACT PRINT"):
             own = [r for r in reqs if r["live"] and r["cc"] == cc]
-            if own and pert and all(r.get("bare") for r in own):
-                ended[cc] = k
+            if own and pert:
+                ended[cc] = (k, own)
             elif own:
                 ended.pop(cc, None)
-                if not pert:
-                    gen[cc] = (k, own)
-            elif not pert and cc in ended and cc in gen:
-                j, cards = gen[cc]
+                gen[cc] = (k, own)
+            elif not pert and cc in ended:
+                i, held = ended.pop(cc)
+                bare = all(r.get("bare") for r in held)
+                j, cards = gen.get(cc, (0, []))
                 add = [dict(self._added_el_file(OrderedDict(r["params"]), list(r["labels"]), anchor, cc),
                             surface=list(r.get("surface", ())))       # (_contact_print_card)
                        for r in cards if r["labels"] or r.get("surface")]
                 if add:
                     add[0]["notes"].append(
                         f"Step {j}'s *{cc} cards written again in step {k}: Abaqus carries them into "
-                        f"it, ccx would not after the empty *{cc} of step {ended[cc]}.")
+                        f"it, ccx would not after the " + (f"empty *{cc} of step {i}." if bare else
+                        f"*{cc} of step {i}, a linear perturbation step, whose requests Abaqus ends "
+                        f"with the perturbation steps."))
                     reqs.extend(add)
-                del ended[cc]
+                    continue
+                key = {"NODE PRINT": "NSET", "EL PRINT": "ELSET"}.get(cc)
+                sets = [r["params"][key] for r in held if r["params"].get(key)] if key else [None]
+                if bare or not sets:
+                    continue
+                r = self._added_el_file(OrderedDict([(key, sets[0])] if key else []), [], anchor, cc)
+                r["bare"] = True
+                r["notes"].append(f"Empty *{cc} added to step {k}: Abaqus ends the print requests of "
+                                  f"step {i}, a linear perturbation step, with the perturbation "
+                                  f"steps, and no general step's are in force; ccx would carry them "
+                                  f"into it.")
+                reqs.append(r)
 
     def _output_request(self, b: Block, ctx: Optional[Block], timing: dict, quiet: "Report") -> dict:
         """One output card of a step: where it goes, its labels and the output control it
@@ -18489,6 +18543,50 @@ class Converter:
         return self._comment_out(msg, [emit_keyword(b.keyword, b.params)] + list(b.data),
                                  reduces) + ["*NO ANALYSIS"]
 
+    def _no_procedure(self, b: Optional[Block]) -> List[str]:
+        """The procedure lines of a step without a ccx procedure (handle_step): its Abaqus
+        procedure card ``b``, one ccx lacks (ABAQUS_ONLY_PROCS; None if the step has none),
+        commented out and *NO ANALYSIS written, so that ccx stops at the step (_no_analysis)
+        instead of running it as the previous step's procedure."""
+        why = ("Without a procedure ccx would run the step as the previous step's procedure "
+               "(or stop, as the first step), so *NO ANALYSIS is written: ccx stops at this step.")
+        if b is None:
+            msg = f"Step {self.emit.no} has no procedure card. {why}"
+            self.report.warn(msg, once=True)
+            self._reduces(f"step {self.emit.no} without a procedure (ccx stops there)")
+            return ["** abq2ccx: " + msg, "*NO ANALYSIS"]
+        return self._no_analysis(b, f"*{b.keyword}: Abaqus' {ABAQUS_ONLY_PROCS[b.keyword]} has no "
+                                    f"ccx counterpart; commented out. {why}",
+                                 f"*{b.keyword} step (no ccx counterpart)")
+
+    def _no_analysis_segfaults(self, deck: EmittedDeck) -> EmittedDeck:
+        """The first step ccx stops at (*NO ANALYSIS: _no_analysis) in a deck with a material
+        card of NO_ANALYSIS_SEGFAULTS, on which ccx 2.23 segfaults there: as the first step it
+        is left without a procedure, where ccx stops all the same (probed); a later one ends
+        the deck: it and the steps after it become comments, so that ccx runs the steps before
+        it and finishes (no card stops ccx at a later step without a crash)."""
+        mat = next((c.keyword for c in deck.cards if c.keyword in NO_ANALYSIS_SEGFAULTS), None)
+        stop = next((s for s in deck.steps if s.first("NO ANALYSIS")), None)
+        if mat is None or stop is None:
+            return deck
+        why = (f"ccx 2.23 segfaults at a *NO ANALYSIS step of a model with a *{mat} material "
+               f"(probed)")
+        if stop.number == 1:
+            msg = (f"*NO ANALYSIS left out of step 1: {why}. Without a procedure ccx stops at the "
+                   f"first step all the same.")
+            deck.swap(stop.first("NO ANALYSIS").line, ["** abq2ccx: " + msg])
+        else:
+            msg = (f"The deck ends before step {stop.number}, at which ccx would stop: {why}. That "
+                   f"step and the steps after it are comments; ccx runs the steps before it.")
+            deck.insert_at(stop.head.line, ["** abq2ccx: " + msg])
+            for c in deck.cards[stop.head.index:]:      # (the later steps' cards)
+                self.report.n_commented += c.step != stop.number and c.keyword not in ("STEP", "END STEP")
+            for i in range(stop.head.line, len(deck.lines)):
+                if not deck.lines[i].lstrip().startswith("**"):
+                    deck.swap(i, ["** " + deck.lines[i]])
+        self.report.warn(msg, once=True)
+        return deck.edited()
+
     def handle_dynamic(self, b: Block) -> List[str]:
         """``*DYNAMIC``: ccx runs implicit (HHT-alpha) and explicit (``EXPLICIT``, central
         difference) direct integration natively; its card knows only EXPLICIT, DIRECT,
@@ -19619,6 +19717,7 @@ class Converter:
         deck = self._modal_own_loads(deck)      # after the loads the restore gives back
         deck = self._clear_body_forces(deck)    # after every pass that writes *DLOAD, OP=NEW
         deck = self._keep_body_loads(deck)      # after the restore, which gives body loads too
+        deck = self._no_analysis_segfaults(deck)
         self._audit_loads(blocks, deck)
         out = self._shift_total_time(deck.render())     # after every pass that writes load cards
         out = self._short_fields(out)           # last: every card is written
@@ -21889,12 +21988,14 @@ class Converter:
         """Guard against a hollow solve: a step the Abaqus deck loads but whose every load
         was commented out (or became a stock ccx user subroutine) would still run — to a
         zero response.  Fills ``unloaded_steps`` (1-based) and ``source_unloaded`` (the deck
-        itself applies no load in any step and has no eigenvalue step)."""
+        itself applies no load in any step and has no eigenvalue step).  ccx runs no step from
+        the first one it stops at (_no_analysis) on."""
         src = step_load_audit(blocks, user_loads=True, abaqus=True)
         dst = step_load_audit(deck.blocks(), user_loads=False)
         self.source_unloaded = bool(src) and all(s == [] for s in src)
+        run = min(self._stopped_steps, default=len(src) + 1)
         self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1)
-                               if s and d == [] and i not in self._stopped_steps]
+                               if s and d == [] and i < run]
         procs: List[Optional[str]] = []             # each step's procedure, counted as there:
         cur: Optional[List[str]] = None             # a *STEP before *END STEP replaces the open one
         for b in list(blocks) + [Block("END STEP", OrderedDict())]:

@@ -3191,12 +3191,12 @@ def lc2_column_deck(n=20):
             f"*BOUNDARY, OP=NEW, LOAD CASE=2\n1, 1, 6\n{top}, 1, 1\n*CLOAD\n{top}, 3, -1.\n*END STEP\n")
 
 
-def pert_procs_deck(twin=False):
+def pert_procs_deck():
     """A C3D8 cube (E 1000, nu 0.3) on rollers whose top moves up at 0.01 per time (*BOUNDARY,
     TYPE=VELOCITY) in a static step, then a *FREQUENCY and a *RESPONSE SPECTRUM step (linear
     perturbation steps), then a static step pulling a top corner sideways on a TIME=TOTAL TIME
-    amplitude while the top moves on.  ``twin``: without the two perturbation steps."""
-    pert = "" if twin else "*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*RESPONSE SPECTRUM\n*END STEP\n"
+    amplitude while the top moves on."""
+    pert = "*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*RESPONSE SPECTRUM\n*END STEP\n"
     return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
             "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
             "*NSET, NSET=TOP\n5, 6, 7, 8\n*NSET, NSET=ALL\n1, 2, 3, 4, 5, 6, 7, 8\n"
@@ -3357,6 +3357,17 @@ def modal_bare_prints_deck(twin=False):
             "*STEP\n*FREQUENCY, STORAGE=YES\n4\n*END STEP\n*STEP\n*MODAL DYNAMIC\n0.01, 0.1\n"
             "*CLOAD\n19, 2, 1.\n*END STEP\n*STEP\n*STATIC\n0.5, 1.\n*CLOAD\nTOP, 2, 0.2\n"
             f"{out if twin else ''}*END STEP\n")
+
+
+def pert_prints_deck(gen=True, own=True, last=""):
+    """after_pert_deck's column (elastic): a static step loading its top (printing the base's
+    RF if ``gen``), a *FREQUENCY step (printing the top's U if ``own``), then a static step
+    loading it twice as much, with print cards ``last``."""
+    rf = "*NODE PRINT, NSET=BOT\nRF\n"
+    freq = "*NODE PRINT, NSET=TOP\nU\n" if own else ""
+    return (after_pert_model() + f"*STEP\n*STATIC\n*CLOAD\nTOP, 2, 0.1\n{rf if gen else ''}*END STEP\n"
+            f"*STEP\n*FREQUENCY\n4\n{freq}*END STEP\n*STEP\n*STATIC\n*CLOAD\nTOP, 2, 0.2\n{last}"
+            "*END STEP\n")
 
 
 def modal_own_loads_deck(base=True):
@@ -8703,15 +8714,20 @@ def main():
         elif all(runs):
             print(f"FAIL  {tag}: no displacement table")
         failures += 0 if ok else 1
-    # a *STATIC, RIKS step (no --approximate) and a *COMPLEX FREQUENCY step: *NO ANALYSIS, so
-    # ccx stops there after the steps before it, without a crash (an *EL FILE carried into the
-    # step crashed ccx 2.23: an empty one ends it)
-    for tag, steps, proc, before in (
-            ("riks_stops", "*STEP\n*STATIC\n*CLOAD\n19, 2, 1.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n"
-             "*STEP\n*STATIC, RIKS\n0.1, 1.\n*CLOAD\n19, 2, 2.\n*END STEP\n", "Static",
-             "ccx ran the Riks step as a load-controlled *STATIC"),
+    # a *STATIC, RIKS step (no --approximate), a *COMPLEX FREQUENCY step and a step of an Abaqus
+    # procedure ccx lacks: *NO ANALYSIS, so ccx stops there after the steps before it, without a
+    # crash (an *EL FILE carried into the step crashed ccx 2.23: an empty one ends it)
+    static = "*STEP\n*STATIC\n*CLOAD\n19, 2, 1.\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n"
+    for tag, steps, proc, second, before in (
+            ("riks_stops", static + "*STEP\n*STATIC, RIKS\n0.1, 1.\n*CLOAD\n19, 2, 2.\n*END STEP\n",
+             "Static", "*STATIC, RIKS", "ccx ran the Riks step as a load-controlled *STATIC"),
             ("complex_frequency_stops", "*STEP\n*FREQUENCY\n4\n*END STEP\n*STEP\n*COMPLEX FREQUENCY\n"
-             "2\n*END STEP\n", "Frequency", "ccx stopped at input")):
+             "2\n*END STEP\n", "Frequency", "*COMPLEX FREQUENCY", "ccx stopped at input"),
+            ("soils_stops", static + "*STEP\n*SOILS, CONSOLIDATION\n0.1, 1.\n*CLOAD\n19, 2, 2.\n"
+             "*END STEP\n", "Static", "*SOILS", "ccx ran the *SOILS step as a load-controlled *STATIC"),
+            ("matrix_generate_stops", "*STEP\n*FREQUENCY\n4\n*END STEP\n*STEP\n*MATRIX GENERATE, "
+             "STIFFNESS\n*END STEP\n", "Frequency", "*MATRIX GENERATE",
+             "ccx ran a second *FREQUENCY step")):
         src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(after_pert_model() + steps)
@@ -8731,9 +8747,66 @@ def main():
               (moved > 1e-3 and len(blocks) == 1 if proc == "Static"
                else len(freqs) == 4 and min(freqs) > 0.0))
         print(f"{'PASS' if ok else 'FAIL'}  {tag} (the column, a *{proc.upper()} step, then "
-              f"{'*STATIC, RIKS' if proc == 'Static' else '*COMPLEX FREQUENCY'}): ccx ran step 1 "
+              f"{second}): ccx ran step 1 "
               f"({'the top moved ' + format(moved, '.4g') if proc == 'Static' else str(len(freqs)) + ' frequencies'})"
               f" and stopped at step 2, exit code {r.returncode} (before: {before})")
+        failures += 0 if ok else 1
+    # the same in a model with a plastic material (yield 1e3: elastic throughout), where ccx
+    # 2.23 segfaults at a *NO ANALYSIS step: the deck ends before the step, so ccx runs step 1
+    # and finishes
+    for tag, second, before in (
+            ("plastic_soils_ends", "*STEP\n*SOILS, CONSOLIDATION\n0.1, 1.\n*CLOAD\n19, 2, 2.\n"
+             "*END STEP\n", "ccx ran the *SOILS step as a load-controlled *STATIC and stopped in "
+             "it: too many cutbacks"),
+            ("plastic_riks_ends", "*STEP\n*STATIC, RIKS\n0.1, 1.\n*CLOAD\n19, 2, 2.\n*END STEP\n",
+             "ccx segfaulted at the *NO ANALYSIS step")):
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(after_pert_model(True) + static + second)
+        convert(src, inp)
+        d = tempfile.mkdtemp(prefix="ccxval_")
+        shutil.copy(inp, os.path.join(d, "job.inp"))
+        r = subprocess.run([ccx, "job"], cwd=d, env={**os.environ, **env}, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=600)
+        blocks = dat_node_blocks(os.path.join(d, "job.dat"))
+        moved = max((abs(x) for blk in blocks for v in blk.values() for x in v), default=0.0)
+        shutil.rmtree(d, ignore_errors=True)
+        sel = [ln.strip() for ln in r.stdout.splitlines() if "analysis was selected" in ln]
+        ok = r.returncode == 0 and "Job finished" in r.stdout and "*ERROR" not in r.stdout and \
+            sel == ["Static analysis was selected"] and len(blocks) == 1 and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (the plastic column, a *STATIC step, then "
+              f"{second.split(chr(10))[1]}): ccx ran step 1 (the top moved {moved:.4g}) and "
+              f"finished, exit code {r.returncode} (before: {before})")
+        failures += 0 if ok else 1
+    # a *FREQUENCY step's own *NODE PRINT, which ccx carried into the next static step (Abaqus
+    # ends it with the perturbation steps): that step prints the cards Abaqus carries into it
+    # (step 1's RF; the twin gives them itself), or nothing (the twin's frequency step prints
+    # nothing); the .frd shows it solved as the twin
+    def prints(dat):
+        return dat_node_blocks(dat, "forces"), dat_node_blocks(dat), frd_last(dat[:-4] + ".frd", "DISP")
+    rf = "*NODE PRINT, NSET=BOT\nRF\n"
+    for tag, decks, counts, what in (
+            ("perturbation_prints_carried", [pert_prints_deck(), pert_prints_deck(last=rf)],
+             (2, 4, 2, 4), "the base's RF printed in the static steps, the top's U in the "
+             "frequency step: the last step's RF as the twin's"),
+            ("perturbation_prints_ended", [pert_prints_deck(False), pert_prints_deck(False, False)],
+             (0, 4, 0, 0), "the top's U printed in the frequency step only: nothing printed in "
+             "the last step")):
+        runs = [review_run(text, tag + ("_ref" if k else ""), prints) for k, text in enumerate(decks)]
+        ok = all(runs)
+        if ok:
+            (f, u, top), (f0, u0, top0) = runs
+            err, rfs = same([f, f0]) if f0 else (0.0, 0.0)
+            moved = max((abs(x) for v in top0.values() for x in v), default=0.0)
+            off = max((abs(a - b) for n, v in top0.items() for a, b in zip(top.get(n, [math.inf] * 3), v)),
+                      default=math.inf)
+            ok = (len(f), len(u), len(f0), len(u0)) == counts and err <= 1e-9 * rfs and \
+                off < 1e-9 * moved and moved > 1e-3 and (rfs > 1e-2 or not f0)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (the column: a static step, *FREQUENCY, then "
+                  f"a static step without print cards; {what}): {len(f)} RF and {len(u)} U tables "
+                  f"(twin {len(f0)}, {len(u0)}), RF {err:.1e} apart, the last .frd displacements "
+                  f"{off:.1e} apart (the top moved {moved:.4g}) (before: the last step printed the "
+                  f"frequency step's U)")
         failures += 0 if ok else 1
     # *CONTACT PRINT CF / CFN / CFS in the *FREQUENCY, modal and steady-state dynamics steps
     # (ccx 2.23 segfaulted, any material: left out there): the static step's CFN against the
@@ -9843,20 +9916,31 @@ def main():
         print(f"FAIL  lc2_column: {len(fac)} factors")
     failures += 0 if ok else 1
 
-    # a *RESPONSE SPECTRUM step (a linear perturbation step, which ccx has no procedure for)
-    # counted as a general step of unknown time by the velocity-BC plan: the top's velocity BC
-    # carried into the last step was dropped there (it stayed at 0.01)
-    runs = [review_run(pert_procs_deck(twin), "pert_procs" + ("_ref" if twin else ""), dat_node_blocks)
-            for twin in (False, True)]
-    ok = all(runs)
-    if ok:
-        err, moved = same(runs, -1)
-        top, side = runs[0][-1].get(7, [0.0, 0.0, math.nan])[2], runs[0][-1].get(7, [0.0])[0]
-        ok = err < 1e-9 * moved and abs(top / 0.02 - 1) < 1e-6 and abs(side) > 1e-4
-        print(f"{'PASS' if ok else 'FAIL'}  pert_procs (a C3D8 cube's top moving at 0.01 per time "
-              f"over a *FREQUENCY and a *RESPONSE SPECTRUM step): the last step as without them "
-              f"({err:.1e} apart; the loaded corner moved {side:.4g} sideways), the top at {top:.7g} "
-              f"vs 0.02")
+    # a *RESPONSE SPECTRUM step (a linear perturbation step, which ccx has no procedure for):
+    # *NO ANALYSIS, so ccx stops there, after the static and the frequency step.  (ccx ran it as
+    # a second *FREQUENCY step and went on, which showed the velocity-BC plan's error: it
+    # counted the step as a general one of unknown time and dropped the top's velocity BC in
+    # the last step; test_one_perturbation_step_rule keeps that.)
+    src, inp = os.path.join(tmp, "pert_procs_src.inp"), os.path.join(tmp, "pert_procs.inp")
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(pert_procs_deck())
+    convert(src, inp)
+    d = tempfile.mkdtemp(prefix="ccxval_")
+    shutil.copy(inp, os.path.join(d, "job.inp"))
+    r = subprocess.run([ccx, "job"], cwd=d, env={**os.environ, **env}, capture_output=True,
+                       encoding="utf-8", errors="replace", timeout=600)
+    disp = frd_blocks(os.path.join(d, "job.frd"), "DISP")      # step 1's, then the modes'
+    shutil.rmtree(d, ignore_errors=True)
+    top = disp[0][1].get(7, [0.0, 0.0, math.nan])[2] if disp else math.nan
+    sel = [ln.strip() for ln in r.stdout.splitlines() if "analysis was selected" in ln]
+    ok = r.returncode == 0 and "*ERROR" not in r.stdout and abs(top / 0.01 - 1) < 1e-6 and \
+        sel == ["Static analysis was selected", "Frequency analysis was selected",
+                "No analysis was selected"]
+    print(f"{'PASS' if ok else 'FAIL'}  pert_procs (a C3D8 cube's top moving at 0.01 per time in a "
+          f"static step, then *FREQUENCY, *RESPONSE SPECTRUM and a static step): ccx ran the static "
+          f"step (the top at {top:.7g}, 0.01) and the frequency step and stopped at the *RESPONSE "
+          f"SPECTRUM step, exit code {r.returncode} (before: it ran that step as a second "
+          f"*FREQUENCY and went on)")
     failures += 0 if ok else 1
 
     # cards between two steps act in the next one (ccx reads them so): the *CLOAD and *NODE
