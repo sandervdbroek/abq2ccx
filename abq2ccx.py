@@ -28600,12 +28600,19 @@ class Converter:
         self._sp_temps = {s for s in static if any(b.keyword == "TEMPERATURE" for b in groups[s - 1])}
         self._sp_temp_dep = any(b.keyword in ("ELASTIC", "HYPERELASTIC", "HYPERFOAM", "EXPANSION") and
                                 temperature_dependent(b) for b in model)
-        acts = op_new_cards(blocks, skip=self.steps.lc2)
-        state = {k for b in model if b.keyword == "BOUNDARY" for k in self._boundary_pairs(b)}
+        acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
+        deck = model + [b for g in groups for b in g]
+        given = {id(b): self._boundary_pairs(b) for b in deck
+                 if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2}
+        # the pairs in force as a step starts: the model data's, then the last general step's
+        # (what follows the last step left out; an unterminated *STEP's cards stay in its step)
+        folds = self.steps.states(lambda b: [(k, True) for k in given[id(b)]], skip=self.steps.lc2,
+                                  nested="join", model=True, blocks=deck)
+        state = set(next(folds))
         last, since, held = 0, set(), set()     # the perturbation procedures since, what they hold
-        for s, group in enumerate(groups, 1):
+        for (s, group), end in zip(enumerate(groups, 1), folds):
             cards = [b for b in group[1:] if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2]
-            pairs = {k for b in cards for k in self._boundary_pairs(b)}
+            pairs = {k for b in cards for k in given[id(b)]}
             new = any(id(b) in acts for b in cards)
             procs = {b.keyword for b in group[1:] if b.keyword in PROC_KW}
             if s in self._pert_idx:
@@ -28626,7 +28633,7 @@ class Converter:
                     self._restore_pairs[s] = set(state)
                     if held - state - pairs:
                         self._restore_new.add(s)
-            state = pairs if new else state | pairs
+            state = set(end)                    # (pairs if new else state | pairs)
             last, since, held = s, set(), set()
 
     # what loads a ccx modal dynamic step (step_load_audit's descriptions; temperatures and
