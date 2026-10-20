@@ -6,6 +6,20 @@ physics.
 
 ## Unreleased
 
+* **Free coupling twists held in every form** — the hold on the ROT NODE now also covers
+  `*DYNAMIC` and linear-rigid decks (ccx stopped converging or exited 255, without a warning),
+  a `*TRANSFORM` on the reference node (solved 1e12 off, silently), `*KINEMATIC COUPLING` cards,
+  and, without NLGEOM, couplings of some translations or of shell or beam nodes (as the linear
+  equations Abaqus solves there). The deck's own BCs on the node's rotations count. All
+  probed exact; under NLGEOM the last ones are warned.
+* **`*CLOAD` and `*EQUATION` on DOFs ccx lacks** (7-10, 12-30) stopped ccx. The line, or the
+  whole equation, is now left out, warned as lost where an element has the DOF.
+* **More composite solids split** — C3D8I, C3D20 and C3D20R bricks (a 20-node layer is tied to
+  the element's own field), and layer axes or angles from a `*DISTRIBUTION`. These were
+  commented out (ccx stopped). The `*DISTRIBUTION` axes are exact; the new bricks are
+  reduced physics (their layer integration or C3D8I's modes differ).
+* **`*DLOAD` / `*DSLOAD` HP** (hydrostatic pressure) is now consistent nodal forces, exact in
+  small-strain steps. A face the zero-pressure level cuts, and NLGEOM steps, stay commented out.
 * **`DASHPOT1`, and more part data in rotated instances** — a `DASHPOT1` (a node's DOF to
   ground) was read as a 2-node element and dropped with its set, so ccx stopped on its
   `*DASHPOT`. It is now a `DASHPOTA` to a new ground node that `*EQUATION`s keep on the DOF's
@@ -40,7 +54,7 @@ physics.
   keep the stack on one displacement field, as Abaqus' single element. Exact where the layer
   integration agrees (C3D8 with 3 or more section points per layer, C3D8R with 1); else
   reduced physics.
-* **`*DLOAD` types ccx lacks** — HP, VP, SP, SBF, PI, PE, edge loads other than EDNOR, a bare
+* **`*DLOAD` types ccx lacks** — VP, SP, SBF, PI, PE, edge loads other than EDNOR, a bare
   `P` on solids: ccx 2.23 stopped on them (crashed on the `P`). They are now commented out,
   warned. On axisymmetric elements, `BR` / `BZ` (radial / axial) become ccx's `BX` / `BY`;
   `BZ` used to act out of the plane.

@@ -6405,6 +6405,8 @@ class Converter:
         # split was left out (_plan_ply_split)
         self._ply_sections: Dict[int, dict] = {}
         self._ply_solids: Dict[int, dict] = {}         # ... of composite solid sections
+        self._solid_sec_axes: Dict[int, tuple] = {}    # ... their orientation's *DISTRIBUTION axes
+        self._ply_next_node = 0                        # (_quadratic_plies: the last node id)
         self._ply_eq: List[str] = []
         self._ply_skipped = ""
         self._ply_unsplit: Dict[int, str] = {}     # id(section) -> why it was not split
@@ -6676,7 +6678,10 @@ class Converter:
         self._kin_hold_bc: List[str] = []          # _plan_kinematic_holds
         self._kin_hold_eq: List[str] = []          # ... its *EQUATIONs on twist ROT NODEs
         self._kin_twist: Dict[int, Tuple[int, List[Vec]]] = {}    # _plan_kinematic_twists
-        self._kin_twist_refused: Dict[int, str] = {}              # ... why not, per ref node
+        self._kin_twist_refused: Dict[int, Tuple[List[Vec], str]] = {}    # ... why not, per ref node
+        self._kin_twist_wait: Dict[int, List[Vec]] = {}       # ... in the forms of _kin_dyn
+        self._kin_twist_eq: set = set()           # ... their refs with linear-equation couplings
+        self._kin_twist_bc: Dict[int, List[Vec]] = {}         # ... axes the deck's BCs always hold
         self._rigid_cards_out = False
         self._star_masses: List[Tuple[str, float]] = []     # (element set, mass) per *MASS card
         self._rotary_done: set = set()             # id(*ROTARY INERTIA) carried by a star
@@ -9334,7 +9339,7 @@ class Converter:
             ori = b.uparam("ORIENTATION")
             elset = (b.param("ELSET") or "").strip()
             shell = kw in ("SHELL SECTION", "SHELL GENERAL SECTION")
-            if id(b) in self._ply_sections:        # ply solids with their own axes, the rotation applied
+            if id(b) in self._ply_sections or id(b) in self._ply_solids:   # ply solids with their own axes
                 continue
             if shell and self._continuum_shell_elset(elset):
                 if ori in self._dist_ori and not b.has("COMPOSITE"):    # runs as a solid
@@ -11466,6 +11471,36 @@ class Converter:
                          f"a warning), and ccx, which has no such DOF, would stop ('unknown "
                          f"DOF').", once=True)
 
+    def _lacking_dof(self, d: int, card: str) -> Optional[bool]:
+        """For a ``card`` ("CLOAD" or "EQUATION") term on DOF ``d`` of _UNKNOWN_DOF_ELEMENTS
+        that the conversion leaves out: whether an element of the model has that DOF in Abaqus
+        (the load or constraint is lost), else None.  ccx 2.23 reads a *CLOAD on DOFs 1-6 only
+        and stops on any other ('nonexistent degree of freedom'; DOFs 0 and 7-31 probed), and an
+        *EQUATION term on 7, 9, 10 or 12-30 ('*ERROR reading *EQUATION'); one on DOF 8 it reads
+        as its own DOF (the rotation about x on a shell or beam node, probed), left out where
+        no element keeps DOF 8, as handle_boundary does."""
+        if d not in self._UNKNOWN_DOF_ELEMENTS or (card == "EQUATION" and not self._inactive_dof((), d)):
+            return None
+        return any(self._UNKNOWN_DOF_ELEMENTS[d][1](t.upper()) for t in self._elem_types) or \
+            (d == 8 and bool(self._pore_nodes))
+
+    def _drop_dof_note(self, card: str, d: int, lost: bool) -> None:
+        """Report a *CLOAD line or *EQUATION left out for a term on DOF ``d`` (_lacking_dof)."""
+        what = self._UNKNOWN_DOF_ELEMENTS[d][0]
+        dof = "DOFs 12-30" if d >= 12 else f"DOF {d}"
+        gone = "load" if card == "CLOAD" else "constraint"
+        lead = f"*CLOAD on {dof} ({what}) left out" if card == "CLOAD" else \
+            f"*EQUATION with a term on {dof} ({what}) commented out"
+        why = "ccx has no such DOF and stops on it ('nonexistent degree of freedom')" if card == "CLOAD" \
+            else "ccx has no such DOF and stops on it ('*ERROR reading *EQUATION')" if d != 8 else \
+            "ccx would read it as its own DOF 8 (the rotation about x on a shell or beam node)"
+        if lost:
+            self.report.warn(f"{lead}: {why}, so that {gone} is LOST (probed on 2.23).", once=True)
+            self._reduces(f"*{card} on {dof} ({what})")
+        else:
+            self.report.note(f"{lead}: no element of the model has {'them' if d >= 12 else 'that DOF'}, "
+                             f"so the {gone} acts on nothing, and {why} (probed on 2.23).", once=True)
+
     def _active_dof_lines(self, spec: str, d1: int, d2: int, extra: List[str]) -> Optional[List[str]]:
         """BC data lines for DOFs d1..d2 on ``spec`` with the rotational DOFs (4-6) moved or
         removed where ccx needs it, or None when the line can stay as it is:
@@ -12661,8 +12696,15 @@ class Converter:
         moved: List[int] = []       # reference nodes whose moments go to their ROT NODE
         hit: List[int] = []         # transformed nodes whose loads _plan_transformed_rotations / _corners rewrite
         marks: List[Tuple[int, List[str]]] = []     # where each data line's lines start, its fields
+        lacking: List[str] = []                     # lines on DOFs ccx has no load on (_lacking_dof)
         for ln in b.data:
             f = [x.strip() for x in ln.split(",")]
+            lost = self._lacking_dof(int(f[1]), "CLOAD") \
+                if len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) else None
+            if lost is not None:
+                self._drop_dof_note("CLOAD", int(f[1]), lost)
+                lacking.append(ln)
+                continue
             marks.append((len(out), f))
             self._check_node_target("CLOAD", f[0] if f else "")
             if not (len(f) >= 2 and re.fullmatch(r"[-+]?\d+", f[1]) and
@@ -12710,6 +12752,12 @@ class Converter:
         if moved:
             self.report.note("Moments on a *RIGID BODY reference point moved to DOFs 1-3 of its "
                              "ROT NODE (" + self._rot_node_why(moved) + ").", once=True)
+        if lacking:
+            if (keep.get("OP") or "").strip().upper() != "NEW" and \
+                    not any(not ln.startswith("**") for ln in out[1:]):
+                out = out[1:]                        # (nothing left to load)
+            out += ["** abq2ccx: *CLOAD line(s) on a DOF ccx has no load on (it stops on them) "
+                    "left out:"] + ["** " + ln for ln in lacking]
         return out
 
     # the parameters of a ccx *DLOAD card, which *DLOAD and *DSLOAD both become
@@ -12741,6 +12789,10 @@ class Converter:
                 continue
             if _is_user_load(b, g):
                 side += self._user_load_line(b, g)
+                continue
+            m = re.fullmatch(r"HP([1-6]?)", label)
+            if m and g[0]:
+                side += self._hydrostatic(b, g, [(g[0], m.group(1))])
                 continue
             rigid = self._rigid_dload(b, g, label) if self._skins and g[0] else None
             if rigid is not None:
@@ -12932,6 +12984,9 @@ class Converter:
                 tag = self._as_pressure(b, "DSLOAD", g)
                 label, mag = "P", p
                 g = [g[0], label, p]
+            if label == "HP" and surf in self.surfaces and not self.surfaces[surf][0].startswith("NODE"):
+                side += self._hydrostatic(b, g, self.surfaces[surf][1])
+                continue
             if not re.fullmatch(r"P[1-6]?", label):
                 side += self._drop_load_line(b, g, f"the load type {label} has no ccx equivalent (ccx "
                                                    f"surface loads are pressures)")
@@ -13366,6 +13421,10 @@ class Converter:
         if base == "P":
             return ("under NLGEOM a pressure stays normal to the deforming surface and acts per "
                     "unit current area")
+        if base == "HP":
+            return ("under NLGEOM a hydrostatic pressure stays normal to the deforming surface and "
+                    "acts per unit current area (Abaqus documents no more: whether its depth "
+                    "follows the surface either)")
         if (b.param("FOLLOWER") or "YES").strip().upper() != "NO":
             return ("under NLGEOM the traction rotates with the surface (FOLLOWER=YES, the Abaqus "
                     "default)")
@@ -13454,6 +13513,60 @@ class Converter:
                 out.append((key, ", ".join(x.strip() for x in entries[0][0].split(",")[:2]) + ", 0.", "0."))
         return out
 
+    def _hydrostatic(self, b: Block, g: List[str], pairs: Sequence[Tuple[str, str]]) -> List[str]:
+        """A hydrostatic pressure line — *DLOAD HPn / HP, *DSLOAD HP (Abaqus/Standard; Abaqus
+        2017 "Distributed loads": magnitude p at level z_b, zero at the zero-pressure level z_a
+        and above it, linear in the global Z, Y in 2-D and axisymmetric models) — on the faces
+        ``pairs`` ((element / set, face: 1-6, S1-S6, SPOS / SNEG or none)) -> consistent nodal
+        forces (_to_nodal_forces), which ccx keeps on the undeformed faces: exact in a small-
+        strain step on a face wholly below the zero-pressure level or above it (the pressure is
+        a polynomial there), to quadrature accuracy on curved quadratic faces; a face the level
+        cuts (the pressure kinks inside) is left out, as are the levels the other way round.
+        It pushes into a continuum face (against its outward normal: the side away from the
+        element's centroid), along the positive normal of an element-based shell or membrane
+        line, against the surface normal of a surface-based one (SPOS: the element normal)."""
+        try:
+            za, zb = (pf(g[k]) if len(g) > k and g[k] else 0.0 for k in (3, 4))
+        except ValueError:
+            return self._drop_load_line(b, g, "its levels are not numbers", reduces=False)
+        if not za > zb:
+            return self._drop_load_line(b, g, "the level of its magnitude does not lie below the "
+                                              "zero-pressure level, which Abaqus' definition (zero "
+                                              "above that level) does not cover")
+        faces: list = []
+        for token, face in pairs:
+            label = (face or "").upper()
+            label = label if label in ("SPOS", "SNEG") or not label else f"S{label[-1]}"
+            for e in self._load_elements(token):
+                got, why = self._load_faces([e], label, shell_reference=True)
+                if why:
+                    return self._drop_load_line(b, g, why)
+                nodes, kind, scale, axi, planar, n1, sense = got[0]
+                info = self.geom.elements.get(e) or self._carriers.get(e)
+                cc = ccx_type(info[0])
+                xyz = [self.geom.nodes[n] for n in nodes]
+                if sense is None and (cc.startswith("C3D") or cc.startswith(PLANE_ELEM_PREFIXES)):
+                    normals: List[Vec] = []
+                    consistent_nodal_forces(kind, xyz, lambda p, n, tg: normals.append(n) or
+                                            (0.0, 0.0, 0.0), axi)
+                    conn = info[1]
+                    mid = tuple(sum(self.geom.nodes[k][i] for k in conn) / len(conn) for i in range(3))
+                    fmid = tuple(sum(x[i] for x in xyz) / len(xyz) for i in range(3))
+                    sense = -1.0 if vdot(normals[0], vsub(fmid, mid)) > 0.0 else 1.0
+                elif sense is None:                    # a shell's or membrane's reference surface
+                    sense = -1.0 if b.keyword == "DSLOAD" and label != "SNEG" else 1.0
+                k = 1 if planar else 2
+                hs = [x[k] for x in xyz]
+                if min(hs) < za < max(hs):
+                    return self._drop_load_line(b, g, f"its zero-pressure level ({short_real(za, 9)}) "
+                                                      f"cuts a face of element {e}, inside which the "
+                                                      f"pressure kinks (nodal forces exact only where "
+                                                      f"it is linear over each face)")
+                faces.append((nodes, kind, scale, axi, planar, n1, sense))
+        if not faces:
+            return self._drop_load_line(b, g, f"'{g[0]}' gives no element faces", reduces=False)
+        return self._to_nodal_forces(b, b.keyword, list(g[:5]) + [""] * (5 - len(g[:5])), faces, None)
+
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
                          why: Optional[str]) -> List[str]:
         """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2) or surface-element
@@ -13467,7 +13580,7 @@ class Converter:
         (_load_faces); plane-element edges carry the section thickness, axisymmetric edges the
         full circle; a 2-D model has no third component."""
         label = g[1].upper()
-        base = label[:5] if label.startswith("TR") else label
+        base = label[:5] if label.startswith("TR") else "HP" if label.startswith("HP") else label
         if why:
             return self._drop_load_line(b, g, why)
         try:
@@ -13530,6 +13643,9 @@ class Converter:
             elif base == "P":
                 def load(p, normal, tangent, s=sense):
                     return vscale(normal, mag * s)
+            elif base == "HP":                  # (d: the zero-pressure level, the magnitude's)
+                def load(p, normal, tangent, s=sense, k=1 if planar else 2):
+                    return vscale(normal, mag * s * max(0.0, (d[0] - p[k]) / (d[0] - d[1])))
             fv = consistent_nodal_forces(kind, [self.geom.nodes[n] for n in nodes], load, axi)
             for nd, v in zip(nodes, fv):
                 for k in range(2 if planar else 3):
@@ -13584,6 +13700,11 @@ class Converter:
             what, lack = "surface tractions (TRVEC / TRSHR)", "ccx has no such load"
         elif base == "P":
             what, lack = "pressures (P) on surface elements", "ccx has no surface element"
+        elif base == "HP":
+            what, lack = ("hydrostatic pressures (HP)", "ccx has no pressure that varies over a face "
+                          "(Abaqus: linear in the global Z, Y in 2-D and axisymmetric models, from "
+                          "the given magnitude at one level to zero at the zero-pressure level, zero "
+                          "above it)")
         elif base == "GRAV":
             what, lack = "gravity (GRAV) on U1 beams", "ccx stops on GRAV on U1 elements"
         else:
@@ -18095,6 +18216,26 @@ class Converter:
         out = self._equation_block_lines(b)
         card = mkblock("EQUATION", data=out[1:])
         eqs = self._equation_terms(card)
+        lacking: List[str] = []         # equations with a term on a DOF ccx lacks (_lacking_dof)
+        for eq in list(eqs):
+            got = [(int(d), self._lacking_dof(int(d), "EQUATION")) for _, d, _ in eq
+                   if re.fullmatch(r"[-+]?\d+", d.strip())]
+            gone = [(d, lost) for d, lost in got if lost is not None]
+            if gone:
+                # (lost unless every term is on a DOF no element has: the others constrain)
+                lost = any(x for _, x in gone) or len(gone) < len(eq)
+                for d, _ in gone:
+                    self._drop_dof_note("EQUATION", d, lost)
+                lacking += equation_rows(eq)
+                eqs.remove(eq)
+        tail: List[str] = []
+        if lacking:
+            tail = ["** abq2ccx: equation(s) with a term on a DOF ccx has no form of left out:"] + \
+                ["** " + x for x in lacking]
+            if not eqs:
+                return tail[:1] + ["** " + out[0]] + tail[1:]
+            out = [out[0]] + [x for eq in eqs for x in equation_rows(eq)]
+            eqs = self._equation_terms(mkblock("EQUATION", data=out[1:]))
         moved, bad = False, None
         for eq in eqs:
             for i, (tok, dof, coef) in enumerate(eq):
@@ -18116,7 +18257,7 @@ class Converter:
                 f"without the rotations of transformed nodes.", out,
                 "*EQUATION on DOFs 4-6 of a node with a *TRANSFORM",
                 comment="*EQUATION with a term on DOFs 4-6 of a node with a *TRANSFORM (misread by "
-                        "ccx 2.23) commented out")
+                        "ccx 2.23) commented out") + tail
         summed = twinned = False
         for i, eq in enumerate(eqs):
             got = self._ccx_equation_terms(eq)
@@ -18124,7 +18265,7 @@ class Converter:
                 eqs[i], s, t = got
                 summed, twinned = summed or s, twinned or t
         if not (moved or summed or twinned):
-            return out
+            return out + tail
         if moved:
             self.report.note("*EQUATION terms on DOFs 4-6 of a *RIGID BODY reference node moved to "
                              "DOFs 1-3 of its ROT NODE, which carries the body's rotation (ccx "
@@ -18151,8 +18292,8 @@ class Converter:
             if eq:
                 lines += equation_rows(eq)
         if len(lines) == 1:
-            return ["** abq2ccx: *EQUATION left out: its terms cancel (0 = 0)"]
-        return lines
+            return ["** abq2ccx: *EQUATION left out: its terms cancel (0 = 0)"] + tail
+        return lines + tail
 
     def _equation_block_lines(self, b: Block) -> List[str]:
         """``*EQUATION``: ccx 2.22 requires node NUMBERS in the terms; Abaqus/CAE decks
@@ -22449,11 +22590,14 @@ class Converter:
         it is exact.  Not where something else uses the rotation: an element, connector, *MPC
         body, *RIGID BODY, distributing coupling or *EQUATION term on the node, or the tied
         rotations of coupled shell/beam nodes.  A free rotation off the global axes (members on
-        one line through the reference node: the twist about it) is held through the ROT NODE
-        of the *RIGID BODY _plan_kinematic_twists makes of the coupling, by *EQUATIONs
-        (``_kin_hold_eq``) or BCs on its DOFs 1-3; where that plan does not apply, warned."""
+        one line through the reference node: the twist about it) is held on the ROT NODE that
+        carries the node's rotation in the form _plan_kinematic_twists gives the coupling, by
+        *EQUATIONs (``_kin_hold_eq``; through a twin where the ROT NODE has the node's
+        *TRANSFORM axes and several local terms would share a global DOF) or BCs on its DOFs
+        1-3, over what the deck's own BCs on the node's rotations in every step leave free (a
+        BC there in some steps only that reaches the twist: refused, as a hold would
+        overconstrain those steps); where no form applies, warned."""
         got: "OrderedDict[int, set]" = OrderedDict()     # ref -> rotations a coupling uses
-        rows: Dict[int, Optional[List[Vec]]] = {}        # ref -> _kin_rotation_rows (None: unknown)
         dist: set = set()
         for i, b in enumerate(blocks):
             if b.keyword == "COUPLING" and i + 1 < len(blocks) and blocks[i + 1].keyword == "DISTRIBUTING":
@@ -22473,12 +22617,8 @@ class Converter:
                 # (axes not known: left as it is; 2-D members, which ccx expands out of their
                 # plane: they solve, probed on CPS4 and CAX4 with '1, 1', '2, 2' and '1, 2')
                 used.update((1, 2, 3))
-                rows[ref] = None
                 continue
-            got_rows, got_used = self._kin_rotation_rows(ref, groups, frame, self._rot_nodes)
-            used.update(got_used)
-            if rows.get(ref, []) is not None:
-                rows[ref] = rows.get(ref, []) + got_rows
+            used.update(self._kin_rotation_rows(ref, groups, frame, self._rot_nodes)[1])
         lines: List[str] = []
         if got:
             busy = {n for e, (typ, conn) in self.geom.elements.items()
@@ -22504,37 +22644,41 @@ class Converter:
                                  f"about z, say) held at zero: Abaqus leaves such a rotation out of "
                                  f"the model, ccx 2.23 makes it a DOF of no stiffness and exits "
                                  f"without a message (probed). Exact.", once=True)
-            for ref, rs in rows.items():
-                off = self._off_axis_rotations(rs) if rs is not None and ref not in busy else []
-                if off:
-                    why = self._kin_twist_refused.get(ref) or "it is not a coupling of all " \
-                        "translations on solid nodes alone"
-                    self.report.warn(f"Kinematic coupling on reference node {ref}: its rotation "
-                                     f"about ({', '.join(short_real(c, 6) for c in off[0])}) moves no "
-                                     f"coupled DOF (its members lie on one line through it, say), so "
-                                     f"it has no stiffness. Abaqus solves around that zero pivot; "
-                                     f"ccx 2.23 solves a linear step on roundoff, which can be "
-                                     f"silently wrong (probed: 4x off), and an NLGEOM step stops "
-                                     f"converging. Not held here: {why} — verify, or couple the "
-                                     f"rotation.", once=True)
         eqs: List[str] = []
-        for ref, (rot, basis) in self._kin_twist.items():
+        n_held = 0
+        for ref, (rot, rs) in self._kin_twist.items():
+            basis = null_space(rs + self._kin_twist_bc.get(ref, []))
+            if not basis:                       # (the lines written leave it held)
+                continue
             for p, row in echelon_rows(basis):
-                others = [(k, c) for k, c in enumerate(row) if k != p and c]
-                if not others:
-                    lines.append(f"{rot}, {p + 1}, {p + 1}")
+                terms = self._dir_terms(rot, row, plan=True)
+                terms.sort(key=lambda t: t[:2] != (rot, p + 1))          # (the pivot first)
+                if len(terms) == 1:
+                    lines.append(f"{terms[0][0]}, {terms[0][1]}, {terms[0][1]}")
                     continue
-                eqs += [str(1 + len(others)), ", ".join(
-                    [f"{rot}, {p + 1}, 1."] + [f"{rot}, {k + 1}, {short_real(c, 12)}" for k, c in others])]
-        if self._kin_twist:
-            self.report.note(f"Kinematic coupling: {len(self._kin_twist)} reference node(s) whose "
-                             f"rotation about an axis off the global ones moves no coupled DOF (its "
-                             f"members lie on one line through the node: the twist about it) -> the "
-                             f"*RIGID BODY the coupling is in ccx (the same RIGID MPCs) with a ROT NODE "
-                             f"whose rotation about that axis is held by an *EQUATION: Abaqus solves "
-                             f"around the zero pivot it leaves, ccx 2.23 solves a linear step on "
-                             f"roundoff, which can be silently wrong, and stops converging under "
-                             f"NLGEOM (probed). Exact (probed against the members' own rigid-link "
+                eqs += self._twin_lines([terms]) + equation_rows(
+                    [(n, k, short_real(c, 12)) for n, k, c in terms])
+            n_held += 1
+        for ref, (basis, why) in self._kin_twist_refused.items():
+            self.report.warn(f"Kinematic coupling on reference node {ref}: its rotation about "
+                             f"({', '.join(short_real(c, 6) for c in basis[0])}) moves no coupled DOF "
+                             f"(its members lie on one line through it, say), so it has no "
+                             f"stiffness. Abaqus solves around that zero pivot; ccx 2.23 solves a "
+                             f"linear step on roundoff, which can be silently wrong (probed: 4x off, "
+                             f"or 1e12), and an NLGEOM or *DYNAMIC step stops converging. Not held "
+                             f"here: {why} — verify, or couple the rotation.", once=True)
+        if n_held:
+            self.report.note(f"Kinematic coupling: {n_held} reference "
+                             f"node(s) whose rotation about an axis off the global ones moves no "
+                             f"coupled DOF (members on one line through the node leave the twist "
+                             f"about it free, a coupling along one axis the turn about it) -> the "
+                             f"coupling carries the node's rotation on a ROT NODE (a "
+                             f"*RIGID BODY: the same RIGID MPCs as ccx's coupling; or its linear "
+                             f"equations where the deck has them), whose rotation about that axis is "
+                             f"held by an *EQUATION: Abaqus solves around the zero pivot it leaves, "
+                             f"ccx 2.23 solves a linear step on roundoff, which can be silently "
+                             f"wrong, and stops converging under NLGEOM or in a *DYNAMIC step "
+                             f"(probed). Exact (probed against the members' own rigid-link "
                              f"equations; NLGEOM converges).", once=True)
         if lines:
             self._kin_hold_bc = ["*BOUNDARY"] + lines
@@ -22578,18 +22722,32 @@ class Converter:
     def _plan_kinematic_twists(self, blocks: List[Block], next_id: int, structural: set) -> int:
         """Kinematic couplings whose reference node has a free rotation off the global axes
         (_off_axis_rotations of _kin_rotation_rows over all its couplings: members on one line
-        through the node leave the twist about that line free) -> the *RIGID BODY with a ROT
-        NODE they are in ccx (``_kin_rb``), whose free rotations _plan_kinematic_holds holds
-        (``_kin_twist``): ccx refuses an *EQUATION on DOFs 4-6 of a kinematic coupling's
-        reference node ('dependent side of two different MPC's'; its own rotation MPCs make
-        them dependent), and a BC holds a global axis only.  Only where every coupling on the
-        node couples all translations on plain 3-D nodes, and nothing else uses the node's
-        rotation (an element, *RIGID BODY, distributing coupling, *MPC body, connector,
-        *BOUNDARY or *EQUATION term on DOFs 4-6), outside the other forms (*TRANSFORM on the
-        node, *DYNAMIC decks, linear rigid equations); else _plan_kinematic_holds warns, with
-        the reason in ``_kin_twist_refused``.  Returns the last node id."""
+        through the node leave the twist about that line free), and the form that carries the
+        node's rotation on DOFs 1-3 of a ROT NODE, where _plan_kinematic_holds holds the twist
+        (``_kin_twist``: ROT NODE, rows): ccx refuses an *EQUATION on DOFs 4-6 of a kinematic
+        coupling's reference node ('dependent side of two different MPC's'; its own rotation
+        MPCs make them dependent), and a BC holds a global axis only.
+
+        * every coupling on the node one of all translations on plain 3-D nodes: the *RIGID
+          BODY it is in ccx (the same RIGID MPCs) with a ROT NODE (``_kin_rb``; a *KINEMATIC
+          COUPLING card's _kin_dynamic_cards writes) — or the one _plan_kinematic_rot_nodes made
+          for a *TRANSFORM on the node, whose axes the ROT NODE then has;
+        * in a deck with a *DYNAMIC step or linear rigid equations, the form
+          _plan_kinematic_rot_nodes gives the couplings there (_plan_twists_written);
+        * else, without NLGEOM, the linear *EQUATIONs Abaqus solves there (``_kin_twist_eq``,
+          _kin_form 'eq'): couplings of some translations, of shell or beam nodes, *KINEMATIC
+          COUPLING cards (probed on 2.23: exact; ccx's own coupling solves on roundoff).
+        The deck's BCs on the node's rotations in every step join the rows (they may hold the
+        twist: then nothing changes, ``_kin_twist_bc``).  Left as it is where something else
+        uses the node's rotation (an element, *RIGID BODY, distributing coupling, *MPC body,
+        connector), it is a shell or beam node, which may hold it, or an ORIENTATION's axes are
+        not known; refused (``_kin_twist_refused``: the twist axes and why, which
+        _plan_kinematic_holds warns of) with an *EQUATION term on its rotations, a BC on them
+        in some steps only that reaches the twist, or under NLGEOM where a coupling has no
+        *RIGID BODY form.  Returns the last node id."""
         per: "OrderedDict[int, List[Tuple[int, Optional[List[Vec]], str]]]" = OrderedDict()
         dist: set = set()
+        rot_nodes = set(self._shell_nodes) | set(self._beam_nodes)
         for i, b in enumerate(blocks):
             if b.keyword == "COUPLING" and i + 1 < len(blocks) and blocks[i + 1].keyword == "DISTRIBUTING":
                 dist.add(self._ref_node(b))
@@ -22599,19 +22757,17 @@ class Converter:
             ref, groups = cg
             frame = self._coupling_frame(b)
             members = [n for ns, _ in groups for n in ns]
-            why = "it is a *KINEMATIC COUPLING card" if b.keyword != "COUPLING" else \
-                "its members include shell, beam, membrane or 2-D nodes" \
+            # why the coupling has no *RIGID BODY form ('' where it has; a *KINEMATIC COUPLING
+            # card in ``_kin_rb`` is written as one by _kin_dynamic_cards)
+            why = "its members include shell, beam, membrane or 2-D nodes" \
                 if any(n in structural or n in self._plane_only for n in members) else \
                 "it does not couple all translations" if not members or \
-                not all({1, 2, 3} <= ds for _, ds in groups) else \
-                "its ORIENTATION's axes are not known" if isinstance(frame, str) else ""
-            got = None if why or isinstance(frame, str) else \
-                self._kin_rotation_rows(ref, groups, frame, set())[0]      # (a known frame)
+                not all({1, 2, 3} <= ds for _, ds in groups) else ""
+            got = None if isinstance(frame, str) else \
+                self._kin_rotation_rows(ref, groups, frame, rot_nodes)[0]
             per.setdefault(ref, []).append((id(b), got, why))
         if not per:
             return next_id
-        bcs = {n for b in blocks if b.keyword == "BOUNDARY" for ns, ds, _ in self._bc_records(b, True)
-               if any(4 <= d <= 6 for d in ds) for n in ns}
         terms = {n for b in blocks if b.keyword == "EQUATION"
                  for ns, d in self._equation_dofs(b) if 4 <= d <= 6 for n in ns}
         busy = {n for e, (typ, conn) in self.geom.elements.items()
@@ -22620,29 +22776,98 @@ class Converter:
         for sec in self._conn_plan.values():
             busy.update(n for it in sec["items"] for n in (it["a"], it["b"]))
         for ref, cs in per.items():
-            if any(got is None for _, got, _ in cs):
-                self._kin_twist_refused[ref] = next(why for _, _, why in cs if why)
+            ids = [c for c, _, _ in cs]
+            own = all(c in self._kin_rb for c in ids)      # (a *TRANSFORM on the node)
+            if ref in structural or ref in busy or (ref in self._rb_rot and not own):
                 continue
-            basis = self._off_axis_rotations([r for _, got, _ in cs for r in got])
-            why = "" if not basis else \
-                "the node is a shell or beam node" if ref in structural else \
-                "something else uses the node's rotation" if ref in busy or ref in self._rb_rot or \
-                any(c in self._kin_rb for c, _, _ in cs) else \
-                "it has a *TRANSFORM" if ref in self._transformed else \
-                "a *BOUNDARY or *EQUATION term is on its rotations" if ref in bcs or ref in terms else \
-                "the deck writes its couplings as equations (a *DYNAMIC step or linear rigid " \
-                "equations)" if self._dynamic_deck or self._linear_rigid or ref in self._kin_eq_refs else ""
-            if why:
-                self._kin_twist_refused[ref] = why
-            if not basis or why:
+            if any(got is None for _, got, _ in cs):     # (axes not known: left as it is)
                 continue
-            next_id += 1
-            self.geom.add_node(next_id, self.geom.nodes[ref])
-            self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
-            for c, _, _ in cs:
-                self._kin_rb[c] = next_id
-            self._kin_twist[ref] = (next_id, basis)
+            rows = [r for _, got, _ in cs for r in got]
+            basis = self._off_axis_rotations(rows)
+            if not basis:
+                continue
+            # the deck's BCs on its rotations in every step hold the rotations about their axes,
+            # and the twist with them where they reach it; one in some steps only that reaches
+            # it would be overconstrained by a hold in those steps
+            always, some = self._twist_bc_axes(ref, blocks)
+            if always and not null_space(rows + always):
+                self._kin_twist_bc[ref] = always
+                continue
+            if any(abs(vdot(q, a)) > 1e-9 for q in null_space(rows + always) for a in some):
+                self._kin_twist_refused[ref] = (basis, "the deck's *BOUNDARY on its rotations holds "
+                                                       "it in some steps only, where a hold would "
+                                                       "overconstrain it")
+                continue
+            self._kin_twist_bc[ref] = always
+            if ref in terms:
+                self._kin_twist_refused[ref] = (basis, "an *EQUATION term is on its rotations")
+            elif self._dynamic_deck or self._linear_rigid or ref in self._kin_eq_refs:
+                self._kin_twist_wait[ref] = basis        # (the forms of those decks)
+            elif own:
+                self._kin_twist[ref] = (self._kin_rb[ids[0]], rows)
+            elif not any(why for _, _, why in cs):
+                next_id += 1
+                self.geom.add_node(next_id, self.geom.nodes[ref])
+                self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
+                for c in ids:
+                    self._kin_rb[c] = next_id
+                self._kin_twist[ref] = (next_id, rows)
+            elif not self._nl_any:
+                self._kin_twist_eq.add(ref)
+                self._kin_twist_wait[ref] = basis
+            else:
+                self._kin_twist_refused[ref] = (basis, "under NLGEOM it has no exact form with a "
+                                                "rotation node: " + next(why for _, _, why in cs if why) +
+                                                " (a *RIGID BODY couples all translations of solid "
+                                                "nodes; linear equations hold for small rotations only)")
         return next_id
+
+    def _twist_bc_axes(self, ref: int, blocks: List[Block]) -> Tuple[List[Vec], List[Vec]]:
+        """The axes (global components; the node's *TRANSFORM axes where it has one, in which
+        Abaqus reads them) of the rotations of ``ref`` the deck's *BOUNDARY holds in every step,
+        and of those it holds in some steps only."""
+        ax = self._local_axes(ref) if ref in self._transformed else None
+        axes = ax if isinstance(ax, tuple) else ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        keys = {(ref, d) for d in (4, 5, 6)}
+        always: Optional[set] = None
+        some: set = set()
+        for active in bc_steps(blocks, lambda b: [((n, d), 0) for ns, ds, _ in self._bc_records(b)
+                                                  for n in ns for d in ds if (n, d) in keys],
+                               self._pert_idx, self.steps.lc2):
+            always = set(active) if always is None else always & set(active)
+            some |= set(active)
+        always = always or set()
+        return [axes[d - 4] for _, d in sorted(always)], [axes[d - 4] for _, d in sorted(some - always)]
+
+    def _plan_twists_written(self, blocks: List[Block]) -> None:
+        """The twists of _plan_kinematic_twists in a deck with a *DYNAMIC step or linear rigid
+        equations, or carried by linear equations (``_kin_twist_eq``): held on the ROT NODE where
+        _plan_kinematic_rot_nodes writes every coupling on the node without ccx's *KINEMATIC
+        (``_kin_rb``: ``_kin_dyn``, or the *RIGID BODY of a *TRANSFORM on the node), over the
+        lines it writes (_coupling_groups live: _kin_form 'rb', 'eq', 'ties'), else refused."""
+        if not self._kin_twist_wait:
+            return
+        rot_nodes = set(self._shell_nodes) | set(self._beam_nodes)
+        rows: Dict[int, List[Vec]] = {}
+        kept: Dict[int, int] = {}                     # ref -> a coupling ccx's *KINEMATIC keeps
+        for i, b in enumerate(blocks):
+            cg = self._coupling_groups(blocks, i, live=True)
+            if cg is None or cg[0] not in self._kin_twist_wait:
+                continue
+            if id(b) not in self._kin_rb:      # (_kin_dyn, or a *TRANSFORM's *RIGID BODY)
+                kept[cg[0]] = id(b)
+                continue
+            got = self._kin_rotation_rows(cg[0], cg[1], self._coupling_frame(b), rot_nodes)[0]
+            rows.setdefault(cg[0], []).extend(got)
+        for ref, basis in self._kin_twist_wait.items():
+            rot = self._rb_rot.get(ref)
+            if ref in kept or rot is None:
+                self._kin_twist_refused[ref] = (basis, "ccx's own *KINEMATIC is kept for it "
+                                                "(shell, beam or 2-D members under NLGEOM in a deck "
+                                                "with a *DYNAMIC step, or lines that have no linear "
+                                                "equations)")
+            elif self._off_axis_rotations(rows.get(ref, [])):
+                self._kin_twist[ref] = (rot, rows[ref])
 
     def _rigid_model_cards(self) -> List[str]:
         """The skins' material and section, and the rotary-inertia stars' *MASS cards —
@@ -24176,6 +24401,8 @@ class Converter:
         plies_of: Dict[int, List[int]] = {}
         stack_of: Dict[int, Tuple[Tuple[int, ...], List[int], List[int]]] = {}
         orig = {e: list(els[e][1]) for p in plans for e in p["elems"]}
+        made20: Dict[tuple, int] = {}                    # (_quadratic_plies)
+        ties20: "OrderedDict[int, Tuple[List[Tuple[int, float]], Tuple[int, int, float]]]" = OrderedDict()
         for p in plans:
             t = [ply["t"] for ply in p["plies"]]
             fr = [0.0]
@@ -24184,6 +24411,20 @@ class Converter:
             fr.append(1.0)
             for e in p["elems"]:
                 typ, conn = els[e]
+                if len(conn) == 20:                 # (a composite solid of 20-node bricks)
+                    axis = self._stack_axis(p["block"], conn) if p["stack"] == "ORIENTATION" else None
+                    order = self._stack_order(conn, p["stack"], axis)
+                    self._ply_next_node = next_n
+                    bricks = self._quadratic_plies(conn, order, fr, made20, ties20)
+                    next_n = self._ply_next_node
+                    ids = [e] + list(range(next_e + 1, next_e + len(bricks)))
+                    next_e += len(bricks) - 1
+                    for eid, nc in zip(ids, bricks):
+                        els[eid] = (typ.upper(), nc)
+                    plies_of[e] = ids
+                    stack_of[e] = (order, [conn[q - 1] for q in order[:4]], [conn[q - 1] for q in order[4:]])
+                    self._elem_types.add(typ.upper())
+                    continue
                 hexa = len(conn) == 8
                 axis = self._stack_axis(p["block"], conn) if hexa and p["stack"] == "ORIENTATION" else None
                 order = self._stack_order(conn, p["stack"], axis) if hexa else (1, 2, 3, 4, 5, 6)
@@ -24233,7 +24474,7 @@ class Converter:
                 continue
             pts = orig.get(e, conn)
             for a, c in element_edges("SC8R" if e in orig and len(pts) == 8 else
-                                      "SC6R" if e in orig else typ, pts):
+                                      "SC6R" if e in orig and len(pts) == 6 else typ, pts):
                 edge = (min(a, c), max(a, c))
                 if edge in users and edge not in own.get(e, ()):
                     plain.add(edge)
@@ -24259,6 +24500,12 @@ class Converter:
                 self._ply_eq += ["3", f"{nid}, {d}, 1., {na}, {d}, {short_real(w - 1.0, 12)}, "
                                       f"{nb}, {d}, {short_real(-w, 12)}"]
         self._tied_nodes += [(exact[nid][0], exact[nid][1], nid, exact[nid][2]) for nid in hanging]
+        for nid, (terms, ends) in ties20.items():
+            for d in dofs:
+                self._ply_eq += equation_rows([(nid, d, "1.")] + [(n, d, short_real(-c, 12))
+                                                                  for n, c in terms])
+            self._tied_nodes.append((ends[0], ends[1], nid, ends[2]))
+            one_field.add(nid)
         face_sets = self._remap_ply_faces(blocks, plies_of, stack_of)
         # every element set of a split element takes all its plies
         for name, ids in list(self.geom.elsets.items()):
@@ -24321,7 +24568,7 @@ class Converter:
         """Faces of split continuum shells -> the faces of their ply solids that carry them
         (stack_face_map: the bottom face on the first ply, the top face on the last, a side
         face on every ply).  *SURFACE lines and element-based face loads (*DLOAD P1-P6,
-        TRVEC1-6, TRSHR1-6, *DFLUX S1-S6, *FILM F1-F6, *RADIATE R1-R6) that name them get an
+        TRVEC1-6, TRSHR1-6, HP1-6, *DFLUX S1-S6, *FILM F1-F6, *RADIATE R1-R6) that name them get an
         element set per new face; a load line that names a split element by number for a body
         load takes all its plies.  Returns the names of the element sets it adds."""
         isint = re.compile(r"[-+]?\d+").fullmatch
@@ -24357,7 +24604,7 @@ class Converter:
                 out.append((name, g))
             return out
 
-        labels = {"DLOAD": ("P", "TRVEC", "TRSHR"), "DFLUX": ("S",), "FILM": ("F",), "RADIATE": ("R",)}
+        labels = {"DLOAD": ("P", "TRVEC", "TRSHR", "HP"), "DFLUX": ("S",), "FILM": ("F",), "RADIATE": ("R",)}
         moved = 0
         for b in blocks:
             if b.keyword == "SURFACE" and (b.param("TYPE") or "ELEMENT").strip().upper() == "ELEMENT":
@@ -24442,7 +24689,7 @@ class Converter:
         """(default, element -> angle) of a *DISTRIBUTION of layer angles (a composite layer's
         orientation field naming a distribution; Abaqus 2017 Keywords *SHELL SECTION)."""
         default, vals = None, {}
-        for rec in merged_data_records(self._dists[name]) if name in self._dists else []:
+        for rec in merged_data_records(self._dist_cards[name]) if name and name in self._dist_cards else []:
             if len(rec) < 2 or not rec[1]:
                 continue
             try:
@@ -24491,9 +24738,75 @@ class Converter:
                          "*DISTRIBUTION with a line per ply solid where the shell curves).", once=True)
         return out
 
-    # the bricks a composite solid section is split on (_solid_ply_plan): each ply brick runs
-    # the element's own formulation
-    _PLY_BRICKS = ("C3D8", "C3D8R")
+    # the bricks a composite solid section is split on (_solid_ply_plan), by node count: each
+    # ply brick runs the element's own formulation
+    _PLY_BRICKS = {"C3D8": 8, "C3D8R": 8, "C3D8I": 8, "C3D20": 20, "C3D20R": 20}
+    # the midside node of each edge of a 20-node brick, by its corners (1-based positions)
+    _HEX20_MID = {(1, 2): 9, (2, 3): 10, (3, 4): 11, (1, 4): 12, (5, 6): 13, (6, 7): 14, (7, 8): 15,
+                  (5, 8): 16, (1, 5): 17, (2, 6): 18, (3, 7): 19, (4, 8): 20}
+
+    def _quadratic_plies(self, conn: Sequence[int], order: Sequence[int], fr: Sequence[float],
+                         made: Dict[tuple, int],
+                         ties: "OrderedDict[int, Tuple[List[Tuple[int, float]], Tuple[int, int, float]]]"
+                         ) -> List[List[int]]:
+        """The 20-node ply bricks of the 20-node brick ``conn`` restacked by ``order``
+        (HEX_STACK_ORDER) between the stack fractions ``fr`` (0, ..., 1): their nodes at the
+        brick's own parametric points — on its stack edges (corners and midsides) and midway
+        along its side faces (midsides of the layer faces) — the brick's own nodes where they
+        fall on one, else new nodes (``made``: by edge or face and fraction, which neighbours
+        share) tied to the brick's quadratic field there (``ties``: node -> (its terms, two
+        nodes and a fraction between them for the temperatures, _tied_nodes)).  The field of a
+        20-node brick restricted to a layer is a 20-node field again (its monomials keep their
+        degrees under a change of the stack coordinate), so the bricks move exactly as the one
+        element, on its own geometry."""
+        nodes = self.geom.nodes
+        mid = {frozenset((conn[a - 1], conn[c - 1])): conn[k - 1] for (a, c), k in self._HEX20_MID.items()}
+        pc = [conn[q - 1] for q in order]
+        bot, top = pc[:4], pc[4:]
+
+        def tied(key: tuple, terms: List[Tuple[int, float]], ends: Tuple[int, int, float]) -> int:
+            nid = made.get(key)
+            if nid is None:
+                self._ply_next_node += 1
+                nid = made[key] = self._ply_next_node
+                xyz = (0.0, 0.0, 0.0)
+                for n, c in terms:
+                    xyz = vadd(xyz, vscale(nodes[n], c))
+                self.geom.add_node(nid, xyz)
+                ties[nid] = ([(n, c) for n, c in terms if abs(c) > 1e-14], ends)
+            return nid
+
+        def edge_pt(i: int, f: float) -> int:            # on stack edge i, at f from the bottom
+            a, c = bot[i], top[i]
+            m = mid[frozenset((a, c))]
+            if f in (0.0, 1.0) or abs(f - 0.5) < 1e-12:
+                return a if f == 0.0 else c if f == 1.0 else m
+            z = 2.0 * f - 1.0
+            lo, hi, g = (a, c, f) if a < c else (c, a, 1.0 - f)
+            return tied(("e", lo, hi, round(g, 10)),
+                        [(a, 0.5 * z * (z - 1.0)), (c, 0.5 * z * (z + 1.0)), (m, 1.0 - z * z)], (a, c, f))
+
+        def face_pt(i: int, f: float) -> int:            # midway along side face i, at f
+            j = (i + 1) % 4
+            a, b, a2, b2 = bot[i], bot[j], top[i], top[j]
+            mb, mt = mid[frozenset((a, b))], mid[frozenset((a2, b2))]
+            if f in (0.0, 1.0):
+                return mb if f == 0.0 else mt
+            t = 2.0 * f - 1.0
+            low, high, g = (tuple(sorted((a, b))), tuple(sorted((a2, b2))), f) \
+                if min(a, b) < min(a2, b2) else (tuple(sorted((a2, b2))), tuple(sorted((a, b))), 1.0 - f)
+            # the 8-node face's shape functions at its middle line (s = 0) and height t
+            return tied(("f", low, high, round(g, 10)),
+                        [(n, -0.25 * (1.0 - t * t)) for n in (a, b, a2, b2)] +
+                        [(mb, 0.5 * (1.0 - t)), (mt, 0.5 * (1.0 + t)),
+                         (mid[frozenset((a, a2))], 0.5 * (1.0 - t * t)),
+                         (mid[frozenset((b, b2))], 0.5 * (1.0 - t * t))], (mb, mt, f))
+        out = []
+        for f0, f1 in zip(fr[:-1], fr[1:]):
+            out.append([edge_pt(i, f0) for i in range(4)] + [edge_pt(i, f1) for i in range(4)] +
+                       [face_pt(i, f0) for i in range(4)] + [face_pt(i, f1) for i in range(4)] +
+                       [edge_pt(i, 0.5 * (f0 + f1)) for i in range(4)])
+        return out
 
     def _solid_ply_plan(self, blocks: List[Block], b: Block, taken: set) -> Union[None, str, dict]:
         """The _plan_ply_split plan of *SOLID SECTION, COMPOSITE ``b`` (Abaqus/Standard: on
@@ -24514,16 +24827,33 @@ class Converter:
             return "its layup could not be read (a layer without a positive thickness or a material)"
         els = self.geom.elements
         elems = [e for e in dedup(self.geom.elset(elset)) if e in els]
-        other = sorted({els[e][0].upper() for e in elems} - set(self._PLY_BRICKS))
+        types = {els[e][0].upper() for e in elems}
+        other = sorted(types - set(self._PLY_BRICKS))
         if not elems or other:
-            return (f"only C3D8 and C3D8R bricks are split into plies here, and its elements "
-                    f"include {', '.join(other[:3])}" if other else "its element set is empty")
-        if any(e in taken or len(els[e][1]) != 8 or any(n not in self.geom.nodes for n in els[e][1])
-               for e in elems):
+            return (f"only C3D8, C3D8R, C3D8I, C3D20 and C3D20R bricks are split into plies here, "
+                    f"and its elements include {', '.join(other[:3])}" if other else
+                    "its element set is empty")
+        if len({self._PLY_BRICKS[t] for t in types}) > 1:
+            return "it mixes 8-node and 20-node bricks"
+        if any(e in taken or len(els[e][1]) != self._PLY_BRICKS[els[e][0].upper()] or
+               any(n not in self.geom.nodes for n in els[e][1]) for e in elems):
             return "some of its elements have undefined nodes, or another composite section took them"
+        ori = b.uparam("ORIENTATION")
+        ob = next((x for x in blocks if x.keyword == "ORIENTATION" and x.uparam("NAME") == ori), None)
+        dist = self._orientation_distribution(ob) if ob is not None and ori else None
+        if dist:
+            if dist not in self._dist_cards or not \
+                    (ob.param("SYSTEM") or "RECTANGULAR").strip().upper().startswith("RECT"):
+                return (f"its orientation {ori} names a *DISTRIBUTION {dist} that is not defined, or "
+                        f"is not a rectangular system")
+            default, vec = self._distribution_lines(self._dist_cards[dist], dist, True, None)
+            to_vec = lambda tok: (tuple(pf(x) for x in tok[:3]), tuple(pf(x) for x in tok[3:6]))
+            self._solid_sec_axes[id(b)] = (to_vec(default) if default else None,
+                                           {e: to_vec(t) for e, t in vec.items()})
         for ply in plies:
-            why = self._solid_ply_axes(b, ply["mat"], ply["ori"])
+            why = self._solid_ply_axes(b, ply["mat"], ply["ori"], elems)
             if isinstance(why, str) and why.startswith("!"):
+                self._solid_sec_axes.pop(id(b), None)
                 return why[1:]
         npts = []
         for rec in merged_data_records(b):
@@ -24537,33 +24867,56 @@ class Converter:
         return dict(block=b, elset=elset, plies=plies, elems=elems, stack=self._stack_direction(b),
                     solid=True, npts=npts)
 
-    def _solid_ply_axes(self, b: Block, mat: str, field: str) -> Union[None, str, Tuple[Vec, Vec]]:
+    def _solid_ply_axes(self, b: Block, mat: str, field: str, elems: Sequence[int] = ()
+                        ) -> Union[None, str, Tuple[Vec, Vec], Dict[int, Tuple[Vec, Vec]]]:
         """The axes a layer (material ``mat``, orientation field ``field``) of the composite solid
         section ``b`` reads in ccx: an *ORIENTATION name, (direction 1, direction 2) of the
-        section's rectangular orientation turned by the layer angle, or None (no axes: none
-        given, or a material without direction dependence); "!" + why where they are not known
-        (_solid_ply_plan)."""
+        section's rectangular orientation turned by the layer angle about the axis of its
+        additional rotation (Abaqus 2017 "Orientations"), {element: those directions} over
+        ``elems`` where a *DISTRIBUTION gives the section's axes per element
+        (``_solid_sec_axes``, _solid_ply_plan) or the layer's angle per element (Abaqus 2017
+        "Solid (continuum) elements": "spatially varying orientation angles ... using
+        distributions"), or None (no axes: none given, or a material without direction
+        dependence); "!" + why where they are not known (_solid_ply_plan).  A layer angle on a
+        section without ORIENTATION: Abaqus documents no axes for it."""
         field = (field or "").strip().upper()
         ori = b.uparam("ORIENTATION")
         angle = _ply_angle(field) if field else 0.0
+        angles = None                         # (default, element -> angle) of a distribution
         if field and angle is None:
             if field in self.orientations:
                 return field
-            return f"!its layer orientation {field} is not an *ORIENTATION (a distribution of angles, say)"
+            if field not in self._dist_cards:
+                return f"!its layer orientation {field} is neither an *ORIENTATION nor a *DISTRIBUTION"
+            angles = self._angle_distribution(field)
         if self._mat_symmetry.get((mat or "").strip().upper(), "aniso") is None:
             return None
-        if not angle:
+        sec = self._solid_sec_axes.get(id(b))
+        if not angle and angles is None and sec is None:
             return ori or None
         if not ori:
             return f"!a layer angle ({field}) needs the section's ORIENTATION, which it has not"
-        if ori not in self._orient_axes or not self.orientations[ori][2].upper().startswith("RECT"):
+        if sec is None and (ori not in self._orient_axes or
+                            not self.orientations[ori][2].upper().startswith("RECT")):
             return (f"!its layer angles turn orientation {ori}, which is not a rectangular system "
                     f"with fixed axes")
-        a, bb, system = self.orientations[ori]
         rot = self._orient_rotation.get(ori)
         k = rot[0] if rot and rot[0] in (1, 2, 3) else 1        # (Abaqus: axis 1 by default)
-        frame, _ = orientation_frame(a, bb, system, (0.0, 0.0, 0.0), (k, (rot[1] if rot else 0.0) + angle))
-        return frame[0], frame[1]
+        base = rot[1] if rot else 0.0
+        if sec is None and angles is None:
+            a, bb, system = self.orientations[ori]
+            frame, _ = orientation_frame(a, bb, system, (0.0, 0.0, 0.0), (k, base + angle))
+            return frame[0], frame[1]
+        out: Dict[int, Tuple[Vec, Vec]] = {}
+        for e in elems:
+            ax = (sec[1].get(e) or sec[0]) if sec else self.orientations[ori][:2]
+            ang = angles[1].get(e, angles[0]) if angles else angle
+            if ax is None or ang is None:
+                return (f"!element {e} has no " + ("axes in the *DISTRIBUTION of orientation " + ori
+                                                   if ax is None else f"angle in *DISTRIBUTION {field}"))
+            frame, _ = orientation_frame(ax[0], ax[1], "RECTANGULAR", (0.0, 0.0, 0.0), (k, base + ang))
+            out[e] = (frame[0], frame[1])
+        return out
 
     def _solid_ply_cards(self, b: Block) -> List[str]:
         """The ccx cards of a composite solid section split into plies (_plan_ply_split): per
@@ -24576,9 +24929,21 @@ class Converter:
                 self.report.note(f"*SOLID SECTION parameter {k} dropped (unused by ccx).", once=True)
         out: List[str] = []
         for grp in plan["groups"]:
-            axes = self._solid_ply_axes(b, grp["mat"], grp["ori"])
+            axes = self._solid_ply_axes(b, grp["mat"], grp["ori"], plan["elems"])
             line = f"*SOLID SECTION, ELSET={grp['set']}, MATERIAL={grp['mat']}"
-            if isinstance(axes, tuple):
+            if isinstance(axes, dict):                # per element: a *DISTRIBUTION, a line per brick
+                toks = OrderedDict((plan["plies_of"][e][k], tuple(_fmt_component(x) for x in (*axes[e][0], *axes[e][1])))
+                                   for k in grp["plies"] for e in plan["elems"])
+                name = self._fresh_name(f"{grp['set']}_ORI")
+                if len(set(toks.values())) == 1:
+                    out += [f"*ORIENTATION, NAME={name}", ", ".join(next(iter(toks.values())))]
+                else:
+                    dname = self._fresh_name(f"{grp['set']}_AXES")
+                    out += [f"*DISTRIBUTION, NAME={dname}"] + \
+                        [f"{eid}, " + ", ".join(tok) for eid, tok in toks.items()] + \
+                        [f"*ORIENTATION, NAME={name}", dname]
+                axes = name
+            elif isinstance(axes, tuple):
                 name = self._fresh_name(f"{grp['set']}_ORI")
                 out += [f"*ORIENTATION, NAME={name}",
                         ", ".join(_fmt_component(x) for x in (*axes[0], *axes[1]))]
@@ -24589,34 +24954,52 @@ class Converter:
 
     def _note_solid_plies(self, p: dict, tied: int) -> None:
         """Report the split of composite solid section plan ``p`` (_plan_ply_split; ``tied``:
-        the interface nodes held on their stack edge).  Abaqus integrates each layer with its
+        the interface nodes held to the element's field).  Abaqus integrates each layer with its
         section points by Simpson's rule through it, Gauss in the plane (2017 "Solid
         (continuum) elements"); a ply C3D8 at 2 x 2 x 2 Gauss points, a ply C3D8R at its centre:
         the same where the strain varies at most linearly through a layer of an undistorted
         element (C3D8, 3 or more section points; C3D8R, 1 point), else the bending through the
-        stack differs (by about 1 / N^2 with N one-point layers)."""
+        stack differs (by about 1 / N^2 with N one-point layers).  A ply C3D8I has incompatible
+        modes of its own, where Abaqus' C3D8I has one set for the stack; a 20-node element's
+        strain varies quadratically through a layer in general, which Simpson's rule (exact to
+        cubics) and a ply C3D20 / C3D20R's 3 / 2 Gauss points integrate differently."""
         types = {self.geom.elements[e][0].upper() for e in p["elems"]}
         same = (all(n >= 3 for n in p["npts"]) if types == {"C3D8"} else
                 all(n == 1 for n in p["npts"]) if types == {"C3D8R"} else False)
         where = f"*SOLID SECTION, COMPOSITE, ELSET={p['elset']}"
+        quad = any(self._PLY_BRICKS.get(t) == 20 for t in types)
         text = (f"{where}: {len(p['elems'])} element(s) written as one brick per layer "
                 f"({len(p['elems']) * len(p['plies'])} bricks, each the element's own type) with "
                 f"its share of the element's length along the stack direction, its material and "
                 f"its axes; ccx has no layered solid section. *EQUATIONs keep the layer interface "
-                f"nodes ({tied} in the model) on the element's straight stack edges, so the stack "
-                f"moves as Abaqus' one element does; element sets take all layers, faces and face "
-                f"loads go to the layers that carry them.")
+                f"nodes ({tied} in the model) "
+                + ("at the element's own 20-node field (a 20-node field on each layer again)"
+                   if quad else "on the element's straight stack edges")
+                + ", so the stack moves as Abaqus' one element does; element sets take all layers, "
+                  "faces and face loads go to the layers that carry them.")
         if same:
             self.report.note(text + " Abaqus' layer integration and the bricks' agree (exact on "
                                     "undistorted elements).", once=True)
             return
-        self.report.warn(text + " Abaqus integrates a layer with its section points (Simpson's "
-                                "rule through it; here " + ", ".join(sorted({str(n) for n in p["npts"]}))
-                         + "), a ply C3D8 at 2 Gauss points through it and a ply C3D8R at its "
-                           "centre: the same under strain uniform through the layers, otherwise "
-                           "the bending through the stack differs (by about 1 / N^2 with N "
-                           "one-point layers).", once=True)
-        self._reduces("*SOLID SECTION, COMPOSITE: the layer integration of its ply bricks")
+        pts = ", ".join(sorted({str(n) for n in p["npts"]}))
+        if "C3D8I" in types:
+            why = (" Each ply C3D8I has incompatible modes of its own, where Abaqus' one C3D8I has "
+                   "one set for the stack: the response differs where those modes act (bending "
+                   "through the stack, say).")
+        elif quad:
+            why = (f" Abaqus integrates a layer with Simpson's rule through its section points "
+                   f"(here {pts}; exact to cubics), a ply C3D20 at 3 Gauss points through it and a "
+                   f"ply C3D20R at 2: the same where the strain varies at most linearly through each "
+                   f"layer with 3 or more section points; a 20-node element's strain varies "
+                   f"quadratically through a layer in general.")
+        else:
+            why = (f" Abaqus integrates a layer with its section points (Simpson's rule through it; "
+                   f"here {pts}), a ply C3D8 at 2 Gauss points through it and a ply C3D8R at its "
+                   f"centre: the same under strain uniform through the layers, otherwise the "
+                   f"bending through the stack differs (by about 1 / N^2 with N one-point layers).")
+        self.report.warn(text + why, once=True)
+        self._reduces("*SOLID SECTION, COMPOSITE: the layer integration of its ply bricks" if "C3D8I" not in types
+                      else "*SOLID SECTION, COMPOSITE: the incompatible modes of its ply C3D8I bricks")
 
     def _ply_group_axes(self, b: Block, grp: dict) -> "OrderedDict[int, Tuple[Vec, Vec, Vec]]":
         """Abaqus' material directions 1, 2, 3 of each ply solid of ``grp``, a group of plies
@@ -26864,6 +27247,15 @@ class Converter:
         convertible: set = set()             # couplings of all translations, 3-D members
         # ref -> (id, its members are plain, it constrains anything: a ROT NODE is needed)
         dyn: "OrderedDict[int, List[Tuple[int, bool, bool]]]" = OrderedDict()
+
+        def add_dyn(b: Block, ref: int, groups: List[Tuple[List[int], set]], members: List[int]) -> None:
+            frame = self._coupling_frame(b)
+            plain = bool(members) and (
+                (dynamic and not any(n in structural or n in self._plane_only for n in members)) or
+                ((self._linear_rigid or ref in self._kin_eq_refs or ref in self._kin_twist_eq) and
+                 all(self._kin_line_form(ref, ns, ds, frame) in ("eq", "ties") for ns, ds in groups)))
+            dyn.setdefault(ref, []).append((id(b), plain, plain and any(
+                self._kin_line_form(ref, ns, ds, frame) in ("rb", "eq", "ties") for ns, ds in groups)))
         for i, b in enumerate(blocks):
             cg = self._coupling_groups(blocks, i)
             # (an undefined reference node: left to ccx, which stops on it as Abaqus does)
@@ -26874,15 +27266,7 @@ class Converter:
                 continue
             members = [n for ns, _ in groups for n in ns]
             if dynamic or self._linear_rigid or ref in self._kin_eq_refs:
-                frame = self._coupling_frame(b)
-                plain = bool(members) and (
-                    (dynamic and not any(n in structural or n in self._plane_only
-                                         for n in members)) or
-                    ((self._linear_rigid or ref in self._kin_eq_refs) and
-                     all(self._kin_line_form(ref, ns, ds, frame) in ("eq", "ties") for ns, ds in groups)))
-                dyn.setdefault(ref, []).append((id(b), plain, plain and any(
-                    self._kin_line_form(ref, ns, ds, frame) in ("rb", "eq", "ties")
-                    for ns, ds in groups)))
+                add_dyn(b, ref, groups, members)
             if b.keyword == "KINEMATIC COUPLING" or ref not in self._transformed or \
                     ref in self._rb_rot or isinstance(self._local_axes(ref), str):
                 continue
@@ -26905,6 +27289,10 @@ class Converter:
                     self._kin_rb[c] = next_id
         n_transformed = len(self._kin_rb)
         next_id = self._plan_kinematic_twists(blocks, next_id, structural)
+        for i, b in enumerate(blocks) if self._kin_twist_eq else ():
+            cg = self._coupling_groups(blocks, i)      # (a twist held through linear equations)
+            if cg is not None and cg[0] in self._kin_twist_eq and cg[1]:
+                add_dyn(b, cg[0], cg[1], [n for ns, _ in cg[1] for n in ns])
         for ref, cs in dyn.items():
             if not all(plain for _, plain, _ in cs) or all(c in self._kin_rb for c, _, _ in cs):
                 continue
@@ -26916,6 +27304,7 @@ class Converter:
             for c, _, _ in cs:
                 self._kin_rb[c] = rot           # (None: every one left out, no ROT NODE)
                 self._kin_dyn.add(c)
+        self._plan_twists_written(blocks)
         if n_transformed:
             self.report.note(f"{n_transformed} kinematic coupling(s) with a *TRANSFORM on the "
                              f"reference node written as *RIGID BODY with a ROT NODE in the node's "
@@ -28875,7 +29264,7 @@ class Converter:
         local = self._rigid_eq_refused(ref, members, dofs) is not None
         if isinstance(frame, str) and not self._kin_all_translations(members, dofs):
             return "drop"
-        if (self._linear_rigid or ref in self._kin_eq_refs) and not local:
+        if (self._linear_rigid or ref in self._kin_eq_refs or ref in self._kin_twist_eq) and not local:
             return "eq"
         if trans == {1, 2, 3}:
             return "rb"
@@ -28888,8 +29277,8 @@ class Converter:
         nodes, whose knots' rotations are tied to the ROT NODE (_rotation_ties: theta(node) =
         theta(ref), as Abaqus couples them), so the coupling's other lines can be equations."""
         form = self._kin_form(ref, members, dofs, frame)
-        if form == "none" and self._linear_rigid and self._mechanical and members and \
-                all(n in self._rot_nodes for n in members):
+        if form == "none" and (self._linear_rigid or ref in self._kin_twist_eq) and self._mechanical \
+                and members and all(n in self._rot_nodes for n in members):
             return "ties"
         return form
 
@@ -29137,7 +29526,8 @@ class Converter:
     def _rot_node_why(self, refs: Sequence[int] = ()) -> str:
         """Why the rotational BCs and moments of reference nodes ``refs`` go to their ROT NODEs."""
         return "the body's rotation is carried there" if self._linear_rigid or \
-            any(n in self._kin_eq_refs for n in refs) else "ccx ignores DOFs 4-6 of the REF NODE"
+            any(n in self._kin_eq_refs or n in self._kin_twist_eq for n in refs) else \
+            "ccx ignores DOFs 4-6 of the REF NODE"
 
     def _warn_finite_rigid(self, why: Optional[str] = None) -> None:
         """A rigid constraint left to ccx's RIGID MPCs in a geometrically linear step ccx runs
@@ -29261,6 +29651,15 @@ class Converter:
         if self._linear_rigid and (not self._dynamic_deck or
                                    any(n in self._expanded for ns, _ in groups for n in ns)):
             self._note_linear_rigid()        # (ccx's coupling would solve: its MPCs chain)
+        elif out and ref in self._kin_twist_eq:
+            self.report.note("Kinematic coupling whose reference node's rotation about an axis off the "
+                             "global ones moves no coupled DOF (members on one line through the node, "
+                             "say), of some translations, of shell or beam nodes or on a *KINEMATIC "
+                             "COUPLING card, in a deck without NLGEOM -> the linear *EQUATIONs Abaqus "
+                             "solves there, u(node) = u(ref) + theta x d on each coupled translation, "
+                             "theta on DOFs 1-3 of a ROT NODE (where the reference node's rotational "
+                             "BCs, moments and equation terms go), which holds that rotation (exact).",
+                             once=True)
         elif out and ref in self._kin_eq_refs:
             self.report.note("Kinematic coupling of some translations along an ORIENTATION with a "
                              "*BOUNDARY on a member DOF ccx's own coupling would eliminate (it then "
@@ -29269,7 +29668,7 @@ class Converter:
                              "along each coupled axis e, theta on DOFs 1-3 of a ROT NODE (where the "
                              "reference node's rotational BCs, moments and equation terms go), with "
                              "another DOF eliminated (exact).", once=True)
-        elif out:
+        elif out and self._dynamic_deck:
             self.report.note("Kinematic coupling in a deck with a *DYNAMIC step: ccx 2.23 solves no "
                              "*DYNAMIC step of a model whose *COUPLING + *KINEMATIC chain no MPCs "
                              "(every free DOF stays at its initial value, with no message; probed), "

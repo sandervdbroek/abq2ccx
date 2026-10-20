@@ -1885,6 +1885,36 @@ def test_boundary_on_inactive_unknown_dof_dropped():
     assert "TOP, 7, 7" not in body and "*BOUNDARY on DOF 7 (warping)" in conv.reduced_physics
 
 
+def test_cload_and_equation_on_dofs_ccx_lacks_left_out():
+    # ccx 2.23 reads a *CLOAD on DOFs 1-6 only (0 and 7-31 stop it: 'nonexistent degree of
+    # freedom') and stops on an *EQUATION term on 7, 9, 10 or 12-30; DOF 8 in an equation it
+    # reads as its own DOF (probed): such lines / equations are left out, as the BCs are
+    deck = HEX + ("*Nset, nset=TOP\n5,6,7,8\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+                  "{eq}*Step\n*Static\n*Cload{op}\n{cl}*End Step\n")
+    body, conv, rep = convert_str(deck.format(eq="", op="", cl="7, 3, 1.\n7, 9, 1.\n6, 8, 2.\n"))
+    assert "*CLOAD\n7, 3, 1.\n" in body and "** 7, 9, 1." in body and "** 6, 8, 2." in body
+    assert "\n7, 9, 1." not in body and other_reduced(conv) == []
+    assert any(lvl == "NOTE" and "*CLOAD on DOF 9 (electric potential) left out: no element" in m
+               for lvl, m in rep.entries)
+    # where an element has the DOF the load is lost: warned, reduced; a card left with no line
+    # goes (with OP=NEW it stays: it removes the earlier loads)
+    body, conv, rep = convert_str(deck.replace("TYPE=C3D8", "TYPE=C3D8E").format(eq="", op="", cl="7, 9, 1.\n"))
+    assert "*CLOAD" not in "\n".join(_live(body)) and "** 7, 9, 1." in body
+    assert "*CLOAD on DOF 9 (electric potential)" in conv.reduced_physics
+    body, _, _ = convert_str(deck.format(eq="", op=", op=NEW", cl="7, 9, 1.\n"))
+    assert "*CLOAD, OP=NEW\n** abq2ccx" in body
+    # an equation with a term on such a DOF goes whole; one on that DOF alone constrains nothing
+    two = "*Equation\n2\n6, 3, 1., 7, 9, -1.\n2\n5, 3, 1., 8, 3, -1.\n"
+    body, conv, rep = convert_str(deck.format(eq=two, op="", cl="7, 3, 1.\n"))
+    assert _equation_terms(body) == [[(5, 3, 1.), (8, 3, -1.)]] and "** 6, 3, 1., 7, 9, -1." in body
+    assert "*EQUATION on DOF 9 (electric potential)" in conv.reduced_physics
+    for dof in (9, 8, 7):
+        body, conv, rep = convert_str(deck.format(eq=f"*Equation\n2\n6, {dof}, 1., 7, {dof}, -1.\n",
+                                                  op="", cl="7, 3, 1.\n"))
+        assert not _equation_terms(body) and "*EQUATION" not in "\n".join(_live(body))
+        assert other_reduced(conv) == [] and f"*EQUATION with a term on DOF {dof}" in rep.text()
+
+
 def test_boundary_dofs_above_30_left_out():
     # Abaqus numbers DOFs 1-30: a range past 30 is cut there, a line wholly above it dropped,
     # warned (a range in the millions stalled the planners, which expand it node by node)
@@ -4097,7 +4127,9 @@ def test_amplitude_times_close_together_stay_apart():
 
 
 def test_kinematic_coupling_keeps_every_line():
-    body, _, _ = convert_str(HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6\n"
+    # (reference node above node 5: the rotation these lines leave free is about z; above the
+    # face's centre it is about (1, 1, 2), which the linear equations hold: test_kinematic_twist_forms)
+    body, _, _ = convert_str(HEX + "*Node\n100,0.,0.,2.\n*Nset,nset=TOP\n5,6\n"
                              "*Kinematic Coupling, ref node=100\nTOP, 1, 1\n7, 3, 3\n")
     assert body.count("*COUPLING") == 2 and "*KINEMATIC\n1, 1" in body and "*KINEMATIC\n3, 3" in body
     body, _, rep = convert_str(HEX + "*Node\n100,0.5,0.5,2.\n*Nset,nset=TOP\n5,6\n"
@@ -4534,8 +4566,10 @@ def test_rotated_instance_turns_part_dofs():
     assert "*ORIENTATION, NAME=I_ABQ2CCX_AXES, SYSTEM=RECTANGULAR\n0.866025403784439, 0.5, 0., " \
            "-0.5, 0.866025403784439, 0.\n" in body
     assert "*SPRING, ELSET=I_SPR, ORIENTATION=I_ABQ2CCX_AXES\n2\n" in body
-    assert "*COUPLING, CONSTRAINT NAME=I_C, REF NODE=100, SURFACE=I_ST, ORIENTATION=I_ABQ2CCX_AXES\n" \
-           "*KINEMATIC\n2, 2\n" in body
+    # (a coupling of DOF 2 alone along the turned axis e2 leaves the rotation about e2 free:
+    # the linear equations Abaqus solves, along e2, with e2 . theta = 0 on the ROT NODE)
+    assert "*EQUATION\n2\n101, 2, 1., 101, 1, -0.57735026919\n" in body and "*KINEMATIC" not in body
+    assert "3, 2, 1, 3, 1, -0.57735026919, 100, 1, 0.57735026919, 100, 2, -1\n" in body
     assert conv.reduced_physics == []
     # an unturned instance keeps the cards as they are, and blank rotation fields read as 0
     body, _, rep = convert_str(_instanced(part, "0., 0., 0., 0., 0., 1., 0.", tail=ROT_TAIL))
@@ -10598,6 +10632,11 @@ def test_kinematic_coupling_orientation():
             body, conv, rep = convert_str(KIN_RP + ori + card.format(o="OR1", d=dofs) + step)
             rot, (lo, hi) = conv._rb_rot[9], map(int, dofs.split(", "))
             eqs = _equation_terms(body)
+            # (a coupling along e1 alone leaves the rotation about e1 free: held, e1 . theta = 0)
+            hold = [row for row in eqs if all(n == rot for n, _, _ in row)]
+            eqs = [row for row in eqs if row not in hold]
+            assert [[(d, round(c, 9)) for _, d, c in row] for row in hold] == \
+                ([[(1, 1.), (3, 0.75)]] if dofs == "1, 1" else [])
             assert len(eqs) == 4 * (hi - lo + 1) and not conv.reduced_physics
             assert len({row[0][:2] for row in eqs}) == len(eqs) and all(row[0][2] == 1. for row in eqs)
             # a rigid motion with any slip along the free local axes satisfies them, a slip
@@ -17362,11 +17401,15 @@ def test_kinematic_twist_held_on_a_rot_node():
     eq = body.split("*EQUATION\n")[1].split("\n*")[0].splitlines()
     assert eq[0] == "2" and re.fullmatch(r"101, ([12]), 1\., 101, (?!\1)[12], 1\.", eq[1]), eq
     assert other_reduced(conv) == [] and "twist about it" in rep.text()
-    # the deck's own BC on a rotation of the node: not held, warned
+    # the deck's own BC on a rotation of the node normal to the twist: the hold is the same
+    # (on DOFs 1-2 of the ROT NODE, where the BC on DOF 3 goes); one that reaches the twist
+    # holds it alone: the coupling is left as it is
     body, conv, rep = convert_str(TWIST.replace("4, 1, 3\n", "4, 1, 3\n100, 6, 6\n"))
-    assert "*KINEMATIC" in body and "*RIGID BODY" not in body
-    assert any(lvl == "WARNING" and "its rotation about (0.707107, 0.707107, 0.)" in m and
-               "a *BOUNDARY or *EQUATION term is on its rotations" in m for lvl, m in rep.entries)
+    assert "*RIGID BODY" in body and "101,3,3" in _bc_lines(body)
+    assert re.search(r"\*EQUATION\n2\n101, [12], 1\., 101, [12], 1\.\n", body)
+    body, conv, rep = convert_str(TWIST.replace("4, 1, 3\n", "4, 1, 3\n100, 4, 4\n"))
+    assert "*KINEMATIC" in body and "*RIGID BODY" not in body and not conv._kin_twist
+    assert "moves no coupled DOF" not in rep.text()
     # a coupling whose free rotation is a global axis keeps task 39's BC hold
     body, _, _ = convert_str(TWIST.replace("5, 7\n*Surface", "5, 6, 7, 8\n*Surface")
                              .replace("*Kinematic\n1, 3", "*Kinematic\n3, 3")
@@ -17374,17 +17417,60 @@ def test_kinematic_twist_held_on_a_rot_node():
     assert "*KINEMATIC" in body and "*BOUNDARY\n100, 6, 6" in body
 
 
+def test_kinematic_twist_forms():
+    # task 91 held the twist of a coupling of all translations on solid nodes only; the other
+    # forms carry the reference node's rotation on a ROT NODE too, where it is held (probed:
+    # exact against the members' own rigid-link equation)
+    hold = re.compile(r"\*EQUATION\n2\n10[12], [12], 1\., 10[12], [12], 1\.\n")
+    dyn = TWIST.replace("*Static\n", "*Dynamic\n0.05, 1.\n").replace(
+        "*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Density\n1e-3\n")
+    for deck, form in ((dyn, "eq"), (dyn.replace("*Step\n", "*Step, nlgeom\n"), "rb"),
+                       (TWIST.replace("*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Plastic\n1e9, 0.\n"), "eq"),
+                       (TWIST.replace("*Coupling, ref node=100, surface=MS, constraint name=C\n*Kinematic\n1, 3\n",
+                                      "*Kinematic Coupling, ref node=100\nMEM, 1, 3\n"), "rb")):
+        body, conv, rep = convert_str(deck)
+        assert hold.search(body) and "*KINEMATIC" not in body and other_reduced(conv) == [], deck
+        assert ("*RIGID BODY" in body) == (form == "rb") and "twist about it" in rep.text()
+    # a *TRANSFORM on the node: the ROT NODE has its axes (local x = the twist axis here): the
+    # hold is one local term, a BC
+    turned = TWIST.replace("*Coupling", "*Nset, nset=NREF\n100\n*Transform, nset=NREF\n"
+                           "1., 1., 0., -1., 1., 0.\n*Coupling")
+    body, conv, rep = convert_str(turned)
+    assert "*RIGID BODY, NSET=ABQ2CCX_RB1, REF NODE=100, ROT NODE=101" in body and "101,1,1" in _bc_lines(body)
+    # some translations, shell or beam members, a *KINEMATIC COUPLING of some: without NLGEOM
+    # the linear equations Abaqus solves there; under NLGEOM no exact form: warned
+    space = TWIST.replace("100, 0.5, 0.5, 1.", "100, 0.5, 0.5, 0.5").replace("5, 7\n*Surface", "1, 7\n*Surface") \
+        .replace("*Kinematic\n1, 3", "*Kinematic\n1, 2").replace("100, 3, 2.\n", "100, 2, 2.\n") \
+        .replace("*Boundary\n1, 1, 3\n", "*Boundary\n").replace("3, 1, 3\n", "")
+    body, conv, rep = convert_str(space)
+    assert re.search(r"\*EQUATION\n3\n101, \d, 1\., 101, \d, 1\., 101, \d, 1\.\n", body), body
+    assert "*KINEMATIC" not in body and other_reduced(conv) == [] and "of some translations" in rep.text()
+    body, conv, rep = convert_str(space.replace("*Step\n", "*Step, nlgeom\n"))
+    assert "*KINEMATIC\n1, 2" in body and any(
+        lvl == "WARNING" and "under NLGEOM it has no exact form" in m for lvl, m in rep.entries)
+    # the deck's BC on a rotation that reaches the twist in some steps only: a hold would
+    # overconstrain those steps (warned); an *EQUATION term on the rotations (warned)
+    two = TWIST.replace("*End Step\n", "*End Step\n*Step\n*Static\n*Boundary, op=NEW\n1, 1, 3\n2, 1, 3\n"
+                        "3, 1, 3\n4, 1, 3\n100, 4, 4\n*End Step\n")
+    for deck, why in ((two, "holds it in some steps only"),
+                      (TWIST.replace("*Step", "*Equation\n2\n100, 4, 1., 1, 1, -1.\n*Step"),
+                       "an *EQUATION term is on its rotations")):
+        body, conv, rep = convert_str(deck)
+        assert "*KINEMATIC" in body and any(lvl == "WARNING" and why in m for lvl, m in rep.entries)
+
+
 def test_dload_types_ccx_lacks_commented_out():
     # ccx 2.23 reads P1-P6, BX / BY / BZ, GRAV, CENTRIF and EDNOR and stops on any other
     # *DLOAD type (probed: HP1, VP1, SP1, SBF, PI, PE, EDSHR1, BR, ...), crashes on a bare P
-    deck = HEX + HEX_SEC + "*Step\n*Static\n*Dload\nEALL, P2, 1.\nEALL, HP1, 1., 2., 0., 0., 1.\n" \
+    # (HP: nodal forces, test_hydrostatic_pressure_as_nodal_forces)
+    deck = HEX + HEX_SEC + "*Step\n*Static\n*Dload\nEALL, P2, 1.\nEALL, VP1, 1.\n" \
         "EALL, SBF, 3.\nEALL, P, 4.\nEALL, BZ, 5.\n*End Step\n"
     body, conv, rep = convert_str(deck)
     assert "\nEALL, P2, 1." in body and "\nEALL, BZ, 5." in body
-    assert all(f"** EALL, {x}" in body for x in ("HP1, 1.", "SBF, 3.", "P, 4."))
-    assert {"*DLOAD HP1 load dropped", "*DLOAD SBF load dropped", "*DLOAD P load dropped"} <= \
+    assert all(f"** EALL, {x}" in body for x in ("VP1, 1.", "SBF, 3.", "P, 4."))
+    assert {"*DLOAD VP1 load dropped", "*DLOAD SBF load dropped", "*DLOAD P load dropped"} <= \
         set(conv.reduced_physics)
-    assert "(hydrostatic pressure)" in rep.text() and "crashes on a bare P" in rep.text()
+    assert "(viscous pressure)" in rep.text() and "crashes on a bare P" in rep.text()
     # on axisymmetric elements BR / BZ are the radial / axial body forces: ccx's BX / BY
     cax = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n*Element, type=CAX4, elset=E\n"
            "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1000., 0.\n*Solid Section, elset=E, "
@@ -17455,14 +17541,101 @@ def test_solid_composite_split_into_plies():
     _, conv, rep = convert_str(HEX + mat + sec + "1., 1, M, 0.\n1., , M, 90.\n")
     assert conv.reduced_physics == ["*SOLID SECTION, COMPOSITE: the layer integration of its ply bricks"]
     # elements the split does not take, or layer axes it does not know: commented out, with why
-    for typ, plies, why in (("C3D8I", "1., 3, M\n1., 3, N\n", "only C3D8 and C3D8R bricks"),
-                            ("C3D8", "1., 3, M, ANG\n1., 3, M\n", "is not an *ORIENTATION"),
+    for typ, plies, why in (("C3D8H", "1., 3, M\n1., 3, N\n", "only C3D8, C3D8R, C3D8I, C3D20 and C3D20R"),
+                            ("C3D8", "1., 3, M, ANG\n1., 3, M\n", "is neither an *ORIENTATION nor"),
                             ("C3D8", "1., 3, M\n1., 3, N\n", "")):
         body, conv, rep = convert_str(HEX.replace("C3D8", typ) + mat + sec + plies)
         if why:
             assert "*SOLID SECTION, COMPOSITE" in conv.reduced_physics and why in rep.text(), why
         else:
             assert "*SOLID SECTION, ELSET=EALL_PLY2, MATERIAL=N" in body
+
+
+def _brick20(typ="C3D20"):
+    """A unit C3D20 (or C3D20R) cube, nodes 1-8 its corners, 9-20 its midsides (Abaqus order)."""
+    c = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    edges = [(1, 2), (2, 3), (3, 4), (4, 1), (5, 6), (6, 7), (7, 8), (8, 5), (1, 5), (2, 6), (3, 7), (4, 8)]
+    pts = c + [tuple((a + b) / 2 for a, b in zip(c[i - 1], c[j - 1])) for i, j in edges]
+    return ("*Node\n" + "".join(f"{n}, {x}, {y}, {z}\n" for n, (x, y, z) in enumerate(pts, 1)) +
+            f"*Element, type={typ}, elset=EALL\n1, " + ", ".join(map(str, range(1, 16))) + ",\n" +
+            ", ".join(map(str, range(16, 21))) + "\n")
+
+
+def test_solid_composite_quadratic_bricks_and_distribution_axes():
+    # task 91 split C3D8 / C3D8R only: C3D20 / C3D20R plies take nodes at the element's own
+    # parametric points, tied to its 20-node field (a 20-node field on each layer again: exact
+    # kinematics, validate_with_ccx.py t95_composite_c3d20_equal); C3D8I plies have their own
+    # incompatible modes: both warned (layer integration / modes)
+    mats = "*Material, name=A\n*Elastic\n1000., 0.3\n*Material, name=B\n*Elastic\n3000., 0.3\n"
+    sec = "*Solid Section, elset=EALL, composite\n0.25, 3, A\n0.75, 3, B\n"
+    body, conv, rep = convert_str(_brick20() + mats + sec)
+    els = body.split("*ELEMENT, TYPE=C3D20")[1].split("\n*")[0].splitlines()[1:]
+    assert len(els) == 4 and els[0].startswith("1, 1, 2, 3, 4, 21, 22, 23, 24,")    # (two lines each)
+    # a stack-edge point at a quarter: the quadratic edge's weights; a face point: the face's 8
+    assert "21, 1, 1., 1, 1, -0.375, 5, 1, 0.125, 17, 1, -0.75" in body
+    eqs = _equation_terms(body)
+    assert len(eqs) == 3 * 16 and sorted({len(e) for e in eqs}) == [4, 9]
+    assert conv.reduced_physics == ["*SOLID SECTION, COMPOSITE: the layer integration of its ply bricks"]
+    assert "at the element's own 20-node field" in rep.text()
+    _, conv, _ = convert_str(HEX.replace("C3D8", "C3D8I") + mats + sec)
+    assert conv.reduced_physics == ["*SOLID SECTION, COMPOSITE: the incompatible modes of its ply C3D8I bricks"]
+    mixed = _brick20() + "*Node\n21, 2., 0., 0.\n22, 2., 1., 0.\n23, 2., 0., 1.\n24, 2., 1., 1.\n" \
+        "*Element, type=C3D8, elset=EALL\n2, 2, 21, 22, 3, 6, 23, 24, 7\n"
+    _, conv, rep = convert_str(mixed + mats + sec)
+    assert "it mixes 8-node and 20-node bricks" in rep.text()
+    # the section orientation's axes per element from a *DISTRIBUTION, or the layer angle per
+    # element from one (validate_with_ccx.py t95_composite_distribution_*): a ccx *DISTRIBUTION
+    # with a line per ply brick, turned by the layer angle about the rotation axis (3)
+    two = HEX + "*Node\n9, 2., 0., 0.\n10, 2., 1., 0.\n11, 2., 0., 1.\n12, 2., 1., 1.\n" \
+        "*Element, type=C3D8, elset=EALL\n2, 2, 9, 10, 3, 6, 11, 12, 7\n"
+    ortho = "*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 10., 0., 0., 0., 5., 5.,\n5.\n"
+    dist = ("*Distribution Table, name=OT\ncoord3D, coord3D\n*Distribution, name=OD, location=ELEMENT, "
+            "table=OT\n, 1., 0., 0., 0., 1., 0.\n1, 1., 0., 0., 0., 1., 0.\n2, 0., 1., 0., -1., 0., 0.\n"
+            "*Orientation, name=OR1\nOD\n3, 0.\n")
+    layers = "*Solid Section, elset=EALL, composite, orientation=OR1\n0.7, 3, M, 0.\n0.3, 3, M, 90.\n"
+    body, conv, rep = convert_str(two + ortho + dist + layers)
+    assert "*DISTRIBUTION, NAME=EALL_PLY1_AXES\n1, 1, 0, 0, 0, 1, 0\n2, 0, 1, 0, -1, 0, 0\n" in body
+    assert "*DISTRIBUTION, NAME=EALL_PLY2_AXES\n3, 0, 1, 0, -1, 0, 0\n4, -1, 0, 0, 0, -1, 0\n" in body
+    assert "*ORIENTATION, NAME=EALL_PLY2_ORI\nEALL_PLY2_AXES\n*SOLID SECTION, ELSET=EALL_PLY2, " \
+           "MATERIAL=M, ORIENTATION=EALL_PLY2_ORI" in body and conv.reduced_physics == []
+    angles = ("*Orientation, name=OR1\n1., 0., 0., 0., 1., 0.\n3, 0.\n*Distribution Table, name=AT\n"
+              "ANGLE\n*Distribution, name=DA, location=ELEMENT, table=AT\n, 0.\n1, 0.\n2, 90.\n")
+    body, conv, _ = convert_str(two + ortho + angles + layers.replace("M, 0.", "M, DA"))
+    assert "*DISTRIBUTION, NAME=EALL_PLY1_AXES\n1, 1, 0, 0, 0, 1, 0\n2, 0, 1, 0, -1, 0, 0\n" in body
+    assert "*ORIENTATION, NAME=EALL_PLY2_ORI\n0, 1, 0, -1, 0, 0\n" in body and conv.reduced_physics == []
+
+
+def test_hydrostatic_pressure_as_nodal_forces():
+    # *DLOAD HPn / *DSLOAD HP (ccx has no pressure varying over a face; it stopped): consistent
+    # nodal forces of p = mag (za - z) / (za - zb), zero above za, pushing into the solid
+    # (validate_with_ccx.py t95_hydrostatic_*: a submerged block, exact)
+    step = "*Step{}\n*Static\n{}*End Step\n"
+    body, conv, rep = convert_str(HEX + HEX_SEC + step.format("", "*Dload\n1, HP4, 1., 1., 0.\n"))
+    cl = body.split("\n*CLOAD")[1].split("\n*")[0]
+    assert "2, 1, -0.166666666667" in cl and "3, 1, -0.166666666667" in cl and \
+        "6, 1, -0.0833333333333" in cl and "7, 1, -0.0833333333333" in cl, cl
+    assert conv.reduced_physics == [] and "hydrostatic pressures (HP)" in rep.text()
+    # surface-based: the same; on shells along the positive element normal (element-based),
+    # against the surface normal (SPOS) — here the levels put the whole face at p = 2
+    surf = HEX + HEX_SEC + "*Surface, name=X1\n1, S4\n"
+    body, _, _ = convert_str(surf + step.format("", "*Dsload\nX1, HP, 1., 1., 0.\n"))
+    assert "2, 1, -0.166666666667" in body.split("\n*CLOAD")[1]
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, "
+             "elset=SH\n1, 1, 2, 3, 4\n*Surface, name=TOP\nSH, SPOS\n*Material, name=M\n*Elastic\n"
+             "1000., 0.3\n*Shell Section, elset=SH, material=M\n0.1\n")
+    for load, sign in (("*Dload\nSH, HP, 2., 5., 0.\n", ""), ("*Dsload\nTOP, HP, 2., 5., 0.\n", "-")):
+        body, conv, _ = convert_str(shell + step.format("", load))
+        assert f"1, 3, {sign}0.5\n" in body.split("\n*CLOAD")[1] and conv.reduced_physics == []
+    # left out: under NLGEOM (the pressure follows the deforming faces), a zero-pressure level
+    # that cuts a face (the pressure kinks inside), levels the other way round
+    for nl, line, why in (("nlgeom", "1, HP4, 1., 1., 0.", "under NLGEOM a hydrostatic pressure"),
+                          ("", "1, HP4, 1., 0.5, 0.", "cuts a face of element 1"),
+                          ("", "1, HP4, 1., 0., 1.", "does not lie below the zero-pressure level")):
+        body, conv, rep = convert_str(HEX + HEX_SEC + step.format(", " + nl if nl else "", "*Dload\n" + line + "\n"))
+        assert f"** {line}" in body and why in rep.text() and "*DLOAD HP4 load dropped" in conv.reduced_physics
+    body, conv, rep = convert_str(HEX + HEX_SEC + step.format(", nlgeom", "*Dload\n1, HP4, 1., 1., 0.\n"),
+                                  approximate=True)
+    assert "*CLOAD" in body and "[APPROX] *DLOAD HP" in rep.text()
 
 
 def test_dof7_on_a_rejected_element_type_gets_the_ccx_stop_not_the_bc():
