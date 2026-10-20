@@ -9351,10 +9351,12 @@ class Converter:
                 self._cl_state = OrderedDict()
                 if proc != "FREQUENCY":
                     self._dl_state = {}
-        elif self._step_idx in self._restore_from:
-            self._nodal_loads, self._dl_state = self._load_base[0], self._load_base[2]
-            self._cl_state = self._load_base[3]
-            self._nodal_emitted = dict(self._load_base[1])
+        elif self._step_idx in self._restore_from:     # (copies, as above: the base stays)
+            loads, emitted, dl, cl = self._load_base
+            self._nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in loads.items())
+            self._dl_state = {o: OrderedDict(st) for o, st in dl.items()}
+            self._cl_state = OrderedDict((k, list(v)) for k, v in cl.items())
+            self._nodal_emitted = dict(emitted)
         for b in inner:
             if b.keyword == "END STEP" or b.keyword in GEOM_KW:
                 continue
