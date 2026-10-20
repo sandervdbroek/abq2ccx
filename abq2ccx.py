@@ -4353,6 +4353,15 @@ class Step:
                                   # deformation plasticity material drops NLGEOM=NO, an explicit step
                                   # with it counts too); a perturbation step keeps the one before it
     temp_dof: Optional[str]       # its first TEMPERATURE_DOF_PROCS card's keyword (handle_step's)
+    # a general step, handle_step's rule (_plan_base_restore's is "not in _pert_idx",
+    # _plan_modal_starts' "general in ccx"):
+    general: bool                 # proc in StepModel.GENERAL_PROCS and no *STEP, PERTURBATION
+    general_before: bool          # a general step before it (handle_step's _general_step_seen)
+    base_nlgeom: bool             # NLGEOM in force in its base state (handle_step's _base_nlgeom): on
+                                  # once a general step's *STEP card has NLGEOM as handle_step writes it
+    base_nlgeom_dp: bool          # the same with a deformation plasticity material (_dp_nlgeom), whose
+                                  # NLGEOM=NO handle_step drops: an explicit step with it gets NLGEOM
+    buckle_loaded: bool           # a *BUCKLE step with a load other than *TEMPERATURE (handle_step's)
     lc2: frozenset                # in a step with a *BUCKLE card: the ids of its *BOUNDARY, LOAD CASE=2
                                   # cards, which the conversion leaves out (StepModel.lc2)
     lc2_repeats: bool             # each repeats a LOAD CASE=1 card of the step (the Abaqus/CAE default)
@@ -4366,6 +4375,23 @@ class StepModel:
     next *END STEP); ``after``, the cards after the last step.  (Later planners add model data
     the model does not hold: *TRANSFORM copies, material and section twins.)"""
 
+    # the procedures of a general step (Step.general)
+    GENERAL_PROCS = ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
+                     "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO")
+
+    @staticmethod
+    def _writes_nlgeom(given: Optional[bool], explicit: bool, pert: bool, base: bool,
+                       dp: bool) -> bool:
+        """NLGEOM on the *STEP card handle_step writes, from ``given`` (Step.nlgeom_card): the
+        deck's, dropped where it is NLGEOM=NO with a deformation plasticity material (``dp``)
+        or NLGEOM on a perturbation step whose base state is linear (``base``: Step.base_nlgeom),
+        and added on an explicit step without it."""
+        if given is None:
+            return explicit
+        if given:
+            return explicit or not (pert and not base)
+        return dp and explicit
+
     def __init__(self, blocks: Sequence[Block]) -> None:
         model: List[Block] = []
         steps: List[Step] = []
@@ -4374,6 +4400,7 @@ class StepModel:
         self.card_step: Dict[int, int] = {}
         star = 0                                # the *STEP cards so far
         nlgeom = False                          # NLGEOM in force (Step.nlgeom)
+        seen = base = base_dp = False           # Step.general_before, base_nlgeom, base_nlgeom_dp
         for is_step, cards in deck_parts(blocks):
             if not is_step:
                 (loose if steps else model).extend(cards)
@@ -4400,6 +4427,7 @@ class StepModel:
             else:
                 lc2, repeats = frozenset(), False
             n = sum(1 for b in cards if b.keyword == "STEP")
+            general = proc in self.GENERAL_PROCS and not pert_param
             steps.append(Step(
                 no=len(steps) + 1, ccx_no=star + 1, cards=tuple(cards), between=tuple(loose),
                 star_steps=n, closed=n == 1 and cards[-1].keyword == "END STEP",
@@ -4410,7 +4438,16 @@ class StepModel:
                 or any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
                 nlgeom=nlgeom,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
+                general=general, general_before=seen, base_nlgeom=base, base_nlgeom_dp=base_dp,
+                buckle_loaded=proc == "BUCKLE" and any(
+                    desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
+                    for _, desc in _load_entries(b, user_loads=True)),
                 lc2=lc2, lc2_repeats=repeats))
+            # NLGEOM stays on once a general step has it (Abaqus): the base state of the later steps
+            if general:
+                seen = True
+                base = base or self._writes_nlgeom(given, explicit, pert, base, False)
+                base_dp = base_dp or self._writes_nlgeom(given, explicit, pert, base_dp, True)
             self.card_step.update((id(b), len(steps)) for b in cards)
             star += n
             loose = []
@@ -5768,8 +5805,10 @@ class Converter:
         self._deck_procs: set = set()               # the deck's procedure keywords (_prescan)
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
+        # the step being emitted: a general step before it, NLGEOM in its base state (handle_step:
+        # Step.general_before, base_nlgeom)
         self._general_step_seen = False
-        self._base_nlgeom = False                   # NLGEOM in a general step so far
+        self._base_nlgeom = False
         self._base_heated = False                   # temperatures set or solved in a general step
         self._base_stressed = False                 # a load, prescribed motion or initial state
         self._step_proc: Optional[str] = None      # the procedure of the step being emitted (None
@@ -10313,10 +10352,13 @@ class Converter:
         step_block = group[0]
         inner = group[1:]
         self._step_idx += 1
-        proc_block = next((b for b in inner if b.keyword in PROC_KW), None)
-        proc = proc_block.keyword if proc_block else None
+        cur = self.steps.steps[self._step_idx - 1]
+        proc_block = cur.proc_card
+        proc = cur.proc or None
         self._step_proc = proc
-        explicit = proc == "DYNAMIC" and proc_block is not None and proc_block.has("EXPLICIT")
+        explicit = cur.explicit
+        self._general_step_seen = cur.general_before            # (_frequency_perturbation)
+        self._base_nlgeom = cur.base_nlgeom_dp if self._dp_nlgeom else cur.base_nlgeom
         params: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in step_block.params.items():
             if k == "NAME":
@@ -10334,8 +10376,10 @@ class Converter:
                     self.report.note(f"*STEP, PERTURBATION dropped on a *{proc} step (ccx reads it only "
                                      f"on *FREQUENCY / *BUCKLE; it runs *{proc} as a linear "
                                      f"procedure anyway).", once=True)
-                elif self._step_idx < self._n_steps and \
-                        not set(range(self._step_idx + 1, self._n_steps + 1)) <= self._pert_idx:
+                elif self.steps.n_star_steps > len(self.steps) or \
+                        any(not s.perturbation for s in self.steps.steps[cur.no:]):
+                    # (a later general step; an unterminated *STEP anywhere in the deck counts
+                    # as one: its *STEP cards outnumber the steps)
                     self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
                                      "general step, so the next general step starts from its deformed "
                                      "state (its loads and boundary conditions are given back there) "
@@ -10343,7 +10387,7 @@ class Converter:
                                      "the perturbation load case after the last general step.", once=True)
                     self._reduces("*STEP, PERTURBATION on a static step before a general step (its "
                                   "response stays)")
-                elif self._step_idx < self._n_steps and self._step_idx + 1 not in self._restore_from:
+                elif self.steps.steps[cur.no:] and cur.no + 1 not in self._restore_from:
                     # (a static perturbation step next gets the base state again)
                     self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
                                      "general step, so its loads persist into the following steps "
@@ -10446,13 +10490,9 @@ class Converter:
         if proc == "FREQUENCY" and not step_block.has("PERTURBATION") and \
                 self._frequency_perturbation(False):
             params["PERTURBATION"] = None
-        if proc in ("STATIC", "DYNAMIC", "HEAT TRANSFER", "COUPLED TEMPERATURE-DISPLACEMENT",
-                    "UNCOUPLED TEMPERATURE-DISPLACEMENT", "VISCO") and not step_block.has("PERTURBATION"):
-            self._general_step_seen = True
-            # NLGEOM stays on once a step has it (Abaqus): the base state of the steps after
-            self._base_nlgeom = self._base_nlgeom or \
-                ("NLGEOM" in params and (params["NLGEOM"] or "YES").strip().upper() != "NO")
-            # its temperatures, loads and prescribed motion (_frequency_perturbation)
+        if cur.general:
+            # its temperatures, loads and prescribed motion: the base state of the steps after
+            # (_frequency_perturbation)
             self._base_heated = self._base_heated or proc in TEMPERATURE_DOF_PROCS or \
                 any(b.keyword == "TEMPERATURE" for b in inner)
             self._base_stressed = self._base_stressed or any(
@@ -10521,11 +10561,8 @@ class Converter:
             self._step_period = None
         if self._step_idx in self._pert_idx or (proc_block is not None and proc_block.has("RIKS")):
             self._step_period = None
-        self._step_temp_dof = next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS),
-                                   None)
-        self._buckle_loaded = proc == "BUCKLE" and any(
-            desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
-            for _, desc in _load_entries(b, user_loads=True))
+        self._step_temp_dof = cur.temp_dof
+        self._buckle_loaded = cur.buckle_loaded
         # a linear perturbation step's loads act in it only (Abaqus): the converted loads it
         # starts from are the base state's, and so are the next general step's, which ccx
         # gets back at its start (_restore_base_states); _nodal_emitted follows what ccx holds

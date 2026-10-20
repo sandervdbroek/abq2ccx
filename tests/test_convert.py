@@ -515,6 +515,31 @@ def test_step_model_states():
         pass
 
 
+def test_step_model_handle_step_facts():
+    # general steps (handle_step's six procedures, no PERTURBATION) and the NLGEOM of the base
+    # state they leave, as handle_step writes the *STEP cards: NLGEOM=NO stays off (with a
+    # deformation plasticity material it is dropped, and the explicit step gets NLGEOM), a
+    # perturbation step's NLGEOM over a linear base state is dropped; *BUCKLE steps loaded by
+    # more than temperatures
+    _, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
+*STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*STATIC\n*END STEP
+*STEP\n*BUCKLE\n2\n*CLOAD\n1, 1, 1.\n*END STEP\n*STEP\n*BUCKLE\n2\n*TEMPERATURE\n1, 10.\n*END STEP
+*STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM\n*STATIC\n*END STEP\n*STEP\n*STATIC\n*END STEP""")
+    assert [s.general for s in m] == [True, False, True, False, False, False, True, True]
+    assert [s.general_before for s in m] == [False] + [True] * 7
+    assert [s.base_nlgeom for s in m] == [False] * 7 + [True]
+    assert [s.base_nlgeom_dp for s in m] == [False] + [True] * 7
+    assert [s.buckle_loaded for s in m] == [False] * 3 + [True] + [False] * 4
+    # a general step with a perturbation card (an unterminated *STEP ran into one) is a
+    # perturbation step too: its NLGEOM is dropped over a linear base, unless it is explicit
+    for proc, on in (("*STATIC", False), ("*DYNAMIC, EXPLICIT\n, 1e-4", True)):
+        _, m = _step_model(f"*STEP, NLGEOM\n{proc}\n*STEP\n*FREQUENCY\n2\n*END STEP\n"
+                           "*STEP\n*STATIC\n*END STEP")
+        one, two = m.steps
+        assert (one.general, one.perturbation, two.general_before) == (True, True, True)
+        assert (two.base_nlgeom, two.base_nlgeom_dp) == (on, on)
+
+
 def test_step_model_explicit_steps():
     # the converter runs an explicit step with NLGEOM: handle_step writes it where NLGEOM= is
     # not given, while any explicit card switches it on for _plan_deck_facts
