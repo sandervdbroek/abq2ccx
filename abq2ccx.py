@@ -4429,7 +4429,7 @@ def amplitude_curve(b: Block) -> Optional[AmplitudeCurve]:
     ccx; before its first and after its last point such an amplitude keeps its end values
     (Abaqus and ccx alike)."""
     definition = (b.param("DEFINITION") or "TABULAR").strip().upper()
-    total = (b.param("TIME") or "").upper().replace(" ", "") == "TOTALTIME"
+    total = b.uparam("TIME").replace(" ", "") == "TOTALTIME"
     absolute = b.uparam("VALUE") == "ABSOLUTE"
 
     def num(key: str, default: float) -> float:
@@ -5175,7 +5175,7 @@ class Converter:
             self.geom.add_to_nset(b.param("NSET"), ids)
 
     def _register_elements(self, b: Block) -> None:
-        typ = (b.param("TYPE") or "").upper()
+        typ = b.uparam("TYPE")
         if typ in CONN_TYPES:
             self._register_connectors(b, typ)
             return
@@ -5295,7 +5295,7 @@ class Converter:
             self.geom.add_to_elset(name, ids)
 
     def _register_orientation(self, b: Block) -> None:
-        name = (b.param("NAME") or "").upper()
+        name = b.uparam("NAME")
         system = (b.param("SYSTEM") or "RECTANGULAR").upper()
         a, bvec = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)
         pts = self._orientation_points(b)     # a distribution-based *ORIENTATION has a
@@ -5325,7 +5325,7 @@ class Converter:
         self._orient_rotation[name] = rot
 
     def _register_surface(self, b: Block) -> None:
-        name = (b.param("NAME") or "").upper()
+        name = b.uparam("NAME")
         typ = (b.param("TYPE") or "ELEMENT").upper()
         entries: List[Tuple[str, Optional[str]]] = []
         for rec in merged_data_records(b):
@@ -5924,7 +5924,7 @@ class Converter:
         last = materials[-1] if materials else None
         kept = False
         for b, m, evolution in reversed(cards):    # ccx reads the last card it is given
-            crit = (b.param("CRITERION") or "").upper().replace(" ", "").replace("-", "")
+            crit = b.uparam("CRITERION").replace(" ", "").replace("-", "")
             if crit != "JOHNSONCOOK":
                 why = ("ccx 2.23 evaluates only the RICE TRACEY and JOHNSON COOK criteria and "
                        "stops on any other ('criterion is not known')")
@@ -7827,7 +7827,7 @@ class Converter:
                 self.report.note(f"*{b.keyword} parameter {k} dropped.", once=True)
 
     def handle_beam_section(self, b: Block) -> List[str]:
-        sec = (b.param("SECTION") or "").upper()
+        sec = b.uparam("SECTION")
         self._u1_last = id(b) in self._u1_cards
         if self._u1_last:
             self._note_dropped_params(b, ("ELSET", "MATERIAL", "SECTION"))
@@ -9205,7 +9205,7 @@ class Converter:
         if proc == "MODAL DYNAMIC":
             self._modal_increments(proc_block, params)
         if proc == "DYNAMIC" and proc_block is not None and "AMPLITUDE" not in params and \
-                not explicit and (proc_block.param("APPLICATION") or "").upper().startswith("QUASI"):
+                not explicit and proc_block.uparam("APPLICATION").startswith("QUASI"):
             params["AMPLITUDE"] = "RAMP"
             self.report.note("*DYNAMIC, APPLICATION=QUASI-STATIC: *STEP AMPLITUDE=RAMP added (the "
                              "Abaqus default for quasi-static dynamics; ccx steps loads in dynamic "
@@ -13392,7 +13392,7 @@ class Converter:
         self._out_contact = {           # the contact ccx gets (_contact_output_issues)
             "abaqus": any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks),
             "pairs": len(pairs),
-            "nts": any((b.param("TYPE") or "").upper().replace(" ", "") != "SURFACETOSURFACE"
+            "nts": any(b.uparam("TYPE").replace(" ", "") != "SURFACETOSURFACE"
                        for b in pairs),
             # elements whose expanded nodes only a 3-D .frd (a beam or shell model) holds
             "flat": not frd3d and any(c.startswith(PLANE_ELEM_PREFIXES + ("M3D",))
@@ -13400,7 +13400,7 @@ class Converter:
             "axi": any(c.startswith("CAX") for c in types.values()),
             # (slave, master, face-to-face) of each ccx contact pair, for *CONTACT PRINT
             "pair_list": [(f[0].strip(), f[1].strip(),
-                           (b.param("TYPE") or "").upper().replace(" ", "") == "SURFACETOSURFACE")
+                           b.uparam("TYPE").replace(" ", "") == "SURFACETOSURFACE")
                           for b in pairs for f in merged_data_records(b) if len(f) > 1 and
                           not {f[0].strip().upper(), f[1].strip().upper()} & set(self._analytic_skipped)]}
         steps = self._step_output_requests(blocks, quiet)
@@ -16068,7 +16068,7 @@ class Converter:
                 self._rb_rot[ref] = self._rb_rot_synth[ref] = next_id
         self._add_knot_beams(knots, blocks)
         # node surfaces whose weights (areas) only these couplings read: no warning they are lost
-        named = {(b.param("SURFACE") or "").strip().upper() for b in blocks
+        named = {b.uparam("SURFACE") for b in blocks
                  if "why" not in self._dist_plans.get(id(b), {"why": 1})}
         named = {s for s in named if self.surfaces.get(s, ("",))[0].startswith("NODE")}
         for b in blocks if named else ():
@@ -16180,7 +16180,7 @@ class Converter:
         all scaled by WEIGHTING METHOD (LINEAR 1 - q, QUADRATIC 1 - q^2, CUBIC 1 - 3 q^2 + 2 q^3,
         q the distance from the reference node over the furthest coupling node's).  Or why
         they cannot be found."""
-        sd = self.surfaces[(b.param("SURFACE") or "").strip().upper()]
+        sd = self.surfaces[b.uparam("SURFACE")]
         w: "OrderedDict[int, float]" = OrderedDict()
         if sd[0].startswith("NODE"):
             kept = set(self._coupling_nodes(b)[0])
@@ -16954,7 +16954,7 @@ class Converter:
         element AND integration point (verified: the Abaqus form is a hard error, the
         expanded form solves).  Expand each record to every int pt of the emitted ccx
         element type (uniform value per element).  Other TYPEs pass through unchanged."""
-        typ = (b.param("TYPE") or "").upper()
+        typ = b.uparam("TYPE")
         ccx_known = {"DISPLACEMENT", "FLUID VELOCITY", "MASS FLOW", "PLASTIC STRAIN", "PRESSURE",
                      "SOLUTION", "STRESS", "TEMPERATURE", "TOTAL PRESSURE", "VELOCITY"}
         if typ and typ not in ccx_known:
@@ -17233,7 +17233,7 @@ class Converter:
                                  "ccx uses the plane-element section thickness for contact (the same "
                                  "here; Abaqus ignores the line in 3-D).", once=True)
         out = [emit_keyword("SURFACE INTERACTION", b.params)]
-        name = (b.param("NAME") or "").upper()
+        name = b.uparam("NAME")
         if name and name in self._si_missing_behavior:
             self.report.note(f"*SURFACE INTERACTION {name} has no *SURFACE BEHAVIOR; added "
                              f"PRESSURE-OVERCLOSURE=HARD (the Abaqus default) so *CONTACT PAIR "
@@ -17361,7 +17361,7 @@ class Converter:
         return [emit_keyword("CONTACT PAIR", keep)] + list(b.data)
 
     def handle_surface(self, b: Block) -> List[str]:
-        if (b.param("TYPE") or "").upper().startswith("ANALYTICAL"):
+        if b.uparam("TYPE").startswith("ANALYTICAL"):
             return self._commented(b, "*SURFACE TYPE=ANALYTICAL RIGID is unsupported by ccx; mesh the "
                                       "rigid surface with elements instead.", reduces=False)
         name = b.uparam("NAME")
@@ -17371,7 +17371,7 @@ class Converter:
                 return [f"*SURFACE, NAME={b.param('NAME')}, TYPE=ELEMENT", f"{elset}, {face}"]
             return self._commented(b, f"Analytical rigid surface {name} not converted "
                                       f"({self._analytic_skipped.get(name, 'see the warnings')}).")
-        is_node = (b.param("TYPE") or "").upper() == "NODE"
+        is_node = b.uparam("TYPE") == "NODE"
         if b.has("COMBINE"):
             return self._commented(b, "*SURFACE, COMBINE (a surface built from other surfaces) has "
                                       "no ccx equivalent; list the element faces / nodes directly.", reduces=False)
@@ -17687,7 +17687,7 @@ class Converter:
         cur_si = None
         for blk in blocks:
             if blk.keyword == "SURFACE INTERACTION":
-                cur_si = (blk.param("NAME") or "").upper()
+                cur_si = blk.uparam("NAME")
                 if cur_si:
                     self._si_missing_behavior.add(cur_si)
             elif blk.keyword == "SURFACE BEHAVIOR" and cur_si:
@@ -17703,7 +17703,7 @@ class Converter:
         self.steps = StepModel(blocks)
         self._pert_idx = self.steps.pert
         self._total_amps = {b.uparam("NAME") for b in blocks if b.keyword == "AMPLITUDE" and
-                            (b.param("TIME") or "").upper().replace(" ", "") == "TOTALTIME"}
+                            b.uparam("TIME").replace(" ", "") == "TOTALTIME"}
         self._amp_curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
                             if b.keyword == "AMPLITUDE" and b.param("NAME")}
         # per step: it switches NLGEOM on.  A linear perturbation step runs linear about the
@@ -20678,7 +20678,7 @@ class Converter:
             return
         names = set(self.geom.nsets)
         joins = self._EDGE_SET_CARDS - ({"DISTRIBUTING COUPLING"} if beam else set())
-        kept = {(b.param("SURFACE") or "").strip().upper() for b in blocks
+        kept = {b.uparam("SURFACE") for b in blocks
                 if id(b) in self._distributing_ids} if beam else set()
         counted: set = set()
         for b in blocks:
@@ -22678,7 +22678,7 @@ class Converter:
                     pass
         self._fields_set = any(
             b.keyword in ("FIELD", "USER DEFINED FIELD")
-            or (b.keyword == "INITIAL CONDITIONS" and (b.param("TYPE") or "").upper() == "FIELD")
+            or (b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "FIELD")
             for b in blocks)
         self._n_steps = sum(1 for b in blocks if b.keyword == "STEP")
         # every parameter value of the deck but card names: a *DISTRIBUTION that some card
@@ -22751,9 +22751,9 @@ class Converter:
             combined, jc_block = False, None
             for b in group[1:]:
                 if b.keyword == "PLASTIC":
-                    combined = ((b.param("HARDENING") or "").upper() == "COMBINED" and
-                                not (b.param("DATATYPE") or "").upper().startswith("PARAM"))
-                    if (b.param("HARDENING") or "").upper().replace(" ", "") == "JOHNSONCOOK":
+                    combined = (b.uparam("HARDENING") == "COMBINED" and
+                                not b.uparam("DATATYPE").startswith("PARAM"))
+                    if b.uparam("HARDENING").replace(" ", "") == "JOHNSONCOOK":
                         jc_block = b
                 elif b.keyword == "CYCLIC HARDENING" and combined:
                     self._cyclic_ok.add(id(b))
@@ -22765,7 +22765,7 @@ class Converter:
         covered: set = set()
         any_temp_ic = False
         for b in blocks:
-            if b.keyword == "INITIAL CONDITIONS" and (b.param("TYPE") or "").upper() == "TEMPERATURE":
+            if b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "TEMPERATURE":
                 any_temp_ic = True
                 for rec in merged_data_records(b):
                     if rec and rec[0]:
@@ -22894,7 +22894,7 @@ class Converter:
         with 'nonexistent material' — and ccx 2.23 segfaults instead when the section is the
         last card of the deck and has a data line (e.g. a plane-element thickness), as for
         any card it rejects there (HISTORY_ONLY_KW).  Flag it so the stop is explained."""
-        defined = {(b.param("NAME") or "").upper() for b in blocks if b.keyword == "MATERIAL"}
+        defined = {b.uparam("NAME") for b in blocks if b.keyword == "MATERIAL"}
         missing: "OrderedDict[str, str]" = OrderedDict()
         for b in blocks:
             if not b.keyword.endswith("SECTION"):
@@ -25746,7 +25746,7 @@ class Converter:
         with all within, 0 with none): those with a node within r; none such: the nearest
         facet(s), as _coupling_nodes (factor 0).  Empty for a node surface, a radius that does
         not read or an undefined reference node."""
-        sd = self.surfaces.get((b.param("SURFACE") or "").strip().upper())
+        sd = self.surfaces.get(b.uparam("SURFACE"))
         r = self._influence_radius(b)
         ref = self._ref_node(b)
         x0 = self.geom.nodes.get(ref) if ref is not None else None
@@ -28003,7 +28003,7 @@ def _partition_assembly(blocks: List[Block]):
     for b in blocks:
         kw = b.keyword
         if kw == "PART":
-            name = (b.param("NAME") or "").upper()
+            name = b.uparam("NAME")
             parts[name] = []
             state = ("PART", name)
             continue
@@ -28018,8 +28018,8 @@ def _partition_assembly(blocks: List[Block]):
             state = None
             continue
         if kw == "INSTANCE":
-            inst = {"name": (b.param("NAME") or "").upper(),
-                    "part": (b.param("PART") or "").upper(),
+            inst = {"name": b.uparam("NAME"),
+                    "part": b.uparam("PART"),
                     "data": list(b.data), "extra": []}
             instances.append(inst)
             state = ("INST", inst)
@@ -28714,7 +28714,7 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
         # of the deck solvable instead of feeding ccx a fatal unknown element.  Connector
         # elements are resolved: the converter writes them as constraints.
         if blk.keyword == "ELEMENT":
-            etyp = (blk.param("TYPE") or "").upper()
+            etyp = blk.uparam("TYPE")
             if (etyp.startswith(UNSUPPORTED_ELEM_PREFIXES) and etyp not in CONN_TYPES) or \
                     etyp in ("JOINTC",):
                 continue
