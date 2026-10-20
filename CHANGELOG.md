@@ -6,6 +6,11 @@ physics.
 
 ## Unreleased
 
+* **An `*EQUATION` held by BCs in some steps only** — where a step's BCs hold every DOF of an
+  equation (both tied DOFs held in a `*FREQUENCY` step, say), ccx stopped ("`*ERROR in
+  cascade`": a BC on the equation's dependent DOF), while Abaqus solves it. The BC on that DOF
+  now goes in the steps whose BCs hold the equation's other DOFs at zero, so the equation holds
+  it there, and the steps after keep the tie. Nonzero values stay as they were, warned.
 * **General steps after linear perturbation steps** — NLGEOM written on a perturbation step
   switched NLGEOM on for the general steps after it (ccx then ran them nonlinear), kept ccx's
   nonlinear `*RIGID BODY` in a `*DYNAMIC` deck (7 % off) and gave an Abaqus UMAT the
@@ -97,8 +102,8 @@ physics.
 * **BCs and moments after a linear perturbation step** — Abaqus drops a perturbation step's
   BCs and loads after it, and the converter gives ccx the base state again, but six planners
   still read them as carried on. An `*EQUATION` on DOFs that only a `*FREQUENCY` step held was
-  dropped as redundant, so its tie was gone in the next general step (now kept; ccx stops on
-  it in the frequency step, warned). A JOIN connector off a beam node whose rotations only such
+  dropped as redundant, so its tie was gone in the next general step (now kept). A JOIN
+  connector off a beam node whose rotations only such
   a step held lost that rotation. On a `*TRANSFORM` node written in global components, the
   step's rotation hold or moment came back in the next general step, and a `*BUCKLE` step's
   load included the earlier moments (buckling factor 0.9 % off). A zero BC in a later

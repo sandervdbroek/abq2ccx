@@ -2643,6 +2643,23 @@ def after_pert_deck(case, twin=False):
             "*NODE OUTPUT\nU\n*ELEMENT OUTPUT\nS\n" + out)
 
 
+def equation_held_deck(steps="both"):
+    """Two C3D8 cubes (E 210000, nu 0.3, rho 7.8e-9) in a row, clamped at x = 0, with
+    *EQUATION u2(12) = u2(9) between two far corners: a *FREQUENCY step whose BCs hold both
+    those DOFs, then a static step pulling node 12 in y.  ``steps`` "freq": the frequency step
+    alone, without the equation (it holds anyway); "static": the static step alone."""
+    eq = "" if steps == "freq" else "*EQUATION\n2\n12, 2, 1., 9, 2, -1.\n"
+    freq = "*STEP\n*FREQUENCY\n3\n*BOUNDARY\n12, 2, 2\n9, 2, 2\n*END STEP\n"
+    static = "*STEP\n*STATIC\n1., 1.\n*CLOAD\n12, 2, 10.\n*NODE PRINT, NSET=FAR\nU\n*END STEP\n"
+    return ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 2.,0.,0.\n4, 0.,1.,0.\n5, 1.,1.,0.\n6, 2.,1.,0.\n"
+            "7, 0.,0.,1.\n8, 1.,0.,1.\n9, 2.,0.,1.\n10, 0.,1.,1.\n11, 1.,1.,1.\n12, 2.,1.,1.\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,5,4,7,8,11,10\n2, 2,3,6,5,8,9,12,11\n"
+            "*NSET, NSET=LEFT\n1, 4, 7, 10\n*NSET, NSET=FAR\n3, 6, 9, 12\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n210000., 0.3\n"
+            "*DENSITY\n7.8e-9\n*BOUNDARY\nLEFT, 1, 3\n" + eq +
+            ("" if steps == "static" else freq) + ("" if steps == "freq" else static))
+
+
 def modal_own_loads_deck(base=True):
     """A unit C3D8 cube (E 1000, nu 0, rho 1e-3) held statically at three corners: a static
     step loads it (``base``: a *CLOAD, a face pressure, gravity and a traction, which becomes
@@ -6168,6 +6185,28 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {err:.1e} apart, the top moved "
                   f"{moved:.4g} (before: {was})")
         failures += 0 if ok else 1
+    # an *EQUATION whose every DOF a *FREQUENCY step holds (ccx stopped: a BC on its dependent
+    # DOF; before that the converter dropped it, untying the static step after)
+    runs = [review_run(equation_held_deck(s), "equation_held" + ("" if s == "both" else "_" + s),
+                       lambda dat: (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"),
+                                    dat_node_blocks(dat)))
+            for s in ("both", "freq", "static")]
+    ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 3 and \
+        len(runs[0][1]) == len(runs[2][1]) == 1
+    if ok:
+        f_err = max(abs(a / b - 1) for a, b in zip(runs[0][0], runs[1][0]))
+        err, moved = same([runs[0][1], runs[2][1]])
+        u = runs[0][1][0]
+        tie = abs(u.get(12, [0.0, math.inf])[1] - u.get(9, [0.0, math.nan])[1])
+        ok = f_err < 1e-6 and err < 1e-9 * moved and tie < 1e-9 * moved and moved > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  equation_held (*EQUATION u2(12) = u2(9) on two cubes, "
+              f"both DOFs held in a *FREQUENCY step, then node 12 pulled in a static step): "
+              f"frequencies {runs[0][0][0]:.7g}, ... as with the BCs alone (max {f_err:.1e} "
+              f"apart), the static step as without the frequency step ({err:.1e} apart, "
+              f"tied DOFs {tie:.1e} apart, moved {moved:.3g})")
+    elif all(runs):
+        print(f"FAIL  equation_held: {len(runs[0][0])} frequencies, {len(runs[0][1])} tables")
+    failures += 0 if ok else 1
     # a *MODAL DYNAMIC step after a loaded static step (ccx 2.23 applied that step's loads in
     # it too): the response to its own loads alone
     runs = [review_run(modal_own_loads_deck(b), "modal_own_loads" + ("" if b else "_ref"),

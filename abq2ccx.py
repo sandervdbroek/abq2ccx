@@ -3495,7 +3495,9 @@ def deck_parts(blocks: Sequence[Block]) -> Iterator[Tuple[bool, List[Block]]]:
 
 def step_groups(blocks: Sequence[Block]) -> Tuple[List[Block], List[List[Block]]]:
     """(the cards before the first *STEP, each step's cards from its *STEP through its
-    *END STEP) — the steps as emit_other writes them (deck_parts)."""
+    *END STEP) — the steps as emit_other writes them (deck_parts).  Their count is
+    step_load_audit's and bc_steps' (a *STEP before *END STEP replaces the open one), though
+    the open step's cards stay in the group, as emitted."""
     model: List[Block] = []
     groups: List[List[Block]] = []
     for step, cards in deck_parts(blocks):
@@ -3534,21 +3536,24 @@ def bc_steps(cards: Sequence[Block], entries: Callable[[Block], Sequence[Tuple[o
     on a key replaces the earlier one, and OP=NEW on a step's first *BOUNDARY card removes
     what is in force (op_new_cards).  After a step in ``restore`` (1-based: Abaqus' linear
     perturbation steps, which _restore_base_states makes ccx undo) the next one starts from
-    what the last other step left.  One dict per *STEP, at its *END STEP (or the next
-    *STEP, or the deck's end); a deck without steps yields the model data's.  Later cards
-    may update a yielded dict: copy what is kept."""
+    what the last other step left.  One dict per step, at its *END STEP (or the deck's end);
+    a *STEP before *END STEP replaces the open one, as in step_load_audit and step_groups;
+    a deck without steps yields the model data's.  Later cards may update a yielded dict:
+    copy what is kept."""
     acts = op_new_cards(cards)
     active: dict = {}
-    base = active                     # what the last step not in ``restore`` left
-    step = 0
+    base = start = active             # what the last step not in ``restore`` left; the open
+    step = 0                          # step's start
     in_step = stepped = False
     for b in cards:
         if b.keyword == "STEP":
             if in_step:
-                yield active
-            step += 1
-            if step - 1 not in restore:
-                base = dict(active)
+                active = dict(start)
+            else:
+                step += 1
+                if step - 1 not in restore:
+                    base = dict(active)
+                start = dict(active)
             in_step = stepped = True
         elif b.keyword == "END STEP" and in_step:
             yield active
@@ -21601,9 +21606,12 @@ class Converter:
         (augmenting paths) assigns the equations, so one can hand its DOF to another that has
         no other choice.  The equations are then accepted in order, each reduced by the ones
         before it: one that reduces to 0 = 0 is redundant and dropped (a duplicate, or a loop
-        of ties, which ccx would hold at zero).  An equation left without a free DOF stays
-        as it is, with a warning, except the converter's own rotation ties, which are
-        dropped (the *BOUNDARY then governs that rotation)."""
+        of ties, which ccx would hold at zero).  An equation left without a free DOF
+        eliminates one whose BCs hold it at zero only in steps that hold the equation's other
+        DOFs at zero too: those BCs go, and the equation holds it there (an equation held in
+        some steps only, by BCs on all its DOFs; probed on 2.23).  Otherwise it stays as it
+        is, with a warning, except the converter's own rotation ties, which are dropped (the
+        *BOUNDARY then governs that rotation)."""
         cards = self._emitted_cards(out)
         isint = re.compile(r"[-+]?\d+").fullmatch
 
@@ -21636,6 +21644,7 @@ class Converter:
         spc: set = set()
         bc_cards: List[Block] = []              # *STEP, *END STEP and *BOUNDARY, for bc_steps
         given: Dict[int, List[Tuple[Tuple[int, int], bool]]] = {}   # a *BOUNDARY's entries
+        writes: Dict[Tuple[int, int], set] = {}                     # (node, DOF) -> its BC lines
         transformed: set = set()
         tcard: Dict[int, Optional[Tuple[str, Vec, Vec]]] = {}   # node -> its (last) *TRANSFORM
         bc_first: Dict[Tuple[int, int], int] = {}               # (node, DOF) -> card of 1st BC
@@ -21665,6 +21674,7 @@ class Converter:
                             spc.add((n, d))
                             entries.append(((n, d), z))
                             bc_first.setdefault((n, d), ci)
+                            writes.setdefault((n, d), set()).add(j)
             elif kw == "TRANSFORM":
                 ns = nodes_of((params.get("NSET") or "").strip())
                 transformed.update(ns)
@@ -21803,11 +21813,25 @@ class Converter:
         assign = self._match_dependents(eqs, cands, transformed)
         # held at zero by a BC in every step (a linear perturbation step's BCs end with it:
         # _restore_base_states frees them in the next general step)
+        eq_dofs = {(n, d) for _, terms in eqs for n, d, _ in terms}
+        steps: List[Dict[Tuple[int, int], bool]] = []         # each step's BCs on those
         held: Optional[set] = None
         for active in bc_steps(bc_cards, lambda b: given[id(b)], self._pert_idx):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
+            steps.append({k: z for k, z in active.items() if k in eq_dofs})
         held = held or set()
+        released: set = set()
+
+        def releasable(k: Tuple[int, int], res: Dict[Tuple[int, int], float]) -> bool:
+            """Whether ``k``'s BCs can go so that the equation ``res`` eliminates it: every
+            step that holds it holds it at zero, with the equation's other DOFs (then the
+            equation holds it there)."""
+            if k not in spc or k[0] in transformed or k in busy or k in taken_too or \
+                    k in released or k in accepted:
+                return False
+            hit = [a for a in steps if k in a]
+            return bool(hit) and all(a[k] and all(a.get(q) for q in res if q != k) for a in hit)
         # Accept the equations in deck order, each reduced by the ones accepted before it
         # (their eliminated DOFs substituted): one that reduces to 0 = 0 — a duplicate, or
         # one closing a loop of ties — holds whenever the others do and is dropped; ccx
@@ -21874,6 +21898,11 @@ class Converter:
             alt = None if several else \
                 next((k for k in (res or {}) if k not in taken and k not in accepted and
                       ccx_pick(k, res) is not None), None)
+            rel = None if alt is not None or res is None else \
+                next((k for k in order + [q for q in res if q not in dofs]
+                      if abs(res.get(k, 0.0)) > tol and releasable(k, res) and
+                      (dofs.count(k) == 1 and abs(coef[k]) > tol if k in dofs else not several)),
+                     None)
             if alt is not None:
                 g = ccx_pick(alt, res)
                 if g:
@@ -21884,6 +21913,19 @@ class Converter:
                 final.append([(alt[0], alt[1], f"{res[alt]:.12g}")] +
                              [(q[0], q[1], f"{c:.12g}") for q, c in res.items() if q != alt])
                 rewritten += 1
+            elif rel is not None:
+                # every DOF of it has a BC, but the steps that hold ``rel`` hold the others at
+                # zero too: its BCs go and the equation holds it there instead (the same
+                # state); the steps that free it keep the tie
+                released.add(rel)
+                src = coef if rel in dofs else res
+                accepted[rel] = {q: -c / src[rel] for q, c in src.items() if q != rel}
+                if rel in dofs:
+                    k = dofs.index(rel)
+                    final.append([terms[k]] + terms[:k] + terms[k + 1:])
+                else:
+                    final.append([(rel[0], rel[1], f"{res[rel]:.12g}")] +
+                                 [(q[0], q[1], f"{c:.12g}") for q, c in res.items() if q != rel])
             elif frozenset(dofs) in self._gen_ties and len(terms) == 2:
                 final.append(None)
                 dropped += 1
@@ -21919,7 +21961,29 @@ class Converter:
                              f"another constraint. CalculiX will stop with '*ERROR in cascade ... "
                              f"dependent side of a MPC and a SPC' (or '... two different MPC's'). "
                              f"Remove the BC or the constraint on that DOF.", once=True)
-        return self._with_equations(out, cards, eqs, final)
+        # the released DOFs' *BOUNDARY lines, written again without them
+        swap: Dict[int, List[str]] = {}
+        for j in sorted({j for k in released for j in writes[k]}):
+            f = fields(j)
+            d1 = int(f[1])
+            d2 = int(f[2]) if len(f) > 2 and isint(f[2]) else d1
+            tail = "".join(", " + x for x in f[3:])
+            gone = sorted(k for k in released if j in writes[k])
+            swap[j] = [f"** abq2ccx: no BC on node {n} DOF {d} here: the *EQUATION holds it "
+                       f"(its other DOFs are held)" for n, d in gone[:3]]
+            for n in dict.fromkeys(nodes_of(f[0])):
+                keep = [d for d in range(min(d1, d2), max(d1, d2) + 1) if (n, d) not in gone]
+                for a, b in zip([d for d in keep if d - 1 not in keep],
+                                [d for d in keep if d + 1 not in keep]):
+                    swap[j].append(f"{n}, {a}, {b}{tail}")
+        if released:                # (a card left without a line stays: ccx 2.23 takes it)
+            self.report.note(f"*EQUATION: the *BOUNDARY on {len(released)} DOF(s) dropped that "
+                             f"are on an equation every DOF of which has a BC in some step (ccx "
+                             f"stops on a DOF that is both: '*ERROR in cascade ... dependent side "
+                             f"of a MPC and a SPC'): each step that held such a DOF holds the "
+                             f"equation's other DOFs at zero too, so the equation holds it there, "
+                             f"and the steps that free them keep the equation — as in Abaqus.")
+        return self._with_equations(out, cards, eqs, final, swap)
 
     @staticmethod
     def _emitted_cards(out: List[str]) -> List[Tuple[str, "OrderedDict[str, Optional[str]]", int,
@@ -22019,10 +22083,12 @@ class Converter:
     @staticmethod
     def _with_equations(out: List[str], cards: List[tuple],
                         eqs: List[Tuple[int, List[Tuple[int, int, str]]]],
-                        final: List[Optional[List[Tuple[int, int, str]]]]) -> List[str]:
+                        final: List[Optional[List[Tuple[int, int, str]]]],
+                        swap: Optional[Dict[int, List[str]]] = None) -> List[str]:
         """``out`` with each *EQUATION card whose equations changed written again from
         ``final`` (the terms of each equation of ``eqs``; None: dropped); a card left without
-        an equation goes."""
+        an equation goes.  ``swap``: other lines of ``out`` written as the given lines."""
+        swap = swap or {}
         new_cards: Dict[int, List[str]] = {}
         by_card: "OrderedDict[int, List[int]]" = OrderedDict()
         for e, (ci, _) in enumerate(eqs):
@@ -22037,7 +22103,7 @@ class Converter:
                     continue
                 lines += equation_rows(terms)
             new_cards[ci] = lines
-        if not new_cards:
+        if not new_cards and not swap:
             return out
         drop_lines: set = set()
         insert: Dict[int, List[str]] = {}
@@ -22052,7 +22118,9 @@ class Converter:
         for j, line in enumerate(out):
             if j in insert:
                 res += insert[j]
-            if j not in drop_lines:
+            if j in swap:
+                res += swap[j]
+            elif j not in drop_lines:
                 res.append(line)
         return res
 
@@ -24745,7 +24813,7 @@ def dat_blocks(path: str) -> Iterator[Tuple[int, str, str, Optional[float], List
 
 
 def _deck_steps(path: str) -> Optional[dict]:
-    """What the results digest reads from a ccx deck: per *STEP its procedure and the DOFs
+    """What the results digest reads from a ccx deck: per step its procedure and the DOFs
     1-3 that the *BOUNDARY cards in effect hold (bc_steps; not at a ROT NODE, whose DOFs are
     rotations: a *RIGID BODY's, or one the converter's comment names for a rigid constraint
     written as linear equations, _linear_rigid_lines), at each node (``held``) and per target node set or node
@@ -24766,6 +24834,7 @@ def _deck_steps(path: str) -> Optional[dict]:
     rot: set = set()
     transforms: List[str] = []
     max_node, kw, params, cur, ecur, etype, need = 0, "", OrderedDict(), None, None, "", 0
+    in_step = 0
     with fh:
         for raw in fh:
             ln = raw.strip()
@@ -24788,8 +24857,11 @@ def _deck_steps(path: str) -> Optional[dict]:
                     given[id(bc_cards[-1])] = []
                 if kw == "BEAM SECTION" and ename:
                     beam_sections.append((ename, (params.get("SECTION") or "").strip().upper()))
-                elif kw == "STEP":
-                    procedures.append(None)
+                elif kw == "STEP":              # one before *END STEP replaces the open one
+                    procedures[len(procedures) - in_step:] = [None]
+                    in_step = 1
+                elif kw == "END STEP":
+                    in_step = 0
                 elif kw in PROC_KW and procedures and not procedures[-1]:
                     procedures[-1] = kw + (", EXPLICIT" if "EXPLICIT" in params else "")
                 elif kw == "RIGID BODY" and (params.get("ROT NODE") or "").strip().isdigit():

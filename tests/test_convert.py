@@ -374,6 +374,17 @@ def test_bc_steps_follow_op_new():
         {(2, 1): True, (3, 1): True, (4, 1): True, (5, 1): True}, {}]
     assert [b.data for b in deck if id(b) in A.op_new_cards(deck)] == [["2, 1, 1"], []]
     assert [dict(a) for a in A.bc_steps(deck[:1], zero)] == [{(1, 1): True}]
+    # a *STEP before *END STEP replaces the open one (its BCs go): bc_steps, step_groups (the
+    # steps as emitted, the open one's cards in) and step_load_audit count the steps alike, so
+    # the restore after step 1 hits the same step
+    deck = A.blocks_from_lines("""*BOUNDARY\n1, 1, 1\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1
+*CLOAD\n2, 2, 1.\n*STEP\n*FREQUENCY\n*BOUNDARY\n3, 1, 1\n*END STEP
+*STEP\n*STATIC\n*CLOAD\n4, 1, 1.\n*END STEP""".splitlines())
+    assert [dict(a) for a in A.bc_steps(deck, zero)] == [{(1, 1): True, (3, 1): True}] * 2
+    assert [dict(a) for a in A.bc_steps(deck, zero, {1})] == [{(1, 1): True, (3, 1): True},
+                                                             {(1, 1): True}]
+    assert [len(g) for g in A.step_groups(deck)[1]] == [8, 4]
+    assert A.step_load_audit(deck, True) == [None, ["*CLOAD on 4"]]
 
 
 def test_op_new_on_a_later_boundary_card_only():
@@ -5673,14 +5684,15 @@ def test_bcs_of_a_perturbation_step_do_not_hold_in_later_steps():
     # the BC-state walkers read a linear perturbation step's BCs as Abaqus does, for that step
     # only (bc_steps' restore): _restore_base_states frees them in the next general step.  An
     # *EQUATION on DOFs that only a *FREQUENCY step holds is not "redundant in every step":
-    # it ties them in step 2.  ccx stops on it in the frequency step (probed): warned
+    # it ties them in step 2 (the frequency step's BC on its dependent DOF goes: next test)
     deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, "
             "elset=EALL, material=M\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*Equation\n2\n"
             "7, 2, 1., 6, 2, -1.\n*Step\n*Frequency\n3\n*Boundary\n7, 2, 2\n6, 2, 2\n*End Step\n"
             "*Step\n*Static\n*Cload\n7, 2, 10.\n*End Step\n")
     body, _, rep = convert_str(deck)
     assert _equations(body) == ["7,2,1.,6,2,-1."] and "redundant" not in rep.text()
-    assert "node 7 DOF 2 is on the dependent side of an *EQUATION" in rep.text()
+    assert "*FREQUENCY\n3\n*BOUNDARY\n** abq2ccx: no BC on node 7 DOF 2 here: the *EQUATION " \
+           "holds it (its other DOFs are held)\n6, 2, 2\n" in body
     # a JOIN connector off a beam node whose rotations only the frequency step holds: its rows
     # keep the node's rotation (theta_a x d), on a knot
     conn = (HEX + "*Node\n20, 3.,0.,0.\n21, 2.,0.,0.\n*Element, type=B31, elset=B\n2, 20, 21\n"
@@ -5691,6 +5703,49 @@ def test_bcs_of_a_perturbation_step_do_not_hold_in_later_steps():
             "*Boundary\n21, 4, 6\n*End Step\n*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n")
     body, conv, _ = convert_str(conn)
     assert conv._conn_knots == [21] and "\n2, 2, 1, 21, 2, -1, 21, 6, 1\n" in body
+
+
+def test_equation_held_by_bcs_in_some_steps():
+    # every DOF of the *EQUATION has a BC in some step: ccx stops on a BC on its dependent DOF
+    # ('*ERROR in cascade'), Abaqus solves it.  Where every step that holds a DOF holds the
+    # others at zero too, that DOF's BCs go and the equation holds it there (probed on 2.23:
+    # the frequencies and the tied static step as Abaqus has them)
+    head = (HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, "
+            "elset=EALL, material=M\n*Nset, nset=TIPS\n6, 7\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n"
+            "4, 1, 3\n*Equation\n2\n7, 2, 1., 6, 2, -1.\n")
+    freq, static = _deck_step("Frequency\n3", "{}"), _deck_step("Static", "{}")
+    load = "*Cload\n7, 2, 10.\n"
+
+    def conv(*steps):
+        body, conv, rep = convert_str(head + "".join(steps))
+        return body, conv, rep.text()
+    # a DOF range is split, a node set written node by node
+    body, c, rep = conv(freq.format("*Boundary\n7, 1, 3\n6, 2, 2\n"), static.format(load))
+    assert "*BOUNDARY\n** abq2ccx: no BC on node 7 DOF 2 here: the *EQUATION holds it (its other " \
+           "DOFs are held)\n7, 1, 1\n7, 3, 3\n6, 2, 2\n*NODE FILE" in body
+    assert _equations(body) == ["7,2,1.,6,2,-1."] and "the *BOUNDARY on 1 DOF(s) dropped" in rep
+    assert "overconstraint" not in rep and not c.reduced_physics
+    body, _, _ = conv(freq.format("*Boundary\nTIPS, 2, 2\n"), static.format(load))
+    assert "\n*BOUNDARY\n** abq2ccx: no BC on node 7 DOF 2 here: the *EQUATION holds it (its " \
+           "other DOFs are held)\n6, 2, 2\n*NODE FILE" in body
+    # model data held in a general step, freed by OP=NEW in the next (the restore aside)
+    body, _, rep = conv(head.replace("*Equation", "*Boundary\nTIPS, 2, 2\n*Equation"),
+                        static.format("*Cload\n5, 1, 1.\n"),
+                        static.format("*Boundary, op=NEW\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n" + load))
+    assert "no BC on node 7 DOF 2 here" in body and "TIPS, 2, 2" not in body
+    # a later step holds the first DOF alone: the other one is eliminated
+    body, _, rep = conv(static.format("*Boundary\n7, 2, 2\n6, 2, 2\n*Cload\n5, 1, 1.\n"),
+                        static.format("*Boundary, op=NEW\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+                                      "7, 2, 2\n*Cload\n5, 1, 1.\n"))
+    assert _equations(body) == ["6,2,-1.,7,2,1."] and "no BC on node 6 DOF 2 here" in body
+    assert body.count("\n7, 2, 2\n") == 2
+    # each DOF held alone in a step, or held at a nonzero value: no DOF can go (warned)
+    for steps in ((static.format("*Boundary\n7, 2, 2\n*Cload\n5, 1, 1.\n"),
+                   static.format("*Boundary, op=NEW\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n6, 2, 2\n"
+                                 "*Cload\n5, 1, 1.\n")),
+                  (freq.format("*Boundary\n7, 2, 2, 0.1\n6, 2, 2, 0.1\n"), static.format(load))):
+        body, _, rep = conv(*steps)
+        assert "no BC on node" not in body and "node 7 DOF 2 is on the dependent side" in rep
 
 
 BUCKLE_CUBE = (HEX + "*Nset, nset=ALL, generate\n1, 8, 1\n*Elset, elset=ROT\n1\n*Material, name=M\n"
