@@ -19418,9 +19418,8 @@ class Converter:
             self._warn_finite_rigid("a kinematic coupling has a line without linear equations "
                                     "(a *TRANSFORM, or rotations only)")
         self._plan_velocity_bcs(blocks)       # after _plan_coupled_bcs: reads its card rewrites
-        if self._explicit_deck and any(
-                any(m in self._plane_only for m in members)
-                for _, members, _ in self._rigid_members(blocks)):
+        if self._explicit_deck and any(n in self._plane_only for c in self._rigid_constraints(blocks)
+                                       for n in c["elim"]):
             self.report.warn("Rigid constraint (*RIGID BODY, kinematic coupling or *MPC BEAM) on "
                              "nodes of plane / axisymmetric elements in a deck with an explicit "
                              "dynamic step: ccx's explicit solver stops on it ('linear and nonlinear "
@@ -20474,8 +20473,11 @@ class Converter:
                     return None
                 n = body_of[n]["ref"]
             return None
-        busy = {(m, d) for _, members, dofs in self._rigid_members(blocks)
-                for m in members for d in dofs}
+        # the translations ccx eliminates on rigid-constraint members (as written: a 2-D
+        # kinematic coupling has no DOF 3, a ROT NODE is no member; along an ORIENTATION ccx's
+        # own pick, _ccx_coupled_translations)
+        busy = {(m, d) for c in self._rigid_constraints(blocks) for m, ds in c["elim"].items()
+                for d in ds}
         # (a transformed node's local DOFs all mix the global ones ccx eliminates)
         busy |= {(m, j) for m, d in list(busy) if d <= 3 and m in self._transformed
                  for j in (1, 2, 3)}
@@ -21222,27 +21224,6 @@ class Converter:
             out.append((self._resolve_nodes(g[0]), dofs, mag))
         return out
 
-    def _rigid_members(self, blocks: List[Block]):
-        """(reference node, members, coupled translations) of every rigid constraint ccx
-        builds from RIGID MPCs: *RIGID BODY, kinematic couplings and the rigid bodies of
-        *MPC BEAM lines.  ccx eliminates the members' coupled translations (only those the
-        converted deck writes: _coupling_groups; along an ORIENTATION's axes as its own
-        coupling does, _ccx_coupled_translations)."""
-        for i, b in enumerate(blocks):
-            ref = self._ref_node(b)
-            if ref is None:
-                continue
-            if b.keyword == "RIGID BODY":
-                tie, pin = self._rigid_body_members(b)
-                yield ref, [n for n in tie + pin if n != ref], {1, 2, 3}
-                continue
-            frame = self._coupling_frame(b) if b.keyword in ("COUPLING", "KINEMATIC COUPLING") else None
-            for nodes, dofs in (self._coupling_groups(blocks, i, live=True) or (ref, []))[1]:
-                yield ref, nodes, self._ccx_coupled_translations(frame, dofs)
-        for bodies in self._mpc_bodies.values():
-            for body in bodies:
-                yield body["ref"], body["members"], {1, 2, 3}
-
     # -- *BOUNDARY on rigid-coupling members ------------------------------------
     def _plan_coupled_bcs(self, blocks: List[Block]) -> None:
         """ccx makes the coupled DOFs of a rigid coupling's members (and the rotations the
@@ -21370,7 +21351,9 @@ class Converter:
         translations along an ORIENTATION's axes: 'trans' the global ones it holds or touches
         (_coupled_span), 'across' per member those it only touches — never imposed by the
         reference node's BCs — with 'stops' those of them ccx eliminates (its own coupling,
-        _ccx_coupled_translations)."""
+        _ccx_coupled_translations).  'elim': per member the global translations ccx
+        eliminates (an equation's dependent term must avoid them): 'trans', but along an
+        ORIENTATION those of _ccx_coupled_translations."""
         out: List[dict] = []
 
         def body_emit(ref: int, rot: Optional[int], members) -> str:
@@ -21421,16 +21404,21 @@ class Converter:
                     rot not in self._transformed
                 trans: Dict[int, set] = {}
                 rots: Dict[int, set] = {}
+                elim: Dict[int, set] = {}
                 along: Dict[int, set] = {}        # member -> local translations of an ORIENTATION
                 for ns, ds in lines:
                     oriented = frame is not None and not rb and not self._kin_all_translations(ns, ds)
+                    written = {d for d in ds if d <= top}
                     for n in ns:
                         if n not in members:
                             continue
                         if oriented:
                             along.setdefault(n, set()).update(ds & {1, 2, 3})
                         trans.setdefault(n, set()).update({1, 2, 3} if rb else set() if oriented
-                                                          else {d for d in ds if d <= top})
+                                                          else written)
+                        elim.setdefault(n, set()).update(
+                            {1, 2, 3} if rb else self._ccx_coupled_translations(frame, written)
+                            if oriented else written)
                         if tie_ok and n in self._knots and n in self._rot_nodes and \
                                 n not in self._transformed:
                             rots.setdefault(n, set()).update(ds & {4, 5, 6})
@@ -21446,7 +21434,7 @@ class Converter:
                 if frame is not None:     # some rotations about an ORIENTATION's axes: no tie
                     rots = {n: ds for n, ds in rots.items() if len(ds) in (0, 3)}   # per DOF
                 out.append(dict(kind=kind, emit=emit, ref=ref, rot=rot, planar=planar,
-                                trans=trans, rots=rots, across=across, stops=stops))
+                                trans=trans, rots=rots, across=across, stops=stops, elim=elim))
         # the rigid bodies of *MPC BEAM lines, emitted as *RIGID BODY with a ROT NODE: the
         # dependent nodes follow the independent one in displacement and rotation
         for bodies in self._mpc_bodies.values():
@@ -21460,6 +21448,7 @@ class Converter:
                                 ref=ref, rot=None,
                                 planar=all(n in self._plane_only for n in members),
                                 trans={n: {1, 2, 3} for n in members},
+                                elim={n: {1, 2, 3} for n in members},
                                 rots={n: {4, 5, 6} for n in members
                                       if tie_ok and n in self._knots and n in self._rot_nodes
                                       and n not in self._transformed}))
