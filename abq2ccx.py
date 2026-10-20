@@ -5440,11 +5440,12 @@ class EmitState:
         self.nodal_reset: set = set()               # cards with OP=NEW in the current step
         self.nodal_emitted: Dict[Tuple[int, int], Tuple[str, Optional[tuple]]] = {}  # in ccx
         self.cload_new = False                      # the deck's *CLOAD, OP=NEW in this step
-        # *DLOAD lines emitted per source card ("DLOAD" / "DSLOAD"): key -> (line, card
-        # parameters, what it loads: _dl_faces, the line in a later step: _load_later), so a
-        # ccx *DLOAD, OP=NEW does not remove the other card's loads, nor a later line on the
-        # same element faces replace them (_flush_dloads)
-        self.dl_state: Dict[str, "OrderedDict[tuple, Tuple[str, tuple, tuple, Optional[tuple]]]"] = {}
+        # *DLOAD lines emitted per source card ("DLOAD" / "DSLOAD"): key -> [(line, card
+        # parameters, what it loads: _dl_faces, the line in a later step: _load_later)], every
+        # line of the step that gave the key (Abaqus adds them up), so a ccx *DLOAD, OP=NEW
+        # does not remove the other card's loads, nor a later line on the same element faces
+        # replace them (_flush_dloads)
+        self.dl_state: Dict[str, "OrderedDict[tuple, List[Tuple[str, tuple, tuple, Optional[tuple]]]]"] = {}
         self.dl_fresh: set = set()                  # (card, key) given in the current step
         self.dl_wiped = False                       # a ccx *DLOAD, OP=NEW in the current step
         self.dl_taken: Dict[tuple, tuple] = {}      # face -> the amplitude of the step's lines on it
@@ -5508,7 +5509,8 @@ class EmitState:
             start = (self.nodal_loads, self.dl_state, self.cl_state) if held else \
                 (self.load_base[0], self.load_base[2], self.load_base[3])
             self.nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in start[0].items())
-            self.dl_state = {o: OrderedDict(st) for o, st in start[1].items()}
+            self.dl_state = {o: OrderedDict((k, list(v)) for k, v in st.items())
+                             for o, st in start[1].items()}
             self.cl_state = OrderedDict((k, list(v)) for k, v in start[2].items())
             if restore:                             # (a static one after perturbation steps)
                 self.nodal_emitted = dict(self.load_base[1])
@@ -5525,7 +5527,7 @@ class EmitState:
         elif restore:                               # (copies, as above: the base stays)
             loads, emitted, dl, cl = self.load_base
             self.nodal_loads = OrderedDict((k, (dict(f), a)) for k, (f, a) in loads.items())
-            self.dl_state = {o: OrderedDict(st) for o, st in dl.items()}
+            self.dl_state = {o: OrderedDict((k, list(v)) for k, v in st.items()) for o, st in dl.items()}
             self.cl_state = OrderedDict((k, list(v)) for k, v in cl.items())
             self.nodal_emitted = dict(emitted)
 
@@ -13212,9 +13214,9 @@ class Converter:
         given again in Abaqus, the traction replaces that load, which ccx keeps until a line
         zeroes it."""
         out = []
-        for key, (line, _, _, _) in self.emit.dl_state.get(origin, {}).items():
+        for key, entries in self.emit.dl_state.get(origin, {}).items():
             if key[:2] == (tag, name) and (origin, key) not in self.emit.dl_fresh:
-                out.append((key, ", ".join(x.strip() for x in line.split(",")[:2]) + ", 0.", "0."))
+                out.append((key, ", ".join(x.strip() for x in entries[0][0].split(",")[:2]) + ", 0.", "0."))
         return out
 
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
@@ -13729,9 +13731,15 @@ class Converter:
                              f"global components (exact). A knot holds the beam section rigid at "
                              f"the node, as beam theory does.", once=True)
         acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks)
+        glob = {n for n, m in self._rot_mode.items() if m == "global"}
+        sources: Dict[int, Dict[int, List[Tuple[str, int, float]]]] = {}    # card -> node -> moments
+        for b, _, _ in cards:
+            if b.keyword == "CLOAD":
+                for n, src, d, v in self._rot_moments(b, glob):
+                    sources.setdefault(id(b), {}).setdefault(n, []).append((src, d, v))
         for n, mode in self._rot_mode.items():
             if mode == "global":
-                self._rot_global_lines(n, self._local_axes(n), cards, acts)
+                self._rot_global_lines(n, self._local_axes(n), cards, acts, sources)
             elif mode == "refuse":
                 for b, _, items in cards:
                     if n in items:
@@ -13818,19 +13826,9 @@ class Converter:
                     out.setdefault(n, []).extend(its)
             return out
 
-        def num(x: str) -> float:
-            try:
-                return pf(x) if x else 0.0
-            except ValueError:
-                return float("nan")
         if b.keyword == "CLOAD":
-            for ln in b.data:
-                f = [x.strip() for x in ln.split(",")]
-                d = dof_number(f[1]) if len(f) >= 2 else None
-                if d is not None and 4 <= d <= 6:
-                    for n in self._resolve_nodes(f[0]):
-                        if n in nodes:
-                            out.setdefault(n, []).append((d, num(f[2] if len(f) > 2 else "")))
+            for n, _, d, v in self._rot_moments(b, nodes):
+                out.setdefault(n, []).append((d, v))
             return out
         recs = self._bc_card_records(b)
         if self._piece_src.get(id(b)) not in self._amp_cards and id(b) not in self._vel_mids:
@@ -13843,7 +13841,7 @@ class Converter:
                 continue
             if re.fullmatch(r"[-+]?\d+", g[1]):
                 rng = bc_dof_range(g)
-                ranges, value = [rng] if rng else [], num(g[3] if len(g) > 3 else "")
+                ranges, value = [rng] if rng else [], self._rot_value(g[3] if len(g) > 3 else "")
             else:
                 ranges, value = self._named_bc_dofs(g[1], self._named_bc_rot(g[0])) or [], 0.0
             for n in self._resolve_nodes(g[0]):
@@ -13851,6 +13849,28 @@ class Converter:
                     out.setdefault(n, []).extend((d, value) for lo, hi in ranges
                                                  for d in range(max(lo, 4), min(hi, 6) + 1))
         return {n: v for n, v in out.items() if v}
+
+    def _rot_moments(self, b: Block, nodes: set) -> List[Tuple[int, str, int, float]]:
+        """(node, source, DOF, value) of the moments the *CLOAD ``b`` gives the nodes of
+        ``nodes`` on DOFs 4-6 (_rot_items), the source as Abaqus tells loads apart
+        (_load_source)."""
+        out = []
+        for ln in b.data:
+            f = [x.strip() for x in ln.split(",")]
+            d = dof_number(f[1]) if len(f) >= 2 else None
+            if d is not None and 4 <= d <= 6:
+                src, v = self._load_source(f[0]), self._rot_value(f[2] if len(f) > 2 else "")
+                out += [(n, src, d, v) for n in self._resolve_nodes(f[0]) if n in nodes]
+        return out
+
+    @staticmethod
+    def _rot_value(x: str) -> float:
+        """A rotational BC's or moment's value field: blank is zero, one that does not read as a
+        number NaN (_rot_items)."""
+        try:
+            return pf(x) if x else 0.0
+        except ValueError:
+            return float("nan")
 
     @staticmethod
     def _zero_hold(b: Block, items: List[Tuple[int, float]]) -> bool:
@@ -13867,12 +13887,13 @@ class Converter:
 
     def _rot_global_lines(self, n: int, axes: Tuple[Vec, Vec, Vec],
                           cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]],
-                          acts: set) -> None:
+                          acts: set, sources: Dict[int, Dict[int, List[Tuple[str, int, float]]]]) -> None:
         """_rot_lines for node ``n``, whose rotational BCs and moments ccx applies about the
         global axes: each card's are rewritten in global components where the step semantics
         let them (Abaqus: a BC or load given in a later step replaces that DOF's, OP=NEW
         removes the earlier steps' - on the cards in ``acts`` (op_new_cards); ccx:
-        likewise per global DOF, loads given within a step add up).
+        likewise per global DOF, loads given within a step add up).  ``sources``: per *CLOAD
+        card and node, its moments as (source, DOF, value) (_rot_moments).
 
         * BCs: the state after each card (the local rotations held, their values) as its
           global values — all three local rotations, or a set whose axes span global ones (a
@@ -13880,12 +13901,14 @@ class Converter:
           they are; values from an earlier step with an amplitude, or with another amplitude
           than the card's, have no such form;
         * moments: each line as its three global components; the first card of a step that
-          loads some of the node's local rotations also gives the components of the ones an
-          earlier step loaded and this one leaves (they carry on in Abaqus, while ccx replaces
-          the global DOFs), if they have no amplitude; a step whose cards have different
-          amplitudes has no such form.  A linear perturbation step's moments are its own (ccx
-          removes the earlier *CLOADs there, or ignores loads), unless it is a *MODAL DYNAMIC
-          step that keeps the earlier ones on (_modal_held).
+          loads some of the node's local rotations also gives the components of the moments of
+          earlier steps whose source (node or node set as written, and DOF: _load_source) this
+          one does not give again (they carry on in Abaqus, also on a rotation the step loads
+          from another source, while ccx replaces the global DOFs), if they have no amplitude;
+          a step whose cards have different amplitudes has no such form.  A linear
+          perturbation step's moments are its own (ccx removes the earlier *CLOADs there, or
+          ignores loads), unless it is a *MODAL DYNAMIC step that keeps the earlier ones on
+          (_modal_held).
 
         After a linear perturbation step (``self._pert_idx``) both start again from the last
         general step's state, which _restore_base_states gives ccx again (as bc_steps)."""
@@ -13913,12 +13936,13 @@ class Converter:
             for d, v in items[n]:
                 state[d] = (v, amp, s)
             self._rot_lines[(id(b), n)] = self._rot_bc_global(n, axes, state, amp, s)
-        state = {}
-        base, cur = state, 0
-        groups: Dict[int, List[Tuple[Block, List[Tuple[int, float]]]]] = {}
+        # (value, amplitude, step) per moment source and local DOF (_load_source)
+        moments: Dict[Tuple[str, int], Tuple[float, Optional[str], int]] = {}
+        base, cur = moments, 0
+        groups: Dict[int, List[Tuple[Block, List[Tuple[str, int, float]]]]] = {}
         for b, s, items in cards:
             if b.keyword == "CLOAD" and n in items:
-                groups.setdefault(s, []).append((b, items[n]))
+                groups.setdefault(s, []).append((b, sources[id(b)][n]))
         verdict: Dict[int, Optional[str]] = {}
 
         def comps(d: int, v: float) -> List[str]:
@@ -13927,37 +13951,41 @@ class Converter:
             if b.keyword != "CLOAD":
                 continue
             if s != cur:
-                state, base, cur = (dict(base), base, s) if cur in pert else (state, dict(state), s)
+                moments, base, cur = (dict(base), base, s) if cur in pert else (moments, dict(moments), s)
             if id(b) in acts:
-                state = {}
+                moments = {}
             if n not in items:
                 continue
             amp = b.uparam("AMPLITUDE") or None
             lines: List[str] = []
             if s not in verdict:
                 group = groups[s]
-                respec = {d for _, its in group for d, _ in its}
+                respec = {(t, d) for _, its in group for t, d, _ in its}
                 own = s in pert and s not in self._modal_held
                 carried = {} if own else \
-                    {j: e for j, e in state.items() if j not in respec and e[0] != 0.0}
+                    {k: e for k, e in moments.items() if k not in respec and e[0] != 0.0}
                 why = None
                 if len({c.uparam("AMPLITUDE") for c, _ in group}) > 1:
                     why = ("this step loads the rotations with different amplitudes, which share "
                            "the global DOFs in ccx")
                 elif any(e[1] is not None or amp is not None for e in carried.values()):
-                    why = ("an earlier step's moment on another rotation of the node carries on in "
-                           "Abaqus with an amplitude, which the global components would restart")
-                elif any(math.isnan(v) for _, its in group for _, v in its):
+                    why = ("an earlier step's moment on the node carries on in Abaqus (on another "
+                           "rotation, or from another node set or number) with an amplitude, which "
+                           "the global components would restart")
+                elif any(math.isnan(v) for _, its in group for _, _, v in its):
                     why = "a value does not read as a number (a *PARAMETER?)"
                 verdict[s] = why
                 if why is None:
-                    for j, (v, _, _) in carried.items():
+                    tot: Dict[int, float] = {}      # (the sources' sum per local rotation)
+                    for (_, j), (v, _, _) in carried.items():
+                        tot[j] = tot.get(j, 0.0) + v
+                    for j, v in tot.items():
                         lines += comps(j, v)
-                for d in respec:
-                    state.pop(d, None)
-            for d, v in items[n]:
-                prev = state.get(d)
-                state[d] = ((prev[0] if prev else 0.0) + v, amp, s)
+                for k in respec:
+                    moments.pop(k, None)
+            for t, d, v in sources[id(b)][n]:
+                prev = moments.get((t, d))
+                moments[(t, d)] = ((prev[0] if prev else 0.0) + v, amp, s)
                 lines += comps(d, v)
             self._rot_lines[(id(b), n)] = verdict[s] or lines
 
@@ -14351,6 +14379,13 @@ class Converter:
                                   f"subroutine to ccx's {sub} and restore the card.")
 
     @staticmethod
+    def _load_source(token: str) -> str:
+        """A concentrated load's source as Abaqus tells loads apart: the node number or node set
+        name as written ("specified in exactly the same way", Abaqus 2017, loads), node numbers
+        as numbers and names in any case."""
+        return str(int(token)) if re.fullmatch(r"[-+]?\d+", token) else token.upper()
+
+    @staticmethod
     def _load_amp(params: "OrderedDict[str, Optional[str]]") -> tuple:
         """What ccx 2.23 compares where one step loads a face or node DOF twice (loadadd,
         forcadd): the amplitude of the ccx card (``params``) — with TIME DELAY a copy of its
@@ -14387,10 +14422,13 @@ class Converter:
     def _track_dloads(self, origin: str, b: Block, lines: List[Tuple[tuple, str, str]],
                       params: "OrderedDict[str, Optional[str]]") -> set:
         """Record the *DLOAD lines emitted for a *DLOAD / *DSLOAD card (``origin``; ``params``:
-        the ccx card's), in Abaqus semantics: a zero magnitude removes the load.  Returns the
-        lines left out: those on element faces that an earlier card of the step loads on
-        another amplitude, which ccx 2.23 stops on ('*ERROR in loadadd'; probed, also for two
-        cards with the same AMPLITUDE and TIME DELAY: _merge_delay_cards), Abaqus adds."""
+        the ccx card's), in Abaqus semantics: a step's first line on a key replaces its loads
+        of earlier steps, its next ones add to it ("multiple definitions of the same load
+        condition in the same step are applied additively", Abaqus 2017, loads), a zero
+        magnitude adds nothing.  Returns the lines left out: those on element faces that an
+        earlier card of the step loads on another amplitude, which ccx 2.23 stops on ('*ERROR
+        in loadadd'; probed, also for two cards with the same AMPLITUDE and TIME DELAY:
+        _merge_delay_cards), Abaqus adds."""
         state = self.emit.dl_state.setdefault(origin, OrderedDict())
         kept = tuple((k, v) for k, v in params.items() if k != "OP")
         case = ((params.get("LOAD CASE") or "1").strip(), (params.get("SECTOR") or "").strip())
@@ -14399,10 +14437,11 @@ class Converter:
         for key, line, mag in lines:
             what = (key[-2], key[-1], case)          # (element or set, label, load case)
             faces = self._dl_faces(what)
-            self.emit.dl_fresh.add((origin, key))
+            if (origin, key) not in self.emit.dl_fresh:
+                self.emit.dl_fresh.add((origin, key))
+                state.pop(key, None)
             if any(self.emit.dl_taken.get(f, amp) != amp for f in faces):
                 drop.add(line)
-                state.pop(key, None)
                 continue
             for f in faces:
                 self.emit.dl_taken[f] = amp
@@ -14410,10 +14449,8 @@ class Converter:
                 zero = bool(mag) and pf(mag) == 0.0
             except ValueError:
                 zero = False
-            if zero:
-                state.pop(key, None)
-            else:
-                state[key] = (line, kept, what, self._load_later(line, kept, amp))
+            if not zero:
+                state.setdefault(key, []).append((line, kept, what, self._load_later(line, kept, amp)))
         return drop
 
     def _dload_clash(self, lines: List[str]) -> List[str]:
@@ -14556,15 +14593,16 @@ class Converter:
         (_restore_base_states)."""
         if not self.emit.dl_wiped and (not self.emit.dl_taken or self._sp_adds):
             return []
-        left = [((o, k), self._dl_faces(what), later) for o, st in self.emit.dl_state.items()
-                for k, (_, _, what, later) in st.items() if (o, k) not in self.emit.dl_fresh]
+        left = [((o, k, i), self._dl_faces(what), later) for o, st in self.emit.dl_state.items()
+                for k, entries in st.items() if (o, k) not in self.emit.dl_fresh
+                for i, (_, _, what, later) in enumerate(entries)]
         again, lost = self._loads_again(left, self.emit.dl_taken, self.emit.dl_wiped)
         if lost:
-            self._lost_loads("faces", [(self.emit.dl_state[o][k][0], self.emit.dl_state[o][k][3])
-                                               for o, k in lost], self.emit.dl_wiped)
+            self._lost_loads("faces", [(self.emit.dl_state[o][k][i][0], self.emit.dl_state[o][k][i][3])
+                                       for o, k, i in lost], self.emit.dl_wiped)
         groups: "OrderedDict[tuple, List[str]]" = OrderedDict()
-        for o, k in again:
-            line, params, _ = self.emit.dl_state[o][k][3]
+        for o, k, i in again:
+            line, params, _ = self.emit.dl_state[o][k][i][3]
             groups.setdefault(params, []).append(line)
         out: List[str] = []
         if groups and self.emit.dl_wiped:
@@ -14584,7 +14622,8 @@ class Converter:
         for params, data in groups.items():
             out.append(emit_keyword("DLOAD", OrderedDict(params)))
             out.extend(self._surfaces_last(data))
-        self._held_again(self.emit.dl_state[o][k][1] != self.emit.dl_state[o][k][3][1] for o, k in again)
+        self._held_again(self.emit.dl_state[o][k][i][1] != self.emit.dl_state[o][k][i][3][1]
+                         for o, k, i in again)
         return out
 
     def _held_again(self, flags: Iterator[bool]) -> None:
@@ -14613,8 +14652,7 @@ class Converter:
         for j, (at, f) in enumerate(marks):
             if len(f) < 2 or not f[0] or not re.fullmatch(r"[-+]?\d+", f[1]):
                 continue
-            token = str(int(f[0])) if re.fullmatch(r"[-+]?\d+", f[0]) else f[0].upper()
-            key = (token, int(f[1]), case)
+            key = (self._load_source(f[0]), int(f[1]), case)
             if key not in self.emit.cl_fresh:          # (a later step's line replaces them)
                 self.emit.cl_fresh.add(key)
                 self.emit.cl_state.pop(key, None)

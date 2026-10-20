@@ -7318,6 +7318,38 @@ def test_face_loads_of_other_sources_add_up_across_steps():
     assert "*STATIC\n*DLOAD\n3, P4, 2.\n" + REGIVEN + "*DLOAD\n3, P4, 1.\n" in _step(body, 3)
 
 
+def test_lines_of_one_face_load_in_a_step_are_given_again_together():
+    # Abaqus adds up the lines of one load in one step ("multiple definitions of the same load
+    # condition in the same step are applied additively", Abaqus 2017, loads; a zero line adds
+    # nothing), and a later step's line of it replaces them all.  Given again on faces a later
+    # step loads from another source, every line comes back (before: the last one alone, and
+    # none after a zero line)
+    two = BAR3 + TIPS + "*Amplitude, name=R\n0., 0., 1., 2.\n*Step\n*Static\n{}*End Step\n" \
+        "*Step\n*Static\n{}*End Step\n"
+    body, conv, _ = convert_str(two.format("*Dsload\nTIPA, P, 1.\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 1.\n"))
+    assert "*DLOAD\n3, P4, 1.\n" + REGIVEN + "*DLOAD\n3, P4, 1.\n3, P4, 1.\n*" in _step(body, 2)
+    assert not conv.reduced_physics
+    body, _, _ = convert_str(two.format("*Dload\n3, P4, 1.\n*Dload\n3, P4, 2.\n", "*Dsload\nTIPA, P, 1.\n"))
+    assert REGIVEN + "*DLOAD\n3, P4, 1.\n3, P4, 2.\n*" in _step(body, 2)
+    body, _, _ = convert_str(two.format("*Dsload\nTIPA, P, 1.\n*Dsload\nTIPA, P, 0.\n", "*Dsload\nTIPB, P, 2.\n"))
+    assert REGIVEN + "*DLOAD\n3, P4, 1.\n*" in _step(body, 2)
+    body, _, _ = convert_str(two.format("*Dsload\nTIPA, P, 1.\nTIPA, P, 1.\n", "*Dsload\nTIPA, P, 4.\n"
+                                                                            "TIPB, P, 2.\n"))
+    assert "*DLOAD\n3, P4, 4.\n3, P4, 2.\n*" in _step(body, 2) and REGIVEN not in body
+    # on a step-time amplitude each at its end value (R(1) = 2), plain
+    body, _, _ = convert_str(two.format("*Dload, amplitude=R\n3, P4, 1.\n3, P4, 1.\n", "*Dsload\nTIPA, P, 1.\n"))
+    assert REGIVEN + "*DLOAD\n3, P4, 2.\n3, P4, 2.\n*" in _step(body, 2)
+    # a line left out (another amplitude on the faces) leaves the step's other line in force
+    body, conv, _ = convert_str(two.format("*Dsload\nTIPA, P, 1.\n*Dsload, amplitude=A\nTIPA, P, 2.\n",
+                                           "*Dsload\nTIPB, P, 2.\n"))
+    assert "** 3, P4, 2.\n" in _step(body, 1) and REGIVEN + "*DLOAD\n3, P4, 1.\n*" in _step(body, 2)
+    # the base state after a perturbation step keeps both
+    body, _, _ = convert_str(two.replace("*Step\n*Static\n{}*End Step\n", "*Step\n*Static\n{}*End Step\n"
+                                         "*Step\n*Frequency\n3\n*End Step\n", 1)
+                             .format("*Dsload\nTIPA, P, 1.\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 1.\n"))
+    assert "*STATIC\n*DLOAD\n3, P4, 1.\n" + REGIVEN + "*DLOAD\n3, P4, 1.\n3, P4, 1.\n*" in _step(body, 3)
+
+
 def test_concentrated_loads_of_other_sources_add_up_across_steps():
     # Abaqus tells concentrated loads apart by the node or node set as written and the DOF: a
     # node loaded through a set in one step and by its number (or through another set) in a
@@ -11184,10 +11216,28 @@ def test_transformed_moments_carry_on_over_steps_on_a_knot():
     body, _, rep = convert_str(_tip("*Cload\n3, 4, 1.\n3, 5, 1.\n*End Step\n*Step\n*Static\n"
                                     "*Cload, amplitude=A\n3, 6, 2.\n").replace(
                                         "*Boundary\n1, 1, 6", "*Amplitude, name=A\n0., 0., 1., 1.\n*Boundary\n1, 1, 6"))
-    assert "an earlier step's moment on another rotation of the node carries on" in rep.text()
+    assert "an earlier step's moment on the node carries on in Abaqus" in rep.text()
     # OP=NEW removes the earlier moments in both
     body, _, _ = convert_str(_tip("*Cload\n3, 4, 1.\n*End Step\n*Step\n*Static\n*Cload, op=NEW\n3, 6, 2.\n"))
     assert _close(_cloads(body)[1], {(3, 4 + k): 2. * e[2][k] for k in range(3)}, 1e-10)
+    # Abaqus tells moments apart by the node or node set as written: one through node set TIP,
+    # then one by the node's number on the same rotation add up (before: the later replaced
+    # it); the same source again replaces it; the node's zero removes its own moment only
+    two = "*Cload\nTIP, 4, 1.\n3, 5, 1.\n*End Step\n*Step\n*Static\n*Cload\n3, 4, 2.\n"
+    body, _, rep = convert_str(_tip(two))
+    assert _close(_cloads(body)[1], {(3, 4 + k): 3. * e[0][k] + e[1][k] for k in range(3)}, 1e-10)
+    assert rep.n_warnings == 0
+    body, _, _ = convert_str(_tip(two.replace("3, 4, 2.", "tip, 4, 2.")))
+    assert _close(_cloads(body)[1], {(3, 4 + k): 2. * e[0][k] + e[1][k] for k in range(3)}, 1e-10)
+    body, _, _ = convert_str(_tip(two + "*End Step\n*Step\n*Static\n*Cload\n3, 4, 0.\n"))
+    assert _close(_cloads(body)[2], {(3, 4 + k): e[0][k] + e[1][k] for k in range(3)}, 1e-10)
+    # two sources' moments on one rotation carried on as their sum
+    body, _, _ = convert_str(_tip("*Cload\nTIP, 4, 1.\n3, 4, 2.\n*End Step\n*Step\n*Static\n*Cload\n3, 6, 1.\n"))
+    assert _close(_cloads(body)[1], {(3, 4 + k): 3. * e[0][k] + e[2][k] for k in range(3)}, 1e-10)
+    # with an amplitude on the step the other source's moment would restart: commented out
+    body, _, rep = convert_str(_tip(two.replace("*Cload\n3, 4, 2.", "*Cload, amplitude=A\n3, 4, 2.")).replace(
+        "*Boundary\n1, 1, 6", "*Amplitude, name=A\n0., 0., 1., 1.\n*Boundary\n1, 1, 6"))
+    assert "from another node set or number) with an amplitude" in rep.text()
 
 
 def test_transformed_rotations_around_a_perturbation_step():

@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Loads given again in a later step: every line** — a `*DLOAD` / `*DSLOAD` given again where a
+  later step loads its faces from another source came back as one line where one step gave it
+  two (Abaqus adds them: 1 + 1, then 1 from another surface: ccx 2, Abaqus 3), and not at all
+  after a zero line or a line left out for its amplitude. Every line now comes back. Moments
+  on a knot node with a `*TRANSFORM` (written in global components): one by node number in a
+  later step replaced one through a node set on the same rotation, where Abaqus adds them; the
+  earlier one is now given again.
 * **TIME DELAY kept on loads converted to nodal forces** — the `*CLOAD` written for a
   traction, beam line load or surface-element pressure carried its amplitude without the
   delay, so ccx applied the amplitude undelayed. ccx 2.23's `*CLOAD` takes TIME DELAY

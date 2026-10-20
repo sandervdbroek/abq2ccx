@@ -5367,10 +5367,12 @@ def main():
     # end value in later steps: given again at that value, plain (also after a ccx *DLOAD,
     # OP=NEW, which the other card's loads come back after); two cards of one step with the
     # same AMPLITUDE and TIME DELAY become one (ccx stops on two copies of one amplitude).
-    # The bar above (nu = 0): an axial force F on each tip node gives tip ux = 12 F / E, a tip
-    # pressure p -3 p / E.  Converted before: 2.4e-2, 1.2e-2, 2.4e-2 for 3.6e-2 (the later
-    # line alone), and ccx stopped on two amplitudes on one face ('*ERROR in loadadd') in the
-    # last two.
+    # Two lines of one source in one step add up, and are given again so (a zero line adds
+    # nothing).  The bar above (nu = 0): an axial force F on each tip node gives tip ux =
+    # 12 F / E, a tip pressure p -3 p / E.  Converted before: 2.4e-2, 1.2e-2, 2.4e-2 for
+    # 3.6e-2 (the later line alone), and ccx stopped on two amplitudes on one face ('*ERROR in
+    # loadadd') in the next two; -6e-3, -6e-3, -9e-3, -6e-3 for -9e-3, -9e-3, -1.5e-2, -9e-3
+    # in the last four (one line of the source given again, none after its zero line).
     tips ="*Nset, nset=TIPF\n13, 14, 15, 16\n*Nset, nset=TIPG\n13, 14, 15, 16\n*Surface, name=TIPA\n" \
            "3, S4\n*Surface, name=TIPB\n3, S4\n*Amplitude, name=R\n0., 0., 1., 2.\n"
     tip_f = lambda f: 12.0 * f / 1000.0
@@ -5391,7 +5393,17 @@ def main():
             ("one step's cards with the same amplitude and time delay", step.format("", "".join(
                 delayed.format(*c) for c in (("Dload", "3, P4, 1."), ("Dsload", "TIPA, P, 2."),
                                              ("Cload", "TIPF, 1, 1."), ("Cload", "TIPG, 1, 1.")))),
-             [tip_p(3.0) + tip_f(2.0)])):
+             [tip_p(3.0) + tip_f(2.0)]),
+            ("two lines of one surface, then another surface", step.format("", "*Dsload\nTIPA, P, 1.\n"
+             "TIPA, P, 1.\n") + step.format("", "*Dsload\nTIPB, P, 1.\n"), [tip_p(2.0), tip_p(3.0)]),
+            ("two cards of one surface, the second zero, then another surface", step.format(
+                "", "*Dsload\nTIPA, P, 1.\n*Dsload\nTIPA, P, 0.\n") + step.format("", "*Dsload\nTIPB, P, 2.\n"),
+             [tip_p(1.0), tip_p(3.0)]),
+            ("two step-time lines of one face, then a surface", step.format("", "*Dload, amplitude=R\n"
+             "3, P4, 1.\n3, P4, 1.\n") + step.format("", "*Dsload\nTIPA, P, 1.\n"), [tip_p(4.0), tip_p(5.0)]),
+            ("two lines of one surface, a frequency step, then another surface", step.format(
+                "", "*Dsload\nTIPA, P, 1.\nTIPA, P, 1.\n") + "*Step\n*Frequency\n2\n*End Step\n" +
+             step.format("", "*Dsload\nTIPB, P, 1.\n"), [tip_p(2.0), None, None, tip_p(3.0)])):
         src = os.path.join(tmp, "load_overlap_src.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(bar + tips + deck)
@@ -8595,6 +8607,22 @@ def main():
               f"frame's joint, a *TRANSFORM line '0.6, 0.8, , -0.8, 0.6, 0.5'): every displacement as "
               f"with the moments in global components and no *TRANSFORM ({err:.1e} apart, free nodes "
               f"moved {moved:.3g})")
+    failures += 0 if ok else 1
+    # moments of two sources on one local rotation (node set TIP, then node 9 itself): Abaqus
+    # adds them; ccx replaced the global DOFs with the later step's (before: local 1 at 0.02
+    # in the last step, its displacements 7.3e-2 off, free nodes moved 0.27)
+    text = pert_frame_deck("moment", False).replace("*CLOAD\n9, 4, 0.01\n", "*CLOAD\nTIP, 4, 0.01\n", 1)
+    runs = [review_run(t, "transform_sources" + tag, dat_node_blocks) for t, tag in (
+        (text.replace("*CLOAD\n9, 4, 0.03\n", "*CLOAD\n9, 4, 0.02\n"), ""),
+        (pert_frame_deck("moment", False, True), "_twin"))]
+    ok = all(runs) and len(runs[0]) == len(runs[1]) == 2 and "TIP, 4" in text
+    if ok:
+        err, moved = same(runs)
+        ok = err < 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  transform_sources (moments about local 1 through node set "
+              f"TIP and local 2 on a B31 frame's joint with a *TRANSFORM, then local 1 by node number): "
+              f"every displacement as with the moments added up in global components and no "
+              f"*TRANSFORM ({err:.1e} apart, free nodes moved {moved:.3g})")
     failures += 0 if ok else 1
     # a zero BC without AMPLITUDE in a *DYNAMIC step after a perturbation step that held the DOF
     # (it counted as at rest, so ccx stepped it), and a JOIN connector off a beam node whose
