@@ -15746,7 +15746,8 @@ class Converter:
         rot_used = self._distributing_rot_used(ref, blocks)
         plan: dict = {"ref": ref, "line": emit_keyword("COUPLING", b.params),
                       "matters": ref in bcs or rot_used or
-                      any(ref in conn for _, conn in self.geom.elements.values())}
+                      any(ref in conn for _, conn in self.geom.elements.values()),
+                      "method": dist.uparam("WEIGHTING METHOD") or "UNIFORM"}
         weights, why = self._distributing_weights(b, dist, ref)
         if not why and (not weights or sum(weights.values()) <= 0.0):
             why = "it couples no node (or weights summing to zero)"
@@ -15992,7 +15993,17 @@ class Converter:
                  f"{len(plan['members'])} coupling nodes)"] + self._twin_lines(rows) + self._equation_lines(rows))
 
     def _warn_distributing_kept(self, plan: dict) -> None:
-        """Warn that a distributing coupling stays ccx's card (_plan_distributing: ``why``)."""
+        """Warn that a distributing coupling stays ccx's card (_plan_distributing: ``why``).
+        ccx 2.23 reads WEIGHTING METHOD= there and ignores it (probed: LINEAR and CUBIC the
+        same as without it), weighting by tributary area (Abaqus' UNIFORM)."""
+        if plan["method"] in ("LINEAR", "QUADRATIC", "CUBIC"):
+            self.report.warn(f"*COUPLING, *DISTRIBUTING (reference node {plan['ref']}) kept as ccx's "
+                             f"card with WEIGHTING METHOD={plan['method']}, which ccx 2.23 ignores "
+                             f"(probed: the same as without it): it weights the coupling nodes by "
+                             f"their tributary areas alone (Abaqus' UNIFORM), so the reference "
+                             f"node's loads spread over the surface with other weights than in "
+                             f"Abaqus.", once=True)
+            self._reduces("*DISTRIBUTING WEIGHTING METHOD ignored by ccx's card")
         self.report.warn(f"*COUPLING, *DISTRIBUTING (reference node {plan['ref']}) kept as ccx's card, as "
                          f"{plan['why']}: ccx only spreads the reference node's loads over the "
                          f"surface and does not move the node with it (a BC there moves nothing, its "

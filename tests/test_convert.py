@@ -9122,6 +9122,16 @@ def test_distributing_coupling_as_equations():
     assert "kept as ccx's card, as the deck runs NLGEOM" in rep.text() and conv.reduced_physics
     body, conv, rep = convert_str(nl, approximate=True)
     assert _equation_terms(body) and "[APPROX] *COUPLING, *DISTRIBUTING in a deck with NLGEOM" in rep.text()
+    # ... where a WEIGHTING METHOD other than UNIFORM is lost: ccx's card ignores it (probed;
+    # validate_with_ccx.py distributing_weighting_nlgeom_card), reduced physics
+    lost = "*DISTRIBUTING WEIGHTING METHOD ignored by ccx's card"
+    for method, warned in (("LINEAR", True), ("QUADRATIC", True), ("CUBIC", True), ("UNIFORM", False)):
+        body, conv, rep = convert_str(nl.replace("*Distributing", f"*Distributing, weighting method={method}"))
+        assert not _equation_terms(body) and (lost in conv.reduced_physics) == warned
+        assert (f"WEIGHTING METHOD={method}, which ccx 2.23 ignores" in rep.text()) == warned
+        body, conv, rep = convert_str(nl.replace("*Distributing", f"*Distributing, weighting method={method}"),
+                                      approximate=True)
+        assert _equation_terms(body) and lost not in conv.reduced_physics
     # the reference node at the centroid and no rotation acted on: exact under NLGEOM too
     body, conv, rep = convert_str(_radius_block((1., 1., 1.), dist.format(s="TOPE", p="", d=""),
                                                 "*Step, nlgeom\n*Static\n*Boundary\n1, 1, 3\n100, 3, 3, 0.01\n*End Step\n"))

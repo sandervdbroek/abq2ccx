@@ -6191,11 +6191,16 @@ def main():
     loads = ["*CLOAD"] + [f"RP, {k + 1}, {f[k]}" for k in range(3)] + [f"RP, {k + 4}, {m[k]}" for k in range(3)]
     far = max(math.dist(xyz[n], DIST_REF) for n in top)
     weights = {n: 1.0 + 0.1 * (n % 3) for n in top}
+    q = {n: math.dist(xyz[n], DIST_REF) / far for n in top}
     for tag, card, w, extra in (
             ("distributing_rp_loads", cpl, area, ()),
             ("distributing_node_surface_weights", [cpl[0].replace("TOP", "TOPW"), "*DISTRIBUTING, WEIGHTING METHOD=LINEAR"],
              {n: weights[n] * (1.0 - math.dist(xyz[n], DIST_REF) / far) for n in top},
-             ["*SURFACE, NAME=TOPW, TYPE=NODE"] + [f"{n}, {weights[n]}" for n in top])):
+             ["*SURFACE, NAME=TOPW, TYPE=NODE"] + [f"{n}, {weights[n]}" for n in top]),
+            ("distributing_weighting_quadratic", [cpl[0], "*DISTRIBUTING, WEIGHTING METHOD=QUADRATIC"],
+             {n: area[n] * (1.0 - q[n] ** 2) for n in top}, ()),
+            ("distributing_weighting_cubic", [cpl[0], "*DISTRIBUTING, WEIGHTING METHOD=CUBIC"],
+             {n: area[n] * (1.0 - 3.0 * q[n] ** 2 + 2.0 * q[n] ** 3) for n in top}, ())):
         motion_w, spread_w = distributing_relations(xyz, w, DIST_REF)
         got, status, out = dist_run(tag, distributing_deck(card, loads, extra))
         ref, _, _ = dist_run(tag + "_ref", distributing_deck((), ["*CLOAD"] + [
@@ -6211,11 +6216,39 @@ def main():
                   max(abs(a - b) for a, b in zip(got[100], ur))) / big
         ok = err < 1e-5
         print(f"{'PASS' if ok else 'FAIL'}  {tag} (a force and a moment on the reference node of a block's top "
-              + ("face" if tag == "distributing_rp_loads" else "nodes as a node surface with weights, WEIGHTING "
-                 "METHOD=LINEAR") + f"): every node {err:.1e} of max |u| ({big:.3g}) from Abaqus' distribution of "
-              f"them as nodal forces, the reference node's displacement included (u3 {got[100][2]:.6g}; ccx's "
-              + ("card: 0" if tag == "distributing_rp_loads" else "card: stopped on the node surface") + ")")
+              + {"distributing_rp_loads": "face", "distributing_node_surface_weights": "nodes as a node surface "
+                 "with weights, WEIGHTING METHOD=LINEAR"}.get(tag, f"face, {card[1][15:]}") + f"): every node "
+              f"{err:.1e} of max |u| ({big:.3g}) from Abaqus' distribution of them as nodal forces, the reference "
+              f"node's displacement included (u3 {got[100][2]:.6g}; ccx's "
+              + {"distributing_rp_loads": "card: 0", "distributing_node_surface_weights": "card: stopped on the "
+                 "node surface"}.get(tag, "card: 0, and it ignores WEIGHTING METHOD") + ")")
         failures += 0 if ok else 1
+    # (b') under NLGEOM the coupling stays ccx's card (its equations would not turn with the
+    # face), which ignores WEIGHTING METHOD: the same displacements as without it, flagged
+    # reduced physics; the reference node's loads moved the face
+    runs = []
+    for card in ("*DISTRIBUTING, WEIGHTING METHOD=CUBIC", "*DISTRIBUTING"):
+        src, inp = os.path.join(tmp, "dist_nl_src.inp"), os.path.join(tmp, "dist_nl.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(distributing_deck([cpl[0], card], loads).replace("*STEP\n", "*STEP, NLGEOM\n"))
+        _, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        runs.append((dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {},
+                     list(conv.reduced_physics)))
+        shutil.rmtree(d, ignore_errors=True)
+    (u, red), (ref, red0) = runs
+    ok = bool(u) and set(u) == set(ref) and all(n in u for n in top)
+    if ok:
+        face = max(abs(x) for n in top for x in ref[n])
+        err = max(abs(a - b) for n in ref for a, b in zip(u[n], ref[n])) / face
+        lost = "*DISTRIBUTING WEIGHTING METHOD ignored by ccx's card"
+        ok = err == 0.0 and face > 1e-4 and lost in red and lost not in red0
+        print(f"{'PASS' if ok else 'FAIL'}  distributing_weighting_nlgeom_card (the block's top face, WEIGHTING "
+              f"METHOD=CUBIC, under NLGEOM: ccx's card kept): {len(u)} nodes {err:.1e} of max |u| ({face:.3g}) "
+              f"from the card without it; the weighting flagged as lost (reduced physics): {lost in red}")
+    else:
+        print("FAIL  distributing_weighting_nlgeom_card: no solution")
+    failures += 0 if ok else 1
     # (c) a B31 cantilever from the reference node (a beam on a solid), its tip loaded: the
     # block takes f and the moment arm x f at the node (the beam is statically determinate), and
     # the tip moves with the face's motion plus the beam's own deflection (its root clamped)

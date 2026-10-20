@@ -6,6 +6,10 @@ physics.
 
 ## Unreleased
 
+* **`WEIGHTING METHOD` on a distributing coupling kept as ccx's card** — ccx 2.23 accepts the
+  parameter but ignores it, weighting by tributary area alone (probed). The equation form
+  applies `LINEAR`, `QUADRATIC` and `CUBIC`. Where the card stays ccx's, as under NLGEOM without
+  `--approximate`, such a weighting is now warned and flagged as reduced physics.
 * **Shell and beam rotations in steps ccx runs nonlinearly** — without NLGEOM, ccx 2.23 still
   runs a step with a plastic, creeping, hyperelastic or user material, a contact pair, or a
   `*DYNAMIC` or coupled procedure through its nonlinear solver. There it turns its shell/beam
