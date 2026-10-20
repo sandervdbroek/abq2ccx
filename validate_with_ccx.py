@@ -4933,6 +4933,37 @@ def ccx_leftovers2_deck(kind):
             "*Node Print, nset=ALLN\nU\n*End Step\n")
 
 
+def restored_chain_deck(chain=True):
+    """An S4 cantilever strip (4 x 1, t 0.1, steel) clamped at x = 0 in the model data, its tip
+    loaded in a static step; ``chain``: after a *FREQUENCY step that holds the tip rotations and
+    a static perturbation step without loads or BCs, which ccx runs as a general step."""
+    nodes = "".join(f"{i + 1 + 5 * j}, {i}., {j}., 0.\n" for j in (0, 1) for i in range(5))
+    els = "".join(f"{e}, {e}, {e + 1}, {e + 6}, {e + 5}\n" for e in range(1, 5))
+    pre = ("*Step\n*Frequency\n3\n*Boundary\nTIP, 4, 6\n*End Step\n"
+           "*Step, perturbation\n*Static\n*End Step\n") if chain else ""
+    return (f"*Node\n{nodes}*Element, type=S4, elset=PLATE\n{els}*Nset, nset=ROOT\n1, 6\n"
+            "*Nset, nset=TIP\n5, 10\n*Material, name=STEEL\n*Elastic\n210000., 0.3\n*Density\n"
+            "7.8e-09\n*Shell Section, elset=PLATE, material=STEEL\n0.1\n*Boundary\nROOT, 1, 6\n" + pre +
+            "*Step\n*Static\n*Cload\nTIP, 3, 0.5\n*Node Print, nset=TIP\nU\n*End Step\n")
+
+
+def wedge_master_deck(contact=True):
+    """A C3D8 collapsed to a wedge (1, 1, 2, 3, 4, 4, 5, 6) held at its top, its face S1 the
+    master of a *CONTACT PAIR with a cube 0.1 below it (held at its bottom), in a *FREQUENCY
+    step: the gap is open, so the frequencies are those without the pair (``contact`` False)."""
+    pair = ("*Surface, name=MS, type=element\nMASTER, S1\n*Surface, name=SL, type=element\n"
+            "BLOCK, S2\n*Surface interaction, name=SI\n*Contact pair, interaction=SI\nSL, MS\n")
+    return ("*Node\n1, 0., 0., 0.\n2, 2., 0., 0.\n3, 0., 2., 0.\n4, 0., 0., 1.\n5, 2., 0., 1.\n"
+            "6, 0., 2., 1.\n11, 0.2, 0.2, -0.5\n12, 0.6, 0.2, -0.5\n13, 0.6, 0.6, -0.5\n"
+            "14, 0.2, 0.6, -0.5\n15, 0.2, 0.2, -0.1\n16, 0.6, 0.2, -0.1\n17, 0.6, 0.6, -0.1\n"
+            "18, 0.2, 0.6, -0.1\n*Element, type=C3D8, elset=MASTER\n1, 1, 1, 2, 3, 4, 4, 5, 6\n"
+            "*Element, type=C3D8, elset=BLOCK\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*Nset, nset=MTOP\n4, 5, 6\n*Nset, nset=BBOT\n11, 12, 13, 14\n*Material, name=M\n"
+            "*Elastic\n1000., 0.3\n*Density\n1e-06\n*Solid Section, elset=MASTER, material=M\n"
+            "*Solid Section, elset=BLOCK, material=M\n*Boundary\nMTOP, 1, 3\nBBOT, 1, 3\n" +
+            (pair if contact else "") + "*Step\n*Frequency\n6\n*End Step\n")
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -11097,6 +11128,52 @@ def main():
     elif all(runs.values()):
         print(f"FAIL  equation_crossed / _nonzero: {len(runs['crossed'])}, {len(runs['nonzero'])} tables")
     failures += 0 if ok else 1
+
+    # three valid decks the converter crashed on (code review 3), solved as the deck without
+    # what triggered it: a general step after a restored static perturbation step on shells
+    # (the restore's OP=NEW, which removes nothing there, indexed the step's first *BOUNDARY)
+    runs = [review_run(restored_chain_deck(c), "restored_chain" + ("" if c else "_ref"),
+                       dat_displacements) for c in (True, False)]
+    if all(runs):
+        got, want = runs[0].get(5, [0.0, 0.0, math.inf])[2], runs[1].get(5, [0.0, 0.0, math.nan])[2]
+        err = abs(ccx_ratio(got, want) - 1)
+        ok = err < 1e-6 and want > 0.5
+        print(f"{'PASS' if ok else 'FAIL'}  restored_chain (S4 strip: *FREQUENCY holding the tip "
+              f"rotations, a static perturbation step, then a loaded static step): tip deflection "
+              f"{got:.7g} vs {want:.7g} in the static step alone ({err:.1e} apart)")
+    failures += 0 if all(runs) and ok else 1
+    # a contact pair's master face on a C3D8 collapsed to a wedge (0 / 0 in closest_on_triangle)
+    eig_title = "E I G E N V A L U E   O U T P U T"
+    runs = [review_run(wedge_master_deck(c), "wedge_master" + ("" if c else "_ref"),
+                       lambda p: dat_eigen_table(p, eig_title)) for c in (True, False)]
+    if all(runs):
+        err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(runs[0], runs[1]))
+        ok = len(runs[0]) == len(runs[1]) == 6 and err < 1e-6 and runs[0][0] > 1.0
+        print(f"{'PASS' if ok else 'FAIL'}  wedge_master (*CONTACT PAIR on a C3D8 face collapsed "
+              f"to a triangle, open gap, *FREQUENCY): {len(runs[0])} frequencies from "
+              f"{runs[0][0]:.7g}, {err:.1e} apart from the deck without the pair")
+    failures += 0 if all(runs) and ok else 1
+    # *NODE, INP= (INPUT abbreviated) in an included file whose data file sits beside it: a
+    # unit cube (nu = 0) pulled by 4 at x = 1 stretches by 4 / 1000
+    os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+    for name, text in (("mesh.inp", "*Node, inp=nodes.inp\n*Element, type=C3D8, elset=E\n"
+                                    "1, 1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=FIX\n1, 4, 5, 8\n"
+                                    "*Nset, nset=TIP\n2, 3, 6, 7\n"),
+                       ("nodes.inp", "1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+                                     "5, 0., 0., 1.\n6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n")):
+        with open(os.path.join(tmp, "sub", name), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    u = review_run("*Include, input=sub/mesh.inp\n*Material, name=M\n*Elastic\n1000., 0.\n"
+                   "*Solid Section, elset=E, material=M\n*Step\n*Static\n*Boundary\nFIX, 1, 3\n"
+                   "*Cload\nTIP, 1, 1.\n*Node Print, nset=TIP\nU\n*End Step\n", "inp_abbreviated",
+                   dat_displacements)
+    if u:
+        dev = max(abs(u.get(n, [math.inf])[0] / 0.004 - 1) for n in (2, 3, 6, 7))
+        ok = dev < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  inp_abbreviated (*NODE, INP=nodes.inp in an included "
+              f"sub/mesh.inp): the pulled face moves {u.get(2, [math.nan])[0]:.7g} (4 / 1000; "
+              f"{dev:.1e} apart)")
+    failures += 0 if u and ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

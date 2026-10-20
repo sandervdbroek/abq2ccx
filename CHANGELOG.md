@@ -547,6 +547,18 @@ physics.
 * **`Converter.convert` closes an unterminated `*STEP` as `read_blocks` does** — with the same
   warning, for a caller that builds its blocks itself. Such blocks were written with the next
   step inside the open one, where ccx stops. Decks read from a file are unchanged.
+* **Converter crashes on valid decks** — on shells or beams, a general step after a static
+  perturbation step that follows another perturbation step with BCs of its own (the general
+  step's redundant `*BOUNDARY, OP=NEW` is now left out); a contact pair whose master face is
+  collapsed to a triangle (an S4 or C3D8 given a node twice) in a deck with a `*FREQUENCY`
+  step; `*NODE, INP=` (INPUT abbreviated) in an included file whose data file sits beside it.
+  An error reading a deck now exits 4 with the conversion-failed message, not a traceback.
+* **Malformed input reported instead of crashing the converter** — `*NSET, ELSET` without a
+  value; a U1 beam on an undefined node; a kinematic coupling of 2-D members along an
+  `ORIENTATION` axis normal to their plane (warned: it couples nothing there); `*NFILL, BIAS`
+  below 1 on many intervals; a distributing coupling in a deck without nodes; a `*PARAMETER`
+  nested too deep for Python's parser. A `*PARAMETER` string format over 100000 characters
+  wide, and `round(x, -n)` with a huge n, could exhaust the memory: refused / bounded.
 
 ## 1.4.0 (October 2026)
 

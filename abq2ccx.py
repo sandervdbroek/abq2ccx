@@ -1446,8 +1446,17 @@ def _param_pow(a, b, *mod):
     return pow(a, b, *mod)
 
 
+def _param_round(x, *n):
+    """``round`` for a *PARAMETER expression: Python's ``round(an int, -n)`` works out
+    ``10 ** n`` first (unbounded memory), so n is cut to +-400 — the same result, a value here
+    being at most 1024 bits (309 digits) and a float's round taking any n."""
+    if n and isinstance(n[0], int):
+        n = (max(-400, min(400, n[0])),) + n[1:]
+    return round(x, *n)
+
+
 _PARAM_EVAL_FUNCS: Dict[str, object] = {
-    "abs": abs, "min": min, "max": max, "round": round, "pow": _param_pow,
+    "abs": abs, "min": min, "max": max, "round": _param_round, "pow": _param_pow,
     "int": int, "float": float,
     **{k: getattr(math, k) for k in (
         "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp",
@@ -1459,6 +1468,7 @@ _PARAM_BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operato
                  ast.Mod: operator.mod, ast.Pow: _param_pow}
 _PARAM_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 _PARAM_TOKEN_RE = re.compile(r"<([A-Za-z_]\w*)>")
+_PARAM_FORMAT_RE = re.compile(r"%(?:\([^)]*\))?[-+ #0]*(\d*)(?:\.(\d*))?")   # width, precision
 _PARAM_REF_RE = re.compile(r"<([^<>]+)>")
 _PARAMETER_CARD_RE = re.compile(r"\*parameter\s*(,|$)", re.I)
 
@@ -1503,6 +1513,11 @@ def _safe_eval_param(expr: str, names: Dict[str, object],
                 text, n = (a, b) if isinstance(a, str) else (b, a)
                 if isinstance(n, int) and len(text) * n > 100000:
                     raise ValueError("string too long")
+            # str % value formats: its widths and precisions are padding Python writes out
+            # before checked() sees the result
+            if isinstance(node.op, ast.Mod) and isinstance(a, str) and sum(
+                    int(w or 0) + int(p or 0) for w, p in _PARAM_FORMAT_RE.findall(a)) > 100000:
+                raise ValueError("string too long")
             return checked(_PARAM_BINOPS[type(node.op)](a, b))
         if isinstance(node, ast.UnaryOp) and type(node.op) in _PARAM_UNARYOPS:
             return _PARAM_UNARYOPS[type(node.op)](ev(node.operand))
@@ -1572,7 +1587,8 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                     ns[name] = val          # visible to later defs resolved in this same pass
                     progressed = True
                     unresolved.discard(name)
-                except (ValueError, ArithmeticError, TypeError, SyntaxError, RecursionError):
+                except (ValueError, ArithmeticError, TypeError, SyntaxError, RecursionError,
+                        MemoryError):   # (ast.parse: "-" * 6000 + "1" overflows its stack)
                     # unresolved (maybe a forward reference)
                     params.setdefault(name, expr)
                     unresolved.add(name)
@@ -1797,10 +1813,11 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                 if src and "<" not in src and _input_path(src, job_dir, here) != os.path.join(
                         job_dir, src):
                     # a data card's INPUT= file found only next to this included file: name
-                    # it from the job directory, where the parse below reads it
+                    # it from the job directory, where the parse below reads it (the token
+                    # read as INPUT: an abbreviation, INP=, too)
                     toks = _split_commas(line)
-                    k = max(i for i, t in enumerate(toks)
-                            if i and "=" in t and _param_name(t.partition("=")[0]) == "INPUT")
+                    k = max(i for i, t in enumerate(toks) if i and "=" in t and
+                            "INPUT" in parse_keyword_line(f"{toks[0]},{t}", {})[1])
                     try:
                         full = os.path.relpath(os.path.join(here, src), job_dir or os.curdir)
                     except ValueError:          # on another drive (Windows)
@@ -2649,8 +2666,15 @@ def pair_tie_tolerance(edges: Sequence[float]) -> float:
 
 
 def closest_on_triangle(p: Vec, a: Vec, b: Vec, c: Vec) -> Vec:
-    """The point of triangle a, b, c nearest to p (Ericson, Real-Time Collision Detection)."""
+    """The point of triangle a, b, c nearest to p (Ericson, Real-Time Collision Detection);
+    of a triangle without area (two corners alike, or in a line), the nearest on its edges."""
     ab, ac, ap = vsub(b, a), vsub(c, a), vsub(p, a)
+    if not any(vcross(ab, ac)):
+        def on_edge(s: Vec, t: Vec) -> Vec:
+            st = vsub(t, s)
+            ll = vdot(st, st)
+            return vadd(s, vscale(st, min(1.0, max(0.0, vdot(vsub(p, s), st) / ll)))) if ll else s
+        return min((on_edge(a, b), on_edge(b, c), on_edge(c, a)), key=lambda q: math.dist(p, q))
     d1, d2 = vdot(ab, ap), vdot(ac, ap)
     if d1 <= 0 and d2 <= 0:
         return a
@@ -2659,18 +2683,19 @@ def closest_on_triangle(p: Vec, a: Vec, b: Vec, c: Vec) -> Vec:
     if d3 >= 0 and d4 <= d3:
         return b
     vc = d1 * d4 - d3 * d2
+    # (a denominator below is 0 only where its numerator is, on an edge of rounded-off length)
     if vc <= 0 and d1 >= 0 and d3 <= 0:
-        return vadd(a, vscale(ab, d1 / (d1 - d3)))
+        return vadd(a, vscale(ab, d1 / ((d1 - d3) or 1.0)))
     cp = vsub(p, c)
     d5, d6 = vdot(ab, cp), vdot(ac, cp)
     if d6 >= 0 and d5 <= d6:
         return c
     vb = d5 * d2 - d1 * d6
     if vb <= 0 and d2 >= 0 and d6 <= 0:
-        return vadd(a, vscale(ac, d2 / (d2 - d6)))
+        return vadd(a, vscale(ac, d2 / ((d2 - d6) or 1.0)))
     va = d3 * d6 - d5 * d4
     if va <= 0 and (d4 - d3) >= 0 and (d5 - d6) >= 0:
-        return vadd(b, vscale(vsub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))))
+        return vadd(b, vscale(vsub(c, b), (d4 - d3) / (((d4 - d3) + (d5 - d6)) or 1.0)))
     den = va + vb + vc
     if den == 0:
         return a
@@ -2963,7 +2988,10 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
         if abs(bias - 1.0) < 1e-12:
             return j / nint
         r = 1.0 / bias
-        return (1.0 - r ** j) / (1.0 - r ** nint)
+        if r < 1.0 or nint * math.log(r) < 700.0:
+            return (1.0 - r ** j) / (1.0 - r ** nint)
+        # (BIAS < 1 on many intervals, where r ** nint overflows: the same in powers of BIAS)
+        return bias ** (nint - j) * (1.0 - bias ** j) / (1.0 - bias ** nint)
 
     for rec in merged_data_records(block):
         if not rec:
@@ -7086,7 +7114,10 @@ class Converter:
         ids: List[int] = []
         # Abaqus *NSET, ELSET=... (collect the nodes of an element set) has no ccx
         # equivalent -> expand it to an explicit node list here.
-        if kind == "N" and b.has("ELSET"):
+        if kind == "N" and b.has("ELSET") and not b.param("ELSET"):
+            self.report.warn(f"*NSET {name}, ELSET names no element set (Abaqus stops on this): "
+                             f"no nodes are taken from one.", once=True)
+        elif kind == "N" and b.has("ELSET"):
             src = b.param("ELSET")
             for eid in self.geom.elset(src):
                 if eid in self.geom.elements:
@@ -10672,8 +10703,10 @@ class Converter:
         def tri_parts(p: List[Vec]) -> List[Tuple[Vec, ...]]:
             nc = 3 if len(p) in (3, 6) else 4
             c, m = p[:nc], p[nc:2 * nc]
-            return [(c[0], c[i], c[i + 1]) for i in range(1, nc - 1)] if len(m) < nc else \
+            parts = [(c[0], c[i], c[i + 1]) for i in range(1, nc - 1)] if len(m) < nc else \
                 [(c[k], m[k], m[k - 1]) for k in range(nc)] + [(m[0], m[i], m[i + 1]) for i in range(1, nc - 1)]
+            # (a collapsed element's part without area, S4 1, 1, 2, 3: no normal, no inside)
+            return [q for q in parts if any(vcross(vsub(q[1], q[0]), vsub(q[2], q[0])))]
 
         for b, slave, master in lines:
             if (slave, master) in cleared:
@@ -18742,7 +18775,7 @@ class Converter:
             named -= {v.strip().upper() for v in b.params.values() if v} | \
                 {x.strip().upper() for rec in merged_data_records(b) for x in rec[:2]}
         self._dist_weighted = named
-        return max(next_id, max(self.geom.nodes))
+        return max(next_id, max(self.geom.nodes, default=0))
 
     def _distributing_plan(self, b: Block, dist: Block, blocks: List[Block], expanded: Dict[int, str],
                            u1: set, bcs: set) -> Optional[dict]:
@@ -26198,6 +26231,8 @@ class Converter:
         lmin = math.inf
         for e in eids:
             conn = self.geom.elements[e][1]
+            if conn[0] not in self.geom.nodes or conn[-1] not in self.geom.nodes:
+                continue                # (warned: _warn_undefined_element_nodes)
             t = vsub(self.geom.nodes[conn[-1]], self.geom.nodes[conn[0]])
             length = vnorm(t)
             if length == 0.0:
@@ -29545,7 +29580,12 @@ class Converter:
                 keys += [k for k, _ in mine if k not in keys]
                 own.append(OrderedDict(mine + terms(ref, vscale(e, -1.0), ks) +
                                        terms(rot, vscale(c, -1.0), (1, 2, 3))))
-            rows += self._pivot_rows(own, keys)
+            mine_rows = self._pivot_rows(own, keys)
+            if len(mine_rows) < len(own):
+                self.report.warn("Kinematic coupling with an ORIENTATION: a coupled local axis "
+                                 "is normal to the plane of its 2-D members, so it couples "
+                                 "nothing there: left out — verify the ORIENTATION.", once=True)
+            rows += mine_rows
         return rows
 
     @staticmethod
@@ -29553,17 +29593,23 @@ class Converter:
                     keys: Sequence[Tuple[int, int]]) -> List[List[Tuple[int, int, float]]]:
         """Equations ``own`` ((node, DOF) -> coefficient; changed in place) reduced
         (Gauss-Jordan) on the DOFs ``keys``: each eliminates one of them (its largest), listed
-        first with coefficient 1, that no other equation has."""
+        first with coefficient 1, that no other equation has.  An equation left without a term
+        on ``keys`` (none, or the ones before took them) is left out."""
+        scale = max((abs(v) for rw in own for q, v in rw.items() if q in keys), default=0.0)
+        kept: List["OrderedDict[Tuple[int, int], float]"] = []
         for i, rw in enumerate(own):
-            p = max((q for q in keys if q in rw), key=lambda q: abs(rw[q]))
+            p = max((q for q in keys if q in rw), key=lambda q: abs(rw[q]), default=None)
+            if p is None or abs(rw[p]) <= 1e-9 * scale:
+                continue
             for other in own:
                 f = other.pop(p, 0.0) / rw[p] if other is not rw else 0.0
                 for q, v in rw.items():
                     if f and q != p:
                         other[q] = other.get(q, 0.0) - f * v
             own[i] = OrderedDict([(p, rw[p])] + [(q, v) for q, v in rw.items() if q != p])
+            kept.append(own[i])
         rows: List[List[Tuple[int, int, float]]] = []
-        for rw in own:
+        for rw in kept:
             piv = next(iter(rw.values()))
             top = max(abs(v) for v in rw.values())
             rows.append([(n, k, v / piv) for (n, k), v in rw.items() if abs(v) > 1e-12 * top])
@@ -31481,7 +31527,8 @@ class Converter:
         on, once shell/beam nodes have had rotational BCs:
 
         * a step whose *BOUNDARY cards re-specify every BC in effect removes nothing, so its
-          OP=NEW is dropped (``self._op_new_drop``): the same model in Abaqus and ccx;
+          OP=NEW is dropped (``self._op_new_drop``; a restored step's, out of _restore_new):
+          the same model in Abaqus and ccx;
         * a step that does remove BCs keeps OP=NEW, and the shell nodes that had rotational
           BCs before it (the stale indices) and the beam nodes that had them before it and
           get them again from it on get a knot beam (``_add_knot_beams``): ccx then carries
@@ -31528,7 +31575,11 @@ class Converter:
         knots: set = set()
         for k, cards in enumerate(steps):
             if new[k] and k and built:
-                if state <= given[k]:
+                if state <= given[k] and k + 1 in self._restore_pairs:
+                    # the restore's OP=NEW (the step's own cards have none, maybe no card at
+                    # all: _plan_base_restore) removes nothing either: the restore leaves it out
+                    self._restore_new.discard(k + 1)
+                elif state <= given[k]:
                     self._op_new_drop.update({id(c): None for c in cards})
                     self._op_new_drop[id(cards[0])] = (
                         "** abq2ccx: OP=NEW dropped: this step re-specifies every boundary "
@@ -34177,7 +34228,15 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
 
 def _convert_one(path: str, args) -> int:
     report = Report()
-    blocks = read_blocks(path, report)
+    try:
+        blocks = read_blocks(path, report)
+        if blocks:
+            conv = Converter(report, args)
+            body = conv.convert(blocks)
+    except Exception as exc:                # surface a clean message, not a bare traceback
+        sys.stderr.write(f"abq2ccx: conversion failed for {path} ({type(exc).__name__}: {exc}).\n"
+                         f"Please report this deck. Run with PYTHONFAULTHANDLER for a traceback.\n")
+        return 4
     if not blocks:
         if not os.path.exists(path):
             sys.stderr.write(f"abq2ccx: cannot read {path}: no such file\n")
@@ -34188,13 +34247,6 @@ def _convert_one(path: str, args) -> int:
             if msg and not msg.startswith("No conversion issues"):
                 sys.stderr.write(msg + "\n")
         return 1
-    conv = Converter(report, args)
-    try:
-        body = conv.convert(blocks)
-    except Exception as exc:                # surface a clean message, not a bare traceback
-        sys.stderr.write(f"abq2ccx: conversion failed for {path} ({type(exc).__name__}: {exc}).\n"
-                         f"Please report this deck. Run with PYTHONFAULTHANDLER for a traceback.\n")
-        return 4
 
     if args.output:
         out_path = args.output

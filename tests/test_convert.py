@@ -200,6 +200,10 @@ def test_nset_from_elset():
     # ccx has no *NSET, ELSET=...; the converter expands it to the elset's nodes.
     body, conv, _ = convert_str(HEX + "*NSET, NSET=CLAMP, ELSET=EALL\n")
     assert sorted(conv.geom.nsets["CLAMP"]) == [1, 2, 3, 4, 5, 6, 7, 8]
+    # ELSET without a value (Abaqus stops on it): warned, no nodes from it (AttributeError)
+    _, conv, rep = convert_str(HEX + "*NSET, NSET=CLAMP, ELSET\n1, 2\n")
+    assert "*NSET CLAMP, ELSET names no element set" in rep.text()
+    assert sorted(conv.geom.nsets["CLAMP"]) == [1, 2]
 
 
 def test_overconstraint_equation_reordered():
@@ -1031,6 +1035,22 @@ def test_parameter_values_beyond_the_float_range_are_refused():
         assert f"length {expr}" in body and conv.geom.nodes[1][0] == 1024.0
 
 
+def test_parameter_formatting_rounding_and_deep_nesting_are_bounded():
+    # string formatting writes out its padding before the size check, and round(an int, -n)
+    # works out 10 ** n: a width or precision over 100000 characters is refused, round's n cut
+    # to +-400 (the same result); 6000 unary minus overflow ast.parse (MemoryError: it crashed)
+    import time
+    for expr in ('"%0200000d" % 1', '"%.200000f" % 1.5', "-" * 6000 + "1"):
+        t = time.time()
+        _, _, rep = convert_str(f"*PARAMETER\nL = {expr}\n*HEADING\nlength <L>\n*NODE\n1, 0., 0., 0.\n")
+        assert time.time() - t < 5 and "*PARAMETER: L could not be evaluated" in rep.text()
+    t = time.time()
+    body, _, rep = convert_str('*PARAMETER\nn = "%03d" % 7\nr = round(1234.5678, 2)\nc = round(1234, -2)\n'
+                               'z = round(7, -10**7)\n*HEADING\n<n> <r> <c> <z>\n*NODE\n1, 0., 0., 0.\n')
+    assert time.time() - t < 5 and "007 1234.57 1200 0\n" in body
+    assert "could not be evaluated" not in rep.text()
+
+
 def test_no_residual_parameter_tokens():
     deck = ("*PARAMETER\nx = 1.5\n*NODE\n1, <x>, 0., 0.\n2, <x>, 1., 0.\n"
             "*ELEMENT, TYPE=T3D2, ELSET=E\n1, 1, 2\n")
@@ -1376,6 +1396,13 @@ def test_nfill_bias_and_unsupported_options():
     # BIAS < 1 puts the nodes toward the first set: intervals in ratio 1/BIAS = 2
     _, conv, rep = convert_str(ends + "*NFILL, BIAS=0.5\nA, B, 2, 50\n")
     assert abs(conv.geom.nodes[51][0] - 4.0 / 3.0) < 1e-12
+    # ... on intervals so many that 2 ** n overflows (OverflowError): (2^j - 1) / (2^n - 1) still
+    from fractions import Fraction
+    _, conv, _ = convert_str("*NODE\n1, 0., 0., 0.\n2001, 1., 0., 0.\n*NSET, NSET=A\n1\n*NSET, NSET=B\n"
+                             "2001\n*NFILL, BIAS=0.5\nA, B, 1100\n")
+    assert len(conv.geom.nodes) == 1101 and all(
+        abs(conv.geom.nodes[1 + j][0] - float(Fraction(2 ** j - 1, 2 ** 1100 - 1))) < 1e-15
+        for j in (1, 1000, 1050, 1099))
     # a non-positive BIAS is uniform spacing, with a warning
     _, conv, rep = convert_str(ends + "*NFILL, BIAS=-2.\nA, B, 2, 50\n")
     assert conv.geom.nodes[51] == (2.0, 0.0, 0.0) and "*NFILL BIAS must be positive" in rep.text()
@@ -3405,6 +3432,16 @@ def test_u1_refusals_keep_todays_section_handling():
     assert "SECTION=RECT" in body and "U1 beam, which carries the profile, cannot be used" in rep.text()
 
 
+def test_u1_beam_on_an_undefined_node():
+    # an element on an undefined node (Abaqus stops on it: warned) gives the U1 plan no n1
+    # direction, where it raised KeyError; the other beams are U1 still
+    body, _, rep = convert_str(
+        "*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=EB\n1, 1, 2\n2, 2, 3\n"
+        "*Beam General Section, elset=EB, section=GENERAL\n0.01, 1e-5, 0., 4e-5, 6e-5\n0., 1., 0.\n"
+        "2.1e5, 8.1e4\n*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n2, 2, 1.\n*End Step\n")
+    assert "name an undefined node (element 2: node 3)" in rep.text() and "TYPE=U1" in body
+
+
 def test_u1_refused_where_the_deck_acts_on_beam_nodes_or_breaks_its_form():
     # what this conversion cannot write onto U1 nodes, or what the beams' geometry rules out:
     # the I-beam keeps today's handling (not a ccx profile), with the reason
@@ -4427,6 +4464,34 @@ def test_include_paths_resolve_from_the_job_directory():
                                                "*INCLUDE, INPUT=<mesh>\n",
                                    "m.inp": "*NODE\n1, 0., 0., 0.\n"})
     assert set(conv.geom.nodes) == {1} and "Could not read" not in rep.text()
+    # INPUT abbreviated (INP=, read in full as Abaqus reads it) in such an included file
+    # (ValueError: the job-directory rename looked for a parameter spelled INPUT)
+    _, conv, rep = _convert_files({
+        "main.inp": "*INCLUDE, INPUT=model/mesh.inp\n",
+        "model/mesh.inp": "*NODE, NSET=N, INP=nodes.inp\n*ELEMENT, TYPE=T3D2, ELSET=E\n1, 1, 2\n",
+        "model/nodes.inp": "1, 0., 0., 0.\n2, 1., 0., 0.\n"})
+    assert set(conv.geom.nodes) == {1, 2} and conv.geom.nsets["N"] == [1, 2]
+    assert "INPUT=model/nodes.inp: data lines inlined" in rep.text() and not conv.reduced_physics
+
+
+def test_cli_reports_an_error_reading_the_deck_as_a_failed_conversion():
+    # an exception reading the deck exits 4 with the failed-conversion message, as one
+    # converting it does (read_blocks ran outside the try: a traceback, exit 1)
+    d = tempfile.mkdtemp()
+    deck = os.path.join(d, "a.inp")
+    with open(deck, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("*NODE\n1, 0., 0., 0.\n")
+
+    def unreadable(path, report):
+        raise ValueError("unreadable")
+    saved, err = (A.read_blocks, sys.stderr), io.StringIO()
+    A.read_blocks, sys.stderr = unreadable, err
+    try:
+        code = A.main([deck, "--check"])
+    finally:
+        A.read_blocks, sys.stderr = saved
+        shutil.rmtree(d, ignore_errors=True)
+    assert code == 4 and "conversion failed for" in err.getvalue() and "ValueError: unreadable" in err.getvalue()
 
 
 def test_unresolved_parameter_tokens_and_orphan_data_lines_warned_once():
@@ -7124,6 +7189,23 @@ def test_op_new_knots_skipped_with_explicit_steps():
     assert "stop ccx's explicit solver" in rep.text() and "from step 2 on" in rep.text()
 
 
+def test_restored_step_whose_op_new_removes_nothing():
+    # *FREQUENCY holding the tip rotations, then a static perturbation step (a general step
+    # in ccx: the restore gives it the base state with OP=NEW, which removes them; knots), then
+    # a general step: nothing is left for its restore's OP=NEW to remove, so it is left out
+    # (the converter indexed that step's first *BOUNDARY, of which it has none: IndexError)
+    deck = STEPPED_PLATE[:STEPPED_PLATE.index("*Step")] + "*Density\n7.8e-9\n*Boundary\nROOT, ENCASTRE\n" \
+        "*Step\n*Frequency\n3\n*Boundary\nTIP, 4, 6\n*End Step\n*Step, perturbation\n*Static\n*End Step\n" \
+        "*Step\n*Static\n*Cload\nTIP, 3, 1.\n*End Step\n"
+    body, conv, rep = convert_str(deck)
+    steps = body.split("*STEP")
+    assert "*BOUNDARY, OP=NEW" in steps[2] and "OP=NEW" not in steps[3] and conv._restore_new == {2}
+    assert sorted(conv._knots) == [1, 3, 4, 6] and "OP=NEW dropped" not in rep.text()
+    # without the static perturbation step the general step's restore removes them: OP=NEW
+    body, conv, _ = convert_str(deck.replace("*Step, perturbation\n*Static\n*End Step\n", ""))
+    assert "*BOUNDARY, OP=NEW" in body.split("*STEP")[2] and conv._restore_new == {2}
+
+
 def test_op_new_examples():
     # the decks validate_with_ccx.py runs: step 2 re-specifies every BC (OP=NEW dropped) /
     # removes the beam's prop (OP=NEW kept, the beam root and plate root nodes are knots)
@@ -8818,6 +8900,41 @@ def test_frequency_base_overclosure_shell_rigid_masters():
     rig = "*Node\n99, 0.5, 0.5, 2.\n*Rigid Body, ref node=99, elset=PL\n*Boundary\n99, 1, 6\n"
     assert stressed(plate(0.99, "R3D4", rig)) and not stressed(plate(1.01, "R3D4", rig))
     assert not stressed(plate(0.99, "R3D4", rig), "")
+
+
+def test_overclosure_on_collapsed_master_faces():
+    # a triangle without area: the nearest point on its edges (two corners alike first: 0 / 0)
+    p = (0.5, 1.0, 0.3)
+    for tri in (((0., 0., 0.), (0., 0., 0.), (2., 0., 0.)), ((0., 0., 0.), (1., 0., 0.), (2., 0., 0.))):
+        assert A.closest_on_triangle(p, *tri) == (0.5, 0.0, 0.0)
+    assert A.closest_on_triangle(p, *[(1., 1., 1.)] * 3) == (1., 1., 1.)
+    assert math.dist(A.closest_on_triangle((.2, .2, 1.), (0., 0., 0.), (1., 0., 0.), (0., 1., 0.)),
+                     (.2, .2, 0.)) < 1e-15
+    # a master face collapsed so (a C3D8 as a wedge, an S4 as a triangle, 1, 1, 2, 3): its
+    # part without area is left out (it crashed), the rest checked: a slave block 0.1 off it
+    # does not start overclosed, one 0.05 into it does
+    wedge = "*Element, type=C3D8, elset=MASTER\n1, 1, 1, 2, 3, 4, 4, 5, 6\n*Solid Section, " \
+            "elset=MASTER, material=M\n*Boundary\n4, 1, 3\n5, 1, 3\n6, 1, 3\n"
+    shell = "*Element, type=S4, elset=MASTER\n1, 1, 1, 2, 3\n*Shell Section, elset=MASTER, " \
+            "material=M\n0.01\n*Boundary\n1, 1, 6\n2, 1, 6\n3, 1, 6\n"
+
+    def stressed(master, face, z, top):
+        block = "".join(f"{11 + i}, {x}, {y}, {z + dz}\n" for i, (x, y, dz) in enumerate(
+            [(.2, .2, 0), (.6, .2, 0), (.6, .6, 0), (.2, .6, 0), (.2, .2, .4), (.6, .2, .4),
+             (.6, .6, .4), (.2, .6, .4)]))
+        body, _, _ = convert_str(
+            "*Node\n1, 0., 0., 0.\n2, 2., 0., 0.\n3, 0., 2., 0.\n4, 0., 0., 1.\n5, 2., 0., 1.\n"
+            "6, 0., 2., 1.\n" + block + master + "*Element, type=C3D8, elset=BLOCK\n2, 11, 12, 13, "
+            "14, 15, 16, 17, 18\n*Solid Section, elset=BLOCK, material=M\n*Material, name=M\n"
+            "*Elastic\n1000., 0.3\n*Density\n1e-6\n*Boundary\n" + ("15, 1, 3\n16, 1, 3\n17, 1, 3\n"
+            "18, 1, 3\n" if top else "11, 1, 3\n12, 1, 3\n13, 1, 3\n14, 1, 3\n") + f"*Surface, "
+            f"name=MS\nMASTER, {face}\n*Surface, name=SL\nBLOCK, {'S1' if top else 'S2'}\n"
+            "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI\nSL, MS\n" +
+            _deck_step("Static") + _deck_step("Frequency\n3"))
+        return body.split("*STEP")[-1].split("\n")[0] == ""
+
+    assert not stressed(wedge, "S1", -0.5, False) and stressed(wedge, "S1", -0.35, False)
+    assert not stressed(shell, "SPOS", 0.1, True) and stressed(shell, "SPOS", -0.05, True)
 
 
 def test_hyperfoam_n1_written_as_n2():
@@ -10736,6 +10853,27 @@ def test_coupling_influence_radius():
     assert "SURFACE=TOPE\n*KINEMATIC" in body and "INFLUENCE RADIUS=X does not read as a number" in rep.text()
 
 
+def test_kinematic_coupling_orientation_axis_normal_to_a_plane_model():
+    # linear equations (a *PLASTIC deck) of a coupling of local DOF 1 of 2-D members, its
+    # ORIENTATION's 1-axis along Z: no in-plane term to eliminate, so no equation, warned
+    # (_pivot_rows divided by the zero pivot)
+    from collections import OrderedDict
+    deck = ("*Node\n1, 0., 0.\n2, 1., 0.\n3, 2., 0.\n4, 0., 1.\n5, 1., 1.\n6, 2., 1.\n9, 2.5, 0.5\n"
+            "*Element, type=CPE4, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Nset, nset=RN\n3, 6\n"
+            "*Surface, name=RIGHT, type=node\nRN\n*Orientation, name=OR\n0., 0., 1., 1., 0., 0.\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1.e6, 0.\n*Solid Section, elset=E, "
+            "material=M\n1.\n*Coupling, ref node=9, surface=RIGHT, constraint name=C1, orientation=OR\n"
+            "*Kinematic\n1, 1\n*Step\n*Static\n*Boundary\n1, 1, 2\n4, 1, 2\n*Cload\n9, 1, 1.\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "a coupled local axis is normal to the plane of its 2-D members" in rep.text()
+    assert not [row for row in _equation_terms(body) if row[0][0] in (3, 6)]
+    # a later equation whose terms on the DOFs the earlier ones took: reduced to none, left out
+    rows = A.Converter._pivot_rows([OrderedDict([((3, 1), 0.6), ((9, 1), -0.6)]),
+                                    OrderedDict([((3, 1), 0.8), ((9, 1), -0.8), ((10, 3), 0.5)])],
+                                   [(3, 1), (3, 2)])
+    assert rows == [[(3, 1, 1.0), (9, 1, -1.0)]]
+
+
 def test_distributing_coupling_card_with_an_influence_radius():
     # under NLGEOM a distributing coupling off its surface's centre stays ccx's card (no
     # equations); its INFLUENCE RADIUS becomes a surface of the facets Abaqus distributes over
@@ -10940,6 +11078,11 @@ def test_distributing_coupling_in_a_plane_model():
     assert all(d in (1, 2) for r in rows for n, d, _ in r[1:]) and f"\n{rot}, 3, 0.25\n" in body
     assert sorted({n for n, _, _ in rows[0][1:]}) == [4, 5, 6]
 
+
+def test_distributing_coupling_in_a_deck_without_nodes():
+    # max() of no node ids raised ValueError: the cards go to ccx as written
+    body, _, _ = convert_str("*Coupling, constraint name=C, ref node=100, surface=S\n*Distributing\n1, 6\n")
+    assert "*COUPLING, CONSTRAINT NAME=C, REF NODE=100, SURFACE=S\n*DISTRIBUTING\n1, 6" in body
 
 
 def test_distributing_weights_on_plane_edges_take_the_section_thickness():
