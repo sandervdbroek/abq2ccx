@@ -3895,6 +3895,8 @@ class Converter:
         self._mem_surfaces: Dict[tuple, str] = {}  # element surface on membranes -> node surface
         self._kinematic_ids: set = set()           # id(*COUPLING) followed by *KINEMATIC
         self._distributing_ids: set = set()        # ... by *DISTRIBUTING
+        self._ref_set_kept: Dict[int, str] = {}    # id(*COUPLING) on several ref nodes -> why one
+        self._nearest_facet: set = set()           # ... whose INFLUENCE RADIUS reaches no facet
         self._mem_thinning: Dict[str, Optional[float]] = {}  # membrane material -> its thinning ratio
         self._explicit_deck = False                # a *DYNAMIC, EXPLICIT step
         self._tie_names: set = set()               # the deck's *TIE names (handle_tie adds cards)
@@ -13591,27 +13593,91 @@ class Converter:
                          "explicit nodes; multi-node sets expanded pairwise).", once=True)
         return out
 
+    def _split_coupling_refs(self, blocks: List[Block]) -> List[Block]:
+        """``blocks`` with each *COUPLING whose REF NODE= names a set of several nodes written
+        once per reference node, with its *KINEMATIC or *DISTRIBUTING (CONSTRAINT
+        NAME=<name>_<node>): Abaqus couples each reference node to the surface nodes within
+        its own INFLUENCE RADIUS, a sphere about that node (Analysis User's Guide, 'Coupling
+        constraints', which asks for a radius with several reference nodes 'to avoid
+        overconstraint issues').  A distributing coupling is split without a radius too (each
+        reference node then follows the whole surface).  A kinematic one is not split without
+        a radius, or where two reference nodes would couple one node — Abaqus/Standard allows
+        no node in two kinematic couplings: handle_coupling_card keeps its first reference
+        node (``_ref_set_kept``)."""
+        out: List[Block] = []
+        i = 0
+        while i < len(blocks):
+            b, nxt = blocks[i], blocks[i + 1] if i + 1 < len(blocks) else None
+            i += 1
+            ref = (b.param("REF NODE") or "").strip()
+            refs = dedup(self.geom.nset(ref)) if b.keyword == "COUPLING" and ref and \
+                not re.fullmatch(r"[-+]?\d+", ref) else []
+            if len(refs) < 2 or nxt is None or nxt.keyword not in ("KINEMATIC", "DISTRIBUTING"):
+                out.append(b)
+                continue
+            name = (b.param("CONSTRAINT NAME") or "").strip()
+            copies = []
+            for n in refs:
+                params = OrderedDict(b.params)
+                params["REF NODE"] = str(n)
+                if name:
+                    params["CONSTRAINT NAME"] = f"{name}_{n}"
+                copies.append(Block(b.keyword, params, list(b.data)))
+            radius = self._influence_radius(b) is not None
+            if nxt.keyword == "KINEMATIC":
+                seen: set = set()
+                for c in copies if radius else ():
+                    nodes = set(self._coupling_nodes(c)[0]) - {self._ref_node(c)}
+                    if nodes & seen:
+                        self._ref_set_kept[id(b)] = (f"two of their INFLUENCE RADIUS spheres hold node "
+                                                     f"{min(nodes & seen)}")
+                        break
+                    seen |= nodes
+                if not radius:
+                    self._ref_set_kept[id(b)] = ("without an INFLUENCE RADIUS each couples the whole "
+                                                 "surface")
+                if id(b) in self._ref_set_kept:
+                    self._nearest_facet -= {id(c) for c in copies}     # (the copies are dropped)
+                    out.append(b)
+                    continue
+            ids = self._kinematic_ids if nxt.keyword == "KINEMATIC" else self._distributing_ids
+            for c in copies:
+                ids.add(id(c))
+                out += [c, Block(nxt.keyword, OrderedDict(nxt.params), list(nxt.data))]
+            i += 1                                  # (``nxt`` copied)
+            self.report.note(f"*COUPLING REF NODE={ref} names {len(refs)} nodes: one coupling per "
+                             f"reference node, as in Abaqus (CONSTRAINT NAME=<name>_<node>), of the "
+                             f"surface nodes within its INFLUENCE RADIUS"
+                             + ("" if radius else " (none: the whole surface)") + ".", once=True)
+        return out
+
     def handle_coupling_card(self, b: Block) -> List[str]:
         """``*COUPLING``: ccx accepts the card but requires REF NODE to be a NODE NUMBER —
         a set name (what Abaqus/CAE always writes, e.g. REF NODE=_PickedSet8) is a hard
         error.  Resolve single-node sets to their node id.  ccx 2.23 does not read INFLUENCE
         RADIUS ('parameter not recognized') and couples the whole surface: a kinematic
         coupling gets a node surface of the nodes Abaqus couples (_coupling_nodes), or is
-        commented out with none; a distributing one keeps its surface, warned, unless every
-        node lies within the radius (Abaqus also weights the nodes by the part of each facet
-        within it)."""
+        commented out with none (a node surface); a distributing one keeps its surface,
+        warned, unless every node lies within the radius (Abaqus also weights the nodes by the
+        part of each facet within it)."""
         params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
         ref = (b.param("REF NODE") or "").strip()
         if ref and not re.fullmatch(r"[-+]?\d+", ref):
-            nodes = self.geom.nset(ref)
+            nodes = dedup(self.geom.nset(ref))
             if len(nodes) == 1:
                 params["REF NODE"] = str(nodes[0])
                 self.report.note(f"*COUPLING REF NODE={ref} resolved to node {nodes[0]} "
                                  f"(ccx needs a node number, not a set name).", once=True)
             elif nodes:
+                # (several reference nodes: one coupling each, _split_coupling_refs, but here)
                 params["REF NODE"] = str(nodes[0])
-                self.report.warn(f"*COUPLING REF NODE={ref} names a set with {len(nodes)} nodes; "
-                                 f"the first ({nodes[0]}) is used — verify.", once=True)
+                why = self._ref_set_kept.get(id(b))
+                self.report.warn(f"*COUPLING REF NODE={ref} names a set with {len(nodes)} nodes, each "
+                                 f"of which Abaqus couples to the surface"
+                                 + (f", but {why} (an overconstraint Abaqus/Standard does not "
+                                    f"allow for a kinematic coupling)" if why else "")
+                                 + f": only the first ({nodes[0]}) is coupled — verify.", once=True)
+                self._reduces("*COUPLING on several reference nodes coupled on the first")
             else:
                 self.report.warn(f"*COUPLING REF NODE={ref} could not be resolved to a node id; "
                                  f"ccx will reject a set name here.", once=True)
@@ -13666,14 +13732,19 @@ class Converter:
                 b, f"*COUPLING, *KINEMATIC: no node of surface {surf} but the reference node lies "
                    f"within its INFLUENCE RADIUS={raw}, so Abaqus "
                 + ("has none to couple" if node_surface else "couples the nodes of the facet "
-                   "nearest the reference node, which the converter does not find")
+                   "nearest the reference node, which the converter cannot find (undefined nodes)")
                 + "; commented out — the constraint is missing.",
                 reduces="*COUPLING with no node within its INFLUENCE RADIUS")
         elif id(b) in self._kinematic_ids and len(nodes) < len(self._surface_member_nodes(surf)):
+            if id(b) in self._nearest_facet:
+                self.report.note("*COUPLING, *KINEMATIC whose INFLUENCE RADIUS reaches no facet of its "
+                                 "element surface: the nodes of the facet nearest the reference node "
+                                 "(of all facets as near, where that point lies on an edge or vertex "
+                                 "they share) are coupled, as Abaqus selects them.", once=True)
             self.report.note("*COUPLING, *KINEMATIC with an INFLUENCE RADIUS: the nodes Abaqus "
                              "couples, of a node surface those within the radius of the reference "
-                             "node, of an element surface every node of each facet with a node "
-                             "within it, are coupled (where ccx's coupling stays, through a node "
+                             "node, of an element surface every node of each facet the radius "
+                             "reaches, are coupled (where ccx's coupling stays, through a node "
                              "surface of them): ccx 2.23 does not read the parameter and would "
                              "couple the whole surface.", once=True)
             if card:
@@ -14517,6 +14588,7 @@ class Converter:
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         self._plan_deck_facts(blocks)
         self.build_geometry(blocks)
+        blocks = self._split_coupling_refs(blocks)
         self._warn_undefined_element_nodes()
         self._drop_surface_elements(raw, blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
@@ -14609,7 +14681,7 @@ class Converter:
         explicit dynamics, whether one is not heat transfer alone (a deck without steps
         counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
         the *TIE names, the linear perturbation steps and which steps run NLGEOM.  No planner
-        adds or replaces such cards.
+        adds or replaces such cards (_split_coupling_refs adds its copies' ids).
 
         Rigid constraints (*RIGID BODY, kinematic couplings, *MPC BEAM bodies) are written as
         linear *EQUATIONs (``_linear_rigid``) in a deck without NLGEOM with a step ccx runs
@@ -19706,9 +19778,10 @@ class Converter:
         DOFs) or a *KINEMATIC COUPLING (one group per line, none when a line's DOFs do not
         read: handle_coupling comments that card out), the reference node left out of the
         members; None for any other card or without a reference node.  A *COUPLING couples
-        the nodes within its INFLUENCE RADIUS (_coupling_nodes; none when no node is within it:
-        handle_coupling_card comments it out).  ``live``: only the groups the converted deck
-        writes (in a coupling of ``_kin_dyn``, those _kin_form writes)."""
+        the nodes within its INFLUENCE RADIUS (_coupling_nodes; none when no node of a node
+        surface is within it: handle_coupling_card comments it out).  ``live``: only the
+        groups the converted deck writes (in a coupling of ``_kin_dyn``, those _kin_form
+        writes)."""
         b = blocks[i]
         native = b.keyword == "COUPLING" and i + 1 < len(blocks) and blocks[i + 1].keyword == "KINEMATIC"
         ref = self._ref_node(b) if native or b.keyword == "KINEMATIC COUPLING" else None
@@ -20736,7 +20809,8 @@ class Converter:
         """(reference node, members, coupled translations) of every rigid constraint ccx
         builds from RIGID MPCs: *RIGID BODY, kinematic couplings and the rigid bodies of
         *MPC BEAM lines.  ccx eliminates the members' coupled translations (only those the
-        converted deck writes: _coupling_groups)."""
+        converted deck writes: _coupling_groups; along an ORIENTATION's axes as its own
+        coupling does, _ccx_coupled_translations)."""
         for i, b in enumerate(blocks):
             ref = self._ref_node(b)
             if ref is None:
@@ -20745,8 +20819,9 @@ class Converter:
                 tie, pin = self._rigid_body_members(b)
                 yield ref, [n for n in tie + pin if n != ref], {1, 2, 3}
                 continue
+            frame = self._coupling_frame(b) if b.keyword in ("COUPLING", "KINEMATIC COUPLING") else None
             for nodes, dofs in (self._coupling_groups(blocks, i, live=True) or (ref, []))[1]:
-                yield ref, nodes, dofs & {1, 2, 3}
+                yield ref, nodes, self._ccx_coupled_translations(frame, dofs)
         for bodies in self._mpc_bodies.values():
             for body in bodies:
                 yield body["ref"], body["members"], {1, 2, 3}
@@ -20769,8 +20844,11 @@ class Converter:
         Abaqus drops it — a kinematic coupling and an MPC eliminate the constrained DOFs of
         their nodes, so Abaqus/Standard does not apply a BC there: by default where the
         constraint is written as linear *EQUATIONs (emit 'eq', _rigid_constraints; ccx would
-        reorder them and keep the BC), else with --approximate.  Rigid constraints: *RIGID
-        BODY, kinematic couplings and the rigid bodies of *MPC BEAM lines (_plan_mpcs)."""
+        reorder them and keep the BC), else with --approximate.  A BC on a global translation
+        that a coupling's ORIENTATION axes only touch ('across') stays, warned: the coupling
+        does not hold that DOF, and which one Abaqus eliminates is not documented.  Rigid
+        constraints: *RIGID BODY, kinematic couplings and the rigid bodies of *MPC BEAM lines
+        (_plan_mpcs)."""
         cons = self._rigid_constraints(blocks)
         if not cons:
             return
@@ -20799,12 +20877,15 @@ class Converter:
             if (m, d) in moved:
                 continue
             c = owner[(m, d)]
-            loose = not ok and c["kind"] != "rb" and (self._approx or c["emit"] == "eq")
+            # (a BC across the coupled axes of an ORIENTATION: Abaqus' handling is not known)
+            across = d in c.get("across", {}).get(m, ())
+            loose = not ok and not across and c["kind"] != "rb" and (self._approx or c["emit"] == "eq")
             if not ok and not loose:
                 # a *RIGID BODY's tied rotation that _plan_rigid_body_move left: _settle_dependents
                 # reorders the tie so the body follows the member's BC, as Abaqus moves it to
                 # the reference node — warned where the BCs differ or contradict its own
-                why = c.get("why", {}).get(d, "")
+                why = ("across-stop" if d in c["stops"].get(m, ()) else "across") if across else \
+                    c.get("why", {}).get(d, "")
                 if not (d > 3 and c["kind"] == "rb" and not why):
                     self._coupled_clash.append((c["kind"], c["emit"], m, d, c["ref"], why))
                     self._clash_dofs.add((m, d))
@@ -20868,7 +20949,11 @@ class Converter:
         coupling, 'eq' = linear *EQUATIONs: _rigid_body_lines, _kin_form; a coupling with lines
         of both gets one entry each), reference node, explicit ROT NODE (a ccx-style deck),
         whether all members are 2-D nodes, and per member the translations ccx makes dependent
-        ('trans') and the rotations the converter ties ('rots')."""
+        ('trans') and the rotations the converter ties ('rots').  A coupling of some
+        translations along an ORIENTATION's axes: 'trans' the global ones it holds or touches
+        (_coupled_span), 'across' per member those it only touches — never imposed by the
+        reference node's BCs — with 'stops' those of them ccx eliminates (its own coupling,
+        _ccx_coupled_translations)."""
         out: List[dict] = []
 
         def body_emit(ref: int, rot: Optional[int], members) -> str:
@@ -20919,19 +21004,32 @@ class Converter:
                     rot not in self._transformed
                 trans: Dict[int, set] = {}
                 rots: Dict[int, set] = {}
+                along: Dict[int, set] = {}        # member -> local translations of an ORIENTATION
                 for ns, ds in lines:
+                    oriented = frame is not None and not rb and not self._kin_all_translations(ns, ds)
                     for n in ns:
                         if n not in members:
                             continue
-                        trans.setdefault(n, set()).update({1, 2, 3} if rb else
-                                                          {d for d in ds if d <= top})
+                        if oriented:
+                            along.setdefault(n, set()).update(ds & {1, 2, 3})
+                        trans.setdefault(n, set()).update({1, 2, 3} if rb else set() if oriented
+                                                          else {d for d in ds if d <= top})
                         if tie_ok and n in self._knots and n in self._rot_nodes and \
                                 n not in self._transformed:
                             rots.setdefault(n, set()).update(ds & {4, 5, 6})
+                across: Dict[int, set] = {}
+                stops: Dict[int, set] = {}
+                for n, ds in along.items():
+                    full, part = (set(), {1, 2, 3}) if isinstance(frame, str) else \
+                        self._coupled_span(frame, ds)
+                    across[n] = {d for d in part if d <= top} - trans[n]   # (less another line's)
+                    trans[n] |= {d for d in full | part if d <= top}
+                    if emit == "kin":
+                        stops[n] = across[n] & self._ccx_coupled_translations(frame, ds)
                 if frame is not None:     # some rotations about an ORIENTATION's axes: no tie
                     rots = {n: ds for n, ds in rots.items() if len(ds) in (0, 3)}   # per DOF
-                out.append(dict(kind=kind, emit=emit, ref=ref, rot=rot,
-                                planar=planar, trans=trans, rots=rots))
+                out.append(dict(kind=kind, emit=emit, ref=ref, rot=rot, planar=planar,
+                                trans=trans, rots=rots, across=across, stops=stops))
         # the rigid bodies of *MPC BEAM lines, emitted as *RIGID BODY with a ROT NODE: the
         # dependent nodes follow the independent one in displacement and rotation
         for bodies in self._mpc_bodies.values():
@@ -21032,8 +21130,8 @@ class Converter:
         Both then start the step equal, so the same target (_same_bc) keeps them equal."""
         step = c["steps"][s]
         e = step["st"][(m, d)]
-        if not e[3]:
-            return False
+        if not e[3] or d in c.get("across", {}).get(m, ()):
+            return False                 # (across an ORIENTATION's coupled axes: not imposed)
         if d == 3 and c["planar"]:
             return True                  # no DOF 3 on a 2-D node in Abaqus; ccx's is held anyway
         if m in self._transformed or c["ref"] in self._transformed:
@@ -21513,6 +21611,41 @@ class Converter:
         coupling's ORIENTATION does not change the constraint."""
         return dofs >= ({1, 2} if members and all(n in self._plane_only for n in members) else {1, 2, 3})
 
+    @staticmethod
+    def _ccx_coupled_translations(frame: Union[None, str, Tuple[Vec, Vec, Vec]], dofs: set) -> set:
+        """The global translations ccx 2.23 eliminates at a member of its *COUPLING +
+        *KINEMATIC of DOFs ``dofs``: the coupled ones, or with an ORIENTATION of axes
+        ``frame`` (_coupling_frame) and some translations, per coupled local axis in turn the
+        one with the largest component not yet taken, the first of equal ones (probed: a BC on
+        any other one solves); all three where the axes are not known."""
+        trans = dofs & {1, 2, 3}
+        if frame is None or not trans or trans == {1, 2, 3}:
+            return trans
+        if isinstance(frame, str):
+            return {1, 2, 3}
+        taken: List[int] = []
+        for j in sorted(trans):
+            e = frame[j - 1]
+            free = [k for k in (1, 2, 3) if k not in taken]
+            top = max(abs(e[k - 1]) for k in free)
+            taken.append(next(k for k in free if abs(e[k - 1]) >= top * (1.0 - 1e-9)))
+        return set(taken)
+
+    @staticmethod
+    def _coupled_span(frame: Tuple[Vec, Vec, Vec], dofs: set) -> Tuple[set, set]:
+        """(full, partial): the global translations a coupling of local translations ``dofs``
+        along ORIENTATION axes ``frame`` holds — those along a combination of the coupled
+        axes —, and those it only touches: neither along the coupled axes nor normal to them."""
+        full: set = set()
+        part: set = set()
+        for d in (1, 2, 3):
+            p = sum(frame[j - 1][d - 1] ** 2 for j in dofs & {1, 2, 3})
+            if p >= 1.0 - 1e-9:
+                full.add(d)
+            elif p > 1e-18:
+                part.add(d)
+        return full, part
+
     def _kin_rows_along(self, ref: int, rot: int, members: Sequence[int], dofs: set,
                         axes: Tuple[Vec, Vec, Vec]) -> List[List[Tuple[int, int, float]]]:
         """_kin_rows for a coupling with an ORIENTATION of axes ``axes``: Abaqus couples the
@@ -21739,10 +21872,12 @@ class Converter:
         """The nodes *COUPLING ``b`` couples in Abaqus, and whether every node of its surface
         lies within its INFLUENCE RADIUS, a sphere about the reference node (Analysis User's
         Guide, 'Coupling constraints'): of a node surface the nodes within it, of an element
-        surface every node of each facet with a node within it (a node at the radius counts).
-        With no node within it Abaqus takes the facet nearest the reference node, which the
-        converter does not find: no nodes.  Without a radius that reads, or with an undefined
-        reference node: the whole surface (ccx 2.23 ignores the parameter)."""
+        surface every node of each facet the sphere reaches ('fully or partially inscribed':
+        a node within it, or the facet's distance, _facet_distance; at the radius counts).
+        Where it reaches none, the nodes of the facet nearest the reference node — of every
+        facet as near, where that point is on an edge or vertex they share (``_nearest_facet``).
+        Without a radius that reads, or with an undefined reference node: the whole surface
+        (ccx 2.23 ignores the parameter)."""
         surf = (b.param("SURFACE") or "").strip()
         nodes = self._surface_member_nodes(surf)
         r = self._influence_radius(b)
@@ -21760,11 +21895,19 @@ class Converter:
         else:
             kept = set()
             types: Dict[str, str] = {}
+            near: List[Tuple[float, List[int]]] = []
             for token, face in sd[1]:
                 for e in self._resolve_elements(token):
-                    facet = self._face_nodes(e, face, types)
-                    if any(inside(n) for n in facet):
+                    facet, corners = self._facet(e, face, types)
+                    dist = self._facet_distance(x0, facet, corners)
+                    if any(inside(n) for n in facet) or (dist is not None and dist <= r * (1.0 + 1e-9)):
                         kept.update(facet)
+                    elif dist is not None:
+                        near.append((dist, facet))
+            if not kept and near:
+                self._nearest_facet.add(id(b))
+                least = min(d for d, _ in near) + 1e-9 * self._model_span()
+                kept = {n for d, facet in near if d <= least for n in facet}
         return [n for n in nodes if n in kept], all(inside(n) for n in nodes)
 
     def _radius_holds_none(self, b: Block, nodes: Sequence[int]) -> bool:
@@ -21775,9 +21918,15 @@ class Converter:
             any(n != ref for n in self._surface_member_nodes(b.param("SURFACE") or ""))
 
     def _face_nodes(self, eid: int, face: Optional[str], types: Dict[str, str]) -> List[int]:
+        return self._facet(eid, face, types)[0]
+
+    def _facet(self, eid: int, face: Optional[str], types: Dict[str, str]) -> Tuple[List[int], int]:
+        """The nodes of facet ``face`` of element ``eid``, corners first, and how many corners
+        it has: 2 on a shell edge, 3 or 4 on a face, 0 where the face is not known (the whole
+        element's nodes)."""
         info = self.geom.elements.get(eid)
         if not info:
-            return []
+            return [], 0
         typ, conn = info
         if typ not in types:
             types[typ] = ccx_type(typ)
@@ -21785,17 +21934,36 @@ class Converter:
         if cc in SHELL_TYPES or cc.startswith("M3D"):
             # SPOS/SNEG (ccx S1/S2) cover the whole element; edges are E1..E4 (ccx S3..S6)
             m = re.fullmatch(r"E([1-4])", f) or re.fullmatch(r"S([3-6])", f)
-            if not m:
-                return list(conn)
-            k = int(m.group(1)) - (2 if f.startswith("S") else 0)
             nc = 3 if n in (3, 6) else 4
+            if not m:
+                return list(conn), min(nc, n)
+            k = int(m.group(1)) - (2 if f.startswith("S") else 0)
             pos = [k, k % nc + 1] + ([nc + k] if n >= 2 * nc else [])
-            return [conn[p - 1] for p in pos if p <= n]
+            return [conn[p - 1] for p in pos if p <= n], 2
         fam = {4: "TET", 10: "TET", 6: "WEDGE", 15: "WEDGE", 8: "HEX", 20: "HEX"}.get(n)
         m = re.fullmatch(r"S(\d)", f)
         if cc.startswith("C3D") and fam and m and int(m.group(1)) in FACE_NODES[fam]:
-            return [conn[p - 1] for p in FACE_NODES[fam][int(m.group(1))] if p <= n]
-        return list(conn)
+            nodes = [conn[p - 1] for p in FACE_NODES[fam][int(m.group(1))] if p <= n]
+            return nodes, 3 if len(nodes) in (3, 6) else 4
+        return list(conn), 0
+
+    def _facet_distance(self, x0: Vec, nodes: Sequence[int], corners: int) -> Optional[float]:
+        """The distance from point ``x0`` to a facet (_facet): to the segment or triangles of
+        its corners (a quadrilateral split along a diagonal; a curved one taken flat) or to
+        its nearest node, whichever is less; None where a node is undefined."""
+        pts = [self.geom.nodes.get(n) for n in nodes]
+        if not pts or any(p is None for p in pts):
+            return None
+        best = min(math.dist(x0, p) for p in pts)
+        c = pts[:corners]
+        if corners == 2:
+            ab = vsub(c[1], c[0])
+            t = min(1.0, max(0.0, vdot(vsub(x0, c[0]), ab) / vdot(ab, ab))) if vdot(ab, ab) else 0.0
+            best = min(best, math.dist(x0, vadd(c[0], vscale(ab, t))))
+        elif corners in (3, 4):
+            for tri in [(c[0], c[1], c[2])] + ([(c[0], c[2], c[3])] if corners == 4 else []):
+                best = min(best, math.dist(x0, closest_on_triangle(x0, *tri)))
+        return best
 
     def _bc_card_records(self, b: Block) -> List[List[str]]:
         """The data records of *BOUNDARY card ``b`` as written: those _plan_coupled_bcs left
@@ -21934,9 +22102,12 @@ class Converter:
                     taken_too.update((int(ref), d) for d in dofs)
                     continue
                 taken_too.update((int(ref), d) for d in (4, 5, 6))    # the coupling rotation
+                ori = (params.get("ORIENTATION") or "").strip()
+                elim = self._ccx_coupled_translations(
+                    (self._conn_axes(ori) or "unknown") if ori else None, dofs)
                 for m in surface_nodes((params.get("SURFACE") or "").strip()):
                     if m != int(ref):
-                        busy.update({(m, d): "*KINEMATIC coupling" for d in dofs if d <= 3})
+                        busy.update({(m, d): "*KINEMATIC coupling" for d in elim})
             elif kw == "MPC":
                 for j in data:
                     f = fields(j)
@@ -22365,6 +22536,21 @@ class Converter:
             where = (f"node {m} DOF {d} follows reference node {ref} through {what[kind]} and also "
                      f"has a *BOUNDARY that the reference node's BCs do not impose ({len(items)} "
                      f"such DOF(s) on {nodes} node(s)). ")
+            if why.startswith("across"):
+                where = (f"node {m} has a *BOUNDARY on global DOF {d}, which the local axes that "
+                         f"{what[kind]} with an ORIENTATION couples to reference node {ref} only "
+                         f"partly cover ({len(items)} such DOF(s) on {nodes} node(s)). ")
+                effect = ("ccx stops: '*ERROR in cascade ... dependent side of a MPC and a SPC' (it "
+                          "eliminates, per coupled axis, the global DOF along which that axis has "
+                          "its largest component; probed). " if why == "across-stop" else
+                          "ccx holds both, the BC and the coupling. ")
+                self.report.warn("Possible overconstraint: " + where + effect +
+                                 "Abaqus/Standard applies no other displacement constraint to a node "
+                                 "of a kinematic coupling, and which global DOF it eliminates along a "
+                                 "turned axis is not documented: the BC is kept as written (also "
+                                 "with --approximate). Take the node out of the BC, or verify.",
+                                 once=True)
+                continue
             if trans and emit == "eq":
                 effect = ("ccx keeps the BC as written: the body's linear *EQUATIONs are reordered "
                           "so that the body follows it, unlike in Abaqus. ")

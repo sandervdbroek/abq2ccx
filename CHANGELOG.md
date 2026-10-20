@@ -6,6 +6,16 @@ physics.
 
 ## Unreleased
 
+* **Member BCs of a coupling along an `ORIENTATION=`** — where a kinematic coupling ties only
+  some local translations, the converter judged its members' BCs by the global DOF numbers.
+  A BC the coupling does not hold was taken off as implied (0.1-0.2 of max |u| off), and ccx
+  stopped on BCs and `*EQUATION`s on the global DOF it eliminates. Those are now judged along
+  the coupled axes. A BC that the coupled axes only partly cover stays, with a warning: Abaqus
+  does not document which global DOF it eliminates there.
+* **Coupling `REF NODE=` a set of several nodes** — Abaqus couples each reference node to the
+  surface nodes within its own `INFLUENCE RADIUS`; the converter coupled the first only. Each
+  now gets its own coupling. A kinematic coupling without a radius, or whose spheres share a
+  node, keeps the first reference node, with a warning (reduced physics).
 * **`*EL PRINT ELKE` where ccx 2.23 segfaults** — ccx crashes computing element kinetic
   energies in a `*BUCKLE` step and in a `*STATIC` or `*VISCO` step it runs linearly (probed).
   The converter now drops `ELKE` there, with a note: such a step has no kinetic energy. ccx
@@ -37,10 +47,11 @@ physics.
   which are now left out there, with a warning.
 * **Coupling `INFLUENCE RADIUS=`** — ccx 2.23 ignores the parameter and coupled the whole
   surface. Abaqus couples the nodes of a node surface within the radius of the reference node,
-  and every node of each element face with a node within it. A kinematic coupling now gets a
-  node surface of those nodes (its linear equations in a `*DYNAMIC` deck cover only them); with
-  none within the radius it is commented out, with a warning. A distributing coupling keeps its
-  surface, warned where the radius leaves nodes out.
+  and every node of each element face the radius reaches; if it reaches none, those of the
+  nearest face. A kinematic coupling now gets a node surface of those nodes (its linear
+  equations in a `*DYNAMIC` deck cover only them); a node surface with no node within the
+  radius is commented out, with a warning. A distributing coupling keeps its surface, warned
+  where the radius leaves nodes out.
 * **Coupled rotations along a coupling `ORIENTATION=`** — the rotations of knotted shell and
   beam members were tied about the global axes where only some rotations are coupled (1.6 %
   off a model turned into the orientation's axes). They are now tied about the orientation's

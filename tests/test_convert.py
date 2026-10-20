@@ -7699,17 +7699,27 @@ def test_coupling_influence_radius():
     body, _, rep = convert_str(_radius_block((1., 1., 1.5), kin.format(s="TOPE", r="0.6")))
     assert "SURFACE=TOPE\n*KINEMATIC" in body and "_RADIUS" not in body
     assert "INFLUENCE RADIUS left out: Abaqus couples every node of the surface" in rep.text()
-    # no node within it: Abaqus takes the facet nearest the reference node (an element surface),
-    # which the converter does not find, or has none (a node surface): commented out, with its
-    # *KINEMATIC, also in a *DYNAMIC deck
-    for surf, why in (("TOPE", "couples the nodes of the facet nearest the reference node"),
-                      ("TOPS", "has none to couple")):
-        for step in ("*Step\n*Static\n*Boundary\n1, 1, 3\n*End Step\n", KIN_DYN_STEP.format("").replace("RP", "100")):
-            body, conv, rep = convert_str(_radius_block(corner, kin.format(s=surf, r="0.1"), step))
-            assert "** *COUPLING, CONSTRAINT NAME=C" in body and "** *KINEMATIC" in body
-            assert "*COUPLING" not in "\n".join(_live(body)) and "*KINEMATIC" not in "\n".join(_live(body))
-            assert why in rep.text() and conv.reduced_physics
-            assert not _equation_terms(body) and 100 not in conv._rb_rot
+    # no node within it: a node surface has none to couple: commented out, with its *KINEMATIC,
+    # also in a *DYNAMIC deck
+    for step in ("*Step\n*Static\n*Boundary\n1, 1, 3\n*End Step\n", KIN_DYN_STEP.format("").replace("RP", "100")):
+        body, conv, rep = convert_str(_radius_block(corner, kin.format(s="TOPS", r="0.1"), step))
+        assert "** *COUPLING, CONSTRAINT NAME=C" in body and "** *KINEMATIC" in body
+        assert "*COUPLING" not in "\n".join(_live(body)) and "*KINEMATIC" not in "\n".join(_live(body))
+        assert "has none to couple" in rep.text() and conv.reduced_physics
+        assert not _equation_terms(body) and 100 not in conv._rb_rot
+    # an element surface: the facets the sphere reaches, a node within it or not (it cuts the
+    # first facet's middle); none reached: the facet nearest the reference node, the two of an
+    # edge it is nearest to (the converter commented it out)
+    for ref, r, kept, nearest in (((0.5, 0.5, 1.3), "0.4", [10, 11, 13, 14], False),
+                                  (corner, "0.1", [10, 11, 13, 14], True),
+                                  ((1., 0.5, 1.2), "0.1", [10, 11, 12, 13, 14, 15], True)):
+        body, conv, rep = convert_str(_radius_block(ref, kin.format(s="TOPE", r=r)))
+        head = "*SURFACE, NAME=TOPE_RADIUS, TYPE=NODE\n"
+        assert sorted(map(int, body.split(head)[1].split("*")[0].split())) == kept
+        assert ("INFLUENCE RADIUS reaches no facet" in rep.text()) == nearest and not conv.reduced_physics
+        dyn, conv, _ = convert_str(_radius_block(ref, kin.format(s="TOPE", r=r), KIN_DYN_STEP.format("")
+                                                 .replace("RP", "100")))
+        assert sorted({row[0][0] for row in _equation_terms(dyn)}) == kept
     # a distributing coupling keeps its surface: warned where the radius leaves nodes out (Abaqus
     # also weights them by the part of each facet within it)
     dist = "*Coupling, constraint name=C, ref node=100, surface=TOPE, influence radius={r}\n*Distributing\n"
@@ -7780,6 +7790,95 @@ def test_kinematic_coupling_rotations_along_its_orientation():
         assert not ties(body) and why in rep.text() and conv.reduced_physics
     body, conv, rep = convert_str(S4 + ORI_MIX + cpl.format(d="1, 5") + stat.format(", nlgeom"), approximate=True)
     assert len(ties(body)) == 4 and "[APPROX] Kinematic coupling of some rotations" in rep.text()
+
+
+
+def test_coupling_on_several_reference_nodes():
+    # REF NODE= a set of several nodes: Abaqus couples each to the surface nodes within its own
+    # INFLUENCE RADIUS; the converter coupled the first only (validate_with_ccx.py
+    # coupling_several_reference_nodes_*)
+    two = "*Node\n101, 2., 2., 1.2\n*Nset, nset=RS\n100, 101\n"
+    kin = two + "*Coupling, constraint name=C, ref node=RS, surface={s}{r}\n*Kinematic\n"
+    corner = (0., 0., 1.2)
+    for step in ("*Step\n*Static\n*Boundary\n1, 1, 3\n*End Step\n", KIN_DYN_STEP.format("").replace("RP", "100")):
+        body, conv, rep = convert_str(_radius_block(corner, kin.format(s="TOPS", r=", influence radius=0.5"), step))
+        assert "one coupling per reference node" in rep.text() and not conv.reduced_physics
+        if "Static" in step:
+            for n, node in ((100, 10), (101, 18)):
+                assert f"*COUPLING, CONSTRAINT NAME=C_{n}, REF NODE={n}, SURFACE=TOPS_RADIUS" in body
+            heads = [l for l in body.splitlines() if l.startswith("*SURFACE, NAME=TOPS_RADIUS")]
+            assert len(heads) == 2 and len(set(heads)) == 2 and body.count("\n*KINEMATIC\n1, 3") == 2
+        else:
+            eqs = _equation_terms(body)
+            assert sorted(row[0][0] for row in eqs) == [10] * 3 + [18] * 3
+            assert {row[1][0] for row in eqs if row[0][0] == 10} == {100}
+            assert {row[1][0] for row in eqs if row[0][0] == 18} == {101}
+    # a node in two spheres (the element surface's facet of node 14), or no radius: a kinematic
+    # coupling on the first reference node only, warned
+    for s, r, why in (("TOPE", ", influence radius=0.5", "spheres hold node 14"),
+                      ("TOPS", "", "without an INFLUENCE RADIUS")):
+        body, conv, rep = convert_str(_radius_block(corner, kin.format(s=s, r=r)))
+        assert "REF NODE=100" in body and "REF NODE=101" not in body and "REF NODE=RS" not in body
+        assert why in rep.text() and "only the first (100) is coupled" in rep.text()
+        assert conv.reduced_physics
+    # a distributing coupling: one per reference node, also on the whole surface
+    body, conv, rep = convert_str(_radius_block(corner, two + "*Coupling, constraint name=C, ref node=RS, "
+                                                "surface=TOPE\n*Distributing\n"))
+    assert "REF NODE=100, SURFACE=TOPE\n*DISTRIBUTING" in body and "REF NODE=101, SURFACE=TOPE\n*DISTRIBUTING" in body
+    assert not conv.reduced_physics
+
+def _ori_z(deg):
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    return f"*Orientation, name=OR1\n{c:.15g}, {s:.15g}, 0., {-s:.15g}, {c:.15g}, 0.\n"
+
+
+def test_kinematic_coupling_member_bcs_along_its_orientation():
+    # a coupling of some translations along an ORIENTATION's axes: ccx eliminates, per coupled
+    # axis, the global DOF along which it has its largest component (probed); the member BCs
+    # the converter takes off as implied, or keeps, went by the global DOF numbers
+    # (validate_with_ccx.py coupling_orientation_member_bc_*)
+    E = ORI_MIX_AXES
+    r = 1 / math.sqrt(2)
+    col = (r, 0.5, 0.5), (-r, 0.5, 0.5)
+    for axes, dofs, want in ((E, {1}, {2}), (E, {1, 2}, {2, 3}), (E, {3}, {1}), (E, {2, 3}, {1, 3}),
+                             (col + ((0., -r, r),), {1, 2}, {1, 2}), (E, {1, 2, 3}, {1, 2, 3})):
+        assert A.Converter._ccx_coupled_translations(axes, dofs | {5}) == want
+    assert A.Converter._ccx_coupled_translations(None, {1, 4}) == {1}
+    assert A.Converter._ccx_coupled_translations("unknown", {1}) == {1, 2, 3}
+    cpl = "*Coupling, constraint name=C, ref node=100, surface=TOPS, orientation=OR1\n*Kinematic\n{d}\n"
+    ref = "100, 1, 1, 0.01\n100, 2, 2, 0.02\n100, 3, 6\n"
+    stat = "*Step\n*Static\n*Boundary\n1, 1, 3\n" + ref + "{bc}*End Step\n"
+    dyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 3\n" + ref + "{bc}*End Step\n"
+    for deg, bc, step, warn in (
+            # local 1 = global y: a BC on y the reference node's imposes, on x unrelated
+            (90, "10, 2, 2, 0.02\n10, 1, 1, 0.005\n", stat, None),
+            (90, "10, 2, 2, 0.02\n10, 1, 1, 0.005\n", dyn, None),
+            # turned 60 degrees: the coupling holds neither x nor y; ccx eliminates y
+            (60, "10, 1, 1, 0.01\n", stat, "ccx holds both"),
+            (60, "10, 2, 2, 0.02\n", stat, "ccx stops"),
+            (30, "10, 1, 1, 0.01\n", dyn, "ccx holds both")):
+        deck = _radius_block((1., 1., 1.5), _ori_z(deg) + cpl.format(d="1, 1"), step.format(bc=bc))
+        body, conv, rep = convert_str(deck)
+        bcs = _bc_lines(body)
+        if deg == 90:
+            assert "10,2,2,0.02" not in bcs and "10,1,1,0.005" in bcs, bcs
+        else:
+            assert bc.strip().replace(" ", "") in bcs, bcs
+        text = rep.text()
+        assert ("partly cover" in text) == bool(warn) and (not warn or warn in text)
+        assert "Abaqus/Standard eliminates the constrained DOFs" not in text
+        approx, _, _ = convert_str(deck, approximate=True)
+        assert _bc_lines(approx) == bcs           # (Abaqus' handling of these is not known)
+    # local 1 and 2 turned about z: the coupling holds x and y, as without the orientation
+    body, _, rep = convert_str(_radius_block((1., 1., 1.5), _ori_z(30) + cpl.format(d="1, 2"),
+                                             stat.format(bc="10, 1, 1, 0.01\n")))
+    assert "10,1,1,0.01" not in _bc_lines(body) and "partly cover" not in rep.text()
+    # an *EQUATION on a DOF ccx eliminates for the coupling (global 2 at 60 degrees, global 1 at
+    # 30) is reordered; ccx stopped on it ('*ERROR reading *EQUATION')
+    for deg, first in ((60, (11, 3)), (30, (10, 2))):
+        body, _, _ = convert_str(_radius_block((1., 1., 1.5), _ori_z(deg) + cpl.format(d="1, 1") +
+                                               "*Equation\n2\n10, 2, 1., 11, 3, -1.\n", stat.format(bc="")))
+        assert _equation_terms(body)[0][0][:2] == first
 
 
 def test_rigid_constraints_in_a_linear_dynamic_deck():
