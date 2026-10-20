@@ -1859,6 +1859,22 @@ def analytic_frame(kind: str, frame: Sequence[Vec]) -> Tuple[Vec, Vec, Vec, Vec]
     return a, er, vcross(ez, er), ez
 
 
+def tie_fraction(form: str, node_based: bool, explicit: bool) -> float:
+    """Abaqus' default position tolerance of a *TIE as a fraction of the typical facet
+    diagonal (Analysis User's Guide, "Mesh tie constraints"): 5 % for the node-to-surface
+    formulation (TYPE=NODE TO SURFACE, a node-based slave surface, Abaqus/Explicit's default),
+    else 10 % (surface-to-surface, Abaqus/Standard's default).  ``form``: TYPE= without
+    blanks, upper case."""
+    n2s = node_based or form == "NODETOSURFACE" or (explicit and form != "SURFACETOSURFACE")
+    return 0.05 if n2s else 0.10
+
+
+def pair_tie_tolerance(edges: Sequence[float]) -> float:
+    """The position tolerance of a tied contact pair the converter writes as a ccx *TIE:
+    ccx's default, 2.5 % of the master faces' mean edge length ``edges``."""
+    return 0.025 * (sum(edges) / len(edges)) if edges else 0.0
+
+
 def closest_on_triangle(p: Vec, a: Vec, b: Vec, c: Vec) -> Vec:
     """The point of triangle a, b, c nearest to p (Ericson, Real-Time Collision Detection)."""
     ab, ac, ap = vsub(b, a), vsub(c, a), vsub(p, a)
@@ -13194,13 +13210,11 @@ class Converter:
                         for e in self._resolve_elements(token) if e in self.geom.elements]
             pts = faces(master) or faces(slave)        # (as for an analytical master)
             if pair:
-                edges = [vnorm(vsub(q[(i + 1) % len(q)], q[i])) for q in pts if len(q) > 1
-                         for i in range(len(q))]
-                tol = 0.025 * sum(edges) / len(edges) if edges else 0.0
+                tol = pair_tie_tolerance([vnorm(vsub(q[(i + 1) % len(q)], q[i])) for q in pts
+                                          if len(q) > 1 for i in range(len(q))])
             else:
                 form = (b.param("TYPE") or "").replace(" ", "").upper()
-                n2s = form == "NODETOSURFACE" or (self._explicit_deck and form != "SURFACETOSURFACE")
-                tol = (0.05 if n2s else 0.10) * self._mean_diagonal(pts)
+                tol = tie_fraction(form, False, self._explicit_deck) * self._mean_diagonal(pts)
         half = 0.0 if not pair or b.has("NO THICKNESS") else \
             0.5 * max([self._mem_thick.get(e, 0.0) for e in self._surface_elements(slave)] or [0.0])
         return tol + half
@@ -15856,16 +15870,18 @@ class Converter:
                 slaves = [n for n in slaves if n not in taken and n in self.geom.nodes]
                 if tol <= 1e-10:
                     if pair:
-                        tol_k = 0.025 * (sum(edge) / len(edge))
+                        tol_k = pair_tie_tolerance(edge)
                     else:
-                        n2s = node_based or form == "NODETOSURFACE" or \
-                            (self._explicit_deck and form != "SURFACETOSURFACE")
-                        if toks[1] in self._analytic:      # the slave side's size (Abaqus)
+                        # the typical facet diagonal is the rigid facets' (_skin_diag: a skin
+                        # brick's face also spans its depth, unlike _membrane_tie_tolerance's
+                        # element faces), the slave side's for an analytical master (Abaqus)
+                        if toks[1] in self._analytic:
                             base = self._node_spacing(slaves) if node_based else \
                                 self._mean_diagonal([self._face_points(e, f) for e, f in slave_faces])
                         else:
                             base = sum(self._skin_diag.get(sk, 0.0) for sk, _ in faces) / len(faces)
-                        tol_k = (0.05 if n2s else 0.10) * (base if base > 0 else sum(edge) / len(edge))
+                        tol_k = tie_fraction(form, node_based, self._explicit_deck) * \
+                            (base if base > 0 else sum(edge) / len(edge))
                 else:
                     tol_k = tol
                 # half thickness of a slave shell node on its side towards the master

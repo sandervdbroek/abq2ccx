@@ -12667,6 +12667,18 @@ def test_rotary_inertia_in_a_turned_orientation():
     plain = inertia(f"*ORIENTATION, NAME=O\n1., 0., 0., 0., {co!r}, {si!r}\n")
     assert max(abs(turned[i][j] - plain[i][j]) for i in range(3) for j in range(3)) < 1e-9
 
+
+def test_tie_tolerance_rules_shared():
+    # one rule for the membrane ties and the ties to rigid masters (they differ only in which
+    # facets give the typical size)
+    assert A.tie_fraction("", False, False) == 0.10
+    assert A.tie_fraction("NODETOSURFACE", False, False) == 0.05
+    assert A.tie_fraction("", True, False) == 0.05                  # a node-based slave
+    assert A.tie_fraction("", False, True) == 0.05                  # Abaqus/Explicit's default
+    assert A.tie_fraction("SURFACETOSURFACE", False, True) == 0.10
+    edges = [0.1, 0.2, 0.3000000000000001]
+    assert A.pair_tie_tolerance(edges) == 0.025 * (sum(edges) / 3) and A.pair_tie_tolerance([]) == 0.0
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
