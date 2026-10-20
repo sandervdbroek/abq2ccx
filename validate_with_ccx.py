@@ -4298,6 +4298,125 @@ def dashpot1_ground_deck():
             "*NODE PRINT, NSET=PROBE, GLOBAL=YES, FREQUENCY=200\nU\n*END STEP\n")
 
 
+def dashpot2_dofs_deck():
+    """Two DASHPOT2s, c = 10, between unit masses, *DYNAMIC NLGEOM 2 s: (a) nodes 1 -> 2,
+    ORIENTATION OR (30 degrees about z), DOFs 1, 2: node 1 pushed by 1 along OR axis 1 and by 1
+    across it (along OR axis 2 and z); node 2 (its *TRANSFORM the OR axes, held in its local
+    1, 3) by 0.5 along OR axis 2.  (b) nodes 3 -> 4, no ORIENTATION, DOFs 2, 3: node 3
+    (*TRANSFORM 45 degrees about z) pushed by 1 along its local 2 and by 1 along its local 1
+    and 3 (across); node 4 (held in x, y) by 0.5 along z.  Along the dashpot DOFs x1 + x2 =
+    1.5 t^2 / 2 and x1 - x2 = w (t - (1 - e^(-20 t)) / 20), w = 0.5 / 20 (dashpot2_dofs_answer);
+    across t^2 / 2.  Printed in global components."""
+    c, s, r = math.cos(math.radians(30)), math.sin(math.radians(30)), math.sqrt(0.5)
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 1., 0.\n4, 1., 1., 0.\n"
+            "*ELEMENT, TYPE=MASS, ELSET=EM\n11, 1\n12, 2\n13, 3\n14, 4\n*MASS, ELSET=EM\n1.\n"
+            f"*ORIENTATION, NAME=OR\n{c:.15f}, {s:.15f}, 0., {-s:.15f}, {c:.15f}, 0.\n"
+            f"*NSET, NSET=N2\n2\n*TRANSFORM, NSET=N2\n{c:.15f}, {s:.15f}, 0., {-s:.15f}, {c:.15f}, 0.\n"
+            f"*NSET, NSET=N3\n3\n*TRANSFORM, NSET=N3\n{r:.15f}, {r:.15f}, 0., {-r:.15f}, {r:.15f}, 0.\n"
+            "*ELEMENT, TYPE=DASHPOT2, ELSET=DA\n21, 1, 2\n*ELEMENT, TYPE=DASHPOT2, ELSET=DB\n22, 3, 4\n"
+            "*DASHPOT, ELSET=DA, ORIENTATION=OR\n1, 2\n10.\n*DASHPOT, ELSET=DB\n2, 3\n10.\n"
+            "*NSET, NSET=PROBE\n1, 2, 3, 4\n*BOUNDARY\n2, 1, 1\n2, 3, 3\n4, 1, 2\n"
+            "*STEP, NLGEOM, INC=1000\n*DYNAMIC, DIRECT\n0.01, 2.\n*CLOAD\n"
+            f"1, 1, {c - s:.15f}\n1, 2, {s + c:.15f}\n1, 3, 1.\n2, 2, 0.5\n3, 2, 1.\n3, 1, 1.\n3, 3, 1.\n"
+            "4, 3, 0.5\n*NODE PRINT, NSET=PROBE, GLOBAL=YES, FREQUENCY=200\nU\n*END STEP\n")
+
+
+def dashpot2_dofs_answer(t=2.0):
+    """(x1, x2, across) of dashpot2_dofs_deck at time ``t``: m x1'' + c (x1' - x2') = 1,
+    m x2'' - c (x1' - x2') = 0.5 (m = 1, c = 10)."""
+    w = 0.5 / 20.0
+    diff, total = w * (t - (1.0 - math.exp(-20.0 * t)) / 20.0), 1.5 * t * t / 2.0
+    return (total + diff) / 2.0, (total - diff) / 2.0, t * t / 2.0
+
+
+ANISO_MASS_AXES = ((1.0, 2.0, 2.0), (-2.0, 2.0, -1.0))   # ORIENTATION a, b: v1 = a / 3, v2 = b / 3
+
+
+def anisotropic_mass_deck(kind):
+    """Point masses 1, 4, 9 along the axes of ORIENTATION AX (v1 = (1, 2, 2) / 3, v2 = (-2, 2,
+    -1) / 3).  "freq": nodes 1 and 3 on three SPRING1s each along x, y, z, of 36 and 72:
+    *FREQUENCY, omega^2 = 4, 8, 9, 18, 36 (and 72; ccx returns fewer modes than the model has
+    DOFs).  "dyn": node 1 free (on a 1e-12 spring: ccx 2.23 moves no node that is on MASS
+    elements only), a force (1, 1, 1) for 1 s, *DYNAMIC NLGEOM: u = M^-1 F t^2 / 2."""
+    a, b = ANISO_MASS_AXES
+    d = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 1., 0.\n*ELEMENT, TYPE=MASS, ELSET=EM\n1, 1\n"
+         + ("3, 3\n" if kind == "freq" else "") +
+         f"*ORIENTATION, NAME=AX\n{a[0]}, {a[1]}, {a[2]}, {b[0]}, {b[1]}, {b[2]}\n"
+         "*MASS, ELSET=EM, TYPE=ANISOTROPIC, ORIENTATION=AX\n1., 4., 9.\n*NSET, NSET=PROBE\n1\n")
+    if kind == "freq":
+        return d + "".join(f"*ELEMENT, TYPE=SPRING1, ELSET=K{n}{k}\n{30 + 3 * n + k}, {n}\n*SPRING, "
+                           f"ELSET=K{n}{k}\n{k}\n{18 * (n + 1)}.\n" for n in (1, 3) for k in (1, 2, 3)) + \
+            "*BOUNDARY\n2, 1, 3\n*STEP\n*FREQUENCY\n5\n*END STEP\n"
+    return d + ("*ELEMENT, TYPE=SPRINGA, ELSET=KA\n31, 1, 2\n*SPRING, ELSET=KA\n\n1.e-12\n*BOUNDARY\n2, 1, 3\n"
+                "*STEP, NLGEOM, INC=1000\n*DYNAMIC, DIRECT\n0.01, 1.\n*CLOAD\n1, 1, 1.\n1, 2, 1.\n1, 3, 1.\n"
+                "*NODE PRINT, NSET=PROBE, FREQUENCY=100\nU\n*END STEP\n")
+
+
+def anisotropic_mass_answer(t=1.0):
+    """u of anisotropic_mass_deck("dyn") at time ``t``: M^-1 F t^2 / 2, M^-1 = sum v_i v_i^T / M_ii."""
+    v1, v2 = (tuple(x / 3.0 for x in ax) for ax in ANISO_MASS_AXES)
+    vs, m = (v1, v2, _cross(v1, v2)), (1.0, 4.0, 9.0)
+    return tuple(sum(sum(vs[i]) / m[i] * vs[i][j] for i in range(3)) * t * t / 2.0 for j in range(3))
+
+
+def spring_transform_deck():
+    """SPRING1 / SPRING2 at nodes with a *TRANSFORM, *STATIC NLGEOM: node 1 (30 degrees about z)
+    on a SPRING1 of 100 on its DOF 1, held in its local 2, 3 and loaded 1 along its local 1:
+    0.01 along it.  Node 2 (45 degrees about z) to node 3 (30 degrees about x) by a SPRING2 of
+    50 on DOFs 2, 3: node 3 held, its local DOF 3 moved 0.02; node 2 held in its local 1, 3 and
+    loaded 1 along its local 2: 0.02 + 1/50 = 0.04 along it.  Printed in global components."""
+    c, s, r = math.cos(math.radians(30)), math.sin(math.radians(30)), math.sqrt(0.5)
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*NSET, NSET=PROBE\n1, 2, 3\n"
+            f"*NSET, NSET=T1\n1\n*TRANSFORM, NSET=T1\n{c:.15f}, {s:.15f}, 0., {-s:.15f}, {c:.15f}, 0.\n"
+            f"*NSET, NSET=T2\n2\n*TRANSFORM, NSET=T2\n{r:.15f}, {r:.15f}, 0., {-r:.15f}, {r:.15f}, 0.\n"
+            f"*NSET, NSET=T3\n3\n*TRANSFORM, NSET=T3\n1., 0., 0., 0., {c:.15f}, {s:.15f}\n"
+            "*ELEMENT, TYPE=SPRING1, ELSET=K1\n1, 1\n*SPRING, ELSET=K1\n1\n100.\n"
+            "*ELEMENT, TYPE=SPRING2, ELSET=K2\n2, 2, 3\n*SPRING, ELSET=K2\n2, 3\n50.\n"
+            "*BOUNDARY\n1, 2, 3\n2, 1, 1\n2, 3, 3\n3, 1, 2\n*STEP, NLGEOM\n*STATIC\n*BOUNDARY\n3, 3, 3, 0.02\n"
+            "*CLOAD\n1, 1, 1.\n2, 2, 1.\n*NODE PRINT, NSET=PROBE, GLOBAL=YES\nU\n*END STEP\n")
+
+
+def spring_numbers_deck():
+    """*SPRING constants Abaqus reads and ccx 2.23 stopped on: a SPRING1 of '100', a SPRINGA of
+    '1e2' after a DOF line '2,' (Abaqus: a blank line), a SPRING2 of '50' on DOFs 1, 1, and a
+    NONLINEAR SPRING1 '-200, -1 / 0, 0 / 200, 1', each pulled by 1: 0.01, 0.01, 0.02, 0.005."""
+    return ("*NODE\n1, 0., 0., 0.\n2, -1., 1., 0.\n3, 0., 1., 0.\n4, 1., 1., 0.\n5, 2., 1., 0.\n6, 0., 2., 0.\n"
+            "*NSET, NSET=PROBE\n1, 3, 5, 6\n*ELEMENT, TYPE=SPRING1, ELSET=K1\n1, 1\n*SPRING, ELSET=K1\n1\n100\n"
+            "*ELEMENT, TYPE=SPRINGA, ELSET=KA\n2, 2, 3\n*SPRING, ELSET=KA\n2,\n1e2\n"
+            "*ELEMENT, TYPE=SPRING2, ELSET=K2\n3, 4, 5\n*SPRING, ELSET=K2\n1, 1\n50\n"
+            "*ELEMENT, TYPE=SPRING1, ELSET=KN\n4, 6\n*SPRING, ELSET=KN, NONLINEAR\n1\n-200, -1\n0, 0\n200, 1\n"
+            "*BOUNDARY\n1, 2, 3\n2, 1, 3\n3, 2, 3\n4, 1, 3\n5, 2, 3\n6, 2, 3\n"
+            "*STEP\n*STATIC\n*CLOAD\n1, 1, 1.\n3, 1, 1.\n5, 1, 1.\n6, 1, 1.\n*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+
+
+def connector_distributing_deck(form):
+    """A 2 x 2 x 2 C3D8 cube (E 1000, nu 0.3) clamped at z = 0, its top face's nodes
+    distributing-coupled to RP 9 at (0.5, 0.5, 1.5).  "conn": a BEAM connector from 9 to 19 at
+    an arm (1, 0, 0), the force (0, 1, 0.5) at 19; "load": that force at 9 with the moment
+    r x F = (0, -0.5, 1).  Abaqus: the same solution."""
+    ids, lines = {}, ["*NODE"]
+    for k in range(3):
+        for j in range(3):
+            for i in range(3):
+                ids[(i, j, k)] = 101 + i + 3 * j + 9 * k
+                lines.append(f"{ids[(i, j, k)]}, {0.5 * i}, {0.5 * j}, {0.5 * k}")
+    lines += ["9, 0.5, 0.5, 1.5", "19, 1.5, 0.5, 1.5", "*ELEMENT, TYPE=C3D8, ELSET=CUBE"]
+    for e, (i, j, k) in enumerate(((i, j, k) for k in range(2) for j in range(2) for i in range(2)), 1):
+        lines.append(f"{e}, " + ", ".join(str(ids[(i + a, j + b, k + z)])
+                                          for z in (0, 1) for a, b in ((0, 0), (1, 0), (1, 1), (0, 1))))
+    lines += ["*NSET, NSET=BASE", ", ".join(str(v) for (i, j, k), v in ids.items() if k == 0),
+              "*NSET, NSET=TOP", ", ".join(str(v) for (i, j, k), v in ids.items() if k == 2),
+              "*NSET, NSET=PROBE", "9, 119, 125, 127"]
+    d = "\n".join(lines) + ("\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SOLID SECTION, ELSET=CUBE, MATERIAL=M\n"
+                            "*SURFACE, NAME=TS, TYPE=NODE\nTOP\n*COUPLING, CONSTRAINT NAME=CD, REF NODE=9, "
+                            "SURFACE=TS\n*DISTRIBUTING\n")
+    if form == "conn":
+        d += "*ELEMENT, TYPE=CONN3D2, ELSET=CN\n50, 9, 19\n*CONNECTOR SECTION, ELSET=CN\nBEAM,\n"
+    d += "*BOUNDARY\nBASE, 1, 3\n*STEP\n*STATIC\n*CLOAD\n"
+    d += "19, 2, 1.\n19, 3, 0.5\n" if form == "conn" else "9, 2, 1.\n9, 3, 0.5\n9, 5, -0.5\n9, 6, 1.\n"
+    return d + "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n"
+
+
 def buckle_gravity_deck(preload="grav", static=False, buckle=True, pert=True, n=2, m=20, load=1e5, nev=2):
     """A C3D8 column, 0.1 x 0.1 x 2 in n x n x m elements (E 210e9, nu 0.3, density 7850),
     clamped at its base, loaded ``load`` down at its top centre (node set TIP) in a *STEP,
@@ -10809,6 +10928,96 @@ def main():
               f"and a HINGE connector between two cubes' couplings, in instances turned 90 degrees about x "
               f"and 40 about (1, 2, 3)): their 10 nodes move R u of the unturned instance's (max |u| "
               f"{scale:.3g}; {errs['I1']:.1e} / {errs['I2']:.1e} apart)")
+    failures += 0 if ok else 1
+
+    # DASHPOT2 (DOF i of a node against DOF j of another, in fixed directions): it was a
+    # DASHPOTA along the node line (1.6 off); now a DASHPOTA to a new node that *EQUATIONs move
+    # with the second node's DOF j along DOF i's line
+    u = review_run(dashpot2_dofs_deck(), "dashpot2_dofs", dat_displacements)
+    ok = bool(u) and all(n in u for n in (1, 2, 3, 4))
+    if ok:
+        c30, s30, r = math.cos(math.radians(30)), math.sin(math.radians(30)), math.sqrt(0.5)
+        x1, x2, across = dashpot2_dofs_answer()
+        got = [_dot(u[1], (c30, s30, 0.0)), _dot(u[2], (-s30, c30, 0.0)), _dot(u[3], (-r, r, 0.0)), u[4][2]]
+        side = [_dot(u[1], (-s30, c30, 0.0)), u[1][2], _dot(u[3], (r, r, 0.0)), u[3][2]]
+        err = max([abs(a - b) for a, b in zip(got, (x1, x2, x1, x2))] + [abs(a - across) for a in side])
+        ok = err < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  dashpot2_dofs (DASHPOT2s on DOFs 1, 2 of an ORIENTATION and on "
+              f"a *TRANSFORM's DOF 2 and global DOF 3, c = 10, unit masses pushed by 1 and 0.5, *DYNAMIC "
+              f"NLGEOM): along {', '.join(f'{x:.6f}' for x in got)} ({x1:.6f}, {x2:.6f} analytic), across "
+              f"{side[0]:.6f} ({across:g}); {err:.1e} off")
+    else:
+        print("FAIL  dashpot2_dofs: no displacements of the four masses")
+    failures += 0 if ok else 1
+
+    # *MASS, TYPE=ANISOTROPIC: ccx 2.23 read its first value as an isotropic mass (frequencies
+    # 36, 36, 36, 72, 72; the free mass moved 0.5 along x, y and z); now the smallest mass on the
+    # node and the rest on new nodes tied along each principal axis
+    freqs = review_run(anisotropic_mass_deck("freq"), "anisotropic_mass_freq",
+                       lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+    u = review_run(anisotropic_mass_deck("dyn"), "anisotropic_mass_dyn", dat_displacements)
+    ok = bool(freqs) and len(freqs) == 5 and bool(u) and 1 in u
+    if ok:
+        want = [math.sqrt(w2) / (2.0 * math.pi) for w2 in (4.0, 8.0, 9.0, 18.0, 36.0)]
+        ferr = max(abs(f / w - 1.0) for f, w in zip(freqs, want))
+        uw = anisotropic_mass_answer()
+        uerr = max(abs(a - b) for a, b in zip(u[1], uw))
+        ok = ferr < 1e-5 and uerr < 1e-6 and min(abs(x) for x in u[1]) > 0.3
+        print(f"{'PASS' if ok else 'FAIL'}  anisotropic_mass (*MASS, TYPE=ANISOTROPIC 1, 4, 9 on general "
+              f"ORIENTATION axes): frequencies of masses on springs 36 and 72 "
+              f"{', '.join(f'{f:.6f}' for f in freqs)} (omega^2 4, 8, 9, 18, 36: {ferr:.1e} off); a free "
+              f"mass under (1, 1, 1), *DYNAMIC NLGEOM, moves ({', '.join(f'{x:.6f}' for x in u[1])}) = "
+              f"M^-1 F t^2 / 2 ({uerr:.1e} off)")
+    else:
+        print(f"FAIL  anisotropic_mass: frequencies {freqs}, displacements {u}")
+    failures += 0 if ok else 1
+
+    # SPRING1 / SPRING2 at nodes with a *TRANSFORM: Abaqus springs the local DOF, ccx 2.23 the
+    # global one (0.0133 / 0.0645 where 0.01 / 0.04 is right); now on a new node tied to it
+    u = review_run(spring_transform_deck(), "spring_transform", dat_displacements)
+    ok = bool(u) and all(n in u for n in (1, 2, 3))
+    if ok:
+        c30, s30, r = math.cos(math.radians(30)), math.sin(math.radians(30)), math.sqrt(0.5)
+        got = (_dot(u[1], (c30, s30, 0.0)), _dot(u[2], (-r, r, 0.0)), _dot(u[3], (0.0, -s30, c30)))
+        side = max(abs(_dot(u[1], (-s30, c30, 0.0))), abs(u[1][2]), abs(_dot(u[2], (r, r, 0.0))), abs(u[2][2]))
+        err = max(abs(a - b) for a, b in zip(got, (0.01, 0.04, 0.02)))
+        ok = err < 1e-7 and side < 1e-8               # (the .dat's 7 digits, turned)
+        print(f"{'PASS' if ok else 'FAIL'}  spring_transform (a SPRING1 and a SPRING2 on local DOFs of "
+              f"nodes with *TRANSFORMs 30 / 45 degrees about z and 30 about x, *STATIC NLGEOM): along "
+              f"their local axes {got[0]:.6g} (1/100), {got[1]:.6g} (0.02 + 1/50); {err:.1e} off, across "
+              f"{side:.1e}")
+    else:
+        print("FAIL  spring_transform: no displacements")
+    failures += 0 if ok else 1
+
+    # *SPRING constants without a decimal point ('100', '1e2'; ccx 2.23 read such a line as the
+    # card's DOF line and stopped: '*SPRING card without data'), and a SPRINGA's DOF line
+    u = review_run(spring_numbers_deck(), "spring_numbers", dat_displacements)
+    ok = bool(u) and all(n in u for n in (1, 3, 5, 6))
+    if ok:
+        got = (u[1][0], u[3][0], u[5][0], u[6][0])
+        err = max(abs(a - b) for a, b in zip(got, (0.01, 0.01, 0.02, 0.005)))
+        ok = err < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  spring_numbers (*SPRING constants '100', '1e2' after a SPRINGA "
+              f"DOF line, '50', a NONLINEAR '200, 1'; unit forces): {', '.join(f'{x:.6g}' for x in got)} "
+              f"(0.01, 0.01, 0.02, 0.005); {err:.1e} off")
+    failures += 0 if ok else 1
+
+    # a connector on a *DISTRIBUTING reference node: the converter did not count it as using the
+    # node's rotation, so the rotation was not tied to the surface (ccx exit 255); a BEAM
+    # connector's force then acts as the force and moment it puts on the node
+    tabs = [review_run(connector_distributing_deck(f), "connector_distributing_" + f, dat_displacements)
+            for f in ("conn", "load")]
+    ok = all(tabs) and all(n in t for t in tabs for n in (9, 119, 125, 127))
+    if ok:
+        scale = max(abs(x) for v in tabs[1].values() for x in v)
+        err = max(abs(a - b) for n in (9, 119, 125, 127) for a, b in zip(tabs[0][n], tabs[1][n]))
+        ok = scale > 1e-3 and err < 1e-6 * scale
+        print(f"{'PASS' if ok else 'FAIL'}  connector_distributing_ref (a BEAM connector on a *DISTRIBUTING "
+              f"reference node, loaded at its far end): the cube moves as under the force and moment at the "
+              f"node (max |u| {scale:.3g}; {err:.1e} apart)")
+    else:
+        print("FAIL  connector_distributing_ref: no displacements")
     failures += 0 if ok else 1
 
     # --- indented keyword lines and abbreviations, read as Abaqus reads them: a free cube

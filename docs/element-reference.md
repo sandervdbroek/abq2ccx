@@ -113,7 +113,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `DASHPOT1` | 1 | → `DASHPOTA` to a new ground node that `*EQUATION`s keep on its DOF's line (exact, also under `NLGEOM`); on a rotational DOF left out (reduced physics) |
-| `DASHPOT2` | 2 | → `DASHPOTA` (substituted: reduced physics) |
+| `DASHPOT2` | 2 | → `DASHPOTA` to a new node that `*EQUATION`s move with the second node's DOF along the first DOF's line (exact, also under `NLGEOM`); on a rotational DOF left out (reduced physics) |
 | `DASHPOTA` | 2 | direct |
 | `DCOUP3D` | 1 | direct |
 | `GAPCYL` | 2 | → `GAPUNI` (substituted: reduced physics) |
@@ -121,8 +121,8 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | `GAPUNI` | 2 | direct |
 | `MASS` | 1 | direct |
 | `ROTARYI` | 1 | on a rigid body with a `*MASS`: six point masses (exact); otherwise flagged |
-| `SPRING1` | 1 | direct |
-| `SPRING2` | 2 | direct |
+| `SPRING1` | 1 | direct; at a node with a `*TRANSFORM` on a new node tied to its local DOF (exact) |
+| `SPRING2` | 2 | direct; at a node with a `*TRANSFORM` on a new node tied to its local DOF (exact) |
 | `SPRINGA` | 2 | direct |
 
 ## fluid/network

@@ -4747,9 +4747,18 @@ def test_dashpot1_to_a_ground_node_on_its_line():
     # u_4 . v = 0, u_4 . w = u_1 . w for the two w normal to v = (0.6, 0.8, 0)
     assert "*EQUATION\n2\n4, 2, 0.8, 4, 1, 0.6\n" in body and "\n4, 3, -1, 1, 3, 1\n" in body
     assert "*DASHPOT, ELSET=D1\n10.\n" in body and "*DASHPOT, ELSET=D2\n10.\n" in body
+    # DASHPOT2 (it was a DASHPOTA along the node line, reduced physics): a DASHPOTA from node 2
+    # to a new node 5 a span away along -x, u_5,1 = u_3,1 (node 3's DOF 1) and u_5 = u_2 across
+    # (validate_with_ccx.py dashpot2_dofs)
+    assert conv.geom.elements[12] == ("DASHPOTA", [2, 5]) and conv.geom.nodes[5] == (2.0 - span, 0.0, 0.0)
+    assert "*EQUATION\n2\n5, 1, 1, 3, 1, -1\n" in body and "\n5, 3, 1, 2, 3, -1\n" in body
     # a rotational DASHPOT1: left out with its set member, warned
     assert 13 not in conv.geom.elements and "DASHPOT1 element(s) 13 left out: its DOF 5 is a rotation" in rep.text()
-    assert conv.reduced_physics == ["DASHPOT1 element left out", "element DASHPOT2 -> DASHPOTA"]
+    assert conv.reduced_physics == ["DASHPOT1 element left out"]
+    # a rotational DASHPOT2: likewise
+    _, conv, rep = convert_str(deck.replace("*Dashpot, elset=D2\n1, 1\n", "*Dashpot, elset=D2\n1, 4\n"))
+    assert 12 not in conv.geom.elements and "DASHPOT2 element(s) 12 left out: its DOF 4 is a rotation" in rep.text()
+    assert conv.reduced_physics == ["DASHPOT2 element left out", "DASHPOT1 element left out"]
     # where a step solves for temperatures the ground node's is tied to its node's (free, it
     # stopped ccx: exit 255)
     body, conv, _ = convert_str(deck.replace("*Dynamic\n0.1, 1.\n", "*Coupled Temperature-displacement\n0.1, 1.\n"))
@@ -4758,12 +4767,32 @@ def test_dashpot1_to_a_ground_node_on_its_line():
 
 def test_anisotropic_point_mass_written_as_ccx_reads_it():
     # ccx 2.23 reads TYPE=ANISOTROPIC's first value as an isotropic mass (probed): it was
-    # passed through without a word
+    # passed through without a word; where the ORIENTATION's axes are not known it still is
     deck = ("*Node\n1, 0., 0., 0.\n*Element, type=MASS, elset=EM\n1, 1\n"
             "*Mass, elset=EM, type=ANISOTROPIC, orientation=OR\n1., 4., 9.\n*Boundary\n1, 1, 3\n")
     body, conv, rep = convert_str(deck)
     assert "*MASS, ELSET=EM\n1.\n" in body and "ANISO" not in body.split("*MASS")[1]
     assert conv.reduced_physics == ["*MASS, TYPE=ANISOTROPIC written as an isotropic mass"]
+    # with known axes: the smallest mass on the node, and per axis with more the rest on a new
+    # node tied to it along the axis and held across it (validate_with_ccx.py anisotropic_mass)
+    oriented = deck.replace("*Mass,", "*Orientation, name=OR\n0., 1., 0., -1., 0., 0.\n*Element, "
+                            "type=C3D8, elset=EALL\n*Elset, elset=ALL\nEM\n*Mass,")
+    body, conv, rep = convert_str(oriented)
+    assert conv.geom.elements[2] == ("MASS", [2]) and conv.geom.elements[3] == ("MASS", [3])
+    assert "*MASS, ELSET=EM\n1.\n*MASS, ELSET=ABQ2CCX_AMASS1_2\n3.\n*MASS, ELSET=ABQ2CCX_AMASS1_3\n8.\n" in body
+    # axis 2 is -x: u_2 . (-1, 0, 0) = u_1 . (-1, 0, 0), u_2 held in y and z; axis 3 is z
+    assert "*EQUATION\n2\n2, 1, -1, 1, 1, 1\n" in body and "*EQUATION\n2\n3, 3, 1, 1, 3, -1\n" in body
+    assert "*EQUATION\n1\n2, 2, 1\n" in body or "*EQUATION\n1\n2, 2, -1\n" in body
+    assert conv.geom.elset("ALL") == [1, 2, 3] and conv.reduced_physics == []
+    # under NLGEOM at a node with rotations (Abaqus turns the axes with it) and with a body
+    # force on the card's own set (the new elements are not in it): warned
+    _, conv, rep = convert_str(oriented.replace("*Element, type=C3D8, elset=EALL\n", "*Node\n9, 1., 0., 0.\n"
+                                                "*Element, type=B31, elset=EB\n7, 1, 9\n") +
+                               "*Step, nlgeom\n*Dynamic\n0.1, 1.\n*Dload\nEM, GRAV, 9.81, 0., 0., -1.\n*End Step\n")
+    assert "on a node with rotations in a deck with NLGEOM" in rep.text()
+    assert "*DLOAD on ELSET=EM of a *MASS, TYPE=ANISOTROPIC" in rep.text()
+    assert "*MASS, TYPE=ANISOTROPIC axes not turned with the node under NLGEOM" in conv.reduced_physics
+    assert "body force on the extra principal masses of an anisotropic *MASS" in conv.reduced_physics
     body, conv, rep = convert_str(deck.replace("1., 4., 9.", "2., 2., 2."))
     assert "*MASS, ELSET=EM\n2.\n" in body and conv.reduced_physics == []
     assert "three equal principal masses written as the isotropic mass" in rep.text()
@@ -4788,6 +4817,111 @@ def test_oriented_couplings_under_nlgeom():
     assert "with an ORIENTATION: ccx 2.23 then reads the reference node's loads in the orientation's axes" \
         in rep.text()
     assert "*CLOAD on the reference node of an oriented *DISTRIBUTING card read in its axes" in conv.reduced_physics
+
+
+def test_partial_kinematic_couplings_under_nlgeom_where_the_reference_node_turns():
+    # an unoriented kinematic coupling of some translations under NLGEOM: Abaqus turns the
+    # coupled directions with the reference node, ccx 2.23 keeps the global ones (probed: -sin
+    # 0.5 where -tan 0.5 is right) — warned where the reference node can turn
+    deck = (HEX + "*Node\n9, 0.5, 0.5, 2.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=EALL, material=M\n*Surface, name=TOP\nEALL, S2\n"
+            "*Coupling, constraint name=C, ref node=9, surface=TOP\n*Kinematic\n1, 2\n*Boundary\n1, 1, 3\n"
+            "2, 1, 3\n3, 1, 3\n4, 1, 3\n*Step, nlgeom\n*Static\n*Cload\n9, 1, 1.\n*End Step\n")
+    _, conv, rep = convert_str(deck)
+    assert "(reference node 9, free to turn) in a deck with NLGEOM" in rep.text()
+    assert conv.reduced_physics == ["kinematic coupling of some translations under NLGEOM (axes not turned)"]
+    # its rotations held at zero (as in the corpus' decks), all translations, or no NLGEOM: exact
+    for held in (deck.replace("*Boundary\n", "*Boundary\n9, 4, 6\n"),
+                 deck.replace("*Kinematic\n1, 2\n", "*Kinematic\n1, 3\n"), deck.replace("*Step, nlgeom", "*Step")):
+        _, conv, rep = convert_str(held)
+        assert "free to turn" not in rep.text() and conv.reduced_physics == []
+    # held in one step only, or turned by a BC: it turns
+    _, conv, _ = convert_str(deck.replace("*End Step\n", "*Boundary\n9, 4, 6\n*End Step\n*Step, nlgeom\n*Static\n"
+                                          "*Boundary, op=new\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*End Step\n"))
+    assert conv.reduced_physics == ["kinematic coupling of some translations under NLGEOM (axes not turned)"]
+    _, conv, _ = convert_str(deck.replace("*Boundary\n", "*Boundary\n9, 4, 5\n9, 6, 6, 0.1\n"))
+    assert conv.reduced_physics == ["kinematic coupling of some translations under NLGEOM (axes not turned)"]
+
+
+def test_connector_on_a_distributing_reference_node_ties_its_rotation():
+    # connectors live in Converter._conn, not geom.elements: a connector on a *DISTRIBUTING
+    # reference node did not count as using its rotation, which then stayed untied (ccx exit
+    # 255; validate_with_ccx.py connector_distributing_ref)
+    deck = (HEX + "*Node\n9, 0.5, 0.5, 2.\n19, 1.5, 0.5, 2.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=EALL, material=M\n*Surface, name=TOP\nEALL, S2\n"
+            "*Coupling, constraint name=C, ref node=9, surface=TOP\n*Distributing\n"
+            "*Element, type=CONN3D2, elset=CN\n50, 9, 19\n*Connector Section, elset=CN\nBEAM,\n"
+            "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*Step\n*Static\n*Cload\n19, 2, 1.\n*End Step\n")
+    _, conv, rep = convert_str(deck)
+    assert "Rotation of a distributing coupling's reference node carried on a ROT NODE" in rep.text()
+    assert conv.reduced_physics == []
+
+
+def test_springs_on_transformed_nodes_act_on_their_local_dofs():
+    # Abaqus' SPRING1 / SPRING2 DOFs at a node with a *TRANSFORM are its local ones; ccx 2.23
+    # springs the global DOF (probed: 1/75 where 1/100 is right): the spring goes to a new node
+    # tied to the local DOF and held in its others (validate_with_ccx.py spring_transform)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Nset, nset=T\n1, 2\n"
+            "*Transform, nset=T\n0.6, 0.8, 0., -0.8, 0.6, 0.\n*Element, type=SPRING1, elset=K1\n1, 1\n"
+            "*Spring, elset=K1\n1\n100.\n*Element, type=SPRING2, elset=K2\n2, 2, 3\n*Spring, elset=K2\n2, 3\n"
+            "50.\n*Element, type=SPRING1, elset=K3\n3, 1\n*Spring, elset=K3\n3\n10.\n"
+            "*Element, type=SPRING1, elset=K4\n4, 3\n*Spring, elset=K4, orientation=OR\n1\n10.\n"
+            "*Orientation, name=OR\n0., 1., 0., -1., 0., 0.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n")
+    body, conv, rep = convert_str(deck)
+    # node 1's DOF 1 and node 2's DOF 2 go to new nodes 4 and 5; node 3 (no transform), DOF 3
+    # of node 1 (its local z is global z) and an oriented spring stay
+    assert conv.geom.elements[1] == ("SPRING1", [4]) and conv.geom.elements[2] == ("SPRING2", [5, 3])
+    assert conv.geom.elements[3] == ("SPRING1", [1]) and conv.geom.elements[4] == ("SPRING1", [3])
+    assert "*EQUATION\n2\n4, 1, 1, 1, 1, -1\n*EQUATION\n1\n4, 2, 1\n*EQUATION\n1\n4, 3, 1\n" in body
+    assert "*EQUATION\n2\n5, 2, 1, 2, 2, -1\n" in body and conv.reduced_physics == []
+    assert "SPRING1 / SPRING2 element(s) on nodes with a *TRANSFORM" in rep.text()
+    # a rotational DOF off its global axis: warned
+    _, conv, rep = convert_str(deck.replace("*Spring, elset=K1\n1\n", "*Spring, elset=K1\n4\n"))
+    assert conv.reduced_physics == ["SPRING1 / SPRING2 on a transformed node's rotation"]
+
+
+def test_rotated_instance_springs_on_transformed_nodes_and_anisotropic_masses():
+    # in a rotated instance a spring / dashpot DOF at a node with a part *TRANSFORM is the
+    # transform's local one, which turns with the instance: the card keeps its DOF numbers (they
+    # were turned as global ones); an anisotropic mass without ORIENTATION has the part's axes
+    part = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=SPRING1, elset=SPR\n50, 2\n"
+            "*Spring, elset=SPR\n1\n100.\n*Element, type=DASHPOT1, elset=DP\n52, 2\n*Dashpot, elset=DP\n1\n10.\n"
+            "*Nset, nset=TR\n2\n*Transform, nset=TR\n0.6, 0.8, 0., -0.8, 0.6, 0.\n"
+            "*Element, type=MASS, elset=EM\n60, 3\n*Mass, elset=EM, type=ANISOTROPIC\n1., 4., 4.\n")
+    body, conv, rep = convert_str(_instanced(part, tail=ROT_TAIL))
+    assert "*SPRING, ELSET=I_SPR\n1\n100.\n" in body and "*EQUATION\n2\n5, 1, 1, 2, 1, -1\n" in body
+    # the dashpot's ground node on the turned transform's axis 1, (-0.8, 0.6, 0)
+    assert "*EQUATION\n2\n4, 1, -0.8, 4, 2, 0.6\n" in body
+    # the mass's axes are the instance's: 2 is -x, 3 is z
+    assert "*MASS, ELSET=I_EM\n1.\n*MASS, ELSET=ABQ2CCX_AMASS1_2\n3.\n*MASS, ELSET=ABQ2CCX_AMASS1_3\n3.\n" in body
+    assert "*EQUATION\n2\n6, 1, -1, 3, 1, 1\n" in body and "*EQUATION\n2\n7, 3, 1, 3, 3, -1\n" in body
+    assert conv.reduced_physics == []
+    # a card on nodes with and without a part *TRANSFORM: turned, warned
+    body, conv, rep = convert_str(_instanced(part.replace("50, 2\n", "50, 2\n51, 1\n"), tail=ROT_TAIL))
+    assert "names DOFs at nodes with and without a part *TRANSFORM" in rep.text()
+    assert conv.reduced_physics == ["*SPRING of rotated *INSTANCE I on transformed and plain nodes"]
+
+
+def test_spring_and_dashpot_numbers_as_ccx_reads_them():
+    # ccx 2.23 reads a *SPRING data line whose first number has no decimal point ('100',
+    # '1e-3') as its DOF line and stops ('*SPRING card without data', probed; code review 3
+    # B18); a DOF line on SPRINGA / DASHPOTA (Abaqus: a blank line) stops it too
+    # (validate_with_ccx.py spring_numbers)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n*Element, type=SPRINGA, elset=S\n1, 1, 2\n"
+            "*Spring, elset=S\n\n100\n*Element, type=SPRINGA, elset=SB\n4, 2, 3\n*Spring, elset=SB\n2,\n1e2, 20\n"
+            "*Element, type=SPRING1, elset=S1\n2, 2\n*Spring, elset=S1\n1\n1.00000000000000000000000e+2\n"
+            "*Element, type=SPRING1, elset=S2\n3, 3\n*Spring, elset=S2, nonlinear\n1\n-100, -1\n0, 0\n1d2, 1\n"
+            "*Element, type=SPRINGA, elset=S3\n5, 1, 3\n*Spring, elset=S3\n-1E-3\n"
+            "*Element, type=DASHPOTA, elset=D\n6, 1, 2\n*Dashpot, elset=D\n1, 1\n10\n"
+            "*Element, type=DASHPOTA, elset=D2\n7, 1, 3\n*Dashpot, elset=D2\n\n10\n")
+    body, _, _ = convert_str(deck)
+    assert "*SPRING, ELSET=S\n100.\n*SPRING, ELSET=SB\n1.e2, 20.\n*SPRING, ELSET=S1\n1\n100.\n" in body
+    assert "*SPRING, ELSET=S2, NONLINEAR\n1\n-100., -1.\n0., 0.\n1.d2, 1.\n*SPRING, ELSET=S3\n-1.E-3\n" in body
+    assert "*DASHPOT, ELSET=D\n10\n*DASHPOT, ELSET=D2\n10" in body
+    assert A.dotted_number(" 1e-3 ") == " 1.e-3 " and A.dotted_number("2.5") == "2.5" and A.dotted_number("x") == "x"
+    # a JOINTC's *SPRING (no ELSET) keeps its DOF line
+    body, _, _ = convert_str("*Node\n1, 0., 0., 0.\n*Spring\n1, 1\n1e12\n")
+    assert body.endswith("*SPRING\n1, 1\n1.e12")
 
 
 def test_pretension_node_and_element_sets_resolved():

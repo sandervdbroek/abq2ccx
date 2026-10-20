@@ -23,6 +23,15 @@ physics.
   dropped (exact), else warned. `*BOUNDARY, FIXED` after such a step or a static perturbation
   step held that step's state; it is now the base-state value where the base state prescribes
   the DOF, else warned. A `*FREQUENCY` step no longer gets converted nodal forces as a `*CLOAD`.
+* **Springs, dashpots and anisotropic masses** — ccx 2.23 stopped on a `*SPRING` constant
+  without a decimal point (`100`, `1e-3`), on a `SPRINGA` card's DOF line and on a `DASHPOTA`
+  card's: constants now get a point, and those lines go. `SPRING1` / `SPRING2` DOFs at a node
+  with a `*TRANSFORM` are the node's local ones in Abaqus; ccx used the global ones (33 % off
+  at 30°). `DASHPOT2` (a DASHPOTA along the node line) and `*MASS, TYPE=ANISOTROPIC` (the
+  isotropic M11) are now exact, through new nodes that `*EQUATION`s tie to the elements' nodes.
+  A connector on a `*DISTRIBUTING` reference node now ties its rotation (ccx exited 255). Under
+  NLGEOM, an unoriented kinematic coupling of some translations whose reference node can turn
+  is warned as reduced physics (ccx keeps the global axes; Abaqus turns them).
 * **Faster conversion** — reading a deck, registering and writing its mesh, and the planners'
   passes over every element are faster, and Python's cyclic garbage collector, which found
   next to nothing to collect, is off while a deck converts: about 40 % less CPU time over the

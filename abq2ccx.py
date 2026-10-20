@@ -1838,7 +1838,9 @@ def read_blocks(path: str, report: Report) -> List[Block]:
     orphans: List[str] = []
     # a *SURFACE whose only data line is blank: Abaqus/Explicit's surface of every exterior
     # face of the model (Keywords Reference *SURFACE), kept as the data line "" for
-    # Converter._free_face_surfaces (any other blank line is skipped)
+    # Converter._free_face_surfaces; and a *SPRING's / *DASHPOT's blank first line, its DOF line
+    # (blank for SPRINGA / DASHPOTA), kept as "" for handle_spring / handle_dashpot (any other
+    # blank line is skipped)
     blank: Optional[Block] = None
 
     def data_lines(run: List[str]) -> None:
@@ -1847,6 +1849,9 @@ def read_blocks(path: str, report: Report) -> List[Block]:
         vals = [x for x in map(str.strip, run) if x]
         if vals:
             blank = None
+            if current is not None and current.keyword in ("SPRING", "DASHPOT") and \
+                    not current.data and not run[0].strip():
+                vals.insert(0, "")
             (orphans if current is None else current.data).extend(vals)
         elif run and current is not None and current.keyword == "SURFACE" and not current.data:
             blank = current
@@ -2184,6 +2189,20 @@ def short_real(x: float, digits: int = 9) -> str:
     the first 20 characters of a field) and always with a decimal point or exponent."""
     s = f"{x:.{digits}g}"
     return s if any(c in s for c in ".eEnN") else s + "."
+
+
+def dotted_number(field: str) -> str:
+    """Data field ``field`` with a decimal point where it is a number without one ('100' ->
+    '100.', ' 1e-3' -> ' 1.e-3', '-2D1' -> '-2.D1'); anything else as it is.  ccx 2.23 reads a
+    *SPRING line whose first number has none as the card's DOF line (handle_spring)."""
+    m = re.fullmatch(r"(\s*[-+]?\d+)([eEdD][-+]?\d+)?(\s*)", field)
+    return field if m is None else m.group(1) + "." + (m.group(2) or "") + m.group(3)
+
+
+def dof_line(line: str) -> bool:
+    """Whether data line ``line`` is blank or holds integers only (a *SPRING / *DASHPOT DOF
+    line, as ccx 2.23 tells one: no decimal point or exponent)."""
+    return all(re.fullmatch(r"[-+]?\d+", f.strip()) for f in line.split(",") if f.strip())
 
 
 # Converter._short_fields: a line with a comma-separated piece over 20 characters, and the
@@ -6794,6 +6813,9 @@ class Converter:
         self._conn_bcs: List[str] = []             # their *BOUNDARY lines (held in every step)
         self._dashpot_cards: set = set()           # *DASHPOTs of DASHPOT1 / 2 elements (_plan_dashpots)
         self._dashpot_rows: List[List[Tuple[int, int, float]]] = []   # their ground nodes' *EQUATIONs
+        self._spring_rows: List[List[Tuple[int, int, float]]] = []    # _plan_transformed_springs' nodes
+        self._amass: Dict[int, Tuple[float, List[Tuple[str, float]]]] = {}   # _plan_anisotropic_masses
+        self._amass_rows: List[List[Tuple[int, int, float]]] = []     # its nodes' *EQUATIONs
         self._conn_held: set = set()               # (node, DOF) held at zero in every step
         self._conn_bc_dofs: set = set()            # (node, DOF) with a BC in any step
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
@@ -7521,6 +7543,7 @@ class Converter:
         "SPECIFIC HEAT": "handle_dependent_material",
         "MASS": "handle_mass",
         "DASHPOT": "handle_dashpot",
+        "SPRING": "handle_spring",
         "CONDUCTIVITY": "handle_dependent_material",
         "EXPANSION": "handle_expansion",
         "MOHR COULOMB": "handle_dependent_material",
@@ -7785,8 +7808,10 @@ class Converter:
         _plan_coupled_inertia scales them (ccx stores a MASS element's mass as its density).
         TYPE=ANISOTROPIC (principal masses M11, M22, M33 along the global or ORIENTATION axes):
         ccx 2.23 has no anisotropic mass and reads the card's first value as an isotropic mass
-        (probed: a mass 1, 4, 9 node moved alike in x, y and z), so the card is written as that
-        isotropic mass — exact where the three are equal, else reduced physics, warned."""
+        (probed: a mass 1, 4, 9 node moved alike in x, y and z), so the card is written as the
+        isotropic mass m0 = min M_ii with one card per axis with more on the new elements
+        _plan_anisotropic_masses tied along it — exact; where the three are equal as that one
+        mass; where the axes are unknown as M11, reduced physics, warned."""
         if not b.uparam("TYPE").startswith("ANISO") or not b.data:
             return self._mass_scaled(b, self.passthrough(b))
         f = trimmed_fields(b.data[0].split(","))
@@ -7797,8 +7822,20 @@ class Converter:
         if not f or not m:
             return self._mass_scaled(b, self.passthrough(b))
         params = OrderedDict((k, v) for k, v in b.params.items() if k not in ("TYPE", "ORIENTATION"))
+        if id(b) in self._amass:
+            m0, cards = self._amass[id(b)]
+            self.report.note("*MASS, TYPE=ANISOTROPIC (ccx 2.23 has none) -> the isotropic mass of the "
+                             "smallest principal value, and per axis with more the rest on a new node "
+                             "that *EQUATIONs tie to the mass's node along that axis and hold across "
+                             "it: the same mass matrix, exact (validate_with_ccx.py anisotropic_mass).",
+                             once=True)
+            out = [emit_keyword("MASS", params), short_real(m0, 12)]
+            for sname, dm in cards:
+                out += [emit_keyword("MASS", OrderedDict(params, ELSET=sname)), short_real(dm, 12)]
+            return self._mass_scaled(b, out)
         if max(m) - min(m) > 1e-12 * max(abs(x) for x in m):
-            self.report.warn("*MASS, TYPE=ANISOTROPIC with different principal masses: ccx 2.23 has no "
+            self.report.warn("*MASS, TYPE=ANISOTROPIC with different principal masses along the axes of "
+                             f"ORIENTATION={b.param('ORIENTATION')}, which are not known: ccx 2.23 has no "
                              "anisotropic point mass and reads the first value (M11) as an isotropic "
                              "one (probed) — written as that isotropic mass, which differs from "
                              "Abaqus' along the other principal axes.", once=True)
@@ -19343,9 +19380,8 @@ class Converter:
 
     def _distributing_rot_used(self, ref: int, blocks: List[Block]) -> bool:
         """Whether the deck acts on a rotation of node ``ref``: a *BOUNDARY or *CLOAD on DOFs
-        4-6, an *EQUATION term there, or a connector on the node."""
-        if self._rotations_acted_on(blocks, ref) or \
-                any(ref in conn and typ.upper().startswith("CONN") for typ, conn in self.geom.elements.values()):
+        4-6, an *EQUATION term there, or a connector on the node (connectors live in _conn)."""
+        if self._rotations_acted_on(blocks, ref) or any(ref in (a, c) for _t, a, c in self._conn.values()):
             return True
         for b in blocks:
             if b.keyword == "EQUATION":
@@ -19681,17 +19717,19 @@ class Converter:
                              f"Exact (probed).")
 
     def _plan_dashpots(self, blocks: List[Block]) -> None:
-        """DASHPOT1 elements: a node's DOF d to ground, acting in a fixed direction v even under
-        NLGEOM (Abaqus 2017 'Dashpots'): the *DASHPOT's ORIENTATION axis d, else the node's
-        *TRANSFORM axis d (its nodal DOFs are local), else the global one.  ccx has no such
-        element, so each becomes a DASHPOTA from the node n to a new node g a model span away
-        along -v, held by *EQUATIONs u_g . v = 0 and u_g . w = u_n . w for the two w normal to
-        v (_dashpot_cards): the line n-g stays along v, so the DASHPOTA's force, its extension
-        rate (v_n . v) times c, acts along v at any motion (probed on 2.23: exact under NLGEOM
-        with a sideways motion twice the line's length); g takes n's temperatures, and where a
-        step solves for them T_g = T_n.  A rotational DOF or unknown axes:
-        the element is left out, warned.  The *DASHPOT cards of DASHPOT1 / DASHPOT2 elements
-        lose their DOF line (handle_dashpot)."""
+        """DASHPOT1 / DASHPOT2 elements: a node's DOF i to ground, or against DOF j of a second
+        node, acting in fixed directions even under NLGEOM (Abaqus 2017 'Dashpots'): DOF i's
+        direction v is the *DASHPOT's ORIENTATION axis i, else the node's *TRANSFORM axis i (its
+        nodal DOFs are local), else the global one; likewise DOF j's, v_b.  ccx has no such
+        element, so each becomes a DASHPOTA from the (first) node n to a new node g a model span
+        away along -v, held by *EQUATIONs u_g . v = u_b . v_b (DASHPOT1: 0) and u_g . w = u_n . w
+        for the two w normal to v (_dashpot_cards): the line n-g stays along v, so the
+        DASHPOTA's force, its extension rate (v_n . v - v_b . v_b) times c, acts along v at any
+        motion — Abaqus' relative velocity, also the sign a NONLINEAR curve reads (probed on
+        2.23: exact under NLGEOM with a sideways motion twice the line's length); g takes n's
+        temperatures, and where a step solves for them T_g = T_n.  A rotational DOF or unknown
+        axes: the element is left out, warned.  The *DASHPOT cards of DASHPOT1 / DASHPOT2
+        elements lose their DOF line (handle_dashpot)."""
         types = {e: t.upper() for e, (t, _) in self.geom.elements.items()
                  if t.upper() in ("DASHPOT1", "DASHPOT2")}
         if not types:
@@ -19703,35 +19741,38 @@ class Converter:
                     if e in types:
                         card_of.setdefault(e, b)
                         self._dashpot_cards.add(id(b))
-        dropped: "OrderedDict[str, List[int]]" = OrderedDict()
+        dropped: "OrderedDict[Tuple[str, str], List[int]]" = OrderedDict()
         span = self._model_span()
         unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-        made = 0
+        made: Dict[str, int] = {}
         for e, typ in types.items():
-            if typ != "DASHPOT1":
-                continue
-            n = self.geom.elements[e][1][0]
+            ends = self.geom.elements[e][1][:1 if typ == "DASHPOT1" else 2]
+            n = ends[0]
             b = card_of.get(e)
             try:
-                d = pint(trimmed_fields(b.data[0].split(","))[0]) if b is not None and b.data else 0
-            except (ValueError, IndexError):
-                d = 0
+                ds = [pint(x) for x in trimmed_fields(b.data[0].split(","))[:len(ends)]] \
+                    if b is not None and b.data else []
+            except ValueError:
+                ds = []
+            ds += [0] * (len(ends) - len(ds))
             name = (b.param("ORIENTATION") or "").strip() if b is not None else ""
-            ax = self._conn_axes(name) if name else self._mpc_frame(n) or unit
-            plane = n in self._plane_only
-            why = ("it has no *DASHPOT card" if b is None else
-                   f"its DOF {d} is a rotation, which a DASHPOTA cannot carry" if 4 <= d <= 6 else
-                   f"its DOF line ({b.data[0].strip() if b.data else ''}) names no displacement DOF"
-                   if not 1 <= d <= 3 else
-                   f"the axes of its ORIENTATION={name} are not known" if ax is None else
-                   f"the local axes of its node are not known ({ax})" if isinstance(ax, str) else
-                   f"its node {n} is not defined" if n not in self.geom.nodes else
-                   "its direction leaves the plane of its plane model's node" if plane and
-                   abs(ax[d - 1][2]) > 1e-9 * vnorm(ax[d - 1]) else None)
+            axes = [self._conn_axes(name) if name else self._mpc_frame(m) or unit for m in ends]
+            why = "it has no *DASHPOT card" if b is None else None
+            for m, d, ax in zip(ends, ds, axes):
+                why = why or (
+                    f"its DOF {d} is a rotation, which a DASHPOTA cannot carry" if 4 <= d <= 6 else
+                    f"its DOF line ({b.data[0].strip() if b.data else ''}) names no displacement DOF"
+                    if not 1 <= d <= 3 else
+                    f"the axes of its ORIENTATION={name} are not known" if ax is None else
+                    f"the local axes of its node are not known ({ax})" if isinstance(ax, str) else
+                    f"its node {m} is not defined" if m not in self.geom.nodes else
+                    "its direction leaves the plane of its plane model's node" if m in self._plane_only
+                    and abs(ax[d - 1][2]) > 1e-9 * vnorm(ax[d - 1]) else None)
             if why:
-                dropped.setdefault(why, []).append(e)
+                dropped.setdefault((typ, why), []).append(e)
                 continue
-            v = vunit(ax[d - 1])
+            v = vunit(axes[0][ds[0] - 1])
+            plane = n in self._plane_only
             g = max(self.geom.nodes) + 1
             self.geom.add_node(g, vsub(self.geom.nodes[n], vscale(v, span)))
             self.geom.elements[e] = ("DASHPOTA", [n, g])
@@ -19740,6 +19781,8 @@ class Converter:
             w2 = vcross(v, w1)
             frame = (v, w1, w2)
             rows = [[(g, k + 1, f[k]) for k in range(3) if abs(f[k]) > 1e-12] for f in frame]
+            if len(ends) > 1:                      # (DASHPOT2: g moves with node b's DOF j)
+                rows[0] += self._dir_terms(ends[1], vscale(vunit(axes[1][ds[1] - 1]), -1.0), plan=True)
             rows[1] += self._dir_terms(n, vscale(w1, -1.0), plan=True)
             if not plane:                          # (a plane model's node does not leave it)
                 rows[2] += self._dir_terms(n, vscale(w2, -1.0), plan=True)
@@ -19754,41 +19797,232 @@ class Converter:
             self._tied_nodes.append((n, n, g, 0.0))
             if self._mpc_thermal:
                 self._dashpot_rows.append([(g, 11, 1.0), (n, 11, -1.0)])
-            made += 1
-        for why, es in dropped.items():
-            self.report.warn(f"DASHPOT1 element(s) {', '.join(map(str, es[:5]))}"
-                             f"{' ...' if len(es) > 5 else ''} left out: {why} (ccx has no DASHPOT1; "
-                             f"the converter writes it as a DASHPOTA to a ground node along its "
+            made[typ] = made.get(typ, 0) + 1
+        for (typ, why), es in dropped.items():
+            self.report.warn(f"{typ} element(s) {', '.join(map(str, es[:5]))}"
+                             f"{' ...' if len(es) > 5 else ''} left out: {why} (ccx has no {typ}; "
+                             f"the converter writes it as a DASHPOTA to a new node along its "
                              f"displacement DOF).", once=True)
-            self._reduces("DASHPOT1 element left out")
+            self._reduces(f"{typ} element left out")
             for e in es:
                 del self.geom.elements[e]
             for sname, ids in self.geom.elsets.items():
                 if any(e in es for e in ids):
                     self.geom.elsets[sname] = [i for i in ids if i not in es]
+        if made.get("DASHPOT1"):
+            self.report.note(f"{made['DASHPOT1']} DASHPOT1 element(s) (a node's DOF to ground; ccx has "
+                             f"none) -> DASHPOTA from the node to a new node a model span away along "
+                             f"the DOF's direction, which *EQUATIONs keep on that line: the dashpot "
+                             f"acts along the fixed direction, as Abaqus' DASHPOT1 does, also under "
+                             f"NLGEOM (validate_with_ccx.py dashpot1_ground).")
+        if made.get("DASHPOT2"):
+            self.report.note(f"{made['DASHPOT2']} DASHPOT2 element(s) (DOF i of a node against DOF j "
+                             f"of another; ccx has none) -> DASHPOTA from the first node to a new node "
+                             f"a model span away along DOF i's direction, which *EQUATIONs move with "
+                             f"the second node's DOF j along that line and with the first node across "
+                             f"it: the dashpot acts on Abaqus' relative velocity in the fixed "
+                             f"directions, also under NLGEOM (validate_with_ccx.py dashpot2_dofs).")
+
+    def _plan_transformed_springs(self, blocks: List[Block]) -> None:
+        """SPRING1 / SPRING2 elements on a node with a *TRANSFORM, of a *SPRING without
+        ORIENTATION=: Abaqus' DOF d there is the node's local one ('Transformed coordinate
+        systems': a transform 'should not be defined at a node that is connected only to a
+        SPRING1 or SPRING2 element', as they have one active DOF), ccx 2.23 springs the global
+        DOF (probed: a SPRING1 on DOF 1, k = 100, of a node turned 30 degrees about z and held
+        across its local axis 1 moved 1/75 along it under a unit force, where 1/100 is right; an
+        ORIENTATION= it reads as Abaqus does).  So the node's place in the element goes to a new
+        node t without one, tied by u_t,d = u_n . v (v the local axis d) and held in its other
+        DOFs (_spring_rows): the spring acts on the local DOF, also under NLGEOM (springs act in
+        a fixed direction).  One t per node and DOF; it takes the node's temperatures.  A
+        rotational DOF off its global axis, or undefined local axes: warned."""
+        twin: Dict[Tuple[int, int], int] = {}
+        made: set = set()
+        lost: List[str] = []
+        for b in blocks:
+            if b.keyword != "SPRING" or (b.param("ORIENTATION") or "").strip() or not b.data:
+                continue
+            try:
+                ds = [pint(x) for x in trimmed_fields(b.data[0].split(",")) if x]
+            except ValueError:
+                continue
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                typ, conn = self.geom.elements.get(e, ("", []))
+                k_n = {"SPRING1": 1, "SPRING2": 2}.get(typ.upper(), 0)
+                if not k_n or len(ds) < k_n or len(conn) < k_n:
+                    continue
+                new = list(conn)
+                for k in range(k_n):
+                    n, d = conn[k], ds[k]
+                    ax = self._mpc_frame(n)
+                    if ax is None or not 1 <= d <= 6:
+                        continue
+                    if isinstance(ax, str) or (d > 3 and abs(ax[d - 4][d - 4] - 1.0) > 1e-9):
+                        lost.append(f"node {n} DOF {d}" + (f" ({ax})" if isinstance(ax, str) else ""))
+                    if isinstance(ax, str) or d > 3 or abs(ax[d - 1][d - 1] - 1.0) <= 1e-12:
+                        continue                                    # (or the global axis)
+                    v = ax[d - 1]
+                    if (n, d) not in twin:
+                        t = twin[(n, d)] = max(self.geom.nodes) + 1
+                        self.geom.add_node(t, self.geom.nodes[n])
+                        self._spring_rows.append([(t, d, 1.0)] + self._dir_terms(n, vscale(v, -1.0), plan=True))
+                        self._spring_rows += [[(t, j, 1.0)] for j in (1, 2, 3) if j != d]
+                        self._tied_nodes.append((n, n, t, 0.0))
+                        if self._mpc_thermal:
+                            self._spring_rows.append([(t, 11, 1.0), (n, 11, -1.0)])
+                    new[k] = twin[(n, d)]
+                if new != list(conn):
+                    self.geom.elements[e] = (typ, new)
+                    made.add(e)
+        if lost:
+            self.report.warn(f"SPRING1 / SPRING2 on a node with a *TRANSFORM ({', '.join(lost[:3])}"
+                             f"{' ...' if len(lost) > 3 else ''}): Abaqus springs the node's local DOF, "
+                             f"ccx 2.23 the global one, and a rotation there (or undefined local axes) "
+                             f"has no form here — the spring acts on the global DOF.", once=True)
+            self._reduces("SPRING1 / SPRING2 on a transformed node's rotation")
         if made:
-            self.report.note(f"{made} DASHPOT1 element(s) (a node's DOF to ground; ccx has none) -> "
-                             f"DASHPOTA from the node to a new node a model span away along the "
-                             f"DOF's direction, which *EQUATIONs keep on that line: the dashpot acts "
-                             f"along the fixed direction, as Abaqus' DASHPOT1 does, also under NLGEOM "
-                             f"(validate_with_ccx.py dashpot1_ground).")
+            self.report.note(f"{len(made)} SPRING1 / SPRING2 element(s) on nodes with a *TRANSFORM: "
+                             f"Abaqus springs the node's local DOF, ccx 2.23 the global one (probed) -> "
+                             f"the spring on a new node without one, tied to the node's local DOF and "
+                             f"held in its others: exact (validate_with_ccx.py spring_transform).")
+
+    def _plan_anisotropic_masses(self, blocks: List[Block]) -> None:
+        """*MASS, TYPE=ANISOTROPIC: principal masses M11, M22, M33 along the axes v_i of its
+        ORIENTATION, else the global ones (Abaqus *MASS), which ccx 2.23 lacks: it reads the
+        first value as an isotropic mass (probed).  Each MASS element of the card keeps the
+        isotropic m0 = min M_ii (handle_mass), and per axis with M_ii > m0 a new node g at its
+        node n gets a MASS element of M_ii - m0 (elset ABQ2CCX_AMASS<k>, also in the element's
+        other sets but the *MASS cards'), held by *EQUATIONs u_g . v_i = u_n . v_i and u_g . w = 0
+        across v_i (_amass_rows): kinetic energy 1/2 m0 |v_n|^2 + sum 1/2 (M_ii - m0) (v_n .
+        v_i)^2 = 1/2 v_n^T M v_n, and gravity M g — exact.  Abaqus turns the axes with the
+        node's rotation under NLGEOM ('if active'): at a node with rotations (a shell / beam or
+        reference node) exact for small rotations only, warned; so is a body force on the
+        card's own element set, which the new elements are not in.  A rotated instance's card
+        has its axes (_turn_instance_dofs)."""
+        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        mass_sets = {(c.param("ELSET") or "").strip().upper() for c in blocks if c.keyword == "MASS"}
+        eid = self._next_ids()[1]
+        for b in blocks:
+            if b.keyword != "MASS" or not b.uparam("TYPE").startswith("ANISO") or not b.data:
+                continue
+            try:
+                m = fields_at(trimmed_fields(b.data[0].split(",")), 3)
+            except ValueError:
+                continue
+            top = max(abs(x) for x in m)
+            name = (b.param("ORIENTATION") or "").strip()
+            ax = self._conn_axes(name) if name else unit
+            if max(m) - min(m) <= 1e-12 * top or ax is None:    # (equal, or unknown axes: handle_mass)
+                continue
+            elset = (b.param("ELSET") or "").strip()
+            members = [e for e in self.geom.elset(elset) if self.geom.elements.get(e, ("",))[0].upper() == "MASS"
+                       and self.geom.elements[e][1][0] in self.geom.nodes]
+            owners: Dict[int, List[str]] = {e: [] for e in members}     # (their sets but the *MASS cards')
+            for s, ids in self.geom.elsets.items() if members else ():
+                if s not in mass_sets:
+                    for x in set(ids) & owners.keys():
+                        owners[x].append(s)
+            m0, cards = min(m), []
+            for i in range(3):
+                if m[i] - m0 <= 1e-12 * top:
+                    continue
+                v = vunit(ax[i])
+                w1 = vunit(vcross(v, unit[min(range(3), key=lambda k: abs(v[k]))]))
+                frame = (v, w1, vcross(v, w1))
+                p = max(itertools.permutations(range(3)),
+                        key=lambda q: abs(frame[0][q[0]] * frame[1][q[1]] * frame[2][q[2]]))
+                sname, ids = f"ABQ2CCX_AMASS{len(self._amass) + 1}_{i + 1}", []
+                for e in members:
+                    n = self.geom.elements[e][1][0]
+                    vn = (v[0], v[1], 0.0) if n in self._plane_only else v   # (it stays in its plane)
+                    if vnorm(vn) <= 1e-9:
+                        continue
+                    g = max(self.geom.nodes) + 1
+                    self.geom.add_node(g, self.geom.nodes[n])
+                    eid += 1
+                    self.geom.add_element(eid, "MASS", [g])
+                    ids.append(eid)
+                    for s in owners[e]:
+                        self.geom.elsets[s].append(eid)
+                    rows = [[(g, k + 1, f[k]) for k in range(3) if abs(f[k]) > 1e-12] for f in frame]
+                    rows[0] += self._dir_terms(n, vscale(vn, -1.0), plan=True)
+                    for j, rw in enumerate(rows):
+                        first = next(t for t in rw if t[0] == g and t[1] == p[j] + 1)
+                        self._amass_rows.append([first] + [t for t in rw if t is not first])
+                    self._tied_nodes.append((n, n, g, 0.0))
+                    if self._mpc_thermal:
+                        self._amass_rows.append([(g, 11, 1.0), (n, 11, -1.0)])
+                if ids:
+                    self.geom.add_to_elset(sname, ids)
+                    cards.append((sname, m[i] - m0))
+            self._amass[id(b)] = (m0, cards)
+            nodes = {self.geom.elements[e][1][0] for e in members}
+            if self._nl_any and any(n in self._rot_nodes or n in self._rb_rot for n in nodes):
+                self.report.warn(f"*MASS, TYPE=ANISOTROPIC, ELSET={elset} on a node with rotations in a "
+                                 f"deck with NLGEOM: Abaqus turns its principal axes with the node, the "
+                                 f"converter's form keeps them fixed — exact for small rotations only.",
+                                 once=True)
+                self._reduces("*MASS, TYPE=ANISOTROPIC axes not turned with the node under NLGEOM")
+            if cards and any(c.keyword == "DLOAD" and any((trimmed_fields(r) or [""])[0].upper() == elset.upper()
+                                                          for r in merged_data_records(c)) for c in blocks):
+                self.report.warn(f"*DLOAD on ELSET={elset} of a *MASS, TYPE=ANISOTROPIC: the converter "
+                                 f"carries its principal masses beyond {short_real(m0)} on new elements "
+                                 f"(ELSET={cards[0][0]}, ...), which that load does not name — their "
+                                 f"body force is missing.", once=True)
+                self._reduces("body force on the extra principal masses of an anisotropic *MASS")
 
     def _dashpot_lines(self) -> List[str]:
-        """The *EQUATIONs that keep each DASHPOT1's ground node on its line (_plan_dashpots)."""
-        rows = self._dashpot_rows
-        return (["** abq2ccx: DASHPOT1 -> DASHPOTA to a ground node kept on the DOF's line"] +
-                self._twin_lines(rows) + self._equation_lines(rows)) if rows else []
+        """The *EQUATIONs that keep each DASHPOT1 / DASHPOT2's new node on its line
+        (_plan_dashpots), tie the springs' nodes on transformed nodes (_plan_transformed_springs)
+        and the anisotropic masses' (_plan_anisotropic_masses)."""
+        out: List[str] = []
+        for rows, what in ((self._dashpot_rows, "DASHPOT1 / DASHPOT2 -> DASHPOTA to a new node kept on "
+                                                "the DOF's line"),
+                           (self._spring_rows, "SPRING1 / SPRING2 on a transformed node -> on a new node "
+                                               "tied to its local DOF"),
+                           (self._amass_rows, "*MASS, TYPE=ANISOTROPIC -> principal masses on new nodes "
+                                              "tied along their axes")):
+            if rows:
+                out += ["** abq2ccx: " + what] + self._twin_lines(rows) + self._equation_lines(rows)
+        return out
 
     def handle_dashpot(self, b: Block) -> List[str]:
         """``*DASHPOT``: of DASHPOT1 / DASHPOT2 elements (written as DASHPOTA, _plan_dashpots /
         ELEMENT_TYPE_MAP) without its first data line, their DOFs, and ORIENTATION= (the
         DASHPOTA acts along its line): ccx reads every data line of the card as 'coefficient,
         frequency, temperature' and stops on the DOF line in a *DYNAMIC step ('the damping
-        coefficient may depend on temperature and frequency only', probed)."""
+        coefficient may depend on temperature and frequency only', probed).  Of DASHPOTA
+        elements, whose first line Abaqus leaves blank, without that line where data lines follow:
+        ccx reads a DOF line there as a coefficient, and stops on '1, 1' ('the damping
+        coefficient may depend ...', probed)."""
         if id(b) not in self._dashpot_cards:
+            if len(b.data) > 1 and dof_line(b.data[0]) and self._elset_types(b) == {"DASHPOTA"}:
+                return self.passthrough(Block(b.keyword, b.params, b.data[1:]))
             return self.passthrough(b)
         params = OrderedDict((k, v) for k, v in b.params.items() if k != "ORIENTATION")
         return [emit_keyword("DASHPOT", params)] + list(b.data[1:])
+
+    def handle_spring(self, b: Block) -> List[str]:
+        """``*SPRING``: ccx 2.23 tells the card's DOF line from its data lines by a decimal point
+        — a line whose first number has none ('100', '1e-3', '-100') is a DOF line to it, and the
+        card stops ccx ('*SPRING card without data', on SPRINGA 'one degree of freedom ...';
+        probed: '100.', '1.e-3' and '1.d2' read) — so the numbers of the data lines get one
+        (dotted_number).  The first line of a SPRINGA card, which Abaqus leaves blank (read_blocks
+        keeps it), is left out where data lines follow: a DOF line there stops ccx too."""
+        lines = list(b.data)
+        first = 0
+        if lines and dof_line(lines[0]):
+            types = self._elset_types(b)
+            if types and not types & {"SPRING1", "SPRING2"} and len(lines) > 1:
+                lines = lines[1:]                   # (SPRINGA: ccx takes no DOF line)
+            else:
+                first = 1                           # (SPRING1 / SPRING2 / a JOINTC's: its DOFs)
+        lines[first:] = [",".join(map(dotted_number, ln.split(","))) for ln in lines[first:]]
+        return self.passthrough(Block(b.keyword, b.params, lines))
+
+    def _elset_types(self, b: Block) -> set:
+        """The element types (upper case) of the elements in card ``b``'s ELSET."""
+        return {self.geom.elements[e][0].upper() for e in self.geom.elset((b.param("ELSET") or "").strip())
+                if e in self.geom.elements}
 
     def _truss_copy_cards(self) -> List[str]:
         """u_copy = u_node for the trusses moved off a beam node, u_hub = u_node and u_copy =
@@ -21268,7 +21502,9 @@ class Converter:
         self._plan_shell_gradients(blocks)      # after _plan_load_facts: the temperature points
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_dashpots(blocks)             # after the planners above: the nodes' *TRANSFORM axes
-        self._warn_oriented_couplings_nlgeom(blocks)
+        self._plan_transformed_springs(blocks)  # likewise
+        self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
+        self._warn_partial_couplings_nlgeom(blocks)
         self._plan_member_mass_tets(blocks)     # after _plan_rot_nodes: the *MPC BEAM bodies
         self._plan_surface_heat(blocks)
         self._plan_load_cases(blocks)
@@ -21396,7 +21632,8 @@ class Converter:
         unreadable exponent ('*ERROR reading *CLOAD' on -5.148903517857142e-05) and is
         silently another number where it leaves a readable one (2.500000000000000000e-1 is
         read as 2.5; probed on *CLOAD, *ELASTIC, *NODE).  Data fields and keyword parameter
-        values; integers, labels and *HEADING text stay as they are."""
+        values; integers, labels and *HEADING text stay as they are.  On a *SPRING the short
+        form keeps a decimal point (1.e+12, not 1e+12: handle_spring)."""
         done: List[Tuple[str, str, str]] = []           # (card, old text, new text)
         kw = ""
 
@@ -21407,7 +21644,7 @@ class Converter:
             v = pf(text)
             if not math.isfinite(v):
                 return field
-            done.append((kw, text, short_real(v, 12)))
+            done.append((kw, text, dotted_number(short_real(v, 12)) if kw == "*SPRING" else short_real(v, 12)))
             return field[:len(field) - len(field.lstrip())] + done[-1][2]
 
         for i, ln in enumerate(out):
@@ -27592,28 +27829,79 @@ class Converter:
                       if self._kin_line_form(ref, ns, ds, frame) in ("rb", "eq", "ties")]
         return ref, groups
 
-    def _warn_oriented_couplings_nlgeom(self, blocks: List[Block]) -> None:
-        """Kinematic couplings of some translations with an ORIENTATION (a deck's own, or a
-        rotated instance's axes, _turn_instance_dofs) in a deck with NLGEOM: Abaqus turns the
-        coupled directions with the reference node ('Coupling constraints'), ccx 2.23 does not
-        (probed: one node coupled in DOF 1 to a reference node turned 0.5 rad moved -0.438 with
-        identity axes, -0.479 = -sin 0.5 without the ORIENTATION, where Abaqus' turned axis gives
-        -tan 0.5 = -0.546; a rotated instance's coupling of some DOFs 3-4 % off its unturned twin
-        at 0.3 rad).  Exact for small rotations: warned as reduced physics."""
+    def _warn_partial_couplings_nlgeom(self, blocks: List[Block]) -> None:
+        """Kinematic couplings of some translations in a deck with NLGEOM whose reference node can
+        turn (_ref_can_turn): Abaqus turns the coupled directions with the reference node, the
+        global ones or an ORIENTATION's (a deck's own, or a rotated instance's axes,
+        _turn_instance_dofs; 'Coupling constraints'), ccx 2.23 does not (probed: one node coupled
+        in DOF 1 to a reference node turned 0.5 rad moved -0.479 = -sin 0.5 without the
+        ORIENTATION, -0.438 with identity axes, where Abaqus' turned axis gives -tan 0.5 =
+        -0.546; a rotated instance's coupling of some DOFs 3-4 % off its unturned twin at 0.3
+        rad).  Exact for small rotations: warned as reduced physics.  An unoriented one in the
+        form _kin_dyn gives it in a deck with a *DYNAMIC step has its own warning there."""
         if not self._nl_any:
             return
-        for i, b in enumerate(blocks):
-            if b.keyword not in ("COUPLING", "KINEMATIC COUPLING") or not (b.param("ORIENTATION") or "").strip():
+        groups = [(b, cg) for b, cg in ((b, self._coupling_groups(blocks, i)) for i, b in enumerate(blocks)
+                                        if b.keyword in ("COUPLING", "KINEMATIC COUPLING"))
+                  if cg is not None and cg[0] in self.geom.nodes]
+        partial = [(b, cg[0]) for b, cg in groups if any(0 < len(ds & {1, 2, 3}) < 3 for _, ds in cg[1])]
+        used: Dict[int, set] = {ref: set() for _, ref in partial}     # the rotations its couplings use
+        for b, cg in groups:
+            if cg[0] in used:
+                frame = self._coupling_frame(b)
+                used[cg[0]].update(self._kin_rotation_rows(
+                    cg[0], cg[1], frame if isinstance(frame, tuple) else None, self._rot_nodes)[1])
+        said: set = set()
+        for b, ref in partial:
+            oriented = bool((b.param("ORIENTATION") or "").strip())
+            if oriented in said or (not oriented and id(b) in self._kin_dyn) or \
+                    not self._ref_can_turn(blocks, ref, used[ref]):
                 continue
-            cg = self._coupling_groups(blocks, i)
-            if cg is not None and any(0 < len(ds & {1, 2, 3}) < 3 for _, ds in cg[1]):
+            said.add(oriented)
+            if oriented:
                 self.report.warn("Kinematic coupling of some translations in the axes of an ORIENTATION "
                                  "in a deck with NLGEOM: Abaqus turns those axes with the reference node, "
                                  "ccx 2.23 does not (probed: 0.5 rad of reference node rotation, 20 % "
                                  "less motion along the turned axis) — exact for small rotations only.",
                                  once=True)
                 self._reduces("oriented kinematic coupling of some translations under NLGEOM")
-                return
+            else:
+                self.report.warn(f"Kinematic coupling of some translations (reference node {ref}, free to "
+                                 f"turn) in a deck with NLGEOM: Abaqus turns the coupled directions with "
+                                 f"the reference node, ccx 2.23 keeps the global ones (probed: 0.5 rad of "
+                                 f"reference node rotation, -sin 0.5 = -0.479 of motion where Abaqus' "
+                                 f"turned axis gives -tan 0.5 = -0.546) — exact for small rotations only.",
+                                 once=True)
+                self._reduces("kinematic coupling of some translations under NLGEOM (axes not turned)")
+
+    def _ref_can_turn(self, blocks: List[Block], ref: int, used: set) -> bool:
+        """Whether kinematic-coupling reference node ``ref`` can turn: one of its rotations is not
+        held at zero by the deck's BCs in every step, and the couplings on it use it (``used``,
+        global axes 1-3: their members move it), a BC turns it, or a moment, element, connector
+        or *EQUATION term acts on the node's rotations (else _plan_kinematic_holds holds it)."""
+        keys = {(ref, d) for d in (4, 5, 6)}
+        held: Optional[set] = None
+        turned = False
+        for active in bc_steps(blocks, lambda c: [((n, d), v) for ns, ds, v in self._bc_records(c)
+                                                  for n in ns for d in ds if (n, d) in keys],
+                               self._pert_idx, self.steps.lc2):
+            zero = {k for k, v in active.items() if v == 0.0}
+            turned = turned or len(zero) < len(active)
+            held = zero if held is None else held & zero
+        free = {d - 3 for _n, d in keys - (held or set())}
+        if not free:
+            return False
+        if turned or free & used or any(ref in (a, c) for _t, a, c in self._conn.values()) or \
+                any(ref in conn for t, conn in self.geom.elements.values() if not t.upper().startswith("MASS")):
+            return True
+        isint = re.compile(r"[-+]?\d+").fullmatch
+        for c in blocks:
+            if c.keyword == "CLOAD" and any(
+                    len(f) > 1 and f[0] and isint(f[1]) and 4 <= int(f[1]) <= 6 and ref in self._resolve_nodes(f[0])
+                    for f in map(trimmed_fields, merged_data_records(c))):
+                return True
+        return any(4 <= k <= 6 and ref in ns for c in blocks if c.keyword == "EQUATION"
+                   for ns, k in self._equation_dofs(c))
 
     def _coupling_frame(self, b: Block) -> Union[None, str, Tuple[Vec, Vec, Vec]]:
         """The axes of a kinematic coupling's ORIENTATION=, in which Abaqus couples the DOFs
@@ -32977,6 +33265,21 @@ def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec]
         p["ORIENTATION"] = AXES_ORIENTATION
         return Block(b.keyword, p, list(b.data))
 
+    def on_local(b: Block, ends: int) -> Optional[bool]:
+        """Whether the spring / dashpot nodes of card ``b`` all have a part *TRANSFORM (their
+        DOFs are its local ones, which turn with the instance: the card keeps its DOF
+        numbers), none has, or (None, warned) some have."""
+        hits = {n in local for e in geo.elset((b.param("ELSET") or "").strip())
+                for n in (geo.elements.get(e) or ("", []))[1][:ends]}
+        if len(hits) > 1:
+            report.warn(f"*INSTANCE {name} is rotated, and the *{b.keyword}, ELSET={b.param('ELSET')} "
+                        f"names DOFs at nodes with and without a part *TRANSFORM: its DOFs are turned "
+                        f"with the instance, those of the transformed nodes should be their local "
+                        f"ones.", once=True)
+            report.reduce(f"*{b.keyword} of rotated *INSTANCE {name} on transformed and plain nodes")
+            return None
+        return hits == {True}
+
     out: Dict[int, Block] = {}
     what: List[str] = []
     for i, b in enumerate(blocks):
@@ -33008,14 +33311,14 @@ def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec]
                 what.append("couplings of some DOFs")
         elif kw == "DASHPOT" and not b.param("ORIENTATION") and any(
                 (geo.elements.get(e) or ("",))[0].upper() == "DASHPOT1"
-                for e in geo.elset((b.param("ELSET") or "").strip())):
+                for e in geo.elset((b.param("ELSET") or "").strip())) and on_local(b, 1) is not True:
             nb = _turn_spring_dofs(b, axes)
             if nb is not b:
                 out[id(b)] = nb or oriented(b)
                 what.append("DASHPOT1 elements")
         elif kw == "SPRING" and not b.param("ORIENTATION") and any(
                 (geo.elements.get(e) or ("",))[0].upper() in ("SPRING1", "SPRING2")
-                for e in geo.elset((b.param("ELSET") or "").strip())):
+                for e in geo.elset((b.param("ELSET") or "").strip())) and on_local(b, 2) is not True:
             nb = _turn_spring_dofs(b, axes)
             if nb is None and b.data and any(pint(x) > 3 for x in
                                              trimmed_fields(b.data[0].split(",")) if x):
@@ -33026,9 +33329,13 @@ def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec]
             elif nb is not b:
                 out[id(b)] = nb or oriented(b)
                 what.append("SPRING1 / SPRING2 elements")
+        elif kw == "MASS" and b.uparam("TYPE").startswith("ANISO") and not b.param("ORIENTATION") and \
+                b.data and len({x.strip() for x in trimmed_fields(b.data[0].split(","))[:3]}) > 1:
+            out[id(b)] = oriented(b)                 # (principal axes along the part's: _plan_anisotropic_masses)
+            what.append("anisotropic masses")
     if what:
         kinds = [k for k in ("*EQUATION terms", "couplings of some DOFs", "SPRING1 / SPRING2 elements",
-                             "DASHPOT1 elements") if k in what]
+                             "DASHPOT1 elements", "anisotropic masses") if k in what]
         report.note(f"*INSTANCE {name} is rotated: the DOFs of its part's "
                     f"{', '.join(kinds[:-1]) + ' and ' if len(kinds) > 1 else ''}{kinds[-1]} are "
                     f"turned with it, as in Abaqus — an equation term (node, DOF j, c) becomes the "

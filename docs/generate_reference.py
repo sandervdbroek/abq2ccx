@@ -49,7 +49,7 @@ TRANSLATED = {
         "nodes; rotated instances rotate `*ORIENTATION` axes (also per-element "
         "`*DISTRIBUTION` axes), beam `n1`, `*NODE` normals, `*NORMAL` vectors and the part's "
         "DOF-numbered data (`*EQUATION` terms, couplings of some DOFs, `SPRING1`/`SPRING2`/"
-        "`DASHPOT1` DOFs, `*GAP` directions, a hinge's axis). Proved by "
+        "`DASHPOT1` DOFs, `*GAP` directions, a hinge's axis, an anisotropic `*MASS`'s axes). Proved by "
         "`validate_with_ccx.py` (`assembly_rotated_instances`: the same results as the model "
         "written flat).",
     "*ORIENTATION": "origin `c` of a 9-value line subtracted from `a`, `b` (ccx has no origin "
@@ -206,10 +206,18 @@ TRANSLATED = {
         "such a step (no `AMPLITUDE`), or a BC that `*BOUNDARY, OP=NEW` releases there, is warned: "
         "ccx's HHT integration overshoots the jump by 5 % at the first increment.",
     "*MASS": "passed through; in a deck with a transient `*COUPLED TEMPERATURE-DISPLACEMENT` step "
-        "divided by 10³⁰ with the densities (see there). `TYPE=ANISOTROPIC` → the isotropic mass "
-        "M11 that ccx 2.23 reads (exact only when the three are equal; else reduced physics).",
+        "divided by 10³⁰ with the densities (see there). `TYPE=ANISOTROPIC` (ccx 2.23 has none) → "
+        "the smallest principal mass on the node, the rest per principal axis on new nodes that "
+        "`*EQUATION`s tie to it along that axis (exact; reduced physics under `NLGEOM` at a node "
+        "with rotations, whose axes Abaqus turns, and where the `ORIENTATION`'s axes are unknown: "
+        "then M11 alone).",
     "*DASHPOT": "of `DASHPOT1` / `DASHPOT2` elements: written without its DOF line, which ccx reads as "
-        "a coefficient and stops on in a dynamic step, and without `ORIENTATION` (see the elements).",
+        "a coefficient and stops on in a dynamic step, and without `ORIENTATION` (see the elements); "
+        "of `DASHPOTA` elements without a DOF line where Abaqus has a blank one (ccx stops on `1, 1`).",
+    "*SPRING": "numbers written with a decimal point (`100` → `100.`, `1e-3` → `1.e-3`): ccx 2.23 reads "
+        "a line without one as the DOF line and stops; a `SPRINGA` card's DOF line (Abaqus: blank) "
+        "left out. `SPRING1` / `SPRING2` DOFs at a node with a `*TRANSFORM` are Abaqus' local ones, ccx "
+        "springs the global DOF → the spring on a new node tied to the local DOF (exact).",
     "*BOUNDARY": "named types (`ENCASTRE`/`PINNED`/`*SYMM`) expanded to DOFs; `TYPE=VELOCITY`/"
         "`ACCELERATION` → a displacement BC whose generated amplitude integrates the history from "
         "the DOF's state at the step start (continued in later steps that keep it). Without "
@@ -653,6 +661,11 @@ def _element_status(t):
             own += (" — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced "
                     "physics; `--approximate` → `S4`, `S8R` where coarse)")
         return f"{own}; under a composite section → `{up}` with midside nodes (reduced physics)"
+    if t == "DASHPOT2":
+        return ("→ `DASHPOTA` to a new node that `*EQUATION`s move with the second node's DOF along the "
+                "first DOF's line (exact, also under `NLGEOM`); on a rotational DOF left out (reduced physics)")
+    if t in ("SPRING1", "SPRING2"):
+        return "direct; at a node with a `*TRANSFORM` on a new node tied to its local DOF (exact)"
     if t in A.EXACT_SUBSTITUTIONS:
         return f"→ `{A.ccx_element_type(t, A.Report())}` (exact)"
     if t in A.ELEMENT_TYPE_MAP:
