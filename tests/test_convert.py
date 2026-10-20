@@ -438,6 +438,7 @@ def test_step_model_general_and_perturbation_steps():
     assert [s.nlgeom_on for s in m] == list(m.nl_steps) == [False] * 3 + [True] + [False] * 3
     assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
     assert [s.nlgeom_written for s in m] == [None, None, None, True, None, False, True]
+    assert [s.ccx_nlgeom for s in m] == [False] * 3 + [True, False, False, True]
     assert (m.nl_any, m.nl_all, len(m)) == (True, False, 7)
     assert all(s.between == () for s in m)
     # one perturbation rule (Abaqus' procedures; handle_step finds no ccx procedure in a *RANDOM
@@ -516,9 +517,11 @@ def test_step_model_handle_step_facts():
     assert [s.general_before for s in m] == [False] + [True] * 7
     assert [s.nlgeom for s in m] == [False] * 6 + [True] * 2
     assert [s.nlgeom_written for s in m] == [False] + [None] * 5 + [True, None]
+    assert [s.ccx_nlgeom for s in m] == [False] * 6 + [True] * 2
     dp = A.StepModel(blocks, dp=True)
     assert [s.nlgeom for s in dp] == [s.nlgeom for s in m]
     assert [s.nlgeom_written for s in dp] == [True, None, True, None, None, True, True, None]
+    assert [s.ccx_nlgeom for s in dp] == [True, False, True, False, False, True, True, True]
     assert [s.buckle_loaded for s in m] == [False] * 3 + [True] + [False] * 4
 
 
@@ -547,14 +550,15 @@ def test_step_model_motion_facts():
 
 
 def test_step_model_planner_facts():
-    # the *STEP cards that switch NLGEOM on (not a perturbation step's), the NLGEOM in force by
-    # the output planners' rule (an explicit step without NLGEOM=NO too) and by the deformation
+    # the *STEP cards that switch NLGEOM on (not a perturbation step's), the NLGEOM ccx runs
+    # by the *STEP cards handle_step writes (an explicit step without NLGEOM=NO too; the static
+    # perturbation step carries it on, a frequency step does not) and the deformation
     # plasticity check's (*STEP cards only); each step's procedure, card by card (damage criteria)
     blocks, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM, INC=5\n*STATIC, RIKS\n*END STEP""")
-    assert m.nl_heads == {id(blocks[12])} and m.explicit_without_nlgeom
-    assert [s.nlgeom_output for s in m] == [False, False, True, True, True]
+    assert m.nl_heads == {id(blocks[12])}
+    assert [s.ccx_nlgeom for s in m] == [False, False, True, True, True]
     assert [s.nlgeom_dp for s in m] == [False] * 4 + [True]
     assert [s.star_proc for s in m] == ["DYNAMIC", "FREQUENCY", "DYNAMIC", "PERTURBATION",
                                         "STATIC, RIKS"]
@@ -563,8 +567,8 @@ def test_step_model_planner_facts():
     blocks, m = _step_model("*STEP\n*END STEP\n*STATIC\n*STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n"
                             "*STEP, NLGEOM\n*STATIC\n*END STEP")
     assert [s.star_proc for s in m] == ["STATIC", "FREQUENCY", "STATIC"]
-    assert m.nl_heads == {id(blocks[6])} and not m.explicit_without_nlgeom
-    assert [(s.proc, s.nlgeom_dp, s.nlgeom_output) for s in m] == [
+    assert m.nl_heads == {id(blocks[6])}
+    assert [(s.proc, s.nlgeom_dp, s.ccx_nlgeom) for s in m] == [
         ("", False, False), ("FREQUENCY", False, False), ("STATIC", True, True)]
 
 
@@ -8981,8 +8985,11 @@ def test_plastic_material_where_ccx_segfaults():
                                     "material (ccx 2.23 segfaults)"]
     _, conv, rep = convert_str(pl + st + freq + _deck_step("Static", "*Cload\n7, 2, 1.\n"))
     assert "ccx ramps them from 0" not in rep.text() and len(conv.reduced_physics) == 1
+    # ... nor where NLGEOM is in force in ccx (Step.ccx_nlgeom): written again after the
+    # frequency step, or carried on from an NLGEOM step after it (code review 3, B39)
     for runs in (_deck_step("Static", load, ", nlgeom") + freq + st,      # NLGEOM written again
-                 st + freq + _deck_step("Dynamic\n0.01, 0.1", load) + st):
+                 st + freq + _deck_step("Dynamic\n0.01, 0.1", load) + st,
+                 st + freq + _deck_step("Static", load, ", nlgeom") + st):
         assert "segfaults" not in convert_str(pl + runs)[2].text()
     assert "segfaults" not in convert_str(pl.replace("*Plastic\n10., 0.\n20., 0.1\n", "") + st + freq
                                           + st)[2].text()

@@ -589,6 +589,9 @@ physics.
   switched it on; ccx ran such a step geometrically linear (a cantilever's tip 8.13 against
   5.05, without a message; with plasticity ccx segfaulted). It is now written `NLGEOM`, with
   a note.
+* **No false "ccx segfaults" after an NLGEOM step** — a plastic or creeping model's `*STATIC`
+  step after a `*FREQUENCY` step was warned as segfaulting, and flagged reduced physics, also
+  where NLGEOM carries on into it in ccx from an earlier step, which ccx solves.
 
 ## 1.4.0 (October 2026)
 

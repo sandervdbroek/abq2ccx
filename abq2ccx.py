@@ -4633,9 +4633,11 @@ class Step:
                                   # step runs about its base state's, its own NLGEOM aside
     nlgeom_written: Optional[bool]    # NLGEOM on the *STEP card handle_step writes (StepModel.
                                   # _writes_nlgeom): None for none, False for NLGEOM=NO
-    nlgeom_output: bool           # in force in ccx by the *STEP cards handle_step writes (the output
-                                  # planners' _ccx_linear_steps): on once a step's *STEP card is in
-                                  # nl_heads, or it is explicit without NLGEOM=NO
+    ccx_nlgeom: bool              # ccx: ccx 2.23 runs it under NLGEOM, by those cards and a deformation
+                                  # plasticity material (StepModel(dp=)): NLGEOM stays on in ccx until a
+                                  # card has NLGEOM=NO or a *FREQUENCY or *BUCKLE step has run (probed),
+                                  # and the procedures of PERTURBATION_PROCS are linear there (a static
+                                  # perturbation step is a general one in ccx)
     nlgeom_dp: bool               # on once a step's *STEP card is in nl_heads, explicit steps not
                                   # counted (_plan_deformation_plasticity)
     temp_dof: Optional[str]       # its first TEMPERATURE_DOF_PROCS card's keyword (handle_step's)
@@ -4685,7 +4687,7 @@ class StepModel:
     of the deck: a walker folds its own deck (``states``, ``acting``).
     _plan_deck_facts reads an early model for the planners before that point.  They read only
     its deck aggregates (``procs``, ``inertia``, ``mass_loads``, ``mass_acts``, ``nl_heads``,
-    ``explicit_without_nlgeom``, ``pert`` and the Converter views of it: _pert_idx, _nl_steps,
+    ``pert`` and the Converter views of it: _pert_idx, _nl_steps,
     _mechanical, ...), which no rewrite changes (test_step_model_is_current).  Model data may
     still change after it (*RIGID BODY parameters; the section cards a handler writes)."""
 
@@ -4791,30 +4793,25 @@ class StepModel:
         # NLGEOM on a general step's *STEP card as handle_step writes it, and a linear
         # perturbation step since the last general step (Converter._restore_from)
         written = since = False
+        flag = False                            # ccx's NLGEOM switch as a step starts (Step.ccx_nlgeom)
         seen = False                            # Step.general_before
         nl_motion, t = False, 0.0               # Step.nlgeom_motion, t_start
-        nl_output = nl_dp = False               # Step.nlgeom_output, nlgeom_dp
-        # card by card: each *STEP card's procedure (Step.star_proc), and whether a *DYNAMIC,
-        # EXPLICIT follows a *STEP card without NLGEOM= (explicit_without_nlgeom)
+        nl_dp = False                           # Step.nlgeom_dp
+        # card by card: each *STEP card's procedure (Step.star_proc)
         star_proc: Dict[int, str] = {}
         last: Optional[Block] = None
-        self.explicit_without_nlgeom = False
         for b in blocks:
             if b.keyword == "STEP":
                 last = b
                 star_proc[id(b)] = "PERTURBATION" if b.has("PERTURBATION") else ""
-            elif last is not None:
-                if b.keyword in PROC_KW and not star_proc[id(last)]:
-                    star_proc[id(last)] = f"{b.keyword}, RIKS" if b.has("RIKS") else b.keyword
-                if b.keyword == "DYNAMIC" and b.has("EXPLICIT") and not last.has("NLGEOM"):
-                    self.explicit_without_nlgeom = True
+            elif last is not None and b.keyword in PROC_KW and not star_proc[id(last)]:
+                star_proc[id(last)] = f"{b.keyword}, RIKS" if b.has("RIKS") else b.keyword
         # the ids of the *STEP cards that switch NLGEOM on (NLGEOM, NLGEOM=YES; Abaqus keeps it on
         # for the later steps) but a perturbation step's own: it runs linear about its base state,
         # and "linear perturbation steps have no effect on subsequent general analysis steps"
         # (Abaqus 2017); handle_step drops it where the base state is linear (ccx would run a
-        # static perturbation step, a general one in ccx, under it).  Read by
-        # _check_nlgeom_expansion, _u1_plans, _note_quadratic_beams, _slab_obstacle and (on a
-        # model of its own) _plan_user_materials.
+        # static perturbation step, a general one in ccx, under it).  Read by _u1_plans,
+        # _slab_obstacle and (on a model of its own) _plan_user_materials.
         heads: set = set()
         for is_step, cards in deck_parts(blocks):
             if not is_step:
@@ -4840,6 +4837,10 @@ class StepModel:
                 nlgeom = nlgeom or (explicit if given is None else given)
                 written = written or bool(nl_written)
             since = pert
+            flag = flag if nl_written is None else nl_written
+            ccx_nl = (dp or flag) and proc not in PERTURBATION_PROCS
+            if proc in ("FREQUENCY", "BUCKLE"):
+                flag = False                    # (ccx forgets it there, probed)
             bcs = [b for b in cards if b.keyword == "BOUNDARY"]
             two = [b for b in bcs if (b.param("LOAD CASE") or "1").strip() == "2"]
             if two and any(b.keyword == "BUCKLE" for b in cards):
@@ -4853,7 +4854,6 @@ class StepModel:
             if given and not pert:
                 heads.add(id(head))
             nl_dp = nl_dp or id(head) in heads
-            nl_output = nl_output or id(head) in heads or (explicit and given is not False)
             motion_explicit = motion_proc == "DYNAMIC" and motion_card.has("EXPLICIT")
             period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
             nl_motion = nl_motion or (not pert and bool(given)) or motion_explicit
@@ -4863,10 +4863,10 @@ class StepModel:
                 pert_param=pert_param, perturbation=pert, nlgeom_card=given,
                 nlgeom_on=(not pert and bool(given)) or
                 any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
-                nlgeom=nlgeom, nlgeom_written=nl_written,
+                nlgeom=nlgeom, nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
                 star_proc=star_proc[id(head)],
-                nlgeom_output=nl_output, nlgeom_dp=nl_dp, general=general, general_before=seen,
+                nlgeom_dp=nl_dp, general=general, general_before=seen,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
@@ -8901,9 +8901,9 @@ class Converter:
         rewrites (ELASTIC_FOR_EXPANSION).  The CalculiX sources changed both NLGEOM routines in
         October 2026, after 2.23.  Decks without temperatures have no thermal strain.  A
         *DEFORMATION PLASTICITY material runs every step under NLGEOM in ccx
-        (_plan_deformation_plasticity)."""
-        # (handle_step switches NLGEOM on in an explicit step without NLGEOM=)
-        nlgeom = self._dp_nlgeom or bool(self.steps.nl_heads) or self.steps.explicit_without_nlgeom
+        (_plan_deformation_plasticity).  The ccx question: a step ccx runs under NLGEOM
+        (Step.ccx_nlgeom; an explicit step without NLGEOM= gets it, handle_step)."""
+        nlgeom = any(s.ccx_nlgeom for s in self.steps)
         keys = {b.keyword for b in blocks}
         changes = bool(keys & {"TEMPERATURE", "COUPLED TEMPERATURE-DISPLACEMENT",
                                "UNCOUPLED TEMPERATURE-DISPLACEMENT"})
@@ -11239,9 +11239,11 @@ class Converter:
         (_restore_yields), which no form of the deck avoids (probed on both builds with a
         plastic and a creeping C3D8 column): a *BUCKLE step (and a *COMPLEX FREQUENCY, CORIOLIS
         one, which the converter does not write), with any output, and a *STATIC or *VISCO
-        step without NLGEOM after a *FREQUENCY step, at its start, also with a modal or
-        steady-state dynamics step in between.  A *DYNAMIC, NLGEOM or coupled temperature-
-        displacement step runs there, and a *DYNAMIC step in between clears it.  (Element and
+        step ccx runs without NLGEOM (``nlgeom``: Step.ccx_nlgeom, the ccx question: NLGEOM
+        carries on from an earlier step's card there) after a *FREQUENCY step, at its start,
+        also with a modal or steady-state dynamics step in between.  A *DYNAMIC, NLGEOM or
+        coupled temperature-displacement step runs there, and a *DYNAMIC step in between
+        clears it.  (Element and
         contact output segfaults the modal and steady-state dynamics steps: _el_file_stops
         drops it.)  Abaqus ignores plasticity and creep in a linear perturbation step.
         ``proc`` None: a step ccx stops at (_no_analysis)."""
@@ -11458,11 +11460,9 @@ class Converter:
                                 "the results (a static step's as a constant offset)." if held
                                 else ""), once=True)
             self._reduces("*MODAL DYNAMIC step started from a deformed or moving model")
-        nl = params.get("NLGEOM", "")
         stops = proc is None or proc == "COMPLEX FREQUENCY" or \
             (proc_block is not None and proc_block.has("RIKS") and not self._approx)
-        self._yield_segfaults(None if stops else proc, self._dp_nlgeom or (     # (_no_analysis)
-            "NLGEOM" in params and (nl or "YES").strip().upper() != "NO"))
+        self._yield_segfaults(None if stops else proc, cur.ccx_nlgeom)     # (_no_analysis)
         out = [self.emit.write_step(params)]
         if stops:
             # ccx reaches none of the step's other cards: they stay as comments.  An *EL FILE
@@ -16601,11 +16601,10 @@ class Converter:
                           ) -> List[bool]:
         """Per step, whether ccx 2.23 runs it linearly (linstatic.c: no kinetic energies, no
         nodal state variables): a *STATIC or *VISCO step, or one without a ccx procedure —
-        Riks too, commented out or (--approximate) a plain *STATIC —, with no NLGEOM in it or
-        an earlier step (Step.nlgeom_output: StepModel.nl_heads, or an explicit step's, which
-        handle_step adds unless NLGEOM=NO; handle_step writes it again after a *FREQUENCY or
-        *BUCKLE step, where ccx forgets it), no material ccx iterates (a kept *PLASTIC, *CREEP,
-        CCX_ITERATED_MATERIALS) and no step after which ccx iterates every step
+        Riks too, commented out or (--approximate) a plain *STATIC —, that ccx does not run
+        under NLGEOM (Step.ccx_nlgeom: the ccx question, by the *STEP cards handle_step writes),
+        with no material ccx iterates (a kept *PLASTIC, *CREEP, CCX_ITERATED_MATERIALS) and no
+        step after which ccx iterates every step
         (CCX_NONLINEAR_AFTER_PROCS) since the last *FREQUENCY or *BUCKLE step, after which ccx
         runs a *STATIC step linearly again (probed, also after an explicit step without
         NLGEOM).  Contact makes ccx iterate too, but the converter cannot tell whether ccx
@@ -16615,7 +16614,7 @@ class Converter:
         after = False
         for (_k, timing, _reqs), step in zip(steps, self.steps):
             linear.append(timing["proc"] in (None, "STATIC", "VISCO") and
-                          not (step.nlgeom_output or after or iterated))
+                          not (step.ccx_nlgeom or after or iterated))
             if timing["proc"] in CCX_NONLINEAR_AFTER_PROCS:
                 after = True
             elif timing["proc"] in ("FREQUENCY", "BUCKLE"):
@@ -24211,7 +24210,8 @@ class Converter:
                 self._b32r_rows.update(e for e in self.geom.elset((b.param("ELSET") or "").strip())
                                        if e in b32r)
         held = set(self.geom.nsets.get(PLANAR_NODES_SET, ()))
-        if self.steps.nl_heads and \
+        # (the ccx question: a step ccx runs under NLGEOM, Step.ccx_nlgeom)
+        if any(s.ccx_nlgeom for s in self.steps) and \
                 any(not set(self.geom.elements[e][1]) <= held for e in b32r):
             self.report.note(f"3-node beams run as ccx's {QUADRATIC_BEAM} in an NLGEOM step: where "
                              f"DOF 3 is not held (a 3-D model), ccx 2.23 can stop converging on "
