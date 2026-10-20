@@ -8164,10 +8164,11 @@ class Converter:
             pre += [f"*ORIENTATION, NAME={self._identity_ori}", "1., 0., 0., 0., 1., 0."]
         return self._identity_ori
 
-    def _section_layers(self, b: Block) -> List[Tuple[str, str, str]]:
+    def _section_layers(self, b: Block, strict: bool = False) -> List[Tuple[str, str, str]]:
         """(thickness, material, orientation field in upper case) of each layer of a shell or
         membrane section: a composite's ply lines (a SYMMETRIC layup mirrored), else the
-        section's material with a blank field."""
+        section's material with a blank field.  A ply line without a thickness or a material
+        is left out with a warning, or (``strict``) gives []."""
         if not b.has("COMPOSITE"):
             return [("", (b.param("MATERIAL") or "").strip(), "")]
         plies: List[Tuple[str, str, str]] = []
@@ -8176,6 +8177,8 @@ class Converter:
             if len(g) >= 3 and g[0] and g[2]:
                 plies.append((g[0], g[2], (g[3] if len(g) > 3 else "").upper()))
             elif g:
+                if strict:
+                    return []
                 self.report.warn(f"*{b.keyword}, COMPOSITE, ELSET={b.param('ELSET') or ''}: ply line "
                                  f"'{', '.join(g)}' has no {'material' if g[0] else 'thickness'} "
                                  f"(Abaqus needs a positive thickness and a material on every "
@@ -20929,25 +20932,14 @@ class Converter:
 
     def _layup(self, b: Block) -> Optional[List[dict]]:
         """The layers of a composite *SHELL SECTION, bottom first (SYMMETRIC mirrored): each
-        its thickness (relative on continuum shells), material and orientation field (an
-        angle, an *ORIENTATION or a distribution name, or ""), or None when a line has no
-        positive thickness or no material."""
-        plies: List[dict] = []
-        for rec in merged_data_records(b):
-            g = [x.strip() for x in rec]
-            if not any(g):
-                continue
-            g += [""] * 4
-            try:
-                t = pf(g[0])
-            except ValueError:
-                return None
-            if t <= 0.0 or not g[2]:
-                return None
-            plies.append(dict(t=t, mat=g[2], ori=g[3]))
-        if b.has("SYMMETRIC"):
-            plies = plies + plies[::-1]
-        return plies or None
+        its thickness (relative on continuum shells), material and orientation field in upper
+        case (an angle, an *ORIENTATION or a distribution name, or ""), or None when a line
+        has no positive thickness or no material."""
+        try:
+            plies = [dict(t=pf(t), mat=m, ori=o) for t, m, o in self._section_layers(b, strict=True)]
+        except ValueError:
+            return None
+        return plies if plies and not any(p["t"] <= 0.0 for p in plies) else None
 
     @staticmethod
     def _stack_direction(b: Block) -> str:
