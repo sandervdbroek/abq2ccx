@@ -18381,7 +18381,8 @@ class Converter:
         deck = self._buckle_displacements(deck)  # after the BCs the restore gives back
         deck = self._modal_own_loads(deck)      # after the loads the restore gives back
         deck = self._clear_body_forces(deck)    # after every pass that writes *DLOAD, OP=NEW
-        out = self._keep_body_loads(deck.render())  # after the restore, which gives body loads too
+        deck = self._keep_body_loads(deck)      # after the restore, which gives body loads too
+        out = deck.render()
         self._audit_loads(blocks, out)
         out = self._shift_total_time(out)       # after every pass that writes load cards
         out = self._short_fields(out)           # last: every card is written
@@ -20948,7 +20949,7 @@ class Converter:
             res.append(line)
         return res + insert.get(len(out), [])
 
-    def _keep_body_loads(self, out: List[str]) -> List[str]:
+    def _keep_body_loads(self, deck: EmittedDeck) -> EmittedDeck:
         """ccx 2.23 aborts (SIGABRT: it frees its body-load table twice) at the end of a step
         that holds no *DLOAD body load (GRAV, CENTRIF, NEWTON) once an earlier step held one,
         and may leave the .dat empty (probed).  A step holds none when it gives none and is a
@@ -20958,31 +20959,31 @@ class Converter:
         set, which loads nothing (probed: the same buckling factors, frequencies and
         displacements, and the job finishes)."""
         holds = seen = dropped = pert = False
-        card = proc = token = None
-        insert: Dict[int, Optional[str]] = {}      # *END STEP line -> the zero line's set
-        steps: List[int] = []
-        for i, raw in enumerate(out):
-            s = raw.strip()
-            if not s or s.startswith("**"):
-                continue
-            if not s.startswith("*"):
-                f = [x.strip() for x in s.split(",")]
-                if card == "DLOAD" and len(f) > 1 and f[0] and f[1].upper() in self._BODY_LOADS:
-                    holds, token = True, f[0]
-                continue
-            card, params = parse_keyword_line(s)
+        proc = token = None
+        # (*END STEP, the zero line's set, the *STEP lines before it); a *STEP inside an open
+        # step starts the next one, the open one left unfinished
+        insert: List[Tuple[EmittedCard, Optional[str], int]] = []
+        n = 0
+        for c in deck.cards:
+            card = c.keyword
             if card == "STEP":
-                steps.append(i)
-                proc, pert, holds = None, "PERTURBATION" in params, holds and not dropped
-            elif card in PROC_KW and steps and proc is None:
+                n += 1
+                proc, pert, holds = None, c.has("PERTURBATION"), holds and not dropped
+            elif card in PROC_KW and n and proc is None:
                 proc, holds = card, holds and card != "BUCKLE"
             elif card == "END STEP":
                 if seen and not holds:
-                    insert[i], holds = token, True
+                    insert.append((c, token, n))
+                    holds = True
                 seen, dropped = seen or holds, proc == "BUCKLE" and pert
+            if card == "DLOAD":
+                for s in c.data:
+                    f = [x.strip() for x in s.split(",")]
+                    if len(f) > 1 and f[0] and f[1].upper() in self._BODY_LOADS:
+                        holds, token = True, f[0]
         if not insert:
-            return out
-        filled = [str(sum(1 for k in steps if k < i)) for i in insert]
+            return deck
+        filled = [str(k) for _, _, k in insert]
         self.report.note(f"Step{'s' if len(filled) > 1 else ''} {', '.join(filled)} "
                          f"hold{'' if len(filled) > 1 else 's'} no body load in ccx 2.23 after an "
                          f"earlier step held one (*BUCKLE drops the earlier loads, and ccx deletes "
@@ -20990,14 +20991,11 @@ class Converter:
                          f"at the step's end (probed). A zero GRAV line is written there: it loads "
                          f"nothing (probed: the same buckling factors and results, and the job "
                          f"finishes).", once=True)
-        res: List[str] = []
-        for i, raw in enumerate(out):
-            if i in insert:
-                res += ["** abq2ccx: a body load of zero: ccx 2.23 aborts after a step without "
-                        "body loads once an earlier step had one", "*DLOAD",
-                        f"{insert[i]}, GRAV, 0., 0., 0., -1."]
-            res.append(raw)
-        return res
+        for end, token, _ in insert:
+            deck.insert_before(end, ["** abq2ccx: a body load of zero: ccx 2.23 aborts after a step "
+                                     "without body loads once an earlier step had one", "*DLOAD",
+                                     f"{token}, GRAV, 0., 0., 0., -1."])
+        return deck.edited()
 
     # the *DLOAD labels ccx 2.23's OP=NEW leaves in force: dloads.f resets the P / I face loads
     # and the GRAV / CENTRIF / NEWTON table only (probed: also on an amplitude)
