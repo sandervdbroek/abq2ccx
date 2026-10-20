@@ -12637,6 +12637,36 @@ def test_ref_node_set_of_several_nodes_warned_on_kinematic_coupling():
     assert "*RIGID BODY REF NODE=RP names a set of 2 nodes, where Abaqus requires one; the first (9)" \
         in rep.text() and "REF NODE=9" in body
 
+
+def test_rotary_inertia_in_a_turned_orientation():
+    # the *ORIENTATION's additional rotation turns the local inertia axes (the orientation
+    # defines them, Keywords *ROTARY INERTIA): the same as the orientation written turned
+    def inertia(ori):
+        deck = RIGID_PLATE + ori + ("*ELEMENT, TYPE=MASS, ELSET=PM\n10, 9\n*MASS, ELSET=PM\n6.\n"
+                                    "*ELEMENT, TYPE=ROTARYI, ELSET=PI\n11, 9\n"
+                                    "*ROTARY INERTIA, ELSET=PI, ORIENTATION=O\n1.5, 2., 1., 0.1, 0., 0.\n"
+                                    "*STEP\n*FREQUENCY\n3\n*END STEP\n")
+        body, _, rep = convert_str(deck)
+        assert "not converted" not in rep.text(), rep.text()
+        g = reparse(body)
+        masses = {}
+        for m in re.finditer(r"\*MASS, ELSET=(\S+)\n(\S+)\n", body):
+            for e in g.elset(m.group(1)):
+                masses[g.elements[e][1][0]] = masses.get(g.elements[e][1][0], 0.0) + float(m.group(2))
+        c = g.nodes[9]
+        return [[sum(m * ((A.vdot(A.vsub(g.nodes[n], c), A.vsub(g.nodes[n], c)) if i == j else 0.0)
+                          - (g.nodes[n][i] - c[i]) * (g.nodes[n][j] - c[j])) for n, m in masses.items())
+                 for j in range(3)] for i in range(3)]
+    co, si = math.cos(math.radians(30.)), math.sin(math.radians(30.))
+    turned = inertia("*ORIENTATION, NAME=O\n1., 0., 0., 0., 1., 0.\n3, 30.\n")
+    plain = inertia(f"*ORIENTATION, NAME=O\n{co!r}, {si!r}, 0., {-si!r}, {co!r}, 0.\n")
+    assert max(abs(turned[i][j] - plain[i][j]) for i in range(3) for j in range(3)) < 1e-9
+    assert abs(turned[0][1]) > 0.1                                   # (turned off the global axes)
+    # about axis 1: the same as the axes 2, 3 written turned
+    turned = inertia("*ORIENTATION, NAME=O\n1., 0., 0., 0., 1., 0.\n1, 30.\n")
+    plain = inertia(f"*ORIENTATION, NAME=O\n1., 0., 0., 0., {co!r}, {si!r}\n")
+    assert max(abs(turned[i][j] - plain[i][j]) for i in range(3) for j in range(3)) < 1e-9
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

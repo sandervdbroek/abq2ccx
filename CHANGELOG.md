@@ -6,6 +6,9 @@ physics.
 
 ## Unreleased
 
+* **`*ROTARY INERTIA` on a turned `*ORIENTATION`** — an orientation with an additional rotation
+  line was refused (the rigid body's rotary inertia not converted, reduced physics). Its turned
+  axes are the inertia axes, as for connectors and coupling orientations, and are now used.
 * **`*KINEMATIC COUPLING, REF NODE=<set>` of several nodes** — Abaqus requires the set to hold one
   node; the converter took the first without a word. It is now warned, as on `*RIGID BODY`.
 * **Analytic amplitudes in `*MODAL DYNAMIC` steps** — a `PERIODIC`, `MODULATED` or `DECAY`

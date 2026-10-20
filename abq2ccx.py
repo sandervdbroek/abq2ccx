@@ -16280,18 +16280,14 @@ class Converter:
 
     def _rotary_axes(self, card: Block) -> Optional[List[Vec]]:
         """The axes (rows) a *ROTARY INERTIA's values refer to: global, or a rectangular
-        *ORIENTATION's (x along a, y towards b, z = x cross y); None for any other system and
+        *ORIENTATION's, its additional rotation applied (_conn_axes; the orientation defines
+        "the local inertia axes", Keywords *ROTARY INERTIA); None for any other system and
         where the orientation's axes are not known (_orient_axes)."""
         name = card.uparam("ORIENTATION")
         if not name:
             return [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
-        o = self.orientations.get(name)
-        if not o or not o[2].upper().startswith("RECT") or self._orient_rotation.get(name) or \
-                name not in self._orient_axes:
-            return None
-        e1 = vunit(o[0])
-        e2 = vunit(vsub(o[1], vscale(e1, vdot(o[1], e1))))
-        return [e1, e2, vcross(e1, e2)]
+        axes = self._conn_axes(name)
+        return list(axes) if axes else None
 
     def _plan_rigid_planar_holds(self) -> None:
         """Model-data BCs that keep the 3-D rigid bodies of plane rigid elements in their
@@ -19896,16 +19892,10 @@ class Converter:
         if hit is None or hit not in self._orient_axes:
             return None
         a, bvec, system = self.orientations[hit]
-        e1, e3 = vunit(a), vunit(vcross(a, bvec))
-        if not system.upper().startswith("RECT") or vnorm(e1) < 0.5 or vnorm(e3) < 0.5:
+        if not system.upper().startswith("RECT") or vnorm(vunit(a)) < 0.5 or \
+                vnorm(vunit(vcross(a, bvec))) < 0.5:
             return None
-        axes = [e1, vcross(e3, e1), e3]
-        rot = self._orient_rotation.get(hit)
-        if rot and rot[0] in (1, 2, 3) and rot[1]:
-            k = rot[0] - 1
-            axes = [v if i == k else rotate_about_axis(v, (0.0, 0.0, 0.0), axes[k], rot[1])
-                    for i, v in enumerate(axes)]
-        return axes[0], axes[1], axes[2]
+        return orientation_frame(a, bvec, system, (0.0, 0.0, 0.0), self._orient_rotation.get(hit))[0]
 
     _CONN_OWN_ROTATION = (
         "Connector on the rotation of a node with a *TRANSFORM that carries its rotation on its "
