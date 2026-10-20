@@ -54,6 +54,15 @@ physics.
   `OP=NEW` on a `*CLOAD`, `*DLOAD` or `*DSLOAD` there removes nothing in Abaqus, so it is
   dropped (ccx removed the base state's loads). A BC on a DOF the base state leaves free, a
   released base BC and a value on an amplitude cannot be added up: warned (reduced physics).
+* **Eigenvalue steps with contact or hyperelastic temperatures** — ccx 2.23 leaves contact
+  out of `*BUCKLE` altogether, with or without `PERTURBATION` (probed: a column braced by
+  touching blocks kept its free factors): now warned (reduced physics). An initial
+  overclosure stresses the base state (Abaqus resolves it as an interference fit in the first
+  general step; probed alike in ccx): a `*FREQUENCY` step after it no longer gets
+  `PERTURBATION` as an unstressed one. Exceptions: node-to-surface `ADJUST`, which moves the
+  nodes strain-free, and a `*CLEARANCE` that sets a gap. Temperature-dependent
+  `*HYPERELASTIC` / `*HYPERFOAM` coefficients now count as heated materials there, as `*ELASTIC`
+  rows do. Contact pairs on unconverted analytical surfaces no longer count as contact.
 
 ## 1.4.0 (October 2026)
 

@@ -1327,13 +1327,35 @@ def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
     return rows
 
 
+def hyper_values(block: Block) -> Optional[int]:
+    """The coefficients per row of a *HYPERELASTIC / *HYPERFOAM card of order N (default 1),
+    or None (test data, MARLOW, USER: no coefficients ccx reads)."""
+    try:
+        n = max(1, int(float(block.param("N") or "1")))
+    except ValueError:
+        return None
+    if block.has("TEST DATA INPUT"):
+        return None
+    if block.keyword == "HYPERFOAM":
+        return 3 * n
+    counts = {"NEO HOOKE": 2, "MOONEY-RIVLIN": 3, "ARRUDA-BOYCE": 3, "VAN DER WAALS": 5,
+              "YEOH": 6, "OGDEN": 3 * n, "REDUCED POLYNOMIAL": 2 * n, "MARLOW": None,
+              "USER": None}
+    return next((v for k, v in counts.items() if block.has(k)), n * (n + 5) // 2)   # POLYNOMIAL
+
+
 def temperature_dependent(block: Block) -> bool:
-    """Whether a *ELASTIC / *DENSITY card tabulates its values at more than one temperature;
-    True when its rows do not read."""
+    """Whether a *ELASTIC / *DENSITY / *HYPERELASTIC / *HYPERFOAM card tabulates its values at
+    more than one temperature; True when its rows do not read."""
     typ = (block.param("TYPE") or "ISOTROPIC").strip().upper()
-    nvals = 1 if block.keyword == "DENSITY" else {
-        "ISOTROPIC": 2, "ISO": 2, "ORTHOTROPIC": 9, "ORTHO": 9, "ENGINEERING CONSTANTS": 9,
-        "LAMINA": 6, "ANISOTROPIC": 21, "ANISO": 21, "TRACTION": 3, "SHEAR": 1}.get(typ)
+    if block.keyword in ("HYPERELASTIC", "HYPERFOAM"):
+        nvals = hyper_values(block)
+        if nvals is None:
+            return False
+    else:
+        nvals = 1 if block.keyword == "DENSITY" else {
+            "ISOTROPIC": 2, "ISO": 2, "ORTHOTROPIC": 9, "ORTHO": 9, "ENGINEERING CONSTANTS": 9,
+            "LAMINA": 6, "ANISOTROPIC": 21, "ANISO": 21, "TRACTION": 3, "SHEAR": 1}.get(typ)
     rows = material_rows(block, nvals) if nvals else None
     if rows is None:
         return sum(1 for ln in block.data if ln.strip()) > 1
@@ -3859,7 +3881,8 @@ class Converter:
         self._has_sensitivity = False
         self._freq_read: set = set()                # *FREQUENCY steps a later step reads modes of
         self._initial_stresses = False
-        self._freq_contact = False                  # a contact pair (ccx's plain *FREQUENCY drops it)
+        self._freq_contact = False                  # contact (plain *FREQUENCY / *BUCKLE drop it)
+        self._overclosed = False                    # one of them starts overclosed
         self._tdep_material = False                 # moduli or density tabulated over temperature
         self._expansion = False
         self._general_step_seen = False
@@ -7746,10 +7769,105 @@ class Converter:
     # a nonlinear spring's tangent and a hyperelastic material's base tangent (without stress
     # stiffness, as Abaqus after a step without NLGEOM; a user material takes the same path);
     # it loses the base temperatures (_base_heated, _tdep_material) and leaves contact pairs
-    # out altogether, even surfaces that touch at the start (_freq_contact; all probed).
+    # out altogether, even surfaces that touch at the start (_freq_contact; all probed), as its
+    # *BUCKLE does in any form (handle_step).
     # Damage, concrete, brittle cracking, hypoelasticity, field variables, general contact and
     # connector behaviour have no ccx counterpart (commented out or kept as an indicator), so
     # PERTURBATION brings none in.
+
+    def _contact_overclosed(self, blocks: List[Block], lines: List[Tuple[Block, str, str]]) -> bool:
+        """Whether a contact pair line ccx gets ((card, slave, master)) starts overclosed: a
+        *CLEARANCE with a negative value, or a slave node behind a continuum face or edge of
+        the master (its sub-triangles / segments through the midside nodes, facing away from
+        its element; not one of that element's nodes) by more than 1e-6 of the model's span
+        and less than the face's size.
+        Abaqus resolves an overclosure as an interference fit, with stresses, in the first
+        increment ("Modeling contact interference fits in Abaqus/Standard"), unless ADJUST
+        moves the slave nodes onto the master strain-free — as ccx 2.23 does on a node-to-
+        surface pair, at any ADJUST value (probed; on a surface-to-surface pair it leaves part
+        of the overclosure).  Shell, rigid and surface-element masters are not checked."""
+        cleared = set()
+        for b in blocks:
+            if b.keyword == "CLEARANCE":
+                nums = []
+                for v in [b.param("VALUE")] + [r[1] for r in merged_data_records(b) if len(r) > 1]:
+                    try:
+                        nums.append(pf(v))
+                    except (TypeError, ValueError):
+                        pass
+                if any(x < 0 for x in nums):
+                    return True
+                if b.param("VALUE"):
+                    cleared.add((b.uparam("SLAVE"), b.uparam("MASTER")))
+        tol = 1e-6 * self._model_span()
+        nodes = self.geom.nodes
+        types: Dict[str, str] = {}
+        for b, slave, master in lines:
+            n2s = (b.param("TYPE") or "").replace(" ", "").upper() != "SURFACETOSURFACE"
+            sd = self.surfaces.get(master)
+            if (b.has("ADJUST") and n2s) or (slave, master) in cleared or not sd or \
+                    sd[0].startswith("NODE"):
+                continue
+            facets: List[Tuple[Tuple[Vec, ...], Vec, float]] = []   # (points, outward normal, size)
+            on_master: set = set()
+            for tok, face in sd[1]:
+                for e in self._resolve_elements(tok):
+                    typ, conn = self.geom.elements.get(e, ("", []))
+                    planar = typ.upper().startswith(PLANAR_SOLID_PREFIXES)
+                    if planar:
+                        ids = self._face_node_ids(e, face)
+                        ok = len(ids) in (2, 3)
+                    else:
+                        ids, corners = self._facet(e, face, types)
+                        ok = typ and types[typ].startswith("C3D") and corners in (3, 4)
+                    if not ok or any(n not in nodes for n in list(ids) + list(conn)):
+                        continue
+                    on_master.update(conn)          # the master body's own nodes
+                    mid = vscale(functools.reduce(vadd, (nodes[n] for n in conn)), 1.0 / len(conn))
+                    p = [nodes[n] for n in ids]
+                    if planar:
+                        parts = [(p[0], p[2]), (p[2], p[1])] if len(p) == 3 else [(p[0], p[1])]
+                        size = vnorm(vsub(p[1], p[0]))
+                    else:
+                        nc = 3 if len(p) in (3, 6) else 4
+                        c, m = p[:nc], p[nc:]
+                        parts = [(c[0], c[i], c[i + 1]) for i in range(1, nc - 1)] if not m else \
+                            [(c[k], m[k], m[k - 1]) for k in range(nc)] + \
+                            [(m[0], m[i], m[i + 1]) for i in range(1, nc - 1)]
+                        size = max(vnorm(vsub(c[(i + 1) % nc], c[i])) for i in range(nc))
+                    for q in parts:
+                        nrm = vunit(vcross(vsub(q[1], q[0]), (0.0, 0.0, 1.0)) if planar else
+                                    vcross(vsub(q[1], q[0]), vsub(q[2], q[0])))
+                        cen = vscale(functools.reduce(vadd, q), 1.0 / len(q))
+                        if vdot(nrm, vsub(cen, mid)) < 0:
+                            nrm = vscale(nrm, -1.0)
+                        facets.append((q, nrm, size))
+            if not facets:
+                continue
+            cell = max(max(f[2] for f in facets), 1e-12)
+            grid: Dict[Tuple[int, ...], List[int]] = {}
+            for i, (q, _, size) in enumerate(facets):
+                lo = [int(math.floor((min(x[a] for x in q) - size) / cell)) for a in range(3)]
+                hi = [int(math.floor((max(x[a] for x in q) + size) / cell)) for a in range(3)]
+                for key in itertools.product(*(range(lo[a], hi[a] + 1) for a in range(3))):
+                    grid.setdefault(key, []).append(i)
+            for n in self._surface_member_nodes(slave):
+                if n in on_master or n not in nodes:
+                    continue
+                x = nodes[n]
+                for i in grid.get(tuple(int(math.floor(x[a] / cell)) for a in range(3)), ()):
+                    q, nrm, size = facets[i]
+                    if len(q) == 3:
+                        near = closest_on_triangle(x, *q)
+                    else:
+                        d = vsub(q[1], q[0])
+                        t = min(1.0, max(0.0, vdot(vsub(x, q[0]), d) / (vdot(d, d) or 1.0)))
+                        near = vadd(q[0], vscale(d, t))
+                    v = vsub(x, near)
+                    s = vdot(v, nrm)
+                    if -size < s < -tol and vdot(v, v) - s * s <= (1e-3 * size) ** 2:
+                        return True
+        return False
 
     def _frequency_perturbation(self, given: bool) -> bool:
         """Whether a *FREQUENCY step gets *STEP, PERTURBATION (``given``: the deck's).  Abaqus
@@ -7763,7 +7881,9 @@ class Converter:
         and the initial temperatures (probed: a column under 0.37 of its buckling load, 16.87 Hz
         vs 20.95 Hz; touching a fixed plate, 29.80 Hz vs 20.95 Hz; the frequency step's own
         *TEMPERATURE is ignored).  Where the base state holds no stress (temperatures without
-        expansion, no loads) PERTURBATION is exact (probed: E halved by heating, 14.81 Hz).
+        expansion, no loads, no overclosure: _contact_overclosed) PERTURBATION is exact
+        (probed: E halved by heating, 14.81 Hz; ccx resolves an overclosure in the first
+        general step, with stresses, as Abaqus does, not in a first-step PERTURBATION).
         ccx's modal / steady-state dynamics and complex frequency steps refuse an .eig file
         written by a perturbation frequency step ('created with perturbation info'; probed):
         PERTURBATION is left out on the frequency step they read (_freq_read)."""
@@ -7838,7 +7958,9 @@ class Converter:
                              f"then refuses ('created with perturbation info'); {left}.", once=True)
             self._reduces("base state of a *FREQUENCY step that modal / steady-state dynamics read")
             return False
-        if not (self._base_stressed or (self._expansion and self._base_heated)):
+        # an overclosure is resolved as an interference fit in the first general step (Abaqus)
+        if not (self._base_stressed or (self._expansion and self._base_heated) or
+                (contact and self._overclosed)):
             if not given and temps:
                 self.report.note("*STEP, PERTURBATION written on a *FREQUENCY step after general "
                                  "steps without NLGEOM that only heat the model: Abaqus evaluates "
@@ -7848,10 +7970,11 @@ class Converter:
             if not given and contact:
                 self.report.note("*STEP, PERTURBATION written on a *FREQUENCY step with contact "
                                  "pairs after general steps without NLGEOM that leave the model "
-                                 "unstressed: Abaqus keeps the base state's contact status, ccx "
-                                 "2.23's plain *FREQUENCY leaves contact out altogether, and the "
-                                 "base state holds no stress its PERTURBATION would add (probed: "
-                                 "a column touching a fixed plate, 29.80 Hz vs 20.95 Hz).", once=True)
+                                 "unstressed (no loads, no overclosure): Abaqus keeps the base "
+                                 "state's contact status, ccx 2.23's plain *FREQUENCY leaves "
+                                 "contact out altogether, and the base state holds no stress its "
+                                 "PERTURBATION would add (probed: a column touching a fixed plate, "
+                                 "29.80 Hz vs 20.95 Hz).", once=True)
             return True
         if given:
             self.report.warn("*FREQUENCY step with PERTURBATION after general steps without "
@@ -7870,12 +7993,14 @@ class Converter:
             self._reduces("*FREQUENCY step at the initial temperatures (Abaqus: the base "
                           "state's)")
         if contact:
-            self.report.warn("*FREQUENCY step with contact pairs after loaded general steps "
-                             "without NLGEOM: Abaqus keeps the base state's contact status, ccx "
-                             "2.23's plain *FREQUENCY leaves contact out altogether (probed: a "
-                             "column pressed against a fixed plate, 20.95 Hz vs 30.14 Hz with "
-                             "PERTURBATION); its PERTURBATION would add the base state's stress "
-                             "stiffness and deformed geometry, which Abaqus leaves out here.",
+            self.report.warn("*FREQUENCY step with contact pairs after general steps without "
+                             "NLGEOM that stress the model (loads, prescribed motion, an "
+                             "overclosure resolved as an interference fit): Abaqus keeps the "
+                             "base state's contact status, ccx 2.23's plain *FREQUENCY leaves "
+                             "contact out altogether (probed: a column pressed against a fixed "
+                             "plate, 20.95 Hz vs 30.14 Hz with PERTURBATION); its PERTURBATION "
+                             "would add the base state's stress stiffness and deformed geometry, "
+                             "which Abaqus leaves out here.",
                              once=True)
             self._reduces("contact left out of a *FREQUENCY step (ccx's plain *FREQUENCY "
                           "drops it)")
@@ -8037,6 +8162,14 @@ class Converter:
                              "state), ccx 2.23 leaves them out there, with or without PERTURBATION "
                              "(probed; after a general step it includes them).", once=True)
             self._reduces("initial stresses left out of a *BUCKLE step's base state")
+        if proc == "BUCKLE" and self._freq_contact:
+            self.report.warn("*BUCKLE step with contact pairs: Abaqus buckles with the base "
+                             "state's contact status frozen (closed points held), ccx 2.23 leaves "
+                             "contact out of *BUCKLE altogether, with or without PERTURBATION, "
+                             "also after a general step that closed it (probed: a column touching "
+                             "a block sideways, factor 2.17 vs 8.61 held); a preload's stresses "
+                             "stay in.", once=True)
+            self._reduces("contact left out of a *BUCKLE step (ccx 2.23 drops it)")
         if proc == "FREQUENCY" and not step_block.has("PERTURBATION") and \
                 self._frequency_perturbation(False):
             params["PERTURBATION"] = None
@@ -19497,9 +19630,21 @@ class Converter:
         # *BUCKLE step: handle_step)
         self._initial_stresses = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "STRESS"
                                      for b in blocks)
-        self._freq_contact = any(b.keyword == "CONTACT PAIR" and not b.has("TIED") for b in blocks)
-        self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY") and temperature_dependent(b)
-                                  for b in blocks)
+        # the contact pairs ccx gets: not TIED, the lines on no analytical rigid surface left
+        # unconverted (_pair_lines comments those out)
+        lines: List[Tuple[Block, str, str]] = []
+        for b in blocks:
+            if b.keyword == "CONTACT PAIR" and not b.has("TIED"):
+                for rec in merged_data_records(b):
+                    toks = [x.strip().upper() for x in rec[:2]]
+                    if len(toks) == 2 and all(toks) and \
+                            not any(t in self._analytic_skipped for t in toks):
+                        lines.append((b, toks[0], toks[1]))
+        self._freq_contact = bool(lines)
+        self._overclosed = bool(lines) and any(b.keyword == "FREQUENCY" for b in blocks) and \
+            self._contact_overclosed(blocks, lines)
+        self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
+                                  and temperature_dependent(b) for b in blocks)
         self._expansion = any(b.keyword == "EXPANSION" for b in blocks)
         self._base_heated = False
         model = itertools.takewhile(lambda b: b.keyword != "STEP", blocks)

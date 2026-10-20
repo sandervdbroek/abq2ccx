@@ -6130,6 +6130,20 @@ def test_frequency_base_temperatures():
     assert not A.temperature_dependent(blk("ELASTIC", {"TYPE": "ENGINEERING CONSTANTS"},
                                            ["1., 1., 1., 0., 0., 0., 1., 1.", "1., 20."]))
     assert A.temperature_dependent(blk("DENSITY", {}, ["1., 20.", "2., 100."]))
+    # hyperelastic coefficients likewise (probed: a Neo-Hooke column, C10 quartered by heating,
+    # 0.216 Hz plain, 0.108 Hz with PERTURBATION, as the hot model); rows of 12 coefficients
+    # (POLYNOMIAL, N=3) take two lines; MARLOW has none
+    hyper = cold.replace("*Elastic\n1000., 0., 0.\n500., 0., 100.\n",
+                         "*Hyperelastic, neo hooke\n100., 0.001, 0.\n25., 0.001, 100.\n")
+    got, red, rep = heads(hyper, heat)
+    assert got == ["", ", PERTURBATION"] and not red and "steps without NLGEOM that only heat" in rep
+    row = "1., 1., 1., 1., 1., 1., 1., 1.\n1., 1., 1., 1., {}"
+    poly = {"POLYNOMIAL": None, "N": "3"}
+    assert A.temperature_dependent(blk("HYPERELASTIC", poly, (row.format(0) + "\n" + row.format(100)).split("\n")))
+    assert not A.temperature_dependent(blk("HYPERELASTIC", poly, row.format(0).split("\n")))
+    assert A.temperature_dependent(blk("HYPERFOAM", {"N": "2"}, ["1., 2., 3., 4., .1, .1, 0.",
+                                                                 "1., 2., 3., 4., .1, .1, 100."]))
+    assert not A.temperature_dependent(blk("HYPERELASTIC", {"MARLOW": None}, ["1.", "2."]))
 
 
 def test_nlgeom_on_a_perturbation_step_stays_in_it():
@@ -6293,6 +6307,77 @@ def test_frequency_base_contact():
     tied = BUCKLE_CUBE + pair.replace("interaction=SI\n", "interaction=SI, tied\n")
     assert heads(tied, "")[0] == [""]
     assert heads(tied, _deck_step("Static"), ", perturbation")[0] == ["", ""]
+    # a pair on an analytical rigid surface the converter comments out is no contact for ccx
+    curved = ANALYTIC_2D + ("*SURFACE, TYPE=SEGMENTS, NAME=TOOL\nSTART, 1.5, 2.5\n"
+                            "CIRCL, 0., 1., 0., 2.5\n*RIGID BODY, REF NODE=9, ANALYTICAL SURFACE=TOOL\n"
+                            "*SURFACE INTERACTION, NAME=I\n*CONTACT PAIR, INTERACTION=I\nTOP, TOOL\n")
+    got, red, rep = heads(curved, "")
+    assert got == [""] and "contact" not in " ".join(red) and "with contact pairs" not in rep
+
+
+def test_frequency_base_overclosure():
+    # Abaqus resolves an initial overclosure as an interference fit, with stresses, in the first
+    # general increment, unless ADJUST moves the slave nodes onto the master strain-free; ccx
+    # 2.23 too (node-to-surface ADJUST at any value; surface-to-surface ADJUST leaves part of
+    # it), so its PERTURBATION adds that prestress after linear steps (probed: a column top
+    # overclosing a fixed plate by 2e-4, 28.80 Hz vs 29.80 Hz touching): a stressed base state.
+    # A first-step PERTURBATION resolves none (probed: the same at either depth)
+    def deck(z0, pair="", extra=""):
+        block = "".join(f"{11 + i}, {x}, {y}, {z0 + z}\n" for i, (x, y, z) in enumerate(
+            [(-.5, -.5, 0), (1.5, -.5, 0), (1.5, 1.5, 0), (-.5, 1.5, 0),
+             (-.5, -.5, 1), (1.5, -.5, 1), (1.5, 1.5, 1), (-.5, 1.5, 1)]))
+        return (BUCKLE_CUBE.replace("*ELEMENT, TYPE=C3D8, ELSET=EALL\n", block +
+                                    "*ELEMENT, TYPE=C3D8, ELSET=EALL\n2, 11,12,13,14,15,16,17,18\n")
+                .replace("*Boundary\n", "*Boundary\n11, 1, 3\n12, 1, 3\n13, 1, 3\n14, 1, 3\n"
+                         "15, 1, 3\n16, 1, 3\n17, 1, 3\n18, 1, 3\n")
+                + "*Elset, elset=BLK\n2\n*Surface, name=SA\nROT, S2\n*Surface, name=SB\nBLK, S1\n"
+                "*Surface Interaction, name=SI\n" + f"*Contact Pair, interaction=SI{pair}\nSA, SB\n" + extra)
+    lost = ["contact left out of a *FREQUENCY step (ccx's plain *FREQUENCY drops it)"]
+
+    def heads(model, pre=_deck_step("Static"), head=""):
+        body, conv, rep = convert_str(model + pre + _deck_step("Frequency\n3", "", head))
+        return [s.split("\n")[0] for s in body.split("*STEP")[1:]], conv.reduced_physics, rep.text()
+
+    for model in (deck(0.99), deck(0.99, ", type=surface to surface, adjust=0."),
+                  deck(1.01, extra="*Clearance, slave=SA, master=SB, value=-0.01\n")):
+        got, red, rep = heads(model)
+        assert got == ["", ""] and red == lost and "overclosure resolved as an interference fit" in rep
+        got, red, rep = heads(model, head=", perturbation")
+        assert got == ["", ", PERTURBATION"] and red and "kept for the base state's contact" in rep
+    # touching, open, adjusted (node-to-surface), a clearance set: unstressed
+    for model in (deck(1.), deck(1.01), deck(0.99, ", adjust=0."),
+                  deck(0.99, extra="*Clearance, slave=SA, master=SB, value=0.\n")):
+        got, red, rep = heads(model)
+        assert got == ["", ", PERTURBATION"] and not red and "(no loads, no overclosure)" in rep
+    # a first step, and an NLGEOM base: PERTURBATION as before
+    assert heads(deck(0.99), "")[:2] == ([", PERTURBATION"], [])
+    assert heads(deck(0.99), _deck_step("Static", "", ", nlgeom"))[:2] == ([", NLGEOM", ", PERTURBATION"], [])
+    # plane elements: an edge of the master
+    plane = ("*NODE\n1,0.,0.\n2,1.,0.\n3,1.,1.\n4,0.,1.\n11,-.5,{0}\n12,1.5,{0}\n13,1.5,{1}\n14,-.5,{1}\n"
+             "*ELEMENT, TYPE=CPE4, ELSET=A\n1,1,2,3,4\n*ELEMENT, TYPE=CPE4, ELSET=B\n2,11,12,13,14\n"
+             "*SOLID SECTION, ELSET=A, MATERIAL=M\n*SOLID SECTION, ELSET=B, MATERIAL=M\n"
+             "*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n*DENSITY\n1.\n*SURFACE, NAME=SA\nA, S3\n"
+             "*SURFACE, NAME=SB\nB, S1\n*SURFACE INTERACTION, NAME=SI\n*CONTACT PAIR, INTERACTION=SI\n"
+             "SA, SB\n*BOUNDARY\n1, 1, 2\n2, 2, 2\n11, 1, 2\n12, 1, 2\n13, 1, 2\n14, 1, 2\n")
+    assert heads(plane.format(0.99, 1.99))[:2] == (["", ""], lost)
+    assert heads(plane.format(1.01, 2.01))[:2] == (["", ", PERTURBATION"], [])
+
+
+def test_buckle_contact_left_out():
+    # Abaqus buckles with the base state's contact status frozen; ccx 2.23 leaves contact out
+    # of *BUCKLE altogether, with or without PERTURBATION, also after a general step that
+    # closed it (probed: a column touching a block sideways, factor 2.17 as without the
+    # block, 8.61 held); a tied pair is a *TIE, which it keeps
+    pair = ("*Surface, name=SA\nROT, S1\n*Surface, name=SB\nROT, S2\n*Surface Interaction, name=SI\n"
+            "*Contact Pair, interaction=SI{}\nSA, SB\n")
+    buckle = _deck_step("Buckle\n2", "*Cload\n7, 3, -1.\n")
+    for pre, head in (("", ""), (_deck_step("Static"), ", PERTURBATION")):
+        body, conv, rep = convert_str(BUCKLE_CUBE + pair.format("") + pre + buckle)
+        assert body.split("*STEP")[-1].split("\n")[0] == head
+        assert "ccx 2.23 leaves contact out of *BUCKLE altogether" in rep.text()
+        assert conv.reduced_physics == ["contact left out of a *BUCKLE step (ccx 2.23 drops it)"]
+        _, conv, rep = convert_str(BUCKLE_CUBE + pair.format(", tied") + pre + buckle)
+        assert "contact out of *BUCKLE" not in rep.text() and not conv.reduced_physics
 
 
 def test_frequency_base_states_the_plain_step_keeps():

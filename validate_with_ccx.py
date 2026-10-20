@@ -3170,12 +3170,14 @@ def frequency_preload_deck(nlgeom=False, pert=False, preload="grav"):
                              "*END STEP"]) + "\n"
 
 
-def frequency_heated_deck(heat=True, t0=20.0):
+def frequency_heated_deck(heat=True, t0=20.0, hyper=False):
     """buckle_gravity_deck's column with E 210e9 at 20 and 105e9 at 120 (rows), at the initial
     temperature ``t0``; ``heat``: a static step raising it to 120 (no load, no expansion: no
-    stress), then a plain *FREQUENCY step for 4 modes."""
+    stress), then a plain *FREQUENCY step for 4 modes.  ``hyper``: a Neo-Hooke material
+    instead, C10 0.5e6 at 20 and 0.125e6 at 120 (D1 1e-7)."""
     deck = buckle_gravity_deck("", buckle=False).replace(
-        "*ELASTIC\n210.e9, 0.3\n", "*ELASTIC\n210.e9, 0.3, 20.\n105.e9, 0.3, 120.\n")
+        "*ELASTIC\n210.e9, 0.3\n", "*HYPERELASTIC, NEO HOOKE\n0.5e6, 1.e-7, 20.\n0.125e6, 1.e-7, 120.\n"
+        if hyper else "*ELASTIC\n210.e9, 0.3, 20.\n105.e9, 0.3, 120.\n")
     lines = ["*NSET, NSET=NALL, GENERATE", f"1, {3 * 3 * 21}, 1",
              "*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"NALL, {t0:g}"]
     if heat:
@@ -3183,19 +3185,22 @@ def frequency_heated_deck(heat=True, t0=20.0):
     return deck + "\n".join(lines + ["*STEP", "*FREQUENCY", "4", "*END STEP"]) + "\n"
 
 
-def frequency_contact_deck(case, n=2, m=20):
+def frequency_contact_deck(case, n=2, m=20, gap=0.0, pair="", head=""):
     """buckle_gravity_deck's column with a fixed C3D8 plate resting on its top face (a
     frictionless *CONTACT PAIR, Abaqus' default HARD contact), and a plain *FREQUENCY step for
     4 modes: ``case`` "first" (the first step), "after" (after a static step that loads
     nothing); "held" no plate, the top face held vertically instead (the closed frictionless
-    contact Abaqus' frequency step freezes, without a penalty); "free" no plate."""
+    contact Abaqus' frequency step freezes, without a penalty); "free" no plate.  ``gap``: the
+    plate that far above the top (negative: overclosed), the static step then printing TIP's
+    U; ``pair``: more *CONTACT PAIR parameters; ``head``: more *STEP parameters of the
+    frequency step."""
     deck = buckle_gravity_deck("", buckle=False, n=n, m=m)
     lines = ["*ELSET, ELSET=ETOP", ", ".join(map(str, range((m - 1) * n * n + 1, m * n * n + 1)))]
     if case in ("first", "after"):
         q = 4
         pid = lambda i, j, k: 10001 + i + (q + 1) * (j + (q + 1) * k)        # noqa: E731
         lines += ["*NODE, NSET=PLATE"] + [f"{pid(i, j, k)}, {-0.05 + 0.2 * i / q:.6g}, "
-                                          f"{-0.05 + 0.2 * j / q:.6g}, {2.0 + 0.05 * k:.6g}"
+                                          f"{-0.05 + 0.2 * j / q:.6g}, {2.0 + gap + 0.05 * k:.6g}"
                                           for k in (0, 1) for j in range(q + 1) for i in range(q + 1)]
         lines += ["*ELEMENT, TYPE=C3D8, ELSET=PL"] + [
             f"{1001 + i + q * j}, {pid(i, j, 0)}, {pid(i + 1, j, 0)}, {pid(i + 1, j + 1, 0)}, "
@@ -3203,12 +3208,55 @@ def frequency_contact_deck(case, n=2, m=20):
             f"{pid(i, j + 1, 1)}" for j in range(q) for i in range(q)]
         lines += ["*SOLID SECTION, ELSET=PL, MATERIAL=STEEL", "*SURFACE, NAME=CTOP", "ETOP, S2",
                   "*SURFACE, NAME=PBOT", "PL, S1", "*SURFACE INTERACTION, NAME=SMOOTH",
-                  "*CONTACT PAIR, INTERACTION=SMOOTH", "CTOP, PBOT", "*BOUNDARY", "PLATE, 1, 3"]
+                  "*CONTACT PAIR, INTERACTION=SMOOTH" + pair, "CTOP, PBOT", "*BOUNDARY", "PLATE, 1, 3"]
     elif case == "held":
         lines += ["*NSET, NSET=TOPN, ELSET=ETOP", "*BOUNDARY", "TOPN, 3, 3"]
     if case == "after":
-        lines += ["*STEP", "*STATIC", "*END STEP"]
-    return deck + "\n".join(lines + ["*STEP", "*FREQUENCY", "4", "*END STEP"]) + "\n"
+        lines += ["*STEP", "*STATIC"] + (["*NODE PRINT, NSET=TIP", "U"] if gap else []) + ["*END STEP"]
+    return deck + "\n".join(lines + ["*STEP" + head, "*FREQUENCY", "4", "*END STEP"]) + "\n"
+
+
+def buckle_contact_deck(case, n=2, m=20):
+    """buckle_gravity_deck's column (no preload) with a fixed C3D8 block touching each of the
+    +x and +y faces of its top element layer (frictionless *CONTACT PAIRs, Abaqus' default
+    HARD contact), *BUCKLE 2 factors: ``case`` "first" (the first step), "pushed" (after a
+    static step pushing TIP 1e3 into both blocks, printing its U); "held" no blocks, those
+    faces held normal to them instead (the closed contact Abaqus' buckling step freezes);
+    "free" no blocks, "free_pushed" no blocks after that static step."""
+    deck = buckle_gravity_deck("", buckle=False, n=n, m=m)
+    top = range((m - 1) * n * n + 1, m * n * n + 1)
+    ex = [e for e in top if (e - 1) % n == n - 1]               # the elements at x = 0.1
+    ey = [e for e in top if (e - 1) // n % n == n - 1]          # ... at y = 0.1
+    lines = ["*ELSET, ELSET=EX", ", ".join(map(str, ex)), "*ELSET, ELSET=EY", ", ".join(map(str, ey))]
+    z0, z1 = 2.0 - 2.0 / m, 2.0
+    if case in ("first", "pushed"):
+        nid = iter(range(20001, 20100))
+        lines += ["*NODE, NSET=BLOCKS"]
+        elems = []
+        for name, (x0, x1), (y0, y1) in (("BX", (0.1, 0.15), (-0.05, 0.15)),
+                                         ("BY", (-0.05, 0.15), (0.1, 0.15))):
+            c = []
+            for z in (z0, z1):
+                for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+                    c.append(next(nid))
+                    lines.append(f"{c[-1]}, {x:.6g}, {y:.6g}, {z:.6g}")
+            elems.append((name, c))
+        for e, (name, c) in enumerate(elems, 2001):
+            lines += [f"*ELEMENT, TYPE=C3D8, ELSET={name}", f"{e}, " + ", ".join(map(str, c))]
+        lines += ["*SOLID SECTION, ELSET=BX, MATERIAL=STEEL", "*SOLID SECTION, ELSET=BY, MATERIAL=STEEL",
+                  "*SURFACE, NAME=CX", "EX, S4", "*SURFACE, NAME=CY", "EY, S5",
+                  "*SURFACE, NAME=MX", "BX, S6", "*SURFACE, NAME=MY", "BY, S3",
+                  "*SURFACE INTERACTION, NAME=SMOOTH", "*CONTACT PAIR, INTERACTION=SMOOTH", "CX, MX",
+                  "*CONTACT PAIR, INTERACTION=SMOOTH", "CY, MY", "*BOUNDARY", "BLOCKS, 1, 3"]
+    elif case == "held":
+        nx = [1 + n + (n + 1) * (j + (n + 1) * k) for k in (m - 1, m) for j in range(n + 1)]
+        ny = [1 + i + (n + 1) * (n + (n + 1) * k) for k in (m - 1, m) for i in range(n + 1)]
+        lines += ["*BOUNDARY"] + [f"{v}, 1, 1" for v in nx] + [f"{v}, 2, 2" for v in ny]
+    if case.endswith("pushed"):
+        lines += ["*STEP", "*STATIC", "*CLOAD", "TIP, 1, 1.e3", "TIP, 2, 1.e3",
+                  "*NODE PRINT, NSET=TIP", "U", "*END STEP"]
+    return deck + "\n".join(lines + ["*STEP", "*BUCKLE", "2", "*CLOAD", "TIP, 3, -1.e5",
+                                      "*END STEP"]) + "\n"
 
 
 def frequency_read_deck(modal=True):
@@ -7030,6 +7078,68 @@ def main():
               f"the prestress, as alone ({err:.1e} apart), the second, which the modal step reads, "
               f"{plain[0]:.7g} without (ccx's modal step refuses perturbation eigenmodes; "
               f"{err2:.1e} from unloaded), TIP moves {tip[0]:.4g}")
+    failures += 0 if ok else 1
+    # temperature-dependent hyperelastic coefficients: ccx's plain step takes the initial
+    # temperatures there too, so after a step that only heats the converter writes PERTURBATION
+    f = [review_run(frequency_heated_deck(h, t0, True), "frequency_base_hyperelastic_" + tag,
+                    lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+         for h, t0, tag in ((True, 20.0, "heated"), (False, 120.0, "hot"), (False, 20.0, "cold"))]
+    ok = all(f)
+    if ok:
+        err = max(abs(a / b - 1) for a, b in zip(f[0], f[1]))
+        ratio = f[2][0] / f[1][0]
+        ok = len(f[0]) == len(f[1]) == 4 and err < 1e-6 and ratio > 1.5
+        print(f"{'PASS' if ok else 'FAIL'}  frequency_base_hyperelastic (the column, Neo-Hooke, its C10 "
+              f"quartered from 20 to 120 degrees, heated to 120 in a static step, then a plain "
+              f"*FREQUENCY step): {f[0][0]:.7g} vs {f[1][0]:.7g} at an initial 120 (4 modes, max "
+              f"{err:.1e} apart); {f[2][0]:.7g} cold, {ratio:.4f} times")
+    failures += 0 if ok else 1
+    # an overclosure the static step resolves stresses the base state (Abaqus: an interference
+    # fit), which ccx's PERTURBATION would add: the deck's plain step stays, without contact;
+    # ADJUST moves the slave nodes onto the plate strain-free: PERTURBATION, as touching
+    first_u = lambda dat: (dat_tables(dat, "displacements") or [[[0] * 4]])[0][0][1:]  # noqa: E731
+    eig = lambda dat: (dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"),  # noqa: E731
+                       first_u(dat))         # (the static step's: the eigensteps print modes)
+    over = review_run(frequency_contact_deck("after", gap=-5e-4), "frequency_base_overclosed", eig)
+    kept = review_run(frequency_contact_deck("after", gap=-5e-4, head=", PERTURBATION"),
+                      "frequency_base_overclosed_pert", eig)
+    adj = review_run(frequency_contact_deck("after", gap=-5e-4, pair=", ADJUST=0."),
+                     "frequency_base_overclosed_adjusted", eig)
+    touch, free = [review_run(frequency_contact_deck(c), "frequency_base_overclosure_" + c,
+                              lambda dat: dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+                   for c in ("after", "free")]
+    ok = bool(over and kept and adj and touch and free and over[0] and adj[0] and kept[0])
+    if ok:
+        uz = [r[1][2] for r in (over, adj)]
+        err = max(abs(a / b - 1) for a, b in zip(over[0], free))
+        err2 = abs(adj[0][0] / touch[0] - 1)
+        pre = kept[0][0] / touch[0] - 1
+        ok = err < 1e-9 and err2 < 2e-3 and abs(pre) > 0.01 and uz[0] < -1e-5 and abs(uz[1]) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  frequency_base_overclosure (the column's top 5e-4 into "
+              f"the plate, an unloaded static step, a *FREQUENCY step): plain {over[0][0]:.7g} as "
+              f"without the plate ({err:.1e} apart), TIP pressed down {uz[0]:.3g}; the deck's "
+              f"PERTURBATION {kept[0][0]:.7g}, {pre:+.1%} from touching {touch[0]:.7g} (the "
+              f"interference prestress); ADJUST=0. {adj[0][0]:.7g} ({err2:.1e} from touching), TIP "
+              f"{uz[1]:.2g}")
+    failures += 0 if ok else 1
+    # ccx 2.23 leaves contact out of *BUCKLE altogether (warned): the factors without the
+    # blocks, also after a static step in which the blocks held the pushed top
+    fac = lambda dat: (dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T"),  # noqa: E731
+                       first_u(dat))
+    b = {c: review_run(buckle_contact_deck(c), "buckle_contact_" + c, fac)
+         for c in ("first", "pushed", "held", "free", "free_pushed")}
+    ok = all(b.values()) and all(r[0] for r in b.values())       # (factors read)
+    if ok:
+        tip = {c: b[c][1] for c in ("pushed", "free_pushed")}
+        err = abs(b["first"][0][0] / b["free"][0][0] - 1)
+        err2 = abs(b["pushed"][0][0] / b["free"][0][0] - 1)      # (the push's prestress)
+        ok = err < 1e-9 and err2 < 1e-3 and b["held"][0][0] > 2.0 * b["free"][0][0] and \
+            0 < tip["pushed"][0] < 0.1 * tip["free_pushed"][0]
+        print(f"{'PASS' if ok else 'FAIL'}  buckle_contact (the column with blocks touching two sides "
+              f"of its top): {b['first'][0][0]:.7g} as the first step, as without the blocks "
+              f"({err:.1e} apart); {b['pushed'][0][0]:.7g} after a static step pushing TIP into them "
+              f"(it moves {tip['pushed'][0]:.3g}, {tip['free_pushed'][0]:.3g} without the blocks; "
+              f"{err2:.1e} from unpushed); {b['held'][0][0]:.7g} with those faces held")
     failures += 0 if ok else 1
 
     # *BUCKLE loaded by a prescribed displacement: ccx 2.23 does not solve a *STEP, PERTURBATION
