@@ -4621,10 +4621,7 @@ class Step:
     perturbation: bool            # an Abaqus linear perturbation step (perturbation_step): _pert_idx,
                                   # the motion fields, the output carry-over, step_load_audit's Abaqus reading
     nlgeom_card: Optional[bool]   # NLGEOM= on its *STEP card (_nlgeom_given)
-    # NLGEOM, by several rules (also nlgeom_motion and the deck's nl_heads):
-    nlgeom_on: bool               # it switches NLGEOM on (the Converter's _nl_steps): not a
-                                  # perturbation step and NLGEOM on its *STEP card, or a *DYNAMIC,
-                                  # EXPLICIT card in it
+    # NLGEOM, two questions (the deck-wide StepModel.nl_any, nl_all, nl_before derive from the first):
     nlgeom: bool                  # Abaqus: NLGEOM in force while it runs.  On once a step that is no
                                   # linear perturbation step has NLGEOM on its *STEP card, or is
                                   # explicit without NLGEOM= (Abaqus/Explicit's default): "once the
@@ -4638,8 +4635,6 @@ class Step:
                                   # card has NLGEOM=NO or a *FREQUENCY or *BUCKLE step has run (probed),
                                   # and the procedures of PERTURBATION_PROCS are linear there (a static
                                   # perturbation step is a general one in ccx)
-    nlgeom_dp: bool               # on once a step's *STEP card is in nl_heads, explicit steps not
-                                  # counted (_plan_deformation_plasticity)
     temp_dof: Optional[str]       # its first TEMPERATURE_DOF_PROCS card's keyword (handle_step's)
     star_proc: str                # read card by card (_plan_material_cards): "PERTURBATION" with
                                   # *STEP, PERTURBATION, else the first PROC_KW card after its *STEP
@@ -4667,9 +4662,6 @@ class Step:
                                   # ACCELERATION BCs (not to be changed)
     ccx_amp: str                  # the one ccx gives a load or BC without AMPLITUDE in the converted
                                   # step
-    nlgeom_motion: bool           # NLGEOM in force by the motion rule (_plan_velocity_bcs): on once a
-                                  # step not a perturbation one has NLGEOM on its *STEP card or is
-                                  # motion_explicit
 
 
 class StepModel:
@@ -4682,13 +4674,13 @@ class StepModel:
     cards.  Converter._read_steps reads the model right after _plan_free_ref_nodes, the last
     planner that replaces or edits a card inside a step; after it no planner or handler
     replaces, inserts, removes or edits a step card (it records a plan applied at emission
-    instead: _vel_cards, _bc_lines, _op_new_drop), so the model's cards, ids (``lc2``,
-    ``nl_heads``) and Step fields hold for every later reader.  The model keeps no card list
+    instead: _vel_cards, _bc_lines, _op_new_drop), so the model's cards, ids (``lc2``) and
+    Step fields hold for every later reader.  The model keeps no card list
     of the deck: a walker folds its own deck (``states``, ``acting``).
     _plan_deck_facts reads an early model for the planners before that point.  They read only
-    its deck aggregates (``procs``, ``inertia``, ``mass_loads``, ``mass_acts``, ``nl_heads``,
-    ``pert`` and the Converter views of it: _pert_idx, _nl_steps,
-    _mechanical, ...), which no rewrite changes (test_step_model_is_current).  Model data may
+    its deck aggregates (``procs``, ``inertia``, ``mass_loads``, ``mass_acts``, ``nl_any``,
+    ``nl_before``, ``pert`` and the Converter views of it: _pert_idx, _nl_any, _mechanical,
+    ...), which no rewrite changes (test_step_model_is_current).  Model data may
     still change after it (*RIGID BODY parameters; the section cards a handler writes)."""
 
     # the procedures of a general step (Step.general)
@@ -4795,8 +4787,7 @@ class StepModel:
         written = since = False
         flag = False                            # ccx's NLGEOM switch as a step starts (Step.ccx_nlgeom)
         seen = False                            # Step.general_before
-        nl_motion, t = False, 0.0               # Step.nlgeom_motion, t_start
-        nl_dp = False                           # Step.nlgeom_dp
+        t = 0.0                                 # Step.t_start
         # card by card: each *STEP card's procedure (Step.star_proc)
         star_proc: Dict[int, str] = {}
         last: Optional[Block] = None
@@ -4806,13 +4797,6 @@ class StepModel:
                 star_proc[id(b)] = "PERTURBATION" if b.has("PERTURBATION") else ""
             elif last is not None and b.keyword in PROC_KW and not star_proc[id(last)]:
                 star_proc[id(last)] = f"{b.keyword}, RIKS" if b.has("RIKS") else b.keyword
-        # the ids of the *STEP cards that switch NLGEOM on (NLGEOM, NLGEOM=YES; Abaqus keeps it on
-        # for the later steps) but a perturbation step's own: it runs linear about its base state,
-        # and "linear perturbation steps have no effect on subsequent general analysis steps"
-        # (Abaqus 2017); handle_step drops it where the base state is linear (ccx would run a
-        # static perturbation step, a general one in ccx, under it).  Read by _u1_plans,
-        # _slab_obstacle and (on a model of its own) _plan_user_materials.
-        heads: set = set()
         for is_step, cards in deck_parts(blocks):
             if not is_step:
                 if steps:
@@ -4851,46 +4835,40 @@ class StepModel:
             else:
                 lc2, repeats = frozenset(), False
             general = proc in self.GENERAL_PROCS and not pert_param
-            if given and not pert:
-                heads.add(id(head))
-            nl_dp = nl_dp or id(head) in heads
             motion_explicit = motion_proc == "DYNAMIC" and motion_card.has("EXPLICIT")
             period, advance, defaults, ccx_amp = self._motion(head, motion_card, pert)
-            nl_motion = nl_motion or (not pert and bool(given)) or motion_explicit
             steps.append(Step(
                 no=len(steps) + 1, cards=tuple(cards), between=tuple(loose), proc=proc,
                 proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
-                pert_param=pert_param, perturbation=pert, nlgeom_card=given,
-                nlgeom_on=(not pert and bool(given)) or
-                any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in inner),
-                nlgeom=nlgeom, nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
+                pert_param=pert_param, perturbation=pert, nlgeom_card=given, nlgeom=nlgeom,
+                nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
                 star_proc=star_proc[id(head)],
-                nlgeom_dp=nl_dp, general=general, general_before=seen,
+                general=general, general_before=seen,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
                 lc2=lc2, lc2_repeats=repeats,
                 motion_label=(motion_proc + (", RIKS" if motion_card.has("RIKS") else ""))
                 if motion_proc else "(no procedure)", motion_explicit=motion_explicit,
-                period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp,
-                nlgeom_motion=nl_motion))
+                period=period, advance=advance, t_start=t, defaults=defaults, ccx_amp=ccx_amp))
             t = None if t is None or advance is None else t + advance
             seen = seen or general
             loose = []
         self.steps: Tuple[Step, ...] = tuple(steps)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
-        self.nl_heads = frozenset(heads)
         # the *BOUNDARY, LOAD CASE=2 cards of *BUCKLE steps: buckling-mode BCs, which ccx cannot
         # have (one set of BCs per step), so the conversion leaves them out (handle_boundary,
         # _plan_load_cases).  No walker of the deck's BCs counts them: they are not there
         # (bc_steps' and op_new_cards' skip)
         self.lc2 = frozenset(i for s in steps for i in s.lc2)
-        # deck-wide (the Converter's views: _nl_steps, _nl_any, ...)
-        self.nl_steps = tuple(s.nlgeom_on for s in steps)
-        general = [s.nlgeom_on for s in steps if not s.perturbation]
-        self.nl_any = any(self.nl_steps)
-        self.nl_all = bool(general) and general[0]          # (NLGEOM stays on once switched on)
+        # deck-wide, by Step.nlgeom (the Converter's views: _nl_any, _nl_all, _nl_before): a step
+        # runs NLGEOM, every general step does (it stays on once switched on), and the steps
+        # before the first one that does (all of them if none)
+        general = [s.nlgeom for s in steps if not s.perturbation]
+        self.nl_any = any(s.nlgeom for s in steps)
+        self.nl_all = bool(general) and general[0]
+        self.nl_before = next((s.no - 1 for s in steps if s.nlgeom), len(steps))
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
         self.procs = frozenset(procs)                       # the deck's procedures
         # where an element's mass acts, two questions: its inertia, in the steps of INERTIA_PROCS
@@ -6935,15 +6913,11 @@ class Converter:
         """A step solves for temperatures."""
         return self._steps_now.mpc_thermal
 
-    @property
-    def _nl_steps(self) -> List[bool]:
-        """Per step: it switches NLGEOM on.  A linear perturbation step runs linear about the
-        base state, and no effect on the general steps after it, whatever its NLGEOM (Abaqus);
-        its *STATIC is a general one in ccx (handle_step).  The converter runs explicit steps
-        with NLGEOM.  NLGEOM stays on for all later steps once a step has switched it on
-        (Abaqus)."""
-        return list(self._steps_now.nl_steps)
-
+    # NLGEOM in Abaqus, deck-wide (Step.nlgeom: a linear perturbation step runs linear about
+    # the base state, with no effect on the general steps after it, whatever its NLGEOM; an
+    # explicit step runs it unless NLGEOM=NO; it stays on for all later steps once a step has
+    # switched it on).  ccx runs a general step under NLGEOM where Abaqus does (handle_step;
+    # and every step with a deformation plasticity material: Step.ccx_nlgeom)
     @property
     def _nl_any(self) -> bool:
         """A step runs NLGEOM."""
@@ -6951,8 +6925,13 @@ class Converter:
 
     @property
     def _nl_all(self) -> bool:
-        """Every step runs NLGEOM."""
+        """Every general step runs NLGEOM."""
         return self._steps_now.nl_all
+
+    @property
+    def _nl_before(self) -> int:
+        """The steps before the first that runs NLGEOM (all of them if none)."""
+        return self._steps_now.nl_before
 
     @property
     def _dynamic_deck(self) -> bool:
@@ -8151,9 +8130,9 @@ class Converter:
         if not mech:
             return blocks
         abaqus = self._abaqus_umat and not self._umat_explicit
-        # (a model of the blocks as given: the deck's is built after the renaming and
-        # _plan_self_contact, which replace cards)
-        nl = abaqus and bool(StepModel(blocks).nl_heads)
+        # (the Abaqus question, Step.nlgeom; a model of the blocks as given: the deck's is
+        # built after the renaming and _plan_self_contact, which replace cards)
+        nl = abaqus and StepModel(blocks).nl_any
         prefix = "ABAQUSNL" if nl else "ABAQUS"
         taken = {b.uparam("NAME") for b in blocks if b.keyword == "MATERIAL"}
         ren: Dict[str, str] = {}
@@ -8856,11 +8835,11 @@ class Converter:
         dps = [m for m, cards in opts.items()
                if any(c.keyword == "DEFORMATION PLASTICITY" for c in cards[1:])]
         small = explicit_no = False
-        for step in self.steps:
+        for step in self.steps:                 # (Abaqus' small strain: Step.nlgeom off)
             explicit_no = explicit_no or step.nlgeom_card is False
             if step.proc in ("STATIC", "DYNAMIC", "VISCO", "COUPLED TEMPERATURE-DISPLACEMENT",
                              "UNCOUPLED TEMPERATURE-DISPLACEMENT") \
-                    and not step.proc_card.has("EXPLICIT") and (not step.nlgeom_dp or step.pert_param):
+                    and not step.proc_card.has("EXPLICIT") and (not step.nlgeom or step.pert_param):
                 small = True
         if not small:
             return
@@ -12494,8 +12473,9 @@ class Converter:
                                  "step, still in force: its motion continues"] + tail_amps))
             # warn where finite rotations about several axes are integrated component-wise:
             # a node turned about more than one axis in this step, or about another axis
-            # than the one it turned about before (the manual's own example of velocity BCs)
-            if step.nlgeom_motion:
+            # than the one it turned about before (the manual's own example of velocity BCs),
+            # under NLGEOM in Abaqus (Step.nlgeom: small rotations add up component-wise)
+            if step.nlgeom:
                 axes: Dict[int, set] = {}
                 for k, st in state.items():
                     bc = st[2]
@@ -14843,6 +14823,8 @@ class Converter:
             if e in self._quad_from:
                 upgraded.update(conn)
         steps = list(self.steps)
+        # (a geometrically linear step before: Step.nlgeom, which ccx runs a general step under
+        # too, handle_step; a perturbation step's is its base state's)
         lin_dyn = any(st.proc == "DYNAMIC" and any(p.proc != "DYNAMIC" and not p.nlgeom for p in steps[:k])
                       for k, st in enumerate(steps))
         cand = {n for n in self._transformed if lin_dyn or n in corner}
@@ -15363,8 +15345,7 @@ class Converter:
         theta^2 of max |u|, a moment theta^2; a B31 frame joint turning 0.009 rad 1.1 %, a knot
         beam on a cantilever turning 0.01 rad 0.35 %; rotations held at zero exact.  No ccx
         form keeps them linear (a shell/beam node's rotation is a DOF only through those MPCs)."""
-        first = self._nl_steps.index(True) if self._nl_any else len(self._solver_steps)
-        steps = [s for s in range(1, first + 1) if self._solver_steps[s - 1]]
+        steps = [s for s in range(1, self._nl_before + 1) if self._solver_steps[s - 1]]
         if not steps or not self._mechanical:
             return
         own = self._rot_nodes - set(self._rb_rot)
@@ -21802,8 +21783,7 @@ class Converter:
                         ("" if iterated in ("CONTACT PAIR", "USER MATERIAL") else " material")
         self._solver_steps = solver
         self._linear_rigid = not self._nl_any and any(solver)
-        first_nl = self._nl_steps.index(True) if self._nl_any else 0
-        self._dyn_before_nl = any(solver[:first_nl])
+        self._dyn_before_nl = self._nl_any and any(solver[:self._nl_before])
         self._solver_why = next((s for s in solver if s), "")
 
     def _drop_surface_elements(self, raw: List[Block], blocks: List[Block]) -> None:
@@ -26638,7 +26618,9 @@ class Converter:
         nodes = {n for e in member for n in self.geom.elements[e][1]}
         if set(self._node_normals) & nodes or "NORMAL" in kws:
             return [], "normals redefine the beams' n2 axes, which is not converted for U1"
-        on = self.steps.nl_heads
+        # (ccx runs a step under NLGEOM from the first under NLGEOM in Abaqus on, handle_step;
+        # a deformation plasticity material, below, from the first)
+        on, k = self._nl_before + 1, 0
         for b in blocks:
             if b.keyword == "TRANSFORM" and \
                     set(self._resolve_nodes((b.param("NSET") or "").strip())) & nodes:
@@ -26647,8 +26629,10 @@ class Converter:
                 return [], "an *EQUATION ties beam nodes, which is not converted for U1"
             if b.keyword in ("SPRING", "DASHPOT") and b.has("NONLINEAR"):
                 return [], f"a nonlinear *{b.keyword} (ccx would iterate, with U1's wrong nodal forces)"
-            if b.keyword == "STEP" and id(b) in on:
-                return [], "a step runs NLGEOM, which U1 cannot ('no second order')"
+            if b.keyword == "STEP":
+                k += 1
+                if k == on:
+                    return [], "a step runs NLGEOM, which U1 cannot ('no second order')"
             if b.keyword in PROC_KW and (b.keyword not in self._U1_PROCEDURES or b.has("RIKS")):
                 return [], (f"a *{b.keyword}{', RIKS' if b.has('RIKS') else ''} step, which U1 cannot "
                             f"run (ccx 2.23 runs it in linear *STATIC, *FREQUENCY, *MODAL DYNAMIC "
@@ -31361,7 +31345,7 @@ class Converter:
         The slab form is exact for small-strain linear elasticity (_plan_incompatible_slabs);
         anything else on the elements (or the deck being out of its scope) keeps the plain
         CPS4 / CPE4 substitution."""
-        if self.steps.nl_heads:
+        if self._nl_any:                       # (Step.nlgeom: Abaqus' small strain)
             return "a step runs NLGEOM"
         for b in blocks:
             if b.keyword in self._OTHER_PROCEDURES:

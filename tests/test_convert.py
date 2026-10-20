@@ -414,7 +414,7 @@ def test_step_model_of_model_data_only():
     # a deck without steps: all of it is model data, and it counts as mechanical
     blocks, m = _step_model("*NODE\n1, 0., 0., 0.\n*BOUNDARY\n1, 1, 3\n")
     assert m.steps == () and len(m) == 0
-    assert m.pert == frozenset() and m.nl_steps == ()
+    assert m.pert == frozenset() and m.nl_before == 0
     assert (m.nl_any, m.nl_all, m.dynamic, m.explicit, m.mechanical) == (False, False, False, False, True)
     assert m.acting(blocks=blocks) == frozenset()
     assert not A.StepModel(A.blocks_from_lines(["*STEP", "*HEAT TRANSFER", "*END STEP"])).mechanical
@@ -435,7 +435,7 @@ def test_step_model_general_and_perturbation_steps():
     assert m.pert == {2, 3, 5, 6} and [s.pert_param for s in m] == [False, False, True] + [False] * 4
     assert [s.perturbation for s in m] == [False, True, True, False, True, True, False]
     assert [s.nlgeom_card for s in m] == [None, True, None, True, None, False, False]
-    assert [s.nlgeom_on for s in m] == list(m.nl_steps) == [False] * 3 + [True] + [False] * 3
+    assert m.nl_before == 3
     assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
     assert [s.nlgeom_written for s in m] == [None, None, None, True, None, False, True]
     assert [s.ccx_nlgeom for s in m] == [False] * 3 + [True, False, False, True]
@@ -453,7 +453,7 @@ def test_step_model_general_and_perturbation_steps():
     _, conv, _ = convert_str(HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n"
                              "*Elastic\n1000., 0.3\n*Boundary\n1, 1, 3\n*Step, nlgeom\n*Static\n"
                              "*End Step\n*Step\n*Frequency\n2\n*End Step\n")
-    assert conv._pert_idx is conv.steps.pert == {2} and conv._nl_steps == [True, False]
+    assert conv._pert_idx is conv.steps.pert == {2} and conv._nl_before == 0
     assert conv._perturbation_steps([]) == {2} and conv._n_steps == len(conv.steps) == 2
 
 
@@ -546,20 +546,19 @@ def test_step_model_motion_facts():
         ("STEP", "STEP", "FIXED"), ("STEP", "RAMP", "RAMP")]
     assert [s.ccx_amp for s in m] == ["RAMP", "STEP", "STEP", "RAMP", "RAMP", "STEP", "STEP", "RAMP"]
     assert [s.motion_explicit for s in m] == [False] * 6 + [True, False]
-    assert [s.nlgeom_motion for s in m] == [False] * 5 + [True] * 3
+    assert [s.nlgeom for s in m] == [False] * 5 + [True] * 3     # (also the motion rule's)
 
 
 def test_step_model_planner_facts():
-    # the *STEP cards that switch NLGEOM on (not a perturbation step's), the NLGEOM ccx runs
-    # by the *STEP cards handle_step writes (an explicit step without NLGEOM=NO too; the static
-    # perturbation step carries it on, a frequency step does not) and the deformation
-    # plasticity check's (*STEP cards only); each step's procedure, card by card (damage criteria)
+    # the NLGEOM in force in Abaqus (not by a perturbation step's own; an explicit step's
+    # without NLGEOM=NO) and the steps before it, the NLGEOM ccx runs by the *STEP cards
+    # handle_step writes (the static perturbation step carries it on, a frequency step does
+    # not); each step's procedure, card by card (damage criteria)
     blocks, m = _step_model("""*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
 *STEP, PERTURBATION\n*STATIC\n*END STEP\n*STEP, NLGEOM, INC=5\n*STATIC, RIKS\n*END STEP""")
-    assert m.nl_heads == {id(blocks[12])}
+    assert [s.nlgeom for s in m] == [False, False, True, True, True] and m.nl_before == 2
     assert [s.ccx_nlgeom for s in m] == [False, False, True, True, True]
-    assert [s.nlgeom_dp for s in m] == [False] * 4 + [True]
     assert [s.star_proc for s in m] == ["DYNAMIC", "FREQUENCY", "DYNAMIC", "PERTURBATION",
                                         "STATIC, RIKS"]
     # card by card: a procedure between steps counts for the step before it; a perturbation
@@ -567,8 +566,8 @@ def test_step_model_planner_facts():
     blocks, m = _step_model("*STEP\n*END STEP\n*STATIC\n*STEP, NLGEOM\n*FREQUENCY\n2\n*END STEP\n"
                             "*STEP, NLGEOM\n*STATIC\n*END STEP")
     assert [s.star_proc for s in m] == ["STATIC", "FREQUENCY", "STATIC"]
-    assert m.nl_heads == {id(blocks[6])}
-    assert [(s.proc, s.nlgeom_dp, s.ccx_nlgeom) for s in m] == [
+    assert m.nl_before == 2
+    assert [(s.proc, s.nlgeom, s.ccx_nlgeom) for s in m] == [
         ("", False, False), ("FREQUENCY", False, False), ("STATIC", True, True)]
 
 
@@ -593,13 +592,13 @@ def test_step_model_deck_facts():
 
 
 def test_step_model_explicit_steps():
-    # the converter runs an explicit step with NLGEOM: handle_step writes it where NLGEOM= is
-    # not given, while any explicit card switches it on for _plan_deck_facts
+    # an explicit step runs NLGEOM unless NLGEOM=NO (Abaqus/Explicit's default, which
+    # handle_step writes); with NLGEOM=NO it is geometrically linear in Abaqus and ccx
     _, m = _step_model("*STEP, NLGEOM=NO\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP\n"
                   "*STEP\n*DYNAMIC\n0.1, 1.\n*END STEP\n*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP")
-    assert [(s.explicit, s.nlgeom_on, s.nlgeom) for s in m] == [
-        (True, True, False), (False, False, False), (True, True, True)]
-    assert (m.explicit, m.dynamic, m.nl_any, m.nl_all) == (True, True, True, True)
+    assert [(s.explicit, s.nlgeom, s.ccx_nlgeom) for s in m] == [
+        (True, False, False), (False, False, False), (True, True, True)]
+    assert (m.explicit, m.dynamic, m.nl_any, m.nl_all, m.nl_before) == (True, True, True, False, 2)
 
 
 def test_step_model_buckle_load_case_two():
@@ -680,7 +679,7 @@ def test_step_model_is_current():
             [k for k, v in vars(A.StepModel(blocks, dp=self._dp_nlgeom)).items() if not _same_cards(v, now[k])]
         assert {k: v for k, v in early.items() if k not in card_level} == \
             {k: v for k, v in now.items() if k not in card_level}
-        assert now.keys() - card_level >= {"procs", "inertia", "mass_loads", "nl_heads", "pert"}
+        assert now.keys() - card_level >= {"procs", "inertia", "mass_loads", "nl_before", "pert"}
         for ids, kw in ((self._kinematic_ids, "KINEMATIC"), (self._distributing_ids, "DISTRIBUTING")):
             assert ids == {id(b) for b, c in zip(blocks, blocks[1:])
                            if b.keyword == "COUPLING" and c.keyword == kw}
