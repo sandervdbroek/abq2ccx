@@ -8390,6 +8390,51 @@ def test_static_perturbation_values_change_the_base_state():
     assert "final perturbation" not in rep.text() and "Static perturbation step 2:" not in rep.text()
 
 
+def test_static_perturbation_sums_per_key_and_total_time_base_state():
+    # the lines of one step add up (Abaqus and ccx 2.23), so a static perturbation step's base
+    # value goes on its first line on a key only (probed: 0.06 where base + perturbation is
+    # 0.048); a BC line replaces the one before, and gets it each time
+    model = BUCKLE_CUBE + "*Nset, nset=N56\n5, 6\n*Amplitude, name=TT, time=total time\n0., 0., 10., 1.\n"
+    g = _deck_step("Static", "*Cload\nN56, 1, 1.\n*Dload\nEALL, GRAV, 1., 1., 0., 0.\n"
+                   "*Boundary\n8, 1, 1, 0.1\n")
+    sp = _deck_step("Static", "*Cload\nN56, 1, 1.\n5, 1, 2.\n*Cload\nN56, 1, 1.\n*Dload\nEALL, GRAV, 1., "
+                    "1., 0., 0.\nEALL, GRAV, 1., 1., 0., 0.\n*Boundary\n8, 1, 1, 0.1\n8, 1, 1, 0.2\n",
+                    ", perturbation")
+    body, conv, _ = convert_str(model + g + sp)
+    last = body.split("*STEP")[-1]
+    assert "*CLOAD\nN56, 1, 2.\n5, 1, 2.\n*CLOAD\nN56, 1, 1.\n" in last, last
+    assert "*DLOAD\nEALL, GRAV, 2., 1., 0., 0.\nEALL, GRAV, 1., 1., 0., 0.\n" in last
+    assert "*BOUNDARY\n8, 1, 1, 0.2\n8, 1, 1, 0.3\n" in last
+    assert conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
+    # ccx runs the step as a general one, along the base state's TIME=TOTAL TIME amplitudes,
+    # where Abaqus' base state stops at the general step's end (probed: the load doubled): their
+    # lines are given again at the values there (0.1 at total time 1, 0.2 after a second general
+    # step), the step's own lines on them get that value, as after a *FREQUENCY step
+    tt = _deck_step("Static", "*Cload, amplitude=TT\nN56, 1, 1.\n*Boundary, amplitude=TT\n8, 1, 1, 1.\n"
+                    "*Temperature, amplitude=TT\nALL, 100.\n")
+    own = _deck_step("Static", "*Cload\n5, 1, 1.\n", ", perturbation")
+    body, conv, rep = convert_str(model + tt + own)
+    assert body.split("*STEP")[-1].startswith(
+        "\n*STATIC\n** abq2ccx: the base state's values on TIME=TOTAL TIME amplitudes, which it holds "
+        "in this static perturbation step\n*BOUNDARY, AMPLITUDE=ABQ2CCX_HOLD\n8, 1, 1, 0.1\n*CLOAD, "
+        "AMPLITUDE=ABQ2CCX_HOLD\n6, 1, 0.1\n*TEMPERATURE, AMPLITUDE=ABQ2CCX_HOLD\nALL, 10.\n*CLOAD\n"
+        "5, 1, 1.1\n"), body.split("*STEP")[-1]
+    assert "Static perturbation step 2: ccx 2.23 runs such a step as a general step" in rep.text()
+    assert conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
+    for between, v, mine in ((_deck_step("Static"), "0.2", "1.2"), (_deck_step("Frequency\n2"), "0.1", "1.1")):
+        body, conv, _ = convert_str(model + tt + between + own)
+        last = body.split("*STEP")[-1]
+        assert f"\n8, 1, 1, {v}\n" in last and f"\n6, 1, {v}\n" in last and f"\n5, 1, {mine}\n" in last
+        assert "AMPLITUDE=TT" not in last, last
+    # a static perturbation *STATIC without a data line has Abaqus' default period 1, also where
+    # the next card has parameters (it was read as the data line: an unknown period, warned)
+    body, conv, rep = convert_str(model + tt + _deck_step("Static", "*Node print, nset=N56\nU\n",
+                                                          ", perturbation") +
+                                  _deck_step("Static", "*Cload, amplitude=TT\n7, 1, 1.\n"))
+    assert "*AMPLITUDE, NAME=TT_SHIFT, TIME=total time, SHIFTX=1.\n" in body
+    assert "unknown time period" not in rep.text() and len(conv.reduced_physics) == 1
+
+
 def test_static_perturbation_temperatures_amplitudes_and_free_dofs():
     # a static perturbation step's temperatures change the base state's too (Abaqus: its load
     # magnitudes include "predefined temperatures"; from the initial ones where no general step

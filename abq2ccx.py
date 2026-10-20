@@ -5691,7 +5691,11 @@ class BaseStateRestore:
         self.sets = EmittedSets()
         self.generated: set = set()                 # the converted loads' nodal-force *CLOADs
         self.amps: Dict[str, Optional[AmplitudeCurve]] = {}
+        self.total_amps: set = set()                # the TIME=TOTAL TIME ones' names
         self.period: Dict[int, Optional[float]] = {}
+        # step -> Abaqus' total time at the end of the last general step up to it (no
+        # perturbation step adds any; None: unknown)
+        self.total: Dict[int, Optional[float]] = {}
         self.procs: Dict[int, str] = {}
         self.by_step: Dict[int, List[EmittedCard]] = {}     # step (0: model data) -> its _RESTORED cards
         self.anchor: Dict[int, EmittedCard] = {}    # step -> the card its restore follows
@@ -5712,6 +5716,7 @@ class BaseStateRestore:
         # the static perturbation steps (_add_base)
         self.summed: List[int] = []
         self.held: List[int] = []                   # the steps given *BOUNDARY, FIXED
+        self.stopped: List[int] = []                # ... TIME=TOTAL TIME lines again (_hold_total)
         self.inexact: Dict[str, List[str]] = {}     # why -> where
 
     def run(self) -> EmittedDeck:
@@ -5723,6 +5728,8 @@ class BaseStateRestore:
                 self._fixed_own(s)
             elif s in self.restore_bcs and s in self.anchor:
                 self._give_bcs(s)
+            if s in self.sp_add and s not in self.restore_from and s in self.anchor:
+                self._hold_total(s)
             if s in self.sp_add or s in self.sp_temps:
                 self._add_base(s)
             if s not in self.pert:                  # (a static perturbation step: given it above)
@@ -5750,6 +5757,8 @@ class BaseStateRestore:
         for b in deck.cards:
             if b.keyword == "AMPLITUDE" and b.param("NAME"):
                 self.amps[b.uparam("NAME")] = amplitude_curve(b)
+                if b.uparam("TIME").replace(" ", "") == "TOTALTIME":
+                    self.total_amps.add(b.uparam("NAME"))
             if b.keyword in self.conv._RESTORED and b.step >= 0:
                 self.by_step.setdefault(b.step, []).append(b)
         # each step's procedure and period as written: the planners know them too
@@ -5764,6 +5773,13 @@ class BaseStateRestore:
                     self.period[s] = pf(rec[1]) if len(rec) > 1 and rec[1] else 1.0
                 except ValueError:
                     self.period[s] = None
+        t: Optional[float] = 0.0                    # (a Riks step's time: its arc length)
+        for st in deck.steps:
+            s = st.number
+            if s not in self.pert:
+                t = None if t is None or self.period.get(s) is None or st.proc.has("RIKS") \
+                    else t + self.period[s]
+            self.total[s] = t
         while self.hold in self.amps:
             self.hold += "_"
 
@@ -5818,16 +5834,18 @@ class BaseStateRestore:
             return True
 
     # -- the values at the end of a general step --------------------------------------------
-    def end_factor(self, b: Block) -> Optional[float]:
-        """The factor a base-state card's amplitude reaches at the end of its step (None:
-        unknown to the converter, as on a FIXED / USER card or an amplitude it does not read
-        at that time)."""
+    def end_factor(self, b: Block, at: Optional[float] = None) -> Optional[float]:
+        """The factor a base-state card's amplitude reaches at the end of its step, a TIME=TOTAL
+        TIME one's at total time ``at`` (None: unknown to the converter, as on a FIXED / USER
+        card, an amplitude it does not read at that time, a TIME=TOTAL TIME one without
+        ``at``)."""
         if b.has("FIXED") or b.has("USER"):
             return None
         amp = b.uparam("AMPLITUDE")
         if amp and amp != self.conv.CCX_RAMP:
-            curve, end = self.amps.get(amp), self.period.get(b.step or 1)
-            if curve is None or curve.total or curve.absolute or end is None:
+            curve = self.amps.get(amp)
+            end = at if amp in self.total_amps else self.period.get(b.step or 1)
+            if curve is None or curve.absolute or end is None:
                 return None
             try:
                 return curve.value(end - pf(b.param("TIME DELAY") or "0"))
@@ -5835,9 +5853,10 @@ class BaseStateRestore:
                 return None
         return 1.0
 
-    def end_value(self, b: Block, rec: List[str]) -> Optional[float]:
-        """The value a base-state line holds at the end of its step (None: unknown)."""
-        factor, j = self.end_factor(b), self.conv._VALUE_FIELD[b.keyword]
+    def end_value(self, b: Block, rec: List[str], at: Optional[float] = None) -> Optional[float]:
+        """The value a base-state line holds at the end of its step (a TIME=TOTAL TIME
+        amplitude's: end_factor; None: unknown)."""
+        factor, j = self.end_factor(b, at), self.conv._VALUE_FIELD[b.keyword]
         try:
             return None if factor is None else \
                 (pf(rec[j]) if len(rec) > j and rec[j] else 0.0) * factor
@@ -5875,28 +5894,34 @@ class BaseStateRestore:
         """(the card parameters, the data line) of a base-state line given again in step
         ``s``: its end value on the constant amplitude, or as it is on a TIME=TOTAL TIME
         amplitude (and a FIXED / USER card's line, and a BC on a node with a *TRANSFORM,
-        where ccx allows one amplitude per node)."""
+        where ccx allows one amplitude per node).  In a static perturbation step (a general
+        step in ccx, which evaluates the amplitude on) a TIME=TOTAL TIME one's value at the
+        base state's end: Abaqus' base state stops there."""
         kw, given_in = b.keyword, b.step
         params = [(k, v) for k, v in b.params.items() if k not in ("OP", "AMPLITUDE", "TIME DELAY")]
         amp = b.uparam("AMPLITUDE")
         factor: Optional[float] = 1.0
         if amp and amp != self.conv.CCX_RAMP:       # (ccx's step ramp ends at the full value)
-            curve = self.amps[amp] if amp in self.amps else None
-            if curve and curve.total:              # it goes on as it is
+            curve, total = self.amps.get(amp), amp in self.total_amps
+            if total and s not in self.pert:        # it goes on as it is
                 return tuple(params + [(k, v) for k, v in b.params.items()
                                        if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
-            end = self.period.get(given_in or 1)    # (model data: from the first step on)
+            # (model data: from the first step on)
+            end = self.total.get(s) if total else self.period.get(given_in or 1)
             try:
                 factor = curve.value(end - pf(b.param("TIME DELAY") or "0")) \
                     if curve and end is not None else None
             except ValueError:
                 factor = None
             if factor is None:
-                self.report.warn(f"*{kw} given again in step {s}, after a linear perturbation "
-                                 f"step: the value amplitude {amp} reached at the end of step "
-                                 f"{given_in or 1} is unknown to the converter, so the line "
-                                 f"keeps the amplitude, which ccx evaluates in step {s} again.",
-                                 once=True)
+                self.report.warn((f"*{kw} given again in static perturbation step {s}: the "
+                                  f"value TIME=TOTAL TIME amplitude {amp} reached at the end of "
+                                  f"the base state" if total else
+                                  f"*{kw} given again in step {s}, after a linear perturbation "
+                                  f"step: the value amplitude {amp} reached at the end of step "
+                                  f"{given_in or 1}") +
+                                 f" is unknown to the converter, so the line keeps the amplitude, "
+                                 f"which ccx evaluates in step {s} again.", once=True)
                 self.conv._reduces(f"*{kw} on amplitude {amp} after a perturbation step")
                 return tuple(params + [(k, v) for k, v in b.params.items()
                                        if k in ("AMPLITUDE", "TIME DELAY")]), ", ".join(rec)
@@ -5979,16 +6004,18 @@ class BaseStateRestore:
             return [emit_keyword(kw, OrderedDict([("OP", "NEW")]))]
         return None
 
-    def _load_entries(self, kw: str, mine: List[EmittedCard]
+    def _load_entries(self, kw: str, mine: List[EmittedCard], only: Optional[set] = None
                       ) -> Tuple[List[Tuple[Block, List[str]]], bool]:
-        """The base state's *CLOAD / *DLOAD lines without what the step's own ``mine`` loads
-        (ccx adds up a load given twice in one step; a line loading part of it: that part,
-        part()), and whether ``mine`` gives some again."""
+        """The base state's *CLOAD / *DLOAD lines (those on an amplitude in ``only``) without
+        what the step's own ``mine`` loads (ccx adds up a load given twice in one step; a line
+        loading part of it: that part, part()), and whether ``mine`` gives some again."""
         entries: List[Tuple[Block, List[str]]] = []
         again = False
         given = {k for b in mine for rec in b.records() if rec and rec[0]
                  for k in self.load_keys(kw, rec)}
         for b, rec, ks in self.contrib[kw]:
+            if only is not None and b.uparam("AMPLITUDE") not in only:
+                continue
             live = [k for k in ks if self.owner[kw].get(k) == b.step]
             left = [k for k in live if k not in given]
             if len(left) == len(ks):
@@ -6035,9 +6062,11 @@ class BaseStateRestore:
         plain = EmittedCard("TEMPERATURE", OrderedDict(), -1, 0, -1)
         return [(plain, rec) for b in ics for rec in b.records() if rec and rec[0]]
 
-    def _cards(self, kw: str, s: int, entries: List[Tuple[Block, List[str]]]) -> List[str]:
+    def _cards(self, kw: str, s: int, entries: List[Tuple[Block, List[str]]],
+               new: bool = True) -> List[str]:
         """The ``kw`` cards of ``entries`` in step ``s``: one per run of lines with the same
-        parameters, OP=NEW on the first (a *BOUNDARY's only where _restore_new)."""
+        parameters, OP=NEW on the first where ``new`` (a *BOUNDARY's only where
+        _restore_new)."""
         runs: List[list] = []
         for b, rec in entries:
             params, text = self.regiven_line(b, rec, s)
@@ -6045,7 +6074,7 @@ class BaseStateRestore:
                 runs[-1][1].append(text)
             else:
                 runs.append([params, [text]])
-        if kw != "BOUNDARY" or s in self.restore_new:
+        if new and (kw != "BOUNDARY" or s in self.restore_new):
             runs = runs or [[(), []]]
             runs[0][0] = (("OP", "NEW"),) + runs[0][0]
         res: List[str] = []
@@ -6227,25 +6256,74 @@ class BaseStateRestore:
             ns = self.sets.members("NSET", rec[0])
             if ns is None:
                 return unknown
-            v = self.temperature(rec, self.end_factor(b) if b.keyword == "TEMPERATURE" else 1.0)
+            v = self.temperature(rec, self.end_factor(b, self.total.get(s))
+                                 if b.keyword == "TEMPERATURE" else 1.0)
             got.update((n, v) for n in ns)
         return got, ()
 
-    def _base_values(self) -> Dict[str, Dict[tuple, Optional[float]]]:
+    def _base_values(self, at: Optional[float]) -> Dict[str, Dict[tuple, Optional[float]]]:
         """What the base state loads and holds, keyed as ccx keys it -> its value at the end
-        of its step (None: unknown; two lines of a step add up)."""
+        of its step, a TIME=TOTAL TIME amplitude's at total time ``at`` (None: unknown; two
+        lines of a step add up)."""
         base: Dict[str, Dict[tuple, Optional[float]]] = {kw: {} for kw in ("BOUNDARY", "CLOAD", "DLOAD")}
         for kw in self.contrib:
             for b, rec, ks in self.contrib[kw]:
-                v = self.end_value(b, rec)
+                v = self.end_value(b, rec, at)
                 for k in ks:
                     if self.owner[kw].get(k) == b.step:
                         old = base[kw].get(k, 0.0)
                         base[kw][k] = None if old is None or v is None else old + v
         for b, rec in self.lines["BOUNDARY"]:
             for k in self.bc_keys(rec) or []:
-                base["BOUNDARY"][k] = self.end_value(b, rec)
+                base["BOUNDARY"][k] = self.end_value(b, rec, at)
         return base
+
+    def _hold_total(self, s: int) -> None:
+        """Static perturbation step ``s`` right after a general step: ccx 2.23 runs it as a
+        general step, so the base state's lines on a TIME=TOTAL TIME amplitude go on along it
+        (probed: the load doubled), where Abaqus' base state stops at the general step's end.
+        They are given again at their values there (regiven_line), right after the procedure
+        card, where the step's own lines leave them (those get the base value: _add_base); a
+        card type whose first card has OP=NEW is left to it."""
+        own = self.by_step.get(s, [])
+        res: List[str] = []
+        for kw in self.conv._RESTORED:
+            if self.deck.steps[s - 1].acting(kw) is not None:
+                continue
+            mine = [b for b in own if b.keyword == kw]
+            entries = self._load_entries(kw, mine, self.total_amps)[0] if kw in self.contrib \
+                else self._total_lines(kw, mine)
+            if entries:
+                res += self._cards(kw, s, entries, new=False)
+        if res:
+            self.deck.insert_after(self.anchor[s], [
+                "** abq2ccx: the base state's values on TIME=TOTAL TIME amplitudes, which it "
+                "holds in this static perturbation step"] + res)
+            self.stopped.append(s)
+
+    def _total_lines(self, kw: str, mine: List[EmittedCard]) -> List[Tuple[Block, List[str]]]:
+        """The base state's *BOUNDARY / *TEMPERATURE lines on a TIME=TOTAL TIME amplitude, on
+        the DOFs / nodes they still hold and the step's own ``mine`` do not give (those
+        replace them): per DOF / node where that is part of a line only."""
+        def keys(rec: List[str]) -> Optional[list]:
+            if kw == "BOUNDARY":
+                return self.bc_keys(rec)
+            return self.sets.members("NSET", rec[0])
+        holder = {k: i for i, (b, rec) in enumerate(self.lines[kw]) for k in keys(rec) or []}
+        given = {k for b in mine for rec in b.records() if rec and rec[0] for k in keys(rec) or []}
+        res: List[Tuple[Block, List[str]]] = []
+        for i, (b, rec) in enumerate(self.lines[kw]):
+            if b.uparam("AMPLITUDE") not in self.total_amps:
+                continue
+            ks = keys(rec)
+            left = ks if ks is None else [k for k in ks if holder[k] == i and k not in given]
+            if left is None or len(left) == len(ks):
+                res.append((b, rec))
+            elif kw == "BOUNDARY":
+                res += [(b, [str(n), str(d), str(d)] + rec[3:]) for n, d in left]
+            else:
+                res += [(b, [str(n)] + rec[1:]) for n in left]
+        return res
 
     def _add_base(self, s: int) -> None:
         """Static perturbation step ``s``: Abaqus reads its load, BC and temperature values as
@@ -6254,12 +6332,13 @@ class BaseStateRestore:
         ccx 2.23 a value given on what the base state loads (a node DOF, a face, a body load's
         set and direction, a node's temperature) as its new value (probed).  Such a line gets
         the base value added (exact for a linear step), split where it loads part of that
-        only (_add_line).  A zero BC on a DOF the base state leaves free holds its base-state
+        only (_add_line), a load's on the step's first line on that key (the lines of a step
+        add up).  A zero BC on a DOF the base state leaves free holds its base-state
         value: *BOUNDARY, FIXED, which ccx holds at the value the step before ends at
         (``fixed``), the base state's where that is the general step or *FREQUENCY steps
         follow it (probed; not after a static perturbation, *BUCKLE or *MODAL DYNAMIC step),
         on the DOFs FIXED can hold (_holdable).  ``inexact``: what cannot be given so."""
-        base = self._base_values()
+        base = self._base_values(self.total.get(s))
         deformed = any(self.contrib.values()) or bool(self.lines["TEMPERATURE"]) or \
             any(self.valued(b, rec) for b, rec in self.lines["BOUNDARY"])
         mine = [b for b in self.by_step.get(s, []) if (b.keyword in base or b.keyword == "TEMPERATURE")
@@ -6268,6 +6347,7 @@ class BaseStateRestore:
             else ({}, ())
         fixable = not self.moved(s)
         fixed: List[Tuple[int, int]] = []
+        done: set = set()                           # the load keys given the base value
         first_bc = next((b for b in mine if b.keyword == "BOUNDARY"), None)
         if deformed and first_bc is not None and first_bc.uparam("OP") == "NEW":
             given = {k for b in mine if b.keyword == "BOUNDARY" for rec in b.records()
@@ -6287,7 +6367,7 @@ class BaseStateRestore:
                 continue
             for i, rec in zip(b.rows, b.records()):
                 if rec and rec[0]:
-                    fixed += self._add_line(s, b, i, rec, base, temps, rest, deformed, fixable)
+                    fixed += self._add_line(s, b, i, rec, base, temps, rest, deformed, fixable, done)
         if fixed:
             self.deck.insert_after(
                 [b for b in mine if b.keyword == "BOUNDARY"][-1],
@@ -6299,9 +6379,10 @@ class BaseStateRestore:
     def _add_line(self, s: int, b: EmittedCard, i: int, rec: List[str],
                   base: Dict[str, Dict[tuple, Optional[float]]],
                   temps: Dict[int, Optional[Tuple[float, ...]]], rest: Optional[Tuple[float, ...]],
-                  deformed: bool, fixable: bool) -> List[Tuple[int, int]]:
+                  deformed: bool, fixable: bool, done: set) -> List[Tuple[int, int]]:
         """Line ``i`` (``rec``) of static perturbation step ``s``'s card ``b`` written with
-        the base value added (_add_base); returns the DOFs it leaves to *BOUNDARY, FIXED."""
+        the base value added (_add_base; a load's where no earlier line of the step got it on
+        that key: ``done``); returns the DOFs it leaves to *BOUNDARY, FIXED."""
         kw, j = b.keyword, self.conv._VALUE_FIELD[b.keyword]
         ks = self.bc_keys(rec) if kw == "BOUNDARY" else self.sets.members("NSET", rec[0]) \
             if kw == "TEMPERATURE" else self.load_keys(kw, rec)
@@ -6320,7 +6401,10 @@ class BaseStateRestore:
                                         "(those of the base state), ccx not",
                                         []).append(f"{s} (*TEMPERATURE {rec[0]})")
         else:
-            on = {k: base[kw][k] for k in ks if k in base[kw] and base[kw][k] != 0.0}
+            on = {k: base[kw][k] for k in ks if k in base[kw] and base[kw][k] != 0.0 and
+                  (kw, k) not in done}
+            if kw in self.contrib:
+                done.update((kw, k) for k in ks)
         fix_ks: List[Tuple[int, int]] = []
         if kw == "BOUNDARY" and deformed:
             free = [k for k in ks if k not in base[kw]]
@@ -6395,6 +6479,13 @@ class BaseStateRestore:
                              f"of the base value (temperatures: of the initial ones where no general "
                              f"step gave any), ccx 2.23 as its new value (probed), so the base value "
                              f"is added to it.", once=True)
+        if self.stopped:
+            self.report.note(f"Static perturbation step{'s' if len(self.stopped) > 1 else ''} "
+                             f"{', '.join(map(str, self.stopped))}: ccx 2.23 runs such a step as a "
+                             f"general step, which goes on along the base state's TIME=TOTAL TIME "
+                             f"amplitudes, while Abaqus' base state stops at the general step's end "
+                             f"(probed), so its lines on them are given again at their values "
+                             f"there.", once=True)
         if self.held:
             self.report.note(f"Static perturbation step{'s' if len(self.held) > 1 else ''} "
                              f"{', '.join(map(str, self.held))}: a zero BC on a DOF the base state "
@@ -23899,8 +23990,8 @@ class Converter:
         added: Dict[int, Optional[float]] = {}  # emitted step -> the time ccx alone adds (None: unknown)
         # each card's emitted step.  This pass's own rules: a card between steps or after the
         # last counts with the step before it, and every *MODAL DYNAMIC / *STATIC card of a
-        # step gives its time (the last one decides), read from the card's first data line or,
-        # without one, from the next card's keyword line
+        # step gives its time (the last one decides), read from the card's first record (a
+        # *STATIC without one: 1, Abaqus' default period)
         at: List[int] = []
         n = 0
         for c in deck.cards:
@@ -23911,12 +24002,9 @@ class Converter:
                 if (c.params.get("TIME") or "").upper().replace(" ", "") == "TOTALTIME":
                     amps[c.uparam("NAME")] = c
             elif n in self._pert_idx and c.keyword in ("MODAL DYNAMIC", "STATIC"):
-                nxt = c.index + 1
-                line = c.data[0] if c.data else (
-                    deck.lines[deck.cards[nxt].line] if nxt < len(deck.cards) else "")
-                rec = line.split(",") if line else []
+                rec = (c.records() or [[]])[0]
                 try:
-                    added[n] = pf(rec[1]) if len(rec) > 1 and rec[1].strip() else \
+                    added[n] = pf(rec[1]) if len(rec) > 1 and rec[1] else \
                         (1.0 if c.keyword == "STATIC" else None)
                 except ValueError:
                     added[n] = None

@@ -3843,6 +3843,41 @@ def static_pert_leftovers_deck(case, between="", ref=False):
         own + out
 
 
+def static_pert_sums_deck(case, between="", ref=False):
+    """modal_own_loads_deck's cube, unloaded, a static step, ``between`` (steps), then a *STEP,
+    PERTURBATION *STATIC step.  ``case`` "twice": the static step loads node 6, face 1 by a
+    pressure and the cube by gravity, the perturbation step changes each by two lines of half
+    (the *CLOAD's on two cards); "total": the static step's *CLOAD on node 6, node 7's x and a
+    traction on a TIME=TOTAL TIME amplitude (0.1 at its end), the perturbation step loading
+    nodes 6 and 7; "shift": that *CLOAD alone, the perturbation step's *STATIC without a data
+    line and an output request next, then a static step loading node 6 on the amplitude (0.2 at
+    Abaqus' total time 2).  The last step prints U.  ``ref``: one static step with the sums,
+    Abaqus' base state plus its perturbation (in "shift": the last step's state)."""
+    text = modal_own_loads_deck(False).replace("*NSET, NSET=N7\n7\n", "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n")
+    text = text[:text.index("*STEP")] + "*AMPLITUDE, NAME=TT, TIME=TOTAL TIME\n0., 0., 10., 1.\n"
+    out = "*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
+    if ref:
+        return text + "*STEP\n*STATIC\n" + {
+            "twice": "*CLOAD\n6, 2, 2.\n*DLOAD\n1, P2, 2.\nEALL, GRAV, 2000., 1., 0., 0.\n",
+            "total": "*CLOAD\n6, 2, 1.5\n7, 3, 0.5\n*BOUNDARY\n7, 1, 1, 0.01\n*DSLOAD\n"
+                     "SIDE, TRVEC, 0.1, 1., 0., 0.\n",
+            "shift": "*CLOAD\n6, 2, 4.\n"}[case] + out
+    if case == "twice":
+        base = "*CLOAD\n6, 2, 1.\n*DLOAD\n1, P2, 1.\nEALL, GRAV, 1000., 1., 0., 0.\n"
+        own = ("*CLOAD\n6, 2, 0.5\n*CLOAD\n6, 2, 0.5\n*DLOAD\n1, P2, 0.5\n1, P2, 0.5\n"
+               "EALL, GRAV, 500., 1., 0., 0.\nEALL, GRAV, 500., 1., 0., 0.\n")
+    else:
+        base = "*CLOAD, AMPLITUDE=TT\n6, 2, 10.\n" + (
+            "*BOUNDARY, AMPLITUDE=TT\n7, 1, 1, 0.1\n*DSLOAD, AMPLITUDE=TT\nSIDE, TRVEC, 1., 1., 0., 0.\n"
+            if case == "total" else "")
+        own = "*CLOAD\n6, 2, 0.5\n7, 3, 0.5\n"
+    text += "*STEP\n*STATIC\n" + base + "*END STEP\n" + between + "*STEP, PERTURBATION\n*STATIC\n"
+    if case == "shift":
+        return text + "*NODE PRINT, NSET=NALL\nU\n" + own + "*END STEP\n*STEP\n*STATIC\n" \
+            "*CLOAD, AMPLITUDE=TT\n6, 2, 20.\n" + out
+    return text + own + out
+
+
 def buckle_amplitude_deck(force, amp=True, start=0.25):
     """buckle_displacement_deck("tied", ``force``): its *STEP, PERTURBATION *BUCKLE step's
     *CLOAD on an amplitude of ``start`` at time 0 (1 at time 1) if ``amp``."""
@@ -10171,6 +10206,33 @@ def main():
                                                                  else "temperature and gradient") +
                       f"): its displacements are those of a static step with the sums ({err:.1e} "
                       f"apart, nodes moved {moved:.3g})")
+            failures += 0 if ok else 1
+    # a static perturbation step's lines on one key add up, its base value goes on the first one
+    # (ccx 2.23 got it on each: twice the base); the base state's values on a TIME=TOTAL TIME
+    # amplitude stop at the general step's end (ccx went on along it: the load doubled); a
+    # *STATIC without a data line has period 1 (the next card was read as one: the later step's
+    # amplitude read at 3, 1.5 times the load)
+    what = {"twice": "a cube loaded statically by a *CLOAD, a pressure and gravity, {}then a *STEP, "
+                     "PERTURBATION *STATIC step changing each by two lines",
+            "total": "a cube loaded statically by a *CLOAD, a prescribed displacement and a traction "
+                     "on a TIME=TOTAL TIME amplitude, {}then a *STEP, PERTURBATION *STATIC step loading "
+                     "it (the amplitude's value at the general step's end)",
+            "shift": "a cube loaded on a TIME=TOTAL TIME amplitude, {}a *STEP, PERTURBATION *STATIC "
+                     "step without a data line, then a static step loading it on the amplitude (at "
+                     "Abaqus' total time 2)"}
+    for case in what:
+        ref = review_run(static_pert_sums_deck(case, ref=True), f"static_pert_{case}_ref", dat_node_blocks)
+        for tag, between in (("", ""), ("_freq", freq))[:1 if case == "shift" else 2]:
+            got = review_run(static_pert_sums_deck(case, between), f"static_pert_{case}{tag}",
+                             dat_node_blocks)
+            ok = bool(got and ref)
+            if ok:
+                err, moved = same([got, ref], -1)
+                ok = err < 1e-9 * moved and moved > 1e-3
+                print(f"{'PASS' if ok else 'FAIL'}  static_pert_{case}{tag} ("
+                      + what[case].format("then *FREQUENCY, " if between else "") + f"): its "
+                      f"displacements are those of a static step with the sums ({err:.1e} apart, "
+                      f"nodes moved {moved:.3g})")
             failures += 0 if ok else 1
     def factors(dat):
         return dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")

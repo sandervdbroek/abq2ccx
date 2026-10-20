@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Static perturbation steps: base + perturbation** — two lines of one load in such a step
+  each got the base value added, so ccx counted it twice. It now goes on the first line only.
+  Base-state loads, BCs and temperatures on a `TIME=TOTAL TIME` amplitude kept rising through
+  the step in ccx (the load doubled). They are now held at their values at the general step's
+  end. A `*STATIC` without a data line read the next card as one: a card with parameters gave a
+  false "unknown time period" warning, and a later step's `TIME=TOTAL TIME` load came out 1.5x.
+  Its period is now 1, Abaqus' default.
 * **`*DLOAD` BX / BY / BZ on shells** — Abaqus applies them as a body force per unit volume;
   ccx 2.23 applied them on its shells as a pressure on the shell's face, so a plate under BX
   bent out of its plane, without a warning. They are now `GRAV` of B / density along the axis,
