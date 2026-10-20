@@ -11260,7 +11260,9 @@ class Converter:
                         state[k][2] = bc
         t0: Optional[float] = 0.0                # total time at the step start (None: unknown)
         nlgeom = False
-        acts = op_new_cards(blocks, skip=self.steps.lc2)
+        # (its own state, not StepModel.states: it follows the motion too; OP=NEW clears at a
+        # step's start)
+        acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
         for s, group in enumerate(groups, 1):
             info = self._step_motion(group, nlgeom)
             nlgeom = info["nlgeom"]
