@@ -4337,7 +4337,7 @@ class Step:
     proc: str                     # the first PROC_KW card's keyword, "" if none (handle_step's): ccx's
                                   # procedure (one ccx lacks, e.g. *RANDOM RESPONSE, is commented out)
     proc_card: Optional[Block]
-    motion_proc: str              # the first PROC_KW or Converter._MOTION_PROCS card's (the motion fields')
+    motion_proc: str              # the first PROC_KW or Converter._MOTION_PROCS card's (motion fields)
     explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT (handle_step's)
     amplitude: str                # *STEP, AMPLITUDE= as written ("" if none)
     pert_param: bool              # *STEP, PERTURBATION as written
@@ -4367,7 +4367,7 @@ class Step:
     general: bool                 # proc in StepModel.GENERAL_PROCS and no *STEP, PERTURBATION
     general_before: bool          # a general step before it (handle_step's _general_step_seen)
     base_nlgeom: bool             # NLGEOM in force in its base state (handle_step's _base_nlgeom): on
-                                  # once a general step's *STEP card has NLGEOM as handle_step writes it
+                                  # once a general step's *STEP card has it as handle_step writes it
     base_nlgeom_dp: bool          # the same with a deformation plasticity material (_dp_nlgeom), whose
                                   # NLGEOM=NO handle_step drops: an explicit step with it gets NLGEOM
     buckle_loaded: bool           # a *BUCKLE step with a load other than *TEMPERATURE (handle_step's)
@@ -4375,7 +4375,7 @@ class Step:
                                   # cards, which the conversion leaves out (StepModel.lc2)
     lc2_repeats: bool             # each repeats a LOAD CASE=1 card of the step (the Abaqus/CAE default)
     # how its nodes move, by motion_proc's card (_plan_velocity_bcs, _plan_default_amplitudes,
-    # _dofs_at_rest, _plan_amplitude_spans):
+    # _dofs_at_rest, the deck's amp_span):
     motion_label: str             # motion_proc, with ", RIKS"; "(no procedure)" if none
     motion_explicit: bool         # that card is a *DYNAMIC, EXPLICIT
     period: Optional[float]       # the time period over which its nodes move (None for Riks, heat
@@ -4386,9 +4386,10 @@ class Step:
                                   # one is unknown)
     defaults: Dict[str, str]      # the Abaqus default amplitude of its DISPLACEMENT, VELOCITY and
                                   # ACCELERATION BCs (not to be changed)
-    ccx_amp: str                  # the one ccx gives a load or BC without AMPLITUDE in the converted step
-    nlgeom_motion: bool           # NLGEOM in force by the motion rule (_plan_velocity_bcs): on once a step
-                                  # not a perturbation one has NLGEOM on its *STEP card or is
+    ccx_amp: str                  # the one ccx gives a load or BC without AMPLITUDE in the converted
+                                  # step
+    nlgeom_motion: bool           # NLGEOM in force by the motion rule (_plan_velocity_bcs): on once a
+                                  # step not a perturbation one has NLGEOM on its *STEP card or is
                                   # motion_explicit
 
 
@@ -4559,7 +4560,8 @@ class StepModel:
                 nlgeom=nlgeom,
                 temp_dof=next((b.keyword for b in inner if b.keyword in TEMPERATURE_DOF_PROCS), None),
                 star_procs=tuple(star_proc[id(b)] for b in cards if b.keyword == "STEP"),
-                nlgeom_output=nl_output, nlgeom_dp=nl_dp, general=general, general_before=seen, base_nlgeom=base, base_nlgeom_dp=base_dp,
+                nlgeom_output=nl_output, nlgeom_dp=nl_dp, general=general, general_before=seen,
+                base_nlgeom=base, base_nlgeom_dp=base_dp,
                 buckle_loaded=proc == "BUCKLE" and any(
                     desc for b in inner if b.keyword in LOAD_CARD_FIELD and b.keyword != "TEMPERATURE"
                     for _, desc in _load_entries(b, user_loads=True)),
@@ -4582,8 +4584,8 @@ class StepModel:
         self.after: Tuple[Block, ...] = tuple(loose)
         self.pert = frozenset(s.no for s in steps if s.perturbation)      # _pert_idx
         self.nl_heads = frozenset(heads)
-        # the *STEP cards, _prescan's _n_steps (handle_step, _nodal_load_clash); len(steps)
-        # counts the steps as emitted
+        # the *STEP cards (_n_steps: _nodal_load_clash; handle_step); len(steps) counts the steps
+        # as emitted
         self.n_star_steps = star
         # the *BOUNDARY, LOAD CASE=2 cards of *BUCKLE steps: buckling-mode BCs, which ccx cannot
         # have (one set of BCs per step), so the conversion leaves them out (handle_boundary,
@@ -4602,6 +4604,7 @@ class StepModel:
         self.nl_any = any(self.nl_steps)
         self.nl_all = bool(general) and general[0]          # (NLGEOM stays on once switched on)
         procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
+        self.procs = frozenset(procs)                       # the deck's procedures
         # where an element's mass acts, two questions: its inertia, in the steps of INERTIA_PROCS
         # (_plan_coupled_inertia: whether the masses can go; _plan_u1_beams: U1's mass matrix),
         # and its weight too, under a mass-proportional *DLOAD (mass_acts: whether a section's
@@ -4613,7 +4616,46 @@ class StepModel:
         self.mass_acts = bool(self.inertia or self.mass_loads)
         self.dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
         self.explicit = any(b.keyword == "DYNAMIC" and b.has("EXPLICIT") for b in blocks)
+        # not heat transfer alone: _mechanical (a deck without procedures counts; for
+        # _plan_circ_rotation_knots, which reads procs, it does not)
         self.mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
+        # a step solves for temperatures, where a TIE ties DOF 11 too (_mpc_thermal)
+        self.mpc_thermal = any(k in CCX_THERMAL_PROCS for k in procs)
+        # the *FREQUENCY steps whose eigenmodes a later modal / steady-state dynamics or complex
+        # frequency step reads (the last one before it, as in Abaqus): they must store them
+        # (STORAGE=YES, or ccx stops: 'cannot open eigenvalue file'), and those steps refuse
+        # eigenmodes of a perturbation step (_freq_read: _frequency_perturbation)
+        read: set = set()
+        last_freq = None
+        for s in steps:
+            if s.proc == "FREQUENCY":
+                last_freq = s.no
+            elif last_freq and s.proc in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS",
+                                          "COMPLEX FREQUENCY"):
+                read.add(last_freq)
+        self.freq_read = frozenset(read)
+        # the longest step time and the latest total time at which the deck's steps read an
+        # amplitude, over which _sample_amplitude tabulates an analytic amplitude (_amp_span;
+        # None if a step's time period is unknown).  A *MODAL DYNAMIC step reads it over its own
+        # time period as well, from the general steps' total time before it (_shift_total_time
+        # takes out what ccx adds to it), though Abaqus adds no perturbation step's time.
+        self.amp_span: Optional[Tuple[float, float]] = None
+        longest = total = reach = 0.0
+        for s in steps:
+            if s.advance is None:
+                break
+            period = 0.0
+            for b in (b for b in s.cards[1:] if b.keyword == "MODAL DYNAMIC"):
+                rec = (merged_data_records(b) or [[]])[0]
+                try:
+                    period = max(pf(rec[1]), 0.0) if len(rec) > 1 and rec[1] else 0.0
+                except ValueError:
+                    pass
+            longest, total = max(longest, s.advance, period), total + s.advance
+            reach = max(reach, total + period)
+        else:
+            if reach > 0.0:
+                self.amp_span = (longest, reach)
 
     def step_of(self, card: Block) -> Step:
         """The step ``card`` belongs to (one of its cards from its *STEP through its *END STEP)."""
@@ -6084,7 +6126,8 @@ class Converter:
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         self._last_coupling: Optional[dict] = None
         # *DISTRIBUTION orientations (see _plan_distributions)
-        self._dists: "OrderedDict[str, Block]" = OrderedDict()  # NAME -> *DISTRIBUTION
+        self._dist_cards: Dict[str, Block] = {}    # NAME -> *DISTRIBUTION, "" too (_plan_deck_facts)
+        self._dists: "OrderedDict[str, Block]" = OrderedDict()  # the named ones (_plan_distributions)
         self._dist_ori: "OrderedDict[str, dict]" = OrderedDict()  # *ORIENTATION NAME -> plan
         self._dist_refs: set = set()               # every *ORIENTATION that names a distribution
         self._dist_split: Dict[int, List[Tuple[str, dict]]] = {}  # id(section) -> groups
@@ -6122,7 +6165,7 @@ class Converter:
         self._out_tp_cards: List[str] = []         # *TIME POINTS to emit before the first *STEP
         self._out_contact = {"abaqus": False, "pairs": 0, "nts": False, "flat": False, "axi": False}
         self._courant: Optional[Tuple[float, int]] = None   # (min h f / c, element), _courant_min
-        self._amp_span: Optional[Tuple[float, float]] = None    # (_plan_amplitude_spans)
+        self._amp_span: Optional[Tuple[float, float]] = None    # (StepModel.amp_span)
         self._si_missing_behavior: set = set()        # (_plan_surface_behavior)
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
@@ -8786,10 +8829,7 @@ class Converter:
         additional rotation applied to the axes, no rotation line), which handle_orientation
         emits right before it; and every shell or membrane section that uses one is split
         into an element set, a plain *ORIENTATION and a section per distinct direction."""
-        self._dists = OrderedDict()
-        for b in blocks:
-            if b.keyword == "DISTRIBUTION" and (b.param("NAME") or "").strip():
-                self._dists[b.param("NAME").strip().upper()] = b
+        self._dists = OrderedDict((k, b) for k, b in self._dist_cards.items() if k)
         refs: List[Tuple[str, str, Block]] = []
         plain: set = set()
         for b in blocks:
@@ -11621,7 +11661,8 @@ class Converter:
                                              f"velocity), as in Abaqus.", once=True)
                         if q == "ACCELERATION" and not dynamic and not bad and \
                                 (mag or curve is not None):
-                            self.report.warn(f"*BOUNDARY, TYPE=ACCELERATION in a {step.motion_label} step: "
+                            self.report.warn(f"*BOUNDARY, TYPE=ACCELERATION in a "
+                                             f"{step.motion_label} step: "
                                              f"the Abaqus manual says acceleration histories should "
                                              f"not be used in static steps. Converted to the motion "
                                              f"the acceleration integrates to from the velocity at "
@@ -13385,7 +13426,7 @@ class Converter:
         used = sorted({n for _, _, items in cards for n in items})
         if not used:
             return
-        dynamic = any(b.keyword == "DYNAMIC" for b in blocks)
+        dynamic = self._dynamic_deck
         beam_nodes = {n for typ, conn in self.geom.elements.values()
                       if ccx_type(typ) in BEAM_TYPES and
                       not ccx_type(typ).startswith(("T2D", "T3D")) for n in conn}
@@ -16814,29 +16855,6 @@ class Converter:
             self._reduces(f"*AMPLITUDE, DEFINITION={definition} read as TABULAR")
         return [emit_keyword("AMPLITUDE", keep)] + scaled(list(b.data))
 
-    def _plan_amplitude_spans(self, blocks: List[Block]) -> None:
-        """The longest step time and the latest total time at which the deck's steps read an
-        amplitude, over which _sample_amplitude tabulates an analytic amplitude (None if a
-        step's time period is unknown).  A *MODAL DYNAMIC step reads it over its own time
-        period as well, from the general steps' total time before it (_shift_total_time
-        takes out what ccx adds to it), though Abaqus adds no perturbation step's time."""
-        self._amp_span = None
-        longest = total = reach = 0.0
-        for step, group in zip(self.steps, step_groups(blocks)[1]):
-            if step.advance is None:
-                return
-            period = 0.0
-            for b in (b for b in group[1:] if b.keyword == "MODAL DYNAMIC"):
-                rec = (merged_data_records(b) or [[]])[0]
-                try:
-                    period = max(pf(rec[1]), 0.0) if len(rec) > 1 and rec[1] else 0.0
-                except ValueError:
-                    pass
-            longest, total = max(longest, step.advance, period), total + step.advance
-            reach = max(reach, total + period)
-        if reach > 0.0:
-            self._amp_span = (longest, reach)
-
     def _sample_amplitude(self, b: Block) -> Optional[List[str]]:
         """``*AMPLITUDE, DEFINITION=PERIODIC / MODULATED / DECAY`` (amplitude_curve) as
         time/amplitude pairs over the time the steps use it: step time up to the longest
@@ -19226,7 +19244,6 @@ class Converter:
         self._prescan(blocks)
         self._plan_member_mass_tets(blocks)     # after _prescan: its *MPC BEAM bodies
         self._plan_surface_heat(blocks)
-        self._plan_amplitude_spans(blocks)
         self._plan_load_cases(blocks)
         self._plan_rigid_planar_holds()             # after _prescan: the bodies' ROT NODEs
         self._plan_kinematic_holds(blocks)          # after _prescan: the coupling plans
@@ -19392,10 +19409,18 @@ class Converter:
         explicit dynamics, whether one is not heat transfer alone (a deck without steps
         counts as mechanical), the *COUPLING cards a *KINEMATIC or *DISTRIBUTING follows,
         the *TIE names, the linear perturbation steps, which steps run NLGEOM, the TIME=TOTAL
-        TIME amplitudes and the amplitudes' curves.  No planner adds or replaces such cards (_split_coupling_refs adds its
-        copies' ids)."""
+        TIME amplitudes and the amplitudes' curves, the *DISTRIBUTION cards by name, and the
+        step model's deck-wide facts.  No planner adds or replaces such cards (_split_coupling_refs
+        adds its copies' ids)."""
         self.steps = StepModel(blocks)
         self._pert_idx = self.steps.pert
+        self._n_steps = self.steps.n_star_steps
+        self._freq_read = set(self.steps.freq_read)
+        self._amp_span = self.steps.amp_span
+        self._mpc_thermal = self.steps.mpc_thermal
+        # NAME -> its *DISTRIBUTION card ("" for one without a name), as the planners look them
+        # up (_plan_distributions leaves the "" one out of _dists)
+        self._dist_cards = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
         self._total_amps = {b.uparam("NAME") for b in blocks if b.keyword == "AMPLITUDE" and
                             b.uparam("TIME").replace(" ", "") == "TOTALTIME"}
         self._amp_curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
@@ -22162,7 +22187,7 @@ class Converter:
                                  f"--max-ply-elements ({limit}); rerun with a larger limit to write "
                                  f"them")
             return
-        dists = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        dists = self._dist_cards
         for p in plans:
             for ply in p["plies"]:
                 field = ply["ori"].strip().upper()
@@ -22598,7 +22623,7 @@ class Converter:
                             continue
                         for n in self._resolve_nodes(r[0].strip()):
                             nodal[n] = t
-        dists = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        dists = self._dist_cards
         thick: "OrderedDict[int, List[Optional[float]]]" = OrderedDict()
         section: Dict[int, Block] = {}
         for b in blocks:
@@ -22881,7 +22906,7 @@ class Converter:
                  all(n in self.geom.nodes for n in els[e][1])}
         if not cands:
             return
-        dists = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
+        dists = self._dist_cards
         thick: Dict[int, List[float]] = {}
         left: Dict[str, List[int]] = {}               # why an element stays as it is -> elements
         for e, ts in ts_all.items():
@@ -23742,7 +23767,6 @@ class Converter:
             b.keyword in ("FIELD", "USER DEFINED FIELD")
             or (b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "FIELD")
             for b in blocks)
-        self._n_steps = sum(1 for b in blocks if b.keyword == "STEP")
         # every parameter value of the deck but card names: a *DISTRIBUTION that some card
         # names (a shell thickness, a material property) carries physics ccx cannot take
         self._param_values = {(v or "").strip().upper() for b in blocks for k, v in b.params.items()
@@ -23765,19 +23789,6 @@ class Converter:
         self._step_idx = 0
         self._step_nlgeom = False
         self._has_sensitivity = any(b.keyword in ("SENSITIVITY", "FEASIBLE DIRECTION") for b in blocks)
-        # the *FREQUENCY steps whose eigenmodes a later modal / steady-state dynamics or complex
-        # frequency step reads (the last one before it, as in Abaqus): they must store them
-        # (STORAGE=YES, or ccx stops: 'cannot open eigenvalue file'), and those steps refuse
-        # eigenmodes of a perturbation step (_frequency_perturbation)
-        self._freq_read = set()
-        last_freq = None
-        for idx, group in enumerate(step_groups(blocks)[1], 1):
-            proc = next((b.keyword for b in group[1:] if b.keyword in PROC_KW), None)
-            if proc == "FREQUENCY":
-                last_freq = idx
-            elif last_freq and proc in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS",
-                                        "COMPLEX FREQUENCY"):
-                self._freq_read.add(last_freq)
         # what a perturbation step's base state holds (_frequency_perturbation; a first
         # *BUCKLE step: handle_step)
         self._initial_stresses = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "STRESS"
@@ -24072,10 +24083,6 @@ class Converter:
         root: exact at any rotation, where linear *EQUATION ties hold for small ones only."""
         self._mpc_plan = {}
         self._mpc_bodies = {}
-        # a TIE also ties the temperature (DOF 11) where a step has one; a heat-transfer-only
-        # deck has no displacements to tie
-        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
-        self._mpc_thermal = any(k in CCX_THERMAL_PROCS for k in procs)
         kinds: Dict[str, str] = {}
         self._expanded = set()                 # nodes of elements ccx expands to 3-D
         rotn: set = set()                      # shell/beam nodes: rotations of their own
@@ -28535,8 +28542,7 @@ class Converter:
             return
         ends = {n for e in self._circ_beam_elements(blocks)
                 for c in [self.geom.elements[e][1]] if len(c) == 3 for n in (c[0], c[2])}
-        procs = [b.keyword for b in blocks if b.keyword in PROC_KW]
-        if not ends or all(p == "HEAT TRANSFER" for p in procs):
+        if not ends or self.steps.procs <= {"HEAT TRANSFER"}:   # (a deck without procedures too)
             return
         twist = set(self._planar_twist) & ends
         moves: set = set()                               # nodes given a nonzero rotation

@@ -548,7 +548,8 @@ def test_step_model_motion_facts():
     _, m = _step_model("""*STEP\n*STATIC\n0.1, 2.\n*END STEP\n*STEP, AMPLITUDE=STEP\n*DYNAMIC\n0.01, 0.5
 *END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 3.\n*END STEP
 *STEP\n*STATIC, RIKS\n*END STEP\n*STEP, NLGEOM\n*GEOSTATIC\n*END STEP
-*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP\n*STEP\n*DYNAMIC, APPLICATION=QUASI-STATIC\n0.1, 1.\n*END STEP""")
+*STEP\n*DYNAMIC, EXPLICIT\n, 1e-4\n*END STEP
+*STEP\n*DYNAMIC, APPLICATION=QUASI-STATIC\n0.1, 1.\n*END STEP""")
     assert [s.motion_label for s in m] == ["STATIC", "DYNAMIC", "FREQUENCY", "HEAT TRANSFER",
                                            "STATIC, RIKS", "GEOSTATIC", "DYNAMIC", "DYNAMIC"]
     assert [s.period for s in m] == [2.0, 0.5, None, None, None, 1.0, 1e-4, 1.0]
@@ -583,6 +584,26 @@ def test_step_model_planner_facts():
     assert m.nl_heads == {id(blocks[5])} and not m.explicit_without_nlgeom
     assert [(s.proc, s.nlgeom_dp, s.nlgeom_output) for s in m] == [("", False, False),
                                                                   ("FREQUENCY", False, False)]
+
+
+def test_step_model_deck_facts():
+    # deck-wide: the *FREQUENCY steps a later step reads the modes of, the time span the steps
+    # read amplitudes over (a modal step's own period on top of the total time), the
+    # procedures, thermal steps
+    blocks, m = _step_model("""*DISTRIBUTION, NAME=d1\n*DISTRIBUTION\n*DISTRIBUTION, NAME=D1
+*STEP\n*STATIC\n0.1, 2.\n*DLOAD\nEALL, GRAV, 9.81, 0., 0., -1.\n*END STEP\n*STEP\n*FREQUENCY\n3
+*END STEP\n*STEP\n*MODAL DYNAMIC\n0.01, 5.\n*END STEP\n*STEP\n*FREQUENCY\n2\n*END STEP""")
+    assert (m.freq_read, m.amp_span) == ({2}, (5.0, 7.0))
+    assert m.procs == {"STATIC", "FREQUENCY", "MODAL DYNAMIC"}
+    assert (m.mechanical, m.mpc_thermal) == (True, False)
+    _, m = _step_model("*STEP\n*DYNAMIC TEMPERATURE-DISPLACEMENT\n*END STEP\n"
+                       "*STEP\n*HEAT TRANSFER\n*END STEP")
+    assert (m.amp_span, m.procs, m.mechanical, m.mpc_thermal) == (None, {"HEAT TRANSFER"}, False, True)
+    # the converter's facts are the model's; *DISTRIBUTION cards by name, the last of a name
+    conv = A.Converter(A.Report(), Opt())
+    conv._plan_deck_facts(blocks)
+    assert (conv._freq_read, conv._amp_span, conv._n_steps) == ({2}, (5.0, 7.0), 4)
+    assert conv._dist_cards == {"D1": blocks[2], "": blocks[1]}
 
 
 def test_step_model_explicit_steps():
