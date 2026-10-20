@@ -12282,6 +12282,14 @@ def test_distributing_weights_on_plane_edges_take_the_section_thickness():
     assert all(abs(got[n] + w / 8.0) < 1e-12 for n, w in zip(range(11, 16), (0.5, 1.0, 2.0, 3.0, 1.5)))
 
 
+def _converter_classes(tree):
+    """Converter's class node, then its mixins' (the module classes it inherits from), by AST."""
+    import ast
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    conv = classes["Converter"]
+    return [conv] + [classes[b.id] for b in conv.bases if isinstance(b, ast.Name) and b.id in classes]
+
+
 def test_no_planner_reads_a_fact_only_a_later_planner_writes():
     # Converter._convert runs its planners in order: one that reads, through any method it calls,
     # an attribute only a later planner writes sees __init__'s default (code review 3: the
@@ -12291,8 +12299,8 @@ def test_no_planner_reads_a_fact_only_a_later_planner_writes():
     import ast
     with open(A.__file__, encoding="utf-8") as fh:
         tree = ast.parse(fh.read())
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Converter")
-    methods = {f.name: f for f in cls.body if isinstance(f, ast.FunctionDef)}
+    methods = {f.name: f for cls in _converter_classes(tree) for f in cls.body
+               if isinstance(f, ast.FunctionDef)}
     mutators = {"add", "update", "append", "extend", "setdefault", "pop", "popitem", "discard",
                 "clear", "remove", "insert"}
 
