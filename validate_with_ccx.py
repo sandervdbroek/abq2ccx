@@ -96,7 +96,10 @@ the deck without it, the reaction at a REF NODE on an element outside the body a
 one, a BEAM connector driven at node b against a hand-written *RIGID BODY, and an initial spin
 against the rigid rotation; an orthotropic expansion on a shell off the x-y plane (its stretch
 along direction 1), temperatures at section points (a plate and a RECT cantilever against plate
-and beam theory) and midside nodes between ends heated on two cards (the one-card decks).
+and beam theory) and midside nodes between ends heated on two cards (the one-card decks); an
+explicit bar with *FIXED MASS SCALING, FACTOR=100 against the bar with its masses scaled by hand
+(its increment 10 times the true mass's), and a target increment DT as ccx's selective mass
+scaling (--approximate).
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -4530,6 +4533,28 @@ def heatless_beam_deck(kind, twin=False):
     if kind == "steady":
         text = text.replace("*Coupled Temperature-displacement\n", "*Coupled Temperature-displacement, steady state\n")
     return text
+
+
+def explicit_mass_deck(card="", twin=1.0):
+    """A C3D8 bar 4 x 1 x 1 (E 1000, nu 0.3, density 1e-3) clamped at x = 0, a point *MASS
+    0.002 at its tip node 20, in a *DYNAMIC, EXPLICIT step of 0.05 under gravity 9810 in -z
+    on the bar and the mass and a tip load 0.5 in y ramped over the step; the tip printed.
+    ``card``: the step's mass scaling card; ``twin``: the densities and the mass that many
+    times larger and the gravity magnitude that many times smaller, by hand."""
+    nid = lambda i, j, k: 1 + i + 5 * (j + 2 * k)                             # noqa: E731
+    lines = ["*Heading", "An explicit bar with mass scaling", "*Node"]
+    lines += [f"{nid(i, j, k)}, {i}., {j}., {k}." for k in range(2) for j in range(2) for i in range(5)]
+    lines.append("*Element, type=C3D8, elset=BAR")
+    lines += [f"{i + 1}, {nid(i, 0, 0)}, {nid(i + 1, 0, 0)}, {nid(i + 1, 1, 0)}, {nid(i, 1, 0)}, "
+              f"{nid(i, 0, 1)}, {nid(i + 1, 0, 1)}, {nid(i + 1, 1, 1)}, {nid(i, 1, 1)}" for i in range(4)]
+    lines += ["*Element, type=MASS, elset=PM", "100, 20", "*Nset, nset=ROOT", "1, 6, 11, 16",
+              "*Nset, nset=TIP", "20", "*Material, name=M", "*Elastic", "1000., 0.3", "*Density",
+              f"{1e-3 * twin:.12g}", "*Solid Section, elset=BAR, material=M", "*Mass, elset=PM",
+              f"{0.002 * twin:.12g}", "*Boundary", "ROOT, 1, 3", "*Amplitude, name=RAMP", "0., 0., 0.05, 1.",
+              "*Step, nlgeom=YES", "*Dynamic, Explicit", ", 0.05"] + ([card] if card else [])
+    lines += ["*Dload", f"BAR, GRAV, {9810.0 / twin:.12g}, 0., 0., -1.", f"PM, GRAV, {9810.0 / twin:.12g}, 0., 0., -1.",
+              "*Cload, amplitude=RAMP", "TIP, 2, 0.5", "*Node print, nset=TIP", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
 
 
 def material_card_deck(kind, twin=False):
@@ -13318,6 +13343,59 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  elcopy_reflect (a C3D8 cube and its *ELCOPY, REFLECT mirror, "
               f"pulled apart): the copy as written out ({err:.1e} apart) and mirroring the cube "
               f"({mirror:.1e}; ux {got[2][0]:.6g}; before: ccx stopped)")
+    failures += 0 if ok else 1
+
+    # --- explicit mass scaling ------------------------------------------------------------
+    def explicit_run(text, tag, approximate=False):
+        """(tip displacements printed, the increment ccx selected, its output) of ``text``
+        converted and solved, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        convert(src, inp, approximate=approximate)
+        d, status, out = run_ccx(ccx, env, inp)
+        hist = dat_displacement_history(os.path.join(d, "job.dat"), 20) if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        inc = re.search(r"SELECTED time increment[^:]*:\s*(\S+)", out)
+        if not hist or not inc:
+            print(f"FAIL  {tag}: no results ({status})")
+            return None
+        return hist, float(inc.group(1)), out
+
+    # *FIXED MASS SCALING, FACTOR=100 on the whole model (it was dropped: ccx ran the true mass
+    # at a 10x smaller increment): every printed increment as the twin with the densities and
+    # the *MASS 100x and gravity / 100 written by hand (Abaqus' gravity keeps the true mass),
+    # and ccx's increment 10 (sqrt 100) times the true mass's
+    runs = [explicit_run(explicit_mass_deck(*a), tag) for a, tag in (
+        (("*Fixed Mass Scaling, factor=100.",), "explicit_mass_factor"),
+        (("", 100.0), "explicit_mass_factor_ref"), (("",), "explicit_mass_factor_true"))]
+    ok = all(runs)
+    if ok:
+        (got, inc, _), (ref, inc_ref, _), (_, inc_true, _) = runs
+        tip = max(abs(x) for x in ref[-1])
+        err = max(abs(a - b) for u, v in zip(got, ref) for a, b in zip(u, v)) / tip
+        grow = inc / inc_true
+        ok = len(got) == len(ref) > 2 and err < 1e-9 and tip > 1e-3 and abs(grow - 10.0) < 1e-6 and inc == inc_ref
+        print(f"{'PASS' if ok else 'FAIL'}  explicit_mass_factor (C3D8 bar with a point mass, gravity and a "
+              f"ramped tip load, *FIXED MASS SCALING, FACTOR=100): {len(got)} printed increments as the "
+              f"twin scaled by hand ({err:.1e} of the tip's {tip:.4g} apart), increment {inc:.6g} = "
+              f"{grow:.6g} x the true mass's {inc_true:.6g}")
+    failures += 0 if ok else 1
+
+    # DT, TYPE=BELOW MIN (target increment 1e-3, 2.2x the bar's stable one): under
+    # --approximate ccx's selective mass scaling with DT as the minimum increment, which ccx
+    # then runs at; without it the card is dropped (the true mass's increment)
+    runs = [explicit_run(explicit_mass_deck("*Fixed Mass Scaling, dt=1e-3"), "explicit_mass_dt" + tag, approx)
+            for tag, approx in (("_approx", True), ("", False))]
+    ok = all(runs)
+    if ok:
+        (hist, inc, out), (_, inc_plain, _) = runs
+        tip = max(abs(x) for x in hist[-1])
+        ok = abs(inc / 1e-3 - 1) < 1e-9 and "Selective Mass Scaling is active" in out and \
+            tip > 1e-3 and inc_plain < 0.5e-3 and "Selective Mass Scaling" not in runs[1][2]
+        print(f"{'PASS' if ok else 'FAIL'}  explicit_mass_dt (the bar, *FIXED MASS SCALING, DT=1e-3, "
+              f"--approximate): ccx's selective mass scaling, increment {inc:.6g} (without "
+              f"--approximate {inc_plain:.6g}), tip moved {tip:.4g}")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

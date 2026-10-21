@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Explicit mass scaling** — `*FIXED MASS SCALING, FACTOR=f` on the whole model, the same in
+  every explicit step, was dropped (ccx ran the true mass, at a sqrt(f) smaller increment); its
+  densities, `*MASS` values and rotary inertias now go out f times larger and its specific heats
+  and GRAV magnitudes f times smaller (Abaqus' gravity and thermal response keep the true mass):
+  Abaqus' scaled mass matrix. A target increment `DT` (`TYPE=BELOW MIN`) becomes ccx's selective
+  mass scaling under `--approximate`; the other forms stay dropped, with the reason.
+
 ## 1.5.0 (October 2026)
 
 Steps read through one step model, with one rule each for NLGEOM, step time and an unterminated

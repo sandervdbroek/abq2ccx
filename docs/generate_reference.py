@@ -180,6 +180,14 @@ TRANSLATED = {
         "surface, which ccx 2.23 leaves out of its stable increment (the contact bounces): ccx's "
         "contact formula with the slave nodes' masses, times 0.8. A fixed `DIRECT` increment "
         "above a cap is warned.",
+    "*FIXED MASS SCALING / *VARIABLE MASS SCALING": "commented out. `FACTOR=f` on the whole model, "
+        "the same in every explicit step → densities, `*MASS` values and rotary inertias f times "
+        "larger, specific heats and GRAV magnitudes f times smaller (Abaqus' gravity and thermal "
+        "response keep the true mass): Abaqus' scaled mass matrix. A target increment `DT` "
+        "(`TYPE=BELOW MIN`) → with `--approximate` ccx's selective mass scaling (`DT` the step's "
+        "minimum increment). Otherwise (part of the model, a factor that changes between steps, "
+        "`TYPE=UNIFORM` / `SET EQUAL DT` with `DT`, `ROLLING`) a numerical control: ccx runs the "
+        "true mass.",
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes). "
         "The step's `*CLOAD` / `*DLOAD` / `*DSLOAD` are commented out: Abaqus ignores them.",
@@ -206,7 +214,8 @@ TRANSLATED = {
         "such a step (no `AMPLITUDE`), or a BC that `*BOUNDARY, OP=NEW` releases there, is warned: "
         "ccx's HHT integration overshoots the jump by 5 % at the first increment.",
     "*MASS": "passed through; in a deck with a transient `*COUPLED TEMPERATURE-DISPLACEMENT` step "
-        "divided by 10³⁰ with the densities (see there). `TYPE=ANISOTROPIC` (ccx 2.23 has none) → "
+        "divided by 10³⁰ with the densities (see there), times an explicit `*FIXED MASS SCALING` "
+        "factor (see there). `TYPE=ANISOTROPIC` (ccx 2.23 has none) → "
         "the smallest principal mass on the node, the rest per principal axis on new nodes that "
         "`*EQUATION`s tie to it along that axis (exact; reduced physics under `NLGEOM` at a node "
         "with rotations, whose axes Abaqus turns, and where the `ORIENTATION`'s axes are unknown: "

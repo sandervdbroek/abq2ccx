@@ -15007,6 +15007,156 @@ def test_coupled_inertia_scales_the_converter_made_masses():
     _, conv, rep = convert_str(COUPLED_HEX + beam.replace("DENSITY=7.8e-9", "DENSITY=RHO") + COUPLED_STEP)
     assert conv._mass_scale is None and "cannot read *BEAM GENERAL SECTION, DENSITY=RHO" in rep.text()
 
+EXPLICIT_HEX = HEX + """*ELEMENT, TYPE=MASS, ELSET=PM
+9, 8
+*NSET, NSET=BOT
+1, 2, 3, 4
+*MATERIAL, NAME=M
+*ELASTIC
+1000., 0.3
+*DENSITY
+7.8e-9, 20.
+7.7e-9, 520.
+*SPECIFIC HEAT
+4.6e8
+*SOLID SECTION, ELSET=EALL, MATERIAL=M
+*MASS, ELSET=PM
+0.002
+*BOUNDARY
+BOT, 1, 3
+"""
+
+
+def _explicit_steps(*cards):
+    """One *DYNAMIC, EXPLICIT step per entry of ``cards`` (the step's mass scaling cards),
+    each under gravity on the brick and the point mass."""
+    return "".join(f"*STEP\n*DYNAMIC, EXPLICIT\n, 0.01\n{c}*DLOAD\nEALL, GRAV, 9810., 0., 0., -1.\n"
+                   f"PM, GRAV, 9810., 0., 0., -1.\n*END STEP\n" for c in cards)
+
+
+def test_explicit_mass_scaling_factor_scales_the_masses():
+    # *FIXED MASS SCALING, FACTOR=f scales the original mass of every element, *MASS ones
+    # too; gravity loads and the thermal response keep the true mass (Abaqus 2017 "Mass
+    # scaling"): the densities and *MASS values go out f times larger, the specific heats and
+    # GRAV magnitudes f times smaller; the card is commented out, the deck's physics kept
+    body, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps("*FIXED MASS SCALING, FACTOR=100.\n"))
+    assert conv._mass_scale == 0.01 and not conv.reduced_physics
+    assert _card(body, "*DENSITY") == ["7.8e-07, 20.", "7.7e-07, 520."]
+    assert _card(body, "*SPECIFIC HEAT") == ["4600000"] and _card(body, "*MASS, ELSET=PM") == ["0.2"]
+    st = _step(body, 1)
+    assert "*DLOAD\nEALL, GRAV, 98.1, 0., 0., -1.\nPM, GRAV, 98.1, 0., 0., -1.\n" in st
+    assert "** *FIXED MASS SCALING, FACTOR=100." in st and "\n*FIXED MASS SCALING" not in body
+    assert "*DYNAMIC, EXPLICIT\n, 0.01\n" in st
+    assert "FACTOR=100 (Abaqus/Explicit: the original mass of every element" in rep.text()
+    assert "stable increment 10 times larger" in rep.text()
+    # the converter's estimate of ccx's increment (explicit output frequencies) sees the
+    # densities as written: sqrt(f) times larger
+    out = "*OUTPUT, FIELD, NUMBER INTERVAL=2\n*NODE OUTPUT\nU\n"
+    freq = [int(re.search(r"\*NODE FILE, FREQUENCY=(\d+)", convert_str(EXPLICIT_HEX + _explicit_steps(
+        c + out))[0]).group(1)) for c in ("", "*FIXED MASS SCALING, FACTOR=100.\n")]
+    assert freq[0] > 20 and abs(freq[0] / freq[1] - 10.0) < 0.5
+    # the masses the converter makes: a *BEAM GENERAL SECTION's DENSITY= and the point masses
+    # that carry a rigid body's rotary inertia
+    beam = ("*NODE\n20, 3., 0., 0.\n21, 4., 0., 0.\n*ELEMENT, TYPE=B31, ELSET=EB\n11, 20, 21\n"
+            "*BEAM GENERAL SECTION, ELSET=EB, SECTION=RECT, DENSITY=7.8e-9\n0.1, 0.1\n0., 1., 0.\n"
+            "210000., 80769.\n")
+    stars = ("*NODE\n100, 0.5, 0.5, 2.\n*ELEMENT, TYPE=MASS, ELSET=EM\n30, 100\n"
+             "*ELEMENT, TYPE=ROTARYI, ELSET=ER\n31, 100\n*NSET, NSET=RP\n100\n*NSET, NSET=TOP\n5, 6, 7, 8\n"
+             "*RIGID BODY, REF NODE=RP, TIE NSET=TOP\n*MASS, ELSET=EM\n0.01\n*ROTARY INERTIA, ELSET=ER\n1., 2., 3.\n")
+    scaled = []
+    for f in ("", "*FIXED MASS SCALING, FACTOR=100.\n"):
+        body, conv, _ = convert_str(EXPLICIT_HEX + beam + stars + _explicit_steps(f))
+        scaled.append((float(_card_at(body.split("*MATERIAL, NAME=ABQ2CCX_RECT_MATERIAL")[1], "*DENSITY")[0]),
+                       [float(m) for m in re.findall(r"\*MASS, ELSET=ABQ2CCX_STAR\d+\n(\S+)\n", body)]))
+    assert scaled[0][1] and abs(scaled[1][0] / scaled[0][0] - 100.0) < 1e-9
+    assert all(abs(b / a - 100.0) < 1e-9 for a, b in zip(scaled[0][1], scaled[1][1]))
+    # the force-free skins of rigid elements: 1e-9 of the deck's density, scaled with it (their
+    # wave speed stays 1e-3 of the model's)
+    plate = ("*NODE\n11, 0., 0., -1.\n12, 1., 0., -1.\n13, 1., 1., -1.\n14, 0., 1., -1.\n19, 0.5, 0.5, -2.\n"
+             "*ELEMENT, TYPE=R3D4, ELSET=PLATE\n21, 11, 12, 13, 14\n*RIGID BODY, REF NODE=19, ELSET=PLATE\n"
+             "*BOUNDARY\n19, 1, 6\n")
+    skins = [_card_at(convert_str(EXPLICIT_HEX + plate + _explicit_steps(f))[0].split(
+        "*MATERIAL, NAME=ABQ2CCX_RIGID")[1], "*DENSITY") for f in ("", "*FIXED MASS SCALING, FACTOR=100.\n")]
+    assert skins == [["7.8e-18"], ["7.8e-16"]]
+
+
+def test_explicit_mass_scaling_over_steps():
+    # the scaled masses carry into the later steps, and a later card scales the original
+    # masses again: ccx has one density for all steps, so a factor that changes (also back to
+    # the true mass: a card without FACTOR and DT) or starts after the first step is not
+    # converted (ccx runs the true mass, as before); the same factor again is
+    fms = "*FIXED MASS SCALING, FACTOR=100.\n"
+    for steps, ok in (((fms, ""), True), ((fms, fms), True), ((fms, "*FIXED MASS SCALING\n"), False),
+                      (("", fms), False), ((fms, "*FIXED MASS SCALING, FACTOR=10.\n"), False)):
+        body, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps(*steps))
+        assert (conv._mass_scale == 0.01) == ok, steps
+        assert ("7.8e-07, 20." in body) == ok and ("98.1" in body) == ok, steps
+        assert ("the factor changes between steps" in rep.text()) != ok, steps
+        assert not conv.reduced_physics
+    assert "factor changes between steps (100 in step 1, 1 in step 2), and ccx has one density" in rep.text() \
+        .replace("10 in step 2", "1 in step 2")
+    # outside an explicit step the card is not Abaqus/Explicit's: dropped with the reason
+    body, conv, rep = convert_str(EXPLICIT_HEX + fms + _explicit_steps(""))
+    assert conv._mass_scale is None and "outside a step" in rep.text()
+    body, conv, rep = convert_str(EXPLICIT_HEX + f"*STEP\n*DYNAMIC\n0.001, 0.01\n{fms}*END STEP\n")
+    assert conv._mass_scale is None and "which is no *DYNAMIC, EXPLICIT step" in rep.text()
+    assert "so ccx runs the true mass" in rep.text()
+
+
+def test_explicit_mass_scaling_element_set():
+    # an ELSET holding every element with mass (sections, *MASS, *ROTARY INERTIA) scales the
+    # whole model's; part of it would need per-element densities: not converted
+    sets = "*ELSET, ELSET=ALL\n1, 9\n*ELSET, ELSET=SOME\n1\n"
+    body, conv, rep = convert_str(EXPLICIT_HEX + sets + _explicit_steps("*FIXED MASS SCALING, FACTOR=4., ELSET=ALL\n"))
+    assert conv._mass_scale == 0.25 and _card(body, "*MASS, ELSET=PM") == ["0.008"]
+    body, conv, rep = convert_str(EXPLICIT_HEX + sets + _explicit_steps("*FIXED MASS SCALING, FACTOR=4., ELSET=SOME\n"))
+    assert conv._mass_scale is None and _card(body, "*MASS, ELSET=PM") == ["0.002"]
+    assert "ELSET=SOME scales the mass of part of the model" in rep.text()
+    # a *VARIABLE MASS SCALING on part of the model keeps only its own DT from converting
+    body, conv, rep = convert_str(EXPLICIT_HEX + sets + _explicit_steps(
+        "*FIXED MASS SCALING, FACTOR=4.\n*VARIABLE MASS SCALING, DT=1e-4, FREQUENCY=1, ELSET=SOME\n"),
+        approximate=True)
+    assert conv._mass_scale == 0.25 and not conv._sms_target
+    assert "*VARIABLE MASS SCALING: explicit mass scaling (artificial mass) not converted: ELSET=SOME" in rep.text()
+    for bad, why in (("FACTOR=<F>", "FACTOR=<F> does not read as a number"), ("FACTOR=0.", "FACTOR=0. is not positive")):
+        _, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps(f"*FIXED MASS SCALING, {bad}\n"))
+        assert conv._mass_scale is None and why in rep.text(), bad
+
+
+def test_explicit_mass_scaling_target_increment():
+    # DT, TYPE=BELOW MIN (the default) scales the elements whose stable increment is below DT:
+    # dropped as a numerical control (ccx runs the true mass, or the masses FACTOR scales),
+    # or with --approximate ccx's selective mass scaling, DT the step's minimum increment
+    # (3rd field), [APPROX]; TYPE=UNIFORM / SET EQUAL DT with DT and DIRECT USER CONTROL not
+    dt = "*FIXED MASS SCALING, DT=1e-4\n"
+    body, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps(dt))
+    assert conv._mass_scale is None and not conv._sms_target and "*DYNAMIC, EXPLICIT\n, 0.01\n" in body
+    assert "(--approximate: ccx's selective mass scaling); commented out, so ccx runs the true mass" in rep.text()
+    body, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps(dt, ""), approximate=True)
+    assert conv._sms_target == {1: 1e-4, 2: 1e-4}
+    assert _step(body, 1).count("*DYNAMIC, EXPLICIT\n, 0.01, 0.0001\n") == 1
+    assert "*DYNAMIC, EXPLICIT\n, 0.01, 0.0001\n" in _step(body, 2)
+    assert "[APPROX] explicit mass scaling to a target increment DT" in rep.text()
+    assert any("explicit mass scaling to a target increment" in r for r in conv.reduced_physics)
+    # a *VARIABLE MASS SCALING without DT ends the one before; the masses it scaled carry on
+    var = "*VARIABLE MASS SCALING, DT=2e-4, TYPE=BELOW MIN, FREQUENCY=10\n"
+    body, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps(
+        "*FIXED MASS SCALING, FACTOR=100.\n" + var, "*VARIABLE MASS SCALING\n"), approximate=True)
+    assert conv._mass_scale == 0.01 and conv._sms_target == {1: 2e-4, 2: 2e-4}
+    body, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps("*FIXED MASS SCALING, FACTOR=100.\n" + var))
+    assert conv._mass_scale == 0.01 and not conv._sms_target
+    assert "*VARIABLE MASS SCALING: explicit mass scaling (artificial mass) not converted" in rep.text()
+    assert "so ccx runs the masses scaled by FACTOR=100." in rep.text()
+    for card, why in (("*FIXED MASS SCALING, DT=1e-4, TYPE=UNIFORM\n", "TYPE=UNIFORM scales every element"),
+                      ("*FIXED MASS SCALING, DT=1e-4, TYPE=SET EQUAL DT\n", "TYPE=SET EQUAL DT scales every"),
+                      ("*VARIABLE MASS SCALING, TYPE=ROLLING, FREQUENCY=1\n", "TYPE=ROLLING needs Abaqus'")):
+        body, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps(card), approximate=True)
+        assert not conv._sms_target and why in rep.text() and "0.0001\n" not in body, card
+    body, conv, rep = convert_str((EXPLICIT_HEX + _explicit_steps(dt)).replace(
+        "*DYNAMIC, EXPLICIT\n, 0.01", "*DYNAMIC, EXPLICIT, DIRECT USER CONTROL\n1e-5, 0.01"), approximate=True)
+    assert not conv._sms_target and "has a fixed increment (DIRECT USER CONTROL)" in rep.text()
+
+
 # --- rigid elements and analytical rigid surfaces ---------------------------------------
 
 RIGID_PLATE = """*NODE
