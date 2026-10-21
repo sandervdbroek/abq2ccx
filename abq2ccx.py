@@ -4209,6 +4209,9 @@ ALL_NODES_SET = "ABQ2CCX_ALL_NODES"
 # Element set (and material) of the force-free "knot beams" that make the shell/beam nodes
 # of a rigid coupling ccx knots — see Converter._plan_rigid_couplings.
 KNOT_SET = "ABQ2CCX_KNOT"
+# Element set of the zero-stiffness springs that let ccx move point masses on nodes of no other
+# element — see Converter._plan_free_masses.
+FREE_MASS_SET = "ABQ2CCX_FREE_MASS"
 # Abaqus rigid elements; ccx has none.  Each becomes a force-free *skin* that its rigid body
 # carries (see Converter._plan_rigid): a facet (R3D3, R3D4) a thin C3D6 / C3D8 one of whose
 # faces is the facet, a plane segment (R2D2, RB2D2) a C3D8 through the model's thickness, an
@@ -10468,17 +10471,128 @@ class _Mesh:
                                  f"body force is missing.", once=True)
                 self._reduces("body force on the extra principal masses of an anisotropic *MASS")
 
+    def _plan_free_masses(self, blocks: List[Block]) -> None:
+        """Nodes on MASS elements only that no constraint ties to anything, in a deck with a
+        *DYNAMIC step: ccx 2.23 never moves such a node (probed: a point mass pushed in
+        *DYNAMIC, implicit or explicit, plain or NLGEOM, stays at u = 0 without a message; an
+        *EQUATION term or any other element on it makes it move).  Where every mechanical step
+        is a *DYNAMIC one, each gets a SPRINGA of zero stiffness to a new node g held by
+        one-term *EQUATIONs (_free_mass_rows): it adds nothing, and the mass moves (probed:
+        exact).  Elsewhere the zero stiffness would make a static or eigenvalue step singular
+        (probed: a *STATIC step stops ccx, exit 255): warned, reduced physics.  g takes the
+        node's temperatures, and where a step solves for them T_g = T_n."""
+        if not self._mechanical or not self.steps.dynamic:
+            return
+        kinds: Dict[int, set] = {}
+        for typ, conn in self.geom.elements.values():
+            for n in conn:
+                kinds.setdefault(n, set()).add(typ.upper())
+        free = sorted(n for n, ts in kinds.items() if ts == {"MASS"} and n in self.geom.nodes)
+        if free:
+            tied = self._constrained_nodes(blocks)
+            free = [n for n in free if n not in tied]
+        if not free:
+            return
+        if any(st.proc != "DYNAMIC" for st in self.steps if st.proc):
+            self.report.warn(f"{len(free)} node(s) on MASS elements only that no constraint ties to "
+                             f"anything (e.g. node {free[0]}): ccx 2.23 never moves such a node in a "
+                             f"*DYNAMIC step (probed: u = 0, no message), and the converter's cure, a "
+                             f"zero-stiffness spring, would make this deck's other steps singular — "
+                             f"their point masses stand still in ccx.", once=True)
+            self._reduces("point masses on nodes of no other element stand still in *DYNAMIC steps")
+            return
+        span = self._model_span()
+        nid, eid = self._next_ids()
+        elems = []
+        for n in free:
+            nid += 1
+            eid += 1
+            self.geom.add_node(nid, vadd(self.geom.nodes[n], (span, 0.0, 0.0)))
+            self.geom.add_element(eid, "SPRINGA", [n, nid])
+            elems.append(eid)
+            self._free_mass_rows += [[(nid, k, 1.0)] for k in (1, 2, 3)]
+            self._tied_nodes.append((n, n, nid, 0.0))
+            if self._mpc_thermal:
+                self._free_mass_rows.append([(nid, 11, 1.0), (n, 11, -1.0)])
+        self.geom.add_to_elset(FREE_MASS_SET, elems)
+        self.report.note(f"{len(free)} node(s) on MASS elements only that no constraint ties to "
+                         f"anything (e.g. node {free[0]}) got a SPRINGA of zero stiffness (elset "
+                         f"{FREE_MASS_SET}) to a new held node: ccx 2.23 never moves a node of MASS "
+                         f"elements only in *DYNAMIC (probed), with the spring it does — exact.")
+
+    def _warn_driven_dashpots(self, blocks: List[Block]) -> None:
+        """Dashpots on a node that a displacement BC moves in a *DYNAMIC step (or that an
+        *EQUATION, or the converter's DASHPOT2 form, ties to one): ccx 2.23 damps as if that
+        node stood still (probed: a mass dragged through a DASHPOTA by a node moving at constant
+        speed moved 0.19 where 0.285 is right, also through an *EQUATION; force-driven nodes are
+        right).  No form of the deck avoids it: warned, reduced physics."""
+        if not self.steps.dynamic:
+            return
+        ends = {n for typ, conn in self.geom.elements.values() if typ.upper() == "DASHPOTA" for n in conn}
+        if not ends:
+            return
+        partners: Dict[int, set] = {}
+        rows = [rw for rw in self._dashpot_rows] + [
+            [(n, 0, 0.0) for node, _d, _c in eq for n in self._resolve_nodes(node)]
+            for b in blocks if b.keyword == "EQUATION" for eq in self._expanded_equations(b)[0]]
+        for rw in rows:
+            ns = {t[0] for t in rw}
+            for n in ns:
+                partners.setdefault(n, set()).update(ns)
+        reach = ends | {m for n in ends for m in partners.get(n, ())}
+        driven: List[int] = []
+        for st in self.steps:
+            if st.proc != "DYNAMIC":
+                continue
+            for c in st.cards:
+                if c.keyword != "BOUNDARY":
+                    continue
+                moving = c.uparam("TYPE") in ("VELOCITY", "ACCELERATION")
+                for ns, ds, v in self._bc_records(c, rot=False):
+                    if (moving or v != 0.0) and any(d <= 3 for d in ds):
+                        driven += [n for n in ns if n in reach]
+        if driven:
+            self.report.warn(f"Dashpot(s) on {len(set(driven))} node(s) that a displacement BC moves "
+                             f"in a *DYNAMIC step, or tied to one (e.g. node {min(driven)}): ccx 2.23 "
+                             f"damps as if such a node stood still (probed: 0.19 of motion where "
+                             f"0.285 is right), so the dashpot force misses its velocity.", once=True)
+            self._reduces("dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)")
+
+    def _constrained_nodes(self, blocks: List[Block]) -> set:
+        """Nodes that a constraint ccx assembles as an MPC names (any term of a deck's *EQUATION,
+        its *MPC / rigid body / coupling / *TIE nodes, connector ends, the converter's own
+        reference and ROT nodes, the nodes its equations tie): ccx 2.23 solves for their DOFs
+        whatever elements they are on."""
+        out = set(self._planar_held_nodes(blocks)) | set(self._ref_nodes) | set(self._rb_rot) | \
+            set(self._rb_rot.values()) | set(self._qmem_copies.values())
+        for b in blocks:
+            if b.keyword == "EQUATION":
+                for eq in self._expanded_equations(b)[0]:
+                    for node, _d, _c in eq:
+                        out.update(self._resolve_nodes(node))
+            elif b.keyword == "RIGID BODY":
+                for k in ("REF NODE", "ROT NODE"):
+                    if (b.param(k) or "").strip():
+                        out.update(self._resolve_nodes(b.param(k).strip()))
+        for _t, a, c in self._conn.values():
+            out.update(n for n in (a, c) if n is not None)
+        for rows in (self._dashpot_rows, self._spring_rows, self._amass_rows):
+            out.update(t[0] for rw in rows for t in rw)
+        return out
+
     def _dashpot_lines(self) -> List[str]:
         """The *EQUATIONs that keep each DASHPOT1 / DASHPOT2's new node on its line
         (_plan_dashpots), tie the springs' nodes on transformed nodes (_plan_transformed_springs)
         and the anisotropic masses' (_plan_anisotropic_masses)."""
-        out: List[str] = []
+        out: List[str] = [f"*SPRING, ELSET={FREE_MASS_SET}", "0."] if self._free_mass_rows else []
         for rows, what in ((self._dashpot_rows, "DASHPOT1 / DASHPOT2 -> DASHPOTA to a new node kept on "
                                                 "the DOF's line"),
                            (self._spring_rows, "SPRING1 / SPRING2 on a transformed node -> on a new node "
                                                "tied to its local DOF"),
                            (self._amass_rows, "*MASS, TYPE=ANISOTROPIC -> principal masses on new nodes "
-                                              "tied along their axes")):
+                                              "tied along their axes"),
+                           (self._free_mass_rows, "point masses on nodes of no other element: a zero "
+                                                  "spring to a held node (ccx moves them only so)")):
             if rows:
                 out += ["** abq2ccx: " + what] + self._twin_lines(rows) + self._equation_lines(rows)
         return out
@@ -15043,8 +15157,6 @@ class _Mesh:
                                    for a in local(conn[8]) or unit], [conn[8]])
             self._qmem[e] = (QUAD_MEMBRANE_SOLID[typ.upper()],
                              bot[:nc] + top[:nc] + bot[nc:] + top[nc:] + mids)
-        self._qmem_axes = {n: ax for n in set(self._qmem_copies.values()) for ax in [local(n)]
-                           if ax and not isinstance(ax, str)}
         self._qmem_eq = rows
         for why, ids in left.items():
             kinds = ", ".join(sorted({els[e][0].upper() for e in ids}))
@@ -15214,9 +15326,10 @@ class _Mesh:
     def _qmem_records(self, b: Block, layout: str) -> List[str]:
         """Extra data lines that carry a per-node *TEMPERATURE / *INITIAL CONDITIONS value
         onto the nodes of the quadratic membranes written as solids: each takes its membrane
-        node's (``layout`` "field": node, values...; "dof": node, DOF, value, turned into the
-        global axes where the membrane node has a *TRANSFORM — the solids' nodes have none).
-        Appended after the card's own lines; boundary conditions never reach these nodes."""
+        node's (``layout`` "field": node, values...; "dof": node, DOF, value — initial
+        velocities, in global axes on any node, as both programs read them; Keywords Reference
+        *INITIAL CONDITIONS, probed on 2.23).  Appended after the card's own lines; boundary
+        conditions never reach these nodes."""
         if not self._qmem_copies or layout not in ("field", "dof"):
             return []
         recs: Dict[int, Dict[int, object]] = {}
@@ -15238,11 +15351,6 @@ class _Mesh:
                 continue
             if layout == "field":
                 out.append(", ".join([str(m)] + ["%.12g" % x for x in r[0]]))
-            elif n in self._qmem_axes and any(d in r for d in (1, 2, 3)):
-                ax = self._qmem_axes[n]
-                g = [sum(float(r.get(k + 1, 0.0)) * ax[k][i] for k in range(3)) for i in range(3)]
-                out += [f"{m}, {i + 1}, {g[i]:.12g}" for i in range(3)]
-                out += [f"{m}, {d}, {float(v):.12g}" for d, v in sorted(r.items()) if d not in (1, 2, 3)]
             else:
                 out += [f"{m}, {d}, {float(v):.12g}" for d, v in sorted(r.items())]
         if out:
@@ -17737,13 +17845,20 @@ class _Rigid:
         """Model-data BCs that keep the 3-D rigid bodies of plane rigid elements in their
         plane, as Abaqus' plane bodies are: reference node DOF 3 and ROT NODE DOFs 1-2
         (rotations about x and y) held — repeated after *BOUNDARY, OP=NEW, which removes
-        them (see handle_boundary)."""
+        them (see handle_boundary).  Likewise a kinematic coupling of plane elements' nodes
+        written as a rigid body with a beam reference node ("rb", _coupling_as_rigid_body):
+        that node's DOFs 3-5, which its ROT NODE follows (probed: the node drifted out of the
+        plane, u3 0.035, the plane motion exact; held, u3 0 and the same plane motion)."""
         lines = []
         for ref in dedup(self._rigid_planar_refs):
             rot = self._rb_rot.get(ref)
             lines.append(f"{ref}, 3, 3")
             if rot is not None:
                 lines.append(f"{rot}, 1, 2")
+        if not any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values()):
+            lines += [f"{p['ref']}, 3, 5" for p in self._coupling_plan.values() if p.get("kind") == "rb"
+                      and p["members"] and p["ref"] not in self._transformed and
+                      all(n in self._plane_only for n in p["members"])]
         self._rigid_planar_bc = ["*BOUNDARY"] + lines if lines else []
 
     def _rigid_model_cards(self) -> List[str]:
@@ -23552,7 +23667,10 @@ class _Dofs:
 
         * on a shell/beam node that is not a knot each becomes a mean-rotation MPC about the
           local axis (gen3dboun / gen3dforc use the transformation): exact for one local
-          rotation per node; with several, usermpc can pick a dependent twice ('zero
+          rotation per node, on a beam only about a section axis (n1, n2, the beam axis:
+          _on_section_axis; about another the corners' angles pick up the rotations about the
+          others, probed: a tip moment about a local axis 30 deg off n1 4x off, silently);
+          with several, usermpc can pick a dependent twice ('zero
           coefficient on the dependent side'; 1.5-156 % off on a beam) — not on a shell,
           whose rotational BCs make two such MPCs at most (but where two hold rotations about
           axes off the normal, ccx holds both in-plane rotations: _plan_shell_rotation_pairs);
@@ -23569,7 +23687,8 @@ class _Dofs:
           as on the rigidly rotated model (probed).
 
         So a beam node keeps its lines where ccx makes it no knot and one local rotation
-        carries all its BCs and moments (no *DYNAMIC step); otherwise it gets a knot beam
+        about a section axis carries all its BCs and moments (no *DYNAMIC step); otherwise it
+        gets a knot beam
         (none in a deck with an explicit step, which stops on them) and the global form.  A
         shell node keeps them where it is no knot (no *DYNAMIC step), takes the global form on
         a knot, and is refused otherwise (a dangling knot beam leaves a shell's drilling
@@ -23623,7 +23742,8 @@ class _Dofs:
                 many = {d for _, _, items in cards for d, _ in items.get(n, ())}
                 if knot is True:
                     mode = "global"
-                elif knot is False and not dynamic and len(many) == 1 and n not in circ:
+                elif knot is False and not dynamic and len(many) == 1 and n not in circ and \
+                        self._on_section_axis(n, axes[min(many) - 4], at.get(n, ())):
                     mode = "keep"
                 elif self._explicit_deck:
                     mode = "keep" if trivial else "refuse"
@@ -24368,6 +24488,17 @@ class _Dofs:
                                  f"moment preload on a knot otherwise than through its mean-rotation "
                                  f"MPCs (probed: a cantilever's buckling factors 3.5x those of the "
                                  f"axis-aligned one under a tip-moment preload) — verify.", once=True)
+
+    def _on_section_axis(self, n: int, axis: Vec, elems: Sequence[int]) -> bool:
+        """Whether ``axis`` lies within _AXIS_TOL of a section axis (n1, n2, the beam axis) that
+        ccx 2.23 gives beam node ``n`` of the beams among ``elems`` (_beam_section_frame);
+        False where those are unknown (*NORMAL cards, a beam's n1)."""
+        beams = [e for e in elems if e in self.geom.elements and
+                 ccx_type(self.geom.elements[e][0]) in ("B31", "B31R", "B32", "B32R")]
+        frame = None if self._has_normal or not beams else self._beam_section_frame(n, beams)
+        size = vnorm(axis)
+        return frame is not None and size > 0 and any(
+            1.0 - abs(vdot(axis, f)) / size < 0.5 * self._AXIS_TOL ** 2 for f in frame)
 
     @classmethod
     def _along_axis(cls, v: Vec) -> bool:
@@ -25592,8 +25723,83 @@ class _Constraints:
         if out:
             self.report.note("*KINEMATIC COUPLING -> node-surface *COUPLING + *KINEMATIC per set of "
                              "coupled DOFs (ccx 2.23 stops on two couplings of one node).", once=True)
+        if sum(1 for ln in out if ln.startswith("*COUPLING")) > 1:
+            self._warn_split_couplings(ref, 1)
         return (out + ties) or self._commented(b, "*KINEMATIC COUPLING couples no translational "
                                                   "DOF; dropped.")
+
+    def _plan_shared_ref_couplings(self, blocks: List[Block]) -> None:
+        """*COUPLING + *KINEMATIC cards on one reference node: Abaqus moves all their nodes with
+        that node as one rigid body, ccx 2.23 turns each coupling about a rotation of its own
+        (probed: a bar end coupled as nodes 3, 6, 9 and node 12 apart moved 1-2 % off one
+        coupling of all four; two that share a node stop ccx, exit 255).  Where they couple the
+        same DOFs (DOFs 4-6 count on members with rotations only) in the same axes, they become
+        one: the first card on a node surface of all their nodes (each card's own,
+        _coupling_nodes: within its INFLUENCE RADIUS), the other cards left out — exact.
+        Otherwise warned, reduced physics."""
+        pairs = [(i, b) for i, b in enumerate(blocks) if b.keyword == "COUPLING" and
+                 i + 1 < len(blocks) and blocks[i + 1].keyword == "KINEMATIC"]
+        by_ref: "OrderedDict[int, List[Tuple[int, Block]]]" = OrderedDict()
+        for i, b in pairs:
+            ref = self._ref_node(b)
+            if ref is not None:
+                by_ref.setdefault(ref, []).append((i, b))
+        gone: set = set()
+        inserts: List[Tuple[int, Block]] = []
+        mixed: List[int] = []
+        for ref, group in by_ref.items():
+            if len(group) < 2:
+                continue
+            members = [[n for n in self._coupling_nodes(b)[0] if n != ref] for _, b in group]
+            span = set(range(1, 7)) if any(n in self._rot_nodes for ms in members for n in ms) \
+                else {1, 2, 3}
+            sets = []
+            for i, _b in group:
+                ds: set = set()
+                try:
+                    for rec in merged_data_records(blocks[i + 1]):
+                        g = trimmed_fields(rec)
+                        if g and g[0]:
+                            lo = pint(g[0])
+                            ds.update(range(lo, (pint(g[1]) if len(g) > 1 and g[1] else lo) + 1))
+                except ValueError:
+                    ds = {0}
+                sets.append(frozenset((ds or set(range(1, 7))) & span | (ds - set(range(1, 7)))))
+            if len(set(sets)) > 1 or len({(b.param("ORIENTATION") or "").strip().upper()
+                                          for _, b in group}) > 1:
+                mixed.append(ref)
+                continue
+            self._reserve_names()
+            name = self._fresh_name(f"ABQ2CCX_REF{ref}_COUPLED")
+            surf = Block("SURFACE", OrderedDict([("NAME", name), ("TYPE", "NODE")]),
+                         [str(n) for n in dedup([n for ms in members for n in ms])])
+            self._register_surface(surf)
+            b0 = group[0][1]
+            b0.params["SURFACE"] = name
+            b0.params.pop("INFLUENCE RADIUS", None)
+            inserts.append((group[0][0], surf))
+            gone.update(x for i, b in group[1:] for x in (id(b), id(blocks[i + 1])))
+            self.report.note(f"{len(group)} *COUPLING + *KINEMATIC cards on reference node {ref} "
+                             f"(e.g.) coupling the same DOFs -> one coupling of all their nodes "
+                             f"(node surface {name}): ccx 2.23 turns each coupling about a rotation "
+                             f"of its own, Abaqus moves them as one body (probed: 1-2 % apart).",
+                             once=True)
+        for i, surf in reversed(inserts):
+            blocks.insert(i, surf)
+        if gone:
+            blocks[:] = [x for x in blocks if id(x) not in gone]
+        if mixed:
+            self._warn_split_couplings(mixed[0], len(mixed))
+
+    def _warn_split_couplings(self, ref: int, count: int) -> None:
+        """Couplings of other DOF sets on one reference node, which ccx 2.23 does not move as one
+        body (_plan_shared_ref_couplings, handle_coupling)."""
+        self.report.warn(f"Kinematic couplings of different DOFs (or axes) on one reference node "
+                         f"({count} node(s), e.g. {ref}): Abaqus moves all their nodes with it as "
+                         f"one rigid body, ccx 2.23 turns each coupling about a rotation of its own "
+                         f"(probed: 1-2 % off one coupling of all the nodes) — verify.", once=True)
+        self._reduces("kinematic couplings of different DOFs on one reference node (ccx turns "
+                      "them apart)")
 
     def _warn_rigid_unsupported(self) -> None:
         """The one rigid-coupling form the knot beams cannot repair (see
@@ -30035,8 +30241,11 @@ class _Constraints:
             return
         if not self._knots:
             # the knot beam carries no load, so its geometry and stiffness only need to be
-            # harmless: short (1 % of the model size), a modulus of the deck's order (keeps
-            # the matrix well scaled), all along one oblique direction (one section card)
+            # harmless: short (1 % of the model size), all along one oblique direction (one
+            # section card), and soft: 1e-6 of the deck's largest modulus.  ccx 2.23's knot
+            # lets the joined sections' size change with the knot beam's own (probed: a stiff
+            # one holds a cantilever's tip section, 1.9e-4 of its axial stretch with the deck's
+            # modulus, 1.7 % at the rigid limit, none from 1e-3 of it down)
             lo = [min(x[k] for x in self.geom.nodes.values()) for k in range(3)]
             hi = [max(x[k] for x in self.geom.nodes.values()) for k in range(3)]
             span = vnorm(vsub((hi[0], hi[1], hi[2]), (lo[0], lo[1], lo[2])))
@@ -30050,7 +30259,7 @@ class _Constraints:
                         moduli.append(pf(recs[0][0]))
                     except (IndexError, ValueError):
                         pass
-            self._knot_e = max([m for m in moduli if m > 0] or [1.0])
+            self._knot_e = 1e-6 * max([m for m in moduli if m > 0] or [1.0])
             # a thermal step needs a conductivity on every element (ccx stops without one)
             if any(b.keyword in CCX_THERMAL_PROCS for b in blocks):
                 ks = []
@@ -31857,7 +32066,9 @@ class _Constraints:
         DYNAMIC step those with a rotational BC, with a modal step of either kind those a
         *CLOAD loads (anywhere: ccx may hold a general step's loads into a modal step,
         _modal_held).  Not in a deck with an explicit step (the massless knot beams stop ccx's
-        explicit solver) or U1 beams (ccx stops on any B31 there): warned."""
+        explicit solver) or U1 beams (ccx stops on any B31 there): warned.  A force on a node of
+        plane / axisymmetric elements is just as wrong there (probed on CPS4), and no knot fits
+        them: warned, reduced physics."""
         procs = {step.proc for step in self.steps}
         modal = procs & {"MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
         if not modal:
@@ -31868,6 +32079,17 @@ class _Constraints:
             if e not in self._u1 and (cc in SHELL_TYPES or (cc in BEAM_TYPES and
                                                             not cc.startswith(("T2D", "T3D")))):
                 expanded.update(conn)
+        plane = {n for typ, conn in self.geom.elements.values()
+                 if ccx_type(typ).startswith(PLANE_ELEM_PREFIXES) for n in conn}
+        loaded = sorted({n for b in blocks if b.keyword == "CLOAD" and plane
+                         for n, _src, _d, v in self._rot_moments(b, plane, (1, 3)) if v})
+        if loaded:
+            self.report.warn(f"*CLOAD on {len(loaded)} node(s) of plane / axisymmetric elements (e.g. "
+                             f"node {loaded[0]}) in a deck with a modal step: ccx 2.23 applies a force on "
+                             f"such a node wrongly in *MODAL DYNAMIC and *STEADY STATE DYNAMICS steps "
+                             f"(probed: 2.7e-7 where its own modes superposed give 2.3e-2), and no knot "
+                             f"fits these elements — check those steps' results.", once=True)
+            self._reduces("concentrated loads on plane-element nodes in modal steps (ccx misapplies them)")
         cand = (expanded & self._rot_nodes) - set(self._knots)
         need: Dict[int, str] = {}               # node -> what needs its knot
         for b in blocks:
@@ -35695,7 +35917,12 @@ class _Loads:
         in this step, or None when they do: always in a small-strain step; under NLGEOM only
         for a traction that keeps its direction (FOLLOWER=NO) and its resultant (CONSTANT
         RESULTANT=YES) — ccx keeps a *CLOAD fixed in direction and magnitude (_loads_nlgeom)."""
-        if not self._loads_nlgeom() or base in ("BX", "BY", "BZ"):
+        return self._nlgeom_load_inexact(b, base) if self._loads_nlgeom() else None
+
+    def _nlgeom_load_inexact(self, b: Block, base: str) -> Optional[str]:
+        """Why nodal forces from the undeformed geometry would not be the load of card ``b``
+        (label ``base``) under NLGEOM, or None (_nodal_load_inexact)."""
+        if base in ("BX", "BY", "BZ"):
             # (a shell body force: per unit undeformed volume and fixed in direction, as ccx
             # applies a solid's BX: _plan_shell_body_forces)
             return None
@@ -35722,6 +35949,51 @@ class _Loads:
             return ("under NLGEOM the traction acts per unit current area (CONSTANT RESULTANT=NO, "
                     "the Abaqus default)")
         return None
+
+    def _warn_carried_tractions(self, blocks: List[Block]) -> None:
+        """A surface traction (TRVEC / TRSHR) of a small-strain step that stays in force into a
+        later step with NLGEOM: Abaqus applies it there as the load it is under NLGEOM (a
+        follower load per current area, unless FOLLOWER=NO, CONSTANT RESULTANT=YES), ccx keeps
+        the earlier step's nodal forces, fixed (_traction_nodal_lines; the step itself writes
+        what it gives again).  Warned, reduced physics."""
+        if not self._nl_any:
+            return
+        active: Dict[Tuple[str, str], Tuple[Block, int]] = {}
+        hit: List[Tuple[int, int]] = []
+        for st in self.steps:
+            if st.perturbation:
+                continue                        # (its loads act in it only)
+            for c in st.cards:
+                if c.keyword not in ("DLOAD", "DSLOAD"):
+                    continue
+                if c.uparam("OP") == "NEW":
+                    active.clear()
+                for rec in merged_data_records(c):
+                    g = trimmed_fields(rec)
+                    label = g[1].upper() if len(g) > 1 else ""
+                    if not re.fullmatch(r"(TRVEC|TRSHR)[1-6]?", label):
+                        continue
+                    try:
+                        zero = not (pf(g[2]) if len(g) > 2 and g[2] else 0.0)
+                    except ValueError:
+                        zero = False
+                    if zero or st.nlgeom:
+                        active.pop((g[0].upper(), label), None)
+                    else:
+                        active[(g[0].upper(), label)] = (c, st.no)
+            if st.nlgeom:                       # (what the step gives again or removes is its own)
+                hit += [(no, st.no) for (_t, label), (b, no) in active.items()
+                        if self._nlgeom_load_inexact(b, label[:5])]
+                active.clear()
+        if hit:
+            self.report.warn(f"A surface traction (TRVEC / TRSHR) of small-strain step {hit[0][0]} "
+                             f"stays in force in step {hit[0][1]}, which runs under NLGEOM: Abaqus "
+                             f"applies it from then on as a follower load per current area (FOLLOWER, "
+                             f"CONSTANT RESULTANT), ccx keeps the nodal forces it became, fixed. Give "
+                             f"the traction again in that step to have it converted for NLGEOM.",
+                             once=True)
+            self._reduces("traction of a small-strain step carried into an NLGEOM step (fixed nodal "
+                          "forces)")
 
     def _follower_pressure(self, b: Block, g: List[str], pairs: Sequence[Tuple[str, str]]
                            ) -> Optional[str]:
@@ -36944,6 +37216,22 @@ class _Loads:
                              "dynamics step reads the eigenmodes from the .eig file ccx writes "
                              "only then.", once=True)
         data = list(b.data)
+        if data and self.emit.no in self._freq_read:
+            f = [x.strip() for x in data[0].split(",")] + ["", ""]
+            try:
+                bounded = any(pf(x) > 0.0 for x in (f[1:2] if solver.startswith("SUB") else f[1:3]) if x)
+            except ValueError:
+                bounded = False
+            if bounded:
+                self.report.warn("*FREQUENCY with a frequency range, whose modes a later modal step "
+                                 "superposes: Abaqus extracts and uses only the modes in the range, "
+                                 "ccx 2.23 writes every mode it computes (the number requested) to "
+                                 "the .eig file and superposes them all — the range only filters its "
+                                 "printed list (arpack.c) — so the responses differ by the other "
+                                 "modes' share. Request the number of modes Abaqus finds in the range "
+                                 "to match it.", once=True)
+                self._reduces("modal step on every computed mode, not only those in the *FREQUENCY "
+                              "range")
         if solver.startswith("SUB") and data:
             f = [x.strip() for x in data[0].split(",")]
             if len(f) > 1 and f[1]:
@@ -38375,14 +38663,16 @@ class _Loads:
         and S8R, and ignores it on S4 and S4R, which it expands into C3D8I / C3D8R (probed: no
         thermal bending, in a step and as an initial condition alike); no input reaches the
         temperatures of the expanded nodes.  A gradient the deck never changes from its
-        initial one strains nothing, in either program.  Likewise the gradients that
-        _plan_point_temperatures gives the B31 / B31R of a TEMPERATURE=VALUES beam section,
-        which ccx 2.23 ignores too (probed; B32 / B32R read them)."""
+        initial one strains nothing, in either program.  Likewise the gradients across B31 /
+        B31R beams, which ccx 2.23 ignores too (probed: a cantilever's tip stays straight;
+        B32 / B32R read them), given as such or written by _plan_point_temperatures for a
+        TEMPERATURE=VALUES beam section."""
         flat = {n: "shell" for e, (typ, conn) in self.geom.elements.items()
                 if ccx_type(typ) in ("S4", "S4R") and e not in self._point_temps for n in conn}
-        flat.update((n, "beam") for e in self._point_beams if e in self.geom.elements
-                    and ccx_type(self.geom.elements[e][0]) in ("B31", "B31R")
-                    for n in self.geom.elements[e][1])
+        knots = set(self.geom.elsets.get(KNOT_SET, ()))     # (the converter's force-free B31s)
+        flat.update((n, "points" if e in self._point_beams else "beam")
+                    for e, (typ, conn) in self.geom.elements.items()
+                    if ccx_type(typ) in ("B31", "B31R") and e not in knots for n in conn)
         initial: Dict[int, tuple] = {}
         changed: set = set()
         for kw in ("INITIAL CONDITIONS", "TEMPERATURE") if flat else ():
@@ -38411,13 +38701,127 @@ class _Loads:
                              f"elements (probed: S3, S6, S8 and S8R read it), so their thermal "
                              f"bending is lost. Mesh those shells with S8R to keep it.")
             self._reduces("temperature gradient on S4 / S4R shells (ccx ignores it)")
-        if len(shells) < len(changed):
-            self.report.warn(f"Temperatures at the points of a *BEAM SECTION, TEMPERATURE=VALUES "
-                             f"vary across the section on {len(changed) - len(shells)} node(s) of "
-                             f"B31 / B31R beams: written as gradients, which ccx 2.23 ignores on "
-                             f"these elements (probed: B32 / B32R read them), so their thermal "
-                             f"bending is lost. Mesh those beams with B32 to keep it.")
+        beams = [n for n in changed if flat[n] != "shell"]
+        if beams:
+            what = (f"Temperatures at the points of a *BEAM SECTION, TEMPERATURE=VALUES vary across "
+                    f"the section on {len(beams)} node(s) of B31 / B31R beams: written as gradients, "
+                    if all(flat[n] == "points" for n in beams) else
+                    f"Temperatures change the gradients across B31 / B31R beams on {len(beams)} "
+                    f"node(s), ")
+            self.report.warn(what + "which ccx 2.23 ignores on these elements (probed: B32 / B32R "
+                             "read them), so their thermal bending is lost. Mesh those beams with "
+                             "B32 to keep it.")
             self._reduces("temperature gradient on B31 / B31R beams (ccx ignores it)")
+
+    def _plan_offset_gradients(self, blocks: List[Block]) -> None:
+        """Temperature lines with a gradient on the nodes of OFFSET shells: the line's
+        temperature is the reference surface's (Abaqus and ccx alike), but ccx 2.23 gives an
+        offset shell's mid-thickness expanded node that temperature instead of the
+        mid-surface's T - g e t (gen3dtemp; e the OFFSET, t the thickness), so the mean
+        through the thickness is off by 2/3 g e t (probed: an S8R plate, OFFSET=0.5, stretched
+        alpha (T - g e t / 3) where its mid-surface twin gives alpha (T - g e t)).  On S6, S8
+        and S8R, whose expansions use that node, each line (T, g) becomes (T - 2/3 g e t, g):
+        the mean and first moment through the thickness exact, and on S8R / S8 the
+        temperatures at their through-thickness integration points too (probed against the
+        twin: displacements and stresses equal; S6's mid-thickness points differ by alpha E g
+        e t / 3, and composites read the layers otherwise: warned).  S3 (a C3D6 of the bottom
+        and top nodes) is exact as it is, S4 / S4R ignore gradients (_plan_shell_gradients).
+        Warned without a rewrite: a nodal thickness, an offset distribution, a node whose
+        shells read the line otherwise, a beam with OFFSET1 / OFFSET2.  Lines of a step and
+        of *INITIAL CONDITIONS alike, split per node group (_point_set)."""
+        kinds: Dict[int, set] = {}              # node -> how its elements read a line (T, g)
+        for b in blocks:
+            if b.keyword == "SHELL SECTION":
+                elset = b.param("ELSET") or ""
+                if self._continuum_shell_elset(elset):
+                    continue
+                off = offset_fraction(b.param("OFFSET"))
+                try:
+                    layers = [pf(x) for x, _m, _o in self._section_layers(b, strict=True)] \
+                        if b.has("COMPOSITE") else [pf((merged_data_records(b) or [[""]])[0][0])]
+                except (ValueError, IndexError):
+                    layers = []
+                for e in self._existing(elset):
+                    typ = ccx_type(self.geom.elements[e][0])
+                    if typ not in ("S6", "S8", "S8R") or off == 0.0:
+                        kind: tuple = ("plain",)
+                    elif off is None:
+                        kind = ("?", "an OFFSET distribution")
+                    elif b.has("NODAL THICKNESS") or b.has("SHELL THICKNESS") or not layers:
+                        kind = ("?", "a nodal or unknown thickness")
+                    else:
+                        kind = ("q", off * sum(layers), "composite" if len(layers) > 1 else
+                                "S6" if typ == "S6" else "")
+                    for n in self.geom.elements[e][1]:
+                        kinds.setdefault(n, set()).add(kind)
+            elif b.keyword == "BEAM SECTION" and any(
+                    (b.param(k) or "0").strip() not in ("0", "0.", "") for k in ("OFFSET1", "OFFSET2")):
+                for e in self._existing(b.param("ELSET") or ""):
+                    for n in self.geom.elements[e][1]:
+                        kinds.setdefault(n, set()).add(("?", "a beam OFFSET1 / OFFSET2"))
+        if not any(k[0] != "plain" for ks in kinds.values() for k in ks):
+            return
+        shift: Dict[int, float] = {}
+        loose: Dict[int, str] = {}
+        for n, ks in kinds.items():
+            qs = {k[1] for k in ks if k[0] == "q"}
+            odd = [k[1] for k in ks if k[0] == "?"]
+            if odd:
+                loose[n] = odd[0]
+            elif len(qs) > 1 or (qs and any(k[0] == "plain" for k in ks)):
+                loose[n] = "shells beside it that read the line otherwise"
+            elif qs:
+                shift[n] = qs.pop()
+                approx = {k[2] for k in ks if k[0] == "q" and k[2]}
+                if approx:
+                    loose[n] = "S6 shells (their mid-thickness integration points)" \
+                        if approx == {"S6"} else "a composite layup"
+        written: set = set()
+        hit: set = set()
+        for b in blocks:
+            if not (b.keyword == "TEMPERATURE" and not b.has("FILE") and not b.has("USER") or
+                    b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "TEMPERATURE"):
+                continue
+            data: List[str] = []
+            changed = False
+            for rec in merged_data_records(b):
+                g = trimmed_fields(rec)
+                try:
+                    v = tuple(pf(x) if x else 0.0 for x in g[1:])
+                except ValueError:
+                    v = ()
+                nodes = self._resolve_nodes(g[0]) if len(v) > 1 and v[1] and g[0] else []
+                hit.update(n for n in nodes if n in loose)
+                groups: "OrderedDict[float, List[int]]" = OrderedDict()
+                for n in nodes:
+                    groups.setdefault(shift.get(n, 0.0), []).append(n)
+                if not any(groups):
+                    data.append(", ".join(g))
+                    continue
+                changed = True
+                for d, ns in groups.items():
+                    written.update(ns if d else ())
+                    target = g[0] if len(groups) == 1 else self._point_set(g[0], ns)
+                    vals = (v[0] - 2.0 / 3.0 * v[1] * d,) + v[1:] if d else v
+                    data.append(", ".join([target] + [short_real(x, 12) for x in vals]))
+            if changed:
+                b.data = data
+        if written:
+            self.report.note(f"Temperature gradients on {len(written)} node(s) of OFFSET shells (S6 / "
+                             f"S8 / S8R): each line (T, g) written as (T - 2/3 g e t, g), e the "
+                             f"offset, t the thickness — ccx 2.23 gives an offset shell's "
+                             f"mid-thickness expanded node the reference surface's temperature, not "
+                             f"the mid-surface's (probed: the mean through the thickness 2/3 g e t "
+                             f"off); written so, it is exact.", once=True)
+        if hit:
+            reasons = sorted({loose[n] for n in hit})
+            self.report.warn(f"Temperature gradients on {len(hit)} node(s) of offset shells or beams "
+                             f"({'; '.join(reasons)}): ccx 2.23 gives an offset section's expanded "
+                             f"nodes other temperatures than Abaqus' linear profile from the "
+                             f"reference surface (probed: an S8R plate's mean temperature 2/3 g e t "
+                             f"off), and the converter's correction is not exact there — verify.",
+                             once=True)
+            self._reduces("temperature gradients on offset shells / beams not exact in ccx")
 
     # The temperature points of a *BEAM SECTION, TEMPERATURE=VALUES (Abaqus 2017 "Beam
     # cross-section library", the figures of temperature input at specific points): their
@@ -38605,9 +39009,8 @@ class _Loads:
         1; 2017 "Using a shell section integrated during the analysis"), and the line that
         keeps the profile's mean and first moment through the thickness — the same section
         forces in a homogeneous elastic shell — is exact where the profile is linear; its
-        temperature is the one at the reference surface (OFFSET), where ccx 2.23 reads it
-        otherwise (probed: an offset shell's nodes stretch by alpha (T - g OFFSET t / 3), not
-        alpha T).  A RECT beam: the corners in space (1 at -1, -2, then 2, 3, 4 counterclockwise),
+        temperature is the one at the reference surface (OFFSET), which ccx 2.23 reads otherwise
+        on an offset shell (_plan_offset_gradients corrects it).  A RECT beam: the corners in space (1 at -1, -2, then 2, 3, 4 counterclockwise),
         bottom, centre and top in a plane — exact where the values are linear across it; in a
         plane, CIRC, PIPE and THICK PIPE alike (bottom, centre, top: at -r, 0, r)."""
         k = self._point_count(r)
@@ -38638,13 +39041,7 @@ class _Loads:
                 return (ref, grad), ("Temperatures that vary through the thickness of a *SHELL SECTION, "
                                      "TEMPERATURE=n with NODAL THICKNESS / SHELL THICKNESS: their gradient "
                                      "is taken over the section's data-line thickness, not each node's.")
-            if off is None or off:
-                return (ref, grad), ("Temperatures that vary through the thickness of a *SHELL SECTION, "
-                                     "TEMPERATURE=n with an OFFSET: written as Abaqus' temperature at the "
-                                     "reference surface and gradient, which ccx 2.23 reads otherwise on an "
-                                     "offset shell (probed: its nodes stretch by alpha (T - g OFFSET t / 3), "
-                                     "not alpha T).")
-            return (ref, grad), ""
+            return (ref, grad), ""      # (an OFFSET: _plan_offset_gradients)
         if r[0] == "BEAM":
             sec, planar, dims = r[2], r[3], r[4]
             half = (dims[1] / 2.0 if sec == "RECT" and len(dims) > 1 else
@@ -41480,6 +41877,144 @@ class _PostPasses:
                          f"and a SPC'; probed), so it is left out. Exact.", once=True)
         return deck.edited()
 
+    def _hold_knot_drilling(self, blocks: List[Block], deck: EmittedDeck) -> EmittedDeck:
+        """The drilling rotation of a converter knot beam's knot on a smooth shell node — one
+        that ccx 2.23 would make no knot by itself (one group of shells, _ccx_knot's test),
+        with no rotational *BOUNDARY and no other element, where no *EQUATION holds a part of
+        its turn about the normal (none names its rotations, or each that does holds a
+        direction normal to it: a coupling of some rotations about axes in the shell's plane).
+        The knot's rotation about the shell normal moves neither the shell's expanded nodes
+        (they lie on the normal) nor anything the force-free knot beam holds, so it has no
+        stiffness: ccx's solution then depends on round-off (probed: a fixed-fixed S4 beam
+        with knot beams on its loaded nodes deflected 0.0056 or 0.105 for 0.292, by the knot
+        beams' modulus; the plain shells, and the knotted ones with that rotation held, 0.292
+        for any).  An *EQUATION n . theta = 0 holds it (n: the node's normal as ccx computes
+        it, _ccx_shell_normal), eliminating a rotation no other equation eliminates: nothing
+        acts on that rotation, in Abaqus' shell as in ccx's (no drilling stiffness), so it
+        changes nothing else."""
+        knots = set(self._knots)
+        if not knots or getattr(self.opt, "solid_dof", False):
+            return deck
+        beams = set(self.geom.elsets.get(KNOT_SET, ()))
+        at = self._elements_at(knots)
+        sections = self._knot_sections(blocks)
+        tie: Dict[int, List[Vec]] = {}          # node -> the rotation directions equations hold
+        dependent: set = set()                  # (node, DOF) an equation eliminates
+        for _ci, terms in self._emitted_equations(deck):
+            dependent.add(terms[0][:2])
+            rot: Dict[int, List[float]] = {}
+            for n, d, c in terms:
+                if 4 <= d <= 6:
+                    try:
+                        rot.setdefault(n, [0.0, 0.0, 0.0])[d - 4] += pf(c)
+                    except ValueError:
+                        rot.setdefault(n, [1.0, 1.0, 1.0])
+            for n, a in rot.items():
+                tie.setdefault(n, []).append((a[0], a[1], a[2]))
+        held: set = set()                       # nodes with a rotational BC
+        sets = self._mesh_sets.read(deck)
+        for c in deck.cards:
+            if c.keyword == "BOUNDARY":
+                for rec in c.records():
+                    rng = bc_dof_range(rec) if rec and rec[0] else None
+                    if rng is None or rng[1] >= 4 and rng[0] <= 6:
+                        held.update(sets.members("NSET", rec[0]) or ([int(rec[0])] if rec and
+                                                                      rec[0].isdigit() else []))
+        rows: List[List[Tuple[int, int, float]]] = []
+        for n in sorted(knots - held - set(self._transformed)):
+            own = [e for e in at.get(n, ()) if e not in beams]
+            if not own or any(ccx_type(self.geom.elements[e][0]) not in SHEET_SHELLS for e in own) or \
+                    len({sections.get(e) for e in own}) > 1 or None in {sections.get(e) for e in own}:
+                continue
+            normals = [self._shell_node_normal(e, n) for e in own]
+            if any(v is None for v in normals) or \
+                    any(vdot(v, normals[0]) < math.cos(math.radians(19.9)) for v in normals):
+                continue                        # (ccx's own knot, or a fold: other normals)
+            nrm = self._ccx_shell_normal(n, at)
+            if nrm is None:
+                continue
+            if any(abs(vdot(nrm, a)) > 1e-6 * vnorm(a) for a in tie.get(n, ())):
+                continue                        # (an equation holds a part of the turn about n)
+            terms = sorted(((n, k + 4, c) for k, c in enumerate(nrm) if abs(c) > 1e-12),
+                           key=lambda t: ((n, t[1]) in dependent, -abs(t[2])))
+            if terms and (n, terms[0][1]) not in dependent:
+                rows.append(terms)
+        if not rows:
+            return deck
+        at = next((c.line for c in deck.cards if c.keyword == "STEP"), len(deck.lines))
+        deck.insert_at(at, ["** abq2ccx: the drilling rotation of knot beams' knots on shell nodes "
+                            "held (no stiffness acts on it)"] + self._equation_lines(rows))
+        self.report.note(f"{len(rows)} knot(s) of the converter's knot beams on shell nodes (e.g. node "
+                         f"{rows[0][0][0]}): their rotation about the shell normal held by an *EQUATION "
+                         f"— nothing stiffens it (the shell's expanded nodes lie on the normal, the knot "
+                         f"beam is force-free), and ccx 2.23's solution then depends on round-off "
+                         f"(probed: a knotted S4 beam 2 % to 50x too stiff, by the knot beam's "
+                         f"modulus).", once=True)
+        return deck.edited()
+
+    def _initial_gradients_back(self, deck: EmittedDeck) -> EmittedDeck:
+        """The initial temperatures (*INITIAL CONDITIONS, TYPE=TEMPERATURE as written) given
+        again as a *TEMPERATURE card where ccx 2.23 loses a shell's or beam's gradient:
+        * in the first step that takes temperatures, where an initial line has a gradient and
+          the step's lines do not name every initial line's target: without a *TEMPERATURE
+          there for a node, ccx gives its outer expanded nodes the
+          'undefined' marker 1.2357 -/+ g t / 2 (probed: a free S8R plate with initial (50,
+          30) shrank 0.0325 over 2; the twin with the initial lines given in the step does
+          not move);
+        * at a *TEMPERATURE, OP=NEW card ccx acts on (a general step's) after gradients were
+          given: ccx sets the temperatures back to the initial ones but keeps the last
+          gradients (probed: an S8R plate stayed bent).
+        The card goes first (with the OP=NEW, which ccx reads on a step's first card only; the
+        step's own lines come after it and replace those of their nodes): the initial state
+        exactly, with no amplitude — none where the step's first card starts with those lines
+        already (BaseStateRestore._gradients_back).  After _audit_loads: the initial state is
+        no load."""
+        ics = [c for c in deck.model if c.keyword == "INITIAL CONDITIONS" and
+               c.uparam("TYPE") == "TEMPERATURE"]
+        if not ics or any(c.has("FILE") or c.has("USER") or c.has("INPUT") for c in ics):
+            return deck
+        recs = [rec for c in ics for rec in c.records() if rec and rec[0]]
+
+        def graded(rec: List[str]) -> bool:
+            t = BaseStateRestore.temperature(rec)
+            return bool(t and any(t[1:]))
+        seen = any(graded(r) for r in recs)
+        first, why = seen, {}
+        for st in deck.steps:
+            proc = st.proc.keyword if st.proc is not None else ""
+            if not proc or proc == "NO ANALYSIS":
+                continue
+            temps = [c for c in st.cards if c.keyword == "TEMPERATURE"]
+            takes = proc not in TEMPERATURE_DOF_PROCS and proc != "BUCKLE" and not st.perturbation
+            again = bool(temps) and temps[0].records()[:len(recs)] == recs   # (BaseStateRestore's)
+            given = {r[0].upper() for c in temps for r in c.records() if r and r[0]}
+            if takes and not again and (first and not all(r[0].upper() in given for r in recs) or
+                                        not first and seen and st.acting("TEMPERATURE") is not None):
+                at = temps[0] if temps else st.end
+                op = at is not None and at.keyword == "TEMPERATURE" and at.op_new()
+                why.setdefault("op" if op and not first else "first", st.number)
+                deck.insert_before(at, ["** abq2ccx: the initial temperatures again (ccx 2.23 loses a "
+                                        "shell's or beam's gradient otherwise)",
+                                        "*TEMPERATURE" + (", OP=NEW" if op else "")] +
+                                   [", ".join(r) for r in recs])
+                if op:
+                    deck.set_keyword(at, OrderedDict((k, v) for k, v in at.params.items() if k != "OP"))
+            first = False
+            seen = seen or any(graded(r) for c in temps for r in c.records() if r and r[0])
+        if "first" in why:
+            self.report.note(f"Initial temperatures with a gradient through a shell's thickness or "
+                             f"across a beam: given again in step {why['first']}, the first that "
+                             f"takes temperatures — without a *TEMPERATURE for a node there, ccx 2.23 "
+                             f"gives its outer expanded nodes the 'undefined' marker 1.2357 -/+ the "
+                             f"gradient's share (probed: spurious thermal strain).", once=True)
+        if "op" in why:
+            self.report.note(f"*TEMPERATURE, OP=NEW after temperature gradients (step {why['op']}): "
+                             f"the initial temperatures and gradients written first on the OP=NEW "
+                             f"card — ccx 2.23 sets the temperatures back to the initial ones but "
+                             f"keeps the last gradients given (probed), Abaqus removes both.",
+                             once=True)
+        return deck.edited()
+
     def _no_analysis_segfaults(self, deck: EmittedDeck) -> EmittedDeck:
         """The first step ccx stops at (*NO ANALYSIS: _no_analysis) in a deck with a material
         card of NO_ANALYSIS_SEGFAULTS, on which ccx 2.23 segfaults there: as the first step it
@@ -42877,7 +43412,6 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._qmem_eq: List[str] = []
         self._mem_mass_acts = False                # mass acts in the deck (a DENSITY= lost)
         self._qmem_copies: Dict[int, int] = {}     # a solid's node -> its membrane node
-        self._qmem_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}   # membrane node -> *TRANSFORM axes
         self._mem_thick: Dict[int, float] = {}     # membrane element -> its largest thickness
         self._mem_surfaces: Dict[tuple, str] = {}  # element surface on membranes -> node surface
         # id(*COUPLING) followed by *KINEMATIC, ... by *DISTRIBUTING (_split_coupling_refs)
@@ -43131,6 +43665,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._conn_bcs: List[str] = []             # their *BOUNDARY lines (held in every step)
         self._dashpot_cards: set = set()           # *DASHPOTs of DASHPOT1 / 2 elements (_plan_dashpots)
         self._dashpot_rows: List[List[Tuple[int, int, float]]] = []   # their ground nodes' *EQUATIONs
+        self._free_mass_rows: List[List[Tuple[int, int, float]]] = []   # _plan_free_masses' held nodes
         self._spring_rows: List[List[Tuple[int, int, float]]] = []    # _plan_transformed_springs' nodes
         self._amass: Dict[int, Tuple[float, List[Tuple[str, float]]]] = {}   # _plan_anisotropic_masses
         self._amass_rows: List[List[Tuple[int, int, float]]] = []     # its nodes' *EQUATIONs
@@ -43753,6 +44288,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_solver_facts(blocks)         # after the step model and _plan_rigid
         self._reset_emission()                  # (handle_step advances the step cursor)
         self._plan_node_classes(blocks)         # after the mesh planners: the final element types
+        self._plan_shared_ref_couplings(blocks)     # after it: the members with rotations
         self._plan_section_thick(blocks)        # before _plan_rot_nodes: its distributing weights
         self._transformed = self._transform_defs(blocks)
         self._plan_connectors(blocks)           # before _plan_mpcs: rigid ones join its bodies
@@ -43796,12 +44332,16 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_coupled_inertia(blocks)
         self._plan_explicit_mass_scaling(blocks)    # after it: the deck's masses scaled once
         self._plan_load_facts(blocks)           # after the mesh planners: the final element types
+        self._warn_carried_tractions(blocks)
         self._plan_point_temperatures(blocks)   # after _plan_load_facts: the temperature points
         self._plan_shell_gradients(blocks)      # after it: the gradients it writes
+        self._plan_offset_gradients(blocks)     # after it: the lines it reads and the point lines
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_dashpots(blocks)             # after the planners above: the nodes' *TRANSFORM axes
         self._plan_transformed_springs(blocks)  # likewise
         self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
+        self._plan_free_masses(blocks)          # after it and the planners adding elements above
+        self._warn_driven_dashpots(blocks)      # after _plan_dashpots: their rows
         self._warn_partial_couplings_nlgeom(blocks)
         self._plan_member_mass_tets(blocks)     # after _plan_rot_nodes: the *MPC BEAM bodies
         self._warn_massless_frequency(blocks)   # after it: its massless tetrahedra
@@ -43896,7 +44436,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         deck = self._keep_body_loads(deck)      # after the restore, which gives body loads too
         deck = self._no_analysis_segfaults(deck)
         self._audit_loads(blocks, deck)
+        deck = self._hold_knot_drilling(blocks, deck)   # after the passes that write BCs and equations
         self._warn_knot_equations(blocks, deck)     # after _settle_dependents: the terms as written
+        deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
         out = self._short_fields(deck.render())     # last: every card is written

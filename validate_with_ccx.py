@@ -6604,12 +6604,12 @@ def turned_cantilever_deck(typ="B31", ne=4, proc="STATIC", knot=False):
         ["*NSET, NSET=ROOTS", ", ".join(str(1000 * m + 1) for m in ms),
          "*NSET, NSET=TIPS", ", ".join(str(1000 * m + nn) for m in ms)]
     if knot:
-        # (a knot's axial stiffness follows its force-free beams' E and size — a soft thin dummy is
-        # 1e-5 of the tip motion apart — so the dummy is like the converter's knot beams: the
-        # deck's E, about 1 % of the model's size, along (1, 1, 1))
+        # (a knot's axial stiffness follows its force-free beams' E and size — a stiff dummy is
+        # 1e-5 of the tip motion apart — so the dummy is like the converter's knot beams: 1e-6
+        # of the deck's E, about 1 % of the model's size, along (1, 1, 1))
         deck += ["*NODE", "9001, 0.0935, 0.0935, 0.0935", "9002, 0.0935, 0.0935, 1.0935", "9101, 9., 9., 9.",
                  "9102, 9., 9., 10.", "*ELEMENT, TYPE=B31, ELSET=DUMMY", "9001, 1, 9001", f"9002, {nn}, 9002",
-                 "*MATERIAL, NAME=DM", "*ELASTIC", "1000., 0.", "*DENSITY", "0.",
+                 "*MATERIAL, NAME=DM", "*ELASTIC", "0.001, 0.", "*DENSITY", "0.",
                  "*BEAM SECTION, ELSET=DUMMY, MATERIAL=DM, SECTION=RECT", "0.08, 0.08", "1., -1., 0.",
                  "*EQUATION", "2", "9101, 1, 1., 9102, 1, -1."]
     deck += ["*STEP", "*FREQUENCY" if proc == "FREQUENCY" else "*STATIC"] + (["8"] if proc == "FREQUENCY" else []) + \
@@ -8851,6 +8851,141 @@ def t155_s8r_deck(width, plastic):
             "".join(f"{n}, 1, 6\n" for (i, j), n in pts.items() if i == 0) + "*STEP\n*STATIC\n*CLOAD\n" +
             "".join(f"{n}, 3, {1e-3 / len(tip):.8g}\n" for n in tip) +
             "*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+
+
+# a flat 2 x 1 plate of two S8R (S8) elements, thickness 0.1, E 1000, nu 0, alpha 1e-3,
+# statically determinate, its corner node 5 at (2, 0, z) pulled along x by 0.01 (so a step
+# always moves it); the nodes at height z
+def gradient_plate_deck(ic, steps, typ="S8R", offset="", z=0.0, extra=""):
+    nodes = [(1, 0, 0), (2, .5, 0), (3, 1, 0), (4, 1.5, 0), (5, 2, 0), (6, 0, .5), (7, 1, .5),
+             (8, 2, .5), (9, 0, 1), (10, .5, 1), (11, 1, 1), (12, 1.5, 1), (13, 2, 1)]
+    return ("*NODE, NSET=NALL\n" + "".join(f"{n}, {x}, {y}, {z}\n" for n, x, y in nodes) +
+            f"*ELEMENT, TYPE={typ}, ELSET=EALL\n1, 1, 3, 11, 9, 2, 7, 10, 6\n2, 3, 5, 13, 11, 4, 8, 12, 7\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*EXPANSION\n1.E-3\n"
+            f"*SHELL SECTION, ELSET=EALL, MATERIAL=M{offset}\n0.1\n*BOUNDARY\n1, 1, 3\n3, 2, 3\n9, 3, 3\n"
+            f"{extra}*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, {ic}\n" + steps)
+
+
+def gradient_step(temps="", load=0.01):
+    """A static step with ``temps`` (a *TEMPERATURE card or none) and node 5 pulled along x."""
+    return (f"*STEP\n*STATIC\n{temps}*CLOAD\n5, 1, {load}\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+
+
+def gradient_beam_deck(ic, temps=""):
+    """A B32 cantilever along z (length 1, RECT 0.1 x 0.1, n1 = x), the material of
+    gradient_plate_deck, its tip pulled along z by 0.01."""
+    return ("*NODE, NSET=NALL\n1, 0., 0., 0\n2, 0., 0., 0.25\n3, 0., 0., 0.5\n4, 0., 0., 0.75\n5, 0., 0., 1\n"
+            "*ELEMENT, TYPE=B32, ELSET=EALL\n1, 1, 2, 3\n2, 3, 4, 5\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n"
+            "*EXPANSION\n1.E-3\n*BEAM SECTION, ELSET=EALL, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n"
+            f"*BOUNDARY\n1, 1, 6\n*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, {ic}\n"
+            f"*STEP\n*STATIC\n{temps}*CLOAD\n5, 3, 0.01\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+
+
+def free_mass_deck(explicit=False, nlgeom=False):
+    """A point mass 2 on a node of no other element, pushed by (1, 0.5, 0) for 1 s in *DYNAMIC
+    (Abaqus: u = F t^2 / 2 m = (0.25, 0.125, 0))."""
+    return ("*NODE, NSET=P\n1, 0., 0., 0.\n*ELEMENT, TYPE=MASS, ELSET=EM\n1, 1\n*MASS, ELSET=EM\n2.\n"
+            f"*STEP{', NLGEOM' if nlgeom else ''}\n*DYNAMIC{', EXPLICIT' if explicit else ''}\n"
+            "0.01, 1.\n*CLOAD\n1, 1, 1.\n1, 2, 0.5\n*NODE PRINT, NSET=P\nU\n*END STEP\n")
+
+
+def membrane_velocity_deck(transformed):
+    """A free M3D8 square (density 1) flying at the initial velocity 2 along global x for
+    0.1 s; ``transformed``: its nodes 1-5 have a *TRANSFORM (local x = global y), which an
+    initial velocity ignores (Keywords Reference, *INITIAL CONDITIONS).  Nodes 6-8 printed."""
+    tr = ("*NSET, NSET=TR\n1, 2, 3, 4, 5\n*TRANSFORM, NSET=TR\n0., 1., 0., -1., 0., 0.\n"
+          if transformed else "")
+    return ("*NODE, NSET=NALL\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n4, 0., 0.5, 0.\n5, 1., 0.5, 0.\n"
+            "6, 0., 1., 0.\n7, 0.5, 1., 0.\n8, 1., 1., 0.\n*NSET, NSET=OUT\n6, 7, 8\n"
+            "*ELEMENT, TYPE=M3D8, ELSET=E\n1, 1, 3, 8, 6, 2, 5, 7, 4\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            f"*DENSITY\n1.\n*MEMBRANE SECTION, ELSET=E, MATERIAL=M\n0.01\n{tr}"
+            "*INITIAL CONDITIONS, TYPE=VELOCITY\nNALL, 1, 2.\n*STEP\n*DYNAMIC\n0.01, 0.1\n"
+            "*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
+
+
+SHARED_REF_BAR = (
+    "*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n6, 2., 1., 0.\n"
+    "7, 0., 0., 1.\n8, 1., 0., 1.\n9, 2., 0., 1.\n10, 0., 1., 1.\n11, 1., 1., 1.\n12, 2., 1., 1.\n"
+    "100, 2.5, 0.5, 0.5\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1, 2, 5, 4, 7, 8, 11, 10\n"
+    "2, 2, 3, 6, 5, 8, 9, 12, 11\n*NSET, NSET=LEFT\n1, 4, 7, 10\n*NSET, NSET=RIGHT\n3, 6, 9, 12\n"
+    "*NSET, NSET=R3\n3, 6, 9\n*NSET, NSET=R1\n12\n*SURFACE, TYPE=NODE, NAME=S3\nR3\n"
+    "*SURFACE, TYPE=NODE, NAME=S1\nR1\n*SURFACE, TYPE=NODE, NAME=SA\nRIGHT\n*MATERIAL, NAME=M\n"
+    "*ELASTIC\n1000., 0.3\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n")
+
+
+def shared_ref_deck(two):
+    """A C3D8 bar whose end nodes 3, 6, 9, 12 are coupled (*KINEMATIC) to the loaded reference
+    node 100: as one coupling, or as two (3, 6, 9 and 12 apart) on the same reference node,
+    which Abaqus moves as one rigid body."""
+    con = ("*COUPLING, CONSTRAINT NAME=C1, REF NODE=100, SURFACE=S3\n*KINEMATIC\n"
+           "*COUPLING, CONSTRAINT NAME=C2, REF NODE=100, SURFACE=S1\n*KINEMATIC\n" if two else
+           "*COUPLING, CONSTRAINT NAME=C1, REF NODE=100, SURFACE=SA\n*KINEMATIC\n")
+    return (SHARED_REF_BAR + con + "*BOUNDARY\nLEFT, 1, 3\n*STEP\n*STATIC\n*CLOAD\n100, 2, 1.\n"
+            "100, 3, 0.5\n*NODE PRINT, NSET=RIGHT\nU\n*END STEP\n")
+
+
+def plane_rb_coupling_deck(beam):
+    """A 2 x 2 CPE4 block whose top edge is coupled (*KINEMATIC) to reference node 100, pushed
+    along x; ``beam``: node 100 is also the end of a B21 beam to a free node, so the coupling
+    becomes a rigid body with a ROT NODE that follows the node's rotations."""
+    b21 = ("*ELEMENT, TYPE=B21, ELSET=BM\n10, 100, 101\n*BEAM SECTION, ELSET=BM, MATERIAL=M, "
+           "SECTION=RECT\n0.1, 0.1\n" if beam else "")
+    return ("*NODE\n1, 0, 0\n2, 1, 0\n3, 2, 0\n4, 0, 1\n5, 1, 1\n6, 2, 1\n7, 0, 2\n8, 1, 2\n9, 2, 2\n"
+            "100, 1, 3\n101, 1, 4\n*ELEMENT, TYPE=CPE4, ELSET=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n"
+            "3, 4, 5, 8, 7\n4, 5, 6, 9, 8\n*ELSET, ELSET=TOPE\n3, 4\n*SURFACE, NAME=TOP\nTOPE, S3\n"
+            "*NSET, NSET=BOT\n1, 2, 3\n*NSET, NSET=OUT\n5, 8, 100\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            f"1000., 0.3\n*SOLID SECTION, ELSET=E, MATERIAL=M\n1.\n{b21}"
+            "*COUPLING, REF NODE=100, SURFACE=TOP, CONSTRAINT NAME=C\n*KINEMATIC\n*STEP\n*STATIC\n"
+            "*BOUNDARY\nBOT, 1, 2\n*CLOAD\n100, 1, 1.\n*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
+
+
+def knot_axial_deck(length=100.0, a=0.05):
+    """A slender B31 cantilever along x (4 elements, RECT a x a, E 1000) pulled by 1 at its tip,
+    whose *TRANSFORM (the global axes) and two local rotational loads (zero moments) give it a
+    knot beam: the stretch is P L / E A."""
+    return ("*NODE, NSET=NALL\n" + "".join(f"{i + 1}, {length * i / 4}, 0., 0.\n" for i in range(5)) +
+            "*ELEMENT, TYPE=B31, ELSET=B\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n*MATERIAL, NAME=M\n"
+            f"*ELASTIC\n1000., 0.3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n{a}, {a}\n0., 1., 0.\n"
+            "*NSET, NSET=TIP\n5\n*TRANSFORM, NSET=TIP\n1., 0., 0., 0., 1., 0.\n*BOUNDARY\n1, 1, 6\n"
+            "*STEP\n*STATIC\n*CLOAD\n5, 1, 1.\n5, 5, 0.\n5, 6, 0.\n*NODE PRINT, NSET=TIP, GLOBAL=YES\nU\n"
+            "*END STEP\n")
+
+
+def transformed_beam_moment_deck(twin):
+    """A B31 cantilever along x (4 elements, RECT 0.1 x 0.2, n1 = y), a tip moment 1e-4 about
+    the axis (0, -sin 30, cos 30): about local axis 2 of a *TRANSFORM turned 30 degrees about x
+    (no section axis), or (``twin``) as its components about local 2 and 3 of a *TRANSFORM
+    along the global axes (two local rotations: a knot as well)."""
+    c, s = math.cos(math.radians(30)), math.sin(math.radians(30))
+    tr, load = (("1., 0., 0., 0., 1., 0.", f"5, 5, {-s * 1e-4:.15g}\n5, 6, {c * 1e-4:.15g}\n") if twin else
+                (f"0., {c:.15f}, {s:.15f}, 0., {-s:.15f}, {c:.15f}", "5, 5, 1e-4\n"))
+    return ("*NODE, NSET=NALL\n" + "".join(f"{i + 1}, {i / 4}, 0., 0.\n" for i in range(5)) +
+            "*ELEMENT, TYPE=B31, ELSET=B\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1000., 0.3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n0.1, 0.2\n0., 1., 0.\n"
+            f"*NSET, NSET=TIP\n5\n*TRANSFORM, NSET=TIP\n{tr}\n*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n"
+            f"*CLOAD\n{load}*NODE PRINT, NSET=TIP, GLOBAL=YES\nU\n*END STEP\n")
+
+
+def knot_drilling_deck(modal=True, nx=30, ny=10):
+    """An S4 plate 1000 x 50, thickness 10, clamped at both ends, loaded across its width at
+    one and two thirds of its length in a static step; ``modal``: a *FREQUENCY and a *STEADY
+    STATE DYNAMICS step load the first line too, so the converter puts knot beams on those
+    nodes (ccx misapplies forces on plain shell nodes in modal steps)."""
+    ids = {(i, j): 1 + i + (nx + 1) * j for j in range(ny + 1) for i in range(nx + 1)}
+    nodes = "".join(f"{ids[(i, j)]}, {1000. * i / nx}, {50. * j / ny}, 0.\n"
+                    for j in range(ny + 1) for i in range(nx + 1))
+    els = "".join(f"{i + 1 + nx * j}, {ids[(i, j)]}, {ids[(i + 1, j)]}, {ids[(i + 1, j + 1)]}, "
+                  f"{ids[(i, j + 1)]}\n" for j in range(ny) for i in range(nx))
+    line = lambda i: ", ".join(str(ids[(i, j)]) for j in range(ny + 1))
+    out = (f"*NODE, NSET=NALL\n{nodes}*ELEMENT, TYPE=S4, ELSET=E\n{els}*NSET, NSET=L1\n{line(nx // 3)}\n"
+           f"*NSET, NSET=L2\n{line(2 * nx // 3)}\n*NSET, NSET=ENDS\n{line(0)}, {line(nx)}\n"
+           "*MATERIAL, NAME=M\n*ELASTIC\n210000., 0.3\n*DENSITY\n7.8e-9\n*SHELL SECTION, ELSET=E, MATERIAL=M\n"
+           "10.\n*BOUNDARY\nENDS, 1, 6\n*STEP\n*STATIC\n*CLOAD\nL1, 3, 22.73\nL2, 3, 22.73\n"
+           "*NODE PRINT, NSET=L1\nU\n*END STEP\n")
+    if modal:
+        out += ("*STEP\n*FREQUENCY\n5\n*END STEP\n*STEP\n*STEADY STATE DYNAMICS\n1., 10., 3\n"
+                "*MODAL DAMPING\n1, 5, 0.02\n*CLOAD\nL1, 3, 22.73\n*END STEP\n")
+    return out
 
 
 def main():
@@ -18120,6 +18255,169 @@ def main():
     else:
         print(f"FAIL  norton_creep_floor: {'solved' if u else 'no results'}, "
               f"{'warned' if warned else 'NOT warned'}, reduced physics {conv.reduced_physics}")
+    failures += 0 if ok else 1
+
+    # --- silently wrong answers (task 123) ---------------------------------------------------
+    def same_u(runs, nodes=None):
+        """Largest difference between two runs' displacement tables, and the largest |u|."""
+        got, ref = runs
+        keys = nodes or sorted(ref)
+        err = max(abs(a - b) for n in keys for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        return err, max(abs(x) for n in keys for x in ref[n])
+
+    # an initial temperature gradient and a first step without *TEMPERATURE: ccx gave the outer
+    # expanded nodes the 'undefined' marker 1.2357 -/+ g t/2 (the plate shrank 0.0325 over 2);
+    # the converter gives the initial temperatures again in the step.  Against the same model
+    # without the gradient (nothing heats it either way); node 5 pulled, so each step moves
+    runs = [review_run(gradient_plate_deck(ic, gradient_step()), f"initial_gradient_plate{k}",
+                       dat_displacements) for k, ic in (("", "50., 30."), ("_ref", "50."))]
+    runs += [review_run(gradient_beam_deck(ic), f"initial_gradient_beam{k}", dat_displacements)
+             for k, ic in (("", "50., 30., 0."), ("_ref", "50."))]
+    ok = all(runs)
+    if ok:
+        (err1, moved1), (err2, moved2) = same_u(runs[:2]), same_u(runs[2:])
+        # (the plate's midside nodes 6.7e-9 apart sideways: ccx's initial and step temperatures
+        # of their expanded nodes differ in the last digits)
+        ok = err1 <= 1e-5 * moved1 and err2 <= 1e-9 * moved2 and moved1 > 1e-5 and moved2 > 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  initial_gradient (S8R plate, initial (50, 30), and a B32 "
+              f"cantilever, initial (50, 30, 0), a first step without *TEMPERATURE): as without the "
+              f"gradient ({err1:.1e} / {err2:.1e} apart; |u| {moved1:.4g} / {moved2:.4g}; before: "
+              f"the plate shrank 0.0325)")
+    failures += 0 if ok else 1
+
+    # *TEMPERATURE, OP=NEW after a gradient: ccx resets the temperatures, keeps the gradient
+    # (the plate stayed bent, U3 -0.1); against the initial values written out
+    runs = [review_run(gradient_plate_deck("0.", gradient_step("*TEMPERATURE\nNALL, 20., 100.\n") +
+                                           gradient_step(f"*TEMPERATURE, OP=NEW\n{t}")),
+                       f"op_new_gradient{k}", lambda p: (dat_node_blocks(p) or [None])[-1])
+            for k, t in (("", ""), ("_ref", "NALL, 0.\n"))]
+    ok = all(runs)
+    if ok:
+        err, moved = same_u(runs)
+        ok = err <= 1e-9 * moved and moved > 1e-5 and abs(runs[0][5][2]) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  op_new_gradient (S8R plate heated (20, 100) in step 1, "
+              f"*TEMPERATURE, OP=NEW in step 2): step 2 as with 'NALL, 0.' written out ({err:.1e} "
+              f"apart; corner U3 {runs[0][5][2]:.1e}, before -0.1; |u| {moved:.4g})")
+    failures += 0 if ok else 1
+
+    # a gradient on OFFSET shells: ccx gave the mid-thickness nodes the reference surface's
+    # temperature (the mean 2/3 g e t off: U1 -3.33e-3 for -1e-2 at T 0); the converter writes
+    # T - 2/3 g e t.  Against the same solid as a mid-surface shell (nodes at z = -0.05, T 5),
+    # unloaded (a load on the reference surface would bend the offset shell)
+    for typ in ("S8R", "S8"):
+        runs = [review_run(gradient_plate_deck("0.", gradient_step(f"*TEMPERATURE\nNALL, {t}, 100.\n", 0.0),
+                                               typ, off, z), f"offset_gradient_{typ.lower()}{k}",
+                           dat_displacements)
+                for k, off, z, t in (("", ", OFFSET=0.5", 0.0, "10."), ("_ref", "", -0.05, "5."))]
+        ok = all(runs)
+        if ok:
+            # (the corners: the S8R strip's midside nodes 4 and 12 swing sideways in a mode its
+            # reduced integration leaves nearly free, 2.1e-3 in both decks, 1.8e-5 apart)
+            err, moved = same_u(runs, [1, 3, 5, 9, 11, 13])
+            ok = err <= 1e-7 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  offset_gradient_{typ.lower()} ({typ} plate, OFFSET=0.5, "
+                  f"(10, 100)): corners as its mid-surface twin at (5, 100) ({err:.1e} apart; U1 "
+                  f"{runs[0][5][0]:.7g} = alpha T_mid x, U3 {runs[0][5][2]:.7g}; before U1 0.01667)")
+        failures += 0 if ok else 1
+
+    # a point mass on a node of no other element: ccx never moved it in *DYNAMIC (u = 0); the
+    # converter hangs a zero-stiffness spring to a held node on it
+    for tag, kw in (("", {}), ("_nlgeom", {"nlgeom": True}), ("_explicit", {"explicit": True})):
+        u = review_run(free_mass_deck(**kw), "free_mass" + tag, dat_displacements)
+        ok = bool(u) and 1 in u
+        if ok:
+            err = max(abs(a - b) for a, b in zip(u[1], (0.25, 0.125, 0.0)))
+            ok = err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  free_mass{tag} (a point mass 2 on its own node pushed "
+                  f"by (1, 0.5, 0) for 1 s): u = ({u[1][0]:.7g}, {u[1][1]:.7g}, {u[1][2]:.2g}) "
+                  f"(F t^2 / 2m = (0.25, 0.125, 0); {err:.1e} off; before: 0)")
+        else:
+            print(f"FAIL  free_mass{tag}: no displacement of the mass")
+        failures += 0 if ok else 1
+
+    # initial velocities on the nodes of quadratic membranes written as solids: the solids' nodes
+    # took a transformed node's velocity turned as if local (both programs read it globally); a
+    # free square flying along x stayed flat only without the *TRANSFORM
+    runs = [review_run(membrane_velocity_deck(t), "membrane_velocity" + ("" if t else "_ref"),
+                       dat_displacements) for t in (True, False)]
+    ok = all(runs)
+    if ok:
+        err, moved = same_u(runs, [6, 7, 8])
+        flight = max(abs(v[0] - 0.2) + abs(v[1]) + abs(v[2]) for n, v in runs[0].items() if n in (6, 7, 8))
+        ok = err <= 1e-9 and flight <= 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  membrane_velocity (a free M3D8 square, initial velocity 2 "
+              f"along x, its nodes 1-5 under a *TRANSFORM): nodes 6-8 at u = (0.2, 0, 0) after 0.1 "
+              f"({flight:.1e} off; {err:.1e} from the untransformed twin; before: 5.9e-5 off)")
+    failures += 0 if ok else 1
+
+    # two kinematic couplings on one reference node: ccx turned each about a rotation of its
+    # own (1-2 % off); the converter makes them one coupling of all their nodes
+    runs = [review_run(shared_ref_deck(t), "shared_ref_coupling" + ("" if t else "_ref"),
+                       dat_displacements) for t in (True, False)]
+    ok = all(runs)
+    if ok:
+        err, moved = same_u(runs)
+        ok = err <= 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  shared_ref_coupling (a C3D8 bar's end nodes coupled to a "
+              f"loaded reference node by two *COUPLING cards): as one coupling of all four ({err:.1e} "
+              f"apart; |u| {moved:.4g}; before 9.0e-4 apart)")
+    failures += 0 if ok else 1
+
+    # a plane edge coupled to a beam's end node (the rigid-body form, ROT NODE on the node's
+    # rotations): the node drifted out of the plane (u3 0.035); now held there
+    runs = [review_run(plane_rb_coupling_deck(b), "plane_rb_coupling" + ("" if b else "_ref"),
+                       dat_displacements) for b in (True, False)]
+    ok = all(runs)
+    if ok:
+        err, moved = same_u(runs)
+        off = max(abs(v[2]) for v in runs[0].values())
+        ok = err <= 1e-9 * moved and off <= 1e-12 and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  plane_rb_coupling (a CPE4 block's top edge coupled to a "
+              f"B21 beam's end node, pushed): out of plane {off:.1e} (before 0.035), the plane motion "
+              f"as without the beam ({err:.1e} apart; |u| {moved:.4g})")
+    failures += 0 if ok else 1
+
+    # knot beams leaked the stretch of the section they knot (ccx's knot follows the knot
+    # beam's section): a slender cantilever's tip 1.3 % short of P L / E A; now 1e-6 as stiff
+    u = review_run(knot_axial_deck(), "knot_axial", dat_displacements)
+    ok = bool(u) and 5 in u
+    if ok:
+        want = 100.0 / (1000.0 * 0.05 ** 2)
+        err = abs(u[5][0] / want - 1.0)
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  knot_axial (a B31 cantilever, L 100, 0.05 x 0.05, its tip a "
+              f"knot, pulled by 1): stretch {u[5][0]:.7g} (P L / E A = {want:g}; {err:.1e} off; "
+              f"before 1.3e-2)")
+    else:
+        print("FAIL  knot_axial: no tip displacement")
+    failures += 0 if ok else 1
+
+    # a moment about a local axis of a deck's *TRANSFORM that is no section axis: kept as ccx's
+    # mean-rotation MPC it was 4x off; now on a knot in global components.  Against the same
+    # moment's components on a knotted tip in global axes
+    runs = [review_run(transformed_beam_moment_deck(t), "transformed_beam_moment" + ("_ref" if t else ""),
+                       dat_displacements) for t in (False, True)]
+    ok = all(runs)
+    if ok:
+        err, moved = same_u(runs)
+        ok = err <= 1e-7 * moved and moved > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  transformed_beam_moment (B31 cantilever, tip moment about "
+              f"local axis 2 of a *TRANSFORM 30 deg off the section axes): as its global components on "
+              f"a knot ({err:.1e} apart; tip |u| {moved:.4g}; before 4x off)")
+    failures += 0 if ok else 1
+
+    # knot beams on smooth shell nodes left the knot's rotation about the normal without
+    # stiffness, so ccx's answer hung on round-off (this plate's static step 16x too stiff); now
+    # held by an *EQUATION.  Against the same plate without the modal steps (no knots)
+    runs = [review_run(knot_drilling_deck(m), "knot_drilling" + ("" if m else "_ref"),
+                       lambda p: (dat_node_blocks(p) or [None])[0]) for m in (True, False)]
+    ok = all(runs)
+    if ok:
+        err, moved = same_u(runs)
+        ok = err <= 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  knot_drilling (an S4 plate with knot beams on 11 loaded nodes "
+              f"for its modal steps): the static step as without them ({err:.1e} apart; |u| {moved:.4g}; "
+              f"before 0.11 of it)")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

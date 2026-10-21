@@ -451,6 +451,27 @@ physics.
   SUBMODEL`, model data holding a `*PARAMETER` that does not evaluate, and step-time
   amplitudes in a `*MODAL DYNAMIC, CONTINUE=YES` step (Abaqus continues the step time there,
   ccx starts it at 0). A material whose copies took all its sections gets no conversion notes.
+* **Silently wrong answers** (ccx ran, exit 0, no message; each probed on 2.23):
+  - Temperatures: an initial shell/beam gradient with no `*TEMPERATURE` in the first step
+    gave the expanded nodes ccx's "undefined" marker (spurious strain), and `*TEMPERATURE,
+    OP=NEW` kept the last gradient; both now get the initial temperatures again. Gradients on
+    `OFFSET` S6 / S8 / S8R shells are written as `T - 2/3 g e t` (the mean was off by
+    `2/3 g e t`). Gradients across B31 / B31R beams, which ccx ignores, are warned.
+  - A point mass on a node of no other element never moved in `*DYNAMIC`; it gets a
+    zero-stiffness spring (warned where the deck has other steps). Initial velocities copied
+    onto quadratic membranes' solid nodes were turned as if local.
+  - Knot beams on smooth shell nodes left the knot's rotation about the normal without
+    stiffness, so ccx's answer hung on round-off (a knotted S4 plate 1.5-16x too stiff); that
+    rotation is now held. Knot beams also leaked their section stiffness into the knot (a
+    slender beam tip 1.3 % short); their modulus is now 1e-6 of the deck's.
+  - Two kinematic couplings of the same DOFs on one reference node turned apart (1-2 %); they
+    become one coupling. A plane-edge coupling on a beam node drifted out of plane. A moment or
+    rotation BC about a deck `*TRANSFORM` axis that is no beam section axis was 4x off; such
+    nodes now get a knot.
+  - Warned as reduced physics: dashpots on nodes a BC moves in `*DYNAMIC`, a small-strain
+    traction carried into an NLGEOM step, `*CLOAD` on plane-element nodes in modal steps, a
+    `*FREQUENCY` range feeding a modal step (ccx superposes every mode it computes), and
+    couplings of different DOFs on one reference node.
 
 ## 1.5.0 (October 2026)
 

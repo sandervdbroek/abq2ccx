@@ -4866,7 +4866,7 @@ def test_rigid_coupling_on_shell_nodes_gets_knot_beams():
     g = reparse(body)
     assert g.elements[3] == ("B31", [5, 101]) and g.elements[4] == ("B31", [6, 102])
     assert g.elsets["ABQ2CCX_KNOT"] == [3, 4] and not dangling_refs(g), dangling_refs(g)
-    assert ("*MATERIAL, NAME=ABQ2CCX_KNOT\n*ELASTIC\n1000., 0.\n*DENSITY\n0.\n*BEAM SECTION, "
+    assert ("*MATERIAL, NAME=ABQ2CCX_KNOT\n*ELASTIC\n0.001, 0.\n*DENSITY\n0.\n*BEAM SECTION, "
             "ELSET=ABQ2CCX_KNOT, MATERIAL=ABQ2CCX_KNOT, SECTION=RECT\n") in body
     assert "*KINEMATIC\n1, 3\n*EQUATION" in body
     assert _equations(body) == [f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6)]
@@ -8817,10 +8817,11 @@ def test_section_temperature_points_written_as_gradients():
     assert lines == ["PLATE, 25., 1000."]
     assert "temperatures at section points (TEMPERATURE=n / VALUES) not exact as ccx's temperature " \
            "and gradients" in conv.reduced_physics
-    # an OFFSET: the temperature at the reference surface, which ccx reads otherwise (probed)
+    # an OFFSET: the temperature at the reference surface (100), in the form an offset S8R
+    # reads right in ccx, T - 2/3 g e t (_plan_offset_gradients)
     lines, conv, _ = run("*Shell Section, elset=E, material=M, temperature=2, offset=SPOS\n0.1\n",
                          "PLATE, 0., 100.")
-    assert lines == ["PLATE, 100., 1000."] and conv.reduced_physics
+    assert lines == ["PLATE, 66.6666666667, 1000."] and not conv.reduced_physics
     # composite layers: n points per layer, shared at the interfaces; one per layer for n = 1
     plies = "0.05, 3, M, 0.\n0.05, 3, M, 90.\n"
     lines, conv, _ = run("*Shell Section, elset=E, composite, temperature=2\n" + plies, "PLATE, 0., 50., 100.")
@@ -9308,7 +9309,7 @@ def test_circ_beam_partial_rotation_bc_gets_knot_beam():
     g = reparse(body)
     assert list(conv._knots) == [1, 3] and g.elsets["ABQ2CCX_KNOT"] == [3, 4]
     assert g.elements[3] == ("B31", [1, 6]) and g.elements[4] == ("B31", [3, 7])
-    assert "*MATERIAL, NAME=ABQ2CCX_KNOT\n*ELASTIC\n210000., 0.\n*DENSITY\n0.\n" in body
+    assert "*MATERIAL, NAME=ABQ2CCX_KNOT\n*ELASTIC\n0.21, 0.\n*DENSITY\n0.\n" in body
     assert "*BOUNDARY\n1, 1, 4\n3, 2, 4\n*STEP" in body and not dangling_refs(g)
     assert "would lock the node's other rotations" in rep.text() and "(1, 3) got a force-free" \
         in rep.text()
@@ -14223,17 +14224,19 @@ def test_kinematic_reference_node_with_a_transform_becomes_a_rigid_body():
     deck = _transformed(KIN9 + "*Equation\n2\nRP, 6, 1., 1, 1, -1.\n" + STEP, "9", YX)
     body, conv, rep = convert_str(deck)
     assert sorted(_equation_terms(body)[0]) == [(1, 1, -1.), (conv._rb_rot[9], 3, 1.)]
-    # two couplings on the reference node: both rigid bodies, one ROT NODE; with one of them
-    # coupling some translations only, neither (that one cannot be a *RIGID BODY)
+    # two couplings of the same DOFs on the reference node: one coupling of all their nodes
+    # (_plan_shared_ref_couplings), one rigid body; with one of them coupling some
+    # translations only, neither (that one cannot be a *RIGID BODY), warned
     two = KIN9 + ("*Nset, nset=BOTN\n1, 2, 3, 4\n*Surface, type=NODE, name=BOTS\nBOTN\n"
                   "*Coupling, constraint name=C2, ref node=RP, surface=BOTS\n*Kinematic\n1, 6\n")
     body, conv, _ = convert_str(_transformed(two + KIN9_STEP.replace("1, 1, 3\n2, 1, 3\n3, 1, 3\n"
                                                                      "4, 1, 3\n", ""), "9", YX))
     rot = conv._rb_rot[9]
-    assert body.count(f"REF NODE=9, ROT NODE={rot}") == 2 and "*COUPLING" not in body
-    body, conv, _ = convert_str(_transformed(two.replace("*Kinematic\n1, 6\n*Nset", "*Kinematic\n"
-                                                         "1, 2\n*Nset") + KIN9_STEP, "9", YX))
+    assert body.count(f"REF NODE=9, ROT NODE={rot}") == 1 and "*COUPLING" not in body
+    body, conv, rep = convert_str(_transformed(two.replace("*Kinematic\n1, 6\n*Nset", "*Kinematic\n"
+                                                           "1, 2\n*Nset") + KIN9_STEP, "9", YX))
     assert body.count("*COUPLING") == 2 and 9 not in conv._rb_rot and conv._rot_mode[9] == "global"
+    assert "Kinematic couplings of different DOFs (or axes) on one reference node" in rep.text()
     # all three rotations held at zero (the same in any axes) uses no axes: still a coupling
     held = KIN9 + "*Step\n*Static\n*Boundary\nRP, 4, 4\nRP, 5, 5\nRP, 6, 6\n*End Step\n"
     body, conv, rep = convert_str(_transformed(held, "9", YX))
@@ -14608,8 +14611,8 @@ def test_kinematic_coupling_rotations_along_its_orientation():
     dense = S4 + "*Density\n1e-8\n"
     e = ORI_MIX_AXES
 
-    def ties(body):
-        return [row for row in _equation_terms(body) if row[0][1] >= 4]
+    def ties(body):     # (not the one-term holds of a knot's drilling rotation: _hold_knot_drilling)
+        return [row for row in _equation_terms(body) if row[0][1] >= 4 and len(row) > 1]
     for deck, target in ((S4 + ORI_MIX + cpl.format(d="1, 5") + stat.format(""), (100, 4)),
                          (S4 + ORI_MIX + legacy.format(d="1, 5") + stat.format(""), (100, 4)),
                          (dense + ORI_MIX + cpl.format(d="1, 5") + dyn, None)):
@@ -15692,13 +15695,20 @@ def _tip(steps, data="0., 1., 0., -1., 0., 0.5"):
 def test_transformed_beam_node_keeps_a_single_local_rotation():
     # on a beam node that is no knot ccx makes a rotational BC / moment a mean-rotation MPC
     # about the LOCAL axis (gen3dboun / gen3dforc use the transform): exact for one local
-    # rotation per node (probed, linear and NLGEOM) — kept as it is, no knot
+    # rotation per node about a section axis (probed, linear and NLGEOM) — kept as it is, no
+    # knot.  Here the local axes are the section's: n1 (0, 0.6, 0.8), n2, the beam axis
+    section = "0., 0.6, 0.8, 0., -0.8, 0.6"
     for steps in ("*Boundary\n3, 5, 5, 0.01\n", "*Cload\n3, 6, 2.\n",
                   "*Boundary\n3, 5, 5\n*End Step\n*Step\n*Static\n*Cload\n3, 5, 1.\n"):
-        body, conv, rep = convert_str(_tip(steps))
+        body, conv, rep = convert_str(_tip(steps, section))
         assert conv._rot_mode == {3: "keep"} and not conv._knots, steps
         assert rep.n_warnings == 0
-    assert "3,5,5,0.01" in _bc_lines(convert_str(_tip("*Boundary\n3, 5, 5, 0.01\n"))[0])
+    assert "3,5,5,0.01" in _bc_lines(convert_str(_tip("*Boundary\n3, 5, 5, 0.01\n", section))[0])
+    # about another axis the corners' angles read the other rotations too (probed: a tip
+    # moment about a local axis 30 deg off n1, 4x off): a knot, global components
+    for steps in ("*Boundary\n3, 5, 5, 0.01\n", "*Cload\n3, 6, 2.\n"):
+        body, conv, rep = convert_str(_tip(steps))
+        assert conv._rot_mode == {3: "global"} and list(conv._knots) == [3], steps
 
 
 def test_transformed_beam_node_rotations_in_global_components_on_a_knot():
@@ -15973,12 +15983,16 @@ def test_transformed_rotations_on_an_upgraded_beams_midside_node():
     # (node 4, between the clamped node 1 and node 2, follows them too: _plan_held_bcs)
     assert one.count("\n5, 4, 4, 0.00799") == 1 and f"{RAMP}\n4, 4, 4, 0.00183" in one
     assert one.split(RAMP)[3].count("\n5, 4, 4, 0.00799") == 1
-    # one local rotation on a node ccx makes no knot (a PIPE section): kept, ends and midside
+    # one local rotation on a node ccx makes no knot (a PIPE section), about a section axis
+    # (the beam axis: a transform about x): kept, ends and midside
     pipe = deck.replace("section=CIRC\n0.05", "section=PIPE\n0.05, 0.01").replace(
         "2, 4, 5, 0.01\n3, 4, 4, 0.02\n3, 5, 5, 0.01\n", "2, 4, 4, 0.01\n3, 4, 4, 0.02\n")
-    body, conv, _ = convert_str(pipe)
+    body, conv, _ = convert_str(pipe.replace(about_z, "1., 0., 0., 0., 0.8660254, 0.5"))
     assert conv._rot_mode == {2: "keep", 3: "keep", 5: "keep"} and not conv._knots
     assert "5,4,4,0.015" in _bc_lines(body)
+    # about an axis off the section's (the transform about z): the global form on knots
+    body, conv, _ = convert_str(pipe)
+    assert conv._rot_mode == {2: "global", 3: "global", 5: "global"} and list(conv._knots) == [2, 3, 5]
     # a composite shell edge's midside node (S4 -> S8R) on a fold, a ccx knot: global too
     # (before: local, which ccx reads about the global axes there; probed: 37 % off)
     fold = _transformed("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
@@ -22180,8 +22194,9 @@ def test_quadratic_membranes_become_solids_held_at_their_nodes():
 
 
 def test_quadratic_membrane_solids_take_velocity_initial_conditions():
-    # the solids' own nodes held at a membrane node take its initial velocity; in the global
-    # axes where the membrane node has a *TRANSFORM (here local x = global y, local z = z)
+    # the solids' own nodes held at a membrane node take its initial velocity, in the global
+    # axes also where the membrane node has a *TRANSFORM: both programs read initial
+    # velocities globally (before: turned as if local, here local x = global y)
     deck = (QM8_STRIP.replace("*Elastic\n100000., 0.3\n", "*Elastic\n100000., 0.3\n*Density\n1e-3\n")
             + "*Membrane Section, elset=SKIN, material=M\n0.01\n*Nset, nset=T\n13\n"
             "*Transform, nset=T\n0., 1., 0., -1., 0., 0.\n"
@@ -22196,7 +22211,7 @@ def test_quadratic_membrane_solids_take_velocity_initial_conditions():
         got.setdefault(conv._qmem_copies[int(n)], set()).add((int(n), int(d), float(v)))
     copies = {m: n for m, n in conv._qmem_copies.items() if n in (3, 13)}
     assert got[3] == {(m, 1, 2.0) for m, n in copies.items() if n == 3}
-    assert got[13] == {(m, d, v) for m, n in copies.items() if n == 13 for d, v in ((1, 0.), (2, 5.), (3, 1.))}
+    assert got[13] == {(m, d, v) for m, n in copies.items() if n == 13 for d, v in ((1, 5.), (3, 1.))}
     assert "lines on the nodes of quadratic membranes written as solids were extended" in rep.text()
 
 
@@ -23168,7 +23183,8 @@ def test_tied_contact_pair_counts_a_shell_slaves_thickness_on_a_rigid_master():
             "tied, adjust=0.1{}\nTOP, TOOL\n*Step\n*Static\n*Boundary\n9, 1, 6\n*End Step\n")
     body, conv, _ = convert_str(deck.format(""))
     assert abs(conv.geom.nodes[1][2] - 0.9) < 1e-12 and "\n*TIE" not in body
-    assert "*EQUATION" not in body and "*EQUATION" in convert_str(deck.replace(
+    # (only the holds of the knots' drilling rotations: _hold_knot_drilling)
+    assert all(len(row) == 1 for row in _equation_terms(body)) and "*EQUATION" in convert_str(deck.replace(
         "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied, adjust=0.1{}\n",
         "*Tie, name=T, position tolerance=0.1\n"))[0]
     body, conv, _ = convert_str(deck.format(", no thickness"))
@@ -25569,6 +25585,246 @@ def test_s8r_strips_one_element_wide_in_iterated_steps_warned():
         _, conv, rep = convert_str(strip(width, plastic))
         assert ("2 S8R element(s) (e.g. element 1) have two opposite edges" in rep.text()) == warned
         assert (flag in conv.reduced_physics) == warned, (width, plastic)
+
+# silently wrong answers (task 123): a 2 x 1 plate of two 8-node shells, alpha 1e-3
+GRAD_PLATE = ("*Node, nset=NALL\n1, 0, 0, 0.\n2, 0.5, 0, 0.\n3, 1, 0, 0.\n4, 1.5, 0, 0.\n5, 2, 0, 0.\n"
+              "6, 0, 0.5, 0.\n7, 1, 0.5, 0.\n8, 2, 0.5, 0.\n9, 0, 1, 0.\n10, 0.5, 1, 0.\n11, 1, 1, 0.\n"
+              "12, 1.5, 1, 0.\n13, 2, 1, 0.\n*Element, type={typ}, elset=EALL\n1, 1, 3, 11, 9, 2, 7, 10, 6\n"
+              "2, 3, 5, 13, 11, 4, 8, 12, 7\n*Material, name=M\n*Elastic\n1000., 0.\n*Expansion\n1.E-3\n"
+              "*Shell Section, elset=EALL, material=M{sec}\n0.1\n*Boundary\n1, 1, 3\n3, 2, 3\n9, 3, 3\n"
+              "*Initial Conditions, type=TEMPERATURE\nNALL, {ic}\n")
+
+
+def _grad_plate(steps, ic="0.", typ="S8R", sec=""):
+    return GRAD_PLATE.format(typ=typ, sec=sec, ic=ic) + steps
+
+
+def test_initial_gradient_given_again_in_the_first_step():
+    # an initial gradient and no *TEMPERATURE for a node in step 1: ccx 2.23 gives the outer
+    # expanded nodes the 'undefined' marker 1.2357 -/+ g t / 2 (probed: the plate shrank);
+    # the initial lines are given again first in that step
+    body, _, rep = convert_str(_grad_plate("*Step\n*Static\n*End Step\n", ic="50., 30."))
+    assert "*TEMPERATURE\nNALL, 50., 30.\n" in _step(body, 1)
+    assert "given again in step 1, the first that takes temperatures" in rep.text()
+    # before the step's own card, which replaces the lines of its nodes
+    body, _, _ = convert_str(_grad_plate("*Step\n*Static\n*Temperature\n5, 60.\n*End Step\n", ic="50., 30."))
+    assert "*TEMPERATURE\nNALL, 50., 30.\n*TEMPERATURE\n5, 60.\n" in _step(body, 1)
+    # a step whose lines name every initial line's target needs none
+    body, _, _ = convert_str(_grad_plate("*Step\n*Static\n*Temperature\nNALL, 60.\n*End Step\n", ic="50., 30."))
+    assert _step(body, 1).count("*TEMPERATURE") == 1
+    # no initial gradient, or a first step that solves for temperatures: nothing added
+    body, _, rep = convert_str(_grad_plate("*Step\n*Static\n*End Step\n", ic="50."))
+    assert "*TEMPERATURE" not in body and "given again" not in rep.text()
+    body, _, _ = convert_str(_grad_plate("*Step\n*Heat Transfer, steady state\n*End Step\n", ic="50., 30."))
+    assert "*TEMPERATURE\n" not in body
+
+
+def test_temperature_op_new_after_gradients_gives_the_initial_ones():
+    # ccx 2.23's OP=NEW resets the temperatures but keeps the last gradients (probed: the plate
+    # stayed bent): the initial lines go first on the OP=NEW card, the step's own lines after
+    one = "*Step\n*Static\n*Temperature\nNALL, 20., 100.\n*End Step\n"
+    body, _, rep = convert_str(_grad_plate(one + "*Step\n*Static\n*Temperature, op=NEW\n*End Step\n"))
+    assert "*TEMPERATURE, OP=NEW\nNALL, 0.\n" in _step(body, 2)
+    assert "OP=NEW after temperature gradients (step 2)" in rep.text()
+    body, _, _ = convert_str(_grad_plate(one + "*Step\n*Static\n*Temperature, op=NEW, amplitude=A\n5, 30.\n"
+                                         "*End Step\n").replace("*Step", "*Amplitude, name=A\n0., 0., 1., 1.\n*Step", 1))
+    assert "*TEMPERATURE, OP=NEW\nNALL, 0.\n*TEMPERATURE, AMPLITUDE=A\n5, 30.\n" in _step(body, 2)
+    # after a linear perturbation step the base state's card starts with the initial lines
+    # already (BaseStateRestore): no second one
+    body, _, _ = convert_str(_grad_plate(one + "*Step, perturbation\n*Static\n*Temperature\nNALL, 30., 50.\n"
+                                         "*End Step\n*Step\n*Static\n*Cload\n5, 1, 1.\n*End Step\n", ic="5., 10."))
+    assert _step(body, 3).count("*TEMPERATURE") == 1 and "OP=NEW" in _step(body, 3)
+    # no gradient given anywhere: the card as it is
+    body, _, _ = convert_str(_grad_plate("*Step\n*Static\n*Temperature\nNALL, 20.\n*End Step\n"
+                                         "*Step\n*Static\n*Temperature, op=NEW\n*End Step\n"))
+    assert _step(body, 2).count("*TEMPERATURE") == 1
+
+
+def test_offset_shell_gradients_written_for_the_mid_thickness_node():
+    # ccx 2.23 gives an offset shell's mid-thickness expanded node the reference surface's
+    # temperature (the mean 2/3 g e t off): on S6 / S8 / S8R a line (T, g) becomes
+    # (T - 2/3 g e t, g), here e 0.5, t 0.1
+    step = "*Step\n*Static\n*Temperature\nNALL, 10., 100.\n*End Step\n"
+    body, conv, rep = convert_str(_grad_plate(step, sec=", offset=SPOS"))
+    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["NALL, 6.66666666667, 100."]
+    assert "OFFSET shells (S6 / S8 / S8R)" in rep.text() and not conv.reduced_physics
+    # initial lines too; lines without a gradient and shells without offset as they are
+    body, _, _ = convert_str(_grad_plate(step, ic="5., 30.", sec=", offset=-0.25"))
+    assert "NALL, 5.5, 30." in body.split("*STEP")[0]
+    body, _, _ = convert_str(_grad_plate("*Step\n*Static\n*Temperature\nNALL, 10.\n*End Step\n",
+                                         sec=", offset=SPOS"))
+    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["NALL, 10."]
+    body, _, _ = convert_str(_grad_plate(step))
+    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["NALL, 10., 100."]
+    # a node of an offset S8R and of a plain one: no form fits both, warned
+    mixed = _grad_plate(step, sec=", offset=SPOS").replace(
+        "2, 3, 5, 13, 11, 4, 8, 12, 7\n", "*Element, type=S8R, elset=E2\n2, 3, 5, 13, 11, 4, 8, 12, 7\n").replace(
+        "*Boundary", "*Shell Section, elset=E2, material=M\n0.1\n*Boundary")
+    body, conv, rep = convert_str(mixed)
+    assert "shells beside it that read the line otherwise" in rep.text() and conv.reduced_physics
+    assert any(ln.endswith(", 6.66666666667, 100.") for ln in _card_at(_step(body, 1), "*TEMPERATURE"))
+    # S3 (bottom and top nodes only) reads it right as it is
+    s3 = (GRAD_PLATE.replace("*Element, type={typ}, elset=EALL\n1, 1, 3, 11, 9, 2, 7, 10, 6\n"
+                             "2, 3, 5, 13, 11, 4, 8, 12, 7\n", "*Element, type=S3, elset=EALL\n1, 1, 3, 11\n"
+                             "2, 1, 11, 9\n").format(typ="", sec=", offset=SPOS", ic="0.") + step)
+    body, conv, rep = convert_str(s3)
+    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["NALL, 10., 100."] and not conv.reduced_physics
+
+
+def test_b31_gradients_warned():
+    # ccx 2.23 ignores beam temperature gradients on B31 / B31R (B32 reads them)
+    beam = ("*Node, nset=NALL\n1, 0., 0., 0.\n2, 0., 0., 0.5\n3, 0., 0., 1.\n*Element, type={}, elset=B\n"
+            "1, 1, 2\n2, 2, 3\n*Material, name=M\n*Elastic\n1000., 0.\n*Expansion\n1e-3\n"
+            "*Beam Section, elset=B, material=M, section=RECT\n0.1, 0.1\n1., 0., 0.\n*Boundary\n1, 1, 6\n"
+            "*Initial Conditions, type=TEMPERATURE\nNALL, 0.\n*Step\n*Static\n*Temperature\nNALL, 10., {}\n"
+            "*End Step\n")
+    _, conv, rep = convert_str(beam.format("B31", "100., 0."))
+    assert "gradients across B31 / B31R beams on 3 node(s)" in rep.text()
+    assert "temperature gradient on B31 / B31R beams (ccx ignores it)" in conv.reduced_physics
+    _, conv, rep = convert_str(beam.format("B31", "0., 0."))
+    assert "B31 / B31R beams" not in rep.text()
+    _, conv, rep = convert_str(beam.format("B32", "100., 0.").replace("1, 1, 2\n2, 2, 3\n", "1, 1, 2, 3\n"))
+    assert "B31 / B31R beams" not in rep.text()
+
+
+def test_free_point_mass_gets_a_zero_spring_in_dynamic_decks():
+    # ccx 2.23 never moves a node of MASS elements only in *DYNAMIC (probed): a zero-stiffness
+    # SPRINGA to a new node held by one-term equations makes it move (exact)
+    mass = "*Node, nset=P\n1, 0., 0., 0.\n*Element, type=MASS, elset=EM\n1, 1\n*Mass, elset=EM\n2.\n"
+    dyn = "*Step\n*Dynamic\n0.01, 1.\n*Cload\n1, 1, 1.\n*End Step\n"
+    body, conv, rep = convert_str(mass + dyn)
+    g = reparse(body)
+    assert g.elements[2] == ("SPRINGA", [1, 2]) and g.elsets["ABQ2CCX_FREE_MASS"] == [2]
+    assert "*SPRING, ELSET=ABQ2CCX_FREE_MASS\n0.\n" in body
+    assert "*EQUATION\n1\n2, 1, 1\n*EQUATION\n1\n2, 2, 1\n*EQUATION\n1\n2, 3, 1\n" in body
+    assert "got a SPRINGA of zero stiffness" in rep.text() and not conv.reduced_physics
+    # a static step too: singular with the spring, so warned
+    _, conv, rep = convert_str(mass + "*Step\n*Static\n*End Step\n" + dyn)
+    assert "point masses on nodes of no other element stand still in *DYNAMIC steps" in conv.reduced_physics
+    # tied by an equation, or no dynamic step: ccx moves it / nothing to do
+    body, _, _ = convert_str(mass + "*Node\n9, 1., 0., 0.\n*Equation\n2\n9, 1, 1., 1, 1, -1.\n" + dyn)
+    assert "FREE_MASS" not in body
+    body, _, _ = convert_str(mass + "*Step\n*Static\n*End Step\n")
+    assert "FREE_MASS" not in body
+
+
+def test_dashpot_on_a_bc_driven_node_warned():
+    # ccx 2.23's DASHPOTA damps as if a node a displacement BC moves stood still (probed)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=MASS, elset=EM\n11, 1\n*Mass, elset=EM\n1.\n"
+            "*Element, type=DASHPOTA, elset=D\n21, 1, 2\n*Dashpot, elset=D\n\n10.\n*Boundary\n1, 2, 3\n2, 2, 3\n"
+            "*Step\n*Dynamic\n0.01, 2.\n*Cload\n1, 1, 1.\n*Boundary\n2, 1, 1, {}\n*End Step\n")
+    _, conv, rep = convert_str(deck.format("0.1"))
+    assert "Dashpot(s) on 1 node(s) that a displacement BC moves" in rep.text()
+    assert "dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)" in conv.reduced_physics
+    _, conv, rep = convert_str(deck.format("0."))
+    assert "Dashpot(s) on" not in rep.text()
+
+
+def test_couplings_on_one_reference_node_become_one():
+    # ccx 2.23 turns each kinematic coupling about a rotation of its own (probed: 1-2 % off):
+    # couplings of the same DOFs on one reference node become one coupling of all their nodes
+    bar = (HEX + HEX_SEC + "*Node\n100, 0.5, 0.5, 2.\n*Nset, nset=A\n5, 6\n*Nset, nset=B\n7, 8\n"
+           "*Surface, type=NODE, name=SA\nA\n*Surface, type=NODE, name=SB\nB\n"
+           "*Coupling, constraint name=C1, ref node=100, surface=SA\n*Kinematic\n{}"
+           "*Coupling, constraint name=C2, ref node=100, surface=SB\n*Kinematic\n{}"
+           "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*Step\n*Static\n*Cload\n100, 1, 1.\n*End Step\n")
+    body, conv, rep = convert_str(bar.format("", "1, 3\n"))
+    assert body.count("*COUPLING") == 1 and "SURFACE=ABQ2CCX_REF100_COUPLED" in body
+    assert "*SURFACE, NAME=ABQ2CCX_REF100_COUPLED, TYPE=NODE\n5\n6\n7\n8\n" in body
+    assert "one coupling of all their nodes" in rep.text() and not conv.reduced_physics
+    # other DOFs: two couplings, warned
+    body, conv, rep = convert_str(bar.format("1, 3\n", "1, 2\n"))
+    assert body.count("*COUPLING") == 2
+    assert "kinematic couplings of different DOFs on one reference node (ccx turns them apart)" \
+        in conv.reduced_physics
+    # a legacy card whose members couple other DOF sets: likewise
+    _, conv, _ = convert_str(HEX + HEX_SEC + "*Node\n100, 0.5, 0.5, 2.\n*Kinematic Coupling, ref node=100\n"
+                             "5, 1, 3\n6, 1, 2\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+                             "*Step\n*Static\n*Cload\n100, 1, 1.\n*End Step\n")
+    assert any("different DOFs on one reference node" in r for r in conv.reduced_physics)
+
+
+def test_plane_edge_coupling_on_a_beam_node_held_in_its_plane():
+    # a kinematic coupling of plane elements' nodes to a B21 beam's end node is written as a
+    # rigid body whose ROT NODE follows the node: its out-of-plane DOFs 3-5 held (it drifted)
+    deck = ("*Node\n1, 0, 0\n2, 1, 0\n3, 0, 1\n4, 1, 1\n100, 0.5, 2\n101, 0.5, 3\n*Element, type=CPE4, "
+            "elset=E\n1, 1, 2, 4, 3\n*Elset, elset=TOPE\n1\n*Surface, name=TOP\nTOPE, S3\n*Material, name=M\n"
+            "*Elastic\n1000., 0.3\n*Solid Section, elset=E, material=M\n1.\n*Element, type=B21, elset=BM\n"
+            "10, 100, 101\n*Beam Section, elset=BM, material=M, section=RECT\n0.1, 0.1\n"
+            "*Coupling, ref node=100, surface=TOP, constraint name=C\n*Kinematic\n*Step\n*Static\n"
+            "*Boundary\n1, 1, 2\n2, 1, 2\n*Cload\n100, 1, 1.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert conv._coupling_plan and "100,3,5" in _bc_lines(body.split("*STEP")[0])
+
+
+def test_traction_carried_into_an_nlgeom_step_warned():
+    # a small-strain step's TRVEC became fixed nodal forces; in a later NLGEOM step Abaqus
+    # applies it as a follower load
+    hexs = HEX + HEX_SEC + "*Surface, name=TOP\nEALL, S2\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 3, 3\n"
+    one = "*Step\n*Static\n*Dsload{}\nTOP, TRVEC, 4., 1., 0., 0.\n*End Step\n"
+    _, conv, rep = convert_str(hexs + one.format("") + "*Step, nlgeom\n*Static\n*End Step\n")
+    assert "stays in force in step 2, which runs under NLGEOM" in rep.text()
+    assert any("carried into an NLGEOM step" in r for r in conv.reduced_physics)
+    # a dead load (FOLLOWER=NO, CONSTANT RESULTANT=YES) is exact; given again, the step writes it
+    _, conv, rep = convert_str(hexs + one.format(", follower=NO, constant resultant=YES") +
+                               "*Step, nlgeom\n*Static\n*End Step\n")
+    assert "stays in force" not in rep.text()
+    _, conv, rep = convert_str(hexs + one.format("") + "*Step, nlgeom\n*Static\n*Dsload, op=NEW\n*End Step\n")
+    assert "stays in force" not in rep.text()
+
+
+def test_plane_node_cload_in_a_modal_step_warned():
+    # ccx 2.23 applies a force on a CPS4 / CPE4 node wrongly in modal steps; no knot fits
+    deck = ("*Node\n1, 0., 0.\n2, 0., 0.1\n3, 0.1, 0.\n4, 0.1, 0.1\n*Element, type=CPS4, elset=P\n"
+            "1, 1, 3, 4, 2\n*Material, name=M\n*Elastic\n2e5, 0.3\n*Density\n1e-3\n"
+            "*Solid Section, elset=P, material=M\n0.01\n*Boundary\n1, 1, 2\n2, 1, 2\n"
+            "*Step\n*Frequency\n3\n*End Step\n*Step\n*{}\n*Cload\n4, 2, 1.\n*End Step\n")
+    _, conv, rep = convert_str(deck.format("Modal Dynamic\n0.0001, 0.01"))
+    assert "*CLOAD on 1 node(s) of plane / axisymmetric elements" in rep.text()
+    assert any("plane-element nodes in modal steps" in r for r in conv.reduced_physics)
+    _, conv, rep = convert_str(deck.format("Static"))
+    assert "plane / axisymmetric elements (e.g." not in rep.text()
+
+
+def test_frequency_range_feeding_a_modal_step_warned():
+    # ccx 2.23 superposes every mode it computed, Abaqus only those in the *FREQUENCY range
+    deck = ("*Node\n1, 0., 0.\n2, 0., 0.1\n3, 0.1, 0.\n4, 0.1, 0.1\n*Element, type=CPS4, elset=P\n"
+            "1, 1, 3, 4, 2\n*Material, name=M\n*Elastic\n2e5, 0.3\n*Density\n1e-3\n"
+            "*Solid Section, elset=P, material=M\n0.01\n*Boundary\n1, 1, 2\n2, 1, 2\n"
+            "*Step\n*Frequency\n{}\n*End Step\n{}")
+    ssd = "*Step\n*Steady State Dynamics\n10., 1000., 10\n*Dload\n1, P2, 1.\n*End Step\n"
+    _, conv, rep = convert_str(deck.format("5, 0., 3000.", ssd))
+    assert "*FREQUENCY with a frequency range, whose modes a later modal step" in rep.text()
+    assert any("only those in the *FREQUENCY range" in r for r in conv.reduced_physics)
+    for line, after in (("5", ssd), ("5, 0., 3000.", "")):
+        _, conv, rep = convert_str(deck.format(line, after))
+        assert "*FREQUENCY with a frequency range" not in rep.text(), (line, after)
+
+
+
+def test_knot_drilling_rotation_held_on_shell_nodes():
+    # a knot beam's knot on a smooth shell node: its rotation about the normal has no stiffness
+    # (the shell's expanded nodes lie on the normal, the knot beam is force-free), so ccx's
+    # answer hung on round-off (probed: a knotted S4 plate 1.5x-16x too stiff): n . theta = 0
+    strip = ("*Node\n" + "".join(f"{1 + i + 5 * j}, {float(i)}, {float(j)}, 0.\n" for j in range(2) for i in range(5)) +
+             "*Element, type=S4, elset=E\n" + "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 7}, {i + 6}\n" for i in range(4)) +
+             "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Shell Section, elset=E, material=M\n0.1\n"
+             "*Boundary\n1, 1, 6\n6, 1, 6\n5, 1, 6\n10, 1, 6\n*Step\n*Frequency\n3\n*End Step\n"
+             "*Step\n*Steady State Dynamics\n1., 10., 3\n*Cload\n3, 3, 1.\n{}*End Step\n")
+    body, conv, rep = convert_str(strip.format(""))
+    assert 3 in conv._knots and "*EQUATION\n1\n3, 6, 1\n" in body
+    assert "rotation about the shell normal held by an *EQUATION" in rep.text()
+    # a rotational BC on the node: left as it is
+    body, conv, _ = convert_str(strip.format("*Boundary\n3, 4, 4\n"))
+    assert "*EQUATION\n1\n3, 6, 1\n" not in body
+    # a rigid coupling that ties all the member's rotations needs none; one of DOFs 1-3 only does
+    s4 = (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n"
+          "*Kinematic\n")
+    body, _, _ = convert_str(s4)
+    assert "*EQUATION\n1\n" not in body
+    body, _, _ = convert_str(s4 + "1, 3\n")
+    assert "*EQUATION\n1\n5, 6, 1\n*EQUATION\n1\n6, 6, 1" in body
+
 
 if __name__ == "__main__":
     import inspect
