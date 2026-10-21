@@ -101,41 +101,62 @@ subroutine" instead of running another material. With it, every mechanical user 
 becomes `ABAQUS<name>` for ccx's Abaqus-UMAT interface (small strain), or `ABAQUSNL<name>` in
 a deck with NLGEOM steps (logarithmic strain); a note names each UMAT argument ccx supplies
 differently ([compatibility](compatibility.md#materials)). A stock ccx runs its linear-elastic
-example there, so build one with the deck's UMAT:
+example there; to run the deck's UMAT, build ccx 2.23 with it. With conda-forge's compilers and
+libraries (tested on macOS arm64; any gfortran and C compiler with SPOOLES 2.2, ARPACK and
+LAPACK will do):
 
-1. Unpack the ccx 2.23 sources (`ccx_2.23.src.tar.bz2`, <https://www.dhondt.de>) and build
-   SPOOLES 2.2 (`make lib`, with `CC` set in `Make.inc` and `drawTree.c` renamed `draw.c` in
-   `Tree/src/makeGlobalLib`) and ARPACK, without which ccx 2.23 does not link.
-2. Save the deck's UMAT as `src/umat.f` in place of ccx's example (the routine is `umat`, with
-   Abaqus' arguments), next to an `ABA_PARAM.INC` holding `implicit real*8(a-h,o-z)` and
-   `parameter (nprecd=2)`. ccx has no Abaqus utility routines (`XIT`, `SINV`, `SPRINC`,
-   `ROTSIG`, …): supply those it calls.
-3. `make ccx_2.23` in `src` with gfortran, a LAPACK in `LIBS` (ccx calls `dgesv`; give
-   libraries as file paths, as the Makefile also lists them as prerequisites), and run the
-   converted deck with the new `ccx_2.23`. On macOS with Homebrew's gcc 13, compile the C
-   files with Apple clang (`-Wno-int-conversion -Wno-incompatible-pointer-types
-   -Wno-implicit-function-declaration -Wno-implicit-int -Wno-return-mismatch`, SPOOLES also
-   `-std=gnu89`) and link with `SDKROOT=$(xcrun --show-sdk-path)`.
+```bash
+conda create -y -n ccx-umat -c conda-forge "spooles>=2.2=*_1006" "arpack=*=nompi*" liblapack c-compiler fortran-compiler make
+conda activate ccx-umat
+```
 
-Built this way with a J2 UMAT (isotropic hardening, radial return), a `C3D8` and a `CPE4`
-cantilever bent well past yield give exactly the reactions and stresses of the same models with
-`*ELASTIC` and `*PLASTIC`.
+Unpack the ccx 2.23 sources (`ccx_2.23.src.tar.bz2`, <https://www.dhondt.de>) and, in
+`CalculiX/ccx_2.23/src`:
+
+1. Replace `umat.f` with the deck's UMAT (fixed-form Fortran), with the files it `INCLUDE`s
+   beside it; `ABA_PARAM.INC` holds `implicit real*8(a-h,o-z)` and `parameter (nprecd=2)`. ccx
+   calls only `UMAT` and has none of Abaqus' utility routines (`XIT`, `SINV`, `SPRINC`,
+   `ROTSIG`, `GETOUTDIR`, …): add those the link step reports missing.
+2. Set U0 in `umat_abaqusnl.f`, which ccx 2.23 never does
+   ([#225](https://github.com/Dhondtguido/CalculiX/issues/225)): under `ABAQUSNL` a UMAT that
+   adds to the stress it gets (plasticity, damage, any incremental law) goes wrong without it.
+
+   ```bash
+   python3 - <<'EOF'
+   p, a = "umat_abaqusnl.f", "      um1(3,2)=um1(2,3)\n"
+   u0 = ("      do jj=1,6\n"
+         "        u0(kal(1,jj),kal(2,jj))=xm1(jj)/wum1(1)+xm2(jj)/wum1(2)\n"
+         "     &       +xm3(jj)/wum1(3)\n"
+         "        u0(kal(2,jj),kal(1,jj))=u0(kal(1,jj),kal(2,jj))\n"
+         "      enddo\n")
+   s = open(p).read()
+   open(p, "w").write(s.replace(a, a + u0, 1))
+   EOF
+   ```
+3. Build `ccx_umat` (the `-Wno-` flags let today's C compilers take ccx 2.23's C; elsewhere
+   name your C and Fortran compilers in `CC`, `FC` and the link line):
+
+   ```bash
+   make -j4 CalculiX.o CalculiX.a CC=clang FC=gfortran FFLAGS="-O2 -cpp -fallow-argument-mismatch -w" \
+     CFLAGS="-O2 -w -I$CONDA_PREFIX/include/spooles -DARCH=\"Linux\" -DSPOOLES -DARPACK -DMATRIXSTORAGE -DNETWORKOUT -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-function-declaration -Wno-implicit-int -Wno-return-mismatch"
+   gfortran -o ccx_umat CalculiX.o CalculiX.a $CONDA_PREFIX/lib/spooles.a -L$CONDA_PREFIX/lib -larpack -llapack -lblas -lpthread -lm -Wl,-rpath,$CONDA_PREFIX/lib
+   ```
+
+   For another UMAT, replace `umat.f`, then `gfortran -O2 -c umat.f && ar r CalculiX.a umat.o`
+   and link again.
+
+Then `abq2ccx --abaqus-umat --run --ccx ./ccx_umat model.inp` converts and runs the deck.
+Built this way with an elastic and a J2 UMAT (isotropic hardening, radial return), cantilevers
+of ten element types bent past yield give exactly the reactions, displacements and stresses of
+the same models with `*ELASTIC` and `*PLASTIC`, and with NLGEOM within 4e-5 of ccx's own
+plasticity; without step 2 the NLGEOM J2 cantilever's tip reaction ends 70 % low. Under
+`ABAQUSNL` the strain and stress come in axes that turn with the material, yet DROT is the
+rotation increment (Abaqus passes the unit matrix in such axes): drop a UMAT's turning of its
+tensor state variables by DROT (`ROTSIG`), or it turns them away from STRESS.
 
 A ccx built with `-DCALCULIX_EXTERNAL_BEHAVIOURS_SUPPORT` (`src/Makefile_MFront`) loads the
 UMAT from a shared library instead: rename the material `@ABAQUS_<LIB>_<FUNCTION>` for the
-function `<FUNCTION>` in `lib<LIB>.so` (ccx manual 8.5); FreeCAD's ccx has no such support.
-In ccx 2.23 `umat_abaqusnl.f` never sets U0, so under `ABAQUSNL` a UMAT that adds to the
-stress it gets (plasticity, damage) goes wrong: under NLGEOM that J2 cantilever's tip reaction
-stayed near its first increment's value, 70 % low at the end. Set U0 after the first
-`um1(3,2)=um1(2,3)` line, and it matches ccx's own plasticity to 2e-5:
-
-```fortran
-      do jj=1,6
-        u0(kal(1,jj),kal(2,jj))=xm1(jj)/wum1(1)+xm2(jj)/wum1(2)
-     &       +xm3(jj)/wum1(3)
-        u0(kal(2,jj),kal(1,jj))=u0(kal(1,jj),kal(2,jj))
-      enddo
-```
+function `<FUNCTION>` in `lib<LIB>.so` (ccx manual 8.5); a stock build has no such support.
 
 A `TYPE=THERMAL` user material always goes to `umatht.f` (Abaqus' UMATHT arguments first; ccx
 uses only FLUX and DFDG). ccx has no VUMAT interface: an Abaqus/Explicit deck's user material

@@ -15011,7 +15011,8 @@ class _Materials:
         running a different material.  With --abaqus-umat it becomes ABAQUS<name> for ccx's
         Abaqus-UMAT interface (umat_abaqus.f: Green-Lagrange strain, which is Abaqus' strain for
         small deformations), ABAQUSNL<name> in a deck with NLGEOM steps (umat_abaqusnl.f:
-        logarithmic strain and rotation increments, as Abaqus under NLGEOM) — not in an
+        logarithmic strain and Cauchy stress in axes that turn with the material, as Abaqus'
+        with a local orientation, though DROT is the rotation increment) — not in an
         Abaqus/Explicit deck, whose user materials are VUMATs.  The *MATERIAL and every
         reference to it (MATERIAL=, composite plies) are renamed."""
         mech: "OrderedDict[str, str]" = OrderedDict()     # upper-case NAME -> NAME
@@ -15078,9 +15079,14 @@ class _Materials:
                                  "it is. Set U0 in umat_abaqusnl.f (the user guide gives the lines) "
                                  "or, where strains and rotations stay small, rename the material "
                                  "ABAQUS<name> (small strain).", once=True)
-                notes = ["STRAN, DSTRAN, DROT: the logarithmic strain, its increment and the "
-                         "rotation increment, in the corotational frame as in Abaqus; ccx assumes "
-                         "an isotropic thermal expansion"]
+                notes = ["STRAN, DSTRAN, STRESS: the logarithmic strain, its increment and the "
+                         "Cauchy stress, in axes that turn with the material (Abaqus' axes with a "
+                         "local orientation); ccx assumes an isotropic thermal expansion",
+                         "DROT: the rotation increment, though those axes already turn with the "
+                         "material (Abaqus then passes the unit matrix), so a UMAT that turns its "
+                         "tensor state variables by DROT (ROTSIG) turns them away from STRESS",
+                         "COORDS: the integration point in the undeformed model (Abaqus: its "
+                         "current position under NLGEOM)"]
             else:
                 notes = ["STRAN, DSTRAN, STRESS, DROT: the Green-Lagrange strain and its increment, "
                          "the second Piola-Kirchhoff stress and DROT = identity — Abaqus' values "

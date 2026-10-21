@@ -1076,6 +1076,266 @@ def umat_cube_deck(name, nlgeom=False):
             f"*STEP{', NLGEOM' if nlgeom else ''}\n*STATIC\n0.25, 1.\n*BOUNDARY\nTOP,3,3,0.001\n"
             "*EL PRINT, ELSET=E\nS\n*END STEP\n")
 
+# The test UMAT of the umat_build checks: a ccx 2.23 built with it as umat.f by the user
+# guide's --abaqus-umat recipe (the U0 fix included) runs them, with CCX_UMAT naming it:
+#   python -c "import validate_with_ccx as v; print(v.TEST_UMAT, end='')" > umat.f
+#   CCX_UMAT=/path/to/ccx_umat python validate_with_ccx.py
+TEST_UMAT = """C     abq2ccx validate_with_ccx.py test UMAT. CMNAME (the material name
+C     without ABAQUS/ABAQUSNL) picks the law; PROPS = E, NU (, SY0, H):
+C     EL...  incremental isotropic elasticity
+C     J2...  EL with J2 plasticity, linear isotropic hardening H, radial
+C            return, consistent tangent; STATEV(1) = PEEQ
+C     ROT... EL; STATEV(1-6) = a copy of the stress turned by DROT each
+C            increment (as ROTSIG), STATEV(7-12) = STRESS, 13-15 COORDS
+      SUBROUTINE UMAT(STRESS,STATEV,DDSDDE,SSE,SPD,SCD,RPL,DDSDDT,
+     1 DRPLDE,DRPLDT,STRAN,DSTRAN,TIME,DTIME,TEMP,DTEMP,PREDEF,DPRED,
+     2 CMNAME,NDI,NSHR,NTENS,NSTATV,PROPS,NPROPS,COORDS,DROT,PNEWDT,
+     3 CELENT,DFGRD0,DFGRD1,NOEL,NPT,LAYER,KSPT,KSTEP,KINC)
+      IMPLICIT REAL*8(A-H,O-Z)
+      CHARACTER*80 CMNAME
+      DIMENSION STRESS(NTENS),STATEV(*),DDSDDE(NTENS,NTENS),
+     1 STRAN(NTENS),DSTRAN(NTENS),PROPS(*),COORDS(3),DROT(3,3),S(6),
+     2 A(3,3),T(3,3)
+      G=PROPS(1)/(2.D0*(1.D0+PROPS(2)))
+      BK=PROPS(1)/(3.D0*(1.D0-2.D0*PROPS(2)))
+      B=1.D0
+      C=0.D0
+      DO I=1,6
+        S(I)=0.D0
+        DO J=1,6
+          DDSDDE(I,J)=0.D0
+        END DO
+      END DO
+      DO I=1,3
+        DO J=1,3
+          DDSDDE(I,J)=BK-2.D0*G/3.D0
+        END DO
+        DDSDDE(I,I)=BK+4.D0*G/3.D0
+        DDSDDE(I+3,I+3)=G
+      END DO
+      DO I=1,6
+        DO J=1,6
+          STRESS(I)=STRESS(I)+DDSDDE(I,J)*DSTRAN(J)
+        END DO
+      END DO
+      IF (CMNAME(1:2).EQ.'J2') THEN
+        P=(STRESS(1)+STRESS(2)+STRESS(3))/3.D0
+        DO I=1,6
+          S(I)=STRESS(I)
+        END DO
+        DO I=1,3
+          S(I)=S(I)-P
+        END DO
+        SN=SQRT(S(1)**2+S(2)**2+S(3)**2+2.D0*(S(4)**2+S(5)**2
+     1    +S(6)**2))
+        Q=SQRT(1.5D0)*SN
+        SY=PROPS(3)+PROPS(4)*STATEV(1)
+        IF (Q.GT.SY) THEN
+          DP=(Q-SY)/(3.D0*G+PROPS(4))
+          STATEV(1)=STATEV(1)+DP
+          B=1.D0-3.D0*G*DP/Q
+          C=3.D0*G/(3.D0*G+PROPS(4))-3.D0*G*DP/Q
+          DO I=1,6
+            STRESS(I)=STRESS(I)-(1.D0-B)*S(I)
+            S(I)=S(I)/SN
+          END DO
+          DO I=1,3
+            DO J=1,3
+              DDSDDE(I,J)=BK-2.D0*G*B/3.D0
+            END DO
+            DDSDDE(I,I)=BK+4.D0*G*B/3.D0
+            DDSDDE(I+3,I+3)=G*B
+          END DO
+          DO I=1,6
+            DO J=1,6
+              DDSDDE(I,J)=DDSDDE(I,J)-2.D0*G*C*S(I)*S(J)
+            END DO
+          END DO
+        END IF
+      ELSE IF (CMNAME(1:3).EQ.'ROT') THEN
+        A(1,1)=STATEV(1)
+        A(2,2)=STATEV(2)
+        A(3,3)=STATEV(3)
+        A(1,2)=STATEV(4)
+        A(1,3)=STATEV(5)
+        A(2,3)=STATEV(6)
+        A(2,1)=A(1,2)
+        A(3,1)=A(1,3)
+        A(3,2)=A(2,3)
+        DO I=1,3
+          DO J=1,3
+            T(I,J)=0.D0
+            DO K=1,3
+              DO L=1,3
+                T(I,J)=T(I,J)+DROT(I,K)*A(K,L)*DROT(J,L)
+              END DO
+            END DO
+          END DO
+        END DO
+        STATEV(1)=T(1,1)
+        STATEV(2)=T(2,2)
+        STATEV(3)=T(3,3)
+        STATEV(4)=T(1,2)
+        STATEV(5)=T(1,3)
+        STATEV(6)=T(2,3)
+        DO I=1,6
+          DO J=1,6
+            STATEV(I)=STATEV(I)+DDSDDE(I,J)*DSTRAN(J)
+          END DO
+          STATEV(I+6)=STRESS(I)
+        END DO
+        DO I=1,3
+          STATEV(I+12)=COORDS(I)
+        END DO
+      END IF
+      RETURN
+      END
+"""
+
+
+def umat_cantilever_deck(name, nlgeom=False, tip=0.5, incs=20):
+    """A C3D8 cantilever 10 x 1 x 1 (10 x 2 x 2 elements) held at x = 0, its free end moved
+    ``tip`` along y in ``incs`` fixed increments.  Its material: TEST_UMAT's J2 law as the
+    *USER MATERIAL ``name`` (E 200000, nu 0.3, sigma_y 250, H 1000), or for ``name`` None the
+    same law as *ELASTIC and *PLASTIC."""
+    nid = lambda i, j, k: 1 + i + 11 * (j + 3 * k)     # noqa: E731
+    lines = ["*NODE"] + [f"{nid(i, j, k)}, {i}, {j / 2}, {k / 2}"
+                         for k in range(3) for j in range(3) for i in range(11)]
+    lines.append("*ELEMENT, TYPE=C3D8, ELSET=E")
+    e = 0
+    for k in range(2):
+        for j in range(2):
+            for i in range(10):
+                e += 1
+                c = [nid(i, j, k), nid(i + 1, j, k), nid(i + 1, j + 1, k), nid(i, j + 1, k)]
+                c += [n + 33 for n in c]
+                lines.append(f"{e}, " + ", ".join(map(str, c)))
+    lines += ["*NSET, NSET=ROOT"] + _ids([nid(0, j, k) for k in range(3) for j in range(3)])
+    lines += ["*NSET, NSET=TIP"] + _ids([nid(10, j, k) for k in range(3) for j in range(3)])
+    lines += ["*ELSET, ELSET=E1", "1"]
+    if name:
+        lines += [f"*MATERIAL, NAME={name}", "*DEPVAR", "1", "*USER MATERIAL, CONSTANTS=4",
+                  "200000., 0.3, 250., 1000."]
+    else:
+        lines += ["*MATERIAL, NAME=NATIVE", "*ELASTIC", "200000., 0.3", "*PLASTIC", "250., 0.",
+                  "10250., 10."]
+    lines += [f"*SOLID SECTION, ELSET=E, MATERIAL={name or 'NATIVE'}", "*BOUNDARY", "ROOT, 1, 3",
+              f"*STEP{', NLGEOM' if nlgeom else ''}, INC=1000", "*STATIC, DIRECT",
+              f"{1 / incs:g}, 1.", "*BOUNDARY", f"TIP, 2, 2, {tip:g}",
+              "*NODE PRINT, NSET=ROOT, TOTALS=ONLY", "RF", "*EL PRINT, ELSET=E1", "S", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def umat_turn_deck(n=30):
+    """Two unit C3D8 cubes, every node held: stretched 1 % along x (step 1), then turned 90
+    degrees about z along the arc in ``n`` fixed increments (step 2: per-node amplitudes),
+    the stretch kept; materials TEST_UMAT's EL (element 1) and ROT (element 2)."""
+    corners = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    lines = ["*NODE"] + [f"{10 * c + k + 1}, {x + 2 * c}, {y}, {z}"
+                         for c in range(2) for k, (x, y, z) in enumerate(corners)]
+    for c, name in enumerate(("ElMat", "RotMat")):
+        lines += [f"*ELEMENT, TYPE=C3D8, ELSET=E{c + 1}",
+                  f"{c + 1}, " + ", ".join(str(10 * c + k + 1) for k in range(8)),
+                  f"*MATERIAL, NAME={name}", "*DEPVAR", "15", "*USER MATERIAL, CONSTANTS=2",
+                  "200000., 0.3", f"*SOLID SECTION, ELSET=E{c + 1}, MATERIAL={name}"]
+    lines += ["*ELSET, ELSET=EALL", "1, 2"]
+    for k, (x, y, _) in enumerate(corners):
+        for d in (0, 1):
+            pts = []
+            for i in range(n + 1):
+                th = math.pi / 2 * i / n
+                u = (math.cos(th) * 1.01 * x - math.sin(th) * y - x if d == 0
+                     else math.sin(th) * 1.01 * x + math.cos(th) * y - y)
+                pts.append(f"{i / n:.10g}, {u:.12g}")
+            lines += [f"*AMPLITUDE, NAME=A{k + 1}{'XY'[d]}"] + [", ".join(pts[i:i + 4])
+                                                            for i in range(0, len(pts), 4)]
+    lines += ["*STEP, NLGEOM, INC=1000", "*STATIC, DIRECT", "0.25, 1.", "*BOUNDARY"]
+    lines += [f"{10 * c + k + 1}, {d}, {d}, {0.01 * x if d == 1 else 0.:g}"
+              for c in range(2) for k, (x, _, _) in enumerate(corners) for d in (1, 2, 3)]
+    lines += ["*EL PRINT, ELSET=EALL", "S, SDV", "*END STEP", "*STEP, NLGEOM, INC=1000",
+              "*STATIC, DIRECT", f"{1 / n:.10g}, 1."]
+    for k in range(8):
+        for d in (1, 2):
+            lines += [f"*BOUNDARY, AMPLITUDE=A{k + 1}{'XY'[d - 1]}"]
+            lines += [f"{10 * c + k + 1}, {d}, {d}, 1." for c in range(2)]
+    lines += ["*EL PRINT, ELSET=EALL", "S, SDV", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+def umat_build_checks(tmp):
+    """The umat_build checks: --abaqus-umat decks in the ccx CCX_UMAT names, built with
+    TEST_UMAT (see there).  Skipped without CCX_UMAT, and for a ccx whose UMAT is another one
+    (a stock ccx runs its linear-elastic example).  Returns the number of failures."""
+    ccx = os.environ.get("CCX_UMAT")
+    if not ccx:
+        print("SKIP  umat_build: CCX_UMAT names no ccx built with TEST_UMAT (--abaqus-umat checks "
+              "in a UMAT-built ccx)")
+        return 0
+    failures = 0
+
+    def run(text, umat=True):
+        src, inp = os.path.join(tmp, "umat_build_src.inp"), os.path.join(tmp, "umat_build.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        convert(src, inp, abaqus_umat=umat)
+        d, status, out = run_ccx(ccx, {}, inp)
+        return d, status
+    # which UMAT: the J2 law holds a stretched cube at its yield stress, ccx's example does not
+    cube = umat_cube_deck("J2Cube").replace("*USER MATERIAL, CONSTANTS=2\n210000., 0.3",
+                                            "*DEPVAR\n1\n*USER MATERIAL, CONSTANTS=4\n210000., 0.3, 100., 0.")
+    d, status = run(cube)
+    s = dat_el_stress(os.path.join(d, "job.dat"), 1) if status == "solved" else None
+    shutil.rmtree(d, ignore_errors=True)
+    if s is None or abs(s[2] / 100. - 1) > 1e-6:
+        example = s is not None and abs(s[2] / 210. - 1) < 1e-6
+        print(f"SKIP  umat_build: {ccx} does not run TEST_UMAT (a cube with its J2 law: S33 "
+              f"{f'{s[2]:.4g}' if s else status}, not 100{': ccx' + chr(39) + 's example UMAT' if example else ''})")
+        return 0
+    # J2 cantilevers: the UMAT against *ELASTIC + *PLASTIC, small strain and NLGEOM (ABAQUSNL,
+    # which needs the U0 fix: without it the tip reaction ends 70 % low)
+    for nlgeom, tip, incs, tol in ((False, 0.5, 20, 1e-9), (True, 2.0, 40, 1e-3)):
+        got = []
+        for name in ("J2Mat", None):
+            d, status = run(umat_cantilever_deck(name, nlgeom, tip, incs), umat=bool(name))
+            dat = os.path.join(d, "job.dat")
+            got.append((dat_totals(dat)[-1][1], dat_el_stress(dat, 1)) if status == "solved" else status)
+            shutil.rmtree(d, ignore_errors=True)
+        ok = all(not isinstance(g, str) for g in got)
+        rel = (max([abs(got[0][0] / got[1][0] - 1)] + [abs(a - b) / max(map(abs, got[1][1]))
+                                                       for a, b in zip(got[0][1], got[1][1])])
+               if ok else None)
+        ok = ok and rel < tol
+        what = "ABAQUSNL, NLGEOM" if nlgeom else "ABAQUS, small strain"
+        hint = "" if ok or not nlgeom else " (the U0 fix missing?)"
+        print(f"{'PASS' if ok else 'FAIL'}  umat_build_j2 ({what}): a C3D8 cantilever bent past yield, the J2 "
+              f"UMAT vs *PLASTIC: tip reaction {got[0] if isinstance(got[0], str) else got[0][0]} vs "
+              f"{got[1] if isinstance(got[1], str) else got[1][0]}, largest difference "
+              f"{f'{rel:.1e}' if rel is not None else '-'} (tolerance {tol:g}){hint}")
+        failures += 0 if ok else 1
+    # ABAQUSNL axes: a stretched cube turned 90 degrees keeps the UMAT's stress right (sxx
+    # before = syy after); STRESS comes in axes that turn with the material, so it stays the
+    # same, while a copy turned by DROT turns 90 degrees away from it; COORDS stays put
+    d, status = run(umat_turn_deck())
+    sdv = [r for r in (dat_tables(os.path.join(d, "job.dat"), "internal state") or [[]])[-1]
+           if len(r) >= 17 and r[:2] == [2, 1]] if status == "solved" else []
+    s1 = dat_el_stress(os.path.join(d, "job.dat"), 1) if status == "solved" else None
+    shutil.rmtree(d, ignore_errors=True)
+    lam, mu = 200000. * 0.3 / (1.3 * 0.4), 200000. / 2.6
+    big, small = (lam + 2 * mu) * math.log(1.01), lam * math.log(1.01)
+    g = (1 - 1 / math.sqrt(3)) / 2                    # integration point 1 of a unit C3D8
+    ok = bool(sdv) and s1 is not None
+    if ok:
+        v = sdv[0][2:]
+        ok = (abs(s1[1] / big - 1) < 1e-4 and abs(s1[0] / small - 1) < 1e-4       # turned
+              and abs(v[6] / big - 1) < 1e-4 and abs(v[7] / small - 1) < 1e-4    # STRESS
+              and abs(v[1] / big - 1) < 1e-4 and abs(v[0] / small - 1) < 1e-4    # DROT copy
+              and max(abs(a - b) for a, b in zip(v[12:15], (2 + g, g, g))) < 1e-6)   # 7 digits
+    print(f"{'PASS' if ok else 'FAIL'}  umat_build_abaqusnl_axes: a cube stretched 1 % and turned 90 degrees: "
+          f"syy {f'{s1[1]:.2f}' if s1 else status} ({big:.2f}); STRESS in turning axes "
+          f"{f'{sdv[0][8]:.2f}' if sdv else '-'}, its copy turned by DROT {f'{sdv[0][2]:.2f}, {sdv[0][3]:.2f}' if sdv else '-'}; "
+          f"COORDS {sdv[0][14:17] if sdv else '-'} (undeformed)")
+    failures += 0 if ok else 1
+    return failures
+
 
 def frd_last(frd_path, name):
     """{node: values} of the last ``name`` block (DISP, STRESS, ...) in a ccx .frd file."""
@@ -8983,6 +9243,7 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  umat_abaqus_interface ({what}): a stock ccx runs its example "
               f"UMAT, S33 = {f'{s[2]:.4f}' if s else status} (reference {ref:.4f})")
         failures += 0 if ok else 1
+    failures += umat_build_checks(tmp)
 
     # --- the --run results digest (abq2ccx.ccx_results_digest) against the references above:
     # the planar beam's frequencies and buckling load (beam theory, Euler), the circular-section

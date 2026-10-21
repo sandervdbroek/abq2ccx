@@ -12,6 +12,13 @@ physics.
   and GRAV magnitudes f times smaller (Abaqus' gravity and thermal response keep the true mass):
   Abaqus' scaled mass matrix. A target increment `DT` (`TYPE=BELOW MIN`) becomes ccx's selective
   mass scaling under `--approximate`; the other forms stay dropped, with the reason.
+* **`--abaqus-umat`** — the user guide builds ccx 2.23 with the deck's UMAT and the U0 fix in
+  a few commands (conda-forge's compilers, SPOOLES and ARPACK). Checked in such a build with an
+  elastic and a J2 UMAT on ten element types, and `validate_with_ccx.py` checks one built with
+  its `TEST_UMAT` when `CCX_UMAT` names it; the `ABAQUSNL` notes now say that strain and
+  stress come in axes that turn with the material while DROT is the rotation increment (a UMAT
+  that turns its tensor state variables by DROT turns them twice) and that COORDS is the
+  undeformed position.
 
 ## 1.5.0 (October 2026)
 
