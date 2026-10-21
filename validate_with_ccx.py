@@ -4945,6 +4945,25 @@ def _instances_of_p():
     return asm + "*END ASSEMBLY\n", rots
 
 
+def rotated_instance_n1_deck(n1=""):
+    """A part P, a B31 cantilever along x of four elements (length 1, nodes 1-5), RECT 0.2 x 0.3
+    (E 1000) whose *BEAM SECTION has no n1 line (``n1``: one), clamped at node 1 and loaded at
+    node 5 by R (0.3, -0.2, 0.5) and the moment R (0.1, 0.2, 0.15), in each of the instances
+    ROTATED_INSTANCES; node 5 printed in global components.  Returns the deck and {instance: R}."""
+    part = ("*PART, NAME=P\n*NODE\n" + "".join(f"{k}, {0.25 * (k - 1)}, 0., 0.\n" for k in range(1, 6)) +
+            "*ELEMENT, TYPE=B31, ELSET=B\n" + "".join(f"{k}, {k}, {k + 1}\n" for k in range(1, 5)) +
+            "*NSET, NSET=ROOT\n1\n*NSET, NSET=TIP\n5\n"
+            f"*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT\n0.2, 0.3\n{n1}*END PART\n")
+    asm, rots = _instances_of_p()
+    deck = part + asm + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*STEP\n*STATIC\n*BOUNDARY\n"
+    deck += "".join(f"{n}.ROOT, ENCASTRE\n" for n in rots) + "*CLOAD\n"
+    for name, r in rots.items():
+        deck += "".join(f"{name}.TIP, {k + 1}, {x:.12g}\n" for k, x in
+                        enumerate((*r((0.3, -0.2, 0.5)), *r((0.1, 0.2, 0.15)))))
+    deck += "".join(f"*NODE PRINT, NSET={n}.TIP, GLOBAL=YES\nU\n" for n in rots)
+    return deck + "*END STEP\n", rots
+
+
 def rotated_instance_point_deck(kind):
     """A part P of node 1 (instance set M) and node 2 at the same place (set GR, held), its
     DOF-numbered data in the part's axes, instanced as ROTATED_INSTANCES; node 1 loaded by R F
@@ -5564,7 +5583,7 @@ def modal_superposition(dat_path, node, dof):
                 continue
             out.append((t, u, sum(p / (o * o - w * w) for p, o in zip(phi2, om))))
         return out
-    return [(t, u, sum(p / (o * o) * (1 - math.cos(o * t)) for p, o in zip(phi2, om)))
+    return [(t, u, sum(ccx_ratio(p, o * o) * (1 - math.cos(o * t)) for p, o in zip(phi2, om)))
             for t, u in resp]
 
 
@@ -6460,7 +6479,7 @@ def main():
             print("\n".join(l for l in out.splitlines() if "ERROR" in l))
             failures += 1
             continue
-        ok = abs(s[1] / 1e6 - face) <= 1e-5 * abs(face)
+        ok = abs(s[1] / 1e6 - face) <= 1e-5 * abs(face) and abs(face) > 1.0
         print(f"{'PASS' if ok else 'FAIL'}  nle10_surface_elements (SFM3D8 skin, {how}): SYY at D = "
               f"{s[1] / 1e6:+.6f} MPa (face pressure {face:+.6f} MPa)")
         failures += 0 if ok else 1
@@ -9001,7 +9020,7 @@ def main():
             failures += 1
             continue
         big = max(abs(x) for v in ref.values() for x in v)
-        err = max(abs(x - y) for n in ref for x, y in zip(got[n], ref[n])) / big
+        err = ccx_ratio(max(abs(x - y) for n in ref for x, y in zip(got[n], ref[n])), big)
         tip = max(got, key=lambda n: abs(got[n][2 if kw["plane"] == "xy" else 1]) if n != 90 else 0.0)
         ok = err < 1e-6 and big > 0.1
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({kw['typ']} strip in the {kw['plane'][0]}-{kw['plane'][1]} plane, a "
@@ -9024,7 +9043,8 @@ def main():
             tab = DCOUP3D_TABLES[key][step]
             scale = max(abs(x) for x in tab)
             worst = max(worst, max(abs(a - b) for a, b in zip(val, tab)) / scale)
-        exact = max(exact, max(abs(a - b) for a, b in zip(got[10], u_r)) / max(abs(x) for x in got[10]))
+        exact = max(exact, ccx_ratio(max(abs(a - b) for a, b in zip(got[10], u_r)),
+                                     max(abs(x) for x in got[10])))
         shown.append(f"u10 {', '.join(f'{x:.3g}' for x in got[10])}")
     ok = worst < 6e-3 and exact < 1e-6
     print(f"{'PASS' if ok else 'FAIL'}  dcoup3d_verification (Abaqus Verification Guide, linear DCOUP3D, three "
@@ -10513,6 +10533,8 @@ def main():
         ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) > 1 and len(runs[0][1]) == 3
         if ok:
             (tables, freqs), (ref_tables, ref_freqs) = runs
+            # (a table all zero, e.g. a mode's held node, compares absolutely: stretch and ssd
+            # show that the runs moved)
             diff = max(abs(a - b) / (max(abs(x) for r in rr for x in r[1:]) or 1.0)
                        for (_t, rows), (_rt, rr) in zip(tables, ref_tables)
                        for row, rrow in zip(rows, rr) for a, b in zip(row, rrow))
@@ -11393,10 +11415,11 @@ def main():
     ok = bool(zero and runs[1])
     if ok:
         warned = "no buckling factor exists" in rep.text()
-        ok = warned and zero[0] > 1e6 * runs[1][0]
+        ratio = ccx_ratio(zero[0], runs[1][0])
+        ok = warned and 1e6 < ratio < math.inf
         print(f"{'PASS' if ok else 'FAIL'}  buckle_amplitude_zero (the column's *BUCKLE load on an "
               f"amplitude of 0 at time 0): {'warned' if warned else 'NOT warned'} that no buckling "
-              f"factor exists; ccx prints {zero[0]:.3g} ({zero[0] / runs[1][0]:.2g} times the factor "
+              f"factor exists; ccx prints {zero[0]:.3g} ({ratio:.2g} times the factor "
               f"under a load)")
     failures += 0 if ok else 1
     # a traction (nodal forces) on an amplitude with TIME DELAY: the generated *CLOAD keeps the
@@ -11425,7 +11448,7 @@ def main():
         ok = all(runs) and len(runs[0]) == len(runs[1]) == (1 if case == "two_amplitudes" else 2)
         if ok:
             err, moved = same(runs)
-            ok = err < 1e-9 * moved
+            ok = err < 1e-9 * moved and moved > 1e-4
             print(f"{'PASS' if ok else 'FAIL'}  load_entries ({case}): node 7 at " + "; ".join(
                 ", ".join(f"{x:.7g}" for x in b[7]) for b in runs[0]) + f" in each step, as under "
                 f"the plain loads Abaqus applies ({err:.1e} apart)")
@@ -12556,7 +12579,7 @@ def main():
         u = review_run(deck, f"turned_cantilever_{typ}", dat_displacements)
         ok = bool(u) and all(n in u for pair in tips.values() for n in pair)
         if ok:
-            errs = {c: max(abs(x - y) for x, y in zip(u[b], rot(u[a]))) / max(abs(x) for x in u[a])
+            errs = {c: ccx_ratio(max(abs(x - y) for x, y in zip(u[b], rot(u[a]))), max(abs(x) for x in u[a]))
                     for c, (a, b) in tips.items()}
             um, theory = u[tips["moment"][0]], (0.2 / (2e3 * 2e-4), -0.1 / (2e3 * 4.5e-4), 0.0)
             off = max(abs(x - y) for x, y in zip(um, theory)) / theory[0]
@@ -12573,7 +12596,7 @@ def main():
     ok = bool(f) and len(f) >= 8
     if ok:
         f = sorted(f)[:8]
-        split = max(abs(f[2 * i + 1] / f[2 * i] - 1) for i in range(4))
+        split = max(abs(ccx_ratio(f[2 * i + 1], f[2 * i]) - 1) for i in range(4))
         eb = 1.8751 ** 2 / (2 * math.pi) * math.sqrt(1e3 * 2e-4 / 0.06)       # Euler-Bernoulli f1
         ok = split < 1e-6 and abs(f[0] / eb - 1) < 0.05
         print(f"{'PASS' if ok else 'FAIL'}  turned_cantilever_modes (4 B32R, the twins in one *FREQUENCY step): "
@@ -12585,7 +12608,7 @@ def main():
     a, b = tips["force+moment"]
     ok = bool(u) and a in u and b in u
     if ok:
-        err = max(abs(x - y) for x, y in zip(u[b], rot(u[a]))) / max(abs(x) for x in u[a])
+        err = ccx_ratio(max(abs(x - y) for x, y in zip(u[b], rot(u[a]))), max(abs(x) for x in u[a]))
         ok = err < 1e-5 and max(abs(x) for x in u[a]) > 0.1
         print(f"{'PASS' if ok else 'FAIL'}  turned_cantilever_knots (4 B31 under a tip force and moment, an "
               f"*EQUATION in the deck: knot beams at the turned root and tip, the unturned ones knots by a "
@@ -12811,7 +12834,7 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  t91_kinematic_twist (*KINEMATIC '1, 3' of two nodes on a "
               f"line through the loaded reference node: its twist about the line moves no coupled "
               f"DOF): as the members' force halves and rigid-link *EQUATION ({err:.1e} apart, max |u| "
-              f"{scale:.4g}); NLGEOM converges, {dnl / scale:.1%} from the linear")
+              f"{scale:.4g}); NLGEOM converges, {ccx_ratio(dnl, scale):.1%} from the linear")
     failures += 0 if ok else 1
 
     dat = t91_run("t91_dload_unknown_type", "dload", ["*DLOAD VP1 load dropped"])
@@ -13239,7 +13262,7 @@ def main():
             if ok:
                 u = got[-1].get(tip, [math.nan] * 3)
                 scale = max(abs(x) for x in want)
-                err = max(abs(a - b) for a, b in zip(u, want)) / scale
+                err = ccx_ratio(max(abs(a - b) for a, b in zip(u, want)), scale)
                 twin_err = abs(twin[-1][3][0] / 0.004 - 1) if lab == "BX" else 0.0
                 ok = err < 1e-4 and twin_err < 1e-4 and scale > 1e-3
                 print(f"{'PASS' if ok else 'FAIL'}  {tag}_{lab.lower()} (the strip of {how}, E, {lab}, 2.): tip "
@@ -13606,6 +13629,34 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  beam_n1_blank_line (B31 cantilever, RECT 0.1 x 0.3, a blank n1 "
               f"line, then 5, 5): tip uy {got:.6g} as with 0., 0., -1. ({ref:.6g}); P L^3 / 3 E I "
               f"{theory:.6g} (before: 0.498)")
+    failures += 0 if ok else 1
+    # a section without an n1 line in a rotated instance: Abaqus' default (0, 0, -1) is in the
+    # part's axes, as all part data, so it turns with the instance (it stayed global: the turned
+    # sections bent the other way); each instance's tip moves R u of the unturned one's, and as
+    # with the default given on the n1 line
+    runs = {}
+    for tag, n1 in (("default", ""), ("given", "0., 0., -1.\n")):
+        deck, rots = rotated_instance_n1_deck(n1)
+        tabs = review_run(deck, f"rotated_instance_n1_{tag}", lambda dat: {
+            s: {int(r[0]): r[1:] for r in rows} for _, title, s, _, rows in A.dat_blocks(dat)
+            if title.startswith("displacements")})
+        runs[tag] = [next(iter((tabs or {}).get(f"{n}_TIP", {}).values()), None) for n in rots]
+    ok = all(all(tips) for tips in runs.values())
+    if ok:
+        base = runs["default"][0]
+        scale = max(abs(x) for x in base)
+        errs = [ccx_ratio(max(abs(a - c) for a, c in zip(tip, rots[n](base))), scale)
+                for n, tip in zip(rots, runs["default"])]
+        given = ccx_ratio(max(abs(a - c) for t, g in zip(runs["default"], runs["given"])
+                              for a, c in zip(t, g)), scale)
+        ok = max(errs) < 1e-6 and given < 1e-9 and scale > 0.1
+        print(f"{'PASS' if ok else 'FAIL'}  rotated_instance_n1 (a B31 cantilever, RECT 0.2 x 0.3, its *BEAM "
+              f"SECTION without an n1 line, under a tip force and moment, in instances turned 90 degrees "
+              f"about x and 40 about (1, 2, 3)): the tips move R u of the unturned one's "
+              f"({errs[1]:.1e} / {errs[2]:.1e} apart; it moved {', '.join(f'{x:.5g}' for x in base)}), "
+              f"{given:.1e} from the deck with n1 = 0, 0, -1 given")
+    else:
+        print(f"FAIL  rotated_instance_n1: no tip displacements ({runs})")
     failures += 0 if ok else 1
 
     # an n1 line with a blank or left-out field (0): read as no n1, so the *DLOAD P1 went along

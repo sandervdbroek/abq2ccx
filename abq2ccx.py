@@ -673,19 +673,42 @@ def beam_n1_line(b: "Block") -> Optional[int]:
     sec = (b.param("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION" else "")
            ).strip().upper()
     data = b.data if b.keyword == "BEAM SECTION" else [ln for ln in b.data if ln.strip()]
-    geo = 1
-    if sec == "ARBITRARY":
-        try:
-            geo = int(float(data[0].split(",")[0]))
-        except (IndexError, ValueError):
-            return None
-    elif b.keyword == "BEAM GENERAL SECTION" and sec == "MESHED":
+    if b.keyword == "BEAM GENERAL SECTION" and sec == "MESHED":
         return 0 if len(data) == 3 else None
-    elif b.keyword == "BEAM GENERAL SECTION" and b.has("TAPER"):
-        geo = 2
+    geo = _beam_geometry_lines(b, sec, data)
+    if geo is None:
+        return None
     if b.keyword == "BEAM GENERAL SECTION" and sec != "NONLINEAR GENERAL":
         return geo if len(data) == geo + 2 else None
     return geo if len(data) > geo else None
+
+
+def _beam_geometry_lines(b: "Block", sec: str, data: List[str]) -> Optional[int]:
+    """The geometry lines before the n1 line of *BEAM SECTION / *BEAM GENERAL SECTION ``b``
+    (SECTION= ``sec``, its lines ``data``): an ARBITRARY profile's segment lines (None where
+    their count does not read), a TAPER section's two, else one."""
+    if sec == "ARBITRARY":
+        try:
+            return int(float(data[0].split(",")[0]))
+        except (IndexError, ValueError):
+            return None
+    return 2 if b.keyword == "BEAM GENERAL SECTION" and b.has("TAPER") else 1
+
+
+def beam_n1_slot(b: "Block") -> Optional[int]:
+    """Where the n1 line of a *BEAM SECTION / *BEAM GENERAL SECTION card without one
+    (beam_n1_line None) goes in ``b.data``: after the geometry lines, before a general
+    section's line of E, G, ...  None where the card has one, or where the place is not clear
+    (a MESHED section, a general section of several E, G lines, missing geometry lines)."""
+    if beam_n1_line(b) is not None:
+        return None
+    sec = (b.param("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION" else "")
+           ).strip().upper()
+    if b.keyword == "BEAM GENERAL SECTION" and sec == "MESHED":
+        return None
+    geo = _beam_geometry_lines(b, sec, b.data)
+    after = 1 if b.keyword == "BEAM GENERAL SECTION" and sec != "NONLINEAR GENERAL" else 0
+    return geo if geo is not None and geo <= len(b.data) <= geo + after else None
 
 
 def beam_section_n1(b: "Block") -> Tuple[float, float, float]:
@@ -767,6 +790,9 @@ class Report:
         # the instances of a flattened assembly (flatten_assembly): name, part, ccx label
         # ranges, offsets and renamed sets and surfaces
         self.instances: List[dict] = []
+        # data lines (stripped) holding a *PARAMETER substituted as its expression text, which
+        # did not evaluate (apply_parameters; Converter._undefined_parameter_data)
+        self.unevaluated: set = set()
 
     def reduce(self, what: str) -> None:
         """Record reduced physics: ``what`` part of the Abaqus model the ccx model drops or
@@ -1609,6 +1635,7 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
         done = j
     kept.extend(lines[done:])
 
+    unresolved: set = set()                 # names substituted as written
     if raw_defs:
         # Abaqus evaluates the definitions in order ("Parametric modeling": x = 2, y = x + 3,
         # x = 4 gives x = 4, y = 5), so a name defined again takes its last value; a definition
@@ -1685,6 +1712,10 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                         f"expression is substituted as written — verify.", once=True)
 
     out = [_substitute_params(ln, params) for ln in kept] if params else lines
+    if unresolved:
+        report.unevaluated.update(
+            new.strip() for ln, new in zip(kept, out) if "<" in ln and not ln.lstrip().startswith("*")
+            and any(m.group(1) in unresolved for m in _PARAM_REF_RE.finditer(ln)))
     undefined: List[str] = []
     cards: List[str] = []                   # the cards with one in their model data
     head = ""                               # the last keyword line
@@ -3012,14 +3043,17 @@ def system_point(v: Sequence[float], system: str) -> Vec:
 def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NGEN`` -> nodes between two existing end nodes, on a straight line (default),
     a circular arc about a centre (LINE=C) or a parabola through a midside point (LINE=P).
-    Fields by position (Abaqus 2017 Keywords *NGEN): the end nodes, the increment (blank: 1),
-    the extra point's node (4) or, without one, its coordinates (5-7, in the SYSTEM= frame, a
+    Fields by position (Abaqus 2017 Keywords *NGEN): the end nodes, the increment (blank or
+    0: the default 1, as expand_generate reads it; Abaqus documents no other meaning of 0), the
+    extra point's node (4) or, without one, its coordinates (5-7, in the SYSTEM= frame, a
     blank one 0: "the node number will take precedence over the coordinates"), and an arc's
     normal (8-10).  Nodes are spaced evenly in arc angle / curve parameter.  End nodes at
     unequal distances from an arc's centre move radially onto their mean distance ("Node
     definition": "The coordinates of the end nodes will be adjusted radially if the circle
-    cannot be passed through both points"; it does not give the radius).  A skipped line's
-    nodes are missing: reduced physics."""
+    cannot be passed through both points"; it does not give the radius).  Returns the nodes
+    the card's NSET receives: the generated ones and the end nodes ("The two end nodes will
+    also be included in the node set"), a skipped line's too.  A skipped line's nodes between
+    them are missing: reduced physics."""
     kind = (block.param("LINE") or "S").strip().upper()[:1]
     system = (block.param("SYSTEM") or "R").strip().upper()[:1]
     created: List[int] = []
@@ -3044,8 +3078,13 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
         except ValueError:
             _skip_unreadable(report, "*NGEN record")
             continue
-        if n1 not in geom.nodes or n2 not in geom.nodes:
+        if inc == 0:
+            inc = 1
+            report.note("*NGEN increment 0 read as the default 1.", once=True)
+        ends = [n for n in dict.fromkeys((n1, n2)) if n in geom.nodes]   # (in the NSET if skipped)
+        if len(ends) < len({n1, n2}):
             skip(f"*NGEN endpoints {n1},{n2} not both defined; skipped.", once=False)
+            created += ends
             continue
         p1, p2 = geom.nodes[n1], geom.nodes[n2]
         extra = None
@@ -3056,8 +3095,9 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
             skip(f"*NGEN LINE={kind}: the {'centre' if kind == 'C' else 'midside'} node "
                  f"is missing or the arc is degenerate (a 180-degree arc needs the normal "
                  f"on the data line); nodes {n1}..{n2} not generated.")
+            created += ends
             continue
-        ids = list(range(n1, n2 + (1 if inc > 0 else -1), inc)) if inc else []
+        ids = list(range(n1, n2 + (1 if inc > 0 else -1), inc))
         if not ids:
             msg = (f"*NGEN endpoints {n1},{n2} with increment {inc} generated no nodes "
                    f"(check the ordering/sign of the range); skipped.")
@@ -3065,6 +3105,7 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
                 skip(msg)
             else:
                 report.warn(msg, once=True)
+            created += ends
             continue
         if kind == "C":
             r1, r2 = vnorm(vsub(p1, extra)), vnorm(vsub(p2, extra))
@@ -3273,9 +3314,9 @@ def expand_nmap(block: Block, geom: Geometry, normals: Dict[int, Vec], report: R
     RECTANGULAR, z for CYLINDRICAL, the polar axis for SPHERICAL) and c in its x-y / theta = 0
     plane; only a given: a plain shift.  ROTATION turns them by the angle about the axis a-b
     through c, TRANSLATION moves them along a-b by the magnitude, SCALE scales them about a.
-    DEFINITION=NODES names a, b, c by node.  A *NODE normal of a mapped node is a vector in
-    the same local axes and turns with them.  Returns what was not converted (DIAMOND,
-    TOROIDAL, BLENDED, unreadable data), or None."""
+    DEFINITION=NODES names a, b, c by node, by position (a blank one: as a left-out point).
+    A *NODE normal of a mapped node is a vector in the same local axes and turns with them.
+    Returns what was not converted (DIAMOND, TOROIDAL, BLENDED, unreadable data), or None."""
     typ = (block.param("TYPE") or "RECTANGULAR").strip().upper()
     if typ not in ("RECTANGULAR", "CYLINDRICAL", "SPHERICAL", "ROTATION", "TRANSLATION", "SCALE"):
         report.warn(f"*NMAP, TYPE={typ} is not converted; its nodes keep their unmapped "
@@ -3286,8 +3327,7 @@ def expand_nmap(block: Block, geom: Geometry, normals: Dict[int, Vec], report: R
     try:
         def points(rec: List[str], count: int) -> List[Optional[Vec]]:
             if by_nodes:
-                ids = [pint(x) for x in rec[:count] if x]
-                return [geom.nodes[i] for i in ids] + [None] * (count - len(ids))
+                return [geom.nodes[pint(x)] if x else None for x in (rec + [""] * count)[:count]]
             v = [pf(x) if x else 0.0 for x in rec]
             return [tuple(v[3 * i:3 * i + 3] + [0.0] * (3 - len(v[3 * i:3 * i + 3]))) if len(v) > 3 * i
                     else None for i in range(count)]
@@ -7294,7 +7334,8 @@ class _Mesh:
         for name, ids in self.geom.nsets.items():
             self._emit_set(out, "NSET", name, ids, self._mesh_sets)
         for name, ids in self.geom.elsets.items():
-            self._emit_set(out, "ELSET", name, ids, self._mesh_sets)
+            if name.upper() not in self._kdyn_elsets:      # (read by a surface left out only)
+                self._emit_set(out, "ELSET", name, ids, self._mesh_sets)
         return out
 
     def _emit_set(self, out: List[str], kw: str, name: str, ids: Sequence[int],
@@ -11360,14 +11401,15 @@ class _Mesh:
         copies[(mat, add)] = name
         return name
 
-    @staticmethod
-    def _material_copy(blocks: List[Block], group: List[Block], name: str, drop: set,
+    def _material_copy(self, blocks: List[Block], group: List[Block], name: str, drop: set,
                        extra: Sequence[Block]) -> None:
         """Insert into ``blocks``, after material ``group`` (its card and options,
         _material_options), a copy of it named ``name``: every card but those ``drop`` names,
         then ``extra``.  A copy carries every other card: one left out (a *DEFORMATION
         PLASTICITY, an *ELECTRICAL CONDUCTIVITY) is behaviour the copy's elements lose, and ccx
-        stops where it was their elasticity."""
+        stops where it was their elasticity.  The original is recorded (``_copied_materials``:
+        _copied_away)."""
+        self._copied_materials.add(group[0].uparam("NAME"))
         clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
                  for c in group if c is group[0] or c.keyword not in drop]
         clone[0].params["NAME"] = name
@@ -14780,8 +14822,8 @@ class _Materials:
                     f[k] = "%.12g" % (0.5 * v)
             lines[i] = ", ".join(f).rstrip()
             halved = True
-        if halved:
-            mat = self._card_material.get(id(b)) or "?"
+        mat = self._card_material.get(id(b)) or "?"
+        if halved and not self._copied_away(mat):
             self.report.note(f"Material {mat}: the shear coefficients alpha12, alpha13, alpha23 of "
                              f"its *EXPANSION, TYPE=ANISO halved — Abaqus gives them as engineering "
                              f"shear strain per degree (gamma12 = alpha12 dT, the shear measure of "
@@ -14884,6 +14926,12 @@ class _Materials:
                              f"*PLASTIC and *CREEP written in that order, which ccx 2.23 needs (it "
                              f"stops on the deck's: Abaqus reads a material's options in any order).",
                              once=True)
+
+    def _copied_away(self, mat: str) -> bool:
+        """Whether material ``mat`` is an original whose copies (_material_copy) took all its
+        sections and plies (_used_materials): its cards change nothing in the analysis, so how
+        they are written is not reported."""
+        return mat.upper() in self._copied_materials and mat.upper() not in self._used_materials
 
     def _plan_material_cards(self, blocks: List[Block]) -> None:
         """Which material each material card belongs to (``_card_material``), the materials
@@ -15642,12 +15690,13 @@ class _Materials:
             while len(f) > 1 and f[-1] == "":
                 f.pop()
             lines.append(", ".join(f))
-        self.report.note(f"Material {mat}: *EXPANSION, TYPE=ANISO without shear coefficients "
-                         f"written as TYPE=ORTHO, the same thermal strain: in NLGEOM steps of a "
-                         f"deck with temperatures ccx 2.23 stops on any TYPE=ANISO expansion with "
-                         f"'too many cutbacks', but computes TYPE=ORTHO right where no "
-                         f"*ORIENTATION or ply angle turns the material axes so that it has shear "
-                         f"in global axes, as here.", once=True)
+        if not self._copied_away(mat):
+            self.report.note(f"Material {mat}: *EXPANSION, TYPE=ANISO without shear coefficients "
+                             f"written as TYPE=ORTHO, the same thermal strain: in NLGEOM steps of a "
+                             f"deck with temperatures ccx 2.23 stops on any TYPE=ANISO expansion "
+                             f"with 'too many cutbacks', but computes TYPE=ORTHO right where no "
+                             f"*ORIENTATION or ply angle turns the material axes so that it has "
+                             f"shear in global axes, as here.", once=True)
         return lines
 
     def _plan_elastic_expansion(self, blocks: List[Block]) -> None:
@@ -15736,6 +15785,8 @@ class _Materials:
                     raise ValueError("invalid constants")
                 rows.append((v, rest[0] if rest else ""))
         except (ValueError, ZeroDivisionError):
+            if self._copied_away(mat):
+                return out
             self.report.warn(f"Material {mat}: its *ELASTIC data could not be read or is invalid, "
                              f"so it was emitted unchanged beside *EXPANSION, TYPE={kind}; ccx 2.23 "
                              f"uses a wrong stiffness for this combination in linear steps of a "
@@ -15782,6 +15833,8 @@ class _Materials:
         why = ("an isotropic *ELASTIC with an orthotropic or anisotropic expansion" if cc == "ISO"
                else "an orthotropic *ELASTIC with an anisotropic expansion unless an *ORIENTATION "
                     "applies")
+        if self._copied_away(mat):
+            return lines
         self.report.note(f"Material {mat}: {what} *ELASTIC written as TYPE={target} with the same "
                          f"stiffness because of its *EXPANSION, TYPE={kind}: in linear steps of a "
                          f"deck with temperatures, ccx 2.23 uses a wrong element stiffness, for "
@@ -25062,24 +25115,32 @@ class _Constraints:
         return [n for n in dedup(nodes) if n not in (ref, rot) and n in self.geom.nodes]
 
     def _kdyn_written(self, b: Block) -> bool:
-        """Whether _kin_dynamic_cards writes the ``kdyn`` *COUPLING ``b`` (equations or a *RIGID
-        BODY of its nodes, without ccx's *COUPLING) rather than commenting it out."""
+        """Whether the ``kdyn`` *COUPLING ``b`` is written without ccx's *COUPLING, as equations
+        or a *RIGID BODY of its nodes (_kin_dynamic_cards), rather than commented out; an ``rb``
+        / ``rbk`` one (_coupling_as_rigid_body) wherever it has members."""
         plan = self._coupling_plan[id(b)]
+        if plan["kind"] in ("rb", "rbk"):
+            return bool(plan["members"])
         nodes = self._kin_dyn_members(plan["ref"], plan["rot"], plan["members"])
         return bool(nodes) and self._kin_form(plan["ref"], nodes, plan["dofs"],
                                               self._coupling_frame(b)) in ("eq", "rb")
 
     def _plan_kdyn_surfaces(self, blocks: List[Block]) -> None:
-        """The surfaces that no card but ``kdyn`` *COUPLINGs (_kin_dynamic_cards) names, by a
-        parameter or a data field: ``_kdyn_surfaces``, which handle_surface leaves out where
-        those couplings are written (_kdyn_written)."""
+        """The surfaces that no card but ``kdyn``, ``rb`` or ``rbk`` *COUPLINGs (written without
+        ccx's *COUPLING: _kin_dynamic_cards, _coupling_as_rigid_body) names, by a parameter or
+        a data field: ``_kdyn_surfaces``, which handle_surface leaves out where those couplings
+        are written (_kdyn_written).  ``_kdyn_elsets``: the INTERNAL element sets (Abaqus/CAE's
+        ``_surf_S3``) of the element surfaces left out that nothing else names, which
+        emit_geometry leaves out too."""
         kdyn = {id(b) for b in blocks if b.keyword == "COUPLING"
-                and (self._coupling_plan.get(id(b)) or {}).get("kind") == "kdyn"}
+                and (self._coupling_plan.get(id(b)) or {}).get("kind") in ("kdyn", "rb", "rbk")}
         names: Dict[str, List[Block]] = {}
         for b in blocks:
             if id(b) in kdyn:
                 names.setdefault(b.uparam("SURFACE"), []).append(b)
         names.pop("", None)
+        surfaces = {b.uparam("NAME"): b for b in blocks if b.keyword == "SURFACE"}
+        internal = {b.uparam("ELSET") for b in blocks if b.keyword == "ELSET" and b.has("INTERNAL")}
         for b in blocks:
             if not names:
                 break
@@ -25090,6 +25151,17 @@ class _Constraints:
                                                             for x in ln.split(",")]:
                 names.pop(x.strip().upper(), None)
         self._kdyn_surfaces = names
+        gone = [surfaces[n] for n, cs in names.items() if n in surfaces and
+                surfaces[n].uparam("TYPE") in ("", "ELEMENT") and all(map(self._kdyn_written, cs))]
+        sets = {r[0].strip().upper() for b in gone for r in merged_data_records(b)
+                if r and r[0].strip().upper() in internal}
+        for b in blocks if sets else ():
+            if b.keyword in GEOM_KW or any(b is g for g in gone):
+                continue
+            for x in [v for v in b.params.values() if v] + [x for ln in b.data
+                                                            for x in ln.split(",")]:
+                sets.discard(x.strip().upper())
+        self._kdyn_elsets = sets
 
     def _kin_dynamic_cards(self, b: Block, plan: dict,
                            groups: Sequence[Tuple[Sequence[int], set]]) -> List[str]:
@@ -27995,7 +28067,14 @@ class _Loads:
         for rec in merged_data_records(b):
             g = [x.strip() for x in rec]
             if len([x for x in g if x]) < 2:
-                if any(g):
+                if any(g) and b.has("SUBMODEL"):
+                    # (a surface name alone: the driven loads of a surface-based submodel)
+                    side += self._comment_out(
+                        f"*DSLOAD, SUBMODEL on '{g[0]}' not converted: the converter does not "
+                        f"convert surface-based submodel loads (ccx's *DSLOAD, SUBMODEL takes "
+                        f"element faces of a *SUBMODEL, TYPE=SURFACE card). Commented out.",
+                        [", ".join(g).rstrip(", ")], "*DSLOAD, SUBMODEL driven loads dropped")
+                elif any(g):
                     side += self._drop_load_line(b, g, "it has no load type label", reduces=False)
                 continue
             # read in place: a blank field is zero (Abaqus), not the next field's value
@@ -31394,12 +31473,16 @@ class _Loads:
         loads that act there or started so.  Right after a general step, the loads ccx
         holds stay on in the modal step (``_modal_held``, no OP=NEW): they hold the model in
         that step's state, which a static step's results then carry as a constant offset,
-        where without them it would vibrate about the undeformed one."""
+        where without them it would vibrate about the undeformed one.
+        A continued step's step-time amplitudes are warned about: Abaqus continues the step
+        time there too, ccx reads them from 0."""
         self._modal_moving, self._modal_held = {}, set()
         procs = [step.proc for step in self.steps]
         if "MODAL DYNAMIC" not in procs:
             return
         audit = step_load_audit(blocks, user_loads=True, abaqus=True)
+        step_amps = {b.uparam("NAME") for b in blocks if b.keyword == "AMPLITUDE" and
+                     b.uparam("TIME").replace(" ", "") != "TOTALTIME"}
         state = base = None                     # the step whose end state ccx holds, if not rest
         general = False                         # the step before is a general one in ccx
         for step in self.steps:
@@ -31407,11 +31490,22 @@ class _Loads:
             loads = (audit[s - 1] if s <= len(audit) else None) or []
             if proc == "MODAL DYNAMIC":
                 prev = procs[s - 2] if s > 1 else ""
-                if state is not None and not (step.proc_card.uparam("CONTINUE") == "YES" and (
-                        prev == proc or (prev == "STATIC" and self.steps.steps[s - 2].perturbation))):
+                continued = step.proc_card.uparam("CONTINUE") == "YES" and (
+                    prev == proc or (prev == "STATIC" and self.steps.steps[s - 2].perturbation))
+                if state is not None and not continued:
                     self._modal_moving[s] = state
                     if general:
                         self._modal_held.add(s)
+                amps = dedup(v.strip().upper() for b in step.cards for k, v in b.params.items()
+                             if k.endswith("AMPLITUDE") and v and v.strip().upper() in step_amps)
+                if continued and amps:
+                    self.report.warn(f"*MODAL DYNAMIC step {s}, CONTINUE=YES: Abaqus continues "
+                                     f"the step time of step {s - 1} into it, so its step-time "
+                                     f"amplitude(s) {', '.join(amps)} start at that step's end "
+                                     f"time; ccx 2.23 starts each step's time at 0 and reads "
+                                     f"them from their start.", once=True)
+                    self._reduces("step-time amplitudes of a *MODAL DYNAMIC, CONTINUE=YES step "
+                                  "read from the step's start")
                 moving = any(d.startswith(self._MODAL_LOADS) for d in loads)
                 state, general = s if state is not None or moving else None, False
             elif proc in ("FREQUENCY", "BUCKLE"):
@@ -31944,8 +32038,9 @@ class _Loads:
                                      f"Use a fixed increment of at most {c:.3g}, or drop DIRECT so "
                                      f"abq2ccx caps the automatic increment.", once=True)
             return data
-        period, limit = num(1), num(3)
-        if limit is None or 0 < limit <= top or (period is not None and 0 < period <= top):
+        # (the step's period as Abaqus reads it: Step.period's rule)
+        period, limit = abaqus_period(Block("DYNAMIC", params, data), False), num(3)
+        if limit is None or 0 < limit <= top or (period is not None and period <= top):
             return data
         fields[3] = cap
         why, elem = next((w, e) for c, w, e in caps if c == top)
@@ -34629,6 +34724,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # INITIATION) -> (material, evolution follows, why commented or None) (_plan_material_cards)
         self._card_material: Dict[int, str] = {}
         self._used_materials: set = set()
+        self._copied_materials: set = set()      # the originals _material_copy copied (upper case)
         self._damage_plan: Dict[int, Tuple[Optional[str], bool, Optional[str]]] = {}
         self._jc_damage_kept = False
         # id(*EXPANSION, TYPE=ANISO) written as TYPE=ORTHO -> its material's name
@@ -34755,8 +34851,10 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # *RIGID BODY reference nodes that a kinematic coupling (ccx's own) shares: the body's ROT
         # NODE follows the node's DOFs 4-6 (_plan_rigid_couplings)
         self._rb_follow: set = set()
-        # the surfaces only such *COUPLING cards read: name -> those cards (_plan_kdyn_surfaces)
+        # the surfaces only such *COUPLING cards read: name -> those cards, and the internal
+        # element sets of those left out (_plan_kdyn_surfaces)
         self._kdyn_surfaces: Dict[str, List[Block]] = {}
+        self._kdyn_elsets: set = set()
         # reference nodes whose couplings are written so in a deck without NLGEOM because one
         # has a member BC on a DOF ccx's ORIENTATION coupling eliminates (_plan_kinematic_rot_nodes)
         self._kin_eq_refs: set = set()
@@ -35309,14 +35407,17 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
 
     def _undefined_parameter_data(self, blocks: List[Block]) -> None:
         """Reduced physics where model data keep a ``<name>`` token no *PARAMETER resolves
-        (apply_parameters warned: undefined, or not evaluable): a node line lost, a constant ccx
+        (apply_parameters warned: undefined, or not evaluable), or a parameter's expression
+        text, which did not evaluate (Report.unevaluated): a node line lost, a constant ccx
         cannot read.  Not for an output request, nor for an option of a material no section
         uses (_commented's rule)."""
         cards: List[str] = []
+        raw = self.report.unevaluated
         for b in blocks:
-            if b.keyword not in CCX_KEYWORDS or b.keyword in _NO_MODEL_DATA_CARDS or \
-                    not any(map(operator.contains, b.data, itertools.repeat("<"))) or \
-                    not any("<" in ln and _PARAM_TOKEN_RE.search(ln) for ln in b.data):
+            if b.keyword not in CCX_KEYWORDS or b.keyword in _NO_MODEL_DATA_CARDS or not (
+                    any(map(operator.contains, b.data, itertools.repeat("<"))) and
+                    any("<" in ln and _PARAM_TOKEN_RE.search(ln) for ln in b.data) or
+                    raw and any(ln in raw for ln in b.data)):
                 continue
             mat = self._card_material.get(id(b)) if b.keyword in MATERIAL_OPTION_CARDS else None
             if mat is None or mat.upper() in self._used_materials:
@@ -36129,6 +36230,14 @@ def _fmt_component(x: float) -> str:
     return "0" if abs(x) < 1e-12 else f"{x:.9g}"
 
 
+def _turned_default_n1(rotv: Callable[[Vec], Vec]) -> Optional[str]:
+    """The n1 line of a beam section without its own n1 in an instance that ``rotv`` turns:
+    Abaqus' default (0, 0, -1) in the part's axes, turned; None where the turn keeps it."""
+    v = rotv((0.0, 0.0, -1.0))
+    return None if max(abs(v[0]), abs(v[1]), abs(v[2] + 1.0)) < 1e-12 else \
+        ", ".join(_fmt_component(x) for x in v)
+
+
 def _fmt_unit(x: float) -> str:
     """A unit-vector component to 15 decimals, trailing zeros dropped: at most 18 characters,
     since ccx 2.23 reads only the first 20 of a data field (probed on *TRANSFORM: a longer
@@ -36691,17 +36800,23 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
                     if o and _ply_angle(o) is None:
                         f[3] = " " + namer(prefix, o)
                         nb.data[i] = ",".join(f)
-            at = beam_n1_line(nb) if rot and b.keyword in ("BEAM SECTION",
-                                                            "BEAM GENERAL SECTION") else None
+            beam = rot and b.keyword in ("BEAM SECTION", "BEAM GENERAL SECTION")
+            at = beam_n1_line(nb) if beam else None
             if at is not None and at < len(nb.data):
                 # the beam's n1 direction (its own data line) turns with the part; its
-                # fields count by position, a blank one 0
+                # fields count by position, a blank one 0, an all-zero / blank line the default
                 try:
                     v = fields_at(nb.data[at].split(","), 3)
                     if any(v):
                         nb.data[at] = ", ".join(_fmt_component(x) for x in rotv(tuple(v)))
+                    elif _turned_default_n1(rotv):
+                        nb.data[at] = _turned_default_n1(rotv)
                 except ValueError:
                     pass
+            elif beam and beam_n1_slot(nb) is not None and _turned_default_n1(rotv):
+                # without an n1 line the default (0, 0, -1) is the part's too ("All data within
+                # a part ... are defined relative to the part's local coordinate system")
+                nb.data.insert(beam_n1_slot(nb), _turned_default_n1(rotv))
             if rot and b.keyword == "GAP" and nb.data:
                 # fields 2-4, a GAPUNI's closure direction (a GAPCYL's axis), are the part's
                 # global direction cosines: they turn with it (all blank or 0: the direction

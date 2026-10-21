@@ -34,6 +34,15 @@ physics.
   stress come in axes that turn with the material while DROT is the rotation increment (a UMAT
   that turns its tensor state variables by DROT turns them twice) and that COORDS is the
   undeformed position.
+* **Small follow-ups** — `*NGEN` with an increment of 0 (the default 1) no longer skips its
+  line, and a skipped line's end nodes still join its NSET, as Abaqus documents. `*NMAP,
+  DEFINITION=NODES` reads its node fields by position. A beam section without an n1 line turns
+  its default n1 with a rotated instance (it stayed global: the turned beams bent up to 52 %
+  off). A coupling written as a `*RIGID BODY` no longer leaves its surface, and an internal
+  element set only that surface names, in the deck unread. Now reduced physics: `*DSLOAD,
+  SUBMODEL`, model data holding a `*PARAMETER` that does not evaluate, and step-time
+  amplitudes in a `*MODAL DYNAMIC, CONTINUE=YES` step (Abaqus continues the step time there,
+  ccx starts it at 0). A material whose copies took all its sections gets no conversion notes.
 
 ## 1.5.0 (October 2026)
 

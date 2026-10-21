@@ -1570,11 +1570,11 @@ def test_mesh_generation_skips_unreadable_records():
                                      "<dx>, 0., 0.\n"),
                      ("*ELGEN record", "*ELGEN, ELSET=E\n1, <n>, 1, 1\n"),
                      ("*ELCOPY card", "*ELCOPY, ELEMENT SHIFT=<k>, OLD SET=E, SHIFT NODES=1\n")):
-        _, conv, rep = convert_str(ends + card + "*NGEN\n1, 10, 0\n")
+        _, conv, rep = convert_str(ends + card + "*NGEN\n10, 1\n")
         assert f"Skipped a {kw} with non-numeric data" in rep.text(), (kw, rep.text())
         assert sorted(conv.geom.nodes) == [1, 2, 10] and list(conv.geom.elements) == [1]
         assert any("non-numeric" in r for r in conv.reduced_physics)
-        assert "with increment 0 generated no nodes" in rep.text()
+        assert "with increment 1 generated no nodes" in rep.text()
 
 
 def test_string_parameter_substitution():
@@ -20400,6 +20400,121 @@ def test_deformation_plasticity_frequency_and_massless_frequency_warned():
     assert "eigenvalues, but at most" not in rep.text()
     _, conv, rep = convert_str(deck.replace("density=0.", "density=1."))
     assert "eigenvalues, but at most" not in rep.text()
+
+
+def test_ngen_increment_zero_is_the_default_and_end_nodes_join_the_nset():
+    # an increment 0 is the default 1 (Abaqus documents no other meaning of it; expand_generate
+    # reads GENERATE lines so): the line was skipped as reduced physics
+    ends = "*NODE\n1, 0., 0., 0.\n5, 4., 0., 0.\n"
+    _, conv, rep = convert_str(ends + "*NGEN, NSET=L\n1, 5, 0\n")
+    assert sorted(conv.geom.nodes) == [1, 2, 3, 4, 5] and conv.geom.nodes[3] == (2.0, 0.0, 0.0)
+    assert conv.geom.nset("L") == [1, 2, 3, 4, 5] and conv.reduced_physics == []
+    assert "*NGEN increment 0 read as the default 1." in rep.text()
+    # "The two end nodes will also be included in the node set": a skipped line's too (they
+    # were left out with its nodes), an undefined one not
+    for card, nset in (("*NGEN, NSET=L\n1, 5, -1\n", [1, 5]), ("*NGEN, NSET=L, LINE=C\n1, 5, 1, 99\n", [1, 5]),
+                       ("*NGEN, NSET=L\n1, 12\n", [1])):
+        _, conv, _ = convert_str(ends + card)
+        assert conv.geom.nset("L") == nset, card
+        assert conv.reduced_physics == ["*NGEN line skipped (its nodes not generated)"], card
+
+
+def test_nmap_node_definition_reads_blank_fields_by_position():
+    # DEFINITION=NODES: a blank node field was dropped, so b read as a (no axis: skipped)
+    nodes = "*NODE, NSET=M\n1, 1., 0., 0.\n2, 0., 1., 0.\n*NODE\n10, 0., 0., 0.\n11, 1., 0., 0.\n"
+    for a in ("", "10"):
+        _, conv, _ = convert_str(nodes + f"*NMAP, NSET=M, TYPE=TRANSLATION, DEFINITION=NODES\n{a}, 11\n2.\n")
+        assert conv.geom.nodes[1] == (3.0, 0.0, 0.0) and conv.geom.nodes[2] == (2.0, 1.0, 0.0), a
+        assert conv.reduced_physics == []
+
+
+def test_rotated_instance_turns_the_default_n1():
+    # without an n1 line (or with a blank one) a beam section's n1 is Abaqus' default
+    # (0, 0, -1) in the part's axes, as all part data: it turns with the instance, as a given
+    # n1 line does (it stayed global, the section turned about its beam; validate_with_ccx.py
+    # rotated_instance_n1)
+    part = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=E\n1, 1, 2\n"
+            "*Beam {}Section, elset=E, {}section=RECT\n0.1, 0.2\n{}")
+    tail = "*Material, name=M\n*Elastic\n1., 0.3\n"
+    for kind, mat, lines, want in (("", "material=M, ", "", "\n0, 1, 0\n*"),
+                                   ("", "material=M, ", "\n5, 5\n", "\n0, 1, 0\n5, 5\n"),
+                                   ("General ", "", "1., 0.4\n", "\n0, 1, 0\n*")):
+        body, _, _ = convert_str(_instanced(part.format(kind, mat, lines), "0., 0., 0., 1., 0., 0., 90.",
+                                            tail=tail))
+        assert "SECTION=RECT\n0.1, 0.2" + want in body, (kind, lines)
+    # a turn that keeps it (about z): no n1 line written
+    body, _, _ = convert_str(_instanced(part.format("", "material=M, ", ""), tail=tail))
+    assert "SECTION=RECT\n0.1, 0.2\n*" in body
+
+
+def test_modal_dynamic_continue_warns_about_step_time_amplitudes():
+    # CONTINUE=YES continues the step time of the modal dynamic step before (Abaqus 2017
+    # Keywords *MODAL DYNAMIC): its step-time amplitudes start there, ccx reads them from 0
+    deck = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Density\n1.\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3\n4, 1, 3\n*Amplitude, name=RAMP{}\n0., 0., 1., 1.\n"
+            "*Step\n*Frequency\n6\n*End Step\n" + "".join(
+                f"*Step\n*Modal Dynamic{c}\n0.01, 0.5\n*Modal Damping\n1, 6, 0.02\n*Cload, amplitude=RAMP\n"
+                "7, 3, 1.\n*End Step\n" for c in ("", "{}")))
+    flag = "step-time amplitudes of a *MODAL DYNAMIC, CONTINUE=YES step read from the step's start"
+    _, conv, rep = convert_str(deck.format("", ", continue=YES"))
+    assert flag in conv.reduced_physics
+    assert "*MODAL DYNAMIC step 3, CONTINUE=YES: Abaqus continues the step time of step 2" in rep.text()
+    for amp, cont in (("", ", continue=NO"), (", time=TOTAL TIME", ", continue=YES")):
+        _, conv, rep = convert_str(deck.format(amp, cont))
+        assert flag not in conv.reduced_physics and "Abaqus continues the step time" not in rep.text()
+
+
+def test_surface_submodel_load_is_reduced_physics():
+    # *DSLOAD, SUBMODEL names surfaces only (their driven loads): commented out as having "no
+    # load type label", which was no reduced physics
+    deck = HEX_MODEL + ("*Surface, name=TOP\nEALL, S2\n*Step\n*Static\n*Dsload, submodel, step=1\nTOP\n"
+                        "*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*DSLOAD, SUBMODEL on 'TOP' not converted: the converter does not convert" in rep.text()
+    assert conv.reduced_physics == ["*DSLOAD, SUBMODEL driven loads dropped"] and "\n** TOP\n" in body
+
+
+def test_unevaluable_parameter_in_model_data_is_reduced_physics():
+    # substituted as its expression text, it left no <name> token to flag (an unused
+    # material's card changes nothing: no flag)
+    deck = ("*Parameter\nw = foo(2.) * 3\n" + HEX_MODEL + "*Material, name=UNUSED\n*Elastic\n<w>, 0.3\n"
+            "*Step\n*Static\n*Dload\nEALL, P2, -<w>\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "EALL, P2, -foo(2.) * 3" in body and "w could not be evaluated" in rep.text()
+    assert conv.reduced_physics == ["*DLOAD data with an unresolved *PARAMETER"]
+
+
+def test_copied_away_material_gets_no_conversion_notes():
+    # an original whose copy took all its sections (here a shell section's DENSITY=) changes
+    # nothing in the analysis: how its cards are written is not reported (it was, beside the
+    # copy's)
+    deck = ("*NODE, NSET=ALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "*ELEMENT, TYPE=S4, ELSET=E\n1, 1, 2, 3, 4\n*Shell Section, elset=E, material=M, density=0.5\n"
+            "0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n*Expansion, type=ORTHO\n1e-5, 2e-5, 3e-5\n"
+            "*Density\n1.\n*Boundary\n1, 1, 6\n2, 1, 6\n*Initial Conditions, type=temperature\nALL, 0.\n"
+            "*Step\n*Static\n*Temperature\nALL, 10.\n*End Step\n*Step\n*Frequency\n2\n*End Step\n")
+    body, _, rep = convert_str(deck)
+    assert "*SHELL SECTION, ELSET=E, MATERIAL=M_SHELL_MASS" in body
+    assert "Material M_SHELL_MASS: isotropic *ELASTIC written as TYPE=ENGINEERING CONSTANTS" in rep.text()
+    assert "Material M:" not in rep.text()
+
+
+RB_SURFACE = (HEX + "*Node\n100, 0.5, 0.5, 1.5\n101, 0.5, 0.5, 3.\n*Element, type=B31, elset=BEAM\n2, 100, 101\n"
+              "*Solid Section, elset=EALL, material=M\n*Beam Section, elset=BEAM, material=M, section=RECT\n"
+              "0.1, 0.1\n1., 0., 0.\n*Material, name=M\n*Elastic\n1000., 0.3\n*Elset, elset=_TOP_S2, internal\n1\n"
+              "*Surface, name=TOP\n_TOP_S2, S2\n*Coupling, constraint name=C1, ref node=100, surface=TOP\n"
+              "*Kinematic\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n*Step\n*Static\n*Cload\n101, 1, 1.\n{}*End Step\n")
+
+
+def test_rigid_body_coupling_leaves_its_surface_and_internal_set_out():
+    # a coupling on a beam's reference node written as a *RIGID BODY of its nodes reads its
+    # surface no more: left out, with the internal element set only it names
+    body, conv, _ = convert_str(RB_SURFACE.format(""))
+    assert "*RIGID BODY, NSET=ABQ2CCX_RB1, REF NODE=100" in body
+    assert "TOP" not in body and conv._kdyn_elsets == {"_TOP_S2"}
+    # a set another card names stays
+    body, _, _ = convert_str(RB_SURFACE.format("*El Print, elset=_TOP_S2\nS\n"))
+    assert "*ELSET, ELSET=_TOP_S2\n1\n" in body and "*SURFACE" not in body
 
 
 if __name__ == "__main__":
