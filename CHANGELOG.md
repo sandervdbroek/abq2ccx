@@ -20,7 +20,10 @@ physics.
   (ccx gave them the density of the element assembled before). Warned: `*DEFORMATION
   PLASTICITY` with a `*FREQUENCY` step (ccx can stop after the eigenvalues, depending on the
   units), and a `*FREQUENCY` step whose eigenvalue count ccx's ARPACK cannot reach because
-  massless sections add degrees of freedom.
+  massless sections add degrees of freedom. The beam-node moment warnings now say what happens
+  and how to avoid it: in `*DYNAMIC` ccx exits where the step starts with the node unturned;
+  after a `*BUCKLE` ccx deletes every load, so the moments given again make a second
+  mean-rotation MPC and ccx loops (or, about one axis, runs 1 % off: now reduced physics).
 * **Explicit mass scaling** — `*FIXED MASS SCALING, FACTOR=f` on the whole model, the same in
   every explicit step, was dropped (ccx ran the true mass, at a sqrt(f) smaller increment); its
   densities, `*MASS` values and rotary inertias now go out f times larger and its specific heats

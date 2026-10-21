@@ -20089,17 +20089,25 @@ def test_collapsed_quad_shells_as_triangles():
 
 
 def test_beam_moments_ccx_cannot_run_warned():
-    # a moment on a beam node that is no knot: ccx exits 255 in an implicit *DYNAMIC step, and
-    # can loop without end around a *BUCKLE step (moment before it and after it)
+    # a moment on a beam node that is no knot: ccx exits 255 in an implicit *DYNAMIC step that
+    # starts with the node unturned, and loops forever around a *BUCKLE step (moment before it
+    # and after it: ccx deletes the loads after a *BUCKLE, the moment given again makes a second
+    # mean-rotation MPC); the moments stay, the warnings say how to avoid it
     dyn = STOP_BEAM + "*Step\n*Dynamic\n0.001, 0.01\n*Cload\nTIP, 5, 0.01\n*End Step\n"
     _, _, rep = convert_str(dyn)
-    assert "in an implicit *DYNAMIC step: ccx 2.23 exits without a message" in rep.text()
+    text = " ".join(rep.text().split())
+    assert "in an implicit *DYNAMIC step, where the node is no knot: ccx 2.23 exits 255" in text
+    assert "turn the node in a step before" in text
     _, _, rep = convert_str(dyn.replace("*Cload\nTIP, 5, 0.01", "*Boundary\nTIP, 5, 5, 0.001"))
-    assert "exits without a message" not in rep.text()
+    assert "exits 255" not in rep.text()
     stat = "*Step\n*Static\n*Cload\nTIP, 4, 0.01\n*End Step\n"
     buckle = "*Step\n*Buckle\n2\n*Cload\nTIP, 1, -1.\n*End Step\n"
-    _, _, rep = convert_str(STOP_BEAM + stat + buckle + stat)
-    assert "around a *BUCKLE step" in rep.text() and "can loop without end" in rep.text()
+    _, conv, rep = convert_str(STOP_BEAM + stat + buckle + stat)
+    text = " ".join(rep.text().split())
+    assert "around a *BUCKLE step" in text and "loops forever in its cascade" in text
+    assert "second mean-rotation MPC" in text and "put the *BUCKLE step last" in text
+    assert conv.reduced_physics == ["moments on beam nodes around a *BUCKLE step (ccx 2.23 loops, or "
+                                    "runs about 1 % off)"]
     _, _, rep = convert_str(STOP_BEAM + stat + buckle)          # nothing after it: runs
     assert "around a *BUCKLE step" not in rep.text()
 

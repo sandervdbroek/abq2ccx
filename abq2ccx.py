@@ -19055,20 +19055,22 @@ class _Dofs:
     def _warn_beam_moment_stops(self, blocks: List[Block]) -> None:
         """Warn of moments ccx 2.23 cannot run on beam nodes that are no knot (mean-rotation
         MPCs, gen3dforc), probed on a cantilever along a global axis and turned in space:
-        * in an implicit *DYNAMIC step (any value, NLGEOM too) ccx exits 255 without a message;
-          a rotational BC there runs, and so does a knot beam;
+        * in an implicit *DYNAMIC step ccx exits 255 without a message where the step starts
+          with the node unturned: from rest, after steps that leave it unturned, after a zero
+          moment (NLGEOM too); a step before it that turns the node (a moment, a rotational BC,
+          a lateral load of 1e-12) lets it run, and so does a knot beam;
         * around a *BUCKLE step - a moment or nonzero rotational BC on the node in a general
-          step before it and a moment in it or after it (the base state's moments, which the
-          converter gives again in a general step after it: _restore_base_states, count) -
-          ccx can loop without end decascading its MPCs ('*WARNING in cascade: zero coefficient
-          on the dependent side of an equation'), writing output until it is killed (2 GB in
-          45 s: a moment about one axis before and after; some moments about several ran); a
-          knot does not.  Shell nodes do neither.  The cause (probed, gen3dforc.f): ccx deletes
-          every load after a *BUCKLE step (nforc = 0), so a moment given again there makes the
-          node a second mean-rotation MPC on top of the one the moment or rotation before it
-          made; a moment first given after the *BUCKLE, or OP=NEW in a general step, runs.  So
-          no restore avoids it: Abaqus keeps the base state's moment, which ccx must be given
-          again."""
+          step before it and a moment in it or after it - ccx loops without end in cascade
+          ('*WARNING in cascade: zero coefficient on the dependent side of an equation', about
+          200 MB of output a second; with a moment about one axis it warned once and ran, the
+          step after the *BUCKLE 1 % off the deck without it).  The cause (CalculiX.c, gen3dforc.f): ccx deletes every
+          load after a *BUCKLE step (nforc = 0), so a moment given after it, which the
+          converter does for the base state's (_restore_base_states: Abaqus keeps them), makes
+          the node a second mean-rotation MPC on top of the first; a moment first given after
+          the *BUCKLE, or OP=NEW in a general step, runs.  On a beam in a general direction a
+          moment in the *BUCKLE step itself loops too.  A knot does neither, nor do shell nodes.
+        The deck's moments stay as written (a knot would stiffen the section at the node); the
+        warnings say what to expect and how to avoid it."""
         if not self._mechanical or not (self.steps.dynamic or "BUCKLE" in self.steps.procs):
             return
         beams_at: Dict[int, List[int]] = {}
@@ -19104,9 +19106,14 @@ class _Dofs:
                      for n in moments.get(st.no, ())})
         if dyn:
             self.report.warn(f"Moments on {len(dyn)} beam node(s) (e.g. node {dyn[0]}) in an implicit "
-                             f"*DYNAMIC step: ccx 2.23 exits without a message there (exit 255, "
-                             f"probed: also on a beam along a global axis, and under NLGEOM) when the "
-                             f"node is no knot; a rotational BC runs.", once=True)
+                             f"*DYNAMIC step, where the node is no knot: ccx 2.23 exits 255 without a "
+                             f"message when such a step starts with the node unturned - from rest, or "
+                             f"after steps that leave it unturned, also after a zero moment (probed, "
+                             f"also under NLGEOM) - and gives no results from that step on. To run "
+                             f"it, turn the node in a step before (a moment or a rotation there; even "
+                             f"a lateral load of 1e-12 let it run), or make the node a knot (a short "
+                             f"beam at an angle to it), which holds its section rigid (0.6-9 % stiffer "
+                             f"in the probes).", once=True)
         loop: set = set()
         for st in steps:
             if st.proc != "BUCKLE":
@@ -19120,16 +19127,24 @@ class _Dofs:
         loop_nodes = plain(loop)
         if loop_nodes:
             self.report.warn(f"Moments on {len(loop_nodes)} beam node(s) (e.g. node {loop_nodes[0]}) "
-                             f"around a *BUCKLE step - a moment or rotation on the node before it, "
-                             f"a moment in it or after it (the converter gives the base state's "
-                             f"loads again after it): ccx 2.23 can loop without end decascading "
-                             f"its MPCs there ('*WARNING in cascade: zero coefficient on the "
-                             f"dependent side of an equation'), writing output until it is stopped "
-                             f"(probed: 2 GB in 45 s with a moment about one axis before and after, "
-                             f"also on a beam along a global axis; other moments ran) where the "
-                             f"node is no knot: ccx deletes every load after a *BUCKLE step, and the "
-                             f"moment given again makes a second mean-rotation MPC on the node. Run "
-                             f"ccx with a file-size limit.", once=True)
+                             f"around a *BUCKLE step, where the node is no knot: a moment or rotation "
+                             f"on it in a general step before the *BUCKLE and a moment in or after "
+                             f"it. ccx 2.23 deletes every load after a *BUCKLE step, so the moments "
+                             f"are given again after it (the converter gives the base state's: "
+                             f"Abaqus keeps them), and each makes the node a second mean-rotation "
+                             f"MPC: ccx then loops forever in its cascade ('*WARNING in cascade: "
+                             f"zero coefficient on the dependent side of an equation'), writing about "
+                             f"200 MB of output a second until it is stopped (probed with moments "
+                             f"about several axes; on a beam in a general direction a moment in the "
+                             f"*BUCKLE step itself loops too), or, with a moment about one axis, "
+                             f"warns once and runs 1 % off (probed). Run ccx with a file-size limit. "
+                             f"To avoid it, put the *BUCKLE step last, "
+                             f"with no moment in it, or run two decks: this one cut after the "
+                             f"*BUCKLE step, and this one without it (a *BUCKLE step leaves the "
+                             f"base state unchanged, so together they give the deck's answers).",
+                             once=True)
+            self._reduces("moments on beam nodes around a *BUCKLE step (ccx 2.23 loops, or runs "
+                          "about 1 % off)")
 
     def _plan_beam_section_axes(self, blocks: List[Block]) -> None:
         """Rotational BCs and moments on beam nodes in general 3-D directions.  ccx 2.23 makes
