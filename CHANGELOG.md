@@ -6,6 +6,21 @@ physics.
 
 ## Unreleased
 
+* **ccx stops the conversion now avoids** — a `*TIE` line naming one surface as slave and master
+  is left out (Abaqus ties nothing there; ccx 2.23 looped without end), and a solid or node slave
+  surface that shares nodes with its master becomes a node surface of its other nodes (Abaqus
+  ties no shared node; other element families: the line is left out, warned). An unread node
+  surface holding `*RIGID BODY` members of plane elements is left out (ccx stopped in cascade).
+  A `*MASS`-only member of a kinematic coupling gets the massless tetrahedron a rigid-body member
+  gets in `*FREQUENCY` decks (ccx stopped in add_bo_st). A static perturbation step between a
+  `*FREQUENCY` step with its own BCs and the modal step reading its modes keeps those BCs, warned
+  (ccx stopped on the .eig file). `*STEP, PERTURBATION` after a `*BUCKLE` step is dropped where
+  the general steps before it leave the model unstressed (was reduced physics). Section
+  materials without `*DENSITY` get `*DENSITY 0` where mass acts and temperatures are defined
+  (ccx gave them the density of the element assembled before). Warned: `*DEFORMATION
+  PLASTICITY` with a `*FREQUENCY` step (ccx can stop after the eigenvalues, depending on the
+  units), and a `*FREQUENCY` step whose eigenvalue count ccx's ARPACK cannot reach because
+  massless sections add degrees of freedom.
 * **Explicit mass scaling** — `*FIXED MASS SCALING, FACTOR=f` on the whole model, the same in
   every explicit step, was dropped (ccx ran the true mass, at a sqrt(f) smaller increment); its
   densities, `*MASS` values and rotary inertias now go out f times larger and its specific heats

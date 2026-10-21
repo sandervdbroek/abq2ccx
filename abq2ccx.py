@@ -7635,6 +7635,8 @@ class _Mesh:
         rho = b.param("DENSITY")
         if rho:                                    # scaled as the deck's (_plan_coupled_inertia)
             out += ["*DENSITY", "%.12g" % (pf(rho) / self._mass_scale) if self._mass_scale else rho]
+        elif self._zero_density:                   # (_plan_massless_materials)
+            out += ["*DENSITY", "0."]
         if alpha:
             zero = b.param("ZERO")
             out += [emit_keyword("EXPANSION", OrderedDict([("ZERO", zero)]) if zero else OrderedDict()),
@@ -8174,19 +8176,82 @@ class _Mesh:
                 params["NAME"] = self._fresh_name(f"{(keep.get('NAME') or 'TIE').strip()}_{i + 1}")
             f = [x.strip() for x in line.split(",")]
             master = f[1] if len(f) > 1 else ""
+            plain = bool(f[0]) and not (b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE"))
+            if plain and f[0].upper() == master.upper():
+                out += self._comment_out(
+                    f"*TIE {params.get('NAME') or ''}: {f[0]} is both its slave and its master "
+                    f"surface. Abaqus generates no tie constraint for identical surfaces (Mesh tie "
+                    f"constraints), and ccx 2.23 loops without end on it ('zero coefficient on the "
+                    f"dependent side of an equation'; probed), so the line is left out.",
+                    [emit_keyword("TIE", params), line], False)
+                continue
             name, cards = self._membrane_node_surface(
                 f[0], "*TIE slave", exclude=set(self._surface_member_nodes(master))) \
-                if f[0] and not (b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE")) else (None, [])
+                if plain else (None, [])
+            membrane = name is not None
+            if plain and not membrane:
+                name, cards = self._shared_tie_slave(f[0], master)
+            if name == "?":
+                out += self._comment_out(
+                    f"*TIE {params.get('NAME') or ''}: slave surface {f[0]} shares nodes with the "
+                    f"faces of master surface {master}. Abaqus does not tie those nodes; ccx 2.23 "
+                    f"ties each one to the face it lies on and loops without end ('zero coefficient "
+                    f"on the dependent side of an equation'; probed). The converter has no node "
+                    f"form for this element family, so the line is left out: leave the shared "
+                    f"nodes out of the slave surface.", [emit_keyword("TIE", params), line],
+                    "*TIE whose slave surface shares nodes with its master (left out)")
+                continue
             if name == "":
                 out.append(f"** abq2ccx: *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
                            f"node of {master}, which joins them already")
                 continue
-            if name:
+            if name and not membrane:
+                line = ", ".join([name] + f[1:])
+            elif name:
                 params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
                     b.param("POSITION TOLERANCE"), f[0], master, b, False), 6)
                 line = ", ".join([name] + f[1:])
             out += cards + [emit_keyword("TIE", params), line]
         return out + comments
+
+    def _shared_tie_slave(self, slave: str, master: str) -> Tuple[Optional[str], List[str]]:
+        """A *TIE slave surface ``slave`` that shares nodes with the faces of ``master``: ccx
+        2.23 ties such a node to the master face it lies on, so the tie's dependent DOF is one
+        of its own independent terms, and loops without end decascading it ('zero coefficient
+        on the dependent side of an equation'; probed on C3D8 blocks sharing an edge of the
+        interface).  Abaqus ties no shared node ("Any nodes shared between the slave and master
+        surfaces will not be tied", surface-to-surface, its Abaqus/Standard default; Mesh tie
+        constraints), so a slave surface on solid elements, or a node surface, becomes a node
+        surface of its other nodes: (its name, its *SURFACE card), "" with none left (probed:
+        the answer of the blocks merged at the interface).  (None, []): nothing shared; ("?",
+        []): shared on another element family (shells, plane elements)."""
+        sd = self.surfaces.get(slave.upper())
+        shared = set(self._surface_member_nodes(master))
+        nodes = self._surface_member_nodes(slave)
+        if sd is None or not shared.intersection(nodes):
+            return None, []
+        keep = [n for n in nodes if n not in shared]
+        if not sd[0].startswith("NODE") and not all(
+                ccx_type(self.geom.elements[e][0]).startswith("C3D")
+                for e in self._surface_elements(slave)):
+            return "?", []
+        if not keep:
+            self.report.note(f"*TIE slave surface {slave}: every node of it lies on the faces of "
+                             f"master surface {master}, and Abaqus ties no shared node (Mesh tie "
+                             f"constraints), so the line is left out (ccx 2.23 can loop without end "
+                             f"on such a tie; probed). Exact.", once=True)
+            return "", []
+        key = (slave.upper(), tuple(keep))
+        if key in self._mem_surfaces:
+            return self._mem_surfaces[key], []
+        self._reserve_names()
+        name = self._fresh_name(f"{slave}_NODES")
+        self._mem_surfaces[key] = name
+        self.report.note(f"*TIE slave surface {slave} shares {len(nodes) - len(keep)} node(s) with "
+                         f"the faces of master surface {master} -> node surface {name} of its other "
+                         f"nodes: Abaqus ties no shared node (Mesh tie constraints), ccx 2.23 would "
+                         f"tie each one to itself and loop without end (probed). Exact.", once=True)
+        return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]
 
     def _membrane_node_surface(self, surf: str, what: str, shells: bool = False,
                                exclude: Optional[set] = None) -> Tuple[Optional[str], List[str]]:
@@ -15770,12 +15835,30 @@ class _Materials:
         at 2 sigma0, a pressure under pure shear strain), so both spellings of Abaqus'
         small-strain step run the same law.  A material that no section, composite ply or
         other card names is commented out (_dp_unused, _plan_dp_materials): it changes
-        nothing in Abaqus."""
+        nothing in Abaqus.
+
+        In a *FREQUENCY step ccx 2.23 evaluates the law for each mode's mass-normalized shape
+        as a linear strain read as a Green-Lagrange one, and stops after printing the
+        eigenvalues where a principal value is below -0.5 ('*ERROR in umat_abaqusnl: negative
+        eigenvalue of the Cauchy-Green tensor', exit 201): whether it does depends on the
+        units, through the size of a mass-normalized mode (probed: a 100 mm steel cube stops
+        in m, kg, s and runs in mm, t, s, both with the elastic law's eigenvalues).  Warned."""
         if not self._dp_nlgeom:
             return
         opts = self._material_options(blocks)
         dps = [m for m, cards in opts.items()
                if any(c.keyword == "DEFORMATION PLASTICITY" for c in cards[1:])]
+        if "FREQUENCY" in self.steps.procs:
+            used = ", ".join((opts[m][0].param("NAME") or "").strip() for m in dps
+                             if id(opts[m][0]) not in self._dp_unused)
+            self.report.warn(f"*DEFORMATION PLASTICITY ({used}) in a model with a *FREQUENCY step: "
+                             f"ccx 2.23 evaluates the law for each mass-normalized mode shape and can "
+                             f"stop after printing the eigenvalues ('*ERROR in umat_abaqusnl: "
+                             f"negative eigenvalue of the Cauchy-Green tensor', exit 201), writing no "
+                             f"mode shapes. Whether it does depends on the units, through the size of "
+                             f"a mass-normalized mode (probed: a 100 mm steel cube stops in m, kg, s "
+                             f"and runs in mm, t, s, both with the elastic law's eigenvalues).",
+                             once=True)
         small = explicit_no = False
         for step in self.steps:                 # (Abaqus' small strain: Step.nlgeom off)
             explicit_no = explicit_no or step.nlgeom_card is False
@@ -16608,6 +16691,38 @@ class _Materials:
                              f"added. ccx gives every element temperature DOFs in this deck's thermal "
                              f"steps and stops on a singular matrix where nothing conducts or stores "
                              f"heat.", once=True)
+
+    def _plan_massless_materials(self, blocks: List[Block]) -> None:
+        """Where mass acts (StepModel.mass_acts) and temperatures are defined (initial ones, a
+        *TEMPERATURE card or a thermal step), ccx 2.23 gives a material without *DENSITY the
+        density of the element it assembled just before (probed on 2.23 builds 2 and 8: two
+        cubes in a *DYNAMIC step, the one without *DENSITY moves as the other's density makes
+        it, by element order; without temperatures it has no mass).  Abaqus gives elements
+        without a density no mass (it is optional for stress/displacement elements), as ccx
+        does without temperatures, so every section material without one gets *DENSITY 0
+        (``_zero_density``: the *BEAM GENERAL SECTION material too, _general_as_beam_section);
+        before the planners that copy materials."""
+        heated = bool(self.steps.procs & CCX_THERMAL_PROCS) or any(
+            b.keyword == "TEMPERATURE" or (b.keyword == "INITIAL CONDITIONS" and
+                                           b.uparam("TYPE") == "TEMPERATURE") for b in blocks)
+        self._zero_density = heated and self.steps.mass_acts
+        if not self._zero_density:
+            return
+        used = {m.upper() for b in blocks if b.keyword.endswith("SECTION")
+                for _t, m, _o in self._section_layers(b, strict=True) if m}
+        names = []
+        for name, group in self._material_options(blocks).items():
+            if name not in used or any(c.keyword == "DENSITY" for c in group):
+                continue
+            at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
+            blocks[at:at] = [Block("DENSITY", OrderedDict(), ["0."])]
+            names.append(name)
+        if names:
+            self.report.note(f"Material{'s' if len(names) > 1 else ''} {', '.join(names)} without "
+                             f"*DENSITY: *DENSITY 0 added. Where temperatures are defined, ccx 2.23 "
+                             f"gives such a material the density of the element it assembled just "
+                             f"before (probed); Abaqus gives its elements no mass, as ccx does "
+                             f"without temperatures. Exact.", once=True)
 
     def _plan_material_facts(self, blocks: List[Block]) -> None:
         """*DEPVAR sizes, field variables, parameter values, section controls, hardening facts."""
@@ -18895,7 +19010,12 @@ class _Dofs:
           ccx can loop without end decascading its MPCs ('*WARNING in cascade: zero coefficient
           on the dependent side of an equation'), writing output until it is killed (2 GB in
           45 s: a moment about one axis before and after; some moments about several ran); a
-          knot does not.  Shell nodes do neither."""
+          knot does not.  Shell nodes do neither.  The cause (probed, gen3dforc.f): ccx deletes
+          every load after a *BUCKLE step (nforc = 0), so a moment given again there makes the
+          node a second mean-rotation MPC on top of the one the moment or rotation before it
+          made; a moment first given after the *BUCKLE, or OP=NEW in a general step, runs.  So
+          no restore avoids it: Abaqus keeps the base state's moment, which ccx must be given
+          again."""
         if not self._mechanical or not (self.steps.dynamic or "BUCKLE" in self.steps.procs):
             return
         beams_at: Dict[int, List[int]] = {}
@@ -18954,7 +19074,9 @@ class _Dofs:
                              f"dependent side of an equation'), writing output until it is stopped "
                              f"(probed: 2 GB in 45 s with a moment about one axis before and after, "
                              f"also on a beam along a global axis; other moments ran) where the "
-                             f"node is no knot. Run ccx with a file-size limit.", once=True)
+                             f"node is no knot: ccx deletes every load after a *BUCKLE step, and the "
+                             f"moment given again makes a second mean-rotation MPC on the node. Run "
+                             f"ccx with a file-size limit.", once=True)
 
     def _plan_beam_section_axes(self, blocks: List[Block]) -> None:
         """Rotational BCs and moments on beam nodes in general 3-D directions.  ccx 2.23 makes
@@ -21548,8 +21670,9 @@ class _Constraints:
 
     def _plan_member_mass_tets(self, blocks: List[Block]) -> None:
         """ccx 2.23's *FREQUENCY stops ('add_bo_st: coefficient should be 0') on a *MASS at a
-        member node of a rigid body (a *RIGID BODY, the body of *MPC BEAM lines) that belongs
-        to no other element (probed; a *DYNAMIC step runs it).  Each such node gets a
+        member node of a rigid body (a *RIGID BODY, the body of *MPC BEAM lines, a kinematic
+        coupling of all translations, as ccx's *KINEMATIC or as the *RIGID BODY it is written
+        as) that belongs to no other element (probed; a *DYNAMIC step runs it).  Each such node gets a
         zero-density tetrahedron (elset ABQ2CCX_RIGID, the skins' material) with three new
         nodes the body also carries: it moves rigidly with the body, so it strains nothing and
         the solution is the deck's (probed: the frequencies of a spring-held body equal those
@@ -21582,6 +21705,23 @@ class _Constraints:
             for body in group:
                 bodies.append((None, body, [n for n in body["members"]
                                             if n not in (body["ref"], body.get("rot"))]))
+        surfaces = {b.uparam("NAME"): b for b in blocks
+                    if b.keyword == "SURFACE" and b.uparam("TYPE") == "NODE"}
+        for i, b in enumerate(blocks):
+            # a kinematic coupling of all translations (ccx's *KINEMATIC, or the *RIGID BODY /
+            # equations it is written as): its node surface, or its plan's members, take the
+            # new nodes (not within an INFLUENCE RADIUS, nor in a planar model's coupling)
+            cg = self._coupling_groups(blocks, i) if b.keyword == "COUPLING" else None
+            if cg is None or len(cg[1]) != 1 or not {1, 2, 3} <= cg[1][0][1] or \
+                    b.param("INFLUENCE RADIUS") is not None or id(b) in self._planar_kin:
+                continue
+            plan = self._coupling_plan.get(id(b)) or {}
+            surf = surfaces.get(b.uparam("SURFACE"))
+            if plan.get("kind") in ("rb", "rbk", "kdyn") and "members" in plan:
+                bodies.append((None, plan, cg[1][0][0]))
+            elif plan.get("kind") in (None, "kin") and surf is not None and \
+                    self._surface_users(blocks, surf.uparam("NAME")) == {"COUPLING"}:
+                bodies.append((surf, {}, cg[1][0][0]))
         nid, eid = self._next_ids()
         h = 1e-3 * self._model_span()
         done: List[int] = []
@@ -21605,24 +21745,97 @@ class _Constraints:
                 done.append(n)
             if not new:
                 continue
-            if card is not None:
+            if card is not None and card.keyword == "SURFACE":
+                card.data = list(card.data) + [str(m) for m in new]
+            elif card is not None:
                 self._add_rigid_members(card, new)
             else:
                 body["members"] = list(body["members"]) + new
         if done:
             self._plan_skin_material(blocks)
-            self.report.note(f"*MASS on {len(done)} rigid-body member node(s) in no other element "
-                             f"(e.g. node {done[0]}): each got a force-free, massless tetrahedron "
-                             f"(elset {RIGID_SET}) of three new nodes the body carries — ccx 2.23's "
-                             f"*FREQUENCY stops on such a mass ('add_bo_st: coefficient should be "
-                             f"0'); the tetrahedron moves rigidly with the body, so the solution is "
-                             f"the same.", once=True)
+            self.report.note(f"*MASS on {len(done)} rigid-body or kinematic-coupling member node(s) "
+                             f"in no other element (e.g. node {done[0]}): each got a force-free, "
+                             f"massless tetrahedron (elset {RIGID_SET}) of three new nodes the body "
+                             f"carries — ccx 2.23's *FREQUENCY stops on such a mass ('add_bo_st: "
+                             f"coefficient should be 0'); the tetrahedron moves rigidly with the "
+                             f"body, so the solution is the same.", once=True)
         if left:
             self.report.note(f"*MASS on {len(left)} member node(s) in no other element (e.g. node "
                              f"{left[0]}) of a rigid body with shell/beam members, every *FREQUENCY "
                              f"step after a step ccx runs through its nonlinear solver: no massless "
                              f"tetrahedron there (ccx 2.23 exits 255 on it in such a step; without "
                              f"it the step runs).", once=True)
+
+    def _warn_massless_frequency(self, blocks: List[Block]) -> None:
+        """ccx 2.23 extracts eigenvalues with ARPACK on 5 x the requested number of Lanczos
+        vectors (frequencys.f; at most the number of equations), which cannot exceed the
+        number of degrees of freedom that carry mass: where massless sections (no density,
+        *DENSITY 0, a *BEAM GENERAL SECTION without DENSITY=) add others, ARPACK fails
+        ('*ERROR in d[n,s]aupd: info=-9999') and ccx mostly crashes (probed: a C3D8 cube held
+        at its base beside a clamped B31 beam without density, 6 eigenvalues: SIGABRT in 5 of
+        6 runs; 2 eigenvalues, or a three-element bar for the cube, run, with the frequencies
+        of the cube alone).  Abaqus extracts them.  Warned where it is certain: the requested
+        number times 5 exceeds an upper bound of the degrees of freedom with mass (3 per node
+        of an element with mass, 24 per shell or beam node, which ccx expands; 3 per *MASS and
+        *ROTARY INERTIA node)."""
+        freq = []
+        for step in self.steps:
+            if step.proc == "FREQUENCY" and step.proc_card is not None:
+                recs = merged_data_records(step.proc_card)
+                try:
+                    freq.append((step.no, int(pf(recs[0][0]))))
+                except (IndexError, ValueError):
+                    continue
+        if not freq:
+            return
+        dens: Dict[str, float] = {}
+        for name, group in self._material_options(blocks).items():
+            d = next((c for c in group if c.keyword == "DENSITY"), None)
+            try:
+                dens[name] = pf(merged_data_records(d)[0][0]) if d is not None else 0.0
+            except (IndexError, ValueError):
+                dens[name] = 1.0                    # (unread: taken as massive)
+        heavy: set = set()                          # elements of a section with mass
+        parts: set = set()                          # ... of any section
+        for b in blocks:
+            if not b.keyword.endswith("SECTION") or not b.param("ELSET"):
+                continue
+            parts.update(self.geom.elset(b.param("ELSET")))
+            try:
+                rho = pf(b.param("DENSITY") or "0")
+            except ValueError:
+                rho = 1.0
+            mats = [m.upper() for _t, m, _o in self._section_layers(b, strict=True) if m]
+            if rho > 0 or any(dens.get(m, 1.0) > 0 for m in mats):
+                heavy.update(self.geom.elset(b.param("ELSET")))
+        structural = self._beam_nodes | self._shell_nodes
+        rigid = set(self.geom.elset(RIGID_SET))     # (skins: rigid-body members)
+        massive: set = set()                        # nodes of elements with mass
+        points: Dict[str, set] = {"MASS": set(), "ROTARYI": set()}
+        light: List[int] = []                       # elements without mass
+        for e, (typ, conn) in self.geom.elements.items():
+            if typ.upper() in points:
+                points[typ.upper()].update(conn)
+            elif e in heavy:
+                massive.update(conn)
+            elif e in parts and e not in rigid:
+                light.append(e)
+        free = [e for e in light if set(self.geom.elements[e][1]) - massive - points["MASS"]
+                - points["ROTARYI"]]
+        if not free:
+            return
+        bound = sum(24 if n in structural else 3 for n in massive) + \
+            3 * len(points["MASS"]) + 3 * len(points["ROTARYI"])
+        bad = [(s, k) for s, k in freq if 5 * k > bound]
+        if not bad:
+            return
+        s, k = bad[0]
+        self.report.warn(f"*FREQUENCY step {s} requests {k} eigenvalues, but at most {bound} degrees "
+                         f"of freedom of the model carry mass, while massless elements add others "
+                         f"(e.g. element {free[0]}): ccx 2.23's eigensolver (ARPACK, on 5 x {k} "
+                         f"vectors) then fails ('*ERROR in d[n,s]aupd: info=-9999') and ccx mostly "
+                         f"crashes (probed). Request at most {max(bound // 5, 1)} eigenvalues, or "
+                         f"give the massless elements a small density.", once=True)
 
     def _plan_kinematic_holds(self, blocks: List[Block]) -> None:
         """Model-data BCs on the rotations of kinematic-coupling reference nodes that no
@@ -25571,7 +25784,12 @@ class _Loads:
         case, frequencies 20 % and buckling factors 16 % low; a step without PERTURBATION is
         unaffected).  Before any general step PERTURBATION adds nothing else there (ccx's
         *BUCKLE leaves initial stresses and contact out either way; _frequency_perturbation
-        keeps it on a *FREQUENCY step for its contact only), so it is dropped; else warned."""
+        keeps it on a *FREQUENCY step for its contact only), so it is dropped; so it is after
+        general steps that leave the model unstressed (no loads, prescribed motion, initial
+        stresses or thermal expansion: the general steps' facts _frequency_perturbation
+        reads), in a model without contact pairs (a plain *FREQUENCY leaves contact out, an
+        overclosure stresses the base) and without a heated temperature-dependent material (a
+        plain step takes the initial temperatures); else warned."""
         src = None
         for step in self.steps.steps[:self.emit.no - 1]:
             src = step.no if step.proc in ("BUCKLE", "MODAL DYNAMIC") else \
@@ -25587,6 +25805,15 @@ class _Loads:
             self.report.note(f"{what}: PERTURBATION dropped. No general step precedes it, so its "
                              f"base state is the initial one, to which PERTURBATION adds nothing "
                              f"here, while {why}.", once=True)
+            return
+        heated = self.emit.base_heated
+        if not (self._model_stressed or self.emit.base_stressed or (self._expansion and heated) or
+                self._freq_contact or (heated and self._tdep_material)):
+            del params["PERTURBATION"]
+            self.report.note(f"{what}: PERTURBATION dropped. The general steps before it leave the "
+                             f"model unstressed (no loads, prescribed motion, initial stresses or "
+                             f"thermal expansion; no contact), so its base state is the initial "
+                             f"one, to which PERTURBATION adds nothing here, while {why}.", once=True)
             return
         self.report.warn(f"{what}: Abaqus takes the last general step's state as its base state, "
                          f"while {why}. Run the *{self.steps.steps[src - 1].proc} step after the "
@@ -31064,14 +31291,15 @@ class _Loads:
         freq = 0                                # the last *FREQUENCY step
         modes = {"MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
         kept: List[str] = []                    # *BUCKLE steps given a *FREQUENCY step's BCs
+        kept_sp: List[str] = []                 # ... static perturbation steps
         off: List[str] = []                     # modal steps with other BCs than their modes'
 
         def pairs_of(h: Tuple[bool, tuple]) -> set:
             return (state if h[0] else set()).union(*(own[k] for k in h[1]))
 
-        def modes_next(s: int) -> bool:         # a modal step next, only *BUCKLE steps between
-            k = s + 1
-            while k in self._pert_idx and procs_of[k - 1] == {"BUCKLE"}:
+        def modes_next(s: int) -> bool:         # a modal step next, only *BUCKLE and static
+            k = s + 1                           # perturbation steps between
+            while k in self._pert_idx and procs_of[k - 1] in ({"BUCKLE"}, {"STATIC"}):
                 k += 1
             return k in self._pert_idx and bool(procs_of[k - 1] & modes)
 
@@ -31085,7 +31313,8 @@ class _Loads:
                 # a static perturbation step (a general step in ccx) gets the base state again
                 # too: its loads and BCs are its own, the earlier perturbation steps' go
                 target: Tuple[bool, tuple] = (True, ())
-                if freq in at_end and (procs & modes or (procs == {"BUCKLE"} and modes_next(s))):
+                if freq in at_end and (procs & modes or (procs in ({"BUCKLE"}, {"STATIC"}) and
+                                                         modes_next(s))):
                     target = at_end[freq]
                 if procs & modes:
                     if freq in at_end and pairs_of(held) != pairs_of(target):
@@ -31102,8 +31331,8 @@ class _Loads:
                         if pairs_of(held) - pairs_of(target) - pairs:
                             self._restore_new.add(s)
                     held = target
-                if procs == {"BUCKLE"} and not new and pairs_of(target) != state:
-                    kept.append(f"{s} (step {freq}'s)")
+                if procs in ({"BUCKLE"}, {"STATIC"}) and not new and pairs_of(target) != state:
+                    (kept if procs == {"BUCKLE"} else kept_sp).append(f"{s} (step {freq}'s)")
                 held = (False, (s,)) if new else (held[0], held[1] + (s,)) if cards else held
                 at_end[s] = held
                 freq = s if "FREQUENCY" in procs else freq
@@ -31127,6 +31356,17 @@ class _Loads:
                              once=True)
             self._reduces("*BUCKLE step with the boundary conditions of a *FREQUENCY step (kept for "
                           "the modal step that reads its modes)")
+        if kept_sp:
+            self.report.warn(f"Static perturbation step(s) {', '.join(kept_sp)} keep the boundary "
+                             f"conditions of the *FREQUENCY step whose modes a modal or steady-state "
+                             f"dynamics step after them reads: Abaqus applies the base state's there "
+                             f"(BCs do not propagate between linear perturbation steps), but ccx 2.23 "
+                             f"needs the modes' BCs in force in that modal step, stops on fewer ('other "
+                             f"boundary conditions than in the input deck which created the .eig "
+                             f"file') and refuses OP=NEW or a new BC there (probed). Run the static "
+                             f"perturbation step(s) before that *FREQUENCY step.", once=True)
+            self._reduces("static perturbation step with the boundary conditions of a *FREQUENCY "
+                          "step (kept for the modal step that reads its modes)")
         if off:
             self.report.warn(f"Modal or steady-state dynamics step(s) {', '.join(off)} start with "
                              f"other boundary conditions than the *FREQUENCY step whose modes they "
@@ -33179,6 +33419,58 @@ class _Output:
 class _PostPasses:
     """Converter's passes over the emitted deck."""
 
+    def _unread_body_surfaces(self, deck: EmittedDeck) -> EmittedDeck:
+        """A *SURFACE, TYPE=NODE that no card reads, with a node of plane or axisymmetric
+        elements that is a *RIGID BODY member: ccx 2.23 stops on it ('*ERROR in cascade: the
+        DOF corresponding to node ... in direction 3 is detected on the dependent side of a MPC
+        and a SPC'; probed: one such node is enough, under any set name or as a node number;
+        the same deck solves without the surface, or with it on other plane nodes, or with
+        *EQUATIONs in place of the body).  So it is left out: nothing reads it, so this is
+        exact.  (A deck's own surface, or one a coupling written as *RIGID BODY leaves.)"""
+        plane = {n for typ, conn in self.geom.elements.values()
+                 if ccx_type(typ).startswith(PLANE_ELEM_PREFIXES) for n in conn}
+        surfs = [c for c in deck.cards if c.keyword == "SURFACE" and c.uparam("TYPE") == "NODE"]
+        bodies = [c for c in deck.cards if c.keyword == "RIGID BODY"]
+        if not plane or not surfs or not bodies:
+            return deck
+        sets = self._mesh_sets.read(deck)
+        members: set = set()
+        for c in bodies:
+            members.update(sets.members("NSET", c.uparam("NSET")) or [] if c.uparam("NSET") else [])
+            members.update(n for e in (sets.members("ELSET", c.uparam("ELSET")) or []
+                                       if c.uparam("ELSET") else [])
+                           if e in self.geom.elements for n in self.geom.elements[e][1])
+        read: set = set()                           # the names other cards give
+        own = {id(c) for c in surfs}
+        for c in deck.cards:
+            if c.opaque or c.keyword in GEOM_KW or id(c) in own:
+                continue
+            read.update((v or "").strip().upper() for v in c.params.values())
+            if not c.keyword.endswith(("PRINT", "FILE", "OUTPUT")):     # (variable keys)
+                read.update(x.strip().upper() for rec in c.records() for x in rec)
+        gone: List[str] = []
+        for c in surfs:
+            if c.uparam("NAME") in read:
+                continue
+            nodes = {n for rec in c.records() if rec and rec[0]
+                     for n in sets.members("NSET", rec[0]) or []}
+            if not nodes & plane & members:
+                continue
+            gone.append(c.uparam("NAME"))
+            deck.swap(c.line, [f"** abq2ccx: node surface {c.uparam('NAME')} left out: no card reads "
+                               f"it (ccx 2.23 stops on it, on rigid-body plane nodes)",
+                               "** " + deck.lines[c.line].strip()])
+            for i in c.rows:
+                deck.swap(i, ["** " + deck.lines[i].strip()])
+            self.report.n_commented += 1
+        if not gone:
+            return deck
+        self.report.note(f"*SURFACE, TYPE=NODE {', '.join(gone)}: no card reads it, and it holds "
+                         f"*RIGID BODY members on plane or axisymmetric elements, on which ccx 2.23 "
+                         f"stops ('*ERROR in cascade: ... detected on the dependent side of a MPC "
+                         f"and a SPC'; probed), so it is left out. Exact.", once=True)
+        return deck.edited()
+
     def _no_analysis_segfaults(self, deck: EmittedDeck) -> EmittedDeck:
         """The first step ccx stops at (*NO ANALYSIS: _no_analysis) in a deck with a material
         card of NO_ANALYSIS_SEGFAULTS, on which ccx 2.23 segfaults there: as the first step it
@@ -34655,6 +34947,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._self_contact: Dict[int, Tuple[Block, List[str]]] = {}
         self._self_approx: Dict[int, Block] = {}
         self._skin_material: Optional[Tuple[float, float, bool]] = None
+        self._zero_density = False                 # *DENSITY 0 where none (_plan_massless_materials)
         self._rigid_planar_refs: List[int] = []
         self._rigid_planar_bc: List[str] = []
         self._kin_hold_bc: List[str] = []          # _plan_kinematic_holds
@@ -35101,6 +35394,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._check_sections(blocks)            # the deck's own mesh: before any planner retypes it
         self._check_numeric_data(blocks)
         self._plan_heatless_materials(blocks)   # before the planners that copy materials
+        self._plan_massless_materials(blocks)   # likewise
         self._drop_surface_elements(raw, blocks)
         blocks = self._free_face_surfaces(blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot
@@ -35174,6 +35468,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
         self._warn_partial_couplings_nlgeom(blocks)
         self._plan_member_mass_tets(blocks)     # after _plan_rot_nodes: the *MPC BEAM bodies
+        self._warn_massless_frequency(blocks)   # after it: its massless tetrahedra
         self._plan_surface_heat(blocks)
         self._plan_load_cases(blocks)
         self._plan_rigid_planar_holds()             # after _plan_rot_nodes: the bodies' ROT NODEs
@@ -35243,6 +35538,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         assert len(deck.steps) == len(self.emit.written) and \
             all(st.end is not None for st in deck.steps), "a step written inside another"
         deck = self._settle_dependents(deck)
+        deck = self._unread_body_surfaces(deck)
         deck = self._restore_base_states(deck)
         deck = self._buckle_displacements(deck)  # after the BCs the restore gives back
         deck = self._modal_own_loads(deck)      # after the loads the restore gives back

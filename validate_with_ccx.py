@@ -6319,6 +6319,89 @@ def ccx_stops_deck(kind):
     raise ValueError(kind)
 
 
+_T124_CUBE = ("*NODE\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n"
+              "*ELEMENT, TYPE=C3D8, ELSET=E\n1,1,2,3,4,5,6,7,8\n*NSET, NSET=BOT\n1,2,3,4\n*NSET, NSET=TOP\n"
+              "5,6,7,8\n*MATERIAL, NAME=M\n*ELASTIC\n1000.,0.3\n*DENSITY\n1e-3\n"
+              "*SOLID SECTION, ELSET=E, MATERIAL=M\n*BOUNDARY\nBOT,1,3\n")
+
+
+def avoidable_stops_deck(kind):
+    """Decks of task 124: conversions ccx 2.23 stopped or looped on, and their twins.
+
+    * rb_surf / rb_ref: two CPS4 elements, the far edge's nodes a *RIGID BODY pulled at its
+      reference node, with an unread node surface of those nodes (ccx: 'cascade: ... MPC and
+      SPC') and without;
+    * self_tie / no_tie: a C3D8 cube whose top face is tied to itself (ccx looped), pressed
+      at its top, and without the tie;
+    * shared_tie / merged: two stacked cubes, the upper one's bottom face tied to the lower's
+      top with two of its four nodes shared (ccx looped), and the cubes merged there;
+    * kin_mass / kin_mass_spring: a kinematic coupling of springs-held nodes, one member a
+      *MASS only (ccx: add_bo_st), *FREQUENCY; and that node also in a spring inside the body;
+    * fq_sp_modal: *FREQUENCY with its own BC, a static perturbation step, *MODAL DYNAMIC
+      reading the modes (ccx stopped on the .eig);
+    * g_b_b / g_b_ref: an unloaded general step, two *BUCKLE steps, and the second alone;
+      gn_b_f / gn_f_ref: an unloaded NLGEOM general step, *BUCKLE, *FREQUENCY, and without the
+      *BUCKLE;
+    * stale / stale_ref: a cube without *DENSITY (element 2) pulled in a *DYNAMIC step beside
+      one of density 1 (element 1), initial temperatures defined; the twin with *DENSITY 0."""
+    if kind in ("rb_surf", "rb_ref"):
+        return ("*HEADING\nrb plane\n*NODE\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n5,2,0\n6,2,1\n100,2.5,0.5\n"
+                "*ELEMENT,TYPE=CPS4,ELSET=E\n1,1,2,3,4\n2,2,5,6,3\n*NSET,NSET=RB\n5,6\n" +
+                ("*SURFACE,TYPE=NODE,NAME=SRB\nRB\n" if kind == "rb_surf" else "") +
+                "*RIGID BODY,REF NODE=100,TIE NSET=RB\n*MATERIAL,NAME=M\n*ELASTIC\n1000.,0.3\n"
+                "*SOLID SECTION,ELSET=E,MATERIAL=M\n1.\n*BOUNDARY\n1,1,2\n4,1,1\n*STEP\n*STATIC\n"
+                "*CLOAD\n100,1,1.\n*NODE PRINT,NSET=RB\nU\n*END STEP\n")
+    if kind in ("self_tie", "no_tie"):
+        return ("*HEADING\nself tie\n" + _T124_CUBE + "*SURFACE, NAME=STOP\nE, S2\n" +
+                ("*TIE, NAME=T1\nSTOP, STOP\n" if kind == "self_tie" else "") +
+                "*STEP\n*STATIC\n*CLOAD\nTOP, 3, -1.\n7, 1, 0.5\n*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+    if kind in ("shared_tie", "merged"):
+        return ("*HEADING\nshared tie\n*NODE\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n"
+                "7,1,1,1\n8,0,1,1\n17,1,1,1\n18,0,1,1\n9,0,0,2\n10,1,0,2\n11,1,1,2\n12,0,1,2\n"
+                "*ELEMENT,TYPE=C3D8,ELSET=A\n1,1,2,3,4,5,6,7,8\n*ELEMENT,TYPE=C3D8,ELSET=B\n" +
+                ("2,5,6,17,18,9,10,11,12\n" if kind == "shared_tie" else "2,5,6,7,8,9,10,11,12\n") +
+                "*NSET,NSET=BOT\n1,2,3,4\n*NSET,NSET=TOP\n9,10,11,12\n*SURFACE,NAME=ATOP\nA,S2\n"
+                "*SURFACE,NAME=BBOT\nB,S1\n" + ("*TIE,NAME=T1\nBBOT,ATOP\n" if kind == "shared_tie" else "") +
+                "*MATERIAL,NAME=M\n*ELASTIC\n1000.,0.3\n*SOLID SECTION,ELSET=A,MATERIAL=M\n"
+                "*SOLID SECTION,ELSET=B,MATERIAL=M\n*BOUNDARY\nBOT,1,3\n*STEP\n*STATIC\n*CLOAD\n"
+                "TOP,1,1.\nTOP,3,0.5\n*NODE PRINT,NSET=TOP\nU\n*END STEP\n")
+    if kind in ("kin_mass", "kin_mass_spring"):
+        return ("*HEADING\nkin mass member\n*NODE\n1,0,0,0\n2,1,0,0\n3,0,1,0\n4,1,1,0\n11,-1,0,0\n"
+                "12,0,-1,0\n13,0,0,-1\n14,1,-1,0\n15,1,0,-1\n16,0,1,-1\n*ELEMENT,TYPE=SPRINGA,ELSET=SPR\n"
+                "101,1,11\n102,1,12\n103,1,13\n104,2,14\n105,2,15\n106,3,16\n" +
+                ("107,4,2\n" if kind == "kin_mass_spring" else "") +
+                "*SPRING,ELSET=SPR\n1000.\n*NSET,NSET=FIX\n11,12,13,14,15,16\n*NSET,NSET=B\n2,3,4\n"
+                "*SURFACE,TYPE=NODE,NAME=BS\nB\n*COUPLING,REF NODE=1,SURFACE=BS,CONSTRAINT NAME=C1\n"
+                "*KINEMATIC\n*ELEMENT,TYPE=MASS,ELSET=M201\n201,2\n*MASS,ELSET=M201\n1.0\n"
+                "*ELEMENT,TYPE=MASS,ELSET=M202\n202,3\n*MASS,ELSET=M202\n2.0\n*ELEMENT,TYPE=MASS,ELSET=M203\n"
+                "203,4\n*MASS,ELSET=M203\n1.5\n*ELEMENT,TYPE=MASS,ELSET=M204\n204,1\n*MASS,ELSET=M204\n0.5\n"
+                "*BOUNDARY\nFIX,1,3\n*STEP\n*FREQUENCY\n4\n*END STEP\n")
+    if kind == "fq_sp_modal":
+        return ("*HEADING\nchain\n" + _T124_CUBE + "*STEP\n*STATIC\n*CLOAD\nTOP,3,-1.\n*END STEP\n"
+                "*STEP\n*FREQUENCY\n3\n*BOUNDARY\nTOP,1,2\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n"
+                "*CLOAD\nTOP,1,0.001\n*END STEP\n*STEP\n*MODAL DYNAMIC\n0.01, 0.05\n*CLOAD\n7, 3, 0.001\n"
+                "*NODE PRINT, NSET=TOP\nU\n*END STEP\n")
+    if kind in ("g_b_b", "g_b_ref", "gn_b_f", "gn_f_ref"):
+        general = "*STEP, NLGEOM\n*STATIC\n*END STEP\n" if kind.startswith("gn") else "*STEP\n*STATIC\n*END STEP\n"
+        side = "*STEP\n*BUCKLE\n2\n*CLOAD\nTOP,1,1.\n*END STEP\n"
+        last = "*STEP\n*FREQUENCY\n3\n*END STEP\n" if kind.startswith("gn") else \
+            "*STEP\n*BUCKLE\n2\n*CLOAD\nTOP,3,-1.\n*END STEP\n"
+        return "*HEADING\npab\n" + _T124_CUBE + general + (side if kind in ("g_b_b", "gn_b_f") else "") + last
+    if kind in ("stale", "stale_ref"):
+        return ("*HEADING\nstale density\n*NODE, NSET=NALL\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n"
+                "6,1,0,1\n7,1,1,1\n8,0,1,1\n11,3,0,0\n12,4,0,0\n13,4,1,0\n14,3,1,0\n15,3,0,1\n16,4,0,1\n"
+                "17,4,1,1\n18,3,1,1\n*ELEMENT,TYPE=C3D8,ELSET=EH\n1,1,2,3,4,5,6,7,8\n"
+                "*ELEMENT,TYPE=C3D8,ELSET=EL\n2,11,12,13,14,15,16,17,18\n*NSET,NSET=HBOT\n1,2,3,4\n"
+                "*NSET,NSET=LBOT\n11,12,13,14\n*NSET,NSET=LTOP\n15,16,17,18\n*MATERIAL,NAME=HEAVY\n"
+                "*ELASTIC\n1000.,0.\n*DENSITY\n1.\n*MATERIAL,NAME=LIGHT\n*ELASTIC\n1000.,0.\n" +
+                ("*DENSITY\n0.\n" if kind == "stale_ref" else "") +
+                "*SOLID SECTION,ELSET=EH,MATERIAL=HEAVY\n*SOLID SECTION,ELSET=EL,MATERIAL=LIGHT\n"
+                "*INITIAL CONDITIONS,TYPE=TEMPERATURE\nNALL,20.\n*AMPLITUDE,NAME=RAMP\n0.,0.,1.,1.\n"
+                "*STEP,INC=100\n*DYNAMIC,DIRECT\n0.02,1.\n*BOUNDARY\nHBOT,1,3\nLBOT,1,3\n15,1,2\n16,2,2\n"
+                "18,1,1\n*CLOAD,AMPLITUDE=RAMP\nLTOP,3,1.\n*NODE PRINT,NSET=LTOP\nU\n*END STEP\n")
+    raise ValueError(kind)
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -13657,6 +13740,129 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  explicit_mass_dt (the bar, *FIXED MASS SCALING, DT=1e-3, "
               f"--approximate): ccx's selective mass scaling, increment {inc:.6g} (without "
               f"--approximate {inc_plain:.6g}), tip moved {tip:.4g}")
+    failures += 0 if ok else 1
+
+    # --- task 124: conversions ccx 2.23 stopped or looped on: exact forms ---
+    def t124_run(tag, kind, reduced=()):
+        """(the .dat path's displacement blocks, buckling factor tables, frequency tables, the
+        report text) of avoidable_stops_deck(kind) converted and solved with exactly the
+        ``reduced`` physics, or None (FAIL printed).  ccx writes its output to a file of at
+        most 50 MB (POSIX) and gets 120 s: some of these decks made it loop without end."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(avoidable_stops_deck(kind))
+        rep, conv = convert(src, inp)
+        d = tempfile.mkdtemp(prefix="ccxval_")
+        shutil.copy(inp, os.path.join(d, "job.inp"))
+        log = os.path.join(d, "ccx.log")
+        def cap():
+            import resource
+            resource.setrlimit(resource.RLIMIT_FSIZE, (50 << 20, 50 << 20))
+        with open(log, "w") as fh:
+            try:
+                rc = subprocess.run([ccx, "job"], cwd=d, env=dict(os.environ, **env), stdout=fh,
+                                    stderr=subprocess.STDOUT, timeout=120,
+                                    preexec_fn=cap if os.name == "posix" else None).returncode
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
+        out = open(log, encoding="utf-8", errors="replace").read() if os.path.getsize(log) < 20 << 20 else ""
+        # (written to a file, ccx's C and Fortran lines come in another order: classify_ccx_run's
+        # step reading does not apply; the checks below show the solve)
+        status = "solved" if rc == 0 and "Job finished" in out and "*ERROR" not in out and \
+            not A.ccx_nonfinite_result(os.path.join(d, "job")) else \
+            f"failed (rc {rc}, {os.path.getsize(log) >> 20} MB of output)"
+        dat = os.path.join(d, "job.dat")
+        res = None
+        if status == "solved":
+            res = (dat_node_blocks(dat), [[r[1] for r in t if len(r) == 2] for t in dat_tables(dat, "B U C K")],
+                   [[r[3] for r in t if len(r) == 5] for t in dat_tables(dat, "E I G E N V A L U E   O U")],
+                   rep.text())
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None or sorted(conv.reduced_physics) != sorted(reduced):
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if res is None else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return res
+
+    def t124_apart(a, b):
+        """The largest difference between two {node: values} blocks, and the largest |value|."""
+        err = max(abs(x - y) for n, v in b.items() for x, y in zip(a.get(n, [math.inf] * len(v)), v))
+        return err, max(abs(x) for v in b.values() for x in v)
+
+    # an unread node surface on a *RIGID BODY's plane-element members: left out
+    runs = [t124_run("t124_rb_surface", "rb_surf"), t124_run("t124_rb_surface_ref", "rb_ref")]
+    ok = all(runs)
+    if ok:
+        err, moved = t124_apart(runs[0][0][-1], runs[1][0][-1])
+        ok = err <= 1e-12 + 1e-9 * moved and moved > 1e-4 and "no card reads it" in " ".join(runs[0][3].split())
+        print(f"{'PASS' if ok else 'FAIL'}  t124_rb_surface (two CPS4, the far edge a rigid body pulled "
+              f"at its reference node, an unread node surface of its nodes): the body's nodes as "
+              f"without the surface ({err:.1e} apart; |u| {moved:.6g}; before: ccx stopped, 'cascade')")
+    failures += 0 if ok else 1
+    # *TIE of one surface with itself / with nodes shared with the master: no tie there
+    for kind, ref, what in (("self_tie", "no_tie", "a cube's top face tied to itself"),
+                            ("shared_tie", "merged", "two stacked cubes tied, two of the four "
+                                                     "interface nodes shared")):
+        runs = [t124_run(f"t124_{kind}", kind), t124_run(f"t124_{kind}_ref", ref)]
+        ok = all(runs)
+        if ok:
+            err, moved = t124_apart(runs[0][0][-1], runs[1][0][-1])
+            ok = err <= 1e-12 + 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  t124_{kind} ({what}): the top as "
+                  f"{'without the tie' if ref == 'no_tie' else 'the cubes merged there'} ({err:.1e} "
+                  f"apart; |u| {moved:.6g}; before: ccx looped without end)")
+        failures += 0 if ok else 1
+    # a *MASS-only kinematic-coupling member in *FREQUENCY: a massless tetrahedron
+    runs = [t124_run("t124_kin_mass", "kin_mass"), t124_run("t124_kin_mass_ref", "kin_mass_spring")]
+    ok = all(runs)
+    if ok:
+        got, want = runs[0][2][0], runs[1][2][0]
+        err = max(abs(ccx_ratio(x, y) - 1) for x, y in zip(got, want)) if len(got) == len(want) == 4 else 1
+        ok = err < 1e-6 and min(got) > 0
+        print(f"{'PASS' if ok else 'FAIL'}  t124_kin_mass (a spring-held kinematic coupling, a member "
+              f"node with a *MASS only, *FREQUENCY): f = {', '.join(f'{x:.7g}' for x in got)}, "
+              f"{err:.1e} off the node also in a spring inside the body (before: ccx stopped, add_bo_st)")
+    failures += 0 if ok else 1
+    # FREQ (own BC) -> static perturbation -> MODAL DYNAMIC: the static step keeps the FREQ's BCs
+    got = t124_run("t124_fq_sp_modal", "fq_sp_modal",
+                   ["static perturbation step with the boundary conditions of a *FREQUENCY step (kept "
+                    "for the modal step that reads its modes)",
+                    "*STEP, PERTURBATION on a static step that is not the last (its loads persist)",
+                    "*MODAL DYNAMIC step started from a deformed or moving model"])
+    ok = got is not None
+    if ok:
+        last = got[0][-1]
+        moved = max(abs(v[2]) for v in last.values())
+        ok = moved > 1e-4 and "keep the boundary conditions" in " ".join(got[3].split())
+        print(f"{'PASS' if ok else 'FAIL'}  t124_fq_sp_modal (*FREQUENCY with its own BC, a static "
+              f"perturbation step, *MODAL DYNAMIC on its modes): the modal step runs, top |u_z| "
+              f"{moved:.6g} (warned, reduced in the static step; before: ccx stopped on the .eig)")
+    failures += 0 if ok else 1
+    # PERTURBATION after a *BUCKLE step on an unstressed base state: dropped
+    for kind, ref, what, k in (("g_b_b", "g_b_ref", "an unloaded general step, two *BUCKLE steps", 1),
+                               ("gn_b_f", "gn_f_ref", "an unloaded NLGEOM step, *BUCKLE, *FREQUENCY", 2)):
+        runs = [t124_run(f"t124_{kind}", kind), t124_run(f"t124_{kind}_ref", ref)]
+        ok = all(runs)
+        if ok:
+            got, want = runs[0][k][-1], runs[1][k][-1]
+            err = max(abs(ccx_ratio(x, y) - 1) for x, y in zip(got, want)) if got and len(got) == len(want) else 1
+            ok = err < 1e-6 and min(got) > 0
+            print(f"{'PASS' if ok else 'FAIL'}  t124_{kind} ({what}): the last step's "
+                  f"{'factors' if k == 1 else 'frequencies'} {', '.join(f'{x:.7g}' for x in got)}, {err:.1e} "
+                  f"off the deck without the first perturbation step (before: about the buckling load case)")
+        failures += 0 if ok else 1
+    # a material without *DENSITY where temperatures are defined: *DENSITY 0
+    runs = [t124_run("t124_stale", "stale"), t124_run("t124_stale_ref", "stale_ref")]
+    ok = all(runs)
+    if ok:
+        err = max(t124_apart(a, b)[0] for a, b in zip(runs[0][0], runs[1][0])) \
+            if len(runs[0][0]) == len(runs[1][0]) else math.inf
+        moved = max(abs(v[2]) for v in runs[0][0][-1].values())
+        ok = err <= 1e-12 and moved > 1e-3 and len(runs[0][0]) >= 5
+        print(f"{'PASS' if ok else 'FAIL'}  t124_stale (a cube of a material without *DENSITY beside "
+              f"one of density 1, initial temperatures, *DYNAMIC): {len(runs[0][0])} increments as with "
+              f"*DENSITY 0 ({err:.1e} apart; top u_z {moved:.6g}; before: the other cube's density)")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

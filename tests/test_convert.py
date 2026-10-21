@@ -999,7 +999,7 @@ def test_rotation_tie_on_a_member_bc_makes_the_body_dependent():
 
 def test_tie_param_handling():
     # Abaqus-only *TIE params (TYPE=) are stripped; ccx-supported ADJUST is kept.
-    deck = (HEX + "*SURFACE, NAME=SS, TYPE=NODE\n1\n*SURFACE, NAME=MM, TYPE=ELEMENT\nEALL, S1\n"
+    deck = (HEX + "*SURFACE, NAME=SS, TYPE=NODE\n5\n*SURFACE, NAME=MM, TYPE=ELEMENT\nEALL, S1\n"
             "*TIE, NAME=T1, TYPE=SURFACE TO SURFACE, ADJUST=NO\nSS, MM\n")
     body, _, _ = convert_str(deck)
     assert "*TIE, NAME=T1" in body
@@ -8856,11 +8856,14 @@ def test_modal_step_keeps_the_bcs_of_the_modes_it_reads():
     _, conv, rep = convert_str(CHAIN.format("") + FREQ3 + BUCK2.replace("*Cload", "*Boundary\n5, 1, 2\n*Cload")
                                + CHAIN_MODAL)
     assert "Modal or steady-state dynamics step(s) 4 (more than step 2's) start with other" in rep.text()
+    # a static perturbation step between them keeps the *FREQUENCY step's BCs too (warned,
+    # reduced physics there), so that the modal step reads its modes (ccx stopped on fewer)
     _, conv, rep = convert_str(CHAIN.format("") + FREQ_BC + "*Step, perturbation\n*Static\n*Cload\n"
                                "TOP, 1, 0.001\n*End Step\n" + CHAIN_MODAL)
-    assert "step(s) 4 (fewer than step 2's)" in rep.text()
-    assert "modal step with other boundary conditions than its modes' (ccx stops on fewer, holds more)" \
-        in conv.reduced_physics
+    assert "Static perturbation step(s) 3 (step 2's) keep the boundary conditions" in rep.text()
+    assert "fewer than step 2's" not in rep.text()
+    assert "static perturbation step with the boundary conditions of a *FREQUENCY step (kept for the " \
+           "modal step that reads its modes)" in conv.reduced_physics
 
 
 def test_perturbation_step_after_a_buckle_step():
@@ -15386,7 +15389,7 @@ def test_analytical_segments_exact_or_approximate():
     for kw in ("*SURFACE, TYPE=SEGMENTS", "*RIGID BODY", "*CONTACT PAIR"):
         assert f"** {kw}" in body                                   # commented out, all three
     # a *TIE's line on that surface is commented out, its other lines kept: reduced physics
-    tie = (ANALYTIC_2D + "*SURFACE, NAME=BOT\nTOPE, S1\n*SURFACE, NAME=RT\nTOPE, S2\n" +
+    tie = (ANALYTIC_2D + "*SURFACE, NAME=BOT\nTOPE, S1\n*SURFACE, NAME=RT\nTOPE, S3\n" +
            curved[len(ANALYTIC_2D):].split("*SURFACE INTERACTION")[0] + "*TIE, NAME=T1\nTOP, TOOL\nBOT, RT\n")
     body, conv, _ = convert_str(tie)
     assert "\nBOT, RT" in body and "** TOP, TOOL" in body and "*TIE" in conv.reduced_physics
@@ -20268,6 +20271,135 @@ def test_friction_anisotropic_behavior_reduced():
                                "0.1, 0.2\n")
     assert any("*FRICTION, ANISOTROPIC BEHAVIOR" == r for r in conv.reduced_physics)
     assert "[WARNING] *FRICTION parameter ANISOTROPIC BEHAVIOR dropped" in rep.text()
+
+
+PLANE_RB = ("*Node\n1, 0, 0\n2, 1, 0\n3, 1, 1\n4, 0, 1\n5, 2, 0\n6, 2, 1\n100, 2.5, 0.5\n"
+            "*Element, type=CPS4, elset=E\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*Nset, nset=RB\n5, 6\n{}"
+            "*Rigid Body, ref node=100, tie nset=RB\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=E, material=M\n1.\n*Boundary\n1, 1, 2\n4, 1, 1\n"
+            "*Step\n*Static\n*Cload\n100, 1, 1.\n*End Step\n")
+
+
+def test_unread_node_surface_on_rigid_plane_members_left_out():
+    # ccx 2.23 stops ('cascade: ... dependent side of a MPC and a SPC') on a node surface that
+    # holds a *RIGID BODY member of plane elements, used or not (probed): one that no card
+    # reads is left out (exact); one on other nodes stays
+    body, conv, rep = convert_str(PLANE_RB.format("*Surface, type=NODE, name=S\nRB\n"))
+    assert "** *SURFACE, TYPE=NODE, NAME=S\n** RB\n" in body
+    assert "no card reads it, and it holds *RIGID BODY members on plane" in rep.text()
+    assert not conv.reduced_physics
+    body, _, _ = convert_str(PLANE_RB.format("*Surface, type=NODE, name=S\n1\n4\n"))
+    assert "\n*SURFACE, TYPE=NODE, NAME=S\n1\n4\n" in body
+    body, _, _ = convert_str(PLANE_RB.format("*Surface, type=NODE, name=S\nRB\n").replace(
+        "*Step", "*Surface Interaction, name=I\n*Surface, name=AE\nE, S1\n*Contact Pair, interaction=I\n"
+        "S, AE\n*Step"))
+    assert "\n*SURFACE, TYPE=NODE, NAME=S\nRB\n" in body      # read by a card: kept
+
+
+def test_tie_on_one_surface_or_on_shared_nodes():
+    # Abaqus ties nothing between identical surfaces and no node the slave and master
+    # surfaces share (Mesh tie constraints); ccx 2.23 loops without end on both (probed)
+    body, conv, rep = convert_str(HEX_MODEL + "*Surface, name=ST\nEALL, S2\n*Tie, name=T1\nST, ST\n")
+    assert "** *TIE, NAME=T1\n** ST, ST" in body and "is both its slave and its master" in rep.text()
+    assert not conv.reduced_physics
+    two = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n17,1,1,1\n"
+           "18,0,1,1\n9,0,0,2\n10,1,0,2\n11,1,1,2\n12,0,1,2\n*Element, type=C3D8, elset=A\n"
+           "1,1,2,3,4,5,6,7,8\n*Element, type=C3D8, elset=B\n2,5,6,17,18,9,10,11,12\n"
+           "*Surface, name=ATOP\nA, S2\n*Surface, name=BBOT\nB, S1\n*Tie, name=T1\nBBOT, ATOP\n"
+           "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A, material=M\n"
+           "*Solid Section, elset=B, material=M\n")
+    body, conv, rep = convert_str(two)
+    assert "*SURFACE, NAME=BBOT_NODES, TYPE=NODE\n17\n18\n*TIE, NAME=T1\nBBOT_NODES, ATOP\n" in body
+    assert "shares 2 node(s) with the faces of master surface ATOP" in rep.text()
+    assert not conv.reduced_physics
+    plane = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n12,1,0\n13,1,1\n5,2,0\n6,2,1\n"
+             "*Element, type=CPS4, elset=A\n1,1,2,3,4\n*Element, type=CPS4, elset=B\n2,2,5,6,13\n"
+             "*Surface, name=AR\nA, S2\n*Surface, name=BL\nB, S4\n*Tie, name=T1\nBL, AR\n"
+             "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A, material=M\n1.\n"
+             "*Solid Section, elset=B, material=M\n1.\n")
+    body, conv, rep = convert_str(plane)
+    assert "** *TIE, NAME=T1\n** BL, AR" in body and "shares nodes with the faces" in rep.text()
+    assert conv.reduced_physics == ["*TIE whose slave surface shares nodes with its master (left out)"]
+
+
+def test_kinematic_coupling_mass_member_gets_a_massless_tetrahedron():
+    # ccx 2.23's *FREQUENCY stops (add_bo_st) on a *MASS at a kinematic-coupling member in no
+    # other element, as at a rigid-body member: a zero-density tetrahedron of three new nodes
+    # the coupling's node surface takes (probed: the frequencies of the node also in a spring)
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n3,0,1,0\n4,1,1,0\n11,-1,0,0\n12,0,-1,0\n13,0,0,-1\n14,1,-1,0\n"
+            "15,1,0,-1\n16,0,1,-1\n*Element, type=SPRINGA, elset=SPR\n101,1,11\n102,1,12\n103,1,13\n"
+            "104,2,14\n105,2,15\n106,3,16\n*Spring, elset=SPR\n1000.\n*Nset, nset=FIX\n11, 12, 13, 14, 15, 16\n"
+            "*Nset, nset=B\n2, 3, 4\n*Surface, type=NODE, name=BS\nB\n"
+            "*Coupling, ref node=1, surface=BS, constraint name=C1\n*Kinematic\n"
+            "*Element, type=MASS, elset=MA\n201, 2\n202, 3\n203, 4\n204, 1\n*Mass, elset=MA\n1.\n"
+            "*Boundary\nFIX, 1, 3\n*Step\n*Frequency\n4\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    new = [n for n in conv.geom.nodes if n > 16]
+    assert len(new) == 3 and "*SURFACE, TYPE=NODE, NAME=BS\nB\n" + "\n".join(map(str, new)) + "\n" in body
+    tet, = [e for e, (t, _) in conv.geom.elements.items() if t == "C3D4"]
+    assert conv.geom.elements[tet][1] == [4] + new
+    assert "rigid-body or kinematic-coupling member node(s)" in rep.text() and not conv.reduced_physics
+    assert "eigenvalues, but at most" not in rep.text()             # (springs: no massless part)
+    body, conv, _ = convert_str(deck.replace("*Frequency\n4", "*Static"))
+    assert not any(t == "C3D4" for t, _ in conv.geom.elements.values())
+
+
+def test_perturbation_after_a_buckle_step_dropped_on_an_unstressed_base():
+    # after general steps that leave the model unstressed, PERTURBATION on a step after a
+    # *BUCKLE adds nothing but ccx's carry-over of the buckling load case: dropped (probed:
+    # the factors and frequencies of the deck without the first *BUCKLE step)
+    head = (HEX + "*Nset, nset=BOT\n1, 2, 3, 4\n*Nset, nset=TOP\n5, 6, 7, 8\n*Material, name=M\n"
+            "*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, elset=EALL, material=M\n"
+            "*Boundary\nBOT, 1, 3\n")
+    side = "*Step\n*Buckle\n2\n*Cload\nTOP, 1, 1.\n*End Step\n"
+    body, conv, rep = convert_str(head + "*Step, nlgeom\n*Static\n*End Step\n" + side + FREQ3)
+    assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == [", NLGEOM", ", PERTURBATION", ""]
+    assert "PERTURBATION dropped. The general steps before it leave the model unstressed" in rep.text()
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(head + "*Step\n*Static\n*End Step\n" + side + BUCK2)
+    assert [s.split("\n")[0] for s in body.split("*STEP")[1:]] == ["", ", PERTURBATION", ""]
+    _, conv, rep = convert_str(CHAIN.format("") + side + BUCK2)          # loaded: warned
+    assert "Abaqus takes the last general step's state" in rep.text() and conv.reduced_physics
+
+
+def test_material_without_density_gets_zero_density_where_temperatures_are_defined():
+    # where temperatures are defined, ccx 2.23 gives a material without *DENSITY the density
+    # of the element assembled before it (probed); Abaqus gives its elements no mass
+    deck = (HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
+            "*Initial Conditions, type=TEMPERATURE\n1, 20.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n"
+            "*Step\n*Dynamic\n0.1, 1.\n*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*ELASTIC\n1000., 0.3\n*DENSITY\n0.\n" in body and "Material M without *DENSITY" in rep.text()
+    body, _, _ = convert_str(deck.replace("*Initial Conditions, type=TEMPERATURE\n1, 20.\n", ""))
+    assert "*DENSITY" not in body
+    body, _, _ = convert_str(deck.replace("*Dynamic\n0.1, 1.", "*Static"))
+    assert "*DENSITY" not in body
+    beam = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=B31, elset=BM\n1, 1, 2\n"
+            "*Beam General Section, elset=BM, section=RECT\n0.1, 0.1\n0., 1., 0.\n1000., 400.\n"
+            "*Initial Conditions, type=TEMPERATURE\n1, 20.\n2, 20.\n*Boundary\n1, 1, 6\n"
+            "*Step\n*Frequency\n2\n*End Step\n")
+    body, _, _ = convert_str(beam)
+    assert re.search(r"\*MATERIAL, NAME=ABQ2CCX_RECT_MATERIAL\n\*ELASTIC\n[^*]+\*DENSITY\n0\.\n", body)
+
+
+def test_deformation_plasticity_frequency_and_massless_frequency_warned():
+    # ccx 2.23 stops on a *FREQUENCY step with *DEFORMATION PLASTICITY depending on the units
+    # (umat_abaqusnl), and its ARPACK fails where fewer DOFs carry mass than 5 x the
+    # requested eigenvalues while massless elements add others (probed): warned
+    _, conv, rep = convert_str(HEX + "*Material, name=M\n*Deformation Plasticity\n2.1e11, 0.3, 2.5e8, 10., "
+                               "0.3\n*Density\n7800.\n*Solid Section, elset=EALL, material=M\n"
+                               "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*Step\n*Frequency\n2\n*End Step\n")
+    assert "*DEFORMATION PLASTICITY (M) in a model with a *FREQUENCY step" in rep.text()
+    deck = (HEX + "*Node\n20, 3., 0., 0.\n21, 4., 0., 0.\n*Element, type=B31, elset=BM\n11, 20, 21\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1.\n*Solid Section, elset=EALL, material=M\n"
+            "*Beam General Section, elset=BM, section=RECT, density=0.\n0.1, 0.1\n0., 1., 0.\n1000., 400.\n"
+            "*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n20, 1, 6\n*Step\n*Frequency\n6\n*End Step\n")
+    _, conv, rep = convert_str(deck)
+    assert "*FREQUENCY step 1 requests 6 eigenvalues, but at most 24 degrees of freedom" in rep.text()
+    _, conv, rep = convert_str(deck.replace("*Frequency\n6", "*Frequency\n2"))
+    assert "eigenvalues, but at most" not in rep.text()
+    _, conv, rep = convert_str(deck.replace("density=0.", "density=1."))
+    assert "eigenvalues, but at most" not in rep.text()
 
 
 if __name__ == "__main__":
