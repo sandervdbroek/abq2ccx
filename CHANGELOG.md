@@ -6,6 +6,23 @@ physics.
 
 ## Unreleased
 
+## 1.5.0 (October 2026)
+
+Steps read through one step model, with one rule each for NLGEOM, step time and an unterminated
+`*STEP`; chains of linear perturbation steps, static perturbation sums and `*BUCKLE` base
+states; eigenvalue, modal and steady-state steps with knots. Couplings and constraints: free
+coupling twists held, distributing couplings on plane, axisymmetric and membrane edges and the
+legacy `*DISTRIBUTING COUPLING`, rigid-body reference nodes, nodes whose rotation two features
+use. Elements that ccx 2.23 runs otherwise than Abaqus are flagged as reduced physics: `S4R`,
+the one-point plane, membrane and beam elements where only hourglass stiffness resists their
+bending, and plastic `CPE4` / `CAX4`, which lock; `--approximate` writes elements that behave in
+their place. Beams in general 3-D directions, springs, dashpots, composite solids and shell
+section axes now convert as Abaqus reads them. More cards ccx 2.23 stopped or crashed on without a word are converted or warned,
+the converter crashes a third whole-file code review found are fixed, and the corpus converts in
+about 40 % less CPU time. Corpus on ccx 2.23: 235 decks gated, 177 solving their own physics
+(1.4.0 counted 188, mainly because its `S4R` and plastic `CPE4` / `CAX4` decks now count as
+reduced physics).
+
 * **Input-side readings** — a blank `*BEAM SECTION` n1 line (the default) before the
   integration-point line made that line n1 (8.9x the deflection); n1 lines with a blank or
   left-out field and `*AMPLITUDE` data with a blank field (SCALEY, EQUALLY SPACED, PERIODIC, a
