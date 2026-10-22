@@ -33096,8 +33096,7 @@ class _Output:
         for msg in self._out_notes.get(id(b), []):
             self.report.note(msg, once=True)
         return self._anchored_output(b) or self._commented(
-            b, f"*{b.keyword}: commented out (no whole-model energy ccx can print there) — the "
-               f"solution is the same.", reduces=False)
+            b, f"*{b.keyword}: commented out — the solution is the same.", reduces=False)
 
     def _anchored_output(self, b: Block, p: Optional[dict] = None) -> List[str]:
         """The ccx output cards (and their notes) _plan_output placed at block ``b``."""
@@ -33270,12 +33269,6 @@ class _Output:
         dropped; Abaqus-only parameters too.  Returns (parameters, labels), labels None when no
         ccx contact variable is left."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
-        for k, v in b.params.items():
-            if k in ("LAST ITERATIONS", "CONTACT ELEMENTS", "FREQUENCYF"):
-                keep[k] = v
-            elif k not in ("FREQ", "FREQUENCY", "TIME POINTS") and \
-                    not (twin is not None and k in ("SLAVE", "MASTER")):    # (the twin's)
-                report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx).", once=True)
         labels: List[str] = []
         for rec in merged_data_records(b):
             for v in (x.upper() for x in rec if x != ""):
@@ -33295,6 +33288,12 @@ class _Output:
                     report.note(f"Contact output variable {v} dropped (ccx writes CDIS, CSTR "
                                 f"and CELS only; its CSTR includes the contact pressure).",
                                 once=True)
+        for k, v in b.params.items():
+            if k in ("LAST ITERATIONS", "CONTACT ELEMENTS", "FREQUENCYF"):
+                keep[k] = v
+            elif k not in ("FREQ", "FREQUENCY", "TIME POINTS") and \
+                    not (twin and k in ("SLAVE", "MASTER")):    # (the *CONTACT PRINT's)
+                report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx).", once=True)
         if not labels:
             had = any(x != "" for rec in merged_data_records(b) for x in rec)
             if had:                                 # every requested variable was dropped
@@ -33599,10 +33598,13 @@ class _Output:
         if ctl[0] == "OFF":
             notes.append(f"{what} with {ctl[1]}=0: Abaqus writes none of it; nothing written.")
         elif timing["pert"] or proc not in ENERGY_TOTAL_PROCS:
+            why = ("Abaqus has none in an eigenvalue step" if proc in ("FREQUENCY", "BUCKLE",
+                                                                       "COMPLEX FREQUENCY") else
+                   "Abaqus' are of the perturbation alone" if timing["pert"] else
+                   "ccx totals mechanical energies only")
             notes.append(f"{what} in a {'linear perturbation ' if timing['pert'] else ''}"
-                         f"*{proc or 'step without a procedure'} step: no whole-model energies "
-                         f"written (Abaqus has none in an eigenvalue step, and those of a "
-                         f"perturbation step are of the perturbation alone).")
+                         f"{'*' + proc if proc else 'procedure-less'} step: no whole-model energies "
+                         f"written ({why}).")
         elif elset and (not self.geom.elset(elset) or self._only_carriers(elset)):
             notes.append(f"{what}, ELSET={elset}: the element set is not in the ccx mesh; dropped.")
         elif not labels:

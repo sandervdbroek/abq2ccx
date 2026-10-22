@@ -6574,6 +6574,8 @@ def test_contact_output_whole_surface_forces_printed():
     assert "*CONTACT FILE\nCSTR\n*CONTACT PRINT, SLAVE=A, MASTER=B\nCFN, CFS, CF\n" in body
     assert "*CONTACT OUTPUT CFN1, CFNM, CFS2, CFT3 -> *CONTACT PRINT (.dat)" in rep.text()
     assert "CAREA: ccx prints the contact area with the whole-surface forces" in rep.text()
+    body, _, rep = convert_str(f2f + hist.format(", slave=A, master=B", "CSTRESS"))
+    assert "*CONTACT OUTPUT parameter SLAVE dropped" in rep.text()   # (no *CONTACT PRINT to take it)
     body, _, rep = convert_str(f2f + hist.format(", slave=B, master=A", "CFN"))
     assert "*CONTACT PRINT" not in body and "no ccx contact pair of these surfaces" in rep.text()
     body, _, rep = convert_str(_contact() + hist.format("", "CFN"))
