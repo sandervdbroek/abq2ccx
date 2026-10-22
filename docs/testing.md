@@ -25,7 +25,9 @@ to every printed digit except how NaN is spelled (`-NAN` on Linux, `-NAN(IND)` o
 and the sixth digit of one buckling factor. ARPACK converges it only to `*BUCKLE`'s default
 accuracy of 1 %, so each platform's BLAS lands on its own value: 223458 on Linux, 223460 on
 Windows, 223459 on macOS. The corpus stays local: it downloads 1052 decks and needs ten
-minutes of ccx.
+minutes of ccx. pyflakes lints every Python file (on Ubuntu), and `validate_with_ccx.py` fails
+on a SKIP that is not on its `EXPECTED_SKIPS` list (its last line is the SKIP total): a SKIP can
+hide a regression.
 
 ## 1. Unit tests — `tests/test_convert.py`
 

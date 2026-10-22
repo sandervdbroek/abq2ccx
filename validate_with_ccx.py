@@ -155,6 +155,23 @@ def convert(path, out_inp, approximate=False, abaqus_umat=False):
 
 CCX_TIMEOUT = 600      # seconds of wall-clock time a ccx run gets
 SKIPPED = []           # the checks that printed SKIP
+# The SKIPs that hide no regression: umat_build without CCX_UMAT, and corner_twin's checks when
+# ccx crashed on the twin at every try (ccx 2.23's random crash at a *DYNAMIC step's start,
+# 5f03246).  Any other SKIP fails validate: a SKIP can hide a regression.
+EXPECTED_SKIPS = ("umat_build", "transform_shell_corner_plate", "transform_shell_corner_panel",
+                  "transform_knot_dynamic")
+
+
+def closing_lines(failures):
+    """Print validate's result and SKIP total; returns the exit status, 1 after a FAIL or a SKIP
+    not on EXPECTED_SKIPS."""
+    names = [s.split(" (")[0] for s in SKIPPED]
+    odd = [n for n in names if n not in EXPECTED_SKIPS or (n == "umat_build" and os.environ.get("CCX_UMAT"))]
+    result = [f"{failures} check(s) failed"] if failures else []
+    result += [f"{len(odd)} SKIP(s) not on the expected-SKIP list: {', '.join(odd)}"] if odd else []
+    print(f"\n{', '.join(result) or 'All checks passed'}.")
+    print(f"SKIP total: {len(names)}" + (f" ({', '.join(names)})" if names else ""))
+    return 1 if result else 0
 
 
 def ccx_job(ccx, env, d, timeout=CCX_TIMEOUT):
@@ -1113,7 +1130,7 @@ def rigid_pressure_deck(kind="R2D2", thick=0.5, p=2.0, k=4.0):
         lines = ["*HEADING", "Pressure on a rigid R2D2 segment", "*NODE", "1, 0., 0.", "2, 1., 0.",
                  "3, 1., 1.", "4, 0., 1.", "11, 0., 2.", "12, 1., 2.", "9, 0.5, 3.",
                  "*ELEMENT, TYPE=CPE4, ELSET=B", "1, 1, 2, 3, 4", "*ELEMENT, TYPE=R2D2, ELSET=R",
-                 "5, 11, 12", f"*SOLID SECTION, ELSET=B, MATERIAL=M", f"{thick:g}"]
+                 "5, 11, 12", "*SOLID SECTION, ELSET=B, MATERIAL=M", f"{thick:g}"]
         held, dof = ["9, 1, 1", "9, 6, 6"], 2
     else:
         lines = ["*HEADING", "Pressure on a rigid R3D4 facet", "*NODE"]
@@ -2050,8 +2067,8 @@ def sheet_sphere_deck(typ, n=16, t=0.01, p=1.0, load="P", offset=None, nlgeom=Fa
                 nodes.append((ids[key], tuple(c / r for c in pt)))
             local[g] = ids[key]
         conn += [[local[g] for g in c] for c in elems]
-    sec = (f"*Membrane Section, elset=SPHERE, material=M" if typ.startswith("M3D") else
-           f"*Shell Section, elset=SPHERE, material=M" + (f", offset={offset}" if offset else ""))
+    sec = ("*Membrane Section, elset=SPHERE, material=M" if typ.startswith("M3D") else
+           "*Shell Section, elset=SPHERE, material=M" + (f", offset={offset}" if offset else ""))
     lines = ["*Heading", f"A sphere octant of {typ} under internal pressure", "*Node"]
     lines += [f"{k}, {x:.12g}, {y:.12g}, {z:.12g}" for k, (x, y, z) in nodes]
     lines.append(f"*Element, type={typ}, elset=SPHERE")
@@ -10697,7 +10714,7 @@ def main():
         runs[label] = (status, dat_el_scalar(dat, "equivalent plastic strain"),
                        dat_el_scalar(dat, "ductile damage initiation"), dat_displacements(dat))
         shutil.rmtree(d, ignore_errors=True)
-    (s1, peeq, duct, u1), (s0, peeq0, duct0, u0) = runs["with"], runs["without"]
+    (s1, peeq, duct, u1), (s0, peeq0, _, u0) = runs["with"], runs["without"]
     eps_f = 0.2 + 0.3 * math.exp(-0.5)
     if s1 != "solved" or s0 != "solved" or not peeq or set(duct) != {1, 2}:
         print(f"FAIL  damage_johnson_cook_cubes: {s1} / {s0} (with / without the card), DUCT "
@@ -11191,8 +11208,8 @@ def main():
         what = {"s4r": "plain S4R", "sc8r": "plain SC8R", "sc8r_composite": "[0/90/0] SC8R plies",
                 "s4r_iso": "isotropic S4R", "sc8r_iso": "isotropic SC8R stacked along the orientation"}[kind]
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}, spherical *ORIENTATION"
-              + (" turned about axis 3" if rot else "") + f", internal pressure): radial and meridional "
-              f"displacement at colatitudes 30-150 deg vs membrane theory"
+              + (" turned about axis 3" if rot else "") + ", internal pressure): radial and meridional "
+              "displacement at colatitudes 30-150 deg vs membrane theory"
               + ("" if kind.endswith("_iso") else " with the fibres along the parallels")
               + f", max difference {err / scale * 100:.2f}% of the largest {scale:.4g}"
               + (" (ccx loads the inner face of its expanded shells: 1 % less load at this t/R)"
@@ -16731,9 +16748,7 @@ def main():
             failures += 1
 
     shutil.rmtree(tmp, ignore_errors=True)
-    skipped = f" ({len(SKIPPED)} skipped: {', '.join(SKIPPED)})" if SKIPPED else ""
-    print(f"\n{'All checks passed' if not failures else str(failures) + ' check(s) failed'}{skipped}.")
-    return 1 if failures else 0
+    return closing_lines(failures)
 
 
 if __name__ == "__main__":

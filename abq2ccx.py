@@ -33972,7 +33972,7 @@ class _Loads:
                 return self._drop_load_line(b, g, "its direction vector is zero", reduces=False)
             unit = vunit(d)
 
-            def load(p, normal, tangent):
+            def common_load(p, normal, tangent):
                 if base == "TRVEC":
                     return vscale(unit, mag)
                 s = vsub(unit, vscale(normal, vdot(unit, normal)))
@@ -33983,14 +33983,14 @@ class _Loads:
         elif base in ("PX", "PY", "PZ", "BX", "BY", "BZ"):
             axis = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}[base[1]]
 
-            def load(p, normal, tangent):
+            def common_load(p, normal, tangent):
                 return vscale(axis, mag)
         elif base == "GRAV":                    # on U1 beams: per mass (the faces' scale)
             if vnorm(d) == 0.0:
                 return self._drop_load_line(b, g, "its direction vector is zero", reduces=False)
             down = vunit(d)                     # ccx and Abaqus normalize it (probed on ccx)
 
-            def load(p, normal, tangent):
+            def common_load(p, normal, tangent):
                 return vscale(down, mag)
         elif base == "CENTRIF":                 # mag: omega^2; d: a point on the axis; per mass
             try:
@@ -34001,7 +34001,7 @@ class _Loads:
                 return self._drop_load_line(b, g, "its axis direction is zero", reduces=False)
             spin = vunit(axis)
 
-            def load(p, normal, tangent):
+            def common_load(p, normal, tangent):
                 q = vsub(p, d)
                 return vscale(vsub(q, vscale(spin, vdot(q, spin))), mag)
         elif base in ("ROTA", "CENT"):          # (d: a point on the axis; _rotary_lines)
@@ -34028,6 +34028,8 @@ class _Loads:
             elif base in ("ROTA", "CENT"):      # (sense: a shell's mid-thickness off its reference)
                 def load(p, normal, tangent, s=sense):
                     return rotary_body_force(base, mag, d, axis, vadd(p, vscale(normal, s)) if s else p)
+            else:                               # the same on every face
+                load = common_load
             fv = consistent_nodal_forces(kind, [self.geom.nodes[n] for n in nodes], load, axi)
             for nd, v in zip(nodes, fv):
                 for k in range(2 if planar else 3):

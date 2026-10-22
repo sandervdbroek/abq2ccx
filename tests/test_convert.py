@@ -23435,10 +23435,16 @@ def test_unused_user_material_noted_as_never_called():
 
 
 if __name__ == "__main__":
+    import inspect
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
     for fn in tests:
         try:
+            need = [n for n, p in inspect.signature(fn).parameters.items()
+                    if p.default is p.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
+            if need:                # pytest fixtures: CI runs this file as a script, passing none
+                raise AssertionError(f"takes {', '.join(need)} (no pytest fixtures here: CI runs "
+                                     "this file as a script)")
             fn()
             print(f"PASS  {fn.__name__}")
         except AssertionError as exc:
