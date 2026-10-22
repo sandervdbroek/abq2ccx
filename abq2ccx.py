@@ -43452,7 +43452,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 if data and first == 0.0:
                     g[0] = g[1] if period > 0.0 else "1."
                     data = [", ".join(trimmed_fields(g))]
-                new = Block("STATIC", OrderedDict(), data)
+                new = Block("STATIC", OrderedDict(), data).placed(b)
                 self._geostatic[id(new)] = b
                 swap[id(b)] = new
                 continue

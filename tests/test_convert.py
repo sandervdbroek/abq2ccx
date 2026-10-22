@@ -3720,6 +3720,11 @@ def test_geostatic_step_as_static():
         assert "\n*STATIC" not in body, why
     _, conv, rep = convert_str(model + "*Material, name=UNUSED\n" + plastic + _deck_step("Geostatic", grav))
     assert conv.reduced_physics == [] and "not converted" not in rep.text()
+    # the *STATIC card made from it is at the *GEOSTATIC card's place in the deck
+    deck = model + _deck_step("Geostatic", grav)
+    _, _, rep = _convert_files({"main.inp": deck})
+    k = next(i for i, (_, m) in enumerate(rep.entries) if "*GEOSTATIC -> *STATIC" in m)
+    assert rep.where[k] == f"main.inp:{deck.splitlines().index('*Geostatic') + 1}", rep.where.get(k)
 
 
 def test_approximate_riks_and_default_off():
